@@ -1,0 +1,39 @@
+{
+  "network": "testnet4",
+  "pow_limit_bits": "0x1f00ffff",
+  "launch_bits_note": "Low-difficulty public testnet4 reset selection: genesis, permissionless, and AuxPoW anchor bits intentionally use the same externally mined reset target for bootstrap accessibility. This does not change the consensus lane cadences.",
+  "genesis": {
+    "model": "fixed_bits",
+    "bits": "0x1a7f1ab5",
+    "timestamp_message": "Financial Times 12/Jun/2026 Quantum computing revolution is closer than you think",
+    "timestamp_source_url": "https://www.ft.com/content/7e461be0-5c13-4a93-a0f8-0659ae5505a2",
+    "max_coinbase_script_sig_bytes": "100",
+    "max_second_push_extranonce_bytes": "8",
+    "mined": {
+      "found_at_unix": "1781704732",
+      "nversion": "1",
+      "ntime": "1781704709",
+      "nbits": "0x1a7f1ab5",
+      "nnonce": "2528738861",
+      "hash": "000000000000796fe86bbc0bf1b66a07e4b4c0676f74b54cf7e5ce8b3f1a0090",
+      "merkle_root": "66bf018c3377135cdc87f66ed4926b6a3be5aeef890841a3cfebaff9dfb91ed0",
+      "target": "0000000000007f1ab50000000000000000000000000000000000000000000000",
+      "coinbase_script_sig_hex": "04ffff001d0800000008f44100004c5146696e616e6369616c2054696d65732031322f4a756e2f32303236205175616e74756d20636f6d707574696e67207265766f6c7574696f6e20697320636c6f736572207468616e20796f75207468696e6b",
+      "coinbase_tx_hex": "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff6104ffff001d0800000008f44100004c5146696e616e6369616c2054696d65732031322f4a756e2f32303236205175616e74756d20636f6d707574696e67207265766f6c7574696f6e20697320636c6f736572207468616e20796f75207468696e6bffffffff010092b2e3040000002321000000000000000000000000000000000000000000000000000000000000000000ac00000000",
+      "genesis_output_script_hex": "21000000000000000000000000000000000000000000000000000000000000000000ac",
+      "extranonce_location": "script_sig_second_push",
+      "extranonce1": "00000008",
+      "extranonce2": "f4410000",
+      "rolling_ntime": true,
+      "version_rolling_mask": "0x1fffe000"
+    }
+  },
+  "permissionless": {
+    "model": "fixed_bits",
+    "bits": "0x1a7f1ab5"
+  },
+  "auxpow": {
+    "model": "fixed_bits",
+    "bits": "0x1a7f1ab5"
+  }
+}

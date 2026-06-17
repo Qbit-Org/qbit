@@ -29,15 +29,20 @@ class ScanblocksTest(BitcoinTestFramework):
         node = self.nodes[0]
         wallet = MiniWallet(node)
 
+        # Mature the default-cache coinbase UTXOs
+        self.ensure_cached_coinbase_mature(self.nodes[0])
+
         # send 1.0, mempool only
         _, spk_1, addr_1 = getnewdestination()
         wallet.send_to(from_node=node, scriptPubKey=spk_1, amount=1 * COIN)
 
-        parent_key = "tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B"
+        parent_key = "qrpbSRJj3eCrXD2z3iQbhaESDr59kqgvZtx9cbX5yqsMHCcEf3rUW2X1BkQVAQvUC1y14Ly3zscn9BvKoe1VCyvM3wgoF9UgedXSaecaxhhYggh"
         # send 1.0, mempool only
         # childkey 5 of `parent_key`
+        childkey_5_desc = node.getdescriptorinfo(f"pkh({parent_key}/5)")["descriptor"]
+        childkey_5_addr = node.deriveaddresses(childkey_5_desc)[0]
         wallet.send_to(from_node=node,
-                       scriptPubKey=address_to_scriptpubkey("mkS4HXoTYWRTescLGaUTGbtTTYX5EjJyEE"),
+                       scriptPubKey=address_to_scriptpubkey(childkey_5_addr),
                        amount=1 * COIN)
 
         # mine a block and assure that the mined blockhash is in the filterresult
@@ -82,19 +87,22 @@ class ScanblocksTest(BitcoinTestFramework):
         assert blockhash in node.scanblocks(
             "start", [{"desc": f"pkh({parent_key}/*)", "range": [0, 100]}], height)['relevant_blocks']
 
-        # check that false-positives are included in the result now; note that
-        # finding a false-positive at runtime would take too long, hence we simply
-        # use a pre-calculated one that collides with the regtest genesis block's
-        # coinbase output and verify that their BIP158 ranged hashes match
+        # Check that false positives are included in the result by deriving one
+        # at runtime for this chain's genesis block.
         genesis_blockhash = node.getblockhash(0)
         genesis_spks = bip158_relevant_scriptpubkeys(node, genesis_blockhash)
         assert_equal(len(genesis_spks), 1)
         genesis_coinbase_spk = list(genesis_spks)[0]
-        false_positive_spk = bytes.fromhex("001400000000000000000000000000000000000cadcb")
-
         genesis_coinbase_hash = bip158_basic_element_hash(genesis_coinbase_spk, 1, genesis_blockhash)
-        false_positive_hash = bip158_basic_element_hash(false_positive_spk, 1, genesis_blockhash)
-        assert_equal(genesis_coinbase_hash, false_positive_hash)
+        false_positive_spk = None
+        for nonce in range(10_000_000):
+            candidate = b"\x00\x14" + nonce.to_bytes(20, "big")
+            if candidate == genesis_coinbase_spk:
+                continue
+            if bip158_basic_element_hash(candidate, 1, genesis_blockhash) == genesis_coinbase_hash:
+                false_positive_spk = candidate
+                break
+        assert false_positive_spk is not None
 
         assert genesis_blockhash in node.scanblocks(
             "start", [{"desc": f"raw({genesis_coinbase_spk.hex()})"}], 0, 0)['relevant_blocks']

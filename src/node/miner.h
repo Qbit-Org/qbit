@@ -3,8 +3,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_NODE_MINER_H
-#define BITCOIN_NODE_MINER_H
+#ifndef QBIT_NODE_MINER_H
+#define QBIT_NODE_MINER_H
 
 #include <interfaces/types.h>
 #include <node/types.h>
@@ -222,10 +222,10 @@ private:
 
 /**
  * Get the minimum time a miner should use in the next block. This always
- * accounts for the BIP94 timewarp rule, so does not necessarily reflect the
- * consensus limit.
+ * accounts for the BIP94 timewarp rule on legacy retargeting networks, so
+ * does not necessarily reflect the consensus limit.
  */
-int64_t GetMinimumTime(const CBlockIndex* pindexPrev, const int64_t difficulty_adjustment_interval);
+int64_t GetMinimumTime(const CBlockIndex* pindexPrev, const Consensus::Params& consensus_params);
 
 int64_t UpdateTime(CBlockHeader* pblock, const Consensus::Params& consensusParams, const CBlockIndex* pindexPrev);
 
@@ -261,4 +261,4 @@ std::optional<BlockRef> GetTip(ChainstateManager& chainman);
 std::optional<BlockRef> WaitTipChanged(ChainstateManager& chainman, KernelNotifications& kernel_notifications, const uint256& current_tip, MillisecondsDouble& timeout);
 } // namespace node
 
-#endif // BITCOIN_NODE_MINER_H
+#endif // QBIT_NODE_MINER_H

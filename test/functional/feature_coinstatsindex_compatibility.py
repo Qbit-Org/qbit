@@ -15,6 +15,7 @@ from test_framework.util import assert_equal
 
 class CoinStatsIndexTest(BitcoinTestFramework):
     def set_test_params(self):
+        self.setup_clean_chain = True
         self.num_nodes = 2
         self.supports_cli = False
         self.extra_args = [["-coinstatsindex"],["-coinstatsindex"]]
@@ -33,6 +34,12 @@ class CoinStatsIndexTest(BitcoinTestFramework):
         )
         self.start_nodes()
 
+    def setup_network(self):
+        # Previous-release binaries may not be P2P-compatible with the current
+        # node in this repository. This test only requires each node to run.
+        self.setup_nodes()
+        self.skip_if_previous_release_chain_mismatch()
+
     def run_test(self):
         self._test_coin_stats_index_compatibility()
 
@@ -45,7 +52,11 @@ class CoinStatsIndexTest(BitcoinTestFramework):
         self.log.info("Test that gettxoutsetinfo() output is consistent between the different index versions")
         res0 = node.gettxoutsetinfo('muhash')
         res1 = legacy_node.gettxoutsetinfo('muhash')
-        assert_equal(res1, res0)
+        # Exclude chain-specific bestblock when nodes run on different chains.
+        assert_equal(
+            {k: v for k, v in res1.items() if k != "bestblock"},
+            {k: v for k, v in res0.items() if k != "bestblock"},
+        )
 
         self.log.info("Test that gettxoutsetinfo() output is consistent for the new index running on a datadir with the old version")
         self.stop_nodes()

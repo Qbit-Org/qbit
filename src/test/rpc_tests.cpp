@@ -3,14 +3,22 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <core_io.h>
+#include <crypto/pqc.h>
 #include <interfaces/chain.h>
+#include <key_io.h>
 #include <node/context.h>
 #include <rpc/blockchain.h>
 #include <rpc/client.h>
+#include <rpc/rawtransaction_util.h>
+#include <chainparamsbase.h>
 #include <rpc/server.h>
 #include <rpc/util.h>
+#include <script/interpreter.h>
+#include <script/signingprovider.h>
+#include <script/script.h>
 #include <test/util/setup_common.h>
 #include <univalue.h>
+#include <util/strencodings.h>
 #include <util/time.h>
 
 #include <any>
@@ -193,20 +201,118 @@ BOOST_AUTO_TEST_CASE(rpc_togglenetwork)
 BOOST_AUTO_TEST_CASE(rpc_rawsign)
 {
     UniValue r;
-    // input is a 1-of-2 multisig (so is output):
+    // input is a legacy 1-of-2 multisig:
     std::string prevout =
       "[{\"txid\":\"b4cc287e58f87cdae59417329f710f3ecd75a4ee1d2872b7248f50977c8493f3\","
       "\"vout\":1,\"scriptPubKey\":\"a914b10c9df5f7edf436c697f02f1efdba4cf399615187\","
       "\"redeemScript\":\"512103debedc17b3df2badbcdd86d5feb4562b86fe182e5998abd8bcd4f122c6155b1b21027e940bb73ab8732bfdf7f9216ecefca5b94d6df834e77e108f68e66f126044c052ae\"}]";
+    BOOST_CHECK_EXCEPTION(CallRPC(std::string("createrawtransaction ") + prevout + " " +
+      "{\"SdS9kSdbYeccJoS5dJs4djaYhqRFjcfmi5\":11}"), std::runtime_error, HasReason("Invalid qbit address"));
+
+    const std::string p2mr_address{EncodeDestination(WitnessV2P2MR{})};
     r = CallRPC(std::string("createrawtransaction ")+prevout+" "+
-      "{\"3HqAe9LtNBjnsfM4CyYaWTnvCaUYT7v4oZ\":11}");
+      "{\""+p2mr_address+"\":11}");
     std::string notsigned = r.get_str();
-    std::string privkey1 = "\"KzsXybp9jX64P5ekX1KUxRQ79Jht9uzW7LorgwE65i5rWACL6LQe\"";
-    std::string privkey2 = "\"Kyhdf5LuKTRx4ge69ybABsiUAWjVRK4XGxAKk2FQLp2HjGMy87Z4\"";
-    r = CallRPC(std::string("signrawtransactionwithkey ")+notsigned+" [] "+prevout);
-    BOOST_CHECK(r.get_obj().find_value("complete").get_bool() == false);
-    r = CallRPC(std::string("signrawtransactionwithkey ")+notsigned+" ["+privkey1+","+privkey2+"] "+prevout);
-    BOOST_CHECK(r.get_obj().find_value("complete").get_bool() == true);
+    std::string privkey1 = "\"Qar5hbz3AHVKb84ZfMZAdpLCrmw72tQ3A37u31y2JYSvERLZSTH5\"";
+    std::string privkey2 = "\"QZgBP5WnkDqDGj3uJKpqsGeZsyxiJHU4KeUN66zLZePMTXVwGRxy\"";
+    BOOST_CHECK_EXCEPTION(CallRPC(std::string("signrawtransactionwithkey ")+notsigned+" [] "+prevout),
+                          std::runtime_error, HasReason("Only restricted-output-mode prevout scriptPubKeys are supported on this chain"));
+    BOOST_CHECK_EXCEPTION(CallRPC(std::string("signrawtransactionwithkey ")+notsigned+" ["+privkey1+","+privkey2+"] "+prevout),
+                          std::runtime_error, HasReason("Legacy WIF private keys are disabled on this chain"));
+}
+
+BOOST_AUTO_TEST_CASE(rpc_parse_pqc_raw_private_key)
+{
+    CPQCKey key;
+    key.MakeNewKey();
+    BOOST_REQUIRE(key.IsValid());
+
+    const std::string pqc_key = "pqc(" + HexStr(std::span<const unsigned char>{key.data(), key.size()}) + ")";
+    FlatSigningProvider provider;
+    std::string error;
+    BOOST_CHECK(ParseRawTransactionKey(pqc_key, provider, error));
+    BOOST_CHECK(error.empty());
+    BOOST_CHECK_EQUAL(provider.pqc_keys.size(), 1U);
+    BOOST_CHECK(provider.pqc_keys.contains(key.GetPubKey()));
+
+    FlatSigningProvider invalid_provider;
+    BOOST_CHECK(!ParseRawTransactionKey("pqc(00)", invalid_provider, error));
+    BOOST_CHECK_EQUAL(error, "Invalid PQC private key");
+}
+
+BOOST_AUTO_TEST_CASE(rpc_parse_prevouts_p2mr)
+{
+    CPQCKey key;
+    key.MakeNewKey();
+    const CPQCPubKey pubkey = key.GetPubKey();
+
+    CScript leaf_script;
+    leaf_script << std::vector<unsigned char>{pubkey.begin(), pubkey.end()} << OP_CHECKSIGPQC;
+
+    TaprootBuilder builder;
+    builder.AddP2MR(/*depth=*/0, leaf_script, P2MR_LEAF_VERSION).FinalizeP2MR();
+    const WitnessV2P2MR output = builder.GetP2MROutput();
+    const CScript script_pub_key = GetScriptForDestination(output);
+    const P2MRSpendData spenddata = builder.GetP2MRSpendData();
+    const auto spend_it = spenddata.scripts.find({std::vector<unsigned char>{leaf_script.begin(), leaf_script.end()}, P2MR_LEAF_VERSION});
+    BOOST_REQUIRE(spend_it != spenddata.scripts.end());
+    BOOST_REQUIRE_EQUAL(spend_it->second.size(), 1U);
+
+    const std::string prevtxs = strprintf(
+        "[{\"txid\":\"%s\",\"vout\":0,\"scriptPubKey\":\"%s\",\"amount\":1.00000000,\"p2mrScript\":\"%s\",\"p2mrControlBlock\":\"%s\"}]",
+        "0101010101010101010101010101010101010101010101010101010101010101",
+        HexStr(script_pub_key),
+        HexStr(leaf_script),
+        HexStr(*spend_it->second.begin()));
+
+    FlatSigningProvider provider;
+    std::map<COutPoint, Coin> coins;
+    ParsePrevouts(JSON(prevtxs), &provider, coins);
+
+    P2MRSpendData parsed;
+    BOOST_CHECK(provider.GetP2MRSpendData(output, parsed));
+    BOOST_CHECK(parsed.merkle_root == output.GetMerkleRoot());
+    BOOST_CHECK_EQUAL(parsed.scripts.size(), 1U);
+    BOOST_CHECK(parsed.scripts.contains({std::vector<unsigned char>{leaf_script.begin(), leaf_script.end()}, P2MR_LEAF_VERSION}));
+
+    const CScript anchor_script_pub_key = GetScriptForDestination(PayToAnchor{});
+    const std::string anchor_prevtxs = strprintf(
+        "[{\"txid\":\"%s\",\"vout\":1,\"scriptPubKey\":\"%s\",\"amount\":1.00000000}]",
+        "0202020202020202020202020202020202020202020202020202020202020202",
+        HexStr(anchor_script_pub_key));
+    FlatSigningProvider anchor_provider;
+    std::map<COutPoint, Coin> anchor_coins;
+    BOOST_CHECK_NO_THROW(ParsePrevouts(JSON(anchor_prevtxs), &anchor_provider, anchor_coins));
+
+    const std::vector<unsigned char> reserved_program(32, 0x03);
+    const CScript reserved_script_pub_key = GetScriptForDestination(WitnessUnknown{3, reserved_program});
+    const std::string reserved_prevtxs = strprintf(
+        "[{\"txid\":\"%s\",\"vout\":2,\"scriptPubKey\":\"%s\",\"amount\":1.00000000}]",
+        "0303030303030303030303030303030303030303030303030303030303030303",
+        HexStr(reserved_script_pub_key));
+    FlatSigningProvider reserved_provider;
+    std::map<COutPoint, Coin> reserved_coins;
+    BOOST_CHECK_NO_THROW(ParsePrevouts(JSON(reserved_prevtxs), &reserved_provider, reserved_coins));
+    BOOST_CHECK(!NormalizeActiveHeight(-1).has_value());
+    BOOST_CHECK_NO_THROW(ParsePrevouts(JSON(reserved_prevtxs), &reserved_provider, reserved_coins, NormalizeActiveHeight(-1)));
+    const auto active_height = NormalizeActiveHeight(0);
+    BOOST_REQUIRE(active_height.has_value());
+    BOOST_CHECK_EQUAL(*active_height, 0);
+
+    std::vector<unsigned char> invalid_control = *spend_it->second.begin();
+    invalid_control[0] &= TAPROOT_LEAF_MASK;
+    const std::string invalid_prevtxs = strprintf(
+        "[{\"txid\":\"%s\",\"vout\":0,\"scriptPubKey\":\"%s\",\"amount\":1.00000000,\"p2mrScript\":\"%s\",\"p2mrControlBlock\":\"%s\"}]",
+        "0101010101010101010101010101010101010101010101010101010101010101",
+        HexStr(script_pub_key),
+        HexStr(leaf_script),
+        HexStr(invalid_control));
+    FlatSigningProvider invalid_provider;
+    std::map<COutPoint, Coin> invalid_coins;
+    BOOST_CHECK_EXCEPTION(
+        ParsePrevouts(JSON(invalid_prevtxs), &invalid_provider, invalid_coins),
+        UniValue,
+        HasJSON(R"({"code":-8,"message":"P2MR control byte bit 0 must be set"})"));
 }
 
 BOOST_AUTO_TEST_CASE(rpc_createraw_op_return)
@@ -424,6 +530,47 @@ BOOST_AUTO_TEST_CASE(rpc_convert_values_generatetoaddress)
     BOOST_CHECK_EQUAL(result[2].getInt<int>(), 9);
 }
 
+BOOST_AUTO_TEST_CASE(rpc_convert_values_importpubkeydb_timestamp)
+{
+    UniValue result;
+
+    BOOST_CHECK_NO_THROW(result = RPCConvertValues("importpubkeydb", {"[]", "false", "now"}));
+    BOOST_CHECK(result[0].isArray());
+    BOOST_CHECK_EQUAL(result[0].get_array().size(), 0U);
+    BOOST_CHECK(!result[1].get_bool());
+    BOOST_CHECK(result[2].isStr());
+    BOOST_CHECK_EQUAL(result[2].get_str(), "now");
+
+    BOOST_CHECK_NO_THROW(result = RPCConvertValues("importpubkeydb", {"[]", "false", "0"}));
+    BOOST_CHECK(result[2].isNum());
+    BOOST_CHECK_EQUAL(result[2].getInt<int>(), 0);
+
+    BOOST_CHECK_NO_THROW(result = RPCConvertNamedValues("importpubkeydb", {"pubkeys=[]", "internal=false", "timestamp=now"}));
+    BOOST_CHECK(result.isObject());
+    BOOST_CHECK(result.find_value("pubkeys").isArray());
+    BOOST_CHECK(!result.find_value("internal").get_bool());
+    BOOST_CHECK(result.find_value("timestamp").isStr());
+    BOOST_CHECK_EQUAL(result.find_value("timestamp").get_str(), "now");
+}
+
+BOOST_AUTO_TEST_CASE(rpc_convert_values_getnetworkhashps_lane)
+{
+    UniValue result;
+
+    BOOST_CHECK_NO_THROW(result = RPCConvertValues("getnetworkhashps", {"120", "-1", "permissionless"}));
+    BOOST_CHECK_EQUAL(result[0].getInt<int>(), 120);
+    BOOST_CHECK_EQUAL(result[1].getInt<int>(), -1);
+    BOOST_CHECK(result[2].isStr());
+    BOOST_CHECK_EQUAL(result[2].get_str(), "permissionless");
+
+    BOOST_CHECK_NO_THROW(result = RPCConvertNamedValues("getnetworkhashps", {"nblocks=120", "height=-1", "lane=auxpow"}));
+    BOOST_CHECK(result.isObject());
+    BOOST_CHECK_EQUAL(result.find_value("nblocks").getInt<int>(), 120);
+    BOOST_CHECK_EQUAL(result.find_value("height").getInt<int>(), -1);
+    BOOST_CHECK(result.find_value("lane").isStr());
+    BOOST_CHECK_EQUAL(result.find_value("lane").get_str(), "auxpow");
+}
+
 BOOST_AUTO_TEST_CASE(rpc_getblockstats_calculate_percentiles_by_weight)
 {
     int64_t total_weight = 200;
@@ -554,35 +701,44 @@ BOOST_AUTO_TEST_CASE(help_example)
 {
     // test different argument types
     const RPCArgList& args = {{"foo", "bar"}, {"b", true}, {"n", 1}};
-    BOOST_CHECK_EQUAL(HelpExampleCliNamed("test", args), "> bitcoin-cli -named test foo=bar b=true n=1\n");
-    BOOST_CHECK_EQUAL(HelpExampleRpcNamed("test", args), "> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"test\", \"params\": {\"foo\":\"bar\",\"b\":true,\"n\":1}}' -H 'content-type: application/json' http://127.0.0.1:8332/\n");
+    BOOST_CHECK_EQUAL(HelpExampleCliNamed("test", args), "> qbit-cli -named test foo=bar b=true n=1\n");
+    BOOST_CHECK_EQUAL(HelpExampleRpcNamed("test", args), "> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"test\", \"params\": {\"foo\":\"bar\",\"b\":true,\"n\":1}}' -H 'content-type: application/json' http://127.0.0.1:8352/\n");
 
     // test shell escape
-    BOOST_CHECK_EQUAL(HelpExampleCliNamed("test", {{"foo", "b'ar"}}), "> bitcoin-cli -named test foo='b'''ar'\n");
-    BOOST_CHECK_EQUAL(HelpExampleCliNamed("test", {{"foo", "b\"ar"}}), "> bitcoin-cli -named test foo='b\"ar'\n");
-    BOOST_CHECK_EQUAL(HelpExampleCliNamed("test", {{"foo", "b ar"}}), "> bitcoin-cli -named test foo='b ar'\n");
+    BOOST_CHECK_EQUAL(HelpExampleCliNamed("test", {{"foo", "b'ar"}}), "> qbit-cli -named test foo='b'''ar'\n");
+    BOOST_CHECK_EQUAL(HelpExampleCliNamed("test", {{"foo", "b\"ar"}}), "> qbit-cli -named test foo='b\"ar'\n");
+    BOOST_CHECK_EQUAL(HelpExampleCliNamed("test", {{"foo", "b ar"}}), "> qbit-cli -named test foo='b ar'\n");
 
     // test object params
     UniValue obj_value(UniValue::VOBJ);
     obj_value.pushKV("foo", "bar");
     obj_value.pushKV("b", false);
     obj_value.pushKV("n", 1);
-    BOOST_CHECK_EQUAL(HelpExampleCliNamed("test", {{"name", obj_value}}), "> bitcoin-cli -named test name='{\"foo\":\"bar\",\"b\":false,\"n\":1}'\n");
-    BOOST_CHECK_EQUAL(HelpExampleRpcNamed("test", {{"name", obj_value}}), "> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"test\", \"params\": {\"name\":{\"foo\":\"bar\",\"b\":false,\"n\":1}}}' -H 'content-type: application/json' http://127.0.0.1:8332/\n");
+    BOOST_CHECK_EQUAL(HelpExampleCliNamed("test", {{"name", obj_value}}), "> qbit-cli -named test name='{\"foo\":\"bar\",\"b\":false,\"n\":1}'\n");
+    BOOST_CHECK_EQUAL(HelpExampleRpcNamed("test", {{"name", obj_value}}), "> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"test\", \"params\": {\"name\":{\"foo\":\"bar\",\"b\":false,\"n\":1}}}' -H 'content-type: application/json' http://127.0.0.1:8352/\n");
 
     // test array params
     UniValue arr_value(UniValue::VARR);
     arr_value.push_back("bar");
     arr_value.push_back(false);
     arr_value.push_back(1);
-    BOOST_CHECK_EQUAL(HelpExampleCliNamed("test", {{"name", arr_value}}), "> bitcoin-cli -named test name='[\"bar\",false,1]'\n");
-    BOOST_CHECK_EQUAL(HelpExampleRpcNamed("test", {{"name", arr_value}}), "> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"test\", \"params\": {\"name\":[\"bar\",false,1]}}' -H 'content-type: application/json' http://127.0.0.1:8332/\n");
+    BOOST_CHECK_EQUAL(HelpExampleCliNamed("test", {{"name", arr_value}}), "> qbit-cli -named test name='[\"bar\",false,1]'\n");
+    BOOST_CHECK_EQUAL(HelpExampleRpcNamed("test", {{"name", arr_value}}), "> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", \"method\": \"test\", \"params\": {\"name\":[\"bar\",false,1]}}' -H 'content-type: application/json' http://127.0.0.1:8352/\n");
 
     // test types don't matter for shell
     BOOST_CHECK_EQUAL(HelpExampleCliNamed("foo", {{"arg", true}}), HelpExampleCliNamed("foo", {{"arg", "true"}}));
 
     // test types matter for Rpc
     BOOST_CHECK_NE(HelpExampleRpcNamed("foo", {{"arg", true}}), HelpExampleRpcNamed("foo", {{"arg", "true"}}));
+}
+
+BOOST_AUTO_TEST_CASE(default_rpc_ports)
+{
+    BOOST_CHECK_EQUAL(CreateBaseChainParams(ChainType::MAIN)->RPCPort(), 8352);
+    BOOST_CHECK_EQUAL(CreateBaseChainParams(ChainType::TESTNET)->RPCPort(), 18352);
+    BOOST_CHECK_EQUAL(CreateBaseChainParams(ChainType::TESTNET4)->RPCPort(), 48352);
+    BOOST_CHECK_EQUAL(CreateBaseChainParams(ChainType::SIGNET)->RPCPort(), 38352);
+    BOOST_CHECK_EQUAL(CreateBaseChainParams(ChainType::REGTEST)->RPCPort(), 18452);
 }
 
 static void CheckRpc(const std::vector<RPCArg>& params, const UniValue& args, RPCHelpMan::RPCMethodImpl test_impl)

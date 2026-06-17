@@ -11,7 +11,10 @@ from test_framework.p2p import (
 )
 
 from test_framework.messages import (
+    CBlock,
     msg_headers,
+    msg_block,
+    from_hex,
 )
 
 from test_framework.blocktools import (
@@ -19,7 +22,10 @@ from test_framework.blocktools import (
     create_block,
 )
 
-from test_framework.util import assert_equal
+from test_framework.util import (
+    assert_equal,
+    assert_raises_rpc_error,
+)
 
 import time
 
@@ -54,7 +60,26 @@ class RejectLowDifficultyHeadersTest(BitcoinTestFramework):
         for n in self.nodes:
             n.setmocktime(time)
 
+    def assert_low_work_block_bodies_do_not_advance_active_tip(self, height):
+        node = self.nodes[3]
+        genesis_hash = node.getblockhash(0)
+        low_work_tip = self.nodes[0].getblockhash(height)
+
+        self.log.info("Deliver below-threshold block bodies and verify active tip remains at genesis")
+        peer = node.add_p2p_connection(P2PInterface())
+        for block_height in range(1, height + 1):
+            block_hex = self.nodes[0].getblock(self.nodes[0].getblockhash(block_height), 0)
+            peer.send_without_ping(msg_block(from_hex(CBlock(), block_hex)))
+        peer.sync_with_ping()
+
+        assert_equal(node.getblockcount(), 0)
+        assert_equal(node.getbestblockhash(), genesis_hash)
+        assert_raises_rpc_error(-1, "Block not available", node.getblock, low_work_tip)
+        peer.peer_disconnect()
+
     def test_chains_sync_when_long_enough(self):
+        genesis_hash = self.nodes[0].getblockhash(0)
+
         self.log.info("Generate blocks on the node with no required chainwork, and verify nodes 1 and 2 have no new headers in their headers tree")
         with self.nodes[1].assert_debug_log(expected_msgs=["[net] Ignoring low-work chain (height=14)"]), self.nodes[2].assert_debug_log(expected_msgs=["[net] Ignoring low-work chain (height=14)"]), self.nodes[3].assert_debug_log(expected_msgs=["Synchronizing blockheaders, height: 14"]):
             self.generate(self.nodes[0], NODE1_BLOCKS_REQUIRED-1, sync_fun=self.no_op)
@@ -73,13 +98,14 @@ class RejectLowDifficultyHeadersTest(BitcoinTestFramework):
             } in node3_chaintips
 
         check_node3_chaintips(2, self.nodes[0].getbestblockhash(), NODE1_BLOCKS_REQUIRED-1)
+        self.assert_low_work_block_bodies_do_not_advance_active_tip(NODE1_BLOCKS_REQUIRED - 1)
 
         for node in self.nodes[1:3]:
             chaintips = node.getchaintips()
             assert len(chaintips) == 1
             assert {
                 'height': 0,
-                'hash': '0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206',
+                'hash': genesis_hash,
                 'branchlen': 0,
                 'status': 'active',
             } in chaintips
@@ -91,7 +117,7 @@ class RejectLowDifficultyHeadersTest(BitcoinTestFramework):
 
         assert {
             'height': 0,
-            'hash': '0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206',
+            'hash': genesis_hash,
             'branchlen': 0,
             'status': 'active',
         } in self.nodes[2].getchaintips()

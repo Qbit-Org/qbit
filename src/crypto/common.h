@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_CRYPTO_COMMON_H
-#define BITCOIN_CRYPTO_COMMON_H
+#ifndef QBIT_CRYPTO_COMMON_H
+#define QBIT_CRYPTO_COMMON_H
 
 #include <compat/endian.h>
 
@@ -105,4 +105,4 @@ inline void WriteBE64(B* ptr, uint64_t x)
     memcpy(ptr, &v, 8);
 }
 
-#endif // BITCOIN_CRYPTO_COMMON_H
+#endif // QBIT_CRYPTO_COMMON_H

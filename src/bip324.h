@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_BIP324_H
-#define BITCOIN_BIP324_H
+#ifndef QBIT_BIP324_H
+#define QBIT_BIP324_H
 
 #include <array>
 #include <cstddef>
@@ -93,4 +93,4 @@ public:
     std::span<const std::byte> GetReceiveGarbageTerminator() const noexcept { return m_recv_garbage_terminator; }
 };
 
-#endif // BITCOIN_BIP324_H
+#endif // QBIT_BIP324_H

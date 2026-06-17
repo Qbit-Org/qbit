@@ -1,14 +1,18 @@
 // Copyright (c) 2022 The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
-#ifndef BITCOIN_KERNEL_MEMPOOL_LIMITS_H
-#define BITCOIN_KERNEL_MEMPOOL_LIMITS_H
+#ifndef QBIT_KERNEL_MEMPOOL_LIMITS_H
+#define QBIT_KERNEL_MEMPOOL_LIMITS_H
 
 #include <policy/policy.h>
 
 #include <cstdint>
 
 namespace kernel {
+
+/** Minimum -maxmempool safety factor applied to the descendant-size limit. */
+static constexpr int64_t MEMPOOL_DESCENDANT_SIZE_LIMIT_FACTOR{40};
+
 /**
  * Options struct containing limit options for a CTxMemPool. Default constructor
  * populates the struct with sane default values which can be modified.
@@ -36,4 +40,4 @@ struct MemPoolLimits {
 };
 } // namespace kernel
 
-#endif // BITCOIN_KERNEL_MEMPOOL_LIMITS_H
+#endif // QBIT_KERNEL_MEMPOOL_LIMITS_H

@@ -6,7 +6,10 @@
 
 export LC_ALL=C.UTF-8
 
-export CI_IMAGE_NAME_TAG="mirror.gcr.io/ubuntu:24.04"
+# shellcheck source=ci/test/00_setup_env_base_image.sh
+source "$( dirname "${BASH_SOURCE[0]}" )/00_setup_env_base_image.sh"
+
+ci_set_base_image_name_tag "ubuntu:24.04"
 export CONTAINER_NAME=ci_native_tidy
 export TIDY_LLVM_V="20"
 export APT_LLVM_V="${TIDY_LLVM_V}"
@@ -17,6 +20,8 @@ export RUN_FUNCTIONAL_TESTS=false
 export RUN_FUZZ_TESTS=false
 export RUN_CHECK_DEPS=true
 export RUN_TIDY=true
+# check-deps.sh currently requires a Makefile-based build directory.
+export CMAKE_GENERATOR="Unix Makefiles"
 export GOAL="install"
 export BITCOIN_CONFIG="\
  -DWITH_ZMQ=ON -DBUILD_GUI=ON -DBUILD_BENCH=ON -DWITH_USDT=ON \

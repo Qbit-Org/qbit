@@ -67,12 +67,12 @@ Copyright: Stephen Hutchings, Jonas Schnelli
 License: Expat
 Comment: Modifications of Stephen Hutchings' Typicons
 
-Files: src/qt/res/icons/bitcoin.*
-       share/pixmaps/bitcoin*
-       src/qt/res/src/bitcoin.svg
-Copyright: Bitboy, Jonas Schnelli
+Files: src/qt/res/icons/qbit.*
+       share/pixmaps/qbit*
+       src/qt/res/src/qbit.svg
+Copyright: qbit
 License: public-domain
-Comment: Site: https://bitcointalk.org/?topic=1756.0
+Comment: Site: https://qbit.org
 
 Files: src/qt/res/icons/proxy.png
        src/qt/res/src/proxy.svg

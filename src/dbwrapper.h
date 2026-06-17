@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_DBWRAPPER_H
-#define BITCOIN_DBWRAPPER_H
+#ifndef QBIT_DBWRAPPER_H
+#define QBIT_DBWRAPPER_H
 
 #include <attributes.h>
 #include <serialize.h>
@@ -286,4 +286,4 @@ public:
     }
 };
 
-#endif // BITCOIN_DBWRAPPER_H
+#endif // QBIT_DBWRAPPER_H

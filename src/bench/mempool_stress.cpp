@@ -4,6 +4,7 @@
 
 #include <bench/bench.h>
 #include <consensus/amount.h>
+#include <consensus/consensus.h>
 #include <policy/policy.h>
 #include <primitives/transaction.h>
 #include <random.h>
@@ -122,7 +123,7 @@ static void MempoolCheck(benchmark::Bench& bench)
 
     bench.run([&]() NO_THREAD_SAFETY_ANALYSIS {
         // Bump up the spendheight so we don't hit premature coinbase spend errors.
-        pool.check(coins_tip, /*spendheight=*/300);
+        pool.check(coins_tip, /*spendheight=*/COINBASE_MATURITY * 2);
     });
 }
 

@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_NODE_PSBT_H
-#define BITCOIN_NODE_PSBT_H
+#ifndef QBIT_NODE_PSBT_H
+#define QBIT_NODE_PSBT_H
 
 #include <psbt.h>
 
@@ -20,6 +20,7 @@ struct PSBTInputAnalysis {
 
     std::vector<CKeyID> missing_pubkeys; //!< Pubkeys whose BIP32 derivation path is missing
     std::vector<CKeyID> missing_sigs;    //!< Pubkeys whose signatures are missing
+    std::vector<CPQCPubKey> missing_p2mr_sigs; //!< P2MR pubkeys whose signatures are missing
     uint160 missing_redeem_script;       //!< Hash160 of redeem script, if missing
     uint256 missing_witness_script;      //!< SHA256 of witness script, if missing
 };
@@ -55,4 +56,4 @@ struct PSBTAnalysis {
 PSBTAnalysis AnalyzePSBT(PartiallySignedTransaction psbtx);
 } // namespace node
 
-#endif // BITCOIN_NODE_PSBT_H
+#endif // QBIT_NODE_PSBT_H

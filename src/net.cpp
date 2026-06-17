@@ -393,7 +393,7 @@ static CService GetBindAddress(const Sock& sock)
     return addr_bind;
 }
 
-CNode* CConnman::ConnectNode(CAddress addrConnect, const char *pszDest, bool fCountFailure, ConnectionType conn_type, bool use_v2transport)
+CNode* CConnman::ConnectNode(CAddress addrConnect, const char *pszDest, bool fCountFailure, ConnectionType conn_type, bool use_v2transport, bool is_archive_connection)
 {
     AssertLockNotHeld(m_unused_i2p_sessions_mutex);
     assert(conn_type != ConnectionType::INBOUND);
@@ -544,6 +544,7 @@ CNode* CConnman::ConnectNode(CAddress addrConnect, const char *pszDest, bool fCo
                                     .i2p_sam_session = std::move(i2p_transient_session),
                                     .recv_flood_size = nReceiveFloodSize,
                                     .use_v2transport = use_v2transport,
+                                    .is_archive_connection = is_archive_connection,
                                 });
         pnode->AddRef();
 
@@ -659,6 +660,7 @@ void CNode::CopyStats(CNodeStats& stats)
     stats.addrLocal = addrLocalUnlocked.IsValid() ? addrLocalUnlocked.ToStringAddrPort() : "";
 
     X(m_conn_type);
+    X(m_is_archive_connection);
 }
 #undef X
 
@@ -1943,7 +1945,8 @@ void CConnman::DisconnectNodes()
                         .grant = std::move(pnode->grantOutbound),
                         .destination = pnode->m_dest,
                         .conn_type = pnode->m_conn_type,
-                        .use_v2transport = false});
+                        .use_v2transport = false,
+                        .is_archive_connection = pnode->m_is_archive_connection});
                     LogDebug(BCLog::NET, "retrying with v1 transport protocol for peer=%d\n", pnode->GetId());
                 }
 
@@ -2768,6 +2771,7 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect, std
                 m_anchors.pop_back();
                 if (!addr.IsValid() || IsLocal(addr) || !g_reachable_nets.Contains(addr) ||
                     !m_msgproc->HasAllDesirableServiceFlags(addr.nServices) ||
+                    m_msgproc->HasUndesirableServiceFlags(addr.nServices) ||
                     outbound_ipv46_peer_netgroups.count(m_netgroupman.GetGroup(addr))) continue;
                 addrConnect = addr;
                 LogDebug(BCLog::NET, "Trying to make an anchor connection to %s\n", addrConnect.ToStringAddrPort());
@@ -2836,6 +2840,8 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect, std
             // for feelers, only require they be a full node (only because most
             // SPV clients don't have a good address DB available)
             if (!fFeeler && !m_msgproc->HasAllDesirableServiceFlags(addr.nServices)) {
+                continue;
+            } else if (!fFeeler && m_msgproc->HasUndesirableServiceFlags(addr.nServices)) {
                 continue;
             } else if (fFeeler && !MayHaveUsefulAddressDB(addr.nServices)) {
                 continue;
@@ -2910,24 +2916,29 @@ std::vector<AddedNodeInfo> CConnman::GetAddedNodeInfo(bool include_connected) co
 
 
     // Build a map of all already connected addresses (by IP:port and by name) to inbound/outbound and resolved CService
-    std::map<CService, bool> mapConnected;
-    std::map<std::string, std::pair<bool, CService>> mapConnectedByName;
+    struct ConnectedAddedNode {
+        bool inbound;
+        CService resolved_address;
+        NodeId nodeid;
+    };
+    std::map<CService, ConnectedAddedNode> mapConnected;
+    std::map<std::string, ConnectedAddedNode> mapConnectedByName;
     {
         LOCK(m_nodes_mutex);
         for (const CNode* pnode : m_nodes) {
             if (pnode->addr.IsValid()) {
-                mapConnected[pnode->addr] = pnode->IsInboundConn();
+                mapConnected[pnode->addr] = {pnode->IsInboundConn(), static_cast<const CService&>(pnode->addr), pnode->GetId()};
             }
             std::string addrName{pnode->m_addr_name};
             if (!addrName.empty()) {
-                mapConnectedByName[std::move(addrName)] = std::make_pair(pnode->IsInboundConn(), static_cast<const CService&>(pnode->addr));
+                mapConnectedByName[std::move(addrName)] = {pnode->IsInboundConn(), static_cast<const CService&>(pnode->addr), pnode->GetId()};
             }
         }
     }
 
     for (const auto& addr : lAddresses) {
         CService service{MaybeFlipIPv6toCJDNS(LookupNumeric(addr.m_added_node, GetDefaultPort(addr.m_added_node)))};
-        AddedNodeInfo addedNode{addr, CService(), false, false};
+        AddedNodeInfo addedNode{addr, CService(), false, false, std::nullopt};
         if (service.IsValid()) {
             // strAddNode is an IP:port
             auto it = mapConnected.find(service);
@@ -2937,7 +2948,8 @@ std::vector<AddedNodeInfo> CConnman::GetAddedNodeInfo(bool include_connected) co
                 }
                 addedNode.resolvedAddress = service;
                 addedNode.fConnected = true;
-                addedNode.fInbound = it->second;
+                addedNode.fInbound = it->second.inbound;
+                addedNode.nodeid = it->second.nodeid;
             }
         } else {
             // strAddNode is a name
@@ -2946,9 +2958,10 @@ std::vector<AddedNodeInfo> CConnman::GetAddedNodeInfo(bool include_connected) co
                 if (!include_connected) {
                     continue;
                 }
-                addedNode.resolvedAddress = it->second.second;
+                addedNode.resolvedAddress = it->second.resolved_address;
                 addedNode.fConnected = true;
-                addedNode.fInbound = it->second.first;
+                addedNode.fInbound = it->second.inbound;
+                addedNode.nodeid = it->second.nodeid;
             }
         }
         ret.emplace_back(std::move(addedNode));
@@ -2974,7 +2987,7 @@ void CConnman::ThreadOpenAddedConnections()
             }
             tried = true;
             CAddress addr(CService(), NODE_NONE);
-            OpenNetworkConnection(addr, false, std::move(grant), info.m_params.m_added_node.c_str(), ConnectionType::MANUAL, info.m_params.m_use_v2transport);
+            OpenNetworkConnection(addr, false, std::move(grant), info.m_params.m_added_node.c_str(), ConnectionType::MANUAL, info.m_params.m_use_v2transport, info.m_params.m_require_archive);
             if (!interruptNet.sleep_for(std::chrono::milliseconds(500))) return;
             grant = CountingSemaphoreGrant<>(*semAddnode, /*fTry=*/true);
         }
@@ -2987,7 +3000,7 @@ void CConnman::ThreadOpenAddedConnections()
 }
 
 // if successful, this moves the passed grant to the constructed node
-void CConnman::OpenNetworkConnection(const CAddress& addrConnect, bool fCountFailure, CountingSemaphoreGrant<>&& grant_outbound, const char *pszDest, ConnectionType conn_type, bool use_v2transport)
+void CConnman::OpenNetworkConnection(const CAddress& addrConnect, bool fCountFailure, CountingSemaphoreGrant<>&& grant_outbound, const char *pszDest, ConnectionType conn_type, bool use_v2transport, bool is_archive_connection)
 {
     AssertLockNotHeld(m_unused_i2p_sessions_mutex);
     assert(conn_type != ConnectionType::INBOUND);
@@ -3009,7 +3022,7 @@ void CConnman::OpenNetworkConnection(const CAddress& addrConnect, bool fCountFai
     } else if (FindNode(std::string(pszDest)))
         return;
 
-    CNode* pnode = ConnectNode(addrConnect, pszDest, fCountFailure, conn_type, use_v2transport);
+    CNode* pnode = ConnectNode(addrConnect, pszDest, fCountFailure, conn_type, use_v2transport, is_archive_connection);
 
     if (!pnode)
         return;
@@ -3817,6 +3830,7 @@ CNode::CNode(NodeId idIn,
       m_prefer_evict{node_opts.prefer_evict},
       nKeyedNetGroup{nKeyedNetGroupIn},
       m_conn_type{conn_type_in},
+      m_is_archive_connection{node_opts.is_archive_connection},
       id{idIn},
       nLocalHostNonce{nLocalHostNonceIn},
       m_recv_flood_size{node_opts.recv_flood_size},
@@ -3967,7 +3981,8 @@ void CConnman::PerformReconnections()
                               std::move(item.grant),
                               item.destination.empty() ? nullptr : item.destination.c_str(),
                               item.conn_type,
-                              item.use_v2transport);
+                              item.use_v2transport,
+                              item.is_archive_connection);
     }
 }
 

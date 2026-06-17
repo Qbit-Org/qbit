@@ -16,6 +16,7 @@ add_library(bitcoin_wallet STATIC EXCLUDE_FROM_ALL
   interfaces.cpp
   load.cpp
   migrate.cpp
+  pqc_usage.cpp
   receive.cpp
   rpc/addresses.cpp
   rpc/backup.cpp
@@ -35,9 +36,10 @@ add_library(bitcoin_wallet STATIC EXCLUDE_FROM_ALL
   walletutil.cpp
 )
 target_link_libraries(bitcoin_wallet
+  PUBLIC
+    bitcoin_common
   PRIVATE
     core_interface
-    bitcoin_common
     $<TARGET_NAME_IF_EXISTS:unofficial::sqlite3::sqlite3>
     $<TARGET_NAME_IF_EXISTS:SQLite::SQLite3>
     univalue

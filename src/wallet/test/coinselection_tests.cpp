@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <consensus/amount.h>
+#include <consensus/consensus.h>
 #include <policy/policy.h>
 #include <wallet/coinselection.h>
 #include <wallet/test/wallet_test_fixture.h>
@@ -148,9 +149,9 @@ BOOST_AUTO_TEST_CASE(bnb_test)
         // BnB fails to find changeless solution when overshooting by cost_of_change + 1 sat
         TestBnBFail("Overshoot upper bound", utxo_pool, /*selection_target=*/4 * CENT - default_cs_params.m_cost_of_change - 1);
 
-        TestBnBSuccess("Select max weight", utxo_pool, /*selection_target=*/4 * CENT, /*expected_input_amounts=*/{1 * CENT, 3 * CENT}, cs_params, /*custom_spending_vsize=*/P2WPKH_INPUT_VSIZE, /*max_selection_weight=*/4 * 2 * P2WPKH_INPUT_VSIZE);
+        TestBnBSuccess("Select max weight", utxo_pool, /*selection_target=*/4 * CENT, /*expected_input_amounts=*/{1 * CENT, 3 * CENT}, cs_params, /*custom_spending_vsize=*/P2WPKH_INPUT_VSIZE, /*max_selection_weight=*/WITNESS_SCALE_FACTOR * 2 * P2WPKH_INPUT_VSIZE);
 
-        TestBnBFail("Exceed max weight", utxo_pool, /*selection_target=*/4 * CENT, /*max_selection_weight=*/4 * 2 * P2WPKH_INPUT_VSIZE - 1, /*expect_max_weight_exceeded=*/true);
+        TestBnBFail("Exceed max weight", utxo_pool, /*selection_target=*/4 * CENT, /*max_selection_weight=*/WITNESS_SCALE_FACTOR * 2 * P2WPKH_INPUT_VSIZE - 1, /*expect_max_weight_exceeded=*/true);
 
         // Simple cases without BnB solution
         TestBnBFail("Smallest combination too big", utxo_pool, /*selection_target=*/0.5 * CENT);

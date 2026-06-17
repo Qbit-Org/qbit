@@ -2,11 +2,12 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_NODE_TXORPHANAGE_H
-#define BITCOIN_NODE_TXORPHANAGE_H
+#ifndef QBIT_NODE_TXORPHANAGE_H
+#define QBIT_NODE_TXORPHANAGE_H
 
 #include <consensus/validation.h>
 #include <net.h>
+#include <policy/policy.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <sync.h>
@@ -16,8 +17,9 @@
 #include <set>
 
 namespace node {
-/** Default value for TxOrphanage::m_reserved_usage_per_peer. Helps limit the total amount of memory used by the orphanage. */
-static constexpr int64_t DEFAULT_RESERVED_ORPHAN_WEIGHT_PER_PEER{404'000};
+/** Default value for TxOrphanage::m_reserved_usage_per_peer. Helps limit the total amount of memory used by the orphanage.
+ * Follows the pattern MAX_STANDARD_TX_WEIGHT + 4000. */
+static constexpr int64_t DEFAULT_RESERVED_ORPHAN_WEIGHT_PER_PEER{MAX_STANDARD_TX_WEIGHT + 4'000};
 /** Default value for TxOrphanage::m_max_global_latency_score. Helps limit the maximum latency for operations like
  * EraseForBlock and LimitOrphans. */
 static constexpr unsigned int DEFAULT_MAX_ORPHANAGE_LATENCY_SCORE{3000};
@@ -148,4 +150,4 @@ public:
 std::unique_ptr<TxOrphanage> MakeTxOrphanage() noexcept;
 std::unique_ptr<TxOrphanage> MakeTxOrphanage(TxOrphanage::Count max_global_latency_score, TxOrphanage::Usage reserved_peer_usage) noexcept;
 } // namespace node
-#endif // BITCOIN_NODE_TXORPHANAGE_H
+#endif // QBIT_NODE_TXORPHANAGE_H

@@ -8,25 +8,33 @@
 #include <test/fuzz/util.h>
 
 #include <cstdint>
+#include <array>
 #include <optional>
 #include <stdexcept>
 #include <vector>
 
-FUZZ_TARGET(protocol)
+namespace {
+[[nodiscard]] CInv ConsumeInv(FuzzedDataProvider& fuzzed_data_provider)
+{
+    static constexpr std::array<uint32_t, 7> INV_TYPES{
+        MSG_TX,
+        MSG_BLOCK,
+        MSG_WTX,
+        MSG_FILTERED_BLOCK,
+        MSG_CMPCT_BLOCK,
+        MSG_WITNESS_BLOCK,
+        MSG_WITNESS_TX,
+    };
+    return {fuzzed_data_provider.PickValueInArray(INV_TYPES), ConsumeUInt256(fuzzed_data_provider)};
+}
+} // namespace
+
+FUZZ_TARGET(protocol, .disable_leak_detection = true)
 {
     FuzzedDataProvider fuzzed_data_provider(buffer.data(), buffer.size());
-    const std::optional<CInv> inv = ConsumeDeserializable<CInv>(fuzzed_data_provider);
-    if (!inv) {
-        return;
-    }
-    try {
-        (void)inv->GetMessageType();
-    } catch (const std::out_of_range&) {
-    }
-    (void)inv->ToString();
-    const std::optional<CInv> another_inv = ConsumeDeserializable<CInv>(fuzzed_data_provider);
-    if (!another_inv) {
-        return;
-    }
-    (void)(*inv < *another_inv);
+    const CInv inv = ConsumeInv(fuzzed_data_provider);
+    (void)inv.GetMessageType();
+    (void)inv.ToString();
+    const CInv another_inv = ConsumeInv(fuzzed_data_provider);
+    (void)(inv < another_inv);
 }

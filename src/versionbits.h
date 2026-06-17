@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_VERSIONBITS_H
-#define BITCOIN_VERSIONBITS_H
+#ifndef QBIT_VERSIONBITS_H
+#define QBIT_VERSIONBITS_H
 
 #include <chain.h>
 #include <sync.h>
@@ -18,11 +18,11 @@ class CChainParams;
 /** What block version to use for new blocks (pre versionbits) */
 static const int32_t VERSIONBITS_LAST_OLD_BLOCK_VERSION = 4;
 /** What bits to set in version for versionbits blocks */
-static const int32_t VERSIONBITS_TOP_BITS = 0x20000000UL;
+static const int32_t VERSIONBITS_TOP_BITS = BLOCK_VERSION_TOP_BITS;
 /** What bitmask determines whether versionbits is in use */
-static const int32_t VERSIONBITS_TOP_MASK = 0xE0000000UL;
-/** Total bits available for versionbits */
-static const int32_t VERSIONBITS_NUM_BITS = 29;
+static const int32_t VERSIONBITS_TOP_MASK = BLOCK_VERSION_TOP_MASK;
+/** Total bits available for BIP9 deployment signalling */
+static const int32_t VERSIONBITS_NUM_BITS = BLOCK_VERSION_SIGNAL_BITS;
 
 /** Opaque type for BIP9 state. See versionbits_impl.h for details. */
 enum class ThresholdState : uint8_t;
@@ -99,4 +99,4 @@ public:
     void Clear() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex);
 };
 
-#endif // BITCOIN_VERSIONBITS_H
+#endif // QBIT_VERSIONBITS_H

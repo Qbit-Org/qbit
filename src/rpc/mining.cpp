@@ -5,14 +5,17 @@
 
 #include <bitcoin-build-config.h> // IWYU pragma: keep
 
+#include <auxpow.h>
 #include <chain.h>
 #include <chainparams.h>
 #include <chainparamsbase.h>
+#include <common/args.h>
 #include <common/system.h>
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
 #include <consensus/merkle.h>
 #include <consensus/params.h>
+#include <consensus/restricted_outputs.h>
 #include <consensus/validation.h>
 #include <core_io.h>
 #include <deploymentinfo.h>
@@ -25,6 +28,7 @@
 #include <node/warnings.h>
 #include <policy/ephemeral_policy.h>
 #include <pow.h>
+#include <primitives/pureheader.h>
 #include <rpc/blockchain.h>
 #include <rpc/mining.h>
 #include <rpc/server.h>
@@ -33,9 +37,12 @@
 #include <script/descriptor.h>
 #include <script/script.h>
 #include <script/signingprovider.h>
+#include <streams.h>
+#include <sync.h>
 #include <txmempool.h>
 #include <univalue.h>
 #include <util/signalinterrupt.h>
+#include <util/check.h>
 #include <util/strencodings.h>
 #include <util/string.h>
 #include <util/time.h>
@@ -44,7 +51,11 @@
 #include <validationinterface.h>
 
 #include <cstdint>
+#include <limits>
+#include <map>
 #include <memory>
+#include <optional>
+#include <span>
 
 using interfaces::BlockRef;
 using interfaces::BlockTemplate;
@@ -56,13 +67,16 @@ using node::RegenerateCommitments;
 using node::UpdateTime;
 using util::ToString;
 
-/**
- * Return average network hashes per second based on the last 'lookup' blocks,
- * or from the last difficulty change if 'lookup' is -1.
- * If 'height' is -1, compute the estimate from current chain tip.
- * If 'height' is a valid block height, compute the estimate at the time when a given block was found.
- */
-static UniValue GetNetworkHashPS(int lookup, int height, const CChain& active_chain) {
+namespace {
+enum class HashrateWork
+{
+    ALL,
+    PERMISSIONLESS,
+    AUXPOW,
+};
+
+double EstimateHashPS(int lookup, int height, const CChain& active_chain, const HashrateWork work_filter)
+{
     if (lookup < -1 || lookup == 0) {
         throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid nblocks. Must be a positive number or -1.");
     }
@@ -77,12 +91,15 @@ static UniValue GetNetworkHashPS(int lookup, int height, const CChain& active_ch
         pb = active_chain[height];
     }
 
-    if (pb == nullptr || !pb->nHeight)
-        return 0;
+    if (pb == nullptr || !pb->nHeight) {
+        return 0.0;
+    }
 
     // If lookup is -1, then use blocks since last difficulty change.
-    if (lookup == -1)
-        lookup = pb->nHeight % Params().GetConsensus().DifficultyAdjustmentInterval() + 1;
+    if (lookup == -1) {
+        const auto& consensus = Params().GetConsensus();
+        lookup = consensus.fPowUseASERT ? 1 : pb->nHeight % consensus.DifficultyAdjustmentInterval() + 1;
+    }
 
     // If lookup is larger than chain, then set it to chain length.
     if (lookup > pb->nHeight)
@@ -99,37 +116,87 @@ static UniValue GetNetworkHashPS(int lookup, int height, const CChain& active_ch
     }
 
     // In case there's a situation where minTime == maxTime, we don't want a divide by zero exception.
-    if (minTime == maxTime)
-        return 0;
+    if (minTime == maxTime) {
+        return 0.0;
+    }
 
-    arith_uint256 workDiff = pb->nChainWork - pb0->nChainWork;
-    int64_t timeDiff = maxTime - minTime;
+    arith_uint256 workDiff{};
+    if (work_filter == HashrateWork::ALL) {
+        workDiff = pb->nChainWork - pb0->nChainWork;
+    } else {
+        const CBlockIndex* pindex = pb;
+        for (int i = 0; i < lookup; ++i) {
+            const bool include_work{work_filter == HashrateWork::PERMISSIONLESS
+                ? pindex->IsPermissionless()
+                : pindex->SignalsAuxpow()};
+            if (include_work) {
+                workDiff += GetBlockProof(*pindex);
+            }
+            pindex = pindex->pprev;
+        }
+    }
+    const int64_t timeDiff = maxTime - minTime;
 
-    return workDiff.getdouble() / timeDiff;
+    return workDiff.getdouble() / static_cast<double>(timeDiff);
+}
+} // namespace
+
+double EstimateNetworkHashPS(int lookup, int height, const CChain& active_chain)
+{
+    return EstimateHashPS(lookup, height, active_chain, HashrateWork::ALL);
+}
+
+double EstimatePermissionlessNetworkHashPS(int lookup, int height, const CChain& active_chain)
+{
+    return EstimateHashPS(lookup, height, active_chain, HashrateWork::PERMISSIONLESS);
+}
+
+double EstimateAuxpowNetworkHashPS(int lookup, int height, const CChain& active_chain)
+{
+    return EstimateHashPS(lookup, height, active_chain, HashrateWork::AUXPOW);
 }
 
 static RPCHelpMan getnetworkhashps()
 {
     return RPCHelpMan{
         "getnetworkhashps",
-        "Returns the estimated network hashes per second based on the last n blocks.\n"
-                "Pass in [blocks] to override # of blocks, -1 specifies since last difficulty change.\n"
-                "Pass in [height] to estimate the network speed at the time when a certain block was found.\n",
+        "Returns the estimated network hashes per second (H/s) based on accepted block proof work.\n"
+                "Pass in [blocks] to override # of blocks, -1 specifies since last difficulty change (or 1 block on ASERT networks).\n"
+                "Pass in [height] to estimate the network speed at the time when a certain block was found.\n"
+                "Pass in [lane] to estimate all work, permissionless work, or AuxPoW work.\n"
+                "Lane-specific estimates filter which block work contributes to the numerator, but keep the same active-chain elapsed-time window as \"all\"; they do not use a lane-local timestamp window.\n"
+                "A lane with no blocks in the selected window returns 0.\n",
                 {
-                    {"nblocks", RPCArg::Type::NUM, RPCArg::Default{120}, "The number of previous blocks to calculate estimate from, or -1 for blocks since last difficulty change."},
+                    {"nblocks", RPCArg::Type::NUM, RPCArg::Default{120}, "The number of previous blocks to calculate estimate from, or -1 for blocks since last difficulty change (1 block on ASERT networks)."},
                     {"height", RPCArg::Type::NUM, RPCArg::Default{-1}, "To estimate at the time of the given height."},
+                    {"lane", RPCArg::Type::STR, RPCArg::Default{"all"}, "Hashrate lane to estimate: \"all\", \"permissionless\", or \"auxpow\"."},
                 },
                 RPCResult{
                     RPCResult::Type::NUM, "", "Hashes per second estimated"},
                 RPCExamples{
                     HelpExampleCli("getnetworkhashps", "")
+            + HelpExampleCli("getnetworkhashps", "120 -1 all")
+            + HelpExampleCli("getnetworkhashps", "120 -1 permissionless")
+            + HelpExampleCli("getnetworkhashps", "120 -1 auxpow")
             + HelpExampleRpc("getnetworkhashps", "")
                 },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
     ChainstateManager& chainman = EnsureAnyChainman(request.context);
     LOCK(cs_main);
-    return GetNetworkHashPS(self.Arg<int>("nblocks"), self.Arg<int>("height"), chainman.ActiveChain());
+    const int nblocks{self.Arg<int>("nblocks")};
+    const int height{self.Arg<int>("height")};
+    const std::string lane{self.Arg<std::string>("lane")};
+    if (lane == "all") {
+        return EstimateNetworkHashPS(nblocks, height, chainman.ActiveChain());
+    }
+    if (lane == "permissionless") {
+        return EstimatePermissionlessNetworkHashPS(nblocks, height, chainman.ActiveChain());
+    }
+    if (lane == "auxpow") {
+        return EstimateAuxpowNetworkHashPS(nblocks, height, chainman.ActiveChain());
+    }
+    throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid lane, expected one of: all, permissionless, auxpow");
 },
     };
 }
@@ -161,8 +228,35 @@ static bool GenerateBlock(ChainstateManager& chainman, CBlock&& block, uint64_t&
     return true;
 }
 
-static UniValue generateBlocks(ChainstateManager& chainman, Mining& miner, const CScript& coinbase_output_script, int nGenerate, uint64_t nMaxTries)
+enum class RestrictedCoinbaseOutputRule {
+    ConsensusOutput,
+    PayoutAddress,
+};
+
+static void EnsureRestrictedCoinbaseOutput(ChainstateManager& chainman, const CScript& coinbase_output_script, RestrictedCoinbaseOutputRule rule)
 {
+    const Consensus::Params& consensus = chainman.GetParams().GetConsensus();
+    if (!consensus.fRestrictedOutputMode) {
+        return;
+    }
+
+    if (rule == RestrictedCoinbaseOutputRule::PayoutAddress) {
+        if (!Consensus::IsRestrictedOutputModeP2MROutput(coinbase_output_script)) {
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Coinbase payout address must be P2MR");
+        }
+        return;
+    }
+
+    const int next_block_height{WITH_LOCK(::cs_main, return chainman.ActiveChain().Height() + 1)};
+    if (!Consensus::IsRestrictedOutputModeConsensusOutput(coinbase_output_script, consensus, next_block_height)) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Coinbase output must be P2MR or an allowed restricted-output exemption");
+    }
+}
+
+static UniValue generateBlocks(ChainstateManager& chainman, Mining& miner, const CScript& coinbase_output_script, int nGenerate, uint64_t nMaxTries, RestrictedCoinbaseOutputRule rule)
+{
+    EnsureRestrictedCoinbaseOutput(chainman, coinbase_output_script, rule);
+
     UniValue blockHashes(UniValue::VARR);
     while (nGenerate > 0 && !chainman.m_interrupt) {
         std::unique_ptr<BlockTemplate> block_template(miner.createNewBlock({ .coinbase_output_script = coinbase_output_script }));
@@ -223,7 +317,7 @@ static RPCHelpMan generatetodescriptor()
         "Mine to a specified descriptor and return the block hashes.",
         {
             {"num_blocks", RPCArg::Type::NUM, RPCArg::Optional::NO, "How many blocks are generated."},
-            {"descriptor", RPCArg::Type::STR, RPCArg::Optional::NO, "The descriptor to send the newly generated bitcoin to."},
+            {"descriptor", RPCArg::Type::STR, RPCArg::Optional::NO, "The descriptor to send the newly generated QBT to."},
             {"maxtries", RPCArg::Type::NUM, RPCArg::Default{DEFAULT_MAX_TRIES}, "How many iterations to try."},
         },
         RPCResult{
@@ -249,7 +343,7 @@ static RPCHelpMan generatetodescriptor()
     Mining& miner = EnsureMining(node);
     ChainstateManager& chainman = EnsureChainman(node);
 
-    return generateBlocks(chainman, miner, coinbase_output_script, num_blocks, max_tries);
+    return generateBlocks(chainman, miner, coinbase_output_script, num_blocks, max_tries, RestrictedCoinbaseOutputRule::ConsensusOutput);
 },
     };
 }
@@ -267,7 +361,7 @@ static RPCHelpMan generatetoaddress()
         "Mine to a specified address and return the block hashes.",
          {
              {"nblocks", RPCArg::Type::NUM, RPCArg::Optional::NO, "How many blocks are generated."},
-             {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The address to send the newly generated bitcoin to."},
+             {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The address to send the newly generated QBT to."},
              {"maxtries", RPCArg::Type::NUM, RPCArg::Default{DEFAULT_MAX_TRIES}, "How many iterations to try."},
          },
          RPCResult{
@@ -278,7 +372,7 @@ static RPCHelpMan generatetoaddress()
          RPCExamples{
             "\nGenerate 11 blocks to myaddress\n"
             + HelpExampleCli("generatetoaddress", "11 \"myaddress\"")
-            + "If you are using the " CLIENT_NAME " wallet, you can get a new address to send the newly generated bitcoin to with:\n"
+            + "If you are using the " CLIENT_NAME " wallet, you can get a new address to send the newly generated QBT to with:\n"
             + HelpExampleCli("getnewaddress", "")
                 },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
@@ -297,7 +391,7 @@ static RPCHelpMan generatetoaddress()
 
     CScript coinbase_output_script = GetScriptForDestination(destination);
 
-    return generateBlocks(chainman, miner, coinbase_output_script, num_blocks, max_tries);
+    return generateBlocks(chainman, miner, coinbase_output_script, num_blocks, max_tries, RestrictedCoinbaseOutputRule::PayoutAddress);
 },
     };
 }
@@ -307,7 +401,7 @@ static RPCHelpMan generateblock()
     return RPCHelpMan{"generateblock",
         "Mine a set of ordered transactions to a specified address or descriptor and return the block hash.",
         {
-            {"output", RPCArg::Type::STR, RPCArg::Optional::NO, "The address or descriptor to send the newly generated bitcoin to."},
+            {"output", RPCArg::Type::STR, RPCArg::Optional::NO, "The address or descriptor to send the newly generated QBT to."},
             {"transactions", RPCArg::Type::ARR, RPCArg::Optional::NO, "An array of hex strings which are either txids or raw transactions.\n"
                 "Txids must reference transactions currently in the mempool.\n"
                 "All transactions must be valid and in valid order, otherwise the block will be rejected.",
@@ -332,6 +426,7 @@ static RPCHelpMan generateblock()
 {
     const auto address_or_descriptor = request.params[0].get_str();
     CScript coinbase_output_script;
+    RestrictedCoinbaseOutputRule coinbase_output_rule{RestrictedCoinbaseOutputRule::ConsensusOutput};
     std::string error;
 
     if (!getScriptFromDescriptor(address_or_descriptor, coinbase_output_script, error)) {
@@ -341,6 +436,7 @@ static RPCHelpMan generateblock()
         }
 
         coinbase_output_script = GetScriptForDestination(destination);
+        coinbase_output_rule = RestrictedCoinbaseOutputRule::PayoutAddress;
     }
 
     NodeContext& node = EnsureAnyNodeContext(request.context);
@@ -373,6 +469,7 @@ static RPCHelpMan generateblock()
     CBlock block;
 
     ChainstateManager& chainman = EnsureChainman(node);
+    EnsureRestrictedCoinbaseOutput(chainman, coinbase_output_script, coinbase_output_rule);
     {
         LOCK(chainman.GetMutex());
         {
@@ -427,17 +524,17 @@ static RPCHelpMan getmininginfo()
                         {RPCResult::Type::STR_HEX, "bits", "The current nBits, compact representation of the block difficulty target"},
                         {RPCResult::Type::NUM, "difficulty", "The current difficulty"},
                         {RPCResult::Type::STR_HEX, "target", "The current target"},
-                        {RPCResult::Type::NUM, "networkhashps", "The network hashes per second"},
+                        {RPCResult::Type::NUM, "networkhashps", "The total active-chain network hashes per second (H/s), equivalent to getnetworkhashps with lane=\"all\""},
                         {RPCResult::Type::NUM, "pooledtx", "The size of the mempool"},
                         {RPCResult::Type::STR_AMOUNT, "blockmintxfee", "Minimum feerate of packages selected for block inclusion in " + CURRENCY_UNIT + "/kvB"},
                         {RPCResult::Type::STR, "chain", "current network name (" LIST_CHAIN_NAMES ")"},
                         {RPCResult::Type::STR_HEX, "signet_challenge", /*optional=*/true, "The block challenge (aka. block script), in hexadecimal (only present if the current network is a signet)"},
-                        {RPCResult::Type::OBJ, "next", "The next block",
+                        {RPCResult::Type::OBJ, "next", "The next permissionless/native Cadence block candidate",
                         {
-                            {RPCResult::Type::NUM, "height", "The next height"},
-                            {RPCResult::Type::STR_HEX, "bits", "The next target nBits"},
-                            {RPCResult::Type::NUM, "difficulty", "The next difficulty"},
-                            {RPCResult::Type::STR_HEX, "target", "The next target"}
+                            {RPCResult::Type::NUM, "height", "The next permissionless/native candidate height"},
+                            {RPCResult::Type::STR_HEX, "bits", "The next permissionless/native candidate target nBits"},
+                            {RPCResult::Type::NUM, "difficulty", "The next permissionless/native candidate difficulty"},
+                            {RPCResult::Type::STR_HEX, "target", "The next permissionless/native candidate target"}
                         }},
                         (IsDeprecatedRPCEnabled("warnings") ?
                             RPCResult{RPCResult::Type::STR, "warnings", "any network and blockchain warnings (DEPRECATED)"} :
@@ -497,7 +594,7 @@ static RPCHelpMan getmininginfo()
 }
 
 
-// NOTE: Unlike wallet RPC (which use BTC values), mining RPCs follow GBT (BIP 22) in using satoshi amounts
+// NOTE: Unlike wallet RPC (which use QBT values), mining RPCs follow GBT (BIP 22) in using satoshi amounts
 static RPCHelpMan prioritisetransaction()
 {
     return RPCHelpMan{"prioritisetransaction",
@@ -601,6 +698,20 @@ static UniValue BIP22ValidationResult(const BlockValidationState& state)
     return "valid?";
 }
 
+static void EnsureMiningPreconditions(NodeContext& node, Mining& miner)
+{
+    if (miner.isTestChain()) return;
+
+    const CConnman& connman = EnsureConnman(node);
+    if (connman.GetNodeCount(ConnectionDirection::Both) == 0) {
+        throw JSONRPCError(RPC_CLIENT_NOT_CONNECTED, CLIENT_NAME " is not connected!");
+    }
+
+    if (miner.isInitialBlockDownload()) {
+        throw JSONRPCError(RPC_CLIENT_IN_INITIAL_DOWNLOAD, CLIENT_NAME " is in initial sync and waiting for blocks...");
+    }
+}
+
 // Prefix rule name with ! if not optional, see BIP9
 static std::string gbt_rule_value(const std::string& name, bool gbt_optional_rule)
 {
@@ -659,6 +770,7 @@ static RPCHelpMan getblocktemplate()
                     {RPCResult::Type::STR, "value", "A supported feature, for example 'proposal'"},
                 }},
                 {RPCResult::Type::NUM, "vbrequired", "bit mask of versionbits the server requires set in submissions"},
+                {RPCResult::Type::STR_HEX, "versionrollingmask", "qbit-recommended BIP310 version-rolling mask for permissionless Stratum work, or 00000000 when version rolling is disabled for this template"},
                 {RPCResult::Type::STR, "previousblockhash", "The hash of current highest block"},
                 {RPCResult::Type::ARR, "transactions", "contents of non-coinbase transactions that should be included in the next block",
                 {
@@ -762,16 +874,7 @@ static RPCHelpMan getblocktemplate()
     if (strMode != "template")
         throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid mode");
 
-    if (!miner.isTestChain()) {
-        const CConnman& connman = EnsureConnman(node);
-        if (connman.GetNodeCount(ConnectionDirection::Both) == 0) {
-            throw JSONRPCError(RPC_CLIENT_NOT_CONNECTED, CLIENT_NAME " is not connected!");
-        }
-
-        if (miner.isInitialBlockDownload()) {
-            throw JSONRPCError(RPC_CLIENT_IN_INITIAL_DOWNLOAD, CLIENT_NAME " is in initial sync and waiting for blocks...");
-        }
-    }
+    EnsureMiningPreconditions(node, miner);
 
     static unsigned int nTransactionsUpdatedLast;
     const CTxMemPool& mempool = EnsureMemPool(node);
@@ -980,10 +1083,22 @@ static RPCHelpMan getblocktemplate()
         }
     }
 
+    // Keep explicit -blockversion regtest overrides intact (they may not use the
+    // BIP9 top-bit shape); only canonicalize versions already in BIP9 layout.
+    if (HasBIP9TopBitsShape(block.nVersion)) {
+        const bool auxpow_version{block.SignalsAuxpow()};
+        CHECK_NONFATAL(consensusParams.nAuxpowChainId >= 0);
+        CHECK_NONFATAL(consensusParams.nAuxpowChainId <= std::numeric_limits<uint16_t>::max());
+        const uint16_t chain_id{auxpow_version ? static_cast<uint16_t>(consensusParams.nAuxpowChainId) : uint16_t{0}};
+        block.nVersion = MakeVersion(chain_id, auxpow_version, block.GetVersionBits());
+    }
+    const uint32_t version_rolling_mask{GetPermissionlessVersionRollingMask(block.nVersion)};
+
     result.pushKV("version", block.nVersion);
     result.pushKV("rules", std::move(aRules));
     result.pushKV("vbavailable", std::move(vbavailable));
     result.pushKV("vbrequired", int(0));
+    result.pushKV("versionrollingmask", strprintf("%08x", version_rolling_mask));
 
     result.pushKV("previousblockhash", block.hashPrevBlock.GetHex());
     result.pushKV("transactions", std::move(transactions));
@@ -991,7 +1106,7 @@ static RPCHelpMan getblocktemplate()
     result.pushKV("coinbasevalue", (int64_t)block.vtx[0]->vout[0].nValue);
     result.pushKV("longpollid", tip.GetHex() + ToString(nTransactionsUpdatedLast));
     result.pushKV("target", hashTarget.GetHex());
-    result.pushKV("mintime", GetMinimumTime(pindexPrev, consensusParams.DifficultyAdjustmentInterval()));
+    result.pushKV("mintime", GetMinimumTime(pindexPrev, consensusParams));
     result.pushKV("mutable", std::move(aMutable));
     result.pushKV("noncerange", "00000000ffffffff");
     int64_t nSigOpLimit = MAX_BLOCK_SIGOPS_COST;
@@ -1042,6 +1157,271 @@ protected:
     }
 };
 
+namespace {
+struct CachedAuxBlock {
+    CBlock block;
+    NodeSeconds created_at;
+    uint64_t sequence;
+};
+
+GlobalMutex g_aux_block_cache_mutex;
+std::map<uint256, CachedAuxBlock> g_aux_block_cache GUARDED_BY(g_aux_block_cache_mutex);
+uint64_t g_aux_block_cache_sequence GUARDED_BY(g_aux_block_cache_mutex){0};
+
+std::chrono::minutes GetAuxBlockTemplateExpiry(const ArgsManager& args)
+{
+    return std::chrono::minutes{args.GetIntArg("-auxpowtemplateexpiry", DEFAULT_AUXPOW_TEMPLATE_EXPIRY_MINUTES)};
+}
+
+int64_t GetAuxBlockTemplateCacheLimit(const ArgsManager& args)
+{
+    return args.GetIntArg("-auxpowtemplatecachelimit", DEFAULT_AUXPOW_TEMPLATE_CACHE_LIMIT);
+}
+
+bool IsAuxBlockTemplateExpired(const CachedAuxBlock& cached_block, const NodeSeconds now, const std::chrono::minutes expiry)
+{
+    return expiry > 0min && now - cached_block.created_at > expiry;
+}
+
+void PruneAuxBlockCacheLocked(const uint256& active_tip_hash, const NodeSeconds now, const std::chrono::minutes expiry) EXCLUSIVE_LOCKS_REQUIRED(g_aux_block_cache_mutex)
+{
+    for (auto it = g_aux_block_cache.begin(); it != g_aux_block_cache.end();) {
+        if (it->second.block.hashPrevBlock != active_tip_hash || IsAuxBlockTemplateExpired(it->second, now, expiry)) {
+            it = g_aux_block_cache.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void TrimAuxBlockCacheToLimitLocked(const int64_t cache_limit) EXCLUSIVE_LOCKS_REQUIRED(g_aux_block_cache_mutex)
+{
+    if (cache_limit <= 0) {
+        return;
+    }
+
+    const auto limit{static_cast<size_t>(cache_limit)};
+    while (g_aux_block_cache.size() > limit) {
+        auto oldest = g_aux_block_cache.begin();
+        for (auto it = g_aux_block_cache.begin(); it != g_aux_block_cache.end(); ++it) {
+            if (it->second.sequence < oldest->second.sequence) {
+                oldest = it;
+            }
+        }
+        g_aux_block_cache.erase(oldest);
+    }
+}
+
+void PruneAuxBlockCache(const uint256& active_tip_hash, const std::chrono::minutes expiry) LOCKS_EXCLUDED(g_aux_block_cache_mutex)
+{
+    LOCK(g_aux_block_cache_mutex);
+    PruneAuxBlockCacheLocked(active_tip_hash, Now<NodeSeconds>(), expiry);
+}
+
+void StoreCachedAuxBlock(const uint256& aux_hash, const CBlock& block, const int64_t cache_limit) LOCKS_EXCLUDED(g_aux_block_cache_mutex)
+{
+    LOCK(g_aux_block_cache_mutex);
+    g_aux_block_cache[aux_hash] = CachedAuxBlock{block, Now<NodeSeconds>(), ++g_aux_block_cache_sequence};
+    TrimAuxBlockCacheToLimitLocked(cache_limit);
+}
+
+std::optional<CBlock> GetCachedAuxBlock(const uint256& aux_hash) LOCKS_EXCLUDED(g_aux_block_cache_mutex)
+{
+    LOCK(g_aux_block_cache_mutex);
+    const auto it = g_aux_block_cache.find(aux_hash);
+    if (it == g_aux_block_cache.end()) {
+        return std::nullopt;
+    }
+    return it->second.block;
+}
+
+void RemoveCachedAuxBlock(const uint256& aux_hash) LOCKS_EXCLUDED(g_aux_block_cache_mutex)
+{
+    LOCK(g_aux_block_cache_mutex);
+    g_aux_block_cache.erase(aux_hash);
+}
+
+CAuxPow DecodeHexAuxPow(const std::string& hex_auxpow)
+{
+    if (!IsHex(hex_auxpow)) {
+        throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "AuxPow decode failed");
+    }
+
+    const std::vector<unsigned char> auxpow_data{ParseHex(hex_auxpow)};
+    DataStream stream{std::span<const unsigned char>{auxpow_data.data(), auxpow_data.size()}};
+    try {
+        CAuxPow auxpow{deserialize, stream};
+        if (!stream.empty()) {
+            throw std::ios_base::failure("AuxPow decode failed");
+        }
+        return auxpow;
+    } catch (const std::exception&) {
+        throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "AuxPow decode failed");
+    }
+}
+
+UniValue ProcessSubmittedBlock(ChainstateManager& chainman, const std::shared_ptr<CBlock>& blockptr)
+{
+    bool new_block;
+    auto sc = std::make_shared<submitblock_StateCatcher>(blockptr->GetHash());
+    CHECK_NONFATAL(chainman.m_options.signals)->RegisterSharedValidationInterface(sc);
+    const bool accepted = chainman.ProcessNewBlock(blockptr, /*force_processing=*/true, /*min_pow_checked=*/true, /*new_block=*/&new_block);
+    CHECK_NONFATAL(chainman.m_options.signals)->UnregisterSharedValidationInterface(sc);
+    if (!new_block && accepted) {
+        return "duplicate";
+    }
+    if (!sc->found) {
+        return "inconclusive";
+    }
+    return BIP22ValidationResult(sc->state);
+}
+} // namespace
+
+static RPCHelpMan createauxblock()
+{
+    return RPCHelpMan{
+        "createauxblock",
+        "Create a merged-mining candidate block paying the coinbase reward to the given P2MR address.\n"
+        "The candidate remains cached for submitauxblock while its previous block stays on the active tip, its age does not exceed -auxpowtemplateexpiry, and it has not been evicted by -auxpowtemplatecachelimit.\n",
+        {
+            {"payout_address", RPCArg::Type::STR, RPCArg::Optional::NO, "The P2MR qbit address to receive the block reward."},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_HEX, "hash", "The candidate aux block hash."},
+                {RPCResult::Type::NUM, "chainid", "The configured AuxPoW chain ID."},
+                {RPCResult::Type::STR_HEX, "previousblockhash", "The previous block hash used by the candidate."},
+                {RPCResult::Type::NUM, "coinbasevalue", "The total coinbase value in satoshis, including fees."},
+                {RPCResult::Type::STR_HEX, "bits", "The compact target for the candidate block."},
+                {RPCResult::Type::NUM, "height", "The candidate block height."},
+                {RPCResult::Type::STR_HEX, "target", "The expanded target for the candidate block."},
+            },
+        },
+        RPCExamples{
+            HelpExampleCli("createauxblock", "\"qcrt1qexampleaddresshere\"") +
+            HelpExampleRpc("createauxblock", "\"qcrt1qexampleaddresshere\"")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    CTxDestination destination = DecodeDestination(self.Arg<std::string>("payout_address"));
+    if (!IsValidDestination(destination)) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Error: Invalid address");
+    }
+
+    NodeContext& node = EnsureAnyNodeContext(request.context);
+    Mining& miner = EnsureMining(node);
+    ChainstateManager& chainman = EnsureChainman(node);
+    const ArgsManager& args = EnsureArgsman(node);
+    EnsureMiningPreconditions(node, miner);
+
+    const CScript coinbase_output_script{GetScriptForDestination(destination)};
+    EnsureRestrictedCoinbaseOutput(chainman, coinbase_output_script, RestrictedCoinbaseOutputRule::PayoutAddress);
+
+    std::unique_ptr<BlockTemplate> block_template(miner.createNewBlock({.coinbase_output_script = coinbase_output_script}));
+    CHECK_NONFATAL(block_template);
+
+    CBlock block{block_template->getBlock()};
+    block.hashMerkleRoot = BlockMerkleRoot(block);
+    const Consensus::Params& consensusParams = chainman.GetParams().GetConsensus();
+
+    const CBlockIndex* pindexPrev{nullptr};
+    uint256 active_tip_hash;
+    int height{0};
+    {
+        LOCK(cs_main);
+        pindexPrev = chainman.m_blockman.LookupBlockIndex(block.hashPrevBlock);
+        CHECK_NONFATAL(pindexPrev);
+        const CBlockIndex* active_tip = chainman.ActiveChain().Tip();
+        CHECK_NONFATAL(active_tip);
+        active_tip_hash = active_tip->GetBlockHash();
+        height = pindexPrev->nHeight + 1;
+    }
+
+    if (!consensusParams.CadenceActiveAtHeight(height)) {
+        throw JSONRPCError(RPC_MISC_ERROR, strprintf("createauxblock is not available because cadence is inactive at height %d", height));
+    }
+
+    CHECK_NONFATAL(consensusParams.nAuxpowChainId >= 0);
+    CHECK_NONFATAL(consensusParams.nAuxpowChainId <= std::numeric_limits<uint16_t>::max());
+    block.nVersion = MakeVersion(static_cast<uint16_t>(consensusParams.nAuxpowChainId), /*auxpow=*/true, block.GetVersionBits());
+    UpdateTime(&block, consensusParams, pindexPrev);
+    block.nBits = GetNextWorkRequired(pindexPrev, &block, consensusParams);
+    block.nNonce = 0;
+
+    const uint256 aux_hash{block.GetHash()};
+    const arith_uint256 hash_target = arith_uint256().SetCompact(block.nBits);
+
+    PruneAuxBlockCache(active_tip_hash, GetAuxBlockTemplateExpiry(args));
+    StoreCachedAuxBlock(aux_hash, block, GetAuxBlockTemplateCacheLimit(args));
+
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("hash", aux_hash.GetHex());
+    result.pushKV("chainid", consensusParams.nAuxpowChainId);
+    result.pushKV("previousblockhash", block.hashPrevBlock.GetHex());
+    result.pushKV("coinbasevalue", static_cast<int64_t>(block.vtx.at(0)->GetValueOut()));
+    result.pushKV("bits", strprintf("%08x", block.nBits));
+    result.pushKV("height", height);
+    result.pushKV("target", hash_target.GetHex());
+    return result;
+},
+    };
+}
+
+static RPCHelpMan submitauxblock()
+{
+    return RPCHelpMan{
+        "submitauxblock",
+        "Submit an AuxPoW payload for a cached merged-mining candidate block.\n",
+        {
+            {"hash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The aux block hash returned by createauxblock."},
+            {"auxpow_hex", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The serialized AuxPoW payload in hexadecimal."},
+        },
+        {
+            RPCResult{"If the block was accepted", RPCResult::Type::NONE, "", ""},
+            RPCResult{"Otherwise", RPCResult::Type::STR, "", "According to BIP22, or stale-prevblk if the cached candidate's previous block left the active tip, the candidate exceeded -auxpowtemplateexpiry, or the candidate was evicted by -auxpowtemplatecachelimit"},
+        },
+        RPCExamples{
+            HelpExampleCli("submitauxblock", "\"hash\" \"auxpowhex\"") +
+            HelpExampleRpc("submitauxblock", "\"hash\", \"auxpowhex\"")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    const uint256 aux_hash{ParseHashV(request.params[0], "hash")};
+    CAuxPow auxpow{DecodeHexAuxPow(self.Arg<std::string>("auxpow_hex"))};
+
+    NodeContext& node = EnsureAnyNodeContext(request.context);
+    ChainstateManager& chainman = EnsureChainman(node);
+    const ArgsManager& args = EnsureArgsman(node);
+
+    uint256 active_tip_hash;
+    {
+        LOCK(cs_main);
+        const CBlockIndex* active_tip = chainman.ActiveChain().Tip();
+        CHECK_NONFATAL(active_tip);
+        active_tip_hash = active_tip->GetBlockHash();
+    }
+
+    PruneAuxBlockCache(active_tip_hash, GetAuxBlockTemplateExpiry(args));
+
+    std::optional<CBlock> cached_block{GetCachedAuxBlock(aux_hash)};
+
+    if (!cached_block) {
+        return "stale-prevblk";
+    }
+
+    auto blockptr = std::make_shared<CBlock>(std::move(*cached_block));
+    blockptr->auxpow = std::make_shared<CAuxPow>(std::move(auxpow));
+
+    UniValue result = ProcessSubmittedBlock(chainman, blockptr);
+    if (result.isNull()) {
+        RemoveCachedAuxBlock(aux_hash);
+    }
+    return result;
+},
+    };
+}
+
 static RPCHelpMan submitblock()
 {
     // We allow 2 arguments for compliance with BIP22. Argument 2 is ignored.
@@ -1078,18 +1458,7 @@ static RPCHelpMan submitblock()
         }
     }
 
-    bool new_block;
-    auto sc = std::make_shared<submitblock_StateCatcher>(block.GetHash());
-    CHECK_NONFATAL(chainman.m_options.signals)->RegisterSharedValidationInterface(sc);
-    bool accepted = chainman.ProcessNewBlock(blockptr, /*force_processing=*/true, /*min_pow_checked=*/true, /*new_block=*/&new_block);
-    CHECK_NONFATAL(chainman.m_options.signals)->UnregisterSharedValidationInterface(sc);
-    if (!new_block && accepted) {
-        return "duplicate";
-    }
-    if (!sc->found) {
-        return "inconclusive";
-    }
-    return BIP22ValidationResult(sc->state);
+    return ProcessSubmittedBlock(chainman, blockptr);
 },
     };
 }
@@ -1142,6 +1511,8 @@ void RegisterMiningRPCCommands(CRPCTable& t)
         {"mining", &prioritisetransaction},
         {"mining", &getprioritisedtransactions},
         {"mining", &getblocktemplate},
+        {"mining", &createauxblock},
+        {"mining", &submitauxblock},
         {"mining", &submitblock},
         {"mining", &submitheader},
 

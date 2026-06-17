@@ -2,9 +2,10 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_KERNEL_BLOCKMANAGER_OPTS_H
-#define BITCOIN_KERNEL_BLOCKMANAGER_OPTS_H
+#ifndef QBIT_KERNEL_BLOCKMANAGER_OPTS_H
+#define QBIT_KERNEL_BLOCKMANAGER_OPTS_H
 
+#include <consensus/consensus.h>
 #include <dbwrapper.h>
 #include <kernel/notifications_interface.h>
 #include <util/fs.h>
@@ -26,6 +27,9 @@ struct BlockManagerOpts {
     bool use_xor{DEFAULT_XOR_BLOCKSDIR};
     uint64_t prune_target{0};
     bool fast_prune{false};
+    bool prune_witnesses{false};
+    bool witness_pruning_enabled{true};
+    int witness_prune_depth{COINBASE_MATURITY};
     const fs::path blocks_dir;
     Notifications& notifications;
     DBParams block_tree_db_params;
@@ -33,4 +37,4 @@ struct BlockManagerOpts {
 
 } // namespace kernel
 
-#endif // BITCOIN_KERNEL_BLOCKMANAGER_OPTS_H
+#endif // QBIT_KERNEL_BLOCKMANAGER_OPTS_H

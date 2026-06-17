@@ -1,0 +1,234 @@
+{
+  "schema_version": 1,
+  "targets": [
+    {
+      "target_id": "lane-a-libbitcoinpqc",
+      "binary": "cargo-fuzz",
+      "harnesses": [
+        "keypair_generation",
+        "sign_verify",
+        "huge_message_api",
+        "concurrent_sign_verify",
+        "key_parsing",
+        "signature_parsing",
+        "verify_invalid",
+        "malformed_inputs",
+        "message_to_indices",
+        "message_to_indices_direct",
+        "wotsc_direct"
+      ],
+      "code_paths": [
+        "src/libbitcoinpqc"
+      ],
+      "invocation_filters": [],
+      "mapping_status": "external_upstream",
+      "smoke_check": false,
+      "upstream": {
+        "repo": "libbitcoinpqc-qbit",
+        "ref": "8ec06cc452c30ab12de00b704144e6139c1e9b3a",
+        "curated_subtree_ref": "8da5e95c83c3f12c9d178fd8e7576b871dd0f2b2",
+        "fuzz_manifest": "fuzz/Cargo.toml",
+        "runner": "fuzz/run_all_fuzzers.sh",
+        "commands": [
+          "cargo +nightly fuzz run <harness> -- -runs=10000",
+          "./fuzz/run_all_fuzzers.sh -runs=10000",
+          "./fuzz/check_fuzz_inventory.sh"
+        ]
+      },
+      "notes": "The qbit curated subtree prunes cargo-fuzz tooling; run these concrete harnesses from the upstream libbitcoinpqc-qbit checkout at the recorded upstream ref."
+    },
+    {
+      "target_id": "lane-a-pqc-wrapper",
+      "binary": "fuzz",
+      "harnesses": [
+        "pqc"
+      ],
+      "code_paths": [
+        "src/test/fuzz/pqc.cpp"
+      ],
+      "invocation_filters": [],
+      "mapping_status": "direct",
+      "smoke_check": true,
+      "notes": "Exercises the qbit PQC wrapper keygen/sign/verify surface."
+    },
+    {
+      "target_id": "lane-a-op-checksigpqc",
+      "binary": "fuzz",
+      "harnesses": [
+        "p2mr_script"
+      ],
+      "code_paths": [
+        "src/test/fuzz/p2mr_script.cpp",
+        "src/script/interpreter.cpp",
+        "src/script/sign.cpp"
+      ],
+      "invocation_filters": [],
+      "mapping_status": "direct",
+      "smoke_check": true,
+      "notes": "Dedicated witness-v2/P2MR harness executes OP_CHECKSIGPQC signing and verification."
+    },
+    {
+      "target_id": "lane-a-p2mr-dispatch",
+      "binary": "fuzz",
+      "harnesses": [
+        "p2mr_script"
+      ],
+      "code_paths": [
+        "src/test/fuzz/p2mr_script.cpp",
+        "src/script/interpreter.cpp"
+      ],
+      "invocation_filters": [],
+      "mapping_status": "direct",
+      "smoke_check": true,
+      "notes": "Dedicated witness-v2/P2MR harness covers outer witness dispatch, control blocks, and script-path execution."
+    },
+    {
+      "target_id": "lane-a-wallet-descriptor",
+      "binary": "fuzz",
+      "harnesses": [
+        "descriptor_parse",
+        "mocked_descriptor_parse",
+        "scriptpubkeyman",
+        "wallet_create_transaction"
+      ],
+      "smoke_harnesses": [
+        "descriptor_parse",
+        "mocked_descriptor_parse",
+        {
+          "name": "scriptpubkeyman",
+          "required_features": [
+            "wallet"
+          ]
+        },
+        {
+          "name": "wallet_create_transaction",
+          "required_features": [
+            "wallet"
+          ]
+        }
+      ],
+      "code_paths": [
+        "src/test/fuzz/descriptor_parse.cpp",
+        "src/wallet/test/fuzz/scriptpubkeyman.cpp",
+        "src/wallet/test/fuzz/spend.cpp"
+      ],
+      "invocation_filters": [],
+      "mapping_status": "direct",
+      "smoke_check": true,
+      "notes": "Descriptor parsing, wallet descriptor materialization, and descriptor-backed wallet spends jointly back the frozen target."
+    },
+    {
+      "target_id": "lane-b-asert",
+      "binary": "fuzz",
+      "harnesses": [
+        "asert_math",
+        "asert_chain_transition",
+        "asert_edge_cases"
+      ],
+      "code_paths": [
+        "src/test/fuzz/asert.cpp"
+      ],
+      "invocation_filters": [],
+      "mapping_status": "direct",
+      "smoke_check": true,
+      "notes": "ASERT math, transition, and edge-case coverage."
+    },
+    {
+      "target_id": "lane-b-auxpow",
+      "binary": "fuzz",
+      "harnesses": [
+        "auxpow"
+      ],
+      "code_paths": [
+        "src/test/fuzz/auxpow.cpp"
+      ],
+      "invocation_filters": [],
+      "mapping_status": "direct",
+      "smoke_check": true,
+      "notes": "AuxPoW serialization and validation surface."
+    },
+    {
+      "target_id": "lane-b-pow-validation",
+      "binary": "fuzz",
+      "harnesses": [
+        "pow",
+        "pow_transition"
+      ],
+      "code_paths": [
+        "src/test/fuzz/pow.cpp"
+      ],
+      "invocation_filters": [],
+      "mapping_status": "direct",
+      "smoke_check": true,
+      "notes": "Proof-of-work and transition validation coverage."
+    },
+    {
+      "target_id": "lane-c-pruning-serving",
+      "binary": "fuzz",
+      "harnesses": [
+        "load_external_block_file",
+        "rpc"
+      ],
+      "code_paths": [
+        "src/test/fuzz/load_external_block_file.cpp",
+        "src/test/fuzz/rpc.cpp"
+      ],
+      "invocation_filters": [
+        "rpc:getblockchaininfo",
+        "rpc:getblockfrompeer",
+        "rpc:pruneblockchain"
+      ],
+      "mapping_status": "direct",
+      "smoke_check": true,
+      "notes": "load_external_block_file covers pruning import state; rpc is narrowed to pruning and history-serving RPCs."
+    },
+    {
+      "target_id": "lane-c-relay-protocol",
+      "binary": "fuzz",
+      "harnesses": [
+        "process_message",
+        "protocol",
+        "p2p_handshake"
+      ],
+      "code_paths": [
+        "src/test/fuzz/process_message.cpp",
+        "src/test/fuzz/protocol.cpp",
+        "src/test/fuzz/p2p_handshake.cpp"
+      ],
+      "invocation_filters": [],
+      "mapping_status": "direct",
+      "smoke_check": true,
+      "notes": "Core relay protocol message handling and handshake coverage."
+    },
+    {
+      "target_id": "lane-c-photon-transport",
+      "binary": "photon_fuzz_protocol",
+      "harnesses": [
+        "photon_fuzz_protocol"
+      ],
+      "code_paths": [
+        "contrib/photon/test/fuzz/fibre_protocol.cpp"
+      ],
+      "invocation_filters": [],
+      "mapping_status": "direct",
+      "smoke_check": false,
+      "notes": "Standalone PHOTON transport fuzz executable."
+    },
+    {
+      "target_id": "lane-c-convergence",
+      "binary": "fuzz",
+      "harnesses": [
+        "headers_sync_state",
+        "p2p_headers_presync"
+      ],
+      "code_paths": [
+        "src/test/fuzz/headerssync.cpp",
+        "src/test/fuzz/p2p_headers_presync.cpp"
+      ],
+      "invocation_filters": [],
+      "mapping_status": "direct",
+      "smoke_check": true,
+      "notes": "Headers convergence and presync state coverage."
+    }
+  ]
+}

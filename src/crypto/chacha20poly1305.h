@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_CRYPTO_CHACHA20POLY1305_H
-#define BITCOIN_CRYPTO_CHACHA20POLY1305_H
+#ifndef QBIT_CRYPTO_CHACHA20POLY1305_H
+#define QBIT_CRYPTO_CHACHA20POLY1305_H
 
 #include <cstddef>
 #include <cstdint>
@@ -145,4 +145,4 @@ public:
     bool Decrypt(std::span<const std::byte> cipher, std::span<const std::byte> aad, std::span<std::byte> plain1, std::span<std::byte> plain2) noexcept;
 };
 
-#endif // BITCOIN_CRYPTO_CHACHA20POLY1305_H
+#endif // QBIT_CRYPTO_CHACHA20POLY1305_H

@@ -17,6 +17,8 @@
 
 #include <univalue.h>
 
+#include <algorithm>
+
 using namespace util::hex_literals;
 
 BOOST_FIXTURE_TEST_SUITE(script_standard_tests, BasicTestingSetup)
@@ -296,12 +298,46 @@ BOOST_AUTO_TEST_CASE(script_standard_ExtractDestination)
     BOOST_CHECK(ExtractDestination(s, address));
     WitnessUnknown unk_v1{1, ToByteVector(pubkey)};
     BOOST_CHECK(std::get<WitnessUnknown>(address) == unk_v1);
+
+    // TxoutType::WITNESS_V2_P2MR
     s.clear();
-    // -> segwit versions 2+ are not specified yet
     s << OP_2 << ToByteVector(xpk);
     BOOST_CHECK(ExtractDestination(s, address));
-    WitnessUnknown unk_v2{2, ToByteVector(xpk)};
-    BOOST_CHECK(std::get<WitnessUnknown>(address) == unk_v2);
+    WitnessV2P2MR p2mr;
+    std::copy(xpk.begin(), xpk.end(), p2mr.begin());
+    BOOST_CHECK(std::get<WitnessV2P2MR>(address) == p2mr);
+
+    // TxoutType::WITNESS_UNKNOWN (future witness version)
+    s.clear();
+    s << OP_3 << ToByteVector(xpk);
+    BOOST_CHECK(ExtractDestination(s, address));
+    WitnessUnknown unk_v3{3, ToByteVector(xpk)};
+    BOOST_CHECK(std::get<WitnessUnknown>(address) == unk_v3);
+}
+
+BOOST_AUTO_TEST_CASE(script_standard_reserved_witness_namespace_uses_generic_unknown_handling)
+{
+    CKey key = GenerateRandomKey();
+    const XOnlyPubKey xpk{key.GetPubKey()};
+    const std::vector<unsigned char> program = ToByteVector(xpk);
+
+    for (int witness_version = 3; witness_version <= 16; ++witness_version) {
+        CScript s;
+        std::vector<std::vector<unsigned char>> solutions;
+        CTxDestination address;
+
+        s << witness_version << program;
+
+        BOOST_CHECK_EQUAL(Solver(s, solutions), TxoutType::WITNESS_UNKNOWN);
+        BOOST_REQUIRE_EQUAL(solutions.size(), 2U);
+        BOOST_REQUIRE_EQUAL(solutions[0].size(), 1U);
+        BOOST_CHECK_EQUAL(solutions[0][0], witness_version);
+        BOOST_CHECK(solutions[1] == program);
+
+        BOOST_CHECK(ExtractDestination(s, address));
+        const WitnessUnknown expected{witness_version, program};
+        BOOST_CHECK(std::get<WitnessUnknown>(address) == expected);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(script_standard_GetScriptFor_)
@@ -447,7 +483,7 @@ BOOST_AUTO_TEST_CASE(script_standard_taproot_builder)
     BOOST_CHECK(builder.IsValid() && builder.IsComplete());
     builder.Finalize(key_inner);
     BOOST_CHECK(builder.IsValid() && builder.IsComplete());
-    BOOST_CHECK_EQUAL(EncodeDestination(builder.GetOutput()), "bc1pj6gaw944fy0xpmzzu45ugqde4rz7mqj5kj0tg8kmr5f0pjq8vnaqgynnge");
+    BOOST_CHECK_EQUAL(EncodeDestination(builder.GetOutput()), "qb1pj6gaw944fy0xpmzzu45ugqde4rz7mqj5kj0tg8kmr5f0pjq8vnaq6d4ew7");
 }
 
 BOOST_AUTO_TEST_CASE(bip341_spk_test_vectors)

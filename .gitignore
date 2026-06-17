@@ -15,6 +15,7 @@
 !contrib/guix/patches/*.patch
 !depends/patches/**/*.patch
 
+
 /CMakeUserPresets.json
 
 # Previous releases

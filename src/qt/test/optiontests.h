@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_QT_TEST_OPTIONTESTS_H
-#define BITCOIN_QT_TEST_OPTIONTESTS_H
+#ifndef QBIT_QT_TEST_OPTIONTESTS_H
+#define QBIT_QT_TEST_OPTIONTESTS_H
 
 #include <common/settings.h>
 #include <qt/optionsmodel.h>
@@ -23,10 +23,12 @@ private Q_SLOTS:
     void integerGetArgBug();
     void parametersInteraction();
     void extractFilter();
+    void qbitUnitDisplay();
+    void displayUnitSettingMigration();
 
 private:
     interfaces::Node& m_node;
     common::Settings m_previous_settings;
 };
 
-#endif // BITCOIN_QT_TEST_OPTIONTESTS_H
+#endif // QBIT_QT_TEST_OPTIONTESTS_H

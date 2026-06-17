@@ -41,6 +41,7 @@ add_executable(bench_bitcoin
   peer_eviction.cpp
   poly1305.cpp
   pool.cpp
+  pqc.cpp
   prevector.cpp
   random.cpp
   readwriteblock.cpp
@@ -55,6 +56,7 @@ add_executable(bench_bitcoin
   util_time.cpp
   verify_script.cpp
 )
+set_target_properties(bench_bitcoin PROPERTIES OUTPUT_NAME bench_qbit)
 
 include(TargetDataSources)
 target_raw_data_sources(bench_bitcoin NAMESPACE benchmark::data
@@ -82,8 +84,12 @@ if(ENABLE_WALLET)
   target_link_libraries(bench_bitcoin bitcoin_wallet)
 endif()
 
+set(BENCH_SANITY_CHECK_ARGS -sanity-check -min-time=0 -p2mronly=0)
+if(WIN32)
+  list(APPEND BENCH_SANITY_CHECK_ARGS -filter=AddrManAdd)
+endif()
 add_test(NAME bench_sanity_check
-  COMMAND bench_bitcoin -sanity-check
+  COMMAND bench_bitcoin ${BENCH_SANITY_CHECK_ARGS}
 )
 
 install_binary_component(bench_bitcoin INTERNAL)

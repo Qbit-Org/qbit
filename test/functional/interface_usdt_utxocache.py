@@ -153,6 +153,8 @@ class UTXOCacheTracepointTest(BitcoinTestFramework):
         self.skip_if_running_under_valgrind()
 
     def run_test(self):
+        self.ensure_cached_coinbase_mature(self.nodes[0])
+
         self.wallet = MiniWallet(self.nodes[0])
 
         self.test_uncache()
@@ -173,8 +175,9 @@ class UTXOCacheTracepointTest(BitcoinTestFramework):
         # in our UTXO cache.
         EARLY_BLOCK_HEIGHT = 1
         block_1_hash = self.nodes[0].getblockhash(EARLY_BLOCK_HEIGHT)
-        block_1 = self.nodes[0].getblock(block_1_hash)
-        block_1_coinbase_txid = block_1["tx"][0]
+        block_1 = self.nodes[0].getblock(block_1_hash, 2)
+        block_1_coinbase_txid = block_1["tx"][0]["txid"]
+        block_1_coinbase_value = int(block_1["tx"][0]["vout"][0]["value"] * COIN)
 
         # Create a transaction and invalidate it by changing the txid of the previous
         # output to the coinbase txid of the block at height 1.
@@ -202,7 +205,7 @@ class UTXOCacheTracepointTest(BitcoinTestFramework):
                 assert_equal(block_1_coinbase_txid, bytes(event.txid[::-1]).hex())
                 assert_equal(0, event.index)  # prevout index
                 assert_equal(EARLY_BLOCK_HEIGHT, event.height)
-                assert_equal(50 * COIN, event.value)
+                assert_equal(block_1_coinbase_value, event.value)
                 assert_equal(True, event.is_coinbase)
             except AssertionError:
                 self.log.exception("Assertion failed")
@@ -404,6 +407,10 @@ class UTXOCacheTracepointTest(BitcoinTestFramework):
 
         BLOCKS_TO_MINE = 350
         self.log.info(f"mine {BLOCKS_TO_MINE} blocks to be able to prune")
+        # Record height before mining so the prune target falls within the newly
+        # created fastprune block files (each ~16kB).  Pre-restart blocks all
+        # share one file and cannot be pruned at their individual heights.
+        base_height = self.nodes[0].getblockcount()
         self.generate(self.wallet, BLOCKS_TO_MINE)
 
         self.log.info("test the utxocache:flush tracepoint API with pruning")
@@ -416,7 +423,9 @@ class UTXOCacheTracepointTest(BitcoinTestFramework):
 
         self.log.info("prune blockchain to trigger a flush for pruning")
         expected_flushes.append({"mode": "NONE", "for_prune": True, "size": 0})
-        self.nodes[0].pruneblockchain(315)
+        # Prune to a height 200 blocks into the fastprune-file range so that
+        # complete 16kB block files exist below the target and get removed.
+        self.nodes[0].pruneblockchain(base_height + 200)
 
         bpf.perf_buffer_poll(timeout=500)
         bpf.cleanup()

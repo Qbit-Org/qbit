@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <chainparams.h>
+#include <common/args.h>
 #include <key.h>
 #include <key_io.h>
 #include <outputtype.h>
@@ -34,6 +35,7 @@
 void initialize_key()
 {
     static ECC_Context ecc_context{};
+    gArgs.ForceSetArg("-p2mronly", "0");
     SelectParams(ChainType::REGTEST);
 }
 

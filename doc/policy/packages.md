@@ -121,6 +121,13 @@ submitted as a package. Note that this rule does not apply to
 TRUC transaction is permitted to be below the mempool min relay feerate, assuming it is considered within
 a package that meets the mempool's feerate requirements.
 
+qbit diverges from Bitcoin Core's inherited TRUC size caps: v3 transactions
+may be up to 50000 virtual bytes, and a v3 transaction spending an unconfirmed
+v3 parent may be up to 45500 virtual bytes. This keeps the one-parent/one-child
+TRUC topology while allowing P2MR spends with SLH-DSA signatures to retain
+roughly the same script-path input fan-in that Bitcoin's 1000-vbyte child cap
+allows with Taproot signatures.
+
 *Rationale*: Avoid situations in which the mempool contains non-bumped transactions below min relay
 feerate (which we consider to have pay 0 fees and thus receiving free relay). While package
 submission would ensure these transactions are bumped at the time of entry, it is not guaranteed

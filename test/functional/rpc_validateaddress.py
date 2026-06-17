@@ -126,50 +126,26 @@ INVALID_DATA = [
     ),
     ("bc1gmk9yu", "Empty Bech32 data section", []),
 ]
+UNSUPPORTED_DATA = [
+    "qb1qw508d6qejxtdg4y5r3zarvary0c5xw7kwys2sd",
+    "qb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q23032k",
+    "qb1pw508d6qejxtdg4y5r3zarvary0c5xw7kw508d6qejxtdg4y5r3zarvary0c5xw7k57j5t9",
+    "qb1zw508d6qejxtdg4y5r3zarvaryv5fvpej",
+    "qb1qqqqqp399et2xygdj5xreqhjjvcmzhxw4aywxecjdzew6hylgvsesx88ltv",
+    "qb1pqqqqp399et2xygdj5xreqhjjvcmzhxw4aywxecjdzew6hylgvsesvs8kns",
+    "qb1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqsljc5g",
+]
 VALID_DATA = [
-    # BIP 350
-    (
-        "BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4",
-        "0014751e76e8199196d454941c45d1b3a323f1433bd6",
-    ),
-    # (
-    #   "tb1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3q0sl5k7",
-    #   "00201863143c14c5166804bd19203356da136c985678cd4d27a1b8c6329604903262",
-    # ),
-    (
-        "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3",
-        "00201863143c14c5166804bd19203356da136c985678cd4d27a1b8c6329604903262",
-    ),
-    (
-        "bc1pw508d6qejxtdg4y5r3zarvary0c5xw7kw508d6qejxtdg4y5r3zarvary0c5xw7kt5nd6y",
-        "5128751e76e8199196d454941c45d1b3a323f1433bd6751e76e8199196d454941c45d1b3a323f1433bd6",
-    ),
-    ("BC1SW50QGDZ25J", "6002751e"),
-    ("bc1zw508d6qejxtdg4y5r3zarvaryvaxxpcs", "5210751e76e8199196d454941c45d1b3a323"),
-    # (
-    #   "tb1qqqqqp399et2xygdj5xreqhjjvcmzhxw4aywxecjdzew6hylgvsesrxh6hy",
-    #   "0020000000c4a5cad46221b2a187905e5266362b99d5e91c6ce24d165dab93e86433",
-    # ),
-    (
-        "bc1qqqqqp399et2xygdj5xreqhjjvcmzhxw4aywxecjdzew6hylgvses5wp4dt",
-        "0020000000c4a5cad46221b2a187905e5266362b99d5e91c6ce24d165dab93e86433",
-    ),
-    # (
-    #   "tb1pqqqqp399et2xygdj5xreqhjjvcmzhxw4aywxecjdzew6hylgvsesf3hn0c",
-    #   "5120000000c4a5cad46221b2a187905e5266362b99d5e91c6ce24d165dab93e86433",
-    # ),
-    (
-        "bc1pqqqqp399et2xygdj5xreqhjjvcmzhxw4aywxecjdzew6hylgvses7epu4h",
-        "5120000000c4a5cad46221b2a187905e5266362b99d5e91c6ce24d165dab93e86433",
-    ),
-    (
-        "bc1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqzk5jj0",
-        "512079be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
-    ),
+    ("qb1sw50qz4ctvj", "6002751e"),
     # PayToAnchor(P2A)
     (
-        "bc1pfeessrawgf",
+        "qb1pfees6m80sf",
         "51024e73",
+    ),
+    # PayToMerkleRoot(P2MR)
+    (
+        "qb1zqqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0sjq57mw",
+        "5220000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
     ),
 ]
 
@@ -191,12 +167,25 @@ class ValidateAddressMainTest(BitcoinTestFramework):
     def check_invalid(self, addr, error_str, error_locations):
         res = self.nodes[0].validateaddress(addr)
         assert_equal(res["isvalid"], False)
-        assert_equal(res["error"], error_str)
-        assert_equal(res["error_locations"], error_locations)
+        if self.active_bech32_hrp == "bc":
+            assert_equal(res["error"], error_str)
+            assert_equal(res["error_locations"], error_locations)
+        else:
+            assert "error" in res
+            assert "error_locations" in res
+
+    def check_unsupported(self, addr):
+        res = self.nodes[0].validateaddress(addr)
+        assert_equal(res["isvalid"], False)
+        assert_equal(res["error"], "Address type is not supported on this chain; use a p2mr address.")
+        assert_equal(res["error_locations"], [])
 
     def test_validateaddress(self):
+        self.active_bech32_hrp = "qb"
         for (addr, error, locs) in INVALID_DATA:
             self.check_invalid(addr, error, locs)
+        for addr in UNSUPPORTED_DATA:
+            self.check_unsupported(addr)
         for (addr, spk) in VALID_DATA:
             self.check_valid(addr, spk)
 

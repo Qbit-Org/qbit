@@ -3,8 +3,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_LOGGING_H
-#define BITCOIN_LOGGING_H
+#ifndef QBIT_LOGGING_H
+#define QBIT_LOGGING_H
 
 #include <crypto/siphash.h>
 #include <threadsafety.h>
@@ -381,4 +381,4 @@ inline void LogPrintFormatInternal(std::source_location&& source_loc, BCLog::Log
 #define LogDebug(category, ...) LogPrintLevel(category, BCLog::Level::Debug, __VA_ARGS__)
 #define LogTrace(category, ...) LogPrintLevel(category, BCLog::Level::Trace, __VA_ARGS__)
 
-#endif // BITCOIN_LOGGING_H
+#endif // QBIT_LOGGING_H

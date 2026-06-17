@@ -43,9 +43,11 @@ BOOST_AUTO_TEST_CASE(MiningInterface)
 
     block_template = mining->createNewBlock(options);
     BOOST_REQUIRE(block_template);
+    const uint32_t legacy_anchor_bits{m_node.chainman->GetParams().GetConsensus().asertAnchorParams.nBitsLegacy};
 
     // The template should use the mocked system time
     BOOST_REQUIRE_EQUAL(block_template->getBlockHeader().nTime, genesis_time + 3 * 60);
+    BOOST_REQUIRE_EQUAL(block_template->getBlockHeader().nBits, legacy_anchor_bits);
 
     const BlockWaitOptions wait_options{.timeout = MillisecondsDouble{0}, .fee_threshold = 1};
 
@@ -61,15 +63,14 @@ BOOST_AUTO_TEST_CASE(MiningInterface)
     should_be_nullptr = block_template->waitNext(wait_options);
     BOOST_REQUIRE(should_be_nullptr == nullptr);
 
-    // One second later the difficulty drops and it returns a new template
-    // Note that we can't test the actual difficulty change, because the
-    // difficulty is already at 1.
+    // One second later there is still no better template because testnet4
+    // no longer uses the 20-minute min-difficulty escape hatch.
     {
         LOCK(cs_main);
         SetMockTime(m_node.chainman->ActiveChain().Tip()->GetBlockTime() + 20 * 60 + 1);
     }
-    block_template = block_template->waitNext(wait_options);
-    BOOST_REQUIRE(block_template);
+    should_be_nullptr = block_template->waitNext(wait_options);
+    BOOST_REQUIRE(should_be_nullptr == nullptr);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

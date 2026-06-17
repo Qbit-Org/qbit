@@ -16,12 +16,13 @@ import copy
 import time
 
 from test_framework.blocktools import (
+    COINBASE_MATURITY,
     MAX_FUTURE_BLOCK_TIME,
     create_block,
     create_coinbase,
     create_tx_with_script,
+    get_block_subsidy,
 )
-from test_framework.messages import COIN
 from test_framework.p2p import P2PDataStore
 from test_framework.script import OP_TRUE
 from test_framework.test_framework import BitcoinTestFramework
@@ -54,10 +55,11 @@ class InvalidBlockRequestTest(BitcoinTestFramework):
         block.solve()
         # Save the coinbase for later
         block1 = block
+        spend_value = block1.vtx[0].vout[0].nValue - 1_000
         peer.send_blocks_and_test([block1], node, success=True)
 
         self.log.info("Mature the block.")
-        self.generatetoaddress(node, 100, node.get_deterministic_priv_key().address)
+        self.generatetoaddress(node, COINBASE_MATURITY, node.get_deterministic_priv_key().address)
 
         best_block = node.getblock(node.getbestblockhash())
         tip = int(node.getbestblockhash(), 16)
@@ -72,8 +74,8 @@ class InvalidBlockRequestTest(BitcoinTestFramework):
         # For more information on merkle-root malleability see src/consensus/merkle.cpp.
         self.log.info("Test merkle root malleability.")
 
-        tx1 = create_tx_with_script(block1.vtx[0], 0, script_sig=bytes([OP_TRUE]), amount=50 * COIN)
-        tx2 = create_tx_with_script(tx1, 0, script_sig=bytes([OP_TRUE]), amount=50 * COIN)
+        tx1 = create_tx_with_script(block1.vtx[0], 0, script_sig=bytes([OP_TRUE]), amount=spend_value)
+        tx2 = create_tx_with_script(tx1, 0, script_sig=bytes([OP_TRUE]), amount=tx1.vout[0].nValue - 1_000)
         block2 = create_block(tip, create_coinbase(height), block_time, txlist=[tx1, tx2])
         block_time += 1
         block2.solve()
@@ -99,7 +101,9 @@ class InvalidBlockRequestTest(BitcoinTestFramework):
 
         self.log.info("Test very broken block.")
 
-        block3 = create_block(tip, create_coinbase(height, nValue=100), block_time)
+        invalid_coinbase = create_coinbase(height)
+        invalid_coinbase.vout[0].nValue = get_block_subsidy(height) + 1
+        block3 = create_block(tip, invalid_coinbase, block_time)
         block_time += 1
         block3.solve()
 
@@ -119,7 +123,7 @@ class InvalidBlockRequestTest(BitcoinTestFramework):
 
         # Complete testing of CVE-2018-17144, by checking for the inflation bug.
         # Create a block that spends the output of a tx in a previous block.
-        tx3 = create_tx_with_script(tx2, 0, script_sig=bytes([OP_TRUE]), amount=50 * COIN)
+        tx3 = create_tx_with_script(tx2, 0, script_sig=bytes([OP_TRUE]), amount=tx2.vout[0].nValue - 1_000)
         tx3.vin.append(tx3.vin[0])  # Duplicates input
         block4 = create_block(tip, create_coinbase(height), block_time, txlist=[tx3])
         block4.solve()

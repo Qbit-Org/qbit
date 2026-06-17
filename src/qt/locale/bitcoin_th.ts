@@ -1010,7 +1010,7 @@ Signing is only possible with addresses of the type 'legacy'.</source>
         <translation type="unfinished">(%1 ล็อคแล้ว)</translation>
     </message>
     <message>
-        <source>Can vary +/- %1 satoshi(s) per input.</source>
+        <source>Can vary +/- %1 bits per input.</source>
         <translation type="unfinished">สามารถเปลี่ยนแปลงได้ +/- %1 ซาโตชิ (s) ต่อการป้อนข้อมูล</translation>
     </message>
     <message>

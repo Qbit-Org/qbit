@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_TEST_UTIL_SETUP_COMMON_H
-#define BITCOIN_TEST_UTIL_SETUP_COMMON_H
+#ifndef QBIT_TEST_UTIL_SETUP_COMMON_H
+#define QBIT_TEST_UTIL_SETUP_COMMON_H
 
 #include <common/args.h> // IWYU pragma: export
 #include <kernel/caches.h>
@@ -253,6 +253,12 @@ struct TestChain100Setup : public TestingSetup {
     CKey coinbaseKey; // private/public key needed to spend coinbase transactions
 };
 
+/** Pre-creates a 100-block REGTEST-mode block chain with P2MR-only disabled. */
+struct UnrestrictedRegtestChain100Setup : public TestChain100Setup {
+    UnrestrictedRegtestChain100Setup()
+        : TestChain100Setup{ChainType::REGTEST, {.extra_args = {"-p2mronly=0"}}} {}
+};
+
 /**
  * Make a test setup that has disk access to the debug.log file disabled. Can
  * be used in "hot loops", for example fuzzing or benchmarking.
@@ -311,4 +317,4 @@ private:
     const std::string m_reason;
 };
 
-#endif // BITCOIN_TEST_UTIL_SETUP_COMMON_H
+#endif // QBIT_TEST_UTIL_SETUP_COMMON_H

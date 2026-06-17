@@ -57,7 +57,7 @@ BOOST_AUTO_TEST_CASE(blockmanager_find_block_pos)
     BOOST_CHECK_EQUAL(actual.nPos, STORAGE_HEADER_BYTES + ::GetSerializeSize(TX_WITH_WITNESS(params->GenesisBlock())) + STORAGE_HEADER_BYTES);
 }
 
-BOOST_FIXTURE_TEST_CASE(blockmanager_scan_unlink_already_pruned_files, TestChain100Setup)
+BOOST_FIXTURE_TEST_CASE(blockmanager_scan_unlink_already_pruned_files, UnrestrictedRegtestChain100Setup)
 {
     // Cap last block file size, and mine new block in a new block file.
     const auto& chainman = Assert(m_node.chainman);

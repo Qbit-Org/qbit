@@ -29,6 +29,10 @@ class OrphanRPCsTest(BitcoinTestFramework):
 
     def run_test(self):
         self.wallet = MiniWallet(self.nodes[0])
+
+        # Mature the default-cache coinbase UTXOs
+        self.ensure_cached_coinbase_mature(self.nodes[0])
+
         self.test_orphan_activity()
         self.test_orphan_details()
         self.test_misc()

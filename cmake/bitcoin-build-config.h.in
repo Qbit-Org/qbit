@@ -57,6 +57,9 @@
 /* Define to 1 if fdatasync is available. */
 #cmakedefine HAVE_FDATASYNC 1
 
+/* Define to 1 for official testnet-only release binaries. */
+#cmakedefine01 QBIT_TESTNET_ONLY_RELEASE
+
 /* Define this symbol if the BSD getentropy system call is available with
    sys/random.h */
 #cmakedefine HAVE_GETENTROPY_RAND 1
@@ -102,6 +105,9 @@
 
 /* Define to the version of this package. */
 #define CLIENT_VERSION_STRING "@CLIENT_VERSION_STRING@"
+
+/* Define to the release phase of this package. */
+#define CLIENT_VERSION_PHASE "@CLIENT_VERSION_PHASE@"
 
 /* Define to 1 if strerror_r returns char *. */
 #cmakedefine STRERROR_R_CHAR_P 1

@@ -10,7 +10,7 @@ from bcc import BPF, USDT
 """Example logging Bitcoin Core utxo set cache flushes utilizing
     the utxocache:flush tracepoint."""
 
-# USAGE:  ./contrib/tracing/log_utxocache_flush.py path/to/bitcoind
+# USAGE:  ./contrib/tracing/log_utxocache_flush.py path/to/qbitd
 
 # BCC: The C program to be compiled to an eBPF program (by BCC) and loaded into
 # a sandboxed Linux kernel VM.
@@ -71,7 +71,7 @@ def print_event(event):
 
 
 def main(pid):
-    print(f"Hooking into bitcoind with pid {pid}")
+    print(f"Hooking into qbitd with pid {pid}")
     bitcoind_with_usdts = USDT(pid=int(pid))
 
     # attaching the trace functions defined in the BPF program
@@ -101,7 +101,7 @@ def main(pid):
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print("USAGE: ", sys.argv[0], "<pid of bitcoind>")
+        print("USAGE: ", sys.argv[0], "<pid of qbitd>")
         exit(1)
 
     pid = sys.argv[1]

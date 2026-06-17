@@ -14,6 +14,7 @@
 #include <policy/feerate.h>
 #include <primitives/transaction.h>
 #include <script/interpreter.h>
+#include <script/p2mr_sizing.h>
 #include <script/script.h>
 #include <script/solver.h>
 #include <serialize.h>
@@ -22,6 +23,29 @@
 #include <algorithm>
 #include <cstddef>
 #include <vector>
+
+namespace {
+static constexpr size_t P2MR_STANDARD_TX_INPUT_TARGET{100};
+static constexpr size_t P2MR_STANDARD_TX_OVERHEAD_BUFFER{20'000};
+
+static_assert(MAX_STANDARD_TX_WEIGHT >= P2MR_STANDARD_TX_INPUT_TARGET * P2MR_V1_SINGLE_KEY_SPEND_SIZE + P2MR_STANDARD_TX_OVERHEAD_BUFFER);
+static_assert(MAX_STANDARD_TX_WEIGHT < (P2MR_STANDARD_TX_INPUT_TARGET + 10) * P2MR_V1_SINGLE_KEY_SPEND_SIZE);
+
+size_t GetP2MRDustSpendSize()
+{
+    static_assert(P2MR_V1_MAX_SIGNATURE_ITEM_SIZE <= MAX_STANDARD_P2MR_STACK_ITEM_SIZE);
+    return P2MR_V1_SINGLE_KEY_SPEND_SIZE;
+}
+
+size_t GetDustSpendSize(const CScript& script_pubkey)
+{
+    std::vector<std::vector<unsigned char>> solutions;
+    if (Solver(script_pubkey, solutions) == TxoutType::WITNESS_V2_P2MR) {
+        return GetP2MRDustSpendSize();
+    }
+    return 32 + 4 + 1 + 107 + 4; // the 148-byte spend estimate used by inherited policy
+}
+} // namespace
 
 CAmount GetDustThreshold(const CTxOut& txout, const CFeeRate& dustRelayFeeIn)
 {
@@ -43,21 +67,10 @@ CAmount GetDustThreshold(const CTxOut& txout, const CFeeRate& dustRelayFeeIn)
         return 0;
 
     size_t nSize = GetSerializeSize(txout);
-    int witnessversion = 0;
-    std::vector<unsigned char> witnessprogram;
 
-    // Note this computation is for spending a Segwit v0 P2WPKH output (a 33 bytes
-    // public key + an ECDSA signature). For Segwit v1 Taproot outputs the minimum
-    // satisfaction is lower (a single BIP340 signature) but this computation was
-    // kept to not further reduce the dust level.
-    // See discussion in https://github.com/bitcoin/bitcoin/pull/22779 for details.
-    if (txout.scriptPubKey.IsWitnessProgram(witnessversion, witnessprogram)) {
-        // sum the sizes of the parts of a transaction input
-        // with 75% segwit discount applied to the script size.
-        nSize += (32 + 4 + 1 + (107 / WITNESS_SCALE_FACTOR) + 4);
-    } else {
-        nSize += (32 + 4 + 1 + 107 + 4); // the 148 mentioned above
-    }
+    // With WITNESS_SCALE_FACTOR=1 there is no segwit discount. P2MR still
+    // needs a larger spend estimate because its witness carries a PQC signature.
+    nSize += GetDustSpendSize(txout.scriptPubKey);
 
     return dustRelayFeeIn.GetFee(nSize);
 }
@@ -137,6 +150,10 @@ bool IsStandardTx(const CTransaction& tx, const std::optional<unsigned>& max_dat
     TxoutType whichType;
     for (const CTxOut& txout : tx.vout) {
         if (!::IsStandard(txout.scriptPubKey, whichType)) {
+            reason = "scriptpubkey";
+            return false;
+        }
+        if (IsReservedFutureWitnessOutput(txout.scriptPubKey)) {
             reason = "scriptpubkey";
             return false;
         }
@@ -330,6 +347,37 @@ bool IsWitnessStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs)
                 // (no policy rules apply)
             } else {
                 // 0 stack elements; this is already invalid by consensus rules
+                return false;
+            }
+        }
+
+        // Check policy limits for P2MR (BIP-360) spends:
+        // - MAX_STANDARD_P2MR_STACK_ITEM_SIZE limit for stack item size
+        // - MAX_STANDARD_P2MR_TOTAL_INITIAL_STACK_BYTES limit for aggregate initial stack bytes
+        // - No annexes
+        if (witnessversion == 2 && witnessprogram.size() == WITNESS_V2_P2MR_SIZE && !p2sh) {
+            // P2MR spend (non-P2SH-wrapped, version 2, witness program size 32; see BIP-360)
+            std::span stack{tx.vin[i].scriptWitness.stack};
+            if (stack.size() >= 2 && !stack.back().empty() && stack.back()[0] == ANNEX_TAG) {
+                // Annexes are nonstandard as long as no semantics are defined for them.
+                return false;
+            }
+            if (stack.size() >= 2) {
+                // Script path spend (2 or more stack elements after removing optional annex)
+                const auto& control_block = SpanPopBack(stack);
+                SpanPopBack(stack); // Ignore script
+                if (control_block.empty()) return false; // Empty control block is invalid
+                if ((control_block[0] & TAPROOT_LEAF_MASK) == P2MR_LEAF_VERSION) {
+                    // Leaf version 0xc0 (P2MR, see BIP-360)
+                    size_t total_stack_bytes{0};
+                    for (const auto& item : stack) {
+                        if (item.size() > MAX_STANDARD_P2MR_STACK_ITEM_SIZE) return false;
+                        total_stack_bytes += item.size();
+                        if (total_stack_bytes > MAX_STANDARD_P2MR_TOTAL_INITIAL_STACK_BYTES) return false;
+                    }
+                }
+            } else {
+                // 0 or 1 stack elements; P2MR is script-path only, so this is invalid by consensus
                 return false;
             }
         }

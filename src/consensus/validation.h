@@ -3,8 +3,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_CONSENSUS_VALIDATION_H
-#define BITCOIN_CONSENSUS_VALIDATION_H
+#ifndef QBIT_CONSENSUS_VALIDATION_H
+#define QBIT_CONSENSUS_VALIDATION_H
 
 #include <string>
 #include <consensus/consensus.h>
@@ -125,10 +125,9 @@ public:
 class TxValidationState : public ValidationState<TxValidationResult> {};
 class BlockValidationState : public ValidationState<BlockValidationResult> {};
 
-// These implement the weight = (stripped_size * 4) + witness_size formula,
-// using only serialization with and without witness data. As witness_size
-// is equal to total_size - stripped_size, this formula is identical to:
-// weight = (stripped_size * 3) + total_size.
+// These implement weight = stripped_size * (WITNESS_SCALE_FACTOR - 1) + total_size
+// using only serialization with and without witness data. With qbit's
+// WITNESS_SCALE_FACTOR=1, weight equals witness-inclusive serialized size.
 static inline int32_t GetTransactionWeight(const CTransaction& tx)
 {
     return ::GetSerializeSize(TX_NO_WITNESS(tx)) * (WITNESS_SCALE_FACTOR - 1) + ::GetSerializeSize(TX_WITH_WITNESS(tx));
@@ -164,4 +163,4 @@ inline int GetWitnessCommitmentIndex(const CBlock& block)
     return commitpos;
 }
 
-#endif // BITCOIN_CONSENSUS_VALIDATION_H
+#endif // QBIT_CONSENSUS_VALIDATION_H

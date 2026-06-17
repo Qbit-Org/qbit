@@ -6,6 +6,7 @@
 
 #include <chainparams.h>
 #include <common/args.h>
+#include <key.h>
 #include <key_io.h>
 #include <logging.h>
 
@@ -32,11 +33,11 @@ fs::path GetWalletDir()
     return path;
 }
 
-WalletDescriptor GenerateWalletDescriptor(const CExtPubKey& master_key, const OutputType& addr_type, bool internal)
+WalletDescriptor GenerateWalletDescriptor(const CExtPubKey& master_pubkey, const OutputType& addr_type, bool internal)
 {
     int64_t creation_time = GetTime();
 
-    std::string xpub = EncodeExtPubKey(master_key);
+    std::string xpub = EncodeExtPubKey(master_pubkey);
 
     // Build descriptor string
     std::string desc_prefix;
@@ -59,9 +60,13 @@ WalletDescriptor GenerateWalletDescriptor(const CExtPubKey& master_key, const Ou
         desc_prefix = "tr(" + xpub + "/86h";
         break;
     }
+    case OutputType::P2MR: {
+        desc_prefix = "mr(pk(pqc(" + xpub + "/87h";
+        desc_suffix += "))";
+        break;
+    }
     case OutputType::UNKNOWN: {
-        // We should never have a DescriptorScriptPubKeyMan for an UNKNOWN OutputType,
-        // so if we get to this point something is wrong
+        // We should never have a DescriptorScriptPubKeyMan for UNKNOWN OutputType.
         assert(false);
     }
     } // no default case, so the compiler can warn about missing cases
@@ -83,6 +88,31 @@ WalletDescriptor GenerateWalletDescriptor(const CExtPubKey& master_key, const Ou
     std::vector<std::unique_ptr<Descriptor>> desc = Parse(desc_str, keys, error, false);
     WalletDescriptor w_desc(std::move(desc.at(0)), creation_time, 0, 0, 0);
     return w_desc;
+}
+
+bool IsP2MROnlyWalletChain()
+{
+    return IsP2MROnlyOutputChain(Params());
+}
+
+std::span<const OutputType> GetWalletOutputTypes()
+{
+    return GetAllowedOutputTypes(Params());
+}
+
+std::span<const OutputType> GetDefaultDescriptorOutputTypes()
+{
+    return GetWalletOutputTypes();
+}
+
+std::string FormatWalletOutputTypes()
+{
+    return "\"" + FormatOutputType(OutputType::P2MR) + "\" on launch chains; unrestricted regtest also accepts " + FormatOutputTypes(GetSupportedOutputTypes());
+}
+
+bool IsWalletOutputTypeAllowed(OutputType type)
+{
+    return IsOutputTypeAllowed(type, Params());
 }
 
 } // namespace wallet

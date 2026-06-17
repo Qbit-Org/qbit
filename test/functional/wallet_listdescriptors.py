@@ -41,9 +41,10 @@ class ListDescriptorsTest(BitcoinTestFramework):
         node.createwallet(wallet_name='w3')
         result = node.get_wallet_rpc('w3').listdescriptors()
         assert_equal("w3", result['wallet_name'])
-        assert_equal(8, len(result['descriptors']))
-        assert_equal(8, len([d for d in result['descriptors'] if d['active']]))
-        assert_equal(4, len([d for d in result['descriptors'] if d['internal']]))
+        assert_equal(10, len(result['descriptors']))
+        assert_equal(10, len([d for d in result['descriptors'] if d['active']]))
+        assert_equal(5, len([d for d in result['descriptors'] if d['internal']]))
+        assert_equal(2, len([d for d in result['descriptors'] if d['desc'].startswith('mr(')]))
         for item in result['descriptors']:
             assert_not_equal(item['desc'], '')
             assert item['next_index'] == 0
@@ -55,8 +56,8 @@ class ListDescriptorsTest(BitcoinTestFramework):
         assert_equal(descriptor_strings, sorted(descriptor_strings))
 
         self.log.info('Test descriptors with hardened derivations are listed in importable form.')
-        xprv = 'tprv8ZgxMBicQKsPeuVhWwi6wuMQGfPKi9Li5GtX35jVNknACgqe3CY4g5xgkfDDJcmtF7o1QnxWDRYw4H5P26PXq7sbcUkEqeR4fg3Kxp2tigg'
-        xpub_acc = 'tpubDCMVLhErorrAGfApiJSJzEKwqeaf2z3NrkVMxgYQjZLzMjXMBeRw2muGNYbvaekAE8rUFLftyEar4LdrG2wXyyTJQZ26zptmeTEjPTaATts'
+        xprv = 'qrpvV1brS3WRoVwgU7HikDpGNFNLY3EW4J4ZaTykHiS2bd8vaBrnYQYNDSNxzohGN1f6pevrALeN6QEdigc6HWYaf4xeWVH3dFjkdQuhYKS3PUq'
+        xpub_acc = 'qrpbSXHDtjgrnNL5oo4yS5Upo8oHFjTqd5Xy5v8mRJ5F2iZRCCKyvwLdFDqVCBCKwPRMsZEj7yr6wYcDKXrdV8vavpEYGFcVEADkuB3St2QEqJp'
         hardened_path = '/84h/1h/0h'
         wallet = node.get_wallet_rpc('w2')
         wallet.importdescriptors([{

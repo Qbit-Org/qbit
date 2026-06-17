@@ -22,10 +22,15 @@
 #include <vector>
 
 namespace wallet {
-static void WalletCreate(benchmark::Bench& bench, bool encrypted)
+static void WalletCreate(benchmark::Bench& bench, bool encrypted, bool p2mr_only)
 {
     auto test_setup = MakeNoLogFileContext<TestingSetup>();
     FastRandomContext random;
+
+    if (p2mr_only) {
+        test_setup->m_args.ForceSetArg("-p2mronly", "1");
+        test_setup->m_args.ForceSetArg("-keypool", "1000");
+    }
 
     WalletContext context;
     context.args = &test_setup->m_args;
@@ -57,10 +62,14 @@ static void WalletCreate(benchmark::Bench& bench, bool encrypted)
     });
 }
 
-static void WalletCreatePlain(benchmark::Bench& bench) { WalletCreate(bench, /*encrypted=*/false); }
-static void WalletCreateEncrypted(benchmark::Bench& bench) { WalletCreate(bench, /*encrypted=*/true); }
+static void WalletCreatePlain(benchmark::Bench& bench) { WalletCreate(bench, /*encrypted=*/false, /*p2mr_only=*/false); }
+static void WalletCreateEncrypted(benchmark::Bench& bench) { WalletCreate(bench, /*encrypted=*/true, /*p2mr_only=*/false); }
+static void WalletCreateP2MROnlyPlain(benchmark::Bench& bench) { WalletCreate(bench, /*encrypted=*/false, /*p2mr_only=*/true); }
+static void WalletCreateP2MROnlyEncrypted(benchmark::Bench& bench) { WalletCreate(bench, /*encrypted=*/true, /*p2mr_only=*/true); }
 
 BENCHMARK(WalletCreatePlain, benchmark::PriorityLevel::LOW);
 BENCHMARK(WalletCreateEncrypted, benchmark::PriorityLevel::LOW);
+BENCHMARK(WalletCreateP2MROnlyPlain, benchmark::PriorityLevel::LOW);
+BENCHMARK(WalletCreateP2MROnlyEncrypted, benchmark::PriorityLevel::LOW);
 
 } // namespace wallet

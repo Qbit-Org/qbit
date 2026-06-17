@@ -5,7 +5,7 @@
 #include <qt/overviewpage.h>
 #include <qt/forms/ui_overviewpage.h>
 
-#include <qt/bitcoinunits.h>
+#include <qt/qbitunits.h>
 #include <qt/clientmodel.h>
 #include <qt/guiconstants.h>
 #include <qt/guiutil.h>
@@ -20,6 +20,7 @@
 #include <QApplication>
 #include <QDateTime>
 #include <QPainter>
+#include <QPixmap>
 #include <QStatusTipEvent>
 
 #include <algorithm>
@@ -29,6 +30,26 @@
 #define NUM_ITEMS 5
 
 Q_DECLARE_METATYPE(interfaces::WalletBalances)
+
+OverviewLogoOverlay::OverviewLogoOverlay(QWidget* parent) :
+    QWidget(parent)
+{
+    setAttribute(Qt::WA_TransparentForMouseEvents);
+    setAttribute(Qt::WA_NoSystemBackground);
+}
+
+void OverviewLogoOverlay::paintEvent(QPaintEvent* event)
+{
+    QWidget::paintEvent(event);
+
+    static const QPixmap background_logo(QStringLiteral(":/icons/overview-background-logo"));
+    if (background_logo.isNull()) return;
+
+    QPainter painter(this);
+    painter.setRenderHint(QPainter::SmoothPixmapTransform);
+    painter.setOpacity(0.08);
+    painter.drawPixmap(rect(), background_logo);
+}
 
 class TxViewDelegate : public QAbstractItemDelegate
 {
@@ -85,7 +106,7 @@ public:
             foreground = option.palette.color(QPalette::Text);
         }
         painter->setPen(foreground);
-        QString amountText = BitcoinUnits::formatWithUnit(unit, amount, true, BitcoinUnits::SeparatorStyle::ALWAYS);
+        QString amountText = QbitUnits::formatWithUnit(unit, amount, true, QbitUnits::SeparatorStyle::ALWAYS);
         if(!confirmed)
         {
             amountText = QString("[") + amountText + QString("]");
@@ -116,7 +137,7 @@ public:
         return {DECORATION_SIZE + 8 + minimum_text_width, DECORATION_SIZE};
     }
 
-    BitcoinUnit unit{BitcoinUnit::BTC};
+    QbitUnit unit{QbitUnit::QBT};
 
 Q_SIGNALS:
     //! An intermediate signal for emitting from the `paint() const` member function.
@@ -136,6 +157,10 @@ OverviewPage::OverviewPage(const PlatformStyle *platformStyle, QWidget *parent) 
     txdelegate(new TxViewDelegate(platformStyle, this))
 {
     ui->setupUi(this);
+
+    m_background_logo = new OverviewLogoOverlay(this);
+    updateLogoOverlayGeometry();
+    m_background_logo->lower();
 
     // use a SingleColorIcon for the "out of sync warning" icon
     QIcon icon = m_platform_style->SingleColorIcon(QStringLiteral(":/icons/warning"));
@@ -186,11 +211,11 @@ OverviewPage::~OverviewPage()
 
 void OverviewPage::setBalance(const interfaces::WalletBalances& balances)
 {
-    BitcoinUnit unit = walletModel->getOptionsModel()->getDisplayUnit();
-    ui->labelBalance->setText(BitcoinUnits::formatWithPrivacy(unit, balances.balance, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy));
-    ui->labelUnconfirmed->setText(BitcoinUnits::formatWithPrivacy(unit, balances.unconfirmed_balance, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy));
-    ui->labelImmature->setText(BitcoinUnits::formatWithPrivacy(unit, balances.immature_balance, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy));
-    ui->labelTotal->setText(BitcoinUnits::formatWithPrivacy(unit, balances.balance + balances.unconfirmed_balance + balances.immature_balance, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy));
+    QbitUnit unit = walletModel->getOptionsModel()->getDisplayUnit();
+    ui->labelBalance->setText(QbitUnits::formatWithPrivacy(unit, balances.balance, QbitUnits::SeparatorStyle::ALWAYS, m_privacy));
+    ui->labelUnconfirmed->setText(QbitUnits::formatWithPrivacy(unit, balances.unconfirmed_balance, QbitUnits::SeparatorStyle::ALWAYS, m_privacy));
+    ui->labelImmature->setText(QbitUnits::formatWithPrivacy(unit, balances.immature_balance, QbitUnits::SeparatorStyle::ALWAYS, m_privacy));
+    ui->labelTotal->setText(QbitUnits::formatWithPrivacy(unit, balances.balance + balances.unconfirmed_balance + balances.immature_balance, QbitUnits::SeparatorStyle::ALWAYS, m_privacy));
     // only show immature (newly mined) balance if it's non-zero, so as not to complicate things
     // for the non-mining users
     bool showImmature = balances.immature_balance != 0;
@@ -239,7 +264,7 @@ void OverviewPage::setWalletModel(WalletModel *model)
         connect(model->getOptionsModel(), &OptionsModel::displayUnitChanged, this, &OverviewPage::updateDisplayUnit);
     }
 
-    // update the display unit, to not use the default ("BTC")
+    // update the display unit, to not use the default ("QBT")
     updateDisplayUnit();
 }
 
@@ -252,6 +277,25 @@ void OverviewPage::changeEvent(QEvent* e)
     }
 
     QWidget::changeEvent(e);
+}
+
+void OverviewPage::resizeEvent(QResizeEvent* event)
+{
+    QWidget::resizeEvent(event);
+    updateLogoOverlayGeometry();
+}
+
+void OverviewPage::updateLogoOverlayGeometry()
+{
+    if (!m_background_logo) return;
+
+    const int logo_size = std::clamp(width() / 3, 220, 300);
+    m_background_logo->setGeometry(
+        -logo_size / 4,
+        height() - logo_size + logo_size / 5,
+        logo_size,
+        logo_size);
+    m_background_logo->lower();
 }
 
 // Only show most recent NUM_ITEMS rows

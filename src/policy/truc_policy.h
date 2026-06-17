@@ -2,10 +2,11 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_POLICY_TRUC_POLICY_H
-#define BITCOIN_POLICY_TRUC_POLICY_H
+#ifndef QBIT_POLICY_TRUC_POLICY_H
+#define QBIT_POLICY_TRUC_POLICY_H
 
 #include <consensus/amount.h>
+#include <crypto/pqc.h>
 #include <policy/packages.h>
 #include <policy/policy.h>
 #include <primitives/transaction.h>
@@ -27,11 +28,25 @@ static constexpr unsigned int TRUC_DESCENDANT_LIMIT{2};
 static constexpr unsigned int TRUC_ANCESTOR_LIMIT{2};
 
 /** Maximum sigop-adjusted virtual size of all v3 transactions. */
-static constexpr int64_t TRUC_MAX_VSIZE{10000};
+static constexpr int64_t TRUC_MAX_VSIZE{50000};
 static constexpr int64_t TRUC_MAX_WEIGHT{TRUC_MAX_VSIZE * WITNESS_SCALE_FACTOR};
-/** Maximum sigop-adjusted virtual size of a tx which spends from an unconfirmed TRUC transaction. */
-static constexpr int64_t TRUC_CHILD_MAX_VSIZE{1000};
+/** Maximum sigop-adjusted virtual size of a tx which spends from an unconfirmed TRUC transaction.
+ *
+ * qbit intentionally diverges from Bitcoin Core's 1000-vbyte child cap to
+ * preserve the practical input fan-in Bitcoin gets from small Taproot
+ * script-path signatures. This admits a 12-input/1-output P2MR child with
+ * 3680-byte PQC signatures while preserving the one-parent/one-child topology.
+ */
+static constexpr int64_t TRUC_CHILD_MAX_VSIZE{45500};
 static constexpr int64_t TRUC_CHILD_MAX_WEIGHT{TRUC_CHILD_MAX_VSIZE * WITNESS_SCALE_FACTOR};
+static constexpr int64_t TRUC_P2MR_SCRIPT_PATH_INPUT_VSIZE{
+    41 + 1 + 3 + static_cast<int64_t>(PQC_SIG_SIZE) + 1 + (1 + static_cast<int64_t>(CPQCPubKey::SIZE) + 1) + 1 + 1};
+static constexpr int64_t TRUC_P2MR_OUTPUT_VSIZE{43};
+static constexpr int64_t TRUC_P2MR_BASE_VSIZE{12};
+static constexpr int64_t TRUC_P2MR_CHILD_REVIEW_FLOOR{
+    TRUC_P2MR_BASE_VSIZE + 12 * TRUC_P2MR_SCRIPT_PATH_INPUT_VSIZE + TRUC_P2MR_OUTPUT_VSIZE};
+static_assert(TRUC_CHILD_MAX_VSIZE >= TRUC_P2MR_CHILD_REVIEW_FLOOR);
+static_assert(TRUC_CHILD_MAX_VSIZE < TRUC_MAX_VSIZE);
 // These limits are within the default ancestor/descendant limits.
 static_assert(TRUC_MAX_VSIZE + TRUC_CHILD_MAX_VSIZE <= DEFAULT_ANCESTOR_SIZE_LIMIT_KVB * 1000);
 static_assert(TRUC_MAX_VSIZE + TRUC_CHILD_MAX_VSIZE <= DEFAULT_DESCENDANT_SIZE_LIMIT_KVB * 1000);
@@ -93,4 +108,4 @@ std::optional<std::string> PackageTRUCChecks(const CTransactionRef& ptx, int64_t
                                            const Package& package,
                                            const CTxMemPool::setEntries& mempool_ancestors);
 
-#endif // BITCOIN_POLICY_TRUC_POLICY_H
+#endif // QBIT_POLICY_TRUC_POLICY_H

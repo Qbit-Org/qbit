@@ -832,7 +832,7 @@ Signing is only possible with addresses of the type 'legacy'.</source>
         <translation type="unfinished">(%1 பூட்டப்பட்டது)</translation>
     </message>
     <message>
-        <source>Can vary +/- %1 satoshi(s) per input.</source>
+        <source>Can vary +/- %1 bits per input.</source>
         <translation type="unfinished">உள்ளீடு ஒன்றுக்கு +/- %1 சாத்தோஷி (கள்) மாறுபடலாம்</translation>
     </message>
     <message>
@@ -2097,7 +2097,7 @@ Signing is only possible with addresses of the type 'legacy'.</source>
         <translation type="unfinished">படிவத்தின் அனைத்து துறையையும் அழி.</translation>
     </message>
     <message>
-        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for bitcoin transactions than the network can process.</source>
+        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for qbit transactions than the network can process.</source>
         <translation type="unfinished">தொகுதிகள் உள்ள இடத்தை விட குறைவான பரிவர்த்தனை அளவு இருக்கும் போது, ​​சுரங்க தொழிலாளர்கள் மற்றும் ரிலேடிங் முனைகள் குறைந்தபட்ச கட்டணத்தைச் செயல்படுத்தலாம். இந்த குறைந்தபட்ச கட்டணத்தை மட்டும் செலுத்துவது நன்றாக உள்ளது, ஆனால் நெட்வொர்க்கில் செயல்படுவதை விட bitcoin பரிவர்த்தனைகளுக்கு இன்னும் கோரிக்கை தேவைப்பட்டால் இது ஒருபோதும் உறுதிப்படுத்தாத பரிவர்த்தனைக்கு காரணமாக இருக்கலாம்.</translation>
     </message>
     <message>
@@ -2284,7 +2284,7 @@ Signing is only possible with addresses of the type 'legacy'.</source>
         <translation type="unfinished">இந்த உள்ளீட்டை அகற்று</translation>
     </message>
     <message>
-        <source>The fee will be deducted from the amount being sent. The recipient will receive less bitcoins than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
+        <source>The fee will be deducted from the amount being sent. The recipient will receive less QBT than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
         <translation type="unfinished">அனுப்பப்படும் தொகையிலிருந்து கட்டணம் கழிக்கப்படும். நீங்கள் உள்ளிடும் தொகையை விட பெறுநர் குறைவான பிட்காயின்களைப் பெறுவார். பல பெறுநர்கள் தேர்ந்தெடுக்கப்பட்டால், கட்டணம் சமமாக பிரிக்கப்படும்.</translation>
     </message>
     <message>

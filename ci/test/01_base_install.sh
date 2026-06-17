@@ -26,7 +26,7 @@ if [ -n "${APT_LLVM_V}" ]; then
   ${CI_RETRY_EXE} apt-get install curl -y
   curl "https://apt.llvm.org/llvm-snapshot.gpg.key" | tee "/etc/apt/trusted.gpg.d/apt.llvm.org.asc"
   (
-    # shellcheck disable=SC2034
+    # shellcheck disable=SC2034,SC1091
     source /etc/os-release
     echo "deb http://apt.llvm.org/${VERSION_CODENAME}/ llvm-toolchain-${VERSION_CODENAME}-${APT_LLVM_V} main" > "/etc/apt/sources.list.d/llvm-toolchain-${VERSION_CODENAME}-${APT_LLVM_V}.list"
   )

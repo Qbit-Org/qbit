@@ -24,10 +24,12 @@
 #include <wallet/feebumper.h>
 #include <wallet/fees.h>
 #include <wallet/load.h>
+#include <wallet/pqc_usage.h>
 #include <wallet/receive.h>
 #include <wallet/rpc/wallet.h>
 #include <wallet/spend.h>
 #include <wallet/wallet.h>
+#include <wallet/walletutil.h>
 
 #include <memory>
 #include <string>
@@ -210,6 +212,17 @@ public:
         });
         return result;
     }
+    std::vector<OutputType> getAvailableAddressTypes() override
+    {
+        LOCK(m_wallet->cs_wallet);
+        std::vector<OutputType> result;
+        for (const OutputType type : GetSupportedOutputTypes()) {
+            if (IsAvailableWalletOutputType(*m_wallet, type, /*internal=*/false)) {
+                result.push_back(type);
+            }
+        }
+        return result;
+    }
     std::vector<std::string> getAddressReceiveRequests() override {
         LOCK(m_wallet->cs_wallet);
         return m_wallet->GetAddressReceiveRequests();
@@ -261,15 +274,23 @@ public:
         const CCoinControl& coin_control,
         bool sign,
         int& change_pos,
-        CAmount& fee) override
+        CAmount& fee,
+        wallet::PQCUsageReport* pqc_usage) override
     {
-        LOCK(m_wallet->cs_wallet);
-        auto res = CreateTransaction(*m_wallet, recipients, change_pos == -1 ? std::nullopt : std::make_optional(change_pos),
-                                     coin_control, sign);
+        PQCUsageRecorder pqc_usage_recorder;
+        auto res = CreateTransaction(*m_wallet,
+                                     recipients,
+                                     change_pos == -1 ? std::nullopt : std::make_optional(change_pos),
+                                     coin_control,
+                                     sign,
+                                     sign ? pqc_usage_recorder.GetObserver() : PQCSignatureCounterObserver{});
         if (!res) return util::Error{util::ErrorString(res)};
         const auto& txr = *res;
         fee = txr.fee;
         change_pos = txr.change_pos ? int(*txr.change_pos) : -1;
+        if (pqc_usage) {
+            *pqc_usage = sign ? BuildSigningPQCUsageReport(pqc_usage_recorder) : PQCUsageReport{};
+        }
 
         return txr.tx;
     }
@@ -377,9 +398,22 @@ public:
         bool bip32derivs,
         size_t* n_signed,
         PartiallySignedTransaction& psbtx,
-        bool& complete) override
+        bool& complete,
+        wallet::PQCUsageReport* pqc_usage) override
     {
-        return m_wallet->FillPSBT(psbtx, complete, sighash_type, sign, bip32derivs, n_signed);
+        PQCUsageRecorder pqc_usage_recorder;
+        const auto err = m_wallet->FillPSBT(psbtx,
+                                            complete,
+                                            sighash_type,
+                                            sign,
+                                            bip32derivs,
+                                            n_signed,
+                                            /*finalize=*/true,
+                                            sign ? pqc_usage_recorder.GetObserver() : PQCSignatureCounterObserver{});
+        if (pqc_usage) {
+            *pqc_usage = sign ? BuildSigningPQCUsageReport(pqc_usage_recorder) : PQCUsageReport{};
+        }
+        return err;
     }
     WalletBalances getBalances() override
     {
@@ -551,7 +585,15 @@ public:
                 JSONRPCRequest wallet_request = request;
                 wallet_request.context = &m_context;
                 return command.actor(wallet_request, result, last_handler);
-            }, command.argNames, command.unique_id);
+            }, command.argNames, command.unique_id, command.GetRpcMethod());
+            m_rpc_handlers.emplace_back(m_context.chain->handleRpc(m_rpc_commands.back()));
+        }
+        for (const CRPCCommand& command : GetWalletExternalSignerRPCCommands()) {
+            m_rpc_commands.emplace_back(command.category, command.name, [this, &command](const JSONRPCRequest& request, UniValue& result, bool last_handler) {
+                JSONRPCRequest wallet_request = request;
+                wallet_request.context = &m_context;
+                return command.actor(wallet_request, result, last_handler);
+            }, command.argNames, command.unique_id, command.GetRpcMethod());
             m_rpc_handlers.emplace_back(m_context.chain->handleRpc(m_rpc_commands.back()));
         }
     }

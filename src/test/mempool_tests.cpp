@@ -4,6 +4,7 @@
 
 #include <common/system.h>
 #include <policy/policy.h>
+#include <policy/settings.h>
 #include <test/util/txmempool.h>
 #include <txmempool.h>
 #include <util/time.h>
@@ -321,7 +322,7 @@ BOOST_AUTO_TEST_CASE(MempoolAncestorIndexingTest)
     tx2.vout[0].scriptPubKey = CScript() << OP_11 << OP_EQUAL;
     tx2.vout[0].nValue = 2 * COIN;
     AddToMempool(pool, entry.Fee(20000LL).FromTx(tx2));
-    uint64_t tx2Size = GetVirtualTransactionSize(CTransaction(tx2));
+    uint64_t tx2Size = GetVirtualTransactionSize(CTransaction(tx2), entry.sigOpCost, ::nBytesPerSigOp);
 
     /* lowest fee */
     CMutableTransaction tx3 = CMutableTransaction();
@@ -369,7 +370,7 @@ BOOST_AUTO_TEST_CASE(MempoolAncestorIndexingTest)
     tx6.vout.resize(1);
     tx6.vout[0].scriptPubKey = CScript() << OP_11 << OP_EQUAL;
     tx6.vout[0].nValue = 20 * COIN;
-    uint64_t tx6Size = GetVirtualTransactionSize(CTransaction(tx6));
+    uint64_t tx6Size = GetVirtualTransactionSize(CTransaction(tx6), entry.sigOpCost, ::nBytesPerSigOp);
 
     AddToMempool(pool, entry.Fee(0LL).FromTx(tx6));
     BOOST_CHECK_EQUAL(pool.size(), 6U);
@@ -388,7 +389,7 @@ BOOST_AUTO_TEST_CASE(MempoolAncestorIndexingTest)
     tx7.vout.resize(1);
     tx7.vout[0].scriptPubKey = CScript() << OP_11 << OP_EQUAL;
     tx7.vout[0].nValue = 10 * COIN;
-    uint64_t tx7Size = GetVirtualTransactionSize(CTransaction(tx7));
+    uint64_t tx7Size = GetVirtualTransactionSize(CTransaction(tx7), entry.sigOpCost, ::nBytesPerSigOp);
 
     /* set the fee to just below tx2's feerate when including ancestor */
     CAmount fee = (20000/tx2Size)*(tx7Size + tx6Size) - 1;
@@ -481,7 +482,7 @@ BOOST_AUTO_TEST_CASE(MempoolSizeLimitTest)
     BOOST_CHECK(!pool.exists(tx2.GetHash()));
     BOOST_CHECK(!pool.exists(tx3.GetHash()));
 
-    CFeeRate maxFeeRateRemoved(2500, GetVirtualTransactionSize(CTransaction(tx3)) + GetVirtualTransactionSize(CTransaction(tx2)));
+    CFeeRate maxFeeRateRemoved(2500, GetVirtualTransactionSize(CTransaction(tx3), entry.sigOpCost, ::nBytesPerSigOp) + GetVirtualTransactionSize(CTransaction(tx2), entry.sigOpCost, ::nBytesPerSigOp));
     BOOST_CHECK_EQUAL(pool.GetMinFee(1).GetFeePerK(), maxFeeRateRemoved.GetFeePerK() + DEFAULT_INCREMENTAL_RELAY_FEE);
 
     CMutableTransaction tx4 = CMutableTransaction();
@@ -574,11 +575,11 @@ BOOST_AUTO_TEST_CASE(MempoolSizeLimitTest)
     BOOST_CHECK_EQUAL(pool.GetMinFee(pool.DynamicMemoryUsage() * 9 / 2).GetFeePerK(), llround((maxFeeRateRemoved.GetFeePerK() + DEFAULT_INCREMENTAL_RELAY_FEE)/8.0));
     // ... with a 1/4 halflife when mempool is < 1/4 its target size
 
-    SetMockTime(42 + 7*CTxMemPool::ROLLING_FEE_HALFLIFE + CTxMemPool::ROLLING_FEE_HALFLIFE/2 + CTxMemPool::ROLLING_FEE_HALFLIFE/4);
+    SetMockTime(42 + 5*CTxMemPool::ROLLING_FEE_HALFLIFE + CTxMemPool::ROLLING_FEE_HALFLIFE/2 + CTxMemPool::ROLLING_FEE_HALFLIFE/4);
     BOOST_CHECK_EQUAL(pool.GetMinFee(1).GetFeePerK(), DEFAULT_INCREMENTAL_RELAY_FEE);
     // ... but feerate should never drop below DEFAULT_INCREMENTAL_RELAY_FEE
 
-    SetMockTime(42 + 8*CTxMemPool::ROLLING_FEE_HALFLIFE + CTxMemPool::ROLLING_FEE_HALFLIFE/2 + CTxMemPool::ROLLING_FEE_HALFLIFE/4);
+    SetMockTime(42 + 6*CTxMemPool::ROLLING_FEE_HALFLIFE + CTxMemPool::ROLLING_FEE_HALFLIFE/2 + CTxMemPool::ROLLING_FEE_HALFLIFE/4);
     BOOST_CHECK_EQUAL(pool.GetMinFee(1).GetFeePerK(), 0);
     // ... unless it has gone all the way to 0 (after getting past DEFAULT_INCREMENTAL_RELAY_FEE/2)
 }

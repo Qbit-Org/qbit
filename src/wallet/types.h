@@ -11,8 +11,8 @@
 //! dependencies. More complicated public wallet types like CCoinControl should
 //! be defined in dedicated header files.
 
-#ifndef BITCOIN_WALLET_TYPES_H
-#define BITCOIN_WALLET_TYPES_H
+#ifndef QBIT_WALLET_TYPES_H
+#define QBIT_WALLET_TYPES_H
 
 #include <type_traits>
 
@@ -32,4 +32,4 @@ enum class AddressPurpose {
 };
 } // namespace wallet
 
-#endif // BITCOIN_WALLET_TYPES_H
+#endif // QBIT_WALLET_TYPES_H

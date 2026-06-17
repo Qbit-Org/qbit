@@ -265,7 +265,6 @@ class CompactBlocksTest(BitcoinTestFramework):
 
     # This test actually causes bitcoind to (reasonably!) disconnect us, so do this last.
     def test_invalid_cmpctblock_message(self):
-        self.generate(self.nodes[0], COINBASE_MATURITY + 1)
         block = self.build_block_on_tip(self.nodes[0])
 
         cmpct_block = P2PHeaderAndShortIDs()
@@ -281,9 +280,10 @@ class CompactBlocksTest(BitcoinTestFramework):
     # bitcoind's choice of nonce.
     def test_compactblock_construction(self, test_node):
         node = self.nodes[0]
-        # Generate a bunch of transactions.
-        self.generate(node, COINBASE_MATURITY + 1)
         num_transactions = 25
+        # qbit's larger coinbase maturity means we only want to mature the
+        # exact number of cached MiniWallet outputs this test consumes.
+        self.wallet.ensure_spendable_utxos(min_spendable=num_transactions, mature_coinbase_count=num_transactions)
 
         segwit_tx_generated = False
         for _ in range(num_transactions):
@@ -598,7 +598,7 @@ class CompactBlocksTest(BitcoinTestFramework):
         node = self.nodes[0]
         # bitcoind will not send blocktxn responses for blocks whose height is
         # more than 10 blocks deep.
-        MAX_GETBLOCKTXN_DEPTH = 10
+        MAX_GETBLOCKTXN_DEPTH = 20
         chain_height = node.getblockcount()
         current_height = chain_height
         while (current_height >= chain_height - MAX_GETBLOCKTXN_DEPTH):
@@ -668,7 +668,7 @@ class CompactBlocksTest(BitcoinTestFramework):
     def test_compactblocks_not_at_tip(self, test_node):
         node = self.nodes[0]
         # Test that requesting old compactblocks doesn't work.
-        MAX_CMPCTBLOCK_DEPTH = 5
+        MAX_CMPCTBLOCK_DEPTH = 10
         new_blocks = []
         for _ in range(MAX_CMPCTBLOCK_DEPTH + 1):
             test_node.clear_block_announcement()

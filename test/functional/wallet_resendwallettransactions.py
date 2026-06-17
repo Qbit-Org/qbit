@@ -8,6 +8,7 @@ import time
 from decimal import Decimal
 
 from test_framework.blocktools import (
+    COINBASE_MATURITY,
     create_block,
     create_coinbase,
 )
@@ -30,6 +31,11 @@ class ResendWalletTransactionsTest(BitcoinTestFramework):
 
     def run_test(self):
         node = self.nodes[0]  # alias
+        fund_addr = node.getnewaddress()
+        if node.getblockcount() < COINBASE_MATURITY + 2:
+            self.generatetoaddress(node, COINBASE_MATURITY + 2 - node.getblockcount(), fund_addr)
+        while len(node.listunspent()) < 2:
+            self.generatetoaddress(node, 1, fund_addr)
 
         peer_first = node.add_p2p_connection(P2PTxInvStore())
 

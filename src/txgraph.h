@@ -11,8 +11,8 @@
 
 #include <util/feefrac.h>
 
-#ifndef BITCOIN_TXGRAPH_H
-#define BITCOIN_TXGRAPH_H
+#ifndef QBIT_TXGRAPH_H
+#define QBIT_TXGRAPH_H
 
 static constexpr unsigned MAX_CLUSTER_COUNT_LIMIT{64};
 
@@ -252,4 +252,4 @@ public:
  *  steps will be performed per cluster before they are considered to be of acceptable quality. */
 std::unique_ptr<TxGraph> MakeTxGraph(unsigned max_cluster_count, uint64_t max_cluster_size, uint64_t acceptable_iters) noexcept;
 
-#endif // BITCOIN_TXGRAPH_H
+#endif // QBIT_TXGRAPH_H

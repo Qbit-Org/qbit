@@ -66,6 +66,6 @@ const CRPCCommand commands[]{
 void RegisterZMQRPCCommands(CRPCTable& t)
 {
     for (const auto& c : commands) {
-        t.appendCommand(c.name, &c);
+        t.appendCommand(c.name, &c, RPCComponent::ZMQ);
     }
 }

@@ -29,5 +29,20 @@ BOOST_AUTO_TEST_CASE(walletdb_readkeyvalue)
     BOOST_CHECK_THROW(ssValue >> dummy, std::ios_base::failure);
 }
 
+BOOST_AUTO_TEST_CASE(walletdb_writecryptedpqckey_overwrite)
+{
+    auto database = std::make_unique<MockableDatabase>();
+    WalletBatch batch(*database);
+
+    CPQCKey key;
+    key.MakeNewKey();
+    const CPQCPubKey pubkey = key.GetPubKey();
+    const std::vector<unsigned char> secret(key.data(), key.data() + key.size());
+    const uint256 descriptor_id{};
+
+    BOOST_CHECK(batch.WriteCryptedDescriptorPQCKey(descriptor_id, pubkey, secret, /*sig_counter=*/0));
+    BOOST_CHECK(batch.WriteCryptedDescriptorPQCKey(descriptor_id, pubkey, secret, /*sig_counter=*/1));
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 } // namespace wallet

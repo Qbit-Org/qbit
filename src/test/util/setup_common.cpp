@@ -40,6 +40,7 @@
 #include <test/util/coverage.h>
 #include <test/util/net.h>
 #include <test/util/random.h>
+#include <test/util/script.h>
 #include <test/util/transaction_utils.h>
 #include <test/util/txmempool.h>
 #include <txdb.h>
@@ -276,6 +277,7 @@ ChainTestingSetup::ChainTestingSetup(const ChainType chainType, TestOpts opts)
         }
         const BlockManager::Options blockman_opts{
             .chainparams = chainman_opts.chainparams,
+            .witness_pruning_enabled = chainman_opts.chainparams.IsWitnessPruningEnabled(),
             .blocks_dir = m_args.GetBlocksDirPath(),
             .notifications = chainman_opts.notifications,
             .block_tree_db_params = DBParams{
@@ -370,25 +372,29 @@ TestChain100Setup::TestChain100Setup(
     TestOpts opts)
     : TestingSetup{ChainType::REGTEST, opts}
 {
-    SetMockTime(1598887952);
+    SetMockTime(1738713602); // qbit regtest genesis nTime
     constexpr std::array<unsigned char, 32> vchKey = {
         {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}};
     coinbaseKey.Set(vchKey.begin(), vchKey.end(), true);
 
-    // Generate a 100-block chain:
+    // Generate a COINBASE_MATURITY-block chain:
     this->mineBlocks(COINBASE_MATURITY);
 
     {
         LOCK(::cs_main);
-        assert(
-            m_node.chainman->ActiveChain().Tip()->GetBlockHash().ToString() ==
-            "0c8c5f79505775a0f6aed6aca2350718ceb9c6f2c878667864d5c7a6d8ffa2a6");
+        if (!Params().GetConsensus().fRestrictedOutputMode) {
+            assert(
+                m_node.chainman->ActiveChain().Tip()->GetBlockHash().ToString() ==
+                "0d9a36e4bfd4c358ab91a51c41c4452600a1e4c6aabb11f3190ee1a384046a4e");
+        }
     }
 }
 
 void TestChain100Setup::mineBlocks(int num_blocks)
 {
-    CScript scriptPubKey = CScript() << ToByteVector(coinbaseKey.GetPubKey()) << OP_CHECKSIG;
+    CScript scriptPubKey = Params().GetConsensus().fRestrictedOutputMode ?
+        P2MROpTrueScript() :
+        CScript() << ToByteVector(coinbaseKey.GetPubKey()) << OP_CHECKSIG;
     for (int i = 0; i < num_blocks; i++) {
         std::vector<CMutableTransaction> noTxns;
         CBlock b = CreateAndProcessBlock(noTxns, scriptPubKey);
@@ -470,10 +476,22 @@ std::pair<CMutableTransaction, CAmount> TestChain100Setup::CreateValidTransactio
         input_coins.insert({outpoint_to_spend, utxo_to_spend});
         inputs_amount += utxo_to_spend.out.nValue;
     }
+    const bool p2mr_op_true_inputs{std::all_of(inputs.begin(), inputs.end(), [&](const COutPoint& outpoint) {
+        return input_coins.at(outpoint).out.scriptPubKey == P2MROpTrueScript();
+    })};
+    const auto satisfy_p2mr_op_true_inputs = [&] {
+        for (auto& input : mempool_txn.vin) {
+            input.scriptWitness.stack = P2MROpTrueStack();
+        }
+    };
     // - Default signature hashing type
     int nHashType = SIGHASH_ALL;
     std::map<int, bilingual_str> input_errors;
-    assert(SignTransaction(mempool_txn, &keystore, input_coins, nHashType, input_errors));
+    if (p2mr_op_true_inputs) {
+        satisfy_p2mr_op_true_inputs();
+    } else {
+        assert(SignTransaction(mempool_txn, &keystore, input_coins, nHashType, input_errors));
+    }
     CAmount current_fee = inputs_amount - std::accumulate(outputs.begin(), outputs.end(), CAmount(0),
         [](const CAmount& acc, const CTxOut& out) {
         return acc + out.nValue;
@@ -490,7 +508,11 @@ std::pair<CMutableTransaction, CAmount> TestChain100Setup::CreateValidTransactio
             mempool_txn.vout[fee_output.value()].nValue -= deduction;
             // Re-sign since an output has changed
             input_errors.clear();
-            assert(SignTransaction(mempool_txn, &keystore, input_coins, nHashType, input_errors));
+            if (p2mr_op_true_inputs) {
+                satisfy_p2mr_op_true_inputs();
+            } else {
+                assert(SignTransaction(mempool_txn, &keystore, input_coins, nHashType, input_errors));
+            }
             current_fee = target_fee;
         }
     }

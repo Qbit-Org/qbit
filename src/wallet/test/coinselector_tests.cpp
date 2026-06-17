@@ -162,7 +162,9 @@ static std::unique_ptr<CWallet> NewWallet(const node::NodeContext& m_node, const
     BOOST_CHECK(wallet->LoadWallet() == DBErrors::LOAD_OK);
     LOCK(wallet->cs_wallet);
     wallet->SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
-    wallet->SetupDescriptorScriptPubKeyMans();
+
+    constexpr auto COINSELECTOR_OUTPUT_TYPES = std::array{OutputType::BECH32};
+    wallet->SetupDescriptorScriptPubKeyMans(COINSELECTOR_OUTPUT_TYPES);
     return wallet;
 }
 
@@ -244,7 +246,8 @@ BOOST_AUTO_TEST_CASE(bnb_search_test)
         coin_selection_params_bnb.m_long_term_feerate = CFeeRate(3000);
 
         // Add selectable outputs, increasing their raw amounts by their input fee to make the effective value equal to the raw amount
-        CAmount input_fee = coin_selection_params_bnb.m_effective_feerate.GetFee(/*virtual_bytes=*/68); // bech32 input size (default test output type)
+        // With WSF=1 (no witness discount), bech32 input vsize is 148 bytes (vs 68 with Bitcoin's WSF=4)
+        CAmount input_fee = coin_selection_params_bnb.m_effective_feerate.GetFee(/*virtual_bytes=*/148);
         add_coin(available_coins, *wallet, 10 * CENT + input_fee, coin_selection_params_bnb.m_effective_feerate, 6 * 24, false, 0, true);
         add_coin(available_coins, *wallet, 9 * CENT + input_fee, coin_selection_params_bnb.m_effective_feerate, 6 * 24, false, 0, true);
         add_coin(available_coins, *wallet, 1 * CENT + input_fee, coin_selection_params_bnb.m_effective_feerate, 6 * 24, false, 0, true);
@@ -993,7 +996,9 @@ BOOST_AUTO_TEST_CASE(coin_grinder_tests)
         // 2) Test max weight exceeded
         // ###########################
         CAmount target = 29.5L * COIN;
-        int max_selection_weight = 3000;
+        // With WSF=1, each bech32 input weighs ~68 WU (no witness discount).
+        // 20 inputs × 68 = ~1360 WU. Set limit below total weight to trigger failure.
+        int max_selection_weight = 1000;
         const auto& res = CoinGrinder(target, dummy_params, m_node, max_selection_weight, [&](CWallet& wallet) {
             CoinsResult available_coins;
             for (int j = 0; j < 10; ++j) {
@@ -1206,12 +1211,13 @@ BOOST_AUTO_TEST_CASE(srd_tests)
         // ###########################
         // 2) Test max weight exceeded
         // ###########################
-        CAmount target = 49.5L * COIN;
-        int max_selection_weight = 3000;
+        // Need all 20 coins (30 COIN) but limit weight below total.
+        // With WSF=1, each bech32 input weighs ~68 WU. 20 × 68 = ~1360 WU.
+        CAmount target = 25 * COIN;
+        int max_selection_weight = 1000;
         const auto& res = SelectCoinsSRD(target, dummy_params, m_node, max_selection_weight, [&](CWallet& wallet) {
             CoinsResult available_coins;
             for (int j = 0; j < 10; ++j) {
-                /* 10 × 1 BTC + 10 × 2 BTC = 30 BTC. 20 × 272 WU = 5440 WU */
                 add_coin(available_coins, wallet, CAmount(1 * COIN), CFeeRate(0), 144, false, 0, true);
                 add_coin(available_coins, wallet, CAmount(2 * COIN), CFeeRate(0), 144, false, 0, true);
             }
@@ -1250,7 +1256,9 @@ static util::Result<SelectionResult> select_coins(const CAmount& target, const C
     LOCK(wallet->cs_wallet);
     auto result = SelectCoins(*wallet, available_coins, /*pre_set_inputs=*/ {}, target, cc, cs_params);
     if (result) {
-        const auto signedTxSize = 10 + 34 + 68 * result->GetInputSet().size(); // static header size + output size + inputs size (P2WPKH)
+        // With WSF=1, bech32 input vsize is 148 bytes (no witness discount)
+        const int bech32_input_size = 148;
+        const auto signedTxSize = 10 + 34 + bech32_input_size * result->GetInputSet().size();
         BOOST_CHECK_LE(signedTxSize * WITNESS_SCALE_FACTOR, MAX_STANDARD_TX_WEIGHT);
 
         BOOST_CHECK_GE(result->GetSelectedValue(), target);
@@ -1269,10 +1277,12 @@ BOOST_AUTO_TEST_CASE(check_max_selection_weight)
     CCoinControl cc;
 
     FastRandomContext rand;
+    // With WSF=1, bech32 input vsize is 148 bytes (no witness discount)
+    const int bech32_input_size = 148;
     CoinSelectionParams cs_params{
         rand,
         /*change_output_size=*/34,
-        /*change_spend_size=*/68,
+        /*change_spend_size=*/bech32_input_size,
         /*min_change_target=*/CENT,
         /*effective_feerate=*/CFeeRate(0),
         /*long_term_feerate=*/CFeeRate(0),
@@ -1284,7 +1294,7 @@ BOOST_AUTO_TEST_CASE(check_max_selection_weight)
     int max_weight = MAX_STANDARD_TX_WEIGHT - WITNESS_SCALE_FACTOR * (cs_params.tx_noinputs_size + cs_params.change_output_size);
     {
         // Scenario 1:
-        // The actor starts with 1x 50.0 BTC and 1515x 0.033 BTC (~100.0 BTC total) unspent outputs
+        // The actor starts with 1x 50.0 BTC and 7000x 0.0071 BTC (99.7 BTC total) unspent outputs
         // Then tries to spend 49.5 BTC
         // The 50.0 BTC output should be selected, because the transaction would otherwise be too large
 
@@ -1293,8 +1303,8 @@ BOOST_AUTO_TEST_CASE(check_max_selection_weight)
         const auto result = select_coins(
             target, cs_params, cc, [&](CWallet& wallet) {
                 CoinsResult available_coins;
-                for (int j = 0; j < 1515; ++j) {
-                    add_coin(available_coins, wallet, CAmount(0.033 * COIN), CFeeRate(0), 144, false, 0, true);
+                for (int j = 0; j < 7000; ++j) {
+                    add_coin(available_coins, wallet, CAmount(0.0071 * COIN), CFeeRate(0), 144, false, 0, true);
                 }
 
                 add_coin(available_coins, wallet, CAmount(50 * COIN), CFeeRate(0), 144, false, 0, true);
@@ -1316,44 +1326,48 @@ BOOST_AUTO_TEST_CASE(check_max_selection_weight)
         // A combination of coins should be selected, such that the created transaction is not too large
 
         // Perform selection
+        // Adjusted coin counts for WSF=1:
+        // With bech32 input size of 148 WU, max ~2702 inputs fit within the default weight limit.
+        // Use 300 x 0.1 BTC (30 BTC) + 300 x 0.08 BTC (24 BTC) = 54 BTC total.
+        // Neither denomination alone can reach the 49.5 BTC target, so both must be used.
+        // Total inputs <= 600, weight <= 600 * 148 = 88,800 WU (within limit).
         const auto result = select_coins(
             target, cs_params, cc, [&](CWallet& wallet) {
                 CoinsResult available_coins;
-                for (int j = 0; j < 400; ++j) {
-                    add_coin(available_coins, wallet, CAmount(0.0625 * COIN), CFeeRate(0), 144, false, 0, true);
+                for (int j = 0; j < 300; ++j) {
+                    add_coin(available_coins, wallet, CAmount(0.1 * COIN), CFeeRate(0), 144, false, 0, true);
                 }
-                for (int j = 0; j < 2000; ++j) {
-                    add_coin(available_coins, wallet, CAmount(0.025 * COIN), CFeeRate(0), 144, false, 0, true);
+                for (int j = 0; j < 300; ++j) {
+                    add_coin(available_coins, wallet, CAmount(0.08 * COIN), CFeeRate(0), 144, false, 0, true);
                 }
                 return available_coins;
             },
             m_node);
 
-        BOOST_CHECK(has_coin(result->GetInputSet(), CAmount(0.0625 * COIN)));
-        BOOST_CHECK(has_coin(result->GetInputSet(), CAmount(0.025 * COIN)));
+        BOOST_CHECK(has_coin(result->GetInputSet(), CAmount(0.1 * COIN)));
+        BOOST_CHECK(has_coin(result->GetInputSet(), CAmount(0.08 * COIN)));
         BOOST_CHECK_LE(result->GetWeight(), max_weight);
     }
 
     {
         // Scenario 3:
 
-        // The actor starts with 1515x 0.033 BTC (49.995 BTC total) unspent outputs
+        // The actor starts with 7000x 0.0071 BTC (49.7 BTC total) unspent outputs
         // No results should be returned, because the transaction would be too large
 
         // Perform selection
         const auto result = select_coins(
             target, cs_params, cc, [&](CWallet& wallet) {
                 CoinsResult available_coins;
-                for (int j = 0; j < 1515; ++j) {
-                    add_coin(available_coins, wallet, CAmount(0.033 * COIN), CFeeRate(0), 144, false, 0, true);
+                for (int j = 0; j < 7000; ++j) {
+                    add_coin(available_coins, wallet, CAmount(0.0071 * COIN), CFeeRate(0), 144, false, 0, true);
                 }
                 return available_coins;
             },
             m_node);
 
         // No results
-        // 1515 inputs * 68 bytes = 103,020 bytes
-        // 103,020 bytes * 4 = 412,080 weight, which is above the MAX_STANDARD_TX_WEIGHT of 400,000
+        // The generated BECH32 coins need more than MAX_STANDARD_TX_WEIGHT of input weight.
         BOOST_CHECK(!result);
     }
 }

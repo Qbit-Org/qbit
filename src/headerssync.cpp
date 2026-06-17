@@ -5,6 +5,7 @@
 #include <headerssync.h>
 #include <logging.h>
 #include <pow.h>
+#include <serialize.h>
 #include <util/check.h>
 #include <util/time.h>
 #include <util/vector.h>
@@ -19,9 +20,29 @@ constexpr size_t HEADER_COMMITMENT_PERIOD{632};
 //! received and validated against commitments.
 constexpr size_t REDOWNLOAD_BUFFER_SIZE{15009}; // 15009/632 = ~23.7 commitments
 
-// Our memory analysis assumes 48 bytes for a CompressedHeader (so we should
-// re-calculate parameters if we compress further)
-static_assert(sizeof(CompressedHeader) == 48);
+//! Number of headers in a full headers message. Keep this synchronized with
+//! MAX_HEADERS_RESULTS in net_processing.h without including it here, since
+//! net_processing depends on headerssync.
+constexpr size_t HEADERS_MESSAGE_SIZE{2000};
+
+//! Maximum serialized AuxPoW payload bytes that can be retained by the
+//! redownload lookahead. This is derived from the number of full headers
+//! messages that can overlap the redownload buffer plus the current message
+//! being processed before PopHeadersReadyForAcceptance() drains it.
+constexpr size_t MAX_REDOWNLOAD_AUXPOW_SERIALIZED_SIZE{
+    ((REDOWNLOAD_BUFFER_SIZE + HEADERS_MESSAGE_SIZE + HEADERS_MESSAGE_SIZE - 1) / HEADERS_MESSAGE_SIZE) *
+    MAX_PROTOCOL_MESSAGE_LENGTH};
+
+// Our memory analysis assumes at most 64 bytes for a CompressedHeader (so we
+// should re-calculate parameters if we grow it further).
+static_assert(sizeof(CompressedHeader) <= 64);
+
+size_t CompressedHeader::AuxpowSerializedSize() const
+{
+    if (!auxpow) return 0;
+    if (!auxpow->coinbase_tx) return 0;
+    return GetSerializeSize(*auxpow);
+}
 
 HeadersSyncState::HeadersSyncState(NodeId id, const Consensus::Params& consensus_params,
         const CBlockIndex* chain_start, const arith_uint256& minimum_required_work) :
@@ -42,8 +63,78 @@ HeadersSyncState::HeadersSyncState(NodeId id, const Consensus::Params& consensus
     // chain to be longer than this (at the current time -- in the future we
     // could try again, if necessary, to sync a longer chain).
     m_max_commitments = 6*(Ticks<std::chrono::seconds>(NodeClock::now() - NodeSeconds{std::chrono::seconds{chain_start->GetMedianTimePast()}}) + MAX_FUTURE_BLOCK_TIME) / HEADER_COMMITMENT_PERIOD;
+    m_presync_difficulty = MakeHeaderDifficultyState();
+    m_redownload_difficulty = MakeHeaderDifficultyState();
 
     LogDebug(BCLog::NET, "Initial headers sync started with peer=%d: height=%i, max_commitments=%i, min_work=%s\n", m_id, m_current_height, m_max_commitments, m_minimum_required_work.ToString());
+}
+
+HeadersSyncState::HeaderDifficultyState HeadersSyncState::MakeHeaderDifficultyState() const
+{
+    HeaderDifficultyState state;
+    state.last_header = m_chain_start->GetBlockHeader();
+    state.height = m_chain_start->nHeight;
+    state.auxpow_count = m_chain_start->nAuxPow;
+
+    const CBlockIndex* pindex = m_chain_start;
+    while (pindex != nullptr) {
+        const ASERTHeaderState header_state{pindex->nHeight, pindex->GetBlockTime(), pindex->nAuxPow};
+        if (pindex->SignalsAuxpow()) {
+            if (!state.previous_auxpow) state.previous_auxpow = header_state;
+        } else {
+            if (!state.previous_permissionless) state.previous_permissionless = header_state;
+        }
+
+        if (state.previous_permissionless && state.previous_auxpow) break;
+        if (pindex->nHeight <= m_consensus_params.asertAnchorParams.nHeight) break;
+        pindex = pindex->pprev;
+    }
+
+    return state;
+}
+
+bool HeadersSyncState::ValidateAndAdvanceHeaderDifficulty(HeaderDifficultyState& state, const CBlockHeader& current)
+{
+    const int64_t next_height = state.height + 1;
+
+    if (!PermittedDifficultyTransition(m_consensus_params,
+                                       next_height,
+                                       state.last_header.nBits,
+                                       current.nBits,
+                                       state.last_header.GetBlockTime(),
+                                       current.GetBlockTime())) {
+        return false;
+    }
+
+    if (!m_consensus_params.fPowNoRetargeting &&
+        m_consensus_params.fPowUseASERT &&
+        m_consensus_params.CadenceActiveAtHeight(static_cast<int>(next_height))) {
+        const bool current_is_auxpow{current.SignalsAuxpow()};
+        const int64_t target_spacing{GetCadenceTargetSpacing(m_consensus_params, current_is_auxpow)};
+        uint32_t expected_nbits{0};
+        const uint32_t pow_limit_nbits{UintToArith256(m_consensus_params.powLimit).GetCompact()};
+        if (m_consensus_params.fPowAllowMinDifficultyBlocks &&
+            current.GetBlockTime() > state.last_header.GetBlockTime() + target_spacing * 2) {
+            expected_nbits = pow_limit_nbits;
+        } else {
+            expected_nbits = GetNextASERTWorkRequired(current_is_auxpow ? state.previous_auxpow : state.previous_permissionless,
+                                                      current_is_auxpow,
+                                                      m_consensus_params);
+        }
+        if (current.nBits != expected_nbits) return false;
+    }
+
+    const bool current_is_auxpow{current.SignalsAuxpow()};
+    state.auxpow_count += current_is_auxpow ? 1 : 0;
+    const ASERTHeaderState current_state{next_height, current.GetBlockTime(), state.auxpow_count};
+    if (current_is_auxpow) {
+        state.previous_auxpow = current_state;
+    } else {
+        state.previous_permissionless = current_state;
+    }
+    state.last_header = current;
+    state.height = next_height;
+    return true;
 }
 
 /** Free any memory in use, and mark this object as no longer usable. This is
@@ -57,6 +148,7 @@ void HeadersSyncState::Finalize()
     ClearShrink(m_redownloaded_headers);
     m_redownload_buffer_last_hash.SetNull();
     m_redownload_buffer_first_prev_hash.SetNull();
+    m_redownload_auxpow_serialized_size = 0;
     m_process_all_remaining_headers = false;
     m_current_height = 0;
 
@@ -168,7 +260,9 @@ bool HeadersSyncState::ValidateAndStoreHeadersCommitments(const std::vector<CBlo
         m_redownload_buffer_last_height = m_chain_start->nHeight;
         m_redownload_buffer_first_prev_hash = m_chain_start->GetBlockHash();
         m_redownload_buffer_last_hash = m_chain_start->GetBlockHash();
+        m_redownload_auxpow_serialized_size = 0;
         m_redownload_chain_work = m_chain_start->nChainWork;
+        m_redownload_difficulty = MakeHeaderDifficultyState();
         m_download_state = State::REDOWNLOAD;
         LogDebug(BCLog::NET, "Initial headers sync transition with peer=%d: reached sufficient work at height=%i, redownloading from height=%i\n", m_id, m_current_height, m_redownload_buffer_last_height);
     }
@@ -182,13 +276,7 @@ bool HeadersSyncState::ValidateAndProcessSingleHeader(const CBlockHeader& curren
 
     int next_height = m_current_height + 1;
 
-    // Verify that the difficulty isn't growing too fast; an adversary with
-    // limited hashing capability has a greater chance of producing a high
-    // work chain if they compress the work into as few blocks as possible,
-    // so don't let anyone give a chain that would violate the difficulty
-    // adjustment maximum.
-    if (!PermittedDifficultyTransition(m_consensus_params, next_height,
-                m_last_header_received.nBits, current.nBits)) {
+    if (!ValidateAndAdvanceHeaderDifficulty(m_presync_difficulty, current)) {
         LogDebug(BCLog::NET, "Initial headers sync aborted with peer=%d: invalid difficulty transition at height=%i (presync phase)\n", m_id, next_height);
         return false;
     }
@@ -227,16 +315,7 @@ bool HeadersSyncState::ValidateAndStoreRedownloadedHeader(const CBlockHeader& he
         return false;
     }
 
-    // Check that the difficulty adjustments are within our tolerance:
-    uint32_t previous_nBits{0};
-    if (!m_redownloaded_headers.empty()) {
-        previous_nBits = m_redownloaded_headers.back().nBits;
-    } else {
-        previous_nBits = m_chain_start->nBits;
-    }
-
-    if (!PermittedDifficultyTransition(m_consensus_params, next_height,
-                previous_nBits, header.nBits)) {
+    if (!ValidateAndAdvanceHeaderDifficulty(m_redownload_difficulty, header)) {
         LogDebug(BCLog::NET, "Initial headers sync aborted with peer=%d: invalid difficulty transition at height=%i (redownload phase)\n", m_id, next_height);
         return false;
     }
@@ -271,7 +350,14 @@ bool HeadersSyncState::ValidateAndStoreRedownloadedHeader(const CBlockHeader& he
     }
 
     // Store this header for later processing.
-    m_redownloaded_headers.emplace_back(header);
+    CompressedHeader compressed_header{header};
+    const size_t auxpow_serialized_size{compressed_header.AuxpowSerializedSize()};
+    if (auxpow_serialized_size > MAX_REDOWNLOAD_AUXPOW_SERIALIZED_SIZE - m_redownload_auxpow_serialized_size) {
+        LogDebug(BCLog::NET, "Initial headers sync aborted with peer=%d: retained auxpow serialized size exceeded limit at height=%i (redownload phase)\n", m_id, next_height);
+        return false;
+    }
+    m_redownload_auxpow_serialized_size += auxpow_serialized_size;
+    m_redownloaded_headers.push_back(std::move(compressed_header));
     m_redownload_buffer_last_height = next_height;
     m_redownload_buffer_last_hash = header.GetHash();
 
@@ -288,6 +374,7 @@ std::vector<CBlockHeader> HeadersSyncState::PopHeadersReadyForAcceptance()
     while (m_redownloaded_headers.size() > REDOWNLOAD_BUFFER_SIZE ||
             (m_redownloaded_headers.size() > 0 && m_process_all_remaining_headers)) {
         ret.emplace_back(m_redownloaded_headers.front().GetFullHeader(m_redownload_buffer_first_prev_hash));
+        m_redownload_auxpow_serialized_size -= m_redownloaded_headers.front().AuxpowSerializedSize();
         m_redownloaded_headers.pop_front();
         m_redownload_buffer_first_prev_hash = ret.back().GetHash();
     }

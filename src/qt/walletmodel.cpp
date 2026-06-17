@@ -201,11 +201,19 @@ WalletModel::SendCoinsReturn WalletModel::prepareTransaction(WalletModelTransact
     try {
         CAmount nFeeRequired = 0;
         int nChangePosRet = -1;
+        wallet::PQCUsageReport pqc_usage;
 
         auto& newTx = transaction.getWtx();
-        const auto& res = m_wallet->createTransaction(vecSend, coinControl, /*sign=*/!wallet().privateKeysDisabled(), nChangePosRet, nFeeRequired);
+        transaction.setPQCUsageReport({});
+        const auto& res = m_wallet->createTransaction(vecSend,
+                                                      coinControl,
+                                                      /*sign=*/!wallet().privateKeysDisabled(),
+                                                      nChangePosRet,
+                                                      nFeeRequired,
+                                                      &pqc_usage);
         newTx = res ? *res : nullptr;
         transaction.setTransactionFee(nFeeRequired);
+        transaction.setPQCUsageReport(pqc_usage);
         if (fSubtractFeeFromAmount && newTx)
             transaction.reassignAmounts(nChangePosRet);
 
@@ -486,15 +494,15 @@ bool WalletModel::bumpFee(Txid hash, Txid& new_hash)
     questionString.append("<tr><td>");
     questionString.append(tr("Current fee:"));
     questionString.append("</td><td>");
-    questionString.append(BitcoinUnits::formatHtmlWithUnit(getOptionsModel()->getDisplayUnit(), old_fee));
+    questionString.append(QbitUnits::formatHtmlWithUnit(getOptionsModel()->getDisplayUnit(), old_fee));
     questionString.append("</td></tr><tr><td>");
     questionString.append(tr("Increase:"));
     questionString.append("</td><td>");
-    questionString.append(BitcoinUnits::formatHtmlWithUnit(getOptionsModel()->getDisplayUnit(), new_fee - old_fee));
+    questionString.append(QbitUnits::formatHtmlWithUnit(getOptionsModel()->getDisplayUnit(), new_fee - old_fee));
     questionString.append("</td></tr><tr><td>");
     questionString.append(tr("New fee:"));
     questionString.append("</td><td>");
-    questionString.append(BitcoinUnits::formatHtmlWithUnit(getOptionsModel()->getDisplayUnit(), new_fee));
+    questionString.append(QbitUnits::formatHtmlWithUnit(getOptionsModel()->getDisplayUnit(), new_fee));
     questionString.append("</td></tr></table>");
 
     // Display warning in the "Confirm fee bump" window if the "Coin Control Features" option is enabled

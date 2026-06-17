@@ -6,6 +6,7 @@
 
 A wallet may have different types of UTXOs to choose from during coin selection,
 where output type is one of the following:
+    - P2MR
     - BECH32M
     - BECH32
     - P2SH-SEGWIT
@@ -15,7 +16,7 @@ This test verifies that mixing different output types is avoided unless
 absolutely necessary. Both wallets start with zero funds. Alice mines
 enough blocks to have spendable coinbase outputs. Alice sends three
 random value payments which sum to 10BTC for each output type to Bob,
-for a total of 40BTC in Bob's wallet.
+for a total of 50BTC in Bob's wallet.
 
 Bob then sends random valued payments back to Alice, some of which need
 unconfirmed change, and we verify that none of these payments contain mixed
@@ -32,6 +33,7 @@ from test_framework.test_framework import BitcoinTestFramework
 from test_framework.blocktools import COINBASE_MATURITY
 
 ADDRESS_TYPES = [
+    "p2mr",
     "bech32m",
     "bech32",
     "p2sh-segwit",
@@ -49,6 +51,12 @@ def is_bech32m_address(node, addr):
     """Check if an address contains a bech32m output."""
     addr_info = node.getaddressinfo(addr)
     return addr_info['desc'].startswith('tr(')
+
+
+def is_p2mr_address(node, addr):
+    """Check if an address contains a p2mr output."""
+    addr_info = node.getaddressinfo(addr)
+    return addr_info['desc'].startswith('mr(')
 
 
 def is_p2sh_segwit_address(node, addr):
@@ -83,6 +91,7 @@ def is_same_type(node, tx):
     has_p2sh = False
     has_bech32 = False
     has_bech32m = False
+    has_p2mr = False
 
     for addr in inputs:
         if is_legacy_address(node, addr):
@@ -93,8 +102,10 @@ def is_same_type(node, tx):
             has_bech32 = True
         if is_bech32m_address(node, addr):
             has_bech32m = True
+        if is_p2mr_address(node, addr):
+            has_p2mr = True
 
-    return (sum([has_legacy, has_p2sh, has_bech32, has_bech32m]) == 1)
+    return (sum([has_legacy, has_p2sh, has_bech32, has_bech32m, has_p2mr]) == 1)
 
 
 def generate_payment_values(n, m):
@@ -126,7 +137,7 @@ class AddressInputTypeGrouping(BitcoinTestFramework):
 
     def make_payment(self, A, B, v, addr_type):
         fee_rate = random.randint(1, 20)
-        self.log.debug(f"Making payment of {v} BTC at fee_rate {fee_rate}")
+        self.log.debug(f"Making payment of {v} coins at fee_rate {fee_rate}")
         tx = B.sendtoaddress(
             address=A.getnewaddress(address_type=addr_type),
             amount=v,
@@ -139,22 +150,28 @@ class AddressInputTypeGrouping(BitcoinTestFramework):
         # alias self.nodes[i] to A, B for readability
         A, B = self.nodes[0], self.nodes[1]
         self.generate(A, COINBASE_MATURITY + 5)
+        while A.getbalance() < 10 * len(ADDRESS_TYPES) + 10:
+            self.generate(A, 1)
 
         self.log.info("Creating mixed UTXOs in B's wallet")
         for v in generate_payment_values(3, 10):
-            self.log.debug(f"Making payment of {v} BTC to legacy")
+            self.log.debug(f"Making payment of {v} coins to p2mr")
+            A.sendtoaddress(B.getnewaddress(address_type="p2mr"), v)
+
+        for v in generate_payment_values(3, 10):
+            self.log.debug(f"Making payment of {v} coins to legacy")
             A.sendtoaddress(B.getnewaddress(address_type="legacy"), v)
 
         for v in generate_payment_values(3, 10):
-            self.log.debug(f"Making payment of {v} BTC to p2sh")
+            self.log.debug(f"Making payment of {v} coins to p2sh")
             A.sendtoaddress(B.getnewaddress(address_type="p2sh-segwit"), v)
 
         for v in generate_payment_values(3, 10):
-            self.log.debug(f"Making payment of {v} BTC to bech32")
+            self.log.debug(f"Making payment of {v} coins to bech32")
             A.sendtoaddress(B.getnewaddress(address_type="bech32"), v)
 
         for v in generate_payment_values(3, 10):
-            self.log.debug(f"Making payment of {v} BTC to bech32m")
+            self.log.debug(f"Making payment of {v} coins to bech32m")
             A.sendtoaddress(B.getnewaddress(address_type="bech32m"), v)
 
         self.generate(A, 1)

@@ -10,9 +10,15 @@ See feature_assumeutxo.py for background.
 - TODO: test loading a wallet (backup) on a pruned node
 
 """
+from pathlib import Path
+import re
+
 from test_framework.address import address_to_scriptpubkey
 from test_framework.descriptors import descsum_create
-from test_framework.test_framework import BitcoinTestFramework
+from test_framework.test_framework import (
+    BitcoinTestFramework,
+    SkipTest,
+)
 from test_framework.messages import COIN
 from test_framework.util import (
     assert_equal,
@@ -27,9 +33,23 @@ SNAPSHOT_BASE_HEIGHT = 299
 FINAL_HEIGHT = 399
 
 
+def regtest_assumeutxo_configured():
+    here = Path(__file__).resolve()
+    root = next((p for p in (here.parent, *here.parents) if (p / "src/kernel/chainparams.cpp").is_file()), None)
+    if root is None:
+        return True
+    chainparams = (root / "src/kernel/chainparams.cpp").read_text(encoding="utf-8")
+    match = re.search(r"class CRegTestParams\b.*?m_assumeutxo_data\s*=\s*\{(.*?)\};", chainparams, re.DOTALL)
+    if match is None:
+        return True
+    return bool(match.group(1).strip())
+
+
 class AssumeutxoTest(BitcoinTestFramework):
     def skip_test_if_missing_module(self):
         self.skip_if_no_wallet()
+        if not regtest_assumeutxo_configured():
+            raise SkipTest("regtest assumeutxo snapshots are not configured")
 
     def set_test_params(self):
         """Use the pregenerated, deterministic chain up to height 199."""

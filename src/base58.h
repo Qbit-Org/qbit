@@ -11,8 +11,8 @@
  * - E-mail usually won't line-break if there's no punctuation to break at.
  * - Double-clicking selects the whole string as one word if it's all alphanumeric.
  */
-#ifndef BITCOIN_BASE58_H
-#define BITCOIN_BASE58_H
+#ifndef QBIT_BASE58_H
+#define QBIT_BASE58_H
 
 #include <span.h>
 
@@ -41,4 +41,4 @@ std::string EncodeBase58Check(std::span<const unsigned char> input);
  */
 [[nodiscard]] bool DecodeBase58Check(const std::string& str, std::vector<unsigned char>& vchRet, int max_ret_len);
 
-#endif // BITCOIN_BASE58_H
+#endif // QBIT_BASE58_H

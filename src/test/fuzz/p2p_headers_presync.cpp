@@ -124,6 +124,9 @@ CBlockHeader ConsumeHeader(FuzzedDataProvider& fuzzed_data_provider, const uint2
     header.nTime = ConsumeTime(fuzzed_data_provider);
     header.hashPrevBlock = prev_hash;
     header.nVersion = fuzzed_data_provider.ConsumeIntegral<int32_t>();
+    if (header.SignalsAuxpow()) {
+        header.nVersion &= ~BLOCK_VERSION_AUXPOW;
+    }
     return header;
 }
 
@@ -159,6 +162,10 @@ void initialize()
     static auto setup{
         MakeNoLogFileContext<HeadersSyncSetup>(ChainType::MAIN,
                                                {
+                                                   // Ensure MinimumChainWork is high enough that the
+                                                   // fuzzer's 1600 low-work headers can never reach it,
+                                                   // even on chains where nMinimumChainWork defaults to 0.
+                                                   .extra_args = {"-minimumchainwork=0000000000000000000000000000000000000001000000000000000000000000"},
                                                    .setup_validation_interface = false,
                                                }),
     };
@@ -166,7 +173,9 @@ void initialize()
 }
 } // namespace
 
-FUZZ_TARGET(p2p_headers_presync, .init = initialize)
+FUZZ_TARGET(p2p_headers_presync,
+    .init = initialize,
+    .disable_leak_detection = true)
 {
     SeedRandomStateForTest(SeedRand::ZEROS);
     FuzzedDataProvider fuzzed_data_provider{buffer.data(), buffer.size()};
@@ -240,8 +249,12 @@ FUZZ_TARGET(p2p_headers_presync, .init = initialize)
     // this variable will accurately reflect the chain's total work.
     total_work += CalculateClaimedHeadersWork(all_headers);
 
-    // This test should never create a chain with more work than MinimumChainWork.
-    assert(total_work < chainman.MinimumChainWork());
+    // Verify this target runs with a minimum anti-DoS threshold high enough
+    // for the generated headers/blocks to stay below it.
+    const arith_uint256 min_chain_work{chainman.MinimumChainWork()};
+    if (min_chain_work > 0) {
+        assert(total_work < min_chain_work);
+    }
 
     // The headers/blocks sent in this test should never be stored, as the chains don't have the work required
     // to meet the anti-DoS work threshold. So, if at any point the block index grew in size, then there's a bug

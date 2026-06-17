@@ -1,0 +1,23 @@
+{
+  "network": "main",
+  "pow_limit_bits": "0x1f00ffff",
+  "genesis": {
+    "temporary_bits": "0x1f00ffff",
+    "source": "Temporary development genesis target. Final mainnet genesis will be mined later; ASERT anchors carry the draft launch difficulty."
+  },
+  "permissionless": {
+    "model": "fdv_hashprice",
+    "fdv_usd": "100000000",
+    "total_supply_qbt": "210000000",
+    "subsidy_qbt": "210",
+    "expected_fees_qbt": "0",
+    "hashprice_usd_per_ph_day": "30.67"
+  },
+  "auxpow": {
+    "model": "bitcoin_hashrate_share",
+    "bitcoin_global_hashrate_eh_s": "1000",
+    "hashrate_share": "0.01",
+    "target_spacing_sec": "300",
+    "source": "Draft rounded launch assumption. Replace with sourced Bitcoin hashrate snapshot before final mainnet genesis."
+  }
+}

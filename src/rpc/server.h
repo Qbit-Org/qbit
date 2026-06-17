@@ -3,8 +3,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_RPC_SERVER_H
-#define BITCOIN_RPC_SERVER_H
+#ifndef QBIT_RPC_SERVER_H
+#define QBIT_RPC_SERVER_H
 
 #include <rpc/request.h>
 #include <rpc/util.h>
@@ -38,6 +38,21 @@ bool RPCIsInWarmup(std::string *outStatus);
 
 typedef RPCHelpMan (*RpcMethodFnType)();
 
+enum class RPCComponent {
+    CORE,
+    WALLET,
+    ZMQ,
+    SIGNER,
+};
+
+struct RPCCommandDoc {
+    std::string category;
+    std::string name;
+    RPCComponent component;
+    RPCHelpMan help;
+    bool requires_external_signer{false};
+};
+
 class CRPCCommand
 {
 public:
@@ -47,9 +62,9 @@ public:
     using Actor = std::function<bool(const JSONRPCRequest& request, UniValue& result, bool last_handler)>;
 
     //! Constructor taking Actor callback supporting multiple handlers.
-    CRPCCommand(std::string category, std::string name, Actor actor, std::vector<std::pair<std::string, bool>> args, intptr_t unique_id)
+    CRPCCommand(std::string category, std::string name, Actor actor, std::vector<std::pair<std::string, bool>> args, intptr_t unique_id, RpcMethodFnType rpc_method = nullptr)
         : category(std::move(category)), name(std::move(name)), actor(std::move(actor)), argNames(std::move(args)),
-          unique_id(unique_id)
+          unique_id(unique_id), m_rpc_method(rpc_method)
     {
     }
 
@@ -60,9 +75,14 @@ public:
               fn().m_name,
               [fn](const JSONRPCRequest& request, UniValue& result, bool) { result = fn().HandleRequest(request); return true; },
               fn().GetArgNames(),
-              intptr_t(fn))
+              intptr_t(fn),
+              fn)
     {
     }
+
+    bool HasRpcMethod() const { return m_rpc_method != nullptr; }
+    RpcMethodFnType GetRpcMethod() const { return m_rpc_method; }
+    RPCHelpMan GetHelpMan() const { return (*CHECK_NONFATAL(m_rpc_method))(); }
 
     std::string category;
     std::string name;
@@ -78,6 +98,9 @@ public:
     //! appended after other arguments, see transformNamedArguments for details.
     std::vector<std::pair<std::string, bool>> argNames;
     intptr_t unique_id;
+
+private:
+    RpcMethodFnType m_rpc_method;
 };
 
 /**
@@ -87,6 +110,11 @@ class CRPCTable
 {
 private:
     std::map<std::string, std::vector<const CRPCCommand*>> mapCommands;
+    std::map<std::string, RPCComponent> mapCommandComponents;
+    std::map<std::string, bool> mapCommandRequiresExternalSigner;
+    //! Optional runtime guard used by the global RPC table without forcing all
+    //! appendCommand callers to link the full RPC server implementation.
+    std::function<bool()> m_registration_allowed;
 public:
     CRPCTable();
     std::string help(const std::string& name, const JSONRPCRequest& helpreq) const;
@@ -122,8 +150,29 @@ public:
      * between calls based on method name, and aliased commands can also
      * register different names, types, and numbers of parameters.
      */
-    void appendCommand(const std::string& name, const CRPCCommand* pcmd);
+    void appendCommand(
+        const std::string& name,
+        const CRPCCommand* pcmd,
+        RPCComponent component = RPCComponent::CORE,
+        bool requires_external_signer = false)
+    {
+        if (m_registration_allowed) {
+            CHECK_NONFATAL(m_registration_allowed()); // Only add commands before rpc is running
+        }
+
+        mapCommands[name].push_back(pcmd);
+        auto [it, inserted] = mapCommandComponents.emplace(name, component);
+        if (!inserted) {
+            CHECK_NONFATAL(it->second == component);
+        }
+        auto [signer_it, signer_inserted] =
+            mapCommandRequiresExternalSigner.emplace(name, requires_external_signer);
+        if (!signer_inserted) {
+            CHECK_NONFATAL(signer_it->second == requires_external_signer);
+        }
+    }
     bool removeCommand(const std::string& name, const CRPCCommand* pcmd);
+    std::vector<RPCCommandDoc> GetCommandDocs() const;
 };
 
 bool IsDeprecatedRPCEnabled(const std::string& method);
@@ -135,4 +184,4 @@ void InterruptRPC();
 void StopRPC();
 UniValue JSONRPCExec(const JSONRPCRequest& jreq, bool catch_errors);
 
-#endif // BITCOIN_RPC_SERVER_H
+#endif // QBIT_RPC_SERVER_H

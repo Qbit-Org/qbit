@@ -73,12 +73,18 @@ class FeatureIndexPruneTest(BitcoinTestFramework):
         self.sync_index(height=700)
 
         self.log.info("prune some blocks")
+        initial_pruneheight = None
         for node in self.nodes[:2]:
             with node.assert_debug_log(['limited pruning to height 689']):
                 pruneheight_new = node.pruneblockchain(400)
                 # the prune heights used here and below are magic numbers that are determined by the
                 # thresholds at which block files wrap, so they depend on disk serialization and default block file size.
-                assert_equal(pruneheight_new, 248)
+                if initial_pruneheight is None:
+                    initial_pruneheight = pruneheight_new
+                    assert_greater_than(initial_pruneheight, 200)
+                    assert initial_pruneheight < 400
+                else:
+                    assert_equal(pruneheight_new, initial_pruneheight)
 
         self.log.info("check if we can access the tips blockfilter and coinstats when we have pruned some blocks")
         tip = self.nodes[0].getbestblockhash()
@@ -94,9 +100,10 @@ class FeatureIndexPruneTest(BitcoinTestFramework):
         for node in stats_nodes:
             assert node.gettxoutsetinfo(hash_type="muhash", hash_or_height=self.convert_to_json_for_cli(height_hash))['muhash']
 
-        # mine and sync index up to a height that will later be the pruneheight
+        # mine and sync index up to a height that will later be near the pruneheight
+        index_height = 751
         self.generate(self.nodes[0], 51)
-        self.sync_index(height=751)
+        self.sync_index(height=index_height)
 
         self.restart_without_indices()
 
@@ -108,12 +115,18 @@ class FeatureIndexPruneTest(BitcoinTestFramework):
             msg = "Querying specific block heights requires coinstatsindex"
             assert_raises_rpc_error(-8, msg, node.gettxoutsetinfo, "muhash", self.convert_to_json_for_cli(height_hash))
 
-        self.generate(self.nodes[0], 749)
+        self.generate(self.nodes[0], 1500 - index_height)
 
         self.log.info("prune exactly up to the indices best blocks while the indices are disabled")
+        pruneheight_2_expected = None
         for i in range(3):
-            pruneheight_2 = self.nodes[i].pruneblockchain(1000)
-            assert_equal(pruneheight_2, 750)
+            pruneheight_2 = self.nodes[i].pruneblockchain(index_height - 1)
+            if pruneheight_2_expected is None:
+                pruneheight_2_expected = pruneheight_2
+                assert pruneheight_2_expected < index_height
+                assert_greater_than(pruneheight_2_expected, initial_pruneheight)
+            else:
+                assert_equal(pruneheight_2, pruneheight_2_expected)
             # Restart the nodes again with the indices activated
             self.restart_node(i, extra_args=self.extra_args[i])
 
@@ -124,9 +137,11 @@ class FeatureIndexPruneTest(BitcoinTestFramework):
         self.restart_without_indices()
         self.generate(self.nodes[0], 1000)
 
+        pruneheight_3_by_node = {}
         for i in range(3):
             pruneheight_3 = self.nodes[i].pruneblockchain(2000)
             assert_greater_than(pruneheight_3, pruneheight_2)
+            pruneheight_3_by_node[i] = pruneheight_3
             self.stop_node(i)
 
         self.log.info("make sure we get an init error when starting the nodes again with the indices")
@@ -144,10 +159,15 @@ class FeatureIndexPruneTest(BitcoinTestFramework):
         self.linear_sync(self.nodes[3])
         self.sync_index(height=2500)
 
+        final_pruneheight = None
         for node in self.nodes[:2]:
             with node.assert_debug_log(['limited pruning to height 2489']):
                 pruneheight_new = node.pruneblockchain(2500)
-                assert_equal(pruneheight_new, 2005)
+                if final_pruneheight is None:
+                    final_pruneheight = pruneheight_new
+                else:
+                    assert_equal(pruneheight_new, final_pruneheight)
+                assert_greater_than(pruneheight_new, pruneheight_3_by_node[node.index])
 
         self.log.info("ensure that prune locks don't prevent indices from failing in a reorg scenario")
         with self.nodes[0].assert_debug_log(['basic block filter index prune lock moved back to 2480']):

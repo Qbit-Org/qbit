@@ -3,7 +3,7 @@
 # Usage: env [ CC=... ] [ C_STANDARD=...] [ CXX=... ] [CXX_STANDARD=...] \
 #            [ CPPFLAGS=... ] [CFLAGS=...] [CXXFLAGS=...] [LDFLAGS=...] \
 #            [ AR=... ] [ NM=... ] [ RANLIB=... ] [ STRIP=... ] [ DEBUG=... ] \
-#            [ LTO=... ] ./gen_id [ID_SALT]...
+#            [ LTO=... ] [ HOST_OS=... ] ./gen_id [ID_SALT]...
 #
 # Prints to stdout a SHA256 hash representing the current toolset, used by
 # depends/Makefile as a build id for caching purposes (detecting when the
@@ -47,14 +47,18 @@
     echo "BEGIN CC"
     bash -c "${CC} -v"
     bash -c "${CC} -v -E -xc -o /dev/null - < /dev/null"
-    bash -c "${CC} -v -E -xobjective-c -o /dev/null - < /dev/null"
+    if [ "$HOST_OS" = "darwin" ]; then
+      bash -c "${CC} -v -E -xobjective-c -o /dev/null - < /dev/null"
+    fi
     echo "C_STANDARD=${C_STANDARD}"
     echo "END CC"
 
     echo "BEGIN CXX"
     bash -c "${CXX} -v"
     bash -c "${CXX} -v -E -xc++ -o /dev/null - < /dev/null"
-    bash -c "${CXX} -v -E -xobjective-c++ -o /dev/null - < /dev/null"
+    if [ "$HOST_OS" = "darwin" ]; then
+      bash -c "${CXX} -v -E -xobjective-c++ -o /dev/null - < /dev/null"
+    fi
     echo "CXX_STANDARD=${CXX_STANDARD}"
     echo "END CXX"
 

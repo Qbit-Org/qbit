@@ -1,0 +1,105 @@
+# FreeBSD Build Guide
+
+**Updated for FreeBSD [14.3](https://www.freebsd.org/releases/14.3R/announce/)**
+
+This guide describes how to build qbitd, command-line utilities, and GUI on FreeBSD.
+
+## Preparation
+
+### 1. Install Required Dependencies
+Run the following as root to install the base dependencies for building.
+
+```bash
+pkg install boost-libs cmake git libevent pkgconf
+```
+
+SQLite is required for the wallet:
+
+```bash
+pkg install sqlite3
+```
+
+To build qbit without the wallet, use `-DENABLE_WALLET=OFF`.
+
+Cap'n Proto is needed for IPC functionality (see [multiprocess.md](/doc/integration/multiprocess.md)):
+
+```bash
+pkg install capnproto
+```
+
+Compile with `-DENABLE_IPC=OFF` if you do not need IPC functionality.
+
+See [dependencies.md](/doc/build/dependencies.md) for a complete overview.
+
+### 2. Clone qbit Repository
+Now that `git` and all the required dependencies are installed, let's clone the qbit repository to a directory. All build scripts and commands will run from this directory.
+```bash
+git clone <qbit-repository-url>
+```
+
+### 3. Install Optional Dependencies
+
+#### GUI Dependencies
+###### Qt6
+
+qbit includes a GUI built with the cross-platform Qt Framework. To compile the GUI, we need to install
+the necessary parts of Qt, the libqrencode and pass `-DBUILD_GUI=ON`. Skip if you don't intend to use the GUI.
+
+```bash
+pkg install qt6-base qt6-tools
+```
+
+###### libqrencode
+
+The GUI will be able to encode addresses in QR codes unless this feature is explicitly disabled. To install libqrencode, run:
+
+```bash
+pkg install libqrencode
+```
+
+Otherwise, if you don't need QR encoding support, use the `-DWITH_QRENCODE=OFF` option to disable this feature in order to compile the GUI.
+
+---
+
+#### Notifications
+###### ZeroMQ
+
+qbit can provide notifications via ZeroMQ. If the package is installed, support will be compiled in.
+```bash
+pkg install libzmq4
+```
+
+#### Test Suite Dependencies
+There is an included test suite that is useful for testing code changes when developing.
+To run the test suite (recommended), you will need to have Python 3 installed:
+
+```bash
+pkg install python3 databases/py-sqlite3 net/py-pyzmq
+```
+---
+
+## Building qbit
+
+### 1. Configuration
+
+There are many ways to configure qbit, here are a few common examples:
+
+##### Wallet and GUI:
+This enables the GUI, assuming `sqlite` and `qt` are installed.
+```bash
+cmake -B build -DBUILD_GUI=ON
+```
+
+Run `cmake -B build -LH` to see the full list of available options.
+
+##### No Wallet or GUI
+```bash
+cmake -B build -DENABLE_WALLET=OFF
+```
+
+### 2. Compile
+
+```bash
+cmake --build build     # Append "-j N" for N parallel jobs.
+ctest --test-dir build  # Append "-j N" for N parallel tests.
+```

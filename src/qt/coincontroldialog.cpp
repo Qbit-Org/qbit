@@ -6,12 +6,13 @@
 #include <qt/forms/ui_coincontroldialog.h>
 
 #include <qt/addresstablemodel.h>
-#include <qt/bitcoinunits.h>
+#include <qt/qbitunits.h>
 #include <qt/guiutil.h>
 #include <qt/optionsmodel.h>
 #include <qt/platformstyle.h>
 #include <qt/walletmodel.h>
 
+#include <crypto/pqc.h>
 #include <interfaces/node.h>
 #include <key_io.h>
 #include <policy/policy.h>
@@ -198,7 +199,7 @@ void CoinControlDialog::showMenu(const QPoint &point)
 // context menu action: copy amount
 void CoinControlDialog::copyAmount()
 {
-    GUIUtil::setClipboard(BitcoinUnits::removeSpaces(contextMenuItem->text(COLUMN_AMOUNT)));
+    GUIUtil::setClipboard(QbitUnits::removeSpaces(contextMenuItem->text(COLUMN_AMOUNT)));
 }
 
 // context menu action: copy label
@@ -422,6 +423,24 @@ void CoinControlDialog::updateLabels(CCoinControl& m_coin_control, WalletModel *
             } else if (witnessversion == 1) { // P2TR key-path spend
                 // 1 WU (witness item count) + 65 WU (Schnorr signature with len byte)
                 nBytesInputs += 66 / WITNESS_SCALE_FACTOR;
+            } else if (witnessversion == 2) { // P2MR script-path spend
+                constexpr int64_t p2mr_item_count_wu{1};
+                constexpr int64_t p2mr_stack_item_len_wu{3}; // CompactSize for PQC_SIG_SIZE plus optional hashtype byte.
+                constexpr int64_t p2mr_signature_wu{static_cast<int64_t>(PQC_SIG_SIZE + 1)};
+                constexpr int64_t p2mr_script_wu{34}; // Typical leaf script: <32-byte pubkey> OP_CHECKSIGPQC.
+                constexpr int64_t p2mr_script_len_wu{1}; // CompactSize for 34-byte script.
+                constexpr int64_t p2mr_control_block_wu{1}; // Single-leaf control block.
+                constexpr int64_t p2mr_control_block_len_wu{1}; // CompactSize for 1-byte control block.
+                const int64_t p2mr_witness_wu{
+                    p2mr_item_count_wu +
+                    p2mr_stack_item_len_wu +
+                    p2mr_signature_wu +
+                    p2mr_script_len_wu +
+                    p2mr_script_wu +
+                    p2mr_control_block_len_wu +
+                    p2mr_control_block_wu
+                };
+                nBytesInputs += p2mr_witness_wu / WITNESS_SCALE_FACTOR;
             } else {
                 // not supported, should be unreachable
                 throw std::runtime_error("Trying to spend future segwit version script");
@@ -450,7 +469,7 @@ void CoinControlDialog::updateLabels(CCoinControl& m_coin_control, WalletModel *
         if (fWitness)
         {
             // there is some fudging in these numbers related to the actual virtual transaction size calculation that will keep this estimate from being exact.
-            // usually, the result will be an overestimate within a couple of satoshis so that the confirmation dialog ends up displaying a slightly smaller fee.
+            // usually, the result will be an overestimate within a couple of base units so that the confirmation dialog ends up displaying a slightly smaller fee.
             // also, the witness stack size value is a variable sized integer. usually, the number of stack items will be well under the single byte var int limit.
             nBytes += 2; // account for the serialized marker and flag bytes
             nBytes += nQuantity; // account for the witness byte that holds the number of stack items for each input.
@@ -492,7 +511,7 @@ void CoinControlDialog::updateLabels(CCoinControl& m_coin_control, WalletModel *
     }
 
     // actually update labels
-    BitcoinUnit nDisplayUnit = BitcoinUnit::BTC;
+    QbitUnit nDisplayUnit = QbitUnit::QBT;
     if (model && model->getOptionsModel())
         nDisplayUnit = model->getOptionsModel()->getDisplayUnit();
 
@@ -509,11 +528,11 @@ void CoinControlDialog::updateLabels(CCoinControl& m_coin_control, WalletModel *
 
     // stats
     l1->setText(QString::number(nQuantity));                                 // Quantity
-    l2->setText(BitcoinUnits::formatWithUnit(nDisplayUnit, nAmount));        // Amount
-    l3->setText(BitcoinUnits::formatWithUnit(nDisplayUnit, nPayFee));        // Fee
-    l4->setText(BitcoinUnits::formatWithUnit(nDisplayUnit, nAfterFee));      // After Fee
+    l2->setText(QbitUnits::formatWithUnit(nDisplayUnit, nAmount));        // Amount
+    l3->setText(QbitUnits::formatWithUnit(nDisplayUnit, nPayFee));        // Fee
+    l4->setText(QbitUnits::formatWithUnit(nDisplayUnit, nAfterFee));      // After Fee
     l5->setText(((nBytes > 0) ? ASYMP_UTF8 : "") + QString::number(nBytes));        // Bytes
-    l8->setText(BitcoinUnits::formatWithUnit(nDisplayUnit, nChange));        // Change
+    l8->setText(QbitUnits::formatWithUnit(nDisplayUnit, nChange));        // Change
     if (nPayFee > 0)
     {
         l3->setText(ASYMP_UTF8 + l3->text());
@@ -522,10 +541,10 @@ void CoinControlDialog::updateLabels(CCoinControl& m_coin_control, WalletModel *
             l8->setText(ASYMP_UTF8 + l8->text());
     }
 
-    // how many satoshis the estimated fee can vary per byte we guess wrong
+    // how many bits the estimated fee can vary per byte we guess wrong
     double dFeeVary = (nBytes != 0) ? (double)nPayFee / nBytes : 0;
 
-    QString toolTip4 = tr("Can vary +/- %1 satoshi(s) per input.").arg(dFeeVary);
+    QString toolTip4 = tr("Can vary +/- %1 bits per input.").arg(dFeeVary);
 
     l3->setToolTip(toolTip4);
     l4->setToolTip(toolTip4);
@@ -563,7 +582,7 @@ void CoinControlDialog::updateView()
     QFlags<Qt::ItemFlag> flgCheckbox = Qt::ItemIsSelectable | Qt::ItemIsEnabled | Qt::ItemIsUserCheckable;
     QFlags<Qt::ItemFlag> flgTristate = Qt::ItemIsSelectable | Qt::ItemIsEnabled | Qt::ItemIsUserCheckable | Qt::ItemIsAutoTristate;
 
-    BitcoinUnit nDisplayUnit = model->getOptionsModel()->getDisplayUnit();
+    QbitUnit nDisplayUnit = model->getOptionsModel()->getDisplayUnit();
 
     for (const auto& coins : model->wallet().listCoins()) {
         CCoinControlWidgetItem* itemWalletAddress{nullptr};
@@ -629,7 +648,7 @@ void CoinControlDialog::updateView()
             }
 
             // amount
-            itemOutput->setText(COLUMN_AMOUNT, BitcoinUnits::format(nDisplayUnit, out.txout.nValue));
+            itemOutput->setText(COLUMN_AMOUNT, QbitUnits::format(nDisplayUnit, out.txout.nValue));
             itemOutput->setData(COLUMN_AMOUNT, Qt::UserRole, QVariant((qlonglong)out.txout.nValue)); // padding so that sorting works correctly
 
             // date
@@ -663,7 +682,7 @@ void CoinControlDialog::updateView()
         if (treeMode)
         {
             itemWalletAddress->setText(COLUMN_CHECKBOX, "(" + QString::number(nChildren) + ")");
-            itemWalletAddress->setText(COLUMN_AMOUNT, BitcoinUnits::format(nDisplayUnit, nSum));
+            itemWalletAddress->setText(COLUMN_AMOUNT, QbitUnits::format(nDisplayUnit, nSum));
             itemWalletAddress->setData(COLUMN_AMOUNT, Qt::UserRole, QVariant((qlonglong)nSum));
         }
     }

@@ -76,6 +76,7 @@ class AuthServiceProxy():
         self._service_name = service_name
         self.ensure_ascii = ensure_ascii  # can be toggled on the fly by tests
         self.reuse_http_connections = True
+        self._last_response_bytes = b""
         self.__url = urllib.parse.urlparse(service_url)
         user = None if self.__url.username is None else self.__url.username.encode('utf8')
         passwd = None if self.__url.password is None else self.__url.password.encode('utf8')
@@ -188,7 +189,9 @@ class AuthServiceProxy():
         # Currently this is only possible if clients call the _request() method
         # directly to send a raw request.
         if http_response.status == HTTPStatus.NO_CONTENT:
-            if len(http_response.read()) != 0:
+            data = http_response.read()
+            self._last_response_bytes = data
+            if len(data) != 0:
                 raise JSONRPCException({'code': -342, 'message': 'Content received with NO CONTENT status code'})
             return None, http_response.status
 
@@ -199,6 +202,7 @@ class AuthServiceProxy():
                 http_response.status)
 
         data = http_response.read()
+        self._last_response_bytes = data
         try:
             responsedata = data.decode('utf8')
         except UnicodeDecodeError as e:

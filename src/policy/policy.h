@@ -3,13 +3,14 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_POLICY_POLICY_H
-#define BITCOIN_POLICY_POLICY_H
+#ifndef QBIT_POLICY_POLICY_H
+#define QBIT_POLICY_POLICY_H
 
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
 #include <primitives/transaction.h>
 #include <script/interpreter.h>
+#include <script/script.h>
 #include <script/solver.h>
 
 #include <cstdint>
@@ -22,16 +23,18 @@ class CScript;
 /** Default for -blockmaxweight, which controls the range of block weights the mining code will create **/
 static constexpr unsigned int DEFAULT_BLOCK_MAX_WEIGHT{MAX_BLOCK_WEIGHT};
 /** Default for -blockreservedweight **/
-static constexpr unsigned int DEFAULT_BLOCK_RESERVED_WEIGHT{8000};
+static constexpr unsigned int DEFAULT_BLOCK_RESERVED_WEIGHT{4000};
 /** This accounts for the block header, var_int encoding of the transaction count and a minimally viable
  * coinbase transaction. It adds an additional safety margin, because even with a thorough understanding
  * of block serialization, it's easy to make a costly mistake when trying to squeeze every last byte.
  * Setting a lower value is prevented at startup. */
-static constexpr unsigned int MINIMUM_BLOCK_RESERVED_WEIGHT{2000};
+static constexpr unsigned int MINIMUM_BLOCK_RESERVED_WEIGHT{1000};
 /** Default for -blockmintxfee, which sets the minimum feerate for a transaction in blocks created by mining code **/
 static constexpr unsigned int DEFAULT_BLOCK_MIN_TX_FEE{1};
-/** The maximum weight for transactions we're willing to relay/mine */
-static constexpr int32_t MAX_STANDARD_TX_WEIGHT{400000};
+/** The maximum weight for transactions we're willing to relay/mine.
+ * Sized around a 100-input single-key P2MR transaction while leaving room for
+ * outputs and transaction overhead. */
+static constexpr int32_t MAX_STANDARD_TX_WEIGHT{400'000};
 /** The minimum non-witness size for transactions we're willing to relay/mine: one larger than 64  */
 static constexpr unsigned int MIN_STANDARD_TX_NONWITNESS_SIZE{65};
 /** Maximum number of signature check operations in an IsStandard() P2SH script */
@@ -41,7 +44,7 @@ static constexpr unsigned int MAX_STANDARD_TX_SIGOPS_COST{MAX_BLOCK_SIGOPS_COST/
 /** The maximum number of potentially executed legacy signature operations in a single standard tx */
 static constexpr unsigned int MAX_TX_LEGACY_SIGOPS{2'500};
 /** Default for -incrementalrelayfee, which sets the minimum feerate increase for mempool limiting or replacement **/
-static constexpr unsigned int DEFAULT_INCREMENTAL_RELAY_FEE{100};
+static constexpr unsigned int DEFAULT_INCREMENTAL_RELAY_FEE{250};
 /** Default for -bytespersigop */
 static constexpr unsigned int DEFAULT_BYTES_PER_SIGOP{20};
 /** Default for -permitbaremultisig */
@@ -52,6 +55,10 @@ static constexpr unsigned int MAX_STANDARD_P2WSH_STACK_ITEMS{100};
 static constexpr unsigned int MAX_STANDARD_P2WSH_STACK_ITEM_SIZE{80};
 /** The maximum size in bytes of each witness stack item in a standard BIP 342 script (Taproot, leaf version 0xc0) */
 static constexpr unsigned int MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE{80};
+/** The maximum size in bytes of each witness stack item in a standard BIP-360 P2MR v1 script */
+static constexpr unsigned int MAX_STANDARD_P2MR_STACK_ITEM_SIZE{MAX_P2MR_V1_STACK_ITEM_SIZE};
+/** The maximum aggregate size in bytes of initial witness stack items in a standard BIP-360 P2MR v1 script */
+static constexpr unsigned int MAX_STANDARD_P2MR_TOTAL_INITIAL_STACK_BYTES{MAX_P2MR_V1_TOTAL_INITIAL_STACK_BYTES};
 /** The maximum size in bytes of a standard witnessScript */
 static constexpr unsigned int MAX_STANDARD_P2WSH_SCRIPT_SIZE{3600};
 /** The maximum size of a standard ScriptSig */
@@ -61,23 +68,23 @@ static constexpr unsigned int MAX_STANDARD_SCRIPTSIG_SIZE{1650};
  * standard and should be done with care and ideally rarely. It makes sense to
  * only increase the dust limit after prior releases were already not creating
  * outputs below the new threshold */
-static constexpr unsigned int DUST_RELAY_TX_FEE{3000};
+static constexpr unsigned int DUST_RELAY_TX_FEE{750};
 /** Default for -minrelaytxfee, minimum relay fee for transactions */
-static constexpr unsigned int DEFAULT_MIN_RELAY_TX_FEE{100};
+static constexpr unsigned int DEFAULT_MIN_RELAY_TX_FEE{250};
 /** Default for -limitancestorcount, max number of in-mempool ancestors */
 static constexpr unsigned int DEFAULT_ANCESTOR_LIMIT{25};
 /** Default for -limitancestorsize, maximum kilobytes of tx + all in-mempool ancestors */
-static constexpr unsigned int DEFAULT_ANCESTOR_SIZE_LIMIT_KVB{101};
+static constexpr unsigned int DEFAULT_ANCESTOR_SIZE_LIMIT_KVB{404};
 /** Default for -limitdescendantcount, max number of in-mempool descendants */
 static constexpr unsigned int DEFAULT_DESCENDANT_LIMIT{25};
 /** Default for -limitdescendantsize, maximum kilobytes of in-mempool descendants */
-static constexpr unsigned int DEFAULT_DESCENDANT_SIZE_LIMIT_KVB{101};
+static constexpr unsigned int DEFAULT_DESCENDANT_SIZE_LIMIT_KVB{404};
 /** Default for -datacarrier */
 static const bool DEFAULT_ACCEPT_DATACARRIER = true;
 /**
  * Default setting for -datacarriersize in vbytes.
  */
-static const unsigned int MAX_OP_RETURN_RELAY = MAX_STANDARD_TX_WEIGHT / WITNESS_SCALE_FACTOR;
+static const unsigned int MAX_OP_RETURN_RELAY = 200'000;
 /**
  * An extra transaction can be added to a package, as long as it only has one
  * ancestor and is no larger than this. Not really any reason to make this
@@ -104,7 +111,8 @@ static constexpr unsigned int MANDATORY_SCRIPT_VERIFY_FLAGS{SCRIPT_VERIFY_P2SH |
                                                              SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY |
                                                              SCRIPT_VERIFY_CHECKSEQUENCEVERIFY |
                                                              SCRIPT_VERIFY_WITNESS |
-                                                             SCRIPT_VERIFY_TAPROOT};
+                                                             SCRIPT_VERIFY_TAPROOT |
+                                                             SCRIPT_VERIFY_P2MR_RULES};
 
 /**
  * Standard script verification flags that standard transactions will comply
@@ -188,4 +196,4 @@ static inline int64_t GetVirtualTransactionInputSize(const CTxIn& tx)
     return GetVirtualTransactionInputSize(tx, 0, 0);
 }
 
-#endif // BITCOIN_POLICY_POLICY_H
+#endif // QBIT_POLICY_POLICY_H

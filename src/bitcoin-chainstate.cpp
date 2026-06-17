@@ -118,6 +118,7 @@ int main(int argc, char* argv[])
     };
     const node::BlockManager::Options blockman_opts{
         .chainparams = chainman_opts.chainparams,
+        .witness_pruning_enabled = chainman_opts.chainparams.IsWitnessPruningEnabled(),
         .blocks_dir = abs_datadir / "blocks",
         .notifications = chainman_opts.notifications,
         .block_tree_db_params = DBParams{

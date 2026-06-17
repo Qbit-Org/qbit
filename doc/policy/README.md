@@ -9,7 +9,10 @@ contents. Policy is *not* applied to transactions in blocks.
 
 This documentation is not an exhaustive list of all policy rules.
 
+These pages are policy references for developers and integrators. They are not
+the first-run qbit user path, and inherited Bitcoin Core policy history should
+not be read as a substitute for qbit launch-chain wallet or address guidance.
+
 - [Mempool Limits](mempool-limits.md)
 - [Mempool Replacements](mempool-replacements.md)
 - [Packages](packages.md)
-

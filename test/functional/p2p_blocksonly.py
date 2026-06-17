@@ -20,6 +20,8 @@ class P2PBlocksOnly(BitcoinTestFramework):
 
     def run_test(self):
         self.miniwallet = MiniWallet(self.nodes[0])
+        # Mature the default-cache coinbase UTXOs
+        self.ensure_cached_coinbase_mature(self.nodes[0])
 
         self.blocksonly_mode_tests()
         self.blocks_relay_conn_tests()

@@ -13,8 +13,8 @@ import subprocess
 
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.test_node import (
-    BITCOIN_PID_FILENAME_DEFAULT,
     ErrorMatch,
+    QBIT_PID_FILENAME_DEFAULT,
 )
 from test_framework.util import assert_equal
 
@@ -221,22 +221,22 @@ class InitTest(BitcoinTestFramework):
                 shutil.move(node.chain_path / f"{dir}_bak", node.chain_path / dir)
 
     def init_pid_test(self):
-        BITCOIN_PID_FILENAME_CUSTOM = "my_fancy_bitcoin_pid_file.foobar"
+        QBIT_PID_FILENAME_CUSTOM = "my_fancy_qbit_pid_file.foobar"
 
         self.log.info("Test specifying custom pid file via -pid command line option")
-        custom_pidfile_relative = BITCOIN_PID_FILENAME_CUSTOM
+        custom_pidfile_relative = QBIT_PID_FILENAME_CUSTOM
         self.log.info(f"-> path relative to datadir ({custom_pidfile_relative})")
         self.restart_node(0, [f"-pid={custom_pidfile_relative}"])
         datadir = self.nodes[0].chain_path
-        assert not (datadir / BITCOIN_PID_FILENAME_DEFAULT).exists()
+        assert not (datadir / QBIT_PID_FILENAME_DEFAULT).exists()
         assert (datadir / custom_pidfile_relative).exists()
         self.stop_node(0)
         assert not (datadir / custom_pidfile_relative).exists()
 
-        custom_pidfile_absolute = Path(self.options.tmpdir) / BITCOIN_PID_FILENAME_CUSTOM
+        custom_pidfile_absolute = Path(self.options.tmpdir) / QBIT_PID_FILENAME_CUSTOM
         self.log.info(f"-> absolute path ({custom_pidfile_absolute})")
         self.restart_node(0, [f"-pid={custom_pidfile_absolute}"])
-        assert not (datadir / BITCOIN_PID_FILENAME_DEFAULT).exists()
+        assert not (datadir / QBIT_PID_FILENAME_DEFAULT).exists()
         assert custom_pidfile_absolute.exists()
         self.stop_node(0)
         assert not custom_pidfile_absolute.exists()

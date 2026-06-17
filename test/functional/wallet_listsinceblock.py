@@ -5,7 +5,6 @@
 """Test the listsinceblock RPC."""
 
 from test_framework.address import key_to_p2wpkh
-from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.descriptors import descsum_create
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.messages import MAX_BIP125_RBF_SEQUENCE
@@ -33,7 +32,7 @@ class ListSinceBlockTest(BitcoinTestFramework):
         # All nodes are in IBD from genesis, so they'll need the miner (node2) to be an outbound connection, or have
         # only one connection. (See fPreferredDownload in net_processing)
         self.connect_nodes(1, 2)
-        self.generate(self.nodes[2], COINBASE_MATURITY + 1)
+        self.ensure_mature_coinbase(self.nodes[2])
 
         self.test_no_blockhash()
         self.test_invalid_blockhash()
@@ -419,8 +418,8 @@ class ListSinceBlockTest(BitcoinTestFramework):
         self.log.info("Test descriptor lookup by scriptPubKey.")
 
         # Create a watchonly wallet tracking two multisig descriptors.
-        multi_a = descsum_create("wsh(multi(1,tpubD6NzVbkrYhZ4YBNjUo96Jxd1u4XKWgnoc7LsA1jz3Yc2NiDbhtfBhaBtemB73n9V5vtJHwU6FVXwggTbeoJWQ1rzdz8ysDuQkpnaHyvnvzR/*,tpubD6NzVbkrYhZ4YHdDGMAYGaWxMSC1B6tPRTHuU5t3BcfcS3nrF523iFm5waFd1pP3ZvJt4Jr8XmCmsTBNx5suhcSgtzpGjGMASR3tau1hJz4/*))")
-        multi_b = descsum_create("wsh(multi(1,tpubD6NzVbkrYhZ4YHdDGMAYGaWxMSC1B6tPRTHuU5t3BcfcS3nrF523iFm5waFd1pP3ZvJt4Jr8XmCmsTBNx5suhcSgtzpGjGMASR3tau1hJz4/*,tpubD6NzVbkrYhZ4Y2RLiuEzNQkntjmsLpPYDm3LTRBYynUQtDtpzeUKAcb9sYthSFL3YR74cdFgF5mW8yKxv2W2CWuZDFR2dUpE5PF9kbrVXNZ/*))")
+        multi_a = descsum_create("wsh(multi(1,qrpbSRJj3eCrXD2z5KGtCaBc7s6MK9QW6nHPqGzGcdGpLhpTDB2ETBZsv287UPmWQWpgjMGZAaeJDoZJwsgNsuHZLreEVgjN6ZEQ1YbHnYFQn2i/*,qrpbSRJj3eCrXD2z5RXMz8D45UzHmX5BmCNyecwJvhQsUmt3GWbUzMvjvhhJmCr2NZ4FDLh8vx2LW5E98eQABBrxeTDvkhQexbg9h8rc5W1Txt8/*))")
+        multi_b = descsum_create("wsh(multi(1,qrpbSRJj3eCrXD2z5RXMz8D45UzHmX5BmCNyecwJvhQsUmt3GWbUzMvjvhhJmCr2NZ4FDLh8vx2LW5E98eQABBrxeTDvkhQexbg9h8rc5W1Txt8/*,qrpbSRJj3eCrXD2z5AKVSgHWBKE8Jpf3vut8Svgjv2iPGwgqighTjwP1P4XNhBV6nz1FBqVKVGRtDPnsQAYk98V59Mgo4x1Qrp9DL73sF5QaaY3/*))")
         self.nodes[0].createwallet(wallet_name="wo", disable_private_keys=True)
         wo_wallet = self.nodes[0].get_wallet_rpc("wo")
         wo_wallet.importdescriptors([

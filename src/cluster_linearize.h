@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_CLUSTER_LINEARIZE_H
-#define BITCOIN_CLUSTER_LINEARIZE_H
+#ifndef QBIT_CLUSTER_LINEARIZE_H
+#define QBIT_CLUSTER_LINEARIZE_H
 
 #include <algorithm>
 #include <cstdint>
@@ -1394,4 +1394,4 @@ void FixLinearization(const DepGraph<SetType>& depgraph, std::span<DepGraphIndex
 
 } // namespace cluster_linearize
 
-#endif // BITCOIN_CLUSTER_LINEARIZE_H
+#endif // QBIT_CLUSTER_LINEARIZE_H

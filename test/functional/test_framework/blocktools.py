@@ -47,18 +47,20 @@ from .script_util import (
 )
 from .util import assert_equal
 
-MAX_BLOCK_SIGOPS = 20000
-MAX_BLOCK_SIGOPS_WEIGHT = MAX_BLOCK_SIGOPS * WITNESS_SCALE_FACTOR
-MAX_STANDARD_TX_SIGOPS = 4000
+MAX_BLOCK_SIGOPS_COST = 80000
+MAX_BLOCK_SIGOPS = MAX_BLOCK_SIGOPS_COST // WITNESS_SCALE_FACTOR
+MAX_BLOCK_SIGOPS_WEIGHT = MAX_BLOCK_SIGOPS_COST
+MAX_STANDARD_TX_SIGOPS_COST = MAX_BLOCK_SIGOPS_COST // 5
+MAX_STANDARD_TX_SIGOPS = MAX_STANDARD_TX_SIGOPS_COST // WITNESS_SCALE_FACTOR
 MAX_STANDARD_TX_WEIGHT = 400000
 
 # Genesis block time (regtest)
-TIME_GENESIS_BLOCK = 1296688602
+TIME_GENESIS_BLOCK = 1738713602
 
 MAX_FUTURE_BLOCK_TIME = 2 * 60 * 60
 
 # Coinbase transaction outputs can only be spent after this number of new blocks (network rule)
-COINBASE_MATURITY = 100
+COINBASE_MATURITY = 1000
 
 # From BIP141
 WITNESS_COMMITMENT_HEADER = b"\xaa\x21\xa9\xed"
@@ -84,11 +86,28 @@ assert_equal(uint256_from_compact(DIFF_4_N_BITS), DIFF_4_TARGET)
 # From BIP325
 SIGNET_HEADER = b"\xec\xc7\xda\xa2"
 
+INITIAL_BLOCK_SUBSIDY = 210 * COIN
+MAINNET_SUBSIDY_STEP_INTERVAL = 43_200
+REGTEST_SUBSIDY_STEP_INTERVAL = 150
+SUBSIDY_STEP_INTERVAL = REGTEST_SUBSIDY_STEP_INTERVAL
+SUBSIDY_STEPDOWN_NUMERATOR = 598
+SUBSIDY_STEPDOWN_DENOMINATOR = 625
+
 def nbits_str(nbits):
     return f"{nbits:08x}"
 
 def target_str(target):
     return f"{target:064x}"
+
+def get_block_subsidy(height, *, subsidy_step_interval=SUBSIDY_STEP_INTERVAL):
+    if height < 0:
+        return 0
+    subsidy = INITIAL_BLOCK_SUBSIDY
+    for _ in range(height // subsidy_step_interval):
+        subsidy = (subsidy * SUBSIDY_STEPDOWN_NUMERATOR) // SUBSIDY_STEPDOWN_DENOMINATOR
+        if subsidy == 0:
+            break
+    return subsidy
 
 def create_block(hashprev=None, coinbase=None, ntime=None, *, version=None, tmpl=None, txlist=None):
     """Create a block (with regtest difficulty)."""
@@ -144,7 +163,16 @@ def script_BIP34_coinbase_height(height):
     return CScript([CScriptNum(height)])
 
 
-def create_coinbase(height, pubkey=None, *, script_pubkey=None, extra_output_script=None, fees=0, nValue=50, halving_period=REGTEST_RETARGET_PERIOD):
+def create_coinbase(
+    height,
+    pubkey=None,
+    *,
+    script_pubkey=None,
+    extra_output_script=None,
+    fees=0,
+    nValue=None,
+    subsidy_step_interval=SUBSIDY_STEP_INTERVAL,
+):
     """Create a coinbase transaction.
 
     If pubkey is passed in, the coinbase output will be a P2PK output;
@@ -156,11 +184,12 @@ def create_coinbase(height, pubkey=None, *, script_pubkey=None, extra_output_scr
     coinbase.nLockTime = height - 1
     coinbase.vin.append(CTxIn(COutPoint(0, 0xffffffff), script_BIP34_coinbase_height(height), MAX_SEQUENCE_NONFINAL))
     coinbaseoutput = CTxOut()
-    coinbaseoutput.nValue = nValue * COIN
-    if nValue == 50:
-        halvings = int(height / halving_period)
-        coinbaseoutput.nValue >>= halvings
-        coinbaseoutput.nValue += fees
+    if nValue is None:
+        coinbaseoutput.nValue = (
+            get_block_subsidy(height, subsidy_step_interval=subsidy_step_interval) + fees
+        )
+    else:
+        coinbaseoutput.nValue = nValue * COIN
     if pubkey is not None:
         coinbaseoutput.scriptPubKey = key_to_p2pk_script(pubkey)
     elif script_pubkey is not None:
@@ -257,3 +286,25 @@ class TestFrameworkBlockTools(unittest.TestCase):
         height = 20
         coinbase_tx = create_coinbase(height=height)
         assert_equal(CScriptNum.decode(coinbase_tx.vin[0].scriptSig), height)
+        assert_equal(coinbase_tx.vout[0].nValue, INITIAL_BLOCK_SUBSIDY)
+
+    def test_get_block_subsidy(self):
+        assert_equal(get_block_subsidy(0), 21_000_000_000)
+        assert_equal(get_block_subsidy(SUBSIDY_STEP_INTERVAL - 1), 21_000_000_000)
+        assert_equal(get_block_subsidy(SUBSIDY_STEP_INTERVAL), 20_092_800_000)
+        assert_equal(
+            get_block_subsidy(
+                MAINNET_SUBSIDY_STEP_INTERVAL - 1,
+                subsidy_step_interval=MAINNET_SUBSIDY_STEP_INTERVAL,
+            ),
+            21_000_000_000,
+        )
+        assert_equal(
+            get_block_subsidy(
+                MAINNET_SUBSIDY_STEP_INTERVAL,
+                subsidy_step_interval=MAINNET_SUBSIDY_STEP_INTERVAL,
+            ),
+            20_092_800_000,
+        )
+        assert_equal(get_block_subsidy(480 * SUBSIDY_STEP_INTERVAL - 1), 1)
+        assert_equal(get_block_subsidy(480 * SUBSIDY_STEP_INTERVAL), 0)

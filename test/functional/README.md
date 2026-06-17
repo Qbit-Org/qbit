@@ -21,7 +21,7 @@ don't have test cases for.
 - Where possible, try to adhere to [PEP-8 guidelines](https://www.python.org/dev/peps/pep-0008/)
 - Use a python linter like flake8 before submitting PRs to catch common style
   nits (eg trailing whitespace, unused imports, etc)
-- The oldest supported Python version is specified in [doc/dependencies.md](/doc/dependencies.md).
+- The oldest supported Python version is specified in [doc/build/dependencies.md](/doc/build/dependencies.md).
   Consider using [pyenv](https://github.com/pyenv/pyenv), which checks [.python-version](/.python-version),
   to prevent accidentally introducing modern syntax from an unsupported Python version.
   The CI linter job also checks this, but [possibly not in all cases](https://github.com/bitcoin/bitcoin/pull/14884#discussion_r239585126).
@@ -197,3 +197,195 @@ perf report -i /path/to/datadir/send-big-msgs.perf.data.xxxx --stdio | c++filt |
 - [Installing perf](https://askubuntu.com/q/50145)
 - [Perf examples](https://www.brendangregg.com/perf.html)
 - [Hotspot](https://github.com/KDAB/hotspot): a GUI for perf output analysis
+
+### Report-only replay benchmarks
+
+Replay benchmark harnesses such as
+[feature_ibd_perf_replay.py](feature_ibd_perf_replay.py) must be run
+explicitly. They are not part of the default functional regression suite and
+they emit measurement artifacts rather than asserting performance thresholds.
+
+These scripts can be combined with `--perf` when startup or replay profiling is
+needed.
+
+`W1-replay-floor` is the lower-bound witness-bearing proxy workload:
+
+```sh
+test/functional/feature_ibd_perf_replay.py \
+  --configfile="$(pwd)/build/test/config.ini" \
+  --workload=w1-replay-floor \
+  --blocks=300 \
+  --txs-per-block=1 \
+  --history-mode=archive \
+  --report-file="$(pwd)/build/reports/feature-ibd-perf-replay-archive-chainstate.json"
+```
+
+`W2-replay-mixed` adds deterministic P2MR wallet spends on top of the proxy
+traffic:
+
+```sh
+test/functional/feature_ibd_perf_replay.py \
+  --configfile="$(pwd)/build/test/config.ini" \
+  --workload=w2-replay-mixed \
+  --blocks=300 \
+  --txs-per-block=1 \
+  --p2mr-spends-per-block=1 \
+  --history-mode=archive \
+  --report-file="$(pwd)/build/reports/feature-ibd-perf-replay-w2-archive-chainstate.json"
+```
+
+Witness-pruned replay lanes require `--reindex-mode=chainstate`. For smaller
+smoke runs, use `--tail-blocks` so the measured history actually falls outside
+the witness retention window before replay. Archive/full-history replay is the
+default lane; witness-pruned replay is the explicit opt-in alternative:
+
+```sh
+test/functional/feature_ibd_perf_replay.py \
+  --configfile="$(pwd)/build/test/config.ini" \
+  --workload=w2-replay-mixed \
+  --history-mode=witness-pruned \
+  --reindex-mode=chainstate \
+  --blocks=5 \
+  --txs-per-block=1 \
+  --p2mr-spends-per-block=1 \
+  --tail-blocks=1002 \
+  --fastprune \
+  --report-file="$(pwd)/build/reports/feature-ibd-perf-replay-w2-witness-pruned-chainstate.json"
+```
+
+By default, the replay benchmark writes its JSON report to
+`build/reports/feature-ibd-perf-replay-<lane>-<workload>.json` under the repo root.
+The report includes the lane/workload labels, git commit, host metadata,
+storage footprint, witness-pruning / assumevalid details when applicable, and
+the measured proxy / P2MR transaction counts used to build the workload.
+Manual workflow split artifacts can be downloaded, merged back into the
+historical artifact-root layout, and summarized with:
+
+```sh
+run_id=<run_id>
+download_dir="build-perf-artifacts/ibd-perf-${run_id}-download"
+artifact_root="build-perf-artifacts/ibd-perf-${run_id}"
+rm -rf "$download_dir" "$artifact_root"
+mkdir -p "$artifact_root"
+gh run download "$run_id" \
+  -p "ibd-perf-${run_id}-*" \
+  -D "$download_dir"
+for artifact_dir in "$download_dir"/ibd-perf-"$run_id"-*; do
+  [ -d "$artifact_dir" ] || continue
+  cp -a "$artifact_dir"/. "$artifact_root"/
+done
+contrib/devtools/summarize_ibd_perf.py "$artifact_root"
+```
+
+Artifact uploads are best-effort so GitHub artifact storage stalls do not fail
+otherwise completed benchmark runs. If artifacts are missing, use the workflow
+job summary and `Record perf artifact manifest` log section as the preserved
+benchmark evidence.
+
+The summarizer writes canonical Markdown and JSON summaries to the artifact
+bundle's `summary/` directory and also reports missing optional trace or
+UTXO/flush evidence explicitly.
+
+Reviewed fixed-host IBD baseline summaries should be promoted under
+`doc/performance/baselines/ibd/`.
+
+### Report-only localhost network IBD benchmarks
+
+`W3` localhost IBD uses a separate report-only harness:
+
+```sh
+test/functional/feature_ibd_perf_network.py \
+  --configfile="$(pwd)/build/test/config.ini" \
+  --workload=w2-replay-mixed \
+  --blocks=300 \
+  --txs-per-block=1 \
+  --p2mr-spends-per-block=1 \
+  --report-file="$(pwd)/build/reports/feature-ibd-perf-network-w3-network-mixed.json"
+```
+
+This harness builds the same deterministic source history on one node, then
+measures a second clean node syncing it over localhost until
+`initialblockdownload=false`. The report includes headers-sync, tip-sync, and
+IBD-exit timing along with peer snapshots and final disk footprint.
+
+### Perf harness validation
+
+`feature_ibd_perf_validation.py` is a zero-node self-check for the perf
+harnesses. It validates workload naming/recipe/count determinism and the
+replay / network JSON schemas without asserting performance thresholds.
+Pass `--run-history-determinism` for an explicit two-node smoke that builds
+tiny W1/W2 histories and compares stable construction metadata. That smoke
+does not assert full chain hash equality because the production harness does
+not currently fix node mining time or wallet key entropy.
+
+### Mempool simulation smoke and reports
+
+[`feature_mempool_sim.py`](feature_mempool_sim.py) is part of the default
+functional suite through its bounded `--ci-smoke` profile. It drives a real
+regtest qbit node through deterministic mempool workloads and fails only on
+correctness-oriented policy invariants, not latency or throughput thresholds.
+
+The CI smoke profile covers three lanes:
+
+- `steady-default`: min-relay boundaries, P2MR-sized witness data, and next-round
+  block inclusion.
+- `constrained-saturation`: a minimum-size mempool pressure run that checks eviction and
+  floating minimum fee behavior.
+- `package-rbf-boundary`: 25/26 ancestor-package behavior and RBF fee-delta
+  boundaries.
+
+`--ci-smoke` uses one steady-default round and 32 saturation transactions. Manual
+runs without `--ci-smoke` use three steady-default rounds and 64 saturation
+transactions by default; both counts can be overridden with `--steady-rounds`
+and `--saturation-txs`. Low `--saturation-txs` overrides remain valid pressure
+samples, but the harness only asserts eviction when the accepted transaction
+vbytes exceed the constrained mempool cap.
+
+The harness also writes JSON and Markdown reports with qbit-specific assumptions,
+lane steps, mempool snapshots, and red-flag classifications:
+
+```sh
+test/functional/feature_mempool_sim.py \
+  --configfile="$(pwd)/build/test/config.ini" \
+  --ci-smoke \
+  --report-file="$(pwd)/build/reports/feature-mempool-sim-report.json" \
+  --summary-file="$(pwd)/build/reports/feature-mempool-sim-summary.md"
+```
+
+### Report-only RPC benchmarks
+
+The RPC harness in
+[feature_rpc_perf.py](feature_rpc_perf.py) follows the same report-only model:
+it is not part of the default functional suite and it emits artifacts instead
+of enforcing pass/fail thresholds.
+
+The checked-in manifest lives at
+[`test/functional/data/rpc_perf_manifest.json`](data/rpc_perf_manifest.json).
+Raw per-run JSON artifacts and Markdown summaries should normally be written to
+`build/reports/`, while checked-in baseline summaries should only come from a fixed
+Linux benchmark host once the methodology is stable.
+
+For manual fixed-host runs on GitHub Actions self-hosted Linux runners, use
+the manual RPC performance workflow.
+
+Example qbit-only run:
+
+```sh
+test/functional/feature_rpc_perf.py \
+  --configfile="$(pwd)/build/test/config.ini" \
+  --run-scale=0.25 \
+  --report-file="$(pwd)/build/reports/feature-rpc-perf-report.json" \
+  --summary-file="$(pwd)/build/reports/feature-rpc-perf-summary.md"
+```
+
+Example qbit vs Bitcoin Core `v30.2` comparison run:
+
+```sh
+test/functional/feature_rpc_perf.py \
+  --configfile="$(pwd)/build/test/config.ini" \
+  --reference-bin-dir="/path/to/bitcoin-core-v30.2/build/bin" \
+  --reference-srcdir="/path/to/bitcoin-core-v30.2" \
+  --report-file="$(pwd)/build/reports/feature-rpc-perf-report.json" \
+  --summary-file="$(pwd)/build/reports/feature-rpc-perf-summary.md" \
+  --inventory-file="$(pwd)/build/reports/feature-rpc-perf-inventory.json"
+```

@@ -3,8 +3,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_VALIDATION_H
-#define BITCOIN_VALIDATION_H
+#ifndef QBIT_VALIDATION_H
+#define QBIT_VALIDATION_H
 
 #include <arith_uint256.h>
 #include <attributes.h>
@@ -18,6 +18,7 @@
 #include <kernel/chainstatemanager_opts.h>
 #include <kernel/cs_main.h> // IWYU pragma: export
 #include <node/blockstorage.h>
+#include <node/orphan_metrics.h>
 #include <policy/feerate.h>
 #include <policy/packages.h>
 #include <policy/policy.h>
@@ -562,6 +563,9 @@ protected:
 
     std::atomic_bool m_prev_script_checks_logged{true};
 
+    bool ReadBlockForConnect(CBlock& block, const CBlockIndex& index, bool* used_recovered = nullptr)
+        EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
 public:
     //! Reference to a BlockManager instance which itself is shared across all
     //! Chainstate instances.
@@ -731,6 +735,9 @@ public:
         EXCLUSIVE_LOCKS_REQUIRED(!m_chainstate_mutex)
         LOCKS_EXCLUDED(::cs_main);
 
+    bool ActivateBestChainStepForTest(BlockValidationState& state, CBlockIndex* pindexMostWork, bool& fResetMostWork)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_mempool->cs);
+
     // Block (dis)connection on a given view:
     DisconnectResult DisconnectBlock(const CBlock& block, const CBlockIndex* pindex, CCoinsViewCache& view)
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
@@ -798,7 +805,7 @@ public:
     }
 
 protected:
-    bool ActivateBestChainStep(BlockValidationState& state, CBlockIndex* pindexMostWork, const std::shared_ptr<const CBlock>& pblock, bool& fInvalidFound, ConnectTrace& connectTrace) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_mempool->cs);
+    bool ActivateBestChainStep(BlockValidationState& state, CBlockIndex* pindexMostWork, const std::shared_ptr<const CBlock>& pblock, bool& fResetMostWork, ConnectTrace& connectTrace) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_mempool->cs);
     bool ConnectTip(
         BlockValidationState& state,
         CBlockIndex* pindexNew,
@@ -993,6 +1000,11 @@ private:
     SteadyClock::duration GUARDED_BY(::cs_main) time_flush{};
     SteadyClock::duration GUARDED_BY(::cs_main) time_chainstate{};
     SteadyClock::duration GUARDED_BY(::cs_main) time_post_connect{};
+    std::optional<uint256> m_pending_witness_recovery GUARDED_BY(::cs_main);
+
+    bool CanSkipScriptChecks(const CBlockIndex& block_index, bool witness_unavailable) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
+    friend struct TestChainstateManager;
 
 public:
     using Options = kernel::ChainstateManagerOpts;
@@ -1002,12 +1014,33 @@ public:
     //! Function to restart active indexes; set dynamically to avoid a circular
     //! dependency on `base/index.cpp`.
     std::function<void()> snapshot_download_completed = std::function<void()>();
+    //! Function to update local service signaling after witness compaction
+    //! changes what this node can serve.
+    std::function<void()> witness_pruning_completed = std::function<void()>();
 
     const CChainParams& GetParams() const { return m_options.chainparams; }
     const Consensus::Params& GetConsensus() const { return m_options.chainparams.GetConsensus(); }
     bool ShouldCheckBlockIndex() const;
     const arith_uint256& MinimumChainWork() const { return *Assert(m_options.minimum_chain_work); }
     const uint256& AssumedValidBlock() const { return *Assert(m_options.assumed_valid_block); }
+    /** Whether this block must include witness bytes when first accepted from a peer.
+     *  Post-segwit blocks still require the full serialization even when
+     *  assumevalid permits skipping script checks, because witness commitment
+     *  and total block size depend on the omitted witness bytes.
+     */
+    bool RequiresWitnessForPeerBlock(const CBlockIndex& block_index) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    /** Whether witness data is required to validate this block.
+     *  Witness-pruned historical validation policy is documented in the
+     *  release validation notes.
+     * Returns false for pre-segwit blocks, or for assumed-valid ancestors when
+     * validation is proceeding without witness data (for example, on a
+     * witness-pruned chainstate).
+     */
+    bool NeedsWitnessForValidation(const CBlockIndex& block_index) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    bool RequiresArchivePeersForValidation() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    const CBlockIndex* PendingWitnessRecovery() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    bool ScheduleWitnessRecovery(const CBlockIndex& block_index) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    void ClearWitnessRecovery(const uint256& block_hash) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     kernel::Notifications& GetNotifications() const { return m_options.notifications; };
 
     /**
@@ -1035,6 +1068,7 @@ public:
     //! A single BlockManager instance is shared across each constructed
     //! chainstate to avoid duplicating block metadata.
     node::BlockManager m_blockman;
+    node::OrphanMetrics m_orphan_metrics;
 
     ValidationCache m_validation_cache;
 
@@ -1218,7 +1252,7 @@ public:
      * @param[out]  new_block A boolean which is set to indicate if the block was first received via this call
      * @returns     If the block was processed, independently of block validity
      */
-    bool ProcessNewBlock(const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked, bool* new_block) LOCKS_EXCLUDED(cs_main);
+    bool ProcessNewBlock(const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked, bool* new_block, bool requested_stripped = false) LOCKS_EXCLUDED(cs_main);
 
     /**
      * Process incoming block headers.
@@ -1253,7 +1287,7 @@ public:
      *
      * @returns   False if the block or header is invalid, or if saving to disk fails (likely a fatal error); true otherwise.
      */
-    bool AcceptBlock(const std::shared_ptr<const CBlock>& pblock, BlockValidationState& state, CBlockIndex** ppindex, bool fRequested, const FlatFilePos* dbp, bool* fNewBlock, bool min_pow_checked) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    bool AcceptBlock(const std::shared_ptr<const CBlock>& pblock, BlockValidationState& state, CBlockIndex** ppindex, bool fRequested, const FlatFilePos* dbp, bool* fNewBlock, bool min_pow_checked, bool requested_stripped = false) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     void ReceivedBlockTransactions(const CBlock& block, CBlockIndex* pindexNew, const FlatFilePos& pos) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
@@ -1365,4 +1399,7 @@ bool IsBIP30Repeat(const CBlockIndex& block_index);
 /** Identifies blocks which coinbase output was subsequently overwritten in the UTXO set (see BIP30) */
 bool IsBIP30Unspendable(const uint256& block_hash, int block_height);
 
-#endif // BITCOIN_VALIDATION_H
+/** Return whether any transaction in the block carries witness data. */
+bool HasAnyWitnessData(const CBlock& block);
+
+#endif // QBIT_VALIDATION_H

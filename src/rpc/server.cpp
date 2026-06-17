@@ -247,16 +247,10 @@ static const CRPCCommand vRPCCommands[]{
 
 CRPCTable::CRPCTable()
 {
+    m_registration_allowed = [] { return !IsRPCRunning(); };
     for (const auto& c : vRPCCommands) {
         appendCommand(c.name, &c);
     }
-}
-
-void CRPCTable::appendCommand(const std::string& name, const CRPCCommand* pcmd)
-{
-    CHECK_NONFATAL(!IsRPCRunning()); // Only add commands before rpc is running
-
-    mapCommands[name].push_back(pcmd);
 }
 
 bool CRPCTable::removeCommand(const std::string& name, const CRPCCommand* pcmd)
@@ -266,10 +260,27 @@ bool CRPCTable::removeCommand(const std::string& name, const CRPCCommand* pcmd)
         auto new_end = std::remove(it->second.begin(), it->second.end(), pcmd);
         if (it->second.end() != new_end) {
             it->second.erase(new_end, it->second.end());
+            if (it->second.empty()) {
+                mapCommands.erase(it);
+                mapCommandComponents.erase(name);
+                mapCommandRequiresExternalSigner.erase(name);
+            }
             return true;
         }
     }
     return false;
+}
+
+std::vector<RPCCommandDoc> CRPCTable::GetCommandDocs() const
+{
+    std::vector<RPCCommandDoc> docs;
+    docs.reserve(mapCommands.size());
+    for (const auto& [name, commands] : mapCommands) {
+        const CRPCCommand& command{*commands.front()};
+        if (!command.HasRpcMethod()) continue;
+        docs.push_back({command.category, name, mapCommandComponents.at(name), command.GetHelpMan(), mapCommandRequiresExternalSigner.at(name)});
+    }
+    return docs;
 }
 
 void StartRPC()
@@ -450,7 +461,7 @@ static inline JSONRPCRequest transformNamedArguments(const JSONRPCRequest& in, c
     // If leftover "args" param was found, use it as a source of positional
     // arguments and add named arguments after. This is a convenience for
     // clients that want to pass a combination of named and positional
-    // arguments as described in doc/JSON-RPC-interface.md#parameter-passing
+    // arguments as described in doc/integration/JSON-RPC-interface.md#parameter-passing
     auto positional_args{argsIn.extract("args")};
     if (positional_args && positional_args.mapped()->isArray()) {
         if (initial_hole_size < (int)positional_args.mapped()->size() && initial_param) {

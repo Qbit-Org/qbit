@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_TEST_UTIL_CLUSTER_LINEARIZE_H
-#define BITCOIN_TEST_UTIL_CLUSTER_LINEARIZE_H
+#ifndef QBIT_TEST_UTIL_CLUSTER_LINEARIZE_H
+#define QBIT_TEST_UTIL_CLUSTER_LINEARIZE_H
 
 #include <cluster_linearize.h>
 #include <serialize.h>
@@ -211,8 +211,8 @@ struct DepGraphFormatter
                 // Read fee, encoded as an unsigned varint (odd=negative, even=non-negative).
                 uint64_t coded_fee;
                 s >> VARINT(coded_fee);
-                coded_fee &= 0xFFFFFFFFFFFFF; // Enough for fee between -21M...21M BTC.
-                static_assert(0xFFFFFFFFFFFFF > uint64_t{2} * 21000000 * 100000000);
+                coded_fee &= 0xFFFFFFFFFFFFFFF; // Enough for fee between -210M...210M QBT.
+                static_assert(0xFFFFFFFFFFFFFFF > uint64_t{2} * 210000000 * 100000000);
                 new_feerate = {UnsignedToSigned(coded_fee), size};
                 // Read dependency information.
                 auto topo_idx = reordering.size();
@@ -419,4 +419,4 @@ inline uint64_t MaxOptimalLinearizationIters(DepGraphIndex cluster_count)
 
 } // namespace
 
-#endif // BITCOIN_TEST_UTIL_CLUSTER_LINEARIZE_H
+#endif // QBIT_TEST_UTIL_CLUSTER_LINEARIZE_H

@@ -9,8 +9,8 @@
 #include <util/chaintype.h>
 
 namespace wallet {
-WalletTestingSetup::WalletTestingSetup(const ChainType chainType)
-    : TestingSetup(chainType),
+WalletTestingSetup::WalletTestingSetup(const ChainType chainType, TestOpts opts)
+    : TestingSetup(chainType, opts),
       m_wallet_loader{interfaces::MakeWalletLoader(*m_node.chain, *Assert(m_node.args))},
       m_wallet(m_node.chain.get(), "", CreateMockableWalletDatabase())
 {

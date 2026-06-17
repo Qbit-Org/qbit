@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_NETBASE_H
-#define BITCOIN_NETBASE_H
+#ifndef QBIT_NETBASE_H
+#define QBIT_NETBASE_H
 
 #include <compat/compat.h>
 #include <netaddress.h>
@@ -347,7 +347,7 @@ bool Socks5(const std::string& strDest, uint16_t port, const ProxyCredentials* a
 /**
  * Determine if a port is "bad" from the perspective of attempting to connect
  * to a node on that port.
- * @see doc/p2p-bad-ports.md
+ * @see doc/reference/p2p-bad-ports.md
  * @param[in] port Port to check.
  * @returns whether the port is bad
  */
@@ -362,4 +362,4 @@ bool IsBadPort(uint16_t port);
  */
 CService MaybeFlipIPv6toCJDNS(const CService& service);
 
-#endif // BITCOIN_NETBASE_H
+#endif // QBIT_NETBASE_H

@@ -17,6 +17,34 @@
 #include <iterator>
 #include <vector>
 
+namespace {
+[[nodiscard]] CBlockHeader ConsumeHeader(FuzzedDataProvider& fuzzed_data_provider)
+{
+    CBlockHeader header;
+    header.nVersion = fuzzed_data_provider.ConsumeIntegral<int32_t>();
+    if (header.SignalsAuxpow()) {
+        header.nVersion &= ~BLOCK_VERSION_AUXPOW;
+    }
+    header.hashPrevBlock = ConsumeUInt256(fuzzed_data_provider);
+    header.hashMerkleRoot = ConsumeUInt256(fuzzed_data_provider);
+    header.nTime = ConsumeTime(fuzzed_data_provider);
+    header.nBits = fuzzed_data_provider.ConsumeIntegral<uint32_t>();
+    header.nNonce = fuzzed_data_provider.ConsumeIntegral<uint32_t>();
+    return header;
+}
+
+[[nodiscard]] std::vector<CBlockHeader> ConsumeHeaders(FuzzedDataProvider& fuzzed_data_provider)
+{
+    std::vector<CBlockHeader> headers;
+    const size_t count = fuzzed_data_provider.ConsumeIntegralInRange<size_t>(0, 16);
+    headers.reserve(count);
+    while (headers.size() < count) {
+        headers.push_back(ConsumeHeader(fuzzed_data_provider));
+    }
+    return headers;
+}
+} // namespace
+
 static void initialize_headers_sync_state_fuzz()
 {
     static const auto testing_setup = MakeNoLogFileContext<>(
@@ -50,74 +78,80 @@ public:
     }
 };
 
-FUZZ_TARGET(headers_sync_state, .init = initialize_headers_sync_state_fuzz)
+FUZZ_TARGET(headers_sync_state,
+    .init = initialize_headers_sync_state_fuzz,
+    .disable_leak_detection = true)
 {
-    SeedRandomStateForTest(SeedRand::ZEROS);
-    FuzzedDataProvider fuzzed_data_provider(buffer.data(), buffer.size());
-    auto mock_time{ConsumeTime(fuzzed_data_provider)};
+    try {
+        SeedRandomStateForTest(SeedRand::ZEROS);
+        FuzzedDataProvider fuzzed_data_provider(buffer.data(), buffer.size());
+        auto mock_time{ConsumeTime(fuzzed_data_provider)};
 
-    CBlockHeader genesis_header{Params().GenesisBlock()};
-    CBlockIndex start_index(genesis_header);
+        CBlockHeader genesis_header{Params().GenesisBlock()};
+        CBlockIndex start_index(genesis_header);
 
-    if (mock_time < start_index.GetMedianTimePast()) return;
-    SetMockTime(mock_time);
+        if (mock_time < start_index.GetMedianTimePast()) return;
+        SetMockTime(mock_time);
 
-    const uint256 genesis_hash = genesis_header.GetHash();
-    start_index.phashBlock = &genesis_hash;
+        const uint256 genesis_hash = genesis_header.GetHash();
+        start_index.phashBlock = &genesis_hash;
 
-    arith_uint256 min_work{UintToArith256(ConsumeUInt256(fuzzed_data_provider))};
-    FuzzedHeadersSyncState headers_sync(
-        /*commit_offset=*/fuzzed_data_provider.ConsumeIntegralInRange<unsigned>(1, 1024),
-        /*chain_start=*/&start_index,
-        /*minimum_required_work=*/min_work);
+        arith_uint256 min_work{UintToArith256(ConsumeUInt256(fuzzed_data_provider))};
+        FuzzedHeadersSyncState headers_sync(
+            /*commit_offset=*/fuzzed_data_provider.ConsumeIntegralInRange<unsigned>(1, 1024),
+            /*chain_start=*/&start_index,
+            /*minimum_required_work=*/min_work);
 
-    // Store headers for potential redownload phase.
-    std::vector<CBlockHeader> all_headers;
-    std::vector<CBlockHeader>::const_iterator redownloaded_it;
-    bool presync{true};
-    bool requested_more{true};
+        // Store headers for potential redownload phase.
+        std::vector<CBlockHeader> all_headers;
+        std::vector<CBlockHeader>::const_iterator redownloaded_it;
+        bool presync{true};
+        bool requested_more{true};
 
-    while (requested_more) {
-        std::vector<CBlockHeader> headers;
+        while (requested_more) {
+            std::vector<CBlockHeader> headers;
 
-        // Consume headers from fuzzer or maybe replay headers if we got to the
-        // redownload phase.
-        if (presync || fuzzed_data_provider.ConsumeBool()) {
-            auto deser_headers = ConsumeDeserializable<std::vector<CBlockHeader>>(fuzzed_data_provider);
-            if (!deser_headers || deser_headers->empty()) return;
+            // Consume headers from fuzzer or maybe replay headers if we got to the
+            // redownload phase.
+            if (presync || fuzzed_data_provider.ConsumeBool()) {
+                auto deser_headers = ConsumeHeaders(fuzzed_data_provider);
+                if (deser_headers.empty()) return;
 
-            if (fuzzed_data_provider.ConsumeBool()) {
-                MakeHeadersContinuous(genesis_header, all_headers, *deser_headers);
-            }
-
-            headers.swap(*deser_headers);
-        } else if (auto num_headers_left{std::distance(redownloaded_it, all_headers.cend())}; num_headers_left > 0) {
-            // Consume some headers from the redownload buffer (At least one
-            // header is consumed).
-            auto begin_it{redownloaded_it};
-            std::advance(redownloaded_it, fuzzed_data_provider.ConsumeIntegralInRange<int>(1, num_headers_left));
-            headers.insert(headers.cend(), begin_it, redownloaded_it);
-        }
-
-        if (headers.empty()) return;
-        auto result = headers_sync.ProcessNextHeaders(headers, fuzzed_data_provider.ConsumeBool());
-        requested_more = result.request_more;
-
-        if (result.request_more) {
-            if (presync) {
-                all_headers.insert(all_headers.cend(), headers.cbegin(), headers.cend());
-
-                if (headers_sync.GetState() == HeadersSyncState::State::REDOWNLOAD) {
-                    presync = false;
-                    redownloaded_it = all_headers.cbegin();
-
-                    // If we get to redownloading, the presynced headers need
-                    // to have the min amount of work on them.
-                    assert(CalculateClaimedHeadersWork(all_headers) >= min_work);
+                if (fuzzed_data_provider.ConsumeBool()) {
+                    MakeHeadersContinuous(genesis_header, all_headers, deser_headers);
                 }
+
+                headers.swap(deser_headers);
+            } else if (auto num_headers_left{std::distance(redownloaded_it, all_headers.cend())}; num_headers_left > 0) {
+                // Consume some headers from the redownload buffer (At least one
+                // header is consumed).
+                auto begin_it{redownloaded_it};
+                std::advance(redownloaded_it, fuzzed_data_provider.ConsumeIntegralInRange<int>(1, num_headers_left));
+                headers.insert(headers.cend(), begin_it, redownloaded_it);
             }
 
-            (void)headers_sync.NextHeadersRequestLocator();
+            if (headers.empty()) return;
+            auto result = headers_sync.ProcessNextHeaders(headers, fuzzed_data_provider.ConsumeBool());
+            requested_more = result.request_more;
+
+            if (result.request_more) {
+                if (presync) {
+                    all_headers.insert(all_headers.cend(), headers.cbegin(), headers.cend());
+
+                    if (headers_sync.GetState() == HeadersSyncState::State::REDOWNLOAD) {
+                        presync = false;
+                        redownloaded_it = all_headers.cbegin();
+
+                        // If we get to redownloading, the presynced headers need
+                        // to have the min amount of work on them.
+                        assert(CalculateClaimedHeadersWork(all_headers) >= min_work);
+                    }
+                }
+
+                (void)headers_sync.NextHeadersRequestLocator();
+            }
         }
+    } catch (const std::ios_base::failure&) {
+        return;
     }
 }

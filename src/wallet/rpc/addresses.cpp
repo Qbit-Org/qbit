@@ -11,6 +11,8 @@
 #include <script/solver.h>
 #include <util/bip32.h>
 #include <util/translation.h>
+#include <util/vector.h>
+#include <wallet/pqc_usage.h>
 #include <wallet/receive.h>
 #include <wallet/rpc/util.h>
 #include <wallet/wallet.h>
@@ -18,19 +20,32 @@
 #include <univalue.h>
 
 namespace wallet {
+namespace {
+std::string FormatDefaultDescriptorKeypoolHelp()
+{
+    const auto default_output_types = GetDefaultDescriptorOutputTypes();
+    return strprintf(
+        "By default, descriptor wallets on this chain have %u active ranged descriptor%s (%s) with %u entries.\n",
+        static_cast<unsigned int>(default_output_types.size()),
+        default_output_types.size() == 1 ? "" : "s",
+        FormatOutputTypes(default_output_types),
+        DEFAULT_KEYPOOL_SIZE);
+}
+} // namespace
+
 RPCHelpMan getnewaddress()
 {
     return RPCHelpMan{
         "getnewaddress",
-        "Returns a new Bitcoin address for receiving payments.\n"
+        "Returns a new qbit address for receiving payments.\n"
                 "If 'label' is specified, it is added to the address book \n"
                 "so payments received with the address will be associated with 'label'.\n",
                 {
                     {"label", RPCArg::Type::STR, RPCArg::Default{""}, "The label name for the address to be linked to. It can also be set to the empty string \"\" to represent the default label. The label does not need to exist, it will be created if there is no label by the given name."},
-                    {"address_type", RPCArg::Type::STR, RPCArg::DefaultHint{"set by -addresstype"}, "The address type to use. Options are " + FormatAllOutputTypes() + "."},
+                    {"address_type", RPCArg::Type::STR, RPCArg::DefaultHint{"set by -addresstype"}, "The address type to use. Options are " + FormatWalletOutputTypes() + "."},
                 },
                 RPCResult{
-                    RPCResult::Type::STR, "address", "The new bitcoin address"
+                    RPCResult::Type::STR, "address", "The new qbit address"
                 },
                 RPCExamples{
                     HelpExampleCli("getnewaddress", "")
@@ -52,11 +67,7 @@ RPCHelpMan getnewaddress()
 
     OutputType output_type = pwallet->m_default_address_type;
     if (!request.params[1].isNull()) {
-        std::optional<OutputType> parsed = ParseOutputType(request.params[1].get_str());
-        if (!parsed) {
-            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, strprintf("Unknown address type '%s'", request.params[1].get_str()));
-        }
-        output_type = parsed.value();
+        output_type = ParseWalletOutputType(*pwallet, request.params[1].get_str(), "address type", /*internal=*/false);
     }
 
     auto op_dest = pwallet->GetNewDestination(output_type, label);
@@ -73,10 +84,10 @@ RPCHelpMan getrawchangeaddress()
 {
     return RPCHelpMan{
         "getrawchangeaddress",
-        "Returns a new Bitcoin address, for receiving change.\n"
+        "Returns a new qbit address, for receiving change.\n"
                 "This is for use with raw transactions, NOT normal use.\n",
                 {
-                    {"address_type", RPCArg::Type::STR, RPCArg::DefaultHint{"set by -changetype"}, "The address type to use. Options are " + FormatAllOutputTypes() + "."},
+                    {"address_type", RPCArg::Type::STR, RPCArg::DefaultHint{"set by -changetype"}, "The address type to use. Options are " + FormatWalletOutputTypes() + "."},
                 },
                 RPCResult{
                     RPCResult::Type::STR, "address", "The address"
@@ -98,11 +109,7 @@ RPCHelpMan getrawchangeaddress()
 
     OutputType output_type = pwallet->m_default_change_type.value_or(pwallet->m_default_address_type);
     if (!request.params[0].isNull()) {
-        std::optional<OutputType> parsed = ParseOutputType(request.params[0].get_str());
-        if (!parsed) {
-            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, strprintf("Unknown address type '%s'", request.params[0].get_str()));
-        }
-        output_type = parsed.value();
+        output_type = ParseWalletOutputType(*pwallet, request.params[0].get_str(), "address type", /*internal=*/true);
     }
 
     auto op_dest = pwallet->GetNewChangeDestination(output_type);
@@ -121,7 +128,7 @@ RPCHelpMan setlabel()
         "setlabel",
         "Sets the label associated with the given address.\n",
                 {
-                    {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The bitcoin address to be associated with a label."},
+                    {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The qbit address to be associated with a label."},
                     {"label", RPCArg::Type::STR, RPCArg::Optional::NO, "The label to assign to the address."},
                 },
                 RPCResult{RPCResult::Type::NONE, "", ""},
@@ -138,7 +145,7 @@ RPCHelpMan setlabel()
 
     CTxDestination dest = DecodeDestination(request.params[0].get_str());
     if (!IsValidDestination(dest)) {
-        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid Bitcoin address");
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid qbit address");
     }
 
     const std::string label{LabelFromValue(request.params[1])};
@@ -169,7 +176,7 @@ RPCHelpMan listaddressgroupings()
                         {
                             {RPCResult::Type::ARR_FIXED, "", "",
                             {
-                                {RPCResult::Type::STR, "address", "The bitcoin address"},
+                                {RPCResult::Type::STR, "address", "The qbit address"},
                                 {RPCResult::Type::STR_AMOUNT, "amount", "The amount in " + CURRENCY_UNIT},
                                 {RPCResult::Type::STR, "label", /*optional=*/true, "The label"},
                             }},
@@ -219,7 +226,7 @@ RPCHelpMan keypoolrefill()
 {
     return RPCHelpMan{"keypoolrefill",
                 "Refills each descriptor keypool in the wallet up to the specified number of new keys.\n"
-                "By default, descriptor wallets have 4 active ranged descriptors (" + FormatAllOutputTypes() + "), each with " + util::ToString(DEFAULT_KEYPOOL_SIZE) + " entries.\n" +
+                + FormatDefaultDescriptorKeypoolHelp() +
         HELP_REQUIRING_PASSPHRASE,
                 {
                     {"newsize", RPCArg::Type::NUM, RPCArg::DefaultHint{strprintf("%u, or as set by -keypool", DEFAULT_KEYPOOL_SIZE)}, "The new keypool size"},
@@ -245,10 +252,9 @@ RPCHelpMan keypoolrefill()
     }
 
     EnsureWalletIsUnlocked(*pwallet);
-    pwallet->TopUpKeyPool(kpSize);
-
-    if (pwallet->GetKeyPoolSize() < kpSize) {
-        throw JSONRPCError(RPC_WALLET_ERROR, "Error refreshing keypool.");
+    auto top_up_res{pwallet->TopUpKeyPoolResult(kpSize)};
+    if (!top_up_res) {
+        throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(top_up_res).original);
     }
     pwallet->RefreshAllTXOs();
 
@@ -348,9 +354,10 @@ public:
         return obj;
     }
 
-    UniValue operator()(const WitnessV1Taproot& id) const { return UniValue(UniValue::VOBJ); }
-    UniValue operator()(const PayToAnchor& id) const { return UniValue(UniValue::VOBJ); }
-    UniValue operator()(const WitnessUnknown& id) const { return UniValue(UniValue::VOBJ); }
+    UniValue operator()(const WitnessV1Taproot&) const { return UniValue(UniValue::VOBJ); }
+    UniValue operator()(const WitnessV2P2MR&) const { return UniValue(UniValue::VOBJ); }
+    UniValue operator()(const PayToAnchor&) const { return UniValue(UniValue::VOBJ); }
+    UniValue operator()(const WitnessUnknown&) const { return UniValue(UniValue::VOBJ); }
 };
 
 static UniValue DescribeWalletAddress(const CWallet& wallet, const CTxDestination& dest)
@@ -369,15 +376,15 @@ RPCHelpMan getaddressinfo()
 {
     return RPCHelpMan{
         "getaddressinfo",
-        "Return information about the given bitcoin address.\n"
+        "Return information about the given qbit address.\n"
                 "Some of the information will only be present if the address is in the active wallet.\n",
                 {
-                    {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The bitcoin address for which to get information."},
+                    {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The qbit address for which to get information."},
                 },
                 RPCResult{
                     RPCResult::Type::OBJ, "", "",
-                    {
-                        {RPCResult::Type::STR, "address", "The bitcoin address validated."},
+                    Cat(std::vector<RPCResult>{
+                        {RPCResult::Type::STR, "address", "The qbit address validated."},
                         {RPCResult::Type::STR_HEX, "scriptPubKey", "The hex-encoded output script generated by the address."},
                         {RPCResult::Type::BOOL, "ismine", "If the address is yours."},
                         {RPCResult::Type::BOOL, "iswatchonly", "(DEPRECATED) Always false."},
@@ -391,7 +398,7 @@ RPCHelpMan getaddressinfo()
                         {RPCResult::Type::STR_HEX, "witness_program", /*optional=*/true, "The hex value of the witness program."},
                         {RPCResult::Type::STR, "script", /*optional=*/true, "The output script type. Only if isscript is true and the redeemscript is known. Possible\n"
                                                                      "types: nonstandard, pubkey, pubkeyhash, scripthash, multisig, nulldata, witness_v0_keyhash,\n"
-                            "witness_v0_scripthash, witness_unknown."},
+                            "witness_v0_scripthash, witness_v1_taproot, witness_v2_p2mr, witness_unknown."},
                         {RPCResult::Type::STR_HEX, "hex", /*optional=*/true, "The redeemscript for the p2sh address."},
                         {RPCResult::Type::ARR, "pubkeys", /*optional=*/true, "Array of pubkeys associated with the known redeemscript (only if script is multisig).",
                         {
@@ -414,7 +421,7 @@ RPCHelpMan getaddressinfo()
                         {
                             {RPCResult::Type::STR, "label name", "Label name (defaults to \"\")."},
                         }},
-                    }
+                    }, PQCUsageRPCResults(/*include_warnings=*/false))
                 },
                 RPCExamples{
                     HelpExampleCli("getaddressinfo", "\"" + EXAMPLE_ADDRESS[0] + "\"") +
@@ -470,7 +477,10 @@ RPCHelpMan getaddressinfo()
     DescriptorScriptPubKeyMan* desc_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(spk_man);
     if (desc_spk_man) {
         std::string desc_str;
-        if (desc_spk_man->GetDescriptorString(desc_str, /*priv=*/false)) {
+        LOCK(desc_spk_man->cs_desc_man);
+        const WalletDescriptor wallet_descriptor = desc_spk_man->GetWalletDescriptor();
+        if (!ShouldSuppressP2MRBIP32Descriptor(*wallet_descriptor.descriptor, /*private_export=*/false) &&
+            desc_spk_man->GetDescriptorString(desc_str, /*priv=*/false)) {
             ret.pushKV("parent_desc", desc_str);
         }
     }
@@ -506,6 +516,9 @@ RPCHelpMan getaddressinfo()
         labels.push_back(address_book_entry->GetLabel());
     }
     ret.pushKV("labels", std::move(labels));
+
+    const PQCUsageReport pqc_usage = BuildGetAddressInfoPQCUsageReport(*pwallet, scriptPubKey);
+    AppendPQCUsage(ret, pqc_usage, /*include_warnings=*/false);
 
     return ret;
 },
@@ -636,7 +649,7 @@ RPCHelpMan walletdisplayaddress()
         "walletdisplayaddress",
         "Display address on an external signer for verification.",
         {
-            {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "bitcoin address to display"},
+            {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "qbit address to display"},
         },
         RPCResult{
             RPCResult::Type::OBJ,"","",

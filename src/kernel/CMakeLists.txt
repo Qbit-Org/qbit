@@ -19,6 +19,8 @@ add_library(bitcoinkernel
   disconnected_transactions.cpp
   mempool_removal_reason.cpp
   ../arith_uint256.cpp
+  ../auxpow.cpp
+  ../auxpow_validation.cpp
   ../chain.cpp
   ../coins.cpp
   ../compressor.cpp
@@ -34,6 +36,7 @@ add_library(bitcoinkernel
   ../logging.cpp
   ../node/blockstorage.cpp
   ../node/chainstate.cpp
+  ../node/orphan_metrics.cpp
   ../node/utxo_snapshot.cpp
   ../policy/ephemeral_policy.cpp
   ../policy/feerate.cpp
@@ -87,6 +90,7 @@ add_library(bitcoinkernel
 target_link_libraries(bitcoinkernel
   PRIVATE
     core_interface
+    bitcoinpqc
     secp256k1_objs
     $<$<PLATFORM_ID:Windows>:bcrypt>
     $<TARGET_NAME_IF_EXISTS:USDT::headers>

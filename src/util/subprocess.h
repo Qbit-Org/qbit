@@ -33,8 +33,8 @@ Documentation for C++ subprocessing library.
 @version 1.0.0
 */
 
-#ifndef BITCOIN_UTIL_SUBPROCESS_H
-#define BITCOIN_UTIL_SUBPROCESS_H
+#ifndef QBIT_UTIL_SUBPROCESS_H
+#define QBIT_UTIL_SUBPROCESS_H
 
 #include <util/syserror.h>
 
@@ -1500,4 +1500,4 @@ namespace detail {
 
 }
 
-#endif // BITCOIN_UTIL_SUBPROCESS_H
+#endif // QBIT_UTIL_SUBPROCESS_H

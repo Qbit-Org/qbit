@@ -8,6 +8,7 @@
 #include <wallet/walletdb.h>
 
 #include <common/system.h>
+#include <crypto/common.h>
 #include <key_io.h>
 #include <primitives/transaction_identifier.h>
 #include <protocol.h>
@@ -24,6 +25,7 @@
 #include <wallet/wallet.h>
 
 #include <atomic>
+#include <array>
 #include <optional>
 #include <string>
 
@@ -50,6 +52,8 @@ const std::string OLD_KEY{"wkey"};
 const std::string ORDERPOSNEXT{"orderposnext"};
 const std::string POOL{"pool"};
 const std::string PURPOSE{"purpose"};
+const std::string PUBKEYDBCURSOR{"pubkeydbcursor"};
+const std::string PUBKEYDBENTRY{"pubkeydbentry"};
 const std::string SETTINGS{"settings"};
 const std::string TX{"tx"};
 const std::string VERSION{"version"};
@@ -58,6 +62,9 @@ const std::string WALLETDESCRIPTORCACHE{"walletdescriptorcache"};
 const std::string WALLETDESCRIPTORLHCACHE{"walletdescriptorlhcache"};
 const std::string WALLETDESCRIPTORCKEY{"walletdescriptorckey"};
 const std::string WALLETDESCRIPTORKEY{"walletdescriptorkey"};
+const std::string WALLETDESCRIPTORPQCCKEY{"walletdescriptorpqc_ckey"};
+const std::string WALLETDESCRIPTORPQCKEY{"walletdescriptorpqckey"};
+const std::string WALLETDESCRIPTORP2MRCACHE{"walletdescriptorp2mrcache"};
 const std::string WATCHMETA{"watchmeta"};
 const std::string WATCHS{"watchs"};
 const std::unordered_set<std::string> LEGACY_TYPES{CRYPTED_KEY, CSCRIPT, DEFAULTKEY, HDCHAIN, KEYMETA, KEY, OLD_KEY, POOL, WATCHMETA, WATCHS};
@@ -231,6 +238,33 @@ bool WalletBatch::WriteCryptedDescriptorKey(const uint256& desc_id, const CPubKe
     return true;
 }
 
+bool WalletBatch::WriteDescriptorPQCKey(const uint256& desc_id, const CPQCPubKey& pubkey, const CPQCKey& privkey, uint32_t sig_counter)
+{
+    // hash pubkey/privkey/counter to accelerate wallet load and integrity-check counter state
+    std::vector<unsigned char> key;
+    key.reserve(pubkey.size() + privkey.size() + sizeof(sig_counter));
+    key.insert(key.end(), pubkey.begin(), pubkey.end());
+    key.insert(key.end(), privkey.data(), privkey.data() + privkey.size());
+    std::array<unsigned char, sizeof(sig_counter)> counter_bytes{};
+    WriteLE32(counter_bytes.data(), sig_counter);
+    key.insert(key.end(), counter_bytes.begin(), counter_bytes.end());
+
+    std::vector<unsigned char> secret(privkey.data(), privkey.data() + privkey.size());
+    return WriteIC(
+        std::make_pair(DBKeys::WALLETDESCRIPTORPQCKEY, std::make_pair(desc_id, pubkey)),
+        std::make_pair(secret, std::make_pair(Hash(key), sig_counter)),
+        true);
+}
+
+bool WalletBatch::WriteCryptedDescriptorPQCKey(const uint256& desc_id, const CPQCPubKey& pubkey, const std::vector<unsigned char>& secret, uint32_t sig_counter)
+{
+    if (!WriteIC(std::make_pair(DBKeys::WALLETDESCRIPTORPQCCKEY, std::make_pair(desc_id, pubkey)), std::make_pair(secret, sig_counter), true)) {
+        return false;
+    }
+    EraseIC(std::make_pair(DBKeys::WALLETDESCRIPTORPQCKEY, std::make_pair(desc_id, pubkey)));
+    return true;
+}
+
 bool WalletBatch::WriteDescriptor(const uint256& desc_id, const WalletDescriptor& descriptor)
 {
     return WriteIC(make_pair(DBKeys::WALLETDESCRIPTOR, desc_id), descriptor);
@@ -241,6 +275,12 @@ bool WalletBatch::WriteDescriptorDerivedCache(const CExtPubKey& xpub, const uint
     std::vector<unsigned char> ser_xpub(BIP32_EXTKEY_SIZE);
     xpub.Encode(ser_xpub.data());
     return WriteIC(std::make_pair(std::make_pair(DBKeys::WALLETDESCRIPTORCACHE, desc_id), std::make_pair(key_exp_index, der_index)), ser_xpub);
+}
+
+bool WalletBatch::WriteDescriptorDerivedP2MRCache(const CPQCPubKey& pubkey, const uint256& desc_id, uint32_t key_exp_index, uint32_t der_index)
+{
+    std::vector<unsigned char> ser_pubkey(pubkey.begin(), pubkey.end());
+    return WriteIC(std::make_pair(std::make_pair(DBKeys::WALLETDESCRIPTORP2MRCACHE, desc_id), std::make_pair(key_exp_index, der_index)), ser_pubkey);
 }
 
 bool WalletBatch::WriteDescriptorParentCache(const CExtPubKey& xpub, const uint256& desc_id, uint32_t key_exp_index)
@@ -267,6 +307,13 @@ bool WalletBatch::WriteDescriptorCacheItems(const uint256& desc_id, const Descri
     for (const auto& derived_xpub_map_pair : cache.GetCachedDerivedExtPubKeys()) {
         for (const auto& derived_xpub_pair : derived_xpub_map_pair.second) {
             if (!WriteDescriptorDerivedCache(derived_xpub_pair.second, desc_id, derived_xpub_map_pair.first, derived_xpub_pair.first)) {
+                return false;
+            }
+        }
+    }
+    for (const auto& derived_p2mr_map_pair : cache.GetCachedDerivedP2MRPubKeys()) {
+        for (const auto& derived_p2mr_pair : derived_p2mr_map_pair.second) {
+            if (!WriteDescriptorDerivedP2MRCache(derived_p2mr_pair.second, desc_id, derived_p2mr_map_pair.first, derived_p2mr_pair.first)) {
                 return false;
             }
         }
@@ -762,8 +809,10 @@ static DBErrors LoadDescriptorWalletRecords(CWallet* pwallet, DatabaseBatch& bat
     // Load descriptor record
     int num_keys = 0;
     int num_ckeys= 0;
+    int num_pqc_keys = 0;
+    int num_crypted_pqc_keys = 0;
     LoadResult desc_res = LoadRecords(pwallet, batch, DBKeys::WALLETDESCRIPTOR,
-        [&batch, &num_keys, &num_ckeys, &last_client] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& strErr) {
+        [&batch, &num_keys, &num_ckeys, &num_pqc_keys, &num_crypted_pqc_keys, &last_client] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& strErr) {
         DBErrors result = DBErrors::LOAD_OK;
 
         uint256 id;
@@ -822,6 +871,30 @@ static DBErrors LoadDescriptorWalletRecords(CWallet* pwallet, DatabaseBatch& bat
             return DBErrors::LOAD_OK;
         });
         result = std::max(result, key_cache_res.m_result);
+
+        // Get derived P2MR key cache for this descriptor
+        prefix = PrefixStream(DBKeys::WALLETDESCRIPTORP2MRCACHE, id);
+        LoadResult p2mr_cache_res = LoadRecords(pwallet, batch, DBKeys::WALLETDESCRIPTORP2MRCACHE, prefix,
+            [&id, &cache] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& err) {
+            uint256 desc_id;
+            uint32_t key_exp_index;
+            uint32_t der_index;
+            key >> desc_id;
+            assert(desc_id == id);
+            key >> key_exp_index;
+            key >> der_index;
+
+            std::vector<unsigned char> ser_pubkey;
+            value >> ser_pubkey;
+            CPQCPubKey pubkey{std::span<const unsigned char>{ser_pubkey}};
+            if (!pubkey.IsValid()) {
+                err = "Error reading wallet database: descriptor P2MR cache pubkey is invalid";
+                return DBErrors::CORRUPT;
+            }
+            cache.CacheDerivedP2MRPubKey(key_exp_index, der_index, pubkey);
+            return DBErrors::LOAD_OK;
+        });
+        result = std::max(result, p2mr_cache_res.m_result);
 
         // Get last hardened cache for this descriptor
         prefix = PrefixStream(DBKeys::WALLETDESCRIPTORLHCACHE, id);
@@ -914,13 +987,109 @@ static DBErrors LoadDescriptorWalletRecords(CWallet* pwallet, DatabaseBatch& bat
         result = std::max(result, ckey_res.m_result);
         num_ckeys = ckey_res.m_records;
 
+        // Get PQC keys
+        prefix = PrefixStream(DBKeys::WALLETDESCRIPTORPQCKEY, id);
+        LoadResult pqc_key_res = LoadRecords(pwallet, batch, DBKeys::WALLETDESCRIPTORPQCKEY, prefix,
+            [&id, &spk_man] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& strErr) {
+            uint256 desc_id;
+            CPQCPubKey pubkey;
+            key >> desc_id;
+            assert(desc_id == id);
+            key >> pubkey;
+            if (!pubkey.IsValid())
+            {
+                strErr = "Error reading wallet database: descriptor PQC key CPQCPubKey corrupt";
+                return DBErrors::CORRUPT;
+            }
+
+            std::vector<unsigned char> privkey_bytes;
+            uint256 hash;
+            uint32_t sig_counter{0};
+            value >> privkey_bytes;
+            value >> hash;
+            const bool has_counter = !value.eof();
+            if (has_counter) {
+                try {
+                    value >> sig_counter;
+                } catch (const std::exception& e) {
+                    strErr = strprintf("Error reading wallet database: descriptor PQC counter parse failed (%s)", e.what());
+                    return DBErrors::CORRUPT;
+                }
+            }
+
+            if (privkey_bytes.size() != CPQCKey::SIZE) {
+                strErr = "Error reading wallet database: descriptor PQC key size mismatch";
+                return DBErrors::CORRUPT;
+            }
+
+            std::vector<unsigned char> to_hash;
+            to_hash.reserve(pubkey.size() + privkey_bytes.size());
+            to_hash.insert(to_hash.end(), pubkey.begin(), pubkey.end());
+            to_hash.insert(to_hash.end(), privkey_bytes.begin(), privkey_bytes.end());
+            const bool legacy_hash_ok = Hash(to_hash) == hash;
+            bool new_hash_ok = false;
+            if (has_counter) {
+                std::array<unsigned char, sizeof(sig_counter)> counter_bytes{};
+                WriteLE32(counter_bytes.data(), sig_counter);
+                to_hash.insert(to_hash.end(), counter_bytes.begin(), counter_bytes.end());
+                new_hash_ok = Hash(to_hash) == hash;
+            }
+            if (has_counter ? !new_hash_ok : !legacy_hash_ok) {
+                strErr = "Error reading wallet database: descriptor PQC key hash mismatch";
+                return DBErrors::CORRUPT;
+            }
+
+            CPQCKey privkey;
+            privkey.Set(privkey_bytes.data(), privkey_bytes.data() + privkey_bytes.size());
+            if (!privkey.IsValid() || privkey.GetPubKey() != pubkey) {
+                strErr = "Error reading wallet database: descriptor PQC key invalid";
+                return DBErrors::CORRUPT;
+            }
+
+            spk_man->AddPQCKey(pubkey, privkey, sig_counter);
+            return DBErrors::LOAD_OK;
+        });
+        result = std::max(result, pqc_key_res.m_result);
+        num_pqc_keys = pqc_key_res.m_records;
+
+        prefix = PrefixStream(DBKeys::WALLETDESCRIPTORPQCCKEY, id);
+        LoadResult crypted_pqc_key_res = LoadRecords(pwallet, batch, DBKeys::WALLETDESCRIPTORPQCCKEY, prefix,
+            [&id, &spk_man] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& err) {
+            uint256 desc_id;
+            CPQCPubKey pubkey;
+            key >> desc_id;
+            assert(desc_id == id);
+            key >> pubkey;
+            if (!pubkey.IsValid()) {
+                err = "Error reading wallet database: descriptor encrypted PQC key CPQCPubKey corrupt";
+                return DBErrors::CORRUPT;
+            }
+
+            std::vector<unsigned char> crypted_secret;
+            uint32_t sig_counter{0};
+            value >> crypted_secret;
+            if (!value.eof()) {
+                try {
+                    value >> sig_counter;
+                } catch (const std::exception& e) {
+                    err = strprintf("Error reading wallet database: descriptor encrypted PQC counter parse failed (%s)", e.what());
+                    return DBErrors::CORRUPT;
+                }
+            }
+
+            spk_man->AddCryptedPQCKey(pubkey, crypted_secret, sig_counter);
+            return DBErrors::LOAD_OK;
+        });
+        result = std::max(result, crypted_pqc_key_res.m_result);
+        num_crypted_pqc_keys = crypted_pqc_key_res.m_records;
+
         return result;
     });
 
     if (desc_res.m_result <= DBErrors::NONCRITICAL_ERROR) {
         // Only log if there are no critical errors
-        pwallet->WalletLogPrintf("Descriptors: %u, Descriptor Keys: %u plaintext, %u encrypted, %u total.\n",
-               desc_res.m_records, num_keys, num_ckeys, num_keys + num_ckeys);
+        pwallet->WalletLogPrintf("Descriptors: %u, Descriptor Keys: %u plaintext, %u encrypted, %u PQC plaintext, %u PQC encrypted, %u total.\n",
+               desc_res.m_records, num_keys, num_ckeys, num_pqc_keys, num_crypted_pqc_keys, num_keys + num_ckeys + num_pqc_keys + num_crypted_pqc_keys);
     }
 
     return desc_res.m_result;
@@ -930,22 +1099,34 @@ static DBErrors LoadAddressBookRecords(CWallet* pwallet, DatabaseBatch& batch) E
 {
     AssertLockHeld(pwallet->cs_wallet);
     DBErrors result = DBErrors::LOAD_OK;
+    auto decode_address_book_destination = [pwallet](const std::string& str_address) -> std::optional<CTxDestination> {
+        std::string error;
+        CTxDestination dest{DecodeDestination(str_address, error)};
+        if (!IsValidDestination(dest)) {
+            pwallet->WalletLogPrintf("Skipping address book metadata for unsupported address '%s'%s\n",
+                                     str_address,
+                                     error.empty() ? "" : strprintf(": %s", error));
+            return std::nullopt;
+        }
+        return dest;
+    };
 
     // Load name record
     LoadResult name_res = LoadRecords(pwallet, batch, DBKeys::NAME,
-        [] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& err) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet) {
+        [&decode_address_book_destination] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& err) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet) {
         std::string strAddress;
         key >> strAddress;
         std::string label;
         value >> label;
-        pwallet->m_address_book[DecodeDestination(strAddress)].SetLabel(label);
+        const auto dest{decode_address_book_destination(strAddress)};
+        if (dest) pwallet->m_address_book[*dest].SetLabel(label);
         return DBErrors::LOAD_OK;
     });
     result = std::max(result, name_res.m_result);
 
     // Load purpose record
     LoadResult purpose_res = LoadRecords(pwallet, batch, DBKeys::PURPOSE,
-        [] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& err) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet) {
+        [&decode_address_book_destination] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& err) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet) {
         std::string strAddress;
         key >> strAddress;
         std::string purpose_str;
@@ -954,19 +1135,21 @@ static DBErrors LoadAddressBookRecords(CWallet* pwallet, DatabaseBatch& batch) E
         if (!purpose) {
             pwallet->WalletLogPrintf("Warning: nonstandard purpose string '%s' for address '%s'\n", purpose_str, strAddress);
         }
-        pwallet->m_address_book[DecodeDestination(strAddress)].purpose = purpose;
+        const auto dest{decode_address_book_destination(strAddress)};
+        if (dest) pwallet->m_address_book[*dest].purpose = purpose;
         return DBErrors::LOAD_OK;
     });
     result = std::max(result, purpose_res.m_result);
 
     // Load destination data record
     LoadResult dest_res = LoadRecords(pwallet, batch, DBKeys::DESTDATA,
-        [] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& err) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet) {
+        [&decode_address_book_destination] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& err) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet) {
         std::string strAddress, strKey, strValue;
         key >> strAddress;
         key >> strKey;
         value >> strValue;
-        const CTxDestination& dest{DecodeDestination(strAddress)};
+        const auto dest{decode_address_book_destination(strAddress)};
+        if (!dest) return DBErrors::LOAD_OK;
         if (strKey.compare("used") == 0) {
             // Load "used" key indicating if an IsMine address has
             // previously been spent from with avoid_reuse option enabled.
@@ -974,15 +1157,69 @@ static DBErrors LoadAddressBookRecords(CWallet* pwallet, DatabaseBatch& batch) E
             // hold more information in the future. Current values are just
             // "1" or "p" for present (which was written prior to
             // f5ba424cd44619d9b9be88b8593d69a7ba96db26).
-            pwallet->LoadAddressPreviouslySpent(dest);
+            pwallet->LoadAddressPreviouslySpent(*dest);
         } else if (strKey.starts_with("rr")) {
             // Load "rr##" keys where ## is a decimal number, and strValue
             // is a serialized RecentRequestEntry object.
-            pwallet->LoadAddressReceiveRequest(dest, strKey.substr(2), strValue);
+            pwallet->LoadAddressReceiveRequest(*dest, strKey.substr(2), strValue);
         }
         return DBErrors::LOAD_OK;
     });
     result = std::max(result, dest_res.m_result);
+
+    return result;
+}
+
+static DBErrors LoadPubKeyDBPoolRecords(CWallet* pwallet, DatabaseBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet)
+{
+    AssertLockHeld(pwallet->cs_wallet);
+    DBErrors result = DBErrors::LOAD_OK;
+
+    LoadResult entry_res = LoadRecords(pwallet, batch, DBKeys::PUBKEYDBENTRY,
+        [] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& err) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet) {
+        int64_t account;
+        bool internal;
+        int64_t index;
+        key >> account;
+        key >> internal;
+        key >> index;
+
+        CPQCPubKey pubkey;
+        value >> pubkey;
+
+        if (account < 0 || index < 0) {
+            err = "Error reading wallet database: pubkeydb pool entry has negative account or index";
+            return DBErrors::CORRUPT;
+        }
+        if (!pubkey.IsValid()) {
+            err = "Error reading wallet database: pubkeydb pool entry has invalid pubkey";
+            return DBErrors::CORRUPT;
+        }
+        if (!pwallet->LoadPubKeyDBPoolEntry({account, internal, index}, pubkey)) {
+            err = "Error reading wallet database: conflicting pubkeydb pool entry";
+            return DBErrors::CORRUPT;
+        }
+        return DBErrors::LOAD_OK;
+    });
+    result = std::max(result, entry_res.m_result);
+
+    LoadResult cursor_res = LoadRecords(pwallet, batch, DBKeys::PUBKEYDBCURSOR,
+        [] (CWallet* pwallet, DataStream& key, DataStream& value, std::string& err) EXCLUSIVE_LOCKS_REQUIRED(pwallet->cs_wallet) {
+        int64_t account;
+        bool internal;
+        int64_t next_index;
+        key >> account;
+        key >> internal;
+        value >> next_index;
+
+        if (account < 0 || next_index < 0) {
+            err = "Error reading wallet database: pubkeydb cursor has negative account or next index";
+            return DBErrors::CORRUPT;
+        }
+        pwallet->LoadPubKeyDBCursor({account, internal}, next_index);
+        return DBErrors::LOAD_OK;
+    });
+    result = std::max(result, cursor_res.m_result);
 
     return result;
 }
@@ -1143,6 +1380,9 @@ DBErrors WalletBatch::LoadWallet(CWallet* pwallet)
         // Load address book
         result = std::max(LoadAddressBookRecords(pwallet, *m_batch), result);
 
+        // Load imported pubkeydb pool state
+        result = std::max(LoadPubKeyDBPoolRecords(pwallet, *m_batch), result);
+
         // Load SPKMs
         result = std::max(LoadActiveSPKMs(pwallet, *m_batch), result);
 
@@ -1250,6 +1490,16 @@ bool WalletBatch::EraseAddressData(const CTxDestination& dest)
     DataStream prefix;
     prefix << DBKeys::DESTDATA << EncodeDestination(dest);
     return m_batch->ErasePrefix(prefix);
+}
+
+bool WalletBatch::WritePubKeyDBPoolEntry(int64_t account, bool internal, int64_t index, const CPQCPubKey& pubkey)
+{
+    return WriteIC(std::make_pair(DBKeys::PUBKEYDBENTRY, std::make_pair(std::make_pair(account, internal), index)), pubkey);
+}
+
+bool WalletBatch::WritePubKeyDBCursor(int64_t account, bool internal, int64_t next_index)
+{
+    return WriteIC(std::make_pair(DBKeys::PUBKEYDBCURSOR, std::make_pair(account, internal)), next_index);
 }
 
 bool WalletBatch::WriteWalletFlags(const uint64_t flags)

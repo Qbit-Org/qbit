@@ -3,13 +3,15 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_CONSENSUS_PARAMS_H
-#define BITCOIN_CONSENSUS_PARAMS_H
+#ifndef QBIT_CONSENSUS_PARAMS_H
+#define QBIT_CONSENSUS_PARAMS_H
 
+#include <consensus/amount.h>
 #include <uint256.h>
 
 #include <array>
 #include <chrono>
+#include <cstdint>
 #include <limits>
 #include <map>
 #include <vector>
@@ -43,7 +45,7 @@ constexpr bool ValidDeployment(DeploymentPos dep) { return dep < MAX_VERSION_BIT
  */
 struct BIP9Deployment {
     /** Bit position to select the particular bit in nVersion. */
-    int bit{28};
+    int bit{0};
     /** Start MedianTime for version bits miner confirmation. Can be a date in the past */
     int64_t nStartTime{NEVER_ACTIVE};
     /** Timeout/expiry MedianTime for the deployment attempt. */
@@ -54,13 +56,13 @@ struct BIP9Deployment {
      */
     int min_activation_height{0};
     /** Period of blocks to check signalling in (usually retarget period, ie params.DifficultyAdjustmentInterval()) */
-    uint32_t period{2016};
+    uint32_t period{20160};
     /**
-     * Minimum blocks including miner confirmation of the total of 2016 blocks in a retargeting period,
-     * which is also used for BIP9 deployments.
-     * Examples: 1916 for 95%, 1512 for testchains.
+     * Minimum blocks including miner confirmation out of one signalling period.
+     * This period is usually the retarget period (params.DifficultyAdjustmentInterval()).
+     * Examples: 19152 for 95% of 20160, 15120 for 75% of 20160.
      */
-    uint32_t threshold{1916};
+    uint32_t threshold{19152};
 
     /** Constant for nTimeout very far in the future. */
     static constexpr int64_t NO_TIMEOUT = std::numeric_limits<int64_t>::max();
@@ -80,9 +82,21 @@ struct BIP9Deployment {
 /**
  * Parameters that influence chain consensus.
  */
+struct ASERTAnchor {
+    int nHeight{0};        //!< Anchor block height.
+    uint32_t nBits{0};     //!< Anchor block target in compact encoding.
+    uint32_t nBitsLegacy{0}; //!< Cadence legacy anchor target in compact encoding.
+    uint32_t nBitsAuxPow{0}; //!< Cadence AuxPoW anchor target in compact encoding.
+    uint64_t nAuxPow{0};   //!< Cumulative AuxPoW block count up to and including the anchor.
+    int64_t nBlockTime{0}; //!< Anchor block timestamp.
+};
+
 struct Params {
     uint256 hashGenesisBlock;
-    int nSubsidyHalvingInterval;
+    CAmount nSubsidyInitial;
+    int nSubsidyStepInterval;
+    int nSubsidyStepdownNumerator;
+    int nSubsidyStepdownDenominator;
     /**
      * Hashes of blocks that
      * - are known to be consensus valid, and
@@ -103,6 +117,10 @@ struct Params {
      * Note that segwit v0 script rules are enforced on all blocks except the
      * BIP 16 exception blocks. */
     int SegwitHeight;
+    /** Block height at which P2MR (BIP360) script-path validation rules become active. */
+    int P2MRHeight{0};
+    /** Block height at which restricted-output mode also accepts the reserved outer witness namespace (v3..v16); set to 0 for a launch baseline, or max int to keep it inactive. */
+    int nOuterReservedWitnessHeight{std::numeric_limits<int>::max()};
     /** Don't warn about unknown BIP 9 activations below this height.
      * This prevents us from warning about the CSV and segwit activations. */
     int MinBIP9WarningHeight;
@@ -116,12 +134,22 @@ struct Params {
       */
     bool enforce_BIP94;
     bool fPowNoRetargeting;
+    bool fRestrictedOutputMode{false}; //!< Restrict all block-created outputs to P2MR plus OP_RETURN/PayToAnchor exemptions; reserved outer witness versions v3..v16 additionally require nOuterReservedWitnessHeight
+    bool fPowUseASERT{false};
+    int nCadenceActivationHeight{0}; //!< Height at which PR6 cadence/AuxPoW header rules become active.
     int64_t nPowTargetSpacing;
+    int64_t nPowTargetSpacingLegacy{0};
+    int64_t nPowTargetSpacingAuxPow{0};
     int64_t nPowTargetTimespan;
+    int nAuxpowChainId{0};
+    int64_t nASERTHalfLife{0};
+    ASERTAnchor asertAnchorParams{};
     std::chrono::seconds PowTargetSpacing() const
     {
         return std::chrono::seconds{nPowTargetSpacing};
     }
+    bool CadenceActiveAtHeight(int height) const { return height >= nCadenceActivationHeight; }
+    bool OuterReservedWitnessActiveAtHeight(int height) const { return height >= nOuterReservedWitnessHeight; }
     int64_t DifficultyAdjustmentInterval() const { return nPowTargetTimespan / nPowTargetSpacing; }
     /** The best chain should have at least this much work */
     uint256 nMinimumChainWork;
@@ -155,4 +183,4 @@ struct Params {
 
 } // namespace Consensus
 
-#endif // BITCOIN_CONSENSUS_PARAMS_H
+#endif // QBIT_CONSENSUS_PARAMS_H

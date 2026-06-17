@@ -9,8 +9,11 @@ add_executable(test_bitcoin
   addrman_tests.cpp
   allocator_tests.cpp
   amount_tests.cpp
+  argsman_chain_tests.cpp
+  asert_tests.cpp
   argsman_tests.cpp
   arith_uint256_tests.cpp
+  auxpow_tests.cpp
   banman_tests.cpp
   base32_tests.cpp
   base58_tests.cpp
@@ -22,10 +25,12 @@ add_executable(test_bitcoin
   blockencodings_tests.cpp
   blockfilter_index_tests.cpp
   blockfilter_tests.cpp
+  blockversion_tests.cpp
   blockmanager_tests.cpp
   bloom_tests.cpp
   bswap_tests.cpp
   caches_tests.cpp
+  cadence_tests.cpp
   chainstate_write_tests.cpp
   checkqueue_tests.cpp
   cluster_linearize_tests.cpp
@@ -39,6 +44,7 @@ add_executable(test_bitcoin
   cuckoocache_tests.cpp
   dbwrapper_tests.cpp
   denialofservice_tests.cpp
+  descriptor_p2mr_tests.cpp
   descriptor_tests.cpp
   disconnected_transactions.cpp
   feefrac_tests.cpp
@@ -50,6 +56,7 @@ add_executable(test_bitcoin
   httpserver_tests.cpp
   i2p_tests.cpp
   interfaces_tests.cpp
+  key_io_p2mr_tests.cpp
   key_io_tests.cpp
   key_tests.cpp
   logging_tests.cpp
@@ -67,8 +74,12 @@ add_executable(test_bitcoin
   netbase_tests.cpp
   node_init_tests.cpp
   node_warnings_tests.cpp
+  confirmation_target_tests.cpp
+  orphan_metrics_tests.cpp
   orphanage_tests.cpp
+  psbt_p2mr_tests.cpp
   pcp_tests.cpp
+  pqc_tests.cpp
   peerman_tests.cpp
   pmt_tests.cpp
   policy_fee_tests.cpp
@@ -80,12 +91,14 @@ add_executable(test_bitcoin
   random_tests.cpp
   rbf_tests.cpp
   rest_tests.cpp
+  rpc_doc_tests.cpp
   result_tests.cpp
   reverselock_tests.cpp
   rpc_tests.cpp
   sanity_tests.cpp
   scheduler_tests.cpp
   script_assets_tests.cpp
+  script_p2mr_tests.cpp
   script_p2sh_tests.cpp
   script_parse_tests.cpp
   script_segwit_tests.cpp
@@ -101,6 +114,7 @@ add_executable(test_bitcoin
   sock_tests.cpp
   span_tests.cpp
   streams_tests.cpp
+  subsidy_tests.cpp
   sync_tests.cpp
   system_ram_tests.cpp
   system_tests.cpp
@@ -129,7 +143,9 @@ add_executable(test_bitcoin
   validation_tests.cpp
   validationinterface_tests.cpp
   versionbits_tests.cpp
+  witness_prune_tests.cpp
 )
+set_target_properties(test_bitcoin PROPERTIES OUTPUT_NAME test_qbit)
 
 include(TargetDataSources)
 target_json_data_sources(test_bitcoin
@@ -138,8 +154,10 @@ target_json_data_sources(test_bitcoin
   data/blockfilters.json
   data/key_io_invalid.json
   data/key_io_valid.json
+  data/mainnet_launch_difficulty.json
   data/script_tests.json
   data/sighash.json
+  data/testnet4_launch_difficulty.json
   data/tx_invalid.json
   data/tx_valid.json
 )
@@ -155,6 +173,7 @@ target_link_libraries(test_bitcoin
   bitcoin_cli
   bitcoin_node
   bitcoin_consensus
+  bitcoinpqc
   minisketch
   secp256k1
   Boost::headers

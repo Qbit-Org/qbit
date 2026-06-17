@@ -39,6 +39,7 @@ from decimal import Decimal
 import os
 import time
 
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.p2p import P2PTxInvStore
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
@@ -57,6 +58,8 @@ class MempoolPersistTest(BitcoinTestFramework):
 
     def run_test(self):
         self.mini_wallet = MiniWallet(self.nodes[2])
+        # Ensure at least one mature coinbase UTXO is available for MiniWallet spends.
+        self.generate(self.mini_wallet, COINBASE_MATURITY)
         if self.is_wallet_compiled():
             self.nodes[2].createwallet(
                 wallet_name="watch",

@@ -7,6 +7,7 @@ import os
 import platform
 
 from test_framework.address import ADDRESS_BCRT1_UNSPENDABLE
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.descriptors import descsum_create
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
@@ -56,7 +57,7 @@ class NotificationsTest(BitcoinTestFramework):
     def run_test(self):
         if self.is_wallet_compiled():
             # Setup the descriptors to be imported to the wallet
-            xpriv = "tprv8ZgxMBicQKsPfHCsTwkiM1KT56RXbGGTqvc2hgqzycpwbHqqpcajQeMRZoBD35kW4RtyCemu6j34Ku5DEspmgjKdt2qe4SvRch5Kk8B8A2v"
+            xpriv = "qrpvV1brS3WRoVwgUUzthDrsmMLPLUGhwQzKM7hFxKYYCVBhxnrzKpb2wzmhowfG6Udidy2oxCTkyhikzJbvWHypWgQgn3NSr4F7aRwhKWJ6CxD"
             desc_imports = [{
                 "desc": descsum_create(f"wpkh({xpriv}/0/*)"),
                 "timestamp": 0,
@@ -110,7 +111,7 @@ class NotificationsTest(BitcoinTestFramework):
             # triggered by node 1
             self.log.info("test -walletnotify with conflicting transactions")
             self.nodes[0].rescanblockchain()
-            self.generatetoaddress(self.nodes[0], 100, ADDRESS_BCRT1_UNSPENDABLE)
+            self.generatetoaddress(self.nodes[0], COINBASE_MATURITY, ADDRESS_BCRT1_UNSPENDABLE)
 
             # Generate transaction on node 0, sync mempools, and check for
             # notification on node 1.

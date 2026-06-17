@@ -13,15 +13,17 @@ their status if block in which they have been included has been
 disconnected.
 """
 
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 import shutil
 
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
         assert_equal,
         assert_greater_than,
         assert_not_equal,
-        assert_raises_rpc_error
+        assert_raises_rpc_error,
+        satoshi_round,
 )
 
 class ReorgsRestoreTest(BitcoinTestFramework):
@@ -48,12 +50,15 @@ class ReorgsRestoreTest(BitcoinTestFramework):
         self.nodes[0].createwallet(wallet_name="w0", load_on_startup=True)
         wallet0 = self.nodes[0].get_wallet_rpc("w0")
         self.generatetoaddress(self.nodes[0], 1, wallet0.getnewaddress(), sync_fun=self.no_op)
-        node0_coinbase_tx_hash = wallet0.getblock(wallet0.getbestblockhash(), verbose=1)['tx'][0]
+        coinbase_block = wallet0.getblock(wallet0.getbestblockhash(), verbose=2)
+        node0_coinbase_tx_hash = coinbase_block['tx'][0]['txid']
+        coinbase_value = Decimal(str(coinbase_block["tx"][0]["vout"][0]["value"]))
 
-        # Mine 100 blocks on top to mature the coinbase and create a descendant
-        self.generate(self.nodes[0], 101, sync_fun=self.no_op)
+        # Mine COINBASE_MATURITY blocks on top to mature the coinbase and create a descendant
+        self.generate(self.nodes[0], COINBASE_MATURITY + 1, sync_fun=self.no_op)
         # Make descendant, send-to-self
-        descendant_tx_id = wallet0.sendtoaddress(wallet0.getnewaddress(), 1)
+        descendant_amount = satoshi_round(coinbase_value / 2, rounding=ROUND_DOWN)
+        descendant_tx_id = wallet0.sendtoaddress(wallet0.getnewaddress(), descendant_amount)
 
         # Verify balance
         wallet0.syncwithvalidationinterfacequeue()
@@ -143,9 +148,21 @@ class ReorgsRestoreTest(BitcoinTestFramework):
         assert_greater_than(wallet.getbalances()["mine"]["immature"], 0)
 
     def run_test(self):
+        fund_wallet = self.nodes[0].get_wallet_rpc(self.default_wallet_name)
+        if self.nodes[0].getblockcount() < COINBASE_MATURITY + 1:
+            self.generatetoaddress(
+                self.nodes[0],
+                COINBASE_MATURITY + 1 - self.nodes[0].getblockcount(),
+                fund_wallet.getnewaddress(),
+            )
+        while fund_wallet.getbalance() < Decimal("20"):
+            self.generatetoaddress(self.nodes[0], 1, fund_wallet.getnewaddress())
+
         # Send a tx from which to conflict outputs later
         txid_conflict_from = self.nodes[0].sendtoaddress(self.nodes[0].getnewaddress(), Decimal("10"))
         self.generate(self.nodes[0], 1)
+        nA = next(tx_out["vout"] for tx_out in self.nodes[0].gettransaction(txid_conflict_from)["details"] if tx_out["amount"] == Decimal("10"))
+        self.nodes[0].lockunspent(False, [{"txid": txid_conflict_from, "vout": nA}])
 
         # Disconnect node1 from others to reorg its chain later
         self.disconnect_nodes(0, 1)
@@ -162,7 +179,6 @@ class ReorgsRestoreTest(BitcoinTestFramework):
 
         # Disconnect node0 from node2 to broadcast a conflict on their respective chains
         self.disconnect_nodes(0, 2)
-        nA = next(tx_out["vout"] for tx_out in self.nodes[0].gettransaction(txid_conflict_from)["details"] if tx_out["amount"] == Decimal("10"))
         inputs = []
         inputs.append({"txid": txid_conflict_from, "vout": nA})
         outputs_1 = {}

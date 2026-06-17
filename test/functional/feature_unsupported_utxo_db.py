@@ -9,7 +9,7 @@ Previous releases are required by this test, see test/README.md.
 
 import shutil
 
-from test_framework.test_framework import BitcoinTestFramework
+from test_framework.test_framework import BitcoinTestFramework, SkipTest
 from test_framework.util import assert_equal
 
 
@@ -31,9 +31,26 @@ class UnsupportedUtxoDbTest(BitcoinTestFramework):
         )
 
     def run_test(self):
-        self.log.info("Create previous version (v0.14.3) utxo db")
         self.start_node(0)
-        block = self.generate(self.nodes[0], 1, sync_fun=self.no_op)[-1]
+        self.start_node(1)
+        if self.nodes[0].getblockhash(0) != self.nodes[1].getblockhash(0):
+            self.stop_nodes()
+            raise SkipTest("previous release uses an incompatible regtest genesis block")
+        self.stop_node(1)
+
+        self.log.info("Create previous version (v0.14.3) utxo db")
+        # Legacy nodes may reject the framework's deterministic mining address.
+        # Pick a valid address for the legacy node without relying on wallet RPCs.
+        candidate_addresses = [
+            self.nodes[0].get_deterministic_priv_key().address,
+            "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn",
+        ]
+        legacy_mining_address = next(
+            (addr for addr in candidate_addresses if self.nodes[0].validateaddress(addr)["isvalid"]),
+            None,
+        )
+        assert legacy_mining_address is not None
+        block = self.generatetoaddress(self.nodes[0], 1, legacy_mining_address, sync_fun=self.no_op)[-1]
         assert_equal(self.nodes[0].getbestblockhash(), block)
         assert_equal(self.nodes[0].gettxoutsetinfo()["total_amount"], 50)
         self.stop_nodes()

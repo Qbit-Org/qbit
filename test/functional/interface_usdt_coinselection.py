@@ -7,6 +7,8 @@
      See https://github.com/bitcoin/bitcoin/blob/master/doc/tracing.md#context-coin_selection
 """
 
+from decimal import Decimal
+
 # Test will be skipped if we don't have bcc installed
 try:
     from bcc import BPF, USDT # type: ignore[import]
@@ -177,8 +179,12 @@ class CoinSelectionTracepointTest(BitcoinTestFramework):
         self.bpf = BPF(text=coinselection_tracepoints_program, usdt_contexts=[ctx], debug=0, cflags=bpf_cflags())
 
         self.log.info("Prepare wallets")
-        self.generate(self.nodes[0], 101)
+        self.ensure_mature_coinbase(self.nodes[0])
         wallet = self.nodes[0].get_wallet_rpc(self.default_wallet_name)
+
+        def test_send_amount():
+            # Keep sends small enough to work across subsidy/maturity variants.
+            return min(wallet.getbalance() / Decimal("2"), Decimal("1"))
 
         self.log.info("Sending a transaction should result in all tracepoints")
         # We should have 5 tracepoints in the order:
@@ -187,7 +193,7 @@ class CoinSelectionTracepointTest(BitcoinTestFramework):
         # 3. attempting_aps_create_tx (type 3)
         # 4. selected_coins (type 1)
         # 5. aps_create_tx_internal (type 4)
-        wallet.sendtoaddress(wallet.getnewaddress(), 10)
+        wallet.sendtoaddress(wallet.getnewaddress(), test_send_amount())
         events = self.get_tracepoints([1, 2, 3, 1, 4])
         success, use_aps, _algo, _waste, change_pos = self.determine_selection_from_usdt(events)
         assert_equal(success, True)
@@ -196,7 +202,8 @@ class CoinSelectionTracepointTest(BitcoinTestFramework):
         self.log.info("Failing to fund results in 1 tracepoint")
         # We should have 1 tracepoints in the order
         # 1. normal_create_tx_internal (type 2)
-        assert_raises_rpc_error(-6, "Insufficient funds", wallet.sendtoaddress, wallet.getnewaddress(), 102 * 50)
+        insufficient_amount = wallet.getbalance() + 1
+        assert_raises_rpc_error(-6, "Insufficient funds", wallet.sendtoaddress, wallet.getnewaddress(), insufficient_amount)
         events = self.get_tracepoints([2])
         success, use_aps, _algo, _waste, change_pos = self.determine_selection_from_usdt(events)
         assert_equal(success, False)
@@ -206,7 +213,7 @@ class CoinSelectionTracepointTest(BitcoinTestFramework):
         # 1. selected_coins (type 1)
         # 2. normal_create_tx_internal (type 2)
         wallet.setwalletflag("avoid_reuse")
-        wallet.sendtoaddress(address=wallet.getnewaddress(), amount=10, avoid_reuse=True)
+        wallet.sendtoaddress(address=wallet.getnewaddress(), amount=test_send_amount(), avoid_reuse=True)
         events = self.get_tracepoints([1, 2])
         success, use_aps, _algo, _waste, change_pos = self.determine_selection_from_usdt(events)
         assert_equal(success, True)

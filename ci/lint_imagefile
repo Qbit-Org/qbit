@@ -4,7 +4,8 @@
 
 # See test/lint/README.md for usage.
 
-FROM mirror.gcr.io/ubuntu:24.04
+ARG CI_IMAGE_NAME_TAG=docker.io/library/ubuntu:24.04
+FROM ${CI_IMAGE_NAME_TAG}
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LC_ALL=C.UTF-8

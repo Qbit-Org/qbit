@@ -1,0 +1,16 @@
+site_name: qbit RPC Reference
+site_description: Generated RPC reference for qbit against the committed v30.2 baseline
+site_url: https://docs.qbit.org/
+theme:
+  name: readthedocs
+  highlightjs: false
+  logo: assets/qbit.svg
+  favicon: assets/qbit.svg
+use_directory_urls: false
+markdown_extensions:
+  - tables
+  - attr_list
+extra_css:
+  - assets/rpcdocs.css
+extra_javascript:
+  - assets/rpcdocs.js

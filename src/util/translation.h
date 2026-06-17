@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_UTIL_TRANSLATION_H
-#define BITCOIN_UTIL_TRANSLATION_H
+#ifndef QBIT_UTIL_TRANSLATION_H
+#define QBIT_UTIL_TRANSLATION_H
 
 #include <tinyformat.h>
 #include <util/string.h>
@@ -107,4 +107,4 @@ bilingual_str format(util::BilingualFmt<sizeof...(Args)> fmt, const Args&... arg
 }
 } // namespace tinyformat
 
-#endif // BITCOIN_UTIL_TRANSLATION_H
+#endif // QBIT_UTIL_TRANSLATION_H

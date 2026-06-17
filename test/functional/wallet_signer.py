@@ -10,6 +10,7 @@ See also rpc_signer.py for tests without wallet context.
 import os
 import sys
 
+from test_framework.descriptors import descsum_create
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_equal,
@@ -55,6 +56,9 @@ class WalletSignerTest(BitcoinTestFramework):
         os.remove(os.path.join(node.cwd, "mock_result"))
 
     def run_test(self):
+        # Mature the default-cache coinbase UTXOs
+        self.ensure_cached_coinbase_mature(self.nodes[0])
+
         self.test_valid_signer()
         self.test_disconnected_signer()
         self.restart_node(1, [f"-signer={self.mock_invalid_signer_path()}", "-keypool=10"])
@@ -86,30 +90,37 @@ class WalletSignerTest(BitcoinTestFramework):
         self.clear_mock_result(self.nodes[1])
 
         assert_equal(hww.getwalletinfo()["keypoolsize"], 40)
+        expected_addrs = {
+            "bech32": self.nodes[1].deriveaddresses(descsum_create("wpkh([00000001/84h/1h/0h/0/0]02c97dc3f4420402e01a113984311bf4a1b8de376cac0bdcfaf1b3ac81f13433c7)"))[0],
+            "p2sh-segwit": self.nodes[1].deriveaddresses(descsum_create("sh(wpkh([00000001/49h/1h/0h/0/0]02c97dc3f4420402e01a113984311bf4a1b8de376cac0bdcfaf1b3ac81f13433c7))"))[0],
+            "legacy": self.nodes[1].deriveaddresses(descsum_create("pkh([00000001/44h/1h/0h/0/0]02c97dc3f4420402e01a113984311bf4a1b8de376cac0bdcfaf1b3ac81f13433c7)"))[0],
+            "bech32m": self.nodes[1].deriveaddresses(descsum_create("tr([00000001/86h/1h/0h/0/0]c97dc3f4420402e01a113984311bf4a1b8de376cac0bdcfaf1b3ac81f13433c7)"))[0],
+            "bech32_fail": self.nodes[1].deriveaddresses(descsum_create("wpkh([00000001/84h/1h/0h/0/1]03a20a46308be0b8ded6dff0a22b10b4245c587ccf23f3b4a303885be3a524f172)"))[0],
+        }
 
         address1 = hww.getnewaddress(address_type="bech32")
-        assert_equal(address1, "bcrt1qm90ugl4d48jv8n6e5t9ln6t9zlpm5th68x4f8g")
+        assert_equal(address1, expected_addrs["bech32"])
         address_info = hww.getaddressinfo(address1)
         assert_equal(address_info['solvable'], True)
         assert_equal(address_info['ismine'], True)
         assert_equal(address_info['hdkeypath'], "m/84h/1h/0h/0/0")
 
         address2 = hww.getnewaddress(address_type="p2sh-segwit")
-        assert_equal(address2, "2N2gQKzjUe47gM8p1JZxaAkTcoHPXV6YyVp")
+        assert_equal(address2, expected_addrs["p2sh-segwit"])
         address_info = hww.getaddressinfo(address2)
         assert_equal(address_info['solvable'], True)
         assert_equal(address_info['ismine'], True)
         assert_equal(address_info['hdkeypath'], "m/49h/1h/0h/0/0")
 
         address3 = hww.getnewaddress(address_type="legacy")
-        assert_equal(address3, "n1LKejAadN6hg2FrBXoU1KrwX4uK16mco9")
+        assert_equal(address3, expected_addrs["legacy"])
         address_info = hww.getaddressinfo(address3)
         assert_equal(address_info['solvable'], True)
         assert_equal(address_info['ismine'], True)
         assert_equal(address_info['hdkeypath'], "m/44h/1h/0h/0/0")
 
         address4 = hww.getnewaddress(address_type="bech32m")
-        assert_equal(address4, "bcrt1phw4cgpt6cd30kz9k4wkpwm872cdvhss29jga2xpmftelhqll62ms4e9sqj")
+        assert_equal(address4, expected_addrs["bech32m"])
         address_info = hww.getaddressinfo(address4)
         assert_equal(address_info['solvable'], True)
         assert_equal(address_info['ismine'], True)
@@ -129,7 +140,7 @@ class WalletSignerTest(BitcoinTestFramework):
 
         # Returned address MUST match:
         address_fail = hww.getnewaddress(address_type="bech32")
-        assert_equal(address_fail, "bcrt1ql7zg7ukh3dwr25ex2zn9jse926f27xy2jz58tm")
+        assert_equal(address_fail, expected_addrs["bech32_fail"])
         assert_raises_rpc_error(-1, 'Signer echoed unexpected address wrong_address',
             hww.walletdisplayaddress, address_fail
         )
@@ -144,21 +155,21 @@ class WalletSignerTest(BitcoinTestFramework):
         assert mock_wallet.getwalletinfo()['private_keys_enabled']
 
         result = mock_wallet.importdescriptors([{
-            "desc": "tr([00000001/86h/1h/0']tprv8ZgxMBicQKsPd7Uf69XL1XwhmjHopUGep8GuEiJDZmbQz6o58LninorQAfcKZWARbtRtfnLcJ5MQ2AtHcQJCCRUcMRvmDUjyEmNUWwx8UbK/0/*)#7ew68cn8",
+            "desc": descsum_create("tr([00000001/86h/1h/0']qrpvV1brS3WRoVwgSKGgKRdVRsxe378zAczWKKN8VLzkndxBMbpDdYo2LAGgQp6Ncu3eBRZjRL2UB436gaQzspTF2NZfFSTa164fCWEr6ReDJGm/0/*)"),
             "timestamp": 0,
             "range": [0,1],
             "internal": False,
             "active": True
         },
         {
-            "desc": "tr([00000001/86h/1h/0']tprv8ZgxMBicQKsPd7Uf69XL1XwhmjHopUGep8GuEiJDZmbQz6o58LninorQAfcKZWARbtRtfnLcJ5MQ2AtHcQJCCRUcMRvmDUjyEmNUWwx8UbK/1/*)#0dtm6drl",
+            "desc": descsum_create("tr([00000001/86h/1h/0']qrpvV1brS3WRoVwgSKGgKRdVRsxe378zAczWKKN8VLzkndxBMbpDdYo2LAGgQp6Ncu3eBRZjRL2UB436gaQzspTF2NZfFSTa164fCWEr6ReDJGm/1/*)"),
             "timestamp": 0,
             "range": [0, 0],
             "internal": True,
             "active": True
         }])
-        assert_equal(result[0], {'success': True})
-        assert_equal(result[1], {'success': True})
+        assert_equal(result[0]["success"], True)
+        assert_equal(result[1]["success"], True)
         assert_equal(mock_wallet.getwalletinfo()["txcount"], 1)
         dest = self.nodes[0].getnewaddress(address_type='bech32')
         mock_psbt = mock_wallet.walletcreatefundedpsbt([], {dest:0.5}, 0, {'replaceable': True}, True)['psbt']

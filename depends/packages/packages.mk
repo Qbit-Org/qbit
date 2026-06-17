@@ -19,6 +19,7 @@ endif
 sqlite_packages=sqlite
 
 zmq_packages=zeromq
+photon_packages=openssl
 
 ipc_packages = capnp
 multiprocess_native_packages = native_libmultiprocess native_capnp

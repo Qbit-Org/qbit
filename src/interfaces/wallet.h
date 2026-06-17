@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_INTERFACES_WALLET_H
-#define BITCOIN_INTERFACES_WALLET_H
+#ifndef QBIT_INTERFACES_WALLET_H
+#define QBIT_INTERFACES_WALLET_H
 
 #include <addresstype.h>
 #include <common/signmessage.h>
@@ -44,6 +44,7 @@ class CCoinControl;
 class CWallet;
 enum class AddressPurpose;
 struct CRecipient;
+struct PQCUsageReport;
 struct WalletContext;
 } // namespace wallet
 
@@ -120,6 +121,9 @@ public:
     //! Get wallet address list.
     virtual std::vector<WalletAddress> getAddresses() = 0;
 
+    //! Get output types the wallet can hand out as receive addresses.
+    virtual std::vector<OutputType> getAvailableAddressTypes() = 0;
+
     //! Get receive requests.
     virtual std::vector<std::string> getAddressReceiveRequests() = 0;
 
@@ -146,7 +150,8 @@ public:
         const wallet::CCoinControl& coin_control,
         bool sign,
         int& change_pos,
-        CAmount& fee) = 0;
+        CAmount& fee,
+        wallet::PQCUsageReport* pqc_usage = nullptr) = 0;
 
     //! Commit transaction.
     virtual void commitTransaction(CTransactionRef tx,
@@ -207,7 +212,8 @@ public:
         bool bip32derivs,
         size_t* n_signed,
         PartiallySignedTransaction& psbtx,
-        bool& complete) = 0;
+        bool& complete,
+        wallet::PQCUsageReport* pqc_usage = nullptr) = 0;
 
     //! Get balances.
     virtual WalletBalances getBalances() = 0;
@@ -438,4 +444,4 @@ std::unique_ptr<WalletLoader> MakeWalletLoader(Chain& chain, ArgsManager& args);
 
 } // namespace interfaces
 
-#endif // BITCOIN_INTERFACES_WALLET_H
+#endif // QBIT_INTERFACES_WALLET_H

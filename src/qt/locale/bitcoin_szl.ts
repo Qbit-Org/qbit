@@ -604,7 +604,7 @@ once_cell = "1.18"</translation>
         <translation type="unfinished">(%1 zaszperowane)</translation>
     </message>
     <message>
-        <source>Can vary +/- %1 satoshi(s) per input.</source>
+        <source>Can vary +/- %1 bits per input.</source>
         <translation type="unfinished">Chwiyrŏ sie +/- %1 satoshi na wchōd.</translation>
     </message>
     <message>

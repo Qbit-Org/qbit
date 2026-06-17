@@ -4,21 +4,30 @@
 
 #include <wallet/wallet.h>
 
+#include <atomic>
 #include <cstdint>
 #include <future>
 #include <memory>
+#include <array>
+#include <set>
+#include <string>
 #include <vector>
 
 #include <addresstype.h>
+#include <chainparams.h>
+#include <crypto/pqc.h>
 #include <interfaces/chain.h>
 #include <key_io.h>
 #include <node/blockstorage.h>
 #include <policy/policy.h>
 #include <rpc/server.h>
+#include <scheduler.h>
 #include <script/solver.h>
+#include <streams.h>
 #include <test/util/logging.h>
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
+#include <util/strencodings.h>
 #include <util/translation.h>
 #include <validation.h>
 #include <validationinterface.h>
@@ -26,6 +35,7 @@
 #include <wallet/context.h>
 #include <wallet/receive.h>
 #include <wallet/spend.h>
+#include <wallet/walletdb.h>
 #include <wallet/test/util.h>
 #include <wallet/test/wallet_test_fixture.h>
 
@@ -36,12 +46,65 @@ using node::MAX_BLOCKFILE_SIZE;
 
 namespace wallet {
 
+extern std::atomic<int> g_deferred_create_keypool_top_up_steps_per_batch;
+
 // Ensure that fee levels defined in the wallet are at least as high
 // as the default levels for node policy.
 static_assert(DEFAULT_TRANSACTION_MINFEE >= DEFAULT_MIN_RELAY_TX_FEE, "wallet minimum fee is smaller than default relay fee");
 static_assert(WALLET_INCREMENTAL_RELAY_FEE >= DEFAULT_INCREMENTAL_RELAY_FEE, "wallet incremental fee is smaller than default incremental relay fee");
 
 BOOST_FIXTURE_TEST_SUITE(wallet_tests, WalletTestingSetup)
+
+constexpr std::array<OutputType, 1> P2MR_ONLY_OUTPUT_TYPES{OutputType::P2MR};
+constexpr std::array<OutputType, 1> BECH32_ONLY_OUTPUT_TYPES{OutputType::BECH32};
+constexpr std::array<OutputType, 3> CHANGE_FALLBACK_OUTPUT_TYPES{OutputType::BECH32M, OutputType::BECH32, OutputType::P2MR};
+constexpr int64_t SINGLE_ADDRESS_KEYPOOL_SIZE{1};
+constexpr int64_t FOUR_ADDRESS_KEYPOOL_SIZE{4};
+
+struct RegtestP2MROnlyWalletTestingSetup : public WalletTestingSetup {
+    RegtestP2MROnlyWalletTestingSetup()
+        : WalletTestingSetup(ChainType::REGTEST, {.extra_args = {"-p2mronly=1"}}) {}
+};
+
+struct RegtestDefaultWalletTestingSetup : public WalletTestingSetup {
+    RegtestDefaultWalletTestingSetup()
+        : WalletTestingSetup(ChainType::REGTEST) {}
+};
+
+struct RegtestUnrestrictedWalletTestingSetup : public WalletTestingSetup {
+    RegtestUnrestrictedWalletTestingSetup()
+        : WalletTestingSetup(ChainType::REGTEST, {.extra_args = {"-p2mronly=0"}}) {}
+};
+
+namespace {
+struct DeferredCreateKeyPoolTopUpBatchStepOverride {
+    explicit DeferredCreateKeyPoolTopUpBatchStepOverride(int step_count)
+        : m_previous_step_count(g_deferred_create_keypool_top_up_steps_per_batch.exchange(step_count))
+    {
+    }
+
+    ~DeferredCreateKeyPoolTopUpBatchStepOverride()
+    {
+        g_deferred_create_keypool_top_up_steps_per_batch.store(m_previous_step_count);
+    }
+
+    const int m_previous_step_count;
+};
+
+void WaitForScheduler(CScheduler& scheduler)
+{
+    std::promise<void> promise;
+    scheduler.scheduleFromNow([&promise] { promise.set_value(); }, std::chrono::milliseconds{1});
+    promise.get_future().wait();
+}
+
+class TestDescriptorScriptPubKeyMan : public DescriptorScriptPubKeyMan
+{
+public:
+    using DescriptorScriptPubKeyMan::DescriptorScriptPubKeyMan;
+    using DescriptorScriptPubKeyMan::TopUpWithDB;
+};
+} // namespace
 
 static CMutableTransaction TestSimpleSpend(const CTransaction& from, uint32_t index, const CKey& key, const CScript& pubkey)
 {
@@ -57,6 +120,25 @@ static CMutableTransaction TestSimpleSpend(const CTransaction& from, uint32_t in
     return mtx;
 }
 
+BOOST_FIXTURE_TEST_CASE(sign_transaction_verifies_complete_non_wallet_inputs, TestingSetup)
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    const CKey key{GenerateRandomKey()};
+    const CScript script_pub_key{GetScriptForDestination(PKHash(key.GetPubKey()))};
+
+    CMutableTransaction funding_mtx;
+    funding_mtx.vout.emplace_back(1 * COIN, script_pub_key);
+    const CTransaction funding_tx{funding_mtx};
+
+    CMutableTransaction spend_tx{TestSimpleSpend(funding_tx, 0, key, script_pub_key)};
+    std::map<COutPoint, Coin> coins;
+    coins.emplace(spend_tx.vin.at(0).prevout, Coin{funding_tx.vout.at(0), /*nHeightIn=*/1, /*fCoinBaseIn=*/false});
+
+    std::map<int, bilingual_str> input_errors;
+    BOOST_CHECK(wallet.SignTransaction(spend_tx, coins, SIGHASH_ALL, input_errors));
+    BOOST_CHECK(input_errors.empty());
+}
+
 static void AddKey(CWallet& wallet, const CKey& key)
 {
     LOCK(wallet.cs_wallet);
@@ -67,6 +149,17 @@ static void AddKey(CWallet& wallet, const CKey& key)
     auto& desc = descs.at(0);
     WalletDescriptor w_desc(std::move(desc), 0, 0, 1, 1);
     Assert(wallet.AddWalletDescriptor(w_desc, provider, "", false));
+}
+
+static CScript GetCachedScriptPubKey(DescriptorScriptPubKeyMan& spk_man, int32_t index)
+{
+    LOCK(spk_man.cs_desc_man);
+    const WalletDescriptor wallet_descriptor = spk_man.GetWalletDescriptor();
+    std::vector<CScript> scripts;
+    FlatSigningProvider out_keys;
+    Assert(wallet_descriptor.descriptor->ExpandFromCache(index, wallet_descriptor.cache, scripts, out_keys));
+    assert(scripts.size() == 1);
+    return scripts.at(0);
 }
 
 BOOST_FIXTURE_TEST_CASE(update_non_range_descriptor, TestingSetup)
@@ -88,13 +181,14 @@ BOOST_FIXTURE_TEST_CASE(update_non_range_descriptor, TestingSetup)
     }
 }
 
-BOOST_FIXTURE_TEST_CASE(scan_for_wallet_transactions, TestChain100Setup)
+BOOST_FIXTURE_TEST_CASE(scan_for_wallet_transactions, UnrestrictedRegtestChain100Setup)
 {
     // Cap last block file size, and mine new block in a new block file.
     CBlockIndex* oldTip = WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain().Tip());
     WITH_LOCK(::cs_main, m_node.chainman->m_blockman.GetBlockFileInfo(oldTip->GetBlockPos().nFile)->nSize = MAX_BLOCKFILE_SIZE);
     CreateAndProcessBlock({}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
     CBlockIndex* newTip = WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain().Tip());
+    const auto& consensus{Params().GetConsensus()};
 
     // Verify ScanForWalletTransactions fails to read an unknown start block.
     {
@@ -143,7 +237,10 @@ BOOST_FIXTURE_TEST_CASE(scan_for_wallet_transactions, TestChain100Setup)
         BOOST_CHECK(result.last_failed_block.IsNull());
         BOOST_CHECK_EQUAL(result.last_scanned_block, newTip->GetBlockHash());
         BOOST_CHECK_EQUAL(*result.last_scanned_height, newTip->nHeight);
-        BOOST_CHECK_EQUAL(GetBalance(wallet).m_mine_immature, 100 * COIN);
+        // Two blocks scanned (heights 1000-1001), using their height-specific qbit subsidy.
+        const CAmount expected_immature{
+            GetBlockSubsidy(oldTip->nHeight, consensus) + GetBlockSubsidy(newTip->nHeight, consensus)};
+        BOOST_CHECK_EQUAL(GetBalance(wallet).m_mine_immature, expected_immature);
 
         {
             CBlockLocator locator;
@@ -179,7 +276,8 @@ BOOST_FIXTURE_TEST_CASE(scan_for_wallet_transactions, TestChain100Setup)
         BOOST_CHECK_EQUAL(result.last_failed_block, oldTip->GetBlockHash());
         BOOST_CHECK_EQUAL(result.last_scanned_block, newTip->GetBlockHash());
         BOOST_CHECK_EQUAL(*result.last_scanned_height, newTip->nHeight);
-        BOOST_CHECK_EQUAL(GetBalance(wallet).m_mine_immature, 50 * COIN);
+        // Only the new block (height 1001) is found after pruning.
+        BOOST_CHECK_EQUAL(GetBalance(wallet).m_mine_immature, GetBlockSubsidy(newTip->nHeight, consensus));
     }
 
     // Prune the remaining block file.
@@ -314,32 +412,46 @@ BOOST_FIXTURE_TEST_CASE(LoadReceiveRequests, TestingSetup)
 {
     for (DatabaseFormat format : DATABASE_FORMATS) {
         const std::string name{strprintf("receive-requests-%i", format)};
-        TestLoadWallet(name, format, [](std::shared_ptr<CWallet> wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet->cs_wallet) {
-            BOOST_CHECK(!wallet->IsAddressPreviouslySpent(PKHash()));
+        WitnessV2P2MR receive_dest;
+        WitnessV2P2MR spent_dest;
+        spent_dest.begin()[0] = 1;
+        TestLoadWallet(name, format, [receive_dest, spent_dest](std::shared_ptr<CWallet> wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet->cs_wallet) {
+            BOOST_CHECK(!wallet->IsAddressPreviouslySpent(receive_dest));
             WalletBatch batch{wallet->GetDatabase()};
-            BOOST_CHECK(batch.WriteAddressPreviouslySpent(PKHash(), true));
-            BOOST_CHECK(batch.WriteAddressPreviouslySpent(ScriptHash(), true));
-            BOOST_CHECK(wallet->SetAddressReceiveRequest(batch, PKHash(), "0", "val_rr00"));
-            BOOST_CHECK(wallet->EraseAddressReceiveRequest(batch, PKHash(), "0"));
-            BOOST_CHECK(wallet->SetAddressReceiveRequest(batch, PKHash(), "1", "val_rr10"));
-            BOOST_CHECK(wallet->SetAddressReceiveRequest(batch, PKHash(), "1", "val_rr11"));
-            BOOST_CHECK(wallet->SetAddressReceiveRequest(batch, ScriptHash(), "2", "val_rr20"));
+            const PKHash unsupported_legacy_dest;
+            const std::string unsupported_legacy_address{EncodeDestination(unsupported_legacy_dest)};
+            BOOST_CHECK(batch.WriteName(unsupported_legacy_address, "legacy_label"));
+            BOOST_CHECK(batch.WritePurpose(unsupported_legacy_address, "receive"));
+            BOOST_CHECK(batch.WriteAddressPreviouslySpent(unsupported_legacy_dest, true));
+            BOOST_CHECK(batch.WriteAddressReceiveRequest(unsupported_legacy_dest, "9", "legacy_rr"));
+            BOOST_CHECK(batch.WriteAddressPreviouslySpent(receive_dest, true));
+            BOOST_CHECK(batch.WriteAddressPreviouslySpent(spent_dest, true));
+            BOOST_CHECK(wallet->SetAddressReceiveRequest(batch, receive_dest, "0", "val_rr00"));
+            BOOST_CHECK(wallet->EraseAddressReceiveRequest(batch, receive_dest, "0"));
+            BOOST_CHECK(wallet->SetAddressReceiveRequest(batch, receive_dest, "1", "val_rr10"));
+            BOOST_CHECK(wallet->SetAddressReceiveRequest(batch, receive_dest, "1", "val_rr11"));
+            BOOST_CHECK(wallet->SetAddressReceiveRequest(batch, spent_dest, "2", "val_rr20"));
         });
-        TestLoadWallet(name, format, [](std::shared_ptr<CWallet> wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet->cs_wallet) {
-            BOOST_CHECK(wallet->IsAddressPreviouslySpent(PKHash()));
-            BOOST_CHECK(wallet->IsAddressPreviouslySpent(ScriptHash()));
+        TestLoadWallet(name, format, [receive_dest, spent_dest](std::shared_ptr<CWallet> wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet->cs_wallet) {
+            BOOST_CHECK(wallet->IsAddressPreviouslySpent(receive_dest));
+            BOOST_CHECK(wallet->IsAddressPreviouslySpent(spent_dest));
+            BOOST_CHECK(!wallet->m_address_book.contains(CNoDestination{}));
+            BOOST_CHECK(!wallet->m_address_book.contains(PKHash{}));
             auto requests = wallet->GetAddressReceiveRequests();
             auto erequests = {"val_rr11", "val_rr20"};
             BOOST_CHECK_EQUAL_COLLECTIONS(requests.begin(), requests.end(), std::begin(erequests), std::end(erequests));
             RunWithinTxn(wallet->GetDatabase(), /*process_desc*/"test", [](WalletBatch& batch){
-                BOOST_CHECK(batch.WriteAddressPreviouslySpent(PKHash(), false));
-                BOOST_CHECK(batch.EraseAddressData(ScriptHash()));
+                WitnessV2P2MR receive_dest;
+                WitnessV2P2MR spent_dest;
+                spent_dest.begin()[0] = 1;
+                BOOST_CHECK(batch.WriteAddressPreviouslySpent(receive_dest, false));
+                BOOST_CHECK(batch.EraseAddressData(spent_dest));
                 return true;
             });
         });
-        TestLoadWallet(name, format, [](std::shared_ptr<CWallet> wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet->cs_wallet) {
-            BOOST_CHECK(!wallet->IsAddressPreviouslySpent(PKHash()));
-            BOOST_CHECK(!wallet->IsAddressPreviouslySpent(ScriptHash()));
+        TestLoadWallet(name, format, [receive_dest, spent_dest](std::shared_ptr<CWallet> wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet->cs_wallet) {
+            BOOST_CHECK(!wallet->IsAddressPreviouslySpent(receive_dest));
+            BOOST_CHECK(!wallet->IsAddressPreviouslySpent(spent_dest));
             auto requests = wallet->GetAddressReceiveRequests();
             auto erequests = {"val_rr11"};
             BOOST_CHECK_EQUAL_COLLECTIONS(requests.begin(), requests.end(), std::begin(erequests), std::end(erequests));
@@ -347,20 +459,1362 @@ BOOST_FIXTURE_TEST_CASE(LoadReceiveRequests, TestingSetup)
     }
 }
 
-class ListCoinsTestingSetup : public TestChain100Setup
+BOOST_AUTO_TEST_CASE(DefaultAddressTypeRequiresP2MRSPKM)
+{
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+
+    auto seeded_wallet = std::make_shared<CWallet>(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    CKey key = GenerateRandomKey();
+    BOOST_REQUIRE(CreateDescriptor(*seeded_wallet, "wpkh(" + EncodeSecret(key) + ")", true));
+
+    auto wallet = TestLoadWallet(DuplicateMockDatabase(seeded_wallet->GetDatabase()), context, WALLET_FLAG_DESCRIPTORS);
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_CHECK(!wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false));
+        BOOST_CHECK_EQUAL(wallet->m_default_address_type, OutputType::BECH32);
+    }
+    TestUnloadWallet(std::move(wallet));
+}
+
+BOOST_AUTO_TEST_CASE(DefaultAddressTypeUsesP2MROnMainnet)
+{
+    m_args.ForceSetArg("-keypool", util::ToString(SINGLE_ADDRESS_KEYPOOL_SIZE));
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+
+    auto wallet = TestLoadWallet(context);
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_REQUIRE(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false));
+        BOOST_CHECK_EQUAL(wallet->m_default_address_type, OutputType::P2MR);
+    }
+    TestUnloadWallet(std::move(wallet));
+}
+
+BOOST_FIXTURE_TEST_CASE(DefaultAddressTypeUsesP2MROnRegtestP2MROnly, RegtestP2MROnlyWalletTestingSetup)
+{
+    m_args.ForceSetArg("-keypool", util::ToString(SINGLE_ADDRESS_KEYPOOL_SIZE));
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+
+    auto wallet = TestLoadWallet(context);
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_REQUIRE(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false));
+        BOOST_CHECK_EQUAL(wallet->m_default_address_type, OutputType::P2MR);
+    }
+    TestUnloadWallet(std::move(wallet));
+}
+
+BOOST_AUTO_TEST_CASE(WalletOutputAvailabilityAllowsChainTypesWithoutManagers)
+{
+    CWallet wallet{m_node.chain.get(), "", CreateMockableWalletDatabase()};
+    BOOST_CHECK(wallet.GetActiveScriptPubKeyMans().empty());
+    BOOST_CHECK(IsAvailableWalletOutputType(wallet, OutputType::P2MR, /*internal=*/false));
+}
+
+BOOST_AUTO_TEST_CASE(FreshWalletOnlyCreatesP2MRManagers)
+{
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+
+    auto wallet = TestLoadWallet(context);
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_REQUIRE(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false));
+        BOOST_REQUIRE(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/true));
+        BOOST_CHECK(!wallet->GetScriptPubKeyMan(OutputType::LEGACY, /*internal=*/false));
+        BOOST_CHECK(!wallet->GetScriptPubKeyMan(OutputType::P2SH_SEGWIT, /*internal=*/false));
+        BOOST_CHECK(!wallet->GetScriptPubKeyMan(OutputType::BECH32, /*internal=*/false));
+        BOOST_CHECK(!wallet->GetScriptPubKeyMan(OutputType::BECH32M, /*internal=*/false));
+    }
+    TestUnloadWallet(std::move(wallet));
+}
+
+BOOST_FIXTURE_TEST_CASE(FreshRegtestWalletDefaultsToP2MROnlyManagers, RegtestDefaultWalletTestingSetup)
+{
+    m_args.ForceSetArg("-keypool", util::ToString(SINGLE_ADDRESS_KEYPOOL_SIZE));
+
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+
+    auto wallet = TestLoadWallet(context);
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_REQUIRE(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false));
+        BOOST_REQUIRE(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/true));
+        BOOST_CHECK(!wallet->GetScriptPubKeyMan(OutputType::LEGACY, /*internal=*/false));
+        BOOST_CHECK(!wallet->GetScriptPubKeyMan(OutputType::LEGACY, /*internal=*/true));
+        BOOST_CHECK(!wallet->GetScriptPubKeyMan(OutputType::P2SH_SEGWIT, /*internal=*/false));
+        BOOST_CHECK(!wallet->GetScriptPubKeyMan(OutputType::P2SH_SEGWIT, /*internal=*/true));
+        BOOST_CHECK(!wallet->GetScriptPubKeyMan(OutputType::BECH32, /*internal=*/false));
+        BOOST_CHECK(!wallet->GetScriptPubKeyMan(OutputType::BECH32, /*internal=*/true));
+        BOOST_CHECK(!wallet->GetScriptPubKeyMan(OutputType::BECH32M, /*internal=*/false));
+        BOOST_CHECK(!wallet->GetScriptPubKeyMan(OutputType::BECH32M, /*internal=*/true));
+        BOOST_CHECK_EQUAL(wallet->m_default_address_type, OutputType::P2MR);
+    }
+    TestUnloadWallet(std::move(wallet));
+}
+
+BOOST_FIXTURE_TEST_CASE(FreshRegtestWalletCanOptOutOfP2MROnlyManagers, RegtestUnrestrictedWalletTestingSetup)
+{
+    m_args.ForceSetArg("-keypool", util::ToString(SINGLE_ADDRESS_KEYPOOL_SIZE));
+
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+
+    auto wallet = TestLoadWallet(context);
+    {
+        LOCK(wallet->cs_wallet);
+        for (const auto& output_type : SUPPORTED_OUTPUT_TYPES) {
+            BOOST_CHECK(wallet->GetScriptPubKeyMan(output_type, /*internal=*/false));
+            BOOST_CHECK(wallet->GetScriptPubKeyMan(output_type, /*internal=*/true));
+        }
+        BOOST_CHECK_EQUAL(wallet->m_default_address_type, DEFAULT_ADDRESS_TYPE);
+    }
+    TestUnloadWallet(std::move(wallet));
+}
+
+BOOST_FIXTURE_TEST_CASE(CreateWalletWarmsP2MRKeypoolThenDefersFullTopUp, RegtestDefaultWalletTestingSetup)
+{
+    constexpr int64_t keypool_size{64};
+    m_args.ForceSetArg("-keypool", util::ToString(keypool_size));
+
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+
+    auto wallet = TestLoadWallet(context);
+    DescriptorScriptPubKeyMan* external_spk_man{nullptr};
+    DescriptorScriptPubKeyMan* internal_spk_man{nullptr};
+    {
+        LOCK(wallet->cs_wallet);
+        external_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false));
+        internal_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/true));
+    }
+    BOOST_REQUIRE(external_spk_man);
+    BOOST_REQUIRE(internal_spk_man);
+
+    BOOST_CHECK(wallet->HasPendingInitialKeyPoolTopUp());
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+        BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+    }
+
+    auto addr = wallet->GetNewDestination(OutputType::P2MR, "");
+    BOOST_REQUIRE(addr);
+    BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL - 1);
+    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+
+    BOOST_CHECK(wallet->RunPendingInitialKeyPoolTopUp());
+    BOOST_CHECK(!wallet->HasPendingInitialKeyPoolTopUp());
+    BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), keypool_size);
+    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), keypool_size);
+
+    TestUnloadWallet(std::move(wallet));
+}
+
+BOOST_FIXTURE_TEST_CASE(CreateWalletSchedulerRefillsDeferredP2MRKeypoolAcrossBatches, RegtestP2MROnlyWalletTestingSetup)
+{
+    constexpr int64_t keypool_size{64};
+    m_args.ForceSetArg("-keypool", util::ToString(keypool_size));
+    DeferredCreateKeyPoolTopUpBatchStepOverride batch_step_override{1};
+
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+    context.scheduler = Assert(m_node.scheduler).get();
+
+    DatabaseOptions options;
+    options.require_create = true;
+    options.create_flags = WALLET_FLAG_DESCRIPTORS;
+
+    DatabaseStatus status;
+    bilingual_str error;
+    std::vector<bilingual_str> warnings;
+    auto wallet = CreateWallet(context, "scheduled_refill_test", std::nullopt, options, status, error, warnings);
+    BOOST_REQUIRE(wallet);
+    BOOST_REQUIRE_EQUAL(status, DatabaseStatus::SUCCESS);
+
+    DescriptorScriptPubKeyMan* external_spk_man{nullptr};
+    DescriptorScriptPubKeyMan* internal_spk_man{nullptr};
+    {
+        LOCK(wallet->cs_wallet);
+        external_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false));
+        internal_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/true));
+    }
+    BOOST_REQUIRE(external_spk_man);
+    BOOST_REQUIRE(internal_spk_man);
+
+    BOOST_CHECK(wallet->HasPendingInitialKeyPoolTopUp());
+    BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+
+    auto& scheduler = *Assert(m_node.scheduler);
+    scheduler.MockForward(std::chrono::seconds{29});
+    WaitForScheduler(scheduler);
+    BOOST_CHECK(wallet->HasPendingInitialKeyPoolTopUp());
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+        BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+    }
+
+    for (int i = 0; i < 10 && wallet->HasPendingInitialKeyPoolTopUp(); ++i) {
+        scheduler.MockForward(std::chrono::seconds{1});
+        WaitForScheduler(scheduler);
+    }
+
+    BOOST_CHECK(!wallet->HasPendingInitialKeyPoolTopUp());
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), keypool_size);
+        BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), keypool_size);
+    }
+
+    BOOST_CHECK(RemoveWallet(context, wallet, std::nullopt));
+    WaitForDeleteWallet(std::move(wallet));
+}
+
+BOOST_FIXTURE_TEST_CASE(LoadWalletSchedulerRefillsDeferredP2MRKeypoolAcrossBatches, RegtestP2MROnlyWalletTestingSetup)
+{
+    constexpr int64_t keypool_size{64};
+    m_args.ForceSetArg("-keypool", util::ToString(keypool_size));
+    DeferredCreateKeyPoolTopUpBatchStepOverride batch_step_override{1};
+
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+    context.scheduler = Assert(m_node.scheduler).get();
+
+    DatabaseOptions create_options;
+    create_options.require_create = true;
+    create_options.create_flags = WALLET_FLAG_DESCRIPTORS;
+
+    DatabaseStatus status;
+    bilingual_str error;
+    std::vector<bilingual_str> warnings;
+    auto wallet = CreateWallet(context, "scheduled_reload_test", std::nullopt, create_options, status, error, warnings);
+    BOOST_REQUIRE(wallet);
+    BOOST_REQUIRE_EQUAL(status, DatabaseStatus::SUCCESS);
+    BOOST_CHECK(RemoveWallet(context, wallet, std::nullopt));
+    WaitForDeleteWallet(std::move(wallet));
+
+    DatabaseOptions load_options;
+    load_options.require_existing = true;
+    auto loaded_wallet = LoadWallet(context, "scheduled_reload_test", std::nullopt, load_options, status, error, warnings);
+    BOOST_REQUIRE(loaded_wallet);
+    BOOST_REQUIRE_EQUAL(status, DatabaseStatus::SUCCESS);
+
+    DescriptorScriptPubKeyMan* external_spk_man{nullptr};
+    DescriptorScriptPubKeyMan* internal_spk_man{nullptr};
+    {
+        LOCK(loaded_wallet->cs_wallet);
+        external_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(loaded_wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false));
+        internal_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(loaded_wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/true));
+    }
+    BOOST_REQUIRE(external_spk_man);
+    BOOST_REQUIRE(internal_spk_man);
+
+    BOOST_CHECK(loaded_wallet->HasPendingInitialKeyPoolTopUp());
+    {
+        LOCK(loaded_wallet->cs_wallet);
+        BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+        BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+    }
+
+    auto& scheduler = *Assert(m_node.scheduler);
+    scheduler.MockForward(std::chrono::seconds{29});
+    WaitForScheduler(scheduler);
+    BOOST_CHECK(loaded_wallet->HasPendingInitialKeyPoolTopUp());
+    {
+        LOCK(loaded_wallet->cs_wallet);
+        BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+        BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+    }
+
+    for (int i = 0; i < 10 && loaded_wallet->HasPendingInitialKeyPoolTopUp(); ++i) {
+        scheduler.MockForward(std::chrono::seconds{1});
+        WaitForScheduler(scheduler);
+    }
+
+    BOOST_CHECK(!loaded_wallet->HasPendingInitialKeyPoolTopUp());
+    {
+        LOCK(loaded_wallet->cs_wallet);
+        BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), keypool_size);
+        BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), keypool_size);
+    }
+
+    BOOST_CHECK(RemoveWallet(context, loaded_wallet, std::nullopt));
+    WaitForDeleteWallet(std::move(loaded_wallet));
+}
+
+BOOST_FIXTURE_TEST_CASE(LoadWalletDoesNotRestoreDeferredP2MRTopUpAfterRefillAndAddressUse, RegtestP2MROnlyWalletTestingSetup)
+{
+    constexpr int64_t keypool_size{64};
+    m_args.ForceSetArg("-keypool", util::ToString(keypool_size));
+
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+
+    DatabaseOptions create_options;
+    create_options.require_create = true;
+    create_options.create_flags = WALLET_FLAG_DESCRIPTORS;
+
+    DatabaseStatus status;
+    bilingual_str error;
+    std::vector<bilingual_str> warnings;
+    auto wallet = CreateWallet(context, "refilled_reload_test", std::nullopt, create_options, status, error, warnings);
+    BOOST_REQUIRE(wallet);
+    BOOST_REQUIRE_EQUAL(status, DatabaseStatus::SUCCESS);
+
+    DescriptorScriptPubKeyMan* external_spk_man{nullptr};
+    DescriptorScriptPubKeyMan* internal_spk_man{nullptr};
+    {
+        LOCK(wallet->cs_wallet);
+        external_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false));
+        internal_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/true));
+    }
+    BOOST_REQUIRE(external_spk_man);
+    BOOST_REQUIRE(internal_spk_man);
+
+    BOOST_CHECK(wallet->HasPendingInitialKeyPoolTopUp());
+    BOOST_CHECK(wallet->RunPendingInitialKeyPoolTopUp());
+    BOOST_CHECK(!wallet->HasPendingInitialKeyPoolTopUp());
+    BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), keypool_size);
+    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), keypool_size);
+
+    auto addr = wallet->GetNewDestination(OutputType::P2MR, "");
+    BOOST_REQUIRE(addr);
+    BOOST_CHECK(!wallet->HasPendingInitialKeyPoolTopUp());
+    BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), keypool_size - 1);
+    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), keypool_size);
+
+    BOOST_CHECK(RemoveWallet(context, wallet, std::nullopt));
+    WaitForDeleteWallet(std::move(wallet));
+
+    DatabaseOptions load_options;
+    load_options.require_existing = true;
+    auto loaded_wallet = LoadWallet(context, "refilled_reload_test", std::nullopt, load_options, status, error, warnings);
+    BOOST_REQUIRE(loaded_wallet);
+    BOOST_REQUIRE_EQUAL(status, DatabaseStatus::SUCCESS);
+
+    {
+        LOCK(loaded_wallet->cs_wallet);
+        external_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(loaded_wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false));
+        internal_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(loaded_wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/true));
+    }
+    BOOST_REQUIRE(external_spk_man);
+    BOOST_REQUIRE(internal_spk_man);
+
+    BOOST_CHECK(!loaded_wallet->HasPendingInitialKeyPoolTopUp());
+    BOOST_REQUIRE(loaded_wallet->GetNewDestination(OutputType::P2MR, ""));
+    BOOST_CHECK(!loaded_wallet->HasPendingInitialKeyPoolTopUp());
+
+    BOOST_CHECK(RemoveWallet(context, loaded_wallet, std::nullopt));
+    WaitForDeleteWallet(std::move(loaded_wallet));
+}
+
+BOOST_FIXTURE_TEST_CASE(LoadWalletKeepsDeferredP2MRTopUpPendingAfterMarkUnusedAddresses, RegtestP2MROnlyWalletTestingSetup)
+{
+    constexpr int64_t keypool_size{64};
+    m_args.ForceSetArg("-keypool", util::ToString(keypool_size));
+
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+
+    DatabaseOptions create_options;
+    create_options.require_create = true;
+    create_options.create_flags = WALLET_FLAG_DESCRIPTORS;
+
+    DatabaseStatus status;
+    bilingual_str error;
+    std::vector<bilingual_str> warnings;
+    auto wallet = CreateWallet(context, "mark_unused_reload_test", std::nullopt, create_options, status, error, warnings);
+    BOOST_REQUIRE(wallet);
+    BOOST_REQUIRE_EQUAL(status, DatabaseStatus::SUCCESS);
+
+    DescriptorScriptPubKeyMan* external_spk_man{nullptr};
+    DescriptorScriptPubKeyMan* internal_spk_man{nullptr};
+    {
+        LOCK(wallet->cs_wallet);
+        external_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false));
+        internal_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/true));
+    }
+    BOOST_REQUIRE(external_spk_man);
+    BOOST_REQUIRE(internal_spk_man);
+
+    const CScript warm_pool_tail = GetCachedScriptPubKey(*external_spk_man, DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL - 1);
+    const auto marked = external_spk_man->MarkUnusedAddresses(warm_pool_tail);
+    BOOST_CHECK_EQUAL(marked.size(), static_cast<size_t>(DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL));
+    BOOST_CHECK(wallet->HasPendingInitialKeyPoolTopUp());
+    BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), 0U);
+    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+    {
+        LOCK(external_spk_man->cs_desc_man);
+        BOOST_CHECK_EQUAL(external_spk_man->GetWalletDescriptor().range_end, DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+    }
+
+    BOOST_CHECK(RemoveWallet(context, wallet, std::nullopt));
+    WaitForDeleteWallet(std::move(wallet));
+
+    DatabaseOptions load_options;
+    load_options.require_existing = true;
+    auto loaded_wallet = LoadWallet(context, "mark_unused_reload_test", std::nullopt, load_options, status, error, warnings);
+    BOOST_REQUIRE(loaded_wallet);
+    BOOST_REQUIRE_EQUAL(status, DatabaseStatus::SUCCESS);
+
+    {
+        LOCK(loaded_wallet->cs_wallet);
+        external_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(loaded_wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false));
+        internal_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(loaded_wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/true));
+    }
+    BOOST_REQUIRE(external_spk_man);
+    BOOST_REQUIRE(internal_spk_man);
+
+    BOOST_CHECK(loaded_wallet->HasPendingInitialKeyPoolTopUp());
+    BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), 0U);
+    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+    {
+        LOCK(external_spk_man->cs_desc_man);
+        BOOST_CHECK_EQUAL(external_spk_man->GetWalletDescriptor().range_end, DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+    }
+
+    BOOST_CHECK(loaded_wallet->RunPendingInitialKeyPoolTopUpStep() == CWallet::PendingInitialKeyPoolTopUpStepResult::PENDING);
+    BOOST_CHECK(loaded_wallet->HasPendingInitialKeyPoolTopUp());
+    BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL * 2);
+    {
+        LOCK(external_spk_man->cs_desc_man);
+        BOOST_CHECK_EQUAL(external_spk_man->GetWalletDescriptor().range_end, DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL * 2);
+    }
+
+    BOOST_CHECK(RemoveWallet(context, loaded_wallet, std::nullopt));
+    WaitForDeleteWallet(std::move(loaded_wallet));
+}
+
+BOOST_FIXTURE_TEST_CASE(LoadWalletUnlockRefillsDeferredP2MRKeypoolForEncryptedWallets, RegtestP2MROnlyWalletTestingSetup)
+{
+    constexpr int64_t keypool_size{64};
+    const SecureString passphrase{"test-passphrase"};
+    m_args.ForceSetArg("-keypool", util::ToString(keypool_size));
+
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+    context.scheduler = Assert(m_node.scheduler).get();
+
+    DatabaseOptions create_options;
+    create_options.require_create = true;
+    create_options.create_flags = WALLET_FLAG_DESCRIPTORS;
+    create_options.create_passphrase = passphrase;
+
+    DatabaseStatus status;
+    bilingual_str error;
+    std::vector<bilingual_str> warnings;
+    auto wallet = CreateWallet(context, "encrypted_reload_test", std::nullopt, create_options, status, error, warnings);
+    BOOST_REQUIRE(wallet);
+    BOOST_REQUIRE_EQUAL(status, DatabaseStatus::SUCCESS);
+    BOOST_CHECK(wallet->IsLocked());
+    BOOST_CHECK(RemoveWallet(context, wallet, std::nullopt));
+    WaitForDeleteWallet(std::move(wallet));
+
+    DatabaseOptions load_options;
+    load_options.require_existing = true;
+    auto loaded_wallet = LoadWallet(context, "encrypted_reload_test", std::nullopt, load_options, status, error, warnings);
+    BOOST_REQUIRE(loaded_wallet);
+    BOOST_REQUIRE_EQUAL(status, DatabaseStatus::SUCCESS);
+    BOOST_CHECK(loaded_wallet->IsLocked());
+
+    DescriptorScriptPubKeyMan* external_spk_man{nullptr};
+    DescriptorScriptPubKeyMan* internal_spk_man{nullptr};
+    {
+        LOCK(loaded_wallet->cs_wallet);
+        external_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(loaded_wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false));
+        internal_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(loaded_wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/true));
+    }
+    BOOST_REQUIRE(external_spk_man);
+    BOOST_REQUIRE(internal_spk_man);
+
+    BOOST_CHECK(loaded_wallet->HasPendingInitialKeyPoolTopUp());
+    {
+        LOCK(loaded_wallet->cs_wallet);
+        BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+        BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+    }
+
+    for (unsigned int i = 0; i < DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL; ++i) {
+        BOOST_REQUIRE(loaded_wallet->GetNewDestination(OutputType::P2MR, ""));
+    }
+    auto exhausted_addr = loaded_wallet->GetNewDestination(OutputType::P2MR, "");
+    BOOST_CHECK(!exhausted_addr);
+    BOOST_CHECK_EQUAL(util::ErrorString(exhausted_addr).original, "Error: Keypool ran out, please call keypoolrefill first");
+    BOOST_CHECK(loaded_wallet->HasPendingInitialKeyPoolTopUp());
+    BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), 0U);
+    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+
+    BOOST_REQUIRE(loaded_wallet->Unlock(passphrase));
+    BOOST_CHECK(!loaded_wallet->HasPendingInitialKeyPoolTopUp());
+    {
+        LOCK(loaded_wallet->cs_wallet);
+        BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), keypool_size);
+        BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), keypool_size);
+    }
+
+    BOOST_CHECK(RemoveWallet(context, loaded_wallet, std::nullopt));
+    WaitForDeleteWallet(std::move(loaded_wallet));
+}
+
+BOOST_FIXTURE_TEST_CASE(KeypoolTopUpReportsLockedInternalP2MRDescriptorFailure, RegtestP2MROnlyWalletTestingSetup)
+{
+    constexpr int64_t keypool_size{64};
+    const SecureString passphrase{"test-passphrase"};
+    m_args.ForceSetArg("-keypool", util::ToString(keypool_size));
+
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+
+    DatabaseOptions create_options;
+    create_options.require_create = true;
+    create_options.create_flags = WALLET_FLAG_DESCRIPTORS;
+    create_options.create_passphrase = passphrase;
+
+    DatabaseStatus status;
+    bilingual_str error;
+    std::vector<bilingual_str> warnings;
+    auto wallet = CreateWallet(context, "locked_internal_refill_error_test", std::nullopt, create_options, status, error, warnings);
+    BOOST_REQUIRE(wallet);
+    BOOST_REQUIRE_EQUAL(status, DatabaseStatus::SUCCESS);
+    BOOST_CHECK(wallet->IsLocked());
+
+    DescriptorScriptPubKeyMan* external_spk_man{nullptr};
+    DescriptorScriptPubKeyMan* internal_spk_man{nullptr};
+    {
+        LOCK(wallet->cs_wallet);
+        external_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false));
+        internal_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/true));
+    }
+    BOOST_REQUIRE(external_spk_man);
+    BOOST_REQUIRE(internal_spk_man);
+    BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+
+    BOOST_REQUIRE(wallet->Unlock(passphrase, /*run_pending_initial_keypool_top_up=*/false));
+    auto external_top_up{external_spk_man->TopUpWithInternalHintResult(/*internal_hint=*/false, keypool_size)};
+    BOOST_REQUIRE_MESSAGE(external_top_up.has_value(), util::ErrorString(external_top_up).original);
+    BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), keypool_size);
+    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+    BOOST_REQUIRE(wallet->Lock());
+
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_CHECK_GE(wallet->GetKeyPoolSize(), static_cast<unsigned int>(keypool_size));
+    }
+    auto top_up_res{wallet->TopUpKeyPoolResult(keypool_size)};
+    BOOST_CHECK(!top_up_res);
+    const std::string message{util::ErrorString(top_up_res).original};
+    BOOST_CHECK(message.find("active internal p2mr descriptor keypool") != std::string::npos);
+    BOOST_CHECK(message.find("target=64") != std::string::npos);
+    BOOST_CHECK(message.find("remaining=16") != std::string::npos);
+    BOOST_CHECK(message.find("wallet encryption key is unavailable for P2MR private-key persistence") != std::string::npos);
+
+    BOOST_CHECK(RemoveWallet(context, wallet, std::nullopt));
+    WaitForDeleteWallet(std::move(wallet));
+}
+
+BOOST_AUTO_TEST_CASE(DescriptorTopUpResultAbortsTransactionOnWriteFailure)
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    LOCK(wallet.cs_wallet);
+    wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+    wallet.SetupDescriptorScriptPubKeyMans(BECH32_ONLY_OUTPUT_TYPES);
+
+    auto* spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(wallet.GetScriptPubKeyMan(OutputType::BECH32, /*internal=*/false));
+    BOOST_REQUIRE(spk_man);
+
+    auto& database = GetMockableDatabase(wallet);
+    database.ResetCounts();
+    database.m_write_pass = false;
+
+    const unsigned int target_size{spk_man->GetKeyPoolSize() + 1};
+    auto top_up_res{spk_man->TopUpWithInternalHintResult(/*internal_hint=*/false, target_size)};
+    BOOST_CHECK(!top_up_res);
+    BOOST_CHECK_EQUAL(database.m_txn_begin_count, 1);
+    BOOST_CHECK_EQUAL(database.m_txn_abort_count, 1);
+    BOOST_CHECK_EQUAL(database.m_txn_commit_count, 0);
+}
+
+BOOST_AUTO_TEST_CASE(DescriptorTopUpResultRestoresMemoryAfterWriteFailure)
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    LOCK(wallet.cs_wallet);
+    wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+    wallet.SetupDescriptorScriptPubKeyMans(BECH32_ONLY_OUTPUT_TYPES);
+
+    auto* spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(wallet.GetScriptPubKeyMan(OutputType::BECH32, /*internal=*/false));
+    BOOST_REQUIRE(spk_man);
+
+    auto& database = GetMockableDatabase(wallet);
+    const unsigned int previous_size{spk_man->GetKeyPoolSize()};
+    const unsigned int target_size{previous_size + 1};
+    database.ResetCounts();
+    database.m_write_fail_after = 0;
+
+    auto top_up_res{spk_man->TopUpWithInternalHintResult(/*internal_hint=*/false, target_size)};
+    BOOST_CHECK(!top_up_res);
+    BOOST_CHECK_EQUAL(database.m_txn_abort_count, 1);
+    BOOST_CHECK_EQUAL(database.m_txn_commit_count, 0);
+    BOOST_CHECK_EQUAL(spk_man->GetKeyPoolSize(), previous_size);
+
+    database.ResetCounts();
+    database.m_write_fail_after = -1;
+    auto retry_res{spk_man->TopUpWithInternalHintResult(/*internal_hint=*/false, target_size)};
+    BOOST_REQUIRE_MESSAGE(retry_res.has_value(), util::ErrorString(retry_res).original);
+    BOOST_CHECK_EQUAL(spk_man->GetKeyPoolSize(), target_size);
+}
+
+BOOST_AUTO_TEST_CASE(DescriptorSetupPropagatesTopUpWithDBWriteFailure)
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    LOCK(wallet.cs_wallet);
+    wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+
+    auto& database = GetMockableDatabase(wallet);
+    database.m_write_fail_after = 2;
+    WalletBatch batch{wallet.GetDatabase()};
+    CExtKey master_key;
+    master_key.SetSeed(GenerateRandomKey());
+    DescriptorScriptPubKeyMan spk_man{wallet, SINGLE_ADDRESS_KEYPOOL_SIZE};
+
+    BOOST_CHECK_THROW(
+        spk_man.SetupDescriptorGeneration(batch, master_key, OutputType::BECH32, /*internal=*/false),
+        std::runtime_error);
+    BOOST_CHECK_GT(database.m_write_count, 2);
+}
+
+BOOST_AUTO_TEST_CASE(DescriptorTopUpWithDBReturnsFalseForExpansionFailure)
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    LOCK(wallet.cs_wallet);
+    wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+
+    CExtKey master_key;
+    master_key.SetSeed(GenerateRandomKey());
+    const std::string desc_str{"combo(" + EncodeExtPubKey(master_key.Neuter()) + "/0h/*h)"};
+    FlatSigningProvider keys;
+    std::string error;
+    auto descs{Parse(desc_str, keys, error, /*require_checksum=*/false)};
+    BOOST_REQUIRE_EQUAL(descs.size(), 1U);
+    WalletDescriptor desc{std::move(descs.at(0)), /*creation_time=*/0, /*range_start=*/0, /*range_end=*/0, /*next_index=*/0};
+    TestDescriptorScriptPubKeyMan spk_man{wallet, desc, SINGLE_ADDRESS_KEYPOOL_SIZE};
+    WalletBatch batch{wallet.GetDatabase()};
+
+    bool top_up{true};
+    BOOST_CHECK_NO_THROW(top_up = spk_man.TopUpWithDB(batch, SINGLE_ADDRESS_KEYPOOL_SIZE, /*internal_hint=*/false));
+    BOOST_CHECK(!top_up);
+}
+
+BOOST_AUTO_TEST_CASE(DescriptorTopUpWithDBThrowsWhenP2MRPersistenceNeedsLockedKey)
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    const SecureString passphrase{"test-passphrase"};
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS | WALLET_FLAG_BLANK_WALLET);
+        wallet.m_keypool_size = SINGLE_ADDRESS_KEYPOOL_SIZE;
+    }
+    BOOST_REQUIRE(wallet.EncryptWallet(passphrase));
+    BOOST_REQUIRE(wallet.Unlock(passphrase, /*run_pending_initial_keypool_top_up=*/false));
+    DescriptorScriptPubKeyMan* spk_man{nullptr};
+    {
+        LOCK(wallet.cs_wallet);
+        CExtKey master_key;
+        master_key.SetSeed(GenerateRandomKey());
+        WalletBatch batch{wallet.GetDatabase()};
+        spk_man = &wallet.SetupDescriptorScriptPubKeyMan(batch, master_key, OutputType::P2MR, /*internal=*/false);
+    }
+    BOOST_REQUIRE(spk_man);
+    BOOST_CHECK_EQUAL(spk_man->GetKeyPoolSize(), SINGLE_ADDRESS_KEYPOOL_SIZE);
+    BOOST_REQUIRE(wallet.Lock());
+    BOOST_REQUIRE(wallet.IsLocked());
+
+    auto top_up_res{spk_man->TopUpWithInternalHintResult(/*internal_hint=*/false, SINGLE_ADDRESS_KEYPOOL_SIZE + 1)};
+    BOOST_CHECK(!top_up_res);
+    BOOST_CHECK_EQUAL(util::ErrorString(top_up_res).original, "wallet encryption key is unavailable for P2MR private-key persistence");
+}
+
+BOOST_AUTO_TEST_CASE(DescriptorTopUpWithDBAllowsLockedPublicP2MRWithoutPrivatePersistence)
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS | WALLET_FLAG_BLANK_WALLET);
+    }
+    BOOST_REQUIRE(wallet.EncryptWallet(SecureString{"test-passphrase"}));
+    BOOST_REQUIRE(wallet.IsLocked());
+
+    const std::string desc_str{"mr(pk(" + HexStr(std::vector<unsigned char>(CPQCPubKey::SIZE, 0x11)) + "))"};
+    FlatSigningProvider keys;
+    std::string error;
+    auto descs{Parse(desc_str, keys, error, /*require_checksum=*/false)};
+    BOOST_REQUIRE_MESSAGE(descs.size() == 1U, error);
+    WalletDescriptor desc{std::move(descs.at(0)), /*creation_time=*/0, /*range_start=*/0, /*range_end=*/0, /*next_index=*/0};
+    TestDescriptorScriptPubKeyMan spk_man{wallet, desc, SINGLE_ADDRESS_KEYPOOL_SIZE};
+    WalletBatch batch{wallet.GetDatabase()};
+
+    bool top_up{false};
+    BOOST_CHECK_NO_THROW(top_up = spk_man.TopUpWithDB(batch, SINGLE_ADDRESS_KEYPOOL_SIZE, /*internal_hint=*/false));
+    BOOST_CHECK(top_up);
+    BOOST_CHECK_EQUAL(spk_man.GetKeyPoolSize(), SINGLE_ADDRESS_KEYPOOL_SIZE);
+}
+
+BOOST_AUTO_TEST_CASE(TopUpKeyPoolResultContinuesAfterDescriptorFailure)
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    const SecureString passphrase{"test-passphrase"};
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS | WALLET_FLAG_BLANK_WALLET);
+        wallet.m_keypool_size = SINGLE_ADDRESS_KEYPOOL_SIZE;
+    }
+    BOOST_REQUIRE(wallet.EncryptWallet(passphrase));
+    BOOST_REQUIRE(wallet.Unlock(passphrase, /*run_pending_initial_keypool_top_up=*/false));
+
+    DescriptorScriptPubKeyMan* failing_spk_man{nullptr};
+    DescriptorScriptPubKeyMan* continued_spk_man{nullptr};
+    {
+        LOCK(wallet.cs_wallet);
+        CExtKey master_key;
+        master_key.SetSeed(GenerateRandomKey());
+        WalletBatch batch{wallet.GetDatabase()};
+        failing_spk_man = &wallet.SetupDescriptorScriptPubKeyMan(batch, master_key, OutputType::P2MR, /*internal=*/false);
+        continued_spk_man = &wallet.SetupDescriptorScriptPubKeyMan(batch, master_key, OutputType::BECH32, /*internal=*/true);
+    }
+    BOOST_REQUIRE(failing_spk_man);
+    BOOST_REQUIRE(continued_spk_man);
+    BOOST_CHECK_EQUAL(failing_spk_man->GetKeyPoolSize(), SINGLE_ADDRESS_KEYPOOL_SIZE);
+    BOOST_CHECK_EQUAL(continued_spk_man->GetKeyPoolSize(), SINGLE_ADDRESS_KEYPOOL_SIZE);
+    BOOST_REQUIRE(wallet.Lock());
+
+    auto top_up_res{wallet.TopUpKeyPoolResult(SINGLE_ADDRESS_KEYPOOL_SIZE + 1)};
+    BOOST_CHECK(!top_up_res);
+    const std::string message{util::ErrorString(top_up_res).original};
+    BOOST_CHECK(message.find("active external p2mr descriptor keypool") != std::string::npos);
+    BOOST_CHECK(message.find("wallet encryption key is unavailable for P2MR private-key persistence") != std::string::npos);
+    BOOST_CHECK_EQUAL(failing_spk_man->GetKeyPoolSize(), SINGLE_ADDRESS_KEYPOOL_SIZE);
+    BOOST_CHECK_EQUAL(continued_spk_man->GetKeyPoolSize(), SINGLE_ADDRESS_KEYPOOL_SIZE + 1);
+}
+
+BOOST_AUTO_TEST_CASE(DescriptorTopUpWithDBKeepsExternalBatchMemoryOnPersistenceFailure)
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    LOCK(wallet.cs_wallet);
+    wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+
+    CExtKey master_key;
+    master_key.SetSeed(GenerateRandomKey());
+    TestDescriptorScriptPubKeyMan spk_man{wallet, SINGLE_ADDRESS_KEYPOOL_SIZE};
+    WalletBatch setup_batch{wallet.GetDatabase()};
+    BOOST_REQUIRE(spk_man.SetupDescriptorGeneration(setup_batch, master_key, OutputType::P2MR, /*internal=*/false));
+
+    auto& database = GetMockableDatabase(wallet);
+    const auto previous_spks{spk_man.GetScriptPubKeys().size()};
+    const unsigned int target_size{spk_man.GetKeyPoolSize() + 1};
+    database.ResetCounts();
+    database.m_write_fail_after = 1;
+    WalletBatch top_up_batch{wallet.GetDatabase()};
+
+    BOOST_CHECK_THROW(
+        spk_man.TopUpWithDB(top_up_batch, target_size, /*internal_hint=*/false),
+        std::runtime_error);
+    BOOST_CHECK_GT(database.m_write_count, 1);
+    BOOST_CHECK_EQUAL(spk_man.GetScriptPubKeys().size(), previous_spks + 1);
+}
+
+BOOST_AUTO_TEST_CASE(LegacyKeypoolDefaultTopUpResultAllowsNoop)
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.SetupLegacyScriptPubKeyMan();
+        BOOST_REQUIRE(wallet.GetLegacyDataSPKM());
+        BOOST_CHECK_EQUAL(wallet.GetActiveScriptPubKeyMans().size(), 1U);
+    }
+
+    BOOST_CHECK(wallet.TopUpKeyPoolResult());
+    BOOST_CHECK(!wallet.TopUpKeyPoolResult(/*kpSize=*/1));
+}
+
+BOOST_AUTO_TEST_CASE(external_signer_setup_rejects_explicit_output_types)
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    LOCK(wallet.cs_wallet);
+    wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS | WALLET_FLAG_DISABLE_PRIVATE_KEYS | WALLET_FLAG_EXTERNAL_SIGNER);
+
+    constexpr std::array output_types{OutputType::P2MR};
+    BOOST_CHECK_EXCEPTION(
+        wallet.SetupDescriptorScriptPubKeyMans(output_types),
+        std::runtime_error,
+        [](const std::runtime_error& e) {
+            return std::string{e.what()} == "Cannot specify output types for external signer wallets";
+        });
+}
+
+BOOST_AUTO_TEST_CASE(P2MRCanGenerateMultipleAddresses)
+{
+    auto wallet = CreateDescriptorWallet(*m_node.chain, P2MR_ONLY_OUTPUT_TYPES, FOUR_ADDRESS_KEYPOOL_SIZE);
+
+    DescriptorScriptPubKeyMan* p2mr_spk_man{nullptr};
+    {
+        LOCK(wallet->cs_wallet);
+        p2mr_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false));
+    }
+    BOOST_REQUIRE(p2mr_spk_man);
+    BOOST_CHECK(p2mr_spk_man->IsHDEnabled());
+    BOOST_CHECK(p2mr_spk_man->CanGetAddresses(/*internal=*/false));
+
+    std::set<CTxDestination> addrs;
+    for (int i = 0; i < 4; ++i) {
+        auto addr = wallet->GetNewDestination(OutputType::P2MR, "");
+        BOOST_REQUIRE(addr);
+        addrs.insert(*addr);
+    }
+    BOOST_CHECK_EQUAL(addrs.size(), 4U);
+    BOOST_CHECK(p2mr_spk_man->CanGetAddresses(/*internal=*/false));
+
+}
+
+BOOST_FIXTURE_TEST_CASE(NonRangedP2MRDescriptorDoesNotDeriveUnrelatedPQCKeys, TestingSetup)
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    LOCK(wallet.cs_wallet);
+    wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+
+    CPQCKey p2mr_key;
+    p2mr_key.MakeNewKey();
+    const CPQCPubKey p2mr_pubkey = p2mr_key.GetPubKey();
+
+    FlatSigningProvider provider;
+    std::string error;
+    auto descs = Parse("mr(pk(" + HexStr(std::span{p2mr_pubkey.data(), p2mr_pubkey.size()}) + "))", provider, error, /* require_checksum=*/ false);
+    BOOST_REQUIRE_EQUAL(descs.size(), 1U);
+
+    const CKey unrelated_key = GenerateRandomKey();
+    provider.keys.emplace(unrelated_key.GetPubKey().GetID(), unrelated_key);
+
+    WalletDescriptor w_desc(std::move(descs.at(0)), /*creation_time=*/0, /*range_start=*/0, /*range_end=*/0, /*next_index=*/0);
+    auto spkm = wallet.AddWalletDescriptor(w_desc, provider, "", /*internal=*/false);
+    BOOST_REQUIRE(spkm);
+
+    BOOST_CHECK(spkm->get().GetPQCKeys().empty());
+
+    int pqc_plain_records{0};
+    for (const auto& [serialized_key, _] : GetMockableDatabase(wallet).m_records) {
+        DataStream key_stream{serialized_key};
+        std::string record_type;
+        key_stream >> record_type;
+        if (record_type == DBKeys::WALLETDESCRIPTORPQCKEY) {
+            ++pqc_plain_records;
+        }
+    }
+    BOOST_CHECK_EQUAL(pqc_plain_records, 0);
+}
+
+BOOST_FIXTURE_TEST_CASE(NonRangedP2MRDescriptorDoesNotUseUnrelatedSeedKey, TestingSetup)
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    LOCK(wallet.cs_wallet);
+    wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+
+    CExtKey account_extkey = DecodeExtKey("qprvYYfRPs43ZezRHV2Fi78WJfTBwdRACukt3egGGXq9z2sVzi51wUYEr1CDfiPnxtZRa5ZJRkMWqDSVgTAwyZ73G9FopkTcMmLh9UExP6efUpe");
+    BOOST_REQUIRE(account_extkey.key.IsValid());
+    for (const uint32_t child : {87U | 0x80000000U, 1U | 0x80000000U, 0U | 0x80000000U}) {
+        CExtKey derived;
+        BOOST_REQUIRE(account_extkey.Derive(derived, child));
+        account_extkey = derived;
+    }
+    const std::string account_xprv = EncodeExtKey(account_extkey);
+    const std::string account_xpub = EncodeExtPubKey(account_extkey.Neuter());
+    const std::string suffix{"/0/0"};
+
+    FlatSigningProvider cache_provider;
+    std::string cache_error;
+    auto cache_descs = Parse("mr(pk(pqc(" + account_xprv + suffix + ")))", cache_provider, cache_error, /* require_checksum=*/ false);
+    BOOST_REQUIRE_EQUAL(cache_descs.size(), 1U);
+
+    DescriptorCache cache;
+    std::vector<CScript> cache_scripts;
+    FlatSigningProvider cache_out_keys;
+    BOOST_REQUIRE(cache_descs.at(0)->Expand(/*pos=*/0, cache_provider, cache_scripts, cache_out_keys, &cache));
+
+    FlatSigningProvider provider;
+    std::string error;
+    auto descs = Parse("mr(pk(pqc(" + account_xpub + suffix + ")))", provider, error, /* require_checksum=*/ false);
+    BOOST_REQUIRE_EQUAL(descs.size(), 1U);
+
+    const CKey unrelated_key = GenerateRandomKey();
+    provider.keys.emplace(unrelated_key.GetPubKey().GetID(), unrelated_key);
+
+    WalletDescriptor w_desc(std::move(descs.at(0)), /*creation_time=*/0, /*range_start=*/0, /*range_end=*/0, /*next_index=*/0);
+    w_desc.cache = cache;
+    auto spkm = wallet.AddWalletDescriptor(w_desc, provider, "", /*internal=*/false);
+    BOOST_REQUIRE(spkm);
+
+    BOOST_CHECK(spkm->get().GetPQCKeys().empty());
+
+    int pqc_plain_records{0};
+    for (const auto& [serialized_key, _] : GetMockableDatabase(wallet).m_records) {
+        DataStream key_stream{serialized_key};
+        std::string record_type;
+        key_stream >> record_type;
+        if (record_type == DBKeys::WALLETDESCRIPTORPQCKEY) {
+            ++pqc_plain_records;
+        }
+    }
+    BOOST_CHECK_EQUAL(pqc_plain_records, 0);
+}
+
+BOOST_FIXTURE_TEST_CASE(NonRangedInternalP2MRDescriptorUsesMatchingPQCKey, TestingSetup)
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    LOCK(wallet.cs_wallet);
+    wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+
+    CExtKey account_extkey = DecodeExtKey("qprvYYfRPs43ZezRHV2Fi78WJfTBwdRACukt3egGGXq9z2sVzi51wUYEr1CDfiPnxtZRa5ZJRkMWqDSVgTAwyZ73G9FopkTcMmLh9UExP6efUpe");
+    BOOST_REQUIRE(account_extkey.key.IsValid());
+    for (const uint32_t child : {87U | 0x80000000U, 1U | 0x80000000U, 0U | 0x80000000U}) {
+        CExtKey derived;
+        BOOST_REQUIRE(account_extkey.Derive(derived, child));
+        account_extkey = derived;
+    }
+    CExtKey leaf_extkey = account_extkey;
+    for (const uint32_t child : {0U, 0U}) {
+        CExtKey derived;
+        BOOST_REQUIRE(leaf_extkey.Derive(derived, child));
+        leaf_extkey = derived;
+    }
+
+    const std::string account_xprv = EncodeExtKey(account_extkey);
+    const std::string account_xpub = EncodeExtPubKey(account_extkey.Neuter());
+    const std::string suffix{"/0/0"};
+
+    FlatSigningProvider cache_provider;
+    std::string cache_error;
+    auto cache_descs = Parse("mr(pk(pqc(" + account_xprv + suffix + ")))", cache_provider, cache_error, /*require_checksum=*/false);
+    BOOST_REQUIRE_MESSAGE(!cache_descs.empty(), cache_error);
+
+    DescriptorCache cache;
+    std::vector<CScript> scripts;
+    FlatSigningProvider cache_out_keys;
+    BOOST_REQUIRE(cache_descs.at(0)->Expand(/*pos=*/0, cache_provider, scripts, cache_out_keys, &cache));
+    BOOST_REQUIRE_EQUAL(cache_out_keys.p2mr_pubkeys.size(), 1U);
+    const CPQCPubKey expected_p2mr_pubkey = cache_out_keys.p2mr_pubkeys.begin()->second;
+
+    FlatSigningProvider provider;
+    std::string error;
+    auto descs = Parse("mr(pk(pqc(" + account_xpub + suffix + ")))", provider, error, /*require_checksum=*/false);
+    BOOST_REQUIRE_MESSAGE(!descs.empty(), error);
+    provider.keys.emplace(leaf_extkey.key.GetPubKey().GetID(), leaf_extkey.key);
+
+    WalletDescriptor w_desc(std::move(descs.at(0)), /*creation_time=*/0, /*range_start=*/0, /*range_end=*/0, /*next_index=*/0);
+    w_desc.cache = std::move(cache);
+    auto spkm = wallet.AddWalletDescriptor(w_desc, provider, "", /*internal=*/true);
+    BOOST_REQUIRE(spkm);
+
+    const auto pqc_keys = spkm->get().GetPQCKeys();
+    BOOST_REQUIRE_EQUAL(pqc_keys.size(), 1U);
+    BOOST_CHECK(pqc_keys.at(0) == expected_p2mr_pubkey);
+}
+
+BOOST_FIXTURE_TEST_CASE(InternalRangedP2MRDescriptorGetSigningProviderUsesMatchingPQCKey, TestingSetup)
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+
+    CExtKey account_extkey = DecodeExtKey("qprvYYfRPs43ZezRHV2Fi78WJfTBwdRACukt3egGGXq9z2sVzi51wUYEr1CDfiPnxtZRa5ZJRkMWqDSVgTAwyZ73G9FopkTcMmLh9UExP6efUpe");
+    BOOST_REQUIRE(account_extkey.key.IsValid());
+    for (const uint32_t child : {87U | 0x80000000U, 1U | 0x80000000U, 0U | 0x80000000U}) {
+        CExtKey derived;
+        BOOST_REQUIRE(account_extkey.Derive(derived, child));
+        account_extkey = derived;
+    }
+
+    const std::string internal_range_desc{"mr(pk(pqc(" + EncodeExtPubKey(account_extkey.Neuter()) + "/1/*)))"};
+
+    FlatSigningProvider provider;
+    std::string error;
+    auto descs = Parse(internal_range_desc, provider, error, /*require_checksum=*/false);
+    BOOST_REQUIRE_MESSAGE(!descs.empty(), error);
+
+    FlatSigningProvider private_provider;
+    private_provider.keys.emplace(account_extkey.key.GetPubKey().GetID(), account_extkey.key);
+
+    std::vector<CScript> scripts;
+    FlatSigningProvider cache_out_keys;
+    DescriptorCache cache;
+    BOOST_REQUIRE(descs.at(0)->Expand(/*pos=*/0, private_provider, scripts, cache_out_keys, &cache));
+    BOOST_REQUIRE_EQUAL(cache_out_keys.p2mr_pubkeys.size(), 1U);
+
+    CExtKey internal_leaf_extkey = account_extkey;
+    CExtKey derived;
+    BOOST_REQUIRE(internal_leaf_extkey.Derive(derived, /*nChild=*/1));
+    internal_leaf_extkey = derived;
+    BOOST_REQUIRE(internal_leaf_extkey.Derive(derived, /*nChild=*/0));
+    internal_leaf_extkey = derived;
+
+    CPQCKey expected_internal_p2mr_key;
+    BOOST_REQUIRE(DerivePQCKey(internal_leaf_extkey.key, /*account=*/0, /*change=*/1, /*index=*/0, expected_internal_p2mr_key));
+    const auto key_exp_pos = cache_out_keys.p2mr_pubkeys.begin()->first;
+    cache.CacheDerivedP2MRPubKey(key_exp_pos, /*der_index=*/0, expected_internal_p2mr_key.GetPubKey());
+
+    WalletDescriptor w_desc(std::move(descs.at(0)), /*creation_time=*/0, /*range_start=*/0, /*range_end=*/1, /*next_index=*/0);
+    w_desc.cache = std::move(cache);
+
+    DescriptorScriptPubKeyMan* spkm{nullptr};
+    {
+        LOCK(wallet.cs_wallet);
+        spkm = &Assert(wallet.AddWalletDescriptor(w_desc, private_provider, "", /*internal=*/true)).value().get();
+    }
+    BOOST_REQUIRE(spkm);
+
+    CPubKey descriptor_pubkey;
+    {
+        LOCK(spkm->cs_desc_man);
+        const WalletDescriptor& wallet_descriptor = spkm->GetWalletDescriptor();
+        std::vector<CScript> cached_scripts;
+        FlatSigningProvider cached_out_keys;
+        BOOST_REQUIRE(wallet_descriptor.descriptor->ExpandFromCache(/*pos=*/0, wallet_descriptor.cache, cached_scripts, cached_out_keys));
+        BOOST_REQUIRE_EQUAL(cached_out_keys.pubkeys.size(), 1U);
+        descriptor_pubkey = cached_out_keys.pubkeys.begin()->second;
+    }
+
+    auto signing_provider = spkm->GetSigningProvider(descriptor_pubkey);
+    BOOST_REQUIRE(signing_provider);
+
+    CPQCKey got_internal_p2mr_key;
+    BOOST_REQUIRE(signing_provider->GetPQCKey(expected_internal_p2mr_key.GetPubKey(), got_internal_p2mr_key));
+    BOOST_CHECK(got_internal_p2mr_key.GetPubKey() == expected_internal_p2mr_key.GetPubKey());
+}
+
+BOOST_AUTO_TEST_CASE(ChangeTypeFallbackUsesP2MROnP2MROnlyChain)
+{
+    auto wallet = CreateDescriptorWallet(*m_node.chain, CHANGE_FALLBACK_OUTPUT_TYPES, SINGLE_ADDRESS_KEYPOOL_SIZE);
+
+    {
+        LOCK(wallet->cs_wallet);
+
+        auto* bech32m_internal = wallet->GetScriptPubKeyMan(OutputType::BECH32M, /*internal=*/true);
+        BOOST_REQUIRE(bech32m_internal);
+        wallet->DeactivateScriptPubKeyMan(bech32m_internal->GetID(), OutputType::BECH32M, /*internal=*/true);
+
+        BOOST_REQUIRE(wallet->GetScriptPubKeyMan(OutputType::BECH32, /*internal=*/true));
+        BOOST_REQUIRE(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/true));
+        wallet->m_default_address_type = OutputType::BECH32;
+
+        const CRecipient recipient{
+            WitnessV0ScriptHash(CScript{} << OP_TRUE),
+            /*nAmount=*/1,
+            /*fSubtractFeeFromAmount=*/false,
+        };
+        const OutputType change_type = wallet->TransactionChangeType(std::nullopt, {recipient});
+        BOOST_CHECK_EQUAL(change_type, OutputType::P2MR);
+    }
+
+}
+
+BOOST_AUTO_TEST_CASE(ChangeTypeFallbackUsesDefaultP2MRWhenAvailable)
+{
+    auto wallet = CreateDescriptorWallet(*m_node.chain, CHANGE_FALLBACK_OUTPUT_TYPES, SINGLE_ADDRESS_KEYPOOL_SIZE);
+
+    {
+        LOCK(wallet->cs_wallet);
+
+        auto* bech32m_internal = wallet->GetScriptPubKeyMan(OutputType::BECH32M, /*internal=*/true);
+        BOOST_REQUIRE(bech32m_internal);
+        wallet->DeactivateScriptPubKeyMan(bech32m_internal->GetID(), OutputType::BECH32M, /*internal=*/true);
+
+        BOOST_REQUIRE(wallet->GetScriptPubKeyMan(OutputType::BECH32, /*internal=*/true));
+        BOOST_REQUIRE(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/true));
+        wallet->m_default_address_type = OutputType::P2MR;
+
+        const CRecipient recipient{
+            WitnessV0ScriptHash(CScript{} << OP_TRUE),
+            /*nAmount=*/1,
+            /*fSubtractFeeFromAmount=*/false,
+        };
+        const OutputType change_type = wallet->TransactionChangeType(std::nullopt, {recipient});
+        BOOST_CHECK_EQUAL(change_type, OutputType::P2MR);
+    }
+
+}
+
+BOOST_AUTO_TEST_CASE(ChangeTypeRecipientMatchUsesP2MROnP2MROnlyChain)
+{
+    auto wallet = CreateDescriptorWallet(*m_node.chain, CHANGE_FALLBACK_OUTPUT_TYPES, SINGLE_ADDRESS_KEYPOOL_SIZE);
+
+    {
+        LOCK(wallet->cs_wallet);
+
+        auto* bech32m_internal = wallet->GetScriptPubKeyMan(OutputType::BECH32M, /*internal=*/true);
+        BOOST_REQUIRE(bech32m_internal);
+        wallet->DeactivateScriptPubKeyMan(bech32m_internal->GetID(), OutputType::BECH32M, /*internal=*/true);
+
+        BOOST_REQUIRE(wallet->GetScriptPubKeyMan(OutputType::BECH32, /*internal=*/true));
+        BOOST_REQUIRE(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/true));
+
+        const CRecipient p2mr_recipient{
+            WitnessV2P2MR{},
+            /*nAmount=*/1,
+            /*fSubtractFeeFromAmount=*/false,
+        };
+        const CRecipient wpkh_recipient{
+            WitnessV0KeyHash(GenerateRandomKey().GetPubKey()),
+            /*nAmount=*/1,
+            /*fSubtractFeeFromAmount=*/false,
+        };
+
+        const OutputType change_type = wallet->TransactionChangeType(std::nullopt, {p2mr_recipient, wpkh_recipient});
+        BOOST_CHECK_EQUAL(change_type, OutputType::P2MR);
+    }
+
+}
+
+BOOST_AUTO_TEST_CASE(P2MRKeysAreEncryptedAtRest)
+{
+    auto wallet = CreateDescriptorWallet(*m_node.chain, P2MR_ONLY_OUTPUT_TYPES, SINGLE_ADDRESS_KEYPOOL_SIZE);
+
+    {
+        LOCK(wallet->cs_wallet);
+        auto* p2mr_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false));
+        BOOST_REQUIRE(p2mr_spk_man);
+        BOOST_CHECK(!p2mr_spk_man->GetPQCKeys().empty());
+    }
+
+    const SecureString passphrase{"test-passphrase"};
+    BOOST_REQUIRE(wallet->EncryptWallet(passphrase));
+    BOOST_CHECK(wallet->IsLocked());
+
+    {
+        LOCK(wallet->cs_wallet);
+        auto* p2mr_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false));
+        BOOST_REQUIRE(p2mr_spk_man);
+        BOOST_CHECK(!p2mr_spk_man->GetPQCKeys().empty());
+    }
+
+    int pqc_plain_records{0};
+    int pqc_crypted_records{0};
+    for (const auto& [serialized_key, _] : GetMockableDatabase(*wallet).m_records) {
+        DataStream key_stream{serialized_key};
+        std::string record_type;
+        key_stream >> record_type;
+        if (record_type == DBKeys::WALLETDESCRIPTORPQCKEY) {
+            ++pqc_plain_records;
+        } else if (record_type == DBKeys::WALLETDESCRIPTORPQCCKEY) {
+            ++pqc_crypted_records;
+        }
+    }
+
+    BOOST_CHECK_EQUAL(pqc_plain_records, 0);
+    BOOST_CHECK_GT(pqc_crypted_records, 0);
+
+}
+
+BOOST_FIXTURE_TEST_CASE(CachedP2MRDescriptorsPersistPQCKeys, TestingSetup)
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    wallet.m_keypool_size = 1;
+    wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+
+    const std::string desc_str{
+        "mr(pk(pqc(qprvYYfRPs43ZezRHV2Fi78WJfTBwdRACukt3egGGXq9z2sVzi51wUYEr1CDfiPnxtZRa5ZJRkMWqDSVgTAwyZ73G9FopkTcMmLh9UExP6efUpe/87h/1h/0h/0/*)))"};
+
+    FlatSigningProvider provider;
+    std::string error;
+    auto parsed_descs = Parse(desc_str, provider, error, /*require_checksum=*/false);
+    BOOST_REQUIRE_MESSAGE(!parsed_descs.empty(), error);
+
+    DescriptorCache cache;
+    FlatSigningProvider out_keys;
+    std::vector<CScript> scripts;
+    BOOST_REQUIRE(parsed_descs.at(0)->Expand(/*pos=*/0, provider, scripts, out_keys, &cache));
+    BOOST_REQUIRE_EQUAL(out_keys.pqc_keys.size(), 1U);
+
+    WalletDescriptor w_desc(std::move(parsed_descs.at(0)), /*creation_time=*/1, /*range_start=*/0, /*range_end=*/0, /*next_index=*/0);
+    w_desc.cache = std::move(cache);
+
+    DescriptorScriptPubKeyMan* p2mr_spk_man{nullptr};
+    {
+        LOCK(wallet.cs_wallet);
+        p2mr_spk_man = &Assert(wallet.AddWalletDescriptor(w_desc, provider, "", /*internal=*/false)).value().get();
+    }
+
+    BOOST_REQUIRE(p2mr_spk_man);
+    {
+        LOCK(p2mr_spk_man->cs_desc_man);
+        BOOST_CHECK_EQUAL(p2mr_spk_man->GetWalletDescriptor().range_end, 1);
+    }
+    BOOST_CHECK_EQUAL(p2mr_spk_man->GetPQCKeys().size(), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(P2MRWalletCanSignSingleInputSpend)
+{
+    auto wallet = CreateDescriptorWallet(*m_node.chain, P2MR_ONLY_OUTPUT_TYPES, SINGLE_ADDRESS_KEYPOOL_SIZE);
+
+    DescriptorScriptPubKeyMan* p2mr_spk_man{nullptr};
+    CPubKey descriptor_pubkey;
+    CScript p2mr_script;
+    {
+        LOCK(wallet->cs_wallet);
+        p2mr_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false));
+    }
+    BOOST_REQUIRE(p2mr_spk_man);
+
+    {
+        LOCK(p2mr_spk_man->cs_desc_man);
+        const WalletDescriptor wallet_descriptor = p2mr_spk_man->GetWalletDescriptor();
+        std::vector<CScript> scripts;
+        FlatSigningProvider out_keys;
+        BOOST_REQUIRE(wallet_descriptor.descriptor->ExpandFromCache(/*pos=*/0, wallet_descriptor.cache, scripts, out_keys));
+        BOOST_REQUIRE_EQUAL(scripts.size(), 1U);
+        BOOST_REQUIRE_EQUAL(out_keys.pubkeys.size(), 1U);
+        p2mr_script = scripts.at(0);
+        descriptor_pubkey = out_keys.pubkeys.begin()->second;
+    }
+
+    auto provider = p2mr_spk_man->GetSigningProvider(descriptor_pubkey);
+    BOOST_REQUIRE(provider);
+    BOOST_CHECK_EQUAL(provider->mr_trees.size(), 1U);
+    BOOST_CHECK_EQUAL(provider->pqc_keys.size(), 1U);
+
+    std::vector<std::vector<unsigned char>> solutions;
+    BOOST_REQUIRE_EQUAL(Solver(p2mr_script, solutions), TxoutType::WITNESS_V2_P2MR);
+    const WitnessV2P2MR output{std::span<const unsigned char>{solutions.at(0)}};
+    P2MRSpendData spenddata;
+    BOOST_REQUIRE(provider->GetP2MRSpendData(output, spenddata));
+    BOOST_CHECK_EQUAL(spenddata.scripts.size(), 1U);
+
+    CMutableTransaction funding_tx;
+    funding_tx.vout.emplace_back(1 * COIN, p2mr_script);
+
+    CMutableTransaction spend_tx;
+    spend_tx.vin.emplace_back(COutPoint{funding_tx.GetHash(), 0});
+    spend_tx.vout.emplace_back(1 * COIN - 10'000, GetScriptForRawPubKey(GenerateRandomKey().GetPubKey()));
+
+    std::map<COutPoint, Coin> coins;
+    coins.emplace(spend_tx.vin.at(0).prevout, Coin{funding_tx.vout.at(0), /*nHeightIn=*/1, /*fCoinBaseIn=*/false});
+
+    std::map<int, bilingual_str> input_errors;
+    const auto format_errors = [&input_errors]() {
+        std::string message;
+        for (const auto& [input_index, error] : input_errors) {
+            if (!message.empty()) message += "; ";
+            message += strprintf("input %d: %s", input_index, error.original);
+        }
+        return message;
+    };
+
+    bool signed_ok{false};
+    {
+        LOCK(wallet->cs_wallet);
+        signed_ok = wallet->SignTransaction(spend_tx, coins, SIGHASH_DEFAULT, input_errors);
+    }
+    BOOST_REQUIRE_MESSAGE(signed_ok, format_errors());
+    BOOST_CHECK_MESSAGE(input_errors.empty(), format_errors());
+    BOOST_CHECK(!spend_tx.vin.at(0).scriptWitness.IsNull());
+}
+
+BOOST_FIXTURE_TEST_CASE(GetSigningProviderSkipsUndecryptablePQCKeys, TestingSetup)
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    const std::string desc_str{
+        "mr(pk(pqc(qprvYYfRPs43ZezRHV2Fi78WJfTBwdRACukt3egGGXq9z2sVzi51wUYEr1CDfiPnxtZRa5ZJRkMWqDSVgTAwyZ73G9FopkTcMmLh9UExP6efUpe/87h/1h/0h/0/0)))"};
+
+    DescriptorScriptPubKeyMan* p2mr_spk_man = CreateDescriptor(wallet, desc_str, true);
+    BOOST_REQUIRE(p2mr_spk_man);
+
+    CPubKey descriptor_pubkey;
+    {
+        LOCK(p2mr_spk_man->cs_desc_man);
+        const WalletDescriptor wallet_descriptor = p2mr_spk_man->GetWalletDescriptor();
+        std::vector<CScript> scripts;
+        FlatSigningProvider out_keys;
+        BOOST_REQUIRE(wallet_descriptor.descriptor->ExpandFromCache(/*pos=*/0, wallet_descriptor.cache, scripts, out_keys));
+        BOOST_REQUIRE_EQUAL(out_keys.pubkeys.size(), 1U);
+        descriptor_pubkey = out_keys.pubkeys.begin()->second;
+    }
+
+    const SecureString passphrase{"test-passphrase"};
+    // This test only needs the descriptor under test to be encrypted. Avoid
+    // unrelated replacement descriptor setup, which is expensive under MSan.
+    wallet.SetWalletFlag(WALLET_FLAG_BLANK_WALLET);
+    BOOST_REQUIRE(wallet.EncryptWallet(passphrase));
+    BOOST_REQUIRE(wallet.Unlock(passphrase));
+
+    CPQCKey bogus_pqc_key;
+    bogus_pqc_key.MakeNewKey();
+    BOOST_REQUIRE(p2mr_spk_man->AddCryptedPQCKey(bogus_pqc_key.GetPubKey(), {0x00}));
+
+    auto provider = p2mr_spk_man->GetSigningProvider(descriptor_pubkey);
+    BOOST_REQUIRE(provider);
+    BOOST_CHECK_EQUAL(provider->pqc_keys.count(bogus_pqc_key.GetPubKey()), 0U);
+    for (const auto& [_, key] : provider->pqc_keys) {
+        BOOST_CHECK(key.IsValid());
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(GetSigningProviderSkipsUndecryptableECDSAKeys, TestingSetup)
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    const std::string desc_str{
+        "mr(pk(pqc(qprvYYfRPs43ZezRHV2Fi78WJfTBwdRACukt3egGGXq9z2sVzi51wUYEr1CDfiPnxtZRa5ZJRkMWqDSVgTAwyZ73G9FopkTcMmLh9UExP6efUpe/87h/1h/0h/0/0)))"};
+
+    DescriptorScriptPubKeyMan* p2mr_spk_man = CreateDescriptor(wallet, desc_str, true);
+    BOOST_REQUIRE(p2mr_spk_man);
+
+    CPubKey descriptor_pubkey;
+    {
+        LOCK(p2mr_spk_man->cs_desc_man);
+        const WalletDescriptor wallet_descriptor = p2mr_spk_man->GetWalletDescriptor();
+        std::vector<CScript> scripts;
+        FlatSigningProvider out_keys;
+        BOOST_REQUIRE(wallet_descriptor.descriptor->ExpandFromCache(/*pos=*/0, wallet_descriptor.cache, scripts, out_keys));
+        BOOST_REQUIRE_EQUAL(out_keys.pubkeys.size(), 1U);
+        descriptor_pubkey = out_keys.pubkeys.begin()->second;
+    }
+
+    const SecureString passphrase{"test-passphrase"};
+    // This test only needs the descriptor under test to be encrypted. Avoid
+    // unrelated replacement descriptor setup, which is expensive under MSan.
+    wallet.SetWalletFlag(WALLET_FLAG_BLANK_WALLET);
+    BOOST_REQUIRE(wallet.EncryptWallet(passphrase));
+    BOOST_REQUIRE(wallet.Unlock(passphrase));
+
+    const CKey bogus_key = GenerateRandomKey();
+    BOOST_REQUIRE(p2mr_spk_man->AddCryptedKey(bogus_key.GetPubKey().GetID(), bogus_key.GetPubKey(), {0x00}));
+
+    auto provider = p2mr_spk_man->GetSigningProvider(descriptor_pubkey);
+    BOOST_REQUIRE(provider);
+    BOOST_CHECK_EQUAL(provider->keys.count(descriptor_pubkey.GetID()), 1U);
+    BOOST_CHECK_EQUAL(provider->keys.count(bogus_key.GetPubKey().GetID()), 0U);
+    for (const auto& [_, key] : provider->keys) {
+        BOOST_CHECK(key.IsValid());
+    }
+}
+
+class ListCoinsTestingSetupBase : public UnrestrictedRegtestChain100Setup
 {
 public:
-    ListCoinsTestingSetup()
-    {
-        CreateAndProcessBlock({}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
-        wallet = CreateSyncedWallet(*m_node.chain, WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
-    }
-
-    ~ListCoinsTestingSetup()
-    {
-        wallet.reset();
-    }
-
     CWalletTx& AddTx(CRecipient recipient)
     {
         CTransactionRef tx;
@@ -390,7 +1844,37 @@ public:
     std::unique_ptr<CWallet> wallet;
 };
 
-BOOST_FIXTURE_TEST_CASE(ListCoinsTest, ListCoinsTestingSetup)
+class ListCoinsMinimalTestingSetup : public ListCoinsTestingSetupBase
+{
+public:
+    ListCoinsMinimalTestingSetup()
+    {
+        CreateAndProcessBlock({}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+        wallet = CreateSyncedWallet(*m_node.chain, WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey, BECH32_ONLY_OUTPUT_TYPES, SINGLE_ADDRESS_KEYPOOL_SIZE);
+    }
+
+    ~ListCoinsMinimalTestingSetup()
+    {
+        wallet.reset();
+    }
+};
+
+class ListCoinsAllTypesTestingSetup : public ListCoinsTestingSetupBase
+{
+public:
+    ListCoinsAllTypesTestingSetup()
+    {
+        CreateAndProcessBlock({}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+        wallet = CreateSyncedWallet(*m_node.chain, WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
+    }
+
+    ~ListCoinsAllTypesTestingSetup()
+    {
+        wallet.reset();
+    }
+};
+
+BOOST_FIXTURE_TEST_CASE(ListCoinsTest, ListCoinsMinimalTestingSetup)
 {
     std::string coinbaseAddress = coinbaseKey.GetPubKey().GetID().ToString();
 
@@ -406,7 +1890,8 @@ BOOST_FIXTURE_TEST_CASE(ListCoinsTest, ListCoinsTestingSetup)
     BOOST_CHECK_EQUAL(list.begin()->second.size(), 1U);
 
     // Check initial balance from one mature coinbase transaction.
-    BOOST_CHECK_EQUAL(50 * COIN, WITH_LOCK(wallet->cs_wallet, return AvailableCoins(*wallet).GetTotalAmount()));
+    // One mature coinbase at the initial qbit block subsidy.
+    BOOST_CHECK_EQUAL(GetBlockSubsidy(1, Params().GetConsensus()), WITH_LOCK(wallet->cs_wallet, return AvailableCoins(*wallet).GetTotalAmount()));
 
     // Add a transaction creating a change address, and confirm ListCoins still
     // returns the coin associated with the change address underneath the
@@ -447,7 +1932,7 @@ BOOST_FIXTURE_TEST_CASE(ListCoinsTest, ListCoinsTestingSetup)
     BOOST_CHECK_EQUAL(list.begin()->second.size(), 2U);
 }
 
-void TestCoinsResult(ListCoinsTest& context, OutputType out_type, CAmount amount,
+void TestCoinsResult(ListCoinsTestingSetupBase& context, OutputType out_type, CAmount amount,
                      std::map<OutputType, size_t>& expected_coins_sizes)
 {
     LOCK(context.wallet->cs_wallet);
@@ -461,10 +1946,10 @@ void TestCoinsResult(ListCoinsTest& context, OutputType out_type, CAmount amount
     for (const auto& [type, size] : expected_coins_sizes) BOOST_CHECK_EQUAL(size, available_coins.coins[type].size());
 }
 
-BOOST_FIXTURE_TEST_CASE(BasicOutputTypesTest, ListCoinsTest)
+BOOST_FIXTURE_TEST_CASE(BasicOutputTypesTest, ListCoinsAllTypesTestingSetup)
 {
     std::map<OutputType, size_t> expected_coins_sizes;
-    for (const auto& out_type : OUTPUT_TYPES) { expected_coins_sizes[out_type] = 0U; }
+    for (const auto& out_type : SUPPORTED_OUTPUT_TYPES) { expected_coins_sizes[out_type] = 0U; }
 
     // Verify our wallet has one usable coinbase UTXO before starting
     // This UTXO is a P2PK, so it should show up in the Other bucket
@@ -480,7 +1965,7 @@ BOOST_FIXTURE_TEST_CASE(BasicOutputTypesTest, ListCoinsTest)
     //   1. One UTXO as the recipient
     //   2. One UTXO from the change, due to payment address matching logic
 
-    for (const auto& out_type : OUTPUT_TYPES) {
+    for (const auto& out_type : SUPPORTED_OUTPUT_TYPES) {
         if (out_type == OutputType::UNKNOWN) continue;
         expected_coins_sizes[out_type] = 2U;
         TestCoinsResult(*this, out_type, 1 * COIN, expected_coins_sizes);
@@ -534,8 +2019,12 @@ static size_t CalculateNestedKeyhashInputSize(bool use_max_sig)
 
 BOOST_FIXTURE_TEST_CASE(dummy_input_size_test, TestChain100Setup)
 {
-    BOOST_CHECK_EQUAL(CalculateNestedKeyhashInputSize(false), DUMMY_NESTED_P2WPKH_INPUT_SIZE);
+    // With WSF=1 (no witness discount), low-S and max-sig sizes differ by 1 byte.
+    // DUMMY_NESTED_P2WPKH_INPUT_SIZE uses the conservative (max-sig) value.
+    BOOST_CHECK_EQUAL(CalculateNestedKeyhashInputSize(false), DUMMY_NESTED_P2WPKH_INPUT_SIZE - 1);
     BOOST_CHECK_EQUAL(CalculateNestedKeyhashInputSize(true), DUMMY_NESTED_P2WPKH_INPUT_SIZE);
+    BOOST_CHECK_EQUAL(DUMMY_P2MR_INPUT_SIZE, P2MR_V1_SINGLE_KEY_SPEND_SIZE);
+    BOOST_CHECK_EQUAL(DUMMY_P2MR_INPUT_SIZE, 3763U);
 }
 
 bool malformed_descriptor(std::ios_base::failure e)
@@ -577,9 +2066,10 @@ BOOST_FIXTURE_TEST_CASE(wallet_descriptor_test, BasicTestingSetup)
 //! wallet rescan and notifications are immediately synced, to verify the wallet
 //! must already have a handler in place for them, and there's no gap after
 //! rescanning where new transactions in new blocks could be lost.
-BOOST_FIXTURE_TEST_CASE(CreateWallet, TestChain100Setup)
+BOOST_FIXTURE_TEST_CASE(CreateWallet, UnrestrictedRegtestChain100Setup)
 {
     m_args.ForceSetArg("-unsafesqlitesync", "1");
+    m_args.ForceSetArg("-keypool", util::ToString(SINGLE_ADDRESS_KEYPOOL_SIZE));
     // Create new wallet with known key and unload it.
     WalletContext context;
     context.args = &m_args;
@@ -679,6 +2169,7 @@ BOOST_FIXTURE_TEST_CASE(CreateWallet, TestChain100Setup)
 
 BOOST_FIXTURE_TEST_CASE(CreateWalletWithoutChain, BasicTestingSetup)
 {
+    m_args.ForceSetArg("-keypool", util::ToString(SINGLE_ADDRESS_KEYPOOL_SIZE));
     WalletContext context;
     context.args = &m_args;
     auto wallet = TestLoadWallet(context);
@@ -686,9 +2177,10 @@ BOOST_FIXTURE_TEST_CASE(CreateWalletWithoutChain, BasicTestingSetup)
     WaitForDeleteWallet(std::move(wallet));
 }
 
-BOOST_FIXTURE_TEST_CASE(RemoveTxs, TestChain100Setup)
+BOOST_FIXTURE_TEST_CASE(RemoveTxs, UnrestrictedRegtestChain100Setup)
 {
     m_args.ForceSetArg("-unsafesqlitesync", "1");
+    m_args.ForceSetArg("-keypool", util::ToString(SINGLE_ADDRESS_KEYPOOL_SIZE));
     WalletContext context;
     context.args = &m_args;
     context.chain = m_node.chain.get();

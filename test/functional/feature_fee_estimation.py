@@ -261,12 +261,32 @@ class EstimateFeeTest(BitcoinTestFramework):
         utxos_to_respend = []
         txids_to_replace = []
 
+        def pop_respendable_utxo():
+            while utxos:
+                candidate = utxos.pop(0)
+                try:
+                    # Ensure the utxo can be used for a policy-valid high-fee replacement.
+                    replacement_tx = make_tx(self.wallet, candidate, high_feerate)
+                except RuntimeError:
+                    continue
+                replacement_accept = node.testmempoolaccept([replacement_tx["hex"]])[0]
+                if not replacement_accept["allowed"]:
+                    self.log.debug(
+                        "Skipping RBF candidate %s:%s for high-fee replacement: %s",
+                        candidate["txid"],
+                        candidate["vout"],
+                        replacement_accept["reject-reason"],
+                    )
+                    continue
+                return candidate
+            raise AssertionError("Insufficient spendable utxos for high-feerate replacement")
+
         assert_greater_than_or_equal(len(utxos), 250)
         for _ in range(5):
             # Broadcast 45 low fee transactions that will need to be RBF'd
             txs = []
             for _ in range(45):
-                u = utxos.pop(0)
+                u = pop_respendable_utxo()
                 tx = make_tx(self.wallet, u, low_feerate)
                 utxos_to_respend.append(u)
                 txids_to_replace.append(tx["txid"])
@@ -434,6 +454,7 @@ class EstimateFeeTest(BitcoinTestFramework):
         # Split two coinbases into many small utxos
         self.start_node(0)
         self.wallet = MiniWallet(self.nodes[0])
+        self.wallet.ensure_spendable_utxos(min_spendable=2, mature_coinbase_count=2)
         self.initial_split(self.nodes[0])
         self.log.info("Finished splitting")
 

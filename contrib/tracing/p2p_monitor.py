@@ -3,7 +3,7 @@
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-""" Interactive bitcoind P2P network traffic monitor utilizing USDT and the
+""" Interactive qbitd P2P network traffic monitor utilizing USDT and the
     net:inbound_message and net:outbound_message tracepoints. """
 
 # This script demonstrates what USDT for Bitcoin Core can enable. It uses BCC
@@ -126,7 +126,7 @@ class Peer:
 
 def main(pid):
     peers = dict()
-    print(f"Hooking into bitcoind with pid {pid}")
+    print(f"Hooking into qbitd with pid {pid}")
     bitcoind_with_usdts = USDT(pid=int(pid))
 
     # attaching the trace functions defined in the BPF program to the tracepoints
@@ -259,7 +259,7 @@ def running_as_root():
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print("USAGE:", sys.argv[0], "<pid of bitcoind>")
+        print("USAGE:", sys.argv[0], "<pid of qbitd>")
         exit()
     if not running_as_root():
         print("You might not have the privileges required to hook into the tracepoints!")

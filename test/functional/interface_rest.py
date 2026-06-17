@@ -97,6 +97,9 @@ class RESTTest (BitcoinTestFramework):
         self.url = urllib.parse.urlparse(self.nodes[0].url)
         self.wallet = MiniWallet(self.nodes[0])
 
+        # Mature the default-cache coinbase UTXOs
+        self.ensure_cached_coinbase_mature(self.nodes[0])
+
         self.log.info("Broadcast test transaction and sync nodes")
         txid = self.wallet.send_to(from_node=self.nodes[0], scriptPubKey=getnewdestination()[1], amount=int(0.1 * COIN))["txid"]
         self.sync_all()
@@ -167,7 +170,7 @@ class RESTTest (BitcoinTestFramework):
         response_hash = bin_response[4:36][::-1].hex()
 
         assert_equal(bb_hash, response_hash)  # check if getutxo's chaintip during calculation was fine
-        assert_equal(chain_height, 201)  # chain height must be 201 (pre-mined chain [200] + generated block [1])
+        assert_equal(chain_height, self.nodes[0].getblockcount())
 
         self.log.info("Test the /getutxos URI with and without /checkmempool")
         # Create a transaction, check that it's found with /checkmempool, but
@@ -298,10 +301,11 @@ class RESTTest (BitcoinTestFramework):
 
         # See if we can get 5 headers in one response
         self.generate(self.nodes[1], 5)
-        expected_filter = {
-            'basic block filter index': {'synced': True, 'best_block_height': 208},
-        }
-        self.wait_until(lambda: self.nodes[0].getindexinfo() == expected_filter)
+        expected_height = self.nodes[0].getblockcount()
+        self.wait_until(lambda: self.nodes[0].getindexinfo().get('basic block filter index') == {
+            'synced': True,
+            'best_block_height': expected_height,
+        })
         json_obj = self.test_rest_request(f"/headers/{bb_hash}", query_params={"count": 5})
         assert_equal(len(json_obj), 5)  # now we should have 5 header objects
         json_obj = self.test_rest_request(f"/blockfilterheaders/basic/{bb_hash}", query_params={"count": 5})

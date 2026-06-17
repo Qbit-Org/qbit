@@ -18,11 +18,16 @@ class FeatureFastpruneTest(BitcoinTestFramework):
     def run_test(self):
         self.log.info("ensure that large blocks don't crash or freeze in -fastprune")
         wallet = MiniWallet(self.nodes[0])
+
+        # Mature the default-cache coinbase UTXOs
+        self.ensure_cached_coinbase_mature(self.nodes[0])
+        height_before = self.nodes[0].getblockcount()
+
         tx = wallet.create_self_transfer()['tx']
         annex = b"\x50" + b"\xff" * 0x10000
         tx.wit.vtxinwit[0].scriptWitness.stack.append(annex)
         self.generateblock(self.nodes[0], output="raw(55)", transactions=[tx.serialize().hex()])
-        assert_equal(self.nodes[0].getblockcount(), 201)
+        assert_equal(self.nodes[0].getblockcount(), height_before + 1)
 
 
 if __name__ == '__main__':

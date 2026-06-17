@@ -4,6 +4,9 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Test orphaned block rewards in the wallet."""
 
+from decimal import Decimal
+
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal
 
@@ -18,32 +21,36 @@ class OrphanedBlockRewardTest(BitcoinTestFramework):
     def run_test(self):
         # Generate some blocks and obtain some coins on node 0.  We send
         # some balance to node 1, which will hold it as a single coin.
-        self.generate(self.nodes[0], 150)
-        self.nodes[0].sendtoaddress(self.nodes[1].getnewaddress(), 10)
+        initial_send = Decimal("0.01")
+        self.ensure_mature_coinbase(self.nodes[0])
+        self.nodes[0].sendtoaddress(self.nodes[1].getnewaddress(), initial_send)
         self.generate(self.nodes[0], 1)
 
         # Get a block reward with node 1 and remember the block so we can orphan
         # it later.
         self.sync_blocks()
         blk = self.generate(self.nodes[1], 1)[0]
+        block_reward = Decimal(str(self.nodes[1].getblock(blk, 2)["tx"][0]["vout"][0]["value"]))
 
         # Let the block reward mature and send coins including both
         # the existing balance and the block reward.
-        self.generate(self.nodes[0], 150)
-        assert_equal(self.nodes[1].getbalance(), 10 + 25)
+        self.generate(self.nodes[0], COINBASE_MATURITY)
+        assert_equal(self.nodes[1].getbalance(), initial_send + block_reward)
         pre_reorg_conf_bals = self.nodes[1].getbalances()
-        txid = self.nodes[1].sendtoaddress(self.nodes[0].getnewaddress(), 30)
+        send_back_amount = initial_send + block_reward - Decimal("0.001")
+        txid = self.nodes[1].sendtoaddress(self.nodes[0].getnewaddress(), send_back_amount)
         orig_chain_tip = self.nodes[0].getbestblockhash()
         self.sync_mempools()
 
         # Orphan the block reward and make sure that the original coins
         # from the wallet can still be spent.
         self.nodes[0].invalidateblock(blk)
-        blocks = self.generate(self.nodes[0], 152)
+        blocks = self.generate(self.nodes[0], COINBASE_MATURITY + 2, sync_fun=self.no_op)
+        self.sync_blocks()
         conflict_block = blocks[0]
         # We expect the descendants of orphaned rewards to no longer be considered
         assert_equal(self.nodes[1].getbalances()["mine"], {
-          "trusted": 10,
+          "trusted": initial_send,
           "untrusted_pending": 0,
           "immature": 0,
         })

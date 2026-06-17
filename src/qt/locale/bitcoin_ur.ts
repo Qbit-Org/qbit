@@ -928,7 +928,7 @@ Signing is only possible with addresses of the type 'legacy'.</source>
         <translation type="unfinished">مقفل'%1</translation>
     </message>
     <message>
-        <source>Can vary +/- %1 satoshi(s) per input.</source>
+        <source>Can vary +/- %1 bits per input.</source>
         <translation type="unfinished">مختلف ہو سکتے ہیں%1 +/- ساتوشی فی ان پٹ۔</translation>
     </message>
     <message>
@@ -2187,7 +2187,7 @@ If you are receiving this error you should request the merchant provide a BIP21 
         <translation type="unfinished">منتخب یونٹ میں بھیجی جانے والی رقم</translation>
     </message>
     <message>
-        <source>The fee will be deducted from the amount being sent. The recipient will receive less bitcoins than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
+        <source>The fee will be deducted from the amount being sent. The recipient will receive less QBT than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
         <translation type="unfinished">بھیجی جانے والی رقم سے فیس کاٹی جائے گی۔ وصول کنندہ کو اس سے کم بٹ کوائنز موصول ہوں گے جو آپ رقم کے خانے میں داخل کریں گے۔ اگر متعدد وصول کنندگان کو منتخب کیا جاتا ہے، تو فیس کو برابر تقسیم کیا جاتا ہے۔</translation>
     </message>
     <message>

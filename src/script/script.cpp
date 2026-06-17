@@ -138,7 +138,7 @@ std::string GetOpName(opcodetype opcode)
     case OP_NOP1                   : return "OP_NOP1";
     case OP_CHECKLOCKTIMEVERIFY    : return "OP_CHECKLOCKTIMEVERIFY";
     case OP_CHECKSEQUENCEVERIFY    : return "OP_CHECKSEQUENCEVERIFY";
-    case OP_NOP4                   : return "OP_NOP4";
+    case OP_CHECKSIGPQC            : return "OP_CHECKSIGPQC";
     case OP_NOP5                   : return "OP_NOP5";
     case OP_NOP6                   : return "OP_NOP6";
     case OP_NOP7                   : return "OP_NOP7";
@@ -148,6 +148,12 @@ std::string GetOpName(opcodetype opcode)
 
     // Opcode added by BIP 342 (Tapscript)
     case OP_CHECKSIGADD            : return "OP_CHECKSIGADD";
+
+    case OP_CHECKTEMPLATEVERIFY    : return "OP_CHECKTEMPLATEVERIFY";
+
+    // qbit P2MR data-signature opcodes
+    case OP_CHECKDATASIGPQC        : return "OP_CHECKDATASIGPQC";
+    case OP_CHECKDATASIGADDPQC     : return "OP_CHECKDATASIGADDPQC";
 
     case OP_INVALIDOPCODE          : return "OP_INVALIDOPCODE";
 

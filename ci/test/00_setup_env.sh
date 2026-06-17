@@ -34,8 +34,12 @@ if [ -n "${FILE_ENV}" ]; then
 fi
 
 echo "Fallback to default values in env (if not yet set)"
-# The number of parallel jobs to pass down to make and test_runner.py
-export MAKEJOBS=${MAKEJOBS:--j$(if command -v nproc > /dev/null 2>&1; then nproc; else sysctl -n hw.logicalcpu; fi)}
+# Parallelism for build stages (depends, compile, tidy, fuzz harness builds)
+export MAKEJOBS=${MAKEJOBS:--j8}
+# Parallelism for runtime test execution, decoupled from build parallelism
+export TEST_RUNNER_JOBS=${TEST_RUNNER_JOBS:-6}
+export CTEST_JOBS=${CTEST_JOBS:-$TEST_RUNNER_JOBS}
+export CMAKE_GENERATOR=${CMAKE_GENERATOR:-Ninja}
 # Whether to prefer BusyBox over GNU utilities
 export USE_BUSY_BOX=${USE_BUSY_BOX:-false}
 
@@ -46,14 +50,23 @@ export RUN_TIDY=${RUN_TIDY:-false}
 # This is needed because some ci machines have slow CPU or disk, so sanitizers
 # might be slow or a reindex might be waiting on disk IO.
 export TEST_RUNNER_TIMEOUT_FACTOR=${TEST_RUNNER_TIMEOUT_FACTOR:-40}
+export TEST_RUNNER_FAILFAST=${TEST_RUNNER_FAILFAST:-false}
+export TEST_RUNNER_EXTRA=${TEST_RUNNER_EXTRA:-}
+export TEST_RUNNER_EXCLUDE=${TEST_RUNNER_EXCLUDE:-}
+export TEST_RUNNER_COMBINED_LOGS_LEN=${TEST_RUNNER_COMBINED_LOGS_LEN:-2000}
+export TEST_RUNNER_RESULTS_FILE=${TEST_RUNNER_RESULTS_FILE:-}
 export RUN_FUZZ_TESTS=${RUN_FUZZ_TESTS:-false}
+
+# Optional runtime resource controls for the Docker container running CI.
+export CI_DOCKER_RUN_CPUS=${CI_DOCKER_RUN_CPUS:-}
+export CI_DOCKER_RUN_MEMORY=${CI_DOCKER_RUN_MEMORY:-}
 
 # Randomize test order.
 # See https://www.boost.org/doc/libs/1_71_0/libs/test/doc/html/boost_test/utf_reference/rt_param_reference/random.html
 export BOOST_TEST_RANDOM=${BOOST_TEST_RANDOM:-1}
 # See man 7 debconf
 export DEBIAN_FRONTEND=noninteractive
-export CCACHE_MAXSIZE=${CCACHE_MAXSIZE:-500M}
+export CCACHE_MAXSIZE=${CCACHE_MAXSIZE:-10G}
 export CCACHE_TEMPDIR=${CCACHE_TEMPDIR:-/tmp/.ccache-temp}
 export CCACHE_COMPRESS=${CCACHE_COMPRESS:-1}
 # The cache dir.

@@ -10,8 +10,8 @@
 //! dependencies. More complicated types should be defined in dedicated header
 //! files.
 
-#ifndef BITCOIN_NODE_TYPES_H
-#define BITCOIN_NODE_TYPES_H
+#ifndef QBIT_NODE_TYPES_H
+#define QBIT_NODE_TYPES_H
 
 #include <consensus/amount.h>
 #include <cstddef>
@@ -49,7 +49,7 @@ struct BlockCreateOptions {
     size_t coinbase_output_max_additional_sigops{400};
     /**
      * Script to put in the coinbase transaction. The default is an
-     * anyone-can-spend dummy.
+     * unspendable dummy that is valid under restricted-output mode.
      *
      * Should only be used for tests, when the default doesn't suffice.
      *
@@ -62,7 +62,7 @@ struct BlockCreateOptions {
      * The size and sigops are not checked against
      * coinbase_max_additional_weight and coinbase_output_max_additional_sigops.
      */
-    CScript coinbase_output_script{CScript() << OP_TRUE};
+    CScript coinbase_output_script{CScript() << OP_RETURN};
 };
 
 struct BlockWaitOptions {
@@ -99,4 +99,4 @@ struct BlockCheckOptions {
 };
 } // namespace node
 
-#endif // BITCOIN_NODE_TYPES_H
+#endif // QBIT_NODE_TYPES_H

@@ -12,6 +12,7 @@ import time
 
 from test_framework.blocktools import MAX_STANDARD_TX_WEIGHT
 from test_framework.mempool_util import (
+    MIN_MAX_MEMPOOL_SIZE_MB,
     create_large_orphan,
     DEFAULT_MIN_RELAY_TX_FEE,
     fill_mempool,
@@ -77,7 +78,7 @@ class PackageRelayTest(BitcoinTestFramework):
         self.setup_clean_chain = True
         self.num_nodes = 1
         self.extra_args = [[
-            "-maxmempool=5",
+            f"-maxmempool={MIN_MAX_MEMPOOL_SIZE_MB}",
         ]]
 
     def create_tx_below_mempoolminfee(self, wallet, utxo_to_spend=None):

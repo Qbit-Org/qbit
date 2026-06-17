@@ -14,6 +14,7 @@ from math import ceil
 
 from test_framework.mempool_util import (
     DEFAULT_MIN_RELAY_TX_FEE,
+    MIN_MAX_MEMPOOL_SIZE_MB,
     fill_mempool,
 )
 from test_framework.messages import (
@@ -40,7 +41,7 @@ class PackageRelayTest(BitcoinTestFramework):
         # hugely speeds up the test, as it involves multiple hops of tx relay.
         self.noban_tx_relay = True
         self.extra_args = [[
-            "-maxmempool=5",
+            f"-maxmempool={MIN_MAX_MEMPOOL_SIZE_MB}",
         ]] * self.num_nodes
 
     def raise_network_minfee(self):

@@ -3,8 +3,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_SCRIPT_SIGN_H
-#define BITCOIN_SCRIPT_SIGN_H
+#ifndef QBIT_SCRIPT_SIGN_H
+#define QBIT_SCRIPT_SIGN_H
 
 #include <attributes.h>
 #include <coins.h>
@@ -33,6 +33,10 @@ public:
     /** Create a singular (non-script) signature. */
     virtual bool CreateSig(const SigningProvider& provider, std::vector<unsigned char>& vchSig, const CKeyID& keyid, const CScript& scriptCode, SigVersion sigversion) const =0;
     virtual bool CreateSchnorrSig(const SigningProvider& provider, std::vector<unsigned char>& sig, const XOnlyPubKey& pubkey, const uint256* leaf_hash, const uint256* merkle_root, SigVersion sigversion) const =0;
+    virtual bool CreatePQCSignature(const SigningProvider& provider, std::vector<unsigned char>& sig, const CPQCPubKey& pubkey, const uint256* leaf_hash, SigVersion sigversion) const =0;
+    virtual bool CanCreatePQCSignature(const SigningProvider& provider, const CPQCPubKey& pubkey) const =0;
+    virtual bool VerifyP2MRScriptSignature(std::span<const unsigned char> sig, const CPQCPubKey& pubkey, const uint256& leaf_hash, SigVersion sigversion) const { return true; }
+    virtual size_t P2MRSignatureSize() const =0;
 };
 
 /** A signature creator for transactions. */
@@ -51,6 +55,10 @@ public:
     const BaseSignatureChecker& Checker() const override { return checker; }
     bool CreateSig(const SigningProvider& provider, std::vector<unsigned char>& vchSig, const CKeyID& keyid, const CScript& scriptCode, SigVersion sigversion) const override;
     bool CreateSchnorrSig(const SigningProvider& provider, std::vector<unsigned char>& sig, const XOnlyPubKey& pubkey, const uint256* leaf_hash, const uint256* merkle_root, SigVersion sigversion) const override;
+    bool CreatePQCSignature(const SigningProvider& provider, std::vector<unsigned char>& sig, const CPQCPubKey& pubkey, const uint256* leaf_hash, SigVersion sigversion) const override;
+    bool CanCreatePQCSignature(const SigningProvider& provider, const CPQCPubKey& pubkey) const override;
+    bool VerifyP2MRScriptSignature(std::span<const unsigned char> sig, const CPQCPubKey& pubkey, const uint256& leaf_hash, SigVersion sigversion) const override;
+    size_t P2MRSignatureSize() const override;
 };
 
 /** A signature checker that accepts all signatures */
@@ -61,6 +69,19 @@ extern const BaseSignatureCreator& DUMMY_SIGNATURE_CREATOR;
 extern const BaseSignatureCreator& DUMMY_MAXIMUM_SIGNATURE_CREATOR;
 
 typedef std::pair<CPubKey, std::vector<unsigned char>> SigPair;
+
+inline bool GetP2MRSignatureHashType(std::span<const unsigned char> sig, uint8_t& hashtype)
+{
+    if (sig.size() != PQC_SIG_SIZE && sig.size() != PQC_SIG_SIZE + 1) {
+        return false;
+    }
+    if (sig.size() == PQC_SIG_SIZE) {
+        hashtype = SIGHASH_DEFAULT;
+        return true;
+    }
+    hashtype = sig.back();
+    return hashtype != SIGHASH_DEFAULT;
+}
 
 // This struct contains information from a transaction input and also contains signatures for that input.
 // The information contained here can be used to create a signature and is also filled by ProduceSignature
@@ -74,14 +95,19 @@ struct SignatureData {
     CScriptWitness scriptWitness; ///< The scriptWitness of an input. Contains complete signatures or the traditional partial signatures format. scriptWitness is part of a transaction input per BIP 144.
     TaprootSpendData tr_spenddata; ///< Taproot spending data.
     std::optional<TaprootBuilder> tr_builder; ///< Taproot tree used to build tr_spenddata.
+    P2MRSpendData p2mr_spenddata; ///< P2MR spending data.
+    std::optional<TaprootBuilder> p2mr_builder; ///< P2MR tree used to build p2mr_spenddata.
     std::map<CKeyID, SigPair> signatures; ///< BIP 174 style partial signatures for the input. May contain all signatures necessary for producing a final scriptSig or scriptWitness.
     std::map<CKeyID, std::pair<CPubKey, KeyOriginInfo>> misc_pubkeys;
     std::vector<unsigned char> taproot_key_path_sig; /// Schnorr signature for key path spending
     std::map<std::pair<XOnlyPubKey, uint256>, std::vector<unsigned char>> taproot_script_sigs; ///< (Partial) schnorr signatures, indexed by XOnlyPubKey and leaf_hash.
+    std::map<std::pair<CPQCPubKey, uint256>, std::vector<unsigned char>> p2mr_script_sigs; ///< (Partial) PQC signatures, indexed by CPQCPubKey and leaf_hash.
     std::map<XOnlyPubKey, std::pair<std::set<uint256>, KeyOriginInfo>> taproot_misc_pubkeys; ///< Miscellaneous Taproot pubkeys involved in this input along with their leaf script hashes and key origin data. Also includes the Taproot internal key (may have no leaf script hashes).
     std::map<CKeyID, XOnlyPubKey> tap_pubkeys; ///< Misc Taproot pubkeys involved in this input, by hash. (Equivalent of misc_pubkeys but for Taproot.)
     std::vector<CKeyID> missing_pubkeys; ///< KeyIDs of pubkeys which could not be found
     std::vector<CKeyID> missing_sigs; ///< KeyIDs of pubkeys for signatures which could not be found
+    std::vector<CPQCPubKey> missing_p2mr_sigs; ///< P2MR pubkeys whose signatures are missing
+    std::vector<CPQCPubKey> invalid_p2mr_sigs; ///< P2MR pubkeys whose cached signatures fail verification
     uint160 missing_redeem_script; ///< ScriptID of the missing redeemScript (if any)
     uint256 missing_witness_script; ///< SHA256 of the missing witnessScript (if any)
     std::map<std::vector<uint8_t>, std::vector<uint8_t>> sha256_preimages; ///< Mapping from a SHA256 hash to its preimage provided to solve a Script
@@ -107,4 +133,4 @@ bool IsSegWitOutput(const SigningProvider& provider, const CScript& script);
 /** Sign the CMutableTransaction */
 bool SignTransaction(CMutableTransaction& mtx, const SigningProvider* provider, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors);
 
-#endif // BITCOIN_SCRIPT_SIGN_H
+#endif // QBIT_SCRIPT_SIGN_H

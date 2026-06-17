@@ -68,14 +68,14 @@ which ignores networks present in the second but not the first.
 `diff_addrs` is intended to provide changes between two ASmaps and
 a node's known peers.
 The command takes two ASmap files, and a file of IP addresses as output by
-the `bitcoin-cli getnodeaddresses` command.
+the `qbit-cli getnodeaddresses` command.
 It returns the changes between the two ASmaps for the peer IPs provided in
 the `getnodeaddresses` output.
 The resulting file is in the same format as the `diff` command shown above.
 
 You can output address data to a file:
 ```
-bitcoin-cli getnodeaddresses 0 > addrs.json
+qbit-cli getnodeaddresses 0 > addrs.json
 ```
 and pass in the address file as the third argument:
 ```

@@ -2,10 +2,10 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#include <addresstype.h>
 #include <chainparams.h>
 #include <index/txindex.h>
 #include <interfaces/chain.h>
+#include <test/util/script.h>
 #include <test/util/setup_common.h>
 #include <validation.h>
 
@@ -48,9 +48,8 @@ BOOST_FIXTURE_TEST_CASE(txindex_initial_sync, TestChain100Setup)
 
     // Check that new transactions in new blocks make it into the index.
     for (int i = 0; i < 10; i++) {
-        CScript coinbase_script_pub_key = GetScriptForDestination(PKHash(coinbaseKey.GetPubKey()));
         std::vector<CMutableTransaction> no_txns;
-        const CBlock& block = CreateAndProcessBlock(no_txns, coinbase_script_pub_key);
+        const CBlock& block = CreateAndProcessBlock(no_txns, P2MROpTrueScript());
         const CTransaction& txn = *block.vtx[0];
 
         BOOST_CHECK(txindex.BlockUntilSyncedToCurrentChain());

@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_CRYPTO_SHA256_H
-#define BITCOIN_CRYPTO_SHA256_H
+#ifndef QBIT_CRYPTO_SHA256_H
+#define QBIT_CRYPTO_SHA256_H
 
 #include <cstdint>
 #include <cstdlib>
@@ -50,4 +50,4 @@ std::string SHA256AutoDetect(sha256_implementation::UseImplementation use_implem
  */
 void SHA256D64(unsigned char* output, const unsigned char* input, size_t blocks);
 
-#endif // BITCOIN_CRYPTO_SHA256_H
+#endif // QBIT_CRYPTO_SHA256_H

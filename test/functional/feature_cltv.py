@@ -8,6 +8,7 @@ Test that the CHECKLOCKTIMEVERIFY soft-fork activates.
 """
 
 from test_framework.blocktools import (
+    COINBASE_MATURITY,
     TIME_GENESIS_BLOCK,
     create_block,
     create_coinbase,
@@ -76,7 +77,7 @@ def cltv_validate(tx, height):
     cltv_modify_tx(tx, prepend_scriptsig=scheme[0], nsequence=scheme[1], nlocktime=scheme[2])
 
 
-CLTV_HEIGHT = 111
+CLTV_HEIGHT = COINBASE_MATURITY + 11
 
 
 class BIP65Test(BitcoinTestFramework):
@@ -115,7 +116,7 @@ class BIP65Test(BitcoinTestFramework):
         # create one invalid tx per CLTV failure reason (5 in total) and collect them
         invalid_cltv_txs = []
         for i in range(5):
-            spendtx = wallet.create_self_transfer()['tx']
+            spendtx = wallet.create_self_transfer(target_vsize=133)['tx']
             cltv_invalidate(spendtx, i)
             invalid_cltv_txs.append(spendtx)
 
@@ -146,7 +147,7 @@ class BIP65Test(BitcoinTestFramework):
 
         # create and test one invalid tx per CLTV failure reason (5 in total)
         for i in range(5):
-            spendtx = wallet.create_self_transfer()['tx']
+            spendtx = wallet.create_self_transfer(target_vsize=133)['tx']
             assert_equal(len(spendtx.vin), 1)
             coin = spendtx.vin[0]
             coin_txid = format(coin.prevout.hash, '064x')

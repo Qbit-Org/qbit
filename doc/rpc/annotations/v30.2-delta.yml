@@ -1,0 +1,37 @@
+{
+  "schema_version": "1",
+  "baseline": "v30.2",
+  "methods": {
+    "getconfirmationtarget": {
+      "status_override": "new_since_v30_2",
+      "delta_summary": "Adds the qbit confirmation-target estimator RPC.",
+      "delta_notes": [
+        "This method does not exist in Bitcoin Core v30.2."
+      ]
+    },
+    "getblocktemplate": {
+      "status_override": "semantic_changed_since_v30_2",
+      "delta_summary": "Cadence, AuxPoW, and qbit version-rolling semantics diverge from upstream behavior.",
+      "delta_notes": [
+        "Structural diffs may be smaller than the behavioral delta.",
+        "qbit permissionless templates include versionrollingmask for BIP310 Stratum pool integration; zero disables rolling for non-BIP9 or AuxPoW template versions."
+      ]
+    },
+    "getnetworkhashps": {
+      "status_override": "semantic_changed_since_v30_2",
+      "delta_summary": "Adds lane-aware qbit hashrate estimates for all, permissionless, and AuxPoW work.",
+      "delta_notes": [
+        "The result is an effective chainwork hashrate estimate in H/s.",
+        "Lane-specific estimates filter which blocks contribute work while using the same active-chain elapsed-time window as the all-lane estimate; they do not use a lane-local timestamp window."
+      ]
+    },
+    "getmininginfo": {
+      "status_override": "semantic_changed_since_v30_2",
+      "delta_summary": "networkhashps is the default total qbit chainwork hashrate estimate, and next is the permissionless/native candidate.",
+      "delta_notes": [
+        "networkhashps is equivalent to getnetworkhashps with lane=\"all\".",
+        "next is the next permissionless/native Cadence candidate. AuxPoW candidate bits and target are returned by createauxblock."
+      ]
+    }
+  }
+}

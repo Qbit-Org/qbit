@@ -3,8 +3,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_SCRIPT_INTERPRETER_H
-#define BITCOIN_SCRIPT_INTERPRETER_H
+#ifndef QBIT_SCRIPT_INTERPRETER_H
+#define QBIT_SCRIPT_INTERPRETER_H
 
 #include <consensus/amount.h>
 #include <hash.h>
@@ -18,6 +18,7 @@
 #include <optional>
 #include <vector>
 
+class CPQCPubKey;
 class CPubKey;
 class CScript;
 class CScriptNum;
@@ -143,6 +144,9 @@ enum : uint32_t {
     // Making unknown public key versions (in BIP 342 scripts) non-standard
     SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE = (1U << 20),
 
+    // P2MR/SegWit v2 validation (BIP-360)
+    SCRIPT_VERIFY_P2MR_RULES = (1U << 21),
+
     // Constants to point to the highest flag in use. Add new flags above this line.
     //
     SCRIPT_VERIFY_END_MARKER
@@ -161,6 +165,11 @@ struct PrecomputedTransactionData
     uint256 m_spent_scripts_single_hash;
     //! Whether the 5 fields above are initialized.
     bool m_bip341_taproot_ready = false;
+
+    // BIP119-style OP_CHECKTEMPLATEVERIFY precomputed data.
+    uint256 m_ctv_script_sigs_single_hash;
+    bool m_ctv_has_nonempty_script_sigs = false;
+    bool m_ctv_ready = false;
 
     // BIP143 precomputed data (double-SHA256).
     uint256 hashPrevouts, hashSequence, hashOutputs;
@@ -193,6 +202,7 @@ enum class SigVersion
     WITNESS_V0 = 1,  //!< Witness v0 (P2WPKH and P2WSH); see BIP 141
     TAPROOT = 2,     //!< Witness v1 with 32-byte program, not BIP16 P2SH-wrapped, key path spending; see BIP 341
     TAPSCRIPT = 3,   //!< Witness v1 with 32-byte program, not BIP16 P2SH-wrapped, script path spending, leaf version 0xc0; see BIP 342
+    P2MR = 4,        //!< Witness v2 with 32-byte program, not BIP16 P2SH-wrapped, script path spending; see BIP-360
 };
 
 struct ScriptExecutionData
@@ -235,9 +245,20 @@ static constexpr size_t TAPROOT_CONTROL_NODE_SIZE = 32;
 static constexpr size_t TAPROOT_CONTROL_MAX_NODE_COUNT = 128;
 static constexpr size_t TAPROOT_CONTROL_MAX_SIZE = TAPROOT_CONTROL_BASE_SIZE + TAPROOT_CONTROL_NODE_SIZE * TAPROOT_CONTROL_MAX_NODE_COUNT;
 
+/** P2MR (BIP-360) constants */
+static constexpr size_t WITNESS_V2_P2MR_SIZE = 32;
+static constexpr size_t P2MR_CONTROL_BASE_SIZE = 1;  //!< Control byte only (no internal key)
+static constexpr size_t P2MR_CONTROL_NODE_SIZE = 32;
+static constexpr size_t P2MR_CONTROL_MAX_NODE_COUNT = 128;
+static constexpr size_t P2MR_CONTROL_MAX_SIZE = P2MR_CONTROL_BASE_SIZE + P2MR_CONTROL_NODE_SIZE * P2MR_CONTROL_MAX_NODE_COUNT;
+
 extern const HashWriter HASHER_TAPSIGHASH; //!< Hasher with tag "TapSighash" pre-fed to it.
+extern const HashWriter HASHER_P2MR_SIGHASH; //!< Hasher with tag "P2MRSighash" pre-fed to it.
 extern const HashWriter HASHER_TAPLEAF;    //!< Hasher with tag "TapLeaf" pre-fed to it.
 extern const HashWriter HASHER_TAPBRANCH;  //!< Hasher with tag "TapBranch" pre-fed to it.
+extern const HashWriter HASHER_P2MR_LEAF;  //!< Hasher with tag "P2MRLeaf" pre-fed to it.
+extern const HashWriter HASHER_P2MR_BRANCH; //!< Hasher with tag "P2MRBranch" pre-fed to it.
+extern const HashWriter HASHER_QBIT_DATA_SIG_PQC; //!< Hasher with tag "QbitDataSigPQC" pre-fed to it.
 
 /** Data structure to cache SHA256 midstates for the ECDSA sighash calculations
  *  (bare, P2SH, P2WPKH, P2WSH). */
@@ -261,6 +282,9 @@ public:
 template <class T>
 uint256 SignatureHash(const CScript& scriptCode, const T& txTo, unsigned int nIn, int32_t nHashType, const CAmount& amount, SigVersion sigversion, const PrecomputedTransactionData* cache = nullptr, SigHashCache* sighash_cache = nullptr);
 
+template <class T>
+uint256 GetDefaultCheckTemplateVerifyHash(const T& tx_to, uint32_t input_index, const PrecomputedTransactionData& cache);
+
 class BaseSignatureChecker
 {
 public:
@@ -270,6 +294,16 @@ public:
     }
 
     virtual bool CheckSchnorrSignature(std::span<const unsigned char> sig, std::span<const unsigned char> pubkey, SigVersion sigversion, ScriptExecutionData& execdata, ScriptError* serror = nullptr) const
+    {
+        return false;
+    }
+
+    virtual bool CheckPQCSignature(std::span<const unsigned char> sig, std::span<const unsigned char> pubkey, SigVersion sigversion, ScriptExecutionData& execdata, ScriptError* serror = nullptr) const
+    {
+        return false;
+    }
+
+    virtual bool CheckTemplateVerifyHash(std::span<const unsigned char> expected, ScriptError* serror = nullptr) const
     {
         return false;
     }
@@ -298,6 +332,8 @@ enum class MissingDataBehavior
 
 template<typename T>
 bool SignatureHashSchnorr(uint256& hash_out, ScriptExecutionData& execdata, const T& tx_to, uint32_t in_pos, uint8_t hash_type, SigVersion sigversion, const PrecomputedTransactionData& cache, MissingDataBehavior mdb);
+template<typename T>
+bool SignatureHashP2MR(uint256& hash_out, ScriptExecutionData& execdata, const T& tx_to, uint32_t in_pos, uint8_t hash_type, const PrecomputedTransactionData& cache, MissingDataBehavior mdb);
 
 template <class T>
 class GenericTransactionSignatureChecker : public BaseSignatureChecker
@@ -313,12 +349,15 @@ private:
 protected:
     virtual bool VerifyECDSASignature(const std::vector<unsigned char>& vchSig, const CPubKey& vchPubKey, const uint256& sighash) const;
     virtual bool VerifySchnorrSignature(std::span<const unsigned char> sig, const XOnlyPubKey& pubkey, const uint256& sighash) const;
+    virtual bool VerifyPQCSignature(std::span<const unsigned char> sig, const CPQCPubKey& pubkey, const uint256& sighash) const;
 
 public:
     GenericTransactionSignatureChecker(const T* txToIn, unsigned int nInIn, const CAmount& amountIn, MissingDataBehavior mdb) : txTo(txToIn), m_mdb(mdb), nIn(nInIn), amount(amountIn), txdata(nullptr) {}
     GenericTransactionSignatureChecker(const T* txToIn, unsigned int nInIn, const CAmount& amountIn, const PrecomputedTransactionData& txdataIn, MissingDataBehavior mdb) : txTo(txToIn), m_mdb(mdb), nIn(nInIn), amount(amountIn), txdata(&txdataIn) {}
     bool CheckECDSASignature(const std::vector<unsigned char>& scriptSig, const std::vector<unsigned char>& vchPubKey, const CScript& scriptCode, SigVersion sigversion) const override;
     bool CheckSchnorrSignature(std::span<const unsigned char> sig, std::span<const unsigned char> pubkey, SigVersion sigversion, ScriptExecutionData& execdata, ScriptError* serror = nullptr) const override;
+    bool CheckPQCSignature(std::span<const unsigned char> sig, std::span<const unsigned char> pubkey, SigVersion sigversion, ScriptExecutionData& execdata, ScriptError* serror = nullptr) const override;
+    bool CheckTemplateVerifyHash(std::span<const unsigned char> expected, ScriptError* serror = nullptr) const override;
     bool CheckLockTime(const CScriptNum& nLockTime) const override;
     bool CheckSequence(const CScriptNum& nSequence) const override;
 };
@@ -344,6 +383,16 @@ public:
         return m_checker.CheckSchnorrSignature(sig, pubkey, sigversion, execdata, serror);
     }
 
+    bool CheckPQCSignature(std::span<const unsigned char> sig, std::span<const unsigned char> pubkey, SigVersion sigversion, ScriptExecutionData& execdata, ScriptError* serror = nullptr) const override
+    {
+        return m_checker.CheckPQCSignature(sig, pubkey, sigversion, execdata, serror);
+    }
+
+    bool CheckTemplateVerifyHash(std::span<const unsigned char> expected, ScriptError* serror = nullptr) const override
+    {
+        return m_checker.CheckTemplateVerifyHash(expected, serror);
+    }
+
     bool CheckLockTime(const CScriptNum& nLockTime) const override
     {
         return m_checker.CheckLockTime(nLockTime);
@@ -359,9 +408,19 @@ uint256 ComputeTapleafHash(uint8_t leaf_version, std::span<const unsigned char> 
 /** Compute the BIP341 tapbranch hash from two branches.
   * Spans must be 32 bytes each. */
 uint256 ComputeTapbranchHash(std::span<const unsigned char> a, std::span<const unsigned char> b);
+/** Compute the P2MR leaf hash from leaf version & script. */
+uint256 ComputeP2MRLeafHash(uint8_t leaf_version, std::span<const unsigned char> script);
+/** Compute the P2MR PQC data-signature hash from a 32-byte message hash. */
+uint256 ComputeQbitDataSigPQCHash(std::span<const unsigned char> msg_hash);
+/** Compute the P2MR branch hash from two branches.
+  * Spans must be 32 bytes each. */
+uint256 ComputeP2MRBranchHash(std::span<const unsigned char> a, std::span<const unsigned char> b);
 /** Compute the BIP341 taproot script tree Merkle root from control block and leaf hash.
  *  Requires control block to have valid length (33 + k*32, with k in {0,1,..,128}). */
 uint256 ComputeTaprootMerkleRoot(std::span<const unsigned char> control, const uint256& tapleaf_hash);
+/** Compute the BIP-360 P2MR script tree Merkle root from control block and leaf hash.
+ *  Requires control block to have valid length (1 + k*32, with k in {0,1,..,128}). */
+uint256 ComputeP2MRMerkleRoot(std::span<const unsigned char> control, const uint256& tapleaf_hash);
 
 bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& script, unsigned int flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptExecutionData& execdata, ScriptError* error = nullptr);
 bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& script, unsigned int flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptError* error = nullptr);
@@ -371,4 +430,4 @@ size_t CountWitnessSigOps(const CScript& scriptSig, const CScript& scriptPubKey,
 
 int FindAndDelete(CScript& script, const CScript& b);
 
-#endif // BITCOIN_SCRIPT_INTERPRETER_H
+#endif // QBIT_SCRIPT_INTERPRETER_H

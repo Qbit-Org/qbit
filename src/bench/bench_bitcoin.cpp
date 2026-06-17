@@ -30,6 +30,7 @@ static void SetupBenchArgs(ArgsManager& argsman)
     SetupHelpOptions(argsman);
     SetupCommonTestArgs(argsman);
 
+    argsman.AddArg("-p2mronly", "Run benchmark test setups using restricted regtest outputs (default: 1). Use -p2mronly=0 for legacy-output compatibility benchmarks.", ArgsManager::ALLOW_ANY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-asymptote=<n1,n2,n3,...>", "Test asymptotic growth of the runtime of an algorithm, if supported by the benchmark", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-filter=<regex>", strprintf("Regular expression filter to select benchmark by name (default: %s)", DEFAULT_BENCH_FILTER), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-list", "List benchmarks without executing them", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
@@ -66,7 +67,7 @@ static std::vector<std::string> parseTestSetupArgs(const ArgsManager& argsman)
 {
     // Parses unit test framework arguments supported by the benchmark framework.
     std::vector<std::string> args;
-    static std::vector<std::string> AVAILABLE_ARGS = {"-testdatadir"};
+    static std::vector<std::string> AVAILABLE_ARGS = {"-testdatadir", "-p2mronly"};
     for (const std::string& arg_name : AVAILABLE_ARGS) {
         auto op_arg = argsman.GetArg(arg_name);
         if (op_arg) args.emplace_back(strprintf("%s=%s", arg_name, *op_arg));
@@ -86,12 +87,12 @@ int main(int argc, char** argv)
     }
 
     if (HelpRequested(argsman)) {
-        std::cout << "Usage:  bench_bitcoin [options]\n"
+        std::cout << "Usage:  bench_qbit [options]\n"
                      "\n"
                   << argsman.GetHelpMessage()
                   << "Description:\n"
                      "\n"
-                     "  bench_bitcoin executes microbenchmarks. The quality of the benchmark results\n"
+                     "  bench_qbit executes microbenchmarks. The quality of the benchmark results\n"
                      "  highly depend on the stability of the machine. It can sometimes be difficult\n"
                      "  to get stable, repeatable results, so here are a few tips:\n"
                      "\n"
@@ -105,7 +106,7 @@ int main(int argc, char** argv)
                      "  * If results are still not reliable, increase runtime with e.g.\n"
                      "    -min-time=5000 to let a benchmark run for at least 5 seconds.\n"
                      "\n"
-                     "  * bench_bitcoin uses nanobench [3] for which there is extensive\n"
+                     "  * bench_qbit uses nanobench [3] for which there is extensive\n"
                      "    documentation available online.\n"
                      "\n"
                      "Environment Variables:\n"
@@ -113,12 +114,12 @@ int main(int argc, char** argv)
                      "  To attach a profiler you can run a benchmark in endless mode. This can be\n"
                      "  done with the environment variable NANOBENCH_ENDLESS. E.g. like so:\n"
                      "\n"
-                     "    NANOBENCH_ENDLESS=MuHash ./bench_bitcoin -filter=MuHash\n"
+                     "    NANOBENCH_ENDLESS=MuHash ./bench_qbit -filter=MuHash\n"
                      "\n"
                      "  In rare cases it can be useful to suppress stability warnings. This can be\n"
                      "  done with the environment variable NANOBENCH_SUPPRESS_WARNINGS, e.g:\n"
                      "\n"
-                     "    NANOBENCH_SUPPRESS_WARNINGS=1 ./bench_bitcoin\n"
+                     "    NANOBENCH_SUPPRESS_WARNINGS=1 ./bench_qbit\n"
                      "\n"
                      "Notes:\n"
                      "\n"

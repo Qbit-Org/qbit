@@ -91,7 +91,16 @@ bool PartiallySignedTransaction::GetInputUTXO(CTxOut& utxo, int input_index) con
 
 bool PSBTInput::IsNull() const
 {
-    return !non_witness_utxo && witness_utxo.IsNull() && partial_sigs.empty() && unknown.empty() && hd_keypaths.empty() && redeem_script.empty() && witness_script.empty();
+    return !non_witness_utxo &&
+           witness_utxo.IsNull() &&
+           partial_sigs.empty() &&
+           unknown.empty() &&
+           hd_keypaths.empty() &&
+           redeem_script.empty() &&
+           witness_script.empty() &&
+           m_qbit_p2mr_script_sigs.empty() &&
+           m_qbit_p2mr_scripts.empty() &&
+           m_qbit_p2mr_merkle_root.IsNull();
 }
 
 void PSBTInput::FillSignatureData(SignatureData& sigdata) const
@@ -124,6 +133,9 @@ void PSBTInput::FillSignatureData(SignatureData& sigdata) const
     for (const auto& [pubkey_leaf, sig] : m_tap_script_sigs) {
         sigdata.taproot_script_sigs.emplace(pubkey_leaf, sig);
     }
+    for (const auto& [pubkey_leaf, sig] : m_qbit_p2mr_script_sigs) {
+        sigdata.p2mr_script_sigs.emplace(pubkey_leaf, sig);
+    }
     if (!m_tap_internal_key.IsNull()) {
         sigdata.tr_spenddata.internal_key = m_tap_internal_key;
     }
@@ -133,9 +145,19 @@ void PSBTInput::FillSignatureData(SignatureData& sigdata) const
     for (const auto& [leaf_script, control_block] : m_tap_scripts) {
         sigdata.tr_spenddata.scripts.emplace(leaf_script, control_block);
     }
+    for (const auto& [leaf_script, control_block] : m_qbit_p2mr_scripts) {
+        sigdata.p2mr_spenddata.scripts.emplace(leaf_script, control_block);
+    }
     for (const auto& [pubkey, leaf_origin] : m_tap_bip32_paths) {
         sigdata.taproot_misc_pubkeys.emplace(pubkey, leaf_origin);
         sigdata.tap_pubkeys.emplace(Hash160(pubkey), pubkey);
+    }
+    if (!m_qbit_p2mr_merkle_root.IsNull()) {
+        sigdata.p2mr_spenddata.merkle_root = m_qbit_p2mr_merkle_root;
+    }
+    for (const auto& [leaf_script, control_blocks] : m_qbit_p2mr_scripts) {
+        auto& scripts = sigdata.p2mr_spenddata.scripts[leaf_script];
+        scripts.insert(control_blocks.begin(), control_blocks.end());
     }
     for (const auto& [hash, preimage] : ripemd160_preimages) {
         sigdata.ripemd160_preimages.emplace(std::vector<unsigned char>(hash.begin(), hash.end()), preimage);
@@ -184,6 +206,9 @@ void PSBTInput::FromSignatureData(const SignatureData& sigdata)
     for (const auto& [pubkey_leaf, sig] : sigdata.taproot_script_sigs) {
         m_tap_script_sigs.emplace(pubkey_leaf, sig);
     }
+    for (const auto& [pubkey_leaf, sig] : sigdata.p2mr_script_sigs) {
+        m_qbit_p2mr_script_sigs.emplace(pubkey_leaf, sig);
+    }
     if (!sigdata.tr_spenddata.internal_key.IsNull()) {
         m_tap_internal_key = sigdata.tr_spenddata.internal_key;
     }
@@ -193,8 +218,23 @@ void PSBTInput::FromSignatureData(const SignatureData& sigdata)
     for (const auto& [leaf_script, control_block] : sigdata.tr_spenddata.scripts) {
         m_tap_scripts.emplace(leaf_script, control_block);
     }
+    for (const auto& [leaf_script, control_block] : sigdata.p2mr_spenddata.scripts) {
+        m_qbit_p2mr_scripts.emplace(leaf_script, control_block);
+    }
     for (const auto& [pubkey, leaf_origin] : sigdata.taproot_misc_pubkeys) {
         m_tap_bip32_paths.emplace(pubkey, leaf_origin);
+    }
+
+    P2MRSpendData spenddata = sigdata.p2mr_spenddata;
+    if (sigdata.p2mr_builder.has_value()) {
+        spenddata.Merge(sigdata.p2mr_builder->GetP2MRSpendData());
+    }
+    if (m_qbit_p2mr_merkle_root.IsNull() && !spenddata.merkle_root.IsNull()) {
+        m_qbit_p2mr_merkle_root = spenddata.merkle_root;
+    }
+    for (const auto& [leaf_script, control_blocks] : spenddata.scripts) {
+        auto& scripts = m_qbit_p2mr_scripts[leaf_script];
+        scripts.insert(control_blocks.begin(), control_blocks.end());
     }
 }
 
@@ -215,6 +255,11 @@ void PSBTInput::Merge(const PSBTInput& input)
     m_tap_script_sigs.insert(input.m_tap_script_sigs.begin(), input.m_tap_script_sigs.end());
     m_tap_scripts.insert(input.m_tap_scripts.begin(), input.m_tap_scripts.end());
     m_tap_bip32_paths.insert(input.m_tap_bip32_paths.begin(), input.m_tap_bip32_paths.end());
+    m_qbit_p2mr_script_sigs.insert(input.m_qbit_p2mr_script_sigs.begin(), input.m_qbit_p2mr_script_sigs.end());
+    for (const auto& [leaf_script, control_blocks] : input.m_qbit_p2mr_scripts) {
+        auto& scripts = m_qbit_p2mr_scripts[leaf_script];
+        scripts.insert(control_blocks.begin(), control_blocks.end());
+    }
 
     if (redeem_script.empty() && !input.redeem_script.empty()) redeem_script = input.redeem_script;
     if (witness_script.empty() && !input.witness_script.empty()) witness_script = input.witness_script;
@@ -223,6 +268,7 @@ void PSBTInput::Merge(const PSBTInput& input)
     if (m_tap_key_sig.empty() && !input.m_tap_key_sig.empty()) m_tap_key_sig = input.m_tap_key_sig;
     if (m_tap_internal_key.IsNull() && !input.m_tap_internal_key.IsNull()) m_tap_internal_key = input.m_tap_internal_key;
     if (m_tap_merkle_root.IsNull() && !input.m_tap_merkle_root.IsNull()) m_tap_merkle_root = input.m_tap_merkle_root;
+    if (m_qbit_p2mr_merkle_root.IsNull() && !input.m_qbit_p2mr_merkle_root.IsNull()) m_qbit_p2mr_merkle_root = input.m_qbit_p2mr_merkle_root;
 }
 
 void PSBTOutput::FillSignatureData(SignatureData& sigdata) const
@@ -413,22 +459,35 @@ PSBTError SignPSBTInput(const SigningProvider& provider, PartiallySignedTransact
         return PSBTError::MISSING_INPUTS;
     }
 
+    int witness_version{-1};
+    std::vector<unsigned char> witness_program;
+    const bool is_p2mr = utxo.scriptPubKey.IsWitnessProgram(witness_version, witness_program) &&
+                         witness_version == 2 &&
+                         witness_program.size() == WITNESS_V2_P2MR_SIZE;
+    if (is_p2mr) {
+        const WitnessV2P2MR output{uint256{std::span<const unsigned char>{witness_program}}};
+        input.m_qbit_p2mr_merkle_root = output.GetMerkleRoot();
+        sigdata.p2mr_spenddata.merkle_root = output.GetMerkleRoot();
+    }
+    const bool default_sighash_input = utxo.scriptPubKey.IsPayToTaproot() || is_p2mr;
+
     // Get the sighash type
     // If both the field and the parameter are provided, they must match
     // If only the parameter is provided, use it and add it to the PSBT if it is other than SIGHASH_DEFAULT
-    // for all input types, and not SIGHASH_ALL for non-taproot input types.
-    // If neither are provided, use SIGHASH_DEFAULT if it is taproot, and SIGHASH_ALL for everything else.
-    if (!sighash) sighash = utxo.scriptPubKey.IsPayToTaproot() ? SIGHASH_DEFAULT : SIGHASH_ALL;
+    // for all input types, and not SIGHASH_ALL for inputs that default to SIGHASH_DEFAULT.
+    // If neither are provided, use SIGHASH_DEFAULT for Taproot and P2MR, and SIGHASH_ALL for everything else.
+    if (!sighash) sighash = default_sighash_input ? SIGHASH_DEFAULT : SIGHASH_ALL;
     Assert(sighash.has_value());
     // For user safety, the desired sighash must be provided if the PSBT wants something other than the default set in the previous line.
     if (input.sighash_type && input.sighash_type != sighash) {
         return PSBTError::SIGHASH_MISMATCH;
     }
     // Set the PSBT sighash field when sighash is not DEFAULT or ALL
-    // DEFAULT is allowed for non-taproot inputs since DEFAULT may be passed for them (e.g. the psbt being signed also has taproot inputs)
-    // Note that signing already aliases DEFAULT to ALL for non-taproot inputs.
-    if (utxo.scriptPubKey.IsPayToTaproot() ? sighash != SIGHASH_DEFAULT :
-                                            (sighash != SIGHASH_DEFAULT && sighash != SIGHASH_ALL)) {
+    // DEFAULT is allowed for non-taproot inputs since DEFAULT may be passed for them
+    // (e.g. the psbt being signed also has Taproot or P2MR inputs).
+    // Legacy and segwit v0 signing alias DEFAULT to ALL; P2MR keeps DEFAULT semantics.
+    if (default_sighash_input ? sighash != SIGHASH_DEFAULT :
+                                (sighash != SIGHASH_DEFAULT && sighash != SIGHASH_ALL)) {
         input.sighash_type = sighash;
     }
 
@@ -440,6 +499,12 @@ PSBTError SignPSBTInput(const SigningProvider& provider, PartiallySignedTransact
         for (const auto& [_, sig] : input.m_tap_script_sigs) {
             if (sig.size() != 64) return PSBTError::SIGHASH_MISMATCH;
         }
+        for (const auto& [_, sig] : input.m_qbit_p2mr_script_sigs) {
+            uint8_t p2mr_hashtype;
+            if (!GetP2MRSignatureHashType(sig, p2mr_hashtype) || p2mr_hashtype != SIGHASH_DEFAULT) {
+                return PSBTError::SIGHASH_MISMATCH;
+            }
+        }
     } else {
         if (!input.m_tap_key_sig.empty() && (input.m_tap_key_sig.size() != 65 || input.m_tap_key_sig.back() != *sighash)) {
             return PSBTError::SIGHASH_MISMATCH;
@@ -449,6 +514,12 @@ PSBTError SignPSBTInput(const SigningProvider& provider, PartiallySignedTransact
         }
         for (const auto& [_, sig] : input.partial_sigs) {
             if (sig.second.back() != *sighash) return PSBTError::SIGHASH_MISMATCH;
+        }
+        for (const auto& [_, sig] : input.m_qbit_p2mr_script_sigs) {
+            uint8_t p2mr_hashtype;
+            if (!GetP2MRSignatureHashType(sig, p2mr_hashtype) || p2mr_hashtype != *sighash) {
+                return PSBTError::SIGHASH_MISMATCH;
+            }
         }
     }
 
@@ -460,6 +531,8 @@ PSBTError SignPSBTInput(const SigningProvider& provider, PartiallySignedTransact
         MutableTransactionSignatureCreator creator(tx, index, utxo.nValue, txdata, *sighash);
         sig_complete = ProduceSignature(provider, creator, utxo.scriptPubKey, sigdata);
     }
+    if (!sigdata.invalid_p2mr_sigs.empty()) return PSBTError::INVALID_P2MR_SIGNATURE;
+
     // Verify that a witness signature was produced in case one was required.
     if (require_witness_sig && !sigdata.witness) return PSBTError::INCOMPLETE;
 
@@ -480,6 +553,8 @@ PSBTError SignPSBTInput(const SigningProvider& provider, PartiallySignedTransact
     if (out_sigdata) {
         out_sigdata->missing_pubkeys = sigdata.missing_pubkeys;
         out_sigdata->missing_sigs = sigdata.missing_sigs;
+        out_sigdata->missing_p2mr_sigs = sigdata.missing_p2mr_sigs;
+        out_sigdata->invalid_p2mr_sigs = sigdata.invalid_p2mr_sigs;
         out_sigdata->missing_redeem_script = sigdata.missing_redeem_script;
         out_sigdata->missing_witness_script = sigdata.missing_witness_script;
     }

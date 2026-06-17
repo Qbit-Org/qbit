@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_RPC_RAWTRANSACTION_UTIL_H
-#define BITCOIN_RPC_RAWTRANSACTION_UTIL_H
+#ifndef QBIT_RPC_RAWTRANSACTION_UTIL_H
+#define QBIT_RPC_RAWTRANSACTION_UTIL_H
 
 #include <addresstype.h>
 #include <consensus/amount.h>
@@ -32,13 +32,27 @@ void SignTransaction(CMutableTransaction& mtx, const SigningProvider* keystore, 
 void SignTransactionResultToJSON(CMutableTransaction& mtx, bool complete, const std::map<COutPoint, Coin>& coins, const std::map<int, bilingual_str>& input_errors, UniValue& result);
 
 /**
+ * Parse a raw signing key accepted by signrawtransactionwithkey into a temporary signing provider.
+ *
+ * Accepted formats are legacy WIF and explicit pqc(...) expressions documented by the RPC.
+ *
+ * @param  key          The user-provided key string
+ * @param  keystore     Temporary signing provider to populate
+ * @param  error        Set to a deterministic RPC-safe error message on failure
+ */
+bool ParseRawTransactionKey(const std::string& key, FlatSigningProvider& keystore, std::string& error);
+
+/** Normalize an active chain height where -1 represents "no active height yet". */
+std::optional<int> NormalizeActiveHeight(int active_height);
+
+/**
   * Parse a prevtxs UniValue array and get the map of coins from it
   *
   * @param  prevTxsUnival Array of previous txns outputs that tx depends on but may not yet be in the block chain
   * @param  keystore      A pointer to the temporary keystore if there is one
   * @param  coins         Map of unspent outputs - coins in mempool and current chain UTXO set, may be extended by previous txns outputs after call
   */
-void ParsePrevouts(const UniValue& prevTxsUnival, FlatSigningProvider* keystore, std::map<COutPoint, Coin>& coins);
+void ParsePrevouts(const UniValue& prevTxsUnival, FlatSigningProvider* keystore, std::map<COutPoint, Coin>& coins, std::optional<int> active_height = std::nullopt);
 
 /** Normalize univalue-represented inputs and add them to the transaction */
 void AddInputs(CMutableTransaction& rawTx, const UniValue& inputs_in, bool rbf);
@@ -55,4 +69,4 @@ void AddOutputs(CMutableTransaction& rawTx, const UniValue& outputs_in);
 /** Create a transaction from univalue parameters */
 CMutableTransaction ConstructTransaction(const UniValue& inputs_in, const UniValue& outputs_in, const UniValue& locktime, std::optional<bool> rbf, const uint32_t version);
 
-#endif // BITCOIN_RPC_RAWTRANSACTION_UTIL_H
+#endif // QBIT_RPC_RAWTRANSACTION_UTIL_H

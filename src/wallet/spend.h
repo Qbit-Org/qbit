@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_WALLET_SPEND_H
-#define BITCOIN_WALLET_SPEND_H
+#ifndef QBIT_WALLET_SPEND_H
+#define QBIT_WALLET_SPEND_H
 
 #include <consensus/amount.h>
 #include <policy/fees.h>
@@ -224,7 +224,7 @@ void DiscourageFeeSniping(CMutableTransaction& tx, FastRandomContext& rng_fast, 
  * selected by SelectCoins(); Also create the change output, when needed
  * @note passing change_pos as std::nullopt will result in setting a random position
  */
-util::Result<CreatedTransactionResult> CreateTransaction(CWallet& wallet, const std::vector<CRecipient>& vecSend, std::optional<unsigned int> change_pos, const CCoinControl& coin_control, bool sign = true);
+util::Result<CreatedTransactionResult> CreateTransaction(CWallet& wallet, const std::vector<CRecipient>& vecSend, std::optional<unsigned int> change_pos, const CCoinControl& coin_control, bool sign = true, const PQCSignatureCounterObserver& pqc_counter_observer = {});
 
 /**
  * Insert additional inputs into the transaction by
@@ -233,4 +233,4 @@ util::Result<CreatedTransactionResult> CreateTransaction(CWallet& wallet, const 
 util::Result<CreatedTransactionResult> FundTransaction(CWallet& wallet, const CMutableTransaction& tx, const std::vector<CRecipient>& recipients, std::optional<unsigned int> change_pos, bool lockUnspents, CCoinControl);
 } // namespace wallet
 
-#endif // BITCOIN_WALLET_SPEND_H
+#endif // QBIT_WALLET_SPEND_H

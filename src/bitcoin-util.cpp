@@ -52,16 +52,16 @@ static int AppInitUtil(ArgsManager& args, int argc, char* argv[])
 
     if (HelpRequested(args) || args.GetBoolArg("-version", false)) {
         // First part of help message is specific to this utility
-        std::string strUsage = CLIENT_NAME " bitcoin-util utility version " + FormatFullVersion() + "\n";
+        std::string strUsage = CLIENT_NAME " qbit-util utility version " + FormatFullVersion() + "\n";
 
         if (args.GetBoolArg("-version", false)) {
             strUsage += FormatParagraph(LicenseInfo());
         } else {
             strUsage += "\n"
-                "The bitcoin-util tool provides bitcoin related functionality that does not rely on the ability to access a running node. Available [commands] are listed below.\n"
+                "The qbit-util tool provides qbit related functionality that does not rely on the ability to access a running node. Available [commands] are listed below.\n"
                 "\n"
-                "Usage:  bitcoin-util [options] [command]\n"
-                "or:     bitcoin-util [options] grind <hex-block-header>\n";
+                "Usage:  qbit-util [options] [command]\n"
+                "or:     qbit-util [options] grind <hex-block-header>\n";
             strUsage += "\n" + args.GetHelpMessage();
         }
 
@@ -76,7 +76,9 @@ static int AppInitUtil(ArgsManager& args, int argc, char* argv[])
 
     // Check for chain settings (Params() calls are only valid after this clause)
     try {
-        SelectParams(args.GetChainType());
+        const ChainType chain{args.GetChainType()};
+        CheckTestnetOnlyReleaseChain(chain);
+        SelectParams(chain);
     } catch (const std::exception& e) {
         tfm::format(std::cerr, "Error: %s\n", e.what());
         return EXIT_FAILURE;
@@ -124,6 +126,22 @@ static int Grind(const std::vector<std::string>& args, std::string& strPrint)
     }
 
     uint32_t nBits = header.nBits;
+    arith_uint256 target;
+    bool neg, over;
+    target.SetCompact(nBits, &neg, &over);
+    if (target == 0 || neg || over) {
+        strPrint = "Could not satisfy difficulty target";
+        return EXIT_FAILURE;
+    }
+
+    // Preserve the provided nonce when the input header already satisfies the target.
+    if (UintToArith256(header.GetHash()) <= target) {
+        DataStream ss{};
+        ss << header;
+        strPrint = HexStr(ss);
+        return EXIT_SUCCESS;
+    }
+
     std::atomic<bool> found{false};
     uint32_t proposed_nonce{};
 

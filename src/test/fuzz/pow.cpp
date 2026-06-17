@@ -63,9 +63,24 @@ FUZZ_TARGET(pow, .init = initialize_pow)
         }
         {
             (void)GetBlockProof(current_block);
-            (void)CalculateNextWorkRequired(&current_block, fuzzed_data_provider.ConsumeIntegralInRange<int64_t>(0, std::numeric_limits<int64_t>::max()), consensus_params);
-            if (current_block.nHeight != std::numeric_limits<int>::max() && current_block.nHeight - (consensus_params.DifficultyAdjustmentInterval() - 1) >= 0) {
+            if (current_block.pprev != nullptr) {
                 (void)GetNextWorkRequired(&current_block, &(*block_header), consensus_params);
+            }
+            if (consensus_params.fPowUseASERT) {
+                const arith_uint256 pow_limit = UintToArith256(consensus_params.powLimit);
+                arith_uint256 ref_target = ConsumeArithUInt256(fuzzed_data_provider);
+                if (ref_target == 0 || ref_target > pow_limit) {
+                    ref_target = arith_uint256().SetCompact(consensus_params.asertAnchorParams.nBits);
+                }
+                const int64_t n_height_diff = fuzzed_data_provider.ConsumeIntegralInRange<int64_t>(0, 1'000'000);
+                const int64_t n_skew = fuzzed_data_provider.ConsumeIntegralInRange<int64_t>(-1'000'000'000, 1'000'000'000);
+                const int64_t n_time_diff = (consensus_params.nPowTargetSpacing * n_height_diff) + n_skew;
+                (void)CalculateASERT(ref_target,
+                                     consensus_params.nPowTargetSpacing,
+                                     n_time_diff,
+                                     n_height_diff,
+                                     pow_limit,
+                                     consensus_params.nASERTHalfLife);
             }
         }
         {
@@ -91,7 +106,6 @@ FUZZ_TARGET(pow_transition, .init = initialize_pow)
 {
     FuzzedDataProvider fuzzed_data_provider(buffer.data(), buffer.size());
     const Consensus::Params& consensus_params{Params().GetConsensus()};
-    std::vector<std::unique_ptr<CBlockIndex>> blocks;
 
     const uint32_t old_time{fuzzed_data_provider.ConsumeIntegral<uint32_t>()};
     const uint32_t new_time{fuzzed_data_provider.ConsumeIntegral<uint32_t>()};
@@ -104,21 +118,41 @@ FUZZ_TARGET(pow_transition, .init = initialize_pow)
     if (old_target > pow_limit) {
         nbits = pow_limit.GetCompact();
     }
-    // Create one difficulty adjustment period worth of headers
-    for (int height = 0; height < consensus_params.DifficultyAdjustmentInterval(); ++height) {
+    CBlockIndex* last_block{nullptr};
+    std::vector<std::unique_ptr<CBlockIndex>> blocks;
+    if (consensus_params.fPowUseASERT) {
+        // ASERT depends on the parent block's height/time relative to the anchor;
+        // it does not require a full retarget-interval chain history.
         CBlockHeader header;
         header.nVersion = version;
-        header.nTime = old_time;
+        header.nTime = new_time;
         header.nBits = nbits;
-        if (height == consensus_params.DifficultyAdjustmentInterval() - 1) {
-            header.nTime = new_time;
-        }
         auto current_block{std::make_unique<CBlockIndex>(header)};
-        current_block->pprev = blocks.empty() ? nullptr : blocks.back().get();
-        current_block->nHeight = height;
+        current_block->nHeight = consensus_params.DifficultyAdjustmentInterval() - 1;
         blocks.emplace_back(std::move(current_block));
+        last_block = blocks.back().get();
+    } else {
+        // Legacy retarget needs one full adjustment interval of linked headers.
+        for (int height = 0; height < consensus_params.DifficultyAdjustmentInterval(); ++height) {
+            CBlockHeader header;
+            header.nVersion = version;
+            header.nTime = old_time;
+            header.nBits = nbits;
+            if (height == consensus_params.DifficultyAdjustmentInterval() - 1) {
+                header.nTime = new_time;
+            }
+            auto current_block{std::make_unique<CBlockIndex>(header)};
+            current_block->pprev = blocks.empty() ? nullptr : blocks.back().get();
+            current_block->nHeight = height;
+            blocks.emplace_back(std::move(current_block));
+        }
+        last_block = blocks.back().get();
     }
-    auto last_block{blocks.back().get()};
     unsigned int new_nbits{GetNextWorkRequired(last_block, nullptr, consensus_params)};
-    Assert(PermittedDifficultyTransition(consensus_params, last_block->nHeight + 1, last_block->nBits, new_nbits));
+    if (consensus_params.fPowUseASERT) {
+        const auto target = DeriveTarget(new_nbits, consensus_params.powLimit);
+        Assert(target.has_value());
+    } else {
+        Assert(PermittedDifficultyTransition(consensus_params, last_block->nHeight + 1, last_block->nBits, new_nbits));
+    }
 }

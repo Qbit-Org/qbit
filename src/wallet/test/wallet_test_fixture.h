@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_WALLET_TEST_WALLET_TEST_FIXTURE_H
-#define BITCOIN_WALLET_TEST_WALLET_TEST_FIXTURE_H
+#ifndef QBIT_WALLET_TEST_WALLET_TEST_FIXTURE_H
+#define QBIT_WALLET_TEST_WALLET_TEST_FIXTURE_H
 
 #include <test/util/setup_common.h>
 
@@ -20,7 +20,7 @@ namespace wallet {
 /** Testing setup and teardown for wallet.
  */
 struct WalletTestingSetup : public TestingSetup {
-    explicit WalletTestingSetup(const ChainType chainType = ChainType::MAIN);
+    explicit WalletTestingSetup(const ChainType chainType = ChainType::MAIN, TestOpts opts = {});
     ~WalletTestingSetup();
 
     std::unique_ptr<interfaces::WalletLoader> m_wallet_loader;
@@ -29,4 +29,4 @@ struct WalletTestingSetup : public TestingSetup {
 };
 } // namespace wallet
 
-#endif // BITCOIN_WALLET_TEST_WALLET_TEST_FIXTURE_H
+#endif // QBIT_WALLET_TEST_WALLET_TEST_FIXTURE_H

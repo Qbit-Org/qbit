@@ -7,6 +7,7 @@
 import time
 
 from test_framework.blocktools import (
+    COINBASE_MATURITY,
     NORMAL_GBT_REQUEST_PARAMS,
     add_witness_commitment,
     create_block,
@@ -35,6 +36,8 @@ from test_framework.util import (
 from test_framework.wallet import MiniWallet
 
 SCRIPT_W0_SH_OP_TRUE = script_to_p2wsh_script(CScript([OP_TRUE]))
+CSV_ACTIVATION_HEIGHT = COINBASE_MATURITY + 432
+MINIWALLET_MATURE_HEIGHT = COINBASE_MATURITY + 100
 
 SEQUENCE_LOCKTIME_DISABLE_FLAG = (1<<31)
 SEQUENCE_LOCKTIME_TYPE_FLAG = (1<<22) # this means use time (0 means height)
@@ -49,16 +52,21 @@ class BIP68Test(BitcoinTestFramework):
         self.num_nodes = 2
         self.extra_args = [
             [
-                '-testactivationheight=csv@432',
+                f'-testactivationheight=csv@{CSV_ACTIVATION_HEIGHT}',
             ],
             [
-                '-testactivationheight=csv@432',
+                f'-testactivationheight=csv@{CSV_ACTIVATION_HEIGHT}',
             ],
         ]
 
     def run_test(self):
         self.relayfee = self.nodes[0].getnetworkinfo()["relayfee"]
         self.wallet = MiniWallet(self.nodes[0])
+        # The cached test chain pre-mines MiniWallet UTXOs in blocks 76-100.
+        # With higher COINBASE_MATURITY, make sure those are spendable before spending.
+        height = self.nodes[0].getblockcount()
+        if height < MINIWALLET_MATURE_HEIGHT:
+            self.generate(self.wallet, MINIWALLET_MATURE_HEIGHT - height, sync_fun=self.no_op)
 
         self.log.info("Running test disable flag")
         self.test_disable_flag()
@@ -386,9 +394,8 @@ class BIP68Test(BitcoinTestFramework):
         assert_equal(self.nodes[0].getbestblockhash(), block.hash_hex)
 
     def activateCSV(self):
-        # activation should happen at block height 432 (3 periods)
-        # getblockchaininfo will show CSV as active at block 431 (144 * 3 -1) since it's returning whether CSV is active for the next block.
-        min_activation_height = 432
+        # getblockchaininfo reports whether CSV is active for the next block.
+        min_activation_height = CSV_ACTIVATION_HEIGHT
         height = self.nodes[0].getblockcount()
         assert_greater_than(min_activation_height - height, 2)
         self.generate(self.wallet, min_activation_height - height - 2, sync_fun=self.no_op)

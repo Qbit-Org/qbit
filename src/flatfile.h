@@ -3,8 +3,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_FLATFILE_H
-#define BITCOIN_FLATFILE_H
+#ifndef QBIT_FLATFILE_H
+#define QBIT_FLATFILE_H
 
 #include <string>
 
@@ -86,4 +86,4 @@ public:
     bool Flush(const FlatFilePos& pos, bool finalize = false) const;
 };
 
-#endif // BITCOIN_FLATFILE_H
+#endif // QBIT_FLATFILE_H

@@ -709,8 +709,8 @@ Signing is only possible with addresses of the type 'legacy'.</source>
         <translation type="unfinished">(%1 ay naka-lock)</translation>
     </message>
     <message>
-        <source>Can vary +/- %1 satoshi(s) per input.</source>
-        <translation type="unfinished">Maaaring magbago ng +/- %1 satoshi(s) kada input.</translation>
+        <source>Can vary +/- %1 bits per input.</source>
+        <translation type="unfinished">Maaaring magbago ng +/- %1 bits kada input.</translation>
     </message>
     <message>
         <source>(no label)</source>
@@ -1936,7 +1936,7 @@ Signing is only possible with addresses of the type 'legacy'.</source>
         <translation type="unfinished">Itago ang mga Setting ng bayad sa Transaksyon</translation>
     </message>
     <message>
-        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for bitcoin transactions than the network can process.</source>
+        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for qbit transactions than the network can process.</source>
         <translation type="unfinished">Kapag mas kaunti ang dami ng transaksyon kaysa sa puwang sa mga blocks, ang mga minero pati na rin ang mga relaying node ay maaaring magpatupad ng minimum na bayad. Ang pagbabayad lamang ng minimum na bayad na ito ay maayos, ngunit malaman na maaari itong magresulta sa hindi kailanmang nagkukumpirmang transaksyon sa sandaling magkaroon ng higit na pangangailangan para sa mga transaksyon ng bitcoin kaysa sa kayang i-proseso ng network.</translation>
     </message>
     <message>
@@ -2131,7 +2131,7 @@ Signing is only possible with addresses of the type 'legacy'.</source>
         <translation type="unfinished">Alisin ang entry na ito</translation>
     </message>
     <message>
-        <source>The fee will be deducted from the amount being sent. The recipient will receive less bitcoins than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
+        <source>The fee will be deducted from the amount being sent. The recipient will receive less QBT than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
         <translation type="unfinished">Ibabawas ang bayad mula sa halagang ipapadala. Ang tatanggap ay makakatanggap ng mas kaunting mga bitcoin kaysa sa pinasok mo sa patlang ng halaga. Kung napili ang maraming tatanggap, ang bayad ay paghihiwalayin.</translation>
     </message>
     <message>

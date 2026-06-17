@@ -12,6 +12,7 @@ except ImportError:
 import re
 
 from test_framework.blocktools import COINBASE_MATURITY
+from test_framework.descriptors import descsum_create
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_not_equal,
@@ -21,11 +22,42 @@ from test_framework.util import (
 from test_framework.wallet_util import WalletUnlock
 
 
+def active_descriptor_keypool_counts(wallet):
+    descriptors = wallet.listdescriptors()["descriptors"]
+    external = sum(
+        1 for descriptor in descriptors
+        if descriptor.get("active") and "range" in descriptor and not descriptor.get("internal", False)
+    )
+    internal = sum(
+        1 for descriptor in descriptors
+        if descriptor.get("active") and "range" in descriptor and descriptor.get("internal", False)
+    )
+    return external, internal
+
+
+def assert_parent_descriptor(desc, prefix, derivation_path, internal):
+    assert desc.startswith(prefix)
+    origin = desc.split("[", maxsplit=1)[1].split("]", maxsplit=1)[0]
+    assert_equal(origin.split("/", maxsplit=1)[1], derivation_path)
+    suffix = desc.split("]", maxsplit=1)[1]
+    assert ("/1/*" if internal else "/0/*") in suffix
+
+
+def assert_p2mr_address_index(node, wallet, address, internal, expected_index):
+    p2mr_desc = next(
+        desc["desc"]
+        for desc in wallet.listdescriptors(True)["descriptors"]
+        if desc["active"] and desc["internal"] == internal and desc["desc"].startswith("mr(")
+    )
+    assert_equal(node.deriveaddresses(p2mr_desc, [expected_index, expected_index])[0], address)
+
+
 class WalletDescriptorTest(BitcoinTestFramework):
     def set_test_params(self):
         self.setup_clean_chain = True
         self.num_nodes = 1
-        self.extra_args = [['-keypool=100']]
+        self.keypool_size = 100
+        self.extra_args = [[f'-keypool={self.keypool_size}']]
 
     def skip_test_if_missing_module(self):
         self.skip_if_no_wallet()
@@ -43,8 +75,8 @@ class WalletDescriptorTest(BitcoinTestFramework):
         # Verify that the parent descriptor is normalized
         # First remove the checksum
         desc_verify = parent_desc.split("#")[0]
-        # Next extract the xpub
-        desc_verify = re.sub(r"tpub\w+?(?=/)", "", desc_verify)
+        # Next extract the extended public key
+        desc_verify = re.sub(r"(?:xpub|tpub|qpub|tqpb|qrpb)\w+?(?=/)", "", desc_verify)
         # Extract origin info
         origin_match = re.search(r'\[([\da-fh/]+)\]', desc_verify)
         origin_part = origin_match.group(1) if origin_match else ""
@@ -80,19 +112,20 @@ class WalletDescriptorTest(BitcoinTestFramework):
         wallet.unloadwallet()
 
     def run_test(self):
-        self.generate(self.nodes[0], COINBASE_MATURITY + 1)
+        self.ensure_mature_coinbase(self.nodes[0])
 
         # Make a descriptor wallet
         self.log.info("Making a descriptor wallet")
         self.nodes[0].createwallet(wallet_name="desc1")
         wallet = self.nodes[0].get_wallet_rpc("desc1")
 
-        # A descriptor wallet should have 100 addresses * 4 types = 400 keys
+        # Descriptor wallets prefill one keypool range per active ranged descriptor.
         self.log.info("Checking wallet info")
         wallet_info = wallet.getwalletinfo()
+        external_descriptors, internal_descriptors = active_descriptor_keypool_counts(wallet)
         assert_equal(wallet_info['format'], 'sqlite')
-        assert_equal(wallet_info['keypoolsize'], 400)
-        assert_equal(wallet_info['keypoolsize_hd_internal'], 400)
+        assert_equal(wallet_info['keypoolsize'], self.keypool_size * external_descriptors)
+        assert_equal(wallet_info['keypoolsize_hd_internal'], self.keypool_size * internal_descriptors)
         assert 'keypoololdest' not in wallet_info
 
         # Check that getnewaddress works
@@ -117,6 +150,11 @@ class WalletDescriptorTest(BitcoinTestFramework):
         assert addr_info['desc'].startswith('tr(')
         assert_equal(addr_info['hdkeypath'], 'm/86h/1h/0h/0/0')
 
+        addr = wallet.getnewaddress("", "p2mr")
+        addr_info = wallet.getaddressinfo(addr)
+        assert addr_info['desc'].startswith('mr(')
+        assert_p2mr_address_index(self.nodes[0], wallet, addr, False, 0)
+
         # Check that getrawchangeaddress works
         addr = wallet.getrawchangeaddress("legacy")
         addr_info = wallet.getaddressinfo(addr)
@@ -138,6 +176,11 @@ class WalletDescriptorTest(BitcoinTestFramework):
         assert addr_info['desc'].startswith('tr(')
         assert_equal(addr_info['hdkeypath'], 'm/86h/1h/0h/1/0')
 
+        addr = wallet.getrawchangeaddress("p2mr")
+        addr_info = wallet.getaddressinfo(addr)
+        assert addr_info['desc'].startswith('mr(')
+        assert_p2mr_address_index(self.nodes[0], wallet, addr, True, 0)
+
         # Make a wallet to receive coins at
         self.nodes[0].createwallet(wallet_name="desc2")
         recv_wrpc = self.nodes[0].get_wallet_rpc("desc2")
@@ -145,6 +188,9 @@ class WalletDescriptorTest(BitcoinTestFramework):
 
         # Generate some coins
         self.generatetoaddress(self.nodes[0], COINBASE_MATURITY + 1, send_wrpc.getnewaddress())
+        funding_target = 11
+        while send_wrpc.getbalance() < funding_target:
+            self.generatetoaddress(self.nodes[0], 1, send_wrpc.getnewaddress())
 
         # Make transactions
         self.log.info("Test sending and receiving")
@@ -172,7 +218,7 @@ class WalletDescriptorTest(BitcoinTestFramework):
         self.log.info("Test that unlock is needed when deriving only hardened keys in an encrypted wallet")
         with WalletUnlock(send_wrpc, "pass"):
             send_wrpc.importdescriptors([{
-                "desc": "wpkh(tprv8ZgxMBicQKsPd7Uf69XL1XwhmjHopUGep8GuEiJDZmbQz6o58LninorQAfcKZWARbtRtfnLcJ5MQ2AtHcQJCCRUcMRvmDUjyEmNUWwx8UbK/0h/*h)#y4dfsj7n",
+                "desc": descsum_create("wpkh(qrpvV1brS3WRoVwgSKGgKRdVRsxe378zAczWKKN8VLzkndxBMbpDdYo2LAGgQp6Ncu3eBRZjRL2UB436gaQzspTF2NZfFSTa164fCWEr6ReDJGm/0h/*h)"),
                 "timestamp": "now",
                 "range": [0,10],
                 "active": True
@@ -204,16 +250,20 @@ class WalletDescriptorTest(BitcoinTestFramework):
         self.nodes[0].createwallet(wallet_name='desc_import', disable_private_keys=True)
         imp_rpc = self.nodes[0].get_wallet_rpc('desc_import')
 
-        addr_types = [('legacy', False, 'pkh(', '44h/1h/0h', -13),
-                      ('p2sh-segwit', False, 'sh(wpkh(', '49h/1h/0h', -14),
-                      ('bech32', False, 'wpkh(', '84h/1h/0h', -13),
-                      ('bech32m', False, 'tr(', '86h/1h/0h', -13),
-                      ('legacy', True, 'pkh(', '44h/1h/0h', -13),
-                      ('p2sh-segwit', True, 'sh(wpkh(', '49h/1h/0h', -14),
-                      ('bech32', True, 'wpkh(', '84h/1h/0h', -13),
-                      ('bech32m', True, 'tr(', '86h/1h/0h', -13)]
+        addr_types = [
+            ('legacy', False, 'pkh(', '44h/1h/0h', True),
+            ('p2sh-segwit', False, 'sh(wpkh(', '49h/1h/0h', True),
+            ('bech32', False, 'wpkh(', '84h/1h/0h', True),
+            ('bech32m', False, 'tr(', '86h/1h/0h', True),
+            ('p2mr', False, 'mr(pk(pqc(', '87h/1h/0h', False),
+            ('legacy', True, 'pkh(', '44h/1h/0h', True),
+            ('p2sh-segwit', True, 'sh(wpkh(', '49h/1h/0h', True),
+            ('bech32', True, 'wpkh(', '84h/1h/0h', True),
+            ('bech32m', True, 'tr(', '86h/1h/0h', True),
+            ('p2mr', True, 'mr(pk(pqc(', '87h/1h/0h', False),
+        ]
 
-        for addr_type, internal, desc_prefix, deriv_path, int_idx in addr_types:
+        for addr_type, internal, desc_prefix, deriv_path, watchonly_import_supported in addr_types:
             int_str = 'internal' if internal else 'external'
 
             self.log.info("Testing descriptor address type for {} {}".format(addr_type, int_str))
@@ -222,13 +272,7 @@ class WalletDescriptorTest(BitcoinTestFramework):
             else:
                 addr = exp_rpc.getnewaddress(address_type=addr_type)
             desc = exp_rpc.getaddressinfo(addr)['parent_desc']
-            assert_equal(desc_prefix, desc[0:len(desc_prefix)])
-            idx = desc.index('/') + 1
-            assert_equal(deriv_path, desc[idx:idx + 9])
-            if internal:
-                assert_equal('1', desc[int_idx])
-            else:
-                assert_equal('0', desc[int_idx])
+            assert_parent_descriptor(desc, desc_prefix, deriv_path, internal)
 
             self.log.info("Testing the same descriptor is returned for address type {} {}".format(addr_type, int_str))
             for i in range(0, 10):
@@ -240,13 +284,23 @@ class WalletDescriptorTest(BitcoinTestFramework):
                 assert_equal(desc, test_desc)
 
             self.log.info("Testing import of exported {} descriptor".format(addr_type))
-            imp_rpc.importdescriptors([{
+            import_result = imp_rpc.importdescriptors([{
                 'desc': desc,
                 'active': True,
                 'next_index': 11,
                 'timestamp': 'now',
                 'internal': internal
-            }])
+            }])[0]
+
+            if not watchonly_import_supported:
+                assert_equal(import_result["success"], False)
+                assert_equal(
+                    import_result["error"]["message"],
+                    "Cannot import public P2MR descriptor: BIP32 extended public keys cannot derive SPHINCS+/P2MR public keys. Use exportpubkeydb/importpubkeydb for watch-only P2MR tracking.",
+                )
+                continue
+
+            assert_equal(import_result["success"], True)
 
             for i in range(0, 10):
                 if internal:

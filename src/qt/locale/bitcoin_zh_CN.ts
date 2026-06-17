@@ -2765,13 +2765,13 @@ For more information on using this console, type %6.
     <message>
         <source>Specify a custom fee per kB (1,000 bytes) of the transaction's virtual size.
 
-Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 satoshis per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 satoshis.</source>
+Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 bits per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 bits.</source>
         <translation type="unfinished">指定交易虚拟大小的每kB (1,000字节) 自定义费率。
 
 附注：因为矿工费是按字节计费的，所以如果费率是“每kvB支付100聪”，那么对于一笔500虚拟字节 (1kvB的一半) 的交易，最终将只会产生50聪的矿工费。（译注：这里就是提醒单位是字节，而不是千字节，如果搞错的话，矿工费会过低，导致交易长时间无法确认，或者压根无法发出）</translation>
     </message>
     <message>
-        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for bitcoin transactions than the network can process.</source>
+        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for qbit transactions than the network can process.</source>
         <translation type="unfinished">当交易量小于可用区块空间时，矿工和中继节点可能会执行最低手续费率限制。按照这个最低费率来支付手续费也是可以的，但请注意，一旦交易需求超出比特币网络能处理的限度，你的交易可能永远也无法确认。</translation>
     </message>
     <message>
@@ -3052,7 +3052,7 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 satos
         <translation type="unfinished">用被选单位表示的待发送金额</translation>
     </message>
     <message>
-        <source>The fee will be deducted from the amount being sent. The recipient will receive less bitcoins than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
+        <source>The fee will be deducted from the amount being sent. The recipient will receive less QBT than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
         <translation type="unfinished">交易费将从发送金额中扣除。接收人收到的比特币将会比您在金额框中输入的更少。如果选中了多个收件人，交易费平分。</translation>
     </message>
     <message>
@@ -3801,8 +3801,8 @@ Go to File &gt; Open Wallet to load a wallet.
         <translation type="unfinished">%s 验证 -assumeutxo 快照状态失败。这表明硬件可能有问题，也可能是软件bug，或者还可能是软件被不当修改、从而让非法快照也能够被加载。因此，将关闭节点并停止使用从这个快照构建出的任何状态，并将链高度从 %d 重置到 %d 。下次启动时，节点将会不使用快照数据从 %d 继续同步。请将这个事件报告给 %s 并在报告中包括您是如何获得这份快照的。无效的链状态快照仍被保存至磁盘上，以供诊断问题的原因。</translation>
     </message>
     <message>
-        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/p2p-bad-ports.md for details and a full list.</source>
-        <translation type="unfinished">%s请求监听端口%u。此端口被认为是“坏的”，所以不太可能有其他节点会连接过来。详情以及完整的端口列表请参见 doc/p2p-bad-ports.md 。</translation>
+        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/reference/p2p-bad-ports.md for details and a full list.</source>
+        <translation type="unfinished">%s请求监听端口%u。此端口被认为是“坏的”，所以不太可能有其他节点会连接过来。详情以及完整的端口列表请参见 doc/reference/p2p-bad-ports.md 。</translation>
     </message>
     <message>
         <source>Disk space for %s may not accommodate the block files. Approximately %u GB of data will be stored in this directory.</source>

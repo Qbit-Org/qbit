@@ -6,9 +6,12 @@
 
 export LC_ALL=C.UTF-8
 
+# shellcheck source=ci/test/00_setup_env_base_image.sh
+source "$( dirname "${BASH_SOURCE[0]}" )/00_setup_env_base_image.sh"
+
 export HOST=i686-pc-linux-gnu
 export CONTAINER_NAME=ci_i686_no_multiprocess
-export CI_IMAGE_NAME_TAG="mirror.gcr.io/ubuntu:24.04"
+ci_set_base_image_name_tag "ubuntu:24.04"
 export CI_IMAGE_PLATFORM="linux/amd64"
 export PACKAGES="llvm clang g++-multilib"
 export DEP_OPTS="DEBUG=1 NO_IPC=1"

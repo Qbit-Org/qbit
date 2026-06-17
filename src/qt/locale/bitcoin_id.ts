@@ -1672,8 +1672,8 @@ Proses migrasi akan mencadangkan dompet sebelum melakukan pemindahan. Fail cadan
 <context>
     <name>bitcoin-core</name>
     <message>
-        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/p2p-bad-ports.md for details and a full list.</source>
-        <translation type="unfinished">%s meminta mendengarkan di port %u. Port ini dianggap "buruk" dan oleh karena itu tidak mungkin peer lain akan terhubung kesini. Lihat doc/p2p-bad-ports.md untuk detail dan daftar lengkap.</translation>
+        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/reference/p2p-bad-ports.md for details and a full list.</source>
+        <translation type="unfinished">%s meminta mendengarkan di port %u. Port ini dianggap "buruk" dan oleh karena itu tidak mungkin peer lain akan terhubung kesini. Lihat doc/reference/p2p-bad-ports.md untuk detail dan daftar lengkap.</translation>
     </message>
     <message>
         <source>Disk space for %s may not accommodate the block files. Approximately %u GB of data will be stored in this directory.</source>

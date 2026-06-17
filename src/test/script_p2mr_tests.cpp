@@ -1,0 +1,2499 @@
+// Copyright (c) 2026-present The qbit core developers
+// Distributed under the MIT software license, see the accompanying
+// file COPYING or https://www.opensource.org/licenses/mit-license.php.
+
+#include <addresstype.h>
+#include <crypto/pqc.h>
+#include <policy/policy.h>
+#include <primitives/transaction.h>
+#include <script/interpreter.h>
+#include <script/p2mr_sizing.h>
+#include <script/sign.h>
+#include <script/script.h>
+#include <script/script_error.h>
+#include <test/util/setup_common.h>
+#include <test/util/transaction_utils.h>
+#include <util/strencodings.h>
+
+#include <boost/test/unit_test.hpp>
+
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <map>
+#include <optional>
+#include <set>
+#include <span>
+#include <vector>
+
+namespace {
+using valtype = std::vector<unsigned char>;
+
+constexpr unsigned int P2MR_SCRIPT_VERIFY_FLAGS{
+    SCRIPT_VERIFY_P2SH |
+    SCRIPT_VERIFY_WITNESS |
+    SCRIPT_VERIFY_TAPROOT |
+    SCRIPT_VERIFY_P2MR_RULES
+};
+
+constexpr unsigned char P2MR_LEAF_VERSION_V1_CONTROL{static_cast<unsigned char>(P2MR_LEAF_VERSION_V1 | 1)};
+
+std::vector<unsigned char> ToByteVector(const uint256& hash)
+{
+    return std::vector<unsigned char>(hash.begin(), hash.end());
+}
+
+valtype ScriptBytes(const CScript& script)
+{
+    return valtype(script.begin(), script.end());
+}
+
+uint256 ComputeMerkleRootSingleLeaf(uint8_t leaf_version, const CScript& leaf_script)
+{
+    const uint256 leaf_hash = ComputeP2MRLeafHash(leaf_version, ScriptBytes(leaf_script));
+    return ComputeP2MRMerkleRoot(std::vector<unsigned char>{static_cast<unsigned char>(leaf_version | 1)}, leaf_hash);
+}
+
+CScript BuildP2MRScriptPubKey(const uint256& merkle_root)
+{
+    return CScript{} << OP_2 << ToByteVector(merkle_root);
+}
+
+std::vector<unsigned char> PQCPubKeyBytes(const CPQCPubKey& pubkey)
+{
+    return std::vector<unsigned char>(pubkey.begin(), pubkey.end());
+}
+
+CScript BuildP2MRPkScript(const CPQCPubKey& pubkey)
+{
+    return CScript{} << PQCPubKeyBytes(pubkey) << OP_CHECKSIGPQC;
+}
+
+CScript BuildDropAllScript(size_t drop_count)
+{
+    CScript script;
+    for (size_t i = 0; i < drop_count; ++i) {
+        script << OP_DROP;
+    }
+    script << OP_TRUE;
+    return script;
+}
+
+std::vector<valtype> BuildP2MRStackItemsForTotalBytes(size_t total_bytes)
+{
+    std::vector<valtype> stack_items;
+    while (total_bytes > 0) {
+        const size_t item_size{std::min<size_t>(MAX_P2MR_V1_STACK_ITEM_SIZE, total_bytes)};
+        stack_items.emplace_back(item_size, 0x01);
+        total_bytes -= item_size;
+    }
+    return stack_items;
+}
+
+CScript BuildP2MRMultiAScript(int threshold, const std::vector<CPQCPubKey>& pubkeys)
+{
+    CScript script;
+    for (size_t i = 0; i < pubkeys.size(); ++i) {
+        script << PQCPubKeyBytes(pubkeys[i]) << (i == 0 ? OP_CHECKSIGPQC : OP_CHECKSIGADD);
+    }
+    script << threshold << OP_NUMEQUAL;
+    return script;
+}
+
+valtype DataSigMessageHash(unsigned char fill)
+{
+    return valtype(32, fill);
+}
+
+valtype SignDataSigPQC(const CPQCKey& key, const valtype& msg_hash)
+{
+    BOOST_REQUIRE_EQUAL(msg_hash.size(), 32U);
+
+    uint32_t signature_counter{0};
+    valtype sig;
+    BOOST_REQUIRE(key.Sign(ComputeQbitDataSigPQCHash(msg_hash), sig, signature_counter));
+    BOOST_CHECK_EQUAL(signature_counter, 1U);
+    BOOST_REQUIRE_EQUAL(sig.size(), PQC_SIG_SIZE);
+    return sig;
+}
+
+valtype SignRawMessageHash(const CPQCKey& key, const valtype& msg_hash)
+{
+    BOOST_REQUIRE_EQUAL(msg_hash.size(), 32U);
+
+    uint256 raw_hash;
+    std::copy(msg_hash.begin(), msg_hash.end(), raw_hash.begin());
+
+    uint32_t signature_counter{0};
+    valtype sig;
+    BOOST_REQUIRE(key.Sign(raw_hash, sig, signature_counter));
+    BOOST_CHECK_EQUAL(signature_counter, 1U);
+    BOOST_REQUIRE_EQUAL(sig.size(), PQC_SIG_SIZE);
+    return sig;
+}
+
+CScript BuildP2MRDataSigScript(const CPQCPubKey& pubkey, const valtype& msg_hash)
+{
+    return CScript{} << msg_hash << PQCPubKeyBytes(pubkey) << OP_CHECKDATASIGPQC;
+}
+
+CScript BuildP2MRDataSigAddScript(int threshold, const std::vector<CPQCPubKey>& pubkeys, const valtype& msg_hash)
+{
+    CScript script;
+    for (size_t i = 0; i < pubkeys.size(); ++i) {
+        if (i == 0) {
+            script << msg_hash << OP_0 << PQCPubKeyBytes(pubkeys[i]) << OP_CHECKDATASIGADDPQC;
+        } else {
+            script << msg_hash << OP_SWAP << PQCPubKeyBytes(pubkeys[i]) << OP_CHECKDATASIGADDPQC;
+        }
+    }
+    script << threshold << OP_NUMEQUAL;
+    return script;
+}
+
+void AddPQCSigningKey(FlatSigningProvider& provider, const CPQCKey& key)
+{
+    const CPQCPubKey pubkey = key.GetPubKey();
+    provider.pqc_keys.emplace(pubkey, key);
+    provider.pqc_sig_counters.emplace(pubkey, 0);
+}
+
+bool ProduceP2MRSignature(const SigningProvider& provider, const CScript& script_pubkey, SignatureData& sigdata, ScriptError* err = nullptr)
+{
+    CMutableTransaction funding_tx;
+    funding_tx.vout.emplace_back(100'000, script_pubkey);
+
+    CMutableTransaction spend_tx;
+    spend_tx.vin.emplace_back(COutPoint{funding_tx.GetHash(), 0});
+    spend_tx.vout.emplace_back(90'000, CScript{} << OP_TRUE);
+
+    PrecomputedTransactionData txdata;
+    txdata.Init(spend_tx, {funding_tx.vout.at(0)}, /*force=*/true);
+
+    MutableTransactionSignatureCreator creator(spend_tx, 0, funding_tx.vout.at(0).nValue, &txdata, SIGHASH_DEFAULT);
+    const bool complete = ProduceSignature(provider, creator, script_pubkey, sigdata);
+    if (!complete && err != nullptr && sigdata.witness) {
+        VerifyScript(sigdata.scriptSig, script_pubkey, &sigdata.scriptWitness, STANDARD_SCRIPT_VERIFY_FLAGS, creator.Checker(), err);
+    }
+    return complete;
+}
+
+class RuntimeFailPQCSigningProvider final : public SigningProvider
+{
+public:
+    FlatSigningProvider provider;
+    std::set<CPQCPubKey> failing_pubkeys;
+    mutable std::map<CPQCPubKey, int> sign_attempts;
+
+    bool CanSignPQC(const CPQCPubKey& pubkey) const override
+    {
+        return provider.CanSignPQC(pubkey);
+    }
+
+    bool SignPQC(const CPQCPubKey& pubkey, const uint256& hash, std::vector<unsigned char>& sig) const override
+    {
+        ++sign_attempts[pubkey];
+        if (failing_pubkeys.count(pubkey) != 0) {
+            sig.clear();
+            return false;
+        }
+        return provider.SignPQC(pubkey, hash, sig);
+    }
+
+    bool GetP2MRSpendData(const WitnessV2P2MR& output, P2MRSpendData& spenddata) const override
+    {
+        return provider.GetP2MRSpendData(output, spenddata);
+    }
+
+    bool GetP2MRBuilder(const WitnessV2P2MR& output, TaprootBuilder& builder) const override
+    {
+        return provider.GetP2MRBuilder(output, builder);
+    }
+};
+
+size_t CountNonEmptyP2MRSignatureItems(const CScriptWitness& witness, size_t pubkey_count)
+{
+    BOOST_REQUIRE_GE(witness.stack.size(), pubkey_count + 2);
+    return static_cast<size_t>(std::count_if(witness.stack.begin(), witness.stack.begin() + pubkey_count, [](const auto& item) {
+        return !item.empty();
+    }));
+}
+
+struct P2MRSpendContext {
+    CTransaction tx_credit;
+    CMutableTransaction tx_spend;
+    PrecomputedTransactionData txdata;
+};
+
+struct TaprootSpendContext {
+    CTransaction tx_credit;
+    CMutableTransaction tx_spend;
+    PrecomputedTransactionData txdata;
+};
+
+P2MRSpendContext BuildP2MRSpend(
+    const CScript& leaf_script,
+    const std::vector<valtype>& stack_items,
+    const std::vector<unsigned char>& control_block,
+    const uint256& program_root)
+{
+    const CScript script_pubkey = BuildP2MRScriptPubKey(program_root);
+    const CMutableTransaction tx_credit_mut = BuildCreditingTransaction(script_pubkey, /*nValue=*/1000);
+    const CTransaction tx_credit{tx_credit_mut};
+
+    CScriptWitness witness;
+    for (const auto& item : stack_items) {
+        witness.stack.push_back(item);
+    }
+    witness.stack.push_back(ScriptBytes(leaf_script));
+    witness.stack.push_back(control_block);
+
+    CMutableTransaction tx_spend = BuildSpendingTransaction(CScript{}, witness, tx_credit);
+
+    PrecomputedTransactionData txdata;
+    txdata.Init(tx_spend, {tx_credit.vout[0]});
+
+    return P2MRSpendContext{tx_credit, tx_spend, txdata};
+}
+
+bool VerifySpend(const P2MRSpendContext& spend, unsigned int flags, ScriptError& err)
+{
+    return VerifyScript(
+        spend.tx_spend.vin[0].scriptSig,
+        spend.tx_credit.vout[0].scriptPubKey,
+        &spend.tx_spend.vin[0].scriptWitness,
+        flags,
+        MutableTransactionSignatureChecker(
+            &spend.tx_spend,
+            0,
+            spend.tx_credit.vout[0].nValue,
+            spend.txdata,
+            MissingDataBehavior::ASSERT_FAIL),
+        &err);
+}
+
+TaprootSpendContext BuildTaprootScriptPathSpend(const CScript& leaf_script)
+{
+    TaprootBuilder builder;
+    builder.Add(/*depth=*/0, leaf_script, TAPROOT_LEAF_TAPSCRIPT).Finalize(XOnlyPubKey::NUMS_H);
+
+    const CScript script_pubkey = GetScriptForDestination(builder.GetOutput());
+    const CMutableTransaction tx_credit_mut = BuildCreditingTransaction(script_pubkey, /*nValue=*/1000);
+    const CTransaction tx_credit{tx_credit_mut};
+
+    CScriptWitness witness;
+    witness.stack.push_back(ScriptBytes(leaf_script));
+    witness.stack.push_back(*builder.GetSpendData().scripts.begin()->second.begin());
+
+    CMutableTransaction tx_spend = BuildSpendingTransaction(CScript{}, witness, tx_credit);
+
+    PrecomputedTransactionData txdata;
+    txdata.Init(tx_spend, {tx_credit.vout[0]});
+
+    return TaprootSpendContext{tx_credit, tx_spend, txdata};
+}
+
+bool VerifyTaprootSpend(const TaprootSpendContext& spend, unsigned int flags, ScriptError& err)
+{
+    return VerifyScript(
+        spend.tx_spend.vin[0].scriptSig,
+        spend.tx_credit.vout[0].scriptPubKey,
+        &spend.tx_spend.vin[0].scriptWitness,
+        flags,
+        MutableTransactionSignatureChecker(
+            &spend.tx_spend,
+            0,
+            spend.tx_credit.vout[0].nValue,
+            spend.txdata,
+            MissingDataBehavior::ASSERT_FAIL),
+        &err);
+}
+
+void RefreshSpendTxData(P2MRSpendContext& spend)
+{
+    spend.txdata = PrecomputedTransactionData{};
+    std::vector<CTxOut> spent_outputs(spend.tx_spend.vin.size(), spend.tx_credit.vout[0]);
+    spend.txdata.Init(spend.tx_spend, std::move(spent_outputs));
+}
+
+CScript BuildCTVScript(const uint256& ctv_hash)
+{
+    return CScript{} << ToByteVector(ctv_hash) << OP_CHECKTEMPLATEVERIFY;
+}
+
+CScript BuildCTVAndPQCChecksigScript(const uint256& ctv_hash, const CPQCPubKey& pubkey)
+{
+    return CScript{} << ToByteVector(ctv_hash) << OP_CHECKTEMPLATEVERIFY << OP_DROP << PQCPubKeyBytes(pubkey) << OP_CHECKSIGPQC;
+}
+
+CScript BuildCTVAndDataSigAddScript(const uint256& ctv_hash, int threshold, const std::vector<CPQCPubKey>& pubkeys, const valtype& msg_hash)
+{
+    CScript script = CScript{} << ToByteVector(ctv_hash) << OP_CHECKTEMPLATEVERIFY << OP_DROP;
+    for (size_t i = 0; i < pubkeys.size(); ++i) {
+        if (i == 0) {
+            script << msg_hash << OP_0 << PQCPubKeyBytes(pubkeys[i]) << OP_CHECKDATASIGADDPQC;
+        } else {
+            script << msg_hash << OP_SWAP << PQCPubKeyBytes(pubkeys[i]) << OP_CHECKDATASIGADDPQC;
+        }
+    }
+    script << threshold << OP_NUMEQUAL;
+    return script;
+}
+
+P2MRSpendContext BuildCTVSpend(const CScript& leaf_script, const std::vector<valtype>& stack_items = {})
+{
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+    return BuildP2MRSpend(
+        leaf_script,
+        stack_items,
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+}
+
+template <typename TxMutator>
+P2MRSpendContext BuildCTVSpendWithComputedHash(TxMutator mutate)
+{
+    const CScript placeholder_script = BuildCTVScript(uint256::ZERO);
+    P2MRSpendContext placeholder = BuildCTVSpend(placeholder_script);
+    mutate(placeholder.tx_spend);
+    RefreshSpendTxData(placeholder);
+    const uint256 ctv_hash = GetDefaultCheckTemplateVerifyHash(placeholder.tx_spend, /*input_index=*/0, placeholder.txdata);
+
+    P2MRSpendContext spend = BuildCTVSpend(BuildCTVScript(ctv_hash));
+    mutate(spend.tx_spend);
+    RefreshSpendTxData(spend);
+    return spend;
+}
+
+P2MRSpendContext BuildCTVSpendWithComputedHash()
+{
+    return BuildCTVSpendWithComputedHash([](CMutableTransaction&) {});
+}
+
+template <typename Mutator>
+void CheckCTVMutationFails(P2MRSpendContext spend, Mutator mutate)
+{
+    mutate(spend.tx_spend);
+    RefreshSpendTxData(spend);
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_TEMPLATE_MISMATCH);
+}
+
+bool VerifyInputScript(const CScript& script_sig, const CScript& script_pubkey, const CScriptWitness& witness, unsigned int flags, ScriptError& err)
+{
+    const CMutableTransaction tx_credit_mut = BuildCreditingTransaction(script_pubkey, /*nValue=*/1000);
+    const CTransaction tx_credit{tx_credit_mut};
+    CMutableTransaction tx_spend = BuildSpendingTransaction(script_sig, witness, tx_credit);
+
+    PrecomputedTransactionData txdata;
+    txdata.Init(tx_spend, {tx_credit.vout[0]});
+
+    return VerifyScript(
+        tx_spend.vin[0].scriptSig,
+        tx_credit.vout[0].scriptPubKey,
+        &tx_spend.vin[0].scriptWitness,
+        flags,
+        MutableTransactionSignatureChecker(
+            &tx_spend,
+            0,
+            tx_credit.vout[0].nValue,
+            txdata,
+            MissingDataBehavior::ASSERT_FAIL),
+        &err);
+}
+
+bool VerifyBaseScript(const CScript& script_pubkey, unsigned int flags, ScriptError& err)
+{
+    return VerifyInputScript(CScript{}, script_pubkey, CScriptWitness{}, flags, err);
+}
+
+ScriptExecutionData BuildExecData(const CScript& leaf_script)
+{
+    ScriptExecutionData execdata;
+    execdata.m_annex_init = true;
+    execdata.m_annex_present = false;
+    execdata.m_tapleaf_hash = ComputeP2MRLeafHash(P2MR_LEAF_VERSION_V1, ScriptBytes(leaf_script));
+    execdata.m_tapleaf_hash_init = true;
+    execdata.m_codeseparator_pos = 0xFFFFFFFFUL;
+    execdata.m_codeseparator_pos_init = true;
+    return execdata;
+}
+
+void SignP2MRLeaf(CPQCKey& key, const CScript& leaf_script, const P2MRSpendContext& spend, std::vector<unsigned char>& sig_out)
+{
+    ScriptExecutionData execdata = BuildExecData(leaf_script);
+    uint256 sighash;
+    BOOST_REQUIRE(SignatureHashP2MR(
+        sighash,
+        execdata,
+        spend.tx_spend,
+        /*in_pos=*/0,
+        SIGHASH_DEFAULT,
+        spend.txdata,
+        MissingDataBehavior::ASSERT_FAIL));
+
+    uint32_t signature_counter{0};
+    BOOST_REQUIRE(key.Sign(sighash, sig_out, signature_counter));
+    BOOST_CHECK_EQUAL(signature_counter, 1U);
+}
+
+} // namespace
+
+BOOST_FIXTURE_TEST_SUITE(script_p2mr_tests, BasicTestingSetup)
+
+static_assert(MAX_P2MR_V1_STACK_ITEM_SIZE == 16 * 1024);
+static_assert(MAX_P2MR_V1_CAT_RESULT_SIZE == 16 * 1024);
+static_assert(MAX_P2MR_V1_TOTAL_INITIAL_STACK_BYTES == 128 * 1024);
+static_assert(MAX_STANDARD_P2MR_STACK_ITEM_SIZE == MAX_P2MR_V1_STACK_ITEM_SIZE);
+static_assert(MAX_STANDARD_P2MR_TOTAL_INITIAL_STACK_BYTES == MAX_P2MR_V1_TOTAL_INITIAL_STACK_BYTES);
+static_assert(MAX_STACK_SIZE == 1000);
+static_assert(MAX_STANDARD_TX_WEIGHT == 400'000);
+static_assert(OP_CHECKDATASIGPQC == 0xbc);
+static_assert(OP_CHECKDATASIGADDPQC == 0xbd);
+
+BOOST_AUTO_TEST_CASE(p2mr_signing_single_key_consumes_one_counter)
+{
+    CPQCKey key;
+    key.MakeNewKey();
+    const CPQCPubKey pubkey = key.GetPubKey();
+    const CScript leaf_script = BuildP2MRPkScript(pubkey);
+
+    TaprootBuilder builder;
+    builder.AddP2MR(/*depth=*/0, ScriptBytes(leaf_script), P2MR_LEAF_VERSION_V1).FinalizeP2MR();
+    const WitnessV2P2MR output = builder.GetP2MROutput();
+    const CScript script_pubkey = BuildP2MRScriptPubKey(output.GetMerkleRoot());
+
+    FlatSigningProvider provider;
+    AddPQCSigningKey(provider, key);
+    provider.mr_trees.emplace(output, builder);
+
+    std::map<CPQCPubKey, int> counter_advances;
+    provider.pqc_counter_observer = [&](const CPQCPubKey& seen_pubkey, uint32_t previous_counter, uint32_t new_counter) {
+        BOOST_CHECK_EQUAL(new_counter, previous_counter + 1);
+        ++counter_advances[seen_pubkey];
+    };
+
+    SignatureData sigdata;
+    sigdata.p2mr_spenddata = builder.GetP2MRSpendData();
+    ScriptError err{SCRIPT_ERR_OK};
+    BOOST_REQUIRE_MESSAGE(ProduceP2MRSignature(provider, script_pubkey, sigdata, &err), ScriptErrorString(err));
+    BOOST_CHECK_EQUAL(counter_advances[pubkey], 1);
+    BOOST_REQUIRE_EQUAL(sigdata.scriptWitness.stack.size(), 3U);
+    BOOST_CHECK(!sigdata.scriptWitness.stack.at(0).empty());
+    BOOST_CHECK(sigdata.scriptWitness.stack.at(1) == ScriptBytes(leaf_script));
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_signing_selects_leaf_before_consuming_counters)
+{
+    CPQCKey selected_key;
+    CPQCKey discarded_key_a;
+    CPQCKey discarded_key_b;
+    selected_key.MakeNewKey();
+    discarded_key_a.MakeNewKey();
+    discarded_key_b.MakeNewKey();
+
+    const CPQCPubKey selected_pubkey = selected_key.GetPubKey();
+    const CPQCPubKey discarded_pubkey_a = discarded_key_a.GetPubKey();
+    const CPQCPubKey discarded_pubkey_b = discarded_key_b.GetPubKey();
+    const CScript selected_leaf = BuildP2MRPkScript(selected_pubkey);
+    const CScript discarded_leaf = BuildP2MRMultiAScript(1, {discarded_pubkey_a, discarded_pubkey_b});
+
+    TaprootBuilder builder;
+    builder.AddP2MR(/*depth=*/1, ScriptBytes(discarded_leaf), P2MR_LEAF_VERSION_V1)
+        .AddP2MR(/*depth=*/1, ScriptBytes(selected_leaf), P2MR_LEAF_VERSION_V1)
+        .FinalizeP2MR();
+    const WitnessV2P2MR output = builder.GetP2MROutput();
+    const CScript script_pubkey = BuildP2MRScriptPubKey(output.GetMerkleRoot());
+
+    FlatSigningProvider provider;
+    AddPQCSigningKey(provider, selected_key);
+    AddPQCSigningKey(provider, discarded_key_a);
+    AddPQCSigningKey(provider, discarded_key_b);
+    provider.mr_trees.emplace(output, builder);
+
+    std::map<CPQCPubKey, int> counter_advances;
+    provider.pqc_counter_observer = [&](const CPQCPubKey& seen_pubkey, uint32_t previous_counter, uint32_t new_counter) {
+        BOOST_CHECK_EQUAL(new_counter, previous_counter + 1);
+        ++counter_advances[seen_pubkey];
+    };
+
+    SignatureData sigdata;
+    sigdata.p2mr_spenddata = builder.GetP2MRSpendData();
+    ScriptError err{SCRIPT_ERR_OK};
+    BOOST_REQUIRE_MESSAGE(ProduceP2MRSignature(provider, script_pubkey, sigdata, &err), ScriptErrorString(err));
+    BOOST_CHECK_EQUAL(counter_advances[selected_pubkey], 1);
+    BOOST_CHECK_EQUAL(counter_advances[discarded_pubkey_a], 0);
+    BOOST_CHECK_EQUAL(counter_advances[discarded_pubkey_b], 0);
+    BOOST_REQUIRE_GE(sigdata.scriptWitness.stack.size(), 3U);
+    BOOST_CHECK(sigdata.scriptWitness.stack.at(sigdata.scriptWitness.stack.size() - 2) == ScriptBytes(selected_leaf));
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_threshold_signing_uses_only_needed_counters)
+{
+    CPQCKey key_a;
+    CPQCKey key_b;
+    CPQCKey key_c;
+    key_a.MakeNewKey();
+    key_b.MakeNewKey();
+    key_c.MakeNewKey();
+
+    const CPQCPubKey pubkey_a = key_a.GetPubKey();
+    const CPQCPubKey pubkey_b = key_b.GetPubKey();
+    const CPQCPubKey pubkey_c = key_c.GetPubKey();
+    const CScript leaf_script = BuildP2MRMultiAScript(2, {pubkey_a, pubkey_b, pubkey_c});
+
+    TaprootBuilder builder;
+    builder.AddP2MR(/*depth=*/0, ScriptBytes(leaf_script), P2MR_LEAF_VERSION_V1).FinalizeP2MR();
+    const WitnessV2P2MR output = builder.GetP2MROutput();
+    const CScript script_pubkey = BuildP2MRScriptPubKey(output.GetMerkleRoot());
+
+    FlatSigningProvider provider;
+    AddPQCSigningKey(provider, key_a);
+    AddPQCSigningKey(provider, key_b);
+    AddPQCSigningKey(provider, key_c);
+    provider.mr_trees.emplace(output, builder);
+
+    std::map<CPQCPubKey, int> counter_advances;
+    provider.pqc_counter_observer = [&](const CPQCPubKey& seen_pubkey, uint32_t previous_counter, uint32_t new_counter) {
+        BOOST_CHECK_EQUAL(new_counter, previous_counter + 1);
+        ++counter_advances[seen_pubkey];
+    };
+
+    SignatureData sigdata;
+    sigdata.p2mr_spenddata = builder.GetP2MRSpendData();
+    ScriptError err{SCRIPT_ERR_OK};
+    BOOST_REQUIRE_MESSAGE(ProduceP2MRSignature(provider, script_pubkey, sigdata, &err), ScriptErrorString(err));
+    BOOST_CHECK_EQUAL(counter_advances[pubkey_a] + counter_advances[pubkey_b] + counter_advances[pubkey_c], 2);
+    BOOST_CHECK_EQUAL(CountNonEmptyP2MRSignatureItems(sigdata.scriptWitness, /*pubkey_count=*/3), 2U);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_signing_falls_back_to_other_keys_in_selected_leaf)
+{
+    CPQCKey key_a;
+    CPQCKey key_b;
+    CPQCKey key_c;
+    key_a.MakeNewKey();
+    key_b.MakeNewKey();
+    key_c.MakeNewKey();
+
+    const CPQCPubKey pubkey_a = key_a.GetPubKey();
+    const CPQCPubKey pubkey_b = key_b.GetPubKey();
+    const CPQCPubKey pubkey_c = key_c.GetPubKey();
+    const CScript leaf_script = BuildP2MRMultiAScript(2, {pubkey_a, pubkey_b, pubkey_c});
+
+    TaprootBuilder builder;
+    builder.AddP2MR(/*depth=*/0, ScriptBytes(leaf_script), P2MR_LEAF_VERSION_V1).FinalizeP2MR();
+    const WitnessV2P2MR output = builder.GetP2MROutput();
+    const CScript script_pubkey = BuildP2MRScriptPubKey(output.GetMerkleRoot());
+
+    RuntimeFailPQCSigningProvider signing_provider;
+    AddPQCSigningKey(signing_provider.provider, key_a);
+    AddPQCSigningKey(signing_provider.provider, key_b);
+    AddPQCSigningKey(signing_provider.provider, key_c);
+    signing_provider.provider.mr_trees.emplace(output, builder);
+    signing_provider.failing_pubkeys.insert(pubkey_c);
+
+    SignatureData sigdata;
+    sigdata.p2mr_spenddata = builder.GetP2MRSpendData();
+    ScriptError err{SCRIPT_ERR_OK};
+    BOOST_REQUIRE_MESSAGE(ProduceP2MRSignature(signing_provider, script_pubkey, sigdata, &err), ScriptErrorString(err));
+    BOOST_CHECK_EQUAL(signing_provider.sign_attempts[pubkey_c], 1);
+    BOOST_CHECK_EQUAL(signing_provider.sign_attempts[pubkey_b], 1);
+    BOOST_CHECK_EQUAL(signing_provider.sign_attempts[pubkey_a], 1);
+    BOOST_CHECK_EQUAL(CountNonEmptyP2MRSignatureItems(sigdata.scriptWitness, /*pubkey_count=*/3), 2U);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_signing_retries_other_leaves_after_runtime_failure)
+{
+    CPQCKey failing_key;
+    CPQCKey backup_key_a;
+    CPQCKey backup_key_b;
+    failing_key.MakeNewKey();
+    backup_key_a.MakeNewKey();
+    backup_key_b.MakeNewKey();
+
+    const CPQCPubKey failing_pubkey = failing_key.GetPubKey();
+    const CPQCPubKey backup_pubkey_a = backup_key_a.GetPubKey();
+    const CPQCPubKey backup_pubkey_b = backup_key_b.GetPubKey();
+    const CScript failing_leaf = BuildP2MRPkScript(failing_pubkey);
+    const CScript backup_leaf = BuildP2MRMultiAScript(1, {backup_pubkey_a, backup_pubkey_b});
+
+    TaprootBuilder builder;
+    builder.AddP2MR(/*depth=*/1, ScriptBytes(failing_leaf), P2MR_LEAF_VERSION_V1)
+        .AddP2MR(/*depth=*/1, ScriptBytes(backup_leaf), P2MR_LEAF_VERSION_V1)
+        .FinalizeP2MR();
+    const WitnessV2P2MR output = builder.GetP2MROutput();
+    const CScript script_pubkey = BuildP2MRScriptPubKey(output.GetMerkleRoot());
+
+    RuntimeFailPQCSigningProvider signing_provider;
+    AddPQCSigningKey(signing_provider.provider, failing_key);
+    AddPQCSigningKey(signing_provider.provider, backup_key_a);
+    AddPQCSigningKey(signing_provider.provider, backup_key_b);
+    signing_provider.provider.mr_trees.emplace(output, builder);
+    signing_provider.failing_pubkeys.insert(failing_pubkey);
+
+    SignatureData sigdata;
+    sigdata.p2mr_spenddata = builder.GetP2MRSpendData();
+    ScriptError err{SCRIPT_ERR_OK};
+    BOOST_REQUIRE_MESSAGE(ProduceP2MRSignature(signing_provider, script_pubkey, sigdata, &err), ScriptErrorString(err));
+    BOOST_CHECK_EQUAL(signing_provider.sign_attempts[failing_pubkey], 1);
+    BOOST_CHECK_EQUAL(signing_provider.sign_attempts[backup_pubkey_a] + signing_provider.sign_attempts[backup_pubkey_b], 1);
+    BOOST_REQUIRE_GE(sigdata.scriptWitness.stack.size(), 3U);
+    BOOST_CHECK(sigdata.scriptWitness.stack.at(sigdata.scriptWitness.stack.size() - 2) == ScriptBytes(backup_leaf));
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_dummy_creator_builds_dummy_witness_without_private_keys)
+{
+    CPQCKey key;
+    key.MakeNewKey();
+
+    const CPQCPubKey pubkey = key.GetPubKey();
+    const CScript leaf_script = BuildP2MRPkScript(pubkey);
+
+    TaprootBuilder builder;
+    builder.AddP2MR(/*depth=*/0, ScriptBytes(leaf_script), P2MR_LEAF_VERSION_V1).FinalizeP2MR();
+    const WitnessV2P2MR output = builder.GetP2MROutput();
+    const CScript script_pubkey = BuildP2MRScriptPubKey(output.GetMerkleRoot());
+
+    SignatureData sigdata;
+    sigdata.p2mr_spenddata = builder.GetP2MRSpendData();
+    BOOST_REQUIRE(ProduceSignature(DUMMY_SIGNING_PROVIDER, DUMMY_SIGNATURE_CREATOR, script_pubkey, sigdata));
+    BOOST_REQUIRE_EQUAL(sigdata.scriptWitness.stack.size(), 3U);
+    BOOST_CHECK_EQUAL(sigdata.scriptWitness.stack.at(0).size(), P2MR_V1_MAX_SIGNATURE_ITEM_SIZE);
+    BOOST_CHECK_EQUAL(sigdata.scriptWitness.stack.at(0).back(), SIGHASH_ALL);
+    BOOST_CHECK(sigdata.scriptWitness.stack.at(1) == ScriptBytes(leaf_script));
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_valid_single_leaf_op_true)
+{
+    const CScript leaf_script = CScript{} << OP_TRUE;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+    const P2MRSpendContext spend = BuildP2MRSpend(leaf_script, /*stack_items=*/{}, /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL}, program_root);
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_rejects_key_path_spend)
+{
+    const CScript leaf_script = CScript{} << OP_TRUE;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+    const CScript script_pubkey = BuildP2MRScriptPubKey(program_root);
+    const CTransaction tx_credit{BuildCreditingTransaction(script_pubkey, /*nValue=*/1000)};
+
+    CScriptWitness witness;
+    witness.stack.push_back(valtype{0x01});
+    CMutableTransaction tx_spend = BuildSpendingTransaction(CScript{}, witness, tx_credit);
+
+    PrecomputedTransactionData txdata;
+    txdata.Init(tx_spend, {tx_credit.vout[0]});
+    const P2MRSpendContext spend{tx_credit, tx_spend, txdata};
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_rejects_wrong_control_size)
+{
+    const CScript leaf_script = CScript{} << OP_TRUE;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+    const P2MRSpendContext spend = BuildP2MRSpend(leaf_script, /*stack_items=*/{}, /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL, 0x00}, program_root);
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_P2MR_WRONG_CONTROL_SIZE);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_rejects_empty_control_block)
+{
+    const CScript leaf_script = CScript{} << OP_TRUE;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+    const P2MRSpendContext spend = BuildP2MRSpend(leaf_script, /*stack_items=*/{}, /*control_block=*/{}, program_root);
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_P2MR_WRONG_CONTROL_SIZE);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_accepts_max_control_path_length)
+{
+    const CScript leaf_script = CScript{} << OP_TRUE;
+
+    // Maximal valid control block: 1 control byte + 128 merkle-path nodes.
+    std::vector<unsigned char> control_block(P2MR_CONTROL_MAX_SIZE, 0x00);
+    control_block[0] = P2MR_LEAF_VERSION_V1_CONTROL;
+
+    const uint256 tapleaf_hash = ComputeP2MRLeafHash(P2MR_LEAF_VERSION_V1, ScriptBytes(leaf_script));
+    const uint256 program_root = ComputeP2MRMerkleRoot(control_block, tapleaf_hash);
+    const P2MRSpendContext spend = BuildP2MRSpend(leaf_script, /*stack_items=*/{}, control_block, program_root);
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_rejects_control_block_larger_than_max)
+{
+    const CScript leaf_script = CScript{} << OP_TRUE;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    // Exceed the max while preserving the 1 + 32*n size shape.
+    std::vector<unsigned char> control_block(P2MR_CONTROL_MAX_SIZE + P2MR_CONTROL_NODE_SIZE, 0x00);
+    control_block[0] = P2MR_LEAF_VERSION_V1_CONTROL;
+
+    const P2MRSpendContext spend = BuildP2MRSpend(leaf_script, /*stack_items=*/{}, control_block, program_root);
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_P2MR_WRONG_CONTROL_SIZE);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_rejects_control_block_one_byte_larger_than_max)
+{
+    const CScript leaf_script = CScript{} << OP_TRUE;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    std::vector<unsigned char> control_block(P2MR_CONTROL_MAX_SIZE + 1, 0x00);
+    control_block[0] = P2MR_LEAF_VERSION_V1_CONTROL;
+
+    const P2MRSpendContext spend = BuildP2MRSpend(leaf_script, /*stack_items=*/{}, control_block, program_root);
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_P2MR_WRONG_CONTROL_SIZE);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_rejects_control_byte_without_required_bit)
+{
+    const CScript leaf_script = CScript{} << OP_TRUE;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+    const P2MRSpendContext spend = BuildP2MRSpend(leaf_script, /*stack_items=*/{}, /*control_block=*/{P2MR_LEAF_VERSION_V1}, program_root);
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_P2MR_CONTROL_BIT0);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_rejects_commitment_mismatch)
+{
+    const CScript leaf_script_committed = CScript{} << OP_TRUE;
+    const CScript leaf_script_spent = CScript{} << OP_FALSE;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script_committed);
+
+    const P2MRSpendContext spend = BuildP2MRSpend(leaf_script_spent, /*stack_items=*/{}, /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL}, program_root);
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_multi_leaf_merkle_path_verifies)
+{
+    const CScript left_leaf = CScript{} << OP_TRUE;
+    const CScript right_leaf = CScript{} << OP_FALSE;
+
+    const uint256 left_hash = ComputeP2MRLeafHash(P2MR_LEAF_VERSION_V1, ScriptBytes(left_leaf));
+    const uint256 right_hash = ComputeP2MRLeafHash(P2MR_LEAF_VERSION_V1, ScriptBytes(right_leaf));
+    const uint256 program_root = ComputeP2MRBranchHash(left_hash, right_hash);
+
+    std::vector<unsigned char> control_block{P2MR_LEAF_VERSION_V1_CONTROL};
+    const std::vector<unsigned char> merkle_sibling = ToByteVector(right_hash);
+    control_block.insert(control_block.end(), merkle_sibling.begin(), merkle_sibling.end());
+
+    const P2MRSpendContext spend = BuildP2MRSpend(left_leaf, /*stack_items=*/{}, control_block, program_root);
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_tree_hash_domain_differs_from_taproot)
+{
+    const CScript leaf_script = CScript{} << OP_TRUE;
+    const uint256 tap_leaf_hash = ComputeTapleafHash(P2MR_LEAF_VERSION_V1, ScriptBytes(leaf_script));
+    const uint256 p2mr_leaf_hash = ComputeP2MRLeafHash(P2MR_LEAF_VERSION_V1, ScriptBytes(leaf_script));
+    BOOST_CHECK(tap_leaf_hash != p2mr_leaf_hash);
+
+    const uint256 tap_branch_hash = ComputeTapbranchHash(tap_leaf_hash, tap_leaf_hash);
+    const uint256 p2mr_branch_hash = ComputeP2MRBranchHash(p2mr_leaf_hash, p2mr_leaf_hash);
+    BOOST_CHECK(tap_branch_hash != p2mr_branch_hash);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_merkle_path_verifies_when_spent_leaf_hash_sorts_after_sibling)
+{
+    const CScript first_leaf = CScript{} << OP_TRUE;
+    const CScript second_leaf = CScript{} << OP_TRUE << OP_NOP;
+
+    const uint256 first_hash = ComputeP2MRLeafHash(P2MR_LEAF_VERSION_V1, ScriptBytes(first_leaf));
+    const uint256 second_hash = ComputeP2MRLeafHash(P2MR_LEAF_VERSION_V1, ScriptBytes(second_leaf));
+    const bool first_less = std::lexicographical_compare(first_hash.begin(), first_hash.end(), second_hash.begin(), second_hash.end());
+
+    const CScript& spent_leaf = first_less ? second_leaf : first_leaf;
+    const uint256& sibling_hash = first_less ? first_hash : second_hash;
+    const uint256& spent_hash = first_less ? second_hash : first_hash;
+    BOOST_CHECK(!std::lexicographical_compare(spent_hash.begin(), spent_hash.end(), sibling_hash.begin(), sibling_hash.end()));
+
+    const uint256 program_root = ComputeP2MRBranchHash(first_hash, second_hash);
+    std::vector<unsigned char> control_block{P2MR_LEAF_VERSION_V1_CONTROL};
+    const std::vector<unsigned char> merkle_sibling = ToByteVector(sibling_hash);
+    control_block.insert(control_block.end(), merkle_sibling.begin(), merkle_sibling.end());
+
+    const P2MRSpendContext spend = BuildP2MRSpend(spent_leaf, /*stack_items=*/{}, control_block, program_root);
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_reserved_leaf_versions_policy_flag)
+{
+    // Include a valid masked leaf version outside the named constants to lock in
+    // the intended "all unknown even leaf versions" upgrade-hook behavior.
+    constexpr uint8_t ARBITRARY_UNKNOWN_LEAF_VERSION{0x8e};
+    static_assert(IsValidP2MRLeafVersion(ARBITRARY_UNKNOWN_LEAF_VERSION));
+    static_assert(ARBITRARY_UNKNOWN_LEAF_VERSION != P2MR_LEAF_VERSION_V1);
+    static_assert(!IsReservedP2MRLeafVersion(ARBITRARY_UNKNOWN_LEAF_VERSION));
+    static_assert(ARBITRARY_UNKNOWN_LEAF_VERSION != P2MR_LEAF_VERSION_RESERVED_1);
+    static_assert(ARBITRARY_UNKNOWN_LEAF_VERSION != P2MR_LEAF_VERSION_RESERVED_2);
+    static_assert(ARBITRARY_UNKNOWN_LEAF_VERSION != P2MR_LEAF_VERSION_RESERVED_3);
+
+    constexpr std::array<uint8_t, 6> UPGRADABLE_LEAF_VERSIONS{
+        P2MR_LEAF_VERSION_RESERVED_1,
+        P2MR_LEAF_VERSION_RESERVED_2,
+        P2MR_LEAF_VERSION_RESERVED_3,
+        P2MR_LEAF_VERSION_EXPERIMENTAL_FIRST,
+        P2MR_LEAF_VERSION_EXTENSION,
+        ARBITRARY_UNKNOWN_LEAF_VERSION,
+    };
+
+    const CScript leaf_script = CScript{} << OP_TRUE;
+    for (const uint8_t leaf_version : UPGRADABLE_LEAF_VERSIONS) {
+        const uint256 program_root = ComputeMerkleRootSingleLeaf(leaf_version, leaf_script);
+        const P2MRSpendContext spend = BuildP2MRSpend(
+            leaf_script,
+            // The 0xc0 stack-item envelope is v1-specific; reserved leaves keep
+            // their own future resource model until activation defines one.
+            /*stack_items=*/{std::vector<unsigned char>(MAX_P2MR_V1_STACK_ITEM_SIZE + 1, 0x42)},
+            /*control_block=*/{static_cast<unsigned char>(leaf_version | 1)},
+            program_root);
+
+        {
+            ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+            BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+            BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+        }
+
+        {
+            ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+            BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS | SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION, err));
+            BOOST_CHECK_EQUAL(err, SCRIPT_ERR_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_future_even_leaf_version_uses_masked_control_byte)
+{
+    static constexpr uint8_t FUTURE_LEAF_VERSION{0xfe};
+    const CScript leaf_script = CScript{} << OP_FALSE;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(FUTURE_LEAF_VERSION, leaf_script);
+    const P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{},
+        /*control_block=*/{static_cast<unsigned char>(FUTURE_LEAF_VERSION | 1)},
+        program_root);
+
+    {
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+    }
+
+    {
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS | SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION, err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_checksigpqc_accepts_valid_signature)
+{
+    CPQCKey key;
+    key.MakeNewKey();
+    BOOST_REQUIRE(key.IsValid());
+    const CPQCPubKey pubkey = key.GetPubKey();
+    BOOST_REQUIRE(pubkey.IsValid());
+
+    const CScript leaf_script = CScript{} << std::vector<unsigned char>(pubkey.begin(), pubkey.end()) << OP_CHECKSIGPQC;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{std::vector<unsigned char>(PQC_SIG_SIZE, 0x00)},
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+
+    ScriptExecutionData execdata = BuildExecData(leaf_script);
+    uint256 sighash;
+    BOOST_REQUIRE(SignatureHashP2MR(
+        sighash,
+        execdata,
+        spend.tx_spend,
+        /*in_pos=*/0,
+        SIGHASH_DEFAULT,
+        spend.txdata,
+        MissingDataBehavior::ASSERT_FAIL));
+
+    uint32_t signature_counter{0};
+    std::vector<unsigned char> sig;
+    BOOST_REQUIRE(key.Sign(sighash, sig, signature_counter));
+    BOOST_CHECK_EQUAL(signature_counter, 1U);
+
+    spend.tx_spend.vin[0].scriptWitness.stack[0] = sig;
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_rejects_legacy_checksig_with_valid_pqc_signature)
+{
+    CPQCKey key;
+    key.MakeNewKey();
+    BOOST_REQUIRE(key.IsValid());
+    const CPQCPubKey pubkey = key.GetPubKey();
+    BOOST_REQUIRE(pubkey.IsValid());
+
+    const CScript leaf_script = CScript{} << PQCPubKeyBytes(pubkey) << OP_CHECKSIG;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{std::vector<unsigned char>(PQC_SIG_SIZE, 0x00)},
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+
+    std::vector<unsigned char> sig;
+    SignP2MRLeaf(key, leaf_script, spend, sig);
+    spend.tx_spend.vin[0].scriptWitness.stack[0] = sig;
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_P2MR_CHECKSIG);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_rejects_legacy_checksigverify_with_valid_pqc_signature)
+{
+    CPQCKey key;
+    key.MakeNewKey();
+    BOOST_REQUIRE(key.IsValid());
+    const CPQCPubKey pubkey = key.GetPubKey();
+    BOOST_REQUIRE(pubkey.IsValid());
+
+    const CScript leaf_script = CScript{} << PQCPubKeyBytes(pubkey) << OP_CHECKSIGVERIFY << OP_TRUE;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{std::vector<unsigned char>(PQC_SIG_SIZE, 0x00)},
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+
+    std::vector<unsigned char> sig;
+    SignP2MRLeaf(key, leaf_script, spend, sig);
+    spend.tx_spend.vin[0].scriptWitness.stack[0] = sig;
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_P2MR_CHECKSIG);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_checksigpqc_verify_form_accepts_valid_signature)
+{
+    CPQCKey key;
+    key.MakeNewKey();
+    BOOST_REQUIRE(key.IsValid());
+    const CPQCPubKey pubkey = key.GetPubKey();
+    BOOST_REQUIRE(pubkey.IsValid());
+
+    const CScript leaf_script = CScript{} << PQCPubKeyBytes(pubkey) << OP_CHECKSIGPQC << OP_VERIFY << OP_TRUE;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{std::vector<unsigned char>(PQC_SIG_SIZE, 0x00)},
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+
+    std::vector<unsigned char> sig;
+    SignP2MRLeaf(key, leaf_script, spend, sig);
+    spend.tx_spend.vin[0].scriptWitness.stack[0] = sig;
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_checksigadd_accepts_valid_multi_a_spend)
+{
+    CPQCKey key_a;
+    CPQCKey key_b;
+    CPQCKey key_c;
+    key_a.MakeNewKey();
+    key_b.MakeNewKey();
+    key_c.MakeNewKey();
+
+    const CPQCPubKey pubkey_a = key_a.GetPubKey();
+    const CPQCPubKey pubkey_b = key_b.GetPubKey();
+    const CPQCPubKey pubkey_c = key_c.GetPubKey();
+    BOOST_REQUIRE(pubkey_a.IsValid());
+    BOOST_REQUIRE(pubkey_b.IsValid());
+    BOOST_REQUIRE(pubkey_c.IsValid());
+
+    const CScript leaf_script = BuildP2MRMultiAScript(2, {pubkey_a, pubkey_b, pubkey_c});
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{valtype{}, std::vector<unsigned char>(PQC_SIG_SIZE, 0x00), std::vector<unsigned char>(PQC_SIG_SIZE, 0x00)},
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+
+    std::vector<unsigned char> sig_a;
+    std::vector<unsigned char> sig_b;
+    SignP2MRLeaf(key_a, leaf_script, spend, sig_a);
+    SignP2MRLeaf(key_b, leaf_script, spend, sig_b);
+    spend.tx_spend.vin[0].scriptWitness.stack[1] = sig_b;
+    spend.tx_spend.vin[0].scriptWitness.stack[2] = sig_a;
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_checksigpqc_accepts_explicit_hashtype)
+{
+    static constexpr uint8_t EXPLICIT_HASHTYPE{SIGHASH_ALL};
+
+    CPQCKey key;
+    key.MakeNewKey();
+    BOOST_REQUIRE(key.IsValid());
+    const CPQCPubKey pubkey = key.GetPubKey();
+    BOOST_REQUIRE(pubkey.IsValid());
+
+    const CScript leaf_script = CScript{} << std::vector<unsigned char>(pubkey.begin(), pubkey.end()) << OP_CHECKSIGPQC;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{std::vector<unsigned char>(PQC_SIG_SIZE, 0x00)},
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+
+    ScriptExecutionData execdata = BuildExecData(leaf_script);
+    uint256 sighash;
+    BOOST_REQUIRE(SignatureHashP2MR(
+        sighash,
+        execdata,
+        spend.tx_spend,
+        /*in_pos=*/0,
+        EXPLICIT_HASHTYPE,
+        spend.txdata,
+        MissingDataBehavior::ASSERT_FAIL));
+
+    uint32_t signature_counter{0};
+    std::vector<unsigned char> sig;
+    BOOST_REQUIRE(key.Sign(sighash, sig, signature_counter));
+    BOOST_CHECK_EQUAL(signature_counter, 1U);
+
+    sig.push_back(EXPLICIT_HASHTYPE);
+    BOOST_REQUIRE_EQUAL(sig.size(), PQC_SIG_SIZE + 1);
+    uint8_t hashtype;
+    BOOST_REQUIRE(GetP2MRSignatureHashType(sig, hashtype));
+    BOOST_CHECK_EQUAL(hashtype, EXPLICIT_HASHTYPE);
+
+    spend.tx_spend.vin[0].scriptWitness.stack[0] = sig;
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_create_pqc_signature_uses_canonical_size)
+{
+    CPQCKey key;
+    key.MakeNewKey();
+    BOOST_REQUIRE(key.IsValid());
+    const CPQCPubKey pubkey = key.GetPubKey();
+    BOOST_REQUIRE(pubkey.IsValid());
+
+    const CScript leaf_script = CScript{} << std::vector<unsigned char>(pubkey.begin(), pubkey.end()) << OP_CHECKSIGPQC;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+    P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{std::vector<unsigned char>(PQC_SIG_SIZE, 0x00)},
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+    const uint256 leaf_hash = ComputeP2MRLeafHash(P2MR_LEAF_VERSION_V1, ScriptBytes(leaf_script));
+
+    FlatSigningProvider provider;
+    provider.pqc_keys.emplace(pubkey, key);
+
+    std::vector<unsigned char> sig;
+    BOOST_REQUIRE(MutableTransactionSignatureCreator(
+        spend.tx_spend,
+        /*input_idx=*/0,
+        spend.tx_credit.vout[0].nValue,
+        &spend.txdata,
+        SIGHASH_DEFAULT)
+        .CreatePQCSignature(provider, sig, pubkey, &leaf_hash, SigVersion::P2MR));
+    BOOST_REQUIRE_EQUAL(sig.size(), PQC_SIG_SIZE);
+    uint8_t hashtype;
+    BOOST_REQUIRE(GetP2MRSignatureHashType(sig, hashtype));
+    BOOST_CHECK_EQUAL(hashtype, SIGHASH_DEFAULT);
+
+    spend.tx_spend.vin[0].scriptWitness.stack[0] = sig;
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_sighash_domain_is_p2mr_specific)
+{
+    const CScript leaf_script = CScript{} << OP_TRUE;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+    const P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{},
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+
+    uint256 p2mr_hash;
+    ScriptExecutionData p2mr_execdata = BuildExecData(leaf_script);
+    BOOST_REQUIRE(SignatureHashP2MR(
+        p2mr_hash,
+        p2mr_execdata,
+        spend.tx_spend,
+        /*in_pos=*/0,
+        SIGHASH_DEFAULT,
+        spend.txdata,
+        MissingDataBehavior::ASSERT_FAIL));
+
+    uint256 tapscript_hash;
+    ScriptExecutionData tapscript_execdata = BuildExecData(leaf_script);
+    tapscript_execdata.m_tapleaf_hash = ComputeTapleafHash(P2MR_LEAF_VERSION_V1, ScriptBytes(leaf_script));
+    BOOST_REQUIRE(SignatureHashSchnorr(
+        tapscript_hash,
+        tapscript_execdata,
+        spend.tx_spend,
+        /*in_pos=*/0,
+        SIGHASH_DEFAULT,
+        SigVersion::TAPSCRIPT,
+        spend.txdata,
+        MissingDataBehavior::ASSERT_FAIL));
+
+    BOOST_CHECK(p2mr_hash != tapscript_hash);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_checkdatasigpqc_accepts_valid_signature)
+{
+    CPQCKey key;
+    key.MakeNewKey();
+    BOOST_REQUIRE(key.IsValid());
+    const CPQCPubKey pubkey = key.GetPubKey();
+    BOOST_REQUIRE(pubkey.IsValid());
+
+    const valtype msg_hash{DataSigMessageHash(0x42)};
+    const CScript leaf_script = BuildP2MRDataSigScript(pubkey, msg_hash);
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{SignDataSigPQC(key, msg_hash)},
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_ctv_opcode_name_is_p2mr_only)
+{
+    BOOST_CHECK_EQUAL(GetOpName(OP_CHECKTEMPLATEVERIFY), "OP_CHECKTEMPLATEVERIFY");
+    CScript ctv_script;
+    ctv_script << OP_CHECKTEMPLATEVERIFY;
+    BOOST_CHECK(!ctv_script.HasValidOps());
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_ctv_byte_is_bad_opcode_in_base_script)
+{
+    const CScript script_pubkey = CScript{} << OP_CHECKTEMPLATEVERIFY;
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifyBaseScript(script_pubkey, SCRIPT_VERIFY_P2SH, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_BAD_OPCODE);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_ctv_byte_remains_op_success_in_taproot)
+{
+    static constexpr unsigned int TAPROOT_SCRIPT_VERIFY_FLAGS{
+        SCRIPT_VERIFY_P2SH |
+        SCRIPT_VERIFY_WITNESS |
+        SCRIPT_VERIFY_TAPROOT
+    };
+
+    const CScript leaf_script = CScript{} << OP_CHECKTEMPLATEVERIFY << OP_FALSE;
+    const TaprootSpendContext spend = BuildTaprootScriptPathSpend(leaf_script);
+
+    {
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(VerifyTaprootSpend(spend, TAPROOT_SCRIPT_VERIFY_FLAGS, err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+    }
+    {
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(!VerifyTaprootSpend(spend, TAPROOT_SCRIPT_VERIFY_FLAGS | SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS, err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_DISCOURAGE_OP_SUCCESS);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_ctv_accepts_matching_template_hash)
+{
+    const P2MRSpendContext spend = BuildCTVSpendWithComputedHash();
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_checkdatasigpqc_empty_signature_returns_false)
+{
+    CPQCKey key;
+    key.MakeNewKey();
+    BOOST_REQUIRE(key.IsValid());
+    const CPQCPubKey pubkey = key.GetPubKey();
+    BOOST_REQUIRE(pubkey.IsValid());
+
+    const valtype msg_hash{DataSigMessageHash(0x43)};
+    const CScript leaf_script = CScript{} << msg_hash << PQCPubKeyBytes(pubkey) << OP_CHECKDATASIGPQC << OP_NOT;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    const P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{valtype{}},
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_ctv_accepts_repeated_matching_template_hash)
+{
+    const CScript placeholder_script = CScript{} << ToByteVector(uint256::ZERO) << OP_CHECKTEMPLATEVERIFY << OP_CHECKTEMPLATEVERIFY;
+    const P2MRSpendContext placeholder = BuildCTVSpend(placeholder_script);
+    const uint256 ctv_hash = GetDefaultCheckTemplateVerifyHash(placeholder.tx_spend, /*input_index=*/0, placeholder.txdata);
+
+    const CScript leaf_script = CScript{} << ToByteVector(ctv_hash) << OP_CHECKTEMPLATEVERIFY << OP_CHECKTEMPLATEVERIFY;
+    const P2MRSpendContext spend = BuildCTVSpend(leaf_script);
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_checkdatasigpqc_rejects_invalid_nonempty_signature)
+{
+    CPQCKey key;
+    key.MakeNewKey();
+    BOOST_REQUIRE(key.IsValid());
+    const CPQCPubKey pubkey = key.GetPubKey();
+    BOOST_REQUIRE(pubkey.IsValid());
+
+    const valtype msg_hash{DataSigMessageHash(0x44)};
+    const CScript leaf_script = BuildP2MRDataSigScript(pubkey, msg_hash);
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    valtype sig{SignDataSigPQC(key, msg_hash)};
+    BOOST_REQUIRE(!sig.empty());
+    sig[0] ^= 0x01;
+
+    const P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{sig},
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_P2MR_SIG);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_checkdatasigpqc_rejects_signature_size_boundaries)
+{
+    CPQCKey key;
+    key.MakeNewKey();
+    BOOST_REQUIRE(key.IsValid());
+    const CPQCPubKey pubkey = key.GetPubKey();
+    BOOST_REQUIRE(pubkey.IsValid());
+
+    const valtype msg_hash{DataSigMessageHash(0x45)};
+    const CScript leaf_script = BuildP2MRDataSigScript(pubkey, msg_hash);
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    for (const size_t sig_size : {
+        static_cast<size_t>(PQC_SIG_SIZE - 1),
+        static_cast<size_t>(PQC_SIG_SIZE + 1),
+    }) {
+        const P2MRSpendContext spend = BuildP2MRSpend(
+            leaf_script,
+            /*stack_items=*/{valtype(sig_size, 0x01)},
+            /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+            program_root);
+
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_P2MR_SIG_SIZE);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_checkdatasigpqc_rejects_message_hash_size_boundaries)
+{
+    CPQCKey key;
+    key.MakeNewKey();
+    BOOST_REQUIRE(key.IsValid());
+    const CPQCPubKey pubkey = key.GetPubKey();
+    BOOST_REQUIRE(pubkey.IsValid());
+
+    for (const size_t msg_hash_size : {31U, 33U}) {
+        const valtype msg_hash(msg_hash_size, 0x46);
+        const CScript leaf_script = BuildP2MRDataSigScript(pubkey, msg_hash);
+        const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+        const P2MRSpendContext spend = BuildP2MRSpend(
+            leaf_script,
+            /*stack_items=*/{valtype(PQC_SIG_SIZE, 0x01)},
+            /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+            program_root);
+
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_PUSH_SIZE);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_checkdatasigpqc_rejects_pubkey_size_boundaries)
+{
+    const valtype msg_hash{DataSigMessageHash(0x47)};
+
+    for (const size_t pubkey_size : {0U, 31U, 33U}) {
+        const CScript leaf_script = CScript{} << msg_hash << valtype(pubkey_size, 0x02) << OP_CHECKDATASIGPQC;
+        const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+        const P2MRSpendContext spend = BuildP2MRSpend(
+            leaf_script,
+            /*stack_items=*/{valtype(PQC_SIG_SIZE, 0x01)},
+            /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+            program_root);
+
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_PUBKEYTYPE);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_checkdatasigpqc_uses_data_signature_domain)
+{
+    CPQCKey key;
+    key.MakeNewKey();
+    BOOST_REQUIRE(key.IsValid());
+    const CPQCPubKey pubkey = key.GetPubKey();
+    BOOST_REQUIRE(pubkey.IsValid());
+
+    const valtype msg_hash{DataSigMessageHash(0x48)};
+    const CScript leaf_script = BuildP2MRDataSigScript(pubkey, msg_hash);
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    {
+        const P2MRSpendContext spend = BuildP2MRSpend(
+            leaf_script,
+            /*stack_items=*/{SignDataSigPQC(key, msg_hash)},
+            /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+            program_root);
+
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+    }
+
+    {
+        const P2MRSpendContext spend = BuildP2MRSpend(
+            leaf_script,
+            /*stack_items=*/{SignRawMessageHash(key, msg_hash)},
+            /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+            program_root);
+
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_P2MR_SIG);
+    }
+
+    {
+        P2MRSpendContext spend = BuildP2MRSpend(
+            leaf_script,
+            /*stack_items=*/{valtype(PQC_SIG_SIZE, 0x00)},
+            /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+            program_root);
+
+        ScriptExecutionData execdata = BuildExecData(leaf_script);
+        uint256 tx_sighash;
+        BOOST_REQUIRE(SignatureHashP2MR(
+            tx_sighash,
+            execdata,
+            spend.tx_spend,
+            /*in_pos=*/0,
+            SIGHASH_DEFAULT,
+            spend.txdata,
+            MissingDataBehavior::ASSERT_FAIL));
+
+        uint32_t signature_counter{0};
+        valtype tx_sig;
+        BOOST_REQUIRE(key.Sign(tx_sighash, tx_sig, signature_counter));
+        BOOST_CHECK_EQUAL(signature_counter, 1U);
+        spend.tx_spend.vin[0].scriptWitness.stack[0] = tx_sig;
+
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_P2MR_SIG);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_checkdatasigaddpqc_accepts_n_of_n)
+{
+    CPQCKey key_a;
+    CPQCKey key_b;
+    key_a.MakeNewKey();
+    key_b.MakeNewKey();
+    BOOST_REQUIRE(key_a.IsValid());
+    BOOST_REQUIRE(key_b.IsValid());
+
+    const CPQCPubKey pubkey_a = key_a.GetPubKey();
+    const CPQCPubKey pubkey_b = key_b.GetPubKey();
+    BOOST_REQUIRE(pubkey_a.IsValid());
+    BOOST_REQUIRE(pubkey_b.IsValid());
+
+    const valtype msg_hash{DataSigMessageHash(0x49)};
+    const CScript leaf_script = BuildP2MRDataSigAddScript(2, {pubkey_a, pubkey_b}, msg_hash);
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    const P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{SignDataSigPQC(key_b, msg_hash), SignDataSigPQC(key_a, msg_hash)},
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_checkdatasigaddpqc_accepts_m_of_n_with_empty_skip)
+{
+    CPQCKey key_a;
+    CPQCKey key_b;
+    CPQCKey key_c;
+    key_a.MakeNewKey();
+    key_b.MakeNewKey();
+    key_c.MakeNewKey();
+    BOOST_REQUIRE(key_a.IsValid());
+    BOOST_REQUIRE(key_b.IsValid());
+    BOOST_REQUIRE(key_c.IsValid());
+
+    const CPQCPubKey pubkey_a = key_a.GetPubKey();
+    const CPQCPubKey pubkey_b = key_b.GetPubKey();
+    const CPQCPubKey pubkey_c = key_c.GetPubKey();
+    BOOST_REQUIRE(pubkey_a.IsValid());
+    BOOST_REQUIRE(pubkey_b.IsValid());
+    BOOST_REQUIRE(pubkey_c.IsValid());
+
+    const valtype msg_hash{DataSigMessageHash(0x4a)};
+    const CScript leaf_script = BuildP2MRDataSigAddScript(2, {pubkey_a, pubkey_b, pubkey_c}, msg_hash);
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    const P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{SignDataSigPQC(key_c, msg_hash), valtype{}, SignDataSigPQC(key_a, msg_hash)},
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_checkdatasigaddpqc_threshold_failure_is_false)
+{
+    CPQCKey key_a;
+    CPQCKey key_b;
+    CPQCKey key_c;
+    key_a.MakeNewKey();
+    key_b.MakeNewKey();
+    key_c.MakeNewKey();
+    BOOST_REQUIRE(key_a.IsValid());
+    BOOST_REQUIRE(key_b.IsValid());
+    BOOST_REQUIRE(key_c.IsValid());
+
+    const CPQCPubKey pubkey_a = key_a.GetPubKey();
+    const CPQCPubKey pubkey_b = key_b.GetPubKey();
+    const CPQCPubKey pubkey_c = key_c.GetPubKey();
+    BOOST_REQUIRE(pubkey_a.IsValid());
+    BOOST_REQUIRE(pubkey_b.IsValid());
+    BOOST_REQUIRE(pubkey_c.IsValid());
+
+    const valtype msg_hash{DataSigMessageHash(0x4b)};
+    const CScript leaf_script = BuildP2MRDataSigAddScript(2, {pubkey_a, pubkey_b, pubkey_c}, msg_hash);
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    const P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{valtype{}, valtype{}, SignDataSigPQC(key_a, msg_hash)},
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_EVAL_FALSE);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_checkdatasigaddpqc_rejects_invalid_nonempty_signature)
+{
+    CPQCKey key_a;
+    CPQCKey key_b;
+    key_a.MakeNewKey();
+    key_b.MakeNewKey();
+    BOOST_REQUIRE(key_a.IsValid());
+    BOOST_REQUIRE(key_b.IsValid());
+
+    const CPQCPubKey pubkey_a = key_a.GetPubKey();
+    const CPQCPubKey pubkey_b = key_b.GetPubKey();
+    BOOST_REQUIRE(pubkey_a.IsValid());
+    BOOST_REQUIRE(pubkey_b.IsValid());
+
+    const valtype msg_hash{DataSigMessageHash(0x4c)};
+    const CScript leaf_script = BuildP2MRDataSigAddScript(2, {pubkey_a, pubkey_b}, msg_hash);
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    valtype sig_b{SignDataSigPQC(key_b, msg_hash)};
+    BOOST_REQUIRE(!sig_b.empty());
+    sig_b[0] ^= 0x01;
+
+    const P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{sig_b, SignDataSigPQC(key_a, msg_hash)},
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_P2MR_SIG);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_checkdatasigaddpqc_rejects_stack_underflow)
+{
+    const CScript leaf_script = CScript{} << OP_CHECKDATASIGADDPQC;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    const P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{},
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_INVALID_STACK_OPERATION);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_ctv_rejects_mismatched_template_hash)
+{
+    const P2MRSpendContext matching_spend = BuildCTVSpendWithComputedHash();
+    std::vector<unsigned char> wrong_hash_bytes = ToByteVector(GetDefaultCheckTemplateVerifyHash(
+        matching_spend.tx_spend,
+        /*input_index=*/0,
+        matching_spend.txdata));
+    wrong_hash_bytes[0] ^= 0x01;
+
+    const uint256 wrong_hash{std::span<const unsigned char>{wrong_hash_bytes}};
+    const P2MRSpendContext spend = BuildCTVSpend(BuildCTVScript(wrong_hash));
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_TEMPLATE_MISMATCH);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_ctv_rejects_later_repeated_mismatch)
+{
+    const CScript placeholder_script = CScript{} << ToByteVector(uint256::ZERO) << OP_CHECKTEMPLATEVERIFY << ToByteVector(uint256::ZERO) << OP_CHECKTEMPLATEVERIFY;
+    const P2MRSpendContext placeholder = BuildCTVSpend(placeholder_script);
+    const uint256 ctv_hash = GetDefaultCheckTemplateVerifyHash(placeholder.tx_spend, /*input_index=*/0, placeholder.txdata);
+    std::vector<unsigned char> wrong_hash_bytes = ToByteVector(ctv_hash);
+    wrong_hash_bytes[0] ^= 0x01;
+    const uint256 wrong_hash{std::span<const unsigned char>{wrong_hash_bytes}};
+
+    const CScript leaf_script = CScript{} << ToByteVector(ctv_hash) << OP_CHECKTEMPLATEVERIFY << ToByteVector(wrong_hash) << OP_CHECKTEMPLATEVERIFY;
+    const P2MRSpendContext spend = BuildCTVSpend(leaf_script);
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_TEMPLATE_MISMATCH);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_ctv_rejects_empty_stack)
+{
+    const CScript leaf_script = CScript{} << OP_CHECKTEMPLATEVERIFY;
+    const P2MRSpendContext spend = BuildCTVSpend(leaf_script);
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_INVALID_STACK_OPERATION);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_checkdatasigaddpqc_validation_weight_enforced)
+{
+    const valtype msg_hash{DataSigMessageHash(0x4d)};
+    const valtype pubkey_a(PQC_PUBKEY_SIZE, 0x11);
+    const valtype pubkey_b(PQC_PUBKEY_SIZE, 0x22);
+    const CScript leaf_script = CScript{}
+        << msg_hash << OP_0 << pubkey_a << OP_CHECKDATASIGADDPQC
+        << msg_hash << OP_SWAP << pubkey_b << OP_CHECKDATASIGADDPQC
+        << OP_2 << OP_EQUAL;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    const P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{valtype{0x01}, valtype{0x01}},
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_P2MR_VALIDATION_WEIGHT);
+}
+
+BOOST_AUTO_TEST_CASE(op_checkdatasigpqc_is_bad_opcode_outside_p2mr)
+{
+    static constexpr unsigned int TAPROOT_SCRIPT_VERIFY_FLAGS{
+        SCRIPT_VERIFY_P2SH |
+        SCRIPT_VERIFY_WITNESS |
+        SCRIPT_VERIFY_TAPROOT
+    };
+
+    for (const opcodetype opcode : {OP_CHECKDATASIGPQC, OP_CHECKDATASIGADDPQC}) {
+        const CScript datasig_script = CScript{} << opcode << OP_TRUE;
+        const valtype datasig_script_bytes = ScriptBytes(datasig_script);
+
+        {
+            ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+            BOOST_CHECK(!VerifyBaseScript(datasig_script, /*flags=*/SCRIPT_VERIFY_P2SH, err));
+            BOOST_CHECK_EQUAL(err, SCRIPT_ERR_BAD_OPCODE);
+        }
+
+        {
+            const CScript p2sh_script_pubkey = GetScriptForDestination(ScriptHash(datasig_script));
+            const CScript script_sig = CScript{} << datasig_script_bytes;
+
+            ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+            BOOST_CHECK(!VerifyInputScript(
+                script_sig, p2sh_script_pubkey, CScriptWitness{}, SCRIPT_VERIFY_P2SH, err));
+            BOOST_CHECK_EQUAL(err, SCRIPT_ERR_BAD_OPCODE);
+        }
+
+        {
+            const CScript witness_v0_script_pubkey = GetScriptForDestination(WitnessV0ScriptHash(datasig_script));
+            CScriptWitness witness;
+            witness.stack.push_back(datasig_script_bytes);
+
+            ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+            BOOST_CHECK(!VerifyInputScript(
+                CScript{}, witness_v0_script_pubkey, witness, SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS, err));
+            BOOST_CHECK_EQUAL(err, SCRIPT_ERR_BAD_OPCODE);
+        }
+
+        {
+            const TaprootSpendContext spend = BuildTaprootScriptPathSpend(datasig_script);
+
+            ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+            BOOST_CHECK(VerifyTaprootSpend(spend, TAPROOT_SCRIPT_VERIFY_FLAGS, err));
+            BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+        }
+
+        {
+            const TaprootSpendContext spend = BuildTaprootScriptPathSpend(datasig_script);
+
+            ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+            BOOST_CHECK(!VerifyTaprootSpend(
+                spend, TAPROOT_SCRIPT_VERIFY_FLAGS | SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS, err));
+            BOOST_CHECK_EQUAL(err, SCRIPT_ERR_DISCOURAGE_OP_SUCCESS);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_ctv_wrong_length_is_consensus_noop_and_nonstandard)
+{
+    for (const size_t ctv_arg_size : {31U, 33U}) {
+        const CScript leaf_script = CScript{} << std::vector<unsigned char>(ctv_arg_size, 0x01) << OP_CHECKTEMPLATEVERIFY;
+        const P2MRSpendContext spend = BuildCTVSpend(leaf_script);
+
+        {
+            ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+            BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+            BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+        }
+        {
+            ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+            BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS | SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS, err));
+            BOOST_CHECK_EQUAL(err, SCRIPT_ERR_DISCOURAGE_OP_SUCCESS);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_ctv_commits_to_transaction_fields)
+{
+    const P2MRSpendContext spend = BuildCTVSpendWithComputedHash();
+
+    CheckCTVMutationFails(spend, [](CMutableTransaction& tx) {
+        ++tx.version;
+    });
+    CheckCTVMutationFails(spend, [](CMutableTransaction& tx) {
+        ++tx.nLockTime;
+    });
+    CheckCTVMutationFails(spend, [](CMutableTransaction& tx) {
+        --tx.vin[0].nSequence;
+    });
+    CheckCTVMutationFails(spend, [](CMutableTransaction& tx) {
+        ++tx.vout[0].nValue;
+    });
+    CheckCTVMutationFails(spend, [](CMutableTransaction& tx) {
+        tx.vin.emplace_back(COutPoint{Txid::FromUint256(uint256::ONE), 1});
+    });
+    CheckCTVMutationFails(spend, [](CMutableTransaction& tx) {
+        tx.vout.emplace_back(1, CScript{} << OP_TRUE);
+    });
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_ctv_commits_to_output_order)
+{
+    const P2MRSpendContext spend = BuildCTVSpendWithComputedHash([](CMutableTransaction& tx) {
+        tx.vout.emplace_back(1, CScript{} << OP_FALSE);
+    });
+
+    CheckCTVMutationFails(spend, [](CMutableTransaction& tx) {
+        std::swap(tx.vout[0], tx.vout[1]);
+    });
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_ctv_commits_to_input_order)
+{
+    const P2MRSpendContext spend = BuildCTVSpendWithComputedHash([](CMutableTransaction& tx) {
+        tx.vin[0].nSequence = 1;
+        tx.vin.emplace_back(COutPoint{Txid::FromUint256(uint256::ONE), 1}, CScript{}, 2);
+    });
+
+    CheckCTVMutationFails(spend, [](CMutableTransaction& tx) {
+        std::swap(tx.vin[0].prevout, tx.vin[1].prevout);
+        std::swap(tx.vin[0].scriptSig, tx.vin[1].scriptSig);
+        std::swap(tx.vin[0].nSequence, tx.vin[1].nSequence);
+    });
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_ctv_default_hash_commits_to_input_index_and_scriptsigs)
+{
+    CMutableTransaction tx;
+    tx.version = 3;
+    tx.nLockTime = 17;
+    tx.vin.emplace_back(COutPoint{Txid::FromUint256(uint256::ONE), 0}, CScript{}, 1);
+    tx.vin.emplace_back(COutPoint{Txid::FromUint256(uint256::ONE), 1}, CScript{}, 2);
+    tx.vout.emplace_back(100, CScript{} << OP_TRUE);
+
+    PrecomputedTransactionData txdata;
+    txdata.Init(tx, {}, /*force=*/true);
+    BOOST_CHECK(txdata.m_ctv_ready);
+    BOOST_CHECK(!txdata.m_ctv_has_nonempty_script_sigs);
+    BOOST_CHECK(GetDefaultCheckTemplateVerifyHash(tx, 0, txdata) != GetDefaultCheckTemplateVerifyHash(tx, 1, txdata));
+
+    CMutableTransaction with_scriptsig{tx};
+    with_scriptsig.vin[1].scriptSig = CScript{} << std::vector<unsigned char>{0x01, 0x02};
+    PrecomputedTransactionData with_scriptsig_data;
+    with_scriptsig_data.Init(with_scriptsig, {}, /*force=*/true);
+    BOOST_CHECK(with_scriptsig_data.m_ctv_ready);
+    BOOST_CHECK(with_scriptsig_data.m_ctv_has_nonempty_script_sigs);
+    BOOST_CHECK(GetDefaultCheckTemplateVerifyHash(tx, 0, txdata) != GetDefaultCheckTemplateVerifyHash(with_scriptsig, 0, with_scriptsig_data));
+
+    CMutableTransaction mutated_scriptsig{with_scriptsig};
+    mutated_scriptsig.vin[1].scriptSig = CScript{} << std::vector<unsigned char>{0x01, 0x03};
+    PrecomputedTransactionData mutated_scriptsig_data;
+    mutated_scriptsig_data.Init(mutated_scriptsig, {}, /*force=*/true);
+    BOOST_CHECK(GetDefaultCheckTemplateVerifyHash(with_scriptsig, 0, with_scriptsig_data) != GetDefaultCheckTemplateVerifyHash(mutated_scriptsig, 0, mutated_scriptsig_data));
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_ctv_default_hash_reference_vectors)
+{
+    CMutableTransaction tx;
+    tx.version = 3;
+    tx.nLockTime = 17;
+    tx.vin.emplace_back(COutPoint{Txid::FromUint256(uint256::ONE), 0}, CScript{}, 0xfffffffe);
+    tx.vin.emplace_back(COutPoint{Txid::FromUint256(uint256::ONE), 1}, CScript{}, 42);
+    tx.vout.emplace_back(123456789, CScript{} << OP_TRUE);
+    tx.vout.emplace_back(987654321, CScript{} << std::vector<unsigned char>{0x02, 0x03, 0x04});
+
+    PrecomputedTransactionData txdata;
+    txdata.Init(tx, {}, /*force=*/true);
+    BOOST_CHECK(txdata.m_ctv_ready);
+    BOOST_CHECK(!txdata.m_ctv_has_nonempty_script_sigs);
+    BOOST_CHECK_EQUAL(HexStr(ToByteVector(GetDefaultCheckTemplateVerifyHash(tx, 0, txdata))), "4bd687b4313aaf7c5b807ec5ee6940e3a1cac9c63143e91e212a74865d6069df");
+    BOOST_CHECK_EQUAL(HexStr(ToByteVector(GetDefaultCheckTemplateVerifyHash(tx, 1, txdata))), "e34cbaa6054ea4f142b1b89e4839d031cfe95aeb284c974c73118be77e682dd9");
+
+    CMutableTransaction with_scriptsig{tx};
+    with_scriptsig.vin[1].scriptSig = CScript{} << std::vector<unsigned char>{0xaa, 0xbb, 0xcc};
+    PrecomputedTransactionData with_scriptsig_data;
+    with_scriptsig_data.Init(with_scriptsig, {}, /*force=*/true);
+    BOOST_CHECK(with_scriptsig_data.m_ctv_ready);
+    BOOST_CHECK(with_scriptsig_data.m_ctv_has_nonempty_script_sigs);
+    BOOST_CHECK_EQUAL(HexStr(ToByteVector(GetDefaultCheckTemplateVerifyHash(with_scriptsig, 0, with_scriptsig_data))), "edcdcb08373d2c0f30d5342c81e0d7b19b954e23748531a48357f6fa5c63af99");
+    BOOST_CHECK_EQUAL(HexStr(ToByteVector(GetDefaultCheckTemplateVerifyHash(with_scriptsig, 1, with_scriptsig_data))), "cb13fcd1e83bca2a1f77061ad356da7658447be753a8e97d9c66967c90dc334b");
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_ctv_with_checksigpqc_accepts_valid_signature)
+{
+    CPQCKey key;
+    key.MakeNewKey();
+    BOOST_REQUIRE(key.IsValid());
+    const CPQCPubKey pubkey = key.GetPubKey();
+    BOOST_REQUIRE(pubkey.IsValid());
+
+    const CScript placeholder_script = BuildCTVAndPQCChecksigScript(uint256::ZERO, pubkey);
+    P2MRSpendContext placeholder = BuildCTVSpend(placeholder_script, {std::vector<unsigned char>(PQC_SIG_SIZE, 0x00)});
+    const uint256 ctv_hash = GetDefaultCheckTemplateVerifyHash(placeholder.tx_spend, /*input_index=*/0, placeholder.txdata);
+
+    const CScript leaf_script = BuildCTVAndPQCChecksigScript(ctv_hash, pubkey);
+    P2MRSpendContext spend = BuildCTVSpend(leaf_script, {std::vector<unsigned char>(PQC_SIG_SIZE, 0x00)});
+
+    ScriptExecutionData execdata = BuildExecData(leaf_script);
+    uint256 sighash;
+    BOOST_REQUIRE(SignatureHashP2MR(
+        sighash,
+        execdata,
+        spend.tx_spend,
+        /*in_pos=*/0,
+        SIGHASH_DEFAULT,
+        spend.txdata,
+        MissingDataBehavior::ASSERT_FAIL));
+
+    uint32_t signature_counter{0};
+    std::vector<unsigned char> sig;
+    BOOST_REQUIRE(key.Sign(sighash, sig, signature_counter));
+    BOOST_CHECK_EQUAL(signature_counter, 1U);
+
+    spend.tx_spend.vin[0].scriptWitness.stack[0] = sig;
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_ctv_with_checkdatasigaddpqc_accepts_valid_threshold)
+{
+    CPQCKey key_a;
+    CPQCKey key_b;
+    key_a.MakeNewKey();
+    key_b.MakeNewKey();
+    BOOST_REQUIRE(key_a.IsValid());
+    BOOST_REQUIRE(key_b.IsValid());
+
+    const CPQCPubKey pubkey_a = key_a.GetPubKey();
+    const CPQCPubKey pubkey_b = key_b.GetPubKey();
+    BOOST_REQUIRE(pubkey_a.IsValid());
+    BOOST_REQUIRE(pubkey_b.IsValid());
+
+    const valtype msg_hash{DataSigMessageHash(0x4e)};
+    const CScript placeholder_script = BuildCTVAndDataSigAddScript(uint256::ZERO, 2, {pubkey_a, pubkey_b}, msg_hash);
+    const P2MRSpendContext placeholder = BuildCTVSpend(placeholder_script);
+    const uint256 ctv_hash = GetDefaultCheckTemplateVerifyHash(placeholder.tx_spend, /*input_index=*/0, placeholder.txdata);
+
+    const CScript leaf_script = BuildCTVAndDataSigAddScript(ctv_hash, 2, {pubkey_a, pubkey_b}, msg_hash);
+    const P2MRSpendContext spend = BuildCTVSpend(leaf_script, {SignDataSigPQC(key_b, msg_hash), SignDataSigPQC(key_a, msg_hash)});
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_ctv_with_checkdatasigaddpqc_rejects_template_mismatch)
+{
+    CPQCKey key_a;
+    CPQCKey key_b;
+    key_a.MakeNewKey();
+    key_b.MakeNewKey();
+    BOOST_REQUIRE(key_a.IsValid());
+    BOOST_REQUIRE(key_b.IsValid());
+
+    const CPQCPubKey pubkey_a = key_a.GetPubKey();
+    const CPQCPubKey pubkey_b = key_b.GetPubKey();
+    BOOST_REQUIRE(pubkey_a.IsValid());
+    BOOST_REQUIRE(pubkey_b.IsValid());
+
+    const valtype msg_hash{DataSigMessageHash(0x4f)};
+    const CScript placeholder_script = BuildCTVAndDataSigAddScript(uint256::ZERO, 2, {pubkey_a, pubkey_b}, msg_hash);
+    const P2MRSpendContext placeholder = BuildCTVSpend(placeholder_script);
+    const uint256 ctv_hash = GetDefaultCheckTemplateVerifyHash(placeholder.tx_spend, /*input_index=*/0, placeholder.txdata);
+
+    const CScript leaf_script = BuildCTVAndDataSigAddScript(ctv_hash, 2, {pubkey_a, pubkey_b}, msg_hash);
+    P2MRSpendContext spend = BuildCTVSpend(leaf_script, {SignDataSigPQC(key_b, msg_hash), SignDataSigPQC(key_a, msg_hash)});
+
+    CheckCTVMutationFails(spend, [](CMutableTransaction& tx) {
+        tx.vout[0].nValue -= 1;
+    });
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_checksigpqc_rejects_invalid_signature)
+{
+    CPQCKey key;
+    key.MakeNewKey();
+    BOOST_REQUIRE(key.IsValid());
+    const CPQCPubKey pubkey = key.GetPubKey();
+
+    const CScript leaf_script = CScript{} << std::vector<unsigned char>(pubkey.begin(), pubkey.end()) << OP_CHECKSIGPQC;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{std::vector<unsigned char>(PQC_SIG_SIZE, 0x00)},
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+
+    ScriptExecutionData execdata = BuildExecData(leaf_script);
+    uint256 sighash;
+    BOOST_REQUIRE(SignatureHashP2MR(
+        sighash,
+        execdata,
+        spend.tx_spend,
+        /*in_pos=*/0,
+        SIGHASH_DEFAULT,
+        spend.txdata,
+        MissingDataBehavior::ASSERT_FAIL));
+
+    uint32_t signature_counter{0};
+    std::vector<unsigned char> sig;
+    BOOST_REQUIRE(key.Sign(sighash, sig, signature_counter));
+    BOOST_REQUIRE(!sig.empty());
+    sig[0] ^= 0x01;
+    spend.tx_spend.vin[0].scriptWitness.stack[0] = sig;
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_P2MR_SIG);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_checksigpqc_rejects_invalid_signature_size)
+{
+    const std::vector<unsigned char> pubkey(PQC_PUBKEY_SIZE, 0x02);
+    const CScript leaf_script = CScript{} << pubkey << OP_CHECKSIGPQC;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    const P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{std::vector<unsigned char>(PQC_SIG_SIZE - 1, 0x01)},
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_P2MR_SIG_SIZE);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_checksigpqc_rejects_empty_signature)
+{
+    const std::vector<unsigned char> pubkey(PQC_PUBKEY_SIZE, 0x02);
+    const CScript leaf_script = CScript{} << pubkey << OP_CHECKSIGPQC << OP_VERIFY << OP_TRUE;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    const P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{valtype{}},
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_VERIFY);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_checksigpqc_rejects_oversized_signature)
+{
+    const std::vector<unsigned char> pubkey(PQC_PUBKEY_SIZE, 0x02);
+    const CScript leaf_script = CScript{} << pubkey << OP_CHECKSIGPQC;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    std::vector<unsigned char> oversized_sig(PQC_SIG_SIZE + 2, 0x00);
+
+    const P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{oversized_sig},
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_P2MR_SIG_SIZE);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_checksigpqc_rejects_wrong_pubkey_type)
+{
+    const CScript leaf_script = CScript{} << std::vector<unsigned char>{} << OP_CHECKSIGPQC;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    // Keep the witness budget above the per-sigop cost so PUBKEYTYPE is reached.
+    std::vector<unsigned char> sig(PQC_SIG_SIZE, 0x00);
+
+    const P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{sig},
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_PUBKEYTYPE);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_checksigpqc_rejects_malformed_pubkey)
+{
+    const std::vector<unsigned char> malformed_pubkey(33, 0x02);
+    const CScript leaf_script = CScript{} << malformed_pubkey << OP_CHECKSIGPQC;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    std::vector<unsigned char> sig(PQC_SIG_SIZE, 0x00);
+
+    const P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{sig},
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_PUBKEYTYPE);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_checksigpqc_rejects_non_32_byte_pubkey)
+{
+    const std::vector<unsigned char> malformed_pubkey(33, 0x02);
+    const CScript leaf_script = CScript{} << malformed_pubkey << OP_CHECKSIGPQC;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    const P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{std::vector<unsigned char>(PQC_SIG_SIZE, 0x00)},
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+
+    {
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_PUBKEYTYPE);
+    }
+
+    {
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS | SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE, err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_PUBKEYTYPE);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_checksigpqc_rejects_stack_underflow)
+{
+    const CScript leaf_script = CScript{} << OP_CHECKSIGPQC;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    const P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{},
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_INVALID_STACK_OPERATION);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_checksigpqc_rejects_sighash_default_byte_suffix)
+{
+    CPQCKey key;
+    key.MakeNewKey();
+    BOOST_REQUIRE(key.IsValid());
+    const CPQCPubKey pubkey = key.GetPubKey();
+    BOOST_REQUIRE(pubkey.IsValid());
+
+    const CScript leaf_script = CScript{} << std::vector<unsigned char>(pubkey.begin(), pubkey.end()) << OP_CHECKSIGPQC;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{std::vector<unsigned char>(PQC_SIG_SIZE, 0x00)},
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+
+    ScriptExecutionData execdata = BuildExecData(leaf_script);
+    uint256 sighash;
+    BOOST_REQUIRE(SignatureHashP2MR(
+        sighash,
+        execdata,
+        spend.tx_spend,
+        /*in_pos=*/0,
+        SIGHASH_DEFAULT,
+        spend.txdata,
+        MissingDataBehavior::ASSERT_FAIL));
+
+    uint32_t signature_counter{0};
+    std::vector<unsigned char> sig;
+    BOOST_REQUIRE(key.Sign(sighash, sig, signature_counter));
+    BOOST_CHECK_EQUAL(sig.size(), PQC_SIG_SIZE);
+
+    std::vector<unsigned char> witness_sig{sig};
+    witness_sig.push_back(SIGHASH_DEFAULT);
+    spend.tx_spend.vin[0].scriptWitness.stack[0] = witness_sig;
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_P2MR_SIG_HASHTYPE);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_checksigpqc_rejects_invalid_sighash_byte_suffix)
+{
+    static constexpr uint8_t INVALID_SIGHASH_TYPE = 0x04;
+
+    CPQCKey key;
+    key.MakeNewKey();
+    BOOST_REQUIRE(key.IsValid());
+    const CPQCPubKey pubkey = key.GetPubKey();
+    BOOST_REQUIRE(pubkey.IsValid());
+
+    const CScript leaf_script = CScript{} << std::vector<unsigned char>(pubkey.begin(), pubkey.end()) << OP_CHECKSIGPQC;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{std::vector<unsigned char>(PQC_SIG_SIZE, 0x00)},
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+
+    ScriptExecutionData execdata = BuildExecData(leaf_script);
+    uint256 sighash;
+    BOOST_REQUIRE(SignatureHashP2MR(
+        sighash,
+        execdata,
+        spend.tx_spend,
+        /*in_pos=*/0,
+        SIGHASH_DEFAULT,
+        spend.txdata,
+        MissingDataBehavior::ASSERT_FAIL));
+
+    uint32_t signature_counter{0};
+    std::vector<unsigned char> sig;
+    BOOST_REQUIRE(key.Sign(sighash, sig, signature_counter));
+    BOOST_CHECK_EQUAL(sig.size(), PQC_SIG_SIZE);
+
+    std::vector<unsigned char> witness_sig{sig};
+    witness_sig.push_back(INVALID_SIGHASH_TYPE);
+    spend.tx_spend.vin[0].scriptWitness.stack[0] = witness_sig;
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_P2MR_SIG_HASHTYPE);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_annex_present_path_succeeds)
+{
+    const CScript leaf_script = CScript{} << OP_TRUE;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{},
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+    spend.tx_spend.vin[0].scriptWitness.stack.push_back(std::vector<unsigned char>{static_cast<unsigned char>(ANNEX_TAG), 0x01, 0x02});
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_annex_then_underflow_rejected)
+{
+    const CScript leaf_script = CScript{} << OP_TRUE;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{},
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+
+    spend.tx_spend.vin[0].scriptWitness.stack = {
+        std::vector<unsigned char>{0x01},
+        std::vector<unsigned char>{static_cast<unsigned char>(ANNEX_TAG), 0xAA},
+    };
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_validation_weight_enforced_for_small_witness)
+{
+    const std::vector<unsigned char> malformed_pubkey_a(33, 0x11);
+    const std::vector<unsigned char> malformed_pubkey_b(33, 0x22);
+
+    const CScript leaf_script = CScript{}
+        << OP_0
+        << malformed_pubkey_a << OP_CHECKSIGADD
+        << malformed_pubkey_b << OP_CHECKSIGADD
+        << OP_2 << OP_EQUAL;
+
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    const P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{valtype{0x01}, valtype{0x01}},
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_P2MR_VALIDATION_WEIGHT);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_initial_stack_item_size_boundary)
+{
+    const CScript leaf_script = CScript{} << OP_DROP << OP_TRUE;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    for (const size_t item_size : {
+        static_cast<size_t>(MAX_P2MR_V1_STACK_ITEM_SIZE - 1),
+        static_cast<size_t>(MAX_P2MR_V1_STACK_ITEM_SIZE),
+    }) {
+        const P2MRSpendContext spend = BuildP2MRSpend(
+            leaf_script,
+            /*stack_items=*/{std::vector<unsigned char>(item_size, 0x01)},
+            /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+            program_root);
+
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+    }
+
+    {
+        const P2MRSpendContext spend = BuildP2MRSpend(
+            leaf_script,
+            /*stack_items=*/{std::vector<unsigned char>(MAX_P2MR_V1_STACK_ITEM_SIZE + 1, 0x01)},
+            /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+            program_root);
+
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_PUSH_SIZE);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_initial_stack_total_bytes_boundary)
+{
+    for (const size_t total_bytes : {
+        static_cast<size_t>(MAX_P2MR_V1_TOTAL_INITIAL_STACK_BYTES - 1),
+        static_cast<size_t>(MAX_P2MR_V1_TOTAL_INITIAL_STACK_BYTES),
+    }) {
+        const std::vector<valtype> stack_items{BuildP2MRStackItemsForTotalBytes(total_bytes)};
+        const CScript leaf_script{BuildDropAllScript(stack_items.size())};
+        const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+        const P2MRSpendContext spend = BuildP2MRSpend(
+            leaf_script,
+            stack_items,
+            /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+            program_root);
+
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+    }
+
+    {
+        const std::vector<valtype> stack_items{BuildP2MRStackItemsForTotalBytes(MAX_P2MR_V1_TOTAL_INITIAL_STACK_BYTES + 1)};
+        const CScript leaf_script{BuildDropAllScript(stack_items.size())};
+        const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+        const P2MRSpendContext spend = BuildP2MRSpend(
+            leaf_script,
+            stack_items,
+            /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+            program_root);
+
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_PUSH_SIZE);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_rejects_stack_copy_amplification_item)
+{
+    const CScript leaf_script = CScript{} << OP_DUP << OP_DROP << OP_DROP << OP_TRUE;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+    const P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{std::vector<unsigned char>(MAX_P2MR_V1_STACK_ITEM_SIZE + 1, 0x01)},
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_PUSH_SIZE);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_rejects_too_many_initial_stack_items)
+{
+    {
+        const std::vector<valtype> stack_items(MAX_STACK_SIZE);
+        const CScript leaf_script{BuildDropAllScript(stack_items.size())};
+        const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+        const P2MRSpendContext spend = BuildP2MRSpend(
+            leaf_script,
+            stack_items,
+            /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+            program_root);
+
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+    }
+
+    {
+        const CScript leaf_script = CScript{} << OP_TRUE;
+        const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+        const std::vector<valtype> stack_items(MAX_STACK_SIZE + 1);
+        const P2MRSpendContext spend = BuildP2MRSpend(
+            leaf_script,
+            stack_items,
+            /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+            program_root);
+
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_STACK_SIZE);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_op_success_cannot_bypass_stack_resource_limits)
+{
+    const CScript leaf_script = CScript{} << OP_RESERVED;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+
+    {
+        const P2MRSpendContext spend = BuildP2MRSpend(
+            leaf_script,
+            /*stack_items=*/{std::vector<unsigned char>(MAX_P2MR_V1_STACK_ITEM_SIZE + 1, 0x01)},
+            /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+            program_root);
+
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_PUSH_SIZE);
+    }
+
+    {
+        const std::vector<valtype> stack_items(MAX_STACK_SIZE + 1);
+        const P2MRSpendContext spend = BuildP2MRSpend(
+            leaf_script,
+            stack_items,
+            /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+            program_root);
+
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_STACK_SIZE);
+    }
+
+    {
+        const std::vector<valtype> stack_items{BuildP2MRStackItemsForTotalBytes(MAX_P2MR_V1_TOTAL_INITIAL_STACK_BYTES + 1)};
+        const P2MRSpendContext spend = BuildP2MRSpend(
+            leaf_script,
+            stack_items,
+            /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+            program_root);
+
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_PUSH_SIZE);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(op_checksigpqc_is_invalid_outside_p2mr)
+{
+    const CScript checksigpqc_script = CScript{} << OP_CHECKSIGPQC << OP_TRUE;
+    const valtype checksigpqc_script_bytes = ScriptBytes(checksigpqc_script);
+
+    {
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(!VerifyBaseScript(checksigpqc_script, /*flags=*/SCRIPT_VERIFY_P2SH, err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_BAD_OPCODE);
+    }
+
+    {
+        const CScript p2sh_script_pubkey = GetScriptForDestination(ScriptHash(checksigpqc_script));
+        const CScript script_sig = CScript{} << checksigpqc_script_bytes;
+
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(!VerifyInputScript(script_sig, p2sh_script_pubkey, CScriptWitness{}, SCRIPT_VERIFY_P2SH, err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_BAD_OPCODE);
+    }
+
+    {
+        const CScript witness_v0_script_pubkey = GetScriptForDestination(WitnessV0ScriptHash(checksigpqc_script));
+        CScriptWitness witness;
+        witness.stack.push_back(checksigpqc_script_bytes);
+
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(!VerifyInputScript(CScript{}, witness_v0_script_pubkey, witness, SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS, err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_BAD_OPCODE);
+    }
+
+    {
+        TaprootBuilder builder;
+        builder.Add(/*depth=*/0, checksigpqc_script_bytes, TAPROOT_LEAF_TAPSCRIPT).Finalize(XOnlyPubKey::NUMS_H);
+        const TaprootSpendData spend_data = builder.GetSpendData();
+        const auto script_leaf = std::make_pair(checksigpqc_script_bytes, static_cast<int>(TAPROOT_LEAF_TAPSCRIPT));
+        const auto& control_blocks = spend_data.scripts.at(script_leaf);
+        CScriptWitness witness;
+        witness.stack.push_back(checksigpqc_script_bytes);
+        witness.stack.push_back(*control_blocks.begin());
+
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(!VerifyInputScript(
+            CScript{},
+            GetScriptForDestination(builder.GetOutput()),
+            witness,
+            SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_TAPROOT,
+            err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_BAD_OPCODE);
+    }
+
+    {
+        const CScript unexecuted = CScript{} << OP_FALSE << OP_IF << OP_CHECKSIGPQC << OP_ENDIF << OP_TRUE;
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(VerifyBaseScript(unexecuted, SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS, err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+    }
+}
+
+BOOST_AUTO_TEST_SUITE_END()

@@ -2,12 +2,12 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_QT_BITCOINGUI_H
-#define BITCOIN_QT_BITCOINGUI_H
+#ifndef QBIT_QT_BITCOINGUI_H
+#define QBIT_QT_BITCOINGUI_H
 
 #include <bitcoin-build-config.h> // IWYU pragma: keep
 
-#include <qt/bitcoinunits.h>
+#include <qt/qbitunits.h>
 #include <qt/clientmodel.h>
 #include <qt/guiutil.h>
 #include <qt/optionsdialog.h>
@@ -183,6 +183,9 @@ private:
     /** Keep track of previous number of blocks, to detect progress */
     int prevBlocks = 0;
     int spinnerFrame = 0;
+    bool m_headers_presync_active{false};
+    int64_t m_headers_presync_height{0};
+    QDateTime m_headers_presync_block_date;
 
     const PlatformStyle *platformStyle;
     const NetworkStyle* const m_network_style;
@@ -265,7 +268,7 @@ public Q_SLOTS:
     bool handlePaymentRequest(const SendCoinsRecipient& recipient);
 
     /** Show incoming transaction notification for new transactions. */
-    void incomingTransaction(const QString& date, BitcoinUnit unit, const CAmount& amount, const QString& type, const QString& address, const QString& label, const QString& walletName);
+    void incomingTransaction(const QString& date, QbitUnit unit, const CAmount& amount, const QString& type, const QString& address, const QString& label, const QString& walletName);
 #endif // ENABLE_WALLET
 
 private:
@@ -348,9 +351,9 @@ private:
 
 private Q_SLOTS:
     /** When Display Units are changed on OptionsModel it will refresh the display text of the control on the status bar */
-    void updateDisplayUnit(BitcoinUnit newUnits);
+    void updateDisplayUnit(QbitUnit newUnits);
     /** Tells underlying optionsModel to update its current display unit. */
     void onMenuSelection(QAction* action);
 };
 
-#endif // BITCOIN_QT_BITCOINGUI_H
+#endif // QBIT_QT_BITCOINGUI_H

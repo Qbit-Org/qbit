@@ -22,7 +22,10 @@
 using node::BlockAssembler;
 
 namespace validation_block_tests {
-struct MinerTestingSetup : public RegTestingSetup {
+struct MinerTestingSetup : public TestingSetup {
+    MinerTestingSetup()
+        : TestingSetup{ChainType::REGTEST, {.extra_args = {"-p2mronly=0"}}} {}
+
     std::shared_ptr<CBlock> Block(const uint256& prev_hash);
     std::shared_ptr<const CBlock> GoodBlock(const uint256& prev_hash);
     std::shared_ptr<const CBlock> BadBlock(const uint256& prev_hash);
@@ -107,6 +110,38 @@ std::shared_ptr<CBlock> MinerTestingSetup::FinalizeBlock(std::shared_ptr<CBlock>
     BOOST_CHECK(Assert(m_node.chainman)->ProcessNewBlockHeaders({{pblock->GetBlockHeader()}}, true, ignored));
 
     return pblock;
+}
+
+static CTransactionRef WitnessTx(const uint64_t prevout_tag, std::vector<std::vector<unsigned char>> witness_stack)
+{
+    CMutableTransaction tx;
+    tx.vin.emplace_back(COutPoint{Txid::FromUint256(uint256{static_cast<uint8_t>(prevout_tag)}), 0}, CScript{}, /*nSequence=*/0);
+    tx.vout.emplace_back(/*nValue=*/0, CScript{} << OP_TRUE);
+    tx.vin[0].scriptWitness.stack = std::move(witness_stack);
+    return MakeTransactionRef(std::move(tx));
+}
+
+static std::shared_ptr<const CBlock> StripWitnesses(const CBlock& block)
+{
+    auto stripped_block{std::make_shared<CBlock>(block)};
+    for (auto& tx : stripped_block->vtx) {
+        CMutableTransaction mutable_tx{*tx};
+        for (auto& txin : mutable_tx.vin) txin.scriptWitness.SetNull();
+        tx = MakeTransactionRef(std::move(mutable_tx));
+    }
+    return stripped_block;
+}
+
+static BlockValidationState AcceptBlockForTest(ChainstateManager& chainman, const std::shared_ptr<const CBlock>& block, bool requested_stripped)
+{
+    BlockValidationState state;
+    bool new_block{false};
+    {
+        LOCK(::cs_main);
+        BOOST_CHECK(!chainman.AcceptBlock(block, state, /*ppindex=*/nullptr, /*fRequested=*/true, /*dbp=*/nullptr, &new_block, /*min_pow_checked=*/true, requested_stripped));
+    }
+    BOOST_CHECK(state.IsInvalid());
+    return state;
 }
 
 // construct a valid block
@@ -207,6 +242,131 @@ BOOST_AUTO_TEST_CASE(processnewblock_signals_ordering)
 
     LOCK(cs_main);
     BOOST_CHECK_EQUAL(sub->m_expected_tip, m_node.chainman->ActiveChain().Tip()->GetBlockHash());
+}
+
+BOOST_AUTO_TEST_CASE(processnewblock_rejects_stripped_segwit_blocks_even_when_requested_stripped)
+{
+    bool ignored{false};
+    BOOST_REQUIRE(Assert(m_node.chainman)->ProcessNewBlock(std::make_shared<CBlock>(Params().GenesisBlock()), true, true, &ignored));
+
+    const uint256 prev_hash{WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain().Tip()->GetBlockHash())};
+    const auto full_block{GoodBlock(prev_hash)};
+
+    BOOST_REQUIRE(GetWitnessCommitmentIndex(*full_block) != NO_WITNESS_COMMITMENT);
+    BOOST_CHECK(HasAnyWitnessData(*full_block));
+    BOOST_REQUIRE(Assert(m_node.chainman)->ProcessNewBlock(full_block, /*force_processing=*/true, /*min_pow_checked=*/true, &ignored, /*requested_stripped=*/false));
+
+    WITH_LOCK(::cs_main, {
+        const CBlockIndex* pindex{m_node.chainman->m_blockman.LookupBlockIndex(full_block->GetHash())};
+        BOOST_REQUIRE(pindex != nullptr);
+        BOOST_CHECK((pindex->nStatus & BLOCK_OPT_WITNESS_PRUNED) == 0);
+    });
+
+    auto stripped_block{std::make_shared<CBlock>(*GoodBlock(full_block->GetHash()))};
+    for (auto& tx : stripped_block->vtx) {
+        CMutableTransaction mutable_tx{*tx};
+        for (auto& txin : mutable_tx.vin) txin.scriptWitness.SetNull();
+        tx = MakeTransactionRef(std::move(mutable_tx));
+    }
+    BOOST_CHECK(!HasAnyWitnessData(*stripped_block));
+    BOOST_CHECK(!Assert(m_node.chainman)->ProcessNewBlock(stripped_block, /*force_processing=*/true, /*min_pow_checked=*/true, &ignored, /*requested_stripped=*/true));
+}
+
+BOOST_AUTO_TEST_CASE(acceptblock_rejects_requested_stripped_block_hiding_overweight_witness)
+{
+    bool ignored{false};
+    BOOST_REQUIRE(Assert(m_node.chainman)->ProcessNewBlock(std::make_shared<CBlock>(Params().GenesisBlock()), true, true, &ignored));
+
+    const uint256 prev_hash{WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain().Tip()->GetBlockHash())};
+
+    auto full_block{Block(prev_hash)};
+    full_block->vtx.push_back(WitnessTx(/*prevout_tag=*/1, {{std::vector<unsigned char>(MAX_BLOCK_WEIGHT, 0x42)}}));
+    full_block = FinalizeBlock(full_block);
+    BOOST_REQUIRE(GetWitnessCommitmentIndex(*full_block) != NO_WITNESS_COMMITMENT);
+    BOOST_REQUIRE(HasAnyWitnessData(*full_block));
+    BOOST_CHECK_GT(GetBlockWeight(*full_block), MAX_BLOCK_WEIGHT);
+
+    const BlockValidationState full_state{
+        AcceptBlockForTest(*Assert(m_node.chainman), full_block, /*requested_stripped=*/false)};
+    BOOST_CHECK_EQUAL(full_state.GetRejectReason(), "bad-blk-weight");
+
+    auto stripped_source{Block(prev_hash)};
+    stripped_source->vtx.push_back(WitnessTx(/*prevout_tag=*/2, {{std::vector<unsigned char>(MAX_BLOCK_WEIGHT, 0x24)}}));
+    stripped_source = FinalizeBlock(stripped_source);
+    BOOST_CHECK_GT(GetBlockWeight(*stripped_source), MAX_BLOCK_WEIGHT);
+
+    const auto stripped_block{StripWitnesses(*stripped_source)};
+    BOOST_CHECK_EQUAL(stripped_source->GetHash(), stripped_block->GetHash());
+    BOOST_CHECK(!HasAnyWitnessData(*stripped_block));
+    BOOST_CHECK_LE(GetBlockWeight(*stripped_block), MAX_BLOCK_WEIGHT);
+
+    BlockValidationState check_state;
+    BOOST_CHECK(CheckBlock(*stripped_block, check_state, Params().GetConsensus()));
+
+    // Keep `allow_stripped` behind `RequiresWitnessForPeerBlock()`: omitted
+    // post-segwit witness bytes can hide both total block weight and witness
+    // commitment failures in `ContextualCheckBlock()` / `CheckWitnessMalleation()`.
+    const BlockValidationState stripped_state{
+        AcceptBlockForTest(*Assert(m_node.chainman), stripped_block, /*requested_stripped=*/true)};
+    BOOST_CHECK_EQUAL(stripped_state.GetRejectReason(), "bad-blk-missing-witness");
+}
+
+BOOST_AUTO_TEST_CASE(acceptblock_rejects_requested_stripped_block_hiding_invalid_witness_commitment)
+{
+    bool ignored{false};
+    BOOST_REQUIRE(Assert(m_node.chainman)->ProcessNewBlock(std::make_shared<CBlock>(Params().GenesisBlock()), true, true, &ignored));
+
+    const uint256 prev_hash{WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain().Tip()->GetBlockHash())};
+
+    auto full_block{std::make_shared<CBlock>(*GoodBlock(prev_hash))};
+    full_block->fChecked = false;
+    full_block->m_checked_merkle_root = false;
+    full_block->m_checked_witness_commitment = false;
+    BOOST_REQUIRE(GetWitnessCommitmentIndex(*full_block) != NO_WITNESS_COMMITMENT);
+    BOOST_REQUIRE(HasAnyWitnessData(*full_block));
+
+    CMutableTransaction mutated_coinbase{*full_block->vtx[0]};
+    BOOST_REQUIRE_EQUAL(mutated_coinbase.vin.size(), 1U);
+    BOOST_REQUIRE_EQUAL(mutated_coinbase.vin[0].scriptWitness.stack.size(), 1U);
+    BOOST_REQUIRE_EQUAL(mutated_coinbase.vin[0].scriptWitness.stack[0].size(), 32U);
+    mutated_coinbase.vin[0].scriptWitness.stack[0][0] ^= 1;
+    full_block->vtx[0] = MakeTransactionRef(std::move(mutated_coinbase));
+    BOOST_CHECK_EQUAL(full_block->hashMerkleRoot, BlockMerkleRoot(*full_block));
+    const int commitpos{GetWitnessCommitmentIndex(*full_block)};
+    BOOST_REQUIRE(commitpos != NO_WITNESS_COMMITMENT);
+    uint256 mutated_commitment{BlockWitnessMerkleRoot(*full_block, nullptr)};
+    CHash256().Write(mutated_commitment).Write(full_block->vtx[0]->vin[0].scriptWitness.stack[0]).Finalize(mutated_commitment);
+    BOOST_CHECK(memcmp(mutated_commitment.begin(), &full_block->vtx[0]->vout[commitpos].scriptPubKey[6], 32) != 0);
+    BOOST_CHECK(IsBlockMutated(*full_block, /*check_witness_root=*/true));
+    full_block->fChecked = false;
+    full_block->m_checked_merkle_root = false;
+    full_block->m_checked_witness_commitment = false;
+
+    const BlockValidationState full_state{
+        AcceptBlockForTest(*Assert(m_node.chainman), full_block, /*requested_stripped=*/false)};
+    BOOST_CHECK_EQUAL(full_state.GetRejectReason(), "bad-witness-merkle-match");
+
+    auto stripped_source{std::make_shared<CBlock>(*GoodBlock(prev_hash))};
+    stripped_source->fChecked = false;
+    stripped_source->m_checked_merkle_root = false;
+    stripped_source->m_checked_witness_commitment = false;
+    CMutableTransaction stripped_source_coinbase{*stripped_source->vtx[0]};
+    BOOST_REQUIRE_EQUAL(stripped_source_coinbase.vin.size(), 1U);
+    BOOST_REQUIRE_EQUAL(stripped_source_coinbase.vin[0].scriptWitness.stack.size(), 1U);
+    BOOST_REQUIRE_EQUAL(stripped_source_coinbase.vin[0].scriptWitness.stack[0].size(), 32U);
+    stripped_source_coinbase.vin[0].scriptWitness.stack[0][0] ^= 1;
+    stripped_source->vtx[0] = MakeTransactionRef(std::move(stripped_source_coinbase));
+
+    const auto stripped_block{StripWitnesses(*stripped_source)};
+    BOOST_CHECK_EQUAL(stripped_source->GetHash(), stripped_block->GetHash());
+    BOOST_CHECK(!HasAnyWitnessData(*stripped_block));
+
+    BlockValidationState check_state;
+    BOOST_CHECK(CheckBlock(*stripped_block, check_state, Params().GetConsensus()));
+
+    const BlockValidationState stripped_state{
+        AcceptBlockForTest(*Assert(m_node.chainman), stripped_block, /*requested_stripped=*/true)};
+    BOOST_CHECK_EQUAL(stripped_state.GetRejectReason(), "bad-blk-missing-witness");
 }
 
 /**

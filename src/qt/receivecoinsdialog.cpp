@@ -22,6 +22,46 @@
 #include <QSettings>
 #include <QTextDocument>
 
+namespace {
+QString AddressTypeLabel(OutputType type)
+{
+    switch (type) {
+    case OutputType::LEGACY:
+        return ReceiveCoinsDialog::tr("Base58 (Legacy)");
+    case OutputType::P2SH_SEGWIT:
+        return ReceiveCoinsDialog::tr("Base58 (P2SH-SegWit)");
+    case OutputType::BECH32:
+        return ReceiveCoinsDialog::tr("Bech32 (SegWit)");
+    case OutputType::BECH32M:
+        return ReceiveCoinsDialog::tr("Bech32m (Taproot)");
+    case OutputType::P2MR:
+        return ReceiveCoinsDialog::tr("P2MR");
+    case OutputType::UNKNOWN:
+        break;
+    }
+    return {};
+}
+
+QString AddressTypeTooltip(OutputType type)
+{
+    switch (type) {
+    case OutputType::LEGACY:
+        return ReceiveCoinsDialog::tr("Not recommended due to higher fees and less protection against typos.");
+    case OutputType::P2SH_SEGWIT:
+        return ReceiveCoinsDialog::tr("Generates an address compatible with older wallets.");
+    case OutputType::BECH32:
+        return ReceiveCoinsDialog::tr("Generates a native segwit address (BIP-173). Some old wallets don't support it.");
+    case OutputType::BECH32M:
+        return ReceiveCoinsDialog::tr("Bech32m (BIP-350) is an upgrade to Bech32, wallet support is still limited.");
+    case OutputType::P2MR:
+        return ReceiveCoinsDialog::tr("Generates a PQC-backed P2MR receive address.");
+    case OutputType::UNKNOWN:
+        break;
+    }
+    return {};
+}
+} // namespace
+
 ReceiveCoinsDialog::ReceiveCoinsDialog(const PlatformStyle *_platformStyle, QWidget *parent) :
     QDialog(parent, GUIUtil::dialog_flags),
     ui(new Ui::ReceiveCoinsDialog),
@@ -87,25 +127,26 @@ void ReceiveCoinsDialog::setModel(WalletModel *_model)
             &ReceiveCoinsDialog::recentRequestsView_selectionChanged);
 
         // Populate address type dropdown and select default
-        auto add_address_type = [&](OutputType type, const QString& text, const QString& tooltip) {
+        ui->addressType->clear();
+        auto add_address_type = [&](OutputType type) {
             const auto index = ui->addressType->count();
-            ui->addressType->addItem(text, (int) type);
-            ui->addressType->setItemData(index, tooltip, Qt::ToolTipRole);
+            ui->addressType->addItem(AddressTypeLabel(type), (int) type);
+            ui->addressType->setItemData(index, AddressTypeTooltip(type), Qt::ToolTipRole);
             if (model->wallet().getDefaultAddressType() == type) ui->addressType->setCurrentIndex(index);
         };
-        add_address_type(OutputType::LEGACY, tr("Base58 (Legacy)"), tr("Not recommended due to higher fees and less protection against typos."));
-        add_address_type(OutputType::P2SH_SEGWIT, tr("Base58 (P2SH-SegWit)"), tr("Generates an address compatible with older wallets."));
-        add_address_type(OutputType::BECH32, tr("Bech32 (SegWit)"), tr("Generates a native segwit address (BIP-173). Some old wallets don't support it."));
-        if (model->wallet().taprootEnabled()) {
-            add_address_type(OutputType::BECH32M, tr("Bech32m (Taproot)"), tr("Bech32m (BIP-350) is an upgrade to Bech32, wallet support is still limited."));
+        for (const OutputType type : model->wallet().getAvailableAddressTypes()) {
+            add_address_type(type);
+        }
+        if (ui->addressType->currentIndex() == -1 && ui->addressType->count() > 0) {
+            ui->addressType->setCurrentIndex(0);
         }
 
         // Set the button to be enabled or disabled based on whether the wallet can give out new addresses.
-        ui->receiveButton->setEnabled(model->wallet().canGetAddresses());
+        ui->receiveButton->setEnabled(model->wallet().canGetAddresses() && ui->addressType->count() > 0);
 
         // Enable/disable the receive button if the wallet is now able/unable to give out new addresses.
         connect(model, &WalletModel::canGetAddressesChanged, [this] {
-            ui->receiveButton->setEnabled(model->wallet().canGetAddresses());
+            ui->receiveButton->setEnabled(model->wallet().canGetAddresses() && ui->addressType->count() > 0);
         });
     }
 }

@@ -2,7 +2,10 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <bitcoin-build-config.h> // IWYU pragma: keep
+
 #include <common/args.h>
+#include <init.h>
 #include <sync.h>
 #include <test/util/logging.h>
 #include <test/util/setup_common.h>
@@ -643,10 +646,11 @@ BOOST_AUTO_TEST_CASE(util_GetArg)
 BOOST_AUTO_TEST_CASE(util_GetChainTypeString)
 {
     TestArgsManager test_args;
+    const auto chain = std::make_pair("-chain=<chain>", ArgsManager::ALLOW_ANY);
     const auto testnet = std::make_pair("-testnet", ArgsManager::ALLOW_ANY);
     const auto testnet4 = std::make_pair("-testnet4", ArgsManager::ALLOW_ANY);
     const auto regtest = std::make_pair("-regtest", ArgsManager::ALLOW_ANY);
-    test_args.SetupArgs({testnet, testnet4, regtest});
+    test_args.SetupArgs({chain, testnet, testnet4, regtest});
 
     const char* argv_testnet4[] = {"cmd", "-testnet4"};
     const char* argv_regtest[] = {"cmd", "-regtest"};
@@ -719,6 +723,32 @@ BOOST_AUTO_TEST_CASE(util_GetChainTypeString)
     test_args.ReadConfigString(testnetconf);
     BOOST_CHECK_THROW(test_args.GetChainTypeString(), std::runtime_error);
 }
+
+#ifdef ENABLE_WALLET
+BOOST_AUTO_TEST_CASE(util_WalletHelpTextDoesNotDependOnDefaultChain)
+{
+    ArgsManager test_args;
+    SetupServerArgs(test_args);
+
+    const char* argv_regtest[] = {"cmd", "-regtest"};
+    std::string error;
+    BOOST_CHECK(test_args.ParseParameters(std::size(argv_regtest), argv_regtest, error));
+    BOOST_CHECK_EQUAL(error, "");
+
+    const std::string help = test_args.GetHelpMessage();
+    BOOST_CHECK_NE(help.find("What type of addresses to use ("), std::string::npos);
+    BOOST_CHECK_NE(help.find("launch chains support only \"p2mr\""), std::string::npos);
+    BOOST_CHECK_NE(help.find("unrestricted regtest (-p2mronly=0)"), std::string::npos);
+    BOOST_CHECK_NE(help.find("\"p2sh-segwit\""), std::string::npos);
+    BOOST_CHECK_NE(help.find("Default is \"bech32\""), std::string::npos);
+    BOOST_CHECK_NE(help.find("What type of change to use ("), std::string::npos);
+    BOOST_CHECK_NE(help.find("Default is \"p2mr\""), std::string::npos);
+    BOOST_CHECK_NE(help.find("-addresstype=legacy"), std::string::npos);
+    BOOST_CHECK_NE(help.find("detail."), std::string::npos);
+    BOOST_CHECK_EQUAL(help.find("What type of addresses to use (\"p2mr\", default: \"p2mr\")"), std::string::npos);
+    BOOST_CHECK_EQUAL(help.find("What type of change to use (\"p2mr\"). Default is \"p2mr\"."), std::string::npos);
+}
+#endif
 
 // Test different ways settings can be merged, and verify results. This test can
 // be used to confirm that updates to settings code don't change behavior

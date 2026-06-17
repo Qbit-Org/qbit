@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_INDEX_BASE_H
-#define BITCOIN_INDEX_BASE_H
+#ifndef QBIT_INDEX_BASE_H
+#define QBIT_INDEX_BASE_H
 
 #include <dbwrapper.h>
 #include <interfaces/chain.h>
@@ -168,4 +168,4 @@ public:
     IndexSummary GetSummary() const;
 };
 
-#endif // BITCOIN_INDEX_BASE_H
+#endif // QBIT_INDEX_BASE_H

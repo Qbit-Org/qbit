@@ -9,9 +9,11 @@ Test that wallet correctly tracks transactions that have been conflicted by bloc
 
 from decimal import Decimal
 
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
         assert_equal,
+        assert_greater_than_or_equal,
 )
 
 class TxConflicts(BitcoinTestFramework):
@@ -31,6 +33,12 @@ class TxConflicts(BitcoinTestFramework):
         using raw transaction RPCs that double-spend UTXOs and have more
         fees, replacing the original transaction.
         """
+        # qbit uses COINBASE_MATURITY=1000. Pre-fund wallets with mature funds
+        # so fixed-amount sends in this test remain spendable.
+        self.generate(self.nodes[2], COINBASE_MATURITY + 60)
+        assert_greater_than_or_equal(self.nodes[2].getbalances()["mine"]["trusted"], Decimal("250"))
+        self.nodes[2].sendtoaddress(self.nodes[0].getnewaddress(), Decimal("30"))
+        self.generate(self.nodes[2], 1)
 
         self.test_block_conflicts()
         self.test_mempool_conflict()
@@ -131,7 +139,7 @@ class TxConflicts(BitcoinTestFramework):
         self.sync_blocks()
         former_conflicted = self.nodes[0].gettransaction(txid_AB_parent)
         assert_equal(former_conflicted["confirmations"], 1)
-        assert_equal(former_conflicted["blockheight"], 217)
+        assert_equal(former_conflicted["blockheight"], self.nodes[0].getblockcount())
 
     def test_mempool_conflict(self):
         self.nodes[0].createwallet("alice")

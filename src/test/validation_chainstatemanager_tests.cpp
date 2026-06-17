@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 //
 #include <chainparams.h>
+#include <consensus/consensus.h>
 #include <consensus/validation.h>
 #include <kernel/disconnected_transactions.h>
 #include <node/chainstatemanager_args.h>
@@ -14,6 +15,7 @@
 #include <test/util/chainstate.h>
 #include <test/util/logging.h>
 #include <test/util/random.h>
+#include <test/util/script.h>
 #include <test/util/setup_common.h>
 #include <test/util/validation.h>
 #include <uint256.h>
@@ -23,7 +25,10 @@
 #include <validationinterface.h>
 
 #include <tinyformat.h>
+#include <util/fs.h>
 
+#include <fstream>
+#include <optional>
 #include <vector>
 
 #include <boost/test/unit_test.hpp>
@@ -33,6 +38,50 @@ using node::KernelNotifications;
 using node::SnapshotMetadata;
 
 BOOST_FIXTURE_TEST_SUITE(validation_chainstatemanager_tests, TestingSetup)
+
+namespace {
+class BlockCheckedStateCatcher final : public CValidationInterface
+{
+public:
+    explicit BlockCheckedStateCatcher(uint256 hash) : m_hash{std::move(hash)} {}
+
+    std::optional<BlockValidationState> m_state;
+
+private:
+    void BlockChecked(const std::shared_ptr<const CBlock>& block, const BlockValidationState& state) override
+    {
+        if (block->GetHash() == m_hash) {
+            m_state = state;
+        }
+    }
+
+    const uint256 m_hash;
+};
+} // namespace
+
+static bool HasAssumeutxoData()
+{
+    return !Params().GetAvailableSnapshotHeights().empty();
+}
+
+static CBlockIndex& InsertTestBlockIndex(ChainstateManager& chainman, const uint256& hash, CBlockIndex* prev, int height, uint32_t n_bits, const arith_uint256& chain_work) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+{
+    AssertLockHeld(::cs_main);
+    auto [it, inserted] = chainman.m_blockman.m_block_index.try_emplace(hash);
+    BOOST_REQUIRE(inserted);
+
+    CBlockIndex& index = it->second;
+    index.phashBlock = &it->first;
+    index.pprev = prev;
+    index.nHeight = height;
+    index.nBits = n_bits;
+    index.nChainWork = chain_work;
+    index.nTx = 1;
+    index.m_chain_tx_count = prev ? prev->m_chain_tx_count + 1 : 1;
+    index.nStatus = BLOCK_VALID_SCRIPTS | BLOCK_HAVE_DATA;
+    index.BuildSkip();
+    return index;
+}
 
 //! Basic tests for ChainstateManager.
 //!
@@ -57,9 +106,10 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager, TestChain100Setup)
     auto& active_chain = WITH_LOCK(manager.GetMutex(), return manager.ActiveChain());
     BOOST_CHECK_EQUAL(&active_chain, &c1.m_chain);
 
-    // Get to a valid assumeutxo tip (per chainparams);
+    // Mine 10 more blocks on top of the COINBASE_MATURITY blocks from TestChain100Setup.
     mineBlocks(10);
-    BOOST_CHECK_EQUAL(WITH_LOCK(manager.GetMutex(), return manager.ActiveHeight()), 110);
+    const int expected_height = COINBASE_MATURITY + 10;
+    BOOST_CHECK_EQUAL(WITH_LOCK(manager.GetMutex(), return manager.ActiveHeight()), expected_height);
     auto active_tip = WITH_LOCK(manager.GetMutex(), return manager.ActiveTip());
     auto exp_tip = c1.m_chain.Tip();
     BOOST_CHECK_EQUAL(active_tip, exp_tip);
@@ -94,10 +144,10 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager, TestChain100Setup)
     auto& active_chain2 = WITH_LOCK(manager.GetMutex(), return manager.ActiveChain());
     BOOST_CHECK_EQUAL(&active_chain2, &c2.m_chain);
 
-    BOOST_CHECK_EQUAL(WITH_LOCK(manager.GetMutex(), return manager.ActiveHeight()), 110);
+    BOOST_CHECK_EQUAL(WITH_LOCK(manager.GetMutex(), return manager.ActiveHeight()), expected_height);
     mineBlocks(1);
-    BOOST_CHECK_EQUAL(WITH_LOCK(manager.GetMutex(), return manager.ActiveHeight()), 111);
-    BOOST_CHECK_EQUAL(WITH_LOCK(manager.GetMutex(), return c1.m_chain.Height()), 110);
+    BOOST_CHECK_EQUAL(WITH_LOCK(manager.GetMutex(), return manager.ActiveHeight()), expected_height + 1);
+    BOOST_CHECK_EQUAL(WITH_LOCK(manager.GetMutex(), return c1.m_chain.Height()), expected_height);
 
     auto active_tip2 = WITH_LOCK(manager.GetMutex(), return manager.ActiveTip());
     BOOST_CHECK_EQUAL(active_tip, active_tip2->pprev);
@@ -159,6 +209,339 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager_rebalance_caches, TestChain100Setup)
     BOOST_CHECK_CLOSE(double(c1.m_coinsdb_cache_size_bytes), max_cache * 0.05, 1);
     BOOST_CHECK_CLOSE(double(c2.m_coinstip_cache_size_bytes), max_cache * 0.95, 1);
     BOOST_CHECK_CLOSE(double(c2.m_coinsdb_cache_size_bytes), max_cache * 0.95, 1);
+}
+
+BOOST_FIXTURE_TEST_CASE(needs_witness_for_validation_gate, TestingSetup)
+{
+    auto& chainman{*Assert(m_node.chainman)};
+    auto& test_chainman{static_cast<TestChainstateManager&>(chainman)};
+
+    WITH_LOCK(::cs_main, {
+        const uint32_t n_bits{chainman.ActiveChain()[0]->nBits};
+        CBlockIndex proof_index;
+        proof_index.nBits = n_bits;
+        const arith_uint256 proof{GetBlockProof(proof_index)};
+        BOOST_REQUIRE(proof != 0);
+
+        auto& mutable_opts = const_cast<ChainstateManager::Options&>(chainman.m_options);
+        mutable_opts.minimum_chain_work = proof;
+
+        auto& base = InsertTestBlockIndex(chainman, uint256{1}, nullptr, 0, n_bits, proof);
+        auto& candidate = InsertTestBlockIndex(chainman, uint256{2}, &base, 1, n_bits, proof * 2);
+        auto& assumed = InsertTestBlockIndex(chainman, uint256{3}, &candidate, 2, n_bits, proof * 3);
+
+        mutable_opts.assumed_valid_block = uint256::ZERO;
+        chainman.m_best_header = &assumed;
+        BOOST_CHECK(chainman.NeedsWitnessForValidation(candidate));
+
+        mutable_opts.assumed_valid_block = assumed.GetBlockHash();
+        BOOST_CHECK(!chainman.NeedsWitnessForValidation(candidate));
+        BOOST_CHECK(!test_chainman.CanSkipScriptChecksForTest(candidate, /*witness_unavailable=*/false));
+
+        auto& best = InsertTestBlockIndex(chainman, uint256{4}, &assumed, 3, n_bits, assumed.nChainWork + proof * 2);
+        chainman.m_best_header = &best;
+        BOOST_CHECK(!chainman.NeedsWitnessForValidation(candidate));
+        BOOST_CHECK(!test_chainman.CanSkipScriptChecksForTest(candidate, /*witness_unavailable=*/false));
+
+        const int64_t burial_seconds{60 * 60 * 24 * 7 * 2};
+        const int64_t burial_blocks{burial_seconds / chainman.GetConsensus().nPowTargetSpacing + 1};
+        auto& buried = InsertTestBlockIndex(chainman, uint256{6}, &best, 4, n_bits, best.nChainWork + proof * burial_blocks);
+        chainman.m_best_header = &buried;
+        BOOST_CHECK(test_chainman.CanSkipScriptChecksForTest(candidate, /*witness_unavailable=*/false));
+
+        auto& alternate = InsertTestBlockIndex(chainman, uint256{5}, &base, 1, n_bits, proof * 2);
+        BOOST_CHECK(chainman.NeedsWitnessForValidation(alternate));
+    });
+}
+
+struct PreSegwitValidationSetup : TestingSetup {
+    PreSegwitValidationSetup()
+        : TestingSetup{ChainType::REGTEST, {.extra_args = {"-testactivationheight=segwit@200"}}}
+    {
+    }
+};
+
+BOOST_FIXTURE_TEST_CASE(needs_witness_for_validation_pre_segwit, PreSegwitValidationSetup)
+{
+    auto& chainman{*Assert(m_node.chainman)};
+
+    WITH_LOCK(::cs_main, {
+        const uint32_t n_bits{chainman.ActiveChain()[0]->nBits};
+        CBlockIndex proof_index;
+        proof_index.nBits = n_bits;
+        const arith_uint256 proof{GetBlockProof(proof_index)};
+        BOOST_REQUIRE(proof != 0);
+
+        auto& candidate = InsertTestBlockIndex(chainman, uint256{42}, nullptr, 1, n_bits, proof);
+        BOOST_CHECK(!chainman.NeedsWitnessForValidation(candidate));
+    });
+}
+
+BOOST_FIXTURE_TEST_CASE(activatebestchainstep_schedules_recovery_for_witness_pruned_candidate_needing_witness, TestingSetup)
+{
+    auto& chainman{*Assert(m_node.chainman)};
+    auto& chainstate{chainman.ActiveChainstate()};
+    BlockValidationState state{};
+    bool reset_most_work{false};
+    CBlockIndex* active_tip{nullptr};
+    CBlockIndex* candidate_ptr{nullptr};
+
+    {
+        LOCK2(::cs_main, *chainstate.MempoolMutex());
+        active_tip = chainman.ActiveChain().Tip();
+        BOOST_REQUIRE(active_tip != nullptr);
+
+        auto [it, inserted] = chainman.m_blockman.m_block_index.try_emplace(uint256{77});
+        BOOST_REQUIRE(inserted);
+
+        CBlockIndex& candidate{it->second};
+        candidate_ptr = &candidate;
+        candidate.phashBlock = &it->first;
+        candidate.pprev = active_tip;
+        candidate.nHeight = active_tip->nHeight + 1;
+        candidate.nBits = active_tip->nBits;
+        candidate.nChainWork = active_tip->nChainWork + GetBlockProof(*active_tip);
+        candidate.nTx = 1;
+        candidate.m_chain_tx_count = active_tip->m_chain_tx_count + 1;
+        candidate.nStatus = BLOCK_VALID_SCRIPTS | BLOCK_HAVE_DATA | BLOCK_OPT_WITNESS_PRUNED;
+        candidate.BuildSkip();
+
+        BOOST_REQUIRE(candidate_ptr != nullptr);
+        BOOST_CHECK(chainman.NeedsWitnessForValidation(*candidate_ptr));
+        BOOST_CHECK(chainstate.ActivateBestChainStepForTest(state, candidate_ptr, reset_most_work));
+        BOOST_REQUIRE(chainman.PendingWitnessRecovery() != nullptr);
+        BOOST_CHECK_EQUAL(chainman.PendingWitnessRecovery()->GetBlockHash(), candidate_ptr->GetBlockHash());
+    }
+    BOOST_CHECK(reset_most_work);
+    BOOST_CHECK_EQUAL(chainstate.m_chain.Tip(), active_tip);
+}
+
+BOOST_FIXTURE_TEST_CASE(activatebestchain_does_not_schedule_recovery_for_candidate_with_missing_ancestor, TestingSetup)
+{
+    auto& chainman{*Assert(m_node.chainman)};
+    auto& chainstate{chainman.ActiveChainstate()};
+    CBlockIndex* active_tip{nullptr};
+    CBlockIndex* candidate_ptr{nullptr};
+
+    {
+        LOCK(::cs_main);
+        active_tip = chainman.ActiveChain().Tip();
+        BOOST_REQUIRE(active_tip != nullptr);
+
+        const arith_uint256 proof{GetBlockProof(*active_tip)};
+        BOOST_REQUIRE(proof != 0);
+
+        auto& missing_ancestor = InsertTestBlockIndex(
+            chainman,
+            uint256{78},
+            active_tip,
+            active_tip->nHeight + 1,
+            active_tip->nBits,
+            active_tip->nChainWork + proof);
+        missing_ancestor.nStatus = BLOCK_VALID_SCRIPTS;
+
+        auto& candidate = InsertTestBlockIndex(
+            chainman,
+            uint256{79},
+            &missing_ancestor,
+            missing_ancestor.nHeight + 1,
+            active_tip->nBits,
+            missing_ancestor.nChainWork + proof);
+        candidate.nStatus = BLOCK_VALID_SCRIPTS | BLOCK_HAVE_DATA | BLOCK_OPT_WITNESS_PRUNED;
+        candidate_ptr = &candidate;
+        chainstate.setBlockIndexCandidates.insert(candidate_ptr);
+
+        BOOST_REQUIRE(chainman.NeedsWitnessForValidation(candidate));
+    }
+
+    BlockValidationState state{};
+    BOOST_CHECK(chainstate.ActivateBestChain(state));
+
+    WITH_LOCK(::cs_main, {
+        BOOST_CHECK_EQUAL(chainman.PendingWitnessRecovery(), nullptr);
+        BOOST_CHECK_EQUAL(chainstate.m_chain.Tip(), active_tip);
+        BOOST_CHECK_EQUAL(chainstate.setBlockIndexCandidates.count(candidate_ptr), 0U);
+    });
+}
+
+BOOST_FIXTURE_TEST_CASE(activatebestchain_replaces_stale_pending_witness_recovery, TestingSetup)
+{
+    auto& chainman{*Assert(m_node.chainman)};
+    auto& chainstate{chainman.ActiveChainstate()};
+    CBlockIndex* active_tip{nullptr};
+    CBlockIndex* candidate_ptr{nullptr};
+
+    {
+        LOCK(::cs_main);
+        active_tip = chainman.ActiveChain().Tip();
+        BOOST_REQUIRE(active_tip != nullptr);
+
+        const arith_uint256 proof{GetBlockProof(*active_tip)};
+        BOOST_REQUIRE(proof != 0);
+
+        auto& stale = InsertTestBlockIndex(
+            chainman,
+            uint256{80},
+            active_tip,
+            active_tip->nHeight + 1,
+            active_tip->nBits,
+            active_tip->nChainWork + proof);
+        stale.nStatus = BLOCK_VALID_SCRIPTS | BLOCK_HAVE_DATA | BLOCK_OPT_WITNESS_PRUNED;
+        BOOST_REQUIRE(chainman.ScheduleWitnessRecovery(stale));
+
+        auto& candidate = InsertTestBlockIndex(
+            chainman,
+            uint256{81},
+            active_tip,
+            active_tip->nHeight + 1,
+            active_tip->nBits,
+            active_tip->nChainWork + proof * 2);
+        candidate.nStatus = BLOCK_VALID_SCRIPTS | BLOCK_HAVE_DATA | BLOCK_OPT_WITNESS_PRUNED;
+        candidate_ptr = &candidate;
+        chainstate.setBlockIndexCandidates.insert(candidate_ptr);
+
+        BOOST_REQUIRE(chainman.NeedsWitnessForValidation(candidate));
+        BOOST_REQUIRE_NE(chainman.PendingWitnessRecovery(), nullptr);
+        BOOST_CHECK_EQUAL(chainman.PendingWitnessRecovery()->GetBlockHash(), stale.GetBlockHash());
+    }
+
+    BlockValidationState state{};
+    BOOST_CHECK(chainstate.ActivateBestChain(state));
+
+    WITH_LOCK(::cs_main, {
+        BOOST_REQUIRE_NE(chainman.PendingWitnessRecovery(), nullptr);
+        BOOST_CHECK_EQUAL(chainman.PendingWitnessRecovery()->GetBlockHash(), candidate_ptr->GetBlockHash());
+        BOOST_CHECK_EQUAL(chainstate.m_chain.Tip(), active_tip);
+    });
+}
+
+BOOST_FIXTURE_TEST_CASE(recovered_witness_retry, TestChain100Setup)
+{
+    auto& chainman{*Assert(m_node.chainman)};
+    auto& chainstate{chainman.ActiveChainstate()};
+    const CBlock candidate_block{CreateBlock({}, P2MROpTrueScript(), chainstate)};
+    const uint256 candidate_hash{candidate_block.GetHash()};
+    const fs::path recovered_path{
+        m_args.GetBlocksDirPath() / "recovered-witness" / fs::PathFromString(candidate_hash.ToString() + ".dat")
+    };
+    CBlockIndex* active_tip{nullptr};
+
+    {
+        LOCK(::cs_main);
+        active_tip = chainman.ActiveChain().Tip();
+        BOOST_REQUIRE(active_tip != nullptr);
+
+        const arith_uint256 proof{GetBlockProof(*active_tip)};
+        BOOST_REQUIRE(proof != 0);
+
+        auto& candidate = InsertTestBlockIndex(
+            chainman,
+            candidate_hash,
+            active_tip,
+            active_tip->nHeight + 1,
+            candidate_block.nBits,
+            active_tip->nChainWork + proof);
+        candidate.nStatus = BLOCK_VALID_SCRIPTS | BLOCK_HAVE_DATA | BLOCK_OPT_WITNESS_PRUNED;
+        chainman.m_best_header = &candidate;
+        chainstate.setBlockIndexCandidates.insert(&candidate);
+
+        BOOST_REQUIRE(chainman.NeedsWitnessForValidation(candidate));
+        BOOST_REQUIRE(chainman.m_blockman.WriteRecoveredBlock(candidate_block));
+        BOOST_REQUIRE(chainman.m_blockman.HaveRecoveredBlock(candidate_hash));
+    }
+
+    {
+        std::ofstream recovered_file{fs::PathToString(recovered_path), std::ios::binary | std::ios::trunc};
+        BOOST_REQUIRE(recovered_file.is_open());
+        recovered_file << "corrupt";
+        recovered_file.close();
+    }
+
+    BlockValidationState state{};
+    BOOST_CHECK(chainstate.ActivateBestChain(state));
+    BOOST_CHECK(state.IsValid());
+
+    WITH_LOCK(::cs_main, {
+        BOOST_REQUIRE_NE(chainman.PendingWitnessRecovery(), nullptr);
+        BOOST_CHECK_EQUAL(chainman.PendingWitnessRecovery()->GetBlockHash(), candidate_hash);
+        BOOST_CHECK(!chainman.m_blockman.HaveRecoveredBlock(candidate_hash));
+        BOOST_CHECK_EQUAL(chainstate.m_chain.Tip(), active_tip);
+    });
+}
+
+BOOST_FIXTURE_TEST_CASE(activatebestchain_recovery_error, TestChain100Setup)
+{
+    auto& chainman{*Assert(m_node.chainman)};
+    auto& chainstate{chainman.ActiveChainstate()};
+    const CMutableTransaction funding_tx{
+        CreateValidMempoolTransaction(
+            m_coinbase_txns[0], 0, /*input_height=*/1, coinbaseKey, P2MROpTrueScript(),
+            /*output_amount=*/1 * COIN, /*submit=*/false)
+    };
+    (void)CreateAndProcessBlock({funding_tx}, P2MROpTrueScript());
+    const int funding_height{WITH_LOCK(::cs_main, return chainstate.m_chain.Height())};
+
+    const CMutableTransaction witness_tx{
+        CreateValidMempoolTransaction(
+            MakeTransactionRef(funding_tx), 0, funding_height, coinbaseKey, P2MROpTrueScript(),
+            /*output_amount=*/COIN / 2, /*submit=*/false)
+    };
+    const CBlock candidate_block{CreateBlock({witness_tx}, P2MROpTrueScript(), chainstate)};
+    CBlock recovered_block{candidate_block};
+    BOOST_REQUIRE_EQUAL(candidate_block.vtx.size(), 2U);
+    CMutableTransaction mutated_witness_tx{*candidate_block.vtx[1]};
+    BOOST_REQUIRE(!mutated_witness_tx.vin.empty());
+    BOOST_REQUIRE(!mutated_witness_tx.vin[0].scriptWitness.stack.empty());
+    BOOST_REQUIRE(!mutated_witness_tx.vin[0].scriptWitness.stack[0].empty());
+    mutated_witness_tx.vin[0].scriptWitness.stack[0][0] ^= 1;
+    recovered_block.vtx[1] = MakeTransactionRef(mutated_witness_tx);
+
+    const uint256 candidate_hash{candidate_block.GetHash()};
+    CBlockIndex* active_tip{nullptr};
+    CBlockIndex* candidate_ptr{nullptr};
+    BlockCheckedStateCatcher catcher{candidate_hash};
+    m_node.validation_signals->RegisterValidationInterface(&catcher);
+
+    {
+        LOCK(::cs_main);
+        active_tip = chainman.ActiveChain().Tip();
+        BOOST_REQUIRE(active_tip != nullptr);
+
+        const arith_uint256 proof{GetBlockProof(*active_tip)};
+        BOOST_REQUIRE(proof != 0);
+
+        auto& candidate = InsertTestBlockIndex(
+            chainman,
+            candidate_hash,
+            active_tip,
+            active_tip->nHeight + 1,
+            candidate_block.nBits,
+            active_tip->nChainWork + proof);
+        candidate.nStatus = BLOCK_VALID_SCRIPTS | BLOCK_HAVE_DATA | BLOCK_OPT_WITNESS_PRUNED;
+        candidate_ptr = &candidate;
+        chainstate.setBlockIndexCandidates.insert(candidate_ptr);
+        BOOST_REQUIRE(chainman.NeedsWitnessForValidation(candidate));
+        BOOST_REQUIRE(chainman.m_blockman.WriteRecoveredBlock(recovered_block));
+        BOOST_REQUIRE(chainman.m_blockman.HaveRecoveredBlock(candidate_hash));
+    }
+
+    BlockValidationState state{};
+    bool reset_most_work{false};
+    {
+        LOCK2(::cs_main, *chainstate.MempoolMutex());
+        BOOST_REQUIRE(candidate_ptr != nullptr);
+        BOOST_CHECK(chainstate.ActivateBestChainStepForTest(state, candidate_ptr, reset_most_work));
+        BOOST_CHECK(state.IsValid());
+        BOOST_CHECK(reset_most_work);
+        BOOST_CHECK(!chainman.m_blockman.HaveRecoveredBlock(candidate_hash));
+        BOOST_CHECK_EQUAL(chainstate.m_chain.Tip(), active_tip);
+    }
+
+    BOOST_REQUIRE(catcher.m_state.has_value());
+    BOOST_CHECK(catcher.m_state->IsError());
+    BOOST_CHECK_EQUAL(catcher.m_state->GetRejectReason(), "recovered-witness-validation-failed");
+
+    m_node.validation_signals->UnregisterValidationInterface(&catcher);
 }
 
 struct SnapshotTestSetup : TestChain100Setup {
@@ -391,6 +774,7 @@ struct SnapshotTestSetup : TestChain100Setup {
             };
             const BlockManager::Options blockman_opts{
                 .chainparams = chainman_opts.chainparams,
+                .witness_pruning_enabled = chainman_opts.chainparams.IsWitnessPruningEnabled(),
                 .blocks_dir = m_args.GetBlocksDirPath(),
                 .notifications = chainman_opts.notifications,
                 .block_tree_db_params = DBParams{
@@ -411,6 +795,10 @@ struct SnapshotTestSetup : TestChain100Setup {
 //! Test basic snapshot activation.
 BOOST_FIXTURE_TEST_CASE(chainstatemanager_activate_snapshot, SnapshotTestSetup)
 {
+    if (!HasAssumeutxoData()) {
+        BOOST_TEST_MESSAGE("Skipping snapshot activation test: no assumeutxo data configured");
+        return;
+    }
     this->SetupSnapshot();
 }
 
@@ -426,6 +814,11 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager_activate_snapshot, SnapshotTestSetup)
 //!
 BOOST_FIXTURE_TEST_CASE(chainstatemanager_loadblockindex, TestChain100Setup)
 {
+    if (!HasAssumeutxoData()) {
+        BOOST_TEST_MESSAGE("Skipping loadblockindex snapshot test: no assumeutxo data configured");
+        return;
+    }
+
     ChainstateManager& chainman = *Assert(m_node.chainman);
     Chainstate& cs1 = chainman.ActiveChainstate();
 
@@ -560,6 +953,11 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager_loadblockindex, TestChain100Setup)
 //! Ensure that snapshot chainstates initialize properly when found on disk.
 BOOST_FIXTURE_TEST_CASE(chainstatemanager_snapshot_init, SnapshotTestSetup)
 {
+    if (!HasAssumeutxoData()) {
+        BOOST_TEST_MESSAGE("Skipping snapshot init test: no assumeutxo data configured");
+        return;
+    }
+
     ChainstateManager& chainman = *Assert(m_node.chainman);
     Chainstate& bg_chainstate = chainman.ActiveChainstate();
 
@@ -629,6 +1027,11 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager_snapshot_init, SnapshotTestSetup)
 
 BOOST_FIXTURE_TEST_CASE(chainstatemanager_snapshot_completion, SnapshotTestSetup)
 {
+    if (!HasAssumeutxoData()) {
+        BOOST_TEST_MESSAGE("Skipping snapshot completion test: no assumeutxo data configured");
+        return;
+    }
+
     this->SetupSnapshot();
 
     ChainstateManager& chainman = *Assert(m_node.chainman);
@@ -712,6 +1115,11 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager_snapshot_completion, SnapshotTestSetup
 
 BOOST_FIXTURE_TEST_CASE(chainstatemanager_snapshot_completion_hash_mismatch, SnapshotTestSetup)
 {
+    if (!HasAssumeutxoData()) {
+        BOOST_TEST_MESSAGE("Skipping snapshot hash mismatch test: no assumeutxo data configured");
+        return;
+    }
+
     auto chainstates = this->SetupSnapshot();
     Chainstate& validation_chainstate = *std::get<0>(chainstates);
     ChainstateManager& chainman = *Assert(m_node.chainman);

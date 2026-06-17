@@ -29,6 +29,8 @@
 #include <net_processing.h>
 #include <node/blockstorage.h>
 #include <node/context.h>
+#include <node/confirmation_target.h>
+#include <node/orphan_metrics.h>
 #include <node/transaction.h>
 #include <node/utxo_snapshot.h>
 #include <node/warnings.h>
@@ -71,6 +73,11 @@ using node::BlockManager;
 using node::NodeContext;
 using node::SnapshotMetadata;
 using util::MakeUnorderedList;
+
+// Keep a local declaration instead of including rpc/mining.h to avoid a header cycle:
+// rpc/blockchain.h -> rpc/mining.h -> rpc/blockchain.h.
+double EstimatePermissionlessNetworkHashPS(int lookup, int height, const CChain& active_chain);
+double EstimateAuxpowNetworkHashPS(int lookup, int height, const CChain& active_chain);
 
 std::tuple<std::unique_ptr<CCoinsViewCursor>, CCoinsStats, const CBlockIndex*>
 PrepareUTXOSnapshot(
@@ -268,7 +275,7 @@ static RPCHelpMan waitfornewblock()
         "waitfornewblock",
         "Waits for any new block and returns useful info about it.\n"
                 "\nReturns the current block on timeout or exit.\n"
-                "\nMake sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0)",
+                "\nMake sure to use no RPC timeout (qbit-cli -rpcclienttimeout=0)",
                 {
                     {"timeout", RPCArg::Type::NUM, RPCArg::Default{0}, "Time in milliseconds to wait for a response. 0 indicates no timeout."},
                     {"current_tip", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "Method waits for the chain tip to differ from this."},
@@ -327,7 +334,7 @@ static RPCHelpMan waitforblock()
         "waitforblock",
         "Waits for a specific new block and returns useful info about it.\n"
                 "\nReturns the current block on timeout or exit.\n"
-                "\nMake sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0)",
+                "\nMake sure to use no RPC timeout (qbit-cli -rpcclienttimeout=0)",
                 {
                     {"blockhash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Block hash to wait for."},
                     {"timeout", RPCArg::Type::NUM, RPCArg::Default{0}, "Time in milliseconds to wait for a response. 0 indicates no timeout."},
@@ -389,7 +396,7 @@ static RPCHelpMan waitforblockheight()
         "Waits for (at least) block height and returns the height and hash\n"
                 "of the current tip.\n"
                 "\nReturns the current block on timeout or exit.\n"
-                "\nMake sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0)",
+                "\nMake sure to use no RPC timeout (qbit-cli -rpcclienttimeout=0)",
                 {
                     {"height", RPCArg::Type::NUM, RPCArg::Optional::NO, "Block height to wait for."},
                     {"timeout", RPCArg::Type::NUM, RPCArg::Default{0}, "Time in milliseconds to wait for a response. 0 indicates no timeout."},
@@ -496,6 +503,7 @@ static RPCHelpMan getblockfrompeer()
         "Subsequent calls for the same block may cause the response from the previous peer to be ignored.\n"
         "Peers generally ignore requests for a stale block that they never fully verified, or one that is more than a month old.\n"
         "When a peer does not respond with a block, we will disconnect.\n"
+        "Blocks below the configured minimum chain work can only be fetched when they are ancestors of the active chain or a known header chain that reaches the work floor.\n"
         "Note: The block could be re-pruned as soon as it is received.\n\n"
         "Returns an empty JSON object if the request was successfully scheduled.",
         {
@@ -729,7 +737,7 @@ const RPCResult getblock_vin{
                     {RPCResult::Type::STR, "asm", "Disassembly of the output script"},
                     {RPCResult::Type::STR, "desc", "Inferred descriptor for the output"},
                     {RPCResult::Type::STR_HEX, "hex", "The raw output script bytes, hex-encoded"},
-                    {RPCResult::Type::STR, "address", /*optional=*/true, "The Bitcoin address (only if a well-defined address exists)"},
+                    {RPCResult::Type::STR, "address", /*optional=*/true, "The qbit address (only if a well-defined address exists)"},
                     {RPCResult::Type::STR, "type", "The type (one of: " + GetAllOutputTypes() + ")"},
                 }},
             }},
@@ -742,9 +750,11 @@ static RPCHelpMan getblock()
     return RPCHelpMan{
         "getblock",
         "If verbosity is 0, returns a string that is serialized, hex-encoded data for block 'hash'.\n"
+                "For witness-pruned historical blocks, this returns the stored block bytes, which may omit witness data.\n"
                 "If verbosity is 1, returns an Object with information about block <hash>.\n"
                 "If verbosity is 2, returns an Object with information about block <hash> and information about each transaction.\n"
-                "If verbosity is 3, returns an Object with information about block <hash> and information about each transaction, including prevout information for inputs (only for unpruned blocks in the current best chain).\n",
+                "If verbosity is 3, returns an Object with information about block <hash> and information about each transaction, including prevout information for inputs (only for unpruned blocks in the current best chain).\n"
+                "Verbose block views are unavailable once a historical block's witness data has been pruned.\n",
                 {
                     {"blockhash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The block hash"},
                     {"verbosity|verbose", RPCArg::Type::NUM, RPCArg::Default{1}, "0 for hex-encoded data, 1 for a JSON object, 2 for JSON object with transaction data, and 3 for JSON object with transaction data including prevout information for inputs",
@@ -760,7 +770,7 @@ static RPCHelpMan getblock()
                     {RPCResult::Type::NUM, "confirmations", "The number of confirmations, or -1 if the block is not on the main chain"},
                     {RPCResult::Type::NUM, "size", "The block size"},
                     {RPCResult::Type::NUM, "strippedsize", "The block size excluding witness data"},
-                    {RPCResult::Type::NUM, "weight", "The block weight as defined in BIP 141"},
+                    {RPCResult::Type::NUM, "weight", "The block weight; qbit fully counts witness data"},
                     {RPCResult::Type::NUM, "height", "The block height or index"},
                     {RPCResult::Type::NUM, "version", "The block version"},
                     {RPCResult::Type::STR_HEX, "versionHex", "The block version formatted in hexadecimal"},
@@ -816,6 +826,7 @@ static RPCHelpMan getblock()
 
     const CBlockIndex* pblockindex;
     const CBlockIndex* tip;
+    bool witness_pruned{false};
     ChainstateManager& chainman = EnsureAnyChainman(request.context);
     {
         LOCK(cs_main);
@@ -825,14 +836,21 @@ static RPCHelpMan getblock()
         if (!pblockindex) {
             throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found");
         }
+
+        witness_pruned = chainman.m_blockman.IsWitnessPruned(*pblockindex);
     }
 
-    const std::vector<std::byte> block_data{GetRawBlockChecked(chainman.m_blockman, *pblockindex)};
-
     if (verbosity <= 0) {
+        const std::vector<std::byte> block_data{GetRawBlockChecked(chainman.m_blockman, *pblockindex)};
         return HexStr(block_data);
     }
 
+    if (witness_pruned) {
+        throw JSONRPCError(RPC_MISC_ERROR,
+                           "Verbose block view unavailable: witness data for this historical block was pruned; use verbosity=0 to fetch stored block bytes.");
+    }
+
+    const std::vector<std::byte> block_data{GetRawBlockChecked(chainman.m_blockman, *pblockindex)};
     DataStream block_stream{block_data};
     CBlock block{};
     block_stream >> TX_WITH_WITNESS(block);
@@ -1172,7 +1190,7 @@ static RPCHelpMan gettxout()
                     {RPCResult::Type::STR, "desc", "Inferred descriptor for the output"},
                     {RPCResult::Type::STR_HEX, "hex", "The raw output script bytes, hex-encoded"},
                     {RPCResult::Type::STR, "type", "The type, eg pubkeyhash"},
-                    {RPCResult::Type::STR, "address", /*optional=*/true, "The Bitcoin address (only if a well-defined address exists)"},
+                    {RPCResult::Type::STR, "address", /*optional=*/true, "The qbit address (only if a well-defined address exists)"},
                 }},
                 {RPCResult::Type::BOOL, "coinbase", "Coinbase or not"},
             }},
@@ -1516,6 +1534,29 @@ struct CompareBlocksByHeight
     }
 };
 
+static std::set<const CBlockIndex*> GetNonActiveChainTips(ChainstateManager& chainman, const CChain& active_chain)
+    EXCLUSIVE_LOCKS_REQUIRED(cs_main)
+{
+    std::set<const CBlockIndex*> set_orphans;
+    std::set<const CBlockIndex*> set_prevs;
+
+    for (const auto& [_, block_index] : chainman.BlockIndex()) {
+        if (!active_chain.Contains(&block_index)) {
+            set_orphans.insert(&block_index);
+            set_prevs.insert(block_index.pprev);
+        }
+    }
+
+    std::set<const CBlockIndex*> set_tips;
+    for (const CBlockIndex* block : set_orphans) {
+        if (set_prevs.erase(block) == 0) {
+            set_tips.insert(block);
+        }
+    }
+
+    return set_tips;
+}
+
 static RPCHelpMan getchaintips()
 {
     return RPCHelpMan{"getchaintips",
@@ -1555,21 +1596,8 @@ static RPCHelpMan getchaintips()
      *  - Add the active chain tip
      */
     std::set<const CBlockIndex*, CompareBlocksByHeight> setTips;
-    std::set<const CBlockIndex*> setOrphans;
-    std::set<const CBlockIndex*> setPrevs;
-
-    for (const auto& [_, block_index] : chainman.BlockIndex()) {
-        if (!active_chain.Contains(&block_index)) {
-            setOrphans.insert(&block_index);
-            setPrevs.insert(block_index.pprev);
-        }
-    }
-
-    for (std::set<const CBlockIndex*>::iterator it = setOrphans.begin(); it != setOrphans.end(); ++it) {
-        if (setPrevs.erase(*it) == 0) {
-            setTips.insert(*it);
-        }
-    }
+    const std::set<const CBlockIndex*> non_active_chain_tips{GetNonActiveChainTips(chainman, active_chain)};
+    setTips.insert(non_active_chain_tips.begin(), non_active_chain_tips.end());
 
     // Always report the currently active tip.
     setTips.insert(active_chain.Tip());
@@ -1610,6 +1638,232 @@ static RPCHelpMan getchaintips()
     }
 
     return res;
+},
+    };
+}
+
+static RPCHelpMan getorphanmetrics()
+{
+    return RPCHelpMan{
+        "getorphanmetrics",
+        "Return stale block metrics over a rolling event window.\n"
+        "Note: \"orphan\" here means stale blocks, not orphan transactions.\n",
+        {
+            {"window", RPCArg::Type::NUM, RPCArg::Default{1000}, "Rolling window size in events (1-10000)"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "", {
+                {RPCResult::Type::NUM, "window_blocks", "requested window size"},
+                {RPCResult::Type::NUM, "window_total", "total events available within the window"},
+                {RPCResult::Type::NUM, "window_stale", "stale block events within the window"},
+                {RPCResult::Type::NUM, "orphan_rate", "window_stale/window_total (0 if window_total is 0)"},
+                {RPCResult::Type::NUM, "lifetime_blocks_connected", "lifetime count of connected blocks observed"},
+                {RPCResult::Type::NUM, "lifetime_stale_blocks", "lifetime count of stale blocks observed"},
+                {RPCResult::Type::NUM, "lifetime_reorgs", "lifetime count of reorganizations observed"},
+                {RPCResult::Type::NUM, "deepest_reorg", "maximum observed reorganization depth"},
+                {RPCResult::Type::NUM, "last_stale_height", "height of most recent stale block, or -1 if none"},
+                {RPCResult::Type::NUM_TIME, "last_stale_time", "timestamp of most recent stale block (unix epoch), or 0 if none"},
+                {RPCResult::Type::NUM, "persistent_stale_tip_count", "count of non-active chain tips known in block index"},
+                {RPCResult::Type::BOOL, "alert", "true if stale rate is above the alert threshold"},
+            }
+        },
+        RPCExamples{
+            HelpExampleCli("getorphanmetrics", "")
+            + HelpExampleCli("getorphanmetrics", "500")
+            + HelpExampleRpc("getorphanmetrics", "500")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    constexpr int64_t DEFAULT_WINDOW{1000};
+    constexpr int64_t MAX_WINDOW{10000};
+
+    int64_t window{DEFAULT_WINDOW};
+    if (!request.params[0].isNull()) {
+        window = request.params[0].getInt<int64_t>();
+        if (window < 1 || window > MAX_WINDOW) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("window must be between 1 and %d", MAX_WINDOW));
+        }
+    }
+
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    const node::OrphanMetrics::MetricsSnapshot snapshot = chainman.m_orphan_metrics.GetSnapshot(static_cast<size_t>(window));
+
+    size_t persistent_stale_tip_count{0};
+    {
+        LOCK(cs_main);
+        CChain& active_chain = chainman.ActiveChain();
+        persistent_stale_tip_count = GetNonActiveChainTips(chainman, active_chain).size();
+    }
+
+    UniValue ret(UniValue::VOBJ);
+    ret.pushKV("window_blocks", static_cast<uint64_t>(snapshot.window_blocks));
+    ret.pushKV("window_total", snapshot.window_total);
+    ret.pushKV("window_stale", snapshot.window_stale);
+    ret.pushKV("orphan_rate", snapshot.orphan_rate);
+    ret.pushKV("lifetime_blocks_connected", snapshot.lifetime_blocks_connected);
+    ret.pushKV("lifetime_stale_blocks", snapshot.lifetime_stale_blocks);
+    ret.pushKV("lifetime_reorgs", snapshot.lifetime_reorgs);
+    ret.pushKV("deepest_reorg", snapshot.deepest_reorg);
+    ret.pushKV("last_stale_height", snapshot.last_stale_height);
+    ret.pushKV("last_stale_time", snapshot.last_stale_time);
+    ret.pushKV("persistent_stale_tip_count", static_cast<uint64_t>(persistent_stale_tip_count));
+    ret.pushKV("alert", snapshot.alert);
+    return ret;
+},
+    };
+}
+
+static RPCHelpMan getconfirmationtarget()
+{
+    static constexpr int HASHRATE_LOOKUP_BLOCKS{120};
+    static constexpr int MIN_OBSERVED_AUXPOW_BLOCKS{1};
+
+    return RPCHelpMan{
+        "getconfirmationtarget",
+        "Calculate the recommended number of confirmations for a transaction.\n"
+        "Uses real-time orphan rate and hashrate to estimate how many qbit\n"
+        "confirmations provide equivalent security to Bitcoin confirmations.\n",
+        {
+            {"value_satoshis", RPCArg::Type::NUM, RPCArg::Optional::NO, "Transaction value in satoshis (included in response for reference)"},
+            {"security_level", RPCArg::Type::STR, RPCArg::Default{"medium"}, "Security level: \"low\" (1 BTC conf), \"medium\" (3), \"high\" (6), \"maximum\" (60)"},
+            {"merge_mining_pct", RPCArg::Type::NUM, RPCArg::DefaultHint{"observed AuxPoW chainwork when sampled, otherwise 0.0"}, "Optional fallback/override fraction of BTC hashrate merge-mining qbit (0.0-1.0). If omitted, observed AuxPoW chainwork is used when enough samples are available."},
+            {"btc_hashrate", RPCArg::Type::NUM, RPCArg::Default{node::ConfirmationCalculator::DEFAULT_BTC_HASHRATE}, "Estimated Bitcoin network hashrate in H/s"},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "", {
+                {RPCResult::Type::NUM, "required_confirmations", "recommended number of qbit confirmations"},
+                {RPCResult::Type::NUM, "required_minutes", "estimated wait time in minutes"},
+                {RPCResult::Type::NUM, "equivalent_btc_confirmations", "equivalent Bitcoin confirmations of security"},
+                {RPCResult::Type::NUM, "permissionless_hashrate", "current qbit permissionless-lane hashrate (H/s; excludes AuxPoW work)"},
+                {RPCResult::Type::NUM, "auxpow_hashrate", "current qbit AuxPoW-lane hashrate (H/s; excludes permissionless work)"},
+                {RPCResult::Type::NUM, "total_observed_hashrate", "current observed qbit hashrate across permissionless and AuxPoW lanes (H/s)"},
+                {RPCResult::Type::NUM, "orphan_rate", "current stale/orphan block rate (from getorphanmetrics)"},
+                {RPCResult::Type::STR, "security_level", "the security level used"},
+                {RPCResult::Type::NUM, "value_qbt", "transaction value in QBT"},
+                {RPCResult::Type::OBJ, "model", "model parameters used in calculation", {
+                    {RPCResult::Type::NUM, "btc_target_confirmations", "target Bitcoin confirmations for this security level"},
+                    {RPCResult::Type::NUM, "block_time_seconds", "qbit block time from consensus parameters"},
+                    {RPCResult::Type::STR, "hashrate_source", "hashrate model source: observed_chainwork, override_merge_mining_pct, or fallback_merge_mining_pct"},
+                    {RPCResult::Type::NUM, "hashrate_window_blocks", "active-chain block window used for hashrate estimates"},
+                    {RPCResult::Type::NUM, "permissionless_blocks_in_window", "permissionless blocks in the hashrate window"},
+                    {RPCResult::Type::NUM, "auxpow_blocks_in_window", "AuxPoW blocks in the hashrate window"},
+                    {RPCResult::Type::NUM, "merge_mining_pct", "fallback/override merge mining participation fraction used when observed chainwork is not selected"},
+                    {RPCResult::Type::NUM, "btc_hashrate", "Bitcoin hashrate estimate used (H/s)"},
+                    {RPCResult::Type::NUM, "orphan_rate_penalty", "confirmation multiplier due to orphan rate"},
+                    {RPCResult::Type::NUM, "security_per_confirmation", "fraction of a BTC confirmation per qbit confirmation"},
+                    {RPCResult::Type::NUM, "cadence_merged_fraction", "fraction of blocks that are merge-mined, derived from consensus lane spacings for the fallback percentage model"},
+                }},
+            }
+        },
+        RPCExamples{
+            HelpExampleCli("getconfirmationtarget", "100000000 \"high\"")
+            + HelpExampleCli("getconfirmationtarget", "1000000000 \"maximum\" 0.01")
+            + HelpExampleRpc("getconfirmationtarget", "100000000, \"high\"")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    const int64_t value_satoshis = request.params[0].getInt<int64_t>();
+    if (value_satoshis < 0) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "value_satoshis must be non-negative");
+    }
+
+    std::string security_level{"medium"};
+    if (!request.params[1].isNull()) {
+        security_level = request.params[1].get_str();
+        if (node::ConfirmationCalculator::BtcTargetForLevel(security_level) < 0) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "security_level must be \"low\", \"medium\", \"high\", or \"maximum\"");
+        }
+    }
+
+    const bool merge_mining_pct_provided{!request.params[2].isNull()};
+    double merge_mining_pct{0.0};
+    if (merge_mining_pct_provided) {
+        merge_mining_pct = request.params[2].get_real();
+        if (merge_mining_pct < 0.0 || merge_mining_pct > 1.0) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "merge_mining_pct must be between 0.0 and 1.0");
+        }
+    }
+
+    double btc_hashrate{node::ConfirmationCalculator::DEFAULT_BTC_HASHRATE};
+    if (!request.params[3].isNull()) {
+        btc_hashrate = request.params[3].get_real();
+        if (btc_hashrate <= 0.0) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "btc_hashrate must be positive");
+        }
+    }
+
+    // Fetch live data from the node.
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
+
+    double permissionless_hashrate{0.0};
+    double auxpow_hashrate{0.0};
+    int hashrate_window_blocks{0};
+    int permissionless_blocks_in_window{0};
+    int auxpow_blocks_in_window{0};
+    {
+        LOCK(cs_main);
+        const CChain& active_chain = chainman.ActiveChain();
+        permissionless_hashrate = EstimatePermissionlessNetworkHashPS(HASHRATE_LOOKUP_BLOCKS, /*height=*/-1, active_chain);
+        auxpow_hashrate = EstimateAuxpowNetworkHashPS(HASHRATE_LOOKUP_BLOCKS, /*height=*/-1, active_chain);
+
+        if (const CBlockIndex* pindex = active_chain.Tip()) {
+            hashrate_window_blocks = std::min(HASHRATE_LOOKUP_BLOCKS, pindex->nHeight);
+            for (int i = 0; i < hashrate_window_blocks; ++i) {
+                if (pindex->SignalsAuxpow()) {
+                    ++auxpow_blocks_in_window;
+                } else {
+                    ++permissionless_blocks_in_window;
+                }
+                pindex = pindex->pprev;
+            }
+        }
+    }
+    const double total_observed_hashrate{permissionless_hashrate + auxpow_hashrate};
+    const bool use_observed_hashrate{!merge_mining_pct_provided &&
+        auxpow_blocks_in_window >= MIN_OBSERVED_AUXPOW_BLOCKS &&
+        total_observed_hashrate > 0.0};
+    const std::string hashrate_source{use_observed_hashrate
+        ? "observed_chainwork"
+        : (merge_mining_pct_provided ? "override_merge_mining_pct" : "fallback_merge_mining_pct")};
+
+    const auto orphan_snapshot = chainman.m_orphan_metrics.GetSnapshot();
+    const double orphan_rate = orphan_snapshot.orphan_rate;
+
+    const auto& consensus = chainman.GetParams().GetConsensus();
+    const int64_t block_time = consensus.nPowTargetSpacing;
+    const int64_t legacy_spacing = consensus.nPowTargetSpacingLegacy;
+    const int64_t auxpow_spacing = consensus.nPowTargetSpacingAuxPow;
+
+    const auto result = node::ConfirmationCalculator::Calculate(
+        value_satoshis, security_level, use_observed_hashrate, merge_mining_pct,
+        btc_hashrate, permissionless_hashrate, auxpow_hashrate, orphan_rate,
+        block_time, legacy_spacing, auxpow_spacing);
+
+    UniValue model(UniValue::VOBJ);
+    model.pushKV("btc_target_confirmations", result.btc_target_confirmations);
+    model.pushKV("block_time_seconds", result.block_time_seconds);
+    model.pushKV("hashrate_source", hashrate_source);
+    model.pushKV("hashrate_window_blocks", hashrate_window_blocks);
+    model.pushKV("permissionless_blocks_in_window", permissionless_blocks_in_window);
+    model.pushKV("auxpow_blocks_in_window", auxpow_blocks_in_window);
+    model.pushKV("merge_mining_pct", result.merge_mining_pct);
+    model.pushKV("btc_hashrate", result.btc_hashrate);
+    model.pushKV("orphan_rate_penalty", result.orphan_rate_penalty);
+    model.pushKV("security_per_confirmation", result.security_per_confirmation);
+    model.pushKV("cadence_merged_fraction", result.cadence_merged_fraction);
+
+    UniValue ret(UniValue::VOBJ);
+    ret.pushKV("required_confirmations", result.required_confirmations);
+    ret.pushKV("required_minutes", result.required_minutes);
+    ret.pushKV("equivalent_btc_confirmations", result.equivalent_btc_confirmations);
+    ret.pushKV("permissionless_hashrate", result.permissionless_hashrate);
+    ret.pushKV("auxpow_hashrate", result.auxpow_hashrate);
+    ret.pushKV("total_observed_hashrate", result.total_observed_hashrate);
+    ret.pushKV("orphan_rate", result.orphan_rate);
+    ret.pushKV("security_level", result.security_level);
+    ret.pushKV("value_qbt", result.value_qbt);
+    ret.pushKV("model", model);
+    return ret;
 },
     };
 }
@@ -2276,7 +2530,7 @@ static RPCHelpMan scantxoutset()
         "or more path elements separated by \"/\", and optionally ending in \"/*\" (unhardened), or \"/*'\" or \"/*h\" (hardened) to specify all\n"
         "unhardened or hardened child keys.\n"
         "In the latter case, a range needs to be specified by below if different from 1000.\n"
-        "For more information on output descriptors, see the documentation in the doc/descriptors.md file.\n",
+        "For more information on output descriptors, see the documentation in the doc/user/wallet/descriptors.md file.\n",
         {
             scan_action_arg_desc,
             scan_objects_arg_desc,
@@ -2474,7 +2728,7 @@ static RPCHelpMan scanblocks()
     return RPCHelpMan{
         "scanblocks",
         "Return relevant blockhashes for given descriptors (requires blockfilterindex).\n"
-        "This call may take several minutes. Make sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0)",
+        "This call may take several minutes. Make sure to use no RPC timeout (qbit-cli -rpcclienttimeout=0)",
         {
             scan_action_arg_desc,
             scan_objects_arg_desc,
@@ -2505,11 +2759,11 @@ static RPCHelpMan scanblocks()
             scan_result_abort,
         },
         RPCExamples{
-            HelpExampleCli("scanblocks", "start '[\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\"]' 300000") +
-            HelpExampleCli("scanblocks", "start '[\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\"]' 100 150 basic") +
+            HelpExampleCli("scanblocks", "start '[\"addr(qbrt1zqqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0s8kqqny)\"]' 300000") +
+            HelpExampleCli("scanblocks", "start '[\"addr(qbrt1zqqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0s8kqqny)\"]' 100 150 basic") +
             HelpExampleCli("scanblocks", "status") +
-            HelpExampleRpc("scanblocks", "\"start\", [\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\"], 300000") +
-            HelpExampleRpc("scanblocks", "\"start\", [\"addr(bcrt1q4u4nsgk6ug0sqz7r3rj9tykjxrsl0yy4d0wwte)\"], 100, 150, \"basic\"") +
+            HelpExampleRpc("scanblocks", "\"start\", [\"addr(qbrt1zqqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0s8kqqny)\"], 300000") +
+            HelpExampleRpc("scanblocks", "\"start\", [\"addr(qbrt1zqqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0s8kqqny)\"], 100, 150, \"basic\"") +
             HelpExampleRpc("scanblocks", "\"status\"")
         },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
@@ -2664,7 +2918,7 @@ static RPCHelpMan getdescriptoractivity()
         "getdescriptoractivity",
         "Get spend and receive activity associated with a set of descriptors for a set of blocks. "
         "This command pairs well with the `relevant_blocks` output of `scanblocks()`.\n"
-        "This call may take several minutes. If you encounter timeouts, try specifying no RPC timeout (bitcoin-cli -rpcclienttimeout=0)",
+        "This call may take several minutes. If you encounter timeouts, try specifying no RPC timeout (qbit-cli -rpcclienttimeout=0)",
         {
             RPCArg{"blockhashes", RPCArg::Type::ARR, RPCArg::Optional::NO, "The list of blockhashes to examine for activity. Order doesn't matter. Must be along main chain or an error is thrown.\n", {
                 {"blockhash", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "A valid blockhash"},
@@ -2706,7 +2960,7 @@ static RPCHelpMan getdescriptoractivity()
             },
         },
         RPCExamples{
-            HelpExampleCli("getdescriptoractivity", "'[\"000000000000000000001347062c12fded7c528943c8ce133987e2e2f5a840ee\"]' '[\"addr(bc1qzl6nsgqzu89a66l50cvwapnkw5shh23zarqkw9)\"]'")
+            HelpExampleCli("getdescriptoractivity", "'[\"000000000000000000001347062c12fded7c528943c8ce133987e2e2f5a840ee\"]' '[\"addr(qb1zqqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0sjq57mw)\"]'")
         },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
@@ -3022,7 +3276,7 @@ static RPCHelpMan dumptxoutset()
         "Write the serialized UTXO set to a file. This can be used in loadtxoutset afterwards if this snapshot height is supported in the chainparams as well.\n\n"
         "Unless the \"latest\" type is requested, the node will roll back to the requested height and network activity will be suspended during this process. "
         "Because of this it is discouraged to interact with the node in any other way during the execution of this call to avoid inconsistent results and race conditions, particularly RPCs that interact with blockstorage.\n\n"
-        "This call may take several minutes. Make sure to use no RPC timeout (bitcoin-cli -rpcclienttimeout=0)",
+        "This call may take several minutes. Make sure to use no RPC timeout (qbit-cli -rpcclienttimeout=0)",
         {
             {"path", RPCArg::Type::STR, RPCArg::Optional::NO, "Path to the output file. If relative, will be prefixed by datadir."},
             {"type", RPCArg::Type::STR, RPCArg::Default(""), "The type of snapshot to create. Can be \"latest\" to create a snapshot of the current UTXO set or \"rollback\" to temporarily roll back the state of the node to a historical block before creating the snapshot of a historical UTXO set. This parameter can be omitted if a separate \"rollback\" named parameter is specified indicating the height or hash of a specific historical block. If \"rollback\" is specified and separate \"rollback\" named parameter is not specified, this will roll back to the latest valid snapshot block that can currently be loaded with loadtxoutset."},
@@ -3317,7 +3571,7 @@ static RPCHelpMan loadtxoutset()
         "Meanwhile, the original chainstate will complete the initial block download process in "
         "the background, eventually validating up to the block that the snapshot is based upon.\n\n"
 
-        "The result is a usable bitcoind instance that is current with the network tip in a "
+        "The result is a usable qbitd instance that is current with the network tip in a "
         "matter of minutes rather than hours. UTXO snapshot are typically obtained from "
         "third-party sources (HTTP, torrent, etc.) which is reasonable since their "
         "contents are always checked by hash.\n\n"
@@ -3371,6 +3625,7 @@ static RPCHelpMan loadtxoutset()
     // Because we can't provide historical blocks during tip or background sync.
     // Update local services to reflect we are a limited peer until we are fully sync.
     node.connman->RemoveLocalServices(NODE_NETWORK);
+    node.connman->RemoveLocalServices(NODE_ARCHIVE);
     // Setting the limited state is usually redundant because the node can always
     // provide the last 288 blocks, but it doesn't hurt to set it.
     node.connman->AddLocalServices(NODE_NETWORK_LIMITED);
@@ -3474,6 +3729,8 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &getblockhash},
         {"blockchain", &getblockheader},
         {"blockchain", &getchaintips},
+        {"blockchain", &getorphanmetrics},
+        {"blockchain", &getconfirmationtarget},
         {"blockchain", &getdifficulty},
         {"blockchain", &getdeploymentinfo},
         {"blockchain", &gettxout},

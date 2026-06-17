@@ -102,6 +102,8 @@ class MempoolExpiryTest(BitcoinTestFramework):
 
     def run_test(self):
         self.wallet = MiniWallet(self.nodes[0])
+        # Mature the default-cache coinbase UTXOs
+        self.ensure_cached_coinbase_mature(self.nodes[0])
 
         self.log.info('Test default mempool expiry timeout of %d hours.' %
                       DEFAULT_MEMPOOL_EXPIRY_HOURS)

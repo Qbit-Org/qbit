@@ -85,7 +85,12 @@ def read_logs(tmp_dir):
         case 0:
             chain = 'regtest'  # fallback to regtest
         case 1:
-            chain = re.search(r'node0/(.+?)/debug\.log$', debug_logs[0].as_posix()).group(1)
+            chain_match = re.search(r'node0/(.+?)/debug\.log$', debug_logs[0].as_posix())
+            if chain_match is None:
+                print(f"Could not infer node chain from {debug_logs[0]}; defaulting to regtest", file=sys.stderr)
+                chain = 'regtest'
+            else:
+                chain = chain_match.group(1)
         case _:
             raise RuntimeError('Max one debug.log is supported, found several:\n\t' +
                                '\n\t'.join(map(str, debug_logs)))

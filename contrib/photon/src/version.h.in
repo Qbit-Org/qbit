@@ -1,0 +1,3 @@
+#pragma once
+
+#define QBIT_PHOTON_VERSION "@QBIT_PHOTON_VERSION@"

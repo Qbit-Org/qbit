@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_UTIL_TASK_RUNNER_H
-#define BITCOIN_UTIL_TASK_RUNNER_H
+#ifndef QBIT_UTIL_TASK_RUNNER_H
+#define QBIT_UTIL_TASK_RUNNER_H
 
 #include <cstddef>
 #include <functional>
@@ -49,4 +49,4 @@ public:
 
 } // namespace util
 
-#endif // BITCOIN_UTIL_TASK_RUNNER_H
+#endif // QBIT_UTIL_TASK_RUNNER_H

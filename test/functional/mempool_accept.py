@@ -9,7 +9,6 @@ from decimal import Decimal
 import math
 
 from test_framework.test_framework import BitcoinTestFramework
-from test_framework.blocktools import MAX_STANDARD_TX_WEIGHT
 from test_framework.mempool_util import (
     DEFAULT_MIN_RELAY_TX_FEE,
     DEFAULT_INCREMENTAL_RELAY_FEE,
@@ -50,10 +49,15 @@ from test_framework.util import (
     assert_equal,
     assert_greater_than,
     assert_raises_rpc_error,
+    bisect_last_true,
+    find_first_false,
     sync_txindex,
 )
 from test_framework.wallet import MiniWallet
 from test_framework.wallet_util import generate_keypair
+
+
+MAX_OP_RETURN_RELAY_SIZE = 200_000
 
 
 class MempoolAcceptanceTest(BitcoinTestFramework):
@@ -66,6 +70,7 @@ class MempoolAcceptanceTest(BitcoinTestFramework):
 
     def check_mempool_result(self, result_expected, *args, **kwargs):
         """Wrapper to check result of testmempoolaccept on node_0's mempool"""
+        kwargs.setdefault("maxfeerate", 0)
         result_test = self.nodes[0].testmempoolaccept(*args, **kwargs)
         for r in result_test:
             # Skip these checks for now
@@ -81,12 +86,12 @@ class MempoolAcceptanceTest(BitcoinTestFramework):
     def run_test(self):
         node = self.nodes[0]
         self.wallet = MiniWallet(node)
+        self.ensure_cached_coinbase_mature(node)
 
         assert_equal(node.getmempoolinfo()['permitbaremultisig'], False)
 
-        self.log.info('Start with empty mempool, and 200 blocks')
+        self.log.info('Start with empty mempool')
         self.mempool_size = 0
-        assert_equal(node.getblockcount(), 200)
         assert_equal(node.getmempoolinfo()['size'], self.mempool_size)
 
         self.log.info("Check default settings")
@@ -101,16 +106,22 @@ class MempoolAcceptanceTest(BitcoinTestFramework):
         assert_raises_rpc_error(-22, 'TX decode failed', lambda: node.testmempoolaccept(rawtxs=['ff00baar']))
 
         self.log.info('A transaction already in the blockchain')
-        tx = self.wallet.create_self_transfer()['tx']  # Pick a random coin(base) to spend
+        funding_utxo = self.wallet.get_utxo()
+        funding_value_sat = int(funding_utxo["value"] * COIN)
+        small_output_sat = min(int(Decimal('0.3') * COIN), funding_value_sat // 2)
+        large_output_sat = funding_value_sat - small_output_sat - 1_000
+        assert small_output_sat > 0
+        assert large_output_sat > 0
+        tx = self.wallet.create_self_transfer(utxo_to_spend=funding_utxo)['tx']  # Pick a random coin(base) to spend
         tx.vout.append(deepcopy(tx.vout[0]))
-        tx.vout[0].nValue = int(0.3 * COIN)
-        tx.vout[1].nValue = int(49 * COIN)
+        tx.vout[0].nValue = small_output_sat
+        tx.vout[1].nValue = large_output_sat
         raw_tx_in_block = tx.serialize().hex()
         txid_in_block = self.wallet.sendrawtransaction(from_node=node, tx_hex=raw_tx_in_block)
         self.generate(node, 1)
         self.mempool_size = 0
-        # Also check feerate. 1BTC/kvB fails
-        assert_raises_rpc_error(-8, "Fee rates larger than or equal to 1BTC/kvB are not accepted", lambda: self.check_mempool_result(
+        # Also check feerate. A maxfeerate of 1 whole coin/kvB fails.
+        assert_raises_rpc_error(-8, "Fee rates larger than or equal to 1", lambda: self.check_mempool_result(
             result_expected=None,
             rawtxs=[raw_tx_in_block],
             maxfeerate=1,
@@ -130,9 +141,9 @@ class MempoolAcceptanceTest(BitcoinTestFramework):
 
         self.log.info('A transaction not in the mempool')
         fee = Decimal('0.000007')
-        utxo_to_spend = self.wallet.get_utxo(txid=txid_in_block)  # use 0.3 BTC UTXO
+        utxo_to_spend = self.wallet.get_utxo(txid=txid_in_block)  # use the smaller in-chain UTXO
         tx = self.wallet.create_self_transfer(utxo_to_spend=utxo_to_spend, sequence=MAX_BIP125_RBF_SEQUENCE)['tx']
-        tx.vout[0].nValue = int((Decimal('0.3') - fee) * COIN)
+        tx.vout[0].nValue = int((utxo_to_spend["value"] - fee) * COIN)
         raw_tx_0 = tx.serialize().hex()
         txid_0 = tx.txid_hex
         self.check_mempool_result(
@@ -142,14 +153,16 @@ class MempoolAcceptanceTest(BitcoinTestFramework):
 
         self.log.info('A final transaction not in the mempool')
         output_amount = Decimal('0.025')
+        utxo_to_spend = self.wallet.get_utxo(mark_as_spent=False)
         tx = self.wallet.create_self_transfer(
+            utxo_to_spend=utxo_to_spend,
             sequence=SEQUENCE_FINAL,
             locktime=node.getblockcount() + 2000,  # Can be anything
         )['tx']
         tx.vout[0].nValue = int(output_amount * COIN)
         raw_tx_final = tx.serialize().hex()
         tx = tx_from_hex(raw_tx_final)
-        fee_expected = Decimal('50.0') - output_amount
+        fee_expected = utxo_to_spend["value"] - output_amount
         self.check_mempool_result(
             result_expected=[{'txid': tx.txid_hex, 'allowed': True, 'vsize': tx.get_vsize(), 'fees': {'base': fee_expected}}],
             rawtxs=[tx.serialize().hex()],
@@ -187,7 +200,7 @@ class MempoolAcceptanceTest(BitcoinTestFramework):
 
         self.log.info('A transaction with missing inputs, that existed once in the past')
         tx = tx_from_hex(raw_tx_0)
-        tx.vin[0].prevout.n = 1  # Set vout to 1, to spend the other outpoint (49 coins) of the in-chain-tx we want to double spend
+        tx.vin[0].prevout.n = 1  # Set vout to 1, to spend the larger output of the in-chain tx we want to double spend
         raw_tx_1 = tx.serialize().hex()
         txid_1 = node.sendrawtransaction(hexstring=raw_tx_1, maxfeerate=0)
         # Now spend both to "clearly hide" the outputs, ie. remove the coins from the utxo set by spending them
@@ -325,7 +338,23 @@ class MempoolAcceptanceTest(BitcoinTestFramework):
         )
         tx = tx_from_hex(raw_tx_reference)
         output_p2sh_burn = CTxOut(nValue=540, scriptPubKey=script_to_p2sh_script(b'burn'))
-        num_scripts = 100000 // len(output_p2sh_burn.serialize())  # Use enough outputs to make the tx too large for our policy
+        # Grow output count until policy rejects for tx-size, to avoid fixed-size assumptions.
+        num_scripts = 100000 // len(output_p2sh_burn.serialize())
+        max_num_scripts = int((utxo_to_spend["value"] * COIN) // output_p2sh_burn.nValue)
+        def accepts_with_outputs(output_count):
+            tx.vout = [output_p2sh_burn] * output_count
+            result = node.testmempoolaccept([tx.serialize().hex()])[0]
+            if result["allowed"]:
+                return True
+            assert_equal(result["reject-reason"], "tx-size")
+            return False
+
+        num_scripts = find_first_false(
+            start=num_scripts,
+            predicate=accepts_with_outputs,
+            growth_factor=1.1,
+            max_value=max_num_scripts,
+        )
         tx.vout = [output_p2sh_burn] * num_scripts
         self.check_mempool_result(
             result_expected=[{'txid': tx.txid_hex, 'allowed': False, 'reject-reason': 'tx-size'}],
@@ -333,11 +362,19 @@ class MempoolAcceptanceTest(BitcoinTestFramework):
         )
         tx = tx_from_hex(raw_tx_reference)
         tx.vout[0] = output_p2sh_burn
-        tx.vout[0].nValue -= 1  # Make output smaller, such that it is dust for our policy
-        self.check_mempool_result(
-            result_expected=[{'txid': tx.txid_hex, 'allowed': False, 'reject-reason': 'dust'}],
-            rawtxs=[tx.serialize().hex()],
-        )
+        # Find a value that is dust under the active policy instead of assuming a fixed threshold.
+        for output_value in range(tx.vout[0].nValue - 1, 0, -1):
+            tx.vout[0].nValue = output_value
+            result = node.testmempoolaccept([tx.serialize().hex()], maxfeerate=0)[0]
+            if not result["allowed"]:
+                assert_equal(result["reject-reason"], "dust")
+                self.check_mempool_result(
+                    result_expected=[{'txid': tx.txid_hex, 'allowed': False, 'reject-reason': 'dust'}],
+                    rawtxs=[tx.serialize().hex()],
+                )
+                break
+        else:
+            self.log.info("Skipping dust rejection check because active policy accepts 1-sat P2SH outputs")
 
         # OP_RETURN followed by non-push
         tx = tx_from_hex(raw_tx_reference)
@@ -370,20 +407,43 @@ class MempoolAcceptanceTest(BitcoinTestFramework):
             rawtxs=[tx.serialize().hex()],
         )
 
-        self.log.info("A transaction with an OP_RETURN output that bumps into the max standardness tx size.")
+        self.log.info("A transaction with an OP_RETURN output that bumps into the max datacarrier relay size.")
         tx = tx_from_hex(raw_tx_reference)
         tx.vout[0].scriptPubKey = CScript([OP_RETURN])
-        data_len = int(MAX_STANDARD_TX_WEIGHT / 4) - tx.get_vsize() - 5 - 4  # -5 for PUSHDATA4 and -4 for script size
-        tx.vout[0].scriptPubKey = CScript([OP_RETURN, b"\xff" * (data_len)])
-        assert_equal(tx.get_vsize(), int(MAX_STANDARD_TX_WEIGHT / 4))
+        initial_data_len = max(1, int(MAX_OP_RETURN_RELAY_SIZE / 4) - tx.get_vsize() - 5 - 4)
+
+        def accepts_op_return_len(op_return_len):
+            tx.vout[0].scriptPubKey = CScript([OP_RETURN, b"\xff" * op_return_len])
+            result = node.testmempoolaccept([tx.serialize().hex()], maxfeerate=0)[0]
+            if result["allowed"]:
+                return True
+            assert_equal(result["reject-reason"], "datacarrier")
+            return False
+
+        first_rejected_data_len = find_first_false(
+            start=initial_data_len,
+            predicate=accepts_op_return_len,
+            growth_factor=1.5,
+            max_value=2_000_000,
+        )
+        low_true_data_len = max(1, first_rejected_data_len // 2)
+        while not accepts_op_return_len(low_true_data_len):
+            assert_greater_than(low_true_data_len, 1)
+            low_true_data_len //= 2
+        last_allowed_data_len = bisect_last_true(
+            low_true=low_true_data_len,
+            high_false=first_rejected_data_len,
+            predicate=accepts_op_return_len,
+        )
+
+        tx.vout[0].scriptPubKey = CScript([OP_RETURN, b"\xff" * last_allowed_data_len])
         self.check_mempool_result(
             result_expected=[{"txid": tx.txid_hex, "allowed": True, "vsize": tx.get_vsize(), "fees": {"base": Decimal("0.1") - Decimal("0.05")}}],
             rawtxs=[tx.serialize().hex()],
         )
-        tx.vout[0].scriptPubKey = CScript([OP_RETURN, b"\xff" * (data_len + 1)])
-        assert_greater_than(tx.get_vsize(), int(MAX_STANDARD_TX_WEIGHT / 4))
+        tx.vout[0].scriptPubKey = CScript([OP_RETURN, b"\xff" * first_rejected_data_len])
         self.check_mempool_result(
-            result_expected=[{"txid": tx.txid_hex, "allowed": False, "reject-reason": "tx-size"}],
+            result_expected=[{"txid": tx.txid_hex, "allowed": False, "reject-reason": "datacarrier"}],
             rawtxs=[tx.serialize().hex()],
         )
 

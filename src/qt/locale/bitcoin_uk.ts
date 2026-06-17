@@ -1067,7 +1067,7 @@ Signing is only possible with addresses of the type 'legacy'.</source>
         <translation type="unfinished">(%1 заблоковано)</translation>
     </message>
     <message>
-        <source>Can vary +/- %1 satoshi(s) per input.</source>
+        <source>Can vary +/- %1 bits per input.</source>
         <translation type="unfinished">Може відрізнятися на +/- %1 сатоші за кожний вхід.</translation>
     </message>
     <message>
@@ -3069,13 +3069,13 @@ For more information on using this console, type %6.
     <message>
         <source>Specify a custom fee per kB (1,000 bytes) of the transaction's virtual size.
 
-Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 satoshis per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 satoshis.</source>
+Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 bits per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 bits.</source>
         <translation type="unfinished">Вкажіть комісію за кБ (1000 байт) віртуального розміру транзакції.
 
 Примітка: Оскільки в розрахунку враховуються байти, комісія "100 сатоші за квБ" для транзакції розміром 500 віртуальних байт (половина 1 квБ) в результаті становить всього 50 сатоші.</translation>
     </message>
     <message>
-        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for bitcoin transactions than the network can process.</source>
+        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for qbit transactions than the network can process.</source>
         <translation type="unfinished">Якщо обсяг транзакцій менше, ніж простір у блоках, майнери, а також вузли ретрансляції можуть стягувати мінімальну плату. Сплата лише цієї мінімальної суми може призвести до ніколи не підтверджуваної транзакції, коли буде більше попиту на біткоїн-транзакції, ніж мережа може обробити.</translation>
     </message>
     <message>
@@ -3372,7 +3372,7 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 satos
         <translation type="unfinished">Сума у вибраній одиниці, яку потрібно надіслати</translation>
     </message>
     <message>
-        <source>The fee will be deducted from the amount being sent. The recipient will receive less bitcoins than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
+        <source>The fee will be deducted from the amount being sent. The recipient will receive less QBT than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
         <translation type="unfinished">Комісію буде знято зі вказаної суми. До отримувача надійде менше біткоїнів, ніж було вказано в полі кількості. Якщо ж отримувачів декілька - комісію буде розподілено між ними.</translation>
     </message>
     <message>
@@ -4146,8 +4146,8 @@ Go to File &gt; Open Wallet to load a wallet.
         <translation type="unfinished">Не вдалося перевірити стан знімка -assumeutxo для %s. Це вказує на проблему з обладнанням, або на помилку в програмному забезпеченні, або на неправильну модифікацію програми, яка дозволила завантажити неправильний знімок. Внаслідок цього вузол вимкнеться та припинить використовувати будь-який стан, побудований на знімку, скидаючи висоту блокчейну з %d на %d. При наступному запуску вузол буде продовжувати синхронізацію з %d, не використовуючи жодних даних зі знімка. Повідомте про цей випадок %s, включаючи інформацію про те, як знімок було отримано. Неправильний знімок стану блокчейну залишиться на диску у випадку, якщо він буде корисний при діагностиці проблеми, що викликала цю помилку.</translation>
     </message>
     <message>
-        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/p2p-bad-ports.md for details and a full list.</source>
-        <translation type="unfinished">Запит %s на прослуховування порту %u. Цей порт вважається «поганим» і тому навряд чи до нього підключиться який-небудь учасник. Перегляньте doc/p2p-bad-ports.md для отримання подробиць та повного списку.</translation>
+        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/reference/p2p-bad-ports.md for details and a full list.</source>
+        <translation type="unfinished">Запит %s на прослуховування порту %u. Цей порт вважається «поганим» і тому навряд чи до нього підключиться який-небудь учасник. Перегляньте doc/reference/p2p-bad-ports.md для отримання подробиць та повного списку.</translation>
     </message>
     <message>
         <source>Disk space for %s may not accommodate the block files. Approximately %u GB of data will be stored in this directory.</source>

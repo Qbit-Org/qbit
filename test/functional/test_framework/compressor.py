@@ -55,4 +55,4 @@ class TestFrameworkCompressor(unittest.TestCase):
         check_amount(1000000, 0x7)
         check_amount(COIN, 0x9)
         check_amount(50*COIN, 0x32)
-        check_amount(21000000*COIN, 0x1406f40)
+        check_amount(210000000*COIN, 0xc845880)

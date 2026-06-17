@@ -10,8 +10,8 @@
 //! dependencies. More complicated types should be defined in dedicated header
 //! files.
 
-#ifndef BITCOIN_COMMON_TYPES_H
-#define BITCOIN_COMMON_TYPES_H
+#ifndef QBIT_COMMON_TYPES_H
+#define QBIT_COMMON_TYPES_H
 
 namespace common {
 enum class PSBTError {
@@ -21,8 +21,9 @@ enum class PSBTError {
     EXTERNAL_SIGNER_FAILED,
     UNSUPPORTED,
     INCOMPLETE,
+    INVALID_P2MR_SIGNATURE,
     OK,
 };
 } // namespace common
 
-#endif // BITCOIN_COMMON_TYPES_H
+#endif // QBIT_COMMON_TYPES_H

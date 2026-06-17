@@ -64,6 +64,10 @@ class UtxoToSqliteTest(BitcoinTestFramework):
     def run_test(self):
         node = self.nodes[0]
         wallet = MiniWallet(node)
+
+        # Mature the default-cache coinbase UTXOs
+        self.ensure_cached_coinbase_mature(self.nodes[0])
+
         key = ECKey()
 
         self.log.info('Create UTXOs with various output script types')

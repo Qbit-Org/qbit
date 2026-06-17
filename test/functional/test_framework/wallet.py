@@ -18,11 +18,13 @@ from test_framework.address import (
     key_to_p2sh_p2wpkh,
     key_to_p2wpkh,
     output_key_to_p2tr,
+    program_to_witness,
 )
 from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.descriptors import descsum_create
 from test_framework.key import (
     ECKey,
+    TaggedHash,
     compute_xonly_pubkey,
 )
 from test_framework.messages import (
@@ -32,11 +34,14 @@ from test_framework.messages import (
     CTxIn,
     CTxInWitness,
     CTxOut,
+    WITNESS_SCALE_FACTOR,
     hash256,
+    ser_string,
 )
 from test_framework.script import (
     CScript,
     OP_NOP,
+    OP_2,
     OP_RETURN,
     OP_TRUE,
     sign_input_legacy,
@@ -57,6 +62,18 @@ from test_framework.util import (
 from test_framework.wallet_util import generate_keypair
 
 DEFAULT_FEE = Decimal("0.0001")
+P2MR_LEAF_VERSION = 0xC0
+
+
+def p2mr_op_true_control_block():
+    return bytes([P2MR_LEAF_VERSION | 1])
+
+
+def p2mr_op_true_script():
+    leaf_script = CScript([OP_TRUE])
+    merkle_root = TaggedHash("P2MRLeaf", bytes([P2MR_LEAF_VERSION]) + ser_string(bytes(leaf_script)))
+    return CScript([OP_2, merkle_root])
+
 
 class MiniWalletMode(Enum):
     """Determines the transaction type the MiniWallet is creating and spending.
@@ -82,6 +99,7 @@ class MiniWalletMode(Enum):
     ADDRESS_OP_TRUE = 1
     RAW_OP_TRUE = 2
     RAW_P2PK = 3
+    ADDRESS_P2MR_OP_TRUE = 4
 
 
 class MiniWallet:
@@ -105,6 +123,11 @@ class MiniWallet:
             internal_key = None if tag_name is None else compute_xonly_pubkey(hash256(tag_name.encode()))[0]
             self._address, self._taproot_info = create_deterministic_address_bcrt1_p2tr_op_true(internal_key)
             self._scriptPubKey = address_to_scriptpubkey(self._address)
+        elif mode == MiniWalletMode.ADDRESS_P2MR_OP_TRUE:
+            assert tag_name is None
+            self._p2mr_leaf_script = CScript([OP_TRUE])
+            self._p2mr_control_block = p2mr_op_true_control_block()
+            self._scriptPubKey = bytes(p2mr_op_true_script())
 
         # When the pre-mined test framework chain is used, it contains coinbase
         # outputs to the MiniWallet's default address in blocks 76-100
@@ -190,11 +213,19 @@ class MiniWallet:
                     leaf_info.script,
                     bytes([leaf_info.version | self._taproot_info.negflag]) + self._taproot_info.internal_pubkey,
                 ]
+        elif self._mode == MiniWalletMode.ADDRESS_P2MR_OP_TRUE:
+            tx.wit.vtxinwit = [CTxInWitness() for _ in tx.vin]
+            for i in tx.wit.vtxinwit:
+                i.scriptWitness.stack = [
+                    bytes(self._p2mr_leaf_script),
+                    self._p2mr_control_block,
+                ]
         else:
             assert False
 
     def generate(self, num_blocks, **kwargs):
         """Generate blocks with coinbase outputs to the internal address, and call rescan_utxos"""
+        kwargs.setdefault("called_by_framework", True)
         blocks = self._test_node.generatetodescriptor(num_blocks, self.get_descriptor(), **kwargs)
         # Calling rescan_utxos here makes sure that after a generate the utxo
         # set is in a clean state. For example, the wallet will update
@@ -205,6 +236,32 @@ class MiniWallet:
         # - However, the wallet will not consider remaining mempool txs
         self.rescan_utxos()
         return blocks
+
+    def ensure_spendable_utxos(self, *, min_spendable=1, mature_coinbase_count=1):
+        """Ensure mature spendable UTXOs exist even when cache assumptions drift."""
+        assert_greater_than_or_equal(min_spendable, 1)
+        assert_greater_than_or_equal(mature_coinbase_count, 1)
+
+        self.rescan_utxos()
+        coinbase_heights = sorted(
+            utxo["height"]
+            for utxo in self.get_utxos(include_immature_coinbase=True, mark_as_spent=False)
+            if utxo["coinbase"]
+        )
+        assert_greater_than_or_equal(len(coinbase_heights), mature_coinbase_count)
+
+        required_height = coinbase_heights[mature_coinbase_count - 1] + COINBASE_MATURITY - 1
+        current_height = self._test_node.getblockcount()
+        if current_height < required_height:
+            self._test_node.generate(required_height - current_height, called_by_framework=True)
+            self.rescan_utxos()
+
+        if len(self.get_utxos(mark_as_spent=False)) < min_spendable:
+            self.generate(COINBASE_MATURITY + 1)
+
+        spendable = self.get_utxos(mark_as_spent=False)
+        assert_greater_than_or_equal(len(spendable), min_spendable)
+        return spendable
 
     def get_output_script(self):
         return self._scriptPubKey
@@ -364,7 +421,11 @@ class MiniWallet:
         assert fee >= 0
         # calculate fee
         if self._mode in (MiniWalletMode.RAW_OP_TRUE, MiniWalletMode.ADDRESS_OP_TRUE):
-            vsize = Decimal(104)  # anyone-can-spend
+            # ADDRESS_OP_TRUE and RAW_OP_TRUE are intentionally padded to the same size.
+            # With WSF=1 there is no witness discount, so the 1-in-1-out tx is larger.
+            vsize = Decimal(133 if WITNESS_SCALE_FACTOR == 1 else 104)  # anyone-can-spend
+        elif self._mode == MiniWalletMode.ADDRESS_P2MR_OP_TRUE:
+            vsize = Decimal(101 if WITNESS_SCALE_FACTOR == 1 else 96)  # P2MR OP_TRUE script path
         elif self._mode == MiniWalletMode.RAW_P2PK:
             vsize = Decimal(168)  # P2PK (73 bytes scriptSig + 35 bytes scriptPubKey + 60 bytes other)
         else:
@@ -422,7 +483,7 @@ class MiniWallet:
 def getnewdestination(address_type='bech32m'):
     """Generate a random destination of the specified type and return the
        corresponding public key, scriptPubKey and address. Supported types are
-       'legacy', 'p2sh-segwit', 'bech32' and 'bech32m'. Can be used when a random
+       'legacy', 'p2sh-segwit', 'bech32', 'bech32m', and 'p2mr'. Can be used when a random
        destination is needed, but no compiled wallet is available (e.g. as
        replacement to the getnewaddress/getaddressinfo RPCs)."""
     key, pubkey = generate_keypair()
@@ -440,6 +501,10 @@ def getnewdestination(address_type='bech32m'):
         pubkey = tap.output_pubkey
         scriptpubkey = tap.scriptPubKey
         address = output_key_to_p2tr(pubkey)
+    elif address_type == 'p2mr':
+        pubkey = compute_xonly_pubkey(key.get_bytes())[0]
+        address = program_to_witness(2, pubkey)
+        scriptpubkey = address_to_scriptpubkey(address)
     else:
         assert False
     return pubkey, scriptpubkey, address

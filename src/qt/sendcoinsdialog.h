@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_QT_SENDCOINSDIALOG_H
-#define BITCOIN_QT_SENDCOINSDIALOG_H
+#ifndef QBIT_QT_SENDCOINSDIALOG_H
+#define QBIT_QT_SENDCOINSDIALOG_H
 
 #include <primitives/transaction_identifier.h>
 #include <qt/clientmodel.h>
@@ -20,6 +20,7 @@ class SendCoinsRecipient;
 enum class SynchronizationState;
 namespace wallet {
 class CCoinControl;
+struct PQCUsageReport;
 } // namespace wallet
 
 namespace Ui {
@@ -29,6 +30,9 @@ namespace Ui {
 QT_BEGIN_NAMESPACE
 class QUrl;
 QT_END_NAMESPACE
+
+QString FormatPQCUsageWarningHtml(const wallet::PQCUsageReport& report);
+QString FormatPQCUsageWarningMessage(const wallet::PQCUsageReport& report);
 
 /** Dialog for sending bitcoins */
 class SendCoinsDialog : public QDialog
@@ -153,4 +157,4 @@ private:
     QString m_psbt_button_text{tr("Create Unsigned")};
 };
 
-#endif // BITCOIN_QT_SENDCOINSDIALOG_H
+#endif // QBIT_QT_SENDCOINSDIALOG_H

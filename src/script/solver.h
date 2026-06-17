@@ -5,11 +5,11 @@
 
 // The Solver functions are used by policy and the wallet, but not consensus.
 
-#ifndef BITCOIN_SCRIPT_SOLVER_H
-#define BITCOIN_SCRIPT_SOLVER_H
+#ifndef QBIT_SCRIPT_SOLVER_H
+#define QBIT_SCRIPT_SOLVER_H
 
 #include <attributes.h>
-#include <script/script.h>
+#include <script/pushdata.h>
 #include <span.h>
 
 #include <string>
@@ -31,16 +31,12 @@ enum class TxoutType {
     WITNESS_V0_SCRIPTHASH,
     WITNESS_V0_KEYHASH,
     WITNESS_V1_TAPROOT,
+    WITNESS_V2_P2MR,     //!< BIP-360 Pay-to-Merkle-Root
     WITNESS_UNKNOWN, //!< Only for Witness versions not already defined above
 };
 
 /** Get the name of a TxoutType as a string */
 std::string GetTxnOutputType(TxoutType t);
-
-constexpr bool IsPushdataOp(opcodetype opcode)
-{
-    return opcode > OP_FALSE && opcode <= OP_PUSHDATA4;
-}
 
 /**
  * Parse a scriptPubKey and identify script type for standard scripts. If
@@ -64,4 +60,4 @@ std::optional<std::pair<int, std::vector<std::span<const unsigned char>>>> Match
 /** Generate a multisig script. */
 CScript GetScriptForMultisig(int nRequired, const std::vector<CPubKey>& keys);
 
-#endif // BITCOIN_SCRIPT_SOLVER_H
+#endif // QBIT_SCRIPT_SOLVER_H

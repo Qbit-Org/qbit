@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_QT_MACNOTIFICATIONHANDLER_H
-#define BITCOIN_QT_MACNOTIFICATIONHANDLER_H
+#ifndef QBIT_QT_MACNOTIFICATIONHANDLER_H
+#define QBIT_QT_MACNOTIFICATIONHANDLER_H
 
 #include <QObject>
 
@@ -24,4 +24,4 @@ public:
 };
 
 
-#endif // BITCOIN_QT_MACNOTIFICATIONHANDLER_H
+#endif // QBIT_QT_MACNOTIFICATIONHANDLER_H

@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_NETADDRESS_H
-#define BITCOIN_NETADDRESS_H
+#ifndef QBIT_NETADDRESS_H
+#define QBIT_NETADDRESS_H
 
 #include <compat/compat.h>
 #include <crypto/siphash.h>
@@ -595,4 +595,4 @@ private:
     const uint64_t m_salt_k1;
 };
 
-#endif // BITCOIN_NETADDRESS_H
+#endif // QBIT_NETADDRESS_H

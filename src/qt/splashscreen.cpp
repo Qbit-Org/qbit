@@ -13,9 +13,12 @@
 #include <interfaces/wallet.h>
 #include <qt/guiutil.h>
 #include <qt/networkstyle.h>
+#ifdef ENABLE_WALLET
 #include <qt/walletmodel.h>
+#endif
 #include <util/translation.h>
 
+#include <algorithm>
 #include <functional>
 
 #include <QApplication>
@@ -29,9 +32,9 @@ SplashScreen::SplashScreen(const NetworkStyle* networkStyle)
     : QWidget()
 {
     // set reference point, paddings
-    int paddingRight            = 50;
+    int paddingRight            = 20;
     int paddingTop              = 50;
-    int titleVersionVSpace      = 17;
+    int titleVersionVSpace      = 22;
     int titleCopyrightVSpace    = 40;
 
     float fontFactor            = 1.0;
@@ -44,7 +47,12 @@ SplashScreen::SplashScreen(const NetworkStyle* networkStyle)
     QString copyrightText   = QString::fromUtf8(CopyrightHolders(strprintf("\xc2\xA9 %u-%u ", 2009, COPYRIGHT_YEAR)).c_str());
     const QString& titleAddText    = networkStyle->getTitleAddText();
 
-    QString font            = QApplication::font().toString();
+    const QFont appFont     = QApplication::font();
+    auto makeFont = [&](qreal pointSize) {
+        QFont scaledFont(appFont);
+        scaledFont.setPointSizeF(pointSize * fontFactor);
+        return scaledFont;
+    };
 
     // create a bitmap according to device pixelratio
     QSize splashSize(480*devicePixelRatio,320*devicePixelRatio);
@@ -72,41 +80,43 @@ SplashScreen::SplashScreen(const NetworkStyle* networkStyle)
     pixPaint.drawPixmap(rectIcon, icon);
 
     // check font size and drawing with
-    pixPaint.setFont(QFont(font, 33*fontFactor));
+    pixPaint.setFont(makeFont(33));
     QFontMetrics fm = pixPaint.fontMetrics();
     int titleTextWidth = GUIUtil::TextWidth(fm, titleText);
     if (titleTextWidth > 176) {
         fontFactor = fontFactor * 176 / titleTextWidth;
     }
 
-    pixPaint.setFont(QFont(font, 33*fontFactor));
+    pixPaint.setFont(makeFont(33));
     fm = pixPaint.fontMetrics();
     titleTextWidth  = GUIUtil::TextWidth(fm, titleText);
-    pixPaint.drawText(pixmap.width()/devicePixelRatio-titleTextWidth-paddingRight,paddingTop,titleText);
+    const int textBlockWidth = std::max(titleTextWidth, 176);
+    const int textBlockLeft = pixmap.width()/devicePixelRatio-textBlockWidth-paddingRight;
+    pixPaint.drawText(textBlockLeft,paddingTop,titleText);
 
-    pixPaint.setFont(QFont(font, 15*fontFactor));
+    pixPaint.setFont(makeFont(15));
 
     // if the version string is too long, reduce size
     fm = pixPaint.fontMetrics();
     int versionTextWidth  = GUIUtil::TextWidth(fm, versionText);
-    if(versionTextWidth > titleTextWidth+paddingRight-10) {
-        pixPaint.setFont(QFont(font, 10*fontFactor));
+    if(versionTextWidth > textBlockWidth) {
+        pixPaint.setFont(makeFont(10));
         titleVersionVSpace -= 5;
     }
-    pixPaint.drawText(pixmap.width()/devicePixelRatio-titleTextWidth-paddingRight+2,paddingTop+titleVersionVSpace,versionText);
+    pixPaint.drawText(textBlockLeft+2,paddingTop+titleVersionVSpace,versionText);
 
     // draw copyright stuff
     {
-        pixPaint.setFont(QFont(font, 10*fontFactor));
-        const int x = pixmap.width()/devicePixelRatio-titleTextWidth-paddingRight;
+        pixPaint.setFont(makeFont(10));
+        const int x = textBlockLeft;
         const int y = paddingTop+titleCopyrightVSpace;
-        QRect copyrightRect(x, y, pixmap.width() - x - paddingRight, pixmap.height() - y);
+        QRect copyrightRect(x, y, textBlockWidth, pixmap.height() - y);
         pixPaint.drawText(copyrightRect, Qt::AlignLeft | Qt::AlignTop | Qt::TextWordWrap, copyrightText);
     }
 
     // draw additional text if special network
     if(!titleAddText.isEmpty()) {
-        QFont boldFont = QFont(font, 10*fontFactor);
+        QFont boldFont = makeFont(10);
         boldFont.setWeight(QFont::Bold);
         pixPaint.setFont(boldFont);
         fm = pixPaint.fontMetrics();

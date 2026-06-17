@@ -34,6 +34,7 @@ util::Result<void> ApplyArgsManOptions(const ArgsManager& args, BlockManager::Op
     opts.prune_target = nPruneTarget;
 
     if (auto value{args.GetBoolArg("-fastprune")}) opts.fast_prune = *value;
+    if (auto value{args.GetBoolArg("-prunewitnesses")}) opts.prune_witnesses = *value;
 
     ReadDatabaseArgs(args, opts.block_tree_db_params.options);
 

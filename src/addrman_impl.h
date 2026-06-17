@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_ADDRMAN_IMPL_H
-#define BITCOIN_ADDRMAN_IMPL_H
+#ifndef QBIT_ADDRMAN_IMPL_H
+#define QBIT_ADDRMAN_IMPL_H
 
 #include <logging.h>
 #include <logging/timer.h>
@@ -292,4 +292,4 @@ private:
     int CheckAddrman() const EXCLUSIVE_LOCKS_REQUIRED(cs);
 };
 
-#endif // BITCOIN_ADDRMAN_IMPL_H
+#endif // QBIT_ADDRMAN_IMPL_H

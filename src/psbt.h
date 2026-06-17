@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_PSBT_H
-#define BITCOIN_PSBT_H
+#ifndef QBIT_PSBT_H
+#define QBIT_PSBT_H
 
 #include <common/types.h>
 #include <node/transaction.h>
@@ -16,6 +16,7 @@
 #include <span.h>
 #include <streams.h>
 
+#include <array>
 #include <optional>
 
 namespace node {
@@ -53,9 +54,11 @@ static constexpr uint8_t PSBT_IN_TAP_LEAF_SCRIPT = 0x15;
 static constexpr uint8_t PSBT_IN_TAP_BIP32_DERIVATION = 0x16;
 static constexpr uint8_t PSBT_IN_TAP_INTERNAL_KEY = 0x17;
 static constexpr uint8_t PSBT_IN_TAP_MERKLE_ROOT = 0x18;
+static constexpr uint8_t PSBT_IN_P2MR_SCRIPT_SIG = 0x19;
 static constexpr uint8_t PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS = 0x1a;
 static constexpr uint8_t PSBT_IN_MUSIG2_PUB_NONCE = 0x1b;
 static constexpr uint8_t PSBT_IN_MUSIG2_PARTIAL_SIG = 0x1c;
+static constexpr uint8_t PSBT_IN_P2MR_LEAF_SCRIPT = 0x1d;
 static constexpr uint8_t PSBT_IN_PROPRIETARY = 0xFC;
 
 // Output types
@@ -78,6 +81,18 @@ const std::streamsize MAX_FILE_SIZE_PSBT = 100000000; // 100 MB
 
 // PSBT version number
 static constexpr uint32_t PSBT_HIGHEST_VERSION = 0;
+
+// qbit proprietary PSBT namespace and P2MR input subtypes.
+static constexpr std::array<unsigned char, 4> PSBT_QBIT_IDENTIFIER{'q', 'b', 'i', 't'};
+static constexpr uint64_t PSBT_QBIT_IN_P2MR_MERKLE_ROOT = 0x01;
+static constexpr uint64_t PSBT_QBIT_IN_P2MR_LEAF_SCRIPT = 0x02;
+static constexpr uint64_t PSBT_QBIT_IN_P2MR_SCRIPT_SIG = 0x03;
+
+inline bool IsQbitProprietaryIdentifier(std::span<const unsigned char> identifier)
+{
+    return identifier.size() == PSBT_QBIT_IDENTIFIER.size() &&
+           std::equal(identifier.begin(), identifier.end(), PSBT_QBIT_IDENTIFIER.begin());
+}
 
 /** A structure for PSBT proprietary types */
 struct PSBTProprietary
@@ -104,6 +119,17 @@ void SerializeToVector(Stream& s, const X&... args)
     SerializeMany(sizecomp, args...);
     WriteCompactSize(s, sizecomp.size());
     SerializeMany(s, args...);
+}
+
+template<typename Stream>
+void SerializeQbitProprietaryKey(Stream& s, uint8_t type, uint64_t subtype, std::span<const unsigned char> key_data = {})
+{
+    SerializeToVector(s,
+                      type,
+                      CompactSizeWriter(PSBT_QBIT_IDENTIFIER.size()),
+                      std::span{PSBT_QBIT_IDENTIFIER},
+                      CompactSizeWriter(subtype),
+                      key_data);
 }
 
 // Takes a stream and multiple arguments and unserializes them first as a vector then each object individually in the order provided in the arguments
@@ -267,6 +293,11 @@ struct PSBTInput
     XOnlyPubKey m_tap_internal_key;
     uint256 m_tap_merkle_root;
 
+    // qbit-proprietary P2MR PSBT fields
+    std::map<std::pair<CPQCPubKey, uint256>, std::vector<unsigned char>> m_qbit_p2mr_script_sigs;
+    std::map<std::pair<std::vector<unsigned char>, int>, std::set<std::vector<unsigned char>, ShortestVectorFirstComparator>> m_qbit_p2mr_scripts;
+    uint256 m_qbit_p2mr_merkle_root;
+
     // MuSig2 fields
     std::map<CPubKey, std::vector<CPubKey>> m_musig2_participants;
     // Key is the aggregate pubkey and the script leaf hash, value is a map of participant pubkey to pubnonce
@@ -284,6 +315,18 @@ struct PSBTInput
     void Merge(const PSBTInput& input);
     PSBTInput() = default;
 
+    void AddP2MRScriptSig(const CPQCPubKey& pubkey, const uint256& leaf_hash, std::vector<unsigned char>&& sig)
+    {
+        const auto key = std::make_pair(pubkey, leaf_hash);
+        const auto it = m_qbit_p2mr_script_sigs.find(key);
+        if (it != m_qbit_p2mr_script_sigs.end()) {
+            if (it->second != sig) {
+                throw std::ios_base::failure("Conflicting P2MR script signature for pubkey and leaf hash");
+            }
+            return;
+        }
+        m_qbit_p2mr_script_sigs.emplace(key, std::move(sig));
+    }
     template <typename Stream>
     inline void Serialize(Stream& s) const {
         // Write the utxo
@@ -372,6 +415,24 @@ struct PSBTInput
                 }
             }
 
+            // Write P2MR script sigs
+            for (const auto& [pubkey_leaf, sig] : m_qbit_p2mr_script_sigs) {
+                const auto& [pubkey, leaf_hash] = pubkey_leaf;
+                SerializeToVector(s, PSBT_IN_P2MR_SCRIPT_SIG, std::span{pubkey.data(), pubkey.size()}, leaf_hash);
+                s << sig;
+            }
+
+            // Write P2MR leaf scripts
+            for (const auto& [leaf, control_blocks] : m_qbit_p2mr_scripts) {
+                const auto& [script, leaf_ver] = leaf;
+                for (const auto& control_block : control_blocks) {
+                    SerializeToVector(s, PSBT_IN_P2MR_LEAF_SCRIPT, std::span{control_block});
+                    std::vector<unsigned char> value_v(script.begin(), script.end());
+                    value_v.push_back((uint8_t)leaf_ver);
+                    s << value_v;
+                }
+            }
+
             // Write taproot bip32 keypaths
             for (const auto& [xonly, leaf_origin] : m_tap_bip32_paths) {
                 const auto& [leaf_hashes, origin] = leaf_origin;
@@ -393,6 +454,12 @@ struct PSBTInput
             if (!m_tap_merkle_root.IsNull()) {
                 SerializeToVector(s, PSBT_IN_TAP_MERKLE_ROOT);
                 SerializeToVector(s, m_tap_merkle_root);
+            }
+
+            // Write qbit P2MR merkle root
+            if (!m_qbit_p2mr_merkle_root.IsNull()) {
+                SerializeQbitProprietaryKey(s, PSBT_IN_PROPRIETARY, PSBT_QBIT_IN_P2MR_MERKLE_ROOT);
+                SerializeToVector(s, m_qbit_p2mr_merkle_root);
             }
 
             // Write MuSig2 Participants
@@ -728,6 +795,61 @@ struct PSBTInput
                     m_tap_scripts[leaf_script].insert(std::vector<unsigned char>(key.begin() + 1, key.end()));
                     break;
                 }
+                case PSBT_IN_P2MR_SCRIPT_SIG:
+                {
+                    if (!key_lookup.emplace(key).second) {
+                        throw std::ios_base::failure("Duplicate Key, input P2MR script signature already provided");
+                    } else if (key.size() != 1 + CPQCPubKey::SIZE + uint256::size()) {
+                        throw std::ios_base::failure("Input P2MR script signature key is not 65 bytes");
+                    }
+                    SpanReader s_key{std::span{key}.subspan(1)};
+                    std::array<unsigned char, CPQCPubKey::SIZE> pubkey_bytes;
+                    s_key >> std::as_writable_bytes(std::span{pubkey_bytes});
+                    CPQCPubKey pubkey{std::span<const unsigned char>{pubkey_bytes}};
+                    if (!pubkey.IsValid()) {
+                        throw std::ios_base::failure("Invalid P2MR pubkey");
+                    }
+                    uint256 hash;
+                    s_key >> hash;
+                    std::vector<unsigned char> sig;
+                    s >> sig;
+                    if (sig.size() < PQC_SIG_SIZE) {
+                        throw std::ios_base::failure("P2MR script signature is shorter than expected");
+                    }
+                    if (sig.size() > PQC_SIG_SIZE + 1) {
+                        throw std::ios_base::failure("P2MR script signature is longer than expected");
+                    }
+                    if (sig.size() == PQC_SIG_SIZE + 1 && sig.back() == SIGHASH_DEFAULT) {
+                        throw std::ios_base::failure("P2MR script signature has invalid sighash type");
+                    }
+                    AddP2MRScriptSig(pubkey, hash, std::move(sig));
+                    break;
+                }
+                case PSBT_IN_P2MR_LEAF_SCRIPT:
+                {
+                    if (!key_lookup.emplace(key).second) {
+                        throw std::ios_base::failure("Duplicate Key, input P2MR leaf script already provided");
+                    }
+                    const size_t control_size = key.size() - 1;
+                    if (control_size < P2MR_CONTROL_BASE_SIZE || control_size > P2MR_CONTROL_MAX_SIZE ||
+                        ((control_size - P2MR_CONTROL_BASE_SIZE) % P2MR_CONTROL_NODE_SIZE) != 0) {
+                        throw std::ios_base::failure("P2MR leaf script key has an invalid control block size");
+                    }
+                    std::vector<unsigned char> control_block(key.begin() + 1, key.end());
+                    if ((control_block.front() & 1) == 0) {
+                        throw std::ios_base::failure("P2MR control byte bit 0 must be set");
+                    }
+                    std::vector<unsigned char> script_v;
+                    s >> script_v;
+                    if (script_v.empty()) {
+                        throw std::ios_base::failure("Input P2MR leaf script must be at least 1 byte");
+                    }
+                    uint8_t leaf_ver = script_v.back();
+                    script_v.pop_back();
+                    const auto leaf_script = std::make_pair(script_v, (int)leaf_ver);
+                    m_qbit_p2mr_scripts[leaf_script].insert(std::move(control_block));
+                    break;
+                }
                 case PSBT_IN_TAP_BIP32_DERIVATION:
                 {
                     if (!key_lookup.emplace(key).second) {
@@ -820,16 +942,98 @@ struct PSBTInput
                 }
                 case PSBT_IN_PROPRIETARY:
                 {
-                    PSBTProprietary this_prop;
-                    skey >> this_prop.identifier;
-                    this_prop.subtype = ReadCompactSize(skey);
-                    this_prop.key = key;
+                    std::vector<unsigned char> identifier;
+                    skey >> identifier;
+                    const uint64_t subtype = ReadCompactSize(skey);
+                    auto store_proprietary = [&](std::vector<unsigned char>&& prop_identifier) {
+                        PSBTProprietary this_prop;
+                        this_prop.identifier = std::move(prop_identifier);
+                        this_prop.subtype = subtype;
+                        this_prop.key = key;
 
-                    if (m_proprietary.count(this_prop) > 0) {
-                        throw std::ios_base::failure("Duplicate Key, proprietary key already found");
+                        if (m_proprietary.count(this_prop) > 0) {
+                            throw std::ios_base::failure("Duplicate Key, proprietary key already found");
+                        }
+                        s >> this_prop.value;
+                        m_proprietary.insert(std::move(this_prop));
+                    };
+
+                    if (IsQbitProprietaryIdentifier(identifier)) {
+                        switch (subtype) {
+                        case PSBT_QBIT_IN_P2MR_MERKLE_ROOT:
+                        {
+                            if (!key_lookup.emplace(key).second) {
+                                throw std::ios_base::failure("Duplicate Key, qbit P2MR merkle root already provided");
+                            } else if (!skey.empty()) {
+                                throw std::ios_base::failure("qbit P2MR merkle root key is more than one byte type");
+                            }
+                            UnserializeFromVector(s, m_qbit_p2mr_merkle_root);
+                            break;
+                        }
+                        case PSBT_QBIT_IN_P2MR_LEAF_SCRIPT:
+                        {
+                            if (!key_lookup.emplace(key).second) {
+                                throw std::ios_base::failure("Duplicate Key, qbit P2MR leaf script already provided");
+                            }
+                            const size_t control_size = skey.size();
+                            if (control_size < P2MR_CONTROL_BASE_SIZE || control_size > P2MR_CONTROL_MAX_SIZE ||
+                                ((control_size - P2MR_CONTROL_BASE_SIZE) % P2MR_CONTROL_NODE_SIZE) != 0) {
+                                throw std::ios_base::failure("qbit P2MR leaf script key has an invalid control block size");
+                            }
+                            std::vector<unsigned char> control_block(control_size);
+                            skey >> std::span{control_block};
+                            if ((control_block.front() & 1) == 0) {
+                                throw std::ios_base::failure("qbit P2MR control byte bit 0 must be set");
+                            }
+                            std::vector<unsigned char> script_v;
+                            s >> script_v;
+                            if (script_v.empty()) {
+                                throw std::ios_base::failure("qbit P2MR leaf script must be at least 1 byte");
+                            }
+                            uint8_t leaf_ver = script_v.back();
+                            script_v.pop_back();
+                            const auto leaf_script = std::make_pair(script_v, (int)leaf_ver);
+                            m_qbit_p2mr_scripts[leaf_script].insert(std::move(control_block));
+                            break;
+                        }
+                        case PSBT_QBIT_IN_P2MR_SCRIPT_SIG:
+                        {
+                            if (!key_lookup.emplace(key).second) {
+                                throw std::ios_base::failure("Duplicate Key, qbit P2MR script signature already provided");
+                            } else if (skey.size() != CPQCPubKey::SIZE + uint256::size()) {
+                                throw std::ios_base::failure("qbit P2MR script signature key is not 64 bytes");
+                            }
+                            std::array<unsigned char, CPQCPubKey::SIZE> pubkey_bytes;
+                            CPQCPubKey pubkey;
+                            uint256 leaf_hash;
+                            skey >> std::span{pubkey_bytes};
+                            pubkey = CPQCPubKey(std::span{pubkey_bytes});
+                            if (!pubkey.IsValid()) {
+                                throw std::ios_base::failure("Invalid qbit P2MR pubkey");
+                            }
+                            skey >> leaf_hash;
+                            std::vector<unsigned char> sig;
+                            s >> sig;
+                            if (sig.size() < PQC_SIG_SIZE) {
+                                throw std::ios_base::failure("qbit P2MR script signature is shorter than expected");
+                            }
+                            if (sig.size() > PQC_SIG_SIZE + 1) {
+                                throw std::ios_base::failure("qbit P2MR script signature is longer than expected");
+                            }
+                            if (sig.size() == PQC_SIG_SIZE + 1 && sig.back() == SIGHASH_DEFAULT) {
+                                throw std::ios_base::failure("qbit P2MR script signature has invalid sighash type");
+                            }
+                            AddP2MRScriptSig(pubkey, leaf_hash, std::move(sig));
+                            break;
+                        }
+                        default:
+                            store_proprietary(std::move(identifier));
+                            break;
+                        }
+                        break;
                     }
-                    s >> this_prop.value;
-                    m_proprietary.insert(this_prop);
+
+                    store_proprietary(std::move(identifier));
                     break;
                 }
                 // Unknown stuff
@@ -1449,4 +1653,4 @@ bool FinalizeAndExtractPSBT(PartiallySignedTransaction& psbtx, CMutableTransacti
 //! Decode a raw (binary blob) PSBT into a PartiallySignedTransaction
 [[nodiscard]] bool DecodeRawPSBT(PartiallySignedTransaction& decoded_psbt, std::span<const std::byte> raw_psbt, std::string& error);
 
-#endif // BITCOIN_PSBT_H
+#endif // QBIT_PSBT_H

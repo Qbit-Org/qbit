@@ -13,9 +13,12 @@ import sys
 from subprocess import check_output
 from typing import Optional, NoReturn
 
+from lint_ignore_dirs import SHARED_EXCLUDED_SUBTREES
+
 CMD_TOP_LEVEL = ["git", "rev-parse", "--show-toplevel"]
 CMD_ALL_FILES = ["git", "ls-files", "-z", "--full-name", "--stage"]
 CMD_SHEBANG_FILES = ["git", "grep", "--full-name", "--line-number", "-I", "^#!"]
+EXCLUDED_SUBTREES = tuple(SHARED_EXCLUDED_SUBTREES)
 
 ALL_SOURCE_FILENAMES_REGEXP = r"^.*\.(cpp|h|py|sh)$"
 ALLOWED_FILENAME_REGEXP = "^[a-zA-Z0-9/_.@][a-zA-Z0-9/_.@-]*$"
@@ -72,6 +75,10 @@ class FileMeta(object):
             return None
 
 
+def is_excluded_subtree(file_path: str) -> bool:
+    return file_path.startswith(EXCLUDED_SUBTREES)
+
+
 def get_git_file_metadata() -> dict[str, FileMeta]:
     '''
     Return a dictionary mapping the name of all files in the repository to git tree metadata.
@@ -80,6 +87,8 @@ def get_git_file_metadata() -> dict[str, FileMeta]:
     files = {}
     for file_spec in files_raw:
         meta = FileMeta(file_spec)
+        if is_excluded_subtree(meta.file_path):
+            continue
         files[meta.file_path] = meta
     return files
 
@@ -177,6 +186,8 @@ def check_shebang_file_permissions(files_meta) -> int:
 
     failed_tests = 0
     for filename in filenames:
+        if is_excluded_subtree(filename):
+            continue
         file_meta = files_meta[filename]
         if file_meta.permissions != ALLOWED_PERMISSION_EXECUTABLES:
             # These file types are typically expected to be sourced and not executed directly

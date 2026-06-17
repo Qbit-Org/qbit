@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_INTERFACES_INIT_H
-#define BITCOIN_INTERFACES_INIT_H
+#ifndef QBIT_INTERFACES_INIT_H
+#define QBIT_INTERFACES_INIT_H
 
 #include <interfaces/chain.h>
 #include <interfaces/echo.h>
@@ -56,4 +56,4 @@ std::unique_ptr<Init> MakeWalletInit(int argc, char* argv[], int& exit_status);
 std::unique_ptr<Init> MakeGuiInit(int argc, char* argv[]);
 } // namespace interfaces
 
-#endif // BITCOIN_INTERFACES_INIT_H
+#endif // QBIT_INTERFACES_INIT_H

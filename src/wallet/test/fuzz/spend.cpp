@@ -41,7 +41,7 @@ FUZZ_TARGET(wallet_create_transaction, .init = initialize_setup)
     FuzzedWallet fuzzed_wallet{
         *g_setup->m_node.chain,
         "fuzzed_wallet_a",
-        "tprv8ZgxMBicQKsPd1QwsGgzfu2pcPYbBosZhJknqreRHgsWx32nNEhMjGQX2cgFL8n6wz9xdDYwLcs78N4nsCo32cxEX8RBtwGsEGgybLiQJfk",
+        "qrpvV1brS3WRoVwgSDCy6YoA6F3ksmPmXxbRCVr26VLxWZEHKY3vsShfGcpoGmAJPXfKXXHoNmEoDbYonmbW8cx5ra3HR8wzgYbZC1ZMAiDm4Ls",
     };
 
     CCoinControl coin_control;
@@ -50,7 +50,7 @@ FUZZ_TARGET(wallet_create_transaction, .init = initialize_setup)
     coin_control.m_include_unsafe_inputs = fuzzed_data_provider.ConsumeBool();
     if (fuzzed_data_provider.ConsumeBool()) coin_control.m_confirm_target = fuzzed_data_provider.ConsumeIntegralInRange<unsigned int>(0, 999'000);
     coin_control.destChange = fuzzed_data_provider.ConsumeBool() ? fuzzed_wallet.GetDestination(fuzzed_data_provider) : ConsumeTxDestination(fuzzed_data_provider);
-    if (fuzzed_data_provider.ConsumeBool()) coin_control.m_change_type = fuzzed_data_provider.PickValueInArray(OUTPUT_TYPES);
+    if (fuzzed_data_provider.ConsumeBool()) coin_control.m_change_type = fuzzed_data_provider.PickValueInArray(SUPPORTED_OUTPUT_TYPES);
     if (fuzzed_data_provider.ConsumeBool()) coin_control.m_feerate = CFeeRate(ConsumeMoney(fuzzed_data_provider, /*max=*/COIN));
     coin_control.m_allow_other_inputs = fuzzed_data_provider.ConsumeBool();
     coin_control.m_locktime = fuzzed_data_provider.ConsumeIntegral<unsigned int>();

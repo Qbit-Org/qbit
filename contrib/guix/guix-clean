@@ -3,7 +3,7 @@ export LC_ALL=C
 set -e -o pipefail
 
 # Source the common prelude, which:
-#   1. Checks if we're at the top directory of the Bitcoin Core repository
+#   1. Checks if we're at the top directory of the qbit repository
 #   2. Defines a few common functions and variables
 #
 # shellcheck source=libexec/prelude.bash
@@ -55,7 +55,7 @@ dir_under_git_root() {
 }
 
 shopt -s nullglob
-found_precious_dirs_files=( "${version_base_prefix}"*/"${var_base_basename}/precious_dirs" ) # This expands to an array of directories...
+found_precious_dirs_files=( "${version_base_prefix}"*/"${var_base_basename}"/precious_dirs* ) # This expands to an array of directories...
 shopt -u nullglob
 
 exclude_flags=()
@@ -67,7 +67,7 @@ for precious_dirs_file in "${found_precious_dirs_files[@]}"; do
 
     # Exclude the precious_dirs file itself
     if dirs_file_exclude_fragment=$(dir_under_git_root "$(dirname "$precious_dirs_file")"); then
-        exclude_flags+=( --exclude="${dirs_file_exclude_fragment}/precious_dirs" )
+        exclude_flags+=( --exclude="${dirs_file_exclude_fragment}/$(basename "$precious_dirs_file")" )
     fi
 
     # Read each 'name=dir' pair from the precious_dirs file

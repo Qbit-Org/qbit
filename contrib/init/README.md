@@ -1,12 +1,14 @@
 Sample configuration files for:
 ```
-systemd: bitcoind.service
-Upstart: bitcoind.conf
-OpenRC:  bitcoind.openrc
-         bitcoind.openrcconf
-CentOS:  bitcoind.init
-macOS:   org.bitcoin.bitcoind.plist
+systemd: qbitd.service
+Upstart: qbitd.conf
+OpenRC:  qbitd.openrc
+         qbitd.openrcconf
+CentOS:  qbitd.init
+macOS:   org.qbit.qbitd.plist
 ```
 have been made available to assist packagers in creating node packages here.
 
-See [doc/init.md](../../doc/init.md) for more information.
+Legacy `bitcoind.*` init files are kept for one release as compatibility aliases.
+
+See [doc/deployment/init.md](../../doc/deployment/init.md) for more information.

@@ -4,6 +4,7 @@
 
 #include <bitcoin-build-config.h> // IWYU pragma: keep
 
+#include <chainparamsbase.h>
 #include <chain.h>
 #include <clientversion.h>
 #include <common/args.h>
@@ -14,6 +15,7 @@
 #include <key_io.h>
 #include <node/types.h>
 #include <outputtype.h>
+#include <policy/feerate.h>
 #include <pow.h>
 #include <rpc/util.h>
 #include <script/descriptor.h>
@@ -31,6 +33,7 @@
 
 #include <algorithm>
 #include <iterator>
+#include <span>
 #include <string_view>
 #include <tuple>
 #include <utility>
@@ -44,7 +47,94 @@ using util::SplitString;
 using util::TrimString;
 
 const std::string UNIX_EPOCH_TIME = "UNIX epoch time";
-const std::string EXAMPLE_ADDRESS[2] = {"bc1q09vm5lfy0j5reeulh4x5752q25uqqvz34hufdl", "bc1q02ad21edsxd23d32dfgqqsz4vv4nmtfzuklhy3"};
+const std::string EXAMPLE_ADDRESS[2] = {"qb1zqqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0sjq57mw", "qb1zyqsjygeyy5nzw2pf9g4jctfw9ucrzv3nxs6nvdec8yark0pa8clsj9cmtx"};
+
+namespace {
+std::string RpcExampleEndpoint()
+{
+    static const auto mainnet_rpc_port = CreateBaseChainParams(ChainType::MAIN)->RPCPort();
+    return strprintf("http://127.0.0.1:%u/", mainnet_rpc_port);
+}
+
+std::string RPCArgTypeToString(RPCArg::Type type)
+{
+    switch (type) {
+    case RPCArg::Type::OBJ: return "OBJ";
+    case RPCArg::Type::ARR: return "ARR";
+    case RPCArg::Type::STR: return "STR";
+    case RPCArg::Type::NUM: return "NUM";
+    case RPCArg::Type::BOOL: return "BOOL";
+    case RPCArg::Type::OBJ_NAMED_PARAMS: return "OBJ_NAMED_PARAMS";
+    case RPCArg::Type::OBJ_USER_KEYS: return "OBJ_USER_KEYS";
+    case RPCArg::Type::AMOUNT: return "AMOUNT";
+    case RPCArg::Type::STR_HEX: return "STR_HEX";
+    case RPCArg::Type::RANGE: return "RANGE";
+    }
+    NONFATAL_UNREACHABLE();
+}
+
+std::string RPCResultTypeToString(RPCResult::Type type)
+{
+    switch (type) {
+    case RPCResult::Type::OBJ: return "OBJ";
+    case RPCResult::Type::ARR: return "ARR";
+    case RPCResult::Type::STR: return "STR";
+    case RPCResult::Type::NUM: return "NUM";
+    case RPCResult::Type::BOOL: return "BOOL";
+    case RPCResult::Type::NONE: return "NONE";
+    case RPCResult::Type::ANY: return "ANY";
+    case RPCResult::Type::STR_AMOUNT: return "STR_AMOUNT";
+    case RPCResult::Type::STR_HEX: return "STR_HEX";
+    case RPCResult::Type::OBJ_DYN: return "OBJ_DYN";
+    case RPCResult::Type::ARR_FIXED: return "ARR_FIXED";
+    case RPCResult::Type::NUM_TIME: return "NUM_TIME";
+    case RPCResult::Type::ELISION: return "ELISION";
+    }
+    NONFATAL_UNREACHABLE();
+}
+
+UniValue StringsToUnivalue(const std::vector<std::string>& values)
+{
+    UniValue arr{UniValue::VARR};
+    for (const auto& value : values) {
+        arr.push_back(value);
+    }
+    return arr;
+}
+
+std::vector<std::string> GetAliases(const std::string& names)
+{
+    std::vector<std::string> parts = SplitString(names, '|');
+    if (parts.size() <= 1) return {};
+    std::vector<std::string> aliases(parts.begin() + 1, parts.end());
+    std::ranges::sort(aliases);
+    return aliases;
+}
+
+std::string GetSummaryLine(const std::string& description)
+{
+    const std::string trimmed{TrimString(description)};
+    const size_t newline_pos{trimmed.find('\n')};
+    return newline_pos == std::string::npos ? trimmed : TrimString(trimmed.substr(0, newline_pos));
+}
+
+std::vector<std::string> GetExampleLines(const std::string& examples)
+{
+    std::vector<std::string> lines;
+    for (std::string line : SplitString(examples, '\n')) {
+        line = TrimString(line);
+        if (line.empty()) continue;
+        if (line.starts_with("> ")) {
+            line.erase(0, 2);
+        } else if (!line.empty() && line.front() == '>') {
+            line.erase(0, 1);
+            line = TrimString(line);
+        }
+        lines.push_back(std::move(line));
+    }
+    return lines;
+}
+} // namespace
 
 std::string GetAllOutputTypes()
 {
@@ -113,7 +203,7 @@ CAmount AmountFromValue(const UniValue& value, int decimals)
 CFeeRate ParseFeeRate(const UniValue& json)
 {
     CAmount val{AmountFromValue(json)};
-    if (val >= COIN) throw JSONRPCError(RPC_INVALID_PARAMETER, "Fee rates larger than or equal to 1BTC/kvB are not accepted");
+    if (val >= COIN) throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Fee rates larger than or equal to 1%s/kvB are not accepted", CURRENCY_UNIT));
     return CFeeRate{val};
 }
 
@@ -185,12 +275,12 @@ std::string ShellQuoteIfNeeded(const std::string& s)
 
 std::string HelpExampleCli(const std::string& methodname, const std::string& args)
 {
-    return "> bitcoin-cli " + methodname + " " + args + "\n";
+    return "> qbit-cli " + methodname + " " + args + "\n";
 }
 
 std::string HelpExampleCliNamed(const std::string& methodname, const RPCArgList& args)
 {
-    std::string result = "> bitcoin-cli -named " + methodname;
+    std::string result = "> qbit-cli -named " + methodname;
     for (const auto& argpair: args) {
         const auto& value = argpair.second.isStr()
                 ? argpair.second.get_str()
@@ -204,7 +294,7 @@ std::string HelpExampleCliNamed(const std::string& methodname, const RPCArgList&
 std::string HelpExampleRpc(const std::string& methodname, const std::string& args)
 {
     return "> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", "
-        "\"method\": \"" + methodname + "\", \"params\": [" + args + "]}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+        "\"method\": \"" + methodname + "\", \"params\": [" + args + "]}' -H 'content-type: application/json' " + RpcExampleEndpoint() + "\n";
 }
 
 std::string HelpExampleRpcNamed(const std::string& methodname, const RPCArgList& args)
@@ -215,7 +305,7 @@ std::string HelpExampleRpcNamed(const std::string& methodname, const RPCArgList&
     }
 
     return "> curl --user myusername --data-binary '{\"jsonrpc\": \"2.0\", \"id\": \"curltest\", "
-           "\"method\": \"" + methodname + "\", \"params\": " + params.write() + "}' -H 'content-type: application/json' http://127.0.0.1:8332/\n";
+           "\"method\": \"" + methodname + "\", \"params\": " + params.write() + "}' -H 'content-type: application/json' " + RpcExampleEndpoint() + "\n";
 }
 
 // Converts a hex string to a public key if possible
@@ -237,6 +327,10 @@ CPubKey HexToPubKey(const std::string& hex_in)
 // Creates a multisig address from a given list of public keys, number of signatures required, and the address type
 CTxDestination AddAndGetMultisigDestination(const int required, const std::vector<CPubKey>& pubkeys, OutputType type, FlatSigningProvider& keystore, CScript& script_out)
 {
+    if (IsP2MROnlyOutputChain()) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Legacy multisig address creation is disabled on this chain");
+    }
+
     // Gather public keys
     if (required < 1) {
         throw JSONRPCError(RPC_INVALID_PARAMETER, "a multisignature address must require at least one key to redeem");
@@ -246,6 +340,10 @@ CTxDestination AddAndGetMultisigDestination(const int required, const std::vecto
     }
     if (pubkeys.size() > MAX_PUBKEYS_PER_MULTISIG) {
         throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Number of keys involved in the multisignature address creation > %d\nReduce the number", MAX_PUBKEYS_PER_MULTISIG));
+    }
+
+    if (type == OutputType::BECH32M || type == OutputType::P2MR || type == OutputType::UNKNOWN) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, strprintf("Multisig does not support output type '%s'", FormatOutputType(type)));
     }
 
     script_out = GetScriptForMultisig(required, pubkeys);
@@ -326,6 +424,16 @@ public:
         obj.pushKV("iswitness", true);
         obj.pushKV("witness_version", 1);
         obj.pushKV("witness_program", HexStr(tap));
+        return obj;
+    }
+
+    UniValue operator()(const WitnessV2P2MR& p2mr) const
+    {
+        UniValue obj(UniValue::VOBJ);
+        obj.pushKV("isscript", true);
+        obj.pushKV("iswitness", true);
+        obj.pushKV("witness_version", 2);
+        obj.pushKV("witness_program", HexStr(p2mr));
         return obj;
     }
 
@@ -630,9 +738,24 @@ std::string RPCResults::ToDescriptionString() const
     return result;
 }
 
+UniValue RPCResults::ToUniValue() const
+{
+    UniValue results{UniValue::VARR};
+    for (const auto& result : m_results) {
+        if (result.m_type == RPCResult::Type::ANY) continue;
+        results.push_back(result.ToUniValue());
+    }
+    return results;
+}
+
 std::string RPCExamples::ToDescriptionString() const
 {
     return m_examples.empty() ? m_examples : "\nExamples:\n" + m_examples;
+}
+
+UniValue RPCExamples::ToUniValue() const
+{
+    return StringsToUnivalue(GetExampleLines(m_examples));
 }
 
 UniValue RPCHelpMan::HandleRequest(const JSONRPCRequest& request) const
@@ -759,6 +882,34 @@ std::vector<std::pair<std::string, bool>> RPCHelpMan::GetArgNames() const
         ret.emplace_back(arg.m_names, /*named_only=*/false);
     }
     return ret;
+}
+
+UniValue RPCHelpMan::ToUniValue(const RPCHelpDocOptions& options) const
+{
+    UniValue method{UniValue::VOBJ};
+    method.pushKV("name", m_name);
+    method.pushKV("category", options.category);
+    method.pushKV("component", options.component);
+    method.pushKV("visible", options.visible);
+    method.pushKV("summary_line", GetSummaryLine(m_description));
+    method.pushKV("description", TrimString(m_description));
+
+    UniValue arguments{UniValue::VARR};
+    bool hidden{false};
+    for (const auto& arg : m_args) {
+        hidden |= arg.m_opts.hidden;
+        arguments.push_back(arg.ToUniValue(hidden));
+    }
+    method.pushKV("arguments", std::move(arguments));
+    method.pushKV("results", m_results.ToUniValue());
+    method.pushKV("examples", m_examples.ToUniValue());
+
+    UniValue feature_flags{UniValue::VOBJ};
+    feature_flags.pushKV("requires_wallet", options.requires_wallet);
+    feature_flags.pushKV("requires_zmq", options.requires_zmq);
+    feature_flags.pushKV("requires_external_signer", options.requires_external_signer);
+    method.pushKV("feature_flags", std::move(feature_flags));
+    return method;
 }
 
 size_t RPCHelpMan::GetParamIndex(std::string_view key) const
@@ -933,6 +1084,35 @@ bool RPCArg::IsOptional() const
     }
 }
 
+// NOLINTNEXTLINE(misc-no-recursion)
+UniValue RPCArg::ToUniValue(bool hidden) const
+{
+    UniValue arg{UniValue::VOBJ};
+    arg.pushKV("name", GetFirstName());
+    arg.pushKV("aliases", StringsToUnivalue(GetAliases(m_names)));
+    arg.pushKV("type", RPCArgTypeToString(m_type));
+    arg.pushKV("required", !IsOptional());
+    arg.pushKV("description", m_description);
+
+    UniValue children{UniValue::VARR};
+    for (const auto& inner : m_inner) {
+        children.push_back(inner.ToUniValue(hidden || m_opts.hidden));
+    }
+    arg.pushKV("children", std::move(children));
+
+    if (hidden || m_opts.hidden) {
+        arg.pushKV("hidden", true);
+    }
+    if (std::holds_alternative<RPCArg::DefaultHint>(m_fallback)) {
+        arg.pushKV("default_kind", "hint");
+        arg.pushKV("default_hint", std::get<RPCArg::DefaultHint>(m_fallback));
+    } else if (std::holds_alternative<RPCArg::Default>(m_fallback)) {
+        arg.pushKV("default_kind", "value");
+        arg.pushKV("default_value", std::get<RPCArg::Default>(m_fallback));
+    }
+    return arg;
+}
+
 std::string RPCArg::ToDescriptionString(bool is_named_arg) const
 {
     std::string ret;
@@ -995,6 +1175,30 @@ std::string RPCArg::ToDescriptionString(bool is_named_arg) const
     if (m_type == Type::OBJ_NAMED_PARAMS) ret += " Options object that can be used to pass named arguments, listed below.";
     ret += m_description.empty() ? "" : " " + m_description;
     return ret;
+}
+
+// NOLINTNEXTLINE(misc-no-recursion)
+UniValue RPCResult::ToUniValue() const
+{
+    UniValue result{UniValue::VOBJ};
+    result.pushKV("name", m_key_name);
+    result.pushKV("type", RPCResultTypeToString(m_type));
+    result.pushKV("description", m_description);
+
+    UniValue children{UniValue::VARR};
+    for (const auto& inner : m_inner) {
+        if (inner.m_type == RPCResult::Type::ANY) continue;
+        children.push_back(inner.ToUniValue());
+    }
+    result.pushKV("children", std::move(children));
+
+    if (m_optional) {
+        result.pushKV("optional", true);
+    }
+    if (!m_cond.empty()) {
+        result.pushKV("conditional", m_cond);
+    }
+    return result;
 }
 
 // NOLINTNEXTLINE(misc-no-recursion)
@@ -1325,6 +1529,30 @@ std::pair<int64_t, int64_t> ParseDescriptorRange(const UniValue& value)
     return {low, high};
 }
 
+static bool DescriptorExpandsOnlyToAllowedDestinations(const Descriptor& desc)
+{
+    FlatSigningProvider provider;
+    std::vector<CScript> scripts;
+    if (!desc.Expand(/*pos=*/0, DUMMY_SIGNING_PROVIDER, scripts, provider)) return false;
+    return !scripts.empty() && std::all_of(scripts.begin(), scripts.end(), [](const CScript& script) {
+        CTxDestination dest;
+        return ExtractDestination(script, dest) && IsDestinationOutputTypeAllowed(dest);
+    });
+}
+
+void EnsureDescriptorOutputTypeAllowed(const Descriptor& desc, std::string_view context)
+{
+    if (!IsP2MROnlyOutputChain()) return;
+
+    const auto output_type = desc.GetOutputType();
+    if (output_type.has_value() && *output_type == OutputType::P2MR) return;
+    if (DescriptorExpandsOnlyToAllowedDestinations(desc)) return;
+
+    const std::string prefix = context.empty() ? "Descriptor" : strprintf("%s descriptor", context);
+    throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
+                       prefix + " is not supported on this chain; only p2mr descriptors are supported except PayToAnchor and activated outer-reserved witness descriptors");
+}
+
 std::vector<CScript> EvalDescriptorStringOrObject(const UniValue& scanobject, FlatSigningProvider& provider, const bool expand_priv)
 {
     std::string desc_str;
@@ -1347,6 +1575,9 @@ std::vector<CScript> EvalDescriptorStringOrObject(const UniValue& scanobject, Fl
     auto descs = Parse(desc_str, provider, error);
     if (descs.empty()) {
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, error);
+    }
+    for (const auto& desc : descs) {
+        EnsureDescriptorOutputTypeAllowed(*desc, "Scan object");
     }
     if (!descs.at(0)->IsRange()) {
         range.first = 0;
@@ -1397,7 +1628,7 @@ std::vector<RPCResult> ScriptPubKeyDoc() {
              {RPCResult::Type::STR, "asm", "Disassembly of the output script"},
              {RPCResult::Type::STR, "desc", "Inferred descriptor for the output"},
              {RPCResult::Type::STR_HEX, "hex", "The raw output script bytes, hex-encoded"},
-             {RPCResult::Type::STR, "address", /*optional=*/true, "The Bitcoin address (only if a well-defined address exists)"},
+             {RPCResult::Type::STR, "address", /*optional=*/true, "The qbit address (only if a well-defined address exists)"},
              {RPCResult::Type::STR, "type", "The type (one of: " + GetAllOutputTypes() + ")"},
          };
 }

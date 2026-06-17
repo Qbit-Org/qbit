@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+#
+#  qbitd The qbit core server.
+#
+#
+# chkconfig: 345 80 20
+# description: qbitd
+# processname: qbitd
+#
+
+# Source function library.
+. /etc/init.d/functions
+
+# you can override defaults in /etc/sysconfig/qbitd, see below
+if [ -f /etc/sysconfig/qbitd ]; then
+        . /etc/sysconfig/qbitd
+fi
+
+RETVAL=0
+
+prog=qbitd
+# you can override the lockfile via QBITD_LOCKFILE in /etc/sysconfig/qbitd
+lockfile=${QBITD_LOCKFILE-/var/lock/subsys/qbitd}
+
+# qbitd defaults to /usr/bin/qbitd, override with QBITD_BIN
+qbitd=${QBITD_BIN-/usr/bin/qbitd}
+qbitd_configfile=${QBITD_CONFIGFILE-/etc/qbit/qbit.conf}
+qbitd_datadir=${QBITD_DATADIR-/var/lib/qbit}
+qbitd_pidfile=${QBITD_PIDFILE-/run/qbit/qbitd.pid}
+qbitd_piddir=$(dirname "${qbitd_pidfile}")
+qbitd_user=${QBITD_USER-qbit}
+qbitd_group=${QBITD_GROUP-qbit}
+
+# QBITD_OPTS can be used to pass additional options (e.g. -txindex).
+# The critical path arguments are always passed separately.
+qbitd_opts="-disablewallet -pid=${qbitd_pidfile} -conf=${qbitd_configfile} -datadir=${qbitd_datadir} ${QBITD_OPTS}"
+
+is_shared_system_dir() {
+    local path
+
+    path=$(normalize_dir_path "$1")
+
+    case "${path}" in
+        /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var|/var/cache|/var/lib|/var/lock|/var/log|/var/run|/var/tmp)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+normalize_dir_path() {
+    local path="$1"
+    local component
+    local joined=""
+    local IFS='/'
+    local last_index
+    local -a components
+    local -a normalized_components=()
+
+    while [ "${path}" != "/" ] && [ "${path%/}" != "${path}" ]; do
+        path=${path%/}
+    done
+
+    IFS='/' read -r -a components <<< "${path}"
+    for component in "${components[@]}"; do
+        case "${component}" in
+            ""|.)
+                ;;
+            ..)
+                if [ "${#normalized_components[@]}" -gt 0 ]; then
+                    last_index=$((${#normalized_components[@]} - 1))
+                    unset "normalized_components[${last_index}]"
+                fi
+                ;;
+            *)
+                normalized_components+=("${component}")
+                ;;
+        esac
+    done
+
+    for component in "${normalized_components[@]}"; do
+        if [ -z "${joined}" ]; then
+            joined="${component}"
+        else
+            joined="${joined}/${component}"
+        fi
+    done
+
+    case "${path}" in
+        /*)
+            if [ -z "${joined}" ]; then
+                printf '/\n'
+            else
+                printf '/%s\n' "${joined}"
+            fi
+            ;;
+        *)
+            if [ -z "${joined}" ]; then
+                printf '.\n'
+            else
+                printf '%s\n' "${joined}"
+            fi
+            ;;
+    esac
+}
+
+prepare_owned_dir() {
+    local path
+    local label="$2"
+    local recursive="$3"
+
+    path=$(normalize_dir_path "$1")
+
+    case "${path}" in
+        /*) ;;
+        *)
+            echo $"${label} must be an absolute path"
+            return 1
+            ;;
+    esac
+
+    if is_shared_system_dir "${path}"; then
+        echo $"${label} must use a dedicated qbit directory, not ${path}"
+        return 1
+    fi
+
+    if [ -L "${path}" ]; then
+        echo $"${label} must not be a symbolic link"
+        return 1
+    fi
+
+    mkdir -p "${path}" || return $?
+    if [ "${recursive}" = "recursive" ]; then
+        chown -R "${qbitd_user}:${qbitd_group}" "${path}" || return $?
+    else
+        chown "${qbitd_user}:${qbitd_group}" "${path}" || return $?
+    fi
+    chmod 0750 "${path}" || return $?
+}
+
+prepare_config_file() {
+    if [ -L "${qbitd_configfile}" ]; then
+        echo $"QBITD_CONFIGFILE must not be a symbolic link"
+        return 1
+    fi
+
+    if [ -f "${qbitd_configfile}" ]; then
+        chown "${qbitd_user}:${qbitd_group}" "${qbitd_configfile}" || return $?
+        chmod 0660 "${qbitd_configfile}" || return $?
+    fi
+}
+
+prepare_service_paths() {
+    if [ -z "${qbitd_user}" ] || [ -z "${qbitd_group}" ]; then
+        echo $"QBITD_USER and QBITD_GROUP must be set"
+        return 1
+    fi
+
+    prepare_owned_dir "${qbitd_piddir}" "QBITD_PIDFILE directory" || return $?
+    prepare_owned_dir "${qbitd_datadir}" "QBITD_DATADIR" recursive || return $?
+    prepare_config_file || return $?
+}
+
+start() {
+    prepare_service_paths || return $?
+    echo -n $"Starting $prog: "
+    daemon --user "$qbitd_user" $DAEMONOPTS "$qbitd" $qbitd_opts
+    RETVAL=$?
+    echo
+    [ $RETVAL -eq 0 ] && touch $lockfile
+    return $RETVAL
+}
+
+stop() {
+    echo -n $"Stopping $prog: "
+    killproc $prog -t600
+    RETVAL=$?
+    echo
+    [ $RETVAL -eq 0 ] && rm -f $lockfile
+    return $RETVAL
+}
+
+case "$1" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    status)
+        status $prog
+        ;;
+    restart)
+        stop
+        start
+        ;;
+    *)
+        echo "Usage: service $prog {start|stop|status|restart}"
+        exit 1
+        ;;
+esac

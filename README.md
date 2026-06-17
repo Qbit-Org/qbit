@@ -1,79 +1,70 @@
-Bitcoin Core integration/staging tree
-=====================================
+qbit
+=====
 
-https://bitcoincore.org
+This repository contains the qbit node, wallet, GUI, and developer tooling.
+qbit is based on Bitcoin Core v30.2, but it is a distinct chain with qbit
+network identity, qbit binaries, qbit data directories, P2MR launch-chain
+wallet outputs, PQC signing, ASERT/Cadence/AuxPoW mining, archive/full-history
+defaults, opt-in witness pruning, and archive bootstrap fallback through
+`-connectarchive`.
 
-For an immediately usable, binary version of the Bitcoin Core software, see
-https://bitcoincore.org/en/download/.
+Current public status and launch resources are published through
+https://qbit.org. Mainnet is not public yet; any mainnet-oriented examples in
+this source tree are guidance for when qbit mainnet is announced.
 
-What is Bitcoin Core?
----------------------
+Official public testnet release artifacts are for qbit testnet4. Start them
+with `-testnet4` or `-chain=testnet4`; no-flag mainnet commands in this tree
+are future-mainnet guidance only. The in-tree mainnet parameters, genesis
+block, and any derived hash are development placeholders, not a qbit mainnet
+launch commitment.
 
-Bitcoin Core connects to the Bitcoin peer-to-peer network to download and fully
-validate blocks and transactions. It also includes a wallet and graphical user
-interface, which can be optionally built.
+The qbit source is open, so third parties can fork it or run private networks.
+Only qbit-published artifacts, tags, release notes, seed resources, and
+qbit.org announcements define official qbit networks.
 
-Further information about Bitcoin Core is available in the [doc folder](/doc).
+Start Here
+----------
+
+- Public testnet: [doc/user/public-testnet.md](doc/user/public-testnet.md)
+- qbit differences from Bitcoin Core:
+  [doc/user/bitcoin-core-differences.md](doc/user/bitcoin-core-differences.md)
+- Running a node when the target network is announced:
+  [doc/user/run-node.md](doc/user/run-node.md)
+- Wallets, P2MR addresses, and backups:
+  [doc/user/wallet/p2mr-wallets.md](doc/user/wallet/p2mr-wallets.md)
+- Exchange and service integration:
+  [doc/integration/exchange-integrator-quickstart.md](doc/integration/exchange-integrator-quickstart.md)
+- Mining and pool integration:
+  [doc/integration/mining-pool-quickstart.md](doc/integration/mining-pool-quickstart.md)
+- Source build docs: [doc/build/](doc/build/)
+
+Documentation Index
+-------------------
+
+The public documentation index is [doc/README.md](doc/README.md). It separates
+primary user-facing docs from integration guides, technical references, and
+source contributor references.
+
+Security and Release Verification
+---------------------------------
+
+The qbit security reporting process, release artifact verification flow, and
+release signing key metadata are not published from this source snapshot yet.
+Use https://qbit.org for any public security, release, or network-resource
+announcements. Do not use Bitcoin Core security contacts, lifecycle pages,
+release keys, issue lists, IRC channels, or mailing lists for qbit.
+
+Contributing
+------------
+
+The public contribution process is owned by the official qbit GitHub
+repository. Its public URL is still launch-owned, so this tree intentionally
+does not point contributors to Bitcoin Core issues, IRC, mailing lists, or
+review process pages. See [CONTRIBUTING.md](CONTRIBUTING.md) for the source
+contributor guidance that applies inside this repository.
 
 License
 -------
 
-Bitcoin Core is released under the terms of the MIT license. See [COPYING](COPYING) for more
-information or see https://opensource.org/license/MIT.
-
-Development Process
--------------------
-
-The `master` branch is regularly built (see `doc/build-*.md` for instructions) and tested, but it is not guaranteed to be
-completely stable. [Tags](https://github.com/bitcoin/bitcoin/tags) are created
-regularly from release branches to indicate new official, stable release versions of Bitcoin Core.
-
-The https://github.com/bitcoin-core/gui repository is used exclusively for the
-development of the GUI. Its master branch is identical in all monotree
-repositories. Release branches and tags do not exist, so please do not fork
-that repository unless it is for development reasons.
-
-The contribution workflow is described in [CONTRIBUTING.md](CONTRIBUTING.md)
-and useful hints for developers can be found in [doc/developer-notes.md](doc/developer-notes.md).
-
-Testing
--------
-
-Testing and code review is the bottleneck for development; we get more pull
-requests than we can review and test on short notice. Please be patient and help out by testing
-other people's pull requests, and remember this is a security-critical project where any mistake might cost people
-lots of money.
-
-### Automated Testing
-
-Developers are strongly encouraged to write [unit tests](src/test/README.md) for new code, and to
-submit new unit tests for old code. Unit tests can be compiled and run
-(assuming they weren't disabled during the generation of the build system) with: `ctest`. Further details on running
-and extending unit tests can be found in [/src/test/README.md](/src/test/README.md).
-
-There are also [regression and integration tests](/test), written
-in Python.
-These tests can be run (if the [test dependencies](/test) are installed) with: `build/test/functional/test_runner.py`
-(assuming `build` is your build directory).
-
-The CI (Continuous Integration) systems make sure that every pull request is tested on Windows, Linux, and macOS.
-The CI must pass on all commits before merge to avoid unrelated CI failures on new pull requests.
-
-### Manual Quality Assurance (QA) Testing
-
-Changes should be tested by somebody other than the developer who wrote the
-code. This is especially important for large or high-risk changes. It is useful
-to add a test plan to the pull request description if testing the changes is
-not straightforward.
-
-Translations
-------------
-
-Changes to translations as well as new translations can be submitted to
-[Bitcoin Core's Transifex page](https://explore.transifex.com/bitcoin/bitcoin/).
-
-Translations are periodically pulled from Transifex and merged into the git repository. See the
-[translation process](doc/translation_process.md) for details on how this works.
-
-**Important**: We do not accept translation changes as GitHub pull requests because the next
-pull from Transifex would automatically overwrite them again.
+qbit is released under the terms of the MIT license. See [COPYING](COPYING) for
+more information.

@@ -33,14 +33,15 @@
 
 namespace node {
 
-int64_t GetMinimumTime(const CBlockIndex* pindexPrev, const int64_t difficulty_adjustment_interval)
+int64_t GetMinimumTime(const CBlockIndex* pindexPrev, const Consensus::Params& consensus_params)
 {
     int64_t min_time{pindexPrev->GetMedianTimePast() + 1};
     // Height of block to be mined.
     const int height{pindexPrev->nHeight + 1};
-    // Account for BIP94 timewarp rule on all networks. This makes future
-    // activation safer.
-    if (height % difficulty_adjustment_interval == 0) {
+    // Account for BIP94 timewarp rule on legacy retargeting networks.
+    if (consensus_params.enforce_BIP94 &&
+        !consensus_params.fPowUseASERT &&
+        height % consensus_params.DifficultyAdjustmentInterval() == 0) {
         min_time = std::max<int64_t>(min_time, pindexPrev->GetBlockTime() - MAX_TIMEWARP);
     }
     return min_time;
@@ -49,7 +50,7 @@ int64_t GetMinimumTime(const CBlockIndex* pindexPrev, const int64_t difficulty_a
 int64_t UpdateTime(CBlockHeader* pblock, const Consensus::Params& consensusParams, const CBlockIndex* pindexPrev)
 {
     int64_t nOldTime = pblock->nTime;
-    int64_t nNewTime{std::max<int64_t>(GetMinimumTime(pindexPrev, consensusParams.DifficultyAdjustmentInterval()),
+    int64_t nNewTime{std::max<int64_t>(GetMinimumTime(pindexPrev, consensusParams),
                                        TicksSinceEpoch<std::chrono::seconds>(NodeClock::now()))};
 
     if (nOldTime < nNewTime) {
@@ -136,7 +137,9 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     assert(pindexPrev != nullptr);
     nHeight = pindexPrev->nHeight + 1;
 
-    pblock->nVersion = m_chainstate.m_chainman.m_versionbitscache.ComputeBlockVersion(pindexPrev, chainparams.GetConsensus());
+    const int32_t bip9_version{m_chainstate.m_chainman.m_versionbitscache.ComputeBlockVersion(pindexPrev, chainparams.GetConsensus())};
+    // Permissionless templates keep chain_id/reserved clear and only carry BIP9 deployment bits.
+    pblock->nVersion = MakeVersion(/*chain_id=*/0, /*auxpow=*/false, ExtractVersionBits(bip9_version));
     // -regtest only: allow overriding block.nVersion with
     // -blockversion=N to test forking scenarios
     if (chainparams.MineBlocksOnDemand()) {

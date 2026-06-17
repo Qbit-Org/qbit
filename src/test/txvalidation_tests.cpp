@@ -3,20 +3,84 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <consensus/validation.h>
+#include <consensus/merkle.h>
 #include <key_io.h>
 #include <policy/packages.h>
 #include <policy/policy.h>
 #include <policy/ephemeral_policy.h>
 #include <policy/truc_policy.h>
+#include <pow.h>
 #include <primitives/transaction.h>
 #include <random.h>
 #include <script/script.h>
 #include <test/util/setup_common.h>
+#include <test/util/script.h>
 #include <test/util/txmempool.h>
+#include <util/time.h>
 #include <validation.h>
 
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
+
+struct RestrictedOutputModeSetup : public TestChain100Setup {
+    RestrictedOutputModeSetup()
+        : TestChain100Setup{ChainType::REGTEST, {.extra_args = {"-p2mronly=1"}}} {}
+};
+
+struct RestrictedOutputModeOuterWitnessSetup : public TestChain100Setup {
+    RestrictedOutputModeOuterWitnessSetup()
+        : TestChain100Setup{ChainType::REGTEST, {.extra_args = {"-p2mronly=1", "-testactivationheight=outerwitness@0"}}} {}
+};
+
+namespace {
+CScript WitnessProgramScript(int witness_version, const std::vector<unsigned char>& witness_program)
+{
+    CScript script;
+    script << witness_version << witness_program;
+    return script;
+}
+
+CScript P2MROutputScript(unsigned char fill = 0x42)
+{
+    return WitnessProgramScript(/*witness_version=*/2, std::vector<unsigned char>(32, fill));
+}
+
+CScript ReservedWitnessNamespaceOutputScript(int witness_version, unsigned char fill = 0x42)
+{
+    return WitnessProgramScript(witness_version, std::vector<unsigned char>(32, fill));
+}
+
+CScript LegacyCoinbaseScriptPubKey(const CKey& coinbase_key)
+{
+    return CScript() << ToByteVector(coinbase_key.GetPubKey()) << OP_CHECKSIG;
+}
+
+CScript CoinbaseScriptPubKey()
+{
+    return P2MROpTrueScript();
+}
+
+CScript PayToAnchorScriptPubKey()
+{
+    return CScript{} << OP_1 << std::vector<unsigned char>{0x4e, 0x73};
+}
+
+CScript OpReturnScriptPubKey()
+{
+    return CScript{} << OP_RETURN;
+}
+
+CBlock ReplaceCoinbaseOutputScript(CBlock block, const CScript& script_pub_key, const Consensus::Params& consensus)
+{
+    CMutableTransaction coinbase{*block.vtx.at(0)};
+    coinbase.vout.at(0).scriptPubKey = script_pub_key;
+    block.vtx.at(0) = MakeTransactionRef(std::move(coinbase));
+    block.hashMerkleRoot = BlockMerkleRoot(block);
+    while (!CheckProofOfWork(block.GetHash(), block.nBits, consensus)) ++block.nNonce;
+    return block;
+}
+} // namespace
 
 BOOST_AUTO_TEST_SUITE(txvalidation_tests)
 
@@ -51,6 +115,227 @@ BOOST_FIXTURE_TEST_CASE(tx_mempool_reject_coinbase, TestChain100Setup)
     BOOST_CHECK(result.m_state.IsInvalid());
     BOOST_CHECK_EQUAL(result.m_state.GetRejectReason(), "coinbase");
     BOOST_CHECK(result.m_state.GetResult() == TxValidationResult::TX_CONSENSUS);
+}
+
+BOOST_FIXTURE_TEST_CASE(tx_mempool_reject_legacy_output_in_restricted_output_mode, RestrictedOutputModeSetup)
+{
+    const CScript non_p2mr_script = CScript() << ToByteVector(coinbaseKey.GetPubKey()) << OP_CHECKSIG;
+    CMutableTransaction tx = CreateValidMempoolTransaction(
+        m_coinbase_txns[0],
+        /*input_vout=*/0,
+        /*input_height=*/COINBASE_MATURITY,
+        coinbaseKey,
+        non_p2mr_script,
+        /*output_amount=*/m_coinbase_txns[0]->vout[0].nValue - 1000,
+        /*submit=*/false);
+
+    LOCK(cs_main);
+    const MempoolAcceptResult result = m_node.chainman->ProcessTransaction(MakeTransactionRef(tx));
+
+    BOOST_CHECK(result.m_result_type == MempoolAcceptResult::ResultType::INVALID);
+    BOOST_CHECK(result.m_state.IsInvalid());
+    BOOST_CHECK_EQUAL(result.m_state.GetRejectReason(), "tx-output-not-p2mr");
+    BOOST_CHECK(result.m_state.GetResult() == TxValidationResult::TX_CONSENSUS);
+}
+
+BOOST_FIXTURE_TEST_CASE(tx_mempool_accept_p2mr_output_unchanged, RestrictedOutputModeSetup)
+{
+    CMutableTransaction tx = CreateValidMempoolTransaction(
+        m_coinbase_txns[0],
+        /*input_vout=*/0,
+        /*input_height=*/COINBASE_MATURITY,
+        coinbaseKey,
+        P2MROutputScript(),
+        /*output_amount=*/m_coinbase_txns[0]->vout[0].nValue - 1000,
+        /*submit=*/false);
+
+    LOCK(cs_main);
+    const MempoolAcceptResult result = m_node.chainman->ProcessTransaction(MakeTransactionRef(tx));
+
+    BOOST_CHECK(result.m_result_type == MempoolAcceptResult::ResultType::VALID);
+}
+
+BOOST_FIXTURE_TEST_CASE(block_rejects_legacy_coinbase_output_in_restricted_output_mode, RestrictedOutputModeSetup)
+{
+    const CBlock block = ReplaceCoinbaseOutputScript(
+        CreateBlock({}, CoinbaseScriptPubKey(), Assert(m_node.chainman)->ActiveChainstate()),
+        LegacyCoinbaseScriptPubKey(coinbaseKey),
+        m_node.chainman->GetConsensus());
+
+    LOCK(cs_main);
+    const BlockValidationState state = TestBlockValidity(Assert(m_node.chainman)->ActiveChainstate(), block, /*check_pow=*/false, /*check_merkle_root=*/false);
+    BOOST_CHECK(state.IsInvalid());
+    BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-txns-output-not-p2mr");
+    BOOST_CHECK(state.GetResult() == BlockValidationResult::BLOCK_CONSENSUS);
+}
+
+BOOST_FIXTURE_TEST_CASE(block_accepts_coinbase_allowlist_outputs_in_restricted_output_mode, RestrictedOutputModeSetup)
+{
+    const int start_height = WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Height());
+
+    CreateAndProcessBlock({}, CoinbaseScriptPubKey());
+    BOOST_CHECK_EQUAL(WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Height()), start_height + 1);
+    SetMockTime(GetTime() + 1);
+
+    CreateAndProcessBlock({}, PayToAnchorScriptPubKey());
+    BOOST_CHECK_EQUAL(WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Height()), start_height + 2);
+    SetMockTime(GetTime() + 1);
+
+    CreateAndProcessBlock({}, OpReturnScriptPubKey());
+    BOOST_CHECK_EQUAL(WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Height()), start_height + 3);
+}
+
+BOOST_FIXTURE_TEST_CASE(block_rejects_coinbase_reserved_witness_namespace_outputs_before_outerwitness_activation, RestrictedOutputModeSetup)
+{
+    for (const int witness_version : {3, 16}) {
+        const CBlock block = ReplaceCoinbaseOutputScript(
+            CreateBlock({}, CoinbaseScriptPubKey(), Assert(m_node.chainman)->ActiveChainstate()),
+            ReservedWitnessNamespaceOutputScript(witness_version),
+            m_node.chainman->GetConsensus());
+
+        LOCK(cs_main);
+        const BlockValidationState state = TestBlockValidity(Assert(m_node.chainman)->ActiveChainstate(), block, /*check_pow=*/false, /*check_merkle_root=*/false);
+        BOOST_CHECK(state.IsInvalid());
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-txns-output-not-p2mr");
+        BOOST_CHECK(state.GetResult() == BlockValidationResult::BLOCK_CONSENSUS);
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(block_accepts_coinbase_reserved_witness_namespace_outputs_after_outerwitness_activation, RestrictedOutputModeOuterWitnessSetup)
+{
+    const int start_height = WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Height());
+
+    CreateAndProcessBlock({}, ReservedWitnessNamespaceOutputScript(/*witness_version=*/3));
+    BOOST_CHECK_EQUAL(WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Height()), start_height + 1);
+    SetMockTime(GetTime() + 1);
+
+    CreateAndProcessBlock({}, ReservedWitnessNamespaceOutputScript(/*witness_version=*/16));
+    BOOST_CHECK_EQUAL(WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Height()), start_height + 2);
+}
+
+BOOST_FIXTURE_TEST_CASE(tx_mempool_reject_reserved_witness_namespace_outputs, RestrictedOutputModeSetup)
+{
+    for (const int witness_version : {3, 16}) {
+        const unsigned int coinbase_index = (witness_version == 3) ? 0U : 1U;
+        CMutableTransaction tx = CreateValidMempoolTransaction(
+            m_coinbase_txns[coinbase_index],
+            /*input_vout=*/0,
+            /*input_height=*/COINBASE_MATURITY,
+            coinbaseKey,
+            ReservedWitnessNamespaceOutputScript(witness_version),
+            /*output_amount=*/m_coinbase_txns[coinbase_index]->vout[0].nValue - 1000,
+            /*submit=*/false);
+
+        LOCK(cs_main);
+        const MempoolAcceptResult result = m_node.chainman->ProcessTransaction(MakeTransactionRef(tx));
+
+        BOOST_CHECK(result.m_result_type == MempoolAcceptResult::ResultType::INVALID);
+        BOOST_CHECK(result.m_state.IsInvalid());
+        BOOST_CHECK_EQUAL(result.m_state.GetRejectReason(), "tx-output-not-p2mr");
+        BOOST_CHECK(result.m_state.GetResult() == TxValidationResult::TX_CONSENSUS);
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(block_rejects_reserved_witness_namespace_outputs_before_outerwitness_activation, RestrictedOutputModeSetup)
+{
+    const CScript coinbase_script_pub_key = CoinbaseScriptPubKey();
+
+    for (const int witness_version : {3, 16}) {
+        const unsigned int coinbase_index = (witness_version == 3) ? 0U : 1U;
+        CMutableTransaction tx = CreateValidMempoolTransaction(
+            m_coinbase_txns[coinbase_index],
+            /*input_vout=*/0,
+            /*input_height=*/COINBASE_MATURITY,
+            coinbaseKey,
+            ReservedWitnessNamespaceOutputScript(witness_version),
+            /*output_amount=*/m_coinbase_txns[coinbase_index]->vout[0].nValue - 1000,
+            /*submit=*/false);
+
+        const CBlock block = CreateBlock({tx}, coinbase_script_pub_key, Assert(m_node.chainman)->ActiveChainstate());
+        LOCK(cs_main);
+        const BlockValidationState state = TestBlockValidity(Assert(m_node.chainman)->ActiveChainstate(), block, /*check_pow=*/false, /*check_merkle_root=*/false);
+        BOOST_CHECK(state.IsInvalid());
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-txns-output-not-p2mr");
+        BOOST_CHECK(state.GetResult() == BlockValidationResult::BLOCK_CONSENSUS);
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(tx_mempool_reject_reserved_witness_namespace_outputs_after_outerwitness_activation, RestrictedOutputModeOuterWitnessSetup)
+{
+    for (const int witness_version : {3, 16}) {
+        const unsigned int coinbase_index = (witness_version == 3) ? 0U : 1U;
+        CMutableTransaction tx = CreateValidMempoolTransaction(
+            m_coinbase_txns[coinbase_index],
+            /*input_vout=*/0,
+            /*input_height=*/COINBASE_MATURITY,
+            coinbaseKey,
+            ReservedWitnessNamespaceOutputScript(witness_version),
+            /*output_amount=*/m_coinbase_txns[coinbase_index]->vout[0].nValue - 1000,
+            /*submit=*/false);
+
+        LOCK(cs_main);
+        const MempoolAcceptResult result = m_node.chainman->ProcessTransaction(MakeTransactionRef(tx));
+
+        BOOST_CHECK(result.m_result_type == MempoolAcceptResult::ResultType::INVALID);
+        BOOST_CHECK(result.m_state.IsInvalid());
+        BOOST_CHECK_EQUAL(result.m_state.GetRejectReason(), "scriptpubkey");
+        BOOST_CHECK(result.m_state.GetResult() == TxValidationResult::TX_NOT_STANDARD);
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(block_accepts_reserved_witness_namespace_outputs_in_restricted_output_mode, RestrictedOutputModeOuterWitnessSetup)
+{
+    const CScript coinbase_script_pub_key = CoinbaseScriptPubKey();
+    const int start_height = WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Height());
+
+    for (int witness_version = 3; witness_version <= 16; ++witness_version) {
+        const unsigned int coinbase_index = witness_version - 3;
+        CMutableTransaction tx = CreateValidMempoolTransaction(
+            m_coinbase_txns[coinbase_index],
+            /*input_vout=*/0,
+            /*input_height=*/COINBASE_MATURITY,
+            coinbaseKey,
+            ReservedWitnessNamespaceOutputScript(witness_version),
+            /*output_amount=*/m_coinbase_txns[coinbase_index]->vout[0].nValue - 1000,
+            /*submit=*/false);
+
+        const Txid txid = tx.GetHash();
+        const CBlock block = CreateAndProcessBlock({tx}, coinbase_script_pub_key);
+
+        BOOST_CHECK(std::any_of(block.vtx.begin(), block.vtx.end(), [&txid](const auto& block_tx) {
+            return block_tx->GetHash() == txid;
+        }));
+        BOOST_CHECK_EQUAL(WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Height()), start_height + (witness_version - 2));
+        SetMockTime(GetTime() + 1);
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(tx_mempool_reject_reserved_witness_namespace_spends, RestrictedOutputModeOuterWitnessSetup)
+{
+    CMutableTransaction funding_tx = CreateValidMempoolTransaction(
+        m_coinbase_txns[0],
+        /*input_vout=*/0,
+        /*input_height=*/COINBASE_MATURITY,
+        coinbaseKey,
+        ReservedWitnessNamespaceOutputScript(/*witness_version=*/3),
+        /*output_amount=*/m_coinbase_txns[0]->vout[0].nValue - 1000,
+        /*submit=*/false);
+
+    CreateAndProcessBlock({funding_tx}, CoinbaseScriptPubKey());
+    SetMockTime(GetTime() + 1);
+
+    CMutableTransaction spend_tx;
+    spend_tx.version = 2;
+    spend_tx.vin.emplace_back(COutPoint{funding_tx.GetHash(), 0});
+    spend_tx.vout.emplace_back(funding_tx.vout[0].nValue - 1000, P2MROutputScript(/*fill=*/0x24));
+
+    LOCK(cs_main);
+    const MempoolAcceptResult result = m_node.chainman->ProcessTransaction(MakeTransactionRef(spend_tx));
+
+    BOOST_CHECK(result.m_result_type == MempoolAcceptResult::ResultType::INVALID);
+    BOOST_CHECK(result.m_state.IsInvalid());
+    BOOST_CHECK_EQUAL(result.m_state.GetRejectReason(), "bad-txns-nonstandard-inputs");
+    BOOST_CHECK(result.m_state.GetResult() == TxValidationResult::TX_INPUTS_NOT_STANDARD);
 }
 
 // Generate a number of random, nonexistent outpoints.
@@ -439,11 +724,13 @@ BOOST_FIXTURE_TEST_CASE(version3_tests, RegTestingSetup)
     }
 
     // Tx spending TRUC cannot be too large in virtual size.
-    auto many_inputs{random_outpoints(100)};
+    auto many_inputs{random_outpoints(1120)};
     many_inputs.emplace_back(mempool_tx_v3->GetHash(), 0);
     {
         auto tx_v3_child_big = make_tx(many_inputs, /*version=*/3);
         const auto vsize{GetVirtualTransactionSize(*tx_v3_child_big)};
+        BOOST_CHECK_GT(vsize, TRUC_CHILD_MAX_VSIZE);
+        BOOST_CHECK_LE(vsize, TRUC_MAX_VSIZE);
         auto ancestors{pool.CalculateMemPoolAncestors(entry.FromTx(tx_v3_child_big), m_limits)};
         const auto expected_error_str{strprintf("version=3 child tx %s (wtxid=%s) is too big: %u > %u virtual bytes",
             tx_v3_child_big->GetHash().ToString(), tx_v3_child_big->GetWitnessHash().ToString(), vsize, TRUC_CHILD_MAX_VSIZE)};
@@ -456,9 +743,27 @@ BOOST_FIXTURE_TEST_CASE(version3_tests, RegTestingSetup)
                           expected_error_str);
     }
 
+    // Boundary coverage around the child limit.
+    {
+        auto tx_v3_child_boundary = make_tx({COutPoint{mempool_tx_v3->GetHash(), 2}}, /*version=*/3);
+        auto ancestors{pool.CalculateMemPoolAncestors(entry.FromTx(tx_v3_child_boundary), m_limits)};
+        BOOST_CHECK(SingleTRUCChecks(tx_v3_child_boundary, *ancestors, empty_conflicts_set, TRUC_CHILD_MAX_VSIZE) == std::nullopt);
+        Package package_child_boundary{mempool_tx_v3, tx_v3_child_boundary};
+        BOOST_CHECK(PackageTRUCChecks(tx_v3_child_boundary, TRUC_CHILD_MAX_VSIZE, package_child_boundary, empty_ancestors) == std::nullopt);
+
+        const auto expected_error_str{strprintf("version=3 child tx %s (wtxid=%s) is too big: %u > %u virtual bytes",
+            tx_v3_child_boundary->GetHash().ToString(), tx_v3_child_boundary->GetWitnessHash().ToString(),
+            TRUC_CHILD_MAX_VSIZE + 1, TRUC_CHILD_MAX_VSIZE)};
+        auto result{SingleTRUCChecks(tx_v3_child_boundary, *ancestors, empty_conflicts_set, TRUC_CHILD_MAX_VSIZE + 1)};
+        BOOST_CHECK_EQUAL(result->first, expected_error_str);
+        BOOST_CHECK_EQUAL(result->second, nullptr);
+        BOOST_CHECK_EQUAL(*PackageTRUCChecks(tx_v3_child_boundary, TRUC_CHILD_MAX_VSIZE + 1, package_child_boundary, empty_ancestors),
+                          expected_error_str);
+    }
+
     // Tx spending TRUC cannot have too many sigops.
-    // This child has 10 P2WSH multisig inputs.
-    auto multisig_outpoints{random_outpoints(10)};
+    // This child has enough P2WSH multisig inputs for sigops-adjusted vsize to exceed the child limit.
+    auto multisig_outpoints{random_outpoints(114)};
     multisig_outpoints.emplace_back(mempool_tx_v3->GetHash(), 0);
     auto keys{random_keys(2)};
     CScript script_multisig;

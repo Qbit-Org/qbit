@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <chainparams.h>
+#include <common/args.h>
 #include <common/signmessage.h>
 #include <key_io.h>
 #include <test/fuzz/FuzzedDataProvider.h>
@@ -20,6 +21,7 @@
 void initialize_message()
 {
     static ECC_Context ecc_context{};
+    gArgs.ForceSetArg("-p2mronly", "0");
     SelectParams(ChainType::REGTEST);
 }
 

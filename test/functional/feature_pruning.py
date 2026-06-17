@@ -70,19 +70,20 @@ class PruneTest(BitcoinTestFramework):
         self.setup_clean_chain = True
         self.num_nodes = 6
         self.uses_wallet = None
+        self.disable_witness_pruning = "-test=disable_witness_pruning"
 
         # Create nodes 0 and 1 to mine.
         # Create node 2 to test pruning.
-        self.full_node_default_args = ["-maxreceivebuffer=20000", "-checkblocks=5"]
+        self.full_node_default_args = ["-maxreceivebuffer=20000", "-checkblocks=5", self.disable_witness_pruning]
         # Create nodes 3 and 4 to test manual pruning (they will be re-started with manual pruning later)
         # Create nodes 5 to test wallet in prune mode, but do not connect
         self.extra_args = [
             self.full_node_default_args,
             self.full_node_default_args,
-            ["-maxreceivebuffer=20000", "-prune=550"],
-            ["-maxreceivebuffer=20000"],
-            ["-maxreceivebuffer=20000"],
-            ["-prune=550", "-blockfilterindex=1"],
+            ["-maxreceivebuffer=20000", "-prune=550", self.disable_witness_pruning],
+            ["-maxreceivebuffer=20000", self.disable_witness_pruning],
+            ["-maxreceivebuffer=20000", self.disable_witness_pruning],
+            ["-prune=550", "-blockfilterindex=1", self.disable_witness_pruning],
         ]
         self.rpc_timeout = 120
 
@@ -134,7 +135,7 @@ class PruneTest(BitcoinTestFramework):
         )
 
     def test_rescan_blockchain(self):
-        self.restart_node(0, ["-prune=550"])
+        self.restart_node(0, ["-prune=550", self.disable_witness_pruning])
         assert_raises_rpc_error(-1, "Can't rescan beyond pruned data. Use RPC call getblockchaininfo to determine your pruned height.", self.nodes[0].rescanblockchain)
 
     def test_height_min(self):
@@ -273,7 +274,7 @@ class PruneTest(BitcoinTestFramework):
         assert_raises_rpc_error(-1, "Cannot prune blocks because node is not in prune mode", node.pruneblockchain, 500)
 
         # now re-start in manual pruning mode
-        self.restart_node(node_number, extra_args=["-prune=1"])
+        self.restart_node(node_number, extra_args=["-prune=1", self.disable_witness_pruning])
         node = self.nodes[node_number]
         assert_equal(node.getblockcount(), 995)
 
@@ -342,14 +343,14 @@ class PruneTest(BitcoinTestFramework):
         assert not has_block(3), "blk00003.dat is still there, should be pruned by now"
 
         # stop node, start back up with auto-prune at 550 MiB, make sure still runs
-        self.restart_node(node_number, extra_args=["-prune=550"])
+        self.restart_node(node_number, extra_args=["-prune=550", self.disable_witness_pruning])
 
         self.log.info("Success")
 
     def wallet_test(self):
         # check that the pruning node's wallet is still in good shape
         self.log.info("Stop and start pruning node to trigger wallet rescan")
-        self.restart_node(2, extra_args=["-prune=550"])
+        self.restart_node(2, extra_args=["-prune=550", self.disable_witness_pruning])
         self.log.info("Success")
 
         # check that wallet loads successfully when restarting a pruned node after IBD.
@@ -358,7 +359,7 @@ class PruneTest(BitcoinTestFramework):
         self.connect_nodes(0, 5)
         nds = [self.nodes[0], self.nodes[5]]
         self.sync_blocks(nds, wait=5, timeout=300)
-        self.restart_node(5, extra_args=["-prune=550", "-blockfilterindex=1"]) # restart to trigger rescan
+        self.restart_node(5, extra_args=["-prune=550", "-blockfilterindex=1", self.disable_witness_pruning]) # restart to trigger rescan
         self.log.info("Success")
 
     def run_test(self):
@@ -487,14 +488,16 @@ class PruneTest(BitcoinTestFramework):
 
     def test_scanblocks_pruned(self):
         node = self.nodes[5]
+        full_node = self.nodes[1]
         genesis_blockhash = node.getblockhash(0)
-        false_positive_spk = bytes.fromhex("001400000000000000000000000000000000000cadcb")
+        genesis_block = full_node.getblock(genesis_blockhash, verbosity=3)
+        genesis_coinbase_spk = genesis_block['tx'][0]['vout'][0]['scriptPubKey']['hex']
 
         assert genesis_blockhash in node.scanblocks(
-            "start", [{"desc": f"raw({false_positive_spk.hex()})"}], 0, 0)['relevant_blocks']
+            "start", [{"desc": f"raw({genesis_coinbase_spk})"}], 0, 0)['relevant_blocks']
 
         assert_raises_rpc_error(-1, "Block not available (pruned data)", node.scanblocks,
-            "start", [{"desc": f"raw({false_positive_spk.hex()})"}], 0, 0, "basic", {"filter_false_positives": True})
+            "start", [{"desc": f"raw({genesis_coinbase_spk})"}], 0, 0, "basic", {"filter_false_positives": True})
 
     def test_pruneheight_undo_presence(self):
         node = self.nodes[5]

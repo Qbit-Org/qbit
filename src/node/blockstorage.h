@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_NODE_BLOCKSTORAGE_H
-#define BITCOIN_NODE_BLOCKSTORAGE_H
+#ifndef QBIT_NODE_BLOCKSTORAGE_H
+#define QBIT_NODE_BLOCKSTORAGE_H
 
 #include <attributes.h>
 #include <chain.h>
@@ -52,7 +52,12 @@ class BlockTreeDB : public CDBWrapper
 {
 public:
     using CDBWrapper::CDBWrapper;
-    bool WriteBatchSync(const std::vector<std::pair<int, const CBlockFileInfo*>>& fileInfo, int nLastFile, const std::vector<const CBlockIndex*>& blockinfo);
+    bool WriteBatchSync(
+        const std::vector<std::pair<int, const CBlockFileInfo*>>& fileInfo,
+        int nLastFile,
+        const std::vector<const CBlockIndex*>& blockinfo,
+        const std::vector<std::pair<std::string, bool>>& flags = {}
+    );
     bool ReadBlockFileInfo(int nFile, CBlockFileInfo& info);
     bool ReadLastBlockFile(int& nFile);
     bool WriteReindexing(bool fReindexing);
@@ -233,6 +238,44 @@ private:
      */
     bool m_check_for_pruning = false;
 
+    /** Global flag to indicate we should check whether historical witness data can be compacted. */
+    bool m_check_for_witness_pruning GUARDED_BY(::cs_main){false};
+
+    /** Highest block file index known to be witness-pruned. */
+    int m_witness_pruned_up_to_file GUARDED_BY(cs_LastBlockFile){-1};
+
+    struct WitnessCompactionPosition {
+        CBlockIndex* index;
+        unsigned int data_pos;
+    };
+    enum class WitnessCompactionStage : uint8_t {
+        PREPARED,
+        INSTALLED,
+    };
+    struct PendingWitnessCompaction {
+        int target_file;
+        fs::path temp_path;
+        fs::path original_path;
+        fs::path backup_path;
+        unsigned int compacted_file_size;
+        std::vector<WitnessCompactionPosition> new_positions;
+        WitnessCompactionStage stage{WitnessCompactionStage::PREPARED};
+    };
+
+    /** Pending witness compaction state spanning durable install and post-DB cleanup. */
+    std::optional<PendingWitnessCompaction> m_pending_witness_compaction GUARDED_BY(cs_LastBlockFile);
+    /** Test-only fault injection to force witness compaction completion failure. */
+    std::atomic<bool> m_force_witness_compaction_failure_for_test{false};
+    enum class WitnessCompactionPrepareFailure : uint8_t {
+        NONE,
+        WRITE,
+        COMMIT,
+        CLOSE,
+    };
+    std::atomic<WitnessCompactionPrepareFailure> m_witness_compaction_prepare_failure_for_test{
+        WitnessCompactionPrepareFailure::NONE
+    };
+
     const bool m_prune_mode;
 
     const Obfuscation m_obfuscation;
@@ -392,9 +435,151 @@ public:
 
     /** True if any block files have ever been pruned. */
     bool m_have_pruned = false;
+    /** True if any witness data has ever been compacted. */
+    bool m_have_witness_pruned = false;
+    /** Persist witnessespruned DB flag in the next block-index batch write. */
+    bool m_write_witness_pruned_flag{false};
 
     //! Check whether the block associated with this index entry is pruned or not.
     bool IsBlockPruned(const CBlockIndex& block) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
+    [[nodiscard]] bool IsWitnessPruneMode() const
+    {
+        return m_opts.witness_pruning_enabled && m_opts.prune_witnesses;
+    }
+
+    [[nodiscard]] bool IsWitnessPruned(const CBlockIndex& index) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+    {
+        return (index.nStatus & BLOCK_OPT_WITNESS_PRUNED) != 0;
+    }
+
+    [[nodiscard]] bool HasWitnessData(const CBlockIndex& index) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+    {
+        return (index.nStatus & BLOCK_HAVE_DATA) && !IsWitnessPruned(index);
+    }
+
+    /** Select one eligible file, write compacted temp file, and stage the pending handoff.
+     *  Returns false only on temporary write/commit failures, so caller can retry next flush cycle. */
+    [[nodiscard]] bool PrepareWitnessCompaction(const CChain& chain)
+        EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_LastBlockFile);
+
+    /** Durably install the compacted block file before block index DB commit. */
+    [[nodiscard]] bool InstallWitnessCompaction() EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_LastBlockFile);
+
+    /** Remove the rollback backup after block index DB commit. */
+    [[nodiscard]] bool FinalizeWitnessCompaction() EXCLUSIVE_LOCKS_REQUIRED(cs_LastBlockFile);
+
+    /** Startup recovery for pending witness-compaction temporary files. */
+    void RecoverPendingWitnessCompactions() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
+    /** Write a temporary full block for validation-only witness recovery. */
+    [[nodiscard]] bool WriteRecoveredBlock(const CBlock& block) const;
+
+    /** Read a temporary recovered full block by hash. */
+    [[nodiscard]] bool ReadRecoveredBlock(CBlock& block, const uint256& hash) const;
+
+    /** Whether a temporary recovered full block exists for the given hash. */
+    [[nodiscard]] bool HaveRecoveredBlock(const uint256& hash) const;
+
+    /** Remove a temporary recovered full block if it exists. */
+    [[nodiscard]] bool RemoveRecoveredBlock(const uint256& hash) const;
+
+    /** Remove stale validation-only recovery files on startup. */
+    void CleanupRecoveredBlocks() const;
+
+    /** Request witness-pruning check on the next FlushStateToDisk cycle. */
+    void RequestWitnessPruningCheck() EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+    {
+        m_check_for_witness_pruning = true;
+    }
+
+    bool WitnessPruningCheckRequested() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+    {
+        return m_check_for_witness_pruning;
+    }
+
+    void ClearWitnessPruningCheck() EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+    {
+        m_check_for_witness_pruning = false;
+    }
+
+    bool HasPendingWitnessCompaction() const EXCLUSIVE_LOCKS_REQUIRED(cs_LastBlockFile)
+    {
+        return m_pending_witness_compaction.has_value();
+    }
+
+    bool HasPendingWitnessCompactionForTest()
+    {
+        LOCK(cs_LastBlockFile);
+        return m_pending_witness_compaction.has_value();
+    }
+
+    bool PrepareWitnessCompactionForTest(int chain_height)
+    {
+        CBlockIndex tip;
+        tip.nHeight = chain_height;
+        CChain chain;
+        chain.SetTip(tip);
+        LOCK2(::cs_main, cs_LastBlockFile);
+        return PrepareWitnessCompaction(chain);
+    }
+
+    bool InstallWitnessCompactionForTest()
+    {
+        LOCK2(::cs_main, cs_LastBlockFile);
+        return InstallWitnessCompaction();
+    }
+
+    bool FinalizeWitnessCompactionForTest()
+    {
+        LOCK(cs_LastBlockFile);
+        return FinalizeWitnessCompaction();
+    }
+
+    void SetPendingWitnessCompactionForTest(std::optional<std::pair<fs::path, fs::path>> pending,
+                                            bool installed = false)
+    {
+        LOCK(cs_LastBlockFile);
+        if (!pending.has_value()) {
+            m_pending_witness_compaction.reset();
+            return;
+        }
+        const auto& [temp_path, original_path] = *pending;
+        m_pending_witness_compaction = PendingWitnessCompaction{
+            .target_file = 0,
+            .temp_path = temp_path,
+            .original_path = original_path,
+            .backup_path = fs::PathFromString(fs::PathToString(original_path) + ".wfull"),
+            .compacted_file_size = 0,
+            .new_positions = {},
+            .stage = installed ? WitnessCompactionStage::INSTALLED : WitnessCompactionStage::PREPARED,
+        };
+    }
+
+    void ForceWitnessCompactionFailureForTest(bool force)
+    {
+        m_force_witness_compaction_failure_for_test.store(force, std::memory_order_relaxed);
+    }
+
+    void ClearWitnessCompactionPrepareFailureForTest()
+    {
+        m_witness_compaction_prepare_failure_for_test.store(WitnessCompactionPrepareFailure::NONE, std::memory_order_relaxed);
+    }
+
+    void InjectWitnessCompactionWriteFailureForTest()
+    {
+        m_witness_compaction_prepare_failure_for_test.store(WitnessCompactionPrepareFailure::WRITE, std::memory_order_relaxed);
+    }
+
+    void InjectWitnessCompactionCommitFailureForTest()
+    {
+        m_witness_compaction_prepare_failure_for_test.store(WitnessCompactionPrepareFailure::COMMIT, std::memory_order_relaxed);
+    }
+
+    void InjectWitnessCompactionCloseFailureForTest()
+    {
+        m_witness_compaction_prepare_failure_for_test.store(WitnessCompactionPrepareFailure::CLOSE, std::memory_order_relaxed);
+    }
 
     //! Create or update a prune lock identified by its name
     void UpdatePruneLock(const std::string& name, const PruneLockInfo& lock_info) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
@@ -424,4 +609,4 @@ public:
 void ImportBlocks(ChainstateManager& chainman, std::span<const fs::path> import_paths);
 } // namespace node
 
-#endif // BITCOIN_NODE_BLOCKSTORAGE_H
+#endif // QBIT_NODE_BLOCKSTORAGE_H

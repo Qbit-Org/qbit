@@ -17,7 +17,7 @@
 
 struct Dersig100Setup : public TestChain100Setup {
     Dersig100Setup()
-        : TestChain100Setup{ChainType::REGTEST, {.extra_args = {"-testactivationheight=dersig@102"}}} {}
+        : TestChain100Setup{ChainType::REGTEST, {.extra_args = {"-p2mronly=0", "-testactivationheight=dersig@1002"}}} {}
 };
 
 bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,

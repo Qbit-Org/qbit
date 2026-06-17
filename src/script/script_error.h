@@ -3,8 +3,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_SCRIPT_SCRIPT_ERROR_H
-#define BITCOIN_SCRIPT_SCRIPT_ERROR_H
+#ifndef QBIT_SCRIPT_SCRIPT_ERROR_H
+#define QBIT_SCRIPT_SCRIPT_ERROR_H
 
 #include <string>
 
@@ -78,6 +78,16 @@ typedef enum ScriptError_t
     SCRIPT_ERR_TAPSCRIPT_CHECKMULTISIG,
     SCRIPT_ERR_TAPSCRIPT_MINIMALIF,
 
+    /* P2MR / SegWit v2 (BIP-360) */
+    SCRIPT_ERR_P2MR_WRONG_CONTROL_SIZE,
+    SCRIPT_ERR_P2MR_CONTROL_BIT0,
+    SCRIPT_ERR_P2MR_VALIDATION_WEIGHT,
+    SCRIPT_ERR_P2MR_SIG_SIZE,
+    SCRIPT_ERR_P2MR_SIG,
+    SCRIPT_ERR_P2MR_SIG_HASHTYPE,
+    SCRIPT_ERR_P2MR_CHECKSIG,
+    SCRIPT_ERR_TEMPLATE_MISMATCH,
+
     /* Constant scriptCode */
     SCRIPT_ERR_OP_CODESEPARATOR,
     SCRIPT_ERR_SIG_FINDANDDELETE,
@@ -89,4 +99,4 @@ typedef enum ScriptError_t
 
 std::string ScriptErrorString(const ScriptError error);
 
-#endif // BITCOIN_SCRIPT_SCRIPT_ERROR_H
+#endif // QBIT_SCRIPT_SCRIPT_ERROR_H

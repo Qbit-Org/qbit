@@ -3,9 +3,10 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_WALLET_WALLETDB_H
-#define BITCOIN_WALLET_WALLETDB_H
+#ifndef QBIT_WALLET_WALLETDB_H
+#define QBIT_WALLET_WALLETDB_H
 
+#include <crypto/pqc.h>
 #include <key.h>
 #include <primitives/transaction_identifier.h>
 #include <script/sign.h>
@@ -74,12 +75,17 @@ extern const std::string OLD_KEY;
 extern const std::string ORDERPOSNEXT;
 extern const std::string POOL;
 extern const std::string PURPOSE;
+extern const std::string PUBKEYDBCURSOR;
+extern const std::string PUBKEYDBENTRY;
 extern const std::string SETTINGS;
 extern const std::string TX;
 extern const std::string VERSION;
 extern const std::string WALLETDESCRIPTOR;
 extern const std::string WALLETDESCRIPTORCKEY;
 extern const std::string WALLETDESCRIPTORKEY;
+extern const std::string WALLETDESCRIPTORPQCCKEY;
+extern const std::string WALLETDESCRIPTORPQCKEY;
+extern const std::string WALLETDESCRIPTORP2MRCACHE;
 extern const std::string WATCHMETA;
 extern const std::string WATCHS;
 
@@ -243,8 +249,11 @@ public:
 
     bool WriteDescriptorKey(const uint256& desc_id, const CPubKey& pubkey, const CPrivKey& privkey);
     bool WriteCryptedDescriptorKey(const uint256& desc_id, const CPubKey& pubkey, const std::vector<unsigned char>& secret);
+    bool WriteDescriptorPQCKey(const uint256& desc_id, const CPQCPubKey& pubkey, const CPQCKey& privkey, uint32_t sig_counter = 0);
+    bool WriteCryptedDescriptorPQCKey(const uint256& desc_id, const CPQCPubKey& pubkey, const std::vector<unsigned char>& secret, uint32_t sig_counter = 0);
     bool WriteDescriptor(const uint256& desc_id, const WalletDescriptor& descriptor);
     bool WriteDescriptorDerivedCache(const CExtPubKey& xpub, const uint256& desc_id, uint32_t key_exp_index, uint32_t der_index);
+    bool WriteDescriptorDerivedP2MRCache(const CPQCPubKey& pubkey, const uint256& desc_id, uint32_t key_exp_index, uint32_t der_index);
     bool WriteDescriptorParentCache(const CExtPubKey& xpub, const uint256& desc_id, uint32_t key_exp_index);
     bool WriteDescriptorLastHardenedCache(const CExtPubKey& xpub, const uint256& desc_id, uint32_t key_exp_index);
     bool WriteDescriptorCacheItems(const uint256& desc_id, const DescriptorCache& cache);
@@ -256,6 +265,8 @@ public:
     bool WriteAddressReceiveRequest(const CTxDestination& dest, const std::string& id, const std::string& receive_request);
     bool EraseAddressReceiveRequest(const CTxDestination& dest, const std::string& id);
     bool EraseAddressData(const CTxDestination& dest);
+    bool WritePubKeyDBPoolEntry(int64_t account, bool internal, int64_t index, const CPQCPubKey& pubkey);
+    bool WritePubKeyDBCursor(int64_t account, bool internal, int64_t next_index);
 
     bool WriteActiveScriptPubKeyMan(uint8_t type, const uint256& id, bool internal);
     bool EraseActiveScriptPubKeyMan(uint8_t type, bool internal);
@@ -309,4 +320,4 @@ bool HasLegacyRecords(CWallet& wallet);
 bool HasLegacyRecords(CWallet& wallet, DatabaseBatch& batch);
 } // namespace wallet
 
-#endif // BITCOIN_WALLET_WALLETDB_H
+#endif // QBIT_WALLET_WALLETDB_H

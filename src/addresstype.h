@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or https://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_ADDRESSTYPE_H
-#define BITCOIN_ADDRESSTYPE_H
+#ifndef QBIT_ADDRESSTYPE_H
+#define QBIT_ADDRESSTYPE_H
 
 #include <attributes.h>
 #include <pubkey.h>
@@ -13,6 +13,9 @@
 #include <util/hash_type.h>
 
 #include <algorithm>
+#include <cassert>
+#include <span>
+#include <stdexcept>
 #include <variant>
 #include <vector>
 
@@ -91,6 +94,21 @@ struct WitnessV1Taproot : public XOnlyPubKey
     explicit WitnessV1Taproot(const XOnlyPubKey& xpk) : XOnlyPubKey(xpk) {}
 };
 
+struct WitnessV2P2MR : public BaseHash<uint256>
+{
+    WitnessV2P2MR() : BaseHash() {}
+    explicit WitnessV2P2MR(const uint256& hash) : BaseHash(hash) {}
+    explicit WitnessV2P2MR(std::span<const unsigned char> program)
+    {
+        if (program.size() != m_hash.size()) {
+            throw std::invalid_argument("WitnessV2P2MR witness program must be 32 bytes");
+        }
+        std::copy(program.begin(), program.end(), m_hash.begin());
+    }
+
+    const uint256& GetMerkleRoot() const LIFETIMEBOUND { return m_hash; }
+};
+
 //! CTxDestination subtype to encode any future Witness version
 struct WitnessUnknown
 {
@@ -136,11 +154,12 @@ struct PayToAnchor : public WitnessUnknown
  *  * WitnessV0ScriptHash: TxoutType::WITNESS_V0_SCRIPTHASH destination (P2WSH address)
  *  * WitnessV0KeyHash: TxoutType::WITNESS_V0_KEYHASH destination (P2WPKH address)
  *  * WitnessV1Taproot: TxoutType::WITNESS_V1_TAPROOT destination (P2TR address)
+ *  * WitnessV2P2MR: TxoutType::WITNESS_V2_P2MR destination (P2MR address)
  *  * PayToAnchor: TxoutType::ANCHOR destination (P2A address)
  *  * WitnessUnknown: TxoutType::WITNESS_UNKNOWN destination (P2W??? address)
  *  A CTxDestination is the internal data type encoded in a bitcoin address
  */
-using CTxDestination = std::variant<CNoDestination, PubKeyDestination, PKHash, ScriptHash, WitnessV0ScriptHash, WitnessV0KeyHash, WitnessV1Taproot, PayToAnchor, WitnessUnknown>;
+using CTxDestination = std::variant<CNoDestination, PubKeyDestination, PKHash, ScriptHash, WitnessV0ScriptHash, WitnessV0KeyHash, WitnessV1Taproot, WitnessV2P2MR, PayToAnchor, WitnessUnknown>;
 
 /** Check whether a CTxDestination corresponds to one with an address. */
 bool IsValidDestination(const CTxDestination& dest);
@@ -164,4 +183,4 @@ bool ExtractDestination(const CScript& scriptPubKey, CTxDestination& addressRet)
  */
 CScript GetScriptForDestination(const CTxDestination& dest);
 
-#endif // BITCOIN_ADDRESSTYPE_H
+#endif // QBIT_ADDRESSTYPE_H

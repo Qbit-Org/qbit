@@ -1,0 +1,155 @@
+# Copyright (c) 2026-present The qbit core developers
+# Distributed under the MIT software license, see the accompanying
+# file COPYING or https://opensource.org/license/mit.
+
+name: RPC Docs Pages
+run-name: RPC Docs Pages (${{ inputs.ref || github.ref_name }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build for RPC docs publication
+        required: false
+        default: ''
+        type: string
+      publish:
+        description: Deploy the built site to GitHub Pages
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rpc-docs-pages
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: build rpc docs site
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.ref_name }}
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            pkgconf \
+            python3 \
+            python3-pip \
+            libboost-dev \
+            libevent-dev \
+            libsqlite3-dev \
+            libzmq3-dev
+
+      - name: Install Python packages
+        run: |
+          if [[ -f doc/rpc/requirements.txt ]]; then
+            pip3 install --break-system-packages -r doc/rpc/requirements.txt
+          else
+            pip3 install --break-system-packages mkdocs PyYAML
+          fi
+
+      - name: Configure build
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DBUILD_GUI=OFF \
+            -DBUILD_TESTS=OFF \
+            -DBUILD_BENCH=OFF \
+            -DENABLE_IPC=OFF \
+            -DWITH_ZMQ=ON
+
+      - name: Build rpc docs
+        run: cmake --build build --target rpcdocs -j"$(nproc)"
+
+      - name: Validate rpc docs outputs
+        run: |
+          test -f build/doc/rpc-site/index.html
+          test -f build/doc/rpc-site/search/search_index.json
+          test -f build/doc/rpc/rpc-docs.json
+          test -f build/doc/rpc/rpc-docs-build-meta.json
+          test -f build/doc/rpc-site/assets/qbit.svg
+          if grep -R -nE "(href|src)=[\"']/" build/doc/rpc-site; then
+            echo "Found root-relative asset paths in build/doc/rpc-site"
+            exit 1
+          fi
+          if grep -R -nE "url\([[:space:]]*[\"']?/" build/doc/rpc-site; then
+            echo "Found root-relative CSS asset paths in build/doc/rpc-site"
+            exit 1
+          fi
+          if grep -R -nE 'cdn\.jsdelivr|unpkg\.com|cdnjs\.cloudflare\.com' build/doc/rpc-site; then
+            echo "Found external CDN dependency in build/doc/rpc-site"
+            exit 1
+          fi
+
+      - name: Validate install layout
+        run: |
+          cmake --install build --prefix "${RUNNER_TEMP}/rpcdocs-install" --component rpcdocs
+          test -f "${RUNNER_TEMP}/rpcdocs-install/share/doc/qbit/rpc/index.html"
+          test -f "${RUNNER_TEMP}/rpcdocs-install/share/doc/qbit/rpc/data/rpc-docs.json"
+          test -f "${RUNNER_TEMP}/rpcdocs-install/share/doc/qbit/rpc/data/rpc-docs-build-meta.json"
+
+      - name: Upload site artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpc-docs-site
+          if-no-files-found: error
+          path: |
+            build/doc/rpc-site/**
+
+      - name: Upload data artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpc-docs-data
+          if-no-files-found: error
+          path: |
+            build/doc/rpc/**
+
+      - name: Upload Pages artifact
+        if: ${{ inputs.publish }}
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: build/doc/rpc-site
+
+      - name: Record dry-run result
+        if: ${{ !inputs.publish }}
+        run: |
+          cat <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          RPC docs site was built and uploaded as artifacts only.
+
+          Re-run this manual workflow with `publish=true` to deploy the same
+          generated site shape to GitHub Pages.
+          EOF
+
+  deploy:
+    name: deploy rpc docs pages
+    needs: build
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-24.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

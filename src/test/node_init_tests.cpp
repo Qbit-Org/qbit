@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <chainparamsbase.h>
 #include <init.h>
 #include <interfaces/init.h>
 #include <rpc/server.h>
@@ -41,7 +42,7 @@ BOOST_AUTO_TEST_CASE(init_test)
     LogInstance().DisconnectTestLogger();
     m_node.args->SetConfigFilePath({});
 
-    // Prevent the test from trying to listen on ports 8332 and 8333.
+    // Prevent the test from trying to listen for RPC or P2P connections.
     m_node.args->ForceSetArg("-server", "0");
     m_node.args->ForceSetArg("-listen", "0");
 
@@ -51,6 +52,15 @@ BOOST_AUTO_TEST_CASE(init_test)
     BOOST_CHECK(AppInitMain(m_node));
     Interrupt(m_node);
     Shutdown(m_node);
+}
+
+BOOST_AUTO_TEST_CASE(base_chain_rpc_ports)
+{
+    BOOST_CHECK_EQUAL(CreateBaseChainParams(ChainType::MAIN)->RPCPort(), 8352);
+    BOOST_CHECK_EQUAL(CreateBaseChainParams(ChainType::TESTNET)->RPCPort(), 18352);
+    BOOST_CHECK_EQUAL(CreateBaseChainParams(ChainType::TESTNET4)->RPCPort(), 48352);
+    BOOST_CHECK_EQUAL(CreateBaseChainParams(ChainType::SIGNET)->RPCPort(), 38352);
+    BOOST_CHECK_EQUAL(CreateBaseChainParams(ChainType::REGTEST)->RPCPort(), 18452);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -210,6 +210,7 @@ fn get_subtrees() -> Vec<&'static str> {
         "src/crc32c",
         "src/crypto/ctaes",
         "src/ipc/libmultiprocess",
+        "src/libbitcoinpqc",
         "src/leveldb",
         "src/minisketch",
         "src/secp256k1",
@@ -222,6 +223,7 @@ fn get_pathspecs_default_excludes() -> Vec<String> {
         .iter()
         .chain(&[
             "doc/release-notes/release-notes-*", // archived notes
+            "contrib/photon/src/vendor/",        // externally sourced vendored code
         ])
         .map(|s| format!(":(exclude){}", s))
         .collect()
@@ -476,7 +478,7 @@ fn get_pathspecs_exclude_whitespace() -> Vec<String> {
             "*.patch",
             "src/qt/locale",
             "contrib/windeploy/win-codesign.cert",
-            "doc/README_windows.txt",
+            "doc/build/README_windows.txt",
             // Temporary excludes, or existing violations
             "contrib/init/bitcoind.openrc",
             "contrib/macdeploy/macdeployqtplus",
@@ -688,7 +690,7 @@ fn lint_doc() -> LintResult {
 fn lint_markdown() -> LintResult {
     let bin_name = "mlc";
     let mut md_ignore_paths = get_subtrees();
-    md_ignore_paths.push("./doc/README_doxygen.md");
+    md_ignore_paths.push("./doc/development/README_doxygen.md");
     let md_ignore_path_str = md_ignore_paths.join(",");
 
     let mut cmd = Command::new(bin_name);

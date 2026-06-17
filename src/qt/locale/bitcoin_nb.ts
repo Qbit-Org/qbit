@@ -964,7 +964,7 @@ Signing is only possible with addresses of the type 'legacy'.</source>
         <translation type="unfinished">(%1 låst)</translation>
     </message>
     <message>
-        <source>Can vary +/- %1 satoshi(s) per input.</source>
+        <source>Can vary +/- %1 bits per input.</source>
         <translation type="unfinished">Kan variere +/- %1 satoshi(er) per input.</translation>
     </message>
     <message>
@@ -2619,7 +2619,7 @@ Hvis du får denne feilen burde du be forretningsdrivende om å tilby en BIP21 k
         <translation type="unfinished">Skjul innstillinger for transaksjonsgebyr</translation>
     </message>
     <message>
-        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for bitcoin transactions than the network can process.</source>
+        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for qbit transactions than the network can process.</source>
         <translation type="unfinished">Når det er mindre transaksjonsvolum enn plass i blokkene, kan minere så vel som noder håndheve et minimumsgebyr for videresending. Å kun betale minsteavgiften er helt greit, men vær klar over at dette kan skape en transaksjon som aldri blir bekreftet hvis det blir større etterspørsel etter bitcoin-transaksjoner enn nettverket kan behandle.</translation>
     </message>
     <message>
@@ -2869,7 +2869,7 @@ Hvis du får denne feilen burde du be forretningsdrivende om å tilby en BIP21 k
         <translation type="unfinished">beløpet som skal sendes inn den valgte enheten.</translation>
     </message>
     <message>
-        <source>The fee will be deducted from the amount being sent. The recipient will receive less bitcoins than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
+        <source>The fee will be deducted from the amount being sent. The recipient will receive less QBT than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
         <translation type="unfinished">Gebyret vil bli trukket fra beløpet som blir sendt. Mottakeren vil motta mindre bitcoins enn det du skriver inn i beløpsfeltet. Hvis det er valgt flere mottakere, deles gebyret likt.</translation>
     </message>
     <message>

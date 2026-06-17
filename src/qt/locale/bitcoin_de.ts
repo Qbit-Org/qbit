@@ -839,7 +839,7 @@ Das Signieren ist nur mit Adressen vom Typ 'Legacy' möglich.</translation>
         <translation type="unfinished">(%1 gesperrt)</translation>
     </message>
     <message>
-        <source>Can vary +/- %1 satoshi(s) per input.</source>
+        <source>Can vary +/- %1 bits per input.</source>
         <translation type="unfinished">Kann pro Eingabe um +/- %1 Satoshi(s) abweichen.</translation>
     </message>
     <message>
@@ -2804,13 +2804,13 @@ Für weitere Informationen über diese Konsole, tippe %6.
     <message>
         <source>Specify a custom fee per kB (1,000 bytes) of the transaction's virtual size.
 
-Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 satoshis per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 satoshis.</source>
+Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 bits per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 bits.</source>
         <translation type="unfinished">Gib manuell eine Gebühr pro kB (1.000 Bytes) der virtuellen Transaktionsgröße an.
 
 Hinweis: Da die Gebühr auf Basis der Bytes berechnet wird, führt eine Gebührenrate von "100 Satoshis per kvB" für eine Transaktion von 500 virtuellen Bytes (die Hälfte von 1 kvB) letztlich zu einer Gebühr von nur 50 Satoshis.</translation>
     </message>
     <message>
-        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for bitcoin transactions than the network can process.</source>
+        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for qbit transactions than the network can process.</source>
         <translation type="unfinished">Nur die minimale Gebühr zu bezahlen ist so lange in Ordnung, wie weniger Transaktionsvolumen als Platz in den Blöcken vorhanden ist. Aber Vorsicht, diese Option kann dazu führen, dass Transaktionen nicht bestätigt werden, wenn mehr Bedarf an Bitcoin-Transaktionen besteht als das Netzwerk verarbeiten kann.</translation>
     </message>
     <message>
@@ -3096,7 +3096,7 @@ Hinweis: Da die Gebühr auf Basis der Bytes berechnet wird, führt eine Gebühre
         <translation type="unfinished">Zu sendender Betrag in der ausgewählten Einheit</translation>
     </message>
     <message>
-        <source>The fee will be deducted from the amount being sent. The recipient will receive less bitcoins than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
+        <source>The fee will be deducted from the amount being sent. The recipient will receive less QBT than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
         <translation type="unfinished">Die Gebühr wird vom zu überweisenden Betrag abgezogen. Der Empfänger wird also weniger Bitcoins erhalten, als Sie im Betrags-Feld eingegeben haben. Falls mehrere Empfänger ausgewählt wurden, wird die Gebühr gleichmäßig verteilt.</translation>
     </message>
     <message>
@@ -3846,8 +3846,8 @@ Gehen Sie zu Datei &gt; Wallet Öffnen, um eine Wallet zu laden.
         <translation type="unfinished">%s konnte den -assumeutxo-Snapshot-Status nicht validieren. Dies deutet auf ein Hardwareproblem, einen Fehler in der Software oder eine fehlerhafte Softwareänderung hin, die das Laden eines ungültigen Schnappschusses ermöglichte. Infolgedessen wird der Knoten heruntergefahren und verwendet keinen Zustand mehr, der auf dem Snapshot aufgebaut wurde, wodurch die Chain Height von %d auf %d zurückgesetzt wird. Beim nächsten Neustart nimmt der Knoten die Synchronisierung ab %d ohne Verwendung von Snapshot-Daten wieder auf. Bitte melden Sie diesen Vorfall an %s und geben Sie an, wie Sie den Snapshot erhalten haben. Der ungültige Snapshot-Chainstatus wird auf der Festplatte belassen, falls er bei der Diagnose des Problems, das diesen Fehler verursacht hat, hilfreich ist.</translation>
     </message>
     <message>
-        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/p2p-bad-ports.md for details and a full list.</source>
-        <translation type="unfinished">%s Aufforderung, auf Port %u zu lauschen. Dieser Port wird als "schlecht" eingeschätzt und es ist daher unwahrscheinlich, dass sich Peers mit ihm verbinden. Siehe doc/p2p-bad-ports.md für Details und eine vollständige Liste.</translation>
+        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/reference/p2p-bad-ports.md for details and a full list.</source>
+        <translation type="unfinished">%s Aufforderung, auf Port %u zu lauschen. Dieser Port wird als "schlecht" eingeschätzt und es ist daher unwahrscheinlich, dass sich Peers mit ihm verbinden. Siehe doc/reference/p2p-bad-ports.md für Details und eine vollständige Liste.</translation>
     </message>
     <message>
         <source>Disk space for %s may not accommodate the block files. Approximately %u GB of data will be stored in this directory.</source>

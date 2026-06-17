@@ -3,8 +3,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_KERNEL_CHAINPARAMS_H
-#define BITCOIN_KERNEL_CHAINPARAMS_H
+#ifndef QBIT_KERNEL_CHAINPARAMS_H
+#define QBIT_KERNEL_CHAINPARAMS_H
 
 #include <consensus/params.h>
 #include <kernel/messagestartchars.h>
@@ -106,6 +106,7 @@ public:
     const std::vector<unsigned char>& Base58Prefix(Base58Type type) const { return base58Prefixes[type]; }
     const std::string& Bech32HRP() const { return bech32_hrp; }
     const std::vector<uint8_t>& FixedSeeds() const { return vFixedSeeds; }
+    bool IsWitnessPruningEnabled() const { return m_witness_pruning_enabled; }
 
     std::optional<AssumeutxoData> AssumeutxoForHeight(int height) const
     {
@@ -141,8 +142,15 @@ public:
     struct RegTestOptions {
         std::unordered_map<Consensus::DeploymentPos, VersionBitsParameters> version_bits_parameters{};
         std::unordered_map<Consensus::BuriedDeployment, int> activation_heights{};
+        std::optional<int> cadence_activation_height{};
+        std::optional<int> outer_witness_activation_height{};
+        std::optional<int> p2mr_activation_height{};
         bool fastprune{false};
         bool enforce_bip94{false};
+        bool restricted_output_mode{true};
+        bool asert{false};
+        bool witness_pruning_enabled{true};
+        bool legacy_retarget{false};
     };
 
     static std::unique_ptr<const CChainParams> RegTest(const RegTestOptions& options);
@@ -168,10 +176,11 @@ protected:
     std::vector<uint8_t> vFixedSeeds;
     bool fDefaultConsistencyChecks;
     bool m_is_mockable_chain;
+    bool m_witness_pruning_enabled{true};
     std::vector<AssumeutxoData> m_assumeutxo_data;
     ChainTxData chainTxData;
 };
 
 std::optional<ChainType> GetNetworkForMagic(const MessageStartChars& pchMessageStart);
 
-#endif // BITCOIN_KERNEL_CHAINPARAMS_H
+#endif // QBIT_KERNEL_CHAINPARAMS_H

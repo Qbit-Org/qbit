@@ -3,8 +3,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_COMMON_SIGNMESSAGE_H
-#define BITCOIN_COMMON_SIGNMESSAGE_H
+#ifndef QBIT_COMMON_SIGNMESSAGE_H
+#define QBIT_COMMON_SIGNMESSAGE_H
 
 #include <uint256.h>
 
@@ -74,4 +74,4 @@ uint256 MessageHash(const std::string& message);
 
 std::string SigningResultString(const SigningResult res);
 
-#endif // BITCOIN_COMMON_SIGNMESSAGE_H
+#endif // QBIT_COMMON_SIGNMESSAGE_H

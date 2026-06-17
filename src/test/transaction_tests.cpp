@@ -13,6 +13,7 @@
 #include <consensus/tx_verify.h>
 #include <consensus/validation.h>
 #include <core_io.h>
+#include <crypto/pqc.h>
 #include <key.h>
 #include <policy/policy.h>
 #include <policy/settings.h>
@@ -71,6 +72,7 @@ static std::map<std::string, unsigned int> mapFlagNames = {
     {std::string("DISCOURAGE_UPGRADABLE_PUBKEYTYPE"), (unsigned int)SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE},
     {std::string("DISCOURAGE_OP_SUCCESS"), (unsigned int)SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS},
     {std::string("DISCOURAGE_UPGRADABLE_TAPROOT_VERSION"), (unsigned int)SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION},
+    {std::string("P2MR_RULES"), (unsigned int)SCRIPT_VERIFY_P2MR_RULES},
 };
 
 unsigned int ParseScriptFlags(std::string strFlags)
@@ -96,6 +98,34 @@ bool CheckMapFlagNames()
         standard_flags_missing &= ~(pair.second);
     }
     return standard_flags_missing == 0;
+}
+
+CScript WitnessProgramScript(int witness_version, const std::vector<unsigned char>& witness_program)
+{
+    CScript script;
+    script << witness_version << witness_program;
+    return script;
+}
+
+CScript DropAllScript(size_t drop_count)
+{
+    CScript script;
+    for (size_t i = 0; i < drop_count; ++i) {
+        script << OP_DROP;
+    }
+    script << OP_TRUE;
+    return script;
+}
+
+std::vector<valtype> P2MRStackItemsForTotalBytes(size_t total_bytes)
+{
+    std::vector<valtype> stack_items;
+    while (total_bytes > 0) {
+        const size_t item_size{total_bytes > MAX_STANDARD_P2MR_STACK_ITEM_SIZE ? MAX_STANDARD_P2MR_STACK_ITEM_SIZE : total_bytes};
+        stack_items.emplace_back(item_size, 0x42);
+        total_bytes -= item_size;
+    }
+    return stack_items;
 }
 
 std::string FormatScriptFlags(unsigned int flags)
@@ -812,8 +842,8 @@ BOOST_AUTO_TEST_CASE(test_IsStandard)
     CheckIsStandard(t);
 
     // Check dust with default relay fee:
-    CAmount nDustThreshold = 182 * g_dust.GetFeePerK() / 1000;
-    BOOST_CHECK_EQUAL(nDustThreshold, 546);
+    CAmount nDustThreshold = (182 * g_dust.GetFeePerK() + 999) / 1000;
+    BOOST_CHECK_EQUAL(nDustThreshold, 137);
 
     // Add dust outputs up to allowed maximum, still standard!
     for (size_t i{0}; i < MAX_DUST_OUTPUTS_PER_TX; ++i) {
@@ -858,6 +888,22 @@ BOOST_AUTO_TEST_CASE(test_IsStandard)
 
     t.vout[0].scriptPubKey = CScript() << OP_1;
     CheckIsNotStandard(t, "scriptpubkey");
+
+    CMutableTransaction witness_version_tx = t;
+    witness_version_tx.vout.resize(1);
+    witness_version_tx.vout[0].nValue = 90 * CENT;
+    const std::vector<unsigned char> witness_program(32, 0x42);
+    witness_version_tx.vout[0].scriptPubKey = CScript() << OP_2 << witness_program;
+    CheckIsStandard(witness_version_tx);
+
+    witness_version_tx.vout[0].scriptPubKey = CScript() << OP_3 << witness_program;
+    CheckIsNotStandard(witness_version_tx, "scriptpubkey");
+
+    witness_version_tx.vout[0].scriptPubKey = CScript() << OP_16 << witness_program;
+    CheckIsNotStandard(witness_version_tx, "scriptpubkey");
+
+    witness_version_tx.vout[0].scriptPubKey = CScript() << OP_1 << std::vector<unsigned char>(31, 0x24);
+    CheckIsStandard(witness_version_tx);
 
     // Custom 83-byte TxoutType::NULL_DATA (standard with max_op_return_relay of 83)
     t.vout[0].scriptPubKey = CScript() << OP_RETURN << "04678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef3804678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38"_hex;
@@ -956,19 +1002,19 @@ BOOST_AUTO_TEST_CASE(test_IsStandard)
 
     // Check tx-size (non-standard if transaction weight is > MAX_STANDARD_TX_WEIGHT)
     t.vin.clear();
-    t.vin.resize(2438); // size per input (empty scriptSig): 41 bytes
-    t.vout[0].scriptPubKey = CScript() << OP_RETURN << std::vector<unsigned char>(19, 0); // output size: 30 bytes
-    // tx header:                12 bytes =>     48 weight units
-    // 2438 inputs: 2438*41 = 99958 bytes => 399832 weight units
-    //    1 output:              30 bytes =>    120 weight units
-    //                      ======================================
-    //                                total: 400000 weight units
-    BOOST_CHECK_EQUAL(GetTransactionWeight(CTransaction(t)), 400000);
+    t.vin.resize(9755); // size per input (empty scriptSig): 41 bytes
+    t.vout[0].scriptPubKey = CScript() << OP_RETURN << std::vector<unsigned char>(22, 0); // output size: 33 bytes
+    // tx header:                  12 bytes =>     12 weight units
+    // 9755 inputs: 9755*41 = 399955 bytes => 399955 weight units
+    //    1 output:                33 bytes =>     33 weight units
+    //                        ======================================
+    //                                  total: 400000 weight units
+    BOOST_CHECK_EQUAL(GetTransactionWeight(CTransaction(t)), MAX_STANDARD_TX_WEIGHT);
     CheckIsStandard(t);
 
-    // increase output size by one byte, so we end up with 400004 weight units
-    t.vout[0].scriptPubKey = CScript() << OP_RETURN << std::vector<unsigned char>(20, 0); // output size: 31 bytes
-    BOOST_CHECK_EQUAL(GetTransactionWeight(CTransaction(t)), 400004);
+    // increase output size by one byte, so we end up with MAX_STANDARD_TX_WEIGHT + 1 weight units
+    t.vout[0].scriptPubKey = CScript() << OP_RETURN << std::vector<unsigned char>(23, 0); // output size: 34 bytes
+    BOOST_CHECK_EQUAL(GetTransactionWeight(CTransaction(t)), MAX_STANDARD_TX_WEIGHT + 1);
     CheckIsNotStandard(t, "tx-size");
 
     // Check bare multisig (standard if policy flag g_bare_multi is set)
@@ -988,69 +1034,87 @@ BOOST_AUTO_TEST_CASE(test_IsStandard)
 
     // Check compressed P2PK outputs dust threshold (must have leading 02 or 03)
     t.vout[0].scriptPubKey = CScript() << std::vector<unsigned char>(33, 0x02) << OP_CHECKSIG;
-    t.vout[0].nValue = 576;
+    t.vout[0].nValue = 144;
     CheckIsStandard(t);
-    t.vout[0].nValue = 575;
+    t.vout[0].nValue = 143;
     CheckIsNotStandard(t, "dust");
 
     // Check uncompressed P2PK outputs dust threshold (must have leading 04/06/07)
     t.vout[0].scriptPubKey = CScript() << std::vector<unsigned char>(65, 0x04) << OP_CHECKSIG;
-    t.vout[0].nValue = 672;
+    t.vout[0].nValue = 168;
     CheckIsStandard(t);
-    t.vout[0].nValue = 671;
+    t.vout[0].nValue = 167;
     CheckIsNotStandard(t, "dust");
 
     // Check P2PKH outputs dust threshold
     t.vout[0].scriptPubKey = CScript() << OP_DUP << OP_HASH160 << std::vector<unsigned char>(20, 0) << OP_EQUALVERIFY << OP_CHECKSIG;
-    t.vout[0].nValue = 546;
+    t.vout[0].nValue = 137;
     CheckIsStandard(t);
-    t.vout[0].nValue = 545;
+    t.vout[0].nValue = 136;
     CheckIsNotStandard(t, "dust");
 
     // Check P2SH outputs dust threshold
     t.vout[0].scriptPubKey = CScript() << OP_HASH160 << std::vector<unsigned char>(20, 0) << OP_EQUAL;
-    t.vout[0].nValue = 540;
+    t.vout[0].nValue = 135;
     CheckIsStandard(t);
-    t.vout[0].nValue = 539;
+    t.vout[0].nValue = 134;
     CheckIsNotStandard(t, "dust");
 
-    // Check P2WPKH outputs dust threshold
+    // Check P2WPKH outputs dust threshold (WSF=1, no segwit discount)
     t.vout[0].scriptPubKey = CScript() << OP_0 << std::vector<unsigned char>(20, 0);
-    t.vout[0].nValue = 294;
+    t.vout[0].nValue = 135;
     CheckIsStandard(t);
-    t.vout[0].nValue = 293;
+    t.vout[0].nValue = 134;
     CheckIsNotStandard(t, "dust");
 
-    // Check P2WSH outputs dust threshold
+    // Check P2WSH outputs dust threshold (WSF=1, no segwit discount)
     t.vout[0].scriptPubKey = CScript() << OP_0 << std::vector<unsigned char>(32, 0);
-    t.vout[0].nValue = 330;
+    t.vout[0].nValue = 144;
     CheckIsStandard(t);
-    t.vout[0].nValue = 329;
+    t.vout[0].nValue = 143;
     CheckIsNotStandard(t, "dust");
 
     // Check P2TR outputs dust threshold (Invalid xonly key ok!)
     t.vout[0].scriptPubKey = CScript() << OP_1 << std::vector<unsigned char>(32, 0);
-    t.vout[0].nValue = 330;
+    t.vout[0].nValue = 144;
     CheckIsStandard(t);
-    t.vout[0].nValue = 329;
+    t.vout[0].nValue = 143;
     CheckIsNotStandard(t, "dust");
 
-    // Check future Witness Program versions dust threshold (non-32-byte pushes are undefined for version 1)
-    for (int op = OP_1; op <= OP_16; op += 1) {
+    // Check P2MR outputs dust threshold. A canonical single-key P2MR spend
+    // includes a PQC signature, leaf script, and P2MR control block.
+    t.vout[0].scriptPubKey = CScript() << OP_2 << std::vector<unsigned char>(32, 0);
+    BOOST_CHECK_EQUAL(GetDustThreshold(t.vout[0], g_dust), 2855);
+    t.vout[0].nValue = 2855;
+    CheckIsStandard(t);
+    t.vout[0].nValue = 2854;
+    CheckIsNotStandard(t, "dust");
+
+    // Check unknown version 1 and version 2 witness programs dust threshold.
+    // Version 1 with a non-32-byte program and version 2 with a non-P2MR-sized
+    // program remain generic unknown witness outputs under policy.
+    for (const opcodetype op : {OP_1, OP_2}) {
         t.vout[0].scriptPubKey = CScript() << (opcodetype)op << std::vector<unsigned char>(2, 0);
-        t.vout[0].nValue = 240;
+        t.vout[0].nValue = 121;
         CheckIsStandard(t);
 
-        t.vout[0].nValue = 239;
+        t.vout[0].nValue = 120;
         CheckIsNotStandard(t, "dust");
+    }
+
+    // Reserved future witness versions are kept dormant through output policy.
+    for (int op = OP_3; op <= OP_16; op += 1) {
+        t.vout[0].scriptPubKey = CScript() << (opcodetype)op << std::vector<unsigned char>(2, 0);
+        t.vout[0].nValue = 121;
+        CheckIsNotStandard(t, "scriptpubkey");
     }
 
     // Check anchor outputs
     t.vout[0].scriptPubKey = CScript() << OP_1 << ANCHOR_BYTES;
     BOOST_CHECK(t.vout[0].scriptPubKey.IsPayToAnchor());
-    t.vout[0].nValue = 240;
+    t.vout[0].nValue = 121;
     CheckIsStandard(t);
-    t.vout[0].nValue = 239;
+    t.vout[0].nValue = 120;
     CheckIsNotStandard(t, "dust");
 }
 
@@ -1163,8 +1227,8 @@ BOOST_AUTO_TEST_CASE(spends_witness_prog)
     std::vector<std::vector<uint8_t>> sol_dummy;
 
     // CNoDestination, PubKeyDestination, PKHash, ScriptHash, WitnessV0ScriptHash, WitnessV0KeyHash,
-    // WitnessV1Taproot, PayToAnchor, WitnessUnknown.
-    static_assert(std::variant_size_v<CTxDestination> == 9);
+    // WitnessV1Taproot, WitnessV2P2MR, PayToAnchor, WitnessUnknown.
+    static_assert(std::variant_size_v<CTxDestination> == 10);
 
     // Go through all defined output types and sanity check SpendsNonAnchorWitnessProg.
 
@@ -1286,7 +1350,9 @@ BOOST_AUTO_TEST_CASE(spends_witness_prog)
     const auto program{ToByteVector(XOnlyPubKey{pubkey})};
     for (int i{2}; i <= 16; ++i) {
         tx_create.vout[0].scriptPubKey = GetScriptForDestination(WitnessUnknown{i, program});
-        BOOST_CHECK_EQUAL(Solver(tx_create.vout[0].scriptPubKey, sol_dummy), TxoutType::WITNESS_UNKNOWN);
+        // Version 2 with 32-byte program is now recognized as P2MR (BIP-360)
+        const auto expected_type = (i == 2) ? TxoutType::WITNESS_V2_P2MR : TxoutType::WITNESS_UNKNOWN;
+        BOOST_CHECK_EQUAL(Solver(tx_create.vout[0].scriptPubKey, sol_dummy), expected_type);
         tx_spend.vin[0].prevout.hash = tx_create.GetHash();
         AddCoins(coins, CTransaction{tx_create}, 0, false);
         BOOST_CHECK(::SpendsNonAnchorWitnessProg(CTransaction{tx_spend}, coins));
@@ -1302,6 +1368,219 @@ BOOST_AUTO_TEST_CASE(spends_witness_prog)
         tx_spend.vin[0].scriptSig.clear();
         BOOST_CHECK(!::SpendsNonAnchorWitnessProg(CTransaction{tx_spend}, coins));
     }
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_minimal_witness_budget)
+{
+    // Minimal single-leaf P2MR witness: [sig] [leaf_script] [control_block].
+    CScript leaf_script = CScript{} << std::vector<unsigned char>(PQC_PUBKEY_SIZE, 1) << OP_CHECKSIGPQC;
+
+    CScriptWitness witness;
+    witness.stack.emplace_back(PQC_SIG_SIZE, 1);
+    witness.stack.emplace_back(leaf_script.begin(), leaf_script.end());
+    witness.stack.emplace_back(std::vector<unsigned char>{0xc1}); // Leaf version 0xc0 with required bit0 set.
+
+    const int64_t validation_budget = ::GetSerializeSize(witness.stack) + VALIDATION_WEIGHT_OFFSET;
+    BOOST_CHECK_GE(validation_budget, VALIDATION_WEIGHT_PER_SIGOP_PQC);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_witness_standard_total_initial_stack_bytes)
+{
+    CCoinsView coins_dummy;
+    CCoinsViewCache coins(&coins_dummy);
+
+    CMutableTransaction tx_create;
+    tx_create.vout.emplace_back(50'000, WitnessProgramScript(/*witness_version=*/2, std::vector<unsigned char>(32, 0x42)));
+    AddCoins(coins, CTransaction{tx_create}, 0, false);
+
+    auto build_spend = [&](size_t total_bytes) {
+        CMutableTransaction tx_spend;
+        tx_spend.vin.emplace_back(tx_create.GetHash(), 0);
+        tx_spend.vout.emplace_back(1, CScript{} << OP_TRUE);
+
+        std::vector<valtype> stack_items{P2MRStackItemsForTotalBytes(total_bytes)};
+        CScriptWitness& witness{tx_spend.vin[0].scriptWitness};
+        witness.stack = std::move(stack_items);
+        const CScript leaf_script{DropAllScript(witness.stack.size())};
+        witness.stack.emplace_back(leaf_script.begin(), leaf_script.end());
+        witness.stack.emplace_back(std::vector<unsigned char>{0xc1});
+
+        return CTransaction{tx_spend};
+    };
+
+    const CTransaction max_standard{build_spend(MAX_STANDARD_P2MR_TOTAL_INITIAL_STACK_BYTES)};
+    BOOST_CHECK_LE(GetTransactionWeight(max_standard), MAX_STANDARD_TX_WEIGHT);
+    BOOST_CHECK(::IsWitnessStandard(max_standard, coins));
+
+    const CTransaction oversized_total{build_spend(MAX_STANDARD_P2MR_TOTAL_INITIAL_STACK_BYTES + 1)};
+    BOOST_CHECK_LE(GetTransactionWeight(oversized_total), MAX_STANDARD_TX_WEIGHT);
+    BOOST_CHECK(!::IsWitnessStandard(oversized_total, coins));
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_raw_signature_format)
+{
+    CPQCKey key;
+    key.MakeNewKey();
+    const CPQCPubKey pubkey = key.GetPubKey();
+    BOOST_REQUIRE(pubkey.IsValid());
+
+    const CScript leaf_script = CScript{} << std::vector<unsigned char>(pubkey.begin(), pubkey.end()) << OP_CHECKSIGPQC;
+    const std::vector<unsigned char> control{0xc1}; // Leaf version 0xc0 with required bit0 set.
+    const uint256 tapleaf_hash = ComputeP2MRLeafHash(control[0] & TAPROOT_LEAF_MASK, leaf_script);
+    const uint256 merkle_root = ComputeP2MRMerkleRoot(control, tapleaf_hash);
+    const std::vector<unsigned char> witness_program{merkle_root.begin(), merkle_root.end()};
+    const CScript p2mr_script_pubkey = CScript{} << OP_2 << witness_program;
+
+    CMutableTransaction tx;
+    tx.vin.resize(1);
+    tx.vout.resize(1);
+    tx.vin[0].scriptWitness.stack.emplace_back(PQC_SIG_SIZE, 0x00);
+    tx.vin[0].scriptWitness.stack.emplace_back(leaf_script.begin(), leaf_script.end());
+    tx.vin[0].scriptWitness.stack.emplace_back(control);
+    tx.vout[0].nValue = CAmount{1};
+    tx.vout[0].scriptPubKey = CScript{} << OP_TRUE;
+
+    const CAmount spent_amount{50'000};
+    std::vector<CTxOut> spent_outputs;
+    spent_outputs.emplace_back(spent_amount, p2mr_script_pubkey);
+
+    PrecomputedTransactionData txdata;
+    txdata.Init(tx, std::move(spent_outputs), /*force=*/true);
+
+    ScriptExecutionData execdata;
+    execdata.m_annex_init = true;
+    execdata.m_annex_present = false;
+    execdata.m_tapleaf_hash = tapleaf_hash;
+    execdata.m_tapleaf_hash_init = true;
+    execdata.m_codeseparator_pos = 0xFFFFFFFF;
+    execdata.m_codeseparator_pos_init = true;
+
+    uint256 sighash;
+    BOOST_REQUIRE(SignatureHashP2MR(sighash, execdata, tx, 0, SIGHASH_DEFAULT, txdata, MissingDataBehavior::FAIL));
+
+    uint32_t sig_counter{0};
+    std::vector<unsigned char> sphincs_sig;
+    BOOST_REQUIRE(key.Sign(sighash, sphincs_sig, sig_counter));
+
+    tx.vin[0].scriptWitness.stack[0] = sphincs_sig;
+
+    constexpr unsigned int flags = MANDATORY_SCRIPT_VERIFY_FLAGS;
+
+    const CTransaction tx_valid{tx};
+    ScriptError serror = SCRIPT_ERR_UNKNOWN_ERROR;
+    bool ok = VerifyScript(tx_valid.vin[0].scriptSig, p2mr_script_pubkey, &tx_valid.vin[0].scriptWitness, flags,
+                           TransactionSignatureChecker(&tx_valid, 0, spent_amount, txdata, MissingDataBehavior::ASSERT_FAIL), &serror);
+    BOOST_CHECK(ok);
+    BOOST_CHECK_EQUAL(serror, SCRIPT_ERR_OK);
+
+    serror = SCRIPT_ERR_UNKNOWN_ERROR;
+    ok = VerifyScript(tx_valid.vin[0].scriptSig, p2mr_script_pubkey, &tx_valid.vin[0].scriptWitness, STANDARD_SCRIPT_VERIFY_FLAGS,
+                      TransactionSignatureChecker(&tx_valid, 0, spent_amount, txdata, MissingDataBehavior::ASSERT_FAIL), &serror);
+    BOOST_CHECK(ok);
+    BOOST_CHECK_EQUAL(serror, SCRIPT_ERR_OK);
+
+    CMutableTransaction tx_bad_sig{tx};
+    tx_bad_sig.vin[0].scriptWitness.stack[0][0] ^= 0x01;
+    const CTransaction tx_invalid{tx_bad_sig};
+    serror = SCRIPT_ERR_UNKNOWN_ERROR;
+    ok = VerifyScript(tx_invalid.vin[0].scriptSig, p2mr_script_pubkey, &tx_invalid.vin[0].scriptWitness, flags,
+                      TransactionSignatureChecker(&tx_invalid, 0, spent_amount, txdata, MissingDataBehavior::ASSERT_FAIL), &serror);
+    BOOST_CHECK(!ok);
+    BOOST_CHECK_EQUAL(serror, SCRIPT_ERR_P2MR_SIG);
+
+    serror = SCRIPT_ERR_UNKNOWN_ERROR;
+    ok = VerifyScript(tx_invalid.vin[0].scriptSig, p2mr_script_pubkey, &tx_invalid.vin[0].scriptWitness, STANDARD_SCRIPT_VERIFY_FLAGS,
+                      TransactionSignatureChecker(&tx_invalid, 0, spent_amount, txdata, MissingDataBehavior::ASSERT_FAIL), &serror);
+    BOOST_CHECK(!ok);
+    BOOST_CHECK_EQUAL(serror, SCRIPT_ERR_P2MR_SIG);
+
+    auto check_malformed_sig = [&](const std::vector<unsigned char>& witness_sig, ScriptError expected_error) {
+        CMutableTransaction tx_malformed{tx};
+        tx_malformed.vin[0].scriptWitness.stack[0] = witness_sig;
+        const CTransaction tx_malformed_format{tx_malformed};
+
+        serror = SCRIPT_ERR_UNKNOWN_ERROR;
+        ok = VerifyScript(tx_malformed_format.vin[0].scriptSig, p2mr_script_pubkey, &tx_malformed_format.vin[0].scriptWitness, flags,
+                          TransactionSignatureChecker(&tx_malformed_format, 0, spent_amount, txdata, MissingDataBehavior::ASSERT_FAIL), &serror);
+        BOOST_CHECK(!ok);
+        BOOST_CHECK_EQUAL(serror, expected_error);
+
+        serror = SCRIPT_ERR_UNKNOWN_ERROR;
+        ok = VerifyScript(tx_malformed_format.vin[0].scriptSig, p2mr_script_pubkey, &tx_malformed_format.vin[0].scriptWitness, STANDARD_SCRIPT_VERIFY_FLAGS,
+                          TransactionSignatureChecker(&tx_malformed_format, 0, spent_amount, txdata, MissingDataBehavior::ASSERT_FAIL), &serror);
+        BOOST_CHECK(!ok);
+        BOOST_CHECK_EQUAL(serror, expected_error);
+    };
+
+    std::vector<unsigned char> malformed_default_suffix_sig = sphincs_sig;
+    malformed_default_suffix_sig.push_back(SIGHASH_DEFAULT);
+    check_malformed_sig(malformed_default_suffix_sig, SCRIPT_ERR_P2MR_SIG_HASHTYPE);
+
+    std::vector<unsigned char> malformed_nondefault_suffix_sig = sphincs_sig;
+    malformed_nondefault_suffix_sig.push_back(SIGHASH_ALL);
+    check_malformed_sig(malformed_nondefault_suffix_sig, SCRIPT_ERR_P2MR_SIG);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_non_32_byte_pubkey_sigops_consume_pqc_weight)
+{
+    const std::vector<unsigned char> pubkey(PQC_PUBKEY_SIZE + 1, 1);
+    CScript leaf_script = CScript{} << pubkey << OP_CHECKSIGPQC;
+
+    const std::vector<unsigned char> control{0xc1}; // Leaf version 0xc0 with required bit0 set.
+    const uint256 tapleaf_hash = ComputeP2MRLeafHash(control[0] & TAPROOT_LEAF_MASK, leaf_script);
+    const uint256 merkle_root = ComputeP2MRMerkleRoot(control, tapleaf_hash);
+    const std::vector<unsigned char> witness_program{merkle_root.begin(), merkle_root.end()};
+    const CScript p2mr_script_pubkey = CScript{} << OP_2 << witness_program;
+
+    CMutableTransaction tx;
+    tx.vin.resize(1);
+    tx.vout.resize(1);
+    tx.vin[0].scriptWitness.stack.emplace_back(std::vector<unsigned char>{0x01});
+    tx.vin[0].scriptWitness.stack.emplace_back(leaf_script.begin(), leaf_script.end());
+    tx.vin[0].scriptWitness.stack.emplace_back(control);
+    tx.vout[0].nValue = CAmount{1};
+    tx.vout[0].scriptPubKey = CScript{} << OP_TRUE;
+
+    const int64_t validation_budget = ::GetSerializeSize(tx.vin[0].scriptWitness.stack) + VALIDATION_WEIGHT_OFFSET;
+    BOOST_CHECK_LT(validation_budget, VALIDATION_WEIGHT_PER_SIGOP_PQC);
+
+    const CAmount spent_amount{50'000};
+    std::vector<CTxOut> spent_outputs;
+    spent_outputs.emplace_back(spent_amount, p2mr_script_pubkey);
+
+    PrecomputedTransactionData txdata;
+    txdata.Init(tx, std::move(spent_outputs), /*force=*/true);
+
+    const CTransaction tx_anyone_can_spend{tx};
+    ScriptError serror = SCRIPT_ERR_UNKNOWN_ERROR;
+    const bool ok = VerifyScript(tx_anyone_can_spend.vin[0].scriptSig, p2mr_script_pubkey, &tx_anyone_can_spend.vin[0].scriptWitness, MANDATORY_SCRIPT_VERIFY_FLAGS,
+                                 TransactionSignatureChecker(&tx_anyone_can_spend, 0, spent_amount, txdata, MissingDataBehavior::ASSERT_FAIL), &serror);
+    BOOST_CHECK(!ok);
+    BOOST_CHECK_EQUAL(serror, SCRIPT_ERR_P2MR_VALIDATION_WEIGHT);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_precomputed_data_ready)
+{
+    CMutableTransaction tx;
+    tx.vin.resize(1);
+    tx.vout.resize(1);
+    tx.vin[0].scriptWitness.stack.emplace_back(std::vector<unsigned char>{0x01});
+    tx.vout[0].nValue = CAmount{1};
+    tx.vout[0].scriptPubKey = CScript{} << OP_TRUE;
+
+    const std::vector<unsigned char> program(32, 0x42);
+    const CScript p2mr_script_pubkey = CScript{} << OP_2 << program;
+    std::vector<CTxOut> spent_outputs;
+    spent_outputs.emplace_back(CAmount{1}, p2mr_script_pubkey);
+
+    PrecomputedTransactionData txdata;
+    txdata.Init(tx, std::move(spent_outputs));
+
+    BOOST_CHECK(txdata.m_spent_outputs_ready);
+    BOOST_CHECK(txdata.m_bip341_taproot_ready);
+    BOOST_CHECK(!txdata.m_bip143_segwit_ready);
+    BOOST_CHECK(txdata.m_ctv_ready);
+    BOOST_CHECK(!txdata.m_ctv_has_nonempty_script_sigs);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

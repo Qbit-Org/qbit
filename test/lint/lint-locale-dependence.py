@@ -50,6 +50,7 @@ KNOWN_VIOLATIONS = [
 ]
 
 REGEXP_EXTERNAL_DEPENDENCIES_EXCLUSIONS = [
+    "contrib/photon/",
     "src/crypto/ctaes/",
     "src/ipc/libmultiprocess/",
     "src/leveldb/",

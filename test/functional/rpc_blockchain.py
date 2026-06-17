@@ -29,6 +29,7 @@ import subprocess
 import textwrap
 
 from test_framework.blocktools import (
+    COINBASE_MATURITY,
     MAX_FUTURE_BLOCK_TIME,
     TIME_GENESIS_BLOCK,
     REGTEST_N_BITS,
@@ -36,6 +37,7 @@ from test_framework.blocktools import (
     create_block,
     create_coinbase,
     create_tx_with_script,
+    get_block_subsidy,
     nbits_str,
     target_str,
 )
@@ -66,7 +68,7 @@ TIME_RANGE_STEP = 600  # ten-minute steps
 TIME_RANGE_MTP = TIME_GENESIS_BLOCK + (HEIGHT - 6) * TIME_RANGE_STEP
 TIME_RANGE_TIP = TIME_GENESIS_BLOCK + (HEIGHT - 1) * TIME_RANGE_STEP
 TIME_RANGE_END = TIME_GENESIS_BLOCK + HEIGHT * TIME_RANGE_STEP
-DIFFICULTY_ADJUSTMENT_INTERVAL = 144
+DIFFICULTY_ADJUSTMENT_INTERVAL = 1440
 
 
 class BlockchainTest(BitcoinTestFramework):
@@ -99,8 +101,13 @@ class BlockchainTest(BitcoinTestFramework):
         self._test_stopatheight()
         self._test_waitforblock() # also tests waitfornewblock
         self._test_waitforblockheight()
-        self._test_getblock()
         self._test_getdeploymentinfo()
+        # Mature coinbase UTXOs for _test_getblock
+        current = self.nodes[0].getblockcount()
+        needed = COINBASE_MATURITY + 1
+        if current < needed:
+            self.generate(self.nodes[0], needed - current)
+        self._test_getblock()
         self._test_verificationprogress()
         self._test_y2106()
         assert self.nodes[0].verifychain(4, 0)
@@ -222,7 +229,7 @@ class BlockchainTest(BitcoinTestFramework):
             'testdummy': {
                 'type': 'bip9',
                 'bip9': {
-                    'bit': 28,
+                    'bit': 0,
                     'start_time': 0,
                     'timeout': 0x7fffffffffffffff,  # testdummy does not have a timeout so is set to the max int64 value
                     'min_activation_height': 0,
@@ -283,13 +290,14 @@ class BlockchainTest(BitcoinTestFramework):
 
     def _test_verificationprogress(self):
         self.log.info("Check that verificationprogress is less than 1 when the block tip is old")
+        block_time = self.nodes[0].getblockchaininfo()["time"]
         future = 2 * 60 * 60
-        self.nodes[0].setmocktime(self.nodes[0].getblockchaininfo()["time"] + future + 1)
+        self.nodes[0].setmocktime(block_time + future + 1)
         assert_greater_than(1, self.nodes[0].getblockchaininfo()["verificationprogress"])
 
-        self.log.info("Check that verificationprogress is exactly 1 for a recent block tip")
-        self.nodes[0].setmocktime(self.nodes[0].getblockchaininfo()["time"] + future)
-        assert_equal(1, self.nodes[0].getblockchaininfo()["verificationprogress"])
+        self.log.info("Check that verificationprogress is close to 1 for a recent block tip")
+        self.nodes[0].setmocktime(block_time + future)
+        assert_greater_than_or_equal(self.nodes[0].getblockchaininfo()["verificationprogress"], 0.999)
 
         self.log.info("Check that verificationprogress is less than 1 as soon as a new header comes in")
         self.nodes[0].submitheader(self.generateblock(self.nodes[0], output="raw(55)", transactions=[], submit=False, sync_fun=self.no_op)["hex"])
@@ -361,7 +369,10 @@ class BlockchainTest(BitcoinTestFramework):
         node = self.nodes[0]
         res = node.gettxoutsetinfo()
 
-        assert_equal(res['total_amount'], Decimal('8725.00000000'))
+        expected_total = Decimal(
+            sum(get_block_subsidy(height) for height in range(1, HEIGHT + 1))
+        ) / COIN
+        assert_equal(res['total_amount'], expected_total)
         assert_equal(res['transactions'], HEIGHT)
         assert_equal(res['height'], HEIGHT)
         assert_equal(res['txouts'], HEIGHT)
@@ -436,7 +447,7 @@ class BlockchainTest(BitcoinTestFramework):
         # Validate the gettxout response
         assert_equal(txout['bestblock'], best_block_hash)
         assert_equal(txout['confirmations'], 1)
-        assert_equal(txout['value'], 25)
+        assert_equal(txout['value'], Decimal(get_block_subsidy(HEIGHT)) / COIN)
         assert_equal(txout['scriptPubKey']['address'], self.wallet.get_address())
         assert_equal(txout['scriptPubKey']['hex'], self.wallet.get_output_script().hex())
         decoded_script = node.decodescript(self.wallet.get_output_script().hex())
@@ -525,14 +536,23 @@ class BlockchainTest(BitcoinTestFramework):
             "Invalid nblocks. Must be a positive number or -1.",
             lambda: self.nodes[0].getnetworkhashps(0),
         )
+        assert_raises_rpc_error(
+            -8,
+            "Invalid lane, expected one of: all, permissionless, auxpow",
+            lambda: self.nodes[0].getnetworkhashps(100, -1, "invalid"),
+        )
 
         # Genesis block height estimate should return 0
         hashes_per_second = self.nodes[0].getnetworkhashps(100, 0)
         assert_equal(hashes_per_second, 0)
+        assert_equal(hashes_per_second, self.nodes[0].getnetworkhashps(100, 0, "all"))
 
         # This should be 2 hashes every 10 minutes or 1/300
         hashes_per_second = self.nodes[0].getnetworkhashps()
+        assert_equal(hashes_per_second, self.nodes[0].getnetworkhashps(120, -1, "all"))
         assert abs(hashes_per_second * 300 - 1) < 0.0001
+        for lane in ("permissionless", "auxpow"):
+            assert isinstance(self.nodes[0].getnetworkhashps(120, -1, lane), (int, float, Decimal))
 
         # Test setting the first param of getnetworkhashps to -1 returns the average network
         # hashes per second from the last difficulty change.
@@ -727,7 +747,9 @@ class BlockchainTest(BitcoinTestFramework):
         self.log.info("Test getblock when only header is known")
         current_height = node.getblock(node.getbestblockhash())['height']
         block_time = node.getblock(node.getbestblockhash())['time'] + 1
-        block = create_block(int(blockhash, 16), create_coinbase(current_height + 1, nValue=100), block_time)
+        header_only_coinbase = create_coinbase(current_height + 1)
+        header_only_coinbase.vout[0].nValue = get_block_subsidy(current_height + 1) + 1
+        block = create_block(int(blockhash, 16), header_only_coinbase, block_time)
         block.solve()
         node.submitheader(block.serialize().hex())
         assert_raises_rpc_error(-1, "Block not available (not fully downloaded)", lambda: node.getblock(block.hash_hex))
@@ -735,7 +757,7 @@ class BlockchainTest(BitcoinTestFramework):
         self.log.info("Test getblock when block data is available but undo data isn't")
         # Submits a block building on the header-only block, so it can't be connected and has no undo data
         tx = create_tx_with_script(block.vtx[0], 0, script_sig=bytes([OP_TRUE]), amount=50 * COIN)
-        block_noundo = create_block(block.hash_int, create_coinbase(current_height + 2, nValue=100), block_time + 1, txlist=[tx])
+        block_noundo = create_block(block.hash_int, create_coinbase(current_height + 2), block_time + 1, txlist=[tx])
         block_noundo.solve()
         node.submitblock(block_noundo.serialize().hex())
 

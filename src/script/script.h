@@ -3,8 +3,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_SCRIPT_SCRIPT_H
-#define BITCOIN_SCRIPT_SCRIPT_H
+#ifndef QBIT_SCRIPT_SCRIPT_H
+#define QBIT_SCRIPT_SCRIPT_H
 
 #include <attributes.h>
 #include <crypto/common.h>
@@ -42,6 +42,14 @@ static const int MAX_SCRIPT_SIZE = 10000;
 // Maximum number of values on script interpreter stack
 static const int MAX_STACK_SIZE = 1000;
 
+// Cap for each initial P2MR v1 (leaf version 0xc0) witness stack item.
+static constexpr unsigned int MAX_P2MR_V1_STACK_ITEM_SIZE{16 * 1024};
+// Cap for the aggregate initial P2MR v1 witness argument stack, after annex,
+// script, and control block handling.
+static constexpr unsigned int MAX_P2MR_V1_TOTAL_INITIAL_STACK_BYTES{128 * 1024};
+// Reserved cap for future P2MR v1 data-manipulation opcodes such as OP_CAT.
+static constexpr unsigned int MAX_P2MR_V1_CAT_RESULT_SIZE{16 * 1024};
+
 // Threshold for nLockTime: below this value it is interpreted as block number,
 // otherwise as UNIX timestamp.
 static const unsigned int LOCKTIME_THRESHOLD = 500000000; // Tue Nov  5 00:53:20 1985 UTC
@@ -60,8 +68,102 @@ static constexpr unsigned int ANNEX_TAG = 0x50;
 // Validation weight per passing signature (Tapscript only, see BIP 342).
 static constexpr int64_t VALIDATION_WEIGHT_PER_SIGOP_PASSED{50};
 
-// How much weight budget is added to the witness size (Tapscript only, see BIP 342).
+// Validation weight per passing PQC signature (P2MR only, see BIP-360).
+// Derived from PQC_SIG_SIZE (3680) + VALIDATION_WEIGHT_OFFSET (50).
+// Keep this <= the minimal single-leaf P2MR witness budget so one valid sigop can succeed.
+static constexpr int64_t VALIDATION_WEIGHT_PER_SIGOP_PQC{3730};
+
+// How much weight budget is added to the witness size (Tapscript/P2MR, see BIP 342).
 static constexpr int64_t VALIDATION_WEIGHT_OFFSET{50};
+
+// P2MR leaf versions use the masked Taproot-style model where bit 0 is reserved for the control byte.
+// Valid committed leaf versions are even bytes; control blocks set bit 0.
+static constexpr uint8_t P2MR_LEAF_VERSION_MASK{0xfe};
+static constexpr uint8_t P2MR_LEAF_VERSION_V1{0xc0};
+// Reserved ranges:
+//   0xc2-0xde: production P2MR script versions
+//   0xe0-0xee: staged signature-system versions
+//   0xf0-0xfc: experimental or deployment-staging versions
+//   0xfe:      extension-envelope leaf version
+static constexpr uint8_t P2MR_LEAF_VERSION_PROD_FIRST{0xc2};
+static constexpr uint8_t P2MR_LEAF_VERSION_PROD_LAST{0xde};
+static constexpr uint8_t P2MR_LEAF_VERSION_STAGED_SIG_SYSTEM_FIRST{0xe0};
+static constexpr uint8_t P2MR_LEAF_VERSION_STAGED_SIG_SYSTEM_LAST{0xee};
+static constexpr uint8_t P2MR_LEAF_VERSION_EXPERIMENTAL_FIRST{0xf0};
+static constexpr uint8_t P2MR_LEAF_VERSION_EXPERIMENTAL_LAST{0xfc};
+static constexpr uint8_t P2MR_LEAF_VERSION_EXTENSION{0xfe};
+
+// Compatibility aliases for existing tests/docs naming specific reserved leaves.
+static constexpr uint8_t P2MR_LEAF_VERSION_RESERVED_1{P2MR_LEAF_VERSION_PROD_FIRST};
+static constexpr uint8_t P2MR_LEAF_VERSION_RESERVED_2{P2MR_LEAF_VERSION_PROD_FIRST + 2};
+static constexpr uint8_t P2MR_LEAF_VERSION_RESERVED_3{P2MR_LEAF_VERSION_PROD_FIRST + 4};
+constexpr bool IsValidP2MRLeafVersion(uint8_t leaf_version)
+{
+    return leaf_version == (leaf_version & P2MR_LEAF_VERSION_MASK);
+}
+constexpr bool IsP2MRV1LeafVersion(uint8_t leaf_version)
+{
+    return leaf_version == P2MR_LEAF_VERSION_V1;
+}
+constexpr bool IsProductionP2MRLeafVersion(uint8_t leaf_version)
+{
+    return IsValidP2MRLeafVersion(leaf_version) &&
+           leaf_version >= P2MR_LEAF_VERSION_PROD_FIRST &&
+           leaf_version <= P2MR_LEAF_VERSION_PROD_LAST;
+}
+constexpr bool IsStagedSignatureSystemP2MRLeafVersion(uint8_t leaf_version)
+{
+    return IsValidP2MRLeafVersion(leaf_version) &&
+           leaf_version >= P2MR_LEAF_VERSION_STAGED_SIG_SYSTEM_FIRST &&
+           leaf_version <= P2MR_LEAF_VERSION_STAGED_SIG_SYSTEM_LAST;
+}
+constexpr bool IsExperimentalP2MRLeafVersion(uint8_t leaf_version)
+{
+    return IsValidP2MRLeafVersion(leaf_version) &&
+           leaf_version >= P2MR_LEAF_VERSION_EXPERIMENTAL_FIRST &&
+           leaf_version <= P2MR_LEAF_VERSION_EXPERIMENTAL_LAST;
+}
+constexpr bool IsExtensionP2MRLeafVersion(uint8_t leaf_version)
+{
+    return leaf_version == P2MR_LEAF_VERSION_EXTENSION;
+}
+constexpr bool IsReservedP2MRLeafVersion(uint8_t leaf_version)
+{
+    return IsProductionP2MRLeafVersion(leaf_version) ||
+           IsStagedSignatureSystemP2MRLeafVersion(leaf_version) ||
+           IsExperimentalP2MRLeafVersion(leaf_version) ||
+           IsExtensionP2MRLeafVersion(leaf_version);
+}
+static_assert(IsValidP2MRLeafVersion(P2MR_LEAF_VERSION_V1));
+static_assert(IsValidP2MRLeafVersion(P2MR_LEAF_VERSION_RESERVED_1));
+static_assert(IsValidP2MRLeafVersion(P2MR_LEAF_VERSION_RESERVED_2));
+static_assert(IsValidP2MRLeafVersion(P2MR_LEAF_VERSION_RESERVED_3));
+static_assert(IsValidP2MRLeafVersion(P2MR_LEAF_VERSION_EXTENSION));
+static_assert(IsP2MRV1LeafVersion(P2MR_LEAF_VERSION_V1));
+static_assert(IsProductionP2MRLeafVersion(P2MR_LEAF_VERSION_PROD_FIRST));
+static_assert(IsProductionP2MRLeafVersion(P2MR_LEAF_VERSION_PROD_LAST));
+static_assert(IsStagedSignatureSystemP2MRLeafVersion(
+    P2MR_LEAF_VERSION_STAGED_SIG_SYSTEM_FIRST));
+static_assert(IsStagedSignatureSystemP2MRLeafVersion(
+    P2MR_LEAF_VERSION_STAGED_SIG_SYSTEM_LAST));
+static_assert(IsReservedP2MRLeafVersion(P2MR_LEAF_VERSION_RESERVED_1));
+static_assert(IsExperimentalP2MRLeafVersion(P2MR_LEAF_VERSION_EXPERIMENTAL_FIRST));
+static_assert(IsExperimentalP2MRLeafVersion(P2MR_LEAF_VERSION_EXPERIMENTAL_LAST));
+static_assert(IsExtensionP2MRLeafVersion(P2MR_LEAF_VERSION_EXTENSION));
+static_assert(IsReservedP2MRLeafVersion(P2MR_LEAF_VERSION_EXTENSION));
+static_assert(!IsReservedP2MRLeafVersion(P2MR_LEAF_VERSION_V1));
+static_assert(P2MR_LEAF_VERSION_V1 != P2MR_LEAF_VERSION_RESERVED_1);
+static_assert(P2MR_LEAF_VERSION_V1 != P2MR_LEAF_VERSION_RESERVED_2);
+static_assert(P2MR_LEAF_VERSION_V1 != P2MR_LEAF_VERSION_RESERVED_3);
+static_assert(P2MR_LEAF_VERSION_RESERVED_1 != P2MR_LEAF_VERSION_RESERVED_2);
+static_assert(P2MR_LEAF_VERSION_RESERVED_1 != P2MR_LEAF_VERSION_RESERVED_3);
+static_assert(P2MR_LEAF_VERSION_RESERVED_2 != P2MR_LEAF_VERSION_RESERVED_3);
+// Compatibility alias for v1-only callers intentionally left outside this narrow track.
+static constexpr uint8_t P2MR_LEAF_VERSION{P2MR_LEAF_VERSION_V1};
+constexpr bool IsReservedFutureWitnessVersion(int witness_version)
+{
+    return witness_version >= 3 && witness_version <= 16;
+}
 
 template <typename T>
 std::vector<unsigned char> ToByteVector(const T& in)
@@ -198,7 +300,7 @@ enum opcodetype
     OP_NOP2 = OP_CHECKLOCKTIMEVERIFY,
     OP_CHECKSEQUENCEVERIFY = 0xb2,
     OP_NOP3 = OP_CHECKSEQUENCEVERIFY,
-    OP_NOP4 = 0xb3,
+    OP_CHECKSIGPQC = 0xb3, // P2MR-only post-quantum signature verification (bounded SPHINCS+); see BIP-360
     OP_NOP5 = 0xb4,
     OP_NOP6 = 0xb5,
     OP_NOP7 = 0xb6,
@@ -208,6 +310,12 @@ enum opcodetype
 
     // Opcode added by BIP 342 (Tapscript)
     OP_CHECKSIGADD = 0xba,
+
+    // P2MR-only OP_CHECKTEMPLATEVERIFY. Uses an OP_SUCCESS byte because 0xb3 is OP_CHECKSIGPQC in qbit.
+    OP_CHECKTEMPLATEVERIFY = 0xbb,
+    // qbit P2MR data-signature opcodes
+    OP_CHECKDATASIGPQC = 0xbc,
+    OP_CHECKDATASIGADDPQC = 0xbd,
 
     OP_INVALIDOPCODE = 0xff,
 };
@@ -581,6 +689,14 @@ public:
     }
 };
 
+inline bool IsReservedFutureWitnessOutput(const CScript& script_pub_key)
+{
+    int witness_version;
+    std::vector<unsigned char> witness_program;
+    return script_pub_key.IsWitnessProgram(witness_version, witness_program) &&
+           IsReservedFutureWitnessVersion(witness_version);
+}
+
 struct CScriptWitness
 {
     // Note that this encodes the data elements being pushed, rather than
@@ -636,4 +752,4 @@ CScript BuildScript(Ts&&... inputs)
     return ret;
 }
 
-#endif // BITCOIN_SCRIPT_SCRIPT_H
+#endif // QBIT_SCRIPT_SCRIPT_H

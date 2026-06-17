@@ -266,7 +266,7 @@ void CreateWalletActivity::createWallet()
         flags |= WALLET_FLAG_EXTERNAL_SIGNER;
     }
 
-    QTimer::singleShot(500ms, worker(), [this, name, flags] {
+    QTimer::singleShot(0ms, worker(), [this, name, flags] {
         auto wallet{node().walletLoader().createWallet(name, m_passphrase, flags, m_warning_message)};
 
         if (wallet) {
@@ -275,7 +275,7 @@ void CreateWalletActivity::createWallet()
             m_error_message = util::ErrorString(wallet);
         }
 
-        QTimer::singleShot(500ms, this, &CreateWalletActivity::finish);
+        QTimer::singleShot(0ms, this, &CreateWalletActivity::finish);
     });
 }
 

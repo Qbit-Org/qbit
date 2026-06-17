@@ -3,8 +3,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_UTIL_FS_HELPERS_H
-#define BITCOIN_UTIL_FS_HELPERS_H
+#ifndef QBIT_UTIL_FS_HELPERS_H
+#define QBIT_UTIL_FS_HELPERS_H
 
 #include <util/fs.h>
 
@@ -41,7 +41,7 @@ bool FileCommit(FILE* file);
  * Sync directory contents. This is required on some environments to ensure that
  * newly created files are committed to disk.
  */
-void DirectoryCommit(const fs::path& dirname);
+bool DirectoryCommit(const fs::path& dirname);
 
 bool TruncateFile(FILE* file, unsigned int length);
 int RaiseFileDescriptorLimit(int nMinFD);
@@ -97,4 +97,4 @@ std::optional<fs::perms> InterpretPermString(const std::string& s);
 fs::path GetSpecialFolderPath(int nFolder, bool fCreate = true);
 #endif
 
-#endif // BITCOIN_UTIL_FS_HELPERS_H
+#endif // QBIT_UTIL_FS_HELPERS_H

@@ -32,10 +32,10 @@ from test_framework.segwit_addr import (
 )
 
 
-ADDRESS_BCRT1_UNSPENDABLE = 'bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq3xueyj'
-ADDRESS_BCRT1_UNSPENDABLE_DESCRIPTOR = 'addr(bcrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq3xueyj)#juyq9d97'
+ADDRESS_BCRT1_UNSPENDABLE = 'qbrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqvgjy92'
+ADDRESS_BCRT1_UNSPENDABLE_DESCRIPTOR = 'addr(qbrt1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqvgjy92)#sgnylhne'
 # Coins sent to this address can be spent with a witness stack of just OP_TRUE
-ADDRESS_BCRT1_P2WSH_OP_TRUE = 'bcrt1qft5p2uhsdcdc3l2ua4ap5qqfg4pjaqlp250x7us7a8qqhrxrxfsqseac85'
+ADDRESS_BCRT1_P2WSH_OP_TRUE = 'qbrt1qft5p2uhsdcdc3l2ua4ap5qqfg4pjaqlp250x7us7a8qqhrxrxfsqdhn9xv'
 
 
 class AddressType(enum.Enum):
@@ -59,7 +59,7 @@ def create_deterministic_address_bcrt1_p2tr_op_true(explicit_internal_key=None):
     taproot_info = taproot_construct(internal_key, [("only-path", CScript([OP_TRUE]))])
     address = output_key_to_p2tr(taproot_info.output_pubkey)
     if explicit_internal_key is None:
-        assert_equal(address, 'bcrt1p9yfmy5h72durp7zrhlw9lf7jpwjgvwdg0jr0lqmmjtgg83266lqsekaqka')
+        assert_equal(address, 'qbrt1p9yfmy5h72durp7zrhlw9lf7jpwjgvwdg0jr0lqmmjtgg83266lqsycnah9')
     return (address, taproot_info)
 
 
@@ -109,12 +109,12 @@ def base58_to_byte(s):
 
 def keyhash_to_p2pkh(hash, main=False):
     assert len(hash) == 20
-    version = 0 if main else 111
+    version = 58 if main else 120
     return byte_to_base58(hash, version)
 
 def scripthash_to_p2sh(hash, main=False):
     assert len(hash) == 20
-    version = 5 if main else 196
+    version = 63 if main else 125
     return byte_to_base58(hash, version)
 
 def key_to_p2pkh(key, main=False):
@@ -136,7 +136,7 @@ def program_to_witness(version, program, main=False):
     assert 0 <= version <= 16
     assert 2 <= len(program) <= 40
     assert version > 0 or len(program) in [20, 32]
-    return encode_segwit_address("bc" if main else "bcrt", version, program)
+    return encode_segwit_address("qb" if main else "qbrt", version, program)
 
 def script_to_p2wsh(script, main=False):
     script = check_script(script)
@@ -175,7 +175,7 @@ def check_script(script):
 
 def bech32_to_bytes(address):
     hrp = address.split('1')[0]
-    if hrp not in ['bc', 'tb', 'bcrt']:
+    if hrp not in ['qb', 'tq', 'qbrt']:
         return (None, None)
     version, payload = decode_segwit_address(hrp, address)
     if version is None:
@@ -189,9 +189,9 @@ def address_to_scriptpubkey(address):
     if version is not None:
         return program_to_witness_script(version, payload) # testnet segwit scriptpubkey
     payload, version = base58_to_byte(address)
-    if version == 111:  # testnet pubkey hash
+    if version == 120:  # testnet pubkey hash
         return keyhash_to_p2pkh_script(payload)
-    elif version == 196:  # testnet script hash
+    elif version == 125:  # testnet script hash
         return scripthash_to_p2sh_script(payload)
     # TODO: also support other address formats
     else:
@@ -203,23 +203,23 @@ class TestFrameworkScript(unittest.TestCase):
         def check_base58(data, version):
             self.assertEqual(base58_to_byte(byte_to_base58(data, version)), (data, version))
 
-        check_base58(bytes.fromhex('1f8ea1702a7bd4941bca0941b852c4bbfedb2e05'), 111)
-        check_base58(bytes.fromhex('3a0b05f4d7f66c3ba7009f453530296c845cc9cf'), 111)
-        check_base58(bytes.fromhex('41c1eaf111802559bad61b60d62b1f897c63928a'), 111)
-        check_base58(bytes.fromhex('0041c1eaf111802559bad61b60d62b1f897c63928a'), 111)
-        check_base58(bytes.fromhex('000041c1eaf111802559bad61b60d62b1f897c63928a'), 111)
-        check_base58(bytes.fromhex('00000041c1eaf111802559bad61b60d62b1f897c63928a'), 111)
-        check_base58(bytes.fromhex('1f8ea1702a7bd4941bca0941b852c4bbfedb2e05'), 0)
-        check_base58(bytes.fromhex('3a0b05f4d7f66c3ba7009f453530296c845cc9cf'), 0)
-        check_base58(bytes.fromhex('41c1eaf111802559bad61b60d62b1f897c63928a'), 0)
-        check_base58(bytes.fromhex('0041c1eaf111802559bad61b60d62b1f897c63928a'), 0)
-        check_base58(bytes.fromhex('000041c1eaf111802559bad61b60d62b1f897c63928a'), 0)
-        check_base58(bytes.fromhex('00000041c1eaf111802559bad61b60d62b1f897c63928a'), 0)
+        check_base58(bytes.fromhex('1f8ea1702a7bd4941bca0941b852c4bbfedb2e05'), 120)
+        check_base58(bytes.fromhex('3a0b05f4d7f66c3ba7009f453530296c845cc9cf'), 120)
+        check_base58(bytes.fromhex('41c1eaf111802559bad61b60d62b1f897c63928a'), 120)
+        check_base58(bytes.fromhex('0041c1eaf111802559bad61b60d62b1f897c63928a'), 120)
+        check_base58(bytes.fromhex('000041c1eaf111802559bad61b60d62b1f897c63928a'), 120)
+        check_base58(bytes.fromhex('00000041c1eaf111802559bad61b60d62b1f897c63928a'), 120)
+        check_base58(bytes.fromhex('1f8ea1702a7bd4941bca0941b852c4bbfedb2e05'), 58)
+        check_base58(bytes.fromhex('3a0b05f4d7f66c3ba7009f453530296c845cc9cf'), 58)
+        check_base58(bytes.fromhex('41c1eaf111802559bad61b60d62b1f897c63928a'), 58)
+        check_base58(bytes.fromhex('0041c1eaf111802559bad61b60d62b1f897c63928a'), 58)
+        check_base58(bytes.fromhex('000041c1eaf111802559bad61b60d62b1f897c63928a'), 58)
+        check_base58(bytes.fromhex('00000041c1eaf111802559bad61b60d62b1f897c63928a'), 58)
 
 
     def test_bech32_decode(self):
         def check_bech32_decode(payload, version):
-            hrp = "tb"
+            hrp = "tq"
             self.assertEqual(bech32_to_bytes(encode_segwit_address(hrp, version, payload)), (version, payload))
 
         check_bech32_decode(bytes.fromhex('36e3e2a33f328de12e4b43c515a75fba2632ecc3'), 0)

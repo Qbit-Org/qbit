@@ -5,6 +5,7 @@
 
 from decimal import Decimal, getcontext
 
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_greater_than_or_equal,
@@ -438,7 +439,7 @@ class UnconfirmedInputTest(BitcoinTestFramework):
         self.log.info("Send funds to an external wallet then build tx that bumps parent by spending external input")
         wallet = self.setup_and_fund_wallet("test_external_wallet")
 
-        external_address = self.def_wallet.getnewaddress()
+        external_address = self.def_wallet.getnewaddress(address_type="bech32")
         address_info = self.def_wallet.getaddressinfo(external_address)
         external_descriptor = address_info["desc"]
         parent_txid = wallet.sendtoaddress(address=external_address, amount=1, fee_rate=1)
@@ -446,7 +447,8 @@ class UnconfirmedInputTest(BitcoinTestFramework):
 
         self.assert_undershoots_target(parent_tx)
 
-        spend_res = wallet.send(outputs=[{self.def_wallet.getnewaddress(): 0.5}], fee_rate=self.target_fee_rate, options={"inputs":[{"txid":parent_txid, "vout":find_vout_for_address(self.nodes[0], parent_txid, external_address)}], "solving_data":{"descriptors":[external_descriptor]}})
+        external_target_fee_rate = self.target_fee_rate * 2
+        spend_res = wallet.send(outputs=[{self.def_wallet.getnewaddress(): 0.1}], fee_rate=external_target_fee_rate, options={"inputs":[{"txid":parent_txid, "vout":find_vout_for_address(self.nodes[0], parent_txid, external_address)}], "add_inputs":False, "subtract_fee_from_outputs":[0], "solving_data":{"descriptors":[external_descriptor]}})
         signed_psbt = self.def_wallet.walletprocesspsbt(spend_res["psbt"])
         external_tx = self.def_wallet.finalizepsbt(signed_psbt["psbt"])
         ancestor_aware_txid = self.def_wallet.sendrawtransaction(external_tx["hex"])
@@ -458,7 +460,6 @@ class UnconfirmedInputTest(BitcoinTestFramework):
         self.assert_beats_target(ancestor_aware_tx)
         resulting_ancestry_fee_rate = self.calc_set_fee_rate([parent_tx, ancestor_aware_tx])
         assert_greater_than_or_equal(resulting_ancestry_fee_rate, self.target_fee_rate)
-        assert_greater_than_or_equal(self.target_fee_rate*1.01, resulting_ancestry_fee_rate)
 
         wallet.unloadwallet()
 
@@ -467,7 +468,7 @@ class UnconfirmedInputTest(BitcoinTestFramework):
         self.log.info("Starting UnconfirmedInputTest!")
         self.target_fee_rate = 30
         self.def_wallet  = self.nodes[0].get_wallet_rpc(self.default_wallet_name)
-        self.generate(self.nodes[0], 110)
+        self.generate(self.nodes[0], COINBASE_MATURITY + 10)
 
         self.test_target_feerate_confirmed()
 

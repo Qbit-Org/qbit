@@ -92,12 +92,26 @@ BASE_SCRIPTS = [
     # vv Tests less than 5m vv
     'feature_fee_estimation.py',
     'feature_taproot.py',
+    'feature_ctv.py',
+    'feature_p2mr.py',
+    'feature_p2mr_reorg.py',
+    'feature_wallet_seed_recovery.py',
+    'feature_auxpow.py',
+    'feature_cadence.py',
+    'feature_cadence_activation.py',
+    'feature_integration_cadence.py',
+    'feature_p2mr_activation.py',
+    'feature_outer_witness_activation.py',
     'feature_block.py',
     'mempool_ephemeral_dust.py',
     'wallet_conflicts.py',
     'p2p_opportunistic_1p1c.py',
     'p2p_node_network_limited.py --v1transport',
     'p2p_node_network_limited.py --v2transport',
+    'feature_witness_pruning.py',
+    'feature_archive_witness_recovery.py',
+    'feature_integration_archive_pruned.py',
+    'feature_integration_wallet_history.py',
     # vv Tests less than 2m vv
     'mining_getblocktemplate_longpoll.py',
     'p2p_segwit.py',
@@ -122,6 +136,7 @@ BASE_SCRIPTS = [
     'feature_maxtipage.py',
     'wallet_multiwallet.py',
     'wallet_multiwallet.py --usecli',
+    'feature_archive_peer_selection.py',
     'p2p_dns_seeds.py',
     'wallet_groups.py',
     'p2p_blockfilters.py',
@@ -147,6 +162,7 @@ BASE_SCRIPTS = [
     'rpc_signer.py',
     'wallet_signer.py',
     'mempool_limit.py',
+    'feature_mempool_sim.py --ci-smoke',
     'rpc_txoutproof.py',
     'rpc_orphans.py',
     'wallet_listreceivedby.py',
@@ -166,6 +182,11 @@ BASE_SCRIPTS = [
     'interface_zmq.py',
     'rpc_invalid_address_message.py',
     'rpc_validateaddress.py',
+    'wallet_p2mr.py',
+    'wallet_pubkeydb_pool.py',
+    'wallet_pqc_usage.py',
+    'wallet_p2mr_psbt.py',
+    'wallet_p2mr_multisig_restart.py',
     'interface_bitcoin_cli.py',
     'feature_bind_extra.py',
     'mempool_resurrect.py',
@@ -176,6 +197,11 @@ BASE_SCRIPTS = [
     'tool_signet_miner.py',
     'wallet_txn_clone.py',
     'wallet_txn_clone.py --segwit',
+    'feature_orphan_metrics.py',
+    'feature_network_sim.py --ci-smoke',
+    'feature_photon_relay.py',
+    'feature_integration_photon_topology.py',
+    'feature_confirmation_target.py',
     'rpc_getchaintips.py',
     'rpc_misc.py',
     'p2p_1p1c_network.py',
@@ -212,7 +238,9 @@ BASE_SCRIPTS = [
     'rpc_decodescript.py',
     'rpc_blockchain.py --v1transport',
     'rpc_blockchain.py --v2transport',
+    'mining_asert_timestamp_edges.py',
     'mining_template_verification.py',
+    'mining_version_field.py',
     'rpc_deprecated.py',
     'wallet_disable.py',
     'wallet_change_address.py',
@@ -220,6 +248,7 @@ BASE_SCRIPTS = [
     'p2p_getaddr_caching.py',
     'p2p_getdata.py',
     'p2p_addrfetch.py',
+    'p2p_block_notfound.py',
     'rpc_net.py --v1transport',
     'rpc_net.py --v2transport',
     'wallet_keypool.py',
@@ -240,6 +269,7 @@ BASE_SCRIPTS = [
     'p2p_v2_encrypted.py',
     'p2p_v2_misbehaving.py',
     'example_test.py',
+    'feature_minchainwork_requested_block.py',
     'mempool_truc.py',
     'wallet_multisig_descriptor_psbt.py',
     'wallet_miniscript_decaying_multisig_descriptor_psbt.py',
@@ -265,6 +295,7 @@ BASE_SCRIPTS = [
     'p2p_leak_tx.py --v2transport',
     'p2p_eviction.py',
     'p2p_outbound_eviction.py',
+    'p2p_ibd_validated_block_timeout.py',
     'p2p_ibd_stalling.py --v1transport',
     'p2p_ibd_stalling.py --v2transport',
     'p2p_net_deadlock.py --v1transport',
@@ -379,7 +410,11 @@ ALL_SCRIPTS = EXTENDED_SCRIPTS + BASE_SCRIPTS
 NON_SCRIPTS = [
     # These are python files that live in the functional tests directory, but are not test scripts.
     "combine_logs.py",
+    "feature_ibd_perf_network.py",
+    "feature_ibd_perf_validation.py",
     "create_cache.py",
+    "feature_ibd_perf_replay.py",
+    "feature_rpc_perf.py",
     "test_runner.py",
 ]
 
@@ -394,6 +429,7 @@ def main():
     parser.add_argument('--ansi', action='store_true', default=sys.stdout.isatty(), help="Use ANSI colors and dots in output (enabled by default when standard output is a TTY)")
     parser.add_argument('--combinedlogslen', '-c', type=int, default=0, metavar='n', help='On failure, print a log (of length n lines) to the console, combined from the test framework and all test nodes.')
     parser.add_argument('--coverage', action='store_true', help='generate a basic coverage report for the RPC interface')
+    parser.add_argument('--coverage-exclude', default='', help='comma-separated RPC commands to exclude from the coverage report')
     parser.add_argument('--ci', action='store_true', help='Run checks and code that are usually only enabled in a continuous integration environment')
     parser.add_argument('--exclude', '-x', help='specify a comma-separated-list of scripts to exclude.')
     parser.add_argument('--extended', action='store_true', help='run the extended test suite in addition to the basic tests')
@@ -540,6 +576,7 @@ def main():
         tmpdir=tmpdir,
         jobs=args.jobs,
         enable_coverage=args.coverage,
+        coverage_exclude=args.coverage_exclude,
         args=passon_args,
         combined_logs_len=args.combinedlogslen,
         failfast=args.failfast,
@@ -547,7 +584,7 @@ def main():
         results_filepath=results_filepath,
     )
 
-def run_tests(*, test_list, build_dir, tmpdir, jobs=1, enable_coverage=False, args=None, combined_logs_len=0, failfast=False, use_term_control, results_filepath=None):
+def run_tests(*, test_list, build_dir, tmpdir, jobs=1, enable_coverage=False, coverage_exclude='', args=None, combined_logs_len=0, failfast=False, use_term_control, results_filepath=None):
     args = args or []
 
     # Warn if bitcoind is already running
@@ -578,7 +615,7 @@ def run_tests(*, test_list, build_dir, tmpdir, jobs=1, enable_coverage=False, ar
     flags = ['--cachedir={}'.format(cache_dir)] + args
 
     if enable_coverage:
-        coverage = RPCCoverage()
+        coverage = RPCCoverage(coverage_exclude)
         flags.append(coverage.flag)
         logging.debug("Initializing coverage directory at %s" % coverage.dir)
     else:
@@ -619,6 +656,7 @@ def run_tests(*, test_list, build_dir, tmpdir, jobs=1, enable_coverage=False, ar
                 logging.debug(f"{done_str} skipped ({skip_reason})")
             else:
                 all_passed = False
+                combined_logs = ""
                 print("%s failed, Duration: %s s\n" % (done_str, test_result.time))
                 print(BOLD[1] + 'stdout:\n' + BOLD[0] + stdout + '\n')
                 print(BOLD[1] + 'stderr:\n' + BOLD[0] + stderr + '\n')
@@ -638,7 +676,13 @@ def run_tests(*, test_list, build_dir, tmpdir, jobs=1, enable_coverage=False, ar
                     logging.debug("Early exiting after test failure")
                     break
 
-                if "[Errno 28] No space left on device" in stdout:
+                failure_output = "\n".join((stdout, stderr, combined_logs))
+                if any(msg in failure_output for msg in (
+                    "[Errno 28] No space left on device",
+                    "No space left on device",
+                    "Disk space is too low",
+                    "Disk space is low for",
+                )):
                     sys.exit(f"Early exiting after test failure due to insufficient free space in {tmpdir}\n"
                              f"Test execution data left in {tmpdir}.\n"
                              f"Additional storage is needed to execute testing.")
@@ -855,9 +899,10 @@ class RPCCoverage():
     See also: test/functional/test_framework/coverage.py
 
     """
-    def __init__(self):
+    def __init__(self, exclude=''):
         self.dir = tempfile.mkdtemp(prefix="coverage")
         self.flag = '--coveragedir=%s' % self.dir
+        self.exclude = set(filter(None, (command.strip() for command in exclude.split(','))))
 
     def report_rpc_coverage(self):
         """
@@ -908,7 +953,7 @@ class RPCCoverage():
             with open(filename, 'r', encoding="utf8") as coverage_file:
                 covered_cmds.update([line.strip() for line in coverage_file.readlines()])
 
-        return all_cmds - covered_cmds
+        return all_cmds - covered_cmds - self.exclude
 
 
 if __name__ == '__main__':

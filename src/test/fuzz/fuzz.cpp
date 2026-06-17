@@ -81,6 +81,24 @@ void FuzzFrameworkRegisterTarget(std::string_view name, TypeTestOneInput target,
 
 static std::string_view g_fuzz_target;
 static const TypeTestOneInput* g_test_one_input{nullptr};
+static bool g_disable_leak_detection{false};
+
+#if defined(__has_feature)
+#    if __has_feature(address_sanitizer)
+#        define ENABLE_FUZZ_LSAN_CONTROL 1
+#    endif
+#endif
+#if defined(__SANITIZE_ADDRESS__)
+#    define ENABLE_FUZZ_LSAN_CONTROL 1
+#endif
+
+#if defined(ENABLE_FUZZ_LSAN_CONTROL)
+extern "C" int __lsan_is_turned_off()
+{
+    return g_disable_leak_detection ? 1 : 0;
+}
+#    undef ENABLE_FUZZ_LSAN_CONTROL
+#endif
 
 static void test_one_input(FuzzBufferType buffer)
 {
@@ -164,6 +182,7 @@ static void initialize()
     }
     Assert(!g_test_one_input);
     g_test_one_input = &it->second.test_one_input;
+    g_disable_leak_detection = it->second.opts.disable_leak_detection;
     it->second.opts.init();
 
     ResetCoverageCounters();

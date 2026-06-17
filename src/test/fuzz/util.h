@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_TEST_FUZZ_UTIL_H
-#define BITCOIN_TEST_FUZZ_UTIL_H
+#ifndef QBIT_TEST_FUZZ_UTIL_H
+#define QBIT_TEST_FUZZ_UTIL_H
 
 #include <addresstype.h>
 #include <arith_uint256.h>
@@ -25,6 +25,7 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <exception>
 #include <optional>
 #include <string>
 #include <vector>
@@ -102,31 +103,31 @@ template <typename P>
 [[nodiscard]] P ConsumeDeserializationParams(FuzzedDataProvider& fuzzed_data_provider) noexcept;
 
 template <typename T, typename P>
-[[nodiscard]] std::optional<T> ConsumeDeserializable(FuzzedDataProvider& fuzzed_data_provider, const P& params, const std::optional<size_t>& max_length = std::nullopt) noexcept
+[[nodiscard]] std::optional<T> ConsumeDeserializable(FuzzedDataProvider& fuzzed_data_provider, const P& params, const std::optional<size_t>& max_length = std::nullopt)
 {
-    const std::vector<uint8_t> buffer{ConsumeRandomLengthByteVector(fuzzed_data_provider, max_length)};
-    DataStream ds{buffer};
-    T obj;
     try {
+        const std::vector<uint8_t> buffer{ConsumeRandomLengthByteVector(fuzzed_data_provider, max_length)};
+        DataStream ds{buffer};
+        T obj;
         ds >> params(obj);
-    } catch (const std::ios_base::failure&) {
+        return obj;
+    } catch (const std::exception&) {
         return std::nullopt;
     }
-    return obj;
 }
 
 template <typename T>
-[[nodiscard]] inline std::optional<T> ConsumeDeserializable(FuzzedDataProvider& fuzzed_data_provider, const std::optional<size_t>& max_length = std::nullopt) noexcept
+[[nodiscard]] inline std::optional<T> ConsumeDeserializable(FuzzedDataProvider& fuzzed_data_provider, const std::optional<size_t>& max_length = std::nullopt)
 {
-    const std::vector<uint8_t> buffer = ConsumeRandomLengthByteVector(fuzzed_data_provider, max_length);
-    DataStream ds{buffer};
-    T obj;
     try {
+        const std::vector<uint8_t> buffer = ConsumeRandomLengthByteVector(fuzzed_data_provider, max_length);
+        DataStream ds{buffer};
+        T obj;
         ds >> obj;
-    } catch (const std::ios_base::failure&) {
+        return obj;
+    } catch (const std::exception&) {
         return std::nullopt;
     }
-    return obj;
 }
 
 template <typename WeakEnumType, size_t size>
@@ -340,4 +341,4 @@ void ReadFromStream(FuzzedDataProvider& fuzzed_data_provider, Stream& stream) no
     }
 }
 
-#endif // BITCOIN_TEST_FUZZ_UTIL_H
+#endif // QBIT_TEST_FUZZ_UTIL_H

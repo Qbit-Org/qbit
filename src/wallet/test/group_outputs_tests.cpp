@@ -22,7 +22,8 @@ static std::shared_ptr<CWallet> NewWallet(const node::NodeContext& m_node)
     wallet->LoadWallet();
     LOCK(wallet->cs_wallet);
     wallet->SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
-    wallet->SetupDescriptorScriptPubKeyMans();
+    constexpr auto GROUP_OUTPUT_TYPES = std::array{OutputType::BECH32};
+    wallet->SetupDescriptorScriptPubKeyMans(GROUP_OUTPUT_TYPES);
     return wallet;
 }
 

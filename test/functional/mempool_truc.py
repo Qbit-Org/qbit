@@ -13,6 +13,7 @@ from test_framework.util import (
     assert_raises_rpc_error,
     get_fee,
 )
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.wallet import (
     COIN,
     DEFAULT_FEE,
@@ -20,8 +21,8 @@ from test_framework.wallet import (
 )
 
 MAX_REPLACEMENT_CANDIDATES = 100
-TRUC_MAX_VSIZE = 10000
-TRUC_CHILD_MAX_VSIZE = 1000
+TRUC_MAX_VSIZE = 50000
+TRUC_CHILD_MAX_VSIZE = 45500
 
 def cleanup(extra_args=None):
     def decorator(func):
@@ -67,7 +68,7 @@ class MempoolTRUC(BitcoinTestFramework):
     @cleanup()
     def test_truc_acceptance(self):
         node = self.nodes[0]
-        self.log.info("Test a child of a TRUC transaction cannot be more than 1000vB")
+        self.log.info(f"Test a child of a TRUC transaction cannot be more than {TRUC_CHILD_MAX_VSIZE}vB")
         tx_v3_parent_normal = self.wallet.send_self_transfer(from_node=node, version=3)
         self.check_mempool([tx_v3_parent_normal["txid"]])
         tx_v3_child_heavy = self.wallet.create_self_transfer(
@@ -95,7 +96,7 @@ class MempoolTRUC(BitcoinTestFramework):
         assert_equal(node.getmempoolentry(tx_v3_parent_normal["txid"])["descendantcount"], 2)
         tx_v3_child_almost_heavy_rbf = self.wallet.send_self_transfer(
             from_node=node,
-            fee_rate=DEFAULT_FEE * 2,
+            fee_rate=DEFAULT_FEE * 60,
             utxo_to_spend=tx_v3_parent_normal["new_utxo"],
             target_vsize=875,
             version=3
@@ -187,7 +188,7 @@ class MempoolTRUC(BitcoinTestFramework):
         self.check_mempool([])
         tx_v2_from_v3 = self.wallet.send_self_transfer(from_node=node, utxo_to_spend=tx_v3_block["new_utxo"], version=2)
         tx_v3_from_v2 = self.wallet.send_self_transfer(from_node=node, utxo_to_spend=tx_v2_block["new_utxo"], version=3)
-        tx_v3_child_large = self.wallet.send_self_transfer(from_node=node, utxo_to_spend=tx_v3_block2["new_utxo"], target_vsize=1250, version=3)
+        tx_v3_child_large = self.wallet.send_self_transfer(from_node=node, utxo_to_spend=tx_v3_block2["new_utxo"], target_vsize=TRUC_CHILD_MAX_VSIZE + 250, version=3)
         assert_greater_than(node.getmempoolentry(tx_v3_child_large["txid"])["vsize"], TRUC_CHILD_MAX_VSIZE)
         tx_chain_4 = self.wallet.send_self_transfer(from_node=node, utxo_to_spend=tx_chain_3["new_utxo"], version=2)
         self.check_mempool([tx_v2_from_v3["txid"], tx_v3_from_v2["txid"], tx_v3_child_large["txid"], tx_chain_4["txid"]])
@@ -283,7 +284,7 @@ class MempoolTRUC(BitcoinTestFramework):
         self.check_mempool([])
         result = node.submitpackage([tx_v3_parent_normal["hex"], tx_v3_child_heavy["hex"]])
         # tx_v3_child_heavy is heavy based on vsize, not sigops.
-        assert_equal(result['package_msg'], f"TRUC-violation, version=3 child tx {tx_v3_child_heavy['txid']} (wtxid={tx_v3_child_heavy['wtxid']}) is too big: {tx_v3_child_heavy['tx'].get_vsize()} > 1000 virtual bytes")
+        assert_equal(result['package_msg'], f"TRUC-violation, version=3 child tx {tx_v3_child_heavy['txid']} (wtxid={tx_v3_child_heavy['wtxid']}) is too big: {tx_v3_child_heavy['tx'].get_vsize()} > {TRUC_CHILD_MAX_VSIZE} virtual bytes")
         self.check_mempool([])
 
         tx_v3_parent = self.wallet.create_self_transfer(version=3)
@@ -663,7 +664,7 @@ class MempoolTRUC(BitcoinTestFramework):
         self.log.info("Generate blocks to create UTXOs")
         node = self.nodes[0]
         self.wallet = MiniWallet(node)
-        self.generate(self.wallet, 200)
+        self.generate(self.wallet, COINBASE_MATURITY + 100)
         self.test_truc_max_vsize()
         self.test_truc_acceptance()
         self.test_truc_replacement()

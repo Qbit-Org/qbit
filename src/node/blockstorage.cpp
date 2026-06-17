@@ -5,6 +5,7 @@
 #include <node/blockstorage.h>
 
 #include <arith_uint256.h>
+#include <auxpow.h>
 #include <chain.h>
 #include <consensus/params.h>
 #include <consensus/validation.h>
@@ -31,6 +32,7 @@
 #include <util/batchpriority.h>
 #include <util/check.h>
 #include <util/fs.h>
+#include <util/fs_helpers.h>
 #include <util/obfuscation.h>
 #include <util/signalinterrupt.h>
 #include <util/strencodings.h>
@@ -38,9 +40,12 @@
 #include <util/translation.h>
 #include <validation.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <map>
 #include <optional>
+#include <stdexcept>
+#include <string_view>
 #include <unordered_map>
 
 namespace kernel {
@@ -78,7 +83,11 @@ bool BlockTreeDB::ReadLastBlockFile(int& nFile)
     return Read(DB_LAST_BLOCK, nFile);
 }
 
-bool BlockTreeDB::WriteBatchSync(const std::vector<std::pair<int, const CBlockFileInfo*>>& fileInfo, int nLastFile, const std::vector<const CBlockIndex*>& blockinfo)
+bool BlockTreeDB::WriteBatchSync(
+    const std::vector<std::pair<int, const CBlockFileInfo*>>& fileInfo,
+    int nLastFile,
+    const std::vector<const CBlockIndex*>& blockinfo,
+    const std::vector<std::pair<std::string, bool>>& flags)
 {
     CDBBatch batch(*this);
     for (const auto& [file, info] : fileInfo) {
@@ -87,6 +96,9 @@ bool BlockTreeDB::WriteBatchSync(const std::vector<std::pair<int, const CBlockFi
     batch.Write(DB_LAST_BLOCK, nLastFile);
     for (const CBlockIndex* bi : blockinfo) {
         batch.Write(std::make_pair(DB_BLOCK_INDEX, bi->GetBlockHash()), CDiskBlockIndex{bi});
+    }
+    for (const auto& [name, value] : flags) {
+        batch.Write(std::make_pair(DB_FLAG, name), value ? uint8_t{'1'} : uint8_t{'0'});
     }
     return WriteBatch(batch, true);
 }
@@ -131,10 +143,24 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
                 pindexNew->nTime          = diskindex.nTime;
                 pindexNew->nBits          = diskindex.nBits;
                 pindexNew->nNonce         = diskindex.nNonce;
+                pindexNew->auxpow         = diskindex.auxpow;
                 pindexNew->nStatus        = diskindex.nStatus;
                 pindexNew->nTx            = diskindex.nTx;
+                pindexNew->nAuxPow        = diskindex.nAuxPow;
 
-                if (!CheckProofOfWork(pindexNew->GetBlockHash(), pindexNew->nBits, consensusParams)) {
+                const CBlockHeader header = pindexNew->GetBlockHeader();
+                if (header.SignalsAuxpow()) {
+                    // Older block index entries may not persist the auxpow payload yet.
+                    if (header.HasAuxpow()) {
+                        if (const auto error = auxpow::Validate(header, consensusParams)) {
+                            LogError("%s: AuxPoW validation failed: %s (%s)\n",
+                                     __func__,
+                                     error->reject_reason,
+                                     error->debug_message);
+                            return false;
+                        }
+                    }
+                } else if (!CheckProofOfWork(pindexNew->GetBlockHash(), pindexNew->nBits, consensusParams)) {
                     LogError("%s: CheckProofOfWork failed: %s\n", __func__, pindexNew->ToString());
                     return false;
                 }
@@ -227,6 +253,7 @@ CBlockIndex* BlockManager::AddToBlockIndex(const CBlockHeader& block, CBlockInde
         pindexNew->BuildSkip();
     }
     pindexNew->nTimeMax = (pindexNew->pprev ? std::max(pindexNew->pprev->nTimeMax, pindexNew->nTime) : pindexNew->nTime);
+    pindexNew->nAuxPow = (pindexNew->pprev ? pindexNew->pprev->nAuxPow : 0) + (pindexNew->SignalsAuxpow() ? 1 : 0);
     pindexNew->nChainWork = (pindexNew->pprev ? pindexNew->pprev->nChainWork : 0) + GetBlockProof(*pindexNew);
     pindexNew->RaiseValidity(BLOCK_VALID_TREE);
     if (best_header == nullptr || best_header->nChainWork < pindexNew->nChainWork) {
@@ -441,6 +468,7 @@ bool BlockManager::LoadBlockIndex(const std::optional<uint256>& snapshot_blockha
             return false;
         }
         previous_index = pindex;
+        pindex->nAuxPow = (pindex->pprev ? pindex->pprev->nAuxPow : 0) + (pindex->SignalsAuxpow() ? 1 : 0);
         pindex->nChainWork = (pindex->pprev ? pindex->pprev->nChainWork : 0) + GetBlockProof(*pindex);
         pindex->nTimeMax = (pindex->pprev ? std::max(pindex->pprev->nTimeMax, pindex->nTime) : pindex->nTime);
 
@@ -481,19 +509,27 @@ bool BlockManager::WriteBlockIndexDB()
     AssertLockHeld(::cs_main);
     std::vector<std::pair<int, const CBlockFileInfo*>> vFiles;
     vFiles.reserve(m_dirty_fileinfo.size());
-    for (std::set<int>::iterator it = m_dirty_fileinfo.begin(); it != m_dirty_fileinfo.end();) {
-        vFiles.emplace_back(*it, &m_blockfile_info[*it]);
-        m_dirty_fileinfo.erase(it++);
+    for (const int file_num : m_dirty_fileinfo) {
+        vFiles.emplace_back(file_num, &m_blockfile_info[file_num]);
     }
     std::vector<const CBlockIndex*> vBlocks;
     vBlocks.reserve(m_dirty_blockindex.size());
-    for (std::set<CBlockIndex*>::iterator it = m_dirty_blockindex.begin(); it != m_dirty_blockindex.end();) {
-        vBlocks.push_back(*it);
-        m_dirty_blockindex.erase(it++);
+    for (CBlockIndex* block_index : m_dirty_blockindex) {
+        vBlocks.push_back(block_index);
+    }
+    std::vector<std::pair<std::string, bool>> flags;
+    if (m_write_witness_pruned_flag) {
+        flags.emplace_back("witnessespruned", true);
     }
     int max_blockfile = WITH_LOCK(cs_LastBlockFile, return this->MaxBlockfileNum());
-    if (!m_block_tree_db->WriteBatchSync(vFiles, max_blockfile, vBlocks)) {
+    if (!m_block_tree_db->WriteBatchSync(vFiles, max_blockfile, vBlocks, flags)) {
         return false;
+    }
+    m_dirty_fileinfo.clear();
+    m_dirty_blockindex.clear();
+    if (m_write_witness_pruned_flag) {
+        m_have_witness_pruned = true;
+        m_write_witness_pruned_flag = false;
     }
     return true;
 }
@@ -521,6 +557,10 @@ bool BlockManager::LoadBlockIndexDB(const std::optional<uint256>& snapshot_block
             break;
         }
     }
+
+    // Pending witness compactions leave recoverable .wpruned temp files behind.
+    // Repair them before validating canonical blk file presence.
+    RecoverPendingWitnessCompactions();
 
     // Check presence of blk files
     LogInfo("Checking all blk files are present...");
@@ -550,6 +590,10 @@ bool BlockManager::LoadBlockIndexDB(const std::optional<uint256>& snapshot_block
     m_block_tree_db->ReadFlag("prunedblockfiles", m_have_pruned);
     if (m_have_pruned) {
         LogInfo("Loading block index db: Block files have previously been pruned");
+    }
+    m_block_tree_db->ReadFlag("witnessespruned", m_have_witness_pruned);
+    if (m_have_witness_pruned) {
+        LogInfo("Loading block index db: Block files have previously been witness-pruned");
     }
 
     // Check whether we need to continue reindexing
@@ -582,6 +626,593 @@ bool BlockManager::IsBlockPruned(const CBlockIndex& block) const
 {
     AssertLockHeld(::cs_main);
     return m_have_pruned && !(block.nStatus & BLOCK_HAVE_DATA) && (block.nTx > 0);
+}
+
+namespace {
+fs::path RecoveredBlocksDir(const fs::path& blocks_dir)
+{
+    return blocks_dir / "recovered-witness";
+}
+
+fs::path RecoveredBlockPath(const fs::path& blocks_dir, const uint256& hash)
+{
+    return RecoveredBlocksDir(blocks_dir) / fs::PathFromString(hash.ToString() + ".dat");
+}
+
+static constexpr std::string_view WITNESS_PRUNE_TEMP_SUFFIX{".dat.wpruned"};
+static constexpr std::string_view WITNESS_PRUNE_BACKUP_SUFFIX{".dat.wfull"};
+
+std::optional<int> ParseWitnessCompactionFileNum(const fs::path& path, const std::string_view suffix)
+{
+    const std::string name{fs::PathToString(path.filename())};
+    if (!name.starts_with("blk") || !name.ends_with(suffix) || name.size() != 3 + 5 + suffix.size()) {
+        return std::nullopt;
+    }
+
+    const std::string digits{name.substr(3, 5)};
+    if (!std::all_of(digits.begin(), digits.end(), [](char c) { return IsDigit(c); })) {
+        return std::nullopt;
+    }
+    return LocaleIndependentAtoi<int>(digits);
+}
+
+std::optional<int> ParseWitnessPruneTempFileNum(const fs::path& path)
+{
+    return ParseWitnessCompactionFileNum(path, WITNESS_PRUNE_TEMP_SUFFIX);
+}
+
+std::optional<int> ParseWitnessPruneBackupFileNum(const fs::path& path)
+{
+    return ParseWitnessCompactionFileNum(path, WITNESS_PRUNE_BACKUP_SUFFIX);
+}
+
+fs::path WitnessCompactionTempPath(const fs::path& original_path)
+{
+    return fs::PathFromString(fs::PathToString(original_path) + ".wpruned");
+}
+
+fs::path WitnessCompactionBackupPath(const fs::path& original_path)
+{
+    return fs::PathFromString(fs::PathToString(original_path) + ".wfull");
+}
+
+bool RemoveWitnessCompactionFile(const fs::path& path, const std::string_view description)
+{
+    std::error_code ec;
+    if (!fs::remove(path, ec) && ec) {
+        LogError("Failed to remove witness compaction %s %s: %s",
+                 description, fs::PathToString(path), ec.message());
+        return false;
+    }
+    return true;
+}
+
+bool CommitWitnessCompactionDirectory(const fs::path& blocks_dir, const std::string_view action)
+{
+    if (!DirectoryCommit(blocks_dir)) {
+        LogError("Witness compaction %s directory sync failed for %s",
+                 action, fs::PathToString(blocks_dir));
+        return false;
+    }
+    return true;
+}
+
+bool RenameWitnessCompactionFile(const fs::path& source,
+                                 const fs::path& destination,
+                                 const fs::path& blocks_dir,
+                                 const std::string_view action)
+{
+    std::error_code ec;
+    fs::rename(source, destination, ec);
+    if (ec) {
+        LogError("Witness compaction %s failed: %s -> %s (%s)",
+                 action, fs::PathToString(source), fs::PathToString(destination), ec.message());
+        return false;
+    }
+    return CommitWitnessCompactionDirectory(blocks_dir, action);
+}
+
+struct WitnessCompactionIndexState {
+    bool has_data{false};
+    bool all_witness_pruned{true};
+};
+
+WitnessCompactionIndexState GetWitnessCompactionIndexState(const BlockMap& block_index, const int file_number)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+{
+    WitnessCompactionIndexState state;
+    for (const auto& [_, index] : block_index) {
+        if (index.nFile != file_number || !(index.nStatus & BLOCK_HAVE_DATA)) {
+            continue;
+        }
+        state.has_data = true;
+        if (!(index.nStatus & BLOCK_OPT_WITNESS_PRUNED)) {
+            state.all_witness_pruned = false;
+            break;
+        }
+    }
+    return state;
+}
+
+struct WitnessCompactionRecoveryFiles {
+    std::optional<fs::path> temp_path;
+    std::optional<fs::path> backup_path;
+};
+} // namespace
+
+bool BlockManager::WriteRecoveredBlock(const CBlock& block) const
+{
+    const uint256 hash{block.GetHash()};
+    const fs::path recovered_dir{RecoveredBlocksDir(m_opts.blocks_dir)};
+    const fs::path recovered_path{RecoveredBlockPath(m_opts.blocks_dir, hash)};
+    const fs::path temp_path{fs::PathFromString(fs::PathToString(recovered_path) + ".tmp")};
+
+    std::error_code ec;
+    try {
+        fs::create_directories(recovered_dir);
+    } catch (const fs::filesystem_error& e) {
+        LogError("Failed to create recovered block directory %s: %s",
+                 fs::PathToString(recovered_dir), e.what());
+        return false;
+    }
+    (void)fs::remove(temp_path, ec);
+
+    AutoFile temp_file{fsbridge::fopen(temp_path, "wb"), m_obfuscation};
+    if (temp_file.IsNull()) {
+        LogError("Failed to open recovered block temp file %s: %s",
+                 fs::PathToString(temp_path), SysErrorString(errno));
+        return false;
+    }
+
+    try {
+        temp_file << TX_WITH_WITNESS(block);
+        if (!temp_file.Commit()) {
+            LogError("Failed to fsync recovered block temp file %s: %s",
+                     fs::PathToString(temp_path), SysErrorString(errno));
+            (void)temp_file.fclose();
+            (void)fs::remove(temp_path, ec);
+            return false;
+        }
+    } catch (const std::exception& e) {
+        LogError("Recovered block write error for %s: %s", hash.ToString(), e.what());
+        (void)temp_file.fclose();
+        (void)fs::remove(temp_path, ec);
+        return false;
+    }
+
+    if (temp_file.fclose() != 0) {
+        LogError("Failed to close recovered block temp file %s: %s",
+                 fs::PathToString(temp_path), SysErrorString(errno));
+        (void)fs::remove(temp_path, ec);
+        return false;
+    }
+
+    fs::rename(temp_path, recovered_path, ec);
+    if (ec) {
+        LogError("Recovered block rename failed: %s -> %s (%s)",
+                 fs::PathToString(temp_path), fs::PathToString(recovered_path), ec.message());
+        (void)fs::remove(temp_path, ec);
+        return false;
+    }
+    return true;
+}
+
+bool BlockManager::ReadRecoveredBlock(CBlock& block, const uint256& hash) const
+{
+    block.SetNull();
+
+    const fs::path recovered_path{RecoveredBlockPath(m_opts.blocks_dir, hash)};
+    AutoFile file{fsbridge::fopen(recovered_path, "rb"), m_obfuscation};
+    if (file.IsNull()) {
+        return false;
+    }
+
+    try {
+        file >> TX_WITH_WITNESS(block);
+    } catch (const std::exception& e) {
+        LogError("Deserialize or I/O error - %s while reading recovered block %s",
+                 e.what(), fs::PathToString(recovered_path.filename()));
+        return false;
+    }
+
+    if (block.GetHash() != hash) {
+        LogError("Recovered block hash mismatch for %s", hash.ToString());
+        return false;
+    }
+
+    return true;
+}
+
+bool BlockManager::HaveRecoveredBlock(const uint256& hash) const
+{
+    return fs::exists(RecoveredBlockPath(m_opts.blocks_dir, hash));
+}
+
+bool BlockManager::RemoveRecoveredBlock(const uint256& hash) const
+{
+    std::error_code ec;
+    if (!fs::remove(RecoveredBlockPath(m_opts.blocks_dir, hash), ec) && ec) {
+        LogError("Failed to remove recovered block %s: %s", hash.ToString(), ec.message());
+        return false;
+    }
+    return true;
+}
+
+void BlockManager::CleanupRecoveredBlocks() const
+{
+    const fs::path recovered_dir{RecoveredBlocksDir(m_opts.blocks_dir)};
+    if (!fs::exists(recovered_dir)) {
+        return;
+    }
+
+    std::error_code ec;
+    fs::remove_all(recovered_dir, ec);
+    if (ec) {
+        throw std::runtime_error{strprintf(
+            "Failed to remove stale recovered witness cache %s (%s)",
+            fs::PathToString(recovered_dir), ec.message())};
+    }
+}
+
+bool BlockManager::PrepareWitnessCompaction(const CChain& chain)
+{
+    AssertLockHeld(::cs_main);
+    AssertLockHeld(cs_LastBlockFile);
+
+    if (!IsWitnessPruneMode() || chain.Height() < m_opts.witness_prune_depth || m_pending_witness_compaction) {
+        return true;
+    }
+
+    const int cutoff_height{chain.Height() - m_opts.witness_prune_depth};
+
+    struct FileBlockEntry {
+        CBlockIndex* index;
+        unsigned int data_pos;
+    };
+
+    int target_file{-1};
+    std::vector<FileBlockEntry> file_blocks;
+
+    const int max_blockfile{MaxBlockfileNum()};
+    for (int file_number = std::max(0, m_witness_pruned_up_to_file + 1); file_number <= max_blockfile; ++file_number) {
+        if (file_number >= static_cast<int>(m_blockfile_info.size())) {
+            break;
+        }
+
+        const CBlockFileInfo& fileinfo{m_blockfile_info[file_number]};
+        if (fileinfo.nSize == 0) {
+            // Only advance this watermark contiguously. Block file numbers are not strictly
+            // ordered by height (e.g. ASSUMED and NORMAL files can interleave), so jumping
+            // ahead here could permanently skip older files that become eligible later.
+            if (file_number == m_witness_pruned_up_to_file + 1) {
+                m_witness_pruned_up_to_file = file_number;
+            }
+            continue;
+        }
+        if (fileinfo.nHeightLast > static_cast<unsigned int>(cutoff_height)) {
+            continue;
+        }
+
+        std::vector<FileBlockEntry> blocks_in_file;
+        blocks_in_file.reserve(fileinfo.nBlocks);
+        bool has_unpruned_witness{false};
+        for (auto& entry : m_block_index) {
+            CBlockIndex& index{entry.second};
+            if (index.nFile != file_number || !(index.nStatus & BLOCK_HAVE_DATA)) {
+                continue;
+            }
+            blocks_in_file.push_back({&index, index.nDataPos});
+            if (!IsWitnessPruned(index)) {
+                has_unpruned_witness = true;
+            }
+        }
+
+        if (blocks_in_file.empty()) {
+            continue;
+        }
+        if (!has_unpruned_witness) {
+            if (file_number == m_witness_pruned_up_to_file + 1) {
+                m_witness_pruned_up_to_file = file_number;
+            }
+            continue;
+        }
+
+        std::sort(blocks_in_file.begin(), blocks_in_file.end(),
+                  [](const FileBlockEntry& a, const FileBlockEntry& b) { return a.data_pos < b.data_pos; });
+        target_file = file_number;
+        file_blocks = std::move(blocks_in_file);
+        break;
+    }
+
+    if (target_file < 0) {
+        return true;
+    }
+
+    const fs::path original_path{m_block_file_seq.FileName(FlatFilePos{target_file, 0})};
+    const fs::path temp_path{WitnessCompactionTempPath(original_path)};
+    const fs::path backup_path{WitnessCompactionBackupPath(original_path)};
+    RemoveWitnessCompactionFile(temp_path, "temp file");
+    if (fs::exists(backup_path)) {
+        LogError("Refusing witness compaction for file %05d while backup file exists: %s",
+                 target_file, fs::PathToString(backup_path));
+        return false;
+    }
+
+    AutoFile temp_file{fsbridge::fopen(temp_path, "wb"), m_obfuscation};
+    if (temp_file.IsNull()) {
+        LogError("Failed to open witness compaction temp file %s: %s",
+                 fs::PathToString(temp_path), SysErrorString(errno));
+        return false;
+    }
+
+    std::vector<WitnessCompactionPosition> new_positions;
+    new_positions.reserve(file_blocks.size());
+
+    unsigned int compacted_file_size{0};
+    try {
+        {
+            BufferedWriter fileout{temp_file};
+            for (const FileBlockEntry& file_block : file_blocks) {
+                CBlockIndex* index{file_block.index};
+                CBlock block;
+                if (!ReadBlock(block, index->GetBlockPos(), index->GetBlockHash())) {
+                    LogError("Failed reading block %s from file %05d during witness compaction",
+                             index->GetBlockHash().ToString(), target_file);
+                    (void)temp_file.fclose();
+                    RemoveWitnessCompactionFile(temp_path, "temp file");
+                    return false;
+                }
+
+                if (m_witness_compaction_prepare_failure_for_test.load(std::memory_order_relaxed) ==
+                    WitnessCompactionPrepareFailure::WRITE) {
+                    throw std::runtime_error{"injected witness compaction write failure"};
+                }
+
+                const unsigned int stripped_size{
+                    static_cast<unsigned int>(GetSerializeSize(TX_NO_WITNESS(block)))
+                };
+                fileout << GetParams().MessageStart() << stripped_size;
+                const unsigned int new_data_pos{compacted_file_size + STORAGE_HEADER_BYTES};
+                fileout << TX_NO_WITNESS(block);
+
+                new_positions.push_back({index, new_data_pos});
+                compacted_file_size += STORAGE_HEADER_BYTES + stripped_size;
+            }
+        }
+        const bool inject_commit_failure{
+            m_witness_compaction_prepare_failure_for_test.load(std::memory_order_relaxed) ==
+            WitnessCompactionPrepareFailure::COMMIT
+        };
+        if (inject_commit_failure) errno = EIO;
+        const bool commit_ok{!inject_commit_failure && temp_file.Commit()};
+        if (!commit_ok) {
+            LogError("Failed to fsync witness compaction temp file %s: %s",
+                     fs::PathToString(temp_path), SysErrorString(errno));
+            (void)temp_file.fclose();
+            RemoveWitnessCompactionFile(temp_path, "temp file");
+            return false;
+        }
+    } catch (const std::exception& e) {
+        LogError("Witness compaction write error for file %05d: %s", target_file, e.what());
+        (void)temp_file.fclose();
+        RemoveWitnessCompactionFile(temp_path, "temp file");
+        return false;
+    }
+
+    const bool inject_close_failure{
+        m_witness_compaction_prepare_failure_for_test.load(std::memory_order_relaxed) ==
+        WitnessCompactionPrepareFailure::CLOSE
+    };
+    bool close_failed{false};
+    if (inject_close_failure) {
+        FILE* raw_file{temp_file.release()};
+        if (raw_file != nullptr) {
+            std::fclose(raw_file);
+        }
+        errno = EIO;
+        close_failed = true;
+    } else {
+        close_failed = temp_file.fclose() != 0;
+    }
+    if (close_failed) {
+        LogError("Failed to close witness compaction temp file %s: %s",
+                 fs::PathToString(temp_path), SysErrorString(errno));
+        RemoveWitnessCompactionFile(temp_path, "temp file");
+        return false;
+    }
+
+    m_pending_witness_compaction = PendingWitnessCompaction{
+        .target_file = target_file,
+        .temp_path = temp_path,
+        .original_path = original_path,
+        .backup_path = backup_path,
+        .compacted_file_size = compacted_file_size,
+        .new_positions = std::move(new_positions),
+        .stage = WitnessCompactionStage::PREPARED,
+    };
+    return true;
+}
+
+bool BlockManager::InstallWitnessCompaction()
+{
+    AssertLockHeld(::cs_main);
+    AssertLockHeld(cs_LastBlockFile);
+
+    if (!m_pending_witness_compaction) {
+        return true;
+    }
+
+    PendingWitnessCompaction& pending{*m_pending_witness_compaction};
+    if (pending.stage != WitnessCompactionStage::PREPARED) {
+        return true;
+    }
+
+    if (m_force_witness_compaction_failure_for_test.load(std::memory_order_relaxed)) {
+        return false;
+    }
+
+    const auto rollback_install = [&]() {
+        bool rollback_ok{true};
+        if (fs::exists(pending.backup_path)) {
+            rollback_ok &= RenameWitnessCompactionFile(
+                pending.backup_path, pending.original_path, m_opts.blocks_dir, "rollback");
+        }
+        if (fs::exists(pending.temp_path)) {
+            rollback_ok &= RemoveWitnessCompactionFile(pending.temp_path, "temp file");
+        }
+        return rollback_ok;
+    };
+
+    if (!RenameWitnessCompactionFile(
+            pending.original_path, pending.backup_path, m_opts.blocks_dir, "backup rename")) {
+        return false;
+    }
+    if (m_force_witness_compaction_failure_for_test.load(std::memory_order_relaxed)) {
+        (void)rollback_install();
+        return false;
+    }
+    if (!RenameWitnessCompactionFile(
+            pending.temp_path, pending.original_path, m_opts.blocks_dir, "install rename")) {
+        (void)rollback_install();
+        return false;
+    }
+
+    for (const auto& [index, new_data_pos] : pending.new_positions) {
+        index->nDataPos = new_data_pos;
+        index->nStatus |= BLOCK_OPT_WITNESS_PRUNED;
+        m_dirty_blockindex.insert(index);
+    }
+    m_blockfile_info.at(pending.target_file).nSize = pending.compacted_file_size;
+    m_dirty_fileinfo.insert(pending.target_file);
+
+    if (!m_have_witness_pruned) {
+        m_write_witness_pruned_flag = true;
+    }
+
+    pending.stage = WitnessCompactionStage::INSTALLED;
+    return true;
+}
+
+bool BlockManager::FinalizeWitnessCompaction()
+{
+    AssertLockHeld(cs_LastBlockFile);
+
+    if (!m_pending_witness_compaction) {
+        return true;
+    }
+
+    PendingWitnessCompaction& pending{*m_pending_witness_compaction};
+    if (pending.stage != WitnessCompactionStage::INSTALLED) {
+        return true;
+    }
+    if (m_force_witness_compaction_failure_for_test.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    if (fs::exists(pending.backup_path) &&
+        !RemoveWitnessCompactionFile(pending.backup_path, "backup file")) {
+        return false;
+    }
+    if (!CommitWitnessCompactionDirectory(m_opts.blocks_dir, "cleanup")) {
+        return false;
+    }
+    if (pending.target_file == m_witness_pruned_up_to_file + 1) {
+        m_witness_pruned_up_to_file = pending.target_file;
+    }
+    m_pending_witness_compaction.reset();
+    return true;
+}
+
+void BlockManager::RecoverPendingWitnessCompactions()
+{
+    AssertLockHeld(::cs_main);
+
+    std::map<int, WitnessCompactionRecoveryFiles> recovery_files;
+    for (const auto& entry : fs::directory_iterator(m_opts.blocks_dir)) {
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+
+        if (const auto file_number{ParseWitnessPruneTempFileNum(entry.path())}; file_number.has_value()) {
+            recovery_files[*file_number].temp_path = entry.path();
+            continue;
+        }
+        if (const auto file_number{ParseWitnessPruneBackupFileNum(entry.path())}; file_number.has_value()) {
+            recovery_files[*file_number].backup_path = entry.path();
+        }
+    }
+
+    for (const auto& [file_number, files] : recovery_files) {
+        const WitnessCompactionIndexState index_state{
+            GetWitnessCompactionIndexState(m_block_index, file_number)};
+        const fs::path original_path{m_block_file_seq.FileName(FlatFilePos{file_number, 0})};
+
+        if (files.backup_path.has_value()) {
+            const fs::path& backup_path{*files.backup_path};
+            if (!index_state.has_data) {
+                throw std::runtime_error{strprintf(
+                    "Found witness compaction backup file %s without indexed block data",
+                    fs::PathToString(backup_path))};
+            }
+            if (index_state.all_witness_pruned) {
+                if (files.temp_path.has_value()) {
+                    throw std::runtime_error{strprintf(
+                        "Found conflicting witness compaction temp and backup files for %05d",
+                        file_number)};
+                }
+                if (!fs::exists(original_path)) {
+                    throw std::runtime_error{strprintf(
+                        "Witness-pruned metadata for file %05d is missing canonical blk file %s",
+                        file_number, fs::PathToString(original_path))};
+                }
+                if (!RemoveWitnessCompactionFile(backup_path, "backup file")) {
+                    throw std::runtime_error{strprintf(
+                        "Failed to remove witness compaction backup file %s",
+                        fs::PathToString(backup_path))};
+                }
+                if (!CommitWitnessCompactionDirectory(m_opts.blocks_dir, "startup cleanup")) {
+                    throw std::runtime_error{strprintf(
+                        "Failed to sync witness compaction cleanup for file %05d",
+                        file_number)};
+                }
+                continue;
+            }
+
+            if (files.temp_path.has_value() &&
+                !RemoveWitnessCompactionFile(*files.temp_path, "temp file")) {
+                throw std::runtime_error{strprintf(
+                    "Failed to remove stale witness compaction temp file %s",
+                    fs::PathToString(*files.temp_path))};
+            }
+            if (!RenameWitnessCompactionFile(
+                    backup_path, original_path, m_opts.blocks_dir, "startup rollback")) {
+                throw std::runtime_error{strprintf(
+                    "Failed to roll back witness-compacted block file %s -> %s",
+                    fs::PathToString(backup_path), fs::PathToString(original_path))};
+            }
+            continue;
+        }
+
+        if (!files.temp_path.has_value()) {
+            continue;
+        }
+
+        const fs::path& temp_path{*files.temp_path};
+        if (index_state.has_data && index_state.all_witness_pruned) {
+            if (!RenameWitnessCompactionFile(
+                    temp_path, original_path, m_opts.blocks_dir, "startup legacy recovery")) {
+                throw std::runtime_error{strprintf(
+                    "Failed to recover witness-compacted block file %s -> %s",
+                    fs::PathToString(temp_path), fs::PathToString(original_path))};
+            }
+            continue;
+        }
+
+        if (!RemoveWitnessCompactionFile(temp_path, "temp file")) {
+            throw std::runtime_error{strprintf(
+                "Failed to remove stale witness compaction temp file %s",
+                fs::PathToString(temp_path))};
+        }
+    }
 }
 
 const CBlockIndex* BlockManager::GetFirstBlock(const CBlockIndex& upper_block, uint32_t status_mask, const CBlockIndex* lower_block) const
@@ -1017,9 +1648,11 @@ bool BlockManager::ReadBlock(CBlock& block, const FlatFilePos& pos, const std::o
 
     const auto block_hash{block.GetHash()};
 
-    // Check the header
-    if (!CheckProofOfWork(block_hash, block.nBits, GetConsensus())) {
-        LogError("Errors in block header at %s while reading block", pos.ToString());
+    if (const auto error = auxpow::Validate(block, GetConsensus())) {
+        LogError("Errors in block header at %s while reading block: %s (%s)",
+                 pos.ToString(),
+                 error->reject_reason,
+                 error->debug_message);
         return false;
     }
 
@@ -1274,6 +1907,24 @@ void ImportBlocks(ChainstateManager& chainman, std::span<const fs::path> import_
             chainman.GetNotifications().fatalError(strprintf(_("Failed to connect best block (%s)."), state.ToString()));
             return;
         }
+    }
+
+    std::vector<Chainstate*> chainstates_to_flush;
+    {
+        LOCK(::cs_main);
+        // ConnectTip() requests witness compaction after advancing the active tip.
+        // When the last imported block sets that request, there may be no later
+        // block or periodic flush to service it, so force one final flush here.
+        if (chainman.m_blockman.WitnessPruningCheckRequested()) {
+            for (Chainstate* chainstate : chainman.GetAll()) {
+                if (chainstate->CanFlushToDisk()) {
+                    chainstates_to_flush.push_back(chainstate);
+                }
+            }
+        }
+    }
+    for (Chainstate* chainstate : chainstates_to_flush) {
+        chainstate->ForceFlushStateToDisk();
     }
     // End scope of ImportingNow
 }

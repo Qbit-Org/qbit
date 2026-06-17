@@ -18,4 +18,4 @@ export BITCOIN_CONFIG="\
  -DREDUCE_EXPORTS=ON \
  -DCMAKE_BUILD_TYPE=Debug \
 "
-export BITCOIN_CMD="bitcoin -m" # Used in functional tests
+export BITCOIN_CMD="qbit -m" # Used in functional tests

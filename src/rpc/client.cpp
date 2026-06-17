@@ -121,6 +121,8 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "createrawtransaction", 3, "replaceable" },
     { "createrawtransaction", 4, "version" },
     { "decoderawtransaction", 1, "iswitness" },
+    { "getdefaultctvhash", 1, "input_index" },
+    { "getdefaultctvhash", 2, "verbose" },
     { "signrawtransactionwithkey", 1, "privkeys" },
     { "signrawtransactionwithkey", 2, "prevtxs" },
     { "signrawtransactionwithwallet", 1, "prevtxs" },
@@ -243,6 +245,11 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "importmempool", 1, "use_current_time" },
     { "importmempool", 1, "apply_unbroadcast_set" },
     { "importdescriptors", 0, "requests" },
+    { "importpubkeydb", 0, "pubkeys" },
+    { "importpubkeydb", 1, "internal" },
+    { "importpubkeydb", 2, "timestamp" },
+    { "getnextpubkeydbaddress", 0, "internal" },
+    { "getnextpubkeydbaddress", 1, "account" },
     { "listdescriptors", 0, "private" },
     { "verifychain", 0, "checklevel" },
     { "verifychain", 1, "nblocks" },
@@ -253,6 +260,10 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "getrawmempool", 0, "verbose" },
     { "getrawmempool", 1, "mempool_sequence" },
     { "getorphantxs", 0, "verbosity" },
+    { "getorphanmetrics", 0, "window" },
+    { "getconfirmationtarget", 0, "value_satoshis" },
+    { "getconfirmationtarget", 2, "merge_mining_pct" },
+    { "getconfirmationtarget", 3, "btc_hashrate" },
     { "estimatesmartfee", 0, "conf_target" },
     { "estimaterawfee", 0, "conf_target" },
     { "estimaterawfee", 1, "threshold" },
@@ -325,6 +336,16 @@ static UniValue Parse(std::string_view raw)
     return parsed;
 }
 
+static bool UseStringLiteralConversion(std::string_view arg_value, const std::string& method, int param_idx)
+{
+    return method == "importpubkeydb" && param_idx == 2 && arg_value == "now";
+}
+
+static bool UseStringLiteralConversion(std::string_view arg_value, const std::string& method, const std::string& param_name)
+{
+    return method == "importpubkeydb" && param_name == "timestamp" && arg_value == "now";
+}
+
 class CRPCConvertTable
 {
 private:
@@ -337,13 +358,15 @@ public:
     /** Return arg_value as UniValue, and first parse it if it is a non-string parameter */
     UniValue ArgToUniValue(std::string_view arg_value, const std::string& method, int param_idx)
     {
-        return members.count({method, param_idx}) > 0 ? Parse(arg_value) : arg_value;
+        if (members.count({method, param_idx}) == 0) return arg_value;
+        return UseStringLiteralConversion(arg_value, method, param_idx) ? UniValue{std::string{arg_value}} : Parse(arg_value);
     }
 
     /** Return arg_value as UniValue, and first parse it if it is a non-string parameter */
     UniValue ArgToUniValue(std::string_view arg_value, const std::string& method, const std::string& param_name)
     {
-        return membersByName.count({method, param_name}) > 0 ? Parse(arg_value) : arg_value;
+        if (membersByName.count({method, param_name}) == 0) return arg_value;
+        return UseStringLiteralConversion(arg_value, method, param_name) ? UniValue{std::string{arg_value}} : Parse(arg_value);
     }
 };
 

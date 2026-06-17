@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <bench/bench.h>
+#include <consensus/consensus.h>
 #include <interfaces/chain.h>
 #include <kernel/chainparams.h>
 #include <primitives/block.h>
@@ -18,6 +19,7 @@
 #include <wallet/wallet.h>
 #include <wallet/walletutil.h>
 
+#include <algorithm>
 #include <cassert>
 #include <memory>
 #include <optional>
@@ -43,7 +45,11 @@ static void WalletBalance(benchmark::Bench& bench, const bool set_dirty, const b
 
     const std::optional<std::string> address_mine{add_mine ? std::optional<std::string>{getnewaddress(wallet)} : std::nullopt};
 
-    for (int i = 0; i < 100; ++i) {
+    // Mine enough blocks so that at least a few coinbases are mature.
+    // Every iteration generates two blocks (one to the wallet address, one
+    // watch-only), so we need COINBASE_MATURITY/2 + a margin of iterations.
+    const int n_iterations = std::max(100, COINBASE_MATURITY / 2 + 50);
+    for (int i = 0; i < n_iterations; ++i) {
         generatetoaddress(test_setup->m_node, address_mine.value_or(ADDRESS_WATCHONLY));
         generatetoaddress(test_setup->m_node, ADDRESS_WATCHONLY);
     }

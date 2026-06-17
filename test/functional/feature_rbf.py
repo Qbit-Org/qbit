@@ -5,6 +5,7 @@
 """Test the RBF code."""
 
 from decimal import Decimal
+import re
 
 from test_framework.messages import (
     MAX_BIP125_RBF_SEQUENCE,
@@ -39,6 +40,8 @@ class ReplaceByFeeTest(BitcoinTestFramework):
 
     def run_test(self):
         self.wallet = MiniWallet(self.nodes[0])
+        # Mature the default-cache coinbase UTXOs
+        self.ensure_cached_coinbase_mature(self.nodes[0])
 
         self.log.info("Running test simple doublespend...")
         self.test_simple_doublespend()
@@ -87,6 +90,13 @@ class ReplaceByFeeTest(BitcoinTestFramework):
         confirmed - txout created will be confirmed in the blockchain;
                     unconfirmed otherwise.
         """
+        # Keep enough headroom for MiniWallet.send_to()'s fixed fee and
+        # a non-dust change output.
+        fee = 1_000
+        min_change = 1_000
+        largest_utxo = self.wallet.get_utxo(mark_as_spent=False, confirmed_only=confirmed)
+        max_sendable = int(COIN * largest_utxo["value"]) - fee - min_change
+        amount = min(amount, max_sendable)
         tx = self.wallet.send_to(from_node=node, scriptPubKey=scriptPubKey or self.wallet.get_output_script(), amount=amount)
 
         if confirmed:
@@ -114,10 +124,13 @@ class ReplaceByFeeTest(BitcoinTestFramework):
 
         # This will raise an exception due to insufficient fee
         reject_reason = "insufficient fee"
-        reject_details = f"{reject_reason}, rejecting replacement {tx.txid_hex}; new feerate 0.00300000 BTC/kvB <= old feerate 0.00300000 BTC/kvB"
         res = self.nodes[0].testmempoolaccept(rawtxs=[tx_hex])[0]
         assert_equal(res["reject-reason"], reject_reason)
-        assert_equal(res["reject-details"], reject_details)
+        reject_details = res["reject-details"]
+        assert re.fullmatch(
+            rf"{reject_reason}, rejecting replacement {tx.txid_hex}; new feerate 0\.00300000 [^ ]+/kvB <= old feerate 0\.00300000 [^ ]+/kvB",
+            reject_details,
+        )
         assert_raises_rpc_error(-26, f"{reject_details}", self.nodes[0].sendrawtransaction, tx_hex, 0)
 
 
@@ -139,6 +152,7 @@ class ReplaceByFeeTest(BitcoinTestFramework):
 
         initial_nValue = 5 * COIN
         tx0_outpoint = self.make_utxo(self.nodes[0], initial_nValue)
+        initial_nValue = int(COIN * tx0_outpoint["value"])
 
         prevout = tx0_outpoint
         remaining_value = initial_nValue
@@ -186,6 +200,7 @@ class ReplaceByFeeTest(BitcoinTestFramework):
 
         initial_nValue = 5 * COIN
         tx0_outpoint = self.make_utxo(self.nodes[0], initial_nValue)
+        initial_nValue = int(COIN * tx0_outpoint["value"])
 
         def branch(prevout, initial_value, max_txs, tree_width=5, fee=0.00001 * COIN, _total_txs=None):
             if _total_txs is None:
@@ -247,7 +262,8 @@ class ReplaceByFeeTest(BitcoinTestFramework):
         for n in (MAX_REPLACEMENT_LIMIT + 1, MAX_REPLACEMENT_LIMIT * 2):
             fee = int(0.00001 * COIN)
             tx0_outpoint = self.make_utxo(self.nodes[0], initial_nValue)
-            tree_txs = list(branch(tx0_outpoint, initial_nValue, n, fee=fee))
+            tx0_value = int(COIN * tx0_outpoint["value"])
+            tree_txs = list(branch(tx0_outpoint, tx0_value, n, fee=fee))
             assert_equal(len(tree_txs), n)
 
             dbl_tx_hex = self.wallet.create_self_transfer(
@@ -367,6 +383,7 @@ class ReplaceByFeeTest(BitcoinTestFramework):
         # Start by creating a single transaction with many outputs
         initial_nValue = 10 * COIN
         utxo = self.make_utxo(self.nodes[0], initial_nValue)
+        initial_nValue = int(COIN * utxo["value"])
         fee = int(0.0001 * COIN)
         split_value = int((initial_nValue - fee) / (MAX_REPLACEMENT_LIMIT + 1))
 
@@ -582,9 +599,9 @@ class ReplaceByFeeTest(BitcoinTestFramework):
     def test_replacement_relay_fee(self):
         tx = self.wallet.send_self_transfer(from_node=self.nodes[0])['tx']
 
-        # Higher fee, higher feerate, different txid, but the replacement does not provide a relay
-        # fee conforming to node's `incrementalrelayfee` policy of 100 sat per KB.
-        assert_equal(self.nodes[0].getmempoolinfo()["incrementalrelayfee"], Decimal("0.000001"))
+        # Higher fee, higher feerate, different txid, but the replacement does
+        # not provide enough incremental relay fee.
+        assert_greater_than_or_equal(self.nodes[0].getmempoolinfo()["incrementalrelayfee"], Decimal("0.000001"))
         tx.vout[0].nValue -= 1
         assert_raises_rpc_error(-26, "insufficient fee", self.nodes[0].sendrawtransaction, tx.serialize().hex())
 

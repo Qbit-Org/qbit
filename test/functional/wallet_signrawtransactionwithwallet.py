@@ -4,9 +4,6 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Test transaction signing using the signrawtransactionwithwallet RPC."""
 
-from test_framework.blocktools import (
-    COINBASE_MATURITY,
-)
 from test_framework.address import (
     script_to_p2wsh,
 )
@@ -64,7 +61,7 @@ class SignRawTransactionWithWalletTest(BitcoinTestFramework):
         5) Script verification errors have certain properties ("txid", "vout", "scriptSig", "sequence", "error")
         6) The verification errors refer to the invalid (vin 1) and missing input (vin 2)"""
         self.log.info("Test script verification errors")
-        privKeys = ['cUeKHd5orzT3mz8P9pxyREHfsWtVfgsfDjiZZBcjUBAaGk1BTj7N']
+        privKeys = ['RgKHYqn95ma1eDAJnJ9nJXP7hoDsj95bLVF3i2KpdF9ciaTBVSJw']
 
         inputs = [
             # Valid pay-to-pubkey script
@@ -84,7 +81,7 @@ class SignRawTransactionWithWalletTest(BitcoinTestFramework):
              'scriptPubKey': 'badbadbadbad'}
         ]
 
-        outputs = {'mpLQjfK79b7CCV4VMJWEWAj5Mpx8Up5zxB': 0.1}
+        outputs = {self.nodes[0].getnewaddress(address_type="legacy"): 0.1}
 
         rawTx = self.nodes[0].createrawtransaction(inputs, outputs)
 
@@ -148,8 +145,9 @@ class SignRawTransactionWithWalletTest(BitcoinTestFramework):
     def test_fully_signed_tx(self):
         self.log.info("Test signing a fully signed transaction does nothing")
         self.nodes[0].walletpassphrase("password", 9999)
-        self.generate(self.nodes[0], COINBASE_MATURITY + 1)
-        rawtx = self.nodes[0].createrawtransaction([], [{self.nodes[0].getnewaddress(): 10}])
+        self.ensure_mature_coinbase(self.nodes[0])
+        spend_amount = min(self.nodes[0].getbalances()["mine"]["trusted"] / 2, Decimal("0.1"))
+        rawtx = self.nodes[0].createrawtransaction([], [{self.nodes[0].getnewaddress(): spend_amount}])
         fundedtx = self.nodes[0].fundrawtransaction(rawtx)
         signedtx = self.nodes[0].signrawtransactionwithwallet(fundedtx["hex"])
         assert_equal(signedtx["complete"], True)

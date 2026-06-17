@@ -3,8 +3,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_ADDRDB_H
-#define BITCOIN_ADDRDB_H
+#ifndef QBIT_ADDRDB_H
+#define QBIT_ADDRDB_H
 
 #include <net_types.h>
 #include <util/fs.h>
@@ -67,4 +67,4 @@ void DumpAnchors(const fs::path& anchors_db_path, const std::vector<CAddress>& a
  */
 std::vector<CAddress> ReadAnchors(const fs::path& anchors_db_path);
 
-#endif // BITCOIN_ADDRDB_H
+#endif // QBIT_ADDRDB_H

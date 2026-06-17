@@ -1027,7 +1027,7 @@ Signing is only possible with addresses of the type 'legacy'.</source>
         <translation type="unfinished">(%1 κλειδωμένο)</translation>
     </message>
     <message>
-        <source>Can vary +/- %1 satoshi(s) per input.</source>
+        <source>Can vary +/- %1 bits per input.</source>
         <translation type="unfinished">Μπορεί να ποικίλλει κατά +/- %1 satoshi ανά input.</translation>
     </message>
     <message>
@@ -3001,13 +3001,13 @@ For more information on using this console, type %6.
     <message>
         <source>Specify a custom fee per kB (1,000 bytes) of the transaction's virtual size.
 
-Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 satoshis per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 satoshis.</source>
+Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 bits per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 bits.</source>
         <translation type="unfinished">Καθορίστε μία εξατομικευμένη χρέωση ανά kB (1.000 bytes) του εικονικού μεγέθους της συναλλαγής.
 
-Σημείωση: Εφόσον η χρέωση υπολογίζεται ανά byte, ένας ρυθμός χρέωσης των «100 satoshis ανά kvB» για μέγεθος συναλλαγής 500 ψηφιακών bytes (το μισό του 1 kvB) θα απέφερε χρέωση μόλις 50 satoshis.</translation>
+Σημείωση: Εφόσον η χρέωση υπολογίζεται ανά byte, ένας ρυθμός χρέωσης των «100 bits ανά kvB» για μέγεθος συναλλαγής 500 ψηφιακών bytes (το μισό του 1 kvB) θα απέφερε χρέωση μόλις 50 bits.</translation>
     </message>
     <message>
-        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for bitcoin transactions than the network can process.</source>
+        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for qbit transactions than the network can process.</source>
         <translation type="unfinished">Όταν υπάρχει λιγότερος όγκος συναλλαγών από το χώρο στα blocks, οι εξορύκτες καθώς και οι κόμβοι αναμετάδοσης μπορούν να επιβάλουν ένα ελάχιστο τέλος. Η πληρωμή μόνο αυτού του ελάχιστου τέλους είναι μια χαρά, αλλά γνωρίζετε ότι αυτό μπορεί να οδηγήσει σε μια συναλλαγή που δεν επιβεβαιώνεται όταν θα υπάρχει μεγαλύτερη ζήτηση για συναλλαγές bitcoin από ότι μπορεί να επεξεργαστεί το δίκτυο.</translation>
     </message>
     <message>
@@ -3289,7 +3289,7 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 satos
         <translation type="unfinished">Το ποσό που θα αποσταλεί με την επιλεγμένη μονάδα</translation>
     </message>
     <message>
-        <source>The fee will be deducted from the amount being sent. The recipient will receive less bitcoins than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
+        <source>The fee will be deducted from the amount being sent. The recipient will receive less QBT than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
         <translation type="unfinished">Το τέλος θα αφαιρεθεί από το ποσό που αποστέλλεται. Ο παραλήπτης θα λάβει λιγότερα bitcoins από ό,τι εισάγετε στο πεδίο ποσό. Εάν επιλεγούν πολλοί παραλήπτες, το έξοδο διαιρείται εξίσου.</translation>
     </message>
     <message>
@@ -4043,8 +4043,8 @@ Go to File &gt; Open Wallet to load a wallet.
         <translation type="unfinished">Οι προγραμματιστές %s</translation>
     </message>
     <message>
-        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/p2p-bad-ports.md for details and a full list.</source>
-        <translation type="unfinished">%s αίτημα για ακρόαση στη θύρα %u. Αυτή η θύρα θεωρείται "κακή" και επομένως είναι απίθανο ότι κάποιος χρήστης θα συνδεθεί σε αυτή. Δες doc/p2p-bad-ports.md για λεπτομέρειες και μια πλήρης λίστα.</translation>
+        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/reference/p2p-bad-ports.md for details and a full list.</source>
+        <translation type="unfinished">%s αίτημα για ακρόαση στη θύρα %u. Αυτή η θύρα θεωρείται "κακή" και επομένως είναι απίθανο ότι κάποιος χρήστης θα συνδεθεί σε αυτή. Δες doc/reference/p2p-bad-ports.md για λεπτομέρειες και μια πλήρης λίστα.</translation>
     </message>
     <message>
         <source>Disk space for %s may not accommodate the block files. Approximately %u GB of data will be stored in this directory.</source>

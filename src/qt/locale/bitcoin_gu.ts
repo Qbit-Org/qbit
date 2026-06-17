@@ -1017,7 +1017,7 @@ Signing is only possible with addresses of the type 'legacy'.</source>
         <translation type="unfinished">(%1લોક કરેલ)</translation>
     </message>
     <message>
-        <source>Can vary +/- %1 satoshi(s) per input.</source>
+        <source>Can vary +/- %1 bits per input.</source>
         <translation type="unfinished">ઇનપુટ દીઠ +/-%1 સતોશી(ઓ) બદલાઈ શકે છે.</translation>
     </message>
     <message>

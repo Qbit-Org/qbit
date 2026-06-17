@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_INDEX_BLOCKFILTERINDEX_H
-#define BITCOIN_INDEX_BLOCKFILTERINDEX_H
+#ifndef QBIT_INDEX_BLOCKFILTERINDEX_H
+#define QBIT_INDEX_BLOCKFILTERINDEX_H
 
 #include <attributes.h>
 #include <blockfilter.h>
@@ -112,4 +112,4 @@ bool DestroyBlockFilterIndex(BlockFilterType filter_type);
 /** Destroy all open block filter indexes. */
 void DestroyAllBlockFilterIndexes();
 
-#endif // BITCOIN_INDEX_BLOCKFILTERINDEX_H
+#endif // QBIT_INDEX_BLOCKFILTERINDEX_H

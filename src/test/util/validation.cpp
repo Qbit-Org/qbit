@@ -31,6 +31,12 @@ void TestChainstateManager::JumpOutOfIbd()
     Assert(!IsInitialBlockDownload());
 }
 
+bool TestChainstateManager::CanSkipScriptChecksForTest(const CBlockIndex& block_index, bool witness_unavailable) const
+{
+    AssertLockHeld(::cs_main);
+    return CanSkipScriptChecks(block_index, witness_unavailable);
+}
+
 void ValidationInterfaceTest::BlockConnected(
         ChainstateRole role,
         CValidationInterface& obj,

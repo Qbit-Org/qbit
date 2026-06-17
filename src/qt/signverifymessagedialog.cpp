@@ -11,8 +11,8 @@
 #include <qt/walletmodel.h>
 
 #include <common/signmessage.h>
-#include <bitcoin-build-config.h> // IWYU pragma: keep
 #include <key_io.h>
+#include <outputtype.h>
 #include <wallet/wallet.h>
 
 #include <string>
@@ -116,6 +116,12 @@ void SignVerifyMessageDialog::on_signMessageButton_SM_clicked()
     /* Clear old signature to ensure users don't get confused on error with an old signature displayed */
     ui->signatureOut_SM->clear();
 
+    if (IsP2MROnlyOutputChain()) {
+        ui->statusLabel_SM->setStyleSheet("QLabel { color: red; }");
+        ui->statusLabel_SM->setText(tr("Legacy message signing is disabled on this chain."));
+        return;
+    }
+
     CTxDestination destination = DecodeDestination(ui->addressIn_SM->text().toStdString());
     if (!IsValidDestination(destination)) {
         ui->statusLabel_SM->setStyleSheet("QLabel { color: red; }");
@@ -126,7 +132,7 @@ void SignVerifyMessageDialog::on_signMessageButton_SM_clicked()
     if (!pkhash) {
         ui->addressIn_SM->setValid(false);
         ui->statusLabel_SM->setStyleSheet("QLabel { color: red; }");
-        ui->statusLabel_SM->setText(tr("The entered address does not refer to a legacy (P2PKH) key. Message signing for SegWit and other non-P2PKH address types is not supported in this version of %1. Please check the address and try again.").arg(CLIENT_NAME));
+        ui->statusLabel_SM->setText(tr("The entered address does not refer to a legacy (P2PKH) key. Legacy message signing does not support this address type. Please check the address and try again."));
         return;
     }
 
@@ -198,6 +204,12 @@ void SignVerifyMessageDialog::on_addressBookButton_VM_clicked()
 
 void SignVerifyMessageDialog::on_verifyMessageButton_VM_clicked()
 {
+    if (IsP2MROnlyOutputChain()) {
+        ui->statusLabel_VM->setStyleSheet("QLabel { color: red; }");
+        ui->statusLabel_VM->setText(tr("Legacy message verification is disabled on this chain."));
+        return;
+    }
+
     const std::string& address = ui->addressIn_VM->text().toStdString();
     const std::string& signature = ui->signatureIn_VM->text().toStdString();
     const std::string& message = ui->messageIn_VM->document()->toPlainText().toStdString();
@@ -224,7 +236,7 @@ void SignVerifyMessageDialog::on_verifyMessageButton_VM_clicked()
         return;
     case MessageVerificationResult::ERR_ADDRESS_NO_KEY:
         ui->addressIn_VM->setValid(false);
-        ui->statusLabel_VM->setText(tr("The entered address does not refer to a legacy (P2PKH) key. Message signing for SegWit and other non-P2PKH address types is not supported in this version of %1. Please check the address and try again.").arg(CLIENT_NAME));
+        ui->statusLabel_VM->setText(tr("The entered address does not refer to a legacy (P2PKH) key. Legacy message verification does not support this address type. Please check the address and try again."));
         return;
     case MessageVerificationResult::ERR_MALFORMED_SIGNATURE:
         ui->signatureIn_VM->setValid(false);

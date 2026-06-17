@@ -2,10 +2,10 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_QT_TRANSACTIONTABLEMODEL_H
-#define BITCOIN_QT_TRANSACTIONTABLEMODEL_H
+#ifndef QBIT_QT_TRANSACTIONTABLEMODEL_H
+#define QBIT_QT_TRANSACTIONTABLEMODEL_H
 
-#include <qt/bitcoinunits.h>
+#include <qt/qbitunits.h>
 
 #include <QAbstractTableModel>
 #include <QStringList>
@@ -96,7 +96,7 @@ private:
     QString formatTxDate(const TransactionRecord *wtx) const;
     QString formatTxType(const TransactionRecord *wtx) const;
     QString formatTxToAddress(const TransactionRecord *wtx, bool tooltip) const;
-    QString formatTxAmount(const TransactionRecord *wtx, bool showUnconfirmed=true, BitcoinUnits::SeparatorStyle separators=BitcoinUnits::SeparatorStyle::STANDARD) const;
+    QString formatTxAmount(const TransactionRecord *wtx, bool showUnconfirmed=true, QbitUnits::SeparatorStyle separators=QbitUnits::SeparatorStyle::STANDARD) const;
     QString formatTooltip(const TransactionRecord *rec) const;
     QVariant txStatusDecoration(const TransactionRecord *wtx) const;
     QVariant txAddressDecoration(const TransactionRecord *wtx) const;
@@ -114,4 +114,4 @@ public Q_SLOTS:
     friend class TransactionTablePriv;
 };
 
-#endif // BITCOIN_QT_TRANSACTIONTABLEMODEL_H
+#endif // QBIT_QT_TRANSACTIONTABLEMODEL_H

@@ -18,6 +18,10 @@ class RPCMempoolInfoTest(BitcoinTestFramework):
 
     def run_test(self):
         self.wallet = MiniWallet(self.nodes[0])
+
+        # Mature the default-cache coinbase UTXOs
+        self.ensure_cached_coinbase_mature(self.nodes[0])
+
         confirmed_utxo = self.wallet.get_utxo()
 
         # Create a tree of unconfirmed transactions in the mempool:

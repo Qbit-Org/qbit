@@ -333,7 +333,7 @@
         <translation type="unfinished">Avrita vekslipening</translation>
     </message>
     <message>
-        <source>Can vary +/- %1 satoshi(s) per input.</source>
+        <source>Can vary +/- %1 bits per input.</source>
         <translation type="unfinished">Kann vera ymiskt +/- %1 satoshi fyri hvørt ískoyti.</translation>
     </message>
     <message>
@@ -1257,8 +1257,8 @@
         <translation type="unfinished">%smennararnir</translation>
     </message>
     <message>
-        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/p2p-bad-ports.md for details and a full list.</source>
-        <translation type="unfinished">%s umbøn at lurta á portur %u. Hetta portrið er tulkað "óhóskandi" og tí er ósannlíkt at nakar viðskiftari sambindur í tað. Sí lista yvir "óhóskandi" portur og nágreiniligari upplýsingar í doc/p2p-bad-ports.md.</translation>
+        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/reference/p2p-bad-ports.md for details and a full list.</source>
+        <translation type="unfinished">%s umbøn at lurta á portur %u. Hetta portrið er tulkað "óhóskandi" og tí er ósannlíkt at nakar viðskiftari sambindur í tað. Sí lista yvir "óhóskandi" portur og nágreiniligari upplýsingar í doc/reference/p2p-bad-ports.md.</translation>
     </message>
     <message>
         <source>%s is set very high!</source>

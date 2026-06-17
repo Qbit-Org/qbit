@@ -6,6 +6,7 @@
 
 #include <common/system.h>
 #include <key_io.h>
+#include <outputtype.h>
 #include <span.h>
 #include <streams.h>
 #include <secp256k1_extrakeys.h>
@@ -23,16 +24,16 @@
 using namespace util::hex_literals;
 using util::ToString;
 
-static const std::string strSecret1 = "5HxWvvfubhXpYYpS3tJkw6fq9jE9j18THftkZjHHfmFiWtmAbrj";
-static const std::string strSecret2 = "5KC4ejrDjv152FGwP386VD1i2NYc5KkfSMyv1nGy1VGDxGHqVY3";
-static const std::string strSecret1C = "Kwr371tjA9u2rFSMZjTNun2PXXP3WPZu2afRHTcta6KxEUdm1vEw";
-static const std::string strSecret2C = "L3Hq7a8FEQwJkW1M2GNKDW28546Vp5miewcCzSqUD9kCAXrJdS3g";
-static const std::string addr1 = "1QFqqMUD55ZV3PJEJZtaKCsQmjLT6JkjvJ";
-static const std::string addr2 = "1F5y5E5FMc5YzdJtB9hLaUe43GDxEKXENJ";
-static const std::string addr1C = "1NoJrossxPBKfCHuJXT4HadJrXRE9Fxiqs";
-static const std::string addr2C = "1CRj2HyM1CXWzHAXLQtiGLyggNT9WQqsDs";
+static const std::string strSecret1 = "6LDbQ7au1tVqiyqJ9rYjW3FqYGKQsqFbgV668Nc5V5Tjp6CV8p6";
+static const std::string strSecret2 = "6MT97vmDA6y6CgHoV1N549biQudsE9soqBBFaRbkpoUFFYrWFTf";
+static const std::string strSecret1C = "QXpaq24cavJJ4HrAi5h4bAxVEzcGPMyS5GyTdYMpnvh1xjkvbShQ";
+static const std::string strSecret2C = "QdGNqaJ8fBLZxYRAAcbzttxDnXKih4BFhdvFLXaQRz7Fto4hVebQ";
+static const std::string addr1 = "QjrpwekvFYSJUXPFiuD4SUf3GzHAKTvYbv";
+static const std::string addr2 = "QagxBXMxY4xNRmPubV1phkRgYXAfRA3VCM";
+static const std::string addr1C = "QiQHy7Ab8r496LNvirmYQrQwMnMwM3g6Bc";
+static const std::string addr2C = "QY2i8bG4BfQLRRFYkkDCPcmKBdProR6kk7";
 
-static const std::string strAddressBad = "1HV9Lc3sNHZxwj4Zk6fB38tEmBryq2cBiF";
+static const std::string strAddressBad = "Qd68SuLaYkSnNs9bARyfAQfsGSoh5gWVrH";
 
 
 BOOST_FIXTURE_TEST_SUITE(key_tests, BasicTestingSetup)
@@ -75,10 +76,17 @@ BOOST_AUTO_TEST_CASE(key_test1)
     BOOST_CHECK(!key2C.VerifyPubKey(pubkey2));
     BOOST_CHECK(key2C.VerifyPubKey(pubkey2C));
 
-    BOOST_CHECK(DecodeDestination(addr1)  == CTxDestination(PKHash(pubkey1)));
-    BOOST_CHECK(DecodeDestination(addr2)  == CTxDestination(PKHash(pubkey2)));
-    BOOST_CHECK(DecodeDestination(addr1C) == CTxDestination(PKHash(pubkey1C)));
-    BOOST_CHECK(DecodeDestination(addr2C) == CTxDestination(PKHash(pubkey2C)));
+    if (IsP2MROnlyOutputChain()) {
+        BOOST_CHECK(!IsValidDestination(DecodeDestination(addr1)));
+        BOOST_CHECK(!IsValidDestination(DecodeDestination(addr2)));
+        BOOST_CHECK(!IsValidDestination(DecodeDestination(addr1C)));
+        BOOST_CHECK(!IsValidDestination(DecodeDestination(addr2C)));
+    } else {
+        BOOST_CHECK(DecodeDestination(addr1)  == CTxDestination(PKHash(pubkey1)));
+        BOOST_CHECK(DecodeDestination(addr2)  == CTxDestination(PKHash(pubkey2)));
+        BOOST_CHECK(DecodeDestination(addr1C) == CTxDestination(PKHash(pubkey1C)));
+        BOOST_CHECK(DecodeDestination(addr2C) == CTxDestination(PKHash(pubkey2C)));
+    }
 
     for (int n=0; n<16; n++)
     {

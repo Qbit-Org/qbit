@@ -922,8 +922,8 @@ Signing is only possible with addresses of the type 'legacy'.</source>
         <translation type="unfinished">&amp;ដោះសោដោយមិនបានចំណាយ</translation>
     </message>
     <message>
-        <source>Can vary +/- %1 satoshi(s) per input.</source>
-        <translation type="unfinished">អាច +/- %1 satoshi(s)ច្រើនក្នុងការបញ្ជូលមួយ។</translation>
+        <source>Can vary +/- %1 bits per input.</source>
+        <translation type="unfinished">អាច +/- %1 bitsច្រើនក្នុងការបញ្ជូលមួយ។</translation>
     </message>
     <message>
         <source>(no label)</source>
@@ -2284,10 +2284,10 @@ If you are receiving this error you should request the merchant provide a BIP21 
     <message>
         <source>Specify a custom fee per kB (1,000 bytes) of the transaction's virtual size.
 
-Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 satoshis per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 satoshis.</source>
+Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 bits per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 bits.</source>
         <translation type="unfinished">បញ្ជាក់ថ្លៃផ្ទាល់ខ្លួនក្នុងមួយkB (1,000 byte) នៃទំហំនិម្មិតរបស់ប្រតិបត្តិការ។
 
-ចំណាំ៖ ដោយសារតម្លៃត្រូវបានគណនាលើមូលដ្ឋានក្នុងមួយបៃ អត្រាថ្លៃសេវា "100 satoshis ក្នុងមួយ kvB" សម្រាប់ទំហំប្រតិបត្តិការ 500  byteនិម្មិត (ពាក់កណ្តាលនៃ 1 kvB) ទីបំផុតនឹងផ្តល់ថ្លៃសេវាត្រឹមតែ 50 satoshis ប៉ុណ្ណោះ។</translation>
+ចំណាំ៖ ដោយសារតម្លៃត្រូវបានគណនាលើមូលដ្ឋានក្នុងមួយបៃ អត្រាថ្លៃសេវា "100 bits ក្នុងមួយ kvB" សម្រាប់ទំហំប្រតិបត្តិការ 500  byteនិម្មិត (ពាក់កណ្តាលនៃ 1 kvB) ទីបំផុតនឹងផ្តល់ថ្លៃសេវាត្រឹមតែ 50 bits ប៉ុណ្ណោះ។</translation>
     </message>
     <message>
         <source>A too low fee might result in a never confirming transaction (read the tooltip)</source>

@@ -1,0 +1,21 @@
+{
+  "schema_version": "1",
+  "baseline": "v30.2",
+  "methods": {
+    "getconfirmationtarget": {
+      "status_override": "new_since_v30_2",
+      "delta_summary": "Adds the qbit confirmation-target estimator RPC.",
+      "delta_notes": [
+        "This method does not exist in Bitcoin Core v30.2."
+      ]
+    },
+    "getblocktemplate": {
+      "status_override": "semantic_changed_since_v30_2",
+      "delta_summary": "Cadence, AuxPoW, and qbit version-rolling semantics diverge from upstream behavior.",
+      "delta_notes": [
+        "Structural diffs may be smaller than the behavioral delta.",
+        "qbit permissionless templates include versionrollingmask for BIP310 Stratum pool integration; zero disables rolling for non-BIP9 or AuxPoW template versions."
+      ]
+    }
+  }
+}

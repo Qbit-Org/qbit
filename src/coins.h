@@ -3,8 +3,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_COINS_H
-#define BITCOIN_COINS_H
+#ifndef QBIT_COINS_H
+#define QBIT_COINS_H
 
 #include <compressor.h>
 #include <core_memusage.h>
@@ -526,4 +526,4 @@ private:
 
 };
 
-#endif // BITCOIN_COINS_H
+#endif // QBIT_COINS_H

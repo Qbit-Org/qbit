@@ -1493,13 +1493,13 @@ For more information on using this console, type %6.
     <message>
         <source>Specify a custom fee per kB (1,000 bytes) of the transaction's virtual size.
 
-Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 satoshis per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 satoshis.</source>
+Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 bits per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 bits.</source>
         <translation type="unfinished">लेन-देन के आभासी आकार के प्रति kB (1,000 बाइट्स) के लिए एक कस्टम शुल्क निर्दिष्ट करें।
 
 नोट: चूंकि शुल्क की गणना प्रति-बाइट के आधार पर की जाती है, इसलिए 500 वर्चुअल बाइट्स (1 केवीबी का आधा) के लेन-देन के आकार के लिए "100 सतोशी प्रति केवीबी" की शुल्क दर अंततः केवल 50 सतोशी का शुल्क देगी।</translation>
     </message>
     <message>
-        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for bitcoin transactions than the network can process.</source>
+        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for qbit transactions than the network can process.</source>
         <translation type="unfinished">जब ब्लॉक में स्थान की तुलना में कम लेन-देन की मात्रा होती है, तो खनिकों के साथ-साथ रिलेइंग नोड्स न्यूनतम शुल्क लागू कर सकते हैं। केवल इस न्यूनतम शुल्क का भुगतान करना ठीक है, लेकिन ध्यान रखें कि नेटवर्क की प्रक्रिया की तुलना में बिटकॉइन लेनदेन की अधिक मांग होने पर इसका परिणाम कभी भी पुष्टिकरण लेनदेन में नहीं हो सकता है।</translation>
     </message>
     <message>
@@ -1787,7 +1787,7 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 satos
         <translation type="unfinished">चयनित इकाई में भेजने के लिए राशि</translation>
     </message>
     <message>
-        <source>The fee will be deducted from the amount being sent. The recipient will receive less bitcoins than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
+        <source>The fee will be deducted from the amount being sent. The recipient will receive less QBT than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
         <translation type="unfinished">भेजी जाने वाली राशि से शुल्क की कटौती की जाएगी। प्राप्तकर्ता को आपके द्वारा राशि फ़ील्ड में दर्ज किए जाने से कम बिटकॉइन प्राप्त होंगे। यदि कई प्राप्तकर्ताओं का चयन किया जाता है, तो शुल्क समान रूप से विभाजित किया जाता है।</translation>
     </message>
     <message>
@@ -2360,8 +2360,8 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 satos
         <translation type="unfinished">-assumeutxo snapshot state को सत्यापित करने में %sविफल रहा |  यह हार्डवेयर समस्या, या सॉफ्टवेयर में बग, या खराब सॉफ्टवेयर संशोधन को इंगित करता है जिसके कारण अमान्य स्नैपशॉट लोड हो गया। इसके परिणामस्वरूप, नोड बंद हो जाएगा और स्नैपशॉट पर निर्मित किसी भी स्थिति का उपयोग करना बंद कर देगा, जिससे चेन की ऊंचाई %d से %d पर रीसेट हो जाएगी। अगली बार restart करने पर, नोड किसी भी स्नैपशॉट डेटा का उपयोग किए बिना %d से सिंक करना फिर से शुरू कर देगा। कृपया इस घटना की रिपोर्ट %s को करें, जिसमें यह भी शामिल है कि आपने स्नैपशॉट कैसे प्राप्त किया। अमान्य स्नैपशॉट चेनस्टेट को डिस्क पर छोड़ दिया जाएगा, ताकि यह उस समस्या का निदान करने में सहायक हो, जिसके कारण यह त्रुटि हुई।</translation>
     </message>
     <message>
-        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/p2p-bad-ports.md for details and a full list.</source>
-        <translation type="unfinished">%s अनुरोध %u पोर्ट पर सुनने का. इस बंदरगाह को "खराब" माना जाता है और इस प्रकार यह संभावना नहीं है कि कोई भी सहकर्मी इससे जुड़ेगा। विवरण और पूरी सूची के लिए doc/p2p-bad-ports.md देखें।</translation>
+        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/reference/p2p-bad-ports.md for details and a full list.</source>
+        <translation type="unfinished">%s अनुरोध %u पोर्ट पर सुनने का. इस बंदरगाह को "खराब" माना जाता है और इस प्रकार यह संभावना नहीं है कि कोई भी सहकर्मी इससे जुड़ेगा। विवरण और पूरी सूची के लिए doc/reference/p2p-bad-ports.md देखें।</translation>
     </message>
     <message>
         <source>Disk space for %s may not accommodate the block files. Approximately %u GB of data will be stored in this directory.</source>

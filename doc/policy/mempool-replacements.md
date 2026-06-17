@@ -58,24 +58,25 @@ This set of rules is similar but distinct from BIP125.
 
 ## History
 
-* Opt-in full replace-by-fee (without inherited signaling) honoured in mempool and mining as of
-  **v0.12.0** ([PR 6871](https://github.com/bitcoin/bitcoin/pull/6871)).
+This policy is inherited from upstream Bitcoin Core behavior where qbit has not
+changed it. The details below are retained for policy context rather than as
+qbit release history.
 
-* [BIP125](https://github.com/bitcoin/bips/blob/master/bip-0125.mediawiki) defined based on
-  Bitcoin Core implementation.
+* Opt-in full replace-by-fee, without inherited signaling, was honored in
+  mempool and mining before the current qbit codebase.
+
+* BIP125 was defined based on the upstream implementation.
 
 * The incremental relay feerate used to calculate the required additional fees is distinct from
-  `-minrelaytxfee` and configurable using `-incrementalrelayfee`
-  ([PR #9380](https://github.com/bitcoin/bitcoin/pull/9380)).
+  `-minrelaytxfee` and configurable using `-incrementalrelayfee`.
 
-* RBF enabled by default in the wallet GUI as of **v0.18.1** ([PR
-  #11605](https://github.com/bitcoin/bitcoin/pull/11605)).
+* RBF was enabled by default in the inherited wallet GUI before the current qbit
+  codebase.
 
-* Full replace-by-fee enabled as a configurable mempool policy as of **v24.0** ([PR
-  #25353](https://github.com/bitcoin/bitcoin/pull/25353)).
+* Full replace-by-fee is available as a configurable mempool policy.
 
-* Full replace-by-fee is the default policy as of **v28.0** ([PR #30493](https://github.com/bitcoin/bitcoin/pull/30493)).
+* Full replace-by-fee is the default policy.
 
-* Signaling for replace-by-fee is no longer required as of [PR 30592](https://github.com/bitcoin/bitcoin/pull/30592).
+* Signaling for replace-by-fee is no longer required.
 
-* The incremental relay feerate default is 0.1sat/vB ([PR #33106](https://github.com/bitcoin/bitcoin/pull/33106)).
+* The incremental relay feerate default is 0.1 sat/vB.

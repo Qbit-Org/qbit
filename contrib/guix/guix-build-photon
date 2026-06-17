@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+export LC_ALL=C
+set -e -o pipefail
+
+# shellcheck source=libexec/prelude.bash
+source "$(dirname "${BASH_SOURCE[0]}")/libexec/prelude.bash"
+
+check_tools cat mkdir make getent curl git guix
+
+if [ -n "$GUIX_BUILD_OPTIONS" ]; then
+cat << EOF
+Error: Environment variable GUIX_BUILD_OPTIONS is not empty:
+  '$GUIX_BUILD_OPTIONS'
+
+Unfortunately this script is incompatible with GUIX_BUILD_OPTIONS, please unset
+GUIX_BUILD_OPTIONS and use ADDITIONAL_GUIX_COMMON_FLAGS or
+ADDITIONAL_GUIX_<CMD>_FLAGS instead.
+EOF
+exit 1
+fi
+
+if ! git diff-index --quiet HEAD -- && [ -z "$FORCE_DIRTY_WORKTREE" ]; then
+cat << EOF
+ERR: The current git worktree is dirty, which may lead to broken builds.
+
+     Aborting...
+
+Hint: To make your git worktree clean, You may want to:
+      1. Commit your changes,
+      2. Stash your changes, or
+      3. Set the 'FORCE_DIRTY_WORKTREE' environment variable if you insist on
+         using a dirty worktree
+EOF
+exit 1
+fi
+
+check_source_date_epoch
+
+export HOSTS="${HOSTS:-x86_64-linux-gnu arm-linux-gnueabihf aarch64-linux-gnu riscv64-linux-gnu powerpc64-linux-gnu}"
+PHOTON_DISTNAME="qbit-photon-${VERSION}"
+if [ "${OUTDIR_BASE}" = "${VERSION_BASE}/output" ]; then
+    OUTDIR_BASE="${VERSION_BASE}/output-photon"
+fi
+PRECIOUS_DIRS_FILE="${VAR_BASE}/precious_dirs-photon"
+
+distsrc_for_host() {
+    distsrc_for_host_at_base "${DISTSRC_BASE}" "${1}"
+}
+
+distsrc_for_host_at_base() {
+    echo "${1}/distsrc-photon-${VERSION}-${2}"
+}
+
+outdir_for_host() {
+    outdir_for_host_at_base "${OUTDIR_BASE}" "${1}" "${2}"
+}
+
+outdir_for_host_at_base() {
+    echo "${1}/${2}${3:+-${3}}"
+}
+
+profiledir_for_host() {
+    echo "${PROFILES_BASE}/photon-${1}${2:+-${2}}"
+}
+
+hosts_distsrc_exists=""
+for host in $HOSTS; do
+    if [ -e "$(distsrc_for_host "$host")" ]; then
+        hosts_distsrc_exists+=" ${host}"
+    fi
+done
+
+if [ -n "$hosts_distsrc_exists" ]; then
+cat << EOF
+ERR: Build directories for this commit already exist for the following platform
+     triples you're attempting to build, probably because of previous builds.
+     Please remove, or otherwise deal with them prior to starting another build.
+
+     Aborting...
+
+Hint: To blow everything away, you may want to use:
+
+  $ ./contrib/guix/guix-clean
+EOF
+for host in $hosts_distsrc_exists; do
+    echo "     ${host} '$(distsrc_for_host "$host")'"
+done
+exit 1
+else
+    mkdir -p "$DISTSRC_BASE"
+fi
+
+mkdir -p "$VERSION_BASE"
+avail_KiB="$(df -Pk "$VERSION_BASE" | sed 1d | tr -s ' ' | cut -d' ' -f4)"
+total_required_KiB=0
+for host in $HOSTS; do
+    required_KiB=6400000
+    total_required_KiB=$((total_required_KiB+required_KiB))
+done
+
+if (( total_required_KiB > avail_KiB )); then
+    total_required_GiB=$((total_required_KiB / 1048576))
+    avail_GiB=$((avail_KiB / 1048576))
+    echo "Performing a qbit-photon Guix build for the selected HOSTS requires ${total_required_GiB} GiB, however, only ${avail_GiB} GiB is available. Please free up some disk space before performing the build."
+    exit 1
+fi
+
+cat << EOF
+Checking that we can connect to the guix-daemon...
+
+Hint: If this hangs, you may want to try turning your guix-daemon off and on
+      again.
+
+EOF
+if ! guix gc --list-failures > /dev/null; then
+cat << EOF
+
+ERR: Failed to connect to the guix-daemon, please ensure that one is running and
+     reachable.
+EOF
+exit 1
+fi
+
+if ! getent services http https ftp > /dev/null 2>&1; then
+cat << EOF
+ERR: Your system's C library cannot find service database entries for at least
+     one of the following services: http, https, ftp.
+EOF
+fi
+
+JOBS="${JOBS:-$(nproc)}"
+SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -c log.showSignature=false log --format=%at -1)}"
+
+depends_precious_dir_names='SOURCES_PATH BASE_CACHE'
+read -r -a depends_precious_dir_names_array <<< "$depends_precious_dir_names"
+precious_dir_names="${depends_precious_dir_names} OUTDIR_BASE PROFILES_BASE"
+
+contains() {
+    for i in ${1}; do
+        if [ "$i" = "${2}" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+for precious_dir_name in $precious_dir_names; do
+    precious_dir_path="${!precious_dir_name}"
+    if [ -n "$precious_dir_path" ]; then
+        if [ ! -e "$precious_dir_path" ]; then
+            mkdir -p "$precious_dir_path"
+        elif [ -L "$precious_dir_path" ]; then
+            echo "ERR: ${precious_dir_name} cannot be a symbolic link"
+            exit 1
+        elif [ ! -d "$precious_dir_path" ]; then
+            echo "ERR: ${precious_dir_name} must be a directory"
+            exit 1
+        fi
+    fi
+done
+
+mkdir -p "$VAR_BASE"
+# shellcheck disable=SC2046
+{
+    make -C "${PWD}/depends" \
+         --no-print-directory \
+         -- $(printf "print-%s\n" "${depends_precious_dir_names_array[@]}")
+
+    for precious_dir_name in $precious_dir_names; do
+        precious_dir_path="${!precious_dir_name}"
+        if ! contains "$depends_precious_dir_names" "$precious_dir_name"; then
+            echo "${precious_dir_name}=${precious_dir_path}"
+        fi
+    done
+} > "${PRECIOUS_DIRS_FILE}"
+
+mkdir -p "$OUTDIR_BASE"
+
+for host in $HOSTS; do
+    make -C "${PWD}/depends" -j"$JOBS" HOST="$host" \
+        NO_BOOST=1 NO_LIBEVENT=1 NO_QT=1 NO_QR=1 NO_WALLET=1 NO_USDT=1 NO_IPC=1 NO_ZMQ= NO_PHOTON= \
+        download-linux ${V:+V=1} ${SOURCES_PATH:+SOURCES_PATH="$SOURCES_PATH"}
+done
+
+int_trap() {
+cat << EOF
+** INT received while building ${1}, you may want to clean up the relevant
+   work directories (e.g. distsrc-photon-*) before rebuilding
+
+Hint: To blow everything away, you may want to use:
+
+  $ ./contrib/guix/guix-clean
+EOF
+}
+
+for host in $HOSTS; do
+    trap 'int_trap ${host}' INT
+
+    (
+        export HOST="$host"
+
+cat << EOF
+INFO: Building ${VERSION:?not set} qbit-photon artifact for platform triple ${HOST:?not set}:
+      ...using reference timestamp: ${SOURCE_DATE_EPOCH:?not set}
+      ...running at most ${JOBS:?not set} jobs
+      ...from worktree directory: '${PWD}'
+          ...bind-mounted in container to: '/bitcoin'
+      ...in build directory: '$(distsrc_for_host "$HOST")'
+          ...bind-mounted in container to: '$(distsrc_for_host_at_base /distsrc-base "$HOST")'
+      ...outputting in: '$(outdir_for_host "$HOST")'
+          ...bind-mounted in container to: '$(outdir_for_host_at_base /outdir-base "$HOST")'
+      ADDITIONAL FLAGS (if set)
+          ADDITIONAL_GUIX_COMMON_FLAGS: ${ADDITIONAL_GUIX_COMMON_FLAGS}
+          ADDITIONAL_GUIX_ENVIRONMENT_FLAGS: ${ADDITIONAL_GUIX_ENVIRONMENT_FLAGS}
+          ADDITIONAL_GUIX_TIMEMACHINE_FLAGS: ${ADDITIONAL_GUIX_TIMEMACHINE_FLAGS}
+EOF
+
+        # shellcheck disable=SC2086
+        time-machine shell --manifest="${PWD}/contrib/guix/manifest.scm" \
+                                 --container \
+                                 --pure \
+                                 --no-cwd \
+                                 --share="$PWD"=/bitcoin \
+                                 --share="$DISTSRC_BASE"=/distsrc-base \
+                                 --share="$OUTDIR_BASE"=/outdir-base \
+                                 --expose="$(git rev-parse --git-common-dir)" \
+                                 ${SOURCES_PATH:+--share="$SOURCES_PATH"} \
+                                 ${BASE_CACHE:+--share="$BASE_CACHE"} \
+                                 --cores="$JOBS" \
+                                 --keep-failed \
+                                 --fallback \
+                                 --link-profile \
+                                 --root="$(profiledir_for_host "${HOST}")" \
+                                 ${SUBSTITUTE_URLS:+--substitute-urls="$SUBSTITUTE_URLS"} \
+                                 ${ADDITIONAL_GUIX_COMMON_FLAGS} ${ADDITIONAL_GUIX_ENVIRONMENT_FLAGS} \
+                                 -- env HOST="$host" \
+                                        VERSION="$VERSION" \
+                                        DISTNAME="$DISTNAME" \
+                                        PHOTON_DISTNAME="$PHOTON_DISTNAME" \
+                                        JOBS="$JOBS" \
+                                        SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:?unable to determine value}" \
+                                        ${V:+V=1} \
+                                        ${SOURCES_PATH:+SOURCES_PATH="$SOURCES_PATH"} \
+                                        ${BASE_CACHE:+BASE_CACHE="$BASE_CACHE"} \
+                                        DISTSRC="$(distsrc_for_host_at_base /distsrc-base "$HOST")" \
+                                        OUTDIR="$(outdir_for_host_at_base /outdir-base "$HOST")" \
+                                        DIST_ARCHIVE_BASE=/outdir-base/dist-archive \
+                                      bash -c "cd /bitcoin && bash contrib/guix/libexec/build-photon.sh"
+    )
+done

@@ -15,13 +15,10 @@ from test_framework.messages import msg_block
 from test_framework.p2p import P2PInterface
 from test_framework.test_framework import BitcoinTestFramework
 
-VB_PERIOD = 144           # versionbits period length for regtest
-VB_THRESHOLD = 108        # versionbits activation threshold for regtest
+VB_PERIOD = 144
+VB_THRESHOLD = 108
 VB_TOP_BITS = 0x20000000
-VB_UNKNOWN_BIT = 27       # Choose a bit unassigned to any deployment
-VB_UNKNOWN_VERSION = VB_TOP_BITS | (1 << VB_UNKNOWN_BIT)
-
-WARN_UNKNOWN_RULES_ACTIVE = f"Unknown new rules activated (versionbit {VB_UNKNOWN_BIT})"
+VB_NUM_BITS = 8
 VB_PATTERN = re.compile("Unknown new rules activated.*versionbit")
 
 class VersionBitsWarningTest(BitcoinTestFramework):
@@ -59,8 +56,26 @@ class VersionBitsWarningTest(BitcoinTestFramework):
             alert_text = f.read()
         return VB_PATTERN.search(alert_text) is not None
 
+    def has_unknown_rules_warning(self, node):
+        return (
+            self.warn_unknown_rules_active in ",".join(node.getmininginfo()["warnings"])
+            and self.warn_unknown_rules_active in ",".join(node.getnetworkinfo()["warnings"])
+        )
+
     def run_test(self):
         node = self.nodes[0]
+        deployment_info = node.getdeploymentinfo()["deployments"]
+
+        used_bits = {
+            deployment["bip9"]["bit"]
+            for deployment in deployment_info.values()
+            if deployment.get("type") == "bip9" and "bit" in deployment.get("bip9", {})
+        }
+        vb_unknown_bit = next((bit for bit in reversed(range(VB_NUM_BITS)) if bit not in used_bits), None)
+        assert vb_unknown_bit is not None
+        vb_unknown_version = VB_TOP_BITS | (1 << vb_unknown_bit)
+        self.warn_unknown_rules_active = f"Unknown new rules activated (versionbit {vb_unknown_bit})"
+
         peer = node.add_p2p_connection(P2PInterface())
 
         node_deterministic_address = node.get_deterministic_priv_key().address
@@ -69,7 +84,7 @@ class VersionBitsWarningTest(BitcoinTestFramework):
 
         self.log.info("Check that there is no warning if previous VB_BLOCKS have <VB_THRESHOLD blocks with unknown versionbits version.")
         # Build one period of blocks with < VB_THRESHOLD blocks signaling some unknown bit
-        self.send_blocks_with_version(peer, VB_THRESHOLD - 1, VB_UNKNOWN_VERSION)
+        self.send_blocks_with_version(peer, VB_THRESHOLD - 1, vb_unknown_version)
         self.generatetoaddress(node, VB_PERIOD - VB_THRESHOLD + 1, node_deterministic_address)
 
         # Check that we're not getting any versionbit-related errors in get*info()
@@ -77,7 +92,7 @@ class VersionBitsWarningTest(BitcoinTestFramework):
         assert not VB_PATTERN.match(",".join(node.getnetworkinfo()["warnings"]))
 
         # Build one period of blocks with VB_THRESHOLD blocks signaling some unknown bit
-        self.send_blocks_with_version(peer, VB_THRESHOLD, VB_UNKNOWN_VERSION)
+        self.send_blocks_with_version(peer, VB_THRESHOLD, vb_unknown_version)
         self.generatetoaddress(node, VB_PERIOD - VB_THRESHOLD, node_deterministic_address)
 
         self.log.info("Check that there is a warning if previous VB_BLOCKS have >=VB_THRESHOLD blocks with unknown versionbits version.")
@@ -93,9 +108,17 @@ class VersionBitsWarningTest(BitcoinTestFramework):
         self.wait_until(lambda: not node.getblockchaininfo()['initialblockdownload'])
         # Generating one more block will be enough to generate an error.
         self.generatetoaddress(node, 1, node_deterministic_address)
+
+        if not self.has_unknown_rules_warning(node):
+            self.log.info("Mine additional unknown-version blocks to cover larger unknown-warning windows.")
+            peer = node.add_p2p_connection(P2PInterface())
+            for _ in range(12):
+                self.send_blocks_with_version(peer, VB_PERIOD * 4, vb_unknown_version)
+                if self.has_unknown_rules_warning(node):
+                    break
+
         # Check that get*info() shows the versionbits unknown rules warning
-        assert WARN_UNKNOWN_RULES_ACTIVE in ",".join(node.getmininginfo()["warnings"])
-        assert WARN_UNKNOWN_RULES_ACTIVE in ",".join(node.getnetworkinfo()["warnings"])
+        assert self.has_unknown_rules_warning(node)
         # Check that the alert file shows the versionbits unknown rules warning
         self.wait_until(lambda: self.versionbits_in_alert_file())
 

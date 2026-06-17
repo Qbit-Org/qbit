@@ -1,0 +1,87 @@
+{
+  "schema_version": "1",
+  "baseline": "v30.2",
+  "summary": {
+    "total_methods": 2,
+    "new_since_v30_2": 1,
+    "surface_changed_since_v30_2": 0,
+    "semantic_changed_since_v30_2": 1,
+    "unchanged": 0
+  },
+  "change_pages": [
+    {
+      "change_type": "new_since_v30_2",
+      "label": "New endpoints since v30.2",
+      "page": "new-since-v30.2.md",
+      "count": 1
+    },
+    {
+      "change_type": "surface_changed_since_v30_2",
+      "label": "Changed params/results since v30.2",
+      "page": "surface-changed-since-v30.2.md",
+      "count": 0
+    },
+    {
+      "change_type": "semantic_changed_since_v30_2",
+      "label": "Changed behavior since v30.2",
+      "page": "semantic-changed-since-v30.2.md",
+      "count": 1
+    }
+  ],
+  "categories": [
+    {
+      "name": "blockchain",
+      "counts": {
+        "total": 2,
+        "new_since_v30_2": 1,
+        "surface_changed_since_v30_2": 0,
+        "semantic_changed_since_v30_2": 1,
+        "unchanged": 0
+      }
+    }
+  ],
+  "methods": [
+    {
+      "name": "getconfirmationtarget",
+      "category": "blockchain",
+      "component": "core",
+      "status": "new_since_v30_2",
+      "change_types": [
+        "new_since_v30_2"
+      ],
+      "badges": [
+        "New since v30.2"
+      ],
+      "summary_line": "Estimate confirmations needed under the current orphan model.",
+      "description": "Return the estimated confirmations and time required to reach a target confidence level.",
+      "delta_summary": "Adds the qbit confirmation-target estimator RPC.",
+      "delta_notes": [
+        "This method does not exist in Bitcoin Core v30.2."
+      ],
+      "arguments": [],
+      "results": [],
+      "examples": []
+    },
+    {
+      "name": "getblocktemplate",
+      "category": "mining",
+      "component": "core",
+      "status": "semantic_changed_since_v30_2",
+      "change_types": [
+        "semantic_changed_since_v30_2"
+      ],
+      "badges": [
+        "Changed behavior since v30.2"
+      ],
+      "summary_line": "Return data needed to construct a block.",
+      "description": "Return a block template with qbit-specific cadence and AuxPoW behavior.",
+      "delta_summary": "Cadence and AuxPoW semantics diverge from upstream behavior.",
+      "delta_notes": [
+        "Structural diffs may be smaller than the behavioral delta."
+      ],
+      "arguments": [],
+      "results": [],
+      "examples": []
+    }
+  ]
+}

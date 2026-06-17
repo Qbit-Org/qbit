@@ -37,6 +37,9 @@ class ListTransactionsTest(BitcoinTestFramework):
         self.skip_if_no_wallet()
 
     def run_test(self):
+        # Mature the default-cache coinbase UTXOs
+        self.ensure_cached_coinbase_mature(self.nodes[0])
+
         self.log.info("Test simple send from node0 to node1")
         txid = self.nodes[0].sendtoaddress(self.nodes[1].getnewaddress(), 0.1)
         self.sync_all()

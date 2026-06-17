@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <chainparams.h>
 #include <consensus/validation.h>
 #include <node/context.h>
 #include <node/mempool_args.h>
@@ -28,6 +29,7 @@ using util::ToString;
 namespace {
 
 const TestingSetup* g_setup;
+constexpr int NUM_MATURE_COINS{50};
 std::vector<COutPoint> g_outpoints_coinbase_init_mature;
 std::vector<COutPoint> g_outpoints_coinbase_init_immature;
 
@@ -42,17 +44,19 @@ struct MockedTxPool : public CTxMemPool {
 
 void initialize_tx_pool()
 {
-    static const auto testing_setup = MakeNoLogFileContext<const TestingSetup>();
+    static const auto testing_setup = MakeNoLogFileContext<const TestingSetup>(
+        ChainType::REGTEST,
+        {.extra_args = {"-p2mronly=0"}});
     g_setup = testing_setup.get();
     SetMockTime(WITH_LOCK(g_setup->m_node.chainman->GetMutex(), return g_setup->m_node.chainman->ActiveTip()->Time()));
 
     BlockAssembler::Options options;
     options.coinbase_output_script = P2WSH_OP_TRUE;
 
-    for (int i = 0; i < 2 * COINBASE_MATURITY; ++i) {
+    for (int i = 0; i < COINBASE_MATURITY + NUM_MATURE_COINS; ++i) {
         COutPoint prevout{MineBlock(g_setup->m_node, options)};
         // Remember the txids to avoid expensive disk access later on
-        auto& outpoints = i < COINBASE_MATURITY ?
+        auto& outpoints = i < NUM_MATURE_COINS ?
                               g_outpoints_coinbase_init_mature :
                               g_outpoints_coinbase_init_immature;
         outpoints.push_back(prevout);
@@ -208,7 +212,7 @@ FUZZ_TARGET(tx_pool_standard, .init = initialize_tx_pool)
     outpoints_rbf = outpoints_supply;
 
     // The sum of the values of all spendable outpoints
-    constexpr CAmount SUPPLY_TOTAL{COINBASE_MATURITY * 50 * COIN};
+    const CAmount SUPPLY_TOTAL{NUM_MATURE_COINS * GetBlockSubsidy(1, Params().GetConsensus())};
 
     SetMempoolConstraints(*node.args, fuzzed_data_provider);
     auto tx_pool_{MakeMempool(fuzzed_data_provider, node)};

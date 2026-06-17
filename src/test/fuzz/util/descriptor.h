@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_TEST_FUZZ_UTIL_DESCRIPTOR_H
-#define BITCOIN_TEST_FUZZ_UTIL_DESCRIPTOR_H
+#ifndef QBIT_TEST_FUZZ_UTIL_DESCRIPTOR_H
+#define QBIT_TEST_FUZZ_UTIL_DESCRIPTOR_H
 
 #include <key_io.h>
 #include <util/strencodings.h>
@@ -76,4 +76,4 @@ constexpr int MAX_WRAPPERS{100};
  */
 bool HasTooManyWrappers(const FuzzBufferType& buff, const int max_wrappers = MAX_WRAPPERS);
 
-#endif // BITCOIN_TEST_FUZZ_UTIL_DESCRIPTOR_H
+#endif // QBIT_TEST_FUZZ_UTIL_DESCRIPTOR_H

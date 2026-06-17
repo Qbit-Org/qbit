@@ -5,6 +5,7 @@
 
 import time
 
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.mempool_util import (
     create_large_orphan,
     tx_in_orphanage,
@@ -633,7 +634,7 @@ class OrphanHandlingTest(BitcoinTestFramework):
 
     @cleanup
     def test_maximal_package_protected(self):
-        self.log.info("Test that a node only announcing a maximally sized ancestor package is protected in orphanage")
+        self.log.info("Test that a node only announcing a large standard package is protected in orphanage")
         self.nodes[0].setmocktime(int(time.time()))
         node = self.nodes[0]
 
@@ -665,18 +666,23 @@ class OrphanHandlingTest(BitcoinTestFramework):
         # normal package request to time out.
         self.wait_until(lambda: len(node.getorphantxs()) == num_individual_dosers)
 
-        # Now honest peer will send a maximally sized ancestor package of 24 orphans chaining
-        # off of a single missing transaction, with a total vsize 404,000Wu
+        # Now honest peer will send a large standard package of 24 orphans chaining
+        # off of a single missing transaction.
         ancestor_package = self.wallet.create_self_transfer_chain(chain_length=DEFAULT_ANCESTOR_LIMIT - 1)
         sum_ancestor_package_vsize = sum([tx["tx"].get_vsize() for tx in ancestor_package])
-        final_tx = self.wallet.create_self_transfer(utxo_to_spend=ancestor_package[-1]["new_utxo"], target_vsize=101000 - sum_ancestor_package_vsize)
+        final_tx = self.wallet.create_self_transfer(utxo_to_spend=ancestor_package[-1]["new_utxo"], target_vsize=195_000 - sum_ancestor_package_vsize)
         ancestor_package.append(final_tx)
+        honest_package_vsize = sum([tx["tx"].get_vsize() for tx in ancestor_package[1:]])
+        self.log.info(f"Honest orphan package vsize: {honest_package_vsize}")
 
         # Peer sends all but first tx to fill up orphange with their orphans
         for orphan in ancestor_package[1:]:
             peer_normal.send_and_ping(msg_tx(orphan["tx"]))
 
+        self.wait_until(lambda: all(orphan["txid"] in node.getorphantxs() for orphan in ancestor_package[1:]))
         orphan_set = node.getorphantxs()
+        missing_orphans = [orphan["txid"] for orphan in ancestor_package[1:] if orphan["txid"] not in orphan_set]
+        assert not missing_orphans, f"missing {len(missing_orphans)} orphans from package of {len(ancestor_package) - 1}; orphanage has {len(orphan_set)} txs; package vsize {honest_package_vsize}"
         for orphan in ancestor_package[1:]:
             assert orphan["txid"] in orphan_set
 
@@ -845,7 +851,9 @@ class OrphanHandlingTest(BitcoinTestFramework):
         self.wallet_nonsegwit = MiniWallet(self.nodes[0], mode=MiniWalletMode.RAW_P2PK)
         self.generate(self.wallet_nonsegwit, 10)
         self.wallet = MiniWallet(self.nodes[0])
-        self.generate(self.wallet, 160)
+        # Ensure both MiniWallet instances have mature, spendable coinbases even with
+        # non-default chain parameters (e.g. higher COINBASE_MATURITY).
+        self.generate(self.wallet, COINBASE_MATURITY + 160)
 
         self.test_arrival_timing_orphan()
         self.test_orphan_rejected_parents_exceptions()

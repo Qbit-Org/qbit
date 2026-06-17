@@ -23,6 +23,7 @@ TEST_FRAMEWORK_MODULES = [
     "crypto.ellswift",
     "key",
     "messages",
+    "network_sim",
     "crypto.muhash",
     "crypto.poly1305",
     "crypto.ripemd160",
@@ -50,4 +51,3 @@ def run_unit_tests():
 
 if __name__ == "__main__":
     run_unit_tests()
-

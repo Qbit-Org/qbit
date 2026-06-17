@@ -15,7 +15,7 @@ RPCHelpMan walletpassphrase()
     return RPCHelpMan{
         "walletpassphrase",
         "Stores the wallet decryption key in memory for 'timeout' seconds.\n"
-                "This is needed prior to performing transactions related to private keys such as sending bitcoins\n"
+                "This is needed prior to performing transactions related to private keys such as sending QBT\n"
             "\nNote:\n"
             "Issuing the walletpassphrase command while the wallet is already unlocked will set a new unlock\n"
             "time that overrides the old one.\n",
@@ -40,8 +40,9 @@ RPCHelpMan walletpassphrase()
 
     int64_t nSleepTime;
     int64_t relock_time;
-    // Prevent concurrent calls to walletpassphrase with the same wallet.
+    // Prevent concurrent walletpassphrase calls and serialize nRelockTime updates with relocks.
     LOCK(pwallet->m_unlock_mutex);
+    LOCK(pwallet->m_relock_mutex);
     {
         LOCK(pwallet->cs_wallet);
 
@@ -101,11 +102,14 @@ RPCHelpMan walletpassphrase()
     std::weak_ptr<CWallet> weak_wallet = wallet;
     context.scheduler->scheduleFromNow([weak_wallet, relock_time] {
         if (auto shared_wallet = weak_wallet.lock()) {
-            LOCK2(shared_wallet->m_relock_mutex, shared_wallet->cs_wallet);
-            // Skip if this is not the most recent relock callback.
-            if (shared_wallet->nRelockTime != relock_time) return;
+            LOCK(shared_wallet->m_relock_mutex);
+            {
+                LOCK(shared_wallet->cs_wallet);
+                // Skip if this is not the most recent relock callback.
+                if (shared_wallet->nRelockTime != relock_time) return;
+            }
             shared_wallet->Lock();
-            shared_wallet->nRelockTime = 0;
+            WITH_LOCK(shared_wallet->cs_wallet, shared_wallet->nRelockTime = 0);
         }
     }, std::chrono::seconds(nSleepTime));
 
@@ -141,8 +145,6 @@ RPCHelpMan walletpassphrasechange()
     if (pwallet->IsScanningWithPassphrase()) {
         throw JSONRPCError(RPC_WALLET_ERROR, "Error: the wallet is currently being used to rescan the blockchain for related transactions. Please call `abortrescan` before changing the passphrase.");
     }
-
-    LOCK2(pwallet->m_relock_mutex, pwallet->cs_wallet);
 
     SecureString strOldWalletPass;
     strOldWalletPass.reserve(100);
@@ -207,10 +209,9 @@ RPCHelpMan walletlock()
         throw JSONRPCError(RPC_WALLET_ERROR, "Error: the wallet is currently being used to rescan the blockchain for related transactions. Please call `abortrescan` before locking the wallet.");
     }
 
-    LOCK2(pwallet->m_relock_mutex, pwallet->cs_wallet);
-
+    LOCK(pwallet->m_relock_mutex);
     pwallet->Lock();
-    pwallet->nRelockTime = 0;
+    WITH_LOCK(pwallet->cs_wallet, pwallet->nRelockTime = 0);
 
     return UniValue::VNULL;
 },
@@ -238,7 +239,7 @@ RPCHelpMan encryptwallet()
                 RPCExamples{
             "\nEncrypt your wallet\n"
             + HelpExampleCli("encryptwallet", "\"my pass phrase\"") +
-            "\nNow set the passphrase to use the wallet, such as for signing or sending bitcoin\n"
+            "\nNow set the passphrase to use the wallet, such as for signing or sending QBT\n"
             + HelpExampleCli("walletpassphrase", "\"my pass phrase\"") +
             "\nNow we can do something like sign\n"
             + HelpExampleCli("signmessage", "\"address\" \"test message\"") +

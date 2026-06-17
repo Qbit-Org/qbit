@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_QT_OVERVIEWPAGE_H
-#define BITCOIN_QT_OVERVIEWPAGE_H
+#ifndef QBIT_QT_OVERVIEWPAGE_H
+#define QBIT_QT_OVERVIEWPAGE_H
 
 #include <interfaces/wallet.h>
 
@@ -22,7 +22,18 @@ namespace Ui {
 
 QT_BEGIN_NAMESPACE
 class QModelIndex;
+class QPaintEvent;
+class QResizeEvent;
 QT_END_NAMESPACE
+
+class OverviewLogoOverlay : public QWidget
+{
+public:
+    explicit OverviewLogoOverlay(QWidget* parent = nullptr);
+
+protected:
+    void paintEvent(QPaintEvent* event) override;
+};
 
 /** Overview ("home") page widget */
 class OverviewPage : public QWidget
@@ -47,6 +58,7 @@ Q_SIGNALS:
 
 protected:
     void changeEvent(QEvent* e) override;
+    void resizeEvent(QResizeEvent* event) override;
 
 private:
     Ui::OverviewPage *ui;
@@ -57,7 +69,10 @@ private:
     const PlatformStyle* m_platform_style;
 
     TxViewDelegate *txdelegate;
+    OverviewLogoOverlay* m_background_logo{nullptr};
     std::unique_ptr<TransactionFilterProxy> filter;
+
+    void updateLogoOverlayGeometry();
 
 private Q_SLOTS:
     void LimitTransactionRows();
@@ -67,4 +82,4 @@ private Q_SLOTS:
     void setMonospacedFont(const QFont&);
 };
 
-#endif // BITCOIN_QT_OVERVIEWPAGE_H
+#endif // QBIT_QT_OVERVIEWPAGE_H

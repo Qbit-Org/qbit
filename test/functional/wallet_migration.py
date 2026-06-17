@@ -58,6 +58,7 @@ class WalletMigrationTest(BitcoinTestFramework):
         )
         self.start_nodes()
         self.init_wallet(node=0)
+        self.skip_if_previous_release_chain_mismatch()
 
     def assert_is_sqlite(self, wallet_name):
         wallet_file_path = self.master_node.wallets_path / wallet_name / self.wallet_data_filename
@@ -107,6 +108,14 @@ class WalletMigrationTest(BitcoinTestFramework):
         else:
             assert_equal(addr_info['labels'], []),
 
+    def set_unique_migration_mocktime(self):
+        # Migration backups use the mocked time in their filename. Keep it
+        # monotonic so same-second runs do not reuse the same backup path.
+        now = int(time.time())
+        self._migration_mocktime = max(now, getattr(self, "_migration_mocktime", now - 1) + 1)
+        self.master_node.setmocktime(self._migration_mocktime)
+        return self._migration_mocktime
+
     def migrate_and_get_rpc(self, wallet_name, **kwargs):
         # Since we may rescan on loading of a wallet, make sure that the best block
         # is written before beginning migration
@@ -131,8 +140,7 @@ class WalletMigrationTest(BitcoinTestFramework):
 
         # migratewallet uses current time in naming the backup file, set a mock time
         # to check that this works correctly.
-        mocked_time = int(time.time())
-        self.master_node.setmocktime(mocked_time)
+        mocked_time = self.set_unique_migration_mocktime()
         # Migrate, checking that rescan does not occur
         with self.master_node.assert_debug_log(expected_msgs=[], unexpected_msgs=["Rescanning"]):
             migrate_info = self.master_node.migratewallet(wallet_name=wallet_name, **kwargs)
@@ -647,6 +655,14 @@ class WalletMigrationTest(BitcoinTestFramework):
         shutil.rmtree(self.master_node.wallets_path / "default_wallet_solvables", ignore_errors=True)
         backup_file.unlink()
 
+    def cleanup_wallet_path(self, wallet_path, node_datadir):
+        wallet_path = Path(wallet_path).resolve()
+        node_datadir = Path(node_datadir).resolve()
+        if wallet_path == node_datadir:
+            (wallet_path / self.wallet_data_filename).unlink(missing_ok=True)
+            return
+        shutil.rmtree(wallet_path, ignore_errors=True)
+
     def test_default_wallet(self):
         self.log.info("Test migration of the wallet named as the empty string")
         wallet = self.create_legacy_wallet("")
@@ -713,8 +729,7 @@ class WalletMigrationTest(BitcoinTestFramework):
         os.mkdir(watch_only_dir)
         shutil.copyfile(old_path / "wallet.dat", watch_only_dir / "wallet.dat")
 
-        mocked_time = int(time.time())
-        self.master_node.setmocktime(mocked_time)
+        mocked_time = self.set_unique_migration_mocktime()
         assert_raises_rpc_error(-4, "Failed to create database", self.master_node.migratewallet, wallet_name)
         self.master_node.setmocktime(0)
 
@@ -735,11 +750,11 @@ class WalletMigrationTest(BitcoinTestFramework):
         if is_default:
             self.clear_default_wallet(backup_path)
         else:
-            backup_path.unlink()
-            Path(watch_only_dir / "wallet.dat").unlink()
-            Path(watch_only_dir).rmdir()
-            Path(master_path / "wallet.dat").unlink()
-            Path(old_path / "wallet.dat").unlink(missing_ok=True)
+            backup_path.unlink(missing_ok=True)
+            shutil.rmtree(watch_only_dir, ignore_errors=True)
+            self.cleanup_wallet_path(master_path, self.master_node.datadir_path)
+            if Path(old_path).resolve() != Path(master_path).resolve():
+                self.cleanup_wallet_path(old_path, self.old_node.datadir_path)
 
     def test_direct_file(self):
         self.log.info("Test migration of a wallet that is not in a wallet directory")
@@ -752,8 +767,7 @@ class WalletMigrationTest(BitcoinTestFramework):
         )
         assert (self.master_node.wallets_path / "plainfile").is_file()
 
-        mocked_time = int(time.time())
-        self.master_node.setmocktime(mocked_time)
+        mocked_time = self.set_unique_migration_mocktime()
         migrate_res = self.master_node.migratewallet("plainfile")
         assert_equal(f"plainfile_{mocked_time}.legacy.bak", os.path.basename(migrate_res["backup_path"]))
         wallet = self.master_node.get_wallet_rpc("plainfile")
@@ -1625,8 +1639,7 @@ class WalletMigrationTest(BitcoinTestFramework):
         assert_raises_rpc_error(-1, "Block not available (pruned data)", self.master_node.getblock, self.master_node.getblockhash(last_wallet_synced_block + 1))
 
         # Check migration failure
-        mocked_time = int(time.time())
-        self.master_node.setmocktime(mocked_time)
+        mocked_time = self.set_unique_migration_mocktime()
         assert_raises_rpc_error(-4, "last wallet synchronisation goes beyond pruned data. You need to -reindex (download the whole blockchain again in case of a pruned node)", self.master_node.migratewallet, wallet_name="")
         self.master_node.setmocktime(0)
 
@@ -1643,7 +1656,7 @@ class WalletMigrationTest(BitcoinTestFramework):
         self.master_node = self.nodes[0]
         self.old_node = self.nodes[1]
 
-        self.generate(self.master_node, 101)
+        self.ensure_mature_coinbase(self.master_node)
 
         # TODO: Test the actual records in the wallet for these tests too. The behavior may be correct, but the data written may not be what we actually want
         self.test_basic()

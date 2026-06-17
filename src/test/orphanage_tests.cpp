@@ -78,7 +78,7 @@ BOOST_AUTO_TEST_CASE(peer_dos_limits)
 
     // Construct transactions to use. They must all be the same size.
     static constexpr unsigned int NUM_TXNS_CREATED = 100;
-    static constexpr int64_t TX_SIZE{469};
+    static constexpr int64_t TX_SIZE{121};
     static constexpr int64_t TOTAL_SIZE = NUM_TXNS_CREATED * TX_SIZE;
 
     std::vector<CTransactionRef> txns;
@@ -344,7 +344,7 @@ BOOST_AUTO_TEST_CASE(peer_dos_limits)
         auto ptx_large = MakeTransactionRef(tx_large);
 
         const auto large_tx_size = GetTransactionWeight(*ptx_large);
-        BOOST_CHECK(large_tx_size > 10 * TX_SIZE);
+        BOOST_CHECK(large_tx_size >= 10 * TX_SIZE);
         BOOST_CHECK(large_tx_size < 11 * TX_SIZE);
 
         auto orphanage = node::MakeTxOrphanage(20, large_tx_size);

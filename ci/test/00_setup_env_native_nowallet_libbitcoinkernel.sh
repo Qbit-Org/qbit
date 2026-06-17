@@ -6,8 +6,11 @@
 
 export LC_ALL=C.UTF-8
 
+# shellcheck source=ci/test/00_setup_env_base_image.sh
+source "$( dirname "${BASH_SOURCE[0]}" )/00_setup_env_base_image.sh"
+
 export CONTAINER_NAME=ci_native_nowallet_libbitcoinkernel
-export CI_IMAGE_NAME_TAG="mirror.gcr.io/debian:bookworm"
+ci_set_base_image_name_tag "debian:bookworm"
 # Use minimum supported python3.10 (or best-effort 3.11) and clang-16, see doc/dependencies.md
 export PACKAGES="python3-zmq python3-pip clang-16 llvm-16 libc++abi-16-dev libc++-16-dev"
 export PIP_PACKAGES="--break-system-packages pycapnp"

@@ -1010,8 +1010,8 @@ A assinatura só é possível com endereços do tipo "legado".</translation>
         <translation type="unfinished">(%1 bloqueado)</translation>
     </message>
     <message>
-        <source>Can vary +/- %1 satoshi(s) per input.</source>
-        <translation type="unfinished">Pode variar +/- %1 satoshi(s) por input.</translation>
+        <source>Can vary +/- %1 bits per input.</source>
+        <translation type="unfinished">Pode variar +/- %1 bits por input.</translation>
     </message>
     <message>
         <source>(no label)</source>
@@ -2977,13 +2977,13 @@ Para mais informação acerca da utilização desta consola, escreva %6.
     <message>
         <source>Specify a custom fee per kB (1,000 bytes) of the transaction's virtual size.
 
-Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 satoshis per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 satoshis.</source>
+Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 bits per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 bits.</source>
         <translation type="unfinished">Especifique uma taxa personalizada por kB (1.000 bytes) do tamanho virtual da transação.
 
-Nota: como a taxa é calculada por byte, uma taxa de "100 satoshis por kvB" para um tamanho de transação de 500 bytes virtuais (metade de 1 kvB) resultaria em uma taxa de apenas 50 satoshis.</translation>
+Nota: como a taxa é calculada por byte, uma taxa de "100 bits por kvB" para um tamanho de transação de 500 bytes virtuais (metade de 1 kvB) resultaria em uma taxa de apenas 50 bits.</translation>
     </message>
     <message>
-        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for bitcoin transactions than the network can process.</source>
+        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for qbit transactions than the network can process.</source>
         <translation type="unfinished">Quando há menos volume de transações do que espaço nos blocos, os mineradores, bem como os pares de retransmissão, podem impor uma taxa mínima. Pagar apenas esta taxa mínima não faz mal, mas tenha em atenção que isto pode resultar numa transação nunca confirmada, uma vez que há mais procura de transações de bitcoin do que a rede pode processar.</translation>
     </message>
     <message>
@@ -3269,7 +3269,7 @@ Nota: como a taxa é calculada por byte, uma taxa de "100 satoshis por kvB" para
         <translation type="unfinished">A quantia a enviar na unidade selecionada</translation>
     </message>
     <message>
-        <source>The fee will be deducted from the amount being sent. The recipient will receive less bitcoins than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
+        <source>The fee will be deducted from the amount being sent. The recipient will receive less QBT than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
         <translation type="unfinished">A taxa será deduzida à quantia que está a ser enviada. O destinatário irá receber menos bitcoins do que as que inseridas no campo da quantia. Se estiverem selecionados múltiplos destinatários, a taxa será repartida equitativamente.</translation>
     </message>
     <message>
@@ -4027,8 +4027,8 @@ Vá ao menu Ficheiro &gt; Abrir carteira para carregar uma carteira
         <translation type="unfinished">%s falhou ao validar o estado do instantâneo -assumeutxo. Isso indica um problema de hardware ou um erro no software ou uma modificação de software incorreta que permitiu que um instantâneo inválido fosse carregado. Como resultado disso, o nó será desligado e deixará de usar qualquer estado que tenha sido construído no instantâneo, redefinindo a altura da cadeia de %d para %d. Na próxima reinicialização, o nó retomará a sincronização a partir de %d sem utilizar quaisquer dados de instantâneos. Por favor, comunique este incidente a %s, incluindo a forma como obteve o instantâneo. O estado em cadeia do instantâneo inválido será deixado no disco, caso seja útil para diagnosticar o problema que causou este erro.</translation>
     </message>
     <message>
-        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/p2p-bad-ports.md for details and a full list.</source>
-        <translation type="unfinished">%s solicita a escuta na porta %u. Esta porta é considerada "má" e, por isso, é improvável que qualquer par se conecte a ela. Veja doc/p2p-bad-ports.md para detalhes e uma lista completa.</translation>
+        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/reference/p2p-bad-ports.md for details and a full list.</source>
+        <translation type="unfinished">%s solicita a escuta na porta %u. Esta porta é considerada "má" e, por isso, é improvável que qualquer par se conecte a ela. Veja doc/reference/p2p-bad-ports.md para detalhes e uma lista completa.</translation>
     </message>
     <message>
         <source>Disk space for %s may not accommodate the block files. Approximately %u GB of data will be stored in this directory.</source>

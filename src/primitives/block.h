@@ -3,14 +3,16 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_PRIMITIVES_BLOCK_H
-#define BITCOIN_PRIMITIVES_BLOCK_H
+#ifndef QBIT_PRIMITIVES_BLOCK_H
+#define QBIT_PRIMITIVES_BLOCK_H
 
+#include <auxpow.h>
+#include <primitives/pureheader.h>
 #include <primitives/transaction.h>
 #include <serialize.h>
-#include <uint256.h>
-#include <util/time.h>
 
+#include <ios>
+#include <memory>
 /** Nodes collect new transactions into a block, hash them into a hash tree,
  * and scan through nonce values to make the block's hash satisfy proof-of-work
  * requirements.  When they solve the proof-of-work, they broadcast the block
@@ -18,49 +20,36 @@
  * in the block is a special one that creates a new coin owned by the creator
  * of the block.
  */
-class CBlockHeader
+class CBlockHeader : public CPureBlockHeader
 {
 public:
-    // header
-    int32_t nVersion;
-    uint256 hashPrevBlock;
-    uint256 hashMerkleRoot;
-    uint32_t nTime;
-    uint32_t nBits;
-    uint32_t nNonce;
+    std::shared_ptr<const CAuxPow> auxpow;
 
     CBlockHeader()
     {
         SetNull();
     }
 
-    SERIALIZE_METHODS(CBlockHeader, obj) { READWRITE(obj.nVersion, obj.hashPrevBlock, obj.hashMerkleRoot, obj.nTime, obj.nBits, obj.nNonce); }
+    SERIALIZE_METHODS(CBlockHeader, obj)
+    {
+        READWRITE(AsBase<CPureBlockHeader>(obj));
+        if (obj.SignalsAuxpow()) {
+            SER_WRITE(obj, if (!obj.auxpow) throw std::ios_base::failure("auxpow version missing payload"););
+            READWRITE(obj.auxpow);
+        } else {
+            SER_READ(obj, obj.auxpow.reset());
+        }
+    }
 
     void SetNull()
     {
-        nVersion = 0;
-        hashPrevBlock.SetNull();
-        hashMerkleRoot.SetNull();
-        nTime = 0;
-        nBits = 0;
-        nNonce = 0;
+        CPureBlockHeader::SetNull();
+        auxpow.reset();
     }
 
-    bool IsNull() const
+    bool HasAuxpow() const
     {
-        return (nBits == 0);
-    }
-
-    uint256 GetHash() const;
-
-    NodeSeconds Time() const
-    {
-        return NodeSeconds{std::chrono::seconds{nTime}};
-    }
-
-    int64_t GetBlockTime() const
-    {
-        return (int64_t)nTime;
+        return static_cast<bool>(auxpow);
     }
 };
 
@@ -110,6 +99,7 @@ public:
         block.nTime          = nTime;
         block.nBits          = nBits;
         block.nNonce         = nNonce;
+        block.auxpow         = auxpow;
         return block;
     }
 
@@ -155,4 +145,4 @@ struct CBlockLocator
     }
 };
 
-#endif // BITCOIN_PRIMITIVES_BLOCK_H
+#endif // QBIT_PRIMITIVES_BLOCK_H

@@ -3,12 +3,15 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <coins.h>
+#include <common/messages.h>
+#include <common/types.h>
 #include <consensus/amount.h>
 #include <consensus/tx_verify.h>
 #include <node/psbt.h>
 #include <policy/policy.h>
 #include <policy/settings.h>
 #include <tinyformat.h>
+#include <util/translation.h>
 
 #include <numeric>
 
@@ -64,7 +67,14 @@ PSBTAnalysis AnalyzePSBT(PartiallySignedTransaction psbtx)
 
             // Figure out what is missing
             SignatureData outdata;
-            bool complete = SignPSBTInput(DUMMY_SIGNING_PROVIDER, psbtx, i, &txdata, std::nullopt, &outdata) == PSBTError::OK;
+            const PSBTError sign_result = SignPSBTInput(DUMMY_SIGNING_PROVIDER, psbtx, i, &txdata, std::nullopt, &outdata);
+            if (sign_result != PSBTError::OK &&
+                sign_result != PSBTError::INCOMPLETE &&
+                sign_result != PSBTError::MISSING_INPUTS) {
+                result.SetInvalid(strprintf("PSBT is not valid. Input %u: %s", i, PSBTErrorString(sign_result).original));
+                return result;
+            }
+            bool complete = sign_result == PSBTError::OK;
 
             // Things are missing
             if (!complete) {
@@ -72,9 +82,13 @@ PSBTAnalysis AnalyzePSBT(PartiallySignedTransaction psbtx)
                 input_analysis.missing_redeem_script = outdata.missing_redeem_script;
                 input_analysis.missing_witness_script = outdata.missing_witness_script;
                 input_analysis.missing_sigs = outdata.missing_sigs;
+                input_analysis.missing_p2mr_sigs = outdata.missing_p2mr_sigs;
 
                 // If we are only missing signatures and nothing else, then next is signer
-                if (outdata.missing_pubkeys.empty() && outdata.missing_redeem_script.IsNull() && outdata.missing_witness_script.IsNull() && !outdata.missing_sigs.empty()) {
+                if (outdata.missing_pubkeys.empty() &&
+                    outdata.missing_redeem_script.IsNull() &&
+                    outdata.missing_witness_script.IsNull() &&
+                    (!outdata.missing_sigs.empty() || !outdata.missing_p2mr_sigs.empty())) {
                     input_analysis.next = PSBTRole::SIGNER;
                 } else {
                     input_analysis.next = PSBTRole::UPDATER;

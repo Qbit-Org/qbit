@@ -43,7 +43,7 @@ static RPCHelpMan enumeratesigners()
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
         {
             const std::string command = gArgs.GetArg("-signer", "");
-            if (command == "") throw JSONRPCError(RPC_MISC_ERROR, "Error: restart bitcoind with -signer=<cmd>");
+            if (command == "") throw JSONRPCError(RPC_MISC_ERROR, "Error: restart qbitd with -signer=<cmd>");
             const std::string chain = gArgs.GetChainTypeString();
             UniValue signers_res = UniValue::VARR;
             try {
@@ -71,7 +71,7 @@ void RegisterSignerRPCCommands(CRPCTable& t)
         {"signer", &enumeratesigners},
     };
     for (const auto& c : commands) {
-        t.appendCommand(c.name, &c);
+        t.appendCommand(c.name, &c, RPCComponent::SIGNER);
     }
 }
 

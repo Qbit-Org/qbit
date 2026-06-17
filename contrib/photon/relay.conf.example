@@ -1,0 +1,49 @@
+# qbit-photon relay configuration example
+#
+# Copy this file to /etc/qbit-photon/relay.conf and update values for your host.
+# Freshness/resource invariants and the `inbound_rejected` / `inbound_evicted`
+# stats are documented in RUNBOOK.md. Current builds enforce those bounds in code.
+
+[local]
+# UDP listen port for relay traffic.
+bind_port = 8144
+
+# One of: info, warn (or warning), error
+log_level = info
+
+[qbitd]
+# qbitd ZMQ endpoint that publishes block hashes.
+# Must match qbitd startup args (e.g. -zmqpubhashblock=tcp://127.0.0.1:28332).
+# The qbitd binary must be built with -DWITH_ZMQ=ON; default core builds do not
+# expose -zmqpubhashblock or getzmqnotifications.
+zmq_hashblock = tcp://127.0.0.1:28332
+
+# Optional qbitd ZMQ sequence endpoint.
+# zmq_sequence = tcp://127.0.0.1:28333
+
+# qbitd RPC endpoint used to fetch and submit blocks.
+rpc_host = 127.0.0.1
+rpc_port = 8352
+
+# RPC auth cookie path used by qbit-photon.
+# This matches the qbitd.service mainnet default; override it explicitly if
+# your qbitd instance uses another chain, datadir, or compatibility path.
+rpc_cookiefile = /var/lib/qbit/.cookie
+
+# RPC timeout in milliseconds.
+rpc_timeout_ms = 5000
+
+[peer.primary]
+# Remote qbit-photon peer.
+host = 198.51.100.10
+port = 8144
+
+# 32-byte HMAC key as 64 hex characters.
+# Generate with: openssl rand -hex 32
+hmac_key = 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+
+# Additional peers can be configured with new sections.
+# [peer.backup]
+# host = 203.0.113.25
+# port = 8144
+# hmac_key = fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210

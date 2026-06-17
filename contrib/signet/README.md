@@ -7,11 +7,11 @@ getcoins.py
 
 A script to call a faucet to get Signet coins.
 
-Syntax: `getcoins.py [-h|--help] [-c|--cmd=<bitcoin-cli path>] [-f|--faucet=<faucet URL>] [-a|--addr=<signet bech32 address>] [-p|--password=<faucet password>] [--] [<bitcoin-cli args>]`
+Syntax: `getcoins.py [-h|--help] [-c|--cmd=<qbit-cli path>] [-f|--faucet=<faucet URL>] [-a|--addr=<signet bech32 address>] [-p|--password=<faucet password>] [--] [<qbit-cli args>]`
 
-* `--cmd` lets you customize the bitcoin-cli path. By default it will look for it in the PATH
+* `--cmd` lets you customize the qbit-cli path. By default it will look for it in the PATH
 * `--faucet` lets you specify which faucet to use; the faucet is assumed to be compatible with https://github.com/kallewoof/bitcoin-faucet
-* `--addr` lets you specify a Signet address; by default, the address must be a bech32 address. This and `--cmd` above complement each other (i.e. you do not need `bitcoin-cli` if you use `--addr`)
+* `--addr` lets you specify a Signet address; by default, the address must be a bech32 address. This and `--cmd` above complement each other (i.e. you do not need `qbit-cli` if you use `--addr`)
 * `--password` lets you specify a faucet password; this is handy if you are in a classroom and set up your own faucet for your students; (above faucet does not limit by IP when password is enabled)
 
 If using the default network, invoking the script with no arguments should be sufficient under normal
@@ -24,7 +24,7 @@ miner
 You will first need to pick a difficulty target. Since signet chains are primarily protected by a signature rather than proof of work, there is no need to spend as much energy as possible mining, however you may wish to choose to spend more time than the absolute minimum. The calibrate subcommand can be used to pick a target appropriate for your hardware, eg:
 
     MINER="./contrib/signet/miner"
-    GRIND="./build/bin/bitcoin-util grind"
+    GRIND="./build/bin/qbit-util grind"
     $MINER calibrate --grind-cmd="$GRIND"
     nbits=1e00f403 for 25s average mining time
 
@@ -32,7 +32,7 @@ It defaults to estimating an nbits value resulting in 25s average time to find a
 
 To mine the first block in your custom chain, you can run:
 
-    CLI="./build/bin/bitcoin-cli -conf=mysignet.conf"
+    CLI="./build/bin/qbit-cli -conf=mysignet.conf"
     ADDR=$($CLI -signet getnewaddress)
     NBITS=1e00f403
     $MINER --cli="$CLI" generate --grind-cmd="$GRIND" --address="$ADDR" --nbits=$NBITS
@@ -54,7 +54,7 @@ The --set-block-time option is available to manually move timestamps forward or 
 
 Instead of using a single address, a ranged descriptor may be provided via the --descriptor parameter, with the reward for the block at height H being sent to the H'th address generated from the descriptor.
 
-Instead of calculating a specific nbits value, --min-nbits can be specified instead, in which case the minimum signet difficulty will be targeted. Signet's minimum difficulty corresponds to --nbits=1e0377ae.
+Instead of calculating a specific nbits value, --min-nbits can be specified instead, in which case the default permissionless launch difficulty will be targeted. The current permissionless launch difficulty corresponds to --nbits=1e00f99b.
 
 By default, the signet miner mines blocks at fixed intervals with minimal variation. If you want blocks to appear more randomly, as they do in mainnet, specify the --poisson option.
 

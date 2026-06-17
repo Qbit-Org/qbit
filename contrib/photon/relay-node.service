@@ -1,0 +1,37 @@
+# It is not recommended to modify this file in-place, because it may be
+# overwritten during package upgrades. If you want to add further options or
+# overwrite existing ones then use:
+#   systemctl edit relay-node.service
+# See "man systemd.service" for details.
+
+[Unit]
+Description=qbit-photon relay daemon
+Documentation=https://qbit.org/
+After=network-online.target qbitd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/qbit-photon --config /etc/qbit-photon/relay.conf
+
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+
+User=qbit
+Group=qbit
+
+ConfigurationDirectory=qbit-photon
+ConfigurationDirectoryMode=0750
+
+# Hardening measures
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+NoNewPrivileges=true
+PrivateDevices=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

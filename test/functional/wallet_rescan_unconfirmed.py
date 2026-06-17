@@ -27,6 +27,9 @@ class WalletRescanUnconfirmed(BitcoinTestFramework):
         node = self.nodes[0]
         tester_wallet = MiniWallet(node)
 
+        # Mature the default-cache coinbase UTXOs
+        self.ensure_cached_coinbase_mature(self.nodes[0])
+
         node.createwallet(wallet_name='w0', disable_private_keys=False)
         w0 = node.get_wallet_rpc('w0')
 

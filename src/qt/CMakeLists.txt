@@ -69,8 +69,8 @@ add_library(bitcoinqt STATIC EXCLUDE_FROM_ALL
   bitcoinamountfield.h
   bitcoingui.cpp
   bitcoingui.h
-  bitcoinunits.cpp
-  bitcoinunits.h
+  qbitunits.cpp
+  qbitunits.h
   clientmodel.cpp
   clientmodel.h
   csvmodelwriter.cpp
@@ -119,7 +119,7 @@ add_library(bitcoinqt STATIC EXCLUDE_FROM_ALL
   utilitydialog.h
   $<$<PLATFORM_ID:Windows>:winshutdownmonitor.cpp>
   $<$<PLATFORM_ID:Windows>:winshutdownmonitor.h>
-  bitcoin.qrc
+  qbit.qrc
   ${CMAKE_CURRENT_BINARY_DIR}/bitcoin_locale.qrc
 )
 target_compile_definitions(bitcoinqt
@@ -251,8 +251,9 @@ add_executable(bitcoin-qt
   main.cpp
   ../init/bitcoin-qt.cpp
 )
+set_target_properties(bitcoin-qt PROPERTIES OUTPUT_NAME qbit-qt)
 
-add_windows_resources(bitcoin-qt res/bitcoin-qt-res.rc)
+add_windows_resources(bitcoin-qt res/qbit-qt-res.rc)
 add_windows_application_manifest(bitcoin-qt)
 
 target_link_libraries(bitcoin-qt
@@ -272,6 +273,7 @@ if(ENABLE_IPC)
     main.cpp
     ../init/bitcoin-gui.cpp
   )
+  set_target_properties(bitcoin-gui PROPERTIES OUTPUT_NAME qbit-gui)
   target_link_libraries(bitcoin-gui
     core_interface
     bitcoinqt

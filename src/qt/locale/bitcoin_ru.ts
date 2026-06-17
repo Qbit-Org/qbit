@@ -1055,7 +1055,7 @@ Signing is only possible with addresses of the type 'legacy'.</source>
         <translation type="unfinished">(%1 заблокирован)</translation>
     </message>
     <message>
-        <source>Can vary +/- %1 satoshi(s) per input.</source>
+        <source>Can vary +/- %1 bits per input.</source>
         <translation type="unfinished">Может меняться на +/- %1 сатоши за каждый вход.</translation>
     </message>
     <message>
@@ -2538,8 +2538,8 @@ Go to File &gt; Open Wallet to load a wallet.
         <translation type="unfinished">%s не удалось подтвердить состояние моментального снимка -assumeutxo. Это указывает на аппаратную проблему, или ошибку в программном обеспечении, или неудачную модификацию программного обеспечения, которая позволила загрузить недопустимый снимок. В результате этого узел выключится и перестанет использовать любое состояние, которое было построено на основе моментального снимка, сбросив высоту цепочки с %d на %d. При следующем перезапуске узел возобновит синхронизацию с %d без использования данных моментального снимка. Сообщите об этом инциденте по адресу %s, указав, как вы получили снимок. Состояние цепи недействительного снимка будет оставлено на диске, если оно поможет в диагностике проблемы, вызвавшей эту ошибку.</translation>
     </message>
     <message>
-        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/p2p-bad-ports.md for details and a full list.</source>
-        <translation type="unfinished">%s хочет открыть порт %u на прослушивание. Этот порт считается "плохим", и другие узлы, скорее всего, не захотят общаться через этот порт. Список портов и подробности можно узнать в документе doc/p2p-bad-ports.md.</translation>
+        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/reference/p2p-bad-ports.md for details and a full list.</source>
+        <translation type="unfinished">%s хочет открыть порт %u на прослушивание. Этот порт считается "плохим", и другие узлы, скорее всего, не захотят общаться через этот порт. Список портов и подробности можно узнать в документе doc/reference/p2p-bad-ports.md.</translation>
     </message>
     <message>
         <source>Error: Dumpfile format record is incorrect. Got "%s", expected "format".</source>

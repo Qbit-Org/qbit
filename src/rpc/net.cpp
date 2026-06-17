@@ -307,6 +307,153 @@ static RPCHelpMan getpeerinfo()
     };
 }
 
+static RPCHelpMan getarchivepeers()
+{
+    return RPCHelpMan{
+        "getarchivepeers",
+        "Returns archive-relevant peer state for bootstrap, fallback debugging, and monitoring.\n"
+        "This RPC reports observed and configured state only. NODE_ARCHIVE is a peer advertisement,\n"
+        "not proof that the peer can serve all historical data.\n",
+        {
+            {"view", RPCArg::Type::STR, RPCArg::Default{"all"}, "Return view: \"all\", \"summary\", \"connected\", or \"configured\"."},
+        },
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::OBJ, "summary", "",
+                {
+                    {RPCResult::Type::NUM, "connected_advertised_archive_peers", "Currently connected peers whose observed service bits include NODE_ARCHIVE"},
+                    {RPCResult::Type::NUM, "connected_archive_connections", "Currently connected peers opened through -connectarchive"},
+                    {RPCResult::Type::NUM, "configured_archive_targets", "Configured -connectarchive entries"},
+                    {RPCResult::Type::NUM, "connected_configured_archive_targets", "Configured -connectarchive entries currently connected"},
+                }},
+                {RPCResult::Type::ARR, "connected", /*optional=*/true, "Archive-relevant connected peers, included for view \"all\" or \"connected\"",
+                {
+                    {RPCResult::Type::OBJ, "", "",
+                    {
+                        {RPCResult::Type::NUM, "nodeid", "Connected peer id"},
+                        {RPCResult::Type::STR, "address", "(host:port) The IP address and port of the peer"},
+                        {RPCResult::Type::STR, "connection_type", "Type of connection"},
+                        {RPCResult::Type::BOOL, "archive_connection", "Whether this connection was opened from -connectarchive"},
+                        {RPCResult::Type::BOOL, "advertises_archive", "Whether observed services include NODE_ARCHIVE"},
+                        {RPCResult::Type::STR_HEX, "services", "The observed services offered"},
+                        {RPCResult::Type::ARR, "servicesnames", "The observed services offered, in human-readable form",
+                        {
+                            {RPCResult::Type::STR, "SERVICE_NAME", "The service name if it is recognised"}
+                        }},
+                    }},
+                }},
+                {RPCResult::Type::ARR, "configured", /*optional=*/true, "Configured -connectarchive targets, included for view \"all\" or \"configured\"",
+                {
+                    {RPCResult::Type::OBJ, "", "",
+                    {
+                        {RPCResult::Type::STR, "target", "Configured -connectarchive target as provided by the operator"},
+                        {RPCResult::Type::STR, "source", "Configuration source, always \"connectarchive\" in this version"},
+                        {RPCResult::Type::BOOL, "connected", "Whether this configured target currently has a matching connected peer"},
+                        {RPCResult::Type::NUM, "nodeid", /*optional=*/true, "Connected peer id when connected=true"},
+                    }},
+                }},
+            },
+        },
+        RPCExamples{
+            HelpExampleCli("getarchivepeers", "")
+            + HelpExampleCli("getarchivepeers", "\"summary\"")
+            + HelpExampleRpc("getarchivepeers", "\"connected\"")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    const std::string view{request.params[0].isNull() ? "all" : request.params[0].get_str()};
+    const bool include_connected{view == "all" || view == "connected"};
+    const bool include_configured{view == "all" || view == "configured"};
+    if (view != "all" && view != "summary" && view != "connected" && view != "configured") {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid view, expected one of: all, summary, connected, configured");
+    }
+
+    NodeContext& node = EnsureAnyNodeContext(request.context);
+    const CConnman& connman = EnsureConnman(node);
+    const PeerManager& peerman = EnsurePeerman(node);
+
+    uint64_t connected_advertised_archive_peers{0};
+    uint64_t connected_archive_connections{0};
+    uint64_t configured_archive_targets{0};
+    uint64_t connected_configured_archive_targets{0};
+
+    UniValue connected(UniValue::VARR);
+    std::vector<CNodeStats> vstats;
+    connman.GetNodeStats(vstats);
+    for (const CNodeStats& stats : vstats) {
+        CNodeStateStats statestats;
+        if (!peerman.GetNodeStateStats(stats.nodeid, statestats)) {
+            continue;
+        }
+
+        const ServiceFlags services{statestats.their_services};
+        const bool advertises_archive{static_cast<bool>(services & NODE_ARCHIVE)};
+        const bool archive_connection{stats.m_is_archive_connection};
+        if (advertises_archive) {
+            ++connected_advertised_archive_peers;
+        }
+        if (archive_connection) {
+            ++connected_archive_connections;
+        }
+        if (!include_connected || (!advertises_archive && !archive_connection)) {
+            continue;
+        }
+
+        UniValue obj(UniValue::VOBJ);
+        obj.pushKV("nodeid", stats.nodeid);
+        obj.pushKV("address", stats.m_addr_name);
+        obj.pushKV("connection_type", ConnectionTypeAsString(stats.m_conn_type));
+        obj.pushKV("archive_connection", archive_connection);
+        obj.pushKV("advertises_archive", advertises_archive);
+        obj.pushKV("services", strprintf("%016x", services));
+        obj.pushKV("servicesnames", GetServicesNames(services));
+        connected.push_back(std::move(obj));
+    }
+
+    UniValue configured(UniValue::VARR);
+    const std::vector<AddedNodeInfo> added_nodes{connman.GetAddedNodeInfo(/*include_connected=*/true)};
+    for (const AddedNodeInfo& info : added_nodes) {
+        if (!info.m_params.m_require_archive) {
+            continue;
+        }
+        ++configured_archive_targets;
+        if (info.fConnected) {
+            ++connected_configured_archive_targets;
+        }
+        if (!include_configured) {
+            continue;
+        }
+
+        UniValue obj(UniValue::VOBJ);
+        obj.pushKV("target", info.m_params.m_added_node);
+        obj.pushKV("source", "connectarchive");
+        obj.pushKV("connected", info.fConnected);
+        if (info.nodeid) {
+            obj.pushKV("nodeid", *info.nodeid);
+        }
+        configured.push_back(std::move(obj));
+    }
+
+    UniValue summary(UniValue::VOBJ);
+    summary.pushKV("connected_advertised_archive_peers", connected_advertised_archive_peers);
+    summary.pushKV("connected_archive_connections", connected_archive_connections);
+    summary.pushKV("configured_archive_targets", configured_archive_targets);
+    summary.pushKV("connected_configured_archive_targets", connected_configured_archive_targets);
+
+    UniValue ret(UniValue::VOBJ);
+    ret.pushKV("summary", std::move(summary));
+    if (include_connected) {
+        ret.pushKV("connected", std::move(connected));
+    }
+    if (include_configured) {
+        ret.pushKV("configured", std::move(configured));
+    }
+    return ret;
+},
+    };
+}
+
 static RPCHelpMan addnode()
 {
     return RPCHelpMan{
@@ -1198,6 +1345,7 @@ void RegisterNetRPCCommands(CRPCTable& t)
         {"network", &getconnectioncount},
         {"network", &ping},
         {"network", &getpeerinfo},
+        {"network", &getarchivepeers},
         {"network", &addnode},
         {"network", &disconnectnode},
         {"network", &getaddednodeinfo},

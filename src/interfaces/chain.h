@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_INTERFACES_CHAIN_H
-#define BITCOIN_INTERFACES_CHAIN_H
+#ifndef QBIT_INTERFACES_CHAIN_H
+#define QBIT_INTERFACES_CHAIN_H
 
 #include <blockfilter.h>
 #include <common/settings.h>
@@ -260,7 +260,7 @@ public:
     virtual void getPackageLimits(unsigned int& limit_ancestor_count, unsigned int& limit_descendant_count) = 0;
 
     //! Check if transaction will pass the mempool's chain limits.
-    virtual util::Result<void> checkChainLimits(const CTransactionRef& tx) = 0;
+    virtual util::Result<void> checkChainLimits(const CTransactionRef& tx, std::optional<int64_t> tx_vsize = std::nullopt) = 0;
 
     //! Estimate smart fee.
     virtual CFeeRate estimateSmartFee(int num_blocks, bool conservative, FeeCalculation* calc = nullptr) = 0;
@@ -424,4 +424,4 @@ std::unique_ptr<Chain> MakeChain(node::NodeContext& node);
 
 } // namespace interfaces
 
-#endif // BITCOIN_INTERFACES_CHAIN_H
+#endif // QBIT_INTERFACES_CHAIN_H

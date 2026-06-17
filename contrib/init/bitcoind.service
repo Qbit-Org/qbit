@@ -3,15 +3,18 @@
 # options or overwrite existing ones then use
 # $ systemctl edit bitcoind.service
 # See "man systemd.service" for details.
+#
+# Deprecated: use qbitd.service. This compatibility unit will be removed after
+# one release.
 
-# Note that almost all daemon options could be specified in
-# /etc/bitcoin/bitcoin.conf, but keep in mind those explicitly
+# Note that almost all daemon options could be specified in the legacy
+# compatibility config path /etc/bitcoin/bitcoin.conf, but keep in mind those explicitly
 # specified as arguments in ExecStart= will override those in the
 # config file.
 
 [Unit]
-Description=Bitcoin daemon
-Documentation=https://github.com/bitcoin/bitcoin/blob/master/doc/init.md
+Description=Deprecated qbit daemon compatibility alias
+Documentation=https://github.com/Qbit-Org/qbit/blob/develop/doc/deployment/init.md
 
 # https://www.freedesktop.org/wiki/Software/systemd/NetworkTarget/
 After=network-online.target

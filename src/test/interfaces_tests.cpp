@@ -5,8 +5,8 @@
 #include <chainparams.h>
 #include <consensus/validation.h>
 #include <interfaces/chain.h>
+#include <test/util/script.h>
 #include <test/util/setup_common.h>
-#include <script/solver.h>
 #include <validation.h>
 
 #include <boost/test/unit_test.hpp>
@@ -47,13 +47,13 @@ BOOST_AUTO_TEST_CASE(findBlock)
 
     bool cur_active{false}, next_active{false};
     uint256 next_hash;
-    BOOST_CHECK_EQUAL(active.Height(), 100);
-    BOOST_CHECK(chain->findBlock(active[99]->GetBlockHash(), FoundBlock().inActiveChain(cur_active).nextBlock(FoundBlock().inActiveChain(next_active).hash(next_hash))));
+    BOOST_CHECK_EQUAL(active.Height(), 1000);
+    BOOST_CHECK(chain->findBlock(active[999]->GetBlockHash(), FoundBlock().inActiveChain(cur_active).nextBlock(FoundBlock().inActiveChain(next_active).hash(next_hash))));
     BOOST_CHECK(cur_active);
     BOOST_CHECK(next_active);
-    BOOST_CHECK_EQUAL(next_hash, active[100]->GetBlockHash());
+    BOOST_CHECK_EQUAL(next_hash, active[1000]->GetBlockHash());
     cur_active = next_active = false;
-    BOOST_CHECK(chain->findBlock(active[100]->GetBlockHash(), FoundBlock().inActiveChain(cur_active).nextBlock(FoundBlock().inActiveChain(next_active))));
+    BOOST_CHECK(chain->findBlock(active[1000]->GetBlockHash(), FoundBlock().inActiveChain(cur_active).nextBlock(FoundBlock().inActiveChain(next_active))));
     BOOST_CHECK(cur_active);
     BOOST_CHECK(!next_active);
 
@@ -105,9 +105,8 @@ BOOST_AUTO_TEST_CASE(findCommonAncestor)
         m_node.chainman->ActiveChainstate().InvalidateBlock(state, active.Tip());
     }
     BOOST_CHECK_EQUAL(active.Height(), orig_tip->nHeight - 10);
-    coinbaseKey.MakeNewKey(true);
     for (int i = 0; i < 20; ++i) {
-        CreateAndProcessBlock({}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+        CreateAndProcessBlock({}, P2MROpTrueScript());
     }
     BOOST_CHECK_EQUAL(active.Height(), orig_tip->nHeight + 10);
     uint256 fork_hash;

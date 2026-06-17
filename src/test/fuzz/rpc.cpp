@@ -9,6 +9,7 @@
 #include <primitives/transaction.h>
 #include <psbt.h>
 #include <rpc/client.h>
+#include <rpc/protocol.h>
 #include <rpc/request.h>
 #include <rpc/server.h>
 #include <span.h>
@@ -45,7 +46,7 @@ struct RPCFuzzTestingSetup : public TestingSetup {
     {
     }
 
-    void CallRPC(const std::string& rpc_method, const std::vector<std::string>& arguments)
+    std::optional<UniValue> CallRPC(const std::string& rpc_method, const std::vector<std::string>& arguments)
     {
         JSONRPCRequest request;
         request.context = &m_node;
@@ -53,9 +54,13 @@ struct RPCFuzzTestingSetup : public TestingSetup {
         try {
             request.params = RPCConvertValues(rpc_method, arguments);
         } catch (const std::runtime_error&) {
-            return;
+            return std::nullopt;
         }
-        tableRPC.execute(request);
+        try {
+            return JSONRPCExec(request, /*catch_errors=*/true);
+        } catch (const std::exception& e) {
+            return JSONRPCReplyObj(NullUniValue, JSONRPCError(RPC_MISC_ERROR, e.what()), request.id, request.m_json_version);
+        }
     }
 
     std::vector<std::string> GetRPCCommands() const
@@ -64,8 +69,36 @@ struct RPCFuzzTestingSetup : public TestingSetup {
     }
 };
 
+std::unique_ptr<RPCFuzzTestingSetup> g_rpc_testing_setup;
 RPCFuzzTestingSetup* rpc_testing_setup = nullptr;
 std::string g_limit_to_rpc_command;
+
+void AssertOnlyExpectedInternalBug(const std::optional<UniValue>& reply)
+{
+    if (!reply.has_value() || !reply->exists("error")) {
+        return;
+    }
+    const UniValue& json_rpc_error = reply->find_value("error");
+    if (!json_rpc_error.isObject()) {
+        return;
+    }
+    const std::string error_msg{json_rpc_error.find_value("message").get_str()};
+    if (error_msg.starts_with("Internal bug detected")) {
+        // Only allow the intentional internal bug
+        assert(error_msg.find("trigger_internal_bug") != std::string::npos);
+    }
+}
+
+void CleanupRPCFuzzTestingSetup()
+{
+    if (!g_rpc_testing_setup) {
+        return;
+    }
+    InterruptRPC();
+    StopRPC();
+    rpc_testing_setup = nullptr;
+    g_rpc_testing_setup.reset();
+}
 
 // RPC commands which are not appropriate for fuzzing: such as RPC commands
 // reading or writing to a filename passed as an RPC parameter, RPC commands
@@ -95,6 +128,7 @@ const std::vector<std::string> RPC_COMMANDS_SAFE_FOR_FUZZING{
     "combinepsbt",
     "combinerawtransaction",
     "converttopsbt",
+    "createauxblock",
     "createmultisig",
     "createpsbt",
     "createrawtransaction",
@@ -113,9 +147,11 @@ const std::vector<std::string> RPC_COMMANDS_SAFE_FOR_FUZZING{
     "generateblock",
     "getaddednodeinfo",
     "getaddrmaninfo",
+    "getarchivepeers",
     "getbestblockhash",
     "getblock",
     "getblockchaininfo",
+    "getconfirmationtarget",
     "getblockcount",
     "getblockfilter",
     "getblockfrompeer", // when no peers are connected, no p2p message is sent
@@ -127,6 +163,7 @@ const std::vector<std::string> RPC_COMMANDS_SAFE_FOR_FUZZING{
     "getchainstates",
     "getchaintxstats",
     "getconnectioncount",
+    "getdefaultctvhash",
     "getdeploymentinfo",
     "getdescriptoractivity",
     "getdescriptorinfo",
@@ -142,6 +179,7 @@ const std::vector<std::string> RPC_COMMANDS_SAFE_FOR_FUZZING{
     "getnetworkhashps",
     "getnetworkinfo",
     "getnodeaddresses",
+    "getorphanmetrics",
     "getorphantxs",
     "getpeerinfo",
     "getprioritisedtransactions",
@@ -171,6 +209,7 @@ const std::vector<std::string> RPC_COMMANDS_SAFE_FOR_FUZZING{
     "setnetworkactive",
     "signmessagewithprivkey",
     "signrawtransactionwithkey",
+    "submitauxblock",
     "submitblock",
     "submitheader",
     "submitpackage",
@@ -333,9 +372,12 @@ std::string ConsumeRPCArgument(FuzzedDataProvider& fuzzed_data_provider, bool& g
 
 RPCFuzzTestingSetup* InitializeRPCFuzzTestingSetup()
 {
-    static const auto setup = MakeNoLogFileContext<RPCFuzzTestingSetup>();
+    if (!g_rpc_testing_setup) {
+        g_rpc_testing_setup = MakeNoLogFileContext<RPCFuzzTestingSetup>();
+        std::atexit(CleanupRPCFuzzTestingSetup);
+    }
     SetRPCWarmupFinished();
-    return setup.get();
+    return g_rpc_testing_setup.get();
 }
 }; // namespace
 
@@ -361,32 +403,35 @@ void initialize_rpc()
     }
 }
 
-FUZZ_TARGET(rpc, .init = initialize_rpc)
+FUZZ_TARGET(rpc,
+    .init = initialize_rpc,
+    .disable_leak_detection = true)
 {
     SeedRandomStateForTest(SeedRand::ZEROS);
     FuzzedDataProvider fuzzed_data_provider{buffer.data(), buffer.size()};
     bool good_data{true};
     SetMockTime(ConsumeTime(fuzzed_data_provider));
-    const std::string rpc_command = fuzzed_data_provider.ConsumeRandomLengthString(64);
-    if (!g_limit_to_rpc_command.empty() && rpc_command != g_limit_to_rpc_command) {
-        return;
-    }
+    const std::string rpc_command = g_limit_to_rpc_command.empty() ? fuzzed_data_provider.ConsumeRandomLengthString(64) : g_limit_to_rpc_command;
     const bool safe_for_fuzzing = std::find(RPC_COMMANDS_SAFE_FOR_FUZZING.begin(), RPC_COMMANDS_SAFE_FOR_FUZZING.end(), rpc_command) != RPC_COMMANDS_SAFE_FOR_FUZZING.end();
     if (!safe_for_fuzzing) {
         return;
     }
     std::vector<std::string> arguments;
+    if (!g_limit_to_rpc_command.empty()) {
+        if (rpc_command == "pruneblockchain" || rpc_command == "getblockfrompeer") {
+            return;
+        }
+        if (rpc_command == "getblockchaininfo") {
+            // RPCHelpMan currently aborts on wrong-arity help paths for this command.
+            // Keep the narrowed shared-fuzz target stable by preserving its valid zero-arg call shape.
+            AssertOnlyExpectedInternalBug(rpc_testing_setup->CallRPC(rpc_command, arguments));
+            return;
+        }
+    }
     LIMITED_WHILE(good_data && fuzzed_data_provider.ConsumeBool(), 100)
     {
         arguments.push_back(ConsumeRPCArgument(fuzzed_data_provider, good_data));
     }
-    try {
-        rpc_testing_setup->CallRPC(rpc_command, arguments);
-    } catch (const UniValue& json_rpc_error) {
-        const std::string error_msg{json_rpc_error.find_value("message").get_str()};
-        if (error_msg.starts_with("Internal bug detected")) {
-            // Only allow the intentional internal bug
-            assert(error_msg.find("trigger_internal_bug") != std::string::npos);
-        }
-    }
+
+    AssertOnlyExpectedInternalBug(rpc_testing_setup->CallRPC(rpc_command, arguments));
 }

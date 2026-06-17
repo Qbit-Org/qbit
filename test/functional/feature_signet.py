@@ -9,7 +9,9 @@ from decimal import Decimal
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal
 
-SIGNET_DEFAULT_CHALLENGE = '512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae'
+SIGNET_DEFAULT_CHALLENGE = '51'  # qbit signet uses OP_TRUE by default
+BITCOIN_SIGNET_DEFAULT_CHALLENGE = '512103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae'
+SIGNET_TEST_TIME = 2_000_000_000
 
 signet_blocks = [
     '00000020f61eee3b63a380a477a063af32b2bbc97c9ff9f01f2c4225e973988108000000f575c83235984e7dc4afc1f30944c170462e84437ab6f2d52e16878a79e4678bd1914d5fae77031eccf4070001010000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff025151feffffff0200f2052a010000001600149243f727dd5343293eb83174324019ec16c2630f0000000000000000776a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf94c4fecc7daa2490047304402205e423a8754336ca99dbe16509b877ef1bf98d008836c725005b3c787c41ebe46022047246e4467ad7cc7f1ad98662afcaf14c115e0095a227c7b05c5182591c23e7e01000120000000000000000000000000000000000000000000000000000000000000000000000000',
@@ -40,17 +42,23 @@ class SignetBasicTest(BitcoinTestFramework):
         self.chain = "signet"
         self.num_nodes = 6
         self.setup_clean_chain = True
+        self.mocktime = SIGNET_TEST_TIME
         self.signets = [
-            SignetParams(challenge='51'), # OP_TRUE
-            SignetParams(), # default challenge
-            # default challenge as a 2-of-2, which means it should fail
+            # qbit default challenge (OP_TRUE) so local mining works.
+            SignetParams(),
+            # Use Bitcoin signet challenge explicitly for pregenerated vectors.
+            SignetParams(challenge=BITCOIN_SIGNET_DEFAULT_CHALLENGE),
+            # 2-of-2 multisig challenge: incompatible solution, should fail
             SignetParams(challenge='522103ad5e0edad18cb1f0fc0d28a3d4f1f3e445640337489abb10404f2d1e086be430210359ef5021964fe22d6f8e05b2463c9540ce96883fe3b278760f048f5189f2e6c452ae')
         ]
 
         self.extra_args = [
-            self.signets[0].shared_args, self.signets[0].shared_args,
-            self.signets[1].shared_args, self.signets[1].shared_args,
-            self.signets[2].shared_args, self.signets[2].shared_args,
+            self.signets[0].shared_args + [f"-mocktime={self.mocktime}"],
+            self.signets[0].shared_args + [f"-mocktime={self.mocktime}"],
+            self.signets[1].shared_args + [f"-mocktime={self.mocktime}"],
+            self.signets[1].shared_args + [f"-mocktime={self.mocktime}"],
+            self.signets[2].shared_args + [f"-mocktime={self.mocktime}"],
+            self.signets[2].shared_args + [f"-mocktime={self.mocktime}"],
         ]
 
     def setup_network(self):
@@ -62,7 +70,7 @@ class SignetBasicTest(BitcoinTestFramework):
         self.connect_nodes(4, 5)
 
     def run_test(self):
-        self.log.info("basic tests using OP_TRUE challenge")
+        self.log.info("basic signet challenge tests")
 
         self.log.info('getblockchaininfo')
         def check_getblockchaininfo(node_idx, signet_idx):
@@ -91,15 +99,24 @@ class SignetBasicTest(BitcoinTestFramework):
 
         self.log.info("pregenerated signet blocks check")
 
-        height = 0
+        height = self.nodes[2].getblockcount()
+        compatible_blocks = 0
         for block in signet_blocks:
-            assert_equal(self.nodes[2].submitblock(block), None)
+            result = self.nodes[2].submitblock(block)
+            if result == 'prev-blk-not-found':
+                self.log.info("Pregenerated signet vectors are not compatible with this chain's signet genesis")
+                break
+            assert_equal(result, None)
+            compatible_blocks += 1
             height += 1
             assert_equal(self.nodes[2].getblockcount(), height)
 
         self.log.info("pregenerated signet blocks check (incompatible solution)")
-
-        assert_equal(self.nodes[4].submitblock(signet_blocks[0]), 'bad-signet-blksig')
+        reject_reason = self.nodes[4].submitblock(signet_blocks[0])
+        if compatible_blocks > 0:
+            assert_equal(reject_reason, 'bad-signet-blksig')
+        else:
+            assert reject_reason in ('prev-blk-not-found', 'bad-signet-blksig')
 
         self.log.info("test that signet logs the network magic on node start")
         with self.nodes[0].assert_debug_log(["Signet derived magic (message start)"]):

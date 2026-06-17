@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_I2P_H
-#define BITCOIN_I2P_H
+#ifndef QBIT_I2P_H
+#define QBIT_I2P_H
 
 #include <compat/compat.h>
 #include <netaddress.h>
@@ -280,4 +280,4 @@ private:
 } // namespace sam
 } // namespace i2p
 
-#endif // BITCOIN_I2P_H
+#endif // QBIT_I2P_H

@@ -29,6 +29,10 @@ class BlocksXORTest(BitcoinTestFramework):
         self.log.info("Mine some blocks, to create multiple blk*.dat/rev*.dat files")
         node = self.nodes[0]
         wallet = MiniWallet(node)
+
+        # Mature the default-cache coinbase UTXOs
+        self.ensure_cached_coinbase_mature(self.nodes[0])
+
         for _ in range(5):
             wallet.send_self_transfer(from_node=node, target_vsize=20000)
             self.generate(wallet, 1)

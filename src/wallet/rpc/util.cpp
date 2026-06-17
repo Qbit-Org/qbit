@@ -6,17 +6,25 @@
 
 #include <common/url.h>
 #include <rpc/util.h>
+#include <script/descriptor.h>
 #include <util/any.h>
+#include <util/strencodings.h>
 #include <util/translation.h>
 #include <wallet/context.h>
 #include <wallet/wallet.h>
+#include <wallet/walletutil.h>
 
+#include <set>
 #include <string_view>
 #include <univalue.h>
 
 namespace wallet {
 static const std::string WALLET_ENDPOINT_BASE = "/wallet/";
 const std::string HELP_REQUIRING_PASSPHRASE{"\nRequires wallet passphrase to be set with walletpassphrase call if wallet is encrypted.\n"};
+const std::string P2MR_BIP32_PUBLIC_DERIVATION_ERROR{
+    "BIP32 extended public keys cannot derive SPHINCS+/P2MR public keys. Use exportpubkeydb/importpubkeydb for watch-only P2MR tracking."};
+const std::string P2MR_DESCRIPTOR_EXPORT_WARNING{
+    "Omitted P2MR descriptors that use BIP32 extended public keys because they are not a SPHINCS+/P2MR public derivation interface. Use exportpubkeydb for watch-only P2MR tracking."};
 
 bool GetAvoidReuseFlag(const CWallet& wallet, const UniValue& param) {
     bool can_avoid_reuse = wallet.IsWalletFlagSet(WALLET_FLAG_AVOID_REUSE);
@@ -27,6 +35,30 @@ bool GetAvoidReuseFlag(const CWallet& wallet, const UniValue& param) {
     }
 
     return avoid_reuse;
+}
+
+static OutputType ParseWalletOutputTypeImpl(const std::string& type, std::string_view kind, const CWallet* wallet, bool internal)
+{
+    std::optional<OutputType> parsed = ParseOutputType(type);
+    if (!parsed) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, strprintf("Unknown %s '%s'", kind, type));
+    }
+
+    const bool allowed = wallet ? IsAvailableWalletOutputType(*wallet, parsed.value(), internal) : IsWalletOutputTypeAllowed(parsed.value());
+    if (!allowed) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, strprintf("%s '%s' is not available on this chain", kind, type));
+    }
+    return parsed.value();
+}
+
+OutputType ParseWalletOutputType(const CWallet& wallet, const std::string& type, std::string_view kind, bool internal)
+{
+    return ParseWalletOutputTypeImpl(type, kind, &wallet, internal);
+}
+
+OutputType ParseWalletOutputType(const std::string& type, std::string_view kind)
+{
+    return ParseWalletOutputTypeImpl(type, kind, nullptr, /*internal=*/false);
 }
 
 std::string EnsureUniqueWalletName(const JSONRPCRequest& request, const std::string* wallet_name)
@@ -111,16 +143,109 @@ std::string LabelFromValue(const UniValue& value)
     return label;
 }
 
+bool IsP2MRBIP32PublicDerivationDescriptor(const Descriptor& descriptor)
+{
+    const auto output_type = descriptor.GetOutputType();
+    if (!output_type || *output_type != OutputType::P2MR) return false;
+
+    std::set<CPubKey> pubkeys;
+    std::set<CExtPubKey> ext_pubs;
+    descriptor.GetPubKeys(pubkeys, ext_pubs);
+    return !ext_pubs.empty();
+}
+
+bool ShouldSuppressP2MRBIP32Descriptor(const Descriptor& descriptor, bool private_export)
+{
+    return !private_export && IsP2MROnlyWalletChain() && IsP2MRBIP32PublicDerivationDescriptor(descriptor);
+}
+
 void PushParentDescriptors(const CWallet& wallet, const CScript& script_pubkey, UniValue& entry)
 {
     UniValue parent_descs(UniValue::VARR);
     for (const auto& desc: wallet.GetWalletDescriptors(script_pubkey)) {
+        if (ShouldSuppressP2MRBIP32Descriptor(*desc.descriptor, /*private_export=*/false)) continue;
+
         std::string desc_str;
         FlatSigningProvider dummy_provider;
         if (!CHECK_NONFATAL(desc.descriptor->ToNormalizedString(dummy_provider, desc_str, &desc.cache))) continue;
         parent_descs.push_back(desc_str);
     }
     entry.pushKV("parent_descs", std::move(parent_descs));
+}
+
+std::vector<RPCResult> PQCUsageRPCResults(bool include_warnings)
+{
+    std::vector<RPCResult> results{
+        {RPCResult::Type::ARR, "pqc_key_states", /*optional=*/true, "PQC usage state for local wallet keys that participated in this response.",
+        {
+            {RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::STR_HEX, "pubkey", "The hex-encoded PQC public key."},
+                {RPCResult::Type::NUM, "pqc_signature_count", "The number of signatures used by this PQC key."},
+                {RPCResult::Type::NUM, "pqc_signature_limit", "The hard signature limit for this PQC key."},
+                {RPCResult::Type::NUM, "pqc_signatures_remaining", "The remaining signature budget for this PQC key."},
+                {RPCResult::Type::STR, "pqc_limit_state", "The PQC usage state. One of `normal`, `warning`, `critical`, or `exhausted`."},
+            }},
+        }},
+        {RPCResult::Type::STR, "pqc_overall_limit_state", /*optional=*/true, "The maximum PQC usage severity across `pqc_key_states`."},
+        {RPCResult::Type::NUM, "pqc_signature_count", /*optional=*/true, "The number of signatures used by the single local PQC key associated with this response."},
+        {RPCResult::Type::NUM, "pqc_signature_limit", /*optional=*/true, "The hard signature limit for the single local PQC key associated with this response."},
+        {RPCResult::Type::NUM, "pqc_signatures_remaining", /*optional=*/true, "The remaining signature budget for the single local PQC key associated with this response."},
+        {RPCResult::Type::STR, "pqc_limit_state", /*optional=*/true, "The PQC usage state for the single local PQC key associated with this response."},
+    };
+    if (include_warnings) {
+        results.push_back({
+            RPCResult::Type::ARR,
+            "warnings",
+            /*optional=*/true,
+            "Human-readable warning lines emitted when PQC threshold transitions or reminder buckets fire.",
+            {
+                {RPCResult::Type::STR, "warning", ""},
+            },
+        });
+    }
+    return results;
+}
+
+void AppendPQCUsage(UniValue& entry, const PQCUsageReport& report, bool include_warnings)
+{
+    if (report.key_states.empty()) {
+        return;
+    }
+
+    UniValue key_states(UniValue::VARR);
+    for (const PQCUsageSnapshot& key_state : report.key_states) {
+        UniValue state(UniValue::VOBJ);
+        state.pushKV("pubkey", HexStr(std::span<const unsigned char>{key_state.pubkey.begin(), key_state.pubkey.end()}));
+        state.pushKV("pqc_signature_count", static_cast<int64_t>(key_state.signature_count));
+        state.pushKV("pqc_signature_limit", static_cast<int64_t>(key_state.signature_limit));
+        state.pushKV("pqc_signatures_remaining", static_cast<int64_t>(key_state.signatures_remaining));
+        state.pushKV("pqc_limit_state", std::string{PQCSignatureLimitStateName(key_state.limit_state)});
+        key_states.push_back(std::move(state));
+    }
+    entry.pushKV("pqc_key_states", std::move(key_states));
+
+    CHECK_NONFATAL(report.overall_state.has_value());
+    entry.pushKV("pqc_overall_limit_state", std::string{PQCSignatureLimitStateName(*report.overall_state)});
+
+    if (report.key_states.size() == 1) {
+        const PQCUsageSnapshot& key_state = report.key_states.front();
+        entry.pushKV("pqc_signature_count", static_cast<int64_t>(key_state.signature_count));
+        entry.pushKV("pqc_signature_limit", static_cast<int64_t>(key_state.signature_limit));
+        entry.pushKV("pqc_signatures_remaining", static_cast<int64_t>(key_state.signatures_remaining));
+        entry.pushKV("pqc_limit_state", std::string{PQCSignatureLimitStateName(key_state.limit_state)});
+    }
+
+    if (include_warnings) {
+        PushWarnings(FormatPQCUsageWarnings(report.warnings), entry);
+    }
+}
+
+void LogPQCUsageWarnings(const CWallet& wallet, const PQCUsageReport& report)
+{
+    for (const bilingual_str& warning : FormatPQCUsageWarnings(report.warnings)) {
+        wallet.WalletLogPrintf("PQC usage warning: %s\n", warning.original);
+    }
 }
 
 void HandleWalletError(const std::shared_ptr<CWallet> wallet, DatabaseStatus& status, bilingual_str& error)

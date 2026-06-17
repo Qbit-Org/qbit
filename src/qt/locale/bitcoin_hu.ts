@@ -1031,7 +1031,7 @@ Aláírni csak régi típusú, egyessel kezdődő címekkel lehet.</translation>
         <translation type="unfinished">(%1 zárolva)</translation>
     </message>
     <message>
-        <source>Can vary +/- %1 satoshi(s) per input.</source>
+        <source>Can vary +/- %1 bits per input.</source>
         <translation type="unfinished">Eltérhet +/- %1 satoshi-val bemenetenként.</translation>
     </message>
     <message>
@@ -3006,13 +3006,13 @@ Gépeljen %5 az elérhető parancsok áttekintéséhez. Több információért a
     <message>
         <source>Specify a custom fee per kB (1,000 bytes) of the transaction's virtual size.
 
-Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 satoshis per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 satoshis.</source>
+Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 bits per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 bits.</source>
         <translation type="unfinished">Adjon meg egy egyéni díjat a tranzakció virtuális méretének 1 kilobájtjához (1000 bájt).
 
 Megjegyzés: Mivel a díj bájtonként van kiszámítva, egy "100 satoshi kvB-nként"-ként megadott díj egy 500 virtuális bájt (1kvB fele) méretű tranzakció végül csak 50 satoshi-s díjat jelentene.</translation>
     </message>
     <message>
-        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for bitcoin transactions than the network can process.</source>
+        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for qbit transactions than the network can process.</source>
         <translation type="unfinished">Ha kevesebb a tranzakció, mint amennyi hely lenne egy blokkban, akkor a bányászok és a többi csomópont megkövetelheti a minimum díjat. Ezt a minimum díjat fizetni elegendő lehet de elképzelhető, hogy ez esetleg egy soha sem jóváhagyott tranzakciót eredményez ahogy a tranzakciók száma magasabb lesz, mint a hálózat által megengedett.</translation>
     </message>
     <message>
@@ -3297,7 +3297,7 @@ Megjegyzés: Mivel a díj bájtonként van kiszámítva, egy "100 satoshi kvB-nk
         <translation type="unfinished">A küldendő összeg a választott egységben.</translation>
     </message>
     <message>
-        <source>The fee will be deducted from the amount being sent. The recipient will receive less bitcoins than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
+        <source>The fee will be deducted from the amount being sent. The recipient will receive less QBT than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
         <translation type="unfinished">A díj le lesz vonva a küldött teljes összegből. A címzett kevesebb bitcoint fog megkapni, mint amennyit az összeg mezőben megadott. Amennyiben több címzett van kiválasztva, az illeték egyenlő mértékben lesz elosztva.</translation>
     </message>
     <message>
@@ -4062,8 +4062,8 @@ A "Fájl &gt; Tárca megnyitása" menüben tölthet be egyet.
         <translation type="unfinished">%s: az -assumeutxo pillanatkép állapot jóváhagyása sikertelen. Ez hardverproblémára, programhibára vagy olyan hibás módosításra utalhat a programban, ami engedélyezte az érvénytelen pillanatkép betöltését. Emiatt a csomópont most leáll és nem használ olyan állapotot ami a megadott pillanatképre épül, újraépítve a blokkláncot %d és %d között. A következő indításkor a csomópont szinkronizálni fog innen: %d figyelmen kívül hagyva minden adatot a pillanatképből. Kérjük jelentse ezt a problémát itt: %s, hozzátéve hogyan jutott a hibát okozó pillanatképhez. Az érvénytelen láncállapot pillanatkép megőrizve marad a lemezen arra az esetre, ha hasznosnak bizonyul a hiba okának feltárása során.</translation>
     </message>
     <message>
-        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/p2p-bad-ports.md for details and a full list.</source>
-        <translation type="unfinished">%s kérés figyel a(z) %u porton. Ennek a portnak a megítélése "rossz" ezért valószínűtlen, hogy más partner ezen keresztül csatlakozna. Részletekért és teljes listáért lásd doc/p2p-bad-ports.md.</translation>
+        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/reference/p2p-bad-ports.md for details and a full list.</source>
+        <translation type="unfinished">%s kérés figyel a(z) %u porton. Ennek a portnak a megítélése "rossz" ezért valószínűtlen, hogy más partner ezen keresztül csatlakozna. Részletekért és teljes listáért lásd doc/reference/p2p-bad-ports.md.</translation>
     </message>
     <message>
         <source>Disk space for %s may not accommodate the block files. Approximately %u GB of data will be stored in this directory.</source>

@@ -3,7 +3,7 @@
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 #
-# Generate seeds.txt from Pieter's DNS seeder
+# Generate qbit seed lists from qbit-owned crawler output.
 #
 
 import argparse
@@ -28,29 +28,16 @@ MAX_SEEDS_PER_ASN = {
 
 MIN_BLOCKS = 910000
 
+NODE_NETWORK = 1 << 0
+NODE_WITNESS = 1 << 3
+NODE_ARCHIVE = 1 << 13
+REQUIRED_SERVICE_FLAGS = NODE_NETWORK | NODE_WITNESS | NODE_ARCHIVE
+
 PATTERN_IPV4 = re.compile(r"^(([0-2]?\d{1,2})\.([0-2]?\d{1,2})\.([0-2]?\d{1,2})\.([0-2]?\d{1,2})):(\d{1,5})$")
 PATTERN_IPV6 = re.compile(r"^\[([\da-f:]+)]:(\d{1,5})$", re.IGNORECASE)
 PATTERN_ONION = re.compile(r"^([a-z2-7]{56}\.onion):(\d+)$")
 PATTERN_I2P = re.compile(r"^([a-z2-7]{52}\.b32\.i2p):(\d{1,5})$")
-PATTERN_AGENT = re.compile(
-    r"^/Satoshi:("
-    r"0\.14\.(0|1|2|3|99)"
-    r"|0\.15\.(0|1|2|99)"
-    r"|0\.16\.(0|1|2|3|99)"
-    r"|0\.17\.(0|0\.1|1|2|99)"
-    r"|0\.18\.(0|1|99)"
-    r"|0\.19\.(0|1|2|99)"
-    r"|0\.20\.(0|1|2|99)"
-    r"|0\.21\.(0|1|2|99)"
-    r"|22\.(0|1|99)\.0"
-    r"|23\.(0|1|2|99)\.0"
-    r"|24\.(0|1|2|99)\.(0|1)"
-    r"|25\.(0|1|2|99)\.0"
-    r"|26\.(0|1|2|99)\.0"
-    r"|27\.(0|1|2|99)\.0"
-    r"|28\.(0|1|2|99)\.0"
-    r"|29\.(0|99)\.0"
-    r")")
+PATTERN_AGENT = re.compile(r"^/qbit:\d+\.\d+\.\d+(?:-[A-Za-z0-9]+(?:[.-][A-Za-z0-9]+)*)?/$")
 
 def parseline(line: str) -> Union[dict, None]:
     """ Parses a line from `seeds_main.txt` into a dictionary of details for that line.
@@ -196,7 +183,7 @@ def ip_stats(ips: list[dict]) -> str:
     return f"{hist['ipv4']:6d} {hist['ipv6']:6d} {hist['onion']:6d} {hist['i2p']:6d} {hist['cjdns']:6d}"
 
 def parse_args():
-    argparser = argparse.ArgumentParser(description='Generate a list of bitcoin node seed ip addresses.')
+    argparser = argparse.ArgumentParser(description='Generate a list of qbit node seed IP addresses.')
     argparser.add_argument("-a","--asmap", help='the location of the asmap asn database file (required)', required=True)
     argparser.add_argument("-s","--seeds", help='the location of the DNS seeds file (required)', required=True)
     argparser.add_argument("-m", "--minblocks", help="The minimum number of blocks each node must have", default=MIN_BLOCKS, type=int)
@@ -228,9 +215,9 @@ def main():
     # Enforce minimal number of blocks.
     ips = [ip for ip in ips if ip['blocks'] >= args.minblocks]
     print(f'{ip_stats(ips):s} Enforce minimal number of blocks', file=sys.stderr)
-    # Require service bit 1.
-    ips = [ip for ip in ips if (ip['service'] & 1) == 1]
-    print(f'{ip_stats(ips):s} Require service bit 1', file=sys.stderr)
+    # Require nodes to match the archive-capable seed query service bits.
+    ips = [ip for ip in ips if (ip['service'] & REQUIRED_SERVICE_FLAGS) == REQUIRED_SERVICE_FLAGS]
+    print(f'{ip_stats(ips):s} Require NODE_NETWORK | NODE_WITNESS | NODE_ARCHIVE', file=sys.stderr)
     # Require at least 50% 30-day uptime for clearnet, onion and i2p; 10% for cjdns
     req_uptime = {
         'ipv4': 50,
@@ -246,9 +233,9 @@ def main():
     print(f'{ip_stats(ips):s} Require a known and recent user agent', file=sys.stderr)
     # Sort by availability (and use last success as tie breaker)
     ips.sort(key=lambda x: (x['uptime'], x['lastsuccess'], x['ip']), reverse=True)
-    # Filter out hosts with multiple bitcoin ports, these are likely abusive
+    # Filter out hosts with multiple qbit ports, these are likely abusive.
     ips = filtermultiport(ips)
-    print(f'{ip_stats(ips):s} Filter out hosts with multiple bitcoin ports', file=sys.stderr)
+    print(f'{ip_stats(ips):s} Filter out hosts with multiple qbit ports', file=sys.stderr)
     # Look up ASNs and limit results, both per ASN and globally.
     ips = filterbyasn(asmap, ips, MAX_SEEDS_PER_ASN, NSEEDS)
     print(f'{ip_stats(ips):s} Look up ASNs and limit results per ASN and per net', file=sys.stderr)

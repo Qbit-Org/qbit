@@ -4,6 +4,7 @@
 # file COPYING or https://opensource.org/license/mit/.
 
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -33,12 +34,24 @@ def main():
         "CI_FAILFAST_TEST_LEAVE_DANGLING",
     ])
 
-    # Append $USER to /tmp/env to support multi-user systems and $CONTAINER_NAME
-    # to allow support starting multiple runs simultaneously by the same user.
-    env_file = "/tmp/env-{u}-{c}".format(
-        u=os.getenv("USER"),
-        c=os.getenv("CONTAINER_NAME"),
+    # Make container/env-file names unique per workflow run to avoid collisions
+    # between concurrent jobs sharing one Docker daemon.
+    unique_id = "{run_id}-{attempt}-{job}".format(
+        run_id=os.getenv("GITHUB_RUN_ID", "local"),
+        attempt=os.getenv("GITHUB_RUN_ATTEMPT", "0"),
+        job=os.getenv("GITHUB_JOB", "job"),
     )
+    unique_id = re.sub(r"[^A-Za-z0-9_.-]", "-", unique_id)
+    container_name = "{base}-{suffix}".format(
+        base=os.getenv("CONTAINER_NAME", "ci"),
+        suffix=unique_id,
+    )
+    env_file = "/tmp/env-{u}-{c}".format(
+        u=os.getenv("USER", "ci"),
+        c=container_name,
+    )
+    os.environ["CI_CONTAINER_NAME"] = container_name
+    os.environ["CI_ENV_FILE"] = env_file
     with open(env_file, "w", encoding="utf8") as file:
         for k, v in os.environ.items():
             if k in settings:

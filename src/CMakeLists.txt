@@ -25,6 +25,8 @@ if (ENABLE_IPC AND NOT WITH_EXTERNAL_LIBMULTIPROCESS)
 endif()
 include(../cmake/secp256k1.cmake)
 add_secp256k1(secp256k1)
+include(../cmake/libbitcoinpqc.cmake)
+add_libbitcoinpqc(libbitcoinpqc)
 
 # Set top-level target output locations.
 if(NOT CMAKE_RUNTIME_OUTPUT_DIRECTORY)
@@ -75,6 +77,7 @@ target_link_libraries(bitcoin_consensus
   PRIVATE
     core_interface
     bitcoin_crypto
+    bitcoinpqc
     secp256k1
 )
 
@@ -108,6 +111,7 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   compressor.cpp
   core_read.cpp
   core_write.cpp
+  crypto/pqc.cpp
   deploymentinfo.cpp
   external_signer.cpp
   init/common.cpp
@@ -147,6 +151,8 @@ target_link_libraries(bitcoin_common
     Boost::headers
     $<TARGET_NAME_IF_EXISTS:USDT::headers>
     $<$<PLATFORM_ID:Windows>:ws2_32>
+  PUBLIC
+    bitcoinpqc
 )
 
 include(InstallBinaryComponent)
@@ -160,6 +166,7 @@ if(ENABLE_WALLET)
       init/bitcoin-wallet.cpp
       wallet/wallettool.cpp
     )
+    set_target_properties(bitcoin-wallet PROPERTIES OUTPUT_NAME qbit-wallet)
     add_windows_resources(bitcoin-wallet bitcoin-wallet-res.rc)
     add_windows_application_manifest(bitcoin-wallet)
     target_link_libraries(bitcoin-wallet
@@ -174,10 +181,12 @@ if(ENABLE_WALLET)
 endif()
 
 
-# P2P and RPC server functionality used by `bitcoind` and `bitcoin-qt` executables.
+# P2P and RPC server functionality used by `qbitd` and `qbit-qt` executables.
 add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   addrdb.cpp
   addrman.cpp
+  auxpow.cpp
+  auxpow_validation.cpp
   banman.cpp
   bip324.cpp
   blockencodings.cpp
@@ -227,6 +236,8 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   node/miner.cpp
   node/mini_miner.cpp
   node/minisketchwrapper.cpp
+  node/confirmation_target.cpp
+  node/orphan_metrics.cpp
   node/peerman_args.cpp
   node/psbt.cpp
   node/timeoffsets.cpp
@@ -246,6 +257,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   policy/truc_policy.cpp
   rest.cpp
   rpc/blockchain.cpp
+  rpc/doc.cpp
   rpc/external_signer.cpp
   rpc/fees.cpp
   rpc/mempool.cpp
@@ -290,32 +302,36 @@ target_link_libraries(bitcoin_node
 # Bitcoin wrapper executable that can call other executables.
 if(BUILD_BITCOIN_BIN)
   add_executable(bitcoin bitcoin.cpp)
+  set_target_properties(bitcoin PROPERTIES OUTPUT_NAME qbit)
   add_windows_resources(bitcoin bitcoin-res.rc)
   add_windows_application_manifest(bitcoin)
   target_link_libraries(bitcoin core_interface bitcoin_common bitcoin_util)
   install_binary_component(bitcoin HAS_MANPAGE)
 endif()
 
-# Bitcoin Core bitcoind.
+# qbit daemon executable.
 if(BUILD_DAEMON)
-  add_executable(bitcoind
+  add_executable(qbitd
     bitcoind.cpp
     init/bitcoind.cpp
   )
-  add_windows_resources(bitcoind bitcoind-res.rc)
-  add_windows_application_manifest(bitcoind)
-  target_link_libraries(bitcoind
+  # Compatibility target for older automation; use `qbitd` for new qbit builds.
+  add_custom_target(bitcoind DEPENDS qbitd)
+  add_windows_resources(qbitd bitcoind-res.rc)
+  add_windows_application_manifest(qbitd)
+  target_link_libraries(qbitd
     core_interface
     bitcoin_node
     $<TARGET_NAME_IF_EXISTS:bitcoin_wallet>
   )
-  install_binary_component(bitcoind HAS_MANPAGE)
+  install_binary_component(qbitd HAS_MANPAGE)
 endif()
 if(ENABLE_IPC AND BUILD_DAEMON)
   add_executable(bitcoin-node
     bitcoind.cpp
     init/bitcoin-node.cpp
   )
+  set_target_properties(bitcoin-node PROPERTIES OUTPUT_NAME qbit-node)
   target_link_libraries(bitcoin-node
     core_interface
     bitcoin_node
@@ -353,12 +369,14 @@ target_link_libraries(bitcoin_cli
 )
 
 
-# Bitcoin Core RPC client
+# qbit RPC client executable.
 if(BUILD_CLI)
-  add_executable(bitcoin-cli bitcoin-cli.cpp)
-  add_windows_resources(bitcoin-cli bitcoin-cli-res.rc)
-  add_windows_application_manifest(bitcoin-cli)
-  target_link_libraries(bitcoin-cli
+  add_executable(qbit-cli bitcoin-cli.cpp)
+  # Compatibility target for older automation; use `qbit-cli` for new qbit builds.
+  add_custom_target(bitcoin-cli DEPENDS qbit-cli)
+  add_windows_resources(qbit-cli bitcoin-cli-res.rc)
+  add_windows_application_manifest(qbit-cli)
+  target_link_libraries(qbit-cli
     core_interface
     bitcoin_cli
     bitcoin_common
@@ -366,12 +384,13 @@ if(BUILD_CLI)
     libevent::core
     libevent::extra
   )
-  install_binary_component(bitcoin-cli HAS_MANPAGE)
+  install_binary_component(qbit-cli HAS_MANPAGE)
 endif()
 
 
 if(BUILD_TX)
   add_executable(bitcoin-tx bitcoin-tx.cpp)
+  set_target_properties(bitcoin-tx PROPERTIES OUTPUT_NAME qbit-tx)
   add_windows_resources(bitcoin-tx bitcoin-tx-res.rc)
   add_windows_application_manifest(bitcoin-tx)
   target_link_libraries(bitcoin-tx
@@ -386,6 +405,7 @@ endif()
 
 if(BUILD_UTIL)
   add_executable(bitcoin-util bitcoin-util.cpp)
+  set_target_properties(bitcoin-util PROPERTIES OUTPUT_NAME qbit-util)
   add_windows_resources(bitcoin-util bitcoin-util-res.rc)
   add_windows_application_manifest(bitcoin-util)
   target_link_libraries(bitcoin-util
@@ -395,6 +415,20 @@ if(BUILD_UTIL)
   )
   install_binary_component(bitcoin-util HAS_MANPAGE)
 endif()
+
+add_executable(bitcoin-rpcdocgen
+  rpc/docgen.cpp
+  rpc/rpcdocgen.cpp
+)
+set_target_properties(bitcoin-rpcdocgen PROPERTIES OUTPUT_NAME qbit-rpcdocgen)
+target_link_libraries(bitcoin-rpcdocgen
+  core_interface
+  bitcoin_node
+  bitcoin_common
+  $<TARGET_NAME_IF_EXISTS:bitcoin_wallet>
+  $<TARGET_NAME_IF_EXISTS:bitcoin_zmq>
+  univalue
+)
 
 
 if(BUILD_GUI)
@@ -417,6 +451,7 @@ if(BUILD_UTIL_CHAINSTATE)
   # - https://github.com/hebasto/bitcoin/pull/236#issuecomment-2183120953
   # - https://github.com/bitcoin/bitcoin/pull/30312#issuecomment-2191235833
   set_target_properties(bitcoin-chainstate PROPERTIES
+    OUTPUT_NAME qbit-chainstate
     SKIP_BUILD_RPATH OFF
   )
   target_link_libraries(bitcoin-chainstate

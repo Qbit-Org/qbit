@@ -7,6 +7,7 @@
 This is meant to be documentation as much as functional tests, so it is kept as simple and readable as possible.
 """
 
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_approx,
@@ -29,7 +30,8 @@ class WalletMultisigDescriptorPSBTTest(BitcoinTestFramework):
         """Extract the wallet's xpubs using `listdescriptors` and pick the one from the `pkh` descriptor since it's least likely to be accidentally reused (legacy addresses)."""
         pkh_descriptor = next(filter(lambda d: d["desc"].startswith("pkh(") and d["internal"] == internal, wallet.listdescriptors()["descriptors"]))
         # Keep all key origin information (master key fingerprint and all derivation steps) for proper support of hardware devices
-        # See section 'Key origin identification' in 'doc/descriptors.md' for more details...
+        # See section 'Key origin identification' in
+        # 'doc/user/wallet/descriptors.md' for more details...
         return pkh_descriptor["desc"].split("pkh(")[1].split(")")[0]
 
     @staticmethod
@@ -97,10 +99,12 @@ class WalletMultisigDescriptorPSBTTest(BitcoinTestFramework):
             assert all(address == change_addresses[0] for address in change_addresses)
 
         self.log.info("Get a mature utxo to send to the multisig...")
-        coordinator_wallet = participants["signers"][0]
-        self.generatetoaddress(self.nodes[0], 101, coordinator_wallet.getnewaddress())
-
         deposit_amount = 6.15
+        coordinator_wallet = participants["signers"][0]
+        self.generatetoaddress(self.nodes[0], COINBASE_MATURITY + 1, coordinator_wallet.getnewaddress())
+        while float(coordinator_wallet.getbalance()) < deposit_amount:
+            self.generatetoaddress(self.nodes[0], 1, coordinator_wallet.getnewaddress())
+
         multisig_receiving_address = participants["multisigs"][0].getnewaddress()
         self.log.info("Send funds to the resulting multisig receiving address...")
         coordinator_wallet.sendtoaddress(multisig_receiving_address, deposit_amount)

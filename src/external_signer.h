@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_EXTERNAL_SIGNER_H
-#define BITCOIN_EXTERNAL_SIGNER_H
+#ifndef QBIT_EXTERNAL_SIGNER_H
+#define QBIT_EXTERNAL_SIGNER_H
 
 #include <common/system.h>
 #include <univalue.h>
@@ -14,7 +14,8 @@
 struct PartiallySignedTransaction;
 
 //! Enables interaction with an external signing device or service, such as
-//! a hardware wallet. See doc/external-signer.md
+//! a hardware wallet. P2MR/PQC external signer workflows require qbit-specific
+//! validation before they are treated as public wallet guidance.
 class ExternalSigner
 {
 private:
@@ -54,7 +55,7 @@ public:
     //! Get receive and change Descriptor(s) from device for a given account.
     //! Calls `<command> getdescriptors --account <account>`
     //! @param[in] account  which BIP32 account to use (e.g. `m/44'/0'/account'`)
-    //! @returns see doc/external-signer.md
+    //! @returns descriptor data reported by the external signer
     UniValue GetDescriptors(const int account);
 
     //! Sign PartiallySignedTransaction on the device.
@@ -63,4 +64,4 @@ public:
     bool SignTransaction(PartiallySignedTransaction& psbt, std::string& error);
 };
 
-#endif // BITCOIN_EXTERNAL_SIGNER_H
+#endif // QBIT_EXTERNAL_SIGNER_H

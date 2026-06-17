@@ -967,7 +967,7 @@ Podpisovanje je možno le s podedovanimi ("legacy") naslovi.</translation>
         <translation type="unfinished">Kopiraj vračilo</translation>
     </message>
     <message>
-        <source>Can vary +/- %1 satoshi(s) per input.</source>
+        <source>Can vary +/- %1 bits per input.</source>
         <translation type="unfinished">Lahko se razlikuje za +/- %1 sat na vhod.</translation>
     </message>
     <message>
@@ -2915,13 +2915,13 @@ Za več informacij glede uporabe konzole uporabite ukaz %6.
     <message>
         <source>Specify a custom fee per kB (1,000 bytes) of the transaction's virtual size.
 
-Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 satoshis per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 satoshis.</source>
+Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 bits per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 bits.</source>
         <translation type="unfinished">Določite poljubno provizijo na kB (1000 bajtov) navidezne velikosti transakcije.
 
 Opomba: Ker se provizija izračuna na bajt, bi provizija "100 satoshijev na kvB" za transakcijo velikosti 500 navideznih bajtov (polovica enega kvB) znašala le 50 satošijev.</translation>
     </message>
     <message>
-        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for bitcoin transactions than the network can process.</source>
+        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for qbit transactions than the network can process.</source>
         <translation type="unfinished">Kadar je v blokih manj prostora, kot je zahtev po transakcijah, lahko rudarji in posredovalna vozlišča zahtevajo minimalno provizijo. V redu, če plačate samo to minimalno provizijo, vendar se zavedajte, da se potem transakcija lahko nikoli ne potrdi, če bo povpraševanje po transakcijah večje, kot ga omrežje lahko obdela.</translation>
     </message>
     <message>
@@ -3205,7 +3205,7 @@ Opomba: Ker se provizija izračuna na bajt, bi provizija "100 satoshijev na kvB"
         <translation type="unfinished">Znesek za pošiljanje v izbrani enoti</translation>
     </message>
     <message>
-        <source>The fee will be deducted from the amount being sent. The recipient will receive less bitcoins than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
+        <source>The fee will be deducted from the amount being sent. The recipient will receive less QBT than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
         <translation type="unfinished">Znesek plačila bo zmanjšan za znesek provizije. Prejemnik bo prejel manjši znesek, kot je bil vnešen. Če je prejemnikov več, bo provizija med njih enakomerno porazdeljena.</translation>
     </message>
     <message>

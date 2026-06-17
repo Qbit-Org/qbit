@@ -6,7 +6,7 @@
 
 #include <qt/bitcoingui.h>
 
-#include <qt/bitcoinunits.h>
+#include <qt/qbitunits.h>
 #include <qt/clientmodel.h>
 #include <qt/createwalletdialog.h>
 #include <qt/guiconstants.h>
@@ -38,6 +38,7 @@
 #include <interfaces/handler.h>
 #include <interfaces/node.h>
 #include <node/interface_ui.h>
+#include <outputtype.h>
 #include <util/translation.h>
 #include <validation.h>
 
@@ -257,14 +258,14 @@ void BitcoinGUI::createActions()
     tabGroup->addAction(overviewAction);
 
     sendCoinsAction = new QAction(platformStyle->SingleColorIcon(":/icons/send"), tr("&Send"), this);
-    sendCoinsAction->setStatusTip(tr("Send coins to a Bitcoin address"));
+    sendCoinsAction->setStatusTip(tr("Send coins to a qbit address"));
     sendCoinsAction->setToolTip(sendCoinsAction->statusTip());
     sendCoinsAction->setCheckable(true);
     sendCoinsAction->setShortcut(QKeySequence(QStringLiteral("Alt+2")));
     tabGroup->addAction(sendCoinsAction);
 
     receiveCoinsAction = new QAction(platformStyle->SingleColorIcon(":/icons/receiving_addresses"), tr("&Receive"), this);
-    receiveCoinsAction->setStatusTip(tr("Request payments (generates QR codes and bitcoin: URIs)"));
+    receiveCoinsAction->setStatusTip(tr("Request payments (generates QR codes and qbit: URIs)"));
     receiveCoinsAction->setToolTip(receiveCoinsAction->statusTip());
     receiveCoinsAction->setCheckable(true);
     receiveCoinsAction->setShortcut(QKeySequence(QStringLiteral("Alt+3")));
@@ -314,13 +315,17 @@ void BitcoinGUI::createActions()
     changePassphraseAction = new QAction(tr("&Change Passphrase…"), this);
     changePassphraseAction->setStatusTip(tr("Change the passphrase used for wallet encryption"));
     signMessageAction = new QAction(tr("Sign &message…"), this);
-    signMessageAction->setStatusTip(tr("Sign messages with your Bitcoin addresses to prove you own them"));
+    signMessageAction->setStatusTip(tr("Sign messages with your qbit addresses to prove you own them"));
     verifyMessageAction = new QAction(tr("&Verify message…"), this);
-    verifyMessageAction->setStatusTip(tr("Verify messages to ensure they were signed with specified Bitcoin addresses"));
+    verifyMessageAction->setStatusTip(tr("Verify messages to ensure they were signed with specified qbit addresses"));
+    if (IsP2MROnlyOutputChain()) {
+        signMessageAction->setStatusTip(tr("Legacy message signing is disabled on this chain"));
+        verifyMessageAction->setStatusTip(tr("Legacy message verification is disabled on this chain"));
+    }
     m_load_psbt_action = new QAction(tr("&Load PSBT from file…"), this);
-    m_load_psbt_action->setStatusTip(tr("Load Partially Signed Bitcoin Transaction"));
+    m_load_psbt_action->setStatusTip(tr("Load Partially Signed Transaction (PSBT)"));
     m_load_psbt_clipboard_action = new QAction(tr("Load PSBT from &clipboard…"), this);
-    m_load_psbt_clipboard_action->setStatusTip(tr("Load Partially Signed Bitcoin Transaction from clipboard"));
+    m_load_psbt_clipboard_action->setStatusTip(tr("Load Partially Signed Transaction (PSBT) from clipboard"));
 
     openRPCConsoleAction = new QAction(tr("Node window"), this);
     openRPCConsoleAction->setStatusTip(tr("Open node debugging and diagnostic console"));
@@ -334,7 +339,7 @@ void BitcoinGUI::createActions()
     usedReceivingAddressesAction->setStatusTip(tr("Show the list of used receiving addresses and labels"));
 
     openAction = new QAction(tr("Open &URI…"), this);
-    openAction->setStatusTip(tr("Open a bitcoin: URI"));
+    openAction->setStatusTip(tr("Open a qbit: URI"));
 
     m_open_wallet_action = new QAction(tr("Open Wallet"), this);
     m_open_wallet_action->setEnabled(false);
@@ -364,7 +369,7 @@ void BitcoinGUI::createActions()
 
     showHelpMessageAction = new QAction(tr("&Command-line options"), this);
     showHelpMessageAction->setMenuRole(QAction::NoRole);
-    showHelpMessageAction->setStatusTip(tr("Show the %1 help message to get a list with possible Bitcoin command-line options").arg(CLIENT_NAME));
+    showHelpMessageAction->setStatusTip(tr("Show the %1 help message to get a list with possible qbit command-line options").arg(CLIENT_NAME));
 
     m_mask_values_action = new QAction(tr("&Mask values"), this);
     m_mask_values_action->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_M));
@@ -825,8 +830,8 @@ void BitcoinGUI::setWalletActionsEnabled(bool enabled)
     encryptWalletAction->setEnabled(enabled);
     backupWalletAction->setEnabled(enabled);
     changePassphraseAction->setEnabled(enabled);
-    signMessageAction->setEnabled(enabled);
-    verifyMessageAction->setEnabled(enabled);
+    signMessageAction->setEnabled(enabled && !IsP2MROnlyOutputChain());
+    verifyMessageAction->setEnabled(enabled && !IsP2MROnlyOutputChain());
     usedSendingAddressesAction->setEnabled(enabled);
     usedReceivingAddressesAction->setEnabled(enabled);
     openAction->setEnabled(enabled);
@@ -1028,7 +1033,7 @@ void BitcoinGUI::updateNetworkState()
 
     if (m_node.getNetworkActive()) {
         //: A substring of the tooltip.
-        tooltip = tr("%n active connection(s) to Bitcoin network.", "", count);
+        tooltip = tr("%n active connection(s) to qbit network.", "", count);
     } else {
         //: A substring of the tooltip.
         tooltip = tr("Network activity disabled.");
@@ -1081,8 +1086,12 @@ void BitcoinGUI::updateHeadersSyncProgressLabel()
 void BitcoinGUI::updateHeadersPresyncProgressLabel(int64_t height, const QDateTime& blockDate)
 {
     int estHeadersLeft = blockDate.secsTo(QDateTime::currentDateTime()) / Params().GetConsensus().nPowTargetSpacing;
-    if (estHeadersLeft > HEADER_HEIGHT_DELTA_SYNC)
-        progressBarLabel->setText(tr("Pre-syncing Headers (%1%)…").arg(QString::number(100.0 / (height+estHeadersLeft)*height, 'f', 1)));
+    const int64_t headers_estimate{height + estHeadersLeft};
+    if (estHeadersLeft > HEADER_HEIGHT_DELTA_SYNC && headers_estimate > 0) {
+        progressBarLabel->setText(tr("Pre-syncing Headers (%1%)…").arg(QString::number(100.0 / headers_estimate * height, 'f', 1)));
+    } else {
+        progressBarLabel->setText(tr("Pre-syncing Headers…"));
+    }
 }
 
 void BitcoinGUI::openOptionsDialogWithTab(OptionsDialog::Tab tab)
@@ -1109,8 +1118,19 @@ void BitcoinGUI::setNumBlocks(int count, const QDateTime& blockDate, double nVer
     }
 #endif
 
+    if (clientModel && synctype != SyncType::HEADER_PRESYNC && m_headers_presync_active) {
+        const int64_t headers_height{synctype == SyncType::HEADER_SYNC ? count : clientModel->getHeaderTipHeight()};
+        if (headers_height >= m_headers_presync_height) {
+            m_headers_presync_active = false;
+            if (modalOverlay) modalOverlay->finishHeadersPresync();
+        }
+    }
+
     if (modalOverlay)
     {
+        // ClientModel::numBlocksChanged is already bounded during IBD/reindex,
+        // so keep modal overlay sync updates on the same cadence as the main
+        // sync status UI.
         if (synctype != SyncType::BLOCK_SYNC)
             modalOverlay->setKnownBestHeight(count, blockDate, synctype == SyncType::HEADER_PRESYNC);
         else
@@ -1122,14 +1142,25 @@ void BitcoinGUI::setNumBlocks(int count, const QDateTime& blockDate, double nVer
     // Prevent orphan statusbar messages (e.g. hover Quit in main menu, wait until chain-sync starts -> garbled text)
     statusBar()->clearMessage();
 
+    if (synctype == SyncType::HEADER_PRESYNC) {
+        m_headers_presync_active = true;
+        m_headers_presync_height = count;
+        m_headers_presync_block_date = blockDate;
+        updateHeadersPresyncProgressLabel(count, blockDate);
+        return;
+    }
+
+    const bool show_headers_presync{m_headers_presync_active};
+    if (show_headers_presync && synctype == SyncType::HEADER_SYNC) {
+        updateHeadersPresyncProgressLabel(m_headers_presync_height, m_headers_presync_block_date);
+        return;
+    }
+
     // Acquire current block source
     BlockSource blockSource{clientModel->getBlockSource()};
     switch (blockSource) {
         case BlockSource::NETWORK:
-            if (synctype == SyncType::HEADER_PRESYNC) {
-                updateHeadersPresyncProgressLabel(count, blockDate);
-                return;
-            } else if (synctype == SyncType::HEADER_SYNC) {
+            if (synctype == SyncType::HEADER_SYNC) {
                 updateHeadersSyncProgressLabel();
                 return;
             }
@@ -1150,6 +1181,8 @@ void BitcoinGUI::setNumBlocks(int count, const QDateTime& blockDate, double nVer
             progressBarLabel->setText(tr("Connecting to peers…"));
             break;
     }
+
+    if (show_headers_presync) updateHeadersPresyncProgressLabel(m_headers_presync_height, m_headers_presync_block_date);
 
     QString tooltip;
 
@@ -1350,11 +1383,11 @@ void BitcoinGUI::showEvent(QShowEvent *event)
 }
 
 #ifdef ENABLE_WALLET
-void BitcoinGUI::incomingTransaction(const QString& date, BitcoinUnit unit, const CAmount& amount, const QString& type, const QString& address, const QString& label, const QString& walletName)
+void BitcoinGUI::incomingTransaction(const QString& date, QbitUnit unit, const CAmount& amount, const QString& type, const QString& address, const QString& label, const QString& walletName)
 {
     // On new transaction, make an info balloon
     QString msg = tr("Date: %1\n").arg(date) +
-                  tr("Amount: %1\n").arg(BitcoinUnits::formatWithUnit(unit, amount, true));
+                  tr("Amount: %1\n").arg(QbitUnits::formatWithUnit(unit, amount, true));
     if (m_node.walletLoader().getWallets().size() > 1 && !walletName.isEmpty()) {
         msg += tr("Wallet: %1\n").arg(walletName);
     }
@@ -1605,11 +1638,11 @@ UnitDisplayStatusBarControl::UnitDisplayStatusBarControl(const PlatformStyle* pl
 {
     createContextMenu();
     setToolTip(tr("Unit to show amounts in. Click to select another unit."));
-    QList<BitcoinUnit> units = BitcoinUnits::availableUnits();
+    QList<QbitUnit> units = QbitUnits::availableUnits();
     int max_width = 0;
     const QFontMetrics fm(font());
-    for (const BitcoinUnit unit : units) {
-        max_width = qMax(max_width, GUIUtil::TextWidth(fm, BitcoinUnits::longName(unit)));
+    for (const QbitUnit unit : units) {
+        max_width = qMax(max_width, GUIUtil::TextWidth(fm, QbitUnits::longName(unit)));
     }
     setMinimumSize(max_width, 0);
     setAlignment(Qt::AlignRight | Qt::AlignVCenter);
@@ -1638,8 +1671,8 @@ void UnitDisplayStatusBarControl::changeEvent(QEvent* e)
 void UnitDisplayStatusBarControl::createContextMenu()
 {
     menu = new QMenu(this);
-    for (const BitcoinUnit u : BitcoinUnits::availableUnits()) {
-        menu->addAction(BitcoinUnits::longName(u))->setData(QVariant::fromValue(u));
+    for (const QbitUnit u : QbitUnits::availableUnits()) {
+        menu->addAction(QbitUnits::longName(u))->setData(QVariant::fromValue(u));
     }
     connect(menu, &QMenu::triggered, this, &UnitDisplayStatusBarControl::onMenuSelection);
 }
@@ -1660,9 +1693,9 @@ void UnitDisplayStatusBarControl::setOptionsModel(OptionsModel *_optionsModel)
 }
 
 /** When Display Units are changed on OptionsModel it will refresh the display text of the control on the status bar */
-void UnitDisplayStatusBarControl::updateDisplayUnit(BitcoinUnit newUnits)
+void UnitDisplayStatusBarControl::updateDisplayUnit(QbitUnit newUnits)
 {
-    setText(BitcoinUnits::longName(newUnits));
+    setText(QbitUnits::longName(newUnits));
 }
 
 /** Shows context menu with Display Unit options by the mouse coordinates */

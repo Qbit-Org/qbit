@@ -58,6 +58,20 @@ static ChainstateLoadResult CompleteChainstateInitialization(
         return {ChainstateLoadStatus::FAILURE, _("You need to rebuild the database using -reindex to go back to unpruned mode.  This will redownload the entire blockchain")};
     }
 
+    if (options.wipe_chainstate_db && chainman.m_blockman.m_have_witness_pruned) {
+        if (chainman.AssumedValidBlock().IsNull()) {
+            return {ChainstateLoadStatus::FAILURE_FATAL,
+                    _("Cannot use -reindex-chainstate on a witness-pruned node without "
+                      "-assumevalid=<hash>. Without an assumed-valid checkpoint, historical "
+                      "script validation requires witness data that has been stripped. Pass "
+                      "-assumevalid=<block hash> to skip historical script validation, or "
+                      "delete the data directory and perform a fresh sync.")};
+        }
+        LogInfo("Witness-pruned node: -reindex-chainstate proceeding under assumevalid=%s. "
+                "The supplied hash must be above the witness-pruned range.",
+                chainman.AssumedValidBlock().ToString());
+    }
+
     // At this point blocktree args are consistent with what's on disk.
     // If we're not mid-reindex (based on disk + args), add a genesis block on disk
     // (otherwise we use the one already on disk).

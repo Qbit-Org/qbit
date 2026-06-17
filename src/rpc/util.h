@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_RPC_UTIL_H
-#define BITCOIN_RPC_UTIL_H
+#ifndef QBIT_RPC_UTIL_H
+#define QBIT_RPC_UTIL_H
 
 #include <addresstype.h>
 #include <consensus/amount.h>
@@ -13,7 +13,6 @@
 #include <rpc/protocol.h>
 #include <rpc/request.h>
 #include <script/script.h>
-#include <script/sign.h>
 #include <uint256.h>
 #include <univalue.h>
 #include <util/check.h>
@@ -34,6 +33,7 @@
 class JSONRPCRequest;
 enum ServiceFlags : uint64_t;
 enum class OutputType;
+struct Descriptor;
 struct FlatSigningProvider;
 struct bilingual_str;
 namespace common {
@@ -124,8 +124,8 @@ int ParseVerbosity(const UniValue& arg, int default_verbosity, bool allow_bool);
  */
 CAmount AmountFromValue(const UniValue& value, int decimals = 8);
 /**
- * Parse a json number or string, denoting BTC/kvB, into a CFeeRate (sat/kvB).
- * Reject negative values or rates larger than 1BTC/kvB.
+ * Parse a json number or string, denoting base-unit/kvB, into a CFeeRate (sat/kvB).
+ * Reject negative values or rates larger than 1 base-unit/kvB.
  */
 CFeeRate ParseFeeRate(const UniValue& json);
 
@@ -156,6 +156,9 @@ std::pair<int64_t, int64_t> ParseDescriptorRange(const UniValue& value);
 /** Evaluate a descriptor given as a string, or as a {"desc":...,"range":...} object, with default range of 1000. */
 std::vector<CScript> EvalDescriptorStringOrObject(const UniValue& scanobject, FlatSigningProvider& provider, const bool expand_priv = false);
 
+/** Reject descriptors that cannot produce launch-chain P2MR outputs when restricted-output mode is active. */
+void EnsureDescriptorOutputTypeAllowed(const Descriptor& desc, std::string_view context);
+
 /**
  * Serializing JSON objects depends on the outer type. Only arrays and
  * dictionaries can be nested in json. The top-level outer type is "NONE".
@@ -180,6 +183,15 @@ struct RPCArgOptions {
                                          //!< options to be passed by name only, and more commonly used options to be
                                          //!< passed by name or position, so the RPC framework allows this as long as
                                          //!< methods set the also_positional flag and read values from both positions.
+};
+
+struct RPCHelpDocOptions {
+    std::string category;
+    std::string component;
+    bool visible{true};
+    bool requires_wallet{false};
+    bool requires_zmq{false};
+    bool requires_external_signer{false};
 };
 
 // NOLINTNEXTLINE(misc-no-recursion)
@@ -285,6 +297,7 @@ struct RPCArg {
      * Set oneline to get the oneline representation (less whitespace)
      */
     std::string ToStringObj(bool oneline) const;
+    UniValue ToUniValue(bool hidden = false) const;
     /**
      * Return the description string, including the argument type and whether
      * the argument is required.
@@ -375,6 +388,7 @@ struct RPCResult {
     void ToSections(Sections& sections, OuterType outer_type = OuterType::NONE, const int current_indent = 0) const;
     /** Return the type string of the result when it is in an object (dict). */
     std::string ToStringObj() const;
+    UniValue ToUniValue() const;
     /** Return the description string, including the result type. */
     std::string ToDescriptionString() const;
     /** Check whether the result JSON type matches.
@@ -403,6 +417,7 @@ struct RPCResults {
      * Return the description string.
      */
     std::string ToDescriptionString() const;
+    UniValue ToUniValue() const;
 };
 
 struct RPCExamples {
@@ -413,6 +428,7 @@ struct RPCExamples {
     {
     }
     std::string ToDescriptionString() const;
+    UniValue ToUniValue() const;
 };
 
 class RPCHelpMan
@@ -492,6 +508,7 @@ public:
     bool IsValidNumArgs(size_t num_args) const;
     //! Return list of arguments and whether they are named-only.
     std::vector<std::pair<std::string, bool>> GetArgNames() const;
+    UniValue ToUniValue(const RPCHelpDocOptions& options) const;
 
     const std::string m_name;
 
@@ -529,4 +546,4 @@ std::vector<RPCResult> ScriptPubKeyDoc();
  */
 uint256 GetTarget(const CBlockIndex& blockindex, const uint256 pow_limit);
 
-#endif // BITCOIN_RPC_UTIL_H
+#endif // QBIT_RPC_UTIL_H

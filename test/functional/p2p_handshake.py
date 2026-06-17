@@ -16,6 +16,7 @@ from test_framework.messages import (
     NODE_NONE,
     NODE_P2P_V2,
     NODE_WITNESS,
+    NODE_WITNESS_PRUNED,
 )
 from test_framework.p2p import P2PInterface
 from test_framework.util import p2p_port
@@ -65,6 +66,19 @@ class P2PHandshakeTest(BitcoinTestFramework):
                 assert (services & desirable_service_flags) == desirable_service_flags
                 self.add_outbound_connection(node, conn_type, services, wait_for_disconnect=False)
 
+    def test_witness_pruned_scope(self, node):
+        services = NODE_NETWORK | NODE_WITNESS | NODE_WITNESS_PRUNED
+        if self.options.v2transport:
+            services |= NODE_P2P_V2
+
+        for conn_type in ["outbound-full-relay", "block-relay-only"]:
+            self.log.info(f'    - services 0x{services:08x}, type "{conn_type}" [disconnect]')
+            with node.assert_debug_log(["peer advertises NODE_WITNESS_PRUNED in full-validation mode"]):
+                self.add_outbound_connection(node, conn_type, services, wait_for_disconnect=True)
+
+        self.log.info(f'    - services 0x{services:08x}, type "addr-fetch" [connect]')
+        self.add_outbound_connection(node, "addr-fetch", services, wait_for_disconnect=False)
+
     def generate_at_mocktime(self, time):
         self.nodes[0].setmocktime(time)
         self.generate(self.nodes[0], 1)
@@ -78,13 +92,20 @@ class P2PHandshakeTest(BitcoinTestFramework):
         self.test_desirable_service_flags(node, [NODE_NETWORK | NODE_WITNESS],
                                           DESIRABLE_SERVICE_FLAGS_FULL, expect_disconnect=False)
 
-        self.log.info("Check that limited peers are only desired if the local chain is close to the tip (<24h)")
-        self.generate_at_mocktime(int(time.time()) - 25 * 3600)  # tip outside the 24h window, should fail
+        self.log.info("Check that limited peers are only desired if the local chain is close to the tip")
+        # Use a clearly old tip to guarantee we're outside the limited-peer desirability window
+        # regardless of chain target spacing.
+        now = int(time.time())
+        self.generate_at_mocktime(now - 365 * 24 * 3600)
         self.test_desirable_service_flags(node, [NODE_NETWORK_LIMITED | NODE_WITNESS],
                                           DESIRABLE_SERVICE_FLAGS_FULL, expect_disconnect=True)
-        self.generate_at_mocktime(int(time.time()) - 23 * 3600)  # tip inside the 24h window, should succeed
+        # Move the tip close to wall clock time so limited peers are desirable again.
+        self.generate_at_mocktime(now)
         self.test_desirable_service_flags(node, [NODE_NETWORK_LIMITED | NODE_WITNESS],
                                           DESIRABLE_SERVICE_FLAGS_PRUNED, expect_disconnect=False)
+
+        self.log.info("Check that NODE_WITNESS_PRUNED rejection is scoped away from addr-fetch connections")
+        self.test_witness_pruned_scope(node)
 
         self.log.info("Check that feeler connections get disconnected immediately")
         with node.assert_debug_log(["feeler connection completed"]):

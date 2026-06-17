@@ -1,0 +1,20 @@
+set(rpcdocs_build_command
+  "@CMAKE_COMMAND@"
+  --build
+  "@PROJECT_BINARY_DIR@"
+  --target
+  rpcdocs
+)
+
+if(CMAKE_INSTALL_CONFIG_NAME)
+  list(APPEND rpcdocs_build_command --config "${CMAKE_INSTALL_CONFIG_NAME}")
+endif()
+
+execute_process(
+  COMMAND ${rpcdocs_build_command}
+  RESULT_VARIABLE rpcdocs_build_result
+)
+
+if(NOT rpcdocs_build_result EQUAL 0)
+  message(FATAL_ERROR "Failed to build rpcdocs during installation.")
+endif()

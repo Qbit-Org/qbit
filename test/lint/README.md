@@ -72,7 +72,7 @@ Check for missing documentation of command line options.
 
 commit-script-check.sh
 ======================
-Verification of [scripted diffs](/doc/developer-notes.md#scripted-diffs).
+Verification of [scripted diffs](/doc/development/developer-notes.md#scripted-diffs).
 Scripted diffs are only assumed to run on the latest LTS release of Ubuntu. Running them on other operating systems
 might require installing GNU tools, such as GNU sed.
 
@@ -95,16 +95,66 @@ maintained:
 * for `src/crc32c`: https://github.com/bitcoin-core/crc32c-subtree.git (branch bitcoin-fork)
 * for `src/crypto/ctaes`: https://github.com/bitcoin-core/ctaes.git (branch master)
 * for `src/ipc/libmultiprocess`: https://github.com/bitcoin-core/libmultiprocess (branch master)
+* for `src/libbitcoinpqc`: https://github.com/<owner>/libbitcoinpqc-qbit.git (branch qbit-subtree)
 * for `src/leveldb`: https://github.com/bitcoin-core/leveldb-subtree.git (branch bitcoin-fork)
 * for `src/minisketch`: https://github.com/bitcoin-core/minisketch.git (branch master)
 * for `src/secp256k1`: https://github.com/bitcoin-core/secp256k1.git (branch master)
 
 Keep this list in sync with `fn get_subtrees()` in the lint runner.
 
+For the qbit-specific libbitcoinpqc subtree workflow, see
+[`doc/subtrees/libbitcoinpqc.md`](../../doc/subtrees/libbitcoinpqc.md).
+
 To do so, add the upstream repository as remote:
 
 ```
 git remote add --fetch secp256k1 https://github.com/bitcoin-core/secp256k1.git
+```
+
+lint-libbitcoinpqc-vectors.py
+=============================
+Run this script from the root of the repository to verify bounded30 SPHINCS+
+vector wiring in `src/libbitcoinpqc/sphincsplus`:
+
+```
+test/lint/lint-libbitcoinpqc-vectors.py
+```
+
+If the curated subtree still contains the upstream NIST KAT generator sources,
+the lint regenerates a reference vector and checks it against `SHA256SUMS`.
+If those sources were pruned from the curated qbit subtree, the lint falls back
+to static bounded30 guard checks and treats the prune as expected. A partially
+present KAT payload, or a missing implementation directory, is treated as an
+error so accidental subtree corruption does not silently bypass vector
+coverage.
+
+lint-qbit-node-defaults.py
+==========================
+Run this script from the root of the repository to verify curated qbit-owned
+node/operator default surfaces such as:
+
+- the generated `share/examples/qbit.conf`
+- generated manpages for RPC defaults
+- qbit linearize defaults
+- qbit-photon RPC defaults
+
+```
+test/lint/lint-qbit-node-defaults.py
+```
+
+lint-qbit-public-docs.py
+========================
+Run this script from the root of the repository to verify curated public
+integration documentation surfaces such as:
+
+- exchange/custody confirmation policy guidance
+- mining guide publication boundaries
+- canonical RPC reference links
+- generated manpage and `qbit.conf` examples
+- stale Bitcoin default ports in public docs
+
+```
+test/lint/lint-qbit-public-docs.py
 ```
 
 lint_ignore_dirs.py

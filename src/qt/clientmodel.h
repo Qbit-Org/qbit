@@ -2,14 +2,17 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_QT_CLIENTMODEL_H
-#define BITCOIN_QT_CLIENTMODEL_H
+#ifndef QBIT_QT_CLIENTMODEL_H
+#define QBIT_QT_CLIENTMODEL_H
 
 #include <QObject>
 #include <QDateTime>
 
 #include <atomic>
+#include <chrono>
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <sync.h>
 #include <uint256.h>
 
@@ -110,7 +113,28 @@ private:
     //! A thread to interact with m_node asynchronously
     QThread* const m_thread;
 
-    void TipChanged(SynchronizationState sync_state, interfaces::BlockTip tip, double verification_progress, SyncType synctype) EXCLUSIVE_LOCKS_REQUIRED(!m_cached_tip_mutex);
+    struct SyncUpdate {
+        int count{0};
+        int64_t block_time{0};
+        double verification_progress{0.0};
+        SyncType synctype{SyncType::BLOCK_SYNC};
+        SynchronizationState sync_state{};
+    };
+
+    Mutex m_sync_update_mutex;
+    std::optional<SyncUpdate> m_pending_sync_update GUARDED_BY(m_sync_update_mutex);
+    std::optional<SyncType> m_last_sync_update_type GUARDED_BY(m_sync_update_mutex);
+    std::optional<SynchronizationState> m_last_sync_update_state GUARDED_BY(m_sync_update_mutex);
+    std::chrono::steady_clock::time_point m_last_sync_update_time GUARDED_BY(m_sync_update_mutex);
+    bool m_sync_update_flush_scheduled GUARDED_BY(m_sync_update_mutex){false};
+    uint64_t m_sync_update_flush_generation GUARDED_BY(m_sync_update_mutex){0};
+
+    void TipChanged(SynchronizationState sync_state, interfaces::BlockTip tip, double verification_progress, SyncType synctype) EXCLUSIVE_LOCKS_REQUIRED(!m_cached_tip_mutex, !m_sync_update_mutex);
+    void ProcessSyncUpdate(SyncUpdate update) EXCLUSIVE_LOCKS_REQUIRED(!m_sync_update_mutex);
+    void EmitNumBlocksChanged(const SyncUpdate& update);
+    void ScheduleSyncUpdateFlush(std::chrono::milliseconds delay, uint64_t generation);
+    void FlushPendingSyncUpdate(uint64_t generation) NO_THREAD_SAFETY_ANALYSIS;
+    void CancelPendingSyncUpdate() NO_THREAD_SAFETY_ANALYSIS;
     void subscribeToCoreSignals();
     void unsubscribeFromCoreSignals();
 
@@ -129,4 +153,4 @@ Q_SIGNALS:
     void showProgress(const QString &title, int nProgress);
 };
 
-#endif // BITCOIN_QT_CLIENTMODEL_H
+#endif // QBIT_QT_CLIENTMODEL_H

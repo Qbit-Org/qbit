@@ -40,6 +40,8 @@ class MempoolPackagesTest(BitcoinTestFramework):
 
     def run_test(self):
         self.wallet = MiniWallet(self.nodes[0])
+        # Mature the default-cache coinbase UTXOs
+        self.ensure_cached_coinbase_mature(self.nodes[0])
         self.wallet.rescan_utxos()
 
         peer_inv_store = self.nodes[0].add_p2p_connection(P2PTxInvStore()) # keep track of invs

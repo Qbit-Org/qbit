@@ -2,6 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <bitcoin-build-config.h> // IWYU pragma: keep
+
 #include <clientversion.h>
 #include <common/signmessage.h>
 #include <hash.h>
@@ -455,8 +457,9 @@ BOOST_AUTO_TEST_CASE(util_ParseMoney)
     BOOST_CHECK_EQUAL(ParseMoney("0.00000001 ").value(), COIN/100000000);
     BOOST_CHECK_EQUAL(ParseMoney(" 0.00000001").value(), COIN/100000000);
 
-    // Parsing amount that cannot be represented should fail
-    BOOST_CHECK(!ParseMoney("100000000.00"));
+    // Parsing amount outside the money range should fail
+    BOOST_CHECK_EQUAL(ParseMoney(FormatMoney(MAX_MONEY)).value(), MAX_MONEY);
+    BOOST_CHECK(!ParseMoney(FormatMoney(MAX_MONEY + 1)));
     BOOST_CHECK(!ParseMoney("0.000000001"));
 
     // Parsing empty string should fail
@@ -872,6 +875,25 @@ BOOST_AUTO_TEST_CASE(test_FormatSubVersion)
     BOOST_CHECK_EQUAL(FormatSubVersion("Test", 99900, std::vector<std::string>()),std::string("/Test:9.99.0/"));
     BOOST_CHECK_EQUAL(FormatSubVersion("Test", 99900, comments),std::string("/Test:9.99.0(comment1)/"));
     BOOST_CHECK_EQUAL(FormatSubVersion("Test", 99900, comments2),std::string("/Test:9.99.0(comment1; Comment2; .,_?@-; )/"));
+    BOOST_CHECK_EQUAL(FormatSubVersion("Test", CLIENT_VERSION, std::vector<std::string>()), "/Test:0.1.0/");
+    BOOST_CHECK_EQUAL(FormatSubVersion(UA_NAME, CLIENT_VERSION, std::vector<std::string>()), std::string("/") + UA_NAME + ":" + CLIENT_VERSION_STRING + "/");
+    BOOST_CHECK_EQUAL(FormatSubVersion(UA_NAME, CLIENT_VERSION, comments), std::string("/") + UA_NAME + ":" + CLIENT_VERSION_STRING + "(comment1)/");
+}
+
+BOOST_AUTO_TEST_CASE(test_CompareSubVersion)
+{
+    BOOST_CHECK_EQUAL(CompareSubVersion("/qbit:0.1.0/", "/qbit:0.1.0/", "qbit").value(), 0);
+    BOOST_CHECK_EQUAL(CompareSubVersion("/qbit:0.1.1/", "/qbit:0.1.0/", "qbit").value(), 1);
+    BOOST_CHECK_EQUAL(CompareSubVersion("/qbit:0.1.0-testnet2/", "/qbit:0.1.0-testnet1/", "qbit").value(), 1);
+    BOOST_CHECK_EQUAL(CompareSubVersion("/qbit:0.1.0-testnet1/", "/qbit:0.1.0-testnet1-rc1/", "qbit").value(), 1);
+    BOOST_CHECK_EQUAL(CompareSubVersion("/qbit:0.1.0-testnet1-rc2/", "/qbit:0.1.0-testnet1-rc1/", "qbit").value(), 1);
+    BOOST_CHECK_EQUAL(CompareSubVersion("/qbit:0.1.0(comment1)/", "/qbit:0.1.0/", "qbit").value(), 0);
+    BOOST_CHECK(!CompareSubVersion("/Satoshi:30.2.0/", "/qbit:0.1.0-testnet1/", "qbit").has_value());
+    BOOST_CHECK(!CompareSubVersion("/qbit:0.1.0-beta1/", "/qbit:0.1.0-testnet1/", "qbit").has_value());
+    BOOST_CHECK(!CompareSubVersion("/qbit:0.1.0-testnet1-/", "/qbit:0.1.0-testnet1/", "qbit").has_value());
+    BOOST_CHECK(!CompareSubVersion("/qbit:0.1.0-/", "/qbit:0.1.0/", "qbit").has_value());
+    BOOST_CHECK(!CompareSubVersion("/qbit:not-a-version/", "/qbit:0.1.0-testnet1/", "qbit").has_value());
+    BOOST_CHECK(!CompareSubVersion("/qbit:99999999999999999999.1.0/", "/qbit:0.1.0-testnet1/", "qbit").has_value());
 }
 
 BOOST_AUTO_TEST_CASE(test_ParseFixedPoint)
@@ -1489,47 +1511,49 @@ BOOST_AUTO_TEST_CASE(message_verify)
             "message too"),
         MessageVerificationResult::ERR_INVALID_ADDRESS);
 
+    // qbit launch chains reject legacy base58 destinations before legacy
+    // message verification reaches signature parsing or key recovery.
     BOOST_CHECK_EQUAL(
         MessageVerify(
-            "3B5fQsEXEaV8v6U3ejYc8XaKXAkyQj2MjV",
+            "SWgeXAXER3MxMEZ554s6FoMx2RhghyJaDT",
             "signature should be irrelevant",
             "message too"),
-        MessageVerificationResult::ERR_ADDRESS_NO_KEY);
+        MessageVerificationResult::ERR_INVALID_ADDRESS);
 
     BOOST_CHECK_EQUAL(
         MessageVerify(
-            "1KqbBpLy5FARmTPD4VZnDDpYjkUvkr82Pm",
+            "QfSaJ7dgFi3FCbUEUptGLVcBF1Rdy97rnQ",
             "invalid signature, not in base64 encoding",
             "message should be irrelevant"),
-        MessageVerificationResult::ERR_MALFORMED_SIGNATURE);
+        MessageVerificationResult::ERR_INVALID_ADDRESS);
 
     BOOST_CHECK_EQUAL(
         MessageVerify(
-            "1KqbBpLy5FARmTPD4VZnDDpYjkUvkr82Pm",
+            "QfSaJ7dgFi3FCbUEUptGLVcBF1Rdy97rnQ",
             "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
             "message should be irrelevant"),
-        MessageVerificationResult::ERR_PUBKEY_NOT_RECOVERED);
+        MessageVerificationResult::ERR_INVALID_ADDRESS);
 
     BOOST_CHECK_EQUAL(
         MessageVerify(
-            "15CRxFdyRpGZLW9w8HnHvVduizdL5jKNbs",
+            "QQoR4YvgcH9NmeExYd6n3mRYEFa3FyQjEu",
             "IPojfrX2dfPnH26UegfbGQQLrdK844DlHq5157/P6h57WyuS/Qsl+h/WSVGDF4MUi4rWSswW38oimDYfNNUBUOk=",
             "I never signed this"),
-        MessageVerificationResult::ERR_NOT_SIGNED);
+        MessageVerificationResult::ERR_INVALID_ADDRESS);
 
     BOOST_CHECK_EQUAL(
         MessageVerify(
-            "15CRxFdyRpGZLW9w8HnHvVduizdL5jKNbs",
+            "QQoR4YvgcH9NmeExYd6n3mRYEFa3FyQjEu",
             "IPojfrX2dfPnH26UegfbGQQLrdK844DlHq5157/P6h57WyuS/Qsl+h/WSVGDF4MUi4rWSswW38oimDYfNNUBUOk=",
             "Trust no one"),
-        MessageVerificationResult::OK);
+        MessageVerificationResult::ERR_INVALID_ADDRESS);
 
     BOOST_CHECK_EQUAL(
         MessageVerify(
-            "11canuhp9X2NocwCq7xNrQYTmUgZAnLK3",
+            "QLcbh6CQzcPqowhxdASSW8CAy2RPmgmxj8",
             "IIcaIENoYW5jZWxsb3Igb24gYnJpbmsgb2Ygc2Vjb25kIGJhaWxvdXQgZm9yIGJhbmtzIAaHRtbCeDZINyavx14=",
             "Trust me"),
-        MessageVerificationResult::OK);
+        MessageVerificationResult::ERR_INVALID_ADDRESS);
 }
 
 BOOST_AUTO_TEST_CASE(message_hash)

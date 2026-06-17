@@ -75,12 +75,12 @@ class CreateWalletTest(BitcoinTestFramework):
         assert_raises_rpc_error(-4, "Error: This wallet has no available keys", w3.getnewaddress)
         # Set the seed
         w3.importdescriptors([{
-            'desc': descsum_create('wpkh(tprv8ZgxMBicQKsPcwuZGKp8TeWppSuLMiLe2d9PupB14QpPeQsqoj3LneJLhGHH13xESfvASyd4EFLJvLrG8b7DrLxEuV7hpF9uUc6XruKA1Wq/0h/*)'),
+            'desc': descsum_create('wpkh(qrpvV1brS3WRoVwgS9haVbvHszXm5pkWhs4VXpEdASsYHHBA1utzJw3eKzicwQmL4SqT2D41CXJv7E21akNyQ1GGgJ3HoVeWbrUbSLxuSLvC8P7/0h/*)'),
             'timestamp': 'now',
             'active': True
         },
         {
-            'desc': descsum_create('wpkh(tprv8ZgxMBicQKsPcwuZGKp8TeWppSuLMiLe2d9PupB14QpPeQsqoj3LneJLhGHH13xESfvASyd4EFLJvLrG8b7DrLxEuV7hpF9uUc6XruKA1Wq/1h/*)'),
+            'desc': descsum_create('wpkh(qrpvV1brS3WRoVwgS9haVbvHszXm5pkWhs4VXpEdASsYHHBA1utzJw3eKzicwQmL4SqT2D41CXJv7E21akNyQ1GGgJ3HoVeWbrUbSLxuSLvC8P7/1h/*)'),
             'timestamp': 'now',
             'active': True,
             'internal': True
@@ -102,12 +102,12 @@ class CreateWalletTest(BitcoinTestFramework):
         with WalletUnlock(w4, "pass"):
             # Now set a seed and it should work. Wallet should also be encrypted
             w4.importdescriptors([{
-                'desc': descsum_create('wpkh(tprv8ZgxMBicQKsPcwuZGKp8TeWppSuLMiLe2d9PupB14QpPeQsqoj3LneJLhGHH13xESfvASyd4EFLJvLrG8b7DrLxEuV7hpF9uUc6XruKA1Wq/0h/*)'),
+                'desc': descsum_create('wpkh(qrpvV1brS3WRoVwgS9haVbvHszXm5pkWhs4VXpEdASsYHHBA1utzJw3eKzicwQmL4SqT2D41CXJv7E21akNyQ1GGgJ3HoVeWbrUbSLxuSLvC8P7/0h/*)'),
                 'timestamp': 'now',
                 'active': True
             },
             {
-                'desc': descsum_create('wpkh(tprv8ZgxMBicQKsPcwuZGKp8TeWppSuLMiLe2d9PupB14QpPeQsqoj3LneJLhGHH13xESfvASyd4EFLJvLrG8b7DrLxEuV7hpF9uUc6XruKA1Wq/1h/*)'),
+                'desc': descsum_create('wpkh(qrpvV1brS3WRoVwgS9haVbvHszXm5pkWhs4VXpEdASsYHHBA1utzJw3eKzicwQmL4SqT2D41CXJv7E21akNyQ1GGgJ3HoVeWbrUbSLxuSLvC8P7/1h/*)'),
                 'timestamp': 'now',
                 'active': True,
                 'internal': True
@@ -142,11 +142,12 @@ class CreateWalletTest(BitcoinTestFramework):
         with WalletUnlock(w6, "thisisapassphrase"):
             w6.signmessage(w6.getnewaddress('', 'legacy'), "test")
             w6.keypoolrefill(1)
-            # There should only be 1 key for legacy, 3 for descriptors
             walletinfo = w6.getwalletinfo()
-            keys = 4
-            assert_equal(walletinfo['keypoolsize'], keys)
-            assert_equal(walletinfo['keypoolsize_hd_internal'], keys)
+            descriptors = w6.listdescriptors()['descriptors']
+            external_keys = sum(1 for descriptor in descriptors if descriptor.get('active') and 'range' in descriptor and not descriptor.get('internal', False))
+            internal_keys = sum(1 for descriptor in descriptors if descriptor.get('active') and 'range' in descriptor and descriptor.get('internal', False))
+            assert_equal(walletinfo['keypoolsize'], external_keys)
+            assert_equal(walletinfo['keypoolsize_hd_internal'], internal_keys)
         # Allow empty passphrase, but there should be a warning
         resp = self.nodes[0].createwallet(wallet_name='w7', disable_private_keys=False, blank=False, passphrase='')
         assert_equal(resp["warnings"], [EMPTY_PASSPHRASE_MSG])

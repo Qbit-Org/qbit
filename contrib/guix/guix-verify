@@ -3,11 +3,29 @@ export LC_ALL=C
 set -e -o pipefail
 
 # Source the common prelude, which:
-#   1. Checks if we're at the top directory of the Bitcoin Core repository
+#   1. Checks if we're at the top directory of the qbit repository
 #   2. Defines a few common functions and variables
 #
 # shellcheck source=libexec/prelude.bash
 source "$(dirname "${BASH_SOURCE[0]}")/libexec/prelude.bash"
+
+ARTIFACT="${ARTIFACT:-core}"
+case "$ARTIFACT" in
+    core)
+        MANIFEST_PREFIX=""
+        ;;
+    photon)
+        MANIFEST_PREFIX="photon-"
+        ;;
+    *)
+        echo "ERR: Unsupported ARTIFACT '${ARTIFACT}'. Expected 'core' or 'photon'."
+        exit 1
+        ;;
+esac
+
+manifest_name() {
+    echo "${MANIFEST_PREFIX}${1}.SHA256SUMS"
+}
 
 
 ###################
@@ -28,11 +46,15 @@ cmd_usage() {
 cat <<EOF
 Synopsis:
 
-    env GUIX_SIGS_REPO=<path/to/guix.sigs> [ SIGNER=<signer> ] ./contrib/guix/guix-verify
+    env GUIX_SIGS_REPO=<path/to/guix.sigs> [ SIGNER=<signer> ] [ ARTIFACT=photon ] ./contrib/guix/guix-verify
 
 Example overriding signer's manifest to use as base
 
     env GUIX_SIGS_REPO=/home/dongcarl/guix.sigs SIGNER=achow101 ./contrib/guix/guix-verify
+
+Example for qbit-photon artifacts
+
+    env GUIX_SIGS_REPO=/home/dongcarl/guix.sigs ARTIFACT=photon ./contrib/guix/guix-verify
 
 EOF
 }
@@ -90,8 +112,11 @@ verify() {
     fi
 }
 
+noncodesigned_manifest="$(manifest_name noncodesigned)"
+all_manifest="$(manifest_name all)"
+
 shopt -s nullglob
-all_noncodesigned=( "$OUTSIGDIR_BASE"/*/noncodesigned.SHA256SUMS )
+all_noncodesigned=( "$OUTSIGDIR_BASE"/*/"$noncodesigned_manifest" )
 shopt -u nullglob
 
 echo "--------------------"
@@ -99,7 +124,7 @@ echo ""
 if (( ${#all_noncodesigned[@]} )); then
     compare_noncodesigned="${all_noncodesigned[0]}"
     if [[ -n "$SIGNER" ]]; then
-        signer_noncodesigned="$OUTSIGDIR_BASE/$SIGNER/noncodesigned.SHA256SUMS"
+        signer_noncodesigned="$OUTSIGDIR_BASE/$SIGNER/$noncodesigned_manifest"
         if [[ -f "$signer_noncodesigned" ]]; then
             echo "Using $SIGNER's manifest as the base to compare against"
             compare_noncodesigned="$signer_noncodesigned"
@@ -114,15 +139,15 @@ if (( ${#all_noncodesigned[@]} )); then
         verify "$compare_noncodesigned" "$current_manifest"
     done
 
-    echo "DONE: Checking output signatures for noncodesigned.SHA256SUMS"
+    echo "DONE: Checking output signatures for ${noncodesigned_manifest}"
     echo ""
 else
-    echo "WARN: No signature directories with noncodesigned.SHA256SUMS found"
+    echo "WARN: No signature directories with ${noncodesigned_manifest} found"
     echo ""
 fi
 
 shopt -s nullglob
-all_all=( "$OUTSIGDIR_BASE"/*/all.SHA256SUMS )
+all_all=( "$OUTSIGDIR_BASE"/*/"$all_manifest" )
 shopt -u nullglob
 
 echo "--------------------"
@@ -130,7 +155,7 @@ echo ""
 if (( ${#all_all[@]} )); then
     compare_all="${all_all[0]}"
     if [[ -n "$SIGNER" ]]; then
-        signer_all="$OUTSIGDIR_BASE/$SIGNER/all.SHA256SUMS"
+        signer_all="$OUTSIGDIR_BASE/$SIGNER/$all_manifest"
         if [[ -f "$signer_all" ]]; then
             echo "Using $SIGNER's manifest as the base to compare against"
             compare_all="$signer_all"
@@ -146,17 +171,17 @@ if (( ${#all_all[@]} )); then
     done
 
     # Sanity check: there should be no entries that exist in
-    # noncodesigned.SHA256SUMS that doesn't exist in all.SHA256SUMS
+    # ${noncodesigned_manifest} that doesn't exist in ${all_manifest}
     if [[ "$(comm -23 <(sort "$compare_noncodesigned") <(sort "$compare_all") | wc -c)" -ne 0 ]]; then
-        echo "ERR: There are unique lines in noncodesigned.SHA256SUMS which"
-        echo "     do not exist in all.SHA256SUMS, something went very wrong."
+        echo "ERR: There are unique lines in ${noncodesigned_manifest} which"
+        echo "     do not exist in ${all_manifest}, something went very wrong."
         exit 1
     fi
 
-    echo "DONE: Checking output signatures for all.SHA256SUMS"
+    echo "DONE: Checking output signatures for ${all_manifest}"
     echo ""
 else
-    echo "WARN: No signature directories with all.SHA256SUMS found"
+    echo "WARN: No signature directories with ${all_manifest} found"
     echo ""
 fi
 

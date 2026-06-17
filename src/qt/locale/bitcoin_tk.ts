@@ -991,7 +991,7 @@ Diňe "miras" görnüşli salgylar bilen gol çekmek mümkin.</translation>
         <translation type="unfinished">(%1 gulply)</translation>
     </message>
     <message>
-        <source>Can vary +/- %1 satoshi(s) per input.</source>
+        <source>Can vary +/- %1 bits per input.</source>
         <translation type="unfinished">Her giriş üçin +/- %1 satosi üýtgäp biler.</translation>
     </message>
     <message>

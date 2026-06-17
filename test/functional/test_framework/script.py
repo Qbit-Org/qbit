@@ -33,6 +33,21 @@ LEAF_VERSION_TAPSCRIPT = 0xc0
 def hash160(s):
     return ripemd160(sha256(s))
 
+def default_ctv_hash(tx, input_index):
+    """Compute qbit's BIP119-style default OP_CHECKTEMPLATEVERIFY hash."""
+    assert 0 <= input_index < len(tx.vin)
+    has_scriptsigs = any(txin.scriptSig for txin in tx.vin)
+    preimage = tx.version.to_bytes(4, "little")
+    preimage += tx.nLockTime.to_bytes(4, "little")
+    if has_scriptsigs:
+        preimage += sha256(b"".join(ser_string(txin.scriptSig) for txin in tx.vin))
+    preimage += len(tx.vin).to_bytes(4, "little")
+    preimage += sha256(b"".join(txin.nSequence.to_bytes(4, "little") for txin in tx.vin))
+    preimage += len(tx.vout).to_bytes(4, "little")
+    preimage += sha256(b"".join(txout.serialize() for txout in tx.vout))
+    preimage += input_index.to_bytes(4, "little")
+    return sha256(preimage)
+
 def bn2vch(v):
     """Convert number to bitcoin-specific little endian format."""
     # We need v.bit_length() bits, plus a sign bit for every nonzero number.
@@ -239,7 +254,7 @@ OP_CHECKMULTISIGVERIFY = CScriptOp(0xaf)
 OP_NOP1 = CScriptOp(0xb0)
 OP_CHECKLOCKTIMEVERIFY = CScriptOp(0xb1)
 OP_CHECKSEQUENCEVERIFY = CScriptOp(0xb2)
-OP_NOP4 = CScriptOp(0xb3)
+OP_CHECKSIGPQC = CScriptOp(0xb3)
 OP_NOP5 = CScriptOp(0xb4)
 OP_NOP6 = CScriptOp(0xb5)
 OP_NOP7 = CScriptOp(0xb6)
@@ -249,6 +264,12 @@ OP_NOP10 = CScriptOp(0xb9)
 
 # BIP 342 opcodes (Tapscript)
 OP_CHECKSIGADD = CScriptOp(0xba)
+
+# qbit P2MR opcode. This byte remains OP_SUCCESS outside P2MR execution.
+OP_CHECKTEMPLATEVERIFY = CScriptOp(0xbb)
+# qbit P2MR data-signature opcodes
+OP_CHECKDATASIGPQC = CScriptOp(0xbc)
+OP_CHECKDATASIGADDPQC = CScriptOp(0xbd)
 
 OP_INVALIDOPCODE = CScriptOp(0xff)
 
@@ -357,7 +378,7 @@ OPCODE_NAMES.update({
     OP_NOP1: 'OP_NOP1',
     OP_CHECKLOCKTIMEVERIFY: 'OP_CHECKLOCKTIMEVERIFY',
     OP_CHECKSEQUENCEVERIFY: 'OP_CHECKSEQUENCEVERIFY',
-    OP_NOP4: 'OP_NOP4',
+    OP_CHECKSIGPQC: 'OP_CHECKSIGPQC',
     OP_NOP5: 'OP_NOP5',
     OP_NOP6: 'OP_NOP6',
     OP_NOP7: 'OP_NOP7',
@@ -365,6 +386,9 @@ OPCODE_NAMES.update({
     OP_NOP9: 'OP_NOP9',
     OP_NOP10: 'OP_NOP10',
     OP_CHECKSIGADD: 'OP_CHECKSIGADD',
+    OP_CHECKTEMPLATEVERIFY: 'OP_CHECKTEMPLATEVERIFY',
+    OP_CHECKDATASIGPQC: 'OP_CHECKDATASIGPQC',
+    OP_CHECKDATASIGADDPQC: 'OP_CHECKDATASIGADDPQC',
     OP_INVALIDOPCODE: 'OP_INVALIDOPCODE',
 })
 

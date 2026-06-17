@@ -8,12 +8,14 @@
 #include <validation.h>
 
 #include <arith_uint256.h>
+#include <auxpow.h>
 #include <chain.h>
 #include <checkqueue.h>
 #include <clientversion.h>
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
 #include <consensus/merkle.h>
+#include <consensus/restricted_outputs.h>
 #include <consensus/tx_check.h>
 #include <consensus/tx_verify.h>
 #include <consensus/validation.h>
@@ -41,6 +43,7 @@
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <random.h>
+#include <script/interpreter.h>
 #include <script/script.h>
 #include <script/sigcache.h>
 #include <signet.h>
@@ -112,6 +115,15 @@ const std::vector<std::string> CHECKLEVEL_DOC {
  *  noticeably interfere with the pruning mechanism.
  * */
 static constexpr int PRUNE_LOCK_BUFFER{10};
+static constexpr auto RECOVERED_WITNESS_READ_FAILED{"recovered-witness-read-failed"};
+static constexpr auto RECOVERED_WITNESS_VALIDATION_FAILED{"recovered-witness-validation-failed"};
+
+static bool IsRecoveredWitnessRetryableError(const BlockValidationState& state)
+{
+    return state.IsError() &&
+        (state.GetRejectReason() == RECOVERED_WITNESS_READ_FAILED ||
+         state.GetRejectReason() == RECOVERED_WITNESS_VALIDATION_FAILED);
+}
 
 TRACEPOINT_SEMAPHORE(validation, block_connected);
 TRACEPOINT_SEMAPHORE(utxocache, flush);
@@ -197,6 +209,7 @@ std::optional<std::vector<int>> CalculatePrevHeights(
     }
     return prev_heights;
 }
+
 } // namespace
 
 std::optional<LockPoints> CalculateLockPointsAtTip(
@@ -806,6 +819,13 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     // Coinbase is only valid in a block, not as a loose transaction
     if (tx.IsCoinBase())
         return state.Invalid(TxValidationResult::TX_CONSENSUS, "coinbase");
+
+    const Consensus::Params& consensus{m_active_chainstate.m_chainman.GetConsensus()};
+    const int next_block_height{m_active_chainstate.m_chain.Height() + 1};
+    if (consensus.fRestrictedOutputMode && !Consensus::HasOnlyRestrictedOutputModeOutputs(tx, consensus, next_block_height)) {
+        // Keep the legacy reject string for compatibility with existing tests and tooling.
+        return state.Invalid(TxValidationResult::TX_CONSENSUS, "tx-output-not-p2mr");
+    }
 
     // Rather not work on nonstandard transactions (unless -testnet/-regtest)
     std::string reason;
@@ -1921,14 +1941,22 @@ PackageMempoolAcceptResult ProcessNewPackage(Chainstate& active_chainstate, CTxM
 
 CAmount GetBlockSubsidy(int nHeight, const Consensus::Params& consensusParams)
 {
-    int halvings = nHeight / consensusParams.nSubsidyHalvingInterval;
-    // Force block reward to zero when right shift is undefined.
-    if (halvings >= 64)
-        return 0;
+    if (nHeight < 0) return 0;
 
-    CAmount nSubsidy = 50 * COIN;
-    // Subsidy is cut in half every 210,000 blocks which will occur approximately every 4 years.
-    nSubsidy >>= halvings;
+    if (!Assume(consensusParams.nSubsidyStepInterval > 0)) return 0;
+    if (!Assume(consensusParams.nSubsidyStepdownNumerator >= 0)) return 0;
+    if (!Assume(consensusParams.nSubsidyStepdownDenominator > 0)) return 0;
+    if (!Assume(consensusParams.nSubsidyStepdownNumerator <= consensusParams.nSubsidyStepdownDenominator)) return 0;
+    if (!Assume(MoneyRange(consensusParams.nSubsidyInitial))) return 0;
+
+    CAmount nSubsidy{consensusParams.nSubsidyInitial};
+    const CAmount stepdown_numerator{consensusParams.nSubsidyStepdownNumerator};
+    const CAmount stepdown_denominator{consensusParams.nSubsidyStepdownDenominator};
+    const int step_count{nHeight / consensusParams.nSubsidyStepInterval};
+    for (int step{0}; step < step_count && nSubsidy > 0; ++step) {
+        nSubsidy = (nSubsidy / stepdown_denominator) * stepdown_numerator
+            + ((nSubsidy % stepdown_denominator) * stepdown_numerator) / stepdown_denominator;
+    }
     return nSubsidy;
 }
 
@@ -2343,6 +2371,9 @@ static unsigned int GetBlockScriptFlags(const CBlockIndex& block_index, const Ch
     // For simplicity, always leave P2SH+WITNESS+TAPROOT on except for the two
     // violating blocks.
     uint32_t flags{SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_TAPROOT};
+    if (block_index.nHeight >= consensusparams.P2MRHeight) {
+        flags |= SCRIPT_VERIFY_P2MR_RULES;
+    }
     const auto it{consensusparams.script_flag_exceptions.find(*Assert(block_index.phashBlock))};
     if (it != consensusparams.script_flag_exceptions.end()) {
         flags = it->second;
@@ -2371,6 +2402,44 @@ static unsigned int GetBlockScriptFlags(const CBlockIndex& block_index, const Ch
     return flags;
 }
 
+// Witness-pruned historical validation policy is tracked in the release
+// validation notes.
+// Full blocks keep the existing two-week assumevalid burial check, while
+// witness-pruned blocks fall back to the assumed-valid ancestry/work gate
+// because witness script execution is unavailable once history is compacted.
+static bool IsAssumedValidAncestor(const ChainstateManager& chainman, const CBlockIndex& block_index)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+{
+    AssertLockHeld(::cs_main);
+
+    if (chainman.AssumedValidBlock().IsNull()) return false;
+    if (!chainman.m_best_header) return false;
+    if (chainman.m_best_header->nChainWork < chainman.MinimumChainWork()) return false;
+
+    const auto it{chainman.m_blockman.m_block_index.find(chainman.AssumedValidBlock())};
+    if (it == chainman.m_blockman.m_block_index.end()) return false;
+    if (it->second.GetAncestor(block_index.nHeight) != &block_index) return false;
+    if (chainman.m_best_header->GetAncestor(block_index.nHeight) != &block_index) return false;
+
+    return true;
+}
+
+bool ChainstateManager::RequiresWitnessForPeerBlock(const CBlockIndex& block_index) const
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+{
+    return DeploymentActiveAt(block_index, *this, Consensus::DEPLOYMENT_SEGWIT);
+}
+
+bool ChainstateManager::CanSkipScriptChecks(const CBlockIndex& block_index, bool witness_unavailable) const
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+{
+    if (!IsAssumedValidAncestor(*this, block_index)) return false;
+    if (witness_unavailable) return true;
+
+    return GetBlockProofEquivalentTime(*m_best_header, block_index, *m_best_header, GetConsensus()) > 60 * 60 * 24 * 7 * 2;
+}
+
+static bool CheckBlockWeight(const CBlock& block, BlockValidationState& state, const char* check_name);
 
 /** Apply the effects of this block (with given index) on the UTXO set represented by coins.
  *  Validity checks that depend on the UTXO set are also done; ConnectBlock()
@@ -2425,36 +2494,24 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         return true;
     }
 
-    bool fScriptChecks = true;
-    if (!m_chainman.AssumedValidBlock().IsNull()) {
-        // We've been configured with the hash of a block which has been externally verified to have a valid history.
-        // A suitable default value is included with the software and updated from time to time.  Because validity
-        //  relative to a piece of software is an objective fact these defaults can be easily reviewed.
-        // This setting doesn't force the selection of any particular chain but makes validating some faster by
-        //  effectively caching the result of part of the verification.
-        BlockMap::const_iterator it{m_blockman.m_block_index.find(m_chainman.AssumedValidBlock())};
-        if (it != m_blockman.m_block_index.end()) {
-            if (it->second.GetAncestor(pindex->nHeight) == pindex &&
-                m_chainman.m_best_header->GetAncestor(pindex->nHeight) == pindex &&
-                m_chainman.m_best_header->nChainWork >= m_chainman.MinimumChainWork()) {
-                // This block is a member of the assumed verified chain and an ancestor of the best header.
-                // Script verification is skipped when connecting blocks under the
-                // assumevalid block. Assuming the assumevalid block is valid this
-                // is safe because block merkle hashes are still computed and checked,
-                // Of course, if an assumed valid block is invalid due to false scriptSigs
-                // this optimization would allow an invalid chain to be accepted.
-                // The equivalent time check discourages hash power from extorting the network via DOS attack
-                //  into accepting an invalid block through telling users they must manually set assumevalid.
-                //  Requiring a software change or burying the invalid block, regardless of the setting, makes
-                //  it hard to hide the implication of the demand.  This also avoids having release candidates
-                //  that are hardly doing any signature verification at all in testing without having to
-                //  artificially set the default assumed verified block further back.
-                // The test against the minimum chain work prevents the skipping when denied access to any chain at
-                //  least as good as the expected chain.
-                fScriptChecks = (GetBlockProofEquivalentTime(*m_chainman.m_best_header, *pindex, *m_chainman.m_best_header, params.GetConsensus()) <= 60 * 60 * 24 * 7 * 2);
-            }
-        }
+    // Full blocks retain the additional two-week burial check. Witness-pruned
+    // blocks cannot satisfy witness-dependent validation unless recovered
+    // witness data was loaded for this connect attempt.
+    const bool block_has_witness{HasAnyWitnessData(block)};
+    const bool block_missing_witness{
+        DeploymentActiveAfter(pindex->pprev, m_chainman, Consensus::DEPLOYMENT_SEGWIT) &&
+        GetWitnessCommitmentIndex(block) != NO_WITNESS_COMMITMENT &&
+        !block_has_witness
+    };
+    const bool witness_unavailable{
+        block_missing_witness ||
+        ((pindex->nStatus & BLOCK_OPT_WITNESS_PRUNED) && !block_has_witness)
+    };
+    if (!block_missing_witness && !CheckBlockWeight(block, state, __func__)) {
+        LogError("%s: Consensus::CheckBlockWeight: %s\n", __func__, state.ToString());
+        return false;
     }
+    bool fScriptChecks = !m_chainman.CanSkipScriptChecks(*pindex, witness_unavailable);
 
     const auto time_1{SteadyClock::now()};
     m_chainman.time_check += time_1 - time_start;
@@ -2593,6 +2650,15 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         const CTransaction &tx = *(block.vtx[i]);
 
         nInputs += tx.vin.size();
+
+        const Consensus::Params& consensus{params.GetConsensus()};
+        if (consensus.fRestrictedOutputMode &&
+            !Consensus::HasOnlyRestrictedOutputModeOutputs(tx, consensus, pindex->nHeight)) {
+            state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                          "bad-txns-output-not-p2mr",
+                          "output outside restricted-output mode allowances");
+            break;
+        }
 
         if (!tx.IsCoinBase())
         {
@@ -2774,6 +2840,7 @@ bool Chainstate::FlushStateToDisk(
     assert(this->CanFlushToDisk());
     std::set<int> setFilesToPrune;
     bool full_flush_completed = false;
+    bool witness_pruning_completed = false;
 
     const size_t coins_count = CoinsTip().GetCacheSize();
     const size_t coins_mem_usage = CoinsTip().DynamicMemoryUsage();
@@ -2825,6 +2892,19 @@ bool Chainstate::FlushStateToDisk(
                 }
             }
         }
+        // Defer witness compaction while background validation is running (assumeutxo),
+        // so witness data remains available for blocks the background chainstate still needs.
+        if (m_blockman.IsWitnessPruneMode() && m_blockman.WitnessPruningCheckRequested() &&
+            m_blockman.m_blockfiles_indexed && !m_chainman.BackgroundSyncInProgress()) {
+            LOG_TIME_MILLIS_WITH_CATEGORY("prepare witness compaction", BCLog::BENCH);
+            const bool prepared{m_blockman.PrepareWitnessCompaction(m_chain)};
+            if (prepared) {
+                m_blockman.ClearWitnessPruningCheck();
+            }
+            if (m_blockman.HasPendingWitnessCompaction()) {
+                fFlushForPrune = true;
+            }
+        }
         const auto nNow{NodeClock::now()};
         // The cache is large and we're within 10% and 10 MiB of the limit, but we have time now (not in the middle of a block processing).
         bool fCacheLarge = mode == FlushStateMode::PERIODIC && cache_state >= CoinsCacheSizeState::LARGE;
@@ -2854,6 +2934,14 @@ bool Chainstate::FlushStateToDisk(
                 }
             }
 
+            const bool had_pending_witness_compaction{m_blockman.HasPendingWitnessCompaction()};
+            if (had_pending_witness_compaction) {
+                if (!m_blockman.InstallWitnessCompaction()) {
+                    return FatalError(m_chainman.GetNotifications(), state,
+                                      _("Witness compaction handoff failed. Will retry on restart."));
+                }
+            }
+
             // Then update all block file information (which may refer to block and undo files).
             {
                 LOG_TIME_MILLIS_WITH_CATEGORY("write block index to disk", BCLog::BENCH);
@@ -2862,6 +2950,13 @@ bool Chainstate::FlushStateToDisk(
                     return FatalError(m_chainman.GetNotifications(), state, _("Failed to write to block index database."));
                 }
             }
+            if (had_pending_witness_compaction) {
+                if (!m_blockman.FinalizeWitnessCompaction()) {
+                    return FatalError(m_chainman.GetNotifications(), state,
+                                      _("Witness compaction handoff failed. Will retry on restart."));
+                }
+            }
+            witness_pruning_completed = had_pending_witness_compaction;
             // Finally remove any pruned files
             if (fFlushForPrune) {
                 LOG_TIME_MILLIS_WITH_CATEGORY("unlink pruned files", BCLog::BENCH);
@@ -2901,6 +2996,9 @@ bool Chainstate::FlushStateToDisk(
             constexpr auto range{DATABASE_WRITE_INTERVAL_MAX - DATABASE_WRITE_INTERVAL_MIN};
             m_next_write = FastRandomContext().rand_uniform_delay(NodeClock::now() + DATABASE_WRITE_INTERVAL_MIN, range);
         }
+    }
+    if (witness_pruning_completed && m_chainman.witness_pruning_completed) {
+        m_chainman.witness_pruning_completed();
     }
     if (full_flush_completed && m_chainman.m_options.signals) {
         // Update best block in wallet (so we can detect restored wallets).
@@ -3014,6 +3112,8 @@ bool Chainstate::DisconnectTip(BlockValidationState& state, DisconnectedBlockTra
         LogError("DisconnectTip(): Failed to read block\n");
         return false;
     }
+    // DisconnectBlock uses undo data (rev*.dat), not witness data. Witness-pruned
+    // blocks can therefore still be disconnected safely.
     // Apply the block atomically to the chain state.
     const auto time_start{SteadyClock::now()};
     {
@@ -3104,6 +3204,28 @@ public:
     }
 };
 
+bool Chainstate::ReadBlockForConnect(CBlock& block, const CBlockIndex& index, bool* used_recovered)
+{
+    AssertLockHeld(::cs_main);
+
+    if (used_recovered != nullptr) {
+        *used_recovered = false;
+    }
+
+    if ((index.nStatus & BLOCK_OPT_WITNESS_PRUNED) &&
+        m_chainman.NeedsWitnessForValidation(index)) {
+        if (used_recovered != nullptr) {
+            *used_recovered = true;
+        }
+        if (!m_blockman.ReadRecoveredBlock(block, index.GetBlockHash())) {
+            return false;
+        }
+        return true;
+    }
+
+    return m_blockman.ReadBlock(block, index);
+}
+
 /**
  * Connect a new block to m_chain. block_to_connect is either nullptr or a pointer to a CBlock
  * corresponding to pindexNew, to bypass loading it again from disk.
@@ -3123,9 +3245,20 @@ bool Chainstate::ConnectTip(
     assert(pindexNew->pprev == m_chain.Tip());
     // Read block from disk.
     const auto time_1{SteadyClock::now()};
+    bool used_recovered{false};
     if (!block_to_connect) {
         std::shared_ptr<CBlock> pblockNew = std::make_shared<CBlock>();
-        if (!m_blockman.ReadBlock(*pblockNew, *pindexNew)) {
+        if (!ReadBlockForConnect(*pblockNew, *pindexNew, &used_recovered)) {
+            if (used_recovered) {
+                m_chainman.ClearWitnessRecovery(pindexNew->GetBlockHash());
+                (void)m_blockman.RemoveRecoveredBlock(pindexNew->GetBlockHash());
+                LogWarning("Recovered witness block %s could not be read; discarding recovered payload and retrying recovery\n",
+                           pindexNew->GetBlockHash().ToString());
+                BlockValidationState retry_state;
+                retry_state.Error(RECOVERED_WITNESS_READ_FAILED);
+                state = retry_state;
+                return false;
+            }
             return FatalError(m_chainman.GetNotifications(), state, _("Failed to read block."));
         }
         block_to_connect = std::move(pblockNew);
@@ -3142,14 +3275,31 @@ bool Chainstate::ConnectTip(
     {
         CCoinsViewCache view(&CoinsTip());
         bool rv = ConnectBlock(*block_to_connect, state, pindexNew, view);
-        if (m_chainman.m_options.signals) {
-            m_chainman.m_options.signals->BlockChecked(block_to_connect, state);
-        }
         if (!rv) {
+            if (used_recovered) {
+                m_chainman.ClearWitnessRecovery(pindexNew->GetBlockHash());
+                (void)m_blockman.RemoveRecoveredBlock(pindexNew->GetBlockHash());
+                if (state.IsInvalid()) {
+                    LogWarning("Recovered witness block %s failed validation (%s); discarding recovered payload and retrying recovery\n",
+                               pindexNew->GetBlockHash().ToString(), state.ToString());
+                    BlockValidationState retry_state;
+                    retry_state.Error(RECOVERED_WITNESS_VALIDATION_FAILED);
+                    state = retry_state;
+                }
+            }
+            if (m_chainman.m_options.signals) {
+                m_chainman.m_options.signals->BlockChecked(block_to_connect, state);
+            }
+            if (IsRecoveredWitnessRetryableError(state)) {
+                return false;
+            }
             if (state.IsInvalid())
                 InvalidBlockFound(pindexNew, state);
             LogError("%s: ConnectBlock %s failed, %s\n", __func__, pindexNew->GetBlockHash().ToString(), state.ToString());
             return false;
+        }
+        if (m_chainman.m_options.signals) {
+            m_chainman.m_options.signals->BlockChecked(block_to_connect, state);
         }
         time_3 = SteadyClock::now();
         m_chainman.time_connect_total += time_3 - time_2;
@@ -3184,6 +3334,9 @@ bool Chainstate::ConnectTip(
     }
     // Update m_chain & related variables.
     m_chain.SetTip(*pindexNew);
+    if (m_blockman.IsWitnessPruneMode()) {
+        m_blockman.RequestWitnessPruningCheck();
+    }
     UpdateTip(pindexNew);
 
     const auto time_6{SteadyClock::now()};
@@ -3207,6 +3360,13 @@ bool Chainstate::ConnectTip(
     }
 
     connectTrace.BlockConnected(pindexNew, std::move(block_to_connect));
+    if (this == &m_chainman.ActiveChainstate() && !m_chainman.IsInitialBlockDownload()) {
+        m_chainman.m_orphan_metrics.RecordBlockConnected(pindexNew->nHeight);
+    }
+    if (used_recovered) {
+        m_chainman.ClearWitnessRecovery(pindexNew->GetBlockHash());
+        (void)m_blockman.RemoveRecoveredBlock(pindexNew->GetBlockHash());
+    }
     return true;
 }
 
@@ -3232,6 +3392,7 @@ CBlockIndex* Chainstate::FindMostWorkChain()
         // Just going until the active chain is an optimization, as we know all blocks in it are valid already.
         CBlockIndex *pindexTest = pindexNew;
         bool fInvalidAncestor = false;
+        CBlockIndex* pindexMissingWitness{nullptr};
         while (pindexTest && !m_chain.Contains(pindexTest)) {
             assert(pindexTest->HaveNumChainTxs() || pindexTest->nHeight == 0);
 
@@ -3241,8 +3402,14 @@ CBlockIndex* Chainstate::FindMostWorkChain()
             // to a chain unless we have all the non-active-chain parent blocks.
             bool fFailedChain = pindexTest->nStatus & BLOCK_FAILED_MASK;
             bool fMissingData = !(pindexTest->nStatus & BLOCK_HAVE_DATA);
+            // When reconnecting a side chain needs witness data that was
+            // compacted away locally, recover the earliest missing block
+            // temporarily instead of excluding the chain outright.
+            bool fMissingWitness = (pindexTest->nStatus & BLOCK_OPT_WITNESS_PRUNED) &&
+                                   m_chainman.NeedsWitnessForValidation(*pindexTest) &&
+                                   !m_blockman.HaveRecoveredBlock(pindexTest->GetBlockHash());
             if (fFailedChain || fMissingData) {
-                // Candidate chain is not usable (either invalid or missing data)
+                // Candidate chain is not usable (either invalid or missing required data)
                 if (fFailedChain && (m_chainman.m_best_invalid == nullptr || pindexNew->nChainWork > m_chainman.m_best_invalid->nChainWork)) {
                     m_chainman.m_best_invalid = pindexNew;
                 }
@@ -3266,7 +3433,14 @@ CBlockIndex* Chainstate::FindMostWorkChain()
                 fInvalidAncestor = true;
                 break;
             }
+            if (fMissingWitness) {
+                pindexMissingWitness = pindexTest;
+            }
             pindexTest = pindexTest->pprev;
+        }
+        if (!fInvalidAncestor && pindexMissingWitness != nullptr) {
+            m_chainman.ScheduleWitnessRecovery(*pindexMissingWitness);
+            return nullptr;
         }
         if (!fInvalidAncestor)
             return pindexNew;
@@ -3291,7 +3465,7 @@ void Chainstate::PruneBlockIndexCandidates() {
  *
  * @returns true unless a system error occurred
  */
-bool Chainstate::ActivateBestChainStep(BlockValidationState& state, CBlockIndex* pindexMostWork, const std::shared_ptr<const CBlock>& pblock, bool& fInvalidFound, ConnectTrace& connectTrace)
+bool Chainstate::ActivateBestChainStep(BlockValidationState& state, CBlockIndex* pindexMostWork, const std::shared_ptr<const CBlock>& pblock, bool& fResetMostWork, ConnectTrace& connectTrace)
 {
     AssertLockHeld(cs_main);
     if (m_mempool) AssertLockHeld(m_mempool->cs);
@@ -3336,6 +3510,16 @@ bool Chainstate::ActivateBestChainStep(BlockValidationState& state, CBlockIndex*
 
         // Connect new blocks.
         for (CBlockIndex* pindexConnect : vpindexToConnect | std::views::reverse) {
+            // Defense in depth: FindMostWorkChain() should have already
+            // scheduled recovery before these candidates reach ConnectTip().
+            if ((pindexConnect->nStatus & BLOCK_OPT_WITNESS_PRUNED) &&
+                m_chainman.NeedsWitnessForValidation(*pindexConnect) &&
+                !m_blockman.HaveRecoveredBlock(pindexConnect->GetBlockHash())) {
+                m_chainman.ScheduleWitnessRecovery(*pindexConnect);
+                fResetMostWork = true;
+                fContinue = false;
+                break;
+            }
             if (!ConnectTip(state, pindexConnect, pindexConnect == pindexMostWork ? pblock : std::shared_ptr<const CBlock>(), connectTrace, disconnectpool)) {
                 if (state.IsInvalid()) {
                     // The block violates a consensus rule.
@@ -3343,7 +3527,16 @@ bool Chainstate::ActivateBestChainStep(BlockValidationState& state, CBlockIndex*
                         InvalidChainFound(vpindexToConnect.front());
                     }
                     state = BlockValidationState();
-                    fInvalidFound = true;
+                    fResetMostWork = true;
+                    fContinue = false;
+                    break;
+                } else if (IsRecoveredWitnessRetryableError(state)) {
+                    // The recovered payload was bad, but the indexed block may
+                    // still be valid. Recompute the best candidate so validation
+                    // schedules a fresh recovery attempt instead of marking the
+                    // chain failed.
+                    state = BlockValidationState();
+                    fResetMostWork = true;
                     fContinue = false;
                     break;
                 } else {
@@ -3413,6 +3606,12 @@ static void LimitValidationInterfaceQueue(ValidationSignals& signals) LOCKS_EXCL
     }
 }
 
+bool Chainstate::ActivateBestChainStepForTest(BlockValidationState& state, CBlockIndex* pindexMostWork, bool& fResetMostWork)
+{
+    ConnectTrace connectTrace;
+    return ActivateBestChainStep(state, pindexMostWork, nullptr, fResetMostWork, connectTrace);
+}
+
 bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<const CBlock> pblock)
 {
     AssertLockNotHeld(m_chainstate_mutex);
@@ -3471,19 +3670,19 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
                     break;
                 }
 
-                bool fInvalidFound = false;
+                bool fResetMostWork = false;
                 std::shared_ptr<const CBlock> nullBlockPtr;
                 // BlockConnected signals must be sent for the original role;
                 // in case snapshot validation is completed during ActivateBestChainStep, the
                 // result of GetRole() changes from BACKGROUND to NORMAL.
                const ChainstateRole chainstate_role{this->GetRole()};
-                if (!ActivateBestChainStep(state, pindexMostWork, pblock && pblock->GetHash() == pindexMostWork->GetBlockHash() ? pblock : nullBlockPtr, fInvalidFound, connectTrace)) {
+                if (!ActivateBestChainStep(state, pindexMostWork, pblock && pblock->GetHash() == pindexMostWork->GetBlockHash() ? pblock : nullBlockPtr, fResetMostWork, connectTrace)) {
                     // A system error occurred
                     return false;
                 }
                 blocks_connected = true;
 
-                if (fInvalidFound) {
+                if (fResetMostWork) {
                     // Wipe cache, we may need another branch now.
                     pindexMostWork = nullptr;
                 }
@@ -3513,6 +3712,25 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
             if (was_in_ibd && !still_in_ibd) {
                 // Active chainstate has exited IBD.
                 exited_ibd = true;
+            }
+
+            if (this == &m_chainman.ActiveChainstate() && !still_in_ibd && starting_tip && pindexFork && pindexFork != starting_tip) {
+                const int reorg_depth{starting_tip->nHeight - pindexFork->nHeight};
+                if (reorg_depth > 0) {
+                    m_chainman.m_orphan_metrics.RecordReorg(reorg_depth);
+                    std::vector<const CBlockIndex*> stale_branch;
+                    stale_branch.reserve(reorg_depth);
+                    const CBlockIndex* pindex{starting_tip};
+                    while (pindex && pindex != pindexFork) {
+                        stale_branch.push_back(pindex);
+                        pindex = pindex->pprev;
+                    }
+                    // Record from fork+1 up to the stale tip so last_stale_height
+                    // reflects the old tip height for this reorg.
+                    for (auto it = stale_branch.rbegin(); it != stale_branch.rend(); ++it) {
+                        m_chainman.m_orphan_metrics.RecordStaleBlock((*it)->nHeight, (*it)->GetBlockHash());
+                    }
+                }
             }
 
             // Notify external listeners about the new tip.
@@ -3923,9 +4141,9 @@ void ChainstateManager::ReceivedBlockTransactions(const CBlock& block, CBlockInd
 
 static bool CheckBlockHeader(const CBlockHeader& block, BlockValidationState& state, const Consensus::Params& consensusParams, bool fCheckPOW = true)
 {
-    // Check proof of work matches claimed amount
-    if (fCheckPOW && !CheckProofOfWork(block.GetHash(), block.nBits, consensusParams))
-        return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "high-hash", "proof of work failed");
+    if (const auto error = auxpow::Validate(block, consensusParams, fCheckPOW)) {
+        return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, error->reject_reason, error->debug_message);
+    }
 
     return true;
 }
@@ -3963,13 +4181,22 @@ static bool CheckMerkleRoot(const CBlock& block, BlockValidationState& state)
  * Note: If the witness commitment is expected (i.e. `expect_witness_commitment
  * = true`), then the block is required to have at least one transaction and the
  * first transaction needs to have at least one input. */
-static bool CheckWitnessMalleation(const CBlock& block, bool expect_witness_commitment, BlockValidationState& state)
+bool HasAnyWitnessData(const CBlock& block)
+{
+    return std::any_of(block.vtx.begin(), block.vtx.end(), [](const auto& tx) { return tx->HasWitness(); });
+}
+
+static bool CheckWitnessMalleation(const CBlock& block, bool expect_witness_commitment, bool allow_stripped, BlockValidationState& state)
 {
     if (expect_witness_commitment) {
         if (block.m_checked_witness_commitment) return true;
 
         int commitpos = GetWitnessCommitmentIndex(block);
         if (commitpos != NO_WITNESS_COMMITMENT) {
+            if (allow_stripped && !HasAnyWitnessData(block)) {
+                return true;
+            }
+
             assert(!block.vtx.empty() && !block.vtx[0]->vin.empty());
             const auto& witness_stack{block.vtx[0]->vin[0].scriptWitness.stack};
 
@@ -4008,6 +4235,14 @@ static bool CheckWitnessMalleation(const CBlock& block, bool expect_witness_comm
         }
     }
 
+    return true;
+}
+
+static bool CheckBlockWeight(const CBlock& block, BlockValidationState& state, const char* check_name)
+{
+    if (GetBlockWeight(block) > MAX_BLOCK_WEIGHT) {
+        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-blk-weight", strprintf("%s : weight limit failed", check_name));
+    }
     return true;
 }
 
@@ -4120,7 +4355,7 @@ std::vector<unsigned char> ChainstateManager::GenerateCoinbaseCommitment(CBlock&
 bool HasValidProofOfWork(const std::vector<CBlockHeader>& headers, const Consensus::Params& consensusParams)
 {
     return std::all_of(headers.cbegin(), headers.cend(),
-            [&](const auto& header) { return CheckProofOfWork(header.GetHash(), header.nBits, consensusParams);});
+            [&](const auto& header) { return !auxpow::Validate(header, consensusParams); });
 }
 
 bool IsBlockMutated(const CBlock& block, bool check_witness_root)
@@ -4146,7 +4381,7 @@ bool IsBlockMutated(const CBlock& block, bool check_witness_root)
         // here as it requires at least 224 bits of work.
     }
 
-    if (!CheckWitnessMalleation(block, check_witness_root, state)) {
+    if (!CheckWitnessMalleation(block, check_witness_root, /*allow_stripped=*/false, state)) {
         LogDebug(BCLog::VALIDATION, "Block mutated: %s\n", state.ToString());
         return true;
     }
@@ -4194,7 +4429,7 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
 
     // Testnet4 and regtest only: Check timestamp against prev for difficulty-adjustment
     // blocks to prevent timewarp attacks (see https://github.com/bitcoin/bitcoin/pull/15482).
-    if (consensusParams.enforce_BIP94) {
+    if (consensusParams.enforce_BIP94 && !consensusParams.fPowUseASERT) {
         // Check timestamp for the first block of each difficulty adjustment
         // interval, except the genesis block.
         if (nHeight % consensusParams.DifficultyAdjustmentInterval() == 0) {
@@ -4217,6 +4452,26 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
                                  strprintf("rejected nVersion=0x%08x block", block.nVersion));
     }
 
+    const bool cadence_active = consensusParams.CadenceActiveAtHeight(nHeight);
+    if (!cadence_active && block.SignalsAuxpow()) {
+        return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "bad-cadence-inactive",
+                             strprintf("rejected pre-activation auxpow header nVersion=0x%08x", block.nVersion));
+    }
+
+    if (cadence_active) {
+        if (!HasCanonicalVersionLayout(block.nVersion)) {
+            return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, strprintf("bad-version-topbits(0x%08x)", block.nVersion),
+                                 strprintf("rejected nVersion=0x%08x noncanonical version layout", block.nVersion));
+        }
+
+        if (HasBIP9TopBitsShape(block.nVersion)) {
+            if (block.HasReservedVersionBits()) {
+                return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, strprintf("bad-version-reserved(0x%08x)", block.nVersion),
+                                     strprintf("rejected nVersion=0x%08x reserved bits", block.nVersion));
+            }
+        }
+    }
+
     return true;
 }
 
@@ -4226,9 +4481,11 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
  *  in ConnectBlock().
  *  Note that -reindex-chainstate skips the validation that happens here!
  */
-static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& state, const ChainstateManager& chainman, const CBlockIndex* pindexPrev)
+static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& state, const ChainstateManager& chainman, const CBlockIndex* pindexPrev, const CBlockIndex* pindex = nullptr, bool requested_stripped = false) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
 {
+    AssertLockHeld(::cs_main);
     const int nHeight = pindexPrev == nullptr ? 0 : pindexPrev->nHeight + 1;
+    const bool expect_witness_commitment{DeploymentActiveAfter(pindexPrev, chainman, Consensus::DEPLOYMENT_SEGWIT)};
 
     // Enforce BIP113 (Median Time Past).
     bool enforce_locktime_median_time_past{false};
@@ -4266,7 +4523,20 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
     // * There must be at least one output whose scriptPubKey is a single 36-byte push, the first 4 bytes of which are
     //   {0xaa, 0x21, 0xa9, 0xed}, and the following 32 bytes are SHA256^2(witness root, witness reserved value). In case there are
     //   multiple, the last one is used.
-    if (!CheckWitnessMalleation(block, DeploymentActiveAfter(pindexPrev, chainman, Consensus::DEPLOYMENT_SEGWIT), state)) {
+    // net_processing should never request stripped post-SegWit blocks, but keep
+    // the acceptance rule local to validation so direct ProcessNewBlock callers
+    // cannot bypass it by setting requested_stripped themselves.
+    if (requested_stripped &&
+        pindex != nullptr &&
+        chainman.RequiresWitnessForPeerBlock(*pindex) &&
+        !HasAnyWitnessData(block)) {
+        return state.Invalid(
+            /*result=*/BlockValidationResult::BLOCK_MUTATED,
+            /*reject_reason=*/"bad-blk-missing-witness",
+            /*debug_message=*/strprintf("%s : witness data required for peer block acceptance", __func__));
+    }
+    const bool allow_stripped{requested_stripped && pindex != nullptr && !chainman.RequiresWitnessForPeerBlock(*pindex)};
+    if (!CheckWitnessMalleation(block, expect_witness_commitment, allow_stripped, state)) {
         return false;
     }
 
@@ -4276,9 +4546,7 @@ static bool ContextualCheckBlock(const CBlock& block, BlockValidationState& stat
     // large by filling up the coinbase witness, which doesn't change
     // the block hash, so we couldn't mark the block as permanently
     // failed).
-    if (GetBlockWeight(block) > MAX_BLOCK_WEIGHT) {
-        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-blk-weight", strprintf("%s : weight limit failed", __func__));
-    }
+    if (!CheckBlockWeight(block, state, __func__)) return false;
 
     return true;
 }
@@ -4394,7 +4662,7 @@ void ChainstateManager::ReportHeadersPresync(const arith_uint256& work, int64_t 
 }
 
 /** Store block on disk. If dbp is non-nullptr, the file is known to already reside on disk */
-bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock, BlockValidationState& state, CBlockIndex** ppindex, bool fRequested, const FlatFilePos* dbp, bool* fNewBlock, bool min_pow_checked)
+bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock, BlockValidationState& state, CBlockIndex** ppindex, bool fRequested, const FlatFilePos* dbp, bool* fNewBlock, bool min_pow_checked, bool requested_stripped)
 {
     const CBlock& block = *pblock;
 
@@ -4434,7 +4702,12 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
     if (fAlreadyHave) return true;
     if (!fRequested) {  // If we didn't ask for it:
         if (pindex->nTx != 0) return true;    // This is a previously-processed block that was pruned
-        if (!fHasMoreOrSameWork) return true; // Don't process less-work chains
+        if (!fHasMoreOrSameWork) {
+            if (!IsInitialBlockDownload()) {
+                m_orphan_metrics.RecordStaleBlock(pindex->nHeight, block.GetHash());
+            }
+            return true; // Don't process less-work chains
+        }
         if (fTooFarAhead) return true;        // Block height is too high
 
         // Protect against DoS attacks from low-work chains.
@@ -4447,7 +4720,7 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
     const CChainParams& params{GetParams()};
 
     if (!CheckBlock(block, state, params.GetConsensus()) ||
-        !ContextualCheckBlock(block, state, *this, pindex->pprev)) {
+        !ContextualCheckBlock(block, state, *this, pindex->pprev, pindex, requested_stripped)) {
         if (Assume(state.IsInvalid())) {
             ActiveChainstate().InvalidBlockFound(pindex, state);
         }
@@ -4494,7 +4767,7 @@ bool ChainstateManager::AcceptBlock(const std::shared_ptr<const CBlock>& pblock,
     return true;
 }
 
-bool ChainstateManager::ProcessNewBlock(const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked, bool* new_block)
+bool ChainstateManager::ProcessNewBlock(const std::shared_ptr<const CBlock>& block, bool force_processing, bool min_pow_checked, bool* new_block, bool requested_stripped)
 {
     AssertLockNotHeld(cs_main);
 
@@ -4515,7 +4788,7 @@ bool ChainstateManager::ProcessNewBlock(const std::shared_ptr<const CBlock>& blo
         bool ret = CheckBlock(*block, state, GetConsensus());
         if (ret) {
             // Store to disk
-            ret = AcceptBlock(block, state, &pindex, force_processing, nullptr, new_block, min_pow_checked);
+            ret = AcceptBlock(block, state, &pindex, force_processing, nullptr, new_block, min_pow_checked, requested_stripped);
         }
         if (!ret) {
             if (m_options.signals) {
@@ -4542,6 +4815,67 @@ bool ChainstateManager::ProcessNewBlock(const std::shared_ptr<const CBlock>& blo
      }
 
     return true;
+}
+
+bool ChainstateManager::NeedsWitnessForValidation(const CBlockIndex& block_index) const
+{
+    AssertLockHeld(::cs_main);
+
+    if (!RequiresWitnessForPeerBlock(block_index)) {
+        return false;
+    }
+
+    return !CanSkipScriptChecks(block_index, /*witness_unavailable=*/true);
+}
+
+bool ChainstateManager::RequiresArchivePeersForValidation() const
+{
+    AssertLockHeld(::cs_main);
+
+    if (!m_blockman.m_have_witness_pruned) {
+        return AssumedValidBlock().IsNull();
+    }
+    return m_pending_witness_recovery.has_value();
+}
+
+const CBlockIndex* ChainstateManager::PendingWitnessRecovery() const
+{
+    AssertLockHeld(::cs_main);
+
+    if (!m_pending_witness_recovery.has_value()) {
+        return nullptr;
+    }
+    return m_blockman.LookupBlockIndex(*m_pending_witness_recovery);
+}
+
+bool ChainstateManager::ScheduleWitnessRecovery(const CBlockIndex& block_index)
+{
+    AssertLockHeld(::cs_main);
+
+    if (m_blockman.HaveRecoveredBlock(block_index.GetBlockHash())) {
+        return false;
+    }
+    if (m_pending_witness_recovery == block_index.GetBlockHash()) {
+        return false;
+    }
+    if (m_pending_witness_recovery.has_value()) {
+        LogInfo("Replacing pending temporary witness recovery for block %s with block %s at height %d",
+                m_pending_witness_recovery->ToString(), block_index.GetBlockHash().ToString(), block_index.nHeight);
+    }
+
+    m_pending_witness_recovery = block_index.GetBlockHash();
+    LogInfo("Scheduling temporary witness recovery for block %s at height %d",
+            block_index.GetBlockHash().ToString(), block_index.nHeight);
+    return true;
+}
+
+void ChainstateManager::ClearWitnessRecovery(const uint256& block_hash)
+{
+    AssertLockHeld(::cs_main);
+
+    if (m_pending_witness_recovery == block_hash) {
+        m_pending_witness_recovery.reset();
+    }
 }
 
 MempoolAcceptResult ChainstateManager::ProcessTransaction(const CTransactionRef& tx, bool test_accept)
@@ -4961,6 +5295,7 @@ bool ChainstateManager::LoadBlockIndex()
         if (!ret) return false;
 
         m_blockman.ScanAndUnlinkAlreadyPrunedFiles();
+        m_blockman.CleanupRecoveredBlocks();
 
         std::vector<CBlockIndex*> vSortedByHeight{m_blockman.GetAllBlockIndices()};
         std::sort(vSortedByHeight.begin(), vSortedByHeight.end(),
@@ -5358,6 +5693,8 @@ void ChainstateManager::CheckBlockIndex() const
             // block, and must be set if it is.
             assert((pindex->m_chain_tx_count != 0) == (pindex == snap_base));
         }
+        const uint64_t expected_auxpow_count = (pindex->pprev ? pindex->pprev->nAuxPow : 0) + (pindex->SignalsAuxpow() ? 1 : 0);
+        assert(pindex->nAuxPow == expected_auxpow_count);
         // There should be no block with more work than m_best_header, unless it's known to be invalid
         assert((pindex->nStatus & BLOCK_FAILED_MASK) || pindex->nChainWork <= m_best_header->nChainWork);
 
@@ -5377,6 +5714,19 @@ void ChainstateManager::CheckBlockIndex() const
             //   candidate, and this will be asserted below. The only exception
             //   is if pindex itself is an assumeutxo snapshot block. Then it is
             //   also a potential candidate.
+            bool candidate_needs_missing_witness = false;
+            if (m_blockman.m_have_witness_pruned || m_blockman.m_write_witness_pruned_flag) {
+                for (const CBlockIndex* candidate = pindex;
+                     candidate && !c->m_chain.Contains(candidate);
+                     candidate = candidate->pprev) {
+                    if ((candidate->nStatus & BLOCK_OPT_WITNESS_PRUNED) &&
+                        NeedsWitnessForValidation(*candidate)) {
+                        candidate_needs_missing_witness = true;
+                        break;
+                    }
+                }
+            }
+
             if (!CBlockIndexWorkComparator()(pindex, c->m_chain.Tip()) && (pindexFirstNeverProcessed == nullptr || pindex == snap_base)) {
                 // If pindex was detected as invalid (pindexFirstInvalid is
                 // non-null), it is not required to be in
@@ -5400,7 +5750,8 @@ void ChainstateManager::CheckBlockIndex() const
                     // If the chainstate was loaded from a snapshot and pindex
                     // is the base of the snapshot, pindex is also a potential
                     // candidate.
-                    if (pindexFirstMissing == nullptr || pindex == c->m_chain.Tip() || pindex == c->SnapshotBase()) {
+                    if (!candidate_needs_missing_witness &&
+                        (pindexFirstMissing == nullptr || pindex == c->m_chain.Tip() || pindex == c->SnapshotBase())) {
                         // If this chainstate is the active chainstate, pindex
                         // must be in setBlockIndexCandidates. Otherwise, this
                         // chainstate is a background validation chainstate, and

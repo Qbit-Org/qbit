@@ -7,6 +7,7 @@ Test mempool acceptance in case of an already known transaction
 with identical non-witness data but different witness.
 """
 
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.messages import (
     COIN,
 )
@@ -27,15 +28,20 @@ class MempoolWtxidTest(BitcoinTestFramework):
     def run_test(self):
         node = self.nodes[0]
 
-        self.log.info('Start with empty mempool and 101 blocks')
-        # The last 100 coinbase transactions are premature
-        blockhash = self.generate(node, 101)[0]
+        self.log.info('Start with empty mempool and %d blocks' % (COINBASE_MATURITY + 1))
+        # The last COINBASE_MATURITY coinbase transactions are premature
+        blockhash = self.generate(node, COINBASE_MATURITY + 1)[0]
         txid = node.getblock(blockhash=blockhash, verbosity=2)["tx"][0]["txid"]
         assert_equal(node.getmempoolinfo()['size'], 0)
 
         self.log.info("Submit parent with multiple script branches to mempool")
         txgen = ValidWitnessMalleatedTx()
-        parent = txgen.build_parent_tx(txid, 9.99998 * COIN)
+        txout = node.gettxout(txid=txid, n=0)
+        assert txout is not None
+        coinbase_value_sat = int(txout["value"] * COIN)
+        parent_value_sat = coinbase_value_sat - 2_000
+        assert parent_value_sat > 0
+        parent = txgen.build_parent_tx(txid, parent_value_sat)
 
         privkeys = [node.get_deterministic_priv_key().key]
         raw_parent = node.signrawtransactionwithkey(hexstring=parent.serialize().hex(), privkeys=privkeys)['hex']
@@ -44,7 +50,9 @@ class MempoolWtxidTest(BitcoinTestFramework):
 
         peer_wtxid_relay = node.add_p2p_connection(P2PTxInvStore())
 
-        child_one, child_two = txgen.build_malleated_children(signed_parent_txid, 9.99996 * COIN)
+        child_value_sat = parent_value_sat - 2_000
+        assert child_value_sat > 0
+        child_one, child_two = txgen.build_malleated_children(signed_parent_txid, child_value_sat)
         child_one_wtxid = child_one.wtxid_hex
         child_one_txid = child_one.txid_hex
         child_two_wtxid = child_two.wtxid_hex

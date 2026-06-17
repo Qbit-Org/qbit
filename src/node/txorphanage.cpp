@@ -52,7 +52,7 @@ class TxOrphanageImpl final : public TxOrphanage {
         /** Get an approximation for "memory usage". The total memory is a function of the memory used to store the
          * transaction itself, each entry in m_orphans, and each entry in m_outpoint_to_orphan_wtxids. We use weight because
          * it is often higher than the actual memory usage of the transaction. This metric conveniently encompasses
-         * m_outpoint_to_orphan_wtxids usage since input data does not get the witness discount, and makes it easier to
+         * m_outpoint_to_orphan_wtxids usage since qbit fully counts input data, and makes it easier to
          * reason about each peer's limits using well-understood transaction attributes. */
         TxOrphanage::Usage GetMemUsage()  const {
             return GetTransactionWeight(*m_tx);

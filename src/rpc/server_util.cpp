@@ -11,6 +11,7 @@
 #include <node/miner.h>
 #include <policy/fees.h>
 #include <pow.h>
+#include <primitives/pureheader.h>
 #include <rpc/protocol.h>
 #include <rpc/request.h>
 #include <txmempool.h>
@@ -137,12 +138,14 @@ AddrMan& EnsureAnyAddrman(const std::any& context)
 void NextEmptyBlockIndex(CBlockIndex& tip, const Consensus::Params& consensusParams, CBlockIndex& next_index)
 {
     CBlockHeader next_header{};
+    next_header.nVersion = MakeVersion(/*chain_id=*/0, /*auxpow=*/false, /*version_bits=*/0);
     next_header.hashPrevBlock  = tip.GetBlockHash();
     UpdateTime(&next_header, consensusParams, &tip);
     next_header.nBits = GetNextWorkRequired(&tip, &next_header, consensusParams);
     next_header.nNonce = 0;
 
     next_index.pprev = &tip;
+    next_index.nVersion = next_header.nVersion;
     next_index.nTime = next_header.nTime;
     next_index.nBits = next_header.nBits;
     next_index.nNonce = next_header.nNonce;

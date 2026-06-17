@@ -29,6 +29,9 @@ class P2PPermissionsTests(BitcoinTestFramework):
     def run_test(self):
         self.wallet = MiniWallet(self.nodes[0])
 
+        # Mature the default-cache coinbase UTXOs
+        self.ensure_cached_coinbase_mature(self.nodes[0])
+
         self.check_tx_relay()
 
         self.checkpermission(

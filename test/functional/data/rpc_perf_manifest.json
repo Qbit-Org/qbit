@@ -1,0 +1,1100 @@
+{
+  "manifest_version": 1,
+  "report_kind": "rpc",
+  "fixtures": {
+    "shared_chain": {
+      "description": "Single-node mature chain with deterministic MiniWallet activity for shared read-only RPCs."
+    },
+    "orphan_window": {
+      "description": "Four-node qbit split/rejoin topology with stale-block history for orphan-rate-driven RPCs."
+    },
+    "auxpow_ready": {
+      "description": "Single-node qbit AuxPoW fixture with mature chain state and a deterministic payout address."
+    },
+    "wallet_ready": {
+      "description": "Single-node wallet fixture with mature spendable funds, reusable raw transaction/PSBT samples, and qbit pubkeydb watch-only state when available."
+    }
+  },
+  "benchmarks": [
+    {
+      "id": "shared.read.getbestblockhash.tip",
+      "description": "Return the current best block hash on a mature single-node chain.",
+      "endpoint": "getbestblockhash",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "shared_getbestblockhash",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "cold": 2,
+        "warm": 11
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "restart_node"
+    },
+    {
+      "id": "shared.read.getblockcount.tip",
+      "description": "Return the current best height on a mature single-node chain.",
+      "endpoint": "getblockcount",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "shared_getblockcount",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "cold": 2,
+        "warm": 11
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "restart_node"
+    },
+    {
+      "id": "shared.read.getblockchaininfo.tip",
+      "description": "Return chain metadata for the prepared shared-chain fixture.",
+      "endpoint": "getblockchaininfo",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "shared_getblockchaininfo",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "cold": 2,
+        "warm": 11
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "restart_node"
+    },
+    {
+      "id": "shared.read.getblockhash.sample",
+      "description": "Resolve a preselected block height to its block hash.",
+      "endpoint": "getblockhash",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "shared_getblockhash",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "cold": 2,
+        "warm": 11
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "restart_node"
+    },
+    {
+      "id": "shared.read.getblockheader.sample",
+      "description": "Fetch the verbose block header for a preselected block hash.",
+      "endpoint": "getblockheader",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "shared_getblockheader",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "cold": 2,
+        "warm": 11
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "restart_node"
+    },
+    {
+      "id": "shared.read.getblockstats.sample",
+      "description": "Collect block statistics for a preselected post-maturity block with deterministic wallet activity.",
+      "endpoint": "getblockstats",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "shared_getblockstats",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "cold": 2,
+        "warm": 11
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "restart_node"
+    },
+    {
+      "id": "qbit.only.getorphanmetrics.default",
+      "description": "Read orphan/stale block metrics after a deterministic stale-block event.",
+      "endpoint": "getorphanmetrics",
+      "fixture": "orphan_window",
+      "lane": "qbit_only_public",
+      "call_builder": "qbit_getorphanmetrics_default",
+      "target_support": [
+        "qbit"
+      ],
+      "modes": {
+        "warm": 9
+      },
+      "comparison_mode": "none",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "qbit.only.getconfirmationtarget.high",
+      "description": "Estimate qbit confirmation targets against the prepared orphan-rate fixture.",
+      "endpoint": "getconfirmationtarget",
+      "fixture": "orphan_window",
+      "lane": "qbit_only_public",
+      "call_builder": "qbit_getconfirmationtarget_high",
+      "target_support": [
+        "qbit"
+      ],
+      "modes": {
+        "warm": 9
+      },
+      "comparison_mode": "none",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "qbit.only.createauxblock.template",
+      "description": "Create a merged-mining template on a qbit AuxPoW-capable node.",
+      "endpoint": "createauxblock",
+      "fixture": "auxpow_ready",
+      "lane": "qbit_only_public",
+      "call_builder": "qbit_createauxblock",
+      "target_support": [
+        "qbit"
+      ],
+      "modes": {
+        "cold": 2,
+        "warm": 7
+      },
+      "comparison_mode": "none",
+      "fixture_reset_mode": "restart_node"
+    },
+    {
+      "id": "qbit.only.submitauxblock.valid",
+      "description": "Submit a valid AuxPoW payload prepared from a fresh template on each sample.",
+      "endpoint": "submitauxblock",
+      "fixture": "auxpow_ready",
+      "lane": "qbit_only_public",
+      "call_builder": "qbit_submitauxblock",
+      "target_support": [
+        "qbit"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "none",
+      "fixture_reset_mode": "prepare_each_sample"
+    },
+    {
+      "id": "qbit.only.exportpubkeydb.default",
+      "description": "Export the prepared signer wallet P2MR pubkey database.",
+      "endpoint": "exportpubkeydb",
+      "fixture": "wallet_ready",
+      "lane": "qbit_only_public",
+      "call_builder": "qbit_exportpubkeydb",
+      "target_support": [
+        "qbit"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "none",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "qbit.only.importpubkeydb.watch",
+      "description": "Import the prepared P2MR pubkey database into a fresh watch-only wallet for each sample.",
+      "endpoint": "importpubkeydb",
+      "fixture": "wallet_ready",
+      "lane": "qbit_only_public",
+      "call_builder": "qbit_importpubkeydb",
+      "target_support": [
+        "qbit"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "none",
+      "fixture_reset_mode": "prepare_each_sample"
+    },
+    {
+      "id": "qbit.only.getnextpubkeydbaddress.external",
+      "description": "Allocate the next imported P2MR pubkey-pool receive address from a watch-only wallet.",
+      "endpoint": "getnextpubkeydbaddress",
+      "fixture": "wallet_ready",
+      "lane": "qbit_only_public",
+      "call_builder": "qbit_getnextpubkeydbaddress",
+      "target_support": [
+        "qbit"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "none",
+      "fixture_reset_mode": "prepare_each_sample"
+    },
+    {
+      "id": "qbit.only.listpubkeydbstatus.default",
+      "description": "Read imported P2MR pubkey-pool allocation status from a watch-only wallet.",
+      "endpoint": "listpubkeydbstatus",
+      "fixture": "wallet_ready",
+      "lane": "qbit_only_public",
+      "call_builder": "qbit_listpubkeydbstatus",
+      "target_support": [
+        "qbit"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "none",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.read.getdifficulty.tip",
+      "description": "Return current proof-of-work difficulty for the prepared chain.",
+      "endpoint": "getdifficulty",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "static_params",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.read.getchaintips.default",
+      "description": "Return chain tip metadata for the prepared chain.",
+      "endpoint": "getchaintips",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "static_params",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.read.gettxoutsetinfo.default",
+      "description": "Return UTXO set statistics for the prepared chain.",
+      "endpoint": "gettxoutsetinfo",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "static_params",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 3
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.read.verifychain.default",
+      "description": "Run the default verifychain check against the prepared chain.",
+      "endpoint": "verifychain",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "static_params",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 3
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.read.getblock.sample",
+      "description": "Fetch a verbose block for a prepared sample hash.",
+      "endpoint": "getblock",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "shared_getblock_verbose",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.read.getrawtransaction.mempool",
+      "description": "Fetch the prepared mempool transaction in verbose form.",
+      "endpoint": "getrawtransaction",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "shared_getrawtransaction_mempool",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.read.gettxout.confirmed",
+      "description": "Read a confirmed UTXO from the prepared chain.",
+      "endpoint": "gettxout",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "shared_gettxout_confirmed",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.read.gettxoutproof.confirmed",
+      "description": "Build a txout proof for the prepared confirmed transaction.",
+      "endpoint": "gettxoutproof",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "shared_gettxoutproof_confirmed",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.read.verifytxoutproof.confirmed",
+      "description": "Verify the txout proof prepared by the shared-chain fixture.",
+      "endpoint": "verifytxoutproof",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "shared_verifytxoutproof_confirmed",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.read.getmempoolinfo.default",
+      "description": "Return mempool summary metadata after the fixture leaves one transaction in mempool.",
+      "endpoint": "getmempoolinfo",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "static_params",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.read.getrawmempool.default",
+      "description": "Return txids currently in the prepared mempool.",
+      "endpoint": "getrawmempool",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "static_params",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.read.getmempoolentry.sample",
+      "description": "Return mempool entry metadata for the prepared transaction.",
+      "endpoint": "getmempoolentry",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "shared_mempool_txid",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.read.getmempoolancestors.sample",
+      "description": "Return ancestor data for the prepared mempool transaction.",
+      "endpoint": "getmempoolancestors",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "shared_mempool_txid",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.read.getmempooldescendants.sample",
+      "description": "Return descendant data for the prepared mempool transaction.",
+      "endpoint": "getmempooldescendants",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "shared_mempool_txid",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.read.gettxspendingprevout.sample",
+      "description": "Check the mempool spender for the prepared previous output.",
+      "endpoint": "gettxspendingprevout",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "shared_gettxspendingprevout",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.read.getnetworkinfo.default",
+      "description": "Return node network configuration and protocol metadata.",
+      "endpoint": "getnetworkinfo",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "static_params",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.read.getnettotals.default",
+      "description": "Return aggregate network byte counters.",
+      "endpoint": "getnettotals",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "static_params",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.read.getconnectioncount.default",
+      "description": "Return active peer connection count in the no-peer fixture.",
+      "endpoint": "getconnectioncount",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "static_params",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.read.getpeerinfo.default",
+      "description": "Return peer metadata in the no-peer fixture.",
+      "endpoint": "getpeerinfo",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "static_params",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.read.getaddednodeinfo.default",
+      "description": "Return configured addnode entries in the no-peer fixture.",
+      "endpoint": "getaddednodeinfo",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "static_params",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.read.getnodeaddresses.limited",
+      "description": "Return a bounded node-address sample.",
+      "endpoint": "getnodeaddresses",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "static_params",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "params": [
+        8
+      ],
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.read.getmemoryinfo.default",
+      "description": "Return memory allocator and locked-pool information.",
+      "endpoint": "getmemoryinfo",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "static_params",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.read.getrpcinfo.default",
+      "description": "Return active RPC command metadata.",
+      "endpoint": "getrpcinfo",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "static_params",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.read.uptime.default",
+      "description": "Return node uptime.",
+      "endpoint": "uptime",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "static_params",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.read.getindexinfo.default",
+      "description": "Return available index status metadata.",
+      "endpoint": "getindexinfo",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "static_params",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.read.getmininginfo.default",
+      "description": "Return mining metadata for the prepared chain.",
+      "endpoint": "getmininginfo",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "static_params",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.read.getnetworkhashps.sample",
+      "description": "Return network hash rate estimate for a bounded block window.",
+      "endpoint": "getnetworkhashps",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "static_params",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "params": [
+        10,
+        -1
+      ],
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.read.getprioritisedtransactions.default",
+      "description": "Return current manual transaction priority deltas.",
+      "endpoint": "getprioritisedtransactions",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "static_params",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.read.estimatesmartfee.six",
+      "description": "Estimate smart fee for a six-block target.",
+      "endpoint": "estimatesmartfee",
+      "fixture": "shared_chain",
+      "lane": "shared_deterministic_read_only",
+      "call_builder": "static_params",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "params": [
+        6
+      ],
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.stateful.testmempoolaccept.fresh",
+      "description": "Validate a fresh unsigned fixture transaction against mempool policy without broadcasting it.",
+      "endpoint": "testmempoolaccept",
+      "fixture": "shared_chain",
+      "lane": "shared_stateful_mutating",
+      "call_builder": "shared_testmempoolaccept",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 3
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "prepared_tx_each_sample"
+    },
+    {
+      "id": "shared.stateful.sendrawtransaction.fresh",
+      "description": "Broadcast a freshly prepared valid transaction from the shared-chain fixture.",
+      "endpoint": "sendrawtransaction",
+      "fixture": "shared_chain",
+      "lane": "shared_stateful_mutating",
+      "call_builder": "stateful_sendrawtransaction",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 3
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "prepared_tx_each_sample"
+    },
+    {
+      "id": "shared.stateful.prioritisetransaction.sample",
+      "description": "Apply a small priority delta to the prepared mempool transaction.",
+      "endpoint": "prioritisetransaction",
+      "fixture": "shared_chain",
+      "lane": "shared_stateful_mutating",
+      "call_builder": "stateful_prioritisetransaction",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 3
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.getblocktemplate.default",
+      "description": "Fetch a block template while recording qbit cadence/AuxPoW response-shape differences.",
+      "endpoint": "getblocktemplate",
+      "fixture": "shared_chain",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "modified_getblocktemplate",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.getaddressinfo.receive",
+      "description": "Inspect wallet address metadata where qbit adds P2MR/PQC fields.",
+      "endpoint": "getaddressinfo",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_getaddressinfo",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.listdescriptors.default",
+      "description": "List wallet descriptors while recording qbit P2MR descriptor shape.",
+      "endpoint": "listdescriptors",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_listdescriptors",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.createwalletdescriptor.default",
+      "description": "Create a wallet descriptor for the target's native descriptor family.",
+      "endpoint": "createwalletdescriptor",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_createwalletdescriptor",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.decodepsbt.wallet",
+      "description": "Decode a wallet-funded PSBT and record qbit PQC/P2MR response-shape differences.",
+      "endpoint": "decodepsbt",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_decodepsbt",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.analyzepsbt.wallet",
+      "description": "Analyze a wallet-funded PSBT and record qbit PQC/P2MR response-shape differences.",
+      "endpoint": "analyzepsbt",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_analyzepsbt",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.signrawtransactionwithkey.empty",
+      "description": "Exercise the shared raw-transaction signing RPC with an empty-input fixture.",
+      "endpoint": "signrawtransactionwithkey",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_signrawtransactionwithkey_empty",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.signrawtransactionwithwallet.funded",
+      "description": "Sign a wallet-funded raw transaction.",
+      "endpoint": "signrawtransactionwithwallet",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_signrawtransactionwithwallet",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 3
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.walletprocesspsbt.inspect",
+      "description": "Process a wallet-funded PSBT without signing to record response shape and latency.",
+      "endpoint": "walletprocesspsbt",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_walletprocesspsbt",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.sendtoaddress.wallet",
+      "description": "Send a small wallet payment to a prepared receive address.",
+      "endpoint": "sendtoaddress",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_sendtoaddress",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 3
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "prepared_tx_each_sample"
+    },
+    {
+      "id": "shared.modified.sendmany.wallet",
+      "description": "Send a small wallet payment through the multi-recipient RPC.",
+      "endpoint": "sendmany",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_sendmany",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 3
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "prepared_tx_each_sample"
+    },
+    {
+      "id": "shared.modified.send.wallet",
+      "description": "Build a small wallet send result without adding it to the wallet or broadcasting it.",
+      "endpoint": "send",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_send",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 3
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "prepared_tx_each_sample"
+    },
+    {
+      "id": "shared.modified.sendall.wallet",
+      "description": "Build a sendall result without adding it to the wallet or broadcasting it.",
+      "endpoint": "sendall",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_sendall",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 2
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "prepared_tx_each_sample"
+    },
+    {
+      "id": "shared.stateful.createwallet.fresh",
+      "description": "Create a fresh wallet with a unique name for each sample.",
+      "endpoint": "createwallet",
+      "fixture": "wallet_ready",
+      "lane": "shared_stateful_mutating",
+      "call_builder": "wallet_createwallet",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 2
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "fresh_wallet_each_sample"
+    },
+    {
+      "id": "shared.stateful.setlabel.receive",
+      "description": "Set a label on the prepared wallet receive address.",
+      "endpoint": "setlabel",
+      "fixture": "wallet_ready",
+      "lane": "shared_stateful_mutating",
+      "call_builder": "wallet_setlabel",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 3
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.stateful.settxfee.fixed",
+      "description": "Set a fixed wallet transaction fee rate.",
+      "endpoint": "settxfee",
+      "fixture": "wallet_ready",
+      "lane": "shared_stateful_mutating",
+      "call_builder": "wallet_settxfee",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 3
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.stateful.lockunspent.sample",
+      "description": "Lock a prepared wallet UTXO after ensuring it is unlocked before each sample.",
+      "endpoint": "lockunspent",
+      "fixture": "wallet_ready",
+      "lane": "shared_stateful_mutating",
+      "call_builder": "wallet_lockunspent",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 3
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    }
+  ]
+}

@@ -2,14 +2,16 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_SCRIPT_DESCRIPTOR_H
-#define BITCOIN_SCRIPT_DESCRIPTOR_H
+#ifndef QBIT_SCRIPT_DESCRIPTOR_H
+#define QBIT_SCRIPT_DESCRIPTOR_H
 
+#include <crypto/pqc.h>
 #include <outputtype.h>
 #include <script/script.h>
 #include <script/sign.h>
 #include <script/signingprovider.h>
 
+#include <unordered_map>
 #include <optional>
 #include <vector>
 
@@ -20,6 +22,8 @@ class DescriptorCache {
 private:
     /** Map key expression index -> map of (key derivation index -> xpub) */
     std::unordered_map<uint32_t, ExtPubKeyMap> m_derived_xpubs;
+    /** Map key expression index -> map of (key derivation index -> P2MR pubkey) */
+    std::unordered_map<uint32_t, std::unordered_map<uint32_t, CPQCPubKey>> m_derived_p2mr_pubkeys;
     /** Map key expression index -> parent xpub */
     ExtPubKeyMap m_parent_xpubs;
     /** Map key expression index -> last hardened xpub */
@@ -52,6 +56,20 @@ public:
      * @param[out] xpub The CExtPubKey to get from cache
      */
     bool GetCachedDerivedExtPubKey(uint32_t key_exp_pos, uint32_t der_index, CExtPubKey& xpub) const;
+    /** Cache a P2MR pubkey derived at an index
+     *
+     * @param[in] key_exp_pos Position of the key expression within the descriptor
+     * @param[in] der_index Derivation index of the key
+     * @param[in] pubkey The CPQCPubKey to cache
+     */
+    void CacheDerivedP2MRPubKey(uint32_t key_exp_pos, uint32_t der_index, const CPQCPubKey& pubkey);
+    /** Retrieve a cached P2MR pubkey derived at an index
+     *
+     * @param[in] key_exp_pos Position of the key expression within the descriptor
+     * @param[in] der_index Derivation index of the key
+     * @param[out] pubkey The CPQCPubKey to get from cache
+     */
+    bool GetCachedDerivedP2MRPubKey(uint32_t key_exp_pos, uint32_t der_index, CPQCPubKey& pubkey) const;
     /** Cache a last hardened xpub
      *
      * @param[in] key_exp_pos Position of the key expression within the descriptor
@@ -69,6 +87,8 @@ public:
     ExtPubKeyMap GetCachedParentExtPubKeys() const;
     /** Retrieve all cached derived xpubs */
     std::unordered_map<uint32_t, ExtPubKeyMap> GetCachedDerivedExtPubKeys() const;
+    /** Retrieve all cached derived P2MR pubkeys */
+    std::unordered_map<uint32_t, std::unordered_map<uint32_t, CPQCPubKey>> GetCachedDerivedP2MRPubKeys() const;
     /** Retrieve all cached last hardened xpubs */
     ExtPubKeyMap GetCachedLastHardenedExtPubKeys() const;
 
@@ -76,6 +96,8 @@ public:
      * Returns a cache containing the items from the other cache unknown to current cache
      */
     DescriptorCache MergeAndDiff(const DescriptorCache& other);
+    /** Remove cached entries matching another DescriptorCache. */
+    void Remove(const DescriptorCache& other);
 };
 
 /** \brief Interface for parsed descriptor objects.
@@ -93,7 +115,7 @@ public:
  * format), and changing xpubs by xprvs.
  *
  * Reference documentation about the descriptor language can be found in
- * doc/descriptors.md.
+ * doc/user/wallet/descriptors.md.
  */
 struct Descriptor {
     virtual ~Descriptor() = default;
@@ -206,4 +228,4 @@ std::unique_ptr<Descriptor> InferDescriptor(const CScript& script, const Signing
 */
 uint256 DescriptorID(const Descriptor& desc);
 
-#endif // BITCOIN_SCRIPT_DESCRIPTOR_H
+#endif // QBIT_SCRIPT_DESCRIPTOR_H

@@ -5,6 +5,7 @@
 #include <chainparams.h>
 #include <rpc/client.h>
 #include <rpc/util.h>
+#include <script/signingprovider.h>
 #include <test/fuzz/fuzz.h>
 #include <util/chaintype.h>
 

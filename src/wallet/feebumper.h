@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_WALLET_FEEBUMPER_H
-#define BITCOIN_WALLET_FEEBUMPER_H
+#ifndef QBIT_WALLET_FEEBUMPER_H
+#define QBIT_WALLET_FEEBUMPER_H
 
 #include <consensus/consensus.h>
 #include <script/interpreter.h>
@@ -92,6 +92,7 @@ public:
             break;
         case SigVersion::TAPROOT:
         case SigVersion::TAPSCRIPT:
+        case SigVersion::P2MR:
             assert(false);
         }
     }
@@ -124,4 +125,4 @@ public:
 } // namespace feebumper
 } // namespace wallet
 
-#endif // BITCOIN_WALLET_FEEBUMPER_H
+#endif // QBIT_WALLET_FEEBUMPER_H

@@ -18,11 +18,14 @@
 #include <wallet/coincontrol.h>
 #include <wallet/feebumper.h>
 #include <wallet/fees.h>
+#include <wallet/pqc_usage.h>
 #include <wallet/rpc/util.h>
 #include <wallet/spend.h>
 #include <wallet/wallet.h>
 
 #include <univalue.h>
+
+#include <algorithm>
 
 using common::FeeModeFromString;
 using common::FeeModesDetail;
@@ -32,11 +35,29 @@ using common::TransactionErrorString;
 using node::TransactionError;
 
 namespace wallet {
+static constexpr const char* RESERVED_WITNESS_OUTPUT_ERROR{
+    "Reserved witness versions are valid addresses, but outputs to reserved witness versions are nonstandard under qbit restricted-output relay policy"};
+
+static void RejectReservedWitnessOutput(const CScript& script_pub_key)
+{
+    if (IsReservedFutureWitnessOutput(script_pub_key)) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, RESERVED_WITNESS_OUTPUT_ERROR);
+    }
+}
+
+static void RejectReservedWitnessOutputs(const std::vector<CTxOut>& outputs)
+{
+    for (const CTxOut& output : outputs) {
+        RejectReservedWitnessOutput(output.scriptPubKey);
+    }
+}
+
 std::vector<CRecipient> CreateRecipients(const std::vector<std::pair<CTxDestination, CAmount>>& outputs, const std::set<int>& subtract_fee_outputs)
 {
     std::vector<CRecipient> recipients;
     for (size_t i = 0; i < outputs.size(); ++i) {
         const auto& [destination, amount] = outputs.at(i);
+        RejectReservedWitnessOutput(GetScriptForDestination(destination));
         CRecipient recipient{destination, amount, subtract_fee_outputs.contains(i)};
         recipients.push_back(recipient);
     }
@@ -110,12 +131,15 @@ static UniValue FinishTransaction(const std::shared_ptr<CWallet> pwallet, const 
 
     // Make a blank psbt
     PartiallySignedTransaction psbtx(rawTx);
+    PQCUsageRecorder pqc_usage_recorder;
 
     // First fill transaction with our data without signing,
     // so external signers are not asked to sign more than once.
     bool complete;
     pwallet->FillPSBT(psbtx, complete, std::nullopt, /*sign=*/false, /*bip32derivs=*/true);
-    const auto err{pwallet->FillPSBT(psbtx, complete, std::nullopt, /*sign=*/true, /*bip32derivs=*/false)};
+    const auto err{pwallet->FillPSBT(psbtx, complete, std::nullopt, /*sign=*/true, /*bip32derivs=*/false, nullptr, /*finalize=*/true, pqc_usage_recorder.GetObserver())};
+    const PQCUsageReport pqc_usage = BuildSigningPQCUsageReport(pqc_usage_recorder);
+    LogPQCUsageWarnings(*pwallet, pqc_usage);
     if (err) {
         throw JSONRPCPSBTError(*err);
     }
@@ -145,6 +169,7 @@ static UniValue FinishTransaction(const std::shared_ptr<CWallet> pwallet, const 
         }
     }
     result.pushKV("complete", complete);
+    AppendPQCUsage(result, pqc_usage, /*include_warnings=*/true);
 
     return result;
 }
@@ -180,9 +205,12 @@ UniValue SendMoney(CWallet& wallet, const CCoinControl &coin_control, std::vecto
 
     // Shuffle recipient list
     std::shuffle(recipients.begin(), recipients.end(), FastRandomContext());
+    PQCUsageRecorder pqc_usage_recorder;
 
     // Send
-    auto res = CreateTransaction(wallet, recipients, /*change_pos=*/std::nullopt, coin_control, true);
+    auto res = CreateTransaction(wallet, recipients, /*change_pos=*/std::nullopt, coin_control, true, pqc_usage_recorder.GetObserver());
+    const PQCUsageReport pqc_usage = BuildSigningPQCUsageReport(pqc_usage_recorder);
+    LogPQCUsageWarnings(wallet, pqc_usage);
     if (!res) {
         throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, util::ErrorString(res).original);
     }
@@ -192,6 +220,7 @@ UniValue SendMoney(CWallet& wallet, const CCoinControl &coin_control, std::vecto
         UniValue entry(UniValue::VOBJ);
         entry.pushKV("txid", tx->GetHash().GetHex());
         entry.pushKV("fee_reason", StringForFeeReason(res->fee_calc.reason));
+        AppendPQCUsage(entry, pqc_usage, /*include_warnings=*/true);
         return entry;
     }
     return tx->GetHash().GetHex();
@@ -242,7 +271,7 @@ RPCHelpMan sendtoaddress()
         "Send an amount to a given address." +
         HELP_REQUIRING_PASSPHRASE,
                 {
-                    {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The bitcoin address to send to."},
+                    {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The qbit address to send to."},
                     {"amount", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "The amount in " + CURRENCY_UNIT + " to send. eg 0.1"},
                     {"comment", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "A comment used to store what the transaction is for.\n"
                                          "This is not part of the transaction, just kept in your wallet."},
@@ -250,7 +279,7 @@ RPCHelpMan sendtoaddress()
                                          "to which you're sending the transaction. This is not part of the \n"
                                          "transaction, just kept in your wallet."},
                     {"subtractfeefromamount", RPCArg::Type::BOOL, RPCArg::Default{false}, "The fee will be deducted from the amount being sent.\n"
-                                         "The recipient will receive less bitcoins than you enter in the amount field."},
+                                         "The recipient will receive less QBT than you enter in the amount field."},
                     {"replaceable", RPCArg::Type::BOOL, RPCArg::DefaultHint{"wallet default"}, "Signal that this transaction can be replaced by a transaction (BIP 125)"},
                     {"conf_target", RPCArg::Type::NUM, RPCArg::DefaultHint{"wallet -txconfirmtarget"}, "Confirmation target in blocks"},
                     {"estimate_mode", RPCArg::Type::STR, RPCArg::Default{"unset"}, "The fee estimate mode, must be one of (case insensitive):\n"
@@ -266,22 +295,22 @@ RPCHelpMan sendtoaddress()
                     },
                     RPCResult{"if verbose is set to true",
                         RPCResult::Type::OBJ, "", "",
-                        {
+                        Cat(std::vector<RPCResult>{
                             {RPCResult::Type::STR_HEX, "txid", "The transaction id."},
                             {RPCResult::Type::STR, "fee_reason", "The transaction fee reason."}
-                        },
+                        }, PQCUsageRPCResults(/*include_warnings=*/true)),
                     },
                 },
                 RPCExamples{
-                    "\nSend 0.1 BTC\n"
+                    "\nSend 0.1 QBT\n"
                     + HelpExampleCli("sendtoaddress", "\"" + EXAMPLE_ADDRESS[0] + "\" 0.1") +
-                    "\nSend 0.1 BTC with a confirmation target of 6 blocks in economical fee estimate mode using positional arguments\n"
+                    "\nSend 0.1 QBT with a confirmation target of 6 blocks in economical fee estimate mode using positional arguments\n"
                     + HelpExampleCli("sendtoaddress", "\"" + EXAMPLE_ADDRESS[0] + "\" 0.1 \"donation\" \"sean's outpost\" false true 6 economical") +
-                    "\nSend 0.1 BTC with a fee rate of 1.1 " + CURRENCY_ATOM + "/vB, subtract fee from amount, BIP125-replaceable, using positional arguments\n"
+                    "\nSend 0.1 QBT with a fee rate of 1.1 " + CURRENCY_ATOM + "/vB, subtract fee from amount, BIP125-replaceable, using positional arguments\n"
                     + HelpExampleCli("sendtoaddress", "\"" + EXAMPLE_ADDRESS[0] + "\" 0.1 \"drinks\" \"room77\" true true null \"unset\" null 1.1") +
-                    "\nSend 0.2 BTC with a confirmation target of 6 blocks in economical fee estimate mode using named arguments\n"
+                    "\nSend 0.2 QBT with a confirmation target of 6 blocks in economical fee estimate mode using named arguments\n"
                     + HelpExampleCli("-named sendtoaddress", "address=\"" + EXAMPLE_ADDRESS[0] + "\" amount=0.2 conf_target=6 estimate_mode=\"economical\"") +
-                    "\nSend 0.5 BTC with a fee rate of 25 " + CURRENCY_ATOM + "/vB using named arguments\n"
+                    "\nSend 0.5 QBT with a fee rate of 25 " + CURRENCY_ATOM + "/vB using named arguments\n"
                     + HelpExampleCli("-named sendtoaddress", "address=\"" + EXAMPLE_ADDRESS[0] + "\" amount=0.5 fee_rate=25")
                     + HelpExampleCli("-named sendtoaddress", "address=\"" + EXAMPLE_ADDRESS[0] + "\" amount=0.5 fee_rate=25 subtractfeefromamount=false replaceable=true avoid_reuse=true comment=\"2 pizzas\" comment_to=\"jeremy\" verbose=true")
                 },
@@ -345,14 +374,14 @@ RPCHelpMan sendmany()
                      }},
                     {"amounts", RPCArg::Type::OBJ_USER_KEYS, RPCArg::Optional::NO, "The addresses and amounts",
                         {
-                            {"address", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "The bitcoin address is the key, the numeric amount (can be string) in " + CURRENCY_UNIT + " is the value"},
+                            {"address", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "The qbit address is the key, the numeric amount (can be string) in " + CURRENCY_UNIT + " is the value"},
                         },
                     },
                     {"minconf", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "Ignored dummy value"},
                     {"comment", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "A comment"},
                     {"subtractfeefrom", RPCArg::Type::ARR, RPCArg::Optional::OMITTED, "The addresses.\n"
                                        "The fee will be equally deducted from the amount of each selected address.\n"
-                                       "Those recipients will receive less bitcoins than you enter in their corresponding amount field.\n"
+                                       "Those recipients will receive less QBT than you enter in their corresponding amount field.\n"
                                        "If no addresses are specified here, the sender pays the fee.",
                         {
                             {"address", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "Subtract fee from this address"},
@@ -372,11 +401,11 @@ RPCHelpMan sendmany()
                     },
                     RPCResult{"if verbose is set to true",
                         RPCResult::Type::OBJ, "", "",
-                        {
+                        Cat(std::vector<RPCResult>{
                             {RPCResult::Type::STR_HEX, "txid", "The transaction id for the send. Only 1 transaction is created regardless of\n"
                 "the number of addresses."},
                             {RPCResult::Type::STR, "fee_reason", "The transaction fee reason."}
-                        },
+                        }, PQCUsageRPCResults(/*include_warnings=*/true)),
                     },
                 },
                 RPCExamples{
@@ -452,7 +481,7 @@ RPCHelpMan settxfee()
 
     if (!pwallet->chain().rpcEnableDeprecated("settxfee")) {
         throw JSONRPCError(RPC_METHOD_DEPRECATED, "settxfee is deprecated and will be fully removed in v31.0."
-        "\nTo use settxfee restart bitcoind with -deprecatedrpc=settxfee.");
+        "\nTo use settxfee restart qbitd with -deprecatedrpc=settxfee.");
     }
 
     CAmount nAmount = AmountFromValue(request.params[0]);
@@ -571,9 +600,10 @@ CreatedTransactionResult FundTransaction(CWallet& wallet, const CMutableTransact
                 CTxDestination dest = DecodeDestination(change_address_str);
 
                 if (!IsValidDestination(dest)) {
-                    throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Change address must be a valid bitcoin address");
+                    throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Change address must be a valid qbit address");
                 }
 
+                RejectReservedWitnessOutput(GetScriptForDestination(dest));
                 coinControl.destChange = dest;
             }
 
@@ -589,11 +619,7 @@ CreatedTransactionResult FundTransaction(CWallet& wallet, const CMutableTransact
                 if (options.exists("changeAddress") || options.exists("change_address")) {
                     throw JSONRPCError(RPC_INVALID_PARAMETER, "Cannot specify both change address and address type options");
                 }
-                if (std::optional<OutputType> parsed = ParseOutputType(options["change_type"].get_str())) {
-                    coinControl.m_change_type.emplace(parsed.value());
-                } else {
-                    throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, strprintf("Unknown change type '%s'", options["change_type"].get_str()));
-                }
+                coinControl.m_change_type.emplace(ParseWalletOutputType(wallet, options["change_type"].get_str(), "change type", /*internal=*/true));
             }
 
             if (options.exists("lockUnspents") || options.exists("lock_unspents")) {
@@ -643,6 +669,12 @@ CreatedTransactionResult FundTransaction(CWallet& wallet, const CMutableTransact
 
     if (options.exists("solving_data")) {
         const UniValue solving_data = options["solving_data"].get_obj();
+        const auto has_non_empty_array = [&](const char* key) {
+            return solving_data.exists(key) && !solving_data[key].get_array().empty();
+        };
+        if (IsP2MROnlyOutputChain() && (has_non_empty_array("pubkeys") || has_non_empty_array("scripts"))) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Legacy pubkey/script solving data is disabled on this chain; use p2mr descriptors");
+        }
         if (solving_data.exists("pubkeys")) {
             for (const UniValue& pk_univ : solving_data["pubkeys"].get_array().getValues()) {
                 const CPubKey pubkey = HexToPubKey(pk_univ.get_str());
@@ -676,6 +708,7 @@ CreatedTransactionResult FundTransaction(CWallet& wallet, const CMutableTransact
                     throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Unable to parse descriptor '%s': %s", desc_str, error));
                 }
                 for (auto& desc : descs) {
+                    EnsureDescriptorOutputTypeAllowed(*desc, "Solving data");
                     desc->Expand(0, desc_out, scripts_temp, desc_out);
                 }
                 coinControl.m_external_provider.Merge(std::move(desc_out));
@@ -701,10 +734,13 @@ CreatedTransactionResult FundTransaction(CWallet& wallet, const CMutableTransact
                 throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter, missing weight key");
             }
             int64_t weight = weight_v.getInt<int64_t>();
-            const int64_t min_input_weight = GetTransactionInputWeight(CTxIn());
-            CHECK_NONFATAL(min_input_weight == 165);
+            static constexpr int64_t min_serialized_input_size = 32 + 4 + 1 + 4; // outpoint + empty scriptSig length + nSequence
+            static constexpr int64_t min_input_weight = min_serialized_input_size * WITNESS_SCALE_FACTOR + 1; // + empty witness stack size
             if (weight < min_input_weight) {
-                throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter, weight cannot be less than 165 (41 bytes (size of outpoint + sequence + empty scriptSig) * 4 (witness scaling factor)) + 1 (empty witness)");
+                throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf(
+                    "Invalid parameter, weight cannot be less than %d (%d bytes (size of outpoint + sequence + empty scriptSig) * %d (witness scaling factor)) + 1 (empty witness)",
+                    min_input_weight, min_serialized_input_size, WITNESS_SCALE_FACTOR
+                ));
             }
             if (weight > MAX_STANDARD_TX_WEIGHT) {
                 throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Invalid parameter, weight cannot be greater than the maximum standard tx weight of %d", MAX_STANDARD_TX_WEIGHT));
@@ -780,16 +816,16 @@ RPCHelpMan fundrawtransaction()
                                                           "If that happens, you will need to fund the transaction with different inputs and republish it."},
                             {"minconf", RPCArg::Type::NUM, RPCArg::Default{0}, "If add_inputs is specified, require inputs with at least this many confirmations."},
                             {"maxconf", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "If add_inputs is specified, require inputs with at most this many confirmations."},
-                            {"changeAddress", RPCArg::Type::STR, RPCArg::DefaultHint{"automatic"}, "The bitcoin address to receive the change"},
+                            {"changeAddress", RPCArg::Type::STR, RPCArg::DefaultHint{"automatic"}, "The qbit address to receive the change"},
                             {"changePosition", RPCArg::Type::NUM, RPCArg::DefaultHint{"random"}, "The index of the change output"},
-                            {"change_type", RPCArg::Type::STR, RPCArg::DefaultHint{"set by -changetype"}, "The output type to use. Only valid if changeAddress is not specified. Options are " + FormatAllOutputTypes() + "."},
+                            {"change_type", RPCArg::Type::STR, RPCArg::DefaultHint{"set by -changetype"}, "The output type to use. Only valid if changeAddress is not specified. Options are " + FormatWalletOutputTypes() + "."},
                             {"includeWatching", RPCArg::Type::BOOL, RPCArg::Default{false}, "(DEPRECATED) No longer used"},
                             {"lockUnspents", RPCArg::Type::BOOL, RPCArg::Default{false}, "Lock selected unspent outputs"},
                             {"fee_rate", RPCArg::Type::AMOUNT, RPCArg::DefaultHint{"not set, fall back to wallet fee estimation"}, "Specify a fee rate in " + CURRENCY_ATOM + "/vB."},
                             {"feeRate", RPCArg::Type::AMOUNT, RPCArg::DefaultHint{"not set, fall back to wallet fee estimation"}, "Specify a fee rate in " + CURRENCY_UNIT + "/kvB."},
                             {"subtractFeeFromOutputs", RPCArg::Type::ARR, RPCArg::Default{UniValue::VARR}, "The integers.\n"
                                                           "The fee will be equally deducted from the amount of each specified output.\n"
-                                                          "Those recipients will receive less bitcoins than you enter in their corresponding amount field.\n"
+                                                          "Those recipients will receive less QBT than you enter in their corresponding amount field.\n"
                                                           "If no outputs are specified here, the sender pays the fee.",
                                 {
                                     {"vout_index", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "The zero-based output index, before a change output is added."},
@@ -921,7 +957,7 @@ RPCHelpMan signrawtransactionwithwallet()
                 },
                 RPCResult{
                     RPCResult::Type::OBJ, "", "",
-                    {
+                    Cat(std::vector<RPCResult>{
                         {RPCResult::Type::STR_HEX, "hex", "The hex-encoded raw transaction with signature(s)"},
                         {RPCResult::Type::BOOL, "complete", "If the transaction has a complete set of signatures"},
                         {RPCResult::Type::ARR, "errors", /*optional=*/true, "Script verification errors (if there are any)",
@@ -939,7 +975,7 @@ RPCHelpMan signrawtransactionwithwallet()
                                 {RPCResult::Type::STR, "error", "Verification or signing error related to the input"},
                             }},
                         }},
-                    }
+                    }, PQCUsageRPCResults(/*include_warnings=*/true))
                 },
                 RPCExamples{
                     HelpExampleCli("signrawtransactionwithwallet", "\"myhex\"")
@@ -956,7 +992,6 @@ RPCHelpMan signrawtransactionwithwallet()
     }
 
     // Sign the transaction
-    LOCK(pwallet->cs_wallet);
     EnsureWalletIsUnlocked(*pwallet);
 
     // Fetch previous transactions (inputs):
@@ -967,7 +1002,7 @@ RPCHelpMan signrawtransactionwithwallet()
     pwallet->chain().findCoins(coins);
 
     // Parse the prevtxs array
-    ParsePrevouts(request.params[1], nullptr, coins);
+    ParsePrevouts(request.params[1], nullptr, coins, pwallet->chain().getHeight());
 
     std::optional<int> nHashType = ParseSighashString(request.params[2]);
     if (!nHashType) {
@@ -977,9 +1012,13 @@ RPCHelpMan signrawtransactionwithwallet()
     // Script verification errors
     std::map<int, bilingual_str> input_errors;
 
-    bool complete = pwallet->SignTransaction(mtx, coins, *nHashType, input_errors);
+    PQCUsageRecorder pqc_usage_recorder;
+    bool complete = pwallet->SignTransaction(mtx, coins, *nHashType, input_errors, pqc_usage_recorder.GetObserver());
+    const PQCUsageReport pqc_usage = BuildSigningPQCUsageReport(pqc_usage_recorder);
+    LogPQCUsageWarnings(*pwallet, pqc_usage);
     UniValue result(UniValue::VOBJ);
     SignTransactionResultToJSON(mtx, complete, coins, input_errors, result);
+    AppendPQCUsage(result, pqc_usage, /*include_warnings=*/true);
     return result;
 },
     };
@@ -993,7 +1032,7 @@ static std::vector<RPCArg> OutputsDoc()
     {
         {"", RPCArg::Type::OBJ_USER_KEYS, RPCArg::Optional::OMITTED, "",
             {
-                {"address", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "A key-value pair. The key (string) is the bitcoin address,\n"
+                {"address", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "A key-value pair. The key (string) is the qbit address,\n"
                          "the value (float or string) is the amount in " + CURRENCY_UNIT + ""},
             },
         },
@@ -1125,6 +1164,7 @@ static RPCHelpMan bumpfee_helper(std::string method_name)
             }
             CMutableTransaction tempTx;
             AddOutputs(tempTx, options["outputs"]);
+            RejectReservedWitnessOutputs(tempTx.vout);
             outputs = tempTx.vout;
         }
 
@@ -1241,9 +1281,9 @@ RPCHelpMan send()
                     {"minconf", RPCArg::Type::NUM, RPCArg::Default{0}, "If add_inputs is specified, require inputs with at least this many confirmations."},
                     {"maxconf", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "If add_inputs is specified, require inputs with at most this many confirmations."},
                     {"add_to_wallet", RPCArg::Type::BOOL, RPCArg::Default{true}, "When false, returns a serialized transaction which will not be added to the wallet or broadcast"},
-                    {"change_address", RPCArg::Type::STR, RPCArg::DefaultHint{"automatic"}, "The bitcoin address to receive the change"},
+                    {"change_address", RPCArg::Type::STR, RPCArg::DefaultHint{"automatic"}, "The qbit address to receive the change"},
                     {"change_position", RPCArg::Type::NUM, RPCArg::DefaultHint{"random"}, "The index of the change output"},
-                    {"change_type", RPCArg::Type::STR, RPCArg::DefaultHint{"set by -changetype"}, "The output type to use. Only valid if change_address is not specified. Options are " + FormatAllOutputTypes() + "."},
+                    {"change_type", RPCArg::Type::STR, RPCArg::DefaultHint{"set by -changetype"}, "The output type to use. Only valid if change_address is not specified. Options are " + FormatWalletOutputTypes() + "."},
                     {"fee_rate", RPCArg::Type::AMOUNT, RPCArg::DefaultHint{"not set, fall back to wallet fee estimation"}, "Specify a fee rate in " + CURRENCY_ATOM + "/vB.", RPCArgOptions{.also_positional = true}},
                     {"include_watching", RPCArg::Type::BOOL, RPCArg::Default{"false"}, "(DEPRECATED) No longer used"},
                     {"inputs", RPCArg::Type::ARR, RPCArg::Default{UniValue::VARR}, "Specify inputs instead of adding them automatically.",
@@ -1265,7 +1305,7 @@ RPCHelpMan send()
                     {"psbt", RPCArg::Type::BOOL,  RPCArg::DefaultHint{"automatic"}, "Always return a PSBT, implies add_to_wallet=false."},
                     {"subtract_fee_from_outputs", RPCArg::Type::ARR, RPCArg::Default{UniValue::VARR}, "Outputs to subtract the fee from, specified as integer indices.\n"
                     "The fee will be equally deducted from the amount of each specified output.\n"
-                    "Those recipients will receive less bitcoins than you enter in their corresponding amount field.\n"
+                    "Those recipients will receive less QBT than you enter in their corresponding amount field.\n"
                     "If no outputs are specified here, the sender pays the fee.",
                         {
                             {"vout_index", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "The zero-based output index, before a change output is added."},
@@ -1280,21 +1320,21 @@ RPCHelpMan send()
         },
         RPCResult{
             RPCResult::Type::OBJ, "", "",
-                {
+                Cat(std::vector<RPCResult>{
                     {RPCResult::Type::BOOL, "complete", "If the transaction has a complete set of signatures"},
                     {RPCResult::Type::STR_HEX, "txid", /*optional=*/true, "The transaction id for the send. Only 1 transaction is created regardless of the number of addresses."},
                     {RPCResult::Type::STR_HEX, "hex", /*optional=*/true, "If add_to_wallet is false, the hex-encoded raw transaction with signature(s)"},
                     {RPCResult::Type::STR, "psbt", /*optional=*/true, "If more signatures are needed, or if add_to_wallet is false, the base64-encoded (partially) signed transaction"}
-                }
+                }, PQCUsageRPCResults(/*include_warnings=*/true))
         },
         RPCExamples{""
-        "\nSend 0.1 BTC with a confirmation target of 6 blocks in economical fee estimate mode\n"
+        "\nSend 0.1 QBT with a confirmation target of 6 blocks in economical fee estimate mode\n"
         + HelpExampleCli("send", "'{\"" + EXAMPLE_ADDRESS[0] + "\": 0.1}' 6 economical\n") +
-        "Send 0.2 BTC with a fee rate of 1.1 " + CURRENCY_ATOM + "/vB using positional arguments\n"
+        "Send 0.2 QBT with a fee rate of 1.1 " + CURRENCY_ATOM + "/vB using positional arguments\n"
         + HelpExampleCli("send", "'{\"" + EXAMPLE_ADDRESS[0] + "\": 0.2}' null \"unset\" 1.1\n") +
-        "Send 0.2 BTC with a fee rate of 1 " + CURRENCY_ATOM + "/vB using the options argument\n"
+        "Send 0.2 QBT with a fee rate of 1 " + CURRENCY_ATOM + "/vB using the options argument\n"
         + HelpExampleCli("send", "'{\"" + EXAMPLE_ADDRESS[0] + "\": 0.2}' null \"unset\" null '{\"fee_rate\": 1}'\n") +
-        "Send 0.3 BTC with a fee rate of 25 " + CURRENCY_ATOM + "/vB using named arguments\n"
+        "Send 0.3 QBT with a fee rate of 25 " + CURRENCY_ATOM + "/vB using named arguments\n"
         + HelpExampleCli("-named send", "outputs='{\"" + EXAMPLE_ADDRESS[0] + "\": 0.3}' fee_rate=25\n") +
         "Create a transaction that should confirm the next block, with a specific input, and return result without adding to wallet or broadcasting to the network\n"
         + HelpExampleCli("send", "'{\"" + EXAMPLE_ADDRESS[0] + "\": 0.1}' 1 economical '{\"add_to_wallet\": false, \"inputs\": [{\"txid\":\"a08e6907dbbd3d809776dbfc5d82e371b764ed838b5655e72f463568df1aadf0\", \"vout\":1}]}'")
@@ -1349,10 +1389,10 @@ RPCHelpMan sendall()
             {"recipients", RPCArg::Type::ARR, RPCArg::Optional::NO, "The sendall destinations. Each address may only appear once.\n"
                 "Optionally some recipients can be specified with an amount to perform payments, but at least one address must appear without a specified amount.\n",
                 {
-                    {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "A bitcoin address which receives an equal share of the unspecified amount."},
+                    {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "A qbit address which receives an equal share of the unspecified amount."},
                     {"", RPCArg::Type::OBJ_USER_KEYS, RPCArg::Optional::OMITTED, "",
                         {
-                            {"address", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "A key-value pair. The key (string) is the bitcoin address, the value (float or string) is the amount in " + CURRENCY_UNIT + ""},
+                            {"address", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "A key-value pair. The key (string) is the qbit address, the value (float or string) is the amount in " + CURRENCY_UNIT + ""},
                         },
                     },
                 },
@@ -1394,12 +1434,12 @@ RPCHelpMan sendall()
         },
         RPCResult{
             RPCResult::Type::OBJ, "", "",
-                {
+                Cat(std::vector<RPCResult>{
                     {RPCResult::Type::BOOL, "complete", "If the transaction has a complete set of signatures"},
                     {RPCResult::Type::STR_HEX, "txid", /*optional=*/true, "The transaction id for the send. Only 1 transaction is created regardless of the number of addresses."},
                     {RPCResult::Type::STR_HEX, "hex", /*optional=*/true, "If add_to_wallet is false, the hex-encoded raw transaction with signature(s)"},
                     {RPCResult::Type::STR, "psbt", /*optional=*/true, "If more signatures are needed, or if add_to_wallet is false, the base64-encoded (partially) signed transaction"}
-                }
+                }, PQCUsageRPCResults(/*include_warnings=*/true))
         },
         RPCExamples{""
         "\nSpend all UTXOs from the wallet with a fee rate of 1 " + CURRENCY_ATOM + "/vB using named arguments\n"
@@ -1491,6 +1531,7 @@ RPCHelpMan sendall()
             }
 
             CMutableTransaction rawTx{ConstructTransaction(options["inputs"], recipient_key_value_pairs, options["locktime"], rbf, coin_control.m_version)};
+            RejectReservedWitnessOutputs(rawTx.vout);
             LOCK(pwallet->cs_wallet);
 
             CAmount total_input_value(0);
@@ -1641,11 +1682,11 @@ RPCHelpMan walletprocesspsbt()
                 },
                 RPCResult{
                     RPCResult::Type::OBJ, "", "",
-                    {
+                    Cat(std::vector<RPCResult>{
                         {RPCResult::Type::STR, "psbt", "The base64-encoded partially signed transaction"},
                         {RPCResult::Type::BOOL, "complete", "If the transaction has a complete set of signatures"},
                         {RPCResult::Type::STR_HEX, "hex", /*optional=*/true, "The hex-encoded network transaction if complete"},
-                    }
+                    }, PQCUsageRPCResults(/*include_warnings=*/true))
                 },
                 RPCExamples{
                     HelpExampleCli("walletprocesspsbt", "\"psbt\"")
@@ -1678,7 +1719,10 @@ RPCHelpMan walletprocesspsbt()
 
     if (sign) EnsureWalletIsUnlocked(*pwallet);
 
-    const auto err{wallet.FillPSBT(psbtx, complete, nHashType, sign, bip32derivs, nullptr, finalize)};
+    PQCUsageRecorder pqc_usage_recorder;
+    const auto err{wallet.FillPSBT(psbtx, complete, nHashType, sign, bip32derivs, nullptr, finalize, sign ? pqc_usage_recorder.GetObserver() : PQCSignatureCounterObserver{})};
+    const PQCUsageReport pqc_usage = sign ? BuildSigningPQCUsageReport(pqc_usage_recorder) : PQCUsageReport{};
+    LogPQCUsageWarnings(wallet, pqc_usage);
     if (err) {
         throw JSONRPCPSBTError(*err);
     }
@@ -1696,6 +1740,7 @@ RPCHelpMan walletprocesspsbt()
         ssTx_final << TX_WITH_WITNESS(mtx);
         result.pushKV("hex", HexStr(ssTx_final));
     }
+    AppendPQCUsage(result, pqc_usage, /*include_warnings=*/true);
 
     return result;
 },
@@ -1744,16 +1789,16 @@ RPCHelpMan walletcreatefundedpsbt()
                                                           "If that happens, you will need to fund the transaction with different inputs and republish it."},
                             {"minconf", RPCArg::Type::NUM, RPCArg::Default{0}, "If add_inputs is specified, require inputs with at least this many confirmations."},
                             {"maxconf", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "If add_inputs is specified, require inputs with at most this many confirmations."},
-                            {"changeAddress", RPCArg::Type::STR, RPCArg::DefaultHint{"automatic"}, "The bitcoin address to receive the change"},
+                            {"changeAddress", RPCArg::Type::STR, RPCArg::DefaultHint{"automatic"}, "The qbit address to receive the change"},
                             {"changePosition", RPCArg::Type::NUM, RPCArg::DefaultHint{"random"}, "The index of the change output"},
-                            {"change_type", RPCArg::Type::STR, RPCArg::DefaultHint{"set by -changetype"}, "The output type to use. Only valid if changeAddress is not specified. Options are " + FormatAllOutputTypes() + "."},
+                            {"change_type", RPCArg::Type::STR, RPCArg::DefaultHint{"set by -changetype"}, "The output type to use. Only valid if changeAddress is not specified. Options are " + FormatWalletOutputTypes() + "."},
                             {"includeWatching", RPCArg::Type::BOOL, RPCArg::Default{false}, "(DEPRECATED) No longer used"},
                             {"lockUnspents", RPCArg::Type::BOOL, RPCArg::Default{false}, "Lock selected unspent outputs"},
                             {"fee_rate", RPCArg::Type::AMOUNT, RPCArg::DefaultHint{"not set, fall back to wallet fee estimation"}, "Specify a fee rate in " + CURRENCY_ATOM + "/vB."},
                             {"feeRate", RPCArg::Type::AMOUNT, RPCArg::DefaultHint{"not set, fall back to wallet fee estimation"}, "Specify a fee rate in " + CURRENCY_UNIT + "/kvB."},
                             {"subtractFeeFromOutputs", RPCArg::Type::ARR, RPCArg::Default{UniValue::VARR}, "The outputs to subtract the fee from.\n"
                                                           "The fee will be equally deducted from the amount of each specified output.\n"
-                                                          "Those recipients will receive less bitcoins than you enter in their corresponding amount field.\n"
+                                                          "Those recipients will receive less QBT than you enter in their corresponding amount field.\n"
                                                           "If no outputs are specified here, the sender pays the fee.",
                                 {
                                     {"vout_index", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "The zero-based output index, before a change output is added."},
@@ -1776,7 +1821,7 @@ RPCHelpMan walletcreatefundedpsbt()
                     }
                                 },
                                 RPCExamples{
-                            "\nCreate a PSBT with automatically picked inputs that sends 0.5 BTC to an address and has a fee rate of 2 sat/vB:\n"
+                            "\nCreate a PSBT with automatically picked inputs that sends 0.5 QBT to an address and has a fee rate of 2 sat/vB:\n"
                             + HelpExampleCli("walletcreatefundedpsbt", "\"[]\" \"[{\\\"" + EXAMPLE_ADDRESS[0] + "\\\":0.5}]\" 0 \"{\\\"add_inputs\\\":true,\\\"fee_rate\\\":2}\"")
                             + "\nCreate the same PSBT as the above one instead using named arguments:\n"
                             + HelpExampleCli("-named walletcreatefundedpsbt", "outputs=\"[{\\\"" + EXAMPLE_ADDRESS[0] + "\\\":0.5}]\" add_inputs=true fee_rate=2")

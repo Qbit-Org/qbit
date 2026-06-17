@@ -668,7 +668,7 @@ DUST_LIMIT = 600
 MIN_FEE = 50000
 
 TX_STANDARD_VERSIONS = [1, 2, TX_MAX_STANDARD_VERSION]
-TRUC_MAX_VSIZE = 10000 # test doesn't cover in-mempool spends, so only this limit is hit
+TRUC_MAX_VSIZE = 50000 # test doesn't cover in-mempool spends, so only this limit is hit
 
 # === Actual test cases ===
 
@@ -855,6 +855,10 @@ def spenders_taproot_active():
                     return CScript([CScriptOp.encode_op_n(witver), prog])
                 scripts = [("s0", CScript([pubs[0], OP_CHECKSIG])), ("dummy", CScript([OP_RETURN]))]
                 tap = taproot_construct(pubs[1], scripts)
+                if not p2sh and witver == 2 and witlen == 32:
+                    # Witness v2/32 is interpreted as P2MR (BIP360), so it is no longer an unknown
+                    # witness program that can be tested here as anyone-can-spend.
+                    continue
                 if not p2sh and witver == 1 and witlen == 32:
                     add_spender(spenders, "applic/keypath", p2sh=p2sh, spk_mutate_pre_p2sh=mutate, tap=tap, key=secs[1], **SIGHASH_BITFLIP, **ERR_SCHNORR_SIG)
                     add_spender(spenders, "applic/scriptpath", p2sh=p2sh, leaf="s0", spk_mutate_pre_p2sh=mutate, tap=tap, key=secs[0], **SINGLE_SIG, failure={"leaf": "dummy"}, **ERR_OP_RETURN)
@@ -1218,6 +1222,9 @@ def spenders_taproot_active():
     # == Legacy tests ==
 
     # Also add a few legacy spends into the mix, so that transactions which combine taproot and pre-taproot spends get tested too.
+    def legacy_sigops_weight(witv0):
+        return 1 if witv0 else WITNESS_SCALE_FACTOR
+
     for compressed in [False, True]:
         eckey1, pubkey1 = generate_keypair(compressed=compressed)
         eckey2, _ = generate_keypair(compressed=compressed)
@@ -1225,15 +1232,15 @@ def spenders_taproot_active():
             for witv0 in [False, True]:
                 for hashtype in VALID_SIGHASHES_ECDSA + [random.randrange(0x04, 0x80), random.randrange(0x84, 0x100)]:
                     standard = (hashtype in VALID_SIGHASHES_ECDSA) and (compressed or not witv0)
-                    add_spender(spenders, "legacy/pk-wrongkey", hashtype=hashtype, p2sh=p2sh, witv0=witv0, standard=standard, script=key_to_p2pk_script(pubkey1), **SINGLE_SIG, key=eckey1, failure={"key": eckey2}, sigops_weight=4-3*witv0, **ERR_EVAL_FALSE)
-                    add_spender(spenders, "legacy/pkh-sighashflip", hashtype=hashtype, p2sh=p2sh, witv0=witv0, standard=standard, pkh=pubkey1, key=eckey1, **SIGHASH_BITFLIP, sigops_weight=4-3*witv0, **ERR_EVAL_FALSE)
+                    add_spender(spenders, "legacy/pk-wrongkey", hashtype=hashtype, p2sh=p2sh, witv0=witv0, standard=standard, script=key_to_p2pk_script(pubkey1), **SINGLE_SIG, key=eckey1, failure={"key": eckey2}, sigops_weight=legacy_sigops_weight(witv0), **ERR_EVAL_FALSE)
+                    add_spender(spenders, "legacy/pkh-sighashflip", hashtype=hashtype, p2sh=p2sh, witv0=witv0, standard=standard, pkh=pubkey1, key=eckey1, **SIGHASH_BITFLIP, sigops_weight=legacy_sigops_weight(witv0), **ERR_EVAL_FALSE)
 
     # Verify that OP_CHECKSIGADD wasn't accidentally added to pre-taproot validation logic.
     for p2sh in [False, True]:
         for witv0 in [False, True]:
             for hashtype in VALID_SIGHASHES_ECDSA + [random.randrange(0x04, 0x80), random.randrange(0x84, 0x100)]:
                 standard = hashtype in VALID_SIGHASHES_ECDSA and (p2sh or witv0)
-                add_spender(spenders, "compat/nocsa", hashtype=hashtype, p2sh=p2sh, witv0=witv0, standard=standard, script=CScript([OP_IF, OP_11, pubkey1, OP_CHECKSIGADD, OP_12, OP_EQUAL, OP_ELSE, pubkey1, OP_CHECKSIG, OP_ENDIF]), key=eckey1, sigops_weight=4-3*witv0, inputs=[getter("sign"), b''], failure={"inputs": [getter("sign"), b'\x01']}, **ERR_BAD_OPCODE)
+                add_spender(spenders, "compat/nocsa", hashtype=hashtype, p2sh=p2sh, witv0=witv0, standard=standard, script=CScript([OP_IF, OP_11, pubkey1, OP_CHECKSIGADD, OP_12, OP_EQUAL, OP_ELSE, pubkey1, OP_CHECKSIG, OP_ENDIF]), key=eckey1, sigops_weight=legacy_sigops_weight(witv0), inputs=[getter("sign"), b''], failure={"inputs": [getter("sign"), b'\x01']}, **ERR_BAD_OPCODE)
 
     # == sighash caching tests ==
 
@@ -1265,7 +1272,7 @@ def spenders_taproot_active():
                         inputs.append(getter("sign", codesepnum=codeseps, hashtype=op))
                 inputs.reverse()
                 script = CScript(script)
-                add_spender(spenders, "sighashcache/legacy", p2sh=p2sh, witv0=witv0, standard=False, script=script, inputs=inputs, key=eckey1, sigops_weight=12*8*(4-3*witv0), no_fail=True)
+                add_spender(spenders, "sighashcache/legacy", p2sh=p2sh, witv0=witv0, standard=False, script=script, inputs=inputs, key=eckey1, sigops_weight=12*8*legacy_sigops_weight(witv0), no_fail=True)
 
     # Sighash caching in tapscript.
     for _ in range(10):
@@ -1416,7 +1423,7 @@ class TaprootTest(BitcoinTestFramework):
     def block_submit(self, node, txs, msg, err_msg, cb_pubkey=None, fees=0, sigops_weight=0, witness=False, accept=False):
 
         # Deplete block of any non-tapscript sigops using a single additional 0-value coinbase output.
-        # It is not impossible to fit enough tapscript sigops to hit the old 80k limit without
+        # It is not practical to fit enough tapscript sigops to hit the block sigops limit without
         # busting txin-level limits. We simply have to account for the p2pk outputs in all
         # transactions.
         extra_output_script = CScript(bytes([OP_CHECKSIG]*((MAX_BLOCK_SIGOPS_WEIGHT - sigops_weight) // WITNESS_SCALE_FACTOR)))
@@ -1657,9 +1664,9 @@ class TaprootTest(BitcoinTestFramework):
         coinbase = CTransaction()
         coinbase.version = 1
         coinbase.vin = [CTxIn(COutPoint(0, 0xffffffff), CScript([OP_1, OP_1]), SEQUENCE_FINAL)]
-        coinbase.vout = [CTxOut(5000000000, CScript([OP_1]))]
+        coinbase.vout = [CTxOut(500000000, CScript([OP_1]))]
         coinbase.nLockTime = 0
-        assert coinbase.txid_hex == "f60c73405d499a956d3162e3483c395526ef78286458a4cb17b125aa92e49b20"
+        assert coinbase.txid_hex == "079a516e5b41d3cbd8abc5f95d4e22c87742ef760bbb62fd527dc2a8301a40c0"
         # Mine it
         block = create_block(hashprev=int(self.nodes[0].getbestblockhash(), 16), coinbase=coinbase)
         block.solve()
@@ -1741,9 +1748,9 @@ class TaprootTest(BitcoinTestFramework):
         # come from distinct txids).
         txn = []
         lasttxid = coinbase.txid_int
-        amount = 5000000000
+        amount = 500000000
         for i, spk in enumerate(old_spks + tap_spks):
-            val = 42000000 * (i + 7)
+            val = 4200000 * (i + 7)
             tx = CTransaction()
             tx.version = 1
             tx.vin = [CTxIn(COutPoint(lasttxid, i & 1), CScript([]), SEQUENCE_FINAL)]
@@ -1810,8 +1817,8 @@ class TaprootTest(BitcoinTestFramework):
         for i, spk in enumerate(input_spks):
             tx.vin.append(CTxIn(spend_info[spk]['prevout'], CScript(), sequences[i]))
             inputs.append(spend_info[spk]['utxo'])
-        tx.vout.append(CTxOut(1000000000, old_spks[1]))
-        tx.vout.append(CTxOut(3410000000, pubs[98]))
+        tx.vout.append(CTxOut(100000000, old_spks[1]))
+        tx.vout.append(CTxOut(341000000, pubs[98]))
         tx.nLockTime = 500000000
         precomputed = {
             "hashAmounts": BIP341_sha_amounts(inputs),
@@ -1868,7 +1875,7 @@ class TaprootTest(BitcoinTestFramework):
         aux = tx_test.setdefault("auxiliary", {})
         aux['fullySignedTx'] = tx.serialize().hex()
         keypath_tests.append(tx_test)
-        assert_equal(hashlib.sha256(tx.serialize()).hexdigest(), "24bab662cb55a7f3bae29b559f651674c62bcc1cd442d44715c0133939107b38")
+        assert_equal(hashlib.sha256(tx.serialize()).hexdigest(), "f1c10bc4845ace07911b4f516a683a5db852dada1ef7fa041e4d41a02d2b095d")
         # Mine the spending transaction
         self.block_submit(self.nodes[0], [tx], "Spending txn", None, sigops_weight=10000, accept=True, witness=True)
 

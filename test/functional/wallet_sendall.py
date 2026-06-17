@@ -6,6 +6,7 @@
 
 from decimal import Decimal, getcontext
 
+from test_framework.blocktools import MAX_STANDARD_TX_WEIGHT
 from test_framework.messages import SEQUENCE_FINAL
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
@@ -285,8 +286,15 @@ class SendallTest(BitcoinTestFramework):
     @cleanup
     def sendall_fails_on_low_fee(self):
         self.log.info("Test sendall fails if the transaction fee is lower than the minimum fee rate setting")
-        assert_raises_rpc_error(-8, "Fee rate (0.999 sat/vB) is lower than the minimum fee rate setting (1.000 sat/vB)",
-        self.wallet.sendall, recipients=[self.recipient], fee_rate=0.999)
+        self.add_utxos([2])
+        low_fee_rate = Decimal("0.001")
+        assert_raises_rpc_error(
+            -8,
+            "minimum fee rate setting",
+            self.wallet.sendall,
+            recipients=[self.recipient],
+            fee_rate=low_fee_rate,
+        )
 
     @cleanup
     def sendall_watchonly_specific_inputs(self):
@@ -458,11 +466,12 @@ class SendallTest(BitcoinTestFramework):
     def sendall_fails_with_transaction_too_large(self):
         self.log.info("Test that sendall fails if resulting transaction is too large")
 
-        # Force the wallet to bulk-generate the addresses we'll need
-        self.wallet.keypoolrefill(1600)
-
-        # create many inputs
-        outputs = {self.wallet.getnewaddress(): 0.000025 for _ in range(1600)}
+        # qbit uses WITNESS_SCALE_FACTOR=1, so a bech32 P2WPKH input weighs ~148 WU.
+        # Pick enough inputs to exceed the active MAX_STANDARD_TX_WEIGHT with margin.
+        input_count = MAX_STANDARD_TX_WEIGHT // 148 + 100
+        # Lazily derive only the external bech32 recipients we need for this
+        # test instead of bulk-refilling every active descriptor pool up front.
+        outputs = {self.wallet.getnewaddress(address_type="bech32"): 0.001 for _ in range(input_count)}
         self.def_wallet.sendmany(amounts=outputs)
         self.generate(self.nodes[0], 1)
 
@@ -476,7 +485,9 @@ class SendallTest(BitcoinTestFramework):
         self.nodes[0].createwallet("activewallet")
         self.wallet = self.nodes[0].get_wallet_rpc("activewallet")
         self.def_wallet = self.nodes[0].get_wallet_rpc(self.default_wallet_name)
-        self.generate(self.nodes[0], 101)
+        self.ensure_mature_coinbase(self.nodes[0])
+        while self.def_wallet.getbalance() < Decimal("300"):
+            self.generatetoaddress(self.nodes[0], 1, self.def_wallet.getnewaddress())
         self.recipient = self.def_wallet.getnewaddress() # payee for a specific amount
         self.remainder_target = self.def_wallet.getnewaddress() # address that receives everything left after payments and fees
         self.split_target = self.def_wallet.getnewaddress() # 2nd target when splitting rest

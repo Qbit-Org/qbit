@@ -3,8 +3,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_CHAIN_H
-#define BITCOIN_CHAIN_H
+#ifndef QBIT_CHAIN_H
+#define QBIT_CHAIN_H
 
 #include <arith_uint256.h>
 #include <consensus/params.h>
@@ -130,6 +130,8 @@ enum BlockStatus : uint32_t {
 
     BLOCK_STATUS_RESERVED    =   256, //!< Unused flag that was previously set on assumeutxo snapshot blocks and their
                                       //!< ancestors before they were validated, and unset when they were validated.
+
+    BLOCK_OPT_WITNESS_PRUNED =   512, //!< witness data has been stripped from this block's on-disk data
 };
 
 /** The block chain is a tree shaped structure starting with the
@@ -140,6 +142,10 @@ enum BlockStatus : uint32_t {
 class CBlockIndex
 {
 public:
+    static constexpr int DUMMY_VERSION = 259901;
+    static constexpr int AUXPOW_PAYLOAD_VERSION = 259902;
+    static constexpr int AUXPOW_OPTIONAL_PAYLOAD_VERSION = 259903;
+
     //! pointer to the hash of the block, if any. Memory is owned by this CBlockIndex
     const uint256* phashBlock{nullptr};
 
@@ -175,6 +181,9 @@ public:
     //! VALID_TRANSACTIONS level.
     uint64_t m_chain_tx_count{0};
 
+    //! Number of merged-mined blocks in the chain up to and including this block.
+    uint64_t nAuxPow{0};
+
     //! Verification status of this block. See enum BlockStatus
     //!
     //! Note: this value is modified to show BLOCK_OPT_WITNESS during UTXO snapshot
@@ -189,6 +198,7 @@ public:
     uint32_t nTime{0};
     uint32_t nBits{0};
     uint32_t nNonce{0};
+    std::shared_ptr<const CAuxPow> auxpow;
 
     //! (memory only) Sequential id assigned to distinguish order in which blocks are received.
     int32_t nSequenceId{0};
@@ -201,7 +211,8 @@ public:
           hashMerkleRoot{block.hashMerkleRoot},
           nTime{block.nTime},
           nBits{block.nBits},
-          nNonce{block.nNonce}
+          nNonce{block.nNonce},
+          auxpow{block.auxpow}
     {
     }
 
@@ -237,6 +248,7 @@ public:
         block.nTime = nTime;
         block.nBits = nBits;
         block.nNonce = nNonce;
+        block.auxpow = auxpow;
         return block;
     }
 
@@ -257,6 +269,16 @@ public:
      * been set manually based on the related AssumeutxoData entry.
      */
     bool HaveNumChainTxs() const { return m_chain_tx_count != 0; }
+
+    bool SignalsAuxpow() const
+    {
+        return IsAuxpowVersion(nVersion);
+    }
+
+    bool IsPermissionless() const
+    {
+        return !SignalsAuxpow();
+    }
 
     NodeSeconds Time() const
     {
@@ -359,8 +381,6 @@ class CDiskBlockIndex : public CBlockIndex
      * Hard-code to the highest client version ever written.
      * SerParams can be used if the field requires any meaning in the future.
      **/
-    static constexpr int DUMMY_VERSION = 259900;
-
 public:
     uint256 hashPrev;
 
@@ -377,12 +397,30 @@ public:
     SERIALIZE_METHODS(CDiskBlockIndex, obj)
     {
         LOCK(::cs_main);
-        int _nVersion = DUMMY_VERSION;
+        int _nVersion = AUXPOW_OPTIONAL_PAYLOAD_VERSION;
         READWRITE(VARINT_MODE(_nVersion, VarIntMode::NONNEGATIVE_SIGNED));
 
         READWRITE(VARINT_MODE(obj.nHeight, VarIntMode::NONNEGATIVE_SIGNED));
         READWRITE(VARINT(obj.nStatus));
         READWRITE(VARINT(obj.nTx));
+        if (_nVersion >= DUMMY_VERSION) {
+            READWRITE(VARINT(obj.nAuxPow));
+        } else {
+            SER_READ(obj, obj.nAuxPow = 0);
+        }
+        if (_nVersion >= AUXPOW_OPTIONAL_PAYLOAD_VERSION) {
+            bool has_auxpow = obj.auxpow != nullptr;
+            READWRITE(has_auxpow);
+            if (has_auxpow) {
+                READWRITE(obj.auxpow);
+            } else {
+                SER_READ(obj, obj.auxpow.reset());
+            }
+        } else if (_nVersion >= AUXPOW_PAYLOAD_VERSION) {
+            READWRITE(obj.auxpow);
+        } else {
+            SER_READ(obj, obj.auxpow.reset());
+        }
         if (obj.nStatus & (BLOCK_HAVE_DATA | BLOCK_HAVE_UNDO)) READWRITE(VARINT_MODE(obj.nFile, VarIntMode::NONNEGATIVE_SIGNED));
         if (obj.nStatus & BLOCK_HAVE_DATA) READWRITE(VARINT(obj.nDataPos));
         if (obj.nStatus & BLOCK_HAVE_UNDO) READWRITE(VARINT(obj.nUndoPos));
@@ -398,7 +436,7 @@ public:
 
     uint256 ConstructBlockHash() const
     {
-        CBlockHeader block;
+        CPureBlockHeader block;
         block.nVersion = nVersion;
         block.hashPrevBlock = hashPrev;
         block.hashMerkleRoot = hashMerkleRoot;
@@ -480,4 +518,4 @@ CBlockLocator GetLocator(const CBlockIndex* index);
 /** Construct a list of hash entries to put in a locator.  */
 std::vector<uint256> LocatorEntries(const CBlockIndex* index);
 
-#endif // BITCOIN_CHAIN_H
+#endif // QBIT_CHAIN_H

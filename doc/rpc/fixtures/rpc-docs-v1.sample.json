@@ -1,0 +1,197 @@
+{
+  "schema_version": "1",
+  "project": "qbit",
+  "project_version": "v30.2-qbit-sample",
+  "methods": [
+    {
+      "name": "getconfirmationtarget",
+      "category": "blockchain",
+      "component": "core",
+      "visible": true,
+      "summary_line": "Estimate confirmations needed under the current orphan model.",
+      "description": "Return the estimated confirmations and time required to reach a target confidence level.",
+      "arguments": [
+        {
+          "name": "amount",
+          "aliases": [],
+          "type": "AMOUNT",
+          "required": true,
+          "description": "Transaction amount to evaluate.",
+          "children": []
+        }
+      ],
+      "results": [
+        {
+          "name": "",
+          "type": "OBJ",
+          "description": "",
+          "children": [
+            {
+              "name": "required_confirmations",
+              "type": "NUM",
+              "description": "Estimated number of confirmations required.",
+              "children": []
+            }
+          ]
+        }
+      ],
+      "examples": [
+        "qbit-cli getconfirmationtarget 100000000"
+      ],
+      "feature_flags": {
+        "requires_wallet": false,
+        "requires_zmq": false,
+        "requires_external_signer": false
+      }
+    },
+    {
+      "name": "getblocktemplate",
+      "category": "mining",
+      "component": "core",
+      "visible": true,
+      "summary_line": "Return data needed to construct a qbit block.",
+      "description": "Return a block template with qbit-specific cadence and AuxPoW behavior.",
+      "arguments": [
+        {
+          "name": "template_request",
+          "aliases": [],
+          "type": "OBJ",
+          "required": false,
+          "description": "Template request object.",
+          "children": [
+            {
+              "name": "mode",
+              "type": "STR",
+              "description": "Template request mode.",
+              "children": []
+            }
+          ]
+        }
+      ],
+      "results": [
+        {
+          "name": "",
+          "type": "OBJ",
+          "description": "",
+          "children": [
+            {
+              "name": "bits",
+              "type": "STR",
+              "description": "Encoded target bits for the next block.",
+              "children": []
+            },
+            {
+              "name": "coinbasevalue",
+              "type": "NUM",
+              "description": "Current qbit block subsidy plus fees.",
+              "children": []
+            }
+          ]
+        }
+      ],
+      "examples": [
+        "qbit-cli getblocktemplate"
+      ],
+      "feature_flags": {
+        "requires_wallet": false,
+        "requires_zmq": false,
+        "requires_external_signer": false
+      }
+    },
+    {
+      "name": "getnetworkhashps",
+      "category": "mining",
+      "component": "core",
+      "visible": true,
+      "summary_line": "Return qbit network hashes per second by work lane.",
+      "description": "Return active-chain network hashes per second for all, permissionless, or AuxPoW work.",
+      "arguments": [
+        {
+          "name": "nblocks",
+          "aliases": [],
+          "type": "NUM",
+          "required": false,
+          "description": "The number of previous blocks to calculate estimate from.",
+          "children": [],
+          "default_kind": "value",
+          "default_value": 120
+        },
+        {
+          "name": "height",
+          "aliases": [],
+          "type": "NUM",
+          "required": false,
+          "description": "Estimate at the time of the given height.",
+          "children": [],
+          "default_kind": "value",
+          "default_value": -1
+        },
+        {
+          "name": "lane",
+          "aliases": [],
+          "type": "STR",
+          "required": false,
+          "description": "Hashrate lane to estimate: all, permissionless, or auxpow.",
+          "children": [],
+          "default_kind": "value",
+          "default_value": "all"
+        }
+      ],
+      "results": [
+        {
+          "name": "",
+          "type": "NUM",
+          "description": "Hashes per second estimated.",
+          "children": []
+        }
+      ],
+      "examples": [
+        "qbit-cli getnetworkhashps",
+        "qbit-cli getnetworkhashps 120 -1 auxpow"
+      ],
+      "feature_flags": {
+        "requires_wallet": false,
+        "requires_zmq": false,
+        "requires_external_signer": false
+      }
+    },
+    {
+      "name": "getmininginfo",
+      "category": "mining",
+      "component": "core",
+      "visible": true,
+      "summary_line": "Return qbit mining-related information.",
+      "description": "Return a JSON object containing qbit mining-related information.",
+      "arguments": [],
+      "results": [
+        {
+          "name": "",
+          "type": "OBJ",
+          "description": "",
+          "children": [
+            {
+              "name": "blocks",
+              "type": "NUM",
+              "description": "The current block height.",
+              "children": []
+            },
+            {
+              "name": "networkhashps",
+              "type": "NUM",
+              "description": "The total active-chain network hashes per second.",
+              "children": []
+            }
+          ]
+        }
+      ],
+      "examples": [
+        "qbit-cli getmininginfo"
+      ],
+      "feature_flags": {
+        "requires_wallet": false,
+        "requires_zmq": false,
+        "requires_external_signer": false
+      }
+    }
+  ]
+}

@@ -6,7 +6,7 @@ The `macdeployqtplus` script should not be run manually. Instead, after building
 make deploy
 ```
 
-When complete, it will have produced `Bitcoin-Core.zip`.
+When complete, it will have produced `qbit.zip`.
 
 ## SDK Extraction
 
@@ -68,10 +68,25 @@ Using an Apple-blessed key to sign binaries is a requirement to produce (distrib
 binaries. Because this private key cannot be shared, we'll have to be a bit creative in order
 for the build process to remain somewhat deterministic. Here's how it works:
 
-- Builders use Guix to create an unsigned release. This outputs an unsigned ZIP which
+- Builders use Guix to create an unsigned qbit release. This outputs an unsigned ZIP which
   users may choose to bless, self-codesign, and run. It also outputs an unsigned app structure
   in the form of a tarball.
 - The Apple keyholder uses this unsigned app to create a detached signature, using the
-  included script. Detached signatures are available from this [repository](https://github.com/bitcoin-core/bitcoin-detached-sigs).
+  included script. Detached signatures are expected in a `qbit-detached-sigs`
+  repository.
 - Builders feed the unsigned app + detached signature back into Guix, which combines the
   pieces into a deterministic ZIP.
+
+Coordinate Apple Developer enrollment, Developer ID key custody, and detached
+signature custody through the internal release-operator checklist before running
+the real detached-signature flow.
+Before running the real detached-signature script, the signing operator can
+preflight their local toolchain and unpacked Guix codesigning tarball with:
+
+```bash
+contrib/macdeploy/check-apple-signing-env.sh \
+  --codesigning-dir <unpacked-codesigning-tarball> \
+  --developer-id-key <developer-id-key.p12> \
+  --app-store-connect-key <AuthKey_...p8> \
+  --team-id <TEAMID>
+```

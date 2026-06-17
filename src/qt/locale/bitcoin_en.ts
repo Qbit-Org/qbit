@@ -76,13 +76,12 @@
     </message>
     <message>
         <location line="+6"/>
-        <source>These are your Bitcoin addresses for sending payments. Always check the amount and the receiving address before sending coins.</source>
+        <source>These are your qbit addresses for sending payments. Always check the amount and the receiving address before sending coins.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
         <location line="+5"/>
-        <source>These are your Bitcoin addresses for receiving payments. Use the &apos;Create new receiving address&apos; button in the receive tab to create new addresses.
-Signing is only possible with addresses of the type &apos;legacy&apos;.</source>
+        <source>These are your qbit addresses for receiving payments. Use the &apos;Create new receiving address&apos; button in the receive tab to create new addresses.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
@@ -205,17 +204,22 @@ Signing is only possible with addresses of the type &apos;legacy&apos;.</source>
     </message>
     <message>
         <location line="+1"/>
-        <source>Warning: If you encrypt your wallet and lose your passphrase, you will &lt;b&gt;LOSE ALL OF YOUR BITCOINS&lt;/b&gt;!</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <location line="+0"/>
         <location line="+18"/>
         <source>Are you sure you wish to encrypt your wallet?</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+12"/>
+        <location line="-18"/>
+        <source>Warning: If you encrypt your wallet and lose your passphrase, you will &lt;b&gt;LOSE ALL OF YOUR QBT&lt;/b&gt;!</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+10"/>
+        <source>Remember that encrypting your wallet cannot fully protect your QBT from being stolen by malware infecting your computer.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+20"/>
         <location line="+58"/>
         <source>Wallet encrypted</source>
         <translation type="unfinished"></translation>
@@ -241,12 +245,7 @@ Signing is only possible with addresses of the type &apos;legacy&apos;.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+7"/>
-        <source>Remember that encrypting your wallet cannot fully protect your bitcoins from being stolen by malware infecting your computer.</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <location line="+5"/>
+        <location line="+12"/>
         <source>Wallet to be encrypted</source>
         <translation type="unfinished"></translation>
     </message>
@@ -368,7 +367,7 @@ Signing is only possible with addresses of the type &apos;legacy&apos;.</source>
 <context>
     <name>BitcoinGUI</name>
     <message>
-        <location filename="../bitcoingui.cpp" line="+252"/>
+        <location filename="../bitcoingui.cpp" line="+253"/>
         <source>&amp;Overview</source>
         <translation>&amp;Overview</translation>
     </message>
@@ -378,7 +377,17 @@ Signing is only possible with addresses of the type &apos;legacy&apos;.</source>
         <translation>Show general overview of wallet</translation>
     </message>
     <message>
-        <location line="+20"/>
+        <location line="+7"/>
+        <source>Send coins to a qbit address</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+7"/>
+        <source>Request payments (generates QR codes and qbit: URIs)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+6"/>
         <source>&amp;Transactions</source>
         <translation>&amp;Transactions</translation>
     </message>
@@ -423,12 +432,52 @@ Signing is only possible with addresses of the type &apos;legacy&apos;.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+44"/>
+        <location line="+12"/>
+        <source>Sign messages with your qbit addresses to prove you own them</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+2"/>
+        <source>Verify messages to ensure they were signed with specified qbit addresses</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+2"/>
+        <source>Legacy message signing is disabled on this chain</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Legacy message verification is disabled on this chain</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+3"/>
+        <source>Load Partially Signed Transaction (PSBT)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+2"/>
+        <source>Load Partially Signed Transaction (PSBT) from clipboard</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+14"/>
+        <source>Open a qbit: URI</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+12"/>
         <source>Create a new wallet</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+188"/>
+        <location line="+18"/>
+        <source>Show the %1 help message to get a list with possible qbit command-line options</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+170"/>
         <source>&amp;Minimize</source>
         <translation type="unfinished"></translation>
     </message>
@@ -437,8 +486,17 @@ Signing is only possible with addresses of the type &apos;legacy&apos;.</source>
         <source>Wallet:</source>
         <translation type="unfinished"></translation>
     </message>
+    <message numerus="yes">
+        <location line="+415"/>
+        <source>%n active connection(s) to qbit network.</source>
+        <extracomment>A substring of the tooltip.</extracomment>
+        <translation type="unfinished">
+            <numerusform></numerusform>
+            <numerusform></numerusform>
+        </translation>
+    </message>
     <message>
-        <location line="+418"/>
+        <location line="+3"/>
         <source>Network activity disabled.</source>
         <extracomment>A substring of the tooltip.</extracomment>
         <translation type="unfinished"></translation>
@@ -449,12 +507,7 @@ Signing is only possible with addresses of the type &apos;legacy&apos;.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="-1220"/>
-        <source>Send coins to a Bitcoin address</source>
-        <translation>Send coins to a Bitcoin address</translation>
-    </message>
-    <message>
-        <location line="+53"/>
+        <location line="-1171"/>
         <source>Backup wallet to another location</source>
         <translation>Backup wallet to another location</translation>
     </message>
@@ -504,22 +557,12 @@ Signing is only possible with addresses of the type &apos;legacy&apos;.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+1"/>
-        <source>Sign messages with your Bitcoin addresses to prove you own them</source>
-        <translation>Sign messages with your Bitcoin addresses to prove you own them</translation>
-    </message>
-    <message>
-        <location line="+1"/>
+        <location line="+2"/>
         <source>&amp;Verify message…</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+1"/>
-        <source>Verify messages to ensure they were signed with specified Bitcoin addresses</source>
-        <translation>Verify messages to ensure they were signed with specified Bitcoin addresses</translation>
-    </message>
-    <message>
-        <location line="+1"/>
+        <location line="+6"/>
         <source>&amp;Load PSBT from file…</source>
         <translation type="unfinished"></translation>
     </message>
@@ -589,12 +632,7 @@ Signing is only possible with addresses of the type &apos;legacy&apos;.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="-883"/>
-        <source>Request payments (generates QR codes and bitcoin: URIs)</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <location line="+65"/>
+        <location line="-818"/>
         <source>Show the list of used sending addresses and labels</source>
         <translation type="unfinished"></translation>
     </message>
@@ -657,27 +695,17 @@ Signing is only possible with addresses of the type &apos;legacy&apos;.</source>
         <translation>Up to date</translation>
     </message>
     <message>
-        <location line="-868"/>
+        <location line="-872"/>
         <source>Ctrl+Q</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+26"/>
-        <source>Load Partially Signed Bitcoin Transaction</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <location line="+1"/>
+        <location line="+31"/>
         <source>Load PSBT from &amp;clipboard…</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+1"/>
-        <source>Load Partially Signed Bitcoin Transaction from clipboard</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <location line="+2"/>
+        <location line="+3"/>
         <source>Node window</source>
         <translation type="unfinished"></translation>
     </message>
@@ -697,12 +725,7 @@ Signing is only possible with addresses of the type &apos;legacy&apos;.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+4"/>
-        <source>Open a bitcoin: URI</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <location line="+2"/>
+        <location line="+6"/>
         <source>Open Wallet</source>
         <translation type="unfinished"></translation>
     </message>
@@ -744,12 +767,7 @@ Signing is only possible with addresses of the type &apos;legacy&apos;.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+5"/>
-        <source>Show the %1 help message to get a list with possible Bitcoin command-line options</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <location line="+2"/>
+        <location line="+7"/>
         <source>&amp;Mask values</source>
         <translation type="unfinished"></translation>
     </message>
@@ -823,17 +841,8 @@ Signing is only possible with addresses of the type &apos;legacy&apos;.</source>
         <source>S&amp;how</source>
         <translation type="unfinished"></translation>
     </message>
-    <message numerus="yes">
-        <location line="+118"/>
-        <source>%n active connection(s) to Bitcoin network.</source>
-        <extracomment>A substring of the tooltip.</extracomment>
-        <translation type="unfinished">
-            <numerusform>%n active connection to Bitcoin network.</numerusform>
-            <numerusform>%n active connections to Bitcoin network.</numerusform>
-        </translation>
-    </message>
     <message>
-        <location line="+10"/>
+        <location line="+128"/>
         <source>Click for more actions.</source>
         <extracomment>A substring of the tooltip. &quot;More actions&quot; are available via the context menu.</extracomment>
         <translation type="unfinished"></translation>
@@ -1096,8 +1105,8 @@ Signing is only possible with addresses of the type &apos;legacy&apos;.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+165"/>
-        <source>Can vary +/- %1 satoshi(s) per input.</source>
+        <location line="+182"/>
+        <source>Can vary +/- %1 bits per input.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
@@ -1279,12 +1288,7 @@ Signing is only possible with addresses of the type &apos;legacy&apos;.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+77"/>
-        <source>The entered address &quot;%1&quot; is not a valid Bitcoin address.</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <location line="+33"/>
+        <location line="+110"/>
         <source>Address &quot;%1&quot; already exists as a receiving address with label &quot;%2&quot; and so cannot be added as a sending address.</source>
         <translation type="unfinished"></translation>
     </message>
@@ -1299,7 +1303,12 @@ Signing is only possible with addresses of the type &apos;legacy&apos;.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+5"/>
+        <location line="-10"/>
+        <source>The entered address &quot;%1&quot; is not a valid qbit address.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+15"/>
         <source>New key generation failed.</source>
         <translation type="unfinished"></translation>
     </message>
@@ -1407,13 +1416,8 @@ Signing is only possible with addresses of the type &apos;legacy&apos;.</source>
         <source>Use a custom data directory:</source>
         <translation>Use a custom data directory:</translation>
     </message>
-    <message>
-        <location filename="../intro.cpp" line="+54"/>
-        <source>Bitcoin</source>
-        <translation type="unfinished">Bitcoin</translation>
-    </message>
     <message numerus="yes">
-        <location line="+164"/>
+        <location filename="../intro.cpp" line="+218"/>
         <source>%n GB of space available</source>
         <translation type="unfinished">
             <numerusform>%n GB of space available</numerusform>
@@ -1462,7 +1466,7 @@ Signing is only possible with addresses of the type &apos;legacy&apos;.</source>
     </message>
     <message>
         <location line="+2"/>
-        <source>%1 will download and store a copy of the Bitcoin block chain.</source>
+        <source>%1 will download and store a copy of the qbit block chain.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
@@ -1476,7 +1480,12 @@ Signing is only possible with addresses of the type &apos;legacy&apos;.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+30"/>
+        <location line="-113"/>
+        <source>qbit</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+143"/>
         <source>Error</source>
         <translation>Error</translation>
     </message>
@@ -1561,17 +1570,7 @@ The migration process will create a backup of the wallet before migrating. This 
         <translation type="unfinished">Form</translation>
     </message>
     <message>
-        <location line="+119"/>
-        <source>Recent transactions may not yet be visible, and therefore your wallet&apos;s balance might be incorrect. This information will be correct once your wallet has finished synchronizing with the bitcoin network, as detailed below.</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <location line="+19"/>
-        <source>Attempting to spend bitcoins that are affected by not-yet-displayed transactions will not be accepted by the network.</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <location line="+63"/>
+        <location line="+201"/>
         <source>Number of blocks left</source>
         <translation type="unfinished"></translation>
     </message>
@@ -1594,7 +1593,17 @@ The migration process will create a backup of the wallet before migrating. This 
         <translation type="unfinished">Last block time</translation>
     </message>
     <message>
-        <location line="+26"/>
+        <location line="-102"/>
+        <source>Recent transactions may not yet be visible, and therefore your wallet&apos;s balance might be incorrect. This information will be correct once your wallet has finished synchronizing with the qbit network, as detailed below.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+19"/>
+        <source>Attempting to spend QBT that is affected by not-yet-displayed transactions will not be accepted by the network.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+109"/>
         <source>Progress</source>
         <translation type="unfinished"></translation>
     </message>
@@ -1638,7 +1647,7 @@ The migration process will create a backup of the wallet before migrating. This 
     <name>OpenURIDialog</name>
     <message>
         <location filename="../forms/openuridialog.ui" line="+14"/>
-        <source>Open bitcoin URI</source>
+        <source>Open qbit URI</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
@@ -1727,17 +1736,17 @@ The migration process will create a backup of the wallet before migrating. This 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+32"/>
-        <source>Automatically open the Bitcoin client port on the router. This only works when your router supports PCP or NAT-PMP and it is enabled. The external port could be random.</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <location line="+3"/>
+        <location line="+35"/>
         <source>Map port using PCP or NA&amp;T-PMP</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+54"/>
+        <location line="+17"/>
+        <source>Connect to the qbit network through a SOCKS5 proxy.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+37"/>
         <location line="+187"/>
         <source>IP address of the proxy (e.g. IPv4: 127.0.0.1 / IPv6: ::1)</source>
         <translation type="unfinished"></translation>
@@ -1892,7 +1901,12 @@ The migration process will create a backup of the wallet before migrating. This 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+52"/>
+        <location line="+42"/>
+        <source>Automatically open the qbit client port on the router. This only works when your router supports PCP or NAT-PMP and it is enabled. The external port could be random.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+10"/>
         <source>Accept connections from outside.</source>
         <translation type="unfinished"></translation>
     </message>
@@ -1902,12 +1916,7 @@ The migration process will create a backup of the wallet before migrating. This 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+7"/>
-        <source>Connect to the Bitcoin network through a SOCKS5 proxy.</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <location line="+3"/>
+        <location line="+10"/>
         <source>&amp;Connect through SOCKS5 proxy (default proxy):</source>
         <translation type="unfinished"></translation>
     </message>
@@ -1950,7 +1959,12 @@ The migration process will create a backup of the wallet before migrating. This 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+130"/>
+        <location line="+25"/>
+        <source>Connect to the qbit network through a separate SOCKS5 proxy for Tor onion services.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+105"/>
         <source>&amp;Window</source>
         <translation>&amp;Window</translation>
     </message>
@@ -2021,12 +2035,7 @@ The migration process will create a backup of the wallet before migrating. This 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+290"/>
-        <source>Connect to the Bitcoin network through a separate SOCKS5 proxy for Tor onion services.</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <location line="+3"/>
+        <location line="+293"/>
         <source>Use separate SOCKS&amp;5 proxy to reach peers via Tor onion services:</source>
         <translation type="unfinished"></translation>
     </message>
@@ -2127,7 +2136,7 @@ The migration process will create a backup of the wallet before migrating. This 
 <context>
     <name>OptionsModel</name>
     <message>
-        <location filename="../optionsmodel.cpp" line="+226"/>
+        <location filename="../optionsmodel.cpp" line="+229"/>
         <source>Could not read setting &quot;%1&quot;, %2.</source>
         <translation type="unfinished"></translation>
     </message>
@@ -2140,13 +2149,7 @@ The migration process will create a backup of the wallet before migrating. This 
         <translation>Form</translation>
     </message>
     <message>
-        <location line="+62"/>
-        <location line="+220"/>
-        <source>The displayed information may be out of date. Your wallet automatically synchronizes with the Bitcoin network after a connection is established, but this process has not completed yet.</source>
-        <translation>The displayed information may be out of date. Your wallet automatically synchronizes with the Bitcoin network after a connection is established, but this process has not completed yet.</translation>
-    </message>
-    <message>
-        <location line="-88"/>
+        <location line="+194"/>
         <source>Available:</source>
         <translation type="unfinished"></translation>
     </message>
@@ -2181,7 +2184,13 @@ The migration process will create a backup of the wallet before migrating. This 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+83"/>
+        <location line="+16"/>
+        <location line="+220"/>
+        <source>The displayed information may be out of date. Your wallet automatically synchronizes with the qbit network after a connection is established, but this process has not completed yet.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="-153"/>
         <source>Total:</source>
         <translation>Total:</translation>
     </message>
@@ -2373,17 +2382,35 @@ The migration process will create a backup of the wallet before migrating. This 
 <context>
     <name>PaymentServer</name>
     <message>
-        <location filename="../paymentserver.cpp" line="+145"/>
+        <location filename="../paymentserver.cpp" line="+147"/>
         <source>Payment request error</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
         <location line="+1"/>
-        <source>Cannot start bitcoin: click-to-pay handler</source>
+        <source>Cannot start qbit: click-to-pay handler</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
         <location line="+48"/>
+        <location line="+5"/>
+        <source>Unsupported URI scheme. Use &apos;qbit:&apos; instead.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+5"/>
+        <source>&apos;qbit://&apos; is not a valid URI. Use &apos;qbit:&apos; instead.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+30"/>
+        <source>URI cannot be parsed! This can be caused by an invalid qbit address or malformed URI parameters.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="-40"/>
+        <location line="+5"/>
+        <location line="+5"/>
         <location line="+16"/>
         <location line="+6"/>
         <location line="+7"/>
@@ -2391,12 +2418,7 @@ The migration process will create a backup of the wallet before migrating. This 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="-29"/>
-        <source>&apos;bitcoin://&apos; is not a valid URI. Use &apos;bitcoin:&apos; instead.</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <location line="+17"/>
+        <location line="-12"/>
         <location line="+23"/>
         <source>Cannot process payment request because BIP70 is not supported.
 Due to widespread security flaws in BIP70 it&apos;s strongly recommended that any merchant instructions to switch wallets be ignored.
@@ -2404,12 +2426,7 @@ If you are receiving this error you should request the merchant provide a BIP21 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="-10"/>
-        <source>URI cannot be parsed! This can be caused by an invalid Bitcoin address or malformed URI parameters.</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <location line="+9"/>
+        <location line="-1"/>
         <source>Payment request file handling</source>
         <translation type="unfinished"></translation>
     </message>
@@ -2492,22 +2509,22 @@ If you are receiving this error you should request the merchant provide a BIP21 
 <context>
     <name>QObject</name>
     <message>
-        <location filename="../bitcoinunits.cpp" line="+197"/>
+        <location filename="../qbitunits.cpp" line="+201"/>
         <source>Amount</source>
         <translation type="unfinished">Amount</translation>
     </message>
     <message>
         <location filename="../guiutil.cpp" line="+138"/>
-        <source>Enter a Bitcoin address (e.g. %1)</source>
+        <source>Enter a qbit address (e.g. %1)</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+295"/>
+        <location line="+300"/>
         <source>Ctrl+W</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+257"/>
+        <location line="+270"/>
         <source>Unroutable</source>
         <translation type="unfinished"></translation>
     </message>
@@ -2689,7 +2706,7 @@ If you are receiving this error you should request the merchant provide a BIP21 
     </message>
     <message>
         <location line="+2"/>
-        <location filename="../rpcconsole.cpp" line="+979"/>
+        <location filename="../rpcconsole.cpp" line="+982"/>
         <source>%1 kB</source>
         <translation type="unfinished"></translation>
     </message>
@@ -2723,7 +2740,7 @@ If you are receiving this error you should request the merchant provide a BIP21 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+422"/>
+        <location line="+423"/>
         <source>Error: %1</source>
         <translation type="unfinished"></translation>
     </message>
@@ -2834,7 +2851,7 @@ If you are receiving this error you should request the merchant provide a BIP21 
         <location line="+26"/>
         <location line="+26"/>
         <location line="+26"/>
-        <location filename="../rpcconsole.h" line="+144"/>
+        <location filename="../rpcconsole.h" line="+147"/>
         <source>N/A</source>
         <translation>N/A</translation>
     </message>
@@ -2900,12 +2917,7 @@ If you are receiving this error you should request the merchant provide a BIP21 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+28"/>
-        <source>Network addresses that your Bitcoin node is currently using to communicate with other nodes.</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <location line="+13"/>
+        <location line="+41"/>
         <source>Block chain</source>
         <translation>Block chain</translation>
     </message>
@@ -3085,7 +3097,12 @@ If you are receiving this error you should request the merchant provide a BIP21 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+288"/>
+        <location line="+268"/>
+        <source>Network addresses that your qbit node is currently using to communicate with other nodes.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+20"/>
         <source>Current block height</source>
         <translation type="unfinished"></translation>
     </message>
@@ -3507,12 +3524,7 @@ For more information on using this console, type %6.
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="-3"/>
-        <source>An optional message to attach to the payment request, which will be displayed when the request is opened. Note: The message will not be sent with the payment over the Bitcoin network.</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <location line="+30"/>
+        <location line="+27"/>
         <source>An optional label to associate with the new receiving address.</source>
         <translation type="unfinished"></translation>
     </message>
@@ -3528,7 +3540,12 @@ For more information on using this console, type %6.
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="-127"/>
+        <location line="-143"/>
+        <source>An optional message to attach to the payment request, which will be displayed when the request is opened. Note: The message will not be sent with the payment over the qbit network.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+16"/>
         <source>An optional label to associate with the new receiving address (used by you to identify an invoice).  It is also attached to the payment request.</source>
         <translation type="unfinished"></translation>
     </message>
@@ -3578,7 +3595,7 @@ For more information on using this console, type %6.
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../receivecoinsdialog.cpp" line="+46"/>
+        <location filename="../receivecoinsdialog.cpp" line="+86"/>
         <source>Copy &amp;URI</source>
         <translation type="unfinished"></translation>
     </message>
@@ -3603,47 +3620,57 @@ For more information on using this console, type %6.
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+46"/>
+        <location line="-60"/>
         <source>Base58 (Legacy)</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+0"/>
+        <location line="+19"/>
         <source>Not recommended due to higher fees and less protection against typos.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+1"/>
+        <location line="-17"/>
         <source>Base58 (P2SH-SegWit)</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+0"/>
+        <location line="+19"/>
         <source>Generates an address compatible with older wallets.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+1"/>
+        <location line="-17"/>
         <source>Bech32 (SegWit)</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+0"/>
+        <location line="+19"/>
         <source>Generates a native segwit address (BIP-173). Some old wallets don&apos;t support it.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+2"/>
+        <location line="-17"/>
         <source>Bech32m (Taproot)</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+0"/>
+        <location line="+2"/>
+        <source>P2MR</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+17"/>
         <source>Bech32m (BIP-350) is an upgrade to Bech32, wallet support is still limited.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+75"/>
+        <location line="+2"/>
+        <source>Generates a PQC-backed P2MR receive address.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+159"/>
         <source>Could not unlock wallet.</source>
         <translation type="unfinished"></translation>
     </message>
@@ -3796,7 +3823,7 @@ For more information on using this console, type %6.
     <name>SendCoinsDialog</name>
     <message>
         <location filename="../forms/sendcoinsdialog.ui" line="+14"/>
-        <location filename="../sendcoinsdialog.cpp" line="+764"/>
+        <location filename="../sendcoinsdialog.cpp" line="+863"/>
         <source>Send Coins</source>
         <translation>Send Coins</translation>
     </message>
@@ -3871,7 +3898,14 @@ For more information on using this console, type %6.
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+82"/>
+        <location line="+77"/>
+        <source>Specify a custom fee per kB (1,000 bytes) of the transaction&apos;s virtual size.
+
+Note:  Since the fee is calculated on a per-byte basis, a fee rate of &quot;100 bits per kvB&quot; for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 bits.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+5"/>
         <source>per kilobyte</source>
         <translation type="unfinished"></translation>
     </message>
@@ -3881,7 +3915,12 @@ For more information on using this console, type %6.
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+112"/>
+        <location line="+83"/>
+        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for qbit transactions than the network can process.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+29"/>
         <source>Recommended:</source>
         <translation type="unfinished"></translation>
     </message>
@@ -3921,19 +3960,7 @@ For more information on using this console, type %6.
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+51"/>
-        <source>Specify a custom fee per kB (1,000 bytes) of the transaction&apos;s virtual size.
-
-Note:  Since the fee is calculated on a per-byte basis, a fee rate of &quot;100 satoshis per kvB&quot; for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 satoshis.</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <location line="+35"/>
-        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for bitcoin transactions than the network can process.</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <location line="+3"/>
+        <location line="+89"/>
         <source>A too low fee might result in a never confirming transaction (read the tooltip)</source>
         <translation type="unfinished"></translation>
     </message>
@@ -3978,7 +4005,7 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of &quot;100 
         <translation>S&amp;end</translation>
     </message>
     <message>
-        <location filename="../sendcoinsdialog.cpp" line="-665"/>
+        <location filename="../sendcoinsdialog.cpp" line="-673"/>
         <source>Copy quantity</source>
         <translation type="unfinished"></translation>
     </message>
@@ -4035,12 +4062,7 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of &quot;100 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+1"/>
-        <source>Creates a Partially Signed Bitcoin Transaction (PSBT) for use with e.g. an offline %1 wallet, or a PSBT-compatible hardware wallet.</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <location line="+103"/>
+        <location line="+104"/>
         <source>%1 to &apos;%2&apos;</source>
         <translation type="unfinished"></translation>
     </message>
@@ -4050,17 +4072,17 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of &quot;100 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+67"/>
+        <location line="+69"/>
         <source>To review recipient list click &quot;Show Details…&quot;</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+63"/>
+        <location line="+64"/>
         <source>Sign failed</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+5"/>
+        <location line="+6"/>
         <source>External signer not found</source>
         <extracomment>&quot;External signer&quot; means using devices such as hardware wallets.</extracomment>
         <translation type="unfinished"></translation>
@@ -4072,12 +4094,76 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of &quot;100 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="-36"/>
+        <location line="-38"/>
         <source>Save Transaction Data</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
+        <location line="-465"/>
+        <source>Normal</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
         <location line="+2"/>
+        <source>Warning</source>
+        <translation type="unfinished">Warning</translation>
+    </message>
+    <message>
+        <location line="+2"/>
+        <source>Critical</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+2"/>
+        <source>Exhausted</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+20"/>
+        <source>PQC usage</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+5"/>
+        <source>Most advanced PQC state after signing: &lt;b&gt;%1&lt;/b&gt;.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+8"/>
+        <location line="+28"/>
+        <source>Signatures remaining for this key: %1 of %2.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="-17"/>
+        <location line="+24"/>
+        <source>Rotate to a new receive address after this transaction.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="-11"/>
+        <source>Most advanced PQC state after signing: %1.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+187"/>
+        <source>Creates a Partially Signed Transaction (PSBT) for use with e.g. an offline %1 wallet, or a PSBT-compatible hardware wallet.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+122"/>
+        <source>Please, review your transaction proposal. This will produce a Partially Signed Transaction (PSBT) which you can save or copy and then sign with e.g. an offline %1 wallet, or a PSBT-compatible hardware wallet.</source>
+        <extracomment>Text to inform a user attempting to create a transaction of their current options. At this stage, a user can only create a PSBT. This string is displayed when private keys are disabled and an external signer is not available.</extracomment>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+5"/>
+        <source>Please, review your transaction. You can create and send this transaction or create a Partially Signed Transaction (PSBT), which you can save or copy and then sign with, e.g., an offline %1 wallet, or a PSBT-compatible hardware wallet.</source>
+        <extracomment>Text to inform a user attempting to create a transaction of their current options. At this stage, a user can send their transaction or create a PSBT. This string is displayed when both private keys and PSBT controls are enabled.</extracomment>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+90"/>
         <source>Partially Signed Transaction (Binary)</source>
         <extracomment>Expanded name of the binary PSBT file format. See: BIP 174.</extracomment>
         <translation type="unfinished"></translation>
@@ -4089,12 +4175,12 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of &quot;100 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+273"/>
+        <location line="+279"/>
         <source>External balance:</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="-325"/>
+        <location line="-333"/>
         <source>or</source>
         <translation type="unfinished"></translation>
     </message>
@@ -4104,13 +4190,7 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of &quot;100 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="-31"/>
-        <source>Please, review your transaction proposal. This will produce a Partially Signed Bitcoin Transaction (PSBT) which you can save or copy and then sign with e.g. an offline %1 wallet, or a PSBT-compatible hardware wallet.</source>
-        <extracomment>Text to inform a user attempting to create a transaction of their current options. At this stage, a user can only create a PSBT. This string is displayed when private keys are disabled and an external signer is not available.</extracomment>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <location line="-30"/>
+        <location line="-61"/>
         <source>%1 from wallet &apos;%2&apos;</source>
         <translation type="unfinished"></translation>
     </message>
@@ -4121,13 +4201,7 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of &quot;100 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+11"/>
-        <source>Please, review your transaction. You can create and send this transaction or create a Partially Signed Bitcoin Transaction (PSBT), which you can save or copy and then sign with, e.g., an offline %1 wallet, or a PSBT-compatible hardware wallet.</source>
-        <extracomment>Text to inform a user attempting to create a transaction of their current options. At this stage, a user can send their transaction or create a PSBT. This string is displayed when both private keys and PSBT controls are enabled.</extracomment>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <location line="+3"/>
+        <location line="+14"/>
         <source>Please, review your transaction.</source>
         <extracomment>Text to prompt a user to review the details of the transaction they are attempting to send.</extracomment>
         <translation type="unfinished"></translation>
@@ -4155,7 +4229,7 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of &quot;100 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+24"/>
+        <location line="+26"/>
         <source>Unsigned Transaction</source>
         <comment>PSBT copied</comment>
         <extracomment>Caption of &quot;PSBT has been copied&quot; messagebox</extracomment>
@@ -4172,12 +4246,17 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of &quot;100 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+49"/>
+        <location line="+51"/>
         <source>Confirm send coins</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+248"/>
+        <location line="+67"/>
+        <source>PQC usage warning</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+185"/>
         <source>The recipient address is not valid. Please recheck.</source>
         <translation type="unfinished"></translation>
     </message>
@@ -4227,7 +4306,7 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of &quot;100 
     </message>
     <message>
         <location line="+99"/>
-        <source>Warning: Invalid Bitcoin address</source>
+        <source>Warning: Invalid qbit address</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
@@ -4264,7 +4343,12 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of &quot;100 
         <translation>Pay &amp;To:</translation>
     </message>
     <message>
-        <location line="+93"/>
+        <location line="+18"/>
+        <source>The qbit address to send the payment to</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+75"/>
         <source>&amp;Label:</source>
         <translation>&amp;Label:</translation>
     </message>
@@ -4274,12 +4358,7 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of &quot;100 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="-7"/>
-        <source>The Bitcoin address to send the payment to</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <location line="+23"/>
+        <location line="+16"/>
         <source>Alt+A</source>
         <translation>Alt+A</translation>
     </message>
@@ -4305,11 +4384,16 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of &quot;100 
     </message>
     <message>
         <location line="+7"/>
-        <source>The fee will be deducted from the amount being sent. The recipient will receive less bitcoins than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
+        <source>The fee will be deducted from the amount being sent. The recipient will receive less QBT than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+3"/>
+        <location line="+29"/>
+        <source>A message that was attached to the qbit: URI which will be stored with the transaction for your reference. Note: This message will not be sent over the qbit network.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="-26"/>
         <source>S&amp;ubtract fee from amount</source>
         <translation type="unfinished"></translation>
     </message>
@@ -4329,16 +4413,11 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of &quot;100 
         <source>Enter a label for this address to add it to the list of used addresses</source>
         <translation type="unfinished"></translation>
     </message>
-    <message>
-        <location line="+58"/>
-        <source>A message that was attached to the bitcoin: URI which will be stored with the transaction for your reference. Note: This message will not be sent over the Bitcoin network.</source>
-        <translation type="unfinished"></translation>
-    </message>
 </context>
 <context>
     <name>SendConfirmationDialog</name>
     <message>
-        <location filename="../sendcoinsdialog.h" line="+151"/>
+        <location filename="../sendcoinsdialog.h" line="+155"/>
         <source>Send</source>
         <translation type="unfinished"></translation>
     </message>
@@ -4375,12 +4454,12 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of &quot;100 
     </message>
     <message>
         <location line="+6"/>
-        <source>You can sign messages/agreements with your legacy (P2PKH) addresses to prove you can receive bitcoins sent to them. Be careful not to sign anything vague or random, as phishing attacks may try to trick you into signing your identity over to them. Only sign fully-detailed statements you agree to.</source>
+        <source>You can sign messages/agreements with your legacy (P2PKH) addresses to prove you can receive QBT sent to them. Be careful not to sign anything vague or random, as phishing attacks may try to trick you into signing your identity over to them. Only sign fully-detailed statements you agree to.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
         <location line="+18"/>
-        <source>The Bitcoin address to sign the message with</source>
+        <source>The qbit address to sign the message with</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
@@ -4423,11 +4502,21 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of &quot;100 
     </message>
     <message>
         <location line="+21"/>
-        <source>Sign the message to prove you own this Bitcoin address</source>
-        <translation>Sign the message to prove you own this Bitcoin address</translation>
+        <source>Sign the message to prove you own this qbit address</source>
+        <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+3"/>
+        <location line="+106"/>
+        <source>The qbit address the message was signed with</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+51"/>
+        <source>Verify the message to ensure it was signed with the specified qbit address</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="-154"/>
         <source>Sign &amp;Message</source>
         <translation>Sign &amp;Message</translation>
     </message>
@@ -4453,12 +4542,7 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of &quot;100 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+21"/>
-        <source>The Bitcoin address the message was signed with</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <location line="+29"/>
+        <location line="+50"/>
         <location line="+3"/>
         <source>The signed message to verify</source>
         <translation type="unfinished"></translation>
@@ -4470,12 +4554,7 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of &quot;100 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+9"/>
-        <source>Verify the message to ensure it was signed with the specified Bitcoin address</source>
-        <translation>Verify the message to ensure it was signed with the specified Bitcoin address</translation>
-    </message>
-    <message>
-        <location line="+3"/>
+        <location line="+12"/>
         <source>Verify &amp;Message</source>
         <translation>Verify &amp;Message</translation>
     </message>
@@ -4490,25 +4569,29 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of &quot;100 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location filename="../signverifymessagedialog.cpp" line="+122"/>
-        <location line="+99"/>
+        <location filename="../signverifymessagedialog.cpp" line="+128"/>
+        <location line="+105"/>
         <source>The entered address is invalid.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="-99"/>
-        <location line="+100"/>
+        <location line="-105"/>
+        <location line="+106"/>
         <source>Please check the address and try again.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="-93"/>
-        <location line="+98"/>
-        <source>The entered address does not refer to a legacy (P2PKH) key. Message signing for SegWit and other non-P2PKH address types is not supported in this version of %1. Please check the address and try again.</source>
+        <location line="-113"/>
+        <source>Legacy message signing is disabled on this chain.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="-90"/>
+        <location line="+14"/>
+        <source>The entered address does not refer to a legacy (P2PKH) key. Legacy message signing does not support this address type. Please check the address and try again.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+8"/>
         <source>Wallet unlock was cancelled.</source>
         <translation type="unfinished"></translation>
     </message>
@@ -4533,7 +4616,17 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of &quot;100 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+66"/>
+        <location line="+37"/>
+        <source>Legacy message verification is disabled on this chain.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+30"/>
+        <source>The entered address does not refer to a legacy (P2PKH) key. Legacy message verification does not support this address type. Please check the address and try again.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+5"/>
         <source>The signature could not be decoded.</source>
         <translation type="unfinished"></translation>
     </message>
@@ -4562,7 +4655,7 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of &quot;100 
 <context>
     <name>SplashScreen</name>
     <message>
-        <location filename="../splashscreen.cpp" line="+175"/>
+        <location filename="../splashscreen.cpp" line="+177"/>
         <source>(press q to shutdown and continue later)</source>
         <translation type="unfinished"></translation>
     </message>
@@ -4583,7 +4676,7 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of &quot;100 
 <context>
     <name>TransactionDesc</name>
     <message>
-        <location filename="../transactiondesc.cpp" line="+39"/>
+        <location filename="../transactiondesc.cpp" line="+34"/>
         <source>conflicted with a transaction with %1 confirmations</source>
         <extracomment>Text explaining the current status of a transaction, shown in the status field of the details window for this transaction. This status represents an unconfirmed transaction that conflicts with a confirmed transaction.</extracomment>
         <translation type="unfinished"></translation>
@@ -4640,7 +4733,7 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of &quot;100 
     </message>
     <message>
         <location line="+5"/>
-        <location line="+14"/>
+        <location line="+13"/>
         <source>From</source>
         <translation type="unfinished"></translation>
     </message>
@@ -4652,32 +4745,32 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of &quot;100 
     <message>
         <location line="+1"/>
         <location line="+20"/>
-        <location line="+66"/>
+        <location line="+57"/>
         <source>To</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="-84"/>
-        <location line="+91"/>
+        <location line="-75"/>
+        <location line="+82"/>
         <source>own address</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="-89"/>
+        <location line="-80"/>
         <source>label</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
         <location line="+36"/>
         <location line="+12"/>
-        <location line="+48"/>
+        <location line="+39"/>
         <location line="+30"/>
         <location line="+60"/>
         <source>Credit</source>
         <translation type="unfinished"></translation>
     </message>
     <message numerus="yes">
-        <location line="-148"/>
+        <location line="-139"/>
         <source>matures in %n more block(s)</source>
         <translation>
             <numerusform>matures in %n more block</numerusform>
@@ -4690,7 +4783,7 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of &quot;100 
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+54"/>
+        <location line="+45"/>
         <location line="+26"/>
         <location line="+63"/>
         <source>Debit</source>
@@ -5196,7 +5289,7 @@ Go to File &gt; Open Wallet to load a wallet.
 <context>
     <name>WalletModel</name>
     <message>
-        <location filename="../walletmodel.cpp" line="+218"/>
+        <location filename="../walletmodel.cpp" line="+226"/>
         <location line="+13"/>
         <source>Send Coins</source>
         <translation type="unfinished">Send Coins</translation>
@@ -5333,22 +5426,22 @@ Go to File &gt; Open Wallet to load a wallet.
 <context>
     <name>bitcoin-core</name>
     <message>
-        <location filename="../bitcoinstrings.cpp" line="+206"/>
+        <location filename="../bitcoinstrings.cpp" line="+211"/>
         <source>The %s developers</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="-194"/>
+        <location line="-199"/>
         <source>%s failed to validate the -assumeutxo snapshot state. This indicates a hardware problem, or a bug in the software, or a bad software modification that allowed an invalid snapshot to be loaded. As a result of this, the node will shut down and stop using any state that was built on the snapshot, resetting the chain height from %d to %d. On the next restart, the node will resume syncing from %d without using any snapshot data. Please report this incident to %s, including how you obtained the snapshot. The invalid snapshot chainstate will be left on disk in case it is helpful in diagnosing the issue that caused this error.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
         <location line="+3"/>
-        <source>%s request to listen on port %u. This port is considered &quot;bad&quot; and thus it is unlikely that any peer will connect to it. See doc/p2p-bad-ports.md for details and a full list.</source>
+        <source>%s request to listen on port %u. This port is considered &quot;bad&quot; and thus it is unlikely that any peer will connect to it. See doc/reference/p2p-bad-ports.md for details and a full list.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+23"/>
+        <location line="+27"/>
         <source>Disk space for %s may not accommodate the block files. Approximately %u GB of data will be stored in this directory.</source>
         <translation type="unfinished"></translation>
     </message>
@@ -5383,12 +5476,7 @@ Go to File &gt; Open Wallet to load a wallet.
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+2"/>
-        <source>Error: Dumpfile version is not supported. This version of bitcoin-wallet only supports version 1 dumpfiles. Got dumpfile with version %s</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <location line="+16"/>
+        <location line="+18"/>
         <source>Error: Unable to produce descriptors for this legacy wallet. Make sure to provide the wallet&apos;s passphrase if it is encrypted.</source>
         <translation type="unfinished"></translation>
     </message>
@@ -5448,7 +5536,7 @@ Go to File &gt; Open Wallet to load a wallet.
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+22"/>
+        <location line="+23"/>
         <source>The block database contains a block which appears to be from the future. This may be due to your computer&apos;s date and time being set incorrectly. Only rebuild the block database if you are sure that your computer&apos;s date and time are correct</source>
         <translation type="unfinished"></translation>
     </message>
@@ -5508,17 +5596,17 @@ Go to File &gt; Open Wallet to load a wallet.
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+1"/>
+        <location line="+2"/>
         <source>Witness data for blocks after height %d requires validation. Please restart with -reindex.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+1"/>
+        <location line="+2"/>
         <source>You need to rebuild the database using -reindex to go back to unpruned mode.  This will redownload the entire blockchain</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="-253"/>
+        <location line="-260"/>
         <source>%s is set very high!</source>
         <translation type="unfinished"></translation>
     </message>
@@ -5528,7 +5616,7 @@ Go to File &gt; Open Wallet to load a wallet.
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+8"/>
+        <location line="+9"/>
         <source>Cannot obtain a lock on directory %s. %s is probably already running.</source>
         <translation type="unfinished"></translation>
     </message>
@@ -5548,17 +5636,17 @@ Go to File &gt; Open Wallet to load a wallet.
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="-14"/>
+        <location line="-15"/>
         <source>%s is set very high! Fees this large could be paid on a single transaction.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+11"/>
+        <location line="+12"/>
         <source>Cannot provide specific connections and have addrman find outgoing connections at the same time.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+23"/>
+        <location line="+26"/>
         <source>Error loading %s: External signer wallet being loaded without external signer support compiled</source>
         <translation type="unfinished"></translation>
     </message>
@@ -5640,11 +5728,6 @@ Go to File &gt; Open Wallet to load a wallet.
     </message>
     <message>
         <location line="+1"/>
-        <source>Options &apos;-datacarrier&apos; or &apos;-datacarriersize&apos; are set but are marked as deprecated. They will be removed in a future version.</source>
-        <translation type="unfinished"></translation>
-    </message>
-    <message>
-        <location line="+1"/>
         <source>Outbound connections restricted to CJDNS (-onlynet=cjdns) but -cjdnsreachable is not provided</source>
         <translation type="unfinished"></translation>
     </message>
@@ -5664,7 +5747,7 @@ Go to File &gt; Open Wallet to load a wallet.
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+6"/>
+        <location line="+7"/>
         <source>Prune: last wallet synchronisation goes beyond pruned data. You need to -reindex (download the whole blockchain again in case of a pruned node)</source>
         <translation type="unfinished"></translation>
     </message>
@@ -5674,7 +5757,7 @@ Go to File &gt; Open Wallet to load a wallet.
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+16"/>
+        <location line="+17"/>
         <source>Specified -blockmaxweight (%d) exceeds consensus maximum block weight (%d)</source>
         <translation type="unfinished"></translation>
     </message>
@@ -5722,7 +5805,7 @@ The wallet might have been tampered with or created with malicious intent.
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+22"/>
+        <location line="+24"/>
         <source>Your computer&apos;s date and time appear to be more than %d minutes out of sync with the network, this may lead to consensus failure. After you&apos;ve confirmed your computer&apos;s clock, this message should no longer appear when you restart your node. Without a restart, it should stop showing automatically after you&apos;ve connected to a sufficient number of new outbound peers, which may take some time. You can inspect the `timeoffset` field of the `getpeerinfo` and `getnetworkinfo` RPC methods to get more info.</source>
         <translation type="unfinished"></translation>
     </message>
@@ -5749,8 +5832,13 @@ Unable to restore backup of wallet.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="-255"/>
+        <location line="-262"/>
         <source>-paytxfee is deprecated and will be fully removed in v31.0.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>A %zu MiB dbcache may be too large for a system memory of only %zu MiB.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
@@ -5785,6 +5873,21 @@ Unable to restore backup of wallet.</source>
     </message>
     <message>
         <location line="+6"/>
+        <source>Cannot use -reindex on a node that has pruned witness data. Witness-pruned block index flags would be lost, causing data corruption. Use -reindex-chainstate instead, or delete the data directory and perform a fresh sync.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Cannot use -reindex-chainstate on a witness-pruned node without -assumevalid=&lt;hash&gt;. Without an assumed-valid checkpoint, historical script validation requires witness data that has been stripped. Pass -assumevalid=&lt;block hash&gt; to skip historical script validation, or delete the data directory and perform a fresh sync.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Cannot use -txindex on a node that has pruned witness data. Delete the data directory and perform a fresh archive sync, or restart without -txindex.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+1"/>
         <source>Cannot write to directory &apos;%s&apos;; check permissions.</source>
         <translation type="unfinished"></translation>
     </message>
@@ -5934,7 +6037,12 @@ Unable to restore backup of wallet.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+6"/>
+        <location line="+4"/>
+        <source>Error: Dumpfile version is not supported. This version of qbit-wallet only supports version 1 dumpfiles. Got dumpfile with version %s</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+2"/>
         <source>Error: Failed to create new watchonly wallet</source>
         <translation type="unfinished"></translation>
     </message>
@@ -6254,7 +6362,12 @@ Unable to restore backup of wallet.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+9"/>
+        <location line="+7"/>
+        <source>P2MR wallet outputs are unavailable before activation height %d (current wallet height: %d)</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+2"/>
         <source>Prune cannot be configured with a negative value.</source>
         <translation type="unfinished"></translation>
     </message>
@@ -6326,6 +6439,11 @@ Unable to restore backup of wallet.</source>
     <message>
         <location line="+1"/>
         <source>Signing transaction failed</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+1"/>
+        <source>Skipping implicit onion bind on %s because it conflicts with an RPC bind on the same endpoint.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
@@ -6534,17 +6652,27 @@ Unable to restore backup of wallet.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+9"/>
+        <location line="+4"/>
+        <source>Witness compaction handoff failed. Will retry on restart.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+2"/>
+        <source>Witness pruning is incompatible with -txindex. Disable -prunewitnesses to keep txindex-backed full transaction history.</source>
+        <translation type="unfinished"></translation>
+    </message>
+    <message>
+        <location line="+5"/>
         <source>acceptstalefeeestimates is not supported on %s chain.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="-13"/>
+        <location line="-15"/>
         <source>Unsupported logging category %s=%s.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="-206"/>
+        <location line="-207"/>
         <source>Error loading %s: Wallet is a legacy wallet. Please migrate to a descriptor wallet using the migration tool (migratewallet RPC).</source>
         <translation type="unfinished"></translation>
     </message>
@@ -6559,7 +6687,7 @@ Unable to restore backup of wallet.</source>
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+131"/>
+        <location line="+132"/>
         <source>Transaction requires one destination of non-zero value, a non-zero feerate, or a pre-selected input</source>
         <translation type="unfinished"></translation>
     </message>
@@ -6573,7 +6701,7 @@ Please try running the latest software version.
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="-211"/>
+        <location line="-212"/>
         <source>Do you want to rebuild the databases now?</source>
         <translation type="unfinished"></translation>
     </message>
@@ -6613,7 +6741,7 @@ Please try running the latest software version.
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="+94"/>
+        <location line="+95"/>
         <source>Unrecognized network in -proxy=&apos;%s&apos;: &apos;%s&apos;</source>
         <translation type="unfinished"></translation>
     </message>
@@ -6638,7 +6766,7 @@ Please try running the latest software version.
         <translation type="unfinished"></translation>
     </message>
     <message>
-        <location line="-74"/>
+        <location line="-75"/>
         <source>Settings file could not be read</source>
         <translation type="unfinished"></translation>
     </message>

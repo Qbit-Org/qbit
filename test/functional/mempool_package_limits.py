@@ -10,6 +10,8 @@ from test_framework.util import (
 )
 from test_framework.wallet import MiniWallet
 
+DEFAULT_ANCESTOR_DESCENDANT_SIZE_LIMIT_VBYTES = 404_000
+
 # Decorator to
 # 1) check that mempool is empty at the start of a subtest
 # 2) run the subtest, which may submit some transaction(s) to the mempool and
@@ -271,7 +273,7 @@ class MempoolPackageLimitsTest(BitcoinTestFramework):
     @check_package_limits
     def test_anc_size_limits(self):
         """Test Case with 2 independent transactions in the mempool and a parent + child in the
-        package, where the package parent is the child of both mempool transactions (30KvB each):
+        package, where the package parent is the child of both mempool transactions:
               A     B
                ^   ^
                  C
@@ -282,7 +284,7 @@ class MempoolPackageLimitsTest(BitcoinTestFramework):
         """
         node = self.nodes[0]
         parent_utxos = []
-        target_vsize = 30_000
+        target_vsize = DEFAULT_ANCESTOR_DESCENDANT_SIZE_LIMIT_VBYTES // 4 + 10_000
         high_fee = 10 * target_vsize  # 10 sats/vB
         self.log.info("Check that in-mempool and in-package ancestor size limits are calculated properly in packages")
         # Mempool transactions A and B
@@ -302,7 +304,7 @@ class MempoolPackageLimitsTest(BitcoinTestFramework):
 
     @check_package_limits
     def test_desc_size_limits(self):
-        """Create 3 mempool transactions and 2 package transactions (21KvB each):
+        """Create 3 mempool transactions and 2 package transactions:
               Ma
              ^ ^
             Mb  Mc
@@ -312,7 +314,7 @@ class MempoolPackageLimitsTest(BitcoinTestFramework):
         and in-package descendants are all considered together.
         """
         node = self.nodes[0]
-        target_vsize = 21_000
+        target_vsize = DEFAULT_ANCESTOR_DESCENDANT_SIZE_LIMIT_VBYTES // 5 + 2_000
         high_fee = 10 * target_vsize  # 10 sats/vB
         self.log.info("Check that in-mempool and in-package descendant sizes are calculated properly in packages")
         # Top parent in mempool, Ma

@@ -3,8 +3,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_NET_H
-#define BITCOIN_NET_H
+#ifndef QBIT_NET_H
+#define QBIT_NET_H
 
 #include <bip324.h>
 #include <chainparams.h>
@@ -100,6 +100,7 @@ typedef int64_t NodeId;
 struct AddedNodeParams {
     std::string m_added_node;
     bool m_use_v2transport;
+    bool m_require_archive{false};
 };
 
 struct AddedNodeInfo {
@@ -107,6 +108,7 @@ struct AddedNodeInfo {
     CService resolvedAddress;
     bool fConnected;
     bool fInbound;
+    std::optional<NodeId> nodeid;
 };
 
 class CNodeStats;
@@ -218,6 +220,7 @@ public:
     Network m_network;
     uint32_t m_mapped_as;
     ConnectionType m_conn_type;
+    bool m_is_archive_connection;
     /** Transport protocol type. */
     TransportProtocolType m_transport_type;
     /** BIP324 session id string in hex, if any. */
@@ -668,6 +671,7 @@ struct CNodeOptions
     bool prefer_evict = false;
     size_t recv_flood_size{DEFAULT_MAXRECEIVEBUFFER * 1000};
     bool use_v2transport = false;
+    bool is_archive_connection = false;
 };
 
 /** Information about a peer */
@@ -739,6 +743,7 @@ public:
     std::atomic_bool fPauseSend{false};
 
     const ConnectionType m_conn_type;
+    const bool m_is_archive_connection{false};
 
     /** Move all messages from the received queue to the processing queue. */
     void MarkReceivedMsgsForProcessing()
@@ -1024,6 +1029,9 @@ public:
      */
     virtual bool HasAllDesirableServiceFlags(ServiceFlags services) const = 0;
 
+    /** Callback to determine whether the given service flags are explicitly unsuitable. */
+    virtual bool HasUndesirableServiceFlags(ServiceFlags services) const = 0;
+
     /**
     * Process protocol messages received from a given node
     *
@@ -1076,7 +1084,7 @@ public:
         bool bind_on_any;
         bool m_use_addrman_outgoing = true;
         std::vector<std::string> m_specified_outgoing;
-        std::vector<std::string> m_added_nodes;
+        std::vector<AddedNodeParams> m_added_nodes;
         bool m_i2p_accept_incoming;
         bool whitelist_forcerelay = DEFAULT_WHITELISTFORCERELAY;
         bool whitelist_relay = DEFAULT_WHITELISTRELAY;
@@ -1086,7 +1094,9 @@ public:
     {
         AssertLockNotHeld(m_total_bytes_sent_mutex);
 
-        m_local_services = connOptions.m_local_services;
+        // Preserve service bits that may have been toggled before Start(),
+        // such as flags added or withdrawn during chainstate loading.
+        m_local_services = ServiceFlags((m_local_services | connOptions.m_local_services) & ~m_removed_local_services);
         m_max_automatic_connections = connOptions.m_max_automatic_connections;
         m_max_outbound_full_relay = std::min(MAX_OUTBOUND_FULL_RELAY_CONNECTIONS, m_max_automatic_connections);
         m_max_outbound_block_relay = std::min(MAX_BLOCK_RELAY_ONLY_CONNECTIONS, m_max_automatic_connections - m_max_outbound_full_relay);
@@ -1107,12 +1117,7 @@ public:
         vWhitelistedRangeOutgoing = connOptions.vWhitelistedRangeOutgoing;
         {
             LOCK(m_added_nodes_mutex);
-            // Attempt v2 connection if we support v2 - we'll reconnect with v1 if our
-            // peer doesn't support it or immediately disconnects us for another reason.
-            const bool use_v2transport(GetLocalServices() & NODE_P2P_V2);
-            for (const std::string& added_node : connOptions.m_added_nodes) {
-                m_added_node_params.push_back({added_node, use_v2transport});
-            }
+            m_added_node_params = connOptions.m_added_nodes;
         }
         m_onion_binds = connOptions.onion_binds;
         whitelist_forcerelay = connOptions.whitelist_forcerelay;
@@ -1138,7 +1143,7 @@ public:
     bool GetNetworkActive() const { return fNetworkActive; };
     bool GetUseAddrmanOutgoing() const { return m_use_addrman_outgoing; };
     void SetNetworkActive(bool active);
-    void OpenNetworkConnection(const CAddress& addrConnect, bool fCountFailure, CountingSemaphoreGrant<>&& grant_outbound, const char* strDest, ConnectionType conn_type, bool use_v2transport) EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex);
+    void OpenNetworkConnection(const CAddress& addrConnect, bool fCountFailure, CountingSemaphoreGrant<>&& grant_outbound, const char* strDest, ConnectionType conn_type, bool use_v2transport, bool is_archive_connection = false) EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex);
     bool CheckIncomingNonce(uint64_t nonce);
     void ASMapHealthCheck();
 
@@ -1255,8 +1260,16 @@ public:
 
     //! Updates the local services that this node advertises to other peers
     //! during connection handshake.
-    void AddLocalServices(ServiceFlags services) { m_local_services = ServiceFlags(m_local_services | services); };
-    void RemoveLocalServices(ServiceFlags services) { m_local_services = ServiceFlags(m_local_services & ~services); }
+    void AddLocalServices(ServiceFlags services)
+    {
+        m_removed_local_services = ServiceFlags(m_removed_local_services & ~services);
+        m_local_services = ServiceFlags(m_local_services | services);
+    };
+    void RemoveLocalServices(ServiceFlags services)
+    {
+        m_removed_local_services = ServiceFlags(m_removed_local_services | services);
+        m_local_services = ServiceFlags(m_local_services & ~services);
+    }
 
     uint64_t GetMaxOutboundTarget() const EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex);
     std::chrono::seconds GetMaxOutboundTimeframe() const;
@@ -1376,7 +1389,7 @@ private:
     bool AlreadyConnectedToAddress(const CAddress& addr);
 
     bool AttemptToEvictConnection();
-    CNode* ConnectNode(CAddress addrConnect, const char *pszDest, bool fCountFailure, ConnectionType conn_type, bool use_v2transport) EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex);
+    CNode* ConnectNode(CAddress addrConnect, const char *pszDest, bool fCountFailure, ConnectionType conn_type, bool use_v2transport, bool is_archive_connection = false) EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex);
     void AddWhitelistPermissionFlags(NetPermissionFlags& flags, std::optional<CNetAddr> addr, const std::vector<NetWhitelistPermissions>& ranges) const;
 
     void DeleteNode(CNode* pnode);
@@ -1503,6 +1516,7 @@ private:
      * \sa Peer::our_services
      */
     std::atomic<ServiceFlags> m_local_services;
+    std::atomic<ServiceFlags> m_removed_local_services{NODE_NONE};
 
     std::unique_ptr<std::counting_semaphore<>> semOutbound;
     std::unique_ptr<std::counting_semaphore<>> semAddnode;
@@ -1631,6 +1645,7 @@ private:
         std::string destination;
         ConnectionType conn_type;
         bool use_v2transport;
+        bool is_archive_connection;
     };
 
     /**
@@ -1696,4 +1711,4 @@ extern std::function<void(const CAddress& addr,
                           bool is_incoming)>
     CaptureMessage;
 
-#endif // BITCOIN_NET_H
+#endif // QBIT_NET_H

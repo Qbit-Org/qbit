@@ -13,14 +13,162 @@
 #include <primitives/transaction.h>
 #include <rpc/request.h>
 #include <rpc/util.h>
+#include <script/descriptor.h>
 #include <script/sign.h>
 #include <script/signingprovider.h>
+#include <script/solver.h>
 #include <tinyformat.h>
 #include <univalue.h>
 #include <util/rbf.h>
 #include <util/string.h>
 #include <util/strencodings.h>
 #include <util/translation.h>
+
+#include <string_view>
+
+namespace {
+
+constexpr std::string_view PQC_KEY_PREFIX{"pqc("};
+constexpr std::string_view DUMMY_P2MR_DESCRIPTOR_PREFIX{"mr(pk("};
+constexpr std::string_view DUMMY_P2MR_DESCRIPTOR_SUFFIX{"))"};
+
+bool IsExplicitPQCKey(const std::string& key, std::string_view& payload)
+{
+    if (key.size() <= PQC_KEY_PREFIX.size() || !key.starts_with(PQC_KEY_PREFIX) || key.back() != ')') {
+        return false;
+    }
+    payload = std::string_view{key}.substr(PQC_KEY_PREFIX.size(), key.size() - PQC_KEY_PREFIX.size() - 1);
+    return true;
+}
+
+bool ParseExplicitPQCSecret(std::string_view payload, FlatSigningProvider& keystore)
+{
+    const std::string payload_str{payload};
+    if (!IsHex(payload_str)) return false;
+
+    const std::vector<unsigned char> key_bytes{ParseHex(payload_str)};
+    if (key_bytes.size() != CPQCKey::SIZE) return false;
+
+    CPQCKey key;
+    key.Set(key_bytes.data(), key_bytes.data() + key_bytes.size());
+    if (!key.IsValid()) return false;
+
+    const CPQCPubKey pubkey = key.GetPubKey();
+    if (!pubkey.IsValid()) return false;
+
+    keystore.pqc_keys.emplace(pubkey, key);
+    keystore.pqc_sig_counters.try_emplace(pubkey, 0);
+    return true;
+}
+
+bool ParseDescriptorPQCPrivateKey(const std::string& key, FlatSigningProvider& keystore)
+{
+    FlatSigningProvider parse_keys;
+    std::string error;
+    const std::string descriptor = std::string{DUMMY_P2MR_DESCRIPTOR_PREFIX} + key + std::string{DUMMY_P2MR_DESCRIPTOR_SUFFIX};
+    auto parsed = Parse(descriptor, parse_keys, error, /*require_checksum=*/false);
+    if (parsed.size() != 1 || parsed.front()->IsRange()) return false;
+
+    FlatSigningProvider expanded_keys;
+    parsed.front()->ExpandPrivate(/*pos=*/0, parse_keys, expanded_keys);
+    if (expanded_keys.pqc_keys.empty()) return false;
+
+    keystore.pqc_keys.insert(expanded_keys.pqc_keys.begin(), expanded_keys.pqc_keys.end());
+    for (const auto& [pubkey, counter] : expanded_keys.pqc_sig_counters) {
+        auto [it, inserted] = keystore.pqc_sig_counters.emplace(pubkey, counter);
+        if (!inserted && counter > it->second) {
+            it->second = counter;
+        }
+    }
+    return true;
+}
+
+std::optional<WitnessV2P2MR> ExtractP2MROutput(const CScript& script_pub_key)
+{
+    std::vector<std::vector<unsigned char>> solutions;
+    if (Solver(script_pub_key, solutions) != TxoutType::WITNESS_V2_P2MR || solutions.size() != 1) return std::nullopt;
+    return WitnessV2P2MR{std::span<const unsigned char>{solutions[0].data(), solutions[0].size()}};
+}
+
+void ParseP2MRPrevout(const UniValue& prev_out, const WitnessV2P2MR& output, FlatSigningProvider& keystore)
+{
+    RPCTypeCheckObj(prev_out,
+        {
+            {"p2mrScript", UniValueType(UniValue::VSTR)},
+            {"p2mrControlBlock", UniValueType(UniValue::VSTR)},
+            {"p2mrLeafVersion", UniValueType(UniValue::VNUM)},
+        }, true);
+
+    const UniValue& script_uv{prev_out.find_value("p2mrScript")};
+    const UniValue& control_uv{prev_out.find_value("p2mrControlBlock")};
+    if (script_uv.isNull() && control_uv.isNull()) return;
+    if (script_uv.isNull() || control_uv.isNull()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Missing p2mrScript/p2mrControlBlock");
+    }
+
+    const std::vector<unsigned char> script_bytes{ParseHexV(script_uv, "p2mrScript")};
+    const std::vector<unsigned char> control_block{ParseHexV(control_uv, "p2mrControlBlock")};
+    if (control_block.size() < P2MR_CONTROL_BASE_SIZE || control_block.size() > P2MR_CONTROL_MAX_SIZE ||
+        ((control_block.size() - P2MR_CONTROL_BASE_SIZE) % P2MR_CONTROL_NODE_SIZE) != 0) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid P2MR control block size");
+    }
+    if ((control_block.front() & 1) == 0) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "P2MR control byte bit 0 must be set");
+    }
+
+    const int leaf_version = prev_out.exists("p2mrLeafVersion") ? prev_out.find_value("p2mrLeafVersion").getInt<int>() : (control_block.front() & TAPROOT_LEAF_MASK);
+    if (leaf_version < 0 || leaf_version > 0xff) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "p2mrLeafVersion out of range");
+    }
+    if ((control_block.front() & TAPROOT_LEAF_MASK) != leaf_version) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "p2mrLeafVersion does not match p2mrControlBlock");
+    }
+
+    const uint256 leaf_hash = ComputeP2MRLeafHash(static_cast<uint8_t>(leaf_version), script_bytes);
+    if (ComputeP2MRMerkleRoot(control_block, leaf_hash) != output.GetMerkleRoot()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "p2mrScript/p2mrControlBlock does not match scriptPubKey");
+    }
+
+    P2MRSpendData& spenddata = keystore.p2mr_spenddata[output];
+    spenddata.merkle_root = output.GetMerkleRoot();
+    spenddata.scripts[{script_bytes, leaf_version}].insert(control_block);
+}
+
+} // namespace
+
+bool ParseRawTransactionKey(const std::string& key, FlatSigningProvider& keystore, std::string& error)
+{
+    std::string_view pqc_payload;
+    if (IsExplicitPQCKey(key, pqc_payload)) {
+        if (ParseExplicitPQCSecret(pqc_payload, keystore) || ParseDescriptorPQCPrivateKey(key, keystore)) {
+            return true;
+        }
+        error = "Invalid PQC private key";
+        return false;
+    }
+
+    if (IsP2MROnlyOutputChain()) {
+        error = "Legacy WIF private keys are disabled on this chain; use pqc(KEY) expressions";
+        return false;
+    }
+
+    CKey decoded = DecodeSecret(key);
+    if (!decoded.IsValid()) {
+        error = "Invalid private key";
+        return false;
+    }
+
+    const CPubKey pubkey = decoded.GetPubKey();
+    const CKeyID key_id = pubkey.GetID();
+    keystore.pubkeys.emplace(key_id, pubkey);
+    keystore.keys.emplace(key_id, decoded);
+    return true;
+}
+
+std::optional<int> NormalizeActiveHeight(int active_height)
+{
+    return active_height >= 0 ? std::optional<int>{active_height} : std::nullopt;
+}
 
 void AddInputs(CMutableTransaction& rawTx, const UniValue& inputs_in, std::optional<bool> rbf)
 {
@@ -118,7 +266,7 @@ std::vector<std::pair<CTxDestination, CAmount>> ParseOutputs(const UniValue& out
             CTxDestination destination{DecodeDestination(name_)};
             CAmount amount{AmountFromValue(outputs[name_])};
             if (!IsValidDestination(destination)) {
-                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, std::string("Invalid Bitcoin address: ") + name_);
+                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, std::string("Invalid qbit address: ") + name_);
             }
 
             if (!destinations.insert(destination).second) {
@@ -187,7 +335,7 @@ static void TxInErrorToJSON(const CTxIn& txin, UniValue& vErrorsRet, const std::
     vErrorsRet.push_back(std::move(entry));
 }
 
-void ParsePrevouts(const UniValue& prevTxsUnival, FlatSigningProvider* keystore, std::map<COutPoint, Coin>& coins)
+void ParsePrevouts(const UniValue& prevTxsUnival, FlatSigningProvider* keystore, std::map<COutPoint, Coin>& coins, std::optional<int> active_height)
 {
     if (!prevTxsUnival.isNull()) {
         const UniValue& prevTxs = prevTxsUnival.get_array();
@@ -216,6 +364,18 @@ void ParsePrevouts(const UniValue& prevTxsUnival, FlatSigningProvider* keystore,
             COutPoint out(txid, nOut);
             std::vector<unsigned char> pkData(ParseHexO(prevOut, "scriptPubKey"));
             CScript scriptPubKey(pkData.begin(), pkData.end());
+            if (IsP2MROnlyOutputChain()) {
+                CTxDestination dest;
+                if (!ExtractDestination(scriptPubKey, dest)) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "Only restricted-output-mode prevout scriptPubKeys are supported on this chain");
+                }
+                const bool output_type_allowed = active_height.has_value() ?
+                    IsDestinationOutputTypeAllowedAtHeight(dest, *active_height) :
+                    IsDestinationOutputTypeAllowed(dest);
+                if (!output_type_allowed) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "Only restricted-output-mode prevout scriptPubKeys are supported on this chain");
+                }
+            }
 
             {
                 auto coin = coins.find(out);
@@ -238,6 +398,7 @@ void ParsePrevouts(const UniValue& prevTxsUnival, FlatSigningProvider* keystore,
             // if redeemScript and private keys were given, add redeemScript to the keystore so it can be signed
             const bool is_p2sh = scriptPubKey.IsPayToScriptHash();
             const bool is_p2wsh = scriptPubKey.IsPayToWitnessScriptHash();
+            const auto p2mr_output = ExtractP2MROutput(scriptPubKey);
             if (keystore && (is_p2sh || is_p2wsh)) {
                 RPCTypeCheckObj(prevOut,
                     {
@@ -303,6 +464,15 @@ void ParsePrevouts(const UniValue& prevTxsUnival, FlatSigningProvider* keystore,
                         throw JSONRPCError(RPC_INVALID_PARAMETER, "redeemScript/witnessScript does not match scriptPubKey");
                     }
                 }
+            }
+
+            if (keystore && !p2mr_output.has_value() &&
+                (prevOut.exists("p2mrScript") || prevOut.exists("p2mrControlBlock") || prevOut.exists("p2mrLeafVersion"))) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "p2mrScript/p2mrControlBlock require a P2MR scriptPubKey");
+            }
+
+            if (keystore && p2mr_output.has_value()) {
+                ParseP2MRPrevout(prevOut, *p2mr_output, *keystore);
             }
         }
     }

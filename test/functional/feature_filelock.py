@@ -8,8 +8,8 @@ import string
 
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.test_node import (
-    BITCOIN_PID_FILENAME_DEFAULT,
     ErrorMatch,
+    QBIT_PID_FILENAME_DEFAULT,
 )
 
 class FilelockTest(BitcoinTestFramework):
@@ -40,7 +40,7 @@ class FilelockTest(BitcoinTestFramework):
         self.log.info("Check that cookie and PID file are not deleted when attempting to start a second bitcoind using the same datadir/blocksdir")
         cookie_file = datadir / ".cookie"
         assert cookie_file.exists()  # should not be deleted during the second bitcoind instance shutdown
-        pid_file = datadir / BITCOIN_PID_FILENAME_DEFAULT
+        pid_file = datadir / QBIT_PID_FILENAME_DEFAULT
         assert pid_file.exists()
 
         if self.is_wallet_compiled():

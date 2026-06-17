@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_COMMON_URL_H
-#define BITCOIN_COMMON_URL_H
+#ifndef QBIT_COMMON_URL_H
+#define QBIT_COMMON_URL_H
 
 #include <string>
 #include <string_view>
@@ -14,4 +14,4 @@
  */
 std::string UrlDecode(std::string_view url_encoded);
 
-#endif // BITCOIN_COMMON_URL_H
+#endif // QBIT_COMMON_URL_H

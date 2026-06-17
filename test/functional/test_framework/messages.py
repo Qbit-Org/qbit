@@ -32,14 +32,14 @@ from test_framework.crypto.siphash import siphash256
 from test_framework.util import assert_equal
 
 MAX_LOCATOR_SZ = 101
-MAX_BLOCK_WEIGHT = 4000000
-DEFAULT_BLOCK_RESERVED_WEIGHT = 8000
-MINIMUM_BLOCK_RESERVED_WEIGHT = 2000
+MAX_BLOCK_WEIGHT = 2000000
+DEFAULT_BLOCK_RESERVED_WEIGHT = 4000
+MINIMUM_BLOCK_RESERVED_WEIGHT = 1000
 MAX_BLOOM_FILTER_SIZE = 36000
 MAX_BLOOM_HASH_FUNCS = 50
 
-COIN = 100000000  # 1 btc in satoshis
-MAX_MONEY = 21000000 * COIN
+COIN = 100000000  # 1 QBT in satoshis
+MAX_MONEY = 210000000 * COIN
 
 MAX_BIP125_RBF_SEQUENCE = 0xfffffffd  # Sequence number that is rbf-opt-in (BIP 125) and csv-opt-out (BIP 68)
 MAX_SEQUENCE_NONFINAL = 0xfffffffe  # Sequence number that is csv-opt-out (BIP 68)
@@ -56,6 +56,8 @@ NODE_WITNESS = (1 << 3)
 NODE_COMPACT_FILTERS = (1 << 6)
 NODE_NETWORK_LIMITED = (1 << 10)
 NODE_P2P_V2 = (1 << 11)
+NODE_WITNESS_PRUNED = (1 << 12)
+NODE_ARCHIVE = (1 << 13)
 
 MSG_TX = 1
 MSG_BLOCK = 2
@@ -65,17 +67,18 @@ MSG_WTX = 5
 MSG_WITNESS_FLAG = 1 << 30
 MSG_TYPE_MASK = 0xffffffff >> 2
 MSG_WITNESS_TX = MSG_TX | MSG_WITNESS_FLAG
+MSG_WITNESS_BLOCK = MSG_BLOCK | MSG_WITNESS_FLAG
 
 FILTER_TYPE_BASIC = 0
 
-WITNESS_SCALE_FACTOR = 4
+WITNESS_SCALE_FACTOR = 1
 
 DEFAULT_ANCESTOR_LIMIT = 25    # default max number of in-mempool ancestors
 DEFAULT_DESCENDANT_LIMIT = 25  # default max number of in-mempool descendants
 
 
 # Default setting for -datacarriersize.
-MAX_OP_RETURN_RELAY = 100_000
+MAX_OP_RETURN_RELAY = 200_000
 
 
 DEFAULT_MEMPOOL_EXPIRY_HOURS = 336  # hours
@@ -84,10 +87,10 @@ TX_MIN_STANDARD_VERSION = 1
 TX_MAX_STANDARD_VERSION = 3
 
 MAGIC_BYTES = {
-    "mainnet": b"\xf9\xbe\xb4\xd9",
-    "testnet4": b"\x1c\x16\x3f\x28",
-    "regtest": b"\xfa\xbf\xb5\xda",
-    "signet": b"\x0a\x03\xcf\x40",
+    "mainnet": b"\x44\x4f\x24\xa8",
+    "testnet4": b"\xc7\xc4\x16\x40",
+    "regtest": b"\xa6\x6b\x1f\xda",
+    "signet": b"\x23\x50\x8a\x26",
 }
 
 def sha256(s):
@@ -687,7 +690,7 @@ class CTransaction:
 
     def is_valid(self):
         for tout in self.vout:
-            if tout.nValue < 0 or tout.nValue > 21000000 * COIN:
+            if tout.nValue < 0 or tout.nValue > MAX_MONEY:
                 return False
         return True
 
@@ -1907,6 +1910,9 @@ class msg_sendtxrcncl:
             (self.version, self.salt)
 
 class TestFrameworkScript(unittest.TestCase):
+    def test_qbit_testnet4_magic_bytes(self):
+        self.assertEqual(MAGIC_BYTES["testnet4"], b"\xc7\xc4\x16\x40")
+
     def test_addrv2_encode_decode(self):
         def check_addrv2(ip, net):
             addr = CAddress()

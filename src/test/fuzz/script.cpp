@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <chainparams.h>
+#include <common/args.h>
 #include <compressor.h>
 #include <core_io.h>
 #include <core_memusage.h>
@@ -33,6 +34,7 @@
 
 void initialize_script()
 {
+    gArgs.ForceSetArg("-p2mronly", "0");
     SelectParams(ChainType::REGTEST);
 }
 

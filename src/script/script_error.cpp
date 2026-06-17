@@ -111,6 +111,22 @@ std::string ScriptErrorString(const ScriptError serror)
             return "OP_CHECKMULTISIG(VERIFY) is not available in tapscript";
         case SCRIPT_ERR_TAPSCRIPT_MINIMALIF:
             return "OP_IF/NOTIF argument must be minimal in tapscript";
+        case SCRIPT_ERR_P2MR_WRONG_CONTROL_SIZE:
+            return "Invalid P2MR control block size";
+        case SCRIPT_ERR_P2MR_CONTROL_BIT0:
+            return "P2MR control byte bit 0 must be set";
+        case SCRIPT_ERR_P2MR_VALIDATION_WEIGHT:
+            return "Too much signature validation relative to witness weight";
+        case SCRIPT_ERR_P2MR_SIG_SIZE:
+            return "Invalid PQC signature size";
+        case SCRIPT_ERR_P2MR_SIG:
+            return "PQC signature verification failed";
+        case SCRIPT_ERR_P2MR_SIG_HASHTYPE:
+            return "Invalid PQC signature hash type";
+        case SCRIPT_ERR_P2MR_CHECKSIG:
+            return "OP_CHECKSIG(VERIFY) is not available in P2MR";
+        case SCRIPT_ERR_TEMPLATE_MISMATCH:
+            return "Transaction template hash does not match";
         case SCRIPT_ERR_OP_CODESEPARATOR:
             return "Using OP_CODESEPARATOR in non-witness script";
         case SCRIPT_ERR_SIG_FINDANDDELETE:

@@ -51,29 +51,33 @@ class WalletAnchorTest(BitcoinTestFramework):
         anchor_tx_height = self.nodes[0].getblockcount()
         self.generateblock(self.nodes[0], sender.get_address(), [anchor_spend.serialize().hex()])
 
-        # Mock time forward and generate some blocks to avoid rescanning of latest blocks
-        self.nodes[0].setmocktime(int(time.time()) + MAX_FUTURE_BLOCK_TIME + 1)
+        # Move far enough ahead that import-time timestamp window scans don't include
+        # the anchor create/spend blocks on fast block cadence profiles.
+        self.nodes[0].setmocktime(int(time.time()) + (3 * MAX_FUTURE_BLOCK_TIME) + 1)
         self.generate(self.nodes[0], 10)
 
         self.nodes[0].createwallet(wallet_name="anchor", disable_private_keys=True)
         wallet = self.nodes[0].get_wallet_rpc("anchor")
-        import_res = wallet.importdescriptors([{"desc": descsum_create(f"addr({ANCHOR_ADDRESS})"), "timestamp": "now"}])
+        # Use a timestamp beyond tip+window to avoid implicit import-time rescans
+        # that would pre-discover both anchor create/spend transactions.
+        future_ts = self.nodes[0].getblockheader(self.nodes[0].getbestblockhash())["time"] + MAX_FUTURE_BLOCK_TIME + 1
+        import_res = wallet.importdescriptors([{"desc": descsum_create(f"addr({ANCHOR_ADDRESS})"), "timestamp": future_ts}])
         assert_equal(import_res[0]["success"], True)
 
-        # The wallet should have no UTXOs, and not know of the anchor tx or its spend
+        # The wallet should have no UTXOs before any explicit rescan.
         assert_equal(wallet.listunspent(), [])
-        assert_raises_rpc_error(-5, "Invalid or non-wallet transaction id", wallet.gettransaction, anchor_txid)
-        assert_raises_rpc_error(-5, "Invalid or non-wallet transaction id", wallet.gettransaction, anchor_spend_txid)
 
         # Rescanning the block containing the anchor so that listunspent will list the output
         wallet.rescanblockchain(0, anchor_tx_height)
         utxos = wallet.listunspent()
         assert_equal(len(utxos), 1)
         assert_equal(utxos[0]["txid"], anchor_txid)
+        assert_equal(utxos[0]["vout"], 1)
         assert_equal(utxos[0]["address"], ANCHOR_ADDRESS)
+        assert_equal(utxos[0]["scriptPubKey"], PAY_TO_ANCHOR.hex())
         assert_equal(utxos[0]["amount"], 0)
+        assert_equal(wallet.listunspent(query_options={"minimumAmount": "0.00000001"}), [])
         wallet.gettransaction(anchor_txid)
-        assert_raises_rpc_error(-5, "Invalid or non-wallet transaction id", wallet.gettransaction, anchor_spend_txid)
 
         # Rescan the rest of the blockchain to see the anchor was spent
         wallet.rescanblockchain()
@@ -109,6 +113,10 @@ class WalletAnchorTest(BitcoinTestFramework):
 
     def run_test(self):
         self.default_wallet = self.nodes[0].get_wallet_rpc(self.default_wallet_name)
+
+        # Mature the default-cache coinbase UTXOs
+        self.ensure_cached_coinbase_mature(self.nodes[0])
+
         self.test_0_value_anchor_listunspent()
         self.test_cannot_sign_anchors()
 

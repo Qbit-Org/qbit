@@ -6,8 +6,12 @@
 #include <chainparams.h>
 #include <consensus/params.h>
 #include <headerssync.h>
+#include <net.h>
 #include <pow.h>
+#include <primitives/pureheader.h>
+#include <serialize.h>
 #include <test/util/setup_common.h>
+#include <util/chaintype.h>
 #include <validation.h>
 #include <vector>
 
@@ -24,6 +28,13 @@ struct HeadersGeneratorSetup : public RegTestingSetup {
     void GenerateHeaders(std::vector<CBlockHeader>& headers, size_t count,
             const uint256& starting_hash, const int nVersion, int prev_time,
             const uint256& merkle_root, const uint32_t nBits);
+
+    CBlockHeader MakeHeader(const uint256& prev_hash, int32_t version, uint32_t n_time, uint32_t n_bits);
+    arith_uint256 ClaimedWork(const CBlockIndex& chain_start, const std::vector<CBlockHeader>& headers);
+    void FinalizeIndex(CBlockIndex& index, const uint256& hash, CBlockIndex* pprev, int height, uint64_t auxpow_count, arith_uint256 chain_work);
+    void AssertHeadersSyncAccepts(const Consensus::Params& consensus, const CBlockIndex& chain_start, const std::vector<CBlockHeader>& headers);
+    void AssertHeadersSyncRejects(const Consensus::Params& consensus, const CBlockIndex& chain_start, const std::vector<CBlockHeader>& headers);
+    std::shared_ptr<const CAuxPow> MakeAuxpowPayloadWithScriptSigSize(size_t script_sig_size);
 };
 
 void HeadersGeneratorSetup::FindProofOfWork(CBlockHeader& starting_header)
@@ -53,6 +64,74 @@ void HeadersGeneratorSetup::GenerateHeaders(std::vector<CBlockHeader>& headers,
         prev_time = next_header.nTime;
     }
     return;
+}
+
+CBlockHeader HeadersGeneratorSetup::MakeHeader(const uint256& prev_hash, const int32_t version, const uint32_t n_time, const uint32_t n_bits)
+{
+    CBlockHeader header;
+    header.nVersion = version;
+    header.hashPrevBlock = prev_hash;
+    header.nTime = n_time;
+    header.nBits = n_bits;
+    return header;
+}
+
+arith_uint256 HeadersGeneratorSetup::ClaimedWork(const CBlockIndex& chain_start, const std::vector<CBlockHeader>& headers)
+{
+    arith_uint256 work{chain_start.nChainWork};
+    for (const CBlockHeader& header : headers) {
+        work += GetBlockProof(CBlockIndex{header});
+    }
+    return work;
+}
+
+void HeadersGeneratorSetup::FinalizeIndex(CBlockIndex& index, const uint256& hash, CBlockIndex* pprev, const int height, const uint64_t auxpow_count, const arith_uint256 chain_work)
+{
+    index.phashBlock = &hash;
+    index.pprev = pprev;
+    index.nHeight = height;
+    index.nAuxPow = auxpow_count;
+    index.nChainWork = chain_work;
+    index.BuildSkip();
+}
+
+void HeadersGeneratorSetup::AssertHeadersSyncAccepts(const Consensus::Params& consensus, const CBlockIndex& chain_start, const std::vector<CBlockHeader>& headers)
+{
+    HeadersSyncState hss{/*id=*/0, consensus, &chain_start, ClaimedWork(chain_start, headers)};
+
+    auto result = hss.ProcessNextHeaders(headers, /*full_headers_message=*/true);
+    BOOST_REQUIRE(result.success);
+    BOOST_REQUIRE(result.request_more);
+    BOOST_REQUIRE(hss.GetState() == HeadersSyncState::State::REDOWNLOAD);
+
+    result = hss.ProcessNextHeaders(headers, /*full_headers_message=*/true);
+    BOOST_CHECK(result.success);
+    BOOST_CHECK(!result.request_more);
+    BOOST_CHECK_EQUAL(result.pow_validated_headers.size(), headers.size());
+    BOOST_CHECK(hss.GetState() == HeadersSyncState::State::FINAL);
+}
+
+void HeadersGeneratorSetup::AssertHeadersSyncRejects(const Consensus::Params& consensus, const CBlockIndex& chain_start, const std::vector<CBlockHeader>& headers)
+{
+    HeadersSyncState hss{/*id=*/0, consensus, &chain_start, ClaimedWork(chain_start, headers)};
+
+    const auto result = hss.ProcessNextHeaders(headers, /*full_headers_message=*/true);
+    BOOST_CHECK(!result.success);
+    BOOST_CHECK(!result.request_more);
+    BOOST_CHECK(hss.GetState() == HeadersSyncState::State::FINAL);
+}
+
+std::shared_ptr<const CAuxPow> HeadersGeneratorSetup::MakeAuxpowPayloadWithScriptSigSize(const size_t script_sig_size)
+{
+    auto auxpow = std::make_shared<CAuxPow>();
+    CMutableTransaction coinbase;
+    coinbase.vin.resize(1);
+    coinbase.vin[0].prevout.SetNull();
+    coinbase.vin[0].scriptSig.resize(script_sig_size);
+    coinbase.vout.resize(1);
+    auxpow->coinbase_tx = MakeTransactionRef(std::move(coinbase));
+    BOOST_REQUIRE_GE(GetSerializeSize(*auxpow), script_sig_size);
+    return auxpow;
 }
 
 BOOST_FIXTURE_TEST_SUITE(headers_sync_chainwork_tests, HeadersGeneratorSetup)
@@ -141,6 +220,182 @@ BOOST_AUTO_TEST_CASE(headers_sync_state)
     // Nevertheless, no validation errors should have been detected with the
     // chain:
     BOOST_CHECK(result.success);
+}
+
+BOOST_AUTO_TEST_CASE(headers_sync_accepts_genesis_to_permissionless_anchor_jumps)
+{
+    // These shipped networks fail on current develop because presync compares
+    // the first permissionless ASERT target to the adjacent genesis target.
+    for (const ChainType chain_type : {ChainType::MAIN, ChainType::SIGNET}) {
+        const auto chain_params = CreateChainParams(*m_node.args, chain_type);
+        const auto& consensus = chain_params->GetConsensus();
+        BOOST_REQUIRE(consensus.fPowUseASERT);
+        BOOST_REQUIRE(consensus.CadenceActiveAtHeight(1));
+
+        CBlockIndex genesis{chain_params->GenesisBlock()};
+        const uint256 genesis_hash{chain_params->GenesisBlock().GetHash()};
+        FinalizeIndex(genesis, genesis_hash, /*pprev=*/nullptr, /*height=*/0, /*auxpow_count=*/0, GetBlockProof(genesis));
+
+        const CBlockHeader permissionless = MakeHeader(genesis.GetBlockHash(),
+                                                       MakeVersion(/*chain_id=*/0, /*auxpow=*/false, /*version_bits=*/0),
+                                                       consensus.asertAnchorParams.nBlockTime + consensus.nPowTargetSpacingLegacy,
+                                                       consensus.asertAnchorParams.nBitsLegacy);
+        AssertHeadersSyncAccepts(consensus, genesis, {permissionless});
+    }
+}
+
+BOOST_AUTO_TEST_CASE(headers_sync_accepts_signet_permissionless_to_auxpow_anchor_jump)
+{
+    // This covers a mixed-lane regression where an honest signet
+    // permissionless-to-AuxPoW transition is rejected by the adjacent 2x guard.
+    const auto chain_params = CreateChainParams(*m_node.args, ChainType::SIGNET);
+    const auto& consensus = chain_params->GetConsensus();
+    BOOST_REQUIRE(consensus.fPowUseASERT);
+    BOOST_REQUIRE(consensus.CadenceActiveAtHeight(2));
+    BOOST_REQUIRE_NE(consensus.asertAnchorParams.nBitsLegacy, consensus.asertAnchorParams.nBitsAuxPow);
+
+    CBlockIndex genesis{chain_params->GenesisBlock()};
+    const uint256 genesis_hash{chain_params->GenesisBlock().GetHash()};
+    FinalizeIndex(genesis, genesis_hash, /*pprev=*/nullptr, /*height=*/0, /*auxpow_count=*/0, GetBlockProof(genesis));
+
+    const CBlockHeader permissionless_header = MakeHeader(genesis.GetBlockHash(),
+                                                          MakeVersion(/*chain_id=*/0, /*auxpow=*/false, /*version_bits=*/0),
+                                                          consensus.asertAnchorParams.nBlockTime + consensus.nPowTargetSpacingLegacy,
+                                                          consensus.asertAnchorParams.nBitsLegacy);
+    CBlockIndex permissionless{permissionless_header};
+    const uint256 permissionless_hash{permissionless_header.GetHash()};
+    FinalizeIndex(permissionless,
+                  permissionless_hash,
+                  &genesis,
+                  /*height=*/1,
+                  /*auxpow_count=*/0,
+                  genesis.nChainWork + GetBlockProof(permissionless));
+
+    const CBlockHeader auxpow = MakeHeader(permissionless.GetBlockHash(),
+                                           MakeVersion(static_cast<uint16_t>(consensus.nAuxpowChainId), /*auxpow=*/true, /*version_bits=*/0),
+                                           permissionless_header.nTime + consensus.nPowTargetSpacing,
+                                           consensus.asertAnchorParams.nBitsAuxPow);
+    AssertHeadersSyncAccepts(consensus, permissionless, {auxpow});
+}
+
+BOOST_AUTO_TEST_CASE(headers_sync_redownload_preserves_auxpow_payload)
+{
+    const auto chain_params = CreateChainParams(*m_node.args, ChainType::SIGNET);
+    const auto& consensus = chain_params->GetConsensus();
+    BOOST_REQUIRE(consensus.fPowUseASERT);
+    BOOST_REQUIRE(consensus.CadenceActiveAtHeight(2));
+
+    CBlockIndex genesis{chain_params->GenesisBlock()};
+    const uint256 genesis_hash{chain_params->GenesisBlock().GetHash()};
+    FinalizeIndex(genesis, genesis_hash, /*pprev=*/nullptr, /*height=*/0, /*auxpow_count=*/0, GetBlockProof(genesis));
+
+    const CBlockHeader permissionless_header = MakeHeader(genesis.GetBlockHash(),
+                                                          MakeVersion(/*chain_id=*/0, /*auxpow=*/false, /*version_bits=*/0),
+                                                          consensus.asertAnchorParams.nBlockTime + consensus.nPowTargetSpacingLegacy,
+                                                          consensus.asertAnchorParams.nBitsLegacy);
+    CBlockIndex permissionless{permissionless_header};
+    const uint256 permissionless_hash{permissionless_header.GetHash()};
+    FinalizeIndex(permissionless,
+                  permissionless_hash,
+                  &genesis,
+                  /*height=*/1,
+                  /*auxpow_count=*/0,
+                  genesis.nChainWork + GetBlockProof(permissionless));
+
+    CBlockHeader auxpow = MakeHeader(permissionless.GetBlockHash(),
+                                     MakeVersion(static_cast<uint16_t>(consensus.nAuxpowChainId), /*auxpow=*/true, /*version_bits=*/0),
+                                     permissionless_header.nTime + consensus.nPowTargetSpacing,
+                                     consensus.asertAnchorParams.nBitsAuxPow);
+    auxpow.auxpow = MakeAuxpowPayloadWithScriptSigSize(0);
+
+    HeadersSyncState hss{/*id=*/0, consensus, &permissionless, ClaimedWork(permissionless, {auxpow})};
+    auto result = hss.ProcessNextHeaders({auxpow}, /*full_headers_message=*/true);
+    BOOST_REQUIRE(result.success);
+    BOOST_REQUIRE(result.request_more);
+    BOOST_REQUIRE(hss.GetState() == HeadersSyncState::State::REDOWNLOAD);
+
+    result = hss.ProcessNextHeaders({auxpow}, /*full_headers_message=*/true);
+    BOOST_REQUIRE(result.success);
+    BOOST_REQUIRE(!result.request_more);
+    BOOST_REQUIRE_EQUAL(result.pow_validated_headers.size(), 1);
+    BOOST_CHECK(result.pow_validated_headers.front().SignalsAuxpow());
+    BOOST_REQUIRE(result.pow_validated_headers.front().HasAuxpow());
+    BOOST_CHECK(result.pow_validated_headers.front().auxpow == auxpow.auxpow);
+    BOOST_CHECK(hss.GetState() == HeadersSyncState::State::FINAL);
+}
+
+BOOST_AUTO_TEST_CASE(headers_sync_redownload_rejects_auxpow_payloads_beyond_protocol_window)
+{
+    const auto chain_params = CreateChainParams(*m_node.args, ChainType::SIGNET);
+    const auto& consensus = chain_params->GetConsensus();
+    BOOST_REQUIRE(consensus.fPowUseASERT);
+    BOOST_REQUIRE(consensus.CadenceActiveAtHeight(2));
+
+    CBlockIndex genesis{chain_params->GenesisBlock()};
+    const uint256 genesis_hash{chain_params->GenesisBlock().GetHash()};
+    FinalizeIndex(genesis, genesis_hash, /*pprev=*/nullptr, /*height=*/0, /*auxpow_count=*/0, GetBlockProof(genesis));
+
+    const CBlockHeader permissionless_header = MakeHeader(genesis.GetBlockHash(),
+                                                          MakeVersion(/*chain_id=*/0, /*auxpow=*/false, /*version_bits=*/0),
+                                                          consensus.asertAnchorParams.nBlockTime + consensus.nPowTargetSpacingLegacy,
+                                                          consensus.asertAnchorParams.nBitsLegacy);
+    CBlockIndex permissionless{permissionless_header};
+    const uint256 permissionless_hash{permissionless_header.GetHash()};
+    FinalizeIndex(permissionless,
+                  permissionless_hash,
+                  &genesis,
+                  /*height=*/1,
+                  /*auxpow_count=*/0,
+                  genesis.nChainWork + GetBlockProof(permissionless));
+
+    CBlockHeader oversized_auxpow = MakeHeader(permissionless.GetBlockHash(),
+                                               MakeVersion(static_cast<uint16_t>(consensus.nAuxpowChainId), /*auxpow=*/true, /*version_bits=*/0),
+                                               permissionless_header.nTime + consensus.nPowTargetSpacing,
+                                               consensus.asertAnchorParams.nBitsAuxPow);
+    oversized_auxpow.auxpow = MakeAuxpowPayloadWithScriptSigSize(MAX_PROTOCOL_MESSAGE_LENGTH * 10);
+
+    HeadersSyncState hss{/*id=*/0, consensus, &permissionless, ClaimedWork(permissionless, {oversized_auxpow})};
+    auto result = hss.ProcessNextHeaders({oversized_auxpow}, /*full_headers_message=*/true);
+    BOOST_REQUIRE(result.success);
+    BOOST_REQUIRE(result.request_more);
+    BOOST_REQUIRE(hss.GetState() == HeadersSyncState::State::REDOWNLOAD);
+
+    result = hss.ProcessNextHeaders({oversized_auxpow}, /*full_headers_message=*/true);
+    BOOST_CHECK(!result.success);
+    BOOST_CHECK(!result.request_more);
+    BOOST_CHECK(result.pow_validated_headers.empty());
+    BOOST_CHECK(hss.GetState() == HeadersSyncState::State::FINAL);
+}
+
+BOOST_AUTO_TEST_CASE(headers_sync_rejects_wrong_signet_auxpow_bits)
+{
+    const auto chain_params = CreateChainParams(*m_node.args, ChainType::SIGNET);
+    const auto& consensus = chain_params->GetConsensus();
+    BOOST_REQUIRE(consensus.fPowUseASERT);
+    BOOST_REQUIRE_NE(consensus.asertAnchorParams.nBitsLegacy, consensus.asertAnchorParams.nBitsAuxPow);
+
+    CBlockIndex genesis{chain_params->GenesisBlock()};
+    const uint256 genesis_hash{chain_params->GenesisBlock().GetHash()};
+    FinalizeIndex(genesis, genesis_hash, /*pprev=*/nullptr, /*height=*/0, /*auxpow_count=*/0, GetBlockProof(genesis));
+
+    const CBlockHeader permissionless_header = MakeHeader(genesis.GetBlockHash(),
+                                                          MakeVersion(/*chain_id=*/0, /*auxpow=*/false, /*version_bits=*/0),
+                                                          consensus.asertAnchorParams.nBlockTime + consensus.nPowTargetSpacingLegacy,
+                                                          consensus.asertAnchorParams.nBitsLegacy);
+    CBlockIndex permissionless{permissionless_header};
+    const uint256 permissionless_hash{permissionless_header.GetHash()};
+    FinalizeIndex(permissionless,
+                  permissionless_hash,
+                  &genesis,
+                  /*height=*/1,
+                  /*auxpow_count=*/0,
+                  genesis.nChainWork + GetBlockProof(permissionless));
+
+    CBlockHeader wrong_auxpow = MakeHeader(permissionless.GetBlockHash(),
+                                           MakeVersion(static_cast<uint16_t>(consensus.nAuxpowChainId), /*auxpow=*/true, /*version_bits=*/0),
+                                           permissionless_header.nTime + consensus.nPowTargetSpacing,
+                                           consensus.asertAnchorParams.nBitsLegacy);
+    AssertHeadersSyncRejects(consensus, permissionless, {wrong_auxpow});
 }
 
 BOOST_AUTO_TEST_SUITE_END()

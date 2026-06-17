@@ -32,6 +32,7 @@ class MempoolCompatibilityTest(BitcoinTestFramework):
             None,
         ])
         self.start_nodes()
+        self.skip_if_previous_release_chain_mismatch()
 
     def run_test(self):
         self.log.info("Test that mempool.dat is compatible between versions")

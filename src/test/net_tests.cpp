@@ -49,6 +49,43 @@ BOOST_AUTO_TEST_CASE(cnode_listen_port)
     BOOST_CHECK(port == altPort);
 }
 
+BOOST_AUTO_TEST_CASE(connman_init_preserves_prestart_local_services)
+{
+    auto connman = std::make_unique<CConnman>(0x1337, 0x1337, *m_node.addrman, *m_node.netgroupman, Params());
+    connman->AddLocalServices(ServiceFlags(NODE_WITNESS_PRUNED | NODE_ARCHIVE));
+
+    CConnman::Options options;
+    options.m_local_services = ServiceFlags(NODE_WITNESS | NODE_P2P_V2);
+    connman->Init(options);
+
+    const ServiceFlags services{connman->GetLocalServices()};
+    BOOST_CHECK(services & NODE_WITNESS);
+    BOOST_CHECK(services & NODE_P2P_V2);
+    BOOST_CHECK(services & NODE_WITNESS_PRUNED);
+    BOOST_CHECK(services & NODE_ARCHIVE);
+}
+
+BOOST_AUTO_TEST_CASE(connman_init_preserves_prestart_local_service_removals)
+{
+    auto connman = std::make_unique<CConnman>(0x1337, 0x1337, *m_node.addrman, *m_node.netgroupman, Params());
+    connman->RemoveLocalServices(NODE_ARCHIVE);
+    connman->AddLocalServices(NODE_WITNESS_PRUNED);
+
+    CConnman::Options options;
+    options.m_local_services = ServiceFlags(NODE_WITNESS | NODE_ARCHIVE);
+    connman->Init(options);
+
+    const ServiceFlags services{connman->GetLocalServices()};
+    BOOST_CHECK(services & NODE_WITNESS);
+    BOOST_CHECK(services & NODE_WITNESS_PRUNED);
+    BOOST_CHECK(!(services & NODE_ARCHIVE));
+}
+
+BOOST_AUTO_TEST_CASE(seeds_service_flags_include_archive)
+{
+    BOOST_CHECK_EQUAL(SeedsServiceFlags(), ServiceFlags(NODE_NETWORK | NODE_WITNESS | NODE_ARCHIVE));
+}
+
 BOOST_AUTO_TEST_CASE(cnode_simple_test)
 {
     NodeId id = 0;

@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_KERNEL_CHECKS_H
-#define BITCOIN_KERNEL_CHECKS_H
+#ifndef QBIT_KERNEL_CHECKS_H
+#define QBIT_KERNEL_CHECKS_H
 
 #include <util/result.h>
 
@@ -17,4 +17,4 @@ struct Context;
 [[nodiscard]] util::Result<void> SanityChecks(const Context&);
 } // namespace kernel
 
-#endif // BITCOIN_KERNEL_CHECKS_H
+#endif // QBIT_KERNEL_CHECKS_H

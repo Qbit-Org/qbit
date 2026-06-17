@@ -2,15 +2,21 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_WALLET_WALLETUTIL_H
-#define BITCOIN_WALLET_WALLETUTIL_H
+#ifndef QBIT_WALLET_WALLETUTIL_H
+#define QBIT_WALLET_WALLETUTIL_H
 
+#include <outputtype.h>
 #include <script/descriptor.h>
 #include <util/fs.h>
 
+#include <optional>
+#include <span>
 #include <vector>
 
+struct CExtPubKey;
+
 namespace wallet {
+class CWallet;
 
 enum WalletFlags : uint64_t {
     // wallet flags in the upper section (> 1 << 31) will lead to not opening the wallet if flag is unknown
@@ -69,6 +75,7 @@ public:
     int32_t range_start = 0; // First item in range; start of range, inclusive, i.e. [range_start, range_end). This never changes.
     int32_t range_end = 0; // Item after the last; end of range, exclusive, i.e. [range_start, range_end). This will increment with each TopUp()
     int32_t next_index = 0; // Position of the next item to generate
+    std::optional<bool> deferred_create_keypool_top_up; // Nullopt for wallets created before deferred-state persistence existed.
     DescriptorCache cache;
 
     void DeserializeDescriptor(const std::string& str)
@@ -91,6 +98,18 @@ public:
         std::string descriptor_str;
         SER_WRITE(obj, descriptor_str = obj.descriptor->ToString());
         READWRITE(descriptor_str, obj.creation_time, obj.next_index, obj.range_start, obj.range_end);
+        if constexpr (ser_action.ForRead()) {
+            obj.deferred_create_keypool_top_up.reset();
+            if (!s.empty()) {
+                bool deferred_create_keypool_top_up;
+                s >> deferred_create_keypool_top_up;
+                obj.deferred_create_keypool_top_up = deferred_create_keypool_top_up;
+            }
+        } else {
+            if (obj.deferred_create_keypool_top_up.has_value()) {
+                s << *obj.deferred_create_keypool_top_up;
+            }
+        }
         SER_READ(obj, obj.DeserializeDescriptor(descriptor_str));
     }
 
@@ -98,7 +117,13 @@ public:
     WalletDescriptor(std::shared_ptr<Descriptor> descriptor, uint64_t creation_time, int32_t range_start, int32_t range_end, int32_t next_index) : descriptor(descriptor), id(DescriptorID(*descriptor)), creation_time(creation_time), range_start(range_start), range_end(range_end), next_index(next_index) { }
 };
 
-WalletDescriptor GenerateWalletDescriptor(const CExtPubKey& master_key, const OutputType& output_type, bool internal);
+WalletDescriptor GenerateWalletDescriptor(const CExtPubKey& master_pubkey, const OutputType& output_type, bool internal);
+bool IsP2MROnlyWalletChain();
+std::span<const OutputType> GetWalletOutputTypes();
+std::span<const OutputType> GetDefaultDescriptorOutputTypes();
+std::string FormatWalletOutputTypes();
+bool IsWalletOutputTypeAllowed(OutputType type);
+bool IsAvailableWalletOutputType(const CWallet& wallet, OutputType type, bool internal);
 } // namespace wallet
 
-#endif // BITCOIN_WALLET_WALLETUTIL_H
+#endif // QBIT_WALLET_WALLETUTIL_H

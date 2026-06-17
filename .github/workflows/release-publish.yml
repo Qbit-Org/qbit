@@ -1,0 +1,498 @@
+# Copyright (c) 2023-present The Bitcoin Core developers
+# Distributed under the MIT software license, see the accompanying
+# file COPYING or https://opensource.org/license/mit/.
+
+name: Release Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Signed annotated git tag to publish, for example v0.1.0-testnet1
+        required: true
+        type: string
+      artifacts_dir:
+        description: Absolute path on the self-hosted runner containing a flat release staging directory with SHA256SUMS, SHA256SUMS.asc, and release artifacts
+        required: true
+        type: string
+      guix_sigs_repo:
+        description: Absolute path on the self-hosted runner to a qbit-guix.sigs checkout containing builder attestations and keys
+        required: true
+        type: string
+      testnet_release_posture_evidence:
+        description: Absolute path on the self-hosted runner to testnet-only posture evidence with every staged core qbitd binary hash; required when release_line=testnet
+        required: false
+        default: ''
+        type: string
+      notes_file:
+        description: Optional release notes file path. Relative paths are resolved from the repository checkout; absolute paths are used as-is
+        required: false
+        default: ''
+        type: string
+      release_name:
+        description: Optional GitHub Release title. Defaults to qbit <tag>
+        required: false
+        default: ''
+        type: string
+      draft:
+        description: Create or update the GitHub Release as a draft
+        required: true
+        default: true
+        type: boolean
+      prerelease:
+        description: Mark the GitHub Release as a prerelease
+        required: true
+        default: false
+        type: boolean
+      make_latest:
+        description: Whether GitHub should mark this release as latest
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'legacy'
+          - 'true'
+      release_line:
+        description: Release trust profile used for signer quorum policy
+        required: true
+        default: testnet
+        type: choice
+        options:
+          - testnet
+          - mainnet
+      require_photon:
+        description: Require qbit-photon artifacts in SHA256SUMS and the upload set
+        required: true
+        default: false
+        type: boolean
+      allow_unsigned_platform_artifacts:
+        description: Allow OS-unsigned platform artifacts; use only for an explicit RC waiver
+        required: true
+        default: false
+        type: boolean
+      allow_codesigning_artifacts:
+        description: Allow public codesigning payload artifacts; use only for an explicit release waiver
+        required: true
+        default: false
+        type: boolean
+      trusted_release_ref:
+        description: Full 40-character reviewed commit SHA used for release validation tooling and key policy; must not be a branch, tag, or the release tag target
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-publish-${{ inputs.tag }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  publish:
+    name: publish release
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 60
+    steps:
+      - name: Validate tag exists and is GitHub-verified
+        id: tag
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const tag = context.payload.inputs?.tag;
+            if (!tag) {
+              core.setFailed('workflow_dispatch input "tag" is required');
+              return;
+            }
+
+            let ref;
+            try {
+              ref = await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` });
+            } catch (err) {
+              core.setFailed(`Tag ${tag} does not exist in ${owner}/${repo}`);
+              return;
+            }
+
+            if (ref.data.object.type !== 'tag') {
+              core.setFailed(`Tag ${tag} must be an annotated signed tag; lightweight tags are not supported`);
+              return;
+            }
+
+            const tagObject = await github.rest.git.getTag({ owner, repo, tag_sha: ref.data.object.sha });
+            const verification = tagObject.data.verification || {};
+            if (!verification.verified) {
+              core.setFailed(`Tag ${tag} is not a verified signed tag (reason: ${verification.reason || 'unknown'})`);
+              return;
+            }
+
+            core.setOutput('tag', tag);
+            core.setOutput('tag_sha', ref.data.object.sha);
+            core.setOutput('target_commitish', tagObject.data.object.sha);
+            core.setOutput('verified_at', verification.verified_at || '');
+
+      - name: Validate trusted release ref input
+        env:
+          TAG_NAME: ${{ steps.tag.outputs.tag }}
+          TAG_SHA: ${{ steps.tag.outputs.tag_sha }}
+          TARGET_COMMITISH: ${{ steps.tag.outputs.target_commitish }}
+          TRUSTED_RELEASE_REF: ${{ inputs.trusted_release_ref }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "${TRUSTED_RELEASE_REF}" =~ ^[0-9A-Fa-f]{40}$ ]]; then
+            echo "trusted_release_ref must be a full 40-character commit SHA from a protected branch or reviewed policy/tooling commit" >&2
+            echo "Branch names, tags, and short SHAs are not accepted for the trusted release policy checkout" >&2
+            exit 1
+          fi
+
+          trusted_lower="$(printf '%s' "${TRUSTED_RELEASE_REF}" | tr '[:upper:]' '[:lower:]')"
+          tag_sha_lower="$(printf '%s' "${TAG_SHA}" | tr '[:upper:]' '[:lower:]')"
+          target_lower="$(printf '%s' "${TARGET_COMMITISH}" | tr '[:upper:]' '[:lower:]')"
+          if [[ "${trusted_lower}" == "${tag_sha_lower}" ]]; then
+            echo "trusted_release_ref must not equal the release tag object SHA for ${TAG_NAME}" >&2
+            exit 1
+          fi
+          if [[ "${trusted_lower}" == "${target_lower}" ]]; then
+            echo "trusted_release_ref must not equal the release tag target commit ${TARGET_COMMITISH}" >&2
+            exit 1
+          fi
+
+      - name: Checkout tagged source
+        uses: actions/checkout@v5
+        with:
+          ref: refs/tags/${{ steps.tag.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Checkout trusted release validation policy
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.trusted_release_ref }}
+          path: .trusted-release
+          fetch-depth: 1
+
+      - name: Resolve trusted release validation paths
+        id: trusted
+        env:
+          TRUSTED_RELEASE_REF: ${{ inputs.trusted_release_ref }}
+        run: |
+          set -euo pipefail
+
+          trusted_root="${GITHUB_WORKSPACE}/.trusted-release"
+          trusted_sha="$(git -C "${trusted_root}" rev-parse HEAD)"
+          trusted_lower="$(printf '%s' "${TRUSTED_RELEASE_REF}" | tr '[:upper:]' '[:lower:]')"
+          trusted_sha_lower="$(printf '%s' "${trusted_sha}" | tr '[:upper:]' '[:lower:]')"
+          if [[ "${trusted_sha_lower}" != "${trusted_lower}" ]]; then
+            echo "Trusted release checkout resolved ${trusted_sha}, expected ${TRUSTED_RELEASE_REF}" >&2
+            exit 1
+          fi
+
+          required_paths=(
+            "ci/release/validate_release_artifacts.py"
+            "ci/release/validate_builder_attestations.py"
+            "ci/release/validate_key_metadata.py"
+            "contrib/release-process/verify-testnet-release-posture.py"
+            "contrib/keys/operator-keys/keys.json"
+          )
+          for required_path in "${required_paths[@]}"; do
+            if [[ ! -f "${trusted_root}/${required_path}" ]]; then
+              echo "Trusted release ref ${TRUSTED_RELEASE_REF} is missing ${required_path}" >&2
+              exit 1
+            fi
+          done
+
+          {
+            echo "root=${trusted_root}"
+            echo "sha=${trusted_sha}"
+            echo "operator_policy=${trusted_root}/contrib/keys/operator-keys/keys.json"
+            echo "operator_keys_dir=${trusted_root}/contrib/keys/operator-keys"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Validate trusted release key policy
+        id: trusted_keys
+        env:
+          TRUSTED_OPERATOR_KEYS_DIR: ${{ steps.trusted.outputs.operator_keys_dir }}
+          TRUSTED_OPERATOR_POLICY: ${{ steps.trusted.outputs.operator_policy }}
+          TRUSTED_ROOT: ${{ steps.trusted.outputs.root }}
+        run: |
+          set -euo pipefail
+
+          validation_output="$(
+            python3 "${TRUSTED_ROOT}/ci/release/validate_key_metadata.py" \
+              --operator-policy "${TRUSTED_OPERATOR_POLICY}" \
+              --operator-keys-dir "${TRUSTED_OPERATOR_KEYS_DIR}" \
+              --require-public-key-files \
+              --skip-policy-transition-validation
+          )"
+          printf '%s\n' "${validation_output}"
+          keys_json_sha256="$(
+            awk -F= '$1 == "policy_sha256" { print $2 }' <<<"${validation_output}" | tail -n 1
+          )"
+          if [[ ! "${keys_json_sha256}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "Trusted release key policy did not emit a valid policy_sha256" >&2
+            exit 1
+          fi
+          {
+            echo "keys_json_sha256=${keys_json_sha256}"
+            echo "policy_sha256=${keys_json_sha256}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Resolve release metadata
+        id: meta
+        env:
+          RELEASE_NAME_INPUT: ${{ inputs.release_name }}
+          TAG_NAME: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${RELEASE_NAME_INPUT}" ]]; then
+            release_name="${RELEASE_NAME_INPUT}"
+          else
+            release_name="qbit ${TAG_NAME}"
+          fi
+
+          delimiter="release_name_$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+          {
+            echo "release_name<<${delimiter}"
+            echo "${release_name}"
+            echo "${delimiter}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Resolve release notes path
+        id: notes
+        env:
+          NOTES_FILE_INPUT: ${{ inputs.notes_file }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${NOTES_FILE_INPUT}" ]]; then
+            echo "has_notes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "${NOTES_FILE_INPUT}" = /* ]]; then
+            notes_path="${NOTES_FILE_INPUT}"
+          else
+            notes_path="${GITHUB_WORKSPACE}/${NOTES_FILE_INPUT}"
+          fi
+
+          if [[ ! -f "${notes_path}" ]]; then
+            echo "Expected release notes file at ${notes_path}" >&2
+            exit 1
+          fi
+
+          {
+            echo "has_notes=true"
+            echo "path=${notes_path}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Validate testnet release posture evidence
+        if: inputs.release_line == 'testnet'
+        env:
+          ALLOW_CODESIGNING_ARTIFACTS: ${{ inputs.allow_codesigning_artifacts }}
+          ALLOW_UNSIGNED_PLATFORM_ARTIFACTS: ${{ inputs.allow_unsigned_platform_artifacts }}
+          ARTIFACTS_DIR_INPUT: ${{ inputs.artifacts_dir }}
+          TAG_NAME: ${{ steps.tag.outputs.tag }}
+          TESTNET_RELEASE_POSTURE_EVIDENCE: ${{ inputs.testnet_release_posture_evidence }}
+          TRUSTED_ROOT: ${{ steps.trusted.outputs.root }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${TESTNET_RELEASE_POSTURE_EVIDENCE}" ]]; then
+            echo "testnet_release_posture_evidence is required when release_line=testnet" >&2
+            exit 1
+          fi
+          if [[ "${TESTNET_RELEASE_POSTURE_EVIDENCE}" != /* ]]; then
+            echo "testnet_release_posture_evidence must be an absolute path on the self-hosted runner" >&2
+            exit 1
+          fi
+          if [[ ! -f "${TESTNET_RELEASE_POSTURE_EVIDENCE}" ]]; then
+            echo "Missing testnet release posture evidence file: ${TESTNET_RELEASE_POSTURE_EVIDENCE}" >&2
+            exit 1
+          fi
+
+          args=(
+            --evidence "${TESTNET_RELEASE_POSTURE_EVIDENCE}"
+            --source-root "${GITHUB_WORKSPACE}"
+            --release-tag "${TAG_NAME}"
+            --artifacts-dir "${ARTIFACTS_DIR_INPUT}"
+          )
+          if [[ "${ALLOW_UNSIGNED_PLATFORM_ARTIFACTS}" == "true" ]]; then
+            args+=(--allow-unsigned-platform-artifacts)
+          fi
+          if [[ "${ALLOW_CODESIGNING_ARTIFACTS}" == "true" ]]; then
+            args+=(--allow-codesigning-artifacts)
+          fi
+
+          python3 "${TRUSTED_ROOT}/contrib/release-process/verify-testnet-release-posture.py" \
+            "${args[@]}"
+
+      - name: Validate staged artifacts and release signatures
+        id: artifacts
+        env:
+          ALLOW_UNSIGNED_PLATFORM_ARTIFACTS: ${{ inputs.allow_unsigned_platform_artifacts }}
+          ALLOW_CODESIGNING_ARTIFACTS: ${{ inputs.allow_codesigning_artifacts }}
+          ARTIFACTS_DIR_INPUT: ${{ inputs.artifacts_dir }}
+          RELEASE_LINE: ${{ inputs.release_line }}
+          REQUIRE_PHOTON: ${{ inputs.require_photon }}
+          TAG_NAME: ${{ steps.tag.outputs.tag }}
+          TRUSTED_OPERATOR_KEYS_DIR: ${{ steps.trusted.outputs.operator_keys_dir }}
+          TRUSTED_OPERATOR_POLICY: ${{ steps.trusted.outputs.operator_policy }}
+          TRUSTED_ROOT: ${{ steps.trusted.outputs.root }}
+        run: |
+          set -euo pipefail
+
+          if ! command -v gpg >/dev/null 2>&1; then
+            echo "gpg is required on the self-hosted runner" >&2
+            exit 1
+          fi
+
+          args=(
+            --artifacts-dir "${ARTIFACTS_DIR_INPUT}"
+            --tag "${TAG_NAME}"
+            --release-line "${RELEASE_LINE}"
+            --operator-key-policy "${TRUSTED_OPERATOR_POLICY}"
+            --operator-keys-dir "${TRUSTED_OPERATOR_KEYS_DIR}"
+            --verify-tag-signature
+            --github-output "${GITHUB_OUTPUT}"
+          )
+          if [[ "${REQUIRE_PHOTON}" == "true" ]]; then
+            args+=(--require-photon-artifact)
+          fi
+          if [[ "${ALLOW_UNSIGNED_PLATFORM_ARTIFACTS}" == "true" ]]; then
+            args+=(--allow-unsigned-platform-artifacts)
+          fi
+          if [[ "${ALLOW_CODESIGNING_ARTIFACTS}" == "true" ]]; then
+            args+=(--allow-codesigning-artifacts)
+          fi
+
+          python3 "${TRUSTED_ROOT}/ci/release/validate_release_artifacts.py" "${args[@]}"
+
+      - name: Validate builder attestations
+        id: builders
+        env:
+          ARTIFACTS_DIR: ${{ steps.artifacts.outputs.dir }}
+          GUIX_SIGS_REPO_INPUT: ${{ inputs.guix_sigs_repo }}
+          PHOTON_ARTIFACT_COUNT: ${{ steps.artifacts.outputs.photon_artifact_count }}
+          RELEASE_LINE: ${{ inputs.release_line }}
+          REQUIRE_PHOTON: ${{ inputs.require_photon }}
+          TAG_NAME: ${{ steps.tag.outputs.tag }}
+          TRUSTED_OPERATOR_KEYS_DIR: ${{ steps.trusted.outputs.operator_keys_dir }}
+          TRUSTED_OPERATOR_POLICY: ${{ steps.trusted.outputs.operator_policy }}
+          TRUSTED_ROOT: ${{ steps.trusted.outputs.root }}
+        run: |
+          set -euo pipefail
+
+          python3 "${TRUSTED_ROOT}/ci/release/validate_key_metadata.py" \
+            --operator-policy "${TRUSTED_OPERATOR_POLICY}" \
+            --operator-keys-dir "${TRUSTED_OPERATOR_KEYS_DIR}" \
+            --operator-policy-mirror "${GUIX_SIGS_REPO_INPUT}/operator-keys/keys.json" \
+            --operator-keys-dir-mirror "${GUIX_SIGS_REPO_INPUT}/operator-keys" \
+            --skip-policy-transition-validation \
+            --require-public-key-files
+
+          args=(
+            --artifacts-dir "${ARTIFACTS_DIR}"
+            --tag "${TAG_NAME}"
+            --release-line "${RELEASE_LINE}"
+            --guix-sigs-repo "${GUIX_SIGS_REPO_INPUT}"
+            --operator-key-policy "${TRUSTED_OPERATOR_POLICY}"
+            --operator-keys-dir "${TRUSTED_OPERATOR_KEYS_DIR}"
+            --guix-operator-key-policy "${GUIX_SIGS_REPO_INPUT}/operator-keys/keys.json"
+            --github-output "${GITHUB_OUTPUT}"
+          )
+          if [[ "${REQUIRE_PHOTON}" == "true" || "${PHOTON_ARTIFACT_COUNT}" != "0" ]]; then
+            args+=(--artifact core --artifact photon)
+          fi
+
+          python3 "${TRUSTED_ROOT}/ci/release/validate_builder_attestations.py" "${args[@]}"
+
+      - name: Create or update GitHub Release with notes file
+        id: release_with_notes
+        if: steps.notes.outputs.has_notes == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          target_commitish: ${{ steps.tag.outputs.target_commitish }}
+          name: ${{ steps.meta.outputs.release_name }}
+          body_path: ${{ steps.notes.outputs.path }}
+          files: ${{ steps.artifacts.outputs.files }}
+          draft: ${{ inputs.draft }}
+          prerelease: ${{ inputs.prerelease }}
+          make_latest: ${{ inputs.make_latest }}
+          fail_on_unmatched_files: true
+          overwrite_files: true
+
+      - name: Create or update GitHub Release with generated notes
+        id: release_generated
+        if: steps.notes.outputs.has_notes != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          target_commitish: ${{ steps.tag.outputs.target_commitish }}
+          name: ${{ steps.meta.outputs.release_name }}
+          files: ${{ steps.artifacts.outputs.files }}
+          draft: ${{ inputs.draft }}
+          prerelease: ${{ inputs.prerelease }}
+          make_latest: ${{ inputs.make_latest }}
+          fail_on_unmatched_files: true
+          overwrite_files: true
+          generate_release_notes: true
+
+      - name: Summarize release publication
+        env:
+          ARTIFACTS_DIR: ${{ steps.artifacts.outputs.dir }}
+          ARTIFACT_COUNT: ${{ steps.artifacts.outputs.artifact_count }}
+          BUILDER_ATTESTATION_CORE_COUNT: ${{ steps.builders.outputs.builder_attestation_core_count }}
+          BUILDER_ATTESTATION_PHOTON_COUNT: ${{ steps.builders.outputs.builder_attestation_photon_count || 'n/a' }}
+          BUILDER_ATTESTATION_QUORUM: ${{ steps.builders.outputs.builder_attestation_quorum }}
+          CORE_ARTIFACT_COUNT: ${{ steps.artifacts.outputs.core_artifact_count }}
+          DRAFT: ${{ inputs.draft }}
+          FILE_COUNT: ${{ steps.artifacts.outputs.file_count }}
+          KEYS_JSON_SHA256: ${{ steps.artifacts.outputs.keys_json_sha256 || steps.trusted_keys.outputs.keys_json_sha256 }}
+          MAKE_LATEST: ${{ inputs.make_latest }}
+          PHOTON_ARTIFACT_COUNT: ${{ steps.artifacts.outputs.photon_artifact_count }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          RELEASE_SIGNER_COUNT: ${{ steps.artifacts.outputs.release_signer_count }}
+          RELEASE_SIGNATURE_ALIASES: ${{ steps.artifacts.outputs.release_signature_aliases }}
+          RELEASE_SIGNATURE_COUNT: ${{ steps.artifacts.outputs.release_signature_count }}
+          RELEASE_SIGNATURE_QUORUM: ${{ steps.artifacts.outputs.release_signature_quorum }}
+          RELEASE_LINE: ${{ inputs.release_line }}
+          RELEASE_URL: ${{ steps.release_with_notes.outputs.url || steps.release_generated.outputs.url }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          TAG_SHA: ${{ steps.tag.outputs.tag_sha }}
+          TARGET_COMMITISH: ${{ steps.tag.outputs.target_commitish }}
+          TRUSTED_RELEASE_REF: ${{ inputs.trusted_release_ref }}
+          TRUSTED_RELEASE_SHA: ${{ steps.trusted.outputs.sha }}
+          VERIFIED_AT: ${{ steps.tag.outputs.verified_at || 'n/a' }}
+        run: |
+          {
+            echo "## Release Publish"
+            echo ""
+            echo "- Tag: \`${TAG}\`"
+            echo "- Verified tag object: \`${TAG_SHA}\`"
+            echo "- Target commit: \`${TARGET_COMMITISH}\`"
+            echo "- Trusted release validation ref: \`${TRUSTED_RELEASE_REF}\`"
+            echo "- Trusted release validation commit: \`${TRUSTED_RELEASE_SHA}\`"
+            echo "- Verified at: \`${VERIFIED_AT}\`"
+            echo "- Artifacts directory: \`${ARTIFACTS_DIR}\`"
+            echo "- Uploaded files: \`${FILE_COUNT}\`"
+            echo "- Manifested artifacts: \`${ARTIFACT_COUNT}\`"
+            echo "- Core artifacts: \`${CORE_ARTIFACT_COUNT}\`"
+            echo "- PHOTON artifacts: \`${PHOTON_ARTIFACT_COUNT}\`"
+            echo "- Release line: \`${RELEASE_LINE}\`"
+            echo "- keys.json SHA256: \`${KEYS_JSON_SHA256}\`"
+            echo "- Active release signers: \`${RELEASE_SIGNER_COUNT}\`"
+            echo "- Release signatures: \`${RELEASE_SIGNATURE_COUNT}/${RELEASE_SIGNATURE_QUORUM}\`"
+            echo "- Counted release signer aliases: \`${RELEASE_SIGNATURE_ALIASES}\`"
+            echo "- Builder attestations (core): \`${BUILDER_ATTESTATION_CORE_COUNT}/${BUILDER_ATTESTATION_QUORUM}\`"
+            echo "- Builder attestations (PHOTON): \`${BUILDER_ATTESTATION_PHOTON_COUNT}/${BUILDER_ATTESTATION_QUORUM}\`"
+            echo "- Draft: \`${DRAFT}\`"
+            echo "- Prerelease: \`${PRERELEASE}\`"
+            echo "- Make latest: \`${MAKE_LATEST}\`"
+            echo "- Release URL: ${RELEASE_URL}"
+          } >> "$GITHUB_STEP_SUMMARY"

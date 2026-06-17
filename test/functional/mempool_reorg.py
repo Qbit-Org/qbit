@@ -10,6 +10,7 @@ that spend (directly or indirectly) coinbase transactions.
 
 import time
 
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.messages import (
     CInv,
     MSG_WTX,
@@ -111,9 +112,13 @@ class MempoolCoinbaseTest(BitcoinTestFramework):
     def run_test(self):
         self.wallet = MiniWallet(self.nodes[0])
         wallet = self.wallet
+        # Start with the cached 200-block chain.
+        start_height = self.nodes[0].getblockcount()
+        assert_equal(start_height, 200)
 
-        # Start with a 200 block chain
-        assert_equal(self.nodes[0].getblockcount(), 200)
+        # Mature the default-cache coinbase UTXOs
+        self.ensure_cached_coinbase_mature(self.nodes[0])
+        assert_equal(self.nodes[0].getblockcount(), max(start_height, COINBASE_MATURITY + 99))
 
         self.log.info("Add 4 coinbase utxos to the miniwallet")
         # Block 76 contains the first spendable coinbase txs.
@@ -182,7 +187,7 @@ class MempoolCoinbaseTest(BitcoinTestFramework):
         assert_equal(set(self.nodes[0].getrawmempool()), {spend_1_id, spend_2_1_id, spend_3_1_id})
 
         self.log.info("Use invalidateblock to re-org back and make all those coinbase spends immature/invalid")
-        b = self.nodes[0].getblockhash(first_block + 100)
+        b = self.nodes[0].getblockhash(first_block + COINBASE_MATURITY)
         for node in self.nodes:
             node.invalidateblock(b)
 

@@ -48,6 +48,10 @@ class GetBlockTemplateLPTest(BitcoinTestFramework):
         assert thr.is_alive()
 
         self.miniwallet = MiniWallet(self.nodes[0])
+
+        # Mature the default-cache coinbase UTXOs
+        self.ensure_cached_coinbase_mature(self.nodes[0])
+
         self.log.info("Test that longpoll will terminate if another node generates a block")
         self.generate(self.nodes[1], 1)  # generate a block on another node
         # check that thread will exit now that new transaction entered mempool

@@ -4,7 +4,6 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Test wallet replace-by-fee capabilities in conjunction with the fallbackfee."""
 
-from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_raises_rpc_error
 
@@ -17,7 +16,7 @@ class WalletRBFTest(BitcoinTestFramework):
         self.skip_if_no_wallet()
 
     def run_test(self):
-        self.generate(self.nodes[0], COINBASE_MATURITY + 1)
+        self.ensure_mature_coinbase(self.nodes[0])
 
         # sending a transaction without fee estimations must be possible by default on regtest
         self.nodes[0].sendtoaddress(self.nodes[0].getnewaddress(), 1)

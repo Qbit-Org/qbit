@@ -43,8 +43,15 @@ void ReadSigNetArgs(const ArgsManager& args, CChainParams::SigNetOptions& option
 
 void ReadRegTestArgs(const ArgsManager& args, CChainParams::RegTestOptions& options)
 {
+    if (auto value = args.GetBoolArg("-asert")) options.asert = *value;
+    if (auto value = args.GetBoolArg("-legacyretarget")) options.legacy_retarget = *value;
     if (auto value = args.GetBoolArg("-fastprune")) options.fastprune = *value;
+    if (auto value = args.GetBoolArg("-p2mronly")) options.restricted_output_mode = *value;
     if (HasTestOption(args, "bip94")) options.enforce_bip94 = true;
+    if (HasTestOption(args, "disable_witness_pruning")) options.witness_pruning_enabled = false;
+    if (options.asert && options.legacy_retarget) {
+        throw std::runtime_error("-asert and -legacyretarget cannot both be enabled.");
+    }
 
     for (const std::string& arg : args.GetArgs("-testactivationheight")) {
         const auto found{arg.find('@')};
@@ -59,7 +66,13 @@ void ReadRegTestArgs(const ArgsManager& args, CChainParams::RegTestOptions& opti
         }
 
         const auto deployment_name{arg.substr(0, found)};
-        if (const auto buried_deployment = GetBuriedDeployment(deployment_name)) {
+        if (deployment_name == "cadence") {
+            options.cadence_activation_height = *height;
+        } else if (deployment_name == "outerwitness") {
+            options.outer_witness_activation_height = *height;
+        } else if (deployment_name == "p2mr") {
+            options.p2mr_activation_height = *height;
+        } else if (const auto buried_deployment = GetBuriedDeployment(deployment_name)) {
             options.activation_heights[*buried_deployment] = *height;
         } else {
             throw std::runtime_error(strprintf("Invalid name (%s) for -testactivationheight=name@height.", arg));

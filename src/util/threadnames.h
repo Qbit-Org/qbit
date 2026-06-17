@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_UTIL_THREADNAMES_H
-#define BITCOIN_UTIL_THREADNAMES_H
+#ifndef QBIT_UTIL_THREADNAMES_H
+#define QBIT_UTIL_THREADNAMES_H
 
 #include <string>
 
@@ -23,4 +23,4 @@ std::string ThreadGetInternalName();
 
 } // namespace util
 
-#endif // BITCOIN_UTIL_THREADNAMES_H
+#endif // QBIT_UTIL_THREADNAMES_H

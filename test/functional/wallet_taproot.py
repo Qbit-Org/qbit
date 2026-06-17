@@ -9,6 +9,7 @@ import uuid
 
 from decimal import Decimal
 from test_framework.address import output_key_to_p2tr
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.key import H_POINT
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal
@@ -21,13 +22,12 @@ from test_framework.script import (
     OP_NUMEQUAL,
     taproot_construct,
 )
-from test_framework.segwit_addr import encode_segwit_address
 
 # xprvs/xpubs, and m/* derived x-only pubkeys (created using independent implementation)
 KEYS = [
     {
-        "xprv": "tprv8ZgxMBicQKsPeNLUGrbv3b7qhUk1LQJZAGMuk9gVuKh9sd4BWGp1eMsehUni6qGb8bjkdwBxCbgNGdh2bYGACK5C5dRTaif9KBKGVnSezxV",
-        "xpub": "tpubD6NzVbkrYhZ4XqNGAWGWSzmxGWFwVjVTjZxh2fioKbVYi7Jx8fdbprVWsdW7mHwqjchBVas8TLZG4Xwuz4RKU4iaCqiCvoSkFCzQptqk5Y1",
+        "xprv": "qrpvV1brS3WRoVwgTa8VW8i5Tw8mxrbBgZ2QfTT8znP38C3vF85L1UpKBiHvwdGmAE9oi8sbPUsp5aN4w3DjrxRD2GAEydxGNKyqGvBe5HqiT61",
+        "xpub": "qrpbSRJj3eCrXD2z4yGQtHK2FuFHgb985pz3xjc6VHFdckhyYa7asxYJ3JRjhG6X82d3P35SNE3LReadKjAhDAQNQuVp4YJbA8mjVvo8KSTjHFZ",
         "pubs": [
             "83d8ee77a0f3a32a5cea96fd1624d623b836c1e5d1ac2dcde46814b619320c18",
             "a30253b018ea6fca966135bf7dd8026915427f24ccf10d4e03f7870f4128569b",
@@ -36,8 +36,8 @@ KEYS = [
         ]
     },
     {
-        "xprv": "tprv8ZgxMBicQKsPe98QUPieXy5KFPVjuZNpcC9JY7K7buJEm8nWvJogK4kTda7eLjK9U4PnMNbSjEkpjDJazeBZ4rhYNYD7N6GEdaysj1AYSb5",
-        "xpub": "tpubD6NzVbkrYhZ4XcACN3PEwNjRpR1g4tZjBVk5pdMR2B6dbd3HYhdGVZNKofAiFZd9okBserZvv58A6tBX4pE64UpXGNTSesfUW7PpW36HuKz",
+        "xprv": "qrpvV1brS3WRoVwgTLvRhfpoxK6FWmLvFi6g7PEXnk1epmf18dofRWoyrRAjsibhQ8CN3bXd6vHJcDSXPcqJG4LbtonbGYjv9havbKrFJTPThGn",
+        "xpub": "qrpbSRJj3eCrXD2z4k4M5pRkkHCmEVtrez4KQfPVHEtFKLK4S5qvHzXxi1JYdHm7cJJMTAa8XVk8tP9XN5QJHvD91Kbm853ptCzTkqCXzhEZQFe",
         "pubs": [
             "f95886b02a84928c5c15bdca32784993105f73de27fa6ad8c1a60389b999267c",
             "71522134160685eb779857033bfc84c7626f13556154653a51dd42619064e679",
@@ -46,8 +46,8 @@ KEYS = [
         ]
     },
     {
-        "xprv": "tprv8ZgxMBicQKsPe3ZJmcj9aJ2EPZJYYCh6Lp3v82p75wspgaXmtDZ2RBtkAtWcGnW2VQDzMHQPBkCKMoYTqh1RfJKjv4PcmWVR7KqTpjsdboN",
-        "xpub": "tpubD6NzVbkrYhZ4XWb6fGPjyhgLxapUhXszv7ehQYrQWDgDX4nYWcNcbgWcM2RhYo9s2mbZcfZJ8t5LzYcr24FK79zVybsw5Qj3Rtqug8jpJMy",
+        "xprv": "qrpvV1brS3WRoVwgTFMKztqJze3Aew9itMQwr199NfWeJpEb45YvPRZKxYK2R2zfLBPF4wMq6q6F4it22D5B77AUVFQnp4vRZ7p754hqQBxDhTb",
+        "xpub": "qrpbSRJj3eCrXD2z4eVFP3SFnc9gNfhfHdNb9HJ6sAPEoNteMXbBFuHJp8SqAf26uXq4gBypVJjW7C6iFjqdFAEN3zmjqJUKJk42gcedAfvJ8SF",
         "pubs": [
             "9fa5ffb68821cf559001caa0577eeea4978b29416def328a707b15e91701a2f7",
             "8a104c54cd34acba60c97dd8f1f7abc89ba9587afd88dc928e91aca7b1c50d20",
@@ -56,8 +56,8 @@ KEYS = [
         ]
     },
     {
-        "xprv": "tprv8ZgxMBicQKsPdKziibn63Rm6aNzp7dSjDnufZMStXr71Huz7iihCRpbZZZ6Voy5HyuHCWx6foHMipzMzUq4tZrtkZ24DJwz5EeNWdsuwX5h",
-        "xpub": "tpubD6NzVbkrYhZ4Wo2WcFSgSqRD9QWkGxddo6WSqsVBx7uQ8QEtM7WncKDRjhFEexK119NigyCsFygA4b7sAPQxqebyFGAZ9XVV1BtcgNzbCRR",
+        "xprv": "qrpvV1brS3WRoVwgSXnjwstFTmn2qkqzTnAaiyztoz9RkiTmfR1GDvhVyB1qohaYsMxWZSR3GVnXgG3RVPthkFDwPoyoT2b26ZJmCPEtDJEGmHU",
+        "xpub": "qrpbSRJj3eCrXD2z3vvfL2VCFjtYZVPvs48E2G9rJV22FH7pxs3X6QRUpm9eZKqe1gzCeZkyZcP5EHhXKnLePVQ1nVPD6xkwNrpUFuhLAwnFjKP",
         "pubs": [
             "03a669ea926f381582ec4a000b9472ba8a17347f5fb159eddd4a07036a6718eb",
             "bbf56b14b119bccafb686adec2e3d2a6b51b1626213590c3afa815d1fd36f85d",
@@ -66,8 +66,8 @@ KEYS = [
         ]
     },
     {
-        "xprv": "tprv8ZgxMBicQKsPen4PGtDwURYnCtVMDejyE8vVwMGhQWfVqB2FBPdekhTacDW4vmsKTsgC1wsncVqXiZdX2YFGAnKoLXYf42M78fQJFzuDYFN",
-        "xpub": "tpubD6NzVbkrYhZ4YF6BAXtXsqCtmv1HNyvsoSXHDsJzpnTtffH1onTEwC5SnLzCHPKPebh2i7Gxvi9kJNADcpuSmH8oM3rCYcHVtdXHjpYoKnX",
+        "xprv": "qrpvV1brS3WRoVwgTyrQWAL6tmZiUGLXZoTpjL1jByyEdP2GCg3PgbdxJ3srrMz7zAkY3Qp2mVZeVUXENyAEHxQJzjQrEY5Tqdfo6QGfqScYtw4",
+        "xpub": "qrpbSRJj3eCrXD2z5NzKtJw3gjgEBztTy5RU2cAggUqq7wgKW85eZ5Mw9e1fbyabe7zbJ25HakTAu2B7ZZNzqvtVi7v3CkSamwcV9ML1ENjY6uB",
         "pubs": [
             "aba457d16a8d59151c387f24d1eb887efbe24644c1ee64b261282e7baebdb247",
             "c8558b7caf198e892032d91f1a48ee9bdc25462b83b4d0ac62bb7fb2a0df630e",
@@ -76,8 +76,8 @@ KEYS = [
         ]
     },
     {
-        "xprv": "tprv8ZgxMBicQKsPd91vCgRmbzA13wyip2RimYeVEkAyZvsEN5pUSB3T43SEBxPsytkxb42d64W2EiRE9CewpJQkzR8HKHLV8Uhk4dMF5yRPaTv",
-        "xpub": "tpubD6NzVbkrYhZ4Wc3i6L6N1Pp7cyVeyMcdLrFGXGDGzCfdCa5F4Zs3EY46N72Ws8QDEUYBVwXfDfda2UKSseSdU1fsBegJBhGCZyxkf28bkQ6",
+        "xprv": "qrpvV1brS3WRoVwgSLowRxXw2LAwKKpuAB9aGjjiVNsWnoDzjaqcwP3kbPrWS6sw3HeBAbATqcBt7h6vocBf5iZopNDLDHsHv62S2NDcfRCTiZd",
+        "xpub": "qrpbSRJj3eCrXD2z3jwrp78spJHT34NqZT7Da1tfysk7HMt432ssormjSyzKBjcvDs5QstvSNahsByewHfYE6kRgQrT73MGgR2bBphmU9bQWr2h",
         "pubs": [
             "9b4d495b74887815a1ff623c055c6eac6b6b2e07d2a016d6526ebac71dd99744",
             "8e971b781b7ce7ab742d80278f2dfe7dd330f3efd6d00047f4a2071f2e7553cb",
@@ -86,8 +86,8 @@ KEYS = [
         ]
     },
     {
-        "xprv": "tprv8ZgxMBicQKsPdEhLRxxwzTv2t18j7ruoffPeqAwVA2qXJ2P66RaMZLUWQ85SjoA7xPxdSgCB9UZ72m65qbnaLPtFTfHVP3MEmkpZk1Bv8RT",
-        "xpub": "tpubD6NzVbkrYhZ4Whj8KcdYPsa9T2efHC6iExzS7gynaJdv8WdripPwjq6NaH5gQJGrLmvUwHY1smhiakUosXNDTEa6qfKUQdLKV6DJBre6XvQ",
+        "xprv": "qrpvV1brS3WRoVwgSSVMfF57Qovy9NyuU1dfArUt5oe2NuCHfXQEbdaf6gtneGZVoC3LXw6UCDt32TEohAco71wdALyJMfpJAefvjVgwKTUVv4L",
+        "xpub": "qrpbSRJj3eCrXD2z3qdH3Pg4Cn3Us7XqsHbJU8dqaJWcsTrLxySVU7JdxH2bPug5m2x3zCJjoviDr5j5qwhb6dMGQ5MLhMurdxfJjp21gP7KZFg",
         "pubs": [
             "d0c19def28bb1b39451c1a814737615983967780d223b79969ba692182c6006b",
             "cb1d1b1dc62fec1894d4c3d9a1b6738e5ff9c273a64f74e9ab363095f45e9c47",
@@ -96,8 +96,8 @@ KEYS = [
         ]
     },
     {
-        "xprv": "tprv8ZgxMBicQKsPcxbqxzcMAwQpiCD8x6qaZEJTxdKxw4w9GuMzDACTD9yhEsHGfqQcfYX4LivosLDDngTykYEp9JnTdcqY7cHqU8PpeFFKyV3",
-        "xpub": "tpubD6NzVbkrYhZ4WRddreGwaM4wHDj57S2V8XuFF9NGMLjY7PckqZ23PebZR1wGA4w84uX2vZphdZVsnREjij1ibYjEBTaTVQCEZCLs4xUDapx",
+        "xprv": "qrpvV1brS3WRoVwgSAPsCGiWbHRkya4KJFZS4RPhDG2W9wHueQP8iNCkkWPyV1mKjEHqF5eu6GcfkJtvT5zh1xPryFsWXdNLuDcXRsGCDjVsLax",
+        "xpub": "qrpbSRJj3eCrXD2z3ZXnaRKTPFYGhJcFhXX5MhYehku6eVwxwrRPaqvjc6XnEeXfWocKiKuHoCzubsXF3cTWwpzmYPWU3AAqijXDov9aZXK8HVp",
         "pubs": [
             "065cc1b92bd99e5a3e626e8296a366b2d132688eb43aea19bc14fd8f43bf07fb",
             "5b95633a7dda34578b6985e6bfd85d83ec38b7ded892a9b74a3d899c85890562",
@@ -106,8 +106,8 @@ KEYS = [
         ]
     },
     {
-        "xprv": "tprv8ZgxMBicQKsPe6zLoU8MTTXgsdJVNBErrYGpoGwHf5VGvwUzdNc7NHeCSzkJkniCxBhZWujXjmD4HZmBBrnr3URgJjM6GxRgMmEhLdqNTWG",
-        "xpub": "tpubD6NzVbkrYhZ4Xa28h7nwrsBoSepRXWRmRqsc5nyb5MHfmRjmFmRhYnG4d9dC7uxixN5AfsEv1Lz3mCAuWvERyvPgKozHUVjfo8EG6foJGy7",
+        "xprv": "qrpvV1brS3WRoVwgTJnN2kEWsoYd919fiKxiMjN43udpswr3JSW98acQue4Uh9EMpBbRXiqQGTRPcjtkwyHtTGwtsRWjCjsu4ZkNKW74vAgvxf9",
+        "xpub": "qrpbSRJj3eCrXD2z4hvHQtqTfmf8rjhc7bvMf1X1YQWRNWW6btYQ14LPmECHSnDbUedvbnTRYWR7yf1R2PPgk2DUvmAvBWafhq4f3r2ybHCGBKD",
         "pubs": [
             "d826a0a53abb6ffc60df25b9c152870578faef4b2eb5a09bdd672bbe32cdd79b",
             "939365e0359ff6bc6f6404ee220714c5d4a0d1e36838b9e2081ede217674e2ba",
@@ -116,8 +116,8 @@ KEYS = [
         ]
     },
     {
-        "xprv": "tprv8ZgxMBicQKsPeB5o5oCsN2dVxM2mtJiYERQEBRc4JNwC1DFGYaEdNkmh8jJYVPU76YhkFoRoWTdh1p3yQGykG8TfDW34dKgrgSx28gswUyL",
-        "xpub": "tpubD6NzVbkrYhZ4Xe7aySsTmSHcXNYi3duSoj11TweMiejaqhW3Ay4DZFPZJses4sfpk4b9VHRhn8v4cKTMjugMM3hqXcqSSmRdiW8QvASXjfY",
+        "xprv": "qrpvV1brS3WRoVwgTNspK5K2nNeSDisxETSPjcVTS4JbXFHxNiGR3nEvv7ByNsnbYnMKg5qb1M7fPSKPgDagfh8o65Yi7WZsQw1YeBpPiBZn64X",
+        "xpub": "qrpbSRJj3eCrXD2z4n1jhDuyaLkwwTRtdjQ32teQvZBC1ox1gAJfvFxumhKn8WFGRcM2PUyQMvbukSwRsWg8y1fQHtV5PKRpg6kcyDw8QjggQJP",
         "pubs": [
             "e360564b2e0e8d06681b6336a29d0750210e8f34afd9afb5e6fd5fe6dba26c81",
             "76b4900f00a1dcce463b6d8e02b768518fce4f9ecd6679a13ad78ea1e4815ad3",
@@ -126,8 +126,8 @@ KEYS = [
         ]
     },
     {
-        "xprv": "tprv8ZgxMBicQKsPfEH6jHemkGDjZRnAaKFJVGH8pQU638E6SdbX9hxit1tK2sfFPfL6KS7v8FfUKxstbfEpzSymbdfBM9Y5UkrxErF9fJaKLK3",
-        "xpub": "tpubD6NzVbkrYhZ4YhJtcwKN9fsr8TJ6jeSD4Zsv6vWPTQ2VH7rHn6nK4WWBCzKK7FkdVVwm3iztCU1UmStY4hX6gRbBmp9UzK9C59dQEzeXS12",
+        "xprv": "qrpvV1brS3WRoVwgUS57xZkwAcEfpodLvTy9zTNN53AdFzarp8cfeuy2RNJbH29JT4DJtyFksoMLCwZbG4mYFs8pRakEFA4tGNBeCb7XEmYPyqx",
+        "xpub": "qrpbSRJj3eCrXD2z5qD3LiMsxaMBYYBHKjvoHjXKZY3DkZEv7aevXPh1GxSQ2cuiTzRq8vL1vNB6An2r2e7KHoW9dGNRdWjsDeUBKsS7jYUYSy8",
         "pubs": [
             "7631cacec3343052d87ef4d0065f61dde82d7d2db0c1cc02ef61ef3c982ea763",
             "c05e44a9e735d1b1bef62e2c0d886e6fb4923b2649b67828290f5cacc51c71b7",
@@ -136,8 +136,8 @@ KEYS = [
         ]
     },
     {
-        "xprv": "tprv8ZgxMBicQKsPdNWU38dT6aGxtqJR4oYS5kPpLVBcuKiiu7gqTYqMMqhUG6DP7pPahzPQu36sWSmeLCP1C4AwqcR5FX2RyRoZfd4B8pAnSdX",
-        "xpub": "tpubD6NzVbkrYhZ4WqYFvnJ3Vyw5TrpME8jLf3zbd1DvKbX7jbwc5wewYLKLSFRzZWV6hZj7XhsXAy7fhE5jB25DiWyNM3ztXbsXHRVCrp5BiPY",
+        "xprv": "qrpvV1brS3WRoVwgSaJVGQjcWvHuAD9bQxGHawV3b7tA8C5VGchyxkqeuC7kWEhSBDGoHXXFeanjPRTLzbuiTUKzfZW89XZEm38FdMvYiGr5HRx",
+        "xpub": "qrpbSRJj3eCrXD2z3ySQeZLZJtQQswhXpEDvtDe15ckkckjYa4kEqEZdknFZFt2PvFAJLz7NQM3j9H92xRJWQ84GfMkcCkbGkwCWY9HvMNtXgZY",
         "pubs": [
             "2258b1c3160be0864a541854eec9164a572f094f7562628281a8073bb89173a7",
             "83df59d0a5c951cdd62b7ab225a62079f48d2a333a86e66c35420d101446e92e",
@@ -146,8 +146,8 @@ KEYS = [
         ]
     },
     {
-        "xprv": "tprv8mGPkMVz5mZuJDnC2NjjAv7E9Zqa5LCgX4zawbZu5nzTtLb5kGhPwycX4H1gtW1f5ZdTKTNtQJ61hk71F2TdcQ93EFDTpUcPBr98QRji615",
-        "xpub": "tpubDHxRtmYEE9FaBgoyv2QKaKmLibMWEfPb6NbNE7cCW4nripqrNfWz8UEPEPbHCrakwLvwFfsqoaf4pjX4gWStp4nECRf1QwBKPkLqnY8pHbj",
+        "xprv": "qrpvVDBHqDHoUweC7RaDFeqtbG8AQwgkRUvY2G5pCEGSJfMEFqcEFUhhVL2oJRVjwttsf6mJ514kHGmiN9diWScgSME68FkGc5w59b1VyunMUQN",
+        "xpub": "qrpbSctASozECejVipi8doSqPEEg8gEgpktBKYEmgj92oE1HZHeV7xRgLvAc42BgZbFxamKC8K43mtgS5vjqucRwkuZU48FPeGWJeU9ZHBDGZ42",
         "pubs": [
             "00a9da96087a72258f83b338ef7f0ea8cbbe05da5f18f091eb397d1ecbf7c3d3",
             "b2749b74d51a78f5fe3ebb3a7c0ff266a468cade143dfa265c57e325177edf00",
@@ -182,7 +182,7 @@ def compute_taproot_address(pubkey, scripts):
     return output_key_to_p2tr(taproot_construct(pubkey, scripts).output_pubkey)
 
 def compute_raw_taproot_address(pubkey):
-    return encode_segwit_address("bcrt", 1, pubkey)
+    return output_key_to_p2tr(pubkey)
 
 class WalletTaprootTest(BitcoinTestFramework):
     """Test generation and spending of P2TR address outputs."""
@@ -293,7 +293,9 @@ class WalletTaprootTest(BitcoinTestFramework):
             self.boring.sendtoaddress(address=addr_g, amount=Decimal(to_amnt) / 100000000, subtractfeefromamount=True)
             self.generatetoaddress(self.nodes[0], 1, self.boring.getnewaddress(), sync_fun=self.no_op)
             test_balance = int(rpc_online.getbalance() * 100000000)
-            ret_amnt = random.randrange(100000, test_balance)
+            # Keep return sends bounded to recently received value to avoid
+            # very large ancestor packages under WITNESS_SCALE_FACTOR=1.
+            ret_amnt = random.randrange(100000, min(test_balance, to_amnt))
             # Increase fee_rate to compensate for the wallet's inability to estimate fees for script path spends.
             res = rpc_online.sendtoaddress(address=self.boring.getnewaddress(), amount=Decimal(ret_amnt) / 100000000, subtractfeefromamount=True, fee_rate=200)
             self.generatetoaddress(self.nodes[0], 1, self.boring.getnewaddress(), sync_fun=self.no_op)
@@ -345,7 +347,7 @@ class WalletTaprootTest(BitcoinTestFramework):
             self.boring.sendtoaddress(address=addr_g, amount=Decimal(to_amnt) / 100000000, subtractfeefromamount=True)
             self.generatetoaddress(self.nodes[0], 1, self.boring.getnewaddress(), sync_fun=self.no_op)
             test_balance = int(psbt_online.getbalance() * 100000000)
-            ret_amnt = random.randrange(100000, test_balance)
+            ret_amnt = random.randrange(100000, min(test_balance, to_amnt))
             # Increase fee_rate to compensate for the wallet's inability to estimate fees for script path spends.
             psbt = psbt_online.walletcreatefundedpsbt([], [{self.boring.getnewaddress(): Decimal(ret_amnt) / 100000000}], None, {"subtractFeeFromOutputs":[0], "fee_rate": 200, "change_type": address_type})['psbt']
             res = psbt_offline.walletprocesspsbt(psbt=psbt, finalize=False)
@@ -395,7 +397,7 @@ class WalletTaprootTest(BitcoinTestFramework):
 
         self.log.info("Mining blocks...")
         gen_addr = self.boring.getnewaddress()
-        self.generatetoaddress(self.nodes[0], 101, gen_addr, sync_fun=self.no_op)
+        self.generatetoaddress(self.nodes[0], COINBASE_MATURITY + 1, gen_addr, sync_fun=self.no_op)
 
         self.do_test(
             "tr(XPRV)",

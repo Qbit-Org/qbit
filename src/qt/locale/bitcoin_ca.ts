@@ -1008,8 +1008,8 @@ Només és possible firmar amb adreces del tipus "legacy".</translation>
         <translation type="unfinished">(%1 bloquejada)</translation>
     </message>
     <message>
-        <source>Can vary +/- %1 satoshi(s) per input.</source>
-        <translation type="unfinished">Pot variar en +/- %1 satoshi(s) per entrada.</translation>
+        <source>Can vary +/- %1 bits per input.</source>
+        <translation type="unfinished">Pot variar en +/- %1 bits per entrada.</translation>
     </message>
     <message>
         <source>(no label)</source>
@@ -2831,12 +2831,12 @@ Per a obtenir més informació sobre com utilitzar aquesta consola, escriviu %6.
     <message>
         <source>Specify a custom fee per kB (1,000 bytes) of the transaction's virtual size.
 
-Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 satoshis per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 satoshis.</source>
+Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 bits per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 bits.</source>
         <translation type="unfinished">Especifiqueu una tarifa personalitzada per kB (1.000 bytes) de la mida virtual de la transacció.
-Nota: atès que la tarifa es calcula per byte, una tarifa de "100 satoshis per kvB" per a una mida de transacció de 500 bytes virtuals (la meitat d'1 kvB) donaria finalment una tarifa de només 50 satoshis.</translation>
+Nota: atès que la tarifa es calcula per byte, una tarifa de "100 bits per kvB" per a una mida de transacció de 500 bytes virtuals (la meitat d'1 kvB) donaria finalment una tarifa de només 50 bits.</translation>
     </message>
     <message>
-        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for bitcoin transactions than the network can process.</source>
+        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for qbit transactions than the network can process.</source>
         <translation type="unfinished">Quan no hi ha prou espai en els blocs per a encabir totes les transaccions, els miners i així mateix els nodes de trànsit poden exigir una taxa mínima. És acceptable pagar únicament la taxa mínima, però tingueu present que pot resultar que la vostra transacció no sigui mai confirmada mentre hi hagi més demanda de transaccions bitcoin de les que la xarxa pot processar.</translation>
     </message>
     <message>
@@ -3109,7 +3109,7 @@ Nota: atès que la tarifa es calcula per byte, una tarifa de "100 satoshis per k
         <translation type="unfinished">L’import a enviar a la unitat seleccionada</translation>
     </message>
     <message>
-        <source>The fee will be deducted from the amount being sent. The recipient will receive less bitcoins than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
+        <source>The fee will be deducted from the amount being sent. The recipient will receive less QBT than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
         <translation type="unfinished">La tarifa es deduirà de l'import que s'enviarà. El destinatari rebrà menys bitcoins que les que introduïu al camp d'import. Si se seleccionen múltiples destinataris, la tarifa es dividirà per igual.</translation>
     </message>
     <message>

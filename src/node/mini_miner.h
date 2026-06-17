@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_NODE_MINI_MINER_H
-#define BITCOIN_NODE_MINI_MINER_H
+#ifndef QBIT_NODE_MINI_MINER_H
+#define QBIT_NODE_MINI_MINER_H
 
 #include <consensus/amount.h>
 #include <primitives/transaction.h>
@@ -169,4 +169,4 @@ public:
 };
 } // namespace node
 
-#endif // BITCOIN_NODE_MINI_MINER_H
+#endif // QBIT_NODE_MINI_MINER_H

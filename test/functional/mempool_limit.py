@@ -7,6 +7,7 @@
 from decimal import Decimal
 
 from test_framework.mempool_util import (
+    MIN_MAX_MEMPOOL_SIZE_MB,
     fill_mempool,
 )
 from test_framework.p2p import P2PTxInvStore
@@ -29,7 +30,7 @@ class MempoolLimitTest(BitcoinTestFramework):
         self.setup_clean_chain = True
         self.num_nodes = 1
         self.extra_args = [[
-            "-maxmempool=5",
+            f"-maxmempool={MIN_MAX_MEMPOOL_SIZE_MB}",
         ]]
 
     def test_rbf_carveout_disallowed(self):
@@ -115,7 +116,7 @@ class MempoolLimitTest(BitcoinTestFramework):
         # Series of parents that don't need CPFP and are submitted individually. Each one is large
         # which means in aggregate they could trigger eviction, but child submission should result
         # in them not being evicted
-        parent_vsize = 25000
+        parent_vsize = 40000
         num_big_parents = 3
         # Need to be large enough to trigger eviction
         # (note that the mempool usage of a tx is about three times its vsize)
@@ -303,13 +304,13 @@ class MempoolLimitTest(BitcoinTestFramework):
         self.log.info("Check a package that passes mempoolminfee but is evicted immediately after submission")
         mempoolmin_feerate = node.getmempoolinfo()["mempoolminfee"]
         current_mempool = node.getrawmempool(verbose=False)
-        worst_feerate_btcvb = Decimal("21000000")
+        worst_feerate_btcvb = Decimal("210000000")
         for txid in current_mempool:
             entry = node.getmempoolentry(txid)
             worst_feerate_btcvb = min(worst_feerate_btcvb, entry["fees"]["descendant"] / entry["descendantsize"])
         # Needs to be large enough to trigger eviction
         # (note that the mempool usage of a tx is about three times its vsize)
-        target_vsize_each = 50000
+        target_vsize_each = 60000
         assert_greater_than(target_vsize_each * 2 * 3, node.getmempoolinfo()["maxmempool"] - node.getmempoolinfo()["bytes"])
         # Should be a true CPFP: parent's feerate is just below mempool min feerate
         parent_feerate = mempoolmin_feerate - Decimal("0.0000001")  # 0.01 sats/vbyte below min feerate
@@ -330,9 +331,12 @@ class MempoolLimitTest(BitcoinTestFramework):
         for wtxid in [tx_parent_just_below["wtxid"], tx_child_just_above["wtxid"]]:
             assert_equal(res["tx-results"][wtxid]["error"], "mempool full")
 
-        self.log.info('Test passing a value below the minimum (5 MB) to -maxmempool throws an error')
+        self.log.info(f'Test passing a value below the minimum ({MIN_MAX_MEMPOOL_SIZE_MB} MB) to -maxmempool throws an error')
         self.stop_node(0)
-        self.nodes[0].assert_start_raises_init_error(["-maxmempool=4"], "Error: -maxmempool must be at least 5 MB")
+        self.nodes[0].assert_start_raises_init_error(
+            [f"-maxmempool={MIN_MAX_MEMPOOL_SIZE_MB - 1}"],
+            f"Error: -maxmempool must be at least {MIN_MAX_MEMPOOL_SIZE_MB} MB",
+        )
 
         self.test_mid_package_eviction_success()
         self.test_mid_package_replacement()

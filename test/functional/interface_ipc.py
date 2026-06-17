@@ -7,6 +7,7 @@ import asyncio
 from io import BytesIO
 from pathlib import Path
 import shutil
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.messages import (CBlock, CTransaction, ser_uint256, COIN)
 from test_framework.test_framework import (BitcoinTestFramework, assert_equal)
 from test_framework.wallet import MiniWallet
@@ -104,6 +105,12 @@ class IPCInterfaceTest(BitcoinTestFramework):
         block_header_size = 80
         timeout = 1000.0 # 1000 milliseconds
         miniwallet = MiniWallet(self.nodes[0])
+        try:
+            miniwallet.get_utxo(mark_as_spent=False)
+        except StopIteration:
+            self.log.debug(f"No mature MiniWallet UTXOs, mining {COINBASE_MATURITY} blocks")
+            self.generatetodescriptor(self.nodes[0], COINBASE_MATURITY, miniwallet.get_descriptor())
+            miniwallet.rescan_utxos()
 
         async def async_routine():
             ctx, init = await self.make_capnp_init_ctx()

@@ -16,10 +16,12 @@ import time
 
 from test_framework.messages import (
     CInv,
+    MAX_BLOCK_WEIGHT,
     MSG_BLOCK,
     msg_getdata,
     msg_mempool,
 )
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.p2p import P2PInterface
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
@@ -68,9 +70,10 @@ class MaxUploadTest(BitcoinTestFramework):
         old_time = int(time.time() - 2*60*60*24*7)
         self.nodes[0].setmocktime(old_time)
 
-        # Generate some old blocks
+        # Generate old blocks and ensure enough mature coinbase outputs are available
+        # for two large-tx batches (14 spends each).
         self.wallet = MiniWallet(self.nodes[0])
-        self.generate(self.wallet, 130)
+        self.generate(self.wallet, COINBASE_MATURITY + 30)
 
         # p2p_conns[0] will only request old blocks
         # p2p_conns[1] will only request new blocks
@@ -106,7 +109,7 @@ class MaxUploadTest(BitcoinTestFramework):
         getdata_request.inv.append(CInv(MSG_BLOCK, big_old_block))
 
         max_bytes_per_day = UPLOAD_TARGET_MB * 1024 *1024
-        daily_buffer = 144 * 4000000
+        daily_buffer = 144 * MAX_BLOCK_WEIGHT
         max_bytes_available = max_bytes_per_day - daily_buffer
         success_count = max_bytes_available // old_block_size
 

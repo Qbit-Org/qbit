@@ -6,7 +6,7 @@
 
 import shutil
 
-from test_framework.blocktools import COINBASE_MATURITY
+from test_framework.descriptors import descsum_create
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_equal,
@@ -36,8 +36,8 @@ class WalletHDTest(BitcoinTestFramework):
         assert_equal(change_addrV["hdkeypath"], "m/84h/1h/0h/1/0")
 
         # Import a non-HD private key in the HD wallet
-        non_hd_add = 'bcrt1qmevj8zfx0wdvp05cqwkmr6mxkfx60yezwjksmt'
-        non_hd_key = 'cS9umN9w6cDMuRVYdbkfE4c7YUFLJRoXMfhQ569uY4odiQbVN8Rt'
+        non_hd_key = 'Rdpt2arGKPLKmeXUG4wU7MhZNkaiMt1TURDtDvrzh8ngAF841eMV'
+        non_hd_add = self.nodes[1].deriveaddresses(descsum_create(f"wpkh({non_hd_key})"))[0]
         wallet_importprivkey(self.nodes[1], non_hd_key, "now")
 
         # This should be enough to keep the master key and the non-HD key
@@ -45,7 +45,7 @@ class WalletHDTest(BitcoinTestFramework):
 
         # Derive some HD addresses and remember the last
         # Also send funds to each add
-        self.generate(self.nodes[0], COINBASE_MATURITY + 1)
+        self.ensure_mature_coinbase(self.nodes[0])
         hd_add = None
         NUM_HD_ADDS = 10
         for i in range(1, NUM_HD_ADDS + 1):

@@ -33,8 +33,8 @@ static RPCHelpMan estimatesmartfee()
         "estimatesmartfee",
         "Estimates the approximate fee per kilobyte needed for a transaction to begin\n"
         "confirmation within conf_target blocks if possible and return the number of blocks\n"
-        "for which the estimate is valid. Uses virtual transaction size as defined\n"
-        "in BIP 141 (witness data is discounted).\n",
+        "for which the estimate is valid. Uses qbit virtual transaction size,\n"
+        "which does not discount witness data.\n",
         {
             {"conf_target", RPCArg::Type::NUM, RPCArg::Optional::NO, "Confirmation target in blocks (1 - 1008)"},
             {"estimate_mode", RPCArg::Type::STR, RPCArg::Default{"economical"}, "The fee estimate mode.\n"
@@ -104,8 +104,8 @@ static RPCHelpMan estimaterawfee()
         "implementation of fee estimation. The parameters it can be called with\n"
         "and the results it returns will change if the internal implementation changes.\n"
         "\nEstimates the approximate fee per kilobyte needed for a transaction to begin\n"
-        "confirmation within conf_target blocks if possible. Uses virtual transaction size as\n"
-        "defined in BIP 141 (witness data is discounted).\n",
+        "confirmation within conf_target blocks if possible. Uses qbit virtual transaction size,\n"
+        "which does not discount witness data.\n",
         {
             {"conf_target", RPCArg::Type::NUM, RPCArg::Optional::NO, "Confirmation target in blocks (1 - 1008)"},
             {"threshold", RPCArg::Type::NUM, RPCArg::Default{0.95}, "The proportion of transactions in a given feerate range that must have been\n"

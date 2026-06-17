@@ -1,94 +1,74 @@
-Bitcoin Core
-=============
+qbit Documentation
+==================
 
-Setup
----------------------
-Bitcoin Core is the original Bitcoin client and it builds the backbone of the network. It downloads and, by default, stores the entire history of Bitcoin transactions, which requires several hundred gigabytes or more of disk space. Depending on the speed of your computer and network connection, the synchronization process can take anywhere from a few hours to several days or more.
+This tree separates primary qbit user guidance from technical/source
+references. Current public release, network, support, faucet, explorer,
+security, and launch-resource status is published through https://qbit.org.
 
-To download Bitcoin Core, visit [bitcoincore.org](https://bitcoincore.org/en/download/).
+Mainnet is not public yet. Mainnet-oriented examples in this tree apply only
+when qbit mainnet is announced.
 
-Running
----------------------
-The following are some helpful notes on how to run Bitcoin Core on your native platform.
+Primary User Docs
+-----------------
 
-### Unix
+- [Public Testnet Resources and Status](user/public-testnet.md)
+- [Getting Started With qbit](user/getting-started.md)
+- [What Changed From Bitcoin Core](user/bitcoin-core-differences.md)
+- [Run a qbit Node](user/run-node.md)
+- [Full-Validation Bootstrap](user/full-validation-bootstrap.md)
+- [Wallets, P2MR Addresses, and Backups](user/wallet/p2mr-wallets.md)
+- [P2MR Watch-Only Pubkey Database Guide](user/wallet/p2mr-pubkeydb.md)
+- [P2MR Multisig](user/wallet/p2mr-multisig.md)
+- [qbit.conf Configuration File](user/setup/bitcoin-conf.md)
+- [Files](user/setup/files.md)
 
-Unpack the files into a directory and run:
+Integration Docs
+----------------
 
-- `bin/bitcoin-qt` (GUI) or
-- `bin/bitcoind` (headless)
-- `bin/bitcoin` (wrapper command)
+- [Exchange and Integrator Quickstart](integration/exchange-integrator-quickstart.md)
+- [Mining and Pool Quickstart](integration/mining-pool-quickstart.md)
+- [RPC Delta and Reference Links](integration/rpc-delta-reference.md)
+- [JSON-RPC Interface](integration/JSON-RPC-interface.md)
+- [ZMQ](integration/zmq.md)
+- [Multiprocess](integration/multiprocess.md)
+- [Canonical RPC Reference](https://docs.qbit.org/)
 
-The `bitcoin` command supports subcommands like `bitcoin gui`, `bitcoin node`, and `bitcoin rpc` exposing different functionality. Subcommands can be listed with `bitcoin help`.
+Technical References
+--------------------
 
-### Windows
+These are public technical references, not first-run wallet or operator
+recipes.
 
-Unpack the files into a directory, and then run bitcoin-qt.exe.
+- [Wallet descriptors](user/wallet/descriptors.md)
+- [PSBT technical reference](user/wallet/psbt.md)
+- [Managing wallets](user/wallet/managing-wallets.md)
+- [Tor support](user/network/tor.md)
+- [I2P support](user/network/i2p.md)
+- [Transaction relay policy](policy/README.md)
+- [Reference material](reference/README.md)
+- [Design notes](design/)
+- [Deployment examples](deployment/)
+- [Subtree runbooks](subtrees/)
 
-### macOS
+Source Contributor References
+-----------------------------
 
-Drag Bitcoin Core to your applications folder, and then run Bitcoin Core.
+- [Build docs](build/)
+- [Developer notes](development/developer-notes.md)
+- [Developer productivity](development/productivity.md)
+- [Performance benchmarking](performance/benchmarking.md)
+- [RPC benchmarking](performance/rpc-benchmarking.md)
+- [Tracing](performance/tracing.md)
 
-### Need Help?
+Unlisted or Sanitized Docs
+--------------------------
 
-* See the documentation at the [Bitcoin Wiki](https://en.bitcoin.it/wiki/Main_Page)
-for help and more information.
-* Ask for help on [Bitcoin StackExchange](https://bitcoin.stackexchange.com).
-* Ask for help on #bitcoin on Libera Chat. If you don't have an IRC client, you can use [web.libera.chat](https://web.libera.chat/#bitcoin).
-* Ask for help on the [BitcoinTalk](https://bitcointalk.org/) forums, in the [Technical Support board](https://bitcointalk.org/index.php?board=4.0).
-
-Building
----------------------
-The following are developer notes on how to build Bitcoin Core on your native platform. They are not complete guides, but include notes on the necessary libraries, compile flags, etc.
-
-- [Dependencies](dependencies.md)
-- [macOS Build Notes](build-osx.md)
-- [Unix Build Notes](build-unix.md)
-- [Windows Build Notes](build-windows-msvc.md)
-- [FreeBSD Build Notes](build-freebsd.md)
-- [OpenBSD Build Notes](build-openbsd.md)
-- [NetBSD Build Notes](build-netbsd.md)
-
-Development
----------------------
-The Bitcoin repo's [root README](/README.md) contains relevant information on the development process and automated testing.
-
-- [Developer Notes](developer-notes.md)
-- [Productivity Notes](productivity.md)
-- [Release Process](release-process.md)
-- [Source Code Documentation (External Link)](https://doxygen.bitcoincore.org/)
-- [Translation Process](translation_process.md)
-- [Translation Strings Policy](translation_strings_policy.md)
-- [JSON-RPC Interface](JSON-RPC-interface.md)
-- [Unauthenticated REST Interface](REST-interface.md)
-- [BIPS](bips.md)
-- [Dnsseed Policy](dnsseed-policy.md)
-- [Benchmarking](benchmarking.md)
-- [Internal Design Docs](design/)
-
-### Resources
-* Discuss on the [BitcoinTalk](https://bitcointalk.org/) forums, in the [Development & Technical Discussion board](https://bitcointalk.org/index.php?board=6.0).
-* Discuss project-specific development on #bitcoin-core-dev on Libera Chat. If you don't have an IRC client, you can use [web.libera.chat](https://web.libera.chat/#bitcoin-core-dev).
-
-### Miscellaneous
-- [Assets Attribution](assets-attribution.md)
-- [bitcoin.conf Configuration File](bitcoin-conf.md)
-- [CJDNS Support](cjdns.md)
-- [Files](files.md)
-- [Fuzz-testing](fuzzing.md)
-- [I2P Support](i2p.md)
-- [Init Scripts (systemd/upstart/openrc)](init.md)
-- [Managing Wallets](managing-wallets.md)
-- [Multisig Tutorial](multisig-tutorial.md)
-- [Offline Signing Tutorial](offline-signing-tutorial.md)
-- [P2P bad ports definition and list](p2p-bad-ports.md)
-- [PSBT support](psbt.md)
-- [Reduce Memory](reduce-memory.md)
-- [Reduce Traffic](reduce-traffic.md)
-- [Tor Support](tor.md)
-- [Transaction Relay Policy](policy/README.md)
-- [ZMQ](zmq.md)
+Some inherited, unresolved, or launch-sensitive documents are deliberately not
+linked from this public index and are stripped from sanitized public source
+snapshots. Use the public guides listed above and qbit.org for finalized
+release, security, and network-resource guidance.
 
 License
----------------------
+-------
+
 Distributed under the [MIT software license](/COPYING).

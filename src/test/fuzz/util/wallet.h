@@ -2,12 +2,14 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_TEST_FUZZ_UTIL_WALLET_H
-#define BITCOIN_TEST_FUZZ_UTIL_WALLET_H
+#ifndef QBIT_TEST_FUZZ_UTIL_WALLET_H
+#define QBIT_TEST_FUZZ_UTIL_WALLET_H
 
 #include <test/fuzz/FuzzedDataProvider.h>
 #include <test/fuzz/fuzz.h>
 #include <test/fuzz/util.h>
+#include <key_io.h>
+#include <outputtype.h>
 #include <policy/policy.h>
 #include <wallet/coincontrol.h>
 #include <wallet/fees.h>
@@ -37,36 +39,18 @@ struct FuzzedWallet {
     }
     void ImportDescriptors(const std::string& seed_insecure)
     {
-        const std::vector<std::string> DESCS{
-            "pkh(%s/%s/*)",
-            "sh(wpkh(%s/%s/*))",
-            "tr(%s/%s/*)",
-            "wpkh(%s/%s/*)",
-        };
+        const CExtKey master_key = DecodeExtKey(seed_insecure);
+        assert(master_key.key.IsValid());
 
-        for (const std::string& desc_fmt : DESCS) {
-            for (bool internal : {true, false}) {
-                const auto descriptor{strprintf(tfm::RuntimeFormat{desc_fmt}, "[5aa9973a/66h/4h/2h]" + seed_insecure, int{internal})};
-
-                FlatSigningProvider keys;
-                std::string error;
-                auto parsed_desc = std::move(Parse(descriptor, keys, error, /*require_checksum=*/false).at(0));
-                assert(parsed_desc);
-                assert(error.empty());
-                assert(parsed_desc->IsRange());
-                assert(parsed_desc->IsSingleType());
-                assert(!keys.keys.empty());
-                WalletDescriptor w_desc{std::move(parsed_desc), /*creation_time=*/0, /*range_start=*/0, /*range_end=*/1, /*next_index=*/0};
-                assert(!wallet->GetDescriptorScriptPubKeyMan(w_desc));
-                LOCK(wallet->cs_wallet);
-                auto& spk_manager = Assert(wallet->AddWalletDescriptor(w_desc, keys, /*label=*/"", internal))->get();
-                wallet->AddActiveScriptPubKeyMan(spk_manager.GetID(), *Assert(w_desc.descriptor->GetOutputType()), internal);
-            }
-        }
+        LOCK(wallet->cs_wallet);
+        assert(RunWithinTxn(wallet->GetDatabase(), /*process_desc=*/"setup descriptors", [&](WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(wallet->cs_wallet) {
+            wallet->SetupDescriptorScriptPubKeyMans(batch, master_key, GetSupportedOutputTypes());
+            return true;
+        }));
     }
     CTxDestination GetDestination(FuzzedDataProvider& fuzzed_data_provider)
     {
-        auto type{fuzzed_data_provider.PickValueInArray(OUTPUT_TYPES)};
+        auto type{fuzzed_data_provider.PickValueInArray(SUPPORTED_OUTPUT_TYPES)};
         if (fuzzed_data_provider.ConsumeBool()) {
             return *Assert(wallet->GetNewDestination(type, ""));
         } else {
@@ -77,4 +61,4 @@ struct FuzzedWallet {
 };
 }
 
-#endif // BITCOIN_TEST_FUZZ_UTIL_WALLET_H
+#endif // QBIT_TEST_FUZZ_UTIL_WALLET_H

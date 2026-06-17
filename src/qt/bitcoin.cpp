@@ -90,7 +90,7 @@ static void RegisterMetaTypes()
     qRegisterMetaType<std::function<void()>>("std::function<void()>");
     qRegisterMetaType<QMessageBox::Icon>("QMessageBox::Icon");
     qRegisterMetaType<interfaces::BlockAndHeaderTipInfo>("interfaces::BlockAndHeaderTipInfo");
-    qRegisterMetaType<BitcoinUnit>("BitcoinUnit");
+    qRegisterMetaType<QbitUnit>("QbitUnit");
 }
 
 static QString GetLangTerritory()
@@ -140,12 +140,12 @@ static void initTranslations(QTranslator &qtTranslatorBase, QTranslator &qtTrans
         QApplication::installTranslator(&qtTranslator);
     }
 
-    // Load e.g. bitcoin_de.qm (shortcut "de" needs to be defined in bitcoin.qrc)
+    // Load e.g. bitcoin_de.qm (shortcut "de" needs to be defined in bitcoin_locale.qrc)
     if (translatorBase.load(lang, ":/translations/")) {
         QApplication::installTranslator(&translatorBase);
     }
 
-    // Load e.g. bitcoin_de_DE.qm (shortcut "de_DE" needs to be defined in bitcoin.qrc)
+    // Load e.g. bitcoin_de_DE.qm (shortcut "de_DE" needs to be defined in bitcoin_locale.qrc)
     if (translator.load(lang_territory, ":/translations/")) {
         QApplication::installTranslator(&translator);
     }
@@ -195,7 +195,7 @@ void DebugMessageHandler(QtMsgType type, const QMessageLogContext& context, cons
 }
 
 static int qt_argc = 1;
-static const char* qt_argv = "bitcoin-qt";
+static const char* qt_argv = "qbit-qt";
 
 BitcoinApplication::BitcoinApplication()
     : QApplication(qt_argc, const_cast<char**>(&qt_argv))
@@ -413,7 +413,7 @@ void BitcoinApplication::initializeResult(bool success, interfaces::BlockAndHead
 
 #ifdef ENABLE_WALLET
         // Now that initialization/startup is done, process any command-line
-        // bitcoin: URIs or payment requests:
+        // qbit: URIs or payment requests:
         if (paymentServer) {
             connect(paymentServer, &PaymentServer::receivedPaymentRequest, window, &BitcoinGUI::handlePaymentRequest);
             connect(window, &BitcoinGUI::receivedURI, paymentServer, &PaymentServer::handleURIOrFile);
@@ -496,7 +496,7 @@ int GuiMain(int argc, char* argv[])
     // Do not refer to data directory yet, this can be overridden by Intro::pickDataDirectory
 
     /// 1. Basic Qt initialization (not dependent on parameters or configuration)
-    Q_INIT_RESOURCE(bitcoin);
+    Q_INIT_RESOURCE(qbit);
     Q_INIT_RESOURCE(bitcoin_locale);
 
 #if defined(QT_QPA_PLATFORM_ANDROID)
@@ -529,7 +529,8 @@ int GuiMain(int argc, char* argv[])
         QString arg(argv[i]);
         bool invalid_token = !arg.startsWith("-");
 #ifdef ENABLE_WALLET
-        if (arg.startsWith(BITCOIN_IPC_PREFIX, Qt::CaseInsensitive)) {
+        if (arg.startsWith(QBIT_IPC_PREFIX, Qt::CaseInsensitive) ||
+            arg.startsWith(LEGACY_BITCOIN_IPC_PREFIX, Qt::CaseInsensitive)) {
             invalid_token &= false;
             payment_server_token_seen = true;
         }
@@ -542,10 +543,10 @@ int GuiMain(int argc, char* argv[])
             return EXIT_FAILURE;
         }
         if (invalid_token) {
-            InitError(Untranslated(strprintf("Command line contains unexpected token '%s', see bitcoin-qt -h for a list of options.", argv[i])));
+            InitError(Untranslated(strprintf("Command line contains unexpected token '%s', see qbit-qt -h for a list of options.", argv[i])));
             QMessageBox::critical(nullptr, CLIENT_NAME,
                                   // message cannot be translated because translations have not been initialized
-                                  QString::fromStdString("Command line contains unexpected token '%1', see bitcoin-qt -h for a list of options.").arg(QString::fromStdString(argv[i])));
+                                  QString::fromStdString("Command line contains unexpected token '%1', see qbit-qt -h for a list of options.").arg(QString::fromStdString(argv[i])));
             return EXIT_FAILURE;
         }
     }
@@ -625,7 +626,7 @@ int GuiMain(int argc, char* argv[])
         exit(EXIT_SUCCESS);
 
     // Start up the payment server early, too, so impatient users that click on
-    // bitcoin: links repeatedly have their payment requests routed to this process:
+    // qbit: links repeatedly have their payment requests routed to this process:
     if (WalletModel::isWalletEnabled()) {
         app.createPaymentServer();
     }

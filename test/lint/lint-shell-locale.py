@@ -15,12 +15,15 @@ import subprocess
 import sys
 import re
 
+from lint_ignore_dirs import SHARED_EXCLUDED_SUBTREES
+
 OPT_IN_LINE = '# This script is intentionally locale dependent by not setting \"export LC_ALL=C\"'
 
 OPT_OUT_LINES = [
     'export LC_ALL=C',
     'export LC_ALL=C.UTF-8',
 ]
+EXCLUDED_SUBTREES = tuple(SHARED_EXCLUDED_SUBTREES)
 
 def get_shell_files_list():
     command = [
@@ -41,7 +44,7 @@ def main():
     exit_code = 0
     shell_files = get_shell_files_list()
     for file_path in shell_files:
-        if re.search('src/(secp256k1|minisketch)/', file_path):
+        if file_path.startswith(EXCLUDED_SUBTREES):
             continue
 
         with open(file_path, 'r', encoding='utf-8') as file_obj:
@@ -64,4 +67,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

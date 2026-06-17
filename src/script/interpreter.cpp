@@ -5,12 +5,16 @@
 
 #include <script/interpreter.h>
 
+#include <crypto/pqc.h>
 #include <crypto/ripemd160.h>
 #include <crypto/sha1.h>
 #include <crypto/sha256.h>
 #include <pubkey.h>
 #include <script/script.h>
 #include <uint256.h>
+
+#include <algorithm>
+#include <limits>
 
 typedef std::vector<unsigned char> valtype;
 
@@ -28,6 +32,18 @@ inline bool set_error(ScriptError* ret, const ScriptError serror)
     if (ret)
         *ret = serror;
     return false;
+}
+
+bool CheckP2MRV1InitialStackResourceLimits(const std::span<const valtype>& stack, ScriptError* serror)
+{
+    if (stack.size() > MAX_STACK_SIZE) return set_error(serror, SCRIPT_ERR_STACK_SIZE);
+    size_t total_stack_bytes{0};
+    for (const valtype& elem : stack) {
+        if (elem.size() > MAX_P2MR_V1_STACK_ITEM_SIZE) return set_error(serror, SCRIPT_ERR_PUSH_SIZE);
+        total_stack_bytes += elem.size();
+        if (total_stack_bytes > MAX_P2MR_V1_TOTAL_INITIAL_STACK_BYTES) return set_error(serror, SCRIPT_ERR_PUSH_SIZE);
+    }
+    return true;
 }
 
 } // namespace
@@ -383,6 +399,73 @@ static bool EvalChecksigTapscript(const valtype& sig, const valtype& pubkey, Scr
     return true;
 }
 
+static bool EvalChecksigP2MR(const valtype& sig, const valtype& pubkey, ScriptExecutionData& execdata, unsigned int flags, const BaseSignatureChecker& checker, SigVersion sigversion, ScriptError* serror, bool& success)
+{
+    assert(sigversion == SigVersion::P2MR);
+
+    /*
+     *  P2MR signature validation (consensus critical). Same structure as Tapscript
+     *  (EvalChecksigTapscript) but uses PQC verification and a larger weight budget.
+     */
+    success = !sig.empty();
+    if (success) {
+        // Count every non-empty P2MR signature operation at the fixed PQC cost.
+        assert(execdata.m_validation_weight_left_init);
+        execdata.m_validation_weight_left -= VALIDATION_WEIGHT_PER_SIGOP_PQC;
+        if (execdata.m_validation_weight_left < 0) {
+            return set_error(serror, SCRIPT_ERR_P2MR_VALIDATION_WEIGHT);
+        }
+    }
+    if (pubkey.size() == 0) {
+        return set_error(serror, SCRIPT_ERR_PUBKEYTYPE);
+    } else if (pubkey.size() == 32) {
+        // 32-byte pubkeys are PQC (bounded SPHINCS+) in P2MR context
+        if (success && !checker.CheckPQCSignature(sig, pubkey, sigversion, execdata, serror)) {
+            return false; // serror is set by CheckPQCSignature
+        }
+    } else {
+        // P2MR v1 defines exactly 32-byte PQC public keys. Future signature
+        // systems should use a new leaf version, opcode, or outer witness version.
+        return set_error(serror, SCRIPT_ERR_PUBKEYTYPE);
+    }
+
+    return true;
+}
+
+static bool EvalCheckDataSigPQC(const valtype& sig, const valtype& msg_hash, const valtype& pubkey, ScriptExecutionData& execdata, ScriptError* serror, bool& success)
+{
+    success = !sig.empty();
+    if (success) {
+        // Match P2MR transaction signatures: every non-empty PQC signature
+        // attempt is charged before deeper validation.
+        assert(execdata.m_validation_weight_left_init);
+        execdata.m_validation_weight_left -= VALIDATION_WEIGHT_PER_SIGOP_PQC;
+        if (execdata.m_validation_weight_left < 0) {
+            return set_error(serror, SCRIPT_ERR_P2MR_VALIDATION_WEIGHT);
+        }
+    }
+
+    if (pubkey.size() != PQC_PUBKEY_SIZE) {
+        return set_error(serror, SCRIPT_ERR_PUBKEYTYPE);
+    }
+    if (msg_hash.size() != 32) {
+        return set_error(serror, SCRIPT_ERR_PUSH_SIZE);
+    }
+    if (!success) {
+        return true;
+    }
+    if (sig.size() != PQC_SIG_SIZE) {
+        return set_error(serror, SCRIPT_ERR_P2MR_SIG_SIZE);
+    }
+
+    const CPQCPubKey pqc_pubkey{pubkey};
+    const uint256 datasig_hash = ComputeQbitDataSigPQCHash(msg_hash);
+    if (!pqc_pubkey.Verify(datasig_hash, sig)) {
+        return set_error(serror, SCRIPT_ERR_P2MR_SIG);
+    }
+    return true;
+}
+
 /** Helper for OP_CHECKSIG, OP_CHECKSIGVERIFY, and (in Tapscript) OP_CHECKSIGADD.
  *
  * A return value of false means the script fails entirely. When true is returned, the
@@ -396,6 +479,8 @@ static bool EvalChecksig(const valtype& sig, const valtype& pubkey, CScript::con
         return EvalChecksigPreTapscript(sig, pubkey, pbegincodehash, pend, flags, checker, sigversion, serror, success);
     case SigVersion::TAPSCRIPT:
         return EvalChecksigTapscript(sig, pubkey, execdata, flags, checker, sigversion, serror, success);
+    case SigVersion::P2MR:
+        return EvalChecksigP2MR(sig, pubkey, execdata, flags, checker, sigversion, serror, success);
     case SigVersion::TAPROOT:
         // Key path spending in Taproot has no script, so this is unreachable.
         break;
@@ -414,7 +499,7 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
     static const valtype vchTrue(1, 1);
 
     // sigversion cannot be TAPROOT here, as it admits no script execution.
-    assert(sigversion == SigVersion::BASE || sigversion == SigVersion::WITNESS_V0 || sigversion == SigVersion::TAPSCRIPT);
+    assert(sigversion == SigVersion::BASE || sigversion == SigVersion::WITNESS_V0 || sigversion == SigVersion::TAPSCRIPT || sigversion == SigVersion::P2MR);
 
     CScript::const_iterator pc = script.begin();
     CScript::const_iterator pend = script.end();
@@ -591,7 +676,41 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                     break;
                 }
 
-                case OP_NOP1: case OP_NOP4: case OP_NOP5:
+                case OP_CHECKSIGPQC:
+                {
+                    if (sigversion != SigVersion::P2MR) return set_error(serror, SCRIPT_ERR_BAD_OPCODE);
+
+                    // OP_CHECKSIGPQC: [sig] [pubkey] -> [result]
+                    // Same stack semantics as OP_CHECKSIG in P2MR context
+                    if (stack.size() < 2)
+                        return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
+
+                    valtype& vchSig    = stacktop(-2);
+                    valtype& vchPubKey = stacktop(-1);
+
+                    bool fSuccess = true;
+                    if (!EvalChecksig(vchSig, vchPubKey, pbegincodehash, pend, execdata, flags, checker, sigversion, serror, fSuccess)) return false;
+                    popstack(stack);
+                    popstack(stack);
+                    stack.push_back(fSuccess ? vchTrue : vchFalse);
+                }
+                break;
+
+                case OP_CHECKTEMPLATEVERIFY:
+                {
+                    if (sigversion != SigVersion::P2MR) return set_error(serror, SCRIPT_ERR_BAD_OPCODE);
+                    if (stack.empty()) return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
+
+                    const valtype& expected = stacktop(-1);
+                    if (expected.size() == uint256::size()) {
+                        if (!checker.CheckTemplateVerifyHash(expected, serror)) return false;
+                    } else if (flags & SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS) {
+                        return set_error(serror, SCRIPT_ERR_DISCOURAGE_OP_SUCCESS);
+                    }
+                }
+                break;
+
+                case OP_NOP1: case OP_NOP5:
                 case OP_NOP6: case OP_NOP7: case OP_NOP8: case OP_NOP9: case OP_NOP10:
                 {
                     if (flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS)
@@ -609,8 +728,8 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                         if (stack.size() < 1)
                             return set_error(serror, SCRIPT_ERR_UNBALANCED_CONDITIONAL);
                         valtype& vch = stacktop(-1);
-                        // Tapscript requires minimal IF/NOTIF inputs as a consensus rule.
-                        if (sigversion == SigVersion::TAPSCRIPT) {
+                        // Tapscript/P2MR requires minimal IF/NOTIF inputs as a consensus rule.
+                        if (sigversion == SigVersion::TAPSCRIPT || sigversion == SigVersion::P2MR) {
                             // The input argument to the OP_IF and OP_NOTIF opcodes must be either
                             // exactly 0 (the empty vector) or exactly 1 (the one-byte vector with value 1).
                             if (vch.size() > 1 || (vch.size() == 1 && vch[0] != 1)) {
@@ -1058,6 +1177,8 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                 case OP_CHECKSIG:
                 case OP_CHECKSIGVERIFY:
                 {
+                    if (sigversion == SigVersion::P2MR) return set_error(serror, SCRIPT_ERR_P2MR_CHECKSIG);
+
                     // (sig pubkey -- bool)
                     if (stack.size() < 2)
                         return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
@@ -1082,8 +1203,8 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
 
                 case OP_CHECKSIGADD:
                 {
-                    // OP_CHECKSIGADD is only available in Tapscript
-                    if (sigversion == SigVersion::BASE || sigversion == SigVersion::WITNESS_V0) return set_error(serror, SCRIPT_ERR_BAD_OPCODE);
+                    // OP_CHECKSIGADD is only available in Tapscript and P2MR
+                    if (sigversion != SigVersion::TAPSCRIPT && sigversion != SigVersion::P2MR) return set_error(serror, SCRIPT_ERR_BAD_OPCODE);
 
                     // (sig num pubkey -- num)
                     if (stack.size() < 3) return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
@@ -1101,10 +1222,52 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                 }
                 break;
 
+                case OP_CHECKDATASIGPQC:
+                {
+                    if (sigversion != SigVersion::P2MR) return set_error(serror, SCRIPT_ERR_BAD_OPCODE);
+
+                    // (sig msg_hash pubkey -- bool)
+                    if (stack.size() < 3) return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
+
+                    const valtype& sig = stacktop(-3);
+                    const valtype& msg_hash = stacktop(-2);
+                    const valtype& pubkey = stacktop(-1);
+
+                    bool success{false};
+                    if (!EvalCheckDataSigPQC(sig, msg_hash, pubkey, execdata, serror, success)) return false;
+                    popstack(stack);
+                    popstack(stack);
+                    popstack(stack);
+                    stack.push_back(success ? vchTrue : vchFalse);
+                }
+                break;
+
+                case OP_CHECKDATASIGADDPQC:
+                {
+                    if (sigversion != SigVersion::P2MR) return set_error(serror, SCRIPT_ERR_BAD_OPCODE);
+
+                    // (sig msg_hash num pubkey -- num)
+                    if (stack.size() < 4) return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
+
+                    const valtype& sig = stacktop(-4);
+                    const valtype& msg_hash = stacktop(-3);
+                    const CScriptNum num(stacktop(-2), fRequireMinimal);
+                    const valtype& pubkey = stacktop(-1);
+
+                    bool success{false};
+                    if (!EvalCheckDataSigPQC(sig, msg_hash, pubkey, execdata, serror, success)) return false;
+                    popstack(stack);
+                    popstack(stack);
+                    popstack(stack);
+                    popstack(stack);
+                    stack.push_back((num + (success ? 1 : 0)).getvch());
+                }
+                break;
+
                 case OP_CHECKMULTISIG:
                 case OP_CHECKMULTISIGVERIFY:
                 {
-                    if (sigversion == SigVersion::TAPSCRIPT) return set_error(serror, SCRIPT_ERR_TAPSCRIPT_CHECKMULTISIG);
+                    if (sigversion == SigVersion::TAPSCRIPT || sigversion == SigVersion::P2MR) return set_error(serror, SCRIPT_ERR_TAPSCRIPT_CHECKMULTISIG);
 
                     // ([sig ...] num_of_signatures [pubkey ...] num_of_pubkeys -- bool)
 
@@ -1360,6 +1523,25 @@ uint256 GetSequencesSHA256(const T& txTo)
     return ss.GetSHA256();
 }
 
+/** Compute the (single) SHA256 of all scriptSigs serialized as script vectors. */
+template <class T>
+uint256 GetScriptSigsSHA256(const T& txTo)
+{
+    HashWriter ss{};
+    for (const auto& txin : txTo.vin) {
+        ss << txin.scriptSig;
+    }
+    return ss.GetSHA256();
+}
+
+template <class T>
+bool HasNonEmptyScriptSigs(const T& txTo)
+{
+    return std::any_of(txTo.vin.begin(), txTo.vin.end(), [](const auto& txin) {
+        return !txin.scriptSig.empty();
+    });
+}
+
 /** Compute the (single) SHA256 of the concatenation of all txouts of a tx. */
 template <class T>
 uint256 GetOutputsSHA256(const T& txTo)
@@ -1408,26 +1590,33 @@ void PrecomputedTransactionData::Init(const T& txTo, std::vector<CTxOut>&& spent
     // Determine which precomputation-impacting features this transaction uses.
     bool uses_bip143_segwit = force;
     bool uses_bip341_taproot = force;
-    for (size_t inpos = 0; inpos < txTo.vin.size() && !(uses_bip143_segwit && uses_bip341_taproot); ++inpos) {
+    bool uses_ctv = force;
+    for (size_t inpos = 0; inpos < txTo.vin.size() && !(uses_bip143_segwit && uses_bip341_taproot && uses_ctv); ++inpos) {
         if (!txTo.vin[inpos].scriptWitness.IsNull()) {
-            if (m_spent_outputs_ready && m_spent_outputs[inpos].scriptPubKey.size() == 2 + WITNESS_V1_TAPROOT_SIZE &&
-                m_spent_outputs[inpos].scriptPubKey[0] == OP_1) {
-                // Treat every witness-bearing spend with 34-byte scriptPubKey that starts with OP_1 as a Taproot
-                // spend. This only works if spent_outputs was provided as well, but if it wasn't, actual validation
-                // will fail anyway. Note that this branch may trigger for scriptPubKeys that aren't actually segwit
-                // but in that case validation will fail as SCRIPT_ERR_WITNESS_UNEXPECTED anyway.
+            int witness_version;
+            std::vector<unsigned char> witness_program;
+            if (m_spent_outputs_ready &&
+                m_spent_outputs[inpos].scriptPubKey.IsWitnessProgram(witness_version, witness_program) &&
+                ((witness_version == 1 && witness_program.size() == WITNESS_V1_TAPROOT_SIZE) ||
+                 (witness_version == 2 && witness_program.size() == WITNESS_V2_P2MR_SIZE))) {
+                // Treat witness-bearing spends of native v1/v2 32-byte witness programs as Taproot-style sighash
+                // users. This only works if spent_outputs was provided as well, but if it wasn't, actual validation
+                // will fail anyway.
                 uses_bip341_taproot = true;
+                if (witness_version == 2) {
+                    uses_ctv = true;
+                }
             } else {
-                // Treat every spend that's not known to native witness v1 as a Witness v0 spend. This branch may
-                // also be taken for unknown witness versions, but it is harmless, and being precise would require
-                // P2SH evaluation to find the redeemScript.
+                // Treat every spend that's not known to native witness v1/v2 32-byte programs as a Witness v0
+                // spend. This branch may also be taken for unknown witness versions, but it is harmless, and being
+                // precise would require P2SH evaluation to find the redeemScript.
                 uses_bip143_segwit = true;
             }
         }
-        if (uses_bip341_taproot && uses_bip143_segwit) break; // No need to scan further if we already need all.
+        if (uses_bip341_taproot && uses_bip143_segwit && uses_ctv) break; // No need to scan further if we already need all.
     }
 
-    if (uses_bip143_segwit || uses_bip341_taproot) {
+    if (uses_bip143_segwit || uses_bip341_taproot || uses_ctv) {
         // Computations shared between both sighash schemes.
         m_prevouts_single_hash = GetPrevoutsSHA256(txTo);
         m_sequences_single_hash = GetSequencesSHA256(txTo);
@@ -1444,6 +1633,13 @@ void PrecomputedTransactionData::Init(const T& txTo, std::vector<CTxOut>&& spent
         m_spent_scripts_single_hash = GetSpentScriptsSHA256(m_spent_outputs);
         m_bip341_taproot_ready = true;
     }
+    if (uses_ctv) {
+        m_ctv_has_nonempty_script_sigs = HasNonEmptyScriptSigs(txTo);
+        if (m_ctv_has_nonempty_script_sigs) {
+            m_ctv_script_sigs_single_hash = GetScriptSigsSHA256(txTo);
+        }
+        m_ctv_ready = true;
+    }
 }
 
 template <class T>
@@ -1459,8 +1655,39 @@ template PrecomputedTransactionData::PrecomputedTransactionData(const CTransacti
 template PrecomputedTransactionData::PrecomputedTransactionData(const CMutableTransaction& txTo);
 
 const HashWriter HASHER_TAPSIGHASH{TaggedHash("TapSighash")};
+const HashWriter HASHER_P2MR_SIGHASH{TaggedHash("P2MRSighash")};
 const HashWriter HASHER_TAPLEAF{TaggedHash("TapLeaf")};
 const HashWriter HASHER_TAPBRANCH{TaggedHash("TapBranch")};
+const HashWriter HASHER_P2MR_LEAF{TaggedHash("P2MRLeaf")};
+const HashWriter HASHER_P2MR_BRANCH{TaggedHash("P2MRBranch")};
+const HashWriter HASHER_QBIT_DATA_SIG_PQC{TaggedHash("QbitDataSigPQC")};
+
+template <class T>
+uint256 GetDefaultCheckTemplateVerifyHash(const T& tx_to, uint32_t input_index, const PrecomputedTransactionData& cache)
+{
+    assert(input_index < tx_to.vin.size());
+    assert(tx_to.vin.size() <= std::numeric_limits<uint32_t>::max());
+    assert(tx_to.vout.size() <= std::numeric_limits<uint32_t>::max());
+    assert(cache.m_ctv_ready);
+
+    HashWriter ss{};
+    ss << tx_to.version;
+    ss << tx_to.nLockTime;
+    if (cache.m_ctv_has_nonempty_script_sigs) {
+        ss << cache.m_ctv_script_sigs_single_hash;
+    }
+    ss << static_cast<uint32_t>(tx_to.vin.size());
+    ss << cache.m_sequences_single_hash;
+    ss << static_cast<uint32_t>(tx_to.vout.size());
+    ss << cache.m_outputs_single_hash;
+    ss << input_index;
+    return ss.GetSHA256();
+}
+
+template uint256 GetDefaultCheckTemplateVerifyHash<CTransaction>(
+    const CTransaction&, uint32_t, const PrecomputedTransactionData&);
+template uint256 GetDefaultCheckTemplateVerifyHash<CMutableTransaction>(
+    const CMutableTransaction&, uint32_t, const PrecomputedTransactionData&);
 
 static bool HandleMissingData(MissingDataBehavior mdb)
 {
@@ -1475,7 +1702,7 @@ static bool HandleMissingData(MissingDataBehavior mdb)
 }
 
 template<typename T>
-bool SignatureHashSchnorr(uint256& hash_out, ScriptExecutionData& execdata, const T& tx_to, uint32_t in_pos, uint8_t hash_type, SigVersion sigversion, const PrecomputedTransactionData& cache, MissingDataBehavior mdb)
+static bool SignatureHashSchnorrCommon(uint256& hash_out, ScriptExecutionData& execdata, const T& tx_to, uint32_t in_pos, uint8_t hash_type, SigVersion sigversion, const PrecomputedTransactionData& cache, MissingDataBehavior mdb, const HashWriter& sighash_hasher)
 {
     uint8_t ext_flag, key_version;
     switch (sigversion) {
@@ -1491,6 +1718,10 @@ bool SignatureHashSchnorr(uint256& hash_out, ScriptExecutionData& execdata, cons
         // request a different key_version with a new sigversion.
         key_version = 0;
         break;
+    case SigVersion::P2MR:
+        ext_flag = 1;
+        key_version = 0;
+        break;
     default:
         assert(false);
     }
@@ -1499,7 +1730,7 @@ bool SignatureHashSchnorr(uint256& hash_out, ScriptExecutionData& execdata, cons
         return HandleMissingData(mdb);
     }
 
-    HashWriter ss{HASHER_TAPSIGHASH};
+    HashWriter ss{sighash_hasher};
 
     // Epoch
     static constexpr uint8_t EPOCH = 0;
@@ -1551,8 +1782,8 @@ bool SignatureHashSchnorr(uint256& hash_out, ScriptExecutionData& execdata, cons
         ss << execdata.m_output_hash.value();
     }
 
-    // Additional data for BIP 342 signatures
-    if (sigversion == SigVersion::TAPSCRIPT) {
+    // Additional data for BIP 342 / BIP-360 signatures
+    if (sigversion == SigVersion::TAPSCRIPT || sigversion == SigVersion::P2MR) {
         assert(execdata.m_tapleaf_hash_init);
         ss << execdata.m_tapleaf_hash;
         ss << key_version;
@@ -1563,6 +1794,32 @@ bool SignatureHashSchnorr(uint256& hash_out, ScriptExecutionData& execdata, cons
     hash_out = ss.GetSHA256();
     return true;
 }
+
+template<typename T>
+bool SignatureHashSchnorr(uint256& hash_out, ScriptExecutionData& execdata, const T& tx_to, uint32_t in_pos, uint8_t hash_type, SigVersion sigversion, const PrecomputedTransactionData& cache, MissingDataBehavior mdb)
+{
+    assert(sigversion == SigVersion::TAPROOT || sigversion == SigVersion::TAPSCRIPT);
+    return SignatureHashSchnorrCommon(hash_out, execdata, tx_to, in_pos, hash_type, sigversion, cache, mdb, HASHER_TAPSIGHASH);
+}
+
+template<typename T>
+bool SignatureHashP2MR(uint256& hash_out, ScriptExecutionData& execdata, const T& tx_to, uint32_t in_pos, uint8_t hash_type, const PrecomputedTransactionData& cache, MissingDataBehavior mdb)
+{
+    return SignatureHashSchnorrCommon(hash_out, execdata, tx_to, in_pos, hash_type, SigVersion::P2MR, cache, mdb, HASHER_P2MR_SIGHASH);
+}
+
+template bool SignatureHashSchnorr<CTransaction>(
+    uint256&, ScriptExecutionData&, const CTransaction&, uint32_t, uint8_t, SigVersion,
+    const PrecomputedTransactionData&, MissingDataBehavior);
+template bool SignatureHashSchnorr<CMutableTransaction>(
+    uint256&, ScriptExecutionData&, const CMutableTransaction&, uint32_t, uint8_t, SigVersion,
+    const PrecomputedTransactionData&, MissingDataBehavior);
+template bool SignatureHashP2MR<CTransaction>(
+    uint256&, ScriptExecutionData&, const CTransaction&, uint32_t, uint8_t,
+    const PrecomputedTransactionData&, MissingDataBehavior);
+template bool SignatureHashP2MR<CMutableTransaction>(
+    uint256&, ScriptExecutionData&, const CMutableTransaction&, uint32_t, uint8_t,
+    const PrecomputedTransactionData&, MissingDataBehavior);
 
 int SigHashCache::CacheIndex(int32_t hash_type) const noexcept
 {
@@ -1737,6 +1994,50 @@ bool GenericTransactionSignatureChecker<T>::CheckSchnorrSignature(std::span<cons
 }
 
 template <class T>
+bool GenericTransactionSignatureChecker<T>::VerifyPQCSignature(std::span<const unsigned char> sig, const CPQCPubKey& pubkey, const uint256& sighash) const
+{
+    return pubkey.Verify(sighash, sig);
+}
+
+template <class T>
+bool GenericTransactionSignatureChecker<T>::CheckPQCSignature(std::span<const unsigned char> sig, std::span<const unsigned char> pubkey_in, SigVersion sigversion, ScriptExecutionData& execdata, ScriptError* serror) const
+{
+    assert(sigversion == SigVersion::P2MR);
+    assert(pubkey_in.size() == PQC_PUBKEY_SIZE);
+    if (sig.size() != PQC_SIG_SIZE && sig.size() != PQC_SIG_SIZE + 1) return set_error(serror, SCRIPT_ERR_P2MR_SIG_SIZE);
+
+    CPQCPubKey pubkey{pubkey_in};
+
+    uint8_t hashtype = SIGHASH_DEFAULT;
+    if (sig.size() == PQC_SIG_SIZE + 1) {
+        hashtype = SpanPopBack(sig);
+        if (hashtype == SIGHASH_DEFAULT) return set_error(serror, SCRIPT_ERR_P2MR_SIG_HASHTYPE);
+    }
+    uint256 sighash;
+    if (!this->txdata) return HandleMissingData(m_mdb);
+    if (!SignatureHashP2MR(sighash, execdata, *txTo, nIn, hashtype, *this->txdata, m_mdb)) {
+        return set_error(serror, SCRIPT_ERR_P2MR_SIG_HASHTYPE);
+    }
+    if (!VerifyPQCSignature(sig, pubkey, sighash)) return set_error(serror, SCRIPT_ERR_P2MR_SIG);
+    return true;
+}
+
+template <class T>
+bool GenericTransactionSignatureChecker<T>::CheckTemplateVerifyHash(std::span<const unsigned char> expected, ScriptError* serror) const
+{
+    assert(expected.size() == uint256::size());
+    if (!txTo || !this->txdata || !this->txdata->m_ctv_ready || nIn >= txTo->vin.size()) {
+        return HandleMissingData(m_mdb);
+    }
+
+    const uint256 actual{GetDefaultCheckTemplateVerifyHash(*txTo, nIn, *this->txdata)};
+    if (!std::equal(expected.begin(), expected.end(), actual.begin())) {
+        return set_error(serror, SCRIPT_ERR_TEMPLATE_MISMATCH);
+    }
+    return true;
+}
+
+template <class T>
 bool GenericTransactionSignatureChecker<T>::CheckLockTime(const CScriptNum& nLockTime) const
 {
     // There are two kinds of nLockTime: lock-by-blockheight
@@ -1828,7 +2129,7 @@ static bool ExecuteWitnessScript(const std::span<const valtype>& stack_span, con
 {
     std::vector<valtype> stack{stack_span.begin(), stack_span.end()};
 
-    if (sigversion == SigVersion::TAPSCRIPT) {
+    if (sigversion == SigVersion::TAPSCRIPT || sigversion == SigVersion::P2MR) {
         // OP_SUCCESSx processing overrides everything, including stack element size limits
         CScript::const_iterator pc = exec_script.begin();
         while (pc < exec_script.end()) {
@@ -1838,7 +2139,14 @@ static bool ExecuteWitnessScript(const std::span<const valtype>& stack_span, con
                 return set_error(serror, SCRIPT_ERR_BAD_OPCODE);
             }
             // New opcodes will be listed here. May use a different sigversion to modify existing opcodes.
+            if (opcode == OP_CHECKTEMPLATEVERIFY && sigversion == SigVersion::P2MR) {
+                continue;
+            }
             if (IsOpSuccess(opcode)) {
+                if (sigversion == SigVersion::P2MR &&
+                    (opcode == OP_CHECKDATASIGPQC || opcode == OP_CHECKDATASIGADDPQC)) {
+                    continue;
+                }
                 if (flags & SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS) {
                     return set_error(serror, SCRIPT_ERR_DISCOURAGE_OP_SUCCESS);
                 }
@@ -1846,13 +2154,17 @@ static bool ExecuteWitnessScript(const std::span<const valtype>& stack_span, con
             }
         }
 
-        // Tapscript enforces initial stack size limits (altstack is empty here)
+        // Tapscript/P2MR enforces initial stack size limits (altstack is empty here)
         if (stack.size() > MAX_STACK_SIZE) return set_error(serror, SCRIPT_ERR_STACK_SIZE);
     }
 
-    // Disallow stack item size > MAX_SCRIPT_ELEMENT_SIZE in witness stack
-    for (const valtype& elem : stack) {
-        if (elem.size() > MAX_SCRIPT_ELEMENT_SIZE) return set_error(serror, SCRIPT_ERR_PUSH_SIZE);
+    // Disallow stack item size > MAX_SCRIPT_ELEMENT_SIZE in witness stack.
+    // P2MR (BIP-360) lifts this limit to accommodate PQC signatures (3680 bytes);
+    // resource usage is bounded by the per-input validation weight budget instead.
+    if (sigversion != SigVersion::P2MR) {
+        for (const valtype& elem : stack) {
+            if (elem.size() > MAX_SCRIPT_ELEMENT_SIZE) return set_error(serror, SCRIPT_ERR_PUSH_SIZE);
+        }
     }
 
     // Run the script interpreter.
@@ -1880,6 +2192,28 @@ uint256 ComputeTapbranchHash(std::span<const unsigned char> a, std::span<const u
     return ss_branch.GetSHA256();
 }
 
+uint256 ComputeP2MRLeafHash(uint8_t leaf_version, std::span<const unsigned char> script)
+{
+    return (HashWriter{HASHER_P2MR_LEAF} << leaf_version << CompactSizeWriter(script.size()) << script).GetSHA256();
+}
+
+uint256 ComputeQbitDataSigPQCHash(std::span<const unsigned char> msg_hash)
+{
+    assert(msg_hash.size() == 32);
+    return (HashWriter{HASHER_QBIT_DATA_SIG_PQC} << msg_hash).GetSHA256();
+}
+
+uint256 ComputeP2MRBranchHash(std::span<const unsigned char> a, std::span<const unsigned char> b)
+{
+    HashWriter ss_branch{HASHER_P2MR_BRANCH};
+    if (std::lexicographical_compare(a.begin(), a.end(), b.begin(), b.end())) {
+        ss_branch << a << b;
+    } else {
+        ss_branch << b << a;
+    }
+    return ss_branch.GetSHA256();
+}
+
 uint256 ComputeTaprootMerkleRoot(std::span<const unsigned char> control, const uint256& tapleaf_hash)
 {
     assert(control.size() >= TAPROOT_CONTROL_BASE_SIZE);
@@ -1893,6 +2227,32 @@ uint256 ComputeTaprootMerkleRoot(std::span<const unsigned char> control, const u
         k = ComputeTapbranchHash(k, node);
     }
     return k;
+}
+
+uint256 ComputeP2MRMerkleRoot(std::span<const unsigned char> control, const uint256& tapleaf_hash)
+{
+    assert(control.size() >= P2MR_CONTROL_BASE_SIZE);
+    assert(control.size() <= P2MR_CONTROL_MAX_SIZE);
+    assert((control.size() - P2MR_CONTROL_BASE_SIZE) % P2MR_CONTROL_NODE_SIZE == 0);
+
+    const int path_len = (control.size() - P2MR_CONTROL_BASE_SIZE) / P2MR_CONTROL_NODE_SIZE;
+    uint256 k = tapleaf_hash;
+    for (int i = 0; i < path_len; ++i) {
+        std::span node{std::span{control}.subspan(P2MR_CONTROL_BASE_SIZE + P2MR_CONTROL_NODE_SIZE * i, P2MR_CONTROL_NODE_SIZE)};
+        k = ComputeP2MRBranchHash(k, node);
+    }
+    return k;
+}
+
+static bool VerifyP2MRCommitment(const std::vector<unsigned char>& control, const std::vector<unsigned char>& program, const uint256& leaf_hash)
+{
+    assert(control.size() >= P2MR_CONTROL_BASE_SIZE);
+    assert(program.size() == uint256::size());
+
+    const uint256 merkle_root = ComputeP2MRMerkleRoot(control, leaf_hash);
+
+    // P2MR: program IS the Merkle root (direct comparison, no tweaking)
+    return memcmp(merkle_root.begin(), program.data(), 32) == 0;
 }
 
 static bool VerifyTaprootCommitment(const std::vector<unsigned char>& control, const std::vector<unsigned char>& program, const uint256& tapleaf_hash)
@@ -1982,6 +2342,68 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
             }
             return set_success(serror);
         }
+    } else if (witversion == 2 && program.size() == WITNESS_V2_P2MR_SIZE && !is_p2sh) {
+        // BIP-360 P2MR: 32-byte witness v2 program (Merkle root of script tree)
+        if (!(flags & SCRIPT_VERIFY_P2MR_RULES)) return set_success(serror);
+        if (stack.size() == 0) return set_error(serror, SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY);
+
+        // Annex handling — identical to Taproot (BIP-341 §4.3)
+        if (stack.size() >= 2 && !stack.back().empty() && stack.back()[0] == ANNEX_TAG) {
+            const valtype& annex = SpanPopBack(stack);
+            execdata.m_annex_hash = (HashWriter{} << annex).GetSHA256();
+            execdata.m_annex_present = true;
+        } else {
+            execdata.m_annex_present = false;
+        }
+        execdata.m_annex_init = true;
+
+        // P2MR has NO key-path spend — script-path only.
+        // After removing optional annex, need at least 2 elements: [script_args..., script, control_block]
+        if (stack.size() < 2) {
+            return set_error(serror, SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY);
+        }
+
+        const valtype& control = SpanPopBack(stack);
+        const valtype& script = SpanPopBack(stack);
+
+        // Validate control block size: 1 + 32*m bytes, where m in [0, 128]
+        if (control.size() < P2MR_CONTROL_BASE_SIZE || control.size() > P2MR_CONTROL_MAX_SIZE || ((control.size() - P2MR_CONTROL_BASE_SIZE) % P2MR_CONTROL_NODE_SIZE) != 0) {
+            return set_error(serror, SCRIPT_ERR_P2MR_WRONG_CONTROL_SIZE);
+        }
+
+        // Verify control byte bit 0 is 1 (BIP-360 requirement)
+        if ((control[0] & 0x01) != 1) {
+            return set_error(serror, SCRIPT_ERR_P2MR_CONTROL_BIT0);
+        }
+
+        const uint8_t leaf_version = control[0] & TAPROOT_LEAF_MASK;
+
+        execdata.m_tapleaf_hash = ComputeP2MRLeafHash(leaf_version, script);
+
+        // Verify Merkle commitment: program == merkle_root
+        if (!VerifyP2MRCommitment(control, program, execdata.m_tapleaf_hash)) {
+            return set_error(serror, SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH);
+        }
+        execdata.m_tapleaf_hash_init = true;
+
+        if (leaf_version == P2MR_LEAF_VERSION_V1) {
+            // Known P2MR v1 leaf semantics (leaf version 0xc0).
+            if (!CheckP2MRV1InitialStackResourceLimits(stack, serror)) return false;
+
+            exec_script = CScript(script.begin(), script.end());
+
+            // Initialize per-input validation weight budget
+            execdata.m_validation_weight_left = ::GetSerializeSize(witness.stack) + VALIDATION_WEIGHT_OFFSET;
+            execdata.m_validation_weight_left_init = true;
+
+            return ExecuteWitnessScript(stack, exec_script, flags, SigVersion::P2MR, checker, execdata, serror);
+        }
+
+        // Reserved future P2MR leaf versions remain consensus-valid until activation defines them.
+        if (flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION) {
+            return set_error(serror, SCRIPT_ERR_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION);
+        }
+        return set_success(serror);
     } else if (!is_p2sh && CScript::IsPayToAnchor(witversion, program)) {
         return true;
     } else {

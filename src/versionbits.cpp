@@ -11,6 +11,23 @@
 
 using enum ThresholdState;
 
+namespace {
+void ValidateDeploymentBits(const Consensus::Params& params)
+{
+    uint32_t seen_mask{0};
+    for (int i = 0; i < static_cast<int>(Consensus::MAX_VERSION_BITS_DEPLOYMENTS); ++i) {
+        const auto pos{static_cast<Consensus::DeploymentPos>(i)};
+        const int bit{params.vDeployments[pos].bit};
+        CHECK_NONFATAL(bit >= 0);
+        CHECK_NONFATAL(bit < BLOCK_VERSION_SIGNAL_BITS);
+        const uint32_t mask{uint32_t{1} << bit};
+        CHECK_NONFATAL((mask & ~static_cast<uint32_t>(BLOCK_VERSION_SIGNAL_MASK)) == 0);
+        CHECK_NONFATAL((seen_mask & mask) == 0);
+        seen_mask |= mask;
+    }
+}
+} // namespace
+
 std::string StateName(ThresholdState state)
 {
     switch (state) {
@@ -191,6 +208,8 @@ int AbstractThresholdConditionChecker::GetStateSinceHeightFor(const CBlockIndex*
 
 BIP9Info VersionBitsCache::Info(const CBlockIndex& block_index, const Consensus::Params& params, Consensus::DeploymentPos id)
 {
+    ValidateDeploymentBits(params);
+
     BIP9Info result;
 
     VersionBitsConditionChecker checker(params, id);
@@ -229,6 +248,8 @@ BIP9GBTStatus VersionBitsCache::GBTStatus(const CBlockIndex& block_index, const 
 {
     BIP9GBTStatus result;
 
+    ValidateDeploymentBits(params);
+
     LOCK(m_mutex);
     for (int i = 0; i < (int)Consensus::MAX_VERSION_BITS_DEPLOYMENTS; i++) {
         auto pos = static_cast<Consensus::DeploymentPos>(i);
@@ -258,13 +279,16 @@ BIP9GBTStatus VersionBitsCache::GBTStatus(const CBlockIndex& block_index, const 
 
 bool VersionBitsCache::IsActiveAfter(const CBlockIndex* pindexPrev, const Consensus::Params& params, Consensus::DeploymentPos pos)
 {
+    ValidateDeploymentBits(params);
+
     LOCK(m_mutex);
     return ThresholdState::ACTIVE == VersionBitsConditionChecker(params, pos).GetStateFor(pindexPrev, m_caches[pos]);
 }
 
 static int32_t ComputeBlockVersion(const CBlockIndex* pindexPrev, const Consensus::Params& params, std::array<ThresholdConditionCache, Consensus::MAX_VERSION_BITS_DEPLOYMENTS>& caches)
 {
-    int32_t nVersion = VERSIONBITS_TOP_BITS;
+    ValidateDeploymentBits(params);
+    int32_t nVersion{MakeVersion(/*chain_id=*/0, /*auxpow=*/false, /*version_bits=*/0)};
 
     for (int i = 0; i < (int)Consensus::MAX_VERSION_BITS_DEPLOYMENTS; i++) {
         Consensus::DeploymentPos pos = static_cast<Consensus::DeploymentPos>(i);
@@ -290,6 +314,9 @@ void VersionBitsCache::Clear()
     for (unsigned int d = 0; d < Consensus::MAX_VERSION_BITS_DEPLOYMENTS; d++) {
         m_caches[d].clear();
     }
+    for (auto& cache : m_warning_caches) {
+        cache.clear();
+    }
 }
 
 namespace {
@@ -310,8 +337,18 @@ public:
     : m_params{chainparams.GetConsensus()}, m_caches{caches}, m_bit(bit)
     {
         if (chainparams.IsTestChain()) {
-            period = chainparams.GetConsensus().DifficultyAdjustmentInterval();
-            threshold = period * 3 / 4; // 75% for test nets per BIP9 suggestion
+            // Keep warning windows aligned with configured test deployment periods
+            // without coupling to a specific deployment entry.
+            uint32_t max_period{0};
+            for (const auto& deployment : chainparams.GetConsensus().vDeployments) {
+                if (deployment.period > max_period) {
+                    max_period = deployment.period;
+                }
+            }
+            if (max_period > 0 && max_period <= static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+                period = static_cast<int>(max_period);
+                threshold = period * 3 / 4; // 75% for test nets per BIP9 suggestion
+            }
         }
     }
 
@@ -323,15 +360,17 @@ public:
     bool Condition(const CBlockIndex* pindex) const override
     {
         return pindex->nHeight >= m_params.MinBIP9WarningHeight &&
-               ((pindex->nVersion & VERSIONBITS_TOP_MASK) == VERSIONBITS_TOP_BITS) &&
-               ((pindex->nVersion >> m_bit) & 1) != 0 &&
-               ((::ComputeBlockVersion(pindex->pprev, m_params, m_caches) >> m_bit) & 1) == 0;
+               HasBIP9TopBitsShape(pindex->nVersion) &&
+               ((ExtractVersionBits(pindex->nVersion) >> m_bit) & 1) != 0 &&
+               ((ExtractVersionBits(::ComputeBlockVersion(pindex->pprev, m_params, m_caches)) >> m_bit) & 1) == 0;
     }
 };
 } // anonymous namespace
 
 std::vector<std::pair<int, bool>> VersionBitsCache::CheckUnknownActivations(const CBlockIndex* pindex, const CChainParams& chainparams)
 {
+    ValidateDeploymentBits(chainparams.GetConsensus());
+
     LOCK(m_mutex);
     std::vector<std::pair<int, bool>> result;
     for (int bit = 0; bit < VERSIONBITS_NUM_BITS; ++bit) {

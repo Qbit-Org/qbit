@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_UTIL_BATCHPRIORITY_H
-#define BITCOIN_UTIL_BATCHPRIORITY_H
+#ifndef QBIT_UTIL_BATCHPRIORITY_H
+#define QBIT_UTIL_BATCHPRIORITY_H
 
 /**
  * On platforms that support it, tell the kernel the calling thread is
@@ -12,4 +12,4 @@
  */
 void ScheduleBatchPriority();
 
-#endif // BITCOIN_UTIL_BATCHPRIORITY_H
+#endif // QBIT_UTIL_BATCHPRIORITY_H

@@ -8,6 +8,7 @@
 #include <init.h>
 #include <qt/bitcoin.h>
 #include <qt/guiutil.h>
+#include <qt/qbitunits.h>
 #include <qt/test/optiontests.h>
 #include <test/util/setup_common.h>
 
@@ -107,8 +108,8 @@ void OptionTests::parametersInteraction()
 {
     // Test that the bug https://github.com/bitcoin-core/gui/issues/567 does not resurface.
     // It was fixed via https://github.com/bitcoin-core/gui/pull/568.
-    // With fListen=false in ~/.config/Bitcoin/Bitcoin-Qt.conf and all else left as default,
-    // bitcoin-qt should set both -listen and -listenonion to false and start successfully.
+    // With fListen=false in ~/.config/qbit/qbit-qt.conf and all else left as default,
+    // qbit-qt should set both -listen and -listenonion to false and start successfully.
     gArgs.LockSettings([&](common::Settings& s) {
         s.forced_settings.erase("listen");
         s.forced_settings.erase("listenonion");
@@ -145,4 +146,44 @@ void OptionTests::extractFilter()
 
     filter = QString("Image (*.png *.jpg)");
     QCOMPARE(GUIUtil::ExtractFirstSuffixFromFilter(filter), "png");
+}
+
+void OptionTests::qbitUnitDisplay()
+{
+    QCOMPARE(QbitUnits::factor(QbitUnit::QBT), qint64{100'000'000});
+    QCOMPARE(QbitUnits::factor(QbitUnit::BIT), qint64{1});
+    QCOMPARE(QbitUnits::longName(QbitUnit::QBT), QString("QBT"));
+    QCOMPARE(QbitUnits::longName(QbitUnit::mQBT), QString("mQBT"));
+    QCOMPARE(QbitUnits::longName(QbitUnit::uQBT), QString::fromUtf8("µQBT"));
+    QCOMPARE(QbitUnits::longName(QbitUnit::BIT), QString("bits"));
+    QCOMPARE(QbitUnits::shortName(QbitUnit::BIT), QString("bits"));
+    QCOMPARE(QbitUnits::formatWithUnit(QbitUnit::QBT, CAmount{100'000'000}, false, QbitUnits::SeparatorStyle::NEVER),
+             QString("1.00000000 QBT"));
+    QCOMPARE(QbitUnits::formatWithUnit(QbitUnit::BIT, CAmount{1}, false, QbitUnits::SeparatorStyle::NEVER),
+             QString("1 bit"));
+    QCOMPARE(QbitUnits::formatWithUnit(QbitUnit::BIT, CAmount{2}, false, QbitUnits::SeparatorStyle::NEVER),
+             QString("2 bits"));
+    QCOMPARE(QbitUnits::formatWithPrivacy(QbitUnit::BIT, CAmount{1}, QbitUnits::SeparatorStyle::NEVER, false).trimmed(),
+             QString("1 bit"));
+    QCOMPARE(QbitUnits::getAmountColumnTitle(QbitUnit::uQBT), QString::fromUtf8("Amount (µQBT)"));
+    QCOMPARE(QbitUnits::getAmountColumnTitle(QbitUnit::BIT), QString("Amount (bits)"));
+}
+
+void OptionTests::displayUnitSettingMigration()
+{
+    QSettings settings;
+    settings.remove("DisplayQbitUnit");
+    settings.remove("DisplayBitcoinUnit");
+    settings.setValue("DisplayBitcoinUnit", 3);
+
+    OptionsModel options{m_node};
+    bilingual_str error;
+    QVERIFY(options.Init(error));
+
+    QCOMPARE(options.getDisplayUnit(), QbitUnit::BIT);
+    QVERIFY(settings.contains("DisplayQbitUnit"));
+    QVERIFY(!settings.contains("DisplayBitcoinUnit"));
+    QCOMPARE(settings.value("DisplayQbitUnit").value<QbitUnit>(), QbitUnit::BIT);
+
+    settings.remove("DisplayQbitUnit");
 }

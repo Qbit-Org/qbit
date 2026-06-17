@@ -1035,7 +1035,7 @@ Signing is only possible with addresses of the type 'legacy'.</source>
         <translation type="unfinished">(ロック済み %1個)</translation>
     </message>
     <message>
-        <source>Can vary +/- %1 satoshi(s) per input.</source>
+        <source>Can vary +/- %1 bits per input.</source>
         <translation type="unfinished">インプット毎に %1 satoshi 前後変動する場合があります。</translation>
     </message>
     <message>
@@ -3005,13 +3005,13 @@ For more information on using this console, type %6.
     <message>
         <source>Specify a custom fee per kB (1,000 bytes) of the transaction's virtual size.
 
-Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 satoshis per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 satoshis.</source>
+Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 bits per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 bits.</source>
         <translation type="unfinished">取引の仮想サイズのkB(1000 bytes)当たりのカスタム手数料を設定してください。
 
-注意: 手数料はbyte単位で計算されます。"100 satoshis / kvB"という手数料率のとき、500 仮想バイト (1 kvBの半分)の取引の手数料はたったの50 satoshisと計算されます。</translation>
+注意: 手数料はbyte単位で計算されます。"100 bits / kvB"という手数料率のとき、500 仮想バイト (1 kvBの半分)の取引の手数料はたったの50 bitsと計算されます。</translation>
     </message>
     <message>
-        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for bitcoin transactions than the network can process.</source>
+        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for qbit transactions than the network can process.</source>
         <translation type="unfinished">ブロック内の空きより取引の量が少ない場合、マイナーや中継ノードは最低限の手数料でも処理することがあります。この最低限の手数料だけを支払っても問題ありませんが、一度取引の需要がネットワークの処理能力を超えてしまった場合には、取引が永久に承認されなくなってしまう可能性があることに注意してください。</translation>
     </message>
     <message>
@@ -3302,7 +3302,7 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 satos
         <translation type="unfinished">選択した単位での送金額</translation>
     </message>
     <message>
-        <source>The fee will be deducted from the amount being sent. The recipient will receive less bitcoins than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
+        <source>The fee will be deducted from the amount being sent. The recipient will receive less QBT than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
         <translation type="unfinished">手数料は送金する金額から差し引かれます。送金先には金額欄で指定した額よりも少ない Bitcoin が送られます。送金先が複数ある場合は、手数料は均等に分けられます。</translation>
     </message>
     <message>
@@ -4066,8 +4066,8 @@ Go to File &gt; Open Wallet to load a wallet.
         <translation type="unfinished">%s は -assumeutxo スナップショットの状態を検証できませんでした。これは、ハードウェアの問題、ソフトウェアのバグ、または無効なスナップショットのロードを可能にした不適切なソフトウェア変更を示しています。この結果、ノードはシャットダウンし、スナップショットに基づいて構築された状態の使用を停止し、チェーンの高さを %d から %d にリセットします。次回の再起動時に、ノードはスナップショット データを使用せずに %d からの同期を再開します。スナップショットの入手方法も含めて、このインシデントを %s に報告してください。無効なスナップショットのチェーン状態は、このエラーの原因となった問題の診断に役立てるためにディスク上に残されます。</translation>
     </message>
     <message>
-        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/p2p-bad-ports.md for details and a full list.</source>
-        <translation type="unfinished">%s はポート %u でリッスンするように要求します。このポートは「不良」と見なされるため、どのピアもこのポートに接続することはないでしょう。詳細と完全なリストについては、doc/p2p-bad-ports.md を参照してください。</translation>
+        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/reference/p2p-bad-ports.md for details and a full list.</source>
+        <translation type="unfinished">%s はポート %u でリッスンするように要求します。このポートは「不良」と見なされるため、どのピアもこのポートに接続することはないでしょう。詳細と完全なリストについては、doc/reference/p2p-bad-ports.md を参照してください。</translation>
     </message>
     <message>
         <source>Disk space for %s may not accommodate the block files. Approximately %u GB of data will be stored in this directory.</source>

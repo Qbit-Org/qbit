@@ -26,6 +26,9 @@ class P2PLeakTxTest(BitcoinTestFramework):
         self.gen_node = self.nodes[0]  # The block and tx generating node
         self.miniwallet = MiniWallet(self.gen_node)
 
+        # Mature the default-cache coinbase UTXOs
+        self.ensure_cached_coinbase_mature(self.nodes[0])
+
         self.test_tx_in_block()
         self.test_notfound_on_replaced_tx()
         self.test_notfound_on_unannounced_tx()

@@ -17,12 +17,29 @@ if test -z "$1"; then
     exit 1
 fi
 
-if ! sed --help 2>&1 | grep -q 'GNU'; then
+find_gnu_tool() {
+    tool_name="$1"
+    fallback_name="$2"
+
+    if "$tool_name" --help 2>&1 | grep -q 'GNU'; then
+        echo "$tool_name"
+        return 0
+    fi
+
+    if command -v "$fallback_name" >/dev/null 2>&1 && "$fallback_name" --help 2>&1 | grep -q 'GNU'; then
+        echo "$fallback_name"
+        return 0
+    fi
+
+    return 1
+}
+
+if ! SED="$(find_gnu_tool sed gsed)"; then
     echo "Error: the installed sed package is not compatible. Please make sure you have GNU sed installed in your system.";
     exit 1;
 fi
 
-if ! grep --help 2>&1 | grep -q 'GNU'; then
+if ! GREP="$(find_gnu_tool grep ggrep)"; then
     echo "Error: the installed grep package is not compatible. Please make sure you have GNU grep installed in your system.";
     exit 1;
 fi
@@ -31,9 +48,9 @@ RET=0
 PREV_BRANCH=$(git name-rev --name-only HEAD)
 PREV_HEAD=$(git rev-parse HEAD)
 for commit in $(git rev-list --reverse "$1"); do
-    if git rev-list -n 1 --pretty="%s" "$commit" | grep -q "^scripted-diff:"; then
+    if git rev-list -n 1 --pretty="%s" "$commit" | "$GREP" -q "^scripted-diff:"; then
         git checkout --quiet "$commit"^ || exit
-        SCRIPT="$(git rev-list --format=%b -n1 "$commit" | sed '/^-BEGIN VERIFY SCRIPT-$/,/^-END VERIFY SCRIPT-$/{//!b};d')"
+        SCRIPT="$(git rev-list --format=%b -n1 "$commit" | "$SED" '/^-BEGIN VERIFY SCRIPT-$/,/^-END VERIFY SCRIPT-$/{//!b};d')"
         if test -z "$SCRIPT"; then
             echo "Error: missing script for: $commit" >&2
             echo "Failed" >&2
@@ -46,7 +63,7 @@ for commit in $(git rev-list --reverse "$1"); do
         fi
         git reset --quiet --hard HEAD
      else
-        if git rev-list "--format=%b" -n1 "$commit" | grep -q '^-\(BEGIN\|END\)[ a-zA-Z]*-$'; then
+        if git rev-list "--format=%b" -n1 "$commit" | "$GREP" -q '^-\(BEGIN\|END\)[ a-zA-Z]*-$'; then
             echo "Error: script block marker but no scripted-diff in title of commit $commit" >&2
             echo "Failed" >&2
             RET=1

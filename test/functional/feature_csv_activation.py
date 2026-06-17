@@ -41,6 +41,7 @@ from itertools import product
 import time
 
 from test_framework.blocktools import (
+    COINBASE_MATURITY,
     create_block,
     create_coinbase,
 )
@@ -88,7 +89,7 @@ def all_rlt_txs(txs):
     return [tx['tx'] for tx in txs]
 
 
-CSV_ACTIVATION_HEIGHT = 432
+CSV_ACTIVATION_HEIGHT = COINBASE_MATURITY + COINBASE_BLOCK_COUNT + 5
 
 
 class BIP68_112_113Test(BitcoinTestFramework):

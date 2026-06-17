@@ -72,12 +72,13 @@ void EditAddressAndSubmit(
  */
 void TestAddAddressesToSendBook(interfaces::Node& node)
 {
-    TestChain100Setup test;
+    TestChain100Setup test{ChainType::REGTEST, {.extra_args = {"-p2mronly=0"}}};
     auto wallet_loader = interfaces::MakeWalletLoader(*test.m_node.chain, *Assert(test.m_node.args));
     test.m_node.wallet_loader = wallet_loader.get();
     node.setContext(&test.m_node);
     const std::shared_ptr<CWallet> wallet = std::make_shared<CWallet>(node.context()->chain.get(), "", CreateMockableWalletDatabase());
     wallet->LoadWallet();
+    wallet->m_keypool_size = 1;
     wallet->SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
     {
         LOCK(wallet->cs_wallet);
@@ -220,7 +221,7 @@ void AddressBookTests::addressBookTests()
         // and fails to handle returned nulls
         // (https://bugreports.qt.io/browse/QTBUG-49686).
         qWarning() << "Skipping AddressBookTests on mac build with 'minimal' platform set due to Qt bugs. To run AppTests, invoke "
-                      "with 'QT_QPA_PLATFORM=cocoa test_bitcoin-qt' on mac, or else use a linux or windows build.";
+                      "with 'QT_QPA_PLATFORM=cocoa test_qbit-qt' on mac, or else use a linux or windows build.";
         return;
     }
 #endif

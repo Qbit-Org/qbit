@@ -28,6 +28,7 @@
 #include <rpc/server.h>
 #include <rpc/server_util.h>
 #include <rpc/util.h>
+#include <script/interpreter.h>
 #include <script/script.h>
 #include <script/sign.h>
 #include <script/signingprovider.h>
@@ -90,8 +91,8 @@ static std::vector<RPCResult> DecodeTxDoc(const std::string& txid_field_doc)
         {RPCResult::Type::STR_HEX, "txid", txid_field_doc},
         {RPCResult::Type::STR_HEX, "hash", "The transaction hash (differs from txid for witness transactions)"},
         {RPCResult::Type::NUM, "size", "The serialized transaction size"},
-        {RPCResult::Type::NUM, "vsize", "The virtual transaction size (differs from size for witness transactions)"},
-        {RPCResult::Type::NUM, "weight", "The transaction's weight (between vsize*4-3 and vsize*4)"},
+        {RPCResult::Type::NUM, "vsize", "The virtual transaction size"},
+        {RPCResult::Type::NUM, "weight", "The transaction's weight; qbit fully counts witness data"},
         {RPCResult::Type::NUM, "version", "The version"},
         {RPCResult::Type::NUM_TIME, "locktime", "The lock time"},
         {RPCResult::Type::ARR, "vin", "",
@@ -147,7 +148,7 @@ static std::vector<RPCArg> CreateTxDoc()
             {
                 {"", RPCArg::Type::OBJ_USER_KEYS, RPCArg::Optional::OMITTED, "",
                     {
-                        {"address", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "A key-value pair. The key (string) is the bitcoin address, the value (float or string) is the amount in " + CURRENCY_UNIT},
+                        {"address", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "A key-value pair. The key (string) is the qbit address, the value (float or string) is the amount in " + CURRENCY_UNIT},
                     },
                 },
                 {"", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "",
@@ -239,8 +240,9 @@ PartiallySignedTransaction ProcessPSBT(const std::string& psbt_string, const std
         // We only actually care about those if our signing provider doesn't hide private
         // information, as is the case with `descriptorprocesspsbt`
         // Only error for mismatching sighash types as it is critical that the sighash to sign with matches the PSBT's
-        if (SignPSBTInput(provider, psbtx, /*index=*/i, &txdata, sighash_type, /*out_sigdata=*/nullptr, finalize) == common::PSBTError::SIGHASH_MISMATCH) {
-            throw JSONRPCPSBTError(common::PSBTError::SIGHASH_MISMATCH);
+        const common::PSBTError sign_result = SignPSBTInput(provider, psbtx, /*index=*/i, &txdata, sighash_type, /*out_sigdata=*/nullptr, finalize);
+        if (sign_result == common::PSBTError::SIGHASH_MISMATCH || sign_result == common::PSBTError::INVALID_P2MR_SIGNATURE) {
+            throw JSONRPCPSBTError(sign_result);
         }
     }
 
@@ -327,6 +329,7 @@ static RPCHelpMan getrawtransaction()
 
     auto txid{Txid::FromUint256(ParseHashV(request.params[0], "parameter 1"))};
     const CBlockIndex* blockindex = nullptr;
+    bool block_witness_pruned{false};
 
     if (txid.ToUint256() == chainman.GetParams().GenesisBlock().hashMerkleRoot) {
         // Special exception for the genesis block coinbase transaction
@@ -343,6 +346,12 @@ static RPCHelpMan getrawtransaction()
         if (!blockindex) {
             throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block hash not found");
         }
+        block_witness_pruned = chainman.m_blockman.IsWitnessPruned(*blockindex);
+    }
+
+    if (block_witness_pruned) {
+        throw JSONRPCError(RPC_MISC_ERROR,
+                           "Raw transaction unavailable: witness data for this historical block was pruned; use an archive node with full witness history.");
     }
 
     bool f_txindex_ready = false;
@@ -488,6 +497,83 @@ static RPCHelpMan decoderawtransaction()
     };
 }
 
+static std::string CTVHashHex(const uint256& hash)
+{
+    return HexStr(std::vector<unsigned char>{hash.begin(), hash.end()});
+}
+
+static RPCHelpMan getdefaultctvhash()
+{
+    return RPCHelpMan{
+        "getdefaultctvhash",
+        "Compute the BIP119-style default OP_CHECKTEMPLATEVERIFY hash for a serialized transaction input.\n"
+        "This helper is protocol-neutral: it does not construct transactions, sign inputs, or interpret application-specific fields.\n",
+        {
+            {"hexstring", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The serialized transaction hex string"},
+            {"input_index", RPCArg::Type::NUM, RPCArg::Optional::NO, "The zero-based input index to commit to"},
+            {"verbose", RPCArg::Type::BOOL, RPCArg::Default{false}, "Return the committed field breakdown"},
+        },
+        {
+            RPCResult{"if verbose is not set or is false",
+                RPCResult::Type::STR_HEX, "ctvhash", "The default CTV hash, hex-encoded in script byte order"},
+            RPCResult{"if verbose is true",
+                RPCResult::Type::OBJ, "", "",
+                {
+                    {RPCResult::Type::STR_HEX, "ctvhash", "The default CTV hash, hex-encoded in script byte order"},
+                    {RPCResult::Type::NUM, "version", "The transaction version"},
+                    {RPCResult::Type::NUM, "locktime", "The transaction lock time"},
+                    {RPCResult::Type::BOOL, "script_sigs_hash_included", "Whether the scriptSig hash is included"},
+                    {RPCResult::Type::STR_HEX, "script_sigs_hash", /*optional=*/true, "Single-SHA256 of all serialized scriptSigs"},
+                    {RPCResult::Type::NUM, "input_count", "The number of inputs committed as uint32"},
+                    {RPCResult::Type::STR_HEX, "sequences_hash", "Single-SHA256 of all input nSequence values"},
+                    {RPCResult::Type::NUM, "output_count", "The number of outputs committed as uint32"},
+                    {RPCResult::Type::STR_HEX, "outputs_hash", "Single-SHA256 of all serialized outputs"},
+                    {RPCResult::Type::NUM, "input_index", "The committed input index"},
+                }},
+        },
+        RPCExamples{
+            HelpExampleCli("getdefaultctvhash", "\"hexstring\" 0")
+          + HelpExampleCli("getdefaultctvhash", "\"hexstring\" 0 true")
+          + HelpExampleRpc("getdefaultctvhash", "\"hexstring\", 0, true")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    CMutableTransaction mtx;
+    if (!DecodeHexTx(mtx, request.params[0].get_str(), /*try_no_witness=*/true, /*try_witness=*/true)) {
+        throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "TX decode failed");
+    }
+
+    const uint32_t input_index{self.Arg<uint32_t>("input_index")};
+    if (input_index >= mtx.vin.size()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Input index %u is out of range for transaction with %u inputs", input_index, mtx.vin.size()));
+    }
+
+    PrecomputedTransactionData txdata;
+    txdata.Init(mtx, {}, /*force=*/true);
+    const uint256 ctvhash{GetDefaultCheckTemplateVerifyHash(mtx, input_index, txdata)};
+
+    if (!self.Arg<bool>("verbose")) {
+        return CTVHashHex(ctvhash);
+    }
+
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("ctvhash", CTVHashHex(ctvhash));
+    result.pushKV("version", mtx.version);
+    result.pushKV("locktime", mtx.nLockTime);
+    result.pushKV("script_sigs_hash_included", txdata.m_ctv_has_nonempty_script_sigs);
+    if (txdata.m_ctv_has_nonempty_script_sigs) {
+        result.pushKV("script_sigs_hash", CTVHashHex(txdata.m_ctv_script_sigs_single_hash));
+    }
+    result.pushKV("input_count", static_cast<uint64_t>(mtx.vin.size()));
+    result.pushKV("sequences_hash", CTVHashHex(txdata.m_sequences_single_hash));
+    result.pushKV("output_count", static_cast<uint64_t>(mtx.vout.size()));
+    result.pushKV("outputs_hash", CTVHashHex(txdata.m_outputs_single_hash));
+    result.pushKV("input_index", input_index);
+    return result;
+},
+    };
+}
+
 static RPCHelpMan decodescript()
 {
     return RPCHelpMan{
@@ -502,7 +588,7 @@ static RPCHelpMan decodescript()
                 {RPCResult::Type::STR, "asm", "Disassembly of the script"},
                 {RPCResult::Type::STR, "desc", "Inferred descriptor for the script"},
                 {RPCResult::Type::STR, "type", "The output type (e.g. " + GetAllOutputTypes() + ")"},
-                {RPCResult::Type::STR, "address", /*optional=*/true, "The Bitcoin address (only if a well-defined address exists)"},
+                {RPCResult::Type::STR, "address", /*optional=*/true, "The qbit address (only if a well-defined address exists)"},
                 {RPCResult::Type::STR, "p2sh", /*optional=*/true,
                  "address of P2SH script wrapping this redeem script (not returned for types that should not be wrapped)"},
                 {RPCResult::Type::OBJ, "segwit", /*optional=*/true,
@@ -511,7 +597,7 @@ static RPCHelpMan decodescript()
                      {RPCResult::Type::STR, "asm", "Disassembly of the output script"},
                      {RPCResult::Type::STR_HEX, "hex", "The raw output script bytes, hex-encoded"},
                      {RPCResult::Type::STR, "type", "The type of the output script (e.g. witness_v0_keyhash or witness_v0_scripthash)"},
-                     {RPCResult::Type::STR, "address", /*optional=*/true, "The Bitcoin address (only if a well-defined address exists)"},
+                     {RPCResult::Type::STR, "address", /*optional=*/true, "The qbit address (only if a well-defined address exists)"},
                      {RPCResult::Type::STR, "desc", "Inferred descriptor for the script"},
                      {RPCResult::Type::STR, "p2sh-segwit", "address of the P2SH script wrapping this witness redeem script"},
                  }},
@@ -550,6 +636,7 @@ static RPCHelpMan decodescript()
         case TxoutType::SCRIPTHASH:
         case TxoutType::WITNESS_UNKNOWN:
         case TxoutType::WITNESS_V1_TAPROOT:
+        case TxoutType::WITNESS_V2_P2MR:
         case TxoutType::ANCHOR:
             // Should not be wrapped
             return false;
@@ -567,7 +654,7 @@ static RPCHelpMan decodescript()
         return true;
     }()};
 
-    if (can_wrap) {
+    if (can_wrap && !IsP2MROnlyOutputChain()) {
         r.pushKV("p2sh", EncodeDestination(ScriptHash(script)));
         // P2SH and witness programs cannot be wrapped in P2WSH, if this script
         // is a witness program, don't return addresses for a segwit programs.
@@ -593,6 +680,7 @@ static RPCHelpMan decodescript()
             case TxoutType::WITNESS_V0_KEYHASH:
             case TxoutType::WITNESS_V0_SCRIPTHASH:
             case TxoutType::WITNESS_V1_TAPROOT:
+            case TxoutType::WITNESS_V2_P2MR:
             case TxoutType::ANCHOR:
                 // Should not be wrapped
                 return false;
@@ -715,15 +803,17 @@ static RPCHelpMan signrawtransactionwithkey()
     return RPCHelpMan{
         "signrawtransactionwithkey",
         "Sign inputs for raw transaction (serialized, hex-encoded).\n"
-                "The second argument is an array of base58-encoded private\n"
-                "keys that will be the only keys used to sign the transaction.\n"
+                "The second argument is an array of private keys that will be the only keys used to sign the transaction.\n"
+                "Accepted formats are legacy base58 WIF keys and explicit pqc(KEY) expressions.\n"
+                + strprintf("For pqc(KEY), KEY must be either a hex-encoded raw PQC secret key (%u bytes) or a concrete non-ranged extended private key expression accepted by mr(pk(...)) descriptors.\n", CPQCKey::SIZE) +
                 "The third optional argument (may be null) is an array of previous transaction outputs that\n"
                 "this transaction depends on but may not yet be in the block chain.\n",
                 {
                     {"hexstring", RPCArg::Type::STR, RPCArg::Optional::NO, "The transaction hex string"},
-                    {"privkeys", RPCArg::Type::ARR, RPCArg::Optional::NO, "The base58-encoded private keys for signing",
+                    {"privkeys", RPCArg::Type::ARR, RPCArg::Optional::NO, "Private keys for signing",
                         {
-                            {"privatekey", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "private key in base58-encoding"},
+                            {"privatekey", RPCArg::Type::STR, RPCArg::Optional::OMITTED,
+                                strprintf("Either a legacy WIF private key, or pqc(KEY) where KEY is raw PQC secret key hex (%u bytes) or a concrete extended private key expression", CPQCKey::SIZE)},
                         },
                         },
                     {"prevtxs", RPCArg::Type::ARR, RPCArg::Optional::OMITTED, "The previous dependent transaction outputs",
@@ -735,6 +825,9 @@ static RPCHelpMan signrawtransactionwithkey()
                                     {"scriptPubKey", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "output script"},
                                     {"redeemScript", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "(required for P2SH) redeem script"},
                                     {"witnessScript", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "(required for P2WSH or P2SH-P2WSH) witness script"},
+                                    {"p2mrScript", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "(required with p2mrControlBlock for P2MR script-path spends) P2MR leaf script"},
+                                    {"p2mrControlBlock", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "(required with p2mrScript for P2MR script-path spends) P2MR control block matching scriptPubKey"},
+                                    {"p2mrLeafVersion", RPCArg::Type::NUM, RPCArg::Optional::OMITTED, "(optional for P2MR script-path spends, defaults to the control block leaf version) leaf version for p2mrScript"},
                                     {"amount", RPCArg::Type::AMOUNT, RPCArg::Optional::OMITTED, "(required for Segwit inputs) the amount spent"},
                                 },
                                 },
@@ -775,6 +868,7 @@ static RPCHelpMan signrawtransactionwithkey()
                 RPCExamples{
                     HelpExampleCli("signrawtransactionwithkey", "\"myhex\" \"[\\\"key1\\\",\\\"key2\\\"]\"")
             + HelpExampleRpc("signrawtransactionwithkey", "\"myhex\", \"[\\\"key1\\\",\\\"key2\\\"]\"")
+            + HelpExampleCli("signrawtransactionwithkey", "\"myhex\" \"[\\\"pqc(tprv.../87h/1h/0h/0/0)\\\"]\" \"[{\\\"txid\\\":\\\"id\\\",\\\"vout\\\":0,\\\"scriptPubKey\\\":\\\"5220...\\\",\\\"amount\\\":1.0,\\\"p2mrScript\\\":\\\"20...b3\\\",\\\"p2mrControlBlock\\\":\\\"c1\\\"}]\"")
                 },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
@@ -786,16 +880,10 @@ static RPCHelpMan signrawtransactionwithkey()
     FlatSigningProvider keystore;
     const UniValue& keys = request.params[1].get_array();
     for (unsigned int idx = 0; idx < keys.size(); ++idx) {
-        UniValue k = keys[idx];
-        CKey key = DecodeSecret(k.get_str());
-        if (!key.IsValid()) {
-            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid private key");
+        std::string error;
+        if (!ParseRawTransactionKey(keys[idx].get_str(), keystore, error)) {
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, error);
         }
-
-        CPubKey pubkey = key.GetPubKey();
-        CKeyID key_id = pubkey.GetID();
-        keystore.pubkeys.emplace(key_id, pubkey);
-        keystore.keys.emplace(key_id, key);
     }
 
     // Fetch previous transactions (inputs):
@@ -805,9 +893,11 @@ static RPCHelpMan signrawtransactionwithkey()
     }
     NodeContext& node = EnsureAnyNodeContext(request.context);
     FindCoins(node, coins);
+    ChainstateManager& chainman = EnsureChainman(node);
+    const int active_height{WITH_LOCK(chainman.GetMutex(), return chainman.ActiveChain().Height())};
 
     // Parse the prevtxs array
-    ParsePrevouts(request.params[2], &keystore, coins);
+    ParsePrevouts(request.params[2], &keystore, coins, NormalizeActiveHeight(active_height));
 
     UniValue result(UniValue::VOBJ);
     SignTransaction(mtx, &keystore, coins, request.params[3], result);
@@ -834,7 +924,7 @@ const RPCResult decodepsbt_inputs{
                     {RPCResult::Type::STR, "desc", "Inferred descriptor for the output"},
                     {RPCResult::Type::STR_HEX, "hex", "The raw output script bytes, hex-encoded"},
                     {RPCResult::Type::STR, "type", "The type, eg 'pubkeyhash'"},
-                    {RPCResult::Type::STR, "address", /*optional=*/true, "The Bitcoin address (only if a well-defined address exists)"},
+                    {RPCResult::Type::STR, "address", /*optional=*/true, "The qbit address (only if a well-defined address exists)"},
                 }},
             }},
             {RPCResult::Type::OBJ_DYN, "partial_signatures", /*optional=*/true, "",
@@ -925,6 +1015,28 @@ const RPCResult decodepsbt_inputs{
             }},
             {RPCResult::Type::STR_HEX, "taproot_internal_key", /*optional=*/ true, "The hex-encoded Taproot x-only internal key"},
             {RPCResult::Type::STR_HEX, "taproot_merkle_root", /*optional=*/ true, "The hex-encoded Taproot merkle root"},
+            {RPCResult::Type::ARR, "p2mr_script_path_sigs", /*optional=*/ true, "",
+            {
+                {RPCResult::Type::OBJ, "", "",
+                {
+                    {RPCResult::Type::STR_HEX, "pubkey", "The P2MR pubkey for this signature"},
+                    {RPCResult::Type::STR_HEX, "leaf_hash", "The leaf hash for this signature"},
+                    {RPCResult::Type::STR_HEX, "sig", "The signature itself"},
+                }},
+            }},
+            {RPCResult::Type::ARR, "p2mr_scripts", /*optional=*/ true, "",
+            {
+                {RPCResult::Type::OBJ, "", "",
+                {
+                    {RPCResult::Type::STR_HEX, "script", "A leaf script"},
+                    {RPCResult::Type::NUM, "leaf_ver", "The version number for the leaf script"},
+                    {RPCResult::Type::ARR, "control_blocks", "The control blocks for this script",
+                    {
+                        {RPCResult::Type::STR_HEX, "control_block", "A hex-encoded control block for this script"},
+                    }},
+                }},
+            }},
+            {RPCResult::Type::STR_HEX, "p2mr_merkle_root", /*optional=*/ true, "The hex-encoded P2MR merkle root"},
             {RPCResult::Type::ARR, "musig2_participant_pubkeys", /*optional=*/true, "",
             {
                 {RPCResult::Type::OBJ, "", "",
@@ -1056,7 +1168,7 @@ static RPCHelpMan decodepsbt()
 {
     return RPCHelpMan{
         "decodepsbt",
-        "Return a JSON object representing the serialized, base64-encoded partially signed Bitcoin transaction.",
+        "Return a JSON object representing the serialized, base64-encoded PSBT.",
                 {
                     {"psbt", RPCArg::Type::STR, RPCArg::Optional::NO, "The PSBT base64 string"},
                 },
@@ -1355,6 +1467,40 @@ static RPCHelpMan decodepsbt()
             in.pushKV("taproot_merkle_root", HexStr(input.m_tap_merkle_root));
         }
 
+        if (!input.m_qbit_p2mr_script_sigs.empty()) {
+            UniValue script_sigs(UniValue::VARR);
+            for (const auto& [pubkey_leaf, sig] : input.m_qbit_p2mr_script_sigs) {
+                const auto& [pubkey, leaf_hash] = pubkey_leaf;
+                UniValue sigobj(UniValue::VOBJ);
+                sigobj.pushKV("pubkey", HexStr(std::span{pubkey.data(), pubkey.size()}));
+                sigobj.pushKV("leaf_hash", HexStr(leaf_hash));
+                sigobj.pushKV("sig", HexStr(sig));
+                script_sigs.push_back(std::move(sigobj));
+            }
+            in.pushKV("p2mr_script_path_sigs", std::move(script_sigs));
+        }
+
+        if (!input.m_qbit_p2mr_scripts.empty()) {
+            UniValue p2mr_scripts(UniValue::VARR);
+            for (const auto& [leaf, control_blocks] : input.m_qbit_p2mr_scripts) {
+                const auto& [script, leaf_ver] = leaf;
+                UniValue script_info(UniValue::VOBJ);
+                script_info.pushKV("script", HexStr(script));
+                script_info.pushKV("leaf_ver", leaf_ver);
+                UniValue control_blocks_univ(UniValue::VARR);
+                for (const auto& control_block : control_blocks) {
+                    control_blocks_univ.push_back(HexStr(control_block));
+                }
+                script_info.pushKV("control_blocks", std::move(control_blocks_univ));
+                p2mr_scripts.push_back(std::move(script_info));
+            }
+            in.pushKV("p2mr_scripts", std::move(p2mr_scripts));
+        }
+
+        if (!input.m_qbit_p2mr_merkle_root.IsNull()) {
+            in.pushKV("p2mr_merkle_root", HexStr(input.m_qbit_p2mr_merkle_root));
+        }
+
         // Write MuSig2 fields
         if (!input.m_musig2_participants.empty()) {
             UniValue musig_pubkeys(UniValue::VARR);
@@ -1559,7 +1705,7 @@ static RPCHelpMan combinepsbt()
 {
     return RPCHelpMan{
         "combinepsbt",
-        "Combine multiple partially signed Bitcoin transactions into one transaction.\n"
+        "Combine multiple PSBTs into one transaction.\n"
                 "Implements the Combiner role.\n",
                 {
                     {"txs", RPCArg::Type::ARR, RPCArg::Optional::NO, "The base64 strings of partially signed transactions",
@@ -1947,6 +2093,10 @@ static RPCHelpMan analyzepsbt()
                                 {
                                     {RPCResult::Type::STR_HEX, "keyid", "Public key ID, hash160 of the public key, of a public key whose signature is missing"},
                                 }},
+                                {RPCResult::Type::ARR, "p2mr_signatures", /*optional=*/true, "",
+                                {
+                                    {RPCResult::Type::STR_HEX, "pubkey", "P2MR pubkey whose signature is missing"},
+                                }},
                                 {RPCResult::Type::STR_HEX, "redeemscript", /*optional=*/true, "Hash160 of the redeem script that is missing"},
                                 {RPCResult::Type::STR_HEX, "witnessscript", /*optional=*/true, "SHA256 of the witness script that is missing"},
                             }},
@@ -2003,6 +2153,13 @@ static RPCHelpMan analyzepsbt()
                 missing_sigs_univ.push_back(HexStr(pubkey));
             }
             missing.pushKV("signatures", std::move(missing_sigs_univ));
+        }
+        if (!input.missing_p2mr_sigs.empty()) {
+            UniValue missing_p2mr_sigs_univ(UniValue::VARR);
+            for (const CPQCPubKey& pubkey : input.missing_p2mr_sigs) {
+                missing_p2mr_sigs_univ.push_back(HexStr(std::span{pubkey.data(), pubkey.size()}));
+            }
+            missing.pushKV("p2mr_signatures", std::move(missing_p2mr_sigs_univ));
         }
         if (!missing.getKeys().empty()) {
             input_univ.pushKV("missing", std::move(missing));
@@ -2121,6 +2278,7 @@ void RegisterRawTransactionRPCCommands(CRPCTable& t)
         {"rawtransactions", &getrawtransaction},
         {"rawtransactions", &createrawtransaction},
         {"rawtransactions", &decoderawtransaction},
+        {"rawtransactions", &getdefaultctvhash},
         {"rawtransactions", &decodescript},
         {"rawtransactions", &combinerawtransaction},
         {"rawtransactions", &signrawtransactionwithkey},

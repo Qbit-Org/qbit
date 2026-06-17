@@ -57,6 +57,9 @@ class P2PEvict(BitcoinTestFramework):
         node = self.nodes[0]
         self.wallet = MiniWallet(node)
 
+        # Mature the default-cache coinbase UTXOs
+        self.ensure_cached_coinbase_mature(self.nodes[0])
+
         self.log.info("Create 4 peers and protect them from eviction by sending us a block")
         for _ in range(4):
             block_peer = node.add_p2p_connection(SlowP2PDataStore())

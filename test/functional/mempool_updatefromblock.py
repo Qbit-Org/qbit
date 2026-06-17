@@ -12,6 +12,7 @@ from math import ceil
 import time
 
 from test_framework.blocktools import (
+    COINBASE_MATURITY,
     create_block,
     create_coinbase,
 )
@@ -141,7 +142,9 @@ class MempoolUpdateFromBlockTest(BitcoinTestFramework):
         # Generate coins for the hundreds of transactions we will make
         parent_target_vsize = 100_000
         wallet = MiniWallet(self.nodes[0])
-        self.generate(wallet, (MAX_DISCONNECTED_TX_POOL_BYTES // parent_target_vsize) + 100)
+        # Need a large set of mature coinbases before creating hundreds of parents.
+        # Generate enough blocks so the mined set includes >200 mature outputs.
+        self.generate(wallet, COINBASE_MATURITY + (MAX_DISCONNECTED_TX_POOL_BYTES // parent_target_vsize) + 100)
 
         assert_equal(self.nodes[0].getrawmempool(), [])
 
@@ -190,7 +193,11 @@ class MempoolUpdateFromBlockTest(BitcoinTestFramework):
         self.log.info('Check that too long chains on reorg are handled')
 
         wallet = MiniWallet(self.nodes[0])
-        self.generate(wallet, 101)
+        # The previous subtest leaves a large mempool behind. Mine it out
+        # without paying another full qbit coinbase-maturity window.
+        while self.nodes[0].getrawmempool():
+            self.generate(wallet, 1)
+        wallet.ensure_spendable_utxos(min_spendable=1, mature_coinbase_count=1)
 
         assert_equal(self.nodes[0].getrawmempool(), [])
 
@@ -219,6 +226,9 @@ class MempoolUpdateFromBlockTest(BitcoinTestFramework):
         assert_equal(set(mempool), set([tx["txid"] for tx in chain[:-2]]))
 
     def run_test(self):
+        wallet = MiniWallet(self.nodes[0])
+        wallet.ensure_spendable_utxos(min_spendable=1, mature_coinbase_count=1)
+
         # Mine in batches of 25 to test multi-block reorg under chain limits
         self.transaction_graph_test(size=CUSTOM_ANCESTOR_COUNT, n_tx_to_mine=[25, 50, 75])
 

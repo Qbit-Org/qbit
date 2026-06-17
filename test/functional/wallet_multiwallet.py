@@ -191,7 +191,8 @@ class MultiWalletTest(BitcoinTestFramework):
         self.nodes[0].createwallet("w5")
         assert_equal(set(node.listwallets()), {"w4", "w5"})
         w5 = wallet("w5")
-        self.generatetoaddress(node, nblocks=1, address=w5.getnewaddress(), sync_fun=self.no_op)
+        block_hash = self.generatetoaddress(node, nblocks=1, address=w5.getnewaddress(), sync_fun=self.no_op)[0]
+        block_subsidy = Decimal(self.nodes[0].getblock(block_hash, 2)["tx"][0]["vout"][0]["value"])
 
         # now if wallets/ exists again, but the rootdir is specified as the walletdir, w4 and w5 should still be loaded
         os.rename(wallet_dir2, wallet_dir())
@@ -200,7 +201,7 @@ class MultiWalletTest(BitcoinTestFramework):
         self.nodes[0].loadwallet("w5")
         assert_equal(set(node.listwallets()), {"w4", "w5"})
         w5 = wallet("w5")
-        assert_equal(w5.getbalances()["mine"]["immature"], 50)
+        assert_equal(w5.getbalances()["mine"]["immature"], block_subsidy)
 
         competing_wallet_dir = os.path.join(self.options.tmpdir, 'competing_walletdir')
         os.mkdir(competing_wallet_dir)
@@ -222,7 +223,7 @@ class MultiWalletTest(BitcoinTestFramework):
         self.generatetoaddress(node, nblocks=1, address=wallets[0].getnewaddress(), sync_fun=self.no_op)
         for wallet_name, wallet in zip(wallet_names, wallets):
             info = wallet.getwalletinfo()
-            assert_equal(wallet.getbalances()["mine"]["immature"], 50 if wallet is wallets[0] else 0)
+            assert_equal(wallet.getbalances()["mine"]["immature"], block_subsidy if wallet is wallets[0] else 0)
             assert_equal(info['walletname'], wallet_name)
 
         # accessing invalid wallet fails
@@ -233,7 +234,7 @@ class MultiWalletTest(BitcoinTestFramework):
 
         w1, w2, w3, w4, *_ = wallets
         self.generatetoaddress(node, nblocks=COINBASE_MATURITY + 1, address=w1.getnewaddress(), sync_fun=self.no_op)
-        assert_equal(w1.getbalance(), 100)
+        assert_equal(w1.getbalance(), block_subsidy * 2)
         assert_equal(w2.getbalance(), 0)
         assert_equal(w3.getbalance(), 0)
         assert_equal(w4.getbalance(), 0)

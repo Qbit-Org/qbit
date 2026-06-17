@@ -991,7 +991,7 @@ Signing is only possible with addresses of the type 'legacy'.</source>
         <translation type="unfinished">(%1 נעולים)</translation>
     </message>
     <message>
-        <source>Can vary +/- %1 satoshi(s) per input.</source>
+        <source>Can vary +/- %1 bits per input.</source>
         <translation type="unfinished">יכול להשתנות במגמה של +/- %1 סנטושי לקלט.</translation>
     </message>
     <message>
@@ -2449,7 +2449,7 @@ Signing is only possible with addresses of the type 'legacy'.</source>
         <translation type="unfinished">הסתרת הגדרות עמלת עסקה</translation>
     </message>
     <message>
-        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for bitcoin transactions than the network can process.</source>
+        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for qbit transactions than the network can process.</source>
         <translation type="unfinished">כאשר יש פחות נפח עסקאות מאשר מקום בבלוק, כורים וכן צמתות מקשרות יכולות להכתיב עמלות מינימום. התשלום של עמלת מינימום הנו תקין, אך יש לקחת בחשבון שהדבר יכול לגרום לעסקה שלא תאושר ברגע שיש יותר ביקוש לעסקאות ביטקוין מאשר הרשת יכולה לעבד.</translation>
     </message>
     <message>
@@ -2666,7 +2666,7 @@ Signing is only possible with addresses of the type 'legacy'.</source>
         <translation type="unfinished">הסכום לשליחה במטבע הנבחר</translation>
     </message>
     <message>
-        <source>The fee will be deducted from the amount being sent. The recipient will receive less bitcoins than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
+        <source>The fee will be deducted from the amount being sent. The recipient will receive less QBT than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
         <translation type="unfinished">העמלה תנוכה מהסכום שנשלח. הנמען יקבל פחות ביטקוינים ממה שסיפקת בשדה הסכום. אם נבחרו מספר נמענים, העמלה תחולק באופן שווה.</translation>
     </message>
     <message>

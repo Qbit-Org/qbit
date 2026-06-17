@@ -38,6 +38,7 @@ NO_QT ?=
 NO_QR ?=
 NO_WALLET ?=
 NO_ZMQ ?=
+NO_PHOTON ?= 1
 NO_USDT ?=
 # Default NO_IPC value is 1 on Windows
 NO_IPC ?= $(if $(findstring mingw32,$(HOST)),1,)
@@ -141,13 +142,13 @@ include packages/packages.mk
 #
 build_id:=$(shell env CC='$(build_CC)' C_STANDARD='$(C_STANDARD)' CXX='$(build_CXX)' CXX_STANDARD='$(CXX_STANDARD)' \
                       AR='$(build_AR)' NM='$(build_NM)' RANLIB='$(build_RANLIB)' STRIP='$(build_STRIP)' SHA256SUM='$(build_SHA256SUM)' \
-                      DEBUG='$(DEBUG)' \
+                      DEBUG='$(DEBUG)' HOST_OS='$(build_os)' \
                       ./gen_id '$(BUILD_ID_SALT)' 'GUIX_ENVIRONMENT=$(realpath $(GUIX_ENVIRONMENT))')
 
 $(host_arch)_$(host_os)_id:=$(shell env CC='$(host_CC)' C_STANDARD='$(C_STANDARD)' CXX='$(host_CXX)' CXX_STANDARD='$(CXX_STANDARD)' \
                                         CPPFLAGS='$(CPPFLAGS)' CFLAGS='$(CFLAGS)' CXXFLAGS='$(CXXFLAGS)' LDFLAGS='$(LDFLAGS)' \
                                         AR='$(host_AR)' NM='$(host_NM)' RANLIB='$(host_RANLIB)' STRIP='$(host_STRIP)' SHA256SUM='$(build_SHA256SUM)' \
-                                        DEBUG='$(DEBUG)' LTO='$(LTO)' \
+                                        DEBUG='$(DEBUG)' LTO='$(LTO)' HOST_OS='$(host_os)' \
                                         ./gen_id '$(HOST_ID_SALT)' 'GUIX_ENVIRONMENT=$(realpath $(GUIX_ENVIRONMENT))')
 
 boost_packages_$(NO_BOOST) = $(boost_packages)
@@ -162,6 +163,7 @@ qt_native_packages_$(NO_QT) = $(qt_native_packages)
 wallet_packages_$(NO_WALLET) = $(sqlite_packages)
 
 zmq_packages_$(NO_ZMQ) = $(zmq_packages)
+photon_packages_$(NO_PHOTON) = $(photon_packages)
 ipc_packages_$(NO_IPC) = $(ipc_packages)
 usdt_packages_$(NO_USDT) = $(usdt_$(host_os)_packages)
 
@@ -170,6 +172,10 @@ native_packages += $($(host_arch)_$(host_os)_native_packages) $($(host_os)_nativ
 
 ifneq ($(zmq_packages_),)
 packages += $(zmq_packages)
+endif
+
+ifneq ($(photon_packages_),)
+packages += $(photon_packages)
 endif
 
 ifneq ($(ipc_packages_),)

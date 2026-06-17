@@ -710,13 +710,19 @@ public:
         limit_ancestor_count = limits.ancestor_count;
         limit_descendant_count = limits.descendant_count;
     }
-    util::Result<void> checkChainLimits(const CTransactionRef& tx) override
+    util::Result<void> checkChainLimits(const CTransactionRef& tx, std::optional<int64_t> tx_vsize) override
     {
         if (!m_node.mempool) return {};
-        LockPoints lp;
-        CTxMemPoolEntry entry(tx, 0, 0, 0, 0, false, 0, lp);
+        int64_t package_vsize{0};
+        if (tx_vsize) {
+            package_vsize = *tx_vsize;
+        } else {
+            LockPoints lp;
+            CTxMemPoolEntry entry(tx, 0, 0, 0, 0, false, 0, lp);
+            package_vsize = entry.GetTxSize();
+        }
         LOCK(m_node.mempool->cs);
-        return m_node.mempool->CheckPackageLimits({tx}, entry.GetTxSize());
+        return m_node.mempool->CheckPackageLimits({tx}, package_vsize);
     }
     CFeeRate estimateSmartFee(int num_blocks, bool conservative, FeeCalculation* calc) override
     {

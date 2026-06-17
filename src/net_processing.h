@@ -3,8 +3,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_NET_PROCESSING_H
-#define BITCOIN_NET_PROCESSING_H
+#ifndef QBIT_NET_PROCESSING_H
+#define QBIT_NET_PROCESSING_H
 
 #include <consensus/amount.h>
 #include <net.h>
@@ -109,6 +109,21 @@ public:
     /** Get statistics from node state */
     virtual bool GetNodeStateStats(NodeId nodeid, CNodeStateStats& stats) const = 0;
 
+    /** Test-only access to whether a block request from a peer was marked stripped. */
+    virtual std::optional<bool> RequestedStrippedForTest(NodeId nodeid, const uint256& hash) const = 0;
+
+    /** Test-only access to the recorded source peer for a received block hash. */
+    virtual std::optional<NodeId> BlockSourcePeerForTest(const uint256& hash) const = 0;
+
+    /** Test-only helper to mark a witness recovery request in flight for a peer. */
+    virtual bool RequestWitnessRecoveryForTest(NodeId nodeid, const CBlockIndex& block_index) = 0;
+
+    /** Test-only setter for peer best-known block state. */
+    virtual void SetBestKnownBlockForTest(NodeId nodeid, const CBlockIndex& block_index) = 0;
+
+    /** Test-only wrapper for headers direct fetch. */
+    virtual void HeadersDirectFetchBlocksForTest(CNode& node, const CBlockIndex& last_header) = 0;
+
     virtual std::vector<node::TxOrphanage::OrphanInfo> GetOrphanTransactions() = 0;
 
     /** Get peer manager info. */
@@ -161,6 +176,9 @@ public:
      * we do not have a confirmed set of service flags.
     */
     virtual ServiceFlags GetDesirableServiceFlags(ServiceFlags services) const = 0;
+
+    /** Whether a peer advertises service flags that make it unsuitable for some connection types. */
+    virtual bool HasUndesirableServiceFlags(ServiceFlags services) const override = 0;
 };
 
-#endif // BITCOIN_NET_PROCESSING_H
+#endif // QBIT_NET_PROCESSING_H

@@ -11,12 +11,16 @@
 #include <primitives/transaction.h>
 #include <script/keyorigin.h>
 #include <script/miniscript.h>
+#include <script/p2mr.h>
+#include <script/p2mr_sizing.h>
 #include <script/script.h>
 #include <script/signingprovider.h>
 #include <script/solver.h>
 #include <uint256.h>
 #include <util/translation.h>
 #include <util/vector.h>
+
+#include <algorithm>
 
 typedef std::vector<unsigned char> valtype;
 
@@ -88,6 +92,58 @@ bool MutableTransactionSignatureCreator::CreateSchnorrSig(const SigningProvider&
     if (!key.SignSchnorr(hash, sig, merkle_root, {})) return false;
     if (nHashType) sig.push_back(nHashType);
     return true;
+}
+
+bool MutableTransactionSignatureCreator::CreatePQCSignature(const SigningProvider& provider, std::vector<unsigned char>& sig, const CPQCPubKey& pubkey, const uint256* leaf_hash, SigVersion sigversion) const
+{
+    assert(sigversion == SigVersion::P2MR);
+
+    if (!m_txdata || !m_txdata->m_bip341_taproot_ready || !m_txdata->m_spent_outputs_ready) return false;
+
+    ScriptExecutionData execdata;
+    execdata.m_annex_init = true;
+    execdata.m_annex_present = false; // Only support annex-less signing for now.
+    execdata.m_codeseparator_pos_init = true;
+    execdata.m_codeseparator_pos = 0xFFFFFFFF; // Only support non-OP_CODESEPARATOR signing for now.
+    if (!leaf_hash) return false;
+    execdata.m_tapleaf_hash_init = true;
+    execdata.m_tapleaf_hash = *leaf_hash;
+
+    uint256 hash;
+    if (!SignatureHashP2MR(hash, execdata, m_txto, nIn, nHashType, *m_txdata, MissingDataBehavior::FAIL)) return false;
+
+    std::vector<unsigned char> raw_sig;
+    if (!provider.SignPQC(pubkey, hash, raw_sig)) return false;
+    sig = std::move(raw_sig);
+    if (nHashType) sig.push_back(nHashType);
+    return true;
+}
+
+bool MutableTransactionSignatureCreator::CanCreatePQCSignature(const SigningProvider& provider, const CPQCPubKey& pubkey) const
+{
+    return provider.CanSignPQC(pubkey);
+}
+
+bool MutableTransactionSignatureCreator::VerifyP2MRScriptSignature(std::span<const unsigned char> sig, const CPQCPubKey& pubkey, const uint256& leaf_hash, SigVersion sigversion) const
+{
+    assert(sigversion == SigVersion::P2MR);
+    if (!m_txdata ||
+        !m_txdata->m_bip341_taproot_ready ||
+        !m_txdata->m_spent_outputs_ready) return true;
+
+    ScriptExecutionData execdata;
+    execdata.m_annex_init = true;
+    execdata.m_annex_present = false;
+    execdata.m_codeseparator_pos_init = true;
+    execdata.m_codeseparator_pos = 0xFFFFFFFF;
+    execdata.m_tapleaf_hash_init = true;
+    execdata.m_tapleaf_hash = leaf_hash;
+    return checker.CheckPQCSignature(sig, std::span{pubkey.data(), pubkey.size()}, sigversion, execdata);
+}
+
+size_t MutableTransactionSignatureCreator::P2MRSignatureSize() const
+{
+    return PQC_SIG_SIZE + (nHashType ? 1 : 0);
 }
 
 static bool GetCScript(const SigningProvider& provider, const SignatureData& sigdata, const CScriptID& scriptid, CScript& script)
@@ -174,6 +230,89 @@ static bool CreateTaprootScriptSig(const BaseSignatureCreator& creator, Signatur
         return true;
     }
     return false;
+}
+
+static const std::vector<unsigned char>* LookupValidP2MRScriptSig(const SignatureData& sigdata, const BaseSignatureCreator& creator, const CPQCPubKey& pubkey, const uint256& leaf_hash, bool* invalid_cached_sig = nullptr)
+{
+    if (invalid_cached_sig) *invalid_cached_sig = false;
+    auto lookup_key = std::make_pair(pubkey, leaf_hash);
+    auto it = sigdata.p2mr_script_sigs.find(lookup_key);
+    if (it == sigdata.p2mr_script_sigs.end()) return nullptr;
+
+    uint8_t hashtype;
+    if (!GetP2MRSignatureHashType(it->second, hashtype) ||
+        !creator.VerifyP2MRScriptSignature(it->second, pubkey, leaf_hash, SigVersion::P2MR)) {
+        if (invalid_cached_sig) *invalid_cached_sig = true;
+        return nullptr;
+    }
+    return &it->second;
+}
+
+static void AddUniqueP2MRPubKey(std::vector<CPQCPubKey>& pubkeys, const CPQCPubKey& pubkey)
+{
+    if (std::find(pubkeys.begin(), pubkeys.end(), pubkey) == pubkeys.end()) {
+        pubkeys.push_back(pubkey);
+    }
+}
+
+static void AddMissingP2MRScriptSig(SignatureData& sigdata, const CPQCPubKey& pubkey)
+{
+    AddUniqueP2MRPubKey(sigdata.missing_p2mr_sigs, pubkey);
+}
+
+static void AddInvalidP2MRScriptSig(SignatureData& sigdata, const CPQCPubKey& pubkey)
+{
+    AddUniqueP2MRPubKey(sigdata.invalid_p2mr_sigs, pubkey);
+}
+
+static bool CreateP2MRScriptSig(const BaseSignatureCreator& creator, SignatureData& sigdata, const SigningProvider& provider, std::vector<unsigned char>& sig_out, const CPQCPubKey& pubkey, const uint256& leaf_hash, SigVersion sigversion)
+{
+    bool invalid_cached_sig{false};
+    if (const auto* cached_sig = LookupValidP2MRScriptSig(sigdata, creator, pubkey, leaf_hash, &invalid_cached_sig)) {
+        sig_out = *cached_sig;
+        return true;
+    }
+    if (invalid_cached_sig) {
+        AddInvalidP2MRScriptSig(sigdata, pubkey);
+        return false;
+    }
+    if (creator.CreatePQCSignature(provider, sig_out, pubkey, &leaf_hash, sigversion)) {
+        sigdata.p2mr_script_sigs[std::make_pair(pubkey, leaf_hash)] = sig_out;
+        return true;
+    }
+    AddMissingP2MRScriptSig(sigdata, pubkey);
+    return false;
+}
+
+static bool ParseP2MRScript(std::span<const unsigned char> script_bytes, std::vector<CPQCPubKey>& pubkeys, int& threshold)
+{
+    constexpr unsigned char PUBKEY_PUSH_SIZE = static_cast<unsigned char>(CPQCPubKey::SIZE);
+    constexpr size_t PK_SCRIPT_SIZE = 1 + CPQCPubKey::SIZE + 1; // <pushlen><pubkey><checksig op>
+
+    pubkeys.clear();
+    threshold = 0;
+
+    // Recognize pk(KEY): <32-byte key> OP_CHECKSIGPQC
+    if (script_bytes.size() == PK_SCRIPT_SIZE && script_bytes[0] == PUBKEY_PUSH_SIZE && script_bytes[CPQCPubKey::SIZE + 1] == OP_CHECKSIGPQC) {
+        CPQCPubKey key{script_bytes.subspan(1, CPQCPubKey::SIZE)};
+        if (!key.IsValid()) return false;
+        pubkeys.emplace_back(key);
+        threshold = 1;
+        return true;
+    }
+
+    CScript script(script_bytes.begin(), script_bytes.end());
+    const auto multi_a = p2mr::MatchMultiA(script);
+    if (!multi_a) return false;
+
+    pubkeys.reserve(multi_a->keyspans.size());
+    for (const auto keyspan : multi_a->keyspans) {
+        CPQCPubKey key{keyspan};
+        if (!key.IsValid()) return false;
+        pubkeys.emplace_back(key);
+    }
+    threshold = multi_a->threshold;
+    return true;
 }
 
 template<typename M, typename K, typename V>
@@ -330,6 +469,141 @@ static bool SignTaprootScript(const SigningProvider& provider, const BaseSignatu
     return ms && ms->Satisfy(ms_satisfier, result) == miniscript::Availability::YES;
 }
 
+struct P2MRScriptSigningPlan {
+    std::vector<unsigned char> script;
+    std::vector<unsigned char> control_block;
+    std::vector<CPQCPubKey> pubkeys;
+    std::vector<bool> candidate_pubkeys;
+    uint256 leaf_hash;
+    int threshold{0};
+    int missing_signatures{0};
+    int new_signatures{0};
+    bool complete{false};
+    size_t witness_size{0};
+};
+
+static bool BuildP2MRScriptSigningPlan(const SigningProvider& provider, const BaseSignatureCreator& creator, SignatureData& sigdata, int leaf_version, std::span<const unsigned char> script_bytes, const std::vector<unsigned char>& control_block, P2MRScriptSigningPlan& plan)
+{
+    // Pre-activation, signing/finalization stays pinned to P2MR v1 leaves only.
+    if (leaf_version != P2MR_LEAF_VERSION_V1) return false;
+
+    std::vector<CPQCPubKey> pubkeys;
+    int threshold{0};
+    if (!ParseP2MRScript(script_bytes, pubkeys, threshold)) return false;
+
+    const uint256 leaf_hash = ComputeP2MRLeafHash(leaf_version, script_bytes);
+    std::vector<bool> candidate_pubkeys(pubkeys.size(), false);
+    int num_candidates{0};
+    int num_cached_signatures{0};
+
+    bool has_invalid_cached_sig{false};
+    for (const auto& pubkey : pubkeys) {
+        bool invalid_cached_sig{false};
+        LookupValidP2MRScriptSig(sigdata, creator, pubkey, leaf_hash, &invalid_cached_sig);
+        if (invalid_cached_sig) {
+            AddInvalidP2MRScriptSig(sigdata, pubkey);
+            has_invalid_cached_sig = true;
+        }
+    }
+    if (has_invalid_cached_sig) return false;
+
+    for (size_t index = 0; index < pubkeys.size(); ++index) {
+        if (LookupValidP2MRScriptSig(sigdata, creator, pubkeys[index], leaf_hash) != nullptr) {
+            candidate_pubkeys[index] = true;
+            ++num_candidates;
+            ++num_cached_signatures;
+        } else if (creator.CanCreatePQCSignature(provider, pubkeys[index])) {
+            candidate_pubkeys[index] = true;
+            ++num_candidates;
+        }
+    }
+    if (num_candidates < threshold) {
+        for (const auto& pubkey : pubkeys) {
+            if (LookupValidP2MRScriptSig(sigdata, creator, pubkey, leaf_hash) == nullptr &&
+                !creator.CanCreatePQCSignature(provider, pubkey)) {
+                AddMissingP2MRScriptSig(sigdata, pubkey);
+            }
+        }
+        if (num_candidates == 0) return false;
+    }
+
+    std::vector<valtype> estimated_stack;
+    estimated_stack.reserve(pubkeys.size() + 2);
+    // Witness element order must be reverse-key-order to satisfy CHECKSIGADD stack semantics.
+    int num_estimated_signatures{0};
+    for (size_t i = pubkeys.size(); i > 0; --i) {
+        const size_t index{i - 1};
+        if (!candidate_pubkeys[index] || num_estimated_signatures >= threshold) {
+            estimated_stack.emplace_back();
+        } else if (const auto* cached_sig = LookupValidP2MRScriptSig(sigdata, creator, pubkeys[index], leaf_hash)) {
+            estimated_stack.push_back(*cached_sig);
+            ++num_estimated_signatures;
+        } else {
+            estimated_stack.emplace_back(creator.P2MRSignatureSize(), 0);
+            ++num_estimated_signatures;
+        }
+    }
+    estimated_stack.emplace_back(script_bytes.begin(), script_bytes.end());
+    estimated_stack.push_back(control_block);
+
+    plan.script.assign(script_bytes.begin(), script_bytes.end());
+    plan.control_block = control_block;
+    plan.pubkeys = std::move(pubkeys);
+    plan.candidate_pubkeys = std::move(candidate_pubkeys);
+    plan.leaf_hash = leaf_hash;
+    plan.threshold = threshold;
+    plan.complete = num_candidates >= threshold;
+    plan.missing_signatures = std::max(0, threshold - num_candidates);
+    plan.new_signatures = std::max(0, std::min(threshold, num_candidates) - num_cached_signatures);
+    plan.witness_size = GetSerializeSize(estimated_stack);
+    return true;
+}
+
+static int SignP2MRScript(const SigningProvider& provider, const BaseSignatureCreator& creator, SignatureData& sigdata, const P2MRScriptSigningPlan& plan, std::vector<valtype>& result)
+{
+    int num_signed{0};
+
+    result.clear();
+    result.reserve(plan.pubkeys.size());
+    for (size_t i = plan.pubkeys.size(); i > 0; --i) {
+        const size_t index{i - 1};
+        if (!plan.candidate_pubkeys[index] || num_signed >= plan.threshold) {
+            result.emplace_back();
+            continue;
+        }
+        std::vector<unsigned char> sig;
+        if (CreateP2MRScriptSig(creator, sigdata, provider, sig, plan.pubkeys[index], plan.leaf_hash, SigVersion::P2MR)) {
+            ++num_signed;
+            result.push_back(std::move(sig));
+        } else {
+            result.emplace_back();
+        }
+    }
+
+    return num_signed;
+}
+
+static const std::vector<unsigned char>* FindValidP2MRControlBlock(const std::set<std::vector<unsigned char>, ShortestVectorFirstComparator>& control_blocks, std::span<const unsigned char> script_bytes, int leaf_version, const WitnessV2P2MR& output)
+{
+    if (leaf_version < 0 || leaf_version > 0xff) return nullptr;
+
+    const uint256 leaf_hash = ComputeP2MRLeafHash(leaf_version, script_bytes);
+    const uint256 merkle_root{std::span<const unsigned char>(output)};
+
+    for (const auto& control_block : control_blocks) {
+        if (control_block.size() < P2MR_CONTROL_BASE_SIZE || control_block.size() > P2MR_CONTROL_MAX_SIZE ||
+            ((control_block.size() - P2MR_CONTROL_BASE_SIZE) % P2MR_CONTROL_NODE_SIZE) != 0) {
+            continue;
+        }
+        if ((control_block[0] & 1) == 0) continue;
+        if ((control_block[0] & TAPROOT_LEAF_MASK) != leaf_version) continue;
+        if (ComputeP2MRMerkleRoot(control_block, leaf_hash) != merkle_root) continue;
+        return &control_block;
+    }
+
+    return nullptr;
+}
+
 static bool SignTaproot(const SigningProvider& provider, const BaseSignatureCreator& creator, const WitnessV1Taproot& output, SignatureData& sigdata, std::vector<valtype>& result)
 {
     TaprootSpendData spenddata;
@@ -389,6 +663,66 @@ static bool SignTaproot(const SigningProvider& provider, const BaseSignatureCrea
         return true;
     }
 
+    return false;
+}
+
+static bool SignP2MR(const SigningProvider& provider, const BaseSignatureCreator& creator, const WitnessV2P2MR& output, SignatureData& sigdata, std::vector<valtype>& result)
+{
+    P2MRSpendData spenddata;
+    TaprootBuilder builder;
+
+    if (provider.GetP2MRSpendData(output, spenddata)) {
+        sigdata.p2mr_spenddata.Merge(spenddata);
+    }
+    if (provider.GetP2MRBuilder(output, builder)) {
+        sigdata.p2mr_builder = builder;
+    }
+    if (sigdata.p2mr_spenddata.scripts.empty() && sigdata.p2mr_builder.has_value()) {
+        sigdata.p2mr_spenddata.Merge(sigdata.p2mr_builder->GetP2MRSpendData());
+    }
+
+    std::vector<P2MRScriptSigningPlan> complete_plans;
+    std::vector<P2MRScriptSigningPlan> partial_plans;
+    for (const auto& [key, control_blocks] : sigdata.p2mr_spenddata.scripts) {
+        const auto& [script, leaf_ver] = key;
+        const auto* control_block = FindValidP2MRControlBlock(control_blocks, script, leaf_ver, output);
+        if (control_block == nullptr) continue;
+        P2MRScriptSigningPlan plan;
+        if (BuildP2MRScriptSigningPlan(provider, creator, sigdata, leaf_ver, script, *control_block, plan)) {
+            if (plan.complete) {
+                complete_plans.push_back(std::move(plan));
+            } else {
+                partial_plans.push_back(std::move(plan));
+            }
+        }
+    }
+    if (!sigdata.invalid_p2mr_sigs.empty()) return false;
+
+    std::stable_sort(complete_plans.begin(), complete_plans.end(), [](const auto& a, const auto& b) {
+        return a.witness_size < b.witness_size;
+    });
+    for (const auto& plan : complete_plans) {
+        std::vector<std::vector<unsigned char>> result_stack;
+        if (SignP2MRScript(provider, creator, sigdata, plan, result_stack) < plan.threshold) continue;
+        result_stack.push_back(plan.script); // Push script
+        result_stack.push_back(plan.control_block); // Push the smallest valid control block
+        result = std::move(result_stack);
+        return true;
+    }
+
+    // If no complete witness can be produced, still create one partial P2MR
+    // signature plan for PSBT handoff to other signers. Limiting the fallback
+    // to the best partial plan avoids burning PQC counters across adversarial
+    // many-leaf incomplete PSBTs.
+    std::stable_sort(partial_plans.begin(), partial_plans.end(), [](const auto& a, const auto& b) {
+        if (a.missing_signatures != b.missing_signatures) return a.missing_signatures < b.missing_signatures;
+        if (a.new_signatures != b.new_signatures) return a.new_signatures < b.new_signatures;
+        return a.witness_size < b.witness_size;
+    });
+    if (!partial_plans.empty()) {
+        std::vector<std::vector<unsigned char>> result_stack;
+        SignP2MRScript(provider, creator, sigdata, partial_plans.front(), result_stack);
+    }
     return false;
 }
 
@@ -476,6 +810,9 @@ static bool SignStep(const SigningProvider& provider, const BaseSignatureCreator
     case TxoutType::WITNESS_V1_TAPROOT:
         return SignTaproot(provider, creator, WitnessV1Taproot(XOnlyPubKey{vSolutions[0]}), sigdata, ret);
 
+    case TxoutType::WITNESS_V2_P2MR:
+        return SignP2MR(provider, creator, WitnessV2P2MR{uint256{std::span<const unsigned char>(vSolutions[0])}}, sigdata, ret);
+
     case TxoutType::ANCHOR:
         return true;
     } // no default case, so the compiler can warn about missing cases
@@ -553,6 +890,12 @@ bool ProduceSignature(const SigningProvider& provider, const BaseSignatureCreato
         sigdata.witness = true;
         result.clear();
     } else if (whichType == TxoutType::WITNESS_V1_TAPROOT && !P2SH) {
+        sigdata.witness = true;
+        if (solved) {
+            sigdata.scriptWitness.stack = std::move(result);
+        }
+        result.clear();
+    } else if (whichType == TxoutType::WITNESS_V2_P2MR && !P2SH) {
         sigdata.witness = true;
         if (solved) {
             sigdata.scriptWitness.stack = std::move(result);
@@ -691,6 +1034,19 @@ void SignatureData::MergeSignatureData(SignatureData sigdata)
     if (witness_script.empty() && !sigdata.witness_script.empty()) {
         witness_script = sigdata.witness_script;
     }
+    tr_spenddata.Merge(std::move(sigdata.tr_spenddata));
+    if (!tr_builder.has_value() && sigdata.tr_builder.has_value()) {
+        tr_builder = std::move(sigdata.tr_builder);
+    }
+    p2mr_spenddata.Merge(std::move(sigdata.p2mr_spenddata));
+    if (!p2mr_builder.has_value() && sigdata.p2mr_builder.has_value()) {
+        p2mr_builder = std::move(sigdata.p2mr_builder);
+    }
+    if (taproot_key_path_sig.empty() && !sigdata.taproot_key_path_sig.empty()) {
+        taproot_key_path_sig = std::move(sigdata.taproot_key_path_sig);
+    }
+    taproot_script_sigs.insert(std::make_move_iterator(sigdata.taproot_script_sigs.begin()), std::make_move_iterator(sigdata.taproot_script_sigs.end()));
+    p2mr_script_sigs.insert(std::make_move_iterator(sigdata.p2mr_script_sigs.begin()), std::make_move_iterator(sigdata.p2mr_script_sigs.end()));
     signatures.insert(std::make_move_iterator(sigdata.signatures.begin()), std::make_move_iterator(sigdata.signatures.end()));
 }
 
@@ -702,6 +1058,7 @@ public:
     DummySignatureChecker() = default;
     bool CheckECDSASignature(const std::vector<unsigned char>& sig, const std::vector<unsigned char>& vchPubKey, const CScript& scriptCode, SigVersion sigversion) const override { return sig.size() != 0; }
     bool CheckSchnorrSignature(std::span<const unsigned char> sig, std::span<const unsigned char> pubkey, SigVersion sigversion, ScriptExecutionData& execdata, ScriptError* serror) const override { return sig.size() != 0; }
+    bool CheckPQCSignature(std::span<const unsigned char> sig, std::span<const unsigned char> pubkey, SigVersion sigversion, ScriptExecutionData& execdata, ScriptError* serror) const override { return !sig.empty(); }
     bool CheckLockTime(const CScriptNum& nLockTime) const override { return true; }
     bool CheckSequence(const CScriptNum& nSequence) const override { return true; }
 };
@@ -737,6 +1094,14 @@ public:
         sig.assign(64, '\000');
         return true;
     }
+    bool CreatePQCSignature(const SigningProvider& provider, std::vector<unsigned char>& sig, const CPQCPubKey& pubkey, const uint256* leaf_hash, SigVersion sigversion) const override
+    {
+        sig.assign(P2MR_V1_MAX_SIGNATURE_ITEM_SIZE, '\000');
+        sig.back() = SIGHASH_ALL;
+        return true;
+    }
+    bool CanCreatePQCSignature(const SigningProvider& provider, const CPQCPubKey& pubkey) const override { return true; }
+    size_t P2MRSignatureSize() const override { return P2MR_V1_MAX_SIGNATURE_ITEM_SIZE; }
 };
 
 }

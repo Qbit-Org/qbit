@@ -2,19 +2,22 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_HEADERSSYNC_H
-#define BITCOIN_HEADERSSYNC_H
+#ifndef QBIT_HEADERSSYNC_H
+#define QBIT_HEADERSSYNC_H
 
 #include <arith_uint256.h>
 #include <chain.h>
 #include <consensus/params.h>
 #include <net.h>
+#include <pow.h>
 #include <primitives/block.h>
 #include <uint256.h>
 #include <util/bitdeque.h>
 #include <util/hasher.h>
 
+#include <cstddef>
 #include <deque>
+#include <memory>
 #include <vector>
 
 // A compressed CBlockHeader, which leaves out the prevhash
@@ -25,6 +28,7 @@ struct CompressedHeader {
     uint32_t nTime{0};
     uint32_t nBits{0};
     uint32_t nNonce{0};
+    std::shared_ptr<const CAuxPow> auxpow;
 
     CompressedHeader()
     {
@@ -38,6 +42,7 @@ struct CompressedHeader {
         nTime = header.nTime;
         nBits = header.nBits;
         nNonce = header.nNonce;
+        auxpow = header.auxpow;
     }
 
     CBlockHeader GetFullHeader(const uint256& hash_prev_block) {
@@ -48,8 +53,11 @@ struct CompressedHeader {
         ret.nTime = nTime;
         ret.nBits = nBits;
         ret.nNonce = nNonce;
+        ret.auxpow = auxpow;
         return ret;
     };
+
+    size_t AuxpowSerializedSize() const;
 };
 
 /** HeadersSyncState:
@@ -207,6 +215,17 @@ private:
     /** Return a set of headers that satisfy our proof-of-work threshold */
     std::vector<CBlockHeader> PopHeadersReadyForAcceptance();
 
+    struct HeaderDifficultyState {
+        CBlockHeader last_header;
+        int64_t height{0};
+        uint64_t auxpow_count{0};
+        std::optional<ASERTHeaderState> previous_permissionless;
+        std::optional<ASERTHeaderState> previous_auxpow;
+    };
+
+    HeaderDifficultyState MakeHeaderDifficultyState() const;
+    bool ValidateAndAdvanceHeaderDifficulty(HeaderDifficultyState& state, const CBlockHeader& current);
+
 private:
     /** NodeId of the peer (used for log messages) **/
     const NodeId m_id;
@@ -242,6 +261,9 @@ private:
     /** Height of m_last_header_received */
     int64_t m_current_height{0};
 
+    HeaderDifficultyState m_presync_difficulty;
+    HeaderDifficultyState m_redownload_difficulty;
+
     /** During phase 2 (REDOWNLOAD), we buffer redownloaded headers in memory
      *  until enough commitments have been verified; those are stored in
      *  m_redownloaded_headers */
@@ -265,6 +287,9 @@ private:
     /** The accumulated work on the redownloaded chain. */
     arith_uint256 m_redownload_chain_work;
 
+    /** Serialized AuxPoW payload bytes retained by m_redownloaded_headers. */
+    size_t m_redownload_auxpow_serialized_size{0};
+
     /** Set this to true once we encounter the target blockheader during phase
      * 2 (REDOWNLOAD). At this point, we can process and store all remaining
      * headers still in m_redownloaded_headers.
@@ -275,4 +300,4 @@ private:
     State m_download_state{State::PRESYNC};
 };
 
-#endif // BITCOIN_HEADERSSYNC_H
+#endif // QBIT_HEADERSSYNC_H

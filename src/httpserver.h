@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_HTTPSERVER_H
-#define BITCOIN_HTTPSERVER_H
+#ifndef QBIT_HTTPSERVER_H
+#define QBIT_HTTPSERVER_H
 
 #include <functional>
 #include <optional>
@@ -45,6 +45,9 @@ void StartHTTPServer();
 void InterruptHTTPServer();
 /** Stop HTTP server */
 void StopHTTPServer();
+
+/** Return whether an active RPC listener overlaps the given service endpoint. */
+bool HTTPRPCSocketOverlaps(const CService& addr);
 
 /** Change logging level for libevent. */
 void UpdateHTTPServerLogging(bool enable);
@@ -191,4 +194,4 @@ private:
     struct event* ev;
 };
 
-#endif // BITCOIN_HTTPSERVER_H
+#endif // QBIT_HTTPSERVER_H

@@ -30,9 +30,6 @@
 #include <QThread>
 #include <QTimer>
 
-static SteadyClock::time_point g_last_header_tip_update_notification{};
-static SteadyClock::time_point g_last_block_tip_update_notification{};
-
 ClientModel::ClientModel(interfaces::Node& node, OptionsModel *_optionsModel, QObject *parent) :
     QObject(parent),
     m_node(node),
@@ -71,6 +68,7 @@ ClientModel::ClientModel(interfaces::Node& node, OptionsModel *_optionsModel, QO
 void ClientModel::stop()
 {
     unsubscribeFromCoreSignals();
+    CancelPendingSyncUpdate();
 
     m_thread->quit();
     m_thread->wait();
@@ -234,16 +232,104 @@ void ClientModel::TipChanged(SynchronizationState sync_state, interfaces::BlockT
         WITH_LOCK(m_cached_tip_mutex, m_cached_tip_blocks = tip.block_hash;);
     }
 
-    // Throttle GUI notifications about (a) blocks during initial sync, and (b) both blocks and headers during reindex.
-    const bool throttle = (sync_state != SynchronizationState::POST_INIT && synctype == SyncType::BLOCK_SYNC) || sync_state == SynchronizationState::INIT_REINDEX;
-    const auto now{throttle ? SteadyClock::now() : SteadyClock::time_point{}};
-    auto& nLastUpdateNotification = synctype != SyncType::BLOCK_SYNC ? g_last_header_tip_update_notification : g_last_block_tip_update_notification;
-    if (throttle && now < nLastUpdateNotification + MODEL_UPDATE_DELAY) {
-        return;
+    ProcessSyncUpdate({tip.block_height, tip.block_time, verification_progress, synctype, sync_state});
+}
+
+void ClientModel::ProcessSyncUpdate(SyncUpdate update)
+{
+    const auto now{SteadyClock::now()};
+    bool emit_now{false};
+    bool schedule_flush{false};
+    std::chrono::milliseconds flush_delay{0};
+    uint64_t flush_generation{0};
+
+    {
+        LOCK(m_sync_update_mutex);
+        const bool coalesce{
+            (update.synctype == SyncType::BLOCK_SYNC &&
+             update.sync_state != SynchronizationState::POST_INIT) ||
+            update.sync_state == SynchronizationState::INIT_REINDEX};
+        const bool sync_transition{
+            !m_last_sync_update_state ||
+            *m_last_sync_update_state != update.sync_state ||
+            !m_last_sync_update_type ||
+            *m_last_sync_update_type != update.synctype};
+        const bool cadence_elapsed{
+            m_last_sync_update_time == SteadyClock::time_point{} ||
+            now >= m_last_sync_update_time + SYNC_UPDATE_DELAY};
+
+        if (!coalesce || sync_transition || cadence_elapsed) {
+            m_pending_sync_update.reset();
+            m_last_sync_update_time = now;
+            m_last_sync_update_state = update.sync_state;
+            m_last_sync_update_type = update.synctype;
+            m_sync_update_flush_scheduled = false;
+            ++m_sync_update_flush_generation;
+            emit_now = true;
+        } else {
+            m_pending_sync_update = update;
+            if (!m_sync_update_flush_scheduled) {
+                m_sync_update_flush_scheduled = true;
+                flush_generation = ++m_sync_update_flush_generation;
+                flush_delay = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    m_last_sync_update_time + SYNC_UPDATE_DELAY - now);
+                schedule_flush = true;
+            }
+        }
     }
 
-    Q_EMIT numBlocksChanged(tip.block_height, QDateTime::fromSecsSinceEpoch(tip.block_time), verification_progress, synctype, sync_state);
-    nLastUpdateNotification = now;
+    if (emit_now) {
+        EmitNumBlocksChanged(update);
+    }
+    if (schedule_flush) {
+        ScheduleSyncUpdateFlush(flush_delay, flush_generation);
+    }
+}
+
+void ClientModel::EmitNumBlocksChanged(const SyncUpdate& update)
+{
+    Q_EMIT numBlocksChanged(update.count, QDateTime::fromSecsSinceEpoch(update.block_time), update.verification_progress, update.synctype, update.sync_state);
+}
+
+void ClientModel::ScheduleSyncUpdateFlush(std::chrono::milliseconds delay, uint64_t generation)
+{
+    const int delay_ms{static_cast<int>(delay.count())};
+    QMetaObject::invokeMethod(
+        this,
+        [this, delay_ms, generation] {
+            QTimer::singleShot(delay_ms, this, [this, generation] {
+                FlushPendingSyncUpdate(generation);
+            });
+        },
+        Qt::QueuedConnection);
+}
+
+void ClientModel::FlushPendingSyncUpdate(uint64_t generation)
+{
+    std::optional<SyncUpdate> update;
+    LOCK(m_sync_update_mutex);
+    if (!m_sync_update_flush_scheduled || generation != m_sync_update_flush_generation) {
+        return;
+    }
+    m_sync_update_flush_scheduled = false;
+    if (!m_pending_sync_update) {
+        return;
+    }
+    update = m_pending_sync_update;
+    m_pending_sync_update.reset();
+    m_last_sync_update_time = SteadyClock::now();
+    m_last_sync_update_state = update->sync_state;
+    m_last_sync_update_type = update->synctype;
+
+    EmitNumBlocksChanged(*update);
+}
+
+void ClientModel::CancelPendingSyncUpdate()
+{
+    LOCK(m_sync_update_mutex);
+    m_pending_sync_update.reset();
+    m_sync_update_flush_scheduled = false;
+    ++m_sync_update_flush_generation;
 }
 
 void ClientModel::subscribeToCoreSignals()

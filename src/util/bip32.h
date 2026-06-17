@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_UTIL_BIP32_H
-#define BITCOIN_UTIL_BIP32_H
+#ifndef QBIT_UTIL_BIP32_H
+#define QBIT_UTIL_BIP32_H
 
 #include <cstdint>
 #include <string>
@@ -16,4 +16,4 @@
 std::string WriteHDKeypath(const std::vector<uint32_t>& keypath, bool apostrophe = false);
 std::string FormatHDKeypath(const std::vector<uint32_t>& path, bool apostrophe = false);
 
-#endif // BITCOIN_UTIL_BIP32_H
+#endif // QBIT_UTIL_BIP32_H

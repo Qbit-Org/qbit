@@ -104,7 +104,13 @@ bool FlatFileSeq::Flush(const FlatFilePos& pos, bool finalize) const
         }
         return false;
     }
-    DirectoryCommit(m_dir);
+    if (!DirectoryCommit(m_dir)) {
+        LogError("%s: failed to sync directory for file %d\n", __func__, pos.nFile);
+        if (fclose(file) != 0) {
+            LogError("Failed to close file %d after directory sync failure", pos.nFile);
+        }
+        return false;
+    }
 
     if (fclose(file) != 0) {
         LogError("Failed to close file %d after flush", pos.nFile);

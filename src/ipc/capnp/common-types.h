@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_IPC_CAPNP_COMMON_TYPES_H
-#define BITCOIN_IPC_CAPNP_COMMON_TYPES_H
+#ifndef QBIT_IPC_CAPNP_COMMON_TYPES_H
+#define QBIT_IPC_CAPNP_COMMON_TYPES_H
 
 #include <clientversion.h>
 #include <interfaces/types.h>
@@ -129,4 +129,4 @@ decltype(auto) CustomReadField(TypeList<UniValue>, Priority<1>, InvokeContext& i
 
 } // namespace mp
 
-#endif // BITCOIN_IPC_CAPNP_COMMON_TYPES_H
+#endif // QBIT_IPC_CAPNP_COMMON_TYPES_H

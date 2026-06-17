@@ -4,9 +4,10 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Test wallet change address selection"""
 
+from decimal import Decimal
 import re
 
-from test_framework.blocktools import COINBASE_MATURITY
+from test_framework.messages import WITNESS_SCALE_FACTOR
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_equal,
@@ -18,10 +19,11 @@ class WalletChangeAddressTest(BitcoinTestFramework):
         self.setup_clean_chain = True
         self.num_nodes = 3
         # discardfee is used to make change outputs less likely in the change_pos test
+        discard_fee = Decimal(WITNESS_SCALE_FACTOR) / Decimal("4")
         self.extra_args = [
             [],
-            ["-discardfee=1"],
-            ["-avoidpartialspends", "-discardfee=1"]
+            [f"-discardfee={discard_fee}"],
+            ["-avoidpartialspends", f"-discardfee={discard_fee}"]
         ]
 
     def skip_test_if_missing_module(self):
@@ -48,22 +50,28 @@ class WalletChangeAddressTest(BitcoinTestFramework):
     def run_test(self):
         self.log.info("Setting up")
         # Mine some coins
-        self.generate(self.nodes[0], COINBASE_MATURITY + 1)
+        self.ensure_mature_coinbase(self.nodes[0])
 
         # Get some addresses from the two nodes
         addr1 = [self.nodes[1].getnewaddress() for _ in range(3)]
         addr2 = [self.nodes[2].getnewaddress() for _ in range(3)]
         addrs = addr1 + addr2
+        total_to_send = Decimal("1.5") * len(addrs)
+        # The matured balance after COINBASE_MATURITY + 1 blocks depends on subsidy.
+        while self.nodes[0].getbalance() <= total_to_send:
+            self.generate(self.nodes[0], 1)
 
         # Send 1 + 0.5 coin to each address
         [self.nodes[0].sendtoaddress(addr, 1.0) for addr in addrs]
         [self.nodes[0].sendtoaddress(addr, 0.5) for addr in addrs]
         self.generate(self.nodes[0], 1)
 
+        # Keep fees tied to chain parameters so each send produces change.
+        relay_fee_rate = self.nodes[0].getnetworkinfo()["relayfee"] * Decimal("100000")
         for i in range(20):
             for n in [1, 2]:
                 self.log.debug(f"Send transaction from node {n}: expected change index {i}")
-                txid = self.nodes[n].sendtoaddress(self.nodes[0].getnewaddress(), 0.2)
+                txid = self.nodes[n].sendtoaddress(self.nodes[0].getnewaddress(), 0.2, fee_rate=relay_fee_rate)
                 tx = self.nodes[n].getrawtransaction(txid, True)
                 # find the change output and ensure that expected change index was used
                 self.assert_change_index(self.nodes[n], tx, i)
@@ -75,10 +83,16 @@ class WalletChangeAddressTest(BitcoinTestFramework):
         w2 = self.nodes[2].get_wallet_rpc("w2")
         addr1 = w1.getnewaddress()
         addr2 = w2.getnewaddress()
-        self.nodes[0].sendtoaddress(addr1, 3.0)
-        self.nodes[0].sendtoaddress(addr1, 0.1)
-        self.nodes[0].sendtoaddress(addr2, 3.0)
-        self.nodes[0].sendtoaddress(addr2, 0.1)
+        large_amount = Decimal("3.0")
+        small_amount = Decimal("0.1")
+        required_for_change_pos = (large_amount + small_amount) * 2
+        while self.nodes[0].getbalance() <= required_for_change_pos:
+            self.generate(self.nodes[0], 1)
+
+        self.nodes[0].sendtoaddress(addr1, large_amount)
+        self.nodes[0].sendtoaddress(addr1, small_amount)
+        self.nodes[0].sendtoaddress(addr2, large_amount)
+        self.nodes[0].sendtoaddress(addr2, small_amount)
         self.generate(self.nodes[0], 1)
 
         sendTo1 = self.nodes[0].getnewaddress()

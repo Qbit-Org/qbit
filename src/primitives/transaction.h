@@ -3,8 +3,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_PRIMITIVES_TRANSACTION_H
-#define BITCOIN_PRIMITIVES_TRANSACTION_H
+#ifndef QBIT_PRIMITIVES_TRANSACTION_H
+#define QBIT_PRIMITIVES_TRANSACTION_H
 
 #include <attributes.h>
 #include <consensus/amount.h>
@@ -423,4 +423,4 @@ struct CMutableTransaction
 typedef std::shared_ptr<const CTransaction> CTransactionRef;
 template <typename Tx> static inline CTransactionRef MakeTransactionRef(Tx&& txIn) { return std::make_shared<const CTransaction>(std::forward<Tx>(txIn)); }
 
-#endif // BITCOIN_PRIMITIVES_TRANSACTION_H
+#endif // QBIT_PRIMITIVES_TRANSACTION_H

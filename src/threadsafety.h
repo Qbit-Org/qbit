@@ -3,8 +3,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_THREADSAFETY_H
-#define BITCOIN_THREADSAFETY_H
+#ifndef QBIT_THREADSAFETY_H
+#define QBIT_THREADSAFETY_H
 
 #include <mutex>
 
@@ -76,4 +76,4 @@ public:
     ~StdLockGuard() UNLOCK_FUNCTION() = default;
 };
 
-#endif // BITCOIN_THREADSAFETY_H
+#endif // QBIT_THREADSAFETY_H

@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_CRYPTO_CHACHA20_H
-#define BITCOIN_CRYPTO_CHACHA20_H
+#ifndef QBIT_CRYPTO_CHACHA20_H
+#define QBIT_CRYPTO_CHACHA20_H
 
 #include <span.h>
 
@@ -156,4 +156,4 @@ public:
     void Crypt(std::span<const std::byte> input, std::span<std::byte> output) noexcept;
 };
 
-#endif // BITCOIN_CRYPTO_CHACHA20_H
+#endif // QBIT_CRYPTO_CHACHA20_H

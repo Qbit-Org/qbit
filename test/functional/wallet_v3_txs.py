@@ -6,6 +6,7 @@
 
 from decimal import Decimal, getcontext
 
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.authproxy import JSONRPCException
 from test_framework.messages import (
     COIN,
@@ -94,7 +95,9 @@ class WalletV3Test(BitcoinTestFramework):
         self.nodes[0].createwallet("charlie")
         self.charlie = self.nodes[0].get_wallet_rpc("charlie")
 
-        self.generatetoaddress(self.nodes[0], 100, self.charlie.getnewaddress())
+        # qbit's COINBASE_MATURITY=1000 requires >1000 blocks to yield mature
+        # balance for this test suite.
+        self.generatetoaddress(self.nodes[0], COINBASE_MATURITY + 3, self.charlie.getnewaddress())
 
         self.run_test_with_swapped_versions(self.tx_spends_unconfirmed_tx_with_wrong_version)
         self.run_test_with_swapped_versions(self.va_tx_spends_confirmed_vb_tx)
@@ -336,7 +339,8 @@ class WalletV3Test(BitcoinTestFramework):
         outputs = {self.bob.getnewaddress() : 1.999}
         bob_txid = self.send_tx(self.bob, inputs, outputs, 3)
         # alice spends both of her utxos, replacing bob's tx
-        outputs = {self.charlie.getnewaddress() : alice_v2_unspent['amount'] + alice_unspent['amount'] - Decimal(0.00005120)}
+        # Use a higher absolute fee so this replacement remains a higher feerate tx under WSF=1.
+        outputs = {self.charlie.getnewaddress() : alice_v2_unspent['amount'] + alice_unspent['amount'] - Decimal(0.00010120)}
         alice_txid = self.send_tx(self.alice, [alice_v2_unspent, alice_unspent], outputs, 3)
         # bob's tx now has a mempool conflict
         assert_equal(self.bob.gettransaction(bob_txid)['mempoolconflicts'], [alice_txid])
@@ -520,14 +524,14 @@ class WalletV3Test(BitcoinTestFramework):
     @cleanup
     def sendall_truc_weight_limit(self):
         self.log.info("Test that sendall follows truc tx weight limit")
-        self.charlie.sendall([self.alice.getnewaddress() for _ in range(300)], add_to_wallet=False, version=2)
+        self.charlie.sendall([self.alice.getnewaddress() for _ in range(1800)], add_to_wallet=False, version=2)
 
         # check that error is only raised if version is 3
         assert_raises_rpc_error(
                 -4,
                 "Transaction too large" ,
                 self.charlie.sendall,
-                [self.alice.getnewaddress() for _ in range(300)],
+                [self.alice.getnewaddress() for _ in range(1800)],
                 version=3
             )
 
@@ -537,13 +541,13 @@ class WalletV3Test(BitcoinTestFramework):
         outputs = {self.charlie.getnewaddress() : 2.0}
         self.send_tx(self.charlie, [], outputs, 3)
 
-        self.charlie.sendall([self.alice.getnewaddress() for _ in range(50)], add_to_wallet=False)
+        self.charlie.sendall([self.alice.getnewaddress() for _ in range(1600)], add_to_wallet=False)
 
         assert_raises_rpc_error(
                 -4,
                 "Transaction too large" ,
                 self.charlie.sendall,
-                [self.alice.getnewaddress() for _ in range(50)],
+                [self.alice.getnewaddress() for _ in range(1600)],
                 version=3
             )
 

@@ -8,6 +8,7 @@ import itertools
 import json
 import os
 
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.address import address_to_scriptpubkey
 from test_framework.descriptors import descsum_create
 from test_framework.key import ECPubKey
@@ -37,12 +38,19 @@ class RpcCreateMultiSigTest(BitcoinTestFramework):
             self.pub.append(pubkey.hex())
             self.priv.append(privkey)
 
+    def ensure_miniwallet_funds(self, minimum_confirmed_utxos=30):
+        rounds = 0
+        while len(self.wallet.get_utxos(mark_as_spent=False, confirmed_only=True)) < minimum_confirmed_utxos and rounds < 10:
+            self.generate(self.wallet, COINBASE_MATURITY + 1)
+            rounds += 1
+
     def run_test(self):
         node0, node1, _node2 = self.nodes
         self.wallet = MiniWallet(test_node=node0)
 
         self.log.info('Generating blocks ...')
         self.generate(self.wallet, 149)
+        self.ensure_miniwallet_funds()
 
         self.create_keys(21)  # max number of allowed keys + 1
         m_of_n = [(2, 3), (3, 3), (2, 5), (3, 5), (10, 15), (15, 15)]
@@ -54,8 +62,10 @@ class RpcCreateMultiSigTest(BitcoinTestFramework):
         self.test_mixing_uncompressed_and_compressed_keys(node0)
         self.test_sortedmulti_descriptors_bip67()
 
-        # Check that bech32m is currently not allowed
-        assert_raises_rpc_error(-5, "createmultisig cannot create bech32m multisig addresses", self.nodes[0].createmultisig, 2, self.pub, "bech32m")
+        # Check that bech32m and p2mr are currently not allowed
+        expected_err = "createmultisig cannot create bech32m or p2mr multisig addresses"
+        assert_raises_rpc_error(-5, expected_err, self.nodes[0].createmultisig, 2, self.pub, "bech32m")
+        assert_raises_rpc_error(-5, expected_err, self.nodes[0].createmultisig, 2, self.pub, "p2mr")
 
         self.log.info('Check correct encoding of multisig script for all n (1..20)')
         for nkeys in range(1, 20+1):
@@ -102,10 +112,11 @@ class RpcCreateMultiSigTest(BitcoinTestFramework):
         madd = msig["address"]
         mredeem = msig["redeemScript"]
         assert_equal(desc, msig['descriptor'])
-        if output_type == 'bech32':
-            assert madd[0:4] == "bcrt"  # actually a bech32 address
-
         spk = address_to_scriptpubkey(madd)
+        if output_type == 'bech32':
+            # Verify witness-v0 program form instead of hard-coding a specific HRP.
+            assert_equal(spk[0], 0x00)
+            assert_equal(spk[1], 0x20)
         value = decimal.Decimal("0.00004000")
         tx = self.wallet.send_to(from_node=self.nodes[0], scriptPubKey=spk, amount=int(value * COIN))
         prevtxs = [{"txid": tx["txid"], "vout": tx["sent_vout"], "scriptPubKey": spk.hex(), "redeemScript": mredeem, "amount": value}]
@@ -190,10 +201,10 @@ class RpcCreateMultiSigTest(BitcoinTestFramework):
         for t in vectors:
             key_str = ','.join(t['keys'])
             desc = descsum_create('sh(sortedmulti(2,{}))'.format(key_str))
-            assert_equal(self.nodes[0].deriveaddresses(desc)[0], t['address'])
+            sortedmulti_addr = self.nodes[0].deriveaddresses(desc)[0]
             sorted_key_str = ','.join(t['sorted_keys'])
             sorted_key_desc = descsum_create('sh(multi(2,{}))'.format(sorted_key_str))
-            assert_equal(self.nodes[0].deriveaddresses(sorted_key_desc)[0], t['address'])
+            assert_equal(self.nodes[0].deriveaddresses(sorted_key_desc)[0], sortedmulti_addr)
 
 
 if __name__ == '__main__':

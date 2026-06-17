@@ -2,11 +2,11 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_QT_BITCOINAMOUNTFIELD_H
-#define BITCOIN_QT_BITCOINAMOUNTFIELD_H
+#ifndef QBIT_QT_BITCOINAMOUNTFIELD_H
+#define QBIT_QT_BITCOINAMOUNTFIELD_H
 
 #include <consensus/amount.h>
-#include <qt/bitcoinunits.h>
+#include <qt/qbitunits.h>
 
 #include <QWidget>
 
@@ -35,13 +35,13 @@ public:
     /** If allow empty is set to false the field will be set to the minimum allowed value if left empty. **/
     void SetAllowEmpty(bool allow);
 
-    /** Set the minimum value in satoshis **/
+    /** Set the minimum value in base units **/
     void SetMinValue(const CAmount& value);
 
-    /** Set the maximum value in satoshis **/
+    /** Set the maximum value in base units **/
     void SetMaxValue(const CAmount& value);
 
-    /** Set single step in satoshis **/
+    /** Set single step in base units **/
     void setSingleStep(const CAmount& step);
 
     /** Make read-only **/
@@ -53,7 +53,7 @@ public:
     bool validate();
 
     /** Change unit used to display amount. */
-    void setDisplayUnit(BitcoinUnit new_unit);
+    void setDisplayUnit(QbitUnit new_unit);
 
     /** Make field empty and ready for new input. */
     void clear();
@@ -82,4 +82,4 @@ private Q_SLOTS:
 
 };
 
-#endif // BITCOIN_QT_BITCOINAMOUNTFIELD_H
+#endif // QBIT_QT_BITCOINAMOUNTFIELD_H

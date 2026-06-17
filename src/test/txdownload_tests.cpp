@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <addresstype.h>
+#include <chainparams.h>
 #include <consensus/validation.h>
 #include <net_processing.h>
 #include <node/txdownloadman_impl.h>
@@ -110,7 +111,7 @@ static CTransactionRef CreatePlaceholderTx(bool segwit)
     return ptx;
 }
 
-BOOST_FIXTURE_TEST_CASE(tx_rejection_types, TestChain100Setup)
+BOOST_FIXTURE_TEST_CASE(tx_rejection_types, UnrestrictedRegtestChain100Setup)
 {
     CTxMemPool& pool = *Assert(m_node.mempool);
     FastRandomContext det_rand{true};
@@ -168,7 +169,7 @@ BOOST_FIXTURE_TEST_CASE(tx_rejection_types, TestChain100Setup)
     }
 }
 
-BOOST_FIXTURE_TEST_CASE(handle_missing_inputs, TestChain100Setup)
+BOOST_FIXTURE_TEST_CASE(handle_missing_inputs, UnrestrictedRegtestChain100Setup)
 {
     CTxMemPool& pool = *Assert(m_node.mempool);
     FastRandomContext det_rand{true};
@@ -184,11 +185,11 @@ BOOST_FIXTURE_TEST_CASE(handle_missing_inputs, TestChain100Setup)
     CKey wallet_key = GenerateRandomKey();
     CScript destination = GetScriptForDestination(PKHash(wallet_key.GetPubKey()));
     // Amount for spending coinbase in a 1-in-1-out tx, at depth n, each time deducting 1000 from the amount as fees.
-    CAmount amount_depth_1{50 * COIN - 1000};
+    CAmount amount_depth_1{GetBlockSubsidy(1, Params().GetConsensus()) - 1000};
     CAmount amount_depth_2{amount_depth_1 - 1000};
     // Amount for spending coinbase in a 1-in-2-out tx, deducting 1000 in fees
-    CAmount amount_split_half{25 * COIN - 500};
-    int test_chain_height{100};
+    CAmount amount_split_half{amount_depth_1 / 2};
+    int test_chain_height{COINBASE_MATURITY};
 
     TxValidationState state_orphan;
     state_orphan.Invalid(TxValidationResult::TX_MISSING_INPUTS, "");

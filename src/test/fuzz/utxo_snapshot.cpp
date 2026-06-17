@@ -50,6 +50,12 @@ void sanity_check_snapshot()
     // Create a temporary chainstate manager to connect the chain to.
     const auto tmp_setup{MakeNoLogFileContext<TestingSetup>(ChainType::REGTEST, TestOpts{.setup_net = false})};
     const auto& node{tmp_setup->m_node};
+
+    // If no assumeutxo data is configured for regtest, skip the sanity check.
+    if (!node.chainman->GetParams().AssumeutxoForHeight(2 * COINBASE_MATURITY)) {
+        return;
+    }
+
     for (auto& block: *g_chain) {
         ProcessBlock(node, block);
     }
@@ -103,7 +109,7 @@ void utxo_snapshot_fuzz(FuzzBufferType buffer)
 {
     SeedRandomStateForTest(SeedRand::ZEROS);
     FuzzedDataProvider fuzzed_data_provider(buffer.data(), buffer.size());
-    SetMockTime(ConsumeTime(fuzzed_data_provider, /*min=*/1296688602)); // regtest genesis block timestamp
+    SetMockTime(ConsumeTime(fuzzed_data_provider, /*min=*/1738713602)); // regtest genesis block timestamp
     auto& setup{*g_setup};
     bool dirty_chainman{false}; // Reuse the global chainman, but reset it when it is dirty
     auto& chainman{*setup.m_node.chainman};

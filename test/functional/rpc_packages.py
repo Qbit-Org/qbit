@@ -9,6 +9,7 @@ import random
 
 from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.mempool_util import (
+    MIN_MAX_MEMPOOL_SIZE_MB,
     fill_mempool,
 )
 from test_framework.messages import (
@@ -441,7 +442,7 @@ class RPCPackagesTest(BitcoinTestFramework):
         # but child is too high fee
         # Lower mempool limit to make it easier to fill_mempool
         self.restart_node(0, extra_args=[
-            "-maxmempool=5",
+            f"-maxmempool={MIN_MAX_MEMPOOL_SIZE_MB}",
             "-persistmempool=0",
         ])
         self.wallet.rescan_utxos()

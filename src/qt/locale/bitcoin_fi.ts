@@ -1021,7 +1021,7 @@ Allekirjoitus on mahdollista vain 'legacy'-tyyppisillä osoitteilla.</translatio
         <translation type="unfinished">(%1 lukittu)</translation>
     </message>
     <message>
-        <source>Can vary +/- %1 satoshi(s) per input.</source>
+        <source>Can vary +/- %1 bits per input.</source>
         <translation type="unfinished">Saattaa vaihdella +/- %1 satoshia per syöte.</translation>
     </message>
     <message>
@@ -2991,14 +2991,14 @@ Luo natiivin segwit-osoitteen (BIP-173). Jotkin vanhat lompakot eivät tue sitä
     <message>
         <source>Specify a custom fee per kB (1,000 bytes) of the transaction's virtual size.
 
-Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 satoshis per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 satoshis.</source>
+Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 bits per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 bits.</source>
         <translation type="unfinished">Määritä mukautettu maksu per kB (1 000 tavua) tapahtuman virtuaalikoosta.
 
 Huom: Koska maksu lasketaan per tavu, "100 satoshin per kB" maksunopeus 500 virtuaalitavun (puolet 1 kB
 ) tapahtumakoolle johtaisi lopulta vain 50 satoshin maksuun.</translation>
     </message>
     <message>
-        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for bitcoin transactions than the network can process.</source>
+        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for qbit transactions than the network can process.</source>
         <translation type="unfinished">Mikäli lohkoissa ei ole tilaa kaikille siirtotapahtumille, voi louhijat sekä välittävät solmut pakottaa vähimmäispalkkion. Tämän vähimmäispalkkion maksaminen on täysin OK, mutta huomaa, että se saattaa johtaa siihen, ettei siirto vahvistu koskaan, jos bitcoin-siirtoja on enemmän kuin mitä verkko pystyy käsittelemään.</translation>
     </message>
     <message>
@@ -3280,7 +3280,7 @@ Huom: Koska maksu lasketaan per tavu, "100 satoshin per kB" maksunopeus 500 virt
         <translation type="unfinished">Lähetettävä summa valitussa yksikössä</translation>
     </message>
     <message>
-        <source>The fee will be deducted from the amount being sent. The recipient will receive less bitcoins than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
+        <source>The fee will be deducted from the amount being sent. The recipient will receive less QBT than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
         <translation type="unfinished">Kulu vähennetään lähetettävästä määrästä. Saaja vastaanottaa vähemmän bitcoineja kuin merkitset Määrä-kenttään. Jos saajia on monia, kulu jaetaan tasan.</translation>
     </message>
     <message>
@@ -4036,8 +4036,8 @@ Varoitus: Tämä voi maksaa ylimääräisen maksun vähentämällä vaihtotuloja
 ilman, että käytetään mitään snapshot-tietoja. Ilmoita tästä tapauksesta osoitteeseen%s, mukaan lukien se, miten sait snapshotin. Virheellinen snapshot-tilatiedosto jätetään levylle, jos se on hyödyllinen ongelman diagnosoinnissa, joka aiheutti tämän virheen.</translation>
     </message>
     <message>
-        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/p2p-bad-ports.md for details and a full list.</source>
-        <translation type="unfinished">%s pyyntö kuunnella porttia %u. Tätä porttia pidetään ”huonona”, joten on epätodennäköistä, että mikään vertaisohjelma muodostaa siihen yhteyden. Katso lisätietoja ja täydellinen luettelo doc/p2p-bad-ports.md-tiedostosta.</translation>
+        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/reference/p2p-bad-ports.md for details and a full list.</source>
+        <translation type="unfinished">%s pyyntö kuunnella porttia %u. Tätä porttia pidetään ”huonona”, joten on epätodennäköistä, että mikään vertaisohjelma muodostaa siihen yhteyden. Katso lisätietoja ja täydellinen luettelo doc/reference/p2p-bad-ports.md-tiedostosta.</translation>
     </message>
     <message>
         <source>Distributed under the MIT software license, see the accompanying file %s or %s</source>

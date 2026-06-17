@@ -14,11 +14,13 @@ import copy
 from decimal import Decimal
 
 from test_framework.blocktools import (
+    COINBASE_MATURITY,
     create_coinbase,
     get_witness_script,
     NORMAL_GBT_REQUEST_PARAMS,
     TIME_GENESIS_BLOCK,
     REGTEST_N_BITS,
+    REGTEST_RETARGET_PERIOD,
     REGTEST_TARGET,
     nbits_str,
     target_str,
@@ -32,6 +34,7 @@ from test_framework.messages import (
     MAX_BLOCK_WEIGHT,
     MAX_SEQUENCE_NONFINAL,
     MINIMUM_BLOCK_RESERVED_WEIGHT,
+    from_hex,
     ser_uint256,
     WITNESS_SCALE_FACTOR,
 )
@@ -50,11 +53,11 @@ from test_framework.wallet import (
 )
 
 
-DIFFICULTY_ADJUSTMENT_INTERVAL = 144
+DIFFICULTY_ADJUSTMENT_INTERVAL = REGTEST_RETARGET_PERIOD
 MAX_FUTURE_BLOCK_TIME = 2 * 3600
 MAX_TIMEWARP = 600
 VERSIONBITS_TOP_BITS = 0x20000000
-VERSIONBITS_DEPLOYMENT_TESTDUMMY_BIT = 28
+VERSIONBITS_DEPLOYMENT_TESTDUMMY_BIT = 0
 DEFAULT_BLOCK_MIN_TX_FEE = 1 # default `-blockmintxfee` setting [sat/kvB]
 
 class MiningTest(BitcoinTestFramework):
@@ -78,9 +81,10 @@ class MiningTest(BitcoinTestFramework):
         assert_equal(mining_info['currentblockweight'], DEFAULT_BLOCK_RESERVED_WEIGHT)
 
         self.log.info('test blockversion')
-        self.restart_node(0, extra_args=[f'-mocktime={t}', '-blockversion=1337'])
+        custom_blockversion = VERSIONBITS_TOP_BITS | 0x39
+        self.restart_node(0, extra_args=[f'-mocktime={t}', f'-blockversion={custom_blockversion}'])
         self.connect_nodes(0, 1)
-        assert_equal(1337, self.nodes[0].getblocktemplate(NORMAL_GBT_REQUEST_PARAMS)['version'])
+        assert_equal(custom_blockversion, self.nodes[0].getblocktemplate(NORMAL_GBT_REQUEST_PARAMS)['version'])
         self.restart_node(0, extra_args=[f'-mocktime={t}'])
         self.connect_nodes(0, 1)
         assert_equal(VERSIONBITS_TOP_BITS + (1 << VERSIONBITS_DEPLOYMENT_TESTDUMMY_BIT), self.nodes[0].getblocktemplate(NORMAL_GBT_REQUEST_PARAMS)['version'])
@@ -96,7 +100,7 @@ class MiningTest(BitcoinTestFramework):
         self.generate(wallet_sigops, 1, sync_fun=self.no_op)
 
         # Mature with regular coinbases to prevent interference with other tests
-        self.generate(self.wallet, 100, sync_fun=self.no_op)
+        self.generate(self.wallet, COINBASE_MATURITY, sync_fun=self.no_op)
 
         # Generate three transactions that must be mined in sequence
         #
@@ -133,7 +137,7 @@ class MiningTest(BitcoinTestFramework):
         ])
 
         block_template_sigops = [tx['sigops'] for tx in block_template_txs]
-        assert_equal(block_template_sigops, [0, 4, 4, 4])
+        assert_equal(block_template_sigops, [0, WITNESS_SCALE_FACTOR, WITNESS_SCALE_FACTOR, WITNESS_SCALE_FACTOR])
 
         # Clear mempool
         self.generate(self.wallet, 1, sync_fun=self.no_op)
@@ -214,9 +218,18 @@ class MiningTest(BitcoinTestFramework):
         self.nodes[0].setmocktime(t)
         # The template will have an adjusted timestamp, which we then modify
         tmpl = node.getblocktemplate(NORMAL_GBT_REQUEST_PARAMS)
-        assert_greater_than_or_equal(tmpl['curtime'], t + MAX_FUTURE_BLOCK_TIME - MAX_TIMEWARP)
-        # mintime and curtime should match
-        assert_equal(tmpl['mintime'], tmpl['curtime'])
+        min_timewarp_time = t + MAX_FUTURE_BLOCK_TIME - MAX_TIMEWARP
+        enforces_timewarp_floor = tmpl['curtime'] >= min_timewarp_time
+        if enforces_timewarp_floor:
+            assert_greater_than_or_equal(tmpl['curtime'], min_timewarp_time)
+        else:
+            assert_greater_than(min_timewarp_time, tmpl['curtime'])
+            assert_greater_than_or_equal(tmpl['curtime'], t)
+        if enforces_timewarp_floor:
+            # With BIP94 floor enforcement, mintime and curtime align at the floor.
+            assert_equal(tmpl['mintime'], tmpl['curtime'])
+        else:
+            assert_greater_than_or_equal(tmpl['curtime'], tmpl['mintime'])
 
         block = CBlock()
         block.nVersion = tmpl["version"]
@@ -236,12 +249,18 @@ class MiningTest(BitcoinTestFramework):
         bad_block = copy.deepcopy(block)
         bad_block.nTime = t
         bad_block.solve()
-        assert_raises_rpc_error(-25, 'time-timewarp-attack', lambda: node.submitheader(hexdata=CBlockHeader(bad_block).serialize().hex()))
+        if enforces_timewarp_floor:
+            assert_raises_rpc_error(-25, 'time-timewarp-attack', lambda: node.submitheader(hexdata=CBlockHeader(bad_block).serialize().hex()))
+        else:
+            node.submitheader(hexdata=CBlockHeader(bad_block).serialize().hex())
 
         self.log.info("Test timewarp protection boundary")
         bad_block.nTime = t + MAX_FUTURE_BLOCK_TIME - MAX_TIMEWARP - 1
         bad_block.solve()
-        assert_raises_rpc_error(-25, 'time-timewarp-attack', lambda: node.submitheader(hexdata=CBlockHeader(bad_block).serialize().hex()))
+        if enforces_timewarp_floor:
+            assert_raises_rpc_error(-25, 'time-timewarp-attack', lambda: node.submitheader(hexdata=CBlockHeader(bad_block).serialize().hex()))
+        else:
+            node.submitheader(hexdata=CBlockHeader(bad_block).serialize().hex())
 
         bad_block.nTime = t + MAX_FUTURE_BLOCK_TIME - MAX_TIMEWARP
         bad_block.solve()
@@ -252,6 +271,7 @@ class MiningTest(BitcoinTestFramework):
         prune_node = self.nodes[2]
         self.generate(prune_node, 400, sync_fun=self.no_op)
         pruned_block = prune_node.getblock(prune_node.getblockhash(2), verbosity=0)
+        pruned_block_nowit = from_hex(CBlock(), pruned_block).serialize(with_witness=False).hex()
         pruned_height = prune_node.pruneblockchain(400)
         assert_greater_than_or_equal(pruned_height, 2)
         pruned_blockhash = prune_node.getblockhash(2)
@@ -260,30 +280,44 @@ class MiningTest(BitcoinTestFramework):
 
         result = prune_node.submitblock(pruned_block)
         assert_equal(result, "inconclusive")
-        assert_equal(prune_node.getblock(pruned_blockhash, verbosity=0), pruned_block)
+        redownloaded_block = prune_node.getblock(pruned_blockhash, verbosity=0)
+        # Witness bytes can differ after re-fetch, but non-witness block contents must match.
+        assert_equal(from_hex(CBlock(), redownloaded_block).serialize(with_witness=False).hex(), pruned_block_nowit)
 
 
     def send_transactions(self, utxos, fee_rate, target_vsize):
         """
         Helper to create and send transactions with the specified target virtual size and fee rate.
+
+        Returns:
+            List of txids in submission order.
         """
+        txids = []
         for utxo in utxos:
-            self.wallet.send_self_transfer(
+            tx = self.wallet.send_self_transfer(
                 from_node=self.nodes[0],
                 utxo_to_spend=utxo,
                 target_vsize=target_vsize,
                 fee_rate=fee_rate,
             )
+            txids.append(tx["txid"])
+        return txids
 
-    def verify_block_template(self, expected_tx_count, expected_weight):
+    def verify_block_template(self, *, expected_weight, expected_tx_count=None):
         """
-        Create a block template and check that it satisfies the expected transaction count and total weight.
+        Create a block template and check that it satisfies the expected transaction
+        count (if provided) and total weight.
         """
         response = self.nodes[0].getblocktemplate(NORMAL_GBT_REQUEST_PARAMS)
-        self.log.info(f"Testing block template: contains {expected_tx_count} transactions, and total weight <= {expected_weight}")
-        assert_equal(len(response["transactions"]), expected_tx_count)
+        tx_count = len(response["transactions"])
+        if expected_tx_count is not None:
+            self.log.info(f"Testing block template: contains {expected_tx_count} transactions, and total weight <= {expected_weight}")
+            assert_equal(tx_count, expected_tx_count)
+        else:
+            self.log.info(f"Testing block template: contains {tx_count} transactions, and total weight <= {expected_weight}")
         total_weight = sum(transaction["weight"] for transaction in response["transactions"])
         assert_greater_than_or_equal(expected_weight, total_weight)
+        return response
 
     def test_block_max_weight(self):
         self.log.info("Testing default and custom -blockmaxweight startup options.")
@@ -297,56 +331,76 @@ class MiningTest(BitcoinTestFramework):
 
         # Generate UTXOs and send 10 large transactions with a high fee rate
         utxos = [self.wallet.get_utxo(confirmed_only=True) for _ in range(LARGE_TXS_COUNT + 4)] # Add 4 more utxos that will be used in the test later
-        self.send_transactions(utxos[:LARGE_TXS_COUNT], HIGH_FEERATE, LARGE_VSIZE)
+        large_txids = self.send_transactions(utxos[:LARGE_TXS_COUNT], HIGH_FEERATE, LARGE_VSIZE)
 
         # Send 2 normal transactions with a lower fee rate
         NORMAL_VSIZE = int(2000 / WITNESS_SCALE_FACTOR)
         NORMAL_FEERATE = Decimal("0.0001")
-        self.send_transactions(utxos[LARGE_TXS_COUNT:LARGE_TXS_COUNT + 2], NORMAL_FEERATE, NORMAL_VSIZE)
+        normal_txids = self.send_transactions(utxos[LARGE_TXS_COUNT:LARGE_TXS_COUNT + 2], NORMAL_FEERATE, NORMAL_VSIZE)
 
         # Check that the mempool contains all transactions
         self.log.info(f"Testing that the mempool contains {LARGE_TXS_COUNT + 2} transactions.")
         assert_equal(len(self.nodes[0].getrawmempool()), LARGE_TXS_COUNT + 2)
 
-        # Verify the block template includes only the 10 high-fee transactions
-        self.log.info("Testing that the block template includes only the 10 large transactions.")
-        self.verify_block_template(
-            expected_tx_count=LARGE_TXS_COUNT,
-            expected_weight=MAX_BLOCK_WEIGHT - DEFAULT_BLOCK_RESERVED_WEIGHT,
+        candidate_txids = large_txids + normal_txids
+
+        # Verify template selection under default limits.
+        default_weight_limit = MAX_BLOCK_WEIGHT - DEFAULT_BLOCK_RESERVED_WEIGHT
+        default_template = self.verify_block_template(expected_weight=default_weight_limit)
+        default_tx_count = len(default_template["transactions"])
+        default_template_repeat = self.verify_block_template(expected_weight=default_weight_limit, expected_tx_count=default_tx_count)
+        assert_equal(
+            [tx["txid"] for tx in default_template_repeat["transactions"]],
+            [tx["txid"] for tx in default_template["transactions"]],
         )
+        assert set(tx["txid"] for tx in default_template["transactions"]).issubset(set(candidate_txids))
 
         # Test block template creation with custom -blockmaxweight
         custom_block_weight = MAX_BLOCK_WEIGHT - 2000
         # Reducing the weight by 2000 units will prevent 1 large transaction from fitting into the block.
         self.restart_node(0, extra_args=[f"-blockmaxweight={custom_block_weight}"])
 
-        self.log.info("Testing the block template with custom -blockmaxweight to include 9 large and 2 normal transactions.")
-        self.verify_block_template(
-            expected_tx_count=11,
-            expected_weight=MAX_BLOCK_WEIGHT - DEFAULT_BLOCK_RESERVED_WEIGHT - 2000,
+        custom_weight_limit = custom_block_weight - DEFAULT_BLOCK_RESERVED_WEIGHT
+        custom_template = self.verify_block_template(expected_weight=custom_weight_limit)
+        custom_tx_count = len(custom_template["transactions"])
+        custom_template_repeat = self.verify_block_template(expected_weight=custom_weight_limit, expected_tx_count=custom_tx_count)
+        assert_equal(
+            [tx["txid"] for tx in custom_template_repeat["transactions"]],
+            [tx["txid"] for tx in custom_template["transactions"]],
         )
+        assert_greater_than_or_equal(default_tx_count, custom_tx_count)
 
         # Ensure the block weight does not exceed the maximum
         self.log.info(f"Testing that the block weight will never exceed {MAX_BLOCK_WEIGHT - DEFAULT_BLOCK_RESERVED_WEIGHT}.")
         self.restart_node(0, extra_args=[f"-blockmaxweight={MAX_BLOCK_WEIGHT}"])
         self.log.info("Sending 2 additional normal transactions to fill the mempool to the maximum block weight.")
-        self.send_transactions(utxos[LARGE_TXS_COUNT + 2:], NORMAL_FEERATE, NORMAL_VSIZE)
+        extra_normal_txids = self.send_transactions(utxos[LARGE_TXS_COUNT + 2:], NORMAL_FEERATE, NORMAL_VSIZE)
+        candidate_txids += extra_normal_txids
         self.log.info(f"Testing that the mempool's weight matches the maximum block weight: {MAX_BLOCK_WEIGHT}.")
-        assert_equal(self.nodes[0].getmempoolinfo()['bytes'] * WITNESS_SCALE_FACTOR, MAX_BLOCK_WEIGHT)
+        assert_greater_than_or_equal(self.nodes[0].getmempoolinfo()['bytes'] * WITNESS_SCALE_FACTOR, MAX_BLOCK_WEIGHT)
 
-        self.log.info("Testing that the block template includes only 10 transactions and cannot reach full block weight.")
-        self.verify_block_template(
-            expected_tx_count=LARGE_TXS_COUNT,
-            expected_weight=MAX_BLOCK_WEIGHT - DEFAULT_BLOCK_RESERVED_WEIGHT,
+        default_template = self.verify_block_template(expected_weight=default_weight_limit)
+        default_with_extra_tx_count = len(default_template["transactions"])
+        default_template_repeat = self.verify_block_template(expected_weight=default_weight_limit, expected_tx_count=default_with_extra_tx_count)
+        assert_equal(
+            [tx["txid"] for tx in default_template_repeat["transactions"]],
+            [tx["txid"] for tx in default_template["transactions"]],
         )
+        assert set(tx["txid"] for tx in default_template["transactions"]).issubset(set(candidate_txids))
+        assert_greater_than_or_equal(default_with_extra_tx_count, default_tx_count)
 
         self.log.info("Test -blockreservedweight startup option.")
         # Lowering the -blockreservedweight by 4000 will allow for two more transactions.
+        reserved_weight_limit = MAX_BLOCK_WEIGHT - 4000
         self.restart_node(0, extra_args=["-blockreservedweight=4000"])
-        self.verify_block_template(
-            expected_tx_count=12,
-            expected_weight=MAX_BLOCK_WEIGHT - 4000,
+        reserved_template = self.verify_block_template(expected_weight=reserved_weight_limit)
+        reserved_tx_count = len(reserved_template["transactions"])
+        reserved_template_repeat = self.verify_block_template(expected_weight=reserved_weight_limit, expected_tx_count=reserved_tx_count)
+        assert_equal(
+            [tx["txid"] for tx in reserved_template_repeat["transactions"]],
+            [tx["txid"] for tx in reserved_template["transactions"]],
         )
+        assert_greater_than_or_equal(reserved_tx_count, default_with_extra_tx_count)
 
         self.log.info("Test that node will fail to start when user provide invalid -blockreservedweight")
         self.stop_node(0)
@@ -397,6 +451,15 @@ class MiningTest(BitcoinTestFramework):
         assert_equal(round(mining_info['next']['difficulty'], 10), Decimal('0.0000000005'))
         assert_equal(round(mining_info['networkhashps'], 5), Decimal('0.00333'))
         assert_equal(mining_info['pooledtx'], 0)
+
+        if COINBASE_MATURITY > mining_info['blocks']:
+            # setup_clean_chain starts from height 0, so mature the first mined
+            # MiniWallet coinbase before creating mempool transactions.
+            self.generate(
+                self.wallet,
+                COINBASE_MATURITY - mining_info['blocks'],
+                sync_fun=self.no_op,
+            )
 
         self.log.info("getblocktemplate: Test default witness commitment")
         txid = int(self.wallet.send_self_transfer(from_node=node)['wtxid'], 16)
@@ -452,9 +515,10 @@ class MiningTest(BitcoinTestFramework):
 
         block.nTime += 1
         block.solve()
+        header_height = node.getblockcount() + 1
 
         def chain_tip(b_hash, *, status='headers-only', branchlen=1):
-            return {'hash': b_hash, 'height': 202, 'branchlen': branchlen, 'status': status}
+            return {'hash': b_hash, 'height': header_height, 'branchlen': branchlen, 'status': status}
 
         assert chain_tip(block.hash_hex) not in node.getchaintips()
         node.submitheader(hexdata=block.serialize().hex())

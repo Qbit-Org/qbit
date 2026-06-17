@@ -1049,7 +1049,7 @@ Ní féidir síniú ach le seoltaí 'oidhreachta'.</translation>
         <translation type="unfinished">(%1 glasáilte)</translation>
     </message>
     <message>
-        <source>Can vary +/- %1 satoshi(s) per input.</source>
+        <source>Can vary +/- %1 bits per input.</source>
         <translation type="unfinished">Athraitheach +/- %1 satosh(í) in aghaidh an ionchuir.</translation>
     </message>
     <message>
@@ -3039,13 +3039,13 @@ Chun tuilleadh eolais a fháil faoin gconsól seo a úsáid, clóscríobh %6.
     <message>
         <source>Specify a custom fee per kB (1,000 bytes) of the transaction's virtual size.
 
-Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 satoshis per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 satoshis.</source>
+Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 bits per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 bits.</source>
         <translation type="unfinished">Sonraigh táille shaincheaptha in aghaidh an kB (1,000 beart) de mhéid fíorúil an idirbhirt.
 
-Nóta: Ós rud é go ríomhtar an táille ar bhonn in aghaidh an bheart, ní thabharfadh ráta táille "100 satoshis in aghaidh an kvB" le haghaidh méid idirbhirt 500 beart fíorúil (leath de 1 kvB) táille ach 50 satoshis ar deireadh thiar.</translation>
+Nóta: Ós rud é go ríomhtar an táille ar bhonn in aghaidh an bheart, ní thabharfadh ráta táille "100 bits in aghaidh an kvB" le haghaidh méid idirbhirt 500 beart fíorúil (leath de 1 kvB) táille ach 50 bits ar deireadh thiar.</translation>
     </message>
     <message>
-        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for bitcoin transactions than the network can process.</source>
+        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for qbit transactions than the network can process.</source>
         <translation type="unfinished">Nuair a bhíonn méid idirbhirt níos lú ná spás sna bloic, féadfaidh mianadóirí chomh maith le nóid athsheachadadh táille íosta a fhorfheidhmiú. Tá sé sách maith an táille íosta seo a íoc, ach bíodh a fhios agat go bhféadfadh idirbheart nach ndeimhnítear riamh a bheith mar thoradh air seo a nuair a bhíonn níos mó éilimh ar idirbhearta bitcoin ná mar is féidir leis an líonra a phróiseáil.</translation>
     </message>
     <message>
@@ -3332,7 +3332,7 @@ Nóta: Ós rud é go ríomhtar an táille ar bhonn in aghaidh an bheart, ní tha
         <translation type="unfinished">An méid atá le seoladh san aonad roghnaithe</translation>
     </message>
     <message>
-        <source>The fee will be deducted from the amount being sent. The recipient will receive less bitcoins than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
+        <source>The fee will be deducted from the amount being sent. The recipient will receive less QBT than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
         <translation type="unfinished">Bainfear an táille ón méid a sheolfar. Gheobhaidh an faighteoir níos lú bitcoins ná mar a iontrálann tú sa réimse méid. Má roghnaítear faighteoirí iolracha, roinntear an táille go cothrom.</translation>
     </message>
     <message>
@@ -4095,8 +4095,8 @@ Téigh go Comhad &gt; Oscail Sparán chun sparán a lódáil.
         <translation type="unfinished">Theip ar %s an staid snapshot -assumeutxo a bhailíochtú. Léiríonn sé seo fadhb crua-earraí, nó fabht sna bogearraí, nó droch-mhodhnú bogearraí a cheadaigh pictiúr neamhbhailí a luchtú. Mar thoradh air seo, stopfar an nód agus stopfaidh sé de úsáid a bhaint as staid ar bith a tógadh ar an seat, ag athshocrú airde an tslabhra ó%dgo%d. Ar an gcéad atosú eile, athchromfar ar an nód ag sioncronú ó %d gan úsáid a bhaint as sonraí seat. Tuairiscigh an teagmhas seo do %s lena n-áirítear conas a fuair tú an pictiúr. Fágfar an slabhrashlabhra neamhbhailí ar an diosca ar eagla go mbeadh sé ina chuidiú leis an tsaincheist ba chúis leis an earráid seo a dhiagnóisiú.</translation>
     </message>
     <message>
-        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/p2p-bad-ports.md for details and a full list.</source>
-        <translation type="unfinished">Iarraidh %s éisteacht ar phort %u. Meastar go bhfuil an port seo "olc" agus dá bhrí sin ní dócha go nascfaidh piaraí ar bith leis. Féach doc/p2p-bad-ports.md le haghaidh sonraí agus liosta iomlán.</translation>
+        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/reference/p2p-bad-ports.md for details and a full list.</source>
+        <translation type="unfinished">Iarraidh %s éisteacht ar phort %u. Meastar go bhfuil an port seo "olc" agus dá bhrí sin ní dócha go nascfaidh piaraí ar bith leis. Féach doc/reference/p2p-bad-ports.md le haghaidh sonraí agus liosta iomlán.</translation>
     </message>
     <message>
         <source>Disk space for %s may not accommodate the block files. Approximately %u GB of data will be stored in this directory.</source>

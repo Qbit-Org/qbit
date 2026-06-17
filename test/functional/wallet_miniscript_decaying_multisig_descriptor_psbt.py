@@ -9,6 +9,7 @@ This is similar to `test/functional/wallet_multisig_descriptor_psbt.py`.
 """
 
 import random
+from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_approx,
@@ -32,7 +33,8 @@ class WalletMiniscriptDecayingMultisigDescriptorPSBTTest(BitcoinTestFramework):
         """Extract the wallet's xpubs using `listdescriptors` and pick the one from the `pkh` descriptor since it's least likely to be accidentally reused (legacy addresses)."""
         pkh_descriptor = next(filter(lambda d: d["desc"].startswith("pkh(") and d["internal"] == internal, wallet.listdescriptors()["descriptors"]))
         # keep all key origin information (master key fingerprint and all derivation steps) for proper support of hardware devices
-        # see section 'Key origin identification' in 'doc/descriptors.md' for more details...
+        # see section 'Key origin identification' in
+        # 'doc/user/wallet/descriptors.md' for more details...
         return pkh_descriptor["desc"].split("pkh(")[1].split(")")[0]
 
     def create_multisig(self, external_xpubs, internal_xpubs):
@@ -65,7 +67,7 @@ class WalletMiniscriptDecayingMultisigDescriptorPSBTTest(BitcoinTestFramework):
         self.M = 4  # starts as 4-of-4
         self.N = 4
 
-        self.locktimes = [104, 106, 108]
+        self.locktimes = [COINBASE_MATURITY + 5, COINBASE_MATURITY + 7, COINBASE_MATURITY + 9]
         assert_equal(len(self.locktimes), self.N - 1)
 
         self.name = f"{self.M}_of_{self.N}_decaying_multisig"
@@ -79,11 +81,14 @@ class WalletMiniscriptDecayingMultisigDescriptorPSBTTest(BitcoinTestFramework):
         multisig = self.create_multisig(external_xpubs, internal_xpubs)
 
         self.log.info("Get a mature utxo to send to the multisig...")
+        deposit_amount = 6.15
+        funding_target = deposit_amount + 2
         coordinator_wallet = self.node.get_wallet_rpc(self.node.createwallet(wallet_name="coordinator")["name"])
-        self.generatetoaddress(self.node, 101, coordinator_wallet.getnewaddress())
+        self.generatetoaddress(self.node, COINBASE_MATURITY + 1, coordinator_wallet.getnewaddress())
+        while float(coordinator_wallet.getbalance()) < funding_target:
+            self.generatetoaddress(self.node, 1, coordinator_wallet.getnewaddress())
 
         self.log.info("Send funds to the multisig's receiving address...")
-        deposit_amount = 6.15
         coordinator_wallet.sendtoaddress(multisig.getnewaddress(), deposit_amount)
         self.generate(self.node, 1)
         assert_approx(multisig.getbalance(), deposit_amount, vspan=0.001)

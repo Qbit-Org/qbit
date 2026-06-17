@@ -2,11 +2,11 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_QT_WALLETVIEW_H
-#define BITCOIN_QT_WALLETVIEW_H
+#ifndef QBIT_QT_WALLETVIEW_H
+#define QBIT_QT_WALLETVIEW_H
 
 #include <consensus/amount.h>
-#include <qt/bitcoinunits.h>
+#include <qt/qbitunits.h>
 
 #include <QStackedWidget>
 
@@ -119,9 +119,9 @@ Q_SIGNALS:
     /** Encryption status of wallet changed */
     void encryptionStatusChanged();
     /** Notify that a new transaction appeared */
-    void incomingTransaction(const QString& date, BitcoinUnit unit, const CAmount& amount, const QString& type, const QString& address, const QString& label, const QString& walletName);
+    void incomingTransaction(const QString& date, QbitUnit unit, const CAmount& amount, const QString& type, const QString& address, const QString& label, const QString& walletName);
     /** Notify that the out of sync warning icon has been pressed */
     void outOfSyncWarningClicked();
 };
 
-#endif // BITCOIN_QT_WALLETVIEW_H
+#endif // QBIT_QT_WALLETVIEW_H

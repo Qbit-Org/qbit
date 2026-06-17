@@ -653,7 +653,7 @@ Signing is only possible with addresses of the type 'legacy'.</source>
         <translation type="unfinished">(قفل شده است %1)</translation>
     </message>
     <message>
-        <source>Can vary +/- %1 satoshi(s) per input.</source>
+        <source>Can vary +/- %1 bits per input.</source>
         <translation type="unfinished">می توانید + / - %1 (ساتوشی) در هر ورودی متفاوت باشد.</translation>
     </message>
     <message>

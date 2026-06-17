@@ -4,7 +4,7 @@
 
 #include <qt/bitcoinamountfield.h>
 
-#include <qt/bitcoinunits.h>
+#include <qt/qbitunits.h>
 #include <qt/guiconstants.h>
 #include <qt/guiutil.h>
 #include <qt/qvaluecombobox.h>
@@ -59,7 +59,7 @@ public:
 
         if (valid) {
             val = qBound(m_min_amount, val, m_max_amount);
-            input = BitcoinUnits::format(currentUnit, val, false, BitcoinUnits::SeparatorStyle::ALWAYS);
+            input = QbitUnits::format(currentUnit, val, false, QbitUnits::SeparatorStyle::ALWAYS);
             lineEdit()->setText(input);
         }
     }
@@ -71,7 +71,7 @@ public:
 
     void setValue(const CAmount& value)
     {
-        lineEdit()->setText(BitcoinUnits::format(currentUnit, value, false, BitcoinUnits::SeparatorStyle::ALWAYS));
+        lineEdit()->setText(QbitUnits::format(currentUnit, value, false, QbitUnits::SeparatorStyle::ALWAYS));
         Q_EMIT valueChanged();
     }
 
@@ -99,13 +99,13 @@ public:
         setValue(val);
     }
 
-    void setDisplayUnit(BitcoinUnit unit)
+    void setDisplayUnit(QbitUnit unit)
     {
         bool valid = false;
         CAmount val = value(&valid);
 
         currentUnit = unit;
-        lineEdit()->setPlaceholderText(BitcoinUnits::format(currentUnit, m_min_amount, false, BitcoinUnits::SeparatorStyle::ALWAYS));
+        lineEdit()->setPlaceholderText(QbitUnits::format(currentUnit, m_min_amount, false, QbitUnits::SeparatorStyle::ALWAYS));
         if(valid)
             setValue(val);
         else
@@ -125,7 +125,7 @@ public:
 
             const QFontMetrics fm(fontMetrics());
             int h = lineEdit()->minimumSizeHint().height();
-            int w = GUIUtil::TextWidth(fm, BitcoinUnits::format(BitcoinUnit::BTC, BitcoinUnits::maxMoney(), false, BitcoinUnits::SeparatorStyle::ALWAYS));
+            int w = GUIUtil::TextWidth(fm, QbitUnits::format(QbitUnit::QBT, QbitUnits::maxMoney(), false, QbitUnits::SeparatorStyle::ALWAYS));
             w += 2; // cursor blinking space
 
             QStyleOptionSpinBox opt;
@@ -150,12 +150,12 @@ public:
     }
 
 private:
-    BitcoinUnit currentUnit{BitcoinUnit::BTC};
-    CAmount singleStep{CAmount(100000)}; // satoshis
+    QbitUnit currentUnit{QbitUnit::QBT};
+    CAmount singleStep{CAmount(100000)}; // base units
     mutable QSize cachedMinimumSizeHint;
     bool m_allow_empty{true};
     CAmount m_min_amount{CAmount(0)};
-    CAmount m_max_amount{BitcoinUnits::maxMoney()};
+    CAmount m_max_amount{QbitUnits::maxMoney()};
 
     /**
      * Parse a string into a number of base monetary units and
@@ -165,10 +165,10 @@ private:
     CAmount parse(const QString &text, bool *valid_out=nullptr) const
     {
         CAmount val = 0;
-        bool valid = BitcoinUnits::parse(currentUnit, text, &val);
+        bool valid = QbitUnits::parse(currentUnit, text, &val);
         if(valid)
         {
-            if(val < 0 || val > BitcoinUnits::maxMoney())
+            if(val < 0 || val > QbitUnits::maxMoney())
                 valid = false;
         }
         if(valid_out)
@@ -228,7 +228,7 @@ BitcoinAmountField::BitcoinAmountField(QWidget* parent)
     QHBoxLayout *layout = new QHBoxLayout(this);
     layout->addWidget(amount);
     unit = new QValueComboBox(this);
-    unit->setModel(new BitcoinUnits(this));
+    unit->setModel(new QbitUnits(this));
     layout->addWidget(unit);
     layout->addStretch(1);
     layout->setContentsMargins(0,0,0,0);
@@ -327,12 +327,12 @@ void BitcoinAmountField::unitChanged(int idx)
     unit->setToolTip(unit->itemData(idx, Qt::ToolTipRole).toString());
 
     // Determine new unit ID
-    QVariant new_unit = unit->currentData(BitcoinUnits::UnitRole);
+    QVariant new_unit = unit->currentData(QbitUnits::UnitRole);
     assert(new_unit.isValid());
-    amount->setDisplayUnit(new_unit.value<BitcoinUnit>());
+    amount->setDisplayUnit(new_unit.value<QbitUnit>());
 }
 
-void BitcoinAmountField::setDisplayUnit(BitcoinUnit new_unit)
+void BitcoinAmountField::setDisplayUnit(QbitUnit new_unit)
 {
     unit->setValue(QVariant::fromValue(new_unit));
 }

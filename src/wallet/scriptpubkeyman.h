@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_WALLET_SCRIPTPUBKEYMAN_H
-#define BITCOIN_WALLET_SCRIPTPUBKEYMAN_H
+#ifndef QBIT_WALLET_SCRIPTPUBKEYMAN_H
+#define QBIT_WALLET_SCRIPTPUBKEYMAN_H
 
 #include <addresstype.h>
 #include <common/messages.h>
@@ -25,7 +25,9 @@
 #include <boost/signals2/signal.hpp>
 
 #include <functional>
+#include <memory>
 #include <optional>
+#include <set>
 #include <unordered_map>
 
 enum class OutputType;
@@ -33,6 +35,13 @@ enum class OutputType;
 namespace wallet {
 struct MigrationData;
 class ScriptPubKeyMan;
+std::vector<CPQCPubKey> ExtractP2MRPubkeys(const CScript& script);
+
+struct PSBTSigningProvider
+{
+    std::unique_ptr<SigningProvider> provider;
+    std::set<unsigned int> input_indexes;
+};
 
 // Wallet storage things that ScriptPubKeyMans need in order to be able to store things to the wallet database.
 // It provides access to things that are part of the entire wallet and not specific to a ScriptPubKeyMan such as
@@ -51,6 +60,8 @@ public:
     virtual bool WithEncryptionKey(std::function<bool (const CKeyingMaterial&)> cb) const = 0;
     virtual bool HasEncryptionKeys() const = 0;
     virtual bool IsLocked() const = 0;
+    virtual bool WithWalletLock(std::function<bool()> cb) const = 0;
+    virtual std::optional<bool> IsInternalScriptPubKeyMan(const ScriptPubKeyMan* spk_man) const = 0;
     //! Callback function for after TopUp completes containing any scripts that were added by a SPKMan
     virtual void TopUpCallback(const std::set<CScript>&, ScriptPubKeyMan*) = 0;
 };
@@ -80,6 +91,7 @@ class ScriptPubKeyMan
 {
 protected:
     WalletStorage& m_storage;
+    std::shared_ptr<void> m_lifetime{std::make_shared<bool>(true)};
 
 public:
     explicit ScriptPubKeyMan(WalletStorage& storage) : m_storage(storage) {}
@@ -100,6 +112,11 @@ public:
       * External wallet code is primarily responsible for topping up prior to fetching new addresses
       */
     virtual bool TopUp(unsigned int size = 0) { return false; }
+    virtual util::Result<void> TopUpResult(unsigned int size = 0)
+    {
+        if (!TopUp(size)) return util::Error{_("scriptPubKey manager top-up failed")};
+        return {};
+    }
 
     /** Mark unused addresses as being used
      * Affects all keys up to and including the one determined by provided script.
@@ -118,6 +135,7 @@ public:
 
     virtual bool HavePrivateKeys() const { return false; }
     virtual bool HaveCryptedKeys() const { return false; }
+    std::weak_ptr<void> GetLifetimeToken() const { return m_lifetime; }
 
     //! The action to do when the DB needs rewrite
     virtual void RewriteDB() {}
@@ -127,6 +145,7 @@ public:
     virtual int64_t GetTimeFirstKey() const { return 0; }
 
     virtual std::unique_ptr<CKeyMetadata> GetMetadata(const CTxDestination& dest) const { return nullptr; }
+    virtual std::optional<uint32_t> GetPQCSignatureCounter(const CPQCPubKey& pubkey) const { return std::nullopt; }
 
     virtual std::unique_ptr<SigningProvider> GetSolvingProvider(const CScript& script) const { return nullptr; }
 
@@ -136,11 +155,15 @@ public:
     virtual bool CanProvide(const CScript& script, SignatureData& sigdata) { return false; }
 
     /** Creates new signatures and adds them to the transaction. Returns whether all inputs were signed */
-    virtual bool SignTransaction(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors) const { return false; }
+    virtual bool SignTransaction(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors, const PQCSignatureCounterObserver& pqc_counter_observer = {}) const { return false; }
+    /** Collect a provider snapshot for transaction signing. The caller can use it after releasing the wallet lock. */
+    virtual std::unique_ptr<SigningProvider> GetSigningProviderForTransaction(const std::map<COutPoint, Coin>& coins, const PQCSignatureCounterObserver& pqc_counter_observer = {}) const { return nullptr; }
     /** Sign a message with the given script */
     virtual SigningResult SignMessage(const std::string& message, const PKHash& pkhash, std::string& str_sig) const { return SigningResult::SIGNING_FAILED; };
     /** Adds script and derivation path information to a PSBT, and optionally signs it. */
-    virtual std::optional<common::PSBTError> FillPSBT(PartiallySignedTransaction& psbt, const PrecomputedTransactionData& txdata, std::optional<int> sighash_type = std::nullopt, bool sign = true, bool bip32derivs = false, int* n_signed = nullptr, bool finalize = true) const { return common::PSBTError::UNSUPPORTED; }
+    virtual std::optional<common::PSBTError> FillPSBT(PartiallySignedTransaction& psbt, const PrecomputedTransactionData& txdata, std::optional<int> sighash_type = std::nullopt, bool sign = true, bool bip32derivs = false, int* n_signed = nullptr, bool finalize = true, const PQCSignatureCounterObserver& pqc_counter_observer = {}) const { return common::PSBTError::UNSUPPORTED; }
+    /** Collect a provider snapshot for PSBT filling. The caller can use it after releasing the wallet lock. */
+    virtual std::optional<PSBTSigningProvider> GetSigningProviderForPSBT(const PartiallySignedTransaction& psbt, bool sign = true, const PQCSignatureCounterObserver& pqc_counter_observer = {}) const { return std::nullopt; }
 
     virtual uint256 GetID() const { return uint256(); }
 
@@ -279,6 +302,8 @@ private:
     using PubKeyMap = std::map<CPubKey, int32_t>; // Map of pubkeys involved in scripts to descriptor range index
     using CryptedKeyMap = std::map<CKeyID, std::pair<CPubKey, std::vector<unsigned char>>>;
     using KeyMap = std::map<CKeyID, CKey>;
+    using CryptedPQCKeyMap = std::map<CPQCPubKey, std::vector<unsigned char>>;
+    using PQCKeyMap = std::map<CPQCPubKey, CPQCKey>;
 
     ScriptPubKeyMap m_map_script_pub_keys GUARDED_BY(cs_desc_man);
     PubKeyMap m_map_pubkeys GUARDED_BY(cs_desc_man);
@@ -286,40 +311,43 @@ private:
 
     KeyMap m_map_keys GUARDED_BY(cs_desc_man);
     CryptedKeyMap m_map_crypted_keys GUARDED_BY(cs_desc_man);
+    CryptedPQCKeyMap m_map_crypted_pqc_keys GUARDED_BY(cs_desc_man);
+    PQCKeyMap m_map_pqc_keys GUARDED_BY(cs_desc_man);
+    mutable std::map<CPQCPubKey, uint32_t> m_map_pqc_sig_counters GUARDED_BY(cs_desc_man);
 
     //! keeps track of whether Unlock has run a thorough check before
     bool m_decryption_thoroughly_checked = false;
 
     //! Number of pre-generated keys/scripts (part of the look-ahead process, used to detect payments)
     int64_t m_keypool_size GUARDED_BY(cs_desc_man){DEFAULT_KEYPOOL_SIZE};
+    //! True when a ranged P2MR descriptor is intentionally underfilled and still owes a full top-up.
+    bool m_deferred_create_keypool_top_up GUARDED_BY(cs_desc_man){false};
 
     bool AddDescriptorKeyWithDB(WalletBatch& batch, const CKey& key, const CPubKey &pubkey) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    bool AddDescriptorPQCKeyWithDB(WalletBatch& batch, const CPQCPubKey& pubkey, const CPQCKey& key, bool has_encryption_keys = false, const CKeyingMaterial* encryption_key = nullptr) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    bool ReservePQCSignatureCounters(const CPQCPubKey& pubkey, uint32_t count, uint32_t& previous_counter, uint32_t& reserved_counter) const;
+    PQCSignatureCounterReserver MakePQCSignatureCounterReserver() const;
 
-    KeyMap GetKeys() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    KeyMap GetKeys() const;
 
     // Cached FlatSigningProviders to avoid regenerating them each time they are needed.
     mutable std::map<int32_t, FlatSigningProvider> m_map_signing_providers;
     // Fetch the SigningProvider for the given script and optionally include private keys
-    std::unique_ptr<FlatSigningProvider> GetSigningProvider(const CScript& script, bool include_private = false) const;
+    std::unique_ptr<FlatSigningProvider> GetSigningProvider(const CScript& script, bool include_private = false, const PQCSignatureCounterObserver& pqc_counter_observer = {}) const;
     // Fetch the SigningProvider for a given index and optionally include private keys. Called by the above functions.
-    std::unique_ptr<FlatSigningProvider> GetSigningProvider(int32_t index, bool include_private = false) const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    std::unique_ptr<FlatSigningProvider> GetSigningProvider(int32_t index, bool include_private = false, const PQCSignatureCounterObserver& pqc_counter_observer = {}) const;
+    std::unique_ptr<FlatSigningProvider> GetSigningProviderForPSBTInput(const CScript& script, const PSBTInput& input, bool sign, const PQCSignatureCounterObserver& pqc_counter_observer) const;
 
 protected:
     WalletDescriptor m_wallet_descriptor GUARDED_BY(cs_desc_man);
 
     //! Same as 'TopUp' but designed for use within a batch transaction context
-    bool TopUpWithDB(WalletBatch& batch, unsigned int size = 0);
+    bool TopUpWithDB(WalletBatch& batch, unsigned int size = 0, std::optional<bool> internal_hint = std::nullopt);
+    util::Result<void> TopUpWithDBResult(WalletBatch& batch, unsigned int size = 0, std::optional<bool> internal_hint = std::nullopt, bool throw_on_persistence_error = false, bool rollback_state_on_error = true);
 
 public:
-    DescriptorScriptPubKeyMan(WalletStorage& storage, WalletDescriptor& descriptor, int64_t keypool_size)
-        :   ScriptPubKeyMan(storage),
-            m_keypool_size(keypool_size),
-            m_wallet_descriptor(descriptor)
-        {}
-    DescriptorScriptPubKeyMan(WalletStorage& storage, int64_t keypool_size)
-        :   ScriptPubKeyMan(storage),
-            m_keypool_size(keypool_size)
-        {}
+    DescriptorScriptPubKeyMan(WalletStorage& storage, WalletDescriptor& descriptor, int64_t keypool_size);
+    DescriptorScriptPubKeyMan(WalletStorage& storage, int64_t keypool_size);
 
     mutable RecursiveMutex cs_desc_man;
 
@@ -337,13 +365,18 @@ public:
     // more on ephemeral data than LegacyScriptPubKeyMan. For wallets using unhardened derivation
     // (with or without private keys), the "keypool" is a single xpub.
     bool TopUp(unsigned int size = 0) override;
+    util::Result<void> TopUpResult(unsigned int size = 0) override;
+    bool TopUpWithInternalHint(std::optional<bool> internal_hint, unsigned int size = 0);
+    util::Result<void> TopUpWithInternalHintResult(std::optional<bool> internal_hint, unsigned int size = 0);
 
     std::vector<WalletDestination> MarkUnusedAddresses(const CScript& script) override;
 
     bool IsHDEnabled() const override;
 
     //! Setup descriptors based on the given CExtkey
-    bool SetupDescriptorGeneration(WalletBatch& batch, const CExtKey& master_key, OutputType addr_type, bool internal);
+    bool SetupDescriptorGeneration(WalletBatch& batch, const CExtKey& master_key, OutputType addr_type, bool internal, unsigned int initial_keypool_size = 0);
+    bool HasDeferredCreateKeyPoolTopUp() const;
+    void MaybeRestoreDeferredCreateKeyPoolTopUp();
 
     bool HavePrivateKeys() const override;
     bool HasPrivKey(const CKeyID& keyid) const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
@@ -356,6 +389,7 @@ public:
     int64_t GetTimeFirstKey() const override;
 
     std::unique_ptr<CKeyMetadata> GetMetadata(const CTxDestination& dest) const override;
+    std::optional<uint32_t> GetPQCSignatureCounter(const CPQCPubKey& pubkey) const override;
 
     bool CanGetAddresses(bool internal = false) const override;
 
@@ -364,11 +398,14 @@ public:
     bool CanProvide(const CScript& script, SignatureData& sigdata) override;
 
     // Fetch the SigningProvider for the given pubkey and always include private keys. This should only be called by signing code.
-    std::unique_ptr<FlatSigningProvider> GetSigningProvider(const CPubKey& pubkey) const;
+    std::unique_ptr<FlatSigningProvider> GetSigningProvider(const CPubKey& pubkey, const PQCSignatureCounterObserver& pqc_counter_observer = {}) const;
+    std::unique_ptr<FlatSigningProvider> GetSigningProvider(const CPQCPubKey& pubkey, const PQCSignatureCounterObserver& pqc_counter_observer = {}) const;
 
-    bool SignTransaction(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors) const override;
+    bool SignTransaction(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors, const PQCSignatureCounterObserver& pqc_counter_observer = {}) const override;
+    std::unique_ptr<SigningProvider> GetSigningProviderForTransaction(const std::map<COutPoint, Coin>& coins, const PQCSignatureCounterObserver& pqc_counter_observer = {}) const override;
     SigningResult SignMessage(const std::string& message, const PKHash& pkhash, std::string& str_sig) const override;
-    std::optional<common::PSBTError> FillPSBT(PartiallySignedTransaction& psbt, const PrecomputedTransactionData& txdata, std::optional<int> sighash_type = std::nullopt, bool sign = true, bool bip32derivs = false, int* n_signed = nullptr, bool finalize = true) const override;
+    std::optional<common::PSBTError> FillPSBT(PartiallySignedTransaction& psbt, const PrecomputedTransactionData& txdata, std::optional<int> sighash_type = std::nullopt, bool sign = true, bool bip32derivs = false, int* n_signed = nullptr, bool finalize = true, const PQCSignatureCounterObserver& pqc_counter_observer = {}) const override;
+    std::optional<PSBTSigningProvider> GetSigningProviderForPSBT(const PartiallySignedTransaction& psbt, bool sign = true, const PQCSignatureCounterObserver& pqc_counter_observer = {}) const override;
 
     uint256 GetID() const override;
 
@@ -376,6 +413,9 @@ public:
 
     bool AddKey(const CKeyID& key_id, const CKey& key);
     bool AddCryptedKey(const CKeyID& key_id, const CPubKey& pubkey, const std::vector<unsigned char>& crypted_key);
+    bool AddCryptedPQCKey(const CPQCPubKey& pubkey, const std::vector<unsigned char>& crypted_key, uint32_t sig_counter = 0);
+    bool AddPQCKey(const CPQCPubKey& pubkey, const CPQCKey& key, uint32_t sig_counter = 0);
+    std::vector<CPQCPubKey> GetPQCKeys() const;
 
     bool HasWalletDescriptor(const WalletDescriptor& desc) const;
     util::Result<void> UpdateWalletDescriptor(WalletDescriptor& descriptor);
@@ -406,4 +446,4 @@ struct MigrationData
 
 } // namespace wallet
 
-#endif // BITCOIN_WALLET_SCRIPTPUBKEYMAN_H
+#endif // QBIT_WALLET_SCRIPTPUBKEYMAN_H

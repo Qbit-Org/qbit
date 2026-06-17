@@ -22,6 +22,11 @@
 
 BOOST_FIXTURE_TEST_SUITE(validation_chainstate_tests, ChainTestingSetup)
 
+static bool HasAssumeutxoData()
+{
+    return !Params().GetAvailableSnapshotHeights().empty();
+}
+
 //! Test resizing coins-related Chainstate caches during runtime.
 //!
 BOOST_AUTO_TEST_CASE(validation_chainstate_resize_caches)
@@ -84,6 +89,11 @@ BOOST_FIXTURE_TEST_CASE(chainstate_update_tip, TestChain100Setup)
     // After adding some blocks to the tip, best block should have changed.
     BOOST_CHECK(get_notify_tip() != curr_tip);
 
+    if (!HasAssumeutxoData()) {
+        BOOST_TEST_MESSAGE("Skipping snapshot/background-chainstate portion: no assumeutxo data configured");
+        return;
+    }
+
     // Grab block 1 from disk; we'll add it to the background chain later.
     std::shared_ptr<CBlock> pblockone = std::make_shared<CBlock>();
     {
@@ -135,8 +145,18 @@ BOOST_FIXTURE_TEST_CASE(chainstate_update_tip, TestChain100Setup)
         BOOST_CHECK(accepted);
     }
 
+    const auto metrics_before_bg = chainman.m_orphan_metrics.GetSnapshot();
+
     // UpdateTip is called here
     bool block_added = background_cs.ActivateBestChain(state, pblockone);
+    const auto metrics_after_bg = chainman.m_orphan_metrics.GetSnapshot();
+
+    // Advancing only the background chainstate should not change stale/orphan
+    // metrics, which are tracked for active chainstate events.
+    BOOST_CHECK_EQUAL(metrics_after_bg.lifetime_blocks_connected, metrics_before_bg.lifetime_blocks_connected);
+    BOOST_CHECK_EQUAL(metrics_after_bg.lifetime_stale_blocks, metrics_before_bg.lifetime_stale_blocks);
+    BOOST_CHECK_EQUAL(metrics_after_bg.lifetime_reorgs, metrics_before_bg.lifetime_reorgs);
+    BOOST_CHECK_EQUAL(metrics_after_bg.deepest_reorg, metrics_before_bg.deepest_reorg);
 
     // Ensure tip is as expected
     BOOST_CHECK_EQUAL(background_cs.m_chain.Tip()->GetBlockHash(), pblockone->GetHash());

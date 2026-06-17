@@ -369,7 +369,7 @@ class SendHeadersTest(BitcoinTestFramework):
         for j in range(2):
             self.log.debug("Part 3.{}: starting...".format(j))
             # First try mining a reorg that can propagate with header announcement
-            new_block_hashes = self.mine_reorg(length=7)
+            new_block_hashes = self.mine_reorg(length=15)
             tip = new_block_hashes[-1]
             inv_node.check_last_inv_announcement(inv=[tip])
             test_node.check_last_headers_announcement(headers=new_block_hashes)
@@ -377,7 +377,7 @@ class SendHeadersTest(BitcoinTestFramework):
             block_time += 8
 
             # Mine a too-large reorg, which should be announced with a single inv
-            new_block_hashes = self.mine_reorg(length=8)
+            new_block_hashes = self.mine_reorg(length=16)
             tip = new_block_hashes[-1]
             inv_node.check_last_inv_announcement(inv=[tip])
             test_node.check_last_inv_announcement(inv=[tip])

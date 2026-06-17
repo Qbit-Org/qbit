@@ -3,16 +3,19 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_SCRIPT_SIGNINGPROVIDER_H
-#define BITCOIN_SCRIPT_SIGNINGPROVIDER_H
+#ifndef QBIT_SCRIPT_SIGNINGPROVIDER_H
+#define QBIT_SCRIPT_SIGNINGPROVIDER_H
 
 #include <addresstype.h>
 #include <attributes.h>
+#include <crypto/pqc.h>
 #include <key.h>
 #include <pubkey.h>
 #include <script/keyorigin.h>
 #include <script/script.h>
 #include <sync.h>
+
+#include <functional>
 
 struct ShortestVectorFirstComparator
 {
@@ -24,10 +27,15 @@ struct ShortestVectorFirstComparator
     }
 };
 
-struct TaprootSpendData
+using PQCSignatureCounterObserver = std::function<void(const CPQCPubKey&, uint32_t, uint32_t)>;
+using PQCSignatureCounterReserver = std::function<bool(const CPQCPubKey&, uint32_t, uint32_t&, uint32_t&)>;
+
+using ScriptMerkleLeaf = std::pair<std::vector<unsigned char>, int>;
+using ScriptMerkleBranchSet = std::set<std::vector<unsigned char>, ShortestVectorFirstComparator>;
+using ScriptMerkleBranches = std::map<ScriptMerkleLeaf, ScriptMerkleBranchSet>;
+
+struct ScriptMerkleSpendData
 {
-    /** The BIP341 internal key. */
-    XOnlyPubKey internal_key;
     /** The Merkle root of the script tree (0 if no scripts). */
     uint256 merkle_root;
     /** Map from (script, leaf_version) to (sets of) control blocks.
@@ -36,12 +44,26 @@ struct TaprootSpendData
      *  inference can reconstruct the full tree. Within each set, the control
      *  blocks are sorted by size, so that the signing logic can easily
      *  prefer the cheapest one. */
-    std::map<std::pair<std::vector<unsigned char>, int>, std::set<std::vector<unsigned char>, ShortestVectorFirstComparator>> scripts;
+    ScriptMerkleBranches scripts;
+    /** Merge script-tree information for the same scriptPubKey into this. */
+    void MergeScripts(ScriptMerkleSpendData other);
+};
+
+struct TaprootSpendData : ScriptMerkleSpendData
+{
+    /** The BIP341 internal key. */
+    XOnlyPubKey internal_key;
     /** Merge other TaprootSpendData (for the same scriptPubKey) into this. */
     void Merge(TaprootSpendData other);
 };
 
-/** Utility class to construct Taproot outputs from internal key and script tree. */
+struct P2MRSpendData : ScriptMerkleSpendData
+{
+    /** Merge other P2MRSpendData (for the same scriptPubKey) into this. */
+    void Merge(P2MRSpendData other);
+};
+
+/** Utility class to construct Taproot or P2MR outputs from a script tree. */
 class TaprootBuilder
 {
 private:
@@ -64,6 +86,10 @@ private:
     };
     /** Whether the builder is in a valid state so far. */
     bool m_valid = true;
+    /** Whether the tree uses P2MR leaf/branch hashing instead of Taproot hashing. */
+    bool m_p2mr_tree = false;
+    /** Whether the tree hash domain has been selected yet. */
+    bool m_tree_type_set = false;
 
     /** The current state of the builder.
      *
@@ -107,20 +133,35 @@ private:
     bool m_parity;               //!< The tweak parity, computed when finalizing.
 
     /** Combine information about a parent Merkle tree node from its child nodes. */
-    static NodeInfo Combine(NodeInfo&& a, NodeInfo&& b);
+    static NodeInfo Combine(NodeInfo&& a, NodeInfo&& b, bool p2mr_tree);
     /** Insert information about a node at a certain depth, and propagate information up. */
     void Insert(NodeInfo&& node, int depth);
+    /** Select Taproot or P2MR hashing for the tree. */
+    void SetTreeType(bool p2mr_tree);
+    /** Add a new script using the selected tree hash domain. */
+    TaprootBuilder& AddInternal(int depth, std::span<const unsigned char> script, int leaf_version, bool track, bool p2mr_tree);
+    /** Add an omitted Merkle node using the selected tree hash domain. */
+    TaprootBuilder& AddOmittedInternal(int depth, const uint256& hash, bool p2mr_tree);
+    /** Serialize tracked leaves into control blocks for spend-data exports. */
+    void PopulateSpendScripts(ScriptMerkleBranches& scripts, size_t control_base_size, size_t control_node_size,
+                              unsigned char parity_bit, bool include_internal_key) const;
 
 public:
     /** Add a new script at a certain depth in the tree. Add() operations must be called
      *  in depth-first traversal order of binary tree. If track is true, it will be included in
      *  the GetSpendData() output. */
     TaprootBuilder& Add(int depth, std::span<const unsigned char> script, int leaf_version, bool track = true);
+    /** Like Add(), but using P2MR leaf/branch hashing. */
+    TaprootBuilder& AddP2MR(int depth, std::span<const unsigned char> script, int leaf_version, bool track = true);
     /** Like Add(), but for a Merkle node with a given hash to the tree. */
     TaprootBuilder& AddOmitted(int depth, const uint256& hash);
+    /** Like AddOmitted(), but using P2MR branch hashing. */
+    TaprootBuilder& AddOmittedP2MR(int depth, const uint256& hash);
     /** Finalize the construction. Can only be called when IsComplete() is true.
         internal_key.IsFullyValid() must be true. */
     TaprootBuilder& Finalize(const XOnlyPubKey& internal_key);
+    /** Finalize the construction for P2MR outputs (Merkle root only, no key tweak). */
+    TaprootBuilder& FinalizeP2MR();
 
     /** Return true if so far all input was valid. */
     bool IsValid() const { return m_valid; }
@@ -132,6 +173,10 @@ public:
     static bool ValidDepths(const std::vector<int>& depths);
     /** Compute spending data (after Finalize()). */
     TaprootSpendData GetSpendData() const;
+    /** Compute P2MR output (after FinalizeP2MR()). */
+    WitnessV2P2MR GetP2MROutput();
+    /** Compute P2MR spending data (after FinalizeP2MR()). */
+    P2MRSpendData GetP2MRSpendData() const;
     /** Returns a vector of tuples representing the depth, leaf version, and script */
     std::vector<std::tuple<uint8_t, uint8_t, std::vector<unsigned char>>> GetTreeTuples() const;
     /** Returns true if there are any tapscripts */
@@ -157,10 +202,15 @@ public:
     virtual bool HaveCScript(const CScriptID &scriptid) const { return false; }
     virtual bool GetPubKey(const CKeyID &address, CPubKey& pubkey) const { return false; }
     virtual bool GetKey(const CKeyID &address, CKey& key) const { return false; }
+    virtual bool GetPQCKey(const CPQCPubKey& pubkey, CPQCKey& key) const { return false; }
+    virtual bool CanSignPQC(const CPQCPubKey& pubkey) const { return false; }
+    virtual bool SignPQC(const CPQCPubKey& pubkey, const uint256& hash, std::vector<unsigned char>& sig) const;
     virtual bool HaveKey(const CKeyID &address) const { return false; }
     virtual bool GetKeyOrigin(const CKeyID& keyid, KeyOriginInfo& info) const { return false; }
     virtual bool GetTaprootSpendData(const XOnlyPubKey& output_key, TaprootSpendData& spenddata) const { return false; }
     virtual bool GetTaprootBuilder(const XOnlyPubKey& output_key, TaprootBuilder& builder) const { return false; }
+    virtual bool GetP2MRSpendData(const WitnessV2P2MR& output, P2MRSpendData& spenddata) const { return false; }
+    virtual bool GetP2MRBuilder(const WitnessV2P2MR& output, TaprootBuilder& builder) const { return false; }
     virtual std::vector<CPubKey> GetMuSig2ParticipantPubkeys(const CPubKey& pubkey) const { return {}; }
 
     bool GetKeyByXOnly(const XOnlyPubKey& pubkey, CKey& key) const
@@ -202,9 +252,14 @@ public:
     bool GetCScript(const CScriptID& scriptid, CScript& script) const override;
     bool GetPubKey(const CKeyID& keyid, CPubKey& pubkey) const override;
     bool GetKey(const CKeyID& keyid, CKey& key) const override;
+    bool GetPQCKey(const CPQCPubKey& pubkey, CPQCKey& key) const override;
+    bool CanSignPQC(const CPQCPubKey& pubkey) const override;
+    bool SignPQC(const CPQCPubKey& pubkey, const uint256& hash, std::vector<unsigned char>& sig) const override;
     bool GetKeyOrigin(const CKeyID& keyid, KeyOriginInfo& info) const override;
     bool GetTaprootSpendData(const XOnlyPubKey& output_key, TaprootSpendData& spenddata) const override;
     bool GetTaprootBuilder(const XOnlyPubKey& output_key, TaprootBuilder& builder) const override;
+    bool GetP2MRSpendData(const WitnessV2P2MR& output, P2MRSpendData& spenddata) const override;
+    bool GetP2MRBuilder(const WitnessV2P2MR& output, TaprootBuilder& builder) const override;
     std::vector<CPubKey> GetMuSig2ParticipantPubkeys(const CPubKey& pubkey) const override;
 };
 
@@ -214,7 +269,15 @@ struct FlatSigningProvider final : public SigningProvider
     std::map<CKeyID, CPubKey> pubkeys;
     std::map<CKeyID, std::pair<CPubKey, KeyOriginInfo>> origins;
     std::map<CKeyID, CKey> keys;
+    std::map<CPQCPubKey, CPQCKey> pqc_keys;
+    mutable std::map<CPQCPubKey, uint32_t> pqc_sig_counters;
+    std::function<bool(const CPQCPubKey&, uint32_t, uint32_t)> pqc_counter_writer;
+    PQCSignatureCounterReserver pqc_counter_reserver;
+    PQCSignatureCounterObserver pqc_counter_observer;
+    std::map<uint32_t, CPQCPubKey> p2mr_pubkeys; /** Map key expression index -> derived P2MR pubkey */
+    std::map<WitnessV2P2MR, P2MRSpendData> p2mr_spenddata; /** Map from output key to raw P2MR spend data */
     std::map<XOnlyPubKey, TaprootBuilder> tr_trees; /** Map from output key to Taproot tree (which can then make the TaprootSpendData */
+    std::map<WitnessV2P2MR, TaprootBuilder> mr_trees; /** Map from output key to P2MR tree (which can then make the P2MRSpendData) */
     std::map<CPubKey, std::vector<CPubKey>> aggregate_pubkeys; /** MuSig2 aggregate pubkeys */
 
     bool GetCScript(const CScriptID& scriptid, CScript& script) const override;
@@ -222,8 +285,13 @@ struct FlatSigningProvider final : public SigningProvider
     bool GetKeyOrigin(const CKeyID& keyid, KeyOriginInfo& info) const override;
     bool HaveKey(const CKeyID &keyid) const override;
     bool GetKey(const CKeyID& keyid, CKey& key) const override;
+    bool GetPQCKey(const CPQCPubKey& pubkey, CPQCKey& key) const override;
+    bool CanSignPQC(const CPQCPubKey& pubkey) const override;
+    bool SignPQC(const CPQCPubKey& pubkey, const uint256& hash, std::vector<unsigned char>& sig) const override;
     bool GetTaprootSpendData(const XOnlyPubKey& output_key, TaprootSpendData& spenddata) const override;
     bool GetTaprootBuilder(const XOnlyPubKey& output_key, TaprootBuilder& builder) const override;
+    bool GetP2MRSpendData(const WitnessV2P2MR& output, P2MRSpendData& spenddata) const override;
+    bool GetP2MRBuilder(const WitnessV2P2MR& output, TaprootBuilder& builder) const override;
     std::vector<CPubKey> GetMuSig2ParticipantPubkeys(const CPubKey& pubkey) const override;
 
     FlatSigningProvider& Merge(FlatSigningProvider&& b) LIFETIMEBOUND;
@@ -316,8 +384,13 @@ public:
     bool GetPubKey(const CKeyID& keyid, CPubKey& pubkey) const override;
     bool GetKeyOrigin(const CKeyID& keyid, KeyOriginInfo& info) const override;
     bool GetKey(const CKeyID& keyid, CKey& key) const override;
+    bool GetPQCKey(const CPQCPubKey& pubkey, CPQCKey& key) const override;
+    bool CanSignPQC(const CPQCPubKey& pubkey) const override;
+    bool SignPQC(const CPQCPubKey& pubkey, const uint256& hash, std::vector<unsigned char>& sig) const override;
     bool GetTaprootSpendData(const XOnlyPubKey& output_key, TaprootSpendData& spenddata) const override;
     bool GetTaprootBuilder(const XOnlyPubKey& output_key, TaprootBuilder& builder) const override;
+    bool GetP2MRSpendData(const WitnessV2P2MR& output, P2MRSpendData& spenddata) const override;
+    bool GetP2MRBuilder(const WitnessV2P2MR& output, TaprootBuilder& builder) const override;
 };
 
-#endif // BITCOIN_SCRIPT_SIGNINGPROVIDER_H
+#endif // QBIT_SCRIPT_SIGNINGPROVIDER_H

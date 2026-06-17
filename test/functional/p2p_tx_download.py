@@ -10,6 +10,7 @@ from enum import Enum
 import time
 
 from test_framework.mempool_util import (
+    MIN_MAX_MEMPOOL_SIZE_MB,
     fill_mempool,
 )
 from test_framework.messages import (
@@ -68,7 +69,7 @@ class ConnectionType(Enum):
 class TxDownloadTest(BitcoinTestFramework):
     def set_test_params(self):
         self.num_nodes = 2
-        self.extra_args= [['-maxmempool=5', '-persistmempool=0']] * self.num_nodes
+        self.extra_args = [[f"-maxmempool={MIN_MAX_MEMPOOL_SIZE_MB}", "-persistmempool=0"]] * self.num_nodes
 
     def test_tx_requests(self):
         self.log.info("Test that we request transactions from all our peers, eventually")
@@ -377,6 +378,9 @@ class TxDownloadTest(BitcoinTestFramework):
 
     def run_test(self):
         self.wallet = MiniWallet(self.nodes[0])
+
+        # Mature the default-cache coinbase UTXOs
+        self.ensure_cached_coinbase_mature(self.nodes[0])
 
         # Run tests without mocktime that only need one peer-connection first, to avoid restarting the nodes
         self.test_expiry_fallback()

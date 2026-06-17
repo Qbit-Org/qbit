@@ -977,7 +977,7 @@ Cüzdan kilidini aç.</translation>
         <translation type="unfinished">(%1'i kilitli)</translation>
     </message>
     <message>
-        <source>Can vary +/- %1 satoshi(s) per input.</source>
+        <source>Can vary +/- %1 bits per input.</source>
         <translation type="unfinished">Her girdi için +/- %1 satoshi değişebilir.</translation>
     </message>
     <message>
@@ -2912,7 +2912,7 @@ Taşıma işlemi, taşıma işleminden önce cüzdanın bir yedeğini oluşturac
         <translation type="unfinished">Bu ögeyi kaldır</translation>
     </message>
     <message>
-        <source>The fee will be deducted from the amount being sent. The recipient will receive less bitcoins than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
+        <source>The fee will be deducted from the amount being sent. The recipient will receive less QBT than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
         <translation type="unfinished">Ücret yollanan tutardan alınacaktır. Alıcı tutar alanına girdiğinizden daha az bitcoin alacaktır. Eğer birden çok alıcı seçiliyse ücret eşit olarak bölünecektir.</translation>
     </message>
     <message>

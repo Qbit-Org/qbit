@@ -1,0 +1,12 @@
+{
+  "schema_version": "1",
+  "project": "bitcoin",
+  "project_version": "v30.2",
+  "generator": "qbit-rpcdocgen",
+  "feature_matrix": {
+    "wallet": true,
+    "zmq": false,
+    "external_signer": true
+  },
+  "method_count": 166
+}

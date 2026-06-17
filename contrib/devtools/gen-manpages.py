@@ -10,13 +10,13 @@ import tempfile
 import argparse
 
 BINARIES = [
-'bin/bitcoin',
-'bin/bitcoind',
-'bin/bitcoin-cli',
-'bin/bitcoin-tx',
-'bin/bitcoin-wallet',
-'bin/bitcoin-util',
-'bin/bitcoin-qt',
+    'bin/qbit',
+    'bin/qbitd',
+    'bin/qbit-cli',
+    'bin/qbit-tx',
+    'bin/qbit-wallet',
+    'bin/qbit-util',
+    'bin/qbit-qt',
 ]
 
 parser = argparse.ArgumentParser(
@@ -88,7 +88,7 @@ with tempfile.NamedTemporaryFile('w', suffix='.h2m') as footer:
     footer.write('\n'.join(versions[0][2]).strip())
     # Create SEE ALSO section
     footer.write('\n[SEE ALSO]\n')
-    footer.write(', '.join(s.rpartition('/')[2] + '(1)' for s in BINARIES))
+    footer.write(', '.join(os.path.basename(path) + '(1)' for path in BINARIES))
     footer.write('\n')
     footer.flush()
 

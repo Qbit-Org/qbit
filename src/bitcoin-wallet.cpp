@@ -37,6 +37,9 @@ static void SetupWalletToolArgs(ArgsManager& argsman)
     argsman.AddArg("-datadir=<dir>", "Specify data directory", ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_NEGATION, OptionsCategory::OPTIONS);
     argsman.AddArg("-wallet=<wallet-name>", "Specify wallet name", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::OPTIONS);
     argsman.AddArg("-dumpfile=<file name>", "When used with 'dump', writes out the records to this file. When used with 'createfromdump', loads the records into a new wallet.", ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_NEGATION, OptionsCategory::OPTIONS);
+    argsman.AddArg("-p2mronly",
+                   "Regtest-only: reject outputs outside P2MR plus OP_RETURN/PayToAnchor, and after outerwitness activation also allow reserved witness v3..v16 in blocks (they remain non-standard in policy). Regtest defaults to P2MR-only; use -p2mronly=0 to enable unrestricted regtest outputs for compatibility testing.",
+                   ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-debug=<category>", "Output debugging information (default: 0).", ArgsManager::ALLOW_ANY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-printtoconsole", "Send trace/debug info to console (default: 1 when no -debug is true, 0 otherwise).", ArgsManager::ALLOW_ANY, OptionsCategory::DEBUG_TEST);
 
@@ -56,17 +59,17 @@ static std::optional<int> WalletAppInit(ArgsManager& args, int argc, char* argv[
     }
     const bool missing_args{argc < 2};
     if (missing_args || HelpRequested(args) || args.GetBoolArg("-version", false)) {
-        std::string strUsage = strprintf("%s bitcoin-wallet utility version", CLIENT_NAME) + " " + FormatFullVersion() + "\n";
+        std::string strUsage = strprintf("%s qbit-wallet utility version", CLIENT_NAME) + " " + FormatFullVersion() + "\n";
 
         if (args.GetBoolArg("-version", false)) {
             strUsage += FormatParagraph(LicenseInfo());
         } else {
             strUsage += "\n"
-                "bitcoin-wallet is an offline tool for creating and interacting with " CLIENT_NAME " wallet files.\n\n"
-                "By default bitcoin-wallet will act on wallets in the default mainnet wallet directory in the datadir.\n\n"
+                "qbit-wallet is an offline tool for creating and interacting with " CLIENT_NAME " wallet files.\n\n"
+                "By default qbit-wallet will act on wallets in the default mainnet wallet directory in the datadir.\n\n"
                 "To change the target wallet, use the -datadir, -wallet and (test)chain selection arguments.\n"
                 "\n"
-                "Usage: bitcoin-wallet [options] <command>\n"
+                "Usage: qbit-wallet [options] <command>\n"
                 "\n";
             strUsage += "\n" + args.GetHelpMessage();
         }
@@ -86,7 +89,9 @@ static std::optional<int> WalletAppInit(ArgsManager& args, int argc, char* argv[
         return EXIT_FAILURE;
     }
     // Check for chain settings (Params() calls are only valid after this clause)
-    SelectParams(args.GetChainType());
+    const ChainType chain{args.GetChainType()};
+    CheckTestnetOnlyReleaseChain(chain);
+    SelectParams(chain);
 
     return std::nullopt;
 }
@@ -119,7 +124,7 @@ MAIN_FUNCTION
 
     const auto command = args.GetCommand();
     if (!command) {
-        tfm::format(std::cerr, "No method provided. Run `bitcoin-wallet -help` for valid methods.\n");
+        tfm::format(std::cerr, "No method provided. Run `qbit-wallet -help` for valid methods.\n");
         return EXIT_FAILURE;
     }
     if (command->args.size() != 0) {

@@ -2,7 +2,7 @@
 # Copyright (c) The Bitcoin Core developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Test the bitcoin wrapper tool."""
+"""Test the qbit wrapper tool."""
 from test_framework.test_framework import (
     BitcoinTestFramework,
     SkipTest,
@@ -22,9 +22,9 @@ class ToolBitcoinTest(BitcoinTestFramework):
         self.num_nodes = 1
 
     def skip_test_if_missing_module(self):
-        # Skip test on windows because currently when `bitcoin node -version` is
+        # Skip test on windows because currently when `qbit node -version` is
         # run on windows, python doesn't capture output from the child
-        # `bitcoind` and `bitcoin-node` process started with _wexecvp, and
+        # `qbitd` and `qbit-node` process started with _wexecvp, and
         # stdout/stderr are always empty. See
         # https://github.com/bitcoin/bitcoin/pull/33229#issuecomment-3265524908
         if platform.system() == "Windows":
@@ -38,7 +38,7 @@ class ToolBitcoinTest(BitcoinTestFramework):
         assert all(node.args[:len(node_argv)] == node_argv for node in self.nodes)
 
     def set_cmd_args(self, node, args):
-        """Set up node so it will be started through bitcoin wrapper command with specified arguments."""
+        """Set up node so it will be started through qbit wrapper command with specified arguments."""
         node.args = [self.binary_paths.bitcoin_bin] + args + ["node"] + self.node_options[node.index]
 
     def test_args(self, cmd_args, node_args, expect_exe=None, expect_error=None):
@@ -60,28 +60,28 @@ class ToolBitcoinTest(BitcoinTestFramework):
     def run_test(self):
         node = self.nodes[0]
 
-        self.log.info("Ensure bitcoin node command invokes bitcoind by default")
-        self.test_args([], [], expect_exe="bitcoind")
+        self.log.info("Ensure qbit node command invokes qbitd by default")
+        self.test_args([], [], expect_exe="qbitd")
 
-        self.log.info("Ensure bitcoin -M invokes bitcoind")
-        self.test_args(["-M"], [], expect_exe="bitcoind")
+        self.log.info("Ensure qbit -M invokes qbitd")
+        self.test_args(["-M"], [], expect_exe="qbitd")
 
-        self.log.info("Ensure bitcoin -M does not accept -ipcbind")
+        self.log.info("Ensure qbit -M does not accept -ipcbind")
         self.test_args(["-M"], ["-ipcbind=unix"], expect_error='Error: Error parsing command line arguments: Invalid parameter -ipcbind=unix')
 
         if self.is_ipc_compiled():
-            self.log.info("Ensure bitcoin -m invokes bitcoin-node")
-            self.test_args(["-m"], [], expect_exe="bitcoin-node")
+            self.log.info("Ensure qbit -m invokes qbit-node")
+            self.test_args(["-m"], [], expect_exe="qbit-node")
 
-            self.log.info("Ensure bitcoin -m does accept -ipcbind")
-            self.test_args(["-m"], ["-ipcbind=unix"], expect_exe="bitcoin-node")
+            self.log.info("Ensure qbit -m does accept -ipcbind")
+            self.test_args(["-m"], ["-ipcbind=unix"], expect_exe="qbit-node")
 
-            self.log.info("Ensure bitcoin accepts -ipcbind by default")
-            self.test_args([], ["-ipcbind=unix"], expect_exe="bitcoin-node")
+            self.log.info("Ensure qbit accepts -ipcbind by default")
+            self.test_args([], ["-ipcbind=unix"], expect_exe="qbit-node")
 
-            self.log.info("Ensure bitcoin recognizes -ipcbind in config file")
+            self.log.info("Ensure qbit recognizes -ipcbind in config file")
             append_config(node.datadir_path, ["ipcbind=unix"])
-            self.test_args([], [], expect_exe="bitcoin-node")
+            self.test_args([], [], expect_exe="qbit-node")
 
 
 def get_node_output(node):

@@ -381,6 +381,29 @@ BOOST_AUTO_TEST_CASE(patharg)
     BOOST_CHECK_EQUAL(local_args.GetPathArg("-dir", "default"), fs::path{""});
 }
 
+BOOST_AUTO_TEST_CASE(config_path_defaults)
+{
+    ArgsManager local_args;
+    SetupArgs(local_args, {
+        {"-conf", ArgsManager::ALLOW_ANY},
+        {"-datadir", ArgsManager::ALLOW_ANY | ArgsManager::DISALLOW_NEGATION},
+    });
+
+    const fs::path datadir{"config_path_defaults"};
+    fs::create_directories(datadir);
+    const fs::path absolute_datadir{fs::absolute(datadir)};
+
+    ResetArgs(local_args, "-datadir=" + fs::PathToString(datadir));
+    BOOST_CHECK_EQUAL(
+        AbsPathForConfigVal(local_args, local_args.GetPathArg("-conf", BITCOIN_CONF_FILENAME), /*net_specific=*/false),
+        absolute_datadir / BITCOIN_CONF_FILENAME);
+
+    ResetArgs(local_args, "-datadir=" + fs::PathToString(datadir) + " -conf=bitcoin.conf");
+    BOOST_CHECK_EQUAL(
+        AbsPathForConfigVal(local_args, local_args.GetPathArg("-conf", BITCOIN_CONF_FILENAME), /*net_specific=*/false),
+        absolute_datadir / "bitcoin.conf");
+}
+
 BOOST_AUTO_TEST_CASE(doubledash)
 {
     ArgsManager local_args;

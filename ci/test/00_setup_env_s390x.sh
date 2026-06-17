@@ -6,10 +6,13 @@
 
 export LC_ALL=C.UTF-8
 
+# shellcheck source=ci/test/00_setup_env_base_image.sh
+source "$( dirname "${BASH_SOURCE[0]}" )/00_setup_env_base_image.sh"
+
 export HOST=s390x-linux-gnu
 export PACKAGES="python3-zmq"
 export CONTAINER_NAME=ci_s390x
-export CI_IMAGE_NAME_TAG="mirror.gcr.io/ubuntu:24.04"
+ci_set_base_image_name_tag "ubuntu:24.04"
 export CI_IMAGE_PLATFORM="linux/s390x"
 export TEST_RUNNER_EXTRA="--exclude rpc_bind,feature_bind_extra"  # Excluded for now, see https://github.com/bitcoin/bitcoin/issues/17765#issuecomment-602068547
 export RUN_FUNCTIONAL_TESTS=true

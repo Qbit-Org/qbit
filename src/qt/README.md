@@ -1,17 +1,17 @@
-This directory contains the source code for the Bitcoin Core graphical user interface (GUI). It uses the [Qt](https://www1.qt.io/developers/) cross-platform framework.
+This directory contains the source code for the qbit graphical user interface (GUI). It uses the [Qt](https://www1.qt.io/developers/) cross-platform framework.
 
 The current precise version for Qt is specified in [qt_details.mk](/depends/packages/qt_details.mk).
 
 ## Compile and run
 
-See build instructions: [Unix](/doc/build-unix.md), [macOS](/doc/build-osx.md), [Windows](/doc/build-windows-msvc.md), [FreeBSD](/doc/build-freebsd.md), [NetBSD](/doc/build-netbsd.md), [OpenBSD](/doc/build-openbsd.md)
+See build instructions: [Unix](/doc/build/build-unix.md), [macOS](/doc/build/build-osx.md), [Windows](/doc/build/build-windows-msvc.md), [FreeBSD](/doc/build/build-freebsd.md), [NetBSD](/doc/build/build-netbsd.md), [OpenBSD](/doc/build/build-openbsd.md)
 
 When following your systems build instructions, make sure to install the `Qt` dependencies.
 
 To run:
 
 ```sh
-./build/bin/bitcoin-qt
+./build/bin/qbit-qt
 ```
 
 ## Files and Directories
@@ -22,7 +22,7 @@ To run:
 
 #### locale/
 
-- Contains translations. They are periodically updated and an effort is made to support as many languages as possible. The process of contributing translations is described in [doc/translation_process.md](/doc/translation_process.md).
+- Contains translations. They are periodically updated and an effort is made to support as many languages as possible. The process of contributing translations is described in [doc/development/localization/translation_process.md](/doc/development/localization/translation_process.md).
 
 #### res/
 
@@ -34,7 +34,7 @@ To run:
 
 #### bitcoingui.(h/cpp)
 
-- Represents the main window of the Bitcoin UI.
+- Represents the main window of the qbit UI.
 
 #### \*model.(h/cpp)
 
@@ -51,7 +51,7 @@ To run:
 
 #### paymentserver.(h/cpp)
 
-- (Deprecated) Used to process BIP21 payment URI requests. Also handles URI-based application switching (e.g. when following a bitcoin:... link from a browser).
+- (Deprecated) Used to process BIP21 payment URI requests. Also handles URI-based application switching (e.g. when following a qbit:... link from a browser).
 
 #### walletview.(h/cpp)
 
@@ -61,7 +61,7 @@ To run:
 
 * UI elements like BitcoinAmountField, which inherit from QWidget.
 * `bitcoinstrings.cpp`: automatically generated
-* `bitcoinunits.(h/cpp)`: BTC / mBTC / etc. handling
+* `qbitunits.(h/cpp)`: QBT / mQBT / µQBT / bits handling
 * `callback.h`
 * `guiconstants.h`: UI colors, app name, etc.
 * `guiutil.h`: several helper functions
@@ -72,7 +72,7 @@ To run:
 
 See [CONTRIBUTING.md](/CONTRIBUTING.md) for general guidelines.
 
-**Note:** Do not change `local/bitcoin_en.ts`. It is updated [automatically](/doc/translation_process.md#writing-code-with-translations).
+**Note:** Do not change `local/bitcoin_en.ts`. It is updated [automatically](/doc/development/localization/translation_process.md#writing-code-with-translations).
 
 ## Using Qt Creator as an IDE
 
@@ -101,7 +101,7 @@ sudo apt-get install qtcreator
 1. Make sure you've installed all dependencies specified in your systems build instructions
 2. Follow the compile instructions for your system, adding the `-DCMAKE_BUILD_TYPE=Debug` build flag
 3. Start Qt Creator. At the start page, do: `New` -> `Import Project` -> `Import Existing Project`
-4. Enter `bitcoin-qt` as the Project Name and enter the absolute path to `src/qt` as Location
+4. Enter `qbit-qt` as the Project Name and enter the absolute path to `src/qt` as Location
 5. Check over the file selection, you may need to select the `forms` directory (necessary if you intend to edit *.ui files)
 6. Confirm the `Summary` page
 7. In the `Projects` tab, select `Manage Kits...`
@@ -119,6 +119,6 @@ sudo apt-get install qtcreator
  - Under `Compilers`: select `"GCC (x86 64bit in /usr/bin)"`
  - Under `Debuggers`: select `"GDB"` as debugger
 
-8. While in the `Projects` tab, ensure that you have the `bitcoin-qt` executable specified under `Run`
- - If the executable is not specified: click `"Choose..."`, navigate to `build/bin`, and select `bitcoin-qt`
-9. You're all set! Start developing, building, and debugging the Bitcoin Core GUI
+8. While in the `Projects` tab, ensure that you have the `qbit-qt` executable specified under `Run`
+ - If the executable is not specified: click `"Choose..."`, navigate to `build/bin`, and select `qbit-qt`
+9. You're all set! Start developing, building, and debugging the qbit GUI

@@ -8,7 +8,7 @@ Test case is:
 4 nodes. 1 2 and 3 send transactions between each other,
 fourth node is a miner.
 1 2 3 each mine a block to start, then
-Miner creates 100 blocks so 1 2 3 each have 50 mature
+Miner creates 100 blocks so 1 2 3 each have 5 mature
 coins to spend.
 Then 5 iterations of 1/2/3 sending coins amongst
 themselves to get transactions in the wallets,
@@ -21,7 +21,7 @@ Miner then generates 101 more blocks, so any
 transaction fees paid mature.
 
 Sanity check:
-  Sum(1,2,3,4 balances) == 114*50
+  Sum(1,2,3,4 balances) == chainstate total - immature balances
 
 1/2/3 are shutdown, and their wallets erased.
 Then restore using wallet.dat backup. And
@@ -70,9 +70,17 @@ class WalletBackupTest(BitcoinTestFramework):
         self.sync_all()
 
     def one_send(self, from_node, to_address):
-        if (randint(1,2) == 1):
-            amount = Decimal(randint(1,10)) / Decimal(10)
-            self.nodes[from_node].sendtoaddress(to_address, amount)
+        if randint(1,2) != 1:
+            return
+
+        node = self.nodes[from_node]
+        reserve = Decimal("0.01")
+        spendable = node.getbalance()
+        if spendable <= reserve:
+            return
+
+        amount = min(Decimal(randint(1,10)) / Decimal(10), spendable - reserve)
+        node.sendtoaddress(to_address, amount)
 
     def do_one_round(self):
         a0 = self.nodes[0].getnewaddress()
@@ -196,17 +204,16 @@ class WalletBackupTest(BitcoinTestFramework):
         self.log.info("Test loading backup on a pruned node when the backup was created close to the prune height of the restoring node")
         node = self.nodes[3]
         self.restart_node(3, ["-prune=1", "-fastprune=1"])
-        # Ensure the chain tip is at height 214, because this test assume it is.
-        assert_equal(node.getchaintips()[0]["height"], 214)
+        start_height = node.getchaintips()[0]["height"]
         # We need a few more blocks so we can actually get above an realistic
         # minimal prune height
         self.generate(node, 50, sync_fun=self.no_op)
-        # Backup created at block height 264
+        # Backup created at block height start_height + 50
         node.backupwallet(node.datadir_path / 'wallet_pruned.bak')
         # Generate more blocks so we can actually prune the older blocks
         self.generate(node, 300, sync_fun=self.no_op)
-        # This gives us an actual prune height roughly in the range of 220 - 240
-        node.pruneblockchain(250)
+        # Prune just below the backup height to exercise near-prune restore behavior.
+        node.pruneblockchain(start_height + 36)
         # The backup should be updated with the latest height (locator) for
         # the backup to load successfully this close to the prune height
         node.restorewallet('pruned', node.datadir_path / 'wallet_pruned.bak')
@@ -221,13 +228,14 @@ class WalletBackupTest(BitcoinTestFramework):
     def run_test(self):
         self.log.info("Generating initial blockchain")
         self.generate(self.nodes[0], 1)
+        block_subsidy = self.nodes[0].getbalances()["mine"]["immature"]
         self.generate(self.nodes[1], 1)
         self.generate(self.nodes[2], 1)
         self.generate(self.nodes[3], COINBASE_MATURITY)
 
-        assert_equal(self.nodes[0].getbalance(), 50)
-        assert_equal(self.nodes[1].getbalance(), 50)
-        assert_equal(self.nodes[2].getbalance(), 50)
+        assert_equal(self.nodes[0].getbalance(), block_subsidy)
+        assert_equal(self.nodes[1].getbalance(), block_subsidy)
+        assert_equal(self.nodes[2].getbalance(), block_subsidy)
         assert_equal(self.nodes[3].getbalance(), 0)
 
         self.log.info("Creating transactions")
@@ -253,9 +261,9 @@ class WalletBackupTest(BitcoinTestFramework):
         balance3 = self.nodes[3].getbalance()
         total = balance0 + balance1 + balance2 + balance3
 
-        # At this point, there are 214 blocks (103 for setup, then 10 rounds, then 101.)
-        # 114 are mature, so the sum of all wallets should be 114 * 50 = 5700.
-        assert_equal(total, 5700)
+        chainstate_total = self.nodes[3].gettxoutsetinfo()["total_amount"]
+        immature_total = sum((node.getbalances()["mine"]["immature"] for node in self.nodes), start=Decimal("0"))
+        assert_equal(total, chainstate_total - immature_total)
 
         ##
         # Test restoring spender wallets from backups

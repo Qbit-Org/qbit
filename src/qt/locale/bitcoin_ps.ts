@@ -964,7 +964,7 @@ Signing is only possible with addresses of the type 'legacy'.</source>
         <translation type="unfinished">%1 بند شوی)</translation>
     </message>
     <message>
-        <source>Can vary +/- %1 satoshi(s) per input.</source>
+        <source>Can vary +/- %1 bits per input.</source>
         <translation type="unfinished">کېدای شي توپیر ولري +/- %1 ساتوشي(ګانې) پر هره ننوتنه.</translation>
     </message>
     <message>

@@ -110,7 +110,14 @@ if [ "$DOWNLOAD_PREVIOUS_RELEASES" = "true" ]; then
   test/get_previous_releases.py --target-dir "$PREVIOUS_RELEASES_DIR"
 fi
 
-BITCOIN_CONFIG_ALL="-DBUILD_BENCH=ON -DBUILD_FUZZ_BINARY=ON"
+BUILD_BENCH=${BUILD_BENCH:-OFF}
+if [ "$RUN_FUZZ_TESTS" = "true" ]; then
+  BUILD_FUZZ_BINARY=${BUILD_FUZZ_BINARY:-ON}
+else
+  BUILD_FUZZ_BINARY=${BUILD_FUZZ_BINARY:-OFF}
+fi
+
+BITCOIN_CONFIG_ALL="-DBUILD_BENCH=${BUILD_BENCH} -DBUILD_FUZZ_BINARY=${BUILD_FUZZ_BINARY}"
 if [ -z "$NO_DEPENDS" ]; then
   BITCOIN_CONFIG_ALL="${BITCOIN_CONFIG_ALL} -DCMAKE_TOOLCHAIN_FILE=$DEPENDS_DIR/$HOST/toolchain.cmake"
 fi
@@ -145,6 +152,41 @@ cmake --build "${BASE_BUILD_DIR}" "$MAKEJOBS" --target all $GOAL || (
   false
 )
 
+if [ "${HOST}" = "x86_64-w64-mingw32" ]; then
+  WINDOWS_STRIP_COMMAND="$(sed -n 's/^CMAKE_STRIP:FILEPATH=//p' "${BASE_BUILD_DIR}/CMakeCache.txt")"
+  if [ -z "${WINDOWS_STRIP_COMMAND}" ]; then
+    WINDOWS_STRIP_COMMAND="${HOST}-strip"
+  fi
+  if ! command -v "${WINDOWS_STRIP_COMMAND}" >/dev/null 2>&1; then
+    echo "Error: Windows strip command not found: ${WINDOWS_STRIP_COMMAND}" >&2
+    exit 1
+  fi
+
+  WINDOWS_EXE_DIRS=()
+  for dir in "${BASE_BUILD_DIR}/bin" "${BASE_BUILD_DIR}/src/secp256k1/bin" "${BASE_BUILD_DIR}/src/univalue"; do
+    if [ -d "${dir}" ]; then
+      WINDOWS_EXE_DIRS+=("${dir}")
+    fi
+  done
+
+  if [ "${#WINDOWS_EXE_DIRS[@]}" -gt 0 ]; then
+    print_windows_exe_sizes() {
+      find "${WINDOWS_EXE_DIRS[@]}" -maxdepth 1 -type f -name '*.exe' -print0 \
+        | xargs -0 -r du -h \
+        | sort -hr
+    }
+
+    echo "Windows executable sizes before strip:"
+    print_windows_exe_sizes
+
+    find "${WINDOWS_EXE_DIRS[@]}" -maxdepth 1 -type f -name '*.exe' -print0 \
+      | xargs -0 -r "${WINDOWS_STRIP_COMMAND}" --strip-debug
+
+    echo "Windows executable sizes after strip:"
+    print_windows_exe_sizes
+  fi
+fi
+
 bash -c "${PRINT_CCACHE_STATISTICS}"
 if [ "$CI" = "true" ]; then
   hit_rate=$(ccache -s | grep "Hits:" | head -1 | sed 's/.*(\(.*\)%).*/\1/')
@@ -173,23 +215,47 @@ if [ "$RUN_UNIT_TESTS" = "true" ]; then
   CTEST_OUTPUT_ON_FAILURE=ON \
   ctest --test-dir "${BASE_BUILD_DIR}" \
     --stop-on-failure \
-    "${MAKEJOBS}" \
+    -j "${CTEST_JOBS}" \
     --timeout $(( TEST_RUNNER_TIMEOUT_FACTOR * 60 ))
+fi
+
+# Build qbit-photon relay daemon for integration tests.
+# If configure fails due to missing deps (e.g. OpenSSL/ZeroMQ dev headers), skip build.
+# If configure succeeds, build failures are real regressions and should fail CI.
+if [ "$RUN_FUNCTIONAL_TESTS" = "true" ]; then
+  PHOTON_SRC="${BASE_ROOT_DIR}/contrib/photon"
+  PHOTON_BUILD="${PHOTON_SRC}/build"
+  if [ -f "${PHOTON_SRC}/CMakeLists.txt" ]; then
+    if cmake -S "${PHOTON_SRC}" -B "${PHOTON_BUILD}" -DCMAKE_BUILD_TYPE=Release 2>/dev/null; then
+      cmake --build "${PHOTON_BUILD}" "$MAKEJOBS"
+    fi
+  fi
 fi
 
 if [ "$RUN_FUNCTIONAL_TESTS" = "true" ]; then
   # parses TEST_RUNNER_EXTRA as an array which allows for multiple arguments such as TEST_RUNNER_EXTRA='--exclude "rpc_bind.py --ipv6"'
   eval "TEST_RUNNER_EXTRA=($TEST_RUNNER_EXTRA)"
+  TEST_RUNNER_ARGS=(
+    --ci
+    --jobs "${TEST_RUNNER_JOBS}"
+    --tmpdirprefix "${BASE_SCRATCH_DIR}/test_runner/"
+    --ansi
+    --combinedlogslen="${TEST_RUNNER_COMBINED_LOGS_LEN}"
+    --timeout-factor="${TEST_RUNNER_TIMEOUT_FACTOR}"
+  )
+  if [ "${TEST_RUNNER_FAILFAST}" = "true" ]; then
+    TEST_RUNNER_ARGS+=(--failfast)
+  fi
+  if [ -n "${TEST_RUNNER_EXCLUDE}" ]; then
+    TEST_RUNNER_ARGS+=(--exclude "${TEST_RUNNER_EXCLUDE}")
+  fi
+  if [ -n "${TEST_RUNNER_RESULTS_FILE}" ]; then
+    TEST_RUNNER_ARGS+=(--resultsfile "${TEST_RUNNER_RESULTS_FILE}")
+  fi
+  TEST_RUNNER_ARGS+=("${TEST_RUNNER_EXTRA[@]}" --quiet)
   LD_LIBRARY_PATH="${DEPENDS_DIR}/${HOST}/lib" \
   "${BASE_BUILD_DIR}/test/functional/test_runner.py" \
-    --ci "${MAKEJOBS}" \
-    --tmpdirprefix "${BASE_SCRATCH_DIR}/test_runner/" \
-    --ansi \
-    --combinedlogslen=99999999 \
-    --timeout-factor="${TEST_RUNNER_TIMEOUT_FACTOR}" \
-    "${TEST_RUNNER_EXTRA[@]}" \
-    --quiet \
-    --failfast
+    "${TEST_RUNNER_ARGS[@]}"
 fi
 
 if [ "${RUN_TIDY}" = "true" ]; then

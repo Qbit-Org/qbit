@@ -25,7 +25,7 @@ from test_framework.test_framework import BitcoinTestFramework
 
 # Timeouts (in seconds)
 CHAIN_SYNC_TIMEOUT = 20 * 60
-HEADERS_RESPONSE_TIME = 2 * 60
+HEADERS_RESPONSE_TIME = 30
 
 
 class P2POutEvict(BitcoinTestFramework):

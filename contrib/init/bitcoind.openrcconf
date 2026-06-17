@@ -1,4 +1,5 @@
 # /etc/conf.d/bitcoind: config file for /etc/init.d/bitcoind
+# Deprecated: use /etc/conf.d/qbitd with qbitd.openrc.
 
 # Config file location
 #BITCOIND_CONFIGFILE="/etc/bitcoin/bitcoin.conf"
@@ -9,23 +10,23 @@
 # What filename to give the pidfile
 #BITCOIND_PIDFILE="${BITCOIND_PIDDIR}/bitcoind.pid"
 
-# Where to write bitcoind data (be mindful that the blockchain is large)
+# Where to write qbit data (be mindful that the blockchain is large)
 #BITCOIND_DATADIR="/var/lib/bitcoind"
 
-# User and group to own bitcoind process
+# User and group to own the deprecated compatibility daemon process
 #BITCOIND_USER="bitcoin"
 #BITCOIND_GROUP="bitcoin"
 
-# Path to bitcoind executable
+# Path to deprecated compatibility daemon executable
 #BITCOIND_BIN="/usr/bin/bitcoind"
 
-# Nice value to run bitcoind under
+# Nice value to run the deprecated compatibility daemon under
 #BITCOIND_NICE=0
 
 # Additional options (avoid -conf and -datadir, use flags above)
 #BITCOIND_OPTS=""
 
-# The timeout in seconds OpenRC will wait for bitcoind to terminate
+# The timeout in seconds OpenRC will wait for the deprecated compatibility daemon to terminate
 # after a SIGTERM has been raised.
 # Note that this will be mapped as argument to start-stop-daemon's
 # '--retry' option, which means you can specify a retry schedule

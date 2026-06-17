@@ -3,8 +3,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_STREAMS_H
-#define BITCOIN_STREAMS_H
+#ifndef QBIT_STREAMS_H
+#define QBIT_STREAMS_H
 
 #include <logging.h>
 #include <serialize.h>
@@ -698,4 +698,4 @@ public:
     }
 };
 
-#endif // BITCOIN_STREAMS_H
+#endif // QBIT_STREAMS_H

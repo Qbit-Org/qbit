@@ -9,6 +9,7 @@
 #include <consensus/consensus.h>
 #include <consensus/validation.h>
 #include <key_io.h>
+#include <outputtype.h>
 #include <script/descriptor.h>
 #include <script/script.h>
 #include <script/solver.h>
@@ -162,7 +163,7 @@ void ScriptToUniv(const CScript& script, UniValue& out, bool include_hex, bool i
     std::vector<std::vector<unsigned char>> solns;
     const TxoutType type{Solver(script, solns)};
 
-    if (include_address && ExtractDestination(script, address) && type != TxoutType::PUBKEY) {
+    if (include_address && ExtractDestination(script, address) && type != TxoutType::PUBKEY && IsDestinationOutputTypeAllowed(address)) {
         out.pushKV("address", EncodeDestination(address));
     }
     out.pushKV("type", GetTxnOutputType(type));

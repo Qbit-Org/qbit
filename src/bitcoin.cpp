@@ -21,26 +21,26 @@ const TranslateFn G_TRANSLATION_FUN{nullptr};
 static constexpr auto HELP_USAGE = R"(Usage: %s [OPTIONS] COMMAND...
 
 Options:
-  -m, --multiprocess     Run multiprocess binaries bitcoin-node, bitcoin-gui.
-  -M, --monolithic       Run monolithic binaries bitcoind, bitcoin-qt. (Default behavior)
+  -m, --multiprocess     Run multiprocess binaries qbit-node, qbit-gui.
+  -M, --monolithic       Run monolithic binaries qbitd, qbit-qt. (Default behavior)
   -v, --version          Show version information
   -h, --help             Show full help message
 
 Commands:
-  gui [ARGS]     Start GUI, equivalent to running 'bitcoin-qt [ARGS]' or 'bitcoin-gui [ARGS]'.
-  node [ARGS]    Start node, equivalent to running 'bitcoind [ARGS]' or 'bitcoin-node [ARGS]'.
-  rpc [ARGS]     Call RPC method, equivalent to running 'bitcoin-cli -named [ARGS]'.
-  wallet [ARGS]  Call wallet command, equivalent to running 'bitcoin-wallet [ARGS]'.
-  tx [ARGS]      Manipulate hex-encoded transactions, equivalent to running 'bitcoin-tx [ARGS]'.
+  gui [ARGS]     Start GUI, equivalent to running 'qbit-qt [ARGS]' or 'qbit-gui [ARGS]'.
+  node [ARGS]    Start node, equivalent to running 'qbitd [ARGS]' or 'qbit-node [ARGS]'.
+  rpc [ARGS]     Call RPC method, equivalent to running 'qbit-cli -named [ARGS]'.
+  wallet [ARGS]  Call wallet command, equivalent to running 'qbit-wallet [ARGS]'.
+  tx [ARGS]      Manipulate hex-encoded transactions, equivalent to running 'qbit-tx [ARGS]'.
   help           Show full help message.
 )";
 
 static constexpr auto HELP_FULL = R"(
 Additional less commonly used commands:
-  bench [ARGS]      Run bench command, equivalent to running 'bench_bitcoin [ARGS]'.
-  chainstate [ARGS] Run bitcoin kernel chainstate util, equivalent to running 'bitcoin-chainstate [ARGS]'.
-  test [ARGS]       Run unit tests, equivalent to running 'test_bitcoin [ARGS]'.
-  test-gui [ARGS]   Run GUI unit tests, equivalent to running 'test_bitcoin-qt [ARGS]'.
+  bench [ARGS]      Run bench command, equivalent to running 'bench_qbit [ARGS]'.
+  chainstate [ARGS] Run qbit kernel chainstate util, equivalent to running 'qbit-chainstate [ARGS]'.
+  test [ARGS]       Run unit tests, equivalent to running 'test_qbit [ARGS]'.
+  test-gui [ARGS]   Run GUI unit tests, equivalent to running 'test_qbit-qt [ARGS]'.
 )";
 
 static constexpr auto HELP_SHORT = R"(
@@ -80,12 +80,12 @@ int main(int argc, char* argv[])
                 return EXIT_FAILURE;
             }
         } else if (cmd.command == "gui") {
-            args.emplace_back(UseMultiprocess(cmd) ? "bitcoin-gui" : "bitcoin-qt");
+            args.emplace_back(UseMultiprocess(cmd) ? "qbit-gui" : "qbit-qt");
         } else if (cmd.command == "node") {
-            args.emplace_back(UseMultiprocess(cmd) ? "bitcoin-node" : "bitcoind");
+            args.emplace_back(UseMultiprocess(cmd) ? "qbit-node" : "qbitd");
         } else if (cmd.command == "rpc") {
-            args.emplace_back("bitcoin-cli");
-            // Since "bitcoin rpc" is a new interface that doesn't need to be
+            args.emplace_back("qbit-cli");
+            // Since "qbit rpc" is a new interface that doesn't need to be
             // backward compatible, enable -named by default so it is convenient
             // for callers to use a mix of named and unnamed parameters. Callers
             // can override this by specifying -nonamed, but should not need to
@@ -93,19 +93,19 @@ int main(int argc, char* argv[])
             // as unnamed parameters.
             args.emplace_back("-named");
         } else if (cmd.command == "wallet") {
-            args.emplace_back("bitcoin-wallet");
+            args.emplace_back("qbit-wallet");
         } else if (cmd.command == "tx") {
-            args.emplace_back("bitcoin-tx");
+            args.emplace_back("qbit-tx");
         } else if (cmd.command == "bench") {
-            args.emplace_back("bench_bitcoin");
+            args.emplace_back("bench_qbit");
         } else if (cmd.command == "chainstate") {
-            args.emplace_back("bitcoin-chainstate");
+            args.emplace_back("qbit-chainstate");
         } else if (cmd.command == "test") {
-            args.emplace_back("test_bitcoin");
+            args.emplace_back("test_qbit");
         } else if (cmd.command == "test-gui") {
-            args.emplace_back("test_bitcoin-qt");
+            args.emplace_back("test_qbit-qt");
         } else if (cmd.command == "util") {
-            args.emplace_back("bitcoin-util");
+            args.emplace_back("qbit-util");
         } else {
             throw std::runtime_error(strprintf("Unrecognized command: '%s'", cmd.command));
         }
@@ -169,12 +169,12 @@ bool UseMultiprocess(const CommandLine& cmd)
     return args.IsArgSet("-ipcbind") || args.IsArgSet("-ipcconnect") || args.IsArgSet("-ipcfd");
 }
 
-//! Execute the specified bitcoind, bitcoin-qt or other command line in `args`
+//! Execute the specified qbitd, qbit-qt or other command line in `args`
 //! using src, bin and libexec directory paths relative to this executable, where
 //! the path to this executable is specified in `wrapper_argv0`.
 //!
 //! @param args Command line arguments to execute, where first argument should
-//!             be a relative path to a bitcoind, bitcoin-qt or other executable
+//!             be a relative path to a qbitd, qbit-qt or other executable
 //!             that will be located on the PATH or relative to wrapper_argv0.
 //!
 //! @param wrapper_argv0 String containing first command line argument passed to
@@ -185,7 +185,7 @@ bool UseMultiprocess(const CommandLine& cmd)
 //! @note This function doesn't currently print anything but can be debugged
 //! from the command line using strace or dtrace like:
 //!
-//!     strace -e trace=execve -s 10000 build/bin/bitcoin ...
+//!     strace -e trace=execve -s 10000 build/bin/qbit ...
 //!     dtrace -n 'proc:::exec-success  /pid == $target/ { trace(curpsinfo->pr_psargs); }' -c ...
 static void ExecCommand(const std::vector<const char*>& args, std::string_view wrapper_argv0)
 {

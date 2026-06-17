@@ -3,8 +3,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or https://opensource.org/license/mit.
 
-#ifndef BITCOIN_UNIVALUE_INCLUDE_UNIVALUE_ESCAPES_H
-#define BITCOIN_UNIVALUE_INCLUDE_UNIVALUE_ESCAPES_H
+#ifndef QBIT_UNIVALUE_INCLUDE_UNIVALUE_ESCAPES_H
+#define QBIT_UNIVALUE_INCLUDE_UNIVALUE_ESCAPES_H
 static const char *escapes[256] = {
 	"\\u0000",
 	"\\u0001",
@@ -263,4 +263,4 @@ static const char *escapes[256] = {
 	nullptr,
 	nullptr,
 };
-#endif // BITCOIN_UNIVALUE_INCLUDE_UNIVALUE_ESCAPES_H
+#endif // QBIT_UNIVALUE_INCLUDE_UNIVALUE_ESCAPES_H

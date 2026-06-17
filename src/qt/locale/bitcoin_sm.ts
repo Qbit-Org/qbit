@@ -957,8 +957,8 @@ Signing is only possible with addresses of the type 'legacy'.</source>
         <translation type="unfinished">(%1 loka)</translation>
     </message>
     <message>
-        <source>Can vary +/- %1 satoshi(s) per input.</source>
-        <translation type="unfinished">E mafai ona suia +/- %1 satoshi(s) i le ulufale taitasi.</translation>
+        <source>Can vary +/- %1 bits per input.</source>
+        <translation type="unfinished">E mafai ona suia +/- %1 bits i le ulufale taitasi.</translation>
     </message>
     <message>
         <source>(no label)</source>

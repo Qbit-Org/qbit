@@ -123,7 +123,8 @@ script will exit.
 gen-manpages.py
 ===============
 
-A small script to automatically create manpages in ../../doc/man by running the release binaries with the -help option.
+A small script to automatically create qbit manpages by running the qbit
+release binaries with the -help option.
 This requires help2man which can be found at: https://www.gnu.org/software/help2man/
 
 This script assumes a build directory named `build` as suggested by example build documentation.
@@ -144,11 +145,14 @@ options, as all its configuration is set at the top of the file. It runs many ti
 pypy3 contrib/devtools/headerssync-params.py
 ```
 
-gen-bitcoin-conf.sh
-===================
+gen-qbit-conf.sh
+================
 
-Generates a bitcoin.conf file in `share/examples/` by parsing the output from `bitcoind --help`. This script is run during the
-release process to include a bitcoin.conf with the release binaries and can also be run by users to generate a file locally.
+Generates a `qbit.conf` file in `share/examples/` by parsing the output from
+`qbitd --help`. This script is run during the release process to include a
+`qbit.conf` with the release binaries and can also be run by users to
+generate a file locally. `gen-bitcoin-conf.sh` is retained as a compatibility
+wrapper for one release.
 When generating a file as part of the release process, make sure to commit the changes after running the script.
 
 This script assumes a build directory named `build` as suggested by example build documentation.
@@ -156,7 +160,7 @@ To use it with a different build directory, set `BUILDDIR`.
 For example:
 
 ```bash
-BUILDDIR=$PWD/my-build-dir contrib/devtools/gen-bitcoin-conf.sh
+BUILDDIR=$PWD/my-build-dir contrib/devtools/gen-qbit-conf.sh
 ```
 
 circular-dependencies.py
@@ -169,3 +173,29 @@ Example usage:
 
     cd .../src
     ../contrib/devtools/circular-dependencies.py {*,*/*,*/*/*}.{h,cpp}
+
+update-libbitcoinpqc-subtree.sh
+===============================
+
+Updates the `src/libbitcoinpqc` subtree from the curated upstream branch
+(`qbit-subtree` by default), then runs `test/lint/git-subtree-check.sh` to
+verify the subtree remains pure.
+Default source resolves from the local `origin` owner to
+`git@github.com:<owner>/libbitcoinpqc-qbit.git`.
+
+For the full two-repo workflow (`develop` -> prune -> `qbit-subtree` -> qbit
+import), see [`doc/subtrees/libbitcoinpqc.md`](../../doc/subtrees/libbitcoinpqc.md).
+
+Run from the repository root:
+
+```bash
+contrib/devtools/update-libbitcoinpqc-subtree.sh
+```
+
+Optional overrides:
+
+```bash
+LIBBITCOINPQC_REMOTE_URL=git@github.com:your-org/libbitcoinpqc-qbit.git \
+LIBBITCOINPQC_REMOTE_REF=qbit-subtree \
+contrib/devtools/update-libbitcoinpqc-subtree.sh
+```

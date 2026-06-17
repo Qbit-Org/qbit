@@ -3,8 +3,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_SUPPORT_ALLOCATORS_SECURE_H
-#define BITCOIN_SUPPORT_ALLOCATORS_SECURE_H
+#ifndef QBIT_SUPPORT_ALLOCATORS_SECURE_H
+#define QBIT_SUPPORT_ALLOCATORS_SECURE_H
 
 #include <support/lockedpool.h>
 #include <support/cleanse.h>
@@ -81,4 +81,4 @@ secure_unique_ptr<T> make_secure_unique(Args&&... as)
     }
 }
 
-#endif // BITCOIN_SUPPORT_ALLOCATORS_SECURE_H
+#endif // QBIT_SUPPORT_ALLOCATORS_SECURE_H

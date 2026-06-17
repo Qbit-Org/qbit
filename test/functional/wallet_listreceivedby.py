@@ -26,6 +26,9 @@ class ReceivedByTest(BitcoinTestFramework):
         self.skip_if_no_cli()
 
     def run_test(self):
+        # Ensure sender wallet has mature spendable balance on custom chain params.
+        self.ensure_mature_coinbase(self.nodes[0])
+
         # save the number of coinbase reward addresses so far
         num_cb_reward_addresses = len(self.nodes[1].listreceivedbyaddress(minconf=0, include_empty=True))
 
@@ -176,9 +179,8 @@ class ReceivedByTest(BitcoinTestFramework):
         label = "label"
         address = self.nodes[0].getnewaddress(label)
 
-        reward = Decimal("25")
-        self.generatetoaddress(self.nodes[0], 1, address)
-        hash = self.nodes[0].getbestblockhash()
+        block_hash = self.generatetoaddress(self.nodes[0], 1, address)[0]
+        reward = self.nodes[0].getblock(block_hash, 2)["tx"][0]["vout"][0]["value"]
 
         self.log.info("getreceivedbyaddress returns nothing with defaults")
         balance = self.nodes[0].getreceivedbyaddress(address)
@@ -238,7 +240,7 @@ class ReceivedByTest(BitcoinTestFramework):
                             {"label": label, "amount": reward})
 
         self.log.info("Invalidate block that paid to address")
-        self.nodes[0].invalidateblock(hash)
+        self.nodes[0].invalidateblock(block_hash)
 
         self.log.info("getreceivedbyaddress does not include invalidated block when minconf is 0 when including immature coinbase")
         balance = self.nodes[0].getreceivedbyaddress(address=address, minconf=0, include_immature_coinbase=True)

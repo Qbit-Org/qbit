@@ -3,8 +3,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_PROTOCOL_H
-#define BITCOIN_PROTOCOL_H
+#ifndef QBIT_PROTOCOL_H
+#define QBIT_PROTOCOL_H
 
 #include <kernel/messagestartchars.h> // IWYU pragma: export
 #include <netaddress.h>
@@ -329,6 +329,13 @@ enum ServiceFlags : uint64_t {
     // NODE_P2P_V2 means the node supports BIP324 transport
     NODE_P2P_V2 = (1 << 11),
 
+    // NODE_WITNESS_PRUNED means the node may not serve historical witness data.
+    NODE_WITNESS_PRUNED = (1 << 12),
+
+    // NODE_ARCHIVE means the node can serve historical blocks and witness data needed for
+    // archive/full-validation bootstrap.
+    NODE_ARCHIVE = (1 << 13),
+
     // Bits 24-31 are reserved for temporary experiments. Just pick a bit that
     // isn't getting used, or one not being used much, and notify the
     // bitcoin-development mailing list. Remember that service bits are just
@@ -351,7 +358,7 @@ std::vector<std::string> serviceFlagsToStr(uint64_t flags);
  * should be updated appropriately to filter for nodes with
  * desired service flags (compatible with our new flags).
  */
-constexpr ServiceFlags SeedsServiceFlags() { return ServiceFlags(NODE_NETWORK | NODE_WITNESS); }
+constexpr ServiceFlags SeedsServiceFlags() { return ServiceFlags(NODE_NETWORK | NODE_WITNESS | NODE_ARCHIVE); }
 
 /**
  * Checks if a peer with the given service flags may be capable of having a
@@ -528,4 +535,4 @@ public:
 /** Convert a TX/WITNESS_TX/WTX CInv to a GenTxid. */
 GenTxid ToGenTxid(const CInv& inv);
 
-#endif // BITCOIN_PROTOCOL_H
+#endif // QBIT_PROTOCOL_H

@@ -7,9 +7,11 @@ add_subdirectory(util)
 add_executable(fuzz
   addition_overflow.cpp
   addrman.cpp
+  asert.cpp
   asmap.cpp
   asmap_direct.cpp
   autofile.cpp
+  auxpow.cpp
   banman.cpp
   base_encode_decode.cpp
   bech32.cpp
@@ -76,6 +78,7 @@ add_executable(fuzz
   p2p_handshake.cpp
   p2p_headers_presync.cpp
   p2p_transport_serialization.cpp
+  p2mr_script.cpp
   pcp.cpp
   package_eval.cpp
   parse_hd_keypath.cpp
@@ -88,6 +91,7 @@ add_executable(fuzz
   policy_estimator_io.cpp
   poolresource.cpp
   pow.cpp
+  pqc.cpp
   prevector.cpp
   primitives_transaction.cpp
   process_message.cpp
@@ -140,6 +144,7 @@ target_link_libraries(fuzz
   test_fuzz
   bitcoin_cli
   bitcoin_common
+  bitcoinpqc
   bitcoin_util
   minisketch
   leveldb
@@ -148,6 +153,22 @@ target_link_libraries(fuzz
   Boost::headers
   libevent::extra
 )
+
+if(BUILD_TESTS)
+  set(REQUIRED_FUZZ_TARGET_ARGS
+    ${PROJECT_SOURCE_DIR}/test/fuzz/verify_required_targets.py
+    --mapping-file ${PROJECT_SOURCE_DIR}/test/fuzz/shared_target_mappings.json
+    --fuzz-binary $<TARGET_FILE:fuzz>
+  )
+  if(ENABLE_WALLET)
+    list(APPEND REQUIRED_FUZZ_TARGET_ARGS --enabled-feature wallet)
+  endif()
+  add_test(
+    NAME required_fuzz_targets
+    COMMAND ${Python3_EXECUTABLE}
+            ${REQUIRED_FUZZ_TARGET_ARGS}
+  )
+endif()
 
 if(ENABLE_WALLET)
   add_subdirectory(${PROJECT_SOURCE_DIR}/src/wallet/test/fuzz wallet)

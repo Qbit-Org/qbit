@@ -25,6 +25,7 @@ import types
 
 from .address import create_deterministic_address_bcrt1_p2tr_op_true
 from .authproxy import JSONRPCException
+from .blocktools import COINBASE_MATURITY
 from . import coverage
 from .p2p import NetworkThread
 from .test_node import TestNode
@@ -52,6 +53,8 @@ TEST_EXIT_FAILED = 1
 TEST_EXIT_SKIPPED = 77
 
 TMPDIR_PREFIX = "bitcoin_func_test_"
+CACHE_CHAIN_HEIGHT = "199"
+CACHE_READY_MARKER = ".cache_ready"
 
 
 class SkipTest(Exception):
@@ -108,7 +111,17 @@ class Binaries:
         bin_dir is set (by tests calling binaries from previous releases) it
         always uses the direct path."""
         if self.bin_dir is not None:
-            return [os.path.join(self.bin_dir, os.path.basename(bin_path))]
+            prev_release_binary = {
+                "node": "bitcoind",
+                "rpc": "bitcoin-cli",
+                "tx": "bitcoin-tx",
+                "util": "bitcoin-util",
+                "wallet": "bitcoin-wallet",
+                "chainstate": "bitcoin-chainstate",
+            }.get(command, os.path.basename(bin_path))
+            if "." in os.path.basename(bin_path) and "." not in prev_release_binary:
+                prev_release_binary = prev_release_binary + os.path.splitext(bin_path)[1]
+            return [os.path.join(self.bin_dir, prev_release_binary)]
         elif self.paths.bitcoin_cmd is not None or need_ipc:
             # If the current test needs IPC functionality, use the bitcoin
             # wrapper binary and append -m so it calls multiprocess binaries.
@@ -282,23 +295,44 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
 
         paths = types.SimpleNamespace()
         binaries = {
-            "bitcoin": "BITCOIN_BIN",
-            "bitcoind": "BITCOIND",
-            "bitcoin-cli": "BITCOINCLI",
-            "bitcoin-util": "BITCOINUTIL",
-            "bitcoin-tx": "BITCOINTX",
-            "bitcoin-chainstate": "BITCOINCHAINSTATE",
-            "bitcoin-wallet": "BITCOINWALLET",
+            "bitcoin_bin": ("qbit", "QBIT_BIN", "bitcoin", "BITCOIN_BIN"),
+            "bitcoind": ("qbitd", "QBITD", "bitcoind", "BITCOIND"),
+            "bitcoincli": ("qbit-cli", "QBITCLI", "bitcoin-cli", "BITCOINCLI"),
+            "bitcoinutil": ("qbit-util", "QBITUTIL", "bitcoin-util", "BITCOINUTIL"),
+            "bitcointx": ("qbit-tx", "QBITTX", "bitcoin-tx", "BITCOINTX"),
+            "bitcoinchainstate": ("qbit-chainstate", "QBITCHAINSTATE", "bitcoin-chainstate", "BITCOINCHAINSTATE"),
+            "bitcoinwallet": ("qbit-wallet", "QBITWALLET", "bitcoin-wallet", "BITCOINWALLET"),
         }
         # Set paths to bitcoin core binaries allowing overrides with environment
         # variables.
-        for binary, env_variable_name in binaries.items():
-            default_filename = os.path.join(
+        for path_attr, (qbit_binary, qbit_env, legacy_binary, legacy_env) in binaries.items():
+            qbit_default_filename = os.path.join(
                 self.config["environment"]["BUILDDIR"],
                 "bin",
-                binary + self.config["environment"]["EXEEXT"],
+                qbit_binary + self.config["environment"]["EXEEXT"],
             )
-            setattr(paths, env_variable_name.lower(), os.getenv(env_variable_name, default=default_filename))
+            legacy_default_filename = os.path.join(
+                self.config["environment"]["BUILDDIR"],
+                "bin",
+                legacy_binary + self.config["environment"]["EXEEXT"],
+            )
+            qbit_env_path = os.getenv(qbit_env)
+            legacy_env_path = os.getenv(legacy_env)
+
+            if qbit_env_path:
+                # Respect explicit QBIT* environment overrides even if they are invalid,
+                # so path typos fail loudly instead of silently falling back.
+                selected_path = qbit_env_path
+            elif os.path.isfile(qbit_default_filename):
+                selected_path = qbit_default_filename
+            elif legacy_env_path:
+                selected_path = legacy_env_path
+            elif os.path.isfile(legacy_default_filename):
+                selected_path = legacy_default_filename
+            else:
+                selected_path = qbit_default_filename
+
+            setattr(paths, path_attr, selected_path)
         # BITCOIN_CMD environment variable can be specified to invoke bitcoin
         # wrapper binary instead of other executables.
         paths.bitcoin_cmd = shlex.split(os.getenv("BITCOIN_CMD", "")) or None
@@ -671,15 +705,26 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
         if not wait_for_connect:
             return
 
-        # Use subversion as peer id. Test nodes have their node number appended to the user agent string
+        # Use subversion as peer id. Test nodes have their node number appended to
+        # the user agent string. Keep a fallback to testnode<N> matching because
+        # mixed-version peers may format subversion slightly differently.
         from_connection_subver = from_connection.getnetworkinfo()['subversion']
         to_connection_subver = to_connection.getnetworkinfo()['subversion']
 
-        def find_conn(node, peer_subversion, inbound):
-            return next(filter(lambda peer: peer['subver'] == peer_subversion and peer['inbound'] == inbound, node.getpeerinfo()), None)
+        def find_conn(node, peer_subversion, peer_idx, inbound):
+            marker = f"testnode{peer_idx}"
 
-        self.wait_until(lambda: find_conn(from_connection, to_connection_subver, inbound=False) is not None)
-        self.wait_until(lambda: find_conn(to_connection, from_connection_subver, inbound=True) is not None)
+            for peer in node.getpeerinfo():
+                if peer['inbound'] != inbound:
+                    continue
+                if peer.get('subver') == peer_subversion:
+                    return peer
+                if marker in peer.get('subver', ''):
+                    return peer
+            return None
+
+        self.wait_until(lambda: find_conn(from_connection, to_connection_subver, to_connection.index, inbound=False) is not None)
+        self.wait_until(lambda: find_conn(to_connection, from_connection_subver, from_connection.index, inbound=True) is not None)
 
         def check_bytesrecv(peer, msg_type, min_bytes_recv):
             assert peer is not None, "Error: peer disconnected"
@@ -691,8 +736,8 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
         #
         # As the flag fSuccessfullyConnected is not exposed, check it by
         # waiting for a pong, which can only happen after the flag was set.
-        self.wait_until(lambda: check_bytesrecv(find_conn(from_connection, to_connection_subver, inbound=False), 'pong', 29))
-        self.wait_until(lambda: check_bytesrecv(find_conn(to_connection, from_connection_subver, inbound=True), 'pong', 29))
+        self.wait_until(lambda: check_bytesrecv(find_conn(from_connection, to_connection_subver, to_connection.index, inbound=False), 'pong', 29))
+        self.wait_until(lambda: check_bytesrecv(find_conn(to_connection, from_connection_subver, from_connection.index, inbound=True), 'pong', 29))
 
     def disconnect_nodes(self, a, b):
         def disconnect_nodes_helper(node_a, node_b):
@@ -748,6 +793,20 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
         blocks = generator.generate(*args, called_by_framework=True, **kwargs)
         sync_fun() if sync_fun else self.sync_all()
         return blocks
+
+    def ensure_minimum_chain_height(self, node, min_height, *, sync_fun=None):
+        current_height = node.getblockcount()
+        if current_height < min_height:
+            self.generate(node, min_height - current_height, sync_fun=sync_fun)
+
+    def ensure_cached_coinbase_mature(self, node, *, sync_fun=None):
+        # Cached MiniWallet coinbases are in blocks 76-100.
+        # Ensure the newest cached coinbase (height 100) is mature.
+        self.ensure_minimum_chain_height(node, COINBASE_MATURITY + 99, sync_fun=sync_fun)
+
+    def ensure_mature_coinbase(self, node, *, extra_blocks=1, sync_fun=None):
+        # Ensure at least one coinbase output is spendable by reaching maturity.
+        self.ensure_minimum_chain_height(node, COINBASE_MATURITY + extra_blocks, sync_fun=sync_fun)
 
     def generateblock(self, generator, *args, sync_fun=None, **kwargs):
         blocks = generator.generateblock(*args, called_by_framework=True, **kwargs)
@@ -877,7 +936,19 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
 
         CACHE_NODE_ID = 0  # Use node 0 to create the cache for all other nodes
         cache_node_dir = get_datadir_path(self.options.cachedir, CACHE_NODE_ID)
+        cache_ready_marker = os.path.join(cache_node_dir, CACHE_READY_MARKER)
         assert self.num_nodes <= MAX_NODES
+
+        def cache_is_ready():
+            try:
+                with open(cache_ready_marker, encoding="utf-8") as marker:
+                    return marker.read().strip() == CACHE_CHAIN_HEIGHT
+            except OSError:
+                return False
+
+        if os.path.isdir(cache_node_dir) and not cache_is_ready():
+            self.log.debug("Removing incomplete cache directory {}".format(cache_node_dir))
+            shutil.rmtree(cache_node_dir)
 
         if not os.path.isdir(cache_node_dir):
             self.log.debug("Creating cache directory {}".format(cache_node_dir))
@@ -889,7 +960,7 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
                     cache_node_dir,
                     chain=self.chain,
                     extra_conf=["bind=127.0.0.1"],
-                    extra_args=[],
+                    extra_args=["-p2mronly=0"] if self.chain == "regtest" else [],
                     rpchost=None,
                     timewait=self.rpc_timeout,
                     timeout_factor=self.options.timeout_factor,
@@ -923,6 +994,8 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
                 )
 
             assert_equal(cache_node.getblockchaininfo()["blocks"], 199)
+            with open(cache_ready_marker, "w", encoding="utf-8") as marker:
+                marker.write(CACHE_CHAIN_HEIGHT + "\n")
 
             # Shut it down, and clean up cache directories:
             self.stop_nodes()
@@ -940,7 +1013,7 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
             self.log.debug("Copy cache directory {} to node {}".format(cache_node_dir, i))
             to_dir = get_datadir_path(self.options.tmpdir, i)
             shutil.copytree(cache_node_dir, to_dir)
-            initialize_datadir(self.options.tmpdir, i, self.chain, self.disable_autoconnect)  # Overwrite port/rpcport in bitcoin.conf
+            initialize_datadir(self.options.tmpdir, i, self.chain, self.disable_autoconnect)  # Overwrite port/rpcport in qbit.conf
 
     def _initialize_chain_clean(self):
         """Initialize empty blockchain for use by the test.
@@ -1044,6 +1117,17 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
         """Skip the running test if previous releases are not available."""
         if not self.has_previous_releases():
             raise SkipTest("previous releases not available or disabled")
+
+    def skip_if_previous_release_chain_mismatch(self):
+        """Skip if previous-release nodes are for a different chain."""
+        current_node = next((node for node in self.nodes if node.version is None), None)
+        if current_node is None:
+            return
+
+        current_genesis = current_node.getblockhash(0)
+        for node in self.nodes:
+            if node.version is not None and node.getblockhash(0) != current_genesis:
+                raise SkipTest("previous release uses an incompatible regtest genesis block")
 
     def has_previous_releases(self):
         """Checks whether previous releases are present and enabled."""

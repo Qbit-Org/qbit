@@ -1023,7 +1023,7 @@ Podpisywanie jest możliwe tylko z adresami typu „legacy”.</translation>
         <translation type="unfinished">(%1 zablokowane)</translation>
     </message>
     <message>
-        <source>Can vary +/- %1 satoshi(s) per input.</source>
+        <source>Can vary +/- %1 bits per input.</source>
         <translation type="unfinished">Waha się +/- %1 satoshi na wejście.</translation>
     </message>
     <message>
@@ -2988,13 +2988,13 @@ Aby uzyskać więcej informacji na temat używania tej konsoli wpisz %6.
     <message>
         <source>Specify a custom fee per kB (1,000 bytes) of the transaction's virtual size.
 
-Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 satoshis per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 satoshis.</source>
+Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 bits per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 bits.</source>
         <translation type="unfinished">Określ niestandardową opłatę za kB (1000 bajtów) wirtualnego rozmiaru transakcji.
 
 Uwaga: Ponieważ opłata jest naliczana za każdy bajt, opłata "100 satoshi za kvB" w przypadku transakcji o wielkości 500 bajtów (połowa 1 kvB) ostatecznie da opłatę w wysokości tylko 50 satoshi.</translation>
     </message>
     <message>
-        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for bitcoin transactions than the network can process.</source>
+        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for qbit transactions than the network can process.</source>
         <translation type="unfinished">Gdy ilość transakcji jest mniejsza niż ilość miejsca w bloku, górnicy i węzły przekazujące wymagają minimalnej opłaty. Zapłata tylko tej wartości jest dopuszczalna, lecz może skutkować transakcją która nigdy nie zostanie potwierdzona w sytuacji, gdy ilość transakcji przekroczy przepustowość sieci.</translation>
     </message>
     <message>
@@ -3281,7 +3281,7 @@ Uwaga: Ponieważ opłata jest naliczana za każdy bajt, opłata "100 satoshi za 
         <translation type="unfinished">Kwota do wysłania w wybranej jednostce</translation>
     </message>
     <message>
-        <source>The fee will be deducted from the amount being sent. The recipient will receive less bitcoins than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
+        <source>The fee will be deducted from the amount being sent. The recipient will receive less QBT than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
         <translation type="unfinished">Opłata zostanie odjęta od kwoty wysyłanej. Odbiorca otrzyma mniej bitcoinów, niż wpiszesz w polu kwoty. Jeśli wybrano wielu odbiorców, opłata zostanie podzielona równo.</translation>
     </message>
     <message>
@@ -4036,8 +4036,8 @@ Przejdź do Plik &gt; Otwórz Portfel aby wgrać portfel.
         <translation type="unfinished">%s nie zdołał zwalidować stanu migawki -assumeutxo. Wskazuje to na problem ze sprzętem, błąd w oprogramowaniu lub nieprawidłową modyfikacją programu, która zezwoliła na załadowanie nieprawidłowej migawki. Z tego powodu węzeł zostanie zamknięty i przestanie używać danych zbudowanych na bazie migawki, resetując wysokość łańcucha z %d do %d. Po ponownym uruchomieniu, węzeł wznowi synchronizację od %d, bez wykorzystania jakichkolwiek danych z migawki. Prosimy zgłosić ten incydent do %s, wliczając w to jak wszedłeś w posiadanie tej migawki. Nieprawidłowy stan łańcucha w oparciu o tą migawkę zostanie zachowany na dysku w przypadku, gdyby okazał się przydatny w diagnostyce problemu, który spowodował ten błąd.</translation>
     </message>
     <message>
-        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/p2p-bad-ports.md for details and a full list.</source>
-        <translation type="unfinished">%s żąda nasłuchiwania na porcie %u. Ten port jest uznany za "zły" i nie jest zbyt prawdopodobne, aby jakikolwiek węzeł połączył się do niego. Zobacz doc/p2p-bad-ports.md, aby dowiedzieć się więcej i zobaczyć pełną listę.</translation>
+        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/reference/p2p-bad-ports.md for details and a full list.</source>
+        <translation type="unfinished">%s żąda nasłuchiwania na porcie %u. Ten port jest uznany za "zły" i nie jest zbyt prawdopodobne, aby jakikolwiek węzeł połączył się do niego. Zobacz doc/reference/p2p-bad-ports.md, aby dowiedzieć się więcej i zobaczyć pełną listę.</translation>
     </message>
     <message>
         <source>Disk space for %s may not accommodate the block files. Approximately %u GB of data will be stored in this directory.</source>

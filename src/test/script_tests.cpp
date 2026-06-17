@@ -82,6 +82,7 @@ static ScriptErrorDesc script_errors[]={
     {SCRIPT_ERR_CLEANSTACK, "CLEANSTACK"},
     {SCRIPT_ERR_MINIMALIF, "MINIMALIF"},
     {SCRIPT_ERR_SIG_NULLFAIL, "NULLFAIL"},
+    {SCRIPT_ERR_P2MR_CHECKSIG, "P2MR_CHECKSIG"},
     {SCRIPT_ERR_DISCOURAGE_UPGRADABLE_NOPS, "DISCOURAGE_UPGRADABLE_NOPS"},
     {SCRIPT_ERR_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM, "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM"},
     {SCRIPT_ERR_WITNESS_PROGRAM_WRONG_LENGTH, "WITNESS_PROGRAM_WRONG_LENGTH"},
@@ -1378,6 +1379,49 @@ BOOST_AUTO_TEST_CASE(script_combineSigs)
     BOOST_CHECK(combined.scriptSig == complete23);
     combined = CombineSignatures(txFrom.vout[0], txTo, partial3_sigs, partial3_sigs);
     BOOST_CHECK(combined.scriptSig == partial3c);
+}
+
+BOOST_AUTO_TEST_CASE(signature_data_merge_combines_taproot_and_p2mr_fields)
+{
+    SignatureData left;
+    SignatureData right;
+
+    const XOnlyPubKey taproot_internal_key{GenerateRandomKey().GetPubKey()};
+    const XOnlyPubKey taproot_script_key{GenerateRandomKey().GetPubKey()};
+    const uint256 taproot_leaf_hash{"0000000000000000000000000000000000000000000000000000000000000001"};
+    const uint256 taproot_merkle_root{"0000000000000000000000000000000000000000000000000000000000000002"};
+    left.tr_spenddata.internal_key = taproot_internal_key;
+    right.tr_spenddata.merkle_root = taproot_merkle_root;
+    right.tr_spenddata.scripts[{std::vector<unsigned char>{static_cast<unsigned char>(OP_TRUE)}, TAPROOT_LEAF_TAPSCRIPT}]
+        .insert(std::vector<unsigned char>{0x01});
+    right.tr_builder.emplace();
+    right.taproot_key_path_sig = {0x30, 0x31, 0x32};
+    right.taproot_script_sigs[{taproot_script_key, taproot_leaf_hash}] = {0x40, 0x41, 0x42};
+
+    CPQCKey pqc_key;
+    pqc_key.MakeNewKey();
+    const CPQCPubKey pqc_pubkey = pqc_key.GetPubKey();
+    const uint256 p2mr_leaf_hash{"0000000000000000000000000000000000000000000000000000000000000003"};
+    const uint256 p2mr_merkle_root{"0000000000000000000000000000000000000000000000000000000000000004"};
+    left.p2mr_spenddata.merkle_root = p2mr_merkle_root;
+    right.p2mr_spenddata.scripts[{std::vector<unsigned char>{static_cast<unsigned char>(OP_FALSE)}, P2MR_LEAF_VERSION}]
+        .insert(std::vector<unsigned char>{0xc1});
+    right.p2mr_builder.emplace();
+    right.p2mr_script_sigs[{pqc_pubkey, p2mr_leaf_hash}] = {0x50, 0x51, 0x52};
+
+    left.MergeSignatureData(std::move(right));
+
+    BOOST_CHECK(left.tr_spenddata.internal_key == taproot_internal_key);
+    BOOST_CHECK(left.tr_spenddata.merkle_root == taproot_merkle_root);
+    BOOST_CHECK_EQUAL(left.tr_spenddata.scripts.size(), 1U);
+    BOOST_CHECK(left.tr_builder.has_value());
+    BOOST_CHECK(left.taproot_key_path_sig == std::vector<unsigned char>({0x30, 0x31, 0x32}));
+    BOOST_CHECK_EQUAL(left.taproot_script_sigs.count({taproot_script_key, taproot_leaf_hash}), 1U);
+
+    BOOST_CHECK(left.p2mr_spenddata.merkle_root == p2mr_merkle_root);
+    BOOST_CHECK_EQUAL(left.p2mr_spenddata.scripts.size(), 1U);
+    BOOST_CHECK(left.p2mr_builder.has_value());
+    BOOST_CHECK_EQUAL(left.p2mr_script_sigs.count({pqc_pubkey, p2mr_leaf_hash}), 1U);
 }
 
 /**

@@ -6,7 +6,10 @@
 
 export LC_ALL=C.UTF-8
 
-export CI_IMAGE_NAME_TAG="mirror.gcr.io/ubuntu:24.04"
+# shellcheck source=ci/test/00_setup_env_base_image.sh
+source "$( dirname "${BASH_SOURCE[0]}" )/00_setup_env_base_image.sh"
+
+ci_set_base_image_name_tag "ubuntu:24.04"
 
 # Only install BCC tracing packages in CI. Container has to match the host for BCC to work.
 if [[ "${INSTALL_BCC_TRACING_TOOLS}" == "true" ]]; then
@@ -20,7 +23,7 @@ fi
 
 export CONTAINER_NAME=ci_native_asan
 export APT_LLVM_V="21"
-export PACKAGES="systemtap-sdt-dev clang-${APT_LLVM_V} llvm-${APT_LLVM_V} libclang-rt-${APT_LLVM_V}-dev python3-zmq qt6-base-dev qt6-tools-dev qt6-l10n-tools libevent-dev libboost-dev libzmq3-dev libqrencode-dev libsqlite3-dev ${BPFCC_PACKAGE} libcapnp-dev capnproto python3-pip"
+export PACKAGES="systemtap-sdt-dev clang-${APT_LLVM_V} llvm-${APT_LLVM_V} libclang-rt-${APT_LLVM_V}-dev python3-zmq qt6-base-dev qt6-tools-dev qt6-l10n-tools libevent-dev libboost-dev libzmq3-dev libssl-dev libqrencode-dev libsqlite3-dev ${BPFCC_PACKAGE} libcapnp-dev capnproto python3-pip"
 export PIP_PACKAGES="--break-system-packages pycapnp"
 export NO_DEPENDS=1
 export GOAL="install"

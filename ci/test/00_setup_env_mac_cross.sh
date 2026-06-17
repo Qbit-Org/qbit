@@ -6,10 +6,13 @@
 
 export LC_ALL=C.UTF-8
 
+# shellcheck source=ci/test/00_setup_env_base_image.sh
+source "$( dirname "${BASH_SOURCE[0]}" )/00_setup_env_base_image.sh"
+
 export SDK_URL=${SDK_URL:-https://bitcoincore.org/depends-sources/sdks}
 
 export CONTAINER_NAME=ci_macos_cross
-export CI_IMAGE_NAME_TAG="mirror.gcr.io/ubuntu:24.04"
+ci_set_base_image_name_tag "ubuntu:24.04"
 export HOST=x86_64-apple-darwin
 export PACKAGES="clang lld llvm zip"
 export XCODE_VERSION=15.0

@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_INTERFACES_TYPES_H
-#define BITCOIN_INTERFACES_TYPES_H
+#ifndef QBIT_INTERFACES_TYPES_H
+#define QBIT_INTERFACES_TYPES_H
 
 #include <uint256.h>
 
@@ -17,4 +17,4 @@ struct BlockRef {
 
 } // namespace interfaces
 
-#endif // BITCOIN_INTERFACES_TYPES_H
+#endif // QBIT_INTERFACES_TYPES_H

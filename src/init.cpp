@@ -64,6 +64,7 @@
 #include <policy/settings.h>
 #include <protocol.h>
 #include <rpc/blockchain.h>
+#include <rpc/mining.h>
 #include <rpc/register.h>
 #include <rpc/server.h>
 #include <rpc/util.h>
@@ -163,7 +164,7 @@ static const char* DEFAULT_ASMAP_FILENAME="ip_asn.map";
 /**
  * The PID file facilities.
  */
-static const char* BITCOIN_PID_FILENAME = "bitcoind.pid";
+static const char* QBIT_PID_FILENAME = "qbitd.pid";
 /**
  * True if this process has created a PID file.
  * Used to determine whether we should remove the PID file on shutdown.
@@ -172,7 +173,7 @@ static bool g_generated_pid{false};
 
 static fs::path GetPidFile(const ArgsManager& args)
 {
-    return AbsPathForConfigVal(args, args.GetPathArg("-pid", BITCOIN_PID_FILENAME));
+    return AbsPathForConfigVal(args, args.GetPathArg("-pid", QBIT_PID_FILENAME));
 }
 
 [[nodiscard]] static bool CreatePidFile(const ArgsManager& args)
@@ -488,6 +489,11 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
                              kernel::DEFAULT_XOR_BLOCKSDIR),
                    ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-fastprune", "Use smaller block files and lower minimum prune height for testing purposes", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-prunewitnesses", "Prune witness data for historical blocks beyond coinbase maturity depth. Default is to retain full witness history (archive mode). (default: 0)",
+                   ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-p2mronly",
+                   "Regtest-only: reject outputs outside P2MR plus OP_RETURN/PayToAnchor, and after outerwitness activation also allow reserved witness v3..v16 in blocks (they remain non-standard in policy). Regtest defaults to P2MR-only; use -p2mronly=0 to enable unrestricted regtest outputs for compatibility testing.",
+                   ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
 #if HAVE_SYSTEM
     argsman.AddArg("-blocknotify=<cmd>", "Execute command when the best block changes (%s in cmd is replaced by block hash)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
 #endif
@@ -514,7 +520,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
                              "(version 1) or the current format (version 2). This temporary option will be removed in the future. (default: %u)",
                              DEFAULT_PERSIST_V1_DAT),
                    ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
-    argsman.AddArg("-pid=<file>", strprintf("Specify pid file. Relative paths will be prefixed by a net-specific datadir location. (default: %s)", BITCOIN_PID_FILENAME), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-pid=<file>", strprintf("Specify pid file. Relative paths will be prefixed by a net-specific datadir location. (default: %s)", QBIT_PID_FILENAME), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-prune=<n>", strprintf("Reduce storage requirements by enabling pruning (deleting) of old blocks. This allows the pruneblockchain RPC to be called to delete specific blocks and enables automatic pruning of old blocks if a target size in MiB is provided. This mode is incompatible with -txindex. "
             "Warning: Reverting this setting requires re-downloading the entire blockchain. "
             "(default: 0 = disable pruning blocks, 1 = allow manual pruning via RPC, >=%u = automatically prune block files to stay under the specified target size in MiB)", MIN_DISK_SPACE_FOR_BLOCK_FILES / 1024 / 1024), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
@@ -535,17 +541,18 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-asmap=<file>", strprintf("Specify asn mapping used for bucketing of the peers (default: %s). Relative paths will be prefixed by the net-specific datadir location.", DEFAULT_ASMAP_FILENAME), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-bantime=<n>", strprintf("Default duration (in seconds) of manually configured bans (default: %u)", DEFAULT_MISBEHAVING_BANTIME), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-bind=<addr>[:<port>][=onion]", strprintf("Bind to given address and always listen on it (default: 0.0.0.0). Use [host]:port notation for IPv6. Append =onion to tag any incoming connections to that address and port as incoming Tor connections (default: 127.0.0.1:%u=onion, testnet3: 127.0.0.1:%u=onion, testnet4: 127.0.0.1:%u=onion, signet: 127.0.0.1:%u=onion, regtest: 127.0.0.1:%u=onion)", defaultChainParams->GetDefaultPort() + 1, testnetChainParams->GetDefaultPort() + 1, testnet4ChainParams->GetDefaultPort() + 1, signetChainParams->GetDefaultPort() + 1, regtestChainParams->GetDefaultPort() + 1), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
-    argsman.AddArg("-cjdnsreachable", "If set, then this host is configured for CJDNS (connecting to fc00::/8 addresses would lead us to the CJDNS network, see doc/cjdns.md) (default: 0)", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-cjdnsreachable", "If set, then this host is configured for CJDNS (connecting to fc00::/8 addresses would lead us to the CJDNS network) (default: 0)", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-connect=<ip>", "Connect only to the specified node; -noconnect disables automatic connections (the rules for this peer are the same as for -addnode). This option can be specified multiple times to connect to multiple nodes.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-connectarchive=<ip>", "Connect to specified archive peer and disconnect it if it does not advertise NODE_NETWORK, NODE_WITNESS, and NODE_ARCHIVE, only advertises NODE_NETWORK_LIMITED for block service, or advertises or later implies NODE_WITNESS_PRUNED. Uses addnode-style semantics (does not disable addrman outbound). This option can be specified multiple times.", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     argsman.AddArg("-discover", "Discover own IP addresses (default: 1 when listening and no -externalip or -proxy)", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
-    argsman.AddArg("-dns", strprintf("Allow DNS lookups for -addnode, -seednode and -connect (default: %u)", DEFAULT_NAME_LOOKUP), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-dns", strprintf("Allow DNS lookups for -addnode, -connectarchive, -seednode and -connect (default: %u)", DEFAULT_NAME_LOOKUP), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-dnsseed", strprintf("Query for peer addresses via DNS lookup, if low on addresses (default: %u unless -connect used or -maxconnections=0)", DEFAULT_DNSSEED), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-externalip=<ip>", "Specify your own public address", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-fixedseeds", strprintf("Allow fixed seeds if DNS seeds don't provide peers (default: %u)", DEFAULT_FIXEDSEEDS), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-forcednsseed", strprintf("Always query for peer addresses via DNS lookup (default: %u)", DEFAULT_FORCEDNSSEED), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-listen", strprintf("Accept connections from outside (default: %u if no -proxy, -connect or -maxconnections=0)", DEFAULT_LISTEN), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-listenonion", strprintf("Automatically create Tor onion service (default: %d)", DEFAULT_LISTEN_ONION), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
-    argsman.AddArg("-maxconnections=<n>", strprintf("Maintain at most <n> automatic connections to peers (default: %u). This limit does not apply to connections manually added via -addnode or the addnode RPC, which have a separate limit of %u.", DEFAULT_MAX_PEER_CONNECTIONS, MAX_ADDNODE_CONNECTIONS), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-maxconnections=<n>", strprintf("Maintain at most <n> automatic connections to peers (default: %u). This limit does not apply to connections manually added via -addnode, -connectarchive, or the addnode RPC, which have a separate limit of %u.", DEFAULT_MAX_PEER_CONNECTIONS, MAX_ADDNODE_CONNECTIONS), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-maxreceivebuffer=<n>", strprintf("Maximum per-connection receive buffer, <n>*1000 bytes (default: %u)", DEFAULT_MAXRECEIVEBUFFER), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-maxsendbuffer=<n>", strprintf("Maximum per-connection memory usage for the send buffer, <n>*1000 bytes (default: %u)", DEFAULT_MAXSENDBUFFER), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-maxuploadtarget=<n>", strprintf("Tries to keep outbound traffic under the given target per 24h. Limit does not apply to peers with 'download' permission or blocks created within past week. 0 = no limit (default: %s). Optional suffix units [k|K|m|M|g|G|t|T] (default: M). Lowercase is 1000 base while uppercase is 1024 base", DEFAULT_MAX_UPLOAD_TARGET), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
@@ -561,7 +568,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-peerbloomfilters", strprintf("Support filtering of blocks and transaction with bloom filters (default: %u)", DEFAULT_PEERBLOOMFILTERS), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-peerblockfilters", strprintf("Serve compact block filters to peers per BIP 157 (default: %u)", DEFAULT_PEERBLOCKFILTERS), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-txreconciliation", strprintf("Enable transaction reconciliations per BIP 330 (default: %d)", DEFAULT_TXRECONCILIATION_ENABLE), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CONNECTION);
-    argsman.AddArg("-port=<port>", strprintf("Listen for connections on <port> (default: %u, testnet3: %u, testnet4: %u, signet: %u, regtest: %u). Not relevant for I2P (see doc/i2p.md). If set to a value x, the default onion listening port will be set to x+1.", defaultChainParams->GetDefaultPort(), testnetChainParams->GetDefaultPort(), testnet4ChainParams->GetDefaultPort(), signetChainParams->GetDefaultPort(), regtestChainParams->GetDefaultPort()), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-port=<port>", strprintf("Listen for connections on <port> (default: %u, testnet3: %u, testnet4: %u, signet: %u, regtest: %u). Not relevant for I2P (see doc/user/network/i2p.md). If set to a value x, the default onion listening port will be set to x+1.", defaultChainParams->GetDefaultPort(), testnetChainParams->GetDefaultPort(), testnet4ChainParams->GetDefaultPort(), signetChainParams->GetDefaultPort(), regtestChainParams->GetDefaultPort()), ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::CONNECTION);
     const std::string proxy_doc_for_value =
 #ifdef HAVE_SOCKADDR_UN
         "<ip>[:<port>]|unix:<path>";
@@ -676,8 +683,10 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-blockreservedweight=<n>", strprintf("Reserve space for the fixed-size block header plus the largest coinbase transaction the mining software may add to the block. (default: %d).", DEFAULT_BLOCK_RESERVED_WEIGHT), ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
     argsman.AddArg("-blockmintxfee=<amt>", strprintf("Set lowest fee rate (in %s/kvB) for transactions to be included in block creation. (default: %s)", CURRENCY_UNIT, FormatMoney(DEFAULT_BLOCK_MIN_TX_FEE)), ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
     argsman.AddArg("-blockversion=<n>", "Override block version to test forking scenarios", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::BLOCK_CREATION);
+    argsman.AddArg("-auxpowtemplateexpiry=<n>", strprintf("Keep same-tip createauxblock templates available for submitauxblock for <n> minutes. Use 0 to disable age expiry. (default: %d)", DEFAULT_AUXPOW_TEMPLATE_EXPIRY_MINUTES), ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
+    argsman.AddArg("-auxpowtemplatecachelimit=<n>", strprintf("Keep at most <n> same-tip createauxblock templates available for submitauxblock, evicting oldest entries first when the limit is exceeded. Use 0 to disable the count limit. (default: %d)", DEFAULT_AUXPOW_TEMPLATE_CACHE_LIMIT), ArgsManager::ALLOW_ANY, OptionsCategory::BLOCK_CREATION);
 
-    argsman.AddArg("-rest", strprintf("Accept public REST requests (default: %u)", DEFAULT_REST_ENABLE), ArgsManager::ALLOW_ANY, OptionsCategory::RPC);
+    argsman.AddArg("-rest", strprintf("Enable unauthenticated REST interface on the RPC port (default: %u)", DEFAULT_REST_ENABLE), ArgsManager::ALLOW_ANY, OptionsCategory::RPC);
     argsman.AddArg("-rpcallowip=<ip>", "Allow JSON-RPC connections from specified source. Valid values for <ip> are a single IP (e.g. 1.2.3.4), a network/netmask (e.g. 1.2.3.4/255.255.255.0), a network/CIDR (e.g. 1.2.3.4/24), all ipv4 (0.0.0.0/0), or all ipv6 (::/0). RFC4193 is allowed only if -cjdnsreachable=0. This option can be specified multiple times", ArgsManager::ALLOW_ANY, OptionsCategory::RPC);
     argsman.AddArg("-rpcauth=<userpw>", "Username and HMAC-SHA-256 hashed password for JSON-RPC connections. The field <userpw> comes in the format: <USERNAME>:<SALT>$<HASH>. A canonical python script is included in share/rpcauth. The client then connects normally using the rpcuser=<USERNAME>/rpcpassword=<PASSWORD> pair of arguments. This option can be specified multiple times", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::RPC);
     argsman.AddArg("-rpcbind=<addr>[:port]", "Bind to given address to listen for JSON-RPC connections. Do not expose the RPC server to untrusted networks such as the public internet! This option is ignored unless -rpcallowip is also passed. Port is optional and overrides -rpcport. Use [host]:port notation for IPv6. This option can be specified multiple times (default: 127.0.0.1 and ::1 i.e., localhost)", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::RPC);
@@ -979,6 +988,9 @@ bool AppInitParameterInteraction(const ArgsManager& args)
             return InitError(_("Prune mode is incompatible with -reindex-chainstate. Use full -reindex instead."));
         }
     }
+    if (args.GetBoolArg("-prunewitnesses", false) && args.GetBoolArg("-txindex", DEFAULT_TXINDEX)) {
+        return InitError(_("Witness pruning is incompatible with -txindex. Disable -prunewitnesses to keep txindex-backed full transaction history."));
+    }
 
     // If -forcednsseed is set to true, ensure -dnsseed has not been set to false
     if (args.GetBoolArg("-forcednsseed", DEFAULT_FORCEDNSSEED) && !args.GetBoolArg("-dnsseed", DEFAULT_DNSSEED)){
@@ -1061,6 +1073,13 @@ bool AppInitParameterInteraction(const ArgsManager& args)
         }
     }
 
+    if (const auto auxpow_template_expiry{args.GetIntArg("-auxpowtemplateexpiry")}; auxpow_template_expiry && *auxpow_template_expiry < 0) {
+        return InitError(Untranslated("-auxpowtemplateexpiry must be greater or equal than zero"));
+    }
+    if (const auto auxpow_template_cache_limit{args.GetIntArg("-auxpowtemplatecachelimit")}; auxpow_template_cache_limit && *auxpow_template_cache_limit < 0) {
+        return InitError(Untranslated("-auxpowtemplatecachelimit must be greater or equal than zero"));
+    }
+
     nBytesPerSigOp = args.GetIntArg("-bytespersigop", nBytesPerSigOp);
 
     if (!g_wallet_init_interface.ParameterInteraction()) return false;
@@ -1103,6 +1122,7 @@ bool AppInitParameterInteraction(const ArgsManager& args)
         }
         BlockManager::Options blockman_opts_dummy{
             .chainparams = chainman_opts_dummy.chainparams,
+            .witness_pruning_enabled = chainparams.IsWitnessPruningEnabled(),
             .blocks_dir = args.GetBlocksDirPath(),
             .notifications = chainman_opts_dummy.notifications,
             .block_tree_db_params = DBParams{
@@ -1273,6 +1293,7 @@ static ChainstateLoadResult InitAndLoadChainstate(
 
     BlockManager::Options blockman_opts{
         .chainparams = chainman_opts.chainparams,
+        .witness_pruning_enabled = chainparams.IsWitnessPruningEnabled(),
         .blocks_dir = args.GetBlocksDirPath(),
         .notifications = chainman_opts.notifications,
         .block_tree_db_params = DBParams{
@@ -1282,6 +1303,31 @@ static ChainstateLoadResult InitAndLoadChainstate(
         },
     };
     Assert(ApplyArgsManOptions(args, blockman_opts)); // no error can happen, already checked in AppInitParameterInteraction
+
+    if (do_reindex) {
+        const fs::path db_path{blockman_opts.block_tree_db_params.path};
+        if (fs::exists(db_path)) {
+            try {
+                kernel::BlockTreeDB check_db(DBParams{
+                    .path = db_path,
+                    .cache_bytes = 0,
+                });
+                bool had_witness_pruned{false};
+                check_db.ReadFlag("witnessespruned", had_witness_pruned);
+                if (had_witness_pruned) {
+                    return {ChainstateLoadStatus::FAILURE_FATAL,
+                            _("Cannot use -reindex on a node that has pruned witness data. "
+                              "Witness-pruned block index flags would be lost, causing data "
+                              "corruption. Use -reindex-chainstate instead, or delete the data "
+                              "directory and perform a fresh sync.")};
+                }
+            } catch (const dbwrapper_error& e) {
+                LogError("Failed to read block index while checking the -reindex witness-pruning guard: %s\n", e.what());
+                return {ChainstateLoadStatus::FAILURE,
+                        Untranslated(strprintf("Error reading block database while checking whether -reindex would corrupt witness-pruned data: %s", e.what()))};
+            }
+        }
+    }
 
     // Creating the chainstate manager internally creates a BlockManager, opens
     // the blocks tree db, and wipes existing block files in case of a reindex.
@@ -1297,6 +1343,9 @@ static ChainstateLoadResult InitAndLoadChainstate(
     }
     ChainstateManager& chainman = *node.chainman;
     if (chainman.m_interrupt) return {ChainstateLoadStatus::INTERRUPTED, {}};
+    if (chainman.m_blockman.IsWitnessPruneMode()) {
+        WITH_LOCK(cs_main, chainman.m_blockman.RequestWitnessPruningCheck());
+    }
 
     // This is defined and set here instead of inline in validation.h to avoid a hard
     // dependency between validation and index/base, since the latter is not in
@@ -1305,6 +1354,10 @@ static ChainstateLoadResult InitAndLoadChainstate(
         if (!node.chainman->m_blockman.IsPruneMode()) {
             LogInfo("[snapshot] re-enabling NODE_NETWORK services");
             node.connman->AddLocalServices(NODE_NETWORK);
+            if (!(node.connman->GetLocalServices() & NODE_WITNESS_PRUNED)) {
+                LogInfo("[snapshot] re-enabling NODE_ARCHIVE services");
+                node.connman->AddLocalServices(NODE_ARCHIVE);
+            }
         }
         LogInfo("[snapshot] restarting indexes");
         // Drain the validation interface queue to ensure that the old indexes
@@ -1317,6 +1370,28 @@ static ChainstateLoadResult InitAndLoadChainstate(
                 LogPrintf("[snapshot] WARNING failed to restart index %s on snapshot chain\n", index->GetName());
             }
         }
+    };
+    chainman.witness_pruning_completed = [&node]() {
+        if (node.connman) {
+            if (node.connman->GetLocalServices() & NODE_ARCHIVE) {
+                LogInfo("Withdrawing NODE_ARCHIVE after witness compaction");
+            }
+            node.connman->RemoveLocalServices(NODE_ARCHIVE);
+            if (!(node.connman->GetLocalServices() & NODE_WITNESS_PRUNED)) {
+                LogInfo("Advertising NODE_WITNESS_PRUNED after witness compaction");
+            }
+            node.connman->AddLocalServices(NODE_WITNESS_PRUNED);
+            return;
+        }
+
+        if (g_local_services & NODE_ARCHIVE) {
+            LogInfo("Witness compaction completed before networking startup; withdrawing NODE_ARCHIVE");
+            g_local_services = ServiceFlags(g_local_services & ~NODE_ARCHIVE);
+        }
+        if (!(g_local_services & NODE_WITNESS_PRUNED)) {
+            LogInfo("Witness compaction completed before networking startup; advertising NODE_WITNESS_PRUNED");
+        }
+        g_local_services = ServiceFlags(g_local_services | NODE_WITNESS_PRUNED);
     };
     node::ChainstateLoadOptions options;
     options.mempool = Assert(node.mempool.get());
@@ -1789,6 +1864,9 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     }
 
     ChainstateManager& chainman = *Assert(node.chainman);
+    if (args.GetBoolArg("-txindex", DEFAULT_TXINDEX) && chainman.m_blockman.m_have_witness_pruned) {
+        return InitError(_("Cannot use -txindex on a node that has pruned witness data. Delete the data directory and perform a fresh archive sync, or restart without -txindex."));
+    }
     auto& kernel_notifications{*Assert(node.notifications)};
 
     assert(!node.peerman);
@@ -1827,6 +1905,11 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 
     // ********************************************************* Step 10: data directory maintenance
 
+    if (chainman.m_blockman.m_have_witness_pruned) {
+        g_local_services = ServiceFlags(g_local_services | NODE_WITNESS_PRUNED);
+        g_local_services = ServiceFlags(g_local_services & ~NODE_ARCHIVE);
+    }
+
     // if pruning, perform the initial blockstore prune
     // after any wallet rescanning has taken place.
     if (chainman.m_blockman.IsPruneMode()) {
@@ -1842,6 +1925,9 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         if (!WITH_LOCK(chainman.GetMutex(), return chainman.BackgroundSyncInProgress())) {
             LogInfo("Setting NODE_NETWORK on non-prune mode");
             g_local_services = ServiceFlags(g_local_services | NODE_NETWORK);
+            if (!chainman.m_blockman.m_have_witness_pruned) {
+                g_local_services = ServiceFlags(g_local_services | NODE_ARCHIVE);
+            }
         } else {
             LogInfo("Running node in NODE_NETWORK_LIMITED mode until snapshot background sync completes");
         }
@@ -1997,7 +2083,13 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     connOptions.m_msgproc = node.peerman.get();
     connOptions.nSendBufferMaxSize = 1000 * args.GetIntArg("-maxsendbuffer", DEFAULT_MAXSENDBUFFER);
     connOptions.nReceiveFloodSize = 1000 * args.GetIntArg("-maxreceivebuffer", DEFAULT_MAXRECEIVEBUFFER);
-    connOptions.m_added_nodes = args.GetArgs("-addnode");
+    const bool use_v2transport(connOptions.m_local_services & NODE_P2P_V2);
+    for (const std::string& added_node : args.GetArgs("-addnode")) {
+        connOptions.m_added_nodes.push_back({added_node, use_v2transport});
+    }
+    for (const std::string& archive_node : args.GetArgs("-connectarchive")) {
+        connOptions.m_added_nodes.push_back({archive_node, use_v2transport, /*m_require_archive=*/true});
+    }
     connOptions.nMaxOutboundLimit = *opt_max_upload;
     connOptions.m_peer_connect_timeout = peer_connect_timeout;
     connOptions.whitelist_forcerelay = args.GetBoolArg("-whitelistforcerelay", DEFAULT_WHITELISTFORCERELAY);
@@ -2012,7 +2104,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     const auto BadPortWarning = [](const char* prefix, uint16_t port) {
         return strprintf(_("%s request to listen on port %u. This port is considered \"bad\" and "
                            "thus it is unlikely that any peer will connect to it. See "
-                           "doc/p2p-bad-ports.md for details and a full list."),
+                           "doc/reference/p2p-bad-ports.md for details and a full list."),
                          prefix,
                          port);
     };
@@ -2064,16 +2156,23 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     }
 
     CService onion_service_target;
+    bool implicit_onion_bind_suppressed{false};
     if (!connOptions.onion_binds.empty()) {
         onion_service_target = connOptions.onion_binds.front();
     } else if (!connOptions.vBinds.empty()) {
         onion_service_target = connOptions.vBinds.front();
     } else {
         onion_service_target = DefaultOnionServiceTarget(default_bind_port_onion);
-        connOptions.onion_binds.push_back(onion_service_target);
+        if (HTTPRPCSocketOverlaps(onion_service_target)) {
+            implicit_onion_bind_suppressed = true;
+            InitWarning(strprintf(_("Skipping implicit onion bind on %s because it conflicts with an RPC bind on the same endpoint."),
+                                  onion_service_target.ToStringAddrPort()));
+        } else {
+            connOptions.onion_binds.push_back(onion_service_target);
+        }
     }
 
-    if (args.GetBoolArg("-listenonion", DEFAULT_LISTEN_ONION)) {
+    if (args.GetBoolArg("-listenonion", DEFAULT_LISTEN_ONION) && !implicit_onion_bind_suppressed) {
         if (connOptions.onion_binds.size() > 1) {
             InitWarning(strprintf(_("More than one onion bind address is provided. Using %s "
                                     "for the automatically created Tor onion service."),

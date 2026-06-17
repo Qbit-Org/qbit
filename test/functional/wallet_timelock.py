@@ -17,6 +17,9 @@ class WalletLocktimeTest(BitcoinTestFramework):
     def run_test(self):
         node = self.nodes[0]
 
+        # Mature the default-cache coinbase UTXOs
+        self.ensure_cached_coinbase_mature(self.nodes[0])
+
         mtp_tip = node.getblockheader(node.getbestblockhash())["mediantime"]
 
         self.log.info("Get new address with label")

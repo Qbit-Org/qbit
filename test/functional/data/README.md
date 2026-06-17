@@ -22,18 +22,20 @@ done
 The CPU miner is kept running as follows:
 
 ```sh
-./minerd -u ... -p ... -o http://127.0.0.1:8332 --no-stratum \
+./minerd -u ... -p ... -o http://127.0.0.1:8352 --no-stratum \
         --coinbase-addr 1NQpH6Nf8QtR2HphLRcvuVqfhXBXsiWn8r \
         --algo sha256d --no-longpoll --scantime 3 --retry-pause 1
 ```
 
-The payout address is derived from first BIP32 test vector master key:
+The original payout address is derived from first BIP32 test vector master key:
 
 ```
 pkh(xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi/44h/0h/0h/<0;1>/*)#fkjtr0yn
 ```
 
 It uses `pkh()` because `tr()` outputs at low heights are not spendable (`unexpected-witness`).
+On qbit, `mining_mainnet.py` reconstructs the coinbase with a P2MR OP_TRUE
+output instead, because mainnet restricted-output mode is active from genesis.
 
 This makes each block deterministic except for its timestamp and nonce, which
 are stored in `mainnet_alt.json` and used to reconstruct the chain without

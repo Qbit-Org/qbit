@@ -72,6 +72,9 @@ class NetTest(BitcoinTestFramework):
         # We need miniwallet to make a transaction
         self.wallet = MiniWallet(self.nodes[0])
 
+        # Mature the default-cache coinbase UTXOs
+        self.ensure_cached_coinbase_mature(self.nodes[0])
+
         # By default, the test framework sets up an addnode connection from
         # node 1 --> node0. By connecting node0 --> node 1, we're left with
         # the two nodes being connected both ways.

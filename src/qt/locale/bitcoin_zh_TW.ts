@@ -999,7 +999,7 @@ Signing is only possible with addresses of the type 'legacy'.</source>
         <translation type="unfinished">(鎖定 %1 枚)</translation>
     </message>
     <message>
-        <source>Can vary +/- %1 satoshi(s) per input.</source>
+        <source>Can vary +/- %1 bits per input.</source>
         <translation type="unfinished">每組輸入可能有 +/- %1 個 satoshi 的誤差。</translation>
     </message>
     <message>
@@ -2956,13 +2956,13 @@ For more information on using this console, type %6.
     <message>
         <source>Specify a custom fee per kB (1,000 bytes) of the transaction's virtual size.
 
-Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 satoshis per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 satoshis.</source>
+Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 bits per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 bits.</source>
         <translation type="unfinished">指定每千字節（1,000字節）交易虛擬大小的自訂手續費。
 
 注意：由於手續費是按每字節計算的，對於虛擬大小為500字節（半千字節）的交易，手續費率為「每千字節100聰」，最終將只收取50聰的手續費。</translation>
     </message>
     <message>
-        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for bitcoin transactions than the network can process.</source>
+        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for qbit transactions than the network can process.</source>
         <translation type="unfinished">當交易量小於可用區塊空間時，礦工和節點可能會執行最低手續費率限制。 以這個最低費率來支付手續費也是可以的，但請注意，一旦交易需求超出比特幣網路能處理的限度，你的交易可能永遠無法確認。</translation>
     </message>
     <message>
@@ -3247,7 +3247,7 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 satos
         <translation type="unfinished">以所選單位發送的金額</translation>
     </message>
     <message>
-        <source>The fee will be deducted from the amount being sent. The recipient will receive less bitcoins than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
+        <source>The fee will be deducted from the amount being sent. The recipient will receive less QBT than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
         <translation type="unfinished">手續費會從要付款出去的金額中扣掉。因此收款人會收到比輸入的金額還要少的 bitcoin。如果有多個收款人的話，手續費會平均分配來扣除。</translation>
     </message>
     <message>
@@ -4003,8 +4003,8 @@ Go to File &gt; Open Wallet to load a wallet.
         <translation type="unfinished">%s 驗證 -assumeutxo 快照狀態失敗。 這顯示硬體可能有問題，也可能是軟體bug，或是軟體被不當修改、從而讓非法快照也能夠載入。 因此，將關閉節點並停止使用從這個快照建構出的任何狀態，並將鏈高度從 %d 重置到 %d 。下次啟動時，節點將會不使用快照資料從 %d 繼續同步。 請將這個事件回報給 %s 並在報告中包括您是如何獲得這份快照的。 無效的鏈狀態快照仍保存至磁碟上，以供診斷問題的原因。</translation>
     </message>
     <message>
-        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/p2p-bad-ports.md for details and a full list.</source>
-        <translation type="unfinished">%s請求監聽端口%u。此連接埠被認為是“壞的”，所以不太可能有其他節點會連接過來。 詳情以及完整的連接埠清單請參閱 doc/p2p-bad-ports.md 。</translation>
+        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/reference/p2p-bad-ports.md for details and a full list.</source>
+        <translation type="unfinished">%s請求監聽端口%u。此連接埠被認為是“壞的”，所以不太可能有其他節點會連接過來。 詳情以及完整的連接埠清單請參閱 doc/reference/p2p-bad-ports.md 。</translation>
     </message>
     <message>
         <source>Disk space for %s may not accommodate the block files. Approximately %u GB of data will be stored in this directory.</source>

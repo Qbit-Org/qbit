@@ -153,6 +153,70 @@ static std::vector<HTTPPathHandler> pathHandlers GUARDED_BY(g_httppathhandlers_m
 //! Bound listening sockets
 static std::vector<evhttp_bound_socket *> boundSockets;
 
+static bool IsInvalidSocket(evutil_socket_t fd)
+{
+    return fd == static_cast<evutil_socket_t>(EVUTIL_INVALID_SOCKET);
+}
+
+static std::optional<CService> GetBoundSocketService(evhttp_bound_socket* socket)
+{
+    struct sockaddr_storage sockaddr;
+    socklen_t addrlen{sizeof(sockaddr)};
+    const evutil_socket_t fd{evhttp_bound_socket_get_fd(socket)};
+    if (IsInvalidSocket(fd) || getsockname(fd, reinterpret_cast<struct sockaddr*>(&sockaddr), &addrlen) != 0) {
+        return std::nullopt;
+    }
+
+    CService service;
+    if (!service.SetSockAddr(reinterpret_cast<const struct sockaddr*>(&sockaddr), addrlen)) {
+        return std::nullopt;
+    }
+    return service;
+}
+
+static bool SocketIsDualStack(evhttp_bound_socket* socket, const CService& service)
+{
+    if (!service.IsIPv6() || !service.IsBindAny()) return false;
+
+#ifdef IPV6_V6ONLY
+    int v6only{1};
+    socklen_t optlen{sizeof(v6only)};
+    const evutil_socket_t fd{evhttp_bound_socket_get_fd(socket)};
+    if (IsInvalidSocket(fd)) return false;
+    if (getsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<sockopt_arg_type>(&v6only), &optlen) != 0) {
+        return false;
+    }
+    return optlen == sizeof(v6only) && v6only == 0;
+#else
+    return false;
+#endif
+}
+
+static bool SocketOverlapsService(evhttp_bound_socket* socket, const CService& bound, const CService& addr)
+{
+    if (bound.GetPort() != addr.GetPort()) return false;
+    if (bound == addr) return true;
+
+    if (bound.IsBindAny()) {
+        if (bound.IsIPv4() && addr.IsIPv4()) return true;
+        if (bound.IsIPv6() && addr.IsIPv6()) return true;
+        if (bound.IsIPv6() && addr.IsIPv4() && SocketIsDualStack(socket, bound)) return true;
+    }
+
+    return false;
+}
+
+bool HTTPRPCSocketOverlaps(const CService& addr)
+{
+    for (evhttp_bound_socket* socket : boundSockets) {
+        const std::optional<CService> bound_addr{GetBoundSocketService(socket)};
+        if (bound_addr.has_value() && SocketOverlapsService(socket, bound_addr.value(), addr)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /**
  * @brief Helps keep track of open `evhttp_connection`s with active `evhttp_requests`
  *

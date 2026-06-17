@@ -78,6 +78,8 @@ class AvoidReuseTest(BitcoinTestFramework):
         self.test_persistence()
         self.test_immutable()
 
+        # Mature the default-cache coinbase UTXOs
+        self.ensure_cached_coinbase_mature(self.nodes[0])
         self.generate(self.nodes[0], 110)
         self.test_change_remains_change(self.nodes[1])
         reset_balance(self.nodes[1], self.nodes[0].getnewaddress())
@@ -94,6 +96,16 @@ class AvoidReuseTest(BitcoinTestFramework):
         self.test_full_destination_group_is_preferred()
         reset_balance(self.nodes[1], self.nodes[0].getnewaddress())
         self.test_all_destination_groups_are_used()
+
+    def send_reused_outputs(self, addr, num_outputs):
+        """
+        Create many outputs to the same address while periodically mining to
+        avoid hitting the mempool unconfirmed ancestor limit.
+        """
+        for i in range(num_outputs):
+            self.nodes[0].sendtoaddress(addr, 1)
+            if (i + 1) % 20 == 0:
+                self.generate(self.nodes[0], 1)
 
     def test_persistence(self):
         '''Test that wallet files persist the avoid_reuse flag.'''
@@ -268,8 +280,7 @@ class AvoidReuseTest(BitcoinTestFramework):
         ret_addr = self.nodes[0].getnewaddress()
 
         # send multiple transactions, reusing one address
-        for _ in range(101):
-            self.nodes[0].sendtoaddress(new_addr, 1)
+        self.send_reused_outputs(new_addr, 101)
 
         self.generate(self.nodes[0], 1)
 
@@ -299,8 +310,7 @@ class AvoidReuseTest(BitcoinTestFramework):
         ret_addr = self.nodes[0].getnewaddress()
 
         # Send 101 outputs of 1 BTC to the same, reused address in the wallet
-        for _ in range(101):
-            self.nodes[0].sendtoaddress(new_addr, 1)
+        self.send_reused_outputs(new_addr, 101)
 
         self.generate(self.nodes[0], 1)
 
@@ -327,8 +337,7 @@ class AvoidReuseTest(BitcoinTestFramework):
         ret_addr = self.nodes[0].getnewaddress()
 
         # Send 202 outputs of 1 BTC to the same, reused address in the wallet
-        for _ in range(202):
-            self.nodes[0].sendtoaddress(new_addr, 1)
+        self.send_reused_outputs(new_addr, 202)
 
         self.generate(self.nodes[0], 1)
 

@@ -37,3 +37,6 @@ race:epoll_ctl
 
 # https://github.com/bitcoin/bitcoin/issues/23366
 race:std::__1::ios_base::*
+
+# macOS libc++/Boost test logging race in test-only DEBUG_LOG_OUT path
+race:boost::unit_test::unit_test_log_t::operator<<

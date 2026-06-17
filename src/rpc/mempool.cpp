@@ -53,7 +53,7 @@ static RPCHelpMan sendrawtransaction()
             {"hexstring", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The hex string of the raw transaction"},
             {"maxfeerate", RPCArg::Type::AMOUNT, RPCArg::Default{FormatMoney(DEFAULT_MAX_RAW_TX_FEE_RATE.GetFeePerK())},
              "Reject transactions whose fee rate is higher than the specified value, expressed in " + CURRENCY_UNIT +
-                 "/kvB.\nFee rates larger than 1BTC/kvB are rejected.\nSet to 0 to accept any fee rate."},
+                 "/kvB.\nFee rates larger than 1" + CURRENCY_UNIT + "/kvB are rejected.\nSet to 0 to accept any fee rate."},
             {"maxburnamount", RPCArg::Type::AMOUNT, RPCArg::Default{FormatMoney(DEFAULT_MAX_BURN_AMOUNT)},
              "Reject transactions with provably unspendable outputs (e.g. 'datacarrier' outputs that use the OP_RETURN opcode) greater than the specified value, expressed in " + CURRENCY_UNIT + ".\n"
              "If burning funds through unspendable outputs is desired, increase this value.\n"
@@ -125,7 +125,7 @@ static RPCHelpMan testmempoolaccept()
             },
             {"maxfeerate", RPCArg::Type::AMOUNT, RPCArg::Default{FormatMoney(DEFAULT_MAX_RAW_TX_FEE_RATE.GetFeePerK())},
              "Reject transactions whose fee rate is higher than the specified value, expressed in " + CURRENCY_UNIT +
-                 "/kvB.\nFee rates larger than 1BTC/kvB are rejected.\nSet to 0 to accept any fee rate."},
+                 "/kvB.\nFee rates larger than 1" + CURRENCY_UNIT + "/kvB are rejected.\nSet to 0 to accept any fee rate."},
         },
         RPCResult{
             RPCResult::Type::ARR, "", "The result of the mempool acceptance test for each raw transaction in the input array.\n"
@@ -139,7 +139,7 @@ static RPCHelpMan testmempoolaccept()
                     {RPCResult::Type::STR, "package-error", /*optional=*/true, "Package validation error, if any (only possible if rawtxs had more than 1 transaction)."},
                     {RPCResult::Type::BOOL, "allowed", /*optional=*/true, "Whether this tx would be accepted to the mempool and pass client-specified maxfeerate. "
                                                        "If not present, the tx was not fully validated due to a failure in another tx in the list."},
-                    {RPCResult::Type::NUM, "vsize", /*optional=*/true, "Virtual transaction size as defined in BIP 141. This is different from actual serialized size for witness transactions as witness data is discounted (only present when 'allowed' is true)"},
+                    {RPCResult::Type::NUM, "vsize", /*optional=*/true, "Sigops-adjusted virtual transaction size used for fee and policy checks; qbit does not discount witness data (only present when 'allowed' is true)"},
                     {RPCResult::Type::OBJ, "fees", /*optional=*/true, "Transaction fees (only present if 'allowed' is true)",
                     {
                         {RPCResult::Type::STR_AMOUNT, "base", "transaction fee in " + CURRENCY_UNIT},
@@ -261,8 +261,8 @@ static RPCHelpMan testmempoolaccept()
 static std::vector<RPCResult> MempoolEntryDescription()
 {
     return {
-        RPCResult{RPCResult::Type::NUM, "vsize", "virtual transaction size as defined in BIP 141. This is different from actual serialized size for witness transactions as witness data is discounted."},
-        RPCResult{RPCResult::Type::NUM, "weight", "transaction weight as defined in BIP 141."},
+        RPCResult{RPCResult::Type::NUM, "vsize", "sigops-adjusted virtual transaction size used for fee and policy checks; qbit does not discount witness data."},
+        RPCResult{RPCResult::Type::NUM, "weight", "transaction weight; qbit fully counts witness data."},
         RPCResult{RPCResult::Type::NUM_TIME, "time", "local time transaction entered pool in seconds since 1 Jan 1970 GMT"},
         RPCResult{RPCResult::Type::NUM, "height", "block height when transaction entered pool"},
         RPCResult{RPCResult::Type::NUM, "descendantcount", "number of in-mempool descendant transactions (including this one)"},
@@ -704,7 +704,7 @@ static RPCHelpMan getmempoolinfo()
             {
                 {RPCResult::Type::BOOL, "loaded", "True if the initial load attempt of the persisted mempool finished"},
                 {RPCResult::Type::NUM, "size", "Current tx count"},
-                {RPCResult::Type::NUM, "bytes", "Sum of all virtual transaction sizes as defined in BIP 141. Differs from actual serialized size because witness data is discounted"},
+                {RPCResult::Type::NUM, "bytes", "Sum of all mempool virtual transaction sizes; qbit does not discount witness data"},
                 {RPCResult::Type::NUM, "usage", "Total memory usage for the mempool"},
                 {RPCResult::Type::STR_AMOUNT, "total_fee", "Total fees for the mempool in " + CURRENCY_UNIT + ", ignoring modified fees through prioritisetransaction"},
                 {RPCResult::Type::NUM, "maxmempool", "Maximum memory usage for the mempool"},
@@ -832,8 +832,8 @@ static std::vector<RPCResult> OrphanDescription()
         RPCResult{RPCResult::Type::STR_HEX, "txid", "The transaction hash in hex"},
         RPCResult{RPCResult::Type::STR_HEX, "wtxid", "The transaction witness hash in hex"},
         RPCResult{RPCResult::Type::NUM, "bytes", "The serialized transaction size in bytes"},
-        RPCResult{RPCResult::Type::NUM, "vsize", "The virtual transaction size as defined in BIP 141. This is different from actual serialized size for witness transactions as witness data is discounted."},
-        RPCResult{RPCResult::Type::NUM, "weight", "The transaction weight as defined in BIP 141."},
+        RPCResult{RPCResult::Type::NUM, "vsize", "The virtual transaction size; qbit does not discount witness data."},
+        RPCResult{RPCResult::Type::NUM, "weight", "The transaction weight; qbit fully counts witness data."},
         RPCResult{RPCResult::Type::ARR, "from", "",
         {
             RPCResult{RPCResult::Type::NUM, "peer_id", "Peer ID"},
@@ -945,7 +945,7 @@ static RPCHelpMan submitpackage()
             },
             {"maxfeerate", RPCArg::Type::AMOUNT, RPCArg::Default{FormatMoney(DEFAULT_MAX_RAW_TX_FEE_RATE.GetFeePerK())},
              "Reject transactions whose fee rate is higher than the specified value, expressed in " + CURRENCY_UNIT +
-                 "/kvB.\nFee rates larger than 1BTC/kvB are rejected.\nSet to 0 to accept any fee rate."},
+                 "/kvB.\nFee rates larger than 1" + CURRENCY_UNIT + "/kvB are rejected.\nSet to 0 to accept any fee rate."},
             {"maxburnamount", RPCArg::Type::AMOUNT, RPCArg::Default{FormatMoney(DEFAULT_MAX_BURN_AMOUNT)},
              "Reject transactions with provably unspendable outputs (e.g. 'datacarrier' outputs that use the OP_RETURN opcode) greater than the specified value, expressed in " + CURRENCY_UNIT + ".\n"
              "If burning funds through unspendable outputs is desired, increase this value.\n"

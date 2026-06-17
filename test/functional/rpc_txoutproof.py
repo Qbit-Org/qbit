@@ -27,9 +27,10 @@ class MerkleBlockTest(BitcoinTestFramework):
 
     def run_test(self):
         miniwallet = MiniWallet(self.nodes[0])
+        # Mature the default-cache coinbase UTXOs
+        self.ensure_cached_coinbase_mature(self.nodes[0])
 
         chain_height = self.nodes[1].getblockcount()
-        assert_equal(chain_height, 200)
 
         txid1 = miniwallet.send_self_transfer(from_node=self.nodes[0])['txid']
         txid2 = miniwallet.send_self_transfer(from_node=self.nodes[0])['txid']

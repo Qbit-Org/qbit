@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_NODE_TXDOWNLOADMAN_H
-#define BITCOIN_NODE_TXDOWNLOADMAN_H
+#ifndef QBIT_NODE_TXDOWNLOADMAN_H
+#define QBIT_NODE_TXDOWNLOADMAN_H
 
 #include <net.h>
 #include <node/txorphanage.h>
@@ -173,4 +173,4 @@ public:
     std::vector<TxOrphanage::OrphanInfo> GetOrphanTransactions() const;
 };
 } // namespace node
-#endif // BITCOIN_NODE_TXDOWNLOADMAN_H
+#endif // QBIT_NODE_TXDOWNLOADMAN_H

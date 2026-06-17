@@ -31,6 +31,9 @@ class MempoolPackagesTest(BitcoinTestFramework):
     def run_test(self):
         self.wallet = MiniWallet(self.nodes[0])
 
+        # Mature the default-cache coinbase UTXOs
+        self.ensure_cached_coinbase_mature(self.nodes[0])
+
         # DEFAULT_ANCESTOR_LIMIT transactions off a confirmed tx should be fine
         chain = []
         utxo = self.wallet.get_utxo()

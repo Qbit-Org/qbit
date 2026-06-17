@@ -64,6 +64,7 @@ class BackwardsCompatibilityTest(BitcoinTestFramework):
 
         self.start_nodes()
         self.import_deterministic_coinbase_privkeys()
+        self.skip_if_previous_release_chain_mismatch()
 
     def split_version(self, node):
         major = node.version // 10000

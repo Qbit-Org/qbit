@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_COMMON_ARGS_H
-#define BITCOIN_COMMON_ARGS_H
+#ifndef QBIT_COMMON_ARGS_H
+#define QBIT_COMMON_ARGS_H
 
 #include <common/settings.h>
 #include <compat/compat.h>
@@ -448,6 +448,15 @@ private:
         const std::map<std::string, std::vector<common::SettingsValue>>& args) const;
 };
 
+/**
+ * Enforce qbit's official testnet-only release posture.
+ *
+ * This is intentionally separate from ArgsManager::GetChainType() so tests,
+ * help/version paths, and config parsing can inspect chain arguments without
+ * turning every default mainnet parse into a startup failure.
+ */
+void CheckTestnetOnlyReleaseChain(ChainType chain);
+
 extern ArgsManager gArgs;
 
 /**
@@ -497,4 +506,4 @@ private:
 #endif
 } // namespace common
 
-#endif // BITCOIN_COMMON_ARGS_H
+#endif // QBIT_COMMON_ARGS_H

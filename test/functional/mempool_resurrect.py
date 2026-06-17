@@ -16,6 +16,8 @@ class MempoolCoinbaseTest(BitcoinTestFramework):
     def run_test(self):
         node = self.nodes[0]
         wallet = MiniWallet(node)
+        # Mature the default-cache coinbase UTXOs
+        self.ensure_cached_coinbase_mature(node)
 
         # Spend block 1/2/3's coinbase transactions
         # Mine a block

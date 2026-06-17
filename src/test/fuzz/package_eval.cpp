@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <chainparams.h>
 #include <consensus/validation.h>
 #include <node/context.h>
 #include <node/mempool_args.h>
@@ -27,6 +28,7 @@ using node::NodeContext;
 namespace {
 
 const TestingSetup* g_setup;
+constexpr int NUM_MATURE_COINS{50};
 std::vector<COutPoint> g_outpoints_coinbase_init_mature;
 
 struct MockedTxPool : public CTxMemPool {
@@ -40,16 +42,18 @@ struct MockedTxPool : public CTxMemPool {
 
 void initialize_tx_pool()
 {
-    static const auto testing_setup = MakeNoLogFileContext<const TestingSetup>();
+    static const auto testing_setup = MakeNoLogFileContext<const TestingSetup>(
+        ChainType::REGTEST,
+        {.extra_args = {"-p2mronly=0"}});
     g_setup = testing_setup.get();
     SetMockTime(WITH_LOCK(g_setup->m_node.chainman->GetMutex(), return g_setup->m_node.chainman->ActiveTip()->Time()));
 
     BlockAssembler::Options options;
     options.coinbase_output_script = P2WSH_EMPTY;
 
-    for (int i = 0; i < 2 * COINBASE_MATURITY; ++i) {
+    for (int i = 0; i < COINBASE_MATURITY + NUM_MATURE_COINS; ++i) {
         COutPoint prevout{MineBlock(g_setup->m_node, options)};
-        if (i < COINBASE_MATURITY) {
+        if (i < NUM_MATURE_COINS) {
             // Remember the txids to avoid expensive disk access later on
             g_outpoints_coinbase_init_mature.push_back(prevout);
         }
@@ -205,7 +209,7 @@ FUZZ_TARGET(ephemeral_package_eval, .init = initialize_tx_pool)
     std::unordered_map<COutPoint, CAmount, SaltedOutpointHasher> outpoints_value;
     for (const auto& outpoint : g_outpoints_coinbase_init_mature) {
         Assert(mempool_outpoints.insert(outpoint).second);
-        outpoints_value[outpoint] = 50 * COIN;
+        outpoints_value[outpoint] = GetBlockSubsidy(1, Params().GetConsensus());
     }
 
     auto outpoints_updater = std::make_shared<OutpointsUpdater>(mempool_outpoints);
@@ -360,7 +364,7 @@ FUZZ_TARGET(tx_package_eval, .init = initialize_tx_pool)
     std::unordered_map<COutPoint, CAmount, SaltedOutpointHasher> outpoints_value;
     for (const auto& outpoint : g_outpoints_coinbase_init_mature) {
         Assert(mempool_outpoints.insert(outpoint).second);
-        outpoints_value[outpoint] = 50 * COIN;
+        outpoints_value[outpoint] = GetBlockSubsidy(1, Params().GetConsensus());
     }
 
     auto outpoints_updater = std::make_shared<OutpointsUpdater>(mempool_outpoints);

@@ -7,22 +7,26 @@
 from test_framework.descriptors import descsum_create
 from test_framework.psbt import PSBT, PSBT_IN_SHA256
 from test_framework.test_framework import BitcoinTestFramework
-from test_framework.util import assert_equal
+from test_framework.util import (
+    assert_equal,
+    bisect_last_true,
+    find_first_false,
+)
 
 
 TPRVS = [
-    "tprv8ZgxMBicQKsPerQj6m35no46amfKQdjY7AhLnmatHYXs8S4MTgeZYkWAn4edSGwwL3vkSiiGqSZQrmy5D3P5gBoqgvYP2fCUpBwbKTMTAkL",
-    "tprv8ZgxMBicQKsPd3cbrKjE5GKKJLDEidhtzSSmPVtSPyoHQGL2LZw49yt9foZsN9BeiC5VqRaESUSDV2PS9w7zAVBSK6EQH3CZW9sMKxSKDwD",
-    "tprv8iF7W37EHnVEtDr9EFeyFjQJFL6SfGby2AnZ2vQARxTQHQXy9tdzZvBBVp8a19e5vXhskczLkJ1AZjqgScqWL4FpmXVp8LLjiorcrFK63Sr",
+    "qrpvV1brS3WRoVwgU4CkL39FD952r9WVknTPcMna3QHRWQtdVw5Vxtes66vT2D8gVfq9ub4bCGQ8iRF7XBVnUTY8W8ttaw5BpGXAmvoxtvKR3zF",
+    "qrpvV1brS3WRoVwgSFQd5bqPVcLFZi4R4nRkVdXze8aycrA3mmMAqmwMhLJRux3vRY4sHjDLayG6KT7v9Rv9RMH2zSGVD6mD4eXFTtjiuRY78AQ",
+    "qrpvVAA1atu3gxZXhReATXm8g5REWhwd1RKpXMsnHZ6heppAeuZ7f6eJ7GbTjxcd4YXJW4qiWAgCdGgsE9NPi2zZA1LsfY2cuwfRgYizRkQsjkA",
 ]
 TPUBS = [
-    "tpubD6NzVbkrYhZ4YPAbyf6urxqqnmJF79PzQtyERAmvkSVS9fweCTjxjDh22Z5St9fGb1a5DUCv8G27nYupKP1Ctr1pkamJossoetzws1moNRn",
-    "tpubD6NzVbkrYhZ4YMQC15JS7QcrsAyfGrGiykweqMmPxTkEVScu7vCZLNpPXW1XphHwzsgmqdHWDQAfucbM72EEB1ZEyfgZxYvkZjYVXx1xS9p",
-    "tpubD6NzVbkrYhZ4YU9vM1s53UhD75UyJatx8EMzMZ3VUjR2FciNfLLkAw6a4pWACChzobTseNqdWk4G7ZdBqRDLtLSACKykTScmqibb1ZrCvJu",
-    "tpubD6NzVbkrYhZ4XRMcMFMMFvzVt6jaDAtjZhD7JLwdPdMm9xa76DnxYYP7w9TZGJDVFkek3ArwVsuacheqqPog8TH5iBCX1wuig8PLXim4n9a",
-    "tpubD6NzVbkrYhZ4WsqRzDmkL82SWcu42JzUvKWzrJHQ8EC2vEHRHkXj1De93sD3biLrKd8XGnamXURGjMbYavbszVDXpjXV2cGUERucLJkE6cy",
-    "tpubDEFLeBkKTm8aiYkySz8hXAXPVnPSfxMi7Fxhg9sejUrkwJuRWvPdLEiXjTDbhGbjLKCZUDUUibLxTnK5UP1q7qYrSnPqnNe7M8mvAW1STcc",
-    "tpubD6NzVbkrYhZ4WR99ygpiJvPMAJiwahjLgGywc5vJx2gUfKUfEPCrbKmQczDPJZmLcyZzRb5Ti6rfUb89S2WFyPH7FDtD6RFDA1hdgTEgEUL",
+    "qrpbSRJj3eCrXD2z5X4khS9RfsKBCrBRhEtae4cdsnJm3bhrz8kGwkeewfdErBfrEtLUERxL67P86a3V3k8bYUzFqgo4cHMh3DCnucofMcF92R4",
+    "qrpbSRJj3eCrXD2z5VJLirLwvK6CHFrqrwmKCvb4HyJEFcxfKuRXsD7FYpkcM8bwBRy9eJ52iGTiBiC3Aop8L8DH7rLUqNGxBtFjpTMD2V36Ucx",
+    "qrpbSRJj3eCrXD2z5c454nuarPAYXAN9tgPYMQ1PpAaKmtdT65X1QdFSPP2ntT6ZYwPCT1r8X21qV45dNkqy4XCPqBDQ42a8gmwm6SQJW3oDbsT",
+    "qrpbSRJj3eCrXD2z4ZFm52Ps4qTqJBckoGPKnrrWkxUTgnaBzRNjqWhekzKLkn3xd2tguB2zup39UBvwstsd4Vnj5J4KZsnuFHEhvrC42DjZcGs",
+    "qrpbSRJj3eCrXD2z41jahzpG92VmvhnEcQV59VAQJupERPQTkh6433SRDfaMsVoSxT23y3Wn9RkyVnSdzYpKp2avwKzmgS7sFwbTV9iKpt2DTDZ",
+    "qrpbSZB5CECKSGcWFgf8AmBDL4ziusGdG3rJLRc78mQV2e5Bmmi4GDJKYgekZ5p141GvyjapLregguNKiyXrhUzt4gL6JUzE1hy6bradf1LryMZ",
+    "qrpbSRJj3eCrXD2z3Z3JhTsE7prgaPc8AoDvuSdM4hT9FBtuVnHHyg7YomhdSconfJSYGPxFJEFfgQt2jnLvf8VJvE4M6vUbKkaCQjWMB3ViTVR",
 ]
 PUBKEYS = [
     "02aebf2d10b040eb936a6f02f44ee82f8b34f5c1ccb20ff3949c2b28206b7c1068",
@@ -319,6 +323,8 @@ class WalletMiniscriptTest(BitcoinTestFramework):
             self.ms_sig_wallet.sendrawtransaction(res["hex"])
 
     def run_test(self):
+        self.ensure_cached_coinbase_mature(self.nodes[0])
+
         self.log.info("Making a descriptor wallet")
         self.funder = self.nodes[0].get_wallet_rpc(self.default_wallet_name)
         self.nodes[0].createwallet(
@@ -370,28 +376,59 @@ class WalletMiniscriptTest(BitcoinTestFramework):
                 desc.get("sha256_preimages"),
             )
 
-        # Test we can sign for a max-size TapMiniscript. Recompute the maximum accepted size
-        # for a TapMiniscript (see cpp file for details). Then pad a simple pubkey check up
-        # to the maximum size. Make sure we can import and spend this script.
+        # Test we can sign for a max-size TapMiniscript. The exact accepted boundary can
+        # vary with policy parameters, so derive it by searching for the largest importable
+        # padding and then verifying one additional byte fails.
+        tapmini_base_watchonly = f"pk({TPUBS[0]}/*)"
+        tapmini_base_signing = f"pk({TPRVS[0]}/*)"
+        tapmini_cache = {}
+
+        def import_tapmini_with_padding(padding):
+            assert padding >= 1
+            if padding not in tapmini_cache:
+                ms = f"{'n' * padding}:{tapmini_base_watchonly}"
+                desc = f"tr({PUBKEYS[0]},{ms})"
+                tapmini_cache[padding] = (
+                    desc,
+                    self.ms_wo_wallet.importdescriptors(
+                        [
+                            {
+                                "desc": descsum_create(desc),
+                                "active": False,
+                                "timestamp": "now",
+                            }
+                        ]
+                    )[0],
+                )
+            return tapmini_cache[padding]
+
+        # Start near the historical estimate and binary-search the real limit.
         leeway_weight = (4 + 4 + 1 + 36 + 4 + 1 + 1 + 8 + 1 + 1 + 33) * 4 + 2
-        max_tapmini_size = 400_000 - 3 - (1 + 65) * 1_000 - 3 - (33 + 32 * 128) - leeway_weight - 5
-        padding = max_tapmini_size - 33 - 1
-        ms = f"pk({TPRVS[0]}/*)"
-        ms = "n" * padding + ":" + ms
-        desc = f"tr({PUBKEYS[0]},{ms})"
-        self.signing_test(desc, None, None, 1, 3, None)
-        # This was really the maximum size, one more byte and we can't import it.
-        ms = "n" + ms
-        desc = f"tr({PUBKEYS[0]},{ms})"
-        res = self.ms_wo_wallet.importdescriptors(
-            [
-                {
-                    "desc": descsum_create(desc),
-                    "active": False,
-                    "timestamp": "now",
-                }
-            ]
-        )[0]
+        max_tapmini_size_guess = (
+            400_000 - 3 - (1 + 65) * 1_000 - 3 - (33 + 32 * 128) - leeway_weight - 5
+        )
+        low_padding = 1
+        high_padding = max(2, max_tapmini_size_guess - 33 - 1)
+
+        _, low_res = import_tapmini_with_padding(low_padding)
+        assert low_res["success"], low_res
+
+        def tapmini_padding_success(padding):
+            _desc, res = import_tapmini_with_padding(padding)
+            return res["success"]
+
+        high_padding = find_first_false(start=high_padding, predicate=tapmini_padding_success)
+        low_padding = bisect_last_true(
+            low_true=low_padding,
+            high_false=high_padding,
+            predicate=tapmini_padding_success,
+        )
+
+        signing_ms = f"{'n' * low_padding}:{tapmini_base_signing}"
+        signing_desc = f"tr({PUBKEYS[0]},{signing_ms})"
+        self.signing_test(signing_desc, None, None, 1, 3, None)
+
+        _, res = import_tapmini_with_padding(high_padding)
         assert not res["success"]
         assert "is not a valid descriptor function" in res["error"]["message"]
 

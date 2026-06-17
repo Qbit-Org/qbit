@@ -993,8 +993,8 @@ Ondertekenen is alleen mogelijk met adressen van het type 'legacy'.</translation
         <translation type="unfinished">(%1 geblokkeerd)</translation>
     </message>
     <message>
-        <source>Can vary +/- %1 satoshi(s) per input.</source>
-        <translation type="unfinished">Kan per input +/- %1 satoshi(s)  variëren.</translation>
+        <source>Can vary +/- %1 bits per input.</source>
+        <translation type="unfinished">Kan per input +/- %1 bits  variëren.</translation>
     </message>
     <message>
         <source>(no label)</source>
@@ -2804,13 +2804,13 @@ Voor meer informatie over het gebruik van deze console, type %6.
     <message>
         <source>Specify a custom fee per kB (1,000 bytes) of the transaction's virtual size.
 
-Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 satoshis per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 satoshis.</source>
+Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 bits per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 bits.</source>
         <translation type="unfinished">Specificeer handmatig een vergoeding per kB (1.000 bytes) voor de virtuele transactiegrootte.
 
-Notitie: Omdat de vergoeding per byte wordt gerekend, zal een vergoeding van "100 satoshis per kvB" voor een transactie ten grootte van 500 virtuele bytes (de helft van 1 kvB) uiteindelijk een vergoeding van maar 50 satoshis betekenen.</translation>
+Notitie: Omdat de vergoeding per byte wordt gerekend, zal een vergoeding van "100 bits per kvB" voor een transactie ten grootte van 500 virtuele bytes (de helft van 1 kvB) uiteindelijk een vergoeding van maar 50 bits betekenen.</translation>
     </message>
     <message>
-        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for bitcoin transactions than the network can process.</source>
+        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for qbit transactions than the network can process.</source>
         <translation type="unfinished">De minimale toeslag betalen is prima mits het transactievolume kleiner is dan de ruimte in de blokken. Let wel op dat dit tot gevolg kan hebben dat een transactie nooit wordt bevestigd als er meer vraag is naar bitcointransacties dan het netwerk kan verwerken.</translation>
     </message>
     <message>
@@ -3092,7 +3092,7 @@ Notitie: Omdat de vergoeding per byte wordt gerekend, zal een vergoeding van "10
         <translation type="unfinished">Het te sturen bedrag in de geselecteerde eenheid</translation>
     </message>
     <message>
-        <source>The fee will be deducted from the amount being sent. The recipient will receive less bitcoins than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
+        <source>The fee will be deducted from the amount being sent. The recipient will receive less QBT than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
         <translation type="unfinished">De transactiekosten zal worden afgetrokken van het bedrag dat verstuurd wordt. De ontvangers zullen minder bitcoins ontvangen dan ingevoerd is in het hoeveelheidsveld. Als er meerdere ontvangers geselecteerd zijn, dan worden de transactiekosten gelijk verdeeld.</translation>
     </message>
     <message>
@@ -3802,8 +3802,8 @@ Ga naar Bestand &gt; Wallet openen om een wallet te laden.
         <translation type="unfinished">%s kon de momentopnamestatus -assumeutxo niet valideren. Dit duidt op een hardwareprobleem, een fout in de software of een slechte softwarewijziging waardoor een ongeldige momentopname kon worden geladen. Als gevolg hiervan wordt het node afgesloten en stopt het met het gebruik van elke status die op de momentopname is gebouwd, waardoor de ketenhoogte wordt gereset van %d naar %d. Bij de volgende herstart hervat het node de synchronisatie vanaf %d zonder momentopnamegegevens te gebruiken. Rapporteer dit incident aan %s, inclusief hoe u aan de momentopname bent gekomen. De kettingstatus van de ongeldige momentopname is op schijf achtergelaten voor het geval dit nuttig is bij het diagnosticeren van het probleem dat deze fout heeft veroorzaakt.</translation>
     </message>
     <message>
-        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/p2p-bad-ports.md for details and a full list.</source>
-        <translation type="unfinished">%s verzoekt om te luisteren op poort %u. Deze poort wordt als "slecht" beschouwd en het is daarom onwaarschijnlijk dat Bitcoin Core peers er verbinding mee maken. Zie doc/p2p-bad-ports.md voor details en een volledige lijst.</translation>
+        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/reference/p2p-bad-ports.md for details and a full list.</source>
+        <translation type="unfinished">%s verzoekt om te luisteren op poort %u. Deze poort wordt als "slecht" beschouwd en het is daarom onwaarschijnlijk dat Bitcoin Core peers er verbinding mee maken. Zie doc/reference/p2p-bad-ports.md voor details en een volledige lijst.</translation>
     </message>
     <message>
         <source>Disk space for %s may not accommodate the block files. Approximately %u GB of data will be stored in this directory.</source>

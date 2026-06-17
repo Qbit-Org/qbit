@@ -29,6 +29,17 @@ from test_framework.script_util import (
     script_to_p2wsh_script,
 )
 
+QBIT_WIF_PREFIXES = {
+    "": 159,
+    "main": 159,
+    "test": 178,
+    "testnet": 178,
+    "testnet3": 178,
+    "testnet4": 178,
+    "signet": 178,
+    "regtest": 166,
+}
+
 Key = namedtuple('Key', ['privkey',
                          'pubkey',
                          'p2pkh_script',
@@ -112,10 +123,13 @@ def test_address(node, address, **kwargs):
         elif addr_info[key] != value:
             raise AssertionError("key {} value {} did not match expected value {}".format(key, addr_info[key], value))
 
-def bytes_to_wif(b, compressed=True):
+def bytes_to_wif(b, compressed=True, *, chain="regtest", version=None):
+    if version is None:
+        version = QBIT_WIF_PREFIXES[chain]
+    b = bytes(b)
     if compressed:
         b += b'\x01'
-    return byte_to_base58(b, 239)
+    return byte_to_base58(b, version)
 
 def generate_keypair(compressed=True, wif=False):
     """Generate a new random keypair and return the corresponding ECKey /

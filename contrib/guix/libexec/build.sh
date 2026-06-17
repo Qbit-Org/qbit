@@ -142,19 +142,13 @@ export GUIX_LD_WRAPPER_DISABLE_RPATH=yes
 
 # Determine the correct value for -Wl,--dynamic-linker for the current $HOST
 case "$HOST" in
-    *linux*)
-        glibc_dynamic_linker=$(
-            case "$HOST" in
-                x86_64-linux-gnu)      echo /lib64/ld-linux-x86-64.so.2 ;;
-                arm-linux-gnueabihf)   echo /lib/ld-linux-armhf.so.3 ;;
-                aarch64-linux-gnu)     echo /lib/ld-linux-aarch64.so.1 ;;
-                riscv64-linux-gnu)     echo /lib/ld-linux-riscv64-lp64d.so.1 ;;
-                powerpc64-linux-gnu)   echo /lib64/ld64.so.1;;
-                powerpc64le-linux-gnu) echo /lib64/ld64.so.2;;
-                *)                     exit 1 ;;
-            esac
-        )
-        ;;
+    x86_64-linux-gnu)      glibc_dynamic_linker=/lib64/ld-linux-x86-64.so.2 ;;
+    arm-linux-gnueabihf)   glibc_dynamic_linker=/lib/ld-linux-armhf.so.3 ;;
+    aarch64-linux-gnu)     glibc_dynamic_linker=/lib/ld-linux-aarch64.so.1 ;;
+    riscv64-linux-gnu)     glibc_dynamic_linker=/lib/ld-linux-riscv64-lp64d.so.1 ;;
+    powerpc64-linux-gnu)   glibc_dynamic_linker=/lib64/ld64.so.1 ;;
+    powerpc64le-linux-gnu) glibc_dynamic_linker=/lib64/ld64.so.2 ;;
+    *linux*)               exit 1 ;;
 esac
 
 # Environment variables for determinism
@@ -206,7 +200,19 @@ mkdir -p "$OUTDIR"
 ###########################
 
 # CONFIGFLAGS
-CONFIGFLAGS="-DREDUCE_EXPORTS=ON -DBUILD_BENCH=OFF -DBUILD_GUI_TESTS=OFF -DBUILD_FUZZ_BINARY=OFF"
+qbit_testnet_only_release_default=OFF
+case "$DISTNAME" in
+    qbit-*-testnet*) qbit_testnet_only_release_default=ON ;;
+esac
+QBIT_TESTNET_ONLY_RELEASE="${QBIT_TESTNET_ONLY_RELEASE:-$qbit_testnet_only_release_default}"
+case "$QBIT_TESTNET_ONLY_RELEASE" in
+    ON|OFF|TRUE|FALSE|YES|NO|Y|N|1|0|on|off|true|false|yes|no|y|n) ;;
+    *)
+        echo "QBIT_TESTNET_ONLY_RELEASE must be a CMake boolean value: $QBIT_TESTNET_ONLY_RELEASE" >&2
+        exit 1
+        ;;
+esac
+CONFIGFLAGS="-DREDUCE_EXPORTS=ON -DBUILD_BENCH=OFF -DBUILD_GUI_TESTS=OFF -DBUILD_FUZZ_BINARY=OFF -DQBIT_TESTNET_ONLY_RELEASE=$QBIT_TESTNET_ONLY_RELEASE"
 
 # CFLAGS
 HOST_CFLAGS="-O2 -g"
@@ -245,7 +251,7 @@ mkdir -p "$DISTSRC"
           -Werror=dev \
           ${CONFIGFLAGS}
 
-    # Build Bitcoin Core
+    # Build qbit
     cmake --build build -j "$JOBS" ${V:+--verbose}
 
     # Perform basic security checks on a series of executables.
@@ -259,16 +265,16 @@ mkdir -p "$DISTSRC"
     case "$HOST" in
         *mingw*)
             cmake --build build -j "$JOBS" -t deploy ${V:+--verbose}
-            mv build/bitcoin-win64-setup.exe "${OUTDIR}/${DISTNAME}-win64-setup-unsigned.exe"
+            mv build/qbit-win64-setup.exe "${OUTDIR}/${DISTNAME}-win64-setup-unsigned.exe"
             ;;
     esac
 
-    # Setup the directory where our Bitcoin Core build for HOST will be
+    # Setup the directory where our qbit build for HOST will be
     # installed. This directory will also later serve as the input for our
     # binary tarballs.
     INSTALLPATH="${PWD}/installed/${DISTNAME}"
     mkdir -p "${INSTALLPATH}"
-    # Install built Bitcoin Core to $INSTALLPATH
+    # Install built qbit to $INSTALLPATH
     case "$HOST" in
         *darwin*)
             # This workaround can be dropped for CMake >= 3.27.
@@ -297,16 +303,16 @@ mkdir -p "$DISTSRC"
 
         case "$HOST" in
             *mingw*)
-                cp "${DISTSRC}/doc/README_windows.txt" "${DISTNAME}/readme.txt"
+                cp "${DISTSRC}/doc/build/README_windows.txt" "${DISTNAME}/readme.txt"
                 ;;
             *linux*)
                 cp "${DISTSRC}/README.md" "${DISTNAME}/"
                 ;;
         esac
 
-        # copy over the example bitcoin.conf file. if contrib/devtools/gen-bitcoin-conf.sh
-        # has not been run before buildling, this file will be a stub
-        cp "${DISTSRC}/share/examples/bitcoin.conf" "${DISTNAME}/"
+        # copy over the example qbit.conf file. if contrib/devtools/gen-qbit-conf.sh
+        # has not been run before building, this file will be a stub
+        cp "${DISTSRC}/share/examples/qbit.conf" "${DISTNAME}/"
 
         cp -r "${DISTSRC}/share/rpcauth" "${DISTNAME}/share/"
 
@@ -369,7 +375,12 @@ mkdir -p "$DISTSRC"
             ;;
         *darwin*)
             cmake --build build --target deploy ${V:+--verbose}
-            mv build/dist/Bitcoin-Core.zip "${OUTDIR}/${DISTNAME}-${HOST}-unsigned.zip"
+            unsigned_zip="$(find build/dist -maxdepth 1 -type f -name '*.zip' -print -quit)"
+            if [ -z "$unsigned_zip" ]; then
+                echo "Error: macOS deploy zip not found under build/dist" >&2
+                exit 1
+            fi
+            mv "$unsigned_zip" "${OUTDIR}/${DISTNAME}-${HOST}-unsigned.zip"
             mkdir -p "unsigned-app-${HOST}"
             cp  --target-directory="unsigned-app-${HOST}" \
                 contrib/macdeploy/detached-sig-create.sh

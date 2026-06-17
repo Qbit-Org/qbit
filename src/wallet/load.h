@@ -3,8 +3,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_WALLET_LOAD_H
-#define BITCOIN_WALLET_LOAD_H
+#ifndef QBIT_WALLET_LOAD_H
+#define QBIT_WALLET_LOAD_H
 
 #include <string>
 #include <vector>
@@ -31,4 +31,4 @@ void StartWallets(WalletContext& context);
 void UnloadWallets(WalletContext& context);
 } // namespace wallet
 
-#endif // BITCOIN_WALLET_LOAD_H
+#endif // QBIT_WALLET_LOAD_H

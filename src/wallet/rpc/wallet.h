@@ -2,15 +2,18 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_WALLET_RPC_WALLET_H
-#define BITCOIN_WALLET_RPC_WALLET_H
+#ifndef QBIT_WALLET_RPC_WALLET_H
+#define QBIT_WALLET_RPC_WALLET_H
 
 #include <span.h>
 
 class CRPCCommand;
+class CRPCTable;
 
 namespace wallet {
 std::span<const CRPCCommand> GetWalletRPCCommands();
+std::span<const CRPCCommand> GetWalletExternalSignerRPCCommands();
+void RegisterWalletRPCCommands(CRPCTable& t);
 } // namespace wallet
 
-#endif // BITCOIN_WALLET_RPC_WALLET_H
+#endif // QBIT_WALLET_RPC_WALLET_H

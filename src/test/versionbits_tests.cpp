@@ -5,12 +5,16 @@
 #include <chain.h>
 #include <chainparams.h>
 #include <consensus/params.h>
+#include <primitives/block.h>
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
+#include <util/check.h>
 #include <util/chaintype.h>
 #include <versionbits.h>
 #include <versionbits_impl.h>
 
+#include <algorithm>
+#include <memory>
 #include <boost/test/unit_test.hpp>
 
 /* Define a virtual block time, one block per 10 minutes after Nov 14 2014, 0:55:36am */
@@ -181,6 +185,25 @@ public:
 
     CBlockIndex* Tip() { return vpblock.empty() ? nullptr : vpblock.back(); }
 };
+
+static std::vector<std::unique_ptr<CBlockIndex>> BuildSignalChain(const int blocks, const int32_t version)
+{
+    std::vector<std::unique_ptr<CBlockIndex>> chain;
+    chain.reserve(blocks);
+    for (int i = 0; i < blocks; ++i) {
+        CBlockHeader header;
+        header.nVersion = version;
+        header.nTime = TestTime(i + 1);
+        header.nBits = 0x207fffff;
+
+        auto index = std::make_unique<CBlockIndex>(header);
+        index->nHeight = i;
+        index->pprev = chain.empty() ? nullptr : chain.back().get();
+        index->BuildSkip();
+        chain.emplace_back(std::move(index));
+    }
+    return chain;
+}
 
 BOOST_FIXTURE_TEST_SUITE(versionbits_tests, BasicTestingSetup)
 
@@ -477,6 +500,60 @@ BOOST_FIXTURE_TEST_CASE(versionbits_computeblockversion, BlockVersionTest)
         args.ForceSetArg("-vbparams", "testdummy:1199145601:1230767999:403200"); // January 1, 2008 - December 31, 2008, min act height 403200
         const auto chainParams = CreateChainParams(args, ChainType::REGTEST);
         check_computeblockversion(vbcache, chainParams->GetConsensus(), Consensus::DEPLOYMENT_TESTDUMMY);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(versionbits_deployment_bit_guards)
+{
+    VersionBitsCache vbcache;
+    const auto chain_params = CreateChainParams(*m_node.args, ChainType::REGTEST);
+
+    {
+        Consensus::Params params = chain_params->GetConsensus();
+        params.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = BLOCK_VERSION_SIGNAL_BITS;
+        BOOST_CHECK_EXCEPTION(
+            vbcache.ComputeBlockVersion(nullptr, params),
+            NonFatalCheckError,
+            [](const NonFatalCheckError&) { return true; });
+    }
+
+    {
+        Consensus::Params params = chain_params->GetConsensus();
+        params.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = params.vDeployments[Consensus::DEPLOYMENT_TAPROOT].bit;
+        BOOST_CHECK_EXCEPTION(
+            vbcache.ComputeBlockVersion(nullptr, params),
+            NonFatalCheckError,
+            [](const NonFatalCheckError&) { return true; });
+    }
+
+    {
+        Consensus::Params params = chain_params->GetConsensus();
+        params.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = BLOCK_VERSION_SIGNAL_BITS - 1;
+        BOOST_CHECK_NO_THROW(vbcache.ComputeBlockVersion(nullptr, params));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(versionbits_unknown_warning_ignores_metadata_bits)
+{
+    VersionBitsCache vbcache;
+    const auto chain_params = CreateChainParams(*m_node.args, ChainType::REGTEST);
+    const int period = chain_params->GetConsensus().vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].period;
+    auto chain = BuildSignalChain(period * 4, MakeVersion(/*chain_id=*/0, /*auxpow=*/false, /*version_bits=*/static_cast<uint8_t>(1 << 7)));
+
+    {
+        const auto warnings = vbcache.CheckUnknownActivations(chain.back().get(), *chain_params);
+        BOOST_CHECK(!warnings.empty());
+        BOOST_CHECK(std::any_of(warnings.begin(), warnings.end(), [](const auto& warning) { return warning.first == 7; }));
+    }
+
+    vbcache.Clear();
+
+    {
+        for (const auto& block : chain) {
+            block->nVersion = MakeVersion(/*chain_id=*/31430, /*auxpow=*/true, /*version_bits=*/0);
+        }
+        const auto warnings = vbcache.CheckUnknownActivations(chain.back().get(), *chain_params);
+        BOOST_CHECK(warnings.empty());
     }
 }
 

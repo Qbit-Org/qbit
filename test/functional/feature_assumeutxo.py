@@ -10,6 +10,8 @@ The assumeutxo value generated and used here is committed to in
 `CRegTestParams::m_assumeutxo_data` in `src/kernel/chainparams.cpp`.
 """
 import contextlib
+from pathlib import Path
+import re
 from shutil import rmtree
 
 from dataclasses import dataclass
@@ -25,6 +27,7 @@ from test_framework.messages import (
     from_hex,
     MAGIC_BYTES,
     MAX_MONEY,
+    NODE_ARCHIVE,
     msg_headers,
     ser_varint,
     tx_from_hex,
@@ -32,7 +35,10 @@ from test_framework.messages import (
 from test_framework.p2p import (
     P2PInterface,
 )
-from test_framework.test_framework import BitcoinTestFramework
+from test_framework.test_framework import (
+    BitcoinTestFramework,
+    SkipTest,
+)
 from test_framework.util import (
     assert_approx,
     assert_equal,
@@ -59,7 +65,22 @@ FINAL_HEIGHT = 399
 COMPLETE_IDX = {'synced': True, 'best_block_height': FINAL_HEIGHT}
 
 
+def regtest_assumeutxo_configured():
+    here = Path(__file__).resolve()
+    root = next((p for p in (here.parent, *here.parents) if (p / "src/kernel/chainparams.cpp").is_file()), None)
+    if root is None:
+        return True
+    chainparams = (root / "src/kernel/chainparams.cpp").read_text(encoding="utf-8")
+    match = re.search(r"class CRegTestParams\b.*?m_assumeutxo_data\s*=\s*\{(.*?)\};", chainparams, re.DOTALL)
+    if match is None:
+        return True
+    return bool(match.group(1).strip())
+
+
 class AssumeutxoTest(BitcoinTestFramework):
+    def skip_test_if_missing_module(self):
+        if not regtest_assumeutxo_configured():
+            raise SkipTest("regtest assumeutxo snapshots are not configured")
 
     def set_test_params(self):
         """Use the pregenerated, deterministic chain up to height 199."""
@@ -330,8 +351,8 @@ class AssumeutxoTest(BitcoinTestFramework):
 
         # Once the headers-chain is synced, the ibd_node must avoid requesting historical blocks from the snapshot_node.
         # If it does request such blocks, the snapshot_node will ignore requests it cannot fulfill, causing the ibd_node
-        # to stall. This stall could last for up to 10 min, ultimately resulting in an abrupt disconnection due to the
-        # ibd_node's perceived unresponsiveness.
+        # to stall. This stall could last for up to the validated-block download timeout, ultimately resulting in an
+        # abrupt disconnection due to the ibd_node's perceived unresponsiveness.
         ensure_for(duration=3, f=lambda: len(ibd_node.getpeerinfo()[0]['inflight']) == 0)
 
         # Now disconnect nodes and finish background chain sync
@@ -341,6 +362,7 @@ class AssumeutxoTest(BitcoinTestFramework):
         # Check the base snapshot block was stored and ensure node signals full-node service support
         self.wait_until(lambda: not try_rpc(-1, "Block not available (not fully downloaded)", snapshot_node.getblock, snapshot_block_hash))
         self.wait_until(lambda: 'NETWORK' in snapshot_node.getnetworkinfo()['localservicesnames'])
+        self.wait_until(lambda: int(snapshot_node.getnetworkinfo()['localservices'], 16) & NODE_ARCHIVE)
 
         # Now that the snapshot_node is synced, verify the ibd_node can sync from it
         self.connect_nodes(snapshot_node.index, ibd_node.index)
@@ -350,6 +372,7 @@ class AssumeutxoTest(BitcoinTestFramework):
     def assert_only_network_limited_service(self, node):
         node_services = node.getnetworkinfo()['localservicesnames']
         assert 'NETWORK' not in node_services
+        assert 'ARCHIVE' not in node_services
         assert 'NETWORK_LIMITED' in node_services
 
     @contextlib.contextmanager
@@ -736,6 +759,7 @@ class AssumeutxoTest(BitcoinTestFramework):
 
         # Once background chain sync completes, the full node must start offering historical blocks again.
         self.wait_until(lambda: {'NETWORK', 'NETWORK_LIMITED'}.issubset(n2.getnetworkinfo()['localservicesnames']))
+        self.wait_until(lambda: int(n2.getnetworkinfo()['localservices'], 16) & NODE_ARCHIVE)
 
         completed_idx_state = {
             'basic block filter index': COMPLETE_IDX,

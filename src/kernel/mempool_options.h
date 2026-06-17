@@ -1,8 +1,8 @@
 // Copyright (c) 2022 The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
-#ifndef BITCOIN_KERNEL_MEMPOOL_OPTIONS_H
-#define BITCOIN_KERNEL_MEMPOOL_OPTIONS_H
+#ifndef QBIT_KERNEL_MEMPOOL_OPTIONS_H
+#define QBIT_KERNEL_MEMPOOL_OPTIONS_H
 
 #include <kernel/mempool_limits.h>
 
@@ -17,8 +17,12 @@ class ValidationSignals;
 
 /** Default for -maxmempool, maximum megabytes of mempool memory usage */
 static constexpr unsigned int DEFAULT_MAX_MEMPOOL_SIZE_MB{300};
-/** Default for -maxmempool when blocksonly is set */
-static constexpr unsigned int DEFAULT_BLOCKSONLY_MAX_MEMPOOL_SIZE_MB{5};
+static constexpr int64_t MIN_MAX_MEMPOOL_SIZE_BYTES{
+    DEFAULT_DESCENDANT_SIZE_LIMIT_KVB * 1'000LL * kernel::MEMPOOL_DESCENDANT_SIZE_LIMIT_FACTOR};
+static constexpr unsigned int MIN_MAX_MEMPOOL_SIZE_MB{
+    static_cast<unsigned int>((MIN_MAX_MEMPOOL_SIZE_BYTES + 999'999) / 1'000'000)};
+/** Default for -maxmempool when blocksonly is set. Must remain at least the policy minimum. */
+static constexpr unsigned int DEFAULT_BLOCKSONLY_MAX_MEMPOOL_SIZE_MB{MIN_MAX_MEMPOOL_SIZE_MB};
 /** Default for -mempoolexpiry, expiration time for mempool transactions in hours */
 static constexpr unsigned int DEFAULT_MEMPOOL_EXPIRY_HOURS{336};
 /** Whether to fall back to legacy V1 serialization when writing mempool.dat */
@@ -60,4 +64,4 @@ struct MemPoolOptions {
 };
 } // namespace kernel
 
-#endif // BITCOIN_KERNEL_MEMPOOL_OPTIONS_H
+#endif // QBIT_KERNEL_MEMPOOL_OPTIONS_H

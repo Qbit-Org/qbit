@@ -3,8 +3,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_WALLET_WALLET_H
-#define BITCOIN_WALLET_WALLET_H
+#ifndef QBIT_WALLET_WALLET_H
+#define QBIT_WALLET_WALLET_H
 
 #include <addresstype.h>
 #include <consensus/amount.h>
@@ -17,6 +17,7 @@
 #include <primitives/transaction.h>
 #include <primitives/transaction_identifier.h>
 #include <script/interpreter.h>
+#include <script/p2mr_sizing.h>
 #include <script/script.h>
 #include <support/allocators/secure.h>
 #include <sync.h>
@@ -37,15 +38,18 @@
 
 #include <atomic>
 #include <cassert>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -108,7 +112,7 @@ static const CAmount DEFAULT_FALLBACK_FEE = 0;
 //! -discardfee default
 static const CAmount DEFAULT_DISCARD_FEE = 10000;
 //! -mintxfee default
-static const CAmount DEFAULT_TRANSACTION_MINFEE = 1000;
+static const CAmount DEFAULT_TRANSACTION_MINFEE = 250;
 //! -consolidatefeerate default
 static const CAmount DEFAULT_CONSOLIDATE_FEERATE{10000}; // 10 sat/vbyte
 /**
@@ -129,6 +133,8 @@ static const bool DEFAULT_SPEND_ZEROCONF_CHANGE = true;
 static const bool DEFAULT_WALLET_REJECT_LONG_CHAINS{true};
 //! -txconfirmtarget default
 static const unsigned int DEFAULT_TX_CONFIRM_TARGET = 6;
+//! Fresh P2MR wallets only need a few addresses immediately; refill the rest after creation.
+static constexpr unsigned int DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL = 16;
 //! -walletrbf default
 static const bool DEFAULT_WALLET_RBF = true;
 static const bool DEFAULT_WALLETBROADCAST = true;
@@ -141,7 +147,8 @@ constexpr CAmount HIGH_TX_FEE_PER_KB{COIN / 100};
 //! -maxtxfee will warn if called with a higher fee than this amount (in satoshis)
 constexpr CAmount HIGH_MAX_TX_FEE{100 * HIGH_TX_FEE_PER_KB};
 //! Pre-calculated constants for input size estimation in *virtual size*
-static constexpr size_t DUMMY_NESTED_P2WPKH_INPUT_SIZE = 91;
+static constexpr size_t DUMMY_NESTED_P2WPKH_INPUT_SIZE = 172;
+static constexpr size_t DUMMY_P2MR_INPUT_SIZE = P2MR_V1_SINGLE_KEY_SPEND_SIZE;
 
 class CCoinControl;
 
@@ -202,6 +209,7 @@ protected:
     const CWallet* const pwallet;
     //! The ScriptPubKeyMan to reserve from. Based on type when GetReservedDestination is called
     ScriptPubKeyMan* m_spk_man{nullptr};
+    std::weak_ptr<void> m_spk_man_lifetime;
     OutputType const type;
     //! The index of the address's key in the keypool
     int64_t nIndex{-1};
@@ -231,6 +239,54 @@ public:
     void ReturnDestination();
     //! Keep the address. Do not return its key to the keypool when this object goes out of scope
     void KeepDestination();
+};
+
+struct PubKeyDBChainKey
+{
+    int64_t account{0};
+    bool internal{false};
+
+    auto AsTuple() const
+    {
+        return std::tie(account, internal);
+    }
+
+    friend bool operator==(const PubKeyDBChainKey& a, const PubKeyDBChainKey& b)
+    {
+        return a.AsTuple() == b.AsTuple();
+    }
+
+    friend bool operator<(const PubKeyDBChainKey& a, const PubKeyDBChainKey& b)
+    {
+        return a.AsTuple() < b.AsTuple();
+    }
+};
+
+struct PubKeyDBPoolKey
+{
+    int64_t account{0};
+    bool internal{false};
+    int64_t index{0};
+
+    auto AsTuple() const
+    {
+        return std::tie(account, internal, index);
+    }
+
+    PubKeyDBChainKey Chain() const
+    {
+        return {account, internal};
+    }
+
+    friend bool operator==(const PubKeyDBPoolKey& a, const PubKeyDBPoolKey& b)
+    {
+        return a.AsTuple() == b.AsTuple();
+    }
+
+    friend bool operator<(const PubKeyDBPoolKey& a, const PubKeyDBPoolKey& b)
+    {
+        return a.AsTuple() < b.AsTuple();
+    }
 };
 
 /**
@@ -313,6 +369,7 @@ private:
     CKeyingMaterial vMasterKey GUARDED_BY(cs_wallet);
 
     bool Unlock(const CKeyingMaterial& vMasterKeyIn);
+    void ClearMasterKey() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     std::atomic<bool> fAbortRescan{false};
     std::atomic<bool> fScanningWallet{false}; // controlled by WalletRescanReserver
@@ -490,6 +547,7 @@ public:
 
     bool IsCrypted() const;
     bool IsLocked() const override;
+    bool WithWalletLock(std::function<bool()> cb) const override;
     bool Lock();
 
     /** Interface to assert chain access */
@@ -505,6 +563,9 @@ public:
     int64_t nOrderPosNext GUARDED_BY(cs_wallet) = 0;
 
     std::map<CTxDestination, CAddressBookData> m_address_book GUARDED_BY(cs_wallet);
+    std::map<PubKeyDBPoolKey, CPQCPubKey> m_pubkeydb_pool_entries GUARDED_BY(cs_wallet);
+    std::map<CPQCPubKey, PubKeyDBPoolKey> m_pubkeydb_pool_by_pubkey GUARDED_BY(cs_wallet);
+    std::map<PubKeyDBChainKey, int64_t> m_pubkeydb_cursors GUARDED_BY(cs_wallet);
     const CAddressBookData* FindAddressBookEntry(const CTxDestination&, bool allow_change = false) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     /** Set of Coins owned by this wallet that we won't try to spend from. A
@@ -597,10 +658,14 @@ public:
     Mutex m_unlock_mutex;
     // Used to prevent deleting the passphrase from memory when it is still in use.
     RecursiveMutex m_relock_mutex;
+    mutable std::mutex m_active_signing_mutex;
+    mutable std::condition_variable m_active_signing_cv;
+    mutable size_t m_active_signing_provider_snapshots{0};
+    mutable bool m_block_signing_provider_snapshots{false};
 
-    bool Unlock(const SecureString& strWalletPassphrase);
+    bool Unlock(const SecureString& strWalletPassphrase, bool run_pending_initial_keypool_top_up = true);
     bool ChangeWalletPassphrase(const SecureString& strOldWalletPassphrase, const SecureString& strNewWalletPassphrase);
-    bool EncryptWallet(const SecureString& strWalletPassphrase);
+    bool EncryptWallet(const SecureString& strWalletPassphrase, bool use_create_keypool_warmup = false);
 
     unsigned int ComputeTimeSmart(const CWalletTx& wtx, bool rescanning_old_block) const;
 
@@ -659,9 +724,9 @@ public:
     OutputType TransactionChangeType(const std::optional<OutputType>& change_type, const std::vector<CRecipient>& vecSend) const;
 
     /** Fetch the inputs and sign with SIGHASH_ALL. */
-    bool SignTransaction(CMutableTransaction& tx) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool SignTransaction(CMutableTransaction& tx, const PQCSignatureCounterObserver& pqc_counter_observer = {}) const;
     /** Sign the tx given the input coins and sighash. */
-    bool SignTransaction(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors) const;
+    bool SignTransaction(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors, const PQCSignatureCounterObserver& pqc_counter_observer = {}) const;
     SigningResult SignMessage(const std::string& message, const PKHash& pkhash, std::string& str_sig) const;
 
     /**
@@ -685,7 +750,8 @@ public:
                   bool sign = true,
                   bool bip32derivs = true,
                   size_t* n_signed = nullptr,
-                  bool finalize = true) const;
+                  bool finalize = true,
+                  const PQCSignatureCounterObserver& pqc_counter_observer = {}) const;
 
     /**
      * Submit the transaction to the node's mempool and then relay to peers.
@@ -751,6 +817,15 @@ public:
 
     size_t KeypoolCountExternalKeys() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool TopUpKeyPool(unsigned int kpSize = 0);
+    util::Result<void> TopUpKeyPoolResult(unsigned int kpSize = 0);
+    bool HasPendingInitialKeyPoolTopUp() const;
+    enum class PendingInitialKeyPoolTopUpStepResult {
+        COMPLETE,
+        PENDING,
+        FAILED,
+    };
+    PendingInitialKeyPoolTopUpStepResult RunPendingInitialKeyPoolTopUpStep();
+    bool RunPendingInitialKeyPoolTopUp();
 
     // Filter struct for 'ListAddrBookAddresses'
     struct AddrBookFilter {
@@ -814,6 +889,15 @@ public:
     std::vector<std::string> GetAddressReceiveRequests() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool SetAddressReceiveRequest(WalletBatch& batch, const CTxDestination& dest, const std::string& id, const std::string& value) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool EraseAddressReceiveRequest(WalletBatch& batch, const CTxDestination& dest, const std::string& id) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    std::set<CTxDestination> GetWalletTxOutDestinations() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool LoadPubKeyDBPoolEntry(const PubKeyDBPoolKey& key, const CPQCPubKey& pubkey) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void LoadPubKeyDBCursor(const PubKeyDBChainKey& key, int64_t next_index) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    util::Result<bool> AddPubKeyDBPoolEntry(WalletBatch& batch, const PubKeyDBPoolKey& key, const CPQCPubKey& pubkey) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool SetPubKeyDBCursor(WalletBatch& batch, const PubKeyDBChainKey& key, int64_t next_index) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    int64_t GetPubKeyDBCursor(const PubKeyDBChainKey& key) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    std::set<PubKeyDBChainKey> GetPubKeyDBChains() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    std::optional<PubKeyDBPoolKey> GetPubKeyDBPoolKey(const CPQCPubKey& pubkey) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    std::vector<std::pair<PubKeyDBPoolKey, CPQCPubKey>> GetPubKeyDBPoolEntries(const PubKeyDBChainKey& key, int64_t minimum_index = 0) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     unsigned int GetKeyPoolSize() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
@@ -1015,13 +1099,16 @@ public:
     void DeactivateScriptPubKeyMan(uint256 id, OutputType type, bool internal);
 
     //! Create new DescriptorScriptPubKeyMan and add it to the wallet
-    DescriptorScriptPubKeyMan& SetupDescriptorScriptPubKeyMan(WalletBatch& batch, const CExtKey& master_key, const OutputType& output_type, bool internal) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    DescriptorScriptPubKeyMan& SetupDescriptorScriptPubKeyMan(WalletBatch& batch, const CExtKey& master_key, const OutputType& output_type, bool internal, bool use_create_keypool_warmup = false) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     //! Create new DescriptorScriptPubKeyMans and add them to the wallet
-    void SetupDescriptorScriptPubKeyMans(WalletBatch& batch, const CExtKey& master_key) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
-    void SetupDescriptorScriptPubKeyMans() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void SetupDescriptorScriptPubKeyMans(WalletBatch& batch, const CExtKey& master_key, std::span<const OutputType> output_types, bool use_create_keypool_warmup = false) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void SetupDescriptorScriptPubKeyMans(WalletBatch& batch, const CExtKey& master_key, bool use_create_keypool_warmup = false) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void SetupDescriptorScriptPubKeyMans(std::span<const OutputType> output_types, bool use_create_keypool_warmup = false) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void SetupDescriptorScriptPubKeyMans(bool use_create_keypool_warmup = false) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     //! Create new seed and default DescriptorScriptPubKeyMans for this wallet
-    void SetupOwnDescriptorScriptPubKeyMans(WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void SetupOwnDescriptorScriptPubKeyMans(WalletBatch& batch, std::span<const OutputType> output_types, bool use_create_keypool_warmup = false) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void SetupOwnDescriptorScriptPubKeyMans(WalletBatch& batch, bool use_create_keypool_warmup = false) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     //! Return the DescriptorScriptPubKeyMan for a WalletDescriptor if it is already in the wallet
     DescriptorScriptPubKeyMan* GetDescriptorScriptPubKeyMan(const WalletDescriptor& desc) const;
@@ -1029,7 +1116,7 @@ public:
     //! Returns whether the provided ScriptPubKeyMan is internal
     //! @param[in] spk_man The ScriptPubKeyMan to test
     //! @return contains value only for active DescriptorScriptPubKeyMan, otherwise undefined
-    std::optional<bool> IsInternalScriptPubKeyMan(ScriptPubKeyMan* spk_man) const;
+    std::optional<bool> IsInternalScriptPubKeyMan(const ScriptPubKeyMan* spk_man) const override;
 
     //! Add a descriptor to the wallet, return a ScriptPubKeyMan & associated output type
     util::Result<std::reference_wrapper<DescriptorScriptPubKeyMan>> AddWalletDescriptor(WalletDescriptor& desc, const FlatSigningProvider& signing_provider, const std::string& label, bool internal) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
@@ -1062,6 +1149,11 @@ public:
     //! Find the private key for the given key id from the wallet's descriptors, if available
     //! Returns nullopt when no descriptor has the key or if the wallet is locked.
     std::optional<CKey> GetKey(const CKeyID& keyid) const;
+
+    bool TryAddActiveSigningProviderSnapshot() const;
+    void RemoveActiveSigningProviderSnapshot() const;
+    void BlockAndWaitForActiveSigningProviderSnapshots() const;
+    void UnblockActiveSigningProviderSnapshots() const;
 };
 
 /**
@@ -1133,4 +1225,4 @@ struct MigrationResult {
 [[nodiscard]] util::Result<MigrationResult> MigrateLegacyToDescriptor(std::shared_ptr<CWallet> local_wallet, const SecureString& passphrase, WalletContext& context);
 } // namespace wallet
 
-#endif // BITCOIN_WALLET_WALLET_H
+#endif // QBIT_WALLET_WALLET_H

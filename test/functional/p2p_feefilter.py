@@ -59,6 +59,8 @@ class FeeFilterTest(BitcoinTestFramework):
         ]] * self.num_nodes
 
     def run_test(self):
+        # Mature the default-cache coinbase UTXOs
+        self.ensure_cached_coinbase_mature(self.nodes[0])
         self.test_feefilter_forcerelay()
         self.test_feefilter()
         self.test_feefilter_blocksonly()

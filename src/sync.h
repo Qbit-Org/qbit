@@ -3,8 +3,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_SYNC_H
-#define BITCOIN_SYNC_H
+#ifndef QBIT_SYNC_H
+#define QBIT_SYNC_H
 
 #ifdef DEBUG_LOCKCONTENTION
 #include <logging.h>
@@ -289,4 +289,4 @@ inline MutexType* MaybeCheckNotHeld(MutexType* m) LOCKS_EXCLUDED(m) LOCK_RETURNE
 //! gcc and the -Wreturn-stack-address flag in clang, both enabled by default.
 #define WITH_LOCK(cs, code) (MaybeCheckNotHeld(cs), [&]() -> decltype(auto) { LOCK(cs); code; }())
 
-#endif // BITCOIN_SYNC_H
+#endif // QBIT_SYNC_H

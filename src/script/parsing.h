@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_SCRIPT_PARSING_H
-#define BITCOIN_SCRIPT_PARSING_H
+#ifndef QBIT_SCRIPT_PARSING_H
+#define QBIT_SCRIPT_PARSING_H
 
 #include <span.h>
 
@@ -37,4 +37,4 @@ std::span<const char> Expr(std::span<const char>& sp);
 
 } // namespace script
 
-#endif // BITCOIN_SCRIPT_PARSING_H
+#endif // QBIT_SCRIPT_PARSING_H

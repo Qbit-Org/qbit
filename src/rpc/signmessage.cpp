@@ -6,6 +6,7 @@
 #include <common/signmessage.h>
 #include <key.h>
 #include <key_io.h>
+#include <outputtype.h>
 #include <rpc/protocol.h>
 #include <rpc/request.h>
 #include <rpc/server.h>
@@ -19,7 +20,7 @@ static RPCHelpMan verifymessage()
     return RPCHelpMan{"verifymessage",
         "Verify a signed message.",
         {
-            {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The bitcoin address to use for the signature."},
+            {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The qbit address to use for the signature."},
             {"signature", RPCArg::Type::STR, RPCArg::Optional::NO, "The signature provided by the signer in base 64 encoding (see signmessage)."},
             {"message", RPCArg::Type::STR, RPCArg::Optional::NO, "The message that was signed."},
         },
@@ -30,14 +31,18 @@ static RPCHelpMan verifymessage()
             "\nUnlock the wallet for 30 seconds\n"
             + HelpExampleCli("walletpassphrase", "\"mypassphrase\" 30") +
             "\nCreate the signature\n"
-            + HelpExampleCli("signmessage", "\"1D1ZrZNe3JUo7ZycKEYQQiQAWd9y54F4XX\" \"my message\"") +
+            + HelpExampleCli("signmessage", "\"QbURpsSa6XFTg61KScF1yntyVDVb1742e2\" \"my message\"") +
             "\nVerify the signature\n"
-            + HelpExampleCli("verifymessage", "\"1D1ZrZNe3JUo7ZycKEYQQiQAWd9y54F4XX\" \"signature\" \"my message\"") +
+            + HelpExampleCli("verifymessage", "\"QbURpsSa6XFTg61KScF1yntyVDVb1742e2\" \"signature\" \"my message\"") +
             "\nAs a JSON-RPC call\n"
-            + HelpExampleRpc("verifymessage", "\"1D1ZrZNe3JUo7ZycKEYQQiQAWd9y54F4XX\", \"signature\", \"my message\"")
+            + HelpExampleRpc("verifymessage", "\"QbURpsSa6XFTg61KScF1yntyVDVb1742e2\", \"signature\", \"my message\"")
         },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
         {
+            if (IsP2MROnlyOutputChain()) {
+                throw JSONRPCError(RPC_METHOD_DEPRECATED, "Legacy message verification is disabled on this chain");
+            }
+
             std::string strAddress = self.Arg<std::string>("address");
             std::string strSign = self.Arg<std::string>("signature");
             std::string strMessage = self.Arg<std::string>("message");
@@ -77,12 +82,16 @@ static RPCHelpMan signmessagewithprivkey()
             "\nCreate the signature\n"
             + HelpExampleCli("signmessagewithprivkey", "\"privkey\" \"my message\"") +
             "\nVerify the signature\n"
-            + HelpExampleCli("verifymessage", "\"1D1ZrZNe3JUo7ZycKEYQQiQAWd9y54F4XX\" \"signature\" \"my message\"") +
+            + HelpExampleCli("verifymessage", "\"QbURpsSa6XFTg61KScF1yntyVDVb1742e2\" \"signature\" \"my message\"") +
             "\nAs a JSON-RPC call\n"
             + HelpExampleRpc("signmessagewithprivkey", "\"privkey\", \"my message\"")
         },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
         {
+            if (IsP2MROnlyOutputChain()) {
+                throw JSONRPCError(RPC_METHOD_DEPRECATED, "Legacy message signing is disabled on this chain");
+            }
+
             std::string strPrivkey = request.params[0].get_str();
             std::string strMessage = request.params[1].get_str();
 

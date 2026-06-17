@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_WALLET_EXTERNAL_SIGNER_SCRIPTPUBKEYMAN_H
-#define BITCOIN_WALLET_EXTERNAL_SIGNER_SCRIPTPUBKEYMAN_H
+#ifndef QBIT_WALLET_EXTERNAL_SIGNER_SCRIPTPUBKEYMAN_H
+#define QBIT_WALLET_EXTERNAL_SIGNER_SCRIPTPUBKEYMAN_H
 
 #include <wallet/scriptpubkeyman.h>
 
@@ -36,7 +36,7 @@ class ExternalSignerScriptPubKeyMan : public DescriptorScriptPubKeyMan
   */
  util::Result<void> DisplayAddress(const CTxDestination& dest, const ExternalSigner& signer) const;
 
-  std::optional<common::PSBTError> FillPSBT(PartiallySignedTransaction& psbt, const PrecomputedTransactionData& txdata, std::optional<int> sighash_type = std::nullopt, bool sign = true, bool bip32derivs = false, int* n_signed = nullptr, bool finalize = true) const override;
+  std::optional<common::PSBTError> FillPSBT(PartiallySignedTransaction& psbt, const PrecomputedTransactionData& txdata, std::optional<int> sighash_type = std::nullopt, bool sign = true, bool bip32derivs = false, int* n_signed = nullptr, bool finalize = true, const PQCSignatureCounterObserver& pqc_counter_observer = {}) const override;
 };
 } // namespace wallet
-#endif // BITCOIN_WALLET_EXTERNAL_SIGNER_SCRIPTPUBKEYMAN_H
+#endif // QBIT_WALLET_EXTERNAL_SIGNER_SCRIPTPUBKEYMAN_H

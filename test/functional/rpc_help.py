@@ -125,6 +125,7 @@ class HelpRpcTest(BitcoinTestFramework):
 
     def wallet_help(self):
         assert 'getnewaddress ( "label" "address_type" )' in self.nodes[0].help('getnewaddress')
+        assert 'By default, descriptor wallets on this chain have 5 active ranged descriptors ("legacy", "p2sh-segwit", "bech32", "bech32m", "p2mr")' in self.nodes[0].help('keypoolrefill')
         self.restart_node(0, extra_args=['-nowallet=1'])
         assert 'getnewaddress ( "label" "address_type" )' in self.nodes[0].help('getnewaddress')
 

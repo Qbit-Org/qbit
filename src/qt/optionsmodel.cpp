@@ -6,10 +6,11 @@
 
 #include <qt/optionsmodel.h>
 
-#include <qt/bitcoinunits.h>
+#include <qt/qbitunits.h>
 #include <qt/guiconstants.h>
 #include <qt/guiutil.h>
 
+#include <clientversion.h>
 #include <common/args.h>
 #include <interfaces/node.h>
 #include <mapport.h>
@@ -20,7 +21,9 @@
 #include <univalue.h>
 #include <util/string.h>
 #include <validation.h>
+#ifdef ENABLE_WALLET
 #include <wallet/wallet.h>
+#endif
 
 #include <QDebug>
 #include <QLatin1Char>
@@ -29,6 +32,9 @@
 #include <QVariant>
 
 const char *DEFAULT_GUI_PROXY_HOST = "127.0.0.1";
+
+static constexpr const char* DISPLAY_QBIT_UNIT_SETTING{"DisplayQbitUnit"};
+static constexpr const char* LEGACY_DISPLAY_BITCOIN_UNIT_SETTING{"DisplayBitcoinUnit"};
 
 static QString GetDefaultProxyAddress();
 
@@ -105,6 +111,26 @@ static int PruneSizeGB(const common::SettingsValue& prune_setting)
 static int ParsePruneSizeGB(const QVariant& prune_size)
 {
     return std::max(1, prune_size.toInt());
+}
+
+static bool TryParseDisplayUnit(const QVariant& value, QbitUnit& unit)
+{
+    if (value.canConvert<QbitUnit>()) {
+        unit = value.value<QbitUnit>();
+        return true;
+    }
+
+    bool ok{false};
+    const int serialized_unit{value.toInt(&ok)};
+    if (!ok) return false;
+
+    switch (serialized_unit) {
+    case 0: unit = QbitUnit::QBT; return true;
+    case 1: unit = QbitUnit::mQBT; return true;
+    case 2: unit = QbitUnit::uQBT; return true;
+    case 3: unit = QbitUnit::BIT; return true;
+    }
+    return false;
 }
 
 struct ProxySetting {
@@ -187,16 +213,18 @@ bool OptionsModel::Init(bilingual_str& error)
     fMinimizeOnClose = settings.value("fMinimizeOnClose").toBool();
 
     // Display
-    if (!settings.contains("DisplayBitcoinUnit")) {
-        settings.setValue("DisplayBitcoinUnit", QVariant::fromValue(BitcoinUnit::BTC));
+    if (!settings.contains(DISPLAY_QBIT_UNIT_SETTING)) {
+        if (settings.contains(LEGACY_DISPLAY_BITCOIN_UNIT_SETTING)) {
+            settings.setValue(DISPLAY_QBIT_UNIT_SETTING, settings.value(LEGACY_DISPLAY_BITCOIN_UNIT_SETTING));
+            settings.remove(LEGACY_DISPLAY_BITCOIN_UNIT_SETTING);
+        } else {
+            settings.setValue(DISPLAY_QBIT_UNIT_SETTING, QVariant::fromValue(QbitUnit::QBT));
+        }
     }
-    QVariant unit = settings.value("DisplayBitcoinUnit");
-    if (unit.canConvert<BitcoinUnit>()) {
-        m_display_bitcoin_unit = unit.value<BitcoinUnit>();
-    } else {
-        m_display_bitcoin_unit = BitcoinUnit::BTC;
-        settings.setValue("DisplayBitcoinUnit", QVariant::fromValue(m_display_bitcoin_unit));
+    if (!TryParseDisplayUnit(settings.value(DISPLAY_QBIT_UNIT_SETTING), m_display_qbit_unit)) {
+        m_display_qbit_unit = QbitUnit::QBT;
     }
+    settings.setValue(DISPLAY_QBIT_UNIT_SETTING, QVariant::fromValue(m_display_qbit_unit));
 
     if (!settings.contains("strThirdPartyTxUrls"))
         settings.setValue("strThirdPartyTxUrls", "");
@@ -451,7 +479,7 @@ QVariant OptionsModel::getOption(OptionID option, const std::string& suffix) con
         return m_sub_fee_from_amount;
 #endif
     case DisplayUnit:
-        return QVariant::fromValue(m_display_bitcoin_unit);
+        return QVariant::fromValue(m_display_qbit_unit);
     case ThirdPartyTxUrls:
         return strThirdPartyTxUrls;
     case Language:
@@ -695,11 +723,11 @@ bool OptionsModel::setOption(OptionID option, const QVariant& value, const std::
 
 void OptionsModel::setDisplayUnit(const QVariant& new_unit)
 {
-    if (new_unit.isNull() || new_unit.value<BitcoinUnit>() == m_display_bitcoin_unit) return;
-    m_display_bitcoin_unit = new_unit.value<BitcoinUnit>();
+    if (new_unit.isNull() || new_unit.value<QbitUnit>() == m_display_qbit_unit) return;
+    m_display_qbit_unit = new_unit.value<QbitUnit>();
     QSettings settings;
-    settings.setValue("DisplayBitcoinUnit", QVariant::fromValue(m_display_bitcoin_unit));
-    Q_EMIT displayUnitChanged(m_display_bitcoin_unit);
+    settings.setValue(DISPLAY_QBIT_UNIT_SETTING, QVariant::fromValue(m_display_qbit_unit));
+    Q_EMIT displayUnitChanged(m_display_qbit_unit);
 }
 
 void OptionsModel::setRestartRequired(bool fRequired)

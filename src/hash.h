@@ -3,8 +3,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BITCOIN_HASH_H
-#define BITCOIN_HASH_H
+#ifndef QBIT_HASH_H
+#define QBIT_HASH_H
 
 #include <attributes.h>
 #include <crypto/common.h>
@@ -226,4 +226,4 @@ inline uint160 RIPEMD160(std::span<const unsigned char> data)
     return result;
 }
 
-#endif // BITCOIN_HASH_H
+#endif // QBIT_HASH_H

@@ -1026,7 +1026,7 @@ Signing is only possible with addresses of the type 'legacy'.</source>
         <translation type="unfinished">(%1 zamčeno)</translation>
     </message>
     <message>
-        <source>Can vary +/- %1 satoshi(s) per input.</source>
+        <source>Can vary +/- %1 bits per input.</source>
         <translation type="unfinished">Může se lišit o +/– %1 satoshi na každý vstup.</translation>
     </message>
     <message>
@@ -3001,13 +3001,13 @@ For more information on using this console, type %6.
     <message>
         <source>Specify a custom fee per kB (1,000 bytes) of the transaction's virtual size.
 
-Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 satoshis per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 satoshis.</source>
+Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 bits per kvB" for a transaction size of 500 virtual bytes (half of 1 kvB) would ultimately yield a fee of only 50 bits.</source>
         <translation type="unfinished">Zadejte vlastní poplatek za kB (1 000 bajtů) virtuální velikosti transakce.
 
  Poznámka: Vzhledem k tomu, že poplatek se vypočítává na bázi za bajt, sazba poplatku „100 satoshi za kvB“ za velikost transakce 500 virtuálních bajtů (polovina z 1 kvB) by nakonec přinesla poplatek pouze 50 satoshi.</translation>
     </message>
     <message>
-        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for bitcoin transactions than the network can process.</source>
+        <source>When there is less transaction volume than space in the blocks, miners as well as relaying nodes may enforce a minimum fee. Paying only this minimum fee is just fine, but be aware that this can result in a never confirming transaction once there is more demand for qbit transactions than the network can process.</source>
         <translation type="unfinished">Když je menší objem transakcí než je místa v blocích, mohou těžaři i uzly, které transakce předávají, vyžadovat minimální poplatek. Zaplatit pouze tento minimální poplatek je v pořádku, ale mějte na paměti, že to může vést k tomu, že vaše transakce nikdy nebude potvrzena, pokud bude větší poptávka po bitcoinových transakcích, než kolik síť zvládne zpracovat.</translation>
     </message>
     <message>
@@ -3294,7 +3294,7 @@ Note:  Since the fee is calculated on a per-byte basis, a fee rate of "100 satos
         <translation type="unfinished">Částka k odeslání ve vybrané měně</translation>
     </message>
     <message>
-        <source>The fee will be deducted from the amount being sent. The recipient will receive less bitcoins than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
+        <source>The fee will be deducted from the amount being sent. The recipient will receive less QBT than you enter in the amount field. If multiple recipients are selected, the fee is split equally.</source>
         <translation type="unfinished">Poplatek se odečte od posílané částky. Příjemce tak dostane méně bitcoinů, než zadáš do pole Částka. Pokud vybereš více příjemců, tak se poplatek rovnoměrně rozloží.</translation>
     </message>
     <message>
@@ -4033,8 +4033,8 @@ Přejděte do Soubor &gt; Otevřít peněženku pro načtení peněženky.
         <translation type="unfinished">%sse nepodařilo ověřit -assumeutxo stav snímku. Tohle značí hardwarový problém, chybu v softwaru nebo špatnou úpravu softwaru, která dovolila nahrání neplatného snímku. Došlo proto k vypnutí uzlu a vy přestaňte používat jakékoliv verze, které byly postaveny na tomto snímku, resetování délky řetězce od %d do %d. Při příštím restartu bude uzel pokračovat v synchronizování od %d bez jakýchkoliv dat snímku. Prosím, nahlašte tento incident %s, včetně toho, jak jste získali tento snímek. Neplatný snímek stavu řetězce byl ponechán na disku v případě, že by to bylo nápomocné při odhalení potíže, která způsobila tuto chybu.</translation>
     </message>
     <message>
-        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/p2p-bad-ports.md for details and a full list.</source>
-        <translation type="unfinished"> %s Žádost o poslech na portu %u . Tento port je považován za "špatný", a proto je nepravděpodobné, že by se k němu připojil nějaký peer. Viz doc/p2p-bad-ports.md pro podrobnosti a úplný seznam.</translation>
+        <source>%s request to listen on port %u. This port is considered "bad" and thus it is unlikely that any peer will connect to it. See doc/reference/p2p-bad-ports.md for details and a full list.</source>
+        <translation type="unfinished"> %s Žádost o poslech na portu %u . Tento port je považován za "špatný", a proto je nepravděpodobné, že by se k němu připojil nějaký peer. Viz doc/reference/p2p-bad-ports.md pro podrobnosti a úplný seznam.</translation>
     </message>
     <message>
         <source>Disk space for %s may not accommodate the block files. Approximately %u GB of data will be stored in this directory.</source>

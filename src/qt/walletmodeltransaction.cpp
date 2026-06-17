@@ -41,6 +41,16 @@ void WalletModelTransaction::setTransactionFee(const CAmount& newFee)
     fee = newFee;
 }
 
+void WalletModelTransaction::setPQCUsageReport(const wallet::PQCUsageReport& new_report)
+{
+    m_pqc_usage_report = new_report;
+}
+
+const wallet::PQCUsageReport& WalletModelTransaction::getPQCUsageReport() const
+{
+    return m_pqc_usage_report;
+}
+
 void WalletModelTransaction::reassignAmounts(int nChangePosRet)
 {
     const CTransaction* walletTransaction = wtx.get();

@@ -9,6 +9,7 @@
 #include <addresstype.h>
 #include <blockfilter.h>
 #include <chain.h>
+#include <chainparams.h>
 #include <coins.h>
 #include <common/args.h>
 #include <common/messages.h>
@@ -42,6 +43,7 @@
 #include <script/sign.h>
 #include <script/signingprovider.h>
 #include <script/solver.h>
+#include <scheduler.h>
 #include <serialize.h>
 #include <span.h>
 #include <streams.h>
@@ -72,6 +74,7 @@
 #include <wallet/walletutil.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <condition_variable>
 #include <exception>
@@ -91,6 +94,8 @@ using util::ReplaceAll;
 using util::ToString;
 
 namespace wallet {
+
+std::atomic<int> g_deferred_create_keypool_top_up_steps_per_batch{256};
 
 bool AddWalletSetting(interfaces::Chain& chain, const std::string& wallet_name)
 {
@@ -271,7 +276,107 @@ void WaitForDeleteWallet(std::shared_ptr<CWallet>&& wallet)
     }
 }
 
+bool IsAvailableWalletOutputType(const CWallet& wallet, OutputType type, bool internal)
+{
+    LOCK(wallet.cs_wallet);
+    return IsWalletOutputTypeAllowed(type) || wallet.GetScriptPubKeyMan(type, internal) != nullptr;
+}
+
 namespace {
+OutputType GetDefaultWalletAddressType(const CWallet& wallet)
+{
+    LOCK(wallet.cs_wallet);
+    return IsP2MROnlyWalletChain() && wallet.GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false) != nullptr
+        ? OutputType::P2MR
+        : DEFAULT_ADDRESS_TYPE;
+}
+
+std::optional<bilingual_str> GetInactiveP2MRWalletOutputError(const CWallet& wallet, OutputType type)
+{
+    if (type != OutputType::P2MR || !IsP2MROnlyWalletChain()) {
+        return std::nullopt;
+    }
+
+    const int p2mr_height{Params().GetConsensus().P2MRHeight};
+    if (p2mr_height == 0) {
+        return std::nullopt;
+    }
+
+    const int wallet_height{WITH_LOCK(wallet.cs_wallet, return wallet.GetLastBlockHeight())};
+    if (wallet_height >= p2mr_height) {
+        return std::nullopt;
+    }
+
+    return strprintf(_("P2MR wallet outputs are unavailable before activation height %d (current wallet height: %d)"), p2mr_height, wallet_height);
+}
+
+unsigned int GetCreateWalletWarmupKeypoolSize(OutputType output_type, int64_t keypool_size)
+{
+    if (!IsP2MROnlyWalletChain() || output_type != OutputType::P2MR) {
+        return 0;
+    }
+    return std::min<int64_t>(keypool_size, int64_t{DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL});
+}
+
+int GetDeferredCreateKeyPoolTopUpStepsPerBatch()
+{
+    return std::max(1, g_deferred_create_keypool_top_up_steps_per_batch.load(std::memory_order_relaxed));
+}
+
+struct DeferredCreateKeyPoolTopUpState {
+    std::weak_ptr<CWallet> wallet;
+    CScheduler* scheduler;
+    int remaining_steps;
+    std::optional<SteadyClock::time_point> refill_start;
+};
+
+void RunScheduledPendingInitialKeyPoolTopUp(const std::shared_ptr<DeferredCreateKeyPoolTopUpState>& state)
+{
+    auto wallet = state->wallet.lock();
+    if (!wallet) {
+        return;
+    }
+    if (!state->refill_start) {
+        state->refill_start = SteadyClock::now();
+    }
+    const auto step_result = wallet->RunPendingInitialKeyPoolTopUpStep();
+    if (step_result == CWallet::PendingInitialKeyPoolTopUpStepResult::COMPLETE) {
+        wallet->WalletLogPrintf("Deferred create-time keypool top up completed in %15dms\n",
+            Ticks<std::chrono::milliseconds>(SteadyClock::now() - *state->refill_start));
+        return;
+    }
+    if (step_result == CWallet::PendingInitialKeyPoolTopUpStepResult::FAILED) {
+        wallet->WalletLogPrintf("Deferred create-time keypool top up paused after a failed background step\n");
+        return;
+    }
+    if (wallet->IsLocked() || !wallet->HasPendingInitialKeyPoolTopUp()) {
+        return;
+    }
+    if (--state->remaining_steps == 0) {
+        wallet->WalletLogPrintf("Deferred create-time keypool top up batch exhausted after %d steps, continuing in background\n",
+            GetDeferredCreateKeyPoolTopUpStepsPerBatch());
+        state->remaining_steps = GetDeferredCreateKeyPoolTopUpStepsPerBatch();
+    }
+    state->scheduler->scheduleFromNow([state] { RunScheduledPendingInitialKeyPoolTopUp(state); }, std::chrono::milliseconds{1});
+}
+
+void SchedulePendingInitialKeyPoolTopUp(WalletContext& context, const std::shared_ptr<CWallet>& wallet)
+{
+    if (!context.scheduler || wallet->IsLocked() || !wallet->HasPendingInitialKeyPoolTopUp()) {
+        return;
+    }
+
+    auto state = std::make_shared<DeferredCreateKeyPoolTopUpState>(DeferredCreateKeyPoolTopUpState{
+        .wallet = wallet,
+        .scheduler = context.scheduler,
+        .remaining_steps = GetDeferredCreateKeyPoolTopUpStepsPerBatch(),
+        .refill_start = std::nullopt,
+    });
+    // Let wallet creation return and the first address calls finish before background
+    // PQC derivation starts competing for CPU.
+    context.scheduler->scheduleFromNow([state] { RunScheduledPendingInitialKeyPoolTopUp(state); }, std::chrono::seconds{30});
+}
+
 std::shared_ptr<CWallet> LoadWalletInternal(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings)
 {
     try {
@@ -292,6 +397,7 @@ std::shared_ptr<CWallet> LoadWalletInternal(WalletContext& context, const std::s
         NotifyWalletLoaded(context, wallet);
         AddWallet(context, wallet);
         wallet->postInitProcess();
+        SchedulePendingInitialKeyPoolTopUp(context, wallet);
 
         // Write the wallet setting
         UpdateWalletSetting(*context.chain, name, load_on_start, warnings);
@@ -423,23 +529,25 @@ std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string&
 
     // Encrypt the wallet
     if (!passphrase.empty() && !(wallet_creation_flags & WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
-        if (!wallet->EncryptWallet(passphrase)) {
+        if (!wallet->EncryptWallet(passphrase, /*use_create_keypool_warmup=*/!create_blank)) {
             error = Untranslated("Error: Wallet created but failed to encrypt.");
             status = DatabaseStatus::FAILED_ENCRYPT;
             return nullptr;
         }
         if (!create_blank) {
             // Unlock the wallet
-            if (!wallet->Unlock(passphrase)) {
+            // Unlock only long enough to rebuild the final encrypted descriptors.
+            // Their deferred refill should start after the final managers are active.
+            if (!wallet->Unlock(passphrase, /*run_pending_initial_keypool_top_up=*/false)) {
                 error = Untranslated("Error: Wallet was encrypted but could not be unlocked");
                 status = DatabaseStatus::FAILED_ENCRYPT;
                 return nullptr;
             }
 
-            // Set a seed for the wallet
+            // Make the final active descriptors use the same warm-up policy as creation.
             {
                 LOCK(wallet->cs_wallet);
-                wallet->SetupDescriptorScriptPubKeyMans();
+                wallet->SetupDescriptorScriptPubKeyMans(/*use_create_keypool_warmup=*/true);
             }
 
             // Relock the wallet
@@ -450,6 +558,7 @@ std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string&
     NotifyWalletLoaded(context, wallet);
     AddWallet(context, wallet);
     wallet->postInitProcess();
+    SchedulePendingInitialKeyPoolTopUp(context, wallet);
 
     // Write the wallet settings
     UpdateWalletSetting(*context.chain, name, load_on_start, warnings);
@@ -600,9 +709,10 @@ static bool DecryptMasterKey(const SecureString& wallet_passphrase, const CMaste
     return true;
 }
 
-bool CWallet::Unlock(const SecureString& strWalletPassphrase)
+bool CWallet::Unlock(const SecureString& strWalletPassphrase, bool run_pending_initial_keypool_top_up)
 {
     CKeyingMaterial plain_master_key;
+    bool unlocked{false};
 
     {
         LOCK(cs_wallet);
@@ -612,45 +722,61 @@ bool CWallet::Unlock(const SecureString& strWalletPassphrase)
                 continue; // try another master key
             }
             if (Unlock(plain_master_key)) {
-                // Now that we've unlocked, upgrade the descriptor cache
-                UpgradeDescriptorCache();
-                return true;
+                unlocked = true;
+                break;
             }
         }
     }
-    return false;
+    if (!unlocked) {
+        return false;
+    }
+
+    // Now that we've unlocked, upgrade the descriptor cache and finish any deferred
+    // create-time keypool refill before normal wallet operations need it.
+    WITH_LOCK(cs_wallet, UpgradeDescriptorCache());
+    if (run_pending_initial_keypool_top_up) {
+        RunPendingInitialKeyPoolTopUp();
+    }
+    return true;
 }
 
 bool CWallet::ChangeWalletPassphrase(const SecureString& strOldWalletPassphrase, const SecureString& strNewWalletPassphrase)
 {
     bool fWasLocked = IsLocked();
+    bool changed{false};
 
     {
-        LOCK2(m_relock_mutex, cs_wallet);
+        LOCK(m_relock_mutex);
         Lock();
 
         CKeyingMaterial plain_master_key;
-        for (auto& [master_key_id, master_key] : mapMasterKeys)
         {
-            if (!DecryptMasterKey(strOldWalletPassphrase, master_key, plain_master_key)) {
-                return false;
-            }
-            if (Unlock(plain_master_key))
+            LOCK(cs_wallet);
+            for (auto& [master_key_id, master_key] : mapMasterKeys)
             {
-                if (!EncryptMasterKey(strNewWalletPassphrase, plain_master_key, master_key)) {
+                if (!DecryptMasterKey(strOldWalletPassphrase, master_key, plain_master_key)) {
                     return false;
                 }
-                WalletLogPrintf("Wallet passphrase changed to an nDeriveIterations of %i\n", master_key.nDeriveIterations);
+                if (Unlock(plain_master_key))
+                {
+                    if (!EncryptMasterKey(strNewWalletPassphrase, plain_master_key, master_key)) {
+                        return false;
+                    }
+                    WalletLogPrintf("Wallet passphrase changed to an nDeriveIterations of %i\n", master_key.nDeriveIterations);
 
-                WalletBatch(GetDatabase()).WriteMasterKey(master_key_id, master_key);
-                if (fWasLocked)
-                    Lock();
-                return true;
+                    WalletBatch(GetDatabase()).WriteMasterKey(master_key_id, master_key);
+                    changed = true;
+                    break;
+                }
             }
+        }
+
+        if (fWasLocked) {
+            Lock();
         }
     }
 
-    return false;
+    return changed;
 }
 
 void CWallet::SetLastBlockProcessedInMem(int block_height, uint256 block_hash)
@@ -788,7 +914,7 @@ void CWallet::AddToSpends(const CWalletTx& wtx)
         AddToSpends(txin.prevout, wtx.GetHash());
 }
 
-bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase)
+bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase, bool use_create_keypool_warmup)
 {
     // Only descriptor wallets can be encrypted
     Assert(IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS));
@@ -845,14 +971,14 @@ bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase)
         delete encrypted_batch;
         encrypted_batch = nullptr;
 
-        Lock();
-        Unlock(strWalletPassphrase);
+        ClearMasterKey();
+        Unlock(strWalletPassphrase, /*run_pending_initial_keypool_top_up=*/false);
 
         // Make new descriptors with a new seed
         if (!IsWalletFlagSet(WALLET_FLAG_BLANK_WALLET)) {
-            SetupDescriptorScriptPubKeyMans();
+            SetupDescriptorScriptPubKeyMans(use_create_keypool_warmup);
         }
-        Lock();
+        ClearMasterKey();
 
         // Need to completely rewrite the wallet file; if we don't, the database might keep
         // bits of the unencrypted private key in slack space in the database file.
@@ -1696,9 +1822,9 @@ bool CWallet::IsHDEnabled() const
 bool CWallet::CanGetAddresses(bool internal) const
 {
     LOCK(cs_wallet);
-    if (m_spk_managers.empty()) return false;
-    for (OutputType t : OUTPUT_TYPES) {
-        auto spk_man = GetScriptPubKeyMan(t, internal);
+    const auto& spk_managers = internal ? m_internal_spk_managers : m_external_spk_managers;
+    if (spk_managers.empty()) return false;
+    for (const auto& [_, spk_man] : spk_managers) {
         if (spk_man && spk_man->CanGetAddresses(internal)) {
             return true;
         }
@@ -2118,64 +2244,129 @@ void MaybeResendWalletTxs(WalletContext& context)
 }
 
 
-bool CWallet::SignTransaction(CMutableTransaction& tx) const
+bool CWallet::SignTransaction(CMutableTransaction& tx, const PQCSignatureCounterObserver& pqc_counter_observer) const
 {
-    AssertLockHeld(cs_wallet);
-
     // Build coins map
     std::map<COutPoint, Coin> coins;
-    for (auto& input : tx.vin) {
-        const auto mi = mapWallet.find(input.prevout.hash);
-        if(mi == mapWallet.end() || input.prevout.n >= mi->second.tx->vout.size()) {
-            return false;
+    {
+        LOCK(cs_wallet);
+        for (auto& input : tx.vin) {
+            const auto mi = mapWallet.find(input.prevout.hash);
+            if(mi == mapWallet.end() || input.prevout.n >= mi->second.tx->vout.size()) {
+                return false;
+            }
+            const CWalletTx& wtx = mi->second;
+            int prev_height = wtx.state<TxStateConfirmed>() ? wtx.state<TxStateConfirmed>()->confirmed_block_height : 0;
+            coins[input.prevout] = Coin(wtx.tx->vout[input.prevout.n], prev_height, wtx.IsCoinBase());
         }
-        const CWalletTx& wtx = mi->second;
-        int prev_height = wtx.state<TxStateConfirmed>() ? wtx.state<TxStateConfirmed>()->confirmed_block_height : 0;
-        coins[input.prevout] = Coin(wtx.tx->vout[input.prevout.n], prev_height, wtx.IsCoinBase());
     }
     std::map<int, bilingual_str> input_errors;
-    return SignTransaction(tx, coins, SIGHASH_DEFAULT, input_errors);
+    return SignTransaction(tx, coins, SIGHASH_DEFAULT, input_errors, pqc_counter_observer);
 }
 
-bool CWallet::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors) const
+bool CWallet::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors, const PQCSignatureCounterObserver& pqc_counter_observer) const
 {
+    std::vector<std::unique_ptr<SigningProvider>> providers;
+    struct ActiveSigningProviderSnapshot {
+        const CWallet& wallet;
+        bool active{false};
+        ~ActiveSigningProviderSnapshot()
+        {
+            if (active) wallet.RemoveActiveSigningProviderSnapshot();
+        }
+    } active_signing_snapshot{*this};
+    if (IsCrypted()) {
+        if (!TryAddActiveSigningProviderSnapshot()) return false;
+        active_signing_snapshot.active = true;
+    }
+
+    {
+        LOCK(cs_wallet);
+        for (ScriptPubKeyMan* spk_man : GetAllScriptPubKeyMans()) {
+            if (auto provider = spk_man->GetSigningProviderForTransaction(coins, pqc_counter_observer)) {
+                providers.push_back(std::move(provider));
+            }
+        }
+    }
+
     // Try to sign with all ScriptPubKeyMans
-    for (ScriptPubKeyMan* spk_man : GetAllScriptPubKeyMans()) {
-        // spk_man->SignTransaction will return true if the transaction is complete,
+    for (const auto& provider : providers) {
+        // SignTransaction will return true if the transaction is complete,
         // so we can exit early and return true if that happens
-        if (spk_man->SignTransaction(tx, coins, sighash, input_errors)) {
+        if (::SignTransaction(tx, provider.get(), coins, sighash, input_errors)) {
             return true;
         }
+    }
+
+    if (::SignTransaction(tx, &DUMMY_SIGNING_PROVIDER, coins, sighash, input_errors)) {
+        return true;
     }
 
     // At this point, one input was not fully signed otherwise we would have exited already
     return false;
 }
 
-std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bool& complete, std::optional<int> sighash_type, bool sign, bool bip32derivs, size_t * n_signed, bool finalize) const
+std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bool& complete, std::optional<int> sighash_type, bool sign, bool bip32derivs, size_t * n_signed, bool finalize, const PQCSignatureCounterObserver& pqc_counter_observer) const
 {
     if (n_signed) {
         *n_signed = 0;
     }
-    LOCK(cs_wallet);
-    // Get all of the previous transactions
-    for (unsigned int i = 0; i < psbtx.tx->vin.size(); ++i) {
-        const CTxIn& txin = psbtx.tx->vin[i];
-        PSBTInput& input = psbtx.inputs.at(i);
 
-        if (PSBTInputSigned(input)) {
-            continue;
+    struct ActiveSigningProviderSnapshot {
+        const CWallet& wallet;
+        bool active{false};
+        ~ActiveSigningProviderSnapshot()
+        {
+            if (active) wallet.RemoveActiveSigningProviderSnapshot();
         }
+    } active_signing_snapshot{*this};
+    if (sign && IsCrypted()) {
+        if (!TryAddActiveSigningProviderSnapshot()) return PSBTError::INCOMPLETE;
+        active_signing_snapshot.active = true;
+    }
 
-        // If we have no utxo, grab it from the wallet.
-        if (!input.non_witness_utxo) {
-            const Txid& txhash = txin.prevout.hash;
-            const auto it = mapWallet.find(txhash);
-            if (it != mapWallet.end()) {
-                const CWalletTx& wtx = it->second;
-                // We only need the non_witness_utxo, which is a superset of the witness_utxo.
-                //   The signing code will switch to the smaller witness_utxo if this is ok.
-                input.non_witness_utxo = wtx.tx;
+    // Get all of the previous transactions
+    std::vector<PSBTSigningProvider> providers;
+    {
+        LOCK(cs_wallet);
+        for (unsigned int i = 0; i < psbtx.tx->vin.size(); ++i) {
+            const CTxIn& txin = psbtx.tx->vin[i];
+            PSBTInput& input = psbtx.inputs.at(i);
+
+            if (PSBTInputSigned(input)) {
+                continue;
+            }
+
+            // If we have no utxo, grab it from the wallet.
+            if (!input.non_witness_utxo) {
+                const Txid& txhash = txin.prevout.hash;
+                const auto it = mapWallet.find(txhash);
+                if (it != mapWallet.end()) {
+                    const CWalletTx& wtx = it->second;
+                    // We only need the non_witness_utxo, which is a superset of the witness_utxo.
+                    //   The signing code will switch to the smaller witness_utxo if this is ok.
+                    input.non_witness_utxo = wtx.tx;
+                }
+            }
+            if (input.non_witness_utxo && txin.prevout.n >= input.non_witness_utxo->vout.size()) {
+                return PSBTError::MISSING_INPUTS;
+            }
+        }
+        const PrecomputedTransactionData locked_txdata = PrecomputePSBTData(psbtx);
+        for (ScriptPubKeyMan* spk_man : GetAllScriptPubKeyMans()) {
+            if (sign) {
+                if (auto signer_spk_man = dynamic_cast<ExternalSignerScriptPubKeyMan*>(spk_man)) {
+                    int n_signed_this_spkm = 0;
+                    const auto error{signer_spk_man->FillPSBT(psbtx, locked_txdata, sighash_type, sign, bip32derivs, &n_signed_this_spkm, finalize, pqc_counter_observer)};
+                    if (error) return error;
+                    if (n_signed) {
+                        (*n_signed) += n_signed_this_spkm;
+                    }
+                    continue;
+                }
+            }
+            if (auto provider = spk_man->GetSigningProviderForPSBT(psbtx, sign, pqc_counter_observer)) {
+                providers.push_back(std::move(*provider));
             }
         }
     }
@@ -2183,11 +2374,37 @@ std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bo
     const PrecomputedTransactionData txdata = PrecomputePSBTData(psbtx);
 
     // Fill in information from ScriptPubKeyMans
-    for (ScriptPubKeyMan* spk_man : GetAllScriptPubKeyMans()) {
+    for (const auto& psbt_provider : providers) {
         int n_signed_this_spkm = 0;
-        const auto error{spk_man->FillPSBT(psbtx, txdata, sighash_type, sign, bip32derivs, &n_signed_this_spkm, finalize)};
-        if (error) {
-            return error;
+        HidingSigningProvider input_provider(psbt_provider.provider.get(), /*hide_secret=*/!sign, /*hide_origin=*/!bip32derivs);
+        for (unsigned int i : psbt_provider.input_indexes) {
+            const CTxIn& txin = psbtx.tx->vin[i];
+            PSBTInput& input = psbtx.inputs.at(i);
+
+            if (PSBTInputSigned(input)) {
+                continue;
+            }
+            if (input.witness_utxo.IsNull() && !input.non_witness_utxo) {
+                continue;
+            }
+            if (input.non_witness_utxo && txin.prevout.n >= input.non_witness_utxo->vout.size()) {
+                return PSBTError::MISSING_INPUTS;
+            }
+
+            PSBTError res = SignPSBTInput(input_provider, psbtx, i, &txdata, sighash_type, nullptr, finalize);
+            if (res != PSBTError::OK && res != PSBTError::INCOMPLETE) {
+                return res;
+            }
+
+            const bool signed_one = PSBTInputSigned(input);
+            if (signed_one || !sign) {
+                ++n_signed_this_spkm;
+            }
+        }
+
+        HidingSigningProvider output_provider(psbt_provider.provider.get(), /*hide_secret=*/true, /*hide_origin=*/!bip32derivs);
+        for (unsigned int i = 0; i < psbtx.tx->vout.size(); ++i) {
+            UpdatePSBTOutput(output_provider, psbtx, i);
         }
 
         if (n_signed) {
@@ -2226,12 +2443,17 @@ OutputType CWallet::TransactionChangeType(const std::optional<OutputType>& chang
         return *change_type;
     }
 
+    if (IsP2MROnlyWalletChain()) {
+        return OutputType::P2MR;
+    }
+
     // if m_default_address_type is legacy, use legacy address as change.
     if (m_default_address_type == OutputType::LEGACY) {
         return OutputType::LEGACY;
     }
 
     bool any_tr{false};
+    bool any_p2mr{false};
     bool any_wpkh{false};
     bool any_sh{false};
     bool any_pkh{false};
@@ -2239,6 +2461,8 @@ OutputType CWallet::TransactionChangeType(const std::optional<OutputType>& chang
     for (const auto& recipient : vecSend) {
         if (std::get_if<WitnessV1Taproot>(&recipient.dest)) {
             any_tr = true;
+        } else if (std::get_if<WitnessV2P2MR>(&recipient.dest)) {
+            any_p2mr = true;
         } else if (std::get_if<WitnessV0KeyHash>(&recipient.dest)) {
             any_wpkh = true;
         } else if (std::get_if<ScriptHash>(&recipient.dest)) {
@@ -2253,10 +2477,14 @@ OutputType CWallet::TransactionChangeType(const std::optional<OutputType>& chang
         // Currently tr is the only type supported by the BECH32M spkman
         return OutputType::BECH32M;
     }
+    const bool has_p2mr_spkman(GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/true));
     const bool has_bech32_spkman(GetScriptPubKeyMan(OutputType::BECH32, /*internal=*/true));
     if (has_bech32_spkman && any_wpkh) {
         // Currently wpkh is the only type supported by the BECH32 spkman
         return OutputType::BECH32;
+    }
+    if (has_p2mr_spkman && any_p2mr) {
+        return OutputType::P2MR;
     }
     const bool has_p2sh_segwit_spkman(GetScriptPubKeyMan(OutputType::P2SH_SEGWIT, /*internal=*/true));
     if (has_p2sh_segwit_spkman && any_sh) {
@@ -2273,8 +2501,16 @@ OutputType CWallet::TransactionChangeType(const std::optional<OutputType>& chang
     if (has_bech32m_spkman) {
         return OutputType::BECH32M;
     }
+    if (m_default_address_type == OutputType::P2MR && has_p2mr_spkman) {
+        // If no recipient type matched, honor the wallet's configured default
+        // receive type before falling back to the legacy BECH32 compatibility path.
+        return OutputType::P2MR;
+    }
     if (has_bech32_spkman) {
         return OutputType::BECH32;
+    }
+    if (has_p2mr_spkman) {
+        return OutputType::P2MR;
     }
     // else use m_default_address_type for change
     return m_default_address_type;
@@ -2511,17 +2747,144 @@ unsigned int CWallet::GetKeyPoolSize() const
 
 bool CWallet::TopUpKeyPool(unsigned int kpSize)
 {
+    return TopUpKeyPoolResult(kpSize).has_value();
+}
+
+util::Result<void> CWallet::TopUpKeyPoolResult(unsigned int kpSize)
+{
     LOCK(cs_wallet);
-    bool res = true;
-    for (auto spk_man : GetActiveScriptPubKeyMans()) {
-        res &= spk_man->TopUp(kpSize);
+    const unsigned int target_size{kpSize > 0 ? kpSize : static_cast<unsigned int>(m_keypool_size)};
+    std::set<ScriptPubKeyMan*> topped_up_non_descriptor_spk_mans;
+    std::optional<bilingual_str> first_error;
+
+    const auto top_up_spk_man = [&](OutputType type, bool internal, ScriptPubKeyMan& spk_man) -> util::Result<void> {
+        DescriptorScriptPubKeyMan* desc_spk_man{dynamic_cast<DescriptorScriptPubKeyMan*>(&spk_man)};
+        unsigned int size_check{target_size};
+        if (desc_spk_man) {
+            util::Result<void> res{desc_spk_man->TopUpWithInternalHintResult(internal, target_size)};
+            if (!res) {
+                return util::Error{strprintf(
+                    _("Could not top up active %s %s descriptor keypool (descriptor id %s, target=%u, remaining=%u): %s"),
+                    internal ? "internal" : "external",
+                    FormatOutputType(type),
+                    spk_man.GetID().ToString(),
+                    target_size,
+                    spk_man.GetKeyPoolSize(),
+                    util::ErrorString(res).original)};
+            }
+        } else {
+            // Legacy SPKMs do not report detailed top-up errors. Preserve the
+            // previous RPC behavior: ignore the bool result here and rely on
+            // the explicit-size post-refill check below.
+            if (topped_up_non_descriptor_spk_mans.insert(&spk_man).second) {
+                spk_man.TopUp(kpSize);
+            }
+            size_check = kpSize;
+        }
+        if (spk_man.GetKeyPoolSize() < size_check) {
+            return util::Error{strprintf(
+                _("Could not top up active %s %s descriptor keypool (descriptor id %s, target=%u, remaining=%u)"),
+                internal ? "internal" : "external",
+                FormatOutputType(type),
+                spk_man.GetID().ToString(),
+                size_check,
+                spk_man.GetKeyPoolSize())};
+        }
+        return {};
+    };
+
+    for (const auto& [type, spk_man] : m_external_spk_managers) {
+        if (!spk_man) continue;
+        auto res{top_up_spk_man(type, /*internal=*/false, *spk_man)};
+        if (!res && !first_error) first_error = util::ErrorString(res);
     }
-    return res;
+    for (const auto& [type, spk_man] : m_internal_spk_managers) {
+        if (!spk_man) continue;
+        auto res{top_up_spk_man(type, /*internal=*/true, *spk_man)};
+        if (!res && !first_error) first_error = util::ErrorString(res);
+    }
+    if (first_error) return util::Error{*first_error};
+    return {};
+}
+
+bool CWallet::HasPendingInitialKeyPoolTopUp() const
+{
+    LOCK(cs_wallet);
+    for (auto* spk_man : GetActiveScriptPubKeyMans()) {
+        auto* desc_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(spk_man);
+        if (desc_spk_man && desc_spk_man->HasDeferredCreateKeyPoolTopUp()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+CWallet::PendingInitialKeyPoolTopUpStepResult CWallet::RunPendingInitialKeyPoolTopUpStep()
+{
+    if (!HasPendingInitialKeyPoolTopUp()) {
+        return PendingInitialKeyPoolTopUpStepResult::COMPLETE;
+    }
+    if (IsLocked()) {
+        return PendingInitialKeyPoolTopUpStepResult::FAILED;
+    }
+
+    std::vector<DescriptorScriptPubKeyMan*> pending_spk_mans;
+    {
+        LOCK(cs_wallet);
+        for (auto* spk_man : GetActiveScriptPubKeyMans()) {
+            auto* desc_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(spk_man);
+            if (desc_spk_man && desc_spk_man->HasDeferredCreateKeyPoolTopUp()) {
+                pending_spk_mans.push_back(desc_spk_man);
+            }
+        }
+    }
+
+    for (auto* desc_spk_man : pending_spk_mans) {
+        const unsigned int next_target = std::min<int64_t>(
+            m_keypool_size,
+            int64_t{desc_spk_man->GetKeyPoolSize()} + DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+        if (!desc_spk_man->TopUp(next_target)) {
+            return PendingInitialKeyPoolTopUpStepResult::FAILED;
+        }
+    }
+
+    return HasPendingInitialKeyPoolTopUp() ? PendingInitialKeyPoolTopUpStepResult::PENDING
+                                           : PendingInitialKeyPoolTopUpStepResult::COMPLETE;
+}
+
+bool CWallet::RunPendingInitialKeyPoolTopUp()
+{
+    if (IsLocked() || !HasPendingInitialKeyPoolTopUp()) {
+        return false;
+    }
+
+    const auto start{SteadyClock::now()};
+    WalletLogPrintf("Running deferred create-time keypool top up to %d entries per active descriptor\n", m_keypool_size);
+    bool complete{false};
+    while (true) {
+        const auto step_result = RunPendingInitialKeyPoolTopUpStep();
+        if (step_result == PendingInitialKeyPoolTopUpStepResult::COMPLETE) {
+            complete = true;
+            break;
+        }
+        if (step_result == PendingInitialKeyPoolTopUpStepResult::FAILED || IsLocked()) {
+            break;
+        }
+        std::this_thread::yield();
+    }
+    WalletLogPrintf("Deferred create-time keypool top up %s in %15dms\n",
+        complete ? "completed" : "did not complete",
+        Ticks<std::chrono::milliseconds>(SteadyClock::now() - start));
+    return complete;
 }
 
 util::Result<CTxDestination> CWallet::GetNewDestination(const OutputType type, const std::string label)
 {
     LOCK(cs_wallet);
+    if (const auto error{GetInactiveP2MRWalletOutputError(*this, type)}) {
+        return util::Error{*error};
+    }
+
     auto spk_man = GetScriptPubKeyMan(type, /*internal=*/false);
     if (!spk_man) {
         return util::Error{strprintf(_("Error: No %s addresses available."), FormatOutputType(type))};
@@ -2601,10 +2964,16 @@ std::set<std::string> CWallet::ListAddrBookLabels(const std::optional<AddressPur
 
 util::Result<CTxDestination> ReserveDestination::GetReservedDestination(bool internal)
 {
+    if (const auto error{GetInactiveP2MRWalletOutputError(*pwallet, type)}) {
+        return util::Error{*error};
+    }
+
     m_spk_man = pwallet->GetScriptPubKeyMan(type, internal);
     if (!m_spk_man) {
         return util::Error{strprintf(_("Error: No %s addresses available."), FormatOutputType(type))};
     }
+    m_spk_man_lifetime = m_spk_man->GetLifetimeToken();
+    fInternal = internal;
 
     if (nIndex == -1) {
         int64_t index;
@@ -2618,8 +2987,11 @@ util::Result<CTxDestination> ReserveDestination::GetReservedDestination(bool int
 
 void ReserveDestination::KeepDestination()
 {
+    LOCK(pwallet->cs_wallet);
     if (nIndex != -1) {
-        m_spk_man->KeepDestination(nIndex, type);
+        if (m_spk_man_lifetime.lock()) {
+            m_spk_man->KeepDestination(nIndex, type);
+        }
     }
     nIndex = -1;
     address = CNoDestination();
@@ -2627,8 +2999,11 @@ void ReserveDestination::KeepDestination()
 
 void ReserveDestination::ReturnDestination()
 {
+    LOCK(pwallet->cs_wallet);
     if (nIndex != -1) {
-        m_spk_man->ReturnDestination(nIndex, fInternal, address);
+        if (m_spk_man_lifetime.lock()) {
+            m_spk_man->ReturnDestination(nIndex, fInternal, address);
+        }
     }
     nIndex = -1;
     address = CNoDestination();
@@ -2805,6 +3180,148 @@ void CWallet::LoadAddressReceiveRequest(const CTxDestination& dest, const std::s
     m_address_book[dest].receive_requests[id] = request;
 }
 
+bool CWallet::LoadPubKeyDBPoolEntry(const PubKeyDBPoolKey& key, const CPQCPubKey& pubkey)
+{
+    AssertLockHeld(cs_wallet);
+
+    if (key.account < 0 || key.index < 0 || !pubkey.IsValid()) {
+        return false;
+    }
+
+    const auto key_it = m_pubkeydb_pool_entries.find(key);
+    if (key_it != m_pubkeydb_pool_entries.end()) {
+        return key_it->second == pubkey;
+    }
+
+    const auto pubkey_it = m_pubkeydb_pool_by_pubkey.find(pubkey);
+    if (pubkey_it != m_pubkeydb_pool_by_pubkey.end()) {
+        return pubkey_it->second == key;
+    }
+
+    m_pubkeydb_pool_entries.emplace(key, pubkey);
+    m_pubkeydb_pool_by_pubkey.emplace(pubkey, key);
+    m_pubkeydb_cursors.emplace(key.Chain(), 0);
+    return true;
+}
+
+void CWallet::LoadPubKeyDBCursor(const PubKeyDBChainKey& key, int64_t next_index)
+{
+    AssertLockHeld(cs_wallet);
+
+    if (key.account < 0 || next_index < 0) {
+        throw std::runtime_error("Cannot load pubkeydb cursor with negative account or next index");
+    }
+
+    m_pubkeydb_cursors[key] = next_index;
+}
+
+util::Result<bool> CWallet::AddPubKeyDBPoolEntry(WalletBatch& batch, const PubKeyDBPoolKey& key, const CPQCPubKey& pubkey)
+{
+    AssertLockHeld(cs_wallet);
+
+    if (key.account < 0 || key.index < 0 || !pubkey.IsValid()) {
+        return util::Error{Untranslated("Invalid pubkeydb pool entry")};
+    }
+
+    const auto key_it = m_pubkeydb_pool_entries.find(key);
+    if (key_it != m_pubkeydb_pool_entries.end()) {
+        if (key_it->second == pubkey) {
+            return false;
+        }
+        return util::Error{Untranslated(strprintf("Pubkeydb pool entry account=%d internal=%d index=%d already maps to another pubkey",
+            key.account, key.internal, key.index))};
+    }
+
+    const auto pubkey_it = m_pubkeydb_pool_by_pubkey.find(pubkey);
+    if (pubkey_it != m_pubkeydb_pool_by_pubkey.end()) {
+        const PubKeyDBPoolKey& existing_key = pubkey_it->second;
+        if (existing_key == key) {
+            return false;
+        }
+        return util::Error{Untranslated(strprintf("Pubkeydb pubkey already maps to account=%d internal=%d index=%d",
+            existing_key.account, existing_key.internal, existing_key.index))};
+    }
+
+    const PubKeyDBChainKey chain_key = key.Chain();
+    const bool write_default_cursor = !m_pubkeydb_cursors.contains(chain_key);
+    if (write_default_cursor && !batch.WritePubKeyDBCursor(chain_key.account, chain_key.internal, 0)) {
+        return util::Error{Untranslated("Writing pubkeydb cursor failed")};
+    }
+    if (!batch.WritePubKeyDBPoolEntry(key.account, key.internal, key.index, pubkey)) {
+        return util::Error{Untranslated("Writing pubkeydb pool entry failed")};
+    }
+
+    if (write_default_cursor) {
+        m_pubkeydb_cursors.emplace(chain_key, 0);
+    }
+    m_pubkeydb_pool_entries.emplace(key, pubkey);
+    m_pubkeydb_pool_by_pubkey.emplace(pubkey, key);
+    return true;
+}
+
+bool CWallet::SetPubKeyDBCursor(WalletBatch& batch, const PubKeyDBChainKey& key, int64_t next_index)
+{
+    AssertLockHeld(cs_wallet);
+
+    if (key.account < 0 || next_index < 0) {
+        return false;
+    }
+    if (!batch.WritePubKeyDBCursor(key.account, key.internal, next_index)) {
+        return false;
+    }
+    m_pubkeydb_cursors[key] = next_index;
+    return true;
+}
+
+int64_t CWallet::GetPubKeyDBCursor(const PubKeyDBChainKey& key) const
+{
+    AssertLockHeld(cs_wallet);
+
+    if (const auto* cursor = common::FindKey(m_pubkeydb_cursors, key)) {
+        return *cursor;
+    }
+    return 0;
+}
+
+std::set<PubKeyDBChainKey> CWallet::GetPubKeyDBChains() const
+{
+    AssertLockHeld(cs_wallet);
+
+    std::set<PubKeyDBChainKey> result;
+    for (const auto& [key, _] : m_pubkeydb_cursors) {
+        result.insert(key);
+    }
+    for (const auto& [key, _] : m_pubkeydb_pool_entries) {
+        result.insert(key.Chain());
+    }
+    return result;
+}
+
+std::optional<PubKeyDBPoolKey> CWallet::GetPubKeyDBPoolKey(const CPQCPubKey& pubkey) const
+{
+    AssertLockHeld(cs_wallet);
+
+    if (const auto* key = common::FindKey(m_pubkeydb_pool_by_pubkey, pubkey)) {
+        return *key;
+    }
+    return std::nullopt;
+}
+
+std::vector<std::pair<PubKeyDBPoolKey, CPQCPubKey>> CWallet::GetPubKeyDBPoolEntries(const PubKeyDBChainKey& key, int64_t minimum_index) const
+{
+    AssertLockHeld(cs_wallet);
+
+    std::vector<std::pair<PubKeyDBPoolKey, CPQCPubKey>> result;
+    const PubKeyDBPoolKey lower_bound_key{key.account, key.internal, std::max<int64_t>(minimum_index, 0)};
+    for (auto it = m_pubkeydb_pool_entries.lower_bound(lower_bound_key); it != m_pubkeydb_pool_entries.end(); ++it) {
+        if (it->first.account != key.account || it->first.internal != key.internal) {
+            break;
+        }
+        result.emplace_back(it->first, it->second);
+    }
+    return result;
+}
+
 bool CWallet::IsAddressPreviouslySpent(const CTxDestination& dest) const
 {
     if (auto* data{common::FindKey(m_address_book, dest)}) return data->previously_spent;
@@ -2834,6 +3351,22 @@ bool CWallet::EraseAddressReceiveRequest(WalletBatch& batch, const CTxDestinatio
     if (!batch.EraseAddressReceiveRequest(dest, id)) return false;
     m_address_book[dest].receive_requests.erase(id);
     return true;
+}
+
+std::set<CTxDestination> CWallet::GetWalletTxOutDestinations() const
+{
+    AssertLockHeld(cs_wallet);
+
+    std::set<CTxDestination> destinations;
+    for (const auto& [_, wtx] : mapWallet) {
+        for (const auto& txout : wtx.tx->vout) {
+            CTxDestination dest;
+            if (ExtractDestination(txout.scriptPubKey, dest)) {
+                destinations.insert(dest);
+            }
+        }
+    }
+    return destinations;
 }
 
 static util::Result<fs::path> GetWalletPath(const std::string& name)
@@ -2946,7 +3479,7 @@ std::shared_ptr<CWallet> CWallet::Create(WalletContext& context, const std::stri
         assert(walletInstance->IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS));
 
         if ((wallet_creation_flags & WALLET_FLAG_EXTERNAL_SIGNER) || !(wallet_creation_flags & (WALLET_FLAG_DISABLE_PRIVATE_KEYS | WALLET_FLAG_BLANK_WALLET))) {
-            walletInstance->SetupDescriptorScriptPubKeyMans();
+            walletInstance->SetupDescriptorScriptPubKeyMans(/*use_create_keypool_warmup=*/true);
         }
 
         if (chain) {
@@ -2974,13 +3507,23 @@ std::shared_ptr<CWallet> CWallet::Create(WalletContext& context, const std::stri
             error = strprintf(_("Unknown address type '%s'"), args.GetArg("-addresstype", ""));
             return nullptr;
         }
+        if (!IsAvailableWalletOutputType(*walletInstance, parsed.value(), /*internal=*/false)) {
+            error = Untranslated(strprintf("Address type '%s' is not available on this chain", args.GetArg("-addresstype", "")));
+            return nullptr;
+        }
         walletInstance->m_default_address_type = parsed.value();
+    } else {
+        walletInstance->m_default_address_type = GetDefaultWalletAddressType(*walletInstance);
     }
 
     if (!args.GetArg("-changetype", "").empty()) {
         std::optional<OutputType> parsed = ParseOutputType(args.GetArg("-changetype", ""));
         if (!parsed) {
             error = strprintf(_("Unknown change type '%s'"), args.GetArg("-changetype", ""));
+            return nullptr;
+        }
+        if (!IsAvailableWalletOutputType(*walletInstance, parsed.value(), /*internal=*/true)) {
+            error = Untranslated(strprintf("Change type '%s' is not available on this chain", args.GetArg("-changetype", "")));
             return nullptr;
         }
         walletInstance->m_default_change_type = parsed.value();
@@ -3101,8 +3644,11 @@ std::shared_ptr<CWallet> CWallet::Create(WalletContext& context, const std::stri
 
     walletInstance->WalletLogPrintf("Wallet completed loading in %15dms\n", Ticks<std::chrono::milliseconds>(SteadyClock::now() - start));
 
-    // Try to top up keypool. No-op if the wallet is locked.
-    walletInstance->TopUpKeyPool();
+    // Try to top up keypool. Fresh P2MR-only wallets may intentionally leave the
+    // remainder for a deferred refill after creation returns.
+    if (!walletInstance->HasPendingInitialKeyPoolTopUp()) {
+        walletInstance->TopUpKeyPool();
+    }
 
     // Cache the first key time
     std::optional<int64_t> time_first_key;
@@ -3143,7 +3689,7 @@ bool CWallet::AttachChain(const std::shared_ptr<CWallet>& walletInstance, interf
             // Wallet is assumed to be from another chain, if genesis block in the active
             // chain differs from the genesis block known to the wallet.
             if (chain.getBlockHash(0) != locator.vHave.back()) {
-                error = Untranslated("Wallet files should not be reused across chains. Restart bitcoind with -walletcrosschain to override.");
+                error = Untranslated("Wallet files should not be reused across chains. Restart qbitd with -walletcrosschain to override.");
                 return false;
             }
         }
@@ -3322,21 +3868,73 @@ bool CWallet::IsLocked() const
     return vMasterKey.empty();
 }
 
+bool CWallet::WithWalletLock(std::function<bool()> cb) const
+{
+    LOCK(cs_wallet);
+    return cb();
+}
+
 bool CWallet::Lock()
 {
     if (!IsCrypted())
         return false;
 
+    // Active PQC signers may need cs_wallet to reserve counters.
+    AssertLockNotHeld(cs_wallet);
     {
-        LOCK2(m_relock_mutex, cs_wallet);
-        if (!vMasterKey.empty()) {
-            memory_cleanse(vMasterKey.data(), vMasterKey.size() * sizeof(decltype(vMasterKey)::value_type));
-            vMasterKey.clear();
+        LOCK(m_relock_mutex);
+        BlockAndWaitForActiveSigningProviderSnapshots();
+        {
+            LOCK(cs_wallet);
+            ClearMasterKey();
         }
+        UnblockActiveSigningProviderSnapshots();
     }
 
     NotifyStatusChanged(this);
     return true;
+}
+
+void CWallet::ClearMasterKey()
+{
+    AssertLockHeld(cs_wallet);
+    if (!vMasterKey.empty()) {
+        memory_cleanse(vMasterKey.data(), vMasterKey.size() * sizeof(decltype(vMasterKey)::value_type));
+        vMasterKey.clear();
+    }
+}
+
+bool CWallet::TryAddActiveSigningProviderSnapshot() const
+{
+    std::lock_guard<std::mutex> lock{m_active_signing_mutex};
+    if (m_block_signing_provider_snapshots) return false;
+    ++m_active_signing_provider_snapshots;
+    return true;
+}
+
+void CWallet::RemoveActiveSigningProviderSnapshot() const
+{
+    std::lock_guard<std::mutex> lock{m_active_signing_mutex};
+    assert(m_active_signing_provider_snapshots > 0);
+    --m_active_signing_provider_snapshots;
+    if (m_active_signing_provider_snapshots == 0) {
+        m_active_signing_cv.notify_all();
+    }
+}
+
+void CWallet::BlockAndWaitForActiveSigningProviderSnapshots() const
+{
+    std::unique_lock<std::mutex> lock{m_active_signing_mutex};
+    m_block_signing_provider_snapshots = true;
+    m_active_signing_cv.wait(lock, [&] {
+        return m_active_signing_provider_snapshots == 0;
+    });
+}
+
+void CWallet::UnblockActiveSigningProviderSnapshots() const
+{
+    std::lock_guard<std::mutex> lock{m_active_signing_mutex};
+    m_block_signing_provider_snapshots = false;
 }
 
 bool CWallet::Unlock(const CKeyingMaterial& vMasterKeyIn)
@@ -3357,12 +3955,14 @@ bool CWallet::Unlock(const CKeyingMaterial& vMasterKeyIn)
 std::set<ScriptPubKeyMan*> CWallet::GetActiveScriptPubKeyMans() const
 {
     std::set<ScriptPubKeyMan*> spk_mans;
-    for (bool internal : {false, true}) {
-        for (OutputType t : OUTPUT_TYPES) {
-            auto spk_man = GetScriptPubKeyMan(t, internal);
-            if (spk_man) {
-                spk_mans.insert(spk_man);
-            }
+    for (const auto& [_, spk_man] : m_external_spk_managers) {
+        if (spk_man) {
+            spk_mans.insert(spk_man);
+        }
+    }
+    for (const auto& [_, spk_man] : m_internal_spk_managers) {
+        if (spk_man) {
+            spk_mans.insert(spk_man);
         }
     }
     return spk_mans;
@@ -3530,11 +4130,12 @@ DescriptorScriptPubKeyMan& CWallet::LoadDescriptorScriptPubKeyMan(uint256 id, Wa
     } else {
         spk_manager = new DescriptorScriptPubKeyMan(*this, desc, m_keypool_size);
     }
+    spk_manager->MaybeRestoreDeferredCreateKeyPoolTopUp();
     AddScriptPubKeyMan(id, std::unique_ptr<ScriptPubKeyMan>(spk_manager));
     return *spk_manager;
 }
 
-DescriptorScriptPubKeyMan& CWallet::SetupDescriptorScriptPubKeyMan(WalletBatch& batch, const CExtKey& master_key, const OutputType& output_type, bool internal)
+DescriptorScriptPubKeyMan& CWallet::SetupDescriptorScriptPubKeyMan(WalletBatch& batch, const CExtKey& master_key, const OutputType& output_type, bool internal, bool use_create_keypool_warmup)
 {
     AssertLockHeld(cs_wallet);
     auto spk_manager = std::unique_ptr<DescriptorScriptPubKeyMan>(new DescriptorScriptPubKeyMan(*this, m_keypool_size));
@@ -3546,7 +4147,8 @@ DescriptorScriptPubKeyMan& CWallet::SetupDescriptorScriptPubKeyMan(WalletBatch& 
             throw std::runtime_error(std::string(__func__) + ": Could not encrypt new descriptors");
         }
     }
-    spk_manager->SetupDescriptorGeneration(batch, master_key, output_type, internal);
+    const unsigned int initial_keypool_size = use_create_keypool_warmup ? GetCreateWalletWarmupKeypoolSize(output_type, m_keypool_size) : 0;
+    spk_manager->SetupDescriptorGeneration(batch, master_key, output_type, internal, initial_keypool_size);
     DescriptorScriptPubKeyMan* out = spk_manager.get();
     uint256 id = spk_manager->GetID();
     AddScriptPubKeyMan(id, std::move(spk_manager));
@@ -3554,17 +4156,22 @@ DescriptorScriptPubKeyMan& CWallet::SetupDescriptorScriptPubKeyMan(WalletBatch& 
     return *out;
 }
 
-void CWallet::SetupDescriptorScriptPubKeyMans(WalletBatch& batch, const CExtKey& master_key)
+void CWallet::SetupDescriptorScriptPubKeyMans(WalletBatch& batch, const CExtKey& master_key, std::span<const OutputType> output_types, bool use_create_keypool_warmup)
 {
     AssertLockHeld(cs_wallet);
     for (bool internal : {false, true}) {
-        for (OutputType t : OUTPUT_TYPES) {
-            SetupDescriptorScriptPubKeyMan(batch, master_key, t, internal);
+        for (OutputType t : output_types) {
+            SetupDescriptorScriptPubKeyMan(batch, master_key, t, internal, use_create_keypool_warmup);
         }
     }
 }
 
-void CWallet::SetupOwnDescriptorScriptPubKeyMans(WalletBatch& batch)
+void CWallet::SetupDescriptorScriptPubKeyMans(WalletBatch& batch, const CExtKey& master_key, bool use_create_keypool_warmup)
+{
+    SetupDescriptorScriptPubKeyMans(batch, master_key, GetDefaultDescriptorOutputTypes(), use_create_keypool_warmup);
+}
+
+void CWallet::SetupOwnDescriptorScriptPubKeyMans(WalletBatch& batch, std::span<const OutputType> output_types, bool use_create_keypool_warmup)
 {
     AssertLockHeld(cs_wallet);
     assert(!IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER));
@@ -3577,18 +4184,35 @@ void CWallet::SetupOwnDescriptorScriptPubKeyMans(WalletBatch& batch)
     CExtKey master_key;
     master_key.SetSeed(seed_key);
 
-    SetupDescriptorScriptPubKeyMans(batch, master_key);
+    SetupDescriptorScriptPubKeyMans(batch, master_key, output_types, use_create_keypool_warmup);
 }
 
-void CWallet::SetupDescriptorScriptPubKeyMans()
+void CWallet::SetupOwnDescriptorScriptPubKeyMans(WalletBatch& batch, bool use_create_keypool_warmup)
+{
+    SetupOwnDescriptorScriptPubKeyMans(batch, GetDefaultDescriptorOutputTypes(), use_create_keypool_warmup);
+}
+
+void CWallet::SetupDescriptorScriptPubKeyMans(std::span<const OutputType> output_types, bool use_create_keypool_warmup)
+{
+    AssertLockHeld(cs_wallet);
+
+    // External signers determine their own descriptors and cannot honor caller-provided output types.
+    if (IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER)) {
+        throw std::runtime_error("Cannot specify output types for external signer wallets");
+    }
+
+    if (!RunWithinTxn(GetDatabase(), /*process_desc=*/"setup descriptors", [&](WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) {
+        SetupOwnDescriptorScriptPubKeyMans(batch, output_types, use_create_keypool_warmup);
+        return true;
+    })) throw std::runtime_error("Error: cannot process db transaction for descriptors setup");
+}
+
+void CWallet::SetupDescriptorScriptPubKeyMans(bool use_create_keypool_warmup)
 {
     AssertLockHeld(cs_wallet);
 
     if (!IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER)) {
-        if (!RunWithinTxn(GetDatabase(), /*process_desc=*/"setup descriptors", [&](WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet){
-            SetupOwnDescriptorScriptPubKeyMans(batch);
-            return true;
-        })) throw std::runtime_error("Error: cannot process db transaction for descriptors setup");
+        SetupDescriptorScriptPubKeyMans(GetDefaultDescriptorOutputTypes(), use_create_keypool_warmup);
     } else {
         auto signer = ExternalSignerScriptPubKeyMan::GetExternalSigner();
         if (!signer) throw std::runtime_error(util::ErrorString(signer).original);
@@ -3697,23 +4321,20 @@ DescriptorScriptPubKeyMan* CWallet::GetDescriptorScriptPubKeyMan(const WalletDes
     return nullptr;
 }
 
-std::optional<bool> CWallet::IsInternalScriptPubKeyMan(ScriptPubKeyMan* spk_man) const
+std::optional<bool> CWallet::IsInternalScriptPubKeyMan(const ScriptPubKeyMan* spk_man) const
 {
-    // only active ScriptPubKeyMan can be internal
-    if (!GetActiveScriptPubKeyMans().count(spk_man)) {
-        return std::nullopt;
+    LOCK(cs_wallet);
+    for (const auto& [_, internal_spk_man] : m_internal_spk_managers) {
+        if (internal_spk_man == spk_man) {
+            return true;
+        }
     }
-
-    const auto desc_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(spk_man);
-    if (!desc_spk_man) {
-        throw std::runtime_error(std::string(__func__) + ": unexpected ScriptPubKeyMan type.");
+    for (const auto& [_, external_spk_man] : m_external_spk_managers) {
+        if (external_spk_man == spk_man) {
+            return false;
+        }
     }
-
-    LOCK(desc_spk_man->cs_desc_man);
-    const auto& type = desc_spk_man->GetWalletDescriptor().descriptor->GetOutputType();
-    assert(type.has_value());
-
-    return GetScriptPubKeyMan(*type, /* internal= */ true) == desc_spk_man;
+    return std::nullopt;
 }
 
 util::Result<std::reference_wrapper<DescriptorScriptPubKeyMan>> CWallet::AddWalletDescriptor(WalletDescriptor& desc, const FlatSigningProvider& signing_provider, const std::string& label, bool internal)
@@ -3746,8 +4367,9 @@ util::Result<std::reference_wrapper<DescriptorScriptPubKeyMan>> CWallet::AddWall
     }
 
     // Top up key pool, the manager will generate new scriptPubKeys internally
-    if (!spk_man->TopUp()) {
-        return util::Error{_("Could not top up scriptPubKeys")};
+    auto top_up_res{spk_man->TopUpWithInternalHintResult(internal)};
+    if (!top_up_res) {
+        return util::Error{_("Could not top up scriptPubKeys: ") + util::ErrorString(top_up_res)};
     }
 
     // Apply the label if necessary

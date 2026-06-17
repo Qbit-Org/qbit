@@ -10,7 +10,10 @@
 
 #include <tinyformat.h>
 
+#include <limits>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using util::Join;
@@ -20,7 +23,7 @@ using util::Join;
  * for both bitcoind and bitcoin-qt, to make it harder for attackers to
  * target servers or GUI users specifically.
  */
-const std::string UA_NAME("Satoshi");
+const std::string UA_NAME("qbit");
 
 
 #include <bitcoin-build-info.h>
@@ -53,6 +56,144 @@ static std::string FormatVersion(int nVersion)
     return strprintf("%d.%d.%d", nVersion / 10000, (nVersion / 100) % 100, nVersion % 100);
 }
 
+static std::string FormatVersionForSubVersion(std::string_view name, int nVersion)
+{
+    if (name == UA_NAME && nVersion == CLIENT_VERSION) {
+        return CLIENT_VERSION_STRING;
+    }
+    return FormatVersion(nVersion);
+}
+namespace {
+struct ParsedPhase {
+    std::string label;
+    std::optional<int> number;
+};
+
+struct ParsedSubVersion {
+    int major;
+    int minor;
+    int patch;
+    std::optional<ParsedPhase> phase;
+    std::optional<int> rc;
+};
+
+constexpr bool IsAsciiDigit(const unsigned char ch)
+{
+    return ch >= '0' && ch <= '9';
+}
+
+constexpr bool IsAsciiAlpha(const unsigned char ch)
+{
+    return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z');
+}
+
+bool ParseInt(std::string_view value, int& out)
+{
+    if (value.empty()) return false;
+
+    int parsed{0};
+    for (const unsigned char ch : value) {
+        if (!IsAsciiDigit(ch)) return false;
+        const int digit{ch - '0'};
+        if (parsed > (std::numeric_limits<int>::max() - digit) / 10) return false;
+        parsed = parsed * 10 + digit;
+    }
+    out = parsed;
+    return true;
+}
+
+std::optional<ParsedPhase> ParsePhase(std::string_view value)
+{
+    if (value.empty()) return std::nullopt;
+
+    size_t split{value.size()};
+    while (split > 0 && IsAsciiDigit(static_cast<unsigned char>(value[split - 1]))) {
+        --split;
+    }
+    if (split == 0) return std::nullopt;
+
+    for (size_t i = 0; i < split; ++i) {
+        if (!IsAsciiAlpha(static_cast<unsigned char>(value[i]))) return std::nullopt;
+    }
+
+    ParsedPhase phase{std::string{value.substr(0, split)}, std::nullopt};
+    if (split == value.size()) return phase;
+
+    int phase_number{0};
+    if (!ParseInt(value.substr(split), phase_number)) return std::nullopt;
+    phase.number = phase_number;
+    return phase;
+}
+
+std::optional<ParsedSubVersion> ParseSubVersion(std::string_view subversion, std::string_view client_name)
+{
+    if (subversion.size() < 5 || subversion.front() != '/' || subversion.back() != '/') return std::nullopt;
+
+    const std::string_view body{subversion.substr(1, subversion.size() - 2)};
+    const size_t colon{body.find(':')};
+    if (colon == std::string_view::npos || body.substr(0, colon) != client_name) return std::nullopt;
+
+    std::string_view version{body.substr(colon + 1)};
+    if (const size_t comments{version.find('(')}; comments != std::string_view::npos) {
+        version = version.substr(0, comments);
+    }
+    if (version.empty()) return std::nullopt;
+
+    ParsedSubVersion parsed{};
+
+    const size_t first_dot{version.find('.')};
+    if (first_dot == std::string_view::npos) return std::nullopt;
+    const size_t second_dot{version.find('.', first_dot + 1)};
+    if (second_dot == std::string_view::npos) return std::nullopt;
+
+    if (!ParseInt(version.substr(0, first_dot), parsed.major)) return std::nullopt;
+    if (!ParseInt(version.substr(first_dot + 1, second_dot - first_dot - 1), parsed.minor)) return std::nullopt;
+
+    std::string_view patch_and_suffixes{version.substr(second_dot + 1)};
+    const size_t first_dash{patch_and_suffixes.find('-')};
+    std::string_view patch{patch_and_suffixes.substr(0, first_dash)};
+    if (!ParseInt(patch, parsed.patch)) return std::nullopt;
+
+    if (first_dash == std::string_view::npos) return parsed;
+
+    std::string_view suffixes{patch_and_suffixes.substr(first_dash + 1)};
+    if (suffixes.empty()) return std::nullopt;
+    while (!suffixes.empty()) {
+        const size_t next_dash{suffixes.find('-')};
+        const std::string_view suffix{suffixes.substr(0, next_dash)};
+        if (suffix.empty()) return std::nullopt;
+
+        if (suffix.starts_with("rc")) {
+            if (parsed.rc.has_value()) return std::nullopt;
+            int rc_number{0};
+            if (!ParseInt(suffix.substr(2), rc_number)) return std::nullopt;
+            parsed.rc = rc_number;
+        } else {
+            if (parsed.phase.has_value() || parsed.rc.has_value()) return std::nullopt;
+            parsed.phase = ParsePhase(suffix);
+            if (!parsed.phase.has_value()) return std::nullopt;
+        }
+
+        if (next_dash == std::string_view::npos) break;
+        suffixes = suffixes.substr(next_dash + 1);
+        if (suffixes.empty()) return std::nullopt;
+    }
+
+    return parsed;
+}
+
+int ComparePhases(const std::optional<ParsedPhase>& lhs, const std::optional<ParsedPhase>& rhs)
+{
+    if (!lhs && !rhs) return 0;
+    if (!lhs || !rhs) return 2;
+    if (lhs->label != rhs->label) return 2;
+    if (lhs->number != rhs->number) {
+        if (!lhs->number || !rhs->number) return 2;
+        return *lhs->number < *rhs->number ? -1 : 1;
+    }
+    return 0;
+}
+} // namespace
 std::string FormatFullVersion()
 {
     static const std::string CLIENT_BUILD(BUILD_DESC BUILD_SUFFIX);
@@ -66,13 +207,42 @@ std::string FormatSubVersion(const std::string& name, int nClientVersion, const 
 {
     std::string comments_str;
     if (!comments.empty()) comments_str = strprintf("(%s)", Join(comments, "; "));
-    return strprintf("/%s:%s%s/", name, FormatVersion(nClientVersion), comments_str);
+    return strprintf("/%s:%s%s/", name, FormatVersionForSubVersion(name, nClientVersion), comments_str);
+}
+
+std::optional<int> CompareSubVersion(std::string_view lhs, std::string_view rhs, std::string_view client_name)
+{
+    const auto parsed_lhs{ParseSubVersion(lhs, client_name)};
+    const auto parsed_rhs{ParseSubVersion(rhs, client_name)};
+    if (!parsed_lhs || !parsed_rhs) return std::nullopt;
+
+    if (parsed_lhs->major != parsed_rhs->major) return parsed_lhs->major < parsed_rhs->major ? -1 : 1;
+    if (parsed_lhs->minor != parsed_rhs->minor) return parsed_lhs->minor < parsed_rhs->minor ? -1 : 1;
+    if (parsed_lhs->patch != parsed_rhs->patch) return parsed_lhs->patch < parsed_rhs->patch ? -1 : 1;
+
+    const int phase_cmp{ComparePhases(parsed_lhs->phase, parsed_rhs->phase)};
+    if (phase_cmp == 2) return std::nullopt;
+    if (phase_cmp != 0) return phase_cmp;
+
+    if (parsed_lhs->rc != parsed_rhs->rc) {
+        if (!parsed_lhs->rc) return 1;
+        if (!parsed_rhs->rc) return -1;
+        return *parsed_lhs->rc < *parsed_rhs->rc ? -1 : 1;
+    }
+
+    return 0;
 }
 
 std::string CopyrightHolders(const std::string& strPrefix)
 {
     const auto copyright_devs = strprintf(_(COPYRIGHT_HOLDERS), COPYRIGHT_HOLDERS_SUBSTITUTION).translated;
-    std::string strCopyrightHolders = strPrefix + copyright_devs;
+    std::string project_prefix{strPrefix};
+    const std::string inherited_year_range{strprintf("%i-%i", 2009, COPYRIGHT_YEAR)};
+    const auto year_pos{project_prefix.find(inherited_year_range)};
+    if (year_pos != std::string::npos) {
+        project_prefix.replace(year_pos, inherited_year_range.size(), strprintf("%i", COPYRIGHT_YEAR));
+    }
+    std::string strCopyrightHolders = project_prefix + copyright_devs;
 
     // Make sure Bitcoin Core copyright is not removed by accident
     if (copyright_devs.find("Bitcoin Core") == std::string::npos) {
@@ -83,7 +253,7 @@ std::string CopyrightHolders(const std::string& strPrefix)
 
 std::string LicenseInfo()
 {
-    const std::string URL_SOURCE_CODE = "<https://github.com/bitcoin/bitcoin>";
+    const std::string URL_SOURCE_CODE = "the public qbit source distribution";
 
     return CopyrightHolders(strprintf(_("Copyright (C) %i-%i"), 2009, COPYRIGHT_YEAR).translated + " ") + "\n" +
            "\n" +

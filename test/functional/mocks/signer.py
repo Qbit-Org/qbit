@@ -8,6 +8,17 @@ import sys
 import argparse
 import json
 
+sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+
+from test_framework.address import (
+    key_to_p2pkh,
+    key_to_p2sh_p2wpkh,
+    key_to_p2wpkh,
+    output_key_to_p2tr,
+)
+from test_framework.descriptors import descsum_create
+from test_framework.script import taproot_construct
+
 def perform_pre_checks():
     mock_result_path = os.path.join(os.getcwd(), "mock_result")
     if os.path.isfile(mock_result_path):
@@ -21,20 +32,20 @@ def enumerate(args):
     sys.stdout.write(json.dumps([{"fingerprint": "00000001", "type": "trezor", "model": "trezor_t"}]))
 
 def getdescriptors(args):
-    xpub = "tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B"
+    xpub = "qrpbSRJj3eCrXD2z3iQbhaESDr59kqgvZtx9cbX5yqsMHCcEf3rUW2X1BkQVAQvUC1y14Ly3zscn9BvKoe1VCyvM3wgoF9UgedXSaecaxhhYggh"
 
     sys.stdout.write(json.dumps({
         "receive": [
-            "pkh([00000001/44h/1h/" + args.account + "']" + xpub + "/0/*)#aqllu46s",
-            "sh(wpkh([00000001/49h/1h/" + args.account + "']" + xpub + "/0/*))#5dh56mgg",
-            "wpkh([00000001/84h/1h/" + args.account + "']" + xpub + "/0/*)#h62dxaej",
-            "tr([00000001/86h/1h/" + args.account + "']" + xpub + "/0/*)#pcd5w87f"
+            descsum_create("pkh([00000001/44h/1h/" + args.account + "']" + xpub + "/0/*)"),
+            descsum_create("sh(wpkh([00000001/49h/1h/" + args.account + "']" + xpub + "/0/*))"),
+            descsum_create("wpkh([00000001/84h/1h/" + args.account + "']" + xpub + "/0/*)"),
+            descsum_create("tr([00000001/86h/1h/" + args.account + "']" + xpub + "/0/*)"),
         ],
         "internal": [
-            "pkh([00000001/44h/1h/" + args.account + "']" + xpub + "/1/*)#v567pq2g",
-            "sh(wpkh([00000001/49h/1h/" + args.account + "']" + xpub + "/1/*))#pvezzyah",
-            "wpkh([00000001/84h/1h/" + args.account + "']" + xpub + "/1/*)#xw0vmgf2",
-            "tr([00000001/86h/1h/" + args.account + "']" + xpub + "/1/*)#svg4njw3"
+            descsum_create("pkh([00000001/44h/1h/" + args.account + "']" + xpub + "/1/*)"),
+            descsum_create("sh(wpkh([00000001/49h/1h/" + args.account + "']" + xpub + "/1/*))"),
+            descsum_create("wpkh([00000001/84h/1h/" + args.account + "']" + xpub + "/1/*)"),
+            descsum_create("tr([00000001/86h/1h/" + args.account + "']" + xpub + "/1/*)"),
 
         ]
     }))
@@ -44,17 +55,20 @@ def displayaddress(args):
     if args.fingerprint != "00000001":
         return sys.stdout.write(json.dumps({"error": "Unexpected fingerprint", "fingerprint": args.fingerprint}))
 
+    pubkey = "02c97dc3f4420402e01a113984311bf4a1b8de376cac0bdcfaf1b3ac81f13433c7"
+    is_main_chain = args.chain == "main"
+    descriptor = args.desc.split("#", 1)[0].replace("'", "h")
     expected_desc = {
-        "wpkh([00000001/84h/1h/0h/0/0]02c97dc3f4420402e01a113984311bf4a1b8de376cac0bdcfaf1b3ac81f13433c7)#3te6hhy7": "bcrt1qm90ugl4d48jv8n6e5t9ln6t9zlpm5th68x4f8g",
-        "sh(wpkh([00000001/49h/1h/0h/0/0]02c97dc3f4420402e01a113984311bf4a1b8de376cac0bdcfaf1b3ac81f13433c7))#kz9y5w82": "2N2gQKzjUe47gM8p1JZxaAkTcoHPXV6YyVp",
-        "pkh([00000001/44h/1h/0h/0/0]02c97dc3f4420402e01a113984311bf4a1b8de376cac0bdcfaf1b3ac81f13433c7)#q3pqd8wh": "n1LKejAadN6hg2FrBXoU1KrwX4uK16mco9",
-        "tr([00000001/86h/1h/0h/0/0]c97dc3f4420402e01a113984311bf4a1b8de376cac0bdcfaf1b3ac81f13433c7)#puqqa90m": "tb1phw4cgpt6cd30kz9k4wkpwm872cdvhss29jga2xpmftelhqll62mscq0k4g",
-        "wpkh([00000001/84h/1h/0h/0/1]03a20a46308be0b8ded6dff0a22b10b4245c587ccf23f3b4a303885be3a524f172)#aqpjv5xr": "wrong_address",
+        "wpkh([00000001/84h/1h/0h/0/0]02c97dc3f4420402e01a113984311bf4a1b8de376cac0bdcfaf1b3ac81f13433c7)": key_to_p2wpkh(pubkey, main=is_main_chain),
+        "sh(wpkh([00000001/49h/1h/0h/0/0]02c97dc3f4420402e01a113984311bf4a1b8de376cac0bdcfaf1b3ac81f13433c7))": key_to_p2sh_p2wpkh(pubkey, main=is_main_chain),
+        "pkh([00000001/44h/1h/0h/0/0]02c97dc3f4420402e01a113984311bf4a1b8de376cac0bdcfaf1b3ac81f13433c7)": key_to_p2pkh(pubkey, main=is_main_chain),
+        "tr([00000001/86h/1h/0h/0/0]c97dc3f4420402e01a113984311bf4a1b8de376cac0bdcfaf1b3ac81f13433c7)": output_key_to_p2tr(taproot_construct(bytes.fromhex("c97dc3f4420402e01a113984311bf4a1b8de376cac0bdcfaf1b3ac81f13433c7")).output_pubkey, main=is_main_chain),
+        "wpkh([00000001/84h/1h/0h/0/1]03a20a46308be0b8ded6dff0a22b10b4245c587ccf23f3b4a303885be3a524f172)": "wrong_address",
     }
-    if args.desc not in expected_desc:
+    if descriptor not in expected_desc:
         return sys.stdout.write(json.dumps({"error": "Unexpected descriptor", "desc": args.desc}))
 
-    return sys.stdout.write(json.dumps({"address": expected_desc[args.desc]}))
+    return sys.stdout.write(json.dumps({"address": expected_desc[descriptor]}))
 
 def signtx(args):
     if args.fingerprint != "00000001":

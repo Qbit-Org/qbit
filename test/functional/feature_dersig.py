@@ -8,6 +8,7 @@ Test the DERSIG soft-fork activation on regtest.
 """
 
 from test_framework.blocktools import (
+    COINBASE_MATURITY,
     create_block,
     create_coinbase,
 )
@@ -41,7 +42,7 @@ def unDERify(tx):
     tx.vin[0].scriptSig = CScript(newscript)
 
 
-DERSIG_HEIGHT = 102
+DERSIG_HEIGHT = COINBASE_MATURITY + 2
 
 
 class BIP66Test(BitcoinTestFramework):

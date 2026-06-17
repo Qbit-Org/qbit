@@ -12,7 +12,9 @@ import re
 
 from subprocess import check_output, CalledProcessError
 
-EXCLUDED_DIRS = ["src/crc32c/", "src/secp256k1/"]
+from lint_ignore_dirs import SHARED_EXCLUDED_SUBTREES
+
+EXCLUDED_DIRS = SHARED_EXCLUDED_SUBTREES
 
 
 def get_exclude_args():
