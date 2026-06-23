@@ -95,14 +95,17 @@ maintained:
 * for `src/crc32c`: https://github.com/bitcoin-core/crc32c-subtree.git (branch bitcoin-fork)
 * for `src/crypto/ctaes`: https://github.com/bitcoin-core/ctaes.git (branch master)
 * for `src/ipc/libmultiprocess`: https://github.com/bitcoin-core/libmultiprocess (branch master)
-* for `src/libbitcoinpqc`: https://github.com/<owner>/libbitcoinpqc-qbit.git (branch qbit-subtree)
 * for `src/leveldb`: https://github.com/bitcoin-core/leveldb-subtree.git (branch bitcoin-fork)
 * for `src/minisketch`: https://github.com/bitcoin-core/minisketch.git (branch master)
 * for `src/secp256k1`: https://github.com/bitcoin-core/secp256k1.git (branch master)
 
 Keep this list in sync with `fn get_subtrees()` in the lint runner.
 
-For the qbit-specific libbitcoinpqc subtree workflow, see
+The qbit-specific `src/libbitcoinpqc` vendored source is excluded from generic
+file linters, but public release snapshot branches may not carry
+`git-subtree` metadata until the public `Qbit-Org/libbitcoinpqc-qbit`
+repository is available. For the libbitcoinpqc subtree workflow and provenance
+checks, see
 [`doc/subtrees/libbitcoinpqc.md`](../../doc/subtrees/libbitcoinpqc.md).
 
 To do so, add the upstream repository as remote:
