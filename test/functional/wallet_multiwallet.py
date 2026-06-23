@@ -58,6 +58,13 @@ class MultiWalletTest(BitcoinTestFramework):
             help='Test data with wallet directories (default: %(default)s)',
         )
 
+    def wait_pqc_key_validation_ready(self, wallet):
+        def ready():
+            validation = wallet.getwalletinfo().get("pqc_key_validation", {})
+            return validation.get("status") in ("not_required", "complete") and not validation.get("signing_blocked", True)
+
+        self.wait_until(ready, timeout=180)
+
     def run_test(self):
         node = self.nodes[0]
 
@@ -358,6 +365,7 @@ class MultiWalletTest(BitcoinTestFramework):
 
         # Successfully unload the wallet referenced by the request endpoint
         # Also ensure unload works during walletpassphrase timeout
+        self.wait_pqc_key_validation_ready(w2)
         w2.encryptwallet('test')
         w2.walletpassphrase('test', 1)
         w2.unloadwallet()

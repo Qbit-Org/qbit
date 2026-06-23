@@ -210,7 +210,6 @@ fn get_subtrees() -> Vec<&'static str> {
         "src/crc32c",
         "src/crypto/ctaes",
         "src/ipc/libmultiprocess",
-        "src/libbitcoinpqc",
         "src/leveldb",
         "src/minisketch",
         "src/secp256k1",
@@ -222,6 +221,9 @@ fn get_pathspecs_default_excludes() -> Vec<String> {
     get_subtrees()
         .iter()
         .chain(&[
+            // qbit-specific vendored source. Public release snapshot branches may not
+            // carry git-subtree metadata until the public upstream repository exists.
+            "src/libbitcoinpqc",
             "doc/release-notes/release-notes-*", // archived notes
             "contrib/photon/src/vendor/",        // externally sourced vendored code
         ])
