@@ -102,22 +102,22 @@ TestVector test4 =
      0);
 
 const std::vector<std::string> TEST5 = {
-    "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"
+    "qpubUjHa4QkoifBNJQxHTUQj6h7riPZAnRT8CjPJ7YqVsvisE9kmpaj8YLBevUE6kACuT8DjCFQ5qAixWyhpihBNJjm1JHiDA24D3pdXtMBJKid", // pubkey version / prvkey mismatch
+    "qprvYWJDeuDutHd55vspMSsijZB8AMigNxjGqWThKARtKbBtMMRdH3QszXsB5QVgyFAwbyTmoBnbdjBQRQxEMFXsGTV3D5Pn5WKBwHHC82rwBaz", // prvkey version / pubkey mismatch
+    "qpubUjHa4QkoifBNJQxHTUQj6h7riPZAnRT8CjPJ7YqVsvisE9kmpaj8YLBevc15T612rpvdjXiuTVCxLG6vP9eEuZ8WSqze8coo2Sf5rreVAa6", // invalid pubkey prefix 04
+    "qprvYWJDeuDutHd55vspMSsijZB8AMigNxjGqWThKARtKbBtMMRdH3QszXsB5QroMurST6Udq5bynjTVipZ8VV9h9hYLvqgGHHzk6amr6ou9T5n", // invalid prvkey prefix 04
+    "qpubUjHa4QkoifBNJQxHTUQj6h7riPZAnRT8CjPJ7YqVsvisE9kmpaj8YLBevWAqvPewJYtxL4ynjkLxUJJbdoo5xSbt5vnKQAk73UdvP4eb9iV", // invalid pubkey prefix 01
+    "qprvYWJDeuDutHd55vspMSsijZB8AMigNxjGqWThKARtKbBtMMRdH3QszXsB5K2ZqDWLtpSxRcrs4zbVrrkok9JYCb1iZvTwYqw47ckgcxPJsxe", // invalid prvkey prefix 01
+    "qprvYWJeUdi1HP5NA8yk1i8muzbMinbB8FTRKnWn1YUBT4orYgZ3QMjYSyzEVqbdkqPMfykFbUZAUWY7tWchcqDMdh4mEJ8pLo8R2jS1tnwjS6i", // zero depth with non-zero parent fingerprint
+    "qpubUjHzt9Eu7kdfNd4D7jfnH8Y6GpRfXiBGh1SNovso1QLqRUtBwu3nznJiMA9nAGeaeHtJ1KBXcaVV1pxh2iYx77y8B6T8xw1Vmur9eTSmAWv", // zero depth with non-zero parent fingerprint
+    "qprvYWJDeuDux5eDwas5VhRE1LrjbDLEup9qED8D5bYhpwEnYWEjcGc8aDuQoU68SFinZHxKNCtHB3jS4DRZai1ZPVe4a8yMQcJq9mzTaxvMr58", // zero depth with non-zero index
+    "qpubUjHa4QkonTCXA4wYbixENUoU9FAjKGsgbS3osyxKPGmmRJZt9ovP82DteneGqgz1Xc6Mn3WeK7goBXmYzbM9rvYRWwHg2kButxQbLkTVfQt", // zero depth with non-zero index
+    "DMwo58pR1QLEFihHiXPVykYB6fJmsTeHvyTp7hRThAtCX8CvYzgPcn8XnmdfHGMQzT7ayAmfo4z3gY5KfbrZWZ6St24UVf2Qgo6oujFktLHdHY4", // unknown extended key version
+    "DMwo58pR1QLEFihHiXPVykYB6fJmsTeHvyTp7hRThAtCX8CvYzgPcn8XnmdfHPmHJiEDXkTiJTVV9rHEBUem2mwVbbNfvT2MTcAqj3nesx8uBf9", // unknown extended key version
+    "qprvYWJDeuDutHd55vspMSsijZB8AMigNxjGqWThKARtKbBtMMRdH3QszXsB5H5pez4K3PmjHoHAAQyVuYA2q2gpYtAqnHPqJhFA7xkJ6yx4W6k", // private key 0 not in 1..n-1
+    "qprvYWJDeuDutHd55vspMSsijZB8AMigNxjGqWThKARtKbBtMMRdH3QszXsB5K2ZqDWLtpSxRcrs4zbVrrkjDGwdfZkw7DCxHzDjRKjJqBB3A5R", // private key n not in 1..n-1
+    "qpubUjHa4QkoifBNJQxHTUQj6h7riPZAnRT8CjPJ7YqVsvisE9kmpaj8YLBevY7b6d6y9yaBTtZVeKxxRcuNYvQoc9SksZrReKS138eJs8TGg8o", // invalid pubkey 020000000000000000000000000000000000000000000000000000000000000007
+    "qprvYWJDeuDutHd57GyMrRDvbDij8SLFcZvtFEt2m4NvoekUUTh6XgkUPP1PXtYDVQT5oBVi6bR5zx38ajCP8UzA7YEAQuugGppBAUziQrwLPSa", // invalid checksum
 };
 
 void RunTest(const TestVector& test)
