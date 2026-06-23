@@ -40,8 +40,8 @@ hardware, physical side-channel attackers, or fault injection from this release.
 Randomized or hedged signing is not exposed by the current API and is deferred
 to a separate explicit API and review track.
 
-See [docs/side-channel-policy.md](docs/side-channel-policy.md) for the reviewed
-side-channel scope and deferred guarantees.
+The reviewed side-channel scope and deferred guarantees are limited to the
+release posture described above.
 
 ## Parameter Choices And Rationale
 
