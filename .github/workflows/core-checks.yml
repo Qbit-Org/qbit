@@ -8,14 +8,17 @@ on:
   pull_request:
     branches:
       - main
+      - 0.1.x
       - develop
   push:
     branches:
       - main
+      - 0.1.x
       - develop
   merge_group:
     branches:
       - main
+      - 0.1.x
       - develop
 
 permissions:
@@ -30,8 +33,77 @@ defaults:
     shell: bash
 
 jobs:
+  classify-changes:
+    name: classify validation profile
+    runs-on: ubuntu-24.04
+    outputs:
+      profile: ${{ steps.classify.outputs.profile }}
+      release_policy_only: ${{ steps.classify.outputs.release_policy_only }}
+      source_validation_required: ${{ steps.classify.outputs.source_validation_required }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Write changed file list
+        id: changed-files
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          BASE_REF: ${{ github.base_ref || github.event.merge_group.base_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+        run: |
+          set -euo pipefail
+
+          changed_files="${RUNNER_TEMP}/changed-files.txt"
+          : > "${changed_files}"
+
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            if [[ -z "${BASE_SHA}" ]]; then
+              echo "::error::Pull request base SHA is unavailable."
+              exit 1
+            fi
+            git diff --name-only "${BASE_SHA}...HEAD" > "${changed_files}"
+          elif [[ "${EVENT_NAME}" == "merge_group" ]]; then
+            base_branch="${BASE_REF#refs/heads/}"
+            if [[ -z "${base_branch}" ]]; then
+              echo "::error::Merge-group base branch is unavailable."
+              exit 1
+            fi
+            git fetch --no-tags --prune origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"
+            git diff --name-only "origin/${base_branch}...HEAD" > "${changed_files}"
+          elif [[ "${EVENT_NAME}" == "push" ]]; then
+            if [[ -n "${BEFORE_SHA}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
+              git diff --name-only "${BEFORE_SHA}..HEAD" > "${changed_files}"
+            else
+              git fetch --no-tags --prune origin "${DEFAULT_BRANCH}"
+              merge_base="$(git merge-base "origin/${DEFAULT_BRANCH}" HEAD 2>/dev/null || true)"
+              if [[ -n "${merge_base}" ]]; then
+                git diff --name-only "${merge_base}...HEAD" > "${changed_files}"
+              else
+                git diff-tree --no-commit-id --name-only -r HEAD > "${changed_files}"
+              fi
+            fi
+          else
+            git diff-tree --no-commit-id --name-only -r HEAD > "${changed_files}"
+          fi
+
+          cat "${changed_files}"
+          echo "changed_files=${changed_files}" >> "$GITHUB_OUTPUT"
+
+      - name: Classify validation profile
+        id: classify
+        run: |
+          python3 ci/checks/classify_merge_profile.py \
+            --changed-files "${{ steps.changed-files.outputs.changed_files }}" \
+            --github-output "$GITHUB_OUTPUT"
+
   build-smoke:
     name: build smoke
+    needs: classify-changes
+    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
 
@@ -77,6 +149,8 @@ jobs:
 
   focused-unit-suites:
     name: focused unit suites
+    needs: classify-changes
+    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 75
 
@@ -133,6 +207,8 @@ jobs:
 
   functional-smoke:
     name: functional smoke
+    needs: classify-changes
+    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
 
@@ -190,6 +266,8 @@ jobs:
 
   release-validator-tests:
     name: release validator tests
+    needs: classify-changes
+    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
 
@@ -294,17 +372,21 @@ jobs:
     name: 'Core Checks Gate'
     runs-on: ubuntu-24.04
     needs:
+      - classify-changes
       - build-smoke
       - focused-unit-suites
       - functional-smoke
       - release-validator-tests
-    # Single aggregated, fail-closed required check for branch protection on
-    # main. Each core check runs unconditionally (path filtering is step-level),
-    # so a non-success result means skipped/cancelled/failure and must block.
+    # Aggregate core check input for Required Merge Gate. Source jobs are skipped
+    # only for the strict release-policy profile; every other profile requires
+    # the core jobs to complete successfully.
     if: ${{ always() }}
     steps:
       - name: Check core check results
         env:
+          CLASSIFY_CHANGES_RESULT: ${{ needs.classify-changes.result }}
+          VALIDATION_PROFILE: ${{ needs.classify-changes.outputs.profile }}
+          SOURCE_VALIDATION_REQUIRED: ${{ needs.classify-changes.outputs.source_validation_required }}
           BUILD_SMOKE_RESULT: ${{ needs.build-smoke.result }}
           FOCUSED_UNIT_SUITES_RESULT: ${{ needs.focused-unit-suites.result }}
           FUNCTIONAL_SMOKE_RESULT: ${{ needs.functional-smoke.result }}
@@ -323,6 +405,13 @@ jobs:
               failed=1
             fi
           }
+
+          check_result "classify validation profile" "${CLASSIFY_CHANGES_RESULT}"
+
+          if [[ "${SOURCE_VALIDATION_REQUIRED}" != "true" ]]; then
+            echo "Validation profile ${VALIDATION_PROFILE} does not require source core checks."
+            exit "${failed}"
+          fi
 
           check_result "build smoke" "${BUILD_SMOKE_RESULT}"
           check_result "focused unit suites" "${FOCUSED_UNIT_SUITES_RESULT}"

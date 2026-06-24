@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026-present The qbit core developers
+# Distributed under the MIT software license, see the accompanying
+# file COPYING or https://opensource.org/license/mit/.
+"""Classify pull request changes for the required merge gate."""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import PurePosixPath
+
+
+RELEASE_POLICY_PROFILE = "release-policy"
+SOURCE_PROFILE = "source"
+
+RELEASE_TRUST_DOC_RE = re.compile(r"^doc/release-trust-[^/]+[.]md$")
+
+
+@dataclass(frozen=True)
+class Classification:
+    paths: tuple[str, ...]
+    invalid_paths: tuple[str, ...]
+    release_policy_paths: tuple[str, ...]
+    outside_paths: tuple[str, ...]
+
+    @property
+    def profile(self) -> str:
+        if not self.paths or self.invalid_paths or self.outside_paths:
+            return SOURCE_PROFILE
+        return RELEASE_POLICY_PROFILE
+
+    @property
+    def release_policy_only(self) -> bool:
+        return self.profile == RELEASE_POLICY_PROFILE
+
+
+def normalize_path(path: str) -> str | None:
+    path = path.strip()
+    if not path or "\0" in path or path.startswith("/"):
+        return None
+
+    parts = PurePosixPath(path).parts
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        return None
+
+    return "/".join(parts)
+
+
+def is_release_policy_path(path: str) -> bool:
+    return (
+        path == ".github/workflows/release-publish.yml"
+        or path.startswith("ci/release/")
+        or path.startswith("contrib/keys/operator-keys/")
+        or RELEASE_TRUST_DOC_RE.fullmatch(path) is not None
+    )
+
+
+def classify_paths(paths: list[str] | tuple[str, ...]) -> Classification:
+    normalized: list[str] = []
+    invalid: list[str] = []
+    release_policy: list[str] = []
+    outside: list[str] = []
+
+    for raw_path in paths:
+        path = normalize_path(raw_path)
+        if path is None:
+            invalid.append(raw_path)
+            continue
+
+        normalized.append(path)
+        if is_release_policy_path(path):
+            release_policy.append(path)
+        else:
+            outside.append(path)
+
+    return Classification(
+        paths=tuple(normalized),
+        invalid_paths=tuple(invalid),
+        release_policy_paths=tuple(release_policy),
+        outside_paths=tuple(outside),
+    )
+
+
+def load_changed_files(path: str) -> list[str]:
+    with open(path, encoding="utf8") as file:
+        return file.read().splitlines()
+
+
+def bool_output(value: bool) -> str:
+    return "true" if value else "false"
+
+
+def github_outputs(classification: Classification) -> dict[str, str]:
+    paths = classification.paths
+    return {
+        "profile": classification.profile,
+        "release_policy_only": bool_output(classification.release_policy_only),
+        "source_validation_required": bool_output(not classification.release_policy_only),
+        "changed_count": str(len(paths)),
+        "touched_operator_keys": bool_output(
+            any(path.startswith("contrib/keys/operator-keys/") for path in paths)
+        ),
+        "touched_release_publish": bool_output(
+            ".github/workflows/release-publish.yml" in paths
+        ),
+        "touched_release_validators": bool_output(
+            any(path.startswith("ci/release/") for path in paths)
+        ),
+        "touched_release_trust_docs": bool_output(
+            any(RELEASE_TRUST_DOC_RE.fullmatch(path) for path in paths)
+        ),
+    }
+
+
+def write_github_output(path: str, values: dict[str, str]) -> None:
+    with open(path, "a", encoding="utf8") as file:
+        for key, value in values.items():
+            file.write(f"{key}={value}\n")
+
+
+def describe_classification(classification: Classification) -> str:
+    lines = [
+        f"validation_profile={classification.profile}",
+        f"changed_count={len(classification.paths)}",
+    ]
+
+    if classification.release_policy_paths:
+        lines.append("release_policy_paths:")
+        lines.extend(f"  {path}" for path in classification.release_policy_paths)
+    if classification.outside_paths:
+        lines.append("full_validation_paths:")
+        lines.extend(f"  {path}" for path in classification.outside_paths)
+    if classification.invalid_paths:
+        lines.append("invalid_paths:")
+        lines.extend(f"  {path}" for path in classification.invalid_paths)
+
+    return "\n".join(lines)
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--changed-files",
+        required=True,
+        help="newline-delimited file list from git diff --name-only",
+    )
+    parser.add_argument(
+        "--github-output",
+        help="append classifier outputs to the GitHub Actions output file",
+    )
+    parser.add_argument(
+        "--require-release-policy-only",
+        action="store_true",
+        help="fail if any changed path is outside the release-policy allowlist",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    classification = classify_paths(load_changed_files(args.changed_files))
+
+    print(describe_classification(classification))
+
+    if args.github_output:
+        write_github_output(args.github_output, github_outputs(classification))
+
+    if args.require_release_policy_only and not classification.release_policy_only:
+        print(
+            "release-policy-only validation requires every changed path to be in "
+            "the release-policy allowlist",
+            file=sys.stderr,
+        )
+        for path in classification.invalid_paths + classification.outside_paths:
+            print(f"outside allowlist: {path}", file=sys.stderr)
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

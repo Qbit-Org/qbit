@@ -36,10 +36,7 @@
         "do_not_enforce_on_create": true,
         "required_status_checks": [
           {
-            "context": "Core Checks Gate"
-          },
-          {
-            "context": "Full Validation Gate"
+            "context": "Required Merge Gate"
           }
         ],
         "strict_required_status_checks_policy": true
