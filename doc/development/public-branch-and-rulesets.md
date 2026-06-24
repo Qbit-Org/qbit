@@ -118,7 +118,7 @@ changed paths. This keeps the required check present for every pull request
 without relying on workflow-level `paths` or `paths-ignore` filters, which can
 leave required workflows pending when GitHub skips them.
 
-The required merge gate has four validation profiles:
+The required merge gate has five validation profiles:
 
 | Profile | Applies to | Required validation |
 | --- | --- | --- |
@@ -126,6 +126,7 @@ The required merge gate has four validation profiles:
 | Release-policy validation | Pull requests whose changed paths are only release policy or trusted release reference files. | Run `git diff --check`, release validator tests for touched release validator/workflow files, operator key metadata validation when operator keys are touched, and a best-effort local YAML parse for `release-publish.yml` when PyYAML is available. |
 | RPC docs validation | Pull requests whose changed paths are only RPC documentation pipeline files. | Run `git diff --check`, RPC docs unit tests, and require the existing `rpc-docs` build check. |
 | Public docs validation | Pull requests whose changed paths are only public-facing documentation and release notes. | Run `git diff --check` and require the existing `public-docs-lint` check. |
+| GitHub metadata validation | Pull requests whose changed paths are only public ruleset templates, repository settings, issue/PR templates, and the docs that explain those settings. | Run `git diff --check`, parse ruleset and repository-settings JSON, assert that public branch rulesets require only `Required Merge Gate`, and best-effort parse issue template YAML when PyYAML is available. |
 
 The lightweight profiles are intentionally narrow. The release-policy allowlist
 is:
@@ -156,16 +157,27 @@ The public docs allowlist is:
 - `doc/user/**`
 - `doc/release-notes-*.md`
 
+The GitHub metadata allowlist is:
+
+- `.github/ISSUE_TEMPLATE/**`
+- `.github/PULL_REQUEST_TEMPLATE.md`
+- `.github/repository-settings/**`
+- `.github/rulesets/**`
+- `ci/README.md`
+- `doc/development/public-branch-and-rulesets.md`
+
 Trusted-release-ref and release-trust pull requests that stay within the
 release-policy allowlist can merge after release-policy validation and review
 without waiting for full source CI. RPC docs pull requests that stay within the
 RPC docs allowlist can merge after RPC docs validation and review without
 waiting for full source CI. Public documentation pull requests that stay within
 the public docs allowlist can merge after public docs validation and review
+without waiting for full source CI. GitHub metadata pull requests that stay
+within the metadata allowlist can merge after metadata validation and review
 without waiting for full source CI. Any path outside the active profile
-allowlist, including source, build, or test files, is classified as full source
-validation. Mixed changes, including changes that span more than one
-lightweight profile, also use full source validation.
+allowlist, including source, build, workflow, action, or test files, is
+classified as full source validation. Mixed changes, including changes that
+span more than one lightweight profile, also use full source validation.
 
 Merge queue is not enabled in these templates. Enable it only after public CI
 supports `merge_group` events.

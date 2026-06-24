@@ -49,6 +49,7 @@ jobs:
       release_policy_only: ${{ steps.classify.outputs.release_policy_only }}
       rpc_docs_only: ${{ steps.classify.outputs.rpc_docs_only }}
       public_docs_only: ${{ steps.classify.outputs.public_docs_only }}
+      github_metadata_only: ${{ steps.classify.outputs.github_metadata_only }}
       source_validation_required: ${{ steps.classify.outputs.source_validation_required }}
     steps:
       - name: Checkout
@@ -405,6 +406,129 @@ jobs:
             git diff-tree --check --root HEAD
           fi
 
+  github-metadata-validation:
+    name: github-metadata validation
+    needs: classify-changes
+    if: ${{ always() && needs.classify-changes.result == 'success' && needs.classify-changes.outputs.profile == 'github-metadata' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Write changed file list
+        id: changed-files
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          BASE_REF: ${{ github.base_ref || github.event.merge_group.base_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+        run: |
+          set -euo pipefail
+
+          changed_files="${RUNNER_TEMP}/changed-files.txt"
+          diff_range=""
+          : > "${changed_files}"
+
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            if [[ -z "${BASE_SHA}" ]]; then
+              echo "::error::Pull request base SHA is unavailable."
+              exit 1
+            fi
+            diff_range="${BASE_SHA}...HEAD"
+            git diff --name-only "${diff_range}" > "${changed_files}"
+          elif [[ "${EVENT_NAME}" == "merge_group" ]]; then
+            base_branch="${BASE_REF#refs/heads/}"
+            if [[ -z "${base_branch}" ]]; then
+              echo "::error::Merge-group base branch is unavailable."
+              exit 1
+            fi
+            git fetch --no-tags --prune origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"
+            diff_range="origin/${base_branch}...HEAD"
+            git diff --name-only "${diff_range}" > "${changed_files}"
+          elif [[ "${EVENT_NAME}" == "push" ]]; then
+            if [[ -n "${BEFORE_SHA}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
+              diff_range="${BEFORE_SHA}..HEAD"
+              git diff --name-only "${diff_range}" > "${changed_files}"
+            else
+              git fetch --no-tags --prune origin "${DEFAULT_BRANCH}"
+              merge_base="$(git merge-base "origin/${DEFAULT_BRANCH}" HEAD 2>/dev/null || true)"
+              if [[ -n "${merge_base}" ]]; then
+                diff_range="${merge_base}...HEAD"
+                git diff --name-only "${diff_range}" > "${changed_files}"
+              else
+                git diff-tree --no-commit-id --name-only -r HEAD > "${changed_files}"
+              fi
+            fi
+          else
+            git diff-tree --no-commit-id --name-only -r HEAD > "${changed_files}"
+          fi
+
+          cat "${changed_files}"
+          echo "changed_files=${changed_files}" >> "$GITHUB_OUTPUT"
+          echo "diff_range=${diff_range}" >> "$GITHUB_OUTPUT"
+
+      - name: Confirm github-metadata profile
+        run: |
+          python3 ci/checks/classify_merge_profile.py \
+            --changed-files "${{ steps.changed-files.outputs.changed_files }}" \
+            --require-profile github-metadata
+
+      - name: Check whitespace in changed files
+        env:
+          DIFF_RANGE: ${{ steps.changed-files.outputs.diff_range }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${DIFF_RANGE}" ]]; then
+            git diff --check "${DIFF_RANGE}"
+          else
+            git diff-tree --check --root HEAD
+          fi
+
+      - name: Validate JSON metadata
+        run: jq empty .github/rulesets/*.json .github/repository-settings/*.json
+
+      - name: Check branch ruleset aggregate gate
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          for path in (Path(".github/rulesets/main.json"), Path(".github/rulesets/0.1.x.json")):
+              data = json.loads(path.read_text(encoding="utf8"))
+              contexts = []
+              for rule in data.get("rules", []):
+                  if rule.get("type") == "required_status_checks":
+                      checks = rule.get("parameters", {}).get("required_status_checks", [])
+                      contexts = [check.get("context") for check in checks]
+                      break
+              if contexts != ["Required Merge Gate"]:
+                  raise SystemExit(
+                      f"{path}: required status checks must be exactly ['Required Merge Gate'], got {contexts!r}"
+                  )
+              print(f"{path}: Required Merge Gate")
+          PY
+
+      - name: Check issue template YAML syntax
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          try:
+              import yaml
+          except ModuleNotFoundError:
+              print("PyYAML is not installed; skipping best-effort YAML parse.")
+              raise SystemExit(0)
+
+          for path in sorted(Path(".github/ISSUE_TEMPLATE").glob("*.yml")):
+              yaml.safe_load(path.read_text(encoding="utf8"))
+              print(f"Parsed {path}")
+          PY
+
   required-merge-gate:
     name: 'Required Merge Gate'
     needs:
@@ -412,6 +536,7 @@ jobs:
       - release-policy-validation
       - rpc-docs-validation
       - public-docs-validation
+      - github-metadata-validation
     if: ${{ always() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 330
@@ -424,6 +549,7 @@ jobs:
           RELEASE_POLICY_VALIDATION_RESULT: ${{ needs.release-policy-validation.result }}
           RPC_DOCS_VALIDATION_RESULT: ${{ needs.rpc-docs-validation.result }}
           PUBLIC_DOCS_VALIDATION_RESULT: ${{ needs.public-docs-validation.result }}
+          GITHUB_METADATA_VALIDATION_RESULT: ${{ needs.github-metadata-validation.result }}
           SOURCE_VALIDATION_REQUIRED: ${{ needs.classify-changes.outputs.source_validation_required }}
           REPOSITORY: ${{ github.repository }}
           SHA: ${{ github.sha }}
@@ -496,6 +622,14 @@ jobs:
                 exit 1
               fi
               wait_for_check "public-docs-lint"
+              exit 0
+              ;;
+            github-metadata)
+              echo "Validation profile ${VALIDATION_PROFILE} requires GitHub metadata validation."
+              if [[ "${GITHUB_METADATA_VALIDATION_RESULT}" != "success" ]]; then
+                echo "::error title=Required Merge Gate failed::GitHub metadata validation result was ${GITHUB_METADATA_VALIDATION_RESULT}."
+                exit 1
+              fi
               exit 0
               ;;
             source)

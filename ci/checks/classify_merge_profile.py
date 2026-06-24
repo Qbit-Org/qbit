@@ -16,6 +16,7 @@ from pathlib import PurePosixPath
 RELEASE_POLICY_PROFILE = "release-policy"
 RPC_DOCS_PROFILE = "rpc-docs"
 PUBLIC_DOCS_PROFILE = "public-docs"
+GITHUB_METADATA_PROFILE = "github-metadata"
 SOURCE_PROFILE = "source"
 
 RELEASE_TRUST_DOC_RE = re.compile(r"^doc/release-trust-[^/]+[.]md$")
@@ -38,6 +39,18 @@ PUBLIC_DOCS_PREFIXES = (
     "doc/reference/",
     "doc/user/",
 )
+GITHUB_METADATA_FILES = frozenset(
+    {
+        ".github/PULL_REQUEST_TEMPLATE.md",
+        "ci/README.md",
+        "doc/development/public-branch-and-rulesets.md",
+    }
+)
+GITHUB_METADATA_PREFIXES = (
+    ".github/ISSUE_TEMPLATE/",
+    ".github/repository-settings/",
+    ".github/rulesets/",
+)
 
 
 @dataclass(frozen=True)
@@ -47,6 +60,7 @@ class Classification:
     release_policy_paths: tuple[str, ...]
     rpc_docs_paths: tuple[str, ...]
     public_docs_paths: tuple[str, ...]
+    github_metadata_paths: tuple[str, ...]
     outside_paths: tuple[str, ...]
 
     @property
@@ -55,6 +69,7 @@ class Classification:
             RELEASE_POLICY_PROFILE: self.release_policy_paths,
             RPC_DOCS_PROFILE: self.rpc_docs_paths,
             PUBLIC_DOCS_PROFILE: self.public_docs_paths,
+            GITHUB_METADATA_PROFILE: self.github_metadata_paths,
         }
 
     @property
@@ -81,6 +96,10 @@ class Classification:
     @property
     def public_docs_only(self) -> bool:
         return self.profile == PUBLIC_DOCS_PROFILE
+
+    @property
+    def github_metadata_only(self) -> bool:
+        return self.profile == GITHUB_METADATA_PROFILE
 
 
 def normalize_path(path: str) -> str | None:
@@ -120,12 +139,17 @@ def is_public_docs_path(path: str) -> bool:
     )
 
 
+def is_github_metadata_path(path: str) -> bool:
+    return path in GITHUB_METADATA_FILES or path.startswith(GITHUB_METADATA_PREFIXES)
+
+
 def classify_paths(paths: list[str] | tuple[str, ...]) -> Classification:
     normalized: list[str] = []
     invalid: list[str] = []
     release_policy: list[str] = []
     rpc_docs: list[str] = []
     public_docs: list[str] = []
+    github_metadata: list[str] = []
     outside: list[str] = []
 
     for raw_path in paths:
@@ -141,6 +165,8 @@ def classify_paths(paths: list[str] | tuple[str, ...]) -> Classification:
             rpc_docs.append(path)
         elif is_public_docs_path(path):
             public_docs.append(path)
+        elif is_github_metadata_path(path):
+            github_metadata.append(path)
         else:
             outside.append(path)
 
@@ -150,6 +176,7 @@ def classify_paths(paths: list[str] | tuple[str, ...]) -> Classification:
         release_policy_paths=tuple(release_policy),
         rpc_docs_paths=tuple(rpc_docs),
         public_docs_paths=tuple(public_docs),
+        github_metadata_paths=tuple(github_metadata),
         outside_paths=tuple(outside),
     )
 
@@ -170,6 +197,7 @@ def github_outputs(classification: Classification) -> dict[str, str]:
         "release_policy_only": bool_output(classification.release_policy_only),
         "rpc_docs_only": bool_output(classification.rpc_docs_only),
         "public_docs_only": bool_output(classification.public_docs_only),
+        "github_metadata_only": bool_output(classification.github_metadata_only),
         "source_validation_required": bool_output(classification.profile == SOURCE_PROFILE),
         "changed_count": str(len(paths)),
         "touched_operator_keys": bool_output(
@@ -186,6 +214,7 @@ def github_outputs(classification: Classification) -> dict[str, str]:
         ),
         "touched_rpc_docs": bool_output(bool(classification.rpc_docs_paths)),
         "touched_public_docs": bool_output(bool(classification.public_docs_paths)),
+        "touched_github_metadata": bool_output(bool(classification.github_metadata_paths)),
     }
 
 
@@ -210,6 +239,9 @@ def describe_classification(classification: Classification) -> str:
     if classification.public_docs_paths:
         lines.append("public_docs_paths:")
         lines.extend(f"  {path}" for path in classification.public_docs_paths)
+    if classification.github_metadata_paths:
+        lines.append("github_metadata_paths:")
+        lines.extend(f"  {path}" for path in classification.github_metadata_paths)
     if classification.outside_paths:
         lines.append("full_validation_paths:")
         lines.extend(f"  {path}" for path in classification.outside_paths)
@@ -237,6 +269,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             RELEASE_POLICY_PROFILE,
             RPC_DOCS_PROFILE,
             PUBLIC_DOCS_PROFILE,
+            GITHUB_METADATA_PROFILE,
             SOURCE_PROFILE,
         ],
         help="fail unless the changed files classify into this validation profile",

@@ -26,13 +26,14 @@ must re-review any new commits, and remove the label if a trusted fork PR is
 updated with unreviewed changes so the next push does not re-run self-hosted
 jobs on unreviewed code.
 
-Branch rulesets require the two aggregated gates, `Core Checks Gate` and
-`Full Validation Gate`, instead of raw jobs. Do not require `build smoke`,
-`focused unit suites`, `ci-matrix`, `lint`, `windows-cross`,
-`test-each-commit`, or other raw jobs directly; those are internal inputs to
-the gates and some are skipped when a fork PR is not trusted. Both gates fail
-closed: a skipped, cancelled, or failed input job makes the gate fail, so an
-untrusted fork PR cannot pass `Full Validation Gate`.
+Branch rulesets require the single aggregate `Required Merge Gate` instead of
+raw jobs or the raw `Core Checks Gate` and `Full Validation Gate` inputs. Do
+not require `build smoke`, `focused unit suites`, `ci-matrix`, `lint`,
+`windows-cross`, `test-each-commit`, or other raw jobs directly; those are
+internal inputs to the gates and some are skipped when a fork PR is not
+trusted. The required gate classifies changed paths and then fails closed: a
+source-affecting PR cannot merge unless both source gates pass, while narrow
+release-policy and documentation profiles must pass their focused validation.
 
 Raw `Full Validation` self-hosted jobs select their runner pool by repository:
 in the public `Qbit-Org/qbit` repo they require the
@@ -42,4 +43,3 @@ full validation in the public repo with no per-repo edits, and in the public
 repo the qbit-tools autoscaler uses the `qbit-trusted-ci` label to count and
 scale only trusted CI work. Fork-PR safety is enforced by the trust-gate
 conditions, independent of the runner pool.
-

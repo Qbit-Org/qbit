@@ -40,6 +40,15 @@ PUBLIC_DOCS_PATHS = [
     "doc/release-notes-0.1.1-testnet4.md",
 ]
 
+GITHUB_METADATA_PATHS = [
+    ".github/rulesets/main.json",
+    ".github/repository-settings/merge-methods.json",
+    ".github/ISSUE_TEMPLATE/bug.yml",
+    ".github/PULL_REQUEST_TEMPLATE.md",
+    "doc/development/public-branch-and-rulesets.md",
+    "ci/README.md",
+]
+
 
 class ClassifyMergeProfileTest(unittest.TestCase):
     def classify(self, paths: list[str]) -> classify_merge_profile.Classification:
@@ -78,6 +87,16 @@ class ClassifyMergeProfileTest(unittest.TestCase):
         self.assertTrue(classification.public_docs_only)
         self.assertEqual(classification.outside_paths, ())
 
+    def test_github_metadata_paths_are_github_metadata_only(self) -> None:
+        classification = self.classify(GITHUB_METADATA_PATHS)
+
+        self.assertEqual(
+            classification.profile,
+            classify_merge_profile.GITHUB_METADATA_PROFILE,
+        )
+        self.assertTrue(classification.github_metadata_only)
+        self.assertEqual(classification.outside_paths, ())
+
     def test_source_path_requires_source_validation(self) -> None:
         classification = self.classify(["src/kernel/chainparams.cpp"])
 
@@ -101,10 +120,29 @@ class ClassifyMergeProfileTest(unittest.TestCase):
                 "ci/release/test_validate_release_artifacts.py",
                 "doc/rpc/site_builder.py",
                 "doc/user/public-testnet.md",
+                ".github/rulesets/main.json",
             ]
         )
 
         self.assertEqual(classification.profile, classify_merge_profile.SOURCE_PROFILE)
+
+    def test_workflow_metadata_requires_source_validation(self) -> None:
+        classification = self.classify([".github/workflows/required-merge-gate.yml"])
+
+        self.assertEqual(classification.profile, classify_merge_profile.SOURCE_PROFILE)
+        self.assertEqual(
+            classification.outside_paths,
+            (".github/workflows/required-merge-gate.yml",),
+        )
+
+    def test_github_actions_require_source_validation(self) -> None:
+        classification = self.classify([".github/actions/configure-docker/action.yml"])
+
+        self.assertEqual(classification.profile, classify_merge_profile.SOURCE_PROFILE)
+        self.assertEqual(
+            classification.outside_paths,
+            (".github/actions/configure-docker/action.yml",),
+        )
 
     def test_empty_change_set_fails_closed_to_source_validation(self) -> None:
         classification = self.classify([])
@@ -152,6 +190,16 @@ class ClassifyMergeProfileTest(unittest.TestCase):
         self.assertEqual(outputs["source_validation_required"], "false")
         self.assertEqual(outputs["touched_public_docs"], "true")
 
+    def test_github_outputs_report_github_metadata_profile(self) -> None:
+        outputs = classify_merge_profile.github_outputs(
+            self.classify(GITHUB_METADATA_PATHS)
+        )
+
+        self.assertEqual(outputs["profile"], "github-metadata")
+        self.assertEqual(outputs["github_metadata_only"], "true")
+        self.assertEqual(outputs["source_validation_required"], "false")
+        self.assertEqual(outputs["touched_github_metadata"], "true")
+
     def test_require_release_policy_only_cli_rejects_outside_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             changed_files = Path(tmpdir) / "changed-files.txt"
@@ -197,6 +245,25 @@ class ClassifyMergeProfileTest(unittest.TestCase):
                     str(changed_files),
                     "--require-profile",
                     classify_merge_profile.PUBLIC_DOCS_PROFILE,
+                ]
+            )
+
+        self.assertEqual(result, 0)
+
+    def test_require_profile_accepts_github_metadata_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            changed_files = Path(tmpdir) / "changed-files.txt"
+            changed_files.write_text(
+                "\n".join(GITHUB_METADATA_PATHS) + "\n",
+                encoding="utf8",
+            )
+
+            result = classify_merge_profile.main(
+                [
+                    "--changed-files",
+                    str(changed_files),
+                    "--require-profile",
+                    classify_merge_profile.GITHUB_METADATA_PROFILE,
                 ]
             )
 
