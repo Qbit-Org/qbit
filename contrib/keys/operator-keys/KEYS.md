@@ -92,6 +92,8 @@ Before relying on a signer policy:
 Release evidence should pin the release tag, tag target, `trusted_release_ref`,
 the exact-byte SHA256 of `keys.json`, the `qbit-guix.sigs` commit, and the
 counted signer aliases/fingerprints.
+The `trusted_release_ref` must be a public commit whose history contains the
+release tag target, and it must not be the release tag object or tag target.
 
 Backup separation
 -----------------

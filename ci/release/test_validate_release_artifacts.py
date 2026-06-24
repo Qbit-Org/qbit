@@ -650,6 +650,22 @@ class ReleaseWorkflowBoundaryTest(unittest.TestCase):
         self.assertIn("validate_release_artifacts.py", workflow)
         self.assertIn("ci/release/verify_testnet_release_posture.py", workflow)
         self.assertNotIn(OLD_TESTNET_POSTURE_VERIFIER, workflow)
+        self.assertIn(
+            "TARGET_COMMITISH: ${{ steps.tag.outputs.target_commitish }}",
+            workflow,
+        )
+        self.assertIn(
+            "git -C \"${trusted_root}\" merge-base --is-ancestor",
+            workflow,
+        )
+        self.assertIn(
+            "must be an ancestor of trusted_release_ref",
+            workflow,
+        )
+        self.assertRegex(
+            workflow,
+            r"Checkout trusted release validation policy[\s\S]*fetch-depth: 0",
+        )
 
         validator_source = VALIDATOR.read_text(encoding="utf8")
         self.assertNotIn("github.rest", validator_source)
