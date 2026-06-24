@@ -1,0 +1,50 @@
+[package]
+name = "qbit-libbitcoinpqc"
+version = "0.3.0"
+edition = "2021"
+authors = ["Qbit contributors"]
+description = "qbit-focused bounded SLH-DSA profile for Bitcoin"
+repository = "https://github.com/Qbit-Org/qbit-libbitcoinpqc"
+readme = "README.md"
+license = "MIT"
+keywords = ["bitcoin", "qbit", "pqc", "slh-dsa", "fips-205"]
+exclude = [".context/**", ".vscode/**"]
+
+[dependencies]
+hex = "0.4"
+libc = "0.2"
+serde = { version = "1.0", features = ["derive"], optional = true }
+zeroize = { version = "1", features = ["derive"] }
+
+[build-dependencies]
+bindgen = "0.71.1"
+cmake = "0.1"
+
+[dev-dependencies]
+getrandom = "0.3"
+hex = "0.4"
+criterion = "0.5"
+serde_json = "1.0"
+secp256k1 = "0.31"
+
+[features]
+default = []
+# Enable this feature in your IDE for better code completion
+# but never use it for actual builds
+ide = []
+# Serialize/deserialize public Rust API types that do not contain secret
+# material. SecretKey and KeyPair require secret-key-serde below.
+serde = ["dep:serde"]
+# Explicit opt-in for serializing/deserializing SecretKey and KeyPair.
+secret-key-serde = ["serde"]
+test-helpers = []
+# Test/benchmark-only: allow runtime environment knobs to force SPHINCS+ backends.
+test-bench-env-knobs = []
+
+[lib]
+name = "bitcoinpqc"
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[[bench]]
+name = "sig_benchmarks"
+harness = false
