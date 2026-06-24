@@ -90,6 +90,13 @@ size_t bitcoin_pqc_signature_size(void);
  *                    separation and input-length binding.
  * @param random_data_size Size of random data, must be >= 128 bytes.
  * @return BITCOIN_PQC_OK on success, error code otherwise
+ *
+ * On success, public_key and secret_key are a self-consistent generated pair.
+ * The generated secret key already contains the root computed during keygen, so
+ * trusted callers that immediately adopt this same-call output do not need to
+ * call bitcoin_pqc_secret_key_validate() only to recompute that root.
+ * Imported, deserialized, or otherwise untrusted exact-size secret material
+ * must still be validated before acceptance.
  */
 bitcoin_pqc_error_t bitcoin_pqc_keygen(
     bitcoin_pqc_keypair_t *keypair,

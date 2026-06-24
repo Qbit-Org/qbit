@@ -1,0 +1,454 @@
+name: Rust CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-matrix:
+    name: Stable CI (${{ matrix.platform }})
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && matrix.fork_runs_on || matrix.runs_on) }}
+    strategy:
+      matrix:
+        include:
+          - platform: linux
+            runs_on: '["self-hosted","linux","x64"]'
+            fork_runs_on: '"ubuntu-latest"'
+          - platform: macos
+            runs_on: '"macos-latest"'
+            fork_runs_on: '"macos-latest"'
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Check repo invariants
+        shell: bash
+        run: |
+          sh ./scripts/check-no-tracked-symlinks.sh
+          sh ./scripts/check-source-inventory.sh
+
+      - name: Install dependencies (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ca-certificates clang cmake curl libclang-dev libssl-dev pkg-config python3
+
+      - name: Select clang (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          echo "CC=clang" >> "$GITHUB_ENV"
+          echo "CXX=clang++" >> "$GITHUB_ENV"
+
+      - name: Guard AVX2 integer conversion hotspots
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          COMMON_FLAGS=(
+            -Wall
+            -Wextra
+            -Werror=implicit-int-conversion
+            -Werror=sign-conversion
+            -Werror=shorten-64-to-32
+          )
+
+          # Keep in sync with CMakeLists.txt target_compile_definitions(PARAMS=...) for sha2-*.
+          for file in \
+            sphincsplus/sha2-avx2/sha256avx.c \
+            sphincsplus/sha2-avx2/utilsx8.c \
+            sphincsplus/sha2-avx2/sha256x8.c \
+            sphincsplus/ref/hash_sha2.c \
+            sphincsplus/ref/sha2.c; do
+            clang -fsyntax-only "$file" \
+              -I sphincsplus/sha2-avx2 \
+              -I sphincsplus/ref \
+              -DPARAMS=sphincs-sha2-128s-bounded30 \
+              -mavx2 \
+              "${COMMON_FLAGS[@]}"
+          done
+
+      - name: Install dependencies (macOS)
+        if: matrix.platform == 'macos'
+        run: |
+          brew install cmake
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Install cargo-audit
+        if: matrix.platform == 'linux'
+        run: cargo install cargo-audit --version 0.22.1 --locked
+
+      - name: Run dependency audit
+        if: matrix.platform == 'linux'
+        run: cargo audit --deny warnings
+
+      - name: Check code format
+        run: cargo fmt -- --check
+
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+
+      - name: Build
+        run: cargo build --verbose
+
+      - name: Run tests
+        run: cargo test --verbose
+
+      - name: Run FORS low-cap signing-limit tests
+        if: matrix.platform == 'linux'
+        run: BITCOINPQC_FORSC_MAX_GRIND_ATTEMPTS=1 CARGO_TARGET_DIR=target/low-fors cargo test --verbose --test signing_stats_tests low_fors_cap
+
+      - name: Run WOTS low-cap signing-limit tests
+        if: matrix.platform == 'linux'
+        run: BITCOINPQC_WOTSC_MAX_COUNTER=0 CARGO_TARGET_DIR=target/low-wots cargo test --verbose --test signing_stats_tests low_wots_cap
+
+      - name: Run tests (serde feature)
+        if: matrix.platform == 'linux'
+        run: cargo test --verbose --features serde
+
+      - name: Run UBSan runtime smoke (Linux)
+        if: matrix.platform == 'linux'
+        env:
+          CC: clang
+          CXX: clang++
+          CFLAGS: "-fsanitize=undefined,unsigned-integer-overflow -fno-sanitize-recover=undefined,unsigned-integer-overflow -fno-omit-frame-pointer"
+          LDFLAGS: "-fsanitize=undefined,unsigned-integer-overflow"
+        run: |
+          cargo test --verbose --test sha2_backend_tests --test bounded_mode_correctness_tests
+          cargo test --verbose --test bounded_mode_correctness_tests bounded_mode_soak_pr_smoke_100_roundtrips -- --ignored --nocapture
+
+      - name: Run backend differential tests under UBSan (test/bench env knobs)
+        if: matrix.platform == 'linux'
+        timeout-minutes: 15
+        env:
+          BACKEND_DIFFERENTIAL_CASES: "1"
+          CC: clang
+          CXX: clang++
+          CFLAGS: "-fsanitize=undefined,unsigned-integer-overflow -fno-sanitize-recover=undefined,unsigned-integer-overflow -fno-omit-frame-pointer"
+          LDFLAGS: "-fsanitize=undefined,unsigned-integer-overflow"
+        run: |
+          UBSAN_RT="$(clang --print-file-name=libclang_rt.ubsan_standalone-x86_64.a)"
+          if [ ! -f "$UBSAN_RT" ]; then
+            echo "Could not find clang UBSan runtime: $UBSAN_RT" >&2
+            exit 1
+          fi
+          RUSTFLAGS="-C linker=clang -C link-arg=$UBSAN_RT -C link-arg=-lpthread -C link-arg=-ldl -C link-arg=-lrt -C link-arg=-lm -C link-arg=-lc" \
+            cargo test --verbose --features test-bench-env-knobs --test backend_differential_tests
+
+      - name: Run backend differential tests (Linux x86/scalar/auto)
+        if: matrix.platform == 'linux'
+        run: cargo test --verbose --features test-bench-env-knobs --test backend_differential_tests
+
+      - name: Run backend differential tests (macOS CommonCrypto)
+        if: matrix.platform == 'macos'
+        run: cargo test --verbose --features test-bench-env-knobs --test backend_differential_tests
+
+      - name: Run production env knob policy test (test-helpers feature)
+        if: matrix.platform == 'linux'
+        run: cargo test --verbose --features test-helpers --test production_env_knobs_tests
+
+      - name: Run FORS invariant tests (test-helpers feature)
+        if: matrix.platform == 'linux'
+        run: cargo test --verbose --features test-helpers --test forsc_invariant_tests
+
+      - name: Run PR soak smoke (100 roundtrips, threaded FORS)
+        if: matrix.platform == 'linux'
+        env:
+          SPX_FORS_THREADS: "2"
+        timeout-minutes: 10
+        run: cargo test --verbose --features test-bench-env-knobs --test bounded_mode_correctness_tests bounded_mode_soak_pr_smoke_100_roundtrips -- --ignored --nocapture
+
+      - name: Run tests (scalar backend)
+        env:
+          SPX_DISABLE_SIMD: "1"
+          SPX_SHA_BACKEND: "scalar"
+        run: cargo test --verbose --features test-bench-env-knobs --test bounded_mode_correctness_tests
+
+      - name: Run tests (threaded FORS, 2 workers)
+        env:
+          SPX_FORS_THREADS: "2"
+        run: cargo test --verbose --features test-bench-env-knobs --test bounded_mode_correctness_tests
+
+      - name: Run tests (threaded FORS, 1 worker - scalar fallback)
+        env:
+          SPX_FORS_THREADS: "1"
+        run: cargo test --verbose --features test-bench-env-knobs --test bounded_mode_correctness_tests
+
+      - name: Run tests (threaded FORS, 4 workers)
+        env:
+          SPX_FORS_THREADS: "4"
+        run: cargo test --verbose --features test-bench-env-knobs --test bounded_mode_correctness_tests
+
+  windows-msvc:
+    name: Windows MSVC
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Check repo invariants
+        shell: bash
+        run: |
+          sh ./scripts/check-no-tracked-symlinks.sh
+          sh ./scripts/check-source-inventory.sh
+
+      - name: Configure MSVC environment
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+        with:
+          arch: x64
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Configure CMake (MSVC)
+        shell: pwsh
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Build C library (Release)
+        shell: pwsh
+        run: cmake --build build --config Release --verbose
+
+      - name: Cargo build
+        shell: pwsh
+        run: cargo build --verbose
+
+      - name: Cargo test
+        shell: pwsh
+        run: cargo test --verbose
+
+      - name: Run backend differential tests (test/bench env knobs)
+        shell: pwsh
+        run: cargo test --verbose --features test-bench-env-knobs --test backend_differential_tests
+
+  param-benchmark:
+    name: Param Benchmark (${{ matrix.platform }})
+    runs-on: ${{ fromJSON(github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && matrix.fork_runs_on || matrix.runs_on) }}
+    strategy:
+      matrix:
+        include:
+          - platform: linux
+            runs_on: '["self-hosted","linux","x64"]'
+            fork_runs_on: '"ubuntu-latest"'
+          - platform: macos
+            runs_on: '"macos-latest"'
+            fork_runs_on: '"macos-latest"'
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install dependencies (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ca-certificates clang cmake curl libclang-dev libssl-dev pkg-config
+
+      - name: Select clang (Linux)
+        if: matrix.platform == 'linux'
+        run: |
+          echo "CC=clang" >> "$GITHUB_ENV"
+          echo "CXX=clang++" >> "$GITHUB_ENV"
+
+      - name: Install dependencies (macOS)
+        if: matrix.platform == 'macos'
+        run: |
+          brew install cmake
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Run param benchmark
+        shell: bash
+        env:
+          PARAM_BENCH_SAMPLES: "5"
+          PARAM_BENCH_TARGET_MS: "1500"
+          PARAM_BENCH_MAX_INNER: "50"
+          PARAM_BENCH_GRIND_SAMPLES: "64"
+        run: |
+          mkdir -p benchmark-artifacts
+          artifact="benchmark-artifacts/param_bench-${RUNNER_OS}-${RUNNER_ARCH}.json"
+          cargo run --release --bin param_bench > "${artifact}"
+          test -s "${artifact}"
+
+      - name: Upload param benchmark JSON
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: param-bench-${{ matrix.platform }}-${{ github.run_attempt }}
+          path: benchmark-artifacts/*.json
+          if-no-files-found: error
+
+  fuzz-smoke:
+    name: Fuzz Smoke (nightly)
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install fuzz dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ca-certificates clang cmake curl libclang-dev libssl-dev pkg-config
+
+      - name: Select clang
+        run: |
+          echo "CC=clang" >> "$GITHUB_ENV"
+          echo "CXX=clang++" >> "$GITHUB_ENV"
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: nightly
+
+      - name: Check fuzz inventory
+        run: ./fuzz/check_fuzz_inventory.sh
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+
+      - name: Build fuzz targets
+        run: cargo +nightly fuzz build
+
+      - name: Run fuzz smoke targets
+        run: ./fuzz/run_all_fuzzers.sh -runs=1
+
+      - name: Run scheduled longer fuzz targets
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        timeout-minutes: 30
+        run: ./fuzz/run_all_fuzzers.sh -max_total_time=60
+
+      - name: Run scheduled native C ASan fuzz smoke
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        timeout-minutes: 20
+        env:
+          CC: clang
+          CXX: clang++
+          CFLAGS: "-g -O1 -fsanitize=address -fno-omit-frame-pointer"
+          CXXFLAGS: "-g -O1 -fsanitize=address -fno-omit-frame-pointer"
+        run: |
+          rm -rf fuzz/target
+          ./fuzz/run_all_fuzzers.sh -runs=1
+
+      - name: Upload fuzz artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-artifacts-${{ github.job }}-${{ github.run_attempt }}
+          path: fuzz/artifacts
+          if-no-files-found: ignore
+
+  nightly-soak:
+    name: Nightly Soak (10k roundtrips, threads=${{ matrix.threads }})
+    runs-on: [self-hosted, linux, x64]
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    strategy:
+      matrix:
+        threads: ["1", "2", "4"]
+      fail-fast: true
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ca-certificates clang cmake curl libclang-dev libssl-dev pkg-config
+
+      - name: Select clang
+        run: |
+          echo "CC=clang" >> "$GITHUB_ENV"
+          echo "CXX=clang++" >> "$GITHUB_ENV"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Soak test (SPX_FORS_THREADS=${{ matrix.threads }})
+        env:
+          SPX_FORS_THREADS: ${{ matrix.threads }}
+        timeout-minutes: 60
+        run: cargo test --release --features test-bench-env-knobs --test bounded_mode_correctness_tests bounded_mode_soak_10k_roundtrips -- --ignored --nocapture
+
+  nightly-forsc-benchmark:
+    name: Nightly FORS+C 64 KiB benchmark
+    runs-on: [self-hosted, linux, x64]
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ca-certificates clang cmake curl libclang-dev libssl-dev pkg-config
+
+      - name: Select clang
+        run: |
+          echo "CC=clang" >> "$GITHUB_ENV"
+          echo "CXX=clang++" >> "$GITHUB_ENV"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Run 64 KiB FORS+C benchmark
+        timeout-minutes: 10
+        run: cargo test --verbose --features test-helpers --test forsc_invariant_tests salt_grinding_64kb_benchmark -- --ignored --nocapture
+
+  supply-chain:
+    name: Supply Chain Audit
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install audit dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ca-certificates clang curl libssl-dev pkg-config ruby
+
+      - name: Select clang
+        run: |
+          echo "CC=clang" >> "$GITHUB_ENV"
+          echo "CXX=clang++" >> "$GITHUB_ENV"
+
+      - name: Check workflow action pins
+        run: ruby scripts/check-workflow-action-pins.rb
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.1 --locked
+
+      - name: Audit Rust dependencies
+        run: cargo audit --deny warnings

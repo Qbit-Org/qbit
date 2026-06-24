@@ -5,6 +5,7 @@ set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+include(CTest)
 find_package(Threads REQUIRED)
 
 option(SPX_ENABLE_ARM_SHA "Enable ARM SHA acceleration" OFF)
@@ -16,7 +17,7 @@ option(SPX_ENABLE_TEST_BENCH_ENV_KNOBS "Enable test/benchmark-only runtime SPHIN
 
 # Set version
 set(BITCOINPQC_VERSION_MAJOR 0)
-set(BITCOINPQC_VERSION_MINOR 2)
+set(BITCOINPQC_VERSION_MINOR 3)
 set(BITCOINPQC_VERSION_PATCH 0)
 
 # Library output settings
@@ -95,6 +96,48 @@ add_library(bitcoinpqc STATIC
 )
 target_link_libraries(bitcoinpqc PUBLIC Threads::Threads)
 
+if(BUILD_TESTING)
+    find_program(SH_EXECUTABLE sh)
+    if(SH_EXECUTABLE)
+        add_test(
+            NAME source_inventory
+            COMMAND ${SH_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/check-source-inventory.sh
+        )
+        set_tests_properties(source_inventory
+            PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        )
+    endif()
+
+    add_executable(bitcoinpqc_c_api_contract_test
+        tests/c/c_api_contract_test.c
+    )
+    target_link_libraries(bitcoinpqc_c_api_contract_test PRIVATE bitcoinpqc)
+    add_test(
+        NAME bitcoinpqc_c_api_contract_test
+        COMMAND bitcoinpqc_c_api_contract_test
+    )
+
+    add_executable(slh_dsa_secret_key_validate_test
+        tests/c/slh_dsa_secret_key_validate_test.c
+    )
+    target_link_libraries(slh_dsa_secret_key_validate_test PRIVATE bitcoinpqc)
+    add_test(
+        NAME slh_dsa_secret_key_validate_test
+        COMMAND slh_dsa_secret_key_validate_test
+    )
+
+    add_executable(slh_dsa_sign_failure_cleanup_test
+        tests/c/slh_dsa_sign_failure_cleanup_test.c
+    )
+    target_compile_definitions(slh_dsa_sign_failure_cleanup_test PRIVATE
+        BITCOINPQC_WOTSC_MAX_COUNTER=${BITCOINPQC_WOTSC_MAX_COUNTER}
+    )
+    target_link_libraries(slh_dsa_sign_failure_cleanup_test PRIVATE bitcoinpqc)
+    add_test(
+        NAME slh_dsa_sign_failure_cleanup_test
+        COMMAND slh_dsa_sign_failure_cleanup_test
+    )
+endif()
 
 # Set include directories for the library
 target_include_directories(bitcoinpqc PUBLIC

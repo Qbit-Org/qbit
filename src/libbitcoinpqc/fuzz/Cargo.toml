@@ -1,0 +1,104 @@
+[package]
+name = "libbitcoinpqc-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.bitcoinpqc]
+package = "qbit-libbitcoinpqc"
+path = ".."
+features = ["test-helpers"]
+
+# Renamed and repurposed from the original target
+[[bin]]
+name = "keypair_generation"
+path = "fuzz_targets/keypair_generation_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+# New target for sign and verify operations
+[[bin]]
+name = "sign_verify"
+path = "fuzz_targets/sign_verify_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+# Large message coverage through the Rust and C APIs
+[[bin]]
+name = "huge_message_api"
+path = "fuzz_targets/huge_message_api_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+# Concurrent signing and verification smoke coverage
+[[bin]]
+name = "concurrent_sign_verify"
+path = "fuzz_targets/concurrent_sign_verify_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+# New target for key parsing
+[[bin]]
+name = "key_parsing"
+path = "fuzz_targets/key_parsing_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+# New target for signature parsing
+[[bin]]
+name = "signature_parsing"
+path = "fuzz_targets/signature_parsing_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+# New target for invalid signature verification behavior
+[[bin]]
+name = "verify_invalid"
+path = "fuzz_targets/verify_invalid_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+# Malformed key/signature edge cases around exact public sizes
+[[bin]]
+name = "malformed_inputs"
+path = "fuzz_targets/malformed_inputs_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+# New target to fuzz FORS bit extraction logic
+[[bin]]
+name = "message_to_indices"
+path = "fuzz_targets/message_to_indices_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+# Direct FFI fuzz target for message_to_indices and forsc_compressed_index
+[[bin]]
+name = "message_to_indices_direct"
+path = "fuzz_targets/message_to_indices_direct_fuzz.rs"
+test = false
+doc = false
+bench = false
+
+# Direct FFI fuzz target for WOTS+C counter search and helper boundaries
+[[bin]]
+name = "wotsc_direct"
+path = "fuzz_targets/wotsc_direct_fuzz.rs"
+test = false
+doc = false
+bench = false
