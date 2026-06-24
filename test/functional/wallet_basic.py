@@ -711,6 +711,7 @@ class WalletTest(BitcoinTestFramework):
         self.nodes[0].syncwithvalidationinterfacequeue()
 
         zeroconf_wallet = self.nodes[0].get_wallet_rpc("zeroconf")
+        self.wait_pqc_key_validation_ready(zeroconf_wallet)
         utxos = zeroconf_wallet.listunspent(minconf=0)
         assert_equal(len(utxos), 1)
         assert_equal(utxos[0]['confirmations'], 0)
