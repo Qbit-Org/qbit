@@ -67,7 +67,7 @@ commitment byte order and the activation height so pool software can follow the
 node result instead of inferring the encoding.
 
 The AuxPoW display-commitment change is a scheduled testnet4 consensus rule
-transition at height `27700`. Nodes and mining software that remain on older
+transition at height `20500`. Nodes and mining software that remain on older
 rules after that height may be unable to follow corrected AuxPoW blocks.
 
 | Item | Value |
@@ -77,7 +77,7 @@ rules after that height may be unable to follow corrected AuxPoW blocks.
 | Default RPC/REST port | `48352` |
 | Address HRP | `tq` |
 | AuxPoW chain ID | `31430` |
-| AuxPoW display-commitment activation height | `27700` |
+| AuxPoW display-commitment activation height | `20500` |
 
 Notable changes
 ===============
@@ -87,8 +87,8 @@ Notable changes
 - Corrected the AuxPoW parent-coinbase commitment byte order used by merged
   mining templates and validation.
 - Preserved existing testnet4 AuxPoW history by validating the original
-  internal byte order before height `27700` and the corrected display byte
-  order at and after height `27700`.
+  internal byte order before height `20500` and the corrected display byte
+  order at and after height `20500`.
 - Added `commitmentorder` and `commitmentactivationheight` fields to
   `createauxblock` results. Before activation the commitment order is
   `internal`; at activation and later it is `display`.

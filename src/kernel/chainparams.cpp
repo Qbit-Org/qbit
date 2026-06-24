@@ -39,7 +39,7 @@ auto consteval_ctor(auto&& input) { return input; }
 
 static constexpr int QBIT_PUBLIC_TESTNET_AUXPOW_CHAIN_ID{31430};
 static constexpr int QBIT_TEST_CHAIN_AUXPOW_CHAIN_ID{QBIT_PUBLIC_TESTNET_AUXPOW_CHAIN_ID};
-static constexpr int QBIT_TESTNET4_AUXPOW_DISPLAY_COMMITMENT_HEIGHT{27'700};
+static constexpr int QBIT_TESTNET4_AUXPOW_DISPLAY_COMMITMENT_HEIGHT{20'500};
 
 // Mainnet is not launched. This placeholder intentionally matches public
 // testnet only while mainnet params are still development scaffolding. Replace
