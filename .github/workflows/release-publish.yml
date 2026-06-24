@@ -173,11 +173,12 @@ jobs:
         with:
           ref: ${{ inputs.trusted_release_ref }}
           path: .trusted-release
-          fetch-depth: 1
+          fetch-depth: 0
 
       - name: Resolve trusted release validation paths
         id: trusted
         env:
+          TARGET_COMMITISH: ${{ steps.tag.outputs.target_commitish }}
           TRUSTED_RELEASE_REF: ${{ inputs.trusted_release_ref }}
         run: |
           set -euo pipefail
@@ -188,6 +189,10 @@ jobs:
           trusted_sha_lower="$(printf '%s' "${trusted_sha}" | tr '[:upper:]' '[:lower:]')"
           if [[ "${trusted_sha_lower}" != "${trusted_lower}" ]]; then
             echo "Trusted release checkout resolved ${trusted_sha}, expected ${TRUSTED_RELEASE_REF}" >&2
+            exit 1
+          fi
+          if ! git -C "${trusted_root}" merge-base --is-ancestor "${TARGET_COMMITISH}" "${trusted_sha}"; then
+            echo "Release tag target ${TARGET_COMMITISH} must be an ancestor of trusted_release_ref ${TRUSTED_RELEASE_REF}" >&2
             exit 1
           fi
 

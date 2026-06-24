@@ -641,12 +641,32 @@ class ReleaseWorkflowBoundaryTest(unittest.TestCase):
         self.assertLess(verified_step, local_validator_step)
         self.assertIn("verification.verified", workflow)
         self.assertIn("validate_release_artifacts.py", workflow)
+        self.assertIn(
+            "TARGET_COMMITISH: ${{ steps.tag.outputs.target_commitish }}",
+            workflow,
+        )
+        self.assertIn(
+            "git -C \"${trusted_root}\" merge-base --is-ancestor",
+            workflow,
+        )
+        self.assertIn(
+            "must be an ancestor of trusted_release_ref",
+            workflow,
+        )
+        self.assertRegex(
+            workflow,
+            r"Checkout trusted release validation policy[\s\S]*fetch-depth: 0",
+        )
 
         validator_source = VALIDATOR.read_text(encoding="utf8")
         self.assertNotIn("github.rest", validator_source)
         self.assertNotIn("gh api", validator_source)
         self.assertNotIn("GITHUB_TOKEN", validator_source)
 
+    @unittest.skipUnless(
+        PUBLISH_LOCAL.is_file(),
+        "publish-local-release.sh is required for local publish fallback checks",
+    )
     def test_local_publish_fallback_checks_github_verified_tag(self) -> None:
         script = PUBLISH_LOCAL.read_text(encoding="utf8")
 
