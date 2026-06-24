@@ -163,6 +163,7 @@ class AbandonConflictTest(BitcoinTestFramework):
         # Remove using high relay fee again
         self.restart_node(0, extra_args=["-minrelaytxfee=0.0001"])
         alice = self.nodes[0].get_wallet_rpc(self.default_wallet_name)
+        self.wait_pqc_key_validation_ready(alice)
         assert self.nodes[0].getmempoolinfo()['loaded']
         assert_equal(len(self.nodes[0].getrawmempool()), 0)
         newbalance = alice.getbalance()

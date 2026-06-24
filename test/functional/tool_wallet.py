@@ -366,6 +366,7 @@ class ToolWalletTest(BitcoinTestFramework):
         self.ensure_mature_coinbase(self.nodes[0])
 
         def_wallet = self.nodes[0].get_wallet_rpc(self.default_wallet_name)
+        self.wait_pqc_key_validation_ready(def_wallet)
         while def_wallet.getbalance() < 15:
             self.generatetoaddress(self.nodes[0], 1, def_wallet.getnewaddress())
 
@@ -429,6 +430,7 @@ class ToolWalletTest(BitcoinTestFramework):
         # to make a very big transaction.
         self.ensure_mature_coinbase(self.nodes[0])
         def_wallet = self.nodes[0].get_wallet_rpc(self.default_wallet_name)
+        self.wait_pqc_key_validation_ready(def_wallet)
         while def_wallet.getbalance() < 6:
             self.generatetoaddress(self.nodes[0], 1, def_wallet.getnewaddress())
         outputs = {}
@@ -436,6 +438,7 @@ class ToolWalletTest(BitcoinTestFramework):
             outputs[wallet.getnewaddress(address_type="p2sh-segwit")] = 0.01
         def_wallet.sendmany(amounts=outputs)
         self.generate(self.nodes[0], 1)
+        self.wait_pqc_key_validation_ready(wallet)
         send_res = wallet.sendall([def_wallet.getnewaddress()])
         self.generate(self.nodes[0], 1)
         assert_equal(send_res["complete"], True)

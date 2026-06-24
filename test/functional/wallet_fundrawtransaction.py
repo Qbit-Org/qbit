@@ -67,13 +67,6 @@ class RawTransactionsTest(BitcoinTestFramework):
         self.connect_nodes(0, 2)
         self.connect_nodes(0, 3)
 
-    def wait_pqc_key_validation_ready(self, wallet):
-        def ready():
-            validation = wallet.getwalletinfo().get("pqc_key_validation", {})
-            return validation.get("status") in ("not_required", "complete") and not validation.get("signing_blocked", True)
-
-        self.wait_until(ready, timeout=180)
-
     def lock_outputs_type(self, wallet, outputtype):
         """
         Only allow UTXOs of the given type
@@ -1450,6 +1443,7 @@ class RawTransactionsTest(BitcoinTestFramework):
         self.connect_nodes(0, 1)
         self.connect_nodes(0, 2)
         self.connect_nodes(0, 3)
+        self.wait_pqc_key_validation_ready(self.nodes[0])
 
     def test_feerate_rounding(self):
         self.log.info("Test that rounding of GetFee does not result in an assertion")

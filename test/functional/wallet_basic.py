@@ -63,13 +63,6 @@ class WalletTest(BitcoinTestFramework):
         """Scale historical 50 BTC-baseline test amounts to the active subsidy."""
         return (Decimal(str(amount)) * self.subsidy_scale).quantize(Decimal("0.00000001"))
 
-    def wait_pqc_key_validation_ready(self, wallet):
-        def ready():
-            validation = wallet.getwalletinfo().get("pqc_key_validation", {})
-            return validation.get("status") in ("not_required", "complete") and not validation.get("signing_blocked", True)
-
-        self.wait_until(ready, timeout=180)
-
     def run_test(self):
 
         # Check that there's no UTXO on none of the nodes
@@ -427,6 +420,7 @@ class WalletTest(BitcoinTestFramework):
         self.connect_nodes(1, 2)
         self.connect_nodes(0, 2)
         self.sync_all(self.nodes[0:3])
+        self.wait_pqc_key_validation_ready(self.nodes[0])
 
         broadcast_amount = min(self.scale_amount(2), (self.nodes[0].getbalance() / Decimal("10")).quantize(Decimal("0.00000001")))
         assert broadcast_amount > 0
@@ -454,6 +448,7 @@ class WalletTest(BitcoinTestFramework):
         self.connect_nodes(1, 2)
         self.connect_nodes(0, 2)
         self.sync_blocks(self.nodes[0:3])
+        self.wait_pqc_key_validation_ready(self.nodes[0])
 
         self.generate(self.nodes[0], 1, sync_fun=lambda: self.sync_blocks(self.nodes[0:3]))
         node_2_bal += broadcast_amount
@@ -524,6 +519,7 @@ class WalletTest(BitcoinTestFramework):
         # reindex will leave rpc warm up "early"; Wait for it to finish
         self.wait_until(lambda: [block_count] * 3 == [self.nodes[i].getblockcount() for i in range(3)])
         assert_equal(balance_nodes, [self.nodes[i].getbalance() for i in range(3)])
+        self.wait_pqc_key_validation_ready(self.nodes[0])
 
         # Exercise listsinceblock with the last two blocks
         coinbase_tx_1 = self.nodes[0].listsinceblock(blocks[0])
@@ -569,6 +565,7 @@ class WalletTest(BitcoinTestFramework):
 
         # Prevent potential race condition when calling wallet RPCs right after restart
         self.nodes[0].syncwithvalidationinterfacequeue()
+        self.wait_pqc_key_validation_ready(self.nodes[0])
 
         node0_balance = self.nodes[0].getbalance()
         # With walletrejectlongchains we will not create the tx and store it in our wallet.
@@ -686,6 +683,8 @@ class WalletTest(BitcoinTestFramework):
         self.nodes[0].createwallet(wallet_name="zeroconf", load_on_startup=True)
         zeroconf_wallet = self.nodes[0].get_wallet_rpc("zeroconf")
         default_wallet = self.nodes[0].get_wallet_rpc(self.default_wallet_name)
+        self.wait_pqc_key_validation_ready(default_wallet)
+        self.wait_pqc_key_validation_ready(zeroconf_wallet)
         default_wallet.sendtoaddress(zeroconf_wallet.getnewaddress(), Decimal('1.0'))
         self.generate(self.nodes[0], 1, sync_fun=self.no_op)
         utxos = zeroconf_wallet.listunspent(minconf=0)
@@ -711,6 +710,7 @@ class WalletTest(BitcoinTestFramework):
         self.nodes[0].syncwithvalidationinterfacequeue()
 
         zeroconf_wallet = self.nodes[0].get_wallet_rpc("zeroconf")
+        self.wait_pqc_key_validation_ready(zeroconf_wallet)
         utxos = zeroconf_wallet.listunspent(minconf=0)
         assert_equal(len(utxos), 1)
         assert_equal(utxos[0]['confirmations'], 0)

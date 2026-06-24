@@ -93,13 +93,6 @@ class WalletPQCUsageTest(BitcoinTestFramework):
         assert_equal(info["pqc_signature_count"], expected_count)
         return info
 
-    def wait_pqc_key_validation_ready(self, wallet):
-        def ready():
-            validation = wallet.getwalletinfo().get("pqc_key_validation", {})
-            return validation.get("status") in ("not_required", "complete") and not validation.get("signing_blocked", True)
-
-        self.wait_until(ready, timeout=180)
-
     def create_raw_spend(self, utxos, destination, fee=None):
         if isinstance(utxos, dict):
             utxos = [utxos]

@@ -155,6 +155,8 @@ class WalletP2MRMultisigRestartTest(BitcoinTestFramework):
         miner = node.get_wallet_rpc(self.default_wallet_name)
         signers = [node.get_wallet_rpc(f"ms_signer_{i}") for i in range(3)]
         coordinator = node.get_wallet_rpc("ms_coordinator")
+        for signer in signers:
+            self.wait_pqc_key_validation_ready(signer)
 
         self.log.info("Counters and spent-state survived the restart")
         assert_equal(self.pqc_count(signers[0], addr_a), 1)

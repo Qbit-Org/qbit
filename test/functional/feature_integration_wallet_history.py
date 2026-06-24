@@ -76,9 +76,6 @@ class IntegrationWalletHistoryTest(BitcoinTestFramework):
             for entry in entries
         )
 
-    def wait_pqc_key_validation_ready(self, wallet):
-        self.wait_until(lambda: not wallet.getwalletinfo()["pqc_key_validation"]["signing_blocked"])
-
     def run_test(self):
         archive_node = self.nodes[0]
         pruned_node = self.nodes[1]
