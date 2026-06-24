@@ -477,11 +477,11 @@ BOOST_AUTO_TEST_CASE(auxpow_commitment_validation_modes_match_activation_plan)
 BOOST_AUTO_TEST_CASE(auxpow_commitment_validation_height_helper)
 {
     auto consensus = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
-    consensus.nAuxpowDisplayCommitmentHeight = 27'700;
+    consensus.nAuxpowDisplayCommitmentHeight = 20'500;
 
-    BOOST_CHECK(auxpow::CommitmentValidationForHeight(consensus, 27'699) == auxpow::CommitmentValidation::INTERNAL);
-    BOOST_CHECK(auxpow::CommitmentValidationForHeight(consensus, 27'700) == auxpow::CommitmentValidation::DISPLAY);
-    BOOST_CHECK(auxpow::CommitmentValidationForHeight(consensus, 27'701) == auxpow::CommitmentValidation::DISPLAY);
+    BOOST_CHECK(auxpow::CommitmentValidationForHeight(consensus, 20'499) == auxpow::CommitmentValidation::INTERNAL);
+    BOOST_CHECK(auxpow::CommitmentValidationForHeight(consensus, 20'500) == auxpow::CommitmentValidation::DISPLAY);
+    BOOST_CHECK(auxpow::CommitmentValidationForHeight(consensus, 20'501) == auxpow::CommitmentValidation::DISPLAY);
 }
 
 BOOST_AUTO_TEST_CASE(auxpow_rejects_commitment_shape_failures)
