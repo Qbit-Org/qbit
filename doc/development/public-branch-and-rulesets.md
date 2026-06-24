@@ -118,25 +118,36 @@ changed paths. This keeps the required check present for every pull request
 without relying on workflow-level `paths` or `paths-ignore` filters, which can
 leave required workflows pending when GitHub skips them.
 
-The required merge gate has two validation profiles:
+The required merge gate has three validation profiles:
 
 | Profile | Applies to | Required validation |
 | --- | --- | --- |
 | Full source validation | Any source-affecting, mixed, unknown, or empty change set. | Require both `Core Checks Gate` and `Full Validation Gate` to complete successfully. |
 | Release-policy validation | Pull requests whose changed paths are only release policy or trusted release reference files. | Run `git diff --check`, release validator tests for touched release validator/workflow files, operator key metadata validation when operator keys are touched, and a best-effort local YAML parse for `release-publish.yml` when PyYAML is available. |
+| RPC docs validation | Pull requests whose changed paths are only RPC documentation pipeline files. | Run `git diff --check`, RPC docs unit tests, and require the existing `rpc-docs` build check. |
 
-The release-policy profile is intentionally narrow. The allowlist is:
+The lightweight profiles are intentionally narrow. The release-policy allowlist
+is:
 
 - `.github/workflows/release-publish.yml`
 - `ci/release/**`
 - `contrib/keys/operator-keys/**`
 - `doc/release-trust-*.md`
 
-Trusted-release-ref and release-trust pull requests that stay within this
-allowlist can merge after release-policy validation and review without waiting
-for full source CI. Any path outside the allowlist, including source, build, or
-test files, is classified as full source validation. Mixed changes also use full
-source validation.
+The RPC docs allowlist is:
+
+- `doc/rpc/**`
+- `test/rpc_docs/**`
+- `cmake/script/normalize_rpc_docs_site_paths.py`
+
+Trusted-release-ref and release-trust pull requests that stay within the
+release-policy allowlist can merge after release-policy validation and review
+without waiting for full source CI. RPC docs pull requests that stay within the
+RPC docs allowlist can merge after RPC docs validation and review without
+waiting for full source CI. Any path outside the active profile allowlist,
+including source, build, or test files, is classified as full source validation.
+Mixed changes, including changes that span more than one lightweight profile,
+also use full source validation.
 
 Merge queue is not enabled in these templates. Enable it only after public CI
 supports `merge_group` events.
