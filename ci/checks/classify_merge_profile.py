@@ -15,9 +15,29 @@ from pathlib import PurePosixPath
 
 RELEASE_POLICY_PROFILE = "release-policy"
 RPC_DOCS_PROFILE = "rpc-docs"
+PUBLIC_DOCS_PROFILE = "public-docs"
 SOURCE_PROFILE = "source"
 
 RELEASE_TRUST_DOC_RE = re.compile(r"^doc/release-trust-[^/]+[.]md$")
+PUBLIC_RELEASE_NOTES_RE = re.compile(r"^doc/release-notes-[^/]+[.]md$")
+
+PUBLIC_DOCS_ROOT_FILES = frozenset(
+    {
+        "README.md",
+        "CONTRIBUTING.md",
+        "SECURITY.md",
+        "doc/README.md",
+    }
+)
+PUBLIC_DOCS_PREFIXES = (
+    "doc/deployment/",
+    "doc/design/",
+    "doc/integration/",
+    "doc/performance/",
+    "doc/policy/",
+    "doc/reference/",
+    "doc/user/",
+)
 
 
 @dataclass(frozen=True)
@@ -26,16 +46,28 @@ class Classification:
     invalid_paths: tuple[str, ...]
     release_policy_paths: tuple[str, ...]
     rpc_docs_paths: tuple[str, ...]
+    public_docs_paths: tuple[str, ...]
     outside_paths: tuple[str, ...]
+
+    @property
+    def lightweight_profile_paths(self) -> dict[str, tuple[str, ...]]:
+        return {
+            RELEASE_POLICY_PROFILE: self.release_policy_paths,
+            RPC_DOCS_PROFILE: self.rpc_docs_paths,
+            PUBLIC_DOCS_PROFILE: self.public_docs_paths,
+        }
 
     @property
     def profile(self) -> str:
         if not self.paths or self.invalid_paths or self.outside_paths:
             return SOURCE_PROFILE
-        if self.release_policy_paths and not self.rpc_docs_paths:
-            return RELEASE_POLICY_PROFILE
-        if self.rpc_docs_paths and not self.release_policy_paths:
-            return RPC_DOCS_PROFILE
+        active_profiles = [
+            profile
+            for profile, profile_paths in self.lightweight_profile_paths.items()
+            if profile_paths
+        ]
+        if len(active_profiles) == 1:
+            return active_profiles[0]
         return SOURCE_PROFILE
 
     @property
@@ -45,6 +77,10 @@ class Classification:
     @property
     def rpc_docs_only(self) -> bool:
         return self.profile == RPC_DOCS_PROFILE
+
+    @property
+    def public_docs_only(self) -> bool:
+        return self.profile == PUBLIC_DOCS_PROFILE
 
 
 def normalize_path(path: str) -> str | None:
@@ -76,11 +112,20 @@ def is_rpc_docs_path(path: str) -> bool:
     )
 
 
+def is_public_docs_path(path: str) -> bool:
+    return (
+        path in PUBLIC_DOCS_ROOT_FILES
+        or path.startswith(PUBLIC_DOCS_PREFIXES)
+        or PUBLIC_RELEASE_NOTES_RE.fullmatch(path) is not None
+    )
+
+
 def classify_paths(paths: list[str] | tuple[str, ...]) -> Classification:
     normalized: list[str] = []
     invalid: list[str] = []
     release_policy: list[str] = []
     rpc_docs: list[str] = []
+    public_docs: list[str] = []
     outside: list[str] = []
 
     for raw_path in paths:
@@ -94,6 +139,8 @@ def classify_paths(paths: list[str] | tuple[str, ...]) -> Classification:
             release_policy.append(path)
         elif is_rpc_docs_path(path):
             rpc_docs.append(path)
+        elif is_public_docs_path(path):
+            public_docs.append(path)
         else:
             outside.append(path)
 
@@ -102,6 +149,7 @@ def classify_paths(paths: list[str] | tuple[str, ...]) -> Classification:
         invalid_paths=tuple(invalid),
         release_policy_paths=tuple(release_policy),
         rpc_docs_paths=tuple(rpc_docs),
+        public_docs_paths=tuple(public_docs),
         outside_paths=tuple(outside),
     )
 
@@ -121,6 +169,7 @@ def github_outputs(classification: Classification) -> dict[str, str]:
         "profile": classification.profile,
         "release_policy_only": bool_output(classification.release_policy_only),
         "rpc_docs_only": bool_output(classification.rpc_docs_only),
+        "public_docs_only": bool_output(classification.public_docs_only),
         "source_validation_required": bool_output(classification.profile == SOURCE_PROFILE),
         "changed_count": str(len(paths)),
         "touched_operator_keys": bool_output(
@@ -136,6 +185,7 @@ def github_outputs(classification: Classification) -> dict[str, str]:
             any(RELEASE_TRUST_DOC_RE.fullmatch(path) for path in paths)
         ),
         "touched_rpc_docs": bool_output(bool(classification.rpc_docs_paths)),
+        "touched_public_docs": bool_output(bool(classification.public_docs_paths)),
     }
 
 
@@ -157,6 +207,9 @@ def describe_classification(classification: Classification) -> str:
     if classification.rpc_docs_paths:
         lines.append("rpc_docs_paths:")
         lines.extend(f"  {path}" for path in classification.rpc_docs_paths)
+    if classification.public_docs_paths:
+        lines.append("public_docs_paths:")
+        lines.extend(f"  {path}" for path in classification.public_docs_paths)
     if classification.outside_paths:
         lines.append("full_validation_paths:")
         lines.extend(f"  {path}" for path in classification.outside_paths)
@@ -180,7 +233,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--require-profile",
-        choices=[RELEASE_POLICY_PROFILE, RPC_DOCS_PROFILE, SOURCE_PROFILE],
+        choices=[
+            RELEASE_POLICY_PROFILE,
+            RPC_DOCS_PROFILE,
+            PUBLIC_DOCS_PROFILE,
+            SOURCE_PROFILE,
+        ],
         help="fail unless the changed files classify into this validation profile",
     )
     parser.add_argument(

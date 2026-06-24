@@ -27,6 +27,19 @@ RPC_DOCS_PATHS = [
     "cmake/script/normalize_rpc_docs_site_paths.py",
 ]
 
+PUBLIC_DOCS_PATHS = [
+    "README.md",
+    "doc/README.md",
+    "doc/user/public-testnet.md",
+    "doc/integration/exchange-integrator-quickstart.md",
+    "doc/reference/ctv.md",
+    "doc/policy/packages.md",
+    "doc/deployment/init.md",
+    "doc/design/p2mr-datapqchash.md",
+    "doc/performance/rpc-benchmarking.md",
+    "doc/release-notes-0.1.1-testnet4.md",
+]
+
 
 class ClassifyMergeProfileTest(unittest.TestCase):
     def classify(self, paths: list[str]) -> classify_merge_profile.Classification:
@@ -58,6 +71,13 @@ class ClassifyMergeProfileTest(unittest.TestCase):
         self.assertTrue(classification.rpc_docs_only)
         self.assertEqual(classification.outside_paths, ())
 
+    def test_public_docs_paths_are_public_docs_only(self) -> None:
+        classification = self.classify(PUBLIC_DOCS_PATHS)
+
+        self.assertEqual(classification.profile, classify_merge_profile.PUBLIC_DOCS_PROFILE)
+        self.assertTrue(classification.public_docs_only)
+        self.assertEqual(classification.outside_paths, ())
+
     def test_source_path_requires_source_validation(self) -> None:
         classification = self.classify(["src/kernel/chainparams.cpp"])
 
@@ -80,6 +100,7 @@ class ClassifyMergeProfileTest(unittest.TestCase):
             [
                 "ci/release/test_validate_release_artifacts.py",
                 "doc/rpc/site_builder.py",
+                "doc/user/public-testnet.md",
             ]
         )
 
@@ -123,6 +144,14 @@ class ClassifyMergeProfileTest(unittest.TestCase):
         self.assertEqual(outputs["source_validation_required"], "false")
         self.assertEqual(outputs["touched_rpc_docs"], "true")
 
+    def test_github_outputs_report_public_docs_profile(self) -> None:
+        outputs = classify_merge_profile.github_outputs(self.classify(PUBLIC_DOCS_PATHS))
+
+        self.assertEqual(outputs["profile"], "public-docs")
+        self.assertEqual(outputs["public_docs_only"], "true")
+        self.assertEqual(outputs["source_validation_required"], "false")
+        self.assertEqual(outputs["touched_public_docs"], "true")
+
     def test_require_release_policy_only_cli_rejects_outside_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             changed_files = Path(tmpdir) / "changed-files.txt"
@@ -152,6 +181,22 @@ class ClassifyMergeProfileTest(unittest.TestCase):
                     str(changed_files),
                     "--require-profile",
                     classify_merge_profile.RPC_DOCS_PROFILE,
+                ]
+            )
+
+        self.assertEqual(result, 0)
+
+    def test_require_profile_accepts_public_docs_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            changed_files = Path(tmpdir) / "changed-files.txt"
+            changed_files.write_text("\n".join(PUBLIC_DOCS_PATHS) + "\n", encoding="utf8")
+
+            result = classify_merge_profile.main(
+                [
+                    "--changed-files",
+                    str(changed_files),
+                    "--require-profile",
+                    classify_merge_profile.PUBLIC_DOCS_PROFILE,
                 ]
             )
 

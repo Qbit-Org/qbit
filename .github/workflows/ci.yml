@@ -848,7 +848,7 @@ jobs:
     name: 'public-docs-lint'
     needs: classify-changes
     runs-on: ubuntu-24.04
-    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft != true) }}
+    if: ${{ (needs.classify-changes.outputs.source_validation_required == 'true' || needs.classify-changes.outputs.profile == 'public-docs') && (github.event_name != 'pull_request' || github.event.pull_request.draft != true) }}
     timeout-minutes: 10
     steps:
       - name: Checkout
