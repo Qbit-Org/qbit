@@ -1,0 +1,98 @@
+{
+  "benchmarks": [
+    {
+      "algorithm": "bounded_slh_dsa_sha2_128s",
+      "latency_ms": 11.734107601938064,
+      "operation": "keygen",
+      "throughput_ops_per_sec": 85.22164905278652
+    },
+    {
+      "algorithm": "bounded_slh_dsa_sha2_128s",
+      "latency_ms": 148.73657361666665,
+      "operation": "sign",
+      "throughput_ops_per_sec": 6.723295929737252
+    },
+    {
+      "algorithm": "bounded_slh_dsa_sha2_128s",
+      "latency_ms": 0.6147084435944823,
+      "operation": "verify",
+      "throughput_ops_per_sec": 1626.7874801792884
+    },
+    {
+      "algorithm": "secp256k1_schnorr",
+      "latency_ms": 0.010400676938502175,
+      "operation": "keygen",
+      "throughput_ops_per_sec": 96147.58788421827
+    },
+    {
+      "algorithm": "secp256k1_schnorr",
+      "latency_ms": 0.011130079903281714,
+      "operation": "sign",
+      "throughput_ops_per_sec": 89846.61464156686
+    },
+    {
+      "algorithm": "secp256k1_schnorr",
+      "latency_ms": 0.01852898390363012,
+      "operation": "verify",
+      "throughput_ops_per_sec": 53969.50017340585
+    }
+  ],
+  "commit_hash": "b4044cc36c89",
+  "generated_at_utc": "2026-02-14T01:23:33Z",
+  "host": {
+    "arch": "aarch64",
+    "arm_sha2": "detected",
+    "cpu_model": "Apple M3 Max",
+    "os": "macos",
+    "sha_ni": "n/a (non-x86 host)"
+  },
+  "impact_analysis": [
+    {
+      "algorithm": "bounded_slh_dsa_sha2_128s",
+      "tps_threshold_1_thread": 16.267874801792882,
+      "tps_threshold_4_core_ideal": 65.07149920717153,
+      "tps_threshold_8_core_ideal": 130.14299841434305,
+      "verify_latency_ms": 0.6147084435944823
+    },
+    {
+      "algorithm": "secp256k1_schnorr",
+      "tps_threshold_1_thread": 539.6950017340585,
+      "tps_threshold_4_core_ideal": 2158.780006936234,
+      "tps_threshold_8_core_ideal": 4317.560013872468,
+      "verify_latency_ms": 0.01852898390363012
+    }
+  ],
+  "optimization_env": {
+    "SPX_DISABLE_SHA_ACCEL": "unset",
+    "SPX_DISABLE_SIMD": "unset",
+    "SPX_FORS_THREADS": "unset",
+    "SPX_DISABLE_THREADS": "unset",
+    "SPX_ENABLE_ARM_SHA": "unset",
+    "SPX_OPT_PROFILE": "unset",
+    "SPX_SHA_BACKEND": "unset"
+  },
+  "run_scope": {
+    "benchmarks_collected": 6,
+    "benchmarks_expected": 6
+  },
+  "runtime_env_knobs": "ignored (production build)",
+  "rustc_version": "rustc 1.84.0 (9fc6b4312 2025-01-07)",
+  "sizes": {
+    "bounded_slh_dsa_sha2_128s": {
+      "public_key_bytes": 32,
+      "secret_key_bytes": 64,
+      "signature_bytes": 3680
+    },
+    "secp256k1_schnorr": {
+      "public_key_bytes": 32,
+      "secret_key_bytes": 32,
+      "signature_bytes": 64
+    }
+  },
+  "verify_budget": {
+    "block_time_seconds": 30.0,
+    "budget_fraction": 0.01,
+    "budget_seconds": 0.3
+  },
+  "worktree_dirty_at_start": false
+}
