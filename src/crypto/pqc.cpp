@@ -62,7 +62,7 @@ void CPQCKey::MakeNewKey()
     m_pubkey_valid = true;
 }
 
-void CPQCKey::SetFromTrustedKeygen(std::span<const unsigned char> secret_key, std::span<const unsigned char> public_key)
+void CPQCKey::SetFromTrustedKeyMaterial(std::span<const unsigned char> secret_key, std::span<const unsigned char> public_key)
 {
     if (secret_key.size() != SIZE || public_key.size() != PQC_PUBKEY_SIZE ||
         secret_key.data() == nullptr || public_key.data() == nullptr ||
@@ -75,6 +75,16 @@ void CPQCKey::SetFromTrustedKeygen(std::span<const unsigned char> secret_key, st
     std::memcpy(m_keydata->data(), secret_key.data(), SIZE);
     std::memcpy(m_pubkey.data(), public_key.data(), PQC_PUBKEY_SIZE);
     m_pubkey_valid = true;
+}
+
+void CPQCKey::SetFromTrustedWalletRecord(std::span<const unsigned char> secret_key, const CPQCPubKey& public_key)
+{
+    if (!public_key.IsValid()) {
+        ClearKeyData();
+        return;
+    }
+
+    SetFromTrustedKeyMaterial(secret_key, std::span<const unsigned char>{public_key.data(), public_key.size()});
 }
 
 void CPQCKey::Set(const unsigned char* begin, const unsigned char* end)
@@ -180,7 +190,7 @@ bool DerivePQCKey(std::span<const unsigned char> master_seed, uint32_t account, 
         return false;
     }
 
-    key_out.SetFromTrustedKeygen(
+    key_out.SetFromTrustedKeyMaterial(
         std::span<const unsigned char>{seckey.data(), seckey.size()},
         std::span<const unsigned char>{pubkey.data(), pubkey.size()});
     memory_cleanse(seckey.data(), seckey.size());

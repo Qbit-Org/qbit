@@ -123,6 +123,8 @@ static const CRPCConvertParam vRPCConvertParams[] =
     { "decoderawtransaction", 1, "iswitness" },
     { "getdefaultctvhash", 1, "input_index" },
     { "getdefaultctvhash", 2, "verbose" },
+    { "verifydatapqchash", 0, "p2mr_proof" },
+    { "signdatapqchash", 2, "options" },
     { "signrawtransactionwithkey", 1, "privkeys" },
     { "signrawtransactionwithkey", 2, "prevtxs" },
     { "signrawtransactionwithwallet", 1, "prevtxs" },

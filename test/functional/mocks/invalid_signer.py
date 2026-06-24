@@ -21,9 +21,9 @@ def enumerate(args):
     sys.stdout.write(json.dumps([{"fingerprint": "b3c19bfc", "type": "trezor", "model": "trezor_t"}]))
 
 def getdescriptors(args):
-    xpub_pkh = "xpub6CRhJvXV8x2AKWvqi1ZSMFU6cbxzQiYrv3dxSUXCawjMJ1JzpqVsveH4way1yCmJm29KzH1zrVZmVwes4Qo6oXVE1HFn4fdiKrYJngqFFc6"
-    xpub_sh = "xpub6CoNoq3Tg4tGSpom2BSwL42gy864KHo3TXkHxLxBbhvCkgmdVXADQmiHbLZhX3Me1cYhRx7s25Lpm4LnT5zu395ANHsXB2QvT9tqJDAibTN"
-    xpub_wpkh = "xpub6DUcLgY1DfgDy2RV6q4djwwsLitaoZDumbribqrR8mP78fEtgZa1XEsqT5MWQ7gwLwKsTQPT28XLoVE5A97rDNTwMXjmzPaNijoCApCbWvp"
+    xpub_pkh = "qrpbSXj4PCoApjTY8T1qsyb3N5GoMowpzCYWgqsfFe7BE1hfsknLeMFfHXt81FeCrSPkCM4VUVi5MuRBTKNFgNdPdoikvabTyXcwAXwS3FbF5jW"
+    xpub_sh = "qrpbSY6jt7K9MrKeFktmC9UYLsqPiL4ttmnhEKyzmWYAEmtXLSEyK2uzmfKLf1EtQGz5SwTrvAowXVCEiS4B53qBsRJhHbDD5tQ9HqHxYnGFwXT"
+    xpub_wpkh = "qrpbSYmyQxoguT7bmxWVGo6Ekmka5vsRP3DZYQ6RR1SPmqMRiQiEW5Knt8UtWk2hHMKNnGF2wd5XXYNkkrwTn6x93ehUGq5TuFZbZRCKRPbFPE3"
 
     sys.stdout.write(json.dumps({
         "receive": [

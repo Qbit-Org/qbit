@@ -72,7 +72,7 @@ def serialize_auxpow_payload(block):
     aux_block_hash = hash256(block._serialize_header())
     commitment = (
         MERGED_MINING_HEADER
-        + aux_block_hash
+        + aux_block_hash[::-1]
         + (1).to_bytes(4, "little")
         + (0).to_bytes(4, "little")
     )

@@ -1,0 +1,924 @@
+# Copyright (c) 2023-present The Bitcoin Core developers
+# Distributed under the MIT software license, see the accompanying
+# file COPYING or https://opensource.org/license/mit.
+
+name: Full Validation
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+      - labeled
+      - unlabeled
+    branches:
+      - main
+      - develop
+  push:
+    branches:
+      - main
+      - develop
+  merge_group:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:  # Manual trigger for full validation on any branch
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.event_name != 'pull_request' && github.run_id || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI_FAILFAST_TEST_LEAVE_DANGLING: 1  # GHA does not care about dangling processes and setting this variable avoids killing the CI script itself on error
+  CIRRUS_CACHE_HOST: http://127.0.0.1:12321/ # When using Cirrus Runners this host can be used by the docker `gha` build cache type.
+  REPO_USE_CIRRUS_RUNNERS: '' # Disabled: using self-hosted runners
+  CI_IMAGE_REGISTRY_PREFIX: qbit-ci-autoscaler:5000/qbit-cache
+  CI_ENFORCE_INTERNAL_REGISTRY: 1
+
+defaults:
+  run:
+    # Enforce fail-fast behavior for all platforms.
+    # See: https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#exit-codes-and-error-action-preference
+    shell: bash
+
+jobs:
+  runners:
+    name: 'determine runners'
+    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted'))) }}
+    # Select the self-hosted runner pool by repository: the public Qbit-Org/qbit
+    # repo requires the dedicated trusted pool (qbit-trusted-ci), while every
+    # other context (the private bridge repo and forks) uses the standard
+    # self-hosted pool. The same workflow then runs full validation in both with
+    # no per-repo edits. Fork-PR safety is enforced separately by the trust-gate
+    # `if:` conditions, independent of the runner pool.
+    runs-on: &qbit_runs_on ${{ github.repository == 'Qbit-Org/qbit' && fromJSON('["self-hosted", "linux", "x64", "qbit-trusted-ci"]') || fromJSON('["self-hosted", "linux", "x64"]') }}
+    outputs:
+      provider: ${{ steps.runners.outputs.provider }}
+    steps:
+      - id: runners
+        run: |
+          if [[ "${REPO_USE_CIRRUS_RUNNERS}" == "${{ github.repository }}" ]]; then
+            echo "provider=cirrus" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Runner Selection::Using Cirrus Runners"
+          else
+            echo "provider=gha" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Runner Selection::Using GitHub-hosted runners"
+          fi
+
+  test-each-commit:
+    name: 'test each commit'
+    runs-on: *qbit_runs_on
+    if: false # Disabled: runner OS (Ubuntu 20.04) lacks required packages (mold, qt6)
+    timeout-minutes: 360  # Use maximum time, see https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idtimeout-minutes. Assuming a worst case time of 1 hour per commit, this leads to a --max-count=6 below.
+    env:
+      MAX_COUNT: 6
+    steps:
+      - name: Determine fetch depth
+        run: echo "FETCH_DEPTH=$((${{ github.event.pull_request.commits }} + 2))" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: ${{ env.FETCH_DEPTH }}
+      - name: Determine commit range
+        run: |
+          # Checkout HEAD~ and find the test base commit
+          # Checkout HEAD~ because it would be wasteful to rerun tests on the PR
+          # head commit that are already run by other jobs.
+          git checkout HEAD~
+          # Figure out test base commit by listing ancestors of HEAD, excluding
+          # ancestors of the most recent merge commit, limiting the list to the
+          # newest MAX_COUNT ancestors, ordering it from oldest to newest, and
+          # taking the first one.
+          #
+          # If the branch contains up to MAX_COUNT ancestor commits after the
+          # most recent merge commit, all of those commits will be tested. If it
+          # contains more, only the most recent MAX_COUNT commits will be
+          # tested.
+          #
+          # In the command below, the ^@ suffix is used to refer to all parents
+          # of the merge commit as described in:
+          # https://git-scm.com/docs/git-rev-parse#_other_rev_parent_shorthand_notations
+          # and the ^ prefix is used to exclude these parents and all their
+          # ancestors from the rev-list output as described in:
+          # https://git-scm.com/docs/git-rev-list
+          MERGE_BASE=$(git rev-list -n1 --merges HEAD)
+          EXCLUDE_MERGE_BASE_ANCESTORS=
+          # MERGE_BASE can be empty due to limited fetch-depth
+          if test -n "$MERGE_BASE"; then
+            EXCLUDE_MERGE_BASE_ANCESTORS=^${MERGE_BASE}^@
+          fi
+          echo "TEST_BASE=$(git rev-list -n$((${{ env.MAX_COUNT }} + 1)) --reverse HEAD $EXCLUDE_MERGE_BASE_ANCESTORS | head -1)" >> "$GITHUB_ENV"
+      - run: |
+          git fetch origin "${GITHUB_BASE_REF}"
+          git config user.email "ci@example.com"
+          git config user.name "CI"
+      - run: |
+          sudo apt-get update
+          sudo apt-get install clang mold ccache build-essential cmake ninja-build pkgconf python3-zmq libevent-dev libboost-dev libsqlite3-dev systemtap-sdt-dev libzmq3-dev qt6-base-dev qt6-tools-dev qt6-l10n-tools libqrencode-dev capnproto libcapnp-dev -y
+          sudo pip3 install --break-system-packages pycapnp
+      - name: Compile and run tests
+        run: |
+          # Run tests on commits after the last merge commit and before the PR head commit
+          git rebase --exec "git merge --no-commit origin/${GITHUB_BASE_REF} && python3 ./.github/ci-test-each-commit-exec.py && git reset --hard" ${{ env.TEST_BASE }}
+
+  macos-native-arm64:
+    name: ${{ matrix.job-name }}
+    runs-on: macos-14
+    if: false # Disabled: no macOS runner available
+
+    timeout-minutes: 120
+
+    strategy:
+      fail-fast: false
+      matrix:
+        job-type: [standard, fuzz]
+        include:
+          - job-type: standard
+            file-env: './ci/test/00_setup_env_mac_native.sh'
+            job-name: 'macOS 14 native, arm64, no depends, sqlite only, gui'
+          - job-type: fuzz
+            file-env: './ci/test/00_setup_env_mac_native_fuzz.sh'
+            job-name: 'macOS 14 native, arm64, fuzz'
+
+    env:
+      DANGER_RUN_CI_ON_HOST: 1
+      BASE_ROOT_DIR: ${{ github.workspace }}
+
+    steps:
+      - &CHECKOUT
+        name: Checkout
+        uses: actions/checkout@v5
+        with:
+          # Ensure PR re-runs use merged state.
+          ref: &CHECKOUT_REF_TMPL ${{ github.event_name == 'pull_request' && github.ref || '' }}
+
+      - name: Clang version
+        run: |
+          # Use the earliest Xcode supported by the release notes template and
+          # providing at least the minimum clang version denoted in
+          # doc/build/dependencies.md.
+          # See: https://developer.apple.com/documentation/xcode-release-notes/xcode-15-release-notes
+          sudo xcode-select --switch /Applications/Xcode_15.0.app
+          clang --version
+
+      - name: Install Homebrew packages
+        env:
+          HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
+        run: |
+          # A workaround for "The `brew link` step did not complete successfully" error.
+          brew install --quiet python@3 || brew link --overwrite python@3
+          brew install --quiet coreutils ninja pkgconf gnu-getopt ccache boost libevent zeromq qt@6 qrencode capnp
+
+      - name: Install Python packages
+        run: |
+          git clone -b v2.1.0 https://github.com/capnproto/pycapnp
+          pip3 install ./pycapnp -C force-bundled-libcapnp=True --break-system-packages
+
+      - name: Set Ccache directory
+        run: echo "CCACHE_DIR=${RUNNER_TEMP}/ccache_dir" >> "$GITHUB_ENV"
+
+      - name: Restore Ccache cache
+        id: ccache-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ github.job }}-${{ matrix.job-type }}-ccache-${{ github.run_id }}
+          restore-keys: ${{ github.job }}-${{ matrix.job-type }}-ccache-
+
+      - name: CI script
+        run: ./ci/test_run_all.sh
+        env:
+          FILE_ENV: ${{ matrix.file-env }}
+
+      - name: Save Ccache cache
+        uses: actions/cache/save@v4
+        if: github.event_name != 'pull_request' && steps.ccache-cache.outputs.cache-hit != 'true'
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          # https://github.com/actions/cache/blob/main/tips-and-workarounds.md#update-a-cache
+          key: ${{ github.job }}-${{ matrix.job-type }}-ccache-${{ github.run_id }}
+
+  windows-native-dll:
+    name: ${{ matrix.job-name }}
+    runs-on: blacksmith-8vcpu-windows-2025
+    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted'))) }}
+    timeout-minutes: 240
+
+    env:
+      PYTHONUTF8: 1
+      TEST_RUNNER_TIMEOUT_FACTOR: 40
+
+    strategy:
+      fail-fast: false
+      matrix:
+        job-type: [standard, fuzz]
+        include:
+          - job-type: standard
+            generate-options: '-DBUILD_GUI=ON -DWITH_ZMQ=ON -DBUILD_BENCH=ON -DWERROR=ON'
+            job-name: 'Windows native, VS 2022 on Blacksmith'
+          - job-type: fuzz
+            generate-options: '-DVCPKG_MANIFEST_NO_DEFAULT_FEATURES=ON -DVCPKG_MANIFEST_FEATURES="wallet" -DBUILD_GUI=OFF -DBUILD_FOR_FUZZING=ON -DWERROR=ON'
+            job-name: 'Windows native, fuzz, VS 2022 on Blacksmith'
+
+    steps:
+      - *CHECKOUT
+
+      - name: Configure Developer Command Prompt for Microsoft Visual C++
+        # Using microsoft/setup-msbuild is not enough.
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Get tool information
+        shell: pwsh
+        run: |
+          cmake -version | Tee-Object -FilePath "cmake_version"
+          Write-Output "---"
+          msbuild -version | Tee-Object -FilePath "msbuild_version"
+          $env:VCToolsVersion | Tee-Object -FilePath "toolset_version"
+          py -3 --version
+          Write-Host "PowerShell version $($PSVersionTable.PSVersion.ToString())"
+          bash --version
+          Write-Output "---"
+          Write-Host "ImageOS=$env:ImageOS"
+          Write-Host "ImageVersion=$env:ImageVersion"
+          Write-Host "VCPKG_INSTALLATION_ROOT=$env:VCPKG_INSTALLATION_ROOT"
+          Write-Host "VCPKG_ROOT=$env:VCPKG_ROOT"
+          if (-not (Test-Path $env:VCPKG_INSTALLATION_ROOT)) {
+            throw "VCPKG_INSTALLATION_ROOT does not exist"
+          }
+
+      - name: Using vcpkg with MSBuild
+        run: |
+          echo "set(VCPKG_BUILD_TYPE release)" >> "${VCPKG_INSTALLATION_ROOT}/triplets/x64-windows.cmake"
+          # Workaround for libevent, which requires CMake 3.1 but is incompatible with CMake >= 4.0.
+          sed -i '1s/^/set(ENV{CMAKE_POLICY_VERSION_MINIMUM} 3.5)\n/' "${VCPKG_INSTALLATION_ROOT}/scripts/ports.cmake"
+
+      - name: vcpkg tools cache
+        uses: actions/cache@v4
+        with:
+          path: C:/vcpkg/downloads/tools
+          key: ${{ github.job }}-vcpkg-tools
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache/restore@v4
+        id: vcpkg-binary-cache
+        with:
+          path: ~/AppData/Local/vcpkg/archives
+          key: ${{ github.job }}-vcpkg-binary-${{ hashFiles('cmake_version', 'msbuild_version', 'toolset_version', 'vcpkg.json') }}
+
+      - name: Generate build system
+        run: |
+          cmake -B build -Werror=dev --preset vs2022 -DCMAKE_TOOLCHAIN_FILE="${VCPKG_INSTALLATION_ROOT}/scripts/buildsystems/vcpkg.cmake" ${{ matrix.generate-options }}
+
+      - name: Save vcpkg binary cache
+        uses: actions/cache/save@v4
+        if: github.event_name != 'pull_request' && steps.vcpkg-binary-cache.outputs.cache-hit != 'true' && matrix.job-type == 'standard'
+        with:
+          path: ~/AppData/Local/vcpkg/archives
+          key: ${{ github.job }}-vcpkg-binary-${{ hashFiles('cmake_version', 'msbuild_version', 'toolset_version', 'vcpkg.json') }}
+
+      - name: Build
+        working-directory: build
+        run: |
+          cmake --build . -j $NUMBER_OF_PROCESSORS --config Release
+
+      - name: Get qbitd manifest
+        if: matrix.job-type == 'standard'
+        working-directory: build
+        run: |
+          mt.exe -nologo -inputresource:bin/Release/qbitd.exe -out:qbitd.manifest
+          cat qbitd.manifest
+          echo
+          mt.exe -nologo -inputresource:bin/Release/qbitd.exe -validate_manifest
+
+      - name: Configure Windows crash dumps
+        if: matrix.job-type == 'standard'
+        shell: pwsh
+        run: |
+          $dumpDir = Join-Path $env:RUNNER_TEMP "crash-dumps"
+          New-Item -ItemType Directory -Force -Path $dumpDir | Out-Null
+          "CRASH_DUMP_DIR=$dumpDir" >> $env:GITHUB_ENV
+
+          foreach ($target in @("test_qbit-qt.exe", "test_qbit.exe", "qbitd.exe")) {
+            $key = "HKCU:\Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\$target"
+            New-Item -Path $key -Force | Out-Null
+            New-ItemProperty -Path $key -Name DumpFolder -Value $dumpDir -PropertyType ExpandString -Force | Out-Null
+            New-ItemProperty -Path $key -Name DumpType -Value 2 -PropertyType DWord -Force | Out-Null
+            New-ItemProperty -Path $key -Name DumpCount -Value 10 -PropertyType DWord -Force | Out-Null
+          }
+
+      - name: Run Qt test with diagnostics
+        id: qt_test
+        if: matrix.job-type == 'standard'
+        continue-on-error: true
+        timeout-minutes: 20
+        working-directory: build
+        shell: pwsh
+        env:
+          QT_PLUGIN_PATH: '${{ github.workspace }}\build\vcpkg_installed\x64-windows\Qt6\plugins'
+          QT_DEBUG_PLUGINS: 1
+          QT_QPA_PLATFORM: offscreen
+          QTEST_FUNCTION_TIMEOUT: 600000
+        run: |
+          Write-Host "QT_PLUGIN_PATH=$env:QT_PLUGIN_PATH"
+          if (Test-Path $env:QT_PLUGIN_PATH) {
+            Get-ChildItem $env:QT_PLUGIN_PATH -Recurse | Select-Object -First 300 -ExpandProperty FullName
+          } else {
+            Write-Host "QT_PLUGIN_PATH does not exist"
+          }
+
+          if (Get-Command dumpbin.exe -ErrorAction SilentlyContinue) {
+            dumpbin.exe /dependents bin\Release\test_qbit-qt.exe
+          } else {
+            Write-Host "dumpbin.exe not found in PATH"
+          }
+
+          $procDumpDir = Join-Path $env:RUNNER_TEMP "procdump"
+          $procDumpZip = Join-Path $env:RUNNER_TEMP "procdump.zip"
+          $procDump = Join-Path $procDumpDir "procdump64.exe"
+          try {
+            Invoke-WebRequest -Uri "https://download.sysinternals.com/files/Procdump.zip" -OutFile $procDumpZip
+            Expand-Archive -Path $procDumpZip -DestinationPath $procDumpDir -Force
+          } catch {
+            Write-Host "Unable to install ProcDump: $($_.Exception.Message)"
+          }
+
+          function Format-ExitCodeHex {
+            param([int] $ExitCode)
+
+            $bytes = [BitConverter]::GetBytes($ExitCode)
+            return "0x{0:x8}" -f [BitConverter]::ToUInt32($bytes, 0)
+          }
+
+          function Invoke-QtTest {
+            param([string] $Platform)
+
+            $env:QT_QPA_PLATFORM = $Platform
+            Write-Host "Running test_qbit-qt.exe with QT_QPA_PLATFORM=$Platform"
+            & bin\Release\test_qbit-qt.exe -v2 2>&1 | ForEach-Object { Write-Host $_ }
+            $exitCode = $LASTEXITCODE
+            $exitHex = Format-ExitCodeHex $exitCode
+            Write-Host "test_qbit-qt.exe exited with $exitCode ($exitHex) on platform $Platform"
+
+            if ($exitCode -ne 0 -and (Test-Path $procDump)) {
+              $platformDumpDir = Join-Path $env:CRASH_DUMP_DIR $Platform
+              New-Item -ItemType Directory -Force -Path $platformDumpDir | Out-Null
+              Write-Host "Re-running under ProcDump for platform $Platform"
+              & $procDump -accepteula -ma -e -t -x $platformDumpDir bin\Release\test_qbit-qt.exe -v2 2>&1 | ForEach-Object { Write-Host $_ }
+              Write-Host "ProcDump exited with $LASTEXITCODE for platform $Platform"
+              Get-ChildItem $platformDumpDir -Recurse -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.FullName }
+            }
+
+            return $exitCode
+          }
+
+          $offscreenExit = Invoke-QtTest "offscreen"
+          if ($offscreenExit -ne 0) {
+            Invoke-QtTest "windows"
+            Invoke-QtTest "minimal"
+            exit 1
+          }
+
+      - name: Analyze Windows crash dumps
+        if: matrix.job-type == 'standard' && steps.qt_test.outcome != 'success'
+        timeout-minutes: 10
+        shell: pwsh
+        run: |
+          if (-not (Test-Path $env:CRASH_DUMP_DIR)) {
+            Write-Host "No crash dump directory found"
+            exit 0
+          }
+
+          $dumps = Get-ChildItem $env:CRASH_DUMP_DIR -Recurse -Filter '*.dmp' -ErrorAction SilentlyContinue
+          if (-not $dumps) {
+            Write-Host "No crash dumps found"
+            exit 0
+          }
+
+          $cdbCommand = Get-Command cdb.exe -ErrorAction SilentlyContinue
+          $cdbPath = if ($cdbCommand) { $cdbCommand.Source } else { $null }
+          if (-not $cdbPath) {
+            $kitsRoot = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots' -Name KitsRoot10 -ErrorAction SilentlyContinue).KitsRoot10
+            if ($kitsRoot) {
+              $candidate = Join-Path $kitsRoot 'Debuggers\x64\cdb.exe'
+              if (Test-Path $candidate) {
+                $cdbPath = $candidate
+              }
+            }
+          }
+
+          if (-not $cdbPath) {
+            Write-Host "cdb.exe not found; uploading dumps for offline analysis"
+            Get-ChildItem $env:CRASH_DUMP_DIR -Recurse
+            exit 0
+          }
+
+          foreach ($dump in $dumps) {
+            Write-Host "Analyzing $($dump.FullName)"
+            & $cdbPath -z $dump.FullName -c "!analyze -v;q"
+          }
+
+      - name: Upload Windows crash diagnostics
+        if: matrix.job-type == 'standard' && steps.qt_test.outcome != 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-qt-crash-diagnostics-${{ github.run_id }}
+          if-no-files-found: ignore
+          path: |
+            ${{ runner.temp }}\crash-dumps\**
+            build\Testing\Temporary\LastTest.log
+            build\bin\Release\test_qbit-qt.exe
+            build\bin\Release\*.pdb
+            build\vcpkg_installed\x64-windows\bin\Qt6*.pdb
+            build\vcpkg_installed\x64-windows\Qt6\plugins\**\*.pdb
+
+      - name: Fail after Qt diagnostics
+        if: matrix.job-type == 'standard' && steps.qt_test.outcome != 'success'
+        shell: pwsh
+        run: exit 1
+
+      - name: Run test suite
+        if: matrix.job-type == 'standard' && steps.qt_test.outcome == 'success'
+        timeout-minutes: 90
+        working-directory: build
+        run: |
+          ctest --output-on-failure --stop-on-failure -E '^test_qbit-qt$' -j "$NUMBER_OF_PROCESSORS" -C Release --timeout 1800
+
+      - name: Run functional tests
+        if: matrix.job-type == 'standard'
+        working-directory: build
+        env:
+          QBIT_BIN: '${{ github.workspace }}\build\bin\Release\qbit.exe'
+          QBITD: '${{ github.workspace }}\build\bin\Release\qbitd.exe'
+          QBITCLI: '${{ github.workspace }}\build\bin\Release\qbit-cli.exe'
+          QBITTX: '${{ github.workspace }}\build\bin\Release\qbit-tx.exe'
+          QBITUTIL: '${{ github.workspace }}\build\bin\Release\qbit-util.exe'
+          QBITWALLET: '${{ github.workspace }}\build\bin\Release\qbit-wallet.exe'
+          BITCOIN_BIN: '${{ github.workspace }}\build\bin\Release\qbit.exe'
+          BITCOIND: '${{ github.workspace }}\build\bin\Release\qbitd.exe'
+          BITCOINCLI: '${{ github.workspace }}\build\bin\Release\qbit-cli.exe'
+          BITCOINTX: '${{ github.workspace }}\build\bin\Release\qbit-tx.exe'
+          BITCOINUTIL: '${{ github.workspace }}\build\bin\Release\qbit-util.exe'
+          BITCOINWALLET: '${{ github.workspace }}\build\bin\Release\qbit-wallet.exe'
+          TEST_RUNNER_FAILFAST: ${{ github.event_name == 'pull_request' && '--failfast' || '' }}
+          TEST_RUNNER_EXTRA: ${{ github.event_name != 'pull_request' && '--extended' || '' }}
+        run: py -3 test/functional/test_runner.py --jobs $NUMBER_OF_PROCESSORS --ci --quiet --tmpdirprefix="${RUNNER_TEMP}" --combinedlogslen=2000 --timeout-factor=${TEST_RUNNER_TIMEOUT_FACTOR} ${TEST_RUNNER_FAILFAST} ${TEST_RUNNER_EXTRA}
+
+      - name: Clone corpora
+        if: matrix.job-type == 'fuzz'
+        run: |
+          git clone --depth=1 https://github.com/bitcoin-core/qa-assets "${RUNNER_TEMP}/qa-assets"
+          cd "${RUNNER_TEMP}/qa-assets"
+          echo "Using qa-assets repo from commit ..."
+          git log -1
+
+      - name: Run fuzz tests
+        if: matrix.job-type == 'fuzz'
+        working-directory: build
+        env:
+          BITCOINFUZZ: '${{ github.workspace }}\build\bin\Release\fuzz.exe'
+        run: |
+          # TODO: Fix the Windows fail-fast in ephemeral_package_eval and re-enable it.
+          py -3 test/fuzz/test_runner.py --par $NUMBER_OF_PROCESSORS --loglevel DEBUG --exclude ephemeral_package_eval "${RUNNER_TEMP}/qa-assets/fuzz_corpora"
+
+  windows-cross:
+    name: 'Linux->Windows cross, no tests'
+    needs: runners
+    runs-on: *qbit_runs_on
+    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted'))) }}
+    timeout-minutes: 240
+
+    env:
+      FILE_ENV: './ci/test/00_setup_env_win64.sh'
+      DANGER_CI_ON_HOST_FOLDERS: 1
+
+    steps:
+      - *CHECKOUT
+
+      - name: Configure environment
+        uses: ./.github/actions/configure-environment
+
+      - name: Restore caches
+        id: restore-cache
+        uses: ./.github/actions/restore-caches
+
+      - name: Configure Docker
+        uses: ./.github/actions/configure-docker
+        with:
+          cache-provider: ${{ needs.runners.outputs.provider }}
+
+      - name: CI script
+        run: ./ci/test_run_all.sh
+
+      - name: Save caches
+        uses: ./.github/actions/save-caches
+
+      - name: Upload built executables
+        uses: actions/upload-artifact@v4
+        with:
+          name: x86_64-w64-mingw32-executables-${{ github.run_id }}
+          path: |
+            ${{ env.BASE_BUILD_DIR }}/bin/*.exe
+            ${{ env.BASE_BUILD_DIR }}/src/secp256k1/bin/*.exe
+            ${{ env.BASE_BUILD_DIR }}/src/univalue/*.exe
+            ${{ env.BASE_BUILD_DIR }}/test/config.ini
+
+  windows-native-test:
+    name: 'Windows, test cross-built'
+    runs-on: blacksmith-8vcpu-windows-2025
+    needs: windows-cross
+    # Defense-in-depth parity with windows-native-dll: never execute on the
+    # third-party Windows runner for untrusted fork PRs. success() preserves the
+    # existing requirement that windows-cross completed; windows-cross shares
+    # this trust gate, so untrusted forks skip it and this job in turn.
+    if: ${{ success() && (github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted')))) }}
+    timeout-minutes: 240
+
+    env:
+      PYTHONUTF8: 1
+      TEST_RUNNER_TIMEOUT_FACTOR: 40
+
+    steps:
+      - *CHECKOUT
+
+      - name: Download built executables
+        uses: actions/download-artifact@v4
+        with:
+          name: x86_64-w64-mingw32-executables-${{ github.run_id }}
+
+      - name: Run qbitd.exe
+        run: ./bin/qbitd.exe -version
+
+      - name: Find mt.exe tool
+        shell: pwsh
+        run: |
+          $sdk_dir = (Get-ItemProperty 'HKLM:\SOFTWARE\Wow6432Node\Microsoft\Windows Kits\Installed Roots' -Name KitsRoot10).KitsRoot10
+          $sdk_latest = (Get-ChildItem "$sdk_dir\bin" -Directory | Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } | Sort-Object Name -Descending | Select-Object -First 1).Name
+          "MT_EXE=${sdk_dir}bin\${sdk_latest}\x64\mt.exe" >> $env:GITHUB_ENV
+
+      - name: Get qbitd manifest
+        shell: pwsh
+        run: |
+          & $env:MT_EXE -nologo -inputresource:bin\qbitd.exe -out:qbitd.manifest
+          Get-Content qbitd.manifest
+          & $env:MT_EXE -nologo -inputresource:bin\qbitd.exe -validate_manifest
+
+      - name: Run unit tests
+        # Can't use ctest here like other jobs as we don't have a CMake build tree.
+        run: |
+          ./bin/test_qbit.exe -l test_suite  # Intentionally run sequentially here, to catch test case failures caused by dirty global state from prior test cases.
+          ./src/secp256k1/bin/exhaustive_tests.exe
+          ./src/secp256k1/bin/noverify_tests.exe
+          ./src/secp256k1/bin/tests.exe
+          ./src/univalue/object.exe
+          ./src/univalue/unitester.exe
+
+      - name: Run benchmarks
+        run: ./bin/bench_qbit.exe -sanity-check -min-time=0 -p2mronly=0 -filter=AddrManAdd
+
+      - name: Adjust paths in test/config.ini
+        shell: pwsh
+        run: |
+          (Get-Content "test/config.ini") -replace '(?<=^SRCDIR=).*', '${{ github.workspace }}' -replace '(?<=^BUILDDIR=).*', '${{ github.workspace }}' -replace '(?<=^RPCAUTH=).*', '${{ github.workspace }}/share/rpcauth/rpcauth.py' | Set-Content "test/config.ini"
+          Get-Content "test/config.ini"
+
+      - name: Set previous release directory
+        run: |
+          echo "PREVIOUS_RELEASES_DIR=${{ runner.temp }}/previous_releases" >> "$GITHUB_ENV"
+
+      - name: Get previous releases
+        working-directory: test
+        run: ./get_previous_releases.py --target-dir $PREVIOUS_RELEASES_DIR
+
+      - name: Run functional tests
+        env:
+          # TODO: Fix the excluded test and re-enable it.
+          # feature_unsupported_utxo_db.py fails on windows because of emojis in the test data directory
+          EXCLUDE: '--exclude wallet_multiwallet.py,feature_unsupported_utxo_db.py'
+          TEST_RUNNER_FAILFAST: ${{ github.event_name == 'pull_request' && '--failfast' || '' }}
+          TEST_RUNNER_EXTRA: ${{ github.event_name != 'pull_request' && '--extended' || '' }}
+        run: py -3 test/functional/test_runner.py --jobs $NUMBER_OF_PROCESSORS --ci --quiet --tmpdirprefix="$RUNNER_TEMP" --combinedlogslen=2000 --timeout-factor=$TEST_RUNNER_TIMEOUT_FACTOR $EXCLUDE $TEST_RUNNER_FAILFAST $TEST_RUNNER_EXTRA
+
+  ci-matrix:
+    name: ${{ matrix.name }}
+    needs: runners
+    runs-on: *qbit_runs_on
+    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted'))) }}
+    timeout-minutes: ${{ matrix.timeout-minutes }}
+
+    env:
+      DANGER_CI_ON_HOST_FOLDERS: 1
+      FILE_ENV: ${{ matrix.file-env }}
+      TEST_RUNNER_FAILFAST: ${{ (github.event_name == 'pull_request' || github.event_name == 'push') && 'true' || 'false' }}
+      MAKEJOBS: ${{ matrix.makejobs || '-j6' }}
+      TEST_RUNNER_JOBS: ${{ matrix.test-runner-jobs || '6' }}
+      CTEST_JOBS: ${{ matrix.ctest-jobs || '6' }}
+      CI_DOCKER_RUN_CPUS: ${{ matrix.container-cpus || '8' }}
+      CI_DOCKER_RUN_MEMORY: ${{ matrix.container-memory || '48g' }}
+      CI_ENFORCE_INTERNAL_REGISTRY: ${{ matrix.file-env == './ci/test/00_setup_env_native_centos.sh' && '0' || '1' }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: 'ASan + LSan + UBSan + integer, no depends, USDT'
+            cirrus-runner: 'ghcr.io/cirruslabs/ubuntu-runner-amd64:24.04-md' # has to match container in ci/test/00_setup_env_native_asan.sh for tracing tools
+            fallback-runner: 'ubuntu-24.04'
+            timeout-minutes: 200
+            file-env: './ci/test/00_setup_env_native_asan.sh'
+
+          - name: 'macOS-cross, gui, no tests'
+            cirrus-runner: 'ghcr.io/cirruslabs/ubuntu-runner-amd64:24.04-sm'
+            fallback-runner: 'ubuntu-24.04'
+            timeout-minutes: 200
+            file-env: './ci/test/00_setup_env_mac_cross.sh'
+
+          - name: 'No wallet, libbitcoinkernel'
+            cirrus-runner: 'ghcr.io/cirruslabs/ubuntu-runner-amd64:24.04-sm'
+            fallback-runner: 'ubuntu-24.04'
+            timeout-minutes: 200
+            file-env: './ci/test/00_setup_env_native_nowallet_libbitcoinkernel.sh'
+
+          - name: 'no IPC, i686, DEBUG'
+            cirrus-runner: 'ghcr.io/cirruslabs/ubuntu-runner-amd64:24.04-md'
+            fallback-runner: 'ubuntu-24.04'
+            timeout-minutes: 200
+            file-env: './ci/test/00_setup_env_i686_no_ipc.sh'
+
+          - name: 'CentOS, depends, gui'
+            cirrus-runner: 'ghcr.io/cirruslabs/ubuntu-runner-amd64:24.04-lg'
+            fallback-runner: 'ubuntu-24.04'
+            timeout-minutes: 200
+            file-env: './ci/test/00_setup_env_native_centos.sh'
+
+          - name: 'tidy'
+            cirrus-runner: 'ghcr.io/cirruslabs/ubuntu-runner-amd64:24.04-md'
+            fallback-runner: 'ubuntu-24.04'
+            timeout-minutes: 200
+            file-env: './ci/test/00_setup_env_native_tidy.sh'
+
+          - name: 'TSan, depends, no gui'
+            cirrus-runner: 'ghcr.io/cirruslabs/ubuntu-runner-amd64:24.04-md'
+            fallback-runner: 'ubuntu-24.04'
+            timeout-minutes: 200
+            file-env: './ci/test/00_setup_env_native_tsan.sh'
+
+          - name: 'MSan, depends'
+            cirrus-runner: 'ghcr.io/cirruslabs/ubuntu-runner-amd64:24.04-lg'
+            fallback-runner: 'ubuntu-24.04'
+            timeout-minutes: 200
+            file-env: './ci/test/00_setup_env_native_msan.sh'
+
+    steps:
+      - *CHECKOUT
+
+      - name: Configure environment
+        uses: ./.github/actions/configure-environment
+
+      - name: Restore caches
+        id: restore-cache
+        uses: ./.github/actions/restore-caches
+
+      - name: Configure Docker
+        uses: ./.github/actions/configure-docker
+        with:
+          cache-provider: ${{ matrix.provider || needs.runners.outputs.provider }}
+
+      - name: Enable bpfcc script
+        if: ${{ env.CONTAINER_NAME == 'ci_native_asan' }}
+        # In the image build step, no external environment variables are available,
+        # so any settings will need to be written to the settings env file:
+        run: sed -i "s|\${INSTALL_BCC_TRACING_TOOLS}|true|g" ./ci/test/00_setup_env_native_asan.sh
+
+      - name: Set mmap_rnd_bits
+        if: ${{ env.CONTAINER_NAME == 'ci_native_tsan' || env.CONTAINER_NAME == 'ci_native_msan' }}
+        # Sanitizers can crash when ASLR entropy is too high (vm.mmap_rnd_bits > 28).
+        # Some runners block sysctl writes but already have a compliant value.
+        run: |
+          REQUIRED=28
+          CURRENT=$(cat /proc/sys/vm/mmap_rnd_bits 2>/dev/null) || true
+          echo "vm.mmap_rnd_bits: current=${CURRENT:-unknown}, required<=${REQUIRED}"
+          if [ -n "$CURRENT" ] && [ "$CURRENT" -le "$REQUIRED" ]; then
+            echo "PASS: value is already compliant ($CURRENT <= $REQUIRED), no write needed."
+            exit 0
+          fi
+          if sudo sysctl -w vm.mmap_rnd_bits=$REQUIRED; then
+            echo "PASS: successfully set vm.mmap_rnd_bits=$REQUIRED."
+            exit 0
+          fi
+          echo "FAIL: vm.mmap_rnd_bits=${CURRENT:-unknown} is too high and could not be lowered to $REQUIRED."
+          echo "This runner is misconfigured for sanitizer jobs."
+          exit 1
+
+      - name: CI script
+        run: ./ci/test_run_all.sh
+
+      - name: Save caches
+        uses: ./.github/actions/save-caches
+
+  lint:
+    name: 'lint'
+    needs: runners
+    runs-on: *qbit_runs_on
+    if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted'))) }}
+    timeout-minutes: 40
+    env:
+      CONTAINER_NAME: "bitcoin-linter"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: *CHECKOUT_REF_TMPL
+          fetch-depth: 0
+
+      - name: Configure Docker
+        uses: ./.github/actions/configure-docker
+        with:
+          cache-provider: ${{ needs.runners.outputs.provider }}
+          cache-from-scopes: bitcoin-linter-main,bitcoin-linter
+          cache-write-policy: always
+
+      - name: CI script
+        run: |
+          set -o xtrace
+          source ./ci/test/00_setup_env_base_image.sh
+          ci_set_base_image_name_tag "ubuntu:24.04"
+          docker buildx build -t "$CONTAINER_NAME" $DOCKER_BUILD_CACHE_ARG --build-arg "CI_IMAGE_NAME_TAG=${CI_IMAGE_NAME_TAG}" --file "./ci/lint_imagefile" .
+          CIRRUS_PR_FLAG=""
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            CIRRUS_PR_FLAG="-e CIRRUS_PR=1"
+          fi
+          # Use docker cp instead of bind mount to avoid DinD path mapping issues
+          # when runners share the host Docker socket.
+          LINT_CID=$(docker create $CIRRUS_PR_FLAG "$CONTAINER_NAME")
+          docker cp "$(pwd)/." "$LINT_CID":/bitcoin
+          docker start -a "$LINT_CID"; rc=$?
+          docker rm "$LINT_CID" || true
+          exit "$rc"
+
+  public-docs-lint:
+    name: 'public-docs-lint'
+    runs-on: ubuntu-24.04
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft != true }}
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: *CHECKOUT_REF_TMPL
+          fetch-depth: 0
+
+      - name: Run public docs lint
+        run: test/lint/lint-qbit-public-docs.py
+
+  rpc-docs:
+    name: 'rpc-docs'
+    runs-on: ubuntu-24.04
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft != true }}
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: *CHECKOUT_REF_TMPL
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            pkgconf \
+            python3 \
+            python3-pip \
+            libboost-dev \
+            libevent-dev \
+            libsqlite3-dev \
+            libzmq3-dev
+
+      - name: Install Python packages
+        run: |
+          if [[ -f doc/rpc/requirements.txt ]]; then
+            pip3 install --break-system-packages -r doc/rpc/requirements.txt
+          else
+            pip3 install --break-system-packages mkdocs PyYAML
+          fi
+
+      - name: Configure build
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DBUILD_GUI=OFF \
+            -DBUILD_TESTS=OFF \
+            -DBUILD_BENCH=OFF \
+            -DENABLE_IPC=OFF \
+            -DWITH_ZMQ=ON
+
+      - name: Build rpc docs
+        run: cmake --build build --target rpcdocs -j"$(nproc)"
+
+      - name: Validate rpc docs outputs
+        run: |
+          test -f build/doc/rpc-site/index.html
+          test -f build/doc/rpc-site/search/search_index.json
+          test -f build/doc/rpc-site/assets/qbit.svg
+          test -f build/doc/rpc/rpc-docs.json
+          test -f build/doc/rpc/rpc-docs-build-meta.json
+          if grep -R -nE "(href|src)=[\"']/" build/doc/rpc-site; then
+            echo "Found root-relative asset paths in build/doc/rpc-site"
+            exit 1
+          fi
+          if grep -R -nE "url\([[:space:]]*[\"']?/" build/doc/rpc-site; then
+            echo "Found root-relative CSS asset paths in build/doc/rpc-site"
+            exit 1
+          fi
+          if grep -R -nE 'cdn\.jsdelivr|unpkg\.com|cdnjs\.cloudflare\.com' build/doc/rpc-site; then
+            echo "Found external CDN dependency in build/doc/rpc-site"
+            exit 1
+          fi
+
+      - name: Validate install layout
+        run: |
+          cmake --install build --prefix "${RUNNER_TEMP}/rpcdocs-install" --component rpcdocs
+          test -f "${RUNNER_TEMP}/rpcdocs-install/share/doc/qbit/rpc/index.html"
+          test -f "${RUNNER_TEMP}/rpcdocs-install/share/doc/qbit/rpc/data/rpc-docs.json"
+          test -f "${RUNNER_TEMP}/rpcdocs-install/share/doc/qbit/rpc/data/rpc-docs-build-meta.json"
+
+      - name: Upload site artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpc-docs-site
+          if-no-files-found: error
+          path: |
+            build/doc/rpc-site/**
+
+      - name: Upload data artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpc-docs-data
+          if-no-files-found: error
+          path: |
+            build/doc/rpc/**
+
+  full-validation-gate:
+    name: 'Full Validation Gate'
+    runs-on: ubuntu-24.04
+    needs:
+      - runners
+      - windows-native-dll
+      - windows-cross
+      - windows-native-test
+      - ci-matrix
+      - lint
+      - public-docs-lint
+      - rpc-docs
+    if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.draft != true) }}
+    steps:
+      - name: Require trusted label for fork PRs
+        if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && !contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted') }}
+        run: |
+          echo "::error title=Full Validation blocked::Fork pull requests into main must have the ci:qbit-trusted label before self-hosted validation jobs can run."
+          exit 1
+
+      - name: Check validation results
+        env:
+          RUNNERS_RESULT: ${{ needs.runners.result }}
+          WINDOWS_NATIVE_DLL_RESULT: ${{ needs.windows-native-dll.result }}
+          WINDOWS_CROSS_RESULT: ${{ needs.windows-cross.result }}
+          WINDOWS_NATIVE_TEST_RESULT: ${{ needs.windows-native-test.result }}
+          CI_MATRIX_RESULT: ${{ needs.ci-matrix.result }}
+          LINT_RESULT: ${{ needs.lint.result }}
+          PUBLIC_DOCS_LINT_RESULT: ${{ needs.public-docs-lint.result }}
+          RPC_DOCS_RESULT: ${{ needs.rpc-docs.result }}
+        run: |
+          set -euo pipefail
+
+          failed=0
+          check_result() {
+            local name="$1"
+            local result="$2"
+
+            echo "${name}: ${result}"
+            if [[ "${result}" != "success" ]]; then
+              echo "::error title=Full Validation failed::${name} result was ${result}."
+              failed=1
+            fi
+          }
+
+          check_result "determine runners" "${RUNNERS_RESULT}"
+          check_result "Windows native DLL" "${WINDOWS_NATIVE_DLL_RESULT}"
+          check_result "Linux->Windows cross" "${WINDOWS_CROSS_RESULT}"
+          check_result "Windows cross-built tests" "${WINDOWS_NATIVE_TEST_RESULT}"
+          check_result "CI matrix" "${CI_MATRIX_RESULT}"
+          check_result "lint" "${LINT_RESULT}"
+          check_result "public docs lint" "${PUBLIC_DOCS_LINT_RESULT}"
+          check_result "rpc docs" "${RPC_DOCS_RESULT}"
+
+          exit "${failed}"

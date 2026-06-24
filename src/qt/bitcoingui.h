@@ -121,7 +121,8 @@ private:
     WalletFrame* walletFrame = nullptr;
 
     UnitDisplayStatusBarControl* unitDisplayControl = nullptr;
-    GUIUtil::ThemedLabel* labelWalletEncryptionIcon = nullptr;
+    QLabel* m_client_version_label = nullptr;
+    GUIUtil::ClickableLabel* labelWalletEncryptionIcon = nullptr;
     GUIUtil::ThemedLabel* labelWalletHDStatusIcon = nullptr;
     GUIUtil::ClickableLabel* labelProxyIcon = nullptr;
     GUIUtil::ClickableLabel* connectionsControl = nullptr;
@@ -129,6 +130,8 @@ private:
     QLabel* progressBarLabel = nullptr;
     GUIUtil::ClickableProgressBar* progressBar = nullptr;
     QProgressDialog* progressDialog = nullptr;
+    bool m_chain_sync_progress_visible{false};
+    bool m_wallet_pqc_validation_progress_visible{false};
 
     QMenuBar* appMenuBar = nullptr;
     QToolBar* appToolBar = nullptr;
@@ -209,6 +212,7 @@ private:
 
     /** Update UI with latest network info from model. */
     void updateNetworkState();
+    void updateClientVersionLabelColor();
 
     void updateHeadersSyncProgressLabel();
     void updateHeadersPresyncProgressLabel(int64_t height, const QDateTime& blockDate);
@@ -257,6 +261,7 @@ private:
        @see WalletModel::EncryptionStatus
     */
     void setEncryptionStatus(int status);
+    void updateWalletPQCValidationStatus();
 
     /** Set the hd-enabled status as shown in the UI.
      @param[in] hdEnabled         current hd enabled status

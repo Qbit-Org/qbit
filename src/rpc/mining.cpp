@@ -1295,6 +1295,8 @@ static RPCHelpMan createauxblock()
                 {RPCResult::Type::NUM, "coinbasevalue", "The total coinbase value in satoshis, including fees."},
                 {RPCResult::Type::STR_HEX, "bits", "The compact target for the candidate block."},
                 {RPCResult::Type::NUM, "height", "The candidate block height."},
+                {RPCResult::Type::STR, "commitmentorder", "The AuxPoW commitment byte order required for this candidate: \"internal\" or \"display\"."},
+                {RPCResult::Type::NUM, "commitmentactivationheight", "The height at which display byte order becomes active."},
                 {RPCResult::Type::STR_HEX, "target", "The expanded target for the candidate block."},
             },
         },
@@ -1351,6 +1353,7 @@ static RPCHelpMan createauxblock()
 
     const uint256 aux_hash{block.GetHash()};
     const arith_uint256 hash_target = arith_uint256().SetCompact(block.nBits);
+    const bool display_commitment{consensusParams.AuxpowDisplayCommitmentActiveAtHeight(height)};
 
     PruneAuxBlockCache(active_tip_hash, GetAuxBlockTemplateExpiry(args));
     StoreCachedAuxBlock(aux_hash, block, GetAuxBlockTemplateCacheLimit(args));
@@ -1362,6 +1365,8 @@ static RPCHelpMan createauxblock()
     result.pushKV("coinbasevalue", static_cast<int64_t>(block.vtx.at(0)->GetValueOut()));
     result.pushKV("bits", strprintf("%08x", block.nBits));
     result.pushKV("height", height);
+    result.pushKV("commitmentorder", display_commitment ? "display" : "internal");
+    result.pushKV("commitmentactivationheight", consensusParams.nAuxpowDisplayCommitmentHeight);
     result.pushKV("target", hash_target.GetHex());
     return result;
 },

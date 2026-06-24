@@ -22,6 +22,7 @@ namespace Ui {
 
 QT_BEGIN_NAMESPACE
 class QModelIndex;
+class QEvent;
 class QPaintEvent;
 class QResizeEvent;
 QT_END_NAMESPACE
@@ -32,6 +33,7 @@ public:
     explicit OverviewLogoOverlay(QWidget* parent = nullptr);
 
 protected:
+    void changeEvent(QEvent* event) override;
     void paintEvent(QPaintEvent* event) override;
 };
 

@@ -17,6 +17,7 @@ private Q_SLOTS:
     void hiddenTipUpdateResetsStaleEtaWhenShown();
     void repeatedVisibleTipUpdatesReuseVisibleState();
     void progressSampleHistoryIsBounded();
+    void incompleteProgressDoesNotRoundToComplete();
 };
 
 #endif // QBIT_QT_TEST_MODALOVERLAYTESTS_H

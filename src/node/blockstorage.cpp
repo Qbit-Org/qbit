@@ -152,7 +152,7 @@ bool BlockTreeDB::LoadBlockIndexGuts(const Consensus::Params& consensusParams, s
                 if (header.SignalsAuxpow()) {
                     // Older block index entries may not persist the auxpow payload yet.
                     if (header.HasAuxpow()) {
-                        if (const auto error = auxpow::Validate(header, consensusParams)) {
+                        if (const auto error = auxpow::Validate(header, consensusParams, /*check_pow=*/true, auxpow::CommitmentValidationForHeight(consensusParams, pindexNew->nHeight))) {
                             LogError("%s: AuxPoW validation failed: %s (%s)\n",
                                      __func__,
                                      error->reject_reason,
@@ -534,10 +534,10 @@ bool BlockManager::WriteBlockIndexDB()
     return true;
 }
 
-bool BlockManager::LoadBlockIndexDB(const std::optional<uint256>& snapshot_blockhash)
+BlockIndexLoadResult BlockManager::LoadBlockIndexDB(const std::optional<uint256>& snapshot_blockhash)
 {
     if (!LoadBlockIndex(snapshot_blockhash)) {
-        return false;
+        return BlockIndexLoadResult::FAILURE;
     }
     int max_blockfile_num{0};
 
@@ -573,8 +573,12 @@ bool BlockManager::LoadBlockIndexDB(const std::optional<uint256>& snapshot_block
     for (std::set<int>::iterator it = setBlkDataFiles.begin(); it != setBlkDataFiles.end(); it++) {
         FlatFilePos pos(*it, 0);
         if (OpenBlockFile(pos, /*fReadOnly=*/true).IsNull()) {
-            return false;
+            return BlockIndexLoadResult::FAILURE;
         }
+    }
+
+    if (const auto result{UpgradeLegacyAuxpowBlockIndexEntries()}; result != BlockIndexLoadResult::SUCCESS) {
+        return result;
     }
 
     {
@@ -601,7 +605,55 @@ bool BlockManager::LoadBlockIndexDB(const std::optional<uint256>& snapshot_block
     m_block_tree_db->ReadReindexing(fReindexing);
     if (fReindexing) m_blockfiles_indexed = false;
 
-    return true;
+    return BlockIndexLoadResult::SUCCESS;
+}
+
+BlockIndexLoadResult BlockManager::UpgradeLegacyAuxpowBlockIndexEntries()
+{
+    AssertLockHeld(::cs_main);
+
+    size_t recovered_payloads{0};
+    for (auto& [hash, index] : m_block_index) {
+        if (!index.SignalsAuxpow() || index.auxpow) {
+            continue;
+        }
+
+        if (!(index.nStatus & BLOCK_HAVE_DATA)) {
+            LogError("%s: legacy AuxPoW block index entry at height %d (%s) is missing both auxpow payload and block data; a one-time full reindex/resync is required to redownload and revalidate\n",
+                     __func__,
+                     index.nHeight,
+                     hash.ToString());
+            return BlockIndexLoadResult::LEGACY_AUXPOW_REQUIRES_REINDEX;
+        }
+
+        CBlock block;
+        if (!ReadBlock(block, index)) {
+            LogError("%s: failed to read and validate legacy AuxPoW block index entry at height %d (%s)\n",
+                     __func__,
+                     index.nHeight,
+                     hash.ToString());
+            return BlockIndexLoadResult::FAILURE;
+        }
+        if (!block.HasAuxpow()) {
+            LogError("%s: legacy AuxPoW block index entry at height %d (%s) points to block data without auxpow payload\n",
+                     __func__,
+                     index.nHeight,
+                     hash.ToString());
+            return BlockIndexLoadResult::FAILURE;
+        }
+
+        index.auxpow = block.auxpow;
+        m_dirty_blockindex.insert(&index);
+        ++recovered_payloads;
+    }
+
+    if (recovered_payloads > 0) {
+        LogInfo("%s: recovered and validated %u legacy AuxPoW block index payloads\n",
+                __func__,
+                static_cast<unsigned int>(recovered_payloads));
+    }
+
+    return BlockIndexLoadResult::SUCCESS;
 }
 
 void BlockManager::ScanAndUnlinkAlreadyPrunedFiles()
@@ -1674,7 +1726,20 @@ bool BlockManager::ReadBlock(CBlock& block, const FlatFilePos& pos, const std::o
 bool BlockManager::ReadBlock(CBlock& block, const CBlockIndex& index) const
 {
     const FlatFilePos block_pos{WITH_LOCK(cs_main, return index.GetBlockPos())};
-    return ReadBlock(block, block_pos, index.GetBlockHash());
+    if (!ReadBlock(block, block_pos, index.GetBlockHash())) {
+        return false;
+    }
+
+    if (const auto error = auxpow::Validate(block, GetConsensus(), /*check_pow=*/true, auxpow::CommitmentValidationForHeight(GetConsensus(), index.nHeight))) {
+        LogError("Errors in block header at %s while reading block at height %d: %s (%s)",
+                 block_pos.ToString(),
+                 index.nHeight,
+                 error->reject_reason,
+                 error->debug_message);
+        return false;
+    }
+
+    return true;
 }
 
 bool BlockManager::ReadRawBlock(std::vector<std::byte>& block, const FlatFilePos& pos) const

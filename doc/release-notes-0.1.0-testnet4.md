@@ -209,7 +209,7 @@ Notable changes
   the node no longer has the needed witness data.
 - P2P sync handling preserves AuxPoW payloads during headers presync and
   redownload while bounding retained serialized AuxPoW bytes. Validated block
-  download timeouts have been retuned for Qbit's slower block-validation paths.
+  download timeouts have been adjusted for Qbit's slower block-validation paths.
 
 ### PHOTON relay
 

@@ -207,6 +207,7 @@ class IntegrationWalletHistoryTest(BitcoinTestFramework):
         self.log.info("A full-history signer wallet can restore the old backup, recover history, and spend again")
         restore_node.restorewallet("restored_source", backup_file)
         restored_wallet = restore_node.get_wallet_rpc("restored_source")
+        self.wait_pqc_key_validation_ready(restored_wallet)
         assert_equal(restored_wallet.getaddressinfo(receive_addr)["ismine"], True)
         assert_equal(restored_wallet.getaddressinfo(change_addr)["ischange"], True)
         assert_greater_than(restored_wallet.gettransaction(incoming_txid)["confirmations"], 0)

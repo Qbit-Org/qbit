@@ -9,6 +9,7 @@
 #include <consensus/amount.h>
 #include <consensus/validation.h>
 #include <interfaces/chain.h>
+#include <logging.h>
 #include <node/types.h>
 #include <numeric>
 #include <policy/policy.h>
@@ -22,6 +23,8 @@
 #include <util/check.h>
 #include <util/moneystr.h>
 #include <util/rbf.h>
+#include <util/signing_timing.h>
+#include <util/time.h>
 #include <util/trace.h>
 #include <util/translation.h>
 #include <wallet/coincontrol.h>
@@ -1449,7 +1452,8 @@ util::Result<CreatedTransactionResult> CreateTransaction(
         std::optional<unsigned int> change_pos,
         const CCoinControl& coin_control,
         bool sign,
-        const PQCSignatureCounterObserver& pqc_counter_observer)
+        const PQCSignatureCounterObserver& pqc_counter_observer,
+        const SigningProgressCallback& progress_callback)
 {
     if (vecSend.empty()) {
         return util::Error{_("Transaction must have at least one recipient")};
@@ -1459,12 +1463,45 @@ util::Result<CreatedTransactionResult> CreateTransaction(
         return util::Error{_("Transaction amounts must not be negative")};
     }
 
+    const bool timing_enabled{util::signing_timing::Enabled()};
+    const uint64_t timing_id{timing_enabled ? util::signing_timing::CurrentOrNextId() : 0};
+    const util::signing_timing::ScopedId timing_scope{timing_id};
+    const auto timing_start{SteadyClock::now()};
+    SteadyClock::duration normal_create_time{};
+    SteadyClock::duration aps_create_time{};
+    SteadyClock::duration final_sign_time{};
+    SteadyClock::duration chain_check_time{};
+    bool aps_attempted{false};
+    bool aps_used{false};
+    const auto log_create_timing = [&](bool success, const char* status, unsigned int inputs, unsigned int outputs) {
+        if (!timing_enabled) return;
+        LogDebug(BCLog::BENCH,
+            "wallet-sign-timing id=%llu phase=create_tx sign=%d recipients=%u inputs=%u outputs=%u "
+            "normal_create_ms=%.2f aps_attempted=%d aps_used=%d aps_create_ms=%.2f final_sign_ms=%.2f "
+            "chain_check_ms=%.2f total_ms=%.2f success=%d status=%s\n",
+            util::signing_timing::LogId(timing_id),
+            sign,
+            static_cast<unsigned int>(vecSend.size()),
+            inputs,
+            outputs,
+            Ticks<MillisecondsDouble>(normal_create_time),
+            aps_attempted,
+            aps_used,
+            Ticks<MillisecondsDouble>(aps_create_time),
+            Ticks<MillisecondsDouble>(final_sign_time),
+            Ticks<MillisecondsDouble>(chain_check_time),
+            Ticks<MillisecondsDouble>(SteadyClock::now() - timing_start),
+            success,
+            status);
+    };
+
     std::optional<CreatedTransactionResult> txr_to_return;
     std::vector<std::unique_ptr<ReserveDestination>> successful_reservations;
     {
         LOCK(wallet.cs_wallet);
 
         auto reservedest = MakeReserveDestination(wallet, vecSend, coin_control);
+        const auto normal_create_start{SteadyClock::now()};
         auto res = CreateTransactionInternal(
             wallet,
             vecSend,
@@ -1474,18 +1511,23 @@ util::Result<CreatedTransactionResult> CreateTransaction(
             PQCSignatureCounterObserver{},
             *reservedest,
             /*check_chain_limits=*/!sign);
+        normal_create_time = SteadyClock::now() - normal_create_start;
         TRACEPOINT(coin_selection, normal_create_tx_internal,
                wallet.GetName().c_str(),
                bool(res),
                res ? res->fee : 0,
                res && res->change_pos.has_value() ? int32_t(*res->change_pos) : -1);
-        if (!res) return util::Error{util::ErrorString(res)};
+        if (!res) {
+            log_create_timing(/*success=*/false, "normal_create_failed", /*inputs=*/0, /*outputs=*/0);
+            return util::Error{util::ErrorString(res)};
+        }
         successful_reservations.push_back(std::move(reservedest));
         const auto& txr_ungrouped = *res;
         txr_to_return.emplace(txr_ungrouped.tx, txr_ungrouped.fee, txr_ungrouped.change_pos, txr_ungrouped.fee_calc);
 
         // try with avoidpartialspends unless it's enabled already
         if (txr_ungrouped.fee > 0 /* 0 means non-functional fee rate estimation */ && wallet.m_max_aps_fee > -1 && !coin_control.m_avoid_partial_spends) {
+            aps_attempted = true;
             TRACEPOINT(coin_selection, attempting_aps_create_tx, wallet.GetName().c_str());
             CCoinControl tmp_cc = coin_control;
             tmp_cc.m_avoid_partial_spends = true;
@@ -1496,6 +1538,7 @@ util::Result<CreatedTransactionResult> CreateTransaction(
             }
 
             auto grouped_reservedest = MakeReserveDestination(wallet, vecSend, tmp_cc);
+            const auto aps_create_start{SteadyClock::now()};
             auto txr_grouped = CreateTransactionInternal(
                 wallet,
                 vecSend,
@@ -1505,6 +1548,7 @@ util::Result<CreatedTransactionResult> CreateTransaction(
                 PQCSignatureCounterObserver{},
                 *grouped_reservedest,
                 /*check_chain_limits=*/!sign);
+            aps_create_time = SteadyClock::now() - aps_create_start;
             // if fee of this alternative one is within the range of the max fee, we use this one
             const bool use_aps{txr_grouped.has_value() ? (txr_grouped->fee <= txr_ungrouped.fee + wallet.m_max_aps_fee) : false};
             TRACEPOINT(coin_selection, aps_create_tx_internal,
@@ -1519,6 +1563,7 @@ util::Result<CreatedTransactionResult> CreateTransaction(
                     txr_ungrouped.fee, txr_grouped->fee, use_aps ? "grouped" : "non-grouped");
                 if (use_aps) {
                     txr_to_return.emplace(txr_grouped->tx, txr_grouped->fee, txr_grouped->change_pos, txr_grouped->fee_calc);
+                    aps_used = true;
                 }
             }
         }
@@ -1529,21 +1574,46 @@ util::Result<CreatedTransactionResult> CreateTransaction(
         for (const auto& reservation : successful_reservations) {
             reservation->KeepDestination();
         }
+        log_create_timing(
+            /*success=*/true,
+            "unsigned",
+            static_cast<unsigned int>(txr_to_return->tx->vin.size()),
+            static_cast<unsigned int>(txr_to_return->tx->vout.size()));
         return *txr_to_return;
     }
 
     CMutableTransaction signed_tx{*txr_to_return->tx};
-    if (!wallet.SignTransaction(signed_tx, pqc_counter_observer)) {
+    const auto final_sign_start{SteadyClock::now()};
+    if (!wallet.SignTransaction(signed_tx, pqc_counter_observer, progress_callback)) {
+        final_sign_time = SteadyClock::now() - final_sign_start;
+        log_create_timing(
+            /*success=*/false,
+            "sign_failed",
+            static_cast<unsigned int>(signed_tx.vin.size()),
+            static_cast<unsigned int>(signed_tx.vout.size()));
         return util::Error{_("Signing transaction failed")};
     }
+    final_sign_time = SteadyClock::now() - final_sign_start;
 
     CTransactionRef tx = MakeTransactionRef(std::move(signed_tx));
     if (GetTransactionWeight(*tx) > MAX_STANDARD_TX_WEIGHT) {
+        log_create_timing(
+            /*success=*/false,
+            "too_large",
+            static_cast<unsigned int>(tx->vin.size()),
+            static_cast<unsigned int>(tx->vout.size()));
         return util::Error{_("Transaction too large")};
     }
     if (gArgs.GetBoolArg("-walletrejectlongchains", DEFAULT_WALLET_REJECT_LONG_CHAINS)) {
+        const auto chain_check_start{SteadyClock::now()};
         auto result = wallet.chain().checkChainLimits(tx);
+        chain_check_time = SteadyClock::now() - chain_check_start;
         if (!result) {
+            log_create_timing(
+                /*success=*/false,
+                "chain_limits_failed",
+                static_cast<unsigned int>(tx->vin.size()),
+                static_cast<unsigned int>(tx->vout.size()));
             return util::Error{util::ErrorString(result)};
         }
     }
@@ -1551,6 +1621,11 @@ util::Result<CreatedTransactionResult> CreateTransaction(
     for (const auto& reservation : successful_reservations) {
         reservation->KeepDestination();
     }
+    log_create_timing(
+        /*success=*/true,
+        "signed",
+        static_cast<unsigned int>(tx->vin.size()),
+        static_cast<unsigned int>(tx->vout.size()));
     return CreatedTransactionResult(tx, txr_to_return->fee, txr_to_return->change_pos, txr_to_return->fee_calc);
 }
 

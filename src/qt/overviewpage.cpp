@@ -19,7 +19,9 @@
 #include <QAbstractItemDelegate>
 #include <QApplication>
 #include <QDateTime>
+#include <QEvent>
 #include <QPainter>
+#include <QPalette>
 #include <QPixmap>
 #include <QStatusTipEvent>
 
@@ -31,6 +33,16 @@
 
 Q_DECLARE_METATYPE(interfaces::WalletBalances)
 
+namespace {
+const QPixmap& OverviewBackgroundLogo(const QPalette& palette)
+{
+    static const QPixmap dark_logo(QStringLiteral(":/icons/overview-background-logo-dark"));
+    static const QPixmap light_logo(QStringLiteral(":/icons/overview-background-logo-light"));
+
+    return palette.color(QPalette::Window).lightness() < 128 ? light_logo : dark_logo;
+}
+} // namespace
+
 OverviewLogoOverlay::OverviewLogoOverlay(QWidget* parent) :
     QWidget(parent)
 {
@@ -38,11 +50,20 @@ OverviewLogoOverlay::OverviewLogoOverlay(QWidget* parent) :
     setAttribute(Qt::WA_NoSystemBackground);
 }
 
+void OverviewLogoOverlay::changeEvent(QEvent* event)
+{
+    if (event->type() == QEvent::PaletteChange || event->type() == QEvent::ApplicationPaletteChange) {
+        update();
+    }
+
+    QWidget::changeEvent(event);
+}
+
 void OverviewLogoOverlay::paintEvent(QPaintEvent* event)
 {
     QWidget::paintEvent(event);
 
-    static const QPixmap background_logo(QStringLiteral(":/icons/overview-background-logo"));
+    const QPixmap& background_logo = OverviewBackgroundLogo(palette());
     if (background_logo.isNull()) return;
 
     QPainter painter(this);

@@ -34,6 +34,7 @@
 
 #include <chain.h>
 #include <chainparams.h>
+#include <clientversion.h>
 #include <common/system.h>
 #include <interfaces/handler.h>
 #include <interfaces/node.h>
@@ -47,6 +48,7 @@
 #include <QAction>
 #include <QActionGroup>
 #include <QApplication>
+#include <QColor>
 #include <QComboBox>
 #include <QCursor>
 #include <QDateTime>
@@ -58,6 +60,7 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QMimeData>
+#include <QPalette>
 #include <QProgressDialog>
 #include <QScreen>
 #include <QSettings>
@@ -72,6 +75,21 @@
 #include <QVBoxLayout>
 #include <QWindow>
 
+#include <algorithm>
+
+namespace {
+QColor MutedStatusBarTextColor(const QPalette& palette)
+{
+    const QColor text_color{palette.color(QPalette::WindowText)};
+    const QColor background_color{palette.color(QPalette::Window)};
+    static constexpr double text_weight{0.55};
+    static constexpr double background_weight{1.0 - text_weight};
+    return QColor{
+        static_cast<int>(text_color.red() * text_weight + background_color.red() * background_weight),
+        static_cast<int>(text_color.green() * text_weight + background_color.green() * background_weight),
+        static_cast<int>(text_color.blue() * text_weight + background_color.blue() * background_weight)};
+}
+} // namespace
 
 const std::string BitcoinGUI::DEFAULT_UIPLATFORM =
 #if defined(Q_OS_MACOS)
@@ -163,14 +181,20 @@ BitcoinGUI::BitcoinGUI(interfaces::Node& node, const PlatformStyle *_platformSty
     frameBlocksLayout->setContentsMargins(3,0,3,0);
     frameBlocksLayout->setSpacing(3);
     unitDisplayControl = new UnitDisplayStatusBarControl(platformStyle);
-    labelWalletEncryptionIcon = new GUIUtil::ThemedLabel(platformStyle);
+    m_client_version_label = new QLabel(QString::fromStdString(FormatFullVersion()), frameBlocks);
+    m_client_version_label->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    m_client_version_label->setToolTip(tr("Client version"));
+    updateClientVersionLabelColor();
+    labelWalletEncryptionIcon = new GUIUtil::ClickableLabel(platformStyle);
     labelWalletHDStatusIcon = new GUIUtil::ThemedLabel(platformStyle);
     labelProxyIcon = new GUIUtil::ClickableLabel(platformStyle);
     connectionsControl = new GUIUtil::ClickableLabel(platformStyle);
     labelBlocksIcon = new GUIUtil::ClickableLabel(platformStyle);
+    frameBlocksLayout->addStretch();
+    frameBlocksLayout->addWidget(m_client_version_label);
     if(enableWallet)
     {
-        frameBlocksLayout->addStretch();
+        frameBlocksLayout->addSpacing(6);
         frameBlocksLayout->addWidget(unitDisplayControl);
         frameBlocksLayout->addStretch();
         frameBlocksLayout->addWidget(labelWalletEncryptionIcon);
@@ -216,6 +240,11 @@ BitcoinGUI::BitcoinGUI(interfaces::Node& node, const PlatformStyle *_platformSty
 
     connect(labelProxyIcon, &GUIUtil::ClickableLabel::clicked, [this] {
         openOptionsDialogWithTab(OptionsDialog::TAB_NETWORK);
+    });
+    connect(labelWalletEncryptionIcon, &GUIUtil::ClickableLabel::clicked, [this] {
+        if (encryptWalletAction && encryptWalletAction->isEnabled()) {
+            encryptWalletAction->trigger();
+        }
     });
 
     connect(labelBlocksIcon, &GUIUtil::ClickableLabel::clicked, this, &BitcoinGUI::showModalOverlay);
@@ -763,6 +792,7 @@ void BitcoinGUI::addWallet(WalletModel* walletModel)
         this->message(title, message, style);
     });
     connect(wallet_view, &WalletView::encryptionStatusChanged, this, &BitcoinGUI::updateWalletStatus);
+    connect(walletModel, &WalletModel::pqcKeyValidationChanged, this, &BitcoinGUI::updateWalletStatus);
     connect(wallet_view, &WalletView::incomingTransaction, this, &BitcoinGUI::incomingTransaction);
     connect(this, &BitcoinGUI::setPrivacy, wallet_view, &WalletView::setPrivacy);
     const bool privacy = isPrivacyModeActivated();
@@ -1049,6 +1079,15 @@ void BitcoinGUI::updateNetworkState()
     connectionsControl->setThemedPixmap(icon, STATUSBAR_ICONSIZE, STATUSBAR_ICONSIZE);
 }
 
+void BitcoinGUI::updateClientVersionLabelColor()
+{
+    if (!m_client_version_label) return;
+
+    QPalette palette{m_client_version_label->palette()};
+    palette.setColor(QPalette::WindowText, MutedStatusBarTextColor(statusBar()->palette()));
+    m_client_version_label->setPalette(palette);
+}
+
 void BitcoinGUI::setNumConnections(int count)
 {
     updateNetworkState();
@@ -1080,7 +1119,7 @@ void BitcoinGUI::updateHeadersSyncProgressLabel()
     int headersTipHeight = clientModel->getHeaderTipHeight();
     int estHeadersLeft = (GetTime() - headersTipTime) / Params().GetConsensus().nPowTargetSpacing;
     if (estHeadersLeft > HEADER_HEIGHT_DELTA_SYNC)
-        progressBarLabel->setText(tr("Syncing Headers (%1%)…").arg(QString::number(100.0 / (headersTipHeight+estHeadersLeft)*headersTipHeight, 'f', 1)));
+        progressBarLabel->setText(tr("Syncing Headers (%1%)…").arg(GUIUtil::formatSyncPercentage(static_cast<double>(headersTipHeight) / (headersTipHeight + estHeadersLeft), /*decimals=*/1, /*incomplete=*/true)));
 }
 
 void BitcoinGUI::updateHeadersPresyncProgressLabel(int64_t height, const QDateTime& blockDate)
@@ -1088,7 +1127,7 @@ void BitcoinGUI::updateHeadersPresyncProgressLabel(int64_t height, const QDateTi
     int estHeadersLeft = blockDate.secsTo(QDateTime::currentDateTime()) / Params().GetConsensus().nPowTargetSpacing;
     const int64_t headers_estimate{height + estHeadersLeft};
     if (estHeadersLeft > HEADER_HEIGHT_DELTA_SYNC && headers_estimate > 0) {
-        progressBarLabel->setText(tr("Pre-syncing Headers (%1%)…").arg(QString::number(100.0 / headers_estimate * height, 'f', 1)));
+        progressBarLabel->setText(tr("Pre-syncing Headers (%1%)…").arg(GUIUtil::formatSyncPercentage(static_cast<double>(height) / headers_estimate, /*decimals=*/1, /*incomplete=*/true)));
     } else {
         progressBarLabel->setText(tr("Pre-syncing Headers…"));
     }
@@ -1143,6 +1182,8 @@ void BitcoinGUI::setNumBlocks(int count, const QDateTime& blockDate, double nVer
     statusBar()->clearMessage();
 
     if (synctype == SyncType::HEADER_PRESYNC) {
+        m_chain_sync_progress_visible = true;
+        m_wallet_pqc_validation_progress_visible = false;
         m_headers_presync_active = true;
         m_headers_presync_height = count;
         m_headers_presync_block_date = blockDate;
@@ -1152,6 +1193,8 @@ void BitcoinGUI::setNumBlocks(int count, const QDateTime& blockDate, double nVer
 
     const bool show_headers_presync{m_headers_presync_active};
     if (show_headers_presync && synctype == SyncType::HEADER_SYNC) {
+        m_chain_sync_progress_visible = true;
+        m_wallet_pqc_validation_progress_visible = false;
         updateHeadersPresyncProgressLabel(m_headers_presync_height, m_headers_presync_block_date);
         return;
     }
@@ -1161,6 +1204,8 @@ void BitcoinGUI::setNumBlocks(int count, const QDateTime& blockDate, double nVer
     switch (blockSource) {
         case BlockSource::NETWORK:
             if (synctype == SyncType::HEADER_SYNC) {
+                m_chain_sync_progress_visible = true;
+                m_wallet_pqc_validation_progress_visible = false;
                 updateHeadersSyncProgressLabel();
                 return;
             }
@@ -1192,7 +1237,7 @@ void BitcoinGUI::setNumBlocks(int count, const QDateTime& blockDate, double nVer
     tooltip = tr("Processed %n block(s) of transaction history.", "", count);
 
     // Set icon state: spinning if catching up, tick otherwise
-    if (secs < MAX_BLOCK_TIME_GAP) {
+        if (secs < MAX_BLOCK_TIME_GAP) {
         tooltip = tr("Up to date") + QString(".<br>") + tooltip;
         labelBlocksIcon->setThemedPixmap(QStringLiteral(":/icons/synced"), STATUSBAR_ICONSIZE, STATUSBAR_ICONSIZE);
 
@@ -1206,6 +1251,7 @@ void BitcoinGUI::setNumBlocks(int count, const QDateTime& blockDate, double nVer
 
         progressBarLabel->setVisible(false);
         progressBar->setVisible(false);
+        m_chain_sync_progress_visible = false;
     }
     else
     {
@@ -1213,9 +1259,14 @@ void BitcoinGUI::setNumBlocks(int count, const QDateTime& blockDate, double nVer
 
         progressBarLabel->setVisible(true);
         progressBar->setFormat(tr("%1 behind").arg(timeBehindText));
-        progressBar->setMaximum(1000000000);
-        progressBar->setValue(nVerificationProgress * 1000000000.0 + 0.5);
+        // Keep the stale-tip bar visibly below full while catch-up is incomplete.
+        static constexpr int PROGRESS_BAR_MAX{100};
+        progressBar->setMaximum(PROGRESS_BAR_MAX);
+        const int progress_bar_value{static_cast<int>(std::clamp(nVerificationProgress, 0.0, 1.0) * PROGRESS_BAR_MAX + 0.5)};
+        progressBar->setValue(std::min(progress_bar_value, PROGRESS_BAR_MAX - 1));
         progressBar->setVisible(true);
+        m_chain_sync_progress_visible = true;
+        m_wallet_pqc_validation_progress_visible = false;
 
         tooltip = tr("Catching up…") + QString("<br>") + tooltip;
         if(count != prevBlocks)
@@ -1247,6 +1298,10 @@ void BitcoinGUI::setNumBlocks(int count, const QDateTime& blockDate, double nVer
     labelBlocksIcon->setToolTip(tooltip);
     progressBarLabel->setToolTip(tooltip);
     progressBar->setToolTip(tooltip);
+
+#ifdef ENABLE_WALLET
+    if (!m_chain_sync_progress_visible) updateWalletPQCValidationStatus();
+#endif
 }
 
 void BitcoinGUI::createWallet()
@@ -1326,6 +1381,7 @@ void BitcoinGUI::changeEvent(QEvent *e)
         sendCoinsAction->setIcon(platformStyle->SingleColorIcon(QStringLiteral(":/icons/send")));
         receiveCoinsAction->setIcon(platformStyle->SingleColorIcon(QStringLiteral(":/icons/receiving_addresses")));
         historyAction->setIcon(platformStyle->SingleColorIcon(QStringLiteral(":/icons/history")));
+        updateClientVersionLabelColor();
     }
 
     QMainWindow::changeEvent(e);
@@ -1487,6 +1543,57 @@ void BitcoinGUI::setEncryptionStatus(int status)
     }
 }
 
+void BitcoinGUI::updateWalletPQCValidationStatus()
+{
+    if (!walletFrame) return;
+    WalletView* const walletView = walletFrame->currentWalletView();
+    if (!walletView) return;
+    WalletModel* const walletModel = walletView->getWalletModel();
+    const wallet::PQCKeyValidationInfo info{walletModel->getPQCKeyValidationInfo()};
+
+    if (walletModel->getEncryptionStatus() == WalletModel::Unencrypted) {
+        encryptWalletAction->setEnabled(!info.signing_blocked);
+    }
+
+    const bool show_pqc_warning{info.encryption_recommended || info.signing_blocked};
+    if (walletModel->getEncryptionStatus() == WalletModel::Unencrypted && show_pqc_warning) {
+        labelWalletEncryptionIcon->show();
+        labelWalletEncryptionIcon->setThemedPixmap(QStringLiteral(":/icons/warning"), STATUSBAR_ICONSIZE, STATUSBAR_ICONSIZE);
+        if (info.failed_records > 0) {
+            labelWalletEncryptionIcon->setToolTip(tr("Plaintext PQC key validation failed. Wallet signing and encryption are disabled until the wallet is restored or repaired."));
+        } else if (info.pending_records > 0) {
+            labelWalletEncryptionIcon->setToolTip(tr("Wallet is unencrypted. qbit is validating plaintext PQC keys before spending is enabled. Encrypt this wallet after validation completes to enable authenticated fast loads."));
+        } else {
+            labelWalletEncryptionIcon->setToolTip(tr("Wallet is unencrypted. qbit validates PQC keys every time this wallet loads. Encrypt wallet to enable authenticated fast loads."));
+        }
+    }
+
+    if (m_chain_sync_progress_visible) {
+        return;
+    }
+
+    if (info.pending_records > 0) {
+        progressBarLabel->setVisible(true);
+        progressBarLabel->setText(tr("Validating wallet keys..."));
+        static constexpr int PROGRESS_BAR_MAX{100};
+        progressBar->setMaximum(PROGRESS_BAR_MAX);
+        const int progress_value{static_cast<int>(std::clamp(info.progress, 0.0, 1.0) * PROGRESS_BAR_MAX + 0.5)};
+        progressBar->setValue(std::min(progress_value, PROGRESS_BAR_MAX - 1));
+        progressBar->setFormat(tr("%1%").arg(progress_value));
+        progressBar->setVisible(true);
+        const QString tooltip{tr("This wallet is unencrypted. qbit is validating plaintext PQC keys before spending is enabled. Encrypt this wallet to enable authenticated fast loads in the future.")};
+        progressBarLabel->setToolTip(tooltip);
+        progressBar->setToolTip(tooltip);
+        m_wallet_pqc_validation_progress_visible = true;
+    } else if (m_wallet_pqc_validation_progress_visible) {
+        progressBarLabel->setVisible(false);
+        progressBar->setVisible(false);
+        progressBarLabel->setToolTip({});
+        progressBar->setToolTip({});
+        m_wallet_pqc_validation_progress_visible = false;
+    }
+}
+
 void BitcoinGUI::updateWalletStatus()
 {
     assert(walletFrame);
@@ -1498,6 +1605,7 @@ void BitcoinGUI::updateWalletStatus()
     WalletModel * const walletModel = walletView->getWalletModel();
     setEncryptionStatus(walletModel->getEncryptionStatus());
     setHDStatus(walletModel->wallet().privateKeysDisabled(), walletModel->wallet().hdEnabled());
+    updateWalletPQCValidationStatus();
 }
 #endif // ENABLE_WALLET
 

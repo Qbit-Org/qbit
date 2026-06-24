@@ -770,6 +770,46 @@ BOOST_AUTO_TEST_CASE(pqc_set_rejects_inconsistent_exact_size_secrets)
     check_mutated_secret(/*pos=*/PQC_SECKEY_SIZE - 1, "pqc_set_mutated_root");
 }
 
+BOOST_AUTO_TEST_CASE(pqc_trusted_wallet_restore_checks_persisted_pubkey_boundary)
+{
+    CPQCKey original;
+    original.MakeNewKey();
+    BOOST_REQUIRE(original.IsValid());
+    const CPQCPubKey pubkey = original.GetPubKey();
+    const std::vector<unsigned char> secret{original.data(), original.data() + original.size()};
+
+    CPQCKey restored;
+    restored.SetFromTrustedWalletRecord(std::span<const unsigned char>{secret.data(), secret.size()}, pubkey);
+    BOOST_REQUIRE(restored.IsValid());
+    BOOST_CHECK(restored == original);
+    BOOST_CHECK(restored.GetPubKey() == pubkey);
+
+    CPQCKey other;
+    other.MakeNewKey();
+    BOOST_REQUIRE(other.IsValid());
+    CPQCKey mismatched_pubkey;
+    mismatched_pubkey.SetFromTrustedWalletRecord(std::span<const unsigned char>{secret.data(), secret.size()}, other.GetPubKey());
+    CheckInvalidPQCKey(mismatched_pubkey, "pqc_trusted_wallet_restore_mismatched_pubkey");
+
+    CPQCKey invalid_pubkey;
+    invalid_pubkey.SetFromTrustedWalletRecord(std::span<const unsigned char>{secret.data(), secret.size()}, CPQCPubKey{});
+    CheckInvalidPQCKey(invalid_pubkey, "pqc_trusted_wallet_restore_invalid_pubkey");
+
+    std::vector<unsigned char> mutated_seed_secret{secret};
+    mutated_seed_secret.front() ^= 0x01;
+    BOOST_REQUIRE_NE(slh_dsa_secret_key_validate(mutated_seed_secret.data(), mutated_seed_secret.size()), 0);
+
+    CPQCKey trusted_record;
+    trusted_record.SetFromTrustedWalletRecord(std::span<const unsigned char>{mutated_seed_secret.data(), mutated_seed_secret.size()}, pubkey);
+    BOOST_REQUIRE(trusted_record.IsValid());
+    BOOST_CHECK(trusted_record.GetPubKey() == pubkey);
+
+    std::vector<unsigned char> sig;
+    uint32_t counter{7};
+    BOOST_CHECK(!trusted_record.Sign(TestHash("pqc_trusted_wallet_restore_mutated_seed"), sig, counter));
+    BOOST_CHECK_EQUAL(counter, 7);
+}
+
 BOOST_AUTO_TEST_CASE(pqc_assignment_from_invalid_clears_state)
 {
     CPQCKey key;

@@ -219,6 +219,7 @@ const std::vector<std::string> RPC_COMMANDS_SAFE_FOR_FUZZING{
     "utxoupdatepsbt",
     "validateaddress",
     "verifychain",
+    "verifydatapqchash",
     "verifymessage",
     "verifytxoutproof",
     "waitforblock",

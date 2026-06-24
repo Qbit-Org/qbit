@@ -5,11 +5,14 @@
 #include <psbt.h>
 
 #include <common/types.h>
+#include <logging.h>
 #include <node/types.h>
 #include <policy/policy.h>
 #include <script/signingprovider.h>
 #include <util/check.h>
+#include <util/signing_timing.h>
 #include <util/strencodings.h>
+#include <util/time.h>
 
 using common::PSBTError;
 
@@ -423,28 +426,72 @@ PrecomputedTransactionData PrecomputePSBTData(const PartiallySignedTransaction& 
 
 PSBTError SignPSBTInput(const SigningProvider& provider, PartiallySignedTransaction& psbt, int index, const PrecomputedTransactionData* txdata, std::optional<int> sighash,  SignatureData* out_sigdata, bool finalize)
 {
+    const bool timing_enabled{util::signing_timing::Enabled() && util::signing_timing::CurrentId() != 0};
+    const uint64_t timing_id{util::signing_timing::CurrentId()};
+    const auto timing_start{SteadyClock::now()};
+    SteadyClock::duration initial_verify_time{};
+    SteadyClock::duration fill_sigdata_time{};
+    SteadyClock::duration utxo_time{};
+    SteadyClock::duration sighash_time{};
+    SteadyClock::duration produce_time{};
+    SteadyClock::duration finalize_time{};
+    bool is_p2mr{false};
+    bool sig_complete{false};
+    const auto log_psbt_input_timing = [&](PSBTError result, const char* status) {
+        if (!timing_enabled) return;
+        LogDebug(BCLog::BENCH,
+            "wallet-sign-timing id=%llu phase=psbt_sign_input input=%d p2mr=%d finalize=%d "
+            "initial_verify_ms=%.2f fill_sigdata_ms=%.2f utxo_ms=%.2f sighash_ms=%.2f "
+            "produce_ms=%.2f finalize_ms=%.2f total_ms=%.2f sig_complete=%d result=%d status=%s\n",
+            util::signing_timing::LogId(timing_id),
+            index,
+            is_p2mr,
+            finalize,
+            Ticks<MillisecondsDouble>(initial_verify_time),
+            Ticks<MillisecondsDouble>(fill_sigdata_time),
+            Ticks<MillisecondsDouble>(utxo_time),
+            Ticks<MillisecondsDouble>(sighash_time),
+            Ticks<MillisecondsDouble>(produce_time),
+            Ticks<MillisecondsDouble>(finalize_time),
+            Ticks<MillisecondsDouble>(SteadyClock::now() - timing_start),
+            sig_complete,
+            static_cast<int>(result),
+            status);
+    };
+
     PSBTInput& input = psbt.inputs.at(index);
     const CMutableTransaction& tx = *psbt.tx;
 
+    const auto initial_verify_start{SteadyClock::now()};
     if (PSBTInputSignedAndVerified(psbt, index, txdata)) {
+        initial_verify_time = SteadyClock::now() - initial_verify_start;
+        log_psbt_input_timing(PSBTError::OK, "already_signed");
         return PSBTError::OK;
     }
+    initial_verify_time = SteadyClock::now() - initial_verify_start;
 
     // Fill SignatureData with input info
     SignatureData sigdata;
+    const auto fill_sigdata_start{SteadyClock::now()};
     input.FillSignatureData(sigdata);
+    fill_sigdata_time = SteadyClock::now() - fill_sigdata_start;
 
     // Get UTXO
     bool require_witness_sig = false;
     CTxOut utxo;
 
+    const auto utxo_start{SteadyClock::now()};
     if (input.non_witness_utxo) {
         // If we're taking our information from a non-witness UTXO, verify that it matches the prevout.
         COutPoint prevout = tx.vin[index].prevout;
         if (prevout.n >= input.non_witness_utxo->vout.size()) {
+            utxo_time = SteadyClock::now() - utxo_start;
+            log_psbt_input_timing(PSBTError::MISSING_INPUTS, "invalid_prevout");
             return PSBTError::MISSING_INPUTS;
         }
         if (input.non_witness_utxo->GetHash() != prevout.hash) {
+            utxo_time = SteadyClock::now() - utxo_start;
+            log_psbt_input_timing(PSBTError::MISSING_INPUTS, "utxo_mismatch");
             return PSBTError::MISSING_INPUTS;
         }
         utxo = input.non_witness_utxo->vout[prevout.n];
@@ -456,14 +503,17 @@ PSBTError SignPSBTInput(const SigningProvider& provider, PartiallySignedTransact
         // a witness signature in this situation.
         require_witness_sig = true;
     } else {
+        utxo_time = SteadyClock::now() - utxo_start;
+        log_psbt_input_timing(PSBTError::MISSING_INPUTS, "missing_utxo");
         return PSBTError::MISSING_INPUTS;
     }
+    utxo_time = SteadyClock::now() - utxo_start;
 
     int witness_version{-1};
     std::vector<unsigned char> witness_program;
-    const bool is_p2mr = utxo.scriptPubKey.IsWitnessProgram(witness_version, witness_program) &&
-                         witness_version == 2 &&
-                         witness_program.size() == WITNESS_V2_P2MR_SIZE;
+    is_p2mr = utxo.scriptPubKey.IsWitnessProgram(witness_version, witness_program) &&
+              witness_version == 2 &&
+              witness_program.size() == WITNESS_V2_P2MR_SIZE;
     if (is_p2mr) {
         const WitnessV2P2MR output{uint256{std::span<const unsigned char>{witness_program}}};
         input.m_qbit_p2mr_merkle_root = output.GetMerkleRoot();
@@ -472,6 +522,7 @@ PSBTError SignPSBTInput(const SigningProvider& provider, PartiallySignedTransact
     const bool default_sighash_input = utxo.scriptPubKey.IsPayToTaproot() || is_p2mr;
 
     // Get the sighash type
+    const auto sighash_start{SteadyClock::now()};
     // If both the field and the parameter are provided, they must match
     // If only the parameter is provided, use it and add it to the PSBT if it is other than SIGHASH_DEFAULT
     // for all input types, and not SIGHASH_ALL for inputs that default to SIGHASH_DEFAULT.
@@ -480,6 +531,8 @@ PSBTError SignPSBTInput(const SigningProvider& provider, PartiallySignedTransact
     Assert(sighash.has_value());
     // For user safety, the desired sighash must be provided if the PSBT wants something other than the default set in the previous line.
     if (input.sighash_type && input.sighash_type != sighash) {
+        sighash_time = SteadyClock::now() - sighash_start;
+        log_psbt_input_timing(PSBTError::SIGHASH_MISMATCH, "sighash_mismatch_field");
         return PSBTError::SIGHASH_MISMATCH;
     }
     // Set the PSBT sighash field when sighash is not DEFAULT or ALL
@@ -494,49 +547,78 @@ PSBTError SignPSBTInput(const SigningProvider& provider, PartiallySignedTransact
     // Check all existing signatures use the sighash type
     if (sighash == SIGHASH_DEFAULT) {
         if (!input.m_tap_key_sig.empty() && input.m_tap_key_sig.size() != 64) {
+            sighash_time = SteadyClock::now() - sighash_start;
+            log_psbt_input_timing(PSBTError::SIGHASH_MISMATCH, "tap_key_sighash_mismatch");
             return PSBTError::SIGHASH_MISMATCH;
         }
         for (const auto& [_, sig] : input.m_tap_script_sigs) {
-            if (sig.size() != 64) return PSBTError::SIGHASH_MISMATCH;
+            if (sig.size() != 64) {
+                sighash_time = SteadyClock::now() - sighash_start;
+                log_psbt_input_timing(PSBTError::SIGHASH_MISMATCH, "tap_script_sighash_mismatch");
+                return PSBTError::SIGHASH_MISMATCH;
+            }
         }
         for (const auto& [_, sig] : input.m_qbit_p2mr_script_sigs) {
             uint8_t p2mr_hashtype;
             if (!GetP2MRSignatureHashType(sig, p2mr_hashtype) || p2mr_hashtype != SIGHASH_DEFAULT) {
+                sighash_time = SteadyClock::now() - sighash_start;
+                log_psbt_input_timing(PSBTError::SIGHASH_MISMATCH, "p2mr_sighash_mismatch");
                 return PSBTError::SIGHASH_MISMATCH;
             }
         }
     } else {
         if (!input.m_tap_key_sig.empty() && (input.m_tap_key_sig.size() != 65 || input.m_tap_key_sig.back() != *sighash)) {
+            sighash_time = SteadyClock::now() - sighash_start;
+            log_psbt_input_timing(PSBTError::SIGHASH_MISMATCH, "tap_key_sighash_mismatch");
             return PSBTError::SIGHASH_MISMATCH;
         }
         for (const auto& [_, sig] : input.m_tap_script_sigs) {
-            if (sig.size() != 65 || sig.back() != *sighash) return PSBTError::SIGHASH_MISMATCH;
+            if (sig.size() != 65 || sig.back() != *sighash) {
+                sighash_time = SteadyClock::now() - sighash_start;
+                log_psbt_input_timing(PSBTError::SIGHASH_MISMATCH, "tap_script_sighash_mismatch");
+                return PSBTError::SIGHASH_MISMATCH;
+            }
         }
         for (const auto& [_, sig] : input.partial_sigs) {
-            if (sig.second.back() != *sighash) return PSBTError::SIGHASH_MISMATCH;
+            if (sig.second.back() != *sighash) {
+                sighash_time = SteadyClock::now() - sighash_start;
+                log_psbt_input_timing(PSBTError::SIGHASH_MISMATCH, "partial_sig_sighash_mismatch");
+                return PSBTError::SIGHASH_MISMATCH;
+            }
         }
         for (const auto& [_, sig] : input.m_qbit_p2mr_script_sigs) {
             uint8_t p2mr_hashtype;
             if (!GetP2MRSignatureHashType(sig, p2mr_hashtype) || p2mr_hashtype != *sighash) {
+                sighash_time = SteadyClock::now() - sighash_start;
+                log_psbt_input_timing(PSBTError::SIGHASH_MISMATCH, "p2mr_sighash_mismatch");
                 return PSBTError::SIGHASH_MISMATCH;
             }
         }
     }
+    sighash_time = SteadyClock::now() - sighash_start;
 
     sigdata.witness = false;
-    bool sig_complete;
+    const auto produce_start{SteadyClock::now()};
     if (txdata == nullptr) {
         sig_complete = ProduceSignature(provider, DUMMY_SIGNATURE_CREATOR, utxo.scriptPubKey, sigdata);
     } else {
         MutableTransactionSignatureCreator creator(tx, index, utxo.nValue, txdata, *sighash);
         sig_complete = ProduceSignature(provider, creator, utxo.scriptPubKey, sigdata);
     }
-    if (!sigdata.invalid_p2mr_sigs.empty()) return PSBTError::INVALID_P2MR_SIGNATURE;
+    produce_time = SteadyClock::now() - produce_start;
+    if (!sigdata.invalid_p2mr_sigs.empty()) {
+        log_psbt_input_timing(PSBTError::INVALID_P2MR_SIGNATURE, "invalid_p2mr_signature");
+        return PSBTError::INVALID_P2MR_SIGNATURE;
+    }
 
     // Verify that a witness signature was produced in case one was required.
-    if (require_witness_sig && !sigdata.witness) return PSBTError::INCOMPLETE;
+    if (require_witness_sig && !sigdata.witness) {
+        log_psbt_input_timing(PSBTError::INCOMPLETE, "missing_witness_signature");
+        return PSBTError::INCOMPLETE;
+    }
 
     // If we are not finalizing, set sigdata.complete to false to not set the scriptWitness
+    const auto finalize_start{SteadyClock::now()};
     if (!finalize && sigdata.complete) sigdata.complete = false;
 
     input.FromSignatureData(sigdata);
@@ -558,8 +640,11 @@ PSBTError SignPSBTInput(const SigningProvider& provider, PartiallySignedTransact
         out_sigdata->missing_redeem_script = sigdata.missing_redeem_script;
         out_sigdata->missing_witness_script = sigdata.missing_witness_script;
     }
+    finalize_time = SteadyClock::now() - finalize_start;
 
-    return sig_complete ? PSBTError::OK : PSBTError::INCOMPLETE;
+    const PSBTError result{sig_complete ? PSBTError::OK : PSBTError::INCOMPLETE};
+    log_psbt_input_timing(result, sig_complete ? "ok" : "incomplete");
+    return result;
 }
 
 void RemoveUnnecessaryTransactions(PartiallySignedTransaction& psbtx)

@@ -10,6 +10,7 @@
 #include <rpc/server.h>
 #include <rpc/util.h>
 #include <univalue.h>
+#include <util/check.h>
 #include <util/translation.h>
 #include <wallet/context.h>
 #include <wallet/receive.h>
@@ -22,6 +23,23 @@
 
 
 namespace wallet {
+
+std::string PQCKeyValidationStatusString(PQCKeyValidationStatus status)
+{
+    switch (status) {
+    case PQCKeyValidationStatus::NOT_REQUIRED:
+        return "not_required";
+    case PQCKeyValidationStatus::PENDING:
+        return "pending";
+    case PQCKeyValidationStatus::RUNNING:
+        return "running";
+    case PQCKeyValidationStatus::COMPLETE:
+        return "complete";
+    case PQCKeyValidationStatus::FAILED:
+        return "failed";
+    } // no default case, so the compiler can warn about missing cases
+    NONFATAL_UNREACHABLE();
+}
 
 static const std::map<uint64_t, std::string> WALLET_FLAG_CAVEATS{
     {WALLET_FLAG_AVOID_REUSE,
@@ -55,6 +73,17 @@ static RPCHelpMan getwalletinfo()
                             {RPCResult::Type::NUM, "progress", "scanning progress percentage [0.0, 1.0]"},
                         }, /*skip_type_check=*/true},
                         {RPCResult::Type::BOOL, "descriptors", "whether this wallet uses descriptors for output script management"},
+                        {RPCResult::Type::OBJ, "pqc_key_validation", "Plaintext PQC wallet key validation state",
+                        {
+                            {RPCResult::Type::STR, "status", "one of not_required, pending, running, complete, failed"},
+                            {RPCResult::Type::NUM, "progress", "validation progress percentage [0.0, 1.0]"},
+                            {RPCResult::Type::NUM, "plaintext_records", "number of plaintext PQC records in this wallet"},
+                            {RPCResult::Type::NUM, "pending_records", "number of plaintext PQC records awaiting validation"},
+                            {RPCResult::Type::NUM, "validated_records", "number of validated plaintext PQC records"},
+                            {RPCResult::Type::NUM, "failed_records", "number of plaintext PQC records that failed validation"},
+                            {RPCResult::Type::BOOL, "signing_blocked", "whether PQC signing is blocked by validation state"},
+                            {RPCResult::Type::BOOL, "encryption_recommended", "whether wallet encryption would enable authenticated fast loads"},
+                        }},
                         {RPCResult::Type::BOOL, "external_signer", "whether this wallet is configured to use an external signer such as a hardware wallet"},
                         {RPCResult::Type::BOOL, "blank", "Whether this wallet intentionally does not contain any keys, scripts, or descriptors"},
                         {RPCResult::Type::NUM_TIME, "birthtime", /*optional=*/true, "The start time for blocks scanning. It could be modified by (re)importing any descriptor with an earlier timestamp."},
@@ -107,6 +136,17 @@ static RPCHelpMan getwalletinfo()
         obj.pushKV("scanning", false);
     }
     obj.pushKV("descriptors", pwallet->IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS));
+    const PQCKeyValidationInfo pqc_validation{pwallet->GetPQCKeyValidationInfo()};
+    UniValue pqc_validation_obj(UniValue::VOBJ);
+    pqc_validation_obj.pushKV("status", PQCKeyValidationStatusString(pqc_validation.status));
+    pqc_validation_obj.pushKV("progress", pqc_validation.progress);
+    pqc_validation_obj.pushKV("plaintext_records", static_cast<uint64_t>(pqc_validation.plaintext_records));
+    pqc_validation_obj.pushKV("pending_records", static_cast<uint64_t>(pqc_validation.pending_records));
+    pqc_validation_obj.pushKV("validated_records", static_cast<uint64_t>(pqc_validation.validated_records));
+    pqc_validation_obj.pushKV("failed_records", static_cast<uint64_t>(pqc_validation.failed_records));
+    pqc_validation_obj.pushKV("signing_blocked", pqc_validation.signing_blocked);
+    pqc_validation_obj.pushKV("encryption_recommended", pqc_validation.encryption_recommended);
+    obj.pushKV("pqc_key_validation", std::move(pqc_validation_obj));
     obj.pushKV("external_signer", pwallet->IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER));
     obj.pushKV("blank", pwallet->IsWalletFlagSet(WALLET_FLAG_BLANK_WALLET));
     if (int64_t birthtime = pwallet->GetBirthTime(); birthtime != UNKNOWN_TIME) {
@@ -920,6 +960,7 @@ RPCHelpMan signrawtransactionwithwallet();
 
 // signmessage
 RPCHelpMan signmessage();
+RPCHelpMan signdatapqchash();
 
 // transactions
 RPCHelpMan listreceivedbyaddress();
@@ -984,6 +1025,7 @@ std::span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &setlabel},
         {"wallet", &settxfee},
         {"wallet", &setwalletflag},
+        {"wallet", &signdatapqchash},
         {"wallet", &signmessage},
         {"wallet", &signrawtransactionwithwallet},
         {"wallet", &simulaterawtransaction},

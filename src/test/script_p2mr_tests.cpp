@@ -7,6 +7,7 @@
 #include <policy/policy.h>
 #include <primitives/transaction.h>
 #include <script/interpreter.h>
+#include <script/p2mr.h>
 #include <script/p2mr_sizing.h>
 #include <script/sign.h>
 #include <script/script.h>
@@ -14,6 +15,7 @@
 #include <test/util/setup_common.h>
 #include <test/util/transaction_utils.h>
 #include <util/strencodings.h>
+#include <util/translation.h>
 
 #include <boost/test/unit_test.hpp>
 
@@ -21,6 +23,7 @@
 #include <array>
 #include <cstdint>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <span>
@@ -230,6 +233,32 @@ struct TaprootSpendContext {
     CMutableTransaction tx_spend;
     PrecomputedTransactionData txdata;
 };
+
+struct MultiInputP2MRSigningContext {
+    CTransaction tx_credit;
+    CMutableTransaction tx_spend;
+    std::map<COutPoint, Coin> coins;
+};
+
+MultiInputP2MRSigningContext BuildMultiInputP2MRSigningContext(const CScript& script_pubkey, size_t input_count)
+{
+    CMutableTransaction tx_credit_mut;
+    for (size_t i{0}; i < input_count; ++i) {
+        tx_credit_mut.vout.emplace_back(100'000 + static_cast<CAmount>(i), script_pubkey);
+    }
+    const CTransaction tx_credit{tx_credit_mut};
+
+    CMutableTransaction tx_spend;
+    std::map<COutPoint, Coin> coins;
+    for (size_t i{0}; i < input_count; ++i) {
+        COutPoint outpoint{tx_credit.GetHash(), static_cast<uint32_t>(i)};
+        tx_spend.vin.emplace_back(outpoint);
+        coins.emplace(outpoint, Coin{tx_credit.vout.at(i), /*nHeightIn=*/1, /*fCoinBaseIn=*/false});
+    }
+    tx_spend.vout.emplace_back(90'000, CScript{} << OP_TRUE);
+
+    return {tx_credit, tx_spend, coins};
+}
 
 P2MRSpendContext BuildP2MRSpend(
     const CScript& leaf_script,
@@ -453,6 +482,26 @@ static_assert(MAX_STANDARD_TX_WEIGHT == 400'000);
 static_assert(OP_CHECKDATASIGPQC == 0xbc);
 static_assert(OP_CHECKDATASIGADDPQC == 0xbd);
 
+BOOST_AUTO_TEST_CASE(p2mr_pubkey_leaf_helpers_roundtrip)
+{
+    CPQCKey key;
+    key.MakeNewKey();
+    BOOST_REQUIRE(key.IsValid());
+    const CPQCPubKey pubkey = key.GetPubKey();
+    BOOST_REQUIRE(pubkey.IsValid());
+
+    const CScript leaf_script = p2mr::BuildPKScript(pubkey);
+    BOOST_CHECK(leaf_script == BuildP2MRPkScript(pubkey));
+
+    const std::optional<CPQCPubKey> matched_pubkey = p2mr::MatchPK(leaf_script);
+    BOOST_REQUIRE(matched_pubkey);
+    BOOST_CHECK(*matched_pubkey == pubkey);
+
+    BOOST_CHECK(!p2mr::MatchPK(CScript{} << PQCPubKeyBytes(pubkey) << OP_CHECKDATASIGPQC));
+    BOOST_CHECK(!p2mr::MatchPK(CScript{} << valtype(CPQCPubKey::SIZE - 1, 0x01) << OP_CHECKSIGPQC));
+    BOOST_CHECK(!p2mr::MatchPK(CScript{} << PQCPubKeyBytes(pubkey) << OP_CHECKSIGPQC << OP_TRUE));
+}
+
 BOOST_AUTO_TEST_CASE(p2mr_signing_single_key_consumes_one_counter)
 {
     CPQCKey key;
@@ -483,6 +532,129 @@ BOOST_AUTO_TEST_CASE(p2mr_signing_single_key_consumes_one_counter)
     BOOST_REQUIRE_EQUAL(sigdata.scriptWitness.stack.size(), 3U);
     BOOST_CHECK(!sigdata.scriptWitness.stack.at(0).empty());
     BOOST_CHECK(sigdata.scriptWitness.stack.at(1) == ScriptBytes(leaf_script));
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_sign_transaction_many_inputs_shared_key_consumes_unique_counters)
+{
+    static constexpr size_t INPUT_COUNT{4};
+
+    CPQCKey key;
+    key.MakeNewKey();
+    const CPQCPubKey pubkey = key.GetPubKey();
+    const CScript leaf_script = BuildP2MRPkScript(pubkey);
+
+    TaprootBuilder builder;
+    builder.AddP2MR(/*depth=*/0, ScriptBytes(leaf_script), P2MR_LEAF_VERSION_V1).FinalizeP2MR();
+    const WitnessV2P2MR output = builder.GetP2MROutput();
+    const CScript script_pubkey = BuildP2MRScriptPubKey(output.GetMerkleRoot());
+    MultiInputP2MRSigningContext context = BuildMultiInputP2MRSigningContext(script_pubkey, INPUT_COUNT);
+
+    FlatSigningProvider provider;
+    AddPQCSigningKey(provider, key);
+    provider.mr_trees.emplace(output, builder);
+
+    std::mutex counter_mutex;
+    bool reservation_valid{true};
+    uint32_t authoritative_counter{0};
+    std::vector<std::pair<uint32_t, uint32_t>> reserved_ranges;
+    provider.pqc_counter_reserver = [&](const CPQCPubKey& seen_pubkey, uint32_t count, uint32_t& previous_counter, uint32_t& reserved_counter) {
+        std::lock_guard<std::mutex> lock(counter_mutex);
+        if (seen_pubkey != pubkey || count != 1 || authoritative_counter > PQC_MAX_SIGNATURES - count) {
+            reservation_valid = false;
+            return false;
+        }
+        previous_counter = authoritative_counter;
+        reserved_counter = authoritative_counter + count;
+        authoritative_counter = reserved_counter;
+        reserved_ranges.emplace_back(previous_counter, reserved_counter);
+        return true;
+    };
+
+    std::vector<std::pair<uint32_t, uint32_t>> observed_ranges;
+    provider.pqc_counter_observer = [&](const CPQCPubKey& seen_pubkey, uint32_t previous_counter, uint32_t new_counter) {
+        BOOST_CHECK(seen_pubkey == pubkey);
+        observed_ranges.emplace_back(previous_counter, new_counter);
+    };
+
+    std::map<int, bilingual_str> input_errors;
+    BOOST_REQUIRE(SignTransaction(context.tx_spend, &provider, context.coins, SIGHASH_DEFAULT, input_errors));
+    BOOST_CHECK(input_errors.empty());
+
+    {
+        std::lock_guard<std::mutex> lock(counter_mutex);
+        BOOST_CHECK(reservation_valid);
+        BOOST_CHECK_EQUAL(authoritative_counter, INPUT_COUNT);
+        BOOST_REQUIRE_EQUAL(reserved_ranges.size(), INPUT_COUNT);
+    }
+    BOOST_REQUIRE_EQUAL(observed_ranges.size(), INPUT_COUNT);
+    std::sort(observed_ranges.begin(), observed_ranges.end());
+    for (size_t i{0}; i < INPUT_COUNT; ++i) {
+        BOOST_CHECK(observed_ranges[i] == std::make_pair(static_cast<uint32_t>(i), static_cast<uint32_t>(i + 1)));
+    }
+    BOOST_CHECK_EQUAL(provider.pqc_sig_counters[pubkey], INPUT_COUNT);
+
+    for (const CTxIn& txin : context.tx_spend.vin) {
+        BOOST_REQUIRE_EQUAL(txin.scriptWitness.stack.size(), 3U);
+        BOOST_CHECK(!txin.scriptWitness.stack.at(0).empty());
+        BOOST_CHECK(txin.scriptWitness.stack.at(1) == ScriptBytes(leaf_script));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_sign_transaction_shared_key_stops_at_usage_limit)
+{
+    static constexpr size_t INPUT_COUNT{2};
+
+    CPQCKey key;
+    key.MakeNewKey();
+    const CPQCPubKey pubkey = key.GetPubKey();
+    const CScript leaf_script = BuildP2MRPkScript(pubkey);
+
+    TaprootBuilder builder;
+    builder.AddP2MR(/*depth=*/0, ScriptBytes(leaf_script), P2MR_LEAF_VERSION_V1).FinalizeP2MR();
+    const WitnessV2P2MR output = builder.GetP2MROutput();
+    const CScript script_pubkey = BuildP2MRScriptPubKey(output.GetMerkleRoot());
+    MultiInputP2MRSigningContext context = BuildMultiInputP2MRSigningContext(script_pubkey, INPUT_COUNT);
+
+    FlatSigningProvider provider;
+    AddPQCSigningKey(provider, key);
+    provider.pqc_sig_counters[pubkey] = PQC_MAX_SIGNATURES - 1;
+    provider.mr_trees.emplace(output, builder);
+
+    std::mutex counter_mutex;
+    uint32_t authoritative_counter{PQC_MAX_SIGNATURES - 1};
+    provider.pqc_counter_reserver = [&](const CPQCPubKey& seen_pubkey, uint32_t count, uint32_t& previous_counter, uint32_t& reserved_counter) {
+        std::lock_guard<std::mutex> lock(counter_mutex);
+        if (seen_pubkey != pubkey || count != 1 || authoritative_counter > PQC_MAX_SIGNATURES - count) {
+            return false;
+        }
+        previous_counter = authoritative_counter;
+        reserved_counter = authoritative_counter + count;
+        authoritative_counter = reserved_counter;
+        return true;
+    };
+
+    std::vector<std::pair<uint32_t, uint32_t>> observed_ranges;
+    provider.pqc_counter_observer = [&](const CPQCPubKey& seen_pubkey, uint32_t previous_counter, uint32_t new_counter) {
+        BOOST_CHECK(seen_pubkey == pubkey);
+        observed_ranges.emplace_back(previous_counter, new_counter);
+    };
+
+    std::map<int, bilingual_str> input_errors;
+    BOOST_CHECK(!SignTransaction(context.tx_spend, &provider, context.coins, SIGHASH_DEFAULT, input_errors));
+    BOOST_CHECK_EQUAL(input_errors.size(), 1U);
+
+    {
+        std::lock_guard<std::mutex> lock(counter_mutex);
+        BOOST_CHECK_EQUAL(authoritative_counter, PQC_MAX_SIGNATURES);
+    }
+    BOOST_REQUIRE_EQUAL(observed_ranges.size(), 1U);
+    BOOST_CHECK(observed_ranges[0] == std::make_pair(PQC_MAX_SIGNATURES - 1, PQC_MAX_SIGNATURES));
+    BOOST_CHECK_EQUAL(provider.pqc_sig_counters[pubkey], PQC_MAX_SIGNATURES);
+
+    const size_t non_empty_signatures{static_cast<size_t>(std::count_if(context.tx_spend.vin.begin(), context.tx_spend.vin.end(), [](const CTxIn& txin) {
+        return !txin.scriptWitness.stack.empty() && !txin.scriptWitness.stack.front().empty();
+    }))};
+    BOOST_CHECK_EQUAL(non_empty_signatures, 1U);
 }
 
 BOOST_AUTO_TEST_CASE(p2mr_signing_selects_leaf_before_consuming_counters)
@@ -1219,6 +1391,44 @@ BOOST_AUTO_TEST_CASE(p2mr_checkdatasigpqc_accepts_valid_signature)
     ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
     BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
     BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_checkdatasigpqc_accepts_witness_supplied_message_hash)
+{
+    CPQCKey key;
+    key.MakeNewKey();
+    BOOST_REQUIRE(key.IsValid());
+    const CPQCPubKey pubkey = key.GetPubKey();
+    BOOST_REQUIRE(pubkey.IsValid());
+
+    const valtype msg_hash{DataSigMessageHash(0x49)};
+    const CScript leaf_script = CScript{} << PQCPubKeyBytes(pubkey) << OP_CHECKDATASIGPQC;
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+    const valtype sig{SignDataSigPQC(key, msg_hash)};
+
+    {
+        const P2MRSpendContext spend = BuildP2MRSpend(
+            leaf_script,
+            /*stack_items=*/{sig, msg_hash},
+            /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+            program_root);
+
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+    }
+
+    {
+        const P2MRSpendContext spend = BuildP2MRSpend(
+            leaf_script,
+            /*stack_items=*/{sig, DataSigMessageHash(0x4a)},
+            /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+            program_root);
+
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_P2MR_SIG);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(p2mr_ctv_opcode_name_is_p2mr_only)

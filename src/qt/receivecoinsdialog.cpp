@@ -140,6 +140,7 @@ void ReceiveCoinsDialog::setModel(WalletModel *_model)
         if (ui->addressType->currentIndex() == -1 && ui->addressType->count() > 0) {
             ui->addressType->setCurrentIndex(0);
         }
+        ui->addressType->setVisible(ui->addressType->count() > 1);
 
         // Set the button to be enabled or disabled based on whether the wallet can give out new addresses.
         ui->receiveButton->setEnabled(model->wallet().canGetAddresses() && ui->addressType->count() > 0);

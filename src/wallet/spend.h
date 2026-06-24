@@ -224,7 +224,7 @@ void DiscourageFeeSniping(CMutableTransaction& tx, FastRandomContext& rng_fast, 
  * selected by SelectCoins(); Also create the change output, when needed
  * @note passing change_pos as std::nullopt will result in setting a random position
  */
-util::Result<CreatedTransactionResult> CreateTransaction(CWallet& wallet, const std::vector<CRecipient>& vecSend, std::optional<unsigned int> change_pos, const CCoinControl& coin_control, bool sign = true, const PQCSignatureCounterObserver& pqc_counter_observer = {});
+util::Result<CreatedTransactionResult> CreateTransaction(CWallet& wallet, const std::vector<CRecipient>& vecSend, std::optional<unsigned int> change_pos, const CCoinControl& coin_control, bool sign = true, const PQCSignatureCounterObserver& pqc_counter_observer = {}, const SigningProgressCallback& progress_callback = {});
 
 /**
  * Insert additional inputs into the transaction by

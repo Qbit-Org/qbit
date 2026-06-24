@@ -28,9 +28,20 @@ struct ValidationError {
     std::string debug_message;
 };
 
+enum class CommitmentValidation {
+    EITHER,
+    INTERNAL,
+    DISPLAY,
+};
+
+inline CommitmentValidation CommitmentValidationForHeight(const Consensus::Params& consensus, const int height)
+{
+    return consensus.AuxpowDisplayCommitmentActiveAtHeight(height) ? CommitmentValidation::DISPLAY : CommitmentValidation::INTERNAL;
+}
+
 uint256 CheckMerkleBranch(const uint256& leaf, std::span<const uint256> branch, uint32_t index);
 int32_t GetExpectedIndex(uint32_t nonce, int32_t chain_id, size_t merkle_height);
-std::optional<ValidationError> Validate(const CBlockHeader& block, const Consensus::Params& consensus, bool check_pow = true);
+std::optional<ValidationError> Validate(const CBlockHeader& block, const Consensus::Params& consensus, bool check_pow = true, CommitmentValidation commitment_validation = CommitmentValidation::EITHER);
 } // namespace auxpow
 
 class CAuxPow
@@ -71,7 +82,7 @@ public:
         return parent_block.GetHash();
     }
 
-    std::optional<auxpow::ValidationError> Validate(const uint256& aux_block_hash, const Consensus::Params& consensus, uint32_t target_bits, uint16_t expected_chain_id, bool check_pow) const;
+    std::optional<auxpow::ValidationError> Validate(const uint256& aux_block_hash, const Consensus::Params& consensus, uint32_t target_bits, uint16_t expected_chain_id, bool check_pow, auxpow::CommitmentValidation commitment_validation) const;
 };
 
 #endif // QBIT_AUXPOW_H

@@ -891,6 +891,16 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
     def wait_until(self, test_function, timeout=60, check_interval=0.05):
         return wait_until_helper_internal(test_function, timeout=timeout, timeout_factor=self.options.timeout_factor, check_interval=check_interval)
 
+    def wait_pqc_key_validation_ready(self, wallet, timeout=180):
+        def ready():
+            validation = wallet.getwalletinfo().get("pqc_key_validation")
+            return validation is None or (
+                validation.get("status") in ("not_required", "complete")
+                and not validation.get("signing_blocked", True)
+            )
+
+        self.wait_until(ready, timeout=timeout)
+
     # Private helper methods. These should not be accessed by the subclass test scripts.
 
     def _start_logging(self):

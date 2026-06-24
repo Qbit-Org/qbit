@@ -9,6 +9,8 @@
 #include <script/signingprovider.h>
 
 #include <logging.h>
+#include <util/signing_timing.h>
+#include <util/time.h>
 
 const SigningProvider& DUMMY_SIGNING_PROVIDER = SigningProvider();
 
@@ -121,9 +123,41 @@ bool FlatSigningProvider::CanSignPQC(const CPQCPubKey& pubkey) const
 }
 bool FlatSigningProvider::SignPQC(const CPQCPubKey& pubkey, const uint256& hash, std::vector<unsigned char>& sig) const
 {
+    const bool timing_enabled{util::signing_timing::Enabled() && util::signing_timing::CurrentId() != 0};
+    const uint64_t timing_id{util::signing_timing::CurrentId()};
+    const auto timing_start{SteadyClock::now()};
+    SteadyClock::duration reserve_time{};
+    SteadyClock::duration raw_sign_time{};
+    SteadyClock::duration rollback_time{};
+    SteadyClock::duration observer_time{};
+    const bool has_reserver{static_cast<bool>(pqc_counter_reserver)};
+    const bool has_writer{static_cast<bool>(pqc_counter_writer)};
+    const auto log_pqc_sign_timing = [&](bool success, const char* status) {
+        if (!timing_enabled) return;
+        LogDebug(BCLog::BENCH,
+            "wallet-sign-timing id=%llu phase=pqc_sign reserve_ms=%.2f raw_sign_ms=%.2f "
+            "rollback_ms=%.2f observer_ms=%.2f total_ms=%.2f success=%d reserver=%d writer=%d status=%s\n",
+            util::signing_timing::LogId(timing_id),
+            Ticks<MillisecondsDouble>(reserve_time),
+            Ticks<MillisecondsDouble>(raw_sign_time),
+            Ticks<MillisecondsDouble>(rollback_time),
+            Ticks<MillisecondsDouble>(observer_time),
+            Ticks<MillisecondsDouble>(SteadyClock::now() - timing_start),
+            success,
+            has_reserver,
+            has_writer,
+            status);
+    };
+
     CPQCKey key;
-    if (!LookupHelper(pqc_keys, pubkey, key)) return false;
-    if (!key.IsValid()) return false;
+    if (!LookupHelper(pqc_keys, pubkey, key)) {
+        log_pqc_sign_timing(/*success=*/false, "missing_key");
+        return false;
+    }
+    if (!key.IsValid()) {
+        log_pqc_sign_timing(/*success=*/false, "invalid_key");
+        return false;
+    }
 
     const auto counter_it = pqc_sig_counters.find(pubkey);
     const bool has_prior_counter = counter_it != pqc_sig_counters.end();
@@ -131,28 +165,47 @@ bool FlatSigningProvider::SignPQC(const CPQCPubKey& pubkey, const uint256& hash,
     uint32_t reserved_previous_counter = previous_counter;
     uint32_t reserved_counter = previous_counter + 1;
     uint32_t counter = previous_counter;
-    if (previous_counter >= PQC_MAX_SIGNATURES) return false;
+    if (previous_counter >= PQC_MAX_SIGNATURES) {
+        log_pqc_sign_timing(/*success=*/false, "limit_exceeded");
+        return false;
+    }
 
     if (pqc_counter_reserver) {
-        if (!pqc_counter_reserver(pubkey, /*count=*/1, reserved_previous_counter, reserved_counter)) return false;
+        const auto reserve_start{SteadyClock::now()};
+        const bool reserved{pqc_counter_reserver(pubkey, /*count=*/1, reserved_previous_counter, reserved_counter)};
+        reserve_time = SteadyClock::now() - reserve_start;
+        if (!reserved) {
+            log_pqc_sign_timing(/*success=*/false, "reserve_failed");
+            return false;
+        }
         if (reserved_previous_counter >= PQC_MAX_SIGNATURES ||
             reserved_counter != reserved_previous_counter + 1) {
             LogPrintf("%s: PQC counter reserver returned invalid range [%u, %u)\n", __func__, reserved_previous_counter, reserved_counter);
+            log_pqc_sign_timing(/*success=*/false, "invalid_reservation");
             return false;
         }
         counter = reserved_previous_counter;
     } else if (pqc_counter_writer) {
         // Reserve exactly one counter value in authoritative storage first.
-        if (!pqc_counter_writer(pubkey, previous_counter, reserved_counter)) return false;
+        const auto reserve_start{SteadyClock::now()};
+        const bool reserved{pqc_counter_writer(pubkey, previous_counter, reserved_counter)};
+        reserve_time = SteadyClock::now() - reserve_start;
+        if (!reserved) {
+            log_pqc_sign_timing(/*success=*/false, "reserve_failed");
+            return false;
+        }
     }
 
+    const auto raw_sign_start{SteadyClock::now()};
     const bool signed_ok = key.Sign(hash, sig, counter);
+    raw_sign_time = SteadyClock::now() - raw_sign_start;
     if (!signed_ok || counter != reserved_counter) {
         if (signed_ok) {
             LogPrintf("%s: PQC signer returned unexpected counter %u (expected %u)\n", __func__, counter, reserved_counter);
         }
         if (pqc_counter_writer && !pqc_counter_reserver) {
             // Best-effort rollback of reservation if signing failed.
+            const auto rollback_start{SteadyClock::now()};
             if (!pqc_counter_writer(pubkey, reserved_counter, previous_counter)) {
                 // If rollback could not be applied, keep local cache at reserved state.
                 pqc_sig_counters[pubkey] = reserved_counter;
@@ -161,15 +214,20 @@ bool FlatSigningProvider::SignPQC(const CPQCPubKey& pubkey, const uint256& hash,
             } else {
                 pqc_sig_counters.erase(pubkey);
             }
+            rollback_time = SteadyClock::now() - rollback_start;
         }
         sig.clear();
+        log_pqc_sign_timing(/*success=*/false, signed_ok ? "unexpected_counter" : "sign_failed");
         return false;
     }
 
     pqc_sig_counters[pubkey] = reserved_counter;
     if (pqc_counter_observer) {
+        const auto observer_start{SteadyClock::now()};
         pqc_counter_observer(pubkey, reserved_previous_counter, reserved_counter);
+        observer_time = SteadyClock::now() - observer_start;
     }
+    log_pqc_sign_timing(/*success=*/true, "ok");
     return true;
 }
 bool FlatSigningProvider::GetTaprootSpendData(const XOnlyPubKey& output_key, TaprootSpendData& spenddata) const
@@ -226,6 +284,9 @@ FlatSigningProvider& FlatSigningProvider::Merge(FlatSigningProvider&& b)
     }
     if (!pqc_counter_reserver && b.pqc_counter_reserver) {
         pqc_counter_reserver = std::move(b.pqc_counter_reserver);
+    }
+    if (!pqc_counter_batch_reserver && b.pqc_counter_batch_reserver) {
+        pqc_counter_batch_reserver = std::move(b.pqc_counter_batch_reserver);
     }
     if (!pqc_counter_observer && b.pqc_counter_observer) {
         pqc_counter_observer = std::move(b.pqc_counter_observer);

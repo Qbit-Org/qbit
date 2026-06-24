@@ -15,6 +15,7 @@
 #include <script/descriptor.h>
 #include <script/script.h>
 #include <script/signingprovider.h>
+#include <uint256.h>
 #include <util/result.h>
 #include <util/time.h>
 #include <wallet/crypter.h>
@@ -29,6 +30,7 @@
 #include <optional>
 #include <set>
 #include <unordered_map>
+#include <vector>
 
 enum class OutputType;
 
@@ -42,6 +44,32 @@ struct PSBTSigningProvider
     std::unique_ptr<SigningProvider> provider;
     std::set<unsigned int> input_indexes;
 };
+
+struct DataPQCSignatureProof
+{
+    WitnessV2P2MR output;
+    uint256 message_hash;
+    uint256 datasig_hash;
+    CPQCPubKey pubkey;
+    std::vector<unsigned char> signature;
+    CScript leaf_script;
+    std::vector<unsigned char> control_block;
+    uint8_t leaf_version{P2MR_LEAF_VERSION_V1};
+};
+
+struct PendingPlaintextPQCKey {
+    CKeyingMaterial secret;
+    uint32_t sig_counter{0};
+};
+
+/** Sign a 32-byte data hash with a PQC key committed by a single-key P2MR pubkey leaf. */
+util::Result<DataPQCSignatureProof> SignP2MRDataHash(
+    const SigningProvider& provider,
+    const WitnessV2P2MR& output,
+    const uint256& message_hash,
+    const std::optional<CPQCPubKey>& requested_pubkey,
+    const std::optional<CScript>& requested_leaf_script,
+    const std::optional<std::vector<unsigned char>>& requested_control_block);
 
 // Wallet storage things that ScriptPubKeyMans need in order to be able to store things to the wallet database.
 // It provides access to things that are part of the entire wallet and not specific to a ScriptPubKeyMan such as
@@ -78,6 +106,12 @@ struct WalletDestination
 {
     CTxDestination dest;
     std::optional<bool> internal;
+};
+
+struct CryptedPQCKeyRecord
+{
+    std::vector<unsigned char> crypted_secret;
+    std::optional<uint256> auth_tag;
 };
 
 /*
@@ -135,6 +169,7 @@ public:
 
     virtual bool HavePrivateKeys() const { return false; }
     virtual bool HaveCryptedKeys() const { return false; }
+    virtual PQCKeyValidationInfo GetPQCKeyValidationInfo() const { return {}; }
     std::weak_ptr<void> GetLifetimeToken() const { return m_lifetime; }
 
     //! The action to do when the DB needs rewrite
@@ -160,6 +195,17 @@ public:
     virtual std::unique_ptr<SigningProvider> GetSigningProviderForTransaction(const std::map<COutPoint, Coin>& coins, const PQCSignatureCounterObserver& pqc_counter_observer = {}) const { return nullptr; }
     /** Sign a message with the given script */
     virtual SigningResult SignMessage(const std::string& message, const PKHash& pkhash, std::string& str_sig) const { return SigningResult::SIGNING_FAILED; };
+    /** Sign a 32-byte data hash with a PQC key committed by a single-key P2MR pubkey leaf. */
+    virtual util::Result<DataPQCSignatureProof> SignDataPQCHash(
+        const WitnessV2P2MR& output,
+        const uint256& message_hash,
+        const std::optional<CPQCPubKey>& requested_pubkey,
+        const std::optional<CScript>& requested_leaf_script,
+        const std::optional<std::vector<unsigned char>>& requested_control_block,
+        const PQCSignatureCounterObserver& pqc_counter_observer = {}) const
+    {
+        return util::Error{Untranslated("P2MR data-hash signing is unsupported by this wallet")};
+    }
     /** Adds script and derivation path information to a PSBT, and optionally signs it. */
     virtual std::optional<common::PSBTError> FillPSBT(PartiallySignedTransaction& psbt, const PrecomputedTransactionData& txdata, std::optional<int> sighash_type = std::nullopt, bool sign = true, bool bip32derivs = false, int* n_signed = nullptr, bool finalize = true, const PQCSignatureCounterObserver& pqc_counter_observer = {}) const { return common::PSBTError::UNSUPPORTED; }
     /** Collect a provider snapshot for PSBT filling. The caller can use it after releasing the wallet lock. */
@@ -302,8 +348,9 @@ private:
     using PubKeyMap = std::map<CPubKey, int32_t>; // Map of pubkeys involved in scripts to descriptor range index
     using CryptedKeyMap = std::map<CKeyID, std::pair<CPubKey, std::vector<unsigned char>>>;
     using KeyMap = std::map<CKeyID, CKey>;
-    using CryptedPQCKeyMap = std::map<CPQCPubKey, std::vector<unsigned char>>;
+    using CryptedPQCKeyMap = std::map<CPQCPubKey, CryptedPQCKeyRecord>;
     using PQCKeyMap = std::map<CPQCPubKey, CPQCKey>;
+    using PendingPlaintextPQCKeyMap = std::map<CPQCPubKey, PendingPlaintextPQCKey>;
 
     ScriptPubKeyMap m_map_script_pub_keys GUARDED_BY(cs_desc_man);
     PubKeyMap m_map_pubkeys GUARDED_BY(cs_desc_man);
@@ -311,8 +358,10 @@ private:
 
     KeyMap m_map_keys GUARDED_BY(cs_desc_man);
     CryptedKeyMap m_map_crypted_keys GUARDED_BY(cs_desc_man);
-    CryptedPQCKeyMap m_map_crypted_pqc_keys GUARDED_BY(cs_desc_man);
+    mutable CryptedPQCKeyMap m_map_crypted_pqc_keys GUARDED_BY(cs_desc_man);
     PQCKeyMap m_map_pqc_keys GUARDED_BY(cs_desc_man);
+    PendingPlaintextPQCKeyMap m_pending_plaintext_pqc_keys GUARDED_BY(cs_desc_man);
+    std::set<CPQCPubKey> m_failed_plaintext_pqc_keys GUARDED_BY(cs_desc_man);
     mutable std::map<CPQCPubKey, uint32_t> m_map_pqc_sig_counters GUARDED_BY(cs_desc_man);
 
     //! keeps track of whether Unlock has run a thorough check before
@@ -325,8 +374,13 @@ private:
 
     bool AddDescriptorKeyWithDB(WalletBatch& batch, const CKey& key, const CPubKey &pubkey) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     bool AddDescriptorPQCKeyWithDB(WalletBatch& batch, const CPQCPubKey& pubkey, const CPQCKey& key, bool has_encryption_keys = false, const CKeyingMaterial* encryption_key = nullptr) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    bool HasBlockedPlaintextPQCKeys() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    bool IsPlaintextPQCKeyBlocked(const CPQCPubKey& pubkey) const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    std::set<CPQCPubKey> GetBlockedPlaintextPQCKeys() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     bool ReservePQCSignatureCounters(const CPQCPubKey& pubkey, uint32_t count, uint32_t& previous_counter, uint32_t& reserved_counter) const;
+    bool ReservePQCSignatureCountersBatch(const std::map<CPQCPubKey, uint32_t>& counts, std::map<CPQCPubKey, PQCSignatureCounterRange>& ranges) const;
     PQCSignatureCounterReserver MakePQCSignatureCounterReserver() const;
+    PQCSignatureCounterBatchReserver MakePQCSignatureCounterBatchReserver() const;
 
     KeyMap GetKeys() const;
 
@@ -383,6 +437,7 @@ public:
     //! Retrieve the particular key if it is available. Returns nullopt if the key is not in the wallet, or if the wallet is locked.
     std::optional<CKey> GetKey(const CKeyID& keyid) const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     bool HaveCryptedKeys() const override;
+    PQCKeyValidationInfo GetPQCKeyValidationInfo() const override;
 
     unsigned int GetKeyPoolSize() const override;
 
@@ -404,6 +459,13 @@ public:
     bool SignTransaction(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors, const PQCSignatureCounterObserver& pqc_counter_observer = {}) const override;
     std::unique_ptr<SigningProvider> GetSigningProviderForTransaction(const std::map<COutPoint, Coin>& coins, const PQCSignatureCounterObserver& pqc_counter_observer = {}) const override;
     SigningResult SignMessage(const std::string& message, const PKHash& pkhash, std::string& str_sig) const override;
+    util::Result<DataPQCSignatureProof> SignDataPQCHash(
+        const WitnessV2P2MR& output,
+        const uint256& message_hash,
+        const std::optional<CPQCPubKey>& requested_pubkey,
+        const std::optional<CScript>& requested_leaf_script,
+        const std::optional<std::vector<unsigned char>>& requested_control_block,
+        const PQCSignatureCounterObserver& pqc_counter_observer = {}) const override;
     std::optional<common::PSBTError> FillPSBT(PartiallySignedTransaction& psbt, const PrecomputedTransactionData& txdata, std::optional<int> sighash_type = std::nullopt, bool sign = true, bool bip32derivs = false, int* n_signed = nullptr, bool finalize = true, const PQCSignatureCounterObserver& pqc_counter_observer = {}) const override;
     std::optional<PSBTSigningProvider> GetSigningProviderForPSBT(const PartiallySignedTransaction& psbt, bool sign = true, const PQCSignatureCounterObserver& pqc_counter_observer = {}) const override;
 
@@ -413,8 +475,12 @@ public:
 
     bool AddKey(const CKeyID& key_id, const CKey& key);
     bool AddCryptedKey(const CKeyID& key_id, const CPubKey& pubkey, const std::vector<unsigned char>& crypted_key);
-    bool AddCryptedPQCKey(const CPQCPubKey& pubkey, const std::vector<unsigned char>& crypted_key, uint32_t sig_counter = 0);
+    bool AddCryptedPQCKey(const CPQCPubKey& pubkey, const std::vector<unsigned char>& crypted_key, uint32_t sig_counter = 0, std::optional<uint256> auth_tag = std::nullopt);
     bool AddPQCKey(const CPQCPubKey& pubkey, const CPQCKey& key, uint32_t sig_counter = 0);
+    bool AddPendingPlaintextPQCKey(const CPQCPubKey& pubkey, CKeyingMaterial secret, uint32_t sig_counter = 0);
+    std::optional<std::pair<CPQCPubKey, PendingPlaintextPQCKey>> GetNextPendingPlaintextPQCKey() const;
+    bool CompletePendingPlaintextPQCKeyValidation(const CPQCPubKey& pubkey, const CPQCKey& key, uint32_t sig_counter);
+    bool FailPendingPlaintextPQCKeyValidation(const CPQCPubKey& pubkey);
     std::vector<CPQCPubKey> GetPQCKeys() const;
 
     bool HasWalletDescriptor(const WalletDescriptor& desc) const;

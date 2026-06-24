@@ -97,6 +97,7 @@ public:
 
     // prepare transaction for getting txfee before sending coins
     SendCoinsReturn prepareTransaction(WalletModelTransaction &transaction, const wallet::CCoinControl& coinControl);
+    static SendCoinsReturn prepareTransaction(interfaces::Wallet& wallet, WalletModelTransaction& transaction, const wallet::CCoinControl& coinControl, CAmount cached_available_balance, const SigningProgressCallback& progress_callback = {});
 
     // Send coins to a list of recipients
     void sendCoins(WalletModelTransaction& transaction);
@@ -116,16 +117,16 @@ public:
 
         bool isValid() const { return valid; }
 
-        // Disable unused copy/move constructors/assignments explicitly.
+        // Disable copy constructors/assignments explicitly.
         UnlockContext(const UnlockContext&) = delete;
-        UnlockContext(UnlockContext&&) = delete;
+        UnlockContext(UnlockContext&& other) noexcept;
         UnlockContext& operator=(const UnlockContext&) = delete;
         UnlockContext& operator=(UnlockContext&&) = delete;
 
     private:
         WalletModel *wallet;
-        const bool valid;
-        const bool relock;
+        bool valid;
+        bool relock;
     };
 
     UnlockContext requestUnlock();
@@ -151,6 +152,8 @@ public:
 
     // Retrieve the cached wallet balance
     interfaces::WalletBalances getCachedBalance() const;
+
+    wallet::PQCKeyValidationInfo getPQCKeyValidationInfo() const;
 
     // If coin control has selected outputs, searches the total amount inside the wallet.
     // Otherwise, uses the wallet's cached available balance.
@@ -195,6 +198,9 @@ Q_SIGNALS:
 
     // Encryption status of wallet changed
     void encryptionStatusChanged();
+
+    // Plaintext PQC key validation status changed
+    void pqcKeyValidationChanged();
 
     // Signal emitted when wallet needs to be unlocked
     // It is valid behaviour for listeners to keep the wallet locked after this signal;

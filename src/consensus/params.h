@@ -137,6 +137,7 @@ struct Params {
     bool fRestrictedOutputMode{false}; //!< Restrict all block-created outputs to P2MR plus OP_RETURN/PayToAnchor exemptions; reserved outer witness versions v3..v16 additionally require nOuterReservedWitnessHeight
     bool fPowUseASERT{false};
     int nCadenceActivationHeight{0}; //!< Height at which PR6 cadence/AuxPoW header rules become active.
+    int nAuxpowDisplayCommitmentHeight{0}; //!< Height at which AuxPoW coinbase commitments use display byte order.
     int64_t nPowTargetSpacing;
     int64_t nPowTargetSpacingLegacy{0};
     int64_t nPowTargetSpacingAuxPow{0};
@@ -149,6 +150,7 @@ struct Params {
         return std::chrono::seconds{nPowTargetSpacing};
     }
     bool CadenceActiveAtHeight(int height) const { return height >= nCadenceActivationHeight; }
+    bool AuxpowDisplayCommitmentActiveAtHeight(int height) const { return height >= nAuxpowDisplayCommitmentHeight; }
     bool OuterReservedWitnessActiveAtHeight(int height) const { return height >= nOuterReservedWitnessHeight; }
     int64_t DifficultyAdjustmentInterval() const { return nPowTargetTimespan / nPowTargetSpacing; }
     /** The best chain should have at least this much work */

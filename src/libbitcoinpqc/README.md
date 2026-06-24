@@ -1,6 +1,6 @@
-# libbitcoinpqc-qbit
+# qbit-libbitcoinpqc
 
-`libbitcoinpqc-qbit` is a qbit-focused fork of `libbitcoinpqc`.
+`qbit-libbitcoinpqc` is a qbit-focused fork of `libbitcoinpqc`.
 
 It is not a general-purpose multi-algorithm signature library. This fork is maintained for the qbit profile and consensus integration work only.
 
@@ -18,12 +18,8 @@ For the current hardening cycle, the production-supported release surfaces are:
 - The Rust crate API.
 
 These are the surfaces used for qbit production integration, release criteria,
-security review, and production packaging in this cycle.
-
-The in-tree Python and Node.js bindings are developer/testing convenience
-surfaces only for the current cycle. They are not production-supported release surfaces, and
-their package publishing, dependency hardening, and binding-specific security
-review do not block the production handoff.
+security review, and production packaging in this cycle. The public source tree
+does not include Python or Node.js binding packages.
 
 ## Security Scope
 
@@ -147,8 +143,8 @@ cargo build --verbose
 cargo test --verbose
 ```
 
-That is the supported Windows path for now. Python/Node bindings, shared-library
-packaging, and AVX2-on-MSVC runtime support are intentionally out of scope.
+That is the supported Windows path for now. Shared-library packaging and
+AVX2-on-MSVC runtime support are intentionally out of scope.
 
 ## Fuzzing
 
@@ -199,6 +195,14 @@ C API ownership rules:
 - Zero-length messages are supported. At the C ABI boundary, `message` may be `NULL` only when `message_size == 0`.
 - Key generation uses caller-provided entropy. Signing is deterministic from
   the secret key and message and does not request operating-system entropy.
+- Successful key generation returns a self-consistent generated pair. The
+  SLH-DSA secret key layout is `[SK_SEED || SK_PRF || PUB_SEED || root]`, the
+  public key layout is `[PUB_SEED || root]`, and the root is computed during
+  keygen. Trusted callers that immediately adopt same-call keygen output do not
+  need to call the secret-key validator only to recompute that root.
+- `slh_dsa_secret_key_validate` and `bitcoin_pqc_secret_key_validate` are for
+  imported, deserialized, or otherwise untrusted exact-size secret material
+  before it is accepted.
 - The internal SPHINCS+ `randombytes` hook aborts with a fatal diagnostic if it
   is invoked without configured deterministic/caller-provided randomness and
   operating-system entropy is unavailable; it never substitutes all-zero bytes
@@ -252,12 +256,15 @@ reusing an output struct; the free functions reset fields to zero and are safe
 to call on zeroed structs or structs returned by this library. Key generation
 requires at least 128 bytes of caller-provided entropy, and all provided bytes
 are mixed into the internal SLH-DSA seed with domain separation and
-input-length binding. Signing is deterministic from the secret key and message,
-so normal signing does not depend on operating-system entropy. The library
-cannot clear caller-owned entropy buffers; callers should protect and zeroize
-those buffers after key generation when they contain sensitive seed material.
-For signing and verification, `message == NULL` is valid only when
-`message_size == 0`.
+input-length binding. Successful key generation returns a self-consistent
+public/secret pair, and trusted callers may adopt that same-call output without
+immediately revalidating the secret-key root. Validation remains required for
+imported, deserialized, or otherwise untrusted exact-size secret material.
+Signing is deterministic from the secret key and message, so normal signing
+does not depend on operating-system entropy. The library cannot clear
+caller-owned entropy buffers; callers should protect and zeroize those buffers
+after key generation when they contain sensitive seed material. For signing and
+verification, `message == NULL` is valid only when `message_size == 0`.
 
 ## Rust API Example
 
@@ -283,29 +290,13 @@ The Rust `serde` feature serializes/deserializes public keys and signatures
 only. Secret key and whole `KeyPair` serde support requires the explicit
 `secret-key-serde` feature because it emits raw secret key material as hex.
 
-## Language Bindings
-
-- `nodejs/` and `python/` are in-tree developer/testing convenience bindings
-  for the single-profile API. They are not production-supported release
-  surfaces for the current cycle.
-- Production integrations should use the C or Rust API directly.
-- Python requires a native shared library by default and only allows its
-  insecure test mock when `BITCOINPQC_ALLOW_MOCK=1` is set. Native ABI smoke
-  checks should set `BITCOINPQC_REQUIRE_NATIVE_ABI=1`.
-- Node.js requires a loadable native addon by default and does not fall back to
-  mock keys, signatures, or verification from production API paths.
-- The legacy Node package has its own binding package version; see
-  `docs/versioning-and-supply-chain.md`.
-
-See `nodejs/README.md` and `python/README.md` for binding-specific setup and testing details.
-
 ## Versioning And Release Checks
 
-Rust, CMake, and Python package metadata currently identify the core library as `0.2.0`.
-The Node package keeps an independent npm package version for its legacy binding distribution.
+Rust and CMake package metadata currently identify the core library as `0.3.0`.
 
 Release readiness and supply-chain validation are tracked in:
 
+- `docs/public-release-surface.md`
 - `docs/versioning-and-supply-chain.md`
 - `docs/release-checklist.md`
 

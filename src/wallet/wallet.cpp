@@ -59,6 +59,7 @@
 #include <util/fs_helpers.h>
 #include <util/moneystr.h>
 #include <util/result.h>
+#include <util/signing_timing.h>
 #include <util/string.h>
 #include <util/time.h>
 #include <util/translation.h>
@@ -330,6 +331,12 @@ struct DeferredCreateKeyPoolTopUpState {
     std::optional<SteadyClock::time_point> refill_start;
 };
 
+struct PlaintextPQCKeyValidationState {
+    std::weak_ptr<CWallet> wallet;
+    CScheduler* scheduler;
+    std::optional<SteadyClock::time_point> validation_start;
+};
+
 void RunScheduledPendingInitialKeyPoolTopUp(const std::shared_ptr<DeferredCreateKeyPoolTopUpState>& state)
 {
     auto wallet = state->wallet.lock();
@@ -377,6 +384,42 @@ void SchedulePendingInitialKeyPoolTopUp(WalletContext& context, const std::share
     context.scheduler->scheduleFromNow([state] { RunScheduledPendingInitialKeyPoolTopUp(state); }, std::chrono::seconds{30});
 }
 
+void RunScheduledPlaintextPQCKeyValidation(const std::shared_ptr<PlaintextPQCKeyValidationState>& state)
+{
+    auto wallet = state->wallet.lock();
+    if (!wallet) {
+        return;
+    }
+    if (!state->validation_start) {
+        state->validation_start = SteadyClock::now();
+    }
+    const auto step_result = wallet->RunPlaintextPQCKeyValidationStep();
+    if (step_result == CWallet::PlaintextPQCKeyValidationStepResult::COMPLETE) {
+        wallet->WalletLogPrintf("Plaintext PQC key validation completed in %15dms\n",
+            Ticks<std::chrono::milliseconds>(SteadyClock::now() - *state->validation_start));
+        return;
+    }
+    if (step_result == CWallet::PlaintextPQCKeyValidationStepResult::FAILED) {
+        wallet->WalletLogPrintf("Plaintext PQC key validation failed; wallet PQC signing is disabled\n");
+        return;
+    }
+    state->scheduler->scheduleFromNow([state] { RunScheduledPlaintextPQCKeyValidation(state); }, std::chrono::milliseconds{1});
+}
+
+void SchedulePlaintextPQCKeyValidationInternal(CScheduler& scheduler, const std::shared_ptr<CWallet>& wallet)
+{
+    const PQCKeyValidationInfo info{wallet->GetPQCKeyValidationInfo()};
+    if (info.pending_records == 0) {
+        return;
+    }
+    auto state = std::make_shared<PlaintextPQCKeyValidationState>(PlaintextPQCKeyValidationState{
+        .wallet = wallet,
+        .scheduler = &scheduler,
+        .validation_start = std::nullopt,
+    });
+    scheduler.scheduleFromNow([state] { RunScheduledPlaintextPQCKeyValidation(state); }, std::chrono::milliseconds{1});
+}
+
 std::shared_ptr<CWallet> LoadWalletInternal(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings)
 {
     try {
@@ -397,6 +440,7 @@ std::shared_ptr<CWallet> LoadWalletInternal(WalletContext& context, const std::s
         NotifyWalletLoaded(context, wallet);
         AddWallet(context, wallet);
         wallet->postInitProcess();
+        if (context.scheduler) SchedulePlaintextPQCKeyValidationInternal(*context.scheduler, wallet);
         SchedulePendingInitialKeyPoolTopUp(context, wallet);
 
         // Write the wallet setting
@@ -465,6 +509,11 @@ private:
     }
 };
 } // namespace
+
+void SchedulePlaintextPQCKeyValidation(CScheduler& scheduler, const std::shared_ptr<CWallet>& wallet)
+{
+    SchedulePlaintextPQCKeyValidationInternal(scheduler, wallet);
+}
 
 std::shared_ptr<CWallet> LoadWallet(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings)
 {
@@ -921,6 +970,11 @@ bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase, bool use_cr
 
     if (IsCrypted())
         return false;
+
+    if (!IsPQCKeyValidationReadyForPrivateKeyUse()) {
+        WalletLogPrintf("Refusing wallet encryption while plaintext PQC key validation is pending or failed\n");
+        return false;
+    }
 
     CKeyingMaterial plain_master_key;
 
@@ -2244,28 +2298,75 @@ void MaybeResendWalletTxs(WalletContext& context)
 }
 
 
-bool CWallet::SignTransaction(CMutableTransaction& tx, const PQCSignatureCounterObserver& pqc_counter_observer) const
+bool CWallet::SignTransaction(CMutableTransaction& tx, const PQCSignatureCounterObserver& pqc_counter_observer, const SigningProgressCallback& progress_callback) const
 {
+    const bool timing_enabled{util::signing_timing::Enabled()};
+    const uint64_t timing_id{timing_enabled ? util::signing_timing::CurrentOrNextId() : 0};
+    const util::signing_timing::ScopedId timing_scope{timing_id};
+    const auto timing_start{SteadyClock::now()};
+    SteadyClock::duration coin_lookup_time{};
+
     // Build coins map
     std::map<COutPoint, Coin> coins;
     {
+        const auto coin_lookup_start{SteadyClock::now()};
         LOCK(cs_wallet);
         for (auto& input : tx.vin) {
             const auto mi = mapWallet.find(input.prevout.hash);
             if(mi == mapWallet.end() || input.prevout.n >= mi->second.tx->vout.size()) {
+                coin_lookup_time = SteadyClock::now() - coin_lookup_start;
+                if (timing_enabled) {
+                    LogDebug(BCLog::BENCH,
+                        "wallet-sign-timing id=%llu phase=wallet_sign_entry inputs=%u coins=%u "
+                        "coin_lookup_ms=%.2f delegate_sign_ms=0.00 total_ms=%.2f success=0 status=missing_input\n",
+                        util::signing_timing::LogId(timing_id),
+                        static_cast<unsigned int>(tx.vin.size()),
+                        static_cast<unsigned int>(coins.size()),
+                        Ticks<MillisecondsDouble>(coin_lookup_time),
+                        Ticks<MillisecondsDouble>(SteadyClock::now() - timing_start));
+                }
                 return false;
             }
             const CWalletTx& wtx = mi->second;
             int prev_height = wtx.state<TxStateConfirmed>() ? wtx.state<TxStateConfirmed>()->confirmed_block_height : 0;
             coins[input.prevout] = Coin(wtx.tx->vout[input.prevout.n], prev_height, wtx.IsCoinBase());
         }
+        coin_lookup_time = SteadyClock::now() - coin_lookup_start;
     }
     std::map<int, bilingual_str> input_errors;
-    return SignTransaction(tx, coins, SIGHASH_DEFAULT, input_errors, pqc_counter_observer);
+    const auto delegate_sign_start{SteadyClock::now()};
+    const bool success{SignTransaction(tx, coins, SIGHASH_DEFAULT, input_errors, pqc_counter_observer, progress_callback)};
+    const auto delegate_sign_time{SteadyClock::now() - delegate_sign_start};
+    if (timing_enabled) {
+        LogDebug(BCLog::BENCH,
+            "wallet-sign-timing id=%llu phase=wallet_sign_entry inputs=%u coins=%u "
+            "coin_lookup_ms=%.2f delegate_sign_ms=%.2f total_ms=%.2f success=%d status=%s\n",
+            util::signing_timing::LogId(timing_id),
+            static_cast<unsigned int>(tx.vin.size()),
+            static_cast<unsigned int>(coins.size()),
+            Ticks<MillisecondsDouble>(coin_lookup_time),
+            Ticks<MillisecondsDouble>(delegate_sign_time),
+            Ticks<MillisecondsDouble>(SteadyClock::now() - timing_start),
+            success,
+            success ? "ok" : "sign_failed");
+    }
+    return success;
 }
 
-bool CWallet::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors, const PQCSignatureCounterObserver& pqc_counter_observer) const
+bool CWallet::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors, const PQCSignatureCounterObserver& pqc_counter_observer, const SigningProgressCallback& progress_callback) const
 {
+    const bool timing_enabled{util::signing_timing::Enabled()};
+    const uint64_t timing_id{timing_enabled ? util::signing_timing::CurrentOrNextId() : 0};
+    const util::signing_timing::ScopedId timing_scope{timing_id};
+    const auto timing_start{SteadyClock::now()};
+    SteadyClock::duration active_snapshot_time{};
+    SteadyClock::duration provider_collect_time{};
+    SteadyClock::duration provider_sign_time{};
+    SteadyClock::duration dummy_sign_time{};
+    unsigned int spk_man_count{0};
+    unsigned int provider_count{0};
+    unsigned int provider_attempts{0};
+
     std::vector<std::unique_ptr<SigningProvider>> providers;
     struct ActiveSigningProviderSnapshot {
         const CWallet& wallet;
@@ -2276,38 +2377,152 @@ bool CWallet::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint,
         }
     } active_signing_snapshot{*this};
     if (IsCrypted()) {
+        const auto active_snapshot_start{SteadyClock::now()};
         if (!TryAddActiveSigningProviderSnapshot()) return false;
+        active_snapshot_time = SteadyClock::now() - active_snapshot_start;
         active_signing_snapshot.active = true;
     }
 
     {
+        const auto provider_collect_start{SteadyClock::now()};
         LOCK(cs_wallet);
-        for (ScriptPubKeyMan* spk_man : GetAllScriptPubKeyMans()) {
-            if (auto provider = spk_man->GetSigningProviderForTransaction(coins, pqc_counter_observer)) {
+        const std::set<ScriptPubKeyMan*> spk_mans{GetAllScriptPubKeyMans()};
+        std::map<ScriptPubKeyMan*, std::map<COutPoint, Coin>> coins_by_spk_man;
+        std::map<COutPoint, Coin> uncached_coins;
+        for (const auto& coin_pair : coins) {
+            const auto& script{coin_pair.second.out.scriptPubKey};
+            const auto cached_spks{m_cached_spks.find(script)};
+            if (cached_spks == m_cached_spks.end() || cached_spks->second.empty()) {
+                // Preserve the previous all-manager scan for scripts outside the wallet cache.
+                uncached_coins.insert(coin_pair);
+                continue;
+            }
+            for (ScriptPubKeyMan* spk_man : cached_spks->second) {
+                coins_by_spk_man[spk_man].insert(coin_pair);
+            }
+        }
+        for (ScriptPubKeyMan* spk_man : spk_mans) {
+            if (!uncached_coins.empty()) {
+                coins_by_spk_man[spk_man].insert(uncached_coins.begin(), uncached_coins.end());
+            }
+            const auto provider_coins{coins_by_spk_man.find(spk_man)};
+            if (provider_coins == coins_by_spk_man.end()) continue;
+            ++spk_man_count;
+            if (auto provider = spk_man->GetSigningProviderForTransaction(provider_coins->second, pqc_counter_observer)) {
                 providers.push_back(std::move(provider));
             }
         }
+        provider_collect_time = SteadyClock::now() - provider_collect_start;
+        provider_count = static_cast<unsigned int>(providers.size());
     }
+
+    const auto log_wallet_sign_timing = [&](bool success, const char* status) {
+        if (!timing_enabled) return;
+        LogDebug(BCLog::BENCH,
+            "wallet-sign-timing id=%llu phase=wallet_sign inputs=%u coins=%u spk_mans=%u providers=%u "
+            "provider_attempts=%u active_snapshot_ms=%.2f provider_collect_ms=%.2f "
+            "provider_sign_ms=%.2f dummy_sign_ms=%.2f total_ms=%.2f success=%d status=%s\n",
+            util::signing_timing::LogId(timing_id),
+            static_cast<unsigned int>(tx.vin.size()),
+            static_cast<unsigned int>(coins.size()),
+            spk_man_count,
+            provider_count,
+            provider_attempts,
+            Ticks<MillisecondsDouble>(active_snapshot_time),
+            Ticks<MillisecondsDouble>(provider_collect_time),
+            Ticks<MillisecondsDouble>(provider_sign_time),
+            Ticks<MillisecondsDouble>(dummy_sign_time),
+            Ticks<MillisecondsDouble>(SteadyClock::now() - timing_start),
+            success,
+            status);
+    };
 
     // Try to sign with all ScriptPubKeyMans
     for (const auto& provider : providers) {
         // SignTransaction will return true if the transaction is complete,
         // so we can exit early and return true if that happens
-        if (::SignTransaction(tx, provider.get(), coins, sighash, input_errors)) {
+        ++provider_attempts;
+        const auto provider_sign_start{SteadyClock::now()};
+        const bool provider_success{::SignTransaction(tx, provider.get(), coins, sighash, input_errors, progress_callback)};
+        provider_sign_time += SteadyClock::now() - provider_sign_start;
+        if (util::signing_timing::TraceEnabled()) {
+            LogTrace(BCLog::BENCH,
+                "wallet-sign-timing id=%llu phase=wallet_sign_provider_attempt attempt=%u "
+                "attempt_ms=%.2f success=%d\n",
+                util::signing_timing::LogId(timing_id),
+                provider_attempts,
+                Ticks<MillisecondsDouble>(SteadyClock::now() - provider_sign_start),
+                provider_success);
+        }
+        if (provider_success) {
+            log_wallet_sign_timing(/*success=*/true, "provider_complete");
             return true;
         }
     }
 
+    const auto dummy_sign_start{SteadyClock::now()};
     if (::SignTransaction(tx, &DUMMY_SIGNING_PROVIDER, coins, sighash, input_errors)) {
+        dummy_sign_time = SteadyClock::now() - dummy_sign_start;
+        log_wallet_sign_timing(/*success=*/true, "dummy_complete");
         return true;
     }
+    dummy_sign_time = SteadyClock::now() - dummy_sign_start;
 
     // At this point, one input was not fully signed otherwise we would have exited already
+    log_wallet_sign_timing(/*success=*/false, "incomplete");
     return false;
 }
 
 std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bool& complete, std::optional<int> sighash_type, bool sign, bool bip32derivs, size_t * n_signed, bool finalize, const PQCSignatureCounterObserver& pqc_counter_observer) const
 {
+    const bool timing_enabled{util::signing_timing::Enabled()};
+    const uint64_t timing_id{timing_enabled ? util::signing_timing::CurrentOrNextId() : 0};
+    const util::signing_timing::ScopedId timing_scope{timing_id};
+    const auto timing_start{SteadyClock::now()};
+    SteadyClock::duration active_snapshot_time{};
+    SteadyClock::duration locked_utxo_time{};
+    SteadyClock::duration locked_precompute_time{};
+    SteadyClock::duration provider_collect_time{};
+    SteadyClock::duration unlocked_precompute_time{};
+    SteadyClock::duration sign_inputs_time{};
+    SteadyClock::duration output_update_time{};
+    SteadyClock::duration remove_unnecessary_time{};
+    SteadyClock::duration final_verify_time{};
+    unsigned int spk_man_count{0};
+    unsigned int provider_count{0};
+    size_t signed_count_metric{0};
+    bool complete_metric{false};
+    const auto log_fillpsbt_timing = [&](bool success, const char* status) {
+        if (!timing_enabled) return;
+        LogDebug(BCLog::BENCH,
+            "wallet-sign-timing id=%llu phase=fillpsbt sign=%d finalize=%d inputs=%u outputs=%u "
+            "spk_mans=%u providers=%u signed_inputs=%u active_snapshot_ms=%.2f locked_utxo_ms=%.2f "
+            "locked_precompute_ms=%.2f provider_collect_ms=%.2f unlocked_precompute_ms=%.2f "
+            "sign_inputs_ms=%.2f output_update_ms=%.2f remove_unnecessary_ms=%.2f final_verify_ms=%.2f "
+            "total_ms=%.2f complete=%d success=%d status=%s\n",
+            util::signing_timing::LogId(timing_id),
+            sign,
+            finalize,
+            static_cast<unsigned int>(psbtx.tx->vin.size()),
+            static_cast<unsigned int>(psbtx.tx->vout.size()),
+            spk_man_count,
+            provider_count,
+            static_cast<unsigned int>(signed_count_metric),
+            Ticks<MillisecondsDouble>(active_snapshot_time),
+            Ticks<MillisecondsDouble>(locked_utxo_time),
+            Ticks<MillisecondsDouble>(locked_precompute_time),
+            Ticks<MillisecondsDouble>(provider_collect_time),
+            Ticks<MillisecondsDouble>(unlocked_precompute_time),
+            Ticks<MillisecondsDouble>(sign_inputs_time),
+            Ticks<MillisecondsDouble>(output_update_time),
+            Ticks<MillisecondsDouble>(remove_unnecessary_time),
+            Ticks<MillisecondsDouble>(final_verify_time),
+            Ticks<MillisecondsDouble>(SteadyClock::now() - timing_start),
+            complete_metric,
+            success,
+            status);
+    };
+
     if (n_signed) {
         *n_signed = 0;
     }
@@ -2321,7 +2536,13 @@ std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bo
         }
     } active_signing_snapshot{*this};
     if (sign && IsCrypted()) {
-        if (!TryAddActiveSigningProviderSnapshot()) return PSBTError::INCOMPLETE;
+        const auto active_snapshot_start{SteadyClock::now()};
+        if (!TryAddActiveSigningProviderSnapshot()) {
+            active_snapshot_time = SteadyClock::now() - active_snapshot_start;
+            log_fillpsbt_timing(/*success=*/false, "active_snapshot_failed");
+            return PSBTError::INCOMPLETE;
+        }
+        active_snapshot_time = SteadyClock::now() - active_snapshot_start;
         active_signing_snapshot.active = true;
     }
 
@@ -2329,6 +2550,7 @@ std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bo
     std::vector<PSBTSigningProvider> providers;
     {
         LOCK(cs_wallet);
+        const auto locked_utxo_start{SteadyClock::now()};
         for (unsigned int i = 0; i < psbtx.tx->vin.size(); ++i) {
             const CTxIn& txin = psbtx.tx->vin[i];
             PSBTInput& input = psbtx.inputs.at(i);
@@ -2349,19 +2571,31 @@ std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bo
                 }
             }
             if (input.non_witness_utxo && txin.prevout.n >= input.non_witness_utxo->vout.size()) {
+                locked_utxo_time = SteadyClock::now() - locked_utxo_start;
+                log_fillpsbt_timing(/*success=*/false, "invalid_prevout_locked");
                 return PSBTError::MISSING_INPUTS;
             }
         }
+        locked_utxo_time = SteadyClock::now() - locked_utxo_start;
+        const auto locked_precompute_start{SteadyClock::now()};
         const PrecomputedTransactionData locked_txdata = PrecomputePSBTData(psbtx);
+        locked_precompute_time = SteadyClock::now() - locked_precompute_start;
+        const auto provider_collect_start{SteadyClock::now()};
         for (ScriptPubKeyMan* spk_man : GetAllScriptPubKeyMans()) {
+            ++spk_man_count;
             if (sign) {
                 if (auto signer_spk_man = dynamic_cast<ExternalSignerScriptPubKeyMan*>(spk_man)) {
                     int n_signed_this_spkm = 0;
                     const auto error{signer_spk_man->FillPSBT(psbtx, locked_txdata, sighash_type, sign, bip32derivs, &n_signed_this_spkm, finalize, pqc_counter_observer)};
-                    if (error) return error;
+                    if (error) {
+                        provider_collect_time = SteadyClock::now() - provider_collect_start;
+                        log_fillpsbt_timing(/*success=*/false, "external_signer_failed");
+                        return error;
+                    }
                     if (n_signed) {
                         (*n_signed) += n_signed_this_spkm;
                     }
+                    signed_count_metric += n_signed_this_spkm;
                     continue;
                 }
             }
@@ -2369,14 +2603,19 @@ std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bo
                 providers.push_back(std::move(*provider));
             }
         }
+        provider_collect_time = SteadyClock::now() - provider_collect_start;
+        provider_count = static_cast<unsigned int>(providers.size());
     }
 
+    const auto unlocked_precompute_start{SteadyClock::now()};
     const PrecomputedTransactionData txdata = PrecomputePSBTData(psbtx);
+    unlocked_precompute_time = SteadyClock::now() - unlocked_precompute_start;
 
     // Fill in information from ScriptPubKeyMans
     for (const auto& psbt_provider : providers) {
         int n_signed_this_spkm = 0;
         HidingSigningProvider input_provider(psbt_provider.provider.get(), /*hide_secret=*/!sign, /*hide_origin=*/!bip32derivs);
+        const auto sign_inputs_start{SteadyClock::now()};
         for (unsigned int i : psbt_provider.input_indexes) {
             const CTxIn& txin = psbtx.tx->vin[i];
             PSBTInput& input = psbtx.inputs.at(i);
@@ -2388,11 +2627,15 @@ std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bo
                 continue;
             }
             if (input.non_witness_utxo && txin.prevout.n >= input.non_witness_utxo->vout.size()) {
+                sign_inputs_time += SteadyClock::now() - sign_inputs_start;
+                log_fillpsbt_timing(/*success=*/false, "invalid_prevout_sign");
                 return PSBTError::MISSING_INPUTS;
             }
 
             PSBTError res = SignPSBTInput(input_provider, psbtx, i, &txdata, sighash_type, nullptr, finalize);
             if (res != PSBTError::OK && res != PSBTError::INCOMPLETE) {
+                sign_inputs_time += SteadyClock::now() - sign_inputs_start;
+                log_fillpsbt_timing(/*success=*/false, "sign_input_failed");
                 return res;
             }
 
@@ -2401,25 +2644,35 @@ std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bo
                 ++n_signed_this_spkm;
             }
         }
+        sign_inputs_time += SteadyClock::now() - sign_inputs_start;
 
         HidingSigningProvider output_provider(psbt_provider.provider.get(), /*hide_secret=*/true, /*hide_origin=*/!bip32derivs);
+        const auto output_update_start{SteadyClock::now()};
         for (unsigned int i = 0; i < psbtx.tx->vout.size(); ++i) {
             UpdatePSBTOutput(output_provider, psbtx, i);
         }
+        output_update_time += SteadyClock::now() - output_update_start;
 
         if (n_signed) {
             (*n_signed) += n_signed_this_spkm;
         }
+        signed_count_metric += n_signed_this_spkm;
     }
 
+    const auto remove_unnecessary_start{SteadyClock::now()};
     RemoveUnnecessaryTransactions(psbtx);
+    remove_unnecessary_time = SteadyClock::now() - remove_unnecessary_start;
 
     // Complete if every input is now signed
+    const auto final_verify_start{SteadyClock::now()};
     complete = true;
     for (size_t i = 0; i < psbtx.inputs.size(); ++i) {
         complete &= PSBTInputSignedAndVerified(psbtx, i, &txdata);
     }
+    final_verify_time = SteadyClock::now() - final_verify_start;
+    complete_metric = complete;
 
+    log_fillpsbt_timing(/*success=*/true, "ok");
     return {};
 }
 
@@ -2434,6 +2687,31 @@ SigningResult CWallet::SignMessage(const std::string& message, const PKHash& pkh
         }
     }
     return SigningResult::PRIVATE_KEY_NOT_AVAILABLE;
+}
+
+util::Result<DataPQCSignatureProof> CWallet::SignDataPQCHash(
+    const WitnessV2P2MR& output,
+    const uint256& message_hash,
+    const std::optional<CPQCPubKey>& requested_pubkey,
+    const std::optional<CScript>& requested_leaf_script,
+    const std::optional<std::vector<unsigned char>>& requested_control_block,
+    const PQCSignatureCounterObserver& pqc_counter_observer) const
+{
+    const CScript script_pub_key = GetScriptForDestination(output);
+    LOCK(cs_wallet); // Protect the SPKM cache lookup and descriptor private-key access below.
+    const std::set<ScriptPubKeyMan*> spk_mans = GetScriptPubKeyMans(script_pub_key);
+    if (spk_mans.empty()) {
+        return util::Error{_("P2MR address is not in this wallet")};
+    }
+
+    bilingual_str last_error;
+    for (const auto& spk_man : spk_mans) {
+        util::Result<DataPQCSignatureProof> proof = spk_man->SignDataPQCHash(
+            output, message_hash, requested_pubkey, requested_leaf_script, requested_control_block, pqc_counter_observer);
+        if (proof) return proof;
+        last_error = util::ErrorString(proof);
+    }
+    return util::Error{last_error.empty() ? _("P2MR data-hash signing failed") : last_error};
 }
 
 OutputType CWallet::TransactionChangeType(const std::optional<OutputType>& change_type, const std::vector<CRecipient>& vecSend) const
@@ -2876,6 +3154,95 @@ bool CWallet::RunPendingInitialKeyPoolTopUp()
         complete ? "completed" : "did not complete",
         Ticks<std::chrono::milliseconds>(SteadyClock::now() - start));
     return complete;
+}
+
+PQCKeyValidationInfo CWallet::GetPQCKeyValidationInfo() const
+{
+    PQCKeyValidationInfo info;
+    bool running{false};
+    bool encrypted{false};
+    {
+        LOCK(cs_wallet);
+        running = m_plaintext_pqc_key_validation_running;
+        encrypted = HasEncryptionKeys();
+        for (const auto* spk_man : GetAllScriptPubKeyMans()) {
+            const PQCKeyValidationInfo spkm_info{spk_man->GetPQCKeyValidationInfo()};
+            info.plaintext_records += spkm_info.plaintext_records;
+            info.pending_records += spkm_info.pending_records;
+            info.validated_records += spkm_info.validated_records;
+            info.failed_records += spkm_info.failed_records;
+        }
+    }
+
+    info.signing_blocked = info.pending_records > 0 || info.failed_records > 0;
+    info.encryption_recommended = !encrypted && info.plaintext_records > 0 && info.failed_records == 0;
+    if (info.failed_records > 0) {
+        info.status = PQCKeyValidationStatus::FAILED;
+    } else if (info.pending_records > 0) {
+        info.status = running ? PQCKeyValidationStatus::RUNNING : PQCKeyValidationStatus::PENDING;
+    } else if (info.plaintext_records > 0) {
+        info.status = PQCKeyValidationStatus::COMPLETE;
+    } else {
+        info.status = PQCKeyValidationStatus::NOT_REQUIRED;
+    }
+    if (info.plaintext_records > 0) {
+        info.progress = std::clamp(static_cast<double>(info.validated_records) / static_cast<double>(info.plaintext_records), 0.0, 1.0);
+    }
+    return info;
+}
+
+CWallet::PlaintextPQCKeyValidationStepResult CWallet::RunPlaintextPQCKeyValidationStep()
+{
+    DescriptorScriptPubKeyMan* target_spk_man{nullptr};
+    std::optional<std::pair<CPQCPubKey, PendingPlaintextPQCKey>> pending_key;
+    {
+        LOCK(cs_wallet);
+        for (ScriptPubKeyMan* spk_man : GetAllScriptPubKeyMans()) {
+            auto* desc_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(spk_man);
+            if (!desc_spk_man) continue;
+            pending_key = desc_spk_man->GetNextPendingPlaintextPQCKey();
+            if (!pending_key) continue;
+            target_spk_man = desc_spk_man;
+            m_plaintext_pqc_key_validation_running = true;
+            break;
+        }
+        if (!pending_key) {
+            m_plaintext_pqc_key_validation_running = false;
+        }
+    }
+
+    if (!pending_key) {
+        NotifyStatusChanged(this);
+        return GetPQCKeyValidationInfo().failed_records > 0 ? PlaintextPQCKeyValidationStepResult::FAILED
+                                                            : PlaintextPQCKeyValidationStepResult::COMPLETE;
+    }
+
+    const auto& [pubkey, pending] = *pending_key;
+    CPQCKey key;
+    key.Set(pending.secret.data(), pending.secret.data() + pending.secret.size());
+    const bool valid{key.IsValid() && key.GetPubKey() == pubkey};
+    if (valid) {
+        target_spk_man->CompletePendingPlaintextPQCKeyValidation(pubkey, key, pending.sig_counter);
+    } else {
+        target_spk_man->FailPendingPlaintextPQCKeyValidation(pubkey);
+    }
+
+    const PQCKeyValidationInfo info{GetPQCKeyValidationInfo()};
+    {
+        LOCK(cs_wallet);
+        m_plaintext_pqc_key_validation_running = info.pending_records > 0;
+    }
+    NotifyStatusChanged(this);
+
+    if (info.pending_records > 0) return PlaintextPQCKeyValidationStepResult::IN_PROGRESS;
+    return info.failed_records > 0 ? PlaintextPQCKeyValidationStepResult::FAILED
+                                   : PlaintextPQCKeyValidationStepResult::COMPLETE;
+}
+
+bool CWallet::IsPQCKeyValidationReadyForPrivateKeyUse() const
+{
+    const PQCKeyValidationInfo info{GetPQCKeyValidationInfo()};
+    return info.pending_records == 0 && info.failed_records == 0;
 }
 
 util::Result<CTxDestination> CWallet::GetNewDestination(const OutputType type, const std::string label)

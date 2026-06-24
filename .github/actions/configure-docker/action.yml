@@ -1,0 +1,189 @@
+name: 'Configure Docker'
+description: 'Set up Docker build driver and configure build cache args'
+inputs:
+  cache-provider:
+    description: 'gha or cirrus cache provider'
+    required: true
+  cache-from-scopes:
+    description: 'Comma-separated cache scopes used for --cache-from'
+    required: false
+    default: ''
+  cache-to-scopes:
+    description: 'Comma-separated cache scopes used for --cache-to'
+    required: false
+    default: ''
+  cache-write-policy:
+    description: 'Cache write behavior: default-branch, always, or never'
+    required: false
+    default: 'default-branch'
+  load-image:
+    description: 'Whether to add --load so the built image is available to docker create/run'
+    required: false
+    default: 'true'
+runs:
+  using: 'composite'
+  steps:
+    - name: Check inputs
+      shell: bash
+      run: |
+        # We expect only gha or cirrus as inputs to cache-provider
+        case "${{ inputs.cache-provider }}" in
+          gha|cirrus)
+            ;;
+          *)
+            echo "::warning title=Unknown input to configure docker action::Provided value was ${{ inputs.cache-provider }}"
+            ;;
+        esac
+
+    - name: Configure BuildKit registry access
+      shell: bash
+      run: |
+        BUILDKIT_CONFIG="${RUNNER_TEMP}/buildkitd.toml"
+        : > "${BUILDKIT_CONFIG}"
+
+        if [[ "${CI_ENFORCE_INTERNAL_REGISTRY}" == "1" ]] && [[ -n "${CI_IMAGE_REGISTRY_PREFIX}" ]]; then
+          REGISTRY_HOST="${CI_IMAGE_REGISTRY_PREFIX%%/*}"
+          {
+            echo "[registry.\"${REGISTRY_HOST}\"]"
+            echo "  http = true"
+            echo "  insecure = true"
+          } >> "${BUILDKIT_CONFIG}"
+          echo "Configured BuildKit to allow plain HTTP for registry host '${REGISTRY_HOST}'."
+        fi
+
+        echo "BUILDKIT_CONFIG=${BUILDKIT_CONFIG}" >> "${GITHUB_ENV}"
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      with:
+        # Use host network to allow access to cirrus gha cache running on the host
+        driver-opts: |
+          network=host
+        buildkitd-config: ${{ env.BUILDKIT_CONFIG }}
+
+    # This is required to allow buildkit to access the actions cache
+    - name: Expose actions cache variables
+      uses: actions/github-script@v6
+      with:
+        script: |
+          Object.keys(process.env).forEach(function (key) {
+            if (key.startsWith('ACTIONS_')) {
+              core.info(`Exporting ${key}`);
+              core.exportVariable(key, process.env[key]);
+            }
+          });
+
+    - name: Construct docker build cache args
+      shell: bash
+      run: |
+        # Configure docker build cache backend
+        #
+        # On forks the gha cache will work but will use Github's cache backend.
+        # Docker will check for variables $ACTIONS_CACHE_URL, $ACTIONS_RESULTS_URL and $ACTIONS_RUNTIME_TOKEN
+        # which are set automatically when running on GitHub infra: https://docs.docker.com/build/cache/backends/gha/#synopsis
+
+        trim_scope() {
+          local scope="$1"
+          scope="${scope#"${scope%%[![:space:]]*}"}"
+          scope="${scope%"${scope##*[![:space:]]}"}"
+          echo "$scope"
+        }
+
+        parse_scope_csv() {
+          local csv="$1"
+          local output_array_name="$2"
+          local -n output_array_ref="$output_array_name"
+          local raw_scope=""
+          local scope=""
+          IFS=',' read -r -a raw_scopes <<< "$csv"
+          for raw_scope in "${raw_scopes[@]}"; do
+            scope="$(trim_scope "$raw_scope")"
+            if [[ -n "$scope" ]]; then
+              output_array_ref+=("$scope")
+            fi
+          done
+        }
+
+        # Use cirrus cache host
+        if [[ ${{ inputs.cache-provider }} == 'cirrus' ]]; then
+          url_args="url=${CIRRUS_CACHE_HOST},url_v2=${CIRRUS_CACHE_HOST}"
+        else
+          url_args=""
+        fi
+
+        cache_from_scopes_input="${{ inputs.cache-from-scopes }}"
+        cache_to_scopes_input="${{ inputs.cache-to-scopes }}"
+        cache_write_policy="${{ inputs.cache-write-policy }}"
+        load_image="${{ inputs.load-image }}"
+
+        if [[ -z "${cache_from_scopes_input}" ]]; then
+          cache_from_scopes_input="${CONTAINER_NAME}"
+        fi
+        if [[ -z "${cache_to_scopes_input}" ]]; then
+          cache_to_scopes_input="${CONTAINER_NAME}"
+        fi
+
+        case "${cache_write_policy}" in
+          default-branch|always|never)
+            ;;
+          *)
+            echo "::warning title=Unknown cache-write-policy::Provided value was ${cache_write_policy}; falling back to default-branch"
+            cache_write_policy="default-branch"
+            ;;
+        esac
+
+        case "${load_image}" in
+          true|false)
+            ;;
+          *)
+            echo "::warning title=Unknown load-image value::Provided value was ${load_image}; falling back to true"
+            load_image="true"
+            ;;
+        esac
+
+        cache_from_scopes=()
+        parse_scope_csv "${cache_from_scopes_input}" cache_from_scopes
+        if [[ ${#cache_from_scopes[@]} -eq 0 ]]; then
+          echo "::error title=Invalid cache-from-scopes::No valid cache scope provided"
+          exit 1
+        fi
+
+        args=()
+        # Always optimistically --cache-from in case a cache blob exists.
+        for scope in "${cache_from_scopes[@]}"; do
+          args+=(--cache-from "type=gha${url_args:+,${url_args}},scope=${scope}")
+        done
+
+        should_write_cache=false
+        case "${cache_write_policy}" in
+          default-branch)
+            if [[ ${{ github.event_name }} == "push" && ${{ github.ref_name }} == ${{ github.event.repository.default_branch }} ]]; then
+              should_write_cache=true
+            fi
+            ;;
+          always)
+            should_write_cache=true
+            ;;
+          never)
+            ;;
+        esac
+
+        # Add --cache-to as configured by the write policy.
+        if [[ "${should_write_cache}" == "true" ]]; then
+          cache_to_scopes=()
+          parse_scope_csv "${cache_to_scopes_input}" cache_to_scopes
+          if [[ ${#cache_to_scopes[@]} -eq 0 ]]; then
+            echo "::error title=Invalid cache-to-scopes::No valid cache scope provided"
+            exit 1
+          fi
+          for scope in "${cache_to_scopes[@]}"; do
+            args+=(--cache-to "type=gha${url_args:+,${url_args}},mode=max,ignore-error=true,scope=${scope}")
+          done
+        fi
+
+        # `--load` is required when the workflow needs to run docker create/run on the image.
+        if [[ "${load_image}" == "true" ]]; then
+          args+=(--load)
+        fi
+
+        echo "DOCKER_BUILD_CACHE_ARG=${args[*]}" >> $GITHUB_ENV

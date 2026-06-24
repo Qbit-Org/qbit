@@ -48,19 +48,17 @@ source contributor references.
 Security and Release Verification
 ---------------------------------
 
-The qbit security reporting process, release artifact verification flow, and
-release signing key metadata are not published from this source snapshot yet.
-Use https://qbit.org for any public security, release, or network-resource
-announcements. Do not use Bitcoin Core security contacts, lifecycle pages,
-release keys, issue lists, IRC channels, or mailing lists for qbit.
+To report security issues, email contact@qbit.org (not for support). Use
+https://qbit.org for public security, release, or network-resource
+announcements.
 
 Contributing
 ------------
 
 The public contribution process is owned by the official qbit GitHub
-repository. Its public URL is still launch-owned, so this tree intentionally
-does not point contributors to Bitcoin Core issues, IRC, mailing lists, or
-review process pages. See [CONTRIBUTING.md](CONTRIBUTING.md) for the source
+repository at https://github.com/Qbit-Org/qbit. This tree intentionally does
+not point contributors to Bitcoin Core issues, IRC, mailing lists, or review
+process pages. See [CONTRIBUTING.md](CONTRIBUTING.md) for the source
 contributor guidance that applies inside this repository.
 
 License

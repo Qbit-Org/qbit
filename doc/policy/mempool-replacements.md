@@ -79,4 +79,4 @@ qbit release history.
 
 * Signaling for replace-by-fee is no longer required.
 
-* The incremental relay feerate default is 0.1 sat/vB.
+* The incremental relay feerate default is 0.1 bits/vB.

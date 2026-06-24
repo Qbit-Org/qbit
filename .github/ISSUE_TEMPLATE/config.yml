@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: qbit Security Policy
+    url: https://github.com/Qbit-Org/qbit/security/policy
+    about: Report security issues privately.
+  - name: qbit Repository
+    url: https://github.com/Qbit-Org/qbit
+    about: qbit project repository

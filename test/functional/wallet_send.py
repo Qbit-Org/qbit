@@ -363,7 +363,7 @@ class WalletSendTest(BitcoinTestFramework):
         self.test_send(from_wallet=w0, to_wallet=w1, amount=1, arg_fee_rate=1, fee_rate=1, add_to_wallet=False,
                        expect_error=(-8, "Pass the fee_rate either as an argument, or in the options object, but not both"))
 
-        assert_raises_rpc_error(-8, "Use fee_rate (sat/vB) instead of feeRate", w0.send, {w1.getnewaddress(): 1}, 6, "conservative", 1, {"feeRate": 0.01})
+        assert_raises_rpc_error(-8, "Use fee_rate (bits/vB) instead of feeRate", w0.send, {w1.getnewaddress(): 1}, 6, "conservative", 1, {"feeRate": 0.01})
 
         assert_raises_rpc_error(-3, "Unexpected key totalFee", w0.send, {w1.getnewaddress(): 1}, 6, "conservative", 1, {"totalFee": 0.01})
 
@@ -389,13 +389,13 @@ class WalletSendTest(BitcoinTestFramework):
         if below_min_fee_rate_sat_vb < Decimal("0.000"):
             below_min_fee_rate_sat_vb = Decimal("0.000")
         self.log.info("Explicit fee rate raises RPC error when fee_rate is below minrelay setting")
-        msg = f"Fee rate ({below_min_fee_rate_sat_vb:.3f} sat/vB) is lower than the minimum fee rate setting ({min_fee_rate_sat_vb:.3f} sat/vB)"
+        msg = f"Fee rate ({below_min_fee_rate_sat_vb:.3f} bits/vB) is lower than the minimum fee rate setting ({min_fee_rate_sat_vb:.3f} bits/vB)"
         self.test_send(from_wallet=w0, to_wallet=w1, amount=1, fee_rate=below_min_fee_rate_sat_vb, expect_error=(-4, msg))
         self.test_send(from_wallet=w0, to_wallet=w1, amount=1, arg_fee_rate=below_min_fee_rate_sat_vb, expect_error=(-4, msg))
 
         self.log.info("Explicit fee rate raises if invalid fee_rate is passed")
         # Test fee_rate with zero values.
-        msg = f"Fee rate (0.000 sat/vB) is lower than the minimum fee rate setting ({min_fee_rate_sat_vb:.3f} sat/vB)"
+        msg = f"Fee rate (0.000 bits/vB) is lower than the minimum fee rate setting ({min_fee_rate_sat_vb:.3f} bits/vB)"
         for zero_value in [0, 0.000, 0.00000000, "0", "0.000", "0.00000000"]:
             self.test_send(from_wallet=w0, to_wallet=w1, amount=1, fee_rate=zero_value, expect_error=(-4, msg))
             self.test_send(from_wallet=w0, to_wallet=w1, amount=1, arg_fee_rate=zero_value, expect_error=(-4, msg))
@@ -404,7 +404,7 @@ class WalletSendTest(BitcoinTestFramework):
         for invalid_value in ["", 0.000000001, 1e-09, 1.111111111, 1111111111111111, "31.999999999999999999999"]:
             self.test_send(from_wallet=w0, to_wallet=w1, amount=1, fee_rate=invalid_value, expect_error=(-3, msg))
             self.test_send(from_wallet=w0, to_wallet=w1, amount=1, arg_fee_rate=invalid_value, expect_error=(-3, msg))
-        # Test fee_rate values that cannot be represented in sat/vB.
+        # Test fee_rate values that cannot be represented in bits/vB.
         for invalid_value in [0.0001, 0.00000001, 0.00099999, 31.99999999]:
             self.test_send(from_wallet=w0, to_wallet=w1, amount=1, fee_rate=invalid_value, expect_error=(-3, msg))
             self.test_send(from_wallet=w0, to_wallet=w1, amount=1, arg_fee_rate=invalid_value, expect_error=(-3, msg))

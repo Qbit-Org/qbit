@@ -1,0 +1,842 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>qbit SPHINCS+ Parameter Explorer</title>
+  <style>
+    :root {
+      --bg-0: #090d12;
+      --bg-1: #111823;
+      --bg-2: #1a2635;
+      --panel: #111a26;
+      --panel-2: #182333;
+      --line: #2a3a50;
+      --text: #e9f0f6;
+      --muted: #a6b7c7;
+      --accent: #50b8ff;
+      --green: #1ec98f;
+      --yellow: #f1cd57;
+      --orange: #f0934a;
+      --red: #ef5f6f;
+      --blue-0: #4fa9ff;
+      --blue-1: #1d80d7;
+      --teal-0: #2ecfbc;
+      --violet-0: #7f7cff;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(1200px 900px at 10% -10%, #1c2e46 0%, transparent 60%),
+        radial-gradient(900px 800px at 100% 0%, #223249 0%, transparent 55%),
+        linear-gradient(180deg, var(--bg-1), var(--bg-0));
+      min-height: 100vh;
+      line-height: 1.4;
+    }
+
+    .wrap {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 24px 18px 56px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 1.7rem;
+      letter-spacing: 0.01em;
+    }
+
+    .sub {
+      margin: 8px 0 0;
+      color: var(--muted);
+      max-width: 980px;
+    }
+
+    .panel {
+      background: linear-gradient(180deg, var(--panel), var(--panel-2));
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 16px;
+      margin-top: 14px;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
+    }
+
+    .section-title {
+      margin: 0 0 10px;
+      font-size: 1.02rem;
+      font-weight: 640;
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 14px;
+    }
+
+    @media (min-width: 980px) {
+      .row.cols-2 {
+        grid-template-columns: 1.2fr 1fr;
+      }
+    }
+
+    .sliders {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 12px;
+    }
+
+    @media (min-width: 780px) {
+      .sliders {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    .slider {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px;
+      background: rgba(8, 12, 18, 0.35);
+    }
+
+    .slider-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+    }
+
+    .slider-head strong {
+      font-size: 0.95rem;
+    }
+
+    .badge {
+      display: inline-block;
+      min-width: 40px;
+      text-align: center;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: #0d1420;
+      padding: 3px 8px;
+      font-size: 0.9rem;
+      font-weight: 640;
+    }
+
+    .range {
+      width: 100%;
+      accent-color: var(--accent);
+    }
+
+    .hint {
+      margin-top: 5px;
+      color: var(--muted);
+      font-size: 0.82rem;
+    }
+
+    .toggle {
+      margin-top: 10px;
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      color: var(--muted);
+      font-size: 0.9rem;
+      border-top: 1px solid var(--line);
+      padding-top: 12px;
+    }
+
+    .toggle input {
+      transform: scale(1.15);
+      accent-color: var(--teal-0);
+    }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    @media (min-width: 980px) {
+      .metrics {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+    }
+
+    .metric {
+      background: rgba(7, 11, 17, 0.45);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px;
+      min-height: 88px;
+    }
+
+    .metric .label {
+      color: var(--muted);
+      font-size: 0.82rem;
+      margin-bottom: 6px;
+    }
+
+    .metric .value {
+      font-size: 1.15rem;
+      font-weight: 680;
+      letter-spacing: 0.01em;
+      word-break: break-word;
+    }
+
+    .tiny {
+      color: var(--muted);
+      font-size: 0.78rem;
+      margin-top: 4px;
+    }
+
+    .band {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      border: 1px solid;
+      padding: 2px 8px;
+      font-size: 0.78rem;
+      font-weight: 640;
+      margin-left: 8px;
+      vertical-align: middle;
+    }
+
+    .band-green { color: var(--green); border-color: rgba(30, 201, 143, 0.55); background: rgba(30, 201, 143, 0.12); }
+    .band-yellow { color: var(--yellow); border-color: rgba(241, 205, 87, 0.55); background: rgba(241, 205, 87, 0.12); }
+    .band-orange { color: var(--orange); border-color: rgba(240, 147, 74, 0.55); background: rgba(240, 147, 74, 0.12); }
+    .band-red { color: var(--red); border-color: rgba(239, 95, 111, 0.55); background: rgba(239, 95, 111, 0.12); }
+
+    .warnings {
+      list-style: none;
+      margin: 8px 0 0;
+      padding: 0;
+      display: grid;
+      gap: 8px;
+    }
+
+    .warnings li {
+      border-radius: 8px;
+      padding: 9px 10px;
+      border: 1px solid;
+      font-size: 0.9rem;
+    }
+
+    .warn-yellow {
+      color: #ffe9ab;
+      border-color: rgba(241, 205, 87, 0.55);
+      background: rgba(241, 205, 87, 0.12);
+    }
+
+    .warn-red {
+      color: #ffd4db;
+      border-color: rgba(239, 95, 111, 0.55);
+      background: rgba(239, 95, 111, 0.12);
+    }
+
+    .warn-green {
+      color: #c7f7e6;
+      border-color: rgba(30, 201, 143, 0.45);
+      background: rgba(30, 201, 143, 0.1);
+    }
+
+    .formula-grid {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 10px;
+    }
+
+    @media (min-width: 980px) {
+      .formula-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    .formula {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px;
+      background: rgba(6, 9, 15, 0.42);
+      font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: 0.84rem;
+      overflow-x: auto;
+      white-space: nowrap;
+    }
+
+    .breakdown {
+      margin-top: 8px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: rgba(6, 9, 15, 0.5);
+      overflow: hidden;
+    }
+
+    .bar {
+      display: flex;
+      width: 100%;
+      height: 30px;
+    }
+
+    .seg {
+      height: 100%;
+      position: relative;
+      min-width: 2px;
+    }
+
+    .seg-rand { background: #4e89ff; }
+    .seg-fors { background: #2ecfbc; }
+    .seg-wots { background: #7e83ff; }
+    .seg-auth { background: #26a86d; }
+
+    .legend {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      padding: 10px;
+      border-top: 1px solid var(--line);
+    }
+
+    @media (min-width: 900px) {
+      .legend {
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+      }
+    }
+
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.86rem;
+      color: var(--muted);
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 2px;
+      flex: 0 0 auto;
+    }
+
+    .presets {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 4px;
+    }
+
+    .preset-btn {
+      border: 1px solid var(--line);
+      background: #101a28;
+      color: var(--text);
+      border-radius: 999px;
+      padding: 7px 11px;
+      cursor: pointer;
+      font-size: 0.84rem;
+    }
+
+    .preset-btn:hover {
+      border-color: #4b6d91;
+      background: #142235;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.86rem;
+      margin-top: 8px;
+    }
+
+    th,
+    td {
+      border-bottom: 1px solid var(--line);
+      padding: 8px 8px;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      color: var(--muted);
+      font-weight: 620;
+      letter-spacing: 0.01em;
+      font-size: 0.79rem;
+      text-transform: uppercase;
+    }
+
+    .row-current {
+      background: rgba(80, 184, 255, 0.12);
+    }
+
+    .mono {
+      font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+      white-space: nowrap;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>qbit SPHINCS+ Parameter Explorer</h1>
+    <p class="sub">
+      Bounded SLH-DSA-SHA2-128s exploration tool. Default profile in this branch: <strong>k=8, a=16, d=5, h=30</strong>.
+      Goal: understand signature size, speed, and security tradeoffs live.
+    </p>
+
+    <section class="panel">
+      <h2 class="section-title">Controls</h2>
+      <div class="row cols-2">
+        <div>
+          <div class="sliders">
+            <div class="slider">
+              <div class="slider-head"><strong>k (FORS trees)</strong><span id="kValue" class="badge">8</span></div>
+              <input id="k" class="range" type="range" min="4" max="22" step="1" value="8">
+              <div class="hint">Range: 4-22</div>
+            </div>
+            <div class="slider">
+              <div class="slider-head"><strong>a (FORS tree height)</strong><span id="aValue" class="badge">16</span></div>
+              <input id="a" class="range" type="range" min="4" max="18" step="1" value="16">
+              <div class="hint">Range: 4-18</div>
+            </div>
+            <div class="slider">
+              <div class="slider-head"><strong>d (Hypertree layers)</strong><span id="dValue" class="badge">5</span></div>
+              <input id="d" class="range" type="range" min="1" max="15" step="1" value="5">
+              <div class="hint">Range: 1-15</div>
+            </div>
+            <div class="slider">
+              <div class="slider-head"><strong>h (Hypertree height)</strong><span id="hValue" class="badge">30</span></div>
+              <input id="h" class="range" type="range" min="20" max="64" step="1" value="30">
+              <div class="hint">Range: 20-64</div>
+            </div>
+          </div>
+          <label class="toggle">
+            <input id="forsCompression" type="checkbox" checked>
+            <span>Use FORS+C signed-tree compression (<span class="mono">k_sig = k-1</span>). Uncheck to model non-compressed FORS (<span class="mono">k_sig = k</span>).</span>
+          </label>
+        </div>
+
+        <div>
+          <div class="metrics">
+            <div class="metric">
+              <div class="label">Signature size</div>
+              <div id="sigSize" class="value">-</div>
+              <div id="sigMode" class="tiny"></div>
+            </div>
+            <div class="metric">
+              <div class="label">FORS security (classical)</div>
+              <div id="classicalBits" class="value">-</div>
+              <div class="tiny">Target: >=128 bits (Category-1 style margin)</div>
+            </div>
+            <div class="metric">
+              <div class="label">FORS security (quantum, Grover)</div>
+              <div id="quantumBits" class="value">-</div>
+              <div class="tiny">Approximate Grover scaling: (k*a)/2</div>
+            </div>
+            <div class="metric">
+              <div class="label">Estimated sign time</div>
+              <div id="signTime" class="value">-</div>
+              <div id="signCost" class="tiny"></div>
+            </div>
+            <div class="metric">
+              <div class="label">Estimated verify time</div>
+              <div id="verifyTime" class="value">-</div>
+              <div id="verifyCost" class="tiny"></div>
+            </div>
+            <div class="metric">
+              <div class="label">Max signatures per key</div>
+              <div id="maxSigs" class="value">-</div>
+              <div class="tiny">Per-key cap = <span class="mono">2^h</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2 class="section-title">Live Warnings</h2>
+      <ul id="warnings" class="warnings"></ul>
+    </section>
+
+    <section class="panel">
+      <h2 class="section-title">Live Formulas</h2>
+      <div class="formula-grid">
+        <div id="f1" class="formula"></div>
+        <div id="f2" class="formula"></div>
+        <div id="f3" class="formula"></div>
+        <div id="f4" class="formula"></div>
+        <div id="f5" class="formula"></div>
+        <div id="f6" class="formula"></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2 class="section-title">Signature Breakdown</h2>
+      <div class="breakdown">
+        <div id="sigBar" class="bar">
+          <div id="segRandom" class="seg seg-rand" style="width: 1%"></div>
+          <div id="segFors" class="seg seg-fors" style="width: 1%"></div>
+          <div id="segWots" class="seg seg-wots" style="width: 1%"></div>
+          <div id="segAuth" class="seg seg-auth" style="width: 1%"></div>
+        </div>
+        <div class="legend">
+          <div class="legend-item"><span class="dot seg-rand"></span><span id="legendRandom"></span></div>
+          <div class="legend-item"><span class="dot seg-fors"></span><span id="legendFors"></span></div>
+          <div class="legend-item"><span class="dot seg-wots"></span><span id="legendWots"></span></div>
+          <div class="legend-item"><span class="dot seg-auth"></span><span id="legendAuth"></span></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2 class="section-title">Presets</h2>
+      <div id="presetButtons" class="presets"></div>
+    </section>
+
+    <section class="panel">
+      <h2 class="section-title">Comparison Table</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Profile</th>
+            <th>Params</th>
+            <th>Sig size</th>
+            <th>k*a</th>
+            <th>Quantum bits</th>
+            <th>Sign time</th>
+            <th>Max sigs</th>
+          </tr>
+        </thead>
+        <tbody id="comparisonBody"></tbody>
+      </table>
+    </section>
+
+    <section class="panel">
+      <h2 class="section-title">Constants</h2>
+      <div class="tiny">
+        Fixed constants in this model: <span class="mono">n=16</span>, <span class="mono">w=256</span>,
+        <span class="mono">WOTS_LEN=16</span> (with WOTS+C), <span class="mono">WOTS_LEN_FULL=18</span> (without).
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const N = 16;
+    const WOTS_LEN = 16;
+    const WOTS_LEN_FULL = 18;
+    const SIGN_CAL_NUM = 148.736574;
+    const SIGN_CAL_DEN = 1998848;
+    const VERIFY_CAL_NUM = 0.614708;
+    const VERIFY_CAL_DEN = 11678;
+
+    const controls = {
+      k: document.getElementById("k"),
+      a: document.getElementById("a"),
+      d: document.getElementById("d"),
+      h: document.getElementById("h"),
+      compression: document.getElementById("forsCompression")
+    };
+
+    const presets = [
+      { name: "Current qbit profile (k=8,a=16)", k: 8, a: 16, d: 5, h: 30 },
+      { name: "Prior develop (k=9,a=9)", k: 9, a: 9, d: 5, h: 30 },
+      { name: "Alt Cat-1 (k=16,a=8)", k: 16, a: 8, d: 5, h: 30 },
+      { name: "Original FORS (k=14,a=12)", k: 14, a: 12, d: 5, h: 30 },
+      { name: "~Kudinov/Nick (k=8,a=12)", k: 8, a: 12, d: 5, h: 30 },
+      { name: "Small + Cat 1 (d=3)", k: 16, a: 8, d: 3, h: 30 },
+      { name: "Standard 128s (upstream)", k: 14, a: 12, d: 7, h: 63 }
+    ];
+
+    function numberWithCommas(value) {
+      return value.toLocaleString("en-US");
+    }
+
+    function formatBigInt(value) {
+      return value.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+    }
+
+    function formatMs(ms) {
+      if (ms < 1) {
+        return ms.toFixed(3) + " ms";
+      }
+      if (ms < 1000) {
+        return ms.toFixed(2) + " ms";
+      }
+      return (ms / 1000).toFixed(2) + " s";
+    }
+
+    function bigintToSci(value) {
+      const s = value.toString();
+      if (s.length <= 4) {
+        return s;
+      }
+      const mantissa = s.slice(0, 1) + "." + s.slice(1, 4);
+      return mantissa + "e" + (s.length - 1);
+    }
+
+    function maxSignatures(h) {
+      return 1n << BigInt(h);
+    }
+
+    function divisorsUpTo15(h) {
+      const ds = [];
+      for (let i = 1; i <= 15; i += 1) {
+        if (h % i === 0) ds.push(i);
+      }
+      return ds;
+    }
+
+    function securityBand(ka) {
+      if (ka >= 128) return "green";
+      if (ka >= 96) return "yellow";
+      if (ka >= 80) return "orange";
+      return "red";
+    }
+
+    function signTimeBand(ms) {
+      if (ms <= 300) return "green";
+      if (ms <= 1000) return "yellow";
+      if (ms <= 5000) return "orange";
+      return "red";
+    }
+
+    function bandChip(kind, label) {
+      return `<span class="band band-${kind}">${label}</span>`;
+    }
+
+    function compute(params) {
+      const k = params.k;
+      const a = params.a;
+      const d = params.d;
+      const h = params.h;
+      const useCompression = params.useCompression;
+
+      const kSig = useCompression ? Math.max(k - 1, 0) : k;
+      const randomizerBytes = N;
+      const forsBytes = N * kSig * (a + 1);
+      const wotsBytes = N * WOTS_LEN * d;
+      const authBytes = N * h;
+      const sigBytes = randomizerBytes + forsBytes + wotsBytes + authBytes;
+      const ka = k * a;
+      const quantumBits = ka / 2;
+      const layerHeight = h / d;
+      const hDivisibleByD = Number.isInteger(layerHeight);
+
+      const signCost = 4608 * d * Math.pow(2, layerHeight) + k * Math.pow(2, a);
+      const signMs = (SIGN_CAL_NUM * signCost) / SIGN_CAL_DEN;
+
+      const verifyCost = 2304 * d + ka + h;
+      const verifyMs = (VERIFY_CAL_NUM * verifyCost) / VERIFY_CAL_DEN;
+
+      const maxSigs = maxSignatures(h);
+
+      return {
+        kSig,
+        randomizerBytes,
+        forsBytes,
+        wotsBytes,
+        authBytes,
+        sigBytes,
+        ka,
+        quantumBits,
+        hDivisibleByD,
+        layerHeight,
+        signCost,
+        signMs,
+        verifyCost,
+        verifyMs,
+        maxSigs
+      };
+    }
+
+    function getCurrentParams() {
+      return {
+        k: Number(controls.k.value),
+        a: Number(controls.a.value),
+        d: Number(controls.d.value),
+        h: Number(controls.h.value),
+        useCompression: controls.compression.checked
+      };
+    }
+
+    function updateSliderBadges() {
+      document.getElementById("kValue").textContent = controls.k.value;
+      document.getElementById("aValue").textContent = controls.a.value;
+      document.getElementById("dValue").textContent = controls.d.value;
+      document.getElementById("hValue").textContent = controls.h.value;
+    }
+
+    function renderWarnings(params, m) {
+      const warningsEl = document.getElementById("warnings");
+      const warnings = [];
+
+      if (!m.hDivisibleByD) {
+        const valid = divisorsUpTo15(params.h).join(", ");
+        warnings.push({
+          cls: "warn-yellow",
+          text: `h/d must be an integer for valid hypertree layering. For h=${params.h}, valid d values are: ${valid}.`
+        });
+      }
+
+      if (m.ka < 128) {
+        warnings.push({
+          cls: "warn-red",
+          text: `k*a=${m.ka} is below 128. This is below the Category-1 target margin.`
+        });
+      }
+
+      if (warnings.length === 0) {
+        warnings.push({
+          cls: "warn-green",
+          text: "No active warnings for divisibility or Category-1 threshold."
+        });
+      }
+
+      warningsEl.innerHTML = warnings
+        .map((w) => `<li class="${w.cls}">${w.text}</li>`)
+        .join("");
+    }
+
+    function renderMetrics(params, m) {
+      const secBand = securityBand(m.ka);
+      const timeBand = signTimeBand(m.signMs);
+
+      document.getElementById("sigSize").textContent = `${numberWithCommas(m.sigBytes)} bytes`;
+      document.getElementById("sigMode").textContent = params.useCompression
+        ? `FORS+C mode: k_sig = k-1 = ${m.kSig}`
+        : `Non-compressed FORS mode: k_sig = k = ${m.kSig}`;
+
+      document.getElementById("classicalBits").innerHTML = `${m.ka} bits ${bandChip(secBand, secBand.toUpperCase())}`;
+      document.getElementById("quantumBits").innerHTML = `${m.quantumBits.toFixed(1)} bits ${bandChip(secBand, secBand.toUpperCase())}`;
+
+      document.getElementById("signTime").innerHTML = `${formatMs(m.signMs)} ${bandChip(timeBand, timeBand.toUpperCase())}`;
+      document.getElementById("signCost").textContent = `sign_cost = ${numberWithCommas(Math.round(m.signCost))} hash calls`;
+
+      document.getElementById("verifyTime").textContent = formatMs(m.verifyMs);
+      document.getElementById("verifyCost").textContent = `verify_cost = ${numberWithCommas(Math.round(m.verifyCost))} hash calls`;
+
+      const maxSigsText = formatBigInt(m.maxSigs);
+      document.getElementById("maxSigs").textContent = `2^${params.h} = ${maxSigsText}`;
+    }
+
+    function renderFormulas(params, m) {
+      const kExpr = params.useCompression ? "(k-1)" : "k";
+      const kNumeric = params.useCompression ? `${params.k - 1}` : `${params.k}`;
+      const signCostRounded = Math.round(m.signCost);
+
+      document.getElementById("f1").textContent = `sig = 16 + 16*${kExpr}*(a+1) + 256*d + 16*h`;
+      document.getElementById("f2").textContent = `sig = 16 + 16*${kNumeric}*(${params.a}+1) + 256*${params.d} + 16*${params.h} = ${m.sigBytes} bytes`;
+      document.getElementById("f3").textContent = `FORS security: k*a = ${params.k}*${params.a} = ${m.ka} bits classical, ${m.quantumBits.toFixed(1)} bits quantum`;
+      document.getElementById("f4").textContent = `max signatures per key: 2^h = 2^${params.h} = ${m.maxSigs.toString()}`;
+      document.getElementById("f5").textContent = `sign_cost = 4608*${params.d}*2^(${params.h}/${params.d}) + ${params.k}*2^${params.a} = ${numberWithCommas(signCostRounded)}`;
+      document.getElementById("f6").textContent = `verify_cost = 2304*${params.d} + ${params.k}*${params.a} + ${params.h} = ${m.verifyCost}`;
+    }
+
+    function renderBreakdown(m) {
+      const total = m.sigBytes;
+      const parts = [
+        { id: "segRandom", bytes: m.randomizerBytes },
+        { id: "segFors", bytes: m.forsBytes },
+        { id: "segWots", bytes: m.wotsBytes },
+        { id: "segAuth", bytes: m.authBytes }
+      ];
+
+      parts.forEach((part) => {
+        const pct = (part.bytes / total) * 100;
+        document.getElementById(part.id).style.width = `${Math.max(pct, 0.8)}%`;
+      });
+
+      document.getElementById("legendRandom").textContent = `Randomizer: ${m.randomizerBytes} B`;
+      document.getElementById("legendFors").textContent = `FORS: ${numberWithCommas(m.forsBytes)} B`;
+      document.getElementById("legendWots").textContent = `WOTS+: ${numberWithCommas(m.wotsBytes)} B`;
+      document.getElementById("legendAuth").textContent = `Auth paths: ${numberWithCommas(m.authBytes)} B`;
+    }
+
+    function renderComparison(currentParams) {
+      const rows = [
+        {
+          name: "Current sliders",
+          params: {
+            k: currentParams.k,
+            a: currentParams.a,
+            d: currentParams.d,
+            h: currentParams.h,
+            useCompression: currentParams.useCompression
+          },
+          current: true
+        },
+        ...presets.map((preset) => ({
+          name: preset.name,
+          params: {
+            ...preset,
+            useCompression: currentParams.useCompression
+          },
+          current: false
+        }))
+      ];
+
+      const tbody = document.getElementById("comparisonBody");
+      tbody.innerHTML = rows.map((row) => {
+        const m = compute(row.params);
+        const securityCls = securityBand(m.ka);
+        const signCls = signTimeBand(m.signMs);
+        const maxSigsSci = bigintToSci(m.maxSigs);
+        const sigFlag = m.hDivisibleByD ? "" : " *";
+
+        return `
+          <tr class="${row.current ? "row-current" : ""}">
+            <td>${row.name}</td>
+            <td class="mono">k=${row.params.k}, a=${row.params.a}, d=${row.params.d}, h=${row.params.h}</td>
+            <td>${numberWithCommas(m.sigBytes)} B${sigFlag}</td>
+            <td>${m.ka} ${bandChip(securityCls, securityCls.toUpperCase())}</td>
+            <td>${m.quantumBits.toFixed(1)}</td>
+            <td>${formatMs(m.signMs)} ${bandChip(signCls, signCls.toUpperCase())}</td>
+            <td class="mono">${maxSigsSci}</td>
+          </tr>
+        `;
+      }).join("");
+    }
+
+    function render() {
+      updateSliderBadges();
+      const params = getCurrentParams();
+      const m = compute(params);
+
+      renderWarnings(params, m);
+      renderMetrics(params, m);
+      renderFormulas(params, m);
+      renderBreakdown(m);
+      renderComparison(params);
+    }
+
+    function setPreset(preset) {
+      controls.k.value = preset.k;
+      controls.a.value = preset.a;
+      controls.d.value = preset.d;
+      controls.h.value = preset.h;
+      render();
+    }
+
+    function initPresets() {
+      const host = document.getElementById("presetButtons");
+      host.innerHTML = "";
+      presets.forEach((preset) => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "preset-btn";
+        btn.textContent = preset.name;
+        btn.addEventListener("click", () => setPreset(preset));
+        host.appendChild(btn);
+      });
+    }
+
+    Object.values(controls).forEach((el) => {
+      el.addEventListener("input", render);
+      el.addEventListener("change", render);
+    });
+
+    initPresets();
+    render();
+  </script>
+</body>
+</html>

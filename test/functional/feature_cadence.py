@@ -130,6 +130,7 @@ class FeatureCadenceTest(BitcoinTestFramework):
             aux_block,
             chain_id=aux_template["chainid"],
             parent_time=self.mock_time,
+            commitment_order=aux_template["commitmentorder"],
         )
         assert_equal(
             node.getblocktemplate(
@@ -157,6 +158,7 @@ class FeatureCadenceTest(BitcoinTestFramework):
             wrong_chain_block,
             chain_id=aux_template["chainid"],
             parent_time=self.mock_time,
+            commitment_order=aux_template["commitmentorder"],
         )
         assert_equal(
             node.getblocktemplate(

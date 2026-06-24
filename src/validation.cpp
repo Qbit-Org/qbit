@@ -4472,6 +4472,12 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
         }
     }
 
+    if (block.SignalsAuxpow()) {
+        if (const auto error = auxpow::Validate(block, consensusParams, /*check_pow=*/false, auxpow::CommitmentValidationForHeight(consensusParams, nHeight))) {
+            return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, error->reject_reason, error->debug_message);
+        }
+    }
+
     return true;
 }
 
@@ -5286,13 +5292,13 @@ void Chainstate::ClearBlockIndexCandidates()
     setBlockIndexCandidates.clear();
 }
 
-bool ChainstateManager::LoadBlockIndex()
+node::BlockIndexLoadResult ChainstateManager::LoadBlockIndex()
 {
     AssertLockHeld(cs_main);
     // Load block index from databases
     if (m_blockman.m_blockfiles_indexed) {
-        bool ret{m_blockman.LoadBlockIndexDB(SnapshotBlockhash())};
-        if (!ret) return false;
+        const auto ret{m_blockman.LoadBlockIndexDB(SnapshotBlockhash())};
+        if (ret != node::BlockIndexLoadResult::SUCCESS) return ret;
 
         m_blockman.ScanAndUnlinkAlreadyPrunedFiles();
         m_blockman.CleanupRecoveredBlocks();
@@ -5302,7 +5308,7 @@ bool ChainstateManager::LoadBlockIndex()
                   CBlockIndexHeightOnlyComparator());
 
         for (CBlockIndex* pindex : vSortedByHeight) {
-            if (m_interrupt) return false;
+            if (m_interrupt) return node::BlockIndexLoadResult::FAILURE;
             // If we have an assumeutxo-based chainstate, then the snapshot
             // block will be a candidate for the tip, but it may not be
             // VALID_TRANSACTIONS (eg if we haven't yet downloaded the block),
@@ -5323,7 +5329,7 @@ bool ChainstateManager::LoadBlockIndex()
                 m_best_header = pindex;
         }
     }
-    return true;
+    return node::BlockIndexLoadResult::SUCCESS;
 }
 
 bool Chainstate::LoadGenesisBlock()

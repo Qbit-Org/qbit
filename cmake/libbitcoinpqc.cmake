@@ -33,7 +33,10 @@ function(add_libbitcoinpqc subdir)
     deduplicate_flags(CMAKE_C_FLAGS)
   endif()
 
+  set(BUILD_TESTING_SAVED "${BUILD_TESTING}")
+  set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
   add_subdirectory(${subdir})
+  set(BUILD_TESTING "${BUILD_TESTING_SAVED}" CACHE BOOL "" FORCE)
 
   # Keep this subtree out of "all" unless linked.
   set_target_properties(bitcoinpqc PROPERTIES

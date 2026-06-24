@@ -40,8 +40,13 @@ static ChainstateLoadResult CompleteChainstateInitialization(
     // LoadBlockIndex will load m_have_pruned if we've ever removed a
     // block file from disk.
     // Note that it also sets m_blockfiles_indexed based on the disk flag!
-    if (!chainman.LoadBlockIndex()) {
+    const auto block_index_load_result{chainman.LoadBlockIndex()};
+    if (block_index_load_result != BlockIndexLoadResult::SUCCESS) {
         if (chainman.m_interrupt) return {ChainstateLoadStatus::INTERRUPTED, {}};
+        if (block_index_load_result == BlockIndexLoadResult::LEGACY_AUXPOW_REQUIRES_REINDEX) {
+            return {ChainstateLoadStatus::LEGACY_AUXPOW_REQUIRES_REINDEX,
+                    _("Legacy pruned AuxPoW block data is missing. A one-time full reindex and resync is required to complete this upgrade.")};
+        }
         return {ChainstateLoadStatus::FAILURE, _("Error loading block database")};
     }
 

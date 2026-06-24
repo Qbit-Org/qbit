@@ -52,6 +52,17 @@ static void RejectReservedWitnessOutputs(const std::vector<CTxOut>& outputs)
     }
 }
 
+static void EnsurePQCKeyValidationReadyForSigning(const CWallet& wallet)
+{
+    const PQCKeyValidationInfo info{wallet.GetPQCKeyValidationInfo()};
+    if (info.pending_records > 0) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Error: plaintext PQC wallet key validation is still in progress. Check getwalletinfo.pqc_key_validation before signing or sending.");
+    }
+    if (info.failed_records > 0) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Error: plaintext PQC wallet key validation failed. Wallet signing is disabled until the wallet is restored or repaired.");
+    }
+}
+
 std::vector<CRecipient> CreateRecipients(const std::vector<std::pair<CTxDestination, CAmount>>& outputs, const std::set<int>& subtract_fee_outputs)
 {
     std::vector<CRecipient> recipients;
@@ -116,6 +127,7 @@ std::set<int> InterpretSubtractFeeFromOutputInstructions(const UniValue& sffo_in
 
 static UniValue FinishTransaction(const std::shared_ptr<CWallet> pwallet, const UniValue& options, CMutableTransaction& rawTx)
 {
+    EnsurePQCKeyValidationReadyForSigning(*pwallet);
     bool can_anti_fee_snipe = !options.exists("locktime");
 
     for (const CTxIn& tx_in : rawTx.vin) {
@@ -202,6 +214,7 @@ UniValue SendMoney(CWallet& wallet, const CCoinControl &coin_control, std::vecto
     if (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
         throw JSONRPCError(RPC_WALLET_ERROR, "Error: Private keys are disabled for this wallet");
     }
+    EnsurePQCKeyValidationReadyForSigning(wallet);
 
     // Shuffle recipient list
     std::shuffle(recipients.begin(), recipients.end(), FastRandomContext());
@@ -993,6 +1006,7 @@ RPCHelpMan signrawtransactionwithwallet()
 
     // Sign the transaction
     EnsureWalletIsUnlocked(*pwallet);
+    EnsurePQCKeyValidationReadyForSigning(*pwallet);
 
     // Fetch previous transactions (inputs):
     std::map<COutPoint, Coin> coins;
@@ -1180,6 +1194,9 @@ static RPCHelpMan bumpfee_helper(std::string method_name)
     LOCK(pwallet->cs_wallet);
 
     EnsureWalletIsUnlocked(*pwallet);
+    if (!want_psbt) {
+        EnsurePQCKeyValidationReadyForSigning(*pwallet);
+    }
 
 
     std::vector<bilingual_str> errors;
@@ -1347,6 +1364,7 @@ RPCHelpMan send()
             UniValue options{request.params[4].isNull() ? UniValue::VOBJ : request.params[4]};
             InterpretFeeEstimationInstructions(/*conf_target=*/request.params[1], /*estimate_mode=*/request.params[2], /*fee_rate=*/request.params[3], options);
             PreventOutdatedOptions(options);
+            EnsurePQCKeyValidationReadyForSigning(*pwallet);
 
 
             bool rbf{options.exists("replaceable") ? options["replaceable"].get_bool() : pwallet->m_signal_rbf};
@@ -1464,6 +1482,7 @@ RPCHelpMan sendall()
             UniValue options{request.params[4].isNull() ? UniValue::VOBJ : request.params[4]};
             InterpretFeeEstimationInstructions(/*conf_target=*/request.params[1], /*estimate_mode=*/request.params[2], /*fee_rate=*/request.params[3], options);
             PreventOutdatedOptions(options);
+            EnsurePQCKeyValidationReadyForSigning(*pwallet);
 
 
             std::set<std::string> addresses_without_amount;
@@ -1717,7 +1736,10 @@ RPCHelpMan walletprocesspsbt()
     bool finalize = request.params[4].isNull() ? true : request.params[4].get_bool();
     bool complete = true;
 
-    if (sign) EnsureWalletIsUnlocked(*pwallet);
+    if (sign) {
+        EnsureWalletIsUnlocked(*pwallet);
+        EnsurePQCKeyValidationReadyForSigning(*pwallet);
+    }
 
     PQCUsageRecorder pqc_usage_recorder;
     const auto err{wallet.FillPSBT(psbtx, complete, nHashType, sign, bip32derivs, nullptr, finalize, sign ? pqc_usage_recorder.GetObserver() : PQCSignatureCounterObserver{})};
@@ -1821,7 +1843,7 @@ RPCHelpMan walletcreatefundedpsbt()
                     }
                                 },
                                 RPCExamples{
-                            "\nCreate a PSBT with automatically picked inputs that sends 0.5 QBT to an address and has a fee rate of 2 sat/vB:\n"
+                            "\nCreate a PSBT with automatically picked inputs that sends 0.5 QBT to an address and has a fee rate of 2 bits/vB:\n"
                             + HelpExampleCli("walletcreatefundedpsbt", "\"[]\" \"[{\\\"" + EXAMPLE_ADDRESS[0] + "\\\":0.5}]\" 0 \"{\\\"add_inputs\\\":true,\\\"fee_rate\\\":2}\"")
                             + "\nCreate the same PSBT as the above one instead using named arguments:\n"
                             + HelpExampleCli("-named walletcreatefundedpsbt", "outputs=\"[{\\\"" + EXAMPLE_ADDRESS[0] + "\\\":0.5}]\" add_inputs=true fee_rate=2")

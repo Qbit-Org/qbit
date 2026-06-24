@@ -1,0 +1,43 @@
+name: Documentation issue
+description: Report missing, unclear, or incorrect documentation.
+labels: [documentation]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for public documentation issues. Do not include security-sensitive details; email contact@qbit.org for security reports.
+  - type: input
+    id: page
+    attributes:
+      label: Page or file
+      description: Link to the page or enter the repository path.
+      placeholder: doc/user/public-testnet.md
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is wrong or missing?
+      description: Describe the documentation problem.
+    validations:
+      required: true
+  - type: textarea
+    id: suggested-change
+    attributes:
+      label: Suggested change
+      description: If you know the fix, describe it here.
+    validations:
+      required: false
+  - type: dropdown
+    id: audience
+    attributes:
+      label: Audience
+      options:
+        - Node operator
+        - Wallet user
+        - Miner or pool operator
+        - Exchange or service integrator
+        - Developer
+        - Other
+    validations:
+      required: false

@@ -76,6 +76,14 @@ def check_merkle_branch(*, leaf, branch, index):
     return merkle_hash
 
 
+def auxpow_commitment_root(root, *, commitment_order="display"):
+    if commitment_order == "display":
+        return ser_uint256(root)[::-1]
+    if commitment_order == "internal":
+        return ser_uint256(root)
+    raise AssertionError(f"unknown AuxPoW commitment order {commitment_order!r}")
+
+
 def make_parent_header(*, merkle_root, ntime, nbits, solve=True):
     parent = CBlockHeader()
     parent.nVersion = 1
@@ -156,6 +164,7 @@ def make_valid_auxpow(
     chain_merkle_branch=None,
     coinbase_merkle_branch=None,
     solve_parent=True,
+    commitment_order="display",
 ):
     chain_merkle_branch = [] if chain_merkle_branch is None else list(chain_merkle_branch)
     coinbase_merkle_branch = [] if coinbase_merkle_branch is None else list(coinbase_merkle_branch)
@@ -163,7 +172,7 @@ def make_valid_auxpow(
     chain_root = check_merkle_branch(leaf=aux_hash, branch=chain_merkle_branch, index=chain_index)
     commitment = (
         MERGED_MINING_HEADER
-        + ser_uint256(chain_root)
+        + auxpow_commitment_root(chain_root, commitment_order=commitment_order)
         + (1 << len(chain_merkle_branch)).to_bytes(4, "little")
         + nonce.to_bytes(4, "little")
     )
@@ -196,23 +205,25 @@ def make_valid_auxpow(
     )
 
 
-def make_valid_auxpow_from_template(template, *, parent_time=0, nonce=0):
+def make_valid_auxpow_from_template(template, *, parent_time=0, nonce=0, commitment_order=None):
     return make_valid_auxpow(
         aux_hash=int(template["hash"], 16),
         target_bits=int(template["bits"], 16),
         chain_id=template["chainid"],
         parent_time=parent_time,
         nonce=nonce,
+        commitment_order=commitment_order or template.get("commitmentorder", "display"),
     )
 
 
-def make_valid_auxpow_from_block(block, *, chain_id=QBIT_AUXPOW_CHAIN_ID, parent_time=0, nonce=0):
+def make_valid_auxpow_from_block(block, *, chain_id=QBIT_AUXPOW_CHAIN_ID, parent_time=0, nonce=0, commitment_order="display"):
     return make_valid_auxpow(
         aux_hash=uint256_from_str(hash256(block._serialize_header())),
         target_bits=block.nBits,
         chain_id=chain_id,
         parent_time=parent_time or block.nTime,
         nonce=nonce,
+        commitment_order=commitment_order,
     )
 
 

@@ -143,6 +143,7 @@ public:
         std::unordered_map<Consensus::DeploymentPos, VersionBitsParameters> version_bits_parameters{};
         std::unordered_map<Consensus::BuriedDeployment, int> activation_heights{};
         std::optional<int> cadence_activation_height{};
+        std::optional<int> auxpow_display_commitment_height{};
         std::optional<int> outer_witness_activation_height{};
         std::optional<int> p2mr_activation_height{};
         bool fastprune{false};

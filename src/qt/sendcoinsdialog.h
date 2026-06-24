@@ -11,10 +11,18 @@
 
 #include <QDialog>
 #include <QMessageBox>
+#include <QPointer>
 #include <QString>
 #include <QTimer>
 
+#include <atomic>
+#include <cstdint>
+#include <memory>
+
 class PlatformStyle;
+class QProgressBar;
+class QProgressDialog;
+class QThread;
 class SendCoinsEntry;
 class SendCoinsRecipient;
 enum class SynchronizationState;
@@ -69,11 +77,27 @@ Q_SIGNALS:
     void coinsSent(const Txid& txid);
 
 private:
+    struct PrepareResult;
+    enum class PrepareProgressPhase {
+        Preparing,
+        Reserving,
+        Signing,
+        Finalizing,
+    };
+    struct PrepareProgress;
+
     Ui::SendCoinsDialog *ui;
     ClientModel* clientModel{nullptr};
     WalletModel* model{nullptr};
     std::unique_ptr<wallet::CCoinControl> m_coin_control;
     std::unique_ptr<WalletModelTransaction> m_current_transaction;
+    std::unique_ptr<WalletModel::UnlockContext> m_prepare_unlock_context;
+    QPointer<QProgressDialog> m_prepare_progress_dialog;
+    QPointer<QProgressBar> m_prepare_progress_bar;
+    QThread* m_prepare_thread{nullptr};
+    uint64_t m_prepare_generation{0};
+    std::atomic_bool m_prepare_cancel_requested{false};
+    std::atomic_bool m_prepare_counters_reserved{false};
     bool fNewRecipientAllowed{true};
     bool fFeeMinimized{true};
     const PlatformStyle *platformStyle;
@@ -87,6 +111,13 @@ private:
     void minimizeFeeSection(bool fMinimize);
     // Format confirmation message
     bool PrepareSendText(QString& question_string, QString& informative_text, QString& detailed_text);
+    bool PrepareSendRequest(std::unique_ptr<WalletModelTransaction>& transaction, wallet::CCoinControl& coin_control);
+    void startPrepareTransaction(std::unique_ptr<WalletModelTransaction> transaction, const wallet::CCoinControl& coin_control);
+    void prepareTransactionProgress(uint64_t generation, PrepareProgress progress);
+    void prepareTransactionFinished(uint64_t generation, std::shared_ptr<PrepareResult> result);
+    void cancelPrepareTransaction();
+    void clearPrepareProgressDialog();
+    void finishSendWithPreparedTransaction(QMessageBox::StandardButton retval);
     /* Sign PSBT using external signer.
      *
      * @param[in,out] psbtx the PSBT to sign

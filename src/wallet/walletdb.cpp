@@ -25,8 +25,10 @@
 #include <wallet/wallet.h>
 
 #include <atomic>
+#include <algorithm>
 #include <array>
 #include <optional>
+#include <span>
 #include <string>
 
 namespace wallet {
@@ -256,9 +258,13 @@ bool WalletBatch::WriteDescriptorPQCKey(const uint256& desc_id, const CPQCPubKey
         true);
 }
 
-bool WalletBatch::WriteCryptedDescriptorPQCKey(const uint256& desc_id, const CPQCPubKey& pubkey, const std::vector<unsigned char>& secret, uint32_t sig_counter)
+bool WalletBatch::WriteCryptedDescriptorPQCKey(const uint256& desc_id, const CPQCPubKey& pubkey, const std::vector<unsigned char>& secret, uint32_t sig_counter, const uint256* auth_tag)
 {
-    if (!WriteIC(std::make_pair(DBKeys::WALLETDESCRIPTORPQCCKEY, std::make_pair(desc_id, pubkey)), std::make_pair(secret, sig_counter), true)) {
+    const auto key{std::make_pair(DBKeys::WALLETDESCRIPTORPQCCKEY, std::make_pair(desc_id, pubkey))};
+    const bool wrote{auth_tag ?
+        WriteIC(key, std::make_pair(secret, std::make_pair(sig_counter, *auth_tag)), true) :
+        WriteIC(key, std::make_pair(secret, sig_counter), true)};
+    if (!wrote) {
         return false;
     }
     EraseIC(std::make_pair(DBKeys::WALLETDESCRIPTORPQCKEY, std::make_pair(desc_id, pubkey)));
@@ -1002,7 +1008,7 @@ static DBErrors LoadDescriptorWalletRecords(CWallet* pwallet, DatabaseBatch& bat
                 return DBErrors::CORRUPT;
             }
 
-            std::vector<unsigned char> privkey_bytes;
+            CKeyingMaterial privkey_bytes;
             uint256 hash;
             uint32_t sig_counter{0};
             value >> privkey_bytes;
@@ -1039,14 +1045,15 @@ static DBErrors LoadDescriptorWalletRecords(CWallet* pwallet, DatabaseBatch& bat
                 return DBErrors::CORRUPT;
             }
 
-            CPQCKey privkey;
-            privkey.Set(privkey_bytes.data(), privkey_bytes.data() + privkey_bytes.size());
-            if (!privkey.IsValid() || privkey.GetPubKey() != pubkey) {
+            if (!std::equal(pubkey.begin(), pubkey.end(), privkey_bytes.end() - pubkey.size())) {
                 strErr = "Error reading wallet database: descriptor PQC key invalid";
                 return DBErrors::CORRUPT;
             }
 
-            spk_man->AddPQCKey(pubkey, privkey, sig_counter);
+            if (!spk_man->AddPendingPlaintextPQCKey(pubkey, std::move(privkey_bytes), sig_counter)) {
+                strErr = "Error reading wallet database: descriptor PQC key load failed";
+                return DBErrors::CORRUPT;
+            }
             return DBErrors::LOAD_OK;
         });
         result = std::max(result, pqc_key_res.m_result);
@@ -1067,6 +1074,7 @@ static DBErrors LoadDescriptorWalletRecords(CWallet* pwallet, DatabaseBatch& bat
 
             std::vector<unsigned char> crypted_secret;
             uint32_t sig_counter{0};
+            std::optional<uint256> auth_tag;
             value >> crypted_secret;
             if (!value.eof()) {
                 try {
@@ -1076,8 +1084,22 @@ static DBErrors LoadDescriptorWalletRecords(CWallet* pwallet, DatabaseBatch& bat
                     return DBErrors::CORRUPT;
                 }
             }
+            if (!value.eof()) {
+                try {
+                    uint256 parsed_auth_tag;
+                    value >> parsed_auth_tag;
+                    auth_tag = parsed_auth_tag;
+                } catch (const std::exception& e) {
+                    err = strprintf("Error reading wallet database: descriptor encrypted PQC auth tag parse failed (%s)", e.what());
+                    return DBErrors::CORRUPT;
+                }
+            }
+            if (!value.eof()) {
+                err = "Error reading wallet database: descriptor encrypted PQC key has trailing data";
+                return DBErrors::CORRUPT;
+            }
 
-            spk_man->AddCryptedPQCKey(pubkey, crypted_secret, sig_counter);
+            spk_man->AddCryptedPQCKey(pubkey, crypted_secret, sig_counter, auth_tag);
             return DBErrors::LOAD_OK;
         });
         result = std::max(result, crypted_pqc_key_res.m_result);

@@ -202,6 +202,19 @@ void WalletView::showOutOfSyncWarning(bool fShow)
 
 void WalletView::encryptWallet()
 {
+    const wallet::PQCKeyValidationInfo pqc_validation{walletModel->getPQCKeyValidationInfo()};
+    if (pqc_validation.pending_records > 0) {
+        Q_EMIT message(tr("Wallet encryption unavailable"),
+                       tr("Wallet key validation is still in progress. Encryption will be available when validation completes."),
+                       CClientUIInterface::MSG_WARNING);
+        return;
+    }
+    if (pqc_validation.failed_records > 0) {
+        Q_EMIT message(tr("Wallet encryption unavailable"),
+                       tr("Plaintext PQC key validation failed. Wallet encryption is disabled until the wallet is restored or repaired."),
+                       CClientUIInterface::MSG_ERROR);
+        return;
+    }
     auto dlg = new AskPassphraseDialog(AskPassphraseDialog::Encrypt, this);
     dlg->setModel(walletModel);
     connect(dlg, &QDialog::finished, this, &WalletView::encryptionStatusChanged);

@@ -113,6 +113,12 @@ enum BlockfileType {
 
 std::ostream& operator<<(std::ostream& os, const BlockfileType& type);
 
+enum class BlockIndexLoadResult {
+    SUCCESS,
+    FAILURE,
+    LEGACY_AUXPOW_REQUIRES_REINDEX,
+};
+
 struct BlockfileCursor {
     // The latest blockfile number.
     int file_num{0};
@@ -154,6 +160,8 @@ private:
      * collections like m_dirty_blockindex.
      */
     bool LoadBlockIndex(const std::optional<uint256>& snapshot_blockhash)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    BlockIndexLoadResult UpgradeLegacyAuxpowBlockIndexEntries()
         EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     /** Return false if block file or undo file flushing fails. */
@@ -344,7 +352,7 @@ public:
     std::unique_ptr<BlockTreeDB> m_block_tree_db GUARDED_BY(::cs_main);
 
     bool WriteBlockIndexDB() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
-    bool LoadBlockIndexDB(const std::optional<uint256>& snapshot_blockhash)
+    BlockIndexLoadResult LoadBlockIndexDB(const std::optional<uint256>& snapshot_blockhash)
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     /**

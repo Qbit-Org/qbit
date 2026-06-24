@@ -4,6 +4,7 @@
 
 #include <qt/test/modaloverlaytests.h>
 
+#include <chainparams.h>
 #include <qt/modaloverlay.h>
 
 #include <QDateTime>
@@ -68,7 +69,7 @@ void ModalOverlayTests::headersPresyncProgressStaysVisible()
     overlay.showHide(/*hide=*/false, /*userRequested=*/true);
     overlay.tipUpdate(/*count=*/0, presync_date.addSecs(-3600), /*nVerificationProgress=*/1.0);
     QVERIFY(!blocks_left->text().contains("Pre-syncing Headers"));
-    QCOMPARE(progress_value->text(), QString("100.00%"));
+    QCOMPARE(progress_value->text(), QString("99.99%"));
 
     overlay.setKnownBestHeight(/*count=*/3000, presync_date, /*presync=*/false);
     overlay.setKnownBestHeight(/*count=*/3000, presync_date, /*presync=*/true);
@@ -180,4 +181,31 @@ void ModalOverlayTests::progressSampleHistoryIsBounded()
     }
 
     QVERIFY(overlay.blockProcessTime.size() <= 2048);
+}
+
+void ModalOverlayTests::incompleteProgressDoesNotRoundToComplete()
+{
+    ModalOverlay overlay{/*enable_wallet=*/false, /*parent=*/nullptr};
+    QLabel* blocks_left{overlay.findChild<QLabel*>("numberOfBlocksLeft")};
+    QLabel* progress_value{overlay.findChild<QLabel*>("percentageProgress")};
+    QVERIFY(blocks_left);
+    QVERIFY(progress_value);
+
+    overlay.showHide(/*hide=*/false, /*userRequested=*/true);
+
+    const QDateTime now{QDateTime::currentDateTime()};
+    overlay.tipUpdate(/*count=*/100, now, /*nVerificationProgress=*/1.0);
+    QCOMPARE(progress_value->text(), QString("100.00%"));
+
+    overlay.tipUpdate(/*count=*/100, now.addSecs(-2 * 60 * 60), /*nVerificationProgress=*/1.0);
+    QCOMPARE(progress_value->text(), QString("99.99%"));
+
+    const int64_t target_spacing{Params().GetConsensus().nPowTargetSpacing};
+    const QDateTime header_date{QDateTime::currentDateTime().addSecs(-30 * target_spacing)};
+    overlay.setKnownBestHeight(/*count=*/1'500'000, header_date, /*presync=*/false);
+    QVERIFY(blocks_left->text().contains("99.9%"));
+    QVERIFY(!blocks_left->text().contains("100.0%"));
+
+    overlay.setKnownBestHeight(/*count=*/1'500'000, header_date, /*presync=*/true);
+    QCOMPARE(progress_value->text(), QString("99.9%"));
 }

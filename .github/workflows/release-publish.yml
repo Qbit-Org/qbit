@@ -200,7 +200,7 @@ jobs:
             "ci/release/validate_release_artifacts.py"
             "ci/release/validate_builder_attestations.py"
             "ci/release/validate_key_metadata.py"
-            "contrib/release-process/verify-testnet-release-posture.py"
+            "ci/release/verify_testnet_release_posture.py"
             "contrib/keys/operator-keys/keys.json"
           )
           for required_path in "${required_paths[@]}"; do
@@ -333,7 +333,7 @@ jobs:
             args+=(--allow-codesigning-artifacts)
           fi
 
-          python3 "${TRUSTED_ROOT}/contrib/release-process/verify-testnet-release-posture.py" \
+          python3 "${TRUSTED_ROOT}/ci/release/verify_testnet_release_posture.py" \
             "${args[@]}"
 
       - name: Validate staged artifacts and release signatures

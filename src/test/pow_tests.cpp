@@ -780,6 +780,14 @@ void sanity_check_chainparams(const ArgsManager& args, ChainType chain_type)
         BOOST_CHECK(!over);
         BOOST_CHECK(UintToArith256(consensus.powLimit) >= auxpow_anchor_compact);
     }
+
+    const ChainTxData& tx_data{chainParams->TxData()};
+    BOOST_CHECK_GT(tx_data.dTxRate, 0.0);
+    if (chain_type != ChainType::REGTEST) {
+        BOOST_CHECK_EQUAL(tx_data.nTime, chainParams->GenesisBlock().nTime);
+        BOOST_CHECK_EQUAL(tx_data.tx_count, 1U);
+        BOOST_CHECK_CLOSE(tx_data.dTxRate, 1.0 / static_cast<double>(consensus.nPowTargetSpacing), 1e-12);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(ChainParams_MAIN_sanity)

@@ -2,6 +2,8 @@
     <qresource prefix="/icons">
         <file alias="qbit">res/icons/qbit.png</file>
         <file alias="overview-background-logo">res/icons/overview-background-logo.png</file>
+        <file alias="overview-background-logo-dark">res/icons/overview-background-logo.png</file>
+        <file alias="overview-background-logo-light">res/icons/overview-background-logo-light.png</file>
         <file alias="address-book">res/icons/address-book.png</file>
         <file alias="send">res/icons/send.png</file>
         <file alias="connect_0">res/icons/connect0.png</file>

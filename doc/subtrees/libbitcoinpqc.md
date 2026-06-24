@@ -1,103 +1,94 @@
 # libbitcoinpqc Subtree Runbook
 
-This runbook defines the update flow for `src/libbitcoinpqc` in the qbit repository.
+This runbook defines the update flow for `src/libbitcoinpqc` in the qbit
+repository.
 
-The update is a two-repo process:
-- Curate `libbitcoinpqc-qbit` (`develop` -> `qbit-subtree`).
-- Import `qbit-subtree` into qbit as a squashed subtree update.
+The subtree source is `Qbit-Org/qbit-libbitcoinpqc`. Imports must use immutable
+release tags from that repository, not the moving `main` branch.
 
-Do not import from `libbitcoinpqc-qbit/develop` directly.
+## Current Pin
 
-## Branch Roles
+- Source repository: `https://github.com/Qbit-Org/qbit-libbitcoinpqc.git`
+- Source tag: `v0.3.0`
+- Peeled tag commit: `ac72d1ffa0ef486f08d37334a43f5db1adb731db`
+- qbit subtree path: `src/libbitcoinpqc`
 
-- `libbitcoinpqc-qbit:develop`:
-  Full upstream development branch. Includes tests, bindings, docs, and tooling.
-- `libbitcoinpqc-qbit:qbit-subtree`:
-  Curated branch for qbit subtree imports. This branch is produced by pruning
-  non-runtime payload after integrating `develop`.
-- `qbit:src/libbitcoinpqc`:
-  Squashed subtree mirror of `libbitcoinpqc-qbit:qbit-subtree`.
+`v0.3.0` is an annotated tag. Git subtree metadata records the peeled commit,
+so the expected `git-subtree-split` value is
+`ac72d1ffa0ef486f08d37334a43f5db1adb731db`.
 
-## Phase 1: Refresh `qbit-subtree` in `libbitcoinpqc-qbit`
-
-Run in a clean `libbitcoinpqc-qbit` clone:
-
-```bash
-git fetch origin
-git checkout -B qbit-subtree-update origin/qbit-subtree
-git merge --no-ff origin/develop
-scripts/prune-for-qbit-subtree.sh
-git add -A
-git commit -m "subtree: prune non-runtime payload for qbit"
-git push origin HEAD:qbit-subtree
-```
-
-qbit intentionally does not keep a local copy of the prune helper under
-`src/libbitcoinpqc/scripts/`. The canonical helper is
-`libbitcoinpqc-qbit:develop:scripts/prune-for-qbit-subtree.sh`, and it deletes
-itself from the curated `qbit-subtree` output after pruning. If
-`scripts/prune-for-qbit-subtree.sh` is missing in your upstream working branch,
-recover it from `origin/develop`, not from `origin/qbit-subtree`:
-
-```bash
-mkdir -p scripts
-git show origin/develop:scripts/prune-for-qbit-subtree.sh > scripts/prune-for-qbit-subtree.sh
-chmod +x scripts/prune-for-qbit-subtree.sh
-```
-
-## Phase 2: Import Curated Subtree into qbit
+## Import Or Refresh The Subtree
 
 Run in a clean `qbit` worktree:
 
 ```bash
 git fetch origin
 git checkout <your-qbit-branch>
-LIBBITCOINPQC_REMOTE_URL=git@github.com:<owner>/libbitcoinpqc-qbit.git \
 contrib/devtools/update-libbitcoinpqc-subtree.sh
 ```
 
-Verify full subtree integrity:
+The helper defaults to `Qbit-Org/qbit-libbitcoinpqc` tag `v0.3.0`. To test a
+future release candidate before changing the defaults:
 
 ```bash
+LIBBITCOINPQC_REMOTE_REF=<tag> \
+contrib/devtools/update-libbitcoinpqc-subtree.sh
+```
+
+or:
+
+```bash
+contrib/devtools/update-libbitcoinpqc-subtree.sh <tag>
+```
+
+Do not import from `main`; create and review a release tag in
+`qbit-libbitcoinpqc` first.
+
+## Verify Subtree Integrity
+
+After importing, verify that the qbit subtree exactly matches the upstream
+commit referenced by the subtree metadata:
+
+```bash
+git fetch https://github.com/Qbit-Org/qbit-libbitcoinpqc.git v0.3.0
 test/lint/git-subtree-check.sh -r src/libbitcoinpqc
 ```
+
+The check should report `GOOD` and show the subtree split commit as
+`ac72d1ffa0ef486f08d37334a43f5db1adb731db` for the current pin.
 
 ## PR Checklist For Subtree Updates
 
 When a PR touches `src/libbitcoinpqc`, confirm:
 
-- [ ] Upstream fix was merged into `libbitcoinpqc-qbit/develop`.
-- [ ] Curated `libbitcoinpqc-qbit/qbit-subtree` was refreshed with prune.
-- [ ] qbit subtree was updated via `contrib/devtools/update-libbitcoinpqc-subtree.sh`.
+- [ ] The source commit is reachable from an immutable release tag in
+  `Qbit-Org/qbit-libbitcoinpqc`.
+- [ ] qbit imported that tag via `contrib/devtools/update-libbitcoinpqc-subtree.sh`.
 - [ ] `test/lint/git-subtree-check.sh -r src/libbitcoinpqc` passes locally.
+- [ ] Any default tag change in `contrib/devtools/update-libbitcoinpqc-subtree.sh`
+  is intentional and matches this runbook.
 
 ## Common Failures
 
 1. Signature:
-   `/tmp/.../src/libbitcoinpqc/sphincsplus/ref/sha2.c:... runtime error: left shift ...`
-   Cause:
-   Fix landed in `libbitcoinpqc-qbit/develop` but `qbit-subtree` was not refreshed.
-   Fix:
-   Re-run Phase 1, then re-run Phase 2.
-
-2. Signature:
    `FAIL: subtree directory was touched without subtree merge`
    Cause:
-   Manual edits in `src/libbitcoinpqc` bypassed subtree import.
+   Files under `src/libbitcoinpqc` were edited manually after the subtree import.
    Fix:
    Re-import via `contrib/devtools/update-libbitcoinpqc-subtree.sh`.
 
-3. Signature:
-   `fatal: unable to access 'https://github.com/...': The requested URL returned error: 403`
-   Cause:
-   Private repo fetch over HTTPS without credentials.
-   Fix:
-   Use SSH remote URL override:
-   `LIBBITCOINPQC_REMOTE_URL=git@github.com:<owner>/libbitcoinpqc-qbit.git`.
-
-4. Signature:
+2. Signature:
    `subtree commit <hash> unavailable: cannot compare. Did you add and fetch the remote?`
    Cause:
    `git-subtree-check.sh -r` cannot find the upstream commit locally.
    Fix:
-   Run the update script (or fetch the upstream ref) before the `-r` check.
+   Run the update script, or fetch the pinned tag from
+   `Qbit-Org/qbit-libbitcoinpqc`, before the `-r` check.
+
+3. Signature:
+   `fatal: unable to access 'https://github.com/...': The requested URL returned error: 403`
+   Cause:
+   The repository requires credentials for HTTPS fetches.
+   Fix:
+   Use an authenticated remote URL override:
+   `LIBBITCOINPQC_REMOTE_URL=git@github.com:Qbit-Org/qbit-libbitcoinpqc.git`.

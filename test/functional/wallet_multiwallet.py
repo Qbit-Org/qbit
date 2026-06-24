@@ -218,6 +218,8 @@ class MultiWalletTest(BitcoinTestFramework):
 
         wallets = [wallet(w) for w in wallet_names]
         wallet_bad = wallet("bad")
+        for wallet_rpc in wallets:
+            self.wait_pqc_key_validation_ready(wallet_rpc)
 
         # check wallet names and balances
         self.generatetoaddress(node, nblocks=1, address=wallets[0].getnewaddress(), sync_fun=self.no_op)
@@ -358,6 +360,7 @@ class MultiWalletTest(BitcoinTestFramework):
 
         # Successfully unload the wallet referenced by the request endpoint
         # Also ensure unload works during walletpassphrase timeout
+        self.wait_pqc_key_validation_ready(w2)
         w2.encryptwallet('test')
         w2.walletpassphrase('test', 1)
         w2.unloadwallet()

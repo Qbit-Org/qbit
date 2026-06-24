@@ -28,6 +28,18 @@ extern "C" {
 
 /**
  * @brief Generate an SLH-DSA-SHA2-128s-bounded30 key pair.
+ *
+ * On success, pk and sk are a self-consistent same-call output pair. The secret
+ * key layout is [SK_SEED || SK_PRF || PUB_SEED || root], and the public key
+ * layout is [PUB_SEED || root]. Key generation computes the root before
+ * returning, so trusted callers that immediately adopt output written by this
+ * call do not need to call slh_dsa_secret_key_validate() only to recheck that
+ * root.
+ *
+ * This trusted-output contract applies only to output from the successful
+ * slh_dsa_keygen() call. Imported, deserialized, or otherwise untrusted
+ * exact-size secret material must still be checked with
+ * slh_dsa_secret_key_validate() before acceptance.
  */
 int slh_dsa_keygen(
     uint8_t *pk,

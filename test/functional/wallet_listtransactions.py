@@ -235,6 +235,8 @@ class ListTransactionsTest(BitcoinTestFramework):
         self.connect_nodes(0, 1)
         self.connect_nodes(1, 2)
         self.connect_nodes(2, 0)
+        self.wait_pqc_key_validation_ready(self.nodes[0])
+        self.wait_pqc_key_validation_ready(self.nodes[1])
 
         addr1 = self.nodes[0].getnewaddress("pizza1", 'legacy')
         addr2 = self.nodes[0].getnewaddress("pizza2", 'p2sh-segwit')

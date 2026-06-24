@@ -11,11 +11,13 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cstdint>
 #include <iterator>
 #include <limits>
 #include <optional>
 #include <string_view>
+#include <vector>
 
 namespace {
 static constexpr std::array<unsigned char, 4> MERGED_MINING_HEADER{0xfa, 0xbe, 0x6d, 0x6d};
@@ -29,7 +31,7 @@ bool HasRoom(Iterator first, Iterator last, size_t size)
 }
 } // namespace
 
-std::optional<auxpow::ValidationError> CAuxPow::Validate(const uint256& aux_block_hash, const Consensus::Params& consensus, const uint32_t target_bits, const uint16_t expected_chain_id, const bool check_pow) const
+std::optional<auxpow::ValidationError> CAuxPow::Validate(const uint256& aux_block_hash, const Consensus::Params& consensus, const uint32_t target_bits, const uint16_t expected_chain_id, const bool check_pow, const auxpow::CommitmentValidation commitment_validation) const
 {
     if (!coinbase_tx || !coinbase_tx->IsCoinBase()) {
         return Invalid("bad-auxpow-coinbase", "auxpow payload coinbase transaction missing or invalid");
@@ -68,50 +70,85 @@ std::optional<auxpow::ValidationError> CAuxPow::Validate(const uint256& aux_bloc
 
     const uint256 chain_root = auxpow::CheckMerkleBranch(aux_block_hash, chain_merkle_branch, static_cast<uint32_t>(chain_index));
     const auto& script_sig = coinbase_tx->vin[0].scriptSig;
+    std::vector<unsigned char> internal_commitment{chain_root.begin(), chain_root.end()};
+    std::vector<unsigned char> display_commitment{internal_commitment};
+    std::reverse(display_commitment.begin(), display_commitment.end());
 
-    const auto root_it = std::search(script_sig.begin(), script_sig.end(), chain_root.begin(), chain_root.end());
-    if (root_it == script_sig.end()) {
-        return Invalid("bad-auxpow-commitment", "auxpow chain merkle root missing from parent coinbase scriptSig");
-    }
-
-    const auto header_it = std::search(script_sig.begin(), script_sig.end(), MERGED_MINING_HEADER.begin(), MERGED_MINING_HEADER.end());
-    if (header_it != script_sig.end()) {
-        const auto second_header_it = std::search(std::next(header_it), script_sig.end(), MERGED_MINING_HEADER.begin(), MERGED_MINING_HEADER.end());
-        if (second_header_it != script_sig.end()) {
-            return Invalid("bad-auxpow-commitment", "auxpow parent coinbase contains multiple merged mining headers");
+    const std::vector<const std::vector<unsigned char>*> commitments = [&] {
+        switch (commitment_validation) {
+        case auxpow::CommitmentValidation::INTERNAL:
+            return std::vector<const std::vector<unsigned char>*>{&internal_commitment};
+        case auxpow::CommitmentValidation::DISPLAY:
+            return std::vector<const std::vector<unsigned char>*>{&display_commitment};
+        case auxpow::CommitmentValidation::EITHER:
+            if (internal_commitment == display_commitment) {
+                return std::vector<const std::vector<unsigned char>*>{&display_commitment};
+            }
+            return std::vector<const std::vector<unsigned char>*>{&display_commitment, &internal_commitment};
         }
-        if (std::next(header_it, MERGED_MINING_HEADER.size()) != root_it) {
-            return Invalid("bad-auxpow-commitment", "auxpow merged mining header must be immediately followed by the committed chain merkle root");
+        assert(false);
+        return std::vector<const std::vector<unsigned char>*>{};
+    }();
+
+    std::optional<auxpow::ValidationError> commitment_error;
+    for (const auto* chain_root_commitment : commitments) {
+        const auto root_it = std::search(script_sig.begin(), script_sig.end(), chain_root_commitment->begin(), chain_root_commitment->end());
+        if (root_it == script_sig.end()) {
+            continue;
         }
-    } else if (static_cast<size_t>(std::distance(script_sig.begin(), root_it)) > auxpow::LEGACY_COMMITMENT_START_LIMIT) {
-        return Invalid("bad-auxpow-commitment", "auxpow chain merkle root appears too deep in the parent coinbase scriptSig");
+
+        const auto header_it = std::search(script_sig.begin(), script_sig.end(), MERGED_MINING_HEADER.begin(), MERGED_MINING_HEADER.end());
+        if (header_it != script_sig.end()) {
+            const auto second_header_it = std::search(std::next(header_it), script_sig.end(), MERGED_MINING_HEADER.begin(), MERGED_MINING_HEADER.end());
+            if (second_header_it != script_sig.end()) {
+                commitment_error = Invalid("bad-auxpow-commitment", "auxpow parent coinbase contains multiple merged mining headers");
+                continue;
+            }
+            if (std::next(header_it, MERGED_MINING_HEADER.size()) != root_it) {
+                commitment_error = Invalid("bad-auxpow-commitment", "auxpow merged mining header must be immediately followed by the committed chain merkle root");
+                continue;
+            }
+        } else if (static_cast<size_t>(std::distance(script_sig.begin(), root_it)) > auxpow::LEGACY_COMMITMENT_START_LIMIT) {
+            commitment_error = Invalid("bad-auxpow-commitment", "auxpow chain merkle root appears too deep in the parent coinbase scriptSig");
+            continue;
+        }
+
+        const auto footer_it = std::next(root_it, chain_root_commitment->size());
+        if (!HasRoom(footer_it, script_sig.end(), sizeof(uint32_t) * 2)) {
+            commitment_error = Invalid("bad-auxpow-commitment", "auxpow commitment is missing merkle size or nonce footer");
+            continue;
+        }
+
+        const uint32_t merkle_size = ReadLE32(&*footer_it);
+        const uint32_t nonce = ReadLE32(&*std::next(footer_it, sizeof(uint32_t)));
+        const uint32_t expected_size = 1U << chain_merkle_branch.size();
+        if (merkle_size != expected_size) {
+            commitment_error = Invalid("bad-auxpow-merkle-size", strprintf("auxpow merkle size=%u expected=%u", merkle_size, expected_size));
+            continue;
+        }
+
+        const int32_t expected_index = auxpow::GetExpectedIndex(nonce, expected_chain_id, chain_merkle_branch.size());
+        if (chain_index != expected_index) {
+            commitment_error = Invalid("bad-auxpow-chain-index",
+                                       strprintf("auxpow chain index=%d expected=%d for chainid=%u nonce=%u",
+                                                 chain_index,
+                                                 expected_index,
+                                                 static_cast<unsigned int>(expected_chain_id),
+                                                 nonce));
+            continue;
+        }
+
+        return std::nullopt;
     }
 
-    const auto footer_it = std::next(root_it, uint256::size());
-    if (!HasRoom(footer_it, script_sig.end(), sizeof(uint32_t) * 2)) return Invalid("bad-auxpow-commitment", "auxpow commitment is missing merkle size or nonce footer");
-
-    const uint32_t merkle_size = ReadLE32(&*footer_it);
-    const uint32_t nonce = ReadLE32(&*std::next(footer_it, sizeof(uint32_t)));
-    const uint32_t expected_size = 1U << chain_merkle_branch.size();
-    if (merkle_size != expected_size) {
-        return Invalid("bad-auxpow-merkle-size", strprintf("auxpow merkle size=%u expected=%u", merkle_size, expected_size));
+    if (commitment_error) {
+        return commitment_error;
     }
-
-    const int32_t expected_index = auxpow::GetExpectedIndex(nonce, expected_chain_id, chain_merkle_branch.size());
-    if (chain_index != expected_index) {
-        return Invalid("bad-auxpow-chain-index",
-                       strprintf("auxpow chain index=%d expected=%d for chainid=%u nonce=%u",
-                                 chain_index,
-                                 expected_index,
-                                 static_cast<unsigned int>(expected_chain_id),
-                                 nonce));
-    }
-
-    return std::nullopt;
+    return Invalid("bad-auxpow-commitment", "auxpow chain merkle root missing from parent coinbase scriptSig");
 }
 
 namespace auxpow {
-std::optional<ValidationError> Validate(const CBlockHeader& block, const Consensus::Params& consensus, const bool check_pow)
+std::optional<ValidationError> Validate(const CBlockHeader& block, const Consensus::Params& consensus, const bool check_pow, const CommitmentValidation commitment_validation)
 {
     if (!block.SignalsAuxpow()) {
         if (block.HasAuxpow()) {
@@ -135,6 +172,6 @@ std::optional<ValidationError> Validate(const CBlockHeader& block, const Consens
         return Invalid("bad-auxpow-missing-payload", "auxpow version is missing the auxpow payload");
     }
 
-    return block.auxpow->Validate(block.GetHash(), consensus, block.nBits, expected_chain_id, check_pow);
+    return block.auxpow->Validate(block.GetHash(), consensus, block.nBits, expected_chain_id, check_pow, commitment_validation);
 }
 } // namespace auxpow

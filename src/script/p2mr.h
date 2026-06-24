@@ -5,6 +5,8 @@
 #ifndef QBIT_SCRIPT_P2MR_H
 #define QBIT_SCRIPT_P2MR_H
 
+#include <crypto/pqc.h>
+#include <script/script.h>
 #include <script/scriptnum_parsing.h>
 
 #include <optional>
@@ -12,6 +14,23 @@
 #include <vector>
 
 namespace p2mr {
+
+inline CScript BuildPKScript(const CPQCPubKey& pubkey)
+{
+    return CScript{} << std::vector<unsigned char>{pubkey.begin(), pubkey.end()} << OP_CHECKSIGPQC;
+}
+
+inline std::optional<CPQCPubKey> MatchPK(const CScript& script)
+{
+    constexpr unsigned char PUBKEY_PUSH_SIZE = static_cast<unsigned char>(CPQCPubKey::SIZE);
+    constexpr size_t PK_SCRIPT_SIZE = 1 + CPQCPubKey::SIZE + 1;
+    if (script.size() != PK_SCRIPT_SIZE || script[0] != PUBKEY_PUSH_SIZE || script[CPQCPubKey::SIZE + 1] != OP_CHECKSIGPQC) {
+        return std::nullopt;
+    }
+    CPQCPubKey pubkey{std::span<const unsigned char>{script}.subspan(1, CPQCPubKey::SIZE)};
+    if (!pubkey.IsValid()) return std::nullopt;
+    return pubkey;
+}
 
 struct MultiAScriptData {
     int threshold;

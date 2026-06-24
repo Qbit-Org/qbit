@@ -69,6 +69,7 @@
 #include <QUrlQuery>
 #include <QtGlobal>
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <exception>
@@ -823,6 +824,21 @@ QString formatNiceTimeOffset(qint64 secs)
         timeBehindText = QObject::tr("%1 and %2").arg(QObject::tr("%n year(s)", "", years)).arg(QObject::tr("%n week(s)","", remainder/WEEK_IN_SECONDS));
     }
     return timeBehindText;
+}
+
+QString formatSyncPercentage(double progress, int decimals, bool incomplete)
+{
+    assert(decimals >= 0);
+
+    double percentage{std::clamp(progress, 0.0, 1.0) * 100.0};
+    if (incomplete) {
+        double smallest_display_unit{1.0};
+        for (int i{0}; i < decimals; ++i) {
+            smallest_display_unit /= 10.0;
+        }
+        percentage = std::min(percentage, 100.0 - smallest_display_unit);
+    }
+    return QString::number(percentage, 'f', decimals);
 }
 
 QString formatBytes(uint64_t bytes)

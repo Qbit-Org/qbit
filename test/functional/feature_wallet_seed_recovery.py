@@ -26,10 +26,10 @@ class FeatureWalletSeedRecoveryTest(BitcoinTestFramework):
         self.num_nodes = 4
         self.rpc_timeout = 600
         self.extra_args = [
-            ["-dnsseed=0", "-fixedseeds=0", f"-keypool={self.FULL_RECOVERY_KEYPOOL}"],
-            ["-dnsseed=0", "-fixedseeds=0", f"-keypool={self.FULL_RECOVERY_KEYPOOL}"],
-            ["-dnsseed=0", "-fixedseeds=0", f"-keypool={self.STRICT_RECOVERY_KEYPOOL}"],
-            ["-dnsseed=0", "-fixedseeds=0"],
+            ["-dnsseed=0", "-fixedseeds=0", f"-keypool={self.FULL_RECOVERY_KEYPOOL}", "-walletpqcparallel=1", "-walletpqcsignthreads=0"],
+            ["-dnsseed=0", "-fixedseeds=0", f"-keypool={self.FULL_RECOVERY_KEYPOOL}", "-walletpqcparallel=1", "-walletpqcsignthreads=0"],
+            ["-dnsseed=0", "-fixedseeds=0", f"-keypool={self.STRICT_RECOVERY_KEYPOOL}", "-walletpqcparallel=1", "-walletpqcsignthreads=0"],
+            ["-dnsseed=0", "-fixedseeds=0", "-walletpqcparallel=1", "-walletpqcsignthreads=0"],
         ]
 
     def skip_test_if_missing_module(self):

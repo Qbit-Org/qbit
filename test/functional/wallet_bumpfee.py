@@ -39,7 +39,7 @@ from test_framework.wallet import MiniWallet
 WALLET_PASSPHRASE = "test"
 WALLET_PASSPHRASE_TIMEOUT = 3600
 
-# Fee rates (sat/vB)
+# Fee rates (bits/vB)
 INSUFFICIENT =      1
 ECONOMICAL   =     50
 NORMAL       =    100
@@ -110,6 +110,7 @@ class BumpFeeTest(BitcoinTestFramework):
         test_change_script_match(self, rbf_node, dest_address)
         test_settxfee(self, rbf_node, dest_address)
         test_maxtxfee_fails(self, rbf_node, dest_address)
+        test_psbtbumpfee_does_not_require_pqc_signing_validation(self, peer_node, rbf_node, dest_address)
         # These tests wipe out a number of utxos that are expected in other tests
         test_small_output_with_feerate_succeeds(self, peer_node, rbf_node, dest_address)
         test_no_more_inputs_fails(self, rbf_node, dest_address)
@@ -145,7 +146,7 @@ class BumpFeeTest(BitcoinTestFramework):
         if not self.options.usecli:
             for invalid_value in ["", 0.000000001, 1e-09, 1.111111111, 1111111111111111, "31.999999999999999999999"]:
                 assert_raises_rpc_error(-3, msg, rbf_node.bumpfee, rbfid, fee_rate=invalid_value)
-        # Test fee_rate values that cannot be represented in sat/vB.
+        # Test fee_rate values that cannot be represented in bits/vB.
         for invalid_value in [0.0001, 0.00000001, 0.00099999, 31.99999999]:
             assert_raises_rpc_error(-3, msg, rbf_node.bumpfee, rbfid, fee_rate=invalid_value)
         # Test fee_rate out of range (negative number).
@@ -423,6 +424,51 @@ def test_notmine_bumpfee(self, rbf_node, peer_node, dest_address):
     self.clear_mempool()
 
 
+def test_psbtbumpfee_does_not_require_pqc_signing_validation(self, peer_node, rbf_node, dest_address):
+    self.log.info("Test that psbtbumpfee remains available while PQC signing validation is blocked")
+    wallet_name = "pqc_bumpfee_source"
+    rbf_node.createwallet(wallet_name)
+    wallet = rbf_node.get_wallet_rpc(wallet_name)
+    try:
+        wallet.createwalletdescriptor("p2mr")
+    except JSONRPCException as e:
+        assert "Descriptor already exists" in e.error["message"]
+    wallet.keypoolrefill(200)
+
+    p2mr_address = wallet.getnewaddress(address_type="p2mr")
+    peer_node.sendtoaddress(p2mr_address, Decimal("1"))
+    self.generate(peer_node, 1)
+    self.sync_all()
+
+    rbfid = wallet.sendtoaddress(dest_address, Decimal("0.5"), fee_rate=NORMAL)
+    assert rbfid in rbf_node.getrawmempool()
+
+    backup_file = rbf_node.datadir_path / "pqc_bumpfee_source.bak"
+    wallet.backupwallet(backup_file)
+    wallet.unloadwallet()
+
+    rbf_node.restorewallet("pqc_bumpfee_restored", backup_file)
+    restored_wallet = rbf_node.get_wallet_rpc("pqc_bumpfee_restored")
+    self.wait_until(
+        lambda: restored_wallet.getwalletinfo()["pqc_key_validation"]["signing_blocked"],
+        timeout=10,
+    )
+
+    bumped_psbt = restored_wallet.psbtbumpfee(rbfid)
+    assert_equal(bumped_psbt["errors"], [])
+    assert "psbt" in bumped_psbt
+
+    assert_raises_rpc_error(
+        -4,
+        "plaintext PQC wallet key validation",
+        restored_wallet.bumpfee,
+        rbfid,
+    )
+
+    restored_wallet.unloadwallet()
+    self.clear_mempool()
+
+
 def test_bumpfee_with_descendant_fails(self, rbf_node, rbf_node_address, dest_address):
     self.log.info('Test that fee cannot be bumped when it has descendant')
     # parent is send-to-self, so we don't have to check which output is change when creating the child tx
@@ -527,7 +573,7 @@ def test_dust_to_fee(self, rbf_node, dest_address):
         self.log.info(f"Skipping dust-to-fee size-specific check for vsize {fulltx['vsize']}")
         self.clear_mempool()
         return
-    # Bump with fee_rate of 350.25 sat/vB vbytes to create dust.
+    # Bump with fee_rate of 350.25 bits/vB vbytes to create dust.
     # Expected fee is 141 vbytes * fee_rate 0.00350250 BTC / 1000 vbytes = 0.00049385 BTC.
     # or occasionally 140 vbytes * fee_rate 0.00350250 BTC / 1000 vbytes = 0.00049035 BTC.
     # Dust should be dropped to the fee, so actual bump fee is 0.00050000 BTC.

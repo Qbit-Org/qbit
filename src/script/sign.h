@@ -13,6 +13,7 @@
 #include <script/interpreter.h>
 #include <script/keyorigin.h>
 #include <script/signingprovider.h>
+#include <script/signingprogress.h>
 #include <uint256.h>
 
 class CKey;
@@ -55,6 +56,7 @@ public:
     const BaseSignatureChecker& Checker() const override { return checker; }
     bool CreateSig(const SigningProvider& provider, std::vector<unsigned char>& vchSig, const CKeyID& keyid, const CScript& scriptCode, SigVersion sigversion) const override;
     bool CreateSchnorrSig(const SigningProvider& provider, std::vector<unsigned char>& sig, const XOnlyPubKey& pubkey, const uint256* leaf_hash, const uint256* merkle_root, SigVersion sigversion) const override;
+    bool CreatePQCSignatureHash(uint256& hash, const uint256& leaf_hash, SigVersion sigversion) const;
     bool CreatePQCSignature(const SigningProvider& provider, std::vector<unsigned char>& sig, const CPQCPubKey& pubkey, const uint256* leaf_hash, SigVersion sigversion) const override;
     bool CanCreatePQCSignature(const SigningProvider& provider, const CPQCPubKey& pubkey) const override;
     bool VerifyP2MRScriptSignature(std::span<const unsigned char> sig, const CPQCPubKey& pubkey, const uint256& leaf_hash, SigVersion sigversion) const override;
@@ -131,6 +133,6 @@ void UpdateInput(CTxIn& input, const SignatureData& data);
 bool IsSegWitOutput(const SigningProvider& provider, const CScript& script);
 
 /** Sign the CMutableTransaction */
-bool SignTransaction(CMutableTransaction& mtx, const SigningProvider* provider, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors);
+bool SignTransaction(CMutableTransaction& mtx, const SigningProvider* provider, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors, const SigningProgressCallback& progress_callback = {});
 
 #endif // QBIT_SCRIPT_SIGN_H

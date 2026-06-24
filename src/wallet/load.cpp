@@ -166,6 +166,7 @@ void StartWallets(WalletContext& context)
 {
     for (const std::shared_ptr<CWallet>& pwallet : GetWallets(context)) {
         pwallet->postInitProcess();
+        SchedulePlaintextPQCKeyValidation(*Assert(context.scheduler), pwallet);
     }
 
     context.scheduler->scheduleEvery([&context] { MaybeResendWalletTxs(context); }, 1min);

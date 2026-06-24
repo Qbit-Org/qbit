@@ -12,4 +12,4 @@ node_modules/
 tags
 TAGS
 rust-toolchain.toml
-Cargo.lock
+.context/

@@ -555,6 +555,7 @@ class RPCPerfTest(BitcoinTestFramework):
                     "importpubkeydb_counter": 0,
                 }
             )
+        self.wait_pqc_key_validation_ready(wallet)
 
     def reset_fixture_for_cold_sample(self, benchmark: BenchmarkCase, context: FixtureContext):
         if benchmark.fixture_reset_mode == "restart_node":

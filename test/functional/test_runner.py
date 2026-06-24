@@ -97,6 +97,7 @@ BASE_SCRIPTS = [
     'feature_p2mr_reorg.py',
     'feature_wallet_seed_recovery.py',
     'feature_auxpow.py',
+    'feature_auxpow_commitment_activation.py',
     'feature_cadence.py',
     'feature_cadence_activation.py',
     'feature_integration_cadence.py',

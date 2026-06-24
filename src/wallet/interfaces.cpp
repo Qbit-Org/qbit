@@ -32,6 +32,7 @@
 #include <wallet/walletutil.h>
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -133,6 +134,18 @@ WalletTxOut MakeWalletTxOut(const CWallet& wallet,
     return result;
 }
 
+std::optional<bilingual_str> GetPQCKeyValidationSigningError(const CWallet& wallet)
+{
+    const PQCKeyValidationInfo pqc_validation{wallet.GetPQCKeyValidationInfo()};
+    if (pqc_validation.pending_records > 0) {
+        return Untranslated("Plaintext PQC wallet key validation is still in progress. Check getwalletinfo.pqc_key_validation before signing or sending.");
+    }
+    if (pqc_validation.failed_records > 0) {
+        return Untranslated("Plaintext PQC wallet key validation failed. Wallet signing is disabled until the wallet is restored or repaired.");
+    }
+    return std::nullopt;
+}
+
 class WalletImpl : public Wallet
 {
 public:
@@ -154,6 +167,7 @@ public:
     void abortRescan() override { m_wallet->AbortRescan(); }
     bool backupWallet(const std::string& filename) override { return m_wallet->BackupWallet(filename); }
     std::string getWalletName() override { return m_wallet->GetName(); }
+    std::unique_ptr<Wallet> clone() override { return std::make_unique<WalletImpl>(m_context, m_wallet); }
     util::Result<CTxDestination> getNewDestination(const OutputType type, const std::string& label) override
     {
         LOCK(m_wallet->cs_wallet);
@@ -169,6 +183,7 @@ public:
     }
     SigningResult signMessage(const std::string& message, const PKHash& pkhash, std::string& str_sig) override
     {
+        if (GetPQCKeyValidationSigningError(*m_wallet)) return SigningResult::SIGNING_FAILED;
         return m_wallet->SignMessage(message, pkhash, str_sig);
     }
     bool isSpendable(const CTxDestination& dest) override
@@ -275,15 +290,20 @@ public:
         bool sign,
         int& change_pos,
         CAmount& fee,
-        wallet::PQCUsageReport* pqc_usage) override
+        wallet::PQCUsageReport* pqc_usage,
+        const SigningProgressCallback& progress_callback) override
     {
+        if (sign) {
+            if (const auto error{GetPQCKeyValidationSigningError(*m_wallet)}) return util::Error{*error};
+        }
         PQCUsageRecorder pqc_usage_recorder;
         auto res = CreateTransaction(*m_wallet,
                                      recipients,
                                      change_pos == -1 ? std::nullopt : std::make_optional(change_pos),
                                      coin_control,
                                      sign,
-                                     sign ? pqc_usage_recorder.GetObserver() : PQCSignatureCounterObserver{});
+                                     sign ? pqc_usage_recorder.GetObserver() : PQCSignatureCounterObserver{},
+                                     progress_callback);
         if (!res) return util::Error{util::ErrorString(res)};
         const auto& txr = *res;
         fee = txr.fee;
@@ -321,7 +341,11 @@ public:
         std::vector<CTxOut> outputs; // just an empty list of new recipients for now
         return feebumper::CreateRateBumpTransaction(*m_wallet.get(), txid, coin_control, errors, old_fee, new_fee, mtx, /* require_mine= */ true, outputs) == feebumper::Result::OK;
     }
-    bool signBumpTransaction(CMutableTransaction& mtx) override { return feebumper::SignTransaction(*m_wallet.get(), mtx); }
+    bool signBumpTransaction(CMutableTransaction& mtx) override
+    {
+        if (GetPQCKeyValidationSigningError(*m_wallet)) return false;
+        return feebumper::SignTransaction(*m_wallet.get(), mtx);
+    }
     bool commitBumpTransaction(const Txid& txid,
         CMutableTransaction&& mtx,
         std::vector<bilingual_str>& errors,
@@ -401,6 +425,14 @@ public:
         bool& complete,
         wallet::PQCUsageReport* pqc_usage) override
     {
+        if (sign) {
+            if (GetPQCKeyValidationSigningError(*m_wallet)) {
+                if (n_signed) *n_signed = 0;
+                complete = false;
+                if (pqc_usage) *pqc_usage = PQCUsageReport{};
+                return PSBTError::UNSUPPORTED;
+            }
+        }
         PQCUsageRecorder pqc_usage_recorder;
         const auto err = m_wallet->FillPSBT(psbtx,
                                             complete,
@@ -530,6 +562,7 @@ public:
     }
     OutputType getDefaultAddressType() override { return m_wallet->m_default_address_type; }
     CAmount getDefaultMaxTxFee() override { return m_wallet->m_default_max_tx_fee; }
+    wallet::PQCKeyValidationInfo getPQCKeyValidationInfo() const override { return m_wallet->GetPQCKeyValidationInfo(); }
     void remove() override
     {
         RemoveWallet(m_context, m_wallet, /*load_on_start=*/false);

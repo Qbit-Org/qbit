@@ -44,6 +44,7 @@ struct ChainstateLoadOptions {
 enum class ChainstateLoadStatus {
     SUCCESS,
     FAILURE, //!< Generic failure which reindexing may fix
+    LEGACY_AUXPOW_REQUIRES_REINDEX, //!< Legacy pruned AuxPoW block index requires full reindex/resync
     FAILURE_FATAL, //!< Fatal error which should not prompt to reindex
     FAILURE_INCOMPATIBLE_DB,
     FAILURE_INSUFFICIENT_DBCACHE,

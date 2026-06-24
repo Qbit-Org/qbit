@@ -9,6 +9,7 @@
 #include <consensus/validation.h>
 #include <crypto/common.h>
 #include <node/blockstorage.h>
+#include <node/kernel_notifications.h>
 #include <node/miner.h>
 #include <pow.h>
 #include <script/script.h>
@@ -19,6 +20,7 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
 #include <array>
 #include <limits>
 #include <memory>
@@ -28,6 +30,43 @@ using node::BlockAssembler;
 
 namespace {
 static constexpr std::array<unsigned char, 4> MERGED_MINING_HEADER{0xfa, 0xbe, 0x6d, 0x6d};
+static constexpr uint8_t DB_BLOCK_INDEX_LEGACY_TEST_KEY{'b'};
+
+std::vector<unsigned char> SerializeCommitmentFooter(uint32_t merkle_size, uint32_t nonce);
+
+struct LegacyDiskBlockIndexWithoutAuxpowPayload {
+    int height;
+    uint32_t status;
+    unsigned int tx_count;
+    uint64_t auxpow_count;
+    int file;
+    unsigned int data_pos;
+    int32_t version;
+    uint256 prev_hash;
+    uint256 merkle_root;
+    uint32_t time;
+    uint32_t bits;
+    uint32_t nonce;
+
+    template <typename Stream>
+    void Serialize(Stream& stream) const
+    {
+        int disk_version{CBlockIndex::DUMMY_VERSION};
+        stream << VARINT_MODE(disk_version, VarIntMode::NONNEGATIVE_SIGNED);
+        stream << VARINT_MODE(height, VarIntMode::NONNEGATIVE_SIGNED);
+        stream << VARINT(status);
+        stream << VARINT(tx_count);
+        stream << VARINT(auxpow_count);
+        if (status & (BLOCK_HAVE_DATA | BLOCK_HAVE_UNDO)) stream << VARINT_MODE(file, VarIntMode::NONNEGATIVE_SIGNED);
+        if (status & BLOCK_HAVE_DATA) stream << VARINT(data_pos);
+        stream << version;
+        stream << prev_hash;
+        stream << merkle_root;
+        stream << time;
+        stream << bits;
+        stream << nonce;
+    }
+};
 
 CTransactionRef MakeParentCoinbase(const std::vector<unsigned char>& commitment)
 {
@@ -41,6 +80,31 @@ CTransactionRef MakeParentCoinbase(const std::vector<unsigned char>& commitment)
     return MakeTransactionRef(std::move(tx));
 }
 
+std::vector<unsigned char> InternalUint256Bytes(const uint256& value)
+{
+    return {value.begin(), value.end()};
+}
+
+std::vector<unsigned char> AuxpowCommitmentRootBytes(const uint256& root)
+{
+    auto bytes = InternalUint256Bytes(root);
+    std::reverse(bytes.begin(), bytes.end());
+    return bytes;
+}
+
+std::vector<unsigned char> MakeCommitment(std::vector<unsigned char> prefix, const std::vector<unsigned char>& root, const uint32_t merkle_size, const uint32_t nonce)
+{
+    prefix.insert(prefix.end(), root.begin(), root.end());
+    const auto footer = SerializeCommitmentFooter(merkle_size, nonce);
+    prefix.insert(prefix.end(), footer.begin(), footer.end());
+    return prefix;
+}
+
+std::vector<unsigned char> MakeCommitment(std::vector<unsigned char> prefix, const uint256& root, const uint32_t merkle_size, const uint32_t nonce)
+{
+    return MakeCommitment(std::move(prefix), AuxpowCommitmentRootBytes(root), merkle_size, nonce);
+}
+
 std::shared_ptr<const CAuxPow> MakeAuxpowPayload(const uint256& aux_block_hash, const Consensus::Params& consensus, const uint32_t target_bits, const uint32_t parent_time)
 {
     auto auxpow = std::make_shared<CAuxPow>();
@@ -51,12 +115,7 @@ std::shared_ptr<const CAuxPow> MakeAuxpowPayload(const uint256& aux_block_hash, 
 
     std::vector<unsigned char> commitment;
     commitment.insert(commitment.end(), MERGED_MINING_HEADER.begin(), MERGED_MINING_HEADER.end());
-    commitment.insert(commitment.end(), aux_block_hash.begin(), aux_block_hash.end());
-
-    unsigned char footer[8];
-    WriteLE32(footer, 1U);
-    WriteLE32(footer + 4, 0U);
-    commitment.insert(commitment.end(), footer, footer + sizeof(footer));
+    commitment = MakeCommitment(std::move(commitment), aux_block_hash, /*merkle_size=*/1, /*nonce=*/0);
 
     auxpow->coinbase_tx = MakeParentCoinbase(commitment);
     auxpow->parent_block.nVersion = 1;
@@ -385,18 +444,44 @@ BOOST_AUTO_TEST_CASE(auxpow_rejects_structural_validation_failures)
 BOOST_AUTO_TEST_CASE(auxpow_accepts_legacy_commitment_without_merged_mining_header)
 {
     const auto consensus = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
-    const auto make_commitment = [](std::vector<unsigned char> prefix, const uint256& root, const uint32_t merkle_size, const uint32_t nonce) {
-        prefix.insert(prefix.end(), root.begin(), root.end());
-        const auto footer = SerializeCommitmentFooter(merkle_size, nonce);
-        prefix.insert(prefix.end(), footer.begin(), footer.end());
-        return prefix;
-    };
 
     CBlockHeader header = MakeAuxpowHeader(consensus);
     header.auxpow = WithCoinbaseScriptSig(*header.auxpow,
-                                          make_commitment(/*prefix=*/{}, header.GetHash(), /*merkle_size=*/1, /*nonce=*/0));
+                                          MakeCommitment(/*prefix=*/{}, header.GetHash(), /*merkle_size=*/1, /*nonce=*/0));
 
     BOOST_CHECK(!auxpow::Validate(header, consensus, /*check_pow=*/false));
+}
+
+BOOST_AUTO_TEST_CASE(auxpow_commitment_validation_modes_match_activation_plan)
+{
+    const auto consensus = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
+
+    CBlockHeader display_order = MakeAuxpowHeader(consensus);
+    BOOST_CHECK(!auxpow::Validate(display_order, consensus, /*check_pow=*/false));
+    BOOST_CHECK(!auxpow::Validate(display_order, consensus, /*check_pow=*/false, auxpow::CommitmentValidation::DISPLAY));
+    const auto display_as_internal = auxpow::Validate(display_order, consensus, /*check_pow=*/false, auxpow::CommitmentValidation::INTERNAL);
+    BOOST_REQUIRE(display_as_internal.has_value());
+    BOOST_CHECK_EQUAL(display_as_internal->reject_reason, "bad-auxpow-commitment");
+
+    CBlockHeader internal_order = MakeAuxpowHeader(consensus);
+    std::vector<unsigned char> prefix{MERGED_MINING_HEADER.begin(), MERGED_MINING_HEADER.end()};
+    internal_order.auxpow = WithCoinbaseScriptSig(*internal_order.auxpow,
+                                                  MakeCommitment(std::move(prefix), InternalUint256Bytes(internal_order.GetHash()), /*merkle_size=*/1, /*nonce=*/0));
+    BOOST_CHECK(!auxpow::Validate(internal_order, consensus, /*check_pow=*/false));
+    BOOST_CHECK(!auxpow::Validate(internal_order, consensus, /*check_pow=*/false, auxpow::CommitmentValidation::INTERNAL));
+    const auto internal_as_display = auxpow::Validate(internal_order, consensus, /*check_pow=*/false, auxpow::CommitmentValidation::DISPLAY);
+    BOOST_REQUIRE(internal_as_display.has_value());
+    BOOST_CHECK_EQUAL(internal_as_display->reject_reason, "bad-auxpow-commitment");
+}
+
+BOOST_AUTO_TEST_CASE(auxpow_commitment_validation_height_helper)
+{
+    auto consensus = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
+    consensus.nAuxpowDisplayCommitmentHeight = 20'500;
+
+    BOOST_CHECK(auxpow::CommitmentValidationForHeight(consensus, 20'499) == auxpow::CommitmentValidation::INTERNAL);
+    BOOST_CHECK(auxpow::CommitmentValidationForHeight(consensus, 20'500) == auxpow::CommitmentValidation::DISPLAY);
+    BOOST_CHECK(auxpow::CommitmentValidationForHeight(consensus, 20'501) == auxpow::CommitmentValidation::DISPLAY);
 }
 
 BOOST_AUTO_TEST_CASE(auxpow_rejects_commitment_shape_failures)
@@ -406,12 +491,6 @@ BOOST_AUTO_TEST_CASE(auxpow_rejects_commitment_shape_failures)
         const auto err = auxpow::Validate(header, consensus, /*check_pow=*/false);
         BOOST_REQUIRE(err.has_value());
         BOOST_CHECK_EQUAL(err->reject_reason, reason);
-    };
-    const auto make_commitment = [](std::vector<unsigned char> prefix, const uint256& root, const uint32_t merkle_size, const uint32_t nonce) {
-        prefix.insert(prefix.end(), root.begin(), root.end());
-        const auto footer = SerializeCommitmentFooter(merkle_size, nonce);
-        prefix.insert(prefix.end(), footer.begin(), footer.end());
-        return prefix;
     };
 
     CBlockHeader missing_root = MakeAuxpowHeader(consensus);
@@ -425,18 +504,18 @@ BOOST_AUTO_TEST_CASE(auxpow_rejects_commitment_shape_failures)
     std::vector<unsigned char> separated_prefix{MERGED_MINING_HEADER.begin(), MERGED_MINING_HEADER.end()};
     separated_prefix.push_back(0x00);
     separated_root.auxpow = WithCoinbaseScriptSig(*separated_root.auxpow,
-                                                  make_commitment(std::move(separated_prefix), separated_root.GetHash(), /*merkle_size=*/1, /*nonce=*/0));
+                                                  MakeCommitment(std::move(separated_prefix), separated_root.GetHash(), /*merkle_size=*/1, /*nonce=*/0));
     expect_reject(separated_root, "bad-auxpow-commitment");
 
     CBlockHeader legacy_offset = MakeAuxpowHeader(consensus);
     std::vector<unsigned char> deep_prefix(auxpow::LEGACY_COMMITMENT_START_LIMIT + 1, 0x00);
     legacy_offset.auxpow = WithCoinbaseScriptSig(*legacy_offset.auxpow,
-                                                 make_commitment(std::move(deep_prefix), legacy_offset.GetHash(), /*merkle_size=*/1, /*nonce=*/0));
+                                                 MakeCommitment(std::move(deep_prefix), legacy_offset.GetHash(), /*merkle_size=*/1, /*nonce=*/0));
     expect_reject(legacy_offset, "bad-auxpow-commitment");
 
     CBlockHeader missing_footer = MakeAuxpowHeader(consensus);
     std::vector<unsigned char> no_footer{MERGED_MINING_HEADER.begin(), MERGED_MINING_HEADER.end()};
-    const uint256 missing_footer_hash = missing_footer.GetHash();
+    const auto missing_footer_hash = AuxpowCommitmentRootBytes(missing_footer.GetHash());
     no_footer.insert(no_footer.end(), missing_footer_hash.begin(), missing_footer_hash.end());
     missing_footer.auxpow = WithCoinbaseScriptSig(*missing_footer.auxpow, no_footer);
     expect_reject(missing_footer, "bad-auxpow-commitment");
@@ -444,7 +523,7 @@ BOOST_AUTO_TEST_CASE(auxpow_rejects_commitment_shape_failures)
     CBlockHeader wrong_merkle_size = MakeAuxpowHeader(consensus);
     std::vector<unsigned char> size_prefix{MERGED_MINING_HEADER.begin(), MERGED_MINING_HEADER.end()};
     wrong_merkle_size.auxpow = WithCoinbaseScriptSig(*wrong_merkle_size.auxpow,
-                                                     make_commitment(std::move(size_prefix), wrong_merkle_size.GetHash(), /*merkle_size=*/2, /*nonce=*/0));
+                                                     MakeCommitment(std::move(size_prefix), wrong_merkle_size.GetHash(), /*merkle_size=*/2, /*nonce=*/0));
     expect_reject(wrong_merkle_size, "bad-auxpow-merkle-size");
 
     CBlockHeader wrong_expected_index = MakeAuxpowHeader(consensus);
@@ -457,7 +536,7 @@ BOOST_AUTO_TEST_CASE(auxpow_rejects_commitment_shape_failures)
                                                          static_cast<uint32_t>(wrong_expected_index_auxpow->chain_index));
     std::vector<unsigned char> index_prefix{MERGED_MINING_HEADER.begin(), MERGED_MINING_HEADER.end()};
     wrong_expected_index.auxpow = WithCoinbaseScriptSig(*wrong_expected_index_auxpow,
-                                                        make_commitment(std::move(index_prefix), chain_root, /*merkle_size=*/2, /*nonce=*/0));
+                                                        MakeCommitment(std::move(index_prefix), chain_root, /*merkle_size=*/2, /*nonce=*/0));
     expect_reject(wrong_expected_index, "bad-auxpow-chain-index");
 }
 
@@ -637,6 +716,126 @@ BOOST_AUTO_TEST_CASE(auxpow_legacy_disk_block_index_entry_without_payload_still_
     BOOST_CHECK_EQUAL(decoded.nAuxPow, 1U);
     BOOST_CHECK(decoded.SignalsAuxpow());
     BOOST_CHECK(!decoded.auxpow);
+}
+
+BOOST_AUTO_TEST_CASE(auxpow_legacy_block_index_load_recovers_payload_from_block_data)
+{
+    const auto& params = Params();
+    const auto& consensus = params.GetConsensus();
+
+    node::KernelNotifications notifications{Assert(m_node.shutdown_request), m_node.exit_status, *Assert(m_node.warnings)};
+    node::BlockManager::Options blockman_opts{
+        .chainparams = params,
+        .use_xor = false,
+        .blocks_dir = m_args.GetBlocksDirPath(),
+        .notifications = notifications,
+        .block_tree_db_params = DBParams{
+            .path = "",
+            .cache_bytes = 1 << 20,
+            .memory_only = true,
+        },
+    };
+    node::BlockManager blockman{*Assert(m_node.shutdown_signal), blockman_opts};
+
+    CBlock block;
+    block.nVersion = MakeVersion(static_cast<uint16_t>(consensus.nAuxpowChainId), /*auxpow=*/true, /*version_bits=*/0);
+    block.hashPrevBlock.SetNull();
+    block.nTime = 1'738'713'707;
+    block.nBits = UintToArith256(consensus.powLimit).GetCompact();
+    block.nNonce = 0;
+    block.vtx = {MakeParentCoinbase({0x51})};
+    block.hashMerkleRoot = BlockMerkleRoot(block);
+    block.auxpow = MakeAuxpowPayload(block.GetHash(), consensus, block.nBits, block.nTime);
+    BOOST_REQUIRE(!auxpow::Validate(block, consensus));
+
+    const uint256 block_hash{block.GetHash()};
+    const FlatFilePos block_pos{blockman.WriteBlock(block, /*nHeight=*/0)};
+    BOOST_REQUIRE(!block_pos.IsNull());
+
+    const LegacyDiskBlockIndexWithoutAuxpowPayload legacy_index{
+        .height = 0,
+        .status = BLOCK_VALID_TREE | BLOCK_HAVE_DATA,
+        .tx_count = static_cast<unsigned int>(block.vtx.size()),
+        .auxpow_count = 1,
+        .file = block_pos.nFile,
+        .data_pos = block_pos.nPos,
+        .version = block.nVersion,
+        .prev_hash = block.hashPrevBlock,
+        .merkle_root = block.hashMerkleRoot,
+        .time = block.nTime,
+        .bits = block.nBits,
+        .nonce = block.nNonce,
+    };
+
+    {
+        LOCK(::cs_main);
+        BOOST_REQUIRE(blockman.m_block_tree_db->WriteBatchSync(
+            {{block_pos.nFile, blockman.GetBlockFileInfo(block_pos.nFile)}},
+            /*nLastFile=*/block_pos.nFile,
+            {}));
+        BOOST_REQUIRE(blockman.m_block_tree_db->Write(std::make_pair(DB_BLOCK_INDEX_LEGACY_TEST_KEY, block_hash), legacy_index));
+        BOOST_REQUIRE(blockman.LoadBlockIndexDB(std::nullopt) == node::BlockIndexLoadResult::SUCCESS);
+        CBlockIndex* loaded_index{blockman.LookupBlockIndex(block_hash)};
+        BOOST_REQUIRE(loaded_index);
+        BOOST_REQUIRE(loaded_index->auxpow);
+        BOOST_CHECK_EQUAL(loaded_index->auxpow->GetParentBlockHash(), block.auxpow->GetParentBlockHash());
+        BOOST_REQUIRE(blockman.WriteBlockIndexDB());
+
+        CDiskBlockIndex persisted;
+        BOOST_REQUIRE(blockman.m_block_tree_db->Read(std::make_pair(DB_BLOCK_INDEX_LEGACY_TEST_KEY, block_hash), persisted));
+        BOOST_REQUIRE(persisted.auxpow);
+        BOOST_CHECK_EQUAL(persisted.auxpow->GetParentBlockHash(), block.auxpow->GetParentBlockHash());
+    }
+}
+
+BOOST_AUTO_TEST_CASE(auxpow_legacy_pruned_block_index_load_requests_reindex)
+{
+    const auto& params = Params();
+    const auto& consensus = params.GetConsensus();
+
+    node::KernelNotifications notifications{Assert(m_node.shutdown_request), m_node.exit_status, *Assert(m_node.warnings)};
+    node::BlockManager::Options blockman_opts{
+        .chainparams = params,
+        .use_xor = false,
+        .blocks_dir = m_args.GetBlocksDirPath(),
+        .notifications = notifications,
+        .block_tree_db_params = DBParams{
+            .path = "",
+            .cache_bytes = 1 << 20,
+            .memory_only = true,
+        },
+    };
+    node::BlockManager blockman{*Assert(m_node.shutdown_signal), blockman_opts};
+
+    CBlockHeader header;
+    header.nVersion = MakeVersion(static_cast<uint16_t>(consensus.nAuxpowChainId), /*auxpow=*/true, /*version_bits=*/0);
+    header.hashPrevBlock.SetNull();
+    header.hashMerkleRoot = uint256{12};
+    header.nTime = 1'738'713'708;
+    header.nBits = UintToArith256(consensus.powLimit).GetCompact();
+    header.nNonce = 0;
+
+    const uint256 block_hash{header.GetHash()};
+    const LegacyDiskBlockIndexWithoutAuxpowPayload legacy_index{
+        .height = 0,
+        .status = BLOCK_VALID_TREE,
+        .tx_count = 1,
+        .auxpow_count = 1,
+        .file = 0,
+        .data_pos = 0,
+        .version = header.nVersion,
+        .prev_hash = header.hashPrevBlock,
+        .merkle_root = header.hashMerkleRoot,
+        .time = header.nTime,
+        .bits = header.nBits,
+        .nonce = header.nNonce,
+    };
+
+    {
+        LOCK(::cs_main);
+        BOOST_REQUIRE(blockman.m_block_tree_db->Write(std::make_pair(DB_BLOCK_INDEX_LEGACY_TEST_KEY, block_hash), legacy_index));
+        BOOST_CHECK(blockman.LoadBlockIndexDB(std::nullopt) == node::BlockIndexLoadResult::LEGACY_AUXPOW_REQUIRES_REINDEX);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(pre_dummy_disk_block_index_entry_defaults_auxpow_count_to_zero)

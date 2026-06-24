@@ -46,6 +46,8 @@ void DummyWalletInit::AddWalletOptions(ArgsManager& argsman) const
         "-walletbroadcast",
         "-walletdir=<dir>",
         "-walletnotify=<cmd>",
+        "-walletpqcparallel=<0|1>",
+        "-walletpqcsignthreads=<n>",
         "-walletrbf",
         "-walletrejectlongchains",
         "-walletcrosschain",

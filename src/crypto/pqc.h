@@ -133,7 +133,7 @@ private:
         m_pubkey_valid = false;
     }
 
-    void SetFromTrustedKeygen(std::span<const unsigned char> secret_key, std::span<const unsigned char> public_key);
+    void SetFromTrustedKeyMaterial(std::span<const unsigned char> secret_key, std::span<const unsigned char> public_key);
 
     friend bool DerivePQCKey(std::span<const unsigned char> master_seed, uint32_t account, uint32_t change, uint32_t index, CPQCKey& key_out);
 
@@ -152,6 +152,9 @@ public:
 
     void MakeNewKey();
     void Set(const unsigned char* begin, const unsigned char* end);
+    //! Restore key material that was already authenticated by wallet persistence.
+    //! This skips the expensive SLH-DSA root recomputation; use Set() for untrusted imports.
+    void SetFromTrustedWalletRecord(std::span<const unsigned char> secret_key, const CPQCPubKey& public_key);
 
     bool Sign(const uint256& hash, std::vector<unsigned char>& sig, uint32_t& counter_inout) const;
     CPQCPubKey GetPubKey() const;

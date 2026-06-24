@@ -18,9 +18,12 @@
 #include <interfaces/handler.h>
 #include <interfaces/node.h>
 #include <key_io.h>
+#include <logging.h>
 #include <node/interface_ui.h>
 #include <node/types.h>
 #include <psbt.h>
+#include <util/signing_timing.h>
+#include <util/time.h>
 #include <util/translation.h>
 #include <wallet/coincontrol.h>
 #include <wallet/wallet.h>
@@ -84,8 +87,10 @@ void WalletModel::updateStatus()
     EncryptionStatus newEncryptionStatus = getEncryptionStatus();
 
     if(cachedEncryptionStatus != newEncryptionStatus) {
+        cachedEncryptionStatus = newEncryptionStatus;
         Q_EMIT encryptionStatusChanged();
     }
+    Q_EMIT pqcKeyValidationChanged();
 }
 
 void WalletModel::pollBalanceChanged()
@@ -149,13 +154,50 @@ bool WalletModel::validateAddress(const QString& address) const
 
 WalletModel::SendCoinsReturn WalletModel::prepareTransaction(WalletModelTransaction &transaction, const CCoinControl& coinControl)
 {
+    return WalletModel::prepareTransaction(*m_wallet, transaction, coinControl, getCachedBalance().balance);
+}
+
+WalletModel::SendCoinsReturn WalletModel::prepareTransaction(interfaces::Wallet& wallet, WalletModelTransaction& transaction, const CCoinControl& coinControl, CAmount cached_available_balance, const SigningProgressCallback& progress_callback)
+{
+    const bool timing_enabled{util::signing_timing::Enabled()};
+    const uint64_t timing_id{timing_enabled ? util::signing_timing::CurrentOrNextId() : 0};
+    const util::signing_timing::ScopedId timing_scope{timing_id};
+    const auto timing_start{SteadyClock::now()};
+    SteadyClock::duration validation_time{};
+    SteadyClock::duration balance_time{};
+    SteadyClock::duration create_transaction_time{};
+    SteadyClock::duration postprocess_time{};
+    unsigned int recipient_count{0};
+    unsigned int output_count{0};
+    CAmount fee_required{0};
+    const auto log_prepare_timing = [&](StatusCode status, const char* status_label) {
+        if (!timing_enabled) return;
+        LogDebug(BCLog::BENCH,
+            "qt-send-timing id=%llu phase=wallet_model_prepare recipients=%u outputs=%u "
+            "validation_ms=%.2f balance_ms=%.2f create_transaction_ms=%.2f postprocess_ms=%.2f "
+            "total_ms=%.2f fee=%lld status_code=%d status=%s\n",
+            util::signing_timing::LogId(timing_id),
+            recipient_count,
+            output_count,
+            Ticks<MillisecondsDouble>(validation_time),
+            Ticks<MillisecondsDouble>(balance_time),
+            Ticks<MillisecondsDouble>(create_transaction_time),
+            Ticks<MillisecondsDouble>(postprocess_time),
+            Ticks<MillisecondsDouble>(SteadyClock::now() - timing_start),
+            static_cast<long long>(fee_required),
+            static_cast<int>(status),
+            status_label);
+    };
+
     CAmount total = 0;
     bool fSubtractFeeFromAmount = false;
     QList<SendCoinsRecipient> recipients = transaction.getRecipients();
     std::vector<CRecipient> vecSend;
+    recipient_count = static_cast<unsigned int>(recipients.size());
 
     if(recipients.empty())
     {
+        log_prepare_timing(OK, "empty");
         return OK;
     }
 
@@ -163,38 +205,49 @@ WalletModel::SendCoinsReturn WalletModel::prepareTransaction(WalletModelTransact
     int nAddresses = 0;
 
     // Pre-check input data for validity
+    const auto validation_start{SteadyClock::now()};
     for (const SendCoinsRecipient &rcp : recipients)
     {
         if (rcp.fSubtractFeeFromAmount)
             fSubtractFeeFromAmount = true;
         {   // User-entered bitcoin address / amount:
-            if(!validateAddress(rcp.address))
+            if(!IsValidDestinationString(rcp.address.toStdString()))
             {
+                validation_time = SteadyClock::now() - validation_start;
+                log_prepare_timing(InvalidAddress, "invalid_address");
                 return InvalidAddress;
             }
             if(rcp.amount <= 0)
             {
+                validation_time = SteadyClock::now() - validation_start;
+                log_prepare_timing(InvalidAmount, "invalid_amount");
                 return InvalidAmount;
             }
             setAddress.insert(rcp.address);
             ++nAddresses;
 
             vecSend.emplace_back(CRecipient{DecodeDestination(rcp.address.toStdString()), rcp.amount, rcp.fSubtractFeeFromAmount});
+            ++output_count;
 
             total += rcp.amount;
         }
     }
+    validation_time = SteadyClock::now() - validation_start;
     if(setAddress.size() != nAddresses)
     {
+        log_prepare_timing(DuplicateAddress, "duplicate_address");
         return DuplicateAddress;
     }
 
     // If no coin was manually selected, use the cached balance
     // Future: can merge this call with 'createTransaction'.
-    CAmount nBalance = getAvailableBalance(&coinControl);
+    const auto balance_start{SteadyClock::now()};
+    CAmount nBalance = coinControl.HasSelected() ? wallet.getAvailableBalance(coinControl) : cached_available_balance;
+    balance_time = SteadyClock::now() - balance_start;
 
     if(total > nBalance)
     {
+        log_prepare_timing(AmountExceedsBalance, "amount_exceeds_balance");
         return AmountExceedsBalance;
     }
 
@@ -205,47 +258,76 @@ WalletModel::SendCoinsReturn WalletModel::prepareTransaction(WalletModelTransact
 
         auto& newTx = transaction.getWtx();
         transaction.setPQCUsageReport({});
-        const auto& res = m_wallet->createTransaction(vecSend,
-                                                      coinControl,
-                                                      /*sign=*/!wallet().privateKeysDisabled(),
-                                                      nChangePosRet,
-                                                      nFeeRequired,
-                                                      &pqc_usage);
+        const auto create_transaction_start{SteadyClock::now()};
+        const auto& res = wallet.createTransaction(vecSend,
+                                                   coinControl,
+                                                   /*sign=*/!wallet.privateKeysDisabled(),
+                                                   nChangePosRet,
+                                                   nFeeRequired,
+                                                   &pqc_usage,
+                                                   progress_callback);
+        create_transaction_time = SteadyClock::now() - create_transaction_start;
+        fee_required = nFeeRequired;
+        const auto postprocess_start{SteadyClock::now()};
         newTx = res ? *res : nullptr;
         transaction.setTransactionFee(nFeeRequired);
         transaction.setPQCUsageReport(pqc_usage);
         if (fSubtractFeeFromAmount && newTx)
             transaction.reassignAmounts(nChangePosRet);
+        postprocess_time = SteadyClock::now() - postprocess_start;
 
         if(!newTx)
         {
             if(!fSubtractFeeFromAmount && (total + nFeeRequired) > nBalance)
             {
+                log_prepare_timing(AmountWithFeeExceedsBalance, "amount_with_fee_exceeds_balance");
                 return SendCoinsReturn(AmountWithFeeExceedsBalance);
             }
-            Q_EMIT message(tr("Send Coins"), QString::fromStdString(util::ErrorString(res).translated),
-                CClientUIInterface::MSG_ERROR);
-            return TransactionCreationFailed;
+            log_prepare_timing(TransactionCreationFailed, "transaction_creation_failed");
+            return SendCoinsReturn(TransactionCreationFailed, QString::fromStdString(util::ErrorString(res).translated));
         }
 
         // Reject absurdly high fee. (This can never happen because the
         // wallet never creates transactions with fee greater than
         // m_default_max_tx_fee. This merely a belt-and-suspenders check).
-        if (nFeeRequired > m_wallet->getDefaultMaxTxFee()) {
+        if (nFeeRequired > wallet.getDefaultMaxTxFee()) {
+            log_prepare_timing(AbsurdFee, "absurd_fee");
             return AbsurdFee;
         }
     } catch (const std::runtime_error& err) {
         // Something unexpected happened, instruct user to report this bug.
-        Q_EMIT message(tr("Send Coins"), QString::fromStdString(err.what()),
-                       CClientUIInterface::MSG_ERROR);
-        return TransactionCreationFailed;
+        log_prepare_timing(TransactionCreationFailed, "runtime_error");
+        return SendCoinsReturn(TransactionCreationFailed, QString::fromStdString(err.what()));
     }
 
+    log_prepare_timing(OK, "ok");
     return SendCoinsReturn(OK);
 }
 
 void WalletModel::sendCoins(WalletModelTransaction& transaction)
 {
+    const bool timing_enabled{util::signing_timing::Enabled()};
+    const uint64_t timing_id{timing_enabled ? util::signing_timing::CurrentOrNextId() : 0};
+    const util::signing_timing::ScopedId timing_scope{timing_id};
+    const auto timing_start{SteadyClock::now()};
+    SteadyClock::duration commit_time{};
+    SteadyClock::duration address_book_time{};
+    SteadyClock::duration balance_check_time{};
+    const unsigned int recipient_count{static_cast<unsigned int>(transaction.getRecipients().size())};
+    const auto log_send_coins_timing = [&](const char* status) {
+        if (!timing_enabled) return;
+        LogDebug(BCLog::BENCH,
+            "qt-send-timing id=%llu phase=wallet_model_send recipients=%u "
+            "commit_ms=%.2f address_book_ms=%.2f balance_check_ms=%.2f total_ms=%.2f status=%s\n",
+            util::signing_timing::LogId(timing_id),
+            recipient_count,
+            Ticks<MillisecondsDouble>(commit_time),
+            Ticks<MillisecondsDouble>(address_book_time),
+            Ticks<MillisecondsDouble>(balance_check_time),
+            Ticks<MillisecondsDouble>(SteadyClock::now() - timing_start),
+            status);
+    };
+
     QByteArray transaction_array; /* store serialized transaction */
 
     {
@@ -257,7 +339,9 @@ void WalletModel::sendCoins(WalletModelTransaction& transaction)
         }
 
         auto& newTx = transaction.getWtx();
+        const auto commit_start{SteadyClock::now()};
         wallet().commitTransaction(newTx, /*value_map=*/{}, std::move(vOrderForm));
+        commit_time = SteadyClock::now() - commit_start;
 
         DataStream ssTx;
         ssTx << TX_WITH_WITNESS(*newTx);
@@ -269,6 +353,7 @@ void WalletModel::sendCoins(WalletModelTransaction& transaction)
     for (const SendCoinsRecipient &rcp : transaction.getRecipients())
     {
         {
+            const auto address_book_start{SteadyClock::now()};
             std::string strAddress = rcp.address.toStdString();
             CTxDestination dest = DecodeDestination(strAddress);
             std::string strLabel = rcp.label.toStdString();
@@ -285,11 +370,15 @@ void WalletModel::sendCoins(WalletModelTransaction& transaction)
                     m_wallet->setAddressBook(dest, strLabel, {}); // {} means don't change purpose
                 }
             }
+            address_book_time += SteadyClock::now() - address_book_start;
         }
         Q_EMIT coinsSent(this, rcp, transaction_array);
     }
 
+    const auto balance_check_start{SteadyClock::now()};
     checkBalanceChanged(m_wallet->getBalances()); // update balance immediately, otherwise there could be a short noticeable delay until pollBalanceChanged hits
+    balance_check_time = SteadyClock::now() - balance_check_start;
+    log_send_coins_timing("ok");
 }
 
 OptionsModel* WalletModel::getOptionsModel() const
@@ -331,6 +420,11 @@ WalletModel::EncryptionStatus WalletModel::getEncryptionStatus() const
     {
         return Unlocked;
     }
+}
+
+wallet::PQCKeyValidationInfo WalletModel::getPQCKeyValidationInfo() const
+{
+    return m_wallet->getPQCKeyValidationInfo();
 }
 
 bool WalletModel::setWalletEncrypted(const SecureString& passphrase)
@@ -464,9 +558,19 @@ WalletModel::UnlockContext::UnlockContext(WalletModel *_wallet, bool _valid, boo
 {
 }
 
+WalletModel::UnlockContext::UnlockContext(UnlockContext&& other) noexcept:
+        wallet(other.wallet),
+        valid(other.valid),
+        relock(other.relock)
+{
+    other.wallet = nullptr;
+    other.valid = false;
+    other.relock = false;
+}
+
 WalletModel::UnlockContext::~UnlockContext()
 {
-    if(valid && relock)
+    if(wallet && valid && relock)
     {
         wallet->setWalletLocked(true);
     }

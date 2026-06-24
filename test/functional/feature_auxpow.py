@@ -8,7 +8,9 @@ from decimal import Decimal
 
 from test_framework.address import p2a
 from test_framework.auxpow import (
+    MERGED_MINING_HEADER,
     QBIT_AUXPOW_CHAIN_ID,
+    check_merkle_branch,
     make_valid_auxpow_from_template,
 )
 from test_framework.blocktools import (
@@ -17,6 +19,7 @@ from test_framework.blocktools import (
 )
 from test_framework.messages import (
     COIN,
+    ser_uint256,
     uint256_from_compact,
 )
 from test_framework.script import CScript
@@ -73,6 +76,8 @@ class FeatureAuxPowTest(BitcoinTestFramework):
             "bits",
             "chainid",
             "coinbasevalue",
+            "commitmentactivationheight",
+            "commitmentorder",
             "hash",
             "height",
             "previousblockhash",
@@ -80,6 +85,8 @@ class FeatureAuxPowTest(BitcoinTestFramework):
         ]
         assert_equal(sorted(aux_template.keys()), expected_keys)
         assert_equal(aux_template["chainid"], QBIT_AUXPOW_CHAIN_ID)
+        assert_equal(aux_template["commitmentactivationheight"], 0)
+        assert_equal(aux_template["commitmentorder"], "display")
         assert_equal(aux_template["previousblockhash"], self.nodes[0].getbestblockhash())
         assert_equal(aux_template["height"], self.nodes[0].getblockcount() + 1)
         assert_equal(aux_template["target"], f"{uint256_from_compact(int(aux_template['bits'], 16)):064x}")
@@ -133,6 +140,24 @@ class FeatureAuxPowTest(BitcoinTestFramework):
         invalid_commitment.update_parent_merkle_root()
         invalid_commitment.solve_parent_pow()
         assert_equal(node.submitauxblock(aux_template["hash"], invalid_commitment.to_hex()), "bad-auxpow-commitment")
+        assert_equal(node.getblockcount(), aux_template["height"] - 1)
+
+        self.log.info("Reject AuxPoW commitments that use internal uint256 byte order")
+        internal_order = self.make_auxpow(aux_template)
+        chain_root = check_merkle_branch(
+            leaf=int(aux_template["hash"], 16),
+            branch=internal_order.chain_merkle_branch,
+            index=internal_order.chain_index,
+        )
+        internal_order.coinbase_tx.vin[0].scriptSig = CScript([
+            MERGED_MINING_HEADER
+            + ser_uint256(chain_root)
+            + (1 << len(internal_order.chain_merkle_branch)).to_bytes(4, "little")
+            + (0).to_bytes(4, "little")
+        ])
+        internal_order.update_parent_merkle_root()
+        internal_order.solve_parent_pow()
+        assert_equal(node.submitauxblock(aux_template["hash"], internal_order.to_hex()), "bad-auxpow-commitment")
         assert_equal(node.getblockcount(), aux_template["height"] - 1)
 
         self.log.info("Rejected AuxPoW submissions remain retryable until accepted")

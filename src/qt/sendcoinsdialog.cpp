@@ -18,11 +18,15 @@
 
 #include <chainparams.h>
 #include <interfaces/node.h>
+#include <interfaces/wallet.h>
 #include <key_io.h>
+#include <logging.h>
 #include <node/interface_ui.h>
 #include <node/types.h>
 #include <policy/fees.h>
 #include <txmempool.h>
+#include <util/signing_timing.h>
+#include <util/time.h>
 #include <util/translation.h>
 #include <validation.h>
 #include <wallet/coincontrol.h>
@@ -37,13 +41,31 @@
 #include <memory>
 
 #include <QFontMetrics>
+#include <QPointer>
+#include <QProgressBar>
+#include <QProgressDialog>
 #include <QScrollBar>
 #include <QSettings>
 #include <QTextDocument>
+#include <QThread>
+#include <QTimer>
 
 using common::PSBTError;
 using wallet::CCoinControl;
 using wallet::DEFAULT_PAY_TX_FEE;
+
+struct SendCoinsDialog::PrepareResult
+{
+    std::unique_ptr<WalletModelTransaction> transaction;
+    WalletModel::SendCoinsReturn status;
+};
+
+struct SendCoinsDialog::PrepareProgress
+{
+    PrepareProgressPhase phase{PrepareProgressPhase::Preparing};
+    unsigned int completed{0};
+    unsigned int total{0};
+};
 
 namespace {
 QString BilingualToQString(const bilingual_str& message)
@@ -69,6 +91,16 @@ QString PQCStateLabel(wallet::PQCSignatureLimitState state)
 bool HasPQCUsageWarning(const wallet::PQCUsageReport& report)
 {
     return !report.warnings.empty();
+}
+
+std::unique_ptr<interfaces::Wallet> GetBackgroundWallet(interfaces::Node& node, const std::string& wallet_name)
+{
+    for (auto& wallet : node.walletLoader().getWallets()) {
+        if (wallet && wallet->getWalletName() == wallet_name) {
+            return std::move(wallet);
+        }
+    }
+    return nullptr;
 }
 
 } // namespace
@@ -326,6 +358,17 @@ void SendCoinsDialog::setModel(WalletModel *_model)
 
 SendCoinsDialog::~SendCoinsDialog()
 {
+    m_prepare_cancel_requested = true;
+    clearPrepareProgressDialog();
+    if (m_prepare_thread) {
+        QThread* thread = m_prepare_thread;
+        m_prepare_thread = nullptr;
+        disconnect(thread, nullptr, this, nullptr);
+        thread->wait();
+        delete thread;
+    }
+    m_prepare_unlock_context.reset();
+
     QSettings settings;
     settings.setValue("fFeeSectionMinimized", fFeeMinimized);
     settings.setValue("nFeeRadio", ui->groupFee->checkedId());
@@ -337,56 +380,7 @@ SendCoinsDialog::~SendCoinsDialog()
 
 bool SendCoinsDialog::PrepareSendText(QString& question_string, QString& informative_text, QString& detailed_text)
 {
-    QList<SendCoinsRecipient> recipients;
-    bool valid = true;
-
-    for(int i = 0; i < ui->entries->count(); ++i)
-    {
-        SendCoinsEntry *entry = qobject_cast<SendCoinsEntry*>(ui->entries->itemAt(i)->widget());
-        if(entry)
-        {
-            if(entry->validate(model->node()))
-            {
-                recipients.append(entry->getValue());
-            }
-            else if (valid)
-            {
-                ui->scrollArea->ensureWidgetVisible(entry);
-                valid = false;
-            }
-        }
-    }
-
-    if(!valid || recipients.isEmpty())
-    {
-        return false;
-    }
-
-    fNewRecipientAllowed = false;
-    WalletModel::UnlockContext ctx(model->requestUnlock());
-    if(!ctx.isValid())
-    {
-        // Unlock wallet was cancelled
-        fNewRecipientAllowed = true;
-        return false;
-    }
-
-    // prepare transaction for getting txFee earlier
-    m_current_transaction = std::make_unique<WalletModelTransaction>(recipients);
-    WalletModel::SendCoinsReturn prepareStatus;
-
-    updateCoinControlState();
-
-    CCoinControl coin_control = *m_coin_control;
-    coin_control.m_allow_other_inputs = !coin_control.HasSelected(); // future, could introduce a checkbox to customize this value.
-    prepareStatus = model->prepareTransaction(*m_current_transaction, coin_control);
-
-    // process prepareStatus and on error generate message shown to user
-    processSendCoinsReturn(prepareStatus,
-        QbitUnits::formatWithUnit(model->getOptionsModel()->getDisplayUnit(), m_current_transaction->getTransactionFee()));
-
-    if(prepareStatus.status != WalletModel::OK) {
-        fNewRecipientAllowed = true;
+    if (!m_current_transaction) {
         return false;
     }
 
@@ -491,6 +485,307 @@ bool SendCoinsDialog::PrepareSendText(QString& question_string, QString& informa
     return true;
 }
 
+bool SendCoinsDialog::PrepareSendRequest(std::unique_ptr<WalletModelTransaction>& transaction, CCoinControl& coin_control)
+{
+    QList<SendCoinsRecipient> recipients;
+    bool valid = true;
+
+    for(int i = 0; i < ui->entries->count(); ++i)
+    {
+        SendCoinsEntry *entry = qobject_cast<SendCoinsEntry*>(ui->entries->itemAt(i)->widget());
+        if(entry)
+        {
+            if(entry->validate(model->node()))
+            {
+                recipients.append(entry->getValue());
+            }
+            else if (valid)
+            {
+                ui->scrollArea->ensureWidgetVisible(entry);
+                valid = false;
+            }
+        }
+    }
+
+    if(!valid || recipients.isEmpty())
+    {
+        return false;
+    }
+
+    fNewRecipientAllowed = false;
+    m_prepare_unlock_context = std::make_unique<WalletModel::UnlockContext>(model->requestUnlock());
+    if(!m_prepare_unlock_context->isValid())
+    {
+        // Unlock wallet was cancelled
+        m_prepare_unlock_context.reset();
+        fNewRecipientAllowed = true;
+        return false;
+    }
+
+    transaction = std::make_unique<WalletModelTransaction>(recipients);
+
+    updateCoinControlState();
+
+    coin_control = *m_coin_control;
+    coin_control.m_allow_other_inputs = !coin_control.HasSelected(); // future, could introduce a checkbox to customize this value.
+    return true;
+}
+
+void SendCoinsDialog::startPrepareTransaction(std::unique_ptr<WalletModelTransaction> transaction, const CCoinControl& coin_control)
+{
+    std::unique_ptr<interfaces::Wallet> wallet = model->wallet().clone();
+    if (!wallet) {
+        wallet = GetBackgroundWallet(model->node(), model->wallet().getWalletName());
+    }
+    if (!wallet) {
+        processSendCoinsReturn(WalletModel::SendCoinsReturn(WalletModel::TransactionCreationFailed, tr("Wallet is no longer loaded.")));
+        fNewRecipientAllowed = true;
+        m_prepare_unlock_context.reset();
+        return;
+    }
+
+    clearPrepareProgressDialog();
+    const uint64_t generation = ++m_prepare_generation;
+    m_prepare_cancel_requested = false;
+    m_prepare_counters_reserved = false;
+
+    m_prepare_progress_dialog = new QProgressDialog(this);
+    m_prepare_progress_dialog->setWindowTitle(tr("Preparing Transaction"));
+    m_prepare_progress_dialog->setLabelText(tr("Preparing transaction..."));
+    m_prepare_progress_dialog->setCancelButtonText(tr("Cancel"));
+    m_prepare_progress_bar = new QProgressBar(m_prepare_progress_dialog);
+    m_prepare_progress_bar->setRange(0, 0);
+    m_prepare_progress_dialog->setBar(m_prepare_progress_bar);
+    m_prepare_progress_dialog->setMinimumDuration(250);
+    m_prepare_progress_dialog->setAutoClose(false);
+    m_prepare_progress_dialog->setAutoReset(false);
+    m_prepare_progress_dialog->setWindowModality(Qt::ApplicationModal);
+    GUIUtil::PolishProgressDialog(m_prepare_progress_dialog);
+    connect(m_prepare_progress_dialog, &QProgressDialog::canceled, this, &SendCoinsDialog::cancelPrepareTransaction);
+    QTimer::singleShot(250, m_prepare_progress_dialog, [this, generation] {
+        if (generation == m_prepare_generation && m_prepare_progress_dialog) {
+            m_prepare_progress_dialog->show();
+        }
+    });
+
+    const CAmount cached_available_balance = model->getCachedBalance().balance;
+    QPointer<SendCoinsDialog> dialog(this);
+    std::atomic_bool* cancel_flag = &m_prepare_cancel_requested;
+    std::atomic_bool* counters_reserved_flag = &m_prepare_counters_reserved;
+    QThread* thread = QThread::create([dialog,
+                                       generation,
+                                       wallet = std::move(wallet),
+                                       transaction = std::move(transaction),
+                                       coin_control,
+                                       cached_available_balance,
+                                       cancel_flag,
+                                       counters_reserved_flag]() mutable {
+        auto result = std::make_shared<PrepareResult>();
+        result->transaction = std::move(transaction);
+        const auto post_progress = [dialog, generation, cancel_flag](PrepareProgress progress, bool cancellable) {
+            if (!dialog || (cancellable && cancel_flag->load())) return false;
+            QMetaObject::invokeMethod(dialog, [dialog, generation, progress] {
+                if (dialog) {
+                    dialog->prepareTransactionProgress(generation, progress);
+                }
+            }, Qt::QueuedConnection);
+            return !cancellable || !cancel_flag->load();
+        };
+        SigningProgressCallback progress_callback = [post_progress, counters_reserved_flag](const SigningProgress& progress) {
+            if (!progress.cancellable) {
+                counters_reserved_flag->store(true);
+            }
+            bool cancellable{progress.cancellable && !counters_reserved_flag->load()};
+            switch (progress.phase) {
+            case SigningProgressPhase::PREPARING_TRANSACTION:
+                return post_progress(PrepareProgress{
+                    .phase = PrepareProgressPhase::Preparing,
+                    .completed = progress.completed,
+                    .total = progress.total,
+                }, cancellable);
+            case SigningProgressPhase::RESERVING_PQC_COUNTERS: {
+                if (progress.total > 0 && progress.completed >= progress.total) {
+                    counters_reserved_flag->store(true);
+                    cancellable = false;
+                }
+                return post_progress(PrepareProgress{
+                    .phase = PrepareProgressPhase::Reserving,
+                    .completed = progress.completed,
+                    .total = progress.total,
+                }, cancellable);
+            }
+            case SigningProgressPhase::SIGNING_INPUTS:
+                return post_progress(PrepareProgress{
+                    .phase = PrepareProgressPhase::Signing,
+                    .completed = std::min(progress.completed, progress.total),
+                    .total = progress.total,
+                }, cancellable);
+            case SigningProgressPhase::FINALIZING_TRANSACTION:
+                return post_progress(PrepareProgress{
+                    .phase = PrepareProgressPhase::Finalizing,
+                    .completed = progress.completed,
+                    .total = progress.total,
+                }, cancellable);
+            }
+            return post_progress(PrepareProgress{}, cancellable);
+        };
+        result->status = WalletModel::prepareTransaction(*wallet, *result->transaction, coin_control, cached_available_balance, progress_callback);
+        if (!dialog) return;
+        QMetaObject::invokeMethod(dialog, [dialog, generation, result] {
+            if (dialog) {
+                dialog->prepareTransactionFinished(generation, result);
+            }
+        }, Qt::QueuedConnection);
+    });
+
+    m_prepare_thread = thread;
+    connect(thread, &QThread::finished, this, [this, thread] {
+        if (m_prepare_thread == thread) {
+            m_prepare_thread = nullptr;
+            thread->deleteLater();
+        }
+    });
+    thread->start();
+}
+
+void SendCoinsDialog::prepareTransactionProgress(uint64_t generation, PrepareProgress progress)
+{
+    if (generation != m_prepare_generation || !m_prepare_progress_dialog) {
+        return;
+    }
+    QPointer<QProgressDialog> progress_dialog{m_prepare_progress_dialog};
+    QPointer<QProgressBar> progress_bar{m_prepare_progress_bar};
+    if (!progress_bar) {
+        return;
+    }
+    const bool counters_reserved{m_prepare_counters_reserved.load()};
+    if (m_prepare_cancel_requested.load() && !counters_reserved) {
+        return;
+    }
+    if (counters_reserved) {
+        progress_dialog->setCancelButton(nullptr);
+        if (!progress_dialog) return;
+    }
+    switch (progress.phase) {
+    case PrepareProgressPhase::Preparing:
+        progress_dialog->setLabelText(tr("Preparing transaction..."));
+        if (!progress_dialog) return;
+        progress_bar->setRange(0, 0);
+        break;
+    case PrepareProgressPhase::Reserving:
+        progress_dialog->setLabelText(tr("Reserving signing counters..."));
+        if (!progress_dialog) return;
+        progress_bar->setRange(0, 0);
+        break;
+    case PrepareProgressPhase::Signing:
+        if (progress.total == 0) {
+            progress_dialog->setLabelText(tr("Signing inputs..."));
+            if (!progress_dialog) return;
+            progress_bar->setRange(0, 0);
+        } else {
+            progress.completed = std::min(progress.completed, progress.total);
+            progress_dialog->setLabelText(tr("Signing inputs: %1 of %2 complete...").arg(progress.completed).arg(progress.total));
+            if (!progress_dialog) return;
+            progress_bar->setRange(0, static_cast<int>(progress.total));
+            progress_bar->setValue(static_cast<int>(progress.completed));
+        }
+        break;
+    case PrepareProgressPhase::Finalizing:
+        progress_dialog->setLabelText(tr("Finalizing transaction..."));
+        if (!progress_dialog) return;
+        progress_bar->setRange(0, 0);
+        break;
+    }
+}
+
+void SendCoinsDialog::prepareTransactionFinished(uint64_t generation, std::shared_ptr<PrepareResult> result)
+{
+    if (generation != m_prepare_generation) {
+        return;
+    }
+    ++m_prepare_generation;
+    const bool counters_reserved{m_prepare_counters_reserved.load()};
+
+    clearPrepareProgressDialog();
+
+    if (m_prepare_cancel_requested.load() && !counters_reserved) {
+        m_prepare_cancel_requested = false;
+        m_prepare_counters_reserved = false;
+        fNewRecipientAllowed = true;
+        m_current_transaction.reset();
+        m_prepare_unlock_context.reset();
+        return;
+    }
+    m_prepare_cancel_requested = false;
+    m_prepare_counters_reserved = false;
+
+    m_current_transaction = std::move(result->transaction);
+
+    processSendCoinsReturn(result->status,
+        QbitUnits::formatWithUnit(model->getOptionsModel()->getDisplayUnit(), m_current_transaction->getTransactionFee()));
+
+    if(result->status.status != WalletModel::OK) {
+        fNewRecipientAllowed = true;
+        m_current_transaction.reset();
+        m_prepare_unlock_context.reset();
+        return;
+    }
+    m_prepare_unlock_context.reset();
+
+    QString question_string, informative_text, detailed_text;
+    if (!PrepareSendText(question_string, informative_text, detailed_text)) {
+        fNewRecipientAllowed = true;
+        m_current_transaction.reset();
+        return;
+    }
+
+    const QString confirmation = tr("Confirm send coins");
+    const bool enable_send{!model->wallet().privateKeysDisabled() || model->wallet().hasExternalSigner()};
+    const bool always_show_unsigned{model->getOptionsModel()->getEnablePSBTControls()};
+    auto confirmationDialog = new SendConfirmationDialog(confirmation, question_string, informative_text, detailed_text, SEND_CONFIRM_DELAY, enable_send, always_show_unsigned, this);
+    confirmationDialog->setAttribute(Qt::WA_DeleteOnClose);
+    // TODO: Replace QDialog::exec() with safer QDialog::show().
+    const auto retval = static_cast<QMessageBox::StandardButton>(confirmationDialog->exec());
+
+    finishSendWithPreparedTransaction(retval);
+}
+
+void SendCoinsDialog::cancelPrepareTransaction()
+{
+    if (m_prepare_counters_reserved.load()) {
+        m_prepare_cancel_requested = false;
+        if (m_prepare_progress_dialog) {
+            m_prepare_progress_dialog->setCancelButton(nullptr);
+            if (m_prepare_progress_bar) {
+                m_prepare_progress_bar->setRange(0, 0);
+            }
+            m_prepare_progress_dialog->setLabelText(tr("Finalizing transaction..."));
+        }
+        return;
+    }
+    m_prepare_cancel_requested = true;
+    if (m_prepare_progress_dialog) {
+        m_prepare_progress_dialog->setCancelButton(nullptr);
+        if (m_prepare_progress_bar) {
+            m_prepare_progress_bar->setRange(0, 0);
+        }
+        m_prepare_progress_dialog->setLabelText(tr("Canceling transaction preparation..."));
+    }
+}
+
+void SendCoinsDialog::clearPrepareProgressDialog()
+{
+    if (!m_prepare_progress_dialog) {
+        return;
+    }
+    QProgressDialog* dialog = m_prepare_progress_dialog;
+    m_prepare_progress_dialog = nullptr;
+    m_prepare_progress_bar = nullptr;
+    disconnect(dialog, nullptr, this, nullptr);
+    dialog->close();
+    dialog->deleteLater();
+}
+
 void SendCoinsDialog::presentPSBT(PartiallySignedTransaction& psbtx)
 {
     // Serialize the PSBT
@@ -574,30 +869,86 @@ bool SendCoinsDialog::signWithExternalSigner(PartiallySignedTransaction& psbtx, 
 
 void SendCoinsDialog::sendButtonClicked([[maybe_unused]] bool checked)
 {
-    if(!model || !model->getOptionsModel())
+    const bool timing_enabled{util::signing_timing::Enabled()};
+    const uint64_t timing_id{timing_enabled ? util::signing_timing::CurrentOrNextId() : 0};
+    const util::signing_timing::ScopedId timing_scope{timing_id};
+    const auto timing_start{SteadyClock::now()};
+    const auto log_send_button_timing = [&](const char* status, bool queued) {
+        if (!timing_enabled) return;
+        LogDebug(BCLog::BENCH,
+            "qt-send-timing id=%llu phase=send_button_async request_ms=%.2f queued=%d status=%s\n",
+            util::signing_timing::LogId(timing_id),
+            Ticks<MillisecondsDouble>(SteadyClock::now() - timing_start),
+            queued,
+            status);
+    };
+
+    if(!model || !model->getOptionsModel()) {
+        log_send_button_timing("missing_model", false);
         return;
+    }
 
-    QString question_string, informative_text, detailed_text;
-    if (!PrepareSendText(question_string, informative_text, detailed_text)) return;
-    assert(m_current_transaction);
+    if (m_prepare_thread) {
+        log_send_button_timing("busy", false);
+        return;
+    }
 
-    const QString confirmation = tr("Confirm send coins");
-    const bool enable_send{!model->wallet().privateKeysDisabled() || model->wallet().hasExternalSigner()};
-    const bool always_show_unsigned{model->getOptionsModel()->getEnablePSBTControls()};
-    auto confirmationDialog = new SendConfirmationDialog(confirmation, question_string, informative_text, detailed_text, SEND_CONFIRM_DELAY, enable_send, always_show_unsigned, this);
-    confirmationDialog->setAttribute(Qt::WA_DeleteOnClose);
-    // TODO: Replace QDialog::exec() with safer QDialog::show().
-    const auto retval = static_cast<QMessageBox::StandardButton>(confirmationDialog->exec());
+    std::unique_ptr<WalletModelTransaction> transaction;
+    CCoinControl coin_control;
+    if (!PrepareSendRequest(transaction, coin_control)) {
+        log_send_button_timing("prepare_request_failed", false);
+        return;
+    }
+    log_send_button_timing("queued", true);
+
+    startPrepareTransaction(std::move(transaction), coin_control);
+}
+
+void SendCoinsDialog::finishSendWithPreparedTransaction(QMessageBox::StandardButton retval)
+{
+    const bool timing_enabled{util::signing_timing::Enabled()};
+    const uint64_t timing_id{timing_enabled ? util::signing_timing::CurrentOrNextId() : 0};
+    const util::signing_timing::ScopedId timing_scope{timing_id};
+    const auto timing_start{SteadyClock::now()};
+    SteadyClock::duration unsigned_psbt_time{};
+    SteadyClock::duration external_sign_time{};
+    SteadyClock::duration send_coins_time{};
+    SteadyClock::duration post_send_time{};
+    bool save_selected{retval == QMessageBox::Save};
+    bool external_signer{false};
+    bool broadcast{false};
+    const auto log_finish_timing = [&](const char* status) {
+        if (!timing_enabled) return;
+        LogDebug(BCLog::BENCH,
+            "qt-send-timing id=%llu phase=send_finish unsigned_psbt_ms=%.2f "
+            "external_sign_ms=%.2f send_coins_ms=%.2f post_send_ms=%.2f total_ms=%.2f "
+            "save_selected=%d external_signer=%d broadcast=%d status=%s\n",
+            util::signing_timing::LogId(timing_id),
+            Ticks<MillisecondsDouble>(unsigned_psbt_time),
+            Ticks<MillisecondsDouble>(external_sign_time),
+            Ticks<MillisecondsDouble>(send_coins_time),
+            Ticks<MillisecondsDouble>(post_send_time),
+            Ticks<MillisecondsDouble>(SteadyClock::now() - timing_start),
+            save_selected,
+            external_signer,
+            broadcast,
+            status);
+    };
 
     if(retval != QMessageBox::Yes && retval != QMessageBox::Save)
     {
         fNewRecipientAllowed = true;
+        m_current_transaction.reset();
+        m_prepare_unlock_context.reset();
+        log_finish_timing("confirmation_rejected");
         return;
     }
 
+    assert(m_current_transaction);
     bool send_failure = false;
     if (retval == QMessageBox::Save) {
         // "Create Unsigned" clicked
+        const auto unsigned_psbt_start{SteadyClock::now()};
         CMutableTransaction mtx = CMutableTransaction{*(m_current_transaction->getWtx())};
         PartiallySignedTransaction psbtx(mtx);
         bool complete = false;
@@ -608,11 +959,14 @@ void SendCoinsDialog::sendButtonClicked([[maybe_unused]] bool checked)
 
         // Copy PSBT to clipboard and offer to save
         presentPSBT(psbtx);
+        unsigned_psbt_time = SteadyClock::now() - unsigned_psbt_start;
     } else {
         // "Send" clicked
         assert(!model->wallet().privateKeysDisabled() || model->wallet().hasExternalSigner());
-        bool broadcast = true;
-        if (model->wallet().hasExternalSigner()) {
+        broadcast = true;
+        external_signer = model->wallet().hasExternalSigner();
+        if (external_signer) {
+            const auto external_sign_start{SteadyClock::now()};
             CMutableTransaction mtx = CMutableTransaction{*(m_current_transaction->getWtx())};
             PartiallySignedTransaction psbtx(mtx);
             bool complete = false;
@@ -635,16 +989,20 @@ void SendCoinsDialog::sendButtonClicked([[maybe_unused]] bool checked)
                     presentPSBT(psbtx);
                 }
             }
+            external_sign_time = SteadyClock::now() - external_sign_start;
         }
 
         // Broadcast the transaction, unless an external signer was used and it
         // failed, or more signatures are needed.
         if (broadcast) {
             // now send the prepared transaction
+            const auto send_coins_start{SteadyClock::now()};
             model->sendCoins(*m_current_transaction);
             Q_EMIT coinsSent(m_current_transaction->getWtx()->GetHash());
+            send_coins_time = SteadyClock::now() - send_coins_start;
         }
     }
+    const auto post_send_start{SteadyClock::now()};
     if (!send_failure) {
         const QString pqc_warning = FormatPQCUsageWarningMessage(m_current_transaction->getPQCUsageReport());
         if (!pqc_warning.isEmpty()) {
@@ -656,6 +1014,9 @@ void SendCoinsDialog::sendButtonClicked([[maybe_unused]] bool checked)
     }
     fNewRecipientAllowed = true;
     m_current_transaction.reset();
+    post_send_time = SteadyClock::now() - post_send_start;
+    m_prepare_unlock_context.reset();
+    log_finish_timing(send_failure ? "send_failed" : "ok");
 }
 
 void SendCoinsDialog::clear()
@@ -848,7 +1209,7 @@ void SendCoinsDialog::processSendCoinsReturn(const WalletModel::SendCoinsReturn 
         msgParams.first = tr("Duplicate address found: addresses should only be used once each.");
         break;
     case WalletModel::TransactionCreationFailed:
-        msgParams.first = tr("Transaction creation failed!");
+        msgParams.first = sendCoinsReturn.reasonCommitFailed.isEmpty() ? tr("Transaction creation failed!") : tr("Transaction creation failed: %1").arg(sendCoinsReturn.reasonCommitFailed);
         msgParams.second = CClientUIInterface::MSG_ERROR;
         break;
     case WalletModel::AbsurdFee:

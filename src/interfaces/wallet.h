@@ -12,10 +12,12 @@
 #include <primitives/transaction_identifier.h>
 #include <pubkey.h>
 #include <script/script.h>
+#include <script/signingprogress.h>
 #include <support/allocators/secure.h>
 #include <util/fs.h>
 #include <util/result.h>
 #include <util/ui_change_type.h>
+#include <wallet/types.h>
 
 #include <cstdint>
 #include <functional>
@@ -95,6 +97,9 @@ public:
     //! Get wallet name.
     virtual std::string getWalletName() = 0;
 
+    //! Create another interface wrapper to the same underlying wallet, if supported.
+    virtual std::unique_ptr<Wallet> clone() { return nullptr; }
+
     // Get a new address.
     virtual util::Result<CTxDestination> getNewDestination(const OutputType type, const std::string& label) = 0;
 
@@ -151,7 +156,8 @@ public:
         bool sign,
         int& change_pos,
         CAmount& fee,
-        wallet::PQCUsageReport* pqc_usage = nullptr) = 0;
+        wallet::PQCUsageReport* pqc_usage = nullptr,
+        const SigningProgressCallback& progress_callback = {}) = 0;
 
     //! Commit transaction.
     virtual void commitTransaction(CTransactionRef tx,
@@ -279,6 +285,9 @@ public:
 
     //! Get max tx fee.
     virtual CAmount getDefaultMaxTxFee() = 0;
+
+    //! Get plaintext PQC key validation state.
+    virtual wallet::PQCKeyValidationInfo getPQCKeyValidationInfo() const = 0;
 
     // Remove wallet.
     virtual void remove() = 0;

@@ -10,6 +10,7 @@
 #include <interfaces/handler.h>
 #include <interfaces/node.h>
 #include <key_io.h>
+#include <node/interface_ui.h>
 #include <qt/bitcoinamountfield.h>
 #include <qt/qbitunits.h>
 #include <qt/clientmodel.h>
@@ -40,6 +41,7 @@
 #include <chrono>
 #include <memory>
 #include <span>
+#include <utility>
 
 #include <QAbstractButton>
 #include <QAction>
@@ -47,7 +49,10 @@
 #include <QCheckBox>
 #include <QClipboard>
 #include <QComboBox>
+#include <QElapsedTimer>
+#include <QEvent>
 #include <QObject>
+#include <QPointer>
 #include <QPushButton>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -72,20 +77,144 @@ constexpr CAmount QT_WALLET_FUNDING_AMOUNT{210 * COIN - 1000};
 constexpr std::array QT_WALLET_BECH32_DESCRIPTOR_OUTPUT_TYPES{OutputType::BECH32};
 constexpr std::array QT_WALLET_P2MR_DESCRIPTOR_OUTPUT_TYPES{OutputType::P2MR};
 
+template <typename Predicate>
+bool WaitUntil(Predicate&& predicate, int timeout_ms)
+{
+    QElapsedTimer timer;
+    timer.start();
+    while (timer.elapsed() < timeout_ms) {
+        if (predicate()) return true;
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+        QTest::qWait(50);
+    }
+    return predicate();
+}
+
+class SendConfirmationClicker : public QObject
+{
+public:
+    SendConfirmationClicker(QString* text, QMessageBox::StandardButton confirm_type)
+        : QObject(QApplication::instance()), m_text(text), m_confirm_type(confirm_type)
+    {
+        QApplication::instance()->installEventFilter(this);
+        m_timer.setInterval(50);
+        connect(&m_timer, &QTimer::timeout, this, &SendConfirmationClicker::tryClickVisibleDialog);
+        m_timer.start();
+    }
+
+    ~SendConfirmationClicker() override
+    {
+        QApplication::instance()->removeEventFilter(this);
+    }
+
+    bool eventFilter(QObject* watched, QEvent* event) override
+    {
+        if (event->type() == QEvent::Show && watched->inherits("SendConfirmationDialog")) {
+            click(qobject_cast<SendConfirmationDialog*>(watched));
+        }
+        return QObject::eventFilter(watched, event);
+    }
+
+private:
+    void tryClickVisibleDialog()
+    {
+        for (QWidget* widget : QApplication::topLevelWidgets()) {
+            if (widget->inherits("SendConfirmationDialog")) {
+                click(qobject_cast<SendConfirmationDialog*>(widget));
+                return;
+            }
+        }
+    }
+
+    void click(SendConfirmationDialog* dialog)
+    {
+        if (m_clicked || !dialog) return;
+        m_clicked = true;
+        if (m_text) *m_text = dialog->text();
+        QAbstractButton* button = dialog->button(m_confirm_type);
+        button->setEnabled(true);
+        QMetaObject::invokeMethod(dialog, "done", Qt::QueuedConnection, Q_ARG(int, static_cast<int>(m_confirm_type)));
+        m_timer.stop();
+        deleteLater();
+    }
+
+    QString* const m_text;
+    const QMessageBox::StandardButton m_confirm_type;
+    QTimer m_timer;
+    bool m_clicked{false};
+};
+
+class MessageBoxClicker : public QObject
+{
+public:
+    MessageBoxClicker(QString object_name, QMessageBox::StandardButton button)
+        : QObject(QApplication::instance()), m_object_name(std::move(object_name)), m_button(button)
+    {
+        QApplication::instance()->installEventFilter(this);
+        m_timer.setInterval(50);
+        connect(&m_timer, &QTimer::timeout, this, &MessageBoxClicker::tryClickVisibleDialog);
+        m_timer.start();
+    }
+
+    ~MessageBoxClicker() override
+    {
+        QApplication::instance()->removeEventFilter(this);
+    }
+
+    bool eventFilter(QObject* watched, QEvent* event) override
+    {
+        if (event->type() == QEvent::Show && watched->inherits("QMessageBox")) {
+            click(qobject_cast<QMessageBox*>(watched));
+        }
+        return QObject::eventFilter(watched, event);
+    }
+
+private:
+    void tryClickVisibleDialog()
+    {
+        for (QWidget* widget : QApplication::topLevelWidgets()) {
+            if (widget->inherits("QMessageBox")) {
+                click(qobject_cast<QMessageBox*>(widget));
+                if (m_clicked) return;
+            }
+        }
+    }
+
+    void click(QMessageBox* dialog)
+    {
+        if (m_clicked || m_click_pending || !dialog || dialog->objectName() != m_object_name) return;
+        QAbstractButton* button = dialog->button(m_button);
+        if (!button) return;
+        if (!m_finished_connected) {
+            m_finished_connected = true;
+            connect(dialog, &QMessageBox::finished, this, [this] {
+                m_clicked = true;
+                m_timer.stop();
+                deleteLater();
+            });
+        }
+        m_click_pending = true;
+        QPointer<QAbstractButton> button_ptr{button};
+        QTimer::singleShot(50, this, [this, button_ptr] {
+            m_click_pending = false;
+            if (m_clicked || !button_ptr) return;
+            button_ptr->setEnabled(true);
+            button_ptr->click();
+        });
+    }
+
+    const QString m_object_name;
+    const QMessageBox::StandardButton m_button;
+    QTimer m_timer;
+    bool m_clicked{false};
+    bool m_click_pending{false};
+    bool m_finished_connected{false};
+};
+
 //! Press "Yes" or "Cancel" buttons in modal send confirmation dialog.
 void ConfirmSend(QString* text = nullptr, QMessageBox::StandardButton confirm_type = QMessageBox::Yes)
 {
-    QTimer::singleShot(0, [text, confirm_type]() {
-        for (QWidget* widget : QApplication::topLevelWidgets()) {
-            if (widget->inherits("SendConfirmationDialog")) {
-                SendConfirmationDialog* dialog = qobject_cast<SendConfirmationDialog*>(widget);
-                if (text) *text = dialog->text();
-                QAbstractButton* button = dialog->button(confirm_type);
-                button->setEnabled(true);
-                button->click();
-            }
-        }
-    });
+    new SendConfirmationClicker(text, confirm_type);
 }
 
 //! Send coins to address and return txid.
@@ -104,9 +233,37 @@ Txid SendCoins(CWallet& wallet, SendCoinsDialog& sendCoinsDialog, const CTxDesti
     boost::signals2::scoped_connection c(wallet.NotifyTransactionChanged.connect([&txid](const Txid& hash, ChangeType status) {
         if (status == CT_NEW) txid = hash;
     }));
+    QString send_error;
+    const QMetaObject::Connection message_connection = QObject::connect(&sendCoinsDialog, &SendCoinsDialog::message, [&](const QString&, const QString& message, unsigned int style) {
+        if (style & CClientUIInterface::MSG_ERROR) send_error = message;
+    });
+    const QString clipboard_before = QApplication::clipboard()->text();
     ConfirmSend(confirm_text, confirm_type);
+    if (confirm_type == QMessageBox::Save) {
+        new MessageBoxClicker(QStringLiteral("psbt_copied_message"), QMessageBox::Discard);
+    }
     bool invoked = QMetaObject::invokeMethod(&sendCoinsDialog, "sendButtonClicked", Q_ARG(bool, false));
     assert(invoked);
+    if (confirm_type == QMessageBox::Yes) {
+        if (!WaitUntil([&txid, &send_error] { return !txid.IsNull() || !send_error.isEmpty(); }, 60000)) {
+            QTest::qFail("Timed out waiting for sent transaction notification", __FILE__, __LINE__);
+        }
+        if (txid.IsNull() && !send_error.isEmpty()) {
+            const QByteArray error = ("Send failed before transaction notification: " + send_error).toLocal8Bit();
+            QTest::qFail(error.constData(), __FILE__, __LINE__);
+        }
+    } else if (confirm_type == QMessageBox::Save) {
+        if (!WaitUntil([&clipboard_before, &send_error] {
+                return (!QApplication::clipboard()->text().isEmpty() && QApplication::clipboard()->text() != clipboard_before) || !send_error.isEmpty();
+            }, 60000)) {
+            QTest::qFail("Timed out waiting for PSBT clipboard update", __FILE__, __LINE__);
+        }
+        if (!send_error.isEmpty()) {
+            const QByteArray error = ("PSBT creation failed: " + send_error).toLocal8Bit();
+            QTest::qFail(error.constData(), __FILE__, __LINE__);
+        }
+    }
+    QObject::disconnect(message_connection);
     return txid;
 }
 
@@ -341,7 +498,8 @@ public:
         bool,
         int& change_pos,
         CAmount& fee,
-        wallet::PQCUsageReport* pqc_usage) override
+        wallet::PQCUsageReport* pqc_usage,
+        const SigningProgressCallback&) override
     {
         CMutableTransaction tx;
         if (!recipients.empty()) {
@@ -396,6 +554,7 @@ public:
     bool hasExternalSigner() override { return false; }
     OutputType getDefaultAddressType() override { return OutputType::P2MR; }
     CAmount getDefaultMaxTxFee() override { return MAX_MONEY; }
+    wallet::PQCKeyValidationInfo getPQCKeyValidationInfo() const override { return {}; }
     void remove() override {}
     std::unique_ptr<interfaces::Handler> handleUnload(UnloadFn) override { return interfaces::MakeCleanupHandler([] {}); }
     std::unique_ptr<interfaces::Handler> handleShowProgress(ShowProgressFn) override { return interfaces::MakeCleanupHandler([] {}); }
@@ -571,23 +730,6 @@ void TestGUIWatchOnly(interfaces::Node& node, TestChain100Setup& test)
     // Set change address
     sendCoinsDialog.getCoinControl()->destChange = PKHash{test.coinbaseKey.GetPubKey()};
 
-    // Time to reject "save" PSBT dialog ('SendCoins' locks the main thread until the dialog receives the event).
-    QTimer timer;
-    timer.setInterval(500);
-    QObject::connect(&timer, &QTimer::timeout, [&](){
-        for (QWidget* widget : QApplication::topLevelWidgets()) {
-            if (widget->inherits("QMessageBox") && widget->objectName().compare("psbt_copied_message") == 0) {
-                QMessageBox* dialog = qobject_cast<QMessageBox*>(widget);
-                QAbstractButton* button = dialog->button(QMessageBox::Discard);
-                button->setEnabled(true);
-                button->click();
-                timer.stop();
-                break;
-            }
-        }
-    });
-    timer.start(500);
-
     // Send tx and verify PSBT copied to the clipboard.
     SendCoins(*wallet.get(), sendCoinsDialog, PKHash(), 5 * COIN, /*rbf=*/false, QMessageBox::Save);
     const std::string& psbt_string = QApplication::clipboard()->text().toStdString();
@@ -621,6 +763,7 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
     QCOMPARE(address_type->count(), 1);
     QCOMPARE(address_type->currentData().toInt(), static_cast<int>(OutputType::P2MR));
     QCOMPARE(address_type->itemText(0), QString("P2MR"));
+    QVERIFY(!address_type->isVisibleTo(&receiveCoinsDialog));
 }
 
 void TestSendPQCReportPropagation(interfaces::Node& node)

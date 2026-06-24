@@ -68,6 +68,8 @@ void ReadRegTestArgs(const ArgsManager& args, CChainParams::RegTestOptions& opti
         const auto deployment_name{arg.substr(0, found)};
         if (deployment_name == "cadence") {
             options.cadence_activation_height = *height;
+        } else if (deployment_name == "auxpowcommitment") {
+            options.auxpow_display_commitment_height = *height;
         } else if (deployment_name == "outerwitness") {
             options.outer_witness_activation_height = *height;
         } else if (deployment_name == "p2mr") {

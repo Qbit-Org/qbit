@@ -103,7 +103,12 @@ FUZZ_TARGET(auxpow,
             if (auxpow_payload->chain_merkle_branch.size() < std::numeric_limits<uint32_t>::digits) {
                 (void)auxpow::GetExpectedIndex(nonce, chain_id, auxpow_payload->chain_merkle_branch.size());
             }
-            (void)auxpow_payload->Validate(aux_hash, consensus, target_bits, chain_id, fuzzed_data_provider.ConsumeBool());
+            const auto commitment_validation = fuzzed_data_provider.PickValueInArray({
+                auxpow::CommitmentValidation::EITHER,
+                auxpow::CommitmentValidation::INTERNAL,
+                auxpow::CommitmentValidation::DISPLAY,
+            });
+            (void)auxpow_payload->Validate(aux_hash, consensus, target_bits, chain_id, fuzzed_data_provider.ConsumeBool(), commitment_validation);
         }
 
         if (fuzzed_data_provider.ConsumeBool()) {

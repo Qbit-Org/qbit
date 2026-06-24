@@ -104,6 +104,7 @@ class WalletHDTest(BitcoinTestFramework):
         self.start_node(1, extra_args=self.extra_args[1])
         self.connect_nodes(0, 1)
         self.sync_all()
+        self.wait_pqc_key_validation_ready(self.nodes[1])
         # Wallet automatically scans blocks older than key on startup
         assert_equal(self.nodes[1].getbalance(), NUM_HD_ADDS + 1)
         out = self.nodes[1].rescanblockchain(0, 1)

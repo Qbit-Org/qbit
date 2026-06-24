@@ -1831,6 +1831,25 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         do_reindex_chainstate,
         kernel_cache_sizes,
         args);
+    if (status == ChainstateLoadStatus::LEGACY_AUXPOW_REQUIRES_REINDEX && !do_reindex && !ShutdownRequested(node)) {
+        if (do_reindex_chainstate) {
+            return InitError(_("Legacy pruned AuxPoW block data cannot be recovered with -reindex-chainstate. Restart with -reindex to rebuild the block database and redownload pruned historical blocks."));
+        }
+        const bilingual_str legacy_auxpow_reindex_message =
+            _("This legacy pruned datadir is missing historical AuxPoW payloads required by the current upgrade. qbit will rebuild the block database and redownload pruned historical blocks once. Wallet data is not deleted. This may take a while.");
+        LogInfo("%s", legacy_auxpow_reindex_message.original);
+        uiInterface.InitMessage(legacy_auxpow_reindex_message.translated);
+        do_reindex = true;
+        if (!Assert(node.shutdown_signal)->reset()) {
+            LogError("Internal error: failed to reset shutdown signal.\n");
+        }
+        std::tie(status, error) = InitAndLoadChainstate(
+            node,
+            do_reindex,
+            do_reindex_chainstate,
+            kernel_cache_sizes,
+            args);
+    }
     if (status == ChainstateLoadStatus::FAILURE && !do_reindex && !ShutdownRequested(node)) {
         // suggest a reindex
         bool do_retry{HasTestOption(args, "reindex_after_failure_noninteractive_yes") ||

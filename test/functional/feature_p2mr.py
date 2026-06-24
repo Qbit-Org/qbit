@@ -525,6 +525,110 @@ class FeatureP2MRTest(BitcoinTestFramework):
         tx = self.create_spend_tx(utxo, [dummy_sig, bytes(leaf_script), p2mr_control_block()])
         self.assert_rejected(tx, "Public key is neither compressed or uncompressed")
 
+    def test_data_pqc_hash_rpc(self, node, p2mr_wallet):
+        self.log.info("Sign and verify an arbitrary data hash with a wallet-owned P2MR pubkey leaf")
+        address = p2mr_wallet.getnewaddress(address_type="p2mr")
+        message_hash = "11" * 32
+        proof = p2mr_wallet.signdatapqchash(address, message_hash)
+
+        assert_equal(proof["address"], address)
+        assert_equal(proof["message_hash"], message_hash)
+        assert_equal(proof["domain"], "QbitDataSigPQC")
+        assert_equal(proof["algorithm"], "SLH-DSA-SHA2-128s-bounded30")
+        assert_equal(proof["proof_mode"], "p2mr-pubkey")
+        assert_equal(len(proof["pubkey"]), 64)
+        assert_equal(len(proof["signature"]), PQC_SIG_SIZE * 2)
+        assert_equal(proof["leaf_version"], P2MR_LEAF_VERSION)
+        assert_equal(proof["leaf_script"], f"20{proof['pubkey']}b3")
+        assert_equal(proof["control_block"], "c1")
+        assert_equal(proof["pqc_signature_count"], 1)
+        assert_equal(proof["pqc_key_states"][0]["pubkey"], proof["pubkey"])
+
+        verified = node.verifydatapqchash(proof)
+        assert_equal(verified["valid"], True)
+        assert_equal(verified["address"], address)
+        assert_equal(verified["message_hash"], message_hash)
+        assert_equal(verified["pubkey"], proof["pubkey"])
+        assert_equal(verified["proof_mode"], "p2mr-pubkey")
+        assert_equal(verified["p2mr_merkle_root"], proof["p2mr_merkle_root"])
+        assert_equal(verified["datasig_hash"], proof["datasig_hash"])
+
+        explicit_proof = p2mr_wallet.signdatapqchash(address, message_hash, {
+            "pubkey": proof["pubkey"],
+            "leaf_script": proof["leaf_script"],
+            "control_block": proof["control_block"],
+            "include_pqc_usage": False,
+        })
+        assert_equal(node.verifydatapqchash(explicit_proof)["valid"], True)
+        assert "pqc_signature_count" not in explicit_proof
+
+        wrong_message = dict(proof)
+        wrong_message["message_hash"] = "22" * 32
+        invalid = node.verifydatapqchash(wrong_message)
+        assert_equal(invalid["valid"], False)
+        assert_equal(invalid["error"], "signature does not verify")
+
+        wrong_signature = dict(proof)
+        wrong_signature["signature"] = proof["signature"][:-2] + ("00" if proof["signature"][-2:] != "00" else "01")
+        invalid = node.verifydatapqchash(wrong_signature)
+        assert_equal(invalid["valid"], False)
+        assert_equal(invalid["error"], "signature does not verify")
+
+        wrong_leaf = dict(proof)
+        wrong_leaf["leaf_script"] = f"20{'00' * 32}b3"
+        invalid = node.verifydatapqchash(wrong_leaf)
+        assert_equal(invalid["valid"], False)
+        assert_equal(invalid["error"], "leaf_script is not a single-key P2MR pubkey leaf for pubkey")
+
+        wrong_address = dict(proof)
+        wrong_address["address"] = p2mr_wallet.getnewaddress(address_type="p2mr")
+        invalid = node.verifydatapqchash(wrong_address)
+        assert_equal(invalid["valid"], False)
+        assert_equal(invalid["error"], "leaf_script/control_block do not match address")
+
+        bad_control = dict(proof)
+        bad_control["control_block"] = "c0"
+        assert_raises_rpc_error(
+            -8,
+            "P2MR control byte bit 0 must be set",
+            node.verifydatapqchash,
+            bad_control,
+        )
+        bad_mode = dict(proof)
+        bad_mode["proof_mode"] = "raw-pubkey"
+        assert_raises_rpc_error(
+            -8,
+            "Only proof_mode \"p2mr-pubkey\" is currently supported",
+            node.verifydatapqchash,
+            bad_mode,
+        )
+        assert_raises_rpc_error(
+            -8,
+            "message_hash must be exactly 32 bytes",
+            p2mr_wallet.signdatapqchash,
+            address,
+            "11" * 31,
+        )
+        assert_raises_rpc_error(
+            -4,
+            "No supported single-key P2MR pubkey leaf was found for this address",
+            p2mr_wallet.signdatapqchash,
+            address,
+            message_hash,
+            {"pubkey": "00" * 32},
+        )
+
+        self.log.info("Spend a CHECKDATASIGPQC leaf with the signdatapqchash signature")
+        datasig_leaf = CScript([bytes.fromhex(proof["pubkey"]), OP_CHECKDATASIGPQC])
+        utxo = self.fund_p2mr_output(p2mr_tapleaf_hash(datasig_leaf))
+        tx = self.create_spend_tx(
+            utxo,
+            [bytes.fromhex(proof["signature"]), bytes.fromhex(message_hash), bytes(datasig_leaf), p2mr_control_block()],
+        )
+        txid = self.script_wallet.sendrawtransaction(from_node=node, tx_hex=tx.serialize().hex())
+        mined = self.generate(self.script_wallet, 1)[0]
+        assert txid in node.getblock(mined)["tx"]
+
     def test_two_of_three_multisig_psbt(self, node, miner, amount: Decimal):
         self.log.info("Exercise a real 2-of-3 P2MR multisig PSBT spend")
         signer_wallets = []
@@ -621,7 +725,7 @@ class FeatureP2MRTest(BitcoinTestFramework):
         node.createwallet("leaf_source_k2")
         leaf_source_k2 = node.get_wallet_rpc("leaf_source_k2")
 
-        self.log.info("1/18 createwalletdescriptor(type=p2mr) creates active descriptors")
+        self.log.info("1/20 createwalletdescriptor(type=p2mr) creates active descriptors")
         created_descs = []
         try:
             created = p2mr_wallet.createwalletdescriptor("p2mr")
@@ -638,7 +742,7 @@ class FeatureP2MRTest(BitcoinTestFramework):
         external_parent_desc = next(desc for desc in created_descs if "/0/*" in desc)
         internal_parent_desc = next(desc for desc in created_descs if "/1/*" in desc)
 
-        self.log.info("2/18 getnewaddress(address_type=p2mr) returns witness v2 P2MR")
+        self.log.info("2/20 getnewaddress(address_type=p2mr) returns witness v2 P2MR")
         first_p2mr_addr = p2mr_wallet.getnewaddress(address_type="p2mr")
         first_p2mr_info = self.assert_p2mr_address(p2mr_wallet, first_p2mr_addr, is_change=False)
         assert first_p2mr_info["desc"].startswith("mr(")
@@ -674,13 +778,22 @@ class FeatureP2MRTest(BitcoinTestFramework):
         raw_fund_amount = (fund_amount / Decimal("20")).quantize(Decimal("0.00000001"))
         watchonly_amount = (fund_amount / Decimal("12")).quantize(Decimal("0.00000001"))
 
-        self.log.info("3/18 send/receive to P2MR address")
+        self.script_wallet = MiniWallet(node)
+        miner.sendtoaddress(self.script_wallet.get_address(), Decimal("1"))
+        self.mine(miner, 1)
+        self.script_wallet.rescan_utxos()
+        assert self.script_wallet.get_utxos(mark_as_spent=False)
+
+        self.log.info("3/20 signdatapqchash/verifydatapqchash sign and verify P2MR pubkey proofs")
+        self.test_data_pqc_hash_rpc(node, p2mr_wallet)
+
+        self.log.info("4/20 send/receive to P2MR address")
         incoming_txid = miner.sendtoaddress(first_p2mr_addr, fund_amount)
         self.mine(miner, 1)
         assert_greater_than(p2mr_wallet.gettransaction(incoming_txid)["confirmations"], 0)
         assert_greater_than(p2mr_wallet.getbalance(), Decimal("0"))
 
-        self.log.info("4/18 spend from P2MR wallet")
+        self.log.info("5/20 spend from P2MR wallet")
         spend_txid = p2mr_wallet.sendtoaddress(miner.getnewaddress(), spend_amount, fee_rate=200)
         spend_tx = p2mr_wallet.gettransaction(spend_txid, verbose=True)
         spend_entry = node.getmempoolentry(spend_txid)
@@ -693,7 +806,7 @@ class FeatureP2MRTest(BitcoinTestFramework):
 
         self.test_truc_real_p2mr_parent_child_policy(node, miner, p2mr_wallet)
 
-        self.log.info("5/18 change output selection prefers P2MR when P2MR SPKM is active")
+        self.log.info("6/20 change output selection prefers P2MR when P2MR SPKM is active")
         change_probe_txid = p2mr_wallet.sendtoaddress(first_p2mr_addr, change_probe_amount, fee_rate=200)
         decoded = p2mr_wallet.gettransaction(change_probe_txid, verbose=True)["decoded"]
         change_outputs = []
@@ -720,7 +833,7 @@ class FeatureP2MRTest(BitcoinTestFramework):
         assert change_index >= first_internal_index
         self.mine(miner, 1)
 
-        self.log.info("6/18 import and derive a multi-leaf mr() descriptor")
+        self.log.info("7/20 import and derive a multi-leaf mr() descriptor")
         hdkey_k1 = leaf_source_k1.gethdkeys({"active_only": True})[0]["xpub"]
         hdkey_k2 = leaf_source_k2.gethdkeys({"active_only": True})[0]["xpub"]
         try:
@@ -748,7 +861,7 @@ class FeatureP2MRTest(BitcoinTestFramework):
         assert_equal(tree_info["isvalid"], True)
         assert_equal(tree_info["witness_version"], 2)
 
-        self.log.info("7/18 descriptor-backed multi-leaf spends cover both pk() leaves")
+        self.log.info("8/20 descriptor-backed multi-leaf spends cover both pk() leaves")
         master_xprv_k1 = leaf_source_k1.gethdkeys(private=True)[0]["xprv"]
         master_xprv_k2 = leaf_source_k2.gethdkeys(private=True)[0]["xprv"]
         k1_index = self.find_wallet_p2mr_index(node, master_xprv_k1, source_addr_k1)
@@ -816,7 +929,7 @@ class FeatureP2MRTest(BitcoinTestFramework):
         assert_equal(node.gettxout(tree_utxo_1["txid"], tree_utxo_1["vout"]), None)
         assert_equal(node.gettxout(tree_utxo_2["txid"], tree_utxo_2["vout"]), None)
 
-        self.log.info("8/18 multisig leaf descriptor derivation (multi_a)")
+        self.log.info("9/20 multisig leaf descriptor derivation (multi_a)")
         multi_desc = descsum_create(f"mr(multi_a(2,{k1},{k2}))")
         import_multi = desc_watch.importdescriptors([{
             "desc": multi_desc,
@@ -829,10 +942,10 @@ class FeatureP2MRTest(BitcoinTestFramework):
         assert_equal(validate_multi["isvalid"], True)
         assert_equal(validate_multi["witness_version"], 2)
 
-        self.log.info("9/18 2-of-3 multisig PSBT requires two signatures")
+        self.log.info("10/20 2-of-3 multisig PSBT requires two signatures")
         self.test_two_of_three_multisig_psbt(node, miner, multisig_amount)
 
-        self.log.info("10/18 exportpubkeydb returns P2MR pubkeys")
+        self.log.info("11/20 exportpubkeydb returns P2MR pubkeys")
         exported_again = p2mr_wallet.exportpubkeydb()
         assert_equal(exported_again["count"], len(exported_again["pubkeys"]))
         assert_greater_than(exported_again["count"], 0)
@@ -845,7 +958,7 @@ class FeatureP2MRTest(BitcoinTestFramework):
         assert_greater_than(len(external_entries), 0)
         assert_greater_than(len(internal_entries), 0)
 
-        self.log.info("11/18 importpubkeydb imports watch-only P2MR descriptors and tracks received funds")
+        self.log.info("12/20 importpubkeydb imports watch-only P2MR descriptors and tracks received funds")
         imported = pubdb_watch.importpubkeydb(exported_again["pubkeys"])
         assert_equal(imported["imported"], exported_again["count"])
         imported_descs = [entry["desc"] for entry in pubdb_watch.listdescriptors()["descriptors"] if entry["desc"].startswith("mr(")]
@@ -865,7 +978,7 @@ class FeatureP2MRTest(BitcoinTestFramework):
         assert_greater_than(pubdb_watch.gettransaction(watch_receive_txid)["confirmations"], 0)
         assert_equal(pubdb_watch.getbalances()["mine"]["trusted"], starting_trusted + watchonly_amount)
 
-        self.log.info("12/18 importpubkeydb watch-only wallets cannot sign and still cover internal descriptors")
+        self.log.info("13/20 importpubkeydb watch-only wallets cannot sign and still cover internal descriptors")
         watch_spend = pubdb_watch.send(
             outputs=[{miner.getnewaddress(): watchonly_amount}],
             fee_rate=200,
@@ -881,7 +994,7 @@ class FeatureP2MRTest(BitcoinTestFramework):
         assert_equal(watch_processed["complete"], False)
         assert_equal(pubdb_watch.finalizepsbt(watch_processed["psbt"])["complete"], False)
 
-        self.log.info("13/18 a single importpubkeydb call recreates receive and change watch-only descriptors")
+        self.log.info("14/20 a single importpubkeydb call recreates receive and change watch-only descriptors")
         imported_internal = pubdb_watch_internal.importpubkeydb(exported_again["pubkeys"], False, 0)
         assert_equal(imported_internal["imported"], exported_again["count"])
         internal_descs = [entry for entry in pubdb_watch_internal.listdescriptors()["descriptors"] if entry["desc"].startswith("mr(")]
@@ -910,12 +1023,12 @@ class FeatureP2MRTest(BitcoinTestFramework):
             exported_again["pubkeys"],
         )
 
-        self.log.info("14/18 descriptor roundtrip via getaddressinfo + deriveaddresses")
+        self.log.info("15/20 descriptor roundtrip via getaddressinfo + deriveaddresses")
         roundtrip_addr = first_p2mr_addr
         roundtrip_desc = p2mr_wallet.getaddressinfo(roundtrip_addr)["desc"]
         assert_equal(node.deriveaddresses(roundtrip_desc), [roundtrip_addr])
 
-        self.log.info("15/18 PSBT funding/signing/finalization with P2MR wallet inputs")
+        self.log.info("16/20 PSBT funding/signing/finalization with P2MR wallet inputs")
         psbt = p2mr_wallet.walletcreatefundedpsbt(
             [],
             [{miner.getnewaddress(): psbt_amount}],
@@ -941,13 +1054,13 @@ class FeatureP2MRTest(BitcoinTestFramework):
         self.mine(miner, 1)
         assert_greater_than(p2mr_wallet.gettransaction(psbt_txid)["confirmations"], 0)
 
-        self.log.info("16/18 plain regtest keeps witness v0 as the default address type")
+        self.log.info("17/20 plain regtest keeps witness v0 as the default address type")
         default_addr = p2mr_wallet.getnewaddress()
         default_info = p2mr_wallet.getaddressinfo(default_addr)
         assert_equal(default_info["witness_version"], 0)
         assert_equal(node.decodescript(default_info["scriptPubKey"])["type"], "witness_v0_keyhash")
 
-        self.log.info("17/18 fee estimation remains available with active P2MR descriptors")
+        self.log.info("18/20 fee estimation remains available with active P2MR descriptors")
         raw = p2mr_wallet.createrawtransaction([], [{miner.getnewaddress(): raw_fund_amount}])
         funded = p2mr_wallet.fundrawtransaction(raw, {"fee_rate": 200, "change_type": "p2mr"})
         funded_decoded = node.decoderawtransaction(funded["hex"])
@@ -956,12 +1069,6 @@ class FeatureP2MRTest(BitcoinTestFramework):
         assert_equal(funded_decoded["vout"][funded["changepos"]]["scriptPubKey"]["type"], "witness_v2_p2mr")
 
         self.log.info("Additional script-path P2MR spend and policy coverage")
-        self.script_wallet = MiniWallet(node)
-        miner.sendtoaddress(self.script_wallet.get_address(), Decimal("1"))
-        self.mine(miner, 1)
-        self.script_wallet.rescan_utxos()
-        assert self.script_wallet.get_utxos(mark_as_spent=False)
-
         self.test_single_leaf_spend()
         self.test_reject_control_bit()
         self.test_reject_commitment_mismatch()
@@ -977,7 +1084,7 @@ class FeatureP2MRTest(BitcoinTestFramework):
         self.test_large_stack_policy_acceptance()
         self.test_op_success_policy_rejection()
 
-        self.log.info("18/19 regtest -p2mronly=1 still defaults a fresh descriptor wallet to P2MR")
+        self.log.info("19/20 regtest -p2mronly=1 still defaults a fresh descriptor wallet to P2MR")
         self.restart_node(0, self.extra_args[0] + ["-p2mronly=1"])
         node = self.nodes[0]
         node.createwallet(wallet_name="p2mr_default_wallet", descriptors=True)
@@ -991,7 +1098,7 @@ class FeatureP2MRTest(BitcoinTestFramework):
         node.syncwithvalidationinterfacequeue()
         node.unloadwallet("p2mr_default_wallet")
 
-        self.log.info("19/19 born-encrypted P2MR wallets warm a small pool and refill on unlock")
+        self.log.info("20/20 born-encrypted P2MR wallets warm a small pool and refill on unlock")
         warm_keypool_size = 16
         node.createwallet(wallet_name="p2mr_default_wallet_enc", passphrase="pass", descriptors=True)
         p2mr_default_wallet_enc = node.get_wallet_rpc("p2mr_default_wallet_enc")

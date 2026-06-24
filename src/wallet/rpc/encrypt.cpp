@@ -265,6 +265,14 @@ RPCHelpMan encryptwallet()
         throw JSONRPCError(RPC_WALLET_ERROR, "Error: the wallet is currently being used to rescan the blockchain for related transactions. Please call `abortrescan` before encrypting the wallet.");
     }
 
+    const PQCKeyValidationInfo pqc_validation{pwallet->GetPQCKeyValidationInfo()};
+    if (pqc_validation.pending_records > 0) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Error: plaintext PQC wallet key validation is still in progress. Try encryptwallet again after validation completes.");
+    }
+    if (pqc_validation.failed_records > 0) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Error: plaintext PQC wallet key validation failed. Wallet encryption is disabled until the wallet is restored or repaired.");
+    }
+
     LOCK2(pwallet->m_relock_mutex, pwallet->cs_wallet);
 
     SecureString strWalletPass;

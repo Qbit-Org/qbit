@@ -82,6 +82,8 @@ void WalletInit::AddWalletOptions(ArgsManager& argsman) const
                                                             CURRENCY_UNIT, FormatMoney(DEFAULT_TRANSACTION_MINFEE)), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-paytxfee=<amt>", strprintf("(DEPRECATED) Fee rate (in %s/kvB) to add to transactions you send (default: %s)",
                                                             CURRENCY_UNIT, FormatMoney(CFeeRate{DEFAULT_PAY_TX_FEE}.GetFeePerK())), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-walletpqcparallel=<0|1>", "Enable the parallel P2MR/PQC wallet transaction signing path (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-walletpqcsignthreads=<n>", "Set the maximum number of worker threads for parallel P2MR/PQC wallet signing. 0 selects an automatic worker count (default: 0)", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
 #ifdef ENABLE_EXTERNAL_SIGNER
     argsman.AddArg("-signer=<cmd>", "External signing tool. P2MR/PQC external signer workflows require qbit-specific validation before they are treated as public wallet guidance.", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
 #endif

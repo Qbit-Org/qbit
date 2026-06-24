@@ -7,6 +7,7 @@
 #include <qt/modaloverlay.h>
 #include <qt/forms/ui_modaloverlay.h>
 
+#include <chain.h>
 #include <chainparams.h>
 #include <qt/guiutil.h>
 
@@ -27,7 +28,7 @@ QString HeaderSyncProgress(int height, const QDateTime& blockDate)
     const int headers_estimate{height + est_headers_left};
     if (headers_estimate <= 0) return {};
 
-    return QString::number(100.0 / headers_estimate * height, 'f', 1);
+    return GUIUtil::formatSyncPercentage(static_cast<double>(height) / headers_estimate, /*decimals=*/1, /*incomplete=*/est_headers_left > 0);
 }
 
 void SetLabelText(QLabel* label, const QString& text)
@@ -176,7 +177,10 @@ void ModalOverlay::renderLatestTip()
 
     QDateTime currentDate = QDateTime::currentDateTime();
     const qint64 current_time_msecs{currentDate.toMSecsSinceEpoch()};
-    const QString percentage_progress{QString::number(nVerificationProgress * 100, 'f', 2) + "%"};
+    const bool incomplete_sync{
+        blockDate.secsTo(currentDate) >= MAX_BLOCK_TIME_GAP ||
+        (bestHeaderDate.isValid() && bestHeaderHeight > count)};
+    const QString percentage_progress{GUIUtil::formatSyncPercentage(nVerificationProgress, /*decimals=*/2, incomplete_sync) + "%"};
     const bool update_progress_metrics{
         ui->percentageProgress->text() != percentage_progress ||
         m_last_progress_metrics_update_msecs == 0 ||

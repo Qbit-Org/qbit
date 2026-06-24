@@ -5,8 +5,11 @@
 
 #include <script/sign.h>
 
+#include <common/args.h>
+#include <common/system.h>
 #include <consensus/amount.h>
 #include <key.h>
+#include <logging.h>
 #include <policy/policy.h>
 #include <primitives/transaction.h>
 #include <script/keyorigin.h>
@@ -17,10 +20,18 @@
 #include <script/signingprovider.h>
 #include <script/solver.h>
 #include <uint256.h>
+#include <util/signing_timing.h>
+#include <util/thread.h>
+#include <util/time.h>
 #include <util/translation.h>
 #include <util/vector.h>
 
 #include <algorithm>
+#include <atomic>
+#include <exception>
+#include <mutex>
+#include <optional>
+#include <thread>
 
 typedef std::vector<unsigned char> valtype;
 
@@ -94,7 +105,7 @@ bool MutableTransactionSignatureCreator::CreateSchnorrSig(const SigningProvider&
     return true;
 }
 
-bool MutableTransactionSignatureCreator::CreatePQCSignature(const SigningProvider& provider, std::vector<unsigned char>& sig, const CPQCPubKey& pubkey, const uint256* leaf_hash, SigVersion sigversion) const
+bool MutableTransactionSignatureCreator::CreatePQCSignatureHash(uint256& hash, const uint256& leaf_hash, SigVersion sigversion) const
 {
     assert(sigversion == SigVersion::P2MR);
 
@@ -105,12 +116,19 @@ bool MutableTransactionSignatureCreator::CreatePQCSignature(const SigningProvide
     execdata.m_annex_present = false; // Only support annex-less signing for now.
     execdata.m_codeseparator_pos_init = true;
     execdata.m_codeseparator_pos = 0xFFFFFFFF; // Only support non-OP_CODESEPARATOR signing for now.
-    if (!leaf_hash) return false;
     execdata.m_tapleaf_hash_init = true;
-    execdata.m_tapleaf_hash = *leaf_hash;
+    execdata.m_tapleaf_hash = leaf_hash;
+
+    return SignatureHashP2MR(hash, execdata, m_txto, nIn, nHashType, *m_txdata, MissingDataBehavior::FAIL);
+}
+
+bool MutableTransactionSignatureCreator::CreatePQCSignature(const SigningProvider& provider, std::vector<unsigned char>& sig, const CPQCPubKey& pubkey, const uint256* leaf_hash, SigVersion sigversion) const
+{
+    assert(sigversion == SigVersion::P2MR);
+    if (!leaf_hash) return false;
 
     uint256 hash;
-    if (!SignatureHashP2MR(hash, execdata, m_txto, nIn, nHashType, *m_txdata, MissingDataBehavior::FAIL)) return false;
+    if (!CreatePQCSignatureHash(hash, *leaf_hash, sigversion)) return false;
 
     std::vector<unsigned char> raw_sig;
     if (!provider.SignPQC(pubkey, hash, raw_sig)) return false;
@@ -726,6 +744,450 @@ static bool SignP2MR(const SigningProvider& provider, const BaseSignatureCreator
     return false;
 }
 
+static std::optional<P2MRScriptSigningPlan> SelectCompleteP2MRSigningPlan(const SigningProvider& provider, const BaseSignatureCreator& creator, const WitnessV2P2MR& output, SignatureData& sigdata)
+{
+    P2MRSpendData spenddata;
+    TaprootBuilder builder;
+
+    if (provider.GetP2MRSpendData(output, spenddata)) {
+        sigdata.p2mr_spenddata.Merge(spenddata);
+    }
+    if (provider.GetP2MRBuilder(output, builder)) {
+        sigdata.p2mr_builder = builder;
+    }
+    if (sigdata.p2mr_spenddata.scripts.empty() && sigdata.p2mr_builder.has_value()) {
+        sigdata.p2mr_spenddata.Merge(sigdata.p2mr_builder->GetP2MRSpendData());
+    }
+
+    std::vector<P2MRScriptSigningPlan> complete_plans;
+    for (const auto& [key, control_blocks] : sigdata.p2mr_spenddata.scripts) {
+        const auto& [script, leaf_ver] = key;
+        const auto* control_block = FindValidP2MRControlBlock(control_blocks, script, leaf_ver, output);
+        if (control_block == nullptr) continue;
+
+        P2MRScriptSigningPlan plan;
+        if (BuildP2MRScriptSigningPlan(provider, creator, sigdata, leaf_ver, script, *control_block, plan) && plan.complete) {
+            complete_plans.push_back(std::move(plan));
+        }
+    }
+    if (!sigdata.invalid_p2mr_sigs.empty() || complete_plans.empty()) return std::nullopt;
+
+    std::stable_sort(complete_plans.begin(), complete_plans.end(), [](const auto& a, const auto& b) {
+        return a.witness_size < b.witness_size;
+    });
+    return std::move(complete_plans.front());
+}
+
+static bool CompleteP2MRWitnessAlreadyPresent(const CTxIn& txin, const WitnessV2P2MR& output, const BaseSignatureCreator& creator)
+{
+    const auto& stack{txin.scriptWitness.stack};
+    if (!txin.scriptSig.empty() || stack.size() < 3) return false;
+
+    const std::vector<unsigned char>& script{stack[stack.size() - 2]};
+    const std::vector<unsigned char>& control_block{stack.back()};
+    if (control_block.empty()) return false;
+
+    const int leaf_version{control_block[0] & TAPROOT_LEAF_MASK};
+    std::set<std::vector<unsigned char>, ShortestVectorFirstComparator> control_blocks;
+    control_blocks.insert(control_block);
+    if (FindValidP2MRControlBlock(control_blocks, script, leaf_version, output) == nullptr) return false;
+
+    std::vector<CPQCPubKey> pubkeys;
+    int threshold{0};
+    if (!ParseP2MRScript(script, pubkeys, threshold)) return false;
+
+    const size_t signature_items{stack.size() - 2};
+    if (signature_items != pubkeys.size()) return false;
+
+    const uint256 leaf_hash{ComputeP2MRLeafHash(leaf_version, script)};
+    int valid_signatures{0};
+    for (size_t pubkey_pos{pubkeys.size()}; pubkey_pos > 0; --pubkey_pos) {
+        const size_t pubkey_index{pubkey_pos - 1};
+        const size_t stack_index{pubkeys.size() - pubkey_pos};
+        const auto& signature{stack[stack_index]};
+        if (signature.empty()) continue;
+
+        uint8_t hashtype;
+        if (!GetP2MRSignatureHashType(signature, hashtype) ||
+            !creator.VerifyP2MRScriptSignature(signature, pubkeys[pubkey_index], leaf_hash, SigVersion::P2MR)) {
+            return false;
+        }
+        ++valid_signatures;
+    }
+    return valid_signatures >= threshold;
+}
+
+namespace {
+class NoPQCSigningProvider final : public SigningProvider
+{
+private:
+    const SigningProvider& m_provider;
+
+public:
+    explicit NoPQCSigningProvider(const SigningProvider& provider) : m_provider{provider} {}
+
+    bool GetCScript(const CScriptID& scriptid, CScript& script) const override { return m_provider.GetCScript(scriptid, script); }
+    bool HaveCScript(const CScriptID& scriptid) const override { return m_provider.HaveCScript(scriptid); }
+    bool GetPubKey(const CKeyID& address, CPubKey& pubkey) const override { return m_provider.GetPubKey(address, pubkey); }
+    bool GetKeyOrigin(const CKeyID& keyid, KeyOriginInfo& info) const override { return m_provider.GetKeyOrigin(keyid, info); }
+    bool GetTaprootSpendData(const XOnlyPubKey& output_key, TaprootSpendData& spenddata) const override { return m_provider.GetTaprootSpendData(output_key, spenddata); }
+    bool GetTaprootBuilder(const XOnlyPubKey& output_key, TaprootBuilder& builder) const override { return m_provider.GetTaprootBuilder(output_key, builder); }
+    bool GetP2MRSpendData(const WitnessV2P2MR& output, P2MRSpendData& spenddata) const override { return m_provider.GetP2MRSpendData(output, spenddata); }
+    bool GetP2MRBuilder(const WitnessV2P2MR& output, TaprootBuilder& builder) const override { return m_provider.GetP2MRBuilder(output, builder); }
+    std::vector<CPubKey> GetMuSig2ParticipantPubkeys(const CPubKey& pubkey) const override { return m_provider.GetMuSig2ParticipantPubkeys(pubkey); }
+};
+} // namespace
+
+struct ParallelPQCSigningJob {
+    unsigned int input_index{0};
+    CPQCPubKey pubkey;
+    CPQCKey key;
+    uint256 leaf_hash;
+    uint256 sighash;
+    int sighash_type{SIGHASH_DEFAULT};
+    uint32_t assigned_counter{0};
+};
+
+struct ParallelPQCSigningResult {
+    bool success{false};
+    std::vector<unsigned char> signature;
+};
+
+struct ParallelPQCInputPlan {
+    CScript prev_pub_key;
+    CAmount amount{0};
+    SignatureData sigdata;
+    P2MRScriptSigningPlan script_plan;
+    std::vector<size_t> job_indices;
+};
+
+static unsigned int GetParallelPQCSigningWorkerCount(size_t jobs)
+{
+    if (jobs == 0) return 0;
+    const int64_t configured_threads{gArgs.GetIntArg("-walletpqcsignthreads", 0)};
+    if (configured_threads < 0) return 0;
+    if (configured_threads > 0) {
+        return static_cast<unsigned int>(std::min<uint64_t>(static_cast<uint64_t>(configured_threads), jobs));
+    }
+
+    const int cores{std::max(1, GetNumCores() - 1)};
+    return std::min<unsigned int>({
+        static_cast<unsigned int>(cores),
+        4U,
+        static_cast<unsigned int>(jobs),
+    });
+}
+
+static bool NotifySigningProgressPhase(const SigningProgressCallback& progress_callback, SigningProgressPhase phase, unsigned int completed, unsigned int total, std::optional<unsigned int> input_index = std::nullopt, bool cancellable = true)
+{
+    if (!progress_callback) return true;
+    const bool should_continue{progress_callback({
+        .phase = phase,
+        .completed = completed,
+        .total = total,
+        .input_index = input_index,
+        .cancellable = cancellable})};
+    return should_continue || !cancellable;
+}
+
+static std::optional<bool> TrySignTransactionPQCParallel(
+    CMutableTransaction& mtx,
+    const FlatSigningProvider& provider,
+    const std::map<COutPoint, Coin>& coins,
+    int nHashType,
+    const PrecomputedTransactionData& txdata,
+    std::map<int, bilingual_str>& input_errors,
+    const SigningProgressCallback& progress_callback)
+{
+    if (!gArgs.GetBoolArg("-walletpqcparallel", true)) return std::nullopt;
+    if (!provider.pqc_counter_batch_reserver) return std::nullopt;
+    if (mtx.vin.empty()) return std::nullopt;
+    if (!NotifySigningProgressPhase(progress_callback, SigningProgressPhase::PREPARING_TRANSACTION, 0, static_cast<unsigned int>(mtx.vin.size()))) {
+        input_errors[0] = _("Signing cancelled");
+        return false;
+    }
+
+    const bool fHashSingle{(nHashType & ~SIGHASH_ANYONECANPAY) == SIGHASH_SINGLE};
+    std::vector<ParallelPQCInputPlan> input_plans;
+    input_plans.reserve(mtx.vin.size());
+    std::vector<ParallelPQCSigningJob> jobs;
+    std::map<CPQCPubKey, uint32_t> counts;
+
+    for (unsigned int i = 0; i < mtx.vin.size(); ++i) {
+        if (fHashSingle && i >= mtx.vout.size()) return std::nullopt;
+
+        const auto coin_it = coins.find(mtx.vin[i].prevout);
+        if (coin_it == coins.end() || coin_it->second.IsSpent()) return std::nullopt;
+        const CTxOut& txout{coin_it->second.out};
+        if (txout.nValue == MAX_MONEY) return std::nullopt;
+
+        std::vector<valtype> solutions;
+        if (Solver(txout.scriptPubKey, solutions) != TxoutType::WITNESS_V2_P2MR) return std::nullopt;
+
+        ParallelPQCInputPlan input_plan;
+        input_plan.prev_pub_key = txout.scriptPubKey;
+        input_plan.amount = txout.nValue;
+        input_plan.sigdata = DataFromTransaction(mtx, i, txout);
+        const WitnessV2P2MR output{uint256{std::span<const unsigned char>(solutions[0])}};
+        MutableTransactionSignatureCreator creator{mtx, i, txout.nValue, &txdata, nHashType};
+        if (input_plan.sigdata.complete || CompleteP2MRWitnessAlreadyPresent(mtx.vin[i], output, creator)) {
+            input_plan.sigdata.complete = true;
+            input_plans.push_back(std::move(input_plan));
+            continue;
+        }
+
+        auto script_plan = SelectCompleteP2MRSigningPlan(provider, creator, output, input_plan.sigdata);
+        if (!script_plan.has_value()) return std::nullopt;
+        input_plan.script_plan = std::move(*script_plan);
+
+        std::map<std::pair<CPQCPubKey, uint256>, size_t> queued_jobs;
+        int num_signed{0};
+        for (size_t pubkey_pos = input_plan.script_plan.pubkeys.size(); pubkey_pos > 0; --pubkey_pos) {
+            const size_t index{pubkey_pos - 1};
+            if (!input_plan.script_plan.candidate_pubkeys[index] || num_signed >= input_plan.script_plan.threshold) {
+                continue;
+            }
+            const CPQCPubKey& pubkey{input_plan.script_plan.pubkeys[index]};
+            if (LookupValidP2MRScriptSig(input_plan.sigdata, creator, pubkey, input_plan.script_plan.leaf_hash) != nullptr) {
+                ++num_signed;
+                continue;
+            }
+
+            const auto queued_key{std::make_pair(pubkey, input_plan.script_plan.leaf_hash)};
+            if (queued_jobs.contains(queued_key)) {
+                ++num_signed;
+                continue;
+            }
+
+            CPQCKey key;
+            if (!provider.GetPQCKey(pubkey, key) || !key.IsValid()) return std::nullopt;
+
+            uint256 sighash;
+            if (!creator.CreatePQCSignatureHash(sighash, input_plan.script_plan.leaf_hash, SigVersion::P2MR)) return std::nullopt;
+
+            const size_t job_index{jobs.size()};
+            input_plan.job_indices.push_back(job_index);
+            queued_jobs.emplace(queued_key, job_index);
+            jobs.push_back({
+                .input_index = i,
+                .pubkey = pubkey,
+                .key = std::move(key),
+                .leaf_hash = input_plan.script_plan.leaf_hash,
+                .sighash = sighash,
+                .sighash_type = nHashType,
+            });
+            ++counts[pubkey];
+            ++num_signed;
+        }
+        if (num_signed < input_plan.script_plan.threshold) return std::nullopt;
+        input_plans.push_back(std::move(input_plan));
+    }
+
+    if (jobs.empty()) {
+        const bool all_inputs_complete{std::all_of(input_plans.begin(), input_plans.end(), [](const auto& input_plan) {
+            return input_plan.sigdata.complete;
+        })};
+        if (!all_inputs_complete) return std::nullopt;
+        input_errors.clear();
+        return true;
+    }
+    const unsigned int worker_count{GetParallelPQCSigningWorkerCount(jobs.size())};
+    if (worker_count == 0) return std::nullopt;
+
+    const unsigned int reservation_total{static_cast<unsigned int>(counts.size())};
+    if (!NotifySigningProgressPhase(progress_callback, SigningProgressPhase::RESERVING_PQC_COUNTERS, 0, reservation_total)) {
+        input_errors[0] = _("Signing cancelled");
+        return false;
+    }
+
+    std::map<CPQCPubKey, PQCSignatureCounterRange> ranges;
+    if (!provider.pqc_counter_batch_reserver(counts, ranges)) {
+        input_errors[0] = _("PQC signature counter reservation failed");
+        return false;
+    }
+    if (ranges.size() != counts.size()) {
+        input_errors[0] = _("PQC signature counter reservation failed");
+        return false;
+    }
+
+    std::map<CPQCPubKey, uint32_t> cursors;
+    for (const auto& [pubkey, count] : counts) {
+        const auto range_it{ranges.find(pubkey)};
+        if (range_it == ranges.end() ||
+            range_it->second.pubkey != pubkey ||
+            range_it->second.reserved_counter < range_it->second.previous_counter ||
+            range_it->second.reserved_counter - range_it->second.previous_counter != count) {
+            input_errors[0] = _("PQC signature counter reservation failed");
+            return false;
+        }
+        cursors.emplace(pubkey, range_it->second.previous_counter);
+    }
+    for (auto& job : jobs) {
+        auto cursor_it{cursors.find(job.pubkey)};
+        if (cursor_it == cursors.end()) {
+            input_errors[job.input_index] = _("PQC signature counter reservation failed");
+            return false;
+        }
+        job.assigned_counter = cursor_it->second++;
+        if (provider.pqc_counter_observer) {
+            provider.pqc_counter_observer(job.pubkey, job.assigned_counter, job.assigned_counter + 1);
+        }
+    }
+    for (const auto& [pubkey, range] : ranges) {
+        if (cursors[pubkey] != range.reserved_counter) {
+            input_errors[0] = _("PQC signature counter reservation failed");
+            return false;
+        }
+    }
+
+    // Counters are committed from this point; later progress callbacks are informational.
+    NotifySigningProgressPhase(progress_callback, SigningProgressPhase::RESERVING_PQC_COUNTERS, reservation_total, reservation_total, std::nullopt, /*cancellable=*/false);
+
+    std::vector<ParallelPQCSigningResult> results(jobs.size());
+    std::atomic<size_t> next_job{0};
+    std::atomic_bool cancel_requested{false};
+    std::atomic_bool worker_failed{false};
+    std::atomic<unsigned int> completed_inputs{0};
+    std::vector<std::atomic<unsigned int>> remaining_jobs_by_input(input_plans.size());
+    for (size_t i = 0; i < input_plans.size(); ++i) {
+        remaining_jobs_by_input[i].store(static_cast<unsigned int>(input_plans[i].job_indices.size()));
+        if (input_plans[i].job_indices.empty()) {
+            ++completed_inputs;
+        }
+    }
+
+    std::mutex progress_mutex;
+    const auto notify_completed_input = [&](unsigned int input_index) {
+        const unsigned int completed{++completed_inputs};
+        std::lock_guard<std::mutex> lock{progress_mutex};
+        NotifySigningProgressPhase(progress_callback, SigningProgressPhase::SIGNING_INPUTS, completed, static_cast<unsigned int>(mtx.vin.size()), input_index, /*cancellable=*/false);
+    };
+
+    NotifySigningProgressPhase(progress_callback, SigningProgressPhase::SIGNING_INPUTS, completed_inputs.load(), static_cast<unsigned int>(mtx.vin.size()), std::nullopt, /*cancellable=*/false);
+
+    std::vector<std::thread> workers;
+    workers.reserve(worker_count);
+    try {
+        for (unsigned int worker_index = 0; worker_index < worker_count; ++worker_index) {
+            workers.emplace_back(&util::TraceThread, "walletpqc", [&] {
+                try {
+                    while (!cancel_requested.load()) {
+                        const size_t job_index{next_job.fetch_add(1)};
+                        if (job_index >= jobs.size()) break;
+
+                        const ParallelPQCSigningJob& job{jobs[job_index]};
+                        uint32_t counter{job.assigned_counter};
+                        std::vector<unsigned char> signature;
+                        const bool signed_ok{job.key.Sign(job.sighash, signature, counter)};
+                        if (!signed_ok || counter != job.assigned_counter + 1) {
+                            worker_failed.store(true);
+                            cancel_requested.store(true);
+                            break;
+                        }
+                        if (job.sighash_type) {
+                            signature.push_back(static_cast<unsigned char>(job.sighash_type));
+                        }
+                        results[job_index] = {
+                            .success = true,
+                            .signature = std::move(signature),
+                        };
+
+                        auto& remaining{remaining_jobs_by_input[job.input_index]};
+                        if (remaining.fetch_sub(1) == 1) {
+                            notify_completed_input(job.input_index);
+                        }
+                    }
+                } catch (const std::exception&) {
+                    worker_failed.store(true);
+                    cancel_requested.store(true);
+                } catch (...) {
+                    worker_failed.store(true);
+                    cancel_requested.store(true);
+                }
+            });
+        }
+    } catch (const std::exception&) {
+        worker_failed.store(true);
+        cancel_requested.store(true);
+    } catch (...) {
+        worker_failed.store(true);
+        cancel_requested.store(true);
+    }
+    for (auto& worker : workers) {
+        if (worker.joinable()) worker.join();
+    }
+
+    if (worker_failed.load()) {
+        for (size_t job_index = 0; job_index < jobs.size(); ++job_index) {
+            const auto& job{jobs[job_index]};
+            if (!results[job_index].success) {
+                input_errors[job.input_index] = _("PQC signing failed");
+                return false;
+            }
+        }
+    }
+    if (cancel_requested.load()) {
+        for (size_t job_index = 0; job_index < jobs.size(); ++job_index) {
+            const auto& job{jobs[job_index]};
+            if (!results[job_index].success) {
+                input_errors[job.input_index] = _("Signing cancelled");
+                return false;
+            }
+        }
+    }
+    for (size_t job_index = 0; job_index < results.size(); ++job_index) {
+        if (!results[job_index].success) {
+            input_errors[jobs[job_index].input_index] = _("PQC signing failed");
+            return false;
+        }
+    }
+
+    NoPQCSigningProvider finalizing_provider{provider};
+    unsigned int finalized_inputs{0};
+    NotifySigningProgressPhase(progress_callback, SigningProgressPhase::FINALIZING_TRANSACTION, finalized_inputs, static_cast<unsigned int>(mtx.vin.size()), std::nullopt, /*cancellable=*/false);
+    const CTransaction txConst{mtx};
+    unsigned int complete_inputs{0};
+    for (unsigned int i = 0; i < input_plans.size(); ++i) {
+        auto& input_plan{input_plans[i]};
+        for (const size_t job_index : input_plan.job_indices) {
+            const auto& job{jobs[job_index]};
+            input_plan.sigdata.p2mr_script_sigs[std::make_pair(job.pubkey, job.leaf_hash)] = results[job_index].signature;
+        }
+
+        MutableTransactionSignatureCreator creator{mtx, i, input_plan.amount, &txdata, nHashType};
+        if (!ProduceSignature(finalizing_provider, creator, input_plan.prev_pub_key, input_plan.sigdata)) {
+            input_errors[i] = _("PQC signing failed");
+        }
+        UpdateInput(mtx.vin[i], input_plan.sigdata);
+
+        ScriptError serror = SCRIPT_ERR_OK;
+        bool verify_failed{false};
+        if (!input_plan.sigdata.complete) {
+            verify_failed = !VerifyScript(mtx.vin[i].scriptSig, input_plan.prev_pub_key, &mtx.vin[i].scriptWitness, STANDARD_SCRIPT_VERIFY_FLAGS, TransactionSignatureChecker(&txConst, i, input_plan.amount, txdata, MissingDataBehavior::FAIL), &serror);
+        }
+        if (verify_failed) {
+            input_errors[i] = Untranslated(ScriptErrorString(serror));
+        } else if (input_plan.sigdata.complete) {
+            ++complete_inputs;
+            input_errors.erase(i);
+        }
+
+        ++finalized_inputs;
+        NotifySigningProgressPhase(progress_callback, SigningProgressPhase::FINALIZING_TRANSACTION, finalized_inputs, static_cast<unsigned int>(mtx.vin.size()), i, /*cancellable=*/false);
+    }
+
+    if (util::signing_timing::TraceEnabled()) {
+        LogTrace(BCLog::BENCH,
+            "wallet-sign-timing phase=script_pqc_parallel inputs=%u jobs=%u workers=%u complete_inputs=%u errors=%u\n",
+            static_cast<unsigned int>(mtx.vin.size()),
+            static_cast<unsigned int>(jobs.size()),
+            worker_count,
+            complete_inputs,
+            static_cast<unsigned int>(input_errors.size()));
+    }
+    return input_errors.empty();
+}
+
 /**
  * Sign scriptPubKey using signature made with creator.
  * Signatures are returned in scriptSigRet (or returns false if scriptPubKey can't be signed),
@@ -1128,8 +1590,22 @@ bool IsSegWitOutput(const SigningProvider& provider, const CScript& script)
     return false;
 }
 
-bool SignTransaction(CMutableTransaction& mtx, const SigningProvider* keystore, const std::map<COutPoint, Coin>& coins, int nHashType, std::map<int, bilingual_str>& input_errors)
+bool SignTransaction(CMutableTransaction& mtx, const SigningProvider* keystore, const std::map<COutPoint, Coin>& coins, int nHashType, std::map<int, bilingual_str>& input_errors, const SigningProgressCallback& progress_callback)
 {
+    const bool timing_enabled{util::signing_timing::Enabled()};
+    const uint64_t timing_id{timing_enabled ? util::signing_timing::CurrentOrNextId() : 0};
+    const util::signing_timing::ScopedId timing_scope{timing_id};
+    const auto timing_start{SteadyClock::now()};
+    SteadyClock::duration precompute_time{};
+    SteadyClock::duration data_time{};
+    SteadyClock::duration produce_time{};
+    SteadyClock::duration update_time{};
+    SteadyClock::duration verify_time{};
+    unsigned int produce_attempts{0};
+    unsigned int verify_attempts{0};
+    unsigned int complete_inputs{0};
+    bool spent_outputs_ready{false};
+
     bool fHashSingle = ((nHashType & ~SIGHASH_ANYONECANPAY) == SIGHASH_SINGLE);
 
     // Use CTransaction for the constant parts of the
@@ -1138,47 +1614,114 @@ bool SignTransaction(CMutableTransaction& mtx, const SigningProvider* keystore, 
 
     PrecomputedTransactionData txdata;
     std::vector<CTxOut> spent_outputs;
-    for (unsigned int i = 0; i < mtx.vin.size(); ++i) {
-        CTxIn& txin = mtx.vin[i];
-        auto coin = coins.find(txin.prevout);
-        if (coin == coins.end() || coin->second.IsSpent()) {
-            txdata.Init(txConst, /*spent_outputs=*/{}, /*force=*/true);
-            break;
-        } else {
-            spent_outputs.emplace_back(coin->second.out.nValue, coin->second.out.scriptPubKey);
+    {
+        const auto precompute_start{SteadyClock::now()};
+        for (unsigned int i = 0; i < mtx.vin.size(); ++i) {
+            CTxIn& txin = mtx.vin[i];
+            auto coin = coins.find(txin.prevout);
+            if (coin == coins.end() || coin->second.IsSpent()) {
+                txdata.Init(txConst, /*spent_outputs=*/{}, /*force=*/true);
+                break;
+            } else {
+                spent_outputs.emplace_back(coin->second.out.nValue, coin->second.out.scriptPubKey);
+            }
+        }
+        spent_outputs_ready = spent_outputs.size() == mtx.vin.size();
+        if (spent_outputs_ready) {
+            txdata.Init(txConst, std::move(spent_outputs), true);
+        }
+        precompute_time = SteadyClock::now() - precompute_start;
+    }
+
+    const auto notify_signing_progress = [&](unsigned int completed, std::optional<unsigned int> input_index = std::nullopt, bool cancellable = true) {
+        if (!progress_callback) return true;
+        const bool should_continue{progress_callback({
+            .phase = SigningProgressPhase::SIGNING_INPUTS,
+            .completed = completed,
+            .total = static_cast<unsigned int>(mtx.vin.size()),
+            .input_index = input_index,
+            .cancellable = cancellable})};
+        return should_continue || !cancellable;
+    };
+
+    if (const auto* flat_provider{dynamic_cast<const FlatSigningProvider*>(keystore)}) {
+        if (std::optional<bool> parallel_result = TrySignTransactionPQCParallel(mtx, *flat_provider, coins, nHashType, txdata, input_errors, progress_callback)) {
+            return *parallel_result;
         }
     }
-    if (spent_outputs.size() == mtx.vin.size()) {
-        txdata.Init(txConst, std::move(spent_outputs), true);
+
+    unsigned int processed_inputs{0};
+    bool pqc_counter_committed{false};
+    if (!notify_signing_progress(processed_inputs)) {
+        if (!mtx.vin.empty()) {
+            input_errors[0] = _("Signing cancelled");
+        }
+        return false;
     }
 
     // Sign what we can:
     for (unsigned int i = 0; i < mtx.vin.size(); ++i) {
+        if (!notify_signing_progress(processed_inputs, i, !pqc_counter_committed)) {
+            input_errors[i] = _("Signing cancelled");
+            return false;
+        }
+
         CTxIn& txin = mtx.vin[i];
         auto coin = coins.find(txin.prevout);
         if (coin == coins.end() || coin->second.IsSpent()) {
             input_errors[i] = _("Input not found or already spent");
+            ++processed_inputs;
+            if (!notify_signing_progress(processed_inputs, i, !pqc_counter_committed)) {
+                if (i + 1 < mtx.vin.size()) {
+                    input_errors[i + 1] = _("Signing cancelled");
+                }
+                return false;
+            }
             continue;
         }
         const CScript& prevPubKey = coin->second.out.scriptPubKey;
         const CAmount& amount = coin->second.out.nValue;
 
+        const auto data_start{SteadyClock::now()};
         SignatureData sigdata = DataFromTransaction(mtx, i, coin->second.out);
+        data_time += SteadyClock::now() - data_start;
         // Only sign SIGHASH_SINGLE if there's a corresponding output:
+        const size_t p2mr_sigs_before{sigdata.p2mr_script_sigs.size()};
         if (!fHashSingle || (i < mtx.vout.size())) {
+            const auto produce_start{SteadyClock::now()};
             ProduceSignature(*keystore, MutableTransactionSignatureCreator(mtx, i, amount, &txdata, nHashType), prevPubKey, sigdata);
+            produce_time += SteadyClock::now() - produce_start;
+            ++produce_attempts;
         }
+        pqc_counter_committed |= sigdata.p2mr_script_sigs.size() > p2mr_sigs_before;
 
+        const auto update_start{SteadyClock::now()};
         UpdateInput(txin, sigdata);
+        update_time += SteadyClock::now() - update_start;
 
         // amount must be specified for valid segwit signature
         if (amount == MAX_MONEY && !txin.scriptWitness.IsNull()) {
             input_errors[i] = _("Missing amount");
+            ++processed_inputs;
+            if (!notify_signing_progress(processed_inputs, i, !pqc_counter_committed)) {
+                if (i + 1 < mtx.vin.size()) {
+                    input_errors[i + 1] = _("Signing cancelled");
+                }
+                return false;
+            }
             continue;
         }
 
         ScriptError serror = SCRIPT_ERR_OK;
-        if (!sigdata.complete && !VerifyScript(txin.scriptSig, prevPubKey, &txin.scriptWitness, STANDARD_SCRIPT_VERIFY_FLAGS, TransactionSignatureChecker(&txConst, i, amount, txdata, MissingDataBehavior::FAIL), &serror)) {
+        bool verified{false};
+        bool verify_failed{false};
+        if (!sigdata.complete) {
+            const auto verify_start{SteadyClock::now()};
+            verify_failed = !VerifyScript(txin.scriptSig, prevPubKey, &txin.scriptWitness, STANDARD_SCRIPT_VERIFY_FLAGS, TransactionSignatureChecker(&txConst, i, amount, txdata, MissingDataBehavior::FAIL), &serror);
+            verify_time += SteadyClock::now() - verify_start;
+            verified = true;
+        }
+        if (verify_failed) {
             if (serror == SCRIPT_ERR_INVALID_STACK_OPERATION) {
                 // Unable to sign input and verification failed (possible attempt to partially sign).
                 input_errors[i] = Untranslated("Unable to sign input, invalid stack size (possibly missing key)");
@@ -1192,6 +1735,46 @@ bool SignTransaction(CMutableTransaction& mtx, const SigningProvider* keystore, 
             // If this input succeeds, make sure there is no error set for it
             input_errors.erase(i);
         }
+        if (verified) ++verify_attempts;
+        if (sigdata.complete) ++complete_inputs;
+        if (util::signing_timing::TraceEnabled()) {
+            LogTrace(BCLog::BENCH,
+                "wallet-sign-timing id=%llu phase=script_sign_input input=%u complete=%d verified=%d errors=%u\n",
+                util::signing_timing::LogId(timing_id),
+                i,
+                sigdata.complete,
+                verified,
+                static_cast<unsigned int>(input_errors.size()));
+        }
+        ++processed_inputs;
+        if (!notify_signing_progress(processed_inputs, i, !pqc_counter_committed)) {
+            if (i + 1 < mtx.vin.size()) {
+                input_errors[i + 1] = _("Signing cancelled");
+                return false;
+            }
+        }
     }
-    return input_errors.empty();
+    const bool success{input_errors.empty()};
+    if (timing_enabled) {
+        LogDebug(BCLog::BENCH,
+            "wallet-sign-timing id=%llu phase=script_sign inputs=%u coins=%u spent_outputs_ready=%d "
+            "precompute_ms=%.2f data_ms=%.2f produce_ms=%.2f update_ms=%.2f verify_ms=%.2f "
+            "produce_attempts=%u verify_attempts=%u complete_inputs=%u errors=%u total_ms=%.2f success=%d\n",
+            util::signing_timing::LogId(timing_id),
+            static_cast<unsigned int>(mtx.vin.size()),
+            static_cast<unsigned int>(coins.size()),
+            spent_outputs_ready,
+            Ticks<MillisecondsDouble>(precompute_time),
+            Ticks<MillisecondsDouble>(data_time),
+            Ticks<MillisecondsDouble>(produce_time),
+            Ticks<MillisecondsDouble>(update_time),
+            Ticks<MillisecondsDouble>(verify_time),
+            produce_attempts,
+            verify_attempts,
+            complete_inputs,
+            static_cast<unsigned int>(input_errors.size()),
+            Ticks<MillisecondsDouble>(SteadyClock::now() - timing_start),
+            success);
+    }
+    return success;
 }

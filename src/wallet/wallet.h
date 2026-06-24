@@ -19,6 +19,7 @@
 #include <script/interpreter.h>
 #include <script/p2mr_sizing.h>
 #include <script/script.h>
+#include <script/signingprogress.h>
 #include <support/allocators/secure.h>
 #include <sync.h>
 #include <tinyformat.h>
@@ -59,6 +60,7 @@
 class CKey;
 class CKeyID;
 class CPubKey;
+class CScheduler;
 class Coin;
 class SigningProvider;
 enum class MemPoolRemovalReason;
@@ -103,6 +105,7 @@ std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string&
 std::shared_ptr<CWallet> RestoreWallet(WalletContext& context, const fs::path& backup_file, const std::string& wallet_name, std::optional<bool> load_on_start, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings, bool load_after_restore = true);
 std::unique_ptr<interfaces::Handler> HandleLoadWallet(WalletContext& context, LoadWalletFn load_wallet);
 void NotifyWalletLoaded(WalletContext& context, const std::shared_ptr<CWallet>& wallet);
+void SchedulePlaintextPQCKeyValidation(CScheduler& scheduler, const std::shared_ptr<CWallet>& wallet);
 std::unique_ptr<WalletDatabase> MakeWalletDatabase(const std::string& name, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error);
 
 //! -paytxfee default
@@ -662,6 +665,7 @@ public:
     mutable std::condition_variable m_active_signing_cv;
     mutable size_t m_active_signing_provider_snapshots{0};
     mutable bool m_block_signing_provider_snapshots{false};
+    bool m_plaintext_pqc_key_validation_running GUARDED_BY(cs_wallet){false};
 
     bool Unlock(const SecureString& strWalletPassphrase, bool run_pending_initial_keypool_top_up = true);
     bool ChangeWalletPassphrase(const SecureString& strOldWalletPassphrase, const SecureString& strNewWalletPassphrase);
@@ -724,10 +728,17 @@ public:
     OutputType TransactionChangeType(const std::optional<OutputType>& change_type, const std::vector<CRecipient>& vecSend) const;
 
     /** Fetch the inputs and sign with SIGHASH_ALL. */
-    bool SignTransaction(CMutableTransaction& tx, const PQCSignatureCounterObserver& pqc_counter_observer = {}) const;
+    bool SignTransaction(CMutableTransaction& tx, const PQCSignatureCounterObserver& pqc_counter_observer = {}, const SigningProgressCallback& progress_callback = {}) const;
     /** Sign the tx given the input coins and sighash. */
-    bool SignTransaction(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors, const PQCSignatureCounterObserver& pqc_counter_observer = {}) const;
+    bool SignTransaction(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors, const PQCSignatureCounterObserver& pqc_counter_observer = {}, const SigningProgressCallback& progress_callback = {}) const;
     SigningResult SignMessage(const std::string& message, const PKHash& pkhash, std::string& str_sig) const;
+    util::Result<DataPQCSignatureProof> SignDataPQCHash(
+        const WitnessV2P2MR& output,
+        const uint256& message_hash,
+        const std::optional<CPQCPubKey>& requested_pubkey = std::nullopt,
+        const std::optional<CScript>& requested_leaf_script = std::nullopt,
+        const std::optional<std::vector<unsigned char>>& requested_control_block = std::nullopt,
+        const PQCSignatureCounterObserver& pqc_counter_observer = {}) const;
 
     /**
      * Fills out a PSBT with information from the wallet. Fills in UTXOs if we have
@@ -826,6 +837,15 @@ public:
     };
     PendingInitialKeyPoolTopUpStepResult RunPendingInitialKeyPoolTopUpStep();
     bool RunPendingInitialKeyPoolTopUp();
+
+    enum class PlaintextPQCKeyValidationStepResult {
+        COMPLETE,
+        IN_PROGRESS,
+        FAILED,
+    };
+    PQCKeyValidationInfo GetPQCKeyValidationInfo() const;
+    PlaintextPQCKeyValidationStepResult RunPlaintextPQCKeyValidationStep();
+    bool IsPQCKeyValidationReadyForPrivateKeyUse() const;
 
     // Filter struct for 'ListAddrBookAddresses'
     struct AddrBookFilter {

@@ -226,7 +226,7 @@ qbit-cli -rpcwallet=first -named sendtoaddress \
   amount=0.1
 ```
 
-To set an explicit fee rate, use `fee_rate` in `sat/vB`:
+To set an explicit fee rate, use `fee_rate` in `bits/vB`:
 
 ```bash
 qbit-cli -rpcwallet=first -named sendtoaddress \

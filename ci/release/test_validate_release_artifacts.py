@@ -23,6 +23,13 @@ WORKFLOW = REPO_ROOT / ".github/workflows/release-publish.yml"
 PUBLISH_LOCAL = REPO_ROOT / "contrib" / "release-process" / "publish-local-release.sh"
 GPG = shutil.which("gpg")
 GIT = shutil.which("git")
+OLD_TESTNET_POSTURE_VERIFIER = "/".join(
+    ["contrib", "release-process", "verify-testnet-release-posture.py"]
+)
+LOCAL_PUBLIC_LINKAGE_FALLBACK = 'LINKAGE_SCRIPT="$SCRIPT_DIR/write-public-linkage.sh"'
+REQUIRED_TRUSTED_PUBLIC_LINKAGE = (
+    '"' + "/".join(["contrib", "release-process", "write-public-linkage.sh"]) + '"'
+)
 
 
 @unittest.skipUnless(GPG and GIT, "gpg and git are required for release validation tests")
@@ -641,6 +648,8 @@ class ReleaseWorkflowBoundaryTest(unittest.TestCase):
         self.assertLess(verified_step, local_validator_step)
         self.assertIn("verification.verified", workflow)
         self.assertIn("validate_release_artifacts.py", workflow)
+        self.assertIn("ci/release/verify_testnet_release_posture.py", workflow)
+        self.assertNotIn(OLD_TESTNET_POSTURE_VERIFIER, workflow)
         self.assertIn(
             "TARGET_COMMITISH: ${{ steps.tag.outputs.target_commitish }}",
             workflow,
@@ -674,6 +683,12 @@ class ReleaseWorkflowBoundaryTest(unittest.TestCase):
         self.assertIn("not a GitHub-verified signed tag", script)
         self.assertIn("repos/$repo_path/git/tags/$remote_tag_sha", script)
         self.assertIn("PUBLIC_RELEASE_CHECKOUT", script)
+        self.assertIn("ci/release/verify_testnet_release_posture.py", script)
+        # write-public-linkage.sh only renders the human-facing release body, so
+        # it is resolved with a local fallback and is never a hard trusted-root
+        # requirement (it must not appear in the required-trusted-paths list).
+        self.assertIn(LOCAL_PUBLIC_LINKAGE_FALLBACK, script)
+        self.assertNotIn(REQUIRED_TRUSTED_PUBLIC_LINKAGE, script)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,16 @@
+name: Security report
+description: Learn how to report security issues privately.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not open a public issue for security-sensitive reports.
+
+        To report security issues, email contact@qbit.org (not for support).
+  - type: checkboxes
+    id: acknowledgement
+    attributes:
+      label: Public issue acknowledgement
+      options:
+        - label: I understand that security-sensitive details should not be submitted in this public issue tracker.
+          required: true

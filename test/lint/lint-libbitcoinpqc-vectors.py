@@ -48,6 +48,11 @@ def kat_generator_state(sphincs_dir: Path, implementation: str) -> str | None:
 
 
 def run_vector_check(sphincs_dir: Path, instance: str, implementation: str) -> bool:
+    vectors_py = sphincs_dir / "vectors.py"
+    if not vectors_py.is_file():
+        print(f"Missing vectors.py at expected path: {vectors_py}", flush=True)
+        return False
+
     cmd = [sys.executable, "vectors.py", instance, implementation]
     print(f"Running {' '.join(cmd)} in {sphincs_dir}", flush=True)
     return subprocess.run(cmd, cwd=sphincs_dir).returncode == 0
@@ -71,9 +76,6 @@ def main() -> None:
         ).strip()
     )
     sphincs_dir = root / "src" / "libbitcoinpqc" / "sphincsplus"
-    if not (sphincs_dir / "vectors.py").is_file():
-        print(f"Missing vectors.py at expected path: {sphincs_dir / 'vectors.py'}")
-        sys.exit(1)
 
     ok = True
     for instance, implementation in VECTORS_TO_CHECK:

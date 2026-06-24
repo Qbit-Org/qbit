@@ -13,9 +13,12 @@
 #include <pubkey.h>
 #include <script/keyorigin.h>
 #include <script/script.h>
+#include <script/signingprogress.h>
 #include <sync.h>
 
+#include <cstdint>
 #include <functional>
+#include <map>
 
 struct ShortestVectorFirstComparator
 {
@@ -29,6 +32,16 @@ struct ShortestVectorFirstComparator
 
 using PQCSignatureCounterObserver = std::function<void(const CPQCPubKey&, uint32_t, uint32_t)>;
 using PQCSignatureCounterReserver = std::function<bool(const CPQCPubKey&, uint32_t, uint32_t&, uint32_t&)>;
+
+struct PQCSignatureCounterRange {
+    CPQCPubKey pubkey;
+    uint32_t previous_counter{0};
+    uint32_t reserved_counter{0};
+};
+
+using PQCSignatureCounterBatchReserver = std::function<bool(
+    const std::map<CPQCPubKey, uint32_t>&,
+    std::map<CPQCPubKey, PQCSignatureCounterRange>&)>;
 
 using ScriptMerkleLeaf = std::pair<std::vector<unsigned char>, int>;
 using ScriptMerkleBranchSet = std::set<std::vector<unsigned char>, ShortestVectorFirstComparator>;
@@ -273,6 +286,7 @@ struct FlatSigningProvider final : public SigningProvider
     mutable std::map<CPQCPubKey, uint32_t> pqc_sig_counters;
     std::function<bool(const CPQCPubKey&, uint32_t, uint32_t)> pqc_counter_writer;
     PQCSignatureCounterReserver pqc_counter_reserver;
+    PQCSignatureCounterBatchReserver pqc_counter_batch_reserver;
     PQCSignatureCounterObserver pqc_counter_observer;
     std::map<uint32_t, CPQCPubKey> p2mr_pubkeys; /** Map key expression index -> derived P2MR pubkey */
     std::map<WitnessV2P2MR, P2MRSpendData> p2mr_spenddata; /** Map from output key to raw P2MR spend data */

@@ -39,6 +39,7 @@ auto consteval_ctor(auto&& input) { return input; }
 
 static constexpr int QBIT_PUBLIC_TESTNET_AUXPOW_CHAIN_ID{31430};
 static constexpr int QBIT_TEST_CHAIN_AUXPOW_CHAIN_ID{QBIT_PUBLIC_TESTNET_AUXPOW_CHAIN_ID};
+static constexpr int QBIT_TESTNET4_AUXPOW_DISPLAY_COMMITMENT_HEIGHT{20'500};
 
 // Mainnet is not launched. This placeholder intentionally matches public
 // testnet only while mainnet params are still development scaffolding. Replace
@@ -99,6 +100,16 @@ static CBlock CreateTestNet4GenesisBlock(uint32_t nTime, uint32_t nNonce, uint32
     return CreateGenesisBlock(genesisInputScript, genesisOutputScript, nTime, nNonce, nBits, nVersion, genesisReward);
 }
 
+static ChainTxData LaunchChainTxData(const CBlock& genesis, int64_t target_spacing)
+{
+    assert(target_spacing > 0);
+    return ChainTxData{
+        .nTime = genesis.nTime,
+        .tx_count = 1,
+        .dTxRate = 1.0 / target_spacing,
+    };
+}
+
 /**
  * Main network on which people trade goods and services.
  */
@@ -125,6 +136,7 @@ public:
         consensus.powLimit = uint256{"0000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
         consensus.nPowTargetTimespan = 14 * 24 * 60 * 60; // Retained for DifficultyAdjustmentInterval(); ASERT replaces epoch retarget.
         consensus.nCadenceActivationHeight = 0; // Clean-slate network: cadence rules are active from genesis unless a test override says otherwise.
+        consensus.nAuxpowDisplayCommitmentHeight = 0;
         consensus.nPowTargetSpacing = 60; // 1-minute blocks
         consensus.nPowTargetSpacingLegacy = 75; // Use 75s/300s lane spacing for an exact 4:1 permissionless:merged split at a 60s aggregate cadence.
         consensus.nPowTargetSpacingAuxPow = 300;
@@ -202,11 +214,7 @@ public:
 
         m_assumeutxo_data = {}; // qbit: no assumeUTXO snapshots yet
 
-        chainTxData = ChainTxData{
-            .nTime = 0,
-            .tx_count = 0,
-            .dTxRate = 0,
-        };
+        chainTxData = LaunchChainTxData(genesis, consensus.nPowTargetSpacing);
     }
 };
 
@@ -235,6 +243,7 @@ public:
         consensus.powLimit = uint256{"0000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"}; // Development difficulty
         consensus.nPowTargetTimespan = 14 * 24 * 60 * 60; // Retained for DifficultyAdjustmentInterval()
         consensus.nCadenceActivationHeight = 0;
+        consensus.nAuxpowDisplayCommitmentHeight = 0;
         consensus.nPowTargetSpacing = 60;
         consensus.nPowTargetSpacingLegacy = 75;
         consensus.nPowTargetSpacingAuxPow = 300;
@@ -296,11 +305,7 @@ public:
 
         m_assumeutxo_data = {};
 
-        chainTxData = ChainTxData{
-            .nTime = 0,
-            .tx_count = 0,
-            .dTxRate = 0,
-        };
+        chainTxData = LaunchChainTxData(genesis, consensus.nPowTargetSpacing);
     }
 };
 
@@ -329,6 +334,7 @@ public:
         consensus.powLimit = uint256{"0000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
         consensus.nPowTargetTimespan = 14 * 24 * 60 * 60;
         consensus.nCadenceActivationHeight = 0;
+        consensus.nAuxpowDisplayCommitmentHeight = QBIT_TESTNET4_AUXPOW_DISPLAY_COMMITMENT_HEIGHT;
         consensus.nPowTargetSpacing = 60;
         consensus.nPowTargetSpacingLegacy = 75;
         consensus.nPowTargetSpacingAuxPow = 300;
@@ -396,11 +402,7 @@ public:
 
         m_assumeutxo_data = {};
 
-        chainTxData = ChainTxData{
-            .nTime = 0,
-            .tx_count = 0,
-            .dTxRate = 0,
-        };
+        chainTxData = LaunchChainTxData(genesis, consensus.nPowTargetSpacing);
     }
 };
 
@@ -422,22 +424,12 @@ public:
             consensus.defaultAssumeValid = uint256{};
             m_assumed_blockchain_size = 0;
             m_assumed_chain_state_size = 0;
-            chainTxData = ChainTxData{
-                0,
-                0,
-                0,
-            };
         } else {
             bin = *options.challenge;
             consensus.nMinimumChainWork = uint256{};
             consensus.defaultAssumeValid = uint256{};
             m_assumed_blockchain_size = 0;
             m_assumed_chain_state_size = 0;
-            chainTxData = ChainTxData{
-                0,
-                0,
-                0,
-            };
             LogInfo("Signet with challenge %s", HexStr(bin));
         }
 
@@ -462,6 +454,7 @@ public:
         consensus.nOuterReservedWitnessHeight = 0;
         consensus.nPowTargetTimespan = 14 * 24 * 60 * 60;
         consensus.nCadenceActivationHeight = 0;
+        consensus.nAuxpowDisplayCommitmentHeight = 0;
         consensus.nPowTargetSpacing = 60;
         consensus.nPowTargetSpacingLegacy = 75;
         consensus.nPowTargetSpacingAuxPow = 300;
@@ -505,6 +498,7 @@ public:
         assert(genesis.hashMerkleRoot == uint256{"773941c57f540b7e0f841db6de90bf4f29d305d8233224c2581025c684387313"});
 
         m_assumeutxo_data = {};
+        chainTxData = LaunchChainTxData(genesis, consensus.nPowTargetSpacing);
 
         base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1,120); // 'q'
         base58Prefixes[SCRIPT_ADDRESS] = std::vector<unsigned char>(1,125); // 's'
@@ -542,6 +536,7 @@ public:
         consensus.CSVHeight = 1;    // Always active unless overridden
         consensus.SegwitHeight = 0; // Always active unless overridden
         consensus.nCadenceActivationHeight = opts.cadence_activation_height.value_or(0); // Always active unless overridden
+        consensus.nAuxpowDisplayCommitmentHeight = opts.auxpow_display_commitment_height.value_or(0); // Always active unless overridden
         consensus.nOuterReservedWitnessHeight = opts.outer_witness_activation_height.value_or(std::numeric_limits<int>::max());
         consensus.P2MRHeight = opts.p2mr_activation_height.value_or(0); // Always active unless overridden
         consensus.MinBIP9WarningHeight = 0;

@@ -14,6 +14,7 @@
 #ifndef QBIT_WALLET_TYPES_H
 #define QBIT_WALLET_TYPES_H
 
+#include <cstddef>
 #include <type_traits>
 
 namespace wallet {
@@ -29,6 +30,25 @@ enum class AddressPurpose {
     RECEIVE,
     SEND,
     REFUND, //!< Never set in current code may be present in older wallet databases
+};
+
+enum class PQCKeyValidationStatus {
+    NOT_REQUIRED,
+    PENDING,
+    RUNNING,
+    COMPLETE,
+    FAILED,
+};
+
+struct PQCKeyValidationInfo {
+    PQCKeyValidationStatus status{PQCKeyValidationStatus::NOT_REQUIRED};
+    size_t plaintext_records{0};
+    size_t pending_records{0};
+    size_t validated_records{0};
+    size_t failed_records{0};
+    double progress{1.0};
+    bool signing_blocked{false};
+    bool encryption_recommended{false};
 };
 } // namespace wallet
 

@@ -1,0 +1,180 @@
+name: Nightly CI
+
+on:
+  schedule:
+    - cron: '30 3 * * *'
+  workflow_dispatch:
+    inputs:
+      run_test_matrix:
+        description: 'Run the existing heavy test matrix'
+        required: false
+        type: boolean
+        default: true
+      run_scanners:
+        description: 'Run scanners'
+        required: false
+        type: boolean
+        default: true
+      scanner_set:
+        description: 'Scanner set'
+        required: false
+        type: choice
+        default: minimum
+        options:
+          - minimum
+          - dependency-only
+          - secrets-only
+          - workflow-only
+          - sast-only
+          - release-only
+      scanner_fail_policy:
+        description: 'Scanner failure policy'
+        required: false
+        type: choice
+        default: infra-and-secrets
+        options:
+          - never
+          - infra-only
+          - infra-and-secrets
+          - high-critical
+      skip_build_scanners:
+        description: 'Skip build-backed scanners such as scan-build'
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: nightly-heavy-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI_FAILFAST_TEST_LEAVE_DANGLING: 1
+  CIRRUS_CACHE_HOST: http://127.0.0.1:12321/
+  REPO_USE_CIRRUS_RUNNERS: ''
+  CI_IMAGE_REGISTRY_PREFIX: qbit-ci-autoscaler:5000/qbit-cache
+  CI_ENFORCE_INTERNAL_REGISTRY: 1
+
+jobs:
+  nightly-matrix:
+    if: ${{ (github.event_name == 'schedule' && vars.CI_NIGHTLY_HEAVY_RUN_TEST_MATRIX != 'false') || (github.event_name == 'workflow_dispatch' && inputs.run_test_matrix) }}
+    name: ${{ matrix.name }}
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: ${{ matrix.timeout-minutes }}
+    env:
+      DANGER_CI_ON_HOST_FOLDERS: 1
+      FILE_ENV: ${{ matrix.file-env }}
+      TEST_RUNNER_FAILFAST: 'false'
+      MAKEJOBS: ${{ matrix.makejobs || '-j6' }}
+      TEST_RUNNER_JOBS: '6'
+      CTEST_JOBS: '6'
+      CI_DOCKER_RUN_CPUS: ${{ matrix.container-cpus || '8' }}
+      CI_DOCKER_RUN_MEMORY: ${{ matrix.container-memory || '48g' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: '32 bit ARM, unit tests, no functional tests'
+            timeout-minutes: 180
+            file-env: './ci/test/00_setup_env_arm.sh'
+            container-cpus: '8'
+            container-memory: '48g'
+          - name: 'previous releases, depends DEBUG'
+            timeout-minutes: 180
+            file-env: './ci/test/00_setup_env_native_previous_releases.sh'
+            container-cpus: '8'
+            container-memory: '48g'
+          - name: 'fuzzer,address,undefined,integer, no depends'
+            timeout-minutes: 240
+            file-env: './ci/test/00_setup_env_native_fuzz.sh'
+            makejobs: '-j12'
+            container-cpus: '12'
+            container-memory: '64g'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'schedule' && 'develop' || github.ref }}
+          fetch-depth: 0
+
+      - name: Configure environment
+        uses: ./.github/actions/configure-environment
+
+      - name: Restore caches
+        id: restore-cache
+        uses: ./.github/actions/restore-caches
+
+      - name: Configure Docker
+        uses: ./.github/actions/configure-docker
+        with:
+          cache-provider: gha
+
+      - name: CI script
+        run: ./ci/test_run_all.sh
+
+      - name: Save caches
+        uses: ./.github/actions/save-caches
+
+  scanner-readiness:
+    if: ${{ (github.event_name == 'schedule' && vars.CI_NIGHTLY_HEAVY_RUN_SCANNERS != 'false') || (github.event_name == 'workflow_dispatch' && inputs.run_scanners) }}
+    name: Scanner
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 240
+    env:
+      SCANNER_SET: ${{ inputs.scanner_set || 'minimum' }}
+      SCANNER_FAIL_POLICY: ${{ inputs.scanner_fail_policy || 'infra-and-secrets' }}
+      SKIP_BUILD_SCANNERS: ${{ inputs.skip_build_scanners || 'false' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'schedule' && 'develop' || github.ref }}
+          fetch-depth: 0
+
+      - name: Install scanner tools
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: ci/scanners/install-scanner-tools.sh
+
+      - name: Run scanner evidence
+        shell: bash
+        env:
+          LIBBITCOINPQC_READ_TOKEN: ${{ secrets.LIBBITCOINPQC_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          mode="nightly"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            mode="manual_dry_run"
+          fi
+          git fetch --no-tags origin +main:refs/remotes/origin/main
+          source_commit="$(git rev-parse HEAD)"
+          history_diff_base_ref="origin/main"
+          scanner_output_root="$RUNNER_TEMP/qbit-scanner-evidence"
+          args=(
+            python3 ci/scanners/run-scanners.py
+            --mode "$mode"
+            --scanner-set "$SCANNER_SET"
+            --source .
+            --source-commit "$source_commit"
+            --freeze-commit "$source_commit"
+            --history-diff-base-ref "$history_diff_base_ref"
+            --output-root "$scanner_output_root"
+            --fail-policy "$SCANNER_FAIL_POLICY"
+          )
+          if [ "$SKIP_BUILD_SCANNERS" = "true" ]; then
+            args+=(--skip-build-scanners)
+          fi
+          "${args[@]}"
+
+      - name: Upload scanner summaries
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qbit-scanner-evidence-${{ github.run_id }}
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/qbit-scanner-evidence/README.md
+            ${{ runner.temp }}/qbit-scanner-evidence/summary.json
+            ${{ runner.temp }}/qbit-scanner-evidence/*/summary.json
+            ${{ runner.temp }}/qbit-scanner-evidence/*/triage.jsonl

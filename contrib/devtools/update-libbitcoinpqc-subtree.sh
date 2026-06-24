@@ -8,20 +8,28 @@ export LC_ALL=C
 set -euo pipefail
 
 derive_default_remote_url() {
-  local origin_url owner
-  origin_url="$(git config --get remote.origin.url 2>/dev/null || true)"
-  owner="$(printf '%s\n' "${origin_url}" | sed -E -n 's#.*github.com[:/]([^/]+)/qbit(\.git)?$#\1#p')"
-  if [[ -n "${owner}" ]]; then
-    printf 'git@github.com:%s/libbitcoinpqc-qbit.git' "${owner}"
-  else
-    printf 'git@github.com:<owner>/libbitcoinpqc-qbit.git'
+  printf 'https://github.com/Qbit-Org/qbit-libbitcoinpqc.git'
+}
+
+resolve_remote_commit() {
+  local remote_url="$1"
+  local remote_ref="$2"
+  local ls_remote_output
+
+  if ls_remote_output="$(git ls-remote --exit-code "${remote_url}" "${remote_ref}^{}" 2>/dev/null)"; then
+    printf '%s\n' "${ls_remote_output}" | awk 'NR==1 {print $1}'
+    return
+  fi
+
+  if ls_remote_output="$(git ls-remote --exit-code "${remote_url}" "${remote_ref}" 2>/dev/null)"; then
+    printf '%s\n' "${ls_remote_output}" | awk 'NR==1 {print $1}'
   fi
 }
 
 readonly PREFIX="src/libbitcoinpqc"
 DEFAULT_REMOTE_URL="$(derive_default_remote_url)"
 readonly DEFAULT_REMOTE_URL
-readonly DEFAULT_REMOTE_REF="qbit-subtree"
+readonly DEFAULT_REMOTE_REF="v0.3.0"
 
 REMOTE_URL="${LIBBITCOINPQC_REMOTE_URL:-$DEFAULT_REMOTE_URL}"
 REMOTE_REF="${LIBBITCOINPQC_REMOTE_REF:-$DEFAULT_REMOTE_REF}"
@@ -30,15 +38,11 @@ if [[ "${1-}" == "--help" ]]; then
   cat <<EOF
 Usage: $(basename "$0") [REF]
 
-Update the $PREFIX subtree from the curated upstream branch.
+Update the $PREFIX subtree from the pinned upstream release tag.
 See doc/subtrees/libbitcoinpqc.md for the full two-repo workflow.
-qbit does not keep a local prune helper; use
-libbitcoinpqc-qbit:develop:scripts/prune-for-qbit-subtree.sh when refreshing
-the upstream curated branch.
 
 Environment overrides:
-  LIBBITCOINPQC_REMOTE_URL   default: git@github.com:<owner>/libbitcoinpqc-qbit.git
-                             (<owner> is inferred from local origin remote)
+  LIBBITCOINPQC_REMOTE_URL   default: $DEFAULT_REMOTE_URL
   LIBBITCOINPQC_REMOTE_REF   default: $DEFAULT_REMOTE_REF
 
 Argument:
@@ -71,9 +75,7 @@ echo "  remote: ${REMOTE_URL}"
 echo "  ref:    ${REMOTE_REF}"
 
 EXPECTED_UPSTREAM_COMMIT=""
-if LS_REMOTE_OUTPUT="$(git ls-remote --exit-code "${REMOTE_URL}" "${REMOTE_REF}" 2>/dev/null)"; then
-  EXPECTED_UPSTREAM_COMMIT="$(printf '%s\n' "${LS_REMOTE_OUTPUT}" | awk 'NR==1 {print $1}')"
-fi
+EXPECTED_UPSTREAM_COMMIT="$(resolve_remote_commit "${REMOTE_URL}" "${REMOTE_REF}")"
 
 if [[ -n "${EXPECTED_UPSTREAM_COMMIT}" ]]; then
   echo "Expected upstream commit: ${EXPECTED_UPSTREAM_COMMIT}"

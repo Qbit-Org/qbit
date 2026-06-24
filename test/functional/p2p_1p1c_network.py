@@ -67,7 +67,7 @@ class PackageRelayTest(BitcoinTestFramework):
             num_outputs=2,
         )
 
-        # Target 1sat/vB so the number of satoshis is equal to the vsize.
+        # Target 1bits/vB so the number of satoshis is equal to the vsize.
         # Round up. The goal is to be between min relay feerate and mempool min feerate.
         fee_2outs = ceil(low_fee_parent_2outs_tester["tx"].get_vsize() / 2)
 
@@ -94,7 +94,7 @@ class PackageRelayTest(BitcoinTestFramework):
         return [parent1["hex"], parent2["hex"], child["hex"]], parent1["tx"], parent2["tx"], child["tx"]
 
     def create_packages(self):
-        # 1: Basic 1-parent-1-child package, parent 1sat/vB, child 999sat/vB
+        # 1: Basic 1-parent-1-child package, parent 1bits/vB, child 999bits/vB
         package_hex_1, parent_1, child_1 = self.create_basic_1p1c(self.wallet)
 
         # 2: same as 1, parent's txid is the same as its wtxid.
