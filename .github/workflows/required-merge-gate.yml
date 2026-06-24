@@ -537,9 +537,9 @@ jobs:
       - rpc-docs-validation
       - public-docs-validation
       - github-metadata-validation
-    if: ${{ always() }}
+    if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.draft != true) }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 330
+    timeout-minutes: 360
     steps:
       - name: Check required validation profile
         env:
@@ -561,39 +561,56 @@ jobs:
             exit 1
           fi
 
-          wait_for_check() {
-            local check_name="$1"
+          wait_for_checks() {
+            local check_names=("$@")
             local attempts=0
-            local max_attempts=300
-            local sleep_seconds=60
+            local max_attempts=720
+            local sleep_seconds=30
+            local pending_count
+            local check_name
+            local result
+            local status
+            local conclusion
 
             while (( attempts < max_attempts )); do
-              result="$(
-                gh api \
-                  -H "Accept: application/vnd.github+json" \
-                  "/repos/${REPOSITORY}/commits/${SHA}/check-runs?per_page=100" \
-                  --jq ".check_runs | map(select(.name == \"${check_name}\")) | sort_by(.started_at // .created_at // \"\") | last // empty | [.status, (.conclusion // \"\")] | @tsv"
-              )"
+              pending_count=0
 
-              if [[ -z "${result}" ]]; then
-                echo "${check_name}: not found yet"
-              else
+              for check_name in "${check_names[@]}"; do
+                result="$(
+                  gh api \
+                    -H "Accept: application/vnd.github+json" \
+                    "/repos/${REPOSITORY}/commits/${SHA}/check-runs?per_page=100" \
+                    --jq ".check_runs | map(select(.name == \"${check_name}\")) | sort_by(.started_at // .created_at // \"\") | last // empty | [.status, (.conclusion // \"\")] | @tsv"
+                )"
+
+                if [[ -z "${result}" ]]; then
+                  echo "${check_name}: not found yet"
+                  pending_count=$((pending_count + 1))
+                  continue
+                fi
+
                 IFS=$'\t' read -r status conclusion <<< "${result}"
                 echo "${check_name}: status=${status} conclusion=${conclusion:-pending}"
                 if [[ "${status}" == "completed" ]]; then
-                  if [[ "${conclusion}" == "success" ]]; then
-                    return 0
+                  if [[ "${conclusion}" != "success" ]]; then
+                    echo "::error title=Required Merge Gate failed::${check_name} concluded ${conclusion}."
+                    return 1
                   fi
-                  echo "::error title=Required Merge Gate failed::${check_name} concluded ${conclusion}."
-                  return 1
+                  continue
                 fi
+
+                pending_count=$((pending_count + 1))
+              done
+
+              if (( pending_count == 0 )); then
+                return 0
               fi
 
               attempts=$((attempts + 1))
               sleep "${sleep_seconds}"
             done
 
-            echo "::error title=Required Merge Gate timed out::${check_name} did not complete in time."
+            echo "::error title=Required Merge Gate timed out::Required checks did not complete in time: ${check_names[*]}"
             return 1
           }
 
@@ -612,7 +629,7 @@ jobs:
                 echo "::error title=Required Merge Gate failed::RPC docs validation result was ${RPC_DOCS_VALIDATION_RESULT}."
                 exit 1
               fi
-              wait_for_check "rpc-docs"
+              wait_for_checks "rpc-docs"
               exit 0
               ;;
             public-docs)
@@ -621,7 +638,7 @@ jobs:
                 echo "::error title=Required Merge Gate failed::Public docs validation result was ${PUBLIC_DOCS_VALIDATION_RESULT}."
                 exit 1
               fi
-              wait_for_check "public-docs-lint"
+              wait_for_checks "public-docs-lint"
               exit 0
               ;;
             github-metadata)
@@ -638,8 +655,7 @@ jobs:
                 exit 1
               fi
               echo "Validation profile ${VALIDATION_PROFILE} requires Core Checks Gate and Full Validation Gate."
-              wait_for_check "Core Checks Gate"
-              wait_for_check "Full Validation Gate"
+              wait_for_checks "Core Checks Gate" "Full Validation Gate"
               ;;
             *)
               echo "::error title=Required Merge Gate failed::Unknown validation profile ${VALIDATION_PROFILE}."
