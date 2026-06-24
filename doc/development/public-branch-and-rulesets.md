@@ -46,10 +46,27 @@ Ruleset JSON templates are the public-safe files below:
 
 | Template | Target | Baseline behavior |
 | --- | --- | --- |
-| `.github/rulesets/main.json` | `refs/heads/main` | Require pull requests, one approval, resolved conversations, merge commits only, `Core Checks Gate`, `Full Validation Gate`, block deletion, and block non-fast-forward updates. |
-| `.github/rulesets/0.1.x.json` | `refs/heads/0.1.x` | Restrict branch creation to bypass actors, require pull requests, one approval, resolved conversations, merge commits only, `Core Checks Gate`, `Full Validation Gate`, block deletion, and block non-fast-forward updates. |
+| `.github/rulesets/main.json` | `refs/heads/main` | Require pull requests, one approval, resolved conversations, squash/rebase merge methods only, linear history, `Core Checks Gate`, `Full Validation Gate`, block deletion, and block non-fast-forward updates. |
+| `.github/rulesets/0.1.x.json` | `refs/heads/0.1.x` | Restrict branch creation to bypass actors, require pull requests, one approval, resolved conversations, squash/rebase merge methods only, linear history, `Core Checks Gate`, `Full Validation Gate`, block deletion, and block non-fast-forward updates. |
 | `.github/rulesets/release-tags-v.json` | `refs/tags/v*` | Restrict tag creation, updates, and deletion to bypass actors. |
 | `.github/rulesets/upstream-refs.json` | `refs/heads/upstream/**` | Lock optional upstream reference branches so only bypass actors can create, update, or delete them. |
+
+## Repository Merge Settings
+
+GitHub ruleset pull request merge-method restrictions apply to the target refs
+selected by each ruleset. Enforce the same no-merge-commit policy for every
+pull request by applying the repository-level merge-method settings template.
+These settings are repository-wide defaults rather than branch-scoped rules:
+
+| Template | Scope | Baseline behavior |
+| --- | --- | --- |
+| `.github/repository-settings/merge-methods.json` | All repository pull requests | Enable squash merges, keep rebase merges available as an optional linear method, and disable normal merge commits by default. |
+
+The normal merge-commit button should stay disabled in routine operation. If an
+unusual case needs a merge commit, a repository admin or release maintainer may
+temporarily set `allow_merge_commit` to `true`, perform the merge, record the
+reason in the relevant pull request or release checklist, and immediately
+restore this default template.
 
 Templates that restrict ref creation, update, or deletion intentionally use
 `OrganizationAdmin` as the only portable bypass actor. Before applying them to
@@ -72,7 +89,7 @@ repository and bypass actors:
 
 ```sh
 gh api \
-  --method PATCH \
+  --method PUT \
   -H "Accept: application/vnd.github+json" \
   repos/Qbit-Org/qbit/rulesets/<ruleset-id> \
   --input .github/rulesets/main.json
@@ -80,6 +97,16 @@ gh api \
 
 Use the same command with the other template paths after reviewing their target
 refs and ruleset IDs.
+
+Apply the repository-wide merge-method policy with the repository API:
+
+```sh
+gh api \
+  --method PATCH \
+  -H "Accept: application/vnd.github+json" \
+  repos/Qbit-Org/qbit \
+  --input .github/repository-settings/merge-methods.json
+```
 
 ## Operational Notes
 
