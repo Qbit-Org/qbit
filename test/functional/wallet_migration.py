@@ -235,6 +235,7 @@ class WalletMigrationTest(BitcoinTestFramework):
         self.restart_node(0)
         self.connect_nodes(0, 1)
         default = self.master_node.get_wallet_rpc(self.default_wallet_name)
+        self.wait_pqc_key_validation_ready(default)
         self.master_node.loadwallet("basic1")
         basic1 = self.master_node.get_wallet_rpc("basic1")
         assert_equal(basic1.getbalance(), bal)

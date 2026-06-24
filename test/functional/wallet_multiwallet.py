@@ -58,13 +58,6 @@ class MultiWalletTest(BitcoinTestFramework):
             help='Test data with wallet directories (default: %(default)s)',
         )
 
-    def wait_pqc_key_validation_ready(self, wallet):
-        def ready():
-            validation = wallet.getwalletinfo().get("pqc_key_validation", {})
-            return validation.get("status") in ("not_required", "complete") and not validation.get("signing_blocked", True)
-
-        self.wait_until(ready, timeout=180)
-
     def run_test(self):
         node = self.nodes[0]
 
@@ -225,6 +218,8 @@ class MultiWalletTest(BitcoinTestFramework):
 
         wallets = [wallet(w) for w in wallet_names]
         wallet_bad = wallet("bad")
+        for wallet_rpc in wallets:
+            self.wait_pqc_key_validation_ready(wallet_rpc)
 
         # check wallet names and balances
         self.generatetoaddress(node, nblocks=1, address=wallets[0].getnewaddress(), sync_fun=self.no_op)
