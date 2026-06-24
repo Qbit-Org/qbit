@@ -46,8 +46,8 @@ Ruleset JSON templates are the public-safe files below:
 
 | Template | Target | Baseline behavior |
 | --- | --- | --- |
-| `.github/rulesets/main.json` | `refs/heads/main` | Require pull requests, one approval, resolved conversations, merge commits only, `Core Checks Gate`, `Full Validation Gate`, block deletion, and block non-fast-forward updates. |
-| `.github/rulesets/0.1.x.json` | `refs/heads/0.1.x` | Restrict branch creation to bypass actors, require pull requests, one approval, resolved conversations, merge commits only, `Core Checks Gate`, `Full Validation Gate`, block deletion, and block non-fast-forward updates. |
+| `.github/rulesets/main.json` | `refs/heads/main` | Require pull requests, one approval, resolved conversations, squash/rebase merge methods only, linear history, `Core Checks Gate`, `Full Validation Gate`, block deletion, and block non-fast-forward updates. |
+| `.github/rulesets/0.1.x.json` | `refs/heads/0.1.x` | Restrict branch creation to bypass actors, require pull requests, one approval, resolved conversations, squash/rebase merge methods only, linear history, `Core Checks Gate`, `Full Validation Gate`, block deletion, and block non-fast-forward updates. |
 | `.github/rulesets/release-tags-v.json` | `refs/tags/v*` | Restrict tag creation, updates, and deletion to bypass actors. |
 | `.github/rulesets/upstream-refs.json` | `refs/heads/upstream/**` | Lock optional upstream reference branches so only bypass actors can create, update, or delete them. |
 
