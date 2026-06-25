@@ -41,7 +41,7 @@ env:
   REPO_USE_CIRRUS_RUNNERS: '' # Disabled: using self-hosted runners
   CI_IMAGE_REGISTRY_PREFIX: qbit-ci-autoscaler:5000/qbit-cache
   CI_ENFORCE_INTERNAL_REGISTRY: 1
-  CI_BUILDKIT_DNS_NAMESERVERS: ${{ github.repository == 'Qbit-Org/qbit' && '100.100.100.100' || '' }}
+  CI_BUILDKIT_DNS_NAMESERVERS: ${{ github.repository == 'Qbit-Org/qbit' && '100.100.100.100,1.1.1.1,8.8.8.8' || '' }}
   CI_BUILDKIT_DNS_SEARCH_DOMAINS: ${{ github.repository == 'Qbit-Org/qbit' && 'tailfa7aa.ts.net,localdomain' || '' }}
 
 defaults:

@@ -56,7 +56,7 @@ class ConfigureDockerBuildKitConfigTest(unittest.TestCase):
             {
                 "CI_ENFORCE_INTERNAL_REGISTRY": "1",
                 "CI_IMAGE_REGISTRY_PREFIX": "qbit-ci-autoscaler:5000/qbit-cache",
-                "CI_BUILDKIT_DNS_NAMESERVERS": "100.100.100.100",
+                "CI_BUILDKIT_DNS_NAMESERVERS": "100.100.100.100,1.1.1.1,8.8.8.8",
                 "CI_BUILDKIT_DNS_SEARCH_DOMAINS": "tailfa7aa.ts.net,localdomain",
             }
         )
@@ -71,7 +71,7 @@ class ConfigureDockerBuildKitConfigTest(unittest.TestCase):
                     "    insecure = true",
                     "",
                     "[dns]",
-                    '  nameservers = ["100.100.100.100"]',
+                    '  nameservers = ["100.100.100.100", "1.1.1.1", "8.8.8.8"]',
                     '  searchDomains = ["tailfa7aa.ts.net", "localdomain"]',
                     "",
                 ]
