@@ -516,7 +516,8 @@ class RPCPerfTest(BitcoinTestFramework):
         mining_address = wallet.getnewaddress()
         node.generatetoaddress(COINBASE_MATURITY + WALLET_READY_MATURE_OUTPUTS, mining_address, called_by_framework=True)
 
-        receive_address = wallet.getnewaddress()
+        receive_label = "rpc-perf-receive"
+        receive_address = wallet.getnewaddress(receive_label)
         raw_tx = wallet.createrawtransaction([], [{receive_address: Decimal("0.10000000")}])
         funded_tx = wallet.fundrawtransaction(raw_tx)
         psbt = wallet.walletcreatefundedpsbt([], [{receive_address: Decimal("0.10000000")}])["psbt"]
@@ -528,6 +529,7 @@ class RPCPerfTest(BitcoinTestFramework):
             {
                 "wallet_name": wallet_name,
                 "wallet_rpc": wallet,
+                "receive_label": receive_label,
                 "receive_address": receive_address,
                 "raw_tx": raw_tx,
                 "funded_tx": funded_tx["hex"],
@@ -916,6 +918,30 @@ class RPCPerfTest(BitcoinTestFramework):
 
     def build_wallet_getaddressinfo(self, benchmark: BenchmarkCase, context: FixtureContext, sample_index: int, mode: str):
         return context.state["wallet_rpc"], "getaddressinfo", [context.state["receive_address"]]
+
+    def build_wallet_getwalletinfo(self, benchmark: BenchmarkCase, context: FixtureContext, sample_index: int, mode: str):
+        return context.state["wallet_rpc"], "getwalletinfo", []
+
+    def build_wallet_getbalance(self, benchmark: BenchmarkCase, context: FixtureContext, sample_index: int, mode: str):
+        return context.state["wallet_rpc"], "getbalance", []
+
+    def build_wallet_getbalances(self, benchmark: BenchmarkCase, context: FixtureContext, sample_index: int, mode: str):
+        return context.state["wallet_rpc"], "getbalances", []
+
+    def build_wallet_listunspent(self, benchmark: BenchmarkCase, context: FixtureContext, sample_index: int, mode: str):
+        return context.state["wallet_rpc"], "listunspent", []
+
+    def build_wallet_listtransactions(self, benchmark: BenchmarkCase, context: FixtureContext, sample_index: int, mode: str):
+        return context.state["wallet_rpc"], "listtransactions", []
+
+    def build_wallet_getaddressesbylabel(self, benchmark: BenchmarkCase, context: FixtureContext, sample_index: int, mode: str):
+        return context.state["wallet_rpc"], "getaddressesbylabel", [context.state["receive_label"]]
+
+    def build_wallet_listlabels(self, benchmark: BenchmarkCase, context: FixtureContext, sample_index: int, mode: str):
+        return context.state["wallet_rpc"], "listlabels", []
+
+    def build_wallet_listlockunspent(self, benchmark: BenchmarkCase, context: FixtureContext, sample_index: int, mode: str):
+        return context.state["wallet_rpc"], "listlockunspent", []
 
     def build_wallet_listdescriptors(self, benchmark: BenchmarkCase, context: FixtureContext, sample_index: int, mode: str):
         return context.state["wallet_rpc"], "listdescriptors", []
