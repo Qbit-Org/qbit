@@ -1,0 +1,59 @@
+# Copyright (c) 2026-present The qbit core developers
+# Distributed under the MIT software license, see the accompanying
+# file COPYING or https://opensource.org/license/mit.
+
+name: Lint Image Prewarm
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .python-version
+      - ci/lint_imagefile
+      - ci/test/00_setup_env_base_image.sh
+      - ci/lint/**
+      - ci/retry/retry
+      - .github/actions/configure-docker/**
+      - .github/workflows/lint-image-prewarm.yml
+  schedule:
+    - cron: '45 0 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: lint-image-prewarm-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CONTAINER_NAME: "bitcoin-linter-main"
+  CI_IMAGE_REGISTRY_PREFIX: qbit-ci-autoscaler:5000/qbit-cache
+  CI_ENFORCE_INTERNAL_REGISTRY: 1
+
+jobs:
+  prewarm:
+    name: Prewarm lint image cache
+    if: ${{ github.ref_name == github.event.repository.default_branch }}
+    runs-on: ${{ github.repository == 'Qbit-Org/qbit' && fromJSON('["self-hosted", "linux", "x64", "qbit-trusted-ci"]') || fromJSON('["self-hosted", "linux", "x64"]') }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Configure Docker
+        uses: ./.github/actions/configure-docker
+        with:
+          cache-provider: gha
+          cache-from-scopes: bitcoin-linter-main
+          cache-to-scopes: bitcoin-linter-main
+          cache-write-policy: always
+          load-image: false
+
+      - name: Build lint image cache
+        run: |
+          set -o xtrace
+          source ./ci/test/00_setup_env_base_image.sh
+          ci_set_base_image_name_tag "ubuntu:24.04"
+          read -r -a docker_build_cache_args <<< "$DOCKER_BUILD_CACHE_ARG"
+          docker buildx build -t "$CONTAINER_NAME" "${docker_build_cache_args[@]}" --build-arg "CI_IMAGE_NAME_TAG=${CI_IMAGE_NAME_TAG}" --file "./ci/lint_imagefile" .

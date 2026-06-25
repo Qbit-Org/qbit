@@ -42,8 +42,8 @@ python3 ci/scanners/run-scanners.py \
 
 Git-history scanners are intentionally bounded. The runner resolves
 `merge-base(--source-commit, --history-diff-base-ref)..--source-commit`; with
-the default `origin/main` base, scheduled `develop` runs scan the qbit
-`main...develop` history window instead of inherited upstream `main` history.
+the default `origin/main` base, scheduled `0.1.x` runs scan the qbit
+`main...0.1.x` history window instead of inherited upstream `main` history.
 
 ## Artifact Policy
 

@@ -1,0 +1,630 @@
+name: IBD Performance Benchmark
+run-name: >-
+  IBD perf (${{ github.event_name == 'schedule' && 'nightly' || inputs.profile }},
+  branch=${{ github.event_name == 'schedule' && '0.1.x' || github.ref_name }})
+
+on:
+  schedule:
+    - cron: '30 6 * * *'
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Benchmark profile to run
+        required: true
+        default: smoke
+        type: choice
+        options:
+          - smoke
+          - phase1-baseline
+          - phase1-baseline-full
+          - phase2-network
+          - phase2-network-full-month
+      runs_per_lane:
+        description: Optional runs-per-lane override; leave blank for the selected profile default
+        required: false
+        default: ""
+        type: string
+      blocks:
+        description: Optional measured-block override; leave blank for the selected profile default
+        required: false
+        default: ""
+        type: string
+      txs_per_block:
+        description: Optional MiniWallet proxy transactions per measured block; blank means 1
+        required: false
+        default: ""
+        type: string
+      p2mr_spends_per_block:
+        description: Optional W2 P2MR wallet spends per measured block; blank means 1
+        required: false
+        default: ""
+        type: string
+      tail_blocks:
+        description: Optional extra empty tail blocks after the measured history; blank means 0
+        required: false
+        default: ""
+        type: string
+      fastprune:
+        description: Use the selected profile default or explicitly set -fastprune
+        required: true
+        default: profile
+        type: choice
+        options:
+          - profile
+          - "true"
+          - "false"
+      enable_network_ibd:
+        description: Use the selected profile default or explicitly run the W3 localhost network IBD lane
+        required: true
+        default: profile
+        type: choice
+        options:
+          - profile
+          - "true"
+          - "false"
+      enable_tracing:
+        description: Capture optional ConnectBlock bpftrace artifacts for representative lanes
+        required: true
+        default: false
+        type: boolean
+      trace_threshold_ms:
+        description: Threshold in milliseconds for optional ConnectBlock tracing
+        required: true
+        default: "25"
+        type: string
+      bench_min_time_ms:
+        description: Optional minimum runtime for each hotspot benchmark in milliseconds; blank means 5000
+        required: false
+        default: ""
+        type: string
+      REPLAY_TIMEOUT:
+        description: Reserved for PR B --replay-timeout harness flag; leave blank until supported
+        required: false
+        default: ""
+        type: string
+      NETWORK_HEADERS_TIMEOUT:
+        description: Reserved for PR B --network-headers-timeout harness flag; leave blank until supported
+        required: false
+        default: ""
+        type: string
+      NETWORK_TIP_TIMEOUT:
+        description: Reserved for PR B --network-tip-timeout harness flag; leave blank until supported
+        required: false
+        default: ""
+        type: string
+      NETWORK_IBD_EXIT_TIMEOUT:
+        description: Reserved for PR B --network-ibd-exit-timeout harness flag; leave blank until supported
+        required: false
+        default: ""
+        type: string
+
+concurrency:
+  group: ibd-perf-${{ github.event_name == 'schedule' && 'nightly-0.1.x' || github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  ibd-perf:
+    name: IBD perf
+    runs-on: ${{ github.repository == 'Qbit-Org/qbit' && fromJSON('["self-hosted", "linux", "x64", "qbit-trusted-ci"]') || fromJSON('["self-hosted", "linux", "x64"]') }}
+    timeout-minutes: 720
+    env:
+      RUN_MODE: ${{ github.event_name == 'schedule' && 'nightly' || 'manual' }}
+      CHECKOUT_REF: ${{ github.event_name == 'schedule' && '0.1.x' || github.ref }}
+      BENCHMARK_REF_NAME: ${{ github.event_name == 'schedule' && '0.1.x' || github.ref_name }}
+      PERF_BUILD_DIR: ${{ github.workspace }}/build-perf
+      PERF_ARTIFACT_ROOT: ${{ github.workspace }}/build-perf-artifacts/ibd-perf-${{ github.run_id }}
+      SELECTED_PROFILE: ${{ github.event_name == 'schedule' && 'nightly-smoke' || inputs.profile }}
+      RUNS_PER_LANE: ${{ github.event_name != 'schedule' && inputs.runs_per_lane || '' }}
+      BLOCKS: ${{ github.event_name != 'schedule' && inputs.blocks || '' }}
+      TXS_PER_BLOCK: ${{ github.event_name != 'schedule' && inputs.txs_per_block || '' }}
+      P2MR_SPENDS_PER_BLOCK: ${{ github.event_name != 'schedule' && inputs.p2mr_spends_per_block || '' }}
+      TAIL_BLOCKS: ${{ github.event_name != 'schedule' && inputs.tail_blocks || '' }}
+      FASTPRUNE: ${{ github.event_name == 'schedule' && 'profile' || inputs.fastprune }}
+      ENABLE_HOTSPOT_BENCHES: true
+      ENABLE_REPLAY_LANES: true
+      ENABLE_NETWORK_IBD: ${{ github.event_name == 'schedule' && 'profile' || inputs.enable_network_ibd }}
+      ENABLE_TRACING: ${{ github.event_name == 'schedule' && 'false' || (inputs.enable_tracing && 'true' || 'false') }}
+      TRACE_THRESHOLD_MS: ${{ github.event_name != 'schedule' && inputs.trace_threshold_ms || '' }}
+      BENCH_MIN_TIME_MS: ${{ github.event_name != 'schedule' && inputs.bench_min_time_ms || '' }}
+      REPLAY_TIMEOUT: ${{ github.event_name != 'schedule' && inputs.REPLAY_TIMEOUT || '' }}
+      NETWORK_HEADERS_TIMEOUT: ${{ github.event_name != 'schedule' && inputs.NETWORK_HEADERS_TIMEOUT || '' }}
+      NETWORK_TIP_TIMEOUT: ${{ github.event_name != 'schedule' && inputs.NETWORK_TIP_TIMEOUT || '' }}
+      NETWORK_IBD_EXIT_TIMEOUT: ${{ github.event_name != 'schedule' && inputs.NETWORK_IBD_EXIT_TIMEOUT || '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+
+      - name: Resolve benchmark profile
+        run: |
+          set -euo pipefail
+
+          override_if_set() {
+            local target="$1"
+            local value="$2"
+            if [ -n "$value" ]; then
+              printf -v "$target" '%s' "$value"
+            fi
+          }
+
+          apply_bool_override() {
+            local target="$1"
+            local value="$2"
+            case "$value" in
+              ""|profile)
+                ;;
+              true|false)
+                printf -v "$target" '%s' "$value"
+                ;;
+              *)
+                echo "Unsupported boolean override '$value' for $target" >&2
+                exit 1
+                ;;
+            esac
+          }
+
+          effective_runs_per_lane="1"
+          effective_blocks="1001"
+          effective_txs_per_block="1"
+          effective_p2mr_spends_per_block="1"
+          effective_tail_blocks="0"
+          effective_fastprune="true"
+          effective_enable_hotspot_benches="true"
+          effective_enable_replay_lanes="true"
+          effective_enable_network_ibd="true"
+          effective_trace_threshold_ms="25"
+          effective_bench_min_time_ms="5000"
+          full_profile="false"
+
+          case "$SELECTED_PROFILE" in
+            smoke)
+              ;;
+            nightly-smoke)
+              effective_runs_per_lane="3"
+              ;;
+            phase1-baseline)
+              effective_runs_per_lane="1"
+              effective_blocks="10000"
+              effective_fastprune="false"
+              effective_enable_hotspot_benches="true"
+              effective_enable_replay_lanes="true"
+              effective_enable_network_ibd="false"
+              ;;
+            phase1-baseline-full)
+              effective_runs_per_lane="5"
+              effective_blocks="262800"
+              effective_fastprune="false"
+              effective_enable_hotspot_benches="true"
+              effective_enable_replay_lanes="true"
+              effective_enable_network_ibd="false"
+              full_profile="true"
+              ;;
+            phase2-network)
+              effective_runs_per_lane="1"
+              effective_blocks="10000"
+              effective_fastprune="false"
+              effective_enable_hotspot_benches="false"
+              effective_enable_replay_lanes="false"
+              effective_enable_network_ibd="true"
+              ;;
+            phase2-network-full-month)
+              effective_runs_per_lane="5"
+              effective_blocks="43200"
+              effective_fastprune="false"
+              effective_enable_hotspot_benches="false"
+              effective_enable_replay_lanes="false"
+              effective_enable_network_ibd="true"
+              full_profile="true"
+              ;;
+            *)
+              echo "Unsupported IBD benchmark profile: $SELECTED_PROFILE" >&2
+              exit 1
+              ;;
+          esac
+
+          if [ "$full_profile" != "true" ]; then
+            override_if_set effective_runs_per_lane "$RUNS_PER_LANE"
+            override_if_set effective_blocks "$BLOCKS"
+            apply_bool_override effective_fastprune "$FASTPRUNE"
+            apply_bool_override effective_enable_network_ibd "$ENABLE_NETWORK_IBD"
+          fi
+          override_if_set effective_txs_per_block "$TXS_PER_BLOCK"
+          override_if_set effective_p2mr_spends_per_block "$P2MR_SPENDS_PER_BLOCK"
+          override_if_set effective_tail_blocks "$TAIL_BLOCKS"
+          override_if_set effective_trace_threshold_ms "$TRACE_THRESHOLD_MS"
+          override_if_set effective_bench_min_time_ms "$BENCH_MIN_TIME_MS"
+
+          {
+            printf '%s\n' "RUNS_PER_LANE=$effective_runs_per_lane"
+            printf '%s\n' "BLOCKS=$effective_blocks"
+            printf '%s\n' "TXS_PER_BLOCK=$effective_txs_per_block"
+            printf '%s\n' "P2MR_SPENDS_PER_BLOCK=$effective_p2mr_spends_per_block"
+            printf '%s\n' "TAIL_BLOCKS=$effective_tail_blocks"
+            printf '%s\n' "FASTPRUNE=$effective_fastprune"
+            printf '%s\n' "ENABLE_HOTSPOT_BENCHES=$effective_enable_hotspot_benches"
+            printf '%s\n' "ENABLE_REPLAY_LANES=$effective_enable_replay_lanes"
+            printf '%s\n' "ENABLE_NETWORK_IBD=$effective_enable_network_ibd"
+            printf '%s\n' "TRACE_THRESHOLD_MS=$effective_trace_threshold_ms"
+            printf '%s\n' "BENCH_MIN_TIME_MS=$effective_bench_min_time_ms"
+          } >> "$GITHUB_ENV"
+
+      - name: Install dependencies
+        env:
+          INSTALL_BPFTRACE: ${{ env.ENABLE_TRACING }}
+        run: |
+          ci/install-perf-dependencies.sh
+
+      - name: Capture host metadata
+        run: |
+          mkdir -p "$PERF_ARTIFACT_ROOT"/bench "$PERF_ARTIFACT_ROOT"/replay "$PERF_ARTIFACT_ROOT"/network "$PERF_ARTIFACT_ROOT"/summary
+          {
+            echo "timestamp_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "git_commit=$(git rev-parse HEAD)"
+            echo "github_repository=${GITHUB_REPOSITORY}"
+            echo "github_workflow=${GITHUB_WORKFLOW}"
+            echo "github_run_id=${GITHUB_RUN_ID}"
+            echo "github_run_number=${GITHUB_RUN_NUMBER}"
+            echo "github_run_attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "workflow_event=${GITHUB_EVENT_NAME}"
+            echo "benchmark_mode=${RUN_MODE}"
+            echo "github_ref=${GITHUB_REF}"
+            echo "github_ref_name=${GITHUB_REF_NAME}"
+            echo "checkout_ref=${CHECKOUT_REF}"
+            echo "benchmark_ref_name=${BENCHMARK_REF_NAME}"
+            echo "profile=${SELECTED_PROFILE}"
+            echo "runs_per_lane=${RUNS_PER_LANE}"
+            echo "blocks=${BLOCKS}"
+            echo "txs_per_block=${TXS_PER_BLOCK}"
+            echo "p2mr_spends_per_block=${P2MR_SPENDS_PER_BLOCK}"
+            echo "tail_blocks=${TAIL_BLOCKS}"
+            echo "fastprune=${FASTPRUNE}"
+            echo "enable_hotspot_benches=${ENABLE_HOTSPOT_BENCHES}"
+            echo "enable_replay_lanes=${ENABLE_REPLAY_LANES}"
+            echo "enable_network_ibd=${ENABLE_NETWORK_IBD}"
+            echo "enable_tracing=${ENABLE_TRACING}"
+            echo "trace_threshold_ms=${TRACE_THRESHOLD_MS}"
+            echo "bench_min_time_ms=${BENCH_MIN_TIME_MS}"
+            echo "replay_timeout=${REPLAY_TIMEOUT}"
+            echo "network_headers_timeout=${NETWORK_HEADERS_TIMEOUT}"
+            echo "network_tip_timeout=${NETWORK_TIP_TIMEOUT}"
+            echo "network_ibd_exit_timeout=${NETWORK_IBD_EXIT_TIMEOUT}"
+            echo "runner_name=${RUNNER_NAME}"
+            echo "runner_arch=${RUNNER_ARCH}"
+            echo "kernel=$(uname -srmo)"
+          } > "$PERF_ARTIFACT_ROOT/summary/host.env"
+          {
+            uname -a
+            echo
+            cat /etc/os-release || true
+            echo
+            lscpu || true
+            echo
+            free -h || true
+            echo
+            df -h || true
+          } > "$PERF_ARTIFACT_ROOT/summary/host.txt"
+
+      - name: Configure build
+        run: |
+          CC=clang-16 CXX='clang++-16 -stdlib=libc++' \
+          cmake -B "$PERF_BUILD_DIR" -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DBUILD_BENCH=ON \
+            -DENABLE_IPC=OFF \
+            -DWITH_USDT=ON
+
+      - name: Build perf targets
+        run: |
+          cmake --build "$PERF_BUILD_DIR" -j"$(nproc)" \
+            --target qbitd qbit-cli bench_bitcoin
+
+      - name: Prepare tracing compatibility path
+        if: ${{ env.ENABLE_TRACING == 'true' }}
+        run: |
+          mkdir -p build/bin
+          ln -sf "$PERF_BUILD_DIR/bin/qbitd" build/bin/qbitd
+
+      - name: Run perf harness validation
+        run: |
+          python3 test/functional/feature_ibd_perf_validation.py \
+            --configfile="$PERF_BUILD_DIR/test/config.ini"
+
+      - name: Run hotspot microbenchmarks
+        run: |
+          set -euo pipefail
+          if [ "$ENABLE_HOTSPOT_BENCHES" != "true" ]; then
+            echo "Hotspot microbenchmarks disabled for profile $SELECTED_PROFILE"
+            exit 0
+          fi
+
+          for run in $(seq 1 "$RUNS_PER_LANE"); do
+            "$PERF_BUILD_DIR"/bin/bench_qbit \
+              -filter='PQCVerify|VerifyScriptP2MRChecksigPQC' \
+              -min-time="$BENCH_MIN_TIME_MS" \
+              -output-json="$PERF_ARTIFACT_ROOT/bench/hotspots-run${run}.json" \
+              -output-csv="$PERF_ARTIFACT_ROOT/bench/hotspots-run${run}.csv"
+          done
+
+      - name: Run IBD lanes
+        run: |
+          set -euo pipefail
+          ulimit -n 10240
+
+          effective_witness_tail="$TAIL_BLOCKS"
+          required_tail=$((1002 - BLOCKS))
+          if [ "$required_tail" -gt "$effective_witness_tail" ]; then
+            effective_witness_tail="$required_tail"
+          fi
+          if [ "$effective_witness_tail" -lt 0 ]; then
+            effective_witness_tail=0
+          fi
+          echo "effective_witness_tail_blocks=$effective_witness_tail" \
+            > "$PERF_ARTIFACT_ROOT/summary/replay-parameters.env"
+
+          run_replay() {
+            local workload="$1"
+            local history_mode="$2"
+            local reindex_mode="$3"
+            local run_id="$4"
+            local tail_blocks="$TAIL_BLOCKS"
+            local report_name="${workload}-${history_mode}-${reindex_mode}-run${run_id}.json"
+            local trace_file=""
+            local cmd=()
+
+            if [ "$history_mode" = "witness-pruned" ]; then
+              tail_blocks="$effective_witness_tail"
+            fi
+
+            if [ "$ENABLE_TRACING" = "true" ] && [ "$workload" = "w2-replay-mixed" ] && [ "$reindex_mode" = "full" ]; then
+              trace_file="$PERF_ARTIFACT_ROOT/replay/${workload}-${history_mode}-${reindex_mode}-run${run_id}.trace.txt"
+            fi
+
+            echo "=== replay ${workload} ${history_mode} ${reindex_mode} run ${run_id} ==="
+            cmd=(
+              python3 test/functional/feature_ibd_perf_replay.py
+              --configfile="$PERF_BUILD_DIR/test/config.ini"
+              --blocks="$BLOCKS"
+              --workload="$workload"
+              --txs-per-block="$TXS_PER_BLOCK"
+              --p2mr-spends-per-block="$P2MR_SPENDS_PER_BLOCK"
+              --tail-blocks="$tail_blocks"
+              --history-mode="$history_mode"
+              --reindex-mode="$reindex_mode"
+              --report-file="$PERF_ARTIFACT_ROOT/replay/$report_name"
+              --connectblock-threshold-ms="$TRACE_THRESHOLD_MS"
+            )
+            if [ -n "$trace_file" ]; then
+              cmd+=(--connectblock-trace-file="$trace_file")
+            fi
+            if [ "$FASTPRUNE" = "true" ]; then
+              cmd+=(--fastprune)
+            fi
+            "${cmd[@]}"
+          }
+
+          run_network() {
+            local workload="$1"
+            local run_id="$2"
+            local report_name="w3-network-${workload}-run${run_id}.json"
+            local trace_file=""
+            local cmd=()
+
+            if [ "$ENABLE_TRACING" = "true" ]; then
+              trace_file="$PERF_ARTIFACT_ROOT/network/${workload}-run${run_id}.trace.txt"
+            fi
+
+            mkdir -p "$PERF_ARTIFACT_ROOT/network"
+            echo "=== network ${workload} run ${run_id} ==="
+            cmd=(
+              python3 test/functional/feature_ibd_perf_network.py
+              --configfile="$PERF_BUILD_DIR/test/config.ini"
+              --blocks="$BLOCKS"
+              --workload="$workload"
+              --txs-per-block="$TXS_PER_BLOCK"
+              --p2mr-spends-per-block="$P2MR_SPENDS_PER_BLOCK"
+              --lane-name="w3-network-mixed"
+              --report-file="$PERF_ARTIFACT_ROOT/network/$report_name"
+              --connectblock-threshold-ms="$TRACE_THRESHOLD_MS"
+            )
+            if [ -n "$trace_file" ]; then
+              cmd+=(--connectblock-trace-file="$trace_file")
+            fi
+            if [ "$FASTPRUNE" = "true" ]; then
+              cmd+=(--fastprune)
+            fi
+            "${cmd[@]}"
+          }
+
+          for run in $(seq 1 "$RUNS_PER_LANE"); do
+            if [ "$ENABLE_REPLAY_LANES" = "true" ]; then
+              run_replay w1-replay-floor archive chainstate "$run"
+              run_replay w1-replay-floor archive full "$run"
+              run_replay w1-replay-floor witness-pruned chainstate "$run"
+              run_replay w2-replay-mixed archive chainstate "$run"
+              run_replay w2-replay-mixed archive full "$run"
+              run_replay w2-replay-mixed witness-pruned chainstate "$run"
+            fi
+            if [ "$ENABLE_NETWORK_IBD" = "true" ]; then
+              run_network w2-replay-mixed "$run"
+            fi
+          done
+
+      - name: Summarize perf results
+        run: |
+          python3 contrib/devtools/summarize_ibd_perf.py "$PERF_ARTIFACT_ROOT"
+          cp "$PERF_ARTIFACT_ROOT/summary/ibd-baseline-summary.md" \
+            "$PERF_ARTIFACT_ROOT/summary/perf-summary.md"
+          cp "$PERF_ARTIFACT_ROOT/summary/ibd-baseline-summary.md" \
+            "$PERF_ARTIFACT_ROOT/summary/replay-summary.md"
+          cat "$PERF_ARTIFACT_ROOT/summary/perf-summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record perf artifact manifest
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p "$PERF_ARTIFACT_ROOT/summary"
+          manifest="$PERF_ARTIFACT_ROOT/summary/artifact-manifest.txt"
+          {
+            echo "# IBD perf artifact manifest"
+            echo "generated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "artifact_root=$PERF_ARTIFACT_ROOT"
+            echo
+            echo "## top-level sizes"
+            du -sh "$PERF_ARTIFACT_ROOT" \
+              "$PERF_ARTIFACT_ROOT"/summary \
+              "$PERF_ARTIFACT_ROOT"/bench \
+              "$PERF_ARTIFACT_ROOT"/replay \
+              "$PERF_ARTIFACT_ROOT"/network 2>/dev/null || true
+            echo
+            echo "## file counts"
+            for dir in summary bench replay network; do
+              path="$PERF_ARTIFACT_ROOT/$dir"
+              if [ -d "$path" ]; then
+                printf '%s\t%s\n' "$dir" "$(find "$path" -type f | wc -l)"
+              else
+                printf '%s\t0\n' "$dir"
+              fi
+            done
+            echo
+            echo "## all artifact files"
+            if [ -d "$PERF_ARTIFACT_ROOT" ]; then
+              du -ah "$PERF_ARTIFACT_ROOT" | sort -h
+            fi
+          } | tee "$manifest"
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            {
+              echo
+              echo "## Artifact upload manifest"
+              echo
+              echo "Artifact uploads are best-effort; if GitHub artifact storage stalls, use this summary and the manifest log for the benchmark evidence."
+              echo
+              echo '```'
+              awk '/^## all artifact files$/ { exit } { print }' "$manifest"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload perf summary artifact
+        id: upload_perf_summary_artifact
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ibd-perf-${{ github.run_id }}-summary
+          path: |
+            ${{ env.PERF_ARTIFACT_ROOT }}/*
+            !${{ env.PERF_ARTIFACT_ROOT }}/bench
+            !${{ env.PERF_ARTIFACT_ROOT }}/bench/**
+            !${{ env.PERF_ARTIFACT_ROOT }}/replay
+            !${{ env.PERF_ARTIFACT_ROOT }}/replay/**
+            !${{ env.PERF_ARTIFACT_ROOT }}/network
+            !${{ env.PERF_ARTIFACT_ROOT }}/network/**
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
+
+      - name: Upload perf benchmark artifacts
+        id: upload_perf_benchmark_artifacts
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ibd-perf-${{ github.run_id }}-bench
+          path: |
+            ${{ env.PERF_ARTIFACT_ROOT }}/*
+            !${{ env.PERF_ARTIFACT_ROOT }}/summary
+            !${{ env.PERF_ARTIFACT_ROOT }}/summary/**
+            !${{ env.PERF_ARTIFACT_ROOT }}/replay
+            !${{ env.PERF_ARTIFACT_ROOT }}/replay/**
+            !${{ env.PERF_ARTIFACT_ROOT }}/network
+            !${{ env.PERF_ARTIFACT_ROOT }}/network/**
+          if-no-files-found: ignore
+          retention-days: 30
+          overwrite: true
+
+      - name: Upload perf replay artifacts
+        id: upload_perf_replay_artifacts
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ibd-perf-${{ github.run_id }}-replay
+          path: |
+            ${{ env.PERF_ARTIFACT_ROOT }}/*
+            !${{ env.PERF_ARTIFACT_ROOT }}/summary
+            !${{ env.PERF_ARTIFACT_ROOT }}/summary/**
+            !${{ env.PERF_ARTIFACT_ROOT }}/bench
+            !${{ env.PERF_ARTIFACT_ROOT }}/bench/**
+            !${{ env.PERF_ARTIFACT_ROOT }}/network
+            !${{ env.PERF_ARTIFACT_ROOT }}/network/**
+          if-no-files-found: ignore
+          retention-days: 30
+          overwrite: true
+
+      - name: Retry perf replay artifact upload
+        id: retry_perf_replay_artifacts
+        if: always() && steps.upload_perf_replay_artifacts.outcome != 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ibd-perf-${{ github.run_id }}-replay
+          path: |
+            ${{ env.PERF_ARTIFACT_ROOT }}/*
+            !${{ env.PERF_ARTIFACT_ROOT }}/summary
+            !${{ env.PERF_ARTIFACT_ROOT }}/summary/**
+            !${{ env.PERF_ARTIFACT_ROOT }}/bench
+            !${{ env.PERF_ARTIFACT_ROOT }}/bench/**
+            !${{ env.PERF_ARTIFACT_ROOT }}/network
+            !${{ env.PERF_ARTIFACT_ROOT }}/network/**
+          if-no-files-found: ignore
+          retention-days: 30
+          overwrite: true
+
+      - name: Upload perf network artifacts
+        id: upload_perf_network_artifacts
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ibd-perf-${{ github.run_id }}-network
+          path: |
+            ${{ env.PERF_ARTIFACT_ROOT }}/*
+            !${{ env.PERF_ARTIFACT_ROOT }}/summary
+            !${{ env.PERF_ARTIFACT_ROOT }}/summary/**
+            !${{ env.PERF_ARTIFACT_ROOT }}/bench
+            !${{ env.PERF_ARTIFACT_ROOT }}/bench/**
+            !${{ env.PERF_ARTIFACT_ROOT }}/replay
+            !${{ env.PERF_ARTIFACT_ROOT }}/replay/**
+          if-no-files-found: ignore
+          retention-days: 30
+          overwrite: true
+
+      - name: Record perf artifact upload status
+        if: always()
+        run: |
+          {
+            echo
+            echo "## Artifact upload status"
+            echo
+            echo "| artifact | status |"
+            echo "| --- | --- |"
+            echo "| summary | ${{ steps.upload_perf_summary_artifact.outcome }} |"
+            echo "| bench | ${{ steps.upload_perf_benchmark_artifacts.outcome }} |"
+            echo "| replay | ${{ steps.upload_perf_replay_artifacts.outcome }} |"
+            echo "| replay retry | ${{ steps.retry_perf_replay_artifacts.outcome }} |"
+            echo "| network | ${{ steps.upload_perf_network_artifacts.outcome }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ steps.upload_perf_replay_artifacts.outcome }}" != "success" ] &&
+             [ "${{ steps.retry_perf_replay_artifacts.outcome }}" != "success" ]; then
+            echo "::warning title=Replay artifact upload unavailable::Replay evidence upload failed after retry; use the job summary and manifest log as preserved benchmark evidence."
+          fi

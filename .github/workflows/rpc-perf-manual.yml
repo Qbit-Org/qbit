@@ -1,0 +1,224 @@
+name: RPC Performance Benchmark
+run-name: >-
+  RPC perf (${{ github.event_name == 'schedule' && 'nightly' || 'manual' }},
+  scale=${{ github.event_name == 'schedule' && '1.0' || inputs.run_scale }},
+  ref=${{ github.event_name == 'schedule' && 'v30.2' || inputs.reference_ref }},
+  branch=${{ github.event_name == 'schedule' && '0.1.x' || github.ref_name }})
+
+on:
+  schedule:
+    - cron: '30 4 * * *'
+  workflow_dispatch:
+    inputs:
+      run_scale:
+        description: Scale manifest run counts for smoke runs or deeper sampling
+        required: true
+        default: "1.0"
+        type: string
+      benchmark_filter:
+        description: Optional regex to select benchmark ids
+        required: false
+        default: ""
+        type: string
+      include_reference:
+        description: Build Bitcoin Core v30.2 and run the shared-endpoint comparison lane
+        required: true
+        default: true
+        type: boolean
+      reference_ref:
+        description: Bitcoin Core tag or branch to benchmark against
+        required: true
+        default: "v30.2"
+        type: string
+
+concurrency:
+  group: rpc-perf-${{ github.event_name == 'schedule' && 'nightly-0.1.x' || github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  rpc-perf:
+    name: RPC perf
+    runs-on: ${{ github.repository == 'Qbit-Org/qbit' && fromJSON('["self-hosted", "linux", "x64", "qbit-trusted-ci"]') || fromJSON('["self-hosted", "linux", "x64"]') }}
+    timeout-minutes: 720
+    env:
+      RUN_MODE: ${{ github.event_name == 'schedule' && 'nightly' || 'manual' }}
+      CHECKOUT_REF: ${{ github.event_name == 'schedule' && '0.1.x' || github.ref }}
+      BENCHMARK_REF_NAME: ${{ github.event_name == 'schedule' && '0.1.x' || github.ref_name }}
+      PERF_BUILD_DIR: ${{ github.workspace }}/build-rpc-perf
+      PERF_ARTIFACT_ROOT: ${{ github.workspace }}/build-rpc-perf-artifacts/rpc-perf-${{ github.run_id }}
+      REFERENCE_REPO: https://github.com/bitcoin/bitcoin.git
+      REFERENCE_ROOT: ${{ github.workspace }}/build-rpc-perf-reference/bitcoin-core-reference
+      REFERENCE_BUILD_DIR: ${{ github.workspace }}/build-rpc-perf-reference/bitcoin-core-reference/build
+      RUN_SCALE: ${{ github.event_name == 'schedule' && '1.0' || inputs.run_scale }}
+      BENCHMARK_FILTER: ${{ github.event_name != 'schedule' && inputs.benchmark_filter || '' }}
+      INCLUDE_REFERENCE: ${{ github.event_name == 'schedule' && 'true' || inputs.include_reference }}
+      REFERENCE_REF: ${{ github.event_name == 'schedule' && 'v30.2' || inputs.reference_ref }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: ci/install-perf-dependencies.sh
+
+      - name: Capture host metadata
+        run: |
+          mkdir -p \
+            "$PERF_ARTIFACT_ROOT"/qbit-only \
+            "$PERF_ARTIFACT_ROOT"/compare \
+            "$PERF_ARTIFACT_ROOT"/summary
+          {
+            echo "timestamp_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "git_commit=$(git rev-parse HEAD)"
+            echo "github_repository=${GITHUB_REPOSITORY}"
+            echo "github_workflow=${GITHUB_WORKFLOW}"
+            echo "github_run_id=${GITHUB_RUN_ID}"
+            echo "github_run_number=${GITHUB_RUN_NUMBER}"
+            echo "github_run_attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "workflow_event=${GITHUB_EVENT_NAME}"
+            echo "benchmark_mode=${RUN_MODE}"
+            echo "github_ref=${GITHUB_REF}"
+            echo "github_ref_name=${GITHUB_REF_NAME}"
+            echo "checkout_ref=${CHECKOUT_REF}"
+            echo "benchmark_ref_name=${BENCHMARK_REF_NAME}"
+            echo "runner_name=${RUNNER_NAME}"
+            echo "runner_arch=${RUNNER_ARCH}"
+            echo "kernel=$(uname -srmo)"
+            echo "manifest_sha256=$(sha256sum test/functional/data/rpc_perf_manifest.json | awk '{print $1}')"
+            echo "run_scale=${RUN_SCALE}"
+            echo "benchmark_filter=${BENCHMARK_FILTER}"
+            echo "include_reference=${INCLUDE_REFERENCE}"
+            echo "reference_ref=${REFERENCE_REF}"
+          } > "$PERF_ARTIFACT_ROOT/summary/host.env"
+          {
+            uname -a
+            echo
+            cat /etc/os-release || true
+            echo
+            lscpu || true
+            echo
+            free -h || true
+            echo
+            df -h || true
+          } > "$PERF_ARTIFACT_ROOT/summary/host.txt"
+
+      - name: Configure qbit build
+        run: |
+          CC=clang-16 CXX='clang++-16 -stdlib=libc++' \
+          cmake -B "$PERF_BUILD_DIR" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_IPC=OFF
+
+      - name: Build qbit RPC targets
+        run: |
+          cmake --build "$PERF_BUILD_DIR" -j"$(nproc)" \
+            --target qbitd qbit-cli
+          "$PERF_BUILD_DIR/bin/qbitd" -version > "$PERF_ARTIFACT_ROOT/summary/qbit-version.txt"
+
+      - name: Checkout Bitcoin Core reference
+        if: ${{ env.INCLUDE_REFERENCE == 'true' }}
+        run: |
+          if [ -e "$REFERENCE_ROOT" ]; then
+            mv "$REFERENCE_ROOT" "${REFERENCE_ROOT}.stale-$(date +%Y%m%d-%H%M%S)"
+          fi
+          git clone --branch "$REFERENCE_REF" --depth 1 --single-branch \
+            "$REFERENCE_REPO" "$REFERENCE_ROOT"
+
+      - name: Configure Bitcoin Core reference build
+        if: ${{ env.INCLUDE_REFERENCE == 'true' }}
+        run: |
+          CC=clang-16 CXX='clang++-16 -stdlib=libc++' \
+          cmake -S "$REFERENCE_ROOT" -B "$REFERENCE_BUILD_DIR" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_IPC=OFF \
+            -DBUILD_TESTS=OFF \
+            -DBUILD_GUI=OFF \
+            -DBUILD_BENCH=OFF \
+            -DBUILD_FUZZ_BINARY=OFF
+
+      - name: Build Bitcoin Core reference targets
+        if: ${{ env.INCLUDE_REFERENCE == 'true' }}
+        run: |
+          cmake --build "$REFERENCE_BUILD_DIR" -j"$(nproc)" \
+            --target bitcoind bitcoin-cli
+          "$REFERENCE_BUILD_DIR/bin/bitcoind" -version > "$PERF_ARTIFACT_ROOT/summary/reference-version.txt"
+
+      - name: Run qbit-only RPC benchmark
+        run: |
+          set -euo pipefail
+          ulimit -n 10240
+          filter_args=()
+          if [ -n "$BENCHMARK_FILTER" ]; then
+            filter_args+=(--benchmark-filter="$BENCHMARK_FILTER")
+          fi
+          python3 test/functional/feature_rpc_perf.py \
+            --configfile="$PERF_BUILD_DIR/test/config.ini" \
+            --run-scale="$RUN_SCALE" \
+            --no-reference \
+            "${filter_args[@]}" \
+            --report-file="$PERF_ARTIFACT_ROOT/qbit-only/feature-rpc-perf-report.json" \
+            --summary-file="$PERF_ARTIFACT_ROOT/qbit-only/feature-rpc-perf-summary.md" \
+            --inventory-file="$PERF_ARTIFACT_ROOT/qbit-only/feature-rpc-perf-inventory.json" \
+            --coverage-file="$PERF_ARTIFACT_ROOT/qbit-only/feature-rpc-perf-coverage.json"
+
+      - name: Run qbit vs Bitcoin Core RPC benchmark
+        if: ${{ env.INCLUDE_REFERENCE == 'true' }}
+        run: |
+          set -euo pipefail
+          ulimit -n 10240
+          filter_args=()
+          if [ -n "$BENCHMARK_FILTER" ]; then
+            filter_args+=(--benchmark-filter="$BENCHMARK_FILTER")
+          fi
+          python3 test/functional/feature_rpc_perf.py \
+            --configfile="$PERF_BUILD_DIR/test/config.ini" \
+            --run-scale="$RUN_SCALE" \
+            --reference-bin-dir="$REFERENCE_BUILD_DIR/bin" \
+            --reference-srcdir="$REFERENCE_ROOT" \
+            --reference-label="bitcoin-core-${REFERENCE_REF}" \
+            "${filter_args[@]}" \
+            --report-file="$PERF_ARTIFACT_ROOT/compare/feature-rpc-perf-report.json" \
+            --summary-file="$PERF_ARTIFACT_ROOT/compare/feature-rpc-perf-summary.md" \
+            --inventory-file="$PERF_ARTIFACT_ROOT/compare/feature-rpc-perf-inventory.json" \
+            --coverage-file="$PERF_ARTIFACT_ROOT/compare/feature-rpc-perf-coverage.json"
+
+      - name: Append benchmark summaries
+        if: always()
+        run: |
+          {
+            echo "# RPC Performance Benchmark"
+            echo ""
+            echo "## Qbit Only"
+            if [ -f "$PERF_ARTIFACT_ROOT/qbit-only/feature-rpc-perf-summary.md" ]; then
+              tail -n +2 "$PERF_ARTIFACT_ROOT/qbit-only/feature-rpc-perf-summary.md"
+            else
+              echo "qbit-only summary missing"
+            fi
+            if [ "$INCLUDE_REFERENCE" = "true" ] && [ -f "$PERF_ARTIFACT_ROOT/compare/feature-rpc-perf-summary.md" ]; then
+              echo ""
+              echo "## Qbit vs Bitcoin Core ${REFERENCE_REF}"
+              tail -n +2 "$PERF_ARTIFACT_ROOT/compare/feature-rpc-perf-summary.md"
+            elif [ "$INCLUDE_REFERENCE" = "true" ]; then
+              echo ""
+              echo "## Qbit vs Bitcoin Core ${REFERENCE_REF}"
+              echo "comparison summary missing"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload RPC perf artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpc-perf-${{ github.run_id }}
+          path: ${{ env.PERF_ARTIFACT_ROOT }}
+          retention-days: 30
