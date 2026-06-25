@@ -111,12 +111,32 @@ class FeatureAuxPowTest(BitcoinTestFramework):
         self.log.info("submitauxblock rejects malformed AuxPoW hex")
         assert_raises_rpc_error(-22, "AuxPow decode failed", node.submitauxblock, aux_template["hash"], "zz")
 
+        self.log.info("submitauxblock rejects legacy AuxPoW payloads with mismatched hashBlock")
+        assert_raises_rpc_error(
+            -22,
+            "AuxPow decode failed",
+            node.submitauxblock,
+            aux_template["hash"],
+            self.make_auxpow(aux_template).to_legacy_hex(legacy_hash_block=42),
+        )
+
         self.log.info("Merged mining happy path: create, solve parent, submit")
         self.advance_mock_time()
         aux_template = node.createauxblock(payout_address)
         current_height = node.getblockcount()
         assert_equal(node.submitauxblock(aux_template["hash"], self.make_auxpow(aux_template).to_hex()), None)
         assert_equal(node.getblockcount(), current_height + 1)
+
+        self.log.info("submitauxblock accepts legacy AuxPoW payloads and stores canonical AuxPoW bytes")
+        self.advance_mock_time()
+        aux_template = node.createauxblock(payout_address)
+        legacy_auxpow = self.make_auxpow(aux_template)
+        current_height = node.getblockcount()
+        assert_equal(node.submitauxblock(aux_template["hash"], legacy_auxpow.to_legacy_hex()), None)
+        assert_equal(node.getblockcount(), current_height + 1)
+        raw_block = node.getblock(node.getbestblockhash(), 0)
+        assert legacy_auxpow.to_hex() in raw_block
+        assert legacy_auxpow.to_legacy_hex() not in raw_block
 
         self.log.info("getmininginfo.next follows the permissionless candidate after an AuxPoW tip")
         native_template = node.getblocktemplate(NORMAL_GBT_REQUEST_PARAMS)

@@ -6,8 +6,13 @@
 #define QBIT_RPC_MINING_H
 
 #include <cstdint>
+#include <string>
 
+class CAuxPow;
 class CChain;
+
+/** Decode the AuxPoW hex layouts accepted by the submitauxblock RPC. */
+CAuxPow DecodeHexAuxPow(const std::string& hex_auxpow);
 
 /**
  * Return average network hashes per second based on the last `lookup` blocks,

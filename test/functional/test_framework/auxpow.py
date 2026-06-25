@@ -132,8 +132,24 @@ class AuxPowPayload:
             + self.parent_block.serialize()
         )
 
+    def serialize_legacy(self, *, legacy_hash_block=None):
+        if legacy_hash_block is None:
+            legacy_hash_block = self.parent_block.hash_int
+        return (
+            self.coinbase_tx.serialize_without_witness()
+            + ser_uint256(legacy_hash_block)
+            + ser_uint256_vector(self.coinbase_merkle_branch)
+            + self.coinbase_branch_index.to_bytes(4, "little", signed=True)
+            + ser_uint256_vector(self.chain_merkle_branch)
+            + self.chain_index.to_bytes(4, "little", signed=True)
+            + self.parent_block.serialize()
+        )
+
     def to_hex(self):
         return self.serialize().hex()
+
+    def to_legacy_hex(self, *, legacy_hash_block=None):
+        return self.serialize_legacy(legacy_hash_block=legacy_hash_block).hex()
 
     def update_parent_merkle_root(self):
         self.parent_block.hashMerkleRoot = check_merkle_branch(

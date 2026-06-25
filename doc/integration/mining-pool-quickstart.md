@@ -148,6 +148,34 @@ Submit a solved AuxPoW payload:
 qbit-cli <chain option> submitauxblock "$AUX_HASH" "$AUXPOW_HEX"
 ```
 
+`AUXPOW_HEX` may use qbit's canonical AuxPoW layout:
+
+| Order | Field |
+|---:|---|
+| 1 | Parent coinbase transaction, serialized without witness |
+| 2 | Coinbase merkle branch |
+| 3 | Coinbase branch index, little-endian signed 32-bit integer |
+| 4 | Aux chain merkle branch |
+| 5 | Aux chain index, little-endian signed 32-bit integer |
+| 6 | Parent block header |
+
+For compatibility with Dogecoin/Namecoin-style AuxPoW serializers,
+`submitauxblock` also accepts this legacy layout:
+
+| Order | Field |
+|---:|---|
+| 1 | Parent coinbase transaction, serialized without witness |
+| 2 | Legacy `hashBlock` field |
+| 3 | Coinbase merkle branch |
+| 4 | Coinbase branch index, little-endian signed 32-bit integer |
+| 5 | Aux chain merkle branch |
+| 6 | Aux chain index, little-endian signed 32-bit integer |
+| 7 | Parent block header |
+
+The legacy `hashBlock` field must be zero or match the parent block header
+hash. qbit drops that compatibility field after RPC decoding, then stores,
+validates, and relays the block using qbit's canonical AuxPoW layout.
+
 `submitauxblock` returns `null` on acceptance. It returns a BIP22-style rejection string otherwise. A common stale result is `stale-prevblk`, which means the cached qbit candidate no longer builds on the active qbit tip, exceeded `-auxpowtemplateexpiry`, or was evicted by `-auxpowtemplatecachelimit`.
 
 ## Cadence lane resumption and monitoring

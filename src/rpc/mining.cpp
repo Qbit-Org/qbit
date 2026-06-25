@@ -1241,6 +1241,46 @@ void RemoveCachedAuxBlock(const uint256& aux_hash) LOCKS_EXCLUDED(g_aux_block_ca
     g_aux_block_cache.erase(aux_hash);
 }
 
+std::optional<CAuxPow> TryDecodeCanonicalAuxPow(std::span<const unsigned char> auxpow_data)
+{
+    DataStream stream{auxpow_data};
+    try {
+        CAuxPow auxpow{deserialize, stream};
+        if (!stream.empty()) {
+            return std::nullopt;
+        }
+        return auxpow;
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
+std::optional<CAuxPow> TryDecodeLegacyAuxPow(std::span<const unsigned char> auxpow_data)
+{
+    DataStream stream{auxpow_data};
+    try {
+        CAuxPow auxpow;
+        uint256 legacy_hash_block;
+        stream >> TX_NO_WITNESS(auxpow.coinbase_tx);
+        stream >> legacy_hash_block;
+        stream >> auxpow.coinbase_merkle_branch;
+        stream >> auxpow.coinbase_branch_index;
+        stream >> auxpow.chain_merkle_branch;
+        stream >> auxpow.chain_index;
+        stream >> auxpow.parent_block;
+        if (!stream.empty()) {
+            return std::nullopt;
+        }
+        if (!legacy_hash_block.IsNull() && legacy_hash_block != auxpow.parent_block.GetHash()) {
+            return std::nullopt;
+        }
+        return auxpow;
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+} // namespace
+
 CAuxPow DecodeHexAuxPow(const std::string& hex_auxpow)
 {
     if (!IsHex(hex_auxpow)) {
@@ -1248,18 +1288,17 @@ CAuxPow DecodeHexAuxPow(const std::string& hex_auxpow)
     }
 
     const std::vector<unsigned char> auxpow_data{ParseHex(hex_auxpow)};
-    DataStream stream{std::span<const unsigned char>{auxpow_data.data(), auxpow_data.size()}};
-    try {
-        CAuxPow auxpow{deserialize, stream};
-        if (!stream.empty()) {
-            throw std::ios_base::failure("AuxPow decode failed");
-        }
-        return auxpow;
-    } catch (const std::exception&) {
-        throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "AuxPow decode failed");
+    const std::span<const unsigned char> auxpow_span{auxpow_data.data(), auxpow_data.size()};
+    if (auto auxpow{TryDecodeCanonicalAuxPow(auxpow_span)}) {
+        return std::move(*auxpow);
     }
+    if (auto auxpow{TryDecodeLegacyAuxPow(auxpow_span)}) {
+        return std::move(*auxpow);
+    }
+    throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "AuxPow decode failed");
 }
 
+namespace {
 UniValue ProcessSubmittedBlock(ChainstateManager& chainman, const std::shared_ptr<CBlock>& blockptr)
 {
     bool new_block;
@@ -1380,7 +1419,7 @@ static RPCHelpMan submitauxblock()
         "Submit an AuxPoW payload for a cached merged-mining candidate block.\n",
         {
             {"hash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The aux block hash returned by createauxblock."},
-            {"auxpow_hex", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The serialized AuxPoW payload in hexadecimal."},
+            {"auxpow_hex", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The serialized AuxPoW payload in hexadecimal. Accepts qbit's canonical layout or a legacy Dogecoin-style payload."},
         },
         {
             RPCResult{"If the block was accepted", RPCResult::Type::NONE, "", ""},
