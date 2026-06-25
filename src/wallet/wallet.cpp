@@ -280,10 +280,18 @@ void WaitForDeleteWallet(std::shared_ptr<CWallet>&& wallet)
 bool IsAvailableWalletOutputType(const CWallet& wallet, OutputType type, bool internal)
 {
     LOCK(wallet.cs_wallet);
-    return IsWalletOutputTypeAllowed(type) || wallet.GetScriptPubKeyMan(type, internal) != nullptr;
+    return IsWalletOutputTypeAllowed(type) && wallet.GetScriptPubKeyMan(type, internal) != nullptr;
 }
 
 namespace {
+std::optional<bilingual_str> GetUnavailableWalletOutputError(OutputType type)
+{
+    if (IsWalletOutputTypeAllowed(type)) {
+        return std::nullopt;
+    }
+    return strprintf(_("Output type '%s' is not available on this chain"), FormatOutputType(type));
+}
+
 OutputType GetDefaultWalletAddressType(const CWallet& wallet)
 {
     LOCK(wallet.cs_wallet);
@@ -3248,6 +3256,9 @@ bool CWallet::IsPQCKeyValidationReadyForPrivateKeyUse() const
 util::Result<CTxDestination> CWallet::GetNewDestination(const OutputType type, const std::string label)
 {
     LOCK(cs_wallet);
+    if (const auto error{GetUnavailableWalletOutputError(type)}) {
+        return util::Error{*error};
+    }
     if (const auto error{GetInactiveP2MRWalletOutputError(*this, type)}) {
         return util::Error{*error};
     }
@@ -3331,6 +3342,9 @@ std::set<std::string> CWallet::ListAddrBookLabels(const std::optional<AddressPur
 
 util::Result<CTxDestination> ReserveDestination::GetReservedDestination(bool internal)
 {
+    if (const auto error{GetUnavailableWalletOutputError(type)}) {
+        return util::Error{*error};
+    }
     if (const auto error{GetInactiveP2MRWalletOutputError(*pwallet, type)}) {
         return util::Error{*error};
     }

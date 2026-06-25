@@ -792,11 +792,25 @@ BOOST_FIXTURE_TEST_CASE(DefaultAddressTypeUsesP2MROnRegtestP2MROnly, RegtestP2MR
     TestUnloadWallet(std::move(wallet));
 }
 
-BOOST_AUTO_TEST_CASE(WalletOutputAvailabilityAllowsChainTypesWithoutManagers)
+BOOST_FIXTURE_TEST_CASE(WalletOutputAvailabilityRequiresAllowedTypeAndManager, RegtestP2MROnlyWalletTestingSetup)
 {
-    CWallet wallet{m_node.chain.get(), "", CreateMockableWalletDatabase()};
-    BOOST_CHECK(wallet.GetActiveScriptPubKeyMans().empty());
-    BOOST_CHECK(IsAvailableWalletOutputType(wallet, OutputType::P2MR, /*internal=*/false));
+    CWallet bare_wallet{m_node.chain.get(), "", CreateMockableWalletDatabase()};
+    BOOST_CHECK(bare_wallet.GetActiveScriptPubKeyMans().empty());
+    BOOST_CHECK(!IsAvailableWalletOutputType(bare_wallet, OutputType::P2MR, /*internal=*/false));
+
+    m_args.ForceSetArg("-keypool", util::ToString(SINGLE_ADDRESS_KEYPOOL_SIZE));
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+
+    auto wallet = TestLoadWallet(context);
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_REQUIRE(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false));
+        BOOST_CHECK(IsAvailableWalletOutputType(*wallet, OutputType::P2MR, /*internal=*/false));
+        BOOST_CHECK(!IsAvailableWalletOutputType(*wallet, OutputType::LEGACY, /*internal=*/false));
+    }
+    TestUnloadWallet(std::move(wallet));
 }
 
 BOOST_AUTO_TEST_CASE(FreshWalletOnlyCreatesP2MRManagers)
