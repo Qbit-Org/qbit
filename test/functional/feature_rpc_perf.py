@@ -516,7 +516,9 @@ class RPCPerfTest(BitcoinTestFramework):
         mining_address = wallet.getnewaddress()
         node.generatetoaddress(COINBASE_MATURITY + WALLET_READY_MATURE_OUTPUTS, mining_address, called_by_framework=True)
 
-        receive_address = wallet.getnewaddress()
+        receive_label = "rpc-perf-receive"
+        receive_address = wallet.getnewaddress(receive_label)
+        receive_script_pubkey = wallet.getaddressinfo(receive_address)["scriptPubKey"]
         raw_tx = wallet.createrawtransaction([], [{receive_address: Decimal("0.10000000")}])
         funded_tx = wallet.fundrawtransaction(raw_tx)
         psbt = wallet.walletcreatefundedpsbt([], [{receive_address: Decimal("0.10000000")}])["psbt"]
@@ -528,7 +530,9 @@ class RPCPerfTest(BitcoinTestFramework):
             {
                 "wallet_name": wallet_name,
                 "wallet_rpc": wallet,
+                "receive_label": receive_label,
                 "receive_address": receive_address,
+                "receive_script_pubkey": receive_script_pubkey,
                 "raw_tx": raw_tx,
                 "funded_tx": funded_tx["hex"],
                 "psbt": psbt,
@@ -917,12 +921,74 @@ class RPCPerfTest(BitcoinTestFramework):
     def build_wallet_getaddressinfo(self, benchmark: BenchmarkCase, context: FixtureContext, sample_index: int, mode: str):
         return context.state["wallet_rpc"], "getaddressinfo", [context.state["receive_address"]]
 
+    def build_wallet_getwalletinfo(self, benchmark: BenchmarkCase, context: FixtureContext, sample_index: int, mode: str):
+        return context.state["wallet_rpc"], "getwalletinfo", []
+
+    def build_wallet_getbalance(self, benchmark: BenchmarkCase, context: FixtureContext, sample_index: int, mode: str):
+        return context.state["wallet_rpc"], "getbalance", []
+
+    def build_wallet_getbalances(self, benchmark: BenchmarkCase, context: FixtureContext, sample_index: int, mode: str):
+        return context.state["wallet_rpc"], "getbalances", []
+
+    def build_wallet_listunspent(self, benchmark: BenchmarkCase, context: FixtureContext, sample_index: int, mode: str):
+        return context.state["wallet_rpc"], "listunspent", []
+
+    def build_wallet_listtransactions(self, benchmark: BenchmarkCase, context: FixtureContext, sample_index: int, mode: str):
+        return context.state["wallet_rpc"], "listtransactions", []
+
+    def build_wallet_getaddressesbylabel(self, benchmark: BenchmarkCase, context: FixtureContext, sample_index: int, mode: str):
+        return context.state["wallet_rpc"], "getaddressesbylabel", [context.state["receive_label"]]
+
+    def build_wallet_listlabels(self, benchmark: BenchmarkCase, context: FixtureContext, sample_index: int, mode: str):
+        return context.state["wallet_rpc"], "listlabels", []
+
+    def build_wallet_listlockunspent(self, benchmark: BenchmarkCase, context: FixtureContext, sample_index: int, mode: str):
+        return context.state["wallet_rpc"], "listlockunspent", []
+
     def build_wallet_listdescriptors(self, benchmark: BenchmarkCase, context: FixtureContext, sample_index: int, mode: str):
         return context.state["wallet_rpc"], "listdescriptors", []
 
     def build_wallet_createwalletdescriptor(self, benchmark: BenchmarkCase, context: FixtureContext, sample_index: int, mode: str):
         descriptor_type = "p2mr" if context.plan.target == QBIT_TARGET else "bech32m"
         return context.state["wallet_rpc"], "createwalletdescriptor", [descriptor_type]
+
+    def build_wallet_createrawtransaction(self, benchmark: BenchmarkCase, context: FixtureContext, sample_index: int, mode: str):
+        return "createrawtransaction", [[], [{context.state["receive_address"]: Decimal("0.10000000")}]]
+
+    def build_wallet_createpsbt(self, benchmark: BenchmarkCase, context: FixtureContext, sample_index: int, mode: str):
+        return "createpsbt", [[], [{context.state["receive_address"]: Decimal("0.10000000")}]]
+
+    def build_wallet_fundrawtransaction(self, benchmark: BenchmarkCase, context: FixtureContext, sample_index: int, mode: str):
+        return context.state["wallet_rpc"], "fundrawtransaction", [
+            context.state["raw_tx"],
+            {"changeAddress": context.state["receive_address"], "changePosition": 1},
+        ]
+
+    def build_wallet_walletcreatefundedpsbt(self, benchmark: BenchmarkCase, context: FixtureContext, sample_index: int, mode: str):
+        return context.state["wallet_rpc"], "walletcreatefundedpsbt", [
+            [],
+            [{context.state["receive_address"]: Decimal("0.10000000")}],
+            0,
+            {"changeAddress": context.state["receive_address"], "changePosition": 1},
+        ]
+
+    def build_wallet_finalizepsbt(self, benchmark: BenchmarkCase, context: FixtureContext, sample_index: int, mode: str) -> tuple[str, list[Any]]:
+        return "finalizepsbt", [context.state["psbt"], False]
+
+    def build_wallet_decoderawtransaction(self, benchmark: BenchmarkCase, context: FixtureContext, sample_index: int, mode: str) -> tuple[str, list[Any]]:
+        return "decoderawtransaction", [context.state["raw_tx"]]
+
+    def build_wallet_decodescript(self, benchmark: BenchmarkCase, context: FixtureContext, sample_index: int, mode: str) -> tuple[str, list[Any]]:
+        return "decodescript", [context.state["receive_script_pubkey"]]
+
+    def build_wallet_utxoupdatepsbt(self, benchmark: BenchmarkCase, context: FixtureContext, sample_index: int, mode: str) -> tuple[str, list[Any]]:
+        return "utxoupdatepsbt", [context.state["psbt"]]
+
+    def build_wallet_combinepsbt(self, benchmark: BenchmarkCase, context: FixtureContext, sample_index: int, mode: str) -> tuple[str, list[Any]]:
+        return "combinepsbt", [[context.state["psbt"]]]
+
+    def build_wallet_converttopsbt(self, benchmark: BenchmarkCase, context: FixtureContext, sample_index: int, mode: str) -> tuple[str, list[Any]]:
+        return "converttopsbt", [context.state["raw_tx"]]
 
     def build_wallet_decodepsbt(self, benchmark: BenchmarkCase, context: FixtureContext, sample_index: int, mode: str) -> tuple[str, list[Any]]:
         return "decodepsbt", [context.state["psbt"]]

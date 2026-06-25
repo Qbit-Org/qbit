@@ -842,6 +842,176 @@
       "fixture_reset_mode": "none"
     },
     {
+      "id": "shared.modified.getwalletinfo.default",
+      "description": "Read metadata for the prepared wallet fixture.",
+      "endpoint": "getwalletinfo",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_getwalletinfo",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.getbalance.default",
+      "description": "Read the prepared wallet's confirmed balance.",
+      "endpoint": "getbalance",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_getbalance",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.getbalances.default",
+      "description": "Read detailed balance buckets for the prepared wallet fixture.",
+      "endpoint": "getbalances",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_getbalances",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.listunspent.default",
+      "description": "List spendable outputs in the prepared wallet fixture.",
+      "endpoint": "listunspent",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_listunspent",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.listtransactions.default",
+      "description": "List recent wallet transactions for the prepared wallet fixture.",
+      "endpoint": "listtransactions",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_listtransactions",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.listwallets.loaded",
+      "description": "List loaded wallets after preparing the wallet fixture.",
+      "endpoint": "listwallets",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "static_params",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.listwalletdir.default",
+      "description": "List available wallet directories after preparing the wallet fixture.",
+      "endpoint": "listwalletdir",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "static_params",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.getaddressesbylabel.receive",
+      "description": "List wallet addresses for the prepared receive label.",
+      "endpoint": "getaddressesbylabel",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_getaddressesbylabel",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.listlabels.default",
+      "description": "List labels in the prepared wallet fixture.",
+      "endpoint": "listlabels",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_listlabels",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.listlockunspent.default",
+      "description": "List locked wallet outputs in the prepared wallet fixture.",
+      "endpoint": "listlockunspent",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_listlockunspent",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
       "id": "shared.modified.listdescriptors.default",
       "description": "List wallet descriptors while recording qbit P2MR descriptor shape.",
       "endpoint": "listdescriptors",
@@ -865,6 +1035,176 @@
       "fixture": "wallet_ready",
       "lane": "shared_name_qbit_modified",
       "call_builder": "wallet_createwalletdescriptor",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.createrawtransaction.wallet_output",
+      "description": "Create an unsigned raw transaction paying the prepared wallet receive address.",
+      "endpoint": "createrawtransaction",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_createrawtransaction",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.createpsbt.wallet_output",
+      "description": "Create an unsigned PSBT paying the prepared wallet receive address.",
+      "endpoint": "createpsbt",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_createpsbt",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.fundrawtransaction.wallet",
+      "description": "Fund a prepared unsigned raw transaction with wallet inputs and a fixed change address.",
+      "endpoint": "fundrawtransaction",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_fundrawtransaction",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 3
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.walletcreatefundedpsbt.wallet",
+      "description": "Create and fund a wallet PSBT with a fixed change address.",
+      "endpoint": "walletcreatefundedpsbt",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_walletcreatefundedpsbt",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 3
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.finalizepsbt.incomplete",
+      "description": "Finalize the prepared unsigned wallet PSBT without extracting a transaction.",
+      "endpoint": "finalizepsbt",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_finalizepsbt",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.decoderawtransaction.wallet",
+      "description": "Decode the prepared unsigned wallet raw transaction.",
+      "endpoint": "decoderawtransaction",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_decoderawtransaction",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.decodescript.receive",
+      "description": "Decode the prepared receive address scriptPubKey.",
+      "endpoint": "decodescript",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_decodescript",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.utxoupdatepsbt.wallet",
+      "description": "Update the prepared wallet PSBT from available UTXO data.",
+      "endpoint": "utxoupdatepsbt",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_utxoupdatepsbt",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.combinepsbt.single",
+      "description": "Run the PSBT combiner over the prepared wallet PSBT.",
+      "endpoint": "combinepsbt",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_combinepsbt",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.converttopsbt.raw",
+      "description": "Convert the prepared unsigned raw transaction into PSBT format.",
+      "endpoint": "converttopsbt",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_converttopsbt",
       "target_support": [
         "qbit",
         "reference"
