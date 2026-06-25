@@ -28,6 +28,8 @@ env:
   CONTAINER_NAME: "bitcoin-linter-main"
   CI_IMAGE_REGISTRY_PREFIX: qbit-ci-autoscaler:5000/qbit-cache
   CI_ENFORCE_INTERNAL_REGISTRY: 1
+  CI_BUILDKIT_DNS_NAMESERVERS: ${{ github.repository == 'Qbit-Org/qbit' && '100.100.100.100' || '' }}
+  CI_BUILDKIT_DNS_SEARCH_DOMAINS: ${{ github.repository == 'Qbit-Org/qbit' && 'tailfa7aa.ts.net,localdomain' || '' }}
 
 jobs:
   prewarm:
