@@ -144,6 +144,10 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     // -blockversion=N to test forking scenarios
     if (chainparams.MineBlocksOnDemand()) {
         pblock->nVersion = gArgs.GetIntArg("-blockversion", pblock->nVersion);
+        // Permissionless templates do not carry an AuxPoW payload.
+        if (pblock->SignalsAuxpow()) {
+            pblock->nVersion = MakeVersion(/*chain_id=*/0, /*auxpow=*/false, pblock->GetVersionBits());
+        }
     }
 
     pblock->nTime = TicksSinceEpoch<std::chrono::seconds>(NodeClock::now());

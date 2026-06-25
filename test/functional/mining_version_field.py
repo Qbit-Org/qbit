@@ -167,6 +167,27 @@ class MiningVersionFieldTest(BitcoinTestFramework):
         self.restart_node(0)
         node = self.nodes[0]
 
+        self.log.info("Preserve version rolling for non-AuxPoW BIP9 -blockversion overrides")
+        bip9_override = make_version(version_bits=0x39)
+        self.restart_node(0, extra_args=[f"-blockversion={bip9_override}"])
+        node = self.nodes[0]
+        bip9_override_tmpl = node.getblocktemplate(NORMAL_GBT_REQUEST_PARAMS)
+        assert_equal(bip9_override_tmpl["version"], bip9_override)
+        assert_equal(bip9_override_tmpl["versionrollingmask"], f"{BLOCK_VERSION_PERMISSIONLESS_ROLLING_MASK:08x}")
+        self.restart_node(0)
+        node = self.nodes[0]
+
+        self.log.info("Sanitize AuxPoW-signalling BIP9 -blockversion overrides for permissionless templates")
+        auxpow_override = make_version(auxpow=True)
+        assert_equal(auxpow_override, 0x20000100)
+        self.restart_node(0, extra_args=[f"-blockversion={auxpow_override}"])
+        node = self.nodes[0]
+        auxpow_override_tmpl = node.getblocktemplate(NORMAL_GBT_REQUEST_PARAMS)
+        assert_equal(auxpow_override_tmpl["version"], make_version(auxpow=False))
+        assert_equal(auxpow_override_tmpl["versionrollingmask"], f"{BLOCK_VERSION_PERMISSIONLESS_ROLLING_MASK:08x}")
+        self.restart_node(0)
+        node = self.nodes[0]
+
         self.log.info("Reject versions with non-BIP9 top bits")
         bad_top_bits = 0x40000000 | signal_bits
         bad_top_bits_block = self.create_candidate_block(version=bad_top_bits)
