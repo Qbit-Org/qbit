@@ -55,27 +55,34 @@ RPCHelpMan getnewaddress()
 {
     std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return UniValue::VNULL;
+    WalletContext& context = EnsureWalletContext(request.context);
 
-    LOCK(pwallet->cs_wallet);
+    OutputType output_type;
+    UniValue encoded_dest;
+    {
+        LOCK(pwallet->cs_wallet);
 
-    if (!pwallet->CanGetAddresses()) {
-        throw JSONRPCError(RPC_WALLET_ERROR, "Error: This wallet has no available keys");
+        if (!pwallet->CanGetAddresses()) {
+            throw JSONRPCError(RPC_WALLET_ERROR, "Error: This wallet has no available keys");
+        }
+
+        // Parse the label first so we don't generate a key if there's an error
+        const std::string label{LabelFromValue(request.params[0])};
+
+        output_type = pwallet->m_default_address_type;
+        if (!request.params[1].isNull()) {
+            output_type = ParseWalletOutputType(*pwallet, request.params[1].get_str(), "address type", /*internal=*/false);
+        }
+
+        auto op_dest = pwallet->GetNewDestination(output_type, label);
+        if (!op_dest) {
+            throw JSONRPCError(RPC_WALLET_KEYPOOL_RAN_OUT, util::ErrorString(op_dest).original);
+        }
+        encoded_dest = UniValue{EncodeDestination(*op_dest)};
     }
 
-    // Parse the label first so we don't generate a key if there's an error
-    const std::string label{LabelFromValue(request.params[0])};
-
-    OutputType output_type = pwallet->m_default_address_type;
-    if (!request.params[1].isNull()) {
-        output_type = ParseWalletOutputType(*pwallet, request.params[1].get_str(), "address type", /*internal=*/false);
-    }
-
-    auto op_dest = pwallet->GetNewDestination(output_type, label);
-    if (!op_dest) {
-        throw JSONRPCError(RPC_WALLET_KEYPOOL_RAN_OUT, util::ErrorString(op_dest).original);
-    }
-
-    return EncodeDestination(*op_dest);
+    MaybeScheduleP2MRReceiveKeyPoolRefill(context, pwallet, output_type);
+    return encoded_dest;
 },
     };
 }

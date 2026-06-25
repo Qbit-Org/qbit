@@ -106,6 +106,7 @@ std::shared_ptr<CWallet> RestoreWallet(WalletContext& context, const fs::path& b
 std::unique_ptr<interfaces::Handler> HandleLoadWallet(WalletContext& context, LoadWalletFn load_wallet);
 void NotifyWalletLoaded(WalletContext& context, const std::shared_ptr<CWallet>& wallet);
 void SchedulePlaintextPQCKeyValidation(CScheduler& scheduler, const std::shared_ptr<CWallet>& wallet);
+void MaybeScheduleP2MRReceiveKeyPoolRefill(WalletContext& context, const std::shared_ptr<CWallet>& wallet, OutputType type);
 std::unique_ptr<WalletDatabase> MakeWalletDatabase(const std::string& name, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error);
 
 //! -paytxfee default
@@ -136,8 +137,6 @@ static const bool DEFAULT_SPEND_ZEROCONF_CHANGE = true;
 static const bool DEFAULT_WALLET_REJECT_LONG_CHAINS{true};
 //! -txconfirmtarget default
 static const unsigned int DEFAULT_TX_CONFIRM_TARGET = 6;
-//! Fresh P2MR wallets only need a few addresses immediately; refill the rest after creation.
-static constexpr unsigned int DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL = 16;
 //! -walletrbf default
 static const bool DEFAULT_WALLET_RBF = true;
 static const bool DEFAULT_WALLETBROADCAST = true;
@@ -822,6 +821,7 @@ public:
 
     /** Number of pre-generated keys/scripts by each spkm (part of the look-ahead process, used to detect payments) */
     int64_t m_keypool_size{DEFAULT_KEYPOOL_SIZE};
+    bool m_p2mr_receive_keypool_refill_scheduled GUARDED_BY(cs_wallet){false};
 
     /** Notify external script when a wallet transaction comes in or is updated (handled by -walletnotify) */
     std::string m_notify_tx_changed_script;
@@ -837,6 +837,12 @@ public:
     };
     PendingInitialKeyPoolTopUpStepResult RunPendingInitialKeyPoolTopUpStep();
     bool RunPendingInitialKeyPoolTopUp();
+    enum class P2MRReceiveKeyPoolRefillStepResult {
+        COMPLETE,
+        PENDING,
+        FAILED,
+    };
+    P2MRReceiveKeyPoolRefillStepResult RunP2MRReceiveKeyPoolRefillStep();
 
     enum class PlaintextPQCKeyValidationStepResult {
         COMPLETE,

@@ -331,6 +331,13 @@ struct DeferredCreateKeyPoolTopUpState {
     std::optional<SteadyClock::time_point> refill_start;
 };
 
+struct P2MRReceiveKeyPoolRefillState {
+    std::weak_ptr<CWallet> wallet;
+    CScheduler* scheduler;
+    int remaining_steps;
+    std::optional<SteadyClock::time_point> refill_start;
+};
+
 struct PlaintextPQCKeyValidationState {
     std::weak_ptr<CWallet> wallet;
     CScheduler* scheduler;
@@ -382,6 +389,74 @@ void SchedulePendingInitialKeyPoolTopUp(WalletContext& context, const std::share
     // Let wallet creation return and the first address calls finish before background
     // PQC derivation starts competing for CPU.
     context.scheduler->scheduleFromNow([state] { RunScheduledPendingInitialKeyPoolTopUp(state); }, std::chrono::seconds{30});
+}
+
+void RunScheduledP2MRReceiveKeyPoolRefill(const std::shared_ptr<P2MRReceiveKeyPoolRefillState>& state)
+{
+    auto wallet = state->wallet.lock();
+    if (!wallet) {
+        return;
+    }
+    if (!state->refill_start) {
+        state->refill_start = SteadyClock::now();
+    }
+    const auto step_result = wallet->RunP2MRReceiveKeyPoolRefillStep();
+    if (step_result == CWallet::P2MRReceiveKeyPoolRefillStepResult::COMPLETE) {
+        wallet->WalletLogPrintf("P2MR receive keypool low-watermark refill completed in %15dms\n",
+            Ticks<std::chrono::milliseconds>(SteadyClock::now() - *state->refill_start));
+        return;
+    }
+    if (step_result == CWallet::P2MRReceiveKeyPoolRefillStepResult::FAILED) {
+        wallet->WalletLogPrintf("P2MR receive keypool low-watermark refill paused after a failed background step\n");
+        return;
+    }
+    if (wallet->IsLocked() || wallet->HasPendingInitialKeyPoolTopUp()) {
+        LOCK(wallet->cs_wallet);
+        wallet->m_p2mr_receive_keypool_refill_scheduled = false;
+        return;
+    }
+    if (--state->remaining_steps == 0) {
+        wallet->WalletLogPrintf("P2MR receive keypool low-watermark refill batch exhausted after %d steps, continuing in background\n",
+            GetDeferredCreateKeyPoolTopUpStepsPerBatch());
+        state->remaining_steps = GetDeferredCreateKeyPoolTopUpStepsPerBatch();
+    }
+    state->scheduler->scheduleFromNow([state] { RunScheduledP2MRReceiveKeyPoolRefill(state); }, std::chrono::milliseconds{1});
+}
+
+void MaybeScheduleP2MRReceiveKeyPoolRefillInternal(WalletContext& context, const std::shared_ptr<CWallet>& wallet, OutputType type)
+{
+    if (!context.scheduler || type != OutputType::P2MR) {
+        return;
+    }
+
+    unsigned int remaining{0};
+    unsigned int low_watermark{0};
+    uint256 descriptor_id;
+    {
+        LOCK(wallet->cs_wallet);
+        if (wallet->m_p2mr_receive_keypool_refill_scheduled || wallet->IsLocked() || wallet->HasPendingInitialKeyPoolTopUp()) {
+            return;
+        }
+        auto* desc_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false));
+        if (!desc_spk_man || !desc_spk_man->NeedsP2MRReceiveKeyPoolRefill()) {
+            return;
+        }
+        remaining = desc_spk_man->GetKeyPoolSize();
+        low_watermark = desc_spk_man->GetP2MRReceiveKeyPoolLowWatermark();
+        descriptor_id = desc_spk_man->GetID();
+        wallet->m_p2mr_receive_keypool_refill_scheduled = true;
+    }
+
+    wallet->WalletLogPrintf("P2MR receive keypool reached low-watermark; scheduling background refill (descriptor id %s, remaining=%u, low_watermark=%u)\n",
+        descriptor_id.ToString(), remaining, low_watermark);
+
+    auto state = std::make_shared<P2MRReceiveKeyPoolRefillState>(P2MRReceiveKeyPoolRefillState{
+        .wallet = wallet,
+        .scheduler = context.scheduler,
+        .remaining_steps = GetDeferredCreateKeyPoolTopUpStepsPerBatch(),
+        .refill_start = std::nullopt,
+    });
+    context.scheduler->scheduleFromNow([state] { RunScheduledP2MRReceiveKeyPoolRefill(state); }, std::chrono::milliseconds{1});
 }
 
 void RunScheduledPlaintextPQCKeyValidation(const std::shared_ptr<PlaintextPQCKeyValidationState>& state)
@@ -513,6 +588,11 @@ private:
 void SchedulePlaintextPQCKeyValidation(CScheduler& scheduler, const std::shared_ptr<CWallet>& wallet)
 {
     SchedulePlaintextPQCKeyValidationInternal(scheduler, wallet);
+}
+
+void MaybeScheduleP2MRReceiveKeyPoolRefill(WalletContext& context, const std::shared_ptr<CWallet>& wallet, OutputType type)
+{
+    MaybeScheduleP2MRReceiveKeyPoolRefillInternal(context, wallet, type);
 }
 
 std::shared_ptr<CWallet> LoadWallet(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings)
@@ -3154,6 +3234,45 @@ bool CWallet::RunPendingInitialKeyPoolTopUp()
         complete ? "completed" : "did not complete",
         Ticks<std::chrono::milliseconds>(SteadyClock::now() - start));
     return complete;
+}
+
+CWallet::P2MRReceiveKeyPoolRefillStepResult CWallet::RunP2MRReceiveKeyPoolRefillStep()
+{
+    DescriptorScriptPubKeyMan* desc_spk_man{nullptr};
+    unsigned int target{0};
+    {
+        LOCK(cs_wallet);
+        if (IsLocked() || HasPendingInitialKeyPoolTopUp()) {
+            m_p2mr_receive_keypool_refill_scheduled = false;
+            return P2MRReceiveKeyPoolRefillStepResult::COMPLETE;
+        }
+        desc_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false));
+        if (!desc_spk_man || desc_spk_man->P2MRReceiveKeyPoolFull()) {
+            m_p2mr_receive_keypool_refill_scheduled = false;
+            return P2MRReceiveKeyPoolRefillStepResult::COMPLETE;
+        }
+        target = desc_spk_man->GetP2MRReceiveKeyPoolRefillStepTarget();
+        if (target == 0) {
+            m_p2mr_receive_keypool_refill_scheduled = false;
+            return P2MRReceiveKeyPoolRefillStepResult::COMPLETE;
+        }
+    }
+
+    util::Result<void> res{desc_spk_man->TopUpWithInternalHintResult(/*internal_hint=*/false, target)};
+    if (!res) {
+        WalletLogPrintf("P2MR receive keypool low-watermark refill failed (descriptor id %s, target=%u, remaining=%u): %s\n",
+            desc_spk_man->GetID().ToString(), target, desc_spk_man->GetKeyPoolSize(), util::ErrorString(res).original);
+        LOCK(cs_wallet);
+        m_p2mr_receive_keypool_refill_scheduled = false;
+        return P2MRReceiveKeyPoolRefillStepResult::FAILED;
+    }
+
+    if (desc_spk_man->P2MRReceiveKeyPoolFull()) {
+        LOCK(cs_wallet);
+        m_p2mr_receive_keypool_refill_scheduled = false;
+        return P2MRReceiveKeyPoolRefillStepResult::COMPLETE;
+    }
+    return P2MRReceiveKeyPoolRefillStepResult::PENDING;
 }
 
 PQCKeyValidationInfo CWallet::GetPQCKeyValidationInfo() const

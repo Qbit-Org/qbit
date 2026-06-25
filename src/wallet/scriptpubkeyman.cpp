@@ -954,7 +954,7 @@ util::Result<CTxDestination> DescriptorScriptPubKeyMan::GetNewDestination(const 
             throw std::runtime_error(std::string(__func__) + ": Types are inconsistent. Stored type does not match type of newly generated address");
         }
 
-        if (!m_deferred_create_keypool_top_up) {
+        if (!m_deferred_create_keypool_top_up && !IsRangedP2MRDescriptorNoLock()) {
             TopUp();
         }
 
@@ -1646,6 +1646,72 @@ void DescriptorScriptPubKeyMan::MaybeRestoreDeferredCreateKeyPoolTopUp()
     m_deferred_create_keypool_top_up = ShouldDeferCreateKeyPoolTopUp(m_wallet_descriptor, m_keypool_size);
 }
 
+bool DescriptorScriptPubKeyMan::IsRangedP2MRDescriptorNoLock() const
+{
+    AssertLockHeld(cs_desc_man);
+    if (!m_wallet_descriptor.descriptor) return false;
+    const std::optional<OutputType> output_type{m_wallet_descriptor.descriptor->GetOutputType()};
+    return output_type && *output_type == OutputType::P2MR && m_wallet_descriptor.descriptor->IsRange();
+}
+
+bool DescriptorScriptPubKeyMan::IsRangedP2MRDescriptor() const
+{
+    LOCK(cs_desc_man);
+    return IsRangedP2MRDescriptorNoLock();
+}
+
+unsigned int DescriptorScriptPubKeyMan::GetKeyPoolSizeNoLock() const
+{
+    AssertLockHeld(cs_desc_man);
+    if (m_wallet_descriptor.range_end <= m_wallet_descriptor.next_index) return 0;
+    return static_cast<unsigned int>(m_wallet_descriptor.range_end - m_wallet_descriptor.next_index);
+}
+
+unsigned int DescriptorScriptPubKeyMan::GetP2MRReceiveKeyPoolLowWatermarkNoLock() const
+{
+    AssertLockHeld(cs_desc_man);
+    return std::min<int64_t>(
+        m_keypool_size,
+        std::max<int64_t>(DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL, m_keypool_size / 10));
+}
+
+unsigned int DescriptorScriptPubKeyMan::GetP2MRReceiveKeyPoolLowWatermark() const
+{
+    LOCK(cs_desc_man);
+    return GetP2MRReceiveKeyPoolLowWatermarkNoLock();
+}
+
+bool DescriptorScriptPubKeyMan::NeedsP2MRReceiveKeyPoolRefill() const
+{
+    LOCK(cs_desc_man);
+    return IsRangedP2MRDescriptorNoLock() &&
+           !m_deferred_create_keypool_top_up &&
+           GetKeyPoolSizeNoLock() < static_cast<unsigned int>(m_keypool_size) &&
+           GetKeyPoolSizeNoLock() <= GetP2MRReceiveKeyPoolLowWatermarkNoLock();
+}
+
+bool DescriptorScriptPubKeyMan::P2MRReceiveKeyPoolFull() const
+{
+    LOCK(cs_desc_man);
+    return !IsRangedP2MRDescriptorNoLock() ||
+           GetKeyPoolSizeNoLock() >= static_cast<unsigned int>(m_keypool_size);
+}
+
+unsigned int DescriptorScriptPubKeyMan::GetP2MRReceiveKeyPoolRefillStepTargetNoLock() const
+{
+    AssertLockHeld(cs_desc_man);
+    if (!IsRangedP2MRDescriptorNoLock()) return 0;
+    return std::min<int64_t>(
+        m_keypool_size,
+        int64_t{GetKeyPoolSizeNoLock()} + DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+}
+
+unsigned int DescriptorScriptPubKeyMan::GetP2MRReceiveKeyPoolRefillStepTarget() const
+{
+    LOCK(cs_desc_man);
+    return GetP2MRReceiveKeyPoolRefillStepTargetNoLock();
+}
+
 bool DescriptorScriptPubKeyMan::IsHDEnabled() const
 {
     LOCK(cs_desc_man);
@@ -1748,7 +1814,7 @@ PQCKeyValidationInfo DescriptorScriptPubKeyMan::GetPQCKeyValidationInfo() const
 unsigned int DescriptorScriptPubKeyMan::GetKeyPoolSize() const
 {
     LOCK(cs_desc_man);
-    return m_wallet_descriptor.range_end - m_wallet_descriptor.next_index;
+    return GetKeyPoolSizeNoLock();
 }
 
 int64_t DescriptorScriptPubKeyMan::GetTimeFirstKey() const

@@ -99,6 +99,8 @@ static constexpr int64_t UNKNOWN_TIME = std::numeric_limits<int64_t>::max();
 
 //! Default for -keypool
 static const unsigned int DEFAULT_KEYPOOL_SIZE = 1000;
+//! Fresh P2MR wallets only need a few addresses immediately; refill the rest in bounded batches.
+static constexpr unsigned int DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL = 16;
 
 std::vector<CKeyID> GetAffectedKeys(const CScript& spk, const SigningProvider& provider);
 
@@ -381,6 +383,10 @@ private:
     bool ReservePQCSignatureCountersBatch(const std::map<CPQCPubKey, uint32_t>& counts, std::map<CPQCPubKey, PQCSignatureCounterRange>& ranges) const;
     PQCSignatureCounterReserver MakePQCSignatureCounterReserver() const;
     PQCSignatureCounterBatchReserver MakePQCSignatureCounterBatchReserver() const;
+    bool IsRangedP2MRDescriptorNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    unsigned int GetKeyPoolSizeNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    unsigned int GetP2MRReceiveKeyPoolLowWatermarkNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    unsigned int GetP2MRReceiveKeyPoolRefillStepTargetNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
 
     KeyMap GetKeys() const;
 
@@ -431,6 +437,11 @@ public:
     bool SetupDescriptorGeneration(WalletBatch& batch, const CExtKey& master_key, OutputType addr_type, bool internal, unsigned int initial_keypool_size = 0);
     bool HasDeferredCreateKeyPoolTopUp() const;
     void MaybeRestoreDeferredCreateKeyPoolTopUp();
+    bool IsRangedP2MRDescriptor() const;
+    unsigned int GetP2MRReceiveKeyPoolLowWatermark() const;
+    bool NeedsP2MRReceiveKeyPoolRefill() const;
+    bool P2MRReceiveKeyPoolFull() const;
+    unsigned int GetP2MRReceiveKeyPoolRefillStepTarget() const;
 
     bool HavePrivateKeys() const override;
     bool HasPrivKey(const CKeyID& keyid) const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
