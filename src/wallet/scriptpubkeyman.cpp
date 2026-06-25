@@ -1085,6 +1085,9 @@ bool DescriptorScriptPubKeyMan::Encrypt(const CKeyingMaterial& master_key, Walle
 util::Result<CTxDestination> DescriptorScriptPubKeyMan::GetReservedDestination(const OutputType type, bool internal, int64_t& index)
 {
     LOCK(cs_desc_man);
+    if (internal) {
+        MaybeTopUpInternalP2MRKeyPool();
+    }
     auto op_dest = GetNewDestination(type);
     index = m_wallet_descriptor.next_index - 1;
     return op_dest;
@@ -1667,6 +1670,25 @@ unsigned int DescriptorScriptPubKeyMan::GetKeyPoolSizeNoLock() const
     return static_cast<unsigned int>(m_wallet_descriptor.range_end - m_wallet_descriptor.next_index);
 }
 
+bool DescriptorScriptPubKeyMan::NeedsP2MRKeyPoolRefillNoLock() const
+{
+    AssertLockHeld(cs_desc_man);
+    return IsRangedP2MRDescriptorNoLock() &&
+           !m_deferred_create_keypool_top_up &&
+           GetKeyPoolSizeNoLock() < static_cast<unsigned int>(m_keypool_size) &&
+           GetKeyPoolSizeNoLock() <= GetP2MRReceiveKeyPoolLowWatermarkNoLock();
+}
+
+void DescriptorScriptPubKeyMan::MaybeTopUpInternalP2MRKeyPool()
+{
+    AssertLockHeld(cs_desc_man);
+    if (m_storage.IsLocked() || !NeedsP2MRKeyPoolRefillNoLock()) return;
+
+    const unsigned int target{GetP2MRReceiveKeyPoolRefillStepTargetNoLock()};
+    if (target == 0) return;
+    (void)TopUpWithInternalHintResult(/*internal_hint=*/true, target);
+}
+
 unsigned int DescriptorScriptPubKeyMan::GetP2MRReceiveKeyPoolLowWatermarkNoLock() const
 {
     AssertLockHeld(cs_desc_man);
@@ -1684,10 +1706,7 @@ unsigned int DescriptorScriptPubKeyMan::GetP2MRReceiveKeyPoolLowWatermark() cons
 bool DescriptorScriptPubKeyMan::NeedsP2MRReceiveKeyPoolRefill() const
 {
     LOCK(cs_desc_man);
-    return IsRangedP2MRDescriptorNoLock() &&
-           !m_deferred_create_keypool_top_up &&
-           GetKeyPoolSizeNoLock() < static_cast<unsigned int>(m_keypool_size) &&
-           GetKeyPoolSizeNoLock() <= GetP2MRReceiveKeyPoolLowWatermarkNoLock();
+    return NeedsP2MRKeyPoolRefillNoLock();
 }
 
 bool DescriptorScriptPubKeyMan::P2MRReceiveKeyPoolFull() const

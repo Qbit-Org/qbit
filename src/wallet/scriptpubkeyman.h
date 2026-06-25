@@ -385,6 +385,8 @@ private:
     PQCSignatureCounterBatchReserver MakePQCSignatureCounterBatchReserver() const;
     bool IsRangedP2MRDescriptorNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     unsigned int GetKeyPoolSizeNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    bool NeedsP2MRKeyPoolRefillNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    void MaybeTopUpInternalP2MRKeyPool() EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     unsigned int GetP2MRReceiveKeyPoolLowWatermarkNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     unsigned int GetP2MRReceiveKeyPoolRefillStepTargetNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
 
