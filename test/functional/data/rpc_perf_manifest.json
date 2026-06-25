@@ -1046,6 +1046,176 @@
       "fixture_reset_mode": "none"
     },
     {
+      "id": "shared.modified.createrawtransaction.wallet_output",
+      "description": "Create an unsigned raw transaction paying the prepared wallet receive address.",
+      "endpoint": "createrawtransaction",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_createrawtransaction",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.createpsbt.wallet_output",
+      "description": "Create an unsigned PSBT paying the prepared wallet receive address.",
+      "endpoint": "createpsbt",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_createpsbt",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.fundrawtransaction.wallet",
+      "description": "Fund a prepared unsigned raw transaction with wallet inputs and a fixed change address.",
+      "endpoint": "fundrawtransaction",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_fundrawtransaction",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 3
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.walletcreatefundedpsbt.wallet",
+      "description": "Create and fund a wallet PSBT with a fixed change address.",
+      "endpoint": "walletcreatefundedpsbt",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_walletcreatefundedpsbt",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 3
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.finalizepsbt.incomplete",
+      "description": "Finalize the prepared unsigned wallet PSBT without extracting a transaction.",
+      "endpoint": "finalizepsbt",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_finalizepsbt",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.decoderawtransaction.wallet",
+      "description": "Decode the prepared unsigned wallet raw transaction.",
+      "endpoint": "decoderawtransaction",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_decoderawtransaction",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.decodescript.receive",
+      "description": "Decode the prepared receive address scriptPubKey.",
+      "endpoint": "decodescript",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_decodescript",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.utxoupdatepsbt.wallet",
+      "description": "Update the prepared wallet PSBT from available UTXO data.",
+      "endpoint": "utxoupdatepsbt",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_utxoupdatepsbt",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.combinepsbt.single",
+      "description": "Run the PSBT combiner over the prepared wallet PSBT.",
+      "endpoint": "combinepsbt",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_combinepsbt",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
+      "id": "shared.modified.converttopsbt.raw",
+      "description": "Convert the prepared unsigned raw transaction into PSBT format.",
+      "endpoint": "converttopsbt",
+      "fixture": "wallet_ready",
+      "lane": "shared_name_qbit_modified",
+      "call_builder": "wallet_converttopsbt",
+      "target_support": [
+        "qbit",
+        "reference"
+      ],
+      "modes": {
+        "warm": 5
+      },
+      "comparison_mode": "latency_only",
+      "fixture_reset_mode": "none"
+    },
+    {
       "id": "shared.modified.decodepsbt.wallet",
       "description": "Decode a wallet-funded PSBT and record qbit PQC/P2MR response-shape differences.",
       "endpoint": "decodepsbt",
