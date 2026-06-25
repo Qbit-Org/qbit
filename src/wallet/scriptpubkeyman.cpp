@@ -1082,10 +1082,10 @@ bool DescriptorScriptPubKeyMan::Encrypt(const CKeyingMaterial& master_key, Walle
     return true;
 }
 
-util::Result<CTxDestination> DescriptorScriptPubKeyMan::GetReservedDestination(const OutputType type, bool internal, int64_t& index)
+util::Result<CTxDestination> DescriptorScriptPubKeyMan::GetReservedDestination(const OutputType type, bool internal, int64_t& index, bool allow_internal_p2mr_refill)
 {
     LOCK(cs_desc_man);
-    if (internal) {
+    if (internal && allow_internal_p2mr_refill) {
         MaybeTopUpInternalP2MRKeyPool();
     }
     auto op_dest = GetNewDestination(type);

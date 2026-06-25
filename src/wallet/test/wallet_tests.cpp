@@ -1325,7 +1325,7 @@ BOOST_FIXTURE_TEST_CASE(P2MRGetNewAddressSchedulesLowWatermarkRefill, RegtestP2M
         LOCK(external_spk_man->cs_desc_man);
         range_end_at_watermark = external_spk_man->GetWalletDescriptor().range_end;
     }
-    MaybeScheduleP2MRReceiveKeyPoolRefill(context, wallet, OutputType::P2MR);
+    MaybeScheduleP2MRKeyPoolRefill(context, wallet, OutputType::P2MR, /*internal=*/false);
     BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), low_watermark);
     {
         LOCK(external_spk_man->cs_desc_man);
@@ -1503,6 +1503,101 @@ BOOST_FIXTURE_TEST_CASE(P2MRGetNewChangeAddressBoundsLowWatermarkRefill, Regtest
     {
         LOCK(internal_spk_man->cs_desc_man);
         BOOST_CHECK_EQUAL(internal_spk_man->GetWalletDescriptor().range_end, range_end_at_watermark + DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+    }
+
+    TestUnloadWallet(std::move(wallet));
+}
+
+BOOST_FIXTURE_TEST_CASE(P2MRGetRawChangeAddressSchedulesLowWatermarkRefill, RegtestP2MROnlyWalletTestingSetup)
+{
+    constexpr int64_t keypool_size{64};
+    m_args.ForceSetArg("-keypool", util::ToString(keypool_size));
+
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+    context.scheduler = Assert(m_node.scheduler).get();
+
+    auto wallet = TestLoadWallet(context);
+    DescriptorScriptPubKeyMan* internal_spk_man{nullptr};
+    {
+        LOCK(wallet->cs_wallet);
+        internal_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/true));
+    }
+    BOOST_REQUIRE(internal_spk_man);
+    BOOST_CHECK(wallet->RunPendingInitialKeyPoolTopUp());
+    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), keypool_size);
+
+    const unsigned int low_watermark{internal_spk_man->GetP2MRReceiveKeyPoolLowWatermark()};
+    BOOST_REQUIRE_EQUAL(low_watermark, DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+    for (int64_t i = 0; i < keypool_size - int64_t{low_watermark}; ++i) {
+        BOOST_REQUIRE(wallet->GetNewChangeDestination(OutputType::P2MR, /*allow_internal_p2mr_refill=*/false));
+    }
+    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), low_watermark);
+
+    int32_t range_end_at_watermark;
+    {
+        LOCK(internal_spk_man->cs_desc_man);
+        range_end_at_watermark = internal_spk_man->GetWalletDescriptor().range_end;
+    }
+
+    BOOST_REQUIRE(wallet->GetNewChangeDestination(OutputType::P2MR, /*allow_internal_p2mr_refill=*/false));
+    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), low_watermark - 1);
+    {
+        LOCK(internal_spk_man->cs_desc_man);
+        BOOST_CHECK_EQUAL(internal_spk_man->GetWalletDescriptor().range_end, range_end_at_watermark);
+    }
+
+    MaybeScheduleP2MRKeyPoolRefill(context, wallet, OutputType::P2MR, /*internal=*/true);
+    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), low_watermark - 1);
+    {
+        LOCK(internal_spk_man->cs_desc_man);
+        BOOST_CHECK_EQUAL(internal_spk_man->GetWalletDescriptor().range_end, range_end_at_watermark);
+    }
+
+    auto& scheduler = *Assert(m_node.scheduler);
+    for (int i = 0; i < 10 && internal_spk_man->GetKeyPoolSize() < keypool_size; ++i) {
+        scheduler.MockForward(std::chrono::seconds{1});
+        WaitForScheduler(scheduler);
+    }
+    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), keypool_size);
+
+    TestUnloadWallet(std::move(wallet));
+}
+
+BOOST_FIXTURE_TEST_CASE(P2MRGetRawChangeAddressFallbackTopUpAtExhaustionWithoutInlineRefill, RegtestP2MROnlyWalletTestingSetup)
+{
+    constexpr int64_t keypool_size{17};
+    m_args.ForceSetArg("-keypool", util::ToString(keypool_size));
+
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+
+    auto wallet = TestLoadWallet(context);
+    DescriptorScriptPubKeyMan* internal_spk_man{nullptr};
+    {
+        LOCK(wallet->cs_wallet);
+        internal_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/true));
+    }
+    BOOST_REQUIRE(internal_spk_man);
+    BOOST_CHECK(wallet->RunPendingInitialKeyPoolTopUp());
+
+    for (int64_t i = 0; i < keypool_size; ++i) {
+        BOOST_REQUIRE(wallet->GetNewChangeDestination(OutputType::P2MR, /*allow_internal_p2mr_refill=*/false));
+    }
+    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), 0U);
+
+    int32_t exhausted_range_end;
+    {
+        LOCK(internal_spk_man->cs_desc_man);
+        exhausted_range_end = internal_spk_man->GetWalletDescriptor().range_end;
+    }
+    BOOST_REQUIRE(wallet->GetNewChangeDestination(OutputType::P2MR, /*allow_internal_p2mr_refill=*/false));
+    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), 0U);
+    {
+        LOCK(internal_spk_man->cs_desc_man);
+        BOOST_CHECK_EQUAL(internal_spk_man->GetWalletDescriptor().range_end, exhausted_range_end + 1);
     }
 
     TestUnloadWallet(std::move(wallet));

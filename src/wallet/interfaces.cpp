@@ -172,7 +172,7 @@ public:
     {
         util::Result<CTxDestination> result = WITH_LOCK(m_wallet->cs_wallet, return m_wallet->GetNewDestination(type, label));
         if (result) {
-            MaybeScheduleP2MRReceiveKeyPoolRefill(m_context, m_wallet, type);
+            MaybeScheduleP2MRKeyPoolRefill(m_context, m_wallet, type, /*internal=*/false);
         }
         return result;
     }
