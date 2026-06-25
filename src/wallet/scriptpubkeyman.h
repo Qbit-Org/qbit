@@ -383,6 +383,13 @@ private:
     bool ReservePQCSignatureCountersBatch(const std::map<CPQCPubKey, uint32_t>& counts, std::map<CPQCPubKey, PQCSignatureCounterRange>& ranges) const;
     PQCSignatureCounterReserver MakePQCSignatureCounterReserver() const;
     PQCSignatureCounterBatchReserver MakePQCSignatureCounterBatchReserver() const;
+    struct TopUpPreparation {
+        std::optional<bool> spkman_is_internal;
+        FlatSigningProvider provider;
+        bool has_encryption_keys{false};
+        std::optional<CKeyingMaterial> encryption_key;
+    };
+    TopUpPreparation PrepareTopUp(std::optional<bool> internal_hint) const;
     bool IsRangedP2MRDescriptorNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     unsigned int GetKeyPoolSizeNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     bool NeedsP2MRKeyPoolRefillNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
@@ -406,6 +413,7 @@ protected:
     //! Same as 'TopUp' but designed for use within a batch transaction context
     bool TopUpWithDB(WalletBatch& batch, unsigned int size = 0, std::optional<bool> internal_hint = std::nullopt);
     util::Result<void> TopUpWithDBResult(WalletBatch& batch, unsigned int size = 0, std::optional<bool> internal_hint = std::nullopt, bool throw_on_persistence_error = false, bool rollback_state_on_error = true);
+    util::Result<void> TopUpWithDBPreparedResult(WalletBatch& batch, unsigned int size, const TopUpPreparation& prepared, bool throw_on_persistence_error, bool rollback_state_on_error) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
 
 public:
     DescriptorScriptPubKeyMan(WalletStorage& storage, WalletDescriptor& descriptor, int64_t keypool_size);
