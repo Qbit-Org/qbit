@@ -552,7 +552,7 @@ jobs:
           GITHUB_METADATA_VALIDATION_RESULT: ${{ needs.github-metadata-validation.result }}
           SOURCE_VALIDATION_REQUIRED: ${{ needs.classify-changes.outputs.source_validation_required }}
           REPOSITORY: ${{ github.repository }}
-          SHA: ${{ github.sha }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
 
