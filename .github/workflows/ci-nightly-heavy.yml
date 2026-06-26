@@ -70,15 +70,23 @@ jobs:
       MAKEJOBS: ${{ matrix.makejobs || '-j6' }}
       TEST_RUNNER_JOBS: '6'
       CTEST_JOBS: '6'
+      CTEST_INCLUDE_RANGE: ${{ matrix.ctest_include_range || '' }}
       CI_DOCKER_RUN_CPUS: ${{ matrix.container-cpus || '8' }}
       CI_DOCKER_RUN_MEMORY: ${{ matrix.container-memory || '48g' }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: '32 bit ARM, unit tests, no functional tests'
+          - name: '32 bit ARM, unit tests shard 1/2, no functional tests'
             timeout-minutes: 180
             file-env: './ci/test/00_setup_env_arm.sh'
+            ctest_include_range: '1,139'
+            container-cpus: '8'
+            container-memory: '48g'
+          - name: '32 bit ARM, unit tests shard 2/2, no functional tests'
+            timeout-minutes: 180
+            file-env: './ci/test/00_setup_env_arm.sh'
+            ctest_include_range: '140,99999'
             container-cpus: '8'
             container-memory: '48g'
           - name: 'previous releases, depends DEBUG'

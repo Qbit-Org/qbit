@@ -104,7 +104,7 @@ class TestNode():
     To make things easier for the test writer, any unrecognised messages will
     be dispatched to the RPC connection."""
 
-    def __init__(self, i, datadir_path, *, chain, rpchost, timewait, timeout_factor, binaries, coverage_dir, cwd, extra_conf=None, extra_args=None, use_cli=False, start_perf=False, use_valgrind=False, version=None, v2transport=False, uses_wallet=False, ipcbind=False):
+    def __init__(self, i, datadir_path, *, chain, rpchost, timewait, timeout_factor, binaries, coverage_dir, cwd, extra_conf=None, extra_args=None, use_cli=False, start_perf=False, use_valgrind=False, version=None, v2transport=False, uses_wallet=False, ipcbind=False, supports_p2mronly=None):
         """
         Kwargs:
             start_perf (bool): If True, begin profiling the node with `perf` as soon as
@@ -134,6 +134,7 @@ class TestNode():
         self.extra_args = extra_args
         self.running_args = list(extra_args or [])
         self.version = version
+        self.supports_p2mronly = self.version is None if supports_p2mronly is None else supports_p2mronly
         # Configuration for logging is set as command-line args rather than in the qbit.conf file.
         # This means that starting a bitcoind using the temp dir to debug a failed test won't
         # spam debug.log.
@@ -334,7 +335,7 @@ class TestNode():
         return False
 
     def _supports_p2mronly(self):
-        return self.version is None
+        return self.supports_p2mronly
 
     def _with_regtest_p2mronly_default(self, extra_args):
         extra_args = list(extra_args or [])

@@ -210,13 +210,19 @@ if [ "$RUN_CHECK_DEPS" = "true" ]; then
 fi
 
 if [ "$RUN_UNIT_TESTS" = "true" ]; then
+  CTEST_ARGS=()
+  if [ -n "${CTEST_INCLUDE_RANGE}" ]; then
+    CTEST_ARGS+=(-I "${CTEST_INCLUDE_RANGE}")
+  fi
+
   DIR_UNIT_TEST_DATA="${DIR_UNIT_TEST_DATA}" \
   LD_LIBRARY_PATH="${DEPENDS_DIR}/${HOST}/lib" \
   CTEST_OUTPUT_ON_FAILURE=ON \
   ctest --test-dir "${BASE_BUILD_DIR}" \
     --stop-on-failure \
     -j "${CTEST_JOBS}" \
-    --timeout $(( TEST_RUNNER_TIMEOUT_FACTOR * 60 ))
+    --timeout $(( TEST_RUNNER_TIMEOUT_FACTOR * 60 )) \
+    "${CTEST_ARGS[@]}"
 fi
 
 # Build qbit-photon relay daemon for integration tests.

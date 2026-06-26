@@ -39,6 +39,7 @@ export MAKEJOBS=${MAKEJOBS:--j8}
 # Parallelism for runtime test execution, decoupled from build parallelism
 export TEST_RUNNER_JOBS=${TEST_RUNNER_JOBS:-6}
 export CTEST_JOBS=${CTEST_JOBS:-$TEST_RUNNER_JOBS}
+export CTEST_INCLUDE_RANGE=${CTEST_INCLUDE_RANGE:-}
 export CMAKE_GENERATOR=${CMAKE_GENERATOR:-Ninja}
 # Whether to prefer BusyBox over GNU utilities
 export USE_BUSY_BOX=${USE_BUSY_BOX:-false}

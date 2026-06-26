@@ -232,8 +232,13 @@ class RPCPerfTest(BitcoinTestFramework):
         for context in self.fixture_contexts:
             for node_index in context.node_indexes:
                 self.extra_args[node_index] = list(context.plan.extra_args)
+                node_init = {}
                 if context.plan.bin_dir is not None:
-                    self.extra_init[node_index] = {"binaries": self.get_binaries(context.plan.bin_dir)}
+                    node_init["binaries"] = self.get_binaries(context.plan.bin_dir)
+                if context.plan.target == REFERENCE_TARGET:
+                    node_init["supports_p2mronly"] = False
+                if node_init:
+                    self.extra_init[node_index] = node_init
 
     def setup_network(self):
         self.setup_nodes()

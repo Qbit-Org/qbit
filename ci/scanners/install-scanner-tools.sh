@@ -14,6 +14,7 @@ TOOL_ROOT="${QBIT_SCANNER_TOOL_ROOT:-${RUNNER_TOOL_CACHE:-$HOME/.cache/qbit}/sca
 BIN_DIR="${QBIT_SCANNER_BIN_DIR:-$TOOL_ROOT/bin}"
 CARGO_ROOT="${QBIT_SCANNER_CARGO_ROOT:-$TOOL_ROOT/cargo}"
 PYTHON_VENV="${QBIT_SCANNER_PYTHON_VENV:-$TOOL_ROOT/python}"
+CARGO_AUDIT_VERSION="${QBIT_SCANNER_CARGO_AUDIT_VERSION:-0.21.1}"
 
 mkdir -p "$BIN_DIR" "$CARGO_ROOT/bin"
 export PATH="$BIN_DIR:$CARGO_ROOT/bin:$PATH"
@@ -251,13 +252,19 @@ install_python_tool() {
 }
 
 install_cargo_audit() {
+    local current_version=""
     if cargo audit --version >/dev/null 2>&1; then
-        log "cargo-audit already available"
-        return
+        current_version="$(cargo audit --version | awk '{print $2}')"
+        if [[ "$current_version" == "$CARGO_AUDIT_VERSION" ]]; then
+            log "cargo-audit $CARGO_AUDIT_VERSION already available"
+            return
+        fi
+        log "Replacing cargo-audit $current_version with $CARGO_AUDIT_VERSION"
+    else
+        log "Installing cargo-audit $CARGO_AUDIT_VERSION"
     fi
 
-    log "Installing cargo-audit"
-    cargo install cargo-audit --locked --root "$CARGO_ROOT"
+    cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked --root "$CARGO_ROOT" --force
 }
 
 show_versions() {
