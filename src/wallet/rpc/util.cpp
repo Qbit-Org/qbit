@@ -44,9 +44,11 @@ static OutputType ParseWalletOutputTypeImpl(const std::string& type, std::string
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, strprintf("Unknown %s '%s'", kind, type));
     }
 
-    const bool allowed = wallet ? IsAvailableWalletOutputType(*wallet, parsed.value(), internal) : IsWalletOutputTypeAllowed(parsed.value());
-    if (!allowed) {
+    if (!IsWalletOutputTypeAllowed(parsed.value())) {
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, strprintf("%s '%s' is not available on this chain", kind, type));
+    }
+    if (wallet && !HasWalletOutputTypeManager(*wallet, parsed.value(), internal)) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, strprintf("%s '%s' is not available in this wallet", kind, type));
     }
     return parsed.value();
 }

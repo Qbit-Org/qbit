@@ -145,7 +145,15 @@ class WalletP2MRTest(BitcoinTestFramework):
         for output_type in (*NON_P2MR_OUTPUT_TYPES, "p2mr"):
             mixed_wallet.getnewaddress("", output_type)
             mixed_wallet.getrawchangeaddress(output_type)
+        blank_raw_tx = mixed_wallet.createrawtransaction([], {mixed_wallet.getnewaddress(): Decimal("1")})
         mixed_wallet.unloadwallet(load_on_startup=False)
+        blank_wallet_name = "blank_output_wallet"
+        node_mixed_managers.createwallet(
+            wallet_name=blank_wallet_name,
+            blank=True,
+            load_on_startup=False,
+        )
+        node_mixed_managers.get_wallet_rpc(blank_wallet_name).unloadwallet(load_on_startup=False)
 
         self.stop_node(2)
         node_mixed_managers.assert_start_raises_init_error(
@@ -158,6 +166,27 @@ class WalletP2MRTest(BitcoinTestFramework):
             expected_msg="Change type 'bech32' is not available on this chain",
             match=ErrorMatch.PARTIAL_REGEX,
         )
+        node_mixed_managers.assert_start_raises_init_error(
+            ["-p2mronly=1", f"-wallet={blank_wallet_name}", "-addresstype=p2mr"],
+            expected_msg="Address type 'p2mr' is not available in this wallet",
+            match=ErrorMatch.PARTIAL_REGEX,
+        )
+        node_mixed_managers.assert_start_raises_init_error(
+            ["-p2mronly=1", f"-wallet={blank_wallet_name}", "-changetype=p2mr"],
+            expected_msg="Change type 'p2mr' is not available in this wallet",
+            match=ErrorMatch.PARTIAL_REGEX,
+        )
+        self.start_node(2, ["-p2mronly=1", f"-wallet={blank_wallet_name}"])
+        blank_wallet = node_mixed_managers.get_wallet_rpc(blank_wallet_name)
+        assert_raises_rpc_error(
+            -5,
+            "change type 'p2mr' is not available in this wallet",
+            blank_wallet.fundrawtransaction,
+            blank_raw_tx,
+            {"change_type": "p2mr"},
+        )
+        blank_wallet.unloadwallet(load_on_startup=False)
+        self.stop_node(2)
         self.start_node(2, ["-p2mronly=1", f"-wallet={mixed_wallet_name}"])
         mixed_wallet = node_mixed_managers.get_wallet_rpc(mixed_wallet_name)
 

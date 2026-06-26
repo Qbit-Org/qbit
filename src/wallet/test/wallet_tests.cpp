@@ -796,6 +796,7 @@ BOOST_FIXTURE_TEST_CASE(WalletOutputAvailabilityRequiresAllowedTypeAndManager, R
 {
     CWallet bare_wallet{m_node.chain.get(), "", CreateMockableWalletDatabase()};
     BOOST_CHECK(bare_wallet.GetActiveScriptPubKeyMans().empty());
+    BOOST_CHECK(!HasWalletOutputTypeManager(bare_wallet, OutputType::P2MR, /*internal=*/false));
     BOOST_CHECK(!IsAvailableWalletOutputType(bare_wallet, OutputType::P2MR, /*internal=*/false));
 
     m_args.ForceSetArg("-keypool", util::ToString(SINGLE_ADDRESS_KEYPOOL_SIZE));
@@ -807,7 +808,9 @@ BOOST_FIXTURE_TEST_CASE(WalletOutputAvailabilityRequiresAllowedTypeAndManager, R
     {
         LOCK(wallet->cs_wallet);
         BOOST_REQUIRE(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false));
+        BOOST_CHECK(HasWalletOutputTypeManager(*wallet, OutputType::P2MR, /*internal=*/false));
         BOOST_CHECK(IsAvailableWalletOutputType(*wallet, OutputType::P2MR, /*internal=*/false));
+        BOOST_CHECK(!HasWalletOutputTypeManager(*wallet, OutputType::LEGACY, /*internal=*/false));
         BOOST_CHECK(!IsAvailableWalletOutputType(*wallet, OutputType::LEGACY, /*internal=*/false));
     }
     TestUnloadWallet(std::move(wallet));
