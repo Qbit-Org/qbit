@@ -166,17 +166,7 @@ class WalletP2MRTest(BitcoinTestFramework):
             expected_msg="Change type 'bech32' is not available on this chain",
             match=ErrorMatch.PARTIAL_REGEX,
         )
-        node_mixed_managers.assert_start_raises_init_error(
-            ["-p2mronly=1", f"-wallet={blank_wallet_name}", "-addresstype=p2mr"],
-            expected_msg="Address type 'p2mr' is not available in this wallet",
-            match=ErrorMatch.PARTIAL_REGEX,
-        )
-        node_mixed_managers.assert_start_raises_init_error(
-            ["-p2mronly=1", f"-wallet={blank_wallet_name}", "-changetype=p2mr"],
-            expected_msg="Change type 'p2mr' is not available in this wallet",
-            match=ErrorMatch.PARTIAL_REGEX,
-        )
-        self.start_node(2, ["-p2mronly=1", f"-wallet={blank_wallet_name}"])
+        self.start_node(2, ["-p2mronly=1", f"-wallet={blank_wallet_name}", "-addresstype=p2mr", "-changetype=p2mr"])
         blank_wallet = node_mixed_managers.get_wallet_rpc(blank_wallet_name)
         assert_raises_rpc_error(
             -5,

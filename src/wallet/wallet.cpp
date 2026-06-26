@@ -330,7 +330,9 @@ std::optional<bilingual_str> GetWalletOutputTypeInitError(
     if (!IsWalletOutputTypeAllowed(type)) {
         return Untranslated(strprintf("%s '%s' is not available on this chain", kind, requested_type));
     }
-    if (!HasWalletOutputTypeManager(wallet, type, internal)) {
+
+    const bool has_active_managers{WITH_LOCK(wallet.cs_wallet, return !wallet.GetActiveScriptPubKeyMans().empty())};
+    if (has_active_managers && !HasWalletOutputTypeManager(wallet, type, internal)) {
         return Untranslated(strprintf("%s '%s' is not available in this wallet", kind, requested_type));
     }
     return std::nullopt;
