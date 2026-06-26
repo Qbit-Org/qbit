@@ -12,6 +12,9 @@
 #include <script/sign.h>
 #include <script/script.h>
 #include <script/script_error.h>
+#include <streams.h>
+#include <test/data/p2mr_pqc_witness_vectors.json.h>
+#include <test/util/json.h>
 #include <test/util/setup_common.h>
 #include <test/util/transaction_utils.h>
 #include <util/strencodings.h>
@@ -27,6 +30,7 @@
 #include <optional>
 #include <set>
 #include <span>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -466,6 +470,123 @@ void SignP2MRLeaf(CPQCKey& key, const CScript& leaf_script, const P2MRSpendConte
     uint32_t signature_counter{0};
     BOOST_REQUIRE(key.Sign(sighash, sig_out, signature_counter));
     BOOST_CHECK_EQUAL(signature_counter, 1U);
+}
+
+struct P2MRWitnessVector {
+    CMutableTransaction spend_tx;
+    CScript prevout_script_pubkey;
+    CAmount prevout_amount;
+    valtype leaf_script;
+    valtype control_block;
+    CPQCPubKey pubkey;
+    valtype signature;
+    valtype p2mr_sigmsg;
+    uint256 p2mr_sighash;
+    uint256 wrong_domain_sighash;
+    valtype wrong_domain_signature;
+    CScript wrong_pubkey_script_pubkey;
+    valtype wrong_pubkey_leaf_script;
+};
+
+valtype ParseHexField(const UniValue& obj, std::string_view field)
+{
+    const UniValue& value = obj[std::string{field}];
+    BOOST_REQUIRE_MESSAGE(value.isStr(), "missing string field " << field);
+    valtype bytes{ParseHex(value.get_str())};
+    BOOST_REQUIRE_MESSAGE(!bytes.empty(), "invalid or empty hex field " << field);
+    return bytes;
+}
+
+uint256 ParseRawUint256Field(const UniValue& obj, std::string_view field)
+{
+    const valtype bytes{ParseHexField(obj, field)};
+    BOOST_REQUIRE_EQUAL(bytes.size(), uint256::size());
+    return uint256{std::span<const unsigned char>{bytes.data(), bytes.size()}};
+}
+
+CScript ParseScriptField(const UniValue& obj, std::string_view field)
+{
+    const valtype bytes{ParseHexField(obj, field)};
+    return CScript{bytes.begin(), bytes.end()};
+}
+
+CMutableTransaction ParseMutableTransactionField(const UniValue& obj, std::string_view field)
+{
+    DataStream stream{ParseHexField(obj, field)};
+    CMutableTransaction tx;
+    stream >> TX_WITH_WITNESS(tx);
+    return tx;
+}
+
+P2MRWitnessVector LoadIndependentP2MRWitnessVector()
+{
+    const UniValue vectors = read_json(json_tests::p2mr_pqc_witness_vectors);
+    BOOST_REQUIRE_EQUAL(vectors.size(), 1U);
+    const UniValue& vec = vectors[0].get_obj();
+
+    const valtype pubkey_bytes{ParseHexField(vec, "pubkey")};
+    BOOST_REQUIRE_EQUAL(pubkey_bytes.size(), PQC_PUBKEY_SIZE);
+    CPQCPubKey pubkey{pubkey_bytes};
+    BOOST_REQUIRE(pubkey.IsValid());
+
+    P2MRWitnessVector out{
+        .spend_tx = ParseMutableTransactionField(vec, "spendTx"),
+        .prevout_script_pubkey = ParseScriptField(vec, "prevoutScriptPubKey"),
+        .prevout_amount = vec["prevoutAmount"].getInt<CAmount>(),
+        .leaf_script = ParseHexField(vec, "leafScript"),
+        .control_block = ParseHexField(vec, "controlBlock"),
+        .pubkey = pubkey,
+        .signature = ParseHexField(vec, "signature"),
+        .p2mr_sigmsg = ParseHexField(vec, "p2mrSigMsg"),
+        .p2mr_sighash = ParseRawUint256Field(vec, "p2mrSighash"),
+        .wrong_domain_sighash = ParseRawUint256Field(vec, "wrongDomainSighash"),
+        .wrong_domain_signature = ParseHexField(vec, "wrongDomainSignature"),
+        .wrong_pubkey_script_pubkey = ParseScriptField(vec, "wrongPubkeyScriptPubKey"),
+        .wrong_pubkey_leaf_script = ParseHexField(vec, "wrongPubkeyLeafScript"),
+    };
+
+    BOOST_REQUIRE_EQUAL(out.signature.size(), PQC_SIG_SIZE);
+    BOOST_REQUIRE(!out.p2mr_sigmsg.empty());
+    BOOST_REQUIRE(out.p2mr_sighash != out.wrong_domain_sighash);
+    BOOST_REQUIRE_EQUAL(out.wrong_domain_signature.size(), PQC_SIG_SIZE);
+    BOOST_REQUIRE_EQUAL(out.spend_tx.vin.size(), 1U);
+    BOOST_REQUIRE_EQUAL(out.spend_tx.vout.size(), 1U);
+    BOOST_REQUIRE_EQUAL(out.spend_tx.vin[0].scriptWitness.stack.size(), 3U);
+    BOOST_REQUIRE(out.spend_tx.vin[0].scriptWitness.stack[0] == out.signature);
+    BOOST_REQUIRE(out.spend_tx.vin[0].scriptWitness.stack[1] == out.leaf_script);
+    BOOST_REQUIRE(out.spend_tx.vin[0].scriptWitness.stack[2] == out.control_block);
+    return out;
+}
+
+PrecomputedTransactionData PrecomputeVectorData(const CMutableTransaction& tx, const CScript& prevout_script_pubkey, CAmount prevout_amount)
+{
+    PrecomputedTransactionData txdata;
+    txdata.Init(tx, {CTxOut{prevout_amount, prevout_script_pubkey}});
+    return txdata;
+}
+
+bool VerifyVectorSpend(const CMutableTransaction& tx, const CScript& prevout_script_pubkey, CAmount prevout_amount, ScriptError& err)
+{
+    PrecomputedTransactionData txdata{PrecomputeVectorData(tx, prevout_script_pubkey, prevout_amount)};
+    return VerifyScript(
+        tx.vin[0].scriptSig,
+        prevout_script_pubkey,
+        &tx.vin[0].scriptWitness,
+        P2MR_SCRIPT_VERIFY_FLAGS,
+        MutableTransactionSignatureChecker(
+            &tx,
+            0,
+            prevout_amount,
+            txdata,
+            MissingDataBehavior::ASSERT_FAIL),
+        &err);
+}
+
+void CheckVectorMutationFails(const P2MRWitnessVector& vector, CMutableTransaction tx, const CScript& prevout_script_pubkey, ScriptError expected_error)
+{
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifyVectorSpend(tx, prevout_script_pubkey, vector.prevout_amount, err));
+    BOOST_CHECK_EQUAL(err, expected_error);
 }
 
 } // namespace
@@ -1129,6 +1250,85 @@ BOOST_AUTO_TEST_CASE(p2mr_checksigpqc_accepts_valid_signature)
     ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
     BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
     BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_checksigpqc_accepts_independent_witness_vector)
+{
+    const P2MRWitnessVector vector{LoadIndependentP2MRWitnessVector()};
+    const CScript leaf_script{vector.leaf_script.begin(), vector.leaf_script.end()};
+    const PrecomputedTransactionData txdata{
+        PrecomputeVectorData(vector.spend_tx, vector.prevout_script_pubkey, vector.prevout_amount)};
+
+    BOOST_CHECK_EQUAL(
+        HexStr(ToByteVector((HashWriter{HASHER_P2MR_SIGHASH} << std::span<const uint8_t>{vector.p2mr_sigmsg}).GetSHA256())),
+        HexStr(ToByteVector(vector.p2mr_sighash)));
+    BOOST_CHECK_EQUAL(
+        HexStr(ToByteVector((HashWriter{HASHER_TAPSIGHASH} << std::span<const uint8_t>{vector.p2mr_sigmsg}).GetSHA256())),
+        HexStr(ToByteVector(vector.wrong_domain_sighash)));
+
+    ScriptExecutionData execdata = BuildExecData(leaf_script);
+    uint256 sighash;
+    BOOST_REQUIRE(SignatureHashP2MR(
+        sighash,
+        execdata,
+        vector.spend_tx,
+        /*in_pos=*/0,
+        SIGHASH_DEFAULT,
+        txdata,
+        MissingDataBehavior::ASSERT_FAIL));
+    BOOST_CHECK_EQUAL(HexStr(ToByteVector(sighash)), HexStr(ToByteVector(vector.p2mr_sighash)));
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(VerifyVectorSpend(vector.spend_tx, vector.prevout_script_pubkey, vector.prevout_amount, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_checksigpqc_rejects_independent_witness_vector_near_misses)
+{
+    static constexpr uint8_t INVALID_SIGHASH_TYPE{0x04};
+
+    const P2MRWitnessVector vector{LoadIndependentP2MRWitnessVector()};
+    {
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_REQUIRE(VerifyVectorSpend(vector.spend_tx, vector.prevout_script_pubkey, vector.prevout_amount, err));
+        BOOST_REQUIRE_EQUAL(err, SCRIPT_ERR_OK);
+    }
+
+    {
+        CMutableTransaction tx{vector.spend_tx};
+        tx.vin[0].scriptWitness.stack[0][0] ^= 0x01;
+        CheckVectorMutationFails(vector, tx, vector.prevout_script_pubkey, SCRIPT_ERR_P2MR_SIG);
+    }
+
+    {
+        CMutableTransaction tx{vector.spend_tx};
+        tx.vin[0].scriptWitness.stack[0] = vector.wrong_domain_signature;
+        CheckVectorMutationFails(vector, tx, vector.prevout_script_pubkey, SCRIPT_ERR_P2MR_SIG);
+    }
+
+    {
+        CMutableTransaction tx{vector.spend_tx};
+        tx.vin[0].scriptWitness.stack[0].push_back(SIGHASH_DEFAULT);
+        CheckVectorMutationFails(vector, tx, vector.prevout_script_pubkey, SCRIPT_ERR_P2MR_SIG_HASHTYPE);
+    }
+
+    {
+        CMutableTransaction tx{vector.spend_tx};
+        tx.vin[0].scriptWitness.stack[0].push_back(INVALID_SIGHASH_TYPE);
+        CheckVectorMutationFails(vector, tx, vector.prevout_script_pubkey, SCRIPT_ERR_P2MR_SIG_HASHTYPE);
+    }
+
+    {
+        CMutableTransaction tx{vector.spend_tx};
+        tx.vin[0].scriptWitness.stack[1][1] ^= 0x01;
+        CheckVectorMutationFails(vector, tx, vector.prevout_script_pubkey, SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH);
+    }
+
+    {
+        CMutableTransaction tx{vector.spend_tx};
+        tx.vin[0].scriptWitness.stack[1] = vector.wrong_pubkey_leaf_script;
+        CheckVectorMutationFails(vector, tx, vector.wrong_pubkey_script_pubkey, SCRIPT_ERR_P2MR_SIG);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(p2mr_rejects_legacy_checksig_with_valid_pqc_signature)
