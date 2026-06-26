@@ -1277,6 +1277,7 @@ BOOST_AUTO_TEST_CASE(p2mr_checksigpqc_accepts_independent_witness_vector)
         txdata,
         MissingDataBehavior::ASSERT_FAIL));
     BOOST_CHECK_EQUAL(HexStr(ToByteVector(sighash)), HexStr(ToByteVector(vector.p2mr_sighash)));
+    BOOST_REQUIRE(vector.pubkey.Verify(vector.p2mr_sighash, vector.signature));
 
     ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
     BOOST_CHECK(VerifyVectorSpend(vector.spend_tx, vector.prevout_script_pubkey, vector.prevout_amount, err));
@@ -1300,6 +1301,8 @@ BOOST_AUTO_TEST_CASE(p2mr_checksigpqc_rejects_independent_witness_vector_near_mi
         CheckVectorMutationFails(vector, tx, vector.prevout_script_pubkey, SCRIPT_ERR_P2MR_SIG);
     }
 
+    BOOST_REQUIRE(vector.pubkey.Verify(vector.wrong_domain_sighash, vector.wrong_domain_signature));
+    BOOST_REQUIRE(!vector.pubkey.Verify(vector.p2mr_sighash, vector.wrong_domain_signature));
     {
         CMutableTransaction tx{vector.spend_tx};
         tx.vin[0].scriptWitness.stack[0] = vector.wrong_domain_signature;
