@@ -1508,6 +1508,49 @@ BOOST_FIXTURE_TEST_CASE(P2MRGetNewChangeAddressBoundsLowWatermarkRefill, Regtest
     TestUnloadWallet(std::move(wallet));
 }
 
+BOOST_AUTO_TEST_CASE(InternalP2MRInlineRefillLogsTransactionFailure)
+{
+    constexpr int64_t keypool_size{20};
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        wallet.m_keypool_size = keypool_size;
+        wallet.SetupDescriptorScriptPubKeyMans(P2MR_ONLY_OUTPUT_TYPES);
+    }
+
+    DescriptorScriptPubKeyMan* internal_spk_man{nullptr};
+    {
+        LOCK(wallet.cs_wallet);
+        internal_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(wallet.GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/true));
+    }
+    BOOST_REQUIRE(internal_spk_man);
+    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), keypool_size);
+
+    const unsigned int low_watermark{internal_spk_man->GetP2MRReceiveKeyPoolLowWatermark()};
+    BOOST_REQUIRE_EQUAL(low_watermark, DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+    for (int64_t i = 0; i < keypool_size - int64_t{low_watermark}; ++i) {
+        BOOST_REQUIRE(wallet.GetNewChangeDestination(OutputType::P2MR));
+    }
+    BOOST_REQUIRE_EQUAL(internal_spk_man->GetKeyPoolSize(), low_watermark);
+
+    auto& database = GetMockableDatabase(wallet);
+    database.ResetCounts();
+    database.m_txn_begin_pass = false;
+    {
+        DebugLogHelper log_helper("P2MR change keypool inline low-watermark refill failed", [](const std::string* line) {
+            return line && line->find("Error starting descriptors keypool top-up database transaction") != std::string::npos;
+        });
+        auto dest{wallet.GetNewChangeDestination(OutputType::P2MR)};
+        BOOST_REQUIRE_MESSAGE(dest.has_value(), util::ErrorString(dest).original);
+    }
+
+    BOOST_CHECK_EQUAL(database.m_txn_begin_count, 1);
+    BOOST_CHECK_EQUAL(database.m_txn_abort_count, 0);
+    BOOST_CHECK_EQUAL(database.m_txn_commit_count, 0);
+    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), low_watermark - 1);
+}
+
 BOOST_FIXTURE_TEST_CASE(P2MRGetRawChangeAddressSchedulesLowWatermarkRefill, RegtestP2MROnlyWalletTestingSetup)
 {
     constexpr int64_t keypool_size{64};

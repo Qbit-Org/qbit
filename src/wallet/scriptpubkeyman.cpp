@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <array>
+#include <exception>
 #include <optional>
 #include <set>
 #include <span>
@@ -1699,7 +1700,16 @@ void DescriptorScriptPubKeyMan::MaybeTopUpInternalP2MRKeyPool()
 
     const unsigned int target{GetP2MRReceiveKeyPoolRefillStepTargetNoLock()};
     if (target == 0) return;
-    (void)TopUpWithInternalHintResult(/*internal_hint=*/true, target);
+    try {
+        util::Result<void> res{TopUpWithInternalHintResult(/*internal_hint=*/true, target)};
+        if (!res) {
+            WalletLogPrintf("P2MR change keypool inline low-watermark refill failed (descriptor id %s, target=%u, remaining=%u): %s\n",
+                GetID().ToString(), target, GetKeyPoolSizeNoLock(), util::ErrorString(res).original);
+        }
+    } catch (const std::exception& e) {
+        WalletLogPrintf("P2MR change keypool inline low-watermark refill failed (descriptor id %s, target=%u, remaining=%u): %s\n",
+            GetID().ToString(), target, GetKeyPoolSizeNoLock(), e.what());
+    }
 }
 
 unsigned int DescriptorScriptPubKeyMan::GetP2MRReceiveKeyPoolLowWatermarkNoLock() const
