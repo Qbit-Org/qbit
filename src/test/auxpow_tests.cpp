@@ -12,10 +12,12 @@
 #include <node/kernel_notifications.h>
 #include <node/miner.h>
 #include <pow.h>
+#include <rpc/mining.h>
 #include <script/script.h>
 #include <streams.h>
 #include <test/util/setup_common.h>
 #include <uint256.h>
+#include <univalue.h>
 #include <validation.h>
 
 #include <boost/test/unit_test.hpp>
@@ -24,6 +26,7 @@
 #include <array>
 #include <limits>
 #include <memory>
+#include <string>
 #include <vector>
 
 using node::BlockAssembler;
@@ -131,6 +134,43 @@ std::shared_ptr<const CAuxPow> MakeAuxpowPayload(const uint256& aux_block_hash, 
     return auxpow;
 }
 
+std::string HexStrFromStream(const DataStream& stream)
+{
+    return HexStr(stream);
+}
+
+std::string SerializeAuxpowHex(const CAuxPow& auxpow)
+{
+    DataStream stream;
+    stream << auxpow;
+    return HexStrFromStream(stream);
+}
+
+std::string SerializeLegacyAuxpowHex(const CAuxPow& auxpow, const uint256& legacy_hash_block)
+{
+    DataStream stream;
+    stream << TX_NO_WITNESS(auxpow.coinbase_tx);
+    stream << legacy_hash_block;
+    stream << auxpow.coinbase_merkle_branch;
+    stream << auxpow.coinbase_branch_index;
+    stream << auxpow.chain_merkle_branch;
+    stream << auxpow.chain_index;
+    stream << auxpow.parent_block;
+    return HexStrFromStream(stream);
+}
+
+void CheckAuxpowPayloadEqual(const CAuxPow& actual, const CAuxPow& expected)
+{
+    BOOST_REQUIRE(actual.coinbase_tx);
+    BOOST_REQUIRE(expected.coinbase_tx);
+    BOOST_CHECK_EQUAL(actual.coinbase_tx->GetHash(), expected.coinbase_tx->GetHash());
+    BOOST_CHECK(actual.coinbase_merkle_branch == expected.coinbase_merkle_branch);
+    BOOST_CHECK_EQUAL(actual.coinbase_branch_index, expected.coinbase_branch_index);
+    BOOST_CHECK(actual.chain_merkle_branch == expected.chain_merkle_branch);
+    BOOST_CHECK_EQUAL(actual.chain_index, expected.chain_index);
+    BOOST_CHECK_EQUAL(actual.parent_block.GetHash(), expected.parent_block.GetHash());
+}
+
 CBlockHeader MakeAuxpowHeader(const Consensus::Params& consensus)
 {
     CBlockHeader header;
@@ -234,6 +274,50 @@ BOOST_AUTO_TEST_CASE(auxpow_block_roundtrip_preserves_payload_and_merkle_root)
     BOOST_CHECK_EQUAL(decoded.hashMerkleRoot, block.hashMerkleRoot);
     BOOST_CHECK_EQUAL(decoded.vtx.size(), block.vtx.size());
     BOOST_CHECK_EQUAL(BlockMerkleRoot(decoded), decoded.hashMerkleRoot);
+}
+
+BOOST_AUTO_TEST_CASE(auxpow_rpc_decoder_accepts_canonical_payload)
+{
+    const auto consensus = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
+    const CBlockHeader header = MakeAuxpowHeader(consensus);
+
+    const CAuxPow decoded = DecodeHexAuxPow(SerializeAuxpowHex(*header.auxpow));
+
+    CheckAuxpowPayloadEqual(decoded, *header.auxpow);
+}
+
+BOOST_AUTO_TEST_CASE(auxpow_rpc_decoder_accepts_legacy_payload)
+{
+    const auto consensus = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
+    const CBlockHeader header = MakeAuxpowHeader(consensus);
+
+    const std::string canonical_hex = SerializeAuxpowHex(*header.auxpow);
+    const std::string legacy_hex = SerializeLegacyAuxpowHex(*header.auxpow, header.auxpow->parent_block.GetHash());
+    const CAuxPow decoded_with_parent_hash = DecodeHexAuxPow(legacy_hex);
+    CheckAuxpowPayloadEqual(decoded_with_parent_hash, *header.auxpow);
+    BOOST_CHECK_EQUAL(SerializeAuxpowHex(decoded_with_parent_hash), canonical_hex);
+    BOOST_CHECK_NE(SerializeAuxpowHex(decoded_with_parent_hash), legacy_hex);
+
+    const CAuxPow decoded_with_null_hash = DecodeHexAuxPow(SerializeLegacyAuxpowHex(*header.auxpow, uint256{}));
+    CheckAuxpowPayloadEqual(decoded_with_null_hash, *header.auxpow);
+}
+
+BOOST_AUTO_TEST_CASE(auxpow_rpc_decoder_rejects_malformed_legacy_payload)
+{
+    const auto consensus = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
+    const CBlockHeader header = MakeAuxpowHeader(consensus);
+
+    std::string truncated_legacy = SerializeLegacyAuxpowHex(*header.auxpow, header.auxpow->parent_block.GetHash());
+    truncated_legacy.resize(truncated_legacy.size() - 2);
+    BOOST_CHECK_THROW(DecodeHexAuxPow(truncated_legacy), UniValue);
+}
+
+BOOST_AUTO_TEST_CASE(auxpow_rpc_decoder_rejects_mismatched_legacy_hash_block)
+{
+    const auto consensus = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
+    const CBlockHeader header = MakeAuxpowHeader(consensus);
+
+    BOOST_CHECK_THROW(DecodeHexAuxPow(SerializeLegacyAuxpowHex(*header.auxpow, uint256{42})), UniValue);
 }
 
 BOOST_AUTO_TEST_CASE(auxpow_rejects_missing_and_unexpected_payload)
