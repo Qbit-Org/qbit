@@ -209,7 +209,18 @@ Do not pad the comment with speculative findings. If no actionable issues are fo
 
 Present the result to the user as a proposed comment, not as a posted comment. Do not use a separate non-publication disclaimer preamble.
 
-The comment should be slightly verbose about review scope and validation evidence. Name the issue, PR artifacts, code paths, test suites, CI workflows, comments, and unresolved-thread state that were checked. Keep findings concise, but give the reader enough context to understand what the review did and did not cover.
+The comment should be a polished review comment, not a raw audit log. Be explicit about what was checked and validated, but keep the pacing tight: concise paragraphs by default, with bullets only where they improve scanability or support a concrete finding.
+
+Aim for a good compromise:
+
+- Include enough evidence that another reviewer can tell what was checked, which issue contract was used, which code paths mattered, and what validation was reviewed.
+- Do not paste the full private checklist, evidence ledger, or every searched CI log line into the comment.
+- Prefer short paragraphs for `Review Scope`, `Issue Fit`, `qbit-Specific Checks`, `Validation Reviewed`, and `Residual Risk`.
+- Use bullets for actionable findings, changed-file summaries when helpful, exact acceptance criteria when the issue is broad, or validation inventories when CI evidence is important.
+- Keep `Deep Checks Performed` concise. It should summarize the most important review passes and attempted-disproof checks, not enumerate every generic skill step.
+- If the PR has no findings and CI is straightforward, keep the whole comment short and reviewer-like.
+- If the PR touches consensus, serialization, mining, wallet fund safety, cryptography, P2P/DoS, release signing, or has incomplete/failing validation, expand with enough concrete evidence to make the conclusion auditable.
+- Never let verbosity imply a stronger review than was actually performed. State local validation gaps plainly.
 
 The final answer should include:
 
@@ -238,19 +249,19 @@ No blocking findings from this review pass.
 Short explanation grounded in the diff.
 
 ### Review Scope
-What was reviewed: backing issue, PR body, changed files, relevant code paths, callers/callees traced, comments/reviews, unresolved thread state, and CI/status checks inspected.
+What was reviewed: backing issue, PR body, changed files, relevant code paths, comments/reviews, unresolved thread state, and CI/status checks inspected. Summarize in one paragraph unless a changed-file list materially improves clarity.
 
 ### Deep Checks Performed
-Summarize the substantive passes performed: issue-contract checklist, consensus impact audit, qbit-specific risk surfaces, lock/persistence/restart/error-path review, test adequacy review, validation evidence review, and attempted disproof of any suspected findings.
+Summarize the substantive passes performed and the strongest attempted-disproof checks. Keep this to a short paragraph or a small targeted bullet list. Do not list generic checks that were irrelevant to the diff.
 
 ### Issue Fit
-How the PR does or does not satisfy the backing issue. Note scope drift and missing acceptance criteria.
+How the PR does or does not satisfy the backing issue. Note scope drift and missing acceptance criteria. Use bullets only when mapping several acceptance criteria.
 
 ### qbit-Specific Checks
-Relevant checks performed for consensus, PQC/P2MR, AuxPoW/mining, wallet/RPC, PHOTON, or release surfaces.
+Relevant checks performed for consensus, PQC/P2MR, AuxPoW/mining, wallet/RPC, PHOTON, or release surfaces. Mention untouched high-risk qbit surfaces only when that helps bound review scope.
 
 ### Validation Reviewed
-Tests, CI workflows/jobs, manual commands, vectors, benchmark/log evidence, or missing validation evidence. Distinguish tests listed by the author from tests found in CI logs.
+Tests, CI workflows/jobs, manual commands, vectors, benchmark/log evidence, or missing validation evidence. Distinguish tests listed by the author from tests found in CI logs. Summarize green CI; expand when a required validation command was located in logs, when checks are failing/skipped, or when a validation gap remains.
 
 ### Residual Risk
 Short list of what this review did not prove.
