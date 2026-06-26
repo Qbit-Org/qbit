@@ -99,6 +99,8 @@ static constexpr int64_t UNKNOWN_TIME = std::numeric_limits<int64_t>::max();
 
 //! Default for -keypool
 static const unsigned int DEFAULT_KEYPOOL_SIZE = 1000;
+//! Fresh P2MR wallets only need a few addresses immediately; refill the rest in bounded batches.
+static constexpr unsigned int DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL = 16;
 
 std::vector<CKeyID> GetAffectedKeys(const CScript& spk, const SigningProvider& provider);
 
@@ -137,7 +139,7 @@ public:
     virtual bool CheckDecryptionKey(const CKeyingMaterial& master_key) { return false; }
     virtual bool Encrypt(const CKeyingMaterial& master_key, WalletBatch* batch) { return false; }
 
-    virtual util::Result<CTxDestination> GetReservedDestination(const OutputType type, bool internal, int64_t& index) { return util::Error{Untranslated("Not supported")}; }
+    virtual util::Result<CTxDestination> GetReservedDestination(const OutputType type, bool internal, int64_t& index, bool allow_internal_p2mr_refill = true) { return util::Error{Untranslated("Not supported")}; }
     virtual void KeepDestination(int64_t index, const OutputType& type) {}
     virtual void ReturnDestination(int64_t index, bool internal, const CTxDestination& addr) {}
 
@@ -381,6 +383,19 @@ private:
     bool ReservePQCSignatureCountersBatch(const std::map<CPQCPubKey, uint32_t>& counts, std::map<CPQCPubKey, PQCSignatureCounterRange>& ranges) const;
     PQCSignatureCounterReserver MakePQCSignatureCounterReserver() const;
     PQCSignatureCounterBatchReserver MakePQCSignatureCounterBatchReserver() const;
+    struct TopUpPreparation {
+        std::optional<bool> spkman_is_internal;
+        FlatSigningProvider provider;
+        bool has_encryption_keys{false};
+        std::optional<CKeyingMaterial> encryption_key;
+    };
+    TopUpPreparation PrepareTopUp(std::optional<bool> internal_hint) const;
+    bool IsRangedP2MRDescriptorNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    unsigned int GetKeyPoolSizeNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    bool NeedsP2MRKeyPoolRefillNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    void MaybeTopUpInternalP2MRKeyPool() EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    unsigned int GetP2MRReceiveKeyPoolLowWatermarkNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    unsigned int GetP2MRReceiveKeyPoolRefillStepTargetNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
 
     KeyMap GetKeys() const;
 
@@ -398,6 +413,7 @@ protected:
     //! Same as 'TopUp' but designed for use within a batch transaction context
     bool TopUpWithDB(WalletBatch& batch, unsigned int size = 0, std::optional<bool> internal_hint = std::nullopt);
     util::Result<void> TopUpWithDBResult(WalletBatch& batch, unsigned int size = 0, std::optional<bool> internal_hint = std::nullopt, bool throw_on_persistence_error = false, bool rollback_state_on_error = true);
+    util::Result<void> TopUpWithDBPreparedResult(WalletBatch& batch, unsigned int size, const TopUpPreparation& prepared, bool throw_on_persistence_error, bool rollback_state_on_error) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
 
 public:
     DescriptorScriptPubKeyMan(WalletStorage& storage, WalletDescriptor& descriptor, int64_t keypool_size);
@@ -411,7 +427,7 @@ public:
     bool CheckDecryptionKey(const CKeyingMaterial& master_key) override;
     bool Encrypt(const CKeyingMaterial& master_key, WalletBatch* batch) override;
 
-    util::Result<CTxDestination> GetReservedDestination(const OutputType type, bool internal, int64_t& index) override;
+    util::Result<CTxDestination> GetReservedDestination(const OutputType type, bool internal, int64_t& index, bool allow_internal_p2mr_refill = true) override;
     void ReturnDestination(int64_t index, bool internal, const CTxDestination& addr) override;
 
     // Tops up the descriptor cache and m_map_script_pub_keys. The cache is stored in the wallet file
@@ -431,6 +447,11 @@ public:
     bool SetupDescriptorGeneration(WalletBatch& batch, const CExtKey& master_key, OutputType addr_type, bool internal, unsigned int initial_keypool_size = 0);
     bool HasDeferredCreateKeyPoolTopUp() const;
     void MaybeRestoreDeferredCreateKeyPoolTopUp();
+    bool IsRangedP2MRDescriptor() const;
+    unsigned int GetP2MRReceiveKeyPoolLowWatermark() const;
+    bool NeedsP2MRReceiveKeyPoolRefill() const;
+    bool P2MRReceiveKeyPoolFull() const;
+    unsigned int GetP2MRReceiveKeyPoolRefillStepTarget() const;
 
     bool HavePrivateKeys() const override;
     bool HasPrivKey(const CKeyID& keyid) const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);

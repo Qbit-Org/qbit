@@ -170,8 +170,11 @@ public:
     std::unique_ptr<Wallet> clone() override { return std::make_unique<WalletImpl>(m_context, m_wallet); }
     util::Result<CTxDestination> getNewDestination(const OutputType type, const std::string& label) override
     {
-        LOCK(m_wallet->cs_wallet);
-        return m_wallet->GetNewDestination(type, label);
+        util::Result<CTxDestination> result = WITH_LOCK(m_wallet->cs_wallet, return m_wallet->GetNewDestination(type, label));
+        if (result) {
+            MaybeScheduleP2MRKeyPoolRefill(m_context, m_wallet, type, /*internal=*/false);
+        }
+        return result;
     }
     bool getPubKey(const CScript& script, const CKeyID& address, CPubKey& pub_key) override
     {

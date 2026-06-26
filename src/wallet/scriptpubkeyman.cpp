@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <array>
+#include <exception>
 #include <optional>
 #include <set>
 #include <span>
@@ -954,7 +955,7 @@ util::Result<CTxDestination> DescriptorScriptPubKeyMan::GetNewDestination(const 
             throw std::runtime_error(std::string(__func__) + ": Types are inconsistent. Stored type does not match type of newly generated address");
         }
 
-        if (!m_deferred_create_keypool_top_up) {
+        if (!m_deferred_create_keypool_top_up && !IsRangedP2MRDescriptorNoLock()) {
             TopUp();
         }
 
@@ -1082,9 +1083,12 @@ bool DescriptorScriptPubKeyMan::Encrypt(const CKeyingMaterial& master_key, Walle
     return true;
 }
 
-util::Result<CTxDestination> DescriptorScriptPubKeyMan::GetReservedDestination(const OutputType type, bool internal, int64_t& index)
+util::Result<CTxDestination> DescriptorScriptPubKeyMan::GetReservedDestination(const OutputType type, bool internal, int64_t& index, bool allow_internal_p2mr_refill)
 {
     LOCK(cs_desc_man);
+    if (internal && allow_internal_p2mr_refill) {
+        MaybeTopUpInternalP2MRKeyPool();
+    }
     auto op_dest = GetNewDestination(type);
     index = m_wallet_descriptor.next_index - 1;
     return op_dest;
@@ -1185,13 +1189,33 @@ bool DescriptorScriptPubKeyMan::TopUpWithInternalHint(std::optional<bool> intern
     return TopUpWithInternalHintResult(internal_hint, size).has_value();
 }
 
+DescriptorScriptPubKeyMan::TopUpPreparation DescriptorScriptPubKeyMan::PrepareTopUp(std::optional<bool> internal_hint) const
+{
+    TopUpPreparation prepared;
+    prepared.spkman_is_internal = internal_hint.has_value() ? internal_hint : m_storage.IsInternalScriptPubKeyMan(this);
+    prepared.provider.keys = GetKeys();
+    prepared.has_encryption_keys = m_storage.HasEncryptionKeys();
+    if (prepared.has_encryption_keys) {
+        m_storage.WithEncryptionKey([&](const CKeyingMaterial& key) {
+            if (!key.empty()) {
+                prepared.encryption_key = key;
+            }
+            return true;
+        });
+    }
+    return prepared;
+}
+
 util::Result<void> DescriptorScriptPubKeyMan::TopUpWithInternalHintResult(std::optional<bool> internal_hint, unsigned int size)
 {
+    const TopUpPreparation prepared{PrepareTopUp(internal_hint)};
+    LOCK(cs_desc_man);
+    // Keep descriptor and database lock ordering aligned with address reservation.
     WalletBatch batch(m_storage.GetDatabase());
     if (!batch.TxnBegin()) {
         return util::Error{_("Error starting descriptors keypool top-up database transaction")};
     }
-    util::Result<void> res{TopUpWithDBResult(batch, size, internal_hint, /*throw_on_persistence_error=*/false, /*rollback_state_on_error=*/true)};
+    util::Result<void> res{TopUpWithDBPreparedResult(batch, size, prepared, /*throw_on_persistence_error=*/false, /*rollback_state_on_error=*/true)};
     if (!res) {
         if (!batch.TxnAbort()) {
             throw std::runtime_error(strprintf(
@@ -1211,21 +1235,14 @@ bool DescriptorScriptPubKeyMan::TopUpWithDB(WalletBatch& batch, unsigned int siz
 
 util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBResult(WalletBatch& batch, unsigned int size, std::optional<bool> internal_hint, bool throw_on_persistence_error, bool rollback_state_on_error)
 {
-    const std::optional<bool> spkman_is_internal = internal_hint.has_value() ? internal_hint : m_storage.IsInternalScriptPubKeyMan(this);
-    FlatSigningProvider provider;
-    provider.keys = GetKeys();
-    const bool has_encryption_keys = m_storage.HasEncryptionKeys();
-    std::optional<CKeyingMaterial> encryption_key;
-    if (has_encryption_keys) {
-        m_storage.WithEncryptionKey([&](const CKeyingMaterial& key) {
-            if (!key.empty()) {
-                encryption_key = key;
-            }
-            return true;
-        });
-    }
-
+    const TopUpPreparation prepared{PrepareTopUp(internal_hint)};
     LOCK(cs_desc_man);
+    return TopUpWithDBPreparedResult(batch, size, prepared, throw_on_persistence_error, rollback_state_on_error);
+}
+
+util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBPreparedResult(WalletBatch& batch, unsigned int size, const TopUpPreparation& prepared, bool throw_on_persistence_error, bool rollback_state_on_error)
+{
+    AssertLockHeld(cs_desc_man);
     const int32_t old_range_start{m_wallet_descriptor.range_start};
     const int32_t old_range_end{m_wallet_descriptor.range_end};
     const std::optional<bool> old_descriptor_deferred_create_keypool_top_up{m_wallet_descriptor.deferred_create_keypool_top_up};
@@ -1340,8 +1357,8 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBResult(WalletBatch& bat
         has_ecdsa_p2mr_source = !pubkeys.empty() || !ext_pubs.empty();
         for (const auto& pubkey : pubkeys) {
             has_private_p2mr_source |= HasPrivKey(pubkey.GetID());
-            const auto it = provider.keys.find(pubkey.GetID());
-            if (it != provider.keys.end()) {
+            const auto it = prepared.provider.keys.find(pubkey.GetID());
+            if (it != prepared.provider.keys.end()) {
                 pqc_master_key = it->second;
                 break;
             }
@@ -1349,8 +1366,8 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBResult(WalletBatch& bat
         for (const auto& ext_pub : ext_pubs) {
             has_private_p2mr_source |= HasPrivKey(ext_pub.pubkey.GetID());
             if (pqc_master_key) continue;
-            const auto it = provider.keys.find(ext_pub.pubkey.GetID());
-            if (it != provider.keys.end()) {
+            const auto it = prepared.provider.keys.find(ext_pub.pubkey.GetID());
+            if (it != prepared.provider.keys.end()) {
                 pqc_master_key = it->second;
             }
         }
@@ -1362,7 +1379,7 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBResult(WalletBatch& bat
         if (can_derive_pqc) {
             const auto* seed_ptr = reinterpret_cast<const unsigned char*>(pqc_master_key->begin());
             const uint32_t pqc_index = 0;
-            if (spkman_is_internal.has_value()) {
+            if (prepared.spkman_is_internal.has_value()) {
                 // Non-ranged pqc(...) descriptors always expand the address path
                 // via change=0, so keep the pre-derived private key aligned.
                 const uint32_t change = 0U;
@@ -1373,8 +1390,8 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBResult(WalletBatch& bat
                 const CPQCPubKey pqc_pub = pqc_key.GetPubKey();
                 const bool had_pqc_key = m_map_pqc_keys.contains(pqc_pub) || m_map_crypted_pqc_keys.contains(pqc_pub) || m_pending_plaintext_pqc_keys.contains(pqc_pub);
                 remember_pqc_key(pqc_pub);
-                if (!AddDescriptorPQCKeyWithDB(batch, pqc_pub, pqc_key, has_encryption_keys, encryption_key ? &*encryption_key : nullptr)) {
-                    if (has_encryption_keys && !encryption_key) {
+                if (!AddDescriptorPQCKeyWithDB(batch, pqc_pub, pqc_key, prepared.has_encryption_keys, prepared.encryption_key ? &*prepared.encryption_key : nullptr)) {
+                    if (prepared.has_encryption_keys && !prepared.encryption_key) {
                         return persistence_error(_("wallet encryption key is unavailable for P2MR private-key persistence"), /*persistence_write_may_have_started=*/false);
                     }
                     return persistence_error(Untranslated(strprintf("failed to write P2MR private key at descriptor index %d", i)));
@@ -1390,8 +1407,8 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBResult(WalletBatch& bat
                     const CPQCPubKey pqc_pub = pqc_key.GetPubKey();
                     const bool had_pqc_key = m_map_pqc_keys.contains(pqc_pub) || m_map_crypted_pqc_keys.contains(pqc_pub) || m_pending_plaintext_pqc_keys.contains(pqc_pub);
                     remember_pqc_key(pqc_pub);
-                    if (!AddDescriptorPQCKeyWithDB(batch, pqc_pub, pqc_key, has_encryption_keys, encryption_key ? &*encryption_key : nullptr)) {
-                        if (has_encryption_keys && !encryption_key) {
+                    if (!AddDescriptorPQCKeyWithDB(batch, pqc_pub, pqc_key, prepared.has_encryption_keys, prepared.encryption_key ? &*prepared.encryption_key : nullptr)) {
+                        if (prepared.has_encryption_keys && !prepared.encryption_key) {
                             return persistence_error(_("wallet encryption key is unavailable for P2MR private-key persistence"), /*persistence_write_may_have_started=*/false);
                         }
                         return persistence_error(Untranslated(strprintf("failed to write P2MR private key at descriptor index %d", i)));
@@ -1407,8 +1424,8 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBResult(WalletBatch& bat
         // Maybe we have a cached xpub and we can expand from the cache first
         const bool expanded_from_cache = m_wallet_descriptor.descriptor->ExpandFromCache(i, m_wallet_descriptor.cache, scripts_temp, out_keys);
         if (!expanded_from_cache) {
-            if (!m_wallet_descriptor.descriptor->Expand(i, provider, scripts_temp, out_keys, &temp_cache)) {
-                if (is_p2mr && has_encryption_keys && !encryption_key && has_private_p2mr_source) {
+            if (!m_wallet_descriptor.descriptor->Expand(i, prepared.provider, scripts_temp, out_keys, &temp_cache)) {
+                if (is_p2mr && prepared.has_encryption_keys && !prepared.encryption_key && has_private_p2mr_source) {
                     return persistence_error(_("wallet encryption key is unavailable for P2MR private-key persistence"), /*persistence_write_may_have_started=*/false);
                 }
                 return top_up_error(Untranslated(strprintf("descriptor expansion failed at index %d; private derivation material may be missing or unavailable", i)));
@@ -1419,9 +1436,9 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBResult(WalletBatch& bat
                 // Cache entries only retain the derived PQC pubkey. Re-expand the
                 // private side so imported cached descriptors can still persist the
                 // signable PQC keys the wallet needs.
-                m_wallet_descriptor.descriptor->ExpandPrivate(i, provider, out_keys);
+                m_wallet_descriptor.descriptor->ExpandPrivate(i, prepared.provider, out_keys);
             }
-            if (has_encryption_keys && !encryption_key && has_private_p2mr_source) {
+            if (prepared.has_encryption_keys && !prepared.encryption_key && has_private_p2mr_source) {
                 for (const auto& p2mr_pair : out_keys.p2mr_pubkeys) {
                     const CPQCPubKey& pqc_pub = p2mr_pair.second;
                     const bool has_pqc_key = m_map_pqc_keys.contains(pqc_pub) || m_map_crypted_pqc_keys.contains(pqc_pub) || m_pending_plaintext_pqc_keys.contains(pqc_pub);
@@ -1433,8 +1450,8 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBResult(WalletBatch& bat
             for (const auto& [pqc_pub, pqc_key] : out_keys.pqc_keys) {
                 const bool had_pqc_key = m_map_pqc_keys.contains(pqc_pub) || m_map_crypted_pqc_keys.contains(pqc_pub) || m_pending_plaintext_pqc_keys.contains(pqc_pub);
                 remember_pqc_key(pqc_pub);
-                if (!AddDescriptorPQCKeyWithDB(batch, pqc_pub, pqc_key, has_encryption_keys, encryption_key ? &*encryption_key : nullptr)) {
-                    if (has_encryption_keys && !encryption_key) {
+                if (!AddDescriptorPQCKeyWithDB(batch, pqc_pub, pqc_key, prepared.has_encryption_keys, prepared.encryption_key ? &*prepared.encryption_key : nullptr)) {
+                    if (prepared.has_encryption_keys && !prepared.encryption_key) {
                         return persistence_error(_("wallet encryption key is unavailable for P2MR private-key persistence"), /*persistence_write_may_have_started=*/false);
                     }
                     return persistence_error(Untranslated(strprintf("failed to write P2MR private key at descriptor index %d", i)));
@@ -1646,6 +1663,97 @@ void DescriptorScriptPubKeyMan::MaybeRestoreDeferredCreateKeyPoolTopUp()
     m_deferred_create_keypool_top_up = ShouldDeferCreateKeyPoolTopUp(m_wallet_descriptor, m_keypool_size);
 }
 
+bool DescriptorScriptPubKeyMan::IsRangedP2MRDescriptorNoLock() const
+{
+    AssertLockHeld(cs_desc_man);
+    if (!m_wallet_descriptor.descriptor) return false;
+    const std::optional<OutputType> output_type{m_wallet_descriptor.descriptor->GetOutputType()};
+    return output_type && *output_type == OutputType::P2MR && m_wallet_descriptor.descriptor->IsRange();
+}
+
+bool DescriptorScriptPubKeyMan::IsRangedP2MRDescriptor() const
+{
+    LOCK(cs_desc_man);
+    return IsRangedP2MRDescriptorNoLock();
+}
+
+unsigned int DescriptorScriptPubKeyMan::GetKeyPoolSizeNoLock() const
+{
+    AssertLockHeld(cs_desc_man);
+    if (m_wallet_descriptor.range_end <= m_wallet_descriptor.next_index) return 0;
+    return static_cast<unsigned int>(m_wallet_descriptor.range_end - m_wallet_descriptor.next_index);
+}
+
+bool DescriptorScriptPubKeyMan::NeedsP2MRKeyPoolRefillNoLock() const
+{
+    AssertLockHeld(cs_desc_man);
+    return IsRangedP2MRDescriptorNoLock() &&
+           !m_deferred_create_keypool_top_up &&
+           GetKeyPoolSizeNoLock() < static_cast<unsigned int>(m_keypool_size) &&
+           GetKeyPoolSizeNoLock() <= GetP2MRReceiveKeyPoolLowWatermarkNoLock();
+}
+
+void DescriptorScriptPubKeyMan::MaybeTopUpInternalP2MRKeyPool()
+{
+    AssertLockHeld(cs_desc_man);
+    if (m_storage.IsLocked() || !NeedsP2MRKeyPoolRefillNoLock()) return;
+
+    const unsigned int target{GetP2MRReceiveKeyPoolRefillStepTargetNoLock()};
+    if (target == 0) return;
+    try {
+        util::Result<void> res{TopUpWithInternalHintResult(/*internal_hint=*/true, target)};
+        if (!res) {
+            WalletLogPrintf("P2MR change keypool inline low-watermark refill failed (descriptor id %s, target=%u, remaining=%u): %s\n",
+                GetID().ToString(), target, GetKeyPoolSizeNoLock(), util::ErrorString(res).original);
+        }
+    } catch (const std::exception& e) {
+        WalletLogPrintf("P2MR change keypool inline low-watermark refill failed (descriptor id %s, target=%u, remaining=%u): %s\n",
+            GetID().ToString(), target, GetKeyPoolSizeNoLock(), e.what());
+    }
+}
+
+unsigned int DescriptorScriptPubKeyMan::GetP2MRReceiveKeyPoolLowWatermarkNoLock() const
+{
+    AssertLockHeld(cs_desc_man);
+    return std::min<int64_t>(
+        m_keypool_size,
+        std::max<int64_t>(DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL, m_keypool_size / 10));
+}
+
+unsigned int DescriptorScriptPubKeyMan::GetP2MRReceiveKeyPoolLowWatermark() const
+{
+    LOCK(cs_desc_man);
+    return GetP2MRReceiveKeyPoolLowWatermarkNoLock();
+}
+
+bool DescriptorScriptPubKeyMan::NeedsP2MRReceiveKeyPoolRefill() const
+{
+    LOCK(cs_desc_man);
+    return NeedsP2MRKeyPoolRefillNoLock();
+}
+
+bool DescriptorScriptPubKeyMan::P2MRReceiveKeyPoolFull() const
+{
+    LOCK(cs_desc_man);
+    return !IsRangedP2MRDescriptorNoLock() ||
+           GetKeyPoolSizeNoLock() >= static_cast<unsigned int>(m_keypool_size);
+}
+
+unsigned int DescriptorScriptPubKeyMan::GetP2MRReceiveKeyPoolRefillStepTargetNoLock() const
+{
+    AssertLockHeld(cs_desc_man);
+    if (!IsRangedP2MRDescriptorNoLock()) return 0;
+    return std::min<int64_t>(
+        m_keypool_size,
+        int64_t{GetKeyPoolSizeNoLock()} + DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+}
+
+unsigned int DescriptorScriptPubKeyMan::GetP2MRReceiveKeyPoolRefillStepTarget() const
+{
+    LOCK(cs_desc_man);
+    return GetP2MRReceiveKeyPoolRefillStepTargetNoLock();
+}
+
 bool DescriptorScriptPubKeyMan::IsHDEnabled() const
 {
     LOCK(cs_desc_man);
@@ -1748,7 +1856,7 @@ PQCKeyValidationInfo DescriptorScriptPubKeyMan::GetPQCKeyValidationInfo() const
 unsigned int DescriptorScriptPubKeyMan::GetKeyPoolSize() const
 {
     LOCK(cs_desc_man);
-    return m_wallet_descriptor.range_end - m_wallet_descriptor.next_index;
+    return GetKeyPoolSizeNoLock();
 }
 
 int64_t DescriptorScriptPubKeyMan::GetTimeFirstKey() const
