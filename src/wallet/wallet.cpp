@@ -1496,10 +1496,15 @@ bool CWallet::AddToWalletIfInvolvingMe(const CTransactionRef& ptx, const SyncTxS
             // loop though all outputs
             for (const CTxOut& txout: tx.vout) {
                 for (const auto& spk_man : GetScriptPubKeyMans(txout.scriptPubKey)) {
-                    for (auto &dest : spk_man->MarkUnusedAddresses(txout.scriptPubKey)) {
+                    const std::optional<bool> internal{IsInternalScriptPubKeyMan(spk_man)};
+                    const MarkUnusedAddressesOptions mark_options{
+                        .internal_hint = internal,
+                        .preserve_full_keypool_lookahead = rescanning_old_block,
+                    };
+                    for (auto &dest : spk_man->MarkUnusedAddresses(txout.scriptPubKey, mark_options)) {
                         // If internal flag is not defined try to infer it from the ScriptPubKeyMan
                         if (!dest.internal.has_value()) {
-                            dest.internal = IsInternalScriptPubKeyMan(spk_man);
+                            dest.internal = internal;
                         }
 
                         // skip if can't determine whether it's a receiving address or not
