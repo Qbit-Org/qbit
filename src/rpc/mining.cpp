@@ -1085,12 +1085,11 @@ static RPCHelpMan getblocktemplate()
 
     // Keep explicit -blockversion regtest overrides intact (they may not use the
     // BIP9 top-bit shape); only canonicalize versions already in BIP9 layout.
+    // Permissionless getblocktemplate candidates never include an AuxPoW
+    // payload, so the returned version must not signal AuxPoW. The dedicated
+    // createauxblock/submitauxblock path sets AuxPoW versions explicitly.
     if (HasBIP9TopBitsShape(block.nVersion)) {
-        const bool auxpow_version{block.SignalsAuxpow()};
-        CHECK_NONFATAL(consensusParams.nAuxpowChainId >= 0);
-        CHECK_NONFATAL(consensusParams.nAuxpowChainId <= std::numeric_limits<uint16_t>::max());
-        const uint16_t chain_id{auxpow_version ? static_cast<uint16_t>(consensusParams.nAuxpowChainId) : uint16_t{0}};
-        block.nVersion = MakeVersion(chain_id, auxpow_version, block.GetVersionBits());
+        block.nVersion = MakeVersion(/*chain_id=*/0, /*auxpow=*/false, block.GetVersionBits());
     }
     const uint32_t version_rolling_mask{GetPermissionlessVersionRollingMask(block.nVersion)};
 
