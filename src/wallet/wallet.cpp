@@ -3252,7 +3252,7 @@ CWallet::P2MRKeyPoolRefillStepResult CWallet::RunP2MRKeyPoolRefillStep(bool inte
         bool& scheduled{internal ? m_p2mr_change_keypool_refill_scheduled : m_p2mr_receive_keypool_refill_scheduled};
         if (IsLocked() || HasPendingInitialKeyPoolTopUp()) {
             scheduled = false;
-            return P2MRKeyPoolRefillStepResult::COMPLETE;
+            return P2MRKeyPoolRefillStepResult::FAILED;
         }
         desc_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(GetScriptPubKeyMan(OutputType::P2MR, internal));
         if (!desc_spk_man || desc_spk_man->P2MRReceiveKeyPoolFull()) {

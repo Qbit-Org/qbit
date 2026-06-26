@@ -1653,6 +1653,35 @@ BOOST_FIXTURE_TEST_CASE(LockedEncryptedP2MRWalletUsesCachedChangeKeysBelowLowWat
     WaitForDeleteWallet(std::move(wallet));
 }
 
+BOOST_FIXTURE_TEST_CASE(LockedP2MRLowWatermarkRefillStepReportsFailure, RegtestP2MROnlyWalletTestingSetup)
+{
+    constexpr int64_t keypool_size{20};
+    const SecureString passphrase{"test-passphrase"};
+    m_args.ForceSetArg("-keypool", util::ToString(keypool_size));
+
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+
+    DatabaseOptions create_options;
+    create_options.require_create = true;
+    create_options.create_flags = WALLET_FLAG_DESCRIPTORS;
+    create_options.create_passphrase = passphrase;
+
+    DatabaseStatus status;
+    bilingual_str error;
+    std::vector<bilingual_str> warnings;
+    auto wallet = CreateWallet(context, "locked_refill_step_failure_test", std::nullopt, create_options, status, error, warnings);
+    BOOST_REQUIRE(wallet);
+    BOOST_REQUIRE_EQUAL(status, DatabaseStatus::SUCCESS);
+    BOOST_REQUIRE(wallet->IsLocked());
+
+    BOOST_CHECK(wallet->RunP2MRKeyPoolRefillStep(/*internal=*/false) == CWallet::P2MRKeyPoolRefillStepResult::FAILED);
+
+    BOOST_CHECK(RemoveWallet(context, wallet, std::nullopt));
+    WaitForDeleteWallet(std::move(wallet));
+}
+
 BOOST_FIXTURE_TEST_CASE(KeypoolTopUpReportsLockedInternalP2MRDescriptorFailure, RegtestP2MROnlyWalletTestingSetup)
 {
     constexpr int64_t keypool_size{64};
