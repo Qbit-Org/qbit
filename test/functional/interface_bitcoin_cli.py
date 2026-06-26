@@ -6,6 +6,8 @@
 
 from decimal import Decimal
 import re
+import socket
+import time
 
 from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.netutil import test_ipv6_local
@@ -18,7 +20,6 @@ from test_framework.util import (
     get_auth_cookie,
     rpc_port,
 )
-import time
 
 # Mine enough blocks to have one mature coinbase output.
 BLOCKS = COINBASE_MATURITY + 1
@@ -74,6 +75,16 @@ def cli_get_info_find_key(cli_get_info, key_prefix):
     matches = [key for key in cli_get_info if key.startswith(key_prefix) and key.endswith("/kvB)")]
     assert_equal(len(matches), 1)
     return matches[0]
+
+
+def can_connect_to_ipv6_rpc(port):
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as sock:
+            sock.settimeout(1)
+            sock.connect(("::1", port))
+            return True
+    except OSError:
+        return False
 
 
 class TestBitcoinCli(BitcoinTestFramework):
@@ -156,6 +167,9 @@ class TestBitcoinCli(BitcoinTestFramework):
 
         self.log.info("Test port usage preferences")
         node_rpc_port = rpc_port(self.nodes[0].index)
+        have_ipv6_rpc = have_ipv6 and can_connect_to_ipv6_rpc(node_rpc_port)
+        if have_ipv6 and not have_ipv6_rpc:
+            self.log.info("Skipping IPv6 RPC reachability tests; node RPC is not reachable on ::1")
         # Prevent qbit-cli from using existing rpcport in conf
         conf_rpcport = "rpcport=" + str(node_rpc_port)
         self.nodes[0].replace_in_config([(conf_rpcport, "#" + conf_rpcport)])
@@ -165,12 +179,12 @@ class TestBitcoinCli(BitcoinTestFramework):
             assert_raises_process_error(1, "Could not connect to the server ::1:1", self.nodes[0].cli(f"-rpcconnect=[::1]:{node_rpc_port}", "-rpcport=1").echo)
 
         assert_equal(BLOCKS, self.nodes[0].cli("-rpcconnect=127.0.0.1:18999", f'-rpcport={node_rpc_port}').getblockcount())
-        if have_ipv6:
+        if have_ipv6_rpc:
             assert_equal(BLOCKS, self.nodes[0].cli("-rpcconnect=[::1]:18999", f'-rpcport={node_rpc_port}').getblockcount())
 
         # prefer rpcconnect port over default
         assert_equal(BLOCKS, self.nodes[0].cli(f"-rpcconnect=127.0.0.1:{node_rpc_port}").getblockcount())
-        if have_ipv6:
+        if have_ipv6_rpc:
             assert_equal(BLOCKS, self.nodes[0].cli(f"-rpcconnect=[::1]:{node_rpc_port}").getblockcount())
 
         # prefer rpcport over default
