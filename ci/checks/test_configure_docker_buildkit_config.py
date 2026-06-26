@@ -100,6 +100,17 @@ class ConfigureDockerBuildKitConfigTest(unittest.TestCase):
             ),
         )
 
+    def test_public_registry_does_not_write_internal_registry_config(self) -> None:
+        config, github_env = self.run_script(
+            {
+                "CI_ENFORCE_INTERNAL_REGISTRY": "0",
+                "CI_IMAGE_REGISTRY_PREFIX": "docker.io/library",
+            }
+        )
+
+        self.assertEqual(config, "")
+        self.assertIn("BUILDKIT_CONFIG=", github_env)
+
     def test_action_input_dns_values_override_ci_env_values(self) -> None:
         config, _github_env = self.run_script(
             {

@@ -39,8 +39,9 @@ env:
   CI_FAILFAST_TEST_LEAVE_DANGLING: 1  # GHA does not care about dangling processes and setting this variable avoids killing the CI script itself on error
   CIRRUS_CACHE_HOST: http://127.0.0.1:12321/ # When using Cirrus Runners this host can be used by the docker `gha` build cache type.
   REPO_USE_CIRRUS_RUNNERS: '' # Disabled: using self-hosted runners
-  CI_IMAGE_REGISTRY_PREFIX: qbit-ci-autoscaler:5000/qbit-cache
-  CI_ENFORCE_INTERNAL_REGISTRY: 1
+  CI_PROFILE: ${{ github.repository == 'Qbit-Org/qbit' && 'internal' || 'public' }}
+  CI_IMAGE_REGISTRY_PREFIX: ${{ github.repository == 'Qbit-Org/qbit' && 'qbit-ci-autoscaler:5000/qbit-cache' || 'docker.io/library' }}
+  CI_ENFORCE_INTERNAL_REGISTRY: ${{ github.repository == 'Qbit-Org/qbit' && '1' || '0' }}
   CI_BUILDKIT_DNS_NAMESERVERS: ${{ github.repository == 'Qbit-Org/qbit' && '100.100.100.100,1.1.1.1,8.8.8.8' || '' }}
   CI_BUILDKIT_DNS_SEARCH_DOMAINS: ${{ github.repository == 'Qbit-Org/qbit' && 'tailfa7aa.ts.net,localdomain' || '' }}
 
@@ -134,15 +135,18 @@ jobs:
     runs-on: &qbit_runs_on ${{ github.repository == 'Qbit-Org/qbit' && fromJSON('["self-hosted", "linux", "x64", "qbit-trusted-ci"]') || fromJSON('["self-hosted", "linux", "x64"]') }}
     outputs:
       provider: ${{ steps.runners.outputs.provider }}
+      ci-profile: ${{ steps.runners.outputs.ci-profile }}
     steps:
       - id: runners
         run: |
+          echo "ci-profile=${CI_PROFILE}" >> "$GITHUB_OUTPUT"
+          echo "::notice title=CI Profile::Using ${CI_PROFILE} CI profile"
           if [[ "${REPO_USE_CIRRUS_RUNNERS}" == "${{ github.repository }}" ]]; then
             echo "provider=cirrus" >> "$GITHUB_OUTPUT"
-            echo "::notice title=Runner Selection::Using Cirrus Runners"
+            echo "::notice title=Cache Selection::Using Cirrus Runners cache backend"
           else
             echo "provider=gha" >> "$GITHUB_OUTPUT"
-            echo "::notice title=Runner Selection::Using GitHub-hosted runners"
+            echo "::notice title=Cache Selection::Using GitHub Actions cache backend"
           fi
 
   test-each-commit:
@@ -280,7 +284,7 @@ jobs:
 
   windows-native-dll:
     name: ${{ matrix.job-name }}
-    runs-on: blacksmith-8vcpu-windows-2025
+    runs-on: ${{ github.repository == 'Qbit-Org/qbit' && 'blacksmith-8vcpu-windows-2025' || 'windows-2022' }}
     needs: classify-changes
     if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted')))) }}
     timeout-minutes: 240
@@ -296,10 +300,10 @@ jobs:
         include:
           - job-type: standard
             generate-options: '-DBUILD_GUI=ON -DWITH_ZMQ=ON -DBUILD_BENCH=ON -DWERROR=ON'
-            job-name: 'Windows native, VS 2022 on Blacksmith'
+            job-name: 'Windows native, VS 2022'
           - job-type: fuzz
             generate-options: '-DVCPKG_MANIFEST_NO_DEFAULT_FEATURES=ON -DVCPKG_MANIFEST_FEATURES="wallet" -DBUILD_GUI=OFF -DBUILD_FOR_FUZZING=ON -DWERROR=ON'
-            job-name: 'Windows native, fuzz, VS 2022 on Blacksmith'
+            job-name: 'Windows native, fuzz, VS 2022'
 
     steps:
       - *CHECKOUT
@@ -609,7 +613,7 @@ jobs:
 
   windows-native-test:
     name: 'Windows, test cross-built'
-    runs-on: blacksmith-8vcpu-windows-2025
+    runs-on: ${{ github.repository == 'Qbit-Org/qbit' && 'blacksmith-8vcpu-windows-2025' || 'windows-2022' }}
     needs:
       - classify-changes
       - windows-cross
@@ -703,7 +707,7 @@ jobs:
       CTEST_JOBS: ${{ matrix.ctest-jobs || '6' }}
       CI_DOCKER_RUN_CPUS: ${{ matrix.container-cpus || '8' }}
       CI_DOCKER_RUN_MEMORY: ${{ matrix.container-memory || '48g' }}
-      CI_ENFORCE_INTERNAL_REGISTRY: ${{ matrix.file-env == './ci/test/00_setup_env_native_centos.sh' && '0' || '1' }}
+      CI_ENFORCE_INTERNAL_REGISTRY: ${{ github.repository == 'Qbit-Org/qbit' && matrix.file-env != './ci/test/00_setup_env_native_centos.sh' && '1' || '0' }}
 
     strategy:
       fail-fast: false
@@ -981,6 +985,7 @@ jobs:
           VALIDATION_PROFILE: ${{ needs.classify-changes.outputs.profile }}
           SOURCE_VALIDATION_REQUIRED: ${{ needs.classify-changes.outputs.source_validation_required }}
           RUNNERS_RESULT: ${{ needs.runners.result }}
+          CI_PROFILE: ${{ needs.runners.outputs.ci-profile }}
           WINDOWS_NATIVE_DLL_RESULT: ${{ needs.windows-native-dll.result }}
           WINDOWS_CROSS_RESULT: ${{ needs.windows-cross.result }}
           WINDOWS_NATIVE_TEST_RESULT: ${{ needs.windows-native-test.result }}
@@ -1004,6 +1009,7 @@ jobs:
           }
 
           check_result "classify validation profile" "${CLASSIFY_CHANGES_RESULT}"
+          echo "CI profile: ${CI_PROFILE:-unavailable}"
 
           if [[ "${SOURCE_VALIDATION_REQUIRED}" != "true" ]]; then
             echo "Validation profile ${VALIDATION_PROFILE} does not require full source validation."
