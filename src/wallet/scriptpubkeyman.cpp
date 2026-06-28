@@ -1509,9 +1509,18 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBPreparedResult(WalletBa
 
 std::vector<WalletDestination> DescriptorScriptPubKeyMan::MarkUnusedAddresses(const CScript& script, const MarkUnusedAddressesOptions& options)
 {
-    LOCK(cs_desc_man);
     std::vector<WalletDestination> result;
-    if (IsMine(script)) {
+    bool p2mr_refill{false};
+    bool non_p2mr_top_up{false};
+    unsigned int p2mr_refill_target{0};
+    unsigned int p2mr_remaining{0};
+    unsigned int p2mr_low_watermark{0};
+    std::string p2mr_descriptor_id;
+
+    {
+        LOCK(cs_desc_man);
+        if (!m_map_script_pub_keys.contains(script)) return result;
+
         int32_t index = m_map_script_pub_keys[script];
         bool advanced_next_index{false};
         if (index >= m_wallet_descriptor.next_index) {
@@ -1551,19 +1560,32 @@ std::vector<WalletDestination> DescriptorScriptPubKeyMan::MarkUnusedAddresses(co
             if (!NeedsP2MRKeyPoolRefillNoLock()) {
                 return result;
             }
-            if (m_storage.IsLocked()) {
-                WalletLogPrintf("%s: P2MR keypool low-watermark refill deferred for locked wallet (descriptor id %s, remaining=%u, low_watermark=%u)\n",
-                    __func__, GetID().ToString(), GetKeyPoolSizeNoLock(), GetP2MRReceiveKeyPoolLowWatermarkNoLock());
-                return result;
-            }
 
-            const unsigned int target{options.preserve_full_keypool_lookahead ? 0 : GetP2MRReceiveKeyPoolRefillStepTargetNoLock()};
-            util::Result<void> res{TopUpWithInternalHintResult(options.internal_hint, target)};
-            if (!res) {
-                WalletLogPrintf("%s: P2MR keypool low-watermark refill failed (descriptor id %s, target=%u, remaining=%u): %s\n",
-                    __func__, GetID().ToString(), target == 0 ? static_cast<unsigned int>(m_keypool_size) : target, GetKeyPoolSizeNoLock(), util::ErrorString(res).original);
-            }
-        } else if (!TopUp()) {
+            p2mr_refill = true;
+            p2mr_refill_target = options.preserve_full_keypool_lookahead ? 0 : GetP2MRReceiveKeyPoolRefillStepTargetNoLock();
+            p2mr_remaining = GetKeyPoolSizeNoLock();
+            p2mr_low_watermark = GetP2MRReceiveKeyPoolLowWatermarkNoLock();
+            p2mr_descriptor_id = GetID().ToString();
+        } else {
+            non_p2mr_top_up = true;
+        }
+    }
+
+    if (p2mr_refill) {
+        if (m_storage.IsLocked()) {
+            WalletLogPrintf("%s: P2MR keypool low-watermark refill deferred for locked wallet (descriptor id %s, remaining=%u, low_watermark=%u)\n",
+                __func__, p2mr_descriptor_id, p2mr_remaining, p2mr_low_watermark);
+            return result;
+        }
+
+        util::Result<void> res{TopUpWithInternalHintResult(options.internal_hint, p2mr_refill_target)};
+        if (!res) {
+            WalletLogPrintf("%s: P2MR keypool low-watermark refill failed (descriptor id %s, target=%u, remaining=%u): %s\n",
+                __func__, p2mr_descriptor_id, p2mr_refill_target == 0 ? static_cast<unsigned int>(m_keypool_size) : p2mr_refill_target, GetKeyPoolSize(), util::ErrorString(res).original);
+        }
+    } else if (non_p2mr_top_up) {
+        util::Result<void> res{TopUpWithInternalHintResult(options.internal_hint)};
+        if (!res) {
             WalletLogPrintf("%s: Topping up keypool failed (locked wallet)\n", __func__);
         }
     }
