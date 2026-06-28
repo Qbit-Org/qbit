@@ -140,6 +140,8 @@ qbit-cli <chain option> createauxblock "$QBIT_PAYOUT_ADDRESS"
 | `coinbasevalue` | qbit coinbase value in satoshis, including fees |
 | `bits` | compact qbit target for this candidate |
 | `height` | candidate qbit block height |
+| `commitmentorder` | AuxPoW commitment root byte order to use when building the parent coinbase commitment for this candidate |
+| `commitmentactivationheight` | height where AuxPoW commitment byte-order behavior changes; at and after this height, valid submissions must follow the returned `commitmentorder` |
 | `target` | expanded qbit target |
 
 Submit a solved AuxPoW payload:
@@ -223,6 +225,12 @@ The commitment is:
 ```text
 0xfa 0xbe 0x6d 0x6d || aux_merkle_root || merkle_tree_size_le32 || nonce_le32
 ```
+
+Pool software must use the `commitmentorder` returned by `createauxblock`
+when serializing `aux_merkle_root` into the parent coinbase commitment. Do not
+infer this byte order from Namecoin/Dogecoin conventions or from local
+serializer assumptions; the RPC result is the source of truth for the
+candidate.
 
 Validation requirements include:
 
