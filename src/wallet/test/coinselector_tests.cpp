@@ -21,7 +21,14 @@
 #include <random>
 
 namespace wallet {
-BOOST_FIXTURE_TEST_SUITE(coinselector_tests, WalletTestingSetup)
+namespace {
+struct CoinSelectorUnrestrictedRegtestSetup : public WalletTestingSetup {
+    CoinSelectorUnrestrictedRegtestSetup()
+        : WalletTestingSetup{ChainType::REGTEST, {.extra_args = {"-p2mronly=0"}}} {}
+};
+} // namespace
+
+BOOST_FIXTURE_TEST_SUITE(coinselector_tests, CoinSelectorUnrestrictedRegtestSetup)
 
 // how many times to run all the tests to have a chance to catch errors that only show up with particular random shuffles
 #define RUN_TESTS 100

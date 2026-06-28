@@ -34,7 +34,7 @@ from test_framework.segwit_addr import (
     convertbits,
 )
 from test_framework.test_framework import BitcoinTestFramework
-from test_framework.test_node import QBIT_BECH32_HRPS, QBIT_RESTRICTED_OUTPUT_CHAINS, TestNode
+from test_framework.test_node import ErrorMatch, QBIT_BECH32_HRPS, QBIT_RESTRICTED_OUTPUT_CHAINS, TestNode
 from test_framework.util import (
     assert_equal,
     assert_raises_rpc_error,
@@ -48,6 +48,7 @@ from test_framework.wallet_util import generate_keypair
 
 
 P2MR_DELAYED_ACTIVATION_HEIGHT = 2
+NON_P2MR_OUTPUT_TYPES = ("legacy", "p2sh-segwit", "bech32", "bech32m")
 
 
 def reserved_witness_script(version, fill=0x42):
@@ -98,11 +99,13 @@ class WalletP2MRTest(BitcoinTestFramework):
 
     def run_test(self):
         node_default = self.nodes[0]
+        node_mixed_managers = self.nodes[2]
         node_restricted_outputs = self.nodes[3]
         node_delayed_restricted_outputs = self.nodes[4]
         node_config_restricted_outputs = self.nodes[5]
 
         # Keep restricted-output-mode tests isolated from the unrestricted helper nodes.
+        self.disconnect_nodes(2, 1)
         self.disconnect_nodes(3, 0)
         self.disconnect_nodes(3, 1)
         self.disconnect_nodes(3, 2)
@@ -134,6 +137,87 @@ class WalletP2MRTest(BitcoinTestFramework):
         assert_equal(TestNode._p2mronly_setting_value("test.p2mronly=1", chain="regtest"), None)
         assert_equal(QBIT_BECH32_HRPS[""], QBIT_BECH32_HRPS["main"])
         assert "" in QBIT_RESTRICTED_OUTPUT_CHAINS
+
+        self.log.info("Check mixed-manager wallets reject explicit non-P2MR output types under -p2mronly")
+        mixed_wallet_name = "mixed_output_wallet"
+        node_mixed_managers.createwallet(wallet_name=mixed_wallet_name, load_on_startup=False)
+        mixed_wallet = node_mixed_managers.get_wallet_rpc(mixed_wallet_name)
+        for output_type in (*NON_P2MR_OUTPUT_TYPES, "p2mr"):
+            mixed_wallet.getnewaddress("", output_type)
+            mixed_wallet.getrawchangeaddress(output_type)
+        blank_raw_tx = mixed_wallet.createrawtransaction([], {mixed_wallet.getnewaddress(): Decimal("1")})
+        mixed_wallet.unloadwallet(load_on_startup=False)
+        blank_wallet_name = "blank_output_wallet"
+        node_mixed_managers.createwallet(
+            wallet_name=blank_wallet_name,
+            blank=True,
+            load_on_startup=False,
+        )
+        node_mixed_managers.get_wallet_rpc(blank_wallet_name).unloadwallet(load_on_startup=False)
+
+        self.stop_node(2)
+        node_mixed_managers.assert_start_raises_init_error(
+            ["-p2mronly=1", f"-wallet={mixed_wallet_name}", "-addresstype=legacy"],
+            expected_msg="Address type 'legacy' is not available on this chain",
+            match=ErrorMatch.PARTIAL_REGEX,
+        )
+        node_mixed_managers.assert_start_raises_init_error(
+            ["-p2mronly=1", f"-wallet={mixed_wallet_name}", "-changetype=bech32"],
+            expected_msg="Change type 'bech32' is not available on this chain",
+            match=ErrorMatch.PARTIAL_REGEX,
+        )
+        self.start_node(2, ["-p2mronly=1", f"-wallet={blank_wallet_name}", "-addresstype=p2mr", "-changetype=p2mr"])
+        blank_wallet = node_mixed_managers.get_wallet_rpc(blank_wallet_name)
+        assert_raises_rpc_error(
+            -5,
+            "change type 'p2mr' is not available in this wallet",
+            blank_wallet.fundrawtransaction,
+            blank_raw_tx,
+            {"change_type": "p2mr"},
+        )
+        blank_wallet.unloadwallet(load_on_startup=False)
+        self.stop_node(2)
+        self.start_node(2, ["-p2mronly=1", f"-wallet={mixed_wallet_name}"])
+        mixed_wallet = node_mixed_managers.get_wallet_rpc(mixed_wallet_name)
+
+        mixed_default_receive = mixed_wallet.getnewaddress()
+        assert mixed_default_receive.startswith("qbrt1z")
+        mixed_default_change = mixed_wallet.getrawchangeaddress()
+        assert mixed_default_change.startswith("qbrt1z")
+        for output_type in NON_P2MR_OUTPUT_TYPES:
+            assert_raises_rpc_error(
+                -5,
+                f"address type '{output_type}' is not available on this chain",
+                mixed_wallet.getnewaddress,
+                "",
+                output_type,
+            )
+            assert_raises_rpc_error(
+                -5,
+                f"address type '{output_type}' is not available on this chain",
+                mixed_wallet.getrawchangeaddress,
+                output_type,
+            )
+
+        self.generatetoaddress(node_mixed_managers, COINBASE_MATURITY + 1, mixed_default_receive, sync_fun=self.no_op)
+        mixed_raw_tx = mixed_wallet.createrawtransaction([], {mixed_wallet.getnewaddress(): Decimal("1")})
+        for output_type in NON_P2MR_OUTPUT_TYPES:
+            assert_raises_rpc_error(
+                -5,
+                f"change type '{output_type}' is not available on this chain",
+                mixed_wallet.fundrawtransaction,
+                mixed_raw_tx,
+                {"change_type": output_type},
+            )
+            assert_raises_rpc_error(
+                -5,
+                f"change type '{output_type}' is not available on this chain",
+                mixed_wallet.walletcreatefundedpsbt,
+                [],
+                [{mixed_wallet.getnewaddress(): Decimal("1")}],
+                0,
+                {"change_type": output_type},
+            )
 
         self.log.info("Check -p2mronly wallets still default to P2MR addresses and reject explicit legacy types")
         node_restricted_outputs.createwallet("restricted_outputs_wallet")

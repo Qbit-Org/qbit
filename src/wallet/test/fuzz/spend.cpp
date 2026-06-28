@@ -25,7 +25,9 @@ const TestingSetup* g_setup;
 
 void initialize_setup()
 {
-    static const auto testing_setup = MakeNoLogFileContext<const TestingSetup>();
+    static const auto testing_setup = MakeNoLogFileContext<const TestingSetup>(
+        ChainType::REGTEST,
+        {.extra_args = {"-p2mronly=0"}});
     g_setup = testing_setup.get();
 }
 

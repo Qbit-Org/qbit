@@ -12,7 +12,14 @@
 #include <boost/test/unit_test.hpp>
 
 namespace wallet {
-BOOST_FIXTURE_TEST_SUITE(group_outputs_tests, TestingSetup)
+namespace {
+struct GroupOutputsUnrestrictedRegtestSetup : public TestingSetup {
+    GroupOutputsUnrestrictedRegtestSetup()
+        : TestingSetup{ChainType::REGTEST, {.extra_args = {"-p2mronly=0"}}} {}
+};
+} // namespace
+
+BOOST_FIXTURE_TEST_SUITE(group_outputs_tests, GroupOutputsUnrestrictedRegtestSetup)
 
 static int nextLockTime = 0;
 
