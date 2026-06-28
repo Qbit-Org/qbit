@@ -1278,6 +1278,21 @@ std::optional<CAuxPow> TryDecodeLegacyAuxPow(std::span<const unsigned char> auxp
         return std::nullopt;
     }
 }
+
+bool AuxPowCoinbaseBranchMatchesParent(const CAuxPow& auxpow)
+{
+    if (!auxpow.coinbase_tx || auxpow.coinbase_branch_index < 0) return false;
+    if (auxpow.coinbase_merkle_branch.size() >= std::numeric_limits<uint32_t>::digits) return false;
+
+    const auto coinbase_branch_index{static_cast<uint32_t>(auxpow.coinbase_branch_index)};
+    if ((coinbase_branch_index >> auxpow.coinbase_merkle_branch.size()) != 0) return false;
+
+    const uint256 coinbase_root = auxpow::CheckMerkleBranch(
+        auxpow.coinbase_tx->GetHash().ToUint256(),
+        auxpow.coinbase_merkle_branch,
+        coinbase_branch_index);
+    return coinbase_root == auxpow.parent_block.hashMerkleRoot;
+}
 } // namespace
 
 CAuxPow DecodeHexAuxPow(const std::string& hex_auxpow)
@@ -1288,11 +1303,19 @@ CAuxPow DecodeHexAuxPow(const std::string& hex_auxpow)
 
     const std::vector<unsigned char> auxpow_data{ParseHex(hex_auxpow)};
     const std::span<const unsigned char> auxpow_span{auxpow_data.data(), auxpow_data.size()};
-    if (auto auxpow{TryDecodeCanonicalAuxPow(auxpow_span)}) {
-        return std::move(*auxpow);
+    auto canonical_auxpow{TryDecodeCanonicalAuxPow(auxpow_span)};
+    auto legacy_auxpow{TryDecodeLegacyAuxPow(auxpow_span)};
+    if (canonical_auxpow && legacy_auxpow) {
+        if (!AuxPowCoinbaseBranchMatchesParent(*canonical_auxpow) && AuxPowCoinbaseBranchMatchesParent(*legacy_auxpow)) {
+            return std::move(*legacy_auxpow);
+        }
+        return std::move(*canonical_auxpow);
     }
-    if (auto auxpow{TryDecodeLegacyAuxPow(auxpow_span)}) {
-        return std::move(*auxpow);
+    if (canonical_auxpow) {
+        return std::move(*canonical_auxpow);
+    }
+    if (legacy_auxpow) {
+        return std::move(*legacy_auxpow);
     }
     throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "AuxPow decode failed");
 }

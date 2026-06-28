@@ -302,6 +302,27 @@ BOOST_AUTO_TEST_CASE(auxpow_rpc_decoder_accepts_legacy_payload)
     CheckAuxpowPayloadEqual(decoded_with_null_hash, *header.auxpow);
 }
 
+BOOST_AUTO_TEST_CASE(auxpow_rpc_decoder_prefers_legacy_for_ambiguous_payload)
+{
+    const auto consensus = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
+    const CBlockHeader header = MakeAuxpowHeader(consensus);
+    CAuxPow auxpow{*header.auxpow};
+
+    for (uint32_t nonce{0}; nonce < 1'000'000; ++nonce) {
+        auxpow.parent_block.nNonce = nonce;
+        if (auxpow.parent_block.GetHash().begin()[0] == 0x01) break;
+    }
+    BOOST_REQUIRE_EQUAL(auxpow.parent_block.GetHash().begin()[0], 0x01);
+
+    const std::string canonical_hex = SerializeAuxpowHex(auxpow);
+    const std::string legacy_hex = SerializeLegacyAuxpowHex(auxpow, auxpow.parent_block.GetHash());
+    const CAuxPow decoded = DecodeHexAuxPow(legacy_hex);
+
+    CheckAuxpowPayloadEqual(decoded, auxpow);
+    BOOST_CHECK_EQUAL(SerializeAuxpowHex(decoded), canonical_hex);
+    BOOST_CHECK_NE(canonical_hex, legacy_hex);
+}
+
 BOOST_AUTO_TEST_CASE(auxpow_rpc_decoder_rejects_malformed_legacy_payload)
 {
     const auto consensus = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
