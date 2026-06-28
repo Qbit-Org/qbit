@@ -1513,6 +1513,7 @@ std::vector<WalletDestination> DescriptorScriptPubKeyMan::MarkUnusedAddresses(co
     bool p2mr_refill{false};
     bool non_p2mr_top_up{false};
     unsigned int p2mr_refill_target{0};
+    unsigned int p2mr_full_refill_target{0};
     unsigned int p2mr_remaining{0};
     unsigned int p2mr_low_watermark{0};
     std::string p2mr_descriptor_id;
@@ -1557,12 +1558,17 @@ std::vector<WalletDestination> DescriptorScriptPubKeyMan::MarkUnusedAddresses(co
                 }
                 NotifyCanGetAddressesChanged();
             }
-            if (!NeedsP2MRKeyPoolRefillNoLock()) {
+            const bool needs_p2mr_refill{
+                options.preserve_full_keypool_lookahead ?
+                    GetKeyPoolSizeNoLock() < static_cast<unsigned int>(m_keypool_size) :
+                    NeedsP2MRKeyPoolRefillNoLock()};
+            if (!needs_p2mr_refill) {
                 return result;
             }
 
             p2mr_refill = true;
             p2mr_refill_target = options.preserve_full_keypool_lookahead ? 0 : GetP2MRReceiveKeyPoolRefillStepTargetNoLock();
+            p2mr_full_refill_target = static_cast<unsigned int>(m_keypool_size);
             p2mr_remaining = GetKeyPoolSizeNoLock();
             p2mr_low_watermark = GetP2MRReceiveKeyPoolLowWatermarkNoLock();
             p2mr_descriptor_id = GetID().ToString();
@@ -1581,7 +1587,7 @@ std::vector<WalletDestination> DescriptorScriptPubKeyMan::MarkUnusedAddresses(co
         util::Result<void> res{TopUpWithInternalHintResult(options.internal_hint, p2mr_refill_target)};
         if (!res) {
             WalletLogPrintf("%s: P2MR keypool low-watermark refill failed (descriptor id %s, target=%u, remaining=%u): %s\n",
-                __func__, p2mr_descriptor_id, p2mr_refill_target == 0 ? static_cast<unsigned int>(m_keypool_size) : p2mr_refill_target, GetKeyPoolSize(), util::ErrorString(res).original);
+                __func__, p2mr_descriptor_id, p2mr_refill_target == 0 ? p2mr_full_refill_target : p2mr_refill_target, GetKeyPoolSize(), util::ErrorString(res).original);
         }
     } else if (non_p2mr_top_up) {
         util::Result<void> res{TopUpWithInternalHintResult(options.internal_hint)};
