@@ -1892,7 +1892,8 @@ BOOST_AUTO_TEST_CASE(p2mr_checksigpqc_rejects_independent_witness_vector_near_mi
 
             {
                 CMutableTransaction tx{vector.spend_tx};
-                tx.vin[0].scriptWitness.stack[3][1] ^= 0x01;
+                BOOST_REQUIRE_GT(tx.vin[0].scriptWitness.stack[3].size(), 1U);
+                tx.vin[0].scriptWitness.stack[3].back() ^= 0x01;
                 CheckVectorMutationFails(vector, tx, vector.prevout_script_pubkey, SCRIPT_ERR_P2MR_SIG);
             }
 
