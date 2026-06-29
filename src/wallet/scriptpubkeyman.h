@@ -110,6 +110,12 @@ struct WalletDestination
     std::optional<bool> internal;
 };
 
+struct MarkUnusedAddressesOptions
+{
+    std::optional<bool> internal_hint;
+    bool preserve_full_keypool_lookahead{false};
+};
+
 struct CryptedPQCKeyRecord
 {
     std::vector<unsigned char> crypted_secret;
@@ -161,7 +167,7 @@ public:
      *
      * @return All of the addresses affected
      */
-    virtual std::vector<WalletDestination> MarkUnusedAddresses(const CScript& script) { return {}; }
+    virtual std::vector<WalletDestination> MarkUnusedAddresses(const CScript& script, const MarkUnusedAddressesOptions& options = {}) { return {}; }
 
     /* Returns true if HD is enabled */
     virtual bool IsHDEnabled() const { return false; }
@@ -439,7 +445,7 @@ public:
     bool TopUpWithInternalHint(std::optional<bool> internal_hint, unsigned int size = 0);
     util::Result<void> TopUpWithInternalHintResult(std::optional<bool> internal_hint, unsigned int size = 0);
 
-    std::vector<WalletDestination> MarkUnusedAddresses(const CScript& script) override;
+    std::vector<WalletDestination> MarkUnusedAddresses(const CScript& script, const MarkUnusedAddressesOptions& options = {}) override;
 
     bool IsHDEnabled() const override;
 

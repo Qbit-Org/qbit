@@ -976,6 +976,9 @@ util::Result<CTxDestination> DescriptorScriptPubKeyMan::GetNewDestination(const 
             return util::Error{_("Error: Cannot extract destination from the generated scriptpubkey")}; // shouldn't happen
         }
         m_wallet_descriptor.next_index++;
+        if (IsRangedP2MRDescriptorNoLock() && !m_deferred_create_keypool_top_up) {
+            m_wallet_descriptor.deferred_create_keypool_top_up = false;
+        }
         WalletBatch(m_storage.GetDatabase()).WriteDescriptor(GetID(), m_wallet_descriptor);
         return dest;
     }
@@ -1504,17 +1507,29 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBPreparedResult(WalletBa
     return {};
 }
 
-std::vector<WalletDestination> DescriptorScriptPubKeyMan::MarkUnusedAddresses(const CScript& script)
+std::vector<WalletDestination> DescriptorScriptPubKeyMan::MarkUnusedAddresses(const CScript& script, const MarkUnusedAddressesOptions& options)
 {
-    LOCK(cs_desc_man);
     std::vector<WalletDestination> result;
-    if (IsMine(script)) {
+    bool p2mr_refill{false};
+    bool non_p2mr_top_up{false};
+    unsigned int p2mr_refill_target{0};
+    unsigned int p2mr_full_refill_target{0};
+    unsigned int p2mr_remaining{0};
+    unsigned int p2mr_low_watermark{0};
+    std::string p2mr_descriptor_id;
+
+    {
+        LOCK(cs_desc_man);
+        if (!m_map_script_pub_keys.contains(script)) return result;
+
         int32_t index = m_map_script_pub_keys[script];
+        bool advanced_next_index{false};
         if (index >= m_wallet_descriptor.next_index) {
             WalletLogPrintf("%s: Detected a used keypool item at index %d, mark all keypool items up to this item as used\n", __func__, index);
             auto out_keys = std::make_unique<FlatSigningProvider>();
             std::vector<CScript> scripts_temp;
             while (index >= m_wallet_descriptor.next_index) {
+                scripts_temp.clear();
                 if (!m_wallet_descriptor.descriptor->ExpandFromCache(m_wallet_descriptor.next_index, m_wallet_descriptor.cache, scripts_temp, *out_keys)) {
                     throw std::runtime_error(std::string(__func__) + ": Unable to expand descriptor from cache");
                 }
@@ -1522,17 +1537,61 @@ std::vector<WalletDestination> DescriptorScriptPubKeyMan::MarkUnusedAddresses(co
                 ExtractDestination(scripts_temp[0], dest);
                 result.push_back({dest, std::nullopt});
                 m_wallet_descriptor.next_index++;
+                advanced_next_index = true;
             }
         }
         if (m_deferred_create_keypool_top_up) {
-            if (!result.empty()) {
+            if (advanced_next_index) {
+                m_wallet_descriptor.deferred_create_keypool_top_up = true;
                 WalletBatch batch(m_storage.GetDatabase());
                 if (!batch.WriteDescriptor(GetID(), m_wallet_descriptor)) {
                     throw std::runtime_error(std::string(__func__) + ": writing descriptor failed");
                 }
                 NotifyCanGetAddressesChanged();
             }
-        } else if (!TopUp()) {
+        } else if (IsRangedP2MRDescriptorNoLock()) {
+            if (advanced_next_index) {
+                m_wallet_descriptor.deferred_create_keypool_top_up = false;
+                WalletBatch batch(m_storage.GetDatabase());
+                if (!batch.WriteDescriptor(GetID(), m_wallet_descriptor)) {
+                    throw std::runtime_error(std::string(__func__) + ": writing descriptor failed");
+                }
+                NotifyCanGetAddressesChanged();
+            }
+            const bool needs_p2mr_refill{
+                options.preserve_full_keypool_lookahead ?
+                    GetKeyPoolSizeNoLock() < static_cast<unsigned int>(m_keypool_size) :
+                    NeedsP2MRKeyPoolRefillNoLock()};
+            if (!needs_p2mr_refill) {
+                return result;
+            }
+
+            p2mr_refill = true;
+            p2mr_refill_target = options.preserve_full_keypool_lookahead ? 0 : GetP2MRReceiveKeyPoolRefillStepTargetNoLock();
+            p2mr_full_refill_target = static_cast<unsigned int>(m_keypool_size);
+            p2mr_remaining = GetKeyPoolSizeNoLock();
+            p2mr_low_watermark = GetP2MRReceiveKeyPoolLowWatermarkNoLock();
+            p2mr_descriptor_id = GetID().ToString();
+        } else {
+            non_p2mr_top_up = true;
+        }
+    }
+
+    if (p2mr_refill) {
+        if (m_storage.IsLocked()) {
+            WalletLogPrintf("%s: P2MR keypool low-watermark refill deferred for locked wallet (descriptor id %s, remaining=%u, low_watermark=%u)\n",
+                __func__, p2mr_descriptor_id, p2mr_remaining, p2mr_low_watermark);
+            return result;
+        }
+
+        util::Result<void> res{TopUpWithInternalHintResult(options.internal_hint, p2mr_refill_target)};
+        if (!res) {
+            WalletLogPrintf("%s: P2MR keypool low-watermark refill failed (descriptor id %s, target=%u, remaining=%u): %s\n",
+                __func__, p2mr_descriptor_id, p2mr_refill_target == 0 ? p2mr_full_refill_target : p2mr_refill_target, GetKeyPoolSize(), util::ErrorString(res).original);
+        }
+    } else if (non_p2mr_top_up) {
+        util::Result<void> res{TopUpWithInternalHintResult(options.internal_hint)};
+        if (!res) {
             WalletLogPrintf("%s: Topping up keypool failed (locked wallet)\n", __func__);
         }
     }
