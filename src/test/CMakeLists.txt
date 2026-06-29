@@ -78,6 +78,7 @@ add_executable(test_bitcoin
   orphan_metrics_tests.cpp
   orphanage_tests.cpp
   psbt_p2mr_tests.cpp
+  p2mr_datapqchash_tests.cpp
   pcp_tests.cpp
   pqc_tests.cpp
   peerman_tests.cpp
@@ -155,6 +156,7 @@ target_json_data_sources(test_bitcoin
   data/key_io_invalid.json
   data/key_io_valid.json
   data/mainnet_launch_difficulty.json
+  data/p2mr_datapqchash_vectors.json
   data/p2mr_pqc_witness_vectors.json
   data/script_tests.json
   data/sighash.json
