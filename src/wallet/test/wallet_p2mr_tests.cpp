@@ -22,7 +22,6 @@
 #include <hash.h>
 #include <interfaces/chain.h>
 #include <key_io.h>
-#include <node/blockstorage.h>
 #include <policy/policy.h>
 #include <rpc/server.h>
 #include <scheduler.h>
@@ -48,8 +47,6 @@
 #include <univalue.h>
 
 #include <chrono>
-
-using node::MAX_BLOCKFILE_SIZE;
 
 namespace wallet {
 
