@@ -80,8 +80,8 @@ EXPECTED_UPSTREAM_COMMIT="$(resolve_remote_commit "${REMOTE_URL}" "${REMOTE_REF}
 if [[ -n "${EXPECTED_UPSTREAM_COMMIT}" ]]; then
   echo "Expected upstream commit: ${EXPECTED_UPSTREAM_COMMIT}"
 else
-  echo "Expected upstream commit: unavailable (git ls-remote failed)"
-  echo "Proceeding with local subtree checks only."
+  echo "error: expected upstream commit unavailable (git ls-remote failed)" >&2
+  exit 1
 fi
 
 if git rev-parse --verify "HEAD:${PREFIX}" >/dev/null 2>&1; then
@@ -92,10 +92,8 @@ else
   git subtree add --prefix="${PREFIX}" "${REMOTE_URL}" "${REMOTE_REF}" --squash
 fi
 
-if [[ -n "${EXPECTED_UPSTREAM_COMMIT}" ]]; then
-  test/lint/git-subtree-check.sh -r "${PREFIX}"
-else
-  test/lint/git-subtree-check.sh "${PREFIX}"
-fi
+LIBBITCOINPQC_REMOTE_URL="${REMOTE_URL}" \
+LIBBITCOINPQC_REMOTE_REF="${REMOTE_REF}" \
+  test/lint/libbitcoinpqc-subtree-check.sh
 
 echo "Subtree update and integrity check completed for ${PREFIX}."
