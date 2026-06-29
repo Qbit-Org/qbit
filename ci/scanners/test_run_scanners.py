@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -53,6 +55,35 @@ class RunScannersTest(unittest.TestCase):
             run_scanners.ls_remote_ref_oid(stdout, "refs/tags/v0.3.0"),
             "",
         )
+
+    def test_git_peel_commit_resolves_annotated_tag_object(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=repo, check=True)
+            subprocess.run(["git", "config", "tag.gpgSign", "false"], cwd=repo, check=True)
+            (repo / "file.txt").write_text("content\n", encoding="utf8")
+            subprocess.run(["git", "add", "file.txt"], cwd=repo, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "initial"], cwd=repo, check=True)
+            subprocess.run(["git", "tag", "-a", "v1", "-m", "release"], cwd=repo, check=True)
+
+            tag_object = subprocess.check_output(
+                ["git", "rev-parse", "v1"],
+                cwd=repo,
+                text=True,
+                encoding="utf8",
+            ).strip()
+            commit = subprocess.check_output(
+                ["git", "rev-parse", "v1^{}"],
+                cwd=repo,
+                text=True,
+                encoding="utf8",
+            ).strip()
+
+            self.assertNotEqual(tag_object, commit)
+            self.assertEqual(run_scanners.git_peel_commit(repo, tag_object), commit)
 
 
 if __name__ == "__main__":

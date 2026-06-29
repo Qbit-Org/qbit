@@ -1114,6 +1114,13 @@ def git_commit_tree(source: Path, commit: str) -> str:
     return stdout.strip() if exit_code == 0 else ""
 
 
+def git_peel_commit(source: Path, object_name: str) -> str:
+    if not object_name:
+        return ""
+    exit_code, stdout, _stderr = git_command(source, "rev-parse", f"{object_name}^{{commit}}")
+    return stdout.strip() if exit_code == 0 else ""
+
+
 def ls_remote_ref_matches(query_ref: str, candidate_ref: str) -> bool:
     if candidate_ref == query_ref:
         return True
@@ -1189,16 +1196,16 @@ def libbitcoinpqc_provenance(source: Path) -> tuple[dict[str, Any], list[str]]:
     }
     gaps: list[str] = []
 
-    upstream_ref_commit, upstream_ref_exit = git_ls_remote_ref(
+    upstream_ref_object, upstream_ref_exit = git_ls_remote_ref(
         source, LIBBITCOINPQC_UPSTREAM_REPO, LIBBITCOINPQC_UPSTREAM_PEELED_REF
     )
-    if not upstream_ref_commit and upstream_ref_exit == 0:
-        upstream_ref_commit, upstream_ref_exit = git_ls_remote_ref(
+    if not upstream_ref_object and upstream_ref_exit == 0:
+        upstream_ref_object, upstream_ref_exit = git_ls_remote_ref(
             source, LIBBITCOINPQC_UPSTREAM_REPO, LIBBITCOINPQC_UPSTREAM_REF
         )
-    provenance["upstream_ref_commit"] = upstream_ref_commit
+    provenance["upstream_ref_object"] = upstream_ref_object
     provenance["upstream_ref_lookup_exit_code"] = upstream_ref_exit
-    if not upstream_ref_commit:
+    if not upstream_ref_object:
         gaps.append(f"libbitcoinpqc upstream tag unavailable: {LIBBITCOINPQC_UPSTREAM_REF}")
 
     metadata = latest_git_subtree_metadata(source, LIBBITCOINPQC_PATH)
@@ -1210,6 +1217,11 @@ def libbitcoinpqc_provenance(source: Path) -> tuple[dict[str, Any], list[str]]:
     fetch_results, fetch_gaps = fetch_libbitcoinpqc_provenance_objects(source, split)
     provenance["fetch_results"] = fetch_results
     gaps.extend(fetch_gaps)
+
+    upstream_ref_commit = git_peel_commit(source, upstream_ref_object)
+    provenance["upstream_ref_commit"] = upstream_ref_commit
+    if upstream_ref_object and not upstream_ref_commit:
+        gaps.append(f"libbitcoinpqc upstream tag object is not peelable to a commit: {upstream_ref_object}")
 
     if split and upstream_ref_commit:
         upstream_source_relationship = "matches_upstream_tag" if split == upstream_ref_commit else "differs"

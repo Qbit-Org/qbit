@@ -75,6 +75,7 @@ if ! git cat-file -e "${upstream_commit}^{commit}" 2>/dev/null; then
   exit 1
 fi
 
+upstream_commit="$(git rev-parse "${upstream_commit}^{commit}")"
 upstream_tree="$(git show -s --format=%T "${upstream_commit}")"
 metadata_split="$(
   git log \
