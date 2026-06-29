@@ -9,6 +9,7 @@
 #include <rpc/util.h>
 #include <script/interpreter.h>
 #include <util/strencodings.h>
+#include <util/translation.h>
 #include <wallet/pqc_usage.h>
 #include <wallet/rpc/util.h>
 #include <wallet/wallet.h>
@@ -67,6 +68,18 @@ void EnsurePQCKeyValidationReadyForSigning(const CWallet& wallet)
     }
     if (info.failed_records > 0) {
         throw JSONRPCError(RPC_WALLET_ERROR, "Error: plaintext PQC wallet key validation failed. Wallet signing is disabled until the wallet is restored or repaired.");
+    }
+}
+
+void LogConsumedPQCDataHashCounters(const CWallet& wallet, const PQCUsageRecorder& recorder, const bilingual_str& error)
+{
+    for (const PQCUsageAdvance& advance : recorder.GetAdvances()) {
+        wallet.WalletLogPrintf(
+            "PQC data-hash signing consumed counter for pubkey %s [%u, %u) before failing: %s\n",
+            HexStr(std::span<const unsigned char>{advance.pubkey.begin(), advance.pubkey.end()}),
+            advance.previous_count,
+            advance.new_count,
+            error.original);
     }
 }
 
@@ -219,11 +232,13 @@ RPCHelpMan signdatapqchash()
             PQCUsageRecorder pqc_usage_recorder;
             util::Result<DataPQCSignatureProof> proof{pwallet->SignDataPQCHash(
                 *output, message_hash, requested_pubkey, requested_leaf_script, requested_control_block, pqc_usage_recorder.GetObserver())};
-            if (!proof) {
-                throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(proof).original);
-            }
             const PQCUsageReport pqc_usage{BuildSigningPQCUsageReport(pqc_usage_recorder)};
             LogPQCUsageWarnings(*pwallet, pqc_usage);
+            if (!proof) {
+                const bilingual_str error{util::ErrorString(proof)};
+                LogConsumedPQCDataHashCounters(*pwallet, pqc_usage_recorder, error);
+                throw JSONRPCError(RPC_WALLET_ERROR, error.original);
+            }
 
             UniValue result{UniValue::VOBJ};
             result.pushKV("address", address);

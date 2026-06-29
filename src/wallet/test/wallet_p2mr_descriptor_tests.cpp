@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <test/data/p2mr_datapqchash_vectors.json.h>
+#include <wallet/pqc_usage.h>
 #include <wallet/test/wallet_p2mr_test_util.h>
 
 #include <span>
@@ -281,6 +282,105 @@ BOOST_AUTO_TEST_CASE(P2MRDataHashSigningMatchesPinnedProofFixture)
     BOOST_CHECK(proof->control_block == control_block);
     BOOST_CHECK_EQUAL(proof->leaf_version, P2MR_LEAF_VERSION_V1);
     BOOST_CHECK_EQUAL(HexStr(proof->signature), vector["signature"].get_str());
+}
+
+BOOST_AUTO_TEST_CASE(P2MRDataHashSigningReportsCommittedFailedLeafReservation)
+{
+    CPQCKey first_key;
+    CPQCKey second_key;
+    first_key.MakeNewKey();
+    second_key.MakeNewKey();
+
+    CPQCPubKey first_pubkey{first_key.GetPubKey()};
+    CPQCPubKey second_pubkey{second_key.GetPubKey()};
+    CScript first_leaf{p2mr::BuildPKScript(first_pubkey)};
+    CScript second_leaf{p2mr::BuildPKScript(second_pubkey)};
+
+    if (ToBytes(second_leaf) < ToBytes(first_leaf)) {
+        std::swap(first_key, second_key);
+        std::swap(first_pubkey, second_pubkey);
+        std::swap(first_leaf, second_leaf);
+    }
+
+    TaprootBuilder builder;
+    builder.AddP2MR(/*depth=*/1, ToBytes(first_leaf), P2MR_LEAF_VERSION_V1)
+        .AddP2MR(/*depth=*/1, ToBytes(second_leaf), P2MR_LEAF_VERSION_V1)
+        .FinalizeP2MR();
+    const WitnessV2P2MR output{builder.GetP2MROutput()};
+
+    FlatSigningProvider provider;
+    AddPQCSigningKeyForTest(provider, first_key);
+    AddPQCSigningKeyForTest(provider, second_key);
+    provider.mr_trees.emplace(output, builder);
+
+    std::map<CPQCPubKey, uint32_t> authoritative_counters{{first_pubkey, 0}, {second_pubkey, 0}};
+    provider.pqc_counter_reserver = [&](const CPQCPubKey& pubkey, uint32_t count, uint32_t& previous_counter, uint32_t& reserved_counter) {
+        BOOST_CHECK_EQUAL(count, 1U);
+        auto counter_it{authoritative_counters.find(pubkey)};
+        BOOST_REQUIRE(counter_it != authoritative_counters.end());
+        previous_counter = counter_it->second;
+        reserved_counter = previous_counter + count;
+        counter_it->second = reserved_counter;
+        return true;
+    };
+
+    PQCUsageRecorder recorder;
+    provider.pqc_counter_observer = recorder.GetObserver();
+    provider.pqc_raw_signer = [&](const CPQCKey& key, const uint256& hash, std::vector<unsigned char>& sig, uint32_t& counter) {
+        if (key.GetPubKey() == first_pubkey) {
+            sig.clear();
+            return false;
+        }
+        return key.Sign(hash, sig, counter);
+    };
+
+    const uint256 message_hash{uint256::ONE};
+    const util::Result<DataPQCSignatureProof> proof{SignP2MRDataHash(
+        provider, output, message_hash, std::nullopt, std::nullopt, std::nullopt)};
+
+    BOOST_REQUIRE(proof);
+    BOOST_CHECK(proof->pubkey == second_pubkey);
+    BOOST_CHECK_EQUAL(authoritative_counters.at(first_pubkey), 1U);
+    BOOST_CHECK_EQUAL(authoritative_counters.at(second_pubkey), 1U);
+    BOOST_CHECK_EQUAL(provider.pqc_sig_counters.at(first_pubkey), 1U);
+    BOOST_CHECK_EQUAL(provider.pqc_sig_counters.at(second_pubkey), 1U);
+
+    const PQCUsageReport report{BuildSigningPQCUsageReport(recorder)};
+    BOOST_REQUIRE_EQUAL(report.key_states.size(), 2U);
+    std::set<CPQCPubKey> reported_pubkeys;
+    for (const PQCUsageSnapshot& snapshot : report.key_states) {
+        BOOST_CHECK_EQUAL(snapshot.signature_count, 1U);
+        reported_pubkeys.insert(snapshot.pubkey);
+    }
+    BOOST_CHECK(reported_pubkeys.contains(first_pubkey));
+    BOOST_CHECK(reported_pubkeys.contains(second_pubkey));
+}
+
+BOOST_AUTO_TEST_CASE(P2MRDataHashSigningDistinguishesExhaustedPQCKey)
+{
+    CPQCKey key;
+    key.MakeNewKey();
+    const CPQCPubKey pubkey{key.GetPubKey()};
+    const CScript leaf{p2mr::BuildPKScript(pubkey)};
+
+    TaprootBuilder builder;
+    builder.AddP2MR(/*depth=*/0, ToBytes(leaf), P2MR_LEAF_VERSION_V1).FinalizeP2MR();
+    const WitnessV2P2MR output{builder.GetP2MROutput()};
+
+    FlatSigningProvider provider;
+    AddPQCSigningKeyForTest(provider, key);
+    provider.pqc_sig_counters[pubkey] = PQC_MAX_SIGNATURES;
+    provider.mr_trees.emplace(output, builder);
+
+    PQCUsageRecorder recorder;
+    provider.pqc_counter_observer = recorder.GetObserver();
+
+    const util::Result<DataPQCSignatureProof> proof{SignP2MRDataHash(
+        provider, output, uint256::ONE, std::nullopt, std::nullopt, std::nullopt)};
+
+    BOOST_CHECK(!proof);
+    BOOST_CHECK_EQUAL(util::ErrorString(proof).original, "PQC signature budget is exhausted for the selected P2MR pubkey leaf");
+    BOOST_CHECK(recorder.Empty());
 }
 
 BOOST_FIXTURE_TEST_CASE(NonRangedP2MRDescriptorDoesNotDeriveUnrelatedPQCKeys, TestingSetup)
