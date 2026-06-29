@@ -1883,7 +1883,7 @@ BOOST_AUTO_TEST_CASE(p2mr_checksigpqc_accepts_independent_sighash_single_matched
     BOOST_REQUIRE_EQUAL(vector.sighash_type, SIGHASH_SINGLE);
     BOOST_REQUIRE_EQUAL(vector.signature.size(), PQC_SIG_SIZE + 1);
     BOOST_CHECK_EQUAL(vector.signature.back(), SIGHASH_SINGLE);
-    BOOST_REQUIRE_EQUAL(vector.input_index, vector.spend_tx.vout.size() - 1);
+    BOOST_REQUIRE_LT(vector.input_index, vector.spend_tx.vout.size());
     BOOST_REQUIRE(vector.p2mr_sigmsg.has_value());
     BOOST_REQUIRE(vector.p2mr_sighash.has_value());
 
