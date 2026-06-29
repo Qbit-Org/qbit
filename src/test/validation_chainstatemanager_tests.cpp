@@ -254,6 +254,51 @@ BOOST_FIXTURE_TEST_CASE(needs_witness_for_validation_gate, TestingSetup)
     });
 }
 
+BOOST_FIXTURE_TEST_CASE(assumevalid_covers_witness_pruned_history_gate, TestingSetup)
+{
+    auto& chainman{*Assert(m_node.chainman)};
+
+    WITH_LOCK(::cs_main, {
+        const uint32_t n_bits{chainman.ActiveChain()[0]->nBits};
+        CBlockIndex proof_index;
+        proof_index.nBits = n_bits;
+        const arith_uint256 proof{GetBlockProof(proof_index)};
+        BOOST_REQUIRE(proof != 0);
+
+        auto& mutable_opts = const_cast<ChainstateManager::Options&>(chainman.m_options);
+        mutable_opts.minimum_chain_work = proof;
+
+        auto& base = InsertTestBlockIndex(chainman, uint256{10}, nullptr, 0, n_bits, proof);
+        auto& highest_pruned = InsertTestBlockIndex(chainman, uint256{11}, &base, 1, n_bits, proof * 2);
+        auto& assumed = InsertTestBlockIndex(chainman, uint256{12}, &highest_pruned, 2, n_bits, proof * 3);
+        auto& best = InsertTestBlockIndex(chainman, uint256{13}, &assumed, 3, n_bits, proof * 4);
+        highest_pruned.nStatus |= BLOCK_OPT_WITNESS_PRUNED;
+        chainman.m_best_header = &best;
+
+        mutable_opts.assumed_valid_block = uint256::ZERO;
+        BOOST_CHECK(!chainman.CheckAssumeValidCoversWitnessPrunedHistory());
+
+        mutable_opts.assumed_valid_block = uint256{14};
+        BOOST_CHECK(!chainman.CheckAssumeValidCoversWitnessPrunedHistory());
+
+        auto& alternate = InsertTestBlockIndex(chainman, uint256{15}, &base, 1, n_bits, proof * 2);
+        mutable_opts.assumed_valid_block = alternate.GetBlockHash();
+        BOOST_CHECK(!chainman.CheckAssumeValidCoversWitnessPrunedHistory());
+
+        mutable_opts.assumed_valid_block = base.GetBlockHash();
+        BOOST_CHECK(!chainman.CheckAssumeValidCoversWitnessPrunedHistory());
+
+        mutable_opts.assumed_valid_block = highest_pruned.GetBlockHash();
+        BOOST_CHECK(chainman.CheckAssumeValidCoversWitnessPrunedHistory());
+
+        mutable_opts.assumed_valid_block = assumed.GetBlockHash();
+        BOOST_CHECK(chainman.CheckAssumeValidCoversWitnessPrunedHistory());
+
+        mutable_opts.minimum_chain_work = best.nChainWork + proof;
+        BOOST_CHECK(!chainman.CheckAssumeValidCoversWitnessPrunedHistory());
+    });
+}
+
 struct PreSegwitValidationSetup : TestingSetup {
     PreSegwitValidationSetup()
         : TestingSetup{ChainType::REGTEST, {.extra_args = {"-testactivationheight=segwit@200"}}}

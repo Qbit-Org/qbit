@@ -4,10 +4,12 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Exercise explicit witness pruning against archive-by-default nodes."""
 
+import hashlib
 import http.client
 from pathlib import Path
 
-from test_framework.blocktools import COINBASE_MATURITY
+from test_framework.authproxy import JSONRPCException
+from test_framework.blocktools import COINBASE_MATURITY, create_block, create_coinbase
 from test_framework.messages import (
     CBlock,
     CBlockHeader,
@@ -85,6 +87,20 @@ def snapshot_blk_sizes(blocks_path: Path):
     return {p.name: p.stat().st_size for p in blocks_path.glob("blk[0-9][0-9][0-9][0-9][0-9].dat")}
 
 
+def snapshot_dir_state(path: Path):
+    if not path.exists():
+        return None
+    return sorted(
+        (
+            str(p.relative_to(path)),
+            p.stat().st_size,
+            hashlib.sha256(p.read_bytes()).hexdigest(),
+        )
+        for p in path.rglob("*")
+        if p.is_file()
+    )
+
+
 class WitnessPruningTest(BitcoinTestFramework):
     def set_test_params(self):
         self.num_nodes = 4
@@ -145,6 +161,45 @@ class WitnessPruningTest(BitcoinTestFramework):
             node.rpc_connected = False
             node.wait_for_rpc_connection(wait_for_import=False)
             return node.getbestblockhash()
+
+    @staticmethod
+    def is_witness_pruned_block(node, block_hash):
+        try:
+            node.getblock(block_hash, 1)
+        except JSONRPCException as e:
+            return VERBOSE_WITNESS_PRUNED_ERROR in e.error["message"]
+        return False
+
+    def assert_reindex_chainstate_assumevalid_fails_without_wipe(
+        self,
+        node,
+        assumevalid_hash,
+        expected_msg,
+        snapshot_path=None,
+    ):
+        chainstate_path = node.chain_path / "chainstate"
+        chainstate_before = snapshot_dir_state(chainstate_path)
+        snapshot_before = snapshot_dir_state(snapshot_path) if snapshot_path else None
+        log_pos = node.debug_log_path.stat().st_size if node.debug_log_path.exists() else 0
+
+        extra_args = ["-fastprune", "-reindex-chainstate"]
+        if assumevalid_hash is not None:
+            extra_args.append(f"-assumevalid={assumevalid_hash}")
+        node.assert_start_raises_init_error(
+            extra_args=extra_args,
+            expected_msg=expected_msg,
+            match=ErrorMatch.PARTIAL_REGEX,
+        )
+
+        assert_equal(snapshot_dir_state(chainstate_path), chainstate_before)
+        if snapshot_path is not None:
+            assert_equal(snapshot_dir_state(snapshot_path), snapshot_before)
+
+        with node.debug_log_path.open("rb") as debug_log:
+            debug_log.seek(log_pos)
+            new_log = debug_log.read().decode("utf-8", errors="replace")
+        assert "Wiping LevelDB" not in new_log
+        assert "[snapshot] deleting snapshot chainstate due to reindexing" not in new_log
 
     def run_test(self):
         pruned_node = self.nodes[0]
@@ -341,6 +396,32 @@ class WitnessPruningTest(BitcoinTestFramework):
         self.connect_nodes(0, 1)
         self.sync_blocks([pruned_node, archive_node])
 
+        self.log.info("Find the highest witness-pruned block for reindex-chainstate guard boundaries")
+        highest_witness_pruned_height = next(
+            height
+            for height in range(tip_height, 0, -1)
+            if self.is_witness_pruned_block(pruned_node, pruned_node.getblockhash(height))
+        )
+        highest_witness_pruned_hash = pruned_node.getblockhash(highest_witness_pruned_height)
+        first_unpruned_after_witness_pruned_hash = pruned_node.getblockhash(highest_witness_pruned_height + 1)
+        assert self.is_witness_pruned_block(pruned_node, highest_witness_pruned_hash)
+        assert not self.is_witness_pruned_block(pruned_node, first_unpruned_after_witness_pruned_hash)
+        assert pruned_height < highest_witness_pruned_height
+
+        self.log.info("Create a known off-best-header-chain hash for the reindex-chainstate assumevalid guard")
+        side_parent_height = tip_height - 2
+        side_parent_hash = pruned_node.getblockhash(side_parent_height)
+        side_parent_header = pruned_node.getblockheader(side_parent_hash)
+        offchain_block = create_block(
+            int(side_parent_hash, 16),
+            create_coinbase(side_parent_height + 1),
+            side_parent_header["time"] + 1,
+        )
+        offchain_block.solve()
+        offchain_assumevalid_hash = offchain_block.hash_hex
+        pruned_node.submitheader(CBlockHeader(offchain_block).serialize().hex())
+        assert_equal(pruned_node.getblockheader(offchain_assumevalid_hash)["hash"], offchain_assumevalid_hash)
+
         self.log.info("Guard: -txindex on a witness-pruned datadir should fail")
         self.stop_node(0)
         pruned_node.assert_start_raises_init_error(
@@ -361,19 +442,61 @@ class WitnessPruningTest(BitcoinTestFramework):
             ),
         )
 
-        self.log.info("Guard: -reindex-chainstate without assumevalid should fail")
-        pruned_node.assert_start_raises_init_error(
-            extra_args=["-fastprune", "-reindex-chainstate"],
+        self.log.info("Guard: -reindex-chainstate without assumevalid should fail before chainstate wipe")
+        self.assert_reindex_chainstate_assumevalid_fails_without_wipe(
+            pruned_node,
+            assumevalid_hash=None,
             expected_msg=(
                 "Error: Cannot use -reindex-chainstate on a witness-pruned node without "
-                "-assumevalid=<hash>. Without an assumed-valid checkpoint, historical script "
-                "validation requires witness data that has been stripped. Pass -assumevalid=<block hash> "
-                "to skip historical script validation, or delete the data directory and perform a fresh sync."
+                "-assumevalid=<hash>"
             ),
         )
 
-        self.log.info("Guard: -reindex-chainstate with assumevalid above the pruned range succeeds")
-        assumevalid_hash = archive_node.getblockhash(tip_height - 5)
+        self.log.info("Guard: unusable assumevalid values should fail before chainstate or snapshot wipe")
+        snapshot_path = pruned_node.chain_path / "chainstate_snapshot"
+        assert not snapshot_path.exists()
+        snapshot_path.mkdir()
+        (snapshot_path / "base_blockhash").write_bytes(b"z" * 32)
+        unknown_hash = "1".zfill(64)
+        below_pruned_range_hash = archive_node.getblockhash(start_height)
+        self.assert_reindex_chainstate_assumevalid_fails_without_wipe(
+            pruned_node,
+            assumevalid_hash=unknown_hash,
+            expected_msg="Error: Cannot use -reindex-chainstate on a witness-pruned node with unknown -assumevalid block",
+            snapshot_path=snapshot_path,
+        )
+        self.assert_reindex_chainstate_assumevalid_fails_without_wipe(
+            pruned_node,
+            assumevalid_hash=offchain_assumevalid_hash,
+            expected_msg=(
+                "Error: Cannot use -reindex-chainstate on a witness-pruned node with "
+                f"-assumevalid={offchain_assumevalid_hash} because that block is not on the best-header chain"
+            ),
+            snapshot_path=snapshot_path,
+        )
+        self.assert_reindex_chainstate_assumevalid_fails_without_wipe(
+            pruned_node,
+            assumevalid_hash=below_pruned_range_hash,
+            expected_msg="Error: Cannot use -reindex-chainstate on a witness-pruned node with -assumevalid=.*does not cover witness-pruned block",
+            snapshot_path=snapshot_path,
+        )
+        self.assert_reindex_chainstate_assumevalid_fails_without_wipe(
+            pruned_node,
+            assumevalid_hash=pruned_hash,
+            expected_msg="Error: Cannot use -reindex-chainstate on a witness-pruned node with -assumevalid=.*does not cover witness-pruned block",
+            snapshot_path=snapshot_path,
+        )
+        (snapshot_path / "base_blockhash").unlink()
+        snapshot_path.rmdir()
+
+        self.log.info("Guard: -reindex-chainstate with assumevalid at the highest witness-pruned block succeeds")
+        self.start_node(0, extra_args=["-fastprune", "-reindex-chainstate", f"-assumevalid={highest_witness_pruned_hash}"])
+        pruned_node = self.nodes[0]
+        assert_equal(pruned_node.getblockcount(), tip_height)
+
+        self.log.info("Guard: -reindex-chainstate with assumevalid immediately above the pruned range succeeds")
+        self.stop_node(0)
+        assumevalid_hash = first_unpruned_after_witness_pruned_hash
         self.start_node(0, extra_args=["-fastprune", "-reindex-chainstate", f"-assumevalid={assumevalid_hash}"])
         pruned_node = self.nodes[0]
         assert_equal(pruned_node.getblockcount(), tip_height)

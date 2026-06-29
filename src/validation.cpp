@@ -2439,6 +2439,82 @@ bool ChainstateManager::CanSkipScriptChecks(const CBlockIndex& block_index, bool
     return GetBlockProofEquivalentTime(*m_best_header, block_index, *m_best_header, GetConsensus()) > 60 * 60 * 24 * 7 * 2;
 }
 
+util::Result<void> ChainstateManager::CheckAssumeValidCoversWitnessPrunedHistory() const
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+{
+    AssertLockHeld(::cs_main);
+
+    const uint256& assumed_valid_block{AssumedValidBlock()};
+    if (assumed_valid_block.IsNull()) {
+        return util::Error{_(
+            "Cannot use -reindex-chainstate on a witness-pruned node without "
+            "-assumevalid=<hash>. Without an assumed-valid checkpoint, historical "
+            "script validation requires witness data that has been stripped. Pass "
+            "-assumevalid=<block hash> to skip historical script validation, or "
+            "delete the data directory and perform a fresh sync.")};
+    }
+
+    if (!m_best_header) {
+        return util::Error{strprintf(
+            _("Cannot use -reindex-chainstate on a witness-pruned node with "
+              "-assumevalid=%s because no best header is loaded."),
+            assumed_valid_block.ToString())};
+    }
+
+    if (m_best_header->nChainWork < MinimumChainWork()) {
+        return util::Error{strprintf(
+            _("Cannot use -reindex-chainstate on a witness-pruned node with "
+              "-assumevalid=%s because the best header does not satisfy "
+              "nMinimumChainWork."),
+            assumed_valid_block.ToString())};
+    }
+
+    const auto assumed_it{m_blockman.m_block_index.find(assumed_valid_block)};
+    if (assumed_it == m_blockman.m_block_index.end()) {
+        return util::Error{strprintf(
+            _("Cannot use -reindex-chainstate on a witness-pruned node with "
+              "unknown -assumevalid block %s. Pass a block hash from the "
+              "best-header chain that covers the witness-pruned range, or "
+              "delete the data directory and perform a fresh sync."),
+            assumed_valid_block.ToString())};
+    }
+
+    const CBlockIndex& assumed_index{assumed_it->second};
+    if (m_best_header->GetAncestor(assumed_index.nHeight) != &assumed_index) {
+        return util::Error{strprintf(
+            _("Cannot use -reindex-chainstate on a witness-pruned node with "
+              "-assumevalid=%s because that block is not on the best-header "
+              "chain. Pass a block hash from the best-header chain that covers "
+              "the witness-pruned range, or delete the data directory and "
+              "perform a fresh sync."),
+            assumed_valid_block.ToString())};
+    }
+
+    const CBlockIndex* highest_witness_pruned{nullptr};
+    for (const CBlockIndex* index{m_best_header}; index != nullptr; index = index->pprev) {
+        if (m_blockman.IsWitnessPruned(*index) && RequiresWitnessForPeerBlock(*index)) {
+            highest_witness_pruned = index;
+            break;
+        }
+    }
+
+    if (highest_witness_pruned &&
+        assumed_index.GetAncestor(highest_witness_pruned->nHeight) != highest_witness_pruned) {
+        return util::Error{strprintf(
+            _("Cannot use -reindex-chainstate on a witness-pruned node with "
+              "-assumevalid=%s because it does not cover witness-pruned block "
+              "%s at height %d. Pass an assumed-valid block on the best-header "
+              "chain at or above height %d, or delete the data directory and "
+              "perform a fresh sync."),
+            assumed_valid_block.ToString(),
+            highest_witness_pruned->GetBlockHash().ToString(),
+            highest_witness_pruned->nHeight,
+            highest_witness_pruned->nHeight)};
+    }
+
+    return {};
+}
+
 static bool CheckBlockWeight(const CBlock& block, BlockValidationState& state, const char* check_name);
 
 /** Apply the effects of this block (with given index) on the UTXO set represented by coins.
