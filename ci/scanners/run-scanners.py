@@ -1114,6 +1114,22 @@ def git_commit_tree(source: Path, commit: str) -> str:
     return stdout.strip() if exit_code == 0 else ""
 
 
+def ls_remote_ref_matches(query_ref: str, candidate_ref: str) -> bool:
+    if candidate_ref == query_ref:
+        return True
+    if query_ref.endswith("^{}") and candidate_ref == query_ref.removesuffix("^{}"):
+        return True
+    return False
+
+
+def ls_remote_ref_oid(stdout: str, ref: str) -> str:
+    for line in stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and ls_remote_ref_matches(ref, parts[1]):
+            return parts[0]
+    return ""
+
+
 def git_ls_remote_ref(source: Path, repo_url: str, ref: str) -> tuple[str, int]:
     exit_code, stdout, _stderr = run_text_command(
         ["git", "ls-remote", repo_url, ref],
@@ -1122,11 +1138,7 @@ def git_ls_remote_ref(source: Path, repo_url: str, ref: str) -> tuple[str, int]:
     )
     if exit_code != 0:
         return "", exit_code
-    for line in stdout.splitlines():
-        parts = line.split()
-        if len(parts) >= 2 and parts[1] == ref:
-            return parts[0], exit_code
-    return "", exit_code
+    return ls_remote_ref_oid(stdout, ref), exit_code
 
 
 def git_fetch(source: Path, repo_url: str, refs: list[str]) -> dict[str, Any]:
