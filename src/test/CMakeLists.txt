@@ -156,6 +156,7 @@ target_json_data_sources(test_bitcoin
   data/key_io_valid.json
   data/mainnet_launch_difficulty.json
   data/p2mr_pqc_witness_vectors.json
+  data/p2mr_vectors.json
   data/script_tests.json
   data/sighash.json
   data/testnet4_launch_difficulty.json

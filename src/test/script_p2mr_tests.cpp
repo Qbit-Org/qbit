@@ -3,7 +3,9 @@
 // file COPYING or https://www.opensource.org/licenses/mit-license.php.
 
 #include <addresstype.h>
+#include <chainparams.h>
 #include <crypto/pqc.h>
+#include <key_io.h>
 #include <policy/policy.h>
 #include <primitives/transaction.h>
 #include <script/interpreter.h>
@@ -14,9 +16,11 @@
 #include <script/script_error.h>
 #include <streams.h>
 #include <test/data/p2mr_pqc_witness_vectors.json.h>
+#include <test/data/p2mr_vectors.json.h>
 #include <test/util/json.h>
 #include <test/util/setup_common.h>
 #include <test/util/transaction_utils.h>
+#include <util/chaintype.h>
 #include <util/strencodings.h>
 #include <util/translation.h>
 
@@ -31,7 +35,10 @@
 #include <optional>
 #include <set>
 #include <span>
+#include <stdexcept>
+#include <string>
 #include <string_view>
+#include <univalue.h>
 #include <vector>
 
 namespace {
@@ -80,6 +87,41 @@ uint256 ComputeMerkleRootSingleLeaf(uint8_t leaf_version, const CScript& leaf_sc
 {
     const uint256 leaf_hash = ComputeP2MRLeafHash(leaf_version, ScriptBytes(leaf_script));
     return ComputeP2MRMerkleRoot(std::vector<unsigned char>{static_cast<unsigned char>(leaf_version | 1)}, leaf_hash);
+}
+
+std::vector<unsigned char> ExpectedP2MRLeafPreimage(uint8_t leaf_version, const std::vector<unsigned char>& leaf_script)
+{
+    std::vector<unsigned char> preimage{leaf_version, static_cast<unsigned char>(leaf_script.size())};
+    preimage.insert(preimage.end(), leaf_script.begin(), leaf_script.end());
+    return preimage;
+}
+
+UniValue P2MRVectorTestData()
+{
+    UniValue tests;
+    if (!tests.read(json_tests::p2mr_vectors) || !tests.isObject()) {
+        throw std::runtime_error("p2mr_vectors.json must contain a JSON object");
+    }
+    BOOST_CHECK_EQUAL(tests["version"].getInt<int>(), 1);
+    return tests;
+}
+
+uint256 VectorHash(const UniValue& obj, const std::string& field)
+{
+    const std::vector<unsigned char> bytes{ParseHex(obj[field].get_str())};
+    if (bytes.size() != uint256::size()) {
+        throw std::runtime_error("P2MR vector field is not a uint256: " + field);
+    }
+    return uint256{bytes};
+}
+
+ScriptError VectorScriptError(const std::string& name)
+{
+    if (name == "SCRIPT_ERR_P2MR_CONTROL_BIT0") return SCRIPT_ERR_P2MR_CONTROL_BIT0;
+    if (name == "SCRIPT_ERR_P2MR_WRONG_CONTROL_SIZE") return SCRIPT_ERR_P2MR_WRONG_CONTROL_SIZE;
+    if (name == "SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH") return SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH;
+    BOOST_FAIL("unknown P2MR vector script error: " + name);
+    return SCRIPT_ERR_UNKNOWN_ERROR;
 }
 
 CScript BuildP2MRScriptPubKey(const uint256& merkle_root)
@@ -632,6 +674,115 @@ static_assert(MAX_STACK_SIZE == 1000);
 static_assert(MAX_STANDARD_TX_WEIGHT == 400'000);
 static_assert(OP_CHECKDATASIGPQC == 0xbc);
 static_assert(OP_CHECKDATASIGADDPQC == 0xbd);
+
+BOOST_AUTO_TEST_CASE(p2mr_independent_commitment_vectors)
+{
+    const UniValue tests{P2MRVectorTestData()};
+    const auto& vectors = tests["valid"].getValues();
+    BOOST_REQUIRE(!vectors.empty());
+
+    for (const auto& vec : vectors) {
+        const std::string name{vec["name"].get_str()};
+        BOOST_TEST_CONTEXT(name)
+        {
+            const std::vector<unsigned char> leaf_script_bytes{ParseHex(vec["leaf_script"].get_str())};
+            BOOST_REQUIRE_LT(leaf_script_bytes.size(), 253U);
+            const uint8_t leaf_version{static_cast<uint8_t>(vec["leaf_version"].getInt<int>())};
+
+            const std::vector<unsigned char> expected_leaf_preimage{ExpectedP2MRLeafPreimage(leaf_version, leaf_script_bytes)};
+            BOOST_CHECK_EQUAL(HexStr(expected_leaf_preimage), vec["leaf_preimage"].get_str());
+
+            const uint256 leaf_hash{ComputeP2MRLeafHash(leaf_version, leaf_script_bytes)};
+            BOOST_CHECK_EQUAL(HexStr(leaf_hash), vec["leaf_hash"].get_str());
+
+            const std::vector<unsigned char> control_block{ParseHex(vec["control_block"].get_str())};
+            BOOST_CHECK_EQUAL(control_block.front() & 1, 1);
+            BOOST_CHECK_EQUAL(control_block.front() & P2MR_LEAF_VERSION_MASK, leaf_version);
+
+            const auto& siblings = vec["siblings"].getValues();
+            const auto& branch_preimages = vec["branch_preimages"].getValues();
+            BOOST_REQUIRE_EQUAL(siblings.size(), branch_preimages.size());
+            BOOST_CHECK_EQUAL(control_block.size(), P2MR_CONTROL_BASE_SIZE + P2MR_CONTROL_NODE_SIZE * siblings.size());
+
+            uint256 branch_hash{leaf_hash};
+            std::vector<unsigned char> expected_control{static_cast<unsigned char>(leaf_version | 1)};
+            for (size_t i{0}; i < siblings.size(); ++i) {
+                const uint256 sibling{ParseHex(siblings[i].get_str())};
+                expected_control.insert(expected_control.end(), sibling.begin(), sibling.end());
+
+                const bool branch_first{std::lexicographical_compare(branch_hash.begin(), branch_hash.end(), sibling.begin(), sibling.end())};
+                std::vector<unsigned char> branch_preimage;
+                if (branch_first) {
+                    branch_preimage.insert(branch_preimage.end(), branch_hash.begin(), branch_hash.end());
+                    branch_preimage.insert(branch_preimage.end(), sibling.begin(), sibling.end());
+                } else {
+                    branch_preimage.insert(branch_preimage.end(), sibling.begin(), sibling.end());
+                    branch_preimage.insert(branch_preimage.end(), branch_hash.begin(), branch_hash.end());
+                }
+                BOOST_CHECK_EQUAL(HexStr(branch_preimage), branch_preimages[i].get_str());
+
+                branch_hash = ComputeP2MRBranchHash(branch_hash, sibling);
+            }
+            BOOST_CHECK(control_block == expected_control);
+
+            const uint256 merkle_root{VectorHash(vec, "merkle_root")};
+            BOOST_CHECK_EQUAL(ComputeP2MRMerkleRoot(control_block, leaf_hash), merkle_root);
+            BOOST_CHECK_EQUAL(branch_hash, merkle_root);
+            BOOST_CHECK_EQUAL(HexStr(BuildP2MRScriptPubKey(merkle_root)), vec["scriptPubKey"].get_str());
+            BOOST_CHECK_EQUAL(HexStr(GetScriptForDestination(WitnessV2P2MR{merkle_root})), vec["scriptPubKey"].get_str());
+
+            SelectParams(ChainType::MAIN);
+            BOOST_CHECK_EQUAL(EncodeDestination(WitnessV2P2MR{merkle_root}), vec["mainnet_address"].get_str());
+            SelectParams(ChainType::REGTEST);
+            BOOST_CHECK_EQUAL(EncodeDestination(WitnessV2P2MR{merkle_root}), vec["regtest_address"].get_str());
+
+            const CScript leaf_script{leaf_script_bytes.begin(), leaf_script_bytes.end()};
+            const P2MRSpendContext spend{BuildP2MRSpend(leaf_script, /*stack_items=*/{}, control_block, merkle_root)};
+            ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+            BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+            BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+        }
+    }
+    SelectParams(ChainType::MAIN);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_independent_negative_vectors)
+{
+    const UniValue tests{P2MRVectorTestData()};
+    const auto& vectors = tests["invalid"].getValues();
+    BOOST_REQUIRE(!vectors.empty());
+
+    for (const auto& vec : vectors) {
+        const std::string name{vec["name"].get_str()};
+        BOOST_TEST_CONTEXT(name)
+        {
+            const std::vector<unsigned char> leaf_script_bytes{ParseHex(vec["leaf_script"].get_str())};
+            BOOST_REQUIRE_LT(leaf_script_bytes.size(), 253U);
+            const uint8_t leaf_version{static_cast<uint8_t>(vec["leaf_version"].getInt<int>())};
+            const uint256 production_leaf_hash{ComputeP2MRLeafHash(leaf_version, leaf_script_bytes)};
+            const std::vector<unsigned char> expected_leaf_preimage{ExpectedP2MRLeafPreimage(leaf_version, leaf_script_bytes)};
+
+            if (!vec["wrong_leaf_preimage"].isNull()) {
+                BOOST_CHECK_NE(HexStr(expected_leaf_preimage), vec["wrong_leaf_preimage"].get_str());
+            }
+            if (!vec["wrong_leaf_hash"].isNull()) {
+                BOOST_CHECK_NE(HexStr(production_leaf_hash), vec["wrong_leaf_hash"].get_str());
+            }
+            if (!vec["wrong_merkle_root"].isNull()) {
+                BOOST_CHECK_EQUAL(vec["wrong_merkle_root"].get_str(), vec["merkle_root"].get_str());
+            }
+
+            const std::vector<unsigned char> control_block{ParseHex(vec["control_block"].get_str())};
+            const uint256 merkle_root{VectorHash(vec, "merkle_root")};
+            const CScript leaf_script{leaf_script_bytes.begin(), leaf_script_bytes.end()};
+            const P2MRSpendContext spend{BuildP2MRSpend(leaf_script, /*stack_items=*/{}, control_block, merkle_root)};
+
+            ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+            BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+            BOOST_CHECK_EQUAL(err, VectorScriptError(vec["expected_error"].get_str()));
+        }
+    }
+}
 
 BOOST_AUTO_TEST_CASE(p2mr_pubkey_leaf_helpers_roundtrip)
 {
