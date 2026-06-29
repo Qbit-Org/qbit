@@ -588,9 +588,10 @@ struct P2MRWitnessVector {
     CPQCPubKey pubkey;
     valtype witness_signature;
     valtype raw_signature;
-    valtype p2mr_sigmsg;
-    uint256 p2mr_sighash;
-    uint256 wrong_domain_sighash;
+    ScriptError expected_error{SCRIPT_ERR_OK};
+    std::optional<valtype> p2mr_sigmsg;
+    std::optional<uint256> p2mr_sighash;
+    std::optional<uint256> wrong_domain_sighash;
     std::optional<valtype> no_annex_sigmsg;
     std::optional<uint256> no_annex_sighash;
     std::optional<valtype> no_annex_signature;
@@ -731,6 +732,20 @@ uint8_t ParseHashTypeField(const UniValue& obj)
     return bytes.front();
 }
 
+ScriptError ParseExpectedP2MRWitnessError(const UniValue& obj)
+{
+    if (!obj.exists("expectedError")) return SCRIPT_ERR_OK;
+
+    const UniValue& value{obj["expectedError"]};
+    BOOST_REQUIRE_MESSAGE(value.isStr(), "expectedError field must be a string");
+    const std::string name{value.get_str()};
+    if (name == "OK") return SCRIPT_ERR_OK;
+    if (name == "P2MR_SIG_HASHTYPE") return SCRIPT_ERR_P2MR_SIG_HASHTYPE;
+
+    BOOST_FAIL("unknown P2MR witness vector expectedError: " + name);
+    return SCRIPT_ERR_UNKNOWN_ERROR;
+}
+
 std::vector<CTxOut> ParseSpentOutputsField(const UniValue& obj)
 {
     const UniValue& outputs = obj["spentOutputs"];
@@ -775,9 +790,10 @@ P2MRWitnessVector ParseP2MRWitnessVector(const UniValue& vec)
         .pubkey = pubkey,
         .witness_signature = std::move(witness_signature),
         .raw_signature = std::move(raw_signature),
-        .p2mr_sigmsg = ParseHexField(vec, "p2mrSigMsg"),
-        .p2mr_sighash = ParseRawUint256Field(vec, "p2mrSighash"),
-        .wrong_domain_sighash = ParseRawUint256Field(vec, "wrongDomainSighash"),
+        .expected_error = ParseExpectedP2MRWitnessError(vec),
+        .p2mr_sigmsg = ParseOptionalHexField(vec, "p2mrSigMsg"),
+        .p2mr_sighash = ParseOptionalRawUint256Field(vec, "p2mrSighash"),
+        .wrong_domain_sighash = ParseOptionalRawUint256Field(vec, "wrongDomainSighash"),
         .no_annex_sigmsg = ParseOptionalHexField(vec, "noAnnexSigMsg"),
         .no_annex_sighash = ParseOptionalRawUint256Field(vec, "noAnnexSighash"),
         .no_annex_signature = ParseOptionalHexField(vec, "noAnnexSignature"),
@@ -794,8 +810,17 @@ P2MRWitnessVector ParseP2MRWitnessVector(const UniValue& vec)
         .data_sig_add = ParseOptionalDataSigAddVector(vec),
     };
 
-    BOOST_REQUIRE(!out.p2mr_sigmsg.empty());
-    BOOST_REQUIRE(out.p2mr_sighash != out.wrong_domain_sighash);
+    if (out.expected_error == SCRIPT_ERR_OK) {
+        BOOST_REQUIRE(out.p2mr_sigmsg);
+        BOOST_REQUIRE(out.p2mr_sighash);
+        BOOST_REQUIRE(out.wrong_domain_sighash);
+        BOOST_REQUIRE(!out.p2mr_sigmsg->empty());
+        BOOST_REQUIRE(*out.p2mr_sighash != *out.wrong_domain_sighash);
+    } else {
+        BOOST_REQUIRE(!out.p2mr_sigmsg);
+        BOOST_REQUIRE(!out.p2mr_sighash);
+        BOOST_REQUIRE(!out.wrong_domain_sighash);
+    }
     BOOST_REQUIRE_EQUAL(out.raw_signature.size(), PQC_SIG_SIZE);
     BOOST_REQUIRE_EQUAL(out.spent_outputs.size(), out.spend_tx.vin.size());
     BOOST_REQUIRE_LT(out.input_index, out.spend_tx.vin.size());
@@ -868,9 +893,13 @@ std::vector<P2MRWitnessVector> LoadIndependentP2MRWitnessVectors()
         "single_key_default_sighash_annex_present",
         "single_key_sighash_none",
         "single_key_sighash_single_matching_output",
+        "single_key_sighash_single_missing_first",
+        "single_key_sighash_single_missing_beyond",
         "single_key_sighash_all_anyonecanpay",
         "single_key_sighash_none_anyonecanpay",
         "single_key_sighash_single_anyonecanpay",
+        "single_key_sighash_single_anyonecanpay_missing_first",
+        "single_key_sighash_single_anyonecanpay_missing_beyond",
     };
     BOOST_REQUIRE_EQUAL(vectors_json.size(), expected_names.size());
     BOOST_REQUIRE_EQUAL(names.size(), expected_names.size());
@@ -1865,16 +1894,21 @@ BOOST_AUTO_TEST_CASE(p2mr_checksigpqc_accepts_independent_witness_vector)
     const std::vector<P2MRWitnessVector> vectors{LoadIndependentP2MRWitnessVectors()};
 
     for (const P2MRWitnessVector& vector : vectors) {
+        if (vector.expected_error != SCRIPT_ERR_OK) continue;
+
         const CScript leaf_script{vector.leaf_script.begin(), vector.leaf_script.end()};
         const PrecomputedTransactionData txdata{PrecomputeVectorData(vector.spend_tx, vector.spent_outputs)};
+        BOOST_REQUIRE(vector.p2mr_sigmsg);
+        BOOST_REQUIRE(vector.p2mr_sighash);
+        BOOST_REQUIRE(vector.wrong_domain_sighash);
 
         BOOST_TEST_CONTEXT(vector.name) {
             BOOST_CHECK_EQUAL(
-                HexStr(ToByteVector((HashWriter{HASHER_P2MR_SIGHASH} << std::span<const uint8_t>{vector.p2mr_sigmsg}).GetSHA256())),
-                HexStr(ToByteVector(vector.p2mr_sighash)));
+                HexStr(ToByteVector((HashWriter{HASHER_P2MR_SIGHASH} << std::span<const uint8_t>{*vector.p2mr_sigmsg}).GetSHA256())),
+                HexStr(ToByteVector(*vector.p2mr_sighash)));
             BOOST_CHECK_EQUAL(
-                HexStr(ToByteVector((HashWriter{HASHER_TAPSIGHASH} << std::span<const uint8_t>{vector.p2mr_sigmsg}).GetSHA256())),
-                HexStr(ToByteVector(vector.wrong_domain_sighash)));
+                HexStr(ToByteVector((HashWriter{HASHER_TAPSIGHASH} << std::span<const uint8_t>{*vector.p2mr_sigmsg}).GetSHA256())),
+                HexStr(ToByteVector(*vector.wrong_domain_sighash)));
 
             ScriptExecutionData execdata = vector.annex ? BuildExecData(leaf_script, *vector.annex) : BuildExecData(leaf_script);
             if (vector.annex) {
@@ -1896,9 +1930,9 @@ BOOST_AUTO_TEST_CASE(p2mr_checksigpqc_accepts_independent_witness_vector)
                 vector.hash_type,
                 txdata,
                 MissingDataBehavior::ASSERT_FAIL));
-            BOOST_CHECK_EQUAL(HexStr(ToByteVector(sighash)), HexStr(ToByteVector(vector.p2mr_sighash)));
-            BOOST_REQUIRE(vector.pubkey.Verify(vector.p2mr_sighash, vector.raw_signature));
-            BOOST_REQUIRE(!vector.pubkey.Verify(vector.wrong_domain_sighash, vector.raw_signature));
+            BOOST_CHECK_EQUAL(HexStr(ToByteVector(sighash)), HexStr(ToByteVector(*vector.p2mr_sighash)));
+            BOOST_REQUIRE(vector.pubkey.Verify(*vector.p2mr_sighash, vector.raw_signature));
+            BOOST_REQUIRE(!vector.pubkey.Verify(*vector.wrong_domain_sighash, vector.raw_signature));
 
             ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
             BOOST_CHECK(VerifyVectorSpend(vector, err));
@@ -1964,10 +1998,11 @@ BOOST_AUTO_TEST_CASE(p2mr_checksigpqc_rejects_independent_witness_vector_near_mi
 
     const P2MRWitnessVector& annex_vector{FindVector(vectors, "single_key_default_sighash_annex_present")};
     BOOST_REQUIRE(annex_vector.annex);
+    BOOST_REQUIRE(annex_vector.p2mr_sighash);
     BOOST_REQUIRE(annex_vector.no_annex_sighash);
     BOOST_REQUIRE(annex_vector.no_annex_signature);
     BOOST_REQUIRE(annex_vector.pubkey.Verify(*annex_vector.no_annex_sighash, *annex_vector.no_annex_signature));
-    BOOST_REQUIRE(!annex_vector.pubkey.Verify(annex_vector.p2mr_sighash, *annex_vector.no_annex_signature));
+    BOOST_REQUIRE(!annex_vector.pubkey.Verify(*annex_vector.p2mr_sighash, *annex_vector.no_annex_signature));
     {
         ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
         BOOST_REQUIRE(VerifyVectorSpend(annex_vector, err));
@@ -1988,6 +2023,49 @@ BOOST_AUTO_TEST_CASE(p2mr_checksigpqc_rejects_independent_witness_vector_near_mi
         CMutableTransaction tx{annex_vector.spend_tx};
         tx.vin[annex_vector.input_index].scriptWitness.stack[0] = *annex_vector.no_annex_signature;
         CheckVectorMutationFails(annex_vector, tx, annex_vector.spent_outputs, SCRIPT_ERR_P2MR_SIG);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_checksigpqc_rejects_independent_sighash_single_missing_output)
+{
+    const std::vector<P2MRWitnessVector> vectors{LoadIndependentP2MRWitnessVectors()};
+    static constexpr std::array<std::string_view, 4> MISSING_OUTPUT_VECTOR_NAMES{{
+        "single_key_sighash_single_missing_first",
+        "single_key_sighash_single_missing_beyond",
+        "single_key_sighash_single_anyonecanpay_missing_first",
+        "single_key_sighash_single_anyonecanpay_missing_beyond",
+    }};
+
+    for (const std::string_view name : MISSING_OUTPUT_VECTOR_NAMES) {
+        const P2MRWitnessVector& vector{FindVector(vectors, name)};
+        BOOST_TEST_CONTEXT(vector.name) {
+            BOOST_REQUIRE_EQUAL(vector.expected_error, SCRIPT_ERR_P2MR_SIG_HASHTYPE);
+            BOOST_REQUIRE(vector.hash_type == SIGHASH_SINGLE || vector.hash_type == (SIGHASH_SINGLE | SIGHASH_ANYONECANPAY));
+            BOOST_REQUIRE_EQUAL(vector.witness_signature.size(), PQC_SIG_SIZE + 1);
+            BOOST_CHECK_EQUAL(vector.witness_signature.back(), vector.hash_type);
+            BOOST_REQUIRE_GE(vector.input_index, vector.spend_tx.vout.size());
+            BOOST_CHECK(!vector.p2mr_sigmsg);
+            BOOST_CHECK(!vector.p2mr_sighash);
+
+            const CScript leaf_script{vector.leaf_script.begin(), vector.leaf_script.end()};
+            const PrecomputedTransactionData txdata{PrecomputeVectorData(vector.spend_tx, vector.spent_outputs)};
+            ScriptExecutionData execdata = BuildExecData(leaf_script);
+            uint256 sighash;
+            // P2MR rejects missing-output SIGHASH_SINGLE instead of defining a
+            // digest or inheriting legacy's uint256::ONE behavior.
+            BOOST_CHECK(!SignatureHashP2MR(
+                sighash,
+                execdata,
+                vector.spend_tx,
+                vector.input_index,
+                vector.hash_type,
+                txdata,
+                MissingDataBehavior::FAIL));
+
+            ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+            BOOST_CHECK(!VerifyVectorSpend(vector, err));
+            BOOST_CHECK_EQUAL(err, vector.expected_error);
+        }
     }
 }
 
