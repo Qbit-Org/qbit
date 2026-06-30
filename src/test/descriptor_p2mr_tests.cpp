@@ -10,6 +10,7 @@
 #include <script/interpreter.h>
 #include <script/script.h>
 #include <script/signingprovider.h>
+#include <test/data/p2mr_vectors.json.h>
 #include <test/util/setup_common.h>
 #include <util/chaintype.h>
 #include <util/strencodings.h>
@@ -19,6 +20,7 @@
 #include <array>
 #include <optional>
 #include <string>
+#include <univalue.h>
 #include <vector>
 
 namespace {
@@ -264,6 +266,32 @@ BOOST_AUTO_TEST_CASE(rawmr_fixed_address_vector)
     BOOST_CHECK_EQUAL(EncodeDestination(output), "qb1zqqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0sjq57mw");
     SelectParams(ChainType::REGTEST);
     BOOST_CHECK_EQUAL(EncodeDestination(output), "qbrt1zqqqsyqcyq5rqwzqfpg9scrgwpugpzysnzs23v9ccrydpk8qarc0s8kqqny");
+    SelectParams(ChainType::MAIN);
+}
+
+BOOST_AUTO_TEST_CASE(rawmr_independent_p2mr_vectors)
+{
+    UniValue tests;
+    BOOST_REQUIRE(tests.read(json_tests::p2mr_vectors));
+    BOOST_REQUIRE(tests.isObject());
+    BOOST_CHECK_EQUAL(tests["version"].getInt<int>(), 1);
+
+    for (const auto& vec : tests["valid"].getValues()) {
+        const std::string root{vec["merkle_root"].get_str()};
+        const std::string desc{"rawmr(" + root + ")"};
+        FlatSigningProvider provider;
+        auto parsed = ParseSingleDescriptor(desc, provider);
+
+        FlatSigningProvider out_provider;
+        const CScript script_pubkey = ExpandSingleScript(*parsed, out_provider);
+        BOOST_CHECK_EQUAL(HexStr(script_pubkey), vec["scriptPubKey"].get_str());
+
+        const WitnessV2P2MR output = ExtractP2MROutput(script_pubkey);
+        SelectParams(ChainType::MAIN);
+        BOOST_CHECK_EQUAL(EncodeDestination(output), vec["mainnet_address"].get_str());
+        SelectParams(ChainType::REGTEST);
+        BOOST_CHECK_EQUAL(EncodeDestination(output), vec["regtest_address"].get_str());
+    }
     SelectParams(ChainType::MAIN);
 }
 

@@ -263,7 +263,7 @@ BOOST_AUTO_TEST_CASE(psbt_p2mr_signing_canonicalizes_conflicting_merkle_root)
     const CPQCPubKey pubkey = key.GetPubKey();
     const CScript leaf_script = P2MRLeafScript(pubkey);
     const std::vector<unsigned char> leaf_script_bytes = Vec(leaf_script);
-    const uint256 leaf_hash = ComputeTapleafHash(P2MR_LEAF_VERSION_V1, leaf_script_bytes);
+    const uint256 leaf_hash = ComputeP2MRLeafHash(P2MR_LEAF_VERSION_V1, leaf_script_bytes);
     const std::vector<unsigned char> control_block = ControlBlock(static_cast<unsigned char>(P2MR_LEAF_VERSION_V1 | 1));
     const uint256 merkle_root = ComputeP2MRMerkleRoot(control_block, leaf_hash);
     const uint256 wrong_root = ByteHash(0xee);

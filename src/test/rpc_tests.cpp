@@ -16,6 +16,7 @@
 #include <script/interpreter.h>
 #include <script/signingprovider.h>
 #include <script/script.h>
+#include <test/data/p2mr_vectors.json.h>
 #include <test/util/setup_common.h>
 #include <univalue.h>
 #include <util/strencodings.h>
@@ -274,6 +275,27 @@ BOOST_AUTO_TEST_CASE(rpc_parse_prevouts_p2mr)
     BOOST_CHECK(parsed.merkle_root == output.GetMerkleRoot());
     BOOST_CHECK_EQUAL(parsed.scripts.size(), 1U);
     BOOST_CHECK(parsed.scripts.contains({std::vector<unsigned char>{leaf_script.begin(), leaf_script.end()}, P2MR_LEAF_VERSION}));
+
+    UniValue p2mr_vectors;
+    BOOST_REQUIRE(p2mr_vectors.read(json_tests::p2mr_vectors));
+    const UniValue& vector = p2mr_vectors["valid"][0];
+    const std::vector<unsigned char> vector_leaf_script{ParseHex(vector["leaf_script"].get_str())};
+    const uint8_t vector_leaf_version{static_cast<uint8_t>(vector["leaf_version"].getInt<int>())};
+    const std::string vector_prevtxs = strprintf(
+        "[{\"txid\":\"%s\",\"vout\":0,\"scriptPubKey\":\"%s\",\"amount\":1.00000000,\"p2mrScript\":\"%s\",\"p2mrControlBlock\":\"%s\"}]",
+        "0404040404040404040404040404040404040404040404040404040404040404",
+        vector["scriptPubKey"].get_str(),
+        vector["leaf_script"].get_str(),
+        vector["control_block"].get_str());
+
+    FlatSigningProvider vector_provider;
+    std::map<COutPoint, Coin> vector_coins;
+    ParsePrevouts(JSON(vector_prevtxs), &vector_provider, vector_coins);
+    const WitnessV2P2MR vector_output{uint256{ParseHex(vector["merkle_root"].get_str())}};
+    P2MRSpendData vector_parsed;
+    BOOST_CHECK(vector_provider.GetP2MRSpendData(vector_output, vector_parsed));
+    BOOST_CHECK_EQUAL(vector_parsed.merkle_root, vector_output.GetMerkleRoot());
+    BOOST_CHECK(vector_parsed.scripts.contains({vector_leaf_script, vector_leaf_version}));
 
     const CScript anchor_script_pub_key = GetScriptForDestination(PayToAnchor{});
     const std::string anchor_prevtxs = strprintf(
