@@ -23,6 +23,7 @@
 #include <qt/recentrequeststablemodel.h>
 #include <qt/sendcoinsdialog.h>
 #include <qt/sendcoinsentry.h>
+#include <qt/signverifymessagedialog.h>
 #include <qt/transactiontablemodel.h>
 #include <qt/transactionview.h>
 #include <qt/walletmodel.h>
@@ -33,6 +34,7 @@
 #include <script/solver.h>
 #include <consensus/consensus.h>
 #include <test/util/setup_common.h>
+#include <util/translation.h>
 #include <validation.h>
 #include <wallet/pqc_usage.h>
 #include <wallet/test/util.h>
@@ -53,7 +55,9 @@
 #include <QEvent>
 #include <QObject>
 #include <QPointer>
+#include <QPlainTextEdit>
 #include <QPushButton>
+#include <QTabWidget>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QTextEdit>
@@ -480,6 +484,7 @@ public:
     util::Result<CTxDestination> getNewDestination(const OutputType, const std::string&) override { return CTxDestination{PKHash{}}; }
     bool getPubKey(const CScript&, const CKeyID&, CPubKey&) override { return false; }
     SigningResult signMessage(const std::string&, const PKHash&, std::string&) override { return SigningResult::PRIVATE_KEY_NOT_AVAILABLE; }
+    util::Result<interfaces::P2MRDataSignatureResult> signP2MRDataHash(const CTxDestination&, const uint256&) override { return util::Error{Untranslated("P2MR data-hash signing unavailable")}; }
     bool isSpendable(const CTxDestination&) override { return false; }
     bool setAddressBook(const CTxDestination&, const std::string&, const std::optional<wallet::AddressPurpose>&) override { return false; }
     bool delAddressBook(const CTxDestination&) override { return false; }
@@ -764,6 +769,43 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
     QCOMPARE(address_type->currentData().toInt(), static_cast<int>(OutputType::P2MR));
     QCOMPARE(address_type->itemText(0), QString("P2MR"));
     QVERIFY(!address_type->isVisibleTo(&receiveCoinsDialog));
+
+    SignVerifyMessageDialog sign_verify_dialog(platformStyle.get(), nullptr);
+    sign_verify_dialog.setModel(mini_gui.walletModel.get());
+
+    QTabWidget* tab_widget = sign_verify_dialog.findChild<QTabWidget*>("tabWidget");
+    QVERIFY(tab_widget);
+    QCOMPARE(tab_widget->tabText(0), QString("&Sign Data Hash"));
+    QCOMPARE(tab_widget->tabText(1), QString("&Verify Proof"));
+
+    QLabel* signature_label = sign_verify_dialog.findChild<QLabel*>("signatureLabel_SM");
+    QVERIFY(signature_label);
+    QCOMPARE(signature_label->text(), QString("Proof JSON"));
+
+    QPushButton* sign_button = sign_verify_dialog.findChild<QPushButton*>("signMessageButton_SM");
+    QVERIFY(sign_button);
+    QCOMPARE(sign_button->text(), QString("Sign &Data Hash"));
+
+    QPlainTextEdit* proof_output = sign_verify_dialog.findChild<QPlainTextEdit*>("signatureOut_SM");
+    QVERIFY(proof_output);
+    QVERIFY(proof_output->minimumHeight() >= 96);
+    QVERIFY(proof_output->placeholderText().contains("Sign Data Hash"));
+
+    QPlainTextEdit* proof_input = sign_verify_dialog.findChild<QPlainTextEdit*>("messageIn_VM");
+    QVERIFY(proof_input);
+    QVERIFY(proof_input->placeholderText().contains("proof JSON"));
+
+    QValidatedLineEdit* verify_address = sign_verify_dialog.findChild<QValidatedLineEdit*>("addressIn_VM");
+    QVERIFY(verify_address);
+    QVERIFY(verify_address->isHidden());
+
+    QValidatedLineEdit* verify_signature = sign_verify_dialog.findChild<QValidatedLineEdit*>("signatureIn_VM");
+    QVERIFY(verify_signature);
+    QVERIFY(verify_signature->isHidden());
+
+    QPushButton* verify_button = sign_verify_dialog.findChild<QPushButton*>("verifyMessageButton_VM");
+    QVERIFY(verify_button);
+    QCOMPARE(verify_button->text(), QString("Verify &Proof"));
 }
 
 void TestSendPQCReportPropagation(interfaces::Node& node)

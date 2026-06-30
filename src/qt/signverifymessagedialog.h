@@ -34,6 +34,9 @@ protected:
     void changeEvent(QEvent* e) override;
 
 private:
+    bool isP2MRDataMode() const;
+    void updateP2MRDataModeUi();
+
     Ui::SignVerifyMessageDialog *ui;
     WalletModel* model{nullptr};
     const PlatformStyle *platformStyle;

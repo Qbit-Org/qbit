@@ -26,6 +26,7 @@
 #include <wallet/load.h>
 #include <wallet/pqc_usage.h>
 #include <wallet/receive.h>
+#include <wallet/rpc/util.h>
 #include <wallet/rpc/wallet.h>
 #include <wallet/spend.h>
 #include <wallet/wallet.h>
@@ -42,6 +43,7 @@ using interfaces::Chain;
 using interfaces::FoundBlock;
 using interfaces::Handler;
 using interfaces::MakeSignalHandler;
+using interfaces::P2MRDataSignatureResult;
 using interfaces::Wallet;
 using interfaces::WalletAddress;
 using interfaces::WalletBalances;
@@ -188,6 +190,40 @@ public:
     {
         if (GetPQCKeyValidationSigningError(*m_wallet)) return SigningResult::SIGNING_FAILED;
         return m_wallet->SignMessage(message, pkhash, str_sig);
+    }
+    util::Result<P2MRDataSignatureResult> signP2MRDataHash(const CTxDestination& dest, const uint256& message_hash) override
+    {
+        if (const auto error{GetPQCKeyValidationSigningError(*m_wallet)}) return util::Error{*error};
+
+        const auto* output{std::get_if<WitnessV2P2MR>(&dest)};
+        if (!output) {
+            return util::Error{Untranslated("Address is not a P2MR address")};
+        }
+
+        PQCUsageRecorder pqc_usage_recorder;
+        util::Result<DataPQCSignatureProof> proof{m_wallet->SignDataPQCHash(
+            *output,
+            message_hash,
+            /*requested_pubkey=*/std::nullopt,
+            /*requested_leaf_script=*/std::nullopt,
+            /*requested_control_block=*/std::nullopt,
+            pqc_usage_recorder.GetObserver())};
+        if (!proof) {
+            return util::Error{util::ErrorString(proof)};
+        }
+
+        P2MRDataSignatureResult result;
+        result.output = proof->output;
+        result.message_hash = proof->message_hash;
+        result.datasig_hash = proof->datasig_hash;
+        result.pubkey.assign(proof->pubkey.begin(), proof->pubkey.end());
+        result.signature = proof->signature;
+        result.leaf_script = proof->leaf_script;
+        result.control_block = proof->control_block;
+        result.leaf_version = proof->leaf_version;
+        result.pqc_usage = std::make_shared<const PQCUsageReport>(BuildSigningPQCUsageReport(pqc_usage_recorder));
+        LogPQCUsageWarnings(*m_wallet, *result.pqc_usage);
+        return result;
     }
     bool isSpendable(const CTxDestination& dest) override
     {
