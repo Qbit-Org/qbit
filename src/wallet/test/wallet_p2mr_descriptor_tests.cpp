@@ -383,6 +383,109 @@ BOOST_AUTO_TEST_CASE(P2MRDataHashSigningDistinguishesExhaustedPQCKey)
     BOOST_CHECK(recorder.Empty());
 }
 
+BOOST_AUTO_TEST_CASE(P2MRDataHashSigningPrefersMissingKeyOverMixedExhaustion)
+{
+    CPQCKey exhausted_key;
+    CPQCKey missing_key;
+    exhausted_key.MakeNewKey();
+    missing_key.MakeNewKey();
+
+    const CPQCPubKey exhausted_pubkey{exhausted_key.GetPubKey()};
+    const CPQCPubKey missing_pubkey{missing_key.GetPubKey()};
+    const CScript exhausted_leaf{p2mr::BuildPKScript(exhausted_pubkey)};
+    const CScript missing_leaf{p2mr::BuildPKScript(missing_pubkey)};
+
+    TaprootBuilder builder;
+    builder.AddP2MR(/*depth=*/1, ToBytes(exhausted_leaf), P2MR_LEAF_VERSION_V1)
+        .AddP2MR(/*depth=*/1, ToBytes(missing_leaf), P2MR_LEAF_VERSION_V1)
+        .FinalizeP2MR();
+    const WitnessV2P2MR output{builder.GetP2MROutput()};
+
+    FlatSigningProvider provider;
+    AddPQCSigningKeyForTest(provider, exhausted_key);
+    provider.pqc_sig_counters[exhausted_pubkey] = PQC_MAX_SIGNATURES;
+    provider.mr_trees.emplace(output, builder);
+
+    PQCUsageRecorder recorder;
+    provider.pqc_counter_observer = recorder.GetObserver();
+
+    const util::Result<DataPQCSignatureProof> proof{SignP2MRDataHash(
+        provider, output, uint256::ONE, std::nullopt, std::nullopt, std::nullopt)};
+
+    BOOST_CHECK(!proof);
+    BOOST_CHECK_EQUAL(util::ErrorString(proof).original, "Private key is not available for the selected P2MR pubkey leaf");
+    BOOST_CHECK(recorder.Empty());
+}
+
+BOOST_AUTO_TEST_CASE(P2MRWalletDataHashSigningReportsNearLimitExhaustion)
+{
+    auto wallet = CreateDescriptorWallet(*m_node.chain, P2MR_ONLY_OUTPUT_TYPES, SINGLE_ADDRESS_KEYPOOL_SIZE);
+
+    DescriptorScriptPubKeyMan* p2mr_spk_man{nullptr};
+    CScript p2mr_script;
+    {
+        LOCK(wallet->cs_wallet);
+        p2mr_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false));
+    }
+    BOOST_REQUIRE(p2mr_spk_man);
+
+    {
+        LOCK(p2mr_spk_man->cs_desc_man);
+        const WalletDescriptor wallet_descriptor = p2mr_spk_man->GetWalletDescriptor();
+        std::vector<CScript> scripts;
+        FlatSigningProvider out_keys;
+        BOOST_REQUIRE(wallet_descriptor.descriptor->ExpandFromCache(/*pos=*/0, wallet_descriptor.cache, scripts, out_keys));
+        BOOST_REQUIRE_EQUAL(scripts.size(), 1U);
+        p2mr_script = scripts.at(0);
+    }
+
+    std::vector<std::vector<unsigned char>> solutions;
+    BOOST_REQUIRE_EQUAL(Solver(p2mr_script, solutions), TxoutType::WITNESS_V2_P2MR);
+    const WitnessV2P2MR output{std::span<const unsigned char>{solutions.at(0)}};
+    const CachedP2MRPubKeys pubkeys{GetCachedP2MRPubKeys(*p2mr_spk_man, /*pos=*/0)};
+
+    auto provider{p2mr_spk_man->GetSigningProvider(pubkeys.pqc_pubkey)};
+    BOOST_REQUIRE(provider);
+    uint32_t previous_counter{0};
+    uint32_t reserved_counter{0};
+    BOOST_REQUIRE(provider->pqc_counter_reserver(pubkeys.pqc_pubkey, PQC_MAX_SIGNATURES - 1, previous_counter, reserved_counter));
+    BOOST_CHECK_EQUAL(previous_counter, 0U);
+    BOOST_CHECK_EQUAL(reserved_counter, PQC_MAX_SIGNATURES - 1);
+    BOOST_CHECK_EQUAL(GetProviderPQCCounter(*p2mr_spk_man, pubkeys.descriptor_pubkey, pubkeys.pqc_pubkey), PQC_MAX_SIGNATURES - 1);
+
+    PQCUsageRecorder recorder;
+    const util::Result<DataPQCSignatureProof> proof{wallet->SignDataPQCHash(
+        output, uint256::ONE, std::nullopt, std::nullopt, std::nullopt, recorder.GetObserver())};
+    BOOST_REQUIRE_MESSAGE(proof, util::ErrorString(proof).original);
+    BOOST_CHECK(proof->pubkey == pubkeys.pqc_pubkey);
+    BOOST_CHECK_EQUAL(proof->signature.size(), PQC_SIG_SIZE);
+
+    const PQCUsageReport report{BuildSigningPQCUsageReport(recorder)};
+    BOOST_REQUIRE(report.overall_state.has_value());
+    BOOST_CHECK(*report.overall_state == PQCSignatureLimitState::EXHAUSTED);
+    BOOST_REQUIRE_EQUAL(report.key_states.size(), 1U);
+    const PQCUsageSnapshot& snapshot{report.key_states.front()};
+    BOOST_CHECK(snapshot.pubkey == pubkeys.pqc_pubkey);
+    BOOST_CHECK_EQUAL(snapshot.signature_count, PQC_MAX_SIGNATURES);
+    BOOST_CHECK_EQUAL(snapshot.signature_limit, PQC_MAX_SIGNATURES);
+    BOOST_CHECK_EQUAL(snapshot.signatures_remaining, 0U);
+    BOOST_CHECK(snapshot.limit_state == PQCSignatureLimitState::EXHAUSTED);
+
+    const std::vector<bilingual_str> warnings{FormatPQCUsageWarnings(report.warnings)};
+    BOOST_REQUIRE_EQUAL(warnings.size(), 1U);
+    BOOST_CHECK(warnings.front().original.find("reached the signature limit") != std::string::npos);
+    BOOST_CHECK(warnings.front().original.find("0 remaining") != std::string::npos);
+    BOOST_CHECK_EQUAL(GetProviderPQCCounter(*p2mr_spk_man, pubkeys.descriptor_pubkey, pubkeys.pqc_pubkey), PQC_MAX_SIGNATURES);
+
+    PQCUsageRecorder exhausted_recorder;
+    const util::Result<DataPQCSignatureProof> exhausted_proof{wallet->SignDataPQCHash(
+        output, uint256::ONE, std::nullopt, std::nullopt, std::nullopt, exhausted_recorder.GetObserver())};
+    BOOST_CHECK(!exhausted_proof);
+    BOOST_CHECK_EQUAL(util::ErrorString(exhausted_proof).original, "PQC signature budget is exhausted for the selected P2MR pubkey leaf");
+    BOOST_CHECK(exhausted_recorder.Empty());
+    BOOST_CHECK_EQUAL(GetProviderPQCCounter(*p2mr_spk_man, pubkeys.descriptor_pubkey, pubkeys.pqc_pubkey), PQC_MAX_SIGNATURES);
+}
+
 BOOST_FIXTURE_TEST_CASE(NonRangedP2MRDescriptorDoesNotDeriveUnrelatedPQCKeys, TestingSetup)
 {
     CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
