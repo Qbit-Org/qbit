@@ -324,8 +324,15 @@ def libbitcoinpqc_github_auth_env(repo_url: str) -> dict[str, str] | None:
     return env
 
 
-def libbitcoinpqc_verify_env() -> dict[str, str] | None:
-    return libbitcoinpqc_github_auth_env(LIBBITCOINPQC_UPSTREAM_REPO)
+def libbitcoinpqc_verify_env() -> dict[str, str]:
+    env = (
+        libbitcoinpqc_github_auth_env(LIBBITCOINPQC_UPSTREAM_REPO)
+        or os.environ.copy()
+    )
+    env["LIBBITCOINPQC_PATH"] = LIBBITCOINPQC_PATH
+    env["LIBBITCOINPQC_REMOTE_URL"] = LIBBITCOINPQC_UPSTREAM_REPO
+    env["LIBBITCOINPQC_REMOTE_REF"] = LIBBITCOINPQC_UPSTREAM_TAG
+    return env
 
 
 def safe_review_id(value: Any) -> str:

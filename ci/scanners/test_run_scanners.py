@@ -105,6 +105,36 @@ class RunScannersTest(unittest.TestCase):
         self.assertTrue(
             any(value.startswith("AUTHORIZATION: basic ") for value in auth_headers)
         )
+        self.assertEqual(run_scanners.LIBBITCOINPQC_PATH, env["LIBBITCOINPQC_PATH"])
+        self.assertEqual(
+            run_scanners.LIBBITCOINPQC_UPSTREAM_REPO,
+            env["LIBBITCOINPQC_REMOTE_URL"],
+        )
+        self.assertEqual(
+            run_scanners.LIBBITCOINPQC_UPSTREAM_TAG,
+            env["LIBBITCOINPQC_REMOTE_REF"],
+        )
+
+    def test_libbitcoinpqc_verify_env_pins_shell_inputs_without_auth(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "LIBBITCOINPQC_READ_TOKEN": "",
+                "UPSTREAM_GITHUB_TOKEN": "",
+            },
+            clear=False,
+        ):
+            env = run_scanners.libbitcoinpqc_verify_env()
+
+        self.assertEqual(run_scanners.LIBBITCOINPQC_PATH, env["LIBBITCOINPQC_PATH"])
+        self.assertEqual(
+            run_scanners.LIBBITCOINPQC_UPSTREAM_REPO,
+            env["LIBBITCOINPQC_REMOTE_URL"],
+        )
+        self.assertEqual(
+            run_scanners.LIBBITCOINPQC_UPSTREAM_TAG,
+            env["LIBBITCOINPQC_REMOTE_REF"],
+        )
 
     def test_libbitcoinpqc_provenance_passes_auth_to_verifier(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -166,6 +196,10 @@ class RunScannersTest(unittest.TestCase):
         ]
         self.assertTrue(
             any(value.startswith("AUTHORIZATION: basic ") for value in auth_headers)
+        )
+        self.assertEqual(
+            run_scanners.LIBBITCOINPQC_UPSTREAM_TAG,
+            verifier_env["LIBBITCOINPQC_REMOTE_REF"],
         )
 
 
