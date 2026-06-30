@@ -2,10 +2,30 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <test/data/p2mr_datapqchash_vectors.json.h>
 #include <wallet/test/wallet_p2mr_test_util.h>
+
+#include <span>
 
 namespace wallet {
 using namespace wallet_p2mr_test;
+
+std::string HashToHex(const uint256& hash)
+{
+    return HexStr(std::span<const unsigned char>{hash.begin(), hash.end()});
+}
+
+UniValue LoadPinnedDataPQCVector()
+{
+    UniValue doc;
+    BOOST_REQUIRE(doc.read(json_tests::p2mr_datapqchash_vectors));
+    BOOST_REQUIRE(doc.isObject());
+    BOOST_CHECK_EQUAL(doc["schema_version"].getInt<int>(), 1);
+    const UniValue& vectors{doc["vectors"]};
+    BOOST_REQUIRE(vectors.isArray());
+    BOOST_REQUIRE_EQUAL(vectors.size(), 1U);
+    return vectors[0];
+}
 
 BOOST_FIXTURE_TEST_SUITE(wallet_p2mr_descriptor_tests, WalletTestingSetup)
 
@@ -207,6 +227,60 @@ BOOST_AUTO_TEST_CASE(P2MRDataHashSigningRetriesLaterLeavesAfterRuntimeFailure)
         std::optional<std::vector<unsigned char>>{failing_control_block})};
     BOOST_CHECK(!explicit_failing_leaf);
     BOOST_CHECK_EQUAL(util::ErrorString(explicit_failing_leaf).original, "PQC data-hash signing failed");
+}
+
+BOOST_AUTO_TEST_CASE(P2MRDataHashSigningMatchesPinnedProofFixture)
+{
+    const UniValue vector{LoadPinnedDataPQCVector()};
+
+    const std::vector<unsigned char> secret_key_bytes{ParseHex(vector["secret_key"].get_str())};
+    const std::vector<unsigned char> pubkey_bytes{ParseHex(vector["pubkey"].get_str())};
+    CPQCKey key;
+    key.Set(secret_key_bytes.data(), secret_key_bytes.data() + secret_key_bytes.size());
+    BOOST_REQUIRE(key.IsValid());
+    const CPQCPubKey pubkey{pubkey_bytes};
+    BOOST_REQUIRE(pubkey.IsValid());
+    BOOST_CHECK(key.GetPubKey() == pubkey);
+
+    const std::vector<unsigned char> leaf_script_bytes{ParseHex(vector["leaf_script"].get_str())};
+    const CScript leaf_script{leaf_script_bytes.begin(), leaf_script_bytes.end()};
+    BOOST_REQUIRE(leaf_script == p2mr::BuildPKScript(pubkey));
+
+    const std::vector<unsigned char> sibling_leaf_script_bytes{ParseHex(vector["tree"]["sibling_leaf_script"].get_str())};
+
+    TaprootBuilder builder;
+    builder.AddP2MR(/*depth=*/1, leaf_script_bytes, P2MR_LEAF_VERSION_V1)
+        .AddP2MR(/*depth=*/1, sibling_leaf_script_bytes, P2MR_LEAF_VERSION_V1)
+        .FinalizeP2MR();
+    const WitnessV2P2MR output{builder.GetP2MROutput()};
+    BOOST_CHECK_EQUAL(HashToHex(output.GetMerkleRoot()), vector["p2mr_merkle_root"].get_str());
+
+    FlatSigningProvider provider;
+    AddPQCSigningKeyForTest(provider, key);
+    provider.mr_trees.emplace(output, builder);
+
+    const std::vector<unsigned char> message_hash_bytes{ParseHex(vector["message_hash"].get_str())};
+    BOOST_REQUIRE_EQUAL(message_hash_bytes.size(), uint256::size());
+    const uint256 message_hash{std::span<const unsigned char>{message_hash_bytes.data(), message_hash_bytes.size()}};
+    const std::vector<unsigned char> control_block{ParseHex(vector["control_block"].get_str())};
+
+    const util::Result<DataPQCSignatureProof> proof{SignP2MRDataHash(
+        provider,
+        output,
+        message_hash,
+        std::optional<CPQCPubKey>{pubkey},
+        std::optional<CScript>{leaf_script},
+        std::optional<std::vector<unsigned char>>{control_block})};
+
+    BOOST_REQUIRE(proof);
+    BOOST_CHECK(proof->output == output);
+    BOOST_CHECK(proof->message_hash == message_hash);
+    BOOST_CHECK_EQUAL(HashToHex(proof->datasig_hash), vector["datasig_hash"].get_str());
+    BOOST_CHECK(proof->pubkey == pubkey);
+    BOOST_CHECK(proof->leaf_script == leaf_script);
+    BOOST_CHECK(proof->control_block == control_block);
+    BOOST_CHECK_EQUAL(proof->leaf_version, P2MR_LEAF_VERSION_V1);
+    BOOST_CHECK_EQUAL(HexStr(proof->signature), vector["signature"].get_str());
 }
 
 BOOST_FIXTURE_TEST_CASE(NonRangedP2MRDescriptorDoesNotDeriveUnrelatedPQCKeys, TestingSetup)
