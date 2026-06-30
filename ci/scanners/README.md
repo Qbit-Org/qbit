@@ -23,10 +23,9 @@ python3 ci/scanners/run-scanners.py \
 `minimum` on Linux runners. It writes installed binary paths to
 `$GITHUB_PATH` when running in GitHub Actions.
 
-The vendored `src/libbitcoinpqc` provenance scanner reads
-`LIBBITCOINPQC_READ_TOKEN` for authenticated access to the configured
-`libbitcoinpqc-qbit` upstream repository. `UPSTREAM_GITHUB_TOKEN` is accepted as
-a compatibility fallback for existing libbitcoinpqc evidence workflows.
+The vendored `src/libbitcoinpqc` provenance scanner verifies the recorded
+`git-subtree-split` against the pinned public `Qbit-Org/qbit-libbitcoinpqc`
+release tag documented in `doc/subtrees/libbitcoinpqc.md`.
 
 For frozen review evidence, write summaries directly into the review record workspace:
 
