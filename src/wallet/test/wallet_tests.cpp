@@ -1589,7 +1589,14 @@ BOOST_AUTO_TEST_CASE(P2MRDataHashSigningRetriesLaterLeavesAfterRuntimeFailure)
     CScript first_leaf{p2mr::BuildPKScript(first_pubkey)};
     CScript second_leaf{p2mr::BuildPKScript(second_pubkey)};
 
-    if (ToBytes(second_leaf) < ToBytes(first_leaf)) {
+    const auto bytes_less{[](const auto& left, const auto& right) {
+        for (size_t i{0}; i < left.size() && i < right.size(); ++i) {
+            if (left[i] != right[i]) return left[i] < right[i];
+        }
+        return left.size() < right.size();
+    }};
+
+    if (bytes_less(ToBytes(second_leaf), ToBytes(first_leaf))) {
         std::swap(first_key, second_key);
         std::swap(first_pubkey, second_pubkey);
         std::swap(first_leaf, second_leaf);
