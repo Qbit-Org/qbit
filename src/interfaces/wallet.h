@@ -63,6 +63,18 @@ struct WalletMigrationResult;
 using WalletOrderForm = std::vector<std::pair<std::string, std::string>>;
 using WalletValueMap = std::map<std::string, std::string>;
 
+struct P2MRDataSignatureResult {
+    WitnessV2P2MR output;
+    uint256 message_hash;
+    uint256 datasig_hash;
+    std::vector<unsigned char> pubkey;
+    std::vector<unsigned char> signature;
+    CScript leaf_script;
+    std::vector<unsigned char> control_block;
+    uint8_t leaf_version;
+    std::shared_ptr<const wallet::PQCUsageReport> pqc_usage;
+};
+
 //! Interface for accessing a wallet.
 class Wallet
 {
@@ -108,6 +120,9 @@ public:
 
     //! Sign message
     virtual SigningResult signMessage(const std::string& message, const PKHash& pkhash, std::string& str_sig) = 0;
+
+    //! Sign a 32-byte data hash with a PQC key committed by a wallet-owned P2MR address.
+    virtual util::Result<P2MRDataSignatureResult> signP2MRDataHash(const CTxDestination& dest, const uint256& message_hash) = 0;
 
     //! Return whether wallet has private key.
     virtual bool isSpendable(const CTxDestination& dest) = 0;
