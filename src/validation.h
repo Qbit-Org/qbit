@@ -1037,6 +1037,8 @@ public:
      * witness-pruned chainstate).
      */
     bool NeedsWitnessForValidation(const CBlockIndex& block_index) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    /** Validate that -assumevalid is usable before replaying witness-pruned history. */
+    [[nodiscard]] util::Result<void> CheckAssumeValidCoversWitnessPrunedHistory() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     bool RequiresArchivePeersForValidation() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     const CBlockIndex* PendingWitnessRecovery() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     bool ScheduleWitnessRecovery(const CBlockIndex& block_index) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
