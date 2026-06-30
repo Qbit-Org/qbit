@@ -164,18 +164,8 @@ bool ParseP2MRProofJson(const QString& proof_json, common::P2MRDataSignatureProo
     std::vector<unsigned char> bytes;
     if (!ParseProofHexField(object, "message_hash", uint256::size(), bytes, error)) return false;
     proof.message_hash = uint256{std::span<const unsigned char>{bytes.data(), bytes.size()}};
-
-    const UniValue& datasig_hash_field{object.find_value("datasig_hash")};
-    if (datasig_hash_field.isNull()) {
-        proof.datasig_hash = ComputeQbitDataSigPQCHash(std::span<const unsigned char>{proof.message_hash.begin(), proof.message_hash.end()});
-    } else {
-        if (!datasig_hash_field.isStr()) {
-            error = SignVerifyMessageDialog::tr("Proof field \"datasig_hash\" must be a string.");
-            return false;
-        }
-        if (!ParseHexBytes(QString::fromStdString(datasig_hash_field.get_str()), "datasig_hash", uint256::size(), bytes, error)) return false;
-        proof.datasig_hash = uint256{std::span<const unsigned char>{bytes.data(), bytes.size()}};
-    }
+    proof.datasig_hash = ComputeQbitDataSigPQCHash(
+        std::span<const unsigned char>{proof.message_hash.begin(), proof.message_hash.end()});
 
     if (!ParseProofHexField(object, "pubkey", PQC_PUBKEY_SIZE, bytes, error)) return false;
     proof.pubkey = CPQCPubKey{bytes};
@@ -480,10 +470,6 @@ void SignVerifyMessageDialog::updateP2MRSignHashPreview()
             return;
         }
     } else {
-        if (ui->messageIn_SM->document()->isEmpty()) {
-            ui->p2mrMessageHash_SM->clear();
-            return;
-        }
         message_hash = HashP2MRUtf8Text(ui->messageIn_SM->document()->toPlainText());
     }
 
@@ -533,10 +519,6 @@ void SignVerifyMessageDialog::updateP2MRVerifyHashPreview()
             return;
         }
     } else {
-        if (ui->p2mrDataIn_VM->document()->isEmpty()) {
-            ui->p2mrVerifyMessageHash_VM->clear();
-            return;
-        }
         message_hash = HashP2MRUtf8Text(ui->p2mrDataIn_VM->document()->toPlainText());
     }
 
@@ -722,7 +704,6 @@ void SignVerifyMessageDialog::on_clearButton_SM_clicked()
     ui->messageIn_SM->clear();
     ui->signatureOut_SM->clear();
     ui->statusLabel_SM->clear();
-    ui->p2mrMessageHash_SM->clear();
 
     ui->addressIn_SM->setFocus();
 }
@@ -849,7 +830,6 @@ void SignVerifyMessageDialog::on_clearButton_VM_clicked()
     ui->signatureIn_VM->clear();
     ui->messageIn_VM->clear();
     ui->p2mrDataIn_VM->clear();
-    ui->p2mrVerifyMessageHash_VM->clear();
     ui->statusLabel_VM->clear();
 
     if (isP2MRDataMode()) {

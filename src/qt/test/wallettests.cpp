@@ -794,6 +794,7 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
 
     QLineEdit* sign_hash_preview = sign_verify_dialog.findChild<QLineEdit*>("p2mrMessageHash_SM");
     QVERIFY(sign_hash_preview);
+    QCOMPARE(sign_hash_preview->text(), QString("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"));
     sign_input->setPlainText("abc");
     QCOMPARE(sign_hash_preview->text(), QString("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
 
@@ -822,10 +823,11 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
 
     QPlainTextEdit* verify_data_input = sign_verify_dialog.findChild<QPlainTextEdit*>("p2mrDataIn_VM");
     QVERIFY(verify_data_input);
-    verify_data_input->setPlainText("abc");
 
     QLineEdit* verify_hash_preview = sign_verify_dialog.findChild<QLineEdit*>("p2mrVerifyMessageHash_VM");
     QVERIFY(verify_hash_preview);
+    QCOMPARE(verify_hash_preview->text(), QString("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"));
+    verify_data_input->setPlainText("abc");
     QCOMPARE(verify_hash_preview->text(), QString("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
 
     verify_input_mode->setCurrentIndex(2);
