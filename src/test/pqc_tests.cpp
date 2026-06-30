@@ -498,6 +498,45 @@ BOOST_AUTO_TEST_CASE(pqc_signing_provider_reserves_authoritative_counter)
     BOOST_CHECK(observed_ranges[1] == std::make_pair(1U, 2U));
 }
 
+BOOST_AUTO_TEST_CASE(pqc_signing_provider_reports_committed_reservation_on_sign_failure)
+{
+    CPQCKey key;
+    key.MakeNewKey();
+    const CPQCPubKey pubkey = key.GetPubKey();
+
+    uint32_t authoritative_counter{0};
+
+    FlatSigningProvider provider;
+    provider.pqc_keys.emplace(pubkey, key);
+    provider.pqc_sig_counters.emplace(pubkey, 0);
+    provider.pqc_counter_reserver = [&](const CPQCPubKey& seen_pubkey, uint32_t count, uint32_t& previous_counter, uint32_t& reserved_counter) {
+        BOOST_CHECK(seen_pubkey == pubkey);
+        BOOST_CHECK_EQUAL(count, 1U);
+        previous_counter = authoritative_counter;
+        reserved_counter = authoritative_counter + count;
+        authoritative_counter = reserved_counter;
+        return true;
+    };
+
+    std::vector<std::pair<uint32_t, uint32_t>> observed_ranges;
+    provider.pqc_counter_observer = [&](const CPQCPubKey& seen_pubkey, uint32_t previous_counter, uint32_t reserved_counter) {
+        BOOST_CHECK(seen_pubkey == pubkey);
+        observed_ranges.emplace_back(previous_counter, reserved_counter);
+    };
+    provider.pqc_raw_signer = [&](const CPQCKey&, const uint256&, std::vector<unsigned char>& sig, uint32_t&) {
+        sig.assign(PQC_SIG_SIZE, 0x42);
+        return false;
+    };
+
+    std::vector<unsigned char> sig;
+    BOOST_CHECK(!provider.SignPQC(pubkey, TestHash("pqc_signing_provider_reports_committed_reservation_on_sign_failure"), sig));
+    BOOST_CHECK(sig.empty());
+    BOOST_CHECK_EQUAL(authoritative_counter, 1U);
+    BOOST_CHECK_EQUAL(provider.pqc_sig_counters[pubkey], 1U);
+    BOOST_REQUIRE_EQUAL(observed_ranges.size(), 1U);
+    BOOST_CHECK(observed_ranges[0] == std::make_pair(0U, 1U));
+}
+
 #ifdef ENABLE_WALLET
 BOOST_AUTO_TEST_CASE(pqc_usage_level_boundaries)
 {

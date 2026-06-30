@@ -2504,6 +2504,8 @@ util::Result<DataPQCSignatureProof> SignP2MRDataHash(
 
     bool found_matching_leaf{false};
     bool found_signable_key{false};
+    bool found_exhausted_key{false};
+    bool found_unavailable_key{false};
     bool signing_failed{false};
     const std::vector<unsigned char> requested_leaf_bytes = requested_leaf_script ?
         std::vector<unsigned char>{requested_leaf_script->begin(), requested_leaf_script->end()} :
@@ -2525,7 +2527,14 @@ util::Result<DataPQCSignatureProof> SignP2MRDataHash(
         if (!control_block) continue;
 
         found_matching_leaf = true;
-        if (!provider.CanSignPQC(*pubkey)) continue;
+        if (!provider.CanSignPQC(*pubkey)) {
+            if (provider.IsPQCSignatureCounterExhausted(*pubkey)) {
+                found_exhausted_key = true;
+            } else {
+                found_unavailable_key = true;
+            }
+            continue;
+        }
         found_signable_key = true;
 
         std::vector<unsigned char> signature;
@@ -2547,6 +2556,9 @@ util::Result<DataPQCSignatureProof> SignP2MRDataHash(
     }
 
     if (found_matching_leaf && !found_signable_key) {
+        if (found_exhausted_key && !found_unavailable_key) {
+            return util::Error{_("PQC signature budget is exhausted for the selected P2MR pubkey leaf")};
+        }
         return util::Error{_("Private key is not available for the selected P2MR pubkey leaf")};
     }
     if (signing_failed) {
