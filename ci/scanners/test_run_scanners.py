@@ -7,11 +7,13 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -84,6 +86,87 @@ class RunScannersTest(unittest.TestCase):
 
             self.assertNotEqual(tag_object, commit)
             self.assertEqual(run_scanners.git_peel_commit(repo, tag_object), commit)
+
+    def test_libbitcoinpqc_verify_env_uses_read_token(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"LIBBITCOINPQC_READ_TOKEN": "test-token"},
+            clear=False,
+        ):
+            env = run_scanners.libbitcoinpqc_verify_env()
+
+        self.assertIsNotNone(env)
+        assert env is not None
+        auth_headers = [
+            value
+            for key, value in env.items()
+            if key.startswith("GIT_CONFIG_VALUE_")
+        ]
+        self.assertTrue(
+            any(value.startswith("AUTHORIZATION: basic ") for value in auth_headers)
+        )
+
+    def test_libbitcoinpqc_provenance_passes_auth_to_verifier(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir)
+            verify_script = source / run_scanners.LIBBITCOINPQC_VERIFY_COMMAND[0]
+            verify_script.parent.mkdir(parents=True)
+            verify_script.write_text("#!/bin/sh\nexit 0\n", encoding="utf8")
+            verifier_envs = []
+
+            def fake_run_text_command(command, cwd, env=None):
+                verifier_envs.append(env)
+                return 0, "", ""
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {"LIBBITCOINPQC_READ_TOKEN": "test-token"},
+                    clear=False,
+                ),
+                patch.object(
+                    run_scanners,
+                    "git_ls_remote_ref",
+                    return_value=("tag-object", 0),
+                ),
+                patch.object(
+                    run_scanners,
+                    "latest_git_subtree_metadata",
+                    return_value={
+                        "git_subtree_split": "commit",
+                        "qbit_import_commit": "import",
+                    },
+                ),
+                patch.object(
+                    run_scanners,
+                    "fetch_libbitcoinpqc_provenance_objects",
+                    return_value=([], []),
+                ),
+                patch.object(run_scanners, "git_peel_commit", return_value="commit"),
+                patch.object(run_scanners, "git_tree_for_path", return_value="tree"),
+                patch.object(run_scanners, "git_commit_tree", return_value="tree"),
+                patch.object(
+                    run_scanners,
+                    "run_text_command",
+                    side_effect=fake_run_text_command,
+                ),
+            ):
+                provenance, gaps = run_scanners.libbitcoinpqc_provenance(source)
+
+        self.assertEqual([], gaps)
+        self.assertEqual(0, provenance["verification_exit_code"])
+        self.assertEqual(1, len(verifier_envs))
+        verifier_env = verifier_envs[0]
+        self.assertIsNotNone(verifier_env)
+        assert verifier_env is not None
+        auth_headers = [
+            value
+            for key, value in verifier_env.items()
+            if key.startswith("GIT_CONFIG_VALUE_")
+        ]
+        self.assertTrue(
+            any(value.startswith("AUTHORIZATION: basic ") for value in auth_headers)
+        )
 
 
 if __name__ == "__main__":

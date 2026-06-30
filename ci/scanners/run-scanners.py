@@ -324,6 +324,10 @@ def libbitcoinpqc_github_auth_env(repo_url: str) -> dict[str, str] | None:
     return env
 
 
+def libbitcoinpqc_verify_env() -> dict[str, str] | None:
+    return libbitcoinpqc_github_auth_env(LIBBITCOINPQC_UPSTREAM_REPO)
+
+
 def safe_review_id(value: Any) -> str:
     text = str(value or "").strip()
     if not text:
@@ -1245,7 +1249,11 @@ def libbitcoinpqc_provenance(source: Path) -> tuple[dict[str, Any], list[str]]:
 
     verify_script = source / LIBBITCOINPQC_VERIFY_COMMAND[0]
     if verify_script.is_file():
-        verify_exit, _stdout, _stderr = run_text_command(LIBBITCOINPQC_VERIFY_COMMAND, source)
+        verify_exit, _stdout, _stderr = run_text_command(
+            LIBBITCOINPQC_VERIFY_COMMAND,
+            source,
+            env=libbitcoinpqc_verify_env(),
+        )
     else:
         verify_exit = 127
     provenance["verification_exit_code"] = verify_exit
