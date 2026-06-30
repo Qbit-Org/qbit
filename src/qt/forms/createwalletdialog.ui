@@ -86,13 +86,13 @@
    <item>
     <widget class="QCheckBox" name="encrypt_wallet_checkbox">
      <property name="toolTip">
-      <string>Encrypt the wallet. The wallet will be encrypted with a passphrase of your choice.</string>
+      <string>Encrypt the wallet with a passphrase of your choice. This protects private keys and enables authenticated wallet loads that avoid repeated plaintext PQC key validation.</string>
      </property>
      <property name="text">
-      <string>Encrypt Wallet</string>
+      <string>Encrypt Wallet (recommended)</string>
      </property>
      <property name="checked">
-      <bool>false</bool>
+      <bool>true</bool>
      </property>
     </widget>
    </item>

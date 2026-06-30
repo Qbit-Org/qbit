@@ -25,7 +25,7 @@ CreateWalletDialog::CreateWalletDialog(QWidget* parent) :
         ui->buttonBox->button(QDialogButtonBox::Ok)->setEnabled(!text.isEmpty());
     });
 
-    connect(ui->encrypt_wallet_checkbox, &QCheckBox::toggled, [this](bool checked) {
+    const auto update_encrypt_wallet_options = [this](bool checked) {
         // Disable the disable_privkeys_checkbox and external_signer_checkbox when isEncryptWalletChecked is
         // set to true, enable it when isEncryptWalletChecked is false.
         ui->disable_privkeys_checkbox->setEnabled(!checked);
@@ -42,19 +42,20 @@ CreateWalletDialog::CreateWalletDialog(QWidget* parent) :
             ui->external_signer_checkbox->setChecked(false);
         }
 
-    });
+    };
+    connect(ui->encrypt_wallet_checkbox, &QCheckBox::toggled, update_encrypt_wallet_options);
 
     connect(ui->external_signer_checkbox, &QCheckBox::toggled, [this](bool checked) {
-        ui->encrypt_wallet_checkbox->setEnabled(!checked);
-        ui->blank_wallet_checkbox->setEnabled(!checked);
-        ui->disable_privkeys_checkbox->setEnabled(!checked);
-
         // The external signer checkbox is only enabled when a device is detected.
-        // In that case it is checked by default. Toggling it restores the other
-        // options to their default.
-        ui->encrypt_wallet_checkbox->setChecked(false);
+        // Toggling it restores the normal wallet defaults, including recommended
+        // encryption when external signing is disabled.
+        ui->encrypt_wallet_checkbox->setChecked(!checked);
         ui->disable_privkeys_checkbox->setChecked(checked);
         ui->blank_wallet_checkbox->setChecked(false);
+
+        ui->encrypt_wallet_checkbox->setEnabled(!checked);
+        ui->blank_wallet_checkbox->setEnabled(!checked);
+        ui->disable_privkeys_checkbox->setEnabled(!checked && !ui->encrypt_wallet_checkbox->isChecked());
     });
 
     connect(ui->disable_privkeys_checkbox, &QCheckBox::toggled, [this](bool checked) {
@@ -76,9 +77,10 @@ CreateWalletDialog::CreateWalletDialog(QWidget* parent) :
 
     connect(ui->blank_wallet_checkbox, &QCheckBox::toggled, [this](bool checked) {
         // Disable the disable_privkeys_checkbox when blank_wallet_checkbox is checked
-        // as blank-ness only pertains to wallets with private keys.
-        ui->disable_privkeys_checkbox->setEnabled(!checked);
-        if (checked) {
+        // as blank-ness only pertains to wallets with private keys. Keep it
+        // disabled while wallet encryption is selected as well.
+        ui->disable_privkeys_checkbox->setEnabled(!checked && !ui->encrypt_wallet_checkbox->isChecked());
+        if (!ui->disable_privkeys_checkbox->isEnabled()) {
             ui->disable_privkeys_checkbox->setChecked(false);
         }
     });
@@ -90,6 +92,7 @@ CreateWalletDialog::CreateWalletDialog(QWidget* parent) :
         ui->external_signer_checkbox->setChecked(false);
 #endif
 
+    update_encrypt_wallet_options(ui->encrypt_wallet_checkbox->isChecked());
 }
 
 CreateWalletDialog::~CreateWalletDialog()
