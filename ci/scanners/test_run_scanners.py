@@ -202,6 +202,62 @@ class RunScannersTest(unittest.TestCase):
             verifier_env["LIBBITCOINPQC_REMOTE_REF"],
         )
 
+    def test_libbitcoinpqc_provenance_flags_import_tree_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir)
+            verify_script = source / run_scanners.LIBBITCOINPQC_VERIFY_COMMAND[0]
+            verify_script.parent.mkdir(parents=True)
+            verify_script.write_text("#!/bin/sh\nexit 0\n", encoding="utf8")
+
+            def fake_git_tree_for_path(source, relpath, commit="HEAD"):
+                return "current-tree" if commit == "HEAD" else "import-tree"
+
+            with (
+                patch.object(
+                    run_scanners,
+                    "git_ls_remote_ref",
+                    return_value=("tag-object", 0),
+                ),
+                patch.object(
+                    run_scanners,
+                    "latest_git_subtree_metadata",
+                    return_value={
+                        "git_subtree_split": "commit",
+                        "qbit_import_commit": "import",
+                    },
+                ),
+                patch.object(
+                    run_scanners,
+                    "fetch_libbitcoinpqc_provenance_objects",
+                    return_value=([], []),
+                ),
+                patch.object(run_scanners, "git_peel_commit", return_value="commit"),
+                patch.object(
+                    run_scanners,
+                    "git_tree_for_path",
+                    side_effect=fake_git_tree_for_path,
+                ),
+                patch.object(
+                    run_scanners,
+                    "git_commit_tree",
+                    return_value="current-tree",
+                ),
+                patch.object(
+                    run_scanners,
+                    "run_text_command",
+                    return_value=(0, "", ""),
+                ),
+            ):
+                provenance, gaps = run_scanners.libbitcoinpqc_provenance(source)
+
+        self.assertEqual("current-tree", provenance["qbit_subtree_tree"])
+        self.assertEqual("import-tree", provenance["qbit_import_tree"])
+        self.assertEqual("current-tree", provenance["upstream_tag_tree"])
+        self.assertIn(
+            "libbitcoinpqc subtree tree does not match the recorded qbit import commit tree.",
+            gaps,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

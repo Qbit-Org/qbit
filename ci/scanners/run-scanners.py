@@ -1244,11 +1244,21 @@ def libbitcoinpqc_provenance(source: Path) -> tuple[dict[str, Any], list[str]]:
             )
 
     current_tree = git_tree_for_path(source, LIBBITCOINPQC_PATH)
+    import_tree = (
+        git_tree_for_path(source, LIBBITCOINPQC_PATH, import_commit)
+        if import_commit
+        else ""
+    )
     upstream_tree = git_commit_tree(source, upstream_ref_commit) if upstream_ref_commit else ""
     provenance["qbit_subtree_tree"] = current_tree
+    provenance["qbit_import_tree"] = import_tree
     provenance["upstream_tag_tree"] = upstream_tree
     if not current_tree:
         gaps.append("libbitcoinpqc subtree tree hash unavailable from HEAD.")
+    if import_commit and not import_tree:
+        gaps.append(f"libbitcoinpqc qbit import commit tree unavailable: {import_commit}")
+    if current_tree and import_tree and current_tree != import_tree:
+        gaps.append("libbitcoinpqc subtree tree does not match the recorded qbit import commit tree.")
     if upstream_ref_commit and not upstream_tree:
         gaps.append(f"libbitcoinpqc upstream tag commit tree unavailable: {upstream_ref_commit}")
     if current_tree and upstream_tree and current_tree != upstream_tree:

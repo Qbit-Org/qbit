@@ -77,25 +77,51 @@ fi
 
 upstream_commit="$(git rev-parse "${upstream_commit}^{commit}")"
 upstream_tree="$(git show -s --format=%T "${upstream_commit}")"
-metadata_split="$(
+metadata_commit="$(
   git log \
     --grep="^git-subtree-dir: ${PREFIX}/*$" \
-    --pretty=format:%B \
-    HEAD |
-  awk '/^git-subtree-split: / {print $2; exit}'
+    --format=%H \
+    -n 1 \
+    HEAD
 )"
+metadata_split=""
+metadata_tree=""
+if [[ -n "${metadata_commit}" ]]; then
+  metadata_split="$(
+    git show -s --format=%B "${metadata_commit}" |
+    awk '/^git-subtree-split: / {print $2; exit}'
+  )"
+  metadata_tree="$(git rev-parse "${metadata_commit}:${PREFIX}" 2>/dev/null || true)"
+fi
 
 echo "${PREFIX} in HEAD currently refers to tree ${current_tree}"
 echo "${REMOTE_URL} ${REMOTE_REF} resolves to commit ${upstream_commit} tree ${upstream_tree}"
+
+if [[ -z "${metadata_commit}" ]]; then
+  echo "FAIL: subtree metadata missing: no git-subtree-dir entry found for ${PREFIX}" >&2
+  exit 1
+fi
 
 if [[ -z "${metadata_split}" ]]; then
   echo "FAIL: subtree metadata missing: no git-subtree-split entry found for ${PREFIX}" >&2
   exit 1
 fi
 
+if [[ -z "${metadata_tree}" ]]; then
+  echo "FAIL: subtree import commit ${metadata_commit} lacks ${PREFIX}" >&2
+  exit 1
+fi
+
+echo "${PREFIX} latest git-subtree import commit is ${metadata_commit} tree ${metadata_tree}"
 echo "${PREFIX} latest git-subtree-split is ${metadata_split}"
 if [[ "${metadata_split}" != "${upstream_commit}" ]]; then
   echo "FAIL: subtree split ${metadata_split} does not match upstream tag commit ${upstream_commit}" >&2
+  exit 1
+fi
+
+if [[ "${current_tree}" != "${metadata_tree}" ]]; then
+  git diff --stat "${metadata_tree}" "${current_tree}" >&2 || true
+  echo "FAIL: ${PREFIX} tree differs from latest subtree import commit ${metadata_commit}" >&2
   exit 1
 fi
 
