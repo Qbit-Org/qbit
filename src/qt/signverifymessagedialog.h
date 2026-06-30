@@ -36,6 +36,10 @@ protected:
 private:
     bool isP2MRDataMode() const;
     void updateP2MRDataModeUi();
+    void updateP2MRSignModeUi();
+    void updateP2MRSignHashPreview();
+    void updateP2MRVerifyModeUi();
+    void updateP2MRVerifyHashPreview();
 
     Ui::SignVerifyMessageDialog *ui;
     WalletModel* model{nullptr};

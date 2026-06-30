@@ -53,6 +53,7 @@
 #include <QComboBox>
 #include <QElapsedTimer>
 #include <QEvent>
+#include <QLineEdit>
 #include <QObject>
 #include <QPointer>
 #include <QPlainTextEdit>
@@ -775,25 +776,61 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
 
     QTabWidget* tab_widget = sign_verify_dialog.findChild<QTabWidget*>("tabWidget");
     QVERIFY(tab_widget);
-    QCOMPARE(tab_widget->tabText(0), QString("&Sign Data Hash"));
+    QCOMPARE(tab_widget->tabText(0), QString("&Sign Data"));
     QCOMPARE(tab_widget->tabText(1), QString("&Verify Proof"));
 
     QLabel* signature_label = sign_verify_dialog.findChild<QLabel*>("signatureLabel_SM");
     QVERIFY(signature_label);
     QCOMPARE(signature_label->text(), QString("Proof JSON"));
 
+    QComboBox* sign_input_mode = sign_verify_dialog.findChild<QComboBox*>("p2mrDataInputMode_SM");
+    QVERIFY(sign_input_mode);
+    QCOMPARE(sign_input_mode->count(), 2);
+    QCOMPARE(sign_input_mode->currentText(), QString("Text"));
+
+    QPlainTextEdit* sign_input = sign_verify_dialog.findChild<QPlainTextEdit*>("messageIn_SM");
+    QVERIFY(sign_input);
+    QVERIFY(sign_input->placeholderText().contains("UTF-8 text"));
+
+    QLineEdit* sign_hash_preview = sign_verify_dialog.findChild<QLineEdit*>("p2mrMessageHash_SM");
+    QVERIFY(sign_hash_preview);
+    sign_input->setPlainText("abc");
+    QCOMPARE(sign_hash_preview->text(), QString("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+
+    sign_input_mode->setCurrentIndex(1);
+    QVERIFY(sign_input->placeholderText().contains("64 hex"));
+    sign_input->setPlainText(QString(64, '0'));
+    QCOMPARE(sign_hash_preview->text(), QString(64, '0'));
+
     QPushButton* sign_button = sign_verify_dialog.findChild<QPushButton*>("signMessageButton_SM");
     QVERIFY(sign_button);
-    QCOMPARE(sign_button->text(), QString("Sign &Data Hash"));
+    QCOMPARE(sign_button->text(), QString("Sign Data &Hash"));
 
     QPlainTextEdit* proof_output = sign_verify_dialog.findChild<QPlainTextEdit*>("signatureOut_SM");
     QVERIFY(proof_output);
     QVERIFY(proof_output->minimumHeight() >= 96);
-    QVERIFY(proof_output->placeholderText().contains("Sign Data Hash"));
+    QVERIFY(proof_output->placeholderText().contains("Sign Data"));
 
     QPlainTextEdit* proof_input = sign_verify_dialog.findChild<QPlainTextEdit*>("messageIn_VM");
     QVERIFY(proof_input);
     QVERIFY(proof_input->placeholderText().contains("proof JSON"));
+
+    QComboBox* verify_input_mode = sign_verify_dialog.findChild<QComboBox*>("p2mrVerifyInputMode_VM");
+    QVERIFY(verify_input_mode);
+    QCOMPARE(verify_input_mode->count(), 3);
+    QCOMPARE(verify_input_mode->currentText(), QString("Text + proof"));
+
+    QPlainTextEdit* verify_data_input = sign_verify_dialog.findChild<QPlainTextEdit*>("p2mrDataIn_VM");
+    QVERIFY(verify_data_input);
+    verify_data_input->setPlainText("abc");
+
+    QLineEdit* verify_hash_preview = sign_verify_dialog.findChild<QLineEdit*>("p2mrVerifyMessageHash_VM");
+    QVERIFY(verify_hash_preview);
+    QCOMPARE(verify_hash_preview->text(), QString("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+
+    verify_input_mode->setCurrentIndex(2);
+    QVERIFY(verify_data_input->isHidden());
+    QVERIFY(verify_hash_preview->isHidden());
 
     QValidatedLineEdit* verify_address = sign_verify_dialog.findChild<QValidatedLineEdit*>("addressIn_VM");
     QVERIFY(verify_address);

@@ -348,10 +348,10 @@ void BitcoinGUI::createActions()
     verifyMessageAction = new QAction(tr("&Verify message…"), this);
     verifyMessageAction->setStatusTip(tr("Verify messages to ensure they were signed with specified qbit addresses"));
     if (IsP2MROnlyOutputChain()) {
-        signMessageAction->setText(tr("Sign data &hash…"));
-        signMessageAction->setStatusTip(tr("Sign a 32-byte hash with a wallet-owned P2MR/PQC key"));
+        signMessageAction->setText(tr("Sign &data…"));
+        signMessageAction->setStatusTip(tr("Sign UTF-8 text or a 32-byte hash with a wallet-owned P2MR/PQC key"));
         verifyMessageAction->setText(tr("&Verify data proof…"));
-        verifyMessageAction->setStatusTip(tr("Verify a P2MR/PQC data-signature proof"));
+        verifyMessageAction->setStatusTip(tr("Verify a P2MR/PQC data-signature proof, optionally bound to original data"));
     }
     m_load_psbt_action = new QAction(tr("&Load PSBT from file…"), this);
     m_load_psbt_action->setStatusTip(tr("Load Partially Signed Transaction (PSBT)"));

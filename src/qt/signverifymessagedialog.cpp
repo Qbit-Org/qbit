@@ -12,6 +12,7 @@
 
 #include <common/p2mr_data_signature.h>
 #include <common/signmessage.h>
+#include <crypto/sha256.h>
 #include <interfaces/wallet.h>
 #include <key_io.h>
 #include <outputtype.h>
@@ -27,7 +28,9 @@
 #include <variant>
 #include <vector>
 
+#include <QByteArray>
 #include <QClipboard>
+#include <QComboBox>
 #include <QPlainTextEdit>
 #include <QStringList>
 
@@ -48,6 +51,29 @@ std::string HashToHexString(const uint256& hash)
 QString ToQString(const std::string& text)
 {
     return QString::fromStdString(text);
+}
+
+constexpr int P2MR_SIGN_INPUT_HASH{1};
+constexpr int P2MR_VERIFY_INPUT_TEXT{0};
+constexpr int P2MR_VERIFY_INPUT_HASH{1};
+constexpr int P2MR_VERIFY_INPUT_PROOF_ONLY{2};
+constexpr const char* P2MR_MESSAGE_HASH_SOURCE_UTF8_TEXT{"utf8-text"};
+constexpr const char* P2MR_MESSAGE_HASH_SOURCE_HEX_HASH{"hex-hash"};
+constexpr const char* P2MR_MESSAGE_HASH_ALGORITHM_SHA256{"sha256"};
+
+struct P2MRMessageHashMetadata {
+    std::optional<std::string> source;
+    std::optional<std::string> algorithm;
+};
+
+uint256 HashP2MRUtf8Text(const QString& text)
+{
+    const QByteArray bytes{text.toUtf8()};
+    uint256 hash;
+    CSHA256()
+        .Write(reinterpret_cast<const unsigned char*>(bytes.constData()), static_cast<size_t>(bytes.size()))
+        .Finalize(hash.begin());
+    return hash;
 }
 
 bool ParseHexBytes(const QString& text, std::string_view name, size_t expected_size, std::vector<unsigned char>& bytes, QString& error)
@@ -250,12 +276,18 @@ common::P2MRDataSignatureProof MakeP2MRDataSignatureProof(const interfaces::P2MR
     };
 }
 
-UniValue BuildP2MRProofJson(const interfaces::P2MRDataSignatureResult& result)
+UniValue BuildP2MRProofJson(const interfaces::P2MRDataSignatureResult& result, const P2MRMessageHashMetadata& metadata)
 {
     const common::P2MRDataSignatureProof proof{MakeP2MRDataSignatureProof(result)};
     UniValue object(UniValue::VOBJ);
     object.pushKV("address", EncodeDestination(CTxDestination{proof.output}));
     object.pushKV("message_hash", HashToHexString(proof.message_hash));
+    if (metadata.source.has_value()) {
+        object.pushKV("message_hash_source", *metadata.source);
+    }
+    if (metadata.algorithm.has_value()) {
+        object.pushKV("message_hash_algorithm", *metadata.algorithm);
+    }
     object.pushKV("datasig_hash", HashToHexString(proof.datasig_hash));
     object.pushKV("domain", common::P2MR_DATA_SIGNATURE_DOMAIN);
     object.pushKV("algorithm", common::P2MR_DATA_SIGNATURE_ALGORITHM);
@@ -302,6 +334,17 @@ SignVerifyMessageDialog::SignVerifyMessageDialog(const PlatformStyle *_platformS
 
     ui->signatureOut_SM->setFont(GUIUtil::fixedPitchFont());
     ui->signatureIn_VM->setFont(GUIUtil::fixedPitchFont());
+    ui->p2mrMessageHash_SM->setFont(GUIUtil::fixedPitchFont());
+    ui->p2mrVerifyMessageHash_VM->setFont(GUIUtil::fixedPitchFont());
+
+    connect(ui->p2mrDataInputMode_SM, qOverload<int>(&QComboBox::currentIndexChanged), this, [this] {
+        updateP2MRSignModeUi();
+    });
+    connect(ui->messageIn_SM, &QPlainTextEdit::textChanged, this, &SignVerifyMessageDialog::updateP2MRSignHashPreview);
+    connect(ui->p2mrVerifyInputMode_VM, qOverload<int>(&QComboBox::currentIndexChanged), this, [this] {
+        updateP2MRVerifyModeUi();
+    });
+    connect(ui->p2mrDataIn_VM, &QPlainTextEdit::textChanged, this, &SignVerifyMessageDialog::updateP2MRVerifyHashPreview);
 
     updateP2MRDataModeUi();
 
@@ -329,20 +372,24 @@ void SignVerifyMessageDialog::updateP2MRDataModeUi()
     const bool p2mr_mode{isP2MRDataMode()};
     if (p2mr_mode) {
         setWindowTitle(tr("P2MR/PQC Data Signatures"));
-        ui->tabWidget->setTabText(0, tr("&Sign Data Hash"));
+        ui->tabWidget->setTabText(0, tr("&Sign Data"));
         ui->tabWidget->setTabText(1, tr("&Verify Proof"));
-        ui->infoLabel_SM->setText(tr("Sign a caller-supplied 32-byte hash with a PQC key committed by a wallet-owned P2MR address. Signing consumes PQC signature budget for that key."));
+        ui->infoLabel_SM->setText(tr("Sign UTF-8 text by hashing it with SHA256, or sign a caller-supplied 32-byte hash, "
+                                     "using a PQC key committed by a wallet-owned P2MR address. Signing consumes PQC "
+                                     "signature budget for that key."));
         ui->addressIn_SM->setToolTip(tr("The wallet-owned P2MR address to sign with"));
-        ui->messageIn_SM->setToolTip(tr("Enter the 32-byte message hash as 64 hex characters"));
-        ui->messageIn_SM->setPlaceholderText(tr("Enter the 32-byte message hash as 64 hex characters"));
         ui->signatureLabel_SM->setText(tr("Proof JSON"));
-        ui->signatureOut_SM->setPlaceholderText(tr("Click \"Sign Data Hash\" to generate proof JSON"));
+        ui->signatureOut_SM->setPlaceholderText(tr("Click \"Sign Data\" to generate proof JSON"));
         ui->copySignatureButton_SM->setToolTip(tr("Copy the current proof JSON to the clipboard"));
-        ui->signMessageButton_SM->setText(tr("Sign &Data Hash"));
-        ui->signMessageButton_SM->setToolTip(tr("Sign the data hash with the selected P2MR/PQC key"));
-        ui->clearButton_SM->setToolTip(tr("Reset all sign data-hash fields"));
+        ui->clearButton_SM->setToolTip(tr("Reset all sign data fields"));
+        ui->p2mrInputModeLabel_SM->setVisible(true);
+        ui->p2mrDataInputMode_SM->setVisible(true);
+        ui->p2mrMessageHashLabel_SM->setVisible(true);
+        ui->p2mrMessageHash_SM->setVisible(true);
 
-        ui->infoLabel_VM->setText(tr("Paste a P2MR/PQC data-signature proof JSON object to verify the address commitment, P2MR control block, data-signature domain, and PQC signature."));
+        ui->infoLabel_VM->setText(tr("Verify a P2MR/PQC data-signature proof JSON object. When original text or a 32-byte "
+                                     "hash is entered, it must match the proof's message_hash before the P2MR commitment "
+                                     "and PQC signature are verified."));
         ui->addressIn_VM->setVisible(false);
         ui->addressBookButton_VM->setVisible(false);
         ui->signatureIn_VM->setVisible(false);
@@ -350,15 +397,150 @@ void SignVerifyMessageDialog::updateP2MRDataModeUi()
         ui->messageIn_VM->setPlaceholderText(tr("Paste proof JSON to verify"));
         ui->verifyMessageButton_VM->setText(tr("Verify &Proof"));
         ui->verifyMessageButton_VM->setToolTip(tr("Verify the P2MR/PQC proof JSON"));
-        ui->clearButton_VM->setToolTip(tr("Reset the proof field"));
+        ui->clearButton_VM->setToolTip(tr("Reset the proof and data fields"));
+        ui->p2mrVerifyModeLabel_VM->setVisible(true);
+        ui->p2mrVerifyInputMode_VM->setVisible(true);
+        ui->p2mrProofLabel_VM->setVisible(true);
+
+        updateP2MRSignModeUi();
+        updateP2MRVerifyModeUi();
     } else {
         setWindowTitle(tr("Signatures - Sign / Verify a Message"));
         ui->tabWidget->setTabText(0, tr("&Sign Message"));
         ui->tabWidget->setTabText(1, tr("&Verify Message"));
+        ui->infoLabel_SM->setText(tr("You can sign messages/agreements with your legacy (P2PKH) addresses to prove you can "
+                                     "receive QBT sent to them. Be careful not to sign anything vague or random, as phishing "
+                                     "attacks may try to trick you into signing your identity over to them. Only sign "
+                                     "fully-detailed statements you agree to."));
+        ui->addressIn_SM->setToolTip(tr("The qbit address to sign the message with"));
+        ui->messageIn_SM->setToolTip(tr("Enter the message you want to sign here"));
+        ui->messageIn_SM->setPlaceholderText(tr("Enter the message you want to sign here"));
+        ui->signatureLabel_SM->setText(tr("Signature"));
+        ui->signatureOut_SM->setPlaceholderText(tr("Click \"Sign Message\" to generate signature"));
+        ui->copySignatureButton_SM->setToolTip(tr("Copy the current signature to the clipboard"));
+        ui->signMessageButton_SM->setText(tr("Sign &Message"));
+        ui->signMessageButton_SM->setToolTip(tr("Sign the message to prove you own this qbit address"));
+        ui->clearButton_SM->setToolTip(tr("Reset all sign message fields"));
+        ui->p2mrInputModeLabel_SM->setVisible(false);
+        ui->p2mrDataInputMode_SM->setVisible(false);
+        ui->p2mrMessageHashLabel_SM->setVisible(false);
+        ui->p2mrMessageHash_SM->setVisible(false);
+
+        ui->infoLabel_VM->setText(tr("Enter the receiver's address, message (ensure you copy line breaks, spaces, tabs, etc. "
+                                     "exactly) and signature below to verify the message. Be careful not to read more into "
+                                     "the signature than what is in the signed message itself, to avoid being tricked by a "
+                                     "man-in-the-middle attack. Note that this only proves the signing party receives with "
+                                     "the address, it cannot prove sendership of any transaction!"));
         ui->addressIn_VM->setVisible(true);
         ui->addressBookButton_VM->setVisible(true);
         ui->signatureIn_VM->setVisible(true);
+        ui->messageIn_VM->setToolTip(tr("The signed message to verify"));
+        ui->messageIn_VM->setPlaceholderText(tr("The signed message to verify"));
+        ui->verifyMessageButton_VM->setText(tr("Verify &Message"));
+        ui->verifyMessageButton_VM->setToolTip(tr("Verify the message to ensure it was signed with the specified qbit address"));
+        ui->clearButton_VM->setToolTip(tr("Reset all verify message fields"));
+        ui->p2mrVerifyModeLabel_VM->setVisible(false);
+        ui->p2mrVerifyInputMode_VM->setVisible(false);
+        ui->p2mrVerifyMessageHashLabel_VM->setVisible(false);
+        ui->p2mrVerifyMessageHash_VM->setVisible(false);
+        ui->p2mrVerifyDataLabel_VM->setVisible(false);
+        ui->p2mrDataIn_VM->setVisible(false);
+        ui->p2mrProofLabel_VM->setVisible(false);
     }
+}
+
+void SignVerifyMessageDialog::updateP2MRSignModeUi()
+{
+    if (!isP2MRDataMode()) return;
+
+    const bool hash_mode{ui->p2mrDataInputMode_SM->currentIndex() == P2MR_SIGN_INPUT_HASH};
+    if (hash_mode) {
+        ui->messageIn_SM->setToolTip(tr("Enter the 32-byte message hash as 64 hex characters"));
+        ui->messageIn_SM->setPlaceholderText(tr("Enter the 32-byte message hash as 64 hex characters"));
+        ui->signMessageButton_SM->setText(tr("Sign Data &Hash"));
+        ui->signMessageButton_SM->setToolTip(tr("Sign the caller-supplied data hash with the selected P2MR/PQC key"));
+    } else {
+        ui->messageIn_SM->setToolTip(tr("Enter the UTF-8 text data to sign"));
+        ui->messageIn_SM->setPlaceholderText(tr("Enter the UTF-8 text data to sign"));
+        ui->signMessageButton_SM->setText(tr("Sign &Data"));
+        ui->signMessageButton_SM->setToolTip(tr("Hash the text with SHA256, then sign the hash with the selected P2MR/PQC key"));
+    }
+    updateP2MRSignHashPreview();
+}
+
+void SignVerifyMessageDialog::updateP2MRSignHashPreview()
+{
+    if (!isP2MRDataMode()) return;
+
+    uint256 message_hash;
+    if (ui->p2mrDataInputMode_SM->currentIndex() == P2MR_SIGN_INPUT_HASH) {
+        QString parse_error;
+        if (!ParseDataHash(ui->messageIn_SM->document()->toPlainText(), message_hash, parse_error)) {
+            ui->p2mrMessageHash_SM->clear();
+            return;
+        }
+    } else {
+        if (ui->messageIn_SM->document()->isEmpty()) {
+            ui->p2mrMessageHash_SM->clear();
+            return;
+        }
+        message_hash = HashP2MRUtf8Text(ui->messageIn_SM->document()->toPlainText());
+    }
+
+    ui->p2mrMessageHash_SM->setText(QString::fromStdString(HashToHexString(message_hash)));
+}
+
+void SignVerifyMessageDialog::updateP2MRVerifyModeUi()
+{
+    if (!isP2MRDataMode()) return;
+
+    const int mode{ui->p2mrVerifyInputMode_VM->currentIndex()};
+    const bool proof_only{mode == P2MR_VERIFY_INPUT_PROOF_ONLY};
+    const bool hash_mode{mode == P2MR_VERIFY_INPUT_HASH};
+
+    ui->p2mrVerifyDataLabel_VM->setVisible(!proof_only);
+    ui->p2mrDataIn_VM->setVisible(!proof_only);
+    ui->p2mrVerifyMessageHashLabel_VM->setVisible(!proof_only);
+    ui->p2mrVerifyMessageHash_VM->setVisible(!proof_only);
+
+    if (hash_mode) {
+        ui->p2mrVerifyDataLabel_VM->setText(tr("Message hash"));
+        ui->p2mrDataIn_VM->setToolTip(tr("Enter the 32-byte message hash as 64 hex characters"));
+        ui->p2mrDataIn_VM->setPlaceholderText(tr("Enter the 32-byte message hash as 64 hex characters"));
+    } else {
+        ui->p2mrVerifyDataLabel_VM->setText(tr("Data"));
+        ui->p2mrDataIn_VM->setToolTip(tr("Enter the signed UTF-8 text data to bind to the proof JSON"));
+        ui->p2mrDataIn_VM->setPlaceholderText(tr("Enter the signed UTF-8 text data to bind to the proof JSON"));
+    }
+    updateP2MRVerifyHashPreview();
+}
+
+void SignVerifyMessageDialog::updateP2MRVerifyHashPreview()
+{
+    if (!isP2MRDataMode()) return;
+
+    const int mode{ui->p2mrVerifyInputMode_VM->currentIndex()};
+    if (mode == P2MR_VERIFY_INPUT_PROOF_ONLY) {
+        ui->p2mrVerifyMessageHash_VM->clear();
+        return;
+    }
+
+    uint256 message_hash;
+    if (mode == P2MR_VERIFY_INPUT_HASH) {
+        QString parse_error;
+        if (!ParseDataHash(ui->p2mrDataIn_VM->document()->toPlainText(), message_hash, parse_error)) {
+            ui->p2mrVerifyMessageHash_VM->clear();
+            return;
+        }
+    } else {
+        if (ui->p2mrDataIn_VM->document()->isEmpty()) {
+            ui->p2mrVerifyMessageHash_VM->clear();
+            return;
+        }
+        message_hash = HashP2MRUtf8Text(ui->p2mrDataIn_VM->document()->toPlainText());
+    }
+
+    ui->p2mrVerifyMessageHash_VM->setText(QString::fromStdString(HashToHexString(message_hash)));
 }
 
 void SignVerifyMessageDialog::setAddress_SM(const QString &address)
@@ -430,12 +612,21 @@ void SignVerifyMessageDialog::on_signMessageButton_SM_clicked()
         }
 
         uint256 message_hash;
-        QString parse_error;
-        if (!ParseDataHash(ui->messageIn_SM->document()->toPlainText(), message_hash, parse_error)) {
-            ui->statusLabel_SM->setStyleSheet("QLabel { color: red; }");
-            ui->statusLabel_SM->setText(parse_error);
-            return;
+        P2MRMessageHashMetadata metadata;
+        if (ui->p2mrDataInputMode_SM->currentIndex() == P2MR_SIGN_INPUT_HASH) {
+            QString parse_error;
+            if (!ParseDataHash(ui->messageIn_SM->document()->toPlainText(), message_hash, parse_error)) {
+                ui->statusLabel_SM->setStyleSheet("QLabel { color: red; }");
+                ui->statusLabel_SM->setText(parse_error);
+                return;
+            }
+            metadata.source = P2MR_MESSAGE_HASH_SOURCE_HEX_HASH;
+        } else {
+            message_hash = HashP2MRUtf8Text(ui->messageIn_SM->document()->toPlainText());
+            metadata.source = P2MR_MESSAGE_HASH_SOURCE_UTF8_TEXT;
+            metadata.algorithm = P2MR_MESSAGE_HASH_ALGORITHM_SHA256;
         }
+        ui->p2mrMessageHash_SM->setText(QString::fromStdString(HashToHexString(message_hash)));
 
         WalletModel::UnlockContext ctx(model->requestUnlock());
         if (!ctx.isValid())
@@ -460,8 +651,10 @@ void SignVerifyMessageDialog::on_signMessageButton_SM_clicked()
             return;
         }
 
-        ui->signatureOut_SM->setPlainText(QString::fromStdString(BuildP2MRProofJson(*result).write(2)));
-        QString status{tr("P2MR/PQC data-hash proof signed.")};
+        ui->signatureOut_SM->setPlainText(QString::fromStdString(BuildP2MRProofJson(*result, metadata).write(2)));
+        QString status{metadata.algorithm.has_value() ?
+            tr("P2MR/PQC data proof signed.") :
+            tr("P2MR/PQC data-hash proof signed.")};
         const QString pqc_usage_status{result->pqc_usage ? FormatPQCUsageStatus(*result->pqc_usage) : QString{}};
         if (!pqc_usage_status.isEmpty()) {
             status.append("\n");
@@ -529,6 +722,7 @@ void SignVerifyMessageDialog::on_clearButton_SM_clicked()
     ui->messageIn_SM->clear();
     ui->signatureOut_SM->clear();
     ui->statusLabel_SM->clear();
+    ui->p2mrMessageHash_SM->clear();
 
     ui->addressIn_SM->setFocus();
 }
@@ -557,12 +751,41 @@ void SignVerifyMessageDialog::on_verifyMessageButton_VM_clicked()
             return;
         }
 
+        std::optional<uint256> expected_message_hash;
+        const int verify_mode{ui->p2mrVerifyInputMode_VM->currentIndex()};
+        if (verify_mode == P2MR_VERIFY_INPUT_HASH) {
+            uint256 parsed_hash;
+            if (!ParseDataHash(ui->p2mrDataIn_VM->document()->toPlainText(), parsed_hash, parse_error)) {
+                ui->statusLabel_VM->setStyleSheet("QLabel { color: red; }");
+                ui->statusLabel_VM->setText(parse_error);
+                return;
+            }
+            expected_message_hash = parsed_hash;
+        } else if (verify_mode == P2MR_VERIFY_INPUT_TEXT) {
+            expected_message_hash = HashP2MRUtf8Text(ui->p2mrDataIn_VM->document()->toPlainText());
+        }
+
+        if (expected_message_hash.has_value() && *expected_message_hash != proof.message_hash) {
+            ui->statusLabel_VM->setStyleSheet("QLabel { color: red; }");
+            ui->statusLabel_VM->setText(
+                tr("Entered data hashes to %1, but the proof signed %2.")
+                    .arg(QString::fromStdString(HashToHexString(*expected_message_hash)))
+                    .arg(QString::fromStdString(HashToHexString(proof.message_hash)))
+            );
+            return;
+        }
+
         const common::P2MRDataSignatureVerification result{common::VerifyP2MRDataSignatureProof(proof)};
         if (result.valid) {
             ui->statusLabel_VM->setStyleSheet("QLabel { color: green; }");
-            ui->statusLabel_VM->setText(
-                tr("P2MR/PQC proof verified for %1.").arg(QString::fromStdString(EncodeDestination(CTxDestination{proof.output})))
-            );
+            QString status{tr("P2MR/PQC proof verified for %1.")
+                .arg(QString::fromStdString(EncodeDestination(CTxDestination{proof.output})))};
+            if (expected_message_hash.has_value()) {
+                status.append("\n");
+                status.append(tr("Entered data matches message hash %1.")
+                    .arg(QString::fromStdString(HashToHexString(*expected_message_hash))));
+            }
+            ui->statusLabel_VM->setText(status);
         } else {
             ui->statusLabel_VM->setStyleSheet("QLabel { color: red; }");
             ui->statusLabel_VM->setText(tr("P2MR/PQC proof verification failed: %1").arg(ToQString(result.error)));
@@ -625,6 +848,8 @@ void SignVerifyMessageDialog::on_clearButton_VM_clicked()
     ui->addressIn_VM->clear();
     ui->signatureIn_VM->clear();
     ui->messageIn_VM->clear();
+    ui->p2mrDataIn_VM->clear();
+    ui->p2mrVerifyMessageHash_VM->clear();
     ui->statusLabel_VM->clear();
 
     if (isP2MRDataMode()) {

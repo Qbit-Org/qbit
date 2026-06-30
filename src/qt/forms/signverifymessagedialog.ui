@@ -95,6 +95,54 @@
         </layout>
        </item>
        <item>
+        <layout class="QHBoxLayout" name="p2mrInputModeLayout_SM">
+         <item>
+          <widget class="QLabel" name="p2mrInputModeLabel_SM">
+           <property name="text">
+            <string>Input</string>
+           </property>
+           <property name="textFormat">
+            <enum>Qt::PlainText</enum>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QComboBox" name="p2mrDataInputMode_SM">
+           <item>
+            <property name="text">
+             <string>Text</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>Hash</string>
+            </property>
+           </item>
+          </widget>
+         </item>
+         <item>
+          <widget class="QLabel" name="p2mrMessageHashLabel_SM">
+           <property name="text">
+            <string>Message hash</string>
+           </property>
+           <property name="textFormat">
+            <enum>Qt::PlainText</enum>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QLineEdit" name="p2mrMessageHash_SM">
+           <property name="toolTip">
+            <string>The 32-byte hash that will be passed to the P2MR/PQC signing RPC</string>
+           </property>
+           <property name="readOnly">
+            <bool>true</bool>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
         <widget class="QPlainTextEdit" name="messageIn_SM">
          <property name="toolTip">
           <string>Enter the message you want to sign here</string>
@@ -295,6 +343,89 @@
           </widget>
          </item>
         </layout>
+       </item>
+       <item>
+        <layout class="QHBoxLayout" name="p2mrVerifyModeLayout_VM">
+         <item>
+          <widget class="QLabel" name="p2mrVerifyModeLabel_VM">
+           <property name="text">
+            <string>Input</string>
+           </property>
+           <property name="textFormat">
+            <enum>Qt::PlainText</enum>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QComboBox" name="p2mrVerifyInputMode_VM">
+           <item>
+            <property name="text">
+             <string>Text + proof</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>Hash + proof</string>
+            </property>
+           </item>
+           <item>
+            <property name="text">
+             <string>Proof only</string>
+            </property>
+           </item>
+          </widget>
+         </item>
+         <item>
+          <widget class="QLabel" name="p2mrVerifyMessageHashLabel_VM">
+           <property name="text">
+            <string>Message hash</string>
+           </property>
+           <property name="textFormat">
+            <enum>Qt::PlainText</enum>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QLineEdit" name="p2mrVerifyMessageHash_VM">
+           <property name="toolTip">
+            <string>The 32-byte hash that must match the proof JSON</string>
+           </property>
+           <property name="readOnly">
+            <bool>true</bool>
+           </property>
+          </widget>
+         </item>
+        </layout>
+       </item>
+       <item>
+        <widget class="QLabel" name="p2mrVerifyDataLabel_VM">
+         <property name="text">
+          <string>Data</string>
+         </property>
+         <property name="textFormat">
+          <enum>Qt::PlainText</enum>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QPlainTextEdit" name="p2mrDataIn_VM">
+         <property name="toolTip">
+          <string>Enter the signed data to bind to the proof JSON</string>
+         </property>
+         <property name="placeholderText">
+          <string>Enter the signed data to bind to the proof JSON</string>
+         </property>
+        </widget>
+       </item>
+       <item>
+        <widget class="QLabel" name="p2mrProofLabel_VM">
+         <property name="text">
+          <string>Proof JSON</string>
+         </property>
+         <property name="textFormat">
+          <enum>Qt::PlainText</enum>
+         </property>
+        </widget>
        </item>
        <item>
         <widget class="QPlainTextEdit" name="messageIn_VM">
