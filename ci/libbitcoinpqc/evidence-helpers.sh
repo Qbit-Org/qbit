@@ -45,19 +45,3 @@ validate_upstream_ref() {
         return 1
     fi
 }
-
-validate_curated_subtree_ref() {
-    local source_dir="$1"
-    local curated_subtree_ref="$2"
-    local log_dir="$3"
-
-    : > "$log_dir/curated-subtree-ref.log"
-    if git -C "$source_dir" cat-file -e "${curated_subtree_ref}^{commit}" 2>>"$log_dir/curated-subtree-ref.log"; then
-        return 0
-    elif git -C "$source_dir" fetch --depth=1 origin "$curated_subtree_ref" >>"$log_dir/curated-subtree-ref.log" 2>&1 &&
-         git -C "$source_dir" cat-file -e "${curated_subtree_ref}^{commit}" 2>>"$log_dir/curated-subtree-ref.log"; then
-        return 0
-    else
-        return 1
-    fi
-}

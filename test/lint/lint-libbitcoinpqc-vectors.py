@@ -6,9 +6,9 @@
 #
 # Verify bounded30 SPHINCS+ wiring in src/libbitcoinpqc/sphincsplus.
 #
-# The curated qbit subtree prunes the upstream NIST KAT generator payload. When
+# The current upstream tag does not carry the NIST KAT generator payload. When
 # those sources are absent, fall back to static bounded30 guard checks instead
-# of treating the prune as a lint failure.
+# of treating that absence as a lint failure.
 
 import subprocess
 import sys
@@ -35,11 +35,11 @@ def kat_generator_state(sphincs_dir: Path, implementation: str) -> str | None:
     if len(existing) == len(KAT_GENERATOR_FILES):
         return "present"
     if not existing:
-        return "pruned"
+        return "absent"
 
     missing = [name for name in KAT_GENERATOR_FILES if name not in existing]
     print(
-        f"{impl_dir} has a partially pruned KAT generator payload.",
+        f"{impl_dir} has a partially present KAT generator payload.",
         flush=True,
     )
     print(f"  present: {', '.join(existing)}", flush=True)
@@ -82,10 +82,10 @@ def main() -> None:
         state = kat_generator_state(sphincs_dir, implementation)
         if state == "present":
             ok &= run_vector_check(sphincs_dir, instance, implementation)
-        elif state == "pruned":
+        elif state == "absent":
             print(
-                "Skipping SPHINCS+ vector regeneration because the curated "
-                f"subtree prunes KAT generator sources from {implementation}.",
+                "Skipping SPHINCS+ vector regeneration because the upstream "
+                f"tag does not include KAT generator sources for {implementation}.",
                 flush=True,
             )
         else:

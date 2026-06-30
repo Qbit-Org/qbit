@@ -1122,12 +1122,12 @@ The tool instructions also include a list of the subtrees managed by Bitcoin Cor
 The ultimate upstream of the few externally managed subtrees are:
 
 - src/libbitcoinpqc
-  - Upstream at https://github.com/<owner>/libbitcoinpqc-qbit ; maintained via
-    the curated `qbit-subtree` branch for subtree imports.
+  - Upstream at https://github.com/Qbit-Org/qbit-libbitcoinpqc ; imported
+    directly from immutable release tags.
   - Follow [libbitcoinpqc subtree runbook](../subtrees/libbitcoinpqc.md).
   - Use `contrib/devtools/update-libbitcoinpqc-subtree.sh` to update this
     subtree, so updates come through `git subtree add/pull --squash` and remain
-    verifiable by `test/lint/git-subtree-check.sh`.
+    verifiable by `test/lint/libbitcoinpqc-subtree-check.sh`.
 
 - src/leveldb
   - Upstream at https://github.com/google/leveldb ; maintained by Google. Open

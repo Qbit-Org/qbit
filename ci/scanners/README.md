@@ -25,8 +25,9 @@ python3 ci/scanners/run-scanners.py \
 
 The vendored `src/libbitcoinpqc` provenance scanner reads
 `LIBBITCOINPQC_READ_TOKEN` for authenticated access to the configured
-`libbitcoinpqc-qbit` upstream repository. `UPSTREAM_GITHUB_TOKEN` is accepted as
-a compatibility fallback for existing libbitcoinpqc evidence workflows.
+`qbit-libbitcoinpqc` upstream repository and verifies the pinned release tag.
+`UPSTREAM_GITHUB_TOKEN` is accepted as a compatibility fallback for existing
+libbitcoinpqc evidence workflows.
 
 For frozen review evidence, write summaries directly into the review record workspace:
 
