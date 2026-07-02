@@ -9,6 +9,7 @@
 #include <script/signingprovider.h>
 
 #include <logging.h>
+#include <util/strencodings.h>
 #include <util/signing_timing.h>
 #include <util/time.h>
 
@@ -59,6 +60,12 @@ bool HidingSigningProvider::CanSignPQC(const CPQCPubKey& pubkey) const
 {
     if (m_hide_secret) return false;
     return m_provider->CanSignPQC(pubkey);
+}
+
+bool HidingSigningProvider::IsPQCSignatureCounterExhausted(const CPQCPubKey& pubkey) const
+{
+    if (m_hide_secret) return false;
+    return m_provider->IsPQCSignatureCounterExhausted(pubkey);
 }
 
 bool HidingSigningProvider::SignPQC(const CPQCPubKey& pubkey, const uint256& hash, std::vector<unsigned char>& sig) const
@@ -121,6 +128,18 @@ bool FlatSigningProvider::CanSignPQC(const CPQCPubKey& pubkey) const
     const uint32_t previous_counter = counter_it != pqc_sig_counters.end() ? counter_it->second : 0;
     return previous_counter < PQC_MAX_SIGNATURES;
 }
+
+bool FlatSigningProvider::IsPQCSignatureCounterExhausted(const CPQCPubKey& pubkey) const
+{
+    CPQCKey key;
+    if (!LookupHelper(pqc_keys, pubkey, key)) return false;
+    if (!key.IsValid()) return false;
+
+    const auto counter_it = pqc_sig_counters.find(pubkey);
+    const uint32_t previous_counter = counter_it != pqc_sig_counters.end() ? counter_it->second : 0;
+    return previous_counter >= PQC_MAX_SIGNATURES;
+}
+
 bool FlatSigningProvider::SignPQC(const CPQCPubKey& pubkey, const uint256& hash, std::vector<unsigned char>& sig) const
 {
     const bool timing_enabled{util::signing_timing::Enabled() && util::signing_timing::CurrentId() != 0};
@@ -165,6 +184,15 @@ bool FlatSigningProvider::SignPQC(const CPQCPubKey& pubkey, const uint256& hash,
     uint32_t reserved_previous_counter = previous_counter;
     uint32_t reserved_counter = previous_counter + 1;
     uint32_t counter = previous_counter;
+    bool committed_reservation{false};
+    const auto observe_counter_advance = [&](uint32_t observed_previous_counter, uint32_t observed_reserved_counter) {
+        pqc_sig_counters[pubkey] = observed_reserved_counter;
+        if (pqc_counter_observer) {
+            const auto observer_start{SteadyClock::now()};
+            pqc_counter_observer(pubkey, observed_previous_counter, observed_reserved_counter);
+            observer_time += SteadyClock::now() - observer_start;
+        }
+    };
     if (previous_counter >= PQC_MAX_SIGNATURES) {
         log_pqc_sign_timing(/*success=*/false, "limit_exceeded");
         return false;
@@ -185,6 +213,11 @@ bool FlatSigningProvider::SignPQC(const CPQCPubKey& pubkey, const uint256& hash,
             return false;
         }
         counter = reserved_previous_counter;
+        committed_reservation = true;
+        // Wallet-backed reservations have already been durably committed by
+        // the reserver. Treat that counter range as consumed even if the raw
+        // signer fails below; reusing it would be less safe than overcounting.
+        observe_counter_advance(reserved_previous_counter, reserved_counter);
     } else if (pqc_counter_writer) {
         // Reserve exactly one counter value in authoritative storage first.
         const auto reserve_start{SteadyClock::now()};
@@ -197,13 +230,19 @@ bool FlatSigningProvider::SignPQC(const CPQCPubKey& pubkey, const uint256& hash,
     }
 
     const auto raw_sign_start{SteadyClock::now()};
-    const bool signed_ok = key.Sign(hash, sig, counter);
+    const bool signed_ok = pqc_raw_signer ? pqc_raw_signer(key, hash, sig, counter) : key.Sign(hash, sig, counter);
     raw_sign_time = SteadyClock::now() - raw_sign_start;
     if (!signed_ok || counter != reserved_counter) {
         if (signed_ok) {
             LogPrintf("%s: PQC signer returned unexpected counter %u (expected %u)\n", __func__, counter, reserved_counter);
         }
-        if (pqc_counter_writer && !pqc_counter_reserver) {
+        if (committed_reservation) {
+            LogPrintf("%s: PQC signing failed after committed counter reservation for pubkey %s [%u, %u)\n",
+                __func__,
+                HexStr(std::span<const unsigned char>{pubkey.begin(), pubkey.end()}),
+                reserved_previous_counter,
+                reserved_counter);
+        } else if (pqc_counter_writer && !pqc_counter_reserver) {
             // Best-effort rollback of reservation if signing failed.
             const auto rollback_start{SteadyClock::now()};
             if (!pqc_counter_writer(pubkey, reserved_counter, previous_counter)) {
@@ -221,11 +260,8 @@ bool FlatSigningProvider::SignPQC(const CPQCPubKey& pubkey, const uint256& hash,
         return false;
     }
 
-    pqc_sig_counters[pubkey] = reserved_counter;
-    if (pqc_counter_observer) {
-        const auto observer_start{SteadyClock::now()};
-        pqc_counter_observer(pubkey, reserved_previous_counter, reserved_counter);
-        observer_time = SteadyClock::now() - observer_start;
+    if (!committed_reservation) {
+        observe_counter_advance(reserved_previous_counter, reserved_counter);
     }
     log_pqc_sign_timing(/*success=*/true, "ok");
     return true;
@@ -290,6 +326,9 @@ FlatSigningProvider& FlatSigningProvider::Merge(FlatSigningProvider&& b)
     }
     if (!pqc_counter_observer && b.pqc_counter_observer) {
         pqc_counter_observer = std::move(b.pqc_counter_observer);
+    }
+    if (!pqc_raw_signer && b.pqc_raw_signer) {
+        pqc_raw_signer = std::move(b.pqc_raw_signer);
     }
     p2mr_pubkeys.merge(b.p2mr_pubkeys);
     for (auto& [output, spenddata] : b.p2mr_spenddata) {
@@ -493,6 +532,14 @@ bool MultiSigningProvider::CanSignPQC(const CPQCPubKey& pubkey) const
 {
     for (const auto& provider : m_providers) {
         if (provider->CanSignPQC(pubkey)) return true;
+    }
+    return false;
+}
+
+bool MultiSigningProvider::IsPQCSignatureCounterExhausted(const CPQCPubKey& pubkey) const
+{
+    for (const auto& provider : m_providers) {
+        if (provider->IsPQCSignatureCounterExhausted(pubkey)) return true;
     }
     return false;
 }
