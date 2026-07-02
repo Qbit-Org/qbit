@@ -26,6 +26,9 @@ python3 ci/scanners/run-scanners.py \
 The vendored `src/libbitcoinpqc` provenance scanner verifies the recorded
 `git-subtree-split` against the pinned public `Qbit-Org/qbit-libbitcoinpqc`
 release tag documented in `doc/subtrees/libbitcoinpqc.md`.
+`LIBBITCOINPQC_READ_TOKEN` is used for authenticated access when present, and
+`UPSTREAM_GITHUB_TOKEN` is accepted as a compatibility fallback for existing
+libbitcoinpqc evidence workflows.
 
 For frozen review evidence, write summaries directly into the review record workspace:
 

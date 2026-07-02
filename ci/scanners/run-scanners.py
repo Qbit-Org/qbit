@@ -125,8 +125,10 @@ LEGACY_MODE_ALIASES = {
 
 LIBBITCOINPQC_PATH = "src/libbitcoinpqc"
 LIBBITCOINPQC_UPSTREAM_REPO = "https://github.com/Qbit-Org/qbit-libbitcoinpqc.git"
-LIBBITCOINPQC_UPSTREAM_REF = "refs/tags/v0.3.0"
-LIBBITCOINPQC_CURATED_REF = ""
+LIBBITCOINPQC_UPSTREAM_TAG = "v0.3.0"
+LIBBITCOINPQC_UPSTREAM_REF = f"refs/tags/{LIBBITCOINPQC_UPSTREAM_TAG}"
+LIBBITCOINPQC_UPSTREAM_PEELED_REF = f"{LIBBITCOINPQC_UPSTREAM_REF}^{{}}"
+LIBBITCOINPQC_VERIFY_COMMAND = ["test/lint/libbitcoinpqc-subtree-check.sh"]
 
 
 def utcnow() -> str:
@@ -318,6 +320,17 @@ def libbitcoinpqc_github_auth_env(repo_url: str) -> dict[str, str] | None:
     env[f"GIT_CONFIG_KEY_{config_count + 1}"] = key
     env[f"GIT_CONFIG_VALUE_{config_count + 1}"] = f"AUTHORIZATION: basic {auth}"
     env["GIT_CONFIG_COUNT"] = str(config_count + 2)
+    return env
+
+
+def libbitcoinpqc_verify_env() -> dict[str, str]:
+    env = (
+        libbitcoinpqc_github_auth_env(LIBBITCOINPQC_UPSTREAM_REPO)
+        or os.environ.copy()
+    )
+    env["LIBBITCOINPQC_PATH"] = LIBBITCOINPQC_PATH
+    env["LIBBITCOINPQC_REMOTE_URL"] = LIBBITCOINPQC_UPSTREAM_REPO
+    env["LIBBITCOINPQC_REMOTE_REF"] = LIBBITCOINPQC_UPSTREAM_TAG
     return env
 
 
@@ -1111,42 +1124,38 @@ def git_commit_tree(source: Path, commit: str) -> str:
     return stdout.strip() if exit_code == 0 else ""
 
 
-def git_commit_parents(source: Path, commit: str) -> list[str]:
-    exit_code, stdout, _stderr = git_command(source, "show", "-s", "--format=%P", commit)
-    return stdout.split() if exit_code == 0 else []
+def git_peel_commit(source: Path, object_name: str) -> str:
+    if not object_name:
+        return ""
+    exit_code, stdout, _stderr = git_command(source, "rev-parse", f"{object_name}^{{commit}}")
+    return stdout.strip() if exit_code == 0 else ""
 
 
-def imported_upstream_source_commit(source: Path, curated_commit: str) -> tuple[str, str]:
-    if not curated_commit or git_object_type(source, curated_commit) != "commit":
-        return "", "unavailable"
-    parents = git_commit_parents(source, curated_commit)
-    if len(parents) >= 2:
-        return parents[1], "merge_second_parent"
-    if not parents:
-        return "", "missing_parent"
-    merge_parents = git_commit_parents(source, parents[0])
-    if len(merge_parents) >= 2:
-        return merge_parents[1], "first_parent_merge_second_parent"
-    return "", "not_derivable"
+def ls_remote_ref_matches(query_ref: str, candidate_ref: str) -> bool:
+    if candidate_ref == query_ref:
+        return True
+    if query_ref.endswith("^{}") and candidate_ref == query_ref.removesuffix("^{}"):
+        return True
+    return False
+
+
+def ls_remote_ref_oid(stdout: str, ref: str) -> str:
+    for line in stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and ls_remote_ref_matches(ref, parts[1]):
+            return parts[0]
+    return ""
 
 
 def git_ls_remote_ref(source: Path, repo_url: str, ref: str) -> tuple[str, int]:
     exit_code, stdout, _stderr = run_text_command(
-        ["git", "ls-remote", repo_url, ref, f"{ref}^{{}}"],
+        ["git", "ls-remote", repo_url, ref],
         source,
         env=libbitcoinpqc_github_auth_env(repo_url),
     )
     if exit_code != 0:
         return "", exit_code
-    peeled_ref = f"{ref}^{{}}"
-    fallback_commit = ""
-    for line in stdout.splitlines():
-        parts = line.split()
-        if len(parts) >= 2 and parts[1] == peeled_ref:
-            return parts[0], exit_code
-        if len(parts) >= 2 and parts[1] == ref:
-            fallback_commit = parts[0]
-    return fallback_commit, exit_code
+    return ls_remote_ref_oid(stdout, ref), exit_code
 
 
 def git_fetch(source: Path, repo_url: str, refs: list[str]) -> dict[str, Any]:
@@ -1163,13 +1172,16 @@ def git_fetch(source: Path, repo_url: str, refs: list[str]) -> dict[str, Any]:
 
 
 def fetch_libbitcoinpqc_provenance_objects(source: Path, split: str) -> tuple[list[dict[str, Any]], list[str]]:
-    provenance_refs = [LIBBITCOINPQC_UPSTREAM_REF]
-    if LIBBITCOINPQC_CURATED_REF:
-        provenance_refs.append(LIBBITCOINPQC_CURATED_REF)
-    results = [git_fetch(source, LIBBITCOINPQC_UPSTREAM_REPO, provenance_refs)]
+    results = [
+        git_fetch(
+            source,
+            LIBBITCOINPQC_UPSTREAM_REPO,
+            [LIBBITCOINPQC_UPSTREAM_TAG],
+        )
+    ]
     gaps = []
     if results[0]["exit_code"] != 0:
-        gaps.append("libbitcoinpqc remote provenance refs fetch failed.")
+        gaps.append(f"libbitcoinpqc upstream tag fetch failed: {LIBBITCOINPQC_UPSTREAM_TAG}")
     if split and git_object_type(source, split) != "commit":
         split_result = git_fetch(source, LIBBITCOINPQC_UPSTREAM_REPO, [split])
         results.append(split_result)
@@ -1183,45 +1195,28 @@ def git_object_type(source: Path, object_name: str) -> str:
     return stdout.strip() if exit_code == 0 else ""
 
 
-def git_ancestor_relationship(source: Path, ancestor: str, descendant: str) -> str:
-    if not ancestor or not descendant:
-        return "missing"
-    if git_object_type(source, ancestor) != "commit" or git_object_type(source, descendant) != "commit":
-        return "unverified"
-    exit_code, _stdout, _stderr = git_command(source, "merge-base", "--is-ancestor", ancestor, descendant)
-    if exit_code == 0:
-        return "ancestor"
-    if exit_code == 1:
-        return "not_ancestor"
-    return "unverified"
-
-
 def libbitcoinpqc_provenance(source: Path) -> tuple[dict[str, Any], list[str]]:
     provenance: dict[str, Any] = {
         "upstream_repo": LIBBITCOINPQC_UPSTREAM_REPO,
         "upstream_ref": LIBBITCOINPQC_UPSTREAM_REF,
-        "curated_ref": LIBBITCOINPQC_CURATED_REF,
+        "upstream_tag": LIBBITCOINPQC_UPSTREAM_TAG,
+        "upstream_peeled_ref": LIBBITCOINPQC_UPSTREAM_PEELED_REF,
+        "verification_command": command_to_string(LIBBITCOINPQC_VERIFY_COMMAND),
         "auth_source": libbitcoinpqc_auth_source() or "checkout/default",
     }
     gaps: list[str] = []
 
-    upstream_ref_commit, upstream_ref_exit = git_ls_remote_ref(
-        source, LIBBITCOINPQC_UPSTREAM_REPO, LIBBITCOINPQC_UPSTREAM_REF
+    upstream_ref_object, upstream_ref_exit = git_ls_remote_ref(
+        source, LIBBITCOINPQC_UPSTREAM_REPO, LIBBITCOINPQC_UPSTREAM_PEELED_REF
     )
-    if LIBBITCOINPQC_CURATED_REF:
-        curated_ref_commit, curated_ref_exit = git_ls_remote_ref(
-            source, LIBBITCOINPQC_UPSTREAM_REPO, LIBBITCOINPQC_CURATED_REF
+    if not upstream_ref_object and upstream_ref_exit == 0:
+        upstream_ref_object, upstream_ref_exit = git_ls_remote_ref(
+            source, LIBBITCOINPQC_UPSTREAM_REPO, LIBBITCOINPQC_UPSTREAM_REF
         )
-    else:
-        curated_ref_commit, curated_ref_exit = "", 0
-    provenance["upstream_ref_commit"] = upstream_ref_commit
+    provenance["upstream_ref_object"] = upstream_ref_object
     provenance["upstream_ref_lookup_exit_code"] = upstream_ref_exit
-    provenance["curated_ref_commit"] = curated_ref_commit
-    provenance["curated_ref_lookup_exit_code"] = curated_ref_exit
-    if not upstream_ref_commit:
-        gaps.append(f"libbitcoinpqc upstream ref unavailable: {LIBBITCOINPQC_UPSTREAM_REF}")
-    if LIBBITCOINPQC_CURATED_REF and not curated_ref_commit:
-        gaps.append(f"libbitcoinpqc curated ref unavailable: {LIBBITCOINPQC_CURATED_REF}")
+    if not upstream_ref_object:
+        gaps.append(f"libbitcoinpqc upstream tag unavailable: {LIBBITCOINPQC_UPSTREAM_REF}")
 
     metadata = latest_git_subtree_metadata(source, LIBBITCOINPQC_PATH)
     provenance.update(metadata)
@@ -1233,60 +1228,56 @@ def libbitcoinpqc_provenance(source: Path) -> tuple[dict[str, Any], list[str]]:
     provenance["fetch_results"] = fetch_results
     gaps.extend(fetch_gaps)
 
-    if LIBBITCOINPQC_CURATED_REF:
-        imported_source_commit, imported_source_method = imported_upstream_source_commit(source, split)
-    else:
-        imported_source_commit, imported_source_method = split, "git_subtree_split"
-    provenance["imported_upstream_source_commit"] = imported_source_commit
-    provenance["imported_upstream_source_method"] = imported_source_method
-    if LIBBITCOINPQC_CURATED_REF and split and not imported_source_commit:
-        gaps.append("libbitcoinpqc imported upstream source commit is not derivable from the curated split.")
-    if imported_source_commit and upstream_ref_commit:
-        if imported_source_commit == upstream_ref_commit:
-            upstream_source_relationship = "matches_upstream_ref"
-        else:
-            upstream_source_relationship = git_ancestor_relationship(
-                source,
-                imported_source_commit,
-                upstream_ref_commit,
-            )
+    upstream_ref_commit = git_peel_commit(source, upstream_ref_object)
+    provenance["upstream_ref_commit"] = upstream_ref_commit
+    if upstream_ref_object and not upstream_ref_commit:
+        gaps.append(f"libbitcoinpqc upstream tag object is not peelable to a commit: {upstream_ref_object}")
+
+    if split and upstream_ref_commit:
+        upstream_source_relationship = "matches_upstream_tag" if split == upstream_ref_commit else "differs"
         provenance["upstream_source_relationship"] = upstream_source_relationship
-        if upstream_source_relationship not in {"matches_upstream_ref", "ancestor"}:
+        if upstream_source_relationship != "matches_upstream_tag":
             gaps.append(
-                "libbitcoinpqc imported upstream source does not match "
-                f"{LIBBITCOINPQC_UPSTREAM_REF}: imported={imported_source_commit} upstream={upstream_ref_commit}"
+                "libbitcoinpqc subtree split does not match "
+                f"{LIBBITCOINPQC_UPSTREAM_REF}: split={split} upstream={upstream_ref_commit}"
             )
 
     current_tree = git_tree_for_path(source, LIBBITCOINPQC_PATH)
-    split_tree = git_commit_tree(source, split) if split else ""
+    import_tree = (
+        git_tree_for_path(source, LIBBITCOINPQC_PATH, import_commit)
+        if import_commit
+        else ""
+    )
+    upstream_tree = git_commit_tree(source, upstream_ref_commit) if upstream_ref_commit else ""
     provenance["qbit_subtree_tree"] = current_tree
-    provenance["git_subtree_split_tree"] = split_tree
+    provenance["qbit_import_tree"] = import_tree
+    provenance["upstream_tag_tree"] = upstream_tree
     if not current_tree:
         gaps.append("libbitcoinpqc subtree tree hash unavailable from HEAD.")
-    if split and not split_tree:
-        gaps.append(f"libbitcoinpqc git-subtree-split tree unavailable: {split}")
-    if current_tree and split_tree and current_tree != split_tree:
-        gaps.append("libbitcoinpqc subtree tree does not match the recorded git-subtree-split tree.")
+    if import_commit and not import_tree:
+        gaps.append(f"libbitcoinpqc qbit import commit tree unavailable: {import_commit}")
+    if current_tree and import_tree and current_tree != import_tree:
+        gaps.append("libbitcoinpqc subtree tree does not match the recorded qbit import commit tree.")
+    if upstream_ref_commit and not upstream_tree:
+        gaps.append(f"libbitcoinpqc upstream tag commit tree unavailable: {upstream_ref_commit}")
+    if current_tree and upstream_tree and current_tree != upstream_tree:
+        gaps.append("libbitcoinpqc subtree tree does not match the upstream tag tree.")
 
-    verification_command = f"git diff --quiet {split}^{{tree}} HEAD:{LIBBITCOINPQC_PATH}" if split else ""
-    provenance["verification_command"] = verification_command
-    verify_exit = 0 if current_tree and split_tree and current_tree == split_tree else 1
+    verify_script = source / LIBBITCOINPQC_VERIFY_COMMAND[0]
+    if verify_script.is_file():
+        verify_exit, _stdout, _stderr = run_text_command(
+            LIBBITCOINPQC_VERIFY_COMMAND,
+            source,
+            env=libbitcoinpqc_verify_env(),
+        )
+    else:
+        verify_exit = 127
     provenance["verification_exit_code"] = verify_exit
     provenance["verification_status"] = "passed" if verify_exit == 0 else "failed"
     if verify_exit != 0:
-        gaps.append(f"libbitcoinpqc subtree verification failed: {verification_command or 'unavailable'}")
-
-    if split and curated_ref_commit:
-        if split == curated_ref_commit:
-            relationship = "matches_curated_ref"
-        else:
-            relationship = git_ancestor_relationship(source, split, curated_ref_commit)
-        provenance["curated_ref_relationship"] = relationship
-        if relationship not in {"matches_curated_ref", "ancestor"}:
-            gaps.append(
-                "libbitcoinpqc imported split is not proven reachable from "
-                f"{LIBBITCOINPQC_CURATED_REF}: imported={split} curated={curated_ref_commit}"
-            )
+        gaps.append(
+            f"libbitcoinpqc full subtree verification failed: {command_to_string(LIBBITCOINPQC_VERIFY_COMMAND)}"
+        )
 
     return provenance, gaps
 

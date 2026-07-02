@@ -2,7 +2,9 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <chainparams.h>
 #include <common/messages.h>
+#include <consensus/restricted_outputs.h>
 #include <consensus/validation.h>
 #include <core_io.h>
 #include <key_io.h>
@@ -49,6 +51,14 @@ static void RejectReservedWitnessOutputs(const std::vector<CTxOut>& outputs)
 {
     for (const CTxOut& output : outputs) {
         RejectReservedWitnessOutput(output.scriptPubKey);
+    }
+}
+
+static void RejectRestrictedOutputModeDisallowedOutput(const CScript& script_pub_key, const Consensus::Params& consensus, int height)
+{
+    RejectReservedWitnessOutput(script_pub_key);
+    if (consensus.fRestrictedOutputMode && !Consensus::IsRestrictedOutputModeConsensusOutput(script_pub_key, consensus, height)) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Output scriptPubKey is not allowed in restricted-output mode");
     }
 }
 
@@ -557,7 +567,7 @@ static std::vector<RPCArg> FundTxDoc(bool solving_data = true)
     return args;
 }
 
-CreatedTransactionResult FundTransaction(CWallet& wallet, const CMutableTransaction& tx, const std::vector<CRecipient>& recipients, const UniValue& options, CCoinControl& coinControl, bool override_min_fee)
+CreatedTransactionResult FundTransaction(CWallet& wallet, const CMutableTransaction& tx, const std::vector<CRecipient>& recipients, const UniValue& options, CCoinControl& coinControl, bool override_min_fee, const std::vector<CTxOut>* original_outputs = nullptr)
 {
     // We want to make sure tx.vout is not used now that we are passing outputs as a vector of recipients.
     // This sets us up to remove tx completely in a future PR in favor of passing the inputs directly.
@@ -776,6 +786,15 @@ CreatedTransactionResult FundTransaction(CWallet& wallet, const CMutableTransact
     if (recipients.empty())
         throw JSONRPCError(RPC_INVALID_PARAMETER, "TX must have at least one output");
 
+    if (original_outputs) {
+        const Consensus::Params& consensus{Params().GetConsensus()};
+        const std::optional<int> chain_height{wallet.chain().getHeight()};
+        const int next_block_height{chain_height.value_or(-1) + 1};
+        for (const CTxOut& output : *original_outputs) {
+            RejectRestrictedOutputModeDisallowedOutput(output.scriptPubKey, consensus, next_block_height);
+        }
+    }
+
     auto txr = FundTransaction(wallet, tx, recipients, change_position, lockUnspents, coinControl);
     if (!txr) {
         throw JSONRPCError(RPC_WALLET_ERROR, ErrorString(txr).original);
@@ -905,6 +924,7 @@ RPCHelpMan fundrawtransaction()
     if (!DecodeHexTx(tx, request.params[0].get_str(), try_no_witness, try_witness)) {
         throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "TX decode failed");
     }
+    const std::vector<CTxOut> original_outputs{tx.vout};
     UniValue options = request.params[1];
     std::vector<std::pair<CTxDestination, CAmount>> destinations;
     for (const auto& tx_out : tx.vout) {
@@ -923,7 +943,7 @@ RPCHelpMan fundrawtransaction()
     // Clear tx.vout since it is not meant to be used now that we are passing outputs directly.
     // This sets us up for a future PR to completely remove tx from the function signature in favor of passing inputs directly
     tx.vout.clear();
-    auto txr = FundTransaction(*pwallet, tx, recipients, options, coin_control, /*override_min_fee=*/true);
+    auto txr = FundTransaction(*pwallet, tx, recipients, options, coin_control, /*override_min_fee=*/true, &original_outputs);
 
     UniValue result(UniValue::VOBJ);
     result.pushKV("hex", EncodeHexTx(*txr.tx));

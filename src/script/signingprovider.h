@@ -32,6 +32,7 @@ struct ShortestVectorFirstComparator
 
 using PQCSignatureCounterObserver = std::function<void(const CPQCPubKey&, uint32_t, uint32_t)>;
 using PQCSignatureCounterReserver = std::function<bool(const CPQCPubKey&, uint32_t, uint32_t&, uint32_t&)>;
+using PQCRawSigner = std::function<bool(const CPQCKey&, const uint256&, std::vector<unsigned char>&, uint32_t&)>;
 
 struct PQCSignatureCounterRange {
     CPQCPubKey pubkey;
@@ -217,6 +218,7 @@ public:
     virtual bool GetKey(const CKeyID &address, CKey& key) const { return false; }
     virtual bool GetPQCKey(const CPQCPubKey& pubkey, CPQCKey& key) const { return false; }
     virtual bool CanSignPQC(const CPQCPubKey& pubkey) const { return false; }
+    virtual bool IsPQCSignatureCounterExhausted(const CPQCPubKey& pubkey) const { return false; }
     virtual bool SignPQC(const CPQCPubKey& pubkey, const uint256& hash, std::vector<unsigned char>& sig) const;
     virtual bool HaveKey(const CKeyID &address) const { return false; }
     virtual bool GetKeyOrigin(const CKeyID& keyid, KeyOriginInfo& info) const { return false; }
@@ -267,6 +269,7 @@ public:
     bool GetKey(const CKeyID& keyid, CKey& key) const override;
     bool GetPQCKey(const CPQCPubKey& pubkey, CPQCKey& key) const override;
     bool CanSignPQC(const CPQCPubKey& pubkey) const override;
+    bool IsPQCSignatureCounterExhausted(const CPQCPubKey& pubkey) const override;
     bool SignPQC(const CPQCPubKey& pubkey, const uint256& hash, std::vector<unsigned char>& sig) const override;
     bool GetKeyOrigin(const CKeyID& keyid, KeyOriginInfo& info) const override;
     bool GetTaprootSpendData(const XOnlyPubKey& output_key, TaprootSpendData& spenddata) const override;
@@ -288,6 +291,7 @@ struct FlatSigningProvider final : public SigningProvider
     PQCSignatureCounterReserver pqc_counter_reserver;
     PQCSignatureCounterBatchReserver pqc_counter_batch_reserver;
     PQCSignatureCounterObserver pqc_counter_observer;
+    PQCRawSigner pqc_raw_signer;
     std::map<uint32_t, CPQCPubKey> p2mr_pubkeys; /** Map key expression index -> derived P2MR pubkey */
     std::map<WitnessV2P2MR, P2MRSpendData> p2mr_spenddata; /** Map from output key to raw P2MR spend data */
     std::map<XOnlyPubKey, TaprootBuilder> tr_trees; /** Map from output key to Taproot tree (which can then make the TaprootSpendData */
@@ -301,6 +305,7 @@ struct FlatSigningProvider final : public SigningProvider
     bool GetKey(const CKeyID& keyid, CKey& key) const override;
     bool GetPQCKey(const CPQCPubKey& pubkey, CPQCKey& key) const override;
     bool CanSignPQC(const CPQCPubKey& pubkey) const override;
+    bool IsPQCSignatureCounterExhausted(const CPQCPubKey& pubkey) const override;
     bool SignPQC(const CPQCPubKey& pubkey, const uint256& hash, std::vector<unsigned char>& sig) const override;
     bool GetTaprootSpendData(const XOnlyPubKey& output_key, TaprootSpendData& spenddata) const override;
     bool GetTaprootBuilder(const XOnlyPubKey& output_key, TaprootBuilder& builder) const override;
@@ -400,6 +405,7 @@ public:
     bool GetKey(const CKeyID& keyid, CKey& key) const override;
     bool GetPQCKey(const CPQCPubKey& pubkey, CPQCKey& key) const override;
     bool CanSignPQC(const CPQCPubKey& pubkey) const override;
+    bool IsPQCSignatureCounterExhausted(const CPQCPubKey& pubkey) const override;
     bool SignPQC(const CPQCPubKey& pubkey, const uint256& hash, std::vector<unsigned char>& sig) const override;
     bool GetTaprootSpendData(const XOnlyPubKey& output_key, TaprootSpendData& spenddata) const override;
     bool GetTaprootBuilder(const XOnlyPubKey& output_key, TaprootBuilder& builder) const override;

@@ -875,7 +875,7 @@ BOOST_AUTO_TEST_CASE(test_FormatSubVersion)
     BOOST_CHECK_EQUAL(FormatSubVersion("Test", 99900, std::vector<std::string>()),std::string("/Test:9.99.0/"));
     BOOST_CHECK_EQUAL(FormatSubVersion("Test", 99900, comments),std::string("/Test:9.99.0(comment1)/"));
     BOOST_CHECK_EQUAL(FormatSubVersion("Test", 99900, comments2),std::string("/Test:9.99.0(comment1; Comment2; .,_?@-; )/"));
-    BOOST_CHECK_EQUAL(FormatSubVersion("Test", CLIENT_VERSION, std::vector<std::string>()), "/Test:0.1.1/");
+    BOOST_CHECK_EQUAL(FormatSubVersion("Test", CLIENT_VERSION, std::vector<std::string>()), "/Test:0.1.2/");
     BOOST_CHECK_EQUAL(FormatSubVersion(UA_NAME, CLIENT_VERSION, std::vector<std::string>()), std::string("/") + UA_NAME + ":" + CLIENT_VERSION_STRING + "/");
     BOOST_CHECK_EQUAL(FormatSubVersion(UA_NAME, CLIENT_VERSION, comments), std::string("/") + UA_NAME + ":" + CLIENT_VERSION_STRING + "(comment1)/");
 }
@@ -883,7 +883,7 @@ BOOST_AUTO_TEST_CASE(test_FormatSubVersion)
 BOOST_AUTO_TEST_CASE(test_CompareSubVersion)
 {
     BOOST_CHECK_EQUAL(CompareSubVersion("/qbit:0.1.0/", "/qbit:0.1.0/", "qbit").value(), 0);
-    BOOST_CHECK_EQUAL(CompareSubVersion("/qbit:0.1.1/", "/qbit:0.1.0/", "qbit").value(), 1);
+    BOOST_CHECK_EQUAL(CompareSubVersion("/qbit:0.1.2/", "/qbit:0.1.1/", "qbit").value(), 1);
     BOOST_CHECK_EQUAL(CompareSubVersion("/qbit:0.1.0-testnet2/", "/qbit:0.1.0-testnet1/", "qbit").value(), 1);
     BOOST_CHECK_EQUAL(CompareSubVersion("/qbit:0.1.0-testnet1/", "/qbit:0.1.0-testnet1-rc1/", "qbit").value(), 1);
     BOOST_CHECK_EQUAL(CompareSubVersion("/qbit:0.1.0-testnet1-rc2/", "/qbit:0.1.0-testnet1-rc1/", "qbit").value(), 1);

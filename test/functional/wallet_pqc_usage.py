@@ -8,7 +8,7 @@ from decimal import Decimal
 
 from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.test_framework import BitcoinTestFramework
-from test_framework.util import assert_equal
+from test_framework.util import assert_equal, assert_raises_rpc_error
 
 
 PQC_SIGNATURE_LIMIT = 1 << 30
@@ -199,6 +199,93 @@ class WalletPQCUsageTest(BitcoinTestFramework):
         assert_equal(signed_psbt["complete"], False)
         self.assert_pqc_fields(signed_psbt)
 
+    def test_signdatapqchash(self):
+        signer = self.create_wallet("pqc_hash_signer", load_on_startup=True)
+        address = signer.getnewaddress(address_type="p2mr")
+        self.wait_pqc_key_validation_ready(signer)
+        self.assert_pqc_signature_count(signer, address, 0)
+
+        proof = signer.signdatapqchash(address, "55" * 32)
+        assert_equal(proof["address"], address)
+        self.assert_pqc_fields(proof, min_signature_count=1)
+        assert_equal(proof["pqc_signature_count"], 1)
+        assert_equal(proof["pqc_key_states"][0]["pubkey"], proof["pubkey"])
+        self.assert_pqc_signature_count(signer, address, 1)
+
+        hidden_usage = signer.signdatapqchash(address, "56" * 32, {"include_pqc_usage": False})
+        self.assert_no_pqc_fields(hidden_usage)
+        self.assert_pqc_signature_count(signer, address, 2)
+
+        assert_raises_rpc_error(
+            -4,
+            "No supported single-key P2MR pubkey leaf was found for this address",
+            signer.signdatapqchash,
+            address,
+            "57" * 32,
+            {"pubkey": "00" * 32},
+        )
+        self.assert_pqc_signature_count(signer, address, 2)
+
+        watch = self.create_wallet("pqc_hash_watch", disable_private_keys=True)
+        watch.importpubkeydb(signer.exportpubkeydb()["pubkeys"], False, 0)
+        assert_raises_rpc_error(
+            -4,
+            "Private key is not available for the selected P2MR pubkey leaf",
+            watch.signdatapqchash,
+            address,
+            "58" * 32,
+            {
+                "pubkey": proof["pubkey"],
+                "leaf_script": proof["leaf_script"],
+                "control_block": proof["control_block"],
+            },
+        )
+        self.assert_pqc_signature_count(signer, address, 2)
+
+        passphrase = "pass"
+        self.nodes[0].createwallet(wallet_name="pqc_hash_locked", passphrase=passphrase)
+        locked = self.nodes[0].get_wallet_rpc("pqc_hash_locked")
+        locked.walletpassphrase(passphrase, 60)
+        locked_address = locked.getnewaddress(address_type="p2mr")
+        self.wait_pqc_key_validation_ready(locked)
+        locked.walletlock()
+        assert_raises_rpc_error(
+            -13,
+            "Please enter the wallet passphrase",
+            locked.signdatapqchash,
+            locked_address,
+            "59" * 32,
+        )
+        locked.walletpassphrase(passphrase, 60)
+        locked_proof = locked.signdatapqchash(locked_address, "5a" * 32)
+        self.assert_pqc_fields(locked_proof, min_signature_count=1)
+        self.assert_pqc_signature_count(locked, locked_address, 1)
+
+    def test_signdatapqchash_plaintext_validation_block(self):
+        source_name = "pqc_hash_validation_source"
+        source = self.create_wallet(source_name)
+        source.keypoolrefill(200)
+        address = source.getnewaddress(address_type="p2mr")
+        backup_file = self.nodes[0].datadir_path / "pqc_hash_validation_source.bak"
+        source.backupwallet(backup_file)
+        self.nodes[0].unloadwallet(source_name)
+
+        restored_name = "pqc_hash_validation_restored"
+        self.nodes[0].restorewallet(restored_name, backup_file)
+        restored = self.nodes[0].get_wallet_rpc(restored_name)
+        self.wait_until(
+            lambda: restored.getwalletinfo()["pqc_key_validation"]["signing_blocked"],
+            timeout=10,
+        )
+        assert_raises_rpc_error(
+            -4,
+            "plaintext PQC wallet key validation",
+            restored.signdatapqchash,
+            address,
+            "5b" * 32,
+        )
+        restored.unloadwallet()
+
     def test_counter_lifecycle(self, funder, receiver):
         wallet_name = "pqc_counter_lifecycle"
         signer = self.create_wallet(wallet_name, load_on_startup=True)
@@ -298,6 +385,8 @@ class WalletPQCUsageTest(BitcoinTestFramework):
         self.test_sendtoaddress_and_sendmany(funder, receiver)
         self.test_send_and_sendall(funder, receiver)
         self.test_rawtx_and_psbt(funder, receiver)
+        self.test_signdatapqchash()
+        self.test_signdatapqchash_plaintext_validation_block()
         self.test_counter_lifecycle(funder, receiver)
         funder = self.nodes[0].get_wallet_rpc("pqc_funder")
         receiver = self.nodes[0].get_wallet_rpc("pqc_receiver")

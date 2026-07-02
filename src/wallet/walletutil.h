@@ -123,6 +123,7 @@ std::span<const OutputType> GetWalletOutputTypes();
 std::span<const OutputType> GetDefaultDescriptorOutputTypes();
 std::string FormatWalletOutputTypes();
 bool IsWalletOutputTypeAllowed(OutputType type);
+bool HasWalletOutputTypeManager(const CWallet& wallet, OutputType type, bool internal);
 bool IsAvailableWalletOutputType(const CWallet& wallet, OutputType type, bool internal);
 } // namespace wallet
 

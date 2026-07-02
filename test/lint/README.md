@@ -101,18 +101,30 @@ maintained:
 
 Keep this list in sync with `fn get_subtrees()` in the lint runner.
 
-The qbit-specific `src/libbitcoinpqc` vendored source is excluded from generic
-file linters, but public release snapshot branches may not carry
-`git-subtree` metadata until the public `Qbit-Org/libbitcoinpqc-qbit`
-repository is available. For the libbitcoinpqc subtree workflow and provenance
-checks, see
-[`doc/subtrees/libbitcoinpqc.md`](../../doc/subtrees/libbitcoinpqc.md).
-
-To do so, add the upstream repository as remote:
+For the generic subtree checks, add the upstream repository as remote:
 
 ```
 git remote add --fetch secp256k1 https://github.com/bitcoin-core/secp256k1.git
 ```
+
+libbitcoinpqc-subtree-check.sh
+==============================
+Run this script from the root of the repository to verify the qbit-specific
+libbitcoinpqc subtree against the pinned upstream release tag:
+
+```
+test/lint/libbitcoinpqc-subtree-check.sh
+```
+
+The defaults match `doc/subtrees/libbitcoinpqc.md`; `LIBBITCOINPQC_REMOTE_URL`
+and `LIBBITCOINPQC_REMOTE_REF` can be overridden when testing a future tagged
+release before changing the defaults.
+
+This check fetches the pinned `Qbit-Org/qbit-libbitcoinpqc` release tag and
+verifies that both `HEAD:src/libbitcoinpqc` and the recorded
+`git-subtree-split` match the peeled tag commit. For the full libbitcoinpqc
+subtree workflow, see
+[`doc/subtrees/libbitcoinpqc.md`](../../doc/subtrees/libbitcoinpqc.md).
 
 lint-libbitcoinpqc-vectors.py
 =============================
@@ -123,13 +135,12 @@ vector wiring in `src/libbitcoinpqc/sphincsplus`:
 test/lint/lint-libbitcoinpqc-vectors.py
 ```
 
-If the curated subtree still contains the upstream NIST KAT generator sources,
-the lint regenerates a reference vector and checks it against `SHA256SUMS`.
-If those sources were pruned from the curated qbit subtree, the lint falls back
-to static bounded30 guard checks and treats the prune as expected. A partially
-present KAT payload, or a missing implementation directory, is treated as an
-error so accidental subtree corruption does not silently bypass vector
-coverage.
+If the upstream tag contains the NIST KAT generator sources, the lint
+regenerates a reference vector and checks it against `SHA256SUMS`. If those
+sources are absent from the upstream tag, the lint falls back to static
+bounded30 guard checks. A partially present KAT payload, or a missing
+implementation directory, is treated as an error so accidental subtree
+corruption does not silently bypass vector coverage.
 
 lint-qbit-node-defaults.py
 ==========================

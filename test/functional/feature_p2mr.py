@@ -4,11 +4,19 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Functional coverage for P2MR wallet flows and script-path spends."""
 
+import json
 import re
 from decimal import Decimal
+from pathlib import Path
 
 from test_framework.authproxy import JSONRPCException
-from test_framework.blocktools import COINBASE_MATURITY, MAX_STANDARD_TX_WEIGHT
+from test_framework.blocktools import (
+    COINBASE_MATURITY,
+    MAX_STANDARD_TX_WEIGHT,
+    add_witness_commitment,
+    create_block,
+    create_coinbase,
+)
 from test_framework.descriptors import descsum_create
 from test_framework.messages import (
     COutPoint,
@@ -163,6 +171,15 @@ class FeatureP2MRTest(BitcoinTestFramework):
         tx.wit.vtxinwit = [CTxInWitness()]
         tx.wit.vtxinwit[0].scriptWitness.stack = witness_stack
         return tx
+
+    def make_witness_block(self, tx: CTransaction):
+        tip = self.nodes[0].getbestblockhash()
+        next_height = self.nodes[0].getblockcount() + 1
+        block_time = self.nodes[0].getblockheader(tip)["mediantime"] + 1
+        block = create_block(int(tip, 16), create_coinbase(next_height), block_time, txlist=[tx])
+        add_witness_commitment(block)
+        block.solve()
+        return block
 
     def p2mr_stack_items_for_total_bytes(self, total_bytes: int) -> list[bytes]:
         stack_items = []
@@ -515,6 +532,62 @@ class FeatureP2MRTest(BitcoinTestFramework):
         ])
         self.assert_rejected(tx, "Taproot version reserved for soft-fork upgrades")
 
+    def test_rawmr_future_leaf_escape_hatch(self, node, miner, p2mr_master_xprv: str, pubkey_hex: str):
+        self.log.info("rawmr future-leaf output derives, funds, rejects under policy, and remains consensus-valid")
+        leaf_script = CScript([bytes.fromhex(pubkey_hex), OP_CHECKSIGPQC])
+        merkle_root = p2mr_tapleaf_hash(leaf_script, P2MR_ARBITRARY_UNKNOWN_LEAF_VERSION)
+        control_block = p2mr_control_block(leaf_version=P2MR_ARBITRARY_UNKNOWN_LEAF_VERSION)
+        rawmr_desc = descsum_create(f"rawmr({merkle_root.hex()})")
+        rawmr_addr = node.deriveaddresses(rawmr_desc)[0]
+        rawmr_info = node.validateaddress(rawmr_addr)
+        assert_equal(rawmr_info["isvalid"], True)
+        assert_equal(rawmr_info["witness_version"], 2)
+        assert_equal(rawmr_info["scriptPubKey"], f"5220{merkle_root.hex()}")
+
+        amount = Decimal("0.00200000")
+        funding_txid = miner.sendtoaddress(rawmr_addr, amount)
+        self.mine(miner, 1)
+        utxo = self.find_utxo_for_address(miner, funding_txid, rawmr_addr)
+        assert_equal(utxo["amount"], amount)
+        amount_sat = int(amount * Decimal("100000000"))
+
+        spending_raw = node.createrawtransaction(
+            [{"txid": utxo["txid"], "vout": utxo["vout"]}],
+            {miner.getnewaddress(): amount - Decimal("0.00001000")},
+        )
+        prevout = {
+            "txid": utxo["txid"],
+            "vout": utxo["vout"],
+            "scriptPubKey": rawmr_info["scriptPubKey"],
+            "amount": amount,
+            "p2mrScript": bytes(leaf_script).hex(),
+            "p2mrControlBlock": control_block.hex(),
+        }
+        key_expr = f"pqc({p2mr_master_xprv}/87h/1h/0h/0/0)"
+        signed = node.signrawtransactionwithkey(spending_raw, [key_expr], [prevout])
+        assert_equal(signed["complete"], False)
+        assert "errors" in signed
+
+        tx = self.create_spend_tx(
+            {"txid": utxo["txid"], "vout": utxo["vout"], "amount": amount_sat},
+            [bytes(leaf_script), control_block],
+        )
+        tx_hex = tx.serialize().hex()
+        policy_result = node.testmempoolaccept([tx_hex])[0]
+        assert_equal(policy_result["allowed"], False)
+        assert "Taproot version reserved for soft-fork upgrades" in policy_result["reject-reason"]
+        assert_raises_rpc_error(
+            -26,
+            "Taproot version reserved for soft-fork upgrades",
+            node.sendrawtransaction,
+            tx_hex,
+        )
+
+        block = self.make_witness_block(tx)
+        assert_equal(None, node.submitblock(block.serialize().hex()))
+        assert_equal(node.getbestblockhash(), block.hash_hex)
+        self.script_wallet.rescan_utxos()
+
     def test_non_32_byte_pubkey_consensus_rejection(self):
         self.log.info("Reject non-32-byte P2MR pubkey size")
         malformed_pubkey = bytes([0x44] * 33)
@@ -524,6 +597,166 @@ class FeatureP2MRTest(BitcoinTestFramework):
         dummy_sig = bytes(PQC_SIG_SIZE)
         tx = self.create_spend_tx(utxo, [dummy_sig, bytes(leaf_script), p2mr_control_block()])
         self.assert_rejected(tx, "Public key is neither compressed or uncompressed")
+
+    def load_data_pqc_hash_fixture(self):
+        path = (
+            Path(self.config["environment"]["SRCDIR"])
+            / "src/test/data/p2mr_datapqchash_vectors.json"
+        )
+        with path.open(encoding="utf-8") as fixture_file:
+            data = json.load(fixture_file)
+        assert_equal(data["schema_version"], 1)
+        assert_equal(len(data["vectors"]), 1)
+        return data["vectors"][0]
+
+    def proof_from_data_pqc_hash_fixture(self, fixture):
+        return {
+            "address": fixture["address"],
+            "message_hash": fixture["message_hash"],
+            "signature": fixture["signature"],
+            "pubkey": fixture["pubkey"],
+            "leaf_script": fixture["leaf_script"],
+            "control_block": fixture["control_block"],
+            "leaf_version": fixture["leaf_version"],
+            "proof_mode": fixture["proof_mode"],
+            # Informational fields from signdatapqchash output; verifydatapqchash recomputes them.
+            "datasig_hash": fixture["datasig_hash"],
+            "p2mr_merkle_root": fixture["p2mr_merkle_root"],
+            "domain": fixture["domain"],
+            "algorithm": fixture["algorithm"],
+        }
+
+    def test_data_pqc_hash_rpc_fixture(self, node, p2mr_wallet):
+        self.log.info("Verify pinned P2MR data-hash proof fixture")
+        fixture = self.load_data_pqc_hash_fixture()
+        assert_equal(fixture["network"], "regtest")
+        assert_equal(fixture["domain"], "QbitDataSigPQC")
+        assert_equal(fixture["algorithm"], "SLH-DSA-SHA2-128s-bounded30")
+        assert_equal(fixture["proof_mode"], "p2mr-pubkey")
+        assert_equal(fixture["leaf_version"], P2MR_LEAF_VERSION)
+        assert_equal(len(fixture["signature"]), PQC_SIG_SIZE * 2)
+        assert_equal(fixture["leaf_script"], f"20{fixture['pubkey']}b3")
+
+        proof = self.proof_from_data_pqc_hash_fixture(fixture)
+        verified = node.verifydatapqchash(proof)
+        assert_equal(verified["valid"], True)
+        assert_equal(verified["address"], fixture["address"])
+        assert_equal(verified["message_hash"], fixture["message_hash"])
+        assert_equal(verified["datasig_hash"], fixture["datasig_hash"])
+        assert_equal(verified["pubkey"], fixture["pubkey"])
+        assert_equal(verified["proof_mode"], fixture["proof_mode"])
+        assert_equal(verified["p2mr_merkle_root"], fixture["p2mr_merkle_root"])
+
+        self.log.info("verifydatapqchash ignores contradictory informational fields and returns recomputed values")
+        wrong_extra = dict(proof)
+        wrong_extra["datasig_hash"] = "00" * 32
+        wrong_extra["p2mr_merkle_root"] = "11" * 32
+        recomputed = node.verifydatapqchash(wrong_extra)
+        assert_equal(recomputed["valid"], True)
+        assert_equal(recomputed["datasig_hash"], fixture["datasig_hash"])
+        assert_equal(recomputed["p2mr_merkle_root"], fixture["p2mr_merkle_root"])
+
+        wrong_message = dict(proof)
+        wrong_message["message_hash"] = "22" * 32
+        invalid = node.verifydatapqchash(wrong_message)
+        assert_equal(invalid["valid"], False)
+        assert_equal(invalid["error"], "signature does not verify")
+
+        wrong_signature = dict(proof)
+        wrong_signature["signature"] = (
+            proof["signature"][:-2]
+            + ("00" if proof["signature"][-2:] != "00" else "01")
+        )
+        invalid = node.verifydatapqchash(wrong_signature)
+        assert_equal(invalid["valid"], False)
+        assert_equal(invalid["error"], "signature does not verify")
+
+        wrong_leaf = dict(proof)
+        wrong_leaf["leaf_script"] = f"20{'00' * 32}b3"
+        invalid = node.verifydatapqchash(wrong_leaf)
+        assert_equal(invalid["valid"], False)
+        assert_equal(invalid["error"], "leaf_script is not a single-key P2MR pubkey leaf for pubkey")
+
+        malformed_leaf = dict(proof)
+        malformed_leaf["leaf_script"] = "51"
+        invalid = node.verifydatapqchash(malformed_leaf)
+        assert_equal(invalid["valid"], False)
+        assert_equal(invalid["error"], "leaf_script is not a single-key P2MR pubkey leaf for pubkey")
+
+        wrong_address = dict(proof)
+        wrong_address["address"] = p2mr_wallet.getnewaddress(address_type="p2mr")
+        invalid = node.verifydatapqchash(wrong_address)
+        assert_equal(invalid["valid"], False)
+        assert_equal(invalid["error"], "leaf_script/control_block do not match address")
+
+        wrong_control = dict(proof)
+        wrong_control["control_block"] = (
+            proof["control_block"][:-2]
+            + ("00" if proof["control_block"][-2:] != "00" else "01")
+        )
+        invalid = node.verifydatapqchash(wrong_control)
+        assert_equal(invalid["valid"], False)
+        assert_equal(invalid["error"], "leaf_script/control_block do not match address")
+
+        unsupported_leaf = dict(proof)
+        unsupported_leaf["leaf_version"] = P2MR_ARBITRARY_UNKNOWN_LEAF_VERSION
+        invalid = node.verifydatapqchash(unsupported_leaf)
+        assert_equal(invalid["valid"], False)
+        assert_equal(invalid["error"], "unsupported P2MR leaf version")
+
+        bad_mode = dict(proof)
+        bad_mode["proof_mode"] = "raw-pubkey"
+        assert_raises_rpc_error(
+            -8,
+            "Only proof_mode \"p2mr-pubkey\" is currently supported",
+            node.verifydatapqchash,
+            bad_mode,
+        )
+
+        bad_message_size = dict(proof)
+        bad_message_size["message_hash"] = "11" * 31
+        assert_raises_rpc_error(
+            -8,
+            "message_hash must be exactly 32 bytes",
+            node.verifydatapqchash,
+            bad_message_size,
+        )
+
+        bad_signature_size = dict(proof)
+        bad_signature_size["signature"] = proof["signature"][:-2]
+        assert_raises_rpc_error(
+            -8,
+            "signature must be exactly 3680 bytes",
+            node.verifydatapqchash,
+            bad_signature_size,
+        )
+
+        bad_pubkey_size = dict(proof)
+        bad_pubkey_size["pubkey"] = "00" * 31
+        assert_raises_rpc_error(
+            -8,
+            "pubkey must be exactly 32 bytes",
+            node.verifydatapqchash,
+            bad_pubkey_size,
+        )
+
+        bad_control_size = dict(proof)
+        bad_control_size["control_block"] = "c100"
+        assert_raises_rpc_error(
+            -8,
+            "Invalid P2MR control block size",
+            node.verifydatapqchash,
+            bad_control_size,
+        )
+
+        bad_control_version = dict(proof)
+        bad_control_version["control_block"] = "c3" + proof["control_block"][2:]
+        assert_raises_rpc_error(
+            -8,
+            "leaf_version does not match control_block",
+            node.verifydatapqchash,
+            bad_control_version,
+        )
 
     def test_data_pqc_hash_rpc(self, node, p2mr_wallet):
         self.log.info("Sign and verify an arbitrary data hash with a wallet-owned P2MR pubkey leaf")
@@ -784,7 +1017,8 @@ class FeatureP2MRTest(BitcoinTestFramework):
         self.script_wallet.rescan_utxos()
         assert self.script_wallet.get_utxos(mark_as_spent=False)
 
-        self.log.info("3/20 signdatapqchash/verifydatapqchash sign and verify P2MR pubkey proofs")
+        self.log.info("3/20 signdatapqchash/verifydatapqchash pinned fixture and wallet round-trip coverage")
+        self.test_data_pqc_hash_rpc_fixture(node, p2mr_wallet)
         self.test_data_pqc_hash_rpc(node, p2mr_wallet)
 
         self.log.info("4/20 send/receive to P2MR address")
@@ -1079,6 +1313,12 @@ class FeatureP2MRTest(BitcoinTestFramework):
         self.test_checkdatasigpqc_validation_errors()
         self.test_malformed_max_size_signature_rejection()
         self.test_unknown_leaf_policy_rejection()
+        self.test_rawmr_future_leaf_escape_hatch(
+            node,
+            miner,
+            p2mr_master_xprv,
+            self.extract_p2mr_pubkey(first_p2mr_info["desc"]),
+        )
         self.test_non_32_byte_pubkey_consensus_rejection()
         self.test_stack_item_policy_rejection()
         self.test_large_stack_policy_acceptance()

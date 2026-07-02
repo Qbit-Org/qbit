@@ -242,6 +242,10 @@ fn lint_subtree() -> LintResult {
             .expect("command_error")
             .success();
     }
+    good &= Command::new("test/lint/libbitcoinpqc-subtree-check.sh")
+        .status()
+        .expect("command_error")
+        .success();
     if good {
         Ok(())
     } else {

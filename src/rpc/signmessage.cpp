@@ -4,6 +4,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <common/signmessage.h>
+#include <common/p2mr_data_signature.h>
 #include <crypto/pqc.h>
 #include <key.h>
 #include <key_io.h>
@@ -225,11 +226,6 @@ static RPCHelpMan verifydatapqchash()
 
             const std::vector<unsigned char> leaf_script_bytes{ParseHexV(proof.find_value("leaf_script"), "leaf_script")};
             const CScript leaf_script{leaf_script_bytes.begin(), leaf_script_bytes.end()};
-            const std::optional<CPQCPubKey> leaf_pubkey{p2mr::MatchPK(leaf_script)};
-            if (!leaf_pubkey || *leaf_pubkey != pubkey) {
-                return InvalidDataPQCProof("leaf_script is not a single-key P2MR pubkey leaf for pubkey");
-            }
-
             const int leaf_version_int{proof.find_value("leaf_version").getInt<int>()};
             if (leaf_version_int < 0 || leaf_version_int > 0xff) {
                 throw JSONRPCError(RPC_INVALID_PARAMETER, "leaf_version out of range");
@@ -251,15 +247,20 @@ static RPCHelpMan verifydatapqchash()
                 throw JSONRPCError(RPC_INVALID_PARAMETER, "leaf_version does not match control_block");
             }
 
-            const uint256 leaf_hash{ComputeP2MRLeafHash(leaf_version, leaf_script_bytes)};
-            const uint256 merkle_root{ComputeP2MRMerkleRoot(control_block, leaf_hash)};
-            if (merkle_root != output->GetMerkleRoot()) {
-                return InvalidDataPQCProof("leaf_script/control_block do not match address");
-            }
-
             const uint256 datasig_hash{ComputeQbitDataSigPQCHash(std::span<const unsigned char>{message_hash.begin(), message_hash.end()})};
-            if (!pubkey.Verify(datasig_hash, signature)) {
-                return InvalidDataPQCProof("signature does not verify");
+            const common::P2MRDataSignatureProof data_proof{
+                .output = *output,
+                .message_hash = message_hash,
+                .datasig_hash = datasig_hash,
+                .pubkey = pubkey,
+                .signature = signature,
+                .leaf_script = leaf_script,
+                .control_block = control_block,
+                .leaf_version = leaf_version,
+            };
+            const common::P2MRDataSignatureVerification verification{common::VerifyP2MRDataSignatureProof(data_proof)};
+            if (!verification.valid) {
+                return InvalidDataPQCProof(verification.error);
             }
 
             UniValue result{UniValue::VOBJ};
@@ -269,7 +270,7 @@ static RPCHelpMan verifydatapqchash()
             result.pushKV("datasig_hash", HashToHex(datasig_hash));
             result.pushKV("pubkey", HexStr(pubkey_bytes));
             result.pushKV("proof_mode", proof_mode);
-            result.pushKV("p2mr_merkle_root", HashToHex(merkle_root));
+            result.pushKV("p2mr_merkle_root", HashToHex(verification.p2mr_merkle_root));
             return result;
         },
     };

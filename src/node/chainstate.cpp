@@ -17,6 +17,7 @@
 #include <txdb.h>
 #include <uint256.h>
 #include <util/fs.h>
+#include <util/result.h>
 #include <util/signalinterrupt.h>
 #include <util/time.h>
 #include <util/translation.h>
@@ -33,7 +34,8 @@ namespace node {
 // to ChainstateManager::InitializeChainstate().
 static ChainstateLoadResult CompleteChainstateInitialization(
     ChainstateManager& chainman,
-    const ChainstateLoadOptions& options) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+    const ChainstateLoadOptions& options,
+    bool snapshot_chainstate_loaded) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
 {
     if (chainman.m_interrupt) return {ChainstateLoadStatus::INTERRUPTED, {}};
 
@@ -64,17 +66,28 @@ static ChainstateLoadResult CompleteChainstateInitialization(
     }
 
     if (options.wipe_chainstate_db && chainman.m_blockman.m_have_witness_pruned) {
-        if (chainman.AssumedValidBlock().IsNull()) {
-            return {ChainstateLoadStatus::FAILURE_FATAL,
-                    _("Cannot use -reindex-chainstate on a witness-pruned node without "
-                      "-assumevalid=<hash>. Without an assumed-valid checkpoint, historical "
-                      "script validation requires witness data that has been stripped. Pass "
-                      "-assumevalid=<block hash> to skip historical script validation, or "
-                      "delete the data directory and perform a fresh sync.")};
+        auto assumevalid_check{chainman.CheckAssumeValidCoversWitnessPrunedHistory()};
+        if (!assumevalid_check) {
+            return {ChainstateLoadStatus::FAILURE_FATAL, util::ErrorString(assumevalid_check)};
         }
         LogInfo("Witness-pruned node: -reindex-chainstate proceeding under assumevalid=%s. "
-                "The supplied hash must be above the witness-pruned range.",
+                "The supplied hash covers the witness-pruned range.",
                 chainman.AssumedValidBlock().ToString());
+    }
+
+    if (options.wipe_chainstate_db) {
+        bool has_snapshot{snapshot_chainstate_loaded};
+        if (!has_snapshot) {
+            // Delay snapshot activation until after the witness-pruned preflight
+            // so an unusable -assumevalid value cannot delete snapshot state.
+            has_snapshot = chainman.DetectSnapshotChainstate();
+        }
+        if (has_snapshot) {
+            LogInfo("[snapshot] deleting snapshot chainstate due to reindexing");
+            if (!chainman.DeleteSnapshotChainstate()) {
+                return {ChainstateLoadStatus::FAILURE_FATAL, Untranslated("Couldn't remove snapshot chainstate.")};
+            }
+        }
     }
 
     // At this point blocktree args are consistent with what's on disk.
@@ -187,17 +200,15 @@ ChainstateLoadResult LoadChainstate(ChainstateManager& chainman, const CacheSize
     // Load the fully validated chainstate.
     chainman.InitializeChainstate(options.mempool);
 
-    // Load a chain created from a UTXO snapshot, if any exist.
-    bool has_snapshot = chainman.DetectSnapshotChainstate();
-
-    if (has_snapshot && options.wipe_chainstate_db) {
-        LogInfo("[snapshot] deleting snapshot chainstate due to reindexing");
-        if (!chainman.DeleteSnapshotChainstate()) {
-            return {ChainstateLoadStatus::FAILURE_FATAL, Untranslated("Couldn't remove snapshot chainstate.")};
-        }
+    // Load a chain created from a UTXO snapshot, if any exist. When the
+    // chainstate will be wiped, this is delayed until after the block index is
+    // loaded and any witness-pruned assumevalid preflight has succeeded.
+    bool snapshot_chainstate_loaded{false};
+    if (!options.wipe_chainstate_db) {
+        snapshot_chainstate_loaded = chainman.DetectSnapshotChainstate();
     }
 
-    auto [init_status, init_error] = CompleteChainstateInitialization(chainman, options);
+    auto [init_status, init_error] = CompleteChainstateInitialization(chainman, options, snapshot_chainstate_loaded);
     if (init_status != ChainstateLoadStatus::SUCCESS) {
         return {init_status, init_error};
     }
@@ -233,7 +244,7 @@ ChainstateLoadResult LoadChainstate(ChainstateManager& chainman, const CacheSize
         // for the fully validated chainstate.
         chainman.ActiveChainstate().ClearBlockIndexCandidates();
 
-        auto [init_status, init_error] = CompleteChainstateInitialization(chainman, options);
+        auto [init_status, init_error] = CompleteChainstateInitialization(chainman, options, /*snapshot_chainstate_loaded=*/false);
         if (init_status != ChainstateLoadStatus::SUCCESS) {
             return {init_status, init_error};
         }

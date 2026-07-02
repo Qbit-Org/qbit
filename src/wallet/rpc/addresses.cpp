@@ -55,27 +55,34 @@ RPCHelpMan getnewaddress()
 {
     std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return UniValue::VNULL;
+    WalletContext& context = EnsureWalletContext(request.context);
 
-    LOCK(pwallet->cs_wallet);
+    OutputType output_type;
+    UniValue encoded_dest;
+    {
+        LOCK(pwallet->cs_wallet);
 
-    if (!pwallet->CanGetAddresses()) {
-        throw JSONRPCError(RPC_WALLET_ERROR, "Error: This wallet has no available keys");
+        if (!pwallet->CanGetAddresses()) {
+            throw JSONRPCError(RPC_WALLET_ERROR, "Error: This wallet has no available keys");
+        }
+
+        // Parse the label first so we don't generate a key if there's an error
+        const std::string label{LabelFromValue(request.params[0])};
+
+        output_type = pwallet->m_default_address_type;
+        if (!request.params[1].isNull()) {
+            output_type = ParseWalletOutputType(*pwallet, request.params[1].get_str(), "address type", /*internal=*/false);
+        }
+
+        auto op_dest = pwallet->GetNewDestination(output_type, label);
+        if (!op_dest) {
+            throw JSONRPCError(RPC_WALLET_KEYPOOL_RAN_OUT, util::ErrorString(op_dest).original);
+        }
+        encoded_dest = UniValue{EncodeDestination(*op_dest)};
     }
 
-    // Parse the label first so we don't generate a key if there's an error
-    const std::string label{LabelFromValue(request.params[0])};
-
-    OutputType output_type = pwallet->m_default_address_type;
-    if (!request.params[1].isNull()) {
-        output_type = ParseWalletOutputType(*pwallet, request.params[1].get_str(), "address type", /*internal=*/false);
-    }
-
-    auto op_dest = pwallet->GetNewDestination(output_type, label);
-    if (!op_dest) {
-        throw JSONRPCError(RPC_WALLET_KEYPOOL_RAN_OUT, util::ErrorString(op_dest).original);
-    }
-
-    return EncodeDestination(*op_dest);
+    MaybeScheduleP2MRKeyPoolRefill(context, pwallet, output_type, /*internal=*/false);
+    return encoded_dest;
 },
     };
 }
@@ -100,23 +107,31 @@ RPCHelpMan getrawchangeaddress()
 {
     std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return UniValue::VNULL;
+    WalletContext& context = EnsureWalletContext(request.context);
 
-    LOCK(pwallet->cs_wallet);
+    OutputType output_type;
+    UniValue encoded_dest;
+    {
+        LOCK(pwallet->cs_wallet);
 
-    if (!pwallet->CanGetAddresses(true)) {
-        throw JSONRPCError(RPC_WALLET_ERROR, "Error: This wallet has no available keys");
+        if (!pwallet->CanGetAddresses(true)) {
+            throw JSONRPCError(RPC_WALLET_ERROR, "Error: This wallet has no available keys");
+        }
+
+        output_type = pwallet->m_default_change_type.value_or(pwallet->m_default_address_type);
+        if (!request.params[0].isNull()) {
+            output_type = ParseWalletOutputType(*pwallet, request.params[0].get_str(), "address type", /*internal=*/true);
+        }
+
+        auto op_dest = pwallet->GetNewChangeDestination(output_type, /*allow_internal_p2mr_refill=*/false);
+        if (!op_dest) {
+            throw JSONRPCError(RPC_WALLET_KEYPOOL_RAN_OUT, util::ErrorString(op_dest).original);
+        }
+        encoded_dest = UniValue{EncodeDestination(*op_dest)};
     }
 
-    OutputType output_type = pwallet->m_default_change_type.value_or(pwallet->m_default_address_type);
-    if (!request.params[0].isNull()) {
-        output_type = ParseWalletOutputType(*pwallet, request.params[0].get_str(), "address type", /*internal=*/true);
-    }
-
-    auto op_dest = pwallet->GetNewChangeDestination(output_type);
-    if (!op_dest) {
-        throw JSONRPCError(RPC_WALLET_KEYPOOL_RAN_OUT, util::ErrorString(op_dest).original);
-    }
-    return EncodeDestination(*op_dest);
+    MaybeScheduleP2MRKeyPoolRefill(context, pwallet, output_type, /*internal=*/true);
+    return encoded_dest;
 },
     };
 }

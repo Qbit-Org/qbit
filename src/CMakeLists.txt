@@ -102,6 +102,7 @@ add_library(bitcoin_common STATIC EXCLUDE_FROM_ALL
   common/interfaces.cpp
   common/messages.cpp
   common/netif.cpp
+  common/p2mr_data_signature.cpp
   common/pcp.cpp
   common/run_command.cpp
   common/settings.cpp
