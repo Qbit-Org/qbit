@@ -28,6 +28,15 @@ UniValue LoadPinnedDataPQCVector()
     return vectors[0];
 }
 
+template <typename ByteRange>
+bool ByteRangeLess(const ByteRange& left, const ByteRange& right)
+{
+    for (size_t i{0}; i < left.size() && i < right.size(); ++i) {
+        if (left[i] != right[i]) return left[i] < right[i];
+    }
+    return left.size() < right.size();
+}
+
 BOOST_FIXTURE_TEST_SUITE(wallet_p2mr_descriptor_tests, WalletTestingSetup)
 
 BOOST_AUTO_TEST_CASE(DescriptorTopUpWithDBThrowsWhenP2MRPersistenceNeedsLockedKey)
@@ -183,7 +192,7 @@ BOOST_AUTO_TEST_CASE(P2MRDataHashSigningRetriesLaterLeavesAfterRuntimeFailure)
     CScript first_leaf{p2mr::BuildPKScript(first_pubkey)};
     CScript second_leaf{p2mr::BuildPKScript(second_pubkey)};
 
-    if (ToBytes(second_leaf) < ToBytes(first_leaf)) {
+    if (ByteRangeLess(ToBytes(second_leaf), ToBytes(first_leaf))) {
         std::swap(first_key, second_key);
         std::swap(first_pubkey, second_pubkey);
         std::swap(first_leaf, second_leaf);
@@ -296,7 +305,7 @@ BOOST_AUTO_TEST_CASE(P2MRDataHashSigningReportsCommittedFailedLeafReservation)
     CScript first_leaf{p2mr::BuildPKScript(first_pubkey)};
     CScript second_leaf{p2mr::BuildPKScript(second_pubkey)};
 
-    if (ToBytes(second_leaf) < ToBytes(first_leaf)) {
+    if (ByteRangeLess(ToBytes(second_leaf), ToBytes(first_leaf))) {
         std::swap(first_key, second_key);
         std::swap(first_pubkey, second_pubkey);
         std::swap(first_leaf, second_leaf);

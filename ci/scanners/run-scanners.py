@@ -265,6 +265,12 @@ def history_log_opts(source: Path, args: argparse.Namespace) -> str:
     return f"{base_commit}..{source_commit}"
 
 
+def decode_command_output(output: bytes | str | None) -> str:
+    if isinstance(output, bytes):
+        return output.decode("utf-8", errors="replace")
+    return output or ""
+
+
 def run_text_command(command: list[str], cwd: Path, env: dict[str, str] | None = None) -> tuple[int, str, str]:
     try:
         completed = subprocess.run(
@@ -272,21 +278,14 @@ def run_text_command(command: list[str], cwd: Path, env: dict[str, str] | None =
             cwd=cwd,
             env=env,
             capture_output=True,
-            text=True,
             check=False,
             timeout=60,
         )
     except subprocess.TimeoutExpired as exc:
-        stdout = (
-            exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-        )
-        stderr = (
-            exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
-        )
-        return 124, stdout, stderr
+        return 124, decode_command_output(exc.stdout), decode_command_output(exc.stderr)
     except OSError as exc:
         return 127, "", f"{type(exc).__name__}: {exc}"
-    return completed.returncode, completed.stdout, completed.stderr
+    return completed.returncode, decode_command_output(completed.stdout), decode_command_output(completed.stderr)
 
 
 def git_command(source: Path, *args: str) -> tuple[int, str, str]:
