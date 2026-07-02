@@ -10,7 +10,13 @@ from decimal import Decimal
 from pathlib import Path
 
 from test_framework.authproxy import JSONRPCException
-from test_framework.blocktools import COINBASE_MATURITY, MAX_STANDARD_TX_WEIGHT
+from test_framework.blocktools import (
+    COINBASE_MATURITY,
+    MAX_STANDARD_TX_WEIGHT,
+    add_witness_commitment,
+    create_block,
+    create_coinbase,
+)
 from test_framework.descriptors import descsum_create
 from test_framework.messages import (
     COutPoint,
@@ -165,6 +171,15 @@ class FeatureP2MRTest(BitcoinTestFramework):
         tx.wit.vtxinwit = [CTxInWitness()]
         tx.wit.vtxinwit[0].scriptWitness.stack = witness_stack
         return tx
+
+    def make_witness_block(self, tx: CTransaction):
+        tip = self.nodes[0].getbestblockhash()
+        next_height = self.nodes[0].getblockcount() + 1
+        block_time = self.nodes[0].getblockheader(tip)["mediantime"] + 1
+        block = create_block(int(tip, 16), create_coinbase(next_height), block_time, txlist=[tx])
+        add_witness_commitment(block)
+        block.solve()
+        return block
 
     def p2mr_stack_items_for_total_bytes(self, total_bytes: int) -> list[bytes]:
         stack_items = []
@@ -516,6 +531,62 @@ class FeatureP2MRTest(BitcoinTestFramework):
             p2mr_control_block(leaf_version=P2MR_ARBITRARY_UNKNOWN_LEAF_VERSION),
         ])
         self.assert_rejected(tx, "Taproot version reserved for soft-fork upgrades")
+
+    def test_rawmr_future_leaf_escape_hatch(self, node, miner, p2mr_master_xprv: str, pubkey_hex: str):
+        self.log.info("rawmr future-leaf output derives, funds, rejects under policy, and remains consensus-valid")
+        leaf_script = CScript([bytes.fromhex(pubkey_hex), OP_CHECKSIGPQC])
+        merkle_root = p2mr_tapleaf_hash(leaf_script, P2MR_ARBITRARY_UNKNOWN_LEAF_VERSION)
+        control_block = p2mr_control_block(leaf_version=P2MR_ARBITRARY_UNKNOWN_LEAF_VERSION)
+        rawmr_desc = descsum_create(f"rawmr({merkle_root.hex()})")
+        rawmr_addr = node.deriveaddresses(rawmr_desc)[0]
+        rawmr_info = node.validateaddress(rawmr_addr)
+        assert_equal(rawmr_info["isvalid"], True)
+        assert_equal(rawmr_info["witness_version"], 2)
+        assert_equal(rawmr_info["scriptPubKey"], f"5220{merkle_root.hex()}")
+
+        amount = Decimal("0.00200000")
+        funding_txid = miner.sendtoaddress(rawmr_addr, amount)
+        self.mine(miner, 1)
+        utxo = self.find_utxo_for_address(miner, funding_txid, rawmr_addr)
+        assert_equal(utxo["amount"], amount)
+        amount_sat = int(amount * Decimal("100000000"))
+
+        spending_raw = node.createrawtransaction(
+            [{"txid": utxo["txid"], "vout": utxo["vout"]}],
+            {miner.getnewaddress(): amount - Decimal("0.00001000")},
+        )
+        prevout = {
+            "txid": utxo["txid"],
+            "vout": utxo["vout"],
+            "scriptPubKey": rawmr_info["scriptPubKey"],
+            "amount": amount,
+            "p2mrScript": bytes(leaf_script).hex(),
+            "p2mrControlBlock": control_block.hex(),
+        }
+        key_expr = f"pqc({p2mr_master_xprv}/87h/1h/0h/0/0)"
+        signed = node.signrawtransactionwithkey(spending_raw, [key_expr], [prevout])
+        assert_equal(signed["complete"], False)
+        assert "errors" in signed
+
+        tx = self.create_spend_tx(
+            {"txid": utxo["txid"], "vout": utxo["vout"], "amount": amount_sat},
+            [bytes(leaf_script), control_block],
+        )
+        tx_hex = tx.serialize().hex()
+        policy_result = node.testmempoolaccept([tx_hex])[0]
+        assert_equal(policy_result["allowed"], False)
+        assert "Taproot version reserved for soft-fork upgrades" in policy_result["reject-reason"]
+        assert_raises_rpc_error(
+            -26,
+            "Taproot version reserved for soft-fork upgrades",
+            node.sendrawtransaction,
+            tx_hex,
+        )
+
+        block = self.make_witness_block(tx)
+        assert_equal(None, node.submitblock(block.serialize().hex()))
+        assert_equal(node.getbestblockhash(), block.hash_hex)
+        self.script_wallet.rescan_utxos()
 
     def test_non_32_byte_pubkey_consensus_rejection(self):
         self.log.info("Reject non-32-byte P2MR pubkey size")
@@ -1242,6 +1313,12 @@ class FeatureP2MRTest(BitcoinTestFramework):
         self.test_checkdatasigpqc_validation_errors()
         self.test_malformed_max_size_signature_rejection()
         self.test_unknown_leaf_policy_rejection()
+        self.test_rawmr_future_leaf_escape_hatch(
+            node,
+            miner,
+            p2mr_master_xprv,
+            self.extract_p2mr_pubkey(first_p2mr_info["desc"]),
+        )
         self.test_non_32_byte_pubkey_consensus_rejection()
         self.test_stack_item_policy_rejection()
         self.test_large_stack_policy_acceptance()
