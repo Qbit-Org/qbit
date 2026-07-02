@@ -18,7 +18,7 @@ Options:
   --build-dir DIR               CMake build directory (default: OUT/build)
   --upstream-repo OWNER/REPO    libbitcoinpqc upstream repo metadata
   --upstream-ref REF            libbitcoinpqc upstream ref metadata
-  --curated-subtree-ref REF     qbit subtree import commit metadata
+  --subtree-source-ref REF      libbitcoinpqc source tag metadata (default: --upstream-ref)
   --expected-subtree-tree SHA   fail if HEAD:src/libbitcoinpqc tree differs
   --threads N                  worker thread count (default: 8)
   --iterations N               per-thread iterations when duration is 0 (default: 2)
@@ -32,7 +32,7 @@ output_dir=""
 build_dir=""
 upstream_repo=""
 upstream_ref=""
-curated_subtree_ref=""
+subtree_source_ref=""
 expected_subtree_tree=""
 threads="8"
 iterations="2"
@@ -46,7 +46,7 @@ while [[ $# -gt 0 ]]; do
         --build-dir) build_dir="$2"; shift 2 ;;
         --upstream-repo) upstream_repo="$2"; shift 2 ;;
         --upstream-ref) upstream_ref="$2"; shift 2 ;;
-        --curated-subtree-ref) curated_subtree_ref="$2"; shift 2 ;;
+        --subtree-source-ref) subtree_source_ref="$2"; shift 2 ;;
         --expected-subtree-tree) expected_subtree_tree="$2"; shift 2 ;;
         --threads) threads="$2"; shift 2 ;;
         --iterations) iterations="$2"; shift 2 ;;
@@ -57,9 +57,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ -z "$output_dir" || -z "$upstream_repo" || -z "$upstream_ref" || -z "$curated_subtree_ref" ]]; then
+if [[ -z "$output_dir" || -z "$upstream_repo" || -z "$upstream_ref" ]]; then
     usage >&2
     exit 2
+fi
+if [[ -z "$subtree_source_ref" ]]; then
+    subtree_source_ref="$upstream_ref"
 fi
 
 for numeric in threads iterations duration_seconds; do
@@ -104,7 +107,6 @@ build_status="not_run"
 tsan_smoke_status="not_run"
 harness_status="not_run"
 upstream_ref_status="not_run"
-curated_subtree_ref_status="not_run"
 actual_subtree_tree=""
 
 record_failure() {
@@ -125,15 +127,6 @@ do_validate_upstream_ref() {
     fi
 }
 
-do_validate_curated_subtree_ref() {
-    if validate_curated_subtree_ref "$source_dir" "$curated_subtree_ref" "$log_dir"; then
-        curated_subtree_ref_status="passed"
-    else
-        curated_subtree_ref_status="failed"
-        record_failure "failed to resolve curated subtree ref $curated_subtree_ref in qbit repository"
-    fi
-}
-
 qbit_commit="$(git -C "$source_dir" rev-parse HEAD 2>/dev/null || true)"
 run_url=""
 if [[ -n "${GITHUB_SERVER_URL:-}" && -n "${GITHUB_REPOSITORY:-}" && -n "${GITHUB_RUN_ID:-}" ]]; then
@@ -146,7 +139,7 @@ fi
     echo "source_dir=$source_dir"
     echo "upstream_repo=$upstream_repo"
     echo "upstream_ref=$upstream_ref"
-    echo "curated_subtree_ref=$curated_subtree_ref"
+    echo "subtree_source_ref=$subtree_source_ref"
     echo "expected_subtree_tree=$expected_subtree_tree"
     echo "github_run_url=$run_url"
     echo "github_ref=${GITHUB_REF:-}"
@@ -182,7 +175,6 @@ fi
 } > "$meta_dir/host.txt" 2>&1
 
 do_validate_upstream_ref
-do_validate_curated_subtree_ref
 
 if actual_subtree_tree="$(git -C "$source_dir" rev-parse HEAD:src/libbitcoinpqc 2>"$log_dir/subtree-tree.log")"; then
     printf '%s\n' "$actual_subtree_tree" > "$meta_dir/subtree-tree.txt"
@@ -302,7 +294,7 @@ export QBIT_COMMIT="$qbit_commit"
 export SOURCE_DIR="$source_dir"
 export UPSTREAM_REPO="$upstream_repo"
 export UPSTREAM_REF="$upstream_ref"
-export CURATED_SUBTREE_REF="$curated_subtree_ref"
+export SUBTREE_SOURCE_REF="$subtree_source_ref"
 export EXPECTED_SUBTREE_TREE="$expected_subtree_tree"
 export ACTUAL_SUBTREE_TREE="$actual_subtree_tree"
 export GITHUB_RUN_URL="$run_url"
@@ -311,7 +303,6 @@ export ITERATIONS="$iterations"
 export DURATION_SECONDS="$duration_seconds"
 export SANITIZER="$sanitizer"
 export UPSTREAM_REF_STATUS="$upstream_ref_status"
-export CURATED_SUBTREE_REF_STATUS="$curated_subtree_ref_status"
 export SUBTREE_CHECK_STATUS="$subtree_check_status"
 export TSAN_SMOKE_STATUS="$tsan_smoke_status"
 export CONFIGURE_STATUS="$configure_status"
@@ -343,7 +334,7 @@ summary = {
     "qbit_commit": os.environ["QBIT_COMMIT"],
     "upstream_repo": os.environ["UPSTREAM_REPO"],
     "upstream_ref": os.environ["UPSTREAM_REF"],
-    "curated_subtree_ref": os.environ["CURATED_SUBTREE_REF"],
+    "subtree_source_ref": os.environ["SUBTREE_SOURCE_REF"],
     "expected_subtree_tree": os.environ["EXPECTED_SUBTREE_TREE"],
     "actual_subtree_tree": os.environ["ACTUAL_SUBTREE_TREE"],
     "github_run_url": os.environ["GITHUB_RUN_URL"],
@@ -362,7 +353,6 @@ summary = {
     },
     "checks": {
         "upstream_ref": os.environ["UPSTREAM_REF_STATUS"],
-        "curated_subtree_ref": os.environ["CURATED_SUBTREE_REF_STATUS"],
         "subtree_tree": os.environ["SUBTREE_CHECK_STATUS"],
         "tsan_smoke": os.environ["TSAN_SMOKE_STATUS"],
         "cmake_configure": os.environ["CONFIGURE_STATUS"],
@@ -383,7 +373,7 @@ lines = [
     f"- Status: `{summary['status']}`",
     f"- qbit commit: `{summary['qbit_commit']}`",
     f"- upstream: `{summary['upstream_repo']}` @ `{summary['upstream_ref']}`",
-    f"- curated subtree ref: `{summary['curated_subtree_ref']}`",
+    f"- subtree source ref: `{summary['subtree_source_ref']}`",
     f"- expected subtree tree: `{summary['expected_subtree_tree']}`",
     f"- actual subtree tree: `{summary['actual_subtree_tree']}`",
     f"- GitHub run: {summary['github_run_url'] or '(not running in GitHub Actions)'}",
@@ -393,7 +383,6 @@ lines = [
     f"- iterations: `{summary['harness']['iterations']}`",
     f"- duration seconds: `{summary['harness']['duration_seconds']}`",
     f"- upstream ref check: `{summary['checks']['upstream_ref']}`",
-    f"- curated subtree ref check: `{summary['checks']['curated_subtree_ref']}`",
     f"- TSAN smoke: `{summary['checks']['tsan_smoke']}`",
     f"- CMake configure: `{summary['checks']['cmake_configure']}`",
     f"- CMake build: `{summary['checks']['cmake_build']}`",

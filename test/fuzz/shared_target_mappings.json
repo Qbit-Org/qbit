@@ -24,9 +24,9 @@
       "mapping_status": "external_upstream",
       "smoke_check": false,
       "upstream": {
-        "repo": "libbitcoinpqc-qbit",
-        "ref": "8ec06cc452c30ab12de00b704144e6139c1e9b3a",
-        "curated_subtree_ref": "8da5e95c83c3f12c9d178fd8e7576b871dd0f2b2",
+        "repo": "Qbit-Org/qbit-libbitcoinpqc",
+        "tag": "v0.3.0",
+        "peeled_commit": "ac72d1ffa0ef486f08d37334a43f5db1adb731db",
         "fuzz_manifest": "fuzz/Cargo.toml",
         "runner": "fuzz/run_all_fuzzers.sh",
         "commands": [
@@ -35,7 +35,7 @@
           "./fuzz/check_fuzz_inventory.sh"
         ]
       },
-      "notes": "The qbit curated subtree prunes cargo-fuzz tooling; run these concrete harnesses from the upstream libbitcoinpqc-qbit checkout at the recorded upstream ref."
+      "notes": "The qbit subtree is imported directly from the recorded upstream tag; run these concrete harnesses from src/libbitcoinpqc or from the matching upstream checkout."
     },
     {
       "target_id": "lane-a-pqc-wrapper",

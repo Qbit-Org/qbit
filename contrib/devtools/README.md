@@ -177,14 +177,14 @@ Example usage:
 update-libbitcoinpqc-subtree.sh
 ===============================
 
-Updates the `src/libbitcoinpqc` subtree from the curated upstream branch
-(`qbit-subtree` by default), then runs `test/lint/git-subtree-check.sh` to
-verify the subtree remains pure.
-Default source resolves from the local `origin` owner to
-`git@github.com:<owner>/libbitcoinpqc-qbit.git`.
+Updates the `src/libbitcoinpqc` subtree from the pinned upstream release tag,
+then runs `test/lint/libbitcoinpqc-subtree-check.sh` to verify that the vendored
+tree and recorded `git-subtree-split` match the peeled tag commit.
 
-For the full two-repo workflow (`develop` -> prune -> `qbit-subtree` -> qbit
-import), see [`doc/subtrees/libbitcoinpqc.md`](../../doc/subtrees/libbitcoinpqc.md).
+The default source is
+`https://github.com/Qbit-Org/qbit-libbitcoinpqc.git` tag `v0.3.0`. For the
+full release-tag import workflow, see
+[`doc/subtrees/libbitcoinpqc.md`](../../doc/subtrees/libbitcoinpqc.md).
 
 Run from the repository root:
 
@@ -195,7 +195,7 @@ contrib/devtools/update-libbitcoinpqc-subtree.sh
 Optional overrides:
 
 ```bash
-LIBBITCOINPQC_REMOTE_URL=git@github.com:your-org/libbitcoinpqc-qbit.git \
-LIBBITCOINPQC_REMOTE_REF=qbit-subtree \
+LIBBITCOINPQC_REMOTE_URL=git@github.com:Qbit-Org/qbit-libbitcoinpqc.git \
+LIBBITCOINPQC_REMOTE_REF=v0.3.0 \
 contrib/devtools/update-libbitcoinpqc-subtree.sh
 ```
