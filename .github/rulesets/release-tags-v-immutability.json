@@ -1,5 +1,5 @@
 {
-  "name": "public-release-tags-v",
+  "name": "public-release-tags-v-immutability",
   "target": "tag",
   "enforcement": "active",
   "bypass_actors": [
@@ -18,9 +18,6 @@
     }
   },
   "rules": [
-    {
-      "type": "creation"
-    },
     {
       "type": "update",
       "parameters": {
