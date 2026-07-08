@@ -14,6 +14,7 @@ on:
       - unlabeled
     branches:
       - main
+      - 1.0.0
       - 0.1.x
       - 1.0.0
       - 1.x.x
@@ -21,6 +22,7 @@ on:
   push:
     branches:
       - main
+      - 1.0.0
       - 0.1.x
       - 1.0.0
       - 1.x.x
@@ -28,6 +30,7 @@ on:
   merge_group:
     branches:
       - main
+      - 1.0.0
       - 0.1.x
       - 1.0.0
       - 1.x.x
