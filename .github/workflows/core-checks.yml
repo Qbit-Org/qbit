@@ -282,11 +282,15 @@ jobs:
 
       - name: Detect release file changes
         id: release_changes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_BEFORE: ${{ github.event.before }}
+          RELEASE_BASE_REF: ${{ github.base_ref || github.event.merge_group.base_ref }}
         run: |
           changed_files="$(mktemp)"
 
-          if [[ "${{ github.event_name }}" == "push" ]]; then
-            before="${{ github.event.before }}"
+          if [[ "${EVENT_NAME}" == "push" ]]; then
+            before="${EVENT_BEFORE}"
             if [[ -z "${before}" || "${before}" =~ ^0+$ ]]; then
               git fetch --no-tags --prune origin main
               merge_base="$(git merge-base origin/main HEAD 2>/dev/null || true)"
@@ -301,7 +305,7 @@ jobs:
               exit 0
             fi
           else
-            base_ref="${{ github.base_ref || github.event.merge_group.base_ref }}"
+            base_ref="${RELEASE_BASE_REF}"
             base_branch="${base_ref#refs/heads/}"
             if [[ -z "${base_branch}" ]]; then
               echo "Could not determine event base branch; running release validator tests."
