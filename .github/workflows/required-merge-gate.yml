@@ -15,16 +15,19 @@ on:
       - unlabeled
     branches:
       - main
+      - 1.0.0
       - 0.1.x
       - develop
   push:
     branches:
       - main
+      - 1.0.0
       - 0.1.x
       - develop
   merge_group:
     branches:
       - main
+      - 1.0.0
       - 0.1.x
       - develop
 
@@ -498,7 +501,11 @@ jobs:
           import json
           from pathlib import Path
 
-          for path in (Path(".github/rulesets/main.json"), Path(".github/rulesets/0.1.x.json")):
+          for path in (
+              Path(".github/rulesets/main.json"),
+              Path(".github/rulesets/1.0.0.json"),
+              Path(".github/rulesets/0.1.x.json"),
+          ):
               data = json.loads(path.read_text(encoding="utf8"))
               contexts = []
               for rule in data.get("rules", []):
