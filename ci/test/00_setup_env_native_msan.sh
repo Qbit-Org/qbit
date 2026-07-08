@@ -32,3 +32,39 @@ export BITCOIN_CONFIG="\
  -DAPPEND_CPPFLAGS='-U_FORTIFY_SOURCE' \
 "
 export USE_INSTRUMENTED_LIBCPP="MemoryWithOrigins"
+
+case "${MSAN_CI_PART:-}" in
+  "")
+    ;;
+  "unit")
+    export CONTAINER_NAME="ci_native_msan_unit"
+    export GOAL="all"
+    export RUN_UNIT_TESTS=true
+    export RUN_FUNCTIONAL_TESTS=false
+    BITCOIN_CONFIG+="\
+ -DBUILD_BITCOIN_BIN=OFF \
+ -DBUILD_DAEMON=OFF \
+ -DBUILD_CLI=OFF \
+ -DBUILD_TX=OFF \
+ -DBUILD_UTIL=OFF \
+ -DBUILD_WALLET_TOOL=OFF \
+"
+    ;;
+  "functional")
+    export CONTAINER_NAME="ci_native_msan_functional"
+    export RUN_UNIT_TESTS=false
+    export RUN_FUNCTIONAL_TESTS=true
+    BITCOIN_CONFIG+="\
+ -DBUILD_TESTS=OFF \
+ -DBUILD_TX=ON \
+ -DBUILD_UTIL=ON \
+ -DBUILD_WALLET_TOOL=ON \
+"
+    ;;
+  *)
+    echo "Unknown MSAN_CI_PART '${MSAN_CI_PART}'" >&2
+    exit 1
+    ;;
+esac
+
+export BITCOIN_CONFIG

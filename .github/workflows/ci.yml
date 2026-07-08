@@ -708,6 +708,7 @@ jobs:
       CI_DOCKER_RUN_CPUS: ${{ matrix.container-cpus || '8' }}
       CI_DOCKER_RUN_MEMORY: ${{ matrix.container-memory || '48g' }}
       CI_ENFORCE_INTERNAL_REGISTRY: ${{ github.repository == 'Qbit-Org/qbit' && matrix.file-env != './ci/test/00_setup_env_native_centos.sh' && '1' || '0' }}
+      MSAN_CI_PART: ${{ matrix.msan-ci-part || '' }}
 
     strategy:
       fail-fast: false
@@ -755,11 +756,19 @@ jobs:
             timeout-minutes: 200
             file-env: './ci/test/00_setup_env_native_tsan.sh'
 
-          - name: 'MSan, depends'
+          - name: 'MSan, depends, unit tests'
             cirrus-runner: 'ghcr.io/cirruslabs/ubuntu-runner-amd64:24.04-lg'
             fallback-runner: 'ubuntu-24.04'
             timeout-minutes: 200
             file-env: './ci/test/00_setup_env_native_msan.sh'
+            msan-ci-part: 'unit'
+
+          - name: 'MSan, depends, functional tests'
+            cirrus-runner: 'ghcr.io/cirruslabs/ubuntu-runner-amd64:24.04-lg'
+            fallback-runner: 'ubuntu-24.04'
+            timeout-minutes: 200
+            file-env: './ci/test/00_setup_env_native_msan.sh'
+            msan-ci-part: 'functional'
 
     steps:
       - *CHECKOUT
@@ -783,7 +792,7 @@ jobs:
         run: sed -i "s|\${INSTALL_BCC_TRACING_TOOLS}|true|g" ./ci/test/00_setup_env_native_asan.sh
 
       - name: Set mmap_rnd_bits
-        if: ${{ env.CONTAINER_NAME == 'ci_native_tsan' || env.CONTAINER_NAME == 'ci_native_msan' }}
+        if: ${{ env.CONTAINER_NAME == 'ci_native_tsan' || startsWith(env.CONTAINER_NAME, 'ci_native_msan') }}
         # Sanitizers can crash when ASLR entropy is too high (vm.mmap_rnd_bits > 28).
         # Some runners block sysctl writes but already have a compliant value.
         run: |
