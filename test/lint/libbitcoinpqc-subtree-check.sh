@@ -10,6 +10,8 @@ set -euo pipefail
 PREFIX="${LIBBITCOINPQC_PATH:-src/libbitcoinpqc}"
 REMOTE_URL="${LIBBITCOINPQC_REMOTE_URL:-https://github.com/Qbit-Org/qbit-libbitcoinpqc.git}"
 REMOTE_REF="${LIBBITCOINPQC_REMOTE_REF:-v0.3.0}"
+APPROVED_RUSTSEC_CROSSBEAM_PATCH="RUSTSEC-2026-0204-crossbeam-epoch-0.9.20"
+APPROVED_RUSTSEC_CROSSBEAM_DIFF_LINES=$'-version = "0.9.18"\n+version = "0.9.20"\n-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"\n+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"'
 
 usage() {
   cat <<EOF
@@ -37,6 +39,43 @@ resolve_remote_commit() {
   if ls_remote_output="$(git ls-remote --exit-code "${remote_url}" "${remote_ref}" 2>/dev/null)"; then
     printf '%s\n' "${ls_remote_output}" | awk 'NR==1 {print $1}'
   fi
+}
+
+approved_downstream_patch() {
+  local base_tree="$1"
+  local current_tree="$2"
+  local changed_paths
+  local changed_lines
+
+  changed_paths="$(git diff --name-only "${base_tree}" "${current_tree}")"
+  if [[ "${changed_paths}" != "Cargo.lock" ]]; then
+    return 1
+  fi
+
+  changed_lines="$(
+    git diff --unified=0 --no-ext-diff "${base_tree}" "${current_tree}" -- Cargo.lock |
+    awk '/^[-+]/ && $0 !~ /^(---|\+\+\+)/ {print}'
+  )"
+  [[ "${changed_lines}" == "${APPROVED_RUSTSEC_CROSSBEAM_DIFF_LINES}" ]]
+}
+
+verify_tree_match_or_approved_patch() {
+  local base_tree="$1"
+  local current_tree="$2"
+  local failure_message="$3"
+
+  if [[ "${current_tree}" == "${base_tree}" ]]; then
+    return 0
+  fi
+
+  if approved_downstream_patch "${base_tree}" "${current_tree}"; then
+    echo "GOOD: approved downstream libbitcoinpqc patch ${APPROVED_RUSTSEC_CROSSBEAM_PATCH}"
+    return 0
+  fi
+
+  git diff --stat "${base_tree}" "${current_tree}" >&2 || true
+  echo "FAIL: ${failure_message}" >&2
+  exit 1
 }
 
 if [[ "${1-}" == "--help" || "${1-}" == "-h" ]]; then
@@ -119,16 +158,14 @@ if [[ "${metadata_split}" != "${upstream_commit}" ]]; then
   exit 1
 fi
 
-if [[ "${current_tree}" != "${metadata_tree}" ]]; then
-  git diff --stat "${metadata_tree}" "${current_tree}" >&2 || true
-  echo "FAIL: ${PREFIX} tree differs from latest subtree import commit ${metadata_commit}" >&2
-  exit 1
-fi
+verify_tree_match_or_approved_patch \
+  "${metadata_tree}" \
+  "${current_tree}" \
+  "${PREFIX} tree differs from latest subtree import commit ${metadata_commit}"
 
-if [[ "${current_tree}" != "${upstream_tree}" ]]; then
-  git diff --stat "${upstream_tree}" "${current_tree}" >&2 || true
-  echo "FAIL: ${PREFIX} tree differs from upstream tag ${REMOTE_REF}" >&2
-  exit 1
-fi
+verify_tree_match_or_approved_patch \
+  "${upstream_tree}" \
+  "${current_tree}" \
+  "${PREFIX} tree differs from upstream tag ${REMOTE_REF}"
 
 echo "GOOD"

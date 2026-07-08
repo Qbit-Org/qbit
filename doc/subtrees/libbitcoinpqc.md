@@ -57,6 +57,13 @@ The check fetches the pinned tag if needed, should report `GOOD`, and should
 show the subtree split commit as `ac72d1ffa0ef486f08d37334a43f5db1adb731db`
 for the current pin.
 
+The current qbit tree carries one approved downstream security delta on top of
+the pinned upstream tag: `RUSTSEC-2026-0204-crossbeam-epoch-0.9.20`, which
+updates only `src/libbitcoinpqc/Cargo.lock` from `crossbeam-epoch 0.9.18` to
+`0.9.20`. The subtree check accepts exactly that lockfile hunk and no other
+subtree drift. Drop the exception after `Qbit-Org/qbit-libbitcoinpqc` publishes
+an immutable tag containing the same advisory fix and qbit imports it.
+
 ## PR Checklist For Subtree Updates
 
 When a PR touches `src/libbitcoinpqc`, confirm:
@@ -67,6 +74,8 @@ When a PR touches `src/libbitcoinpqc`, confirm:
 - [ ] `test/lint/libbitcoinpqc-subtree-check.sh` passes locally.
 - [ ] Any default tag change in `contrib/devtools/update-libbitcoinpqc-subtree.sh`
   is intentional and matches this runbook.
+- [ ] Any downstream security delta is listed above, is limited to the exact
+  lint allowlist, and is removed once a fixed upstream release tag is imported.
 
 ## Common Failures
 

@@ -100,7 +100,7 @@ jobs:
     steps:
       - name: Validate tag exists and is GitHub-verified
         id: tag
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
           script: |
             const { owner, repo } = context.repo;
@@ -163,13 +163,13 @@ jobs:
           fi
 
       - name: Checkout tagged source
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: refs/tags/${{ steps.tag.outputs.tag }}
           fetch-depth: 0
 
       - name: Checkout trusted release validation policy
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ inputs.trusted_release_ref }}
           path: .trusted-release
@@ -419,7 +419,7 @@ jobs:
       - name: Create or update GitHub Release with notes file
         id: release_with_notes
         if: steps.notes.outputs.has_notes == 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           target_commitish: ${{ steps.tag.outputs.target_commitish }}
@@ -435,7 +435,7 @@ jobs:
       - name: Create or update GitHub Release with generated notes
         id: release_generated
         if: steps.notes.outputs.has_notes != 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           target_commitish: ${{ steps.tag.outputs.target_commitish }}

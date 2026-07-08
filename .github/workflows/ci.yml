@@ -64,7 +64,7 @@ jobs:
       source_validation_required: ${{ steps.classify.outputs.source_validation_required }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 0
 
@@ -155,14 +155,14 @@ jobs:
   test-each-commit:
     name: 'test each commit'
     runs-on: *qbit_runs_on
-    if: false # Disabled: runner OS (Ubuntu 20.04) lacks required packages (mold, qt6)
+    if: ${{ github.event_name == 'pull_request' && vars.QBIT_ENABLE_TEST_EACH_COMMIT == 'true' && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted')) }} # Disabled by default: runner OS (Ubuntu 20.04) lacks required packages (mold, qt6)
     timeout-minutes: 360  # Use maximum time, see https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idtimeout-minutes. Assuming a worst case time of 1 hour per commit, this leads to a --max-count=6 below.
     env:
       MAX_COUNT: 6
     steps:
       - name: Determine fetch depth
         run: echo "FETCH_DEPTH=$((${{ github.event.pull_request.commits }} + 2))" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: ${{ env.FETCH_DEPTH }}
@@ -189,12 +189,12 @@ jobs:
           # ancestors from the rev-list output as described in:
           # https://git-scm.com/docs/git-rev-list
           MERGE_BASE=$(git rev-list -n1 --merges HEAD)
-          EXCLUDE_MERGE_BASE_ANCESTORS=
+          exclude_merge_base_ancestors=()
           # MERGE_BASE can be empty due to limited fetch-depth
           if test -n "$MERGE_BASE"; then
-            EXCLUDE_MERGE_BASE_ANCESTORS=^${MERGE_BASE}^@
+            exclude_merge_base_ancestors=("^${MERGE_BASE}^@")
           fi
-          echo "TEST_BASE=$(git rev-list -n$((${{ env.MAX_COUNT }} + 1)) --reverse HEAD $EXCLUDE_MERGE_BASE_ANCESTORS | head -1)" >> "$GITHUB_ENV"
+          echo "TEST_BASE=$(git rev-list -n$((${{ env.MAX_COUNT }} + 1)) --reverse HEAD "${exclude_merge_base_ancestors[@]}" | head -1)" >> "$GITHUB_ENV"
       - run: |
           git fetch origin "${GITHUB_BASE_REF}"
           git config user.email "ci@example.com"
@@ -211,7 +211,7 @@ jobs:
   macos-native-arm64:
     name: ${{ matrix.job-name }}
     runs-on: macos-14
-    if: false # Disabled: no macOS runner available
+    if: ${{ vars.QBIT_ENABLE_MACOS_NATIVE_ARM64 == 'true' }} # Disabled by default: no macOS runner available
 
     timeout-minutes: 120
 
@@ -234,7 +234,7 @@ jobs:
     steps:
       - &CHECKOUT
         name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           # Ensure PR re-runs use merged state.
           ref: &CHECKOUT_REF_TMPL ${{ github.event_name == 'pull_request' && github.ref || '' }}
@@ -266,7 +266,7 @@ jobs:
 
       - name: Restore Ccache cache
         id: ccache-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ env.CCACHE_DIR }}
           key: ${{ github.job }}-${{ matrix.job-type }}-ccache-${{ github.run_id }}
@@ -278,7 +278,7 @@ jobs:
           FILE_ENV: ${{ matrix.file-env }}
 
       - name: Save Ccache cache
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         if: github.event_name != 'pull_request' && steps.ccache-cache.outputs.cache-hit != 'true'
         with:
           path: ${{ env.CCACHE_DIR }}
@@ -313,7 +313,7 @@ jobs:
 
       - name: Configure Developer Command Prompt for Microsoft Visual C++
         # Using microsoft/setup-msbuild is not enough.
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
         with:
           arch: x64
 
@@ -343,13 +343,13 @@ jobs:
           sed -i '1s/^/set(ENV{CMAKE_POLICY_VERSION_MINIMUM} 3.5)\n/' "${VCPKG_INSTALLATION_ROOT}/scripts/ports.cmake"
 
       - name: vcpkg tools cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: C:/vcpkg/downloads/tools
           key: ${{ github.job }}-vcpkg-tools
 
       - name: Restore vcpkg binary cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         id: vcpkg-binary-cache
         with:
           path: ~/AppData/Local/vcpkg/archives
@@ -360,7 +360,7 @@ jobs:
           cmake -B build -Werror=dev --preset vs2022 -DCMAKE_TOOLCHAIN_FILE="${VCPKG_INSTALLATION_ROOT}/scripts/buildsystems/vcpkg.cmake" ${{ matrix.generate-options }}
 
       - name: Save vcpkg binary cache
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         if: github.event_name != 'pull_request' && steps.vcpkg-binary-cache.outputs.cache-hit != 'true' && matrix.job-type == 'standard'
         with:
           path: ~/AppData/Local/vcpkg/archives
@@ -369,7 +369,7 @@ jobs:
       - name: Build
         working-directory: build
         run: |
-          cmake --build . -j $NUMBER_OF_PROCESSORS --config Release
+          cmake --build . -j "$NUMBER_OF_PROCESSORS" --config Release
 
       - name: Get qbitd manifest
         if: matrix.job-type == 'standard'
@@ -509,7 +509,7 @@ jobs:
 
       - name: Upload Windows crash diagnostics
         if: matrix.job-type == 'standard' && steps.qt_test.outcome != 'success'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows-qt-crash-diagnostics-${{ github.run_id }}
           if-no-files-found: ignore
@@ -551,7 +551,22 @@ jobs:
           BITCOINWALLET: '${{ github.workspace }}\build\bin\Release\qbit-wallet.exe'
           TEST_RUNNER_FAILFAST: ${{ github.event_name == 'pull_request' && '--failfast' || '' }}
           TEST_RUNNER_EXTRA: ${{ github.event_name != 'pull_request' && '--extended' || '' }}
-        run: py -3 test/functional/test_runner.py --jobs $NUMBER_OF_PROCESSORS --ci --quiet --tmpdirprefix="${RUNNER_TEMP}" --combinedlogslen=2000 --timeout-factor=${TEST_RUNNER_TIMEOUT_FACTOR} ${TEST_RUNNER_FAILFAST} ${TEST_RUNNER_EXTRA}
+        run: |
+          test_runner_args=(
+            --jobs "$NUMBER_OF_PROCESSORS"
+            --ci
+            --quiet
+            --tmpdirprefix="${RUNNER_TEMP}"
+            --combinedlogslen=2000
+            --timeout-factor="${TEST_RUNNER_TIMEOUT_FACTOR}"
+          )
+          if [[ -n "${TEST_RUNNER_FAILFAST}" ]]; then
+            test_runner_args+=("${TEST_RUNNER_FAILFAST}")
+          fi
+          if [[ -n "${TEST_RUNNER_EXTRA}" ]]; then
+            test_runner_args+=("${TEST_RUNNER_EXTRA}")
+          fi
+          py -3 test/functional/test_runner.py "${test_runner_args[@]}"
 
       - name: Clone corpora
         if: matrix.job-type == 'fuzz'
@@ -568,7 +583,7 @@ jobs:
           BITCOINFUZZ: '${{ github.workspace }}\build\bin\Release\fuzz.exe'
         run: |
           # TODO: Fix the Windows fail-fast in ephemeral_package_eval and re-enable it.
-          py -3 test/fuzz/test_runner.py --par $NUMBER_OF_PROCESSORS --loglevel DEBUG --exclude ephemeral_package_eval "${RUNNER_TEMP}/qa-assets/fuzz_corpora"
+          py -3 test/fuzz/test_runner.py --par "$NUMBER_OF_PROCESSORS" --loglevel DEBUG --exclude ephemeral_package_eval "${RUNNER_TEMP}/qa-assets/fuzz_corpora"
 
   windows-cross:
     name: 'Linux->Windows cross, no tests'
@@ -605,7 +620,7 @@ jobs:
         uses: ./.github/actions/save-caches
 
       - name: Upload built executables
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: x86_64-w64-mingw32-executables-${{ github.run_id }}
           path: |
@@ -635,7 +650,7 @@ jobs:
       - *CHECKOUT
 
       - name: Download built executables
-        uses: actions/download-artifact@v4.1.3
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: x86_64-w64-mingw32-executables-${{ github.run_id }}
 
@@ -681,16 +696,31 @@ jobs:
 
       - name: Get previous releases
         working-directory: test
-        run: ./get_previous_releases.py --target-dir $PREVIOUS_RELEASES_DIR
+        run: ./get_previous_releases.py --target-dir "$PREVIOUS_RELEASES_DIR"
 
       - name: Run functional tests
         env:
           # TODO: Fix the excluded test and re-enable it.
           # feature_unsupported_utxo_db.py fails on windows because of emojis in the test data directory
-          EXCLUDE: '--exclude wallet_multiwallet.py,feature_unsupported_utxo_db.py'
           TEST_RUNNER_FAILFAST: ${{ github.event_name == 'pull_request' && '--failfast' || '' }}
           TEST_RUNNER_EXTRA: ${{ github.event_name != 'pull_request' && '--extended' || '' }}
-        run: py -3 test/functional/test_runner.py --jobs $NUMBER_OF_PROCESSORS --ci --quiet --tmpdirprefix="$RUNNER_TEMP" --combinedlogslen=2000 --timeout-factor=$TEST_RUNNER_TIMEOUT_FACTOR $EXCLUDE $TEST_RUNNER_FAILFAST $TEST_RUNNER_EXTRA
+        run: |
+          test_runner_args=(
+            --jobs "$NUMBER_OF_PROCESSORS"
+            --ci
+            --quiet
+            --tmpdirprefix="$RUNNER_TEMP"
+            --combinedlogslen=2000
+            --timeout-factor="$TEST_RUNNER_TIMEOUT_FACTOR"
+            --exclude "wallet_multiwallet.py,feature_unsupported_utxo_db.py"
+          )
+          if [[ -n "${TEST_RUNNER_FAILFAST}" ]]; then
+            test_runner_args+=("${TEST_RUNNER_FAILFAST}")
+          fi
+          if [[ -n "${TEST_RUNNER_EXTRA}" ]]; then
+            test_runner_args+=("${TEST_RUNNER_EXTRA}")
+          fi
+          py -3 test/functional/test_runner.py "${test_runner_args[@]}"
 
   ci-matrix:
     name: ${{ matrix.name }}
@@ -722,42 +752,84 @@ jobs:
             fallback-runner: 'ubuntu-24.04'
             timeout-minutes: 200
             file-env: './ci/test/00_setup_env_native_asan.sh'
+            makejobs: '-j6'
+            test-runner-jobs: '6'
+            ctest-jobs: '6'
+            container-cpus: '8'
+            container-memory: '48g'
+            provider: ''
 
           - name: 'macOS-cross, gui, no tests'
             cirrus-runner: 'ghcr.io/cirruslabs/ubuntu-runner-amd64:24.04-sm'
             fallback-runner: 'ubuntu-24.04'
             timeout-minutes: 200
             file-env: './ci/test/00_setup_env_mac_cross.sh'
+            makejobs: '-j6'
+            test-runner-jobs: '6'
+            ctest-jobs: '6'
+            container-cpus: '8'
+            container-memory: '48g'
+            provider: ''
 
           - name: 'No wallet, libbitcoinkernel'
             cirrus-runner: 'ghcr.io/cirruslabs/ubuntu-runner-amd64:24.04-sm'
             fallback-runner: 'ubuntu-24.04'
             timeout-minutes: 200
             file-env: './ci/test/00_setup_env_native_nowallet_libbitcoinkernel.sh'
+            makejobs: '-j6'
+            test-runner-jobs: '6'
+            ctest-jobs: '6'
+            container-cpus: '8'
+            container-memory: '48g'
+            provider: ''
 
           - name: 'no IPC, i686, DEBUG'
             cirrus-runner: 'ghcr.io/cirruslabs/ubuntu-runner-amd64:24.04-md'
             fallback-runner: 'ubuntu-24.04'
             timeout-minutes: 200
             file-env: './ci/test/00_setup_env_i686_no_ipc.sh'
+            makejobs: '-j6'
+            test-runner-jobs: '6'
+            ctest-jobs: '6'
+            container-cpus: '8'
+            container-memory: '48g'
+            provider: ''
 
           - name: 'CentOS, depends, gui'
             cirrus-runner: 'ghcr.io/cirruslabs/ubuntu-runner-amd64:24.04-lg'
             fallback-runner: 'ubuntu-24.04'
             timeout-minutes: 200
             file-env: './ci/test/00_setup_env_native_centos.sh'
+            makejobs: '-j6'
+            test-runner-jobs: '6'
+            ctest-jobs: '6'
+            container-cpus: '8'
+            container-memory: '48g'
+            provider: ''
 
           - name: 'tidy'
             cirrus-runner: 'ghcr.io/cirruslabs/ubuntu-runner-amd64:24.04-md'
             fallback-runner: 'ubuntu-24.04'
             timeout-minutes: 200
             file-env: './ci/test/00_setup_env_native_tidy.sh'
+            makejobs: '-j6'
+            test-runner-jobs: '6'
+            ctest-jobs: '6'
+            container-cpus: '8'
+            container-memory: '48g'
+            provider: ''
 
           - name: 'TSan, depends, no gui'
             cirrus-runner: 'ghcr.io/cirruslabs/ubuntu-runner-amd64:24.04-md'
             fallback-runner: 'ubuntu-24.04'
             timeout-minutes: 200
             file-env: './ci/test/00_setup_env_native_tsan.sh'
+            makejobs: '-j6'
+            test-runner-jobs: '6'
+            ctest-jobs: '6'
+            container-cpus: '8'
+            container-memory: '48g'
+            provider: ''
 
           - name: 'MSan, depends, unit tests'
             cirrus-runner: 'ghcr.io/cirruslabs/ubuntu-runner-amd64:24.04-lg'
@@ -765,6 +837,12 @@ jobs:
             timeout-minutes: 200
             file-env: './ci/test/00_setup_env_native_msan.sh'
             msan-ci-part: 'unit'
+            makejobs: '-j6'
+            test-runner-jobs: '6'
+            ctest-jobs: '6'
+            container-cpus: '8'
+            container-memory: '48g'
+            provider: ''
 
           - name: 'MSan, depends, functional tests'
             cirrus-runner: 'ghcr.io/cirruslabs/ubuntu-runner-amd64:24.04-lg'
@@ -772,6 +850,12 @@ jobs:
             timeout-minutes: 200
             file-env: './ci/test/00_setup_env_native_msan.sh'
             msan-ci-part: 'functional'
+            makejobs: '-j6'
+            test-runner-jobs: '6'
+            ctest-jobs: '6'
+            container-cpus: '8'
+            container-memory: '48g'
+            provider: ''
 
     steps:
       - *CHECKOUT
@@ -832,7 +916,7 @@ jobs:
       CONTAINER_NAME: "bitcoin-linter"
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: *CHECKOUT_REF_TMPL
           fetch-depth: 0
@@ -849,14 +933,15 @@ jobs:
           set -o xtrace
           source ./ci/test/00_setup_env_base_image.sh
           ci_set_base_image_name_tag "ubuntu:24.04"
-          docker buildx build -t "$CONTAINER_NAME" $DOCKER_BUILD_CACHE_ARG --build-arg "CI_IMAGE_NAME_TAG=${CI_IMAGE_NAME_TAG}" --file "./ci/lint_imagefile" .
-          CIRRUS_PR_FLAG=""
+          read -r -a docker_build_cache_args <<< "${DOCKER_BUILD_CACHE_ARG:-}"
+          docker buildx build -t "$CONTAINER_NAME" "${docker_build_cache_args[@]}" --build-arg "CI_IMAGE_NAME_TAG=${CI_IMAGE_NAME_TAG}" --file "./ci/lint_imagefile" .
+          cirrus_pr_flags=()
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            CIRRUS_PR_FLAG="-e CIRRUS_PR=1"
+            cirrus_pr_flags=(-e CIRRUS_PR=1)
           fi
           # Use docker cp instead of bind mount to avoid DinD path mapping issues
           # when runners share the host Docker socket.
-          LINT_CID=$(docker create $CIRRUS_PR_FLAG "$CONTAINER_NAME")
+          LINT_CID=$(docker create "${cirrus_pr_flags[@]}" "$CONTAINER_NAME")
           docker cp "$(pwd)/." "$LINT_CID":/bitcoin
           docker start -a "$LINT_CID"; rc=$?
           docker rm "$LINT_CID" || true
@@ -870,7 +955,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: *CHECKOUT_REF_TMPL
           fetch-depth: 0
@@ -887,7 +972,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: *CHECKOUT_REF_TMPL
 
@@ -955,7 +1040,7 @@ jobs:
           test -f "${RUNNER_TEMP}/rpcdocs-install/share/doc/qbit/rpc/data/rpc-docs-build-meta.json"
 
       - name: Upload site artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: rpc-docs-site
           if-no-files-found: error
@@ -963,7 +1048,7 @@ jobs:
             build/doc/rpc-site/**
 
       - name: Upload data artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: rpc-docs-data
           if-no-files-found: error

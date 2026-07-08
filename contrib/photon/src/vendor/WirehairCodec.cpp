@@ -1462,7 +1462,7 @@ void Codec::InitializeColumnValues()
     const uint16_t first_heavy_row = _defer_count + _dense_count;
     const uint16_t column_count = _defer_count + _mix_count;
 
-    uint16_t pivot_i;
+    unsigned pivot_i;
 
     // For each pivot:
     for (pivot_i = 0; pivot_i < column_count; ++pivot_i)
@@ -2534,7 +2534,7 @@ void Codec::BackSubstituteAboveDiagonal()
             if (first_word == last_word)
             {
                 // For each pivot row:
-                for (uint16_t above_pivot_i = 0; above_pivot_i < backsub_i; ++above_pivot_i)
+                for (unsigned above_pivot_i = 0; above_pivot_i < backsub_i; ++above_pivot_i)
                 {
                     const unsigned ge_row_k = *pivot_row++;
 
@@ -2567,7 +2567,7 @@ void Codec::BackSubstituteAboveDiagonal()
                 const unsigned shift1 = 64 - shift0;
 
                 // For each pivot row,
-                for (uint16_t above_pivot_i = 0; above_pivot_i < backsub_i; ++above_pivot_i)
+                for (unsigned above_pivot_i = 0; above_pivot_i < backsub_i; ++above_pivot_i)
                 {
                     const unsigned ge_row_k = *pivot_row++;
 
@@ -3099,7 +3099,7 @@ WirehairResult Codec::ResumeSolveMatrix(
     uint64_t ge_mask = 1;
 
     // For each pivot-found column up to the start of the heavy columns:
-    for (uint16_t pivot_j = 0; pivot_j < _next_pivot && pivot_j < _first_heavy_column; ++pivot_j)
+    for (unsigned pivot_j = 0; pivot_j < _next_pivot && pivot_j < _first_heavy_column; ++pivot_j)
     {
         const unsigned word_offset = pivot_j >> 6;
         uint64_t * GF256_RESTRICT rem_row = &ge_new_row[word_offset];
@@ -3721,7 +3721,7 @@ bool Codec::AllocateMatrix()
     // received in excess of N for when the decoder fails and has to resume
     // again.
     // When these extra rows are added we clear the row memory at that point.
-    memset(_ge_matrix, 0, ge_cols * ge_pitch * sizeof(uint64_t));
+    memset(_ge_matrix, 0, (size_t)ge_cols * ge_pitch * sizeof(uint64_t));
 
     return true;
 }
