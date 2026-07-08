@@ -38,6 +38,7 @@ SCANNER_TRIAGED_DISPOSITIONS = {
     "not_security",
     "routed_to_track",
 }
+MIN_ZIZMOR_VERSION = (1, 24, 0)
 README_PREAMBLE = (
     f"{OUTPUT_ROOT_README_TITLE}\n\n"
     "Raw scanner output may contain sensitive paths or secret-adjacent context and is private by default.\n"
@@ -869,6 +870,18 @@ def tool_version(executable: str) -> str:
     return ""
 
 
+def version_tuple_from_text(text: str) -> tuple[int, int, int] | None:
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", text)
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+
+def zizmor_version_supported(version_text: str) -> bool:
+    version = version_tuple_from_text(version_text)
+    return version is not None and version >= MIN_ZIZMOR_VERSION
+
+
 def git_worktree_dirty(source: Path) -> bool:
     completed = subprocess.run(
         ["git", "-C", str(source), "status", "--porcelain"],
@@ -1523,6 +1536,26 @@ def run_scanner(tool: str, args: argparse.Namespace, output_root: Path) -> dict[
         write_json(summary_path, summary)
         return summary
 
+    external_tool_version = tool_version(spec.executable)
+    if tool == "zizmor" and not zizmor_version_supported(external_tool_version):
+        summary = create_summary(
+            args=args,
+            spec=spec,
+            status="skipped",
+            tool_version_value=external_tool_version,
+            commands=[],
+            raw_paths=[],
+            counts=empty_counts(),
+            triage_path=triage_path,
+            coverage_gaps=[
+                "zizmor is too old for qbit workflow syntax; install zizmor >= "
+                + ".".join(str(part) for part in MIN_ZIZMOR_VERSION)
+                + "."
+            ],
+        )
+        write_json(summary_path, summary)
+        return summary
+
     commands, report = external_commands(tool, args.source, raw_dir, args)
     exit_codes = []
     for index, command in enumerate(commands):
@@ -1546,7 +1579,7 @@ def run_scanner(tool: str, args: argparse.Namespace, output_root: Path) -> dict[
         args=args,
         spec=spec,
         status=status,
-        tool_version_value=tool_version(spec.executable),
+        tool_version_value=external_tool_version,
         commands=commands,
         raw_paths=raw_paths,
         counts=counts,

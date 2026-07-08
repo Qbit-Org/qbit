@@ -14,7 +14,7 @@ TOOL_ROOT="${QBIT_SCANNER_TOOL_ROOT:-${RUNNER_TOOL_CACHE:-$HOME/.cache/qbit}/sca
 BIN_DIR="${QBIT_SCANNER_BIN_DIR:-$TOOL_ROOT/bin}"
 CARGO_ROOT="${QBIT_SCANNER_CARGO_ROOT:-$TOOL_ROOT/cargo}"
 PYTHON_VENV="${QBIT_SCANNER_PYTHON_VENV:-$TOOL_ROOT/python}"
-CARGO_AUDIT_VERSION="${QBIT_SCANNER_CARGO_AUDIT_VERSION:-0.21.1}"
+CARGO_AUDIT_VERSION="${QBIT_SCANNER_CARGO_AUDIT_VERSION:-0.22.2}"
 
 mkdir -p "$BIN_DIR" "$CARGO_ROOT/bin"
 export PATH="$BIN_DIR:$CARGO_ROOT/bin:$PATH"
@@ -117,12 +117,49 @@ import json
 import os
 import re
 import sys
+import urllib.parse
 import urllib.request
 
 repo = sys.argv[1]
 asset_regex = re.compile(sys.argv[2])
 request = urllib.request.Request(
     f"https://api.github.com/repos/{repo}/releases/latest",
+    headers={
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "qbit-scanner-installer",
+    },
+)
+token = os.environ.get("GITHUB_TOKEN")
+if token:
+    request.add_header("Authorization", f"Bearer {token}")
+with urllib.request.urlopen(request, timeout=60) as response:
+    release = json.load(response)
+for asset in release.get("assets", []):
+    name = str(asset.get("name", ""))
+    if asset_regex.search(name):
+        print(asset["browser_download_url"])
+        raise SystemExit(0)
+raise SystemExit(f"No release asset matching {asset_regex.pattern!r} found in {repo} {release.get('tag_name', '')}")
+PY
+}
+
+github_release_asset_url() {
+    local repo="$1"
+    local tag="$2"
+    local asset_regex="$3"
+    python3 - "$repo" "$tag" "$asset_regex" <<'PY'
+import json
+import os
+import re
+import sys
+import urllib.parse
+import urllib.request
+
+repo = sys.argv[1]
+tag = urllib.parse.quote(sys.argv[2], safe="")
+asset_regex = re.compile(sys.argv[3])
+request = urllib.request.Request(
+    f"https://api.github.com/repos/{repo}/releases/tags/{tag}",
     headers={
         "Accept": "application/vnd.github+json",
         "User-Agent": "qbit-scanner-installer",
@@ -156,8 +193,8 @@ install_plain_binary() {
     local name="$1"
     local repo="$2"
     local asset_regex="$3"
-    if need_cmd "$name"; then
-        log "$name already available"
+    if [[ -x "$BIN_DIR/$name" ]]; then
+        log "$name already available in scanner tool cache"
         return
     fi
 
@@ -175,8 +212,8 @@ install_tar_binary() {
     local name="$1"
     local repo="$2"
     local asset_regex="$3"
-    if need_cmd "$name"; then
-        log "$name already available"
+    if [[ -x "$BIN_DIR/$name" ]]; then
+        log "$name already available in scanner tool cache"
         return
     fi
 
@@ -237,12 +274,8 @@ ensure_scan_build() {
 
 install_python_tool() {
     local name="$1"
-    if need_cmd "$name"; then
-        log "$name already available"
-        return
-    fi
 
-    log "Installing $name"
+    log "Installing or upgrading $name"
     if [[ ! -x "$PYTHON_VENV/bin/python" ]]; then
         python3 -m venv "$PYTHON_VENV"
         "$PYTHON_VENV/bin/python" -m pip install --upgrade pip wheel
@@ -251,20 +284,59 @@ install_python_tool() {
     ln -sf "$PYTHON_VENV/bin/$name" "$BIN_DIR/$name"
 }
 
+cargo_audit_target() {
+    case "$(uname -m)" in
+        x86_64)
+            printf 'x86_64-unknown-linux-musl'
+            ;;
+        aarch64|arm64)
+            printf 'aarch64-unknown-linux-gnu'
+            ;;
+        armv7l)
+            printf 'armv7-unknown-linux-gnueabihf'
+            ;;
+        *)
+            echo "Unsupported cargo-audit release architecture: $(uname -m)" >&2
+            exit 1
+            ;;
+    esac
+}
+
 install_cargo_audit() {
     local current_version=""
-    if cargo audit --version >/dev/null 2>&1; then
-        current_version="$(cargo audit --version | awk '{print $2}')"
-        if [[ "$current_version" == "$CARGO_AUDIT_VERSION" ]]; then
-            log "cargo-audit $CARGO_AUDIT_VERSION already available"
-            return
+    if [[ -x "$BIN_DIR/cargo-audit" ]]; then
+        if current_version="$("$BIN_DIR/cargo-audit" --version 2>/dev/null | awk '{print $2}')"; then
+            if [[ "$current_version" == "$CARGO_AUDIT_VERSION" ]]; then
+                log "cargo-audit $CARGO_AUDIT_VERSION already available"
+                return
+            fi
+            log "Replacing cargo-audit ${current_version:-unknown} with $CARGO_AUDIT_VERSION"
+        else
+            log "Replacing broken cached cargo-audit with $CARGO_AUDIT_VERSION"
         fi
-        log "Replacing cargo-audit $current_version with $CARGO_AUDIT_VERSION"
     else
         log "Installing cargo-audit $CARGO_AUDIT_VERSION"
     fi
 
-    cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked --root "$CARGO_ROOT" --force
+    local tmp
+    tmp="$(mktemp -d)"
+    local target
+    target="$(cargo_audit_target)"
+    local url
+    url="$(github_release_asset_url \
+        rustsec/rustsec \
+        "cargo-audit/v${CARGO_AUDIT_VERSION}" \
+        "^cargo-audit-${target}-v${CARGO_AUDIT_VERSION}\\.tgz$")"
+    download "$url" "$tmp/cargo-audit.tar.gz"
+    tar -xzf "$tmp/cargo-audit.tar.gz" -C "$tmp"
+    local candidate
+    candidate="$(find "$tmp" -type f -name cargo-audit | head -n 1)"
+    if [[ -z "$candidate" ]]; then
+        echo "Unable to find cargo-audit in downloaded archive" >&2
+        exit 1
+    fi
+    install -m 0755 "$candidate" "$BIN_DIR/cargo-audit"
+    rm -rf "$tmp"
 }
 
 show_versions() {
