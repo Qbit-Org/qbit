@@ -8,16 +8,19 @@ on:
   pull_request:
     branches:
       - main
+      - 1.0.0
       - 0.1.x
       - develop
   push:
     branches:
       - main
+      - 1.0.0
       - 0.1.x
       - develop
   merge_group:
     branches:
       - main
+      - 1.0.0
       - 0.1.x
       - develop
 
