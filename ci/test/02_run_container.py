@@ -3,11 +3,45 @@
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or https://opensource.org/license/mit/.
 
+import hashlib
 import os
 import re
 import shlex
 import subprocess
 import sys
+
+MAX_DOCKER_NAME_LEN = 63
+CI_NETWORK_PREFIX = "ci-ip6net-"
+MAX_CI_CONTAINER_NAME_LEN = MAX_DOCKER_NAME_LEN - len(CI_NETWORK_PREFIX)
+
+
+def sanitize_name_part(value):
+    return re.sub(r"[^A-Za-z0-9_.-]", "-", value)
+
+
+def short_hash(value, length=10):
+    return hashlib.sha256(value.encode("utf8")).hexdigest()[:length]
+
+
+def ci_container_name(base, run_id, run_attempt, job, runner_name):
+    base = sanitize_name_part(base or "ci")
+    unique_id = "-".join(
+        sanitize_name_part(part)
+        for part in (
+            run_id or "local",
+            run_attempt or "0",
+            job or "job",
+            f"r{short_hash(runner_name or 'runner')}",
+        )
+        if part
+    )
+    candidate = f"{base}-{unique_id}"
+    if len(candidate) <= MAX_CI_CONTAINER_NAME_LEN:
+        return candidate
+
+    digest = short_hash(candidate)
+    prefix_len = MAX_CI_CONTAINER_NAME_LEN - len(digest) - 1
+    return f"{candidate[:prefix_len].rstrip('-')}-{digest}"
 
 
 def run(cmd, **kwargs):
@@ -34,17 +68,15 @@ def main():
         "CI_FAILFAST_TEST_LEAVE_DANGLING",
     ])
 
-    # Make container/env-file names unique per workflow run to avoid collisions
-    # between concurrent jobs sharing one Docker daemon.
-    unique_id = "{run_id}-{attempt}-{job}".format(
-        run_id=os.getenv("GITHUB_RUN_ID", "local"),
-        attempt=os.getenv("GITHUB_RUN_ATTEMPT", "0"),
-        job=os.getenv("GITHUB_JOB", "job"),
-    )
-    unique_id = re.sub(r"[^A-Za-z0-9_.-]", "-", unique_id)
-    container_name = "{base}-{suffix}".format(
+    # Make container/env-file names unique per runner instance. GitHub sets the
+    # same GITHUB_JOB for every matrix entry, while qbit self-hosted runner
+    # instances can share one Docker daemon.
+    container_name = ci_container_name(
         base=os.getenv("CONTAINER_NAME", "ci"),
-        suffix=unique_id,
+        run_id=os.getenv("GITHUB_RUN_ID", "local"),
+        run_attempt=os.getenv("GITHUB_RUN_ATTEMPT", "0"),
+        job=os.getenv("GITHUB_JOB", "job"),
+        runner_name=os.getenv("RUNNER_NAME", "runner"),
     )
     env_file = "/tmp/env-{u}-{c}".format(
         u=os.getenv("USER", "ci"),

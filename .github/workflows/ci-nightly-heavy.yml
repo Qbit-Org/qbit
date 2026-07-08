@@ -134,7 +134,7 @@ jobs:
     env:
       SCANNER_SET: ${{ inputs.scanner_set || 'minimum' }}
       SCANNER_FAIL_POLICY: ${{ inputs.scanner_fail_policy || 'infra-and-secrets' }}
-      SKIP_BUILD_SCANNERS: ${{ inputs.skip_build_scanners || 'false' }}
+      SKIP_BUILD_SCANNERS: ${{ github.event_name == 'schedule' && 'true' || inputs.skip_build_scanners && 'true' || 'false' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5

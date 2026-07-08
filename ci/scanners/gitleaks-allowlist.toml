@@ -1,0 +1,15 @@
+title = "qbit gitleaks allowlist"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Deterministic P2MR data-hash proof vector key material"
+condition = "AND"
+regexTarget = "line"
+paths = [
+  '''src/test/data/p2mr_datapqchash_vectors\.json''',
+]
+regexes = [
+  '''"(keygen_entropy|secret_key)": "[0-9a-f]+"''',
+]

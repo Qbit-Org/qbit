@@ -34,6 +34,12 @@ run_scanners = load_run_scanners()
 
 
 class RunScannersTest(unittest.TestCase):
+    def test_zizmor_version_gate_rejects_old_python38_compatible_release(self) -> None:
+        self.assertFalse(run_scanners.zizmor_version_supported("zizmor 1.2.0"))
+
+    def test_zizmor_version_gate_accepts_anchor_compatible_release(self) -> None:
+        self.assertTrue(run_scanners.zizmor_version_supported("zizmor 1.24.1"))
+
     def test_ls_remote_ref_oid_accepts_exact_peeled_tag_ref(self) -> None:
         stdout = "ac72d1\trefs/tags/v0.3.0^{}\n456aaf\trefs/tags/v0.3.0\n"
 
