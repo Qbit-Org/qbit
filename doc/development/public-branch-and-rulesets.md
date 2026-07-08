@@ -35,10 +35,11 @@ Public release tags use signed, annotated `v*` tags:
 | `v0.1.0-testnet4` | Final v0.1.0 testnet4 release tag. |
 | `v0.1.N-testnet4` | Future v0.1.x patch or reset tags, when needed. |
 
-Tag updates and deletions are not part of normal release operations. If a tag
-must be corrected before announcement, delete and recreate it only through the
-release-maintainer path, and record the replacement rationale in the release
-checklist.
+Tag updates and deletions are not part of normal release operations. Release
+maintainers may create `v*` tags, but they must not be able to update or delete
+them after creation. If a tag must be corrected before announcement, delete and
+recreate it only through an organization-admin break-glass path, and record the
+replacement rationale in the release checklist.
 
 ## Ruleset Templates
 
@@ -48,7 +49,8 @@ Ruleset JSON templates are the public-safe files below:
 | --- | --- | --- |
 | `.github/rulesets/main.json` | `refs/heads/main` | Require pull requests, one approval, resolved conversations, squash/rebase merge methods only, linear history, `Required Merge Gate`, block deletion, and block non-fast-forward updates. |
 | `.github/rulesets/0.1.x.json` | `refs/heads/0.1.x` | Restrict branch creation to bypass actors, require pull requests, one approval, resolved conversations, squash/rebase merge methods only, linear history, `Required Merge Gate`, block deletion, and block non-fast-forward updates. |
-| `.github/rulesets/release-tags-v.json` | `refs/tags/v*` | Restrict tag creation, updates, and deletion to bypass actors. |
+| `.github/rulesets/release-tags-v-creation.json` | `refs/tags/v*` | Restrict tag creation to organization admins and the release-maintainers team. |
+| `.github/rulesets/release-tags-v-immutability.json` | `refs/tags/v*` | Restrict tag updates and deletion to organization admins only. |
 | `.github/rulesets/upstream-refs.json` | `refs/heads/upstream/**` | Lock optional upstream reference branches so only bypass actors can create, update, or delete them. |
 
 ## Repository Merge Settings
@@ -68,11 +70,15 @@ temporarily set `allow_merge_commit` to `true`, perform the merge, record the
 reason in the relevant pull request or release checklist, and immediately
 restore this default template.
 
-Templates that restrict ref creation, update, or deletion intentionally use
-`OrganizationAdmin` as the only portable bypass actor. Before applying them to
-the public repository, maintainers should replace or supplement that bypass
-with the final public release-maintainer team, user, or repository-role actor
-IDs.
+Templates that restrict ref creation, update, or deletion use
+`OrganizationAdmin` as the portable bypass actor. The `v*` tag creation template
+also includes a `Team` bypass actor for the release-maintainers team. GitHub
+rulesets require the numeric team ID as `actor_id`; the current public
+`release-maintainers` team ID is `18321137`.
+
+The `v*` tag immutability template intentionally does not include the
+release-maintainers team. Release maintainers can create release tags, but only
+organization admins can update or delete them.
 
 GitHub's ruleset `required_signatures` rule checks commit signatures, not the
 release tag object. Do not rely on rulesets alone for the signed annotated tag
@@ -97,6 +103,15 @@ gh api \
 
 Use the same command with the other template paths after reviewing their target
 refs and ruleset IDs.
+
+When migrating the live `v*` tag policy, replace the former combined
+`public-release-tags-v` ruleset with both split rulesets. Confirm the
+`release-maintainers` team ID before applying
+`.github/rulesets/release-tags-v-creation.json`:
+
+```sh
+gh api orgs/Qbit-Org/teams/release-maintainers --jq .id
+```
 
 Apply the repository-wide merge-method policy with the repository API:
 
