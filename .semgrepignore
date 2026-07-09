@@ -1,0 +1,2 @@
+# Vendored upstream subtree; downstream lint requires it to remain a pure subtree.
+src/secp256k1/
