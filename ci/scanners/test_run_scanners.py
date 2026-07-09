@@ -258,6 +258,36 @@ class RunScannersTest(unittest.TestCase):
             gaps,
         )
 
+    def test_libbitcoinpqc_approves_crossbeam_rustsec_lockfile_patch(self) -> None:
+        self.assertEqual(
+            [run_scanners.LIBBITCOINPQC_RUSTSEC_CROSSBEAM_PATCH_ID],
+            run_scanners.libbitcoinpqc_approved_downstream_patch_ids(
+                ["Cargo.lock"],
+                run_scanners.LIBBITCOINPQC_RUSTSEC_CROSSBEAM_PATCH_LINES,
+            ),
+        )
+
+    def test_libbitcoinpqc_rejects_other_lockfile_patch(self) -> None:
+        changed_lines = list(run_scanners.LIBBITCOINPQC_RUSTSEC_CROSSBEAM_PATCH_LINES)
+        changed_lines[-1] = '+checksum = "unexpected"'
+
+        self.assertEqual(
+            [],
+            run_scanners.libbitcoinpqc_approved_downstream_patch_ids(
+                ["Cargo.lock"],
+                changed_lines,
+            ),
+        )
+
+    def test_libbitcoinpqc_rejects_extra_downstream_path(self) -> None:
+        self.assertEqual(
+            [],
+            run_scanners.libbitcoinpqc_approved_downstream_patch_ids(
+                ["Cargo.lock", "README.md"],
+                run_scanners.LIBBITCOINPQC_RUSTSEC_CROSSBEAM_PATCH_LINES,
+            ),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -58,13 +58,13 @@ jobs:
       REFERENCE_REF: ${{ github.event_name == 'schedule' && 'v30.2' || inputs.reference_ref }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ env.CHECKOUT_REF }}
           fetch-depth: 1
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.10"
 
@@ -217,7 +217,7 @@ jobs:
 
       - name: Upload RPC perf artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: rpc-perf-${{ github.run_id }}
           path: ${{ env.PERF_ARTIFACT_ROOT }}
