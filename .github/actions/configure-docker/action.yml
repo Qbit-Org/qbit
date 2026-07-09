@@ -54,7 +54,7 @@ runs:
         bash "${GITHUB_ACTION_PATH}/buildkit-config.sh"
 
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
+      uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       with:
         # Use host network to allow access to cirrus gha cache running on the host
         driver-opts: |
@@ -63,7 +63,7 @@ runs:
 
     # This is required to allow buildkit to access the actions cache
     - name: Expose actions cache variables
-      uses: actions/github-script@v6
+      uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
       with:
         script: |
           Object.keys(process.env).forEach(function (key) {

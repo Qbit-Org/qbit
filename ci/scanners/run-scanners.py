@@ -130,6 +130,13 @@ LIBBITCOINPQC_UPSTREAM_TAG = "v0.3.0"
 LIBBITCOINPQC_UPSTREAM_REF = f"refs/tags/{LIBBITCOINPQC_UPSTREAM_TAG}"
 LIBBITCOINPQC_UPSTREAM_PEELED_REF = f"{LIBBITCOINPQC_UPSTREAM_REF}^{{}}"
 LIBBITCOINPQC_VERIFY_COMMAND = ["test/lint/libbitcoinpqc-subtree-check.sh"]
+LIBBITCOINPQC_RUSTSEC_CROSSBEAM_PATCH_ID = "RUSTSEC-2026-0204-crossbeam-epoch-0.9.20"
+LIBBITCOINPQC_RUSTSEC_CROSSBEAM_PATCH_LINES = [
+    '-version = "0.9.18"',
+    '+version = "0.9.20"',
+    '-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"',
+    '+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"',
+]
 
 
 def utcnow() -> str:
@@ -1137,6 +1144,63 @@ def git_commit_tree(source: Path, commit: str) -> str:
     return stdout.strip() if exit_code == 0 else ""
 
 
+def git_diff_name_only(source: Path, left: str, right: str) -> list[str]:
+    exit_code, stdout, _stderr = git_command(source, "diff", "--name-only", left, right)
+    if exit_code != 0:
+        return []
+    return [line.strip() for line in stdout.splitlines() if line.strip()]
+
+
+def git_diff_changed_lines(source: Path, left: str, right: str, path: str) -> list[str]:
+    exit_code, stdout, _stderr = git_command(
+        source,
+        "diff",
+        "--unified=0",
+        "--no-ext-diff",
+        left,
+        right,
+        "--",
+        path,
+    )
+    if exit_code != 0:
+        return []
+    return [
+        line
+        for line in stdout.splitlines()
+        if (line.startswith("+") or line.startswith("-"))
+        and not line.startswith("+++")
+        and not line.startswith("---")
+    ]
+
+
+def libbitcoinpqc_approved_downstream_patch_ids(
+    changed_paths: list[str],
+    cargo_lock_changed_lines: list[str],
+) -> list[str]:
+    if (
+        changed_paths == ["Cargo.lock"]
+        and cargo_lock_changed_lines == LIBBITCOINPQC_RUSTSEC_CROSSBEAM_PATCH_LINES
+    ):
+        return [LIBBITCOINPQC_RUSTSEC_CROSSBEAM_PATCH_ID]
+    return []
+
+
+def libbitcoinpqc_approved_downstream_patch_ids_for_trees(
+    source: Path,
+    base_tree: str,
+    current_tree: str,
+) -> list[str]:
+    if not base_tree or not current_tree or base_tree == current_tree:
+        return []
+    changed_paths = git_diff_name_only(source, base_tree, current_tree)
+    cargo_lock_changed_lines = (
+        git_diff_changed_lines(source, base_tree, current_tree, "Cargo.lock")
+        if changed_paths == ["Cargo.lock"]
+        else []
+    )
+    return libbitcoinpqc_approved_downstream_patch_ids(changed_paths, cargo_lock_changed_lines)
+
+
 def git_peel_commit(source: Path, object_name: str) -> str:
     if not object_name:
         return ""
@@ -1265,15 +1329,24 @@ def libbitcoinpqc_provenance(source: Path) -> tuple[dict[str, Any], list[str]]:
     provenance["qbit_subtree_tree"] = current_tree
     provenance["qbit_import_tree"] = import_tree
     provenance["upstream_tag_tree"] = upstream_tree
+    approved_import_patches = libbitcoinpqc_approved_downstream_patch_ids_for_trees(
+        source, import_tree, current_tree
+    )
+    approved_upstream_patches = libbitcoinpqc_approved_downstream_patch_ids_for_trees(
+        source, upstream_tree, current_tree
+    )
+    approved_patches = sorted(set(approved_import_patches + approved_upstream_patches))
+    if approved_patches:
+        provenance["approved_downstream_patches"] = approved_patches
     if not current_tree:
         gaps.append("libbitcoinpqc subtree tree hash unavailable from HEAD.")
     if import_commit and not import_tree:
         gaps.append(f"libbitcoinpqc qbit import commit tree unavailable: {import_commit}")
-    if current_tree and import_tree and current_tree != import_tree:
+    if current_tree and import_tree and current_tree != import_tree and not approved_import_patches:
         gaps.append("libbitcoinpqc subtree tree does not match the recorded qbit import commit tree.")
     if upstream_ref_commit and not upstream_tree:
         gaps.append(f"libbitcoinpqc upstream tag commit tree unavailable: {upstream_ref_commit}")
-    if current_tree and upstream_tree and current_tree != upstream_tree:
+    if current_tree and upstream_tree and current_tree != upstream_tree and not approved_upstream_patches:
         gaps.append("libbitcoinpqc subtree tree does not match the upstream tag tree.")
 
     verify_script = source / LIBBITCOINPQC_VERIFY_COMMAND[0]

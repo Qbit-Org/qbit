@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import os
 import re
 import shutil
 import subprocess
@@ -574,7 +573,7 @@ def main() -> int:
 
         with tempfile.TemporaryDirectory(prefix="qbit-operator-gnupg-") as gnupg_home:
             gnupg_home_path = Path(gnupg_home)
-            os.chmod(gnupg_home_path, 0o700)
+            gnupg_home_path.chmod(0o700)
             import_operator_keys(args.gpg, gnupg_home_path, operator_keys_dir, policy)
             counts: dict[str, list[str]] = {}
             for artifact in artifacts:

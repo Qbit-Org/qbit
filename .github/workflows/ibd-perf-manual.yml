@@ -135,13 +135,13 @@ jobs:
       NETWORK_IBD_EXIT_TIMEOUT: ${{ github.event_name != 'schedule' && inputs.NETWORK_IBD_EXIT_TIMEOUT || '' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ env.CHECKOUT_REF }}
           fetch-depth: 1
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.10"
 
@@ -518,7 +518,7 @@ jobs:
         id: upload_perf_summary_artifact
         if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ibd-perf-${{ github.run_id }}-summary
           path: |
@@ -537,7 +537,7 @@ jobs:
         id: upload_perf_benchmark_artifacts
         if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ibd-perf-${{ github.run_id }}-bench
           path: |
@@ -556,7 +556,7 @@ jobs:
         id: upload_perf_replay_artifacts
         if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ibd-perf-${{ github.run_id }}-replay
           path: |
@@ -575,7 +575,7 @@ jobs:
         id: retry_perf_replay_artifacts
         if: always() && steps.upload_perf_replay_artifacts.outcome != 'success'
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ibd-perf-${{ github.run_id }}-replay
           path: |
@@ -594,7 +594,7 @@ jobs:
         id: upload_perf_network_artifacts
         if: always()
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ibd-perf-${{ github.run_id }}-network
           path: |
