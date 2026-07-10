@@ -32,6 +32,7 @@ if(ENABLE_WALLET)
   target_sources(test_bitcoin-qt
     PRIVATE
       addressbooktests.cpp
+      walletcontrollertests.cpp
       wallettests.cpp
       ../../wallet/test/wallet_test_fixture.cpp
   )
