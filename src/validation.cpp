@@ -116,6 +116,8 @@ const std::vector<std::string> CHECKLEVEL_DOC {
  *  noticeably interfere with the pruning mechanism.
  * */
 static constexpr int PRUNE_LOCK_BUFFER{10};
+/** Recent-work margin for warning about a substantially better invalid chain. */
+static constexpr int INVALID_CHAIN_WORK_WINDOW{6};
 static constexpr auto RECOVERED_WITNESS_READ_FAILED{"recovered-witness-read-failed"};
 static constexpr auto RECOVERED_WITNESS_VALIDATION_FAILED{"recovered-witness-validation-failed"};
 
@@ -2062,7 +2064,10 @@ void Chainstate::CheckForkWarningConditions()
         return;
     }
 
-    if (m_chainman.m_best_invalid && m_chainman.m_best_invalid->nChainWork > m_chain.Tip()->nChainWork + (GetBlockProof(*m_chain.Tip()) * 6)) {
+    const CBlockIndex& tip{*Assert(m_chain.Tip())};
+    const arith_uint256 invalid_chain_work_margin{GetRecentChainWork(tip, INVALID_CHAIN_WORK_WINDOW)};
+    if (m_chainman.m_best_invalid &&
+        m_chainman.m_best_invalid->nChainWork > tip.nChainWork + invalid_chain_work_margin) {
         LogPrintf("%s: Warning: Found invalid chain at least ~6 blocks longer than our best chain.\nChain state database corruption likely.\n", __func__);
         m_chainman.GetNotifications().warningSet(
             kernel::Warning::LARGE_WORK_INVALID_CHAIN,

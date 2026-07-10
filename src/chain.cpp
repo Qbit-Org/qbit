@@ -138,6 +138,17 @@ arith_uint256 GetBlockProof(const CBlockIndex& block)
     return (~bnTarget / (bnTarget + 1)) + 1;
 }
 
+arith_uint256 GetRecentChainWork(const CBlockIndex& tip, const int block_count)
+{
+    assert(block_count > 0);
+    if (tip.nHeight < block_count) return tip.nChainWork;
+
+    const CBlockIndex* ancestor{tip.GetAncestor(tip.nHeight - block_count)};
+    assert(ancestor != nullptr);
+    assert(ancestor->nChainWork <= tip.nChainWork);
+    return tip.nChainWork - ancestor->nChainWork;
+}
+
 int64_t GetBlockProofEquivalentTime(const CBlockIndex& to, const CBlockIndex& from, const CBlockIndex& tip, const Consensus::Params& params)
 {
     arith_uint256 r;

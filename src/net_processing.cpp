@@ -155,6 +155,8 @@ static const unsigned int MAX_BLOCKS_TO_ANNOUNCE = 16;
 static const unsigned int NODE_NETWORK_LIMITED_MIN_BLOCKS = 288;
 /** Window, in blocks, for connecting to NODE_NETWORK_LIMITED peers */
 static const unsigned int NODE_NETWORK_LIMITED_ALLOW_CONN_BLOCKS = 144;
+/** Recent-work window used to admit near-tip headers and blocks. */
+static constexpr int ANTI_DOS_WORK_WINDOW{144};
 /** Average delay between local address broadcasts */
 static constexpr auto AVG_LOCAL_ADDRESS_BROADCAST_INTERVAL{24h};
 /** Average delay between peer address broadcasts */
@@ -2660,9 +2662,9 @@ arith_uint256 PeerManagerImpl::GetAntiDoSWorkThreshold()
     LOCK(cs_main);
     if (m_chainman.ActiveChain().Tip() != nullptr) {
         const CBlockIndex *tip = m_chainman.ActiveChain().Tip();
-        // Use a 144 block buffer, so that we'll accept headers that fork from
-        // near our tip.
-        near_chaintip_work = tip->nChainWork - std::min<arith_uint256>(144*GetBlockProof(*tip), tip->nChainWork);
+        // Use the aggregate work of the recent window so that the buffer does
+        // not depend on which Cadence lane produced the current tip.
+        near_chaintip_work = tip->nChainWork - GetRecentChainWork(*tip, ANTI_DOS_WORK_WINDOW);
     }
     return std::max(near_chaintip_work, m_chainman.MinimumChainWork());
 }

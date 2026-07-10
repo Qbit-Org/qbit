@@ -366,6 +366,8 @@ protected:
 };
 
 arith_uint256 GetBlockProof(const CBlockIndex& block);
+/** Return the cumulative work contributed by up to the most recent block_count blocks ending at tip. */
+arith_uint256 GetRecentChainWork(const CBlockIndex& tip, int block_count);
 /** Return the time it would take to redo the work difference between from and to, assuming the current hashrate corresponds to the difficulty at tip, in seconds. */
 int64_t GetBlockProofEquivalentTime(const CBlockIndex& to, const CBlockIndex& from, const CBlockIndex& tip, const Consensus::Params&);
 /** Find the forking point between two chain tips. */
