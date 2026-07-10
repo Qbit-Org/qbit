@@ -60,6 +60,7 @@ from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_not_equal,
     assert_equal,
+    assert_raises_rpc_error,
     softfork_active,
 )
 from test_framework.wallet import MiniWallet
@@ -645,25 +646,28 @@ class CompactBlocksTest(BitcoinTestFramework):
         bad_peer.wait_for_disconnect()
 
     def test_low_work_compactblocks(self, test_node):
-        # A compactblock with insufficient work won't get its header included
+        # Compact blocks at the threshold are admitted, while a compact block
+        # one proof below it does not get its header included.
         node = self.nodes[0]
-        hashPrevBlock = int(node.getblockhash(node.getblockcount() - 150), 16)
-        block = self.build_block_on_tip(node)
-        block.hashPrevBlock = hashPrevBlock
-        block.solve()
+        height = node.getblockcount()
+        assert height > 146
 
-        comp_block = HeaderAndShortIDs()
-        comp_block.initialize_from_block(block)
+        def build_compact_block(parent_height):
+            block = self.build_block_on_tip(node)
+            block.hashPrevBlock = int(node.getblockhash(parent_height), 16)
+            block.solve()
+            compact = HeaderAndShortIDs()
+            compact.initialize_from_block(block)
+            return block, compact
+
+        accepted, accepted_compact = build_compact_block(height - 145)
+        test_node.send_and_ping(msg_cmpctblock(accepted_compact.to_p2p()))
+        assert_equal(node.getblockheader(accepted.hash_hex)["hash"], accepted.hash_hex)
+
+        rejected, rejected_compact = build_compact_block(height - 146)
         with self.nodes[0].assert_debug_log(['[net] Ignoring low-work compact block from peer 0']):
-            test_node.send_and_ping(msg_cmpctblock(comp_block.to_p2p()))
-
-        tips = node.getchaintips()
-        found = False
-        for x in tips:
-            if x["hash"] == block.hash_hex:
-                found = True
-                break
-        assert not found
+            test_node.send_and_ping(msg_cmpctblock(rejected_compact.to_p2p()))
+        assert_raises_rpc_error(-5, "Block not found", node.getblockheader, rejected.hash_hex)
 
     def test_compactblocks_not_at_tip(self, test_node):
         node = self.nodes[0]

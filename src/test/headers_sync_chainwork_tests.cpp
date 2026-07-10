@@ -136,6 +136,70 @@ std::shared_ptr<const CAuxPow> HeadersGeneratorSetup::MakeAuxpowPayloadWithScrip
 
 BOOST_FIXTURE_TEST_SUITE(headers_sync_chainwork_tests, HeadersGeneratorSetup)
 
+BOOST_AUTO_TEST_CASE(recent_chainwork_uses_mixed_lane_window)
+{
+    static constexpr int WORK_WINDOW{144};
+    const auto chain_params = CreateChainParams(*m_node.args, ChainType::MAIN);
+    const auto& consensus = chain_params->GetConsensus();
+    const uint32_t permissionless_bits{consensus.asertAnchorParams.nBitsLegacy};
+    const uint32_t auxpow_bits{consensus.asertAnchorParams.nBitsAuxPow};
+
+    CBlockIndex permissionless_index;
+    permissionless_index.nBits = permissionless_bits;
+    CBlockIndex auxpow_index;
+    auxpow_index.nBits = auxpow_bits;
+    const arith_uint256 permissionless_work{GetBlockProof(permissionless_index)};
+    const arith_uint256 auxpow_work{GetBlockProof(auxpow_index)};
+    BOOST_REQUIRE_NE(permissionless_work, auxpow_work);
+
+    std::vector<CBlockIndex> auxpow_tip_chain(WORK_WINDOW + 2);
+    std::vector<CBlockIndex> permissionless_tip_chain(WORK_WINDOW + 2);
+    const auto build_chain = [&](std::vector<CBlockIndex>& blocks, const bool auxpow_tip) {
+        uint64_t auxpow_count{0};
+        for (int height = 0; height < static_cast<int>(blocks.size()); ++height) {
+            // Give both windows the same 115:29 lane mix while changing which
+            // lane produced the block at height 144.
+            const bool auxpow{height > 0 && height <= WORK_WINDOW &&
+                              (auxpow_tip ? height <= 28 || height == WORK_WINDOW : height <= 29)};
+            CBlockIndex& block{blocks[height]};
+            block.nHeight = height;
+            block.pprev = height == 0 ? nullptr : &blocks[height - 1];
+            block.nVersion = MakeVersion(auxpow ? static_cast<uint16_t>(consensus.nAuxpowChainId) : 0,
+                                         auxpow,
+                                         /*version_bits=*/0);
+            block.nBits = auxpow ? auxpow_bits : permissionless_bits;
+            auxpow_count += auxpow;
+            block.nAuxPow = auxpow_count;
+            block.nChainWork = (block.pprev ? block.pprev->nChainWork : arith_uint256{}) + GetBlockProof(block);
+            block.BuildSkip();
+        }
+    };
+    build_chain(auxpow_tip_chain, /*auxpow_tip=*/true);
+    build_chain(permissionless_tip_chain, /*auxpow_tip=*/false);
+
+    const arith_uint256 expected_window{permissionless_work * 115 + auxpow_work * 29};
+    BOOST_CHECK_EQUAL(GetRecentChainWork(auxpow_tip_chain[WORK_WINDOW], WORK_WINDOW), expected_window);
+    BOOST_CHECK_EQUAL(GetRecentChainWork(permissionless_tip_chain[WORK_WINDOW], WORK_WINDOW), expected_window);
+    BOOST_CHECK_NE(GetBlockProof(auxpow_tip_chain[WORK_WINDOW]) * WORK_WINDOW,
+                   GetBlockProof(permissionless_tip_chain[WORK_WINDOW]) * WORK_WINDOW);
+
+    // Short chains use all available work, while full windows exclude the
+    // ancestor immediately before the window.
+    BOOST_CHECK_EQUAL(GetRecentChainWork(auxpow_tip_chain[0], WORK_WINDOW), auxpow_tip_chain[0].nChainWork);
+    BOOST_CHECK_EQUAL(GetRecentChainWork(auxpow_tip_chain[WORK_WINDOW - 1], WORK_WINDOW),
+                      auxpow_tip_chain[WORK_WINDOW - 1].nChainWork);
+    BOOST_CHECK_EQUAL(GetRecentChainWork(auxpow_tip_chain[WORK_WINDOW], WORK_WINDOW),
+                      auxpow_tip_chain[WORK_WINDOW].nChainWork - auxpow_tip_chain[0].nChainWork);
+    BOOST_CHECK_EQUAL(GetRecentChainWork(auxpow_tip_chain[WORK_WINDOW + 1], WORK_WINDOW),
+                      auxpow_tip_chain[WORK_WINDOW + 1].nChainWork - auxpow_tip_chain[1].nChainWork);
+
+    arith_uint256 expected_warning_window{0};
+    for (int height = WORK_WINDOW - 5; height <= WORK_WINDOW; ++height) {
+        expected_warning_window += GetBlockProof(auxpow_tip_chain[height]);
+    }
+    BOOST_CHECK_EQUAL(GetRecentChainWork(auxpow_tip_chain[WORK_WINDOW], 6), expected_warning_window);
+}
+
 // In this test, we construct two sets of headers from genesis, one with
 // sufficient proof of work and one without.
 // 1. We deliver the first set of headers and verify that the headers sync state
