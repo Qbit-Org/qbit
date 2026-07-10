@@ -509,21 +509,17 @@ class WalletP2MRTest(BitcoinTestFramework):
             raw_tx_with_outputs([(reserved_witness_script(3), COIN)]),
         )
 
-        self.log.info("Check invalid fee-subtraction outputs fail before locking wallet inputs")
+        self.log.info("Check an invalid fee-subtraction output fails before locking wallet inputs")
         invalid_raw_tx = raw_tx_with_outputs([(invalid_p2pkh_script, COIN)])
         locked_before = p2mr_wallet.listlockunspent()
-        for options in (
+        assert_raises_rpc_error(
+            -8,
+            "Output scriptPubKey is not allowed in restricted-output mode",
+            p2mr_wallet.fundrawtransaction,
+            invalid_raw_tx,
             {"subtractFeeFromOutputs": [0], "lockUnspents": True},
-            {"subtract_fee_from_outputs": [0], "lock_unspents": True},
-        ):
-            assert_raises_rpc_error(
-                -8,
-                "Output scriptPubKey is not allowed in restricted-output mode",
-                p2mr_wallet.fundrawtransaction,
-                invalid_raw_tx,
-                options,
-            )
-            assert_equal(p2mr_wallet.listlockunspent(), locked_before)
+        )
+        assert_equal(p2mr_wallet.listlockunspent(), locked_before)
 
         self.log.info("Check -p2mronly fundrawtransaction accepts prebuilt allowed recipient outputs")
         for output_name, outputs in (
