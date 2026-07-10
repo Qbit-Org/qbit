@@ -187,12 +187,12 @@ bool ParseP2MRProofJson(const QString& proof_json, common::P2MRDataSignatureProo
         error = SignVerifyMessageDialog::tr("Proof field \"leaf_version\" must be a number.");
         return false;
     }
-    const int leaf_version_int{leaf_version.getInt<int>()};
-    if (leaf_version_int < 0 || leaf_version_int > 0xff) {
-        error = SignVerifyMessageDialog::tr("Proof field \"leaf_version\" is out of range.");
+    const auto leaf_version_int{ToIntegral<uint8_t>(leaf_version.getValStr())};
+    if (!leaf_version_int.has_value()) {
+        error = SignVerifyMessageDialog::tr("Proof field \"leaf_version\" must be an integer from 0 to 255.");
         return false;
     }
-    proof.leaf_version = static_cast<uint8_t>(leaf_version_int);
+    proof.leaf_version = *leaf_version_int;
     return true;
 }
 
