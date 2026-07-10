@@ -6,6 +6,8 @@
 #include <qt/test/util.h>
 
 #include <wallet/coincontrol.h>
+#include <common/p2mr_data_signature.h>
+#include <crypto/pqc.h>
 #include <interfaces/chain.h>
 #include <interfaces/handler.h>
 #include <interfaces/node.h>
@@ -53,6 +55,7 @@
 #include <QComboBox>
 #include <QElapsedTimer>
 #include <QEvent>
+#include <QLabel>
 #include <QLineEdit>
 #include <QObject>
 #include <QPointer>
@@ -64,6 +67,8 @@
 #include <QTextEdit>
 #include <QListView>
 #include <QDialogButtonBox>
+
+#include <univalue.h>
 
 using wallet::AddWallet;
 using wallet::CWallet;
@@ -81,6 +86,67 @@ constexpr int QT_WALLET_FUNDING_TXS{5};
 constexpr CAmount QT_WALLET_FUNDING_AMOUNT{210 * COIN - 1000};
 constexpr std::array QT_WALLET_BECH32_DESCRIPTOR_OUTPUT_TYPES{OutputType::BECH32};
 constexpr std::array QT_WALLET_P2MR_DESCRIPTOR_OUTPUT_TYPES{OutputType::P2MR};
+
+QString MakeP2MRProofJson(std::string leaf_version)
+{
+    UniValue proof{UniValue::VOBJ};
+    proof.pushKV("proof_mode", common::P2MR_DATA_SIGNATURE_PROOF_MODE);
+    proof.pushKV("address", EncodeDestination(WitnessV2P2MR{}));
+    proof.pushKV("message_hash", std::string(uint256::size() * 2, '0'));
+    proof.pushKV("pubkey", std::string(PQC_PUBKEY_SIZE * 2, '0'));
+    proof.pushKV("signature", std::string(PQC_SIG_SIZE * 2, '0'));
+    proof.pushKV("leaf_script", "00");
+    proof.pushKV("control_block", "c1");
+
+    UniValue leaf_version_value;
+    leaf_version_value.setNumStr(std::move(leaf_version));
+    proof.pushKV("leaf_version", std::move(leaf_version_value));
+    return QString::fromStdString(proof.write());
+}
+
+void TestP2MRProofLeafVersionValidation(SignVerifyMessageDialog& dialog)
+{
+    QPlainTextEdit* proof_input = dialog.findChild<QPlainTextEdit*>("messageIn_VM");
+    QVERIFY(proof_input);
+    QComboBox* verify_input_mode = dialog.findChild<QComboBox*>("p2mrVerifyInputMode_VM");
+    QVERIFY(verify_input_mode);
+    QLabel* status_label = dialog.findChild<QLabel*>("statusLabel_VM");
+    QVERIFY(status_label);
+    QPushButton* verify_button = dialog.findChild<QPushButton*>("verifyMessageButton_VM");
+    QVERIFY(verify_button);
+
+    dialog.showTab_VM(/*fShow=*/false);
+    verify_input_mode->setCurrentIndex(2);
+
+    const QString stale_success{"P2MR/PQC proof verified for a previous proof."};
+    const QString leaf_version_error{"Proof field \"leaf_version\" must be an integer from 0 to 255."};
+    const std::array invalid_leaf_versions{
+        "192.0",
+        "1e2",
+        "-1",
+        "256",
+        "2147483648",
+        "1e1000000",
+    };
+    for (const char* leaf_version : invalid_leaf_versions) {
+        status_label->setStyleSheet("QLabel { color: green; }");
+        status_label->setText(stale_success);
+        proof_input->setPlainText(MakeP2MRProofJson(leaf_version));
+
+        verify_button->click();
+
+        QCOMPARE(status_label->text(), leaf_version_error);
+        QVERIFY(status_label->styleSheet().contains("red"));
+        QVERIFY(status_label->text() != stale_success);
+        QVERIFY(verify_button->isEnabled());
+        QVERIFY(QApplication::instance() != nullptr);
+    }
+
+    proof_input->setPlainText(MakeP2MRProofJson("192"));
+    verify_button->click();
+    QVERIFY(status_label->text().startsWith("P2MR/PQC proof verification failed:"));
+    QVERIFY(status_label->styleSheet().contains("red"));
+}
 
 template <typename Predicate>
 bool WaitUntil(Predicate&& predicate, int timeout_ms)
@@ -845,6 +911,8 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
     QPushButton* verify_button = sign_verify_dialog.findChild<QPushButton*>("verifyMessageButton_VM");
     QVERIFY(verify_button);
     QCOMPARE(verify_button->text(), QString("Verify &Proof"));
+
+    TestP2MRProofLeafVersionValidation(sign_verify_dialog);
 }
 
 void TestSendPQCReportPropagation(interfaces::Node& node)
