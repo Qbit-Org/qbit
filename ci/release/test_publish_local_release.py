@@ -342,6 +342,26 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         self.assertNotIn("release upload", gh_log)
         self.assertNotIn("release edit", gh_log)
 
+    def test_validation_only_accepts_matching_published_release(self) -> None:
+        (self.gh_state / "release-state").write_text("published\n", encoding="utf8")
+        remote_assets = []
+        for path in sorted(self.artifacts.iterdir()):
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            remote_assets.append(f"{path.name}\tsha256:{digest}")
+        (self.gh_state / "assets.tsv").write_text(
+            "\n".join(remote_assets) + "\n", encoding="utf8"
+        )
+
+        result = self.run_publisher()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Published release assets exactly match", result.stdout)
+        self.assertIn("Validation-only mode complete", result.stdout)
+        gh_log = self.gh_log.read_text(encoding="utf8")
+        self.assertNotIn("release create", gh_log)
+        self.assertNotIn("release upload", gh_log)
+        self.assertNotIn("release edit", gh_log)
+
     def test_draft_asset_digest_mismatch_fails_without_replacement(self) -> None:
         artifact = next(
             path for path in self.artifacts.iterdir() if path.name.startswith("qbit-")

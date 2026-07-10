@@ -681,8 +681,15 @@ RELEASE_TAG=""
 RELEASE_URL=""
 if RELEASE_VIEW_OUTPUT="$(release_view 2>/dev/null)"; then
     load_release_view "$RELEASE_VIEW_OUTPUT"
-    [ "$RELEASE_IS_DRAFT" = true ] \
-        || die "Release $TAG already exists and is published; refusing to modify it"
+    if [ "$RELEASE_IS_DRAFT" != true ]; then
+        [ "$MODE" = validate ] \
+            || die "Release $TAG already exists and is published; refusing to modify it"
+        write_remote_asset_manifest "$REMOTE_ASSET_MANIFEST"
+        compare_asset_manifests exact "$REMOTE_ASSET_MANIFEST"
+        msg "Published release assets exactly match local names and SHA256 digests"
+        msg "Validation-only mode complete: $RELEASE_URL (immutable=$RELEASE_IS_IMMUTABLE)"
+        exit 0
+    fi
     write_remote_asset_manifest "$REMOTE_ASSET_MANIFEST"
     compare_asset_manifests subset "$REMOTE_ASSET_MANIFEST"
     msg "Found matching draft release; missing assets will be resumed"
