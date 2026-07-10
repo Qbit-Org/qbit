@@ -323,8 +323,7 @@ jobs:
 
           release_process_re='contrib/release-''process/'
           release_sanitize_re='contrib/release-''sanitize/'
-          release_publish_re='[.]github/workflows/release-publish[.]yml$'
-          release_path_re="^(ci/release/|contrib/guix/|${release_process_re}|${release_sanitize_re}|${release_publish_re})"
+          release_path_re="^(ci/release/|contrib/guix/|${release_process_re}|${release_sanitize_re})"
           if grep -E "${release_path_re}" "${changed_files}"; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
@@ -343,10 +342,10 @@ jobs:
         run: |
           release_process_dir='contrib/release-''process'
           release_sanitize_dir='contrib/release-''sanitize'
-          # Retained public release tests: present in both the source tree and
-          # sanitized public snapshots, and depended on by release-publish.yml,
-          # so a missing file is a regression and must fail the check.
+          # Retained public release tests cover the public publisher and its
+          # validators, so a missing file is a regression and must fail.
           required_tests=(
+            ci/release/test_publish_local_release.py
             ci/release/test_validate_builder_attestations.py
             ci/release/test_validate_key_metadata.py
             ci/release/test_validate_release_artifacts.py
@@ -362,7 +361,7 @@ jobs:
           )
           for test_file in "${required_tests[@]}"; do
             if [[ ! -f "${test_file}" ]]; then
-              echo "::error::Retained release test ${test_file} is missing; it is kept in public snapshots and required by release-publish.yml." >&2
+              echo "::error::Required public release test ${test_file} is missing." >&2
               exit 1
             fi
             python3 "${test_file}"
