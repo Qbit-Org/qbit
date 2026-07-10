@@ -64,7 +64,12 @@ static bool HasAssumeutxoData()
     return !Params().GetAvailableSnapshotHeights().empty();
 }
 
-static CBlockIndex& InsertTestBlockIndex(ChainstateManager& chainman, const uint256& hash, CBlockIndex* prev, int height, uint32_t n_bits, const arith_uint256& chain_work) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+static uint256 TestBlockHash(uint64_t value)
+{
+    return ArithToUint256(arith_uint256{value});
+}
+
+static CBlockIndex& InsertTestBlockIndex(ChainstateManager& chainman, const uint256& hash, CBlockIndex* prev, int height, uint32_t n_bits, const arith_uint256& chain_work, uint32_t block_time = 0, bool auxpow = false) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
 {
     AssertLockHeld(::cs_main);
     auto [it, inserted] = chainman.m_blockman.m_block_index.try_emplace(hash);
@@ -76,6 +81,11 @@ static CBlockIndex& InsertTestBlockIndex(ChainstateManager& chainman, const uint
     index.nHeight = height;
     index.nBits = n_bits;
     index.nChainWork = chain_work;
+    index.nTime = block_time;
+    if (auxpow) {
+        index.nVersion = MakeVersion(static_cast<uint16_t>(chainman.GetConsensus().nAuxpowChainId),
+                                     /*auxpow=*/true, /*version_bits=*/0);
+    }
     index.nTx = 1;
     index.m_chain_tx_count = prev ? prev->m_chain_tx_count + 1 : 1;
     index.nStatus = BLOCK_VALID_SCRIPTS | BLOCK_HAVE_DATA;
@@ -226,9 +236,9 @@ BOOST_FIXTURE_TEST_CASE(needs_witness_for_validation_gate, TestingSetup)
         auto& mutable_opts = const_cast<ChainstateManager::Options&>(chainman.m_options);
         mutable_opts.minimum_chain_work = proof;
 
-        auto& base = InsertTestBlockIndex(chainman, uint256{1}, nullptr, 0, n_bits, proof);
-        auto& candidate = InsertTestBlockIndex(chainman, uint256{2}, &base, 1, n_bits, proof * 2);
-        auto& assumed = InsertTestBlockIndex(chainman, uint256{3}, &candidate, 2, n_bits, proof * 3);
+        auto& base = InsertTestBlockIndex(chainman, uint256{1}, nullptr, 0, n_bits, proof, 1'000);
+        auto& candidate = InsertTestBlockIndex(chainman, uint256{2}, &base, 1, n_bits, proof * 2, 1'060);
+        auto& assumed = InsertTestBlockIndex(chainman, uint256{3}, &candidate, 2, n_bits, proof * 3, 1'120);
 
         mutable_opts.assumed_valid_block = uint256::ZERO;
         chainman.m_best_header = &assumed;
@@ -238,19 +248,205 @@ BOOST_FIXTURE_TEST_CASE(needs_witness_for_validation_gate, TestingSetup)
         BOOST_CHECK(!chainman.NeedsWitnessForValidation(candidate));
         BOOST_CHECK(!test_chainman.CanSkipScriptChecksForTest(candidate, /*witness_unavailable=*/false));
 
-        auto& best = InsertTestBlockIndex(chainman, uint256{4}, &assumed, 3, n_bits, assumed.nChainWork + proof * 2);
+        auto& best = InsertTestBlockIndex(chainman, uint256{4}, &assumed, 3, n_bits, assumed.nChainWork + proof * 2, 1'180);
         chainman.m_best_header = &best;
         BOOST_CHECK(!chainman.NeedsWitnessForValidation(candidate));
         BOOST_CHECK(!test_chainman.CanSkipScriptChecksForTest(candidate, /*witness_unavailable=*/false));
 
         const int64_t burial_seconds{60 * 60 * 24 * 7 * 2};
         const int64_t burial_blocks{burial_seconds / chainman.GetConsensus().nPowTargetSpacing + 1};
-        auto& buried = InsertTestBlockIndex(chainman, uint256{6}, &best, 4, n_bits, best.nChainWork + proof * burial_blocks);
-        chainman.m_best_header = &buried;
+        auto* buried = &InsertTestBlockIndex(chainman, uint256{6}, &best, 4, n_bits, best.nChainWork + proof * burial_blocks, 1'240);
+        // Include enough history before the sampled window for both endpoint
+        // median-times-past to use a full 11-block sample.
+        for (int i = 0; i < 126; ++i) {
+            buried = &InsertTestBlockIndex(chainman, uint256{static_cast<uint8_t>(100 + i)}, buried,
+                                           buried->nHeight + 1, n_bits, buried->nChainWork + proof,
+                                           buried->nTime + chainman.GetConsensus().nPowTargetSpacing);
+        }
+        chainman.m_best_header = buried;
         BOOST_CHECK(test_chainman.CanSkipScriptChecksForTest(candidate, /*witness_unavailable=*/false));
 
         auto& alternate = InsertTestBlockIndex(chainman, uint256{5}, &base, 1, n_bits, proof * 2);
         BOOST_CHECK(chainman.NeedsWitnessForValidation(alternate));
+    });
+}
+
+BOOST_FIXTURE_TEST_CASE(assumevalid_burial_uses_mixed_lane_work_rate, TestingSetup)
+{
+    auto& chainman{*Assert(m_node.chainman)};
+    auto& test_chainman{static_cast<TestChainstateManager&>(chainman)};
+
+    WITH_LOCK(::cs_main, {
+        const uint32_t permissionless_bits{chainman.ActiveChain()[0]->nBits};
+        CBlockIndex proof_index;
+        proof_index.nBits = permissionless_bits;
+        const arith_uint256 permissionless_proof{GetBlockProof(proof_index)};
+        BOOST_REQUIRE(permissionless_proof != 0);
+
+        arith_uint256 auxpow_target;
+        auxpow_target.SetCompact(permissionless_bits);
+        auxpow_target /= arith_uint256{1'000};
+        const uint32_t auxpow_bits{auxpow_target.GetCompact()};
+        proof_index.nBits = auxpow_bits;
+        const arith_uint256 auxpow_proof{GetBlockProof(proof_index)};
+        BOOST_REQUIRE(auxpow_proof > permissionless_proof * 900);
+
+        auto& mutable_opts = const_cast<ChainstateManager::Options&>(chainman.m_options);
+        mutable_opts.minimum_chain_work = permissionless_proof;
+
+        auto* candidate = &InsertTestBlockIndex(chainman, uint256{1}, nullptr, 0,
+                                                permissionless_bits, permissionless_proof, 1'000);
+        mutable_opts.assumed_valid_block = candidate->GetBlockHash();
+
+        // Give the recent-work window enough preceding history for stable MTP
+        // endpoints, then compress the older burial work into one test index.
+        CBlockIndex* tip{candidate};
+        for (int i = 0; i < 10; ++i) {
+            tip = &InsertTestBlockIndex(chainman, uint256{static_cast<uint8_t>(2 + i)}, tip,
+                                        tip->nHeight + 1, permissionless_bits,
+                                        tip->nChainWork + permissionless_proof, tip->nTime + 60);
+        }
+
+        const arith_uint256 window_work{auxpow_proof * 24 + permissionless_proof * 96};
+        const arith_uint256 target_burial_work{window_work * 167 + (window_work * 9) / arith_uint256{10}};
+        const arith_uint256 work_before_window{target_burial_work - window_work};
+        BOOST_REQUIRE(candidate->nChainWork + work_before_window > tip->nChainWork);
+        tip = &InsertTestBlockIndex(chainman, uint256{12}, tip, tip->nHeight + 1,
+                                    permissionless_bits, candidate->nChainWork + work_before_window,
+                                    tip->nTime + 60);
+
+        for (int i = 0; i < 120; ++i) {
+            const bool auxpow{i % 5 == 0};
+            const arith_uint256 block_proof{auxpow ? auxpow_proof : permissionless_proof};
+            tip = &InsertTestBlockIndex(chainman, uint256{static_cast<uint8_t>(20 + i)}, tip,
+                                        tip->nHeight + 1, auxpow ? auxpow_bits : permissionless_bits,
+                                        tip->nChainWork + block_proof, tip->nTime + 60, auxpow);
+        }
+
+        BOOST_REQUIRE(tip->IsPermissionless());
+        BOOST_CHECK_EQUAL(tip->nChainWork - candidate->nChainWork, target_burial_work);
+        chainman.m_best_header = tip;
+        BOOST_CHECK_GT(GetBlockProofEquivalentTime(*tip, *candidate, *tip, chainman.GetConsensus()),
+                       60 * 60 * 24 * 7 * 2);
+        BOOST_CHECK(!test_chainman.CanSkipScriptChecksForTest(*candidate, /*witness_unavailable=*/false));
+
+        tip = &InsertTestBlockIndex(chainman, uint256{200}, tip, tip->nHeight + 1, auxpow_bits,
+                                    tip->nChainWork + auxpow_proof, tip->nTime + 60, /*auxpow=*/true);
+        BOOST_REQUIRE(tip->SignalsAuxpow());
+        chainman.m_best_header = tip;
+        BOOST_CHECK_LT(GetBlockProofEquivalentTime(*tip, *candidate, *tip, chainman.GetConsensus()),
+                       60 * 60 * 24 * 7 * 2);
+        BOOST_CHECK(!test_chainman.CanSkipScriptChecksForTest(*candidate, /*witness_unavailable=*/false));
+    });
+}
+
+BOOST_FIXTURE_TEST_CASE(assumevalid_burial_rejects_unusable_work_rate_samples, TestingSetup)
+{
+    auto& chainman{*Assert(m_node.chainman)};
+    auto& test_chainman{static_cast<TestChainstateManager&>(chainman)};
+
+    WITH_LOCK(::cs_main, {
+        const uint32_t n_bits{chainman.ActiveChain()[0]->nBits};
+        CBlockIndex proof_index;
+        proof_index.nBits = n_bits;
+        const arith_uint256 proof{GetBlockProof(proof_index)};
+        BOOST_REQUIRE(proof != 0);
+
+        auto& mutable_opts = const_cast<ChainstateManager::Options&>(chainman.m_options);
+        mutable_opts.minimum_chain_work = 0;
+
+        auto* stale_candidate = &InsertTestBlockIndex(chainman, TestBlockHash(1'000), nullptr, 0,
+                                                      n_bits, proof, 1'000);
+        auto* stale_tip = &InsertTestBlockIndex(chainman, TestBlockHash(1'001), stale_candidate, 1,
+                                                n_bits, proof * 2, 1'060);
+        for (int i = 0; i < 120; ++i) {
+            stale_tip = &InsertTestBlockIndex(chainman, TestBlockHash(1'002 + i), stale_tip,
+                                              stale_tip->nHeight + 1, n_bits, stale_tip->nChainWork,
+                                              stale_tip->nTime + 60);
+        }
+        mutable_opts.assumed_valid_block = stale_candidate->GetBlockHash();
+        chainman.m_best_header = stale_tip;
+        BOOST_CHECK(!test_chainman.CanSkipScriptChecksForTest(*stale_candidate, /*witness_unavailable=*/false));
+
+        auto* zero_time_candidate = &InsertTestBlockIndex(chainman, TestBlockHash(2'000), nullptr, 0,
+                                                          n_bits, proof, 1'000);
+        CBlockIndex* zero_time_tip{zero_time_candidate};
+        for (int i = 0; i < 119; ++i) {
+            zero_time_tip = &InsertTestBlockIndex(chainman, TestBlockHash(2'001 + i), zero_time_tip,
+                                                  zero_time_tip->nHeight + 1, n_bits,
+                                                  zero_time_tip->nChainWork + proof, 1'000);
+        }
+        mutable_opts.assumed_valid_block = zero_time_candidate->GetBlockHash();
+        chainman.m_best_header = zero_time_tip;
+        BOOST_CHECK(!test_chainman.CanSkipScriptChecksForTest(*zero_time_candidate, /*witness_unavailable=*/false));
+
+        zero_time_tip = &InsertTestBlockIndex(chainman, TestBlockHash(2'120), zero_time_tip,
+                                              zero_time_tip->nHeight + 1, n_bits,
+                                              zero_time_tip->nChainWork + proof, 1'000);
+        chainman.m_best_header = zero_time_tip;
+        BOOST_CHECK(!test_chainman.CanSkipScriptChecksForTest(*zero_time_candidate, /*witness_unavailable=*/false));
+
+        auto* high_work_candidate = &InsertTestBlockIndex(chainman, TestBlockHash(3'000), nullptr, 0,
+                                                          n_bits, proof * 1'000, 1'000);
+        auto* low_work_tip = &InsertTestBlockIndex(chainman, TestBlockHash(3'001), high_work_candidate, 1,
+                                                   n_bits, proof, 1'060);
+        for (int i = 0; i < 120; ++i) {
+            low_work_tip = &InsertTestBlockIndex(chainman, TestBlockHash(3'002 + i), low_work_tip,
+                                                 low_work_tip->nHeight + 1, n_bits,
+                                                 low_work_tip->nChainWork + proof, low_work_tip->nTime + 60);
+        }
+        mutable_opts.assumed_valid_block = high_work_candidate->GetBlockHash();
+        chainman.m_best_header = low_work_tip;
+        BOOST_REQUIRE(low_work_tip->nChainWork < high_work_candidate->nChainWork);
+        BOOST_CHECK(!test_chainman.CanSkipScriptChecksForTest(*high_work_candidate, /*witness_unavailable=*/false));
+    });
+}
+
+BOOST_FIXTURE_TEST_CASE(assumevalid_burial_boundary_is_strict_and_overflow_safe, TestingSetup)
+{
+    auto& chainman{*Assert(m_node.chainman)};
+    auto& test_chainman{static_cast<TestChainstateManager&>(chainman)};
+
+    WITH_LOCK(::cs_main, {
+        const uint32_t n_bits{chainman.ActiveChain()[0]->nBits};
+        constexpr uint32_t BURIAL_SECONDS{60 * 60 * 24 * 7 * 2};
+        constexpr uint32_t WINDOW_BLOCKS{120};
+        constexpr uint32_t EXACT_BLOCK_SPACING{BURIAL_SECONDS / WINDOW_BLOCKS};
+        const arith_uint256 max_work{~arith_uint256{0}};
+
+        auto& mutable_opts = const_cast<ChainstateManager::Options&>(chainman.m_options);
+        mutable_opts.minimum_chain_work = 0;
+
+        auto* candidate = &InsertTestBlockIndex(chainman, TestBlockHash(4'000), nullptr, 0,
+                                                n_bits, 0, 1'000);
+        CBlockIndex* window_start{candidate};
+        for (int i = 0; i < 11; ++i) {
+            window_start = &InsertTestBlockIndex(chainman, TestBlockHash(4'001 + i), window_start,
+                                                 window_start->nHeight + 1, n_bits, 0,
+                                                 window_start->nTime + EXACT_BLOCK_SPACING);
+        }
+
+        std::vector<CBlockIndex*> window;
+        window.reserve(WINDOW_BLOCKS);
+        CBlockIndex* tip{window_start};
+        for (uint32_t i = 1; i <= WINDOW_BLOCKS; ++i) {
+            const arith_uint256 chain_work{i == WINDOW_BLOCKS ? max_work : arith_uint256{i}};
+            tip = &InsertTestBlockIndex(chainman, TestBlockHash(4'100 + i), tip,
+                                        tip->nHeight + 1, n_bits, chain_work,
+                                        window_start->nTime + i * EXACT_BLOCK_SPACING);
+            window.push_back(tip);
+        }
+
+        mutable_opts.assumed_valid_block = candidate->GetBlockHash();
+        chainman.m_best_header = tip;
+        BOOST_REQUIRE_EQUAL(tip->GetMedianTimePast() - window_start->GetMedianTimePast(), BURIAL_SECONDS);
+        BOOST_CHECK(!test_chainman.CanSkipScriptChecksForTest(*candidate, /*witness_unavailable=*/false));
+
+        for (uint32_t i = 1; i <= WINDOW_BLOCKS; ++i) {
+            window[i - 1]->nTime = window_start->nTime + i * (EXACT_BLOCK_SPACING + 1);
+        }
+        BOOST_REQUIRE_GT(tip->GetMedianTimePast() - window_start->GetMedianTimePast(), BURIAL_SECONDS);
+        BOOST_CHECK(test_chainman.CanSkipScriptChecksForTest(*candidate, /*witness_unavailable=*/false));
     });
 }
 

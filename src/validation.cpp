@@ -71,6 +71,7 @@
 #include <cassert>
 #include <chrono>
 #include <deque>
+#include <limits>
 #include <numeric>
 #include <optional>
 #include <ranges>
@@ -2407,6 +2408,65 @@ static unsigned int GetBlockScriptFlags(const CBlockIndex& block_index, const Ch
 // Full blocks keep the existing two-week assumevalid burial check, while
 // witness-pruned blocks fall back to the assumed-valid ancestry/work gate
 // because witness script execution is unavailable once history is compacted.
+static constexpr int ASSUMEVALID_WORK_RATE_WINDOW{120};
+static constexpr uint32_t ASSUMEVALID_BURIAL_SECONDS{60 * 60 * 24 * 7 * 2};
+
+/**
+ * Return whether work / reference_work exceeds seconds / elapsed_seconds.
+ *
+ * Dividing both ratios into integer and remainder parts avoids overflowing
+ * arith_uint256 when comparing the cross-products.
+ */
+static bool WorkDurationExceeds(const arith_uint256& work, const arith_uint256& reference_work,
+                                uint32_t elapsed_seconds, uint32_t seconds)
+{
+    if (work == 0 || reference_work == 0 || elapsed_seconds == 0) return false;
+
+    const arith_uint256 work_quotient{work / reference_work};
+    const arith_uint256 seconds_quotient{seconds / elapsed_seconds};
+    if (work_quotient != seconds_quotient) return work_quotient > seconds_quotient;
+
+    const arith_uint256 work_remainder{work - work_quotient * reference_work};
+    const uint32_t seconds_remainder{seconds % elapsed_seconds};
+
+    // Compare work_remainder / reference_work with
+    // seconds_remainder / elapsed_seconds. Computing the floor of the
+    // right-hand cross-product this way keeps every intermediate value in
+    // range. The first product is strictly less than reference_work and the
+    // second product fits in uint64_t.
+    const arith_uint256 elapsed{elapsed_seconds};
+    const arith_uint256 reference_quotient{reference_work / elapsed};
+    const arith_uint256 reference_remainder{reference_work - reference_quotient * elapsed};
+    arith_uint256 remainder_threshold{reference_quotient * seconds_remainder};
+    remainder_threshold += reference_remainder.GetLow64() * seconds_remainder / elapsed_seconds;
+
+    return work_remainder > remainder_threshold;
+}
+
+/**
+ * Check the assumevalid burial interval against aggregate recent chainwork.
+ * A multi-block work-rate sample prevents either cadence lane at the tip from
+ * controlling the estimate. Missing history, non-monotonic work, and invalid
+ * timestamp windows all fail closed.
+ */
+static bool HasAssumeValidBurial(const CBlockIndex& tip, const CBlockIndex& block_index)
+{
+    const CBlockIndex* window_start{&tip};
+    for (int i = 0; i < ASSUMEVALID_WORK_RATE_WINDOW; ++i) {
+        window_start = window_start->pprev;
+        if (!window_start) return false;
+    }
+
+    if (tip.nChainWork <= window_start->nChainWork || tip.nChainWork <= block_index.nChainWork) return false;
+
+    const int64_t elapsed{tip.GetMedianTimePast() - window_start->GetMedianTimePast()};
+    if (elapsed <= 0 || elapsed > std::numeric_limits<uint32_t>::max()) return false;
+
+    return WorkDurationExceeds(tip.nChainWork - block_index.nChainWork,
+                               tip.nChainWork - window_start->nChainWork,
+                               static_cast<uint32_t>(elapsed), ASSUMEVALID_BURIAL_SECONDS);
+}
+
 static bool IsAssumedValidAncestor(const ChainstateManager& chainman, const CBlockIndex& block_index)
     EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
 {
@@ -2436,7 +2496,7 @@ bool ChainstateManager::CanSkipScriptChecks(const CBlockIndex& block_index, bool
     if (!IsAssumedValidAncestor(*this, block_index)) return false;
     if (witness_unavailable) return true;
 
-    return GetBlockProofEquivalentTime(*m_best_header, block_index, *m_best_header, GetConsensus()) > 60 * 60 * 24 * 7 * 2;
+    return HasAssumeValidBurial(*m_best_header, block_index);
 }
 
 util::Result<void> ChainstateManager::CheckAssumeValidCoversWitnessPrunedHistory() const
