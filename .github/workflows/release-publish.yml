@@ -129,6 +129,10 @@ jobs:
               core.setFailed(`Tag ${tag} is not a verified signed tag (reason: ${verification.reason || 'unknown'})`);
               return;
             }
+            if (tagObject.data.object.type !== 'commit') {
+              core.setFailed(`Tag ${tag} must target a commit, got ${tagObject.data.object.type || 'unknown'}`);
+              return;
+            }
 
             core.setOutput('tag', tag);
             core.setOutput('tag_sha', ref.data.object.sha);
@@ -167,6 +171,28 @@ jobs:
         with:
           ref: refs/tags/${{ steps.tag.outputs.tag }}
           fetch-depth: 0
+
+      - name: Restore verified annotated release tag
+        env:
+          TAG_NAME: ${{ steps.tag.outputs.tag }}
+          TAG_SHA: ${{ steps.tag.outputs.tag_sha }}
+          TARGET_COMMITISH: ${{ steps.tag.outputs.target_commitish }}
+        run: |
+          set -euo pipefail
+
+          git fetch --force --no-tags origin \
+            "refs/tags/${TAG_NAME}:refs/tags/${TAG_NAME}"
+
+          local_tag_sha="$(git rev-parse "refs/tags/${TAG_NAME}^{tag}")"
+          local_target="$(git rev-parse "refs/tags/${TAG_NAME}^{commit}")"
+          if [[ "${local_tag_sha,,}" != "${TAG_SHA,,}" ]]; then
+            echo "Local tag object ${local_tag_sha} does not match verified tag object ${TAG_SHA}" >&2
+            exit 1
+          fi
+          if [[ "${local_target,,}" != "${TARGET_COMMITISH,,}" ]]; then
+            echo "Local tag target ${local_target} does not match verified target ${TARGET_COMMITISH}" >&2
+            exit 1
+          fi
 
       - name: Checkout trusted release validation policy
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -385,7 +411,9 @@ jobs:
           PHOTON_ARTIFACT_COUNT: ${{ steps.artifacts.outputs.photon_artifact_count }}
           RELEASE_LINE: ${{ inputs.release_line }}
           REQUIRE_PHOTON: ${{ inputs.require_photon }}
+          SOURCE_ROOT: ${{ github.workspace }}
           TAG_NAME: ${{ steps.tag.outputs.tag }}
+          TARGET_COMMITISH: ${{ steps.tag.outputs.target_commitish }}
           TRUSTED_OPERATOR_KEYS_DIR: ${{ steps.trusted.outputs.operator_keys_dir }}
           TRUSTED_OPERATOR_POLICY: ${{ steps.trusted.outputs.operator_policy }}
           TRUSTED_ROOT: ${{ steps.trusted.outputs.root }}
@@ -403,6 +431,8 @@ jobs:
           args=(
             --artifacts-dir "${ARTIFACTS_DIR}"
             --tag "${TAG_NAME}"
+            --source-root "${SOURCE_ROOT}"
+            --expected-tag-target "${TARGET_COMMITISH}"
             --release-line "${RELEASE_LINE}"
             --guix-sigs-repo "${GUIX_SIGS_REPO_INPUT}"
             --operator-key-policy "${TRUSTED_OPERATOR_POLICY}"
@@ -455,6 +485,9 @@ jobs:
           BUILDER_ATTESTATION_CORE_COUNT: ${{ steps.builders.outputs.builder_attestation_core_count }}
           BUILDER_ATTESTATION_PHOTON_COUNT: ${{ steps.builders.outputs.builder_attestation_photon_count || 'n/a' }}
           BUILDER_ATTESTATION_QUORUM: ${{ steps.builders.outputs.builder_attestation_quorum }}
+          BUILDER_ATTESTATION_SOURCE_ARCHIVE: ${{ steps.builders.outputs.builder_attestation_source_archive }}
+          BUILDER_ATTESTATION_SOURCE_SHA256: ${{ steps.builders.outputs.builder_attestation_source_sha256 }}
+          BUILDER_ATTESTATION_TAG_TARGET: ${{ steps.builders.outputs.builder_attestation_tag_target }}
           CORE_ARTIFACT_COUNT: ${{ steps.artifacts.outputs.core_artifact_count }}
           DRAFT: ${{ inputs.draft }}
           FILE_COUNT: ${{ steps.artifacts.outputs.file_count }}
@@ -496,6 +529,9 @@ jobs:
             echo "- Counted release signer aliases: \`${RELEASE_SIGNATURE_ALIASES}\`"
             echo "- Builder attestations (core): \`${BUILDER_ATTESTATION_CORE_COUNT}/${BUILDER_ATTESTATION_QUORUM}\`"
             echo "- Builder attestations (PHOTON): \`${BUILDER_ATTESTATION_PHOTON_COUNT}/${BUILDER_ATTESTATION_QUORUM}\`"
+            echo "- Builder source archive: \`${BUILDER_ATTESTATION_SOURCE_ARCHIVE}\`"
+            echo "- Builder source archive SHA256: \`${BUILDER_ATTESTATION_SOURCE_SHA256}\`"
+            echo "- Builder source tag target: \`${BUILDER_ATTESTATION_TAG_TARGET}\`"
             echo "- Draft: \`${DRAFT}\`"
             echo "- Prerelease: \`${PRERELEASE}\`"
             echo "- Make latest: \`${MAKE_LATEST}\`"

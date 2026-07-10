@@ -42,7 +42,15 @@ the corresponding Guix helper is run with `ARTIFACT=...`.
    before release publication.
 5. The release coordinator runs
    `ci/release/validate_builder_attestations.py` from the qbit source checkout
-   before publishing GitHub Release assets.
+   before publishing GitHub Release assets, passing the public release checkout
+   as `--source-root` and the verified annotated-tag target as
+   `--expected-tag-target`.
+
+Every counted core and PHOTON manifest must contain the common
+`qbit-<version>.tar.gz` entry. The validator reconstructs that archive from the
+signed-tag target with the same Guix `git archive` prefix and requires its exact
+basename and SHA256 before counting the manifest toward quorum. The source
+archive remains attestation evidence and is not a staged GitHub Release asset.
 
 The release signer key that signs `SHA256SUMS.operator-XX.asc` for GitHub
 release artifacts can also sign that operator's Guix attestations when the
