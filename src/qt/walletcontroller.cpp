@@ -17,6 +17,7 @@
 #include <util/string.h>
 #include <util/threadnames.h>
 #include <util/translation.h>
+#include <wallet/context.h>
 #include <wallet/wallet.h>
 
 #include <algorithm>
@@ -26,6 +27,7 @@
 #include <utility>
 
 #include <QApplication>
+#include <QCloseEvent>
 #include <QMessageBox>
 #include <QMetaObject>
 #include <QThread>
@@ -43,6 +45,36 @@ struct PendingWalletModel
 {
     std::unique_ptr<interfaces::Wallet> wallet;
     std::function<void(WalletModel*)> callback;
+};
+
+class NonDismissibleProgressDialog final : public QProgressDialog
+{
+public:
+    explicit NonDismissibleProgressDialog(QWidget* parent) : QProgressDialog(parent) {}
+
+    void finishAndClose()
+    {
+        m_operation_finished = true;
+        close();
+    }
+
+protected:
+    void reject() override
+    {
+        if (m_operation_finished) QProgressDialog::reject();
+    }
+
+    void closeEvent(QCloseEvent* event) override
+    {
+        if (!m_operation_finished) {
+            event->ignore();
+            return;
+        }
+        QProgressDialog::closeEvent(event);
+    }
+
+private:
+    bool m_operation_finished{false};
 };
 } // namespace
 
@@ -214,14 +246,29 @@ void WalletControllerActivity::scheduleWalletModel(std::unique_ptr<interfaces::W
     m_wallet_controller->scheduleWalletModel(std::move(wallet), std::move(callback));
 }
 
+WalletControllerActivity::~WalletControllerActivity()
+{
+    delete m_progress_dialog.data();
+}
+
 void WalletControllerActivity::showProgressDialog(const QString& title_text, const QString& label_text, bool show_minimized)
 {
-    auto progress_dialog = new QProgressDialog(m_parent_widget);
+    assert(!m_progress_dialog);
+    auto progress_dialog = new NonDismissibleProgressDialog(m_parent_widget);
+    m_progress_dialog = progress_dialog;
     progress_dialog->setAttribute(Qt::WA_DeleteOnClose);
-    connect(this, &WalletControllerActivity::finished, progress_dialog, &QWidget::close);
+    connect(this, &WalletControllerActivity::finished, progress_dialog, &NonDismissibleProgressDialog::finishAndClose);
 
+    progress_dialog->setObjectName(QStringLiteral("walletControllerProgressDialog"));
+    Qt::WindowFlags window_flags{progress_dialog->windowFlags()};
+    window_flags.setFlag(Qt::CustomizeWindowHint);
+    window_flags.setFlag(Qt::WindowCloseButtonHint, false);
+    progress_dialog->setWindowFlags(window_flags);
     progress_dialog->setWindowTitle(title_text);
-    progress_dialog->setLabelText(label_text);
+    progress_dialog->setLabelText(
+        label_text + QStringLiteral("<br><br>") +
+        //: Explanatory text for non-cancellable wallet operations.
+        tr("This operation cannot be canceled. This window will close automatically when it is finished."));
     progress_dialog->setRange(0, 0);
     progress_dialog->setCancelButton(nullptr);
     progress_dialog->setWindowModality(Qt::ApplicationModal);
@@ -230,7 +277,11 @@ void WalletControllerActivity::showProgressDialog(const QString& title_text, con
     // See details in https://bugreports.qt.io/browse/QTBUG-47042.
     progress_dialog->setValue(0);
     // When requested, launch dialog minimized
-    if (show_minimized) progress_dialog->showMinimized();
+    if (show_minimized) {
+        progress_dialog->showMinimized();
+    } else {
+        progress_dialog->show();
+    }
 }
 
 CreateWalletActivity::CreateWalletActivity(WalletController* wallet_controller, QWidget* parent_widget)
@@ -264,14 +315,6 @@ void CreateWalletActivity::askPassphrase()
 
 void CreateWalletActivity::createWallet()
 {
-    showProgressDialog(
-        //: Title of window indicating the progress of creation of a new wallet.
-        tr("Create Wallet"),
-        /*: Descriptive text of the create wallet progress window which indicates
-            to the user which wallet is currently being created. */
-        tr("Creating Wallet <b>%1</b>…").arg(m_create_wallet_dialog->walletName().toHtmlEscaped()));
-
-    std::string name = m_create_wallet_dialog->walletName().toStdString();
     uint64_t flags = 0;
     // Enable descriptors by default.
     flags |= WALLET_FLAG_DESCRIPTORS;
@@ -285,13 +328,32 @@ void CreateWalletActivity::createWallet()
         flags |= WALLET_FLAG_EXTERNAL_SIGNER;
     }
 
-    QTimer::singleShot(0ms, worker(), [this, name, flags] {
+    createWallet(m_create_wallet_dialog->walletName(), flags);
+}
+
+void CreateWalletActivity::createWallet(const QString& name, uint64_t flags)
+{
+    showProgressDialog(
+        //: Title of window indicating the progress of creation of a new wallet.
+        tr("Create Wallet"),
+        /*: Descriptive text of the create wallet progress window which indicates
+            to the user which wallet is currently being created. */
+        tr("Creating Wallet <b>%1</b>…").arg(name.toHtmlEscaped()));
+
+    QTimer::singleShot(0ms, worker(), [this, name = name.toStdString(), flags] {
         auto wallet{node().walletLoader().createWallet(name, m_passphrase, flags, m_warning_message)};
 
         if (wallet) {
             scheduleWalletModel(std::move(*wallet), [this](WalletModel* wallet_model) {
                 m_wallet_model = wallet_model;
-                finish();
+                if (wallet::WalletContext* context{node().walletLoader().context()}; context && context->create_wallet_stage_fn) {
+                    QTimer::singleShot(0ms, worker(), [this, context] {
+                        context->create_wallet_stage_fn(wallet::CreateWalletStage::MODEL_ADOPTED_BEFORE_CREATED_SIGNAL);
+                        QTimer::singleShot(0ms, this, &CreateWalletActivity::finish);
+                    });
+                } else {
+                    finish();
+                }
             });
         } else {
             m_error_message = util::ErrorString(wallet);

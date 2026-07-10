@@ -17,6 +17,7 @@
 #include <vector>
 
 #include <QMessageBox>
+#include <QPointer>
 #include <QProgressDialog>
 #include <QThread>
 #include <QTimer>
@@ -43,6 +44,7 @@ class CreateWalletDialog;
 class MigrateWalletActivity;
 class OpenWalletActivity;
 class WalletControllerActivity;
+class WalletActivityTests;
 
 /**
  * Controller between interfaces::Node, WalletModel instances and the GUI.
@@ -97,7 +99,7 @@ class WalletControllerActivity : public QObject
 
 public:
     WalletControllerActivity(WalletController* wallet_controller, QWidget* parent_widget);
-    virtual ~WalletControllerActivity() = default;
+    ~WalletControllerActivity() override;
 
 Q_SIGNALS:
     void finished();
@@ -111,6 +113,7 @@ protected:
 
     WalletController* const m_wallet_controller;
     QWidget* const m_parent_widget;
+    QPointer<QProgressDialog> m_progress_dialog;
     WalletModel* m_wallet_model{nullptr};
     bilingual_str m_error_message;
     std::vector<bilingual_str> m_warning_message;
@@ -133,11 +136,14 @@ Q_SIGNALS:
 private:
     void askPassphrase();
     void createWallet();
+    void createWallet(const QString& name, uint64_t flags);
     void finish();
 
     SecureString m_passphrase;
     CreateWalletDialog* m_create_wallet_dialog{nullptr};
     AskPassphraseDialog* m_passphrase_dialog{nullptr};
+
+    friend class WalletActivityTests;
 };
 
 class OpenWalletActivity : public WalletControllerActivity
