@@ -667,6 +667,30 @@ class ReleaseWorkflowBoundaryTest(unittest.TestCase):
             workflow,
             r"Checkout trusted release validation policy[\s\S]*fetch-depth: 0",
         )
+        restore_step_start = workflow.index(
+            "- name: Restore verified annotated release tag"
+        )
+        restore_step_end = workflow.index(
+            "- name: Checkout trusted release validation policy",
+            restore_step_start,
+        )
+        restore_step = workflow[restore_step_start:restore_step_end]
+        self.assertLess(verified_step, restore_step_start)
+        self.assertLess(restore_step_start, local_validator_step)
+        self.assertIn(
+            '"refs/tags/${TAG_NAME}:refs/tags/${TAG_NAME}"',
+            restore_step,
+        )
+        self.assertIn('git rev-parse "refs/tags/${TAG_NAME}^{tag}"', restore_step)
+        self.assertIn(
+            'git rev-parse "refs/tags/${TAG_NAME}^{commit}"',
+            restore_step,
+        )
+        self.assertIn('"${local_tag_sha,,}" != "${TAG_SHA,,}"', restore_step)
+        self.assertIn(
+            '"${local_target,,}" != "${TARGET_COMMITISH,,}"',
+            restore_step,
+        )
         builder_step_start = workflow.index("- name: Validate builder attestations")
         builder_step_end = workflow.index(
             "- name: Create or update GitHub Release",
