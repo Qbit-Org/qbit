@@ -647,6 +647,7 @@ class ReleaseWorkflowBoundaryTest(unittest.TestCase):
 
         self.assertLess(verified_step, local_validator_step)
         self.assertIn("verification.verified", workflow)
+        self.assertIn("tagObject.data.object.type !== 'commit'", workflow)
         self.assertIn("validate_release_artifacts.py", workflow)
         self.assertIn("ci/release/verify_testnet_release_posture.py", workflow)
         self.assertNotIn(OLD_TESTNET_POSTURE_VERIFIER, workflow)
@@ -666,6 +667,52 @@ class ReleaseWorkflowBoundaryTest(unittest.TestCase):
             workflow,
             r"Checkout trusted release validation policy[\s\S]*fetch-depth: 0",
         )
+        restore_step_start = workflow.index(
+            "- name: Restore verified annotated release tag"
+        )
+        restore_step_end = workflow.index(
+            "- name: Checkout trusted release validation policy",
+            restore_step_start,
+        )
+        restore_step = workflow[restore_step_start:restore_step_end]
+        self.assertLess(verified_step, restore_step_start)
+        self.assertLess(restore_step_start, local_validator_step)
+        self.assertIn(
+            '"refs/tags/${TAG_NAME}:refs/tags/${TAG_NAME}"',
+            restore_step,
+        )
+        self.assertIn('git rev-parse "refs/tags/${TAG_NAME}^{tag}"', restore_step)
+        self.assertIn(
+            'git rev-parse "refs/tags/${TAG_NAME}^{commit}"',
+            restore_step,
+        )
+        self.assertIn('"${local_tag_sha,,}" != "${TAG_SHA,,}"', restore_step)
+        self.assertIn(
+            '"${local_target,,}" != "${TARGET_COMMITISH,,}"',
+            restore_step,
+        )
+        builder_step_start = workflow.index("- name: Validate builder attestations")
+        builder_step_end = workflow.index(
+            "- name: Create or update GitHub Release",
+            builder_step_start,
+        )
+        builder_step = workflow[builder_step_start:builder_step_end]
+        self.assertIn("SOURCE_ROOT: ${{ github.workspace }}", builder_step)
+        self.assertIn(
+            "TARGET_COMMITISH: ${{ steps.tag.outputs.target_commitish }}",
+            builder_step,
+        )
+        self.assertIn("--source-root \"${SOURCE_ROOT}\"", builder_step)
+        self.assertIn(
+            "--expected-tag-target \"${TARGET_COMMITISH}\"",
+            builder_step,
+        )
+        self.assertIn(
+            "BUILDER_ATTESTATION_SOURCE_SHA256: "
+            "${{ steps.builders.outputs.builder_attestation_source_sha256 }}",
+            workflow,
+        )
+        self.assertIn("Builder source archive SHA256", workflow)
 
         validator_source = VALIDATOR.read_text(encoding="utf8")
         self.assertNotIn("github.rest", validator_source)

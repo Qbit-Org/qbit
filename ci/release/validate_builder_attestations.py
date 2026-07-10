@@ -27,6 +27,7 @@ CHECKSUMS_FILE = "SHA256SUMS"
 FINGERPRINT_RE = re.compile(r"^[0-9A-F]{40}$")
 APPROVAL_ALIAS_RE = re.compile(r"^[a-z0-9][a-z0-9-]{2,31}$")
 SHA256SUMS_LINE_RE = re.compile(r"^([0-9A-Fa-f]{64}) [ *](.+)$")
+COMMIT_SHA_RE = re.compile(r"^[0-9A-Fa-f]{40}$")
 ALLOWED_ARTIFACT_SETS = {"core", "photon"}
 
 
@@ -51,6 +52,13 @@ class BuilderPolicy:
     active_signer_set_size: int
     signer_public_key_files: frozenset[str]
     active_builders: dict[str, BuilderOperator]
+
+
+@dataclass(frozen=True)
+class CanonicalSourceArchive:
+    name: str
+    sha256: str
+    tag_target: str
 
 
 def normalize_fingerprint(value: str) -> str:
@@ -316,7 +324,7 @@ def parse_sha256sums(path: Path) -> dict[str, str]:
 
 
 def expected_release_entries(artifacts_dir: Path, tag: str, artifact: str) -> dict[str, str]:
-    version = tag.removeprefix("v")
+    version = release_version(tag)
     all_entries = parse_sha256sums(artifacts_dir / CHECKSUMS_FILE)
     if artifact == "core":
         prefix = f"qbit-{version}-"
@@ -335,7 +343,7 @@ def expected_release_entries(artifacts_dir: Path, tag: str, artifact: str) -> di
 
 
 def detected_artifacts(artifacts_dir: Path, tag: str) -> list[str]:
-    version = tag.removeprefix("v")
+    version = release_version(tag)
     all_entries = parse_sha256sums(artifacts_dir / CHECKSUMS_FILE)
     artifacts: list[str] = []
     if any(name.startswith(f"qbit-{version}-") for name in all_entries):
@@ -406,6 +414,135 @@ def run_command(
     )
 
 
+def release_version(tag: str) -> str:
+    if not tag.startswith("v") or len(tag) == 1:
+        raise BuilderValidationError(f"Release tag must start with v: {tag!r}")
+    version = tag[1:]
+    if Path(version).name != version or "\\" in version or version in {".", ".."}:
+        raise BuilderValidationError(f"Release tag has an unsafe version component: {tag!r}")
+    return version
+
+
+def git_stdout(git: str, source_root: Path, args: list[str], *, action: str) -> str:
+    try:
+        result = run_command([git, "-C", str(source_root), *args])
+    except OSError as exc:
+        raise BuilderValidationError(f"Failed to run git while {action}: {exc}") from exc
+    if result.returncode != 0:
+        detail = one_line_error(Exception(result.stderr or result.stdout))
+        suffix = f": {detail}" if detail else ""
+        raise BuilderValidationError(f"Failed to {action}{suffix}")
+    return result.stdout.strip()
+
+
+def reconstruct_canonical_source_archive(
+    *,
+    git: str,
+    source_root: Path,
+    tag: str,
+    expected_tag_target: str,
+) -> CanonicalSourceArchive:
+    version = release_version(tag)
+    if not source_root.is_dir():
+        raise BuilderValidationError(f"Source root is not a directory: {source_root}")
+    if not COMMIT_SHA_RE.fullmatch(expected_tag_target):
+        raise BuilderValidationError(
+            "--expected-tag-target must be a full 40-character commit SHA"
+        )
+    expected_target = expected_tag_target.lower()
+    tag_ref = f"refs/tags/{tag}"
+
+    object_type = git_stdout(
+        git,
+        source_root,
+        ["cat-file", "-t", tag_ref],
+        action=f"resolve annotated release tag {tag}",
+    )
+    if object_type != "tag":
+        raise BuilderValidationError(
+            f"Release tag {tag} must be an annotated tag object, got {object_type!r}"
+        )
+
+    tag_payload = git_stdout(
+        git,
+        source_root,
+        ["cat-file", "-p", tag_ref],
+        action=f"inspect annotated release tag {tag}",
+    )
+    tag_headers = tag_payload.split("\n\n", 1)[0].splitlines()
+    if (
+        len(tag_headers) < 2
+        or not tag_headers[0].startswith("object ")
+        or not tag_headers[1].startswith("type ")
+    ):
+        raise BuilderValidationError(f"Release tag {tag} has malformed object headers")
+    direct_target = tag_headers[0].removeprefix("object ").lower()
+    direct_target_type = tag_headers[1].removeprefix("type ")
+    if direct_target_type != "commit":
+        raise BuilderValidationError(
+            f"Release tag {tag} must directly target a commit, got {direct_target_type!r}"
+        )
+    if direct_target != expected_target:
+        raise BuilderValidationError(
+            f"Release tag {tag} directly targets {direct_target}, not verified target "
+            f"{expected_target}"
+        )
+
+    resolved_target = git_stdout(
+        git,
+        source_root,
+        ["rev-parse", "--verify", f"{tag_ref}^{{commit}}"],
+        action=f"resolve release tag target for {tag}",
+    ).lower()
+    if not COMMIT_SHA_RE.fullmatch(resolved_target):
+        raise BuilderValidationError(
+            f"Release tag {tag} resolved to an invalid commit SHA: {resolved_target!r}"
+        )
+    if resolved_target != expected_target:
+        raise BuilderValidationError(
+            f"Release tag {tag} target {resolved_target} does not match "
+            f"verified target {expected_target}"
+        )
+
+    target_type = git_stdout(
+        git,
+        source_root,
+        ["cat-file", "-t", expected_target],
+        action=f"verify release tag target {expected_target}",
+    )
+    if target_type != "commit":
+        raise BuilderValidationError(
+            f"Release tag {tag} target must be a commit, got {target_type!r}"
+        )
+
+    archive_name = f"qbit-{version}.tar.gz"
+    with tempfile.TemporaryDirectory(prefix="qbit-source-archive-") as temp_dir:
+        archive_path = Path(temp_dir) / archive_name
+        git_stdout(
+            git,
+            source_root,
+            [
+                "archive",
+                f"--prefix=qbit-{version}/",
+                f"--output={archive_path}",
+                expected_target,
+            ],
+            action=f"reconstruct canonical source archive for {tag}",
+        )
+        try:
+            archive_sha256 = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+        except OSError as exc:
+            raise BuilderValidationError(
+                f"Failed to hash canonical source archive {archive_name}: {exc}"
+            ) from exc
+
+    return CanonicalSourceArchive(
+        name=archive_name,
+        sha256=archive_sha256,
+        tag_target=expected_target,
+    )
+
+
 def status_fingerprints(status_output: str) -> list[str]:
     fingerprints: list[str] = []
     for line in status_output.splitlines():
@@ -465,12 +602,29 @@ def find_builder_manifest(builder_dir: Path, artifact: str) -> Path | None:
     return None
 
 
-def manifest_covers_release_entries(manifest: Path, expected_entries: dict[str, str]) -> bool:
+def require_manifest_coverage(
+    manifest: Path,
+    release_entries: dict[str, str],
+    source_archive: CanonicalSourceArchive,
+) -> None:
     manifest_entries = parse_sha256sums(manifest)
-    for name, digest in expected_entries.items():
-        if manifest_entries.get(name) != digest:
-            return False
-    return True
+    source_digest = manifest_entries.get(source_archive.name)
+    if source_digest is None:
+        raise BuilderValidationError(
+            f"manifest is missing canonical source archive {source_archive.name}"
+        )
+    if source_digest != source_archive.sha256:
+        raise BuilderValidationError(
+            f"manifest source archive {source_archive.name} has digest {source_digest}, "
+            f"expected {source_archive.sha256} from signed tag target"
+        )
+    for name, digest in release_entries.items():
+        actual = manifest_entries.get(name)
+        if actual != digest:
+            raise BuilderValidationError(
+                f"manifest does not cover staged artifact {name}: "
+                f"got {actual or 'missing'}, expected {digest}"
+            )
 
 
 def one_line_error(error: Exception) -> str:
@@ -485,6 +639,7 @@ def validate_artifact_attestations(
     version: str,
     artifact: str,
     release_entries: dict[str, str],
+    source_archive: CanonicalSourceArchive,
     builders: dict[str, BuilderOperator],
     quorum: int,
 ) -> list[str]:
@@ -505,9 +660,7 @@ def validate_artifact_attestations(
             continue
         try:
             verify_manifest_signature(gpg, gnupg_home, manifest, builder.fingerprint)
-            if not manifest_covers_release_entries(manifest, release_entries):
-                rejected.append(f"{alias}: manifest does not cover staged {artifact} artifacts")
-                continue
+            require_manifest_coverage(manifest, release_entries, source_archive)
             counted.append(alias)
         except BuilderValidationError as exc:
             rejected.append(f"{alias}: {one_line_error(exc)}")
@@ -528,6 +681,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifacts-dir", required=True, type=Path)
     parser.add_argument("--tag", required=True)
+    parser.add_argument("--source-root", required=True, type=Path)
+    parser.add_argument("--expected-tag-target", required=True)
     parser.add_argument("--release-line", required=True, choices=("testnet", "mainnet"))
     parser.add_argument("--guix-sigs-repo", required=True, type=Path)
     parser.add_argument("--operator-key-policy", default=DEFAULT_OPERATOR_POLICY, type=Path)
@@ -535,6 +690,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--guix-operator-key-policy", type=Path)
     parser.add_argument("--guix-operator-keys-dir", type=Path)
     parser.add_argument("--gpg", default=shutil.which("gpg") or "gpg")
+    parser.add_argument("--git", default=shutil.which("git") or "git")
     parser.add_argument("--artifact", choices=("core", "photon"), action="append")
     parser.add_argument("--github-output", type=Path)
     return parser.parse_args()
@@ -554,6 +710,12 @@ def main() -> int:
         artifacts_dir = args.artifacts_dir.resolve()
         guix_sigs_repo = args.guix_sigs_repo.resolve()
         operator_keys_dir = args.operator_keys_dir.resolve()
+        source_archive = reconstruct_canonical_source_archive(
+            git=args.git,
+            source_root=args.source_root.resolve(),
+            tag=args.tag,
+            expected_tag_target=args.expected_tag_target,
+        )
         policy = load_builder_policy(
             args.operator_key_policy.resolve(),
             operator_keys_dir,
@@ -568,7 +730,7 @@ def main() -> int:
             args.release_line,
         )
         quorum = policy.builder_attestation_quorum
-        version = args.tag.removeprefix("v")
+        version = release_version(args.tag)
         artifacts = args.artifact or detected_artifacts(artifacts_dir, args.tag)
 
         with tempfile.TemporaryDirectory(prefix="qbit-operator-gnupg-") as gnupg_home:
@@ -584,6 +746,7 @@ def main() -> int:
                     version=version,
                     artifact=artifact,
                     release_entries=expected_release_entries(artifacts_dir, args.tag, artifact),
+                    source_archive=source_archive,
                     builders=builders,
                     quorum=quorum,
                 )
@@ -592,12 +755,19 @@ def main() -> int:
         if args.github_output:
             with args.github_output.open("a", encoding="utf8") as output:
                 output.write(f"builder_attestation_quorum={quorum}\n")
+                output.write(f"builder_attestation_source_archive={source_archive.name}\n")
+                output.write(f"builder_attestation_source_sha256={source_archive.sha256}\n")
+                output.write(f"builder_attestation_tag_target={source_archive.tag_target}\n")
                 for artifact, counted in sorted(counts.items()):
                     output.write(f"builder_attestation_{artifact}_count={len(counted)}\n")
                     output.write(f"builder_attestation_{artifact}_aliases={','.join(counted)}\n")
 
         summary = ", ".join(f"{artifact}:{len(counted)}/{quorum}" for artifact, counted in sorted(counts.items()))
-        print(f"Validated builder attestations: {summary}")
+        print(
+            f"Validated builder attestations: {summary}; "
+            f"source={source_archive.name}:{source_archive.sha256}; "
+            f"tag_target={source_archive.tag_target}"
+        )
         return 0
     except BuilderValidationError as exc:
         print(f"ERR: {exc}", file=sys.stderr)

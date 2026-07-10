@@ -27,6 +27,12 @@ The tag target commit is the source commit used for release builds. Do not use a
 private source commit, a sanitizer mapping, a branch name, a short SHA, or a tag
 object SHA as the release source.
 
+The release validator recreates `qbit-<version>.tar.gz` directly from that tag
+target with the same `git archive --prefix="qbit-<version>/"` semantics used by
+the Guix build. Every counted core and PHOTON builder manifest must contain the
+resulting basename and SHA256. The source archive is builder evidence and is not
+part of the staged GitHub Release upload set.
+
 ## Trusted Validation Ref
 
 `trusted_release_ref` is the reviewed public commit used for release validation
@@ -58,12 +64,19 @@ The workflow validates:
   tag target commit
 - staged artifacts match `SHA256SUMS`
 - `SHA256SUMS.asc` meets release-signature quorum
-- `qbit-guix.sigs` builder attestations meet builder quorum
+- `qbit-guix.sigs` builder attestations meet builder quorum and every counted
+  manifest is bound to the source archive reconstructed from the signed tag
+  target
 - testnet posture evidence passes when `release_line=testnet`
 
 Testnet posture evidence is mandatory for `release_line=testnet`: both the
 publish workflow and the local publish fallback require the
 `TESTNET_RELEASE_POSTURE_EVIDENCE` input and fail closed when it is missing.
+
+Any local publication path must run the builder validator with the public
+release checkout as `--source-root` and the commit target obtained from the
+verified annotated tag as `--expected-tag-target`. These inputs are required;
+an older local caller that omits them fails before builder quorum is evaluated.
 
 Public validators live under `ci/release/`. Release key metadata lives under
 `contrib/keys/operator-keys/`.
@@ -79,6 +92,7 @@ Normal public release evidence should pin public data:
 - exact-byte `keys.json` SHA256, `policy_id`, and `policy_sequence`
 - exact public `qbit-guix.sigs` commit used for final validation
 - counted builder aliases/fingerprints and artifact sets
+- canonical source archive basename, SHA256, and signed-tag target commit
 - counted release signer aliases/fingerprints
 - artifact manifest digest, combined signature digest, individual operator
   signature digests, and artifact count
