@@ -6,6 +6,7 @@
 #define QBIT_QT_TEST_APPTESTS_H
 
 #include <QObject>
+#include <QPointer>
 #include <set>
 #include <string>
 #include <utility>
@@ -13,6 +14,9 @@
 class BitcoinApplication;
 class BitcoinGUI;
 class RPCConsole;
+class SendCoinsDialog;
+class WalletModel;
+class WalletView;
 
 class AppTests : public QObject
 {
@@ -45,6 +49,11 @@ private:
     //! either run or thrown exceptions. This could be a simple int counter
     //! instead of a set of names, but the names might be useful for debugging.
     std::multiset<std::string> m_callbacks;
+
+    QPointer<WalletModel> m_shutdown_wallet_model;
+    QPointer<WalletView> m_shutdown_wallet_view;
+    QPointer<SendCoinsDialog> m_shutdown_send_dialog;
+    bool m_wallet_dependents_destroyed_before_model{false};
 };
 
 #endif // QBIT_QT_TEST_APPTESTS_H

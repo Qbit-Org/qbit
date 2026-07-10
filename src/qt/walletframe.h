@@ -6,6 +6,7 @@
 #define QBIT_QT_WALLETFRAME_H
 
 #include <QFrame>
+#include <QList>
 #include <QMap>
 
 class ClientModel;
@@ -38,7 +39,7 @@ public:
     bool addView(WalletView* walletView);
     void setCurrentWallet(WalletModel* wallet_model);
     void removeWallet(WalletModel* wallet_model);
-    void removeAllWallets();
+    QList<WalletModel*> getWalletModels() const;
 
     bool handlePaymentRequest(const SendCoinsRecipient& recipient);
 

@@ -46,7 +46,9 @@
 
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <span>
 #include <utility>
@@ -65,6 +67,7 @@
 #include <QPointer>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QSignalSpy>
 #include <QTabWidget>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -536,23 +539,86 @@ public:
         transactionView.setModel(walletModel.get());
     }
 
+    void initModel(std::unique_ptr<interfaces::Wallet> wallet, const PlatformStyle* platformStyle)
+    {
+        walletModel = std::make_unique<WalletModel>(std::move(wallet), *clientModel, platformStyle);
+        sendCoinsDialog.setModel(walletModel.get());
+        transactionView.setModel(walletModel.get());
+    }
+
+};
+
+struct SyntheticWalletState {
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool create_entered{false};
+    bool allow_create{true};
+    bool background_clone_destroyed{false};
+    bool encrypted{false};
+    bool locked{false};
+    int lock_calls{0};
+    int unlock_calls{0};
 };
 
 class SyntheticPQCReportWallet : public interfaces::Wallet
 {
 public:
-    explicit SyntheticPQCReportWallet(wallet::PQCUsageReport report) : m_report(std::move(report)) {}
-    explicit SyntheticPQCReportWallet(interfaces::P2MRDataSignatureResult result) : m_p2mr_result(std::move(result)) {}
+    explicit SyntheticPQCReportWallet(
+        wallet::PQCUsageReport report = {},
+        std::shared_ptr<SyntheticWalletState> state = std::make_shared<SyntheticWalletState>(),
+        bool background_clone = false)
+        : m_report(std::move(report)), m_state(std::move(state)), m_background_clone(background_clone)
+    {
+    }
+    explicit SyntheticPQCReportWallet(interfaces::P2MRDataSignatureResult result)
+        : SyntheticPQCReportWallet()
+    {
+        m_p2mr_result = std::move(result);
+    }
+
+    ~SyntheticPQCReportWallet() override
+    {
+        if (!m_background_clone) return;
+        {
+            std::lock_guard lock{m_state->mutex};
+            m_state->background_clone_destroyed = true;
+        }
+        m_state->condition.notify_all();
+    }
 
     bool encryptWallet(const SecureString&) override { return false; }
-    bool isCrypted() override { return false; }
-    bool lock() override { return false; }
-    bool unlock(const SecureString&) override { return true; }
-    bool isLocked() override { return false; }
+    bool isCrypted() override
+    {
+        std::lock_guard lock{m_state->mutex};
+        return m_state->encrypted;
+    }
+    bool lock() override
+    {
+        std::lock_guard lock{m_state->mutex};
+        m_state->locked = true;
+        ++m_state->lock_calls;
+        return true;
+    }
+    bool unlock(const SecureString&) override
+    {
+        std::lock_guard lock{m_state->mutex};
+        m_state->locked = false;
+        ++m_state->unlock_calls;
+        return true;
+    }
+    bool isLocked() override
+    {
+        std::lock_guard lock{m_state->mutex};
+        return m_state->locked;
+    }
     bool changeWalletPassphrase(const SecureString&, const SecureString&) override { return false; }
     void abortRescan() override {}
     bool backupWallet(const std::string&) override { return false; }
     std::string getWalletName() override { return "synthetic-pqc-report"; }
+    std::unique_ptr<interfaces::Wallet> clone() override
+    {
+        return std::make_unique<SyntheticPQCReportWallet>(m_report, m_state, /*background_clone=*/true);
+    }
     util::Result<CTxDestination> getNewDestination(const OutputType, const std::string&) override { return CTxDestination{PKHash{}}; }
     bool getPubKey(const CScript&, const CKeyID&, CPubKey&) override { return false; }
     SigningResult signMessage(const std::string&, const PKHash&, std::string&) override { return SigningResult::PRIVATE_KEY_NOT_AVAILABLE; }
@@ -582,6 +648,13 @@ public:
         wallet::PQCUsageReport* pqc_usage,
         const SigningProgressCallback&) override
     {
+        {
+            std::unique_lock lock{m_state->mutex};
+            m_state->create_entered = true;
+            m_state->condition.notify_all();
+            m_state->condition.wait(lock, [this] { return m_state->allow_create; });
+        }
+
         CMutableTransaction tx;
         if (!recipients.empty()) {
             tx.vout.emplace_back(recipients.front().nAmount, CScript{} << OP_TRUE);
@@ -647,6 +720,8 @@ public:
 private:
     wallet::PQCUsageReport m_report;
     std::optional<interfaces::P2MRDataSignatureResult> m_p2mr_result;
+    std::shared_ptr<SyntheticWalletState> m_state;
+    const bool m_background_clone;
 };
 
 //! Simple qt wallet tests.
@@ -1297,6 +1372,92 @@ void TestSendPQCReportPropagation(interfaces::Node& node)
     QCOMPARE(pqc_usage.key_states.front().signatures_remaining, PQC_MAX_SIGNATURES - 7);
 }
 
+void TestSendCompletionAfterModelDestruction(interfaces::Node& node)
+{
+    TestChain100Setup test{ChainType::REGTEST, {.extra_args = {"-p2mronly=0"}}};
+    node.setContext(&test.m_node);
+
+    std::unique_ptr<const PlatformStyle> platform_style{PlatformStyle::instantiate("other")};
+    MiniGUI mini_gui{node, platform_style.get()};
+    auto state{std::make_shared<SyntheticWalletState>()};
+    mini_gui.initModel(std::make_unique<SyntheticPQCReportWallet>(wallet::PQCUsageReport{}, state), platform_style.get());
+    mini_gui.walletModel->pollBalanceChanged();
+
+    SendCoinsDialog& send_dialog{mini_gui.sendCoinsDialog};
+    QVBoxLayout* const entries{send_dialog.findChild<QVBoxLayout*>("entries")};
+    QVERIFY(entries);
+    SendCoinsEntry* const entry{qobject_cast<SendCoinsEntry*>(entries->itemAt(0)->widget())};
+    QVERIFY(entry);
+    entry->findChild<QValidatedLineEdit*>("payTo")->setText(QString::fromStdString(EncodeDestination(PKHash{})));
+    entry->findChild<BitcoinAmountField*>("payAmount")->setValue(COIN);
+    send_dialog.getCoinControl()->Select(COutPoint{Txid{}, 0});
+
+    QSignalSpy coins_sent{&send_dialog, &SendCoinsDialog::coinsSent};
+    QVERIFY(coins_sent.isValid());
+    QVERIFY(QMetaObject::invokeMethod(&send_dialog, "sendButtonClicked", Q_ARG(bool, false)));
+
+    {
+        std::unique_lock lock{state->mutex};
+        QVERIFY(state->condition.wait_for(lock, std::chrono::seconds{5}, [state] {
+            return state->background_clone_destroyed;
+        }));
+        QVERIFY(state->create_entered);
+    }
+
+    QPointer<WalletModel> model_guard{mini_gui.walletModel.get()};
+    mini_gui.walletModel.reset();
+    QVERIFY(model_guard.isNull());
+
+    // The worker destroyed its cloned wallet only after queueing completion.
+    // Deliver that completion while the dialog is alive but its model is gone.
+    QCoreApplication::sendPostedEvents(&send_dialog, QEvent::MetaCall);
+    QCoreApplication::processEvents();
+
+    QCOMPARE(coins_sent.count(), 0);
+    for (QWidget* widget : QApplication::topLevelWidgets()) {
+        QVERIFY(!widget->inherits("SendConfirmationDialog"));
+    }
+}
+
+void TestUnlockContextModelLifetime(interfaces::Node& node)
+{
+    TestChain100Setup test{ChainType::REGTEST, {.extra_args = {"-p2mronly=0"}}};
+    node.setContext(&test.m_node);
+
+    std::unique_ptr<const PlatformStyle> platform_style{PlatformStyle::instantiate("other")};
+    OptionsModel options_model{node};
+    bilingual_str error;
+    QVERIFY(options_model.Init(error));
+    ClientModel client_model{node, &options_model};
+
+    auto state{std::make_shared<SyntheticWalletState>()};
+    {
+        std::lock_guard lock{state->mutex};
+        state->encrypted = true;
+        state->locked = false;
+    }
+    auto wallet_model{std::make_unique<WalletModel>(
+        std::make_unique<SyntheticPQCReportWallet>(wallet::PQCUsageReport{}, state),
+        client_model,
+        platform_style.get())};
+
+    auto lock_calls = [state] {
+        std::lock_guard lock{state->mutex};
+        return state->lock_calls;
+    };
+
+    {
+        WalletModel::UnlockContext live_context{wallet_model.get(), /*valid=*/true, /*relock=*/true};
+    }
+    QCOMPARE(lock_calls(), 1);
+
+    auto stale_context{std::make_unique<WalletModel::UnlockContext>(
+        wallet_model.get(), /*valid=*/true, /*relock=*/true)};
+    wallet_model.reset();
+    stale_context.reset();
+    QCOMPARE(lock_calls(), 1);
+}
+
 void TestSendPQCWarningFormatting()
 {
     CPQCKey key;
@@ -1366,5 +1527,7 @@ void WalletTests::walletTests()
     TestGUI(m_node);
     TestP2MRReceiveAddressTypes(m_node);
     TestSendPQCReportPropagation(m_node);
+    TestSendCompletionAfterModelDestruction(m_node);
+    TestUnlockContextModelLifetime(m_node);
     TestSendPQCWarningFormatting();
 }
