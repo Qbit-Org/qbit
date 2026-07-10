@@ -662,6 +662,15 @@ void TestGUI(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
     SendCoinsDialog& sendCoinsDialog = mini_gui.sendCoinsDialog;
     TransactionView& transactionView = mini_gui.transactionView;
 
+    SignVerifyMessageDialog legacy_sign_verify_dialog(platformStyle.get(), nullptr);
+    legacy_sign_verify_dialog.setModel(&walletModel);
+    QLabel* expected_signer_label = legacy_sign_verify_dialog.findChild<QLabel*>("expectedSignerLabel_VM");
+    QVERIFY(expected_signer_label);
+    QVERIFY(expected_signer_label->isHidden());
+    QValidatedLineEdit* legacy_verify_address = legacy_sign_verify_dialog.findChild<QValidatedLineEdit*>("addressIn_VM");
+    QVERIFY(legacy_verify_address);
+    QVERIFY(!legacy_verify_address->isHidden());
+
     // Update walletModel cached balance which will trigger an update for the 'labelBalance' QLabel.
     walletModel.pollBalanceChanged();
     // Check balance in send dialog
@@ -789,6 +798,7 @@ void TestGUIWatchOnly(interfaces::Node& node, TestChain100Setup& test)
     std::unique_ptr<const PlatformStyle> platformStyle(PlatformStyle::instantiate("other"));
     MiniGUI mini_gui(node, platformStyle.get());
     mini_gui.initModelForWallet(node, wallet, platformStyle.get());
+
     WalletModel& walletModel = *mini_gui.walletModel;
     SendCoinsDialog& sendCoinsDialog = mini_gui.sendCoinsDialog;
 
@@ -828,6 +838,13 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
     MiniGUI mini_gui(node, platformStyle.get());
     mini_gui.initModelForWallet(node, wallet, platformStyle.get());
 
+    QVERIFY(wallet->TopUpKeyPool(2));
+    const CTxDestination expected_signer_dest{*Assert(wallet->GetNewDestination(OutputType::P2MR, ""))};
+    const CTxDestination proof_signer_dest{*Assert(wallet->GetNewDestination(OutputType::P2MR, ""))};
+    QVERIFY(expected_signer_dest != proof_signer_dest);
+    const QString expected_signer_address{QString::fromStdString(EncodeDestination(expected_signer_dest))};
+    const QString proof_signer_address{QString::fromStdString(EncodeDestination(proof_signer_dest))};
+
     ReceiveCoinsDialog receiveCoinsDialog(platformStyle.get());
     receiveCoinsDialog.setModel(mini_gui.walletModel.get());
     QComboBox* address_type = receiveCoinsDialog.findChild<QComboBox*>("addressType");
@@ -857,6 +874,9 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
     QPlainTextEdit* sign_input = sign_verify_dialog.findChild<QPlainTextEdit*>("messageIn_SM");
     QVERIFY(sign_input);
     QVERIFY(sign_input->placeholderText().contains("UTF-8 text"));
+
+    QValidatedLineEdit* sign_address = sign_verify_dialog.findChild<QValidatedLineEdit*>("addressIn_SM");
+    QVERIFY(sign_address);
 
     QLineEdit* sign_hash_preview = sign_verify_dialog.findChild<QLineEdit*>("p2mrMessageHash_SM");
     QVERIFY(sign_hash_preview);
@@ -900,9 +920,17 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
     QVERIFY(verify_data_input->isHidden());
     QVERIFY(verify_hash_preview->isHidden());
 
+    QLabel* expected_signer_label = sign_verify_dialog.findChild<QLabel*>("expectedSignerLabel_VM");
+    QVERIFY(expected_signer_label);
+    QVERIFY(!expected_signer_label->isHidden());
+
     QValidatedLineEdit* verify_address = sign_verify_dialog.findChild<QValidatedLineEdit*>("addressIn_VM");
     QVERIFY(verify_address);
-    QVERIFY(verify_address->isHidden());
+    QVERIFY(!verify_address->isHidden());
+
+    QPushButton* verify_address_book = sign_verify_dialog.findChild<QPushButton*>("addressBookButton_VM");
+    QVERIFY(verify_address_book);
+    QVERIFY(!verify_address_book->isHidden());
 
     QValidatedLineEdit* verify_signature = sign_verify_dialog.findChild<QValidatedLineEdit*>("signatureIn_VM");
     QVERIFY(verify_signature);
@@ -913,6 +941,84 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
     QCOMPARE(verify_button->text(), QString("Verify &Proof"));
 
     TestP2MRProofLeafVersionValidation(sign_verify_dialog);
+
+    QLabel* verify_status = sign_verify_dialog.findChild<QLabel*>("statusLabel_VM");
+    QVERIFY(verify_status);
+
+    sign_input_mode->setCurrentIndex(0);
+    sign_address->setText(proof_signer_address);
+    const QString signed_text{"expected signer binding test"};
+    sign_input->setPlainText(signed_text);
+    const QString signed_message_hash{sign_hash_preview->text()};
+    sign_button->click();
+    const QString proof_json{proof_output->toPlainText()};
+    QVERIFY(!proof_json.isEmpty());
+
+    sign_verify_dialog.showTab_VM(/*fShow=*/false);
+    proof_input->setPlainText(proof_json);
+
+    const auto verify = [&](const QString& expected_address, int input_mode, const QString& data) {
+        verify_address->setText(expected_address);
+        verify_input_mode->setCurrentIndex(input_mode);
+        verify_data_input->setPlainText(data);
+        proof_input->setPlainText(proof_json);
+        verify_button->click();
+    };
+
+    verify(proof_signer_address, /*input_mode=*/0, signed_text);
+    QVERIFY(verify_status->styleSheet().contains("green"));
+    QVERIFY(verify_status->text().contains("authenticated for the expected signer"));
+    QVERIFY(verify_status->text().contains(proof_signer_address));
+    QVERIFY(verify_status->text().contains(signed_message_hash));
+
+    verify(expected_signer_address, /*input_mode=*/0, signed_text);
+    QVERIFY(verify_status->styleSheet().contains("red"));
+    QVERIFY(verify_status->text().contains(expected_signer_address));
+    QVERIFY(verify_status->text().contains(proof_signer_address));
+    QVERIFY(verify_address->isValid());
+
+    const QString wrong_text{"different text"};
+    verify(proof_signer_address, /*input_mode=*/0, wrong_text);
+    const QString wrong_message_hash{verify_hash_preview->text()};
+    QVERIFY(verify_status->styleSheet().contains("red"));
+    QVERIFY(verify_status->text().contains(wrong_message_hash));
+    QVERIFY(verify_status->text().contains(signed_message_hash));
+
+    const QString wrong_network_address{"qb1zt39mp8jjcqd7pyh7qgz93gmhh2qlqppq8c3j4qy02chzfzp8c7sqkcq5ga"};
+    verify(wrong_network_address, /*input_mode=*/0, signed_text);
+    QVERIFY(verify_status->styleSheet().contains("red"));
+    QVERIFY(verify_status->text().contains("invalid for the active network"));
+    QVERIFY(!verify_address->isValid());
+    QVERIFY(verify_status->text().contains(proof_signer_address));
+    QVERIFY(verify_status->text().contains(signed_message_hash));
+
+    verify(/*expected_address=*/{}, /*input_mode=*/0, signed_text);
+    QVERIFY(verify_status->styleSheet().isEmpty());
+    QVERIFY(verify_status->text().contains("cryptographically valid"));
+    QVERIFY(verify_status->text().contains("No expected signer was provided"));
+    QVERIFY(verify_status->text().contains(proof_signer_address));
+    QVERIFY(verify_status->text().contains(signed_message_hash));
+
+    verify(/*expected_address=*/{}, /*input_mode=*/2, /*data=*/{});
+    QVERIFY(verify_status->styleSheet().isEmpty());
+    QVERIFY(verify_status->text().contains("No expected signer was provided"));
+    QVERIFY(verify_status->text().contains("Proof-only mode"));
+    QVERIFY(verify_status->text().contains(proof_signer_address));
+    QVERIFY(verify_status->text().contains(signed_message_hash));
+
+    verify(proof_signer_address, /*input_mode=*/2, /*data=*/{});
+    QVERIFY(verify_status->styleSheet().isEmpty());
+    QVERIFY(verify_status->text().contains("Expected signer matches"));
+    QVERIFY(verify_status->text().contains("Proof-only mode"));
+
+    QPushButton* verify_clear = sign_verify_dialog.findChild<QPushButton*>("clearButton_VM");
+    QVERIFY(verify_clear);
+    verify_clear->click();
+    QVERIFY(verify_address->text().isEmpty());
+    QVERIFY(proof_input->toPlainText().isEmpty());
+    QVERIFY(verify_data_input->toPlainText().isEmpty());
+    QVERIFY(verify_status->text().isEmpty());
+    QVERIFY(verify_status->styleSheet().isEmpty());
 }
 
 void TestSendPQCReportPropagation(interfaces::Node& node)

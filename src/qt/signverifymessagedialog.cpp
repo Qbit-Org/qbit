@@ -196,6 +196,28 @@ bool ParseP2MRProofJson(const QString& proof_json, common::P2MRDataSignatureProo
     return true;
 }
 
+bool ParseExpectedP2MRSigner(const QString& address_text, std::optional<WitnessV2P2MR>& expected_signer, QString& error)
+{
+    expected_signer.reset();
+    const QString trimmed_address{address_text.trimmed()};
+    if (trimmed_address.isEmpty()) return true;
+
+    const CTxDestination destination{DecodeDestination(trimmed_address.toStdString())};
+    if (!IsValidDestination(destination)) {
+        error = SignVerifyMessageDialog::tr("The expected signer address is invalid for the active network.");
+        return false;
+    }
+
+    const auto* output{std::get_if<WitnessV2P2MR>(&destination)};
+    if (!output) {
+        error = SignVerifyMessageDialog::tr("The expected signer address is not a P2MR address.");
+        return false;
+    }
+
+    expected_signer = *output;
+    return true;
+}
+
 void AppendPQCUsageJson(UniValue& object, const wallet::PQCUsageReport& report)
 {
     if (report.key_states.empty()) return;
@@ -377,11 +399,15 @@ void SignVerifyMessageDialog::updateP2MRDataModeUi()
         ui->p2mrMessageHashLabel_SM->setVisible(true);
         ui->p2mrMessageHash_SM->setVisible(true);
 
-        ui->infoLabel_VM->setText(tr("Verify a P2MR/PQC data-signature proof JSON object. When original text or a 32-byte "
-                                     "hash is entered, it must match the proof's message_hash before the P2MR commitment "
-                                     "and PQC signature are verified."));
-        ui->addressIn_VM->setVisible(false);
-        ui->addressBookButton_VM->setVisible(false);
+        ui->infoLabel_VM->setText(tr("Enter an expected signer address from a trusted source to authenticate a P2MR/PQC "
+                                     "proof. Entered text or a 32-byte hash must also match the proof's message_hash. "
+                                     "Without an expected signer, or in proof-only mode, verification reports only "
+                                     "cryptographic validity with a neutral result."));
+        ui->expectedSignerLabel_VM->setVisible(true);
+        ui->addressIn_VM->setVisible(true);
+        ui->addressIn_VM->setToolTip(tr("The expected P2MR signer address from a trusted source; leave blank for neutral proof validation"));
+        ui->addressBookButton_VM->setVisible(true);
+        ui->addressBookButton_VM->setToolTip(tr("Choose an expected signer address"));
         ui->signatureIn_VM->setVisible(false);
         ui->messageIn_VM->setToolTip(tr("Paste proof JSON to verify"));
         ui->messageIn_VM->setPlaceholderText(tr("Paste proof JSON to verify"));
@@ -421,8 +447,11 @@ void SignVerifyMessageDialog::updateP2MRDataModeUi()
                                      "the signature than what is in the signed message itself, to avoid being tricked by a "
                                      "man-in-the-middle attack. Note that this only proves the signing party receives with "
                                      "the address, it cannot prove sendership of any transaction!"));
+        ui->expectedSignerLabel_VM->setVisible(false);
         ui->addressIn_VM->setVisible(true);
+        ui->addressIn_VM->setToolTip(tr("The qbit address the message was signed with"));
         ui->addressBookButton_VM->setVisible(true);
+        ui->addressBookButton_VM->setToolTip(tr("Choose previously used address"));
         ui->signatureIn_VM->setVisible(true);
         ui->messageIn_VM->setToolTip(tr("The signed message to verify"));
         ui->messageIn_VM->setPlaceholderText(tr("The signed message to verify"));
@@ -724,11 +753,41 @@ void SignVerifyMessageDialog::on_addressBookButton_VM_clicked()
 void SignVerifyMessageDialog::on_verifyMessageButton_VM_clicked()
 {
     if (isP2MRDataMode()) {
+        const auto set_error = [this](const QString& text) {
+            ui->statusLabel_VM->setStyleSheet("QLabel { color: red; }");
+            ui->statusLabel_VM->setText(text);
+        };
+        const auto set_neutral = [this](const QString& text) {
+            ui->statusLabel_VM->setStyleSheet("");
+            ui->statusLabel_VM->setText(text);
+        };
+        const auto set_authenticated = [this](const QString& text) {
+            ui->statusLabel_VM->setStyleSheet("QLabel { color: green; }");
+            ui->statusLabel_VM->setText(text);
+        };
+
         common::P2MRDataSignatureProof proof;
         QString parse_error;
         if (!ParseP2MRProofJson(ui->messageIn_VM->document()->toPlainText(), proof, parse_error)) {
-            ui->statusLabel_VM->setStyleSheet("QLabel { color: red; }");
-            ui->statusLabel_VM->setText(parse_error);
+            set_error(parse_error);
+            return;
+        }
+
+        const QString embedded_signer{QString::fromStdString(EncodeDestination(CTxDestination{proof.output}))};
+        const QString signed_message_hash{QString::fromStdString(HashToHexString(proof.message_hash))};
+        const auto proof_context = [&] {
+            return QStringList{
+                tr("Proof-supplied signer: %1.").arg(embedded_signer),
+                tr("Signed message hash: %1.").arg(signed_message_hash),
+            };
+        };
+
+        std::optional<WitnessV2P2MR> expected_signer;
+        if (!ParseExpectedP2MRSigner(ui->addressIn_VM->text(), expected_signer, parse_error)) {
+            ui->addressIn_VM->setValid(false);
+            QStringList status{parse_error};
+            status.append(proof_context());
+            set_error(status.join("\n"));
             return;
         }
 
@@ -737,8 +796,9 @@ void SignVerifyMessageDialog::on_verifyMessageButton_VM_clicked()
         if (verify_mode == P2MR_VERIFY_INPUT_HASH) {
             uint256 parsed_hash;
             if (!ParseDataHash(ui->p2mrDataIn_VM->document()->toPlainText(), parsed_hash, parse_error)) {
-                ui->statusLabel_VM->setStyleSheet("QLabel { color: red; }");
-                ui->statusLabel_VM->setText(parse_error);
+                QStringList status{parse_error};
+                status.append(proof_context());
+                set_error(status.join("\n"));
                 return;
             }
             expected_message_hash = parsed_hash;
@@ -746,30 +806,58 @@ void SignVerifyMessageDialog::on_verifyMessageButton_VM_clicked()
             expected_message_hash = HashP2MRUtf8Text(ui->p2mrDataIn_VM->document()->toPlainText());
         }
 
+        if (expected_signer.has_value() && *expected_signer != proof.output) {
+            const QString expected_address{QString::fromStdString(EncodeDestination(CTxDestination{*expected_signer}))};
+            QStringList status{
+                tr("The proof contains signer %1, but the expected signer is %2.").arg(embedded_signer, expected_address),
+                tr("Signed message hash: %1.").arg(signed_message_hash),
+            };
+            set_error(status.join("\n"));
+            return;
+        }
+
         if (expected_message_hash.has_value() && *expected_message_hash != proof.message_hash) {
-            ui->statusLabel_VM->setStyleSheet("QLabel { color: red; }");
-            ui->statusLabel_VM->setText(
-                tr("Entered data hashes to %1, but the proof signed %2.")
-                    .arg(QString::fromStdString(HashToHexString(*expected_message_hash)))
-                    .arg(QString::fromStdString(HashToHexString(proof.message_hash)))
-            );
+            QStringList status{
+                tr("Entered data hashes to %1, but the proof contains message hash %2.")
+                    .arg(QString::fromStdString(HashToHexString(*expected_message_hash)), signed_message_hash),
+                tr("Proof-supplied signer: %1.").arg(embedded_signer),
+            };
+            set_error(status.join("\n"));
             return;
         }
 
         const common::P2MRDataSignatureVerification result{common::VerifyP2MRDataSignatureProof(proof)};
         if (result.valid) {
-            ui->statusLabel_VM->setStyleSheet("QLabel { color: green; }");
-            QString status{tr("P2MR/PQC proof verified for %1.")
-                .arg(QString::fromStdString(EncodeDestination(CTxDestination{proof.output})))};
-            if (expected_message_hash.has_value()) {
-                status.append("\n");
-                status.append(tr("Entered data matches message hash %1.")
-                    .arg(QString::fromStdString(HashToHexString(*expected_message_hash))));
+            const bool identity_bound{expected_signer.has_value()};
+            const bool data_bound{expected_message_hash.has_value()};
+            QStringList status{
+                identity_bound && data_bound ?
+                    tr("P2MR/PQC proof authenticated for the expected signer.") :
+                    tr("P2MR/PQC proof is cryptographically valid."),
+                tr("Embedded signer: %1.").arg(embedded_signer),
+                tr("Signed message hash: %1.").arg(signed_message_hash),
+            };
+            if (identity_bound) {
+                status.append(tr("Expected signer matches the embedded signer."));
+            } else {
+                status.append(tr("No expected signer was provided; signer identity was not independently authenticated."));
             }
-            ui->statusLabel_VM->setText(status);
+            if (expected_message_hash.has_value()) {
+                status.append(tr("Entered data matches the signed message hash."));
+            } else {
+                status.append(tr("Proof-only mode did not independently bind the signed data."));
+            }
+            if (identity_bound && data_bound) {
+                set_authenticated(status.join("\n"));
+            } else {
+                set_neutral(status.join("\n"));
+            }
         } else {
-            ui->statusLabel_VM->setStyleSheet("QLabel { color: red; }");
-            ui->statusLabel_VM->setText(tr("P2MR/PQC proof verification failed: %1").arg(ToQString(result.error)));
+            QStringList status{
+                tr("P2MR/PQC proof verification failed: %1").arg(ToQString(result.error)),
+            };
+            status.append(proof_context());
+            set_error(status.join("\n"));
         }
         return;
     }
@@ -831,12 +919,9 @@ void SignVerifyMessageDialog::on_clearButton_VM_clicked()
     ui->messageIn_VM->clear();
     ui->p2mrDataIn_VM->clear();
     ui->statusLabel_VM->clear();
+    ui->statusLabel_VM->setStyleSheet("");
 
-    if (isP2MRDataMode()) {
-        ui->messageIn_VM->setFocus();
-    } else {
-        ui->addressIn_VM->setFocus();
-    }
+    ui->addressIn_VM->setFocus();
 }
 
 bool SignVerifyMessageDialog::eventFilter(QObject *object, QEvent *event)
@@ -859,6 +944,7 @@ bool SignVerifyMessageDialog::eventFilter(QObject *object, QEvent *event)
         {
             /* Clear status message on focus change */
             ui->statusLabel_VM->clear();
+            ui->statusLabel_VM->setStyleSheet("");
         }
     }
     return QDialog::eventFilter(object, event);
