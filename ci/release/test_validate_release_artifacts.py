@@ -667,9 +667,22 @@ class ReleaseWorkflowBoundaryTest(unittest.TestCase):
             workflow,
             r"Checkout trusted release validation policy[\s\S]*fetch-depth: 0",
         )
-        self.assertIn("SOURCE_ROOT: ${{ github.workspace }}", workflow)
-        self.assertIn("--source-root \"${SOURCE_ROOT}\"", workflow)
-        self.assertIn("--expected-tag-target \"${TARGET_COMMITISH}\"", workflow)
+        builder_step_start = workflow.index("- name: Validate builder attestations")
+        builder_step_end = workflow.index(
+            "- name: Create or update GitHub Release",
+            builder_step_start,
+        )
+        builder_step = workflow[builder_step_start:builder_step_end]
+        self.assertIn("SOURCE_ROOT: ${{ github.workspace }}", builder_step)
+        self.assertIn(
+            "TARGET_COMMITISH: ${{ steps.tag.outputs.target_commitish }}",
+            builder_step,
+        )
+        self.assertIn("--source-root \"${SOURCE_ROOT}\"", builder_step)
+        self.assertIn(
+            "--expected-tag-target \"${TARGET_COMMITISH}\"",
+            builder_step,
+        )
         self.assertIn(
             "BUILDER_ATTESTATION_SOURCE_SHA256: "
             "${{ steps.builders.outputs.builder_attestation_source_sha256 }}",

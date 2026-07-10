@@ -348,9 +348,7 @@ jobs:
           ARTIFACTS_DIR_INPUT: ${{ inputs.artifacts_dir }}
           RELEASE_LINE: ${{ inputs.release_line }}
           REQUIRE_PHOTON: ${{ inputs.require_photon }}
-          SOURCE_ROOT: ${{ github.workspace }}
           TAG_NAME: ${{ steps.tag.outputs.tag }}
-          TARGET_COMMITISH: ${{ steps.tag.outputs.target_commitish }}
           TRUSTED_OPERATOR_KEYS_DIR: ${{ steps.trusted.outputs.operator_keys_dir }}
           TRUSTED_OPERATOR_POLICY: ${{ steps.trusted.outputs.operator_policy }}
           TRUSTED_ROOT: ${{ steps.trusted.outputs.root }}
@@ -391,7 +389,9 @@ jobs:
           PHOTON_ARTIFACT_COUNT: ${{ steps.artifacts.outputs.photon_artifact_count }}
           RELEASE_LINE: ${{ inputs.release_line }}
           REQUIRE_PHOTON: ${{ inputs.require_photon }}
+          SOURCE_ROOT: ${{ github.workspace }}
           TAG_NAME: ${{ steps.tag.outputs.tag }}
+          TARGET_COMMITISH: ${{ steps.tag.outputs.target_commitish }}
           TRUSTED_OPERATOR_KEYS_DIR: ${{ steps.trusted.outputs.operator_keys_dir }}
           TRUSTED_OPERATOR_POLICY: ${{ steps.trusted.outputs.operator_policy }}
           TRUSTED_ROOT: ${{ steps.trusted.outputs.root }}
