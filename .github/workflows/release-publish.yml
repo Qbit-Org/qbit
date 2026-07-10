@@ -129,6 +129,10 @@ jobs:
               core.setFailed(`Tag ${tag} is not a verified signed tag (reason: ${verification.reason || 'unknown'})`);
               return;
             }
+            if (tagObject.data.object.type !== 'commit') {
+              core.setFailed(`Tag ${tag} must target a commit, got ${tagObject.data.object.type || 'unknown'}`);
+              return;
+            }
 
             core.setOutput('tag', tag);
             core.setOutput('tag_sha', ref.data.object.sha);
@@ -344,7 +348,9 @@ jobs:
           ARTIFACTS_DIR_INPUT: ${{ inputs.artifacts_dir }}
           RELEASE_LINE: ${{ inputs.release_line }}
           REQUIRE_PHOTON: ${{ inputs.require_photon }}
+          SOURCE_ROOT: ${{ github.workspace }}
           TAG_NAME: ${{ steps.tag.outputs.tag }}
+          TARGET_COMMITISH: ${{ steps.tag.outputs.target_commitish }}
           TRUSTED_OPERATOR_KEYS_DIR: ${{ steps.trusted.outputs.operator_keys_dir }}
           TRUSTED_OPERATOR_POLICY: ${{ steps.trusted.outputs.operator_policy }}
           TRUSTED_ROOT: ${{ steps.trusted.outputs.root }}
@@ -403,6 +409,8 @@ jobs:
           args=(
             --artifacts-dir "${ARTIFACTS_DIR}"
             --tag "${TAG_NAME}"
+            --source-root "${SOURCE_ROOT}"
+            --expected-tag-target "${TARGET_COMMITISH}"
             --release-line "${RELEASE_LINE}"
             --guix-sigs-repo "${GUIX_SIGS_REPO_INPUT}"
             --operator-key-policy "${TRUSTED_OPERATOR_POLICY}"
@@ -455,6 +463,9 @@ jobs:
           BUILDER_ATTESTATION_CORE_COUNT: ${{ steps.builders.outputs.builder_attestation_core_count }}
           BUILDER_ATTESTATION_PHOTON_COUNT: ${{ steps.builders.outputs.builder_attestation_photon_count || 'n/a' }}
           BUILDER_ATTESTATION_QUORUM: ${{ steps.builders.outputs.builder_attestation_quorum }}
+          BUILDER_ATTESTATION_SOURCE_ARCHIVE: ${{ steps.builders.outputs.builder_attestation_source_archive }}
+          BUILDER_ATTESTATION_SOURCE_SHA256: ${{ steps.builders.outputs.builder_attestation_source_sha256 }}
+          BUILDER_ATTESTATION_TAG_TARGET: ${{ steps.builders.outputs.builder_attestation_tag_target }}
           CORE_ARTIFACT_COUNT: ${{ steps.artifacts.outputs.core_artifact_count }}
           DRAFT: ${{ inputs.draft }}
           FILE_COUNT: ${{ steps.artifacts.outputs.file_count }}
@@ -496,6 +507,9 @@ jobs:
             echo "- Counted release signer aliases: \`${RELEASE_SIGNATURE_ALIASES}\`"
             echo "- Builder attestations (core): \`${BUILDER_ATTESTATION_CORE_COUNT}/${BUILDER_ATTESTATION_QUORUM}\`"
             echo "- Builder attestations (PHOTON): \`${BUILDER_ATTESTATION_PHOTON_COUNT}/${BUILDER_ATTESTATION_QUORUM}\`"
+            echo "- Builder source archive: \`${BUILDER_ATTESTATION_SOURCE_ARCHIVE}\`"
+            echo "- Builder source archive SHA256: \`${BUILDER_ATTESTATION_SOURCE_SHA256}\`"
+            echo "- Builder source tag target: \`${BUILDER_ATTESTATION_TAG_TARGET}\`"
             echo "- Draft: \`${DRAFT}\`"
             echo "- Prerelease: \`${PRERELEASE}\`"
             echo "- Make latest: \`${MAKE_LATEST}\`"
