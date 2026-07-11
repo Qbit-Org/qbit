@@ -163,7 +163,7 @@ RPCHelpMan signdatapqchash()
                     {"pubkey", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "Optional 32-byte P2MR pubkey to select when the address commits to more than one single-key leaf."},
                     {"leaf_script", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "Optional exact P2MR leaf script to sign against."},
                     {"control_block", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "Optional exact P2MR control block to prove with."},
-                    {"include_pqc_usage", RPCArg::Type::BOOL, RPCArg::Default{true}, "Include PQC key-usage counters and warnings in the result."},
+                    {"include_pqc_usage", RPCArg::Type::BOOL, RPCArg::Default{true}, "Include wallet-local PQC key-usage counters and warnings in the result. These fields may reveal exact remaining signature budget and public keys from failed retry attempts; set false when sharing the result as a portable proof."},
                 },
                 RPCArgOptions{.oneline_description="options"}},
         },

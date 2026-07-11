@@ -57,14 +57,6 @@ constexpr int P2MR_SIGN_INPUT_HASH{1};
 constexpr int P2MR_VERIFY_INPUT_TEXT{0};
 constexpr int P2MR_VERIFY_INPUT_HASH{1};
 constexpr int P2MR_VERIFY_INPUT_PROOF_ONLY{2};
-constexpr const char* P2MR_MESSAGE_HASH_SOURCE_UTF8_TEXT{"utf8-text"};
-constexpr const char* P2MR_MESSAGE_HASH_SOURCE_HEX_HASH{"hex-hash"};
-constexpr const char* P2MR_MESSAGE_HASH_ALGORITHM_SHA256{"sha256"};
-
-struct P2MRMessageHashMetadata {
-    std::optional<std::string> source;
-    std::optional<std::string> algorithm;
-};
 
 uint256 HashP2MRUtf8Text(const QString& text)
 {
@@ -218,43 +210,6 @@ bool ParseExpectedP2MRSigner(const QString& address_text, std::optional<WitnessV
     return true;
 }
 
-void AppendPQCUsageJson(UniValue& object, const wallet::PQCUsageReport& report)
-{
-    if (report.key_states.empty()) return;
-
-    UniValue key_states(UniValue::VARR);
-    for (const wallet::PQCUsageSnapshot& key_state : report.key_states) {
-        UniValue state(UniValue::VOBJ);
-        state.pushKV("pubkey", HexStr(std::span<const unsigned char>{key_state.pubkey.begin(), key_state.pubkey.end()}));
-        state.pushKV("pqc_signature_count", static_cast<int64_t>(key_state.signature_count));
-        state.pushKV("pqc_signature_limit", static_cast<int64_t>(key_state.signature_limit));
-        state.pushKV("pqc_signatures_remaining", static_cast<int64_t>(key_state.signatures_remaining));
-        state.pushKV("pqc_limit_state", std::string{wallet::PQCSignatureLimitStateName(key_state.limit_state)});
-        key_states.push_back(std::move(state));
-    }
-    object.pushKV("pqc_key_states", std::move(key_states));
-
-    if (report.overall_state.has_value()) {
-        object.pushKV("pqc_overall_limit_state", std::string{wallet::PQCSignatureLimitStateName(*report.overall_state)});
-    }
-    if (report.key_states.size() == 1) {
-        const wallet::PQCUsageSnapshot& key_state{report.key_states.front()};
-        object.pushKV("pqc_signature_count", static_cast<int64_t>(key_state.signature_count));
-        object.pushKV("pqc_signature_limit", static_cast<int64_t>(key_state.signature_limit));
-        object.pushKV("pqc_signatures_remaining", static_cast<int64_t>(key_state.signatures_remaining));
-        object.pushKV("pqc_limit_state", std::string{wallet::PQCSignatureLimitStateName(key_state.limit_state)});
-    }
-
-    const std::vector<bilingual_str> warnings{wallet::FormatPQCUsageWarnings(report.warnings)};
-    if (!warnings.empty()) {
-        UniValue warning_values(UniValue::VARR);
-        for (const bilingual_str& warning : warnings) {
-            warning_values.push_back(warning.translated.empty() ? warning.original : warning.translated);
-        }
-        object.pushKV("warnings", std::move(warning_values));
-    }
-}
-
 QString FormatPQCUsageStatus(const wallet::PQCUsageReport& report)
 {
     QStringList lines;
@@ -288,31 +243,19 @@ common::P2MRDataSignatureProof MakeP2MRDataSignatureProof(const interfaces::P2MR
     };
 }
 
-UniValue BuildP2MRProofJson(const interfaces::P2MRDataSignatureResult& result, const P2MRMessageHashMetadata& metadata)
+// Keep the portable proof limited to fields consumed by both Qt and RPC
+// verification. Wallet-local usage belongs in the signer status only.
+UniValue BuildP2MRProofJson(const common::P2MRDataSignatureProof& proof)
 {
-    const common::P2MRDataSignatureProof proof{MakeP2MRDataSignatureProof(result)};
     UniValue object(UniValue::VOBJ);
     object.pushKV("address", EncodeDestination(CTxDestination{proof.output}));
     object.pushKV("message_hash", HashToHexString(proof.message_hash));
-    if (metadata.source.has_value()) {
-        object.pushKV("message_hash_source", *metadata.source);
-    }
-    if (metadata.algorithm.has_value()) {
-        object.pushKV("message_hash_algorithm", *metadata.algorithm);
-    }
-    object.pushKV("datasig_hash", HashToHexString(proof.datasig_hash));
-    object.pushKV("domain", common::P2MR_DATA_SIGNATURE_DOMAIN);
-    object.pushKV("algorithm", common::P2MR_DATA_SIGNATURE_ALGORITHM);
     object.pushKV("proof_mode", common::P2MR_DATA_SIGNATURE_PROOF_MODE);
     object.pushKV("pubkey", HexStr(std::span<const unsigned char>{proof.pubkey.begin(), proof.pubkey.end()}));
     object.pushKV("signature", HexStr(proof.signature));
     object.pushKV("leaf_version", static_cast<int>(proof.leaf_version));
     object.pushKV("leaf_script", HexStr(proof.leaf_script));
     object.pushKV("control_block", HexStr(proof.control_block));
-    object.pushKV("p2mr_merkle_root", HashToHexString(proof.output.GetMerkleRoot()));
-    if (result.pqc_usage) {
-        AppendPQCUsageJson(object, *result.pqc_usage);
-    }
     return object;
 }
 
@@ -623,19 +566,16 @@ void SignVerifyMessageDialog::on_signMessageButton_SM_clicked()
         }
 
         uint256 message_hash;
-        P2MRMessageHashMetadata metadata;
-        if (ui->p2mrDataInputMode_SM->currentIndex() == P2MR_SIGN_INPUT_HASH) {
+        const bool hash_input{ui->p2mrDataInputMode_SM->currentIndex() == P2MR_SIGN_INPUT_HASH};
+        if (hash_input) {
             QString parse_error;
             if (!ParseDataHash(ui->messageIn_SM->document()->toPlainText(), message_hash, parse_error)) {
                 ui->statusLabel_SM->setStyleSheet("QLabel { color: red; }");
                 ui->statusLabel_SM->setText(parse_error);
                 return;
             }
-            metadata.source = P2MR_MESSAGE_HASH_SOURCE_HEX_HASH;
         } else {
             message_hash = HashP2MRUtf8Text(ui->messageIn_SM->document()->toPlainText());
-            metadata.source = P2MR_MESSAGE_HASH_SOURCE_UTF8_TEXT;
-            metadata.algorithm = P2MR_MESSAGE_HASH_ALGORITHM_SHA256;
         }
         ui->p2mrMessageHash_SM->setText(QString::fromStdString(HashToHexString(message_hash)));
 
@@ -662,10 +602,10 @@ void SignVerifyMessageDialog::on_signMessageButton_SM_clicked()
             return;
         }
 
-        ui->signatureOut_SM->setPlainText(QString::fromStdString(BuildP2MRProofJson(*result, metadata).write(2)));
-        QString status{metadata.algorithm.has_value() ?
-            tr("P2MR/PQC data proof signed.") :
-            tr("P2MR/PQC data-hash proof signed.")};
+        ui->signatureOut_SM->setPlainText(QString::fromStdString(BuildP2MRProofJson(proof).write(2)));
+        QString status{hash_input ?
+            tr("P2MR/PQC data-hash proof signed.") :
+            tr("P2MR/PQC data proof signed.")};
         const QString pqc_usage_status{result->pqc_usage ? FormatPQCUsageStatus(*result->pqc_usage) : QString{}};
         if (!pqc_usage_status.isEmpty()) {
             status.append("\n");
