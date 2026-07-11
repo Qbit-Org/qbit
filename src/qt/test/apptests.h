@@ -7,6 +7,8 @@
 
 #include <QObject>
 #include <QPointer>
+#include <cstdint>
+#include <memory>
 #include <set>
 #include <string>
 #include <utility>
@@ -17,6 +19,10 @@ class RPCConsole;
 class SendCoinsDialog;
 class WalletModel;
 class WalletView;
+
+namespace qt_test {
+struct SyntheticWalletState;
+}
 
 class AppTests : public QObject
 {
@@ -53,6 +59,9 @@ private:
     QPointer<WalletModel> m_shutdown_wallet_model;
     QPointer<WalletView> m_shutdown_wallet_view;
     QPointer<SendCoinsDialog> m_shutdown_send_dialog;
+    std::shared_ptr<qt_test::SyntheticWalletState> m_shutdown_wallet_state;
+    int64_t m_shutdown_elapsed_ms{-1};
+    int m_shutdown_coins_sent{0};
     bool m_wallet_dependents_destroyed_before_model{false};
 };
 
