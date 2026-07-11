@@ -1,5 +1,5 @@
 {
-  "name": "public-main",
+  "name": "public-maintenance-1.0.0",
   "target": "branch",
   "enforcement": "active",
   "bypass_actors": [
@@ -12,12 +12,15 @@
   "conditions": {
     "ref_name": {
       "include": [
-        "refs/heads/main"
+        "refs/heads/1.0.0"
       ],
       "exclude": []
     }
   },
   "rules": [
+    {
+      "type": "creation"
+    },
     {
       "type": "deletion"
     },
