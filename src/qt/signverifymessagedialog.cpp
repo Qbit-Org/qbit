@@ -67,12 +67,20 @@ constexpr size_t P2MR_PROOF_REQUIRED_HEX_CHARS{
     2 * (uint256::size() + PQC_PUBKEY_SIZE + PQC_SIG_SIZE + P2MR_V1_PK_LEAF_SCRIPT_SIZE + P2MR_CONTROL_MAX_SIZE)};
 static_assert(P2MR_PROOF_REQUIRED_HEX_CHARS == 15'750);
 
-// The largest proof qbit-qt can currently produce has a maximum-length qbrt
-// address, a 128-node control path, and the longest PQC usage/exhaustion
-// metadata. Its 16,331 value characters plus 661 pretty-printed JSON syntax
-// characters total 16,992. The next power of two leaves room for compatible
-// informational fields while keeping GUI-thread work strictly bounded.
-constexpr size_t P2MR_MAX_GENERATED_PROOF_JSON_CHARS{16'331 + 661};
+// The portable proof has eight fields. At their protocol maxima, the address,
+// fixed-size hex fields, proof mode, and decimal leaf version use 15,828 value
+// characters. UniValue::write(2) adds exactly 160 JSON syntax characters.
+// Keeping the input limit at the next power of two leaves room for compatible
+// legacy/RPC informational fields while strictly bounding GUI-thread work.
+constexpr size_t P2MR_PROOF_MODE_CHARS{std::string_view{common::P2MR_DATA_SIGNATURE_PROOF_MODE}.size()};
+constexpr size_t P2MR_MAX_LEAF_VERSION_CHARS{3};
+constexpr size_t P2MR_MAX_GENERATED_PROOF_VALUE_CHARS{
+    P2MR_PROOF_MAX_ADDRESS_CHARS + P2MR_PROOF_REQUIRED_HEX_CHARS + P2MR_PROOF_MODE_CHARS + P2MR_MAX_LEAF_VERSION_CHARS};
+constexpr size_t P2MR_GENERATED_PROOF_JSON_SYNTAX_CHARS{160};
+constexpr size_t P2MR_MAX_GENERATED_PROOF_JSON_CHARS{
+    P2MR_MAX_GENERATED_PROOF_VALUE_CHARS + P2MR_GENERATED_PROOF_JSON_SYNTAX_CHARS};
+static_assert(P2MR_MAX_GENERATED_PROOF_VALUE_CHARS == 15'828);
+static_assert(P2MR_MAX_GENERATED_PROOF_JSON_CHARS == 15'988);
 static_assert(SignVerifyMessageDialog::MAX_P2MR_PROOF_DOCUMENT_CHARS == 32'768);
 static_assert(SignVerifyMessageDialog::MAX_P2MR_PROOF_DOCUMENT_CHARS >= P2MR_MAX_GENERATED_PROOF_JSON_CHARS);
 

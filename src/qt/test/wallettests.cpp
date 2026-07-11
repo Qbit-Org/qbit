@@ -870,7 +870,6 @@ UniValue ProofWithControlDepth(const UniValue& proof, size_t depth)
     const uint256 merkle_root{ComputeP2MRMerkleRoot(control_block, leaf_hash)};
     result.pushKV("control_block", HexStr(control_block));
     result.pushKV("address", EncodeDestination(WitnessV2P2MR{merkle_root}));
-    result.pushKV("p2mr_merkle_root", HexStr(std::span<const unsigned char>{merkle_root.begin(), merkle_root.end()}));
     return result;
 }
 
@@ -1227,7 +1226,8 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
     expect_error(write_proof(duplicate_unknown), "duplicated");
 
     const UniValue maximum_control_proof{ProofWithControlDepth(valid_proof, P2MR_CONTROL_MAX_NODE_COUNT)};
-    QString maximum_json{write_proof(maximum_control_proof)};
+    const QString maximum_json{QString::fromStdString(maximum_control_proof.write(2))};
+    QCOMPARE(maximum_json.size(), qsizetype{15'988});
     QVERIFY(maximum_json.size() < SignVerifyMessageDialog::MAX_P2MR_PROOF_DOCUMENT_CHARS - 1);
     for (const int document_size : {SignVerifyMessageDialog::MAX_P2MR_PROOF_DOCUMENT_CHARS - 1,
                                     SignVerifyMessageDialog::MAX_P2MR_PROOF_DOCUMENT_CHARS}) {
@@ -1283,11 +1283,19 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
     builder.AddP2MR(/*depth=*/1, selected_leaf_bytes, P2MR_LEAF_VERSION_V1)
         .AddP2MR(/*depth=*/1, alternate_leaf_bytes, P2MR_LEAF_VERSION_V1)
         .FinalizeP2MR();
-    const WitnessV2P2MR output{builder.GetP2MROutput()};
     const P2MRSpendData spend_data{builder.GetP2MRSpendData()};
     const auto selected_leaf_it{spend_data.scripts.find({selected_leaf_bytes, P2MR_LEAF_VERSION_V1})};
     QVERIFY(selected_leaf_it != spend_data.scripts.end());
     QVERIFY(!selected_leaf_it->second.empty());
+    std::vector<unsigned char> selected_control_block{*selected_leaf_it->second.begin()};
+    selected_control_block.resize(P2MR_CONTROL_BASE_SIZE);
+    for (size_t node{0}; node < P2MR_CONTROL_MAX_NODE_COUNT; ++node) {
+        for (size_t byte{0}; byte < P2MR_CONTROL_NODE_SIZE; ++byte) {
+            selected_control_block.push_back(static_cast<unsigned char>(node + byte + 1));
+        }
+    }
+    const uint256 selected_leaf_hash{ComputeP2MRLeafHash(P2MR_LEAF_VERSION_V1, selected_leaf_bytes)};
+    const WitnessV2P2MR output{ComputeP2MRMerkleRoot(selected_control_block, selected_leaf_hash)};
 
     const uint256 message_hash{uint256::ONE};
     const uint256 datasig_hash{ComputeQbitDataSigPQCHash(std::span<const unsigned char>{message_hash.begin(), message_hash.end()})};
@@ -1296,14 +1304,36 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
     QVERIFY(selected_key.Sign(datasig_hash, signature, signature_counter));
     QCOMPARE(signature_counter, 1U);
 
+    // The old rich exporter exceeded the 32 KiB verifier limit with this many
+    // advanced retry keys and exhaustion warnings. The portable proof must be
+    // independent of the wallet-local report's cardinality.
+    constexpr size_t FAILED_RETRY_KEY_COUNT{37};
+    std::set<CPQCPubKey> failed_retry_pubkeys{alternate_pubkey};
+    for (unsigned char marker{1}; failed_retry_pubkeys.size() < FAILED_RETRY_KEY_COUNT; ++marker) {
+        std::array<unsigned char, PQC_PUBKEY_SIZE> pubkey_bytes;
+        pubkey_bytes.fill(marker);
+        const CPQCPubKey pubkey{std::span<const unsigned char>{pubkey_bytes}};
+        if (pubkey.IsValid() && pubkey != selected_pubkey) failed_retry_pubkeys.insert(pubkey);
+    }
+
     wallet::PQCUsageReport retry_report;
-    retry_report.key_states.push_back({
-        .pubkey = alternate_pubkey,
-        .signature_count = wallet::PQC_WARNING_SIGNATURE_THRESHOLD,
-        .signature_limit = PQC_MAX_SIGNATURES,
-        .signatures_remaining = PQC_MAX_SIGNATURES - wallet::PQC_WARNING_SIGNATURE_THRESHOLD,
-        .limit_state = wallet::PQCSignatureLimitState::WARNING,
-    });
+    for (const CPQCPubKey& failed_pubkey : failed_retry_pubkeys) {
+        retry_report.key_states.push_back({
+            .pubkey = failed_pubkey,
+            .signature_count = PQC_MAX_SIGNATURES,
+            .signature_limit = PQC_MAX_SIGNATURES,
+            .signatures_remaining = 0,
+            .limit_state = wallet::PQCSignatureLimitState::EXHAUSTED,
+        });
+        retry_report.warnings.push_back({
+            .pubkey = failed_pubkey,
+            .previous_count = PQC_MAX_SIGNATURES - 1,
+            .new_count = PQC_MAX_SIGNATURES,
+            .previous_state = wallet::PQCSignatureLimitState::CRITICAL,
+            .current_state = wallet::PQCSignatureLimitState::EXHAUSTED,
+            .kind = wallet::PQCUsageWarningKind::TRANSITION,
+        });
+    }
     retry_report.key_states.push_back({
         .pubkey = selected_pubkey,
         .signature_count = 1,
@@ -1311,15 +1341,9 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
         .signatures_remaining = PQC_MAX_SIGNATURES - 1,
         .limit_state = wallet::PQCSignatureLimitState::NORMAL,
     });
-    retry_report.overall_state = wallet::PQCSignatureLimitState::WARNING;
-    retry_report.warnings.push_back({
-        .pubkey = alternate_pubkey,
-        .previous_count = wallet::PQC_WARNING_SIGNATURE_THRESHOLD - 1,
-        .new_count = wallet::PQC_WARNING_SIGNATURE_THRESHOLD,
-        .previous_state = wallet::PQCSignatureLimitState::NORMAL,
-        .current_state = wallet::PQCSignatureLimitState::WARNING,
-        .kind = wallet::PQCUsageWarningKind::TRANSITION,
-    });
+    retry_report.overall_state = wallet::PQCSignatureLimitState::EXHAUSTED;
+    QCOMPARE(retry_report.key_states.size(), FAILED_RETRY_KEY_COUNT + 1);
+    QCOMPARE(retry_report.warnings.size(), FAILED_RETRY_KEY_COUNT);
 
     interfaces::P2MRDataSignatureResult synthetic_result{
         .output = output,
@@ -1328,7 +1352,7 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
         .pubkey = std::vector<unsigned char>{selected_pubkey.begin(), selected_pubkey.end()},
         .signature = signature,
         .leaf_script = selected_leaf,
-        .control_block = *selected_leaf_it->second.begin(),
+        .control_block = selected_control_block,
         .leaf_version = P2MR_LEAF_VERSION_V1,
         .pqc_usage = std::make_shared<const wallet::PQCUsageReport>(retry_report),
     };
@@ -1353,10 +1377,12 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
 
     const QString proof_text{generated_proof->toPlainText()};
     QVERIFY(!proof_text.isEmpty());
+    QCOMPARE(proof_text.size(), qsizetype{15'988});
+    QVERIFY(proof_text.size() <= SignVerifyMessageDialog::MAX_P2MR_PROOF_DOCUMENT_CHARS);
     UniValue proof_object;
     QVERIFY(proof_object.read(proof_text.toStdString()));
     QVERIFY(proof_object.isObject());
-    const std::set<std::string> required_fields{
+    const std::set<std::string> portable_fields{
         "address",
         "message_hash",
         "pubkey",
@@ -1366,8 +1392,8 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
         "leaf_version",
         "proof_mode",
     };
-    QCOMPARE(proof_object.getKeys().size(), required_fields.size());
-    for (const std::string& field : required_fields) {
+    QCOMPARE(proof_object.getKeys().size(), portable_fields.size());
+    for (const std::string& field : portable_fields) {
         QVERIFY(proof_object.exists(field));
     }
 
@@ -1392,7 +1418,7 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
     const QString alternate_pubkey_hex{QString::fromStdString(HexStr(std::span<const unsigned char>{alternate_pubkey.begin(), alternate_pubkey.end()}))};
     QVERIFY(!proof_text.contains(alternate_pubkey_hex));
     QVERIFY(proof_status->text().contains(alternate_pubkey_hex));
-    QVERIFY(proof_status->text().contains("PQC usage state after signing: warning."));
+    QVERIFY(proof_status->text().contains("PQC usage state after signing: exhausted."));
 
     QApplication::clipboard()->clear();
     proof_copy_button->click();
@@ -1484,7 +1510,7 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
                                            .arg(signatures_remaining)));
     UniValue single_key_proof;
     QVERIFY(single_key_proof.read(single_key_proof_output->toPlainText().toStdString()));
-    QCOMPARE(single_key_proof.getKeys().size(), required_fields.size());
+    QCOMPARE(single_key_proof.getKeys().size(), portable_fields.size());
     for (const char* field : local_or_informational_fields) {
         QVERIFY(!single_key_proof.exists(field));
     }
