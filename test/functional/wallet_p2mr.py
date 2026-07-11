@@ -22,6 +22,7 @@ from test_framework.messages import (
     CTransaction,
     CTxOut,
 )
+from test_framework.script import CScript, OP_TRUE
 from test_framework.script_util import (
     ANCHOR_ADDRESS,
     DUMMY_MIN_OP_RETURN_SCRIPT,
@@ -31,6 +32,7 @@ from test_framework.script_util import (
     key_to_p2wpkh_script,
     output_key_to_p2tr_script,
     program_to_witness_script,
+    script_to_p2wsh_script,
 )
 from test_framework.segwit_addr import (
     Encoding,
@@ -471,13 +473,17 @@ class WalletP2MRTest(BitcoinTestFramework):
             {"solving_data": {"scripts": [key_to_p2pkh_script(legacy_pubkey_for_rpc).hex()]}},
         )
 
+        p2mr_script = bytes.fromhex(receive_info["scriptPubKey"])
         self.log.info("Check -p2mronly fundrawtransaction rejects prebuilt non-P2MR recipient outputs")
         _, raw_recipient_pubkey = generate_keypair(wif=True)
+        invalid_p2pkh_script = key_to_p2pkh_script(raw_recipient_pubkey)
         for output_name, script_pub_key in (
-            ("legacy P2PKH", key_to_p2pkh_script(raw_recipient_pubkey)),
+            ("legacy P2PKH", invalid_p2pkh_script),
             ("P2SH-SegWit", key_to_p2sh_p2wpkh_script(raw_recipient_pubkey)),
             ("bech32 v0", key_to_p2wpkh_script(raw_recipient_pubkey)),
+            ("bech32 v0 P2WSH", script_to_p2wsh_script(CScript([OP_TRUE]))),
             ("bech32m v1", output_key_to_p2tr_script(bytes(range(32, 64)))),
+            ("non-extractable script", CScript([OP_TRUE])),
         ):
             self.log.debug("Reject %s raw recipient output", output_name)
             assert_raises_rpc_error(
@@ -487,8 +493,35 @@ class WalletP2MRTest(BitcoinTestFramework):
                 raw_tx_with_outputs([(script_pub_key, COIN)]),
             )
 
+        self.log.info("Check one invalid output rejects a mixed prebuilt output set")
+        assert_raises_rpc_error(
+            -8,
+            "Output scriptPubKey is not allowed in restricted-output mode",
+            p2mr_wallet.fundrawtransaction,
+            raw_tx_with_outputs([(p2mr_script, COIN), (invalid_p2pkh_script, COIN)]),
+        )
+
+        self.log.info("Check -p2mronly fundrawtransaction preserves reserved-witness wallet policy")
+        assert_raises_rpc_error(
+            -8,
+            "Reserved witness versions are valid addresses, but outputs to reserved witness versions are nonstandard under qbit restricted-output relay policy",
+            p2mr_wallet.fundrawtransaction,
+            raw_tx_with_outputs([(reserved_witness_script(3), COIN)]),
+        )
+
+        self.log.info("Check an invalid fee-subtraction output fails before locking wallet inputs")
+        invalid_raw_tx = raw_tx_with_outputs([(invalid_p2pkh_script, COIN)])
+        locked_before = p2mr_wallet.listlockunspent()
+        assert_raises_rpc_error(
+            -8,
+            "Output scriptPubKey is not allowed in restricted-output mode",
+            p2mr_wallet.fundrawtransaction,
+            invalid_raw_tx,
+            {"subtractFeeFromOutputs": [0], "lockUnspents": True},
+        )
+        assert_equal(p2mr_wallet.listlockunspent(), locked_before)
+
         self.log.info("Check -p2mronly fundrawtransaction accepts prebuilt allowed recipient outputs")
-        p2mr_script = bytes.fromhex(receive_info["scriptPubKey"])
         for output_name, outputs in (
             ("P2MR", [(p2mr_script, COIN)]),
             ("P2MR with OP_RETURN", [(p2mr_script, COIN), (DUMMY_MIN_OP_RETURN_SCRIPT, 0)]),
@@ -496,7 +529,20 @@ class WalletP2MRTest(BitcoinTestFramework):
         ):
             self.log.debug("Accept %s raw recipient output", output_name)
             funded_raw = p2mr_wallet.fundrawtransaction(raw_tx_with_outputs(outputs))
-            assert "hex" in funded_raw
+            decoded_funded = p2mr_wallet.decoderawtransaction(funded_raw["hex"])
+            original_vouts = [
+                vout
+                for index, vout in enumerate(decoded_funded["vout"])
+                if index != funded_raw["changepos"]
+            ]
+            assert_equal(
+                [vout["scriptPubKey"]["hex"] for vout in original_vouts],
+                [script_pub_key.hex() for script_pub_key, _ in outputs],
+            )
+            assert_equal(
+                [vout["value"] for vout in original_vouts],
+                [Decimal(amount) / COIN for _, amount in outputs],
+            )
 
         self.log.info("Check restricted-output mempool rejection for legacy outputs")
         _, non_p2mr_pubkey = generate_keypair(wif=True)
