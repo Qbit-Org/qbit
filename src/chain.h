@@ -155,6 +155,12 @@ public:
     //! pointer to the index of some further predecessor of this block
     CBlockIndex* pskip{nullptr};
 
+    //! nearest strict permissionless ancestor (memory only)
+    CBlockIndex* pprev_permissionless{nullptr};
+
+    //! nearest strict AuxPoW ancestor (memory only)
+    CBlockIndex* pprev_auxpow{nullptr};
+
     //! height of the entry in the chain. The genesis block has height 0
     int nHeight{0};
 
@@ -341,6 +347,16 @@ public:
 
     //! Build the skiplist pointer for this entry.
     void BuildSkip();
+
+    //! Build branch-local Cadence lane predecessor pointers for this entry.
+    void BuildCadenceLaneLinks();
+
+    /**
+     * Return the most recent block in the requested Cadence lane, including
+     * this entry when it matches. An opposite-lane ancestor below min_height
+     * is excluded to preserve the ASERT anchor boundary.
+     */
+    const CBlockIndex* GetPreviousBlockForLane(bool auxpow, int min_height) const noexcept;
 
     //! Efficiently find an ancestor of this block.
     CBlockIndex* GetAncestor(int height);

@@ -13,6 +13,8 @@
 #include <test/util/setup_common.h>
 #include <util/chaintype.h>
 #include <validation.h>
+
+#include <deque>
 #include <vector>
 
 #include <boost/test/unit_test.hpp>
@@ -93,6 +95,7 @@ void HeadersGeneratorSetup::FinalizeIndex(CBlockIndex& index, const uint256& has
     index.nAuxPow = auxpow_count;
     index.nChainWork = chain_work;
     index.BuildSkip();
+    index.BuildCadenceLaneLinks();
 }
 
 void HeadersGeneratorSetup::AssertHeadersSyncAccepts(const Consensus::Params& consensus, const CBlockIndex& chain_start, const std::vector<CBlockHeader>& headers)
@@ -172,6 +175,7 @@ BOOST_AUTO_TEST_CASE(recent_chainwork_uses_mixed_lane_window)
             block.nAuxPow = auxpow_count;
             block.nChainWork = (block.pprev ? block.pprev->nChainWork : arith_uint256{}) + GetBlockProof(block);
             block.BuildSkip();
+            block.BuildCadenceLaneLinks();
         }
     };
     build_chain(auxpow_tip_chain, /*auxpow_tip=*/true);
@@ -340,6 +344,59 @@ BOOST_AUTO_TEST_CASE(headers_sync_accepts_signet_permissionless_to_auxpow_anchor
                                            permissionless_header.nTime + consensus.nPowTargetSpacing,
                                            consensus.asertAnchorParams.nBitsAuxPow);
     AssertHeadersSyncAccepts(consensus, permissionless, {auxpow});
+}
+
+BOOST_AUTO_TEST_CASE(headers_sync_uses_cached_starved_lane_history)
+{
+    const auto chain_params = CreateChainParams(*m_node.args, ChainType::MAIN);
+    const auto& consensus = chain_params->GetConsensus();
+    const int32_t permissionless_version{MakeVersion(/*chain_id=*/0, /*auxpow=*/false, /*version_bits=*/0)};
+    const int32_t auxpow_version{MakeVersion(static_cast<uint16_t>(consensus.nAuxpowChainId), /*auxpow=*/true, /*version_bits=*/0)};
+    const uint32_t permissionless_bits{consensus.asertAnchorParams.nBitsLegacy};
+    const uint32_t auxpow_bits{consensus.asertAnchorParams.nBitsAuxPow};
+
+    for (const bool starve_auxpow : {false, true}) {
+        std::deque<CBlockIndex> chain;
+        std::deque<uint256> hashes;
+        const auto append = [&](const int32_t version, const uint32_t time, const uint32_t bits) {
+            CBlockHeader header = MakeHeader(chain.empty() ? uint256{} : chain.back().GetBlockHash(), version, time, bits);
+            chain.emplace_back(header);
+            hashes.emplace_back(header.GetHash());
+            CBlockIndex& index{chain.back()};
+            CBlockIndex* parent{chain.size() == 1 ? nullptr : &chain[chain.size() - 2]};
+            FinalizeIndex(index,
+                          hashes.back(),
+                          parent,
+                          parent == nullptr ? 0 : parent->nHeight + 1,
+                          (parent == nullptr ? 0 : parent->nAuxPow) + (header.SignalsAuxpow() ? 1 : 0),
+                          (parent == nullptr ? arith_uint256{} : parent->nChainWork) + GetBlockProof(index));
+        };
+
+        append(permissionless_version,
+               consensus.asertAnchorParams.nBlockTime,
+               permissionless_bits);
+        if (starve_auxpow) {
+            append(auxpow_version,
+                   consensus.asertAnchorParams.nBlockTime + consensus.nPowTargetSpacingAuxPow,
+                   auxpow_bits);
+        }
+
+        const int32_t repeated_version{starve_auxpow ? permissionless_version : auxpow_version};
+        const uint32_t repeated_bits{starve_auxpow ? permissionless_bits : auxpow_bits};
+        for (int i = 1; i <= 1000; ++i) {
+            append(repeated_version,
+                   chain.back().nTime + static_cast<uint32_t>(starve_auxpow ? consensus.nPowTargetSpacingLegacy : consensus.nPowTargetSpacingAuxPow),
+                   repeated_bits);
+        }
+
+        const int32_t resumed_version{starve_auxpow ? auxpow_version : permissionless_version};
+        CBlockHeader resumed = MakeHeader(chain.back().GetBlockHash(),
+                                          resumed_version,
+                                          chain.back().nTime + 1,
+                                          /*n_bits=*/0);
+        resumed.nBits = GetNextWorkRequired(&chain.back(), &resumed, consensus);
+        AssertHeadersSyncAccepts(consensus, chain.back(), {resumed});
+    }
 }
 
 BOOST_AUTO_TEST_CASE(headers_sync_redownload_preserves_auxpow_payload)

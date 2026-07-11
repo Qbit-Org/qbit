@@ -81,6 +81,7 @@ struct HashrateTestChain {
         block->index.nChainWork = (block->index.pprev ? block->index.pprev->nChainWork : arith_uint256{}) + GetBlockProof(block->index);
         block->index.phashBlock = &block->hash;
         block->index.BuildSkip();
+        block->index.BuildCadenceLaneLinks();
         blocks.push_back(std::move(block));
         chain.SetTip(blocks.back()->index);
     }

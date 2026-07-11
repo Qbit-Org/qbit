@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <deque>
 #include <limits>
 #include <memory>
 #include <string>
@@ -778,6 +779,101 @@ BOOST_AUTO_TEST_CASE(auxpow_disk_block_index_reload_preserves_payload)
     BOOST_REQUIRE(decoded_header.HasAuxpow());
     BOOST_CHECK_EQUAL(decoded_header.GetHash(), hash);
     BOOST_CHECK_EQUAL(decoded_header.auxpow->GetParentBlockHash(), header.auxpow->GetParentBlockHash());
+}
+
+BOOST_AUTO_TEST_CASE(cadence_lane_links_rebuild_on_block_index_load)
+{
+    const auto& params = Params();
+    const auto& consensus = params.GetConsensus();
+    const uint32_t pow_limit_bits{UintToArith256(consensus.powLimit).GetCompact()};
+
+    std::deque<CBlockIndex> indexes;
+    std::deque<uint256> hashes;
+    const auto add_index = [&](CBlockHeader header, CBlockIndex* parent) -> CBlockIndex& {
+        if (header.SignalsAuxpow()) {
+            header.auxpow = MakeAuxpowPayload(header.GetHash(), consensus, header.nBits, header.nTime);
+        } else {
+            while (!CheckProofOfWork(header.GetHash(), header.nBits, consensus))
+                ++header.nNonce;
+        }
+        indexes.emplace_back(header);
+        hashes.emplace_back(header.GetHash());
+        CBlockIndex& index{indexes.back()};
+        index.phashBlock = &hashes.back();
+        index.pprev = parent;
+        index.nHeight = parent == nullptr ? 0 : parent->nHeight + 1;
+        index.nAuxPow = (parent == nullptr ? 0 : parent->nAuxPow) + (header.SignalsAuxpow() ? 1 : 0);
+        return index;
+    };
+
+    CBlockHeader root_header;
+    root_header.nVersion = MakeVersion(/*chain_id=*/0, /*auxpow=*/false, /*version_bits=*/0);
+    root_header.hashMerkleRoot = uint256{101};
+    root_header.nTime = 1'738'713'700;
+    root_header.nBits = pow_limit_bits;
+    CBlockIndex& root{add_index(root_header, nullptr)};
+
+    CBlockHeader auxpow_header;
+    auxpow_header.nVersion = MakeVersion(static_cast<uint16_t>(consensus.nAuxpowChainId), /*auxpow=*/true, /*version_bits=*/0);
+    auxpow_header.hashPrevBlock = root.GetBlockHash();
+    auxpow_header.hashMerkleRoot = uint256{102};
+    auxpow_header.nTime = root.nTime + 1;
+    auxpow_header.nBits = pow_limit_bits;
+    CBlockIndex& auxpow{add_index(auxpow_header, &root)};
+
+    CBlockHeader permissionless_header;
+    permissionless_header.nVersion = MakeVersion(/*chain_id=*/0, /*auxpow=*/false, /*version_bits=*/0);
+    permissionless_header.hashPrevBlock = auxpow.GetBlockHash();
+    permissionless_header.hashMerkleRoot = uint256{103};
+    permissionless_header.nTime = auxpow.nTime + 1;
+    permissionless_header.nBits = pow_limit_bits;
+    CBlockIndex& permissionless{add_index(permissionless_header, &auxpow)};
+
+    CBlockHeader fork_header{auxpow_header};
+    fork_header.hashPrevBlock = root.GetBlockHash();
+    fork_header.hashMerkleRoot = uint256{104};
+    fork_header.nTime = root.nTime + 2;
+    fork_header.auxpow.reset();
+    CBlockIndex& fork_auxpow{add_index(fork_header, &root)};
+
+    node::KernelNotifications notifications{Assert(m_node.shutdown_request), m_node.exit_status, *Assert(m_node.warnings)};
+    node::BlockManager::Options blockman_opts{
+        .chainparams = params,
+        .use_xor = false,
+        .blocks_dir = m_args.GetBlocksDirPath(),
+        .notifications = notifications,
+        .block_tree_db_params = DBParams{
+            .path = "",
+            .cache_bytes = 1 << 20,
+            .memory_only = true,
+        },
+    };
+    node::BlockManager blockman{*Assert(m_node.shutdown_signal), blockman_opts};
+
+    {
+        LOCK(::cs_main);
+        BOOST_REQUIRE(blockman.m_block_tree_db->WriteBatchSync(
+            {}, /*nLastFile=*/0, {&root, &auxpow, &permissionless, &fork_auxpow}));
+        BOOST_REQUIRE(blockman.LoadBlockIndexDB(std::nullopt) == node::BlockIndexLoadResult::SUCCESS);
+
+        const CBlockIndex* loaded_root{blockman.LookupBlockIndex(root.GetBlockHash())};
+        const CBlockIndex* loaded_auxpow{blockman.LookupBlockIndex(auxpow.GetBlockHash())};
+        const CBlockIndex* loaded_permissionless{blockman.LookupBlockIndex(permissionless.GetBlockHash())};
+        const CBlockIndex* loaded_fork_auxpow{blockman.LookupBlockIndex(fork_auxpow.GetBlockHash())};
+        BOOST_REQUIRE(loaded_root);
+        BOOST_REQUIRE(loaded_auxpow);
+        BOOST_REQUIRE(loaded_permissionless);
+        BOOST_REQUIRE(loaded_fork_auxpow);
+
+        BOOST_CHECK(loaded_root->pprev_permissionless == nullptr);
+        BOOST_CHECK(loaded_root->pprev_auxpow == nullptr);
+        BOOST_CHECK(loaded_auxpow->pprev_permissionless == loaded_root);
+        BOOST_CHECK(loaded_auxpow->pprev_auxpow == nullptr);
+        BOOST_CHECK(loaded_permissionless->pprev_permissionless == loaded_root);
+        BOOST_CHECK(loaded_permissionless->pprev_auxpow == loaded_auxpow);
+        BOOST_CHECK(loaded_fork_auxpow->pprev_permissionless == loaded_root);
+        BOOST_CHECK(loaded_fork_auxpow->pprev_auxpow == nullptr);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(auxpow_legacy_disk_block_index_entry_without_payload_still_deserializes)

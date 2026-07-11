@@ -123,6 +123,29 @@ void CBlockIndex::BuildSkip()
         pskip = pprev->GetAncestor(GetSkipHeight(nHeight));
 }
 
+void CBlockIndex::BuildCadenceLaneLinks()
+{
+    pprev_permissionless = nullptr;
+    pprev_auxpow = nullptr;
+    if (!pprev) return;
+
+    if (pprev->SignalsAuxpow()) {
+        pprev_auxpow = pprev;
+        pprev_permissionless = pprev->pprev_permissionless;
+    } else {
+        pprev_permissionless = pprev;
+        pprev_auxpow = pprev->pprev_auxpow;
+    }
+}
+
+const CBlockIndex* CBlockIndex::GetPreviousBlockForLane(const bool auxpow, const int min_height) const noexcept
+{
+    if (SignalsAuxpow() == auxpow) return this;
+
+    const CBlockIndex* candidate = auxpow ? pprev_auxpow : pprev_permissionless;
+    return candidate != nullptr && candidate->nHeight >= min_height ? candidate : nullptr;
+}
+
 arith_uint256 GetBlockProof(const CBlockIndex& block)
 {
     arith_uint256 bnTarget;
