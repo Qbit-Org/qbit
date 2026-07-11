@@ -1180,7 +1180,7 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
         expect_error(write_proof(proof), "must be a string");
     }
 
-    for (const std::string& leaf_version : {"-1", "256", "1.5", "999999999999999999999999"}) {
+    for (const char* leaf_version : {"-1", "256", "1.5", "999999999999999999999999"}) {
         UniValue proof{valid_proof};
         UniValue version;
         version.setNumStr(leaf_version);
