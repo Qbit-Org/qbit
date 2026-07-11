@@ -23,6 +23,15 @@ namespace wallet {
 class CWallet;
 using LoadWalletFn = std::function<void(std::unique_ptr<interfaces::Wallet> wallet)>;
 
+enum class CreateWalletStage {
+    BEFORE_DATABASE_CREATION,
+    ENCRYPTION_COMMITTED_BEFORE_FINAL_DESCRIPTORS,
+    BEFORE_LOAD_NOTIFICATION,
+    MODEL_ADOPTED_BEFORE_CREATED_SIGNAL,
+};
+
+using CreateWalletStageFn = std::function<void(CreateWalletStage)>;
+
 //! WalletContext struct containing references to state shared between CWallet
 //! instances, like the reference to the chain interface, and the list of opened
 //! wallets.
@@ -42,6 +51,10 @@ struct WalletContext {
     Mutex wallets_mutex;
     std::vector<std::shared_ptr<CWallet>> wallets GUARDED_BY(wallets_mutex);
     std::list<LoadWalletFn> wallet_load_fns GUARDED_BY(wallets_mutex);
+
+    // Optional deterministic lifecycle hook for tests. Set before wallet
+    // creation starts and keep unchanged until creation has completed.
+    CreateWalletStageFn create_wallet_stage_fn;
 
     //! Declare default constructor and destructor that are not inline, so code
     //! instantiating the WalletContext struct doesn't need to #include class

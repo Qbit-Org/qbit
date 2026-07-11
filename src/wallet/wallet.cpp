@@ -673,6 +673,10 @@ std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string&
         return nullptr;
     }
 
+    if (context.create_wallet_stage_fn) {
+        context.create_wallet_stage_fn(CreateWalletStage::BEFORE_DATABASE_CREATION);
+    }
+
     // Wallet::Verify will check if we're trying to create a wallet with a duplicate name.
     std::unique_ptr<WalletDatabase> database = MakeWalletDatabase(name, options, status, error);
     if (!database) {
@@ -697,6 +701,9 @@ std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string&
             status = DatabaseStatus::FAILED_ENCRYPT;
             return nullptr;
         }
+        if (!create_blank && context.create_wallet_stage_fn) {
+            context.create_wallet_stage_fn(CreateWalletStage::ENCRYPTION_COMMITTED_BEFORE_FINAL_DESCRIPTORS);
+        }
         if (!create_blank) {
             // Unlock the wallet
             // Unlock only long enough to rebuild the final encrypted descriptors.
@@ -716,6 +723,10 @@ std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string&
             // Relock the wallet
             wallet->Lock();
         }
+    }
+
+    if (context.create_wallet_stage_fn) {
+        context.create_wallet_stage_fn(CreateWalletStage::BEFORE_LOAD_NOTIFICATION);
     }
 
     NotifyWalletLoaded(context, wallet);
