@@ -142,7 +142,7 @@ void AppTests::appTests()
     QVERIFY(m_shutdown_wallet_state);
 
     const auto state{m_shutdown_wallet_state};
-    std::jthread watchdog{[state] {
+    std::thread watchdog{[state] {
         std::unique_lock lock{state->mutex};
         if (!state->condition.wait_for(lock, 5s, [state] {
                 return state->create_finished || state->shutdown_complete;
