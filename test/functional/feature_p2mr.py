@@ -786,6 +786,20 @@ class FeatureP2MRTest(BitcoinTestFramework):
         assert_equal(verified["p2mr_merkle_root"], proof["p2mr_merkle_root"])
         assert_equal(verified["datasig_hash"], proof["datasig_hash"])
 
+        minimal_proof_fields = {
+            "address",
+            "message_hash",
+            "pubkey",
+            "signature",
+            "leaf_script",
+            "control_block",
+            "leaf_version",
+            "proof_mode",
+        }
+        minimal_proof = {field: proof[field] for field in minimal_proof_fields}
+        assert_equal(set(minimal_proof), minimal_proof_fields)
+        assert_equal(node.verifydatapqchash(minimal_proof)["valid"], True)
+
         explicit_proof = p2mr_wallet.signdatapqchash(address, message_hash, {
             "pubkey": proof["pubkey"],
             "leaf_script": proof["leaf_script"],
@@ -793,7 +807,16 @@ class FeatureP2MRTest(BitcoinTestFramework):
             "include_pqc_usage": False,
         })
         assert_equal(node.verifydatapqchash(explicit_proof)["valid"], True)
-        assert "pqc_signature_count" not in explicit_proof
+        for field in (
+            "pqc_key_states",
+            "pqc_overall_limit_state",
+            "pqc_signature_count",
+            "pqc_signature_limit",
+            "pqc_signatures_remaining",
+            "pqc_limit_state",
+            "warnings",
+        ):
+            assert field not in explicit_proof
 
         wrong_message = dict(proof)
         wrong_message["message_hash"] = "22" * 32
