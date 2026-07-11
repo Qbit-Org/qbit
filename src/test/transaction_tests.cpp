@@ -1381,7 +1381,8 @@ BOOST_AUTO_TEST_CASE(p2mr_minimal_witness_budget)
     witness.stack.emplace_back(std::vector<unsigned char>{0xc1}); // Leaf version 0xc0 with required bit0 set.
 
     const int64_t validation_budget = ::GetSerializeSize(witness.stack) + VALIDATION_WEIGHT_OFFSET;
-    BOOST_CHECK_GE(validation_budget, VALIDATION_WEIGHT_PER_SIGOP_PQC);
+    BOOST_CHECK_GE(validation_budget, P2MR_VALIDATION_WEIGHT_PER_SIGOP_LEGACY);
+    BOOST_CHECK_GE(validation_budget, P2MR_VALIDATION_WEIGHT_PER_SIGOP_V2);
 }
 
 BOOST_AUTO_TEST_CASE(p2mr_witness_standard_total_initial_stack_bytes)
@@ -1542,7 +1543,7 @@ BOOST_AUTO_TEST_CASE(p2mr_non_32_byte_pubkey_sigops_consume_pqc_weight)
     tx.vout[0].scriptPubKey = CScript{} << OP_TRUE;
 
     const int64_t validation_budget = ::GetSerializeSize(tx.vin[0].scriptWitness.stack) + VALIDATION_WEIGHT_OFFSET;
-    BOOST_CHECK_LT(validation_budget, VALIDATION_WEIGHT_PER_SIGOP_PQC);
+    BOOST_CHECK_LT(validation_budget, P2MR_VALIDATION_WEIGHT_PER_SIGOP_V2);
 
     const CAmount spent_amount{50'000};
     std::vector<CTxOut> spent_outputs;

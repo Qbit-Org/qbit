@@ -280,6 +280,8 @@ bool CheckSequenceLocksAtTip(CBlockIndex* tip,
 
 // Returns the script flags which should be checked for a given block
 static unsigned int GetBlockScriptFlags(const CBlockIndex& block_index, const ChainstateManager& chainman);
+static unsigned int GetNextBlockScriptFlags(const ChainstateManager& chainman) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+static unsigned int GetStandardScriptFlagsForNextBlock(const ChainstateManager& chainman) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
 static void LimitMempoolSize(CTxMemPool& pool, CCoinsViewCache& coins_cache)
     EXCLUSIVE_LOCKS_REQUIRED(::cs_main, pool.cs)
@@ -352,13 +354,17 @@ void Chainstate::MaybeUpdateMempoolForReorg(
     m_mempool->UpdateTransactionsFromBlock(vHashUpdate);
 
     // Predicate to use for filtering transactions in removeForReorg.
-    // Checks whether the transaction is still final and, if it spends a coinbase output, mature.
+    // Checks whether the transaction is still final, valid under the next
+    // block's script rules and, if it spends a coinbase output, mature.
     // Also updates valid entries' cached LockPoints if needed.
     // If false, the tx is still valid and its lockpoints are updated.
     // If true, the tx would be invalid in the next block; remove this entry and all of its descendants.
     // Note that TRUC rules are not applied here, so reorgs may cause violations of TRUC inheritance or
     // topology restrictions.
-    const auto filter_final_and_mature = [&](CTxMemPool::txiter it)
+    CCoinsViewMemPool view_mempool{&CoinsTip(), *m_mempool};
+    CCoinsViewCache reorg_view{&view_mempool};
+    const unsigned int next_block_script_flags{GetNextBlockScriptFlags(m_chainman)};
+    const auto filter_final_script_and_mature = [&](CTxMemPool::txiter it)
         EXCLUSIVE_LOCKS_REQUIRED(m_mempool->cs, ::cs_main) {
         AssertLockHeld(m_mempool->cs);
         AssertLockHeld(::cs_main);
@@ -375,7 +381,6 @@ void Chainstate::MaybeUpdateMempoolForReorg(
                 return true;
             }
         } else {
-            const CCoinsViewMemPool view_mempool{&CoinsTip(), *m_mempool};
             const std::optional<LockPoints> new_lock_points{CalculateLockPointsAtTip(m_chain.Tip(), view_mempool, tx)};
             if (new_lock_points.has_value() && CheckSequenceLocksAtTip(m_chain.Tip(), *new_lock_points)) {
                 // Now update the mempool entry lockpoints as well.
@@ -397,12 +402,21 @@ void Chainstate::MaybeUpdateMempoolForReorg(
                 }
             }
         }
+
+        TxValidationState script_state;
+        PrecomputedTransactionData txdata;
+        if (!CheckInputScripts(tx, script_state, reorg_view, next_block_script_flags,
+                /*cacheSigStore=*/true, /*cacheFullScriptStore=*/true, txdata, m_chainman.m_validation_cache)) {
+            return true;
+        }
         // Transaction is still valid and cached LockPoints are updated.
         return false;
     };
 
-    // We also need to remove any now-immature transactions
-    m_mempool->removeForReorg(m_chain, filter_final_and_mature);
+    // We also need to remove transactions invalid under the new tip's
+    // next-block rules, including transactions made invalid by crossing a
+    // height-activated consensus boundary in reverse.
+    m_mempool->removeForReorg(m_chain, filter_final_script_and_mature);
     // Re-limit mempool size, in case we added any transactions
     LimitMempoolSize(*m_mempool, this->CoinsTip());
 }
@@ -1274,7 +1288,7 @@ bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws)
     const CTransaction& tx = *ws.m_ptx;
     TxValidationState& state = ws.m_state;
 
-    constexpr unsigned int scriptVerifyFlags = STANDARD_SCRIPT_VERIFY_FLAGS;
+    const unsigned int scriptVerifyFlags{GetStandardScriptFlagsForNextBlock(m_active_chainstate.m_chainman)};
 
     // Check input scripts and signatures.
     // This is done last to help prevent CPU exhaustion denial-of-service attacks.
@@ -1298,12 +1312,9 @@ bool MemPoolAccept::ConsensusScriptChecks(const ATMPArgs& args, Workspace& ws)
     const Txid& hash = ws.m_hash;
     TxValidationState& state = ws.m_state;
 
-    // Check again against the current block tip's script verification
-    // flags to cache our script execution flags. This is, of course,
-    // useless if the next block has different script flags from the
-    // previous one, but because the cache tracks script flags for us it
-    // will auto-invalidate and we'll just have a few blocks of extra
-    // misses on soft-fork activation.
+    // Check again against the next block's consensus flags. Using the
+    // candidate height is required for height-activated consensus changes
+    // whose first valid transaction may be mined in the activation block.
     //
     // This is also useful in case of bugs in the standard flags that cause
     // transactions to pass as valid when they're actually invalid. For
@@ -1313,8 +1324,8 @@ bool MemPoolAccept::ConsensusScriptChecks(const ATMPArgs& args, Workspace& ws)
     // There is a similar check in CreateNewBlock() to prevent creating
     // invalid blocks (using TestBlockValidity), however allowing such
     // transactions into the mempool can be exploited as a DoS attack.
-    unsigned int currentBlockScriptVerifyFlags{GetBlockScriptFlags(*m_active_chainstate.m_chain.Tip(), m_active_chainstate.m_chainman)};
-    if (!CheckInputsFromMempoolAndCache(tx, state, m_view, m_pool, currentBlockScriptVerifyFlags,
+    const unsigned int nextBlockScriptVerifyFlags{GetNextBlockScriptFlags(m_active_chainstate.m_chainman)};
+    if (!CheckInputsFromMempoolAndCache(tx, state, m_view, m_pool, nextBlockScriptVerifyFlags,
                                         ws.m_precomputed_txdata, m_active_chainstate.CoinsTip(), GetValidationCache())) {
         LogPrintf("BUG! PLEASE REPORT THIS! CheckInputScripts failed against latest-block but not STANDARD flags %s, %s\n", hash.ToString(), state.ToString());
         return Assume(false);
@@ -2379,6 +2390,9 @@ static unsigned int GetBlockScriptFlags(const CBlockIndex& block_index, const Ch
     uint32_t flags{SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_TAPROOT};
     if (block_index.nHeight >= consensusparams.P2MRHeight) {
         flags |= SCRIPT_VERIFY_P2MR_RULES;
+        if (!consensusparams.P2MRValidationWeightV2ActiveAtHeight(block_index.nHeight)) {
+            flags |= SCRIPT_VERIFY_P2MR_LEGACY_VALIDATION_WEIGHT;
+        }
     }
     const auto it{consensusparams.script_flag_exceptions.find(*Assert(block_index.phashBlock))};
     if (it != consensusparams.script_flag_exceptions.end()) {
@@ -2405,6 +2419,39 @@ static unsigned int GetBlockScriptFlags(const CBlockIndex& block_index, const Ch
         flags |= SCRIPT_VERIFY_NULLDUMMY;
     }
 
+    return flags;
+}
+
+static unsigned int GetNextBlockScriptFlags(const ChainstateManager& chainman)
+{
+    AssertLockHeld(cs_main);
+    const CBlockIndex* tip{chainman.ActiveChain().Tip()};
+    assert(tip != nullptr);
+    const int next_height{tip->nHeight + 1};
+    unsigned int flags{GetBlockScriptFlags(*tip, chainman)};
+    const Consensus::Params& consensus{chainman.GetConsensus()};
+    if (next_height >= consensus.P2MRHeight) {
+        flags |= SCRIPT_VERIFY_P2MR_RULES;
+        if (consensus.P2MRValidationWeightV2ActiveAtHeight(next_height)) {
+            flags &= ~SCRIPT_VERIFY_P2MR_LEGACY_VALIDATION_WEIGHT;
+        } else {
+            flags |= SCRIPT_VERIFY_P2MR_LEGACY_VALIDATION_WEIGHT;
+        }
+    }
+    return flags;
+}
+
+static unsigned int GetStandardScriptFlagsForNextBlock(const ChainstateManager& chainman)
+{
+    AssertLockHeld(cs_main);
+    unsigned int flags{STANDARD_SCRIPT_VERIFY_FLAGS};
+    const CBlockIndex* tip{chainman.ActiveChain().Tip()};
+    assert(tip != nullptr);
+    const int next_height{tip->nHeight + 1};
+    const Consensus::Params& consensus{chainman.GetConsensus()};
+    if (next_height >= consensus.P2MRHeight && !consensus.P2MRValidationWeightV2ActiveAtHeight(next_height)) {
+        flags |= SCRIPT_VERIFY_P2MR_LEGACY_VALIDATION_WEIGHT;
+    }
     return flags;
 }
 

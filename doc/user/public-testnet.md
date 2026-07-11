@@ -19,6 +19,12 @@ The current public rehearsal network is qbit `testnet4`. The
 `v0.1.0-testnet4` release starts a reset lineage and is not compatible with
 earlier rc testnet4 chain data.
 
+P2MR validation-weight v2 activates on the existing testnet4 chain at block
+60,000. This activation does not reset the chain, but it is a consensus
+relaxation and requires miners and validating services to upgrade beforehand.
+Use `getblockchaininfo` and inspect `p2mr_validation_weight` for the local
+node's activation status.
+
 The qbit codebase defines testnet4 chain parameters, ports, address prefixes,
 archive-node behavior, the `-testnet4` command-line flag, DNS seed hostnames,
 and archive fallback endpoints. The current values in this page are confirmed

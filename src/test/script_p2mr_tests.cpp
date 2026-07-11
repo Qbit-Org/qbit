@@ -2646,6 +2646,40 @@ BOOST_AUTO_TEST_CASE(p2mr_checksigadd_accepts_valid_multi_a_spend)
     BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
 }
 
+BOOST_AUTO_TEST_CASE(p2mr_five_of_five_activates_with_validation_weight_v2)
+{
+    std::array<CPQCKey, 5> keys;
+    std::vector<CPQCPubKey> pubkeys;
+    pubkeys.reserve(keys.size());
+    for (auto& key : keys) {
+        key.MakeNewKey();
+        BOOST_REQUIRE(key.IsValid());
+        pubkeys.push_back(key.GetPubKey());
+    }
+
+    const CScript leaf_script = BuildP2MRMultiAScript(5, pubkeys);
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+    P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/std::vector<valtype>(keys.size(), valtype(PQC_SIG_SIZE, 0x00)),
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        valtype sig;
+        SignP2MRLeaf(keys[i], leaf_script, spend, sig);
+        spend.tx_spend.vin[0].scriptWitness.stack[keys.size() - 1 - i] = std::move(sig);
+    }
+
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS | SCRIPT_VERIFY_P2MR_LEGACY_VALIDATION_WEIGHT, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_P2MR_VALIDATION_WEIGHT);
+
+    err = SCRIPT_ERR_UNKNOWN_ERROR;
+    BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+}
+
 BOOST_AUTO_TEST_CASE(p2mr_checksigpqc_accepts_explicit_hashtype)
 {
     static constexpr uint8_t EXPLICIT_HASHTYPE{SIGHASH_ALL};

@@ -15,8 +15,13 @@
 static constexpr size_t P2MR_V1_WITNESS_STACK_ITEMS{3}; // signature, leaf script, control block
 static constexpr size_t P2MR_V1_MAX_SIGNATURE_ITEM_SIZE{PQC_SIG_SIZE + 1};
 static constexpr size_t P2MR_V1_PK_LEAF_SCRIPT_SIZE{1 + CPQCPubKey::SIZE + 1};
+static constexpr size_t P2MR_V1_MAX_STANDARD_SIGNATURES{
+    MAX_P2MR_V1_TOTAL_INITIAL_STACK_BYTES / P2MR_V1_MAX_SIGNATURE_ITEM_SIZE};
 
 static_assert(P2MR_V1_MAX_SIGNATURE_ITEM_SIZE <= MAX_P2MR_V1_STACK_ITEM_SIZE);
+static_assert(P2MR_VALIDATION_WEIGHT_PER_SIGOP_V2 == PQC_SIG_SIZE + GetSizeOfCompactSize(PQC_SIG_SIZE));
+static_assert(P2MR_VALIDATION_WEIGHT_PER_SIGOP_LEGACY > P2MR_VALIDATION_WEIGHT_PER_SIGOP_V2);
+static_assert(P2MR_V1_MAX_STANDARD_SIGNATURES == 35);
 
 constexpr size_t GetP2MRControlBlockSize(size_t merkle_depth)
 {

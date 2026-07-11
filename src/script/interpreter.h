@@ -147,6 +147,10 @@ enum : uint32_t {
     // P2MR/SegWit v2 validation (BIP-360)
     SCRIPT_VERIFY_P2MR_RULES = (1U << 21),
 
+    // Enforce the original qbit P2MR validation-weight debit. This flag is
+    // removed at the height-activated validation-weight-v2 consensus change.
+    SCRIPT_VERIFY_P2MR_LEGACY_VALIDATION_WEIGHT = (1U << 22),
+
     // Constants to point to the highest flag in use. Add new flags above this line.
     //
     SCRIPT_VERIFY_END_MARKER
