@@ -10,6 +10,6 @@ PQC usage warnings and remaining-budget information continue to be shown in
 the local signer status. Existing proof JSON containing the former optional
 fields remains accepted by both qbit-qt and the `verifydatapqchash` RPC.
 
-The `signdatapqchash` RPC response and its `include_pqc_usage` default are
-unchanged. Set `include_pqc_usage=false` when using that RPC result as a
-portable proof.
+The `signdatapqchash` RPC now omits wallet-local PQC usage fields by default so
+its result remains bounded and portable. Set `include_pqc_usage=true` to include
+those fields for local diagnostics.
