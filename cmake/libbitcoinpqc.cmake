@@ -7,8 +7,21 @@ enable_language(C)
 function(add_libbitcoinpqc subdir)
   message("")
   message("Configuring libbitcoinpqc subtree...")
+
+  if(SPX_ENABLE_TEST_BENCH_ENV_KNOBS)
+    message(FATAL_ERROR
+      "SPX_ENABLE_TEST_BENCH_ENV_KNOBS is test/benchmark-only and cannot "
+      "be enabled in an integrated qbit build. Configure src/libbitcoinpqc "
+      "as a standalone project for backend experiments."
+    )
+  endif()
+
   set(BUILD_SHARED_LIBS OFF)
   set(CMAKE_EXPORT_COMPILE_COMMANDS OFF)
+  set(SPX_ENABLE_TEST_BENCH_ENV_KNOBS OFF CACHE BOOL
+    "Unavailable in integrated qbit builds." FORCE
+  )
+  mark_as_advanced(FORCE SPX_ENABLE_TEST_BENCH_ENV_KNOBS)
 
   include(GetTargetInterface)
   # -fsanitize and related flags apply to both C++ and C,
@@ -37,6 +50,13 @@ function(add_libbitcoinpqc subdir)
   set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
   add_subdirectory(${subdir})
   set(BUILD_TESTING "${BUILD_TESTING_SAVED}" CACHE BOOL "" FORCE)
+
+  # Enforce qbit's production policy independently of the subtree default.
+  # If the test-only macro is injected through compiler flags, opt_flags.h
+  # rejects the conflicting definitions while compiling the actual library.
+  target_compile_definitions(bitcoinpqc PRIVATE
+    SPX_PRODUCTION_BUILD=1
+  )
 
   # Keep this subtree out of "all" unless linked.
   set_target_properties(bitcoinpqc PROPERTIES

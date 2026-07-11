@@ -36,6 +36,14 @@ class GuixBuildConfigTest(unittest.TestCase):
             script,
         )
 
+    def test_release_builds_disable_pqc_runtime_controls(self) -> None:
+        script = BUILD_SH.read_text(encoding="utf8")
+
+        self.assertIn(
+            '-DSPX_ENABLE_TEST_BENCH_ENV_KNOBS=OFF',
+            script,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
