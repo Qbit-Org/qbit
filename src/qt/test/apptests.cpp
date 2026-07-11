@@ -7,21 +7,24 @@
 #include <bitcoin-build-config.h> // IWYU pragma: keep
 
 #include <chainparams.h>
-#include <common/args.h>
-#include <interfaces/wallet.h>
 #include <key.h>
 #include <logging.h>
 #include <qt/bitcoin.h>
 #include <qt/bitcoingui.h>
 #include <qt/networkstyle.h>
 #include <qt/rpcconsole.h>
+#include <test/util/setup_common.h>
+#include <validation.h>
+
+#ifdef ENABLE_WALLET
+#include <common/args.h>
+#include <interfaces/wallet.h>
 #include <qt/sendcoinsdialog.h>
 #include <qt/walletcontroller.h>
 #include <qt/walletview.h>
-#include <test/util/setup_common.h>
 #include <univalue.h>
-#include <validation.h>
 #include <wallet/wallet.h>
+#endif // ENABLE_WALLET
 
 #include <QAction>
 #include <QLineEdit>
@@ -124,6 +127,15 @@ void AppTests::guiTests(BitcoinGUI* window)
     QVERIFY(controller);
 
     for (const std::string name : {"qt-shutdown-lifetime-1", "qt-shutdown-lifetime-2"}) {
+        QSignalSpy wallet_added_spy(controller, &WalletController::walletAdded);
+        QVERIFY(wallet_added_spy.isValid());
+        WalletModel* wallet_model{nullptr};
+        QObject wallet_added_context;
+        connect(
+            controller,
+            &WalletController::walletAdded,
+            &wallet_added_context,
+            [&](WalletModel* model) { wallet_model = model; });
         std::vector<bilingual_str> warnings;
         auto wallet{m_app.node().walletLoader().createWallet(
             name,
@@ -131,7 +143,7 @@ void AppTests::guiTests(BitcoinGUI* window)
             wallet::WALLET_FLAG_DESCRIPTORS | wallet::WALLET_FLAG_BLANK_WALLET,
             warnings)};
         QVERIFY(wallet);
-        WalletModel* const wallet_model{controller->getOrCreateWallet(std::move(*wallet))};
+        if (!wallet_model) QVERIFY(wallet_added_spy.wait(5000));
         QVERIFY(wallet_model);
 
         if (!m_shutdown_wallet_model) {
