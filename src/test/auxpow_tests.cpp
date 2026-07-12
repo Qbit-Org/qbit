@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <limits>
 #include <memory>
 #include <string>
@@ -108,8 +109,9 @@ std::vector<unsigned char> MakeCommitment(std::vector<unsigned char> prefix, con
     return MakeCommitment(std::move(prefix), AuxpowCommitmentRootBytes(root), merkle_size, nonce);
 }
 
-std::shared_ptr<const CAuxPow> MakeAuxpowPayload(const uint256& aux_block_hash, const Consensus::Params& consensus, const uint32_t target_bits, const uint32_t parent_time)
+std::shared_ptr<const CAuxPow> MakeAuxpowPayload(const uint256& aux_block_hash, const Consensus::Params& consensus, const uint32_t target_bits, const uint32_t parent_time, const auxpow::CommitmentValidation commitment_order = auxpow::CommitmentValidation::DISPLAY)
 {
+    assert(commitment_order != auxpow::CommitmentValidation::EITHER);
     auto auxpow = std::make_shared<CAuxPow>();
     auxpow->coinbase_merkle_branch.clear();
     auxpow->coinbase_branch_index = 0;
@@ -118,7 +120,8 @@ std::shared_ptr<const CAuxPow> MakeAuxpowPayload(const uint256& aux_block_hash, 
 
     std::vector<unsigned char> commitment;
     commitment.insert(commitment.end(), MERGED_MINING_HEADER.begin(), MERGED_MINING_HEADER.end());
-    commitment = MakeCommitment(std::move(commitment), aux_block_hash, /*merkle_size=*/1, /*nonce=*/0);
+    const auto commitment_root = commitment_order == auxpow::CommitmentValidation::DISPLAY ? AuxpowCommitmentRootBytes(aux_block_hash) : InternalUint256Bytes(aux_block_hash);
+    commitment = MakeCommitment(std::move(commitment), commitment_root, /*merkle_size=*/1, /*nonce=*/0);
 
     auxpow->coinbase_tx = MakeParentCoinbase(commitment);
     auxpow->parent_block.nVersion = 1;
@@ -1049,6 +1052,63 @@ BOOST_AUTO_TEST_CASE(auxpow_header_reject_reason_and_index_accounting)
     const CBlockIndex* tip = WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain().Tip());
     BOOST_REQUIRE(tip != nullptr);
     BOOST_CHECK_EQUAL(tip->nAuxPow, 1U);
+}
+
+BOOST_AUTO_TEST_CASE(auxpow_known_header_rejects_height_invalid_payload_substitution)
+{
+    const auto& consensus = Params().GetConsensus();
+    bool new_block{false};
+    BOOST_REQUIRE(m_node.chainman->ProcessNewBlock(std::make_shared<CBlock>(Params().GenesisBlock()), /*force_processing=*/true, /*min_pow_checked=*/true, &new_block));
+
+    auto block = CreateBlockTemplate();
+    block->nVersion = MakeVersion(static_cast<uint16_t>(consensus.nAuxpowChainId), /*auxpow=*/true, block->GetVersionBits());
+    FinalizeBlock(*block);
+
+    CBlockHeader display_header{block->GetBlockHeader()};
+    display_header.auxpow = MakeAuxpowPayload(display_header.GetHash(), consensus, display_header.nBits, display_header.nTime, auxpow::CommitmentValidation::DISPLAY);
+    const uint256 indexed_parent_hash{display_header.auxpow->GetParentBlockHash()};
+
+    BlockValidationState state;
+    const CBlockIndex* pindex{nullptr};
+    BOOST_REQUIRE(m_node.chainman->ProcessNewBlockHeaders({{display_header}}, /*min_pow_checked=*/true, state, &pindex));
+    BOOST_REQUIRE(pindex != nullptr);
+    BOOST_REQUIRE(pindex->auxpow);
+    BOOST_CHECK_EQUAL(pindex->auxpow->GetParentBlockHash(), indexed_parent_hash);
+
+    auto internal_block = std::make_shared<CBlock>(*block);
+    internal_block->auxpow = MakeAuxpowPayload(internal_block->GetHash(), consensus, internal_block->nBits, internal_block->nTime + 1, auxpow::CommitmentValidation::INTERNAL);
+
+    state = BlockValidationState{};
+    BOOST_CHECK(!m_node.chainman->ProcessNewBlockHeaders({{internal_block->GetBlockHeader()}}, /*min_pow_checked=*/true, state));
+    BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-auxpow-commitment");
+
+    // force_processing=true exercises the requested-block path used by
+    // getblockfrompeer after a header has already been accepted.
+    new_block = true;
+    BOOST_CHECK(!m_node.chainman->ProcessNewBlock(internal_block, /*force_processing=*/true, /*min_pow_checked=*/true, &new_block));
+    BOOST_CHECK(!new_block);
+    const uint32_t rejected_status{WITH_LOCK(::cs_main, return pindex->nStatus)};
+    BOOST_CHECK(!(rejected_status & BLOCK_HAVE_DATA));
+    BOOST_CHECK(!(rejected_status & BLOCK_FAILED_MASK));
+    BOOST_REQUIRE(pindex->auxpow);
+    BOOST_CHECK_EQUAL(pindex->auxpow->GetParentBlockHash(), indexed_parent_hash);
+
+    auto alternate_display_block = std::make_shared<CBlock>(*block);
+    alternate_display_block->auxpow = MakeAuxpowPayload(alternate_display_block->GetHash(), consensus, alternate_display_block->nBits, alternate_display_block->nTime + 2, auxpow::CommitmentValidation::DISPLAY);
+    BOOST_REQUIRE_NE(alternate_display_block->auxpow->GetParentBlockHash(), indexed_parent_hash);
+
+    BOOST_REQUIRE(m_node.chainman->ProcessNewBlock(alternate_display_block, /*force_processing=*/true, /*min_pow_checked=*/true, &new_block));
+    BOOST_CHECK(new_block);
+    const uint32_t accepted_status{WITH_LOCK(::cs_main, return pindex->nStatus)};
+    BOOST_CHECK(accepted_status & BLOCK_HAVE_DATA);
+    BOOST_CHECK(!(accepted_status & BLOCK_FAILED_MASK));
+    BOOST_REQUIRE(pindex->auxpow);
+    BOOST_CHECK_EQUAL(pindex->auxpow->GetParentBlockHash(), indexed_parent_hash);
+
+    CBlock stored_block;
+    BOOST_REQUIRE(m_node.chainman->m_blockman.ReadBlock(stored_block, *pindex));
+    BOOST_REQUIRE(stored_block.auxpow);
+    BOOST_CHECK_EQUAL(stored_block.auxpow->GetParentBlockHash(), alternate_display_block->auxpow->GetParentBlockHash());
 }
 
 BOOST_AUTO_TEST_CASE(has_valid_proof_of_work_rejects_bad_permissionless_headers)
