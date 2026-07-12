@@ -484,6 +484,9 @@ by `createauxblock`, not by `getmininginfo.next`.
 
 ## Compatibility Notes for Bitcoin Core Integrators
 
+- Consult the [qbit P2MR v1 integration support
+  matrix](p2mr-v1-support-matrix.md) before treating a wallet, signer, PSBT
+  tool, explorer, or validator as supported by a release.
 - Do not hard-code Bitcoin Core ports, address prefixes, or address type assumptions.
 - Do not treat Bitcoin confirmation counts as qbit confirmation policy.
 - Do not assume historical verbose `getblock` works on witness-pruned nodes.
