@@ -856,7 +856,7 @@ def spenders_taproot_active():
                 scripts = [("s0", CScript([pubs[0], OP_CHECKSIG])), ("dummy", CScript([OP_RETURN]))]
                 tap = taproot_construct(pubs[1], scripts)
                 if not p2sh and witver == 2 and witlen == 32:
-                    # Witness v2/32 is interpreted as P2MR (BIP360), so it is no longer an unknown
+                    # Native witness v2/32 is qbit P2MR v1, so it is no longer an unknown
                     # witness program that can be tested here as anyone-can-spend.
                     continue
                 if not p2sh and witver == 1 and witlen == 32:

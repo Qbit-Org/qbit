@@ -1328,7 +1328,7 @@ class SegWitTest(BitcoinTestFramework):
             # First try to spend to a future version segwit script_pubkey.
             if version in (OP_1, OP_2):
                 # Don't use 32-byte v1/v2 witness programs, which are assigned
-                # to Taproot (BIP 341) and P2MR (BIP 360) respectively.
+                # to Taproot (BIP 341) and qbit P2MR v1 respectively.
                 script_pubkey = CScript([CScriptOp(version), witness_hash + b'\x00'])
             else:
                 script_pubkey = CScript([CScriptOp(version), witness_hash])

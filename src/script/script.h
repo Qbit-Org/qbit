@@ -303,7 +303,7 @@ enum opcodetype
     OP_NOP2 = OP_CHECKLOCKTIMEVERIFY,
     OP_CHECKSEQUENCEVERIFY = 0xb2,
     OP_NOP3 = OP_CHECKSEQUENCEVERIFY,
-    OP_CHECKSIGPQC = 0xb3, // P2MR-only post-quantum signature verification (bounded SPHINCS+); see BIP-360
+    OP_CHECKSIGPQC = 0xb3, // qbit P2MR v1 post-quantum signature verification (bounded SLH-DSA)
     OP_NOP5 = 0xb4,
     OP_NOP6 = 0xb5,
     OP_NOP7 = 0xb6,
