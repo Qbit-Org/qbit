@@ -142,7 +142,13 @@ class TestStartStopStartupFailure(InternalTestMixin, BitcoinTestFramework):
     def setup_network(self):
         self.add_nodes(self.num_nodes, self.extra_args)
         self.nodes[0].start()
-        self.nodes[0].stop_node()
+        try:
+            self.nodes[0].stop_node()
+        finally:
+            # stop_node() is expected to raise before stopping the process. Wait
+            # for the forced shutdown so Windows releases debug.log before the
+            # parent test removes this child test's temporary directory.
+            self.nodes[0].kill_process()
         assert False, "stop_node() should raise an exception when we haven't called wait_for_rpc_connection()"
 
     def run_test(self):
