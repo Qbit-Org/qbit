@@ -79,6 +79,10 @@ if [[ -n "${USE_INSTRUMENTED_LIBCPP}" ]]; then
 fi
 
 if [[ "${RUN_TIDY}" == "true" ]]; then
+  # The CI image may already contain these paths from its image-build install.
+  # Runtime setup uses a different BASE_ROOT_DIR marker, so reset them before
+  # cloning and configuring again.
+  rm -rf /include-what-you-use /iwyu-build
   ${CI_RETRY_EXE} git clone --depth=1 https://github.com/include-what-you-use/include-what-you-use -b clang_"${TIDY_LLVM_V}" /include-what-you-use
   cmake -B /iwyu-build/ -G 'Unix Makefiles' -DCMAKE_PREFIX_PATH=/usr/lib/llvm-"${TIDY_LLVM_V}" -S /include-what-you-use
   make -C /iwyu-build/ install "$MAKEJOBS"
