@@ -5,17 +5,21 @@
 #include <addresstype.h>
 #include <chainparams.h>
 #include <crypto/pqc.h>
+#include <crypto/sha256.h>
 #include <key_io.h>
 #include <policy/policy.h>
 #include <primitives/transaction.h>
 #include <script/interpreter.h>
 #include <script/p2mr.h>
 #include <script/p2mr_sizing.h>
-#include <script/sign.h>
 #include <script/script.h>
 #include <script/script_error.h>
+#include <script/sign.h>
 #include <streams.h>
+#include <test/data/p2mr_cross_profile_vectors.json.h>
 #include <test/data/p2mr_pqc_witness_vectors.json.h>
+#include <test/data/p2mr_script_boundary_vectors.json.h>
+#include <test/data/p2mr_v1_manifest.json.h>
 #include <test/data/p2mr_vectors.json.h>
 #include <test/util/json.h>
 #include <test/util/setup_common.h>
@@ -103,7 +107,18 @@ UniValue P2MRVectorTestData()
     if (!tests.read(json_tests::p2mr_vectors) || !tests.isObject()) {
         throw std::runtime_error("p2mr_vectors.json must contain a JSON object");
     }
-    BOOST_CHECK_EQUAL(tests["version"].getInt<int>(), 1);
+    BOOST_CHECK_EQUAL(tests["schema_version"].getInt<int>(), 1);
+    BOOST_CHECK_EQUAL(tests["profile"].get_str(), "qbit-p2mr-v1");
+    BOOST_CHECK_EQUAL(tests["profile_version"].getInt<int>(), 1);
+    const std::set<std::string> expected_keys{
+        "schema_version", "profile", "profile_version", "generator", "valid", "invalid"};
+    const std::vector<std::string> keys{tests.getKeys()};
+    const std::set<std::string> actual_keys{keys.begin(), keys.end()};
+    BOOST_REQUIRE_MESSAGE(actual_keys == expected_keys, "p2mr_vectors.json has unknown or missing top-level fields");
+    const UniValue& generator{tests["generator"].get_obj()};
+    BOOST_CHECK_EQUAL(generator["id"].get_str(), "standalone-python");
+    BOOST_CHECK_EQUAL(generator["version"].getInt<int>(), 1);
+    BOOST_CHECK(!generator["uses_qbit_consensus_helpers"].get_bool());
     return tests;
 }
 
@@ -118,11 +133,30 @@ uint256 VectorHash(const UniValue& obj, const std::string& field)
 
 ScriptError VectorScriptError(const std::string& name)
 {
+    if (name == "SCRIPT_ERR_OK") return SCRIPT_ERR_OK;
+    if (name == "SCRIPT_ERR_EVAL_FALSE") return SCRIPT_ERR_EVAL_FALSE;
     if (name == "SCRIPT_ERR_P2MR_CONTROL_BIT0") return SCRIPT_ERR_P2MR_CONTROL_BIT0;
     if (name == "SCRIPT_ERR_P2MR_WRONG_CONTROL_SIZE") return SCRIPT_ERR_P2MR_WRONG_CONTROL_SIZE;
     if (name == "SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH") return SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH;
     BOOST_FAIL("unknown P2MR vector script error: " + name);
     return SCRIPT_ERR_UNKNOWN_ERROR;
+}
+
+std::string Sha256Hex(std::string_view bytes)
+{
+    std::array<unsigned char, CSHA256::OUTPUT_SIZE> digest;
+    CSHA256()
+        .Write(reinterpret_cast<const unsigned char*>(bytes.data()), bytes.size())
+        .Finalize(digest.data());
+    return HexStr(digest);
+}
+
+void CheckExactObjectKeys(const UniValue& object, const std::set<std::string>& expected, std::string_view context)
+{
+    BOOST_REQUIRE_MESSAGE(object.isObject(), context << " must be an object");
+    const std::vector<std::string> keys{object.getKeys()};
+    const std::set<std::string> actual{keys.begin(), keys.end()};
+    BOOST_REQUIRE_MESSAGE(actual == expected, context << " has unknown or missing fields");
 }
 
 CScript BuildP2MRScriptPubKey(const uint256& merkle_root)
@@ -760,13 +794,13 @@ std::optional<uint32_t> ParseOptionalCodeSeparatorPositionField(const UniValue& 
 
 ScriptError ParseExpectedP2MRWitnessError(const UniValue& obj)
 {
-    if (!obj.exists("expectedError")) return SCRIPT_ERR_OK;
-
-    const UniValue& value{obj["expectedError"]};
-    BOOST_REQUIRE_MESSAGE(value.isStr(), "expectedError field must be a string");
+    const UniValue& expected{obj["expected"]};
+    BOOST_REQUIRE_MESSAGE(expected.isObject(), "expected field must be an object");
+    const UniValue& value{expected["error"]};
+    BOOST_REQUIRE_MESSAGE(value.isStr(), "expected.error field must be a string");
     const std::string name{value.get_str()};
-    if (name == "OK") return SCRIPT_ERR_OK;
-    if (name == "P2MR_SIG_HASHTYPE") return SCRIPT_ERR_P2MR_SIG_HASHTYPE;
+    if (name == "SCRIPT_ERR_OK") return SCRIPT_ERR_OK;
+    if (name == "SCRIPT_ERR_P2MR_SIG_HASHTYPE") return SCRIPT_ERR_P2MR_SIG_HASHTYPE;
 
     BOOST_FAIL("unknown P2MR witness vector expectedError: " + name);
     return SCRIPT_ERR_UNKNOWN_ERROR;
@@ -787,6 +821,16 @@ std::vector<CTxOut> ParseSpentOutputsField(const UniValue& obj)
 
 P2MRWitnessVector ParseP2MRWitnessVector(const UniValue& vec)
 {
+    const std::string vector_id{vec["id"].get_str()};
+    BOOST_REQUIRE_EQUAL(vector_id, vec["name"].get_str());
+    const UniValue& generator{vec["generator"].get_obj()};
+    CheckExactObjectKeys(generator, {"id", "version"}, "witness generator");
+    const std::set<std::string> rust_owned_ids{
+        "single_key_leading_codesep", "branch_codesep_true", "branch_codesep_false"};
+    const std::string expected_generator{rust_owned_ids.contains(vector_id) ? "standalone-rust" : "standalone-python"};
+    BOOST_REQUIRE_EQUAL(generator["id"].get_str(), expected_generator);
+    BOOST_REQUIRE_EQUAL(generator["version"].getInt<int>(), 1);
+
     const valtype pubkey_bytes{ParseHexField(vec, "pubkey")};
     BOOST_REQUIRE_EQUAL(pubkey_bytes.size(), PQC_PUBKEY_SIZE);
     CPQCPubKey pubkey{pubkey_bytes};
@@ -841,6 +885,30 @@ P2MRWitnessVector ParseP2MRWitnessVector(const UniValue& vec)
         .data_sig_add = ParseOptionalDataSigAddVector(vec),
     };
 
+    const valtype leaf_version{ParseHexField(vec, "leafVersion")};
+    const valtype epoch{ParseHexField(vec, "epoch")};
+    const valtype spend_type{ParseHexField(vec, "spendType")};
+    const valtype key_version{ParseHexField(vec, "keyVersion")};
+    BOOST_REQUIRE_EQUAL(leaf_version.size(), 1U);
+    BOOST_REQUIRE_EQUAL(epoch.size(), 1U);
+    BOOST_REQUIRE_EQUAL(spend_type.size(), 1U);
+    BOOST_REQUIRE_EQUAL(key_version.size(), 1U);
+    BOOST_CHECK_EQUAL(leaf_version[0], P2MR_LEAF_VERSION_V1);
+    BOOST_CHECK_EQUAL(epoch[0], 0U);
+    BOOST_CHECK_EQUAL(spend_type[0], out.annex ? 3U : 2U);
+    BOOST_CHECK_EQUAL(key_version[0], 0U);
+
+    const uint256 leaf_hash{ParseRawUint256Field(vec, "leafHash")};
+    BOOST_CHECK_EQUAL(leaf_hash, ComputeP2MRLeafHash(leaf_version[0], out.leaf_script));
+    BOOST_REQUIRE(!out.control_block.empty());
+    BOOST_CHECK_EQUAL(out.control_block[0] & P2MR_LEAF_VERSION_MASK, leaf_version[0]);
+    const CAmount prevout_amount{vec["prevoutAmount"].getInt<CAmount>()};
+    const CScript prevout_script_pubkey{ParseScriptField(vec, "prevoutScriptPubKey")};
+    BOOST_REQUIRE_LT(out.input_index, out.spent_outputs.size());
+    BOOST_CHECK_EQUAL(prevout_amount, out.spent_outputs[out.input_index].nValue);
+    BOOST_CHECK(prevout_script_pubkey == out.spent_outputs[out.input_index].scriptPubKey);
+    BOOST_CHECK(prevout_script_pubkey == BuildP2MRScriptPubKey(ComputeP2MRMerkleRoot(out.control_block, leaf_hash)));
+
     if (out.expected_error == SCRIPT_ERR_OK) {
         BOOST_REQUIRE(out.p2mr_sigmsg);
         BOOST_REQUIRE(out.p2mr_sighash);
@@ -859,11 +927,22 @@ P2MRWitnessVector ParseP2MRWitnessVector(const UniValue& vec)
         BOOST_REQUIRE(!out.p2mr_sighash);
         BOOST_REQUIRE(!out.wrong_domain_sighash);
     }
+    BOOST_REQUIRE_EQUAL(vec["digest_defined"].get_bool(), out.p2mr_sighash.has_value());
+    const UniValue& expected{vec["expected"].get_obj()};
+    BOOST_REQUIRE_EQUAL(expected["accepted"].get_bool(), out.expected_error == SCRIPT_ERR_OK);
+    BOOST_REQUIRE_EQUAL(
+        expected["stage"].get_str(),
+        out.expected_error == SCRIPT_ERR_OK ? "script-complete" : "sighash");
     BOOST_REQUIRE_EQUAL(out.raw_signature.size(), PQC_SIG_SIZE);
     BOOST_REQUIRE_EQUAL(out.spent_outputs.size(), out.spend_tx.vin.size());
     BOOST_REQUIRE_LT(out.input_index, out.spend_tx.vin.size());
     BOOST_REQUIRE_LT(out.input_index, out.spent_outputs.size());
     const auto& stack{out.spend_tx.vin[out.input_index].scriptWitness.stack};
+    const auto& witness_items{vec["witness"].getValues()};
+    BOOST_REQUIRE_EQUAL(witness_items.size(), stack.size());
+    for (size_t index{0}; index < stack.size(); ++index) {
+        BOOST_REQUIRE(stack[index] == ParseHex(witness_items[index].get_str()));
+    }
     BOOST_REQUIRE_GE(stack.size(), out.annex ? 4U : 3U);
     BOOST_REQUIRE(stack[0] == out.witness_signature);
     const size_t leaf_index{out.annex ? 1U : stack.size() - 2};
@@ -920,7 +999,18 @@ P2MRWitnessVector ParseP2MRWitnessVector(const UniValue& vec)
 
 std::vector<P2MRWitnessVector> LoadIndependentP2MRWitnessVectors()
 {
-    const UniValue vectors_json = read_json(json_tests::p2mr_pqc_witness_vectors);
+    UniValue corpus;
+    BOOST_REQUIRE(corpus.read(json_tests::p2mr_pqc_witness_vectors));
+    BOOST_REQUIRE(corpus.isObject());
+    BOOST_REQUIRE_EQUAL(corpus["schema_version"].getInt<int>(), 1);
+    BOOST_REQUIRE_EQUAL(corpus["profile"].get_str(), "qbit-p2mr-v1");
+    BOOST_REQUIRE_EQUAL(corpus["profile_version"].getInt<int>(), 1);
+    const std::vector<std::string> top_level_keys{corpus.getKeys()};
+    const std::set<std::string> actual_keys{top_level_keys.begin(), top_level_keys.end()};
+    const std::set<std::string> expected_keys{"schema_version", "profile", "profile_version", "vectors"};
+    BOOST_REQUIRE_MESSAGE(actual_keys == expected_keys, "witness corpus has unknown or missing top-level fields");
+    const UniValue& vectors_json{corpus["vectors"]};
+    BOOST_REQUIRE(vectors_json.isArray());
 
     std::vector<P2MRWitnessVector> vectors;
     std::set<std::string> names;
@@ -1060,6 +1150,358 @@ bool VerifyVectorSpend(const P2MRWitnessVector& vector, ScriptError& err)
     return VerifyVectorSpend(vector, vector.spend_tx, vector.spent_outputs, err);
 }
 
+struct BoundaryExecution {
+    bool accepted;
+    ScriptError error;
+};
+
+ScriptError BoundaryScriptError(std::string_view name)
+{
+    if (name == "SCRIPT_ERR_OK") return SCRIPT_ERR_OK;
+    if (name == "SCRIPT_ERR_EVAL_FALSE") return SCRIPT_ERR_EVAL_FALSE;
+    if (name == "SCRIPT_ERR_VERIFY") return SCRIPT_ERR_VERIFY;
+    if (name == "SCRIPT_ERR_PUSH_SIZE") return SCRIPT_ERR_PUSH_SIZE;
+    if (name == "SCRIPT_ERR_STACK_SIZE") return SCRIPT_ERR_STACK_SIZE;
+    if (name == "SCRIPT_ERR_BAD_OPCODE") return SCRIPT_ERR_BAD_OPCODE;
+    if (name == "SCRIPT_ERR_CLEANSTACK") return SCRIPT_ERR_CLEANSTACK;
+    if (name == "SCRIPT_ERR_PUBKEYTYPE") return SCRIPT_ERR_PUBKEYTYPE;
+    if (name == "SCRIPT_ERR_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION") return SCRIPT_ERR_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION;
+    if (name == "SCRIPT_ERR_DISCOURAGE_OP_SUCCESS") return SCRIPT_ERR_DISCOURAGE_OP_SUCCESS;
+    if (name == "SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY") return SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY;
+    if (name == "SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH") return SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH;
+    if (name == "SCRIPT_ERR_TAPSCRIPT_CHECKMULTISIG") return SCRIPT_ERR_TAPSCRIPT_CHECKMULTISIG;
+    if (name == "SCRIPT_ERR_P2MR_WRONG_CONTROL_SIZE") return SCRIPT_ERR_P2MR_WRONG_CONTROL_SIZE;
+    if (name == "SCRIPT_ERR_P2MR_CONTROL_BIT0") return SCRIPT_ERR_P2MR_CONTROL_BIT0;
+    if (name == "SCRIPT_ERR_P2MR_VALIDATION_WEIGHT") return SCRIPT_ERR_P2MR_VALIDATION_WEIGHT;
+    if (name == "SCRIPT_ERR_P2MR_SIG_SIZE") return SCRIPT_ERR_P2MR_SIG_SIZE;
+    if (name == "SCRIPT_ERR_P2MR_SIG") return SCRIPT_ERR_P2MR_SIG;
+    if (name == "SCRIPT_ERR_P2MR_CHECKSIG") return SCRIPT_ERR_P2MR_CHECKSIG;
+    if (name == "SCRIPT_ERR_TEMPLATE_MISMATCH") return SCRIPT_ERR_TEMPLATE_MISMATCH;
+    BOOST_FAIL("unknown P2MR boundary error: " + std::string{name});
+    return SCRIPT_ERR_UNKNOWN_ERROR;
+}
+
+BoundaryExecution ExecuteBoundarySpend(const P2MRSpendContext& spend, unsigned int flags)
+{
+    ScriptError error{SCRIPT_ERR_UNKNOWN_ERROR};
+    const bool accepted{VerifySpend(spend, flags, error)};
+    return {accepted, error};
+}
+
+BoundaryExecution ExecuteBoundaryFixtureSpend(
+    const CMutableTransaction& tx,
+    const std::vector<CTxOut>& spent_outputs,
+    uint32_t input_index,
+    unsigned int flags)
+{
+    BOOST_REQUIRE_LT(input_index, tx.vin.size());
+    BOOST_REQUIRE_EQUAL(spent_outputs.size(), tx.vin.size());
+    PrecomputedTransactionData txdata{PrecomputeVectorData(tx, spent_outputs)};
+    const CTxOut& spent_output{spent_outputs[input_index]};
+    ScriptError error{SCRIPT_ERR_UNKNOWN_ERROR};
+    const bool accepted{VerifyScript(
+        tx.vin[input_index].scriptSig,
+        spent_output.scriptPubKey,
+        &tx.vin[input_index].scriptWitness,
+        flags,
+        MutableTransactionSignatureChecker(
+            &tx,
+            input_index,
+            spent_output.nValue,
+            txdata,
+            MissingDataBehavior::ASSERT_FAIL),
+        &error)};
+    return {accepted, error};
+}
+
+UniValue DefaultP2MRWitnessFixtureJson()
+{
+    UniValue corpus;
+    BOOST_REQUIRE(corpus.read(json_tests::p2mr_pqc_witness_vectors));
+    for (const UniValue& value : corpus["vectors"].getValues()) {
+        if (value["id"].get_str() == "single_key_default_sighash") return value.get_obj();
+    }
+    BOOST_FAIL("missing single_key_default_sighash fixture");
+    return {};
+}
+
+void CheckBoundaryFixtureSelector(const UniValue& parameters, std::string_view artifact)
+{
+    BOOST_REQUIRE_EQUAL(parameters["fixture_file"].get_str(), "src/test/data/p2mr_pqc_witness_vectors.json");
+    BOOST_REQUIRE_EQUAL(parameters["fixture_id"].get_str(), "single_key_default_sighash");
+    BOOST_REQUIRE_EQUAL(parameters["artifact"].get_str(), artifact);
+}
+
+BoundaryExecution ExecuteP2MRBoundaryCase(const UniValue& test, unsigned int flags)
+{
+    const std::string scenario{test["scenario"].get_str()};
+    const UniValue& parameters{test["parameters"].get_obj()};
+
+    if (scenario == "witness-shape") {
+        CheckExactObjectKeys(parameters, {"kind"}, "boundary witness-shape parameters");
+        const CScript leaf_script{CScript{} << OP_TRUE};
+        const uint256 root{ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script)};
+        P2MRSpendContext spend{BuildP2MRSpend(
+            leaf_script, {}, {P2MR_LEAF_VERSION_V1_CONTROL}, root)};
+        const std::string kind{parameters["kind"].get_str()};
+        if (kind == "empty") {
+            spend.tx_spend.vin[0].scriptWitness.stack.clear();
+        } else if (kind == "one-element") {
+            spend.tx_spend.vin[0].scriptWitness.stack = {valtype{0x01}};
+        } else if (kind == "annex-underflow") {
+            spend.tx_spend.vin[0].scriptWitness.stack = {valtype{0x01}, valtype{ANNEX_TAG}};
+        } else {
+            BOOST_FAIL("unknown boundary witness shape: " + kind);
+        }
+        return ExecuteBoundarySpend(spend, flags);
+    }
+
+    if (scenario == "control-path") {
+        CheckExactObjectKeys(parameters, {"nodes", "mutation"}, "boundary control-path parameters");
+        const int nodes{parameters["nodes"].getInt<int>()};
+        BOOST_REQUIRE_GE(nodes, 0);
+        BOOST_REQUIRE_LE(nodes, 129);
+        const std::string mutation{parameters["mutation"].get_str()};
+        const CScript leaf_script{CScript{} << OP_TRUE};
+        const uint256 leaf_hash{ComputeP2MRLeafHash(P2MR_LEAF_VERSION_V1, ScriptBytes(leaf_script))};
+        valtype control(1 + static_cast<size_t>(nodes) * P2MR_CONTROL_NODE_SIZE, 0x00);
+        control[0] = P2MR_LEAF_VERSION_V1_CONTROL;
+        uint256 root{nodes <= static_cast<int>(P2MR_CONTROL_MAX_NODE_COUNT) ?
+                         ComputeP2MRMerkleRoot(control, leaf_hash) :
+                         leaf_hash};
+        if (mutation == "append-byte") {
+            control.push_back(0x00);
+        } else if (mutation == "clear-marker") {
+            control[0] &= 0xfe;
+        } else if (mutation == "path-node") {
+            BOOST_REQUIRE_EQUAL(nodes, 1);
+            control.back() ^= 0x01;
+        } else if (mutation == "program-root") {
+            root.begin()[0] ^= 0x01;
+        } else if (mutation != "none") {
+            BOOST_FAIL("unknown boundary control mutation: " + mutation);
+        }
+        return ExecuteBoundarySpend(BuildP2MRSpend(leaf_script, {}, control, root), flags);
+    }
+
+    if (scenario == "leaf-version") {
+        CheckExactObjectKeys(parameters, {"control_byte", "script"}, "boundary leaf-version parameters");
+        const int control_value{parameters["control_byte"].getInt<int>()};
+        BOOST_REQUIRE_GE(control_value, 0);
+        BOOST_REQUIRE_LE(control_value, 255);
+        const unsigned char control_byte{static_cast<unsigned char>(control_value)};
+        BOOST_REQUIRE_EQUAL(control_byte & 1, 1);
+        const std::string script_kind{parameters["script"].get_str()};
+        BOOST_REQUIRE(script_kind == "true" || script_kind == "false");
+        const CScript leaf_script{CScript{} << (script_kind == "true" ? OP_TRUE : OP_FALSE)};
+        const uint8_t leaf_version{static_cast<uint8_t>(control_byte & P2MR_LEAF_VERSION_MASK)};
+        const uint256 root{ComputeMerkleRootSingleLeaf(leaf_version, leaf_script)};
+        return ExecuteBoundarySpend(BuildP2MRSpend(leaf_script, {}, {control_byte}, root), flags);
+    }
+
+    if (scenario == "opcode") {
+        const std::string kind{parameters["kind"].get_str()};
+        if (kind == "checksigpqc-valid" || kind == "checksigpqc-invalid") {
+            const std::set<std::string> parameter_keys{kind == "checksigpqc-valid" ?
+                                                           std::set<std::string>{"kind", "fixture_file", "fixture_id", "artifact"} :
+                                                           std::set<std::string>{"kind", "fixture_file", "fixture_id", "artifact", "mutation"}};
+            CheckExactObjectKeys(parameters, parameter_keys, "boundary CHECKSIGPQC fixture parameters");
+            CheckBoundaryFixtureSelector(parameters, "transaction-checksigpqc");
+            if (kind == "checksigpqc-invalid") {
+                BOOST_REQUIRE_EQUAL(parameters["mutation"].get_str(), "flip-first-signature-byte");
+            }
+            const std::vector<P2MRWitnessVector> vectors{LoadIndependentP2MRWitnessVectors()};
+            const P2MRWitnessVector& vector{FindVector(vectors, "single_key_default_sighash")};
+            CMutableTransaction tx{vector.spend_tx};
+            if (kind == "checksigpqc-invalid") tx.vin[vector.input_index].scriptWitness.stack[0][0] ^= 0x01;
+            return ExecuteBoundaryFixtureSpend(tx, vector.spent_outputs, vector.input_index, flags);
+        }
+        if (kind == "checksigpqc-empty") {
+            CheckExactObjectKeys(parameters, {"kind"}, "boundary CHECKSIGPQC empty parameters");
+            const CScript leaf_script{CScript{} << valtype(PQC_PUBKEY_SIZE, 0x02) << OP_CHECKSIGPQC << OP_VERIFY << OP_TRUE};
+            return ExecuteBoundarySpend(BuildP2MRSpend(
+                                            leaf_script, {valtype{}}, {P2MR_LEAF_VERSION_V1_CONTROL},
+                                            ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script)),
+                                        flags);
+        }
+        if (kind == "checksigpqc-bad-size" || kind == "checksigpqc-bad-key") {
+            CheckExactObjectKeys(parameters, {"kind"}, "boundary CHECKSIGPQC invalid parameters");
+            const valtype pubkey{kind == "checksigpqc-bad-key" ? valtype{} : valtype(PQC_PUBKEY_SIZE, 0x02)};
+            const valtype signature{kind == "checksigpqc-bad-size" ? valtype(PQC_SIG_SIZE - 1, 0x01) : valtype(PQC_SIG_SIZE, 0x01)};
+            const CScript leaf_script{CScript{} << pubkey << OP_CHECKSIGPQC};
+            return ExecuteBoundarySpend(BuildP2MRSpend(
+                                            leaf_script, {signature}, {P2MR_LEAF_VERSION_V1_CONTROL},
+                                            ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script)),
+                                        flags);
+        }
+        if (kind == "checksigadd-valid") {
+            CheckExactObjectKeys(parameters, {"kind", "fixture_file", "fixture_id", "artifact"}, "boundary CHECKSIGADD fixture parameters");
+            CheckBoundaryFixtureSelector(parameters, "checkSigAdd");
+            const UniValue fixture{DefaultP2MRWitnessFixtureJson()};
+            const UniValue& add{fixture["checkSigAdd"].get_obj()};
+            CheckExactObjectKeys(
+                add,
+                {"provenance", "inputIndex", "spentOutputs", "spendTx", "leafVersion", "leafScript",
+                 "controlBlock", "leafHash", "scriptPubKey", "pubkey", "signature", "p2mrSigMsg",
+                 "p2mrSighash", "expected"},
+                "CHECKSIGADD fixture");
+            const uint32_t input_index{add["inputIndex"].getInt<uint32_t>()};
+            const CMutableTransaction tx{ParseMutableTransactionField(add, "spendTx")};
+            const std::vector<CTxOut> spent_outputs{ParseSpentOutputsField(add)};
+            const valtype leaf_script{ParseHexField(add, "leafScript")};
+            const valtype control_block{ParseHexField(add, "controlBlock")};
+            const uint256 leaf_hash{ParseRawUint256Field(add, "leafHash")};
+            BOOST_REQUIRE(ParseHexField(add, "leafVersion") == valtype{P2MR_LEAF_VERSION_V1});
+            BOOST_REQUIRE(control_block == valtype{P2MR_LEAF_VERSION_V1_CONTROL});
+            BOOST_CHECK_EQUAL(leaf_hash, ComputeP2MRLeafHash(P2MR_LEAF_VERSION_V1, leaf_script));
+            BOOST_CHECK(ParseScriptField(add, "scriptPubKey") == BuildP2MRScriptPubKey(leaf_hash));
+            BOOST_REQUIRE_LT(input_index, tx.vin.size());
+            BOOST_REQUIRE_EQUAL(tx.vin[input_index].scriptWitness.stack.size(), 3U);
+            BOOST_CHECK(tx.vin[input_index].scriptWitness.stack[0] == ParseHexField(add, "signature"));
+            BOOST_CHECK(tx.vin[input_index].scriptWitness.stack[1] == leaf_script);
+            BOOST_CHECK(tx.vin[input_index].scriptWitness.stack[2] == control_block);
+            return ExecuteBoundaryFixtureSpend(tx, spent_outputs, input_index, flags);
+        }
+        if (kind == "legacy-checksig" || kind == "legacy-checkmultisig") {
+            CheckExactObjectKeys(parameters, {"kind"}, "boundary legacy opcode parameters");
+            const CScript leaf_script{CScript{} << (kind == "legacy-checksig" ? OP_CHECKSIG : OP_CHECKMULTISIG)};
+            return ExecuteBoundarySpend(BuildP2MRSpend(
+                                            leaf_script, {}, {P2MR_LEAF_VERSION_V1_CONTROL},
+                                            ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script)),
+                                        flags);
+        }
+        if (kind == "ctv-fixed") {
+            CheckExactObjectKeys(
+                parameters,
+                {"kind", "control_block", "template_hash", "leaf_script", "script_pubkey"},
+                "boundary fixed CTV parameters");
+            const CScript leaf_script{ParseScriptField(parameters, "leaf_script")};
+            const CScript script_pubkey{ParseScriptField(parameters, "script_pubkey")};
+            const valtype control_block{ParseHexField(parameters, "control_block")};
+            const uint256 template_hash{ParseRawUint256Field(parameters, "template_hash")};
+            BOOST_REQUIRE(control_block == valtype{P2MR_LEAF_VERSION_V1_CONTROL});
+            BOOST_CHECK(leaf_script == BuildCTVScript(template_hash));
+            BOOST_CHECK(script_pubkey == BuildP2MRScriptPubKey(
+                                             ComputeP2MRLeafHash(P2MR_LEAF_VERSION_V1, ScriptBytes(leaf_script))));
+            P2MRSpendContext spend{BuildP2MRSpend(script_pubkey, leaf_script, {}, control_block)};
+            return ExecuteBoundarySpend(spend, flags);
+        }
+        if (kind == "checkdatasigpqc-valid") {
+            CheckExactObjectKeys(parameters, {"kind", "fixture_file", "fixture_id", "artifact"}, "boundary CHECKDATASIGPQC fixture parameters");
+            CheckBoundaryFixtureSelector(parameters, "dataSig");
+            const std::vector<P2MRWitnessVector> vectors{LoadIndependentP2MRWitnessVectors()};
+            const P2MRWitnessVector& vector{FindVector(vectors, "single_key_default_sighash")};
+            const CMutableTransaction tx{BuildDataSigVectorSpend(vector)};
+            return ExecuteBoundaryFixtureSpend(tx, BuildDataSigSpentOutputs(vector), 0, flags);
+        }
+        if (kind == "checkdatasigaddpqc-valid") {
+            CheckExactObjectKeys(parameters, {"kind", "fixture_file", "fixture_id", "artifact"}, "boundary CHECKDATASIGADDPQC fixture parameters");
+            CheckBoundaryFixtureSelector(parameters, "dataSigAdd");
+            const std::vector<P2MRWitnessVector> vectors{LoadIndependentP2MRWitnessVectors()};
+            const P2MRWitnessVector& vector{FindVector(vectors, "single_key_default_sighash")};
+            BOOST_REQUIRE(vector.data_sig_add);
+            const DataSigAddVector& add{*vector.data_sig_add};
+            const CMutableTransaction tx{BuildDataSigAddNOfNVectorSpend(add)};
+            const std::vector<CTxOut> spent_outputs{BuildSingleInputSpentOutputs(vector, add.n_of_n_script_pubkey)};
+            return ExecuteBoundaryFixtureSpend(tx, spent_outputs, 0, flags);
+        }
+        if (kind == "op-success" || kind == "disabled") {
+            CheckExactObjectKeys(parameters, {"kind"}, "boundary reserved opcode parameters");
+            const opcodetype opcode{kind == "op-success" ? OP_RESERVED : OP_VERIF};
+            const CScript leaf_script{CScript{} << opcode};
+            return ExecuteBoundarySpend(BuildP2MRSpend(
+                                            leaf_script, {}, {P2MR_LEAF_VERSION_V1_CONTROL},
+                                            ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script)),
+                                        flags);
+        }
+        BOOST_FAIL("unknown boundary opcode kind: " + kind);
+    }
+
+    if (scenario == "resource") {
+        const std::string kind{parameters["kind"].get_str()};
+        if (kind == "stack-items" || kind == "item-bytes" || kind == "total-bytes") {
+            CheckExactObjectKeys(parameters, {"kind", "value"}, "boundary size resource parameters");
+            const int value{parameters["value"].getInt<int>()};
+            BOOST_REQUIRE_GE(value, 0);
+            std::vector<valtype> stack_items;
+            if (kind == "stack-items") stack_items.resize(value);
+            if (kind == "item-bytes") stack_items.emplace_back(value, 0x01);
+            if (kind == "total-bytes") stack_items = BuildP2MRStackItemsForTotalBytes(value);
+            const CScript leaf_script{BuildDropAllScript(stack_items.size())};
+            return ExecuteBoundarySpend(BuildP2MRSpend(
+                                            leaf_script, stack_items, {P2MR_LEAF_VERSION_V1_CONTROL},
+                                            ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script)),
+                                        flags);
+        }
+        if (kind == "validation-weight") {
+            CheckExactObjectKeys(parameters, {"kind", "nonempty_checks", "fixture_file", "fixture_id", "artifact"}, "boundary validation resource parameters");
+            const int checks{parameters["nonempty_checks"].getInt<int>()};
+            BOOST_REQUIRE(checks == 1 || checks == 2);
+            const std::vector<P2MRWitnessVector> vectors{LoadIndependentP2MRWitnessVectors()};
+            const P2MRWitnessVector& vector{FindVector(vectors, "single_key_default_sighash")};
+            CMutableTransaction tx;
+            std::vector<CTxOut> spent_outputs;
+            uint32_t input_index{0};
+            if (checks == 1) {
+                CheckBoundaryFixtureSelector(parameters, "transaction-checksigpqc");
+                tx = vector.spend_tx;
+                spent_outputs = vector.spent_outputs;
+                input_index = vector.input_index;
+            } else {
+                CheckBoundaryFixtureSelector(parameters, "dataSigAdd");
+                BOOST_REQUIRE(vector.data_sig_add);
+                const DataSigAddVector& add{*vector.data_sig_add};
+                tx = BuildDataSigAddNOfNVectorSpend(add);
+                spent_outputs = BuildSingleInputSpentOutputs(vector, add.n_of_n_script_pubkey);
+            }
+            const int64_t budget{static_cast<int64_t>(GetSerializeSize(tx.vin[input_index].scriptWitness.stack)) + VALIDATION_WEIGHT_OFFSET};
+            BOOST_CHECK_GE(budget, checks * VALIDATION_WEIGHT_PER_SIGOP_PQC);
+            BOOST_CHECK_LT(budget, (checks + 1) * VALIDATION_WEIGHT_PER_SIGOP_PQC);
+            return ExecuteBoundaryFixtureSpend(tx, spent_outputs, input_index, flags);
+        }
+        if (kind == "validation-weight-exceeded") {
+            CheckExactObjectKeys(parameters, {"kind", "nonempty_checks"}, "boundary exceeded-weight parameters");
+            BOOST_REQUIRE_EQUAL(parameters["nonempty_checks"].getInt<int>(), 2);
+            const CScript leaf_script{CScript{}
+                                      << OP_0
+                                      << valtype(PQC_PUBKEY_SIZE, 0x11) << OP_CHECKSIGADD
+                                      << valtype(PQC_PUBKEY_SIZE, 0x22) << OP_CHECKSIGADD
+                                      << OP_2 << OP_EQUAL};
+            P2MRSpendContext spend{BuildP2MRSpend(
+                leaf_script, {valtype{0x01}, valtype{0x01}}, {P2MR_LEAF_VERSION_V1_CONTROL},
+                ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script))};
+            const int64_t budget{static_cast<int64_t>(GetSerializeSize(spend.tx_spend.vin[0].scriptWitness.stack)) + VALIDATION_WEIGHT_OFFSET};
+            BOOST_CHECK_LT(budget, VALIDATION_WEIGHT_PER_SIGOP_PQC);
+            return ExecuteBoundarySpend(spend, flags);
+        }
+        if (kind == "empty-signatures") {
+            CheckExactObjectKeys(parameters, {"kind", "nonempty_checks"}, "boundary empty-signature parameters");
+            BOOST_REQUIRE_EQUAL(parameters["nonempty_checks"].getInt<int>(), 0);
+            CPQCKey key_a;
+            CPQCKey key_b;
+            key_a.MakeNewKey();
+            key_b.MakeNewKey();
+            const CScript leaf_script{BuildP2MRMultiAScript(0, {key_a.GetPubKey(), key_b.GetPubKey()})};
+            return ExecuteBoundarySpend(BuildP2MRSpend(
+                                            leaf_script, {valtype{}, valtype{}}, {P2MR_LEAF_VERSION_V1_CONTROL},
+                                            ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script)),
+                                        flags);
+        }
+        if (kind == "clean-stack" || kind == "false-final") {
+            CheckExactObjectKeys(parameters, {"kind", "value"}, "boundary final-stack parameters");
+            const CScript leaf_script{kind == "clean-stack" ? CScript{} << OP_TRUE << OP_TRUE : CScript{} << OP_FALSE};
+            return ExecuteBoundarySpend(BuildP2MRSpend(
+                                            leaf_script, {}, {P2MR_LEAF_VERSION_V1_CONTROL},
+                                            ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script)),
+                                        flags);
+        }
+        BOOST_FAIL("unknown boundary resource kind: " + kind);
+    }
+
+    BOOST_FAIL("unknown P2MR boundary scenario: " + scenario);
+    return {false, SCRIPT_ERR_UNKNOWN_ERROR};
+}
+
 void CheckVectorMutationFails(const P2MRWitnessVector& vector, CMutableTransaction tx, std::vector<CTxOut> spent_outputs, ScriptError expected_error)
 {
     ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
@@ -1098,6 +1540,11 @@ BOOST_AUTO_TEST_CASE(p2mr_independent_commitment_vectors)
         const std::string name{vec["name"].get_str()};
         BOOST_TEST_CONTEXT(name)
         {
+            BOOST_CHECK_EQUAL(vec["id"].get_str(), name);
+            const UniValue& expected{vec["expected"].get_obj()};
+            BOOST_CHECK(expected["accepted"].get_bool());
+            BOOST_CHECK_EQUAL(expected["stage"].get_str(), "script-complete");
+            BOOST_CHECK_EQUAL(expected["error"].get_str(), "SCRIPT_ERR_OK");
             const std::vector<unsigned char> leaf_script_bytes{ParseHex(vec["leaf_script"].get_str())};
             BOOST_REQUIRE_LT(leaf_script_bytes.size(), 253U);
             const uint8_t leaf_version{static_cast<uint8_t>(vec["leaf_version"].getInt<int>())};
@@ -1169,6 +1616,10 @@ BOOST_AUTO_TEST_CASE(p2mr_independent_negative_vectors)
         const std::string name{vec["name"].get_str()};
         BOOST_TEST_CONTEXT(name)
         {
+            BOOST_CHECK_EQUAL(vec["id"].get_str(), name);
+            const UniValue& expected{vec["expected"].get_obj()};
+            BOOST_CHECK(!expected["accepted"].get_bool());
+            BOOST_CHECK_EQUAL(expected["error"].get_str(), vec["expected_error"].get_str());
             const std::vector<unsigned char> leaf_script_bytes{ParseHex(vec["leaf_script"].get_str())};
             BOOST_REQUIRE_LT(leaf_script_bytes.size(), 253U);
             const uint8_t leaf_version{static_cast<uint8_t>(vec["leaf_version"].getInt<int>())};
@@ -1193,6 +1644,165 @@ BOOST_AUTO_TEST_CASE(p2mr_independent_negative_vectors)
             ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
             BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
             BOOST_CHECK_EQUAL(err, VectorScriptError(vec["expected_error"].get_str()));
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_v1_manifest_matches_embedded_corpus)
+{
+    UniValue manifest;
+    BOOST_REQUIRE(manifest.read(json_tests::p2mr_v1_manifest));
+    BOOST_REQUIRE(manifest.isObject());
+    BOOST_CHECK_EQUAL(manifest["schema_version"].getInt<int>(), 1);
+    BOOST_CHECK_EQUAL(manifest["profile"].get_str(), "qbit-p2mr-v1");
+    BOOST_CHECK_EQUAL(manifest["profile_version"].getInt<int>(), 1);
+
+    const std::vector<std::string> keys{manifest.getKeys()};
+    const std::set<std::string> actual_keys{keys.begin(), keys.end()};
+    const std::set<std::string> expected_keys{
+        "schema_version", "profile", "profile_version", "specification",
+        "reference_implementation", "ancestry", "case_count", "case_counts", "files"};
+    BOOST_REQUIRE_MESSAGE(actual_keys == expected_keys, "P2MR v1 manifest has unknown or missing fields");
+    BOOST_CHECK_EQUAL(manifest["specification"].get_str(), "doc/consensus/p2mr-v1.md");
+
+    const UniValue& reference{manifest["reference_implementation"].get_obj()};
+    CheckExactObjectKeys(reference, {"repository", "commit"}, "manifest reference_implementation");
+    BOOST_CHECK_EQUAL(reference["repository"].get_str(), "Qbit-Org/qbit");
+    BOOST_CHECK_EQUAL(reference["commit"].get_str(), "988756471aeecdf4463c04be49da2b7b89a98c21");
+
+    const UniValue& ancestry{manifest["ancestry"].get_obj()};
+    CheckExactObjectKeys(ancestry, {"name", "version", "commit", "normative"}, "manifest ancestry");
+    BOOST_CHECK_EQUAL(ancestry["name"].get_str(), "BIP-360");
+    BOOST_CHECK_EQUAL(ancestry["version"].get_str(), "0.12.0");
+    BOOST_CHECK_EQUAL(ancestry["commit"].get_str(), "6740c533e8dce4e912f17ee85a6f627644e1b783");
+    BOOST_CHECK(!ancestry["normative"].get_bool());
+
+    const UniValue& counts{manifest["case_counts"].get_obj()};
+    CheckExactObjectKeys(
+        counts,
+        {"commitment_valid", "commitment_invalid", "witness", "cross_profile", "script_boundary"},
+        "manifest case_counts");
+    BOOST_CHECK_EQUAL(counts["commitment_valid"].getInt<int>(), 4);
+    BOOST_CHECK_EQUAL(counts["commitment_invalid"].getInt<int>(), 7);
+    BOOST_CHECK_EQUAL(counts["witness"].getInt<int>(), 14);
+    BOOST_CHECK_EQUAL(counts["cross_profile"].getInt<int>(), 2);
+    BOOST_CHECK_EQUAL(counts["script_boundary"].getInt<int>(), 43);
+    BOOST_CHECK_EQUAL(manifest["case_count"].getInt<int>(), 70);
+
+    struct ManifestFile {
+        std::string_view bytes;
+        int case_count;
+        std::string_view purpose;
+    };
+    const std::map<std::string, ManifestFile> embedded_files{
+        {"src/test/data/p2mr_cross_profile_vectors.json",
+         {json_tests::p2mr_cross_profile_vectors, 2, "qbit and pinned-profile boundary vectors"}},
+        {"src/test/data/p2mr_pqc_witness_vectors.json",
+         {json_tests::p2mr_pqc_witness_vectors, 14, "PQC sighash and witness vectors"}},
+        {"src/test/data/p2mr_script_boundary_vectors.json",
+         {json_tests::p2mr_script_boundary_vectors, 43, "script, control, leaf, opcode, and resource boundary vectors"}},
+        {"src/test/data/p2mr_vectors.json",
+         {json_tests::p2mr_vectors, 11, "commitment, control block, root, and address vectors"}},
+    };
+    const UniValue& files{manifest["files"]};
+    BOOST_REQUIRE(files.isArray());
+    BOOST_REQUIRE_EQUAL(files.size(), embedded_files.size());
+    std::string previous_path;
+    for (const UniValue& entry : files.getValues()) {
+        CheckExactObjectKeys(entry, {"path", "purpose", "case_count", "sha256"}, "manifest file entry");
+        const std::string path{entry["path"].get_str()};
+        BOOST_CHECK(previous_path.empty() || previous_path < path);
+        previous_path = path;
+        const auto it{embedded_files.find(path)};
+        BOOST_REQUIRE_MESSAGE(it != embedded_files.end(), "unknown manifest path " << path);
+        BOOST_CHECK_EQUAL(entry["purpose"].get_str(), it->second.purpose);
+        BOOST_CHECK_EQUAL(entry["case_count"].getInt<int>(), it->second.case_count);
+        BOOST_CHECK_EQUAL(entry["sha256"].get_str(), Sha256Hex(it->second.bytes));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_v1_cross_profile_qbit_results)
+{
+    UniValue corpus;
+    BOOST_REQUIRE(corpus.read(json_tests::p2mr_cross_profile_vectors));
+    BOOST_REQUIRE(corpus.isObject());
+    BOOST_CHECK_EQUAL(corpus["schema_version"].getInt<int>(), 1);
+    BOOST_CHECK_EQUAL(corpus["profile"].get_str(), "qbit-p2mr-v1");
+    BOOST_CHECK_EQUAL(corpus["profile_version"].getInt<int>(), 1);
+    const std::vector<std::string> keys{corpus.getKeys()};
+    const std::set<std::string> actual_keys{keys.begin(), keys.end()};
+    const std::set<std::string> expected_keys{
+        "schema_version", "profile", "profile_version", "comparison_profile", "vectors"};
+    BOOST_REQUIRE_MESSAGE(actual_keys == expected_keys, "cross-profile corpus has unknown or missing fields");
+    const UniValue& comparison_profile{corpus["comparison_profile"].get_obj()};
+    CheckExactObjectKeys(
+        comparison_profile, {"name", "version", "commit", "normative"}, "cross-profile identity");
+    BOOST_CHECK_EQUAL(comparison_profile["name"].get_str(), "BIP-360");
+    BOOST_CHECK_EQUAL(comparison_profile["version"].get_str(), "0.12.0");
+    BOOST_CHECK_EQUAL(comparison_profile["commit"].get_str(), "6740c533e8dce4e912f17ee85a6f627644e1b783");
+    BOOST_CHECK(!comparison_profile["normative"].get_bool());
+    BOOST_REQUIRE_EQUAL(corpus["vectors"].size(), 2U);
+
+    for (const UniValue& vec : corpus["vectors"].getValues()) {
+        BOOST_TEST_CONTEXT(vec["id"].get_str())
+        {
+            CheckExactObjectKeys(
+                vec,
+                {"id", "name", "comparison_scope", "leaf_version", "leaf_script", "control_block",
+                 "tapleaf_root", "p2mr_leaf_root", "scriptPubKey", "witness", "expected"},
+                "cross-profile vector");
+            BOOST_CHECK_EQUAL(vec["leaf_version"].get_str(), "c0");
+            const CScript leaf_script{ScriptFromHex(vec["leaf_script"].get_str().c_str())};
+            const std::vector<unsigned char> control_block{ParseHex(vec["control_block"].get_str())};
+            const uint256 tapleaf_root{VectorHash(vec, "tapleaf_root")};
+            const uint256 p2mr_leaf_root{VectorHash(vec, "p2mr_leaf_root")};
+            BOOST_CHECK_EQUAL(ComputeTapleafHash(P2MR_LEAF_VERSION_V1, ScriptBytes(leaf_script)), tapleaf_root);
+            BOOST_CHECK_EQUAL(ComputeP2MRLeafHash(P2MR_LEAF_VERSION_V1, ScriptBytes(leaf_script)), p2mr_leaf_root);
+            BOOST_CHECK_NE(tapleaf_root, p2mr_leaf_root);
+
+            const auto& witness{vec["witness"].getValues()};
+            BOOST_REQUIRE_EQUAL(witness.size(), 2U);
+            BOOST_CHECK_EQUAL(witness[0].get_str(), vec["leaf_script"].get_str());
+            BOOST_CHECK_EQUAL(witness[1].get_str(), vec["control_block"].get_str());
+
+            const CScript script_pubkey{ScriptFromHex(vec["scriptPubKey"].get_str().c_str())};
+            const std::string vector_id{vec["id"].get_str()};
+            const UniValue& all_expected{vec["expected"].get_obj()};
+            const UniValue* comparison_expected{nullptr};
+            if (vector_id == "pinned-bip-root-rejected-by-qbit") {
+                BOOST_CHECK_EQUAL(vec["comparison_scope"].get_str(), "full-pinned-profile");
+                CheckExactObjectKeys(all_expected, {"pinned_bip_360", "qbit_p2mr_v1"}, "cross-profile expected");
+                comparison_expected = &all_expected["pinned_bip_360"];
+                BOOST_CHECK(script_pubkey == BuildP2MRScriptPubKey(tapleaf_root));
+            } else {
+                BOOST_REQUIRE_EQUAL(vector_id, "qbit-root-executes-depth-zero-script");
+                BOOST_CHECK_EQUAL(vec["comparison_scope"].get_str(), "isolated-depth-zero-rule-with-qbit-tags");
+                CheckExactObjectKeys(
+                    all_expected,
+                    {"bip_style_depth_zero_with_qbit_tags", "qbit_p2mr_v1"},
+                    "cross-profile expected");
+                comparison_expected = &all_expected["bip_style_depth_zero_with_qbit_tags"];
+                BOOST_CHECK(script_pubkey == BuildP2MRScriptPubKey(p2mr_leaf_root));
+            }
+            CheckExactObjectKeys(*comparison_expected, {"accepted", "stage", "error"}, "comparison-side expected");
+            BOOST_CHECK((*comparison_expected)["accepted"].get_bool());
+            BOOST_CHECK_EQUAL((*comparison_expected)["stage"].get_str(), "depth-zero-shortcut");
+            BOOST_CHECK_EQUAL((*comparison_expected)["error"].get_str(), "SCRIPT_ERR_OK");
+
+            const P2MRSpendContext spend{BuildP2MRSpend(
+                script_pubkey, leaf_script, /*stack_items=*/{}, control_block)};
+            const UniValue& expected{all_expected["qbit_p2mr_v1"].get_obj()};
+            CheckExactObjectKeys(expected, {"accepted", "stage", "error"}, "qbit expected");
+            BOOST_CHECK(!expected["accepted"].get_bool());
+            const std::string error_name{expected["error"].get_str()};
+            BOOST_CHECK_EQUAL(
+                expected["stage"].get_str(),
+                error_name == "SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH" ? "commitment" : "script-execution");
+            BOOST_CHECK(
+                error_name == "SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH" || error_name == "SCRIPT_ERR_EVAL_FALSE");
+            ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+            BOOST_CHECK(!VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+            BOOST_CHECK_EQUAL(err, VectorScriptError(error_name));
         }
     }
 }
@@ -4145,6 +4755,87 @@ BOOST_AUTO_TEST_CASE(op_checksigpqc_is_invalid_outside_p2mr)
         BOOST_CHECK(VerifyBaseScript(unexecuted, SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS, err));
         BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
     }
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_v1_script_boundary_vectors)
+{
+    UniValue corpus;
+    BOOST_REQUIRE(corpus.read(json_tests::p2mr_script_boundary_vectors));
+    CheckExactObjectKeys(
+        corpus,
+        {"schema_version", "profile", "profile_version", "limits", "cases"},
+        "P2MR script boundary corpus");
+    BOOST_CHECK_EQUAL(corpus["schema_version"].getInt<int>(), 1);
+    BOOST_CHECK_EQUAL(corpus["profile"].get_str(), "qbit-p2mr-v1");
+    BOOST_CHECK_EQUAL(corpus["profile_version"].getInt<int>(), 1);
+
+    const UniValue& limits{corpus["limits"].get_obj()};
+    CheckExactObjectKeys(
+        limits,
+        {"control_path_max_nodes", "initial_stack_max_items", "initial_stack_item_max_bytes",
+         "initial_stack_total_max_bytes", "validation_weight_per_nonempty_pqc_check"},
+        "P2MR script boundary limits");
+    BOOST_CHECK_EQUAL(limits["control_path_max_nodes"].getInt<size_t>(), P2MR_CONTROL_MAX_NODE_COUNT);
+    BOOST_CHECK_EQUAL(limits["initial_stack_max_items"].getInt<int>(), MAX_STACK_SIZE);
+    BOOST_CHECK_EQUAL(limits["initial_stack_item_max_bytes"].getInt<unsigned int>(), MAX_P2MR_V1_STACK_ITEM_SIZE);
+    BOOST_CHECK_EQUAL(limits["initial_stack_total_max_bytes"].getInt<unsigned int>(), MAX_P2MR_V1_TOTAL_INITIAL_STACK_BYTES);
+    BOOST_CHECK_EQUAL(limits["validation_weight_per_nonempty_pqc_check"].getInt<int64_t>(), VALIDATION_WEIGHT_PER_SIGOP_PQC);
+
+    const UniValue& cases{corpus["cases"]};
+    BOOST_REQUIRE(cases.isArray());
+    BOOST_REQUIRE_EQUAL(cases.size(), 43U);
+    std::set<std::string> ids;
+    std::map<std::string, size_t> category_counts;
+    const std::map<std::string, std::string> category_scenarios{
+        {"witness-control", ""},
+        {"leaf-version", "leaf-version"},
+        {"opcode", "opcode"},
+        {"resource", "resource"},
+    };
+
+    for (const UniValue& value : cases.getValues()) {
+        const UniValue& test{value.get_obj()};
+        CheckExactObjectKeys(
+            test,
+            {"id", "category", "scenario", "parameters", "consensus", "policy"},
+            "P2MR script boundary case");
+        const std::string id{test["id"].get_str()};
+        const std::string category{test["category"].get_str()};
+        const std::string scenario{test["scenario"].get_str()};
+        BOOST_REQUIRE_MESSAGE(!id.empty() && ids.insert(id).second, "duplicate or empty boundary id " << id);
+        BOOST_REQUIRE_MESSAGE(category_scenarios.contains(category), "unknown boundary category " << category);
+        if (category == "witness-control") {
+            BOOST_REQUIRE(scenario == "witness-shape" || scenario == "control-path");
+        } else {
+            BOOST_REQUIRE_EQUAL(scenario, category_scenarios.at(category));
+        }
+        ++category_counts[category];
+
+        for (const auto& [name, flags] : std::array<std::pair<std::string_view, unsigned int>, 2>{{
+                 {"consensus", P2MR_SCRIPT_VERIFY_FLAGS},
+                 {"policy", STANDARD_SCRIPT_VERIFY_FLAGS},
+             }}) {
+            const UniValue& expected{test[std::string{name}].get_obj()};
+            CheckExactObjectKeys(expected, {"accepted", "stage", "error"}, "P2MR boundary expected outcome");
+            const bool expected_accepted{expected["accepted"].get_bool()};
+            const std::string expected_stage{expected["stage"].get_str()};
+            const ScriptError expected_error{BoundaryScriptError(expected["error"].get_str())};
+            BOOST_REQUIRE(!expected_stage.empty());
+            BOOST_REQUIRE_EQUAL(expected_accepted, expected_error == SCRIPT_ERR_OK);
+
+            BOOST_TEST_CONTEXT(id << " (" << name << ")")
+            {
+                const BoundaryExecution actual{ExecuteP2MRBoundaryCase(test, flags)};
+                BOOST_CHECK_EQUAL(actual.accepted, expected_accepted);
+                BOOST_CHECK_EQUAL(actual.error, expected_error);
+            }
+        }
+    }
+
+    BOOST_CHECK_EQUAL(category_counts["witness-control"], 10U);
+    BOOST_CHECK_EQUAL(category_counts["leaf-version"], 7U);
+    BOOST_CHECK_EQUAL(category_counts["opcode"], 14U);
+    BOOST_CHECK_EQUAL(category_counts["resource"], 12U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

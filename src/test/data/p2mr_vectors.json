@@ -1,8 +1,17 @@
 {
-    "version": 1,
+    "schema_version": 1,
+    "profile": "qbit-p2mr-v1",
+    "profile_version": 1,
+    "generator": {
+        "id": "standalone-python",
+        "version": 1,
+        "uses_qbit_consensus_helpers": false
+    },
     "valid": [
         {
+            "id": "single_leaf_op_true",
             "name": "single_leaf_op_true",
+            "expected": {"accepted": true, "stage": "script-complete", "error": "SCRIPT_ERR_OK"},
             "leaf_script": "51",
             "leaf_version": 192,
             "leaf_preimage": "c00151",
@@ -16,7 +25,9 @@
             "regtest_address": "qbrt1zt39mp8jjcqd7pyh7qgz93gmhh2qlqppq8c3j4qy02chzfzp8c7sqrw52qh"
         },
         {
+            "id": "two_leaf_op_true_with_op_false_sibling",
             "name": "two_leaf_op_true_with_op_false_sibling",
+            "expected": {"accepted": true, "stage": "script-complete", "error": "SCRIPT_ERR_OK"},
             "leaf_script": "51",
             "leaf_version": 192,
             "leaf_preimage": "c00151",
@@ -34,7 +45,9 @@
             "regtest_address": "qbrt1z5hysl6jfnyncpvrvfm957h56q3a082ndaytp5utrdmrf7qqyndfq4wrpt5"
         },
         {
+            "id": "two_leaf_spent_hash_sorts_after_sibling",
             "name": "two_leaf_spent_hash_sorts_after_sibling",
+            "expected": {"accepted": true, "stage": "script-complete", "error": "SCRIPT_ERR_OK"},
             "leaf_script": "5161",
             "leaf_version": 192,
             "leaf_preimage": "c0025161",
@@ -53,7 +66,9 @@
             "notes": "The spent leaf hash is lexicographically greater than its sibling, so the branch preimage must be sibling || spent."
         },
         {
+            "id": "three_leaf_two_level_spend_middle_leaf",
             "name": "three_leaf_two_level_spend_middle_leaf",
+            "expected": {"accepted": true, "stage": "script-complete", "error": "SCRIPT_ERR_OK"},
             "leaf_script": "5161",
             "leaf_version": 192,
             "leaf_preimage": "c0025161",
@@ -76,7 +91,9 @@
     ],
     "invalid": [
         {
+            "id": "missing_bit0_control_marker",
             "name": "missing_bit0_control_marker",
+            "expected": {"accepted": false, "stage": "control-marker", "error": "SCRIPT_ERR_P2MR_CONTROL_BIT0"},
             "base": "single_leaf_op_true",
             "leaf_script": "51",
             "leaf_version": 192,
@@ -85,7 +102,9 @@
             "expected_error": "SCRIPT_ERR_P2MR_CONTROL_BIT0"
         },
         {
+            "id": "malformed_control_block_size",
             "name": "malformed_control_block_size",
+            "expected": {"accepted": false, "stage": "control-size", "error": "SCRIPT_ERR_P2MR_WRONG_CONTROL_SIZE"},
             "base": "single_leaf_op_true",
             "leaf_script": "51",
             "leaf_version": 192,
@@ -94,7 +113,9 @@
             "expected_error": "SCRIPT_ERR_P2MR_WRONG_CONTROL_SIZE"
         },
         {
+            "id": "wrong_leaf_version",
             "name": "wrong_leaf_version",
+            "expected": {"accepted": false, "stage": "commitment", "error": "SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH"},
             "base": "single_leaf_op_true",
             "leaf_script": "51",
             "leaf_version": 194,
@@ -103,7 +124,9 @@
             "expected_error": "SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH"
         },
         {
+            "id": "wrong_compactsize_script_length_encoding",
             "name": "wrong_compactsize_script_length_encoding",
+            "expected": {"accepted": false, "stage": "commitment", "error": "SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH"},
             "base": "single_leaf_op_true",
             "leaf_script": "51",
             "leaf_version": 192,
@@ -114,7 +137,9 @@
             "expected_error": "SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH"
         },
         {
+            "id": "mutated_sibling",
             "name": "mutated_sibling",
+            "expected": {"accepted": false, "stage": "commitment", "error": "SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH"},
             "base": "two_leaf_op_true_with_op_false_sibling",
             "leaf_script": "51",
             "leaf_version": 192,
@@ -123,7 +148,9 @@
             "expected_error": "SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH"
         },
         {
+            "id": "unsorted_branch_preimage_when_spent_hash_sorts_after_sibling",
             "name": "unsorted_branch_preimage_when_spent_hash_sorts_after_sibling",
+            "expected": {"accepted": false, "stage": "commitment", "error": "SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH"},
             "base": "two_leaf_spent_hash_sorts_after_sibling",
             "leaf_script": "5161",
             "leaf_version": 192,
@@ -134,7 +161,9 @@
             "expected_error": "SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH"
         },
         {
+            "id": "wrong_address_root_commitment",
             "name": "wrong_address_root_commitment",
+            "expected": {"accepted": false, "stage": "commitment", "error": "SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH"},
             "base": "single_leaf_op_true",
             "leaf_script": "51",
             "leaf_version": 192,

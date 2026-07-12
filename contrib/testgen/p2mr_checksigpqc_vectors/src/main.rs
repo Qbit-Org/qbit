@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const OP_1: u8 = 0x51;
 const OP_2: u8 = 0x52;
@@ -19,6 +19,28 @@ const P2MR_CONTROL_BYTE: u8 = P2MR_LEAF_VERSION | 1;
 const SIGHASH_DEFAULT: u8 = 0x00;
 const PREVOUT_AMOUNT: i64 = 1000;
 const SPEND_OUTPUT_AMOUNT: i64 = 900;
+const SCHEMA_VERSION: u64 = 1;
+const PROFILE: &str = "qbit-p2mr-v1";
+const PROFILE_VERSION: u64 = 1;
+const GENERATOR_VERSION: u64 = 1;
+const PYTHON_OWNED_IDS: [&str; 11] = [
+    "single_key_default_sighash",
+    "single_key_sighash_none",
+    "single_key_sighash_single_matching_output",
+    "single_key_sighash_all_anyonecanpay",
+    "single_key_sighash_none_anyonecanpay",
+    "single_key_sighash_single_anyonecanpay",
+    "single_key_default_sighash_annex_present",
+    "single_key_sighash_single_missing_first",
+    "single_key_sighash_single_missing_beyond",
+    "single_key_sighash_single_anyonecanpay_missing_first",
+    "single_key_sighash_single_anyonecanpay_missing_beyond",
+];
+const RUST_OWNED_IDS: [&str; 3] = [
+    "single_key_leading_codesep",
+    "branch_codesep_true",
+    "branch_codesep_false",
+];
 
 #[derive(Clone)]
 struct TxIn {
@@ -52,7 +74,9 @@ struct SpentOutput {
 
 #[derive(Serialize)]
 struct WitnessVector {
+    id: String,
     name: String,
+    generator: Generator,
     provenance: String,
     annex: String,
     #[serde(rename = "inputIndex")]
@@ -80,8 +104,14 @@ struct WitnessVector {
     leaf_script: String,
     #[serde(rename = "controlBlock")]
     control_block: String,
+    #[serde(rename = "leafHash")]
+    leaf_hash: String,
     pubkey: String,
     signature: String,
+    witness: Vec<String>,
+    #[serde(rename = "digest_defined")]
+    digest_defined: bool,
+    expected: Expected,
     #[serde(rename = "p2mrSigMsg")]
     p2mr_sigmsg: String,
     #[serde(rename = "p2mrSighash")]
@@ -104,16 +134,49 @@ struct WitnessVector {
     wrong_pubkey_script_pubkey: String,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let out_path = env::args()
-        .nth(1)
-        .unwrap_or_else(|| "src/test/data/p2mr_pqc_witness_vectors.json".to_string());
+#[derive(Serialize)]
+struct Generator {
+    id: String,
+    version: u64,
+}
 
-    let out_path = Path::new(&out_path);
-    let vectors = merge_existing_fields(out_path, build_vectors()?)?;
-    let json = serde_json::to_string_pretty(&vectors)?;
-    fs::write(out_path, format!("{json}\n"))?;
+#[derive(Serialize)]
+struct Expected {
+    accepted: bool,
+    stage: String,
+    error: String,
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let (input_path, output_path) = parse_args()?;
+    if input_path == output_path {
+        return Err("--input and --output must be different paths".into());
+    }
+    let corpus = merge_existing_fields(&input_path, build_vectors()?)?;
+    let json = serde_json::to_string_pretty(&corpus)?;
+    fs::write(output_path, format!("{json}\n"))?;
     Ok(())
+}
+
+fn parse_args() -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
+    let mut args = env::args().skip(1);
+    let mut input = None;
+    let mut output = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--input" => input = Some(PathBuf::from(args.next().ok_or("--input requires a path")?)),
+            "--output" => {
+                output = Some(PathBuf::from(
+                    args.next().ok_or("--output requires a path")?,
+                ))
+            }
+            _ => return Err(format!("unknown argument: {arg}").into()),
+        }
+    }
+    Ok((
+        input.ok_or("missing required --input")?,
+        output.ok_or("missing required --output")?,
+    ))
 }
 
 fn build_vectors() -> Result<Vec<WitnessVector>, Box<dyn std::error::Error>> {
@@ -161,71 +224,134 @@ fn build_vectors() -> Result<Vec<WitnessVector>, Box<dyn std::error::Error>> {
 }
 
 fn merge_existing_fields(
-    out_path: &Path,
+    input_path: &Path,
     generated: Vec<WitnessVector>,
-) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
-    let mut generated_by_name = HashMap::<String, Map<String, Value>>::new();
-    let mut generated_names = Vec::with_capacity(generated.len());
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let mut generated_by_id = HashMap::<String, Map<String, Value>>::new();
     for vector in generated {
         let generated_value = serde_json::to_value(vector)?;
         let generated_object = generated_value
             .as_object()
             .ok_or("generated vector did not serialize to a JSON object")?
             .clone();
-        let name = generated_object
-            .get("name")
+        let id = generated_object
+            .get("id")
             .and_then(Value::as_str)
-            .ok_or("generated vector is missing a name")?
+            .ok_or("generated vector is missing an id")?
             .to_string();
 
-        if generated_by_name
-            .insert(name.clone(), generated_object)
+        if expected_owner(&id) != Some("standalone-rust") {
+            return Err(format!("Rust generator produced unowned vector {id}").into());
+        }
+        if generated_by_id
+            .insert(id.clone(), generated_object)
             .is_some()
         {
-            return Err(format!("duplicate generated vector {name}").into());
-        }
-        generated_names.push(name);
-    }
-
-    let mut merged = Vec::new();
-    let mut emitted_generated_names = HashSet::new();
-    if out_path.exists() {
-        let existing_json: Value = serde_json::from_str(&fs::read_to_string(out_path)?)?;
-        let existing_array = existing_json
-            .as_array()
-            .ok_or("existing fixture is not a JSON array")?;
-        merged.reserve(existing_array.len() + generated_names.len());
-
-        for existing in existing_array {
-            let Some(name) = existing.get("name").and_then(Value::as_str) else {
-                merged.push(existing.clone());
-                continue;
-            };
-            let Some(generated_object) = generated_by_name.get(name) else {
-                merged.push(existing.clone());
-                continue;
-            };
-
-            let mut object = existing.as_object().cloned().unwrap_or_default();
-            for (key, value) in generated_object {
-                object.insert(key.clone(), value.clone());
-            }
-            emitted_generated_names.insert(name.to_string());
-            merged.push(Value::Object(object));
+            return Err(format!("duplicate generated vector {id}").into());
         }
     }
+    let generated_ids: HashSet<&str> = generated_by_id.keys().map(String::as_str).collect();
+    if generated_ids != RUST_OWNED_IDS.into_iter().collect() {
+        return Err("Rust generator did not produce its exact owned ID set".into());
+    }
 
-    for name in generated_names {
-        if emitted_generated_names.contains(&name) {
+    let mut corpus: Value = serde_json::from_str(&fs::read_to_string(input_path)?)?;
+    validate_corpus(&corpus)?;
+    let existing_array = corpus
+        .get_mut("vectors")
+        .and_then(Value::as_array_mut)
+        .ok_or("witness corpus vectors is not an array")?;
+
+    let mut merged = Vec::with_capacity(existing_array.len());
+    for existing in existing_array.iter() {
+        let id = existing
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or("existing vector is missing an id")?;
+        let Some(generated_object) = generated_by_id.remove(id) else {
+            merged.push(existing.clone());
             continue;
+        };
+
+        let mut object = existing.as_object().cloned().unwrap_or_default();
+        for (key, value) in generated_object {
+            object.insert(key, value);
         }
-        let generated_object = generated_by_name
-            .remove(&name)
-            .ok_or_else(|| format!("missing generated vector {name}"))?;
-        merged.push(Value::Object(generated_object));
+        merged.push(Value::Object(object));
+    }
+    if !generated_by_id.is_empty() {
+        return Err(
+            format!("Rust-owned vectors missing from input corpus: {generated_by_id:?}").into(),
+        );
     }
 
-    Ok(merged)
+    *existing_array = merged;
+    Ok(corpus)
+}
+
+fn validate_corpus(corpus: &Value) -> Result<(), Box<dyn std::error::Error>> {
+    let object = corpus
+        .as_object()
+        .ok_or("witness corpus must be an object")?;
+    let expected_keys = ["schema_version", "profile", "profile_version", "vectors"];
+    if object.len() != expected_keys.len()
+        || expected_keys.iter().any(|key| !object.contains_key(*key))
+    {
+        return Err("unknown witness corpus top-level field".into());
+    }
+    if object.get("schema_version").and_then(Value::as_u64) != Some(SCHEMA_VERSION)
+        || object.get("profile").and_then(Value::as_str) != Some(PROFILE)
+        || object.get("profile_version").and_then(Value::as_u64) != Some(PROFILE_VERSION)
+    {
+        return Err("unsupported witness corpus schema or profile".into());
+    }
+    if !object.get("vectors").is_some_and(Value::is_array) {
+        return Err("witness corpus vectors must be an array".into());
+    }
+    let vectors = object["vectors"].as_array().expect("array checked above");
+    let mut seen = HashSet::new();
+    for vector in vectors {
+        let vector_object = vector
+            .as_object()
+            .ok_or("witness vector must be an object")?;
+        let id = vector_object
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or("witness vector is missing an id")?;
+        if vector_object.get("name").and_then(Value::as_str) != Some(id) {
+            return Err(format!("witness vector {id} name does not match its stable id").into());
+        }
+        if !seen.insert(id) {
+            return Err(format!("duplicate witness vector id: {id}").into());
+        }
+        let owner =
+            expected_owner(id).ok_or_else(|| format!("unknown witness vector ownership: {id}"))?;
+        let generator = vector_object
+            .get("generator")
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("witness vector {id} is missing generator metadata"))?;
+        if generator.len() != 2
+            || generator.get("id").and_then(Value::as_str) != Some(owner)
+            || generator.get("version").and_then(Value::as_u64) != Some(GENERATOR_VERSION)
+        {
+            return Err(format!("witness vector {id} generator does not match its owner").into());
+        }
+    }
+    let expected_ids: HashSet<&str> = PYTHON_OWNED_IDS.into_iter().chain(RUST_OWNED_IDS).collect();
+    if seen != expected_ids {
+        return Err("witness corpus does not contain the exact owned ID set".into());
+    }
+    Ok(())
+}
+
+fn expected_owner(id: &str) -> Option<&'static str> {
+    if PYTHON_OWNED_IDS.contains(&id) {
+        Some("standalone-python")
+    } else if RUST_OWNED_IDS.contains(&id) {
+        Some("standalone-rust")
+    } else {
+        None
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -258,6 +384,7 @@ fn build_vector(
 
     unsigned_tx.vin[0].witness =
         witness_stack(&signature.bytes, &script_args, leaf_script, &control_block);
+    let witness = unsigned_tx.vin[0].witness.iter().map(hex::encode).collect();
     let spend_tx = unsigned_tx.serialize(true);
 
     let wrong_codeseparator_sigmsg = p2mr_sigmsg(
@@ -289,7 +416,12 @@ fn build_vector(
     let wrong_pubkey_script_pubkey = p2mr_script_pubkey(&p2mr_leaf_hash(&wrong_pubkey_leaf_script));
 
     Ok(WitnessVector {
+        id: name.to_string(),
         name: name.to_string(),
+        generator: Generator {
+            id: "standalone-rust".to_string(),
+            version: GENERATOR_VERSION,
+        },
         provenance: format!(
             "Generated from deterministic libbitcoinpqc seed {key_seed:#04x} plus the independent Rust P2MR serializer in contrib/testgen/p2mr_checksigpqc_vectors; the vector signs the manually computed P2MRSighash digest with libbitcoinpqc and does not use qbit wallet/signing/sighash helpers."
         ),
@@ -310,8 +442,16 @@ fn build_vector(
         leaf_version: hex::encode([P2MR_LEAF_VERSION]),
         leaf_script: hex::encode(leaf_script),
         control_block: hex::encode(control_block),
+        leaf_hash: hex::encode(p2mr_leaf_hash(leaf_script)),
         pubkey: hex::encode(&keypair.public_key.bytes),
         signature: hex::encode(signature.bytes),
+        witness,
+        digest_defined: true,
+        expected: Expected {
+            accepted: true,
+            stage: "script-complete".to_string(),
+            error: "SCRIPT_ERR_OK".to_string(),
+        },
         p2mr_sigmsg: hex::encode(sigmsg),
         p2mr_sighash: hex::encode(p2mr_sighash),
         wrong_codeseparator_pos: hex::encode(wrong_codeseparator_pos.to_le_bytes()),
