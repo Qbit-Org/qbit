@@ -4,6 +4,8 @@
 
 #include <qt/test/apptests.h>
 
+#include <bitcoin-build-config.h> // IWYU pragma: keep
+
 #include <chainparams.h>
 #include <key.h>
 #include <logging.h>
@@ -14,19 +16,74 @@
 #include <test/util/setup_common.h>
 #include <validation.h>
 
+#ifdef ENABLE_WALLET
+#include <common/args.h>
+#include <interfaces/wallet.h>
+#include <key_io.h>
+#include <qt/bitcoinamountfield.h>
+#include <qt/qvalidatedlineedit.h>
+#include <qt/sendcoinsdialog.h>
+#include <qt/sendcoinsentry.h>
+#include <qt/test/syntheticwallet.h>
+#include <qt/walletcontroller.h>
+#include <qt/walletview.h>
+#include <univalue.h>
+#include <wallet/coincontrol.h>
+#include <wallet/wallet.h>
+#endif // ENABLE_WALLET
+
+#include <chrono>
+#include <thread>
+
 #include <QAction>
+#include <QDialogButtonBox>
+#include <QElapsedTimer>
+#include <QEvent>
 #include <QLineEdit>
+#include <QPushButton>
 #include <QRegularExpression>
 #include <QScopedPointer>
 #include <QSignalSpy>
 #include <QString>
 #include <QTest>
 #include <QTextEdit>
+#include <QTimer>
+#include <QVBoxLayout>
 #include <QtGlobal>
 #include <QtTest/QtTestWidgets>
 #include <QtTest/QtTestGui>
 
 namespace {
+using namespace std::chrono_literals;
+
+#ifdef ENABLE_WALLET
+class TestWalletAdoptionActivity : public WalletControllerActivity
+{
+public:
+    using WalletControllerActivity::WalletControllerActivity;
+
+    void adopt(std::unique_ptr<interfaces::Wallet> wallet, std::function<void(WalletModel*)> callback)
+    {
+        scheduleWalletModel(std::move(wallet), std::move(callback));
+    }
+};
+
+void AcceptWalletUnlock()
+{
+    QTimer::singleShot(0, qApp, [] {
+        for (QWidget* widget : QApplication::topLevelWidgets()) {
+            if (!widget->inherits("AskPassphraseDialog")) continue;
+            QLineEdit* const passphrase{widget->findChild<QLineEdit*>("passEdit1")};
+            QDialogButtonBox* const buttons{widget->findChild<QDialogButtonBox*>("buttonBox")};
+            if (!passphrase || !buttons) return;
+            passphrase->setText("test-passphrase");
+            buttons->button(QDialogButtonBox::Ok)->click();
+            return;
+        }
+    });
+}
+#endif // ENABLE_WALLET
+
 //! Regex find a string group inside of the console output
 QString FindInConsole(const QString& output, const QString& pattern)
 {
@@ -77,8 +134,92 @@ void AppTests::appTests()
     m_app.baseInitialize();
     m_app.requestInitialize();
     m_app.exec();
+
+#ifdef ENABLE_WALLET
+    QVERIFY(m_shutdown_wallet_model);
+    QVERIFY(m_shutdown_wallet_view);
+    QVERIFY(m_shutdown_send_dialog);
+    QVERIFY(m_shutdown_wallet_state);
+
+    const auto state{m_shutdown_wallet_state};
+    std::thread watchdog{[state] {
+        std::unique_lock lock{state->mutex};
+        if (!state->condition.wait_for(lock, 5s, [state] {
+                return state->create_finished || state->shutdown_complete;
+            })) {
+            state->watchdog_released = true;
+            state->allow_create = true;
+            lock.unlock();
+            state->condition.notify_all();
+        }
+    }};
+
+    QElapsedTimer shutdown_timer;
+    shutdown_timer.start();
+    QEvent quit_event{QEvent::Quit};
+    const bool quit_delivered{QCoreApplication::sendEvent(&m_app, &quit_event)};
+    m_shutdown_elapsed_ms = shutdown_timer.elapsed();
+
+    {
+        std::lock_guard lock{state->mutex};
+        state->shutdown_complete = true;
+        state->allow_create = true;
+    }
+    state->condition.notify_all();
+    watchdog.join();
+
+    bool worker_destroyed{false};
+    {
+        std::unique_lock lock{state->mutex};
+        worker_destroyed = state->condition.wait_for(lock, 5s, [state] {
+            return state->background_clone_destroyed;
+        });
+    }
+#else
     m_app.requestShutdown();
+#endif // ENABLE_WALLET
     m_app.exec();
+
+#ifdef ENABLE_WALLET
+    bool cancel_observed{false};
+    bool watchdog_released{false};
+    bool locked{false};
+    int lock_calls{0};
+    int unlock_calls{0};
+    {
+        std::lock_guard lock{state->mutex};
+        cancel_observed = state->cancel_observed;
+        watchdog_released = state->watchdog_released;
+        locked = state->locked;
+        lock_calls = state->lock_calls;
+        unlock_calls = state->unlock_calls;
+    }
+    QVERIFY(quit_delivered);
+    QVERIFY2(m_shutdown_elapsed_ms < 5000, "Qt wallet shutdown exceeded the five-second bound");
+    QVERIFY(!watchdog_released);
+    QVERIFY(cancel_observed);
+    QVERIFY(worker_destroyed);
+    QVERIFY(m_shutdown_wallet_model.isNull());
+    QVERIFY(m_shutdown_wallet_view.isNull());
+    QVERIFY(m_shutdown_send_dialog.isNull());
+    QVERIFY(m_wallet_dependents_destroyed_before_model);
+    QVERIFY(locked);
+    QCOMPARE(unlock_calls, 1);
+    QCOMPARE(lock_calls, 1);
+    QCOMPARE(m_shutdown_coins_sent, 0);
+    for (QWidget* widget : QApplication::topLevelWidgets()) {
+        QVERIFY(!widget->inherits("SendConfirmationDialog"));
+    }
+#endif // ENABLE_WALLET
+
+#ifdef ENABLE_WALLET
+    // WalletLoader::createWallet persists startup entries. Remove test-only
+    // entries so later options tests see their original settings fixture.
+    gArgs.LockSettings([](common::Settings& settings) {
+        settings.rw_settings.erase("wallet");
+    });
+    QVERIFY(gArgs.WriteSettingsFile());
+#endif // ENABLE_WALLET
 
     // Reset global state to avoid interfering with later tests.
     LogInstance().DisconnectTestLogger();
@@ -88,6 +229,98 @@ void AppTests::appTests()
 void AppTests::guiTests(BitcoinGUI* window)
 {
     HandleCallback callback{"guiTests", *this};
+
+#ifdef ENABLE_WALLET
+    WalletController* const controller{window->getWalletController()};
+    QVERIFY(controller);
+
+    for (const std::string name : {"qt-shutdown-lifetime-1", "qt-shutdown-lifetime-2"}) {
+        QSignalSpy wallet_added_spy(controller, &WalletController::walletAdded);
+        QVERIFY(wallet_added_spy.isValid());
+        WalletModel* wallet_model{nullptr};
+        QObject wallet_added_context;
+        connect(
+            controller,
+            &WalletController::walletAdded,
+            &wallet_added_context,
+            [&](WalletModel* model) { wallet_model = model; });
+        std::vector<bilingual_str> warnings;
+        auto wallet{m_app.node().walletLoader().createWallet(
+            name,
+            SecureString{},
+            wallet::WALLET_FLAG_DESCRIPTORS | wallet::WALLET_FLAG_BLANK_WALLET,
+            warnings)};
+        QVERIFY(wallet);
+        if (!wallet_model) QVERIFY(wallet_added_spy.wait(5000));
+        QVERIFY(wallet_model);
+    }
+
+    m_shutdown_wallet_state = std::make_shared<qt_test::SyntheticWalletState>();
+    {
+        std::lock_guard lock{m_shutdown_wallet_state->mutex};
+        m_shutdown_wallet_state->allow_create = false;
+        m_shutdown_wallet_state->wait_for_cancel = true;
+        m_shutdown_wallet_state->encrypted = true;
+        m_shutdown_wallet_state->locked = true;
+    }
+
+    QSignalSpy wallet_added_spy(controller, &WalletController::walletAdded);
+    QVERIFY(wallet_added_spy.isValid());
+    auto* adoption_activity{new TestWalletAdoptionActivity(controller, window)};
+    adoption_activity->adopt(
+        qt_test::MakeSyntheticWallet(wallet::PQCUsageReport{}, m_shutdown_wallet_state),
+        [this, adoption_activity](WalletModel* model) {
+            m_shutdown_wallet_model = model;
+            adoption_activity->deleteLater();
+        });
+    if (!m_shutdown_wallet_model) QVERIFY(wallet_added_spy.wait(5000));
+    QVERIFY(m_shutdown_wallet_model);
+
+    for (WalletView* wallet_view : window->findChildren<WalletView*>()) {
+        if (wallet_view->getWalletModel() == m_shutdown_wallet_model) {
+            m_shutdown_wallet_view = wallet_view;
+            m_shutdown_send_dialog = wallet_view->findChild<SendCoinsDialog*>();
+            break;
+        }
+    }
+    QVERIFY(m_shutdown_wallet_view);
+    QVERIFY(m_shutdown_send_dialog);
+    connect(m_shutdown_wallet_model, &QObject::destroyed, this, [this] {
+        m_wallet_dependents_destroyed_before_model =
+            m_shutdown_wallet_view.isNull() && m_shutdown_send_dialog.isNull();
+    });
+    connect(m_shutdown_send_dialog, &SendCoinsDialog::coinsSent, this, [this] {
+        ++m_shutdown_coins_sent;
+    });
+
+    m_shutdown_wallet_model->pollBalanceChanged();
+    QVBoxLayout* const entries{m_shutdown_send_dialog->findChild<QVBoxLayout*>("entries")};
+    QVERIFY(entries);
+    SendCoinsEntry* const entry{qobject_cast<SendCoinsEntry*>(entries->itemAt(0)->widget())};
+    QVERIFY(entry);
+    entry->findChild<QValidatedLineEdit*>("payTo")->setText(QString::fromStdString(EncodeDestination(WitnessV2P2MR{})));
+    entry->findChild<BitcoinAmountField*>("payAmount")->setValue(COIN);
+    m_shutdown_send_dialog->getCoinControl()->Select(COutPoint{Txid{}, 0});
+    QVERIFY(entry->validate(m_app.node()));
+    QVERIFY(m_shutdown_send_dialog->getCoinControl()->HasSelected());
+    QCOMPARE(
+        m_shutdown_wallet_model->wallet().getAvailableBalance(*m_shutdown_send_dialog->getCoinControl()),
+        50 * COIN);
+
+    AcceptWalletUnlock();
+    QVERIFY(QMetaObject::invokeMethod(m_shutdown_send_dialog, "sendButtonClicked", Q_ARG(bool, false)));
+    {
+        std::unique_lock lock{m_shutdown_wallet_state->mutex};
+        QVERIFY(m_shutdown_wallet_state->condition.wait_for(lock, 5s, [this] {
+            return m_shutdown_wallet_state->create_entered;
+        }));
+        QCOMPARE(m_shutdown_wallet_state->unlock_calls, 1);
+        QVERIFY(!m_shutdown_wallet_state->locked);
+    }
+
+    QCOMPARE(window->findChildren<WalletView*>().size(), 3);
+#endif // ENABLE_WALLET
+
     connect(window, &BitcoinGUI::consoleShown, this, &AppTests::consoleTests);
     expectCallback("consoleTests");
     QAction* action = window->findChild<QAction*>("openRPCConsoleAction");
@@ -98,6 +331,9 @@ void AppTests::guiTests(BitcoinGUI* window)
 void AppTests::consoleTests(RPCConsole* console)
 {
     HandleCallback callback{"consoleTests", *this};
+#ifdef ENABLE_WALLET
+    console->setCurrentWallet(nullptr);
+#endif // ENABLE_WALLET
     TestRpcCommand(console);
 }
 

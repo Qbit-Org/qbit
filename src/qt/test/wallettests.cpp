@@ -9,7 +9,6 @@
 #include <common/p2mr_data_signature.h>
 #include <crypto/pqc.h>
 #include <interfaces/chain.h>
-#include <interfaces/handler.h>
 #include <interfaces/node.h>
 #include <key_io.h>
 #include <node/interface_ui.h>
@@ -26,6 +25,7 @@
 #include <qt/sendcoinsdialog.h>
 #include <qt/sendcoinsentry.h>
 #include <qt/signverifymessagedialog.h>
+#include <qt/test/syntheticwallet.h>
 #include <qt/transactiontablemodel.h>
 #include <qt/transactionview.h>
 #include <qt/walletmodel.h>
@@ -65,6 +65,7 @@
 #include <QPointer>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QSignalSpy>
 #include <QTabWidget>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -536,117 +537,13 @@ public:
         transactionView.setModel(walletModel.get());
     }
 
-};
+    void initModel(std::unique_ptr<interfaces::Wallet> wallet, const PlatformStyle* platformStyle)
+    {
+        walletModel = std::make_unique<WalletModel>(std::move(wallet), *clientModel, platformStyle);
+        sendCoinsDialog.setModel(walletModel.get());
+        transactionView.setModel(walletModel.get());
+    }
 
-class SyntheticPQCReportWallet : public interfaces::Wallet
-{
-public:
-    explicit SyntheticPQCReportWallet(wallet::PQCUsageReport report) : m_report(std::move(report)) {}
-    explicit SyntheticPQCReportWallet(interfaces::P2MRDataSignatureResult result) : m_p2mr_result(std::move(result)) {}
-
-    bool encryptWallet(const SecureString&) override { return false; }
-    bool isCrypted() override { return false; }
-    bool lock() override { return false; }
-    bool unlock(const SecureString&) override { return true; }
-    bool isLocked() override { return false; }
-    bool changeWalletPassphrase(const SecureString&, const SecureString&) override { return false; }
-    void abortRescan() override {}
-    bool backupWallet(const std::string&) override { return false; }
-    std::string getWalletName() override { return "synthetic-pqc-report"; }
-    util::Result<CTxDestination> getNewDestination(const OutputType, const std::string&) override { return CTxDestination{PKHash{}}; }
-    bool getPubKey(const CScript&, const CKeyID&, CPubKey&) override { return false; }
-    SigningResult signMessage(const std::string&, const PKHash&, std::string&) override { return SigningResult::PRIVATE_KEY_NOT_AVAILABLE; }
-    util::Result<interfaces::P2MRDataSignatureResult> signP2MRDataHash(const CTxDestination&, const uint256&) override
-    {
-        if (!m_p2mr_result) return util::Error{Untranslated("P2MR data-hash signing unavailable")};
-        return *m_p2mr_result;
-    }
-    bool isSpendable(const CTxDestination&) override { return false; }
-    bool setAddressBook(const CTxDestination&, const std::string&, const std::optional<wallet::AddressPurpose>&) override { return false; }
-    bool delAddressBook(const CTxDestination&) override { return false; }
-    bool getAddress(const CTxDestination&, std::string*, wallet::AddressPurpose*) override { return false; }
-    std::vector<interfaces::WalletAddress> getAddresses() override { return {}; }
-    std::vector<OutputType> getAvailableAddressTypes() override { return {OutputType::P2MR}; }
-    std::vector<std::string> getAddressReceiveRequests() override { return {}; }
-    bool setAddressReceiveRequest(const CTxDestination&, const std::string&, const std::string&) override { return false; }
-    util::Result<void> displayAddress(const CTxDestination&) override { return {}; }
-    bool lockCoin(const COutPoint&, const bool) override { return false; }
-    bool unlockCoin(const COutPoint&) override { return false; }
-    bool isLockedCoin(const COutPoint&) override { return false; }
-    void listLockedCoins(std::vector<COutPoint>&) override {}
-    util::Result<CTransactionRef> createTransaction(const std::vector<wallet::CRecipient>& recipients,
-        const wallet::CCoinControl&,
-        bool,
-        int& change_pos,
-        CAmount& fee,
-        wallet::PQCUsageReport* pqc_usage,
-        const SigningProgressCallback&) override
-    {
-        CMutableTransaction tx;
-        if (!recipients.empty()) {
-            tx.vout.emplace_back(recipients.front().nAmount, CScript{} << OP_TRUE);
-        }
-        change_pos = -1;
-        fee = 1000;
-        if (pqc_usage) {
-            *pqc_usage = m_report;
-        }
-        return MakeTransactionRef(std::move(tx));
-    }
-    void commitTransaction(CTransactionRef, interfaces::WalletValueMap, interfaces::WalletOrderForm) override {}
-    bool transactionCanBeAbandoned(const Txid&) override { return false; }
-    bool abandonTransaction(const Txid&) override { return false; }
-    bool transactionCanBeBumped(const Txid&) override { return false; }
-    bool createBumpTransaction(const Txid&, const wallet::CCoinControl&, std::vector<bilingual_str>&, CAmount&, CAmount&, CMutableTransaction&) override { return false; }
-    bool signBumpTransaction(CMutableTransaction&) override { return false; }
-    bool commitBumpTransaction(const Txid&, CMutableTransaction&&, std::vector<bilingual_str>&, Txid&) override { return false; }
-    CTransactionRef getTx(const Txid&) override { return {}; }
-    interfaces::WalletTx getWalletTx(const Txid&) override { return {}; }
-    std::set<interfaces::WalletTx> getWalletTxs() override { return {}; }
-    bool tryGetTxStatus(const Txid&, interfaces::WalletTxStatus&, int&, int64_t&) override { return false; }
-    interfaces::WalletTx getWalletTxDetails(const Txid&, interfaces::WalletTxStatus&, interfaces::WalletOrderForm&, bool&, int&) override { return {}; }
-    std::optional<common::PSBTError> fillPSBT(std::optional<int>, bool, bool, size_t*, PartiallySignedTransaction&, bool&, wallet::PQCUsageReport*) override { return std::nullopt; }
-    interfaces::WalletBalances getBalances() override { return {.balance = 50 * COIN}; }
-    bool tryGetBalances(interfaces::WalletBalances& balances, uint256&) override
-    {
-        balances = getBalances();
-        return true;
-    }
-    CAmount getBalance() override { return 50 * COIN; }
-    CAmount getAvailableBalance(const wallet::CCoinControl&) override { return 50 * COIN; }
-    bool txinIsMine(const CTxIn&) override { return false; }
-    bool txoutIsMine(const CTxOut&) override { return false; }
-    CAmount getDebit(const CTxIn&) override { return 0; }
-    CAmount getCredit(const CTxOut&) override { return 0; }
-    CoinsList listCoins() override { return {}; }
-    std::vector<interfaces::WalletTxOut> getCoins(const std::vector<COutPoint>&) override { return {}; }
-    CAmount getRequiredFee(unsigned int) override { return 0; }
-    CAmount getMinimumFee(unsigned int, const wallet::CCoinControl&, int* returned_target, FeeReason* reason) override
-    {
-        if (returned_target) *returned_target = 6;
-        if (reason) *reason = FeeReason::NONE;
-        return 0;
-    }
-    unsigned int getConfirmTarget() override { return 6; }
-    bool hdEnabled() override { return true; }
-    bool canGetAddresses() override { return true; }
-    bool privateKeysDisabled() override { return false; }
-    bool taprootEnabled() override { return false; }
-    bool hasExternalSigner() override { return false; }
-    OutputType getDefaultAddressType() override { return OutputType::P2MR; }
-    CAmount getDefaultMaxTxFee() override { return MAX_MONEY; }
-    wallet::PQCKeyValidationInfo getPQCKeyValidationInfo() const override { return {}; }
-    void remove() override {}
-    std::unique_ptr<interfaces::Handler> handleUnload(UnloadFn) override { return interfaces::MakeCleanupHandler([] {}); }
-    std::unique_ptr<interfaces::Handler> handleShowProgress(ShowProgressFn) override { return interfaces::MakeCleanupHandler([] {}); }
-    std::unique_ptr<interfaces::Handler> handleStatusChanged(StatusChangedFn) override { return interfaces::MakeCleanupHandler([] {}); }
-    std::unique_ptr<interfaces::Handler> handleAddressBookChanged(AddressBookChangedFn) override { return interfaces::MakeCleanupHandler([] {}); }
-    std::unique_ptr<interfaces::Handler> handleTransactionChanged(TransactionChangedFn) override { return interfaces::MakeCleanupHandler([] {}); }
-    std::unique_ptr<interfaces::Handler> handleCanGetAddressesChanged(CanGetAddressesChangedFn) override { return interfaces::MakeCleanupHandler([] {}); }
-
-private:
-    wallet::PQCUsageReport m_report;
-    std::optional<interfaces::P2MRDataSignatureResult> m_p2mr_result;
 };
 
 //! Simple qt wallet tests.
@@ -1100,7 +997,7 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
         .pqc_usage = std::make_shared<const wallet::PQCUsageReport>(retry_report),
     };
 
-    WalletModel proof_wallet_model(std::make_unique<SyntheticPQCReportWallet>(synthetic_result), *mini_gui.clientModel, platformStyle.get());
+    WalletModel proof_wallet_model(qt_test::MakeSyntheticWallet(synthetic_result), *mini_gui.clientModel, platformStyle.get());
     SignVerifyMessageDialog proof_dialog(platformStyle.get(), nullptr);
     proof_dialog.setModel(&proof_wallet_model);
 
@@ -1227,7 +1124,7 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
     });
     synthetic_result.pqc_usage = std::make_shared<const wallet::PQCUsageReport>(single_key_report);
 
-    WalletModel single_key_wallet_model(std::make_unique<SyntheticPQCReportWallet>(synthetic_result), *mini_gui.clientModel, platformStyle.get());
+    WalletModel single_key_wallet_model(qt_test::MakeSyntheticWallet(synthetic_result), *mini_gui.clientModel, platformStyle.get());
     SignVerifyMessageDialog single_key_dialog(platformStyle.get(), nullptr);
     single_key_dialog.setModel(&single_key_wallet_model);
     QValidatedLineEdit* single_key_address = single_key_dialog.findChild<QValidatedLineEdit*>("addressIn_SM");
@@ -1280,7 +1177,7 @@ void TestSendPQCReportPropagation(interfaces::Node& node)
     });
     expected_report.overall_state = wallet::PQCSignatureLimitState::NORMAL;
 
-    WalletModel wallet_model(std::make_unique<SyntheticPQCReportWallet>(expected_report), client_model, platformStyle.get());
+    WalletModel wallet_model(qt_test::MakeSyntheticWallet(expected_report), client_model, platformStyle.get());
     wallet::CCoinControl coin_control;
     coin_control.Select(COutPoint{Txid{}, 0});
 
@@ -1295,6 +1192,92 @@ void TestSendPQCReportPropagation(interfaces::Node& node)
     QCOMPARE(*pqc_usage.overall_state, wallet::PQCSignatureLimitState::NORMAL);
     QCOMPARE(pqc_usage.key_states.front().signature_count, 7U);
     QCOMPARE(pqc_usage.key_states.front().signatures_remaining, PQC_MAX_SIGNATURES - 7);
+}
+
+void TestSendCompletionAfterModelDestruction(interfaces::Node& node)
+{
+    TestChain100Setup test{ChainType::REGTEST, {.extra_args = {"-p2mronly=0"}}};
+    node.setContext(&test.m_node);
+
+    std::unique_ptr<const PlatformStyle> platform_style{PlatformStyle::instantiate("other")};
+    MiniGUI mini_gui{node, platform_style.get()};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    mini_gui.initModel(qt_test::MakeSyntheticWallet(wallet::PQCUsageReport{}, state), platform_style.get());
+    mini_gui.walletModel->pollBalanceChanged();
+
+    SendCoinsDialog& send_dialog{mini_gui.sendCoinsDialog};
+    QVBoxLayout* const entries{send_dialog.findChild<QVBoxLayout*>("entries")};
+    QVERIFY(entries);
+    SendCoinsEntry* const entry{qobject_cast<SendCoinsEntry*>(entries->itemAt(0)->widget())};
+    QVERIFY(entry);
+    entry->findChild<QValidatedLineEdit*>("payTo")->setText(QString::fromStdString(EncodeDestination(PKHash{})));
+    entry->findChild<BitcoinAmountField*>("payAmount")->setValue(COIN);
+    send_dialog.getCoinControl()->Select(COutPoint{Txid{}, 0});
+
+    QSignalSpy coins_sent{&send_dialog, &SendCoinsDialog::coinsSent};
+    QVERIFY(coins_sent.isValid());
+    QVERIFY(QMetaObject::invokeMethod(&send_dialog, "sendButtonClicked", Q_ARG(bool, false)));
+
+    {
+        std::unique_lock lock{state->mutex};
+        QVERIFY(state->condition.wait_for(lock, std::chrono::seconds{5}, [state] {
+            return state->background_clone_destroyed;
+        }));
+        QVERIFY(state->create_entered);
+    }
+
+    QPointer<WalletModel> model_guard{mini_gui.walletModel.get()};
+    mini_gui.walletModel.reset();
+    QVERIFY(model_guard.isNull());
+
+    // The worker destroyed its cloned wallet only after queueing completion.
+    // Deliver that completion while the dialog is alive but its model is gone.
+    QCoreApplication::sendPostedEvents(&send_dialog, QEvent::MetaCall);
+    QCoreApplication::processEvents();
+
+    QCOMPARE(coins_sent.count(), 0);
+    for (QWidget* widget : QApplication::topLevelWidgets()) {
+        QVERIFY(!widget->inherits("SendConfirmationDialog"));
+    }
+}
+
+void TestUnlockContextModelLifetime(interfaces::Node& node)
+{
+    TestChain100Setup test{ChainType::REGTEST, {.extra_args = {"-p2mronly=0"}}};
+    node.setContext(&test.m_node);
+
+    std::unique_ptr<const PlatformStyle> platform_style{PlatformStyle::instantiate("other")};
+    OptionsModel options_model{node};
+    bilingual_str error;
+    QVERIFY(options_model.Init(error));
+    ClientModel client_model{node, &options_model};
+
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    {
+        std::lock_guard lock{state->mutex};
+        state->encrypted = true;
+        state->locked = false;
+    }
+    auto wallet_model{std::make_unique<WalletModel>(
+        qt_test::MakeSyntheticWallet(wallet::PQCUsageReport{}, state),
+        client_model,
+        platform_style.get())};
+
+    auto lock_calls = [state] {
+        std::lock_guard lock{state->mutex};
+        return state->lock_calls;
+    };
+
+    {
+        WalletModel::UnlockContext live_context{wallet_model.get(), /*valid=*/true, /*relock=*/true};
+    }
+    QCOMPARE(lock_calls(), 1);
+
+    auto stale_context{std::make_unique<WalletModel::UnlockContext>(
+        wallet_model.get(), /*valid=*/true, /*relock=*/true)};
+    wallet_model.reset();
+    stale_context.reset();
+    QCOMPARE(lock_calls(), 1);
 }
 
 void TestSendPQCWarningFormatting()
@@ -1366,5 +1349,7 @@ void WalletTests::walletTests()
     TestGUI(m_node);
     TestP2MRReceiveAddressTypes(m_node);
     TestSendPQCReportPropagation(m_node);
+    TestSendCompletionAfterModelDestruction(m_node);
+    TestUnlockContextModelLifetime(m_node);
     TestSendPQCWarningFormatting();
 }

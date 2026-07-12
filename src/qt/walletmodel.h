@@ -16,6 +16,7 @@
 #include <vector>
 
 #include <QObject>
+#include <QPointer>
 
 enum class OutputType;
 
@@ -124,7 +125,7 @@ public:
         UnlockContext& operator=(UnlockContext&&) = delete;
 
     private:
-        WalletModel *wallet;
+        QPointer<WalletModel> wallet;
         bool valid;
         bool relock;
     };

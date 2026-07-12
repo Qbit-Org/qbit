@@ -708,6 +708,15 @@ void SendCoinsDialog::prepareTransactionFinished(uint64_t generation, std::share
 
     clearPrepareProgressDialog();
 
+    if (!model) {
+        m_prepare_cancel_requested = false;
+        m_prepare_counters_reserved = false;
+        fNewRecipientAllowed = true;
+        m_current_transaction.reset();
+        m_prepare_unlock_context.reset();
+        return;
+    }
+
     if (m_prepare_cancel_requested.load() && !counters_reserved) {
         m_prepare_cancel_requested = false;
         m_prepare_counters_reserved = false;

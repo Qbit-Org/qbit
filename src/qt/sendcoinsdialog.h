@@ -88,7 +88,7 @@ private:
 
     Ui::SendCoinsDialog *ui;
     ClientModel* clientModel{nullptr};
-    WalletModel* model{nullptr};
+    QPointer<WalletModel> model;
     std::unique_ptr<wallet::CCoinControl> m_coin_control;
     std::unique_ptr<WalletModelTransaction> m_current_transaction;
     std::unique_ptr<WalletModel::UnlockContext> m_prepare_unlock_context;

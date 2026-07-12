@@ -32,6 +32,7 @@ if(ENABLE_WALLET)
   target_sources(test_bitcoin-qt
     PRIVATE
       addressbooktests.cpp
+      syntheticwallet.cpp
       walletcontrollertests.cpp
       walletactivitytests.cpp
       wallettests.cpp

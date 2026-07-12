@@ -846,10 +846,12 @@ void BitcoinGUI::setCurrentWalletBySelectorIndex(int index)
 
 void BitcoinGUI::removeAllWallets()
 {
-    if(!walletFrame)
-        return;
+    if (!walletFrame) return;
+
     setWalletActionsEnabled(false);
-    walletFrame->removeAllWallets();
+    for (WalletModel* wallet_model : walletFrame->getWalletModels()) {
+        removeWallet(wallet_model);
+    }
 }
 #endif // ENABLE_WALLET
 
