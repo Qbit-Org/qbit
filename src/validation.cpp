@@ -4715,6 +4715,12 @@ bool ChainstateManager::AcceptBlockHeader(const CBlockHeader& block, BlockValida
                 LogDebug(BCLog::VALIDATION, "%s: block %s is marked invalid\n", __func__, hash.ToString());
                 return state.Invalid(BlockValidationResult::BLOCK_CACHED_INVALID, "duplicate-invalid");
             }
+            // AuxPoW is not part of the block hash, so a known header can be
+            // received again with a different payload. Validate the incoming
+            // payload for the indexed height before treating it as equivalent.
+            if (const auto error = auxpow::Validate(block, GetConsensus(), /*check_pow=*/true, auxpow::CommitmentValidationForHeight(GetConsensus(), pindex->nHeight))) {
+                return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, error->reject_reason, error->debug_message);
+            }
             return true;
         }
 
