@@ -359,6 +359,11 @@ void BitcoinApplication::requestShutdown()
     pollShutdownTimer->stop();
 
 #ifdef ENABLE_WALLET
+    // Wallet views own background send workers and temporary unlock contexts
+    // which reference WalletModel objects parented to the wallet controller.
+    // Destroy the views and join their workers before deleting those models.
+    window->removeAllWallets();
+
     // Delete wallet controller here manually, instead of relying on Qt object
     // tracking (https://doc.qt.io/qt-5/objecttrees.html). This makes sure
     // walletmodel m_handle_* notification handlers are deleted before wallets
