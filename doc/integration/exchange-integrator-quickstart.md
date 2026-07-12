@@ -320,6 +320,8 @@ Do not carry these assumptions from Bitcoin Core into a qbit integration:
 
 ## References
 
+- qbit P2MR v1 integration support matrix:
+  `doc/integration/p2mr-v1-support-matrix.md`
 - JSON-RPC interface: `doc/integration/JSON-RPC-interface.md`
 - Canonical RPC reference: `https://docs.qbit.org/`
 - RPC delta and migration notes: `doc/integration/rpc-delta-reference.md`

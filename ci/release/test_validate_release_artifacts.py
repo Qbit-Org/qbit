@@ -309,6 +309,15 @@ class ValidateReleaseArtifactsTest(unittest.TestCase):
             capture_output=True,
             text=True,
         )
+        # The fixture signs its release tag explicitly below. Keep the setup
+        # commit independent of a developer's global commit.gpgsign setting.
+        subprocess.run(
+            [GIT, "config", "commit.gpgsign", "false"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
         (repo / "README.md").write_text("qbit\n", encoding="utf8")
         subprocess.run([GIT, "add", "README.md"], cwd=repo, check=True, capture_output=True, text=True)
         subprocess.run(
@@ -718,6 +727,51 @@ class ReleaseWorkflowBoundaryTest(unittest.TestCase):
         self.assertNotIn("github.rest", validator_source)
         self.assertNotIn("gh api", validator_source)
         self.assertNotIn("GITHUB_TOKEN", validator_source)
+
+    def test_p2mr_conformance_gate_stays_before_artifacts_and_publication(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf8")
+        p2mr_step_start = workflow.index(
+            "- name: Validate qbit P2MR v1 release conformance"
+        )
+        artifact_step_start = workflow.index(
+            "- name: Validate staged artifacts and release signatures"
+        )
+        publication_step_start = workflow.index(
+            "- name: Create or update GitHub Release"
+        )
+        p2mr_step = workflow[p2mr_step_start:artifact_step_start]
+
+        self.assertLess(p2mr_step_start, artifact_step_start)
+        self.assertLess(p2mr_step_start, publication_step_start)
+        for input_name in (
+            "p2mr_v1_conformance_evidence",
+            "p2mr_v1_oracle_report",
+            "p2mr_v1_integration_matrix",
+        ):
+            self.assertIn(input_name, workflow)
+            self.assertIn(f"[{input_name}]", p2mr_step)
+        self.assertIn(
+            'echo "${input_name} must be an absolute path on the self-hosted runner"',
+            p2mr_step,
+        )
+        self.assertIn("inputs.release_line == 'mainnet'", p2mr_step)
+        self.assertIn(
+            '"ci/release/verify_p2mr_v1_conformance.py"',
+            workflow,
+        )
+        self.assertIn(
+            'python3 "${TRUSTED_ROOT}/ci/release/verify_p2mr_v1_conformance.py"',
+            p2mr_step,
+        )
+        self.assertIn('--source-root "${SOURCE_ROOT}"', p2mr_step)
+        self.assertIn('--release-tag "${TAG_NAME}"', p2mr_step)
+        self.assertIn('--github-output "${GITHUB_OUTPUT}"', p2mr_step)
+        self.assertIn(
+            "TARGET_COMMITISH: ${{ steps.tag.outputs.target_commitish }}",
+            p2mr_step,
+        )
+        self.assertNotIn("action-gh-release", p2mr_step)
+        self.assertIn("P2MR corpus manifest SHA256", workflow)
 
     @unittest.skipUnless(
         PUBLISH_LOCAL.is_file(),

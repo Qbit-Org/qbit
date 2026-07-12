@@ -396,6 +396,10 @@ qbit-cli <chain option> getnetworkhashps 120 -1 auxpow
 
 ## Launch Readiness Caveats
 
+- Record the exact pool/miner version, qbit P2MR v1 corpus digest, environment,
+  result, and public evidence in the
+  [integration support matrix](p2mr-v1-support-matrix.md). RPC-shape
+  compatibility alone is not a passing result.
 - Do not publish stale examples using `bc1...`, `bech32`, or Bitcoin Core address assumptions for qbit coinbase outputs.
 - Public-chain qbit payouts should be P2MR. Regtest can be less restrictive unless `-p2mronly=1` is enabled.
 - Public docs should rely only on qbit-owned public mining setup inputs.

@@ -21,6 +21,9 @@ announcements define official qbit networks.
 - [Exchange and Integrator Quickstart](exchange-integrator-quickstart.md)
 - [Mining and Pool Quickstart](mining-pool-quickstart.md)
 - [RPC Delta and Migration Notes](rpc-delta-reference.md)
+- [qbit P2MR v1 Integration Support Matrix](p2mr-v1-support-matrix.md) —
+  current public inventory and exact-release evidence requirements. The
+  checked-in matrix is intentionally a blocking draft, not mainnet signoff.
 
 ## Interface References
 

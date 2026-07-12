@@ -5,6 +5,13 @@ and binary artifacts.
 
 For the normal public release process, see [release-process.md](release-process.md).
 
+The release process includes the fail-closed qbit P2MR v1 mainnet gate. The
+[evidence JSON](examples/p2mr-v1-conformance-evidence.json) is a field example
+only: its zero hashes and `example.invalid` references deliberately cannot
+validate. The checked-in [integration support
+matrix](../integration/p2mr-v1-support-matrix.md) is likewise a draft until a
+final external snapshot is completed for an exact signed release tag target.
+
 For release binaries:
 
 - download artifacts from the matching qbit GitHub Release

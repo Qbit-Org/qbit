@@ -24,6 +24,21 @@ on:
         required: false
         default: ''
         type: string
+      p2mr_v1_conformance_evidence:
+        description: Absolute path on the self-hosted runner to the qbit P2MR v1 release evidence envelope; required for mainnet
+        required: false
+        default: ''
+        type: string
+      p2mr_v1_oracle_report:
+        description: Absolute path on the self-hosted runner to the canonical qbit P2MR v1 oracle report bound by the evidence envelope
+        required: false
+        default: ''
+        type: string
+      p2mr_v1_integration_matrix:
+        description: Absolute path on the self-hosted runner to the finalized qbit P2MR v1 integration inventory bound by the evidence envelope
+        required: false
+        default: ''
+        type: string
       notes_file:
         description: Optional release notes file path. Relative paths are resolved from the repository checkout; absolute paths are used as-is
         required: false
@@ -227,6 +242,7 @@ jobs:
             "ci/release/validate_builder_attestations.py"
             "ci/release/validate_key_metadata.py"
             "ci/release/verify_testnet_release_posture.py"
+            "ci/release/verify_p2mr_v1_conformance.py"
             "contrib/keys/operator-keys/keys.json"
           )
           for required_path in "${required_paths[@]}"; do
@@ -320,6 +336,59 @@ jobs:
             echo "has_notes=true"
             echo "path=${notes_path}"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Validate qbit P2MR v1 release conformance
+        id: p2mr
+        if: inputs.release_line == 'mainnet' || inputs.p2mr_v1_conformance_evidence != '' || inputs.p2mr_v1_oracle_report != '' || inputs.p2mr_v1_integration_matrix != ''
+        env:
+          P2MR_V1_CONFORMANCE_EVIDENCE: ${{ inputs.p2mr_v1_conformance_evidence }}
+          P2MR_V1_INTEGRATION_MATRIX: ${{ inputs.p2mr_v1_integration_matrix }}
+          P2MR_V1_ORACLE_REPORT: ${{ inputs.p2mr_v1_oracle_report }}
+          SOURCE_ROOT: ${{ github.workspace }}
+          TAG_NAME: ${{ steps.tag.outputs.tag }}
+          TARGET_COMMITISH: ${{ steps.tag.outputs.target_commitish }}
+          TRUSTED_ROOT: ${{ steps.trusted.outputs.root }}
+        run: |
+          set -euo pipefail
+
+          declare -A inputs=(
+            [p2mr_v1_conformance_evidence]="${P2MR_V1_CONFORMANCE_EVIDENCE}"
+            [p2mr_v1_oracle_report]="${P2MR_V1_ORACLE_REPORT}"
+            [p2mr_v1_integration_matrix]="${P2MR_V1_INTEGRATION_MATRIX}"
+          )
+          for input_name in "${!inputs[@]}"; do
+            input_path="${inputs[${input_name}]}"
+            if [[ -z "${input_path}" ]]; then
+              echo "${input_name} is required when any qbit P2MR v1 evidence is supplied and is always required for mainnet" >&2
+              exit 1
+            fi
+            if [[ "${input_path}" != /* ]]; then
+              echo "${input_name} must be an absolute path on the self-hosted runner" >&2
+              exit 1
+            fi
+            if [[ ! -f "${input_path}" ]]; then
+              echo "Missing ${input_name} file" >&2
+              exit 1
+            fi
+          done
+
+          python3 "${TRUSTED_ROOT}/ci/release/verify_p2mr_v1_conformance.py" \
+            --evidence "${P2MR_V1_CONFORMANCE_EVIDENCE}" \
+            --source-root "${SOURCE_ROOT}" \
+            --release-tag "${TAG_NAME}" \
+            --oracle-report "${P2MR_V1_ORACLE_REPORT}" \
+            --integration-matrix "${P2MR_V1_INTEGRATION_MATRIX}" \
+            --github-output "${GITHUB_OUTPUT}"
+
+          {
+            echo "## qbit P2MR v1 Conformance"
+            echo ""
+            echo "- Release source commit: \`${TARGET_COMMITISH}\`"
+            echo "- Profile: \`$(awk -F= '$1 == "profile" { print $2 }' "${GITHUB_OUTPUT}" | tail -n 1)\`"
+            echo "- Corpus manifest SHA256: \`$(awk -F= '$1 == "manifest_sha256" { print $2 }' "${GITHUB_OUTPUT}" | tail -n 1)\`"
+            echo "- Oracle case count: \`$(awk -F= '$1 == "case_count" { print $2 }' "${GITHUB_OUTPUT}" | tail -n 1)\`"
+            echo "- Integration matrix SHA256: \`$(awk -F= '$1 == "integration_matrix_sha256" { print $2 }' "${GITHUB_OUTPUT}" | tail -n 1)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Validate testnet release posture evidence
         if: inputs.release_line == 'testnet'
@@ -494,6 +563,10 @@ jobs:
           KEYS_JSON_SHA256: ${{ steps.artifacts.outputs.keys_json_sha256 || steps.trusted_keys.outputs.keys_json_sha256 }}
           MAKE_LATEST: ${{ inputs.make_latest }}
           PHOTON_ARTIFACT_COUNT: ${{ steps.artifacts.outputs.photon_artifact_count }}
+          P2MR_CASE_COUNT: ${{ steps.p2mr.outputs.case_count || 'n/a' }}
+          P2MR_INTEGRATION_MATRIX_SHA256: ${{ steps.p2mr.outputs.integration_matrix_sha256 || 'n/a' }}
+          P2MR_MANIFEST_SHA256: ${{ steps.p2mr.outputs.manifest_sha256 || 'n/a' }}
+          P2MR_PROFILE: ${{ steps.p2mr.outputs.profile || 'not-claimed' }}
           PRERELEASE: ${{ inputs.prerelease }}
           RELEASE_SIGNER_COUNT: ${{ steps.artifacts.outputs.release_signer_count }}
           RELEASE_SIGNATURE_ALIASES: ${{ steps.artifacts.outputs.release_signature_aliases }}
@@ -522,6 +595,10 @@ jobs:
             echo "- Manifested artifacts: \`${ARTIFACT_COUNT}\`"
             echo "- Core artifacts: \`${CORE_ARTIFACT_COUNT}\`"
             echo "- PHOTON artifacts: \`${PHOTON_ARTIFACT_COUNT}\`"
+            echo "- P2MR conformance profile: \`${P2MR_PROFILE}\`"
+            echo "- P2MR corpus manifest SHA256: \`${P2MR_MANIFEST_SHA256}\`"
+            echo "- P2MR oracle case count: \`${P2MR_CASE_COUNT}\`"
+            echo "- P2MR integration matrix SHA256: \`${P2MR_INTEGRATION_MATRIX_SHA256}\`"
             echo "- Release line: \`${RELEASE_LINE}\`"
             echo "- keys.json SHA256: \`${KEYS_JSON_SHA256}\`"
             echo "- Active release signers: \`${RELEASE_SIGNER_COUNT}\`"

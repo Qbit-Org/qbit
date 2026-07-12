@@ -497,6 +497,21 @@ initial reference implementation, and the pinned ancestry comparison. The
 qbit unit suites and the standalone oracle under
 `contrib/testgen/p2mr_v1_oracle/` consume that corpus independently.
 
+Release conformance is stricter than a development-branch test result. The
+release validator binds the manifest, every listed corpus file, the canonical
+oracle report, qbit test result, consensus review, and finalized integration
+inventory to the exact signed tag target. The public
+[integration support matrix](../integration/p2mr-v1-support-matrix.md) is the
+human view of the machine inventory. Its checked-in `draft` status is not
+release evidence and cannot satisfy the mainnet publication gate.
+
+A release claiming `qbit-p2mr-v1` conformance MUST identify its exact reviewed
+source commit, specification version, corpus manifest digest, qbit result,
+independent oracle report digest, and integration inventory digest. If an
+implementation/specification contradiction is found, the discrepancy MUST be
+recorded and reviewed. It MUST NOT be resolved by silently changing version 1
+transaction validity.
+
 ## Ancestry reference
 
 The non-normative ancestor used for historical comparison is
