@@ -7,7 +7,7 @@ qbit is based on Bitcoin Core v30.2, but it is not a Bitcoin network with differ
 - qbit has its own network identity, ports, address HRPs, payment URI scheme, genesis blocks, and chain parameters. Any concrete genesis hash in pre-launch documentation should be treated as a placeholder until the launch specification freezes it.
 - Mainnet is not public or launched yet. Official public testnet release artifacts are for testnet4; no-flag mainnet commands are future-mainnet guidance only.
 - Public qbit launch chains are P2MR-only for spendable outputs. Do not expect legacy, P2SH-SegWit, native SegWit v0, or Taproot receive/change outputs to work as user payment outputs.
-- qbit's live authorization path uses P2MR script-path spends with `OP_CHECKSIGPQC` and bounded `SLH-DSA-SHA2-128s` signatures, not secp256k1 ECDSA or BIP340 Schnorr signatures.
+- qbit's live authorization path uses P2MR script-path spends with `OP_CHECKSIGPQC` and `SLH-DSA-SHA2-128s-bounded30` signatures, not secp256k1 ECDSA or BIP340 Schnorr signatures.
 - qbit has no witness discount. A 3,680-byte PQC signature counts at full weight.
 - qbit uses ASERT difficulty adjustment and Cadence mining lanes instead of Bitcoin's 2016-block retarget.
 - qbit keeps full witness history by default. Witness pruning is an explicit opt-in mode.
@@ -65,7 +65,12 @@ qbit also uses a clean-chain posture: major inherited consensus deployments are 
 
 ## P2MR and SLH-DSA
 
-qbit's live spendable output model is P2MR, Pay to Merkle Root. A P2MR output is a witness v2 output whose 32-byte witness program is the Merkle root of a script tree.
+qbit's live spendable output model is qbit P2MR v1, Pay to Merkle Root. A
+P2MR output is a witness v2 output whose 32-byte witness program is the Merkle
+root of a script tree. The normative byte-level rules are in the
+[qbit P2MR v1 Consensus Profile](../consensus/p2mr-v1.md). qbit P2MR v1 is not
+compatible with the ancestry profile pinned there; integrations must not
+substitute its commitment, depth-zero, opcode, or sighash behavior.
 
 P2MR resembles Taproot/Tapscript in some implementation structure, but it is not Taproot:
 
@@ -88,7 +93,8 @@ The active signature profile is bounded `SLH-DSA-SHA2-128s`:
 | PQC public key | 32 bytes |
 | PQC secret key | 64 bytes |
 | PQC signature | 3,680 bytes |
-| P2MR v1 signature algorithm byte | `0x01` for the current SLH-DSA/SPHINCS+ path |
+| P2MR v1 signature algorithm selector | None; the active leaf/opcode selects the fixed profile |
+| Optional transaction-signature suffix | A nonzero sighash byte; `0x01` means `SIGHASH_ALL` |
 | P2MR leaf version | `0xc0` |
 
 ### P2MR Data-Signature Opcodes

@@ -2098,7 +2098,7 @@ enum class ParseScriptContext {
     P2WPKH,  //!< Inside wpkh() (no script, pubkey only)
     P2WSH,   //!< Inside wsh() (script becomes v0 witness script)
     P2TR,    //!< Inside tr() (either internal key, or BIP342 script leaf)
-    P2MR,    //!< Inside mr() (BIP-360 P2MR v1 script leaf)
+    P2MR,    //!< Inside mr() (qbit P2MR v1 script leaf)
     MUSIG,   //!< Inside musig() (implies P2TR, cannot have nested musig())
 };
 

@@ -19,6 +19,7 @@ Primary User Docs
 - [Wallets, P2MR Addresses, and Backups](user/wallet/p2mr-wallets.md)
 - [P2MR Watch-Only Pubkey Database Guide](user/wallet/p2mr-pubkeydb.md)
 - [P2MR Multisig](user/wallet/p2mr-multisig.md)
+- [qbit P2MR v1 Consensus Profile](consensus/p2mr-v1.md)
 - [qbit.conf Configuration File](user/setup/bitcoin-conf.md)
 - [Files](user/setup/files.md)
 

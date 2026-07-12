@@ -15,6 +15,9 @@ announcements define official qbit networks.
 
 ## qbit Integration Guides
 
+- [qbit P2MR v1 Consensus Profile](../consensus/p2mr-v1.md) — normative
+  commitment, witness, script, signature, and resource rules, including the
+  incompatibilities with its pinned ancestry profile.
 - [Exchange and Integrator Quickstart](exchange-integrator-quickstart.md)
 - [Mining and Pool Quickstart](mining-pool-quickstart.md)
 - [RPC Delta and Migration Notes](rpc-delta-reference.md)

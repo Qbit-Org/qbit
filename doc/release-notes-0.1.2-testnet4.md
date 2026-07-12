@@ -136,6 +136,10 @@ Notable changes
 
 ### P2MR descriptors and future leaves
 
+- Published the normative [qbit P2MR v1 consensus profile](consensus/p2mr-v1.md),
+  which freezes the implemented commitment, depth-zero execution, sighash,
+  opcode, PQC, and resource rules and documents the intentional incompatibility
+  with its pinned ancestry profile. Existing transaction validity is unchanged.
 - Added an end-to-end `feature_p2mr.py` regression for `rawmr(<future-leaf-root>)`
   outputs.
 - Covered public descriptor derivation, wallet funding, signer refusal for a

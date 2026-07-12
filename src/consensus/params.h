@@ -117,7 +117,7 @@ struct Params {
      * Note that segwit v0 script rules are enforced on all blocks except the
      * BIP 16 exception blocks. */
     int SegwitHeight;
-    /** Block height at which P2MR (BIP360) script-path validation rules become active. */
+    /** Block height at which qbit P2MR v1 script-path validation rules become active. */
     int P2MRHeight{0};
     /** Block height at which restricted-output mode also accepts the reserved outer witness namespace (v3..v16); set to 0 for a launch baseline, or max int to keep it inactive. */
     int nOuterReservedWitnessHeight{std::numeric_limits<int>::max()};

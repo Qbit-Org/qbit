@@ -15,6 +15,11 @@ The qbit mining RPC surface is implemented in qbit Core. This guide documents
 the qbit protocol and node requirements directly; do not assume generic Bitcoin
 pool examples are valid for qbit without the checks below.
 
+Pools or template processors that inspect, construct, or independently validate
+P2MR spends must implement the normative
+[qbit P2MR v1 Consensus Profile](../consensus/p2mr-v1.md). It is not compatible
+with the ancestry profile pinned there.
+
 ## What changes from Bitcoin Core
 
 qbit mining has two block classes:

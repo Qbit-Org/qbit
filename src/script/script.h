@@ -68,7 +68,7 @@ static constexpr unsigned int ANNEX_TAG = 0x50;
 // Validation weight per passing signature (Tapscript only, see BIP 342).
 static constexpr int64_t VALIDATION_WEIGHT_PER_SIGOP_PASSED{50};
 
-// Validation weight per passing PQC signature (P2MR only, see BIP-360).
+// Validation weight per passing PQC signature (qbit P2MR v1 only).
 // Derived from PQC_SIG_SIZE (3680) + VALIDATION_WEIGHT_OFFSET (50).
 // Keep this <= the minimal single-leaf P2MR witness budget so one valid sigop can succeed.
 static constexpr int64_t VALIDATION_WEIGHT_PER_SIGOP_PQC{3730};
@@ -300,7 +300,7 @@ enum opcodetype
     OP_NOP2 = OP_CHECKLOCKTIMEVERIFY,
     OP_CHECKSEQUENCEVERIFY = 0xb2,
     OP_NOP3 = OP_CHECKSEQUENCEVERIFY,
-    OP_CHECKSIGPQC = 0xb3, // P2MR-only post-quantum signature verification (bounded SPHINCS+); see BIP-360
+    OP_CHECKSIGPQC = 0xb3, // qbit P2MR v1 post-quantum signature verification (bounded SLH-DSA)
     OP_NOP5 = 0xb4,
     OP_NOP6 = 0xb5,
     OP_NOP7 = 0xb6,

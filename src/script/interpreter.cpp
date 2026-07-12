@@ -1782,7 +1782,7 @@ static bool SignatureHashSchnorrCommon(uint256& hash_out, ScriptExecutionData& e
         ss << execdata.m_output_hash.value();
     }
 
-    // Additional data for BIP 342 / BIP-360 signatures
+    // Additional data for BIP 342 Tapscript or qbit P2MR v1 signatures
     if (sigversion == SigVersion::TAPSCRIPT || sigversion == SigVersion::P2MR) {
         assert(execdata.m_tapleaf_hash_init);
         ss << execdata.m_tapleaf_hash;
@@ -2159,7 +2159,7 @@ static bool ExecuteWitnessScript(const std::span<const valtype>& stack_span, con
     }
 
     // Disallow stack item size > MAX_SCRIPT_ELEMENT_SIZE in witness stack.
-    // P2MR (BIP-360) lifts this limit to accommodate PQC signatures (3680 bytes);
+    // qbit P2MR v1 lifts this limit to accommodate PQC signatures (3680 bytes);
     // resource usage is bounded by the per-input validation weight budget instead.
     if (sigversion != SigVersion::P2MR) {
         for (const valtype& elem : stack) {
@@ -2343,7 +2343,7 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
             return set_success(serror);
         }
     } else if (witversion == 2 && program.size() == WITNESS_V2_P2MR_SIZE && !is_p2sh) {
-        // BIP-360 P2MR: 32-byte witness v2 program (Merkle root of script tree)
+        // qbit P2MR v1: 32-byte witness v2 program (Merkle root of script tree)
         if (!(flags & SCRIPT_VERIFY_P2MR_RULES)) return set_success(serror);
         if (stack.size() == 0) return set_error(serror, SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY);
 
@@ -2371,7 +2371,7 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
             return set_error(serror, SCRIPT_ERR_P2MR_WRONG_CONTROL_SIZE);
         }
 
-        // Verify control byte bit 0 is 1 (BIP-360 requirement)
+        // Verify the qbit P2MR v1 control-byte marker (bit 0 is 1).
         if ((control[0] & 0x01) != 1) {
             return set_error(serror, SCRIPT_ERR_P2MR_CONTROL_BIT0);
         }

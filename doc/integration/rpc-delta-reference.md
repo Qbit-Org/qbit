@@ -11,6 +11,7 @@ method arguments, result schemas, examples, and command semantics.
 - Canonical RPC reference: [docs.qbit.org](https://docs.qbit.org/)
 - Generated RPC documentation assets: `doc/rpc/`
 - qbit protocol overview: [What Changed From Bitcoin Core](../user/bitcoin-core-differences.md)
+- normative P2MR rules: [qbit P2MR v1 Consensus Profile](../consensus/p2mr-v1.md)
 - Exchange and integrator quickstart: [Exchange and Integrator Quickstart](exchange-integrator-quickstart.md)
 - Full-validation and archive bootstrap guide: [Full-Validation Bootstrap](../user/full-validation-bootstrap.md)
 - P2MR watch-only pubkey database guide: [P2MR Watch-Only Pubkey Database Guide](../user/wallet/p2mr-pubkeydb.md)
@@ -36,6 +37,11 @@ than older Bitcoin Core assumptions. Future mainnet launch values include
 witness pruning via `-prunewitnesses=1`. Current official public testnet
 release artifacts are for testnet4; use `-testnet4` or `-chain=testnet4` in
 testnet examples.
+
+RPC clients that construct or independently inspect P2MR commitments and
+signatures must use qbit P2MR v1, not the ancestry profile pinned in its
+specification. In particular, a trailing transaction-signature byte is a
+sighash type; there is no witness algorithm selector.
 
 ## qbit-Only RPCs
 
