@@ -57,6 +57,13 @@ function(add_libbitcoinpqc subdir)
   target_compile_definitions(bitcoinpqc PRIVATE
     SPX_PRODUCTION_BUILD=1
   )
+  # CMake emits target definitions before CMAKE_C_FLAGS. Repeat the policy as
+  # a target option so an injected -U cannot cancel production mode before
+  # opt_flags.h evaluates the mutual-exclusion check.
+  target_compile_options(bitcoinpqc PRIVATE
+    "$<$<C_COMPILER_ID:MSVC>:/DSPX_PRODUCTION_BUILD=1>"
+    "$<$<NOT:$<C_COMPILER_ID:MSVC>>:-DSPX_PRODUCTION_BUILD=1>"
+  )
 
   # Keep this subtree out of "all" unless linked.
   set_target_properties(bitcoinpqc PROPERTIES

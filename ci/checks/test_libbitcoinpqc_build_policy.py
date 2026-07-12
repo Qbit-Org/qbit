@@ -164,6 +164,23 @@ class LibbitcoinpqcBuildPolicyTest(unittest.TestCase):
             combined,
         )
 
+    def test_compiler_flag_undefinition_cannot_enable_runtime_controls(self) -> None:
+        configured = self.cmake_configure(
+            "compiler-undefinition",
+            "-DCMAKE_C_FLAGS=-USPX_PRODUCTION_BUILD "
+            "-DSPX_ENABLE_TEST_BENCH_ENV_KNOBS=1",
+        )
+        self.assertEqual(configured.returncode, 0, configured.stdout + configured.stderr)
+
+        built = self.cmake_build("compiler-undefinition")
+        combined = built.stdout + built.stderr
+        self.assertNotEqual(built.returncode, 0, combined)
+        self.assertIn(
+            "SPX_PRODUCTION_BUILD cannot be combined with "
+            "SPX_ENABLE_TEST_BENCH_ENV_KNOBS",
+            combined,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
