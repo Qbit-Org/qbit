@@ -152,6 +152,7 @@ class BlockchainTest(BitcoinTestFramework):
             'headers',
             'initialblockdownload',
             'mediantime',
+            'p2mr_validation_weight',
             'pruned',
             'size_on_disk',
             'target',
@@ -163,6 +164,14 @@ class BlockchainTest(BitcoinTestFramework):
 
         assert_equal(res['time'], TIME_RANGE_END - TIME_RANGE_STEP)
         assert_equal(res['mediantime'], TIME_RANGE_MTP)
+        assert_equal(res['p2mr_validation_weight'], {
+            'legacy_per_sigop': 3730,
+            'v2_per_sigop': 3683,
+            'activation_height': 0,
+            'active_for_tip': True,
+            'active_for_next_block': True,
+            'blocks_remaining': 0,
+        })
 
         # result should have these additional pruning keys if manual pruning is enabled
         assert_equal(sorted(res.keys()), sorted(['pruneheight', 'automatic_pruning'] + keys))
