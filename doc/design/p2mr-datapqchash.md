@@ -90,7 +90,10 @@ the signer status continues to show the overall usage state, single-key
 remaining budget, and any threshold or reminder warnings. Counts, limits,
 warnings, and keys observed during retry attempts are not part of the proof
 JSON. Proofs created by older qbit-qt versions can contain those additional
-fields; both Qt and RPC verification continue to accept them.
+fields. Qt accepts them when the complete proof document is at most 32,768
+characters, while RPC verification continues to accept them. For larger legacy
+exports, remove wallet-local usage fields before importing the proof into
+qbit-qt.
 
 ## Verification Flow
 
