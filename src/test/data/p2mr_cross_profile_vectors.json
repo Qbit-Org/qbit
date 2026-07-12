@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "profile": "qbit-p2mr-v1",
+  "profile_version": 1,
+  "comparison_profile": {
+    "name": "BIP-360",
+    "version": "0.12.0",
+    "commit": "6740c533e8dce4e912f17ee85a6f627644e1b783",
+    "normative": false
+  },
+  "vectors": [
+    {
+      "id": "pinned-bip-root-rejected-by-qbit",
+      "name": "Pinned BIP-360 root is not a qbit P2MR v1 commitment",
+      "comparison_scope": "full-pinned-profile",
+      "leaf_version": "c0",
+      "leaf_script": "00",
+      "control_block": "c1",
+      "tapleaf_root": "e7e4d593fcb72926eedbe0d1e311f41acd6f6ef161dcba081a75168ec4dcd379",
+      "p2mr_leaf_root": "fae97225114b26d9ef3e3bea70f90d08fec30d9833c50b23e4a6cf8c33e6b200",
+      "scriptPubKey": "5220e7e4d593fcb72926eedbe0d1e311f41acd6f6ef161dcba081a75168ec4dcd379",
+      "witness": ["00", "c1"],
+      "expected": {
+        "pinned_bip_360": {"accepted": true, "stage": "depth-zero-shortcut", "error": "SCRIPT_ERR_OK"},
+        "qbit_p2mr_v1": {"accepted": false, "stage": "commitment", "error": "SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH"}
+      }
+    },
+    {
+      "id": "qbit-root-executes-depth-zero-script",
+      "name": "qbit P2MR v1 executes a matching depth-zero OP_0 leaf",
+      "comparison_scope": "isolated-depth-zero-rule-with-qbit-tags",
+      "leaf_version": "c0",
+      "leaf_script": "00",
+      "control_block": "c1",
+      "tapleaf_root": "e7e4d593fcb72926eedbe0d1e311f41acd6f6ef161dcba081a75168ec4dcd379",
+      "p2mr_leaf_root": "fae97225114b26d9ef3e3bea70f90d08fec30d9833c50b23e4a6cf8c33e6b200",
+      "scriptPubKey": "5220fae97225114b26d9ef3e3bea70f90d08fec30d9833c50b23e4a6cf8c33e6b200",
+      "witness": ["00", "c1"],
+      "expected": {
+        "bip_style_depth_zero_with_qbit_tags": {"accepted": true, "stage": "depth-zero-shortcut", "error": "SCRIPT_ERR_OK"},
+        "qbit_p2mr_v1": {"accepted": false, "stage": "script-execution", "error": "SCRIPT_ERR_EVAL_FALSE"}
+      }
+    }
+  ]
+}

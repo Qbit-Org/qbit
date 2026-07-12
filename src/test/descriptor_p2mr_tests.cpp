@@ -275,9 +275,13 @@ BOOST_AUTO_TEST_CASE(rawmr_independent_p2mr_vectors)
     UniValue tests;
     BOOST_REQUIRE(tests.read(json_tests::p2mr_vectors));
     BOOST_REQUIRE(tests.isObject());
-    BOOST_CHECK_EQUAL(tests["version"].getInt<int>(), 1);
+    BOOST_CHECK_EQUAL(tests["schema_version"].getInt<int>(), 1);
+    BOOST_CHECK_EQUAL(tests["profile"].get_str(), "qbit-p2mr-v1");
+    BOOST_CHECK_EQUAL(tests["profile_version"].getInt<int>(), 1);
 
     for (const auto& vec : tests["valid"].getValues()) {
+        BOOST_CHECK_EQUAL(vec["id"].get_str(), vec["name"].get_str());
+        BOOST_CHECK(vec["expected"]["accepted"].get_bool());
         const std::string root{vec["merkle_root"].get_str()};
         const std::string desc{"rawmr(" + root + ")"};
         FlatSigningProvider provider;
