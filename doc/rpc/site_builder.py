@@ -376,6 +376,7 @@ def build_site_model(
     summary = build_summary(methods)
     return {
         "schema_version": SCHEMA_VERSION,
+        "project_version": manifest["project_version"],
         "baseline": baseline_label,
         "summary": summary,
         "change_pages": build_change_page_entries(methods, baseline_label),
@@ -863,6 +864,8 @@ def write_mkdocs_config(site_model: dict[str, Any], out_dir: str | Path) -> Path
             base_config,
             f"docs_dir: {json.dumps(str(source_root / 'docs'))}",
             f"site_dir: {json.dumps(str(out_path.resolve()))}",
+            "extra:",
+            f"  version: {json.dumps(site_model['project_version'])}",
             "strict: true",
             *nav_lines,
             "",

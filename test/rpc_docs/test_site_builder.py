@@ -8,6 +8,7 @@ from __future__ import annotations
 import copy
 import importlib.util
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -29,6 +30,9 @@ SITE_BUILDER_SPEC.loader.exec_module(site_builder)
 FIXTURE_MANIFEST = DOC_RPC_DIR / "fixtures" / "rpc-docs-v1.sample.json"
 BASELINE_MANIFEST = DOC_RPC_DIR / "baselines" / "v30.2" / "rpc-docs.json"
 OVERLAY_FILE = DOC_RPC_DIR / "annotations" / "v30.2-delta.yml"
+MKDOCS_AVAILABLE = (
+    shutil.which("mkdocs") is not None or importlib.util.find_spec("mkdocs") is not None
+)
 
 
 def make_method(name: str, category: str, component: str, summary: str) -> dict:
@@ -239,6 +243,7 @@ class SiteBuilderTest(unittest.TestCase):
         methods = {method["name"]: method for method in site_model["methods"]}
         categories = {entry["name"]: entry["counts"] for entry in site_model["categories"]}
 
+        self.assertEqual(site_model["project_version"], "test")
         self.assertEqual(methods["getwalletinfo"]["status"], site_builder.STATUS_UNCHANGED)
         self.assertIn("Wallet", methods["getwalletinfo"]["badges"])
         self.assertEqual(
@@ -346,6 +351,27 @@ class SiteBuilderTest(unittest.TestCase):
         self.assertIn('util&lt;script&gt; / core&quot;&amp;', html)
         self.assertNotIn("<script>", html)
 
+    def test_mkdocs_config_includes_version_and_full_logo(self) -> None:
+        manifest = site_builder.load_manifest(FIXTURE_MANIFEST)
+        baseline = site_builder.load_manifest(BASELINE_MANIFEST)
+        overlay = site_builder.load_overlay(
+            OVERLAY_FILE, set(site_builder.manifest_method_index(manifest))
+        )
+        site_model = site_builder.build_site_model(manifest, baseline, overlay)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_dir = Path(tmpdir) / "rpc-site"
+            site_builder.render_markdown_site(site_model, out_dir)
+            config_path = site_builder.write_mkdocs_config(site_model, out_dir)
+            assets_dir = site_builder.copy_site_assets(out_dir)
+            config_text = config_path.read_text(encoding="utf-8")
+
+            self.assertIn("logo: assets/logo-full.svg", config_text)
+            self.assertIn("favicon: assets/qbit.svg", config_text)
+            self.assertIn('version: "v30.2-qbit-sample"', config_text)
+            self.assertTrue((assets_dir / "logo-full.svg").exists())
+
+    @unittest.skipUnless(MKDOCS_AVAILABLE, "MkDocs is required to generate HTML")
     def test_build_site_cli_generates_html_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             out_dir = Path("rpc-site")
@@ -374,9 +400,13 @@ class SiteBuilderTest(unittest.TestCase):
             )
             self.assertTrue((Path(tmpdir) / out_dir / "index.html").exists())
             self.assertTrue((Path(tmpdir) / out_dir / "assets" / "qbit.svg").exists())
+            self.assertTrue(
+                (Path(tmpdir) / out_dir / "assets" / "logo-full.svg").exists()
+            )
             site_model_path = Path(tmpdir) / "rpc" / "site-model.json"
             self.assertTrue(site_model_path.exists())
-            self.assertTrue((Path(tmpdir) / "rpc-site-src" / "mkdocs.yml").exists())
+            config_path = Path(tmpdir) / "rpc-site-src" / "mkdocs.yml"
+            self.assertTrue(config_path.exists())
             self.assertTrue(
                 (Path(tmpdir) / "rpc-site-src" / "docs" / "new-since-v30.2.md").exists()
             )
@@ -397,6 +427,10 @@ class SiteBuilderTest(unittest.TestCase):
                 ).exists()
             )
             site_model_text = site_model_path.read_text(encoding="utf-8")
+            config_text = config_path.read_text(encoding="utf-8")
+            index_html = (Path(tmpdir) / out_dir / "index.html").read_text(
+                encoding="utf-8"
+            )
             method_page_text = (
                 Path(tmpdir) / "rpc-site-src" / "docs" / "methods" / "getblocktemplate.md"
             ).read_text(encoding="utf-8")
@@ -404,6 +438,9 @@ class SiteBuilderTest(unittest.TestCase):
             self.assertNotIn("issue_links", site_model_text)
             self.assertNotIn("tags", site_model_text)
             self.assertNotIn("## Tracking", method_page_text)
+            self.assertIn('version: "v30.2-qbit-sample"', config_text)
+            self.assertIn('src="assets/logo-full.svg"', index_html)
+            self.assertIn('<div class="version">\n          v30.2-qbit-sample', index_html)
 
 
 if __name__ == "__main__":
