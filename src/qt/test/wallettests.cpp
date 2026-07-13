@@ -34,7 +34,9 @@
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <rpc/server.h>
+#include <script/interpreter.h>
 #include <script/p2mr.h>
+#include <script/p2mr_sizing.h>
 #include <script/solver.h>
 #include <consensus/consensus.h>
 #include <test/util/setup_common.h>
@@ -49,7 +51,10 @@
 #include <memory>
 #include <set>
 #include <span>
+#include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 #include <QAbstractButton>
 #include <QAction>
@@ -100,7 +105,7 @@ QString MakeP2MRProofJson(std::string leaf_version)
     proof.pushKV("message_hash", std::string(uint256::size() * 2, '0'));
     proof.pushKV("pubkey", std::string(PQC_PUBKEY_SIZE * 2, '0'));
     proof.pushKV("signature", std::string(PQC_SIG_SIZE * 2, '0'));
-    proof.pushKV("leaf_script", "00");
+    proof.pushKV("leaf_script", std::string(P2MR_V1_PK_LEAF_SCRIPT_SIZE * 2, '0'));
     proof.pushKV("control_block", "c1");
 
     UniValue leaf_version_value;
@@ -732,6 +737,52 @@ void TestGUIWatchOnly(interfaces::Node& node, TestChain100Setup& test)
     QVERIFY(DecodeRawPSBT(psbt, MakeByteSpan(*decoded_psbt), err));
 }
 
+UniValue CopyProofWithout(const UniValue& proof, std::string_view omitted_key)
+{
+    UniValue copy(UniValue::VOBJ);
+    const std::vector<std::string>& keys{proof.getKeys()};
+    const std::vector<UniValue>& values{proof.getValues()};
+    for (size_t i{0}; i < keys.size(); ++i) {
+        if (keys[i] != omitted_key) copy.pushKVEnd(keys[i], values[i]);
+    }
+    return copy;
+}
+
+UniValue ProofWithControlDepth(const UniValue& proof, size_t depth)
+{
+    assert(depth <= P2MR_CONTROL_MAX_NODE_COUNT);
+
+    UniValue result{proof};
+    std::vector<unsigned char> control_block{ParseHex(proof.find_value("control_block").get_str())};
+    control_block.resize(P2MR_CONTROL_BASE_SIZE);
+    for (size_t node{0}; node < depth; ++node) {
+        for (size_t byte{0}; byte < P2MR_CONTROL_NODE_SIZE; ++byte) {
+            control_block.push_back(static_cast<unsigned char>(node + byte + 1));
+        }
+    }
+
+    const std::vector<unsigned char> leaf_script{ParseHex(proof.find_value("leaf_script").get_str())};
+    const uint8_t leaf_version{proof.find_value("leaf_version").getInt<uint8_t>()};
+    const uint256 leaf_hash{ComputeP2MRLeafHash(leaf_version, leaf_script)};
+    const uint256 merkle_root{ComputeP2MRMerkleRoot(control_block, leaf_hash)};
+    result.pushKV("control_block", HexStr(control_block));
+    result.pushKV("address", EncodeDestination(WitnessV2P2MR{merkle_root}));
+    return result;
+}
+
+QString ProofWithNestedArrays(const UniValue& proof, size_t array_count)
+{
+    std::string json{proof.write()};
+    assert(!json.empty() && json.back() == '}');
+    json.pop_back();
+    json += ",\"nested\":";
+    json.append(array_count, '[');
+    json += '0';
+    json.append(array_count, ']');
+    json += '}';
+    return QString::fromStdString(json);
+}
+
 void TestP2MRReceiveAddressTypes(interfaces::Node& node)
 {
     TestChain100Setup test{ChainType::REGTEST, {.extra_args = {"-p2mronly=1"}}};
@@ -924,6 +975,188 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
     QVERIFY(verify_address->text().isEmpty());
     QVERIFY(proof_input->toPlainText().isEmpty());
     QVERIFY(verify_data_input->toPlainText().isEmpty());
+
+    UniValue valid_proof;
+    QVERIFY(valid_proof.read(proof_json.toStdString()));
+    QVERIFY(valid_proof.isObject());
+
+    const auto verify_json = [&](const QString& json) {
+        verify_address->clear();
+        verify_input_mode->setCurrentIndex(2);
+        proof_input->setPlainText(json);
+        verify_button->click();
+        return verify_status->text();
+    };
+    const auto write_proof = [](const UniValue& proof) {
+        return QString::fromStdString(proof.write());
+    };
+    const auto proof_with_field = [&](const UniValue& proof, const char* name, std::string value) {
+        UniValue modified{proof};
+        modified.pushKV(name, std::move(value));
+        return write_proof(modified);
+    };
+    const auto expect_valid = [&](const QString& json) {
+        const QString status{verify_json(json)};
+        QVERIFY2(status.contains("cryptographically valid"), status.toLocal8Bit().constData());
+        QVERIFY(verify_status->styleSheet().isEmpty());
+    };
+    const auto expect_error = [&](const QString& json, const QString& expected) {
+        const QString status{verify_json(json)};
+        QVERIFY2(status.contains(expected), status.toLocal8Bit().constData());
+        QVERIFY(verify_status->styleSheet().contains("red"));
+    };
+
+    expect_valid(write_proof(valid_proof));
+
+    struct ExactHexField {
+        const char* name;
+        size_t bytes;
+    };
+    const std::array exact_hex_fields{
+        ExactHexField{"message_hash", uint256::size()},
+        ExactHexField{"pubkey", PQC_PUBKEY_SIZE},
+        ExactHexField{"signature", PQC_SIG_SIZE},
+        ExactHexField{"leaf_script", P2MR_V1_PK_LEAF_SCRIPT_SIZE},
+    };
+    // The genuine proof above is simultaneously the at-limit case for every
+    // exact-size field. Exercise one byte below/above, odd, and same-size
+    // non-hex inputs independently for each field.
+    for (const ExactHexField& field : exact_hex_fields) {
+        expect_error(proof_with_field(valid_proof, field.name, std::string((field.bytes - 1) * 2, '0')), "must be exactly");
+        expect_error(proof_with_field(valid_proof, field.name, std::string(field.bytes * 2 + 2, '0')), "must be exactly");
+        expect_error(proof_with_field(valid_proof, field.name, std::string(field.bytes * 2 - 1, '0')), "must be exactly");
+        expect_error(proof_with_field(valid_proof, field.name, std::string(field.bytes * 2, 'g')), "must be hex");
+    }
+    // A large non-hex value must fail on its size before the decoder scans it.
+    expect_error(proof_with_field(valid_proof, "signature", std::string(20'000, 'g')), "must be exactly");
+
+    const std::array valid_control_depths{size_t{0}, size_t{1}, P2MR_CONTROL_MAX_NODE_COUNT};
+    for (const size_t depth : valid_control_depths) {
+        const UniValue proof{ProofWithControlDepth(valid_proof, depth)};
+        QCOMPARE(proof.find_value("control_block").get_str().size(), GetP2MRControlBlockSize(depth) * 2);
+        expect_valid(write_proof(proof));
+    }
+    // Boundaries around the minimum, first node, and protocol maximum:
+    // 0/1/2, 32/33/34, and 4096/4097/4098 serialized bytes.
+    const std::array invalid_control_sizes{size_t{0}, size_t{2}, size_t{32}, size_t{34}, P2MR_CONTROL_MAX_SIZE - 1, P2MR_CONTROL_MAX_SIZE + 1};
+    for (const size_t byte_count : invalid_control_sizes) {
+        expect_error(proof_with_field(valid_proof, "control_block", std::string(byte_count * 2, '0')), "must be 1 + 32*n bytes");
+    }
+    expect_error(proof_with_field(valid_proof, "control_block", std::string(P2MR_CONTROL_MAX_SIZE * 2, 'g')), "must be hex");
+
+    const std::string valid_address{valid_proof.find_value("address").get_str()};
+    QCOMPARE(valid_address.size(), size_t{64});
+    expect_error(proof_with_field(valid_proof, "address", std::string(63, 'q')), "address is invalid");
+    expect_valid(write_proof(valid_proof));
+    expect_error(proof_with_field(valid_proof, "address", std::string(65, 'q')), "address is too long");
+
+    const std::array required_fields{
+        "proof_mode", "address", "message_hash", "pubkey", "signature", "leaf_version", "leaf_script", "control_block",
+    };
+    UniValue minimal_rpc_proof(UniValue::VOBJ);
+    for (const char* field : required_fields) {
+        minimal_rpc_proof.pushKVEnd(field, valid_proof.find_value(field));
+    }
+    expect_valid(write_proof(minimal_rpc_proof));
+
+    for (const char* field : required_fields) {
+        expect_error(write_proof(CopyProofWithout(valid_proof, field)), QString::fromLatin1(field));
+    }
+
+    std::vector<UniValue> invalid_string_types;
+    invalid_string_types.emplace_back();
+    UniValue number;
+    number.setInt(1);
+    invalid_string_types.push_back(number);
+    invalid_string_types.emplace_back(UniValue::VARR);
+    invalid_string_types.emplace_back(UniValue::VOBJ);
+    for (const UniValue& invalid_type : invalid_string_types) {
+        UniValue proof{valid_proof};
+        proof.pushKV("message_hash", invalid_type);
+        expect_error(write_proof(proof), "must be a string");
+    }
+
+    for (const char* leaf_version : {"-1", "256", "1.5", "999999999999999999999999"}) {
+        UniValue proof{valid_proof};
+        UniValue version;
+        version.setNumStr(leaf_version);
+        proof.pushKV("leaf_version", version);
+        expect_error(write_proof(proof), "integer from 0 to 255");
+    }
+    for (const int leaf_version : {0, 255}) {
+        UniValue proof{valid_proof};
+        proof.pushKV("leaf_version", leaf_version);
+        expect_error(write_proof(proof), "proof verification failed");
+    }
+
+    expect_error("[]", "JSON object");
+    expect_error("{", "JSON object");
+    expect_error(write_proof(valid_proof) + " trailing", "JSON object");
+
+    UniValue nested_value(UniValue::VOBJ);
+    UniValue nested_array(UniValue::VARR);
+    nested_array.push_back("compatible metadata");
+    nested_value.pushKV("array", std::move(nested_array));
+    UniValue proof_with_unknown{valid_proof};
+    proof_with_unknown.pushKV("unknown", std::move(nested_value));
+    expect_valid(write_proof(proof_with_unknown));
+
+    // UniValue permits at most 512 simultaneously open containers. The proof
+    // object consumes one level, so 510/511/512 nested arrays cover below, at,
+    // and above the parser's limit.
+    expect_valid(ProofWithNestedArrays(valid_proof, 510));
+    expect_valid(ProofWithNestedArrays(valid_proof, 511));
+    expect_error(ProofWithNestedArrays(valid_proof, 512), "JSON object");
+
+    for (const char* field : required_fields) {
+        UniValue duplicate{valid_proof};
+        duplicate.pushKVEnd(field, valid_proof.find_value(field));
+        expect_error(write_proof(duplicate), "duplicated");
+    }
+    UniValue duplicate_first(UniValue::VOBJ);
+    duplicate_first.pushKVEnd("signature", valid_proof.find_value("signature"));
+    duplicate_first.pushKVs(valid_proof);
+    expect_error(write_proof(duplicate_first), "duplicated");
+    UniValue duplicate_unknown{valid_proof};
+    duplicate_unknown.pushKVEnd("unknown", 1);
+    duplicate_unknown.pushKVEnd("unknown", 2);
+    expect_error(write_proof(duplicate_unknown), "duplicated");
+
+    const UniValue maximum_control_proof{ProofWithControlDepth(valid_proof, P2MR_CONTROL_MAX_NODE_COUNT)};
+    const QString maximum_json{QString::fromStdString(maximum_control_proof.write(2))};
+    QCOMPARE(maximum_json.size(), qsizetype{15'988});
+    QVERIFY(maximum_json.size() < SignVerifyMessageDialog::MAX_P2MR_PROOF_DOCUMENT_CHARS - 1);
+    for (const int document_size : {SignVerifyMessageDialog::MAX_P2MR_PROOF_DOCUMENT_CHARS - 1,
+                                    SignVerifyMessageDialog::MAX_P2MR_PROOF_DOCUMENT_CHARS}) {
+        QString padded{maximum_json};
+        padded.append(QString(document_size - padded.size(), ' '));
+        QCOMPARE(padded.size(), static_cast<qsizetype>(document_size));
+        expect_valid(padded);
+    }
+
+    // Editing after a success must clear both the old message and status style.
+    proof_input->setPlainText(QString(SignVerifyMessageDialog::MAX_P2MR_PROOF_DOCUMENT_CHARS + 1, ' '));
+    QVERIFY(verify_status->text().isEmpty());
+    QVERIFY(verify_status->styleSheet().isEmpty());
+    bool heartbeat{false};
+    QTimer::singleShot(0, [&] { heartbeat = true; });
+    QElapsedTimer rejection_timer;
+    rejection_timer.start();
+    verify_button->click();
+    QVERIFY2(rejection_timer.elapsed() < 1000, "Oversized proof rejection blocked the GUI thread");
+    QCoreApplication::processEvents();
+    QVERIFY(heartbeat);
+    QVERIFY(verify_status->text().contains("maximum size"));
+    QVERIFY(!verify_status->text().contains("cryptographically valid"));
+    QVERIFY(verify_status->styleSheet().contains("red"));
+
+    // Malformed input after the oversized error also replaces the status, and
+    // any subsequent edit clears it instead of leaving a stale failure/success.
+    proof_input->setPlainText("{");
+    QVERIFY(verify_status->text().isEmpty());
+    verify_button->click();
+    QVERIFY(verify_status->text().contains("JSON object"));
+    proof_input->setPlainText(write_proof(valid_proof));
     QVERIFY(verify_status->text().isEmpty());
     QVERIFY(verify_status->styleSheet().isEmpty());
 
@@ -947,11 +1180,19 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
     builder.AddP2MR(/*depth=*/1, selected_leaf_bytes, P2MR_LEAF_VERSION_V1)
         .AddP2MR(/*depth=*/1, alternate_leaf_bytes, P2MR_LEAF_VERSION_V1)
         .FinalizeP2MR();
-    const WitnessV2P2MR output{builder.GetP2MROutput()};
     const P2MRSpendData spend_data{builder.GetP2MRSpendData()};
     const auto selected_leaf_it{spend_data.scripts.find({selected_leaf_bytes, P2MR_LEAF_VERSION_V1})};
     QVERIFY(selected_leaf_it != spend_data.scripts.end());
     QVERIFY(!selected_leaf_it->second.empty());
+    std::vector<unsigned char> selected_control_block{*selected_leaf_it->second.begin()};
+    selected_control_block.resize(P2MR_CONTROL_BASE_SIZE);
+    for (size_t node{0}; node < P2MR_CONTROL_MAX_NODE_COUNT; ++node) {
+        for (size_t byte{0}; byte < P2MR_CONTROL_NODE_SIZE; ++byte) {
+            selected_control_block.push_back(static_cast<unsigned char>(node + byte + 1));
+        }
+    }
+    const uint256 selected_leaf_hash{ComputeP2MRLeafHash(P2MR_LEAF_VERSION_V1, selected_leaf_bytes)};
+    const WitnessV2P2MR output{ComputeP2MRMerkleRoot(selected_control_block, selected_leaf_hash)};
 
     const uint256 message_hash{uint256::ONE};
     const uint256 datasig_hash{ComputeQbitDataSigPQCHash(std::span<const unsigned char>{message_hash.begin(), message_hash.end()})};
@@ -960,14 +1201,36 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
     QVERIFY(selected_key.Sign(datasig_hash, signature, signature_counter));
     QCOMPARE(signature_counter, 1U);
 
+    // The old rich exporter exceeded the 32 KiB verifier limit with this many
+    // advanced retry keys and exhaustion warnings. The portable proof must be
+    // independent of the wallet-local report's cardinality.
+    constexpr size_t FAILED_RETRY_KEY_COUNT{37};
+    std::set<CPQCPubKey> failed_retry_pubkeys{alternate_pubkey};
+    for (unsigned char marker{1}; failed_retry_pubkeys.size() < FAILED_RETRY_KEY_COUNT; ++marker) {
+        std::array<unsigned char, PQC_PUBKEY_SIZE> pubkey_bytes;
+        pubkey_bytes.fill(marker);
+        const CPQCPubKey pubkey{std::span<const unsigned char>{pubkey_bytes}};
+        if (pubkey.IsValid() && pubkey != selected_pubkey) failed_retry_pubkeys.insert(pubkey);
+    }
+
     wallet::PQCUsageReport retry_report;
-    retry_report.key_states.push_back({
-        .pubkey = alternate_pubkey,
-        .signature_count = wallet::PQC_WARNING_SIGNATURE_THRESHOLD,
-        .signature_limit = PQC_MAX_SIGNATURES,
-        .signatures_remaining = PQC_MAX_SIGNATURES - wallet::PQC_WARNING_SIGNATURE_THRESHOLD,
-        .limit_state = wallet::PQCSignatureLimitState::WARNING,
-    });
+    for (const CPQCPubKey& failed_pubkey : failed_retry_pubkeys) {
+        retry_report.key_states.push_back({
+            .pubkey = failed_pubkey,
+            .signature_count = PQC_MAX_SIGNATURES,
+            .signature_limit = PQC_MAX_SIGNATURES,
+            .signatures_remaining = 0,
+            .limit_state = wallet::PQCSignatureLimitState::EXHAUSTED,
+        });
+        retry_report.warnings.push_back({
+            .pubkey = failed_pubkey,
+            .previous_count = PQC_MAX_SIGNATURES - 1,
+            .new_count = PQC_MAX_SIGNATURES,
+            .previous_state = wallet::PQCSignatureLimitState::CRITICAL,
+            .current_state = wallet::PQCSignatureLimitState::EXHAUSTED,
+            .kind = wallet::PQCUsageWarningKind::TRANSITION,
+        });
+    }
     retry_report.key_states.push_back({
         .pubkey = selected_pubkey,
         .signature_count = 1,
@@ -975,15 +1238,9 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
         .signatures_remaining = PQC_MAX_SIGNATURES - 1,
         .limit_state = wallet::PQCSignatureLimitState::NORMAL,
     });
-    retry_report.overall_state = wallet::PQCSignatureLimitState::WARNING;
-    retry_report.warnings.push_back({
-        .pubkey = alternate_pubkey,
-        .previous_count = wallet::PQC_WARNING_SIGNATURE_THRESHOLD - 1,
-        .new_count = wallet::PQC_WARNING_SIGNATURE_THRESHOLD,
-        .previous_state = wallet::PQCSignatureLimitState::NORMAL,
-        .current_state = wallet::PQCSignatureLimitState::WARNING,
-        .kind = wallet::PQCUsageWarningKind::TRANSITION,
-    });
+    retry_report.overall_state = wallet::PQCSignatureLimitState::EXHAUSTED;
+    QCOMPARE(retry_report.key_states.size(), FAILED_RETRY_KEY_COUNT + 1);
+    QCOMPARE(retry_report.warnings.size(), FAILED_RETRY_KEY_COUNT);
 
     interfaces::P2MRDataSignatureResult synthetic_result{
         .output = output,
@@ -992,7 +1249,7 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
         .pubkey = std::vector<unsigned char>{selected_pubkey.begin(), selected_pubkey.end()},
         .signature = signature,
         .leaf_script = selected_leaf,
-        .control_block = *selected_leaf_it->second.begin(),
+        .control_block = selected_control_block,
         .leaf_version = P2MR_LEAF_VERSION_V1,
         .pqc_usage = std::make_shared<const wallet::PQCUsageReport>(retry_report),
     };
@@ -1017,10 +1274,12 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
 
     const QString proof_text{generated_proof->toPlainText()};
     QVERIFY(!proof_text.isEmpty());
+    QCOMPARE(proof_text.size(), qsizetype{15'988});
+    QVERIFY(proof_text.size() <= SignVerifyMessageDialog::MAX_P2MR_PROOF_DOCUMENT_CHARS);
     UniValue proof_object;
     QVERIFY(proof_object.read(proof_text.toStdString()));
     QVERIFY(proof_object.isObject());
-    const std::set<std::string> required_fields{
+    const std::set<std::string> portable_fields{
         "address",
         "message_hash",
         "pubkey",
@@ -1030,8 +1289,8 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
         "leaf_version",
         "proof_mode",
     };
-    QCOMPARE(proof_object.getKeys().size(), required_fields.size());
-    for (const std::string& field : required_fields) {
+    QCOMPARE(proof_object.getKeys().size(), portable_fields.size());
+    for (const std::string& field : portable_fields) {
         QVERIFY(proof_object.exists(field));
     }
 
@@ -1056,7 +1315,7 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
     const QString alternate_pubkey_hex{QString::fromStdString(HexStr(std::span<const unsigned char>{alternate_pubkey.begin(), alternate_pubkey.end()}))};
     QVERIFY(!proof_text.contains(alternate_pubkey_hex));
     QVERIFY(proof_status->text().contains(alternate_pubkey_hex));
-    QVERIFY(proof_status->text().contains("PQC usage state after signing: warning."));
+    QVERIFY(proof_status->text().contains("PQC usage state after signing: exhausted."));
 
     QApplication::clipboard()->clear();
     proof_copy_button->click();
@@ -1148,7 +1407,7 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
                                            .arg(signatures_remaining)));
     UniValue single_key_proof;
     QVERIFY(single_key_proof.read(single_key_proof_output->toPlainText().toStdString()));
-    QCOMPARE(single_key_proof.getKeys().size(), required_fields.size());
+    QCOMPARE(single_key_proof.getKeys().size(), portable_fields.size());
     for (const char* field : local_or_informational_fields) {
         QVERIFY(!single_key_proof.exists(field));
     }

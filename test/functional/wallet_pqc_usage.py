@@ -205,14 +205,14 @@ class WalletPQCUsageTest(BitcoinTestFramework):
         self.wait_pqc_key_validation_ready(signer)
         self.assert_pqc_signature_count(signer, address, 0)
 
-        proof = signer.signdatapqchash(address, "55" * 32)
+        proof = signer.signdatapqchash(address, "55" * 32, {"include_pqc_usage": True})
         assert_equal(proof["address"], address)
         self.assert_pqc_fields(proof, min_signature_count=1)
         assert_equal(proof["pqc_signature_count"], 1)
         assert_equal(proof["pqc_key_states"][0]["pubkey"], proof["pubkey"])
         self.assert_pqc_signature_count(signer, address, 1)
 
-        hidden_usage = signer.signdatapqchash(address, "56" * 32, {"include_pqc_usage": False})
+        hidden_usage = signer.signdatapqchash(address, "56" * 32)
         self.assert_no_pqc_fields(hidden_usage)
         self.assert_pqc_signature_count(signer, address, 2)
 
@@ -257,7 +257,7 @@ class WalletPQCUsageTest(BitcoinTestFramework):
             "59" * 32,
         )
         locked.walletpassphrase(passphrase, 60)
-        locked_proof = locked.signdatapqchash(locked_address, "5a" * 32)
+        locked_proof = locked.signdatapqchash(locked_address, "5a" * 32, {"include_pqc_usage": True})
         self.assert_pqc_fields(locked_proof, min_signature_count=1)
         self.assert_pqc_signature_count(locked, locked_address, 1)
 

@@ -17,14 +17,17 @@
 #include <key_io.h>
 #include <outputtype.h>
 #include <script/interpreter.h>
+#include <script/p2mr_sizing.h>
 #include <util/strencodings.h>
 #include <util/translation.h>
 #include <wallet/pqc_usage.h>
 #include <wallet/wallet.h>
 
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -33,6 +36,7 @@
 #include <QComboBox>
 #include <QPlainTextEdit>
 #include <QStringList>
+#include <QTextDocument>
 
 #include <univalue.h>
 
@@ -58,6 +62,28 @@ constexpr int P2MR_VERIFY_INPUT_TEXT{0};
 constexpr int P2MR_VERIFY_INPUT_HASH{1};
 constexpr int P2MR_VERIFY_INPUT_PROOF_ONLY{2};
 
+constexpr size_t P2MR_PROOF_MAX_ADDRESS_CHARS{64};
+constexpr size_t P2MR_PROOF_REQUIRED_HEX_CHARS{
+    2 * (uint256::size() + PQC_PUBKEY_SIZE + PQC_SIG_SIZE + P2MR_V1_PK_LEAF_SCRIPT_SIZE + P2MR_CONTROL_MAX_SIZE)};
+static_assert(P2MR_PROOF_REQUIRED_HEX_CHARS == 15'750);
+
+// The portable proof has eight fields. At their protocol maxima, the address,
+// fixed-size hex fields, proof mode, and decimal leaf version use 15,828 value
+// characters. UniValue::write(2) adds exactly 160 JSON syntax characters.
+// Keeping the input limit at the next power of two leaves room for compatible
+// legacy/RPC informational fields while strictly bounding GUI-thread work.
+constexpr size_t P2MR_PROOF_MODE_CHARS{std::string_view{common::P2MR_DATA_SIGNATURE_PROOF_MODE}.size()};
+constexpr size_t P2MR_MAX_LEAF_VERSION_CHARS{3};
+constexpr size_t P2MR_MAX_GENERATED_PROOF_VALUE_CHARS{
+    P2MR_PROOF_MAX_ADDRESS_CHARS + P2MR_PROOF_REQUIRED_HEX_CHARS + P2MR_PROOF_MODE_CHARS + P2MR_MAX_LEAF_VERSION_CHARS};
+constexpr size_t P2MR_GENERATED_PROOF_JSON_SYNTAX_CHARS{160};
+constexpr size_t P2MR_MAX_GENERATED_PROOF_JSON_CHARS{
+    P2MR_MAX_GENERATED_PROOF_VALUE_CHARS + P2MR_GENERATED_PROOF_JSON_SYNTAX_CHARS};
+static_assert(P2MR_MAX_GENERATED_PROOF_VALUE_CHARS == 15'828);
+static_assert(P2MR_MAX_GENERATED_PROOF_JSON_CHARS == 15'988);
+static_assert(SignVerifyMessageDialog::MAX_P2MR_PROOF_DOCUMENT_CHARS == 32'768);
+static_assert(SignVerifyMessageDialog::MAX_P2MR_PROOF_DOCUMENT_CHARS >= P2MR_MAX_GENERATED_PROOF_JSON_CHARS);
+
 uint256 HashP2MRUtf8Text(const QString& text)
 {
     const QByteArray bytes{text.toUtf8()};
@@ -70,16 +96,19 @@ uint256 HashP2MRUtf8Text(const QString& text)
 
 bool ParseHexBytes(const QString& text, std::string_view name, size_t expected_size, std::vector<unsigned char>& bytes, QString& error)
 {
-    const std::string value{text.trimmed().toStdString()};
-    if (!IsHex(value)) {
-        error = SignVerifyMessageDialog::tr("%1 must be hex.").arg(QString::fromStdString(std::string{name}));
-        return false;
-    }
-    bytes = ParseHex(value);
-    if (bytes.size() != expected_size) {
+    const QString trimmed{text.trimmed()};
+    if (static_cast<size_t>(trimmed.size()) != expected_size * 2) {
         error = SignVerifyMessageDialog::tr("%1 must be exactly %2 bytes.").arg(QString::fromStdString(std::string{name})).arg(expected_size);
         return false;
     }
+
+    const QByteArray value{trimmed.toLatin1()};
+    const std::string_view value_view{value.constData(), static_cast<size_t>(value.size())};
+    if (!IsHex(value_view)) {
+        error = SignVerifyMessageDialog::tr("%1 must be hex.").arg(QString::fromStdString(std::string{name}));
+        return false;
+    }
+    bytes = ParseHex(value_view);
     return true;
 }
 
@@ -93,55 +122,89 @@ bool ParseDataHash(const QString& text, uint256& hash, QString& error)
     return true;
 }
 
-bool ReadRequiredString(const UniValue& object, const char* name, std::string& value, QString& error)
+const std::string* GetRequiredString(const UniValue& object, const char* name, QString& error)
 {
     const UniValue& field{object.find_value(name)};
     if (!field.isStr()) {
         error = SignVerifyMessageDialog::tr("Proof field \"%1\" must be a string.").arg(name);
-        return false;
+        return nullptr;
     }
-    value = field.get_str();
+    return &field.get_str();
+}
+
+bool RejectDuplicateProofFields(const UniValue& object, QString& error)
+{
+    std::set<std::string_view> fields;
+    for (const std::string& key : object.getKeys()) {
+        if (!fields.insert(key).second) {
+            error = SignVerifyMessageDialog::tr("Proof field \"%1\" is duplicated.").arg(QString::fromStdString(key));
+            return false;
+        }
+    }
     return true;
 }
 
-bool ParseProofHexField(const UniValue& object, const char* name, size_t expected_size, std::vector<unsigned char>& bytes, QString& error)
+bool ParseExactProofHex(const UniValue& object, const char* name, size_t expected_size, std::vector<unsigned char>& bytes, QString& error)
 {
-    std::string text;
-    if (!ReadRequiredString(object, name, text, error)) return false;
-    return ParseHexBytes(QString::fromStdString(text), name, expected_size, bytes, error);
-}
-
-bool ParseProofScriptField(const UniValue& object, const char* name, CScript& script, QString& error)
-{
-    std::string text;
-    if (!ReadRequiredString(object, name, text, error)) return false;
-    if (!IsHex(text)) {
+    const std::string* text{GetRequiredString(object, name, error)};
+    if (!text) return false;
+    if (text->size() != expected_size * 2) {
+        error = SignVerifyMessageDialog::tr("%1 must be exactly %2 bytes.").arg(name).arg(expected_size);
+        return false;
+    }
+    if (!IsHex(*text)) {
         error = SignVerifyMessageDialog::tr("Proof field \"%1\" must be hex.").arg(name);
         return false;
     }
-    const std::vector<unsigned char> bytes{ParseHex(text)};
-    script = CScript{bytes.begin(), bytes.end()};
+    bytes = ParseHex(*text);
+    return true;
+}
+
+bool ParseControlBlock(const UniValue& object, std::vector<unsigned char>& control_block, QString& error)
+{
+    const std::string* text{GetRequiredString(object, "control_block", error)};
+    if (!text) return false;
+
+    constexpr size_t MIN_HEX_CHARS{P2MR_CONTROL_BASE_SIZE * 2};
+    constexpr size_t MAX_HEX_CHARS{P2MR_CONTROL_MAX_SIZE * 2};
+    constexpr size_t NODE_HEX_CHARS{P2MR_CONTROL_NODE_SIZE * 2};
+    if (text->size() < MIN_HEX_CHARS || text->size() > MAX_HEX_CHARS ||
+        (text->size() - MIN_HEX_CHARS) % NODE_HEX_CHARS != 0) {
+        error = SignVerifyMessageDialog::tr("Proof field \"control_block\" must be 1 + 32*n bytes for n from 0 to 128.");
+        return false;
+    }
+    if (!IsHex(*text)) {
+        error = SignVerifyMessageDialog::tr("Proof field \"control_block\" must be hex.");
+        return false;
+    }
+    control_block = ParseHex(*text);
     return true;
 }
 
 bool ParseP2MRProofJson(const QString& proof_json, common::P2MRDataSignatureProof& proof, QString& error)
 {
+    const QByteArray proof_utf8{proof_json.toUtf8()};
     UniValue object;
-    if (!object.read(proof_json.toStdString()) || !object.isObject()) {
+    if (!object.read(std::string_view{proof_utf8.constData(), static_cast<size_t>(proof_utf8.size())}) || !object.isObject()) {
         error = SignVerifyMessageDialog::tr("Proof must be a JSON object.");
         return false;
     }
+    if (!RejectDuplicateProofFields(object, error)) return false;
 
-    std::string proof_mode;
-    if (!ReadRequiredString(object, "proof_mode", proof_mode, error)) return false;
-    if (proof_mode != common::P2MR_DATA_SIGNATURE_PROOF_MODE) {
+    const std::string* proof_mode{GetRequiredString(object, "proof_mode", error)};
+    if (!proof_mode) return false;
+    if (*proof_mode != common::P2MR_DATA_SIGNATURE_PROOF_MODE) {
         error = SignVerifyMessageDialog::tr("Unsupported proof_mode.");
         return false;
     }
 
-    std::string address;
-    if (!ReadRequiredString(object, "address", address, error)) return false;
-    const CTxDestination dest{DecodeDestination(address)};
+    const std::string* address{GetRequiredString(object, "address", error)};
+    if (!address) return false;
+    if (address->size() > P2MR_PROOF_MAX_ADDRESS_CHARS) {
+        error = SignVerifyMessageDialog::tr("Proof address is too long.");
+        return false;
+    }
+    const CTxDestination dest{DecodeDestination(*address)};
     if (!IsValidDestination(dest)) {
         error = SignVerifyMessageDialog::tr("Proof address is invalid.");
         return false;
@@ -154,29 +217,24 @@ bool ParseP2MRProofJson(const QString& proof_json, common::P2MRDataSignatureProo
     proof.output = *output;
 
     std::vector<unsigned char> bytes;
-    if (!ParseProofHexField(object, "message_hash", uint256::size(), bytes, error)) return false;
+    if (!ParseExactProofHex(object, "message_hash", uint256::size(), bytes, error)) return false;
     proof.message_hash = uint256{std::span<const unsigned char>{bytes.data(), bytes.size()}};
     proof.datasig_hash = ComputeQbitDataSigPQCHash(
         std::span<const unsigned char>{proof.message_hash.begin(), proof.message_hash.end()});
 
-    if (!ParseProofHexField(object, "pubkey", PQC_PUBKEY_SIZE, bytes, error)) return false;
+    if (!ParseExactProofHex(object, "pubkey", PQC_PUBKEY_SIZE, bytes, error)) return false;
     proof.pubkey = CPQCPubKey{bytes};
 
-    if (!ParseProofHexField(object, "signature", PQC_SIG_SIZE, proof.signature, error)) return false;
+    if (!ParseExactProofHex(object, "signature", PQC_SIG_SIZE, proof.signature, error)) return false;
 
-    if (!ParseProofScriptField(object, "leaf_script", proof.leaf_script, error)) return false;
+    if (!ParseExactProofHex(object, "leaf_script", P2MR_V1_PK_LEAF_SCRIPT_SIZE, bytes, error)) return false;
+    proof.leaf_script = CScript{bytes.begin(), bytes.end()};
 
-    std::string control_block;
-    if (!ReadRequiredString(object, "control_block", control_block, error)) return false;
-    if (!IsHex(control_block)) {
-        error = SignVerifyMessageDialog::tr("Proof field \"control_block\" must be hex.");
-        return false;
-    }
-    proof.control_block = ParseHex(control_block);
+    if (!ParseControlBlock(object, proof.control_block, error)) return false;
 
     const UniValue& leaf_version{object.find_value("leaf_version")};
     if (!leaf_version.isNum()) {
-        error = SignVerifyMessageDialog::tr("Proof field \"leaf_version\" must be a number.");
+        error = SignVerifyMessageDialog::tr("Proof field \"leaf_version\" must be an integer from 0 to 255.");
         return false;
     }
     const auto leaf_version_int{ToIntegral<uint8_t>(leaf_version.getValStr())};
@@ -297,9 +355,14 @@ SignVerifyMessageDialog::SignVerifyMessageDialog(const PlatformStyle *_platformS
     });
     connect(ui->messageIn_SM, &QPlainTextEdit::textChanged, this, &SignVerifyMessageDialog::updateP2MRSignHashPreview);
     connect(ui->p2mrVerifyInputMode_VM, qOverload<int>(&QComboBox::currentIndexChanged), this, [this] {
+        clearVerifyStatus();
         updateP2MRVerifyModeUi();
     });
     connect(ui->p2mrDataIn_VM, &QPlainTextEdit::textChanged, this, &SignVerifyMessageDialog::updateP2MRVerifyHashPreview);
+    connect(ui->addressIn_VM, &QLineEdit::textChanged, this, &SignVerifyMessageDialog::clearVerifyStatus);
+    connect(ui->messageIn_VM, &QPlainTextEdit::textChanged, this, &SignVerifyMessageDialog::clearVerifyStatus);
+    connect(ui->signatureIn_VM, &QLineEdit::textChanged, this, &SignVerifyMessageDialog::clearVerifyStatus);
+    connect(ui->p2mrDataIn_VM, &QPlainTextEdit::textChanged, this, &SignVerifyMessageDialog::clearVerifyStatus);
 
     updateP2MRDataModeUi();
 
@@ -497,6 +560,12 @@ void SignVerifyMessageDialog::updateP2MRVerifyHashPreview()
     ui->p2mrVerifyMessageHash_VM->setText(QString::fromStdString(HashToHexString(message_hash)));
 }
 
+void SignVerifyMessageDialog::clearVerifyStatus()
+{
+    ui->statusLabel_VM->clear();
+    ui->statusLabel_VM->setStyleSheet({});
+}
+
 void SignVerifyMessageDialog::setAddress_SM(const QString &address)
 {
     ui->addressIn_SM->setText(address);
@@ -692,6 +761,8 @@ void SignVerifyMessageDialog::on_addressBookButton_VM_clicked()
 
 void SignVerifyMessageDialog::on_verifyMessageButton_VM_clicked()
 {
+    clearVerifyStatus();
+
     if (isP2MRDataMode()) {
         const auto set_error = [this](const QString& text) {
             ui->statusLabel_VM->setStyleSheet("QLabel { color: red; }");
@@ -705,6 +776,12 @@ void SignVerifyMessageDialog::on_verifyMessageButton_VM_clicked()
             ui->statusLabel_VM->setStyleSheet("QLabel { color: green; }");
             ui->statusLabel_VM->setText(text);
         };
+
+        const int proof_character_count{ui->messageIn_VM->document()->characterCount() - 1};
+        if (proof_character_count > MAX_P2MR_PROOF_DOCUMENT_CHARS) {
+            set_error(tr("Proof JSON exceeds the maximum size of %1 characters.").arg(MAX_P2MR_PROOF_DOCUMENT_CHARS));
+            return;
+        }
 
         common::P2MRDataSignatureProof proof;
         QString parse_error;
@@ -858,8 +935,7 @@ void SignVerifyMessageDialog::on_clearButton_VM_clicked()
     ui->signatureIn_VM->clear();
     ui->messageIn_VM->clear();
     ui->p2mrDataIn_VM->clear();
-    ui->statusLabel_VM->clear();
-    ui->statusLabel_VM->setStyleSheet("");
+    clearVerifyStatus();
 
     ui->addressIn_VM->setFocus();
 }
@@ -883,8 +959,7 @@ bool SignVerifyMessageDialog::eventFilter(QObject *object, QEvent *event)
         else if (ui->tabWidget->currentIndex() == 1)
         {
             /* Clear status message on focus change */
-            ui->statusLabel_VM->clear();
-            ui->statusLabel_VM->setStyleSheet("");
+            clearVerifyStatus();
         }
     }
     return QDialog::eventFilter(object, event);

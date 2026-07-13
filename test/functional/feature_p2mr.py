@@ -774,8 +774,18 @@ class FeatureP2MRTest(BitcoinTestFramework):
         assert_equal(proof["leaf_version"], P2MR_LEAF_VERSION)
         assert_equal(proof["leaf_script"], f"20{proof['pubkey']}b3")
         assert_equal(proof["control_block"], "c1")
-        assert_equal(proof["pqc_signature_count"], 1)
-        assert_equal(proof["pqc_key_states"][0]["pubkey"], proof["pubkey"])
+
+        usage_fields = (
+            "pqc_key_states",
+            "pqc_overall_limit_state",
+            "pqc_signature_count",
+            "pqc_signature_limit",
+            "pqc_signatures_remaining",
+            "pqc_limit_state",
+            "warnings",
+        )
+        for field in usage_fields:
+            assert field not in proof
 
         verified = node.verifydatapqchash(proof)
         assert_equal(verified["valid"], True)
@@ -800,23 +810,15 @@ class FeatureP2MRTest(BitcoinTestFramework):
         assert_equal(set(minimal_proof), minimal_proof_fields)
         assert_equal(node.verifydatapqchash(minimal_proof)["valid"], True)
 
-        explicit_proof = p2mr_wallet.signdatapqchash(address, message_hash, {
+        usage_proof = p2mr_wallet.signdatapqchash(address, message_hash, {
             "pubkey": proof["pubkey"],
             "leaf_script": proof["leaf_script"],
             "control_block": proof["control_block"],
-            "include_pqc_usage": False,
+            "include_pqc_usage": True,
         })
-        assert_equal(node.verifydatapqchash(explicit_proof)["valid"], True)
-        for field in (
-            "pqc_key_states",
-            "pqc_overall_limit_state",
-            "pqc_signature_count",
-            "pqc_signature_limit",
-            "pqc_signatures_remaining",
-            "pqc_limit_state",
-            "warnings",
-        ):
-            assert field not in explicit_proof
+        assert_equal(node.verifydatapqchash(usage_proof)["valid"], True)
+        assert_equal(usage_proof["pqc_signature_count"], 2)
+        assert_equal(usage_proof["pqc_key_states"][0]["pubkey"], proof["pubkey"])
 
         wrong_message = dict(proof)
         wrong_message["message_hash"] = "22" * 32
