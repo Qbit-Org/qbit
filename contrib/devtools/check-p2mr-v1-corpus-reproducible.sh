@@ -14,6 +14,8 @@ temp_root="${tmpdir}/source"
 temp_data="${temp_root}/src/test/data"
 mkdir -p "${temp_data}"
 
+python3 "${repo_root}/contrib/devtools/test_p2mr_v1_generators.py"
+
 corpus_files=(
   p2mr_cross_profile_vectors.json
   p2mr_pqc_witness_vectors.json
@@ -21,21 +23,20 @@ corpus_files=(
   p2mr_vectors.json
   p2mr_v1_manifest.json
 )
-for file in "${corpus_files[@]}"; do
-  cp "${repo_root}/src/test/data/${file}" "${temp_data}/${file}"
-done
-
 python_output="${tmpdir}/python-witness.json"
 rust_output="${tmpdir}/rust-witness.json"
+python3 "${repo_root}/contrib/devtools/generate-p2mr-v1-corpus.py" \
+  --output-dir "${temp_data}"
 python3 "${repo_root}/contrib/devtools/generate-p2mr-pqc-witness-vectors.py" \
-  --input "${temp_data}/p2mr_pqc_witness_vectors.json" \
   --output "${python_output}"
 
 cargo run --locked --offline --quiet \
   --manifest-path "${repo_root}/contrib/testgen/p2mr_checksigpqc_vectors/Cargo.toml" -- \
-  --input "${python_output}" \
   --output "${rust_output}"
-mv "${rust_output}" "${temp_data}/p2mr_pqc_witness_vectors.json"
+python3 "${repo_root}/contrib/devtools/merge-p2mr-pqc-witness-vectors.py" \
+  --python "${python_output}" \
+  --rust "${rust_output}" \
+  --output "${temp_data}/p2mr_pqc_witness_vectors.json"
 
 python3 "${repo_root}/contrib/devtools/update-p2mr-v1-manifest.py" \
   --source-root "${temp_root}" \

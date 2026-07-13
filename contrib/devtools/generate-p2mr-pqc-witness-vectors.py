@@ -64,9 +64,7 @@ PYTHON_OWNED_IDS = frozenset(
         "single_key_sighash_single_anyonecanpay_missing_beyond",
     }
 )
-PYTHON_GENERATED_IDS = PYTHON_OWNED_IDS - {"single_key_default_sighash_annex_present"}
-RUST_OWNED_IDS = frozenset({"single_key_leading_codesep", "branch_codesep_true", "branch_codesep_false"})
-ALL_OWNED_IDS = PYTHON_OWNED_IDS | RUST_OWNED_IDS
+PYTHON_GENERATED_IDS = PYTHON_OWNED_IDS
 
 
 @dataclass(frozen=True)
@@ -227,7 +225,14 @@ def p2mr_script_pubkey(root: bytes) -> bytes:
     return bytes([OP_2, 32]) + root
 
 
-def p2mr_signature_msg(tx: Transaction, spent_outputs: tuple[TxOut, ...], hash_type: int, input_index: int, leaf_hash: bytes) -> bytes:
+def p2mr_signature_msg(
+    tx: Transaction,
+    spent_outputs: tuple[TxOut, ...],
+    hash_type: int,
+    input_index: int,
+    leaf_hash: bytes,
+    annex: bytes | None = None,
+) -> bytes:
     if len(tx.vin) != len(spent_outputs):
         raise ValueError("spent output count does not match input count")
     if input_index >= len(tx.vin):
@@ -253,8 +258,8 @@ def p2mr_signature_msg(tx: Transaction, spent_outputs: tuple[TxOut, ...], hash_t
     if output_type == SIGHASH_ALL:
         msg += sha256(b"".join(txout.serialize() for txout in tx.vout))
 
-    # P2MR script path, no annex.
-    msg += bytes([0x02])
+    # P2MR script path, with the low bit committing to annex presence.
+    msg += bytes([0x02 + int(annex is not None)])
 
     if input_type == SIGHASH_ANYONECANPAY:
         msg += tx.vin[input_index].serialize_prevout()
@@ -262,6 +267,9 @@ def p2mr_signature_msg(tx: Transaction, spent_outputs: tuple[TxOut, ...], hash_t
         msg += uint32(tx.vin[input_index].sequence)
     else:
         msg += uint32(input_index)
+
+    if annex is not None:
+        msg += sha256(ser_string(annex))
 
     if output_type == SIGHASH_SINGLE:
         msg += sha256(tx.vout[input_index].serialize())
@@ -613,6 +621,103 @@ def build_vector(lib: ctypes.CDLL, name: str, hash_type: int, seed_fill: int) ->
     return vector
 
 
+def build_annex_vector(lib: ctypes.CDLL) -> dict[str, object]:
+    seed_fill = 0x21
+    pubkey, secret = deterministic_keypair(lib, seed_fill)
+    leaf_script = build_p2mr_leaf_script(pubkey)
+    hashed_leaf = p2mr_leaf_hash(leaf_script)
+    output_script = p2mr_script_pubkey(hashed_leaf)
+    annex = bytes.fromhex("505100997ea5")
+    tx_without_witness = Transaction(
+        version=2,
+        vin=(
+            TxIn(
+                prevout_hash=bytes.fromhex(
+                    "d632b56c8248e9356b4ade4b623a18c84c808a0900345911ea99830e16d73345"
+                ),
+                prevout_n=0,
+                sequence=0xFFFFFFFE,
+            ),
+        ),
+        vout=(TxOut(1500, bytes([OP_1])),),
+        locktime=0,
+    )
+    spent_outputs = (TxOut(2000, output_script),)
+    sigmsg = p2mr_signature_msg(
+        tx_without_witness,
+        spent_outputs,
+        SIGHASH_DEFAULT,
+        0,
+        hashed_leaf,
+        annex,
+    )
+    sighash = tagged_hash("P2MRSighash", sigmsg)
+    signature = sign_digest(lib, secret, sighash)
+    no_annex_sigmsg = p2mr_signature_msg(
+        tx_without_witness,
+        spent_outputs,
+        SIGHASH_DEFAULT,
+        0,
+        hashed_leaf,
+    )
+    no_annex_sighash = tagged_hash("P2MRSighash", no_annex_sigmsg)
+    no_annex_signature = sign_digest(lib, secret, no_annex_sighash)
+    wrong_domain_sighash = tagged_hash("TapSighash", sigmsg)
+    wrong_domain_signature = sign_digest(lib, secret, wrong_domain_sighash)
+    wrong_pubkey = bytes([pubkey[0] ^ 1]) + pubkey[1:]
+    wrong_pubkey_leaf_script = build_p2mr_leaf_script(wrong_pubkey)
+    tx = tx_without_witness.with_input_witness(
+        0,
+        (signature, leaf_script, bytes([P2MR_CONTROL_BYTE_V1]), annex),
+    )
+    return {
+        "name": "single_key_default_sighash_annex_present",
+        "provenance": (
+            "Generated from deterministic libbitcoinpqc seed 0x21 plus an independent "
+            "Python P2MR serializer; the vector signs the manually computed annex-present "
+            "P2MRSighash digest with libbitcoinpqc and does not use qbit "
+            "wallet/signing/sighash helpers."
+        ),
+        "prevoutAmount": spent_outputs[0].value,
+        "prevoutScriptPubKey": output_script.hex(),
+        "spendTx": tx.serialize(with_witness=True).hex(),
+        "leafVersion": f"{P2MR_LEAF_VERSION_V1:02x}",
+        "leafScript": leaf_script.hex(),
+        "controlBlock": f"{P2MR_CONTROL_BYTE_V1:02x}",
+        "annex": annex.hex(),
+        "annexHash": sha256(ser_string(annex)).hex(),
+        "pubkey": pubkey.hex(),
+        "signature": signature.hex(),
+        "p2mrSigMsg": sigmsg.hex(),
+        "p2mrSighash": sighash.hex(),
+        "wrongDomainSighash": wrong_domain_sighash.hex(),
+        "wrongDomainSignature": wrong_domain_signature.hex(),
+        "noAnnexSigMsg": no_annex_sigmsg.hex(),
+        "noAnnexSighash": no_annex_sighash.hex(),
+        "noAnnexSignature": no_annex_signature.hex(),
+        "wrongPubkeyLeafScript": wrong_pubkey_leaf_script.hex(),
+        "wrongPubkeyScriptPubKey": p2mr_script_pubkey(
+            p2mr_leaf_hash(wrong_pubkey_leaf_script)
+        ).hex(),
+        "inputIndex": 0,
+        "hashType": "00",
+        "epoch": "00",
+        "spendType": "03",
+        "keyVersion": "00",
+        "codeSeparatorPosition": "ffffffff",
+        "spentOutputs": [
+            {"amount": spent_outputs[0].value, "scriptPubKey": output_script.hex()}
+        ],
+        "witness": [
+            signature.hex(),
+            leaf_script.hex(),
+            f"{P2MR_CONTROL_BYTE_V1:02x}",
+            annex.hex(),
+        ],
+        "leafHash": hashed_leaf.hex(),
+    }
+
+
 def build_missing_output_vector(
     lib: ctypes.CDLL,
     name: str,
@@ -680,45 +785,6 @@ def build_missing_output_vector(
     }
 
 
-def load_corpus(path: Path) -> dict[str, object]:
-    value = json.loads(path.read_text(encoding="utf8"))
-    if not isinstance(value, dict):
-        raise ValueError("witness corpus must be a JSON object")
-    if value.get("schema_version") != SCHEMA_VERSION:
-        raise ValueError("unsupported witness corpus schema_version")
-    if value.get("profile") != PROFILE or value.get("profile_version") != PROFILE_VERSION:
-        raise ValueError("unsupported witness corpus profile")
-    if set(value) != {"schema_version", "profile", "profile_version", "vectors"}:
-        raise ValueError("unknown witness corpus top-level field")
-    if not isinstance(value["vectors"], list):
-        raise ValueError("witness corpus vectors must be an array")
-    return value
-
-
-def owner_for_id(vector_id: str) -> str:
-    if vector_id in PYTHON_OWNED_IDS:
-        return "standalone-python"
-    if vector_id in RUST_OWNED_IDS:
-        return "standalone-rust"
-    raise ValueError(f"unknown witness vector ownership: {vector_id}")
-
-
-def validate_existing_ownership(vector: dict[str, object]) -> str:
-    vector_id = vector.get("id")
-    name = vector.get("name")
-    if not isinstance(vector_id, str) or not vector_id or vector_id != name:
-        raise ValueError("witness vector id and name must be identical non-empty strings")
-    expected_owner = owner_for_id(vector_id)
-    generator = vector.get("generator")
-    if not isinstance(generator, dict):
-        raise ValueError(f"witness vector {vector_id} is missing generator metadata")
-    if set(generator) != {"id", "version"}:
-        raise ValueError(f"witness vector {vector_id} has invalid generator metadata")
-    if generator.get("id") != expected_owner or generator.get("version") != GENERATOR_VERSION:
-        raise ValueError(f"witness vector {vector_id} generator does not match its owner")
-    return vector_id
-
-
 def add_generated_metadata(vector: dict[str, object]) -> str:
     name = vector.get("name")
     if not isinstance(name, str) or name not in PYTHON_GENERATED_IDS:
@@ -763,56 +829,39 @@ def add_common_metadata(vector: dict[str, object], vector_id: str) -> None:
         vector["witness"] = witness
 
 
-def merge_vectors(corpus: dict[str, object], generated: list[dict[str, object]]) -> None:
-    vectors = corpus["vectors"]
-    assert isinstance(vectors, list)
-    generated_by_id: dict[str, dict[str, object]] = {}
+def generated_corpus(generated: list[dict[str, object]]) -> dict[str, object]:
+    vectors: list[dict[str, object]] = []
+    seen: set[str] = set()
     for vector in generated:
         vector_id = add_generated_metadata(vector)
         add_common_metadata(vector, vector_id)
-        if vector_id in generated_by_id:
-            raise ValueError(f"duplicate generated witness vector id: {vector_id}")
-        generated_by_id[vector_id] = vector
-    if set(generated_by_id) != PYTHON_GENERATED_IDS:
-        raise ValueError("Python generator did not produce its exact owned generated ID set")
-
-    seen: set[str] = set()
-    for index, existing in enumerate(vectors):
-        if not isinstance(existing, dict):
-            raise ValueError("witness vector must be an object")
-        vector_id = validate_existing_ownership(existing)
         if vector_id in seen:
-            raise ValueError(f"duplicate witness vector id: {vector_id}")
+            raise ValueError(f"duplicate generated witness vector id: {vector_id}")
         seen.add(vector_id)
-        if vector_id in generated_by_id:
-            existing.update(generated_by_id.pop(vector_id))
-        add_common_metadata(existing, vector_id)
-        vectors[index] = existing
-
-    if seen != ALL_OWNED_IDS:
-        missing = sorted(ALL_OWNED_IDS - seen)
-        unknown = sorted(seen - ALL_OWNED_IDS)
-        raise ValueError(f"witness corpus ownership mismatch; missing={missing}, unknown={unknown}")
-    if generated_by_id:
-        raise ValueError(f"Python-owned vectors missing from input corpus: {sorted(generated_by_id)}")
+        vectors.append(vector)
+    if seen != PYTHON_GENERATED_IDS:
+        raise ValueError("Python generator did not produce its exact owned generated ID set")
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "profile": PROFILE,
+        "profile_version": PROFILE_VERSION,
+        "vectors": vectors,
+    }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", type=Path, required=True, help="existing wrapped corpus to merge")
-    parser.add_argument("--output", type=Path, required=True, help="write the merged corpus to this path")
+    parser.add_argument("--output", type=Path, required=True, help="write the generated corpus")
     args = parser.parse_args()
-
-    if args.input.resolve() == args.output.resolve():
-        raise ValueError("--input and --output must be different paths")
 
     repo_root = Path(__file__).resolve().parents[2]
     lib = load_libbitcoinpqc(repo_root)
     vectors = [build_vector(lib, *spec) for spec in vector_specs()]
+    vectors.append(build_annex_vector(lib))
     vectors += [build_missing_output_vector(lib, *spec) for spec in missing_output_vector_specs()]
-    corpus = load_corpus(args.input)
-    merge_vectors(corpus, vectors)
+    corpus = generated_corpus(vectors)
     payload = json.dumps(corpus, indent=2) + "\n"
+    args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(payload, encoding="utf8")
     return 0
 

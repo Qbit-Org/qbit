@@ -10,51 +10,835 @@
     "validation_weight_per_nonempty_pqc_check": 3730
   },
   "cases": [
-    {"id":"witness-empty","category":"witness-control","scenario":"witness-shape","parameters":{"kind":"empty"},"consensus":{"accepted":false,"stage":"witness","error":"SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY"},"policy":{"accepted":false,"stage":"witness","error":"SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY"}},
-    {"id":"witness-one-element","category":"witness-control","scenario":"witness-shape","parameters":{"kind":"one-element"},"consensus":{"accepted":false,"stage":"witness","error":"SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY"},"policy":{"accepted":false,"stage":"witness","error":"SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY"}},
-    {"id":"witness-annex-underflow","category":"witness-control","scenario":"witness-shape","parameters":{"kind":"annex-underflow"},"consensus":{"accepted":false,"stage":"witness","error":"SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY"},"policy":{"accepted":false,"stage":"witness","error":"SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY"}},
-    {"id":"control-minimum","category":"witness-control","scenario":"control-path","parameters":{"nodes":0,"mutation":"none"},"consensus":{"accepted":true,"stage":"script-complete","error":"SCRIPT_ERR_OK"},"policy":{"accepted":true,"stage":"script-complete","error":"SCRIPT_ERR_OK"}},
-    {"id":"control-depth-128","category":"witness-control","scenario":"control-path","parameters":{"nodes":128,"mutation":"none"},"consensus":{"accepted":true,"stage":"script-complete","error":"SCRIPT_ERR_OK"},"policy":{"accepted":true,"stage":"script-complete","error":"SCRIPT_ERR_OK"}},
-    {"id":"control-depth-129","category":"witness-control","scenario":"control-path","parameters":{"nodes":129,"mutation":"none"},"consensus":{"accepted":false,"stage":"control-size","error":"SCRIPT_ERR_P2MR_WRONG_CONTROL_SIZE"},"policy":{"accepted":false,"stage":"control-size","error":"SCRIPT_ERR_P2MR_WRONG_CONTROL_SIZE"}},
-    {"id":"control-nonmultiple-length","category":"witness-control","scenario":"control-path","parameters":{"nodes":0,"mutation":"append-byte"},"consensus":{"accepted":false,"stage":"control-size","error":"SCRIPT_ERR_P2MR_WRONG_CONTROL_SIZE"},"policy":{"accepted":false,"stage":"control-size","error":"SCRIPT_ERR_P2MR_WRONG_CONTROL_SIZE"}},
-    {"id":"control-marker-zero","category":"witness-control","scenario":"control-path","parameters":{"nodes":0,"mutation":"clear-marker"},"consensus":{"accepted":false,"stage":"control-marker","error":"SCRIPT_ERR_P2MR_CONTROL_BIT0"},"policy":{"accepted":false,"stage":"control-marker","error":"SCRIPT_ERR_P2MR_CONTROL_BIT0"}},
-    {"id":"control-mutated-path-node","category":"witness-control","scenario":"control-path","parameters":{"nodes":1,"mutation":"path-node"},"consensus":{"accepted":false,"stage":"commitment","error":"SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH"},"policy":{"accepted":false,"stage":"commitment","error":"SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH"}},
-    {"id":"control-direct-root-mismatch","category":"witness-control","scenario":"control-path","parameters":{"nodes":0,"mutation":"program-root"},"consensus":{"accepted":false,"stage":"commitment","error":"SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH"},"policy":{"accepted":false,"stage":"commitment","error":"SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH"}},
-
-    {"id":"leaf-c0-true","category":"leaf-version","scenario":"leaf-version","parameters":{"control_byte":193,"script":"true"},"consensus":{"accepted":true,"stage":"script-complete","error":"SCRIPT_ERR_OK"},"policy":{"accepted":true,"stage":"script-complete","error":"SCRIPT_ERR_OK"}},
-    {"id":"leaf-c0-false","category":"leaf-version","scenario":"leaf-version","parameters":{"control_byte":193,"script":"false"},"consensus":{"accepted":false,"stage":"script","error":"SCRIPT_ERR_EVAL_FALSE"},"policy":{"accepted":false,"stage":"script","error":"SCRIPT_ERR_EVAL_FALSE"}},
-    {"id":"leaf-production-reserved","category":"leaf-version","scenario":"leaf-version","parameters":{"control_byte":195,"script":"false"},"consensus":{"accepted":true,"stage":"upgrade-success","error":"SCRIPT_ERR_OK"},"policy":{"accepted":false,"stage":"policy","error":"SCRIPT_ERR_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION"}},
-    {"id":"leaf-staged-signature-system","category":"leaf-version","scenario":"leaf-version","parameters":{"control_byte":225,"script":"false"},"consensus":{"accepted":true,"stage":"upgrade-success","error":"SCRIPT_ERR_OK"},"policy":{"accepted":false,"stage":"policy","error":"SCRIPT_ERR_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION"}},
-    {"id":"leaf-experimental","category":"leaf-version","scenario":"leaf-version","parameters":{"control_byte":241,"script":"false"},"consensus":{"accepted":true,"stage":"upgrade-success","error":"SCRIPT_ERR_OK"},"policy":{"accepted":false,"stage":"policy","error":"SCRIPT_ERR_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION"}},
-    {"id":"leaf-extension-fe","category":"leaf-version","scenario":"leaf-version","parameters":{"control_byte":255,"script":"false"},"consensus":{"accepted":true,"stage":"upgrade-success","error":"SCRIPT_ERR_OK"},"policy":{"accepted":false,"stage":"policy","error":"SCRIPT_ERR_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION"}},
-    {"id":"leaf-odd-control-mask","category":"leaf-version","scenario":"leaf-version","parameters":{"control_byte":195,"script":"true"},"consensus":{"accepted":true,"stage":"upgrade-success","error":"SCRIPT_ERR_OK"},"policy":{"accepted":false,"stage":"policy","error":"SCRIPT_ERR_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION"}},
-
-    {"id":"opcode-checksigpqc-valid","category":"opcode","scenario":"opcode","parameters":{"kind":"checksigpqc-valid","fixture_file":"src/test/data/p2mr_pqc_witness_vectors.json","fixture_id":"single_key_default_sighash","artifact":"transaction-checksigpqc"},"consensus":{"accepted":true,"stage":"script-complete","error":"SCRIPT_ERR_OK"},"policy":{"accepted":true,"stage":"script-complete","error":"SCRIPT_ERR_OK"}},
-    {"id":"opcode-checksigpqc-empty-signature","category":"opcode","scenario":"opcode","parameters":{"kind":"checksigpqc-empty"},"consensus":{"accepted":false,"stage":"script","error":"SCRIPT_ERR_VERIFY"},"policy":{"accepted":false,"stage":"script","error":"SCRIPT_ERR_VERIFY"}},
-    {"id":"opcode-checksigpqc-bad-size","category":"opcode","scenario":"opcode","parameters":{"kind":"checksigpqc-bad-size"},"consensus":{"accepted":false,"stage":"script","error":"SCRIPT_ERR_P2MR_SIG_SIZE"},"policy":{"accepted":false,"stage":"script","error":"SCRIPT_ERR_P2MR_SIG_SIZE"}},
-    {"id":"opcode-checksigpqc-bad-key","category":"opcode","scenario":"opcode","parameters":{"kind":"checksigpqc-bad-key"},"consensus":{"accepted":false,"stage":"script","error":"SCRIPT_ERR_PUBKEYTYPE"},"policy":{"accepted":false,"stage":"script","error":"SCRIPT_ERR_PUBKEYTYPE"}},
-    {"id":"opcode-checksigpqc-invalid-signature","category":"opcode","scenario":"opcode","parameters":{"kind":"checksigpqc-invalid","fixture_file":"src/test/data/p2mr_pqc_witness_vectors.json","fixture_id":"single_key_default_sighash","artifact":"transaction-checksigpqc","mutation":"flip-first-signature-byte"},"consensus":{"accepted":false,"stage":"script","error":"SCRIPT_ERR_P2MR_SIG"},"policy":{"accepted":false,"stage":"script","error":"SCRIPT_ERR_P2MR_SIG"}},
-    {"id":"opcode-checksigadd-pqc","category":"opcode","scenario":"opcode","parameters":{"kind":"checksigadd-valid","fixture_file":"src/test/data/p2mr_pqc_witness_vectors.json","fixture_id":"single_key_default_sighash","artifact":"checkSigAdd"},"consensus":{"accepted":true,"stage":"script-complete","error":"SCRIPT_ERR_OK"},"policy":{"accepted":true,"stage":"script-complete","error":"SCRIPT_ERR_OK"}},
-    {"id":"opcode-legacy-checksig","category":"opcode","scenario":"opcode","parameters":{"kind":"legacy-checksig"},"consensus":{"accepted":false,"stage":"script","error":"SCRIPT_ERR_P2MR_CHECKSIG"},"policy":{"accepted":false,"stage":"script","error":"SCRIPT_ERR_P2MR_CHECKSIG"}},
-    {"id":"opcode-legacy-checkmultisig","category":"opcode","scenario":"opcode","parameters":{"kind":"legacy-checkmultisig"},"consensus":{"accepted":false,"stage":"script","error":"SCRIPT_ERR_TAPSCRIPT_CHECKMULTISIG"},"policy":{"accepted":false,"stage":"script","error":"SCRIPT_ERR_TAPSCRIPT_CHECKMULTISIG"}},
-    {"id":"opcode-ctv-valid","category":"opcode","scenario":"opcode","parameters":{"kind":"ctv-fixed","control_block":"c1","template_hash":"6597328251a37cb785454f8315b503cefb55e79383bbb6b361c7ed0aa36c28ac","leaf_script":"206597328251a37cb785454f8315b503cefb55e79383bbb6b361c7ed0aa36c28acbb","script_pubkey":"52207efd262261fb0e7917e65f9ba628fa12549527ec1649173648e6e637cfd017ac"},"consensus":{"accepted":true,"stage":"script-complete","error":"SCRIPT_ERR_OK"},"policy":{"accepted":true,"stage":"script-complete","error":"SCRIPT_ERR_OK"}},
-    {"id":"opcode-ctv-mismatch","category":"opcode","scenario":"opcode","parameters":{"kind":"ctv-fixed","control_block":"c1","template_hash":"6497328251a37cb785454f8315b503cefb55e79383bbb6b361c7ed0aa36c28ac","leaf_script":"206497328251a37cb785454f8315b503cefb55e79383bbb6b361c7ed0aa36c28acbb","script_pubkey":"522093e9c5f8a9170f35989d4c55ec190d356e79743ac59d3428fedde4ddfe79b2e1"},"consensus":{"accepted":false,"stage":"script","error":"SCRIPT_ERR_TEMPLATE_MISMATCH"},"policy":{"accepted":false,"stage":"script","error":"SCRIPT_ERR_TEMPLATE_MISMATCH"}},
-    {"id":"opcode-checkdatasigpqc","category":"opcode","scenario":"opcode","parameters":{"kind":"checkdatasigpqc-valid","fixture_file":"src/test/data/p2mr_pqc_witness_vectors.json","fixture_id":"single_key_default_sighash","artifact":"dataSig"},"consensus":{"accepted":true,"stage":"script-complete","error":"SCRIPT_ERR_OK"},"policy":{"accepted":true,"stage":"script-complete","error":"SCRIPT_ERR_OK"}},
-    {"id":"opcode-checkdatasigaddpqc","category":"opcode","scenario":"opcode","parameters":{"kind":"checkdatasigaddpqc-valid","fixture_file":"src/test/data/p2mr_pqc_witness_vectors.json","fixture_id":"single_key_default_sighash","artifact":"dataSigAdd"},"consensus":{"accepted":true,"stage":"script-complete","error":"SCRIPT_ERR_OK"},"policy":{"accepted":true,"stage":"script-complete","error":"SCRIPT_ERR_OK"}},
-    {"id":"opcode-nonactivated-op-success","category":"opcode","scenario":"opcode","parameters":{"kind":"op-success"},"consensus":{"accepted":true,"stage":"op-success","error":"SCRIPT_ERR_OK"},"policy":{"accepted":false,"stage":"policy","error":"SCRIPT_ERR_DISCOURAGE_OP_SUCCESS"}},
-    {"id":"opcode-permanently-disabled","category":"opcode","scenario":"opcode","parameters":{"kind":"disabled"},"consensus":{"accepted":false,"stage":"script","error":"SCRIPT_ERR_BAD_OPCODE"},"policy":{"accepted":false,"stage":"script","error":"SCRIPT_ERR_BAD_OPCODE"}},
-
-    {"id":"resource-stack-items-1000","category":"resource","scenario":"resource","parameters":{"kind":"stack-items","value":1000},"consensus":{"accepted":true,"stage":"script-complete","error":"SCRIPT_ERR_OK"},"policy":{"accepted":true,"stage":"script-complete","error":"SCRIPT_ERR_OK"}},
-    {"id":"resource-stack-items-1001","category":"resource","scenario":"resource","parameters":{"kind":"stack-items","value":1001},"consensus":{"accepted":false,"stage":"initial-stack","error":"SCRIPT_ERR_STACK_SIZE"},"policy":{"accepted":false,"stage":"initial-stack","error":"SCRIPT_ERR_STACK_SIZE"}},
-    {"id":"resource-item-bytes-16384","category":"resource","scenario":"resource","parameters":{"kind":"item-bytes","value":16384},"consensus":{"accepted":true,"stage":"script-complete","error":"SCRIPT_ERR_OK"},"policy":{"accepted":true,"stage":"script-complete","error":"SCRIPT_ERR_OK"}},
-    {"id":"resource-item-bytes-16385","category":"resource","scenario":"resource","parameters":{"kind":"item-bytes","value":16385},"consensus":{"accepted":false,"stage":"initial-stack","error":"SCRIPT_ERR_PUSH_SIZE"},"policy":{"accepted":false,"stage":"initial-stack","error":"SCRIPT_ERR_PUSH_SIZE"}},
-    {"id":"resource-total-bytes-131072","category":"resource","scenario":"resource","parameters":{"kind":"total-bytes","value":131072},"consensus":{"accepted":true,"stage":"script-complete","error":"SCRIPT_ERR_OK"},"policy":{"accepted":true,"stage":"script-complete","error":"SCRIPT_ERR_OK"}},
-    {"id":"resource-total-bytes-131073","category":"resource","scenario":"resource","parameters":{"kind":"total-bytes","value":131073},"consensus":{"accepted":false,"stage":"initial-stack","error":"SCRIPT_ERR_PUSH_SIZE"},"policy":{"accepted":false,"stage":"initial-stack","error":"SCRIPT_ERR_PUSH_SIZE"}},
-    {"id":"resource-validation-weight-one","category":"resource","scenario":"resource","parameters":{"kind":"validation-weight","nonempty_checks":1,"fixture_file":"src/test/data/p2mr_pqc_witness_vectors.json","fixture_id":"single_key_default_sighash","artifact":"transaction-checksigpqc"},"consensus":{"accepted":true,"stage":"script-complete","error":"SCRIPT_ERR_OK"},"policy":{"accepted":true,"stage":"script-complete","error":"SCRIPT_ERR_OK"}},
-    {"id":"resource-validation-weight-multiple","category":"resource","scenario":"resource","parameters":{"kind":"validation-weight","nonempty_checks":2,"fixture_file":"src/test/data/p2mr_pqc_witness_vectors.json","fixture_id":"single_key_default_sighash","artifact":"dataSigAdd"},"consensus":{"accepted":true,"stage":"script-complete","error":"SCRIPT_ERR_OK"},"policy":{"accepted":true,"stage":"script-complete","error":"SCRIPT_ERR_OK"}},
-    {"id":"resource-validation-weight-exceeded","category":"resource","scenario":"resource","parameters":{"kind":"validation-weight-exceeded","nonempty_checks":2},"consensus":{"accepted":false,"stage":"validation-weight","error":"SCRIPT_ERR_P2MR_VALIDATION_WEIGHT"},"policy":{"accepted":false,"stage":"validation-weight","error":"SCRIPT_ERR_P2MR_VALIDATION_WEIGHT"}},
-    {"id":"resource-empty-signatures-no-charge","category":"resource","scenario":"resource","parameters":{"kind":"empty-signatures","nonempty_checks":0},"consensus":{"accepted":true,"stage":"script-complete","error":"SCRIPT_ERR_OK"},"policy":{"accepted":true,"stage":"script-complete","error":"SCRIPT_ERR_OK"}},
-    {"id":"resource-clean-stack","category":"resource","scenario":"resource","parameters":{"kind":"clean-stack","value":2},"consensus":{"accepted":false,"stage":"script-complete","error":"SCRIPT_ERR_CLEANSTACK"},"policy":{"accepted":false,"stage":"script-complete","error":"SCRIPT_ERR_CLEANSTACK"}},
-    {"id":"resource-false-final-stack","category":"resource","scenario":"resource","parameters":{"kind":"false-final","value":0},"consensus":{"accepted":false,"stage":"script-complete","error":"SCRIPT_ERR_EVAL_FALSE"},"policy":{"accepted":false,"stage":"script-complete","error":"SCRIPT_ERR_EVAL_FALSE"}}
+    {
+      "id": "witness-empty",
+      "category": "witness-control",
+      "scenario": "witness-shape",
+      "parameters": {
+        "kind": "empty"
+      },
+      "consensus": {
+        "accepted": false,
+        "stage": "witness",
+        "error": "SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "witness",
+        "error": "SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY"
+      }
+    },
+    {
+      "id": "witness-one-element",
+      "category": "witness-control",
+      "scenario": "witness-shape",
+      "parameters": {
+        "kind": "one-element"
+      },
+      "consensus": {
+        "accepted": false,
+        "stage": "witness",
+        "error": "SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "witness",
+        "error": "SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY"
+      }
+    },
+    {
+      "id": "witness-annex-underflow",
+      "category": "witness-control",
+      "scenario": "witness-shape",
+      "parameters": {
+        "kind": "annex-underflow"
+      },
+      "consensus": {
+        "accepted": false,
+        "stage": "witness",
+        "error": "SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "witness",
+        "error": "SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY"
+      }
+    },
+    {
+      "id": "control-minimum",
+      "category": "witness-control",
+      "scenario": "control-path",
+      "parameters": {
+        "nodes": 0,
+        "mutation": "none"
+      },
+      "consensus": {
+        "accepted": true,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_OK"
+      },
+      "policy": {
+        "accepted": true,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_OK"
+      }
+    },
+    {
+      "id": "control-depth-128",
+      "category": "witness-control",
+      "scenario": "control-path",
+      "parameters": {
+        "nodes": 128,
+        "mutation": "none"
+      },
+      "consensus": {
+        "accepted": true,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_OK"
+      },
+      "policy": {
+        "accepted": true,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_OK"
+      }
+    },
+    {
+      "id": "control-depth-129",
+      "category": "witness-control",
+      "scenario": "control-path",
+      "parameters": {
+        "nodes": 129,
+        "mutation": "none"
+      },
+      "consensus": {
+        "accepted": false,
+        "stage": "control-size",
+        "error": "SCRIPT_ERR_P2MR_WRONG_CONTROL_SIZE"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "control-size",
+        "error": "SCRIPT_ERR_P2MR_WRONG_CONTROL_SIZE"
+      }
+    },
+    {
+      "id": "control-nonmultiple-length",
+      "category": "witness-control",
+      "scenario": "control-path",
+      "parameters": {
+        "nodes": 0,
+        "mutation": "append-byte"
+      },
+      "consensus": {
+        "accepted": false,
+        "stage": "control-size",
+        "error": "SCRIPT_ERR_P2MR_WRONG_CONTROL_SIZE"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "control-size",
+        "error": "SCRIPT_ERR_P2MR_WRONG_CONTROL_SIZE"
+      }
+    },
+    {
+      "id": "control-marker-zero",
+      "category": "witness-control",
+      "scenario": "control-path",
+      "parameters": {
+        "nodes": 0,
+        "mutation": "clear-marker"
+      },
+      "consensus": {
+        "accepted": false,
+        "stage": "control-marker",
+        "error": "SCRIPT_ERR_P2MR_CONTROL_BIT0"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "control-marker",
+        "error": "SCRIPT_ERR_P2MR_CONTROL_BIT0"
+      }
+    },
+    {
+      "id": "control-mutated-path-node",
+      "category": "witness-control",
+      "scenario": "control-path",
+      "parameters": {
+        "nodes": 1,
+        "mutation": "path-node"
+      },
+      "consensus": {
+        "accepted": false,
+        "stage": "commitment",
+        "error": "SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "commitment",
+        "error": "SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH"
+      }
+    },
+    {
+      "id": "control-direct-root-mismatch",
+      "category": "witness-control",
+      "scenario": "control-path",
+      "parameters": {
+        "nodes": 0,
+        "mutation": "program-root"
+      },
+      "consensus": {
+        "accepted": false,
+        "stage": "commitment",
+        "error": "SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "commitment",
+        "error": "SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH"
+      }
+    },
+    {
+      "id": "leaf-c0-true",
+      "category": "leaf-version",
+      "scenario": "leaf-version",
+      "parameters": {
+        "control_byte": 193,
+        "script": "true"
+      },
+      "consensus": {
+        "accepted": true,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_OK"
+      },
+      "policy": {
+        "accepted": true,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_OK"
+      }
+    },
+    {
+      "id": "leaf-c0-false",
+      "category": "leaf-version",
+      "scenario": "leaf-version",
+      "parameters": {
+        "control_byte": 193,
+        "script": "false"
+      },
+      "consensus": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_EVAL_FALSE"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_EVAL_FALSE"
+      }
+    },
+    {
+      "id": "leaf-production-reserved",
+      "category": "leaf-version",
+      "scenario": "leaf-version",
+      "parameters": {
+        "control_byte": 195,
+        "script": "false"
+      },
+      "consensus": {
+        "accepted": true,
+        "stage": "upgrade-success",
+        "error": "SCRIPT_ERR_OK"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "policy",
+        "error": "SCRIPT_ERR_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION"
+      }
+    },
+    {
+      "id": "leaf-staged-signature-system",
+      "category": "leaf-version",
+      "scenario": "leaf-version",
+      "parameters": {
+        "control_byte": 225,
+        "script": "false"
+      },
+      "consensus": {
+        "accepted": true,
+        "stage": "upgrade-success",
+        "error": "SCRIPT_ERR_OK"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "policy",
+        "error": "SCRIPT_ERR_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION"
+      }
+    },
+    {
+      "id": "leaf-experimental",
+      "category": "leaf-version",
+      "scenario": "leaf-version",
+      "parameters": {
+        "control_byte": 241,
+        "script": "false"
+      },
+      "consensus": {
+        "accepted": true,
+        "stage": "upgrade-success",
+        "error": "SCRIPT_ERR_OK"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "policy",
+        "error": "SCRIPT_ERR_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION"
+      }
+    },
+    {
+      "id": "leaf-extension-fe",
+      "category": "leaf-version",
+      "scenario": "leaf-version",
+      "parameters": {
+        "control_byte": 255,
+        "script": "false"
+      },
+      "consensus": {
+        "accepted": true,
+        "stage": "upgrade-success",
+        "error": "SCRIPT_ERR_OK"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "policy",
+        "error": "SCRIPT_ERR_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION"
+      }
+    },
+    {
+      "id": "leaf-odd-control-mask",
+      "category": "leaf-version",
+      "scenario": "leaf-version",
+      "parameters": {
+        "control_byte": 195,
+        "script": "true"
+      },
+      "consensus": {
+        "accepted": true,
+        "stage": "upgrade-success",
+        "error": "SCRIPT_ERR_OK"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "policy",
+        "error": "SCRIPT_ERR_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION"
+      }
+    },
+    {
+      "id": "opcode-checksigpqc-valid",
+      "category": "opcode",
+      "scenario": "opcode",
+      "parameters": {
+        "kind": "checksigpqc-valid",
+        "fixture_file": "src/test/data/p2mr_pqc_witness_vectors.json",
+        "fixture_id": "single_key_default_sighash",
+        "artifact": "transaction-checksigpqc"
+      },
+      "consensus": {
+        "accepted": true,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_OK"
+      },
+      "policy": {
+        "accepted": true,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_OK"
+      }
+    },
+    {
+      "id": "opcode-checksigpqc-empty-signature",
+      "category": "opcode",
+      "scenario": "opcode",
+      "parameters": {
+        "kind": "checksigpqc-empty"
+      },
+      "consensus": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_VERIFY"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_VERIFY"
+      }
+    },
+    {
+      "id": "opcode-checksigpqc-bad-size",
+      "category": "opcode",
+      "scenario": "opcode",
+      "parameters": {
+        "kind": "checksigpqc-bad-size"
+      },
+      "consensus": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_P2MR_SIG_SIZE"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_P2MR_SIG_SIZE"
+      }
+    },
+    {
+      "id": "opcode-checksigpqc-bad-key",
+      "category": "opcode",
+      "scenario": "opcode",
+      "parameters": {
+        "kind": "checksigpqc-bad-key"
+      },
+      "consensus": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_PUBKEYTYPE"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_PUBKEYTYPE"
+      }
+    },
+    {
+      "id": "opcode-checksigpqc-invalid-signature",
+      "category": "opcode",
+      "scenario": "opcode",
+      "parameters": {
+        "kind": "checksigpqc-invalid",
+        "fixture_file": "src/test/data/p2mr_pqc_witness_vectors.json",
+        "fixture_id": "single_key_default_sighash",
+        "artifact": "transaction-checksigpqc",
+        "mutation": "flip-first-signature-byte"
+      },
+      "consensus": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_P2MR_SIG"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_P2MR_SIG"
+      }
+    },
+    {
+      "id": "opcode-checksigadd-pqc",
+      "category": "opcode",
+      "scenario": "opcode",
+      "parameters": {
+        "kind": "checksigadd-valid",
+        "fixture_file": "src/test/data/p2mr_pqc_witness_vectors.json",
+        "fixture_id": "single_key_default_sighash",
+        "artifact": "checkSigAdd"
+      },
+      "consensus": {
+        "accepted": true,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_OK"
+      },
+      "policy": {
+        "accepted": true,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_OK"
+      }
+    },
+    {
+      "id": "opcode-legacy-checksig",
+      "category": "opcode",
+      "scenario": "opcode",
+      "parameters": {
+        "kind": "legacy-checksig"
+      },
+      "consensus": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_P2MR_CHECKSIG"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_P2MR_CHECKSIG"
+      }
+    },
+    {
+      "id": "opcode-legacy-checkmultisig",
+      "category": "opcode",
+      "scenario": "opcode",
+      "parameters": {
+        "kind": "legacy-checkmultisig"
+      },
+      "consensus": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_TAPSCRIPT_CHECKMULTISIG"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_TAPSCRIPT_CHECKMULTISIG"
+      }
+    },
+    {
+      "id": "opcode-ctv-valid",
+      "category": "opcode",
+      "scenario": "opcode",
+      "parameters": {
+        "kind": "ctv-fixed",
+        "control_block": "c1",
+        "template_hash": "6597328251a37cb785454f8315b503cefb55e79383bbb6b361c7ed0aa36c28ac",
+        "leaf_script": "206597328251a37cb785454f8315b503cefb55e79383bbb6b361c7ed0aa36c28acbb",
+        "script_pubkey": "52207efd262261fb0e7917e65f9ba628fa12549527ec1649173648e6e637cfd017ac"
+      },
+      "consensus": {
+        "accepted": true,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_OK"
+      },
+      "policy": {
+        "accepted": true,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_OK"
+      }
+    },
+    {
+      "id": "opcode-ctv-mismatch",
+      "category": "opcode",
+      "scenario": "opcode",
+      "parameters": {
+        "kind": "ctv-fixed",
+        "control_block": "c1",
+        "template_hash": "6497328251a37cb785454f8315b503cefb55e79383bbb6b361c7ed0aa36c28ac",
+        "leaf_script": "206497328251a37cb785454f8315b503cefb55e79383bbb6b361c7ed0aa36c28acbb",
+        "script_pubkey": "522093e9c5f8a9170f35989d4c55ec190d356e79743ac59d3428fedde4ddfe79b2e1"
+      },
+      "consensus": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_TEMPLATE_MISMATCH"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_TEMPLATE_MISMATCH"
+      }
+    },
+    {
+      "id": "opcode-checkdatasigpqc",
+      "category": "opcode",
+      "scenario": "opcode",
+      "parameters": {
+        "kind": "checkdatasigpqc-valid",
+        "fixture_file": "src/test/data/p2mr_pqc_witness_vectors.json",
+        "fixture_id": "single_key_default_sighash",
+        "artifact": "dataSig"
+      },
+      "consensus": {
+        "accepted": true,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_OK"
+      },
+      "policy": {
+        "accepted": true,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_OK"
+      }
+    },
+    {
+      "id": "opcode-checkdatasigaddpqc",
+      "category": "opcode",
+      "scenario": "opcode",
+      "parameters": {
+        "kind": "checkdatasigaddpqc-valid",
+        "fixture_file": "src/test/data/p2mr_pqc_witness_vectors.json",
+        "fixture_id": "single_key_default_sighash",
+        "artifact": "dataSigAdd"
+      },
+      "consensus": {
+        "accepted": true,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_OK"
+      },
+      "policy": {
+        "accepted": true,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_OK"
+      }
+    },
+    {
+      "id": "opcode-nonactivated-op-success",
+      "category": "opcode",
+      "scenario": "opcode",
+      "parameters": {
+        "kind": "op-success"
+      },
+      "consensus": {
+        "accepted": true,
+        "stage": "op-success",
+        "error": "SCRIPT_ERR_OK"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "policy",
+        "error": "SCRIPT_ERR_DISCOURAGE_OP_SUCCESS"
+      }
+    },
+    {
+      "id": "opcode-permanently-disabled",
+      "category": "opcode",
+      "scenario": "opcode",
+      "parameters": {
+        "kind": "disabled"
+      },
+      "consensus": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_BAD_OPCODE"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_BAD_OPCODE"
+      }
+    },
+    {
+      "id": "resource-stack-items-1000",
+      "category": "resource",
+      "scenario": "resource",
+      "parameters": {
+        "kind": "stack-items",
+        "value": 1000
+      },
+      "consensus": {
+        "accepted": true,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_OK"
+      },
+      "policy": {
+        "accepted": true,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_OK"
+      }
+    },
+    {
+      "id": "resource-stack-items-1001",
+      "category": "resource",
+      "scenario": "resource",
+      "parameters": {
+        "kind": "stack-items",
+        "value": 1001
+      },
+      "consensus": {
+        "accepted": false,
+        "stage": "initial-stack",
+        "error": "SCRIPT_ERR_STACK_SIZE"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "initial-stack",
+        "error": "SCRIPT_ERR_STACK_SIZE"
+      }
+    },
+    {
+      "id": "resource-item-bytes-16384",
+      "category": "resource",
+      "scenario": "resource",
+      "parameters": {
+        "kind": "item-bytes",
+        "value": 16384
+      },
+      "consensus": {
+        "accepted": true,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_OK"
+      },
+      "policy": {
+        "accepted": true,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_OK"
+      }
+    },
+    {
+      "id": "resource-item-bytes-16385",
+      "category": "resource",
+      "scenario": "resource",
+      "parameters": {
+        "kind": "item-bytes",
+        "value": 16385
+      },
+      "consensus": {
+        "accepted": false,
+        "stage": "initial-stack",
+        "error": "SCRIPT_ERR_PUSH_SIZE"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "initial-stack",
+        "error": "SCRIPT_ERR_PUSH_SIZE"
+      }
+    },
+    {
+      "id": "resource-total-bytes-131072",
+      "category": "resource",
+      "scenario": "resource",
+      "parameters": {
+        "kind": "total-bytes",
+        "value": 131072
+      },
+      "consensus": {
+        "accepted": true,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_OK"
+      },
+      "policy": {
+        "accepted": true,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_OK"
+      }
+    },
+    {
+      "id": "resource-total-bytes-131073",
+      "category": "resource",
+      "scenario": "resource",
+      "parameters": {
+        "kind": "total-bytes",
+        "value": 131073
+      },
+      "consensus": {
+        "accepted": false,
+        "stage": "initial-stack",
+        "error": "SCRIPT_ERR_PUSH_SIZE"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "initial-stack",
+        "error": "SCRIPT_ERR_PUSH_SIZE"
+      }
+    },
+    {
+      "id": "resource-validation-weight-one",
+      "category": "resource",
+      "scenario": "resource",
+      "parameters": {
+        "kind": "validation-weight",
+        "nonempty_checks": 1,
+        "fixture_file": "src/test/data/p2mr_pqc_witness_vectors.json",
+        "fixture_id": "single_key_default_sighash",
+        "artifact": "transaction-checksigpqc"
+      },
+      "consensus": {
+        "accepted": true,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_OK"
+      },
+      "policy": {
+        "accepted": true,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_OK"
+      }
+    },
+    {
+      "id": "resource-validation-weight-multiple",
+      "category": "resource",
+      "scenario": "resource",
+      "parameters": {
+        "kind": "validation-weight",
+        "nonempty_checks": 2,
+        "fixture_file": "src/test/data/p2mr_pqc_witness_vectors.json",
+        "fixture_id": "single_key_default_sighash",
+        "artifact": "dataSigAdd"
+      },
+      "consensus": {
+        "accepted": true,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_OK"
+      },
+      "policy": {
+        "accepted": true,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_OK"
+      }
+    },
+    {
+      "id": "resource-validation-weight-exceeded",
+      "category": "resource",
+      "scenario": "resource",
+      "parameters": {
+        "kind": "validation-weight-exceeded",
+        "nonempty_checks": 2
+      },
+      "consensus": {
+        "accepted": false,
+        "stage": "validation-weight",
+        "error": "SCRIPT_ERR_P2MR_VALIDATION_WEIGHT"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "validation-weight",
+        "error": "SCRIPT_ERR_P2MR_VALIDATION_WEIGHT"
+      }
+    },
+    {
+      "id": "resource-empty-signatures-no-charge",
+      "category": "resource",
+      "scenario": "resource",
+      "parameters": {
+        "kind": "empty-signatures",
+        "nonempty_checks": 0
+      },
+      "consensus": {
+        "accepted": true,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_OK"
+      },
+      "policy": {
+        "accepted": true,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_OK"
+      }
+    },
+    {
+      "id": "resource-clean-stack",
+      "category": "resource",
+      "scenario": "resource",
+      "parameters": {
+        "kind": "clean-stack",
+        "value": 2
+      },
+      "consensus": {
+        "accepted": false,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_CLEANSTACK"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_CLEANSTACK"
+      }
+    },
+    {
+      "id": "resource-false-final-stack",
+      "category": "resource",
+      "scenario": "resource",
+      "parameters": {
+        "kind": "false-final",
+        "value": 0
+      },
+      "consensus": {
+        "accepted": false,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_EVAL_FALSE"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_EVAL_FALSE"
+      }
+    }
   ]
 }

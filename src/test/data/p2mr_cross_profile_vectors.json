@@ -18,11 +18,22 @@
       "control_block": "c1",
       "tapleaf_root": "e7e4d593fcb72926eedbe0d1e311f41acd6f6ef161dcba081a75168ec4dcd379",
       "p2mr_leaf_root": "fae97225114b26d9ef3e3bea70f90d08fec30d9833c50b23e4a6cf8c33e6b200",
+      "witness": [
+        "00",
+        "c1"
+      ],
       "scriptPubKey": "5220e7e4d593fcb72926eedbe0d1e311f41acd6f6ef161dcba081a75168ec4dcd379",
-      "witness": ["00", "c1"],
       "expected": {
-        "pinned_bip_360": {"accepted": true, "stage": "depth-zero-shortcut", "error": "SCRIPT_ERR_OK"},
-        "qbit_p2mr_v1": {"accepted": false, "stage": "commitment", "error": "SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH"}
+        "pinned_bip_360": {
+          "accepted": true,
+          "stage": "depth-zero-shortcut",
+          "error": "SCRIPT_ERR_OK"
+        },
+        "qbit_p2mr_v1": {
+          "accepted": false,
+          "stage": "commitment",
+          "error": "SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH"
+        }
       }
     },
     {
@@ -34,11 +45,22 @@
       "control_block": "c1",
       "tapleaf_root": "e7e4d593fcb72926eedbe0d1e311f41acd6f6ef161dcba081a75168ec4dcd379",
       "p2mr_leaf_root": "fae97225114b26d9ef3e3bea70f90d08fec30d9833c50b23e4a6cf8c33e6b200",
+      "witness": [
+        "00",
+        "c1"
+      ],
       "scriptPubKey": "5220fae97225114b26d9ef3e3bea70f90d08fec30d9833c50b23e4a6cf8c33e6b200",
-      "witness": ["00", "c1"],
       "expected": {
-        "bip_style_depth_zero_with_qbit_tags": {"accepted": true, "stage": "depth-zero-shortcut", "error": "SCRIPT_ERR_OK"},
-        "qbit_p2mr_v1": {"accepted": false, "stage": "script-execution", "error": "SCRIPT_ERR_EVAL_FALSE"}
+        "bip_style_depth_zero_with_qbit_tags": {
+          "accepted": true,
+          "stage": "depth-zero-shortcut",
+          "error": "SCRIPT_ERR_OK"
+        },
+        "qbit_p2mr_v1": {
+          "accepted": false,
+          "stage": "script-execution",
+          "error": "SCRIPT_ERR_EVAL_FALSE"
+        }
       }
     }
   ]

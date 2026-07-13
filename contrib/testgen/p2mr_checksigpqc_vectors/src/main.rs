@@ -1,11 +1,10 @@
 use bitcoinpqc::{generate_keypair, sign, verify, KeyPair};
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 const OP_1: u8 = 0x51;
 const OP_2: u8 = 0x52;
@@ -23,19 +22,6 @@ const SCHEMA_VERSION: u64 = 1;
 const PROFILE: &str = "qbit-p2mr-v1";
 const PROFILE_VERSION: u64 = 1;
 const GENERATOR_VERSION: u64 = 1;
-const PYTHON_OWNED_IDS: [&str; 11] = [
-    "single_key_default_sighash",
-    "single_key_sighash_none",
-    "single_key_sighash_single_matching_output",
-    "single_key_sighash_all_anyonecanpay",
-    "single_key_sighash_none_anyonecanpay",
-    "single_key_sighash_single_anyonecanpay",
-    "single_key_default_sighash_annex_present",
-    "single_key_sighash_single_missing_first",
-    "single_key_sighash_single_missing_beyond",
-    "single_key_sighash_single_anyonecanpay_missing_first",
-    "single_key_sighash_single_anyonecanpay_missing_beyond",
-];
 const RUST_OWNED_IDS: [&str; 3] = [
     "single_key_leading_codesep",
     "branch_codesep_true",
@@ -148,23 +134,31 @@ struct Expected {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (input_path, output_path) = parse_args()?;
-    if input_path == output_path {
-        return Err("--input and --output must be different paths".into());
+    let output_path = parse_args()?;
+    let vectors = build_vectors()?;
+    let generated_ids: Vec<&str> = vectors.iter().map(|vector| vector.id.as_str()).collect();
+    if generated_ids != RUST_OWNED_IDS {
+        return Err("Rust generator did not produce its exact owned ID order".into());
     }
-    let corpus = merge_existing_fields(&input_path, build_vectors()?)?;
+    let corpus = json!({
+        "schema_version": SCHEMA_VERSION,
+        "profile": PROFILE,
+        "profile_version": PROFILE_VERSION,
+        "vectors": vectors,
+    });
     let json = serde_json::to_string_pretty(&corpus)?;
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     fs::write(output_path, format!("{json}\n"))?;
     Ok(())
 }
 
-fn parse_args() -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
+fn parse_args() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
-    let mut input = None;
     let mut output = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--input" => input = Some(PathBuf::from(args.next().ok_or("--input requires a path")?)),
             "--output" => {
                 output = Some(PathBuf::from(
                     args.next().ok_or("--output requires a path")?,
@@ -173,10 +167,7 @@ fn parse_args() -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
             _ => return Err(format!("unknown argument: {arg}").into()),
         }
     }
-    Ok((
-        input.ok_or("missing required --input")?,
-        output.ok_or("missing required --output")?,
-    ))
+    Ok(output.ok_or("missing required --output")?)
 }
 
 fn build_vectors() -> Result<Vec<WitnessVector>, Box<dyn std::error::Error>> {
@@ -221,137 +212,6 @@ fn build_vectors() -> Result<Vec<WitnessVector>, Box<dyn std::error::Error>> {
             9,
         )?,
     ])
-}
-
-fn merge_existing_fields(
-    input_path: &Path,
-    generated: Vec<WitnessVector>,
-) -> Result<Value, Box<dyn std::error::Error>> {
-    let mut generated_by_id = HashMap::<String, Map<String, Value>>::new();
-    for vector in generated {
-        let generated_value = serde_json::to_value(vector)?;
-        let generated_object = generated_value
-            .as_object()
-            .ok_or("generated vector did not serialize to a JSON object")?
-            .clone();
-        let id = generated_object
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or("generated vector is missing an id")?
-            .to_string();
-
-        if expected_owner(&id) != Some("standalone-rust") {
-            return Err(format!("Rust generator produced unowned vector {id}").into());
-        }
-        if generated_by_id
-            .insert(id.clone(), generated_object)
-            .is_some()
-        {
-            return Err(format!("duplicate generated vector {id}").into());
-        }
-    }
-    let generated_ids: HashSet<&str> = generated_by_id.keys().map(String::as_str).collect();
-    if generated_ids != RUST_OWNED_IDS.into_iter().collect() {
-        return Err("Rust generator did not produce its exact owned ID set".into());
-    }
-
-    let mut corpus: Value = serde_json::from_str(&fs::read_to_string(input_path)?)?;
-    validate_corpus(&corpus)?;
-    let existing_array = corpus
-        .get_mut("vectors")
-        .and_then(Value::as_array_mut)
-        .ok_or("witness corpus vectors is not an array")?;
-
-    let mut merged = Vec::with_capacity(existing_array.len());
-    for existing in existing_array.iter() {
-        let id = existing
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or("existing vector is missing an id")?;
-        let Some(generated_object) = generated_by_id.remove(id) else {
-            merged.push(existing.clone());
-            continue;
-        };
-
-        let mut object = existing.as_object().cloned().unwrap_or_default();
-        for (key, value) in generated_object {
-            object.insert(key, value);
-        }
-        merged.push(Value::Object(object));
-    }
-    if !generated_by_id.is_empty() {
-        return Err(
-            format!("Rust-owned vectors missing from input corpus: {generated_by_id:?}").into(),
-        );
-    }
-
-    *existing_array = merged;
-    Ok(corpus)
-}
-
-fn validate_corpus(corpus: &Value) -> Result<(), Box<dyn std::error::Error>> {
-    let object = corpus
-        .as_object()
-        .ok_or("witness corpus must be an object")?;
-    let expected_keys = ["schema_version", "profile", "profile_version", "vectors"];
-    if object.len() != expected_keys.len()
-        || expected_keys.iter().any(|key| !object.contains_key(*key))
-    {
-        return Err("unknown witness corpus top-level field".into());
-    }
-    if object.get("schema_version").and_then(Value::as_u64) != Some(SCHEMA_VERSION)
-        || object.get("profile").and_then(Value::as_str) != Some(PROFILE)
-        || object.get("profile_version").and_then(Value::as_u64) != Some(PROFILE_VERSION)
-    {
-        return Err("unsupported witness corpus schema or profile".into());
-    }
-    if !object.get("vectors").is_some_and(Value::is_array) {
-        return Err("witness corpus vectors must be an array".into());
-    }
-    let vectors = object["vectors"].as_array().expect("array checked above");
-    let mut seen = HashSet::new();
-    for vector in vectors {
-        let vector_object = vector
-            .as_object()
-            .ok_or("witness vector must be an object")?;
-        let id = vector_object
-            .get("id")
-            .and_then(Value::as_str)
-            .ok_or("witness vector is missing an id")?;
-        if vector_object.get("name").and_then(Value::as_str) != Some(id) {
-            return Err(format!("witness vector {id} name does not match its stable id").into());
-        }
-        if !seen.insert(id) {
-            return Err(format!("duplicate witness vector id: {id}").into());
-        }
-        let owner =
-            expected_owner(id).ok_or_else(|| format!("unknown witness vector ownership: {id}"))?;
-        let generator = vector_object
-            .get("generator")
-            .and_then(Value::as_object)
-            .ok_or_else(|| format!("witness vector {id} is missing generator metadata"))?;
-        if generator.len() != 2
-            || generator.get("id").and_then(Value::as_str) != Some(owner)
-            || generator.get("version").and_then(Value::as_u64) != Some(GENERATOR_VERSION)
-        {
-            return Err(format!("witness vector {id} generator does not match its owner").into());
-        }
-    }
-    let expected_ids: HashSet<&str> = PYTHON_OWNED_IDS.into_iter().chain(RUST_OWNED_IDS).collect();
-    if seen != expected_ids {
-        return Err("witness corpus does not contain the exact owned ID set".into());
-    }
-    Ok(())
-}
-
-fn expected_owner(id: &str) -> Option<&'static str> {
-    if PYTHON_OWNED_IDS.contains(&id) {
-        Some("standalone-python")
-    } else if RUST_OWNED_IDS.contains(&id) {
-        Some("standalone-rust")
-    } else {
-        None
-    }
 }
 
 #[allow(clippy::too_many_arguments)]

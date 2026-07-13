@@ -25,16 +25,21 @@ and `artifact`. `fixture_file` names a manifest-covered corpus file,
 `transaction-checksigpqc`, `checkSigAdd`, `dataSig`, or `dataSigAdd`. Consumers
 must reject unknown files, missing or duplicate IDs, and unknown artifacts.
 
-Regenerate the independently serialized witness fixture into temporary files,
-then update the manifest only after reviewing the vector diff:
+Regenerate every corpus file from independent source generators into temporary
+files, merge the disjoint witness-generator outputs, then update the manifest
+only after reviewing the vector diff:
 
 ```
+python3 contrib/devtools/generate-p2mr-v1-corpus.py \
+  --output-dir /tmp/p2mr-data
 python3 contrib/devtools/generate-p2mr-pqc-witness-vectors.py \
-  --input src/test/data/p2mr_pqc_witness_vectors.json \
   --output /tmp/p2mr-python.json
 cargo run --locked \
   --manifest-path contrib/testgen/p2mr_checksigpqc_vectors/Cargo.toml -- \
-  --input /tmp/p2mr-python.json --output /tmp/p2mr-final.json
+  --output /tmp/p2mr-rust.json
+python3 contrib/devtools/merge-p2mr-pqc-witness-vectors.py \
+  --python /tmp/p2mr-python.json --rust /tmp/p2mr-rust.json \
+  --output /tmp/p2mr-data/p2mr_pqc_witness_vectors.json
 python3 contrib/devtools/update-p2mr-v1-manifest.py
 python3 contrib/devtools/update-p2mr-v1-manifest.py --check
 ```

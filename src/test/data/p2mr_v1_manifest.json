@@ -26,25 +26,25 @@
       "path": "src/test/data/p2mr_cross_profile_vectors.json",
       "purpose": "qbit and pinned-profile boundary vectors",
       "case_count": 2,
-      "sha256": "6a77bb8db0efa1b932000b304391927d38605666f4bddb99e1d3dc00d15fbe24"
+      "sha256": "1d754f952fb430017585c9e09f6d032dbc4ab7849630f1b0c358132d6bb5702f"
     },
     {
       "path": "src/test/data/p2mr_pqc_witness_vectors.json",
       "purpose": "PQC sighash and witness vectors",
       "case_count": 14,
-      "sha256": "52cc676cb414c31c2222f9e4b9fae81cbc2af3180ca348b75c720eb157da7284"
+      "sha256": "4efb0a13b60b50b95e74e2979b4d8edee36184001f7d0448c5e1afaabc2dcfb4"
     },
     {
       "path": "src/test/data/p2mr_script_boundary_vectors.json",
       "purpose": "script, control, leaf, opcode, and resource boundary vectors",
       "case_count": 43,
-      "sha256": "132febecfaee6d0581ce1df5ff89455eed9febd8b850d25ae4b31d641645b8c4"
+      "sha256": "15c78ffac91f861ec4549ea2c4ee046aafebad96f0fd4dcae780dca2f3119894"
     },
     {
       "path": "src/test/data/p2mr_vectors.json",
       "purpose": "commitment, control block, root, and address vectors",
       "case_count": 11,
-      "sha256": "6f03b254ee8eecddf70fb4fe641fb6e0ae1d12dc96ee9c568d555be6c9dc3332"
+      "sha256": "50527577dd84cd9ee2b66a3fbc91c53677f5d4e45527afdc86d4f9cb050cbc1a"
     }
   ]
 }

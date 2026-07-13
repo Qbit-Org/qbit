@@ -22,21 +22,6 @@ REFERENCE_COMMIT = "988756471aeecdf4463c04be49da2b7b89a98c21"
 ANCESTRY_NAME = "BIP-360"
 ANCESTRY_VERSION = "0.12.0"
 ANCESTRY_COMMIT = "6740c533e8dce4e912f17ee85a6f627644e1b783"
-MANIFEST_FIELDS = {
-    "schema_version",
-    "profile",
-    "profile_version",
-    "specification",
-    "reference_implementation",
-    "ancestry",
-    "case_count",
-    "case_counts",
-    "files",
-}
-FILE_FIELDS = {"path", "purpose", "case_count", "sha256"}
-REFERENCE_FIELDS = {"repository", "commit"}
-ANCESTRY_FIELDS = {"name", "version", "commit", "normative"}
-CASE_COUNT_FIELDS = {"commitment_valid", "commitment_invalid", "witness", "cross_profile", "script_boundary"}
 FILE_PURPOSES = {
     "src/test/data/p2mr_cross_profile_vectors.json": "qbit and pinned-profile boundary vectors",
     "src/test/data/p2mr_pqc_witness_vectors.json": "PQC sighash and witness vectors",
@@ -98,66 +83,38 @@ def case_counts(repo_root: Path) -> tuple[dict[str, int], dict[str, int]]:
     return counts, per_file
 
 
-def updated_manifest(repo_root: Path, manifest_path: Path) -> str:
-    manifest = read_json(manifest_path)
-    if set(manifest) != MANIFEST_FIELDS:
-        raise ValueError("manifest has unknown or missing top-level fields")
-    if manifest.get("schema_version") != SCHEMA_VERSION:
-        raise ValueError("manifest has an unsupported schema_version")
-    if manifest.get("profile") != PROFILE or manifest.get("profile_version") != PROFILE_VERSION:
-        raise ValueError("manifest has an unsupported profile")
-    if manifest.get("specification") != SPECIFICATION:
-        raise ValueError("manifest has an unexpected specification path")
-
-    reference = manifest.get("reference_implementation")
-    if not isinstance(reference, dict) or set(reference) != REFERENCE_FIELDS:
-        raise ValueError("manifest reference_implementation has unknown or missing fields")
-    if reference.get("repository") != REFERENCE_REPOSITORY or reference.get("commit") != REFERENCE_COMMIT:
-        raise ValueError("manifest has an unexpected reference implementation")
-
-    ancestry = manifest.get("ancestry")
-    if not isinstance(ancestry, dict) or set(ancestry) != ANCESTRY_FIELDS:
-        raise ValueError("manifest ancestry has unknown or missing fields")
-    if (
-        ancestry.get("name") != ANCESTRY_NAME
-        or ancestry.get("version") != ANCESTRY_VERSION
-        or ancestry.get("commit") != ANCESTRY_COMMIT
-        or ancestry.get("normative") is not False
-    ):
-        raise ValueError("manifest has unexpected ancestry metadata")
-
-    manifest_counts = manifest.get("case_counts")
-    if not isinstance(manifest_counts, dict) or set(manifest_counts) != CASE_COUNT_FIELDS:
-        raise ValueError("manifest case_counts has unknown or missing fields")
-    if not isinstance(manifest.get("case_count"), int):
-        raise ValueError("manifest case_count must be an integer")
-
-    files = manifest.get("files")
-    if not isinstance(files, list) or len(files) != len(CORPUS_FILES):
-        raise ValueError("manifest has the wrong number of corpus files")
-    paths = [entry.get("path") for entry in files if isinstance(entry, dict)]
-    if paths != list(CORPUS_FILES):
-        raise ValueError("manifest files must contain the canonical sorted paths")
-    if any(set(entry) != FILE_FIELDS for entry in files):
-        raise ValueError("manifest file entry has unknown or missing fields")
-    for entry in files:
-        path = entry["path"]
-        if entry.get("purpose") != FILE_PURPOSES[path]:
-            raise ValueError(f"manifest file {path} has an unexpected purpose")
-        digest = entry.get("sha256")
-        if not isinstance(digest, str) or len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
-            raise ValueError(f"manifest file {path} has an invalid sha256")
-        if not isinstance(entry.get("case_count"), int):
-            raise ValueError(f"manifest file {path} has an invalid case_count")
-
+def generated_manifest(repo_root: Path) -> str:
     counts, per_file = case_counts(repo_root)
-    manifest["case_count"] = sum(counts.values())
-    manifest["case_counts"] = counts
-    for entry in files:
-        relative_path = entry["path"]
+    files = []
+    for relative_path in CORPUS_FILES:
         data = (repo_root / relative_path).read_bytes()
-        entry["case_count"] = per_file[relative_path]
-        entry["sha256"] = hashlib.sha256(data).hexdigest()
+        files.append(
+            {
+                "path": relative_path,
+                "purpose": FILE_PURPOSES[relative_path],
+                "case_count": per_file[relative_path],
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+        )
+    manifest = {
+        "schema_version": SCHEMA_VERSION,
+        "profile": PROFILE,
+        "profile_version": PROFILE_VERSION,
+        "specification": SPECIFICATION,
+        "reference_implementation": {
+            "repository": REFERENCE_REPOSITORY,
+            "commit": REFERENCE_COMMIT,
+        },
+        "ancestry": {
+            "name": ANCESTRY_NAME,
+            "version": ANCESTRY_VERSION,
+            "commit": ANCESTRY_COMMIT,
+            "normative": False,
+        },
+        "case_count": sum(counts.values()),
+        "case_counts": counts,
+        "files": files,
+    }
     return json.dumps(manifest, indent=2) + "\n"
 
 
@@ -183,14 +140,15 @@ def main() -> int:
     manifest_path = args.manifest or Path("src/test/data/p2mr_v1_manifest.json")
     if not manifest_path.is_absolute():
         manifest_path = repo_root / manifest_path
-    expected = updated_manifest(repo_root, manifest_path)
-    current = manifest_path.read_text(encoding="utf8")
+    expected = generated_manifest(repo_root)
     if args.check:
+        current = manifest_path.read_text(encoding="utf8")
         if current != expected:
             print(f"{manifest_path} is stale")
             return 1
         return 0
     output_path = args.output or manifest_path
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(expected, encoding="utf8")
     return 0
 
