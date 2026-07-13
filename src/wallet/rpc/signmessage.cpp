@@ -71,18 +71,6 @@ void EnsurePQCKeyValidationReadyForSigning(const CWallet& wallet)
     }
 }
 
-void LogConsumedPQCDataHashCounters(const CWallet& wallet, const PQCUsageRecorder& recorder, const bilingual_str& error)
-{
-    for (const PQCUsageAdvance& advance : recorder.GetAdvances()) {
-        wallet.WalletLogPrintf(
-            "PQC data-hash signing consumed counter for pubkey %s [%u, %u) before failing: %s\n",
-            HexStr(std::span<const unsigned char>{advance.pubkey.begin(), advance.pubkey.end()}),
-            advance.previous_count,
-            advance.new_count,
-            error.original);
-    }
-}
-
 } // namespace
 
 RPCHelpMan signmessage()

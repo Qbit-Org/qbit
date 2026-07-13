@@ -1251,10 +1251,9 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
         .leaf_script = selected_leaf,
         .control_block = selected_control_block,
         .leaf_version = P2MR_LEAF_VERSION_V1,
-        .pqc_usage = std::make_shared<const wallet::PQCUsageReport>(retry_report),
     };
 
-    WalletModel proof_wallet_model(qt_test::MakeSyntheticWallet(synthetic_result), *mini_gui.clientModel, platformStyle.get());
+    WalletModel proof_wallet_model(qt_test::MakeSyntheticWallet(synthetic_result, retry_report), *mini_gui.clientModel, platformStyle.get());
     SignVerifyMessageDialog proof_dialog(platformStyle.get(), nullptr);
     proof_dialog.setModel(&proof_wallet_model);
 
@@ -1315,7 +1314,7 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
     const QString alternate_pubkey_hex{QString::fromStdString(HexStr(std::span<const unsigned char>{alternate_pubkey.begin(), alternate_pubkey.end()}))};
     QVERIFY(!proof_text.contains(alternate_pubkey_hex));
     QVERIFY(proof_status->text().contains(alternate_pubkey_hex));
-    QVERIFY(proof_status->text().contains("PQC usage state after signing: exhausted."));
+    QVERIFY(proof_status->text().contains("PQC usage state after this signing attempt: exhausted."));
 
     QApplication::clipboard()->clear();
     proof_copy_button->click();
@@ -1381,9 +1380,7 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
         .current_state = wallet::PQCSignatureLimitState::WARNING,
         .kind = wallet::PQCUsageWarningKind::TRANSITION,
     });
-    synthetic_result.pqc_usage = std::make_shared<const wallet::PQCUsageReport>(single_key_report);
-
-    WalletModel single_key_wallet_model(qt_test::MakeSyntheticWallet(synthetic_result), *mini_gui.clientModel, platformStyle.get());
+    WalletModel single_key_wallet_model(qt_test::MakeSyntheticWallet(synthetic_result, single_key_report), *mini_gui.clientModel, platformStyle.get());
     SignVerifyMessageDialog single_key_dialog(platformStyle.get(), nullptr);
     single_key_dialog.setModel(&single_key_wallet_model);
     QValidatedLineEdit* single_key_address = single_key_dialog.findChild<QValidatedLineEdit*>("addressIn_SM");
@@ -1400,7 +1397,10 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
 
     const QString single_key_status{single_key_status_label->text()};
     const uint32_t signatures_remaining{PQC_MAX_SIGNATURES - wallet::PQC_WARNING_SIGNATURE_THRESHOLD};
-    QVERIFY(single_key_status.contains(QString("Signatures remaining for this key: %1 of %2.").arg(signatures_remaining).arg(PQC_MAX_SIGNATURES)));
+    QVERIFY(single_key_status.contains(QString("%1 of %2 signatures used, %3 remaining; state: warning.")
+                                           .arg(wallet::PQC_WARNING_SIGNATURE_THRESHOLD)
+                                           .arg(PQC_MAX_SIGNATURES)
+                                           .arg(signatures_remaining)));
     QVERIFY(single_key_status.contains(QString("%1 of %2 signatures used, %3 remaining")
                                            .arg(wallet::PQC_WARNING_SIGNATURE_THRESHOLD)
                                            .arg(PQC_MAX_SIGNATURES)
@@ -1411,6 +1411,65 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
     for (const char* field : local_or_informational_fields) {
         QVERIFY(!single_key_proof.exists(field));
     }
+
+    wallet::PQCUsageReport failed_report;
+    failed_report.key_states.push_back({
+        .pubkey = alternate_pubkey,
+        .signature_count = 1,
+        .signature_limit = PQC_MAX_SIGNATURES,
+        .signatures_remaining = PQC_MAX_SIGNATURES - 1,
+        .limit_state = wallet::PQCSignatureLimitState::NORMAL,
+    });
+    failed_report.key_states.push_back({
+        .pubkey = selected_pubkey,
+        .signature_count = PQC_MAX_SIGNATURES,
+        .signature_limit = PQC_MAX_SIGNATURES,
+        .signatures_remaining = 0,
+        .limit_state = wallet::PQCSignatureLimitState::EXHAUSTED,
+    });
+    failed_report.overall_state = wallet::PQCSignatureLimitState::EXHAUSTED;
+    failed_report.warnings.push_back({
+        .pubkey = selected_pubkey,
+        .previous_count = PQC_MAX_SIGNATURES - 1,
+        .new_count = PQC_MAX_SIGNATURES,
+        .previous_state = wallet::PQCSignatureLimitState::CRITICAL,
+        .current_state = wallet::PQCSignatureLimitState::EXHAUSTED,
+        .kind = wallet::PQCUsageWarningKind::TRANSITION,
+    });
+
+    WalletModel failed_wallet_model(
+        qt_test::MakeSyntheticP2MRFailureWallet(Untranslated("PQC data-hash signing failed"), failed_report),
+        *mini_gui.clientModel,
+        platformStyle.get());
+    SignVerifyMessageDialog failed_dialog(platformStyle.get(), nullptr);
+    failed_dialog.setModel(&failed_wallet_model);
+    QValidatedLineEdit* failed_address = failed_dialog.findChild<QValidatedLineEdit*>("addressIn_SM");
+    QComboBox* failed_sign_mode = failed_dialog.findChild<QComboBox*>("p2mrDataInputMode_SM");
+    QPlainTextEdit* failed_message = failed_dialog.findChild<QPlainTextEdit*>("messageIn_SM");
+    QPushButton* failed_sign_button = failed_dialog.findChild<QPushButton*>("signMessageButton_SM");
+    QLabel* failed_status_label = failed_dialog.findChild<QLabel*>("statusLabel_SM");
+    QPlainTextEdit* failed_proof_output = failed_dialog.findChild<QPlainTextEdit*>("signatureOut_SM");
+    QVERIFY(failed_address && failed_sign_mode && failed_message && failed_sign_button && failed_status_label && failed_proof_output);
+
+    failed_address->setText(QString::fromStdString(EncodeDestination(CTxDestination{output})));
+    failed_sign_mode->setCurrentIndex(1);
+    failed_message->setPlainText(QString::fromStdString(HexStr(std::span<const unsigned char>{message_hash.begin(), message_hash.end()})));
+    failed_sign_button->click();
+
+    const QString failed_status{failed_status_label->text()};
+    const QString selected_pubkey_hex{QString::fromStdString(HexStr(std::span<const unsigned char>{selected_pubkey.begin(), selected_pubkey.end()}))};
+    QVERIFY(failed_proof_output->toPlainText().isEmpty());
+    QVERIFY(failed_status_label->styleSheet().contains("color: red"));
+    QVERIFY(failed_status.contains("PQC data-hash signing failed"));
+    QVERIFY(failed_status.contains("failed after consuming PQC signature capacity"));
+    QVERIFY(failed_status.contains("PQC usage state after this signing attempt: exhausted."));
+    QVERIFY(failed_status.contains(alternate_pubkey_hex));
+    QVERIFY(failed_status.contains(selected_pubkey_hex));
+    QVERIFY(failed_status.contains(QString("1 of %1 signatures used, %2 remaining; state: normal.")
+                                       .arg(PQC_MAX_SIGNATURES)
+                                       .arg(PQC_MAX_SIGNATURES - 1)));
+    QVERIFY(failed_status.contains(QString("%1 of %1 signatures used, 0 remaining; state: exhausted.").arg(PQC_MAX_SIGNATURES)));
+    QVERIFY(failed_status.contains("reached the signature limit"));
 }
 
 void TestSendPQCReportPropagation(interfaces::Node& node)

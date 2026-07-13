@@ -243,13 +243,6 @@ void AppendPQCUsage(UniValue& entry, const PQCUsageReport& report, bool include_
     }
 }
 
-void LogPQCUsageWarnings(const CWallet& wallet, const PQCUsageReport& report)
-{
-    for (const bilingual_str& warning : FormatPQCUsageWarnings(report.warnings)) {
-        wallet.WalletLogPrintf("PQC usage warning: %s\n", warning.original);
-    }
-}
-
 void HandleWalletError(const std::shared_ptr<CWallet> wallet, DatabaseStatus& status, bilingual_str& error)
 {
     if (!wallet) {

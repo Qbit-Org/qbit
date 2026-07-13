@@ -272,14 +272,16 @@ QString FormatPQCUsageStatus(const wallet::PQCUsageReport& report)
 {
     QStringList lines;
     if (report.overall_state.has_value()) {
-        lines.append(SignVerifyMessageDialog::tr("PQC usage state after signing: %1.")
+        lines.append(SignVerifyMessageDialog::tr("PQC usage state after this signing attempt: %1.")
             .arg(QString::fromStdString(std::string{wallet::PQCSignatureLimitStateName(*report.overall_state)})));
     }
-    if (report.key_states.size() == 1) {
-        const wallet::PQCUsageSnapshot& key_state{report.key_states.front()};
-        lines.append(SignVerifyMessageDialog::tr("Signatures remaining for this key: %1 of %2.")
+    for (const wallet::PQCUsageSnapshot& key_state : report.key_states) {
+        lines.append(SignVerifyMessageDialog::tr("PQC key %1: %2 of %3 signatures used, %4 remaining; state: %5.")
+            .arg(QString::fromStdString(HexStr(std::span<const unsigned char>{key_state.pubkey.begin(), key_state.pubkey.end()})))
+            .arg(key_state.signature_count)
+            .arg(key_state.signature_limit)
             .arg(key_state.signatures_remaining)
-            .arg(key_state.signature_limit));
+            .arg(QString::fromStdString(std::string{wallet::PQCSignatureLimitStateName(key_state.limit_state)})));
     }
     for (const bilingual_str& warning : wallet::FormatPQCUsageWarnings(report.warnings)) {
         lines.append(BilingualToQString(warning));
@@ -656,10 +658,19 @@ void SignVerifyMessageDialog::on_signMessageButton_SM_clicked()
             return;
         }
 
-        util::Result<interfaces::P2MRDataSignatureResult> result{model->wallet().signP2MRDataHash(destination, message_hash)};
+        interfaces::P2MRDataSignatureAttempt attempt{model->wallet().signP2MRDataHash(destination, message_hash)};
+        const auto& result{attempt.result};
         if (!result) {
+            QString status{BilingualToQString(util::ErrorString(result))};
+            const QString pqc_usage_status{attempt.pqc_usage ? FormatPQCUsageStatus(*attempt.pqc_usage) : QString{}};
+            if (!pqc_usage_status.isEmpty()) {
+                status.append("\n");
+                status.append(tr("The signing attempt failed after consuming PQC signature capacity."));
+                status.append("\n");
+                status.append(pqc_usage_status);
+            }
             ui->statusLabel_SM->setStyleSheet("QLabel { color: red; }");
-            ui->statusLabel_SM->setText(BilingualToQString(util::ErrorString(result)));
+            ui->statusLabel_SM->setText(status);
             return;
         }
 
@@ -675,7 +686,7 @@ void SignVerifyMessageDialog::on_signMessageButton_SM_clicked()
         QString status{hash_input ?
             tr("P2MR/PQC data-hash proof signed.") :
             tr("P2MR/PQC data proof signed.")};
-        const QString pqc_usage_status{result->pqc_usage ? FormatPQCUsageStatus(*result->pqc_usage) : QString{}};
+        const QString pqc_usage_status{attempt.pqc_usage ? FormatPQCUsageStatus(*attempt.pqc_usage) : QString{}};
         if (!pqc_usage_status.isEmpty()) {
             status.append("\n");
             status.append(pqc_usage_status);
