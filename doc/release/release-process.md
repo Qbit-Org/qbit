@@ -81,6 +81,75 @@ The publisher validates:
 Testnet posture evidence is mandatory for `release_line=testnet`; the publisher
 fails closed when `--testnet-posture-evidence` is missing.
 
+## qbit P2MR v1 Conformance
+
+Mainnet publication requires three separate absolute-path inputs to the local
+publisher:
+
+- `p2mr_v1_conformance_evidence`, the release evidence envelope;
+- `p2mr_v1_oracle_report`, the canonical standalone-oracle report; and
+- `p2mr_v1_integration_matrix`, the finalized machine-readable support
+  inventory.
+
+For testnet, all three may be omitted, in which case the release does not claim
+completed qbit P2MR v1 conformance. Supplying any one requires all three and
+runs the same validation. Mainnet always requires all three. There is no
+mainnet waiver.
+
+The checked-in
+[`p2mr-v1-support-matrix.json`](../integration/p2mr-v1-support-matrix.json)
+is an intentionally blocking draft. It documents the required inventory but
+cannot be supplied as final release evidence. Release operators must produce a
+separate finalized snapshot whose `release_source_commit` is the exact signed
+tag target. Every required in-tree surface must be `supported` and `pass` with
+`version` equal to that tag-target commit, plus an environment, review date,
+and stable public evidence.
+Unsupported external categories remain explicit `not-claimed` rows; absence is
+not evidence.
+
+Before supplying the workflow inputs:
+
+1. Freeze the signed annotated release tag and record its peeled commit SHA.
+2. Run the complete qbit P2MR v1 unit suite on that exact commit.
+3. Run the standalone oracle in release mode on that exact commit and preserve
+   its canonical report.
+4. Recalculate the tagged manifest and every manifest-listed corpus digest.
+5. Complete the integration inventory with exact versions, environments,
+   limitations, results, owners, and stable public evidence.
+6. Re-run consensus review on the exact tag target and preserve a stable public
+   review reference.
+7. Build the evidence envelope using
+   [`p2mr-v1-conformance-evidence.json`](examples/p2mr-v1-conformance-evidence.json)
+   as a field example. Zero hashes and `example.invalid` references must all be
+   replaced.
+8. Run `ci/release/verify_p2mr_v1_conformance.py` locally with the tag checkout
+   and the three finalized files.
+9. Supply those same exact files to `publish-local-release.sh` with
+   `--p2mr-v1-conformance-evidence`, `--p2mr-v1-oracle-report`, and
+   `--p2mr-v1-integration-matrix`.
+10. Preserve the profile version, tag target, manifest digest, oracle report
+    digest, integration matrix digest, consensus review, and workflow run URL
+    with the public release evidence.
+
+The validator runs from `trusted_release_ref`, but reads the normative
+specification, manifest, and corpus as Git blobs from the signed tag target. It
+requires the qbit result, oracle report, consensus review, and finalized matrix
+to name that same commit. Review of an ancestor is insufficient.
+
+Release notes must use one of these precise forms:
+
+```text
+Conforms to qbit P2MR v1 corpus <digest> on source commit <SHA>; independent oracle report <digest>.
+```
+
+or:
+
+```text
+This release does not claim completed qbit P2MR v1 conformance.
+```
+
+Do not substitute `BIP-360 compatible`, `P2MR compatible`, or `P2MR tested`.
+
 Any local publication path must run the builder validator with the public
 release checkout as `--source-root` and the commit target obtained from the
 verified annotated tag as `--expected-tag-target`. These inputs are required;
@@ -149,6 +218,10 @@ Normal public release evidence should pin public data:
 - release publication URL and final GitHub Release state
 - publisher command transcript, asset inventory and digest verification output,
   release URL, and immutable release state
+- qbit P2MR v1 profile version, exact release source commit, corpus manifest
+  digest, qbit conformance result, oracle report digest, finalized integration
+  matrix digest, and exact-SHA consensus review evidence, or an explicit
+  statement that completed qbit P2MR v1 conformance is not claimed
 
 Normal public release evidence must not require private source commits,
 sanitizer manifests, sanitizer mapping files, private qbit-tools state, operator

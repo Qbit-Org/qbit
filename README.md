@@ -28,6 +28,8 @@ Start Here
 - Public testnet: [doc/user/public-testnet.md](doc/user/public-testnet.md)
 - qbit differences from Bitcoin Core:
   [doc/user/bitcoin-core-differences.md](doc/user/bitcoin-core-differences.md)
+- Normative P2MR consensus profile:
+  [doc/consensus/p2mr-v1.md](doc/consensus/p2mr-v1.md)
 - Running a node when the target network is announced:
   [doc/user/run-node.md](doc/user/run-node.md)
 - Wallets, P2MR addresses, and backups:

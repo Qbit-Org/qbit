@@ -15,6 +15,11 @@ The qbit mining RPC surface is implemented in qbit Core. This guide documents
 the qbit protocol and node requirements directly; do not assume generic Bitcoin
 pool examples are valid for qbit without the checks below.
 
+Pools or template processors that inspect, construct, or independently validate
+P2MR spends must implement the normative
+[qbit P2MR v1 Consensus Profile](../consensus/p2mr-v1.md). It is not compatible
+with the ancestry profile pinned there.
+
 ## What changes from Bitcoin Core
 
 qbit mining has two block classes:
@@ -391,6 +396,10 @@ qbit-cli <chain option> getnetworkhashps 120 -1 auxpow
 
 ## Launch Readiness Caveats
 
+- Record the exact pool/miner version, qbit P2MR v1 corpus digest, environment,
+  result, and public evidence in the
+  [integration support matrix](p2mr-v1-support-matrix.md). RPC-shape
+  compatibility alone is not a passing result.
 - Do not publish stale examples using `bc1...`, `bech32`, or Bitcoin Core address assumptions for qbit coinbase outputs.
 - Public-chain qbit payouts should be P2MR. Regtest can be less restrictive unless `-p2mronly=1` is enabled.
 - Public docs should rely only on qbit-owned public mining setup inputs.

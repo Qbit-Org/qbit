@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "profile": "qbit-p2mr-v1",
+  "profile_version": 1,
+  "specification": "doc/consensus/p2mr-v1.md",
+  "reference_implementation": {
+    "repository": "Qbit-Org/qbit",
+    "commit": "988756471aeecdf4463c04be49da2b7b89a98c21"
+  },
+  "ancestry": {
+    "name": "BIP-360",
+    "version": "0.12.0",
+    "commit": "6740c533e8dce4e912f17ee85a6f627644e1b783",
+    "normative": false
+  },
+  "case_count": 78,
+  "case_counts": {
+    "commitment_valid": 4,
+    "commitment_invalid": 7,
+    "witness": 14,
+    "cross_profile": 2,
+    "script_boundary": 51
+  },
+  "files": [
+    {
+      "path": "src/test/data/p2mr_cross_profile_vectors.json",
+      "purpose": "qbit and pinned-profile boundary vectors",
+      "case_count": 2,
+      "sha256": "1d754f952fb430017585c9e09f6d032dbc4ab7849630f1b0c358132d6bb5702f"
+    },
+    {
+      "path": "src/test/data/p2mr_pqc_witness_vectors.json",
+      "purpose": "PQC sighash and witness vectors",
+      "case_count": 14,
+      "sha256": "4efb0a13b60b50b95e74e2979b4d8edee36184001f7d0448c5e1afaabc2dcfb4"
+    },
+    {
+      "path": "src/test/data/p2mr_script_boundary_vectors.json",
+      "purpose": "script, control, leaf, opcode, and resource boundary vectors",
+      "case_count": 51,
+      "sha256": "0dfff99a45b8e1ccb80e149b069f28c47114b05767ecec2a37e07c9dc578c6b4"
+    },
+    {
+      "path": "src/test/data/p2mr_vectors.json",
+      "purpose": "commitment, control block, root, and address vectors",
+      "case_count": 11,
+      "sha256": "50527577dd84cd9ee2b66a3fbc91c53677f5d4e45527afdc86d4f9cb050cbc1a"
+    }
+  ]
+}

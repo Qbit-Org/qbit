@@ -1350,7 +1350,7 @@ BOOST_AUTO_TEST_CASE(spends_witness_prog)
     const auto program{ToByteVector(XOnlyPubKey{pubkey})};
     for (int i{2}; i <= 16; ++i) {
         tx_create.vout[0].scriptPubKey = GetScriptForDestination(WitnessUnknown{i, program});
-        // Version 2 with 32-byte program is now recognized as P2MR (BIP-360)
+        // Native version 2 with 32-byte program is recognized as qbit P2MR v1.
         const auto expected_type = (i == 2) ? TxoutType::WITNESS_V2_P2MR : TxoutType::WITNESS_UNKNOWN;
         BOOST_CHECK_EQUAL(Solver(tx_create.vout[0].scriptPubKey, sol_dummy), expected_type);
         tx_spend.vin[0].prevout.hash = tx_create.GetHash();

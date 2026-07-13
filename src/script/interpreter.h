@@ -144,7 +144,7 @@ enum : uint32_t {
     // Making unknown public key versions (in BIP 342 scripts) non-standard
     SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE = (1U << 20),
 
-    // P2MR/SegWit v2 validation (BIP-360)
+    // qbit P2MR v1 / SegWit v2 validation
     SCRIPT_VERIFY_P2MR_RULES = (1U << 21),
 
     // Enforce the original qbit P2MR validation-weight debit. This flag is
@@ -206,7 +206,7 @@ enum class SigVersion
     WITNESS_V0 = 1,  //!< Witness v0 (P2WPKH and P2WSH); see BIP 141
     TAPROOT = 2,     //!< Witness v1 with 32-byte program, not BIP16 P2SH-wrapped, key path spending; see BIP 341
     TAPSCRIPT = 3,   //!< Witness v1 with 32-byte program, not BIP16 P2SH-wrapped, script path spending, leaf version 0xc0; see BIP 342
-    P2MR = 4,        //!< Witness v2 with 32-byte program, not BIP16 P2SH-wrapped, script path spending; see BIP-360
+    P2MR = 4,        //!< qbit P2MR v1: native witness v2/32, script-path spending
 };
 
 struct ScriptExecutionData
@@ -249,7 +249,7 @@ static constexpr size_t TAPROOT_CONTROL_NODE_SIZE = 32;
 static constexpr size_t TAPROOT_CONTROL_MAX_NODE_COUNT = 128;
 static constexpr size_t TAPROOT_CONTROL_MAX_SIZE = TAPROOT_CONTROL_BASE_SIZE + TAPROOT_CONTROL_NODE_SIZE * TAPROOT_CONTROL_MAX_NODE_COUNT;
 
-/** P2MR (BIP-360) constants */
+/** qbit P2MR v1 constants */
 static constexpr size_t WITNESS_V2_P2MR_SIZE = 32;
 static constexpr size_t P2MR_CONTROL_BASE_SIZE = 1;  //!< Control byte only (no internal key)
 static constexpr size_t P2MR_CONTROL_NODE_SIZE = 32;
@@ -422,7 +422,7 @@ uint256 ComputeP2MRBranchHash(std::span<const unsigned char> a, std::span<const 
 /** Compute the BIP341 taproot script tree Merkle root from control block and leaf hash.
  *  Requires control block to have valid length (33 + k*32, with k in {0,1,..,128}). */
 uint256 ComputeTaprootMerkleRoot(std::span<const unsigned char> control, const uint256& tapleaf_hash);
-/** Compute the BIP-360 P2MR script tree Merkle root from control block and leaf hash.
+/** Compute the qbit P2MR v1 script tree Merkle root from control block and leaf hash.
  *  Requires control block to have valid length (1 + k*32, with k in {0,1,..,128}). */
 uint256 ComputeP2MRMerkleRoot(std::span<const unsigned char> control, const uint256& tapleaf_hash);
 
