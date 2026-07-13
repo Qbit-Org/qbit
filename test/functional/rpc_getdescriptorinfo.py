@@ -56,8 +56,28 @@ class DescriptorTest(BitcoinTestFramework):
         self.test_desc('sh(wpkh(03fff97bd5755eeea420453a14355235d382f6472f8568a18b2f057a1460297556))', isrange=False, issolvable=True, hasprivatekeys=False)
         # Any P2PK, P2PKH, P2WPKH, or P2SH-P2WPKH output with the specified public key.
         self.test_desc('combo(0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798)', isrange=False, issolvable=True, hasprivatekeys=False)
-        # A raw P2MR Merkle root without spend data.
-        self.test_desc('rawmr(4444444444444444444444444444444444444444444444444444444444444444)', isrange=False, issolvable=False, hasprivatekeys=False)
+        # P2MR outputs without spend data.
+        p2mr_root = "44" * 32
+        rawmr = f"rawmr({p2mr_root})"
+        self.test_desc(rawmr, isrange=False, issolvable=False, hasprivatekeys=False)
+        rawmr_info = self.nodes[0].getdescriptorinfo(rawmr)
+        assert_equal(rawmr_info["has_p2mr_standard_satisfaction"], False)
+        p2mr_address = self.nodes[0].deriveaddresses(descsum_create(rawmr))[0]
+        for unsolvable in [f"addr({p2mr_address})", f"raw(5220{p2mr_root})"]:
+            info = self.nodes[0].getdescriptorinfo(unsolvable)
+            assert_equal(info["issolvable"], False)
+            assert_equal(info["has_p2mr_standard_satisfaction"], False)
+        p2mr_keys = [f"{index + 1:064x}" for index in range(36)]
+        safe_p2mr = f"mr(multi_a(35,{','.join(p2mr_keys)}))"
+        unsafe_p2mr = f"mr(multi_a(36,{','.join(p2mr_keys)}))"
+        assert_equal(self.nodes[0].getdescriptorinfo(safe_p2mr)["has_p2mr_standard_satisfaction"], True)
+        assert_equal(self.nodes[0].getdescriptorinfo(unsafe_p2mr)["has_p2mr_standard_satisfaction"], False)
+        assert_raises_rpc_error(
+            -5,
+            "multi_a thresholds must not exceed 35",
+            self.nodes[0].deriveaddresses,
+            descsum_create(unsafe_p2mr),
+        )
         # An (overly complicated) P2SH-P2WSH-P2PKH output with the specified public key.
         self.test_desc('sh(wsh(pkh(02e493dbf1c10d80f3581e4904930b1404cc6c13900ee0758474fa94abe8c4cd13)))', isrange=False, issolvable=True, hasprivatekeys=False)
         # A bare *1-of-2* multisig output with keys in the specified order.

@@ -146,6 +146,7 @@ public:
         std::optional<int> auxpow_display_commitment_height{};
         std::optional<int> outer_witness_activation_height{};
         std::optional<int> p2mr_activation_height{};
+        std::optional<int> p2mr_validation_weight_v2_height{};
         bool fastprune{false};
         bool enforce_bip94{false};
         bool restricted_output_mode{true};

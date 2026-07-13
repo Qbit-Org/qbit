@@ -914,6 +914,21 @@ BOOST_AUTO_TEST_CASE(ChainParams_outerwitness_defaults)
     BOOST_CHECK_EQUAL(regtest_consensus.nOuterReservedWitnessHeight, std::numeric_limits<int>::max());
 }
 
+BOOST_AUTO_TEST_CASE(ChainParams_p2mr_validation_weight_v2_defaults)
+{
+    const auto main_consensus = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
+    const auto testnet_consensus = CreateChainParams(*m_node.args, ChainType::TESTNET)->GetConsensus();
+    const auto testnet4_consensus = CreateChainParams(*m_node.args, ChainType::TESTNET4)->GetConsensus();
+    const auto signet_consensus = CreateChainParams(*m_node.args, ChainType::SIGNET)->GetConsensus();
+    const auto regtest_consensus = CreateChainParams(*m_node.args, ChainType::REGTEST)->GetConsensus();
+
+    BOOST_CHECK_EQUAL(main_consensus.nP2MRValidationWeightV2Height, 0);
+    BOOST_CHECK_EQUAL(testnet_consensus.nP2MRValidationWeightV2Height, 0);
+    BOOST_CHECK_EQUAL(testnet4_consensus.nP2MRValidationWeightV2Height, 60'000);
+    BOOST_CHECK_EQUAL(signet_consensus.nP2MRValidationWeightV2Height, 0);
+    BOOST_CHECK_EQUAL(regtest_consensus.nP2MRValidationWeightV2Height, 0);
+}
+
 BOOST_AUTO_TEST_CASE(ChainParams_TESTNET4_launch_anchor)
 {
     const UniValue config = ReadTestnet4LaunchDifficultyConfig();

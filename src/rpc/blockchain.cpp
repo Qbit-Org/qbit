@@ -39,6 +39,7 @@
 #include <rpc/server_util.h>
 #include <rpc/util.h>
 #include <script/descriptor.h>
+#include <script/script.h>
 #include <serialize.h>
 #include <streams.h>
 #include <sync.h>
@@ -53,6 +54,8 @@
 #include <util/translation.h>
 #include <validation.h>
 #include <validationinterface.h>
+
+#include <algorithm>
 #include <versionbits.h>
 
 #include <cstdint>
@@ -1377,6 +1380,14 @@ RPCHelpMan getblockchaininfo()
                 {RPCResult::Type::BOOL, "automatic_pruning", /*optional=*/true, "whether automatic pruning is enabled (only present if pruning is enabled)"},
                 {RPCResult::Type::NUM, "prune_target_size", /*optional=*/true, "the target size used by pruning (only present if automatic pruning is enabled)"},
                 {RPCResult::Type::STR_HEX, "signet_challenge", /*optional=*/true, "the block challenge (aka. block script), in hexadecimal (only present if the current network is a signet)"},
+                {RPCResult::Type::OBJ, "p2mr_validation_weight", "P2MR validation-weight activation state", {
+                    {RPCResult::Type::NUM, "legacy_per_sigop", "Legacy P2MR validation debit"},
+                    {RPCResult::Type::NUM, "v2_per_sigop", "Validation-weight-v2 P2MR debit"},
+                    {RPCResult::Type::NUM, "activation_height", "First block using validation-weight-v2"},
+                    {RPCResult::Type::BOOL, "active_for_tip", "Whether validation-weight-v2 applies to the current tip"},
+                    {RPCResult::Type::BOOL, "active_for_next_block", "Whether validation-weight-v2 applies to the next block"},
+                    {RPCResult::Type::NUM, "blocks_remaining", "Blocks until activation, measured from the next block"},
+                }},
                 (IsDeprecatedRPCEnabled("warnings") ?
                     RPCResult{RPCResult::Type::STR, "warnings", "any network and blockchain warnings (DEPRECATED)"} :
                     RPCResult{RPCResult::Type::ARR, "warnings", "any network and blockchain warnings (run with `-deprecatedrpc=warnings` to return the latest warning as a single string)",
@@ -1428,6 +1439,16 @@ RPCHelpMan getblockchaininfo()
             chainman.GetParams().GetConsensus().signet_challenge;
         obj.pushKV("signet_challenge", HexStr(signet_challenge));
     }
+
+    const Consensus::Params& consensus{chainman.GetConsensus()};
+    UniValue p2mr_weight(UniValue::VOBJ);
+    p2mr_weight.pushKV("legacy_per_sigop", P2MR_VALIDATION_WEIGHT_PER_SIGOP_LEGACY);
+    p2mr_weight.pushKV("v2_per_sigop", P2MR_VALIDATION_WEIGHT_PER_SIGOP_V2);
+    p2mr_weight.pushKV("activation_height", consensus.nP2MRValidationWeightV2Height);
+    p2mr_weight.pushKV("active_for_tip", consensus.P2MRValidationWeightV2ActiveAtHeight(height));
+    p2mr_weight.pushKV("active_for_next_block", consensus.P2MRValidationWeightV2ActiveAtHeight(height + 1));
+    p2mr_weight.pushKV("blocks_remaining", std::max(0, consensus.nP2MRValidationWeightV2Height - (height + 1)));
+    obj.pushKV("p2mr_validation_weight", std::move(p2mr_weight));
 
     NodeContext& node = EnsureAnyNodeContext(request.context);
     obj.pushKV("warnings", node::GetWarningsForRpc(*CHECK_NONFATAL(node.warnings), IsDeprecatedRPCEnabled("warnings")));

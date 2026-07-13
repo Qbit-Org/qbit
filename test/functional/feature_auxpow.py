@@ -80,10 +80,16 @@ class FeatureAuxPowTest(BitcoinTestFramework):
             "commitmentorder",
             "hash",
             "height",
+            "p2mr_validation_weight",
             "previousblockhash",
             "target",
         ]
         assert_equal(sorted(aux_template.keys()), expected_keys)
+        assert_equal(aux_template["p2mr_validation_weight"], {
+            "per_sigop": 3683,
+            "v2_active": True,
+            "v2_activation_height": 0,
+        })
         assert_equal(aux_template["chainid"], QBIT_AUXPOW_CHAIN_ID)
         assert_equal(aux_template["commitmentactivationheight"], 0)
         assert_equal(aux_template["commitmentorder"], "display")

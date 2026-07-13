@@ -13,6 +13,7 @@
 #include <script/merkle_script_tree.h>
 #include <script/parsing.h>
 #include <script/p2mr.h>
+#include <script/p2mr_sizing.h>
 #include <script/script.h>
 #include <script/signingprovider.h>
 #include <script/solver.h>
@@ -1781,6 +1782,7 @@ public:
     P2MRMultiADescriptor(int threshold, std::vector<CPQCPubKey> pubkeys, bool sorted)
         : DescriptorImpl({}, sorted ? "sortedmulti_a" : "multi_a"), m_threshold(threshold), m_pubkeys(std::move(pubkeys)), m_sorted(sorted) {}
     bool IsSingleType() const final { return true; }
+    bool HasP2MRStandardSatisfaction() const final { return static_cast<size_t>(m_threshold) <= P2MR_V1_MAX_STANDARD_SIGNATURES; }
 
     std::optional<int64_t> ScriptSize() const override
     {
@@ -1859,6 +1861,12 @@ public:
     }
     std::optional<OutputType> GetOutputType() const override { return OutputType::P2MR; }
     bool IsSingleType() const final { return true; }
+    bool HasP2MRStandardSatisfaction() const final
+    {
+        return std::ranges::any_of(m_subdescriptor_args, [](const auto& desc) {
+            return desc->HasP2MRStandardSatisfaction();
+        });
+    }
 
     std::optional<int64_t> ScriptSize() const override { return 1 + 1 + 32; }
 
@@ -1914,6 +1922,7 @@ protected:
 public:
     explicit RawMRDescriptor(const uint256& merkle_root) : DescriptorImpl({}, "rawmr"), m_merkle_root(merkle_root) {}
     bool IsSolvable() const final { return false; }
+    bool HasP2MRStandardSatisfaction() const final { return false; }
     std::optional<OutputType> GetOutputType() const override { return OutputType::P2MR; }
     bool IsSingleType() const final { return true; }
 
