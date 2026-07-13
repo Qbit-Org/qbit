@@ -14,7 +14,7 @@ import classify_merge_profile
 
 
 TRUSTED_RELEASE_REF_PATHS = [
-    ".github/workflows/release-publish.yml",
+    "contrib/release-process/publish-local-release.sh",
     "ci/release/test_validate_release_artifacts.py",
     "contrib/keys/operator-keys/KEYS.md",
     "doc/release-trust-0.1.1-testnet4.md",
@@ -65,6 +65,7 @@ class ClassifyMergeProfileTest(unittest.TestCase):
         classification = self.classify(
             [
                 ".github/workflows/release-publish.yml",
+                "contrib/release-process/publish-local-release.sh",
                 "ci/release/validate_key_metadata.py",
                 "contrib/keys/operator-keys/public-keys/operator-01-release.asc",
                 "doc/release-trust-v0.1.0-testnet4.md",

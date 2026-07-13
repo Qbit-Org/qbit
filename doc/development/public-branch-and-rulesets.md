@@ -84,11 +84,10 @@ GitHub's ruleset `required_signatures` rule checks commit signatures, not the
 release tag object. Do not rely on rulesets alone for the signed annotated tag
 policy. The public release path must verify tag objects directly:
 
-- `.github/workflows/release-publish.yml` rejects lightweight tags and requires
-  GitHub-verified annotated tag signatures before publication.
+- `contrib/release-process/publish-local-release.sh` rejects lightweight tags
+  and requires GitHub-verified annotated tag signatures before publication.
 - `ci/release/validate_release_artifacts.py --verify-tag-signature` verifies the
-  release tag against the active qbit release-key policy for workflow and local
-  publication paths.
+  release tag against the active qbit release-key policy.
 
 Apply a template with the repository rulesets API after confirming the target
 repository and bypass actors:
@@ -138,7 +137,7 @@ The required merge gate has five validation profiles:
 | Profile | Applies to | Required validation |
 | --- | --- | --- |
 | Full source validation | Any source-affecting, mixed, unknown, or empty change set. | Require both `Core Checks Gate` and `Full Validation Gate` to complete successfully. |
-| Release-policy validation | Pull requests whose changed paths are only release policy or trusted release reference files. | Run `git diff --check`, release validator tests for touched release validator/workflow files, operator key metadata validation when operator keys are touched, and a best-effort local YAML parse for `release-publish.yml` when PyYAML is available. |
+| Release-policy validation | Pull requests whose changed paths are only release policy or trusted release reference files. | Run `git diff --check`, release publisher and validator tests for touched publication or validator files, `bash -n` for publisher changes, and operator key metadata validation when operator keys are touched. |
 | RPC docs validation | Pull requests whose changed paths are only RPC documentation pipeline files. | Run `git diff --check`, RPC docs unit tests, and require the existing `rpc-docs` build check. |
 | Public docs validation | Pull requests whose changed paths are only public-facing documentation and release notes. | Run `git diff --check` and require the existing `public-docs-lint` check. |
 | GitHub metadata validation | Pull requests whose changed paths are only public ruleset templates, repository settings, issue/PR templates, and the docs that explain those settings. | Run `git diff --check`, parse ruleset and repository-settings JSON, assert that public branch rulesets require only `Required Merge Gate`, and best-effort parse issue template YAML when PyYAML is available. |
@@ -146,7 +145,7 @@ The required merge gate has five validation profiles:
 The lightweight profiles are intentionally narrow. The release-policy allowlist
 is:
 
-- `.github/workflows/release-publish.yml`
+- `contrib/release-process/publish-local-release.sh`
 - `ci/release/**`
 - `contrib/keys/operator-keys/**`
 - `doc/release-trust-*.md`

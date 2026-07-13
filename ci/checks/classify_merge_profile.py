@@ -117,6 +117,7 @@ def normalize_path(path: str) -> str | None:
 def is_release_policy_path(path: str) -> bool:
     return (
         path == ".github/workflows/release-publish.yml"
+        or path == "contrib/release-process/publish-local-release.sh"
         or path.startswith("ci/release/")
         or path.startswith("contrib/keys/operator-keys/")
         or RELEASE_TRUST_DOC_RE.fullmatch(path) is not None
@@ -205,6 +206,7 @@ def github_outputs(classification: Classification) -> dict[str, str]:
         ),
         "touched_release_publish": bool_output(
             ".github/workflows/release-publish.yml" in paths
+            or "contrib/release-process/publish-local-release.sh" in paths
         ),
         "touched_release_validators": bool_output(
             any(path.startswith("ci/release/") for path in paths)
