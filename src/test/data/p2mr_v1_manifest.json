@@ -13,13 +13,13 @@
     "commit": "6740c533e8dce4e912f17ee85a6f627644e1b783",
     "normative": false
   },
-  "case_count": 70,
+  "case_count": 74,
   "case_counts": {
     "commitment_valid": 4,
     "commitment_invalid": 7,
     "witness": 14,
     "cross_profile": 2,
-    "script_boundary": 43
+    "script_boundary": 47
   },
   "files": [
     {
@@ -37,8 +37,8 @@
     {
       "path": "src/test/data/p2mr_script_boundary_vectors.json",
       "purpose": "script, control, leaf, opcode, and resource boundary vectors",
-      "case_count": 43,
-      "sha256": "15c78ffac91f861ec4549ea2c4ee046aafebad96f0fd4dcae780dca2f3119894"
+      "case_count": 47,
+      "sha256": "0139fddaecb87cca1beb13248f2ca91b892f9b4c012e521c88497c75419b0b7c"
     },
     {
       "path": "src/test/data/p2mr_vectors.json",

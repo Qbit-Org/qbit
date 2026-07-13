@@ -550,6 +550,50 @@
       }
     },
     {
+      "id": "opcode-checkdatasigpqc-invalid-signature",
+      "category": "opcode",
+      "scenario": "opcode",
+      "parameters": {
+        "kind": "checkdatasigpqc-invalid",
+        "fixture_file": "src/test/data/p2mr_pqc_witness_vectors.json",
+        "fixture_id": "single_key_default_sighash",
+        "artifact": "dataSig",
+        "mutation": "flip-first-signature-byte"
+      },
+      "consensus": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_P2MR_SIG"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_P2MR_SIG"
+      }
+    },
+    {
+      "id": "opcode-checkdatasigpqc-wrong-domain",
+      "category": "opcode",
+      "scenario": "opcode",
+      "parameters": {
+        "kind": "checkdatasigpqc-wrong-domain",
+        "fixture_file": "src/test/data/p2mr_pqc_witness_vectors.json",
+        "fixture_id": "single_key_default_sighash",
+        "artifact": "dataSig",
+        "mutation": "raw-message-signature"
+      },
+      "consensus": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_P2MR_SIG"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_P2MR_SIG"
+      }
+    },
+    {
       "id": "opcode-checkdatasigaddpqc",
       "category": "opcode",
       "scenario": "opcode",
@@ -568,6 +612,48 @@
         "accepted": true,
         "stage": "script-complete",
         "error": "SCRIPT_ERR_OK"
+      }
+    },
+    {
+      "id": "opcode-checkdatasigaddpqc-wrong-message",
+      "category": "opcode",
+      "scenario": "opcode",
+      "parameters": {
+        "kind": "checkdatasigaddpqc-wrong-message",
+        "fixture_file": "src/test/data/p2mr_pqc_witness_vectors.json",
+        "fixture_id": "single_key_default_sighash",
+        "artifact": "dataSigAdd"
+      },
+      "consensus": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_P2MR_SIG"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_P2MR_SIG"
+      }
+    },
+    {
+      "id": "opcode-checkdatasigaddpqc-wrong-pubkey",
+      "category": "opcode",
+      "scenario": "opcode",
+      "parameters": {
+        "kind": "checkdatasigaddpqc-wrong-pubkey",
+        "fixture_file": "src/test/data/p2mr_pqc_witness_vectors.json",
+        "fixture_id": "single_key_default_sighash",
+        "artifact": "dataSigAdd"
+      },
+      "consensus": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_P2MR_SIG"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_P2MR_SIG"
       }
     },
     {

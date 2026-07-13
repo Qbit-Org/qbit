@@ -1437,23 +1437,43 @@ BoundaryExecution ExecuteP2MRBoundaryCase(const UniValue& test, unsigned int fla
             P2MRSpendContext spend{BuildP2MRSpend(script_pubkey, leaf_script, {}, control_block)};
             return ExecuteBoundarySpend(spend, flags);
         }
-        if (kind == "checkdatasigpqc-valid") {
-            CheckExactObjectKeys(parameters, {"kind", "fixture_file", "fixture_id", "artifact"}, "boundary CHECKDATASIGPQC fixture parameters");
+        if (kind == "checkdatasigpqc-valid" || kind == "checkdatasigpqc-invalid" || kind == "checkdatasigpqc-wrong-domain") {
+            const std::set<std::string> parameter_keys{kind == "checkdatasigpqc-valid" ?
+                                                           std::set<std::string>{"kind", "fixture_file", "fixture_id", "artifact"} :
+                                                           std::set<std::string>{"kind", "fixture_file", "fixture_id", "artifact", "mutation"}};
+            CheckExactObjectKeys(parameters, parameter_keys, "boundary CHECKDATASIGPQC fixture parameters");
             CheckBoundaryFixtureSelector(parameters, "dataSig");
             const std::vector<P2MRWitnessVector> vectors{LoadIndependentP2MRWitnessVectors()};
             const P2MRWitnessVector& vector{FindVector(vectors, "single_key_default_sighash")};
-            const CMutableTransaction tx{BuildDataSigVectorSpend(vector)};
+            CMutableTransaction tx{BuildDataSigVectorSpend(vector)};
+            if (kind == "checkdatasigpqc-invalid") {
+                BOOST_REQUIRE_EQUAL(parameters["mutation"].get_str(), "flip-first-signature-byte");
+                tx.vin[0].scriptWitness.stack[0][0] ^= 0x01;
+            } else if (kind == "checkdatasigpqc-wrong-domain") {
+                BOOST_REQUIRE_EQUAL(parameters["mutation"].get_str(), "raw-message-signature");
+                BOOST_REQUIRE(vector.data_sig_raw_message_signature);
+                tx.vin[0].scriptWitness.stack[0] = *vector.data_sig_raw_message_signature;
+            }
             return ExecuteBoundaryFixtureSpend(tx, BuildDataSigSpentOutputs(vector), 0, flags);
         }
-        if (kind == "checkdatasigaddpqc-valid") {
+        if (kind == "checkdatasigaddpqc-valid" || kind == "checkdatasigaddpqc-wrong-message" || kind == "checkdatasigaddpqc-wrong-pubkey") {
             CheckExactObjectKeys(parameters, {"kind", "fixture_file", "fixture_id", "artifact"}, "boundary CHECKDATASIGADDPQC fixture parameters");
             CheckBoundaryFixtureSelector(parameters, "dataSigAdd");
             const std::vector<P2MRWitnessVector> vectors{LoadIndependentP2MRWitnessVectors()};
             const P2MRWitnessVector& vector{FindVector(vectors, "single_key_default_sighash")};
             BOOST_REQUIRE(vector.data_sig_add);
             const DataSigAddVector& add{*vector.data_sig_add};
-            const CMutableTransaction tx{BuildDataSigAddNOfNVectorSpend(add)};
-            const std::vector<CTxOut> spent_outputs{BuildSingleInputSpentOutputs(vector, add.n_of_n_script_pubkey)};
+            const CMutableTransaction tx{kind == "checkdatasigaddpqc-valid" ?
+                                             BuildDataSigAddNOfNVectorSpend(add) :
+                                             BuildIndependentP2MRVectorSpend(
+                                                 {add.signature_b, add.signature_a},
+                                                 kind == "checkdatasigaddpqc-wrong-message" ? add.wrong_message_hash_leaf_script : add.wrong_pubkey_leaf_script,
+                                                 add.control_block)};
+            const CScript& script_pubkey{kind == "checkdatasigaddpqc-valid" ?
+                                             add.n_of_n_script_pubkey :
+                                         kind == "checkdatasigaddpqc-wrong-message" ? add.wrong_message_hash_script_pubkey :
+                                                                                      add.wrong_pubkey_script_pubkey};
+            const std::vector<CTxOut> spent_outputs{BuildSingleInputSpentOutputs(vector, script_pubkey)};
             return ExecuteBoundaryFixtureSpend(tx, spent_outputs, 0, flags);
         }
         if (kind == "op-success" || kind == "disabled") {
@@ -1737,8 +1757,8 @@ BOOST_AUTO_TEST_CASE(p2mr_v1_manifest_matches_embedded_corpus)
     BOOST_CHECK_EQUAL(counts["commitment_invalid"].getInt<int>(), 7);
     BOOST_CHECK_EQUAL(counts["witness"].getInt<int>(), 14);
     BOOST_CHECK_EQUAL(counts["cross_profile"].getInt<int>(), 2);
-    BOOST_CHECK_EQUAL(counts["script_boundary"].getInt<int>(), 43);
-    BOOST_CHECK_EQUAL(manifest["case_count"].getInt<int>(), 70);
+    BOOST_CHECK_EQUAL(counts["script_boundary"].getInt<int>(), 47);
+    BOOST_CHECK_EQUAL(manifest["case_count"].getInt<int>(), 74);
 
     struct ManifestFile {
         std::string_view bytes;
@@ -1751,7 +1771,7 @@ BOOST_AUTO_TEST_CASE(p2mr_v1_manifest_matches_embedded_corpus)
         {"src/test/data/p2mr_pqc_witness_vectors.json",
          {json_tests::p2mr_pqc_witness_vectors, 14, "PQC sighash and witness vectors"}},
         {"src/test/data/p2mr_script_boundary_vectors.json",
-         {json_tests::p2mr_script_boundary_vectors, 43, "script, control, leaf, opcode, and resource boundary vectors"}},
+         {json_tests::p2mr_script_boundary_vectors, 47, "script, control, leaf, opcode, and resource boundary vectors"}},
         {"src/test/data/p2mr_vectors.json",
          {json_tests::p2mr_vectors, 11, "commitment, control block, root, and address vectors"}},
     };
@@ -4995,7 +5015,7 @@ BOOST_AUTO_TEST_CASE(p2mr_v1_script_boundary_vectors)
 
     const UniValue& cases{corpus["cases"]};
     BOOST_REQUIRE(cases.isArray());
-    BOOST_REQUIRE_EQUAL(cases.size(), 43U);
+    BOOST_REQUIRE_EQUAL(cases.size(), 47U);
     std::set<std::string> ids;
     std::map<std::string, size_t> category_counts;
     const std::map<std::string, std::string> category_scenarios{
@@ -5046,7 +5066,7 @@ BOOST_AUTO_TEST_CASE(p2mr_v1_script_boundary_vectors)
 
     BOOST_CHECK_EQUAL(category_counts["witness-control"], 10U);
     BOOST_CHECK_EQUAL(category_counts["leaf-version"], 7U);
-    BOOST_CHECK_EQUAL(category_counts["opcode"], 14U);
+    BOOST_CHECK_EQUAL(category_counts["opcode"], 18U);
     BOOST_CHECK_EQUAL(category_counts["resource"], 12U);
 }
 

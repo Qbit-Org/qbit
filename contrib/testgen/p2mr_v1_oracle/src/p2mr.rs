@@ -248,9 +248,12 @@ fn commitment_outcome(control: &[u8], script_bytes: &[u8], program: &[u8; 32]) -
             error: "SCRIPT_ERR_OK".to_string(),
         };
     }
-    match script::evaluate(script_bytes, &[], |_, _, _| {
-        Err("unsupported signature in commitment-only case".to_string())
-    }) {
+    match script::evaluate(
+        script_bytes,
+        &[],
+        |_, _, _| Err("unsupported signature in commitment-only case".to_string()),
+        |_, _, _| Err("unsupported data signature in commitment-only case".to_string()),
+    ) {
         Ok(()) => Expected {
             accepted: true,
             stage: "script-complete".to_string(),
@@ -748,6 +751,7 @@ fn validate_checksigadd_fixture(case: &Map<String, Value>, id: &str) -> Result<(
             }
             check_p2mr_signature(executed_pubkey, &digest, executed_signature, 0)
         },
+        |_, _, _| Err(format!("{id}.checkSigAdd: unexpected data signature")),
     )
     .map_err(|error| format!("{id}.checkSigAdd: {error}"))?;
     if signature_checks != 1 {
@@ -768,6 +772,51 @@ fn validate_checksigadd_fixture(case: &Map<String, Value>, id: &str) -> Result<(
         return Err(format!("{id}.checkSigAdd: expected result mismatch"));
     }
     Ok(())
+}
+
+fn execute_data_signature_script(
+    script_bytes: &[u8],
+    initial_stack: &[Vec<u8>],
+    control: &[u8],
+) -> Result<usize, String> {
+    let mut witness = initial_stack.to_vec();
+    witness.push(script_bytes.to_vec());
+    witness.push(control.to_vec());
+    let mut validation_weight = witness_serialized_size(&witness) as i64 + VALIDATION_WEIGHT_OFFSET;
+    let mut signature_checks = 0usize;
+    script::evaluate(
+        script_bytes,
+        initial_stack,
+        |_, _, _| Err("unexpected transaction signature opcode".to_string()),
+        |signature, message_hash, pubkey| {
+            signature_checks += 1;
+            if !signature.is_empty() {
+                validation_weight -= VALIDATION_WEIGHT_PER_PQC;
+                if validation_weight < 0 {
+                    return Err("SCRIPT_ERR_P2MR_VALIDATION_WEIGHT".to_string());
+                }
+            }
+            if pubkey.len() != PQC_PUBLIC_KEY_SIZE {
+                return Err("SCRIPT_ERR_PUBKEYTYPE".to_string());
+            }
+            if message_hash.len() != 32 {
+                return Err("SCRIPT_ERR_PUSH_SIZE".to_string());
+            }
+            if signature.is_empty() {
+                return Ok(false);
+            }
+            if signature.len() != PQC_SIGNATURE_SIZE {
+                return Err("SCRIPT_ERR_P2MR_SIG_SIZE".to_string());
+            }
+            let digest = tagged_hash("QbitDataSigPQC", message_hash);
+            if primitive_verify(pubkey, &digest, signature)? {
+                Ok(true)
+            } else {
+                Err("SCRIPT_ERR_P2MR_SIG".to_string())
+            }
+        },
+    )?;
+    Ok(signature_checks)
 }
 
 fn validate_ancillary_data_signatures(case: &Map<String, Value>, id: &str) -> Result<(), String> {
@@ -800,6 +849,15 @@ fn validate_ancillary_data_signatures(case: &Map<String, Value>, id: &str) -> Re
     if expected_leaf != decode_hex(string(case, "dataSigLeafScript", id)?, id)? {
         return Err(format!("{id}: dataSigLeafScript serialization mismatch"));
     }
+    let control = decode_hex(string(case, "dataSigControlBlock", id)?, id)?;
+    if execute_data_signature_script(
+        &expected_leaf,
+        &[signature.clone(), message.to_vec()],
+        &control,
+    )? != 1
+    {
+        return Err(format!("{id}: dataSig did not execute exactly one check"));
+    }
     let mut wrong_pubkey = pubkey.clone();
     wrong_pubkey[0] ^= 1;
     let mut expected_wrong_leaf = vec![PQC_PUBLIC_KEY_SIZE as u8];
@@ -810,6 +868,15 @@ fn validate_ancillary_data_signatures(case: &Map<String, Value>, id: &str) -> Re
             "{id}: dataSigWrongPubkeyLeafScript serialization mismatch"
         ));
     }
+    let wrong_pubkey_error = execute_data_signature_script(
+        &expected_wrong_leaf,
+        &[signature.clone(), message.to_vec()],
+        &control,
+    )
+    .unwrap_err();
+    if wrong_pubkey_error != "SCRIPT_ERR_P2MR_SIG" {
+        return Err(format!("{id}: wrong data-signature pubkey error mismatch"));
+    }
     let raw_signature = decode_hex(
         string(case, "dataSigRawMessageSignature", id)?,
         &format!("{id}.dataSigRawMessageSignature"),
@@ -818,6 +885,15 @@ fn validate_ancillary_data_signatures(case: &Map<String, Value>, id: &str) -> Re
         || primitive_verify(&pubkey, &digest, &raw_signature)?
     {
         return Err(format!("{id}: raw-message domain separation mismatch"));
+    }
+    let raw_domain_error = execute_data_signature_script(
+        &expected_leaf,
+        &[raw_signature.clone(), message.to_vec()],
+        &control,
+    )
+    .unwrap_err();
+    if raw_domain_error != "SCRIPT_ERR_P2MR_SIG" {
+        return Err(format!("{id}: raw-message execution error mismatch"));
     }
     for (leaf_field, output_field) in [
         ("dataSigLeafScript", "dataSigScriptPubKey"),
@@ -832,7 +908,6 @@ fn validate_ancillary_data_signatures(case: &Map<String, Value>, id: &str) -> Re
             &format!("{id}.{output_field}"),
         )?;
         let program = program_from_script_pubkey(&output, id)?;
-        let control = decode_hex(string(case, "dataSigControlBlock", id)?, id)?;
         if root_from_control(&control, &leaf, "P2MRLeaf", "P2MRBranch")? != program {
             return Err(format!("{id}: {leaf_field} commitment mismatch"));
         }
@@ -845,6 +920,7 @@ fn validate_ancillary_data_signatures(case: &Map<String, Value>, id: &str) -> Re
             return Err(format!("{id}: dataSigAdd tagged hash mismatch"));
         }
         let mut pubkeys = Vec::new();
+        let mut signatures = Vec::new();
         for suffix in ["A", "B", "C"] {
             let pubkey = decode_hex(string(add, &format!("pubkey{suffix}"), id)?, id)?;
             let signature = decode_hex(string(add, &format!("signature{suffix}"), id)?, id)?;
@@ -854,6 +930,7 @@ fn validate_ancillary_data_signatures(case: &Map<String, Value>, id: &str) -> Re
                 ));
             }
             pubkeys.push(pubkey);
+            signatures.push(signature);
         }
         let pubkey_a = decode_hex(string(add, "pubkeyA", id)?, id)?;
         let raw_a = decode_hex(string(add, "rawMessageSignatureA", id)?, id)?;
@@ -884,12 +961,12 @@ fn validate_ancillary_data_signatures(case: &Map<String, Value>, id: &str) -> Re
         wrong_keys[0][0] ^= 1;
         let wrong_pubkey_script = build_add_script(&add_message, &wrong_keys, 2);
         for (field, expected_script) in [
-            ("nOfNLeafScript", n_of_n),
-            ("mOfNLeafScript", m_of_n),
-            ("wrongMessageHashLeafScript", wrong_message_script),
-            ("wrongPubkeyLeafScript", wrong_pubkey_script),
+            ("nOfNLeafScript", &n_of_n),
+            ("mOfNLeafScript", &m_of_n),
+            ("wrongMessageHashLeafScript", &wrong_message_script),
+            ("wrongPubkeyLeafScript", &wrong_pubkey_script),
         ] {
-            if decode_hex(string(add, field, id)?, id)? != expected_script {
+            if decode_hex(string(add, field, id)?, id)? != *expected_script {
                 return Err(format!("{id}: dataSigAdd {field} serialization mismatch"));
             }
         }
@@ -905,6 +982,37 @@ fn validate_ancillary_data_signatures(case: &Map<String, Value>, id: &str) -> Re
             let control = decode_hex(string(add, "controlBlock", id)?, id)?;
             if root_from_control(&control, &leaf, "P2MRLeaf", "P2MRBranch")? != program {
                 return Err(format!("{id}: dataSigAdd {leaf_field} commitment mismatch"));
+            }
+        }
+        let control = decode_hex(string(add, "controlBlock", id)?, id)?;
+        if execute_data_signature_script(
+            &n_of_n,
+            &[signatures[1].clone(), signatures[0].clone()],
+            &control,
+        )? != 2
+        {
+            return Err(format!("{id}: dataSigAdd n-of-n execution mismatch"));
+        }
+        if execute_data_signature_script(
+            &m_of_n,
+            &[signatures[2].clone(), Vec::new(), signatures[0].clone()],
+            &control,
+        )? != 3
+        {
+            return Err(format!("{id}: dataSigAdd m-of-n execution mismatch"));
+        }
+        for (name, script_bytes) in [
+            ("wrong message", &wrong_message_script),
+            ("wrong pubkey", &wrong_pubkey_script),
+        ] {
+            let error = execute_data_signature_script(
+                script_bytes,
+                &[signatures[1].clone(), signatures[0].clone()],
+                &control,
+            )
+            .unwrap_err();
+            if error != "SCRIPT_ERR_P2MR_SIG" {
+                return Err(format!("{id}: dataSigAdd {name} execution mismatch"));
             }
         }
     }
@@ -1068,39 +1176,44 @@ pub fn evaluate_witness(case: &Value) -> Result<Observation, String> {
     let mut validation_weight =
         witness_serialized_size(&declared_witness) as i64 + VALIDATION_WEIGHT_OFFSET;
     let mut signature_checks = 0usize;
-    script::evaluate(&script_bytes, &spend_stack, |signature, pubkey, codesep| {
-        signature_checks += 1;
-        if codesep != declared_codesep {
-            return Err(format!("{id}: executed code separator position mismatch"));
-        }
-        if pubkey != declared_pubkey {
-            return Err(format!("{id}: executed pubkey mismatch"));
-        }
-        if pubkey.len() != PQC_PUBLIC_KEY_SIZE {
-            return Err("SCRIPT_ERR_PUBKEYTYPE".to_string());
-        }
-        if signature.is_empty() {
-            return Ok(false);
-        }
-        validation_weight -= VALIDATION_WEIGHT_PER_PQC;
-        if validation_weight < 0 {
-            return Err("SCRIPT_ERR_P2MR_VALIDATION_WEIGHT".to_string());
-        }
-        let message = p2mr_sigmsg(
-            &tx,
-            &spent_outputs,
-            input_index,
-            hash_type,
-            annex_hash,
-            &leaf,
-            codesep,
-        )?
-        .ok_or("SCRIPT_ERR_P2MR_SIG_HASHTYPE")?;
-        if message != computed_message {
-            return Err(format!("{id}: executed signature message mismatch"));
-        }
-        check_p2mr_signature(pubkey, &computed_digest, signature, hash_type)
-    })
+    script::evaluate(
+        &script_bytes,
+        &spend_stack,
+        |signature, pubkey, codesep| {
+            signature_checks += 1;
+            if codesep != declared_codesep {
+                return Err(format!("{id}: executed code separator position mismatch"));
+            }
+            if pubkey != declared_pubkey {
+                return Err(format!("{id}: executed pubkey mismatch"));
+            }
+            if pubkey.len() != PQC_PUBLIC_KEY_SIZE {
+                return Err("SCRIPT_ERR_PUBKEYTYPE".to_string());
+            }
+            if signature.is_empty() {
+                return Ok(false);
+            }
+            validation_weight -= VALIDATION_WEIGHT_PER_PQC;
+            if validation_weight < 0 {
+                return Err("SCRIPT_ERR_P2MR_VALIDATION_WEIGHT".to_string());
+            }
+            let message = p2mr_sigmsg(
+                &tx,
+                &spent_outputs,
+                input_index,
+                hash_type,
+                annex_hash,
+                &leaf,
+                codesep,
+            )?
+            .ok_or("SCRIPT_ERR_P2MR_SIG_HASHTYPE")?;
+            if message != computed_message {
+                return Err(format!("{id}: executed signature message mismatch"));
+            }
+            check_p2mr_signature(pubkey, &computed_digest, signature, hash_type)
+        },
+        |_, _, _| Err(format!("{id}: unexpected data signature opcode")),
+    )
     .map_err(|error| format!("{id}: {error}"))?;
     if signature_checks != 1 {
         return Err(format!(
@@ -1392,7 +1505,12 @@ fn boundary_outcome(
                 other => return Err(format!("{id}: unsupported leaf script {other}")),
             };
             if control_byte & 0xfe == P2MR_LEAF_VERSION {
-                let result = script::evaluate(&script, &[], |_, _, _| unreachable!());
+                let result = script::evaluate(
+                    &script,
+                    &[],
+                    |_, _, _| unreachable!(),
+                    |_, _, _| unreachable!(),
+                );
                 let consensus = match result {
                     Ok(()) => Expected {
                         accepted: true,
@@ -1560,18 +1678,83 @@ fn boundary_outcome(
                         }
                     }
                 }
-                "checkdatasigpqc-valid" | "checkdatasigaddpqc-valid" => {
-                    let artifact = if kind == "checkdatasigpqc-valid" {
-                        "dataSig"
+                "checkdatasigpqc-valid"
+                | "checkdatasigpqc-invalid"
+                | "checkdatasigpqc-wrong-domain"
+                | "checkdatasigaddpqc-valid"
+                | "checkdatasigaddpqc-wrong-message"
+                | "checkdatasigaddpqc-wrong-pubkey" => {
+                    let is_add = kind.starts_with("checkdatasigaddpqc");
+                    let extras = if !is_add && kind != "checkdatasigpqc-valid" {
+                        &["mutation"][..]
                     } else {
-                        "dataSigAdd"
+                        &[][..]
                     };
-                    let fixture = boundary_fixture(parameters, id, witness_cases, artifact, &[])?;
-                    validate_ancillary_data_signatures(fixture, string(fixture, "id", id)?)?;
-                    Expected {
-                        accepted: true,
-                        stage: "script-complete".to_string(),
-                        error: "SCRIPT_ERR_OK".to_string(),
+                    let fixture = boundary_fixture(
+                        parameters,
+                        id,
+                        witness_cases,
+                        if is_add { "dataSigAdd" } else { "dataSig" },
+                        extras,
+                    )?;
+                    let fixture_id = string(fixture, "id", id)?;
+                    validate_ancillary_data_signatures(fixture, fixture_id)?;
+                    let result = if is_add {
+                        let add = object(
+                            fixture
+                                .get("dataSigAdd")
+                                .ok_or_else(|| format!("{id}: missing dataSigAdd"))?,
+                            id,
+                        )?;
+                        let leaf_field = match kind {
+                            "checkdatasigaddpqc-valid" => "nOfNLeafScript",
+                            "checkdatasigaddpqc-wrong-message" => "wrongMessageHashLeafScript",
+                            "checkdatasigaddpqc-wrong-pubkey" => "wrongPubkeyLeafScript",
+                            _ => unreachable!(),
+                        };
+                        execute_data_signature_script(
+                            &decode_hex(string(add, leaf_field, id)?, id)?,
+                            &[
+                                decode_hex(string(add, "signatureB", id)?, id)?,
+                                decode_hex(string(add, "signatureA", id)?, id)?,
+                            ],
+                            &decode_hex(string(add, "controlBlock", id)?, id)?,
+                        )
+                    } else {
+                        let mut signature =
+                            decode_hex(string(fixture, "dataSigSignature", id)?, id)?;
+                        if kind == "checkdatasigpqc-invalid" {
+                            if string(parameters, "mutation", id)? != "flip-first-signature-byte" {
+                                return Err(format!("{id}: unsupported data signature mutation"));
+                            }
+                            signature[0] ^= 1;
+                        } else if kind == "checkdatasigpqc-wrong-domain" {
+                            if string(parameters, "mutation", id)? != "raw-message-signature" {
+                                return Err(format!("{id}: unsupported data signature mutation"));
+                            }
+                            signature =
+                                decode_hex(string(fixture, "dataSigRawMessageSignature", id)?, id)?;
+                        }
+                        execute_data_signature_script(
+                            &decode_hex(string(fixture, "dataSigLeafScript", id)?, id)?,
+                            &[
+                                signature,
+                                decode_hex(string(fixture, "dataSigMessageHash", id)?, id)?,
+                            ],
+                            &decode_hex(string(fixture, "dataSigControlBlock", id)?, id)?,
+                        )
+                    };
+                    match result {
+                        Ok(_) => Expected {
+                            accepted: true,
+                            stage: "script-complete".to_string(),
+                            error: "SCRIPT_ERR_OK".to_string(),
+                        },
+                        Err(error) => Expected {
+                            accepted: false,
+                            stage: "script".to_string(),
+                            error,
+                        },
                     }
                 }
                 "op-success" => {
@@ -1713,8 +1896,13 @@ fn boundary_outcome(
                     } else {
                         vec![0x00]
                     };
-                    let error = script::evaluate(&script, &[], |_, _, _| unreachable!())
-                        .expect_err("boundary final-stack script must fail");
+                    let error = script::evaluate(
+                        &script,
+                        &[],
+                        |_, _, _| unreachable!(),
+                        |_, _, _| unreachable!(),
+                    )
+                    .expect_err("boundary final-stack script must fail");
                     Expected {
                         accepted: false,
                         stage: "script-complete".to_string(),
@@ -1904,6 +2092,55 @@ mod tests {
         assert!(outcome.accepted);
         assert_eq!(outcome.stage, "upgrade-success");
         assert_eq!(outcome.error, "SCRIPT_ERR_OK");
+    }
+
+    #[test]
+    fn data_signature_checks_match_consensus_error_ordering() {
+        let data_script = |pubkey_size: usize| {
+            let mut script = vec![pubkey_size as u8];
+            script.resize(1 + pubkey_size, 2);
+            script.push(0xbc);
+            script
+        };
+        let control = [0xc1];
+
+        assert_eq!(
+            execute_data_signature_script(
+                &data_script(31),
+                &[vec![1; PQC_SIGNATURE_SIZE], vec![1; 31]],
+                &control,
+            )
+            .unwrap_err(),
+            "SCRIPT_ERR_PUBKEYTYPE"
+        );
+        assert_eq!(
+            execute_data_signature_script(
+                &data_script(32),
+                &[vec![1; PQC_SIGNATURE_SIZE], vec![1; 31]],
+                &control,
+            )
+            .unwrap_err(),
+            "SCRIPT_ERR_PUSH_SIZE"
+        );
+        assert_eq!(
+            execute_data_signature_script(
+                &data_script(32),
+                &[vec![1; PQC_SIGNATURE_SIZE - 1], vec![1; 32]],
+                &control,
+            )
+            .unwrap_err(),
+            "SCRIPT_ERR_P2MR_SIG_SIZE"
+        );
+        assert_eq!(
+            execute_data_signature_script(&data_script(32), &[Vec::new(), vec![1; 32]], &control,)
+                .unwrap_err(),
+            "SCRIPT_ERR_EVAL_FALSE"
+        );
+        assert_eq!(
+            execute_data_signature_script(&data_script(32), &[vec![1], vec![1; 32]], &control,)
+                .unwrap_err(),
+            "SCRIPT_ERR_P2MR_VALIDATION_WEIGHT"
+        );
     }
 
     #[test]

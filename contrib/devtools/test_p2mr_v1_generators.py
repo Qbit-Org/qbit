@@ -38,7 +38,7 @@ class P2MRV1GeneratorTest(unittest.TestCase):
             expected_counts = {
                 "p2mr_vectors.json": (4, 7),
                 "p2mr_cross_profile_vectors.json": 2,
-                "p2mr_script_boundary_vectors.json": 43,
+                "p2mr_script_boundary_vectors.json": 47,
             }
             for filename, expected_count in expected_counts.items():
                 first_bytes = (first / filename).read_bytes()
@@ -125,7 +125,7 @@ class P2MRV1GeneratorTest(unittest.TestCase):
                 encoding="utf8",
             )
             generated = json.loads(manifest.generated_manifest(root))
-            self.assertEqual(generated["case_count"], 56)
+            self.assertEqual(generated["case_count"], 60)
             self.assertEqual(generated["case_counts"]["witness"], 0)
 
 

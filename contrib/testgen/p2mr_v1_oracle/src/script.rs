@@ -61,13 +61,15 @@ fn serialize_script_num(value: i64) -> Vec<u8> {
     encoded
 }
 
-pub fn evaluate<F>(
+pub fn evaluate<T, D>(
     script: &[u8],
     initial_stack: &[Vec<u8>],
-    mut check_signature: F,
+    mut check_signature: T,
+    mut check_data_signature: D,
 ) -> Result<(), String>
 where
-    F: FnMut(&[u8], &[u8], u32) -> Result<bool, String>,
+    T: FnMut(&[u8], &[u8], u32) -> Result<bool, String>,
+    D: FnMut(&[u8], &[u8], &[u8]) -> Result<bool, String>,
 {
     if initial_stack.len() > MAX_STACK_ITEMS {
         return Err("SCRIPT_ERR_STACK_SIZE".to_string());
@@ -109,9 +111,9 @@ where
                 }
                 position = end;
             }
-            0x51 => {
+            0x51..=0x60 => {
                 if executing {
-                    stack.push(vec![1]);
+                    stack.push(serialize_script_num(i64::from(opcode - 0x50)));
                 }
             }
             0x61 => {}
@@ -133,6 +135,15 @@ where
             0x68 => {
                 if conditionals.pop().is_none() {
                     return Err("SCRIPT_ERR_UNBALANCED_CONDITIONAL".to_string());
+                }
+            }
+            0x7c => {
+                if executing {
+                    if stack.len() < 2 {
+                        return Err("SCRIPT_ERR_INVALID_STACK_OPERATION".to_string());
+                    }
+                    let top = stack.len() - 1;
+                    stack.swap(top, top - 1);
                 }
             }
             0xab => {
@@ -157,6 +168,31 @@ where
                     let number = parse_script_num(&stack.pop().unwrap())?;
                     let signature = stack.pop().unwrap();
                     let valid = check_signature(&signature, &pubkey, last_codesep)?;
+                    stack.push(serialize_script_num(number + i64::from(valid)));
+                }
+            }
+            0xbc => {
+                if executing {
+                    if stack.len() < 3 {
+                        return Err("SCRIPT_ERR_INVALID_STACK_OPERATION".to_string());
+                    }
+                    let pubkey = stack.pop().unwrap();
+                    let message_hash = stack.pop().unwrap();
+                    let signature = stack.pop().unwrap();
+                    let valid = check_data_signature(&signature, &message_hash, &pubkey)?;
+                    stack.push(if valid { vec![1] } else { Vec::new() });
+                }
+            }
+            0xbd => {
+                if executing {
+                    if stack.len() < 4 {
+                        return Err("SCRIPT_ERR_INVALID_STACK_OPERATION".to_string());
+                    }
+                    let pubkey = stack.pop().unwrap();
+                    let number = parse_script_num(&stack.pop().unwrap())?;
+                    let message_hash = stack.pop().unwrap();
+                    let signature = stack.pop().unwrap();
+                    let valid = check_data_signature(&signature, &message_hash, &pubkey)?;
                     stack.push(serialize_script_num(number + i64::from(valid)));
                 }
             }
@@ -197,29 +233,77 @@ mod tests {
 
     #[test]
     fn evaluates_true_and_false() {
-        assert!(evaluate(&[0x51], &[], |_, _, _| unreachable!()).is_ok());
+        assert!(evaluate(
+            &[0x51],
+            &[],
+            |_, _, _| unreachable!(),
+            |_, _, _| { unreachable!() }
+        )
+        .is_ok());
         assert_eq!(
-            evaluate(&[0x00], &[], |_, _, _| unreachable!()).unwrap_err(),
+            evaluate(
+                &[0x00],
+                &[],
+                |_, _, _| unreachable!(),
+                |_, _, _| unreachable!()
+            )
+            .unwrap_err(),
             "SCRIPT_ERR_EVAL_FALSE"
         );
     }
 
     #[test]
     fn rejects_unsupported_opcode() {
-        assert!(evaluate(&[0x6a], &[], |_, _, _| unreachable!())
-            .unwrap_err()
-            .starts_with("UNSUPPORTED_P2MR_OPCODE"));
+        assert!(evaluate(
+            &[0x6a],
+            &[],
+            |_, _, _| unreachable!(),
+            |_, _, _| unreachable!()
+        )
+        .unwrap_err()
+        .starts_with("UNSUPPORTED_P2MR_OPCODE"));
     }
 
     #[test]
     fn executes_checksigadd_and_numequal() {
         let script = [0x00, 0x01, 0x02, 0xba, 0x51, 0x9c];
-        assert!(evaluate(&script, &[vec![3]], |signature, pubkey, codesep| {
-            assert_eq!(signature, [3]);
-            assert_eq!(pubkey, [2]);
-            assert_eq!(codesep, u32::MAX);
-            Ok(true)
-        })
+        assert!(evaluate(
+            &script,
+            &[vec![3]],
+            |signature, pubkey, codesep| {
+                assert_eq!(signature, [3]);
+                assert_eq!(pubkey, [2]);
+                assert_eq!(codesep, u32::MAX);
+                Ok(true)
+            },
+            |_, _, _| unreachable!()
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn executes_checkdatasig_and_checkdatasigadd() {
+        let checksig_script = [0x01, 0x02, 0x01, 0x03, 0xbc];
+        assert!(evaluate(
+            &checksig_script,
+            &[vec![1]],
+            |_, _, _| unreachable!(),
+            |signature, message_hash, pubkey| {
+                assert_eq!(signature, [1]);
+                assert_eq!(message_hash, [2]);
+                assert_eq!(pubkey, [3]);
+                Ok(true)
+            }
+        )
+        .is_ok());
+
+        let add_script = [0x01, 0x02, 0x00, 0x01, 0x03, 0xbd, 0x51, 0x9c];
+        assert!(evaluate(
+            &add_script,
+            &[vec![1]],
+            |_, _, _| unreachable!(),
+            |_, _, _| Ok(true)
+        )
         .is_ok());
     }
 
@@ -257,7 +341,8 @@ mod tests {
             evaluate(
                 &[0x51],
                 &vec![Vec::new(); MAX_STACK_ITEMS + 1],
-                |_, _, _| { unreachable!() }
+                |_, _, _| unreachable!(),
+                |_, _, _| unreachable!()
             )
             .unwrap_err(),
             "SCRIPT_ERR_STACK_SIZE"
@@ -266,6 +351,7 @@ mod tests {
             evaluate(
                 &[0x51],
                 &[vec![0; MAX_STACK_ITEM_BYTES + 1]],
+                |_, _, _| unreachable!(),
                 |_, _, _| unreachable!()
             )
             .unwrap_err(),
@@ -279,11 +365,16 @@ mod tests {
         script.extend_from_slice(&[1; 32]);
         script.push(0xb3);
         assert_eq!(
-            evaluate(&script, &[Vec::new()], |signature, pubkey, _| {
-                assert!(signature.is_empty());
-                assert_eq!(pubkey, &[1; 32]);
-                Ok(false)
-            })
+            evaluate(
+                &script,
+                &[Vec::new()],
+                |signature, pubkey, _| {
+                    assert!(signature.is_empty());
+                    assert_eq!(pubkey, &[1; 32]);
+                    Ok(false)
+                },
+                |_, _, _| unreachable!()
+            )
             .unwrap_err(),
             "SCRIPT_ERR_EVAL_FALSE"
         );
