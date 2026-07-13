@@ -43,6 +43,7 @@ using interfaces::Chain;
 using interfaces::FoundBlock;
 using interfaces::Handler;
 using interfaces::MakeSignalHandler;
+using interfaces::P2MRDataSignatureAttempt;
 using interfaces::P2MRDataSignatureResult;
 using interfaces::Wallet;
 using interfaces::WalletAddress;
@@ -191,13 +192,21 @@ public:
         if (GetPQCKeyValidationSigningError(*m_wallet)) return SigningResult::SIGNING_FAILED;
         return m_wallet->SignMessage(message, pkhash, str_sig);
     }
-    util::Result<P2MRDataSignatureResult> signP2MRDataHash(const CTxDestination& dest, const uint256& message_hash) override
+    P2MRDataSignatureAttempt signP2MRDataHash(const CTxDestination& dest, const uint256& message_hash) override
     {
-        if (const auto error{GetPQCKeyValidationSigningError(*m_wallet)}) return util::Error{*error};
+        if (const auto error{GetPQCKeyValidationSigningError(*m_wallet)}) {
+            return {
+                .result = util::Error{*error},
+                .pqc_usage = nullptr,
+            };
+        }
 
         const auto* output{std::get_if<WitnessV2P2MR>(&dest)};
         if (!output) {
-            return util::Error{Untranslated("Address is not a P2MR address")};
+            return {
+                .result = util::Error{Untranslated("Address is not a P2MR address")},
+                .pqc_usage = nullptr,
+            };
         }
 
         PQCUsageRecorder pqc_usage_recorder;
@@ -208,8 +217,15 @@ public:
             /*requested_leaf_script=*/std::nullopt,
             /*requested_control_block=*/std::nullopt,
             pqc_usage_recorder.GetObserver())};
+        auto pqc_usage{std::make_shared<const PQCUsageReport>(BuildSigningPQCUsageReport(pqc_usage_recorder))};
+        LogPQCUsageWarnings(*m_wallet, *pqc_usage);
         if (!proof) {
-            return util::Error{util::ErrorString(proof)};
+            bilingual_str error{util::ErrorString(proof)};
+            LogConsumedPQCDataHashCounters(*m_wallet, pqc_usage_recorder, error);
+            return {
+                .result = util::Error{std::move(error)},
+                .pqc_usage = std::move(pqc_usage),
+            };
         }
 
         P2MRDataSignatureResult result;
@@ -221,9 +237,10 @@ public:
         result.leaf_script = proof->leaf_script;
         result.control_block = proof->control_block;
         result.leaf_version = proof->leaf_version;
-        result.pqc_usage = std::make_shared<const PQCUsageReport>(BuildSigningPQCUsageReport(pqc_usage_recorder));
-        LogPQCUsageWarnings(*m_wallet, *result.pqc_usage);
-        return result;
+        return {
+            .result = std::move(result),
+            .pqc_usage = std::move(pqc_usage),
+        };
     }
     bool isSpendable(const CTxDestination& dest) override
     {

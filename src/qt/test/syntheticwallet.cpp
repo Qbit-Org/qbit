@@ -32,8 +32,16 @@ public:
         : m_report(std::move(report)), m_state(std::move(state)), m_background_clone(background_clone)
     {
     }
-    explicit SyntheticWallet(interfaces::P2MRDataSignatureResult result)
+    explicit SyntheticWallet(interfaces::P2MRDataSignatureResult result, wallet::PQCUsageReport report)
         : m_p2mr_result(std::move(result)),
+          m_p2mr_usage(std::make_shared<const wallet::PQCUsageReport>(std::move(report))),
+          m_state(std::make_shared<SyntheticWalletState>()),
+          m_background_clone(false)
+    {
+    }
+    explicit SyntheticWallet(bilingual_str error, wallet::PQCUsageReport report)
+        : m_p2mr_error(std::move(error)),
+          m_p2mr_usage(std::make_shared<const wallet::PQCUsageReport>(std::move(report))),
           m_state(std::make_shared<SyntheticWalletState>()),
           m_background_clone(false)
     {
@@ -85,10 +93,18 @@ public:
     util::Result<CTxDestination> getNewDestination(const OutputType, const std::string&) override { return CTxDestination{PKHash{}}; }
     bool getPubKey(const CScript&, const CKeyID&, CPubKey&) override { return false; }
     SigningResult signMessage(const std::string&, const PKHash&, std::string&) override { return SigningResult::PRIVATE_KEY_NOT_AVAILABLE; }
-    util::Result<interfaces::P2MRDataSignatureResult> signP2MRDataHash(const CTxDestination&, const uint256&) override
+    interfaces::P2MRDataSignatureAttempt signP2MRDataHash(const CTxDestination&, const uint256&) override
     {
-        if (!m_p2mr_result) return util::Error{Untranslated("P2MR data-hash signing unavailable")};
-        return *m_p2mr_result;
+        if (m_p2mr_result) {
+            return {
+                .result = *m_p2mr_result,
+                .pqc_usage = m_p2mr_usage,
+            };
+        }
+        return {
+            .result = util::Error{m_p2mr_error.value_or(Untranslated("P2MR data-hash signing unavailable"))},
+            .pqc_usage = m_p2mr_usage,
+        };
     }
     bool isSpendable(const CTxDestination&) override { return false; }
     bool setAddressBook(const CTxDestination&, const std::string&, const std::optional<wallet::AddressPurpose>&) override { return false; }
@@ -218,6 +234,8 @@ public:
 private:
     wallet::PQCUsageReport m_report;
     std::optional<interfaces::P2MRDataSignatureResult> m_p2mr_result;
+    std::optional<bilingual_str> m_p2mr_error;
+    std::shared_ptr<const wallet::PQCUsageReport> m_p2mr_usage;
     std::shared_ptr<SyntheticWalletState> m_state;
     const bool m_background_clone;
 };
@@ -231,9 +249,18 @@ std::unique_ptr<interfaces::Wallet> MakeSyntheticWallet(
     return std::make_unique<SyntheticWallet>(std::move(report), std::move(state));
 }
 
-std::unique_ptr<interfaces::Wallet> MakeSyntheticWallet(interfaces::P2MRDataSignatureResult result)
+std::unique_ptr<interfaces::Wallet> MakeSyntheticWallet(
+    interfaces::P2MRDataSignatureResult result,
+    wallet::PQCUsageReport report)
 {
-    return std::make_unique<SyntheticWallet>(std::move(result));
+    return std::make_unique<SyntheticWallet>(std::move(result), std::move(report));
+}
+
+std::unique_ptr<interfaces::Wallet> MakeSyntheticP2MRFailureWallet(
+    bilingual_str error,
+    wallet::PQCUsageReport report)
+{
+    return std::make_unique<SyntheticWallet>(std::move(error), std::move(report));
 }
 
 } // namespace qt_test

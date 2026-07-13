@@ -83,6 +83,8 @@ private:
 [[nodiscard]] std::vector<bilingual_str> FormatPQCUsageWarnings(const std::vector<PQCUsageWarning>& warnings);
 [[nodiscard]] PQCUsageReport BuildSigningPQCUsageReport(const PQCUsageRecorder& recorder);
 [[nodiscard]] PQCUsageReport BuildGetAddressInfoPQCUsageReport(const CWallet& wallet, const CScript& script_pubkey);
+void LogPQCUsageWarnings(const CWallet& wallet, const PQCUsageReport& report);
+void LogConsumedPQCDataHashCounters(const CWallet& wallet, const PQCUsageRecorder& recorder, const bilingual_str& error);
 } // namespace wallet
 
 #endif // QBIT_WALLET_PQC_USAGE_H
