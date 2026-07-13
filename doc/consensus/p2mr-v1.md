@@ -438,7 +438,7 @@ For a known `0xc0` leaf, after annex, script, and control removal:
 | Main stack plus alt-stack while executing | 1,000 items | consensus |
 | Literal pushed by script bytecode when OP_SUCCESS does not short circuit | 520 bytes | consensus |
 | Validation-weight initial value | serialized full witness size + 50 | consensus |
-| Charge for each nonempty PQC signature attempt | 3,730 | consensus |
+| Charge for each nonempty PQC signature attempt | 3,683 | consensus |
 | Standard transaction weight | 400,000 | policy |
 | Maximum block weight | 2,000,000 | consensus |
 | Maximum serialized block size | 2,000,000 bytes | consensus buffer/size rule |
@@ -447,7 +447,7 @@ For a known `0xc0` leaf, after annex, script, and control removal:
 The serialized full witness size used for validation weight includes the
 witness element count and every length prefix and element, including annex,
 script, and control block. Each nonempty `CHECKSIGPQC`, P2MR `CHECKSIGADD`,
-`CHECKDATASIGPQC`, or `CHECKDATASIGADDPQC` attempt subtracts 3,730 before
+`CHECKDATASIGPQC`, or `CHECKDATASIGADDPQC` attempt subtracts 3,683 before
 deeper signature validation. A negative remainder fails.
 
 P2MR lifts the generic 520-byte limit for *initial witness stack items* only,

@@ -10,7 +10,7 @@ const MAX_CONTROL_SIZE: usize = 1 + 32 * 128;
 const PQC_PUBLIC_KEY_SIZE: usize = 32;
 const PQC_SIGNATURE_SIZE: usize = 3680;
 const VALIDATION_WEIGHT_OFFSET: i64 = 50;
-const VALIDATION_WEIGHT_PER_PQC: i64 = 3730;
+const VALIDATION_WEIGHT_PER_PQC: i64 = 3683;
 
 #[derive(Clone)]
 pub struct Observation {

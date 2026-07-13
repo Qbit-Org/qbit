@@ -421,7 +421,7 @@ def build_boundary_corpus() -> dict[str, Any]:
             "initial_stack_max_items": 1000,
             "initial_stack_item_max_bytes": 16_384,
             "initial_stack_total_max_bytes": 128 * 1024,
-            "validation_weight_per_nonempty_pqc_check": 3_730,
+            "validation_weight_per_nonempty_pqc_check": 3_683,
         },
         "cases": cases,
     }

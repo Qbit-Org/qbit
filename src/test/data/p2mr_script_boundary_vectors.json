@@ -7,7 +7,7 @@
     "initial_stack_max_items": 1000,
     "initial_stack_item_max_bytes": 16384,
     "initial_stack_total_max_bytes": 131072,
-    "validation_weight_per_nonempty_pqc_check": 3730
+    "validation_weight_per_nonempty_pqc_check": 3683
   },
   "cases": [
     {

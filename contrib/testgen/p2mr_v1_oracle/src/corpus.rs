@@ -368,7 +368,7 @@ fn cases_for(path: &str, value: &Value) -> Result<Vec<Value>, String> {
                 ("initial_stack_max_items", 1000),
                 ("initial_stack_item_max_bytes", 16_384),
                 ("initial_stack_total_max_bytes", 131_072),
-                ("validation_weight_per_nonempty_pqc_check", 3_730),
+                ("validation_weight_per_nonempty_pqc_check", 3_683),
             ] {
                 if limits.get(field).and_then(Value::as_u64) != Some(expected) {
                     return Err(format!("{path}: unexpected {field}"));

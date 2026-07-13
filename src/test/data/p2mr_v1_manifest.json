@@ -38,7 +38,7 @@
       "path": "src/test/data/p2mr_script_boundary_vectors.json",
       "purpose": "script, control, leaf, opcode, and resource boundary vectors",
       "case_count": 47,
-      "sha256": "0139fddaecb87cca1beb13248f2ca91b892f9b4c012e521c88497c75419b0b7c"
+      "sha256": "afde886b873d19cfa024fa7c528b20cced7592d8e0b891d1cad1348ab07124f8"
     },
     {
       "path": "src/test/data/p2mr_vectors.json",

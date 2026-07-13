@@ -1526,8 +1526,8 @@ BoundaryExecution ExecuteP2MRBoundaryCase(const UniValue& test, unsigned int fla
                 spent_outputs = BuildSingleInputSpentOutputs(vector, add.n_of_n_script_pubkey);
             }
             const int64_t budget{static_cast<int64_t>(GetSerializeSize(tx.vin[input_index].scriptWitness.stack)) + VALIDATION_WEIGHT_OFFSET};
-            BOOST_CHECK_GE(budget, checks * P2MR_VALIDATION_WEIGHT_PER_SIGOP_LEGACY);
-            BOOST_CHECK_LT(budget, (checks + 1) * P2MR_VALIDATION_WEIGHT_PER_SIGOP_LEGACY);
+            BOOST_CHECK_GE(budget, checks * P2MR_VALIDATION_WEIGHT_PER_SIGOP_V2);
+            BOOST_CHECK_LT(budget, (checks + 1) * P2MR_VALIDATION_WEIGHT_PER_SIGOP_V2);
             return ExecuteBoundaryFixtureSpend(tx, spent_outputs, input_index, flags);
         }
         if (kind == "validation-weight-exceeded") {
@@ -1542,7 +1542,7 @@ BoundaryExecution ExecuteP2MRBoundaryCase(const UniValue& test, unsigned int fla
                 leaf_script, {valtype{0x01}, valtype{0x01}}, {P2MR_LEAF_VERSION_V1_CONTROL},
                 ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script))};
             const int64_t budget{static_cast<int64_t>(GetSerializeSize(spend.tx_spend.vin[0].scriptWitness.stack)) + VALIDATION_WEIGHT_OFFSET};
-            BOOST_CHECK_LT(budget, P2MR_VALIDATION_WEIGHT_PER_SIGOP_LEGACY);
+            BOOST_CHECK_LT(budget, P2MR_VALIDATION_WEIGHT_PER_SIGOP_V2);
             return ExecuteBoundarySpend(spend, flags);
         }
         if (kind == "empty-signatures") {
@@ -5011,7 +5011,7 @@ BOOST_AUTO_TEST_CASE(p2mr_v1_script_boundary_vectors)
     BOOST_CHECK_EQUAL(limits["initial_stack_max_items"].getInt<int>(), MAX_STACK_SIZE);
     BOOST_CHECK_EQUAL(limits["initial_stack_item_max_bytes"].getInt<unsigned int>(), MAX_P2MR_V1_STACK_ITEM_SIZE);
     BOOST_CHECK_EQUAL(limits["initial_stack_total_max_bytes"].getInt<unsigned int>(), MAX_P2MR_V1_TOTAL_INITIAL_STACK_BYTES);
-    BOOST_CHECK_EQUAL(limits["validation_weight_per_nonempty_pqc_check"].getInt<int64_t>(), P2MR_VALIDATION_WEIGHT_PER_SIGOP_LEGACY);
+    BOOST_CHECK_EQUAL(limits["validation_weight_per_nonempty_pqc_check"].getInt<int64_t>(), P2MR_VALIDATION_WEIGHT_PER_SIGOP_V2);
 
     const UniValue& cases{corpus["cases"]};
     BOOST_REQUIRE(cases.isArray());
