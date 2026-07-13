@@ -197,6 +197,11 @@ exact match before publication. A draft body that cannot be corrected and
 verified remains unpublished. Manual changes to a resumed draft are therefore
 not preserved; record curated notes in a file and pass `--notes-file`.
 
+New drafts default to non-prerelease and `make-latest=false`. When resuming a
+draft, omitted metadata options preserve its existing prerelease and latest
+state. Use `--prerelease` or `--no-prerelease` and an explicit `--make-latest`
+mode to change those values during a resumed operation.
+
 Draft releases are expected to remain mutable while their assets are assembled.
 The publisher does not require `isImmutable=true` until `--publish` transitions
 the draft to a published release. It then polls the final release metadata for a

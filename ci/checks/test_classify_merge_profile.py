@@ -66,7 +66,6 @@ class ClassifyMergeProfileTest(unittest.TestCase):
     def test_release_policy_allowlist_covers_release_paths(self) -> None:
         classification = self.classify(
             [
-                ".github/workflows/release-publish.yml",
                 "contrib/release-process/publish-local-release.sh",
                 "ci/release/validate_key_metadata.py",
                 "contrib/keys/operator-keys/public-keys/operator-01-release.asc",
@@ -93,6 +92,15 @@ class ClassifyMergeProfileTest(unittest.TestCase):
                 self.assertEqual(outputs["release_policy_only"], "true")
                 self.assertEqual(outputs["source_validation_required"], "false")
                 self.assertEqual(outputs["touched_release_validators"], "true")
+
+    def test_retired_release_workflow_requires_source_validation(self) -> None:
+        path = ".github/workflows/release-publish.yml"
+        classification = self.classify([path])
+        outputs = classify_merge_profile.github_outputs(classification)
+
+        self.assertEqual(classification.profile, classify_merge_profile.SOURCE_PROFILE)
+        self.assertEqual(classification.outside_paths, (path,))
+        self.assertEqual(outputs["touched_release_publish"], "false")
 
     def test_rpc_docs_paths_are_rpc_docs_only(self) -> None:
         classification = self.classify(RPC_DOCS_PATHS)

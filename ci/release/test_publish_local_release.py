@@ -188,6 +188,10 @@ if args[:2] == ["release", "create"]:
     (state / "release-body").write_text(
         notes_file.read_text(encoding="utf8"), encoding="utf8"
     )
+    prerelease = "true" if "--prerelease" in args else "false"
+    latest = "true" if "--latest" in args else "false"
+    (state / "prerelease-state").write_text(prerelease, encoding="utf8")
+    (state / "latest-state").write_text(latest, encoding="utf8")
     raise SystemExit(0)
 
 if args[:2] == ["release", "upload"]:
@@ -208,6 +212,14 @@ if args[:2] == ["release", "edit"]:
         )
     if "--draft=false" in args:
         (state / "release-state").write_text("published\n", encoding="utf8")
+    if "--prerelease" in args:
+        (state / "prerelease-state").write_text("true", encoding="utf8")
+    elif "--prerelease=false" in args:
+        (state / "prerelease-state").write_text("false", encoding="utf8")
+    if "--latest" in args:
+        (state / "latest-state").write_text("true", encoding="utf8")
+    elif "--latest=false" in args:
+        (state / "latest-state").write_text("false", encoding="utf8")
     raise SystemExit(0)
 
 print("unsupported fake gh command: " + " ".join(args), file=sys.stderr)
@@ -500,6 +512,49 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Verified draft release", result.stdout)
         self.assertFalse((self.gh_state / "immutable-view-count").exists())
+
+    def test_resumed_draft_preserves_omitted_release_metadata(self) -> None:
+        (self.gh_state / "release-state").write_text("draft\n", encoding="utf8")
+        (self.gh_state / "assets.tsv").write_text("", encoding="utf8")
+        (self.gh_state / "prerelease-state").write_text("true", encoding="utf8")
+        (self.gh_state / "latest-state").write_text("true", encoding="utf8")
+
+        result = self.run_publisher("--publish")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            (self.gh_state / "prerelease-state").read_text(encoding="utf8"), "true"
+        )
+        self.assertEqual(
+            (self.gh_state / "latest-state").read_text(encoding="utf8"), "true"
+        )
+        edit_args = next(
+            line.split()
+            for line in self.gh_log.read_text(encoding="utf8").splitlines()
+            if line.startswith("release edit")
+        )
+        self.assertNotIn("--prerelease", edit_args)
+        self.assertNotIn("--prerelease=false", edit_args)
+        self.assertNotIn("--latest", edit_args)
+        self.assertNotIn("--latest=false", edit_args)
+
+    def test_resumed_draft_metadata_can_be_explicitly_cleared(self) -> None:
+        (self.gh_state / "release-state").write_text("draft\n", encoding="utf8")
+        (self.gh_state / "assets.tsv").write_text("", encoding="utf8")
+        (self.gh_state / "prerelease-state").write_text("true", encoding="utf8")
+        (self.gh_state / "latest-state").write_text("true", encoding="utf8")
+
+        result = self.run_publisher(
+            "--create-draft", "--no-prerelease", "--make-latest", "false"
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            (self.gh_state / "prerelease-state").read_text(encoding="utf8"), "false"
+        )
+        self.assertEqual(
+            (self.gh_state / "latest-state").read_text(encoding="utf8"), "false"
+        )
 
     def test_draft_asset_digest_mismatch_fails_without_replacement(self) -> None:
         artifact = next(

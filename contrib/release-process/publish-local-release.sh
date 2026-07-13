@@ -52,7 +52,11 @@ Release metadata:
   --notes-file FILE                 Release notes; otherwise generate notes.
   --release-name NAME               Default: qbit <TAG>.
   --prerelease                      Mark the release as a prerelease.
-  --make-latest MODE                true, false, or auto. Default: false.
+  --no-prerelease                   Explicitly clear the prerelease flag.
+  --make-latest MODE                true, false, or auto.
+
+For a new draft, prerelease and make-latest default to false. When resuming a
+draft, omitted metadata options preserve its current prerelease and latest state.
 
 Publication mode (mutually exclusive):
   --create-draft                    Upload and verify assets, then leave a draft.
@@ -405,8 +409,8 @@ RELEASE_NAME=""
 REQUIRE_PHOTON=0
 ALLOW_UNSIGNED_PLATFORM_ARTIFACTS=0
 ALLOW_CODESIGNING_ARTIFACTS=0
-PRERELEASE=0
-MAKE_LATEST=false
+PRERELEASE=preserve
+MAKE_LATEST=preserve
 MODE=validate
 GH_REPO=Qbit-Org/qbit
 GUIX_SIGS_GH_REPO=Qbit-Org/qbit-guix.sigs
@@ -483,7 +487,18 @@ while [ "$#" -gt 0 ]; do
             ALLOW_CODESIGNING_ARTIFACTS=1
             shift
             ;;
-        --prerelease) PRERELEASE=1; shift ;;
+        --prerelease)
+            [ "$PRERELEASE" != false ] \
+                || die "--prerelease and --no-prerelease are mutually exclusive"
+            PRERELEASE=true
+            shift
+            ;;
+        --no-prerelease)
+            [ "$PRERELEASE" != true ] \
+                || die "--prerelease and --no-prerelease are mutually exclusive"
+            PRERELEASE=false
+            shift
+            ;;
         --make-latest)
             require_value "$1" "${2:-}"
             MAKE_LATEST="$(lowercase "$2")"
@@ -536,7 +551,7 @@ case "$RELEASE_LINE" in
     *) die "--release-line must be testnet or mainnet: $RELEASE_LINE" ;;
 esac
 case "$MAKE_LATEST" in
-    true|false|auto) ;;
+    preserve|true|false|auto) ;;
     *) die "--make-latest must be true, false, or auto: $MAKE_LATEST" ;;
 esac
 if [ "$RELEASE_LINE" = testnet ] && [ -z "$TESTNET_POSTURE_EVIDENCE" ]; then
@@ -868,16 +883,13 @@ create_args=(
     --title "$RELEASE_NAME"
 )
 create_args+=(--notes-file "$EFFECTIVE_NOTES_FILE")
-if [ "$PRERELEASE" -ne 0 ]; then
-    create_args+=(--prerelease)
-fi
+case "$PRERELEASE" in
+    true) create_args+=(--prerelease) ;;
+    preserve|false) ;;
+esac
 case "$MAKE_LATEST" in
-    true)
-        create_args+=(--latest)
-        ;;
-    false)
-        create_args+=(--latest=false)
-        ;;
+    true) create_args+=(--latest) ;;
+    preserve|false) create_args+=(--latest=false) ;;
     auto) ;;
 esac
 
@@ -929,15 +941,15 @@ edit_args=(
     --title "$RELEASE_NAME"
     --notes-file "$EFFECTIVE_NOTES_FILE"
 )
-if [ "$PRERELEASE" -eq 1 ]; then
-    edit_args+=(--prerelease)
-else
-    edit_args+=(--prerelease=false)
-fi
+case "$PRERELEASE" in
+    true) edit_args+=(--prerelease) ;;
+    false) edit_args+=(--prerelease=false) ;;
+    preserve) ;;
+esac
 case "$MAKE_LATEST" in
     true) edit_args+=(--latest) ;;
     false) edit_args+=(--latest=false) ;;
-    auto) ;;
+    preserve|auto) ;;
 esac
 
 msg "Updating verified draft metadata for $TAG"
