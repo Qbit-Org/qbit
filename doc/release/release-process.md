@@ -163,7 +163,9 @@ Public validators live under `ci/release/`. Release key metadata lives under
 
 ## Publishing
 
-The publisher requires `gh`, `git`, `gpg`, and `python3`. Run it from the
+The publisher requires `gh`, `git`, `gpg`, `python3`, and an authenticated GitHub
+account with push access to the target repository. Push access is required even
+in validation-only mode so the release listing includes drafts. Run it from the
 repository root at the selected trusted release ref. A command with no
 publication mode performs all local and remote validation without changing a
 GitHub Release:
@@ -209,9 +211,10 @@ bounded period and fails unless GitHub reports both `isDraft=false` and
 `isImmutable=true`, then polls the locked asset inventory and digests for a
 bounded period to tolerate GitHub API propagation. Validation-only mode likewise
 rejects an existing published release that is not immutable or whose immutable
-state is missing. A release lookup is considered absent only when GitHub
-explicitly returns HTTP 404; authentication, API, and other lookup failures stop
-validation rather than skipping the remote release checks.
+state is missing. Release discovery uses a fully paginated listing so matching
+drafts remain resumable. A release is considered absent only after that listing
+succeeds without a matching tag; authentication, API, and other lookup failures
+stop validation rather than skipping the remote release checks.
 
 Release immutability must be enabled under the target repository's release
 settings or enforced by its organization before publication. GitHub applies the

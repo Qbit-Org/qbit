@@ -121,6 +121,8 @@ if args and args[0] == "api":
         print("behind")
     elif "/commits/" in endpoint:
         print(endpoint.rsplit("/", 1)[1])
+    elif endpoint.count("/") == 2:
+        print(os.environ.get("FAKE_GH_CAN_PUSH", "true"))
     elif endpoint.endswith("/releases/generate-notes"):
         print(
             json.dumps(
@@ -130,39 +132,32 @@ if args and args[0] == "api":
                 }
             )
         )
-    elif "/releases/tags/" in endpoint:
+    elif endpoint.endswith("/releases?per_page=100"):
         if os.environ.get("FAKE_GH_RELEASE_LOOKUP_ERROR") == "true":
             print("simulated release lookup failure", file=sys.stderr)
             raise SystemExit(1)
         release_state = state / "release-state"
-        if not release_state.exists():
-            print("HTTP/2.0 404 Not Found")
-            print()
-            print('{"message":"Not Found"}')
-            print("release not found", file=sys.stderr)
-            raise SystemExit(1)
-        draft = release_state.read_text(encoding="utf8").strip() == "draft"
-        if draft:
-            immutable = os.environ.get("FAKE_GH_DRAFT_IMMUTABLE", "false")
-        else:
-            sequence = os.environ.get("FAKE_GH_IMMUTABLE_SEQUENCE", "true").split(",")
-            counter_path = state / "immutable-view-count"
-            counter = int(counter_path.read_text(encoding="utf8")) if counter_path.exists() else 0
-            immutable = sequence[min(counter, len(sequence) - 1)]
-            counter_path.write_text(str(counter + 1), encoding="utf8")
-        print("HTTP/2.0 200 OK")
-        print()
-        print(
-            "\t".join(
-                [
-                    "1",
-                    str(draft).lower(),
-                    immutable,
-                    os.environ["FAKE_GH_TAG"],
-                    "https://example.invalid/release/" + os.environ["FAKE_GH_TAG"],
-                ]
+        if release_state.exists():
+            draft = release_state.read_text(encoding="utf8").strip() == "draft"
+            if draft:
+                immutable = os.environ.get("FAKE_GH_DRAFT_IMMUTABLE", "false")
+            else:
+                sequence = os.environ.get("FAKE_GH_IMMUTABLE_SEQUENCE", "true").split(",")
+                counter_path = state / "immutable-view-count"
+                counter = int(counter_path.read_text(encoding="utf8")) if counter_path.exists() else 0
+                immutable = sequence[min(counter, len(sequence) - 1)]
+                counter_path.write_text(str(counter + 1), encoding="utf8")
+            print(
+                "\t".join(
+                    [
+                        "1",
+                        str(draft).lower(),
+                        immutable,
+                        os.environ["FAKE_GH_TAG"],
+                        "https://example.invalid/release/" + os.environ["FAKE_GH_TAG"],
+                    ]
+                )
             )
-        )
     elif "/releases/1/assets" in endpoint:
         assets = state / "assets.tsv"
         if assets.exists():
@@ -379,6 +374,7 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         draft_immutable: str = "false",
         release_lookup_error: bool = False,
         published_asset_lag: int = 0,
+        can_push: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         env = dict(os.environ)
         env["PATH"] = f"{self.bin_dir}{os.pathsep}{env['PATH']}"
@@ -397,6 +393,7 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
                 "FAKE_GH_DRAFT_IMMUTABLE": draft_immutable,
                 "FAKE_GH_RELEASE_LOOKUP_ERROR": str(release_lookup_error).lower(),
                 "FAKE_GH_PUBLISHED_ASSET_LAG": str(published_asset_lag),
+                "FAKE_GH_CAN_PUSH": str(can_push).lower(),
                 "FAKE_VALIDATOR_LOG": str(self.validator_log),
             }
         )
@@ -484,6 +481,13 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         self.assertNotIn("release create", gh_log)
         self.assertNotIn("release upload", gh_log)
         self.assertNotIn("release edit", gh_log)
+
+    def test_release_discovery_requires_push_access(self) -> None:
+        result = self.run_publisher(can_push=False)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires push access", result.stderr)
+        self.assertFalse(self.validator_log.exists())
 
     def test_wrong_trusted_ref_fails_closed(self) -> None:
         result = self.run_publisher(trusted_ref="1" * 40)
@@ -578,6 +582,10 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         self.assertNotIn("--prerelease=false", edit_args)
         self.assertNotIn("--latest", edit_args)
         self.assertNotIn("--latest=false", edit_args)
+        gh_log = self.gh_log.read_text(encoding="utf8")
+        self.assertIn("/releases?per_page=100", gh_log)
+        self.assertNotIn("/releases/tags/", gh_log)
+        self.assertNotIn("release create", gh_log)
 
     def test_resumed_draft_metadata_can_be_explicitly_cleared(self) -> None:
         (self.gh_state / "release-state").write_text("draft\n", encoding="utf8")
@@ -719,7 +727,11 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         self.assertIn("release edit", gh_log)
         self.assertIn("--draft=false", gh_log)
         log_lines = gh_log.splitlines()
-        final_view = max(i for i, line in enumerate(log_lines) if "/releases/tags/" in line)
+        final_view = max(
+            i
+            for i, line in enumerate(log_lines)
+            if "/releases?per_page=100" in line
+        )
         final_assets = max(i for i, line in enumerate(log_lines) if "/releases/1/assets" in line)
         self.assertGreater(final_assets, final_view)
 

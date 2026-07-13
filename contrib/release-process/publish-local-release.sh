@@ -203,21 +203,27 @@ remote_commit_on_branch() {
 
 release_view() {
     local errors="$WORK_DIR/release-view-errors"
-    local http_status
     local response
-    if response="$(
-        gh api --include "repos/$GH_REPO_PATH/releases/tags/$TAG" \
-            --jq '[.id, (.draft | tostring), (.immutable | tostring), .tag_name, .html_url] | @tsv' \
+    local release_id
+    local is_draft
+    local is_immutable
+    local release_tag
+    local release_url
+    if ! response="$(
+        gh api --paginate "repos/$GH_REPO_PATH/releases?per_page=100" \
+            --jq '.[] | [.id, (.draft | tostring), (.immutable | tostring), .tag_name, .html_url] | @tsv' \
             2> "$errors"
     )"; then
-        http_status="$(printf '%s\n' "$response" | awk 'NR == 1 { print $2 }')"
-    else
-        http_status="$(printf '%s\n' "$response" | awk 'NR == 1 { print $2 }')"
-        [ "$http_status" != 404 ] || return 3
         return 2
     fi
-    [ "$http_status" = 200 ] || return 2
-    printf '%s\n' "$response" | awk 'NF { line=$0 } END { print line }'
+    while IFS=$'\t' read -r release_id is_draft is_immutable \
+            release_tag release_url; do
+        [ "$release_tag" = "$TAG" ] || continue
+        printf '%s\t%s\t%s\t%s\t%s\n' \
+            "$release_id" "$is_draft" "$is_immutable" "$release_tag" "$release_url"
+        return 0
+    done <<< "$response"
+    return 3
 }
 
 load_release_view() {
@@ -659,6 +665,11 @@ git -C "$TRUSTED_ROOT" merge-base --is-ancestor "$TAG_TARGET" "$TRUSTED_RELEASE_
 
 GH_REPO_PATH="$(github_repo_path "$GH_REPO")"
 GUIX_SIGS_GH_REPO_PATH="$(github_repo_path "$GUIX_SIGS_GH_REPO")"
+REPO_CAN_PUSH="$(
+    gh api "repos/$GH_REPO_PATH" --jq '(.permissions.push // false) | tostring'
+)" || die "Could not verify authenticated access to $GH_REPO"
+[ "$REPO_CAN_PUSH" = true ] \
+    || die "Authenticated GitHub account requires push access to $GH_REPO to discover draft releases"
 msg "Verifying trusted release ref is public"
 remote_commit "$GH_REPO_PATH" "$TRUSTED_RELEASE_REF" "Trusted release ref"
 msg "Verifying qbit-guix.sigs commit is public and merged"
