@@ -57,6 +57,7 @@ class PublishLocalReleaseTest(unittest.TestCase):
         self.validator_log = self.root / "validator.log"
         self._write_fake_gh()
         self._write_executable(self.bin_dir / "gpg", "#!/usr/bin/env bash\nexit 0\n")
+        self._write_executable(self.bin_dir / "sleep", "#!/usr/bin/env bash\nexit 0\n")
         self.trusted = self._build_trusted_checkout()
         self.guix_sigs = self._build_guix_sigs_checkout()
         self.artifacts = self._build_artifacts()
@@ -127,7 +128,19 @@ if args and args[0] == "api":
     elif "/releases/1/assets" in endpoint:
         assets = state / "assets.tsv"
         if assets.exists():
-            print(assets.read_text(encoding="utf8"), end="")
+            asset_reads = state / "asset-reads"
+            read_count = (
+                int(asset_reads.read_text(encoding="utf8"))
+                if asset_reads.exists()
+                else 0
+            )
+            asset_reads.write_text(str(read_count + 1), encoding="utf8")
+            asset_text = assets.read_text(encoding="utf8")
+            if read_count < int(os.environ["FAKE_GH_EMPTY_DIGEST_READS"]):
+                for line in asset_text.splitlines():
+                    print(line.split("\t", 1)[0] + "\t")
+            else:
+                print(asset_text, end="")
     elif endpoint.endswith("/releases/1"):
         body_path = state / "release-body"
         body = body_path.read_text(encoding="utf8") if body_path.exists() else ""
@@ -300,6 +313,7 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         verified: bool = True,
         trusted_ref: str | None = None,
         ignore_notes_edit: bool = False,
+        empty_digest_reads: int = 0,
     ) -> subprocess.CompletedProcess[str]:
         env = dict(os.environ)
         env["PATH"] = f"{self.bin_dir}{os.pathsep}{env['PATH']}"
@@ -313,6 +327,7 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
                 "FAKE_GH_VERIFIED": str(verified).lower(),
                 "FAKE_GH_GENERATED_NOTES": GENERATED_NOTES,
                 "FAKE_GH_IGNORE_NOTES_EDIT": str(ignore_notes_edit).lower(),
+                "FAKE_GH_EMPTY_DIGEST_READS": str(empty_digest_reads),
                 "FAKE_VALIDATOR_LOG": str(self.validator_log),
             }
         )
@@ -341,7 +356,8 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Validation-only mode", result.stdout)
-        self.assertIn("gh release create", result.stdout)
+        self.assertIn("would be created with the expected notes", result.stdout)
+        self.assertNotIn("gh release create", result.stdout)
         validator_log = self.validator_log.read_text(encoding="utf8")
         self.assertIn(f"--source-root {self.trusted.resolve()}", validator_log)
         self.assertIn(f"--expected-tag-target {self.tag_target}", validator_log)
@@ -411,6 +427,29 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         gh_log = self.gh_log.read_text(encoding="utf8")
         self.assertNotIn("release upload", gh_log)
         self.assertNotIn("--clobber", gh_log)
+
+    def test_resume_retries_transient_remote_asset_digest(self) -> None:
+        artifact = next(
+            path for path in self.artifacts.iterdir() if path.name.startswith("qbit-")
+        )
+        digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        (self.gh_state / "release-state").write_text("draft\n", encoding="utf8")
+        (self.gh_state / "assets.tsv").write_text(
+            f"{artifact.name}\tsha256:{digest}\n", encoding="utf8"
+        )
+        (self.gh_state / "release-body").write_text("stale\n", encoding="utf8")
+
+        result = self.run_publisher(
+            "--create-draft",
+            empty_digest_reads=1,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Found matching draft release", result.stdout)
+        self.assertGreaterEqual(
+            self.gh_log.read_text(encoding="utf8").count("/releases/1/assets"),
+            4,
+        )
 
     def test_publish_replaces_stale_draft_body_with_generated_notes(self) -> None:
         (self.gh_state / "release-state").write_text("draft\n", encoding="utf8")

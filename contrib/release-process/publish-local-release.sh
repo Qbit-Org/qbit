@@ -320,18 +320,27 @@ remote_has_asset() {
     return 1
 }
 
-wait_for_exact_assets() {
+wait_for_asset_manifest_match() {
+    local mode="$1"
     local attempt
     local errors="$WORK_DIR/asset-verification-errors"
     for attempt in 1 2 3 4 5; do
         write_remote_asset_manifest "$REMOTE_ASSET_MANIFEST"
-        if compare_asset_manifests exact "$REMOTE_ASSET_MANIFEST" 2> "$errors"; then
+        if compare_asset_manifests "$mode" "$REMOTE_ASSET_MANIFEST" 2> "$errors"; then
             return 0
         fi
         [ "$attempt" -eq 5 ] || sleep 2
     done
     cat "$errors" >&2
     return 1
+}
+
+wait_for_subset_assets() {
+    wait_for_asset_manifest_match subset
+}
+
+wait_for_exact_assets() {
+    wait_for_asset_manifest_match exact
 }
 
 TAG=""
@@ -742,8 +751,8 @@ if RELEASE_VIEW_OUTPUT="$(release_view 2>/dev/null)"; then
         msg "Validation-only mode complete: $RELEASE_URL (immutable=$RELEASE_IS_IMMUTABLE)"
         exit 0
     fi
-    write_remote_asset_manifest "$REMOTE_ASSET_MANIFEST"
-    compare_asset_manifests subset "$REMOTE_ASSET_MANIFEST"
+    wait_for_subset_assets \
+        || die "Draft release assets are not a digest-matching subset of the validated upload set"
     msg "Found matching draft release; missing assets will be resumed"
 else
     : > "$REMOTE_ASSET_MANIFEST"
@@ -758,25 +767,16 @@ create_args=(
     --verify-tag
     --title "$RELEASE_NAME"
 )
-preview_create_args=("${create_args[@]}")
-if [ -n "$NOTES_FILE" ]; then
-    preview_create_args+=(--notes-file "$NOTES_FILE")
-else
-    preview_create_args+=(--generate-notes)
-fi
 create_args+=(--notes-file "$EFFECTIVE_NOTES_FILE")
 if [ "$PRERELEASE" -ne 0 ]; then
     create_args+=(--prerelease)
-    preview_create_args+=(--prerelease)
 fi
 case "$MAKE_LATEST" in
     true)
         create_args+=(--latest)
-        preview_create_args+=(--latest)
         ;;
     false)
         create_args+=(--latest=false)
-        preview_create_args+=(--latest=false)
         ;;
     auto) ;;
 esac
@@ -784,7 +784,7 @@ esac
 if [ "$MODE" = validate ]; then
     msg "Validation-only mode; no GitHub Release will be changed"
     if [ -z "$RELEASE_ID" ]; then
-        print_shell_command "${preview_create_args[@]}"
+        msg "Draft release $TAG would be created with the expected notes; rerun with --create-draft to create it"
     else
         verify_release_notes \
             || die "Draft release notes do not match the expected notes"
@@ -806,8 +806,8 @@ if [ -z "$RELEASE_ID" ]; then
     [ "$RELEASE_IS_DRAFT" = true ] || die "New release $TAG is not a draft"
 fi
 
-write_remote_asset_manifest "$REMOTE_ASSET_MANIFEST"
-compare_asset_manifests subset "$REMOTE_ASSET_MANIFEST"
+wait_for_subset_assets \
+    || die "Draft release assets are not a digest-matching subset of the validated upload set"
 for upload_file in "${upload_files[@]}"; do
     asset_name="$(basename "$upload_file")"
     if remote_has_asset "$asset_name"; then
