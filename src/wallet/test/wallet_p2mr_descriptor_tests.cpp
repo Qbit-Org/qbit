@@ -365,6 +365,91 @@ BOOST_AUTO_TEST_CASE(P2MRDataHashSigningReportsCommittedFailedLeafReservation)
     BOOST_CHECK(reported_pubkeys.contains(second_pubkey));
 }
 
+BOOST_AUTO_TEST_CASE(P2MRDataHashSigningReportsAllFailedLeafReservations)
+{
+    CPQCKey first_key;
+    CPQCKey second_key;
+    first_key.MakeNewKey();
+    second_key.MakeNewKey();
+
+    CPQCPubKey first_pubkey{first_key.GetPubKey()};
+    CPQCPubKey second_pubkey{second_key.GetPubKey()};
+    CScript first_leaf{p2mr::BuildPKScript(first_pubkey)};
+    CScript second_leaf{p2mr::BuildPKScript(second_pubkey)};
+
+    if (ByteRangeLess(ToBytes(second_leaf), ToBytes(first_leaf))) {
+        std::swap(first_key, second_key);
+        std::swap(first_pubkey, second_pubkey);
+        std::swap(first_leaf, second_leaf);
+    }
+
+    TaprootBuilder builder;
+    builder.AddP2MR(/*depth=*/1, ToBytes(first_leaf), P2MR_LEAF_VERSION_V1)
+        .AddP2MR(/*depth=*/1, ToBytes(second_leaf), P2MR_LEAF_VERSION_V1)
+        .FinalizeP2MR();
+    const WitnessV2P2MR output{builder.GetP2MROutput()};
+
+    FlatSigningProvider provider;
+    AddPQCSigningKeyForTest(provider, first_key);
+    AddPQCSigningKeyForTest(provider, second_key);
+    provider.pqc_sig_counters[second_pubkey] = PQC_MAX_SIGNATURES - 1;
+    provider.mr_trees.emplace(output, builder);
+
+    std::map<CPQCPubKey, uint32_t> authoritative_counters{
+        {first_pubkey, 0},
+        {second_pubkey, PQC_MAX_SIGNATURES - 1},
+    };
+    provider.pqc_counter_reserver = [&](const CPQCPubKey& pubkey, uint32_t count, uint32_t& previous_counter, uint32_t& reserved_counter) {
+        BOOST_CHECK_EQUAL(count, 1U);
+        auto counter_it{authoritative_counters.find(pubkey)};
+        BOOST_REQUIRE(counter_it != authoritative_counters.end());
+        previous_counter = counter_it->second;
+        reserved_counter = previous_counter + count;
+        counter_it->second = reserved_counter;
+        return true;
+    };
+
+    PQCUsageRecorder recorder;
+    provider.pqc_counter_observer = recorder.GetObserver();
+    provider.pqc_raw_signer = [&](const CPQCKey& key, const uint256&, std::vector<unsigned char>& sig, uint32_t&) {
+        BOOST_CHECK(key.GetPubKey() == first_pubkey || key.GetPubKey() == second_pubkey);
+        sig.clear();
+        return false;
+    };
+
+    const util::Result<DataPQCSignatureProof> proof{SignP2MRDataHash(
+        provider, output, uint256::ONE, std::nullopt, std::nullopt, std::nullopt)};
+
+    BOOST_CHECK(!proof);
+    BOOST_CHECK_EQUAL(util::ErrorString(proof).original, "PQC signature budget is exhausted for the selected P2MR pubkey leaf");
+    BOOST_CHECK_EQUAL(authoritative_counters.at(first_pubkey), 1U);
+    BOOST_CHECK_EQUAL(authoritative_counters.at(second_pubkey), PQC_MAX_SIGNATURES);
+    BOOST_CHECK_EQUAL(provider.pqc_sig_counters.at(first_pubkey), 1U);
+    BOOST_CHECK_EQUAL(provider.pqc_sig_counters.at(second_pubkey), PQC_MAX_SIGNATURES);
+
+    const PQCUsageReport report{BuildSigningPQCUsageReport(recorder)};
+    BOOST_REQUIRE(report.overall_state.has_value());
+    BOOST_CHECK(*report.overall_state == PQCSignatureLimitState::EXHAUSTED);
+    BOOST_REQUIRE_EQUAL(report.key_states.size(), 2U);
+    std::map<CPQCPubKey, uint32_t> reported_counts;
+    std::map<CPQCPubKey, uint32_t> reported_remaining;
+    std::map<CPQCPubKey, PQCSignatureLimitState> reported_states;
+    for (const PQCUsageSnapshot& snapshot : report.key_states) {
+        reported_counts.emplace(snapshot.pubkey, snapshot.signature_count);
+        reported_remaining.emplace(snapshot.pubkey, snapshot.signatures_remaining);
+        reported_states.emplace(snapshot.pubkey, snapshot.limit_state);
+    }
+    BOOST_CHECK_EQUAL(reported_counts.at(first_pubkey), 1U);
+    BOOST_CHECK_EQUAL(reported_remaining.at(first_pubkey), PQC_MAX_SIGNATURES - 1);
+    BOOST_CHECK(reported_states.at(first_pubkey) == PQCSignatureLimitState::NORMAL);
+    BOOST_CHECK_EQUAL(reported_counts.at(second_pubkey), PQC_MAX_SIGNATURES);
+    BOOST_CHECK_EQUAL(reported_remaining.at(second_pubkey), 0U);
+    BOOST_CHECK(reported_states.at(second_pubkey) == PQCSignatureLimitState::EXHAUSTED);
+    BOOST_REQUIRE_EQUAL(report.warnings.size(), 1U);
+    BOOST_CHECK(report.warnings.front().pubkey == second_pubkey);
+    BOOST_CHECK(report.warnings.front().current_state == PQCSignatureLimitState::EXHAUSTED);
+}
+
 BOOST_AUTO_TEST_CASE(P2MRDataHashSigningReportsFinalSlotFailureAsExhausted)
 {
     CPQCKey key;

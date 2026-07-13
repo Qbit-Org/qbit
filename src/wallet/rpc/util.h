@@ -62,7 +62,6 @@ bool ShouldSuppressP2MRBIP32Descriptor(const Descriptor& descriptor, bool privat
 void PushParentDescriptors(const CWallet& wallet, const CScript& script_pubkey, UniValue& entry);
 std::vector<RPCResult> PQCUsageRPCResults(bool include_warnings);
 void AppendPQCUsage(UniValue& entry, const PQCUsageReport& report, bool include_warnings);
-void LogPQCUsageWarnings(const CWallet& wallet, const PQCUsageReport& report);
 
 void HandleWalletError(const std::shared_ptr<CWallet> wallet, DatabaseStatus& status, bilingual_str& error);
 void AppendLastProcessedBlock(UniValue& entry, const CWallet& wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);

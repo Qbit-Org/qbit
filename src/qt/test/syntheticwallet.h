@@ -34,7 +34,12 @@ struct SyntheticWalletState {
 std::unique_ptr<interfaces::Wallet> MakeSyntheticWallet(
     wallet::PQCUsageReport report = {},
     std::shared_ptr<SyntheticWalletState> state = std::make_shared<SyntheticWalletState>());
-std::unique_ptr<interfaces::Wallet> MakeSyntheticWallet(interfaces::P2MRDataSignatureResult result);
+std::unique_ptr<interfaces::Wallet> MakeSyntheticWallet(
+    interfaces::P2MRDataSignatureResult result,
+    wallet::PQCUsageReport report = {});
+std::unique_ptr<interfaces::Wallet> MakeSyntheticP2MRFailureWallet(
+    bilingual_str error,
+    wallet::PQCUsageReport report);
 
 } // namespace qt_test
 
