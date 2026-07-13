@@ -290,6 +290,57 @@ size_t CountNonEmptyP2MRSignatureItems(const CScriptWitness& witness, size_t pub
     }));
 }
 
+std::vector<CPQCPubKey> BuildP2MRBoundaryPubKeys(size_t count)
+{
+    std::vector<CPQCPubKey> pubkeys;
+    pubkeys.reserve(count);
+    for (size_t i{0}; i < count; ++i) {
+        std::array<unsigned char, CPQCPubKey::SIZE> bytes{};
+        bytes[0] = static_cast<unsigned char>(i + 1);
+        pubkeys.emplace_back(std::span<const unsigned char>{bytes});
+    }
+    return pubkeys;
+}
+
+class P2MRBoundarySignatureChecker final : public BaseSignatureChecker
+{
+public:
+    bool CheckPQCSignature(std::span<const unsigned char> sig, std::span<const unsigned char> pubkey, SigVersion sigversion, ScriptExecutionData& execdata, ScriptError* serror) const override
+    {
+        uint8_t hash_type;
+        return sigversion == SigVersion::P2MR &&
+               pubkey.size() == CPQCPubKey::SIZE &&
+               GetP2MRSignatureHashType(sig, hash_type) &&
+               (hash_type == SIGHASH_DEFAULT || hash_type == SIGHASH_ALL);
+    }
+};
+
+class P2MRBoundarySignatureCreator final : public BaseSignatureCreator
+{
+private:
+    const int m_hash_type;
+    const P2MRBoundarySignatureChecker m_checker;
+
+public:
+    explicit P2MRBoundarySignatureCreator(int hash_type) : m_hash_type{hash_type}
+    {
+        assert(hash_type == SIGHASH_DEFAULT || hash_type == SIGHASH_ALL);
+    }
+
+    const BaseSignatureChecker& Checker() const override { return m_checker; }
+    bool CreateSig(const SigningProvider& provider, std::vector<unsigned char>& sig, const CKeyID& keyid, const CScript& script_code, SigVersion sigversion) const override { return false; }
+    bool CreateSchnorrSig(const SigningProvider& provider, std::vector<unsigned char>& sig, const XOnlyPubKey& pubkey, const uint256* leaf_hash, const uint256* merkle_root, SigVersion sigversion) const override { return false; }
+    bool CreatePQCSignature(const SigningProvider& provider, std::vector<unsigned char>& sig, const CPQCPubKey& pubkey, const uint256* leaf_hash, SigVersion sigversion) const override
+    {
+        if (!pubkey.IsValid() || leaf_hash == nullptr || sigversion != SigVersion::P2MR) return false;
+        sig.assign(PQC_SIG_SIZE, 0x01);
+        if (m_hash_type != SIGHASH_DEFAULT) sig.push_back(static_cast<unsigned char>(m_hash_type));
+        return true;
+    }
+    bool CanCreatePQCSignature(const SigningProvider& provider, const CPQCPubKey& pubkey) const override { return pubkey.IsValid(); }
+    size_t P2MRSignatureSize() const override { return PQC_SIG_SIZE + (m_hash_type == SIGHASH_DEFAULT ? 0 : 1); }
+};
+
 struct P2MRSpendContext {
     CTransaction tx_credit;
     CMutableTransaction tx_spend;
@@ -2678,6 +2729,131 @@ BOOST_AUTO_TEST_CASE(p2mr_five_of_five_activates_with_validation_weight_v2)
     err = SCRIPT_ERR_UNKNOWN_ERROR;
     BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
     BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_validation_weight_boundary_matrix)
+{
+    struct BoundaryCase {
+        std::string_view name;
+        size_t threshold;
+        size_t key_count;
+        int hash_type;
+        int control_depth;
+        int64_t legacy_margin;
+        int64_t v2_margin;
+    };
+    static constexpr std::array<BoundaryCase, 8> CASES{{
+        {"4-of-4 default depth 0", 4, 4, SIGHASH_DEFAULT, 0, 4, 192},
+        {"5-of-5 default depth 0", 5, 5, SIGHASH_DEFAULT, 0, -9, 226},
+        {"5-of-5 all depth 0", 5, 5, SIGHASH_ALL, 0, -4, 231},
+        {"5-of-5 default depth 1", 5, 5, SIGHASH_DEFAULT, 1, 23, 258},
+        {"6-of-6 default depth 0", 6, 6, SIGHASH_DEFAULT, 0, -22, 260},
+        {"8-of-9 default depth 0", 8, 9, SIGHASH_DEFAULT, 0, -11, 365},
+        {"35-of-35 default depth 0", 35, 35, SIGHASH_DEFAULT, 0, -396, 1249},
+        {"35-of-35 all depth 0", 35, 35, SIGHASH_ALL, 0, -361, 1284},
+    }};
+    static constexpr std::array<unsigned int, 2> VERIFY_FLAG_SETS{
+        MANDATORY_SCRIPT_VERIFY_FLAGS,
+        STANDARD_SCRIPT_VERIFY_FLAGS,
+    };
+
+    for (const BoundaryCase& test : CASES) {
+        const std::vector<CPQCPubKey> pubkeys{BuildP2MRBoundaryPubKeys(test.key_count)};
+        const CScript leaf_script{BuildP2MRMultiAScript(test.threshold, pubkeys)};
+
+        TaprootBuilder builder;
+        if (test.control_depth == 0) {
+            builder.AddP2MR(/*depth=*/0, ScriptBytes(leaf_script), P2MR_LEAF_VERSION_V1);
+        } else {
+            builder.AddP2MR(/*depth=*/1, ScriptBytes(leaf_script), P2MR_LEAF_VERSION_V1)
+                .AddOmittedP2MR(/*depth=*/1, uint256::ONE);
+        }
+        builder.FinalizeP2MR();
+        const CScript script_pubkey{BuildP2MRScriptPubKey(builder.GetP2MROutput().GetMerkleRoot())};
+
+        const P2MRBoundarySignatureCreator creator{test.hash_type};
+        SignatureData sigdata;
+        sigdata.p2mr_spenddata = builder.GetP2MRSpendData();
+        BOOST_REQUIRE_MESSAGE(
+            ProduceSignature(DUMMY_SIGNING_PROVIDER, creator, script_pubkey, sigdata),
+            test.name);
+        BOOST_REQUIRE_EQUAL(sigdata.scriptWitness.stack.size(), test.key_count + 2);
+        BOOST_CHECK_EQUAL(
+            CountNonEmptyP2MRSignatureItems(sigdata.scriptWitness, test.key_count),
+            test.threshold);
+        BOOST_CHECK(sigdata.scriptWitness.stack[test.key_count] == ScriptBytes(leaf_script));
+        BOOST_CHECK_EQUAL(
+            sigdata.scriptWitness.stack.back().size(),
+            P2MR_CONTROL_BASE_SIZE + test.control_depth * P2MR_CONTROL_NODE_SIZE);
+
+        size_t initial_stack_bytes{0};
+        for (size_t i{0}; i < test.key_count; ++i) {
+            initial_stack_bytes += sigdata.scriptWitness.stack[i].size();
+        }
+        BOOST_CHECK_EQUAL(initial_stack_bytes, test.threshold * creator.P2MRSignatureSize());
+        if (test.threshold == 35) {
+            BOOST_CHECK_EQUAL(initial_stack_bytes, test.hash_type == SIGHASH_DEFAULT ? 128'800 : 128'835);
+        }
+
+        const int64_t validation_budget{
+            static_cast<int64_t>(::GetSerializeSize(sigdata.scriptWitness.stack)) + VALIDATION_WEIGHT_OFFSET};
+        BOOST_CHECK_EQUAL(
+            validation_budget - static_cast<int64_t>(test.threshold) * P2MR_VALIDATION_WEIGHT_PER_SIGOP_LEGACY,
+            test.legacy_margin);
+        BOOST_CHECK_EQUAL(
+            validation_budget - static_cast<int64_t>(test.threshold) * P2MR_VALIDATION_WEIGHT_PER_SIGOP_V2,
+            test.v2_margin);
+
+        for (const unsigned int base_flags : VERIFY_FLAG_SETS) {
+            for (const bool legacy : {false, true}) {
+                const unsigned int flags{base_flags | (legacy ? SCRIPT_VERIFY_P2MR_LEGACY_VALIDATION_WEIGHT : 0)};
+                const bool expect_success{!legacy || test.legacy_margin >= 0};
+                ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+                BOOST_CHECK_EQUAL(
+                    VerifyScript(sigdata.scriptSig, script_pubkey, &sigdata.scriptWitness, flags, creator.Checker(), &err),
+                    expect_success);
+                BOOST_CHECK_EQUAL(err, expect_success ? SCRIPT_ERR_OK : SCRIPT_ERR_P2MR_VALIDATION_WEIGHT);
+            }
+        }
+    }
+
+    for (const int hash_type : {SIGHASH_DEFAULT, SIGHASH_ALL}) {
+        static constexpr size_t KEY_COUNT{36};
+        const std::vector<CPQCPubKey> pubkeys{BuildP2MRBoundaryPubKeys(KEY_COUNT)};
+        const CScript leaf_script{BuildP2MRMultiAScript(KEY_COUNT, pubkeys)};
+        TaprootBuilder builder;
+        builder.AddP2MR(/*depth=*/0, ScriptBytes(leaf_script), P2MR_LEAF_VERSION_V1).FinalizeP2MR();
+        const CScript script_pubkey{BuildP2MRScriptPubKey(builder.GetP2MROutput().GetMerkleRoot())};
+
+        const P2MRBoundarySignatureCreator creator{hash_type};
+        SignatureData sigdata;
+        sigdata.p2mr_spenddata = builder.GetP2MRSpendData();
+        BOOST_CHECK(!ProduceSignature(DUMMY_SIGNING_PROVIDER, creator, script_pubkey, sigdata));
+        BOOST_CHECK(sigdata.scriptWitness.stack.empty());
+
+        CScriptWitness oversized_witness;
+        oversized_witness.stack.assign(KEY_COUNT, valtype(creator.P2MRSignatureSize(), 0x01));
+        if (hash_type != SIGHASH_DEFAULT) {
+            for (valtype& sig : oversized_witness.stack)
+                sig.back() = SIGHASH_ALL;
+        }
+        size_t initial_stack_bytes{0};
+        for (const valtype& sig : oversized_witness.stack)
+            initial_stack_bytes += sig.size();
+        BOOST_CHECK_EQUAL(initial_stack_bytes, hash_type == SIGHASH_DEFAULT ? 132'480 : 132'516);
+        BOOST_CHECK_GT(initial_stack_bytes, MAX_P2MR_V1_TOTAL_INITIAL_STACK_BYTES);
+        oversized_witness.stack.push_back(ScriptBytes(leaf_script));
+        oversized_witness.stack.push_back(*builder.GetP2MRSpendData().scripts.begin()->second.begin());
+
+        for (const unsigned int base_flags : VERIFY_FLAG_SETS) {
+            for (const bool legacy : {false, true}) {
+                const unsigned int flags{base_flags | (legacy ? SCRIPT_VERIFY_P2MR_LEGACY_VALIDATION_WEIGHT : 0)};
+                ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+                BOOST_CHECK(!VerifyScript(CScript{}, script_pubkey, &oversized_witness, flags, creator.Checker(), &err));
+                BOOST_CHECK_EQUAL(err, SCRIPT_ERR_PUSH_SIZE);
+            }
+        }
+    }
 }
 
 BOOST_AUTO_TEST_CASE(p2mr_checksigpqc_accepts_explicit_hashtype)
