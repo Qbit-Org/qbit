@@ -202,9 +202,22 @@ remote_commit_on_branch() {
 }
 
 release_view() {
-    gh release view "$TAG" --repo "$GH_REPO" \
-        --json databaseId,isDraft,isImmutable,tagName,url \
-        --jq '[.databaseId, (.isDraft | tostring), (.isImmutable | tostring), .tagName, .url] | @tsv'
+    local errors="$WORK_DIR/release-view-errors"
+    local http_status
+    local response
+    if response="$(
+        gh api --include "repos/$GH_REPO_PATH/releases/tags/$TAG" \
+            --jq '[.id, (.draft | tostring), (.immutable | tostring), .tag_name, .html_url] | @tsv' \
+            2> "$errors"
+    )"; then
+        http_status="$(printf '%s\n' "$response" | awk 'NR == 1 { print $2 }')"
+    else
+        http_status="$(printf '%s\n' "$response" | awk 'NR == 1 { print $2 }')"
+        [ "$http_status" != 404 ] || return 3
+        return 2
+    fi
+    [ "$http_status" = 200 ] || return 2
+    printf '%s\n' "$response" | awk 'NF { line=$0 } END { print line }'
 }
 
 load_release_view() {
@@ -213,6 +226,16 @@ load_release_view() {
         RELEASE_TAG RELEASE_URL <<< "$release_view_output"
     [ "$RELEASE_TAG" = "$TAG" ] \
         || die "GitHub Release tag $RELEASE_TAG does not match $TAG"
+}
+
+require_release_view() {
+    local output
+    if output="$(release_view)"; then
+        load_release_view "$output"
+        return
+    fi
+    cat "$WORK_DIR/release-view-errors" >&2
+    die "Could not inspect GitHub Release $TAG in $GH_REPO"
 }
 
 immutable_release_error() {
@@ -234,7 +257,7 @@ wait_for_published_immutable_release() {
     local output
     local errors="$WORK_DIR/release-view-errors"
     for attempt in 1 2 3 4 5; do
-        if output="$(release_view 2> "$errors")"; then
+        if output="$(release_view)"; then
             metadata_observed=1
             load_release_view "$output"
             if [ "$RELEASE_IS_DRAFT" = false ] && \
@@ -854,7 +877,7 @@ RELEASE_IS_DRAFT=""
 RELEASE_IS_IMMUTABLE=""
 RELEASE_TAG=""
 RELEASE_URL=""
-if RELEASE_VIEW_OUTPUT="$(release_view 2>/dev/null)"; then
+if RELEASE_VIEW_OUTPUT="$(release_view)"; then
     load_release_view "$RELEASE_VIEW_OUTPUT"
     if [ "$RELEASE_IS_DRAFT" != true ]; then
         [ "$MODE" = validate ] \
@@ -870,7 +893,13 @@ if RELEASE_VIEW_OUTPUT="$(release_view 2>/dev/null)"; then
         || die "Draft release assets are not a digest-matching subset of the validated upload set"
     msg "Found matching draft release; missing assets will be resumed"
 else
-    : > "$REMOTE_ASSET_MANIFEST"
+    view_status=$?
+    if [ "$view_status" -eq 3 ]; then
+        : > "$REMOTE_ASSET_MANIFEST"
+    else
+        cat "$WORK_DIR/release-view-errors" >&2
+        die "Could not inspect GitHub Release $TAG in $GH_REPO"
+    fi
 fi
 
 prepare_release_notes
@@ -913,8 +942,7 @@ fi
 if [ -z "$RELEASE_ID" ]; then
     msg "Creating draft release $TAG"
     "${create_args[@]}"
-    RELEASE_VIEW_OUTPUT="$(release_view)"
-    load_release_view "$RELEASE_VIEW_OUTPUT"
+    require_release_view
     [ "$RELEASE_IS_DRAFT" = true ] || die "New release $TAG is not a draft"
 fi
 
@@ -962,13 +990,12 @@ if [ "$MODE" = publish ]; then
     msg "Publishing release $TAG"
     "${edit_args[@]}" --draft=false
     wait_for_published_immutable_release
-    write_remote_asset_manifest "$REMOTE_ASSET_MANIFEST"
-    compare_asset_manifests exact "$REMOTE_ASSET_MANIFEST"
+    wait_for_exact_assets \
+        || die "Published immutable release assets do not exactly match the validated upload set"
     msg "Published immutable release assets exactly match local names and SHA256 digests"
     msg "Published immutable release: $RELEASE_URL"
 else
-    RELEASE_VIEW_OUTPUT="$(release_view)"
-    load_release_view "$RELEASE_VIEW_OUTPUT"
+    require_release_view
     [ "$RELEASE_IS_DRAFT" = true ] || die "Release $TAG did not remain a draft"
     msg "Verified draft release: $RELEASE_URL"
 fi

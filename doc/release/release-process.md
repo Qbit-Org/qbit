@@ -206,8 +206,12 @@ Draft releases are expected to remain mutable while their assets are assembled.
 The publisher does not require `isImmutable=true` until `--publish` transitions
 the draft to a published release. It then polls the final release metadata for a
 bounded period and fails unless GitHub reports both `isDraft=false` and
-`isImmutable=true`. Validation-only mode likewise rejects an existing published
-release that is not immutable or whose immutable state is missing.
+`isImmutable=true`, then polls the locked asset inventory and digests for a
+bounded period to tolerate GitHub API propagation. Validation-only mode likewise
+rejects an existing published release that is not immutable or whose immutable
+state is missing. A release lookup is considered absent only when GitHub
+explicitly returns HTTP 404; authentication, API, and other lookup failures stop
+validation rather than skipping the remote release checks.
 
 Release immutability must be enabled under the target repository's release
 settings or enforced by its organization before publication. GitHub applies the
