@@ -68,10 +68,13 @@ static constexpr unsigned int ANNEX_TAG = 0x50;
 // Validation weight per passing signature (Tapscript only, see BIP 342).
 static constexpr int64_t VALIDATION_WEIGHT_PER_SIGOP_PASSED{50};
 
-// Validation weight per passing PQC signature (P2MR only, see BIP-360).
-// Derived from PQC_SIG_SIZE (3680) + VALIDATION_WEIGHT_OFFSET (50).
-// Keep this <= the minimal single-leaf P2MR witness budget so one valid sigop can succeed.
-static constexpr int64_t VALIDATION_WEIGHT_PER_SIGOP_PQC{3730};
+// Validation weight per passing PQC signature under the original testnet4 rule.
+static constexpr int64_t P2MR_VALIDATION_WEIGHT_PER_SIGOP_LEGACY{3730};
+
+// Validation weight per passing PQC signature after validation-weight-v2.
+// This matches the marginal serialized witness size of a default-sighash
+// signature: CompactSize(3680) plus the 3680-byte signature.
+static constexpr int64_t P2MR_VALIDATION_WEIGHT_PER_SIGOP_V2{3683};
 
 // How much weight budget is added to the witness size (Tapscript/P2MR, see BIP 342).
 static constexpr int64_t VALIDATION_WEIGHT_OFFSET{50};

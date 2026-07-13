@@ -130,6 +130,7 @@ public:
         consensus.BIP66Height = 0;
         consensus.CSVHeight = 0;
         consensus.SegwitHeight = 0;
+        consensus.nP2MRValidationWeightV2Height = 0; // Final P2MR accounting is active from genesis.
         // Pre-launch network: reserve the outer witness namespace from genesis so future v3..v16 families can soft-fork on top of the launch baseline.
         consensus.nOuterReservedWitnessHeight = 0;
         consensus.MinBIP9WarningHeight = 0;
@@ -237,6 +238,7 @@ public:
         consensus.BIP66Height = 0;
         consensus.CSVHeight = 0;
         consensus.SegwitHeight = 0;
+        consensus.nP2MRValidationWeightV2Height = 0;
         // Pre-launch network: reserve the outer witness namespace from genesis so future v3..v16 families can soft-fork on top of the launch baseline.
         consensus.nOuterReservedWitnessHeight = 0;
         consensus.MinBIP9WarningHeight = 0;
@@ -328,6 +330,7 @@ public:
         consensus.BIP66Height = 0;
         consensus.CSVHeight = 0;
         consensus.SegwitHeight = 0;
+        consensus.nP2MRValidationWeightV2Height = 60'000;
         // Match launch restricted-output semantics on the public rehearsal network.
         consensus.nOuterReservedWitnessHeight = 0;
         consensus.MinBIP9WarningHeight = 0;
@@ -450,6 +453,7 @@ public:
         consensus.BIP66Height = 0;
         consensus.CSVHeight = 0;
         consensus.SegwitHeight = 0;
+        consensus.nP2MRValidationWeightV2Height = 0;
         // Reset network: reserve the outer witness namespace from genesis so future v3..v16 families can soft-fork on top of the relaunched baseline.
         consensus.nOuterReservedWitnessHeight = 0;
         consensus.nPowTargetTimespan = 14 * 24 * 60 * 60;
@@ -539,6 +543,7 @@ public:
         consensus.nAuxpowDisplayCommitmentHeight = opts.auxpow_display_commitment_height.value_or(0); // Always active unless overridden
         consensus.nOuterReservedWitnessHeight = opts.outer_witness_activation_height.value_or(std::numeric_limits<int>::max());
         consensus.P2MRHeight = opts.p2mr_activation_height.value_or(0); // Always active unless overridden
+        consensus.nP2MRValidationWeightV2Height = opts.p2mr_validation_weight_v2_height.value_or(0);
         consensus.MinBIP9WarningHeight = 0;
         consensus.powLimit = uint256{"7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
         consensus.nPowTargetTimespan = 24 * 60 * 60; // one day

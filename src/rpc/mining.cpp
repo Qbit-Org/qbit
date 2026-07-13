@@ -75,6 +75,16 @@ enum class HashrateWork
     AUXPOW,
 };
 
+UniValue P2MRValidationWeightForHeight(const Consensus::Params& consensus, int height)
+{
+    const bool v2_active{consensus.P2MRValidationWeightV2ActiveAtHeight(height)};
+    UniValue result{UniValue::VOBJ};
+    result.pushKV("per_sigop", v2_active ? P2MR_VALIDATION_WEIGHT_PER_SIGOP_V2 : P2MR_VALIDATION_WEIGHT_PER_SIGOP_LEGACY);
+    result.pushKV("v2_active", v2_active);
+    result.pushKV("v2_activation_height", consensus.nP2MRValidationWeightV2Height);
+    return result;
+}
+
 double EstimateHashPS(int lookup, int height, const CChain& active_chain, const HashrateWork work_filter)
 {
     if (lookup < -1 || lookup == 0) {
@@ -807,6 +817,11 @@ static RPCHelpMan getblocktemplate()
                 {RPCResult::Type::NUM_TIME, "curtime", "current timestamp in " + UNIX_EPOCH_TIME + ". Adjusted for the proposed BIP94 timewarp rule."},
                 {RPCResult::Type::STR, "bits", "compressed target of next block"},
                 {RPCResult::Type::NUM, "height", "The height of the next block"},
+                {RPCResult::Type::OBJ, "p2mr_validation_weight", "P2MR validation-weight rule for this template", {
+                    {RPCResult::Type::NUM, "per_sigop", "P2MR validation debit per non-empty PQC signature operation"},
+                    {RPCResult::Type::BOOL, "v2_active", "Whether validation-weight-v2 applies to this template"},
+                    {RPCResult::Type::NUM, "v2_activation_height", "First block using validation-weight-v2"},
+                }},
                 {RPCResult::Type::STR_HEX, "signet_challenge", /*optional=*/true, "Only on signet"},
                 {RPCResult::Type::STR_HEX, "default_witness_commitment", /*optional=*/true, "a valid witness commitment for the unmodified block template"},
             }},
@@ -1124,6 +1139,7 @@ static RPCHelpMan getblocktemplate()
     result.pushKV("curtime", block.GetBlockTime());
     result.pushKV("bits", strprintf("%08x", block.nBits));
     result.pushKV("height", (int64_t)(pindexPrev->nHeight+1));
+    result.pushKV("p2mr_validation_weight", P2MRValidationWeightForHeight(consensusParams, pindexPrev->nHeight + 1));
 
     if (consensusParams.signet_blocks) {
         result.pushKV("signet_challenge", HexStr(consensusParams.signet_challenge));
@@ -1356,6 +1372,11 @@ static RPCHelpMan createauxblock()
                 {RPCResult::Type::NUM, "coinbasevalue", "The total coinbase value in satoshis, including fees."},
                 {RPCResult::Type::STR_HEX, "bits", "The compact target for the candidate block."},
                 {RPCResult::Type::NUM, "height", "The candidate block height."},
+                {RPCResult::Type::OBJ, "p2mr_validation_weight", "P2MR validation-weight rule for this candidate", {
+                    {RPCResult::Type::NUM, "per_sigop", "P2MR validation debit per non-empty PQC signature operation"},
+                    {RPCResult::Type::BOOL, "v2_active", "Whether validation-weight-v2 applies to this candidate"},
+                    {RPCResult::Type::NUM, "v2_activation_height", "First block using validation-weight-v2"},
+                }},
                 {RPCResult::Type::STR, "commitmentorder", "The AuxPoW commitment byte order required for this candidate: \"internal\" or \"display\"."},
                 {RPCResult::Type::NUM, "commitmentactivationheight", "The height at which display byte order becomes active."},
                 {RPCResult::Type::STR_HEX, "target", "The expanded target for the candidate block."},
@@ -1426,6 +1447,7 @@ static RPCHelpMan createauxblock()
     result.pushKV("coinbasevalue", static_cast<int64_t>(block.vtx.at(0)->GetValueOut()));
     result.pushKV("bits", strprintf("%08x", block.nBits));
     result.pushKV("height", height);
+    result.pushKV("p2mr_validation_weight", P2MRValidationWeightForHeight(consensusParams, height));
     result.pushKV("commitmentorder", display_commitment ? "display" : "internal");
     result.pushKV("commitmentactivationheight", consensusParams.nAuxpowDisplayCommitmentHeight);
     result.pushKV("target", hash_target.GetHex());

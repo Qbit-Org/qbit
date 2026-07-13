@@ -508,6 +508,7 @@ static bool BuildP2MRScriptSigningPlan(const SigningProvider& provider, const Ba
     std::vector<CPQCPubKey> pubkeys;
     int threshold{0};
     if (!ParseP2MRScript(script_bytes, pubkeys, threshold)) return false;
+    if (static_cast<size_t>(threshold) > P2MR_V1_MAX_STANDARD_SIGNATURES) return false;
 
     const uint256 leaf_hash = ComputeP2MRLeafHash(leaf_version, script_bytes);
     std::vector<bool> candidate_pubkeys(pubkeys.size(), false);
@@ -561,8 +562,19 @@ static bool BuildP2MRScriptSigningPlan(const SigningProvider& provider, const Ba
             ++num_estimated_signatures;
         }
     }
+    if (estimated_stack.size() > MAX_STACK_SIZE) return false;
+    size_t initial_stack_bytes{0};
+    for (const auto& item : estimated_stack) {
+        if (item.size() > MAX_P2MR_V1_STACK_ITEM_SIZE) return false;
+        initial_stack_bytes += item.size();
+        if (initial_stack_bytes > MAX_P2MR_V1_TOTAL_INITIAL_STACK_BYTES) return false;
+    }
     estimated_stack.emplace_back(script_bytes.begin(), script_bytes.end());
     estimated_stack.push_back(control_block);
+    if (GetSerializeSize(estimated_stack) + VALIDATION_WEIGHT_OFFSET <
+        static_cast<size_t>(num_estimated_signatures) * P2MR_VALIDATION_WEIGHT_PER_SIGOP_V2) {
+        return false;
+    }
 
     plan.script.assign(script_bytes.begin(), script_bytes.end());
     plan.control_block = control_block;

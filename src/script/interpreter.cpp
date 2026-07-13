@@ -411,7 +411,9 @@ static bool EvalChecksigP2MR(const valtype& sig, const valtype& pubkey, ScriptEx
     if (success) {
         // Count every non-empty P2MR signature operation at the fixed PQC cost.
         assert(execdata.m_validation_weight_left_init);
-        execdata.m_validation_weight_left -= VALIDATION_WEIGHT_PER_SIGOP_PQC;
+        const int64_t validation_cost = (flags & SCRIPT_VERIFY_P2MR_LEGACY_VALIDATION_WEIGHT) ?
+            P2MR_VALIDATION_WEIGHT_PER_SIGOP_LEGACY : P2MR_VALIDATION_WEIGHT_PER_SIGOP_V2;
+        execdata.m_validation_weight_left -= validation_cost;
         if (execdata.m_validation_weight_left < 0) {
             return set_error(serror, SCRIPT_ERR_P2MR_VALIDATION_WEIGHT);
         }
@@ -432,14 +434,16 @@ static bool EvalChecksigP2MR(const valtype& sig, const valtype& pubkey, ScriptEx
     return true;
 }
 
-static bool EvalCheckDataSigPQC(const valtype& sig, const valtype& msg_hash, const valtype& pubkey, ScriptExecutionData& execdata, ScriptError* serror, bool& success)
+static bool EvalCheckDataSigPQC(const valtype& sig, const valtype& msg_hash, const valtype& pubkey, ScriptExecutionData& execdata, unsigned int flags, ScriptError* serror, bool& success)
 {
     success = !sig.empty();
     if (success) {
         // Match P2MR transaction signatures: every non-empty PQC signature
         // attempt is charged before deeper validation.
         assert(execdata.m_validation_weight_left_init);
-        execdata.m_validation_weight_left -= VALIDATION_WEIGHT_PER_SIGOP_PQC;
+        const int64_t validation_cost = (flags & SCRIPT_VERIFY_P2MR_LEGACY_VALIDATION_WEIGHT) ?
+            P2MR_VALIDATION_WEIGHT_PER_SIGOP_LEGACY : P2MR_VALIDATION_WEIGHT_PER_SIGOP_V2;
+        execdata.m_validation_weight_left -= validation_cost;
         if (execdata.m_validation_weight_left < 0) {
             return set_error(serror, SCRIPT_ERR_P2MR_VALIDATION_WEIGHT);
         }
@@ -1234,7 +1238,7 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                     const valtype& pubkey = stacktop(-1);
 
                     bool success{false};
-                    if (!EvalCheckDataSigPQC(sig, msg_hash, pubkey, execdata, serror, success)) return false;
+                    if (!EvalCheckDataSigPQC(sig, msg_hash, pubkey, execdata, flags, serror, success)) return false;
                     popstack(stack);
                     popstack(stack);
                     popstack(stack);
@@ -1255,7 +1259,7 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                     const valtype& pubkey = stacktop(-1);
 
                     bool success{false};
-                    if (!EvalCheckDataSigPQC(sig, msg_hash, pubkey, execdata, serror, success)) return false;
+                    if (!EvalCheckDataSigPQC(sig, msg_hash, pubkey, execdata, flags, serror, success)) return false;
                     popstack(stack);
                     popstack(stack);
                     popstack(stack);

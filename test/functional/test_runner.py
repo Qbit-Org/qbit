@@ -102,6 +102,7 @@ BASE_SCRIPTS = [
     'feature_cadence_activation.py',
     'feature_integration_cadence.py',
     'feature_p2mr_activation.py',
+    'feature_p2mr_weight_activation.py',
     'feature_outer_witness_activation.py',
     'feature_block.py',
     'mempool_ephemeral_dust.py',

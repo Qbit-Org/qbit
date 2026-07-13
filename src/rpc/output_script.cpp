@@ -11,6 +11,7 @@
 #include <rpc/server.h>
 #include <rpc/util.h>
 #include <script/descriptor.h>
+#include <script/p2mr_sizing.h>
 #include <script/script.h>
 #include <script/signingprovider.h>
 #include <tinyformat.h>
@@ -187,6 +188,7 @@ static RPCHelpMan getdescriptorinfo()
                 {RPCResult::Type::STR, "checksum", "The checksum for the input descriptor"},
                 {RPCResult::Type::BOOL, "isrange", "Whether the descriptor is ranged"},
                 {RPCResult::Type::BOOL, "issolvable", "Whether the descriptor is solvable"},
+                {RPCResult::Type::BOOL, "has_p2mr_standard_satisfaction", /*optional=*/true, "Whether a P2MR descriptor has a wallet-constructible satisfaction within P2MR v1 resource limits"},
                 {RPCResult::Type::BOOL, "hasprivatekeys", "Whether the input descriptor contained at least one private key"},
             }
         },
@@ -221,6 +223,9 @@ static RPCHelpMan getdescriptorinfo()
             result.pushKV("checksum", GetDescriptorChecksum(request.params[0].get_str()));
             result.pushKV("isrange", descs.at(0)->IsRange());
             result.pushKV("issolvable", descs.at(0)->IsSolvable());
+            if (descs.at(0)->GetOutputType() == OutputType::P2MR) {
+                result.pushKV("has_p2mr_standard_satisfaction", descs.at(0)->HasP2MRStandardSatisfaction());
+            }
             result.pushKV("hasprivatekeys", provider.keys.size() > 0);
             return result;
         },
@@ -331,6 +336,10 @@ static RPCHelpMan deriveaddresses()
             }
             for (const auto& desc : descs) {
                 EnsureDescriptorOutputTypeAllowed(*desc, "Input");
+                if (desc->GetOutputType() == OutputType::P2MR && desc->IsSolvable() && !desc->HasP2MRStandardSatisfaction()) {
+                    throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
+                        strprintf("P2MR descriptor has no wallet-constructible satisfaction: multi_a thresholds must not exceed %u", P2MR_V1_MAX_STANDARD_SIGNATURES));
+                }
             }
             auto& desc = descs.at(0);
             if (!desc->IsRange() && request.params.size() > 1) {
