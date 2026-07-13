@@ -7,7 +7,7 @@
 - Profile: `qbit-p2mr-v1`
 - Profile version: `1`
 - Status: `draft`
-- Corpus manifest SHA256: `45fbfcee9af5fa149938c27de39d340d83108a76a2b39a640a8af8cf5d83b2dc`
+- Corpus manifest SHA256: `36e69d48387d7e9f36e9cfe3eef939cf375137cb6e45af1514345ea969b7e62e`
 
 | Component | Category | Owner/contact | Version | Profile | Result | Release surface | Evidence | Limitations | Reviewed at |
 |---|---|---|---|---|---|---|---|---|---|
