@@ -2806,7 +2806,8 @@ BOOST_AUTO_TEST_CASE(p2mr_validation_weight_boundary_matrix)
 
         for (const unsigned int base_flags : VERIFY_FLAG_SETS) {
             for (const bool legacy : {false, true}) {
-                const unsigned int flags{base_flags | (legacy ? SCRIPT_VERIFY_P2MR_LEGACY_VALIDATION_WEIGHT : 0)};
+                unsigned int flags{base_flags};
+                if (legacy) flags |= SCRIPT_VERIFY_P2MR_LEGACY_VALIDATION_WEIGHT;
                 const bool expect_success{!legacy || test.legacy_margin >= 0};
                 ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
                 BOOST_CHECK_EQUAL(
@@ -2847,7 +2848,8 @@ BOOST_AUTO_TEST_CASE(p2mr_validation_weight_boundary_matrix)
 
         for (const unsigned int base_flags : VERIFY_FLAG_SETS) {
             for (const bool legacy : {false, true}) {
-                const unsigned int flags{base_flags | (legacy ? SCRIPT_VERIFY_P2MR_LEGACY_VALIDATION_WEIGHT : 0)};
+                unsigned int flags{base_flags};
+                if (legacy) flags |= SCRIPT_VERIFY_P2MR_LEGACY_VALIDATION_WEIGHT;
                 ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
                 BOOST_CHECK(!VerifyScript(CScript{}, script_pubkey, &oversized_witness, flags, creator.Checker(), &err));
                 BOOST_CHECK_EQUAL(err, SCRIPT_ERR_PUSH_SIZE);
