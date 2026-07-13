@@ -45,11 +45,11 @@ The RPC:
 8. returns the signature plus enough proof material for stateless verification.
 
 Signing uses the same wallet PQC signing provider path as transaction signing,
-so stateful PQC signature counters advance and the normal PQC usage fields are
-included in the RPC result unless `include_pqc_usage` is set to false. These
-fields describe wallet-local operational state and can include public keys from
-failed signing attempts when the wallet retries a later P2MR leaf. Set
-`include_pqc_usage=false` before sharing an RPC result as a portable proof.
+so stateful PQC signature counters advance. The RPC omits wallet-local PQC usage
+fields by default, keeping its result bounded and portable. Set
+`include_pqc_usage=true` to include those fields for local diagnostics. They can
+reveal exact remaining signature budgets and public keys from failed signing
+attempts when the wallet retries a later P2MR leaf.
 
 The RPC response includes:
 
@@ -90,7 +90,10 @@ the signer status continues to show the overall usage state, single-key
 remaining budget, and any threshold or reminder warnings. Counts, limits,
 warnings, and keys observed during retry attempts are not part of the proof
 JSON. Proofs created by older qbit-qt versions can contain those additional
-fields; both Qt and RPC verification continue to accept them.
+fields. Qt accepts them when the complete proof document is at most 32,768
+characters, while RPC verification continues to accept them. For larger legacy
+exports, remove wallet-local usage fields before importing the proof into
+qbit-qt.
 
 ## Verification Flow
 
