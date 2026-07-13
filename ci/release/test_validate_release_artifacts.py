@@ -19,17 +19,9 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 VALIDATOR = REPO_ROOT / "ci" / "release" / "validate_release_artifacts.py"
-WORKFLOW = REPO_ROOT / ".github/workflows/release-publish.yml"
 PUBLISH_LOCAL = REPO_ROOT / "contrib" / "release-process" / "publish-local-release.sh"
 GPG = shutil.which("gpg")
 GIT = shutil.which("git")
-OLD_TESTNET_POSTURE_VERIFIER = "/".join(
-    ["contrib", "release-process", "verify-testnet-release-posture.py"]
-)
-LOCAL_PUBLIC_LINKAGE_FALLBACK = 'LINKAGE_SCRIPT="$SCRIPT_DIR/write-public-linkage.sh"'
-REQUIRED_TRUSTED_PUBLIC_LINKAGE = (
-    '"' + "/".join(["contrib", "release-process", "write-public-linkage.sh"]) + '"'
-)
 
 
 @unittest.skipUnless(GPG and GIT, "gpg and git are required for release validation tests")
@@ -639,103 +631,25 @@ class ValidateReleaseArtifactsTest(unittest.TestCase):
         self.assertIn("not signed by an active qbit release key", result.stderr)
 
 
-class ReleaseWorkflowBoundaryTest(unittest.TestCase):
-    def test_github_verified_precheck_stays_before_local_validator(self) -> None:
-        workflow = WORKFLOW.read_text(encoding="utf8")
-        verified_step = workflow.index("Validate tag exists and is GitHub-verified")
-        local_validator_step = workflow.index("Validate staged artifacts and release signatures")
+class ReleasePublisherBoundaryTest(unittest.TestCase):
+    def test_github_and_source_binding_checks_stay_in_publisher(self) -> None:
+        publisher = PUBLISH_LOCAL.read_text(encoding="utf8")
 
-        self.assertLess(verified_step, local_validator_step)
-        self.assertIn("verification.verified", workflow)
-        self.assertIn("tagObject.data.object.type !== 'commit'", workflow)
-        self.assertIn("validate_release_artifacts.py", workflow)
-        self.assertIn("ci/release/verify_testnet_release_posture.py", workflow)
-        self.assertNotIn(OLD_TESTNET_POSTURE_VERIFIER, workflow)
-        self.assertIn(
-            "TARGET_COMMITISH: ${{ steps.tag.outputs.target_commitish }}",
-            workflow,
-        )
-        self.assertIn(
-            "git -C \"${trusted_root}\" merge-base --is-ancestor",
-            workflow,
-        )
-        self.assertIn(
-            "must be an ancestor of trusted_release_ref",
-            workflow,
-        )
-        self.assertRegex(
-            workflow,
-            r"Checkout trusted release validation policy[\s\S]*fetch-depth: 0",
-        )
-        restore_step_start = workflow.index(
-            "- name: Restore verified annotated release tag"
-        )
-        restore_step_end = workflow.index(
-            "- name: Checkout trusted release validation policy",
-            restore_step_start,
-        )
-        restore_step = workflow[restore_step_start:restore_step_end]
-        self.assertLess(verified_step, restore_step_start)
-        self.assertLess(restore_step_start, local_validator_step)
-        self.assertIn(
-            '"refs/tags/${TAG_NAME}:refs/tags/${TAG_NAME}"',
-            restore_step,
-        )
-        self.assertIn('git rev-parse "refs/tags/${TAG_NAME}^{tag}"', restore_step)
-        self.assertIn(
-            'git rev-parse "refs/tags/${TAG_NAME}^{commit}"',
-            restore_step,
-        )
-        self.assertIn('"${local_tag_sha,,}" != "${TAG_SHA,,}"', restore_step)
-        self.assertIn(
-            '"${local_target,,}" != "${TARGET_COMMITISH,,}"',
-            restore_step,
-        )
-        builder_step_start = workflow.index("- name: Validate builder attestations")
-        builder_step_end = workflow.index(
-            "- name: Create or update GitHub Release",
-            builder_step_start,
-        )
-        builder_step = workflow[builder_step_start:builder_step_end]
-        self.assertIn("SOURCE_ROOT: ${{ github.workspace }}", builder_step)
-        self.assertIn(
-            "TARGET_COMMITISH: ${{ steps.tag.outputs.target_commitish }}",
-            builder_step,
-        )
-        self.assertIn("--source-root \"${SOURCE_ROOT}\"", builder_step)
-        self.assertIn(
-            "--expected-tag-target \"${TARGET_COMMITISH}\"",
-            builder_step,
-        )
-        self.assertIn(
-            "BUILDER_ATTESTATION_SOURCE_SHA256: "
-            "${{ steps.builders.outputs.builder_attestation_source_sha256 }}",
-            workflow,
-        )
-        self.assertIn("Builder source archive SHA256", workflow)
+        self.assertIn(".verification.verified", publisher)
+        self.assertIn("not a GitHub-verified signed tag", publisher)
+        self.assertIn('"$REMOTE_TARGET_TYPE" = commit', publisher)
+        self.assertIn("merge-base --is-ancestor", publisher)
+        self.assertIn("ci/release/validate_release_artifacts.py", publisher)
+        self.assertIn("ci/release/verify_testnet_release_posture.py", publisher)
+        self.assertIn('--source-root "$TRUSTED_ROOT"', publisher)
+        self.assertIn('--expected-tag-target "$TAG_TARGET"', publisher)
+        self.assertIn("builder_attestation_source_sha256", publisher)
+        self.assertIn("Release $TAG already exists and is published", publisher)
 
         validator_source = VALIDATOR.read_text(encoding="utf8")
         self.assertNotIn("github.rest", validator_source)
         self.assertNotIn("gh api", validator_source)
         self.assertNotIn("GITHUB_TOKEN", validator_source)
-
-    @unittest.skipUnless(
-        PUBLISH_LOCAL.is_file(),
-        "publish-local-release.sh is required for local publish fallback checks",
-    )
-    def test_local_publish_fallback_checks_github_verified_tag(self) -> None:
-        script = PUBLISH_LOCAL.read_text(encoding="utf8")
-
-        self.assertIn(".verification.verified", script)
-        self.assertIn("not a GitHub-verified signed tag", script)
-        self.assertIn("repos/$repo_path/git/tags/$remote_tag_sha", script)
-        self.assertIn("PUBLIC_RELEASE_CHECKOUT", script)
-        self.assertIn("ci/release/verify_testnet_release_posture.py", script)
-        # write-public-linkage.sh only renders the human-facing release body, so
-        # it is resolved with a local fallback and is never a hard trusted-root
-        # requirement (it must not appear in the required-trusted-paths list).
-        self.assertIn(LOCAL_PUBLIC_LINKAGE_FALLBACK, script)
-        self.assertNotIn(REQUIRED_TRUSTED_PUBLIC_LINKAGE, script)
 
 
 if __name__ == "__main__":

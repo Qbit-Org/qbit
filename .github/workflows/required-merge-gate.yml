@@ -202,22 +202,11 @@ jobs:
             git diff-tree --check --root HEAD
           fi
 
-      - name: Check workflow YAML syntax
+      - name: Check release publisher syntax
         if: steps.classify.outputs.touched_release_publish == 'true'
         run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          try:
-              import yaml
-          except ModuleNotFoundError:
-              print("PyYAML is not installed; skipping best-effort YAML parse.")
-              raise SystemExit(0)
-
-          path = Path(".github/workflows/release-publish.yml")
-          yaml.safe_load(path.read_text(encoding="utf8"))
-          print(f"Parsed {path}")
-          PY
+          set -euo pipefail
+          bash -n contrib/release-process/publish-local-release.sh
 
       - name: Run release validator tests
         if: steps.classify.outputs.touched_release_publish == 'true' || steps.classify.outputs.touched_release_validators == 'true'
@@ -225,6 +214,7 @@ jobs:
           set -euo pipefail
 
           tests=(
+            ci.release.test_publish_local_release
             ci.release.test_validate_builder_attestations
             ci.release.test_validate_key_metadata
             ci.release.test_validate_release_artifacts
