@@ -60,6 +60,7 @@ FUZZ_TARGET(pow, .init = initialize_pow)
             } else {
                 current_block.nChainWork = ConsumeArithUInt256(fuzzed_data_provider);
             }
+            current_block.BuildCadenceLaneLinks();
         }
         {
             (void)GetBlockProof(current_block);
@@ -144,6 +145,7 @@ FUZZ_TARGET(pow_transition, .init = initialize_pow)
             auto current_block{std::make_unique<CBlockIndex>(header)};
             current_block->pprev = blocks.empty() ? nullptr : blocks.back().get();
             current_block->nHeight = height;
+            current_block->BuildCadenceLaneLinks();
             blocks.emplace_back(std::move(current_block));
         }
         last_block = blocks.back().get();

@@ -217,19 +217,6 @@ uint32_t GetASERTAnchorBits(const Consensus::Params& params, const bool auxpow) 
     return anchor.nBits;
 }
 
-const CBlockIndex* GetPreviousSameTypeBlock(const CBlockIndex* pindexLast,
-                                            const bool next_block_is_auxpow,
-                                            const Consensus::Params& params) noexcept
-{
-    const auto& anchor = params.asertAnchorParams;
-    const CBlockIndex* pindexPrev = pindexLast;
-    while (pindexPrev != nullptr && IsAuxpowBlock(pindexPrev) != next_block_is_auxpow) {
-        if (pindexPrev->nHeight <= anchor.nHeight) return nullptr;
-        pindexPrev = pindexPrev->pprev;
-    }
-    return pindexPrev;
-}
-
 ASERTHeaderState GetASERTHeaderState(const CBlockIndex& pindex) noexcept
 {
     return ASERTHeaderState{pindex.nHeight, pindex.GetBlockTime(), pindex.nAuxPow};
@@ -351,7 +338,7 @@ unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast, const CBlockHead
         return GetNextASERTWorkRequired(pindexLast, params);
     }
 
-    const CBlockIndex* pindexPrevSameType = GetPreviousSameTypeBlock(pindexLast, next_block_is_auxpow, params);
+    const CBlockIndex* pindexPrevSameType = pindexLast->GetPreviousBlockForLane(next_block_is_auxpow, params.asertAnchorParams.nHeight);
     return GetNextASERTWorkRequired(pindexPrevSameType, next_block_is_auxpow, params);
 }
 

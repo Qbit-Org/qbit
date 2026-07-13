@@ -90,12 +90,43 @@ CBlockIndex& AppendBlock(std::deque<CBlockIndex>& chain, const int32_t version, 
         index.nAuxPow = index.pprev->nAuxPow;
         index.BuildSkip();
     }
+    index.BuildCadenceLaneLinks();
 
     if (IsAuxpowVersion(version)) {
         ++index.nAuxPow;
     }
 
     return index;
+}
+
+CBlockIndex& AppendChild(std::deque<CBlockIndex>& storage,
+                         CBlockIndex* parent,
+                         const int32_t version,
+                         const uint32_t time,
+                         const uint32_t bits)
+{
+    storage.emplace_back();
+    CBlockIndex& index = storage.back();
+    index.pprev = parent;
+    index.nHeight = parent == nullptr ? 0 : parent->nHeight + 1;
+    index.nVersion = version;
+    index.nTime = time;
+    index.nBits = bits;
+    index.nAuxPow = (parent == nullptr ? 0 : parent->nAuxPow) + (IsAuxpowVersion(version) ? 1 : 0);
+    index.BuildSkip();
+    index.BuildCadenceLaneLinks();
+    return index;
+}
+
+const CBlockIndex* LinearPreviousBlockForLane(const CBlockIndex* pindex,
+                                              const bool auxpow,
+                                              const int anchor_height)
+{
+    while (pindex != nullptr && pindex->SignalsAuxpow() != auxpow) {
+        if (pindex->nHeight <= anchor_height) return nullptr;
+        pindex = pindex->pprev;
+    }
+    return pindex;
 }
 
 CBlockHeader MakeNextHeader(const int32_t version, const uint32_t time)
@@ -201,6 +232,62 @@ BOOST_AUTO_TEST_CASE(cadence_same_type_predecessor_lookup)
 
     const CBlockHeader next_merged = MakeNextHeader(merged_version, anchor_time + 300);
     BOOST_CHECK_EQUAL(GetNextWorkRequired(tip, &next_merged, consensus), ExpectedCadenceBits(consensus, *merged_1, /*auxpow=*/true));
+}
+
+BOOST_AUTO_TEST_CASE(cadence_lane_links_match_linear_reference_on_forks_and_anchors)
+{
+    const auto consensus = GetConsensusParams(*m_node.args);
+    const int32_t permissionless_version = PermissionlessVersion();
+    const int32_t merged_version = MergedVersion(consensus);
+    const uint32_t legacy_bits = LegacyAnchorBits(consensus);
+    const uint32_t merged_bits = AuxPowAnchorBits(consensus);
+    const uint32_t anchor_time = consensus.asertAnchorParams.nBlockTime;
+
+    std::deque<CBlockIndex> common;
+    CBlockIndex* genesis = &AppendChild(common, nullptr, permissionless_version, anchor_time, legacy_bits);
+    CBlockIndex* first_auxpow = &AppendChild(common, genesis, merged_version, anchor_time + 60, merged_bits);
+    CBlockIndex* fork = &AppendChild(common, first_auxpow, permissionless_version, anchor_time + 120, legacy_bits);
+
+    std::deque<CBlockIndex> permissionless_branch;
+    CBlockIndex* permissionless_tip = fork;
+    for (int i = 1; i <= 1000; ++i) {
+        permissionless_tip = &AppendChild(permissionless_branch,
+                                          permissionless_tip,
+                                          permissionless_version,
+                                          anchor_time + 120 + i * 60,
+                                          legacy_bits);
+    }
+
+    std::deque<CBlockIndex> auxpow_branch;
+    CBlockIndex* auxpow_tip = fork;
+    for (int i = 1; i <= 1000; ++i) {
+        auxpow_tip = &AppendChild(auxpow_branch,
+                                  auxpow_tip,
+                                  merged_version,
+                                  anchor_time + 120 + i * 60,
+                                  merged_bits);
+    }
+
+    for (const CBlockIndex* tip : {permissionless_tip, auxpow_tip}) {
+        for (const bool auxpow : {false, true}) {
+            const CBlockIndex* linear = LinearPreviousBlockForLane(tip, auxpow, /*anchor_height=*/0);
+            BOOST_CHECK(tip->GetPreviousBlockForLane(auxpow, /*min_height=*/0) == linear);
+
+            const CBlockHeader next = MakeNextHeader(auxpow ? merged_version : permissionless_version, tip->nTime + 1);
+            const uint32_t expected_bits = linear != nullptr ? ExpectedCadenceBits(consensus, *linear, auxpow) : (auxpow ? merged_bits : legacy_bits);
+            BOOST_CHECK_EQUAL(GetNextWorkRequired(tip, &next, consensus), expected_bits);
+        }
+    }
+
+    BOOST_CHECK(permissionless_tip->GetPreviousBlockForLane(/*auxpow=*/true, fork->nHeight) == nullptr);
+    BOOST_CHECK(permissionless_tip->GetPreviousBlockForLane(/*auxpow=*/true, first_auxpow->nHeight) == first_auxpow);
+    BOOST_CHECK(auxpow_tip->GetPreviousBlockForLane(/*auxpow=*/false, fork->nHeight) == fork);
+
+    CChain active_chain;
+    active_chain.SetTip(*permissionless_tip);
+    BOOST_CHECK(active_chain.Tip()->GetPreviousBlockForLane(/*auxpow=*/true, /*min_height=*/0) == first_auxpow);
+    active_chain.SetTip(*auxpow_tip);
+    BOOST_CHECK(active_chain.Tip()->GetPreviousBlockForLane(/*auxpow=*/false, /*min_height=*/0) == fork);
 }
 
 BOOST_AUTO_TEST_CASE(cadence_pre_activation_uses_single_track_asert_history)

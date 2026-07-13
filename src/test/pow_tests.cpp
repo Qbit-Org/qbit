@@ -438,6 +438,7 @@ BOOST_AUTO_TEST_CASE(get_next_work_legacy_retarget_clamps_powlimit_regression)
         chain[i].nTime = (i == interval - 1) ? first_time + extreme_gap : first_time + i * consensus.nPowTargetSpacing;
         chain[i].pprev = (i > 0) ? &chain[i - 1] : nullptr;
         chain[i].BuildSkip();
+        chain[i].BuildCadenceLaneLinks();
     }
 
     CBlockHeader next_block{};
