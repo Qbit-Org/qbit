@@ -332,6 +332,22 @@ mod tests {
     }
 
     #[test]
+    fn signature_opcodes_reject_stack_underflow() {
+        for opcode in [0xb3, 0xba, 0xbc, 0xbd] {
+            assert_eq!(
+                evaluate(
+                    &[opcode],
+                    &[],
+                    |_, _, _| unreachable!(),
+                    |_, _, _| unreachable!(),
+                )
+                .unwrap_err(),
+                "SCRIPT_ERR_INVALID_STACK_OPERATION"
+            );
+        }
+    }
+
+    #[test]
     fn script_numbers_roundtrip_boundaries() {
         for value in [
             -2_147_483_647,

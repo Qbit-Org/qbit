@@ -830,9 +830,32 @@ fn execute_data_signature_script(
 }
 
 fn validate_ancillary_data_signatures(case: &Map<String, Value>, id: &str) -> Result<(), String> {
-    let Some(message_hex) = case.get("dataSigMessageHash").and_then(Value::as_str) else {
+    const DATA_SIG_FIELDS: [&str; 11] = [
+        "dataSigMessageHash",
+        "dataSigHash",
+        "dataSigPubkey",
+        "dataSigSignature",
+        "dataSigRawMessageSignature",
+        "dataSigLeafScript",
+        "dataSigControlBlock",
+        "dataSigScriptPubKey",
+        "dataSigWrongPubkeyLeafScript",
+        "dataSigWrongPubkeyScriptPubKey",
+        "dataSigProvenance",
+    ];
+    let Some(message_value) = case.get("dataSigMessageHash") else {
+        if DATA_SIG_FIELDS
+            .iter()
+            .any(|field| case.contains_key(*field))
+            || case.contains_key("dataSigAdd")
+        {
+            return Err(format!("{id}: incomplete dataSig fixture"));
+        }
         return Ok(());
     };
+    let message_hex = message_value
+        .as_str()
+        .ok_or_else(|| format!("{id}: dataSigMessageHash must be a string"))?;
     let message = decode_32(message_hex, &format!("{id}.dataSigMessageHash"))?;
     let digest = tagged_hash("QbitDataSigPQC", &message);
     if decode_32(
@@ -1027,6 +1050,26 @@ fn validate_ancillary_data_signatures(case: &Map<String, Value>, id: &str) -> Re
         }
     }
     Ok(())
+}
+
+fn validate_required_data_signature_fixture(
+    case: &Map<String, Value>,
+    id: &str,
+) -> Result<(), String> {
+    if !case.contains_key("dataSigMessageHash") {
+        return Err(format!("{id}: missing required dataSig fixture"));
+    }
+    validate_ancillary_data_signatures(case, id)
+}
+
+fn validate_required_data_signature_add_fixture(
+    case: &Map<String, Value>,
+    id: &str,
+) -> Result<(), String> {
+    if !case.contains_key("dataSigAdd") {
+        return Err(format!("{id}: missing required dataSigAdd fixture"));
+    }
+    validate_required_data_signature_fixture(case, id)
 }
 
 pub fn evaluate_witness(case: &Value) -> Result<Observation, String> {
@@ -1552,6 +1595,31 @@ fn boundary_outcome(
         "opcode" => {
             let kind = string(parameters, "kind", id)?;
             let consensus = match kind {
+                "checksigpqc-underflow"
+                | "checksigadd-underflow"
+                | "checkdatasigpqc-underflow"
+                | "checkdatasigaddpqc-underflow" => {
+                    exact_object_keys(parameters, &["kind"], id)?;
+                    let opcode = match kind {
+                        "checksigpqc-underflow" => 0xb3,
+                        "checksigadd-underflow" => 0xba,
+                        "checkdatasigpqc-underflow" => 0xbc,
+                        "checkdatasigaddpqc-underflow" => 0xbd,
+                        _ => unreachable!(),
+                    };
+                    let error = script::evaluate(
+                        &[opcode],
+                        &[],
+                        |_, _, _| unreachable!(),
+                        |_, _, _| unreachable!(),
+                    )
+                    .expect_err("signature opcode without arguments must fail");
+                    Expected {
+                        accepted: false,
+                        stage: "script".to_string(),
+                        error,
+                    }
+                }
                 "checksigpqc-valid" | "checksigpqc-invalid" => {
                     let extras = if kind == "checksigpqc-invalid" {
                         &["mutation"][..]
@@ -1708,7 +1776,11 @@ fn boundary_outcome(
                         extras,
                     )?;
                     let fixture_id = string(fixture, "id", id)?;
-                    validate_ancillary_data_signatures(fixture, fixture_id)?;
+                    if is_add {
+                        validate_required_data_signature_add_fixture(fixture, fixture_id)?;
+                    } else {
+                        validate_required_data_signature_fixture(fixture, fixture_id)?;
+                    }
                     let result = if is_add {
                         let add = object(
                             fixture
@@ -1846,7 +1918,7 @@ fn boundary_outcome(
                             .witness
                             .clone()
                     } else {
-                        validate_ancillary_data_signatures(fixture, fixture_id)?;
+                        validate_required_data_signature_add_fixture(fixture, fixture_id)?;
                         let add = object(
                             fixture
                                 .get("dataSigAdd")
@@ -2028,6 +2100,22 @@ mod tests {
     use super::*;
     use crate::transaction::TxIn;
     use serde_json::json;
+
+    fn default_witness_fixture() -> Map<String, Value> {
+        let corpus: Value = serde_json::from_str(include_str!(
+            "../../../../src/test/data/p2mr_pqc_witness_vectors.json"
+        ))
+        .unwrap();
+        corpus["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["id"] == "single_key_default_sighash")
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .clone()
+    }
 
     #[test]
     fn branch_order_is_lexicographic_in_both_directions() {
@@ -2266,6 +2354,87 @@ mod tests {
         assert_eq!(
             validate_required_checksigadd_fixture(&Map::new(), "boundary-checksigadd").unwrap_err(),
             "boundary-checksigadd: missing required checkSigAdd fixture"
+        );
+    }
+
+    #[test]
+    fn required_ancillary_fixtures_fail_closed_when_malformed() {
+        let fixture = default_witness_fixture();
+
+        let mut malformed_checksigadd = fixture.clone();
+        malformed_checksigadd.insert("checkSigAdd".to_string(), Value::String("bad".to_string()));
+        assert_eq!(
+            validate_required_checksigadd_fixture(&malformed_checksigadd, "fixture").unwrap_err(),
+            "fixture.checkSigAdd: expected object"
+        );
+
+        let mut missing_data_sig = fixture.clone();
+        missing_data_sig.remove("dataSigMessageHash");
+        assert_eq!(
+            validate_required_data_signature_fixture(&missing_data_sig, "fixture").unwrap_err(),
+            "fixture: missing required dataSig fixture"
+        );
+
+        let mut partial_data_sig = Map::new();
+        partial_data_sig.insert("dataSigHash".to_string(), Value::String("00".to_string()));
+        assert_eq!(
+            validate_ancillary_data_signatures(&partial_data_sig, "fixture").unwrap_err(),
+            "fixture: incomplete dataSig fixture"
+        );
+
+        let mut wrong_type_data_sig = fixture.clone();
+        wrong_type_data_sig.insert("dataSigMessageHash".to_string(), Value::Bool(false));
+        assert_eq!(
+            validate_required_data_signature_fixture(&wrong_type_data_sig, "fixture").unwrap_err(),
+            "fixture: dataSigMessageHash must be a string"
+        );
+
+        let mut truncated_data_sig = fixture.clone();
+        truncated_data_sig.insert(
+            "dataSigSignature".to_string(),
+            Value::String("00".to_string()),
+        );
+        assert_eq!(
+            validate_required_data_signature_fixture(&truncated_data_sig, "fixture").unwrap_err(),
+            "SCRIPT_ERR_P2MR_SIG_SIZE"
+        );
+
+        let mut mismatched_data_sig_leaf = fixture.clone();
+        mismatched_data_sig_leaf.insert(
+            "dataSigLeafScript".to_string(),
+            Value::String("00".to_string()),
+        );
+        assert_eq!(
+            validate_required_data_signature_fixture(&mismatched_data_sig_leaf, "fixture")
+                .unwrap_err(),
+            "fixture: dataSigLeafScript serialization mismatch"
+        );
+
+        let mut missing_data_sig_add = fixture.clone();
+        missing_data_sig_add.remove("dataSigAdd");
+        assert_eq!(
+            validate_required_data_signature_add_fixture(&missing_data_sig_add, "fixture")
+                .unwrap_err(),
+            "fixture: missing required dataSigAdd fixture"
+        );
+
+        let mut malformed_data_sig_add = fixture.clone();
+        malformed_data_sig_add.insert("dataSigAdd".to_string(), Value::String("bad".to_string()));
+        assert_eq!(
+            validate_required_data_signature_add_fixture(&malformed_data_sig_add, "fixture")
+                .unwrap_err(),
+            "fixture.dataSigAdd: expected object"
+        );
+
+        let mut truncated_data_sig_add = fixture;
+        truncated_data_sig_add["dataSigAdd"]
+            .as_object_mut()
+            .unwrap()
+            .insert("signatureA".to_string(), Value::String("00".to_string()));
+        assert_eq!(
+            validate_required_data_signature_add_fixture(&truncated_data_sig_add, "fixture")
+                .unwrap_err(),
+            "SCRIPT_ERR_P2MR_SIG_SIZE"
         );
     }
 }
