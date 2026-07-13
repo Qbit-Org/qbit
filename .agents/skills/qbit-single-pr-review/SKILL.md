@@ -195,13 +195,13 @@ Lead with actionable findings. Use these severities:
 - `medium`: plausible bug, incomplete edge coverage, unclear behavior, or documentation/runbook gap that should be addressed.
 - `low`: small maintainability, clarity, or test-quality issue that does not block correctness.
 
-Each finding should include:
+Each finding must include:
 
 - A severity.
 - File and line reference when possible.
 - The observed behavior.
 - Why it matters in qbit or Bitcoin Core terms.
-- The concrete fix or evidence needed.
+- A separate `Potential resolution:` line directly beneath the finding that states the concrete fix or evidence needed. Do not leave the resolution implicit in the finding explanation.
 
 Do not pad the comment with speculative findings. If no actionable issues are found, say that and list remaining residual risks or validation gaps.
 
@@ -238,7 +238,8 @@ The proposed GitHub comment should use this structure:
 ## PR Review
 
 ### Findings
-- [severity] `path:line` - Finding title. Explanation and requested change.
+- [severity] `path:line` - Finding title. Explanation of the observed behavior and why it matters.
+  - **Potential resolution:** Concrete fix or evidence needed.
 
 If there are no findings:
 No blocking findings from this review pass.
