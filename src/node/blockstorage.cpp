@@ -252,6 +252,7 @@ CBlockIndex* BlockManager::AddToBlockIndex(const CBlockHeader& block, CBlockInde
         pindexNew->nHeight = pindexNew->pprev->nHeight + 1;
         pindexNew->BuildSkip();
     }
+    pindexNew->BuildCadenceLaneLinks();
     pindexNew->nTimeMax = (pindexNew->pprev ? std::max(pindexNew->pprev->nTimeMax, pindexNew->nTime) : pindexNew->nTime);
     pindexNew->nAuxPow = (pindexNew->pprev ? pindexNew->pprev->nAuxPow : 0) + (pindexNew->SignalsAuxpow() ? 1 : 0);
     pindexNew->nChainWork = (pindexNew->pprev ? pindexNew->pprev->nChainWork : 0) + GetBlockProof(*pindexNew);
@@ -468,6 +469,7 @@ bool BlockManager::LoadBlockIndex(const std::optional<uint256>& snapshot_blockha
             return false;
         }
         previous_index = pindex;
+        pindex->BuildCadenceLaneLinks();
         pindex->nAuxPow = (pindex->pprev ? pindex->pprev->nAuxPow : 0) + (pindex->SignalsAuxpow() ? 1 : 0);
         pindex->nChainWork = (pindex->pprev ? pindex->pprev->nChainWork : 0) + GetBlockProof(*pindex);
         pindex->nTimeMax = (pindex->pprev ? std::max(pindex->pprev->nTimeMax, pindex->nTime) : pindex->nTime);

@@ -76,18 +76,15 @@ HeadersSyncState::HeaderDifficultyState HeadersSyncState::MakeHeaderDifficultySt
     state.height = m_chain_start->nHeight;
     state.auxpow_count = m_chain_start->nAuxPow;
 
-    const CBlockIndex* pindex = m_chain_start;
-    while (pindex != nullptr) {
-        const ASERTHeaderState header_state{pindex->nHeight, pindex->GetBlockTime(), pindex->nAuxPow};
-        if (pindex->SignalsAuxpow()) {
-            if (!state.previous_auxpow) state.previous_auxpow = header_state;
-        } else {
-            if (!state.previous_permissionless) state.previous_permissionless = header_state;
-        }
-
-        if (state.previous_permissionless && state.previous_auxpow) break;
-        if (pindex->nHeight <= m_consensus_params.asertAnchorParams.nHeight) break;
-        pindex = pindex->pprev;
+    const int anchor_height{m_consensus_params.asertAnchorParams.nHeight};
+    const auto to_header_state = [](const CBlockIndex& pindex) {
+        return ASERTHeaderState{pindex.nHeight, pindex.GetBlockTime(), pindex.nAuxPow};
+    };
+    if (const CBlockIndex* permissionless = m_chain_start->GetPreviousBlockForLane(/*auxpow=*/false, anchor_height)) {
+        state.previous_permissionless = to_header_state(*permissionless);
+    }
+    if (const CBlockIndex* auxpow = m_chain_start->GetPreviousBlockForLane(/*auxpow=*/true, anchor_height)) {
+        state.previous_auxpow = to_header_state(*auxpow);
     }
 
     return state;

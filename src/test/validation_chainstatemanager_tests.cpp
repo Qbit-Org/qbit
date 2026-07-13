@@ -90,6 +90,7 @@ static CBlockIndex& InsertTestBlockIndex(ChainstateManager& chainman, const uint
     index.m_chain_tx_count = prev ? prev->m_chain_tx_count + 1 : 1;
     index.nStatus = BLOCK_VALID_SCRIPTS | BLOCK_HAVE_DATA;
     index.BuildSkip();
+    index.BuildCadenceLaneLinks();
     return index;
 }
 
@@ -546,6 +547,7 @@ BOOST_FIXTURE_TEST_CASE(activatebestchainstep_schedules_recovery_for_witness_pru
         candidate.m_chain_tx_count = active_tip->m_chain_tx_count + 1;
         candidate.nStatus = BLOCK_VALID_SCRIPTS | BLOCK_HAVE_DATA | BLOCK_OPT_WITNESS_PRUNED;
         candidate.BuildSkip();
+        candidate.BuildCadenceLaneLinks();
 
         BOOST_REQUIRE(candidate_ptr != nullptr);
         BOOST_CHECK(chainman.NeedsWitnessForValidation(*candidate_ptr));

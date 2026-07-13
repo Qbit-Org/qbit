@@ -5848,6 +5848,10 @@ void ChainstateManager::CheckBlockIndex() const
         }
         const uint64_t expected_auxpow_count = (pindex->pprev ? pindex->pprev->nAuxPow : 0) + (pindex->SignalsAuxpow() ? 1 : 0);
         assert(pindex->nAuxPow == expected_auxpow_count);
+        const CBlockIndex* expected_permissionless = pindex->pprev ? (pindex->pprev->SignalsAuxpow() ? pindex->pprev->pprev_permissionless : pindex->pprev) : nullptr;
+        const CBlockIndex* expected_auxpow = pindex->pprev ? (pindex->pprev->SignalsAuxpow() ? pindex->pprev : pindex->pprev->pprev_auxpow) : nullptr;
+        assert(pindex->pprev_permissionless == expected_permissionless);
+        assert(pindex->pprev_auxpow == expected_auxpow);
         // There should be no block with more work than m_best_header, unless it's known to be invalid
         assert((pindex->nStatus & BLOCK_FAILED_MASK) || pindex->nChainWork <= m_best_header->nChainWork);
 

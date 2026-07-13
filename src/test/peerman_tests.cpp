@@ -75,6 +75,7 @@ static std::vector<CBlockHeader> BuildHeaders(const CBlockIndex& base_index, con
         current_index.pprev = const_cast<CBlockIndex*>(prev_index);
         current_index.nHeight = prev_index->nHeight + 1;
         current_index.BuildSkip();
+        current_index.BuildCadenceLaneLinks();
 
         prev_header = headers.back();
         prev_index = &current_index;
@@ -98,6 +99,7 @@ static CBlockIndex& InsertTestBlockIndex(ChainstateManager& chainman, const uint
     index.m_chain_tx_count = prev ? prev->m_chain_tx_count + 1 : 1;
     index.nStatus = BLOCK_VALID_SCRIPTS | BLOCK_HAVE_DATA;
     index.BuildSkip();
+    index.BuildCadenceLaneLinks();
     return index;
 }
 
