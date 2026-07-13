@@ -160,13 +160,20 @@ if args[:2] == ["release", "view"]:
     if not release_state.exists():
         raise SystemExit(1)
     draft = release_state.read_text(encoding="utf8").strip() == "draft"
-    immutable = not draft
+    if draft:
+        immutable = os.environ.get("FAKE_GH_DRAFT_IMMUTABLE", "false")
+    else:
+        sequence = os.environ.get("FAKE_GH_IMMUTABLE_SEQUENCE", "true").split(",")
+        counter_path = state / "immutable-view-count"
+        counter = int(counter_path.read_text(encoding="utf8")) if counter_path.exists() else 0
+        immutable = sequence[min(counter, len(sequence) - 1)]
+        counter_path.write_text(str(counter + 1), encoding="utf8")
     print(
         "\t".join(
             [
                 "1",
                 str(draft).lower(),
-                str(immutable).lower(),
+                immutable,
                 os.environ["FAKE_GH_TAG"],
                 "https://example.invalid/release/" + os.environ["FAKE_GH_TAG"],
             ]
@@ -330,6 +337,8 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         ignore_notes_edit: bool = False,
         empty_digest_reads: int = 0,
         release_line: str = "testnet",
+        immutable_sequence: tuple[str, ...] = ("true",),
+        draft_immutable: str = "false",
     ) -> subprocess.CompletedProcess[str]:
         env = dict(os.environ)
         env["PATH"] = f"{self.bin_dir}{os.pathsep}{env['PATH']}"
@@ -344,6 +353,8 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
                 "FAKE_GH_GENERATED_NOTES": GENERATED_NOTES,
                 "FAKE_GH_IGNORE_NOTES_EDIT": str(ignore_notes_edit).lower(),
                 "FAKE_GH_EMPTY_DIGEST_READS": str(empty_digest_reads),
+                "FAKE_GH_IMMUTABLE_SEQUENCE": ",".join(immutable_sequence),
+                "FAKE_GH_DRAFT_IMMUTABLE": draft_immutable,
                 "FAKE_VALIDATOR_LOG": str(self.validator_log),
             }
         )
@@ -440,7 +451,7 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         self.assertNotIn("release upload", gh_log)
         self.assertNotIn("release edit", gh_log)
 
-    def test_validation_only_accepts_matching_published_release(self) -> None:
+    def test_validation_only_accepts_matching_immutable_published_release(self) -> None:
         (self.gh_state / "release-state").write_text("published\n", encoding="utf8")
         remote_assets = []
         for path in sorted(self.artifacts.iterdir()):
@@ -459,6 +470,36 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         self.assertNotIn("release create", gh_log)
         self.assertNotIn("release upload", gh_log)
         self.assertNotIn("release edit", gh_log)
+
+    def test_validation_only_rejects_matching_mutable_published_release(self) -> None:
+        (self.gh_state / "release-state").write_text("published\n", encoding="utf8")
+
+        result = self.run_publisher(
+            "--repo", "Example-Org/release-target", immutable_sequence=("false",)
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("did not confirm it as immutable", result.stderr)
+        self.assertIn("Example-Org/release-target", result.stderr)
+        self.assertIn("Settings > Releases", result.stderr)
+        gh_log = self.gh_log.read_text(encoding="utf8")
+        self.assertNotIn("release upload", gh_log)
+        self.assertNotIn("release edit", gh_log)
+
+    def test_validation_only_rejects_missing_published_immutable_state(self) -> None:
+        (self.gh_state / "release-state").write_text("published\n", encoding="utf8")
+
+        result = self.run_publisher(immutable_sequence=("null",))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("isImmutable=null", result.stderr)
+
+    def test_create_draft_does_not_require_immutable_state(self) -> None:
+        result = self.run_publisher("--create-draft", draft_immutable="null")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Verified draft release", result.stdout)
+        self.assertFalse((self.gh_state / "immutable-view-count").exists())
 
     def test_draft_asset_digest_mismatch_fails_without_replacement(self) -> None:
         artifact = next(
@@ -564,7 +605,7 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("Draft release assets exactly match", result.stdout)
-        self.assertIn("Published release", result.stdout)
+        self.assertIn("Published immutable release", result.stdout)
         self.assertEqual(
             (self.gh_state / "release-state").read_text(encoding="utf8").strip(),
             "published",
@@ -581,6 +622,26 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         self.assertEqual(gh_log.count("release upload"), len(uploaded))
         self.assertIn("release edit", gh_log)
         self.assertIn("--draft=false", gh_log)
+
+    def test_publish_polls_until_release_becomes_immutable(self) -> None:
+        result = self.run_publisher(
+            "--publish", immutable_sequence=("false", "null", "true")
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Published immutable release", result.stdout)
+        self.assertEqual(
+            (self.gh_state / "immutable-view-count").read_text(encoding="utf8"), "3"
+        )
+
+    def test_publish_fails_when_release_remains_mutable(self) -> None:
+        result = self.run_publisher("--publish", immutable_sequence=("false",))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("did not confirm it as immutable", result.stderr)
+        self.assertEqual(
+            (self.gh_state / "immutable-view-count").read_text(encoding="utf8"), "5"
+        )
 
 
 if __name__ == "__main__":

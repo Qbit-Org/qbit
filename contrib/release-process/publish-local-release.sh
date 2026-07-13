@@ -67,6 +67,9 @@ Repository overrides:
 Existing published releases are never changed. A matching draft can be safely
 resumed: its notes are replaced and verified, and existing assets must be a
 digest-matching subset of the validated set.
+Published releases are accepted only when GitHub reports them as immutable. The
+target of --repo must enable repository release immutability or be covered by an
+organization immutable-release policy before publication.
 EOF
 }
 
@@ -206,6 +209,44 @@ load_release_view() {
         RELEASE_TAG RELEASE_URL <<< "$release_view_output"
     [ "$RELEASE_TAG" = "$TAG" ] \
         || die "GitHub Release tag $RELEASE_TAG does not match $TAG"
+}
+
+immutable_release_error() {
+    local observed="${RELEASE_IS_IMMUTABLE:-missing}"
+    die "Release $TAG in $GH_REPO is published but GitHub did not confirm it as immutable" \
+        "(isImmutable=$observed). Enable release immutability under the target" \
+        "repository's Settings > Releases or enforce the organization immutable-release" \
+        "policy before publishing. GitHub applies this setting only to future releases;" \
+        "this release requires manual remediation."
+}
+
+require_immutable_release() {
+    [ "$RELEASE_IS_IMMUTABLE" = true ] || immutable_release_error
+}
+
+wait_for_published_immutable_release() {
+    local attempt
+    local metadata_observed=0
+    local output
+    local errors="$WORK_DIR/release-view-errors"
+    for attempt in 1 2 3 4 5; do
+        if output="$(release_view 2> "$errors")"; then
+            metadata_observed=1
+            load_release_view "$output"
+            if [ "$RELEASE_IS_DRAFT" = false ] && \
+                    [ "$RELEASE_IS_IMMUTABLE" = true ]; then
+                return 0
+            fi
+        fi
+        [ "$attempt" -eq 5 ] || sleep 2
+    done
+    if [ "$metadata_observed" -eq 0 ]; then
+        cat "$errors" >&2
+        die "Could not confirm the final published state of release $TAG in $GH_REPO"
+    fi
+    [ "$RELEASE_IS_DRAFT" = false ] \
+        || die "Release $TAG in $GH_REPO did not reach the published state"
+    immutable_release_error
 }
 
 prepare_release_notes() {
@@ -803,10 +844,11 @@ if RELEASE_VIEW_OUTPUT="$(release_view 2>/dev/null)"; then
     if [ "$RELEASE_IS_DRAFT" != true ]; then
         [ "$MODE" = validate ] \
             || die "Release $TAG already exists and is published; refusing to modify it"
+        require_immutable_release
         write_remote_asset_manifest "$REMOTE_ASSET_MANIFEST"
         compare_asset_manifests exact "$REMOTE_ASSET_MANIFEST"
         msg "Published release assets exactly match local names and SHA256 digests"
-        msg "Validation-only mode complete: $RELEASE_URL (immutable=$RELEASE_IS_IMMUTABLE)"
+        msg "Validation-only mode complete: $RELEASE_URL (immutable=true)"
         exit 0
     fi
     wait_for_subset_assets \
@@ -907,14 +949,14 @@ msg "Draft release notes exactly match the expected notes"
 if [ "$MODE" = publish ]; then
     msg "Publishing release $TAG"
     "${edit_args[@]}" --draft=false
-fi
-
-RELEASE_VIEW_OUTPUT="$(release_view)"
-load_release_view "$RELEASE_VIEW_OUTPUT"
-if [ "$MODE" = publish ]; then
-    [ "$RELEASE_IS_DRAFT" = false ] || die "Release $TAG remained a draft"
-    msg "Published release: $RELEASE_URL (immutable=$RELEASE_IS_IMMUTABLE)"
+    wait_for_published_immutable_release
+    write_remote_asset_manifest "$REMOTE_ASSET_MANIFEST"
+    compare_asset_manifests exact "$REMOTE_ASSET_MANIFEST"
+    msg "Published immutable release assets exactly match local names and SHA256 digests"
+    msg "Published immutable release: $RELEASE_URL"
 else
+    RELEASE_VIEW_OUTPUT="$(release_view)"
+    load_release_view "$RELEASE_VIEW_OUTPUT"
     [ "$RELEASE_IS_DRAFT" = true ] || die "Release $TAG did not remain a draft"
     msg "Verified draft release: $RELEASE_URL"
 fi
