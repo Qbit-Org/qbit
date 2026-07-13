@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -70,7 +71,7 @@ class P2MRV1GeneratorTest(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "generated.json"
-            vectors = [
+            vectors: list[dict[str, Any]] = [
                 {
                     "id": vector_id,
                     "name": vector_id,
@@ -78,7 +79,7 @@ class P2MRV1GeneratorTest(unittest.TestCase):
                 }
                 for vector_id in sorted(merger.PYTHON_IDS)
             ]
-            corpus = {
+            corpus: dict[str, Any] = {
                 "schema_version": 1,
                 "profile": "qbit-p2mr-v1",
                 "profile_version": 1,
