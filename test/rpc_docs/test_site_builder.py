@@ -239,6 +239,7 @@ class SiteBuilderTest(unittest.TestCase):
         methods = {method["name"]: method for method in site_model["methods"]}
         categories = {entry["name"]: entry["counts"] for entry in site_model["categories"]}
 
+        self.assertEqual(site_model["project_version"], "test")
         self.assertEqual(methods["getwalletinfo"]["status"], site_builder.STATUS_UNCHANGED)
         self.assertIn("Wallet", methods["getwalletinfo"]["badges"])
         self.assertEqual(
@@ -374,9 +375,13 @@ class SiteBuilderTest(unittest.TestCase):
             )
             self.assertTrue((Path(tmpdir) / out_dir / "index.html").exists())
             self.assertTrue((Path(tmpdir) / out_dir / "assets" / "qbit.svg").exists())
+            self.assertTrue(
+                (Path(tmpdir) / out_dir / "assets" / "logo-full.svg").exists()
+            )
             site_model_path = Path(tmpdir) / "rpc" / "site-model.json"
             self.assertTrue(site_model_path.exists())
-            self.assertTrue((Path(tmpdir) / "rpc-site-src" / "mkdocs.yml").exists())
+            config_path = Path(tmpdir) / "rpc-site-src" / "mkdocs.yml"
+            self.assertTrue(config_path.exists())
             self.assertTrue(
                 (Path(tmpdir) / "rpc-site-src" / "docs" / "new-since-v30.2.md").exists()
             )
@@ -397,6 +402,10 @@ class SiteBuilderTest(unittest.TestCase):
                 ).exists()
             )
             site_model_text = site_model_path.read_text(encoding="utf-8")
+            config_text = config_path.read_text(encoding="utf-8")
+            index_html = (Path(tmpdir) / out_dir / "index.html").read_text(
+                encoding="utf-8"
+            )
             method_page_text = (
                 Path(tmpdir) / "rpc-site-src" / "docs" / "methods" / "getblocktemplate.md"
             ).read_text(encoding="utf-8")
@@ -404,6 +413,9 @@ class SiteBuilderTest(unittest.TestCase):
             self.assertNotIn("issue_links", site_model_text)
             self.assertNotIn("tags", site_model_text)
             self.assertNotIn("## Tracking", method_page_text)
+            self.assertIn('version: "v30.2-qbit-sample"', config_text)
+            self.assertIn('src="assets/logo-full.svg"', index_html)
+            self.assertIn('<div class="version">\n          v30.2-qbit-sample', index_html)
 
 
 if __name__ == "__main__":
