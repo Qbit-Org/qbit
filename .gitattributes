@@ -1,1 +1,4 @@
 src/clientversion.cpp export-subst
+
+# The P2MR manifest commits to byte-exact JSON hashes across platforms.
+src/test/data/p2mr*.json text eol=lf
