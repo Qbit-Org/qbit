@@ -36,6 +36,12 @@ Required:
 Required for testnet:
   --testnet-posture-evidence FILE   Testnet-only posture evidence.
 
+Required for mainnet; optional as an all-or-none set for testnet:
+  --p2mr-v1-conformance-evidence FILE
+                                     qbit P2MR v1 release evidence envelope.
+  --p2mr-v1-oracle-report FILE       Canonical standalone-oracle report.
+  --p2mr-v1-integration-matrix FILE  Finalized integration support inventory.
+
 Release policy:
   --require-photon                  Require PHOTON artifacts and attestations.
   --allow-unsigned-platform-artifacts
@@ -350,6 +356,9 @@ GUIX_SIGS_REPO=""
 GUIX_SIGS_REF=""
 RELEASE_LINE=""
 TESTNET_POSTURE_EVIDENCE=""
+P2MR_V1_CONFORMANCE_EVIDENCE=""
+P2MR_V1_ORACLE_REPORT=""
+P2MR_V1_INTEGRATION_MATRIX=""
 NOTES_FILE=""
 RELEASE_NAME=""
 REQUIRE_PHOTON=0
@@ -397,6 +406,21 @@ while [ "$#" -gt 0 ]; do
         --testnet-posture-evidence)
             require_value "$1" "${2:-}"
             TESTNET_POSTURE_EVIDENCE="$2"
+            shift 2
+            ;;
+        --p2mr-v1-conformance-evidence)
+            require_value "$1" "${2:-}"
+            P2MR_V1_CONFORMANCE_EVIDENCE="$2"
+            shift 2
+            ;;
+        --p2mr-v1-oracle-report)
+            require_value "$1" "${2:-}"
+            P2MR_V1_ORACLE_REPORT="$2"
+            shift 2
+            ;;
+        --p2mr-v1-integration-matrix)
+            require_value "$1" "${2:-}"
+            P2MR_V1_INTEGRATION_MATRIX="$2"
             shift 2
             ;;
         --notes-file)
@@ -477,6 +501,23 @@ esac
 if [ "$RELEASE_LINE" = testnet ] && [ -z "$TESTNET_POSTURE_EVIDENCE" ]; then
     die "--testnet-posture-evidence is required for testnet releases"
 fi
+P2MR_CONFORMANCE_REQUESTED=0
+if [ "$RELEASE_LINE" = mainnet ] \
+    || [ -n "$P2MR_V1_CONFORMANCE_EVIDENCE" ] \
+    || [ -n "$P2MR_V1_ORACLE_REPORT" ] \
+    || [ -n "$P2MR_V1_INTEGRATION_MATRIX" ]; then
+    P2MR_CONFORMANCE_REQUESTED=1
+    for input_name in \
+        P2MR_V1_CONFORMANCE_EVIDENCE \
+        P2MR_V1_ORACLE_REPORT \
+        P2MR_V1_INTEGRATION_MATRIX; do
+        input_path="${!input_name}"
+        [ -n "$input_path" ] \
+            || die "$input_name is required when qbit P2MR v1 conformance is requested and is always required for mainnet"
+        [[ "$input_path" = /* ]] \
+            || die "$input_name must be an absolute path"
+    done
+fi
 
 need_cmd awk gh git gpg grep python3 tr
 gh auth status >/dev/null
@@ -495,6 +536,7 @@ required_trusted_paths=(
     ci/release/validate_release_artifacts.py
     ci/release/validate_builder_attestations.py
     ci/release/validate_key_metadata.py
+    ci/release/verify_p2mr_v1_conformance.py
     ci/release/verify_testnet_release_posture.py
     contrib/keys/operator-keys/keys.json
 )
@@ -517,6 +559,11 @@ if [ -n "$NOTES_FILE" ]; then
 fi
 if [ -n "$TESTNET_POSTURE_EVIDENCE" ]; then
     TESTNET_POSTURE_EVIDENCE="$(resolve_file "$TESTNET_POSTURE_EVIDENCE")"
+fi
+if [ "$P2MR_CONFORMANCE_REQUESTED" -eq 1 ]; then
+    P2MR_V1_CONFORMANCE_EVIDENCE="$(resolve_file "$P2MR_V1_CONFORMANCE_EVIDENCE")"
+    P2MR_V1_ORACLE_REPORT="$(resolve_file "$P2MR_V1_ORACLE_REPORT")"
+    P2MR_V1_INTEGRATION_MATRIX="$(resolve_file "$P2MR_V1_INTEGRATION_MATRIX")"
 fi
 RELEASE_NAME="${RELEASE_NAME:-qbit $TAG}"
 
@@ -572,6 +619,17 @@ VALIDATION_OUTPUT="$WORK_DIR/validation-output.env"
 LOCAL_ASSET_MANIFEST="$WORK_DIR/local-assets.tsv"
 REMOTE_ASSET_MANIFEST="$WORK_DIR/remote-assets.tsv"
 : > "$VALIDATION_OUTPUT"
+
+if [ "$P2MR_CONFORMANCE_REQUESTED" -eq 1 ]; then
+    msg "Validating qbit P2MR v1 release conformance"
+    python3 "$TRUSTED_ROOT/ci/release/verify_p2mr_v1_conformance.py" \
+        --evidence "$P2MR_V1_CONFORMANCE_EVIDENCE" \
+        --source-root "$TRUSTED_ROOT" \
+        --release-tag "$TAG" \
+        --oracle-report "$P2MR_V1_ORACLE_REPORT" \
+        --integration-matrix "$P2MR_V1_INTEGRATION_MATRIX" \
+        --github-output "$VALIDATION_OUTPUT"
+fi
 
 if [ "$RELEASE_LINE" = testnet ]; then
     msg "Validating testnet release posture"

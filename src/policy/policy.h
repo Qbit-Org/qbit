@@ -55,9 +55,9 @@ static constexpr unsigned int MAX_STANDARD_P2WSH_STACK_ITEMS{100};
 static constexpr unsigned int MAX_STANDARD_P2WSH_STACK_ITEM_SIZE{80};
 /** The maximum size in bytes of each witness stack item in a standard BIP 342 script (Taproot, leaf version 0xc0) */
 static constexpr unsigned int MAX_STANDARD_TAPSCRIPT_STACK_ITEM_SIZE{80};
-/** The maximum size in bytes of each witness stack item in a standard BIP-360 P2MR v1 script */
+/** The maximum size in bytes of each witness stack item in a standard qbit P2MR v1 script */
 static constexpr unsigned int MAX_STANDARD_P2MR_STACK_ITEM_SIZE{MAX_P2MR_V1_STACK_ITEM_SIZE};
-/** The maximum aggregate size in bytes of initial witness stack items in a standard BIP-360 P2MR v1 script */
+/** The maximum aggregate size in bytes of initial witness stack items in a standard qbit P2MR v1 script */
 static constexpr unsigned int MAX_STANDARD_P2MR_TOTAL_INITIAL_STACK_BYTES{MAX_P2MR_V1_TOTAL_INITIAL_STACK_BYTES};
 /** The maximum size in bytes of a standard witnessScript */
 static constexpr unsigned int MAX_STANDARD_P2WSH_SCRIPT_SIZE{3600};

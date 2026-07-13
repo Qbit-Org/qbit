@@ -117,7 +117,7 @@ struct Params {
      * Note that segwit v0 script rules are enforced on all blocks except the
      * BIP 16 exception blocks. */
     int SegwitHeight;
-    /** Block height at which P2MR (BIP360) script-path validation rules become active. */
+    /** Block height at which qbit P2MR v1 script-path validation rules become active. */
     int P2MRHeight{0};
     /** Block height at which P2MR validation weight uses the serialized-signature marginal cost. */
     int nP2MRValidationWeightV2Height{std::numeric_limits<int>::max()};

@@ -63,6 +63,11 @@ class PublishLocalReleaseTest(unittest.TestCase):
         self.artifacts = self._build_artifacts()
         self.posture = self.root / "testnet-posture.env"
         self.posture.write_text("testnet_release_posture=validated\n", encoding="utf8")
+        self.p2mr_evidence = self.root / "p2mr-evidence.json"
+        self.p2mr_oracle = self.root / "p2mr-oracle.json"
+        self.p2mr_matrix = self.root / "p2mr-matrix.json"
+        for path in (self.p2mr_evidence, self.p2mr_oracle, self.p2mr_matrix):
+            path.write_text("{}\n", encoding="utf8")
         self.tag_object = git(self.trusted, "rev-parse", f"refs/tags/{TAG}^{{tag}}")
         self.tag_target = git(self.trusted, "rev-parse", f"refs/tags/{TAG}^{{commit}}")
         self.trusted_ref = git(self.trusted, "rev-parse", "HEAD")
@@ -275,6 +280,16 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
     log.write("builder " + " ".join(args) + "\n")
 """,
         )
+        self._write_executable(
+            validator_dir / "verify_p2mr_v1_conformance.py",
+            r"""#!/usr/bin/env python3
+import os
+import sys
+
+with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
+    log.write("p2mr " + " ".join(sys.argv[1:]) + "\n")
+""",
+        )
         for name in ("validate_key_metadata.py", "verify_testnet_release_posture.py"):
             self._write_executable(
                 validator_dir / name,
@@ -314,6 +329,7 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         trusted_ref: str | None = None,
         ignore_notes_edit: bool = False,
         empty_digest_reads: int = 0,
+        release_line: str = "testnet",
     ) -> subprocess.CompletedProcess[str]:
         env = dict(os.environ)
         env["PATH"] = f"{self.bin_dir}{os.pathsep}{env['PATH']}"
@@ -344,11 +360,11 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
             "--guix-sigs-ref",
             self.guix_sigs_ref,
             "--release-line",
-            "testnet",
-            "--testnet-posture-evidence",
-            str(self.posture),
-            *extra_args,
+            release_line,
         ]
+        if release_line == "testnet":
+            args.extend(["--testnet-posture-evidence", str(self.posture)])
+        args.extend(extra_args)
         return subprocess.run(args, check=False, capture_output=True, text=True, env=env)
 
     def test_validation_only_uses_pr84_source_binding_inputs(self) -> None:
@@ -370,6 +386,39 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("not a GitHub-verified signed tag", result.stderr)
+        self.assertFalse(self.validator_log.exists())
+
+    def test_mainnet_requires_complete_p2mr_conformance_evidence(self) -> None:
+        result = self.run_publisher(release_line="mainnet")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("P2MR_V1_CONFORMANCE_EVIDENCE is required", result.stderr)
+        self.assertFalse(self.validator_log.exists())
+
+    def test_p2mr_conformance_runs_before_artifact_validation(self) -> None:
+        result = self.run_publisher(
+            "--p2mr-v1-conformance-evidence",
+            str(self.p2mr_evidence),
+            "--p2mr-v1-oracle-report",
+            str(self.p2mr_oracle),
+            "--p2mr-v1-integration-matrix",
+            str(self.p2mr_matrix),
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        validator_log = self.validator_log.read_text(encoding="utf8")
+        self.assertLess(validator_log.index("p2mr "), validator_log.index("release "))
+        self.assertIn(f"--source-root {self.trusted.resolve()}", validator_log)
+        self.assertIn(f"--release-tag {TAG}", validator_log)
+
+    def test_partial_p2mr_conformance_evidence_fails_closed(self) -> None:
+        result = self.run_publisher(
+            "--p2mr-v1-conformance-evidence",
+            str(self.p2mr_evidence),
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("P2MR_V1_ORACLE_REPORT is required", result.stderr)
         self.assertFalse(self.validator_log.exists())
 
     def test_wrong_trusted_ref_fails_closed(self) -> None:

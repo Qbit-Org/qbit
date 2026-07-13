@@ -32,6 +32,8 @@ PUBLIC_DOCS_PATHS = [
     "doc/README.md",
     "doc/user/public-testnet.md",
     "doc/integration/exchange-integrator-quickstart.md",
+    "doc/integration/p2mr-v1-support-matrix.json",
+    "doc/integration/p2mr-v1-support-matrix.md",
     "doc/reference/ctv.md",
     "doc/policy/packages.md",
     "doc/deployment/init.md",
@@ -73,6 +75,24 @@ class ClassifyMergeProfileTest(unittest.TestCase):
         )
 
         self.assertEqual(classification.profile, classify_merge_profile.RELEASE_POLICY_PROFILE)
+
+    def test_p2mr_release_validator_paths_use_release_policy_profile(self) -> None:
+        for path in (
+            "ci/release/verify_p2mr_v1_conformance.py",
+            "ci/release/test_verify_p2mr_v1_conformance.py",
+        ):
+            with self.subTest(path=path):
+                classification = self.classify([path])
+                outputs = classify_merge_profile.github_outputs(classification)
+
+                self.assertEqual(
+                    classification.profile,
+                    classify_merge_profile.RELEASE_POLICY_PROFILE,
+                )
+                self.assertTrue(classification.release_policy_only)
+                self.assertEqual(outputs["release_policy_only"], "true")
+                self.assertEqual(outputs["source_validation_required"], "false")
+                self.assertEqual(outputs["touched_release_validators"], "true")
 
     def test_rpc_docs_paths_are_rpc_docs_only(self) -> None:
         classification = self.classify(RPC_DOCS_PATHS)

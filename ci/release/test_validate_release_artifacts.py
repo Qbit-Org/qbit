@@ -301,6 +301,15 @@ class ValidateReleaseArtifactsTest(unittest.TestCase):
             capture_output=True,
             text=True,
         )
+        # The fixture signs its release tag explicitly below. Keep the setup
+        # commit independent of a developer's global commit.gpgsign setting.
+        subprocess.run(
+            [GIT, "config", "commit.gpgsign", "false"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
         (repo / "README.md").write_text("qbit\n", encoding="utf8")
         subprocess.run([GIT, "add", "README.md"], cwd=repo, check=True, capture_output=True, text=True)
         subprocess.run(
@@ -650,7 +659,6 @@ class ReleasePublisherBoundaryTest(unittest.TestCase):
         self.assertNotIn("github.rest", validator_source)
         self.assertNotIn("gh api", validator_source)
         self.assertNotIn("GITHUB_TOKEN", validator_source)
-
 
 if __name__ == "__main__":
     unittest.main()

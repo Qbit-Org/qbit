@@ -9,4 +9,4 @@ To use inside a scripted-diff (or just execute directly):
 
 To regenerate the independent P2MR `OP_CHECKSIGPQC` witness vectors:
 
-    cargo run --manifest-path p2mr_checksigpqc_vectors/Cargo.toml -- ../../src/test/data/p2mr_pqc_witness_vectors.json
+    cargo run --manifest-path p2mr_checksigpqc_vectors/Cargo.toml -- --output /tmp/p2mr-rust.json
