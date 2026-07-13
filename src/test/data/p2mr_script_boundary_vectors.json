@@ -428,6 +428,24 @@
       }
     },
     {
+      "id": "opcode-checksigpqc-underflow",
+      "category": "opcode",
+      "scenario": "opcode",
+      "parameters": {
+        "kind": "checksigpqc-underflow"
+      },
+      "consensus": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_INVALID_STACK_OPERATION"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_INVALID_STACK_OPERATION"
+      }
+    },
+    {
       "id": "opcode-checksigadd-pqc",
       "category": "opcode",
       "scenario": "opcode",
@@ -446,6 +464,24 @@
         "accepted": true,
         "stage": "script-complete",
         "error": "SCRIPT_ERR_OK"
+      }
+    },
+    {
+      "id": "opcode-checksigadd-pqc-underflow",
+      "category": "opcode",
+      "scenario": "opcode",
+      "parameters": {
+        "kind": "checksigadd-underflow"
+      },
+      "consensus": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_INVALID_STACK_OPERATION"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_INVALID_STACK_OPERATION"
       }
     },
     {
@@ -594,6 +630,24 @@
       }
     },
     {
+      "id": "opcode-checkdatasigpqc-underflow",
+      "category": "opcode",
+      "scenario": "opcode",
+      "parameters": {
+        "kind": "checkdatasigpqc-underflow"
+      },
+      "consensus": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_INVALID_STACK_OPERATION"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_INVALID_STACK_OPERATION"
+      }
+    },
+    {
       "id": "opcode-checkdatasigaddpqc",
       "category": "opcode",
       "scenario": "opcode",
@@ -654,6 +708,24 @@
         "accepted": false,
         "stage": "script",
         "error": "SCRIPT_ERR_P2MR_SIG"
+      }
+    },
+    {
+      "id": "opcode-checkdatasigaddpqc-underflow",
+      "category": "opcode",
+      "scenario": "opcode",
+      "parameters": {
+        "kind": "checkdatasigaddpqc-underflow"
+      },
+      "consensus": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_INVALID_STACK_OPERATION"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "script",
+        "error": "SCRIPT_ERR_INVALID_STACK_OPERATION"
       }
     },
     {

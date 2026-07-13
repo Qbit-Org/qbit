@@ -1213,6 +1213,7 @@ ScriptError BoundaryScriptError(std::string_view name)
     if (name == "SCRIPT_ERR_VERIFY") return SCRIPT_ERR_VERIFY;
     if (name == "SCRIPT_ERR_PUSH_SIZE") return SCRIPT_ERR_PUSH_SIZE;
     if (name == "SCRIPT_ERR_STACK_SIZE") return SCRIPT_ERR_STACK_SIZE;
+    if (name == "SCRIPT_ERR_INVALID_STACK_OPERATION") return SCRIPT_ERR_INVALID_STACK_OPERATION;
     if (name == "SCRIPT_ERR_BAD_OPCODE") return SCRIPT_ERR_BAD_OPCODE;
     if (name == "SCRIPT_ERR_CLEANSTACK") return SCRIPT_ERR_CLEANSTACK;
     if (name == "SCRIPT_ERR_PUBKEYTYPE") return SCRIPT_ERR_PUBKEYTYPE;
@@ -1352,6 +1353,20 @@ BoundaryExecution ExecuteP2MRBoundaryCase(const UniValue& test, unsigned int fla
 
     if (scenario == "opcode") {
         const std::string kind{parameters["kind"].get_str()};
+        if (kind == "checksigpqc-underflow" || kind == "checksigadd-underflow" ||
+            kind == "checkdatasigpqc-underflow" || kind == "checkdatasigaddpqc-underflow") {
+            CheckExactObjectKeys(parameters, {"kind"}, "boundary signature-opcode underflow parameters");
+            const opcodetype opcode{
+                kind == "checksigpqc-underflow"       ? OP_CHECKSIGPQC :
+                kind == "checksigadd-underflow"       ? OP_CHECKSIGADD :
+                kind == "checkdatasigpqc-underflow"   ? OP_CHECKDATASIGPQC :
+                                                         OP_CHECKDATASIGADDPQC};
+            const CScript leaf_script{CScript{} << opcode};
+            return ExecuteBoundarySpend(BuildP2MRSpend(
+                                            leaf_script, {}, {P2MR_LEAF_VERSION_V1_CONTROL},
+                                            ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script)),
+                                        flags);
+        }
         if (kind == "checksigpqc-valid" || kind == "checksigpqc-invalid") {
             const std::set<std::string> parameter_keys{kind == "checksigpqc-valid" ?
                                                            std::set<std::string>{"kind", "fixture_file", "fixture_id", "artifact"} :
@@ -1757,8 +1772,8 @@ BOOST_AUTO_TEST_CASE(p2mr_v1_manifest_matches_embedded_corpus)
     BOOST_CHECK_EQUAL(counts["commitment_invalid"].getInt<int>(), 7);
     BOOST_CHECK_EQUAL(counts["witness"].getInt<int>(), 14);
     BOOST_CHECK_EQUAL(counts["cross_profile"].getInt<int>(), 2);
-    BOOST_CHECK_EQUAL(counts["script_boundary"].getInt<int>(), 47);
-    BOOST_CHECK_EQUAL(manifest["case_count"].getInt<int>(), 74);
+    BOOST_CHECK_EQUAL(counts["script_boundary"].getInt<int>(), 51);
+    BOOST_CHECK_EQUAL(manifest["case_count"].getInt<int>(), 78);
 
     struct ManifestFile {
         std::string_view bytes;
@@ -1771,7 +1786,7 @@ BOOST_AUTO_TEST_CASE(p2mr_v1_manifest_matches_embedded_corpus)
         {"src/test/data/p2mr_pqc_witness_vectors.json",
          {json_tests::p2mr_pqc_witness_vectors, 14, "PQC sighash and witness vectors"}},
         {"src/test/data/p2mr_script_boundary_vectors.json",
-         {json_tests::p2mr_script_boundary_vectors, 47, "script, control, leaf, opcode, and resource boundary vectors"}},
+         {json_tests::p2mr_script_boundary_vectors, 51, "script, control, leaf, opcode, and resource boundary vectors"}},
         {"src/test/data/p2mr_vectors.json",
          {json_tests::p2mr_vectors, 11, "commitment, control block, root, and address vectors"}},
     };
@@ -5015,7 +5030,7 @@ BOOST_AUTO_TEST_CASE(p2mr_v1_script_boundary_vectors)
 
     const UniValue& cases{corpus["cases"]};
     BOOST_REQUIRE(cases.isArray());
-    BOOST_REQUIRE_EQUAL(cases.size(), 47U);
+    BOOST_REQUIRE_EQUAL(cases.size(), 51U);
     std::set<std::string> ids;
     std::map<std::string, size_t> category_counts;
     const std::map<std::string, std::string> category_scenarios{
@@ -5066,7 +5081,7 @@ BOOST_AUTO_TEST_CASE(p2mr_v1_script_boundary_vectors)
 
     BOOST_CHECK_EQUAL(category_counts["witness-control"], 10U);
     BOOST_CHECK_EQUAL(category_counts["leaf-version"], 7U);
-    BOOST_CHECK_EQUAL(category_counts["opcode"], 18U);
+    BOOST_CHECK_EQUAL(category_counts["opcode"], 22U);
     BOOST_CHECK_EQUAL(category_counts["resource"], 12U);
 }
 
