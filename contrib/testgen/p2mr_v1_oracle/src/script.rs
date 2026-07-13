@@ -146,6 +146,16 @@ where
                     stack.swap(top, top - 1);
                 }
             }
+            0x87 => {
+                if executing {
+                    if stack.len() < 2 {
+                        return Err("SCRIPT_ERR_INVALID_STACK_OPERATION".to_string());
+                    }
+                    let right = stack.pop().unwrap();
+                    let left = stack.pop().unwrap();
+                    stack.push(if left == right { vec![1] } else { Vec::new() });
+                }
+            }
             0xab => {
                 if executing {
                     last_codesep = opcode_position;
@@ -265,7 +275,7 @@ mod tests {
     }
 
     #[test]
-    fn executes_checksigadd_and_numequal() {
+    fn executes_checksigadd_with_equal_and_numequal() {
         let script = [0x00, 0x01, 0x02, 0xba, 0x51, 0x9c];
         assert!(evaluate(
             &script,
@@ -279,6 +289,20 @@ mod tests {
             |_, _, _| unreachable!()
         )
         .is_ok());
+
+        let two_of_two = [0x00, 0x01, 0x02, 0xba, 0x01, 0x03, 0xba, 0x52, 0x87];
+        let mut checks = 0;
+        assert!(evaluate(
+            &two_of_two,
+            &[vec![1], vec![1]],
+            |_, _, _| {
+                checks += 1;
+                Ok(true)
+            },
+            |_, _, _| unreachable!()
+        )
+        .is_ok());
+        assert_eq!(checks, 2);
     }
 
     #[test]

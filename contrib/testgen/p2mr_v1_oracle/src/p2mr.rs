@@ -1876,16 +1876,56 @@ fn boundary_outcome(
                 "validation-weight-exceeded" => {
                     exact_object_keys(parameters, &["kind", "nonempty_checks"], id)?;
                     let checks = unsigned(parameters, "nonempty_checks", id)? as usize;
-                    let synthetic_witness = vec![vec![1]; checks];
-                    let budget = witness_serialized_size(&synthetic_witness)
-                        + VALIDATION_WEIGHT_OFFSET as usize;
-                    if checks != 2 || budget >= VALIDATION_WEIGHT_PER_PQC as usize {
+                    if checks != 2 {
                         return Err(format!("{id}: invalid exceeded-weight construction"));
+                    }
+                    let initial_stack = vec![vec![1]; checks];
+                    let mut leaf_script = vec![0x00];
+                    for pubkey_byte in [0x11, 0x22] {
+                        leaf_script.push(PQC_PUBLIC_KEY_SIZE as u8);
+                        leaf_script.extend_from_slice(&[pubkey_byte; PQC_PUBLIC_KEY_SIZE]);
+                        leaf_script.push(0xba);
+                    }
+                    leaf_script.extend_from_slice(&[0x52, 0x87]);
+                    let mut witness = initial_stack.clone();
+                    witness.push(leaf_script.clone());
+                    witness.push(vec![P2MR_LEAF_VERSION | 1]);
+                    let budget =
+                        witness_serialized_size(&witness) + VALIDATION_WEIGHT_OFFSET as usize;
+                    if budget >= VALIDATION_WEIGHT_PER_PQC as usize {
+                        return Err(format!("{id}: invalid exceeded-weight construction"));
+                    }
+                    let mut signature_checks = 0usize;
+                    let mut validation_weight = budget as i64;
+                    let error = script::evaluate(
+                        &leaf_script,
+                        &initial_stack,
+                        |signature, pubkey, codesep| {
+                            signature_checks += 1;
+                            if signature != [1]
+                                || pubkey != [0x11; PQC_PUBLIC_KEY_SIZE]
+                                || codesep != u32::MAX
+                            {
+                                return Err(format!("{id}: exceeded-weight stack mismatch"));
+                            }
+                            validation_weight -= VALIDATION_WEIGHT_PER_PQC;
+                            if validation_weight < 0 {
+                                return Err("SCRIPT_ERR_P2MR_VALIDATION_WEIGHT".to_string());
+                            }
+                            Ok(true)
+                        },
+                        |_, _, _| Err(format!("{id}: unexpected data signature opcode")),
+                    )
+                    .expect_err("two-CHECKSIGADD script must exceed validation weight");
+                    if signature_checks != 1 {
+                        return Err(format!(
+                            "{id}: exceeded-weight script executed {signature_checks} checks"
+                        ));
                     }
                     Expected {
                         accepted: false,
                         stage: "validation-weight".to_string(),
-                        error: "SCRIPT_ERR_P2MR_VALIDATION_WEIGHT".to_string(),
+                        error,
                     }
                 }
                 "empty-signatures" => {

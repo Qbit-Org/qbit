@@ -32,6 +32,8 @@ PUBLIC_DOCS_PATHS = [
     "doc/README.md",
     "doc/user/public-testnet.md",
     "doc/integration/exchange-integrator-quickstart.md",
+    "doc/integration/p2mr-v1-support-matrix.json",
+    "doc/integration/p2mr-v1-support-matrix.md",
     "doc/reference/ctv.md",
     "doc/policy/packages.md",
     "doc/deployment/init.md",
