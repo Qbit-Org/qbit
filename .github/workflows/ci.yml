@@ -15,16 +15,22 @@ on:
     branches:
       - main
       - 0.1.x
+      - 1.0.0
+      - 1.x.x
       - develop
   push:
     branches:
       - main
       - 0.1.x
+      - 1.0.0
+      - 1.x.x
       - develop
   merge_group:
     branches:
       - main
       - 0.1.x
+      - 1.0.0
+      - 1.x.x
       - develop
   workflow_dispatch:  # Manual trigger for full validation on any branch
 

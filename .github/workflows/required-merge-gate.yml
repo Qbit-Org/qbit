@@ -16,16 +16,22 @@ on:
     branches:
       - main
       - 0.1.x
+      - 1.0.0
+      - 1.x.x
       - develop
   push:
     branches:
       - main
       - 0.1.x
+      - 1.0.0
+      - 1.x.x
       - develop
   merge_group:
     branches:
       - main
       - 0.1.x
+      - 1.0.0
+      - 1.x.x
       - develop
 
 permissions:
@@ -498,19 +504,31 @@ jobs:
           import json
           from pathlib import Path
 
-          for path in (Path(".github/rulesets/main.json"), Path(".github/rulesets/0.1.x.json")):
+          for path in (
+              Path(".github/rulesets/main.json"),
+              Path(".github/rulesets/1.0.0.json"),
+              Path(".github/rulesets/1.x.x.json"),
+              Path(".github/rulesets/0.1.x.json"),
+          ):
               data = json.loads(path.read_text(encoding="utf8"))
               contexts = []
+              strict = None
               for rule in data.get("rules", []):
                   if rule.get("type") == "required_status_checks":
-                      checks = rule.get("parameters", {}).get("required_status_checks", [])
+                      parameters = rule.get("parameters", {})
+                      checks = parameters.get("required_status_checks", [])
                       contexts = [check.get("context") for check in checks]
+                      strict = parameters.get("strict_required_status_checks_policy")
                       break
               if contexts != ["Required Merge Gate"]:
                   raise SystemExit(
                       f"{path}: required status checks must be exactly ['Required Merge Gate'], got {contexts!r}"
                   )
-              print(f"{path}: Required Merge Gate")
+              if strict is not False:
+                  raise SystemExit(
+                      f"{path}: strict required status checks policy must be false, got {strict!r}"
+                  )
+              print(f"{path}: Required Merge Gate (branch update not required)")
           PY
 
       - name: Check issue template YAML syntax
