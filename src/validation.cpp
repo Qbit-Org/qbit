@@ -2449,7 +2449,12 @@ static unsigned int GetStandardScriptFlagsForNextBlock(const ChainstateManager& 
     assert(tip != nullptr);
     const int next_height{tip->nHeight + 1};
     const Consensus::Params& consensus{chainman.GetConsensus()};
-    if (next_height >= consensus.P2MRHeight && !consensus.P2MRValidationWeightV2ActiveAtHeight(next_height)) {
+    // Standard policy enforces P2MR before consensus activation. In that
+    // interval, apply the validation-weight rule that will be active in the
+    // first P2MR consensus block so the mempool cannot admit a transaction
+    // that makes the activation-height mining template invalid.
+    const int p2mr_policy_height{std::max(next_height, consensus.P2MRHeight)};
+    if (!consensus.P2MRValidationWeightV2ActiveAtHeight(p2mr_policy_height)) {
         flags |= SCRIPT_VERIFY_P2MR_LEGACY_VALIDATION_WEIGHT;
     }
     return flags;
