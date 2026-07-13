@@ -16,11 +16,15 @@ Suggested generated path:
 Required fields:
 
 - `schema_version`
+- `project_version`
 - `baseline`
 - `summary`
 - `change_pages`
 - `categories`
 - `methods`
+
+`project_version` is copied from the generated current manifest and is shown
+in the site navigation.
 
 ## Summary shape
 

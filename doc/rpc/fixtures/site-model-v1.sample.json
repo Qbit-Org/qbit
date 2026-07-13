@@ -1,5 +1,6 @@
 {
   "schema_version": "1",
+  "project_version": "v30.2-qbit-sample",
   "baseline": "v30.2",
   "summary": {
     "total_methods": 2,
