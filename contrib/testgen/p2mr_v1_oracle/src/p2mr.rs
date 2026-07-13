@@ -703,10 +703,45 @@ fn validate_checksigadd_fixture(case: &Map<String, Value>, id: &str) -> Result<(
         return Err(format!("{id}.checkSigAdd: signature message mismatch"));
     }
     let digest = tagged_hash("P2MRSighash", &message);
-    if digest != decode_32(string(fixture, "p2mrSighash", id)?, id)?
-        || !primitive_verify(&pubkey, &digest, parse_signature(&signature, 0)?)?
-    {
-        return Err(format!("{id}.checkSigAdd: signature mismatch"));
+    if digest != decode_32(string(fixture, "p2mrSighash", id)?, id)? {
+        return Err(format!("{id}.checkSigAdd: signature digest mismatch"));
+    }
+    let mut signature_checks = 0usize;
+    let mut validation_weight =
+        witness_serialized_size(&tx.inputs[input_index].witness) as i64 + VALIDATION_WEIGHT_OFFSET;
+    script::evaluate(
+        &leaf,
+        &parsed.stack,
+        |executed_signature, executed_pubkey, codesep| {
+            signature_checks += 1;
+            if codesep != u32::MAX {
+                return Err(format!("{id}.checkSigAdd: unexpected code separator"));
+            }
+            if executed_signature != signature || executed_pubkey != pubkey {
+                return Err(format!("{id}.checkSigAdd: executed stack mismatch"));
+            }
+            if executed_pubkey.len() != PQC_PUBLIC_KEY_SIZE {
+                return Err("SCRIPT_ERR_PUBKEYTYPE".to_string());
+            }
+            if executed_signature.is_empty() {
+                return Ok(false);
+            }
+            validation_weight -= VALIDATION_WEIGHT_PER_PQC;
+            if validation_weight < 0 {
+                return Err("SCRIPT_ERR_P2MR_VALIDATION_WEIGHT".to_string());
+            }
+            primitive_verify(
+                executed_pubkey,
+                &digest,
+                parse_signature(executed_signature, 0)?,
+            )
+        },
+    )
+    .map_err(|error| format!("{id}.checkSigAdd: {error}"))?;
+    if signature_checks != 1 {
+        return Err(format!(
+            "{id}.checkSigAdd: expected exactly one executed signature check"
+        ));
     }
     let expected_result = expected(
         fixture

@@ -443,6 +443,7 @@ jobs:
             ci/release/test_validate_builder_attestations.py
             ci/release/test_validate_key_metadata.py
             ci/release/test_validate_release_artifacts.py
+            ci/release/test_verify_p2mr_v1_conformance.py
             ci/release/test_verify_testnet_release_posture.py
             contrib/guix/test_build_config.py
           )

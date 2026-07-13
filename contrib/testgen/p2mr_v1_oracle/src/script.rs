@@ -17,6 +17,50 @@ fn toggle_else(conditionals: &mut [bool]) -> Result<(), &'static str> {
     Ok(())
 }
 
+fn parse_script_num(value: &[u8]) -> Result<i64, String> {
+    if value.len() > 4 {
+        return Err("SCRIPT_ERR_UNKNOWN_ERROR".to_string());
+    }
+    if let Some(last) = value.last() {
+        if last & 0x7f == 0 && (value.len() == 1 || value[value.len() - 2] & 0x80 == 0) {
+            return Err("SCRIPT_ERR_UNKNOWN_ERROR".to_string());
+        }
+    }
+    let mut magnitude = 0u64;
+    for (index, byte) in value.iter().enumerate() {
+        magnitude |= u64::from(*byte) << (8 * index);
+    }
+    if value.last().is_some_and(|byte| byte & 0x80 != 0) {
+        magnitude &= !(0x80u64 << (8 * (value.len() - 1)));
+        Ok(-(magnitude as i64))
+    } else {
+        Ok(magnitude as i64)
+    }
+}
+
+fn serialize_script_num(value: i64) -> Vec<u8> {
+    if value == 0 {
+        return Vec::new();
+    }
+    let negative = value < 0;
+    let mut magnitude = if negative {
+        (-value) as u64
+    } else {
+        value as u64
+    };
+    let mut encoded = Vec::new();
+    while magnitude != 0 {
+        encoded.push((magnitude & 0xff) as u8);
+        magnitude >>= 8;
+    }
+    if encoded.last().unwrap() & 0x80 != 0 {
+        encoded.push(if negative { 0x80 } else { 0 });
+    } else if negative {
+        *encoded.last_mut().unwrap() |= 0x80;
+    }
+    encoded
+}
+
 pub fn evaluate<F>(
     script: &[u8],
     initial_stack: &[Vec<u8>],
@@ -104,6 +148,28 @@ where
                     stack.push(if valid { vec![1] } else { Vec::new() });
                 }
             }
+            0xba => {
+                if executing {
+                    if stack.len() < 3 {
+                        return Err("SCRIPT_ERR_INVALID_STACK_OPERATION".to_string());
+                    }
+                    let pubkey = stack.pop().unwrap();
+                    let number = parse_script_num(&stack.pop().unwrap())?;
+                    let signature = stack.pop().unwrap();
+                    let valid = check_signature(&signature, &pubkey, last_codesep)?;
+                    stack.push(serialize_script_num(number + i64::from(valid)));
+                }
+            }
+            0x9c => {
+                if executing {
+                    if stack.len() < 2 {
+                        return Err("SCRIPT_ERR_INVALID_STACK_OPERATION".to_string());
+                    }
+                    let right = parse_script_num(&stack.pop().unwrap())?;
+                    let left = parse_script_num(&stack.pop().unwrap())?;
+                    stack.push(if left == right { vec![1] } else { Vec::new() });
+                }
+            }
             _ => return Err(format!("UNSUPPORTED_P2MR_OPCODE_{opcode:02x}")),
         }
         opcode_position = opcode_position
@@ -140,9 +206,49 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_opcode() {
-        assert!(evaluate(&[0xba], &[], |_, _, _| unreachable!())
+        assert!(evaluate(&[0x6a], &[], |_, _, _| unreachable!())
             .unwrap_err()
             .starts_with("UNSUPPORTED_P2MR_OPCODE"));
+    }
+
+    #[test]
+    fn executes_checksigadd_and_numequal() {
+        let script = [0x00, 0x01, 0x02, 0xba, 0x51, 0x9c];
+        assert!(evaluate(&script, &[vec![3]], |signature, pubkey, codesep| {
+            assert_eq!(signature, [3]);
+            assert_eq!(pubkey, [2]);
+            assert_eq!(codesep, u32::MAX);
+            Ok(true)
+        })
+        .is_ok());
+    }
+
+    #[test]
+    fn script_numbers_roundtrip_boundaries() {
+        for value in [
+            -2_147_483_647,
+            -129,
+            -128,
+            -1,
+            0,
+            1,
+            127,
+            128,
+            2_147_483_647,
+        ] {
+            assert_eq!(
+                parse_script_num(&serialize_script_num(value)).unwrap(),
+                value
+            );
+        }
+        assert_eq!(
+            parse_script_num(&[0x80]).unwrap_err(),
+            "SCRIPT_ERR_UNKNOWN_ERROR"
+        );
+        assert_eq!(
+            parse_script_num(&[0; 5]).unwrap_err(),
+            "SCRIPT_ERR_UNKNOWN_ERROR"
+        );
     }
 
     #[test]
