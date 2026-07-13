@@ -534,6 +534,22 @@ fn primitive_verify(pubkey: &[u8], message: &[u8], signature: &[u8]) -> Result<b
     Ok(bitcoinpqc::verify(&pubkey, message, &signature).is_ok())
 }
 
+fn check_p2mr_signature(
+    pubkey: &[u8],
+    message: &[u8],
+    signature: &[u8],
+    hash_type: u8,
+) -> Result<bool, String> {
+    if signature.is_empty() {
+        return Ok(false);
+    }
+    if primitive_verify(pubkey, message, parse_signature(signature, hash_type)?)? {
+        Ok(true)
+    } else {
+        Err("SCRIPT_ERR_P2MR_SIG".to_string())
+    }
+}
+
 fn witness_serialized_size(witness: &[Vec<u8>]) -> usize {
     let mut encoded = Vec::new();
     compact_size(witness.len() as u64, &mut encoded);
@@ -730,11 +746,7 @@ fn validate_checksigadd_fixture(case: &Map<String, Value>, id: &str) -> Result<(
             if validation_weight < 0 {
                 return Err("SCRIPT_ERR_P2MR_VALIDATION_WEIGHT".to_string());
             }
-            primitive_verify(
-                executed_pubkey,
-                &digest,
-                parse_signature(executed_signature, 0)?,
-            )
+            check_p2mr_signature(executed_pubkey, &digest, executed_signature, 0)
         },
     )
     .map_err(|error| format!("{id}.checkSigAdd: {error}"))?;
@@ -1074,7 +1086,6 @@ pub fn evaluate_witness(case: &Value) -> Result<Observation, String> {
         if validation_weight < 0 {
             return Err("SCRIPT_ERR_P2MR_VALIDATION_WEIGHT".to_string());
         }
-        let raw_signature = parse_signature(signature, hash_type)?;
         let message = p2mr_sigmsg(
             &tx,
             &spent_outputs,
@@ -1088,11 +1099,7 @@ pub fn evaluate_witness(case: &Value) -> Result<Observation, String> {
         if message != computed_message {
             return Err(format!("{id}: executed signature message mismatch"));
         }
-        if primitive_verify(pubkey, &computed_digest, raw_signature)? {
-            Ok(true)
-        } else {
-            Err("SCRIPT_ERR_P2MR_SIG".to_string())
-        }
+        check_p2mr_signature(pubkey, &computed_digest, signature, hash_type)
     })
     .map_err(|error| format!("{id}: {error}"))?;
     if signature_checks != 1 {
@@ -1939,6 +1946,31 @@ mod tests {
         assert_eq!(
             witness_v2_address("qbrt", &program),
             "qbrt1zt39mp8jjcqd7pyh7qgz93gmhh2qlqppq8c3j4qy02chzfzp8c7sqrw52qh"
+        );
+    }
+
+    #[test]
+    fn p2mr_signature_check_hard_fails_invalid_nonempty_signature() {
+        let corpus: Value = serde_json::from_str(include_str!(
+            "../../../../src/test/data/p2mr_pqc_witness_vectors.json"
+        ))
+        .unwrap();
+        let fixture = corpus["vectors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["id"] == "single_key_default_sighash")
+            .unwrap();
+        let checksigadd = &fixture["checkSigAdd"];
+        let pubkey = hex::decode(checksigadd["pubkey"].as_str().unwrap()).unwrap();
+        let digest = hex::decode(checksigadd["p2mrSighash"].as_str().unwrap()).unwrap();
+        let mut signature = hex::decode(checksigadd["signature"].as_str().unwrap()).unwrap();
+
+        assert!(check_p2mr_signature(&pubkey, &digest, &signature, 0).unwrap());
+        signature[0] ^= 1;
+        assert_eq!(
+            check_p2mr_signature(&pubkey, &digest, &signature, 0).unwrap_err(),
+            "SCRIPT_ERR_P2MR_SIG"
         );
     }
 }
