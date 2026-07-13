@@ -16,13 +16,6 @@ mkdir -p "${temp_data}"
 
 python3 "${repo_root}/contrib/devtools/test_p2mr_v1_generators.py"
 
-corpus_files=(
-  p2mr_cross_profile_vectors.json
-  p2mr_pqc_witness_vectors.json
-  p2mr_script_boundary_vectors.json
-  p2mr_vectors.json
-  p2mr_v1_manifest.json
-)
 python_output="${tmpdir}/python-witness.json"
 rust_output="${tmpdir}/rust-witness.json"
 python3 "${repo_root}/contrib/devtools/generate-p2mr-v1-corpus.py" \
@@ -42,15 +35,6 @@ python3 "${repo_root}/contrib/devtools/update-p2mr-v1-manifest.py" \
   --source-root "${temp_root}" \
   --manifest src/test/data/p2mr_v1_manifest.json
 
-failed=0
-for file in "${corpus_files[@]}"; do
-  if ! cmp -s "${repo_root}/src/test/data/${file}" "${temp_data}/${file}"; then
-    echo "P2MR v1 corpus is not reproducible: src/test/data/${file}" >&2
-    failed=1
-  fi
-done
-if [[ "${failed}" != 0 ]]; then
-  exit 1
-fi
-
-echo "P2MR v1 generated corpus and manifest are reproducible."
+python3 "${repo_root}/contrib/devtools/test_p2mr_v1_reproducibility.py" \
+  --repo-root "${repo_root}" \
+  --generated-data "${temp_data}"
