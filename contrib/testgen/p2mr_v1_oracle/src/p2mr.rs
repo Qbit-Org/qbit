@@ -774,6 +774,16 @@ fn validate_checksigadd_fixture(case: &Map<String, Value>, id: &str) -> Result<(
     Ok(())
 }
 
+fn validate_required_checksigadd_fixture(
+    case: &Map<String, Value>,
+    id: &str,
+) -> Result<(), String> {
+    if !case.contains_key("checkSigAdd") {
+        return Err(format!("{id}: missing required checkSigAdd fixture"));
+    }
+    validate_checksigadd_fixture(case, id)
+}
+
 fn execute_data_signature_script(
     script_bytes: &[u8],
     initial_stack: &[Vec<u8>],
@@ -1614,7 +1624,7 @@ fn boundary_outcome(
                 "checksigadd-valid" => {
                     let fixture =
                         boundary_fixture(parameters, id, witness_cases, "checkSigAdd", &[])?;
-                    validate_checksigadd_fixture(fixture, string(fixture, "id", id)?)?;
+                    validate_required_checksigadd_fixture(fixture, string(fixture, "id", id)?)?;
                     Expected {
                         accepted: true,
                         stage: "script-complete".to_string(),
@@ -2208,6 +2218,14 @@ mod tests {
         assert_eq!(
             check_p2mr_signature(&pubkey, &digest, &signature, 0).unwrap_err(),
             "SCRIPT_ERR_P2MR_SIG"
+        );
+    }
+
+    #[test]
+    fn required_checksigadd_fixture_fails_closed_when_absent() {
+        assert_eq!(
+            validate_required_checksigadd_fixture(&Map::new(), "boundary-checksigadd").unwrap_err(),
+            "boundary-checksigadd: missing required checkSigAdd fixture"
         );
     }
 }
