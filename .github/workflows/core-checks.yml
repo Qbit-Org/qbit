@@ -133,6 +133,9 @@ jobs:
             libevent-dev \
             libsqlite3-dev
 
+      - name: Test integrated libbitcoinpqc build policy
+        run: python3 ci/checks/test_libbitcoinpqc_build_policy.py
+
       - name: Configure build
         run: |
           cmake -B build -G Ninja \
@@ -145,6 +148,16 @@ jobs:
             -DWITH_ZMQ=OFF \
             -DWITH_USDT=OFF \
             -DWITH_CCACHE=OFF
+
+      - name: Verify integrated libbitcoinpqc compile definitions
+        run: |
+          grep -Fx 'SPX_ENABLE_TEST_BENCH_ENV_KNOBS:BOOL=OFF' build/CMakeCache.txt
+          cmake --build build --target bitcoinpqc --verbose 2>&1 | tee bitcoinpqc-build.log
+          grep -F -- '-DSPX_PRODUCTION_BUILD=1' bitcoinpqc-build.log
+          if grep -F -- '-DSPX_ENABLE_TEST_BENCH_ENV_KNOBS=1' bitcoinpqc-build.log; then
+            echo 'Integrated libbitcoinpqc build unexpectedly enabled runtime test controls.' >&2
+            exit 1
+          fi
 
       - name: Build daemon and CLI
         run: cmake --build build --target qbitd qbit-cli -j"$(nproc)"

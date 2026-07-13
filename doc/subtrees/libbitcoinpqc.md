@@ -17,6 +17,26 @@ release tags from that repository, not the moving `main` branch.
 so the expected `git-subtree-split` value is
 `ac72d1ffa0ef486f08d37334a43f5db1adb731db`.
 
+## Downstream Build Policy
+
+qbit always compiles the integrated `bitcoinpqc` target with
+`SPX_PRODUCTION_BUILD=1`. Configuring qbit with
+`SPX_ENABLE_TEST_BENCH_ENV_KNOBS=ON` is prohibited because it would make
+consensus-reachable PQC behavior selectable through test and benchmark
+environment variables. The qbit CMake configuration fails rather than
+silently overriding that request.
+
+Backend experiments that require the runtime controls must configure
+`src/libbitcoinpqc` as a standalone project. Upstream work to make differential
+tests prove which accelerated implementation ran is tracked in
+[`Qbit-Org/qbit-libbitcoinpqc#3`](https://github.com/Qbit-Org/qbit-libbitcoinpqc/issues/3).
+
+`BITCOINPQC_WOTSC_MAX_COUNTER` is an operational signing cap used while
+signing statistics are active, not a verifier protocol limit. Verification
+continues to accept the full two-byte WOTS+C counter range. See the subtree's
+[`bounded30` signature-limit documentation](../../src/libbitcoinpqc/docs/bounded30-signature-limit.md)
+for the complete distinction.
+
 ## Import Or Refresh The Subtree
 
 Run in a clean `qbit` worktree:
