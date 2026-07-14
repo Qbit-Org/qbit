@@ -52,7 +52,11 @@ Release metadata:
   --notes-file FILE                 Release notes; otherwise generate notes.
   --release-name NAME               Default: qbit <TAG>.
   --prerelease                      Mark the release as a prerelease.
-  --make-latest MODE                true, false, or auto. Default: false.
+  --no-prerelease                   Explicitly clear the prerelease flag.
+  --make-latest MODE                true, false, or auto.
+
+For a new draft, prerelease and make-latest default to false. When resuming a
+draft, omitted metadata options preserve its current prerelease and latest state.
 
 Publication mode (mutually exclusive):
   --create-draft                    Upload and verify assets, then leave a draft.
@@ -67,6 +71,9 @@ Repository overrides:
 Existing published releases are never changed. A matching draft can be safely
 resumed: its notes are replaced and verified, and existing assets must be a
 digest-matching subset of the validated set.
+Published releases are accepted only when GitHub reports them as immutable. The
+target of --repo must enable repository release immutability or be covered by an
+organization immutable-release policy before publication.
 EOF
 }
 
@@ -195,9 +202,28 @@ remote_commit_on_branch() {
 }
 
 release_view() {
-    gh release view "$TAG" --repo "$GH_REPO" \
-        --json databaseId,isDraft,isImmutable,tagName,url \
-        --jq '[.databaseId, (.isDraft | tostring), (.isImmutable | tostring), .tagName, .url] | @tsv'
+    local errors="$WORK_DIR/release-view-errors"
+    local response
+    local release_id
+    local is_draft
+    local is_immutable
+    local release_tag
+    local release_url
+    if ! response="$(
+        gh api --paginate "repos/$GH_REPO_PATH/releases?per_page=100" \
+            --jq '.[] | [.id, (.draft | tostring), (.immutable | tostring), .tag_name, .html_url] | @tsv' \
+            2> "$errors"
+    )"; then
+        return 2
+    fi
+    while IFS=$'\t' read -r release_id is_draft is_immutable \
+            release_tag release_url; do
+        [ "$release_tag" = "$TAG" ] || continue
+        printf '%s\t%s\t%s\t%s\t%s\n' \
+            "$release_id" "$is_draft" "$is_immutable" "$release_tag" "$release_url"
+        return 0
+    done <<< "$response"
+    return 3
 }
 
 load_release_view() {
@@ -206,6 +232,54 @@ load_release_view() {
         RELEASE_TAG RELEASE_URL <<< "$release_view_output"
     [ "$RELEASE_TAG" = "$TAG" ] \
         || die "GitHub Release tag $RELEASE_TAG does not match $TAG"
+}
+
+require_release_view() {
+    local output
+    if output="$(release_view)"; then
+        load_release_view "$output"
+        return
+    fi
+    cat "$WORK_DIR/release-view-errors" >&2
+    die "Could not inspect GitHub Release $TAG in $GH_REPO"
+}
+
+immutable_release_error() {
+    local observed="${RELEASE_IS_IMMUTABLE:-missing}"
+    die "Release $TAG in $GH_REPO is published but GitHub did not confirm it as immutable" \
+        "(isImmutable=$observed). Enable release immutability under the target" \
+        "repository's Settings > Releases or enforce the organization immutable-release" \
+        "policy before publishing. GitHub applies this setting only to future releases;" \
+        "this release requires manual remediation."
+}
+
+require_immutable_release() {
+    [ "$RELEASE_IS_IMMUTABLE" = true ] || immutable_release_error
+}
+
+wait_for_published_immutable_release() {
+    local attempt
+    local metadata_observed=0
+    local output
+    local errors="$WORK_DIR/release-view-errors"
+    for attempt in 1 2 3 4 5; do
+        if output="$(release_view)"; then
+            metadata_observed=1
+            load_release_view "$output"
+            if [ "$RELEASE_IS_DRAFT" = false ] && \
+                    [ "$RELEASE_IS_IMMUTABLE" = true ]; then
+                return 0
+            fi
+        fi
+        [ "$attempt" -eq 5 ] || sleep 2
+    done
+    if [ "$metadata_observed" -eq 0 ]; then
+        cat "$errors" >&2
+        die "Could not confirm the final published state of release $TAG in $GH_REPO"
+    fi
+    [ "$RELEASE_IS_DRAFT" = false ] \
+        || die "Release $TAG in $GH_REPO did not reach the published state"
+    immutable_release_error
 }
 
 prepare_release_notes() {
@@ -364,8 +438,8 @@ RELEASE_NAME=""
 REQUIRE_PHOTON=0
 ALLOW_UNSIGNED_PLATFORM_ARTIFACTS=0
 ALLOW_CODESIGNING_ARTIFACTS=0
-PRERELEASE=0
-MAKE_LATEST=false
+PRERELEASE=preserve
+MAKE_LATEST=preserve
 MODE=validate
 GH_REPO=Qbit-Org/qbit
 GUIX_SIGS_GH_REPO=Qbit-Org/qbit-guix.sigs
@@ -442,7 +516,18 @@ while [ "$#" -gt 0 ]; do
             ALLOW_CODESIGNING_ARTIFACTS=1
             shift
             ;;
-        --prerelease) PRERELEASE=1; shift ;;
+        --prerelease)
+            [ "$PRERELEASE" != false ] \
+                || die "--prerelease and --no-prerelease are mutually exclusive"
+            PRERELEASE=true
+            shift
+            ;;
+        --no-prerelease)
+            [ "$PRERELEASE" != true ] \
+                || die "--prerelease and --no-prerelease are mutually exclusive"
+            PRERELEASE=false
+            shift
+            ;;
         --make-latest)
             require_value "$1" "${2:-}"
             MAKE_LATEST="$(lowercase "$2")"
@@ -495,7 +580,7 @@ case "$RELEASE_LINE" in
     *) die "--release-line must be testnet or mainnet: $RELEASE_LINE" ;;
 esac
 case "$MAKE_LATEST" in
-    true|false|auto) ;;
+    preserve|true|false|auto) ;;
     *) die "--make-latest must be true, false, or auto: $MAKE_LATEST" ;;
 esac
 if [ "$RELEASE_LINE" = testnet ] && [ -z "$TESTNET_POSTURE_EVIDENCE" ]; then
@@ -580,6 +665,11 @@ git -C "$TRUSTED_ROOT" merge-base --is-ancestor "$TAG_TARGET" "$TRUSTED_RELEASE_
 
 GH_REPO_PATH="$(github_repo_path "$GH_REPO")"
 GUIX_SIGS_GH_REPO_PATH="$(github_repo_path "$GUIX_SIGS_GH_REPO")"
+REPO_CAN_PUSH="$(
+    gh api "repos/$GH_REPO_PATH" --jq '(.permissions.push // false) | tostring'
+)" || die "Could not verify authenticated access to $GH_REPO"
+[ "$REPO_CAN_PUSH" = true ] \
+    || die "Authenticated GitHub account requires push access to $GH_REPO to discover draft releases"
 msg "Verifying trusted release ref is public"
 remote_commit "$GH_REPO_PATH" "$TRUSTED_RELEASE_REF" "Trusted release ref"
 msg "Verifying qbit-guix.sigs commit is public and merged"
@@ -798,22 +888,29 @@ RELEASE_IS_DRAFT=""
 RELEASE_IS_IMMUTABLE=""
 RELEASE_TAG=""
 RELEASE_URL=""
-if RELEASE_VIEW_OUTPUT="$(release_view 2>/dev/null)"; then
+if RELEASE_VIEW_OUTPUT="$(release_view)"; then
     load_release_view "$RELEASE_VIEW_OUTPUT"
     if [ "$RELEASE_IS_DRAFT" != true ]; then
         [ "$MODE" = validate ] \
             || die "Release $TAG already exists and is published; refusing to modify it"
+        require_immutable_release
         write_remote_asset_manifest "$REMOTE_ASSET_MANIFEST"
         compare_asset_manifests exact "$REMOTE_ASSET_MANIFEST"
         msg "Published release assets exactly match local names and SHA256 digests"
-        msg "Validation-only mode complete: $RELEASE_URL (immutable=$RELEASE_IS_IMMUTABLE)"
+        msg "Validation-only mode complete: $RELEASE_URL (immutable=true)"
         exit 0
     fi
     wait_for_subset_assets \
         || die "Draft release assets are not a digest-matching subset of the validated upload set"
     msg "Found matching draft release; missing assets will be resumed"
 else
-    : > "$REMOTE_ASSET_MANIFEST"
+    view_status=$?
+    if [ "$view_status" -eq 3 ]; then
+        : > "$REMOTE_ASSET_MANIFEST"
+    else
+        cat "$WORK_DIR/release-view-errors" >&2
+        die "Could not inspect GitHub Release $TAG in $GH_REPO"
+    fi
 fi
 
 prepare_release_notes
@@ -826,16 +923,13 @@ create_args=(
     --title "$RELEASE_NAME"
 )
 create_args+=(--notes-file "$EFFECTIVE_NOTES_FILE")
-if [ "$PRERELEASE" -ne 0 ]; then
-    create_args+=(--prerelease)
-fi
+case "$PRERELEASE" in
+    true) create_args+=(--prerelease) ;;
+    preserve|false) ;;
+esac
 case "$MAKE_LATEST" in
-    true)
-        create_args+=(--latest)
-        ;;
-    false)
-        create_args+=(--latest=false)
-        ;;
+    true) create_args+=(--latest) ;;
+    preserve|false) create_args+=(--latest=false) ;;
     auto) ;;
 esac
 
@@ -859,8 +953,7 @@ fi
 if [ -z "$RELEASE_ID" ]; then
     msg "Creating draft release $TAG"
     "${create_args[@]}"
-    RELEASE_VIEW_OUTPUT="$(release_view)"
-    load_release_view "$RELEASE_VIEW_OUTPUT"
+    require_release_view
     [ "$RELEASE_IS_DRAFT" = true ] || die "New release $TAG is not a draft"
 fi
 
@@ -887,15 +980,15 @@ edit_args=(
     --title "$RELEASE_NAME"
     --notes-file "$EFFECTIVE_NOTES_FILE"
 )
-if [ "$PRERELEASE" -eq 1 ]; then
-    edit_args+=(--prerelease)
-else
-    edit_args+=(--prerelease=false)
-fi
+case "$PRERELEASE" in
+    true) edit_args+=(--prerelease) ;;
+    false) edit_args+=(--prerelease=false) ;;
+    preserve) ;;
+esac
 case "$MAKE_LATEST" in
     true) edit_args+=(--latest) ;;
     false) edit_args+=(--latest=false) ;;
-    auto) ;;
+    preserve|auto) ;;
 esac
 
 msg "Updating verified draft metadata for $TAG"
@@ -907,14 +1000,13 @@ msg "Draft release notes exactly match the expected notes"
 if [ "$MODE" = publish ]; then
     msg "Publishing release $TAG"
     "${edit_args[@]}" --draft=false
-fi
-
-RELEASE_VIEW_OUTPUT="$(release_view)"
-load_release_view "$RELEASE_VIEW_OUTPUT"
-if [ "$MODE" = publish ]; then
-    [ "$RELEASE_IS_DRAFT" = false ] || die "Release $TAG remained a draft"
-    msg "Published release: $RELEASE_URL (immutable=$RELEASE_IS_IMMUTABLE)"
+    wait_for_published_immutable_release
+    wait_for_exact_assets \
+        || die "Published immutable release assets do not exactly match the validated upload set"
+    msg "Published immutable release assets exactly match local names and SHA256 digests"
+    msg "Published immutable release: $RELEASE_URL"
 else
+    require_release_view
     [ "$RELEASE_IS_DRAFT" = true ] || die "Release $TAG did not remain a draft"
     msg "Verified draft release: $RELEASE_URL"
 fi
