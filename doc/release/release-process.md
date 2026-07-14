@@ -77,6 +77,8 @@ The publisher validates:
   selected by the publisher
 - the draft release asset names and GitHub-computed SHA256 digests exactly match
   the validator-approved upload set before publication
+- the final published release is immutable, and its locked asset names and
+  GitHub-computed SHA256 digests still exactly match the validated upload set
 
 Testnet posture evidence is mandatory for `release_line=testnet`; the publisher
 fails closed when `--testnet-posture-evidence` is missing.
@@ -161,7 +163,9 @@ Public validators live under `ci/release/`. Release key metadata lives under
 
 ## Publishing
 
-The publisher requires `gh`, `git`, `gpg`, and `python3`. Run it from the
+The publisher requires `gh`, `git`, `gpg`, `python3`, and an authenticated GitHub
+account with push access to the target repository. Push access is required even
+in validation-only mode so the release listing includes drafts. Run it from the
 repository root at the selected trusted release ref. A command with no
 publication mode performs all local and remote validation without changing a
 GitHub Release:
@@ -194,6 +198,31 @@ publisher replaces any existing draft body, fetches it back, and requires an
 exact match before publication. A draft body that cannot be corrected and
 verified remains unpublished. Manual changes to a resumed draft are therefore
 not preserved; record curated notes in a file and pass `--notes-file`.
+
+New drafts default to non-prerelease and `make-latest=false`. When resuming a
+draft, omitted metadata options preserve its existing prerelease and latest
+state. Use `--prerelease` or `--no-prerelease` and an explicit `--make-latest`
+mode to change those values during a resumed operation.
+
+Draft releases are expected to remain mutable while their assets are assembled.
+The publisher does not require `isImmutable=true` until `--publish` transitions
+the draft to a published release. It then polls the final release metadata for a
+bounded period and fails unless GitHub reports both `isDraft=false` and
+`isImmutable=true`, then polls the locked asset inventory and digests for a
+bounded period to tolerate GitHub API propagation. Validation-only mode likewise
+rejects an existing published release that is not immutable or whose immutable
+state is missing. Release discovery uses a fully paginated listing so matching
+drafts remain resumable. A release is considered absent only after that listing
+succeeds without a matching tag; authentication, API, and other lookup failures
+stop validation rather than skipping the remote release checks.
+
+Release immutability must be enabled under the target repository's release
+settings or enforced by its organization before publication. GitHub applies the
+setting only to future releases; enabling it does not make an existing mutable
+release immutable. When `--repo OWNER/REPO` overrides the default repository,
+that target repository must independently satisfy the same policy. A publisher
+failure after a mutable publication requires manual release remediation; rerunning
+the publisher does not retrofit immutability or modify the published release.
 
 Unsigned platform or public codesigning payload waivers require the explicit
 `--allow-unsigned-platform-artifacts` or `--allow-codesigning-artifacts` flags.
