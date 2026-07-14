@@ -646,7 +646,10 @@ class ReleasePublisherBoundaryTest(unittest.TestCase):
 
         self.assertIn(".verification.verified", publisher)
         self.assertIn("not a GitHub-verified signed tag", publisher)
-        self.assertIn('"$REMOTE_TARGET_TYPE" = commit', publisher)
+        self.assertIn('"$remote_target_type" = commit', publisher)
+        self.assertIn('"$remote_verification_reason" = valid', publisher)
+        self.assertIn("verify_remote_tag_pin pre-publication", publisher)
+        self.assertIn("verify_remote_tag_pin post-publication", publisher)
         self.assertIn("merge-base --is-ancestor", publisher)
         self.assertIn("ci/release/validate_release_artifacts.py", publisher)
         self.assertIn("ci/release/verify_testnet_release_posture.py", publisher)
