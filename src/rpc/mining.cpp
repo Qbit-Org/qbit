@@ -102,7 +102,7 @@ void EnsureTemplateTimeIsValid(const CBlockHeader& block, const Consensus::Param
 
     LogWarning("Unable to create a block template at height %d: minimum timestamp %d exceeds maximum timestamp %d\n",
                height, block.GetBlockTime(), max_time);
-    throw JSONRPCError(RPC_MISC_ERROR, strprintf("No valid block timestamp is currently available at height %d; median time past requires %d but the future-time limit permits at most %d", height, block.GetBlockTime(), max_time));
+    throw JSONRPCError(RPC_MISC_ERROR, strprintf("time-too-new: no valid block timestamp is currently available at height %d; median time past requires %d but the future-time limit permits at most %d", height, block.GetBlockTime(), max_time));
 }
 
 double EstimateHashPS(int lookup, int height, const CChain& active_chain, const HashrateWork work_filter)

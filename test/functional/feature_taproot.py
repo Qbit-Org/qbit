@@ -117,6 +117,7 @@ import json
 import hashlib
 import os
 import random
+import time
 
 # Whether or not to output generated test vectors, in JSON format.
 GEN_TEST_VECTORS = False
@@ -1421,6 +1422,7 @@ class TaprootTest(BitcoinTestFramework):
         self.setup_clean_chain = True
 
     def block_submit(self, node, txs, msg, err_msg, cb_pubkey=None, fees=0, sigops_weight=0, witness=False, accept=False):
+        node.setmocktime(self.lastblocktime)
 
         # Deplete block of any non-tapscript sigops using a single additional 0-value coinbase output.
         # It is not practical to fit enough tapscript sigops to hit the block sigops limit without
@@ -1668,7 +1670,7 @@ class TaprootTest(BitcoinTestFramework):
         coinbase.nLockTime = 0
         assert coinbase.txid_hex == "079a516e5b41d3cbd8abc5f95d4e22c87742ef760bbb62fd527dc2a8301a40c0"
         # Mine it
-        block = create_block(hashprev=int(self.nodes[0].getbestblockhash(), 16), coinbase=coinbase)
+        block = create_block(hashprev=int(self.nodes[0].getbestblockhash(), 16), coinbase=coinbase, ntime=int(time.time()))
         block.solve()
         self.nodes[0].submitblock(block.serialize().hex())
         assert_equal(self.nodes[0].getblockcount(), 1)
