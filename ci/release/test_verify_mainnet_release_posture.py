@@ -160,7 +160,11 @@ def test_release_builds_default_mainnet_guard_off():
         path.write_text(text, encoding="utf8")
 
     def run_validator(
-        self, *, source_root: Path | None = None, release_tag: str | None = None
+        self,
+        *,
+        source_root: Path | None = None,
+        release_tag: str | None = None,
+        result_json: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         args = [
             sys.executable,
@@ -170,6 +174,8 @@ def test_release_builds_default_mainnet_guard_off():
         ]
         if release_tag:
             args.extend(("--release-tag", release_tag))
+        if result_json:
+            args.extend(("--result-json", str(result_json)))
         return subprocess.run(args, check=False, capture_output=True, text=True)
 
     def git(self, *args: str) -> str:
@@ -195,10 +201,20 @@ def test_release_builds_default_mainnet_guard_off():
         return result.stdout.strip()
 
     def test_valid_final_posture_succeeds(self) -> None:
-        result = self.run_validator()
+        result_path = self.root / "result.json"
+        result = self.run_validator(result_json=result_path)
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Validated fail-closed mainnet release posture", result.stdout)
+        self.assertEqual(
+            json.loads(result_path.read_text(encoding="utf8")),
+            {
+                "schema": 1,
+                "ready": True,
+                "source": "working tree",
+                "failures": [],
+            },
+        )
 
     def test_matching_auxpow_chain_id_fails(self) -> None:
         path = self.root / "src/kernel/chainparams.cpp"
@@ -210,10 +226,13 @@ def test_release_builds_default_mainnet_guard_off():
             encoding="utf8",
         )
 
-        result = self.run_validator()
+        result_path = self.root / "result.json"
+        result = self.run_validator(result_json=result_path)
 
         self.assertEqual(result.returncode, 1)
         self.assertIn("must differ from testnet4", result.stderr)
+        failures = json.loads(result_path.read_text(encoding="utf8"))["failures"]
+        self.assertEqual([failure["id"] for failure in failures], ["auxpow_chain_id"])
 
     def test_auxpow_chain_id_must_fit_its_consensus_field(self) -> None:
         path = self.root / "src/kernel/chainparams.cpp"
@@ -322,11 +341,17 @@ def test_release_builds_default_mainnet_guard_off():
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_checked_in_draft_is_blocked_until_final_values_land(self) -> None:
-        result = self.run_validator(source_root=REPO_ROOT)
+        result_path = self.root / "result.json"
+        result = self.run_validator(source_root=REPO_ROOT, result_json=result_path)
 
         self.assertEqual(result.returncode, 1)
         self.assertIn("must differ from testnet4", result.stderr)
         self.assertIn("draft marker", result.stderr)
+        failures = json.loads(result_path.read_text(encoding="utf8"))["failures"]
+        self.assertEqual(
+            {failure["id"] for failure in failures},
+            {"auxpow_chain_id", "genesis_asert"},
+        )
 
     def test_core_checks_runs_real_gate_on_release_candidate_tag(self) -> None:
         workflow = CORE_CHECKS.read_text(encoding="utf8")

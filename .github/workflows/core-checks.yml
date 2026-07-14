@@ -108,11 +108,13 @@ jobs:
         id: release-target
         env:
           TARGET_REF: ${{ github.base_ref || github.event.merge_group.base_ref || github.ref }}
+          VALIDATION_PROFILE: ${{ steps.classify.outputs.profile }}
         run: |
           set -euo pipefail
 
           target_branch="${TARGET_REF#refs/heads/}"
-          if [[ "${target_branch}" == "1.0.0" ]]; then
+          if [[ "${target_branch}" == "1.0.0" ]] && \
+             [[ "${VALIDATION_PROFILE}" == "source" || "${VALIDATION_PROFILE}" == "release-policy" ]]; then
             echo "mainnet_publish_gate_required=true" >> "$GITHUB_OUTPUT"
           else
             echo "mainnet_publish_gate_required=false" >> "$GITHUB_OUTPUT"
@@ -459,6 +461,7 @@ jobs:
             ci/release/test_validate_builder_attestations.py
             ci/release/test_validate_key_metadata.py
             ci/release/test_validate_release_artifacts.py
+            ci/release/test_verify_mainnet_ci_posture.py
             ci/release/test_verify_mainnet_release_posture.py
             ci/release/test_verify_p2mr_v1_conformance.py
             ci/release/test_verify_testnet_release_posture.py
@@ -487,9 +490,9 @@ jobs:
           done
 
   mainnet-publish-gate:
-    name: mainnet publish gate
+    name: mainnet publication posture
     needs: classify-changes
-    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' && needs.classify-changes.outputs.mainnet_publish_gate_required == 'true' }}
+    if: ${{ needs.classify-changes.outputs.mainnet_publish_gate_required == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
 
@@ -519,9 +522,20 @@ jobs:
           RELEASE_CANDIDATE_TAG: ${{ steps.release-candidate.outputs.tag }}
         run: |
           set -euo pipefail
+          posture_result="${RUNNER_TEMP}/mainnet-posture-result.json"
+
+          set +e
           python3 ci/release/verify_mainnet_release_posture.py \
             --source-root "$GITHUB_WORKSPACE" \
-            --release-tag "${RELEASE_CANDIDATE_TAG}"
+            --release-tag "${RELEASE_CANDIDATE_TAG}" \
+            --result-json "${posture_result}"
+          validator_exit_code=$?
+          set -e
+
+          python3 ci/release/verify_mainnet_ci_posture.py \
+            --policy ci/release/mainnet_ci_posture.json \
+            --result-json "${posture_result}" \
+            --validator-exit-code "${validator_exit_code}"
 
   core-checks-gate:
     name: 'Core Checks Gate'
@@ -534,9 +548,9 @@ jobs:
       - functional-smoke
       - release-validator-tests
       - mainnet-publish-gate
-    # Aggregate core check input for Required Merge Gate. Source jobs are skipped
-    # only for the strict release-policy profile; every other profile requires
-    # the core jobs to complete successfully.
+    # Aggregate core check input for Required Merge Gate. The phase-aware
+    # mainnet posture runs for source and release-policy changes targeting
+    # 1.0.0; source build/test jobs remain conditional on source validation.
     if: ${{ always() }}
     steps:
       - name: Check core check results
@@ -568,6 +582,12 @@ jobs:
 
           check_result "classify validation profile" "${CLASSIFY_CHANGES_RESULT}"
 
+          if [[ "${MAINNET_PUBLISH_GATE_REQUIRED}" == "true" ]]; then
+            check_result "mainnet publication posture" "${MAINNET_PUBLISH_GATE_RESULT}"
+          else
+            echo "Mainnet publication posture is not required for this target/profile."
+          fi
+
           if [[ "${SOURCE_VALIDATION_REQUIRED}" != "true" ]]; then
             echo "Validation profile ${VALIDATION_PROFILE} does not require source core checks."
             exit "${failed}"
@@ -578,11 +598,5 @@ jobs:
           check_result "P2MR v1 conformance" "${P2MR_V1_CONFORMANCE_RESULT}"
           check_result "functional smoke" "${FUNCTIONAL_SMOKE_RESULT}"
           check_result "release validator tests" "${RELEASE_VALIDATOR_TESTS_RESULT}"
-
-          if [[ "${MAINNET_PUBLISH_GATE_REQUIRED}" == "true" ]]; then
-            check_result "mainnet publish gate" "${MAINNET_PUBLISH_GATE_RESULT}"
-          else
-            echo "Mainnet publish gate is not required for this target branch."
-          fi
 
           exit "${failed}"

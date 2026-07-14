@@ -144,9 +144,10 @@ principal changes in that range are listed below. The following
   archive-node fallbacks while preserving the existing testnet4 identity.
 - Set the launch blockchain and chainstate size estimates to zero so initial
   storage guidance does not imply pre-existing mainnet history.
-- Added a fail-closed mainnet posture validator and a required Core Checks job
-  that reject draft genesis/ASERT data, a testnet-colliding AuxPoW chain ID,
-  incomplete bootstrap wiring, or missing default-mainnet assertions.
+- Added a fail-closed mainnet posture validator and a phase-aware Core Checks
+  job. Staging accepts exactly the declared genesis/ASERT and AuxPoW chain-ID
+  blockers; final CI and the publisher require complete success and reject
+  incomplete bootstrap wiring or missing default-mainnet assertions.
 - Added mainnet operator, mining-pool, exchange, bootstrap, compatibility, and
   release-verification guidance.
 

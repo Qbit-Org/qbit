@@ -97,12 +97,26 @@ Mainnet publication automatically runs
 target. The validator does not inspect mutable working-tree replacements for
 tagged source files and has no waiver.
 
-Core Checks also runs this same validator as the required `mainnet publish gate`
-job for source changes targeting the `1.0.0` branch. CI creates an annotated
-tag at the exact checked-out candidate commit so that this early check exercises
-the validator's immutable tag-target path. The local publisher remains the
-authority for publication: it independently reruns the validator against the
-real signed public tag after verifying that tag's GitHub signature and ancestry.
+Core Checks also runs this same validator in the required `mainnet publication
+posture` job for source and release-policy changes targeting the `1.0.0` branch.
+This explicitly includes the lightweight profile used by changes to release
+validators and publishing scripts. CI creates an annotated tag at the exact
+checked-out candidate commit so that this early check exercises the validator's
+immutable tag-target path.
+
+`ci/release/mainnet_ci_posture.json` separates merge posture from publication
+posture without weakening the publisher. In `staging` phase, Core Checks
+requires the real validator to fail for exactly the declared launch blockers;
+missing expected failures or additional bootstrap, default-chain, or source
+failures fail CI. When the final commitments land, the same change must set the
+policy to `final` and clear its expected failures, at which point Core Checks
+requires the validator to succeed. A publication-ready result while the policy
+still says `staging` also fails CI.
+
+The local publisher does not read this CI phase policy. It remains the authority
+for publication and independently requires unconditional validator success
+against the real signed public tag after verifying that tag's GitHub signature
+and ancestry. There is no staging mode or publication waiver.
 
 It fails closed unless:
 
@@ -119,10 +133,11 @@ It fails closed unless:
   infer posture from an archive name, and unit tests assert that default and
   explicit mainnet selection are accepted in a standard build.
 
-The v1.0.0 preparation branch is expected to build while this publication gate
-rejects its deliberate chain-ID and genesis/ASERT placeholders. Those failures
-must become successes in the final signed tag target before any mainnet draft
-release can be created or published.
+The v1.0.0 preparation branch is expected to build while the real publication
+gate rejects its deliberate chain-ID and genesis/ASERT placeholders. Core
+Checks accepts that state only when those are the exact two reported failure
+categories. Both failures must become successes, and the CI policy must move to
+`final`, before any mainnet draft release can be created or published.
 
 ## Mainnet-capable build default
 

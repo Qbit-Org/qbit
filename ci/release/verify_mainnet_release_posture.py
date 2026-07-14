@@ -17,6 +17,7 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+RESULT_SCHEMA = 1
 SOURCE_PATHS = (
     "CMakeLists.txt",
     "contrib/guix/libexec/build.sh",
@@ -552,7 +553,23 @@ def parse_args() -> argparse.Namespace:
         "--release-tag",
         help="release tag whose peeled commit supplies every checked source file",
     )
+    parser.add_argument(
+        "--result-json",
+        type=Path,
+        help="write a machine-readable result without changing pass/fail behavior",
+    )
     return parser.parse_args()
+
+
+def write_result(path: Path | None, result: dict[str, Any]) -> bool:
+    if path is None:
+        return True
+    try:
+        path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf8")
+    except OSError as exc:
+        print(f"ERR: Could not write mainnet posture result {path}: {exc}", file=sys.stderr)
+        return False
+    return True
 
 
 def main() -> int:
@@ -562,27 +579,46 @@ def main() -> int:
             args.source_root.resolve(), args.release_tag
         )
     except MainnetPostureError as exc:
+        write_result(
+            args.result_json,
+            {
+                "schema": RESULT_SCHEMA,
+                "ready": False,
+                "source": args.release_tag or "working tree",
+                "failures": [
+                    {"id": "source_read", "name": "source read", "message": str(exc)}
+                ],
+            },
+        )
         print(f"ERR: {exc}", file=sys.stderr)
         return 1
 
-    failures: list[str] = []
-    for name, check in (
-        ("AuxPoW chain ID", validate_chain_id),
-        ("genesis and ASERT launch data", validate_launch_difficulty),
-        ("mainnet bootstrap", validate_bootstrap),
-        ("default-mainnet build posture", validate_default_chain),
+    failures: list[dict[str, str]] = []
+    for failure_id, name, check in (
+        ("auxpow_chain_id", "AuxPoW chain ID", validate_chain_id),
+        ("genesis_asert", "genesis and ASERT launch data", validate_launch_difficulty),
+        ("bootstrap", "mainnet bootstrap", validate_bootstrap),
+        ("default_mainnet", "default-mainnet build posture", validate_default_chain),
     ):
         try:
             check(sources)
         except MainnetPostureError as exc:
-            failures.append(f"{name}: {exc}")
+            failures.append({"id": failure_id, "name": name, "message": str(exc)})
+    source_description = source_commit or "working tree"
+    result = {
+        "schema": RESULT_SCHEMA,
+        "ready": not failures,
+        "source": source_description,
+        "failures": failures,
+    }
+    if not write_result(args.result_json, result):
+        return 1
     if failures:
         print("ERR: Mainnet release posture is not publication-ready:", file=sys.stderr)
         for failure in failures:
-            print(f"- {failure}", file=sys.stderr)
+            print(f"- {failure['name']}: {failure['message']}", file=sys.stderr)
         return 1
 
-    source_description = source_commit or "working tree"
     print(f"Validated fail-closed mainnet release posture for {source_description}")
     return 0
 

@@ -8,7 +8,10 @@ For the normal public release process, see [release-process.md](release-process.
 The release process includes fail-closed mainnet launch-posture and qbit P2MR
 v1 gates. The launch-posture validator inspects the peeled signed-tag target
 and rejects placeholder network values, draft launch calibration, incomplete
-bootstrap wiring, or missing default-mainnet assertions. The [evidence
+bootstrap wiring, or missing default-mainnet assertions. Core Checks permits
+the preparation branch to merge only while its real validator failures exactly
+match the checked-in staging policy; the publisher always requires complete
+success. The [evidence
 JSON](examples/p2mr-v1-conformance-evidence.json) is a field example only: its
 zero hashes and `example.invalid` references deliberately cannot validate. The
 checked-in [integration support
