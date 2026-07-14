@@ -451,6 +451,30 @@ def validate_launch_calibration(artifact: dict[str, Any], chainparams: str) -> N
         ),
         "mainnet_launch_difficulty.json.genesis.expected_bits",
     )
+    runtime_genesis_bits = genesis_bits
+    if "temporary_runtime_bits" in genesis:
+        runtime_genesis_bits = parse_artifact_bits(
+            required_artifact_string(
+                genesis,
+                "temporary_runtime_bits",
+                "mainnet_launch_difficulty.json.genesis",
+            ),
+            "mainnet_launch_difficulty.json.genesis.temporary_runtime_bits",
+        )
+    pow_limit_bits = parse_artifact_bits(
+        required_artifact_string(
+            artifact, "pow_limit_bits", "mainnet_launch_difficulty.json"
+        ),
+        "mainnet_launch_difficulty.json.pow_limit_bits",
+    )
+    runtime_target = compact_to_target(
+        runtime_genesis_bits,
+        "mainnet_launch_difficulty.json.genesis runtime bits",
+    )
+    if runtime_target > compact_to_target(pow_limit_bits, "pow_limit_bits"):
+        raise MainnetPostureError(
+            "mainnet launch genesis runtime target exceeds pow_limit_bits"
+        )
     permissionless_bits = calculate_permissionless_bits(artifact)
     expected_permissionless_bits = parse_artifact_bits(
         required_artifact_string(
@@ -498,11 +522,24 @@ def validate_launch_calibration(artifact: dict[str, Any], chainparams: str) -> N
     anchor_bits = [
         resolve_cpp_int(anchor_tokens[index], constants) for index in (1, 2, 3)
     ]
+    asserted_hash_match = re.search(
+        r'assert\(consensus[.]hashGenesisBlock\s*==\s*uint256\{"([0-9A-Fa-f]{64})"\}\)',
+        main_code,
+    )
+    if asserted_hash_match is None:
+        raise MainnetPostureError(
+            "CMainParams is missing a full-width asserted genesis hash"
+        )
+    asserted_hash = int(asserted_hash_match.group(1), 16)
+    if asserted_hash > runtime_target:
+        raise MainnetPostureError(
+            "mainnet asserted genesis hash does not satisfy its runtime target"
+        )
     code_pairs = (
         (
             "mainnet genesis",
             extract_genesis_bits(main_body, constants, "CMainParams"),
-            genesis_bits,
+            runtime_genesis_bits,
         ),
         (
             "testnet4 genesis",
@@ -598,6 +635,7 @@ def validate_launch_difficulty(sources: dict[str, str]) -> None:
     )
     required_test_assertions = (
         "chain_params->GenesisBlock().nBits",
+        "CheckProofOfWork(chain_params->GenesisBlock().GetHash()",
         "consensus.asertAnchorParams.nBits",
         "consensus.asertAnchorParams.nBitsLegacy",
         "consensus.asertAnchorParams.nBitsAuxPow",

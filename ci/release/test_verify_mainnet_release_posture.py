@@ -33,8 +33,8 @@ public:
         m_assumed_chain_state_size = 0;
         genesis = CreateGenesisBlock(1, 2, 0x1a7f1ab5, 4, 5);
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"01"});
-        assert(genesis.hashMerkleRoot == uint256{"02"});
+        assert(consensus.hashGenesisBlock == uint256{"0000000000000000000000000000000000000000000000000000000000000001"});
+        assert(genesis.hashMerkleRoot == uint256{"0000000000000000000000000000000000000000000000000000000000000002"});
         vSeeds.emplace_back("flux-mainnet.qbit.org");
         vSeeds.emplace_back("phase-mainnet.qbit.org");
         vFixedSeeds = std::vector<uint8_t>(chainparams_seed_main.begin(), chainparams_seed_main.end());
@@ -80,6 +80,7 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_auxpow_chain_id_is_distinct)
 BOOST_AUTO_TEST_CASE(ChainParams_MAIN_launch_difficulty_config)
 {
     BOOST_CHECK_EQUAL(chain_params->GenesisBlock().nBits, genesis_bits);
+    BOOST_CHECK(CheckProofOfWork(chain_params->GenesisBlock().GetHash(), genesis_bits, consensus));
     BOOST_CHECK_EQUAL(consensus.asertAnchorParams.nBits, permissionless_bits);
     BOOST_CHECK_EQUAL(consensus.asertAnchorParams.nBitsLegacy, permissionless_bits);
     BOOST_CHECK_EQUAL(consensus.asertAnchorParams.nBitsAuxPow, auxpow_bits);
@@ -315,6 +316,46 @@ def test_release_builds_default_mainnet_guard_off():
 
         self.assertEqual(result.returncode, 1)
         self.assertIn("temporary", result.stderr)
+
+    def test_declared_temporary_runtime_bits_are_coherent_but_not_publishable(self) -> None:
+        artifact = json.loads(json.dumps(VALID_DIFFICULTY))
+        artifact["genesis"]["temporary_runtime_bits"] = "0x1f00ffff"
+        self.write(
+            "src/test/data/mainnet_launch_difficulty.json",
+            json.dumps(artifact) + "\n",
+        )
+        path = self.root / "src/kernel/chainparams.cpp"
+        path.write_text(
+            path.read_text(encoding="utf8").replace(
+                "genesis = CreateGenesisBlock(1, 2, 0x1a7f1ab5, 4, 5);",
+                "genesis = CreateGenesisBlock(1, 2, 0x1f00ffff, 4, 5);",
+            ),
+            encoding="utf8",
+        )
+
+        result = self.run_validator()
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("temporary", result.stderr)
+        self.assertNotIn("launch code target mismatch", result.stderr)
+
+    def test_asserted_genesis_hash_must_satisfy_runtime_target(self) -> None:
+        path = self.root / "src/kernel/chainparams.cpp"
+        path.write_text(
+            path.read_text(encoding="utf8").replace(
+                "0" * 63 + "1",
+                "f" * 64,
+            ),
+            encoding="utf8",
+        )
+
+        result = self.run_validator()
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "asserted genesis hash does not satisfy its runtime target",
+            result.stderr,
+        )
 
     def test_calculated_lane_bits_must_match_fixture_expectation(self) -> None:
         artifact = json.loads(json.dumps(VALID_DIFFICULTY))

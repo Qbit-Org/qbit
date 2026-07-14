@@ -186,13 +186,14 @@ public:
         m_assumed_blockchain_size = 0; // No mainnet history exists at launch.
         m_assumed_chain_state_size = 0;
 
-        // The genesis header uses the same low-difficulty nBits as CTestNet4Params.
-        // MAINNET LAUNCH BLOCKER: replace the development genesis identity below
-        // when the launch timestamp, nonce, hash, and merkle root are approved.
-        genesis = CreateGenesisBlock(1738713600, 45609, 0x1a7f1ab5, 1, consensus.nSubsidyInitial);
+        // The selected final genesis target is 0x1a7f1ab5; the explicitly
+        // declared temporary runtime target below keeps staging binaries usable.
+        // MAINNET LAUNCH BLOCKER: mine the final genesis identity and replace its
+        // timestamp, nonce, hash, merkle root, and temporary nBits.
+        genesis = CreateGenesisBlock(1738713600, 45609, 0x1f00ffff, 1, consensus.nSubsidyInitial);
         consensus.hashGenesisBlock = genesis.GetHash();
         consensus.BIP34Hash = consensus.hashGenesisBlock;
-        assert(consensus.hashGenesisBlock == uint256{"4e445b80630b0dcf11b2acae8be789379d1e919f174626172b8ae571d07cbbd2"});
+        assert(consensus.hashGenesisBlock == uint256{"0000324188278d089b5eabd9b62bf874c7512677cea90720af51ea5a61a2f997"});
         assert(genesis.hashMerkleRoot == uint256{"773941c57f540b7e0f841db6de90bf4f29d305d8233224c2581025c684387313"});
 
         // Note that of those which support the service bits prefix, most only support a subset of

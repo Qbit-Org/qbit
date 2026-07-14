@@ -830,11 +830,13 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_launch_difficulty_config)
     const UniValue& permissionless_config = RequiredObject(config, "permissionless");
     const UniValue& auxpow_config = RequiredObject(config, "auxpow");
     const uint32_t genesis_bits = CalculateGenesisLaunchBits(config);
+    const uint32_t runtime_genesis_bits = ParseBits(RequiredString(genesis_config, "temporary_runtime_bits"));
     const uint32_t permissionless_bits = CalculatePermissionlessLaunchBits(config);
     const uint32_t auxpow_bits = CalculateAuxPowLaunchBits(config);
 
     BOOST_CHECK_EQUAL(RequiredString(genesis_config, "reference_network"), "testnet4");
     BOOST_CHECK_EQUAL(genesis_bits, ParseBits(RequiredString(genesis_config, "expected_bits")));
+    BOOST_CHECK_NE(runtime_genesis_bits, genesis_bits);
     BOOST_CHECK_EQUAL(permissionless_bits, ParseBits(RequiredString(permissionless_config, "expected_bits")));
     BOOST_CHECK_EQUAL(auxpow_bits, ParseBits(RequiredString(auxpow_config, "expected_bits")));
 
@@ -847,8 +849,9 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_launch_difficulty_config)
     BOOST_CHECK_EQUAL(consensus.nPowTargetSpacingLegacy, 75);
     BOOST_CHECK_EQUAL(consensus.nPowTargetSpacingAuxPow, 300);
 
-    BOOST_CHECK_EQUAL(chain_params->GenesisBlock().nBits, genesis_bits);
+    BOOST_CHECK_EQUAL(chain_params->GenesisBlock().nBits, runtime_genesis_bits);
     BOOST_CHECK_EQUAL(testnet4_chain_params->GenesisBlock().nBits, genesis_bits);
+    BOOST_CHECK(CheckProofOfWork(chain_params->GenesisBlock().GetHash(), runtime_genesis_bits, consensus));
     BOOST_CHECK_EQUAL(consensus.asertAnchorParams.nBits, permissionless_bits);
     BOOST_CHECK_EQUAL(consensus.asertAnchorParams.nBitsLegacy, permissionless_bits);
     BOOST_CHECK_EQUAL(consensus.asertAnchorParams.nBitsAuxPow, auxpow_bits);

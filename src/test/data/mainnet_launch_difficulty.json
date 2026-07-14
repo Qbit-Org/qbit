@@ -7,7 +7,8 @@
     "bits": "0x1a7f1ab5",
     "expected_bits": "0x1a7f1ab5",
     "reference_network": "testnet4",
-    "source": "Launch policy fixes the mainnet genesis header target to the public qbit testnet4 genesis nBits."
+    "temporary_runtime_bits": "0x1f00ffff",
+    "source": "Launch policy fixes the final mainnet genesis header target to the public qbit testnet4 genesis nBits; the separately declared temporary runtime target keeps staging binaries runnable until the final genesis is mined."
   },
   "permissionless": {
     "model": "fdv_hashprice",

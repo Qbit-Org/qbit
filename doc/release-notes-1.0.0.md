@@ -174,9 +174,9 @@ Overall v1.0.0 summary
   half-life.
 - Launch difficulty is fixed from the July 13, 2026 Hashrate Index snapshot:
   the permissionless lane uses the seven-day average USD hashprice, while the
-  AuxPoW lane assumes 1% of the seven-day Bitcoin hashrate SMA. The genesis
-  header matches the low-difficulty public testnet4 `nBits` independently of
-  both lane anchors.
+  AuxPoW lane assumes 1% of the seven-day Bitcoin hashrate SMA. The selected
+  final genesis target matches public testnet4 `nBits`; staging retains a
+  separately declared, easier runtime target until the final genesis is mined.
 - Permissionless mining uses `getblocktemplate` and `submitblock`.
 - Merged mining uses `createauxblock` and `submitauxblock`; pool software must
   follow the commitment order and chain ID returned by the node.
