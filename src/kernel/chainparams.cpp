@@ -41,10 +41,11 @@ static constexpr int QBIT_PUBLIC_TESTNET_AUXPOW_CHAIN_ID{31430};
 static constexpr int QBIT_TEST_CHAIN_AUXPOW_CHAIN_ID{QBIT_PUBLIC_TESTNET_AUXPOW_CHAIN_ID};
 static constexpr int QBIT_TESTNET4_AUXPOW_DISPLAY_COMMITMENT_HEIGHT{20'500};
 
-// Mainnet is not launched. This placeholder intentionally matches public
-// testnet only while mainnet params are still development scaffolding. Replace
-// it with a distinct final value before mainnet is enabled or reset.
-static constexpr int QBIT_MAINNET_PLACEHOLDER_AUXPOW_CHAIN_ID{QBIT_PUBLIC_TESTNET_AUXPOW_CHAIN_ID};
+// MAINNET LAUNCH BLOCKER: this is deliberately not the final mainnet AuxPoW
+// chain ID. It repeats the public-testnet value so no reviewer or pool operator
+// can mistake it for a separately allocated production ID. Replace this
+// constant, its tests, and the mining documentation before the v1.0.0 tag.
+static constexpr int QBIT_MAINNET_PLACEHOLDER_AUXPOW_CHAIN_ID{31430};
 
 static CBlock CreateGenesisBlock(const CScript& genesisInputScript, const CScript& genesisOutputScript, uint32_t nTime, uint32_t nNonce, uint32_t nBits, int32_t nVersion, const CAmount& genesisReward)
 {
@@ -181,8 +182,8 @@ public:
         pchMessageStart[3] = 0xa8;
         nDefaultPort = 8355;
         nPruneAfterHeight = 100000;
-        m_assumed_blockchain_size = 1; // qbit: placeholder, chain doesn't exist yet
-        m_assumed_chain_state_size = 1;
+        m_assumed_blockchain_size = 0; // No mainnet history exists at launch.
+        m_assumed_chain_state_size = 0;
 
         // Temporary development genesis target. ASERT lane anchors below carry the
         // draft launch difficulty until the final mainnet genesis is mined.
@@ -197,8 +198,8 @@ public:
         // This is fine at runtime as we'll fall back to using them as an addrfetch if they don't support the
         // service bits we want, but we should get them updated to support all service bits wanted by any
         // release ASAP to avoid it where possible.
-        // qbit: no DNS seeds yet — network doesn't exist
-        vSeeds.clear();
+        vSeeds.emplace_back("flux-mainnet.qbit.org");
+        vSeeds.emplace_back("phase-mainnet.qbit.org");
 
         base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1,58);  // 'Q'
         base58Prefixes[SCRIPT_ADDRESS] = std::vector<unsigned char>(1,63);  // 'S'
@@ -208,7 +209,7 @@ public:
 
         bech32_hrp = "qb";
 
-        vFixedSeeds.clear(); // qbit: no fixed seeds yet
+        vFixedSeeds = std::vector<uint8_t>(chainparams_seed_main.begin(), chainparams_seed_main.end());
 
         fDefaultConsistencyChecks = false;
         m_is_mockable_chain = false;

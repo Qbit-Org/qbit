@@ -796,13 +796,18 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_sanity)
     sanity_check_chainparams(*m_node.args, ChainType::MAIN);
 }
 
-BOOST_AUTO_TEST_CASE(ChainParams_MAIN_placeholder_has_no_public_bootstrap)
+BOOST_AUTO_TEST_CASE(ChainParams_MAIN_launch_bootstrap)
 {
     const auto chain_params = CreateChainParams(*m_node.args, ChainType::MAIN);
     const auto& consensus = chain_params->GetConsensus();
+    const auto& dns_seeds = chain_params->DNSSeeds();
 
-    BOOST_CHECK(chain_params->DNSSeeds().empty());
-    BOOST_CHECK(chain_params->FixedSeeds().empty());
+    BOOST_REQUIRE_EQUAL(dns_seeds.size(), 2U);
+    BOOST_CHECK_EQUAL(dns_seeds[0], "flux-mainnet.qbit.org");
+    BOOST_CHECK_EQUAL(dns_seeds[1], "phase-mainnet.qbit.org");
+    BOOST_CHECK_EQUAL(chain_params->FixedSeeds().size(), 16U);
+    BOOST_CHECK_EQUAL(chain_params->AssumedBlockchainSize(), 0U);
+    BOOST_CHECK_EQUAL(chain_params->AssumedChainStateSize(), 0U);
     BOOST_CHECK(consensus.nMinimumChainWork.IsNull());
     BOOST_CHECK(consensus.defaultAssumeValid.IsNull());
 }
@@ -813,6 +818,8 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_auxpow_chain_id_is_placeholder)
     const auto testnet4_consensus = CreateChainParams(*m_node.args, ChainType::TESTNET4)->GetConsensus();
 
     BOOST_CHECK_EQUAL(testnet4_consensus.nAuxpowChainId, 31430);
+    // MAINNET LAUNCH BLOCKER: the mainnet value intentionally remains the
+    // public-testnet placeholder until the final allocation is approved.
     BOOST_CHECK_EQUAL(main_consensus.nAuxpowChainId, testnet4_consensus.nAuxpowChainId);
 }
 

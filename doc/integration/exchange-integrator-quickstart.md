@@ -69,8 +69,9 @@ changetype=p2mr
 # Archive/full-history is the default. Leave witness pruning disabled.
 # prunewitnesses=0
 
-# Add qbit.org-published fallback endpoints when launch infrastructure is live.
-# connectarchive=<published-archive-host>:8355
+# Project-operated mainnet archive fallbacks for degraded discovery.
+connectarchive=positron-mainnet.qbit.org:8355
+connectarchive=graviton-mainnet.qbit.org:8355
 ```
 
 Use `share/rpcauth` to generate `rpcauth` credentials. Cookie authentication is

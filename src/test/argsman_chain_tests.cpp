@@ -23,11 +23,9 @@ BOOST_AUTO_TEST_CASE(testnet_only_release_mainnet_guard)
 #if QBIT_TESTNET_ONLY_RELEASE
     const auto check_mainnet_guard = [](const std::runtime_error& e) {
         const std::string message{e.what()};
-        return message.find("public testnet4 only") != std::string::npos &&
+        return message.find("intentionally disables mainnet chain selection") != std::string::npos &&
                message.find("-testnet4") != std::string::npos &&
-               message.find("-chain=testnet4") != std::string::npos &&
-               message.find("Mainnet is not launched") != std::string::npos &&
-               message.find("in-tree mainnet genesis is a development placeholder") != std::string::npos;
+               message.find("-chain=testnet4") != std::string::npos;
     };
 #endif
 

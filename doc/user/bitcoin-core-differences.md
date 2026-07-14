@@ -27,8 +27,13 @@ Other qbit networks use distinct parameters and are documented separately.
 The in-tree mainnet parameters, genesis block, derived hash, and message-start
 bytes are development placeholders until a qbit mainnet launch announcement
 freezes them. The in-tree mainnet AuxPoW chain ID currently matches public
-testnet as a placeholder only; it must be replaced with a distinct final value
-before mainnet is enabled or reset.
+testnet as a conspicuous placeholder only; it must be replaced with the
+approved production allocation before the v1.0.0 tag.
+
+The v1.0.0 launch source includes DNS discovery through
+`flux-mainnet.qbit.org` and `phase-mainnet.qbit.org`. Its project-operated
+archive fallbacks are `positron-mainnet.qbit.org:8355` and
+`graviton-mainnet.qbit.org:8355`.
 
 The qbit source is open, so third parties can fork it or run private networks.
 Only qbit-published artifacts, tags, release notes, seed resources, and

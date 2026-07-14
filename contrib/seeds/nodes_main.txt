@@ -1,3 +1,5 @@
-# Placeholder only.
-# qbit does not yet ship live fixed seeds.
-# Do not replace this file with Bitcoin-derived data.
+# qbit v1.0.0 mainnet launch archive-capable fixed seeds.
+# positron-mainnet.qbit.org
+57.129.105.90:8355
+# graviton-mainnet.qbit.org
+40.160.72.123:8355

@@ -402,6 +402,16 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
     log.write("p2mr " + " ".join(sys.argv[1:]) + "\n")
 """,
         )
+        self._write_executable(
+            validator_dir / "verify_mainnet_release_posture.py",
+            r"""#!/usr/bin/env python3
+import os
+import sys
+
+with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
+    log.write("mainnet-posture " + " ".join(sys.argv[1:]) + "\n")
+""",
+        )
         for name in ("validate_key_metadata.py", "verify_testnet_release_posture.py"):
             self._write_executable(
                 validator_dir / name,
@@ -539,6 +549,26 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("P2MR_V1_CONFORMANCE_EVIDENCE is required", result.stderr)
         self.assertFalse(self.validator_log.exists())
+
+    def test_mainnet_posture_runs_before_conformance_and_artifact_validation(self) -> None:
+        result = self.run_publisher(
+            "--p2mr-v1-conformance-evidence",
+            str(self.p2mr_evidence),
+            "--p2mr-v1-oracle-report",
+            str(self.p2mr_oracle),
+            "--p2mr-v1-integration-matrix",
+            str(self.p2mr_matrix),
+            release_line="mainnet",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        validator_log = self.validator_log.read_text(encoding="utf8")
+        self.assertLess(
+            validator_log.index("mainnet-posture "), validator_log.index("p2mr ")
+        )
+        self.assertLess(validator_log.index("p2mr "), validator_log.index("release "))
+        self.assertIn(f"--source-root {self.trusted.resolve()}", validator_log)
+        self.assertIn(f"--release-tag {TAG}", validator_log)
 
     def test_p2mr_conformance_runs_before_artifact_validation(self) -> None:
         result = self.run_publisher(
