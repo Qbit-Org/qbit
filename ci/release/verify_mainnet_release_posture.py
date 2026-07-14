@@ -228,6 +228,9 @@ def validate_chain_id(sources: dict[str, str]) -> None:
             f"value {main_id} must differ from testnet4 chain ID {testnet4_id}"
         )
 
+    # Finalization must replace the staging equality regression as well as the
+    # consensus constant. A constant-only edit must remain unpublishable even
+    # when this validator runs without the compiled unit-test suite.
     try:
         test_body = extract_test_body(
             sources["src/test/pow_tests.cpp"],

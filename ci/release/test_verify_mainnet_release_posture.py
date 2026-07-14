@@ -254,6 +254,26 @@ def test_release_builds_default_mainnet_guard_off():
         failures = json.loads(result_path.read_text(encoding="utf8"))["failures"]
         self.assertEqual([failure["id"] for failure in failures], ["auxpow_chain_id"])
 
+    def test_final_chain_id_without_distinctness_regression_stays_blocked(self) -> None:
+        path = self.root / "src/test/pow_tests.cpp"
+        path.write_text(
+            path.read_text(encoding="utf8")
+            .replace(
+                "ChainParams_MAIN_auxpow_chain_id_is_distinct",
+                "ChainParams_MAIN_auxpow_chain_id_is_placeholder",
+            )
+            .replace("BOOST_CHECK_NE", "BOOST_CHECK_EQUAL"),
+            encoding="utf8",
+        )
+
+        result = self.run_validator()
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "Missing ChainParams_MAIN_auxpow_chain_id_is_distinct test",
+            result.stderr,
+        )
+
     def test_auxpow_chain_id_must_fit_its_consensus_field(self) -> None:
         path = self.root / "src/kernel/chainparams.cpp"
         path.write_text(
