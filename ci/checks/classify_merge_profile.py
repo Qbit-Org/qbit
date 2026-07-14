@@ -51,6 +51,10 @@ GITHUB_METADATA_PREFIXES = (
     ".github/repository-settings/",
     ".github/rulesets/",
 )
+OPERATOR_KEYS_PREFIXES = (
+    "contrib/keys/operator-keys/",
+    "contrib/guix/repo-templates/qbit-guix.sigs/operator-keys/",
+)
 
 
 @dataclass(frozen=True)
@@ -118,7 +122,7 @@ def is_release_policy_path(path: str) -> bool:
     return (
         path == "contrib/release-process/publish-local-release.sh"
         or path.startswith("ci/release/")
-        or path.startswith("contrib/keys/operator-keys/")
+        or any(path.startswith(prefix) for prefix in OPERATOR_KEYS_PREFIXES)
         or RELEASE_TRUST_DOC_RE.fullmatch(path) is not None
     )
 
@@ -201,7 +205,11 @@ def github_outputs(classification: Classification) -> dict[str, str]:
         "source_validation_required": bool_output(classification.profile == SOURCE_PROFILE),
         "changed_count": str(len(paths)),
         "touched_operator_keys": bool_output(
-            any(path.startswith("contrib/keys/operator-keys/") for path in paths)
+            any(
+                path.startswith(prefix)
+                for path in paths
+                for prefix in OPERATOR_KEYS_PREFIXES
+            )
         ),
         "touched_release_publish": bool_output(
             "contrib/release-process/publish-local-release.sh" in paths

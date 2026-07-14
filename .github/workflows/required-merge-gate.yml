@@ -54,6 +54,7 @@ jobs:
       public_docs_only: ${{ steps.classify.outputs.public_docs_only }}
       github_metadata_only: ${{ steps.classify.outputs.github_metadata_only }}
       source_validation_required: ${{ steps.classify.outputs.source_validation_required }}
+      touched_operator_keys: ${{ steps.classify.outputs.touched_operator_keys }}
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -113,6 +114,111 @@ jobs:
           python3 ci/checks/classify_merge_profile.py \
             --changed-files "${{ steps.changed-files.outputs.changed_files }}" \
             --github-output "$GITHUB_OUTPUT"
+
+  operator-key-policy-validation:
+    name: operator-key policy validation
+    needs: classify-changes
+    if: ${{ always() && needs.classify-changes.result == 'success' && needs.classify-changes.outputs.touched_operator_keys == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+
+      - name: Install policy validation dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gpg
+
+      - name: Validate current policy and transition approvals
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          BASE_REF: ${{ github.base_ref || github.event.merge_group.base_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+        run: |
+          set -euo pipefail
+
+          canonical_dir="contrib/keys/operator-keys"
+          mirror_dir="contrib/guix/repo-templates/qbit-guix.sigs/operator-keys"
+          validator_args=(
+            --operator-policy "${canonical_dir}/keys.json"
+            --operator-keys-dir "${canonical_dir}"
+            --operator-policy-mirror "${mirror_dir}/keys.json"
+            --operator-keys-dir-mirror "${mirror_dir}"
+            --require-public-key-files
+          )
+
+          base_commit=""
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            base_commit="${BASE_SHA}"
+          elif [[ "${EVENT_NAME}" == "merge_group" ]]; then
+            base_branch="${BASE_REF#refs/heads/}"
+            if [[ -n "${base_branch}" ]]; then
+              git fetch --no-tags --prune origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"
+              base_commit="$(git merge-base "origin/${base_branch}" HEAD)"
+            fi
+          elif [[ "${EVENT_NAME}" == "push" && -n "${BEFORE_SHA}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
+            base_commit="${BEFORE_SHA}"
+          elif git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+            base_commit="$(git rev-parse HEAD^)"
+          fi
+
+          policy_changed=true
+          if [[ -n "${base_commit}" ]] \
+            && git cat-file -e "${base_commit}:${canonical_dir}/keys.json" 2>/dev/null \
+            && git diff --quiet "${base_commit}" -- "${canonical_dir}/keys.json"; then
+            policy_changed=false
+          fi
+
+          if [[ "${policy_changed}" == false ]]; then
+            validator_args+=(--skip-policy-transition-validation)
+          elif [[ -n "${base_commit}" ]] \
+            && git cat-file -e "${base_commit}:${canonical_dir}/keys.json" 2>/dev/null; then
+            previous_root="${RUNNER_TEMP}/previous-operator-policy"
+            mkdir -p "${previous_root}"
+            git archive "${base_commit}" "${canonical_dir}" | tar -x -C "${previous_root}"
+            validator_args+=(
+              --previous-operator-policy "${previous_root}/${canonical_dir}/keys.json"
+            )
+          else
+            validator_args+=(--skip-policy-transition-validation)
+          fi
+
+          python3 ci/release/validate_key_metadata.py "${validator_args[@]}"
+
+      - name: Validate exact operator-key mirror
+        run: |
+          set -euo pipefail
+          PYTHONPATH=ci/release python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          from validate_builder_attestations import load_builder_policy, validate_builder_mirror
+
+          canonical_dir = Path("contrib/keys/operator-keys")
+          mirror_dir = Path("contrib/guix/repo-templates/qbit-guix.sigs/operator-keys")
+          release_lines = json.loads(
+              (canonical_dir / "keys.json").read_text(encoding="utf8")
+          )["release_lines"]
+
+          for release_line in sorted(release_lines):
+              policy = load_builder_policy(
+                  canonical_dir / "keys.json",
+                  canonical_dir,
+                  release_line,
+              )
+              validate_builder_mirror(
+                  policy,
+                  canonical_dir,
+                  mirror_dir / "keys.json",
+                  mirror_dir,
+                  release_line,
+              )
+              print(f"Exact operator-key mirror validated for {release_line}")
+          PY
 
   release-policy-validation:
     name: release-policy validation
@@ -531,6 +637,7 @@ jobs:
     name: 'Required Merge Gate'
     needs:
       - classify-changes
+      - operator-key-policy-validation
       - release-policy-validation
       - rpc-docs-validation
       - public-docs-validation
@@ -543,12 +650,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CLASSIFY_CHANGES_RESULT: ${{ needs.classify-changes.result }}
+          OPERATOR_KEY_POLICY_VALIDATION_RESULT: ${{ needs.operator-key-policy-validation.result }}
           VALIDATION_PROFILE: ${{ needs.classify-changes.outputs.profile }}
           RELEASE_POLICY_VALIDATION_RESULT: ${{ needs.release-policy-validation.result }}
           RPC_DOCS_VALIDATION_RESULT: ${{ needs.rpc-docs-validation.result }}
           PUBLIC_DOCS_VALIDATION_RESULT: ${{ needs.public-docs-validation.result }}
           GITHUB_METADATA_VALIDATION_RESULT: ${{ needs.github-metadata-validation.result }}
           SOURCE_VALIDATION_REQUIRED: ${{ needs.classify-changes.outputs.source_validation_required }}
+          TOUCHED_OPERATOR_KEYS: ${{ needs.classify-changes.outputs.touched_operator_keys }}
           REPOSITORY: ${{ github.repository }}
           SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
@@ -556,6 +665,12 @@ jobs:
 
           if [[ "${CLASSIFY_CHANGES_RESULT}" != "success" ]]; then
             echo "::error title=Required Merge Gate failed::Change classification result was ${CLASSIFY_CHANGES_RESULT}."
+            exit 1
+          fi
+
+          if [[ "${TOUCHED_OPERATOR_KEYS}" == "true" \
+            && "${OPERATOR_KEY_POLICY_VALIDATION_RESULT}" != "success" ]]; then
+            echo "::error title=Required Merge Gate failed::Operator-key policy validation result was ${OPERATOR_KEY_POLICY_VALIDATION_RESULT}."
             exit 1
           fi
 
