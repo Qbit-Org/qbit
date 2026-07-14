@@ -21,6 +21,14 @@
 
 BOOST_FIXTURE_TEST_SUITE(validation_tests, TestingSetup)
 
+BOOST_AUTO_TEST_CASE(fee_estimation_tip_age_boundary)
+{
+    static constexpr int64_t NOW{100'000};
+    BOOST_CHECK(IsBlockTimeCurrentForFeeEstimation(NOW - 20 * 60 + 1, NOW));
+    BOOST_CHECK(IsBlockTimeCurrentForFeeEstimation(NOW - 20 * 60, NOW));
+    BOOST_CHECK(!IsBlockTimeCurrentForFeeEstimation(NOW - 20 * 60 - 1, NOW));
+}
+
 BOOST_AUTO_TEST_CASE(signet_parse_tests)
 {
     ArgsManager signet_argsman;

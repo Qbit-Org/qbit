@@ -5,11 +5,21 @@
 #include <qt/test/modaloverlaytests.h>
 
 #include <chainparams.h>
+#include <qt/guiutil.h>
 #include <qt/modaloverlay.h>
 
 #include <QDateTime>
 #include <QLabel>
 #include <QTest>
+
+void ModalOverlayTests::blockTimeFreshnessBoundary()
+{
+    const QDateTime now{QDateTime::currentDateTime()};
+    QVERIFY(GUIUtil::IsBlockTimeFresh(now.addSecs(-599), now));
+    QVERIFY(!GUIUtil::IsBlockTimeFresh(now.addSecs(-600), now));
+    QVERIFY(!GUIUtil::IsBlockTimeFresh(now.addSecs(-601), now));
+    QVERIFY(GUIUtil::IsBlockTimeFresh(now.addSecs(1), now));
+}
 
 void ModalOverlayTests::headersPresyncProgressStaysVisible()
 {

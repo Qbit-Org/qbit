@@ -22,6 +22,7 @@
 #include <deploymentstatus.h>
 #include <interfaces/mining.h>
 #include <key_io.h>
+#include <logging.h>
 #include <net.h>
 #include <node/context.h>
 #include <node/miner.h>
@@ -83,6 +84,25 @@ UniValue P2MRValidationWeightForHeight(const Consensus::Params& consensus, int h
     result.pushKV("v2_active", v2_active);
     result.pushKV("v2_activation_height", consensus.nP2MRValidationWeightV2Height);
     return result;
+}
+
+UniValue FutureBlockTimeForHeight(const Consensus::Params& consensus, int height)
+{
+    UniValue result{UniValue::VOBJ};
+    result.pushKV("limit_seconds", GetMaxFutureBlockTime(consensus, height));
+    result.pushKV("v2_active", consensus.FutureBlockTimeV2ActiveAtHeight(height));
+    result.pushKV("v2_activation_height", consensus.nFutureBlockTimeV2Height);
+    return result;
+}
+
+void EnsureTemplateTimeIsValid(const CBlockHeader& block, const Consensus::Params& consensus, int height)
+{
+    const int64_t max_time{TicksSinceEpoch<std::chrono::seconds>(NodeClock::now()) + GetMaxFutureBlockTime(consensus, height)};
+    if (block.GetBlockTime() <= max_time) return;
+
+    LogWarning("Unable to create a block template at height %d: minimum timestamp %d exceeds maximum timestamp %d\n",
+               height, block.GetBlockTime(), max_time);
+    throw JSONRPCError(RPC_MISC_ERROR, strprintf("No valid block timestamp is currently available at height %d; median time past requires %d but the future-time limit permits at most %d", height, block.GetBlockTime(), max_time));
 }
 
 double EstimateHashPS(int lookup, int height, const CChain& active_chain, const HashrateWork work_filter)
@@ -822,6 +842,11 @@ static RPCHelpMan getblocktemplate()
                     {RPCResult::Type::BOOL, "v2_active", "Whether validation-weight-v2 applies to this template"},
                     {RPCResult::Type::NUM, "v2_activation_height", "First block using validation-weight-v2"},
                 }},
+                {RPCResult::Type::OBJ, "future_block_time", "Future-time rule for this template", {
+                    {RPCResult::Type::NUM, "limit_seconds", "Maximum seconds this template timestamp may exceed node time"},
+                    {RPCResult::Type::BOOL, "v2_active", "Whether the qbit v2 future-time limit applies to this template"},
+                    {RPCResult::Type::NUM, "v2_activation_height", "First block using the qbit v2 future-time limit"},
+                }},
                 {RPCResult::Type::STR_HEX, "signet_challenge", /*optional=*/true, "Only on signet"},
                 {RPCResult::Type::STR_HEX, "default_witness_commitment", /*optional=*/true, "a valid witness commitment for the unmodified block template"},
             }},
@@ -1001,6 +1026,7 @@ static RPCHelpMan getblocktemplate()
 
     // Update nTime
     UpdateTime(&block, consensusParams, pindexPrev);
+    EnsureTemplateTimeIsValid(block, consensusParams, pindexPrev->nHeight + 1);
     block.nNonce = 0;
 
     // NOTE: If at some point we support pre-segwit miners post-segwit-activation, this needs to take segwit support into consideration
@@ -1140,6 +1166,7 @@ static RPCHelpMan getblocktemplate()
     result.pushKV("bits", strprintf("%08x", block.nBits));
     result.pushKV("height", (int64_t)(pindexPrev->nHeight+1));
     result.pushKV("p2mr_validation_weight", P2MRValidationWeightForHeight(consensusParams, pindexPrev->nHeight + 1));
+    result.pushKV("future_block_time", FutureBlockTimeForHeight(consensusParams, pindexPrev->nHeight + 1));
 
     if (consensusParams.signet_blocks) {
         result.pushKV("signet_challenge", HexStr(consensusParams.signet_challenge));
@@ -1377,6 +1404,11 @@ static RPCHelpMan createauxblock()
                     {RPCResult::Type::BOOL, "v2_active", "Whether validation-weight-v2 applies to this candidate"},
                     {RPCResult::Type::NUM, "v2_activation_height", "First block using validation-weight-v2"},
                 }},
+                {RPCResult::Type::OBJ, "future_block_time", "Future-time rule for this candidate", {
+                    {RPCResult::Type::NUM, "limit_seconds", "Maximum seconds this candidate timestamp may exceed node time"},
+                    {RPCResult::Type::BOOL, "v2_active", "Whether the qbit v2 future-time limit applies to this candidate"},
+                    {RPCResult::Type::NUM, "v2_activation_height", "First block using the qbit v2 future-time limit"},
+                }},
                 {RPCResult::Type::STR, "commitmentorder", "The AuxPoW commitment byte order required for this candidate: \"internal\" or \"display\"."},
                 {RPCResult::Type::NUM, "commitmentactivationheight", "The height at which display byte order becomes active."},
                 {RPCResult::Type::STR_HEX, "target", "The expanded target for the candidate block."},
@@ -1430,6 +1462,7 @@ static RPCHelpMan createauxblock()
     CHECK_NONFATAL(consensusParams.nAuxpowChainId <= std::numeric_limits<uint16_t>::max());
     block.nVersion = MakeVersion(static_cast<uint16_t>(consensusParams.nAuxpowChainId), /*auxpow=*/true, block.GetVersionBits());
     UpdateTime(&block, consensusParams, pindexPrev);
+    EnsureTemplateTimeIsValid(block, consensusParams, height);
     block.nBits = GetNextWorkRequired(pindexPrev, &block, consensusParams);
     block.nNonce = 0;
 
@@ -1448,6 +1481,7 @@ static RPCHelpMan createauxblock()
     result.pushKV("bits", strprintf("%08x", block.nBits));
     result.pushKV("height", height);
     result.pushKV("p2mr_validation_weight", P2MRValidationWeightForHeight(consensusParams, height));
+    result.pushKV("future_block_time", FutureBlockTimeForHeight(consensusParams, height));
     result.pushKV("commitmentorder", display_commitment ? "display" : "internal");
     result.pushKV("commitmentactivationheight", consensusParams.nAuxpowDisplayCommitmentHeight);
     result.pushKV("target", hash_target.GetHex());

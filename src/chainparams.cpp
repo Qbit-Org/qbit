@@ -76,6 +76,8 @@ void ReadRegTestArgs(const ArgsManager& args, CChainParams::RegTestOptions& opti
             options.p2mr_activation_height = *height;
         } else if (deployment_name == "p2mrweightv2") {
             options.p2mr_validation_weight_v2_height = *height;
+        } else if (deployment_name == "futuretime") {
+            options.future_block_time_v2_height = *height;
         } else if (const auto buried_deployment = GetBuriedDeployment(deployment_name)) {
             options.activation_heights[*buried_deployment] = *height;
         } else {

@@ -4,6 +4,7 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 from test_framework.blocktools import (
+    MAX_FUTURE_BLOCK_TIME,
     NORMAL_GBT_REQUEST_PARAMS,
     create_block,
     create_coinbase,
@@ -106,7 +107,8 @@ class MiningAsertTimestampEdgesTest(BitcoinTestFramework):
         parent_hash = node.getbestblockhash()
         parent = node.getblock(parent_hash)
         parent_height = node.getblockcount()
-        future_time = parent["mediantime"] + 1200
+        future_time = parent["mediantime"] + MAX_FUTURE_BLOCK_TIME
+        node.setmocktime(future_time - MAX_FUTURE_BLOCK_TIME)
         future_parent = self.make_block(parent_hash, parent_height + 1, future_time)
         assert_equal(node.submitblock(future_parent.serialize().hex()), None)
         node.waitforblockheight(parent_height + 1)
@@ -114,7 +116,7 @@ class MiningAsertTimestampEdgesTest(BitcoinTestFramework):
         self.log.info("Out-of-order timestamp vs parent is accepted when still above MTP")
         current_parent_hash = node.getbestblockhash()
         current_parent = node.getblock(current_parent_hash)
-        out_of_order_time = max(current_parent["mediantime"] + 1, future_time - 600)
+        out_of_order_time = max(current_parent["mediantime"] + 1, future_time - MAX_FUTURE_BLOCK_TIME // 2)
         assert out_of_order_time < future_time
 
         child_height = node.getblockcount() + 1

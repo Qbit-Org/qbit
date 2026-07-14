@@ -100,6 +100,7 @@ BASE_SCRIPTS = [
     'feature_auxpow_commitment_activation.py',
     'feature_cadence.py',
     'feature_cadence_activation.py',
+    'feature_future_block_time_activation.py',
     'feature_integration_cadence.py',
     'feature_p2mr_activation.py',
     'feature_p2mr_weight_activation.py',

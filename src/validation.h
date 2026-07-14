@@ -1404,4 +1404,7 @@ bool IsBIP30Unspendable(const uint256& block_hash, int block_height);
 /** Return whether any transaction in the block carries witness data. */
 bool HasAnyWitnessData(const CBlock& block);
 
+/** Return whether a tip timestamp is recent enough to learn fee estimates. */
+bool IsBlockTimeCurrentForFeeEstimation(int64_t block_time, int64_t now);
+
 #endif // QBIT_VALIDATION_H

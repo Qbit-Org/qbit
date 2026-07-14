@@ -121,6 +121,8 @@ struct Params {
     int P2MRHeight{0};
     /** Block height at which P2MR validation weight uses the serialized-signature marginal cost. */
     int nP2MRValidationWeightV2Height{std::numeric_limits<int>::max()};
+    /** Block height at which the maximum future block time is reduced to the qbit v2 limit. */
+    int nFutureBlockTimeV2Height{std::numeric_limits<int>::max()};
     /** Block height at which restricted-output mode also accepts the reserved outer witness namespace (v3..v16); set to 0 for a launch baseline, or max int to keep it inactive. */
     int nOuterReservedWitnessHeight{std::numeric_limits<int>::max()};
     /** Don't warn about unknown BIP 9 activations below this height.
@@ -155,6 +157,7 @@ struct Params {
     bool AuxpowDisplayCommitmentActiveAtHeight(int height) const { return height >= nAuxpowDisplayCommitmentHeight; }
     bool OuterReservedWitnessActiveAtHeight(int height) const { return height >= nOuterReservedWitnessHeight; }
     bool P2MRValidationWeightV2ActiveAtHeight(int height) const { return height >= nP2MRValidationWeightV2Height; }
+    bool FutureBlockTimeV2ActiveAtHeight(int height) const { return height >= nFutureBlockTimeV2Height; }
     int64_t DifficultyAdjustmentInterval() const { return nPowTargetTimespan / nPowTargetSpacing; }
     /** The best chain should have at least this much work */
     uint256 nMinimumChainWork;

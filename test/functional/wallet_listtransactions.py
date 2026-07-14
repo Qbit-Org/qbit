@@ -9,7 +9,7 @@ import time
 import os
 import shutil
 
-from test_framework.blocktools import MAX_FUTURE_BLOCK_TIME
+from test_framework.blocktools import TIMESTAMP_WINDOW
 from test_framework.descriptors import descsum_create
 from test_framework.messages import (
     COIN,
@@ -354,7 +354,7 @@ class ListTransactionsTest(BitcoinTestFramework):
             if confirm:
                 self.generate(self.nodes[0], 1, sync_fun=self.no_op)
                 # Mock time forward and generate blocks so that the import does not rescan the transaction
-                self.nodes[0].setmocktime(int(time.time()) + MAX_FUTURE_BLOCK_TIME + 1)
+                self.nodes[0].setmocktime(int(time.time()) + TIMESTAMP_WINDOW + 1)
                 self.generate(self.nodes[0], 10, sync_fun=self.no_op)
 
             import_res = wallet.importdescriptors([{"desc": descriptor, "timestamp": "now"}])

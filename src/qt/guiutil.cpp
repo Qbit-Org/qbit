@@ -12,6 +12,7 @@
 
 #include <addresstype.h>
 #include <base58.h>
+#include <chain.h>
 #include <chainparams.h>
 #include <common/args.h>
 #include <interfaces/node.h>
@@ -96,6 +97,11 @@ QString dateTimeStr(const QDateTime &date)
 QString dateTimeStr(qint64 nTime)
 {
     return dateTimeStr(QDateTime::fromSecsSinceEpoch(nTime));
+}
+
+bool IsBlockTimeFresh(const QDateTime& block_date, const QDateTime& current_date)
+{
+    return block_date.secsTo(current_date) < MAX_BLOCK_TIME_GAP;
 }
 
 QFont fixedPitchFont(bool use_embedded_font)

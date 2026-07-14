@@ -178,7 +178,7 @@ void ModalOverlay::renderLatestTip()
     QDateTime currentDate = QDateTime::currentDateTime();
     const qint64 current_time_msecs{currentDate.toMSecsSinceEpoch()};
     const bool incomplete_sync{
-        blockDate.secsTo(currentDate) >= MAX_BLOCK_TIME_GAP ||
+        !GUIUtil::IsBlockTimeFresh(blockDate, currentDate) ||
         (bestHeaderDate.isValid() && bestHeaderHeight > count)};
     const QString percentage_progress{GUIUtil::formatSyncPercentage(nVerificationProgress, /*decimals=*/2, incomplete_sync) + "%"};
     const bool update_progress_metrics{

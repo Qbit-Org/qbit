@@ -63,6 +63,9 @@ namespace GUIUtil
     QString dateTimeStr(const QDateTime &datetime);
     QString dateTimeStr(qint64 nTime);
 
+    /** Whether a block timestamp is recent enough for the GUI to show a synced state. */
+    bool IsBlockTimeFresh(const QDateTime& block_date, const QDateTime& current_date);
+
     // Return a monospace font
     QFont fixedPitchFont(bool use_embedded_font = false);
 
