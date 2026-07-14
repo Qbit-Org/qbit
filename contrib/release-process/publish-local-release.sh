@@ -50,13 +50,14 @@ Release policy:
 
 Release metadata:
   --notes-file FILE                 Release notes; otherwise generate notes.
-  --release-name NAME               Default: qbit <TAG>.
+  --release-name NAME               Default for a new draft: qbit <TAG>.
   --prerelease                      Mark the release as a prerelease.
   --no-prerelease                   Explicitly clear the prerelease flag.
-  --make-latest MODE                true, false, or auto.
+  --make-latest MODE                true, false, or auto (GitHub legacy mode).
 
 For a new draft, prerelease and make-latest default to false. When resuming a
-draft, omitted metadata options preserve its current prerelease and latest state.
+draft, omitted metadata options preserve its current title, prerelease, and
+latest state.
 
 Publication mode (mutually exclusive):
   --create-draft                    Upload and verify assets, then leave a draft.
@@ -201,6 +202,70 @@ remote_commit_on_branch() {
     esac
 }
 
+remote_tag_pin_failure() {
+    local phase="$1"
+    shift
+    if [ "$phase" = post-publication ]; then
+        die "$*" "Release $TAG may already be immutable. Stop distribution," \
+            "preserve the publisher transcript and observed tag values, and follow" \
+            "the immutable-publication recovery procedure in doc/release/release-process.md."
+    fi
+    die "$*"
+}
+
+verify_remote_tag_pin() {
+    local phase="$1"
+    local remote_ref
+    local remote_tag_type
+    local remote_tag_sha
+    local remote_tag_query
+    local remote_tag_info
+    local remote_tag_target
+    local remote_target_type
+    local remote_verified
+    local remote_verification_reason
+    local remote_verified_at
+
+    remote_ref="$(
+        gh api "repos/$GH_REPO_PATH/git/ref/tags/$TAG" \
+            --jq '.object.type + " " + .object.sha'
+    )" || remote_tag_pin_failure "$phase" \
+        "Could not resolve remote tag $TAG during $phase verification"
+    remote_tag_type="${remote_ref%% *}"
+    remote_tag_sha="${remote_ref#* }"
+    [ "$remote_tag_type" = tag ] \
+        || remote_tag_pin_failure "$phase" \
+            "Remote tag $TAG must be annotated during $phase verification, got $remote_tag_type"
+    [ "$(lowercase "$remote_tag_sha")" = "$(lowercase "$TAG_OBJECT")" ] \
+        || remote_tag_pin_failure "$phase" \
+            "Remote tag object $remote_tag_sha does not match pinned tag object $TAG_OBJECT during $phase verification"
+
+    remote_tag_query='[.object.sha, .object.type, '
+    remote_tag_query+='((.verification.verified // false) | tostring), '
+    remote_tag_query+='(.verification.reason // "unknown"), '
+    remote_tag_query+='(.verification.verified_at // "")] | @tsv'
+    remote_tag_info="$(
+        gh api "repos/$GH_REPO_PATH/git/tags/$TAG_OBJECT" \
+            --jq "$remote_tag_query"
+    )" || remote_tag_pin_failure "$phase" \
+        "Could not inspect pinned remote tag object $TAG_OBJECT during $phase verification"
+    IFS=$'\t' read -r remote_tag_target remote_target_type remote_verified \
+        remote_verification_reason remote_verified_at <<< "$remote_tag_info"
+    [ "$remote_target_type" = commit ] \
+        || remote_tag_pin_failure "$phase" \
+            "Remote tag $TAG must directly target a commit during $phase verification, got $remote_target_type"
+    [ "$(lowercase "$remote_tag_target")" = "$(lowercase "$TAG_TARGET")" ] \
+        || remote_tag_pin_failure "$phase" \
+            "Remote tag target $remote_tag_target does not match pinned tag target" \
+            "$TAG_TARGET during $phase verification"
+    [ "$remote_verified" = true ] && [ "$remote_verification_reason" = valid ] \
+        || remote_tag_pin_failure "$phase" \
+            "Remote tag $TAG is not a GitHub-verified signed tag with exact valid" \
+            "status during $phase verification (verified=$remote_verified" \
+            "reason=$remote_verification_reason)"
+    msg "Remote tag pin verified during $phase${remote_verified_at:+ at $remote_verified_at}"
+}
+
 release_view() {
     local errors="$WORK_DIR/release-view-errors"
     local response
@@ -284,8 +349,21 @@ wait_for_published_immutable_release() {
 
 prepare_release_notes() {
     if [ -n "$NOTES_FILE" ]; then
-        EFFECTIVE_NOTES_FILE="$NOTES_FILE"
-        msg "Using explicit release notes from $NOTES_FILE"
+        EFFECTIVE_NOTES_FILE="$WORK_DIR/explicit-release-notes.md"
+        python3 - "$NOTES_FILE" "$EFFECTIVE_NOTES_FILE" <<'PY'
+import sys
+from pathlib import Path
+
+source = Path(sys.argv[1])
+destination = Path(sys.argv[2])
+content = source.read_bytes()
+try:
+    content.decode("utf8")
+except UnicodeDecodeError as error:
+    raise SystemExit(f"Explicit release notes are not valid UTF-8: {error}") from error
+destination.write_bytes(content)
+PY
+        msg "Snapshotted explicit release notes from $NOTES_FILE"
         return
     fi
 
@@ -435,6 +513,8 @@ P2MR_V1_ORACLE_REPORT=""
 P2MR_V1_INTEGRATION_MATRIX=""
 NOTES_FILE=""
 RELEASE_NAME=""
+RELEASE_NAME_EXPLICIT=0
+RELEASE_CREATED_THIS_RUN=0
 REQUIRE_PHOTON=0
 ALLOW_UNSIGNED_PLATFORM_ARTIFACTS=0
 ALLOW_CODESIGNING_ARTIFACTS=0
@@ -505,6 +585,7 @@ while [ "$#" -gt 0 ]; do
         --release-name)
             require_value "$1" "${2:-}"
             RELEASE_NAME="$2"
+            RELEASE_NAME_EXPLICIT=1
             shift 2
             ;;
         --require-photon) REQUIRE_PHOTON=1; shift ;;
@@ -677,31 +758,7 @@ remote_commit "$GUIX_SIGS_GH_REPO_PATH" "$GUIX_SIGS_REF" "qbit-guix.sigs commit"
 remote_commit_on_branch "$GUIX_SIGS_GH_REPO_PATH" "$GUIX_SIGS_REF" \
     "$GUIX_SIGS_BRANCH" "qbit-guix.sigs commit"
 
-REMOTE_REF="$(gh api "repos/$GH_REPO_PATH/git/ref/tags/$TAG" --jq '.object.type + " " + .object.sha')" \
-    || die "Could not resolve remote tag $TAG"
-REMOTE_TAG_TYPE="${REMOTE_REF%% *}"
-REMOTE_TAG_SHA="${REMOTE_REF#* }"
-[ "$REMOTE_TAG_TYPE" = tag ] \
-    || die "Remote tag $TAG must be annotated, got $REMOTE_TAG_TYPE"
-[ "$(lowercase "$REMOTE_TAG_SHA")" = "$(lowercase "$TAG_OBJECT")" ] \
-    || die "Remote tag object $REMOTE_TAG_SHA does not match local tag object $TAG_OBJECT"
-REMOTE_TAG_QUERY='[.object.sha, .object.type, '
-REMOTE_TAG_QUERY+='((.verification.verified // false) | tostring), '
-REMOTE_TAG_QUERY+='(.verification.reason // "unknown"), '
-REMOTE_TAG_QUERY+='(.verification.verified_at // "")] | @tsv'
-REMOTE_TAG_INFO="$(
-    gh api "repos/$GH_REPO_PATH/git/tags/$REMOTE_TAG_SHA" \
-        --jq "$REMOTE_TAG_QUERY"
-)" || die "Could not inspect remote tag $TAG"
-IFS=$'\t' read -r REMOTE_TAG_TARGET REMOTE_TARGET_TYPE REMOTE_VERIFIED \
-    REMOTE_VERIFICATION_REASON REMOTE_VERIFIED_AT <<< "$REMOTE_TAG_INFO"
-[ "$REMOTE_TARGET_TYPE" = commit ] \
-    || die "Remote tag $TAG must directly target a commit, got $REMOTE_TARGET_TYPE"
-[ "$REMOTE_VERIFIED" = true ] \
-    || die "Remote tag $TAG is not a GitHub-verified signed tag (reason: $REMOTE_VERIFICATION_REASON)"
-[ "$(lowercase "$REMOTE_TAG_TARGET")" = "$(lowercase "$TAG_TARGET")" ] \
-    || die "Remote tag target $REMOTE_TAG_TARGET does not match local tag target $TAG_TARGET"
-msg "Remote tag is GitHub-verified${REMOTE_VERIFIED_AT:+ at $REMOTE_VERIFIED_AT}"
+verify_remote_tag_pin initial
 
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/qbit-release-publish.XXXXXX")"
 trap 'rm -rf "$WORK_DIR"' EXIT
@@ -709,6 +766,7 @@ VALIDATION_OUTPUT="$WORK_DIR/validation-output.env"
 LOCAL_ASSET_MANIFEST="$WORK_DIR/local-assets.tsv"
 REMOTE_ASSET_MANIFEST="$WORK_DIR/remote-assets.tsv"
 : > "$VALIDATION_OUTPUT"
+[ -z "$NOTES_FILE" ] || prepare_release_notes
 
 if [ "$P2MR_CONFORMANCE_REQUESTED" -eq 1 ]; then
     msg "Validating qbit P2MR v1 release conformance"
@@ -896,6 +954,7 @@ if RELEASE_VIEW_OUTPUT="$(release_view)"; then
         require_immutable_release
         write_remote_asset_manifest "$REMOTE_ASSET_MANIFEST"
         compare_asset_manifests exact "$REMOTE_ASSET_MANIFEST"
+        verify_remote_tag_pin post-publication
         msg "Published release assets exactly match local names and SHA256 digests"
         msg "Validation-only mode complete: $RELEASE_URL (immutable=true)"
         exit 0
@@ -913,7 +972,7 @@ else
     fi
 fi
 
-prepare_release_notes
+[ -n "${EFFECTIVE_NOTES_FILE:-}" ] || prepare_release_notes
 
 create_args=(
     gh release create "$TAG"
@@ -951,6 +1010,7 @@ if [ "$MODE" = validate ]; then
 fi
 
 if [ -z "$RELEASE_ID" ]; then
+    RELEASE_CREATED_THIS_RUN=1
     msg "Creating draft release $TAG"
     "${create_args[@]}"
     require_release_view
@@ -976,33 +1036,54 @@ msg "Draft release assets exactly match local names and SHA256 digests"
 edit_args=(
     gh release edit "$TAG"
     --repo "$GH_REPO"
-    --verify-tag
-    --title "$RELEASE_NAME"
     --notes-file "$EFFECTIVE_NOTES_FILE"
 )
+[ "$RELEASE_NAME_EXPLICIT" -eq 0 ] || edit_args+=(--title "$RELEASE_NAME")
 case "$PRERELEASE" in
     true) edit_args+=(--prerelease) ;;
     false) edit_args+=(--prerelease=false) ;;
     preserve) ;;
 esac
-case "$MAKE_LATEST" in
-    true) edit_args+=(--latest) ;;
-    false) edit_args+=(--latest=false) ;;
-    preserve|auto) ;;
-esac
-
+if [ "$MODE" = draft ]; then
+    case "$MAKE_LATEST" in
+        true) edit_args+=(--latest) ;;
+        false) edit_args+=(--latest=false) ;;
+        preserve|auto) ;;
+    esac
+fi
 msg "Updating verified draft metadata for $TAG"
 "${edit_args[@]}" --draft
+if [ "$MODE" = draft ] && [ "$MAKE_LATEST" = auto ]; then
+    gh api "repos/$GH_REPO_PATH/releases/$RELEASE_ID" \
+        --method PATCH -f make_latest=legacy >/dev/null \
+        || die "Could not apply automatic latest-release policy to draft $TAG"
+fi
 verify_release_notes \
     || die "Draft release notes do not match the expected notes"
 msg "Draft release notes exactly match the expected notes"
 
 if [ "$MODE" = publish ]; then
+    publish_args=(
+        gh api "repos/$GH_REPO_PATH/releases/$RELEASE_ID"
+        --method PATCH
+        -F draft=false
+    )
+    case "$MAKE_LATEST" in
+        true|false) publish_args+=(-f "make_latest=$MAKE_LATEST") ;;
+        auto) publish_args+=(-f make_latest=legacy) ;;
+        preserve)
+            [ "$RELEASE_CREATED_THIS_RUN" -eq 0 ] \
+                || publish_args+=(-f make_latest=false)
+            ;;
+    esac
     msg "Publishing release $TAG"
-    "${edit_args[@]}" --draft=false
+    verify_remote_tag_pin pre-publication
+    "${publish_args[@]}" >/dev/null \
+        || die "Could not publish release $TAG"
     wait_for_published_immutable_release
     wait_for_exact_assets \
         || die "Published immutable release assets do not exactly match the validated upload set"
+    verify_remote_tag_pin post-publication
     msg "Published immutable release assets exactly match local names and SHA256 digests"
     msg "Published immutable release: $RELEASE_URL"
 else

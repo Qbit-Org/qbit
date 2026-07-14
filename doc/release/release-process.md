@@ -61,7 +61,9 @@ coordinator-held artifacts; GitHub Actions does not publish releases.
 
 The publisher validates:
 
-- the release tag is a signed annotated tag that GitHub verifies
+- the release tag ref resolves to the exact locally pinned annotated-tag object,
+  that object directly targets the pinned commit, and GitHub reports its
+  signature verification as exactly `verified=true` and `reason=valid`
 - the tag signer is accepted by the qbit release key policy
 - `trusted_release_ref` is a full public commit SHA and is not the tag object or
   tag target commit, and the tag target is its ancestor
@@ -79,6 +81,8 @@ The publisher validates:
   the validator-approved upload set before publication
 - the final published release is immutable, and its locked asset names and
   GitHub-computed SHA256 digests still exactly match the validated upload set
+- the immutable release locked the same signed tag object and target checked
+  before validation and immediately before publication
 
 Testnet posture evidence is mandatory for `release_line=testnet`; the publisher
 fails closed when `--testnet-posture-evidence` is missing.
@@ -191,27 +195,36 @@ the publisher never uses replacement uploads and never modifies an existing
 published release.
 
 Release notes follow the same policy for new and resumed drafts. When
-`--notes-file` is provided, its exact UTF-8 contents are authoritative. When it
-is omitted, the publisher obtains a body from GitHub's generate-release-notes
-API and uses that body as the authoritative notes for the invocation. The
-publisher replaces any existing draft body, fetches it back, and requires an
-exact match before publication. A draft body that cannot be corrected and
-verified remains unpublished. Manual changes to a resumed draft are therefore
-not preserved; record curated notes in a file and pass `--notes-file`.
+`--notes-file` is provided, the publisher validates its UTF-8 encoding and
+snapshots its exact bytes into the invocation work directory before the
+long-running validators execute. Later changes to the source file cannot alter
+the release body. When the option is omitted, the publisher obtains a body from
+GitHub's generate-release-notes API and snapshots that generated body for the
+invocation. The publisher replaces any existing draft body, fetches it back,
+and requires an exact match before publication. A draft body that cannot be
+corrected and verified remains unpublished. Manual changes to a resumed draft
+are therefore not preserved; record curated notes in a file and pass
+`--notes-file`.
 
-New drafts default to non-prerelease and `make-latest=false`. When resuming a
-draft, omitted metadata options preserve its existing prerelease and latest
-state. Use `--prerelease` or `--no-prerelease` and an explicit `--make-latest`
-mode to change those values during a resumed operation.
+New drafts default to the title `qbit <TAG>`, non-prerelease, and
+`make-latest=false`. When resuming a draft, omitting `--release-name` preserves
+its current title, and omitted prerelease and latest options preserve their
+current state. Use `--release-name`, `--prerelease` or `--no-prerelease`, and an
+explicit `--make-latest` mode to change those values. `--make-latest auto` maps
+to GitHub's `make_latest=legacy` behavior, which selects the latest release by
+creation date and semantic version rather than preserving the prior setting.
 
 Draft releases are expected to remain mutable while their assets are assembled.
 The publisher does not require `isImmutable=true` until `--publish` transitions
-the draft to a published release. It then polls the final release metadata for a
-bounded period and fails unless GitHub reports both `isDraft=false` and
-`isImmutable=true`, then polls the locked asset inventory and digests for a
-bounded period to tolerate GitHub API propagation. Validation-only mode likewise
-rejects an existing published release that is not immutable or whose immutable
-state is missing. Release discovery uses a fully paginated listing so matching
+the draft to a published release. The exact remote tag ref, annotated-tag object,
+commit target, and GitHub signature verification are checked before validation
+and again immediately before that transition. The publisher then polls the
+final release metadata for a bounded period and fails unless GitHub reports both
+`isDraft=false` and `isImmutable=true`, polls the locked asset inventory and
+digests for API propagation, and performs the exact tag check a final time before
+reporting success. Validation-only mode likewise rejects an existing published
+release that is not immutable, whose immutable state is missing, or whose final
+tag pin differs. Release discovery uses a fully paginated listing so matching
 drafts remain resumable. A release is considered absent only after that listing
 succeeds without a matching tag; authentication, API, and other lookup failures
 stop validation rather than skipping the remote release checks.
@@ -223,6 +236,21 @@ release immutable. When `--repo OWNER/REPO` overrides the default repository,
 that target repository must independently satisfy the same policy. A publisher
 failure after a mutable publication requires manual release remediation; rerunning
 the publisher does not retrofit immutability or modify the published release.
+
+### Immutable-publication recovery
+
+A final tag-pin failure can occur after GitHub has already made the release
+immutable. The publisher exits unsuccessfully and identifies the expected and
+observed tag values; it cannot roll the publication back. Stop distributing the
+release and preserve the complete publisher transcript, release URL and ID,
+expected and observed tag object and target, and repository audit evidence. Do
+not rerun the publisher expecting it to repair or replace the immutable release.
+
+Handle the event through the release-integrity incident process. If policy calls
+for removing the incorrect immutable release, remember that GitHub does not
+allow its tag name to be reused afterward. Prepare a new version, create and
+sign a new annotated tag, repeat the complete validation and publication flow,
+and publish a correction notice that identifies the superseded release.
 
 Unsigned platform or public codesigning payload waivers require the explicit
 `--allow-unsigned-platform-artifacts` or `--allow-codesigning-artifacts` flags.

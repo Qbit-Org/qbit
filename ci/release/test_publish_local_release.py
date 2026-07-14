@@ -98,21 +98,64 @@ log = Path(os.environ["FAKE_GH_LOG"])
 with log.open("a", encoding="utf8") as output:
     output.write(" ".join(args) + "\n")
 
+
+def sequence_value(name, fallback, index):
+    values = os.environ.get(name, fallback).split(",")
+    return values[min(index, len(values) - 1)]
+
+
+def next_counter(name):
+    path = state / name
+    value = int(path.read_text(encoding="utf8")) if path.exists() else 0
+    path.write_text(str(value + 1), encoding="utf8")
+    return value
+
+
+def api_fields():
+    fields = {}
+    for index, value in enumerate(args[:-1]):
+        if value in {"-f", "-F", "--raw-field", "--field"}:
+            key, field_value = args[index + 1].split("=", 1)
+            fields[key] = field_value
+    return fields
+
+
 if args[:2] == ["auth", "status"]:
     raise SystemExit(0)
 
 if args and args[0] == "api":
     endpoint = next(value for value in args[1:] if value.startswith("repos/"))
     if "/git/ref/tags/" in endpoint:
-        print("tag " + os.environ["FAKE_GH_TAG_OBJECT"])
+        index = next_counter("tag-ref-read-count")
+        moved_tag_path = state / "moved-tag-object"
+        if moved_tag_path.exists():
+            tag_object = moved_tag_path.read_text(encoding="utf8")
+        else:
+            tag_object = sequence_value(
+                "FAKE_GH_TAG_OBJECT_SEQUENCE",
+                os.environ["FAKE_GH_TAG_OBJECT"],
+                index,
+            )
+        print("tag " + tag_object)
     elif "/git/tags/" in endpoint:
+        index = next_counter("tag-object-read-count")
         print(
             "\t".join(
                 [
-                    os.environ["FAKE_GH_TAG_TARGET"],
+                    sequence_value(
+                        "FAKE_GH_TAG_TARGET_SEQUENCE",
+                        os.environ["FAKE_GH_TAG_TARGET"],
+                        index,
+                    ),
                     "commit",
-                    os.environ.get("FAKE_GH_VERIFIED", "true"),
-                    "valid",
+                    sequence_value(
+                        "FAKE_GH_VERIFIED_SEQUENCE",
+                        os.environ.get("FAKE_GH_VERIFIED", "true"),
+                        index,
+                    ),
+                    sequence_value(
+                        "FAKE_GH_VERIFICATION_REASON_SEQUENCE", "valid", index
+                    ),
                     "2026-01-01T00:00:00Z",
                 ]
             )
@@ -142,6 +185,13 @@ if args and args[0] == "api":
             if draft:
                 immutable = os.environ.get("FAKE_GH_DRAFT_IMMUTABLE", "false")
             else:
+                moved_tag_object = os.environ.get(
+                    "FAKE_GH_TAG_OBJECT_DURING_IMMUTABLE_POLL", ""
+                )
+                if moved_tag_object:
+                    (state / "moved-tag-object").write_text(
+                        moved_tag_object, encoding="utf8"
+                    )
                 sequence = os.environ.get("FAKE_GH_IMMUTABLE_SEQUENCE", "true").split(",")
                 counter_path = state / "immutable-view-count"
                 counter = int(counter_path.read_text(encoding="utf8")) if counter_path.exists() else 0
@@ -193,10 +243,24 @@ if args and args[0] == "api":
                     print(line.split("\t", 1)[0] + "\t")
             else:
                 print(asset_text, end="")
+    elif endpoint.endswith("/releases/1") and "PATCH" in args:
+        fields = api_fields()
+        if fields.get("draft") == "false":
+            (state / "release-state").write_text("published\n", encoding="utf8")
+        if "make_latest" in fields:
+            (state / "latest-mode").write_text(
+                fields["make_latest"], encoding="utf8"
+            )
+            (state / "latest-state").write_text(
+                fields["make_latest"], encoding="utf8"
+            )
+        print(json.dumps({"id": 1, "draft": fields.get("draft") != "false"}))
     elif endpoint.endswith("/releases/1"):
         body_path = state / "release-body"
         body = body_path.read_text(encoding="utf8") if body_path.exists() else ""
-        print(json.dumps({"body": body}))
+        title_path = state / "release-title"
+        title = title_path.read_text(encoding="utf8") if title_path.exists() else ""
+        print(json.dumps({"body": body, "name": title}))
     else:
         print("unsupported fake gh api endpoint: " + endpoint, file=sys.stderr)
         raise SystemExit(2)
@@ -209,6 +273,8 @@ if args[:2] == ["release", "create"]:
     (state / "release-body").write_text(
         notes_file.read_text(encoding="utf8"), encoding="utf8"
     )
+    title = args[args.index("--title") + 1]
+    (state / "release-title").write_text(title, encoding="utf8")
     prerelease = "true" if "--prerelease" in args else "false"
     latest = "true" if "--latest" in args else "false"
     (state / "prerelease-state").write_text(prerelease, encoding="utf8")
@@ -231,6 +297,9 @@ if args[:2] == ["release", "edit"]:
         (state / "release-body").write_text(
             notes_file.read_text(encoding="utf8"), encoding="utf8"
         )
+    if "--title" in args:
+        title = args[args.index("--title") + 1]
+        (state / "release-title").write_text(title, encoding="utf8")
     if "--draft=false" in args:
         (state / "release-state").write_text("published\n", encoding="utf8")
     if "--prerelease" in args:
@@ -279,6 +348,9 @@ def option(name):
 
 artifacts = Path(option("--artifacts-dir"))
 output_path = Path(option("--github-output"))
+notes_to_mutate = os.environ.get("FAKE_MUTATE_NOTES_FILE")
+if notes_to_mutate:
+    Path(notes_to_mutate).write_text("mutated after snapshot\n", encoding="utf8")
 files = sorted(path.resolve() for path in artifacts.iterdir() if path.is_file())
 with output_path.open("a", encoding="utf8") as output:
     output.write(f"file_count={len(files)}\n")
@@ -375,6 +447,12 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         release_lookup_error: bool = False,
         published_asset_lag: int = 0,
         can_push: bool = True,
+        tag_object_sequence: tuple[str, ...] | None = None,
+        tag_target_sequence: tuple[str, ...] | None = None,
+        verified_sequence: tuple[bool, ...] | None = None,
+        verification_reason_sequence: tuple[str, ...] | None = None,
+        tag_object_during_immutable_poll: str | None = None,
+        mutate_notes_file: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = dict(os.environ)
         env["PATH"] = f"{self.bin_dir}{os.pathsep}{env['PATH']}"
@@ -386,6 +464,22 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
                 "FAKE_GH_TAG_OBJECT": self.tag_object,
                 "FAKE_GH_TAG_TARGET": self.tag_target,
                 "FAKE_GH_VERIFIED": str(verified).lower(),
+                "FAKE_GH_TAG_OBJECT_SEQUENCE": ",".join(
+                    tag_object_sequence or (self.tag_object,)
+                ),
+                "FAKE_GH_TAG_TARGET_SEQUENCE": ",".join(
+                    tag_target_sequence or (self.tag_target,)
+                ),
+                "FAKE_GH_VERIFIED_SEQUENCE": ",".join(
+                    str(value).lower()
+                    for value in (verified_sequence or (verified,))
+                ),
+                "FAKE_GH_VERIFICATION_REASON_SEQUENCE": ",".join(
+                    verification_reason_sequence or ("valid",)
+                ),
+                "FAKE_GH_TAG_OBJECT_DURING_IMMUTABLE_POLL": (
+                    tag_object_during_immutable_poll or ""
+                ),
                 "FAKE_GH_GENERATED_NOTES": GENERATED_NOTES,
                 "FAKE_GH_IGNORE_NOTES_EDIT": str(ignore_notes_edit).lower(),
                 "FAKE_GH_EMPTY_DIGEST_READS": str(empty_digest_reads),
@@ -395,6 +489,7 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
                 "FAKE_GH_PUBLISHED_ASSET_LAG": str(published_asset_lag),
                 "FAKE_GH_CAN_PUSH": str(can_push).lower(),
                 "FAKE_VALIDATOR_LOG": str(self.validator_log),
+                "FAKE_MUTATE_NOTES_FILE": str(mutate_notes_file or ""),
             }
         )
         args = [
@@ -563,6 +658,9 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         (self.gh_state / "assets.tsv").write_text("", encoding="utf8")
         (self.gh_state / "prerelease-state").write_text("true", encoding="utf8")
         (self.gh_state / "latest-state").write_text("true", encoding="utf8")
+        (self.gh_state / "release-title").write_text(
+            "Custom coordinator title", encoding="utf8"
+        )
 
         result = self.run_publisher("--publish")
 
@@ -573,6 +671,10 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         self.assertEqual(
             (self.gh_state / "latest-state").read_text(encoding="utf8"), "true"
         )
+        self.assertEqual(
+            (self.gh_state / "release-title").read_text(encoding="utf8"),
+            "Custom coordinator title",
+        )
         edit_args = next(
             line.split()
             for line in self.gh_log.read_text(encoding="utf8").splitlines()
@@ -582,10 +684,40 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         self.assertNotIn("--prerelease=false", edit_args)
         self.assertNotIn("--latest", edit_args)
         self.assertNotIn("--latest=false", edit_args)
+        self.assertNotIn("--title", edit_args)
         gh_log = self.gh_log.read_text(encoding="utf8")
         self.assertIn("/releases?per_page=100", gh_log)
         self.assertNotIn("/releases/tags/", gh_log)
         self.assertNotIn("release create", gh_log)
+        publish_call = next(
+            line
+            for line in gh_log.splitlines()
+            if "/releases/1 --method PATCH" in line and "draft=false" in line
+        )
+        self.assertNotIn("make_latest=", publish_call)
+
+    def test_resumed_draft_replaces_title_only_when_explicit(self) -> None:
+        (self.gh_state / "release-state").write_text("draft\n", encoding="utf8")
+        (self.gh_state / "assets.tsv").write_text("", encoding="utf8")
+        (self.gh_state / "release-title").write_text(
+            "Custom coordinator title", encoding="utf8"
+        )
+
+        result = self.run_publisher(
+            "--publish", "--release-name", "Approved release title"
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            (self.gh_state / "release-title").read_text(encoding="utf8"),
+            "Approved release title",
+        )
+        edit_call = next(
+            line
+            for line in self.gh_log.read_text(encoding="utf8").splitlines()
+            if line.startswith("release edit ")
+        )
+        self.assertIn("--title Approved release title", edit_call)
 
     def test_resumed_draft_metadata_can_be_explicitly_cleared(self) -> None:
         (self.gh_state / "release-state").write_text("draft\n", encoding="utf8")
@@ -664,10 +796,17 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
             for line in self.gh_log.read_text(encoding="utf8").splitlines()
             if line.startswith("release edit ")
         ]
-        self.assertEqual(len(edit_commands), 2)
+        self.assertEqual(len(edit_commands), 1)
         self.assertIn("--draft", edit_commands[0].split())
         self.assertNotIn("--draft=false", edit_commands[0].split())
-        self.assertIn("--draft=false", edit_commands[1].split())
+        self.assertIn(
+            "draft=false",
+            next(
+                line
+                for line in self.gh_log.read_text(encoding="utf8").splitlines()
+                if "/releases/1 --method PATCH" in line
+            ),
+        )
 
     def test_publish_replaces_stale_draft_body_with_explicit_notes(self) -> None:
         notes = self.root / "release-notes.md"
@@ -686,6 +825,25 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         self.assertNotIn(
             "releases/generate-notes",
             self.gh_log.read_text(encoding="utf8"),
+        )
+
+    def test_publish_uses_snapshot_when_explicit_notes_change_during_validation(self) -> None:
+        notes = self.root / "release-notes.md"
+        approved_notes = "Approved notes\n\nExact coordinator contents"
+        notes.write_text(approved_notes, encoding="utf8")
+
+        result = self.run_publisher(
+            "--publish",
+            "--notes-file",
+            str(notes),
+            mutate_notes_file=notes,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(notes.read_text(encoding="utf8"), "mutated after snapshot\n")
+        self.assertEqual(
+            (self.gh_state / "release-body").read_text(encoding="utf8"),
+            approved_notes,
         )
 
     def test_publish_fails_closed_when_draft_body_cannot_be_corrected(self) -> None:
@@ -725,7 +883,7 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         self.assertEqual(gh_log.count("release create"), 1)
         self.assertEqual(gh_log.count("release upload"), len(uploaded))
         self.assertIn("release edit", gh_log)
-        self.assertIn("--draft=false", gh_log)
+        self.assertIn("--method PATCH -F draft=false -f make_latest=false", gh_log)
         log_lines = gh_log.splitlines()
         final_view = max(
             i
@@ -766,6 +924,101 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         self.assertEqual(
             (self.gh_state / "immutable-view-count").read_text(encoding="utf8"), "3"
         )
+
+    def test_publish_maps_make_latest_auto_to_github_legacy_mode(self) -> None:
+        (self.gh_state / "release-state").write_text("draft\n", encoding="utf8")
+        (self.gh_state / "assets.tsv").write_text("", encoding="utf8")
+        (self.gh_state / "latest-state").write_text("true", encoding="utf8")
+
+        result = self.run_publisher("--publish", "--make-latest", "auto")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            (self.gh_state / "latest-mode").read_text(encoding="utf8"), "legacy"
+        )
+        publish_call = next(
+            line
+            for line in self.gh_log.read_text(encoding="utf8").splitlines()
+            if "/releases/1 --method PATCH" in line and "draft=false" in line
+        )
+        self.assertIn("make_latest=legacy", publish_call)
+
+    def test_tag_move_before_publication_leaves_release_as_draft(self) -> None:
+        moved_tag_object = "f" * 40
+
+        result = self.run_publisher(
+            "--publish",
+            tag_object_sequence=(self.tag_object, moved_tag_object),
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("during pre-publication verification", result.stderr)
+        self.assertEqual(
+            (self.gh_state / "release-state").read_text(encoding="utf8").strip(),
+            "draft",
+        )
+        self.assertNotIn("draft=false", self.gh_log.read_text(encoding="utf8"))
+
+    def test_tag_target_change_before_publication_leaves_release_as_draft(self) -> None:
+        moved_tag_target = "e" * 40
+
+        result = self.run_publisher(
+            "--publish",
+            tag_target_sequence=(self.tag_target, moved_tag_target),
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not match pinned tag target", result.stderr)
+        self.assertIn("during pre-publication verification", result.stderr)
+        self.assertEqual(
+            (self.gh_state / "release-state").read_text(encoding="utf8").strip(),
+            "draft",
+        )
+
+    def test_tag_signature_change_before_publication_leaves_release_as_draft(self) -> None:
+        result = self.run_publisher(
+            "--publish",
+            verified_sequence=(True, False),
+            verification_reason_sequence=("valid", "invalid"),
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("exact valid status", result.stderr)
+        self.assertIn("during pre-publication verification", result.stderr)
+        self.assertEqual(
+            (self.gh_state / "release-state").read_text(encoding="utf8").strip(),
+            "draft",
+        )
+
+    def test_tag_move_during_immutable_polling_fails_after_publication(self) -> None:
+        moved_tag_object = "d" * 40
+
+        result = self.run_publisher(
+            "--publish",
+            immutable_sequence=("false", "true"),
+            tag_object_during_immutable_poll=moved_tag_object,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("during post-publication verification", result.stderr)
+        self.assertIn("may already be immutable", result.stderr)
+        self.assertIn("Stop distribution", result.stderr)
+        self.assertEqual(
+            (self.gh_state / "release-state").read_text(encoding="utf8").strip(),
+            "published",
+        )
+        log_lines = self.gh_log.read_text(encoding="utf8").splitlines()
+        publish_index = next(
+            index
+            for index, line in enumerate(log_lines)
+            if "/releases/1 --method PATCH" in line and "draft=false" in line
+        )
+        final_tag_index = max(
+            index
+            for index, line in enumerate(log_lines)
+            if "/git/ref/tags/" in line
+        )
+        self.assertGreater(final_tag_index, publish_index)
 
     def test_publish_fails_when_release_remains_mutable(self) -> None:
         result = self.run_publisher("--publish", immutable_sequence=("false",))
