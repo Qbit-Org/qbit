@@ -149,10 +149,11 @@ public:
         consensus.fRestrictedOutputMode = true;
         consensus.fPowUseASERT = true;
         consensus.nASERTHalfLife = 2 * 60 * 60;
-        // Draft launch calibration from src/test/data/mainnet_launch_difficulty.json:
-        // permissionless uses $100M FDV and $30.67/PH/day hashprice; AuxPoW uses
-        // 1% of a rounded 1000 EH/s Bitcoin hashrate at 300s target spacing.
-        consensus.asertAnchorParams = Consensus::ASERTAnchor{0, 0x1810c357, 0x1810c357, 0x180192f8, 0, 1738713600};
+        // Dated launch calibration from src/test/data/mainnet_launch_difficulty.json:
+        // permissionless uses $100M FDV and the July 13, 2026 7-day average
+        // $30.39/PH/day hashprice; AuxPoW uses 1% of the 879 EH/s Bitcoin
+        // 7-day hashrate SMA at 300s target spacing.
+        consensus.asertAnchorParams = Consensus::ASERTAnchor{0, 0x18109c29, 0x18109c29, 0x1801ca70, 0, 1738713600};
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 0;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
@@ -185,12 +186,13 @@ public:
         m_assumed_blockchain_size = 0; // No mainnet history exists at launch.
         m_assumed_chain_state_size = 0;
 
-        // Temporary development genesis target. ASERT lane anchors below carry the
-        // draft launch difficulty until the final mainnet genesis is mined.
-        genesis = CreateGenesisBlock(1738713600, 45609, 0x1f00ffff, 1, consensus.nSubsidyInitial);
+        // The genesis header uses the same low-difficulty nBits as CTestNet4Params.
+        // MAINNET LAUNCH BLOCKER: replace the development genesis identity below
+        // when the launch timestamp, nonce, hash, and merkle root are approved.
+        genesis = CreateGenesisBlock(1738713600, 45609, 0x1a7f1ab5, 1, consensus.nSubsidyInitial);
         consensus.hashGenesisBlock = genesis.GetHash();
         consensus.BIP34Hash = consensus.hashGenesisBlock;
-        assert(consensus.hashGenesisBlock == uint256{"0000324188278d089b5eabd9b62bf874c7512677cea90720af51ea5a61a2f997"});
+        assert(consensus.hashGenesisBlock == uint256{"4e445b80630b0dcf11b2acae8be789379d1e919f174626172b8ae571d07cbbd2"});
         assert(genesis.hashMerkleRoot == uint256{"773941c57f540b7e0f841db6de90bf4f29d305d8233224c2581025c684387313"});
 
         // Note that of those which support the service bits prefix, most only support a subset of

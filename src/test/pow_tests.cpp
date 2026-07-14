@@ -826,11 +826,20 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_auxpow_chain_id_is_placeholder)
 BOOST_AUTO_TEST_CASE(ChainParams_MAIN_launch_difficulty_config)
 {
     const UniValue config = ReadMainnetLaunchDifficultyConfig();
+    const UniValue& genesis_config = RequiredObject(config, "genesis");
+    const UniValue& permissionless_config = RequiredObject(config, "permissionless");
+    const UniValue& auxpow_config = RequiredObject(config, "auxpow");
+    const uint32_t genesis_bits = CalculateGenesisLaunchBits(config);
     const uint32_t permissionless_bits = CalculatePermissionlessLaunchBits(config);
     const uint32_t auxpow_bits = CalculateAuxPowLaunchBits(config);
-    const uint32_t temporary_genesis_bits = ParseBits(RequiredString(RequiredObject(config, "genesis"), "temporary_bits"));
+
+    BOOST_CHECK_EQUAL(RequiredString(genesis_config, "reference_network"), "testnet4");
+    BOOST_CHECK_EQUAL(genesis_bits, ParseBits(RequiredString(genesis_config, "expected_bits")));
+    BOOST_CHECK_EQUAL(permissionless_bits, ParseBits(RequiredString(permissionless_config, "expected_bits")));
+    BOOST_CHECK_EQUAL(auxpow_bits, ParseBits(RequiredString(auxpow_config, "expected_bits")));
 
     const auto chain_params = CreateChainParams(*m_node.args, ChainType::MAIN);
+    const auto testnet4_chain_params = CreateChainParams(*m_node.args, ChainType::TESTNET4);
     const auto& consensus = chain_params->GetConsensus();
 
     BOOST_CHECK_EQUAL(consensus.fPowUseASERT, true);
@@ -838,7 +847,8 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_launch_difficulty_config)
     BOOST_CHECK_EQUAL(consensus.nPowTargetSpacingLegacy, 75);
     BOOST_CHECK_EQUAL(consensus.nPowTargetSpacingAuxPow, 300);
 
-    BOOST_CHECK_EQUAL(chain_params->GenesisBlock().nBits, temporary_genesis_bits);
+    BOOST_CHECK_EQUAL(chain_params->GenesisBlock().nBits, genesis_bits);
+    BOOST_CHECK_EQUAL(testnet4_chain_params->GenesisBlock().nBits, genesis_bits);
     BOOST_CHECK_EQUAL(consensus.asertAnchorParams.nBits, permissionless_bits);
     BOOST_CHECK_EQUAL(consensus.asertAnchorParams.nBitsLegacy, permissionless_bits);
     BOOST_CHECK_EQUAL(consensus.asertAnchorParams.nBitsAuxPow, auxpow_bits);

@@ -12,6 +12,7 @@ import json
 import re
 import subprocess
 import sys
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -263,6 +264,263 @@ def json_strings(value: Any, path: str = "$") -> list[tuple[str, str]]:
     return found
 
 
+def required_artifact_string(value: dict[str, Any], key: str, location: str) -> str:
+    field = value.get(key)
+    if not isinstance(field, str) or not field.strip():
+        raise MainnetPostureError(f"{location}.{key} must be a nonempty string")
+    return field
+
+
+def parse_artifact_decimal(value: str, location: str) -> Fraction:
+    if not re.fullmatch(r"[0-9]+(?:[.][0-9]+)?", value):
+        raise MainnetPostureError(f"{location} must be an unsigned decimal")
+    whole, dot, fractional = value.partition(".")
+    denominator = 10 ** len(fractional) if dot else 1
+    numerator = int(whole) * denominator + (int(fractional) if dot else 0)
+    if numerator == 0:
+        raise MainnetPostureError(f"{location} must be greater than zero")
+    return Fraction(numerator, denominator)
+
+
+def parse_artifact_bits(value: str, location: str) -> int:
+    if not re.fullmatch(r"0[xX][0-9A-Fa-f]{1,8}", value):
+        raise MainnetPostureError(f"{location} must be 32-bit hexadecimal compact bits")
+    return int(value, 16)
+
+
+def compact_to_target(bits: int, location: str) -> int:
+    size = bits >> 24
+    word = bits & 0x007FFFFF
+    if bits & 0x00800000 or word == 0:
+        raise MainnetPostureError(f"{location} encodes an invalid target")
+    if size <= 3:
+        target = word >> (8 * (3 - size))
+    else:
+        target = word << (8 * (size - 3))
+    if target == 0 or target >= 1 << 256:
+        raise MainnetPostureError(f"{location} encodes a zero or overflowing target")
+    return target
+
+
+def target_to_compact(target: int) -> int:
+    if target <= 0 or target >= 1 << 256:
+        raise MainnetPostureError("calculated launch target is outside the 256-bit range")
+    size = (target.bit_length() + 7) // 8
+    if size <= 3:
+        word = target << (8 * (3 - size))
+    else:
+        word = target >> (8 * (size - 3))
+    if word & 0x00800000:
+        word >>= 8
+        size += 1
+    return (size << 24) | word
+
+
+def difficulty_to_bits(difficulty: Fraction, pow_limit_bits: int) -> int:
+    diff1_target = 0xFFFF << (8 * (0x1D - 3))
+    target = (diff1_target * difficulty.denominator) // difficulty.numerator
+    target = min(target, compact_to_target(pow_limit_bits, "pow_limit_bits"))
+    return target_to_compact(target)
+
+
+def calculate_permissionless_bits(artifact: dict[str, Any]) -> int:
+    lane = artifact["permissionless"]
+    assert isinstance(lane, dict)
+    location = "mainnet_launch_difficulty.json.permissionless"
+    if required_artifact_string(lane, "model", location) != "fdv_hashprice":
+        raise MainnetPostureError(f"{location}.model must be 'fdv_hashprice'")
+    fdv = parse_artifact_decimal(
+        required_artifact_string(lane, "fdv_usd", location), f"{location}.fdv_usd"
+    )
+    supply = parse_artifact_decimal(
+        required_artifact_string(lane, "total_supply_qbt", location),
+        f"{location}.total_supply_qbt",
+    )
+    subsidy = parse_artifact_decimal(
+        required_artifact_string(lane, "subsidy_qbt", location),
+        f"{location}.subsidy_qbt",
+    )
+    fees_text = required_artifact_string(lane, "expected_fees_qbt", location)
+    if fees_text == "0":
+        fees = Fraction(0)
+    else:
+        fees = parse_artifact_decimal(fees_text, f"{location}.expected_fees_qbt")
+    hashprice = parse_artifact_decimal(
+        required_artifact_string(lane, "hashprice_usd_per_ph_day", location),
+        f"{location}.hashprice_usd_per_ph_day",
+    )
+    block_value = (fdv / supply) * (subsidy + fees)
+    difficulty = block_value / ((hashprice / (10**15 * 86400)) * (1 << 32))
+    pow_limit_bits = parse_artifact_bits(
+        required_artifact_string(
+            artifact, "pow_limit_bits", "mainnet_launch_difficulty.json"
+        ),
+        "mainnet_launch_difficulty.json.pow_limit_bits",
+    )
+    return difficulty_to_bits(difficulty, pow_limit_bits)
+
+
+def calculate_auxpow_bits(artifact: dict[str, Any]) -> int:
+    lane = artifact["auxpow"]
+    assert isinstance(lane, dict)
+    location = "mainnet_launch_difficulty.json.auxpow"
+    if required_artifact_string(lane, "model", location) != "bitcoin_hashrate_share":
+        raise MainnetPostureError(f"{location}.model must be 'bitcoin_hashrate_share'")
+    bitcoin_hashrate = parse_artifact_decimal(
+        required_artifact_string(lane, "bitcoin_global_hashrate_eh_s", location),
+        f"{location}.bitcoin_global_hashrate_eh_s",
+    )
+    hashrate_share = parse_artifact_decimal(
+        required_artifact_string(lane, "hashrate_share", location),
+        f"{location}.hashrate_share",
+    )
+    target_spacing = parse_artifact_decimal(
+        required_artifact_string(lane, "target_spacing_sec", location),
+        f"{location}.target_spacing_sec",
+    )
+    difficulty = bitcoin_hashrate * 10**18 * hashrate_share * target_spacing / (1 << 32)
+    pow_limit_bits = parse_artifact_bits(
+        required_artifact_string(
+            artifact, "pow_limit_bits", "mainnet_launch_difficulty.json"
+        ),
+        "mainnet_launch_difficulty.json.pow_limit_bits",
+    )
+    return difficulty_to_bits(difficulty, pow_limit_bits)
+
+
+def extract_genesis_bits(
+    class_body: str, constants: dict[str, str], class_name: str
+) -> int:
+    match = re.search(
+        r"genesis\s*=\s*Create(?:TestNet4)?GenesisBlock\(\s*[^,]+,\s*[^,]+,\s*([^,\s]+)",
+        strip_cpp_comments(class_body),
+    )
+    if match is None:
+        raise MainnetPostureError(f"{class_name} is missing CreateGenesisBlock nBits")
+    return resolve_cpp_int(match.group(1), constants)
+
+
+def validate_launch_calibration(artifact: dict[str, Any], chainparams: str) -> None:
+    if artifact.get("schema") != 1:
+        raise MainnetPostureError("mainnet_launch_difficulty.json.schema must be 1")
+    genesis = artifact.get("genesis")
+    permissionless = artifact.get("permissionless")
+    auxpow = artifact.get("auxpow")
+    if not all(
+        isinstance(section, dict) for section in (genesis, permissionless, auxpow)
+    ):
+        raise MainnetPostureError(
+            "mainnet launch calibration requires genesis, permissionless, and auxpow objects"
+        )
+    assert (
+        isinstance(genesis, dict)
+        and isinstance(permissionless, dict)
+        and isinstance(auxpow, dict)
+    )
+
+    if (
+        required_artifact_string(
+            genesis, "model", "mainnet_launch_difficulty.json.genesis"
+        )
+        != "fixed_bits"
+    ):
+        raise MainnetPostureError(
+            "mainnet_launch_difficulty.json.genesis.model must be 'fixed_bits'"
+        )
+    if (
+        required_artifact_string(
+            genesis, "reference_network", "mainnet_launch_difficulty.json.genesis"
+        )
+        != "testnet4"
+    ):
+        raise MainnetPostureError(
+            "mainnet launch genesis reference_network must be 'testnet4'"
+        )
+    genesis_bits = parse_artifact_bits(
+        required_artifact_string(
+            genesis, "bits", "mainnet_launch_difficulty.json.genesis"
+        ),
+        "mainnet_launch_difficulty.json.genesis.bits",
+    )
+    expected_genesis_bits = parse_artifact_bits(
+        required_artifact_string(
+            genesis, "expected_bits", "mainnet_launch_difficulty.json.genesis"
+        ),
+        "mainnet_launch_difficulty.json.genesis.expected_bits",
+    )
+    permissionless_bits = calculate_permissionless_bits(artifact)
+    expected_permissionless_bits = parse_artifact_bits(
+        required_artifact_string(
+            permissionless,
+            "expected_bits",
+            "mainnet_launch_difficulty.json.permissionless",
+        ),
+        "mainnet_launch_difficulty.json.permissionless.expected_bits",
+    )
+    auxpow_bits = calculate_auxpow_bits(artifact)
+    expected_auxpow_bits = parse_artifact_bits(
+        required_artifact_string(
+            auxpow, "expected_bits", "mainnet_launch_difficulty.json.auxpow"
+        ),
+        "mainnet_launch_difficulty.json.auxpow.expected_bits",
+    )
+    expected_pairs = (
+        ("genesis", genesis_bits, expected_genesis_bits),
+        ("permissionless", permissionless_bits, expected_permissionless_bits),
+        ("auxpow", auxpow_bits, expected_auxpow_bits),
+    )
+    mismatches = [
+        f"{name} calculated 0x{calculated:08x}, expected 0x{expected:08x}"
+        for name, calculated, expected in expected_pairs
+        if calculated != expected
+    ]
+    if mismatches:
+        raise MainnetPostureError(
+            "launch fixture target mismatch: " + "; ".join(mismatches)
+        )
+
+    constants = parse_cpp_int_constants(chainparams)
+    main_body = extract_class_body(chainparams, "CMainParams")
+    testnet4_body = extract_class_body(chainparams, "CTestNet4Params")
+    main_code = strip_cpp_comments(main_body)
+    anchor_match = re.search(
+        r"consensus[.]asertAnchorParams\s*=\s*Consensus::ASERTAnchor\{([^}]+)\}",
+        main_code,
+    )
+    if anchor_match is None:
+        raise MainnetPostureError("CMainParams is missing its ASERT anchor initializer")
+    anchor_tokens = [token.strip() for token in anchor_match.group(1).split(",")]
+    if len(anchor_tokens) != 6:
+        raise MainnetPostureError("CMainParams ASERT anchor must contain six fields")
+    anchor_bits = [
+        resolve_cpp_int(anchor_tokens[index], constants) for index in (1, 2, 3)
+    ]
+    code_pairs = (
+        (
+            "mainnet genesis",
+            extract_genesis_bits(main_body, constants, "CMainParams"),
+            genesis_bits,
+        ),
+        (
+            "testnet4 genesis",
+            extract_genesis_bits(testnet4_body, constants, "CTestNet4Params"),
+            genesis_bits,
+        ),
+        ("ASERT fallback", anchor_bits[0], permissionless_bits),
+        ("ASERT permissionless", anchor_bits[1], permissionless_bits),
+        ("ASERT AuxPoW", anchor_bits[2], auxpow_bits),
+    )
+    code_mismatches = [
+        f"{name} is 0x{actual:08x}, fixture requires 0x{expected:08x}"
+        for name, actual, expected in code_pairs
+        if actual != expected
+    ]
+    if code_mismatches:
+        raise MainnetPostureError(
+            "launch code target mismatch: " + "; ".join(code_mismatches)
+        )
+
+
 def validate_launch_difficulty(sources: dict[str, str]) -> None:
     artifact_path = "src/test/data/mainnet_launch_difficulty.json"
     try:
@@ -282,6 +540,11 @@ def validate_launch_difficulty(sources: dict[str, str]) -> None:
             failures.append(
                 f"{artifact_path}.{section}.source must record final source provenance"
             )
+
+    try:
+        validate_launch_calibration(artifact, sources["src/kernel/chainparams.cpp"])
+    except MainnetPostureError as exc:
+        failures.append(str(exc))
 
     markers: list[str] = []
     for path, value in json_strings(artifact):
@@ -565,9 +828,14 @@ def write_result(path: Path | None, result: dict[str, Any]) -> bool:
     if path is None:
         return True
     try:
-        path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf8")
+        path.write_text(
+            json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf8"
+        )
     except OSError as exc:
-        print(f"ERR: Could not write mainnet posture result {path}: {exc}", file=sys.stderr)
+        print(
+            f"ERR: Could not write mainnet posture result {path}: {exc}",
+            file=sys.stderr,
+        )
         return False
     return True
 

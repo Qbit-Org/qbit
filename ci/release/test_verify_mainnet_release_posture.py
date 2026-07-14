@@ -27,11 +27,11 @@ class CMainParams : public CChainParams {
 public:
     CMainParams() {
         consensus.nAuxpowChainId = QBIT_MAINNET_AUXPOW_CHAIN_ID;
-        consensus.asertAnchorParams = Consensus::ASERTAnchor{0, 1, 1, 1, 0, 1};
+        consensus.asertAnchorParams = Consensus::ASERTAnchor{0, 0x18109c29, 0x18109c29, 0x1801ca70, 0, 1};
         nDefaultPort = 8355;
         m_assumed_blockchain_size = 0;
         m_assumed_chain_state_size = 0;
-        genesis = CreateGenesisBlock(1, 2, 3, 4, 5);
+        genesis = CreateGenesisBlock(1, 2, 0x1a7f1ab5, 4, 5);
         consensus.hashGenesisBlock = genesis.GetHash();
         assert(consensus.hashGenesisBlock == uint256{"01"});
         assert(genesis.hashMerkleRoot == uint256{"02"});
@@ -42,12 +42,17 @@ public:
 };
 
 class CTestNetParams : public CChainParams {
+public:
+    CTestNetParams() {
+        genesis = CreateGenesisBlock(1, 2, 0x1f00ffff, 4, 5);
+    }
 };
 
 class CTestNet4Params : public CChainParams {
 public:
     CTestNet4Params() {
         consensus.nAuxpowChainId = QBIT_PUBLIC_TESTNET_AUXPOW_CHAIN_ID;
+        genesis = CreateTestNet4GenesisBlock(1, 2, 0x1a7f1ab5, 4, 5);
     }
 };
 """
@@ -105,17 +110,32 @@ static constexpr std::array<uint8_t, 16> chainparams_seed_main{{
 """
 
 VALID_DIFFICULTY: dict[str, Any] = {
+    "schema": 1,
     "network": "main",
+    "pow_limit_bits": "0x1f00ffff",
     "genesis": {
-        "bits": "0x1f00ffff",
+        "model": "fixed_bits",
+        "bits": "0x1a7f1ab5",
+        "expected_bits": "0x1a7f1ab5",
+        "reference_network": "testnet4",
         "source": "Approved genesis mining record and launch signoff",
     },
     "permissionless": {
         "model": "fdv_hashprice",
+        "fdv_usd": "100000000",
+        "total_supply_qbt": "210000000",
+        "subsidy_qbt": "210",
+        "expected_fees_qbt": "0",
+        "hashprice_usd_per_ph_day": "30.39",
+        "expected_bits": "0x18109c29",
         "source": "Dated hashprice observation with archived evidence",
     },
     "auxpow": {
         "model": "bitcoin_hashrate_share",
+        "bitcoin_global_hashrate_eh_s": "879",
+        "hashrate_share": "0.01",
+        "target_spacing_sec": "300",
+        "expected_bits": "0x1801ca70",
         "source": "Dated Bitcoin hashrate observation with archived evidence",
     },
 }
@@ -275,6 +295,33 @@ def test_release_builds_default_mainnet_guard_off():
 
         self.assertEqual(result.returncode, 1)
         self.assertIn("temporary", result.stderr)
+
+    def test_calculated_lane_bits_must_match_fixture_expectation(self) -> None:
+        artifact = json.loads(json.dumps(VALID_DIFFICULTY))
+        artifact["permissionless"]["expected_bits"] = "0x18109c28"
+        self.write(
+            "src/test/data/mainnet_launch_difficulty.json",
+            json.dumps(artifact) + "\n",
+        )
+
+        result = self.run_validator()
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("launch fixture target mismatch", result.stderr)
+        self.assertIn("permissionless calculated 0x18109c29", result.stderr)
+
+    def test_chainparams_lane_bits_must_match_fixture(self) -> None:
+        path = self.root / "src/kernel/chainparams.cpp"
+        path.write_text(
+            path.read_text(encoding="utf8").replace("0x1801ca70", "0x1801ca71"),
+            encoding="utf8",
+        )
+
+        result = self.run_validator()
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("launch code target mismatch", result.stderr)
+        self.assertIn("ASERT AuxPoW is 0x1801ca71", result.stderr)
 
     def test_fixed_seed_bytes_must_match_approved_input(self) -> None:
         path = self.root / "src/chainparamsseeds.h"

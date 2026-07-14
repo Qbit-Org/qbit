@@ -172,6 +172,11 @@ Overall v1.0.0 summary
   permissionless lane and a 300-second AuxPoW lane.
 - Both lanes use independent ASERT difficulty tracking with a two-hour
   half-life.
+- Launch difficulty is fixed from the July 13, 2026 Hashrate Index snapshot:
+  the permissionless lane uses the seven-day average USD hashprice, while the
+  AuxPoW lane assumes 1% of the seven-day Bitcoin hashrate SMA. The genesis
+  header matches the low-difficulty public testnet4 `nBits` independently of
+  both lane anchors.
 - Permissionless mining uses `getblocktemplate` and `submitblock`.
 - Merged mining uses `createauxblock` and `submitauxblock`; pool software must
   follow the commitment order and chain ID returned by the node.
