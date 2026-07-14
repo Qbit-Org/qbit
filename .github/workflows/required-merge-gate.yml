@@ -136,8 +136,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           BEFORE_SHA: ${{ github.event.before }}
-          BASE_REF: ${{ github.base_ref || github.event.merge_group.base_ref }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || '' }}
         run: |
           set -euo pipefail
 
@@ -160,14 +159,8 @@ jobs:
                 "${canonical_dir}/keys.json"
             )"
             history_root=""
-            if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            if [[ "${EVENT_NAME}" == "pull_request" || "${EVENT_NAME}" == "merge_group" ]]; then
               history_root="${BASE_SHA}"
-            elif [[ "${EVENT_NAME}" == "merge_group" ]]; then
-              base_branch="${BASE_REF#refs/heads/}"
-              if [[ -n "${base_branch}" ]]; then
-                git fetch --no-tags --prune origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"
-                history_root="$(git merge-base "origin/${base_branch}" HEAD)"
-              fi
             elif [[ "${EVENT_NAME}" == "push" && -n "${BEFORE_SHA}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
               history_root="${BEFORE_SHA}"
             elif git rev-parse --verify HEAD^ >/dev/null 2>&1; then
