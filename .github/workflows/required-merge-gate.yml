@@ -151,40 +151,61 @@ jobs:
             --require-public-key-files
           )
 
-          base_commit=""
-          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
-            base_commit="${BASE_SHA}"
-          elif [[ "${EVENT_NAME}" == "merge_group" ]]; then
-            base_branch="${BASE_REF#refs/heads/}"
-            if [[ -n "${base_branch}" ]]; then
-              git fetch --no-tags --prune origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"
-              base_commit="$(git merge-base "origin/${base_branch}" HEAD)"
+          policy_sequence="$(
+            jq -er '.policy_sequence | select(type == "number")' "${canonical_dir}/keys.json"
+          )"
+          if (( policy_sequence > 1 )); then
+            previous_policy_sha256="$(
+              jq -er '.previous_policy_sha256 | select(type == "string")' \
+                "${canonical_dir}/keys.json"
+            )"
+            history_root=""
+            if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+              history_root="${BASE_SHA}"
+            elif [[ "${EVENT_NAME}" == "merge_group" ]]; then
+              base_branch="${BASE_REF#refs/heads/}"
+              if [[ -n "${base_branch}" ]]; then
+                git fetch --no-tags --prune origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"
+                history_root="$(git merge-base "origin/${base_branch}" HEAD)"
+              fi
+            elif [[ "${EVENT_NAME}" == "push" && -n "${BEFORE_SHA}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
+              history_root="${BEFORE_SHA}"
+            elif git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+              history_root="$(git rev-parse HEAD^)"
             fi
-          elif [[ "${EVENT_NAME}" == "push" && -n "${BEFORE_SHA}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
-            base_commit="${BEFORE_SHA}"
-          elif git rev-parse --verify HEAD^ >/dev/null 2>&1; then
-            base_commit="$(git rev-parse HEAD^)"
-          fi
 
-          policy_changed=true
-          if [[ -n "${base_commit}" ]] \
-            && git cat-file -e "${base_commit}:${canonical_dir}/keys.json" 2>/dev/null \
-            && git diff --quiet "${base_commit}" -- "${canonical_dir}/keys.json"; then
-            policy_changed=false
-          fi
+            if [[ -z "${history_root}" ]]; then
+              echo "::error::Unable to identify trusted history for previous operator policy discovery."
+              exit 1
+            fi
 
-          if [[ "${policy_changed}" == false ]]; then
-            validator_args+=(--skip-policy-transition-validation)
-          elif [[ -n "${base_commit}" ]] \
-            && git cat-file -e "${base_commit}:${canonical_dir}/keys.json" 2>/dev/null; then
+            previous_commit=""
+            while IFS= read -r candidate_commit; do
+              if ! git cat-file -e "${candidate_commit}:${canonical_dir}/keys.json" 2>/dev/null; then
+                continue
+              fi
+              candidate_sha256="$(
+                git show "${candidate_commit}:${canonical_dir}/keys.json" \
+                  | sha256sum \
+                  | cut -d ' ' -f 1
+              )"
+              if [[ "${candidate_sha256}" == "${previous_policy_sha256}" ]]; then
+                previous_commit="${candidate_commit}"
+                break
+              fi
+            done < <(git rev-list "${history_root}" -- "${canonical_dir}/keys.json")
+
+            if [[ -z "${previous_commit}" ]]; then
+              echo "::error::Previous operator policy ${previous_policy_sha256} is not present in trusted base history."
+              exit 1
+            fi
+
             previous_root="${RUNNER_TEMP}/previous-operator-policy"
             mkdir -p "${previous_root}"
-            git archive "${base_commit}" "${canonical_dir}" | tar -x -C "${previous_root}"
+            git archive "${previous_commit}" "${canonical_dir}" | tar -x -C "${previous_root}"
             validator_args+=(
               --previous-operator-policy "${previous_root}/${canonical_dir}/keys.json"
             )
-          else
-            validator_args+=(--skip-policy-transition-validation)
           fi
 
           python3 ci/release/validate_key_metadata.py "${validator_args[@]}"
