@@ -7,9 +7,9 @@
 > any inherited Bitcoin Core multisig recipe, and it must be run with
 > qbit-aware tooling end to end.
 
-Mainnet is not public yet. Mainnet examples below apply when qbit mainnet is
-announced. Use the dedicated [public testnet guide](../public-testnet.md) for
-the current rehearsal network's chain flag and address HRP.
+Examples below target mainnet unless they include a testnet4 chain flag. Use
+the dedicated [public testnet guide](../public-testnet.md) for the test
+network's chain flag and address HRP.
 
 P2MR multisig lets a group require a threshold of independent post-quantum
 signatures (for example, 2 of 3) to spend an output. It is built from qbit's

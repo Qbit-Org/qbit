@@ -1,13 +1,11 @@
 # Getting Started With qbit
 
-This guide is the future-mainnet first-run path for qbit users. It covers the
-mainnet-shaped flow: install qbit, start a node, check sync, create a P2MR
+This guide is the mainnet first-run path for qbit users. It covers the
+mainnet flow: install qbit, start a node, check sync, create a P2MR
 wallet, receive and send funds, and back up safely.
 
-Mainnet is not public yet. This guide describes the mainnet-shaped workflow for
-when qbit mainnet is announced. If you are joining the current public rehearsal
-network, use the dedicated public testnet guide instead and pass `-testnet4` or
-`-chain=testnet4` to qbit commands.
+If you are joining public testnet4, use the dedicated public testnet guide and
+pass `-testnet4` or `-chain=testnet4` to qbit commands.
 
 ## 1. Download and Verify
 
@@ -49,29 +47,26 @@ For GUI use, start `qbit-qt` instead of `qbitd`. The rest of this guide uses
 
 ## 2. Choose a Network
 
-When qbit mainnet is launched, mainnet is the default qbit chain. Until then,
-no-flag mainnet commands in this guide are future-mainnet examples only. For
-the current public testnet, always start with `-testnet4` or
-`-chain=testnet4`; developer builds may still select the placeholder main chain
-if no chain flag is provided.
+Mainnet is the default qbit chain. For public testnet4, always start with
+`-testnet4` or `-chain=testnet4`.
 
 ```bash
 qbitd -daemonwait
 ```
 
-Use `qbit-cli` without a chain flag for mainnet after launch:
+Use `qbit-cli` without a chain flag for mainnet:
 
 ```bash
 qbit-cli getblockchaininfo
 ```
 
-Future mainnet values:
+Mainnet values:
 
 | Network | Start flag | P2P port | RPC port | Address prefix |
 | --- | --- | ---: | ---: | --- |
-| Future mainnet | none after launch | `8355` | `8352` | `qb` |
+| Mainnet | none, or `-chain=main` | `8355` | `8352` | `qb` |
 
-Use the dedicated public testnet guide for the current rehearsal network:
+Use the dedicated public testnet guide for testnet4:
 
 ```bash
 qbitd -testnet4 -daemonwait
@@ -80,13 +75,13 @@ qbit-cli -testnet4 getblockchaininfo
 
 ## 3. Let the Node Find Peers
 
-For future mainnet, start normally first:
+For mainnet, start normally first:
 
 ```bash
 qbitd -daemonwait
 ```
 
-Check future-mainnet network and sync state:
+Check mainnet network and sync state:
 
 ```bash
 qbit-cli getnetworkinfo
@@ -104,9 +99,8 @@ qbit retains full witness history by default. Do not enable
 `-prunewitnesses=1` for a first node unless you intentionally want a
 witness-pruned node and understand that it is not an archive bootstrap peer.
 
-If future-mainnet seed infrastructure is not live yet, peer discovery may not
-find peers. Use only the archive fallback endpoints published for the specific
-release or network through qbit.org:
+If automatic peer discovery is degraded, use only the archive fallback
+endpoints published for the release through qbit.org:
 
 ```bash
 qbitd -daemonwait \
@@ -142,7 +136,7 @@ Most data is chain-specific:
 
 | Chain | Data subdirectory |
 | --- | --- |
-| Future mainnet | data directory root |
+| Mainnet | data directory root |
 
 Other chains use their own subdirectories; see the dedicated guide for the
 network you are using.
@@ -272,8 +266,8 @@ qbit-cli loadwallet "first"
 
 - confirm `qbitd` is running
 - use the same chain flag on `qbit-cli` that you used for `qbitd`
-- for future mainnet, check that you are using the qbit mainnet RPC port,
-  `8352`; for public testnet4, use `48352`
+- for mainnet, check that you are using the qbit mainnet RPC port, `8352`; for
+  public testnet4, use `48352`
 
 No peers or no header progress:
 
@@ -290,7 +284,7 @@ Wallet RPC says no wallet is loaded:
 Address type is rejected:
 
 - use `getnewaddress "" "p2mr"`
-- use addresses with the right qbit prefix: `qb` on future mainnet, `tq` on
+- use addresses with the right qbit prefix: `qb` on mainnet, `tq` on
   public testnet4
 - use `qbit:` URIs; `bitcoin:` URIs are not valid qbit payment URIs
 
@@ -306,5 +300,5 @@ You are unsure which chain you are on:
 qbit-cli <chain option> getblockchaininfo | jq '.chain'
 ```
 
-The `chain` value should be `main` only for future mainnet after launch. It
-should be `testnet4` for the current public rehearsal network.
+The `chain` value should be `main` for mainnet and `testnet4` for public
+testnet4.

@@ -5,8 +5,8 @@ This tree separates primary qbit user guidance from technical/source
 references. Current public release, network, support, faucet, explorer,
 security, and launch-resource status is published through https://qbit.org.
 
-Mainnet is not public yet. Mainnet-oriented examples in this tree apply only
-when qbit mainnet is announced.
+Qbit v1.0.0 launches mainnet. Commands without a chain flag select mainnet;
+use `-testnet4` or `-chain=testnet4` to join the public test network.
 
 Primary User Docs
 -----------------

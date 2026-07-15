@@ -4,8 +4,8 @@ qbit is based on Bitcoin Core v30.2, but it is not a Bitcoin network with differ
 
 ## Short Version
 
-- qbit has its own network identity, ports, address HRPs, payment URI scheme, genesis blocks, and chain parameters. Any concrete genesis hash in pre-launch documentation should be treated as a placeholder until the launch specification freezes it.
-- Mainnet is not public or launched yet. Official public testnet release artifacts are for testnet4; no-flag mainnet commands are future-mainnet guidance only.
+- qbit has its own network identity, ports, address HRPs, payment URI scheme, genesis blocks, and chain parameters. The v1.0.0 source pins the mainnet genesis identity, which becomes official through the signed release and qbit.org launch announcement.
+- Qbit v1.0.0 launches mainnet as the default chain; public testnet4 remains available through `-testnet4` or `-chain=testnet4`.
 - Public qbit launch chains are P2MR-only for spendable outputs. Do not expect legacy, P2SH-SegWit, native SegWit v0, or Taproot receive/change outputs to work as user payment outputs.
 - qbit's live authorization path uses P2MR script-path spends with `OP_CHECKSIGPQC` and `SLH-DSA-SHA2-128s-bounded30` signatures, not secp256k1 ECDSA or BIP340 Schnorr signatures.
 - qbit has no witness discount. A 3,680-byte PQC signature counts at full weight.
@@ -21,14 +21,12 @@ Use qbit binaries and qbit config. Do not point Bitcoin Core tooling at a qbit d
 | Network | P2P port | RPC/REST port | Address HRP | Notes |
 |---|---:|---:|---|---|
 | Public testnet4 | `48355` | `48352` | `tq` | Current public rehearsal network. |
-| Future mainnet | `8355` | `8352` | `qb` | Reserved qbit mainnet identity for when mainnet is announced. |
+| Mainnet | `8355` | `8352` | `qb` | Default qbit v1.0.0 network. |
 
 Other qbit networks use distinct parameters and are documented separately.
-The in-tree mainnet parameters, genesis block, derived hash, and message-start
-bytes are development placeholders until a qbit mainnet launch announcement
-freezes them. The in-tree mainnet AuxPoW chain ID currently matches public
-testnet as a conspicuous placeholder only; it must be replaced with the
-approved production allocation before the v1.0.0 tag.
+The v1.0.0 source pins the mined mainnet genesis block, derived hash, and
+genesis-bound ASERT anchor. Mainnet AuxPoW chain ID `47` is the production
+allocation and is distinct from public testnet chain ID `31430`.
 
 The v1.0.0 launch source includes DNS discovery through
 `flux-mainnet.qbit.org` and `phase-mainnet.qbit.org`. Its project-operated
@@ -65,7 +63,7 @@ qbit starts from Bitcoin Core mechanics where they still fit, but the chain para
 | GUI synced-state block gap | 10 minutes |
 | Default maximum IBD tip age | 3 hours |
 | Public testnet AuxPoW chain ID | 31430 |
-| Future mainnet AuxPoW chain ID | placeholder `31430`; not a launch value |
+| Mainnet AuxPoW chain ID | 47 |
 
 The `WITNESS_SCALE_FACTOR` is `1`, so qbit does not discount witness data. This matters because P2MR signatures are large. Fee estimation, block template sizing, transaction batching, channel designs, and any custom policy logic should treat witness bytes as full-weight data.
 
@@ -217,8 +215,7 @@ qbit uses ASERT difficulty adjustment and Cadence lanes:
 - AuxPoW merged mining targets a 300 second lane.
 - The lane split is intended to produce an aggregate 4:1 permissionless-to-AuxPoW cadence.
 - Public testnet AuxPoW uses qbit chain ID `31430`.
-- The in-tree mainnet AuxPoW chain ID is a placeholder and must not be treated
-  as the future mainnet launch value.
+- Mainnet AuxPoW uses qbit chain ID `47`.
 
 A qbit block can be a permissionless block or an AuxPoW block. AuxPoW blocks carry an AuxPoW payload and must signal the expected version/chain-id semantics. Permissionless blocks must not include an AuxPoW payload.
 

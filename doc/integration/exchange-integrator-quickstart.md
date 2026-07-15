@@ -10,17 +10,15 @@ up.
 qbit is not a drop-in Bitcoin network. Treat the points below as integration
 requirements, not branding differences.
 
-Mainnet is not public yet. Mainnet integration examples below apply when qbit
-mainnet is announced. Current public release, network-resource, faucet,
-explorer, and support status is published through https://qbit.org.
-Official public testnet release artifacts are for testnet4; no-flag mainnet
-commands in this guide are future-mainnet examples only.
+The examples below target mainnet unless they include a testnet4 chain flag.
+Current public release, network-resource, faucet, explorer, and support status
+is published through https://qbit.org.
 
 ## Network identity
 
 | Network | Chain flag | P2P port | RPC port | Address HRP |
 |---|---:|---:|---:|---|
-| Future mainnet | none after launch | `8355` | `8352` | `qb` |
+| Mainnet | none, or `-chain=main` | `8355` | `8352` | `qb` |
 | Testnet4 | `-testnet4` or `-chain=testnet4` | `48355` | `48352` | `tq` |
 
 Launch chains use P2MR addresses. Do not accept Bitcoin mainnet/testnet
@@ -48,7 +46,7 @@ prefer an archive/full-history node. Archive mode is the qbit default; do not
 enable `-prunewitnesses=1` on the node that your accounting, block scanner, or
 support tooling depends on.
 
-For a future-mainnet integration node when qbit mainnet is launched:
+For a mainnet integration node:
 
 ```ini
 # qbit.conf
@@ -134,8 +132,8 @@ Require all of the following before storing or displaying an address:
 - `validateaddress` returns `isvalid: true`
 - `validateaddress` returns `iswitness: true`
 - `validateaddress` returns `witness_version: 2`
-- the HRP matches the network you are integrating: `qb` for future mainnet
-  after launch, `tq` for testnet4
+- the HRP matches the network you are integrating: `qb` for mainnet and `tq`
+  for testnet4
 - `getaddressinfo` shows the address belongs to the expected wallet when the address is internally generated
 
 Do not validate qbit addresses with Bitcoin Core libraries unless they have

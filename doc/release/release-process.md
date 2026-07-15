@@ -133,11 +133,12 @@ It fails closed unless:
   infer posture from an archive name, and unit tests assert that default and
   explicit mainnet selection are accepted in a standard build.
 
-The v1.0.0 preparation branch is expected to build while the real publication
-gate rejects its deliberate chain-ID and genesis/ASERT placeholders. Core
-Checks accepts that state only when those are the exact two reported failure
-categories. Both failures must become successes, and the CI policy must move to
-`final`, before any mainnet draft release can be created or published.
+The v1.0.0 launch source fixes production mainnet AuxPoW chain ID `47`, the
+mined mainnet genesis identity, and its six-field ASERT anchor. The checked-in
+CI policy is `final` with no expected failures, so Core Checks rejects any
+change that makes the real publication validator report a launch-posture
+failure. The local publisher independently repeats the same validation against
+the peeled signed-tag target.
 
 ## Mainnet-capable build default
 

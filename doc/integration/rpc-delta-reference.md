@@ -32,12 +32,11 @@ qbit keeps the Bitcoin Core RPC shape where that is still accurate, but adds or 
 - stale block metrics and qbit confirmation-target estimation
 
 For protocol constants behind these RPCs, use the protocol specification rather
-than older Bitcoin Core assumptions. Future mainnet launch values include
+than older Bitcoin Core assumptions. Mainnet values include
 60-second aggregate target spacing, P2MR as the public spendable output model,
 `qb` mainnet addresses, archive/full-history retention by default, and explicit
-witness pruning via `-prunewitnesses=1`. Current official public testnet
-release artifacts are for testnet4; use `-testnet4` or `-chain=testnet4` in
-testnet examples.
+witness pruning via `-prunewitnesses=1`. Use `-testnet4` or
+`-chain=testnet4` in testnet examples.
 
 RPC clients that construct or independently inspect P2MR commitments and
 signatures must use qbit P2MR v1, not the ancestry profile pinned in its

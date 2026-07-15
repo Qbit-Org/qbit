@@ -10,9 +10,8 @@ chains. The normal spendable address type is P2MR, the normal payment URI scheme
 is `qbit:`, and P2MR private-key wallets carry stateful PQC signature counters
 that must be protected with the wallet.
 
-Mainnet is not public yet. Mainnet examples below apply when qbit mainnet is
-announced. Use the dedicated public testnet guide for the current rehearsal
-network.
+Examples below target mainnet unless they include a testnet4 chain flag. Use
+the dedicated public testnet guide for testnet4-specific network details.
 
 ## Address Rules
 
@@ -55,7 +54,7 @@ P2MR addresses are encoded with the chain's qbit HRP:
 
 | Network | HRP |
 | --- | --- |
-| mainnet, when launched | `qb` |
+| mainnet | `qb` |
 
 Use the dedicated public testnet guide for rehearsal-network HRPs.
 

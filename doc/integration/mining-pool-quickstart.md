@@ -5,11 +5,9 @@ mining RPCs, Stratum, and SHA-256d mining. qbit keeps the familiar
 permissionless `getblocktemplate` / `submitblock` path, and adds a second
 AuxPoW path for merged mining.
 
-Mainnet is not public yet. Mainnet mining examples below apply when qbit
-mainnet is announced. Current public release and network-resource status is
-published through https://qbit.org.
-Official public testnet release artifacts are for testnet4; no-flag mainnet
-commands in this guide are future-mainnet examples only.
+The examples below target mainnet unless they include a testnet4 chain flag.
+Current public release and network-resource status is published through
+https://qbit.org.
 
 The qbit mining RPC surface is implemented in qbit Core. This guide documents
 the qbit protocol and node requirements directly; do not assume generic Bitcoin
@@ -30,7 +28,7 @@ qbit mining has two block classes:
 | AuxPoW merged mining | External SHA-256d parent chain | `createauxblock`, `submitauxblock` | Pool software that can insert and submit AuxPoW commitments |
 
 Both paths use SHA-256d proof of work. qbit targets an aggregate 60 second
-block interval. Mainnet launch parameters, when announced, use a 75 second
+block interval. Mainnet uses a 75 second
 permissionless lane and a 300 second AuxPoW lane, with independent ASERT
 difficulty tracking for each lane. Fork choice remains most accumulated work,
 not longest height.
@@ -44,21 +42,20 @@ Current protocol constants relevant to miners:
 | AuxPoW lane spacing | 300 seconds |
 | Difficulty algorithm | ASERT, 2 hour halflife |
 | Maximum future block time | 10 minutes after future-time-v2 activation |
+| Mainnet AuxPoW chain ID | `47` |
 | Public testnet AuxPoW chain ID | `31430` |
 | Max block weight | 2,000,000 |
 | Witness scale factor | 1 |
 | Coinbase maturity | 1,000 blocks |
-| Future mainnet P2P / RPC ports | `8355` / `8352` |
-| Future mainnet DNS seeds | `flux-mainnet.qbit.org`, `phase-mainnet.qbit.org` |
-| Future mainnet archive fallbacks | `positron-mainnet.qbit.org:8355`, `graviton-mainnet.qbit.org:8355` |
+| Mainnet P2P / RPC ports | `8355` / `8352` |
+| Mainnet DNS seeds | `flux-mainnet.qbit.org`, `phase-mainnet.qbit.org` |
+| Mainnet archive fallbacks | `positron-mainnet.qbit.org:8355`, `graviton-mainnet.qbit.org:8355` |
 | Regtest P2P / RPC ports | `18460` / `18452` |
-| Future mainnet P2MR address HRP | `qb` |
+| Mainnet P2MR address HRP | `qb` |
 | Regtest P2MR address HRP | `qbrt` |
 
-MAINNET LAUNCH BLOCKER: the in-tree mainnet AuxPoW chain ID deliberately
-matches public testnet as a conspicuous placeholder. It is not a mainnet launch
-value and must be replaced with the approved production allocation before the
-v1.0.0 tag.
+Mainnet and public testnet deliberately use distinct AuxPoW identities. Mainnet
+uses chain ID `47`; public testnet retains chain ID `31430`.
 
 ## Coinbase payout addresses
 
@@ -73,7 +70,7 @@ qbit-cli <chain option> createwallet "pool"
 qbit-cli <chain option> -rpcwallet=pool getnewaddress "coinbase" "p2mr"
 ```
 
-On future mainnet after launch the address should start with `qb`. On public
+On mainnet the address should start with `qb`. On public
 testnet4 it should start with `tq`. On regtest it should start with `qbrt`.
 
 For pool software, treat the qbit payout address as chain-specific configuration. The address used for `createauxblock`, `generatetoaddress`, or a pool coinbase output must decode as P2MR on public qbit networks. Non-P2MR addresses are rejected on launch chains.
@@ -148,7 +145,7 @@ qbit-cli <chain option> createauxblock "$QBIT_PAYOUT_ADDRESS"
 | Field | Meaning |
 |---|---|
 | `hash` | Candidate aux block hash; pass this back to `submitauxblock` |
-| `chainid` | qbit AuxPoW chain ID for the selected network, currently `31430` on public testnet |
+| `chainid` | qbit AuxPoW chain ID for the selected network: `47` on mainnet or `31430` on public testnet |
 | `previousblockhash` | qbit tip used by the candidate |
 | `coinbasevalue` | qbit coinbase value in satoshis, including fees |
 | `bits` | compact qbit target for this candidate |
@@ -249,8 +246,8 @@ candidate.
 
 Validation requirements include:
 
-- The qbit AuxPoW chain ID must match the selected network. Public testnet
-  currently requires `31430`.
+- The qbit AuxPoW chain ID must match the selected network. Mainnet requires
+  `47`; public testnet requires `31430`.
 - The AuxPoW header must signal the AuxPoW flag.
 - Permissionless blocks must not carry an AuxPoW payload.
 - The parent block hash must satisfy the qbit target from the aux candidate.
@@ -356,7 +353,7 @@ Before calling an integration production-ready, record evidence for these checkp
 | P2MR payout | `getnewaddress "coinbase" "p2mr"` returns the expected HRP |
 | Permissionless template | `getblocktemplate '{"rules":["segwit"]}'` returns height, bits, target, and coinbasevalue |
 | Permissionless submission | `submitblock` returns `null` for a solved qbit block |
-| AuxPoW template | On public testnet, `createauxblock` returns `chainid=31430` and a qbit target |
+| AuxPoW template | `createauxblock` returns `chainid=47` on mainnet or `chainid=31430` on public testnet, plus a qbit target |
 | AuxPoW commitment | Parent coinbase contains exactly one `fabe6d6d` commitment before the aux root |
 | AuxPoW submission | `submitauxblock` returns `null` for a valid payload |
 | Stale handling | Tip changes and template expiry produce controlled refreshes, not repeated stale submissions |

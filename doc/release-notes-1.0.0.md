@@ -24,19 +24,13 @@ over a longer horizon while retaining the open participation, verifiability,
 and self-custody expected of peer-to-peer digital value. Read more about the
 design and long-term vision at [qbit.org](https://qbit.org/).
 
-Draft launch status
-===================
+Launch commitments
+==================
 
-This release note is intentionally checked in before the two launch-time
-consensus commitments are finalized. The current source must not be tagged or
-published as v1.0.0 until both blockers are resolved:
-
-- replace the development mainnet genesis block and draft ASERT launch anchor
-  with the approved, mined mainnet values; and
-- replace the conspicuous mainnet AuxPoW chain-ID placeholder with the approved
-  production allocation.
-
-The public testnet4 genesis block and AuxPoW chain ID remain unchanged.
+The v1.0.0 source pins the mined mainnet genesis block, its genesis-bound ASERT
+anchor, and production AuxPoW chain ID `47`. The public testnet4 genesis block
+and AuxPoW chain ID `31430` remain unchanged. Mainnet becomes official only
+through the signed v1.0.0 release and qbit.org launch announcement.
 
 How to Upgrade
 ==============
@@ -68,8 +62,11 @@ flag is required.
 | DNS seed 2 | `phase-mainnet.qbit.org` |
 | Archive fallback 1 | `positron-mainnet.qbit.org:8355` |
 | Archive fallback 2 | `graviton-mainnet.qbit.org:8355` |
-| AuxPoW chain ID | Pending final launch allocation |
-| Genesis block | Pending final launch commitment |
+| AuxPoW chain ID | `47` |
+| Genesis block | `0000000000004d60aa5d46013991d0a0e2995d89ee98e53068ae196d763e79f2` |
+| Genesis `nBits` | `0x1a7f1ab5` |
+| ASERT permissionless / legacy anchor | `0x18109c29` |
+| ASERT AuxPoW anchor | `0x1801ca70` |
 
 Mainnet-capable binaries are the build default. Operators who intentionally
 need a binary that rejects mainnet must build with
@@ -145,9 +142,9 @@ principal changes in that range are listed below. The following
 - Set the launch blockchain and chainstate size estimates to zero so initial
   storage guidance does not imply pre-existing mainnet history.
 - Added a fail-closed mainnet posture validator and a phase-aware Core Checks
-  job. Staging accepts exactly the declared genesis/ASERT and AuxPoW chain-ID
-  blockers; final CI and the publisher require complete success and reject
-  incomplete bootstrap wiring or missing default-mainnet assertions.
+  job. The checked-in final policy and the publisher require complete success
+  and reject altered genesis/ASERT commitments, incomplete bootstrap wiring,
+  or missing default-mainnet assertions.
 - Added mainnet operator, mining-pool, exchange, bootstrap, compatibility, and
   release-verification guidance.
 
@@ -170,13 +167,16 @@ Overall v1.0.0 summary
 
 - Mainnet uses a 60-second aggregate Cadence target split between a 75-second
   permissionless lane and a 300-second AuxPoW lane.
+- Mainnet AuxPoW uses production chain ID `47`, distinct from public
+  testnet4 chain ID `31430`.
 - Both lanes use independent ASERT difficulty tracking with a two-hour
   half-life.
 - Launch difficulty is fixed from the July 13, 2026 Hashrate Index snapshot:
   the permissionless lane uses the seven-day average USD hashprice, while the
   AuxPoW lane assumes 1% of the seven-day Bitcoin hashrate SMA. The selected
-  final genesis target matches public testnet4 `nBits`; staging retains a
-  separately declared, easier runtime target until the final genesis is mined.
+  genesis target matches public testnet4 `nBits`. The mined mainnet block and
+  all three ASERT lane-anchor targets are pinned in source and checked by the
+  publication gate.
 - Permissionless mining uses `getblocktemplate` and `submitblock`.
 - Merged mining uses `createauxblock` and `submitauxblock`; pool software must
   follow the commitment order and chain ID returned by the node.
@@ -192,9 +192,9 @@ Overall v1.0.0 summary
 
 ### Release security
 
-- Mainnet publication fails closed unless the signed tag target has a distinct
-  production AuxPoW chain ID, final sourced genesis/ASERT data, exact bootstrap
-  seed generation, and tested default-mainnet build behavior.
+- Mainnet publication fails closed unless the signed tag target retains
+  production AuxPoW chain ID `47`, final sourced genesis/ASERT data, exact
+  bootstrap seed generation, and tested default-mainnet build behavior.
 - Release source is bound to a verified signed annotated tag and a distinct
   trusted validation ref.
 - Builder attestations bind each counted artifact set to the reconstructed

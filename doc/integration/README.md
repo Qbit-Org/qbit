@@ -3,15 +3,11 @@
 These documents are for services, tools, pools, exchanges, custodians, miners,
 and developers integrating with qbit.
 
-Mainnet is not public yet. Treat mainnet-specific instructions as "when
-launched" guidance until qbit.org announces the public network and resource
-set.
-
-Official public testnet release artifacts are for testnet4. No-flag mainnet
-commands in these integration docs are future-mainnet examples only. The source
-is open, so third parties can fork it or run private networks, but only
-qbit-published artifacts, tags, release notes, seed resources, and qbit.org
-announcements define official qbit networks.
+Qbit v1.0.0 launches mainnet as the default chain. Public testnet4 remains
+available through its explicit chain flags. The source is open, so third
+parties can fork it or run private networks, but only qbit-published artifacts,
+tags, release notes, seed resources, and qbit.org announcements define official
+qbit networks.
 
 ## qbit Integration Guides
 
