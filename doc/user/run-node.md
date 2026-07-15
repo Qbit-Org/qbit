@@ -90,8 +90,8 @@ dns=1
 dnsseed=1
 fixedseeds=1
 
-connectarchive=<archive-host-1>:8355
-connectarchive=<archive-host-2>:8355
+connectarchive=positron-mainnet.qbit.org:8355
+connectarchive=graviton-mainnet.qbit.org:8355
 ```
 
 Use the endpoints published for your specific release or network reset. Do not
@@ -153,9 +153,11 @@ The intended launch posture is:
 4. fall back to published `-connectarchive` endpoints if automatic bootstrap is
    degraded
 
-Seed hostnames, fixed-seed state, and archive fallback endpoints are
-release/network-resource values. Use the values published through qbit.org for
-the release and network you are running.
+The v1.0.0 launch source uses `flux-mainnet.qbit.org` and
+`phase-mainnet.qbit.org` for automatic DNS discovery. Its fixed seeds are the
+numeric launch addresses for `positron-mainnet.qbit.org:8355` and
+`graviton-mainnet.qbit.org:8355`. Use qbit.org to confirm their current
+operational status for the release and network you are running.
 
 Fixed seeds and archive fallback endpoints are not the same configuration
 surface. Fixed seeds are compiled into a release and are used automatically as a
@@ -177,8 +179,8 @@ Example:
 
 ```bash
 qbitd <chain option> \
-  -connectarchive=<archive-host-1>:<p2p-port> \
-  -connectarchive=<archive-host-2>:<p2p-port>
+  -connectarchive=positron-mainnet.qbit.org:8355 \
+  -connectarchive=graviton-mainnet.qbit.org:8355
 ```
 
 qbit checks these peers before treating them as archive fallback peers. A

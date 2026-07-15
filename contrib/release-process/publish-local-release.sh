@@ -702,6 +702,7 @@ required_trusted_paths=(
     ci/release/validate_release_artifacts.py
     ci/release/validate_builder_attestations.py
     ci/release/validate_key_metadata.py
+    ci/release/verify_mainnet_release_posture.py
     ci/release/verify_p2mr_v1_conformance.py
     ci/release/verify_testnet_release_posture.py
     contrib/keys/operator-keys/keys.json
@@ -767,6 +768,13 @@ LOCAL_ASSET_MANIFEST="$WORK_DIR/local-assets.tsv"
 REMOTE_ASSET_MANIFEST="$WORK_DIR/remote-assets.tsv"
 : > "$VALIDATION_OUTPUT"
 [ -z "$NOTES_FILE" ] || prepare_release_notes
+
+if [ "$RELEASE_LINE" = mainnet ]; then
+    msg "Validating fail-closed mainnet launch posture"
+    python3 "$TRUSTED_ROOT/ci/release/verify_mainnet_release_posture.py" \
+        --source-root "$TRUSTED_ROOT" \
+        --release-tag "$TAG"
+fi
 
 if [ "$P2MR_CONFORMANCE_REQUESTED" -eq 1 ]; then
     msg "Validating qbit P2MR v1 release conformance"

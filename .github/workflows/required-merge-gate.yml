@@ -335,6 +335,8 @@ jobs:
             ci.release.test_validate_builder_attestations
             ci.release.test_validate_key_metadata
             ci.release.test_validate_release_artifacts
+            ci.release.test_verify_mainnet_ci_posture
+            ci.release.test_verify_mainnet_release_posture
             ci.release.test_verify_p2mr_v1_conformance
           )
           if [[ -f ci/release/test_verify_testnet_release_posture.py ]]; then
@@ -748,6 +750,7 @@ jobs:
                 echo "::error title=Required Merge Gate failed::Release-policy validation result was ${RELEASE_POLICY_VALIDATION_RESULT}."
                 exit 1
               fi
+              wait_for_checks "Core Checks Gate"
               exit 0
               ;;
             rpc-docs)

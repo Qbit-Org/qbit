@@ -1,9 +1,14 @@
 {
+  "schema": 1,
   "network": "main",
   "pow_limit_bits": "0x1f00ffff",
   "genesis": {
-    "temporary_bits": "0x1f00ffff",
-    "source": "Temporary development genesis target. Final mainnet genesis will be mined later; ASERT anchors carry the draft launch difficulty."
+    "model": "fixed_bits",
+    "bits": "0x1a7f1ab5",
+    "expected_bits": "0x1a7f1ab5",
+    "reference_network": "testnet4",
+    "temporary_runtime_bits": "0x1f00ffff",
+    "source": "Launch policy fixes the final mainnet genesis header target to the public qbit testnet4 genesis nBits; the separately declared temporary runtime target keeps staging binaries runnable until the final genesis is mined."
   },
   "permissionless": {
     "model": "fdv_hashprice",
@@ -11,13 +16,27 @@
     "total_supply_qbt": "210000000",
     "subsidy_qbt": "210",
     "expected_fees_qbt": "0",
-    "hashprice_usd_per_ph_day": "30.67"
+    "hashprice_usd_per_ph_day": "30.39",
+    "hashprice_basis": "7-day average",
+    "observed_at": "2026-07-13T21:00:00Z",
+    "source_url": "https://hashrateindex.com/blog/hashrate-index-roundup-july-13-2026/",
+    "policy_source_url": "https://github.com/Qbit-Org/qbit-white-paper/blob/1ab5f360e9e79060b3f74bf571affe52ffde2c84/paper/qbit-whitepaper.md#63-initial-difficulty",
+    "derived_difficulty_approx": "66194694345.81881",
+    "expected_bits": "0x18109c29",
+    "source": "Hashrate Index Roundup dated July 13, 2026; 7-day average USD hashprice observed at 21:00 UTC."
   },
   "auxpow": {
     "model": "bitcoin_hashrate_share",
-    "bitcoin_global_hashrate_eh_s": "1000",
+    "bitcoin_global_hashrate_eh_s": "879",
+    "bitcoin_hashrate_basis": "7-day simple moving average",
     "hashrate_share": "0.01",
     "target_spacing_sec": "300",
-    "source": "Draft rounded launch assumption. Replace with sourced Bitcoin hashrate snapshot before final mainnet genesis."
+    "observed_at": "2026-07-13T21:00:00Z",
+    "source_url": "https://hashrateindex.com/blog/hashrate-index-roundup-july-13-2026/",
+    "policy_source_url": "https://github.com/Qbit-Org/qbit-white-paper/blob/1ab5f360e9e79060b3f74bf571affe52ffde2c84/paper/qbit-whitepaper.md#63-initial-difficulty",
+    "derived_hashrate_eh_s": "8.79",
+    "derived_difficulty_approx": "613974407315.25421",
+    "expected_bits": "0x1801ca70",
+    "source": "Hashrate Index Roundup dated July 13, 2026; Bitcoin 7-day hashrate SMA observed at 21:00 UTC, combined with the approved 1% launch participation assumption."
   }
 }

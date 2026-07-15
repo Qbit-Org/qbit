@@ -43,6 +43,7 @@ jobs:
       profile: ${{ steps.classify.outputs.profile }}
       release_policy_only: ${{ steps.classify.outputs.release_policy_only }}
       source_validation_required: ${{ steps.classify.outputs.source_validation_required }}
+      mainnet_publish_gate_required: ${{ steps.release-target.outputs.mainnet_publish_gate_required }}
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -102,6 +103,22 @@ jobs:
           python3 ci/checks/classify_merge_profile.py \
             --changed-files "${{ steps.changed-files.outputs.changed_files }}" \
             --github-output "$GITHUB_OUTPUT"
+
+      - name: Classify release target
+        id: release-target
+        env:
+          TARGET_REF: ${{ github.base_ref || github.event.merge_group.base_ref || github.ref }}
+          VALIDATION_PROFILE: ${{ steps.classify.outputs.profile }}
+        run: |
+          set -euo pipefail
+
+          target_branch="${TARGET_REF#refs/heads/}"
+          if [[ "${target_branch}" == "1.0.0" ]] && \
+             [[ "${VALIDATION_PROFILE}" == "source" || "${VALIDATION_PROFILE}" == "release-policy" ]]; then
+            echo "mainnet_publish_gate_required=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "mainnet_publish_gate_required=false" >> "$GITHUB_OUTPUT"
+          fi
 
   build-smoke:
     name: build smoke
@@ -444,6 +461,8 @@ jobs:
             ci/release/test_validate_builder_attestations.py
             ci/release/test_validate_key_metadata.py
             ci/release/test_validate_release_artifacts.py
+            ci/release/test_verify_mainnet_ci_posture.py
+            ci/release/test_verify_mainnet_release_posture.py
             ci/release/test_verify_p2mr_v1_conformance.py
             ci/release/test_verify_testnet_release_posture.py
             contrib/guix/test_build_config.py
@@ -470,6 +489,54 @@ jobs:
             python3 "${test_file}"
           done
 
+  mainnet-publish-gate:
+    name: mainnet publication posture
+    needs: classify-changes
+    if: ${{ needs.classify-changes.outputs.mainnet_publish_gate_required == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+
+      - name: Create immutable CI release-candidate tag
+        id: release-candidate
+        run: |
+          set -euo pipefail
+
+          source_sha="$(git rev-parse HEAD)"
+          candidate_tag="v0.0.0-mainnet-posture-ci.${source_sha}"
+          git \
+            -c user.name='qbit Core Checks' \
+            -c user.email='core-checks@qbit.org' \
+            -c tag.gpgSign=false \
+            tag --annotate "${candidate_tag}" "${source_sha}" \
+            --message "Core Checks mainnet posture candidate ${source_sha}"
+          echo "tag=${candidate_tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Run fail-closed mainnet publication gate
+        env:
+          RELEASE_CANDIDATE_TAG: ${{ steps.release-candidate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          posture_result="${RUNNER_TEMP}/mainnet-posture-result.json"
+
+          set +e
+          python3 ci/release/verify_mainnet_release_posture.py \
+            --source-root "$GITHUB_WORKSPACE" \
+            --release-tag "${RELEASE_CANDIDATE_TAG}" \
+            --result-json "${posture_result}"
+          validator_exit_code=$?
+          set -e
+
+          python3 ci/release/verify_mainnet_ci_posture.py \
+            --policy ci/release/mainnet_ci_posture.json \
+            --result-json "${posture_result}" \
+            --validator-exit-code "${validator_exit_code}"
+
   core-checks-gate:
     name: 'Core Checks Gate'
     runs-on: ubuntu-24.04
@@ -480,9 +547,10 @@ jobs:
       - p2mr-v1-conformance
       - functional-smoke
       - release-validator-tests
-    # Aggregate core check input for Required Merge Gate. Source jobs are skipped
-    # only for the strict release-policy profile; every other profile requires
-    # the core jobs to complete successfully.
+      - mainnet-publish-gate
+    # Aggregate core check input for Required Merge Gate. The phase-aware
+    # mainnet posture runs for source and release-policy changes targeting
+    # 1.0.0; source build/test jobs remain conditional on source validation.
     if: ${{ always() }}
     steps:
       - name: Check core check results
@@ -495,6 +563,8 @@ jobs:
           P2MR_V1_CONFORMANCE_RESULT: ${{ needs.p2mr-v1-conformance.result }}
           FUNCTIONAL_SMOKE_RESULT: ${{ needs.functional-smoke.result }}
           RELEASE_VALIDATOR_TESTS_RESULT: ${{ needs.release-validator-tests.result }}
+          MAINNET_PUBLISH_GATE_REQUIRED: ${{ needs.classify-changes.outputs.mainnet_publish_gate_required }}
+          MAINNET_PUBLISH_GATE_RESULT: ${{ needs.mainnet-publish-gate.result }}
         run: |
           set -euo pipefail
 
@@ -511,6 +581,12 @@ jobs:
           }
 
           check_result "classify validation profile" "${CLASSIFY_CHANGES_RESULT}"
+
+          if [[ "${MAINNET_PUBLISH_GATE_REQUIRED}" == "true" ]]; then
+            check_result "mainnet publication posture" "${MAINNET_PUBLISH_GATE_RESULT}"
+          else
+            echo "Mainnet publication posture is not required for this target/profile."
+          fi
 
           if [[ "${SOURCE_VALIDATION_REQUIRED}" != "true" ]]; then
             echo "Validation profile ${VALIDATION_PROFILE} does not require source core checks."

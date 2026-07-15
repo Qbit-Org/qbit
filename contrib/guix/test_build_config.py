@@ -15,24 +15,16 @@ BUILD_SH = REPO_ROOT / "contrib" / "guix" / "libexec" / "build.sh"
 
 
 class GuixBuildConfigTest(unittest.TestCase):
-    def test_testnet_release_builds_enable_mainnet_guard(self) -> None:
+    def test_release_builds_default_mainnet_guard_off(self) -> None:
         script = BUILD_SH.read_text(encoding="utf8")
 
-        self.assertRegex(
-            script,
-            re.compile(
-                r'case "\$DISTNAME" in\s+'
-                r'qbit-\*-testnet\*\) qbit_testnet_only_release_default=ON ;;',
-                re.MULTILINE,
-            ),
-        )
+        self.assertNotRegex(script, re.compile(r'qbit-\*-testnet', re.MULTILINE))
         self.assertIn(
             '-DQBIT_TESTNET_ONLY_RELEASE=$QBIT_TESTNET_ONLY_RELEASE',
             script,
         )
         self.assertIn(
-            'QBIT_TESTNET_ONLY_RELEASE="${QBIT_TESTNET_ONLY_RELEASE:-'
-            '$qbit_testnet_only_release_default}"',
+            'QBIT_TESTNET_ONLY_RELEASE="${QBIT_TESTNET_ONLY_RELEASE:-OFF}"',
             script,
         )
 

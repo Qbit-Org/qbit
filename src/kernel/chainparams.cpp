@@ -41,10 +41,11 @@ static constexpr int QBIT_PUBLIC_TESTNET_AUXPOW_CHAIN_ID{31430};
 static constexpr int QBIT_TEST_CHAIN_AUXPOW_CHAIN_ID{QBIT_PUBLIC_TESTNET_AUXPOW_CHAIN_ID};
 static constexpr int QBIT_TESTNET4_AUXPOW_DISPLAY_COMMITMENT_HEIGHT{20'500};
 
-// Mainnet is not launched. This placeholder intentionally matches public
-// testnet only while mainnet params are still development scaffolding. Replace
-// it with a distinct final value before mainnet is enabled or reset.
-static constexpr int QBIT_MAINNET_PLACEHOLDER_AUXPOW_CHAIN_ID{QBIT_PUBLIC_TESTNET_AUXPOW_CHAIN_ID};
+// MAINNET LAUNCH BLOCKER: this is deliberately not the final mainnet AuxPoW
+// chain ID. It repeats the public-testnet value so no reviewer or pool operator
+// can mistake it for a separately allocated production ID. Replace this
+// constant, its tests, and the mining documentation before the v1.0.0 tag.
+static constexpr int QBIT_MAINNET_PLACEHOLDER_AUXPOW_CHAIN_ID{31430};
 
 static CBlock CreateGenesisBlock(const CScript& genesisInputScript, const CScript& genesisOutputScript, uint32_t nTime, uint32_t nNonce, uint32_t nBits, int32_t nVersion, const CAmount& genesisReward)
 {
@@ -148,10 +149,11 @@ public:
         consensus.fRestrictedOutputMode = true;
         consensus.fPowUseASERT = true;
         consensus.nASERTHalfLife = 2 * 60 * 60;
-        // Draft launch calibration from src/test/data/mainnet_launch_difficulty.json:
-        // permissionless uses $100M FDV and $30.67/PH/day hashprice; AuxPoW uses
-        // 1% of a rounded 1000 EH/s Bitcoin hashrate at 300s target spacing.
-        consensus.asertAnchorParams = Consensus::ASERTAnchor{0, 0x1810c357, 0x1810c357, 0x180192f8, 0, 1738713600};
+        // Dated launch calibration from src/test/data/mainnet_launch_difficulty.json:
+        // permissionless uses $100M FDV and the July 13, 2026 7-day average
+        // $30.39/PH/day hashprice; AuxPoW uses 1% of the 879 EH/s Bitcoin
+        // 7-day hashrate SMA at 300s target spacing.
+        consensus.asertAnchorParams = Consensus::ASERTAnchor{0, 0x18109c29, 0x18109c29, 0x1801ca70, 0, 1738713600};
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 0;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
@@ -181,11 +183,13 @@ public:
         pchMessageStart[3] = 0xa8;
         nDefaultPort = 8355;
         nPruneAfterHeight = 100000;
-        m_assumed_blockchain_size = 1; // qbit: placeholder, chain doesn't exist yet
-        m_assumed_chain_state_size = 1;
+        m_assumed_blockchain_size = 0; // No mainnet history exists at launch.
+        m_assumed_chain_state_size = 0;
 
-        // Temporary development genesis target. ASERT lane anchors below carry the
-        // draft launch difficulty until the final mainnet genesis is mined.
+        // The selected final genesis target is 0x1a7f1ab5; the explicitly
+        // declared temporary runtime target below keeps staging binaries usable.
+        // MAINNET LAUNCH BLOCKER: mine the final genesis identity and replace its
+        // timestamp, nonce, hash, merkle root, and temporary nBits.
         genesis = CreateGenesisBlock(1738713600, 45609, 0x1f00ffff, 1, consensus.nSubsidyInitial);
         consensus.hashGenesisBlock = genesis.GetHash();
         consensus.BIP34Hash = consensus.hashGenesisBlock;
@@ -197,8 +201,8 @@ public:
         // This is fine at runtime as we'll fall back to using them as an addrfetch if they don't support the
         // service bits we want, but we should get them updated to support all service bits wanted by any
         // release ASAP to avoid it where possible.
-        // qbit: no DNS seeds yet — network doesn't exist
-        vSeeds.clear();
+        vSeeds.emplace_back("flux-mainnet.qbit.org");
+        vSeeds.emplace_back("phase-mainnet.qbit.org");
 
         base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1,58);  // 'Q'
         base58Prefixes[SCRIPT_ADDRESS] = std::vector<unsigned char>(1,63);  // 'S'
@@ -208,7 +212,7 @@ public:
 
         bech32_hrp = "qb";
 
-        vFixedSeeds.clear(); // qbit: no fixed seeds yet
+        vFixedSeeds = std::vector<uint8_t>(chainparams_seed_main.begin(), chainparams_seed_main.end());
 
         fDefaultConsistencyChecks = false;
         m_is_mockable_chain = false;

@@ -14,9 +14,9 @@ this source tree are guidance for when qbit mainnet is announced.
 
 Official public testnet release artifacts are for qbit testnet4. Start them
 with `-testnet4` or `-chain=testnet4`; no-flag mainnet commands in this tree
-are future-mainnet guidance only. The in-tree mainnet parameters, genesis
-block, and any derived hash are development placeholders, not a qbit mainnet
-launch commitment.
+are future-mainnet guidance only. The in-tree mainnet genesis block, derived
+hash, ASERT launch calibration, and AuxPoW chain ID remain explicit launch
+placeholders, not qbit mainnet launch commitments.
 
 The qbit source is open, so third parties can fork it or run private networks.
 Only qbit-published artifacts, tags, release notes, seed resources, and
