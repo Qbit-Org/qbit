@@ -812,36 +812,35 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_launch_bootstrap)
     BOOST_CHECK(consensus.defaultAssumeValid.IsNull());
 }
 
-BOOST_AUTO_TEST_CASE(ChainParams_MAIN_auxpow_chain_id_is_placeholder)
+BOOST_AUTO_TEST_CASE(ChainParams_MAIN_auxpow_chain_id_is_distinct)
 {
     const auto main_consensus = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
     const auto testnet4_consensus = CreateChainParams(*m_node.args, ChainType::TESTNET4)->GetConsensus();
 
+    BOOST_CHECK_EQUAL(main_consensus.nAuxpowChainId, 47);
     BOOST_CHECK_EQUAL(testnet4_consensus.nAuxpowChainId, 31430);
-    // MAINNET LAUNCH BLOCKER: the mainnet value intentionally remains the
-    // public-testnet placeholder until the final allocation is approved.
-    BOOST_CHECK_EQUAL(main_consensus.nAuxpowChainId, testnet4_consensus.nAuxpowChainId);
+    BOOST_CHECK_NE(main_consensus.nAuxpowChainId, testnet4_consensus.nAuxpowChainId);
 }
 
 BOOST_AUTO_TEST_CASE(ChainParams_MAIN_launch_difficulty_config)
 {
     const UniValue config = ReadMainnetLaunchDifficultyConfig();
     const UniValue& genesis_config = RequiredObject(config, "genesis");
+    const UniValue& mined_genesis = RequiredObject(genesis_config, "mined");
     const UniValue& permissionless_config = RequiredObject(config, "permissionless");
     const UniValue& auxpow_config = RequiredObject(config, "auxpow");
     const uint32_t genesis_bits = CalculateGenesisLaunchBits(config);
-    const uint32_t runtime_genesis_bits = ParseBits(RequiredString(genesis_config, "temporary_runtime_bits"));
     const uint32_t permissionless_bits = CalculatePermissionlessLaunchBits(config);
     const uint32_t auxpow_bits = CalculateAuxPowLaunchBits(config);
 
     BOOST_CHECK_EQUAL(RequiredString(genesis_config, "reference_network"), "testnet4");
     BOOST_CHECK_EQUAL(genesis_bits, ParseBits(RequiredString(genesis_config, "expected_bits")));
-    BOOST_CHECK_NE(runtime_genesis_bits, genesis_bits);
     BOOST_CHECK_EQUAL(permissionless_bits, ParseBits(RequiredString(permissionless_config, "expected_bits")));
     BOOST_CHECK_EQUAL(auxpow_bits, ParseBits(RequiredString(auxpow_config, "expected_bits")));
 
     const auto chain_params = CreateChainParams(*m_node.args, ChainType::MAIN);
     const auto testnet4_chain_params = CreateChainParams(*m_node.args, ChainType::TESTNET4);
+    const CBlock& genesis_block = chain_params->GenesisBlock();
     const auto& consensus = chain_params->GetConsensus();
 
     BOOST_CHECK_EQUAL(consensus.fPowUseASERT, true);
@@ -849,17 +848,41 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_launch_difficulty_config)
     BOOST_CHECK_EQUAL(consensus.nPowTargetSpacingLegacy, 75);
     BOOST_CHECK_EQUAL(consensus.nPowTargetSpacingAuxPow, 300);
 
-    BOOST_CHECK_EQUAL(chain_params->GenesisBlock().nBits, runtime_genesis_bits);
+    BOOST_CHECK_EQUAL(
+        RequiredString(genesis_config, "timestamp_message"),
+        "Google: Securing ECC Cryptocurrencies against Quantum Vulnerabilities 958157:3abaf85");
+    BOOST_CHECK_EQUAL(
+        RequiredString(genesis_config, "timestamp_source_url"),
+        "https://arxiv.org/abs/2603.28846");
+    BOOST_CHECK_EQUAL(RequiredString(genesis_config, "max_coinbase_script_sig_bytes"), "100");
+    BOOST_CHECK_EQUAL(RequiredString(genesis_config, "max_second_push_extranonce_bytes"), "8");
+    BOOST_CHECK_EQUAL(genesis_block.nVersion, static_cast<int32_t>(ParseUint32(RequiredString(mined_genesis, "nversion"))));
+    BOOST_CHECK_EQUAL(genesis_block.nTime, ParseUint32(RequiredString(mined_genesis, "ntime")));
+    BOOST_CHECK_EQUAL(genesis_block.nBits, ParseBits(RequiredString(mined_genesis, "nbits")));
+    BOOST_CHECK_EQUAL(genesis_block.nNonce, ParseUint32(RequiredString(mined_genesis, "nnonce")));
+    BOOST_CHECK_EQUAL(consensus.hashGenesisBlock.ToString(), RequiredString(mined_genesis, "hash"));
+    BOOST_CHECK_EQUAL(genesis_block.GetHash().ToString(), RequiredString(mined_genesis, "hash"));
+    BOOST_CHECK_EQUAL(genesis_block.hashMerkleRoot.ToString(), RequiredString(mined_genesis, "merkle_root"));
+    BOOST_REQUIRE_EQUAL(genesis_block.vtx.size(), 1U);
+    BOOST_REQUIRE_EQUAL(genesis_block.vtx[0]->vin.size(), 1U);
+    BOOST_REQUIRE_EQUAL(genesis_block.vtx[0]->vout.size(), 1U);
+    BOOST_CHECK_EQUAL(genesis_block.vtx[0]->vin[0].scriptSig.size(), 100U);
+    BOOST_CHECK_EQUAL(genesis_block.vtx[0]->vout[0].nValue, 210 * COIN);
+    BOOST_CHECK_EQUAL(HexStr(genesis_block.vtx[0]->vin[0].scriptSig), RequiredString(mined_genesis, "coinbase_script_sig_hex"));
+    BOOST_CHECK_EQUAL(HexStr(genesis_block.vtx[0]->vout[0].scriptPubKey), RequiredString(mined_genesis, "genesis_output_script_hex"));
+    BOOST_CHECK_EQUAL(EncodeHexTx(*genesis_block.vtx[0]), RequiredString(mined_genesis, "coinbase_tx_hex"));
+
+    BOOST_CHECK_EQUAL(genesis_block.nBits, genesis_bits);
     BOOST_CHECK_EQUAL(testnet4_chain_params->GenesisBlock().nBits, genesis_bits);
-    BOOST_CHECK(CheckProofOfWork(chain_params->GenesisBlock().GetHash(), runtime_genesis_bits, consensus));
+    BOOST_CHECK(CheckProofOfWork(chain_params->GenesisBlock().GetHash(), genesis_bits, consensus));
     BOOST_CHECK_EQUAL(consensus.asertAnchorParams.nBits, permissionless_bits);
     BOOST_CHECK_EQUAL(consensus.asertAnchorParams.nBitsLegacy, permissionless_bits);
     BOOST_CHECK_EQUAL(consensus.asertAnchorParams.nBitsAuxPow, auxpow_bits);
     BOOST_CHECK_EQUAL(consensus.asertAnchorParams.nHeight, 0);
     BOOST_CHECK_EQUAL(consensus.asertAnchorParams.nAuxPow, 0U);
-    BOOST_CHECK_EQUAL(consensus.asertAnchorParams.nBlockTime, chain_params->GenesisBlock().nTime);
+    BOOST_CHECK_EQUAL(consensus.asertAnchorParams.nBlockTime, genesis_block.nTime);
 
-    CBlockIndex genesis{chain_params->GenesisBlock()};
+    CBlockIndex genesis{genesis_block};
     genesis.nHeight = consensus.asertAnchorParams.nHeight;
     genesis.nAuxPow = consensus.asertAnchorParams.nAuxPow;
 

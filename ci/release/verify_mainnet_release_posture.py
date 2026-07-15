@@ -7,9 +7,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import ipaddress
 import json
 import re
+import struct
 import subprocess
 import sys
 from fractions import Fraction
@@ -427,16 +429,124 @@ def calculate_auxpow_bits(artifact: dict[str, Any]) -> int:
     return difficulty_to_bits(difficulty, pow_limit_bits)
 
 
-def extract_genesis_bits(
+def extract_genesis_call(
     class_body: str, constants: dict[str, str], class_name: str
-) -> int:
+) -> tuple[int, int, int, int]:
     match = re.search(
-        r"genesis\s*=\s*Create(?:TestNet4)?GenesisBlock\(\s*[^,]+,\s*[^,]+,\s*([^,\s]+)",
+        r"genesis\s*=\s*Create(?:MainNet|TestNet4)?GenesisBlock\("
+        r"\s*([^,]+),\s*([^,]+),\s*([^,]+),\s*([^,]+),",
         strip_cpp_comments(class_body),
     )
     if match is None:
         raise MainnetPostureError(f"{class_name} is missing CreateGenesisBlock nBits")
-    return resolve_cpp_int(match.group(1), constants)
+    return tuple(resolve_cpp_int(match.group(index), constants) for index in range(1, 5))
+
+
+def required_hex(
+    value: dict[str, Any], key: str, location: str, *, byte_length: int | None = None
+) -> tuple[str, bytes]:
+    encoded = required_artifact_string(value, key, location)
+    if not re.fullmatch(r"[0-9a-f]+", encoded) or len(encoded) % 2:
+        raise MainnetPostureError(f"{location}.{key} must be lowercase hexadecimal")
+    decoded = bytes.fromhex(encoded)
+    if byte_length is not None and len(decoded) != byte_length:
+        raise MainnetPostureError(
+            f"{location}.{key} must be exactly {byte_length} bytes"
+        )
+    return encoded, decoded
+
+
+def verify_mined_genesis(
+    genesis: dict[str, Any], genesis_bits: int
+) -> dict[str, int | str]:
+    genesis_location = "mainnet_launch_difficulty.json.genesis"
+    mined = genesis.get("mined")
+    if not isinstance(mined, dict):
+        raise MainnetPostureError(f"{genesis_location}.mined must be an object")
+    mined_location = f"{genesis_location}.mined"
+
+    nversion = int(required_artifact_string(mined, "nversion", mined_location), 10)
+    ntime = int(required_artifact_string(mined, "ntime", mined_location), 10)
+    nnonce = int(required_artifact_string(mined, "nnonce", mined_location), 10)
+    for name, number in (("nversion", nversion), ("ntime", ntime), ("nnonce", nnonce)):
+        if not 0 <= number <= 0xFFFFFFFF:
+            raise MainnetPostureError(f"{mined_location}.{name} is outside uint32 range")
+    mined_bits = parse_artifact_bits(
+        required_artifact_string(mined, "nbits", mined_location),
+        f"{mined_location}.nbits",
+    )
+    if mined_bits != genesis_bits:
+        raise MainnetPostureError(
+            f"mined genesis nBits is 0x{mined_bits:08x}, fixture requires 0x{genesis_bits:08x}"
+        )
+
+    block_hash, _ = required_hex(mined, "hash", mined_location, byte_length=32)
+    merkle_root, merkle_bytes = required_hex(
+        mined, "merkle_root", mined_location, byte_length=32
+    )
+    target_hex, _ = required_hex(mined, "target", mined_location, byte_length=32)
+    script_sig_hex, script_sig = required_hex(
+        mined, "coinbase_script_sig_hex", mined_location
+    )
+    _, coinbase_tx = required_hex(mined, "coinbase_tx_hex", mined_location)
+    output_script_hex, output_script = required_hex(
+        mined, "genesis_output_script_hex", mined_location
+    )
+
+    max_script_sig = int(
+        required_artifact_string(
+            genesis, "max_coinbase_script_sig_bytes", genesis_location
+        ),
+        10,
+    )
+    if len(script_sig) != max_script_sig or max_script_sig > 100:
+        raise MainnetPostureError(
+            f"mined genesis scriptSig is {len(script_sig)} bytes; configured limit is {max_script_sig}"
+        )
+    timestamp = required_artifact_string(
+        genesis, "timestamp_message", genesis_location
+    ).encode("utf8")
+    if timestamp not in script_sig:
+        raise MainnetPostureError("mined genesis scriptSig does not contain timestamp_message")
+    if script_sig not in coinbase_tx or output_script not in coinbase_tx:
+        raise MainnetPostureError(
+            "mined genesis coinbase transaction does not contain its declared scripts"
+        )
+
+    calculated_merkle = hashlib.sha256(hashlib.sha256(coinbase_tx).digest()).digest()[::-1]
+    if calculated_merkle.hex() != merkle_root:
+        raise MainnetPostureError(
+            "mined genesis coinbase transaction does not produce its declared merkle root"
+        )
+    header = (
+        struct.pack("<I", nversion)
+        + bytes(32)
+        + merkle_bytes[::-1]
+        + struct.pack("<III", ntime, mined_bits, nnonce)
+    )
+    calculated_hash = hashlib.sha256(hashlib.sha256(header).digest()).digest()[::-1].hex()
+    if calculated_hash != block_hash:
+        raise MainnetPostureError(
+            f"mined genesis header hashes to {calculated_hash}, not {block_hash}"
+        )
+    target = compact_to_target(mined_bits, f"{mined_location}.nbits")
+    if target_hex != f"{target:064x}":
+        raise MainnetPostureError(
+            f"mined genesis target is {target_hex}, compact nBits requires {target:064x}"
+        )
+    if int(block_hash, 16) > target:
+        raise MainnetPostureError("mined genesis hash does not satisfy its target")
+
+    return {
+        "nversion": nversion,
+        "ntime": ntime,
+        "nnonce": nnonce,
+        "nbits": mined_bits,
+        "hash": block_hash,
+        "merkle_root": merkle_root,
+        "coinbase_script_sig_hex": script_sig_hex,
+        "genesis_output_script_hex": output_script_hex,
+    }
 
 
 def validate_launch_calibration(artifact: dict[str, Any], chainparams: str) -> None:
@@ -541,6 +651,7 @@ def validate_launch_calibration(artifact: dict[str, Any], chainparams: str) -> N
         raise MainnetPostureError(
             "launch fixture target mismatch: " + "; ".join(mismatches)
         )
+    mined = verify_mined_genesis(genesis, genesis_bits)
 
     constants = parse_cpp_int_constants(chainparams)
     main_body = extract_class_body(chainparams, "CMainParams")
@@ -555,9 +666,12 @@ def validate_launch_calibration(artifact: dict[str, Any], chainparams: str) -> N
     anchor_tokens = [token.strip() for token in anchor_match.group(1).split(",")]
     if len(anchor_tokens) != 6:
         raise MainnetPostureError("CMainParams ASERT anchor must contain six fields")
-    anchor_bits = [
-        resolve_cpp_int(anchor_tokens[index], constants) for index in (1, 2, 3)
-    ]
+    anchor = [resolve_cpp_int(token, constants) for token in anchor_tokens]
+    anchor_bits = anchor[1:4]
+    main_genesis_call = extract_genesis_call(main_body, constants, "CMainParams")
+    testnet4_genesis_call = extract_genesis_call(
+        testnet4_body, constants, "CTestNet4Params"
+    )
     asserted_hash_match = re.search(
         r'assert\(consensus[.]hashGenesisBlock\s*==\s*uint256\{"([0-9A-Fa-f]{64})"\}\)',
         main_code,
@@ -566,20 +680,73 @@ def validate_launch_calibration(artifact: dict[str, Any], chainparams: str) -> N
         raise MainnetPostureError(
             "CMainParams is missing a full-width asserted genesis hash"
         )
-    asserted_hash = int(asserted_hash_match.group(1), 16)
+    asserted_hash_hex = asserted_hash_match.group(1).lower()
+    asserted_hash = int(asserted_hash_hex, 16)
     if asserted_hash > runtime_target:
         raise MainnetPostureError(
             "mainnet asserted genesis hash does not satisfy its runtime target"
         )
+    asserted_merkle_match = re.search(
+        r'assert\(genesis[.]hashMerkleRoot\s*==\s*uint256\{"([0-9A-Fa-f]{64})"\}\)',
+        main_code,
+    )
+    if asserted_merkle_match is None:
+        raise MainnetPostureError(
+            "CMainParams is missing a full-width asserted genesis merkle root"
+        )
+    asserted_merkle_hex = asserted_merkle_match.group(1).lower()
+
+    identity_mismatches: list[str] = []
+    mined_call = (
+        int(mined["ntime"]),
+        int(mined["nnonce"]),
+        int(mined["nbits"]),
+        int(mined["nversion"]),
+    )
+    if main_genesis_call != mined_call:
+        identity_mismatches.append(
+            f"mainnet genesis call is {main_genesis_call}, mined record requires {mined_call}"
+        )
+    if asserted_hash_hex != mined["hash"]:
+        identity_mismatches.append(
+            f"asserted genesis hash is {asserted_hash_hex}, mined record requires {mined['hash']}"
+        )
+    if asserted_merkle_hex != mined["merkle_root"]:
+        identity_mismatches.append(
+            "asserted genesis merkle root is "
+            f"{asserted_merkle_hex}, mined record requires {mined['merkle_root']}"
+        )
+    expected_anchor = (
+        0,
+        permissionless_bits,
+        permissionless_bits,
+        auxpow_bits,
+        0,
+        int(mined["ntime"]),
+    )
+    if tuple(anchor) != expected_anchor:
+        identity_mismatches.append(
+            f"ASERT anchor is {tuple(anchor)}, launch record requires {expected_anchor}"
+        )
+    if str(mined["coinbase_script_sig_hex"]) not in chainparams:
+        identity_mismatches.append(
+            "CreateMainNetGenesisBlock does not contain the exact mined coinbase scriptSig"
+        )
+    if identity_mismatches:
+        raise MainnetPostureError(
+            "mainnet genesis/ASERT identity mismatch: "
+            + "; ".join(identity_mismatches)
+        )
+
     code_pairs = (
         (
             "mainnet genesis",
-            extract_genesis_bits(main_body, constants, "CMainParams"),
+            main_genesis_call[2],
             runtime_genesis_bits,
         ),
         (
             "testnet4 genesis",
-            extract_genesis_bits(testnet4_body, constants, "CTestNet4Params"),
+            testnet4_genesis_call[2],
             genesis_bits,
         ),
         ("ASERT fallback", anchor_bits[0], permissionless_bits),
@@ -652,7 +819,7 @@ def validate_launch_difficulty(sources: dict[str, str]) -> None:
 
     main_code = strip_cpp_comments(main_body)
     required_main_assertions = (
-        "genesis = CreateGenesisBlock(",
+        "genesis = CreateMainNetGenesisBlock(",
         "assert(consensus.hashGenesisBlock == uint256{",
         "assert(genesis.hashMerkleRoot == uint256{",
         "consensus.asertAnchorParams = Consensus::ASERTAnchor{",

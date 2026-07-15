@@ -153,7 +153,7 @@ class VerifyMainnetCIPostureTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("exit code disagrees", result.stderr)
 
-    def test_checked_in_staging_policy_matches_real_validator_failures(self) -> None:
+    def test_checked_in_final_policy_matches_publication_ready_source(self) -> None:
         result_path = self.root / "checked-in-result.json"
         validator = subprocess.run(
             [
@@ -168,7 +168,7 @@ class VerifyMainnetCIPostureTest(unittest.TestCase):
             capture_output=True,
             text=True,
         )
-        self.assertEqual(validator.returncode, 1)
+        self.assertEqual(validator.returncode, 0, validator.stderr)
 
         result = self.run_checker(POLICY, result_path, validator.returncode)
 

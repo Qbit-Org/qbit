@@ -23,18 +23,23 @@ VALID_CHAINPARAMS = """\
 static constexpr int QBIT_PUBLIC_TESTNET_AUXPOW_CHAIN_ID{31430};
 static constexpr int QBIT_MAINNET_AUXPOW_CHAIN_ID{4919};
 
+static CBlock CreateMainNetGenesisBlock(int, int, int, int, int)
+{
+    ParseHex("04ffff001d08044c0000000000004c54476f6f676c653a205365637572696e67204543432043727970746f63757272656e6369657320616761696e7374205175616e74756d2056756c6e65726162696c6974696573203935383135373a33616261663835");
+}
+
 class CMainParams : public CChainParams {
 public:
     CMainParams() {
         consensus.nAuxpowChainId = QBIT_MAINNET_AUXPOW_CHAIN_ID;
-        consensus.asertAnchorParams = Consensus::ASERTAnchor{0, 0x18109c29, 0x18109c29, 0x1801ca70, 0, 1};
+        consensus.asertAnchorParams = Consensus::ASERTAnchor{0, 0x18109c29, 0x18109c29, 0x1801ca70, 0, 1784131083};
         nDefaultPort = 8355;
         m_assumed_blockchain_size = 0;
         m_assumed_chain_state_size = 0;
-        genesis = CreateGenesisBlock(1, 2, 0x1a7f1ab5, 4, 5);
+        genesis = CreateMainNetGenesisBlock(1784131083, 1084616938, 0x1a7f1ab5, 1, 5);
         consensus.hashGenesisBlock = genesis.GetHash();
-        assert(consensus.hashGenesisBlock == uint256{"0000000000000000000000000000000000000000000000000000000000000001"});
-        assert(genesis.hashMerkleRoot == uint256{"0000000000000000000000000000000000000000000000000000000000000002"});
+        assert(consensus.hashGenesisBlock == uint256{"0000000000004d60aa5d46013991d0a0e2995d89ee98e53068ae196d763e79f2"});
+        assert(genesis.hashMerkleRoot == uint256{"584b62d357e3213ae27815d53b41efc869cc91fcf73d6a81dcab5e08508cb6f1"});
         vSeeds.emplace_back("flux-mainnet.qbit.org");
         vSeeds.emplace_back("phase-mainnet.qbit.org");
         vFixedSeeds = std::vector<uint8_t>(chainparams_seed_main.begin(), chainparams_seed_main.end());
@@ -119,7 +124,23 @@ VALID_DIFFICULTY: dict[str, Any] = {
         "bits": "0x1a7f1ab5",
         "expected_bits": "0x1a7f1ab5",
         "reference_network": "testnet4",
+        "timestamp_message": "Google: Securing ECC Cryptocurrencies against Quantum Vulnerabilities 958157:3abaf85",
+        "timestamp_source_url": "https://arxiv.org/abs/2603.28846",
+        "max_coinbase_script_sig_bytes": "100",
+        "max_second_push_extranonce_bytes": "8",
         "source": "Approved genesis mining record and launch signoff",
+        "mined": {
+            "nversion": "1",
+            "ntime": "1784131083",
+            "nbits": "0x1a7f1ab5",
+            "nnonce": "1084616938",
+            "hash": "0000000000004d60aa5d46013991d0a0e2995d89ee98e53068ae196d763e79f2",
+            "merkle_root": "584b62d357e3213ae27815d53b41efc869cc91fcf73d6a81dcab5e08508cb6f1",
+            "target": "0000000000007f1ab50000000000000000000000000000000000000000000000",
+            "coinbase_script_sig_hex": "04ffff001d08044c0000000000004c54476f6f676c653a205365637572696e67204543432043727970746f63757272656e6369657320616761696e7374205175616e74756d2056756c6e65726162696c6974696573203935383135373a33616261663835",
+            "coinbase_tx_hex": "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff6404ffff001d08044c0000000000004c54476f6f676c653a205365637572696e67204543432043727970746f63757272656e6369657320616761696e7374205175616e74756d2056756c6e65726162696c6974696573203935383135373a33616261663835ffffffff010092b2e3040000002321000000000000000000000000000000000000000000000000000000000000000000ac00000000",
+            "genesis_output_script_hex": "21000000000000000000000000000000000000000000000000000000000000000000ac",
+        },
     },
     "permissionless": {
         "model": "fdv_hashprice",
@@ -363,8 +384,8 @@ def test_release_builds_default_mainnet_guard_off():
         path = self.root / "src/kernel/chainparams.cpp"
         path.write_text(
             path.read_text(encoding="utf8").replace(
-                "genesis = CreateGenesisBlock(1, 2, 0x1a7f1ab5, 4, 5);",
-                "genesis = CreateGenesisBlock(1, 2, 0x1f00ffff, 4, 5);",
+                "genesis = CreateMainNetGenesisBlock(1784131083, 1084616938, 0x1a7f1ab5, 1, 5);",
+                "genesis = CreateMainNetGenesisBlock(1784131083, 1084616938, 0x1f00ffff, 1, 5);",
             ),
             encoding="utf8",
         )
@@ -379,7 +400,7 @@ def test_release_builds_default_mainnet_guard_off():
         path = self.root / "src/kernel/chainparams.cpp"
         path.write_text(
             path.read_text(encoding="utf8").replace(
-                "0" * 63 + "1",
+                "0000000000004d60aa5d46013991d0a0e2995d89ee98e53068ae196d763e79f2",
                 "f" * 64,
             ),
             encoding="utf8",
@@ -417,8 +438,8 @@ def test_release_builds_default_mainnet_guard_off():
         result = self.run_validator()
 
         self.assertEqual(result.returncode, 1)
-        self.assertIn("launch code target mismatch", result.stderr)
-        self.assertIn("ASERT AuxPoW is 0x1801ca71", result.stderr)
+        self.assertIn("mainnet genesis/ASERT identity mismatch", result.stderr)
+        self.assertIn("ASERT anchor is", result.stderr)
 
     def test_fixed_seed_bytes_must_match_approved_input(self) -> None:
         path = self.root / "src/chainparamsseeds.h"
@@ -484,18 +505,13 @@ def test_release_builds_default_mainnet_guard_off():
 
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_checked_in_draft_is_blocked_until_final_values_land(self) -> None:
+    def test_checked_in_source_is_publication_ready(self) -> None:
         result_path = self.root / "result.json"
         result = self.run_validator(source_root=REPO_ROOT, result_json=result_path)
 
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("must differ from testnet4", result.stderr)
-        self.assertIn("draft marker", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
         failures = json.loads(result_path.read_text(encoding="utf8"))["failures"]
-        self.assertEqual(
-            {failure["id"] for failure in failures},
-            {"auxpow_chain_id", "genesis_asert"},
-        )
+        self.assertEqual(failures, [])
 
     def test_core_checks_runs_real_gate_on_release_candidate_tag(self) -> None:
         workflow = CORE_CHECKS.read_text(encoding="utf8")
