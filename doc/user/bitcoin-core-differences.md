@@ -61,6 +61,9 @@ qbit starts from Bitcoin Core mechanics where they still fit, but the chain para
 | Total scheduled emission | 209,999,997.618768 QBT |
 | Maximum money cap | 210,000,000 QBT |
 | Difficulty adjustment | ASERT, `aserti3-2d`, 2 hour half-life |
+| Maximum future block time | 10 minutes after the network-specific v2 activation |
+| GUI synced-state block gap | 10 minutes |
+| Default maximum IBD tip age | 3 hours |
 | Public testnet AuxPoW chain ID | 31430 |
 | Future mainnet AuxPoW chain ID | placeholder `31430`; not a launch value |
 
@@ -218,6 +221,12 @@ qbit uses ASERT difficulty adjustment and Cadence lanes:
   as the future mainnet launch value.
 
 A qbit block can be a permissionless block or an AuxPoW block. AuxPoW blocks carry an AuxPoW payload and must signal the expected version/chain-id semantics. Permissionless blocks must not include an AuxPoW payload.
+
+Qbit limits future block timestamps to ten minutes after future block time v2
+activation. Testnet4 retains the inherited two-hour rule below height 60,000
+and activates the ten-minute rule at height 60,000. Wallet and RPC historical
+timestamp searches retain an independent two-hour safety window. See
+[future block time v2 and chain freshness](../reference/future-block-time-v2.md).
 
 Cadence ASERT is lane-local. If one lane is quiet while the other lane advances
 the active chain, that quiet lane resumes from its prior same-lane history and

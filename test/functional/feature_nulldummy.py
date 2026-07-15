@@ -13,7 +13,6 @@ Generate COINBASE_MATURITY (CB) more blocks to ensure the coinbases are mature.
 [Policy/Consensus] Check that the new NULLDUMMY rules are enforced on block CB + 5.
 """
 from decimal import Decimal
-import time
 
 from test_framework.address import address_to_scriptpubkey
 from test_framework.blocktools import (
@@ -88,7 +87,7 @@ class NULLDUMMYTest(BitcoinTestFramework):
         self.generate(self.nodes[0], COINBASE_MATURITY)  # block height = COINBASE_MATURITY + 2
         self.lastblockhash = self.nodes[0].getbestblockhash()
         self.lastblockheight = COINBASE_MATURITY + 2
-        self.lastblocktime = int(time.time()) + self.lastblockheight
+        self.lastblocktime = self.nodes[0].getblock(self.lastblockhash)["time"]
 
         test1_amount = coinbase_amount[0] - fee_step
         test1_chained_amount = test1_amount - fee_step

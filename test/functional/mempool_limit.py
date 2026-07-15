@@ -31,6 +31,10 @@ class MempoolLimitTest(BitcoinTestFramework):
         self.num_nodes = 1
         self.extra_args = [[
             f"-maxmempool={MIN_MAX_MEMPOOL_SIZE_MB}",
+            # This test rapidly mines several thousand blocks solely to create
+            # mature UTXOs. Keep its synthetic chain independent of the
+            # future-time-v2 rule being tested elsewhere.
+            "-testactivationheight=futuretime@10000000",
         ]]
 
     def test_rbf_carveout_disallowed(self):

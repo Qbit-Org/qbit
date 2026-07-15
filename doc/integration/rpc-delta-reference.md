@@ -27,6 +27,7 @@ qbit keeps the Bitcoin Core RPC shape where that is still accurate, but adds or 
 - P2MR addresses and wallet descriptors
 - post-quantum signing state and signature-budget reporting
 - Cadence and AuxPoW mining
+- future block-time activation and candidate timestamp headroom
 - archive-by-default node behavior and witness-pruned peers
 - stale block metrics and qbit confirmation-target estimation
 
@@ -67,12 +68,29 @@ Important result fields:
 - `coinbasevalue`: total coinbase value in satoshis, including fees
 - `bits` and `target`: candidate difficulty target
 - `height`: candidate qbit block height
+- `future_block_time`: maximum future timestamp and activation state for this
+  candidate
 
 Integrator notes:
 
 - The payout address must be valid for the active qbit network.
 - On restricted-output launch chains, the coinbase output must be P2MR or an allowed restricted-output exemption.
 - The RPC is unavailable before Cadence activation.
+- On testnet4, `future_block_time.limit_seconds` changes from 7,200 to 600 for
+  the height-60,000 candidate.
+
+### Future-time fields on shared RPCs
+
+`getblockchaininfo.future_block_time` reports the legacy and v2 limits,
+activation height, current and next-block state, blocks remaining, and the
+minimum, maximum, and remaining timestamp headroom for the next block.
+
+`getblocktemplate.future_block_time` reports the limit and activation state
+for the permissionless candidate. Both it and `createauxblock` may fail with a
+`time-too-new` template-validity error if median time past temporarily exceeds
+the maximum future timestamp. Operators should treat negative
+`next_block_time_headroom_seconds` as a clock/activation incident and wait for
+wall time to catch up rather than manufacturing an out-of-range timestamp.
 
 ### `submitauxblock`
 

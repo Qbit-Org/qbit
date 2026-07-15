@@ -25,6 +25,14 @@ relaxation and requires miners and validating services to upgrade beforehand.
 Use `getblockchaininfo` and inspect `p2mr_validation_weight` for the local
 node's activation status.
 
+Future block time v2 independently activates at block 60,000. The maximum
+accepted future timestamp changes from two hours to ten minutes for block
+60,000 and later. Upgrade miners and validating services before activation,
+keep node and pool clocks synchronized, and inspect
+`getblockchaininfo.future_block_time`, especially
+`next_block_time_headroom_seconds`, while approaching the boundary. See the
+[future block time v2 reference](../reference/future-block-time-v2.md).
+
 The qbit codebase defines testnet4 chain parameters, ports, address prefixes,
 archive-node behavior, the `-testnet4` command-line flag, DNS seed hostnames,
 and archive fallback endpoints. The current values in this page are confirmed
@@ -196,6 +204,9 @@ Look for:
 - `headers` at least as high as `blocks`
 - `initialblockdownload` becoming `false`
 - `verificationprogress` near `1`
+- `future_block_time.active_for_next_block` and
+  `future_block_time.next_block_time_headroom_seconds` showing the expected
+  activation state and a non-negative timestamp range
 - `bestblockhash` matching the release or network status page, if one is
   published
 

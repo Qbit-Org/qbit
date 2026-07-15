@@ -949,6 +949,23 @@ BOOST_AUTO_TEST_CASE(ChainParams_p2mr_validation_weight_v2_defaults)
     BOOST_CHECK_EQUAL(regtest_consensus.nP2MRValidationWeightV2Height, 0);
 }
 
+BOOST_AUTO_TEST_CASE(ChainParams_future_block_time_v2_defaults)
+{
+    const auto main_consensus = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
+    const auto testnet_consensus = CreateChainParams(*m_node.args, ChainType::TESTNET)->GetConsensus();
+    const auto testnet4_consensus = CreateChainParams(*m_node.args, ChainType::TESTNET4)->GetConsensus();
+    const auto signet_consensus = CreateChainParams(*m_node.args, ChainType::SIGNET)->GetConsensus();
+    const auto regtest_consensus = CreateChainParams(*m_node.args, ChainType::REGTEST)->GetConsensus();
+
+    BOOST_CHECK_EQUAL(main_consensus.nFutureBlockTimeV2Height, 0);
+    BOOST_CHECK_EQUAL(testnet_consensus.nFutureBlockTimeV2Height, 0);
+    BOOST_CHECK_EQUAL(testnet4_consensus.nFutureBlockTimeV2Height, 60'000);
+    BOOST_CHECK_EQUAL(signet_consensus.nFutureBlockTimeV2Height, 0);
+    BOOST_CHECK_EQUAL(regtest_consensus.nFutureBlockTimeV2Height, 0);
+    BOOST_CHECK_EQUAL(GetMaxFutureBlockTime(testnet4_consensus, 59'999), MAX_FUTURE_BLOCK_TIME_LEGACY);
+    BOOST_CHECK_EQUAL(GetMaxFutureBlockTime(testnet4_consensus, 60'000), MAX_FUTURE_BLOCK_TIME_V2);
+}
+
 BOOST_AUTO_TEST_CASE(ChainParams_TESTNET4_launch_anchor)
 {
     const UniValue config = ReadTestnet4LaunchDifficultyConfig();

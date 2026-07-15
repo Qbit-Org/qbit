@@ -96,6 +96,9 @@ class FullBlockTest(BitcoinTestFramework):
         self.extra_args = [[
             '-acceptnonstdtxn=1',  # This is a consensus block test, we don't care about tx policy
             '-testactivationheight=bip34@2',
+            # Preserve this test's explicit legacy two-hour timestamp cases;
+            # future-time-v2 has dedicated activation coverage.
+            '-testactivationheight=futuretime@10000000',
         ]]
 
     def run_test(self):

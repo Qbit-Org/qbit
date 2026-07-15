@@ -43,6 +43,7 @@ Current protocol constants relevant to miners:
 | Permissionless lane spacing | 75 seconds |
 | AuxPoW lane spacing | 300 seconds |
 | Difficulty algorithm | ASERT, 2 hour halflife |
+| Maximum future block time | 10 minutes after future-time-v2 activation |
 | Public testnet AuxPoW chain ID | `31430` |
 | Max block weight | 2,000,000 |
 | Witness scale factor | 1 |
@@ -107,6 +108,10 @@ qbit-specific integration notes:
 - On signet, include `signet` as well: `{"rules":["segwit","signet"]}`.
 - `submitblock` returns `null` on acceptance, or a BIP22-style rejection string.
 - Pool software should refresh templates on tip changes and mempool updates as it would for Bitcoin Core.
+- Read `future_block_time` from every template. On testnet4 the candidate limit
+  changes from 7,200 to 600 seconds at height 60,000. Keep pool and node clocks
+  synchronized and do not add a pool-local future-time offset beyond the
+  returned limit.
 
 For Stratum v1 pools implementing BIP310 `version-rolling`, grant miners only the intersection of their requested mask and qbit's permissionless mask:
 
@@ -148,6 +153,7 @@ qbit-cli <chain option> createauxblock "$QBIT_PAYOUT_ADDRESS"
 | `coinbasevalue` | qbit coinbase value in satoshis, including fees |
 | `bits` | compact qbit target for this candidate |
 | `height` | candidate qbit block height |
+| `future_block_time` | candidate future-time limit and activation state |
 | `commitmentorder` | AuxPoW commitment root byte order to use when building the parent coinbase commitment for this candidate |
 | `commitmentactivationheight` | height where AuxPoW commitment byte-order behavior changes; at and after this height, valid submissions must follow the returned `commitmentorder` |
 | `target` | expanded qbit target |
@@ -210,6 +216,7 @@ large hashrate changes:
 | Lane hashrate | `getnetworkhashps 120 -1 permissionless` and `getnetworkhashps 120 -1 auxpow` |
 | Candidate difficulty | `getblocktemplate` / `getmininginfo.next` for permissionless work; `createauxblock` `bits` and `target` for AuxPoW work |
 | Submission health | Stale rate, rejection reason, and same-tip candidate expiry |
+| Timestamp headroom | `getblockchaininfo.future_block_time`, especially `next_block_time_headroom_seconds` before testnet4 height 60,000 |
 
 Recommended launch runbook thresholds:
 

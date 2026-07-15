@@ -100,8 +100,10 @@ static constexpr size_t WARN_FLUSH_COINS_SIZE = 1 << 30; // 1 GiB
 */
 static constexpr auto DATABASE_WRITE_INTERVAL_MIN{50min};
 static constexpr auto DATABASE_WRITE_INTERVAL_MAX{70min};
-/** Maximum age of our tip for us to be considered current for fee estimation */
-static constexpr std::chrono::hours MAX_FEE_ESTIMATION_TIP_AGE{3};
+/** Stop learning fee estimates after twenty missed aggregate target intervals. */
+static constexpr std::chrono::minutes MAX_FEE_ESTIMATION_TIP_AGE{20};
+/** Prefer height-derived verification progress only for a recently updated qbit chain. */
+static constexpr auto VERIFICATION_PROGRESS_RECENT_WINDOW{15min};
 const std::vector<std::string> CHECKLEVEL_DOC {
     "level 0 reads the blocks from disk",
     "level 1 verifies block validity",
@@ -299,13 +301,18 @@ static void LimitMempoolSize(CTxMemPool& pool, CCoinsViewCache& coins_cache)
         coins_cache.Uncache(removed);
 }
 
+bool IsBlockTimeCurrentForFeeEstimation(int64_t block_time, int64_t now)
+{
+    return block_time >= now - Ticks<std::chrono::seconds>(MAX_FEE_ESTIMATION_TIP_AGE);
+}
+
 static bool IsCurrentForFeeEstimation(Chainstate& active_chainstate) EXCLUSIVE_LOCKS_REQUIRED(cs_main)
 {
     AssertLockHeld(cs_main);
     if (active_chainstate.m_chainman.IsInitialBlockDownload()) {
         return false;
     }
-    if (active_chainstate.m_chain.Tip()->GetBlockTime() < count_seconds(GetTime<std::chrono::seconds>() - MAX_FEE_ESTIMATION_TIP_AGE))
+    if (!IsBlockTimeCurrentForFeeEstimation(active_chainstate.m_chain.Tip()->GetBlockTime(), GetTime()))
         return false;
     if (active_chainstate.m_chain.Height() < active_chainstate.m_chainman.m_best_header->nHeight - 1) {
         return false;
@@ -4633,7 +4640,7 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
     }
 
     // Check timestamp
-    if (block.Time() > NodeClock::now() + std::chrono::seconds{MAX_FUTURE_BLOCK_TIME}) {
+    if (block.Time() > NodeClock::now() + std::chrono::seconds{GetMaxFutureBlockTime(consensusParams, nHeight)}) {
         return state.Invalid(BlockValidationResult::BLOCK_TIME_FUTURE, "time-too-new", "block timestamp too far in the future");
     }
 
@@ -6138,7 +6145,7 @@ double ChainstateManager::GuessVerificationProgress(const CBlockIndex* pindex) c
 
     const int64_t nNow{TicksSinceEpoch<std::chrono::seconds>(NodeClock::now())};
     const auto block_time{
-        (Assume(m_best_header) && std::abs(nNow - pindex->GetBlockTime()) <= Ticks<std::chrono::seconds>(2h) &&
+        (Assume(m_best_header) && std::abs(nNow - pindex->GetBlockTime()) <= Ticks<std::chrono::seconds>(VERIFICATION_PROGRESS_RECENT_WINDOW) &&
          Assume(m_best_header->nHeight >= pindex->nHeight)) ?
             // When the header is known to be recent, switch to a height-based
             // approach. This ensures the returned value is quantized when

@@ -54,8 +54,8 @@ from test_framework.wallet import (
 
 
 DIFFICULTY_ADJUSTMENT_INTERVAL = REGTEST_RETARGET_PERIOD
-MAX_FUTURE_BLOCK_TIME = 2 * 3600
-MAX_TIMEWARP = 600
+MAX_FUTURE_BLOCK_TIME = 2 * 60 * 60
+MAX_TIMEWARP = 60
 VERSIONBITS_TOP_BITS = 0x20000000
 VERSIONBITS_DEPLOYMENT_TESTDUMMY_BIT = 0
 DEFAULT_BLOCK_MIN_TX_FEE = 1 # default `-blockmintxfee` setting [sat/kvB]
@@ -197,7 +197,9 @@ class MiningTest(BitcoinTestFramework):
     def test_timewarp(self):
         self.log.info("Test timewarp attack mitigation (BIP94)")
         node = self.nodes[0]
-        self.restart_node(0, extra_args=['-test=bip94'])
+        # Keep this inherited BIP94 test on the legacy future-time regime. The
+        # qbit v2 activation boundary is covered independently.
+        self.restart_node(0, extra_args=['-test=bip94', '-testactivationheight=futuretime@10000000'])
 
         self.log.info("Mine until the last block of the retarget period")
         blockchain_info = self.nodes[0].getblockchaininfo()
@@ -209,7 +211,7 @@ class MiningTest(BitcoinTestFramework):
             self.nodes[0].setmocktime(t)
             self.generate(self.wallet, 1, sync_fun=self.no_op)
 
-        self.log.info("Create block two hours in the future")
+        self.log.info("Create block at the legacy future-time limit for the BIP94 test")
         self.nodes[0].setmocktime(t + MAX_FUTURE_BLOCK_TIME)
         self.generate(self.wallet, 1, sync_fun=self.no_op)
         assert_equal(node.getblock(node.getbestblockhash())['time'], t + MAX_FUTURE_BLOCK_TIME)
