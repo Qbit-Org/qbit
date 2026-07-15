@@ -411,7 +411,9 @@ static bool EvalChecksigP2MR(const valtype& sig, const valtype& pubkey, ScriptEx
     if (success) {
         // Count every non-empty P2MR signature operation at the fixed PQC cost.
         assert(execdata.m_validation_weight_left_init);
-        execdata.m_validation_weight_left -= VALIDATION_WEIGHT_PER_SIGOP_PQC;
+        const int64_t validation_cost = (flags & SCRIPT_VERIFY_P2MR_LEGACY_VALIDATION_WEIGHT) ?
+            P2MR_VALIDATION_WEIGHT_PER_SIGOP_LEGACY : P2MR_VALIDATION_WEIGHT_PER_SIGOP_V2;
+        execdata.m_validation_weight_left -= validation_cost;
         if (execdata.m_validation_weight_left < 0) {
             return set_error(serror, SCRIPT_ERR_P2MR_VALIDATION_WEIGHT);
         }
@@ -432,14 +434,16 @@ static bool EvalChecksigP2MR(const valtype& sig, const valtype& pubkey, ScriptEx
     return true;
 }
 
-static bool EvalCheckDataSigPQC(const valtype& sig, const valtype& msg_hash, const valtype& pubkey, ScriptExecutionData& execdata, ScriptError* serror, bool& success)
+static bool EvalCheckDataSigPQC(const valtype& sig, const valtype& msg_hash, const valtype& pubkey, ScriptExecutionData& execdata, unsigned int flags, ScriptError* serror, bool& success)
 {
     success = !sig.empty();
     if (success) {
         // Match P2MR transaction signatures: every non-empty PQC signature
         // attempt is charged before deeper validation.
         assert(execdata.m_validation_weight_left_init);
-        execdata.m_validation_weight_left -= VALIDATION_WEIGHT_PER_SIGOP_PQC;
+        const int64_t validation_cost = (flags & SCRIPT_VERIFY_P2MR_LEGACY_VALIDATION_WEIGHT) ?
+            P2MR_VALIDATION_WEIGHT_PER_SIGOP_LEGACY : P2MR_VALIDATION_WEIGHT_PER_SIGOP_V2;
+        execdata.m_validation_weight_left -= validation_cost;
         if (execdata.m_validation_weight_left < 0) {
             return set_error(serror, SCRIPT_ERR_P2MR_VALIDATION_WEIGHT);
         }
@@ -1234,7 +1238,7 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                     const valtype& pubkey = stacktop(-1);
 
                     bool success{false};
-                    if (!EvalCheckDataSigPQC(sig, msg_hash, pubkey, execdata, serror, success)) return false;
+                    if (!EvalCheckDataSigPQC(sig, msg_hash, pubkey, execdata, flags, serror, success)) return false;
                     popstack(stack);
                     popstack(stack);
                     popstack(stack);
@@ -1255,7 +1259,7 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                     const valtype& pubkey = stacktop(-1);
 
                     bool success{false};
-                    if (!EvalCheckDataSigPQC(sig, msg_hash, pubkey, execdata, serror, success)) return false;
+                    if (!EvalCheckDataSigPQC(sig, msg_hash, pubkey, execdata, flags, serror, success)) return false;
                     popstack(stack);
                     popstack(stack);
                     popstack(stack);
@@ -1782,7 +1786,7 @@ static bool SignatureHashSchnorrCommon(uint256& hash_out, ScriptExecutionData& e
         ss << execdata.m_output_hash.value();
     }
 
-    // Additional data for BIP 342 / BIP-360 signatures
+    // Additional data for BIP 342 Tapscript or qbit P2MR v1 signatures
     if (sigversion == SigVersion::TAPSCRIPT || sigversion == SigVersion::P2MR) {
         assert(execdata.m_tapleaf_hash_init);
         ss << execdata.m_tapleaf_hash;
@@ -2159,7 +2163,7 @@ static bool ExecuteWitnessScript(const std::span<const valtype>& stack_span, con
     }
 
     // Disallow stack item size > MAX_SCRIPT_ELEMENT_SIZE in witness stack.
-    // P2MR (BIP-360) lifts this limit to accommodate PQC signatures (3680 bytes);
+    // qbit P2MR v1 lifts this limit to accommodate PQC signatures (3680 bytes);
     // resource usage is bounded by the per-input validation weight budget instead.
     if (sigversion != SigVersion::P2MR) {
         for (const valtype& elem : stack) {
@@ -2343,7 +2347,7 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
             return set_success(serror);
         }
     } else if (witversion == 2 && program.size() == WITNESS_V2_P2MR_SIZE && !is_p2sh) {
-        // BIP-360 P2MR: 32-byte witness v2 program (Merkle root of script tree)
+        // qbit P2MR v1: 32-byte witness v2 program (Merkle root of script tree)
         if (!(flags & SCRIPT_VERIFY_P2MR_RULES)) return set_success(serror);
         if (stack.size() == 0) return set_error(serror, SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY);
 
@@ -2371,7 +2375,7 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
             return set_error(serror, SCRIPT_ERR_P2MR_WRONG_CONTROL_SIZE);
         }
 
-        // Verify control byte bit 0 is 1 (BIP-360 requirement)
+        // Verify the qbit P2MR v1 control-byte marker (bit 0 is 1).
         if ((control[0] & 0x01) != 1) {
             return set_error(serror, SCRIPT_ERR_P2MR_CONTROL_BIT0);
         }

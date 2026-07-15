@@ -12,6 +12,7 @@ class ModalOverlayTests : public QObject
     Q_OBJECT
 
 private Q_SLOTS:
+    void blockTimeFreshnessBoundary();
     void headersPresyncProgressStaysVisible();
     void hiddenTipUpdateRendersLatestTipWhenShown();
     void hiddenTipUpdateResetsStaleEtaWhenShown();

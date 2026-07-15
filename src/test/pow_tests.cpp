@@ -438,6 +438,7 @@ BOOST_AUTO_TEST_CASE(get_next_work_legacy_retarget_clamps_powlimit_regression)
         chain[i].nTime = (i == interval - 1) ? first_time + extreme_gap : first_time + i * consensus.nPowTargetSpacing;
         chain[i].pprev = (i > 0) ? &chain[i - 1] : nullptr;
         chain[i].BuildSkip();
+        chain[i].BuildCadenceLaneLinks();
     }
 
     CBlockHeader next_block{};
@@ -795,34 +796,51 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_sanity)
     sanity_check_chainparams(*m_node.args, ChainType::MAIN);
 }
 
-BOOST_AUTO_TEST_CASE(ChainParams_MAIN_placeholder_has_no_public_bootstrap)
+BOOST_AUTO_TEST_CASE(ChainParams_MAIN_launch_bootstrap)
 {
     const auto chain_params = CreateChainParams(*m_node.args, ChainType::MAIN);
     const auto& consensus = chain_params->GetConsensus();
+    const auto& dns_seeds = chain_params->DNSSeeds();
 
-    BOOST_CHECK(chain_params->DNSSeeds().empty());
-    BOOST_CHECK(chain_params->FixedSeeds().empty());
+    BOOST_REQUIRE_EQUAL(dns_seeds.size(), 2U);
+    BOOST_CHECK_EQUAL(dns_seeds[0], "flux-mainnet.qbit.org");
+    BOOST_CHECK_EQUAL(dns_seeds[1], "phase-mainnet.qbit.org");
+    BOOST_CHECK_EQUAL(chain_params->FixedSeeds().size(), 16U);
+    BOOST_CHECK_EQUAL(chain_params->AssumedBlockchainSize(), 0U);
+    BOOST_CHECK_EQUAL(chain_params->AssumedChainStateSize(), 0U);
     BOOST_CHECK(consensus.nMinimumChainWork.IsNull());
     BOOST_CHECK(consensus.defaultAssumeValid.IsNull());
 }
 
-BOOST_AUTO_TEST_CASE(ChainParams_MAIN_auxpow_chain_id_is_placeholder)
+BOOST_AUTO_TEST_CASE(ChainParams_MAIN_auxpow_chain_id_is_distinct)
 {
     const auto main_consensus = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
     const auto testnet4_consensus = CreateChainParams(*m_node.args, ChainType::TESTNET4)->GetConsensus();
 
+    BOOST_CHECK_EQUAL(main_consensus.nAuxpowChainId, 47);
     BOOST_CHECK_EQUAL(testnet4_consensus.nAuxpowChainId, 31430);
-    BOOST_CHECK_EQUAL(main_consensus.nAuxpowChainId, testnet4_consensus.nAuxpowChainId);
+    BOOST_CHECK_NE(main_consensus.nAuxpowChainId, testnet4_consensus.nAuxpowChainId);
 }
 
 BOOST_AUTO_TEST_CASE(ChainParams_MAIN_launch_difficulty_config)
 {
     const UniValue config = ReadMainnetLaunchDifficultyConfig();
+    const UniValue& genesis_config = RequiredObject(config, "genesis");
+    const UniValue& mined_genesis = RequiredObject(genesis_config, "mined");
+    const UniValue& permissionless_config = RequiredObject(config, "permissionless");
+    const UniValue& auxpow_config = RequiredObject(config, "auxpow");
+    const uint32_t genesis_bits = CalculateGenesisLaunchBits(config);
     const uint32_t permissionless_bits = CalculatePermissionlessLaunchBits(config);
     const uint32_t auxpow_bits = CalculateAuxPowLaunchBits(config);
-    const uint32_t temporary_genesis_bits = ParseBits(RequiredString(RequiredObject(config, "genesis"), "temporary_bits"));
+
+    BOOST_CHECK_EQUAL(RequiredString(genesis_config, "reference_network"), "testnet4");
+    BOOST_CHECK_EQUAL(genesis_bits, ParseBits(RequiredString(genesis_config, "expected_bits")));
+    BOOST_CHECK_EQUAL(permissionless_bits, ParseBits(RequiredString(permissionless_config, "expected_bits")));
+    BOOST_CHECK_EQUAL(auxpow_bits, ParseBits(RequiredString(auxpow_config, "expected_bits")));
 
     const auto chain_params = CreateChainParams(*m_node.args, ChainType::MAIN);
+    const auto testnet4_chain_params = CreateChainParams(*m_node.args, ChainType::TESTNET4);
+    const CBlock& genesis_block = chain_params->GenesisBlock();
     const auto& consensus = chain_params->GetConsensus();
 
     BOOST_CHECK_EQUAL(consensus.fPowUseASERT, true);
@@ -830,15 +848,41 @@ BOOST_AUTO_TEST_CASE(ChainParams_MAIN_launch_difficulty_config)
     BOOST_CHECK_EQUAL(consensus.nPowTargetSpacingLegacy, 75);
     BOOST_CHECK_EQUAL(consensus.nPowTargetSpacingAuxPow, 300);
 
-    BOOST_CHECK_EQUAL(chain_params->GenesisBlock().nBits, temporary_genesis_bits);
+    BOOST_CHECK_EQUAL(
+        RequiredString(genesis_config, "timestamp_message"),
+        "Google: Securing ECC Cryptocurrencies against Quantum Vulnerabilities 958157:3abaf85");
+    BOOST_CHECK_EQUAL(
+        RequiredString(genesis_config, "timestamp_source_url"),
+        "https://arxiv.org/abs/2603.28846");
+    BOOST_CHECK_EQUAL(RequiredString(genesis_config, "max_coinbase_script_sig_bytes"), "100");
+    BOOST_CHECK_EQUAL(RequiredString(genesis_config, "max_second_push_extranonce_bytes"), "8");
+    BOOST_CHECK_EQUAL(genesis_block.nVersion, static_cast<int32_t>(ParseUint32(RequiredString(mined_genesis, "nversion"))));
+    BOOST_CHECK_EQUAL(genesis_block.nTime, ParseUint32(RequiredString(mined_genesis, "ntime")));
+    BOOST_CHECK_EQUAL(genesis_block.nBits, ParseBits(RequiredString(mined_genesis, "nbits")));
+    BOOST_CHECK_EQUAL(genesis_block.nNonce, ParseUint32(RequiredString(mined_genesis, "nnonce")));
+    BOOST_CHECK_EQUAL(consensus.hashGenesisBlock.ToString(), RequiredString(mined_genesis, "hash"));
+    BOOST_CHECK_EQUAL(genesis_block.GetHash().ToString(), RequiredString(mined_genesis, "hash"));
+    BOOST_CHECK_EQUAL(genesis_block.hashMerkleRoot.ToString(), RequiredString(mined_genesis, "merkle_root"));
+    BOOST_REQUIRE_EQUAL(genesis_block.vtx.size(), 1U);
+    BOOST_REQUIRE_EQUAL(genesis_block.vtx[0]->vin.size(), 1U);
+    BOOST_REQUIRE_EQUAL(genesis_block.vtx[0]->vout.size(), 1U);
+    BOOST_CHECK_EQUAL(genesis_block.vtx[0]->vin[0].scriptSig.size(), 100U);
+    BOOST_CHECK_EQUAL(genesis_block.vtx[0]->vout[0].nValue, 210 * COIN);
+    BOOST_CHECK_EQUAL(HexStr(genesis_block.vtx[0]->vin[0].scriptSig), RequiredString(mined_genesis, "coinbase_script_sig_hex"));
+    BOOST_CHECK_EQUAL(HexStr(genesis_block.vtx[0]->vout[0].scriptPubKey), RequiredString(mined_genesis, "genesis_output_script_hex"));
+    BOOST_CHECK_EQUAL(EncodeHexTx(*genesis_block.vtx[0]), RequiredString(mined_genesis, "coinbase_tx_hex"));
+
+    BOOST_CHECK_EQUAL(genesis_block.nBits, genesis_bits);
+    BOOST_CHECK_EQUAL(testnet4_chain_params->GenesisBlock().nBits, genesis_bits);
+    BOOST_CHECK(CheckProofOfWork(chain_params->GenesisBlock().GetHash(), genesis_bits, consensus));
     BOOST_CHECK_EQUAL(consensus.asertAnchorParams.nBits, permissionless_bits);
     BOOST_CHECK_EQUAL(consensus.asertAnchorParams.nBitsLegacy, permissionless_bits);
     BOOST_CHECK_EQUAL(consensus.asertAnchorParams.nBitsAuxPow, auxpow_bits);
     BOOST_CHECK_EQUAL(consensus.asertAnchorParams.nHeight, 0);
     BOOST_CHECK_EQUAL(consensus.asertAnchorParams.nAuxPow, 0U);
-    BOOST_CHECK_EQUAL(consensus.asertAnchorParams.nBlockTime, chain_params->GenesisBlock().nTime);
+    BOOST_CHECK_EQUAL(consensus.asertAnchorParams.nBlockTime, genesis_block.nTime);
 
-    CBlockIndex genesis{chain_params->GenesisBlock()};
+    CBlockIndex genesis{genesis_block};
     genesis.nHeight = consensus.asertAnchorParams.nHeight;
     genesis.nAuxPow = consensus.asertAnchorParams.nAuxPow;
 
@@ -911,6 +955,38 @@ BOOST_AUTO_TEST_CASE(ChainParams_outerwitness_defaults)
     BOOST_CHECK_EQUAL(signet_consensus.nOuterReservedWitnessHeight, 0);
     BOOST_CHECK_EQUAL(testnet4_consensus.nOuterReservedWitnessHeight, 0);
     BOOST_CHECK_EQUAL(regtest_consensus.nOuterReservedWitnessHeight, std::numeric_limits<int>::max());
+}
+
+BOOST_AUTO_TEST_CASE(ChainParams_p2mr_validation_weight_v2_defaults)
+{
+    const auto main_consensus = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
+    const auto testnet_consensus = CreateChainParams(*m_node.args, ChainType::TESTNET)->GetConsensus();
+    const auto testnet4_consensus = CreateChainParams(*m_node.args, ChainType::TESTNET4)->GetConsensus();
+    const auto signet_consensus = CreateChainParams(*m_node.args, ChainType::SIGNET)->GetConsensus();
+    const auto regtest_consensus = CreateChainParams(*m_node.args, ChainType::REGTEST)->GetConsensus();
+
+    BOOST_CHECK_EQUAL(main_consensus.nP2MRValidationWeightV2Height, 0);
+    BOOST_CHECK_EQUAL(testnet_consensus.nP2MRValidationWeightV2Height, 0);
+    BOOST_CHECK_EQUAL(testnet4_consensus.nP2MRValidationWeightV2Height, 60'000);
+    BOOST_CHECK_EQUAL(signet_consensus.nP2MRValidationWeightV2Height, 0);
+    BOOST_CHECK_EQUAL(regtest_consensus.nP2MRValidationWeightV2Height, 0);
+}
+
+BOOST_AUTO_TEST_CASE(ChainParams_future_block_time_v2_defaults)
+{
+    const auto main_consensus = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
+    const auto testnet_consensus = CreateChainParams(*m_node.args, ChainType::TESTNET)->GetConsensus();
+    const auto testnet4_consensus = CreateChainParams(*m_node.args, ChainType::TESTNET4)->GetConsensus();
+    const auto signet_consensus = CreateChainParams(*m_node.args, ChainType::SIGNET)->GetConsensus();
+    const auto regtest_consensus = CreateChainParams(*m_node.args, ChainType::REGTEST)->GetConsensus();
+
+    BOOST_CHECK_EQUAL(main_consensus.nFutureBlockTimeV2Height, 0);
+    BOOST_CHECK_EQUAL(testnet_consensus.nFutureBlockTimeV2Height, 0);
+    BOOST_CHECK_EQUAL(testnet4_consensus.nFutureBlockTimeV2Height, 60'000);
+    BOOST_CHECK_EQUAL(signet_consensus.nFutureBlockTimeV2Height, 0);
+    BOOST_CHECK_EQUAL(regtest_consensus.nFutureBlockTimeV2Height, 0);
+    BOOST_CHECK_EQUAL(GetMaxFutureBlockTime(testnet4_consensus, 59'999), MAX_FUTURE_BLOCK_TIME_LEGACY);
+    BOOST_CHECK_EQUAL(GetMaxFutureBlockTime(testnet4_consensus, 60'000), MAX_FUTURE_BLOCK_TIME_V2);
 }
 
 BOOST_AUTO_TEST_CASE(ChainParams_TESTNET4_launch_anchor)

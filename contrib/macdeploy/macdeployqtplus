@@ -493,7 +493,7 @@ with open(os.path.join(applicationBundle.resourcesPath, "qt.conf"), "wb") as f:
 # ------------------------------------------------
 
 if platform.system() == "Darwin":
-    subprocess.check_call(f"codesign --deep --force --sign - {target}", shell=True)
+    subprocess.check_call(["codesign", "--deep", "--force", "--sign", "-", target])
 
 # ------------------------------------------------
 

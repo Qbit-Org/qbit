@@ -45,10 +45,13 @@ The RPC:
 8. returns the signature plus enough proof material for stateless verification.
 
 Signing uses the same wallet PQC signing provider path as transaction signing,
-so stateful PQC signature counters advance and the normal PQC usage fields are
-included unless `include_pqc_usage` is set to false.
+so stateful PQC signature counters advance. The RPC omits wallet-local PQC usage
+fields by default, keeping its result bounded and portable. Set
+`include_pqc_usage=true` to include those fields for local diagnostics. They can
+reveal exact remaining signature budgets and public keys from failed signing
+attempts when the wallet retries a later P2MR leaf.
 
-The response includes:
+The RPC response includes:
 
 - `address`
 - `message_hash`
@@ -64,11 +67,42 @@ The response includes:
 - `p2mr_merkle_root`
 - optional PQC usage fields
 
+`datasig_hash`, `domain`, `algorithm`, and `p2mr_merkle_root` are informational
+RPC result fields. Verification recomputes the data-signature hash and P2MR
+Merkle root instead of trusting them.
+
+## Portable Proof Schema
+
+A portable `p2mr-pubkey` proof contains only the fields required for stateless
+verification:
+
+- `address`
+- `message_hash`
+- `signature`
+- `pubkey`
+- `leaf_script`
+- `control_block`
+- `leaf_version`
+- `proof_mode`
+
+qbit-qt displays and copies this minimal schema. PQC usage data remains local:
+after every signing attempt that advances a counter, the signer status shows
+the overall usage state and each affected key's exact count, remaining budget,
+and limit state, followed by any threshold or reminder warnings. This reporting
+also applies when signing ultimately fails after one or more committed counter
+reservations; no portable proof is produced on failure. Counts, limits,
+warnings, and keys observed during retry attempts are not part of the proof
+JSON. Proofs created by older qbit-qt versions can contain those additional
+fields. Qt accepts them when the complete proof document is at most 32,768
+characters, while RPC verification continues to accept them. For larger legacy
+exports, remove wallet-local usage fields before importing the proof into
+qbit-qt.
+
 ## Verification Flow
 
 `verifydatapqchash "p2mr_proof"` is a non-wallet utility RPC.
 
-The proof must include:
+The proof must include the portable proof fields:
 
 - `address`
 - `message_hash`

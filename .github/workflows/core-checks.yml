@@ -8,6 +8,7 @@ on:
   pull_request:
     branches:
       - main
+      - 1.0.0
       - 0.1.x
       - 1.0.0
       - 1.x.x
@@ -15,6 +16,7 @@ on:
   push:
     branches:
       - main
+      - 1.0.0
       - 0.1.x
       - 1.0.0
       - 1.x.x
@@ -22,6 +24,7 @@ on:
   merge_group:
     branches:
       - main
+      - 1.0.0
       - 0.1.x
       - 1.0.0
       - 1.x.x
@@ -46,9 +49,10 @@ jobs:
       profile: ${{ steps.classify.outputs.profile }}
       release_policy_only: ${{ steps.classify.outputs.release_policy_only }}
       source_validation_required: ${{ steps.classify.outputs.source_validation_required }}
+      mainnet_publish_gate_required: ${{ steps.release-target.outputs.mainnet_publish_gate_required }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 0
 
@@ -106,6 +110,22 @@ jobs:
             --changed-files "${{ steps.changed-files.outputs.changed_files }}" \
             --github-output "$GITHUB_OUTPUT"
 
+      - name: Classify release target
+        id: release-target
+        env:
+          TARGET_REF: ${{ github.base_ref || github.event.merge_group.base_ref || github.ref }}
+          VALIDATION_PROFILE: ${{ steps.classify.outputs.profile }}
+        run: |
+          set -euo pipefail
+
+          target_branch="${TARGET_REF#refs/heads/}"
+          if [[ "${target_branch}" == "1.0.0" ]] && \
+             [[ "${VALIDATION_PROFILE}" == "source" || "${VALIDATION_PROFILE}" == "release-policy" ]]; then
+            echo "mainnet_publish_gate_required=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "mainnet_publish_gate_required=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build-smoke:
     name: build smoke
     needs: classify-changes
@@ -115,7 +135,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Install build dependencies
         run: |
@@ -130,6 +150,9 @@ jobs:
             libevent-dev \
             libsqlite3-dev
 
+      - name: Test integrated libbitcoinpqc build policy
+        run: python3 ci/checks/test_libbitcoinpqc_build_policy.py
+
       - name: Configure build
         run: |
           cmake -B build -G Ninja \
@@ -142,6 +165,16 @@ jobs:
             -DWITH_ZMQ=OFF \
             -DWITH_USDT=OFF \
             -DWITH_CCACHE=OFF
+
+      - name: Verify integrated libbitcoinpqc compile definitions
+        run: |
+          grep -Fx 'SPX_ENABLE_TEST_BENCH_ENV_KNOBS:BOOL=OFF' build/CMakeCache.txt
+          cmake --build build --target bitcoinpqc --verbose 2>&1 | tee bitcoinpqc-build.log
+          grep -F -- '-DSPX_PRODUCTION_BUILD=1' bitcoinpqc-build.log
+          if grep -F -- '-DSPX_ENABLE_TEST_BENCH_ENV_KNOBS=1' bitcoinpqc-build.log; then
+            echo 'Integrated libbitcoinpqc build unexpectedly enabled runtime test controls.' >&2
+            exit 1
+          fi
 
       - name: Build daemon and CLI
         run: cmake --build build --target qbitd qbit-cli -j"$(nproc)"
@@ -162,7 +195,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Install build dependencies
         run: |
@@ -211,6 +244,88 @@ jobs:
             build/bin/test_qbit --run_test="${suite}" --catch_system_error=no --log_level=test_suite
           done
 
+  p2mr-v1-conformance:
+    name: P2MR v1 conformance
+    needs: classify-changes
+    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Set standalone oracle target directory
+        run: echo "CARGO_TARGET_DIR=${RUNNER_TEMP}/p2mr-rust-target" >> "$GITHUB_ENV"
+
+      - name: Install oracle build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            cmake \
+            libclang-dev \
+            pkgconf \
+            python3
+
+      - name: Check Rust toolchain
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Fetch locked Rust dependencies
+        run: |
+          cargo fetch --locked --target x86_64-unknown-linux-gnu \
+            --manifest-path contrib/testgen/p2mr_v1_oracle/Cargo.toml
+          cargo fetch --locked --target x86_64-unknown-linux-gnu \
+            --manifest-path contrib/testgen/p2mr_checksigpqc_vectors/Cargo.toml
+
+      - name: Test standalone oracle
+        run: |
+          cargo fmt --manifest-path contrib/testgen/p2mr_v1_oracle/Cargo.toml -- --check
+          cargo test --locked --offline \
+            --manifest-path contrib/testgen/p2mr_v1_oracle/Cargo.toml
+
+      - name: Verify P2MR v1 corpus
+        run: |
+          set -o pipefail
+          cargo run --locked --offline --quiet \
+            --manifest-path contrib/testgen/p2mr_v1_oracle/Cargo.toml -- \
+            verify \
+            --manifest src/test/data/p2mr_v1_manifest.json \
+            --source-root . \
+            --report "${RUNNER_TEMP}/p2mr-v1-conformance-report.json" \
+            --release \
+            --oracle-commit "${GITHUB_SHA}" \
+            2>&1 | tee "${RUNNER_TEMP}/p2mr-v1-oracle.log"
+
+      - name: Check corpus reproducibility
+        run: contrib/devtools/check-p2mr-v1-corpus-reproducible.sh
+
+      - name: Write conformance summary
+        if: ${{ success() }}
+        run: |
+          jq -r '
+            "### qbit P2MR v1 conformance\n\n" +
+            "- Manifest: `" + .manifest_sha256 + "`\n" +
+            "- Cases: " + (.case_counts.total | tostring) +
+            " (" + (.case_counts.accepted | tostring) + " accepted, " +
+            (.case_counts.rejected | tostring) + " rejected)\n" +
+            "- Oracle commit: `" + .oracle.commit + "`"
+          ' "${RUNNER_TEMP}/p2mr-v1-conformance-report.json" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload conformance evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: p2mr-v1-conformance-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/p2mr-v1-conformance-report.json
+            ${{ runner.temp }}/p2mr-v1-oracle.log
+          if-no-files-found: warn
+          retention-days: 30
+
   functional-smoke:
     name: functional smoke
     needs: classify-changes
@@ -220,7 +335,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Install build dependencies
         run: |
@@ -279,17 +394,21 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 0
 
       - name: Detect release file changes
         id: release_changes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_BEFORE: ${{ github.event.before }}
+          RELEASE_BASE_REF: ${{ github.base_ref || github.event.merge_group.base_ref }}
         run: |
           changed_files="$(mktemp)"
 
-          if [[ "${{ github.event_name }}" == "push" ]]; then
-            before="${{ github.event.before }}"
+          if [[ "${EVENT_NAME}" == "push" ]]; then
+            before="${EVENT_BEFORE}"
             if [[ -z "${before}" || "${before}" =~ ^0+$ ]]; then
               git fetch --no-tags --prune origin main
               merge_base="$(git merge-base origin/main HEAD 2>/dev/null || true)"
@@ -304,7 +423,7 @@ jobs:
               exit 0
             fi
           else
-            base_ref="${{ github.base_ref || github.event.merge_group.base_ref }}"
+            base_ref="${RELEASE_BASE_REF}"
             base_branch="${base_ref#refs/heads/}"
             if [[ -z "${base_branch}" ]]; then
               echo "Could not determine event base branch; running release validator tests."
@@ -322,8 +441,7 @@ jobs:
 
           release_process_re='contrib/release-''process/'
           release_sanitize_re='contrib/release-''sanitize/'
-          release_publish_re='[.]github/workflows/release-publish[.]yml$'
-          release_path_re="^(ci/release/|contrib/guix/|${release_process_re}|${release_sanitize_re}|${release_publish_re})"
+          release_path_re="^(ci/release/|contrib/guix/|${release_process_re}|${release_sanitize_re})"
           if grep -E "${release_path_re}" "${changed_files}"; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
@@ -342,13 +460,16 @@ jobs:
         run: |
           release_process_dir='contrib/release-''process'
           release_sanitize_dir='contrib/release-''sanitize'
-          # Retained public release tests: present in both the source tree and
-          # sanitized public snapshots, and depended on by release-publish.yml,
-          # so a missing file is a regression and must fail the check.
+          # Retained public release tests cover the public publisher and its
+          # validators, so a missing file is a regression and must fail.
           required_tests=(
+            ci/release/test_publish_local_release.py
             ci/release/test_validate_builder_attestations.py
             ci/release/test_validate_key_metadata.py
             ci/release/test_validate_release_artifacts.py
+            ci/release/test_verify_mainnet_ci_posture.py
+            ci/release/test_verify_mainnet_release_posture.py
+            ci/release/test_verify_p2mr_v1_conformance.py
             ci/release/test_verify_testnet_release_posture.py
             contrib/guix/test_build_config.py
           )
@@ -361,7 +482,7 @@ jobs:
           )
           for test_file in "${required_tests[@]}"; do
             if [[ ! -f "${test_file}" ]]; then
-              echo "::error::Retained release test ${test_file} is missing; it is kept in public snapshots and required by release-publish.yml." >&2
+              echo "::error::Required public release test ${test_file} is missing." >&2
               exit 1
             fi
             python3 "${test_file}"
@@ -374,6 +495,54 @@ jobs:
             python3 "${test_file}"
           done
 
+  mainnet-publish-gate:
+    name: mainnet publication posture
+    needs: classify-changes
+    if: ${{ needs.classify-changes.outputs.mainnet_publish_gate_required == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+
+      - name: Create immutable CI release-candidate tag
+        id: release-candidate
+        run: |
+          set -euo pipefail
+
+          source_sha="$(git rev-parse HEAD)"
+          candidate_tag="v0.0.0-mainnet-posture-ci.${source_sha}"
+          git \
+            -c user.name='qbit Core Checks' \
+            -c user.email='core-checks@qbit.org' \
+            -c tag.gpgSign=false \
+            tag --annotate "${candidate_tag}" "${source_sha}" \
+            --message "Core Checks mainnet posture candidate ${source_sha}"
+          echo "tag=${candidate_tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Run fail-closed mainnet publication gate
+        env:
+          RELEASE_CANDIDATE_TAG: ${{ steps.release-candidate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          posture_result="${RUNNER_TEMP}/mainnet-posture-result.json"
+
+          set +e
+          python3 ci/release/verify_mainnet_release_posture.py \
+            --source-root "$GITHUB_WORKSPACE" \
+            --release-tag "${RELEASE_CANDIDATE_TAG}" \
+            --result-json "${posture_result}"
+          validator_exit_code=$?
+          set -e
+
+          python3 ci/release/verify_mainnet_ci_posture.py \
+            --policy ci/release/mainnet_ci_posture.json \
+            --result-json "${posture_result}" \
+            --validator-exit-code "${validator_exit_code}"
+
   core-checks-gate:
     name: 'Core Checks Gate'
     runs-on: ubuntu-24.04
@@ -381,11 +550,13 @@ jobs:
       - classify-changes
       - build-smoke
       - focused-unit-suites
+      - p2mr-v1-conformance
       - functional-smoke
       - release-validator-tests
-    # Aggregate core check input for Required Merge Gate. Source jobs are skipped
-    # only for the strict release-policy profile; every other profile requires
-    # the core jobs to complete successfully.
+      - mainnet-publish-gate
+    # Aggregate core check input for Required Merge Gate. The phase-aware
+    # mainnet posture runs for source and release-policy changes targeting
+    # 1.0.0; source build/test jobs remain conditional on source validation.
     if: ${{ always() }}
     steps:
       - name: Check core check results
@@ -395,8 +566,11 @@ jobs:
           SOURCE_VALIDATION_REQUIRED: ${{ needs.classify-changes.outputs.source_validation_required }}
           BUILD_SMOKE_RESULT: ${{ needs.build-smoke.result }}
           FOCUSED_UNIT_SUITES_RESULT: ${{ needs.focused-unit-suites.result }}
+          P2MR_V1_CONFORMANCE_RESULT: ${{ needs.p2mr-v1-conformance.result }}
           FUNCTIONAL_SMOKE_RESULT: ${{ needs.functional-smoke.result }}
           RELEASE_VALIDATOR_TESTS_RESULT: ${{ needs.release-validator-tests.result }}
+          MAINNET_PUBLISH_GATE_REQUIRED: ${{ needs.classify-changes.outputs.mainnet_publish_gate_required }}
+          MAINNET_PUBLISH_GATE_RESULT: ${{ needs.mainnet-publish-gate.result }}
         run: |
           set -euo pipefail
 
@@ -414,6 +588,12 @@ jobs:
 
           check_result "classify validation profile" "${CLASSIFY_CHANGES_RESULT}"
 
+          if [[ "${MAINNET_PUBLISH_GATE_REQUIRED}" == "true" ]]; then
+            check_result "mainnet publication posture" "${MAINNET_PUBLISH_GATE_RESULT}"
+          else
+            echo "Mainnet publication posture is not required for this target/profile."
+          fi
+
           if [[ "${SOURCE_VALIDATION_REQUIRED}" != "true" ]]; then
             echo "Validation profile ${VALIDATION_PROFILE} does not require source core checks."
             exit "${failed}"
@@ -421,6 +601,7 @@ jobs:
 
           check_result "build smoke" "${BUILD_SMOKE_RESULT}"
           check_result "focused unit suites" "${FOCUSED_UNIT_SUITES_RESULT}"
+          check_result "P2MR v1 conformance" "${P2MR_V1_CONFORMANCE_RESULT}"
           check_result "functional smoke" "${FUNCTIONAL_SMOKE_RESULT}"
           check_result "release validator tests" "${RELEASE_VALIDATOR_TESTS_RESULT}"
 

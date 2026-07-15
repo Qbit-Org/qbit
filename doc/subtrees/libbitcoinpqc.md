@@ -17,6 +17,26 @@ release tags from that repository, not the moving `main` branch.
 so the expected `git-subtree-split` value is
 `ac72d1ffa0ef486f08d37334a43f5db1adb731db`.
 
+## Downstream Build Policy
+
+qbit always compiles the integrated `bitcoinpqc` target with
+`SPX_PRODUCTION_BUILD=1`. Configuring qbit with
+`SPX_ENABLE_TEST_BENCH_ENV_KNOBS=ON` is prohibited because it would make
+consensus-reachable PQC behavior selectable through test and benchmark
+environment variables. The qbit CMake configuration fails rather than
+silently overriding that request.
+
+Backend experiments that require the runtime controls must configure
+`src/libbitcoinpqc` as a standalone project. Upstream work to make differential
+tests prove which accelerated implementation ran is tracked in
+[`Qbit-Org/qbit-libbitcoinpqc#3`](https://github.com/Qbit-Org/qbit-libbitcoinpqc/issues/3).
+
+`BITCOINPQC_WOTSC_MAX_COUNTER` is an operational signing cap used while
+signing statistics are active, not a verifier protocol limit. Verification
+continues to accept the full two-byte WOTS+C counter range. See the subtree's
+[`bounded30` signature-limit documentation](../../src/libbitcoinpqc/docs/bounded30-signature-limit.md)
+for the complete distinction.
+
 ## Import Or Refresh The Subtree
 
 Run in a clean `qbit` worktree:
@@ -57,6 +77,13 @@ The check fetches the pinned tag if needed, should report `GOOD`, and should
 show the subtree split commit as `ac72d1ffa0ef486f08d37334a43f5db1adb731db`
 for the current pin.
 
+The current qbit tree carries one approved downstream security delta on top of
+the pinned upstream tag: `RUSTSEC-2026-0204-crossbeam-epoch-0.9.20`, which
+updates only `src/libbitcoinpqc/Cargo.lock` from `crossbeam-epoch 0.9.18` to
+`0.9.20`. The subtree check accepts exactly that lockfile hunk and no other
+subtree drift. Drop the exception after `Qbit-Org/qbit-libbitcoinpqc` publishes
+an immutable tag containing the same advisory fix and qbit imports it.
+
 ## PR Checklist For Subtree Updates
 
 When a PR touches `src/libbitcoinpqc`, confirm:
@@ -67,6 +94,8 @@ When a PR touches `src/libbitcoinpqc`, confirm:
 - [ ] `test/lint/libbitcoinpqc-subtree-check.sh` passes locally.
 - [ ] Any default tag change in `contrib/devtools/update-libbitcoinpqc-subtree.sh`
   is intentional and matches this runbook.
+- [ ] Any downstream security delta is listed above, is limited to the exact
+  lint allowlist, and is removed once a fixed upstream release tag is imported.
 
 ## Common Failures
 

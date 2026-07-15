@@ -33,13 +33,15 @@ runs:
   steps:
     - name: Check inputs
       shell: bash
+      env:
+        CACHE_PROVIDER: ${{ inputs.cache-provider }}
       run: |
         # We expect only gha or cirrus as inputs to cache-provider
-        case "${{ inputs.cache-provider }}" in
+        case "${CACHE_PROVIDER}" in
           gha|cirrus)
             ;;
           *)
-            echo "::warning title=Unknown input to configure docker action::Provided value was ${{ inputs.cache-provider }}"
+            echo "::warning title=Unknown input to configure docker action::Provided value was ${CACHE_PROVIDER}"
             ;;
         esac
 
@@ -52,7 +54,7 @@ runs:
         bash "${GITHUB_ACTION_PATH}/buildkit-config.sh"
 
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
+      uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       with:
         # Use host network to allow access to cirrus gha cache running on the host
         driver-opts: |
@@ -61,7 +63,7 @@ runs:
 
     # This is required to allow buildkit to access the actions cache
     - name: Expose actions cache variables
-      uses: actions/github-script@v6
+      uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410 # v6
       with:
         script: |
           Object.keys(process.env).forEach(function (key) {
@@ -73,6 +75,15 @@ runs:
 
     - name: Construct docker build cache args
       shell: bash
+      env:
+        CACHE_PROVIDER: ${{ inputs.cache-provider }}
+        CACHE_FROM_SCOPES: ${{ inputs.cache-from-scopes }}
+        CACHE_TO_SCOPES: ${{ inputs.cache-to-scopes }}
+        CACHE_WRITE_POLICY: ${{ inputs.cache-write-policy }}
+        LOAD_IMAGE: ${{ inputs.load-image }}
+        EVENT_NAME: ${{ github.event_name }}
+        REF_NAME: ${{ github.ref_name }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       run: |
         # Configure docker build cache backend
         #
@@ -103,16 +114,16 @@ runs:
         }
 
         # Use cirrus cache host
-        if [[ ${{ inputs.cache-provider }} == 'cirrus' ]]; then
+        if [[ "${CACHE_PROVIDER}" == 'cirrus' ]]; then
           url_args="url=${CIRRUS_CACHE_HOST},url_v2=${CIRRUS_CACHE_HOST}"
         else
           url_args=""
         fi
 
-        cache_from_scopes_input="${{ inputs.cache-from-scopes }}"
-        cache_to_scopes_input="${{ inputs.cache-to-scopes }}"
-        cache_write_policy="${{ inputs.cache-write-policy }}"
-        load_image="${{ inputs.load-image }}"
+        cache_from_scopes_input="${CACHE_FROM_SCOPES}"
+        cache_to_scopes_input="${CACHE_TO_SCOPES}"
+        cache_write_policy="${CACHE_WRITE_POLICY}"
+        load_image="${LOAD_IMAGE}"
 
         if [[ -z "${cache_from_scopes_input}" ]]; then
           cache_from_scopes_input="${CONTAINER_NAME}"
@@ -155,7 +166,7 @@ runs:
         should_write_cache=false
         case "${cache_write_policy}" in
           default-branch)
-            if [[ ${{ github.event_name }} == "push" && ${{ github.ref_name }} == ${{ github.event.repository.default_branch }} ]]; then
+            if [[ "${EVENT_NAME}" == "push" && "${REF_NAME}" == "${DEFAULT_BRANCH}" ]]; then
               should_write_cache=true
             fi
             ;;
@@ -184,4 +195,4 @@ runs:
           args+=(--load)
         fi
 
-        echo "DOCKER_BUILD_CACHE_ARG=${args[*]}" >> $GITHUB_ENV
+        echo "DOCKER_BUILD_CACHE_ARG=${args[*]}" >> "$GITHUB_ENV"

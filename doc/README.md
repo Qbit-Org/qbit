@@ -5,8 +5,8 @@ This tree separates primary qbit user guidance from technical/source
 references. Current public release, network, support, faucet, explorer,
 security, and launch-resource status is published through https://qbit.org.
 
-Mainnet is not public yet. Mainnet-oriented examples in this tree apply only
-when qbit mainnet is announced.
+Qbit v1.0.0 launches mainnet. Commands without a chain flag select mainnet;
+use `-testnet4` or `-chain=testnet4` to join the public test network.
 
 Primary User Docs
 -----------------
@@ -19,6 +19,7 @@ Primary User Docs
 - [Wallets, P2MR Addresses, and Backups](user/wallet/p2mr-wallets.md)
 - [P2MR Watch-Only Pubkey Database Guide](user/wallet/p2mr-pubkeydb.md)
 - [P2MR Multisig](user/wallet/p2mr-multisig.md)
+- [qbit P2MR v1 Consensus Profile](consensus/p2mr-v1.md)
 - [qbit.conf Configuration File](user/setup/bitcoin-conf.md)
 - [Files](user/setup/files.md)
 

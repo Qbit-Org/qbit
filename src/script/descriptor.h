@@ -127,6 +127,10 @@ struct Descriptor {
      *  This is true for all descriptors except ones that use `raw` or `addr` constructions. */
     virtual bool IsSolvable() const = 0;
 
+    /** Whether a P2MR descriptor has at least one wallet-constructible
+     * satisfaction within the v1 initial-stack resource limits. */
+    virtual bool HasP2MRStandardSatisfaction() const { return IsSolvable(); }
+
     /** Convert the descriptor back to a string, undoing parsing. */
     virtual std::string ToString(bool compat_format=false) const = 0;
 

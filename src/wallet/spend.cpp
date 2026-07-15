@@ -1005,7 +1005,9 @@ static bool IsCurrentForAntiFeeSniping(interfaces::Chain& chain, const uint256& 
     if (chain.isInitialBlockDownload()) {
         return false;
     }
-    constexpr int64_t MAX_ANTI_FEE_SNIPING_TIP_AGE = 8 * 60 * 60; // in seconds
+    // Keep anti-fee-sniping active through short interruptions, but not after
+    // sixty missed aggregate target intervals.
+    constexpr int64_t MAX_ANTI_FEE_SNIPING_TIP_AGE = 60 * 60; // in seconds
     int64_t block_time;
     CHECK_NONFATAL(chain.findBlock(block_hash, FoundBlock().time(block_time)));
     if (block_time < (GetTime() - MAX_ANTI_FEE_SNIPING_TIP_AGE)) {

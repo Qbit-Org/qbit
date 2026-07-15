@@ -9,14 +9,12 @@ defaults, opt-in witness pruning, and archive bootstrap fallback through
 `-connectarchive`.
 
 Current public status and launch resources are published through
-https://qbit.org. Mainnet is not public yet; any mainnet-oriented examples in
-this source tree are guidance for when qbit mainnet is announced.
+https://qbit.org. Qbit v1.0.0 launches mainnet; commands without a chain flag
+select mainnet by default.
 
-Official public testnet release artifacts are for qbit testnet4. Start them
-with `-testnet4` or `-chain=testnet4`; no-flag mainnet commands in this tree
-are future-mainnet guidance only. The in-tree mainnet parameters, genesis
-block, and any derived hash are development placeholders, not a qbit mainnet
-launch commitment.
+The public testnet4 network remains available with `-testnet4` or
+`-chain=testnet4`. The v1.0.0 source pins mainnet AuxPoW chain ID `47`, the
+mined genesis block, and the genesis-bound ASERT launch anchor.
 
 The qbit source is open, so third parties can fork it or run private networks.
 Only qbit-published artifacts, tags, release notes, seed resources, and
@@ -28,7 +26,9 @@ Start Here
 - Public testnet: [doc/user/public-testnet.md](doc/user/public-testnet.md)
 - qbit differences from Bitcoin Core:
   [doc/user/bitcoin-core-differences.md](doc/user/bitcoin-core-differences.md)
-- Running a node when the target network is announced:
+- Normative P2MR consensus profile:
+  [doc/consensus/p2mr-v1.md](doc/consensus/p2mr-v1.md)
+- Running a node:
   [doc/user/run-node.md](doc/user/run-node.md)
 - Wallets, P2MR addresses, and backups:
   [doc/user/wallet/p2mr-wallets.md](doc/user/wallet/p2mr-wallets.md)

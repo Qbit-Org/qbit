@@ -11,6 +11,7 @@ method arguments, result schemas, examples, and command semantics.
 - Canonical RPC reference: [docs.qbit.org](https://docs.qbit.org/)
 - Generated RPC documentation assets: `doc/rpc/`
 - qbit protocol overview: [What Changed From Bitcoin Core](../user/bitcoin-core-differences.md)
+- normative P2MR rules: [qbit P2MR v1 Consensus Profile](../consensus/p2mr-v1.md)
 - Exchange and integrator quickstart: [Exchange and Integrator Quickstart](exchange-integrator-quickstart.md)
 - Full-validation and archive bootstrap guide: [Full-Validation Bootstrap](../user/full-validation-bootstrap.md)
 - P2MR watch-only pubkey database guide: [P2MR Watch-Only Pubkey Database Guide](../user/wallet/p2mr-pubkeydb.md)
@@ -26,16 +27,21 @@ qbit keeps the Bitcoin Core RPC shape where that is still accurate, but adds or 
 - P2MR addresses and wallet descriptors
 - post-quantum signing state and signature-budget reporting
 - Cadence and AuxPoW mining
+- future block-time activation and candidate timestamp headroom
 - archive-by-default node behavior and witness-pruned peers
 - stale block metrics and qbit confirmation-target estimation
 
 For protocol constants behind these RPCs, use the protocol specification rather
-than older Bitcoin Core assumptions. Future mainnet launch values include
+than older Bitcoin Core assumptions. Mainnet values include
 60-second aggregate target spacing, P2MR as the public spendable output model,
 `qb` mainnet addresses, archive/full-history retention by default, and explicit
-witness pruning via `-prunewitnesses=1`. Current official public testnet
-release artifacts are for testnet4; use `-testnet4` or `-chain=testnet4` in
-testnet examples.
+witness pruning via `-prunewitnesses=1`. Use `-testnet4` or
+`-chain=testnet4` in testnet examples.
+
+RPC clients that construct or independently inspect P2MR commitments and
+signatures must use qbit P2MR v1, not the ancestry profile pinned in its
+specification. In particular, a trailing transaction-signature byte is a
+sighash type; there is no witness algorithm selector.
 
 ## qbit-Only RPCs
 
@@ -61,12 +67,29 @@ Important result fields:
 - `coinbasevalue`: total coinbase value in satoshis, including fees
 - `bits` and `target`: candidate difficulty target
 - `height`: candidate qbit block height
+- `future_block_time`: maximum future timestamp and activation state for this
+  candidate
 
 Integrator notes:
 
 - The payout address must be valid for the active qbit network.
 - On restricted-output launch chains, the coinbase output must be P2MR or an allowed restricted-output exemption.
 - The RPC is unavailable before Cadence activation.
+- On testnet4, `future_block_time.limit_seconds` changes from 7,200 to 600 for
+  the height-60,000 candidate.
+
+### Future-time fields on shared RPCs
+
+`getblockchaininfo.future_block_time` reports the legacy and v2 limits,
+activation height, current and next-block state, blocks remaining, and the
+minimum, maximum, and remaining timestamp headroom for the next block.
+
+`getblocktemplate.future_block_time` reports the limit and activation state
+for the permissionless candidate. Both it and `createauxblock` may fail with a
+`time-too-new` template-validity error if median time past temporarily exceeds
+the maximum future timestamp. Operators should treat negative
+`next_block_time_headroom_seconds` as a clock/activation incident and wait for
+wall time to catch up rather than manufacturing an out-of-range timestamp.
 
 ### `submitauxblock`
 
@@ -478,6 +501,9 @@ by `createauxblock`, not by `getmininginfo.next`.
 
 ## Compatibility Notes for Bitcoin Core Integrators
 
+- Consult the [qbit P2MR v1 integration support
+  matrix](p2mr-v1-support-matrix.md) before treating a wallet, signer, PSBT
+  tool, explorer, or validator as supported by a release.
 - Do not hard-code Bitcoin Core ports, address prefixes, or address type assumptions.
 - Do not treat Bitcoin confirmation counts as qbit confirmation policy.
 - Do not assume historical verbose `getblock` works on witness-pruned nodes.

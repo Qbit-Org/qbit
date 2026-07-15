@@ -559,7 +559,7 @@ WalletModel::UnlockContext::UnlockContext(WalletModel *_wallet, bool _valid, boo
 }
 
 WalletModel::UnlockContext::UnlockContext(UnlockContext&& other) noexcept:
-        wallet(other.wallet),
+        wallet(std::move(other.wallet)),
         valid(other.valid),
         relock(other.relock)
 {

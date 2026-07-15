@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "profile": "qbit-p2mr-v1",
+  "profile_version": 1,
+  "specification_commit": "0000000000000000000000000000000000000000",
+  "corpus_manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "release_tag": "v0.0.0-example",
+  "release_source_commit": "0000000000000000000000000000000000000000",
+  "consensus_review": {
+    "source_commit": "0000000000000000000000000000000000000000",
+    "evidence": "https://example.invalid/replace-with-public-consensus-review"
+  },
+  "oracle": {
+    "name": "p2mr-v1-oracle",
+    "version": "1",
+    "source_commit": "0000000000000000000000000000000000000000",
+    "report_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "result": "pass",
+    "case_count": 0
+  },
+  "qbit": {
+    "test_binary_commit": "0000000000000000000000000000000000000000",
+    "result": "pass",
+    "case_count": 0,
+    "evidence": "https://example.invalid/replace-with-public-qbit-test-run"
+  },
+  "integration_matrix": {
+    "release_source_commit": "0000000000000000000000000000000000000000",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "blocking_failures": 0,
+    "unresolved_claimed_support": 0
+  }
+}

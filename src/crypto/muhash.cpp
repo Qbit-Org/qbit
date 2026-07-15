@@ -60,7 +60,7 @@ inline void mulnadd3(limb_t& c0, limb_t& c1, limb_t& c2, limb_t& d0, limb_t& d1,
     t += (double_limb_t)d1 * n + c1;
     c1 = t;
     t >>= LIMB_SIZE;
-    c2 = t + d2 * n;
+    c2 = t + double_limb_t{d2} * n;
 }
 
 /* [c0,c1] *= n */

@@ -14,7 +14,7 @@ from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal
 
 
-DEFAULT_MAX_TIP_AGE = 24 * 60 * 60
+DEFAULT_MAX_TIP_AGE = 3 * 60 * 60
 
 
 class MaxTipAgeTest(BitcoinTestFramework):
@@ -48,10 +48,15 @@ class MaxTipAgeTest(BitcoinTestFramework):
         node_miner.setmocktime(0)
 
     def run_test(self):
-        self.log.info("Test IBD with maximum tip age of 24 hours (default).")
+        for hours in [20, 10, 5]:
+            maxtipage = hours * 60 * 60
+            self.log.info(f"Test IBD with maximum tip age of {hours} hours (-maxtipage={maxtipage}).")
+            self.test_maxtipage(maxtipage)
+
+        self.log.info("Test IBD with maximum tip age of 3 hours (default).")
         self.test_maxtipage(DEFAULT_MAX_TIP_AGE, set_parameter=False)
 
-        for hours in [20, 10, 5, 2, 1]:
+        for hours in [2, 1]:
             maxtipage = hours * 60 * 60
             self.log.info(f"Test IBD with maximum tip age of {hours} hours (-maxtipage={maxtipage}).")
             self.test_maxtipage(maxtipage)

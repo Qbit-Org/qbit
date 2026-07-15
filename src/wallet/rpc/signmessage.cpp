@@ -71,18 +71,6 @@ void EnsurePQCKeyValidationReadyForSigning(const CWallet& wallet)
     }
 }
 
-void LogConsumedPQCDataHashCounters(const CWallet& wallet, const PQCUsageRecorder& recorder, const bilingual_str& error)
-{
-    for (const PQCUsageAdvance& advance : recorder.GetAdvances()) {
-        wallet.WalletLogPrintf(
-            "PQC data-hash signing consumed counter for pubkey %s [%u, %u) before failing: %s\n",
-            HexStr(std::span<const unsigned char>{advance.pubkey.begin(), advance.pubkey.end()}),
-            advance.previous_count,
-            advance.new_count,
-            error.original);
-    }
-}
-
 } // namespace
 
 RPCHelpMan signmessage()
@@ -163,7 +151,7 @@ RPCHelpMan signdatapqchash()
                     {"pubkey", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "Optional 32-byte P2MR pubkey to select when the address commits to more than one single-key leaf."},
                     {"leaf_script", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "Optional exact P2MR leaf script to sign against."},
                     {"control_block", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "Optional exact P2MR control block to prove with."},
-                    {"include_pqc_usage", RPCArg::Type::BOOL, RPCArg::Default{true}, "Include PQC key-usage counters and warnings in the result."},
+                    {"include_pqc_usage", RPCArg::Type::BOOL, RPCArg::Default{false}, "Include wallet-local PQC key-usage counters and warnings in the result. These fields may reveal exact remaining signature budget and public keys from failed retry attempts; enable only for local diagnostics."},
                 },
                 RPCArgOptions{.oneline_description="options"}},
         },
@@ -227,7 +215,7 @@ RPCHelpMan signdatapqchash()
             const std::optional<CPQCPubKey> requested_pubkey{ParseOptionalP2MRPubKey(options)};
             const std::optional<CScript> requested_leaf_script{ParseOptionalScript(options)};
             const std::optional<std::vector<unsigned char>> requested_control_block{ParseOptionalControlBlock(options)};
-            const bool include_pqc_usage{!options.exists("include_pqc_usage") || options.find_value("include_pqc_usage").get_bool()};
+            const bool include_pqc_usage{options.exists("include_pqc_usage") && options.find_value("include_pqc_usage").get_bool()};
 
             PQCUsageRecorder pqc_usage_recorder;
             util::Result<DataPQCSignatureProof> proof{pwallet->SignDataPQCHash(

@@ -578,7 +578,7 @@ def main() -> int:
 
         with tempfile.TemporaryDirectory(prefix="qbit-release-gnupg-") as gnupg_home:
             gnupg_home_path = Path(gnupg_home)
-            os.chmod(gnupg_home_path, 0o700)
+            gnupg_home_path.chmod(0o700)
             import_release_keys(args.gpg, gnupg_home_path, keys_dir, policy)
             counted_aliases = verify_manifest_signatures(
                 args.gpg, gnupg_home_path, artifacts_dir, policy

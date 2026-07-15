@@ -38,7 +38,7 @@ requests when multiple wallets are in use.
 
 ### Examples
 
-The examples below use the future-mainnet RPC port. For public testnet4, use
+The examples below use the mainnet RPC port. For public testnet4, use
 the same endpoint paths on port `48352` and pass `-testnet4` to `qbit-cli`
 commands.
 

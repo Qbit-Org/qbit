@@ -30,6 +30,7 @@
 #include <node/blockstorage.h>
 #include <node/context.h>
 #include <node/confirmation_target.h>
+#include <node/miner.h>
 #include <node/orphan_metrics.h>
 #include <node/transaction.h>
 #include <node/utxo_snapshot.h>
@@ -39,6 +40,7 @@
 #include <rpc/server_util.h>
 #include <rpc/util.h>
 #include <script/descriptor.h>
+#include <script/script.h>
 #include <serialize.h>
 #include <streams.h>
 #include <sync.h>
@@ -53,6 +55,8 @@
 #include <util/translation.h>
 #include <validation.h>
 #include <validationinterface.h>
+
+#include <algorithm>
 #include <versionbits.h>
 
 #include <cstdint>
@@ -1377,6 +1381,27 @@ RPCHelpMan getblockchaininfo()
                 {RPCResult::Type::BOOL, "automatic_pruning", /*optional=*/true, "whether automatic pruning is enabled (only present if pruning is enabled)"},
                 {RPCResult::Type::NUM, "prune_target_size", /*optional=*/true, "the target size used by pruning (only present if automatic pruning is enabled)"},
                 {RPCResult::Type::STR_HEX, "signet_challenge", /*optional=*/true, "the block challenge (aka. block script), in hexadecimal (only present if the current network is a signet)"},
+                {RPCResult::Type::OBJ, "p2mr_validation_weight", "P2MR validation-weight activation state", {
+                    {RPCResult::Type::NUM, "legacy_per_sigop", "Legacy P2MR validation debit"},
+                    {RPCResult::Type::NUM, "v2_per_sigop", "Validation-weight-v2 P2MR debit"},
+                    {RPCResult::Type::NUM, "activation_height", "First block using validation-weight-v2"},
+                    {RPCResult::Type::BOOL, "active_for_tip", "Whether validation-weight-v2 applies to the current tip"},
+                    {RPCResult::Type::BOOL, "active_for_next_block", "Whether validation-weight-v2 applies to the next block"},
+                    {RPCResult::Type::NUM, "blocks_remaining", "Blocks until activation, measured from the next block"},
+                }},
+                {RPCResult::Type::OBJ, "future_block_time", "Future block-time activation state and next-block timestamp bounds", {
+                    {RPCResult::Type::NUM, "legacy_limit_seconds", "Legacy maximum future block time"},
+                    {RPCResult::Type::NUM, "v2_limit_seconds", "Qbit v2 maximum future block time"},
+                    {RPCResult::Type::NUM, "activation_height", "First block using the qbit v2 future-time limit"},
+                    {RPCResult::Type::BOOL, "active_for_tip", "Whether the qbit v2 limit applies to the current tip"},
+                    {RPCResult::Type::BOOL, "active_for_next_block", "Whether the qbit v2 limit applies to the next block"},
+                    {RPCResult::Type::NUM, "tip_limit_seconds", "Future-time limit applicable to the current tip"},
+                    {RPCResult::Type::NUM, "next_block_limit_seconds", "Future-time limit applicable to the next block"},
+                    {RPCResult::Type::NUM, "blocks_remaining", "Blocks until activation, measured from the next block"},
+                    {RPCResult::Type::NUM_TIME, "next_block_min_time", "Minimum valid timestamp for the next block"},
+                    {RPCResult::Type::NUM_TIME, "next_block_max_time", "Maximum valid timestamp for the next block at current node time"},
+                    {RPCResult::Type::NUM, "next_block_time_headroom_seconds", "Seconds between the next-block minimum and maximum timestamps; negative means no valid timestamp is currently available"},
+                }},
                 (IsDeprecatedRPCEnabled("warnings") ?
                     RPCResult{RPCResult::Type::STR, "warnings", "any network and blockchain warnings (DEPRECATED)"} :
                     RPCResult{RPCResult::Type::ARR, "warnings", "any network and blockchain warnings (run with `-deprecatedrpc=warnings` to return the latest warning as a single string)",
@@ -1428,6 +1453,33 @@ RPCHelpMan getblockchaininfo()
             chainman.GetParams().GetConsensus().signet_challenge;
         obj.pushKV("signet_challenge", HexStr(signet_challenge));
     }
+
+    const Consensus::Params& consensus{chainman.GetConsensus()};
+    UniValue p2mr_weight(UniValue::VOBJ);
+    p2mr_weight.pushKV("legacy_per_sigop", P2MR_VALIDATION_WEIGHT_PER_SIGOP_LEGACY);
+    p2mr_weight.pushKV("v2_per_sigop", P2MR_VALIDATION_WEIGHT_PER_SIGOP_V2);
+    p2mr_weight.pushKV("activation_height", consensus.nP2MRValidationWeightV2Height);
+    p2mr_weight.pushKV("active_for_tip", consensus.P2MRValidationWeightV2ActiveAtHeight(height));
+    p2mr_weight.pushKV("active_for_next_block", consensus.P2MRValidationWeightV2ActiveAtHeight(height + 1));
+    p2mr_weight.pushKV("blocks_remaining", std::max(0, consensus.nP2MRValidationWeightV2Height - (height + 1)));
+    obj.pushKV("p2mr_validation_weight", std::move(p2mr_weight));
+
+    const int next_height{height + 1};
+    const int64_t next_min_time{node::GetMinimumTime(&tip, consensus)};
+    const int64_t next_max_time{GetTime() + GetMaxFutureBlockTime(consensus, next_height)};
+    UniValue future_block_time(UniValue::VOBJ);
+    future_block_time.pushKV("legacy_limit_seconds", MAX_FUTURE_BLOCK_TIME_LEGACY);
+    future_block_time.pushKV("v2_limit_seconds", MAX_FUTURE_BLOCK_TIME_V2);
+    future_block_time.pushKV("activation_height", consensus.nFutureBlockTimeV2Height);
+    future_block_time.pushKV("active_for_tip", consensus.FutureBlockTimeV2ActiveAtHeight(height));
+    future_block_time.pushKV("active_for_next_block", consensus.FutureBlockTimeV2ActiveAtHeight(next_height));
+    future_block_time.pushKV("tip_limit_seconds", GetMaxFutureBlockTime(consensus, height));
+    future_block_time.pushKV("next_block_limit_seconds", GetMaxFutureBlockTime(consensus, next_height));
+    future_block_time.pushKV("blocks_remaining", std::max(0, consensus.nFutureBlockTimeV2Height - next_height));
+    future_block_time.pushKV("next_block_min_time", next_min_time);
+    future_block_time.pushKV("next_block_max_time", next_max_time);
+    future_block_time.pushKV("next_block_time_headroom_seconds", next_max_time - next_min_time);
+    obj.pushKV("future_block_time", std::move(future_block_time));
 
     NodeContext& node = EnsureAnyNodeContext(request.context);
     obj.pushKV("warnings", node::GetWarningsForRpc(*CHECK_NONFATAL(node.warnings), IsDeprecatedRPCEnabled("warnings")));

@@ -19,6 +19,13 @@ class SignVerifyMessageDialog : public QDialog
     Q_OBJECT
 
 public:
+    /**
+     * Inclusive limit for P2MR proof JSON entered in the Qt verifier.
+     * QTextDocument::characterCount() includes its final paragraph separator,
+     * so callers must subtract one before comparing against this value.
+     */
+    static constexpr int MAX_P2MR_PROOF_DOCUMENT_CHARS{32 * 1024};
+
     explicit SignVerifyMessageDialog(const PlatformStyle *platformStyle, QWidget *parent);
     ~SignVerifyMessageDialog();
 
@@ -40,6 +47,7 @@ private:
     void updateP2MRSignHashPreview();
     void updateP2MRVerifyModeUi();
     void updateP2MRVerifyHashPreview();
+    void clearVerifyStatus();
 
     Ui::SignVerifyMessageDialog *ui;
     WalletModel* model{nullptr};

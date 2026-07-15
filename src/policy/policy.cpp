@@ -351,12 +351,12 @@ bool IsWitnessStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs)
             }
         }
 
-        // Check policy limits for P2MR (BIP-360) spends:
+        // Check policy limits for qbit P2MR v1 spends:
         // - MAX_STANDARD_P2MR_STACK_ITEM_SIZE limit for stack item size
         // - MAX_STANDARD_P2MR_TOTAL_INITIAL_STACK_BYTES limit for aggregate initial stack bytes
         // - No annexes
         if (witnessversion == 2 && witnessprogram.size() == WITNESS_V2_P2MR_SIZE && !p2sh) {
-            // P2MR spend (non-P2SH-wrapped, version 2, witness program size 32; see BIP-360)
+            // qbit P2MR v1 spend (native version 2, 32-byte witness program)
             std::span stack{tx.vin[i].scriptWitness.stack};
             if (stack.size() >= 2 && !stack.back().empty() && stack.back()[0] == ANNEX_TAG) {
                 // Annexes are nonstandard as long as no semantics are defined for them.
@@ -368,7 +368,7 @@ bool IsWitnessStandard(const CTransaction& tx, const CCoinsViewCache& mapInputs)
                 SpanPopBack(stack); // Ignore script
                 if (control_block.empty()) return false; // Empty control block is invalid
                 if ((control_block[0] & TAPROOT_LEAF_MASK) == P2MR_LEAF_VERSION) {
-                    // Leaf version 0xc0 (P2MR, see BIP-360)
+                    // Active qbit P2MR v1 leaf version 0xc0
                     size_t total_stack_bytes{0};
                     for (const auto& item : stack) {
                         if (item.size() > MAX_STANDARD_P2MR_STACK_ITEM_SIZE) return false;

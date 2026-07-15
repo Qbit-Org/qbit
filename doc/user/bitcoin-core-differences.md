@@ -4,10 +4,10 @@ qbit is based on Bitcoin Core v30.2, but it is not a Bitcoin network with differ
 
 ## Short Version
 
-- qbit has its own network identity, ports, address HRPs, payment URI scheme, genesis blocks, and chain parameters. Any concrete genesis hash in pre-launch documentation should be treated as a placeholder until the launch specification freezes it.
-- Mainnet is not public or launched yet. Official public testnet release artifacts are for testnet4; no-flag mainnet commands are future-mainnet guidance only.
+- qbit has its own network identity, ports, address HRPs, payment URI scheme, genesis blocks, and chain parameters. The v1.0.0 source pins the mainnet genesis identity, which becomes official through the signed release and qbit.org launch announcement.
+- Qbit v1.0.0 launches mainnet as the default chain; public testnet4 remains available through `-testnet4` or `-chain=testnet4`.
 - Public qbit launch chains are P2MR-only for spendable outputs. Do not expect legacy, P2SH-SegWit, native SegWit v0, or Taproot receive/change outputs to work as user payment outputs.
-- qbit's live authorization path uses P2MR script-path spends with `OP_CHECKSIGPQC` and bounded `SLH-DSA-SHA2-128s` signatures, not secp256k1 ECDSA or BIP340 Schnorr signatures.
+- qbit's live authorization path uses P2MR script-path spends with `OP_CHECKSIGPQC` and `SLH-DSA-SHA2-128s-bounded30` signatures, not secp256k1 ECDSA or BIP340 Schnorr signatures.
 - qbit has no witness discount. A 3,680-byte PQC signature counts at full weight.
 - qbit uses ASERT difficulty adjustment and Cadence mining lanes instead of Bitcoin's 2016-block retarget.
 - qbit keeps full witness history by default. Witness pruning is an explicit opt-in mode.
@@ -21,14 +21,17 @@ Use qbit binaries and qbit config. Do not point Bitcoin Core tooling at a qbit d
 | Network | P2P port | RPC/REST port | Address HRP | Notes |
 |---|---:|---:|---|---|
 | Public testnet4 | `48355` | `48352` | `tq` | Current public rehearsal network. |
-| Future mainnet | `8355` | `8352` | `qb` | Reserved qbit mainnet identity for when mainnet is announced. |
+| Mainnet | `8355` | `8352` | `qb` | Default qbit v1.0.0 network. |
 
 Other qbit networks use distinct parameters and are documented separately.
-The in-tree mainnet parameters, genesis block, derived hash, and message-start
-bytes are development placeholders until a qbit mainnet launch announcement
-freezes them. The in-tree mainnet AuxPoW chain ID currently matches public
-testnet as a placeholder only; it must be replaced with a distinct final value
-before mainnet is enabled or reset.
+The v1.0.0 source pins the mined mainnet genesis block, derived hash, and
+genesis-bound ASERT anchor. Mainnet AuxPoW chain ID `47` is the production
+allocation and is distinct from public testnet chain ID `31430`.
+
+The v1.0.0 launch source includes DNS discovery through
+`flux-mainnet.qbit.org` and `phase-mainnet.qbit.org`. Its project-operated
+archive fallbacks are `positron-mainnet.qbit.org:8355` and
+`graviton-mainnet.qbit.org:8355`.
 
 The qbit source is open, so third parties can fork it or run private networks.
 Only qbit-published artifacts, tags, release notes, seed resources, and
@@ -56,8 +59,11 @@ qbit starts from Bitcoin Core mechanics where they still fit, but the chain para
 | Total scheduled emission | 209,999,997.618768 QBT |
 | Maximum money cap | 210,000,000 QBT |
 | Difficulty adjustment | ASERT, `aserti3-2d`, 2 hour half-life |
+| Maximum future block time | 10 minutes after the network-specific v2 activation |
+| GUI synced-state block gap | 10 minutes |
+| Default maximum IBD tip age | 3 hours |
 | Public testnet AuxPoW chain ID | 31430 |
-| Future mainnet AuxPoW chain ID | placeholder `31430`; not a launch value |
+| Mainnet AuxPoW chain ID | 47 |
 
 The `WITNESS_SCALE_FACTOR` is `1`, so qbit does not discount witness data. This matters because P2MR signatures are large. Fee estimation, block template sizing, transaction batching, channel designs, and any custom policy logic should treat witness bytes as full-weight data.
 
@@ -65,7 +71,12 @@ qbit also uses a clean-chain posture: major inherited consensus deployments are 
 
 ## P2MR and SLH-DSA
 
-qbit's live spendable output model is P2MR, Pay to Merkle Root. A P2MR output is a witness v2 output whose 32-byte witness program is the Merkle root of a script tree.
+qbit's live spendable output model is qbit P2MR v1, Pay to Merkle Root. A
+P2MR output is a witness v2 output whose 32-byte witness program is the Merkle
+root of a script tree. The normative byte-level rules are in the
+[qbit P2MR v1 Consensus Profile](../consensus/p2mr-v1.md). qbit P2MR v1 is not
+compatible with the ancestry profile pinned there; integrations must not
+substitute its commitment, depth-zero, opcode, or sighash behavior.
 
 P2MR resembles Taproot/Tapscript in some implementation structure, but it is not Taproot:
 
@@ -88,7 +99,8 @@ The active signature profile is bounded `SLH-DSA-SHA2-128s`:
 | PQC public key | 32 bytes |
 | PQC secret key | 64 bytes |
 | PQC signature | 3,680 bytes |
-| P2MR v1 signature algorithm byte | `0x01` for the current SLH-DSA/SPHINCS+ path |
+| P2MR v1 signature algorithm selector | None; the active leaf/opcode selects the fixed profile |
+| Optional transaction-signature suffix | A nonzero sighash byte; `0x01` means `SIGHASH_ALL` |
 | P2MR leaf version | `0xc0` |
 
 ### P2MR Data-Signature Opcodes
@@ -203,10 +215,15 @@ qbit uses ASERT difficulty adjustment and Cadence lanes:
 - AuxPoW merged mining targets a 300 second lane.
 - The lane split is intended to produce an aggregate 4:1 permissionless-to-AuxPoW cadence.
 - Public testnet AuxPoW uses qbit chain ID `31430`.
-- The in-tree mainnet AuxPoW chain ID is a placeholder and must not be treated
-  as the future mainnet launch value.
+- Mainnet AuxPoW uses qbit chain ID `47`.
 
 A qbit block can be a permissionless block or an AuxPoW block. AuxPoW blocks carry an AuxPoW payload and must signal the expected version/chain-id semantics. Permissionless blocks must not include an AuxPoW payload.
+
+Qbit limits future block timestamps to ten minutes after future block time v2
+activation. Testnet4 retains the inherited two-hour rule below height 60,000
+and activates the ten-minute rule at height 60,000. Wallet and RPC historical
+timestamp searches retain an independent two-hour safety window. See
+[future block time v2 and chain freshness](../reference/future-block-time-v2.md).
 
 Cadence ASERT is lane-local. If one lane is quiet while the other lane advances
 the active chain, that quiet lane resumes from its prior same-lane history and

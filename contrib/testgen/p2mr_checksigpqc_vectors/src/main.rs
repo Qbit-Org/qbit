@@ -1,11 +1,10 @@
 use bitcoinpqc::{generate_keypair, sign, verify, KeyPair};
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::PathBuf;
 
 const OP_1: u8 = 0x51;
 const OP_2: u8 = 0x52;
@@ -19,6 +18,15 @@ const P2MR_CONTROL_BYTE: u8 = P2MR_LEAF_VERSION | 1;
 const SIGHASH_DEFAULT: u8 = 0x00;
 const PREVOUT_AMOUNT: i64 = 1000;
 const SPEND_OUTPUT_AMOUNT: i64 = 900;
+const SCHEMA_VERSION: u64 = 1;
+const PROFILE: &str = "qbit-p2mr-v1";
+const PROFILE_VERSION: u64 = 1;
+const GENERATOR_VERSION: u64 = 1;
+const RUST_OWNED_IDS: [&str; 3] = [
+    "single_key_leading_codesep",
+    "branch_codesep_true",
+    "branch_codesep_false",
+];
 
 #[derive(Clone)]
 struct TxIn {
@@ -52,7 +60,9 @@ struct SpentOutput {
 
 #[derive(Serialize)]
 struct WitnessVector {
+    id: String,
     name: String,
+    generator: Generator,
     provenance: String,
     annex: String,
     #[serde(rename = "inputIndex")]
@@ -80,8 +90,14 @@ struct WitnessVector {
     leaf_script: String,
     #[serde(rename = "controlBlock")]
     control_block: String,
+    #[serde(rename = "leafHash")]
+    leaf_hash: String,
     pubkey: String,
     signature: String,
+    witness: Vec<String>,
+    #[serde(rename = "digest_defined")]
+    digest_defined: bool,
+    expected: Expected,
     #[serde(rename = "p2mrSigMsg")]
     p2mr_sigmsg: String,
     #[serde(rename = "p2mrSighash")]
@@ -104,16 +120,54 @@ struct WitnessVector {
     wrong_pubkey_script_pubkey: String,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let out_path = env::args()
-        .nth(1)
-        .unwrap_or_else(|| "src/test/data/p2mr_pqc_witness_vectors.json".to_string());
+#[derive(Serialize)]
+struct Generator {
+    id: String,
+    version: u64,
+}
 
-    let out_path = Path::new(&out_path);
-    let vectors = merge_existing_fields(out_path, build_vectors()?)?;
-    let json = serde_json::to_string_pretty(&vectors)?;
-    fs::write(out_path, format!("{json}\n"))?;
+#[derive(Serialize)]
+struct Expected {
+    accepted: bool,
+    stage: String,
+    error: String,
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let output_path = parse_args()?;
+    let vectors = build_vectors()?;
+    let generated_ids: Vec<&str> = vectors.iter().map(|vector| vector.id.as_str()).collect();
+    if generated_ids != RUST_OWNED_IDS {
+        return Err("Rust generator did not produce its exact owned ID order".into());
+    }
+    let corpus = json!({
+        "schema_version": SCHEMA_VERSION,
+        "profile": PROFILE,
+        "profile_version": PROFILE_VERSION,
+        "vectors": vectors,
+    });
+    let json = serde_json::to_string_pretty(&corpus)?;
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(output_path, format!("{json}\n"))?;
     Ok(())
+}
+
+fn parse_args() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let mut args = env::args().skip(1);
+    let mut output = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--output" => {
+                output = Some(PathBuf::from(
+                    args.next().ok_or("--output requires a path")?,
+                ))
+            }
+            _ => return Err(format!("unknown argument: {arg}").into()),
+        }
+    }
+    Ok(output.ok_or("missing required --output")?)
 }
 
 fn build_vectors() -> Result<Vec<WitnessVector>, Box<dyn std::error::Error>> {
@@ -160,74 +214,6 @@ fn build_vectors() -> Result<Vec<WitnessVector>, Box<dyn std::error::Error>> {
     ])
 }
 
-fn merge_existing_fields(
-    out_path: &Path,
-    generated: Vec<WitnessVector>,
-) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
-    let mut generated_by_name = HashMap::<String, Map<String, Value>>::new();
-    let mut generated_names = Vec::with_capacity(generated.len());
-    for vector in generated {
-        let generated_value = serde_json::to_value(vector)?;
-        let generated_object = generated_value
-            .as_object()
-            .ok_or("generated vector did not serialize to a JSON object")?
-            .clone();
-        let name = generated_object
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or("generated vector is missing a name")?
-            .to_string();
-
-        if generated_by_name
-            .insert(name.clone(), generated_object)
-            .is_some()
-        {
-            return Err(format!("duplicate generated vector {name}").into());
-        }
-        generated_names.push(name);
-    }
-
-    let mut merged = Vec::new();
-    let mut emitted_generated_names = HashSet::new();
-    if out_path.exists() {
-        let existing_json: Value = serde_json::from_str(&fs::read_to_string(out_path)?)?;
-        let existing_array = existing_json
-            .as_array()
-            .ok_or("existing fixture is not a JSON array")?;
-        merged.reserve(existing_array.len() + generated_names.len());
-
-        for existing in existing_array {
-            let Some(name) = existing.get("name").and_then(Value::as_str) else {
-                merged.push(existing.clone());
-                continue;
-            };
-            let Some(generated_object) = generated_by_name.get(name) else {
-                merged.push(existing.clone());
-                continue;
-            };
-
-            let mut object = existing.as_object().cloned().unwrap_or_default();
-            for (key, value) in generated_object {
-                object.insert(key.clone(), value.clone());
-            }
-            emitted_generated_names.insert(name.to_string());
-            merged.push(Value::Object(object));
-        }
-    }
-
-    for name in generated_names {
-        if emitted_generated_names.contains(&name) {
-            continue;
-        }
-        let generated_object = generated_by_name
-            .remove(&name)
-            .ok_or_else(|| format!("missing generated vector {name}"))?;
-        merged.push(Value::Object(generated_object));
-    }
-
-    Ok(merged)
-}
-
 #[allow(clippy::too_many_arguments)]
 fn build_vector(
     name: &str,
@@ -258,6 +244,7 @@ fn build_vector(
 
     unsigned_tx.vin[0].witness =
         witness_stack(&signature.bytes, &script_args, leaf_script, &control_block);
+    let witness = unsigned_tx.vin[0].witness.iter().map(hex::encode).collect();
     let spend_tx = unsigned_tx.serialize(true);
 
     let wrong_codeseparator_sigmsg = p2mr_sigmsg(
@@ -289,7 +276,12 @@ fn build_vector(
     let wrong_pubkey_script_pubkey = p2mr_script_pubkey(&p2mr_leaf_hash(&wrong_pubkey_leaf_script));
 
     Ok(WitnessVector {
+        id: name.to_string(),
         name: name.to_string(),
+        generator: Generator {
+            id: "standalone-rust".to_string(),
+            version: GENERATOR_VERSION,
+        },
         provenance: format!(
             "Generated from deterministic libbitcoinpqc seed {key_seed:#04x} plus the independent Rust P2MR serializer in contrib/testgen/p2mr_checksigpqc_vectors; the vector signs the manually computed P2MRSighash digest with libbitcoinpqc and does not use qbit wallet/signing/sighash helpers."
         ),
@@ -310,8 +302,16 @@ fn build_vector(
         leaf_version: hex::encode([P2MR_LEAF_VERSION]),
         leaf_script: hex::encode(leaf_script),
         control_block: hex::encode(control_block),
+        leaf_hash: hex::encode(p2mr_leaf_hash(leaf_script)),
         pubkey: hex::encode(&keypair.public_key.bytes),
         signature: hex::encode(signature.bytes),
+        witness,
+        digest_defined: true,
+        expected: Expected {
+            accepted: true,
+            stage: "script-complete".to_string(),
+            error: "SCRIPT_ERR_OK".to_string(),
+        },
         p2mr_sigmsg: hex::encode(sigmsg),
         p2mr_sighash: hex::encode(p2mr_sighash),
         wrong_codeseparator_pos: hex::encode(wrong_codeseparator_pos.to_le_bytes()),

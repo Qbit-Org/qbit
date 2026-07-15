@@ -42,6 +42,10 @@ Node1 is unused in tests 3-7:
 7. Send Node0 the missing block again.
    Node0 should process and the tip should advance.
 
+7b. Send unrequested blocks at and immediately below the dynamic recent-work
+    threshold. The exact-threshold header should be accepted, while the
+    below-threshold header should not enter the block index.
+
 8. Create a fork which is invalid at a height longer than the current chain
    (ie to which the node will try to reorg) but which has headers built on top
    of the invalid block. Check that we get disconnected if we send more headers
@@ -232,6 +236,35 @@ class AcceptBlockTest(BitcoinTestFramework):
         assert_equal(self.nodes[0].getbestblockhash(), all_blocks[286].hash_hex)
         assert_raises_rpc_error(-1, "Block not available (not fully downloaded)", self.nodes[0].getblock, all_blocks[287].hash_hex)
         self.log.info("Successfully reorged to longer chain")
+
+        # 7b. Exercise the block-message min_pow_checked gate at the dynamic
+        # recent-work threshold. On constant-work regtest, a child of the
+        # height-(tip-145) block has chainwork exactly equal to the threshold.
+        active_height = self.nodes[0].getblockcount()
+        assert active_height > 146
+        boundary_time = self.nodes[0].getblockheader(self.nodes[0].getbestblockhash())["time"] + 1
+
+        accepted_parent_height = active_height - 145
+        accepted_boundary = create_block(
+            int(self.nodes[0].getblockhash(accepted_parent_height), 16),
+            create_coinbase(accepted_parent_height + 1),
+            boundary_time,
+        )
+        accepted_boundary.solve()
+        test_node.send_and_ping(msg_block(accepted_boundary))
+        assert_equal(self.nodes[0].getblockheader(accepted_boundary.hash_hex)["hash"], accepted_boundary.hash_hex)
+        assert_raises_rpc_error(-1, "Block not available", self.nodes[0].getblock, accepted_boundary.hash_hex)
+
+        rejected_parent_height = active_height - 146
+        rejected_boundary = create_block(
+            int(self.nodes[0].getblockhash(rejected_parent_height), 16),
+            create_coinbase(rejected_parent_height + 1),
+            boundary_time,
+        )
+        rejected_boundary.solve()
+        with self.nodes[0].assert_debug_log(expected_msgs=["missing anti-dos proof-of-work validation"]):
+            test_node.send_and_ping(msg_block(rejected_boundary))
+        assert_raises_rpc_error(-5, "Block not found", self.nodes[0].getblockheader, rejected_boundary.hash_hex)
 
         # 8. Create a chain which is invalid at a height longer than the
         # current chain, but which has more blocks on top of that

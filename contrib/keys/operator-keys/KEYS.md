@@ -63,14 +63,24 @@ approvals/<policy_id>/
 The hash is computed over the checked-in `keys.json` bytes. Detached approval
 signatures are counted against active signers from the previous policy.
 
-Current testnet signers
------------------------
+Current release-line policy
+---------------------------
+
+| Release Line | Active Signers | Release Signatures | Builder Attestations | Later Policy Changes |
+|--------------|----------------|--------------------|----------------------|----------------------|
+| testnet | 3 | 2 | 2 | 2 |
+| mainnet | 5 | 3 | 3 | 3 |
+
+Current signers
+---------------
 
 | Signer Alias | Signing Fingerprint | Public Certificate | Release Line | Capabilities | Artifact Sets | Created | First Release |
 |--------------|---------------------|--------------------|--------------|--------------|---------------|---------|---------------|
-| operator-01 | 289EA3EC2F1939A24984840ED26CFC05586D371E | public-keys/operator-01-release.asc | testnet | release-signing, builder-attestation | core, photon | 2026-06-08 | v0.1.0-testnet4-rc3 |
-| operator-02 | 1B95A7AA02F5530BDB1CD92387012E62F6CC1393 | public-keys/operator-02-release.asc | testnet | release-signing, builder-attestation | core, photon | 2026-06-08 | v0.1.0-testnet4-rc3 |
-| operator-03 | 05A14A415C26F4216DC254FE52D5CC557D764586 | public-keys/operator-03-release.asc | testnet | release-signing, builder-attestation | core, photon | 2026-06-08 | v0.1.0-testnet4-rc3 |
+| operator-01 | 289EA3EC2F1939A24984840ED26CFC05586D371E | public-keys/operator-01-release.asc | mainnet, testnet | release-signing, builder-attestation | core, photon | 2026-06-08 | v0.1.0-testnet4-rc3 |
+| operator-02 | 1B95A7AA02F5530BDB1CD92387012E62F6CC1393 | public-keys/operator-02-release.asc | mainnet, testnet | release-signing, builder-attestation | core, photon | 2026-06-08 | v0.1.0-testnet4-rc3 |
+| operator-03 | 05A14A415C26F4216DC254FE52D5CC557D764586 | public-keys/operator-03-release.asc | mainnet, testnet | release-signing, builder-attestation | core, photon | 2026-06-08 | v0.1.0-testnet4-rc3 |
+| operator-04 | 71E5D38304B66183448285AB81859E1B1DEA4ED5 | public-keys/operator-04-release.asc | mainnet | release-signing, builder-attestation | core, photon | 2026-07-07 | v1.0.0 |
+| operator-05 | D57AB80A8580EC27CDB45455E9FC0931AE6CA9BD | public-keys/operator-05-release.asc | mainnet | release-signing, builder-attestation | core, photon | 2026-07-14 | v1.0.0 |
 
 Publication checklist
 ---------------------

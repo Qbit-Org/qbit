@@ -20,6 +20,7 @@ from test_framework.messages import (
 from test_framework.blocktools import (
     NORMAL_GBT_REQUEST_PARAMS,
     create_block,
+    create_coinbase,
 )
 
 from test_framework.util import (
@@ -40,6 +41,11 @@ class RejectLowDifficultyHeadersTest(BitcoinTestFramework):
         self.num_nodes = 4
         # Node0 has no required chainwork; node1 requires 15 blocks on top of the genesis block; node2 requires 2047
         self.extra_args = [["-minimumchainwork=0x0", "-checkblockindex=0"], ["-minimumchainwork=0x1f", "-checkblockindex=0"], ["-minimumchainwork=0x1000", "-checkblockindex=0"], ["-minimumchainwork=0x1000", "-checkblockindex=0", "-whitelist=noban@127.0.0.1"]]
+        # This test mines synthetic 4,110-block branches in seconds. Keep its
+        # focus on minimum-chainwork and headers-sync behavior rather than the
+        # default regtest future-time rule, which has dedicated coverage.
+        for args in self.extra_args:
+            args.append("-testactivationheight=futuretime@10000000")
 
     def setup_network(self):
         self.setup_nodes()
@@ -163,6 +169,38 @@ class RejectLowDifficultyHeadersTest(BitcoinTestFramework):
         # getpeerinfo should show a sync in progress
         assert_equal(node.getpeerinfo()[0]['presynced_headers'], 2000)
 
+    def test_dynamic_work_threshold_boundary(self):
+        self.log.info("Test the dynamic recent-work threshold boundary for headers")
+        node = self.nodes[0]
+        height = node.getblockcount()
+        assert height > 146
+        peer = node.add_p2p_connection(P2PInterface())
+        template = node.getblocktemplate(NORMAL_GBT_REQUEST_PARAMS)
+
+        def build_fork_header(parent_height):
+            block = create_block(
+                hashprev=int(node.getblockhash(parent_height), 16),
+                coinbase=create_coinbase(parent_height + 1),
+                ntime=template["curtime"],
+                tmpl=template,
+            )
+            block.solve()
+            return block
+
+        # On constant-work regtest, this header's chainwork is exactly the
+        # active tip's chainwork minus the most recent 144-block work window.
+        accepted = build_fork_header(height - 145)
+        peer.send_and_ping(msg_headers(headers=[accepted]))
+        assert_equal(node.getblockheader(accepted.hash_hex)["hash"], accepted.hash_hex)
+
+        # Moving the parent back one more block leaves the candidate one proof
+        # below the threshold, so it must not enter the block index.
+        rejected = build_fork_header(height - 146)
+        with node.assert_debug_log(expected_msgs=[f"[net] Ignoring low-work chain (height={height - 145})"]):
+            peer.send_and_ping(msg_headers(headers=[rejected]))
+        assert_raises_rpc_error(-5, "Block not found", node.getblockheader, rejected.hash_hex)
+        peer.peer_disconnect()
+
     def test_large_reorgs_can_succeed(self):
         self.log.info("Test that a 2000+ block reorg, starting from a point that is more than 2000 blocks before a locator entry, can succeed")
 
@@ -188,6 +226,8 @@ class RejectLowDifficultyHeadersTest(BitcoinTestFramework):
 
     def run_test(self):
         self.test_chains_sync_when_long_enough()
+
+        self.test_dynamic_work_threshold_boundary()
 
         self.test_large_reorgs_can_succeed()
 

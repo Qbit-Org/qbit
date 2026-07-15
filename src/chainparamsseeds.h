@@ -9,7 +9,9 @@
  *
  * Each line contains a BIP155 serialized (networkID, addr, port) tuple.
  */
-static constexpr std::array<uint8_t, 0> chainparams_seed_main{{
+static constexpr std::array<uint8_t, 16> chainparams_seed_main{{
+    0x01,0x04,0x39,0x81,0x69,0x5a,0x20,0xa3,
+    0x01,0x04,0x28,0xa0,0x48,0x7b,0x20,0xa3,
 }};
 
 static constexpr std::array<uint8_t, 0> chainparams_seed_signet{{

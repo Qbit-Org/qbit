@@ -149,9 +149,11 @@ class BlockchainTest(BitcoinTestFramework):
             'chain',
             'chainwork',
             'difficulty',
+            'future_block_time',
             'headers',
             'initialblockdownload',
             'mediantime',
+            'p2mr_validation_weight',
             'pruned',
             'size_on_disk',
             'target',
@@ -163,6 +165,24 @@ class BlockchainTest(BitcoinTestFramework):
 
         assert_equal(res['time'], TIME_RANGE_END - TIME_RANGE_STEP)
         assert_equal(res['mediantime'], TIME_RANGE_MTP)
+        assert_equal(res['p2mr_validation_weight'], {
+            'legacy_per_sigop': 3730,
+            'v2_per_sigop': 3683,
+            'activation_height': 0,
+            'active_for_tip': True,
+            'active_for_next_block': True,
+            'blocks_remaining': 0,
+        })
+        future_time = res['future_block_time']
+        assert_equal(future_time['legacy_limit_seconds'], 7200)
+        assert_equal(future_time['v2_limit_seconds'], 600)
+        assert_equal(future_time['activation_height'], 0)
+        assert_equal(future_time['active_for_tip'], True)
+        assert_equal(future_time['active_for_next_block'], True)
+        assert_equal(future_time['tip_limit_seconds'], 600)
+        assert_equal(future_time['next_block_limit_seconds'], 600)
+        assert_equal(future_time['blocks_remaining'], 0)
+        assert_equal(future_time['next_block_time_headroom_seconds'], future_time['next_block_max_time'] - future_time['next_block_min_time'])
 
         # result should have these additional pruning keys if manual pruning is enabled
         assert_equal(sorted(res.keys()), sorted(['pruneheight', 'automatic_pruning'] + keys))
@@ -291,7 +311,7 @@ class BlockchainTest(BitcoinTestFramework):
     def _test_verificationprogress(self):
         self.log.info("Check that verificationprogress is less than 1 when the block tip is old")
         block_time = self.nodes[0].getblockchaininfo()["time"]
-        future = 2 * 60 * 60
+        future = 15 * 60
         self.nodes[0].setmocktime(block_time + future + 1)
         assert_greater_than(1, self.nodes[0].getblockchaininfo()["verificationprogress"])
 

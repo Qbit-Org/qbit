@@ -64,7 +64,7 @@ std::string UniValue::write(unsigned int prettyIndent,
 
 static void indentStr(unsigned int prettyIndent, unsigned int indentLevel, std::string& s)
 {
-    s.append(prettyIndent * indentLevel, ' ');
+    s.append(static_cast<std::string::size_type>(prettyIndent) * indentLevel, ' ');
 }
 
 // NOLINTNEXTLINE(misc-no-recursion)

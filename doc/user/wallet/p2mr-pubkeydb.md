@@ -13,9 +13,8 @@ watch-only interface. Use qbit's explicit P2MR pubkey database flow instead:
 - `getnextpubkeydbaddress` to allocate imported receive/change addresses
 - `listpubkeydbstatus` to monitor remaining imported address capacity
 
-Mainnet is not public yet. Examples that omit a chain flag use the
-mainnet-shaped command form for when qbit mainnet is announced. Use the public
-testnet guide for current rehearsal-network flags and HRPs.
+Examples that omit a chain flag target mainnet. Use the public testnet guide
+for testnet4 flags and HRPs.
 
 ## Why xpub Is Not Enough
 

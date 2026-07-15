@@ -6,8 +6,9 @@
 #include <qt/test/util.h>
 
 #include <wallet/coincontrol.h>
+#include <common/p2mr_data_signature.h>
+#include <crypto/pqc.h>
 #include <interfaces/chain.h>
-#include <interfaces/handler.h>
 #include <interfaces/node.h>
 #include <key_io.h>
 #include <node/interface_ui.h>
@@ -24,6 +25,7 @@
 #include <qt/sendcoinsdialog.h>
 #include <qt/sendcoinsentry.h>
 #include <qt/signverifymessagedialog.h>
+#include <qt/test/syntheticwallet.h>
 #include <qt/transactiontablemodel.h>
 #include <qt/transactionview.h>
 #include <qt/walletmodel.h>
@@ -31,6 +33,10 @@
 #include <outputtype.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
+#include <rpc/server.h>
+#include <script/interpreter.h>
+#include <script/p2mr.h>
+#include <script/p2mr_sizing.h>
 #include <script/solver.h>
 #include <consensus/consensus.h>
 #include <test/util/setup_common.h>
@@ -40,10 +46,15 @@
 #include <wallet/test/util.h>
 #include <wallet/wallet.h>
 
+#include <array>
 #include <chrono>
 #include <memory>
+#include <set>
 #include <span>
+#include <string>
+#include <string_view>
 #include <utility>
+#include <vector>
 
 #include <QAbstractButton>
 #include <QAction>
@@ -53,17 +64,21 @@
 #include <QComboBox>
 #include <QElapsedTimer>
 #include <QEvent>
+#include <QLabel>
 #include <QLineEdit>
 #include <QObject>
 #include <QPointer>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QSignalSpy>
 #include <QTabWidget>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QTextEdit>
 #include <QListView>
 #include <QDialogButtonBox>
+
+#include <univalue.h>
 
 using wallet::AddWallet;
 using wallet::CWallet;
@@ -81,6 +96,67 @@ constexpr int QT_WALLET_FUNDING_TXS{5};
 constexpr CAmount QT_WALLET_FUNDING_AMOUNT{210 * COIN - 1000};
 constexpr std::array QT_WALLET_BECH32_DESCRIPTOR_OUTPUT_TYPES{OutputType::BECH32};
 constexpr std::array QT_WALLET_P2MR_DESCRIPTOR_OUTPUT_TYPES{OutputType::P2MR};
+
+QString MakeP2MRProofJson(std::string leaf_version)
+{
+    UniValue proof{UniValue::VOBJ};
+    proof.pushKV("proof_mode", common::P2MR_DATA_SIGNATURE_PROOF_MODE);
+    proof.pushKV("address", EncodeDestination(WitnessV2P2MR{}));
+    proof.pushKV("message_hash", std::string(uint256::size() * 2, '0'));
+    proof.pushKV("pubkey", std::string(PQC_PUBKEY_SIZE * 2, '0'));
+    proof.pushKV("signature", std::string(PQC_SIG_SIZE * 2, '0'));
+    proof.pushKV("leaf_script", std::string(P2MR_V1_PK_LEAF_SCRIPT_SIZE * 2, '0'));
+    proof.pushKV("control_block", "c1");
+
+    UniValue leaf_version_value;
+    leaf_version_value.setNumStr(std::move(leaf_version));
+    proof.pushKV("leaf_version", std::move(leaf_version_value));
+    return QString::fromStdString(proof.write());
+}
+
+void TestP2MRProofLeafVersionValidation(SignVerifyMessageDialog& dialog)
+{
+    QPlainTextEdit* proof_input = dialog.findChild<QPlainTextEdit*>("messageIn_VM");
+    QVERIFY(proof_input);
+    QComboBox* verify_input_mode = dialog.findChild<QComboBox*>("p2mrVerifyInputMode_VM");
+    QVERIFY(verify_input_mode);
+    QLabel* status_label = dialog.findChild<QLabel*>("statusLabel_VM");
+    QVERIFY(status_label);
+    QPushButton* verify_button = dialog.findChild<QPushButton*>("verifyMessageButton_VM");
+    QVERIFY(verify_button);
+
+    dialog.showTab_VM(/*fShow=*/false);
+    verify_input_mode->setCurrentIndex(2);
+
+    const QString stale_success{"P2MR/PQC proof verified for a previous proof."};
+    const QString leaf_version_error{"Proof field \"leaf_version\" must be an integer from 0 to 255."};
+    const std::array invalid_leaf_versions{
+        "192.0",
+        "1e2",
+        "-1",
+        "256",
+        "2147483648",
+        "1e1000000",
+    };
+    for (const char* leaf_version : invalid_leaf_versions) {
+        status_label->setStyleSheet("QLabel { color: green; }");
+        status_label->setText(stale_success);
+        proof_input->setPlainText(MakeP2MRProofJson(leaf_version));
+
+        verify_button->click();
+
+        QCOMPARE(status_label->text(), leaf_version_error);
+        QVERIFY(status_label->styleSheet().contains("red"));
+        QVERIFY(status_label->text() != stale_success);
+        QVERIFY(verify_button->isEnabled());
+        QVERIFY(QApplication::instance() != nullptr);
+    }
+
+    proof_input->setPlainText(MakeP2MRProofJson("192"));
+    verify_button->click();
+    QVERIFY(status_label->text().startsWith("P2MR/PQC proof verification failed:"));
+    QVERIFY(status_label->styleSheet().contains("red"));
+}
 
 template <typename Predicate>
 bool WaitUntil(Predicate&& predicate, int timeout_ms)
@@ -466,111 +542,13 @@ public:
         transactionView.setModel(walletModel.get());
     }
 
-};
-
-class SyntheticPQCReportWallet : public interfaces::Wallet
-{
-public:
-    explicit SyntheticPQCReportWallet(wallet::PQCUsageReport report) : m_report(std::move(report)) {}
-
-    bool encryptWallet(const SecureString&) override { return false; }
-    bool isCrypted() override { return false; }
-    bool lock() override { return false; }
-    bool unlock(const SecureString&) override { return true; }
-    bool isLocked() override { return false; }
-    bool changeWalletPassphrase(const SecureString&, const SecureString&) override { return false; }
-    void abortRescan() override {}
-    bool backupWallet(const std::string&) override { return false; }
-    std::string getWalletName() override { return "synthetic-pqc-report"; }
-    util::Result<CTxDestination> getNewDestination(const OutputType, const std::string&) override { return CTxDestination{PKHash{}}; }
-    bool getPubKey(const CScript&, const CKeyID&, CPubKey&) override { return false; }
-    SigningResult signMessage(const std::string&, const PKHash&, std::string&) override { return SigningResult::PRIVATE_KEY_NOT_AVAILABLE; }
-    util::Result<interfaces::P2MRDataSignatureResult> signP2MRDataHash(const CTxDestination&, const uint256&) override { return util::Error{Untranslated("P2MR data-hash signing unavailable")}; }
-    bool isSpendable(const CTxDestination&) override { return false; }
-    bool setAddressBook(const CTxDestination&, const std::string&, const std::optional<wallet::AddressPurpose>&) override { return false; }
-    bool delAddressBook(const CTxDestination&) override { return false; }
-    bool getAddress(const CTxDestination&, std::string*, wallet::AddressPurpose*) override { return false; }
-    std::vector<interfaces::WalletAddress> getAddresses() override { return {}; }
-    std::vector<OutputType> getAvailableAddressTypes() override { return {OutputType::P2MR}; }
-    std::vector<std::string> getAddressReceiveRequests() override { return {}; }
-    bool setAddressReceiveRequest(const CTxDestination&, const std::string&, const std::string&) override { return false; }
-    util::Result<void> displayAddress(const CTxDestination&) override { return {}; }
-    bool lockCoin(const COutPoint&, const bool) override { return false; }
-    bool unlockCoin(const COutPoint&) override { return false; }
-    bool isLockedCoin(const COutPoint&) override { return false; }
-    void listLockedCoins(std::vector<COutPoint>&) override {}
-    util::Result<CTransactionRef> createTransaction(const std::vector<wallet::CRecipient>& recipients,
-        const wallet::CCoinControl&,
-        bool,
-        int& change_pos,
-        CAmount& fee,
-        wallet::PQCUsageReport* pqc_usage,
-        const SigningProgressCallback&) override
+    void initModel(std::unique_ptr<interfaces::Wallet> wallet, const PlatformStyle* platformStyle)
     {
-        CMutableTransaction tx;
-        if (!recipients.empty()) {
-            tx.vout.emplace_back(recipients.front().nAmount, CScript{} << OP_TRUE);
-        }
-        change_pos = -1;
-        fee = 1000;
-        if (pqc_usage) {
-            *pqc_usage = m_report;
-        }
-        return MakeTransactionRef(std::move(tx));
+        walletModel = std::make_unique<WalletModel>(std::move(wallet), *clientModel, platformStyle);
+        sendCoinsDialog.setModel(walletModel.get());
+        transactionView.setModel(walletModel.get());
     }
-    void commitTransaction(CTransactionRef, interfaces::WalletValueMap, interfaces::WalletOrderForm) override {}
-    bool transactionCanBeAbandoned(const Txid&) override { return false; }
-    bool abandonTransaction(const Txid&) override { return false; }
-    bool transactionCanBeBumped(const Txid&) override { return false; }
-    bool createBumpTransaction(const Txid&, const wallet::CCoinControl&, std::vector<bilingual_str>&, CAmount&, CAmount&, CMutableTransaction&) override { return false; }
-    bool signBumpTransaction(CMutableTransaction&) override { return false; }
-    bool commitBumpTransaction(const Txid&, CMutableTransaction&&, std::vector<bilingual_str>&, Txid&) override { return false; }
-    CTransactionRef getTx(const Txid&) override { return {}; }
-    interfaces::WalletTx getWalletTx(const Txid&) override { return {}; }
-    std::set<interfaces::WalletTx> getWalletTxs() override { return {}; }
-    bool tryGetTxStatus(const Txid&, interfaces::WalletTxStatus&, int&, int64_t&) override { return false; }
-    interfaces::WalletTx getWalletTxDetails(const Txid&, interfaces::WalletTxStatus&, interfaces::WalletOrderForm&, bool&, int&) override { return {}; }
-    std::optional<common::PSBTError> fillPSBT(std::optional<int>, bool, bool, size_t*, PartiallySignedTransaction&, bool&, wallet::PQCUsageReport*) override { return std::nullopt; }
-    interfaces::WalletBalances getBalances() override { return {.balance = 50 * COIN}; }
-    bool tryGetBalances(interfaces::WalletBalances& balances, uint256&) override
-    {
-        balances = getBalances();
-        return true;
-    }
-    CAmount getBalance() override { return 50 * COIN; }
-    CAmount getAvailableBalance(const wallet::CCoinControl&) override { return 50 * COIN; }
-    bool txinIsMine(const CTxIn&) override { return false; }
-    bool txoutIsMine(const CTxOut&) override { return false; }
-    CAmount getDebit(const CTxIn&) override { return 0; }
-    CAmount getCredit(const CTxOut&) override { return 0; }
-    CoinsList listCoins() override { return {}; }
-    std::vector<interfaces::WalletTxOut> getCoins(const std::vector<COutPoint>&) override { return {}; }
-    CAmount getRequiredFee(unsigned int) override { return 0; }
-    CAmount getMinimumFee(unsigned int, const wallet::CCoinControl&, int* returned_target, FeeReason* reason) override
-    {
-        if (returned_target) *returned_target = 6;
-        if (reason) *reason = FeeReason::NONE;
-        return 0;
-    }
-    unsigned int getConfirmTarget() override { return 6; }
-    bool hdEnabled() override { return true; }
-    bool canGetAddresses() override { return true; }
-    bool privateKeysDisabled() override { return false; }
-    bool taprootEnabled() override { return false; }
-    bool hasExternalSigner() override { return false; }
-    OutputType getDefaultAddressType() override { return OutputType::P2MR; }
-    CAmount getDefaultMaxTxFee() override { return MAX_MONEY; }
-    wallet::PQCKeyValidationInfo getPQCKeyValidationInfo() const override { return {}; }
-    void remove() override {}
-    std::unique_ptr<interfaces::Handler> handleUnload(UnloadFn) override { return interfaces::MakeCleanupHandler([] {}); }
-    std::unique_ptr<interfaces::Handler> handleShowProgress(ShowProgressFn) override { return interfaces::MakeCleanupHandler([] {}); }
-    std::unique_ptr<interfaces::Handler> handleStatusChanged(StatusChangedFn) override { return interfaces::MakeCleanupHandler([] {}); }
-    std::unique_ptr<interfaces::Handler> handleAddressBookChanged(AddressBookChangedFn) override { return interfaces::MakeCleanupHandler([] {}); }
-    std::unique_ptr<interfaces::Handler> handleTransactionChanged(TransactionChangedFn) override { return interfaces::MakeCleanupHandler([] {}); }
-    std::unique_ptr<interfaces::Handler> handleCanGetAddressesChanged(CanGetAddressesChangedFn) override { return interfaces::MakeCleanupHandler([] {}); }
 
-private:
-    wallet::PQCUsageReport m_report;
 };
 
 //! Simple qt wallet tests.
@@ -595,6 +573,15 @@ void TestGUI(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
     WalletModel& walletModel = *mini_gui.walletModel;
     SendCoinsDialog& sendCoinsDialog = mini_gui.sendCoinsDialog;
     TransactionView& transactionView = mini_gui.transactionView;
+
+    SignVerifyMessageDialog legacy_sign_verify_dialog(platformStyle.get(), nullptr);
+    legacy_sign_verify_dialog.setModel(&walletModel);
+    QLabel* expected_signer_label = legacy_sign_verify_dialog.findChild<QLabel*>("expectedSignerLabel_VM");
+    QVERIFY(expected_signer_label);
+    QVERIFY(expected_signer_label->isHidden());
+    QValidatedLineEdit* legacy_verify_address = legacy_sign_verify_dialog.findChild<QValidatedLineEdit*>("addressIn_VM");
+    QVERIFY(legacy_verify_address);
+    QVERIFY(!legacy_verify_address->isHidden());
 
     // Update walletModel cached balance which will trigger an update for the 'labelBalance' QLabel.
     walletModel.pollBalanceChanged();
@@ -723,6 +710,7 @@ void TestGUIWatchOnly(interfaces::Node& node, TestChain100Setup& test)
     std::unique_ptr<const PlatformStyle> platformStyle(PlatformStyle::instantiate("other"));
     MiniGUI mini_gui(node, platformStyle.get());
     mini_gui.initModelForWallet(node, wallet, platformStyle.get());
+
     WalletModel& walletModel = *mini_gui.walletModel;
     SendCoinsDialog& sendCoinsDialog = mini_gui.sendCoinsDialog;
 
@@ -749,6 +737,52 @@ void TestGUIWatchOnly(interfaces::Node& node, TestChain100Setup& test)
     QVERIFY(DecodeRawPSBT(psbt, MakeByteSpan(*decoded_psbt), err));
 }
 
+UniValue CopyProofWithout(const UniValue& proof, std::string_view omitted_key)
+{
+    UniValue copy(UniValue::VOBJ);
+    const std::vector<std::string>& keys{proof.getKeys()};
+    const std::vector<UniValue>& values{proof.getValues()};
+    for (size_t i{0}; i < keys.size(); ++i) {
+        if (keys[i] != omitted_key) copy.pushKVEnd(keys[i], values[i]);
+    }
+    return copy;
+}
+
+UniValue ProofWithControlDepth(const UniValue& proof, size_t depth)
+{
+    assert(depth <= P2MR_CONTROL_MAX_NODE_COUNT);
+
+    UniValue result{proof};
+    std::vector<unsigned char> control_block{ParseHex(proof.find_value("control_block").get_str())};
+    control_block.resize(P2MR_CONTROL_BASE_SIZE);
+    for (size_t node{0}; node < depth; ++node) {
+        for (size_t byte{0}; byte < P2MR_CONTROL_NODE_SIZE; ++byte) {
+            control_block.push_back(static_cast<unsigned char>(node + byte + 1));
+        }
+    }
+
+    const std::vector<unsigned char> leaf_script{ParseHex(proof.find_value("leaf_script").get_str())};
+    const uint8_t leaf_version{proof.find_value("leaf_version").getInt<uint8_t>()};
+    const uint256 leaf_hash{ComputeP2MRLeafHash(leaf_version, leaf_script)};
+    const uint256 merkle_root{ComputeP2MRMerkleRoot(control_block, leaf_hash)};
+    result.pushKV("control_block", HexStr(control_block));
+    result.pushKV("address", EncodeDestination(WitnessV2P2MR{merkle_root}));
+    return result;
+}
+
+QString ProofWithNestedArrays(const UniValue& proof, size_t array_count)
+{
+    std::string json{proof.write()};
+    assert(!json.empty() && json.back() == '}');
+    json.pop_back();
+    json += ",\"nested\":";
+    json.append(array_count, '[');
+    json += '0';
+    json.append(array_count, ']');
+    json += '}';
+    return QString::fromStdString(json);
+}
+
 void TestP2MRReceiveAddressTypes(interfaces::Node& node)
 {
     TestChain100Setup test{ChainType::REGTEST, {.extra_args = {"-p2mronly=1"}}};
@@ -761,6 +795,13 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
     std::unique_ptr<const PlatformStyle> platformStyle(PlatformStyle::instantiate("other"));
     MiniGUI mini_gui(node, platformStyle.get());
     mini_gui.initModelForWallet(node, wallet, platformStyle.get());
+
+    QVERIFY(wallet->TopUpKeyPool(2));
+    const CTxDestination expected_signer_dest{*Assert(wallet->GetNewDestination(OutputType::P2MR, ""))};
+    const CTxDestination proof_signer_dest{*Assert(wallet->GetNewDestination(OutputType::P2MR, ""))};
+    QVERIFY(expected_signer_dest != proof_signer_dest);
+    const QString expected_signer_address{QString::fromStdString(EncodeDestination(expected_signer_dest))};
+    const QString proof_signer_address{QString::fromStdString(EncodeDestination(proof_signer_dest))};
 
     ReceiveCoinsDialog receiveCoinsDialog(platformStyle.get());
     receiveCoinsDialog.setModel(mini_gui.walletModel.get());
@@ -791,6 +832,9 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
     QPlainTextEdit* sign_input = sign_verify_dialog.findChild<QPlainTextEdit*>("messageIn_SM");
     QVERIFY(sign_input);
     QVERIFY(sign_input->placeholderText().contains("UTF-8 text"));
+
+    QValidatedLineEdit* sign_address = sign_verify_dialog.findChild<QValidatedLineEdit*>("addressIn_SM");
+    QVERIFY(sign_address);
 
     QLineEdit* sign_hash_preview = sign_verify_dialog.findChild<QLineEdit*>("p2mrMessageHash_SM");
     QVERIFY(sign_hash_preview);
@@ -834,9 +878,17 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
     QVERIFY(verify_data_input->isHidden());
     QVERIFY(verify_hash_preview->isHidden());
 
+    QLabel* expected_signer_label = sign_verify_dialog.findChild<QLabel*>("expectedSignerLabel_VM");
+    QVERIFY(expected_signer_label);
+    QVERIFY(!expected_signer_label->isHidden());
+
     QValidatedLineEdit* verify_address = sign_verify_dialog.findChild<QValidatedLineEdit*>("addressIn_VM");
     QVERIFY(verify_address);
-    QVERIFY(verify_address->isHidden());
+    QVERIFY(!verify_address->isHidden());
+
+    QPushButton* verify_address_book = sign_verify_dialog.findChild<QPushButton*>("addressBookButton_VM");
+    QVERIFY(verify_address_book);
+    QVERIFY(!verify_address_book->isHidden());
 
     QValidatedLineEdit* verify_signature = sign_verify_dialog.findChild<QValidatedLineEdit*>("signatureIn_VM");
     QVERIFY(verify_signature);
@@ -845,6 +897,579 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
     QPushButton* verify_button = sign_verify_dialog.findChild<QPushButton*>("verifyMessageButton_VM");
     QVERIFY(verify_button);
     QCOMPARE(verify_button->text(), QString("Verify &Proof"));
+
+    TestP2MRProofLeafVersionValidation(sign_verify_dialog);
+
+    QLabel* verify_status = sign_verify_dialog.findChild<QLabel*>("statusLabel_VM");
+    QVERIFY(verify_status);
+
+    sign_input_mode->setCurrentIndex(0);
+    sign_address->setText(proof_signer_address);
+    const QString signed_text{"expected signer binding test"};
+    sign_input->setPlainText(signed_text);
+    const QString signed_message_hash{sign_hash_preview->text()};
+    sign_button->click();
+    const QString proof_json{proof_output->toPlainText()};
+    QVERIFY(!proof_json.isEmpty());
+
+    sign_verify_dialog.showTab_VM(/*fShow=*/false);
+    proof_input->setPlainText(proof_json);
+
+    const auto verify = [&](const QString& expected_address, int input_mode, const QString& data) {
+        verify_address->setText(expected_address);
+        verify_input_mode->setCurrentIndex(input_mode);
+        verify_data_input->setPlainText(data);
+        proof_input->setPlainText(proof_json);
+        verify_button->click();
+    };
+
+    verify(proof_signer_address, /*input_mode=*/0, signed_text);
+    QVERIFY(verify_status->styleSheet().contains("green"));
+    QVERIFY(verify_status->text().contains("authenticated for the expected signer"));
+    QVERIFY(verify_status->text().contains(proof_signer_address));
+    QVERIFY(verify_status->text().contains(signed_message_hash));
+
+    verify(expected_signer_address, /*input_mode=*/0, signed_text);
+    QVERIFY(verify_status->styleSheet().contains("red"));
+    QVERIFY(verify_status->text().contains(expected_signer_address));
+    QVERIFY(verify_status->text().contains(proof_signer_address));
+    QVERIFY(verify_address->isValid());
+
+    const QString wrong_text{"different text"};
+    verify(proof_signer_address, /*input_mode=*/0, wrong_text);
+    const QString wrong_message_hash{verify_hash_preview->text()};
+    QVERIFY(verify_status->styleSheet().contains("red"));
+    QVERIFY(verify_status->text().contains(wrong_message_hash));
+    QVERIFY(verify_status->text().contains(signed_message_hash));
+
+    const QString wrong_network_address{"qb1zt39mp8jjcqd7pyh7qgz93gmhh2qlqppq8c3j4qy02chzfzp8c7sqkcq5ga"};
+    verify(wrong_network_address, /*input_mode=*/0, signed_text);
+    QVERIFY(verify_status->styleSheet().contains("red"));
+    QVERIFY(verify_status->text().contains("invalid for the active network"));
+    QVERIFY(!verify_address->isValid());
+    QVERIFY(verify_status->text().contains(proof_signer_address));
+    QVERIFY(verify_status->text().contains(signed_message_hash));
+
+    verify(/*expected_address=*/{}, /*input_mode=*/0, signed_text);
+    QVERIFY(verify_status->styleSheet().isEmpty());
+    QVERIFY(verify_status->text().contains("cryptographically valid"));
+    QVERIFY(verify_status->text().contains("No expected signer was provided"));
+    QVERIFY(verify_status->text().contains(proof_signer_address));
+    QVERIFY(verify_status->text().contains(signed_message_hash));
+
+    verify(/*expected_address=*/{}, /*input_mode=*/2, /*data=*/{});
+    QVERIFY(verify_status->styleSheet().isEmpty());
+    QVERIFY(verify_status->text().contains("No expected signer was provided"));
+    QVERIFY(verify_status->text().contains("Proof-only mode"));
+    QVERIFY(verify_status->text().contains(proof_signer_address));
+    QVERIFY(verify_status->text().contains(signed_message_hash));
+
+    verify(proof_signer_address, /*input_mode=*/2, /*data=*/{});
+    QVERIFY(verify_status->styleSheet().isEmpty());
+    QVERIFY(verify_status->text().contains("Expected signer matches"));
+    QVERIFY(verify_status->text().contains("Proof-only mode"));
+
+    QPushButton* verify_clear = sign_verify_dialog.findChild<QPushButton*>("clearButton_VM");
+    QVERIFY(verify_clear);
+    verify_clear->click();
+    QVERIFY(verify_address->text().isEmpty());
+    QVERIFY(proof_input->toPlainText().isEmpty());
+    QVERIFY(verify_data_input->toPlainText().isEmpty());
+
+    UniValue valid_proof;
+    QVERIFY(valid_proof.read(proof_json.toStdString()));
+    QVERIFY(valid_proof.isObject());
+
+    const auto verify_json = [&](const QString& json) {
+        verify_address->clear();
+        verify_input_mode->setCurrentIndex(2);
+        proof_input->setPlainText(json);
+        verify_button->click();
+        return verify_status->text();
+    };
+    const auto write_proof = [](const UniValue& proof) {
+        return QString::fromStdString(proof.write());
+    };
+    const auto proof_with_field = [&](const UniValue& proof, const char* name, std::string value) {
+        UniValue modified{proof};
+        modified.pushKV(name, std::move(value));
+        return write_proof(modified);
+    };
+    const auto expect_valid = [&](const QString& json) {
+        const QString status{verify_json(json)};
+        QVERIFY2(status.contains("cryptographically valid"), status.toLocal8Bit().constData());
+        QVERIFY(verify_status->styleSheet().isEmpty());
+    };
+    const auto expect_error = [&](const QString& json, const QString& expected) {
+        const QString status{verify_json(json)};
+        QVERIFY2(status.contains(expected), status.toLocal8Bit().constData());
+        QVERIFY(verify_status->styleSheet().contains("red"));
+    };
+
+    expect_valid(write_proof(valid_proof));
+
+    struct ExactHexField {
+        const char* name;
+        size_t bytes;
+    };
+    const std::array exact_hex_fields{
+        ExactHexField{"message_hash", uint256::size()},
+        ExactHexField{"pubkey", PQC_PUBKEY_SIZE},
+        ExactHexField{"signature", PQC_SIG_SIZE},
+        ExactHexField{"leaf_script", P2MR_V1_PK_LEAF_SCRIPT_SIZE},
+    };
+    // The genuine proof above is simultaneously the at-limit case for every
+    // exact-size field. Exercise one byte below/above, odd, and same-size
+    // non-hex inputs independently for each field.
+    for (const ExactHexField& field : exact_hex_fields) {
+        expect_error(proof_with_field(valid_proof, field.name, std::string((field.bytes - 1) * 2, '0')), "must be exactly");
+        expect_error(proof_with_field(valid_proof, field.name, std::string(field.bytes * 2 + 2, '0')), "must be exactly");
+        expect_error(proof_with_field(valid_proof, field.name, std::string(field.bytes * 2 - 1, '0')), "must be exactly");
+        expect_error(proof_with_field(valid_proof, field.name, std::string(field.bytes * 2, 'g')), "must be hex");
+    }
+    // A large non-hex value must fail on its size before the decoder scans it.
+    expect_error(proof_with_field(valid_proof, "signature", std::string(20'000, 'g')), "must be exactly");
+
+    const std::array valid_control_depths{size_t{0}, size_t{1}, P2MR_CONTROL_MAX_NODE_COUNT};
+    for (const size_t depth : valid_control_depths) {
+        const UniValue proof{ProofWithControlDepth(valid_proof, depth)};
+        QCOMPARE(proof.find_value("control_block").get_str().size(), GetP2MRControlBlockSize(depth) * 2);
+        expect_valid(write_proof(proof));
+    }
+    // Boundaries around the minimum, first node, and protocol maximum:
+    // 0/1/2, 32/33/34, and 4096/4097/4098 serialized bytes.
+    const std::array invalid_control_sizes{size_t{0}, size_t{2}, size_t{32}, size_t{34}, P2MR_CONTROL_MAX_SIZE - 1, P2MR_CONTROL_MAX_SIZE + 1};
+    for (const size_t byte_count : invalid_control_sizes) {
+        expect_error(proof_with_field(valid_proof, "control_block", std::string(byte_count * 2, '0')), "must be 1 + 32*n bytes");
+    }
+    expect_error(proof_with_field(valid_proof, "control_block", std::string(P2MR_CONTROL_MAX_SIZE * 2, 'g')), "must be hex");
+
+    const std::string valid_address{valid_proof.find_value("address").get_str()};
+    QCOMPARE(valid_address.size(), size_t{64});
+    expect_error(proof_with_field(valid_proof, "address", std::string(63, 'q')), "address is invalid");
+    expect_valid(write_proof(valid_proof));
+    expect_error(proof_with_field(valid_proof, "address", std::string(65, 'q')), "address is too long");
+
+    const std::array required_fields{
+        "proof_mode", "address", "message_hash", "pubkey", "signature", "leaf_version", "leaf_script", "control_block",
+    };
+    UniValue minimal_rpc_proof(UniValue::VOBJ);
+    for (const char* field : required_fields) {
+        minimal_rpc_proof.pushKVEnd(field, valid_proof.find_value(field));
+    }
+    expect_valid(write_proof(minimal_rpc_proof));
+
+    for (const char* field : required_fields) {
+        expect_error(write_proof(CopyProofWithout(valid_proof, field)), QString::fromLatin1(field));
+    }
+
+    std::vector<UniValue> invalid_string_types;
+    invalid_string_types.emplace_back();
+    UniValue number;
+    number.setInt(1);
+    invalid_string_types.push_back(number);
+    invalid_string_types.emplace_back(UniValue::VARR);
+    invalid_string_types.emplace_back(UniValue::VOBJ);
+    for (const UniValue& invalid_type : invalid_string_types) {
+        UniValue proof{valid_proof};
+        proof.pushKV("message_hash", invalid_type);
+        expect_error(write_proof(proof), "must be a string");
+    }
+
+    for (const char* leaf_version : {"-1", "256", "1.5", "999999999999999999999999"}) {
+        UniValue proof{valid_proof};
+        UniValue version;
+        version.setNumStr(leaf_version);
+        proof.pushKV("leaf_version", version);
+        expect_error(write_proof(proof), "integer from 0 to 255");
+    }
+    for (const int leaf_version : {0, 255}) {
+        UniValue proof{valid_proof};
+        proof.pushKV("leaf_version", leaf_version);
+        expect_error(write_proof(proof), "proof verification failed");
+    }
+
+    expect_error("[]", "JSON object");
+    expect_error("{", "JSON object");
+    expect_error(write_proof(valid_proof) + " trailing", "JSON object");
+
+    UniValue nested_value(UniValue::VOBJ);
+    UniValue nested_array(UniValue::VARR);
+    nested_array.push_back("compatible metadata");
+    nested_value.pushKV("array", std::move(nested_array));
+    UniValue proof_with_unknown{valid_proof};
+    proof_with_unknown.pushKV("unknown", std::move(nested_value));
+    expect_valid(write_proof(proof_with_unknown));
+
+    // UniValue permits at most 512 simultaneously open containers. The proof
+    // object consumes one level, so 510/511/512 nested arrays cover below, at,
+    // and above the parser's limit.
+    expect_valid(ProofWithNestedArrays(valid_proof, 510));
+    expect_valid(ProofWithNestedArrays(valid_proof, 511));
+    expect_error(ProofWithNestedArrays(valid_proof, 512), "JSON object");
+
+    for (const char* field : required_fields) {
+        UniValue duplicate{valid_proof};
+        duplicate.pushKVEnd(field, valid_proof.find_value(field));
+        expect_error(write_proof(duplicate), "duplicated");
+    }
+    UniValue duplicate_first(UniValue::VOBJ);
+    duplicate_first.pushKVEnd("signature", valid_proof.find_value("signature"));
+    duplicate_first.pushKVs(valid_proof);
+    expect_error(write_proof(duplicate_first), "duplicated");
+    UniValue duplicate_unknown{valid_proof};
+    duplicate_unknown.pushKVEnd("unknown", 1);
+    duplicate_unknown.pushKVEnd("unknown", 2);
+    expect_error(write_proof(duplicate_unknown), "duplicated");
+
+    const UniValue maximum_control_proof{ProofWithControlDepth(valid_proof, P2MR_CONTROL_MAX_NODE_COUNT)};
+    const QString maximum_json{QString::fromStdString(maximum_control_proof.write(2))};
+    QCOMPARE(maximum_json.size(), qsizetype{15'988});
+    QVERIFY(maximum_json.size() < SignVerifyMessageDialog::MAX_P2MR_PROOF_DOCUMENT_CHARS - 1);
+    for (const int document_size : {SignVerifyMessageDialog::MAX_P2MR_PROOF_DOCUMENT_CHARS - 1,
+                                    SignVerifyMessageDialog::MAX_P2MR_PROOF_DOCUMENT_CHARS}) {
+        QString padded{maximum_json};
+        padded.append(QString(document_size - padded.size(), ' '));
+        QCOMPARE(padded.size(), static_cast<qsizetype>(document_size));
+        expect_valid(padded);
+    }
+
+    // Editing after a success must clear both the old message and status style.
+    proof_input->setPlainText(QString(SignVerifyMessageDialog::MAX_P2MR_PROOF_DOCUMENT_CHARS + 1, ' '));
+    QVERIFY(verify_status->text().isEmpty());
+    QVERIFY(verify_status->styleSheet().isEmpty());
+    bool heartbeat{false};
+    QTimer::singleShot(0, [&] { heartbeat = true; });
+    QElapsedTimer rejection_timer;
+    rejection_timer.start();
+    verify_button->click();
+    QVERIFY2(rejection_timer.elapsed() < 1000, "Oversized proof rejection blocked the GUI thread");
+    QCoreApplication::processEvents();
+    QVERIFY(heartbeat);
+    QVERIFY(verify_status->text().contains("maximum size"));
+    QVERIFY(!verify_status->text().contains("cryptographically valid"));
+    QVERIFY(verify_status->styleSheet().contains("red"));
+
+    // Malformed input after the oversized error also replaces the status, and
+    // any subsequent edit clears it instead of leaving a stale failure/success.
+    proof_input->setPlainText("{");
+    QVERIFY(verify_status->text().isEmpty());
+    verify_button->click();
+    QVERIFY(verify_status->text().contains("JSON object"));
+    proof_input->setPlainText(write_proof(valid_proof));
+    QVERIFY(verify_status->text().isEmpty());
+    QVERIFY(verify_status->styleSheet().isEmpty());
+
+    CPQCKey selected_key;
+    selected_key.MakeNewKey();
+    QVERIFY(selected_key.IsValid());
+    const CPQCPubKey selected_pubkey{selected_key.GetPubKey()};
+
+    std::array<unsigned char, PQC_PUBKEY_SIZE> alternate_pubkey_bytes;
+    alternate_pubkey_bytes.fill(0x5a);
+    const CPQCPubKey alternate_pubkey{std::span<const unsigned char>{alternate_pubkey_bytes}};
+    QVERIFY(alternate_pubkey.IsValid());
+    QVERIFY(alternate_pubkey != selected_pubkey);
+
+    const CScript selected_leaf{p2mr::BuildPKScript(selected_pubkey)};
+    const CScript alternate_leaf{p2mr::BuildPKScript(alternate_pubkey)};
+    const std::vector<unsigned char> selected_leaf_bytes{selected_leaf.begin(), selected_leaf.end()};
+    const std::vector<unsigned char> alternate_leaf_bytes{alternate_leaf.begin(), alternate_leaf.end()};
+
+    TaprootBuilder builder;
+    builder.AddP2MR(/*depth=*/1, selected_leaf_bytes, P2MR_LEAF_VERSION_V1)
+        .AddP2MR(/*depth=*/1, alternate_leaf_bytes, P2MR_LEAF_VERSION_V1)
+        .FinalizeP2MR();
+    const P2MRSpendData spend_data{builder.GetP2MRSpendData()};
+    const auto selected_leaf_it{spend_data.scripts.find({selected_leaf_bytes, P2MR_LEAF_VERSION_V1})};
+    QVERIFY(selected_leaf_it != spend_data.scripts.end());
+    QVERIFY(!selected_leaf_it->second.empty());
+    std::vector<unsigned char> selected_control_block{*selected_leaf_it->second.begin()};
+    selected_control_block.resize(P2MR_CONTROL_BASE_SIZE);
+    for (size_t node{0}; node < P2MR_CONTROL_MAX_NODE_COUNT; ++node) {
+        for (size_t byte{0}; byte < P2MR_CONTROL_NODE_SIZE; ++byte) {
+            selected_control_block.push_back(static_cast<unsigned char>(node + byte + 1));
+        }
+    }
+    const uint256 selected_leaf_hash{ComputeP2MRLeafHash(P2MR_LEAF_VERSION_V1, selected_leaf_bytes)};
+    const WitnessV2P2MR output{ComputeP2MRMerkleRoot(selected_control_block, selected_leaf_hash)};
+
+    const uint256 message_hash{uint256::ONE};
+    const uint256 datasig_hash{ComputeQbitDataSigPQCHash(std::span<const unsigned char>{message_hash.begin(), message_hash.end()})};
+    std::vector<unsigned char> signature;
+    uint32_t signature_counter{0};
+    QVERIFY(selected_key.Sign(datasig_hash, signature, signature_counter));
+    QCOMPARE(signature_counter, 1U);
+
+    // The old rich exporter exceeded the 32 KiB verifier limit with this many
+    // advanced retry keys and exhaustion warnings. The portable proof must be
+    // independent of the wallet-local report's cardinality.
+    constexpr size_t FAILED_RETRY_KEY_COUNT{37};
+    std::set<CPQCPubKey> failed_retry_pubkeys{alternate_pubkey};
+    for (unsigned char marker{1}; failed_retry_pubkeys.size() < FAILED_RETRY_KEY_COUNT; ++marker) {
+        std::array<unsigned char, PQC_PUBKEY_SIZE> pubkey_bytes;
+        pubkey_bytes.fill(marker);
+        const CPQCPubKey pubkey{std::span<const unsigned char>{pubkey_bytes}};
+        if (pubkey.IsValid() && pubkey != selected_pubkey) failed_retry_pubkeys.insert(pubkey);
+    }
+
+    wallet::PQCUsageReport retry_report;
+    for (const CPQCPubKey& failed_pubkey : failed_retry_pubkeys) {
+        retry_report.key_states.push_back({
+            .pubkey = failed_pubkey,
+            .signature_count = PQC_MAX_SIGNATURES,
+            .signature_limit = PQC_MAX_SIGNATURES,
+            .signatures_remaining = 0,
+            .limit_state = wallet::PQCSignatureLimitState::EXHAUSTED,
+        });
+        retry_report.warnings.push_back({
+            .pubkey = failed_pubkey,
+            .previous_count = PQC_MAX_SIGNATURES - 1,
+            .new_count = PQC_MAX_SIGNATURES,
+            .previous_state = wallet::PQCSignatureLimitState::CRITICAL,
+            .current_state = wallet::PQCSignatureLimitState::EXHAUSTED,
+            .kind = wallet::PQCUsageWarningKind::TRANSITION,
+        });
+    }
+    retry_report.key_states.push_back({
+        .pubkey = selected_pubkey,
+        .signature_count = 1,
+        .signature_limit = PQC_MAX_SIGNATURES,
+        .signatures_remaining = PQC_MAX_SIGNATURES - 1,
+        .limit_state = wallet::PQCSignatureLimitState::NORMAL,
+    });
+    retry_report.overall_state = wallet::PQCSignatureLimitState::EXHAUSTED;
+    QCOMPARE(retry_report.key_states.size(), FAILED_RETRY_KEY_COUNT + 1);
+    QCOMPARE(retry_report.warnings.size(), FAILED_RETRY_KEY_COUNT);
+
+    interfaces::P2MRDataSignatureResult synthetic_result{
+        .output = output,
+        .message_hash = message_hash,
+        .datasig_hash = datasig_hash,
+        .pubkey = std::vector<unsigned char>{selected_pubkey.begin(), selected_pubkey.end()},
+        .signature = signature,
+        .leaf_script = selected_leaf,
+        .control_block = selected_control_block,
+        .leaf_version = P2MR_LEAF_VERSION_V1,
+    };
+
+    WalletModel proof_wallet_model(qt_test::MakeSyntheticWallet(synthetic_result, retry_report), *mini_gui.clientModel, platformStyle.get());
+    SignVerifyMessageDialog proof_dialog(platformStyle.get(), nullptr);
+    proof_dialog.setModel(&proof_wallet_model);
+
+    QValidatedLineEdit* proof_address = proof_dialog.findChild<QValidatedLineEdit*>("addressIn_SM");
+    QComboBox* proof_sign_mode = proof_dialog.findChild<QComboBox*>("p2mrDataInputMode_SM");
+    QPlainTextEdit* proof_message = proof_dialog.findChild<QPlainTextEdit*>("messageIn_SM");
+    QPushButton* proof_sign_button = proof_dialog.findChild<QPushButton*>("signMessageButton_SM");
+    QPlainTextEdit* generated_proof = proof_dialog.findChild<QPlainTextEdit*>("signatureOut_SM");
+    QLabel* proof_status = proof_dialog.findChild<QLabel*>("statusLabel_SM");
+    QPushButton* proof_copy_button = proof_dialog.findChild<QPushButton*>("copySignatureButton_SM");
+    QVERIFY(proof_address && proof_sign_mode && proof_message && proof_sign_button && generated_proof && proof_status && proof_copy_button);
+
+    proof_address->setText(QString::fromStdString(EncodeDestination(CTxDestination{output})));
+    proof_sign_mode->setCurrentIndex(1);
+    proof_message->setPlainText(QString::fromStdString(HexStr(std::span<const unsigned char>{message_hash.begin(), message_hash.end()})));
+    proof_sign_button->click();
+
+    const QString proof_text{generated_proof->toPlainText()};
+    QVERIFY(!proof_text.isEmpty());
+    QCOMPARE(proof_text.size(), qsizetype{15'988});
+    QVERIFY(proof_text.size() <= SignVerifyMessageDialog::MAX_P2MR_PROOF_DOCUMENT_CHARS);
+    UniValue proof_object;
+    QVERIFY(proof_object.read(proof_text.toStdString()));
+    QVERIFY(proof_object.isObject());
+    const std::set<std::string> portable_fields{
+        "address",
+        "message_hash",
+        "pubkey",
+        "signature",
+        "leaf_script",
+        "control_block",
+        "leaf_version",
+        "proof_mode",
+    };
+    QCOMPARE(proof_object.getKeys().size(), portable_fields.size());
+    for (const std::string& field : portable_fields) {
+        QVERIFY(proof_object.exists(field));
+    }
+
+    const std::array<const char*, 13> local_or_informational_fields{
+        "message_hash_source",
+        "message_hash_algorithm",
+        "datasig_hash",
+        "domain",
+        "algorithm",
+        "p2mr_merkle_root",
+        "pqc_key_states",
+        "pqc_overall_limit_state",
+        "pqc_signature_count",
+        "pqc_signature_limit",
+        "pqc_signatures_remaining",
+        "pqc_limit_state",
+        "warnings",
+    };
+    for (const char* field : local_or_informational_fields) {
+        QVERIFY(!proof_object.exists(field));
+    }
+    const QString alternate_pubkey_hex{QString::fromStdString(HexStr(std::span<const unsigned char>{alternate_pubkey.begin(), alternate_pubkey.end()}))};
+    QVERIFY(!proof_text.contains(alternate_pubkey_hex));
+    QVERIFY(proof_status->text().contains(alternate_pubkey_hex));
+    QVERIFY(proof_status->text().contains("PQC usage state after this signing attempt: exhausted."));
+
+    QApplication::clipboard()->clear();
+    proof_copy_button->click();
+    QCOMPARE(QApplication::clipboard()->text(), proof_text);
+
+    QComboBox* proof_verify_mode = proof_dialog.findChild<QComboBox*>("p2mrVerifyInputMode_VM");
+    QPlainTextEdit* proof_verify_input = proof_dialog.findChild<QPlainTextEdit*>("messageIn_VM");
+    QPushButton* proof_verify_button = proof_dialog.findChild<QPushButton*>("verifyMessageButton_VM");
+    QLabel* proof_verify_status = proof_dialog.findChild<QLabel*>("statusLabel_VM");
+    QVERIFY(proof_verify_mode && proof_verify_input && proof_verify_button && proof_verify_status);
+    proof_verify_mode->setCurrentIndex(2);
+    proof_verify_input->setPlainText(proof_text);
+    proof_verify_button->click();
+    QVERIFY(proof_verify_status->text().contains("P2MR/PQC proof is cryptographically valid"));
+
+    JSONRPCRequest request;
+    request.context = &test.m_node;
+    request.strMethod = "verifydatapqchash";
+    request.params = UniValue{UniValue::VARR};
+    request.params.push_back(proof_object);
+    if (RPCIsInWarmup(nullptr)) SetRPCWarmupFinished();
+    const UniValue rpc_result{tableRPC.execute(request)};
+    QVERIFY(rpc_result["valid"].get_bool());
+
+    UniValue legacy_proof{proof_object};
+    legacy_proof.pushKV("datasig_hash", HexStr(std::span<const unsigned char>{datasig_hash.begin(), datasig_hash.end()}));
+    legacy_proof.pushKV("domain", common::P2MR_DATA_SIGNATURE_DOMAIN);
+    legacy_proof.pushKV("algorithm", common::P2MR_DATA_SIGNATURE_ALGORITHM);
+    const uint256 merkle_root{output.GetMerkleRoot()};
+    legacy_proof.pushKV("p2mr_merkle_root", HexStr(std::span<const unsigned char>{merkle_root.begin(), merkle_root.end()}));
+    UniValue legacy_key_states{UniValue::VARR};
+    UniValue legacy_key_state{UniValue::VOBJ};
+    legacy_key_state.pushKV("pubkey", alternate_pubkey_hex.toStdString());
+    legacy_key_state.pushKV("pqc_signature_count", static_cast<int64_t>(wallet::PQC_WARNING_SIGNATURE_THRESHOLD));
+    legacy_key_state.pushKV("pqc_signature_limit", static_cast<int64_t>(PQC_MAX_SIGNATURES));
+    legacy_key_state.pushKV("pqc_signatures_remaining", static_cast<int64_t>(PQC_MAX_SIGNATURES - wallet::PQC_WARNING_SIGNATURE_THRESHOLD));
+    legacy_key_state.pushKV("pqc_limit_state", "warning");
+    legacy_key_states.push_back(std::move(legacy_key_state));
+    legacy_proof.pushKV("pqc_key_states", std::move(legacy_key_states));
+    legacy_proof.pushKV("pqc_overall_limit_state", "warning");
+    UniValue legacy_warnings{UniValue::VARR};
+    legacy_warnings.push_back("legacy local PQC warning");
+    legacy_proof.pushKV("warnings", std::move(legacy_warnings));
+
+    proof_verify_input->setPlainText(QString::fromStdString(legacy_proof.write(2)));
+    proof_verify_button->click();
+    QVERIFY(proof_verify_status->text().contains("P2MR/PQC proof is cryptographically valid"));
+
+    wallet::PQCUsageReport single_key_report;
+    single_key_report.key_states.push_back({
+        .pubkey = selected_pubkey,
+        .signature_count = wallet::PQC_WARNING_SIGNATURE_THRESHOLD,
+        .signature_limit = PQC_MAX_SIGNATURES,
+        .signatures_remaining = PQC_MAX_SIGNATURES - wallet::PQC_WARNING_SIGNATURE_THRESHOLD,
+        .limit_state = wallet::PQCSignatureLimitState::WARNING,
+    });
+    single_key_report.overall_state = wallet::PQCSignatureLimitState::WARNING;
+    single_key_report.warnings.push_back({
+        .pubkey = selected_pubkey,
+        .previous_count = wallet::PQC_WARNING_SIGNATURE_THRESHOLD - 1,
+        .new_count = wallet::PQC_WARNING_SIGNATURE_THRESHOLD,
+        .previous_state = wallet::PQCSignatureLimitState::NORMAL,
+        .current_state = wallet::PQCSignatureLimitState::WARNING,
+        .kind = wallet::PQCUsageWarningKind::TRANSITION,
+    });
+    WalletModel single_key_wallet_model(qt_test::MakeSyntheticWallet(synthetic_result, single_key_report), *mini_gui.clientModel, platformStyle.get());
+    SignVerifyMessageDialog single_key_dialog(platformStyle.get(), nullptr);
+    single_key_dialog.setModel(&single_key_wallet_model);
+    QValidatedLineEdit* single_key_address = single_key_dialog.findChild<QValidatedLineEdit*>("addressIn_SM");
+    QComboBox* single_key_sign_mode = single_key_dialog.findChild<QComboBox*>("p2mrDataInputMode_SM");
+    QPlainTextEdit* single_key_message = single_key_dialog.findChild<QPlainTextEdit*>("messageIn_SM");
+    QPushButton* single_key_sign_button = single_key_dialog.findChild<QPushButton*>("signMessageButton_SM");
+    QLabel* single_key_status_label = single_key_dialog.findChild<QLabel*>("statusLabel_SM");
+    QPlainTextEdit* single_key_proof_output = single_key_dialog.findChild<QPlainTextEdit*>("signatureOut_SM");
+    QVERIFY(single_key_address && single_key_sign_mode && single_key_message && single_key_sign_button && single_key_status_label && single_key_proof_output);
+    single_key_address->setText(QString::fromStdString(EncodeDestination(CTxDestination{output})));
+    single_key_sign_mode->setCurrentIndex(1);
+    single_key_message->setPlainText(QString::fromStdString(HexStr(std::span<const unsigned char>{message_hash.begin(), message_hash.end()})));
+    single_key_sign_button->click();
+
+    const QString single_key_status{single_key_status_label->text()};
+    const uint32_t signatures_remaining{PQC_MAX_SIGNATURES - wallet::PQC_WARNING_SIGNATURE_THRESHOLD};
+    QVERIFY(single_key_status.contains(QString("%1 of %2 signatures used, %3 remaining; state: warning.")
+                                           .arg(wallet::PQC_WARNING_SIGNATURE_THRESHOLD)
+                                           .arg(PQC_MAX_SIGNATURES)
+                                           .arg(signatures_remaining)));
+    QVERIFY(single_key_status.contains(QString("%1 of %2 signatures used, %3 remaining")
+                                           .arg(wallet::PQC_WARNING_SIGNATURE_THRESHOLD)
+                                           .arg(PQC_MAX_SIGNATURES)
+                                           .arg(signatures_remaining)));
+    UniValue single_key_proof;
+    QVERIFY(single_key_proof.read(single_key_proof_output->toPlainText().toStdString()));
+    QCOMPARE(single_key_proof.getKeys().size(), portable_fields.size());
+    for (const char* field : local_or_informational_fields) {
+        QVERIFY(!single_key_proof.exists(field));
+    }
+
+    wallet::PQCUsageReport failed_report;
+    failed_report.key_states.push_back({
+        .pubkey = alternate_pubkey,
+        .signature_count = 1,
+        .signature_limit = PQC_MAX_SIGNATURES,
+        .signatures_remaining = PQC_MAX_SIGNATURES - 1,
+        .limit_state = wallet::PQCSignatureLimitState::NORMAL,
+    });
+    failed_report.key_states.push_back({
+        .pubkey = selected_pubkey,
+        .signature_count = PQC_MAX_SIGNATURES,
+        .signature_limit = PQC_MAX_SIGNATURES,
+        .signatures_remaining = 0,
+        .limit_state = wallet::PQCSignatureLimitState::EXHAUSTED,
+    });
+    failed_report.overall_state = wallet::PQCSignatureLimitState::EXHAUSTED;
+    failed_report.warnings.push_back({
+        .pubkey = selected_pubkey,
+        .previous_count = PQC_MAX_SIGNATURES - 1,
+        .new_count = PQC_MAX_SIGNATURES,
+        .previous_state = wallet::PQCSignatureLimitState::CRITICAL,
+        .current_state = wallet::PQCSignatureLimitState::EXHAUSTED,
+        .kind = wallet::PQCUsageWarningKind::TRANSITION,
+    });
+
+    WalletModel failed_wallet_model(
+        qt_test::MakeSyntheticP2MRFailureWallet(Untranslated("PQC data-hash signing failed"), failed_report),
+        *mini_gui.clientModel,
+        platformStyle.get());
+    SignVerifyMessageDialog failed_dialog(platformStyle.get(), nullptr);
+    failed_dialog.setModel(&failed_wallet_model);
+    QValidatedLineEdit* failed_address = failed_dialog.findChild<QValidatedLineEdit*>("addressIn_SM");
+    QComboBox* failed_sign_mode = failed_dialog.findChild<QComboBox*>("p2mrDataInputMode_SM");
+    QPlainTextEdit* failed_message = failed_dialog.findChild<QPlainTextEdit*>("messageIn_SM");
+    QPushButton* failed_sign_button = failed_dialog.findChild<QPushButton*>("signMessageButton_SM");
+    QLabel* failed_status_label = failed_dialog.findChild<QLabel*>("statusLabel_SM");
+    QPlainTextEdit* failed_proof_output = failed_dialog.findChild<QPlainTextEdit*>("signatureOut_SM");
+    QVERIFY(failed_address && failed_sign_mode && failed_message && failed_sign_button && failed_status_label && failed_proof_output);
+
+    failed_address->setText(QString::fromStdString(EncodeDestination(CTxDestination{output})));
+    failed_sign_mode->setCurrentIndex(1);
+    failed_message->setPlainText(QString::fromStdString(HexStr(std::span<const unsigned char>{message_hash.begin(), message_hash.end()})));
+    failed_sign_button->click();
+
+    const QString failed_status{failed_status_label->text()};
+    const QString selected_pubkey_hex{QString::fromStdString(HexStr(std::span<const unsigned char>{selected_pubkey.begin(), selected_pubkey.end()}))};
+    QVERIFY(failed_proof_output->toPlainText().isEmpty());
+    QVERIFY(failed_status_label->styleSheet().contains("color: red"));
+    QVERIFY(failed_status.contains("PQC data-hash signing failed"));
+    QVERIFY(failed_status.contains("failed after consuming PQC signature capacity"));
+    QVERIFY(failed_status.contains("PQC usage state after this signing attempt: exhausted."));
+    QVERIFY(failed_status.contains(alternate_pubkey_hex));
+    QVERIFY(failed_status.contains(selected_pubkey_hex));
+    QVERIFY(failed_status.contains(QString("1 of %1 signatures used, %2 remaining; state: normal.")
+                                       .arg(PQC_MAX_SIGNATURES)
+                                       .arg(PQC_MAX_SIGNATURES - 1)));
+    QVERIFY(failed_status.contains(QString("%1 of %1 signatures used, 0 remaining; state: exhausted.").arg(PQC_MAX_SIGNATURES)));
+    QVERIFY(failed_status.contains("reached the signature limit"));
 }
 
 void TestSendPQCReportPropagation(interfaces::Node& node)
@@ -870,7 +1495,7 @@ void TestSendPQCReportPropagation(interfaces::Node& node)
     });
     expected_report.overall_state = wallet::PQCSignatureLimitState::NORMAL;
 
-    WalletModel wallet_model(std::make_unique<SyntheticPQCReportWallet>(expected_report), client_model, platformStyle.get());
+    WalletModel wallet_model(qt_test::MakeSyntheticWallet(expected_report), client_model, platformStyle.get());
     wallet::CCoinControl coin_control;
     coin_control.Select(COutPoint{Txid{}, 0});
 
@@ -885,6 +1510,92 @@ void TestSendPQCReportPropagation(interfaces::Node& node)
     QCOMPARE(*pqc_usage.overall_state, wallet::PQCSignatureLimitState::NORMAL);
     QCOMPARE(pqc_usage.key_states.front().signature_count, 7U);
     QCOMPARE(pqc_usage.key_states.front().signatures_remaining, PQC_MAX_SIGNATURES - 7);
+}
+
+void TestSendCompletionAfterModelDestruction(interfaces::Node& node)
+{
+    TestChain100Setup test{ChainType::REGTEST, {.extra_args = {"-p2mronly=0"}}};
+    node.setContext(&test.m_node);
+
+    std::unique_ptr<const PlatformStyle> platform_style{PlatformStyle::instantiate("other")};
+    MiniGUI mini_gui{node, platform_style.get()};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    mini_gui.initModel(qt_test::MakeSyntheticWallet(wallet::PQCUsageReport{}, state), platform_style.get());
+    mini_gui.walletModel->pollBalanceChanged();
+
+    SendCoinsDialog& send_dialog{mini_gui.sendCoinsDialog};
+    QVBoxLayout* const entries{send_dialog.findChild<QVBoxLayout*>("entries")};
+    QVERIFY(entries);
+    SendCoinsEntry* const entry{qobject_cast<SendCoinsEntry*>(entries->itemAt(0)->widget())};
+    QVERIFY(entry);
+    entry->findChild<QValidatedLineEdit*>("payTo")->setText(QString::fromStdString(EncodeDestination(PKHash{})));
+    entry->findChild<BitcoinAmountField*>("payAmount")->setValue(COIN);
+    send_dialog.getCoinControl()->Select(COutPoint{Txid{}, 0});
+
+    QSignalSpy coins_sent{&send_dialog, &SendCoinsDialog::coinsSent};
+    QVERIFY(coins_sent.isValid());
+    QVERIFY(QMetaObject::invokeMethod(&send_dialog, "sendButtonClicked", Q_ARG(bool, false)));
+
+    {
+        std::unique_lock lock{state->mutex};
+        QVERIFY(state->condition.wait_for(lock, std::chrono::seconds{5}, [state] {
+            return state->background_clone_destroyed;
+        }));
+        QVERIFY(state->create_entered);
+    }
+
+    QPointer<WalletModel> model_guard{mini_gui.walletModel.get()};
+    mini_gui.walletModel.reset();
+    QVERIFY(model_guard.isNull());
+
+    // The worker destroyed its cloned wallet only after queueing completion.
+    // Deliver that completion while the dialog is alive but its model is gone.
+    QCoreApplication::sendPostedEvents(&send_dialog, QEvent::MetaCall);
+    QCoreApplication::processEvents();
+
+    QCOMPARE(coins_sent.count(), 0);
+    for (QWidget* widget : QApplication::topLevelWidgets()) {
+        QVERIFY(!widget->inherits("SendConfirmationDialog"));
+    }
+}
+
+void TestUnlockContextModelLifetime(interfaces::Node& node)
+{
+    TestChain100Setup test{ChainType::REGTEST, {.extra_args = {"-p2mronly=0"}}};
+    node.setContext(&test.m_node);
+
+    std::unique_ptr<const PlatformStyle> platform_style{PlatformStyle::instantiate("other")};
+    OptionsModel options_model{node};
+    bilingual_str error;
+    QVERIFY(options_model.Init(error));
+    ClientModel client_model{node, &options_model};
+
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    {
+        std::lock_guard lock{state->mutex};
+        state->encrypted = true;
+        state->locked = false;
+    }
+    auto wallet_model{std::make_unique<WalletModel>(
+        qt_test::MakeSyntheticWallet(wallet::PQCUsageReport{}, state),
+        client_model,
+        platform_style.get())};
+
+    auto lock_calls = [state] {
+        std::lock_guard lock{state->mutex};
+        return state->lock_calls;
+    };
+
+    {
+        WalletModel::UnlockContext live_context{wallet_model.get(), /*valid=*/true, /*relock=*/true};
+    }
+    QCOMPARE(lock_calls(), 1);
+
+    auto stale_context{std::make_unique<WalletModel::UnlockContext>(
+        wallet_model.get(), /*valid=*/true, /*relock=*/true)};
+    wallet_model.reset();
+    stale_context.reset();
+    QCOMPARE(lock_calls(), 1);
 }
 
 void TestSendPQCWarningFormatting()
@@ -956,5 +1667,7 @@ void WalletTests::walletTests()
     TestGUI(m_node);
     TestP2MRReceiveAddressTypes(m_node);
     TestSendPQCReportPropagation(m_node);
+    TestSendCompletionAfterModelDestruction(m_node);
+    TestUnlockContextModelLifetime(m_node);
     TestSendPQCWarningFormatting();
 }

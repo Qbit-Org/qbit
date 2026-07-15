@@ -4,7 +4,7 @@ site_url: https://docs.qbit.org/
 theme:
   name: readthedocs
   highlightjs: false
-  logo: assets/qbit.svg
+  logo: assets/logo-full.svg
   favicon: assets/qbit.svg
 use_directory_urls: false
 markdown_extensions:

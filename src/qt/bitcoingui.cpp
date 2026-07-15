@@ -846,10 +846,12 @@ void BitcoinGUI::setCurrentWalletBySelectorIndex(int index)
 
 void BitcoinGUI::removeAllWallets()
 {
-    if(!walletFrame)
-        return;
+    if (!walletFrame) return;
+
     setWalletActionsEnabled(false);
-    walletFrame->removeAllWallets();
+    for (WalletModel* wallet_model : walletFrame->getWalletModels()) {
+        removeWallet(wallet_model);
+    }
 }
 #endif // ENABLE_WALLET
 
@@ -1239,7 +1241,7 @@ void BitcoinGUI::setNumBlocks(int count, const QDateTime& blockDate, double nVer
     tooltip = tr("Processed %n block(s) of transaction history.", "", count);
 
     // Set icon state: spinning if catching up, tick otherwise
-        if (secs < MAX_BLOCK_TIME_GAP) {
+    if (GUIUtil::IsBlockTimeFresh(blockDate, currentDate)) {
         tooltip = tr("Up to date") + QString(".<br>") + tooltip;
         labelBlocksIcon->setThemedPixmap(QStringLiteral(":/icons/synced"), STATUSBAR_ICONSIZE, STATUSBAR_ICONSIZE);
 

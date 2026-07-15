@@ -10,15 +10,13 @@ https://qbit.org.
 
 ## Pick a network
 
-Mainnet is not public yet. Mainnet parameters below apply when qbit mainnet is
-announced. Use the dedicated public testnet guide for the current
-rehearsal-network commands. Official public testnet release artifacts are for
-testnet4 and should be started with `-testnet4` or `-chain=testnet4`.
+Mainnet is the default chain. Public testnet4 should be started explicitly with
+`-testnet4` or `-chain=testnet4`.
 
 | Network | Chain option | P2P port | RPC port | Address HRP |
 | --- | --- | ---: | ---: | --- |
 | Public testnet4 | `-testnet4` or `-chain=testnet4` | 48355 | 48352 | `tq` |
-| Future mainnet | default, or `-chain=main` after launch | 8355 | 8352 | `qb` |
+| Mainnet | default, or `-chain=main` | 8355 | 8352 | `qb` |
 
 The RPC port is for local control of your node. Do not expose RPC to the public
 internet. If you want to help the P2P network, allow inbound TCP traffic to the
@@ -35,13 +33,13 @@ qbit uses qbit-native data directories and `qbit.conf`, not Bitcoin Core's
 | macOS | `$HOME/Library/Application Support/Qbit/` | `$HOME/Library/Application Support/Qbit/qbit.conf` |
 | Windows | `%LOCALAPPDATA%\Qbit\` | `%LOCALAPPDATA%\Qbit\qbit.conf` |
 
-Future mainnet chain data is stored in the base data directory. Non-mainnet
+Mainnet chain data is stored in the base data directory. Non-mainnet
 chains use their own subdirectories.
 
-## Start a normal mainnet node when launched
+## Start a normal mainnet node
 
-This section is future-mainnet guidance. For the current public testnet, use
-the public testnet guide and include `-testnet4` on daemon and CLI commands.
+For public testnet4, use the public testnet guide and include `-testnet4` on
+daemon and CLI commands.
 
 Start with the default archive/full-history behavior:
 
@@ -62,7 +60,7 @@ connections.
 
 ## Recommended first config
 
-This is a conservative future-mainnet configuration for a normal operator node:
+This is a conservative mainnet configuration for a normal operator node:
 
 ```ini
 server=1
@@ -90,8 +88,8 @@ dns=1
 dnsseed=1
 fixedseeds=1
 
-connectarchive=<archive-host-1>:8355
-connectarchive=<archive-host-2>:8355
+connectarchive=positron-mainnet.qbit.org:8355
+connectarchive=graviton-mainnet.qbit.org:8355
 ```
 
 Use the endpoints published for your specific release or network reset. Do not
@@ -153,9 +151,11 @@ The intended launch posture is:
 4. fall back to published `-connectarchive` endpoints if automatic bootstrap is
    degraded
 
-Seed hostnames, fixed-seed state, and archive fallback endpoints are
-release/network-resource values. Use the values published through qbit.org for
-the release and network you are running.
+The v1.0.0 launch source uses `flux-mainnet.qbit.org` and
+`phase-mainnet.qbit.org` for automatic DNS discovery. Its fixed seeds are the
+numeric launch addresses for `positron-mainnet.qbit.org:8355` and
+`graviton-mainnet.qbit.org:8355`. Use qbit.org to confirm their current
+operational status for the release and network you are running.
 
 Fixed seeds and archive fallback endpoints are not the same configuration
 surface. Fixed seeds are compiled into a release and are used automatically as a
@@ -177,8 +177,8 @@ Example:
 
 ```bash
 qbitd <chain option> \
-  -connectarchive=<archive-host-1>:<p2p-port> \
-  -connectarchive=<archive-host-2>:<p2p-port>
+  -connectarchive=positron-mainnet.qbit.org:8355 \
+  -connectarchive=graviton-mainnet.qbit.org:8355
 ```
 
 qbit checks these peers before treating them as archive fallback peers. A
@@ -202,8 +202,7 @@ qbit-cli <chain option> getarchivepeers summary
 
 Healthy signs in `getblockchaininfo`:
 
-- `chain` is `main` only for future mainnet after launch, or `testnet4` for the
-  current public rehearsal network
+- `chain` is `main` for mainnet or `testnet4` for the public test network
 - `blocks` and `headers` are increasing during sync
 - `blocks` catches up to `headers`
 - `verificationprogress` approaches `1`
@@ -238,7 +237,7 @@ Outbound-only nodes can sync without opening inbound firewall rules, assuming
 peer discovery is working. To contribute capacity to the network, allow inbound
 TCP traffic on the P2P port:
 
-- future mainnet: TCP `8355`
+- mainnet: TCP `8355`
 - testnet4: TCP `48355`
 
 Keep RPC bound to localhost unless you have a private network and explicit
@@ -360,6 +359,6 @@ Stop the node cleanly first:
 qbit-cli <chain option> stop
 ```
 
-Then move or delete only the chain data you want to resync. For future mainnet,
+Then move or delete only the chain data you want to resync. For mainnet,
 chain data is in the qbit data directory root. Keep wallet backups separate
 from chain data cleanup.

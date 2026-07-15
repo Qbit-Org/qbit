@@ -4,8 +4,8 @@ These documents are for people running qbit, configuring their node or wallet,
 and following user workflows. Current release and network-resource status is
 published through https://qbit.org.
 
-Mainnet is not public yet. Mainnet-oriented docs apply only when qbit mainnet
-is announced.
+Qbit v1.0.0 launches mainnet. Mainnet is the default chain; the public
+testnet4 network remains available through its explicit chain flags.
 
 ## Start Here
 

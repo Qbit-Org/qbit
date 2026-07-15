@@ -8,16 +8,29 @@ to do while that infrastructure is not yet available.
 qbit testnet is not Bitcoin testnet. Use qbit binaries, qbit network flags, and
 qbit addresses only.
 
-Official public testnet release artifacts are testnet-only. Use `-testnet4` or
-`-chain=testnet4` for every daemon, CLI, wallet, and GUI invocation that joins
-the public rehearsal network. Mainnet is not public or launched yet; no-flag
-mainnet commands in other docs are future-mainnet guidance only.
+Use `-testnet4` or `-chain=testnet4` for every daemon, CLI, wallet, and GUI
+invocation that joins the public rehearsal network. Commands without a chain
+flag select mainnet.
 
 ## Current Status
 
 The current public rehearsal network is qbit `testnet4`. The
 `v0.1.0-testnet4` release starts a reset lineage and is not compatible with
 earlier rc testnet4 chain data.
+
+P2MR validation-weight v2 activates on the existing testnet4 chain at block
+60,000. This activation does not reset the chain, but it is a consensus
+relaxation and requires miners and validating services to upgrade beforehand.
+Use `getblockchaininfo` and inspect `p2mr_validation_weight` for the local
+node's activation status.
+
+Future block time v2 independently activates at block 60,000. The maximum
+accepted future timestamp changes from two hours to ten minutes for block
+60,000 and later. Upgrade miners and validating services before activation,
+keep node and pool clocks synchronized, and inspect
+`getblockchaininfo.future_block_time`, especially
+`next_block_time_headroom_seconds`, while approaching the boundary. See the
+[future block time v2 reference](../reference/future-block-time-v2.md).
 
 The qbit codebase defines testnet4 chain parameters, ports, address prefixes,
 archive-node behavior, the `-testnet4` command-line flag, DNS seed hostnames,
@@ -27,18 +40,16 @@ exists at this time. If the release you are using has not published test-coin
 distribution instructions, those resources are not available yet from this
 document alone.
 
-The in-tree mainnet parameters, genesis block, and any derived hash are
-development placeholders. They are not an official qbit mainnet launch hash,
-network identity, or release commitment. The in-tree mainnet AuxPoW chain ID
-currently matches public testnet as a placeholder only; it must be replaced
-with a distinct final value before mainnet is enabled or reset.
+The v1.0.0 source pins the mined mainnet genesis block, its genesis-bound ASERT
+anchor, and mainnet AuxPoW chain ID `47`, distinct from public testnet chain ID
+`31430`. The two networks retain separate genesis blocks, ports, address HRPs,
+and data directories.
 
 The qbit source is open, so third parties can fork it or run private networks.
 Only qbit-published artifacts, tags, release notes, seed resources, and
 qbit.org announcements define official qbit networks.
 
-Before treating any testnet as live, check qbit.org for the release notes or
-public launch announcement for:
+Before joining a testnet, check qbit.org and its release notes for:
 
 - the exact release version and build identifier
 - DNS seed hostnames
@@ -70,9 +81,8 @@ publishes updated seed sets, use the values from that release for that network
 instance.
 
 This testnet4 genesis hash is a rehearsal-network value for the current reset
-lineage. Do not treat it, or any in-tree mainnet placeholder hash, as a future
-mainnet launch commitment unless a qbit release announcement explicitly freezes
-it for that network.
+lineage. Do not substitute it for the separately pinned mainnet genesis hash;
+use the identity published for the selected network in its signed release.
 
 ## Start a Node
 
@@ -190,6 +200,9 @@ Look for:
 - `headers` at least as high as `blocks`
 - `initialblockdownload` becoming `false`
 - `verificationprogress` near `1`
+- `future_block_time.active_for_next_block` and
+  `future_block_time.next_block_time_headroom_seconds` showing the expected
+  activation state and a non-negative timestamp range
 - `bestblockhash` matching the release or network status page, if one is
   published
 

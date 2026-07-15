@@ -62,7 +62,9 @@ HeadersSyncState::HeadersSyncState(NodeId id, const Consensus::Params& consensus
     // exceeds this bound, because it's not possible for a consensus-valid
     // chain to be longer than this (at the current time -- in the future we
     // could try again, if necessary, to sync a longer chain).
-    m_max_commitments = 6*(Ticks<std::chrono::seconds>(NodeClock::now() - NodeSeconds{std::chrono::seconds{chain_start->GetMedianTimePast()}}) + MAX_FUTURE_BLOCK_TIME) / HEADER_COMMITMENT_PERIOD;
+    // Header sync must admit histories produced under the legacy two-hour
+    // future-time rule, even when the v2 rule is active at the current tip.
+    m_max_commitments = 6*(Ticks<std::chrono::seconds>(NodeClock::now() - NodeSeconds{std::chrono::seconds{chain_start->GetMedianTimePast()}}) + MAX_FUTURE_BLOCK_TIME_LEGACY) / HEADER_COMMITMENT_PERIOD;
     m_presync_difficulty = MakeHeaderDifficultyState();
     m_redownload_difficulty = MakeHeaderDifficultyState();
 
@@ -76,18 +78,15 @@ HeadersSyncState::HeaderDifficultyState HeadersSyncState::MakeHeaderDifficultySt
     state.height = m_chain_start->nHeight;
     state.auxpow_count = m_chain_start->nAuxPow;
 
-    const CBlockIndex* pindex = m_chain_start;
-    while (pindex != nullptr) {
-        const ASERTHeaderState header_state{pindex->nHeight, pindex->GetBlockTime(), pindex->nAuxPow};
-        if (pindex->SignalsAuxpow()) {
-            if (!state.previous_auxpow) state.previous_auxpow = header_state;
-        } else {
-            if (!state.previous_permissionless) state.previous_permissionless = header_state;
-        }
-
-        if (state.previous_permissionless && state.previous_auxpow) break;
-        if (pindex->nHeight <= m_consensus_params.asertAnchorParams.nHeight) break;
-        pindex = pindex->pprev;
+    const int anchor_height{m_consensus_params.asertAnchorParams.nHeight};
+    const auto to_header_state = [](const CBlockIndex& pindex) {
+        return ASERTHeaderState{pindex.nHeight, pindex.GetBlockTime(), pindex.nAuxPow};
+    };
+    if (const CBlockIndex* permissionless = m_chain_start->GetPreviousBlockForLane(/*auxpow=*/false, anchor_height)) {
+        state.previous_permissionless = to_header_state(*permissionless);
+    }
+    if (const CBlockIndex* auxpow = m_chain_start->GetPreviousBlockForLane(/*auxpow=*/true, anchor_height)) {
+        state.previous_auxpow = to_header_state(*auxpow);
     }
 
     return state;

@@ -23,26 +23,43 @@
 #include <vector>
 
 /**
- * Maximum amount of time that a block timestamp is allowed to exceed the
- * current time before the block will be accepted.
+ * Legacy maximum amount of time that a block timestamp is allowed to exceed
+ * the current time before the block will be accepted.
  */
-static constexpr int64_t MAX_FUTURE_BLOCK_TIME = 2 * 60 * 60;
+static constexpr int64_t MAX_FUTURE_BLOCK_TIME_LEGACY = 2 * 60 * 60;
+
+/**
+ * Qbit maximum future block time after the height-activated v2 rule. Ten
+ * minutes spans ten aggregate target intervals, eight permissionless target
+ * intervals, two AuxPoW target intervals, and one twelfth of the ASERT
+ * half-life.
+ */
+static constexpr int64_t MAX_FUTURE_BLOCK_TIME_V2 = 10 * 60;
+
+/** Return the future-time limit applicable to a candidate block height. */
+inline int64_t GetMaxFutureBlockTime(const Consensus::Params& params, int height)
+{
+    return params.FutureBlockTimeV2ActiveAtHeight(height) ? MAX_FUTURE_BLOCK_TIME_V2 : MAX_FUTURE_BLOCK_TIME_LEGACY;
+}
 
 /**
  * Timestamp window used as a grace period by code that compares external
  * timestamps (such as timestamps passed to RPCs, or wallet key creation times)
- * to block timestamps. This should be set at least as high as
- * MAX_FUTURE_BLOCK_TIME.
+ * to block timestamps. This remains large enough to cover blocks accepted
+ * under the legacy future-time rule and is intentionally independent of the
+ * active validation limit.
  */
-static constexpr int64_t TIMESTAMP_WINDOW = MAX_FUTURE_BLOCK_TIME;
+static constexpr int64_t TIMESTAMP_WINDOW = 2 * 60 * 60;
+static_assert(TIMESTAMP_WINDOW >= MAX_FUTURE_BLOCK_TIME_LEGACY);
 
 /**
  * Maximum gap between node time and block time used
- * for the "Catching up..." mode in GUI.
+ * for the "Catching up..." mode in GUI. Ten minutes represents ten missed
+ * aggregate target intervals.
  *
  * Ref: https://github.com/bitcoin/bitcoin/pull/1026
  */
-static constexpr int64_t MAX_BLOCK_TIME_GAP = 90 * 60;
+static constexpr int64_t MAX_BLOCK_TIME_GAP = 10 * 60;
 
 class CBlockFileInfo
 {
@@ -154,6 +171,12 @@ public:
 
     //! pointer to the index of some further predecessor of this block
     CBlockIndex* pskip{nullptr};
+
+    //! nearest strict permissionless ancestor (memory only)
+    CBlockIndex* pprev_permissionless{nullptr};
+
+    //! nearest strict AuxPoW ancestor (memory only)
+    CBlockIndex* pprev_auxpow{nullptr};
 
     //! height of the entry in the chain. The genesis block has height 0
     int nHeight{0};
@@ -342,6 +365,16 @@ public:
     //! Build the skiplist pointer for this entry.
     void BuildSkip();
 
+    //! Build branch-local Cadence lane predecessor pointers for this entry.
+    void BuildCadenceLaneLinks();
+
+    /**
+     * Return the most recent block in the requested Cadence lane, including
+     * this entry when it matches. An opposite-lane ancestor below min_height
+     * is excluded to preserve the ASERT anchor boundary.
+     */
+    const CBlockIndex* GetPreviousBlockForLane(bool auxpow, int min_height) const noexcept;
+
     //! Efficiently find an ancestor of this block.
     CBlockIndex* GetAncestor(int height);
     const CBlockIndex* GetAncestor(int height) const;
@@ -366,6 +399,8 @@ protected:
 };
 
 arith_uint256 GetBlockProof(const CBlockIndex& block);
+/** Return the cumulative work contributed by up to the most recent block_count blocks ending at tip. */
+arith_uint256 GetRecentChainWork(const CBlockIndex& tip, int block_count);
 /** Return the time it would take to redo the work difference between from and to, assuming the current hashrate corresponds to the difficulty at tip, in seconds. */
 int64_t GetBlockProofEquivalentTime(const CBlockIndex& to, const CBlockIndex& from, const CBlockIndex& tip, const Consensus::Params&);
 /** Find the forking point between two chain tips. */

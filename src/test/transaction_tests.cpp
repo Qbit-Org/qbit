@@ -1350,7 +1350,7 @@ BOOST_AUTO_TEST_CASE(spends_witness_prog)
     const auto program{ToByteVector(XOnlyPubKey{pubkey})};
     for (int i{2}; i <= 16; ++i) {
         tx_create.vout[0].scriptPubKey = GetScriptForDestination(WitnessUnknown{i, program});
-        // Version 2 with 32-byte program is now recognized as P2MR (BIP-360)
+        // Native version 2 with 32-byte program is recognized as qbit P2MR v1.
         const auto expected_type = (i == 2) ? TxoutType::WITNESS_V2_P2MR : TxoutType::WITNESS_UNKNOWN;
         BOOST_CHECK_EQUAL(Solver(tx_create.vout[0].scriptPubKey, sol_dummy), expected_type);
         tx_spend.vin[0].prevout.hash = tx_create.GetHash();
@@ -1381,7 +1381,31 @@ BOOST_AUTO_TEST_CASE(p2mr_minimal_witness_budget)
     witness.stack.emplace_back(std::vector<unsigned char>{0xc1}); // Leaf version 0xc0 with required bit0 set.
 
     const int64_t validation_budget = ::GetSerializeSize(witness.stack) + VALIDATION_WEIGHT_OFFSET;
-    BOOST_CHECK_GE(validation_budget, VALIDATION_WEIGHT_PER_SIGOP_PQC);
+    BOOST_CHECK_GE(validation_budget, P2MR_VALIDATION_WEIGHT_PER_SIGOP_LEGACY);
+    BOOST_CHECK_GE(validation_budget, P2MR_VALIDATION_WEIGHT_PER_SIGOP_V2);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_block_wide_verification_bound)
+{
+    static constexpr int64_t MIN_SERIALIZED_TXIN_SIZE{32 + 4 + 1 + 4};
+    static_assert(WITNESS_SCALE_FACTOR == 1);
+    static_assert(VALIDATION_WEIGHT_OFFSET > MIN_SERIALIZED_TXIN_SIZE);
+
+    static constexpr int64_t MAX_P2MR_INPUTS{MAX_BLOCK_WEIGHT / MIN_SERIALIZED_TXIN_SIZE};
+    static constexpr int64_t MAX_P2MR_VALIDATION_BUDGET{
+        static_cast<int64_t>(MAX_BLOCK_WEIGHT) +
+        (VALIDATION_WEIGHT_OFFSET - MIN_SERIALIZED_TXIN_SIZE) * MAX_P2MR_INPUTS};
+
+    const CTxIn empty_txin{};
+    BOOST_CHECK_EQUAL(::GetSerializeSize(empty_txin), MIN_SERIALIZED_TXIN_SIZE);
+    BOOST_CHECK_EQUAL(MAX_P2MR_INPUTS, 48'780);
+    BOOST_CHECK_EQUAL(MAX_P2MR_VALIDATION_BUDGET, 2'439'020);
+    BOOST_CHECK_EQUAL(MAX_P2MR_VALIDATION_BUDGET / P2MR_VALIDATION_WEIGHT_PER_SIGOP_LEGACY, 653);
+    BOOST_CHECK_EQUAL(MAX_P2MR_VALIDATION_BUDGET / P2MR_VALIDATION_WEIGHT_PER_SIGOP_V2, 662);
+    BOOST_CHECK_EQUAL(
+        MAX_P2MR_VALIDATION_BUDGET / P2MR_VALIDATION_WEIGHT_PER_SIGOP_V2 -
+            MAX_P2MR_VALIDATION_BUDGET / P2MR_VALIDATION_WEIGHT_PER_SIGOP_LEGACY,
+        9);
 }
 
 BOOST_AUTO_TEST_CASE(p2mr_witness_standard_total_initial_stack_bytes)
@@ -1542,7 +1566,7 @@ BOOST_AUTO_TEST_CASE(p2mr_non_32_byte_pubkey_sigops_consume_pqc_weight)
     tx.vout[0].scriptPubKey = CScript{} << OP_TRUE;
 
     const int64_t validation_budget = ::GetSerializeSize(tx.vin[0].scriptWitness.stack) + VALIDATION_WEIGHT_OFFSET;
-    BOOST_CHECK_LT(validation_budget, VALIDATION_WEIGHT_PER_SIGOP_PQC);
+    BOOST_CHECK_LT(validation_budget, P2MR_VALIDATION_WEIGHT_PER_SIGOP_V2);
 
     const CAmount spent_amount{50'000};
     std::vector<CTxOut> spent_outputs;

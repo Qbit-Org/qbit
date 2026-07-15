@@ -5,7 +5,7 @@
 
 import time
 
-from test_framework.blocktools import MAX_FUTURE_BLOCK_TIME
+from test_framework.blocktools import TIMESTAMP_WINDOW
 from test_framework.descriptors import descsum_create
 from test_framework.messages import (
     COutPoint,
@@ -53,14 +53,14 @@ class WalletAnchorTest(BitcoinTestFramework):
 
         # Move far enough ahead that import-time timestamp window scans don't include
         # the anchor create/spend blocks on fast block cadence profiles.
-        self.nodes[0].setmocktime(int(time.time()) + (3 * MAX_FUTURE_BLOCK_TIME) + 1)
+        self.nodes[0].setmocktime(int(time.time()) + (3 * TIMESTAMP_WINDOW) + 1)
         self.generate(self.nodes[0], 10)
 
         self.nodes[0].createwallet(wallet_name="anchor", disable_private_keys=True)
         wallet = self.nodes[0].get_wallet_rpc("anchor")
         # Use a timestamp beyond tip+window to avoid implicit import-time rescans
         # that would pre-discover both anchor create/spend transactions.
-        future_ts = self.nodes[0].getblockheader(self.nodes[0].getbestblockhash())["time"] + MAX_FUTURE_BLOCK_TIME + 1
+        future_ts = self.nodes[0].getblockheader(self.nodes[0].getbestblockhash())["time"] + TIMESTAMP_WINDOW + 1
         import_res = wallet.importdescriptors([{"desc": descsum_create(f"addr({ANCHOR_ADDRESS})"), "timestamp": future_ts}])
         assert_equal(import_res[0]["success"], True)
 

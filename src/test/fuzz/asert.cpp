@@ -71,6 +71,7 @@ FUZZ_TARGET(asert_chain_transition, .init = initialize_asert)
     anchor_index->nHeight = consensus_params.asertAnchorParams.nHeight;
     anchor_index->nTime = anchor_header.nTime;
     anchor_index->nBits = anchor_header.nBits;
+    anchor_index->BuildCadenceLaneLinks();
 
     std::vector<std::unique_ptr<CBlockIndex>> chain;
     chain.emplace_back(std::move(anchor_index));
@@ -97,6 +98,7 @@ FUZZ_TARGET(asert_chain_transition, .init = initialize_asert)
         next_index->nHeight = prev->nHeight + 1;
         next_index->nTime = next_header.nTime;
         next_index->nBits = next_bits;
+        next_index->BuildCadenceLaneLinks();
         chain.emplace_back(std::move(next_index));
     }
 }

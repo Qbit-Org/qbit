@@ -21,7 +21,8 @@
 class CChainParams;
 class ValidationSignals;
 
-static constexpr auto DEFAULT_MAX_TIP_AGE{24h};
+/** Treat a tip as stale for IBD after 180 missed aggregate target intervals. */
+static constexpr auto DEFAULT_MAX_TIP_AGE{3h};
 
 namespace kernel {
 

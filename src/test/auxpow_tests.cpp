@@ -24,6 +24,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
+#include <deque>
 #include <limits>
 #include <memory>
 #include <string>
@@ -108,8 +110,9 @@ std::vector<unsigned char> MakeCommitment(std::vector<unsigned char> prefix, con
     return MakeCommitment(std::move(prefix), AuxpowCommitmentRootBytes(root), merkle_size, nonce);
 }
 
-std::shared_ptr<const CAuxPow> MakeAuxpowPayload(const uint256& aux_block_hash, const Consensus::Params& consensus, const uint32_t target_bits, const uint32_t parent_time)
+std::shared_ptr<const CAuxPow> MakeAuxpowPayload(const uint256& aux_block_hash, const Consensus::Params& consensus, const uint32_t target_bits, const uint32_t parent_time, const auxpow::CommitmentValidation commitment_order = auxpow::CommitmentValidation::DISPLAY)
 {
+    assert(commitment_order != auxpow::CommitmentValidation::EITHER);
     auto auxpow = std::make_shared<CAuxPow>();
     auxpow->coinbase_merkle_branch.clear();
     auxpow->coinbase_branch_index = 0;
@@ -118,7 +121,8 @@ std::shared_ptr<const CAuxPow> MakeAuxpowPayload(const uint256& aux_block_hash, 
 
     std::vector<unsigned char> commitment;
     commitment.insert(commitment.end(), MERGED_MINING_HEADER.begin(), MERGED_MINING_HEADER.end());
-    commitment = MakeCommitment(std::move(commitment), aux_block_hash, /*merkle_size=*/1, /*nonce=*/0);
+    const auto commitment_root = commitment_order == auxpow::CommitmentValidation::DISPLAY ? AuxpowCommitmentRootBytes(aux_block_hash) : InternalUint256Bytes(aux_block_hash);
+    commitment = MakeCommitment(std::move(commitment), commitment_root, /*merkle_size=*/1, /*nonce=*/0);
 
     auxpow->coinbase_tx = MakeParentCoinbase(commitment);
     auxpow->parent_block.nVersion = 1;
@@ -777,6 +781,101 @@ BOOST_AUTO_TEST_CASE(auxpow_disk_block_index_reload_preserves_payload)
     BOOST_CHECK_EQUAL(decoded_header.auxpow->GetParentBlockHash(), header.auxpow->GetParentBlockHash());
 }
 
+BOOST_AUTO_TEST_CASE(cadence_lane_links_rebuild_on_block_index_load)
+{
+    const auto& params = Params();
+    const auto& consensus = params.GetConsensus();
+    const uint32_t pow_limit_bits{UintToArith256(consensus.powLimit).GetCompact()};
+
+    std::deque<CBlockIndex> indexes;
+    std::deque<uint256> hashes;
+    const auto add_index = [&](CBlockHeader header, CBlockIndex* parent) -> CBlockIndex& {
+        if (header.SignalsAuxpow()) {
+            header.auxpow = MakeAuxpowPayload(header.GetHash(), consensus, header.nBits, header.nTime);
+        } else {
+            while (!CheckProofOfWork(header.GetHash(), header.nBits, consensus))
+                ++header.nNonce;
+        }
+        indexes.emplace_back(header);
+        hashes.emplace_back(header.GetHash());
+        CBlockIndex& index{indexes.back()};
+        index.phashBlock = &hashes.back();
+        index.pprev = parent;
+        index.nHeight = parent == nullptr ? 0 : parent->nHeight + 1;
+        index.nAuxPow = (parent == nullptr ? 0 : parent->nAuxPow) + (header.SignalsAuxpow() ? 1 : 0);
+        return index;
+    };
+
+    CBlockHeader root_header;
+    root_header.nVersion = MakeVersion(/*chain_id=*/0, /*auxpow=*/false, /*version_bits=*/0);
+    root_header.hashMerkleRoot = uint256{101};
+    root_header.nTime = 1'738'713'700;
+    root_header.nBits = pow_limit_bits;
+    CBlockIndex& root{add_index(root_header, nullptr)};
+
+    CBlockHeader auxpow_header;
+    auxpow_header.nVersion = MakeVersion(static_cast<uint16_t>(consensus.nAuxpowChainId), /*auxpow=*/true, /*version_bits=*/0);
+    auxpow_header.hashPrevBlock = root.GetBlockHash();
+    auxpow_header.hashMerkleRoot = uint256{102};
+    auxpow_header.nTime = root.nTime + 1;
+    auxpow_header.nBits = pow_limit_bits;
+    CBlockIndex& auxpow{add_index(auxpow_header, &root)};
+
+    CBlockHeader permissionless_header;
+    permissionless_header.nVersion = MakeVersion(/*chain_id=*/0, /*auxpow=*/false, /*version_bits=*/0);
+    permissionless_header.hashPrevBlock = auxpow.GetBlockHash();
+    permissionless_header.hashMerkleRoot = uint256{103};
+    permissionless_header.nTime = auxpow.nTime + 1;
+    permissionless_header.nBits = pow_limit_bits;
+    CBlockIndex& permissionless{add_index(permissionless_header, &auxpow)};
+
+    CBlockHeader fork_header{auxpow_header};
+    fork_header.hashPrevBlock = root.GetBlockHash();
+    fork_header.hashMerkleRoot = uint256{104};
+    fork_header.nTime = root.nTime + 2;
+    fork_header.auxpow.reset();
+    CBlockIndex& fork_auxpow{add_index(fork_header, &root)};
+
+    node::KernelNotifications notifications{Assert(m_node.shutdown_request), m_node.exit_status, *Assert(m_node.warnings)};
+    node::BlockManager::Options blockman_opts{
+        .chainparams = params,
+        .use_xor = false,
+        .blocks_dir = m_args.GetBlocksDirPath(),
+        .notifications = notifications,
+        .block_tree_db_params = DBParams{
+            .path = "",
+            .cache_bytes = 1 << 20,
+            .memory_only = true,
+        },
+    };
+    node::BlockManager blockman{*Assert(m_node.shutdown_signal), blockman_opts};
+
+    {
+        LOCK(::cs_main);
+        BOOST_REQUIRE(blockman.m_block_tree_db->WriteBatchSync(
+            {}, /*nLastFile=*/0, {&root, &auxpow, &permissionless, &fork_auxpow}));
+        BOOST_REQUIRE(blockman.LoadBlockIndexDB(std::nullopt) == node::BlockIndexLoadResult::SUCCESS);
+
+        const CBlockIndex* loaded_root{blockman.LookupBlockIndex(root.GetBlockHash())};
+        const CBlockIndex* loaded_auxpow{blockman.LookupBlockIndex(auxpow.GetBlockHash())};
+        const CBlockIndex* loaded_permissionless{blockman.LookupBlockIndex(permissionless.GetBlockHash())};
+        const CBlockIndex* loaded_fork_auxpow{blockman.LookupBlockIndex(fork_auxpow.GetBlockHash())};
+        BOOST_REQUIRE(loaded_root);
+        BOOST_REQUIRE(loaded_auxpow);
+        BOOST_REQUIRE(loaded_permissionless);
+        BOOST_REQUIRE(loaded_fork_auxpow);
+
+        BOOST_CHECK(loaded_root->pprev_permissionless == nullptr);
+        BOOST_CHECK(loaded_root->pprev_auxpow == nullptr);
+        BOOST_CHECK(loaded_auxpow->pprev_permissionless == loaded_root);
+        BOOST_CHECK(loaded_auxpow->pprev_auxpow == nullptr);
+        BOOST_CHECK(loaded_permissionless->pprev_permissionless == loaded_root);
+        BOOST_CHECK(loaded_permissionless->pprev_auxpow == loaded_auxpow);
+        BOOST_CHECK(loaded_fork_auxpow->pprev_permissionless == loaded_root);
+        BOOST_CHECK(loaded_fork_auxpow->pprev_auxpow == nullptr);
+    }
+}
+
 BOOST_AUTO_TEST_CASE(auxpow_legacy_disk_block_index_entry_without_payload_still_deserializes)
 {
     const auto consensus = CreateChainParams(*m_node.args, ChainType::MAIN)->GetConsensus();
@@ -1049,6 +1148,63 @@ BOOST_AUTO_TEST_CASE(auxpow_header_reject_reason_and_index_accounting)
     const CBlockIndex* tip = WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain().Tip());
     BOOST_REQUIRE(tip != nullptr);
     BOOST_CHECK_EQUAL(tip->nAuxPow, 1U);
+}
+
+BOOST_AUTO_TEST_CASE(auxpow_known_header_rejects_height_invalid_payload_substitution)
+{
+    const auto& consensus = Params().GetConsensus();
+    bool new_block{false};
+    BOOST_REQUIRE(m_node.chainman->ProcessNewBlock(std::make_shared<CBlock>(Params().GenesisBlock()), /*force_processing=*/true, /*min_pow_checked=*/true, &new_block));
+
+    auto block = CreateBlockTemplate();
+    block->nVersion = MakeVersion(static_cast<uint16_t>(consensus.nAuxpowChainId), /*auxpow=*/true, block->GetVersionBits());
+    FinalizeBlock(*block);
+
+    CBlockHeader display_header{block->GetBlockHeader()};
+    display_header.auxpow = MakeAuxpowPayload(display_header.GetHash(), consensus, display_header.nBits, display_header.nTime, auxpow::CommitmentValidation::DISPLAY);
+    const uint256 indexed_parent_hash{display_header.auxpow->GetParentBlockHash()};
+
+    BlockValidationState state;
+    const CBlockIndex* pindex{nullptr};
+    BOOST_REQUIRE(m_node.chainman->ProcessNewBlockHeaders({{display_header}}, /*min_pow_checked=*/true, state, &pindex));
+    BOOST_REQUIRE(pindex != nullptr);
+    BOOST_REQUIRE(pindex->auxpow);
+    BOOST_CHECK_EQUAL(pindex->auxpow->GetParentBlockHash(), indexed_parent_hash);
+
+    auto internal_block = std::make_shared<CBlock>(*block);
+    internal_block->auxpow = MakeAuxpowPayload(internal_block->GetHash(), consensus, internal_block->nBits, internal_block->nTime + 1, auxpow::CommitmentValidation::INTERNAL);
+
+    state = BlockValidationState{};
+    BOOST_CHECK(!m_node.chainman->ProcessNewBlockHeaders({{internal_block->GetBlockHeader()}}, /*min_pow_checked=*/true, state));
+    BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-auxpow-commitment");
+
+    // force_processing=true exercises the requested-block path used by
+    // getblockfrompeer after a header has already been accepted.
+    new_block = true;
+    BOOST_CHECK(!m_node.chainman->ProcessNewBlock(internal_block, /*force_processing=*/true, /*min_pow_checked=*/true, &new_block));
+    BOOST_CHECK(!new_block);
+    const uint32_t rejected_status{WITH_LOCK(::cs_main, return pindex->nStatus)};
+    BOOST_CHECK(!(rejected_status & BLOCK_HAVE_DATA));
+    BOOST_CHECK(!(rejected_status & BLOCK_FAILED_MASK));
+    BOOST_REQUIRE(pindex->auxpow);
+    BOOST_CHECK_EQUAL(pindex->auxpow->GetParentBlockHash(), indexed_parent_hash);
+
+    auto alternate_display_block = std::make_shared<CBlock>(*block);
+    alternate_display_block->auxpow = MakeAuxpowPayload(alternate_display_block->GetHash(), consensus, alternate_display_block->nBits, alternate_display_block->nTime + 2, auxpow::CommitmentValidation::DISPLAY);
+    BOOST_REQUIRE_NE(alternate_display_block->auxpow->GetParentBlockHash(), indexed_parent_hash);
+
+    BOOST_REQUIRE(m_node.chainman->ProcessNewBlock(alternate_display_block, /*force_processing=*/true, /*min_pow_checked=*/true, &new_block));
+    BOOST_CHECK(new_block);
+    const uint32_t accepted_status{WITH_LOCK(::cs_main, return pindex->nStatus)};
+    BOOST_CHECK(accepted_status & BLOCK_HAVE_DATA);
+    BOOST_CHECK(!(accepted_status & BLOCK_FAILED_MASK));
+    BOOST_REQUIRE(pindex->auxpow);
+    BOOST_CHECK_EQUAL(pindex->auxpow->GetParentBlockHash(), indexed_parent_hash);
+
+    CBlock stored_block;
+    BOOST_REQUIRE(m_node.chainman->m_blockman.ReadBlock(stored_block, *pindex));
+    BOOST_REQUIRE(stored_block.auxpow);
+    BOOST_CHECK_EQUAL(stored_block.auxpow->GetParentBlockHash(), alternate_display_block->auxpow->GetParentBlockHash());
 }
 
 BOOST_AUTO_TEST_CASE(has_valid_proof_of_work_rejects_bad_permissionless_headers)

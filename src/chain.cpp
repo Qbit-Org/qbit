@@ -123,6 +123,29 @@ void CBlockIndex::BuildSkip()
         pskip = pprev->GetAncestor(GetSkipHeight(nHeight));
 }
 
+void CBlockIndex::BuildCadenceLaneLinks()
+{
+    pprev_permissionless = nullptr;
+    pprev_auxpow = nullptr;
+    if (!pprev) return;
+
+    if (pprev->SignalsAuxpow()) {
+        pprev_auxpow = pprev;
+        pprev_permissionless = pprev->pprev_permissionless;
+    } else {
+        pprev_permissionless = pprev;
+        pprev_auxpow = pprev->pprev_auxpow;
+    }
+}
+
+const CBlockIndex* CBlockIndex::GetPreviousBlockForLane(const bool auxpow, const int min_height) const noexcept
+{
+    if (SignalsAuxpow() == auxpow) return this;
+
+    const CBlockIndex* candidate = auxpow ? pprev_auxpow : pprev_permissionless;
+    return candidate != nullptr && candidate->nHeight >= min_height ? candidate : nullptr;
+}
+
 arith_uint256 GetBlockProof(const CBlockIndex& block)
 {
     arith_uint256 bnTarget;
@@ -136,6 +159,17 @@ arith_uint256 GetBlockProof(const CBlockIndex& block)
     // as bnTarget+1, it is equal to ((2**256 - bnTarget - 1) / (bnTarget+1)) + 1,
     // or ~bnTarget / (bnTarget+1) + 1.
     return (~bnTarget / (bnTarget + 1)) + 1;
+}
+
+arith_uint256 GetRecentChainWork(const CBlockIndex& tip, const int block_count)
+{
+    assert(block_count > 0);
+    if (tip.nHeight < block_count) return tip.nChainWork;
+
+    const CBlockIndex* ancestor{tip.GetAncestor(tip.nHeight - block_count)};
+    assert(ancestor != nullptr);
+    assert(ancestor->nChainWork <= tip.nChainWork);
+    return tip.nChainWork - ancestor->nChainWork;
 }
 
 int64_t GetBlockProofEquivalentTime(const CBlockIndex& to, const CBlockIndex& from, const CBlockIndex& tip, const Consensus::Params& params)

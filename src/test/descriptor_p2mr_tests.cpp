@@ -14,6 +14,7 @@
 #include <test/util/setup_common.h>
 #include <util/chaintype.h>
 #include <util/strencodings.h>
+#include <util/string.h>
 
 #include <boost/test/unit_test.hpp>
 
@@ -274,9 +275,13 @@ BOOST_AUTO_TEST_CASE(rawmr_independent_p2mr_vectors)
     UniValue tests;
     BOOST_REQUIRE(tests.read(json_tests::p2mr_vectors));
     BOOST_REQUIRE(tests.isObject());
-    BOOST_CHECK_EQUAL(tests["version"].getInt<int>(), 1);
+    BOOST_CHECK_EQUAL(tests["schema_version"].getInt<int>(), 1);
+    BOOST_CHECK_EQUAL(tests["profile"].get_str(), "qbit-p2mr-v1");
+    BOOST_CHECK_EQUAL(tests["profile_version"].getInt<int>(), 1);
 
     for (const auto& vec : tests["valid"].getValues()) {
+        BOOST_CHECK_EQUAL(vec["id"].get_str(), vec["name"].get_str());
+        BOOST_CHECK(vec["expected"]["accepted"].get_bool());
         const std::string root{vec["merkle_root"].get_str()};
         const std::string desc{"rawmr(" + root + ")"};
         FlatSigningProvider provider;
@@ -544,6 +549,31 @@ BOOST_AUTO_TEST_CASE(flat_signing_provider_p2mr_roundtrip)
     BOOST_CHECK(got_builder.GetP2MROutput() == output);
     BOOST_CHECK(got_spend.scripts == expected_spend.scripts);
     BOOST_CHECK_EQUAL(got_spend.merkle_root, expected_spend.merkle_root);
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_descriptor_reports_initial_stack_satisfiability)
+{
+    const auto multi_desc = [](int threshold, int key_count) {
+        std::string desc{"mr(multi_a(" + util::ToString(threshold)};
+        for (int i = 0; i < key_count; ++i) {
+            desc += "," + HexPubkey(static_cast<unsigned char>(i + 1));
+        }
+        return desc + "))";
+    };
+
+    FlatSigningProvider provider;
+    auto threshold_35 = ParseSingleDescriptor(multi_desc(35, 35), provider);
+    BOOST_CHECK(threshold_35->HasP2MRStandardSatisfaction());
+
+    FlatSigningProvider unsupported_provider;
+    auto threshold_36 = ParseSingleDescriptor(multi_desc(36, 36), unsupported_provider);
+    BOOST_CHECK(!threshold_36->HasP2MRStandardSatisfaction());
+
+    const std::string unsupported_leaf = multi_desc(36, 36);
+    const std::string mixed = "mr({pk(" + HexPubkey(0xf0) + ")," + unsupported_leaf.substr(3, unsupported_leaf.size() - 4) + "})";
+    FlatSigningProvider mixed_provider;
+    auto mixed_desc = ParseSingleDescriptor(mixed, mixed_provider);
+    BOOST_CHECK(mixed_desc->HasP2MRStandardSatisfaction());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

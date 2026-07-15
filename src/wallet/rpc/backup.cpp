@@ -12,6 +12,7 @@
 #include <merkleblock.h>
 #include <rpc/util.h>
 #include <script/descriptor.h>
+#include <script/p2mr_sizing.h>
 #include <script/script.h>
 #include <script/solver.h>
 #include <sync.h>
@@ -849,6 +850,13 @@ static UniValue ProcessDescriptorImport(CWallet& wallet, const UniValue& data, c
         }
         for (const auto& parsed_desc : parsed_descs) {
             EnsureDescriptorOutputTypeAllowed(*parsed_desc, "Imported");
+            if (parsed_desc->GetOutputType() == OutputType::P2MR && parsed_desc->IsSolvable() && !parsed_desc->HasP2MRStandardSatisfaction()) {
+                if (active) {
+                    throw JSONRPCError(RPC_WALLET_ERROR,
+                        strprintf("Cannot activate P2MR descriptor without a wallet-constructible satisfaction; multi_a thresholds must not exceed %u", P2MR_V1_MAX_STANDARD_SIGNATURES));
+                }
+                warnings.push_back(strprintf("Imported inactive P2MR descriptor has no wallet-constructible satisfaction; multi_a thresholds above %u cannot be finalized", P2MR_V1_MAX_STANDARD_SIGNATURES));
+            }
         }
         std::optional<bool> internal;
         if (data.exists("internal")) {

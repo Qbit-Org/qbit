@@ -71,6 +71,7 @@
 #include <cassert>
 #include <chrono>
 #include <deque>
+#include <limits>
 #include <numeric>
 #include <optional>
 #include <ranges>
@@ -99,8 +100,10 @@ static constexpr size_t WARN_FLUSH_COINS_SIZE = 1 << 30; // 1 GiB
 */
 static constexpr auto DATABASE_WRITE_INTERVAL_MIN{50min};
 static constexpr auto DATABASE_WRITE_INTERVAL_MAX{70min};
-/** Maximum age of our tip for us to be considered current for fee estimation */
-static constexpr std::chrono::hours MAX_FEE_ESTIMATION_TIP_AGE{3};
+/** Stop learning fee estimates after twenty missed aggregate target intervals. */
+static constexpr std::chrono::minutes MAX_FEE_ESTIMATION_TIP_AGE{20};
+/** Prefer height-derived verification progress only for a recently updated qbit chain. */
+static constexpr auto VERIFICATION_PROGRESS_RECENT_WINDOW{15min};
 const std::vector<std::string> CHECKLEVEL_DOC {
     "level 0 reads the blocks from disk",
     "level 1 verifies block validity",
@@ -115,6 +118,8 @@ const std::vector<std::string> CHECKLEVEL_DOC {
  *  noticeably interfere with the pruning mechanism.
  * */
 static constexpr int PRUNE_LOCK_BUFFER{10};
+/** Recent-work margin for warning about a substantially better invalid chain. */
+static constexpr int INVALID_CHAIN_WORK_WINDOW{6};
 static constexpr auto RECOVERED_WITNESS_READ_FAILED{"recovered-witness-read-failed"};
 static constexpr auto RECOVERED_WITNESS_VALIDATION_FAILED{"recovered-witness-validation-failed"};
 
@@ -277,6 +282,8 @@ bool CheckSequenceLocksAtTip(CBlockIndex* tip,
 
 // Returns the script flags which should be checked for a given block
 static unsigned int GetBlockScriptFlags(const CBlockIndex& block_index, const ChainstateManager& chainman);
+static unsigned int GetNextBlockScriptFlags(const ChainstateManager& chainman) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+static unsigned int GetStandardScriptFlagsForNextBlock(const ChainstateManager& chainman) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
 static void LimitMempoolSize(CTxMemPool& pool, CCoinsViewCache& coins_cache)
     EXCLUSIVE_LOCKS_REQUIRED(::cs_main, pool.cs)
@@ -294,13 +301,18 @@ static void LimitMempoolSize(CTxMemPool& pool, CCoinsViewCache& coins_cache)
         coins_cache.Uncache(removed);
 }
 
+bool IsBlockTimeCurrentForFeeEstimation(int64_t block_time, int64_t now)
+{
+    return block_time >= now - Ticks<std::chrono::seconds>(MAX_FEE_ESTIMATION_TIP_AGE);
+}
+
 static bool IsCurrentForFeeEstimation(Chainstate& active_chainstate) EXCLUSIVE_LOCKS_REQUIRED(cs_main)
 {
     AssertLockHeld(cs_main);
     if (active_chainstate.m_chainman.IsInitialBlockDownload()) {
         return false;
     }
-    if (active_chainstate.m_chain.Tip()->GetBlockTime() < count_seconds(GetTime<std::chrono::seconds>() - MAX_FEE_ESTIMATION_TIP_AGE))
+    if (!IsBlockTimeCurrentForFeeEstimation(active_chainstate.m_chain.Tip()->GetBlockTime(), GetTime()))
         return false;
     if (active_chainstate.m_chain.Height() < active_chainstate.m_chainman.m_best_header->nHeight - 1) {
         return false;
@@ -349,13 +361,17 @@ void Chainstate::MaybeUpdateMempoolForReorg(
     m_mempool->UpdateTransactionsFromBlock(vHashUpdate);
 
     // Predicate to use for filtering transactions in removeForReorg.
-    // Checks whether the transaction is still final and, if it spends a coinbase output, mature.
+    // Checks whether the transaction is still final, valid under the next
+    // block's script rules and, if it spends a coinbase output, mature.
     // Also updates valid entries' cached LockPoints if needed.
     // If false, the tx is still valid and its lockpoints are updated.
     // If true, the tx would be invalid in the next block; remove this entry and all of its descendants.
     // Note that TRUC rules are not applied here, so reorgs may cause violations of TRUC inheritance or
     // topology restrictions.
-    const auto filter_final_and_mature = [&](CTxMemPool::txiter it)
+    CCoinsViewMemPool view_mempool{&CoinsTip(), *m_mempool};
+    CCoinsViewCache reorg_view{&view_mempool};
+    const unsigned int next_block_script_flags{GetNextBlockScriptFlags(m_chainman)};
+    const auto filter_final_script_and_mature = [&](CTxMemPool::txiter it)
         EXCLUSIVE_LOCKS_REQUIRED(m_mempool->cs, ::cs_main) {
         AssertLockHeld(m_mempool->cs);
         AssertLockHeld(::cs_main);
@@ -372,7 +388,6 @@ void Chainstate::MaybeUpdateMempoolForReorg(
                 return true;
             }
         } else {
-            const CCoinsViewMemPool view_mempool{&CoinsTip(), *m_mempool};
             const std::optional<LockPoints> new_lock_points{CalculateLockPointsAtTip(m_chain.Tip(), view_mempool, tx)};
             if (new_lock_points.has_value() && CheckSequenceLocksAtTip(m_chain.Tip(), *new_lock_points)) {
                 // Now update the mempool entry lockpoints as well.
@@ -394,12 +409,21 @@ void Chainstate::MaybeUpdateMempoolForReorg(
                 }
             }
         }
+
+        TxValidationState script_state;
+        PrecomputedTransactionData txdata;
+        if (!CheckInputScripts(tx, script_state, reorg_view, next_block_script_flags,
+                /*cacheSigStore=*/true, /*cacheFullScriptStore=*/true, txdata, m_chainman.m_validation_cache)) {
+            return true;
+        }
         // Transaction is still valid and cached LockPoints are updated.
         return false;
     };
 
-    // We also need to remove any now-immature transactions
-    m_mempool->removeForReorg(m_chain, filter_final_and_mature);
+    // We also need to remove transactions invalid under the new tip's
+    // next-block rules, including transactions made invalid by crossing a
+    // height-activated consensus boundary in reverse.
+    m_mempool->removeForReorg(m_chain, filter_final_script_and_mature);
     // Re-limit mempool size, in case we added any transactions
     LimitMempoolSize(*m_mempool, this->CoinsTip());
 }
@@ -1271,7 +1295,7 @@ bool MemPoolAccept::PolicyScriptChecks(const ATMPArgs& args, Workspace& ws)
     const CTransaction& tx = *ws.m_ptx;
     TxValidationState& state = ws.m_state;
 
-    constexpr unsigned int scriptVerifyFlags = STANDARD_SCRIPT_VERIFY_FLAGS;
+    const unsigned int scriptVerifyFlags{GetStandardScriptFlagsForNextBlock(m_active_chainstate.m_chainman)};
 
     // Check input scripts and signatures.
     // This is done last to help prevent CPU exhaustion denial-of-service attacks.
@@ -1295,12 +1319,9 @@ bool MemPoolAccept::ConsensusScriptChecks(const ATMPArgs& args, Workspace& ws)
     const Txid& hash = ws.m_hash;
     TxValidationState& state = ws.m_state;
 
-    // Check again against the current block tip's script verification
-    // flags to cache our script execution flags. This is, of course,
-    // useless if the next block has different script flags from the
-    // previous one, but because the cache tracks script flags for us it
-    // will auto-invalidate and we'll just have a few blocks of extra
-    // misses on soft-fork activation.
+    // Check again against the next block's consensus flags. Using the
+    // candidate height is required for height-activated consensus changes
+    // whose first valid transaction may be mined in the activation block.
     //
     // This is also useful in case of bugs in the standard flags that cause
     // transactions to pass as valid when they're actually invalid. For
@@ -1310,8 +1331,8 @@ bool MemPoolAccept::ConsensusScriptChecks(const ATMPArgs& args, Workspace& ws)
     // There is a similar check in CreateNewBlock() to prevent creating
     // invalid blocks (using TestBlockValidity), however allowing such
     // transactions into the mempool can be exploited as a DoS attack.
-    unsigned int currentBlockScriptVerifyFlags{GetBlockScriptFlags(*m_active_chainstate.m_chain.Tip(), m_active_chainstate.m_chainman)};
-    if (!CheckInputsFromMempoolAndCache(tx, state, m_view, m_pool, currentBlockScriptVerifyFlags,
+    const unsigned int nextBlockScriptVerifyFlags{GetNextBlockScriptFlags(m_active_chainstate.m_chainman)};
+    if (!CheckInputsFromMempoolAndCache(tx, state, m_view, m_pool, nextBlockScriptVerifyFlags,
                                         ws.m_precomputed_txdata, m_active_chainstate.CoinsTip(), GetValidationCache())) {
         LogPrintf("BUG! PLEASE REPORT THIS! CheckInputScripts failed against latest-block but not STANDARD flags %s, %s\n", hash.ToString(), state.ToString());
         return Assume(false);
@@ -2061,7 +2082,10 @@ void Chainstate::CheckForkWarningConditions()
         return;
     }
 
-    if (m_chainman.m_best_invalid && m_chainman.m_best_invalid->nChainWork > m_chain.Tip()->nChainWork + (GetBlockProof(*m_chain.Tip()) * 6)) {
+    const CBlockIndex& tip{*Assert(m_chain.Tip())};
+    const arith_uint256 invalid_chain_work_margin{GetRecentChainWork(tip, INVALID_CHAIN_WORK_WINDOW)};
+    if (m_chainman.m_best_invalid &&
+        m_chainman.m_best_invalid->nChainWork > tip.nChainWork + invalid_chain_work_margin) {
         LogPrintf("%s: Warning: Found invalid chain at least ~6 blocks longer than our best chain.\nChain state database corruption likely.\n", __func__);
         m_chainman.GetNotifications().warningSet(
             kernel::Warning::LARGE_WORK_INVALID_CHAIN,
@@ -2373,6 +2397,9 @@ static unsigned int GetBlockScriptFlags(const CBlockIndex& block_index, const Ch
     uint32_t flags{SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_TAPROOT};
     if (block_index.nHeight >= consensusparams.P2MRHeight) {
         flags |= SCRIPT_VERIFY_P2MR_RULES;
+        if (!consensusparams.P2MRValidationWeightV2ActiveAtHeight(block_index.nHeight)) {
+            flags |= SCRIPT_VERIFY_P2MR_LEGACY_VALIDATION_WEIGHT;
+        }
     }
     const auto it{consensusparams.script_flag_exceptions.find(*Assert(block_index.phashBlock))};
     if (it != consensusparams.script_flag_exceptions.end()) {
@@ -2402,11 +2429,108 @@ static unsigned int GetBlockScriptFlags(const CBlockIndex& block_index, const Ch
     return flags;
 }
 
+static unsigned int GetNextBlockScriptFlags(const ChainstateManager& chainman)
+{
+    AssertLockHeld(cs_main);
+    const CBlockIndex* tip{chainman.ActiveChain().Tip()};
+    assert(tip != nullptr);
+    const int next_height{tip->nHeight + 1};
+    unsigned int flags{GetBlockScriptFlags(*tip, chainman)};
+    const Consensus::Params& consensus{chainman.GetConsensus()};
+    if (next_height >= consensus.P2MRHeight) {
+        flags |= SCRIPT_VERIFY_P2MR_RULES;
+        if (consensus.P2MRValidationWeightV2ActiveAtHeight(next_height)) {
+            flags &= ~SCRIPT_VERIFY_P2MR_LEGACY_VALIDATION_WEIGHT;
+        } else {
+            flags |= SCRIPT_VERIFY_P2MR_LEGACY_VALIDATION_WEIGHT;
+        }
+    }
+    return flags;
+}
+
+static unsigned int GetStandardScriptFlagsForNextBlock(const ChainstateManager& chainman)
+{
+    AssertLockHeld(cs_main);
+    unsigned int flags{STANDARD_SCRIPT_VERIFY_FLAGS};
+    const CBlockIndex* tip{chainman.ActiveChain().Tip()};
+    assert(tip != nullptr);
+    const int next_height{tip->nHeight + 1};
+    const Consensus::Params& consensus{chainman.GetConsensus()};
+    // Standard policy enforces P2MR before consensus activation. In that
+    // interval, apply the validation-weight rule that will be active in the
+    // first P2MR consensus block so the mempool cannot admit a transaction
+    // that makes the activation-height mining template invalid.
+    const int p2mr_policy_height{std::max(next_height, consensus.P2MRHeight)};
+    if (!consensus.P2MRValidationWeightV2ActiveAtHeight(p2mr_policy_height)) {
+        flags |= SCRIPT_VERIFY_P2MR_LEGACY_VALIDATION_WEIGHT;
+    }
+    return flags;
+}
+
 // Witness-pruned historical validation policy is tracked in the release
 // validation notes.
 // Full blocks keep the existing two-week assumevalid burial check, while
 // witness-pruned blocks fall back to the assumed-valid ancestry/work gate
 // because witness script execution is unavailable once history is compacted.
+static constexpr int ASSUMEVALID_WORK_RATE_WINDOW{120};
+static constexpr uint32_t ASSUMEVALID_BURIAL_SECONDS{60 * 60 * 24 * 7 * 2};
+
+/**
+ * Return whether work / reference_work exceeds seconds / elapsed_seconds.
+ *
+ * Dividing both ratios into integer and remainder parts avoids overflowing
+ * arith_uint256 when comparing the cross-products.
+ */
+static bool WorkDurationExceeds(const arith_uint256& work, const arith_uint256& reference_work,
+                                uint32_t elapsed_seconds, uint32_t seconds)
+{
+    if (work == 0 || reference_work == 0 || elapsed_seconds == 0) return false;
+
+    const arith_uint256 work_quotient{work / reference_work};
+    const arith_uint256 seconds_quotient{seconds / elapsed_seconds};
+    if (work_quotient != seconds_quotient) return work_quotient > seconds_quotient;
+
+    const arith_uint256 work_remainder{work - work_quotient * reference_work};
+    const uint32_t seconds_remainder{seconds % elapsed_seconds};
+
+    // Compare work_remainder / reference_work with
+    // seconds_remainder / elapsed_seconds. Computing the floor of the
+    // right-hand cross-product this way keeps every intermediate value in
+    // range. The first product is strictly less than reference_work and the
+    // second product fits in uint64_t.
+    const arith_uint256 elapsed{elapsed_seconds};
+    const arith_uint256 reference_quotient{reference_work / elapsed};
+    const arith_uint256 reference_remainder{reference_work - reference_quotient * elapsed};
+    arith_uint256 remainder_threshold{reference_quotient * seconds_remainder};
+    remainder_threshold += reference_remainder.GetLow64() * seconds_remainder / elapsed_seconds;
+
+    return work_remainder > remainder_threshold;
+}
+
+/**
+ * Check the assumevalid burial interval against aggregate recent chainwork.
+ * A multi-block work-rate sample prevents either cadence lane at the tip from
+ * controlling the estimate. Missing history, non-monotonic work, and invalid
+ * timestamp windows all fail closed.
+ */
+static bool HasAssumeValidBurial(const CBlockIndex& tip, const CBlockIndex& block_index)
+{
+    const CBlockIndex* window_start{&tip};
+    for (int i = 0; i < ASSUMEVALID_WORK_RATE_WINDOW; ++i) {
+        window_start = window_start->pprev;
+        if (!window_start) return false;
+    }
+
+    if (tip.nChainWork <= window_start->nChainWork || tip.nChainWork <= block_index.nChainWork) return false;
+
+    const int64_t elapsed{tip.GetMedianTimePast() - window_start->GetMedianTimePast()};
+    if (elapsed <= 0 || elapsed > std::numeric_limits<uint32_t>::max()) return false;
+
+    return WorkDurationExceeds(tip.nChainWork - block_index.nChainWork,
+                               tip.nChainWork - window_start->nChainWork,
+                               static_cast<uint32_t>(elapsed), ASSUMEVALID_BURIAL_SECONDS);
+}
+
 static bool IsAssumedValidAncestor(const ChainstateManager& chainman, const CBlockIndex& block_index)
     EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
 {
@@ -2436,7 +2560,7 @@ bool ChainstateManager::CanSkipScriptChecks(const CBlockIndex& block_index, bool
     if (!IsAssumedValidAncestor(*this, block_index)) return false;
     if (witness_unavailable) return true;
 
-    return GetBlockProofEquivalentTime(*m_best_header, block_index, *m_best_header, GetConsensus()) > 60 * 60 * 24 * 7 * 2;
+    return HasAssumeValidBurial(*m_best_header, block_index);
 }
 
 util::Result<void> ChainstateManager::CheckAssumeValidCoversWitnessPrunedHistory() const
@@ -4516,7 +4640,7 @@ static bool ContextualCheckBlockHeader(const CBlockHeader& block, BlockValidatio
     }
 
     // Check timestamp
-    if (block.Time() > NodeClock::now() + std::chrono::seconds{MAX_FUTURE_BLOCK_TIME}) {
+    if (block.Time() > NodeClock::now() + std::chrono::seconds{GetMaxFutureBlockTime(consensusParams, nHeight)}) {
         return state.Invalid(BlockValidationResult::BLOCK_TIME_FUTURE, "time-too-new", "block timestamp too far in the future");
     }
 
@@ -4649,6 +4773,12 @@ bool ChainstateManager::AcceptBlockHeader(const CBlockHeader& block, BlockValida
             if (pindex->nStatus & BLOCK_FAILED_MASK) {
                 LogDebug(BCLog::VALIDATION, "%s: block %s is marked invalid\n", __func__, hash.ToString());
                 return state.Invalid(BlockValidationResult::BLOCK_CACHED_INVALID, "duplicate-invalid");
+            }
+            // AuxPoW is not part of the block hash, so a known header can be
+            // received again with a different payload. Validate the incoming
+            // payload for the indexed height before treating it as equivalent.
+            if (const auto error = auxpow::Validate(block, GetConsensus(), /*check_pow=*/true, auxpow::CommitmentValidationForHeight(GetConsensus(), pindex->nHeight))) {
+                return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, error->reject_reason, error->debug_message);
             }
             return true;
         }
@@ -5777,6 +5907,10 @@ void ChainstateManager::CheckBlockIndex() const
         }
         const uint64_t expected_auxpow_count = (pindex->pprev ? pindex->pprev->nAuxPow : 0) + (pindex->SignalsAuxpow() ? 1 : 0);
         assert(pindex->nAuxPow == expected_auxpow_count);
+        const CBlockIndex* expected_permissionless = pindex->pprev ? (pindex->pprev->SignalsAuxpow() ? pindex->pprev->pprev_permissionless : pindex->pprev) : nullptr;
+        const CBlockIndex* expected_auxpow = pindex->pprev ? (pindex->pprev->SignalsAuxpow() ? pindex->pprev : pindex->pprev->pprev_auxpow) : nullptr;
+        assert(pindex->pprev_permissionless == expected_permissionless);
+        assert(pindex->pprev_auxpow == expected_auxpow);
         // There should be no block with more work than m_best_header, unless it's known to be invalid
         assert((pindex->nStatus & BLOCK_FAILED_MASK) || pindex->nChainWork <= m_best_header->nChainWork);
 
@@ -6011,7 +6145,7 @@ double ChainstateManager::GuessVerificationProgress(const CBlockIndex* pindex) c
 
     const int64_t nNow{TicksSinceEpoch<std::chrono::seconds>(NodeClock::now())};
     const auto block_time{
-        (Assume(m_best_header) && std::abs(nNow - pindex->GetBlockTime()) <= Ticks<std::chrono::seconds>(2h) &&
+        (Assume(m_best_header) && std::abs(nNow - pindex->GetBlockTime()) <= Ticks<std::chrono::seconds>(VERIFICATION_PROGRESS_RECENT_WINDOW) &&
          Assume(m_best_header->nHeight >= pindex->nHeight)) ?
             // When the header is known to be recent, switch to a height-based
             // approach. This ensures the returned value is quantized when

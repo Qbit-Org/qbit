@@ -41,10 +41,12 @@ static constexpr int QBIT_PUBLIC_TESTNET_AUXPOW_CHAIN_ID{31430};
 static constexpr int QBIT_TEST_CHAIN_AUXPOW_CHAIN_ID{QBIT_PUBLIC_TESTNET_AUXPOW_CHAIN_ID};
 static constexpr int QBIT_TESTNET4_AUXPOW_DISPLAY_COMMITMENT_HEIGHT{20'500};
 
-// Mainnet is not launched. This placeholder intentionally matches public
-// testnet only while mainnet params are still development scaffolding. Replace
-// it with a distinct final value before mainnet is enabled or reset.
-static constexpr int QBIT_MAINNET_PLACEHOLDER_AUXPOW_CHAIN_ID{QBIT_PUBLIC_TESTNET_AUXPOW_CHAIN_ID};
+// Mainnet uses its separately allocated production AuxPoW chain ID. Public
+// testnet retains its established identity above.
+static constexpr int QBIT_MAINNET_AUXPOW_CHAIN_ID{47};
+static_assert(QBIT_MAINNET_AUXPOW_CHAIN_ID >= 1 &&
+              QBIT_MAINNET_AUXPOW_CHAIN_ID <= 0xFFFF);
+static_assert(QBIT_MAINNET_AUXPOW_CHAIN_ID != QBIT_PUBLIC_TESTNET_AUXPOW_CHAIN_ID);
 
 static CBlock CreateGenesisBlock(const CScript& genesisInputScript, const CScript& genesisOutputScript, uint32_t nTime, uint32_t nNonce, uint32_t nBits, int32_t nVersion, const CAmount& genesisReward)
 {
@@ -74,16 +76,14 @@ static CBlock CreateGenesisBlock(const char* pszTimestamp, const CScript& genesi
 }
 
 /**
- * Build the qbit development genesis block.
+ * Build the qbit development-network genesis block.
  *
  * Headline: "qbit/v0.1 development genesis - not for production use"
  * Output: 33 zero bytes + OP_CHECKSIG (unspendable, follows testnet4 pattern)
  * Reward: 210 QBT
  *
- * This is a development placeholder. Before mainnet launch:
- * - Replace headline with a real, dateable publication headline
- * - Finalize production nBits from sourced launch assumptions
- * - Re-mine with C/CUDA at real difficulty
+ * This helper is retained for development networks. Mainnet uses its dedicated,
+ * externally mined CreateMainNetGenesisBlock record below.
  */
 static CBlock CreateGenesisBlock(uint32_t nTime, uint32_t nNonce, uint32_t nBits, int32_t nVersion, const CAmount& genesisReward)
 {
@@ -95,6 +95,16 @@ static CBlock CreateGenesisBlock(uint32_t nTime, uint32_t nNonce, uint32_t nBits
 static CBlock CreateTestNet4GenesisBlock(uint32_t nTime, uint32_t nNonce, uint32_t nBits, int32_t nVersion, const CAmount& genesisReward)
 {
     const auto genesisInputScriptBytes = ParseHex("04ffff001d0800000008f44100004c5146696e616e6369616c2054696d65732031322f4a756e2f32303236205175616e74756d20636f6d707574696e67207265766f6c7574696f6e20697320636c6f736572207468616e20796f75207468696e6b");
+    const CScript genesisInputScript{genesisInputScriptBytes.begin(), genesisInputScriptBytes.end()};
+    const CScript genesisOutputScript = CScript() << "000000000000000000000000000000000000000000000000000000000000000000"_hex << OP_CHECKSIG;
+    return CreateGenesisBlock(genesisInputScript, genesisOutputScript, nTime, nNonce, nBits, nVersion, genesisReward);
+}
+
+static CBlock CreateMainNetGenesisBlock(uint32_t nTime, uint32_t nNonce, uint32_t nBits, int32_t nVersion, const CAmount& genesisReward)
+{
+    // Preserve the exact 100-byte scriptSig used by the public genesis mining
+    // record, including its eight-byte second-push extranonce.
+    const auto genesisInputScriptBytes = ParseHex("04ffff001d08044c0000000000004c54476f6f676c653a205365637572696e67204543432043727970746f63757272656e6369657320616761696e7374205175616e74756d2056756c6e65726162696c6974696573203935383135373a33616261663835");
     const CScript genesisInputScript{genesisInputScriptBytes.begin(), genesisInputScriptBytes.end()};
     const CScript genesisOutputScript = CScript() << "000000000000000000000000000000000000000000000000000000000000000000"_hex << OP_CHECKSIG;
     return CreateGenesisBlock(genesisInputScript, genesisOutputScript, nTime, nNonce, nBits, nVersion, genesisReward);
@@ -130,6 +140,8 @@ public:
         consensus.BIP66Height = 0;
         consensus.CSVHeight = 0;
         consensus.SegwitHeight = 0;
+        consensus.nP2MRValidationWeightV2Height = 0; // Final P2MR accounting is active from genesis.
+        consensus.nFutureBlockTimeV2Height = 0;
         // Pre-launch network: reserve the outer witness namespace from genesis so future v3..v16 families can soft-fork on top of the launch baseline.
         consensus.nOuterReservedWitnessHeight = 0;
         consensus.MinBIP9WarningHeight = 0;
@@ -140,17 +152,18 @@ public:
         consensus.nPowTargetSpacing = 60; // 1-minute blocks
         consensus.nPowTargetSpacingLegacy = 75; // Use 75s/300s lane spacing for an exact 4:1 permissionless:merged split at a 60s aggregate cadence.
         consensus.nPowTargetSpacingAuxPow = 300;
-        consensus.nAuxpowChainId = QBIT_MAINNET_PLACEHOLDER_AUXPOW_CHAIN_ID;
+        consensus.nAuxpowChainId = QBIT_MAINNET_AUXPOW_CHAIN_ID;
         consensus.fPowAllowMinDifficultyBlocks = false;
         consensus.enforce_BIP94 = false;
         consensus.fPowNoRetargeting = false;
         consensus.fRestrictedOutputMode = true;
         consensus.fPowUseASERT = true;
         consensus.nASERTHalfLife = 2 * 60 * 60;
-        // Draft launch calibration from src/test/data/mainnet_launch_difficulty.json:
-        // permissionless uses $100M FDV and $30.67/PH/day hashprice; AuxPoW uses
-        // 1% of a rounded 1000 EH/s Bitcoin hashrate at 300s target spacing.
-        consensus.asertAnchorParams = Consensus::ASERTAnchor{0, 0x1810c357, 0x1810c357, 0x180192f8, 0, 1738713600};
+        // Dated launch calibration from src/test/data/mainnet_launch_difficulty.json:
+        // permissionless uses $100M FDV and the July 13, 2026 7-day average
+        // $30.39/PH/day hashprice; AuxPoW uses 1% of the 879 EH/s Bitcoin
+        // 7-day hashrate SMA at 300s target spacing.
+        consensus.asertAnchorParams = Consensus::ASERTAnchor{0, 0x18109c29, 0x18109c29, 0x1801ca70, 0, 1784131083};
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].bit = 0;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
         consensus.vDeployments[Consensus::DEPLOYMENT_TESTDUMMY].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
@@ -180,24 +193,22 @@ public:
         pchMessageStart[3] = 0xa8;
         nDefaultPort = 8355;
         nPruneAfterHeight = 100000;
-        m_assumed_blockchain_size = 1; // qbit: placeholder, chain doesn't exist yet
-        m_assumed_chain_state_size = 1;
+        m_assumed_blockchain_size = 0; // No mainnet history exists at launch.
+        m_assumed_chain_state_size = 0;
 
-        // Temporary development genesis target. ASERT lane anchors below carry the
-        // draft launch difficulty until the final mainnet genesis is mined.
-        genesis = CreateGenesisBlock(1738713600, 45609, 0x1f00ffff, 1, consensus.nSubsidyInitial);
+        genesis = CreateMainNetGenesisBlock(1784131083, 1084616938, 0x1a7f1ab5, 1, consensus.nSubsidyInitial);
         consensus.hashGenesisBlock = genesis.GetHash();
         consensus.BIP34Hash = consensus.hashGenesisBlock;
-        assert(consensus.hashGenesisBlock == uint256{"0000324188278d089b5eabd9b62bf874c7512677cea90720af51ea5a61a2f997"});
-        assert(genesis.hashMerkleRoot == uint256{"773941c57f540b7e0f841db6de90bf4f29d305d8233224c2581025c684387313"});
+        assert(consensus.hashGenesisBlock == uint256{"0000000000004d60aa5d46013991d0a0e2995d89ee98e53068ae196d763e79f2"});
+        assert(genesis.hashMerkleRoot == uint256{"584b62d357e3213ae27815d53b41efc869cc91fcf73d6a81dcab5e08508cb6f1"});
 
         // Note that of those which support the service bits prefix, most only support a subset of
         // possible options.
         // This is fine at runtime as we'll fall back to using them as an addrfetch if they don't support the
         // service bits we want, but we should get them updated to support all service bits wanted by any
         // release ASAP to avoid it where possible.
-        // qbit: no DNS seeds yet — network doesn't exist
-        vSeeds.clear();
+        vSeeds.emplace_back("flux-mainnet.qbit.org");
+        vSeeds.emplace_back("phase-mainnet.qbit.org");
 
         base58Prefixes[PUBKEY_ADDRESS] = std::vector<unsigned char>(1,58);  // 'Q'
         base58Prefixes[SCRIPT_ADDRESS] = std::vector<unsigned char>(1,63);  // 'S'
@@ -207,7 +218,7 @@ public:
 
         bech32_hrp = "qb";
 
-        vFixedSeeds.clear(); // qbit: no fixed seeds yet
+        vFixedSeeds = std::vector<uint8_t>(chainparams_seed_main.begin(), chainparams_seed_main.end());
 
         fDefaultConsistencyChecks = false;
         m_is_mockable_chain = false;
@@ -237,6 +248,8 @@ public:
         consensus.BIP66Height = 0;
         consensus.CSVHeight = 0;
         consensus.SegwitHeight = 0;
+        consensus.nP2MRValidationWeightV2Height = 0;
+        consensus.nFutureBlockTimeV2Height = 0;
         // Pre-launch network: reserve the outer witness namespace from genesis so future v3..v16 families can soft-fork on top of the launch baseline.
         consensus.nOuterReservedWitnessHeight = 0;
         consensus.MinBIP9WarningHeight = 0;
@@ -328,6 +341,8 @@ public:
         consensus.BIP66Height = 0;
         consensus.CSVHeight = 0;
         consensus.SegwitHeight = 0;
+        consensus.nP2MRValidationWeightV2Height = 60'000;
+        consensus.nFutureBlockTimeV2Height = 60'000;
         // Match launch restricted-output semantics on the public rehearsal network.
         consensus.nOuterReservedWitnessHeight = 0;
         consensus.MinBIP9WarningHeight = 0;
@@ -450,6 +465,8 @@ public:
         consensus.BIP66Height = 0;
         consensus.CSVHeight = 0;
         consensus.SegwitHeight = 0;
+        consensus.nP2MRValidationWeightV2Height = 0;
+        consensus.nFutureBlockTimeV2Height = 0;
         // Reset network: reserve the outer witness namespace from genesis so future v3..v16 families can soft-fork on top of the relaunched baseline.
         consensus.nOuterReservedWitnessHeight = 0;
         consensus.nPowTargetTimespan = 14 * 24 * 60 * 60;
@@ -539,6 +556,8 @@ public:
         consensus.nAuxpowDisplayCommitmentHeight = opts.auxpow_display_commitment_height.value_or(0); // Always active unless overridden
         consensus.nOuterReservedWitnessHeight = opts.outer_witness_activation_height.value_or(std::numeric_limits<int>::max());
         consensus.P2MRHeight = opts.p2mr_activation_height.value_or(0); // Always active unless overridden
+        consensus.nP2MRValidationWeightV2Height = opts.p2mr_validation_weight_v2_height.value_or(0);
+        consensus.nFutureBlockTimeV2Height = opts.future_block_time_v2_height.value_or(0);
         consensus.MinBIP9WarningHeight = 0;
         consensus.powLimit = uint256{"7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
         consensus.nPowTargetTimespan = 24 * 60 * 60; // one day

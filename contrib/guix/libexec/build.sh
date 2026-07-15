@@ -200,11 +200,10 @@ mkdir -p "$OUTDIR"
 ###########################
 
 # CONFIGFLAGS
-qbit_testnet_only_release_default=OFF
-case "$DISTNAME" in
-    qbit-*-testnet*) qbit_testnet_only_release_default=ON ;;
-esac
-QBIT_TESTNET_ONLY_RELEASE="${QBIT_TESTNET_ONLY_RELEASE:-$qbit_testnet_only_release_default}"
+# Mainnet-capable binaries are the default for every distribution name.
+# Testnet-only packages must opt in explicitly with
+# QBIT_TESTNET_ONLY_RELEASE=ON; package naming must not change chain access.
+QBIT_TESTNET_ONLY_RELEASE="${QBIT_TESTNET_ONLY_RELEASE:-OFF}"
 case "$QBIT_TESTNET_ONLY_RELEASE" in
     ON|OFF|TRUE|FALSE|YES|NO|Y|N|1|0|on|off|true|false|yes|no|y|n) ;;
     *)
@@ -213,6 +212,7 @@ case "$QBIT_TESTNET_ONLY_RELEASE" in
         ;;
 esac
 CONFIGFLAGS="-DREDUCE_EXPORTS=ON -DBUILD_BENCH=OFF -DBUILD_GUI_TESTS=OFF -DBUILD_FUZZ_BINARY=OFF -DQBIT_TESTNET_ONLY_RELEASE=$QBIT_TESTNET_ONLY_RELEASE"
+CONFIGFLAGS+=" -DSPX_ENABLE_TEST_BENCH_ENV_KNOBS=OFF"
 
 # CFLAGS
 HOST_CFLAGS="-O2 -g"

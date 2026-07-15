@@ -28,6 +28,8 @@
 #include <util/time.h>
 #include <validation.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <ios>
@@ -109,7 +111,11 @@ void utxo_snapshot_fuzz(FuzzBufferType buffer)
 {
     SeedRandomStateForTest(SeedRand::ZEROS);
     FuzzedDataProvider fuzzed_data_provider(buffer.data(), buffer.size());
-    SetMockTime(ConsumeTime(fuzzed_data_provider, /*min=*/1738713602)); // regtest genesis block timestamp
+    const NodeSeconds fuzz_time{
+        std::chrono::seconds{ConsumeTime(fuzzed_data_provider, /*min=*/1738713602)}}; // regtest genesis block timestamp
+    // This target asserts that every header in the static chain is valid. Do
+    // not let the fuzzed clock make those known-good headers too far ahead.
+    SetMockTime(std::max(fuzz_time, g_chain->back()->Time()));
     auto& setup{*g_setup};
     bool dirty_chainman{false}; // Reuse the global chainman, but reset it when it is dirty
     auto& chainman{*setup.m_node.chainman};

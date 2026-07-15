@@ -172,6 +172,25 @@ std::vector<bilingual_str> FormatPQCUsageWarnings(const std::vector<PQCUsageWarn
     return out;
 }
 
+void LogPQCUsageWarnings(const CWallet& wallet, const PQCUsageReport& report)
+{
+    for (const bilingual_str& warning : FormatPQCUsageWarnings(report.warnings)) {
+        wallet.WalletLogPrintf("PQC usage warning: %s\n", warning.original);
+    }
+}
+
+void LogConsumedPQCDataHashCounters(const CWallet& wallet, const PQCUsageRecorder& recorder, const bilingual_str& error)
+{
+    for (const PQCUsageAdvance& advance : recorder.GetAdvances()) {
+        wallet.WalletLogPrintf(
+            "PQC data-hash signing consumed counter for pubkey %s [%u, %u) before failing: %s\n",
+            HexStr(std::span<const unsigned char>{advance.pubkey.begin(), advance.pubkey.end()}),
+            advance.previous_count,
+            advance.new_count,
+            error.original);
+    }
+}
+
 PQCUsageReport BuildSigningPQCUsageReport(const PQCUsageRecorder& recorder)
 {
     PQCUsageReport report;

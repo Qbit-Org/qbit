@@ -13,9 +13,9 @@ current checked-in seed artifacts are:
 - `nodes_signet.txt`
 - `src/chainparamsseeds.h`
 
-These networks remain placeholders until qbit has release-approved seed inputs.
+`nodes_main.txt` contains the release-approved mainnet launch archive nodes.
 `nodes_testnet4.txt` contains the public testnet4 reset archive-capable fixed
-seeds.
+seeds. The legacy testnet and signet inputs remain empty placeholders.
 
 Do not repopulate these files from Bitcoin-derived data sources.
 
