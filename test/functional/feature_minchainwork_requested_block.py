@@ -33,6 +33,10 @@ class RequestedBlockMinimumChainWorkTest(BitcoinTestFramework):
             [f"-minimumchainwork=0x{MINIMUM_CHAIN_WORK:x}", "-checkblockindex=0", "-fastprune", "-prune=1"],
             [f"-minimumchainwork=0x{MINIMUM_CHAIN_WORK:x}", "-checkblockindex=0"],
         ]
+        # This test uses long, synthetic timestamp sequences to exercise
+        # minimum-chain-work behavior, not future-time validation.
+        for args in self.extra_args:
+            args.append("-testactivationheight=futuretime@10000000")
 
     def submit_header(self, node, block):
         node.submitheader(CBlockHeader(block).serialize().hex())
