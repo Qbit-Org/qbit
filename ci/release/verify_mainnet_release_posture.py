@@ -139,6 +139,40 @@ def strip_cpp_comments(text: str) -> str:
     return "".join(result)
 
 
+def strip_cpp_comments_and_literals(text: str) -> str:
+    """Return only executable-looking C++ tokens, preserving newlines."""
+    text = strip_cpp_comments(text)
+    result: list[str] = []
+    index = 0
+    quote = ""
+    while index < len(text):
+        char = text[index]
+        if not quote:
+            if char in {'"', "'"}:
+                quote = char
+                result.append(" ")
+            else:
+                result.append(char)
+            index += 1
+            continue
+        if char == "\n":
+            result.append(char)
+            index += 1
+            continue
+        if char == "\\" and index + 1 < len(text):
+            if text[index + 1] == "\n":
+                result.append("\n")
+            else:
+                result.append(" ")
+            index += 2
+            continue
+        result.append(" ")
+        if char == quote:
+            quote = ""
+        index += 1
+    return "".join(result)
+
+
 def extract_braced_region(text: str, marker: str, description: str) -> str:
     start = text.find(marker)
     if start == -1:
@@ -233,18 +267,20 @@ def validate_chain_id(sources: dict[str, str]) -> None:
     # when this validator runs without the compiled unit-test suite.
     try:
         test_body = extract_test_body(
-            sources["src/test/pow_tests.cpp"],
+            strip_cpp_comments_and_literals(sources["src/test/pow_tests.cpp"]),
             "ChainParams_MAIN_auxpow_chain_id_is_distinct",
         )
-        required = (
-            "BOOST_CHECK_NE",
-            "main_consensus.nAuxpowChainId",
-            "testnet4_consensus.nAuxpowChainId",
-        )
-        missing = [token for token in required if token not in test_body]
-        if missing:
+        if not re.search(
+            r"\bBOOST_CHECK_NE\s*\(\s*"
+            r"main_consensus\s*\.\s*nAuxpowChainId\s*,\s*"
+            r"testnet4_consensus\s*\.\s*nAuxpowChainId\s*"
+            r"\)\s*;",
+            test_body,
+        ):
             failures.append(
-                "distinctness test is missing assertion token(s): " + ", ".join(missing)
+                "distinctness test must contain a live "
+                "BOOST_CHECK_NE(main_consensus.nAuxpowChainId, "
+                "testnet4_consensus.nAuxpowChainId) assertion"
             )
     except MainnetPostureError as exc:
         failures.append(str(exc))

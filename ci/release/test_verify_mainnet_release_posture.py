@@ -275,6 +275,42 @@ def test_release_builds_default_mainnet_guard_off():
             result.stderr,
         )
 
+    def test_commented_distinctness_assertion_stays_blocked(self) -> None:
+        path = self.root / "src/test/pow_tests.cpp"
+        path.write_text(
+            path.read_text(encoding="utf8").replace(
+                "    BOOST_CHECK_NE(main_consensus.nAuxpowChainId, "
+                "testnet4_consensus.nAuxpowChainId);",
+                "    // BOOST_CHECK_NE(main_consensus.nAuxpowChainId, "
+                "testnet4_consensus.nAuxpowChainId);",
+            ),
+            encoding="utf8",
+        )
+
+        result = self.run_validator()
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("distinctness test must contain a live BOOST_CHECK_NE", result.stderr)
+
+    def test_wrong_distinctness_macro_with_comment_tokens_stays_blocked(self) -> None:
+        path = self.root / "src/test/pow_tests.cpp"
+        path.write_text(
+            path.read_text(encoding="utf8").replace(
+                "    BOOST_CHECK_NE(main_consensus.nAuxpowChainId, "
+                "testnet4_consensus.nAuxpowChainId);",
+                "    BOOST_CHECK_EQUAL(main_consensus.nAuxpowChainId, "
+                "testnet4_consensus.nAuxpowChainId);\n"
+                "    // BOOST_CHECK_NE(main_consensus.nAuxpowChainId, "
+                "testnet4_consensus.nAuxpowChainId);",
+            ),
+            encoding="utf8",
+        )
+
+        result = self.run_validator()
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("distinctness test must contain a live BOOST_CHECK_NE", result.stderr)
+
     def test_auxpow_chain_id_must_fit_its_consensus_field(self) -> None:
         path = self.root / "src/kernel/chainparams.cpp"
         path.write_text(
