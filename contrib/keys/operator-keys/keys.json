@@ -1,15 +1,21 @@
 {
   "schema_version": 2,
-  "policy_id": "qbit-release-keys-testnet-000001",
-  "policy_sequence": 1,
-  "previous_policy_sha256": null,
-  "effective_from_tag": "v0.1.0-testnet4-rc3",
+  "policy_id": "qbit-release-keys-mainnet-000002",
+  "policy_sequence": 2,
+  "previous_policy_sha256": "3084240d8589bb53d376bbf409683871c60d7d154c50b8a192308a61f4f9b2b2",
+  "effective_from_tag": "v1.0.0",
   "release_lines": {
     "testnet": {
       "active_signer_set_size": 3,
       "release_signature_quorum": 2,
       "builder_attestation_quorum": 2,
       "policy_change_quorum": 2
+    },
+    "mainnet": {
+      "active_signer_set_size": 5,
+      "release_signature_quorum": 3,
+      "builder_attestation_quorum": 3,
+      "policy_change_quorum": 3
     }
   },
   "signers": [
@@ -19,7 +25,7 @@
       "key_origin": "external-yubikey",
       "public_key_file": "public-keys/operator-01-release.asc",
       "signing_fingerprint": "289EA3EC2F1939A24984840ED26CFC05586D371E",
-      "release_lines": ["testnet"],
+      "release_lines": ["mainnet", "testnet"],
       "capabilities": ["release-signing", "builder-attestation"],
       "artifact_sets": ["core", "photon"],
       "created": "2026-06-08",
@@ -31,7 +37,7 @@
       "key_origin": "external-yubikey",
       "public_key_file": "public-keys/operator-02-release.asc",
       "signing_fingerprint": "1B95A7AA02F5530BDB1CD92387012E62F6CC1393",
-      "release_lines": ["testnet"],
+      "release_lines": ["mainnet", "testnet"],
       "capabilities": ["release-signing", "builder-attestation"],
       "artifact_sets": ["core", "photon"],
       "created": "2026-06-08",
@@ -43,11 +49,35 @@
       "key_origin": "external-yubikey",
       "public_key_file": "public-keys/operator-03-release.asc",
       "signing_fingerprint": "05A14A415C26F4216DC254FE52D5CC557D764586",
-      "release_lines": ["testnet"],
+      "release_lines": ["mainnet", "testnet"],
       "capabilities": ["release-signing", "builder-attestation"],
       "artifact_sets": ["core", "photon"],
       "created": "2026-06-08",
       "first_release": "v0.1.0-testnet4-rc3"
+    },
+    {
+      "alias": "operator-04",
+      "status": "active",
+      "key_origin": "external-yubikey",
+      "public_key_file": "public-keys/operator-04-release.asc",
+      "signing_fingerprint": "71E5D38304B66183448285AB81859E1B1DEA4ED5",
+      "release_lines": ["mainnet"],
+      "capabilities": ["release-signing", "builder-attestation"],
+      "artifact_sets": ["core", "photon"],
+      "created": "2026-07-07",
+      "first_release": "v1.0.0"
+    },
+    {
+      "alias": "operator-05",
+      "status": "active",
+      "key_origin": "external-yubikey",
+      "public_key_file": "public-keys/operator-05-release.asc",
+      "signing_fingerprint": "D57AB80A8580EC27CDB45455E9FC0931AE6CA9BD",
+      "release_lines": ["mainnet"],
+      "capabilities": ["release-signing", "builder-attestation"],
+      "artifact_sets": ["core", "photon"],
+      "created": "2026-07-14",
+      "first_release": "v1.0.0"
     }
   ]
 }

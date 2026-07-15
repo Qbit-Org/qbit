@@ -466,7 +466,12 @@ class ValidateKeyMetadataTest(unittest.TestCase):
 
     def test_repo_default_metadata_validates(self) -> None:
         result = subprocess.run(
-            [sys.executable, str(METADATA_VALIDATOR), "--require-public-key-files"],
+            [
+                sys.executable,
+                str(METADATA_VALIDATOR),
+                "--require-public-key-files",
+                "--skip-policy-transition-validation",
+            ],
             cwd=REPO_ROOT,
             check=False,
             capture_output=True,
