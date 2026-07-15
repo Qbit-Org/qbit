@@ -17,6 +17,7 @@ TRUSTED_RELEASE_REF_PATHS = [
     "contrib/release-process/publish-local-release.sh",
     "ci/release/test_validate_release_artifacts.py",
     "contrib/keys/operator-keys/KEYS.md",
+    "contrib/guix/repo-templates/qbit-guix.sigs/operator-keys/keys.json",
     "doc/release-trust-0.1.1-testnet4.md",
 ]
 
@@ -74,6 +75,18 @@ class ClassifyMergeProfileTest(unittest.TestCase):
         )
 
         self.assertEqual(classification.profile, classify_merge_profile.RELEASE_POLICY_PROFILE)
+
+    def test_guix_operator_key_mirror_is_release_policy(self) -> None:
+        path = (
+            "contrib/guix/repo-templates/qbit-guix.sigs/operator-keys/"
+            "approvals/qbit-release-keys-mainnet-000002/operator-02.asc"
+        )
+        classification = self.classify([path])
+        outputs = classify_merge_profile.github_outputs(classification)
+
+        self.assertEqual(classification.profile, classify_merge_profile.RELEASE_POLICY_PROFILE)
+        self.assertTrue(classification.release_policy_only)
+        self.assertEqual(outputs["touched_operator_keys"], "true")
 
     def test_p2mr_release_validator_paths_use_release_policy_profile(self) -> None:
         for path in (
