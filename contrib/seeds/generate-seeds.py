@@ -163,8 +163,8 @@ def main():
         sys.exit(1)
     g = sys.stdout
     indir = sys.argv[1]
-    g.write('#ifndef BITCOIN_CHAINPARAMSSEEDS_H\n')
-    g.write('#define BITCOIN_CHAINPARAMSSEEDS_H\n')
+    g.write('#ifndef QBIT_CHAINPARAMSSEEDS_H\n')
+    g.write('#define QBIT_CHAINPARAMSSEEDS_H\n')
     g.write('#include <array>\n')
     g.write('#include <cstdint>\n')
     g.write('\n')
@@ -185,7 +185,7 @@ def main():
     g.write('\n')
     with open(os.path.join(indir,'nodes_testnet4.txt'), 'r', encoding="utf8") as f:
         process_nodes(g, f, 'chainparams_seed_testnet4')
-    g.write('#endif // BITCOIN_CHAINPARAMSSEEDS_H\n')
+    g.write('#endif // QBIT_CHAINPARAMSSEEDS_H\n')
 
 if __name__ == '__main__':
     main()

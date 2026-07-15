@@ -48,13 +48,16 @@ Current protocol constants relevant to miners:
 | Witness scale factor | 1 |
 | Coinbase maturity | 1,000 blocks |
 | Future mainnet P2P / RPC ports | `8355` / `8352` |
+| Future mainnet DNS seeds | `flux-mainnet.qbit.org`, `phase-mainnet.qbit.org` |
+| Future mainnet archive fallbacks | `positron-mainnet.qbit.org:8355`, `graviton-mainnet.qbit.org:8355` |
 | Regtest P2P / RPC ports | `18460` / `18452` |
 | Future mainnet P2MR address HRP | `qb` |
 | Regtest P2MR address HRP | `qbrt` |
 
-The in-tree mainnet AuxPoW chain ID currently matches public testnet as a
-placeholder only. It is not a mainnet launch value and must be replaced with a
-distinct final value before mainnet is enabled or reset.
+MAINNET LAUNCH BLOCKER: the in-tree mainnet AuxPoW chain ID deliberately
+matches public testnet as a conspicuous placeholder. It is not a mainnet launch
+value and must be replaced with the approved production allocation before the
+v1.0.0 tag.
 
 ## Coinbase payout addresses
 

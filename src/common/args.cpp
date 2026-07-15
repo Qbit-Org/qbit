@@ -45,8 +45,8 @@ ArgsManager gArgs;
 
 #if QBIT_TESTNET_ONLY_RELEASE
 static constexpr auto QBIT_TESTNET_ONLY_RELEASE_MAINNET_ERROR{
-    "This qbit build is for public testnet4 only. Start with -testnet4 or -chain=testnet4. "
-    "Mainnet is not launched, and the in-tree mainnet genesis is a development placeholder."};
+    "This qbit build intentionally disables mainnet chain selection. "
+    "Start with -testnet4 or -chain=testnet4."};
 #endif
 
 void CheckTestnetOnlyReleaseChain(ChainType chain)

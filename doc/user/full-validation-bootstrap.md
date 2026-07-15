@@ -53,16 +53,16 @@ Example command:
 
 ```bash
 qbitd -assumevalid=0 \
-  -connectarchive=<archive-host-1>:8355 \
-  -connectarchive=<archive-host-2>:8355
+  -connectarchive=positron-mainnet.qbit.org:8355 \
+  -connectarchive=graviton-mainnet.qbit.org:8355
 ```
 
 Example `qbit.conf` fragment:
 
 ```ini
 assumevalid=0
-connectarchive=<archive-host-1>:8355
-connectarchive=<archive-host-2>:8355
+connectarchive=positron-mainnet.qbit.org:8355
+connectarchive=graviton-mainnet.qbit.org:8355
 ```
 
 Notes:
@@ -97,12 +97,13 @@ For users, the important distinction is whether the default path works or the
 published fallback endpoints are needed. If neither path works, there is no
 supported public full-validation bootstrap path for that network at that time.
 
-## Current Repo State
+## Mainnet launch resources
 
-This repository can document the supported flow before public infrastructure is
-live, but deployment-specific seed hostnames and published archive endpoints
-are tracked separately.
+The v1.0.0 launch source includes these automatic DNS seeds:
 
-If the project has not yet published live archive fallback endpoints for the
-network you are trying to use, this guide defines the supported flow but does
-not by itself create working public infrastructure.
+- `flux-mainnet.qbit.org`
+- `phase-mainnet.qbit.org`
+
+The two archive fallbacks above are also compiled into v1.0.0 as fixed seed
+addresses. Use qbit.org and the matching release notes to confirm current
+network-resource status before relying on them operationally.

@@ -110,8 +110,8 @@ release or network through qbit.org:
 
 ```bash
 qbitd -daemonwait \
-  -connectarchive=<archive-host-1>:8355 \
-  -connectarchive=<archive-host-2>:8355
+  -connectarchive=positron-mainnet.qbit.org:8355 \
+  -connectarchive=graviton-mainnet.qbit.org:8355
 ```
 
 Then inspect archive peer state:

@@ -22,6 +22,7 @@ qbit repository. Examples:
 
 - `v0.1.0-testnet4-rc1`
 - `v0.1.1-testnet4`
+- `v1.0.0`
 
 The tag target commit is the source commit used for release builds. Do not use a
 private source commit, a sanitizer mapping, a branch name, a short SHA, or a tag
@@ -75,6 +76,8 @@ The publisher validates:
   manifest is bound to the source archive reconstructed from the signed tag
   target
 - testnet posture evidence passes when `release_line=testnet`
+- the signed tag target passes the fail-closed mainnet launch-posture validator
+  when `release_line=mainnet`
 - the draft release body exactly matches the explicit or generated release notes
   selected by the publisher
 - the draft release asset names and GitHub-computed SHA256 digests exactly match
@@ -86,6 +89,68 @@ The publisher validates:
 
 Testnet posture evidence is mandatory for `release_line=testnet`; the publisher
 fails closed when `--testnet-posture-evidence` is missing.
+
+## Mainnet launch posture gate
+
+Mainnet publication automatically runs
+`ci/release/verify_mainnet_release_posture.py` against the peeled signed-tag
+target. The validator does not inspect mutable working-tree replacements for
+tagged source files and has no waiver.
+
+Core Checks also runs this same validator in the required `mainnet publication
+posture` job for source and release-policy changes targeting the `1.0.0` branch.
+This explicitly includes the lightweight profile used by changes to release
+validators and publishing scripts. CI creates an annotated tag at the exact
+checked-out candidate commit so that this early check exercises the validator's
+immutable tag-target path.
+
+`ci/release/mainnet_ci_posture.json` separates merge posture from publication
+posture without weakening the publisher. In `staging` phase, Core Checks
+requires the real validator to fail for exactly the declared launch blockers;
+missing expected failures or additional bootstrap, default-chain, or source
+failures fail CI. When the final commitments land, the same change must set the
+policy to `final` and clear its expected failures, at which point Core Checks
+requires the validator to succeed. A publication-ready result while the policy
+still says `staging` also fails CI.
+
+The local publisher does not read this CI phase policy. It remains the authority
+for publication and independently requires unconditional validator success
+against the real signed public tag after verifying that tag's GitHub signature
+and ancestry. There is no staging mode or publication waiver.
+
+It fails closed unless:
+
+- the mainnet AuxPoW chain ID is non-placeholder, differs from testnet4, and
+  has a unit-test assertion for that distinction;
+- the mainnet genesis and ASERT launch artifact records final source provenance
+  without draft, temporary, replacement, or placeholder markers;
+- chainparams retain pinned genesis-hash, Merkle-root, and ASERT assertions;
+- at least two unique DNS seeds and two unique numeric fixed seeds are present,
+  the generated BIP155 fixed-seed bytes exactly match `nodes_main.txt`, and the
+  bootstrap unit test asserts the published seed set and zero launch-size
+  estimates; and
+- CMake and Guix default `QBIT_TESTNET_ONLY_RELEASE` to `OFF`, Guix does not
+  infer posture from an archive name, and unit tests assert that default and
+  explicit mainnet selection are accepted in a standard build.
+
+The v1.0.0 preparation branch is expected to build while the real publication
+gate rejects its deliberate chain-ID and genesis/ASERT placeholders. Core
+Checks accepts that state only when those are the exact two reported failure
+categories. Both failures must become successes, and the CI policy must move to
+`final`, before any mainnet draft release can be created or published.
+
+## Mainnet-capable build default
+
+Standard source and Guix builds default to
+`QBIT_TESTNET_ONLY_RELEASE=OFF`, regardless of the distribution archive name.
+This makes mainnet chain selection available in ordinary v1.0.0 binaries.
+
+A testnet-only package remains available as an explicit opt-in by configuring
+with `-DQBIT_TESTNET_ONLY_RELEASE=ON` or setting
+`QBIT_TESTNET_ONLY_RELEASE=ON` for the Guix build. Such a binary rejects both
+no-flag mainnet startup and explicit `-chain=main` startup. Release builders
+must record the selected value; package naming must not be used as evidence of
+the compiled chain posture.
 
 ## qbit P2MR v1 Conformance
 

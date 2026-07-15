@@ -652,6 +652,7 @@ class ReleasePublisherBoundaryTest(unittest.TestCase):
         self.assertIn("verify_remote_tag_pin post-publication", publisher)
         self.assertIn("merge-base --is-ancestor", publisher)
         self.assertIn("ci/release/validate_release_artifacts.py", publisher)
+        self.assertIn("ci/release/verify_mainnet_release_posture.py", publisher)
         self.assertIn("ci/release/verify_testnet_release_posture.py", publisher)
         self.assertIn('--source-root "$TRUSTED_ROOT"', publisher)
         self.assertIn('--expected-tag-target "$TAG_TARGET"', publisher)
