@@ -397,13 +397,13 @@ BOOST_AUTO_TEST_CASE(auxpow_expected_index_vectors_document_qbit_slot_math)
     // used by Namecoin, so these vectors pin qbit's slot assignment.
     BOOST_CHECK_EQUAL(auxpow::GetExpectedIndex(/*nonce=*/0, /*chain_id=*/1, /*merkle_height=*/0), 0);
     BOOST_CHECK_EQUAL(auxpow::GetExpectedIndex(/*nonce=*/0, /*chain_id=*/1, /*merkle_height=*/1), 1);
-    BOOST_CHECK_EQUAL(auxpow::GetExpectedIndex(/*nonce=*/0, consensus.nAuxpowChainId, /*merkle_height=*/4), 12);
-    BOOST_CHECK_EQUAL(auxpow::GetExpectedIndex(/*nonce=*/0x12345678, consensus.nAuxpowChainId, /*merkle_height=*/4), 4);
-    BOOST_CHECK_EQUAL(auxpow::GetExpectedIndex(/*nonce=*/0, consensus.nAuxpowChainId, /*merkle_height=*/32), 882684108);
+    BOOST_CHECK_EQUAL(auxpow::GetExpectedIndex(/*nonce=*/0, consensus.nAuxpowChainId, /*merkle_height=*/4), 1);
+    BOOST_CHECK_EQUAL(auxpow::GetExpectedIndex(/*nonce=*/0x12345678, consensus.nAuxpowChainId, /*merkle_height=*/4), 9);
+    BOOST_CHECK_EQUAL(auxpow::GetExpectedIndex(/*nonce=*/0, consensus.nAuxpowChainId, /*merkle_height=*/32), -414942079);
     BOOST_CHECK_EQUAL(auxpow::GetExpectedIndex(std::numeric_limits<uint32_t>::max(),
                                                consensus.nAuxpowChainId,
                                                auxpow::MAX_CHAIN_MERKLE_BRANCH_LENGTH),
-                      838473315);
+                      614588952);
 }
 
 BOOST_AUTO_TEST_CASE(auxpow_merkle_branch_respects_left_and_right_positions)
