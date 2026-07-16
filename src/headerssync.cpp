@@ -64,7 +64,12 @@ HeadersSyncState::HeadersSyncState(NodeId id, const Consensus::Params& consensus
     // could try again, if necessary, to sync a longer chain).
     // Header sync must admit histories produced under the legacy two-hour
     // future-time rule, even when the v2 rule is active at the current tip.
-    m_max_commitments = 6*(Ticks<std::chrono::seconds>(NodeClock::now() - NodeSeconds{std::chrono::seconds{chain_start->GetMedianTimePast()}}) + MAX_FUTURE_BLOCK_TIME_LEGACY) / HEADER_COMMITMENT_PERIOD;
+    const int64_t commitment_time{
+        Ticks<std::chrono::seconds>(NodeClock::now() - NodeSeconds{std::chrono::seconds{chain_start->GetMedianTimePast()}}) +
+        MAX_FUTURE_BLOCK_TIME_LEGACY};
+    if (commitment_time > 0) {
+        m_max_commitments = 6 * static_cast<uint64_t>(commitment_time) / HEADER_COMMITMENT_PERIOD;
+    }
     m_presync_difficulty = MakeHeaderDifficultyState();
     m_redownload_difficulty = MakeHeaderDifficultyState();
 

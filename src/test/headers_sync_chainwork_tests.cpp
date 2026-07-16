@@ -12,6 +12,7 @@
 #include <serialize.h>
 #include <test/util/setup_common.h>
 #include <util/chaintype.h>
+#include <util/time.h>
 #include <validation.h>
 
 #include <deque>
@@ -290,6 +291,19 @@ BOOST_AUTO_TEST_CASE(headers_sync_state)
     BOOST_CHECK(result.success);
 }
 
+BOOST_AUTO_TEST_CASE(headers_sync_future_chain_start_does_not_wrap_commitment_limit)
+{
+    const auto chain_params = CreateChainParams(*m_node.args, ChainType::MAIN);
+    const auto& consensus = chain_params->GetConsensus();
+    CBlockIndex genesis{chain_params->GenesisBlock()};
+    const uint256 genesis_hash{chain_params->GenesisBlock().GetHash()};
+    FinalizeIndex(genesis, genesis_hash, /*pprev=*/nullptr, /*height=*/0, /*auxpow_count=*/0, GetBlockProof(genesis));
+
+    SetMockTime(genesis.GetMedianTimePast() - MAX_FUTURE_BLOCK_TIME_LEGACY - 1);
+    HeadersSyncState hss{/*id=*/0, consensus, &genesis, genesis.nChainWork};
+    BOOST_CHECK(hss.GetState() == HeadersSyncState::State::PRESYNC);
+}
+
 BOOST_AUTO_TEST_CASE(headers_sync_accepts_genesis_to_permissionless_anchor_jumps)
 {
     // These shipped networks fail on current develop because presync compares
@@ -395,6 +409,7 @@ BOOST_AUTO_TEST_CASE(headers_sync_uses_cached_starved_lane_history)
                                           chain.back().nTime + 1,
                                           /*n_bits=*/0);
         resumed.nBits = GetNextWorkRequired(&chain.back(), &resumed, consensus);
+        SetMockTime(chain.back().GetMedianTimePast() + 1);
         AssertHeadersSyncAccepts(consensus, chain.back(), {resumed});
     }
 }
