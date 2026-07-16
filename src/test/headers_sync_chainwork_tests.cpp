@@ -20,6 +20,25 @@
 
 #include <boost/test/unit_test.hpp>
 
+namespace {
+class ScopedMockTime
+{
+public:
+    explicit ScopedMockTime(std::chrono::seconds mock_time) : m_previous{GetMockTime()}
+    {
+        SetMockTime(mock_time);
+    }
+
+    ~ScopedMockTime()
+    {
+        SetMockTime(m_previous);
+    }
+
+private:
+    const std::chrono::seconds m_previous;
+};
+} // namespace
+
 struct HeadersGeneratorSetup : public RegTestingSetup {
     /** Search for a nonce to meet (regtest) proof of work */
     void FindProofOfWork(CBlockHeader& starting_header);
@@ -299,7 +318,7 @@ BOOST_AUTO_TEST_CASE(headers_sync_future_chain_start_does_not_wrap_commitment_li
     const uint256 genesis_hash{chain_params->GenesisBlock().GetHash()};
     FinalizeIndex(genesis, genesis_hash, /*pprev=*/nullptr, /*height=*/0, /*auxpow_count=*/0, GetBlockProof(genesis));
 
-    SetMockTime(genesis.GetMedianTimePast() - MAX_FUTURE_BLOCK_TIME_LEGACY - 1);
+    const ScopedMockTime mock_time{std::chrono::seconds{genesis.GetMedianTimePast() - MAX_FUTURE_BLOCK_TIME_LEGACY - 1}};
     HeadersSyncState hss{/*id=*/0, consensus, &genesis, genesis.nChainWork};
     BOOST_CHECK(hss.GetState() == HeadersSyncState::State::PRESYNC);
 }
@@ -409,7 +428,7 @@ BOOST_AUTO_TEST_CASE(headers_sync_uses_cached_starved_lane_history)
                                           chain.back().nTime + 1,
                                           /*n_bits=*/0);
         resumed.nBits = GetNextWorkRequired(&chain.back(), &resumed, consensus);
-        SetMockTime(chain.back().GetMedianTimePast() + 1);
+        const ScopedMockTime mock_time{std::chrono::seconds{chain.back().GetMedianTimePast() + 1}};
         AssertHeadersSyncAccepts(consensus, chain.back(), {resumed});
     }
 }
