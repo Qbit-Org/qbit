@@ -844,6 +844,11 @@ void BitcoinGUI::setCurrentWalletBySelectorIndex(int index)
     if (wallet_model) setCurrentWallet(wallet_model);
 }
 
+void BitcoinGUI::prepareWalletsForShutdown()
+{
+    if (walletFrame) walletFrame->prepareForShutdown();
+}
+
 void BitcoinGUI::removeAllWallets()
 {
     if (!walletFrame) return;

@@ -211,18 +211,29 @@ void AppTests::appTests()
         QVERIFY(!widget->inherits("SendConfirmationDialog"));
     }
 #endif // ENABLE_WALLET
+}
 
+void AppTests::cleanup()
+{
 #ifdef ENABLE_WALLET
-    // WalletLoader::createWallet persists startup entries. Remove test-only
-    // entries so later options tests see their original settings fixture.
-    gArgs.LockSettings([](common::Settings& settings) {
-        settings.rw_settings.erase("wallet");
-    });
-    QVERIFY(gArgs.WriteSettingsFile());
+    bool settings_written{true};
+    if (m_remove_test_wallet_settings) {
+        // WalletLoader::createWallet persists startup entries. Remove
+        // test-only entries so later options tests see their original fixture.
+        gArgs.LockSettings([](common::Settings& settings) {
+            settings.rw_settings.erase("wallet");
+        });
+        settings_written = gArgs.WriteSettingsFile();
+        m_remove_test_wallet_settings = false;
+    }
 #endif // ENABLE_WALLET
 
-    // Reset global state to avoid interfering with later tests.
+    // Reset global state even when a QVERIFY returns early from appTests().
     LogInstance().DisconnectTestLogger();
+
+#ifdef ENABLE_WALLET
+    QVERIFY(settings_written);
+#endif // ENABLE_WALLET
 }
 
 //! Entry point for BitcoinGUI tests.
@@ -234,6 +245,7 @@ void AppTests::guiTests(BitcoinGUI* window)
     WalletController* const controller{window->getWalletController()};
     QVERIFY(controller);
 
+    m_remove_test_wallet_settings = true;
     for (const std::string name : {"qt-shutdown-lifetime-1", "qt-shutdown-lifetime-2"}) {
         QSignalSpy wallet_added_spy(controller, &WalletController::walletAdded);
         QVERIFY(wallet_added_spy.isValid());

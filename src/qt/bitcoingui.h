@@ -90,6 +90,7 @@ public:
     */
     void addWallet(WalletModel* walletModel);
     void removeWallet(WalletModel* walletModel);
+    void prepareWalletsForShutdown();
     void removeAllWallets();
 #endif // ENABLE_WALLET
     bool enableWallet = false;
