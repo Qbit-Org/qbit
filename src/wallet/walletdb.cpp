@@ -1478,6 +1478,9 @@ static bool RunWithinTxn(WalletBatch& batch, std::string_view process_desc, cons
 
     if (!batch.TxnCommit()) {
         LogDebug(BCLog::WALLETDB, "Error: cannot commit db txn for %s\n", process_desc);
+        if (batch.HasActiveTxn() && !batch.TxnAbort()) {
+            LogDebug(BCLog::WALLETDB, "Error: cannot abort db txn after commit failure for %s\n", process_desc);
+        }
         return false;
     }
 
@@ -1541,12 +1544,24 @@ bool WalletBatch::TxnBegin()
     return m_batch->TxnBegin();
 }
 
+WalletBatch::~WalletBatch()
+{
+    if (!HasActiveTxn()) return;
+    try {
+        if (!TxnAbort()) {
+            LogDebug(BCLog::WALLETDB, "Error: cannot abort active db txn while destroying wallet batch\n");
+        }
+    } catch (const std::exception& e) {
+        LogDebug(BCLog::WALLETDB, "Error aborting active db txn while destroying wallet batch: %s\n", e.what());
+    }
+}
+
 bool WalletBatch::TxnCommit()
 {
     bool res = m_batch->TxnCommit();
     if (res) {
         for (const auto& listener : m_txn_listeners) {
-            listener.on_commit();
+            if (listener.on_commit) listener.on_commit();
         }
         // txn finished, clear listeners
         m_txn_listeners.clear();
@@ -1558,8 +1573,8 @@ bool WalletBatch::TxnAbort()
 {
     bool res = m_batch->TxnAbort();
     if (res) {
-        for (const auto& listener : m_txn_listeners) {
-            listener.on_abort();
+        for (auto it = m_txn_listeners.rbegin(); it != m_txn_listeners.rend(); ++it) {
+            if (it->on_abort) it->on_abort();
         }
         // txn finished, clear listeners
         m_txn_listeners.clear();

@@ -10,6 +10,7 @@
 #include <wallet/scriptpubkeyman.h>
 
 #include <memory>
+#include <optional>
 #include <span>
 
 class ArgsManager;
@@ -69,6 +70,8 @@ class MockableBatch : public DatabaseBatch
 {
 private:
     MockableDatabase& m_database;
+    bool m_txn_active{false};
+    std::optional<MockableData> m_txn_snapshot;
 
     bool ReadKey(DataStream&& key, DataStream& value) override;
     bool WriteKey(DataStream&& key, DataStream&& value, bool overwrite=true) override;
@@ -78,16 +81,16 @@ private:
 
 public:
     explicit MockableBatch(MockableDatabase& database) : m_database(database) {}
-    ~MockableBatch() = default;
+    ~MockableBatch() override;
 
-    void Close() override {}
+    void Close() override;
 
     std::unique_ptr<DatabaseCursor> GetNewCursor() override;
     std::unique_ptr<DatabaseCursor> GetNewPrefixCursor(std::span<const std::byte> prefix) override;
     bool TxnBegin() override;
     bool TxnCommit() override;
     bool TxnAbort() override;
-    bool HasActiveTxn() override { return false; }
+    bool HasActiveTxn() override { return m_txn_active; }
 };
 
 /** A WalletDatabase whose contents and return values can be modified as needed for testing

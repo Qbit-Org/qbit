@@ -927,6 +927,7 @@ std::optional<MigrationData> LegacyDataSPKM::MigrateToDescriptor()
 
     // Finalize transaction
     if (!batch.TxnCommit()) {
+        if (batch.HasActiveTxn()) batch.TxnAbort();
         LogPrintf("Error generating descriptors for migration, cannot commit db transaction\n");
         return std::nullopt;
     }
@@ -1212,22 +1213,35 @@ DescriptorScriptPubKeyMan::TopUpPreparation DescriptorScriptPubKeyMan::PrepareTo
 util::Result<void> DescriptorScriptPubKeyMan::TopUpWithInternalHintResult(std::optional<bool> internal_hint, unsigned int size)
 {
     const TopUpPreparation prepared{PrepareTopUp(internal_hint)};
-    LOCK(cs_desc_man);
-    // Keep descriptor and database lock ordering aligned with address reservation.
-    WalletBatch batch(m_storage.GetDatabase());
-    if (!batch.TxnBegin()) {
-        return util::Error{_("Error starting descriptors keypool top-up database transaction")};
-    }
-    util::Result<void> res{TopUpWithDBPreparedResult(batch, size, prepared, /*throw_on_persistence_error=*/false, /*rollback_state_on_error=*/true)};
-    if (!res) {
-        if (!batch.TxnAbort()) {
-            throw std::runtime_error(strprintf(
-                "Error during descriptors keypool top up. Cannot abort changes for wallet [%s]: %s",
-                m_storage.LogName(), util::ErrorString(res).original));
+    std::shared_ptr<TopUpChange> change;
+    {
+        LOCK(cs_desc_man);
+        // Keep descriptor and database lock ordering aligned with address reservation.
+        WalletBatch batch(m_storage.GetDatabase());
+        if (!batch.TxnBegin()) {
+            return util::Error{_("Error starting descriptors keypool top-up database transaction")};
         }
-        return res;
+        util::Result<std::shared_ptr<TopUpChange>> res{TopUpWithDBPreparedResult(batch, size, prepared, /*throw_on_persistence_error=*/false, /*rollback_state_on_error=*/true)};
+        if (!res) {
+            if (!batch.TxnAbort()) {
+                throw std::runtime_error(strprintf(
+                    "Error during descriptors keypool top up. Cannot abort changes for wallet [%s]: %s",
+                    m_storage.LogName(), util::ErrorString(res).original));
+            }
+            return util::Error{util::ErrorString(res)};
+        }
+        change = *res;
+        if (!batch.TxnCommit()) {
+            const bool aborted{!batch.HasActiveTxn() || batch.TxnAbort()};
+            change->rollback();
+            if (!aborted) {
+                throw std::runtime_error(strprintf("Error during descriptors keypool top up. Cannot abort changes after commit failure for wallet [%s]", m_storage.LogName()));
+            }
+            throw std::runtime_error(strprintf("Error during descriptors keypool top up. Cannot commit changes for wallet [%s]", m_storage.LogName()));
+        }
     }
-    if (!batch.TxnCommit()) throw std::runtime_error(strprintf("Error during descriptors keypool top up. Cannot commit changes for wallet [%s]", m_storage.LogName()));
+
+    PublishTopUp(*change);
     return {};
 }
 
@@ -1239,27 +1253,56 @@ bool DescriptorScriptPubKeyMan::TopUpWithDB(WalletBatch& batch, unsigned int siz
 util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBResult(WalletBatch& batch, unsigned int size, std::optional<bool> internal_hint, bool throw_on_persistence_error, bool rollback_state_on_error)
 {
     const TopUpPreparation prepared{PrepareTopUp(internal_hint)};
-    LOCK(cs_desc_man);
-    return TopUpWithDBPreparedResult(batch, size, prepared, throw_on_persistence_error, rollback_state_on_error);
+    std::shared_ptr<TopUpChange> change;
+    {
+        LOCK(cs_desc_man);
+        util::Result<std::shared_ptr<TopUpChange>> res{TopUpWithDBPreparedResult(batch, size, prepared, throw_on_persistence_error, rollback_state_on_error || batch.HasActiveTxn())};
+        if (!res) return util::Error{util::ErrorString(res)};
+        change = *res;
+        if (batch.HasActiveTxn()) {
+            try {
+                RegisterTopUpTxnListener(batch, change);
+            } catch (...) {
+                change->rollback();
+                throw;
+            }
+            return {};
+        }
+    }
+
+    PublishTopUp(*change);
+    return {};
 }
 
-util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBPreparedResult(WalletBatch& batch, unsigned int size, const TopUpPreparation& prepared, bool throw_on_persistence_error, bool rollback_state_on_error)
+util::Result<std::shared_ptr<DescriptorScriptPubKeyMan::TopUpChange>> DescriptorScriptPubKeyMan::TopUpWithDBPreparedResult(WalletBatch& batch, unsigned int size, const TopUpPreparation& prepared, bool throw_on_persistence_error, bool rollback_state_on_error)
 {
     AssertLockHeld(cs_desc_man);
-    const int32_t old_range_start{m_wallet_descriptor.range_start};
-    const int32_t old_range_end{m_wallet_descriptor.range_end};
-    const std::optional<bool> old_descriptor_deferred_create_keypool_top_up{m_wallet_descriptor.deferred_create_keypool_top_up};
-    const int32_t old_max_cached_index{m_max_cached_index};
-    const bool old_deferred_create_keypool_top_up{m_deferred_create_keypool_top_up};
-    DescriptorCache added_cache_items;
-    std::map<CScript, std::optional<int32_t>> old_script_pub_key_values;
-    std::set<CPubKey> added_pubkeys;
     struct OldPQCKeyState {
         std::optional<CPQCKey> key;
         std::optional<CryptedPQCKeyRecord> crypted_key;
         std::optional<uint32_t> sig_counter;
     };
-    std::map<CPQCPubKey, OldPQCKeyState> old_pqc_key_values;
+    struct TopUpRollbackState {
+        int32_t old_range_start;
+        int32_t old_range_end;
+        std::optional<bool> old_descriptor_deferred_create_keypool_top_up;
+        int32_t old_max_cached_index;
+        bool old_deferred_create_keypool_top_up;
+        DescriptorCache added_cache_items;
+        std::map<CScript, std::optional<int32_t>> old_script_pub_key_values;
+        std::set<CPubKey> added_pubkeys;
+        std::map<CPQCPubKey, OldPQCKeyState> old_pqc_key_values;
+    };
+    auto rollback_state{std::make_shared<TopUpRollbackState>(
+        m_wallet_descriptor.range_start,
+        m_wallet_descriptor.range_end,
+        m_wallet_descriptor.deferred_create_keypool_top_up,
+        m_max_cached_index,
+        m_deferred_create_keypool_top_up)};
+    DescriptorCache& added_cache_items{rollback_state->added_cache_items};
+    auto& old_script_pub_key_values{rollback_state->old_script_pub_key_values};
+    auto& added_pubkeys{rollback_state->added_pubkeys};
+    auto& old_pqc_key_values{rollback_state->old_pqc_key_values};
     bool has_persisted_top_up_writes{false};
     const auto remember_script_pub_key = [&](const CScript& script) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man) {
         if (old_script_pub_key_values.contains(script)) return;
@@ -1280,23 +1323,23 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBPreparedResult(WalletBa
         }
         old_pqc_key_values.emplace(pubkey, std::move(state));
     };
-    const auto restore_top_up_state = [&]() EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man) {
-        m_wallet_descriptor.range_start = old_range_start;
-        m_wallet_descriptor.range_end = old_range_end;
-        m_wallet_descriptor.deferred_create_keypool_top_up = old_descriptor_deferred_create_keypool_top_up;
-        m_wallet_descriptor.cache.Remove(added_cache_items);
-        m_max_cached_index = old_max_cached_index;
-        for (const auto& [script, old_index] : old_script_pub_key_values) {
+    const auto restore_top_up_state = [this, rollback_state]() EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man) {
+        m_wallet_descriptor.range_start = rollback_state->old_range_start;
+        m_wallet_descriptor.range_end = rollback_state->old_range_end;
+        m_wallet_descriptor.deferred_create_keypool_top_up = rollback_state->old_descriptor_deferred_create_keypool_top_up;
+        m_wallet_descriptor.cache.Remove(rollback_state->added_cache_items);
+        m_max_cached_index = rollback_state->old_max_cached_index;
+        for (const auto& [script, old_index] : rollback_state->old_script_pub_key_values) {
             if (old_index) {
                 m_map_script_pub_keys[script] = *old_index;
             } else {
                 m_map_script_pub_keys.erase(script);
             }
         }
-        for (const CPubKey& pubkey : added_pubkeys) {
+        for (const CPubKey& pubkey : rollback_state->added_pubkeys) {
             m_map_pubkeys.erase(pubkey);
         }
-        for (const auto& [pubkey, old_state] : old_pqc_key_values) {
+        for (const auto& [pubkey, old_state] : rollback_state->old_pqc_key_values) {
             if (old_state.key) {
                 m_map_pqc_keys[pubkey] = *old_state.key;
             } else {
@@ -1313,18 +1356,18 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBPreparedResult(WalletBa
                 m_map_pqc_sig_counters.erase(pubkey);
             }
         }
-        m_deferred_create_keypool_top_up = old_deferred_create_keypool_top_up;
+        m_deferred_create_keypool_top_up = rollback_state->old_deferred_create_keypool_top_up;
     };
     const auto restore_top_up_state_if_safe = [&](bool persistence_write_may_have_started) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man) {
         if (rollback_state_on_error || (!persistence_write_may_have_started && !has_persisted_top_up_writes)) {
             restore_top_up_state();
         }
     };
-    const auto top_up_error = [&](bilingual_str error) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man) -> util::Result<void> {
+    const auto top_up_error = [&](bilingual_str error) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man) -> util::Result<std::shared_ptr<TopUpChange>> {
         restore_top_up_state_if_safe(/*persistence_write_may_have_started=*/false);
         return util::Error{std::move(error)};
     };
-    const auto persistence_error = [&](bilingual_str error, bool persistence_write_may_have_started = true) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man) -> util::Result<void> {
+    const auto persistence_error = [&](bilingual_str error, bool persistence_write_may_have_started = true) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man) -> util::Result<std::shared_ptr<TopUpChange>> {
         restore_top_up_state_if_safe(persistence_write_may_have_started);
         if (throw_on_persistence_error) throw std::runtime_error(error.original);
         return util::Error{std::move(error)};
@@ -1502,9 +1545,27 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBPreparedResult(WalletBa
     // By this point, the cache size should be the size of the entire range
     assert(m_wallet_descriptor.range_end - 1 == m_max_cached_index);
 
-    m_storage.TopUpCallback(new_spks, this);
+    auto change{std::make_shared<TopUpChange>()};
+    change->new_spks = std::move(new_spks);
+    change->rollback = restore_top_up_state;
+    return change;
+}
+
+void DescriptorScriptPubKeyMan::PublishTopUp(const TopUpChange& change)
+{
+    m_storage.TopUpCallback(change.new_spks, this);
     NotifyCanGetAddressesChanged();
-    return {};
+}
+
+void DescriptorScriptPubKeyMan::RegisterTopUpTxnListener(WalletBatch& batch, const std::shared_ptr<TopUpChange>& change)
+{
+    batch.RegisterTxnListener({
+        .on_commit = [this, change] { PublishTopUp(*change); },
+        .on_abort = [this, change] {
+            LOCK(cs_desc_man);
+            change->rollback();
+        },
+    });
 }
 
 std::vector<WalletDestination> DescriptorScriptPubKeyMan::MarkUnusedAddresses(const CScript& script, const MarkUnusedAddressesOptions& options)
@@ -2781,33 +2842,35 @@ uint256 DescriptorScriptPubKeyMan::GetID() const
 
 void DescriptorScriptPubKeyMan::SetCache(const DescriptorCache& cache)
 {
-    LOCK(cs_desc_man);
     std::set<CScript> new_spks;
-    m_wallet_descriptor.cache = cache;
-    for (int32_t i = m_wallet_descriptor.range_start; i < m_wallet_descriptor.range_end; ++i) {
-        FlatSigningProvider out_keys;
-        std::vector<CScript> scripts_temp;
-        if (!m_wallet_descriptor.descriptor->ExpandFromCache(i, m_wallet_descriptor.cache, scripts_temp, out_keys)) {
-            throw std::runtime_error("Error: Unable to expand wallet descriptor from cache");
-        }
-        // Add all of the scriptPubKeys to the scriptPubKey set
-        new_spks.insert(scripts_temp.begin(), scripts_temp.end());
-        for (const CScript& script : scripts_temp) {
-            if (m_map_script_pub_keys.count(script) != 0) {
-                throw std::runtime_error(strprintf("Error: Already loaded script at index %d as being at index %d", i, m_map_script_pub_keys[script]));
+    {
+        LOCK(cs_desc_man);
+        m_wallet_descriptor.cache = cache;
+        for (int32_t i = m_wallet_descriptor.range_start; i < m_wallet_descriptor.range_end; ++i) {
+            FlatSigningProvider out_keys;
+            std::vector<CScript> scripts_temp;
+            if (!m_wallet_descriptor.descriptor->ExpandFromCache(i, m_wallet_descriptor.cache, scripts_temp, out_keys)) {
+                throw std::runtime_error("Error: Unable to expand wallet descriptor from cache");
             }
-            m_map_script_pub_keys[script] = i;
-        }
-        for (const auto& pk_pair : out_keys.pubkeys) {
-            const CPubKey& pubkey = pk_pair.second;
-            if (m_map_pubkeys.count(pubkey) != 0) {
-                // We don't need to give an error here.
-                // It doesn't matter which of many valid indexes the pubkey has, we just need an index where we can derive it and its private key
-                continue;
+            // Add all of the scriptPubKeys to the scriptPubKey set
+            new_spks.insert(scripts_temp.begin(), scripts_temp.end());
+            for (const CScript& script : scripts_temp) {
+                if (m_map_script_pub_keys.count(script) != 0) {
+                    throw std::runtime_error(strprintf("Error: Already loaded script at index %d as being at index %d", i, m_map_script_pub_keys[script]));
+                }
+                m_map_script_pub_keys[script] = i;
             }
-            m_map_pubkeys[pubkey] = i;
+            for (const auto& pk_pair : out_keys.pubkeys) {
+                const CPubKey& pubkey = pk_pair.second;
+                if (m_map_pubkeys.count(pubkey) != 0) {
+                    // We don't need to give an error here.
+                    // It doesn't matter which of many valid indexes the pubkey has, we just need an index where we can derive it and its private key
+                    continue;
+                }
+                m_map_pubkeys[pubkey] = i;
+            }
+            m_max_cached_index++;
         }
-        m_max_cached_index++;
     }
     // Make sure the wallet knows about our new spks
     m_storage.TopUpCallback(new_spks, this);

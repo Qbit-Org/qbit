@@ -492,7 +492,7 @@ private:
     void SetWalletFlagWithDB(WalletBatch& batch, uint64_t flags);
 
     //! Cache of descriptor ScriptPubKeys used for IsMine. Maps ScriptPubKey to set of spkms
-    std::unordered_map<CScript, std::vector<ScriptPubKeyMan*>, SaltedSipHasher> m_cached_spks;
+    std::unordered_map<CScript, std::vector<ScriptPubKeyMan*>, SaltedSipHasher> m_cached_spks GUARDED_BY(cs_wallet);
 
     //! Set of both spent and unspent transaction outputs owned by this wallet
     std::unordered_map<COutPoint, WalletTXO, SaltedOutpointHasher> m_txos GUARDED_BY(cs_wallet);
@@ -1166,7 +1166,7 @@ public:
     bool CanGrindR() const;
 
     //! Add scriptPubKeys for this ScriptPubKeyMan into the scriptPubKey cache
-    void CacheNewScriptPubKeys(const std::set<CScript>& spks, ScriptPubKeyMan* spkm);
+    void CacheNewScriptPubKeys(const std::set<CScript>& spks, ScriptPubKeyMan* spkm) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     void TopUpCallback(const std::set<CScript>& spks, ScriptPubKeyMan* spkm) override;
 
