@@ -383,15 +383,18 @@ void RunScheduledPendingInitialKeyPoolTopUp(const std::shared_ptr<DeferredCreate
     }
     const auto step_result = wallet->RunPendingInitialKeyPoolTopUpStep();
     if (step_result == CWallet::PendingInitialKeyPoolTopUpStepResult::COMPLETE) {
+        WITH_LOCK(wallet->cs_wallet, wallet->m_deferred_create_keypool_top_up_scheduled = false);
         wallet->WalletLogPrintf("Deferred create-time keypool top up completed in %15dms\n",
             Ticks<std::chrono::milliseconds>(SteadyClock::now() - *state->refill_start));
         return;
     }
     if (step_result == CWallet::PendingInitialKeyPoolTopUpStepResult::FAILED) {
+        WITH_LOCK(wallet->cs_wallet, wallet->m_deferred_create_keypool_top_up_scheduled = false);
         wallet->WalletLogPrintf("Deferred create-time keypool top up paused after a failed background step\n");
         return;
     }
     if (wallet->IsLocked() || !wallet->HasPendingInitialKeyPoolTopUp()) {
+        WITH_LOCK(wallet->cs_wallet, wallet->m_deferred_create_keypool_top_up_scheduled = false);
         return;
     }
     if (--state->remaining_steps == 0) {
@@ -402,10 +405,16 @@ void RunScheduledPendingInitialKeyPoolTopUp(const std::shared_ptr<DeferredCreate
     state->scheduler->scheduleFromNow([state] { RunScheduledPendingInitialKeyPoolTopUp(state); }, std::chrono::milliseconds{1});
 }
 
-void SchedulePendingInitialKeyPoolTopUp(WalletContext& context, const std::shared_ptr<CWallet>& wallet)
+void SchedulePendingInitialKeyPoolTopUp(WalletContext& context, const std::shared_ptr<CWallet>& wallet, std::chrono::milliseconds delay)
 {
-    if (!context.scheduler || wallet->IsLocked() || !wallet->HasPendingInitialKeyPoolTopUp()) {
-        return;
+    if (!context.scheduler) return;
+
+    {
+        LOCK(wallet->cs_wallet);
+        if (wallet->m_deferred_create_keypool_top_up_scheduled || wallet->IsLocked() || !wallet->HasPendingInitialKeyPoolTopUp()) {
+            return;
+        }
+        wallet->m_deferred_create_keypool_top_up_scheduled = true;
     }
 
     auto state = std::make_shared<DeferredCreateKeyPoolTopUpState>(DeferredCreateKeyPoolTopUpState{
@@ -414,9 +423,7 @@ void SchedulePendingInitialKeyPoolTopUp(WalletContext& context, const std::share
         .remaining_steps = GetDeferredCreateKeyPoolTopUpStepsPerBatch(),
         .refill_start = std::nullopt,
     });
-    // Let wallet creation return and the first address calls finish before background
-    // PQC derivation starts competing for CPU.
-    context.scheduler->scheduleFromNow([state] { RunScheduledPendingInitialKeyPoolTopUp(state); }, std::chrono::seconds{30});
+    context.scheduler->scheduleFromNow([state] { RunScheduledPendingInitialKeyPoolTopUp(state); }, delay);
 }
 
 void RunScheduledP2MRKeyPoolRefill(const std::shared_ptr<P2MRKeyPoolRefillState>& state)
@@ -550,7 +557,9 @@ std::shared_ptr<CWallet> LoadWalletInternal(WalletContext& context, const std::s
         AddWallet(context, wallet);
         wallet->postInitProcess();
         if (context.scheduler) SchedulePlaintextPQCKeyValidationInternal(*context.scheduler, wallet);
-        SchedulePendingInitialKeyPoolTopUp(context, wallet);
+        // Let wallet loading return and initial address calls finish before
+        // background PQC derivation starts competing for CPU.
+        SchedulePendingInitialKeyPoolTopUp(context, wallet, std::chrono::seconds{30});
 
         // Write the wallet setting
         UpdateWalletSetting(*context.chain, name, load_on_start, warnings);
@@ -622,6 +631,11 @@ private:
 void SchedulePlaintextPQCKeyValidation(CScheduler& scheduler, const std::shared_ptr<CWallet>& wallet)
 {
     SchedulePlaintextPQCKeyValidationInternal(scheduler, wallet);
+}
+
+void MaybeSchedulePendingInitialKeyPoolTopUp(WalletContext& context, const std::shared_ptr<CWallet>& wallet)
+{
+    SchedulePendingInitialKeyPoolTopUp(context, wallet, std::chrono::milliseconds{1});
 }
 
 void MaybeScheduleP2MRKeyPoolRefill(WalletContext& context, const std::shared_ptr<CWallet>& wallet, OutputType type, bool internal)
@@ -732,7 +746,9 @@ std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string&
     NotifyWalletLoaded(context, wallet);
     AddWallet(context, wallet);
     wallet->postInitProcess();
-    SchedulePendingInitialKeyPoolTopUp(context, wallet);
+    // Let wallet creation return and initial address calls finish before
+    // background PQC derivation starts competing for CPU.
+    SchedulePendingInitialKeyPoolTopUp(context, wallet, std::chrono::seconds{30});
 
     // Write the wallet settings
     UpdateWalletSetting(*context.chain, name, load_on_start, warnings);

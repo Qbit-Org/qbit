@@ -503,7 +503,7 @@ static void ShowProgress(WalletModel *walletmodel, const std::string &title, int
 
 static void NotifyCanGetAddressesChanged(WalletModel* walletmodel)
 {
-    bool invoked = QMetaObject::invokeMethod(walletmodel, "canGetAddressesChanged");
+    bool invoked = QMetaObject::invokeMethod(walletmodel, "canGetAddressesChanged", Qt::QueuedConnection);
     assert(invoked);
 }
 

@@ -1099,12 +1099,14 @@ util::Result<CTxDestination> DescriptorScriptPubKeyMan::GetReservedDestination(c
 
 void DescriptorScriptPubKeyMan::ReturnDestination(int64_t index, bool internal, const CTxDestination& addr)
 {
-    LOCK(cs_desc_man);
-    // Only return when the index was the most recent
-    if (m_wallet_descriptor.next_index - 1 == index) {
-        m_wallet_descriptor.next_index--;
+    {
+        LOCK(cs_desc_man);
+        // Only return when the index was the most recent
+        if (m_wallet_descriptor.next_index - 1 == index) {
+            m_wallet_descriptor.next_index--;
+        }
+        WalletBatch(m_storage.GetDatabase()).WriteDescriptor(GetID(), m_wallet_descriptor);
     }
-    WalletBatch(m_storage.GetDatabase()).WriteDescriptor(GetID(), m_wallet_descriptor);
     NotifyCanGetAddressesChanged();
 }
 
@@ -1212,22 +1214,28 @@ DescriptorScriptPubKeyMan::TopUpPreparation DescriptorScriptPubKeyMan::PrepareTo
 util::Result<void> DescriptorScriptPubKeyMan::TopUpWithInternalHintResult(std::optional<bool> internal_hint, unsigned int size)
 {
     const TopUpPreparation prepared{PrepareTopUp(internal_hint)};
-    LOCK(cs_desc_man);
-    // Keep descriptor and database lock ordering aligned with address reservation.
-    WalletBatch batch(m_storage.GetDatabase());
-    if (!batch.TxnBegin()) {
-        return util::Error{_("Error starting descriptors keypool top-up database transaction")};
-    }
-    util::Result<void> res{TopUpWithDBPreparedResult(batch, size, prepared, /*throw_on_persistence_error=*/false, /*rollback_state_on_error=*/true)};
-    if (!res) {
-        if (!batch.TxnAbort()) {
-            throw std::runtime_error(strprintf(
-                "Error during descriptors keypool top up. Cannot abort changes for wallet [%s]: %s",
-                m_storage.LogName(), util::ErrorString(res).original));
+    {
+        LOCK(cs_desc_man);
+        // Keep descriptor and database lock ordering aligned with address reservation.
+        WalletBatch batch(m_storage.GetDatabase());
+        if (!batch.TxnBegin()) {
+            return util::Error{_("Error starting descriptors keypool top-up database transaction")};
         }
-        return res;
+        util::Result<void> res{TopUpWithDBPreparedResult(batch, size, prepared, /*throw_on_persistence_error=*/false, /*rollback_state_on_error=*/true)};
+        if (!res) {
+            if (!batch.TxnAbort()) {
+                throw std::runtime_error(strprintf(
+                    "Error during descriptors keypool top up. Cannot abort changes for wallet [%s]: %s",
+                    m_storage.LogName(), util::ErrorString(res).original));
+            }
+            return res;
+        }
+        if (!batch.TxnCommit()) throw std::runtime_error(strprintf("Error during descriptors keypool top up. Cannot commit changes for wallet [%s]", m_storage.LogName()));
     }
-    if (!batch.TxnCommit()) throw std::runtime_error(strprintf("Error during descriptors keypool top up. Cannot commit changes for wallet [%s]", m_storage.LogName()));
+    // Do not invoke external observers while holding the descriptor mutex or
+    // the SQLite writer. Observers may synchronously query the wallet and take
+    // cs_wallet.
+    NotifyCanGetAddressesChanged();
     return {};
 }
 
@@ -1239,8 +1247,23 @@ bool DescriptorScriptPubKeyMan::TopUpWithDB(WalletBatch& batch, unsigned int siz
 util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBResult(WalletBatch& batch, unsigned int size, std::optional<bool> internal_hint, bool throw_on_persistence_error, bool rollback_state_on_error)
 {
     const TopUpPreparation prepared{PrepareTopUp(internal_hint)};
-    LOCK(cs_desc_man);
-    return TopUpWithDBPreparedResult(batch, size, prepared, throw_on_persistence_error, rollback_state_on_error);
+    util::Result<void> result{[&] {
+        LOCK(cs_desc_man);
+        return TopUpWithDBPreparedResult(batch, size, prepared, throw_on_persistence_error, rollback_state_on_error);
+    }()};
+    if (!result) return result;
+
+    if (batch.HasActiveTxn()) {
+        // Caller-owned transactions publish address availability only after
+        // their complete descriptor update is durable.
+        batch.RegisterTxnListener({
+            .on_commit = [this] { NotifyCanGetAddressesChanged(); },
+            .on_abort = [] {},
+        });
+    } else {
+        NotifyCanGetAddressesChanged();
+    }
+    return {};
 }
 
 util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBPreparedResult(WalletBatch& batch, unsigned int size, const TopUpPreparation& prepared, bool throw_on_persistence_error, bool rollback_state_on_error)
@@ -1503,13 +1526,13 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBPreparedResult(WalletBa
     assert(m_wallet_descriptor.range_end - 1 == m_max_cached_index);
 
     m_storage.TopUpCallback(new_spks, this);
-    NotifyCanGetAddressesChanged();
     return {};
 }
 
 std::vector<WalletDestination> DescriptorScriptPubKeyMan::MarkUnusedAddresses(const CScript& script, const MarkUnusedAddressesOptions& options)
 {
     std::vector<WalletDestination> result;
+    bool notify_can_get_addresses_changed{false};
     bool p2mr_refill{false};
     bool non_p2mr_top_up{false};
     unsigned int p2mr_refill_target{0};
@@ -1547,7 +1570,7 @@ std::vector<WalletDestination> DescriptorScriptPubKeyMan::MarkUnusedAddresses(co
                 if (!batch.WriteDescriptor(GetID(), m_wallet_descriptor)) {
                     throw std::runtime_error(std::string(__func__) + ": writing descriptor failed");
                 }
-                NotifyCanGetAddressesChanged();
+                notify_can_get_addresses_changed = true;
             }
         } else if (IsRangedP2MRDescriptorNoLock()) {
             if (advanced_next_index) {
@@ -1556,25 +1579,27 @@ std::vector<WalletDestination> DescriptorScriptPubKeyMan::MarkUnusedAddresses(co
                 if (!batch.WriteDescriptor(GetID(), m_wallet_descriptor)) {
                     throw std::runtime_error(std::string(__func__) + ": writing descriptor failed");
                 }
-                NotifyCanGetAddressesChanged();
+                notify_can_get_addresses_changed = true;
             }
             const bool needs_p2mr_refill{
                 options.preserve_full_keypool_lookahead ?
                     GetKeyPoolSizeNoLock() < static_cast<unsigned int>(m_keypool_size) :
                     NeedsP2MRKeyPoolRefillNoLock()};
-            if (!needs_p2mr_refill) {
-                return result;
+            if (needs_p2mr_refill) {
+                p2mr_refill = true;
+                p2mr_refill_target = options.preserve_full_keypool_lookahead ? 0 : GetP2MRReceiveKeyPoolRefillStepTargetNoLock();
+                p2mr_full_refill_target = static_cast<unsigned int>(m_keypool_size);
+                p2mr_remaining = GetKeyPoolSizeNoLock();
+                p2mr_low_watermark = GetP2MRReceiveKeyPoolLowWatermarkNoLock();
+                p2mr_descriptor_id = GetID().ToString();
             }
-
-            p2mr_refill = true;
-            p2mr_refill_target = options.preserve_full_keypool_lookahead ? 0 : GetP2MRReceiveKeyPoolRefillStepTargetNoLock();
-            p2mr_full_refill_target = static_cast<unsigned int>(m_keypool_size);
-            p2mr_remaining = GetKeyPoolSizeNoLock();
-            p2mr_low_watermark = GetP2MRReceiveKeyPoolLowWatermarkNoLock();
-            p2mr_descriptor_id = GetID().ToString();
         } else {
             non_p2mr_top_up = true;
         }
+    }
+
+    if (notify_can_get_addresses_changed) {
+        NotifyCanGetAddressesChanged();
     }
 
     if (p2mr_refill) {

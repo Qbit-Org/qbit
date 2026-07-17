@@ -569,6 +569,8 @@ BOOST_AUTO_TEST_CASE(DescriptorTopUpResultRestoresMemoryAfterWriteFailure)
     auto& database = GetMockableDatabase(wallet);
     const unsigned int previous_size{spk_man->GetKeyPoolSize()};
     const unsigned int target_size{previous_size + 1};
+    int notification_count{0};
+    auto connection = spk_man->NotifyCanGetAddressesChanged.connect([&] { ++notification_count; });
     database.ResetCounts();
     database.m_write_fail_after = 0;
 
@@ -577,12 +579,14 @@ BOOST_AUTO_TEST_CASE(DescriptorTopUpResultRestoresMemoryAfterWriteFailure)
     BOOST_CHECK_EQUAL(database.m_txn_abort_count, 1);
     BOOST_CHECK_EQUAL(database.m_txn_commit_count, 0);
     BOOST_CHECK_EQUAL(spk_man->GetKeyPoolSize(), previous_size);
+    BOOST_CHECK_EQUAL(notification_count, 0);
 
     database.ResetCounts();
     database.m_write_fail_after = -1;
     auto retry_res{spk_man->TopUpWithInternalHintResult(/*internal_hint=*/false, target_size)};
     BOOST_REQUIRE_MESSAGE(retry_res.has_value(), util::ErrorString(retry_res).original);
     BOOST_CHECK_EQUAL(spk_man->GetKeyPoolSize(), target_size);
+    BOOST_CHECK_EQUAL(notification_count, 1);
 }
 
 BOOST_AUTO_TEST_CASE(DescriptorSetupPropagatesTopUpWithDBWriteFailure)

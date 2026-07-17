@@ -1598,6 +1598,40 @@ void TestUnlockContextModelLifetime(interfaces::Node& node)
     QCOMPARE(lock_calls(), 1);
 }
 
+void TestCanGetAddressesNotificationIsQueued(interfaces::Node& node)
+{
+    TestChain100Setup test{ChainType::REGTEST, {.extra_args = {"-p2mronly=0"}}};
+    node.setContext(&test.m_node);
+
+    std::unique_ptr<const PlatformStyle> platform_style{PlatformStyle::instantiate("other")};
+    OptionsModel options_model{node};
+    bilingual_str error;
+    QVERIFY(options_model.Init(error));
+    ClientModel client_model{node, &options_model};
+
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    WalletModel wallet_model{
+        qt_test::MakeSyntheticWallet(wallet::PQCUsageReport{}, state),
+        client_model,
+        platform_style.get()};
+    QSignalSpy notification_spy{&wallet_model, &WalletModel::canGetAddressesChanged};
+    QVERIFY(notification_spy.isValid());
+
+    std::function<void()> notify;
+    {
+        std::lock_guard lock{state->mutex};
+        notify = state->can_get_addresses_changed;
+    }
+    QVERIFY(notify);
+
+    notify();
+    QCOMPARE(notification_spy.count(), 0);
+
+    QCoreApplication::sendPostedEvents(&wallet_model, QEvent::MetaCall);
+    QCoreApplication::processEvents();
+    QCOMPARE(notification_spy.count(), 1);
+}
+
 void TestSendPQCWarningFormatting()
 {
     CPQCKey key;
@@ -1669,5 +1703,6 @@ void WalletTests::walletTests()
     TestSendPQCReportPropagation(m_node);
     TestSendCompletionAfterModelDestruction(m_node);
     TestUnlockContextModelLifetime(m_node);
+    TestCanGetAddressesNotificationIsQueued(m_node);
     TestSendPQCWarningFormatting();
 }

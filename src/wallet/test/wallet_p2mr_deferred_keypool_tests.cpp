@@ -3,11 +3,60 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <wallet/test/wallet_p2mr_test_util.h>
+#include <wallet/sqlite.h>
 
 namespace wallet {
 using namespace wallet_p2mr_test;
 
 BOOST_FIXTURE_TEST_SUITE(wallet_p2mr_deferred_keypool_tests, WalletTestingSetup)
+
+BOOST_FIXTURE_TEST_CASE(DeferredTopUpNotifiesAfterCommitWithoutWalletLockInversion, RegtestP2MROnlyWalletTestingSetup, * boost::unit_test::timeout(10))
+{
+    constexpr int64_t keypool_size{64};
+    m_args.ForceSetArg("-keypool", util::ToString(keypool_size));
+
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+
+    auto wallet = TestLoadWallet(context);
+    auto* external_spk_man = WITH_LOCK(wallet->cs_wallet, return dynamic_cast<DescriptorScriptPubKeyMan*>(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false)));
+    BOOST_REQUIRE(external_spk_man);
+    BOOST_REQUIRE(wallet->HasPendingInitialKeyPoolTopUp());
+
+    auto& database{dynamic_cast<SQLiteDatabase&>(wallet->GetDatabase())};
+    int notification_count{0};
+    bool callback_can_get_addresses{false};
+    std::atomic_bool writer_succeeded{false};
+    std::promise<void> wallet_lock_acquired;
+    auto wallet_lock_acquired_future{wallet_lock_acquired.get_future()};
+    std::thread writer;
+
+    auto connection = external_spk_man->NotifyCanGetAddressesChanged.connect([&] {
+        ++notification_count;
+        BOOST_CHECK(LockStackEmpty());
+        BOOST_CHECK(!database.HasActiveTxn());
+
+        writer = std::thread([&] {
+            LOCK(wallet->cs_wallet);
+            wallet_lock_acquired.set_value();
+            WalletBatch batch{wallet->GetDatabase()};
+            writer_succeeded = batch.WriteOrderPosNext(1);
+        });
+        wallet_lock_acquired_future.wait();
+        callback_can_get_addresses = wallet->CanGetAddresses();
+    });
+
+    BOOST_CHECK(wallet->RunPendingInitialKeyPoolTopUpStep() == CWallet::PendingInitialKeyPoolTopUpStepResult::PENDING);
+    BOOST_REQUIRE(writer.joinable());
+    writer.join();
+
+    BOOST_CHECK_EQUAL(notification_count, 1);
+    BOOST_CHECK(callback_can_get_addresses);
+    BOOST_CHECK(writer_succeeded);
+
+    TestUnloadWallet(std::move(wallet));
+}
 
 BOOST_FIXTURE_TEST_CASE(CreateWalletWarmsP2MRKeypoolThenDefersFullTopUp, RegtestDefaultWalletTestingSetup)
 {
@@ -400,6 +449,96 @@ BOOST_FIXTURE_TEST_CASE(LoadWalletUnlockRefillsDeferredP2MRKeypoolForEncryptedWa
 
     BOOST_CHECK(RemoveWallet(context, loaded_wallet, std::nullopt));
     WaitForDeleteWallet(std::move(loaded_wallet));
+}
+
+BOOST_FIXTURE_TEST_CASE(WalletInterfaceUnlockSchedulesDeferredP2MRKeypoolTopUp, RegtestP2MROnlyWalletTestingSetup)
+{
+    constexpr int64_t keypool_size{64};
+    const SecureString passphrase{"test-passphrase"};
+    m_args.ForceSetArg("-keypool", util::ToString(keypool_size));
+    DeferredCreateKeyPoolTopUpBatchStepOverride batch_step_override{1};
+
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+    context.scheduler = Assert(m_node.scheduler).get();
+
+    DatabaseOptions options;
+    options.require_create = true;
+    options.create_flags = WALLET_FLAG_DESCRIPTORS;
+    options.create_passphrase = passphrase;
+
+    DatabaseStatus status;
+    bilingual_str error;
+    std::vector<bilingual_str> warnings;
+    auto wallet = CreateWallet(context, "interface_unlock_refill_test", std::nullopt, options, status, error, warnings);
+    BOOST_REQUIRE(wallet);
+    BOOST_REQUIRE_EQUAL(status, DatabaseStatus::SUCCESS);
+    BOOST_REQUIRE(wallet->IsLocked());
+    BOOST_REQUIRE(wallet->HasPendingInitialKeyPoolTopUp());
+
+    auto* external_spk_man = WITH_LOCK(wallet->cs_wallet, return dynamic_cast<DescriptorScriptPubKeyMan*>(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false)));
+    auto* internal_spk_man = WITH_LOCK(wallet->cs_wallet, return dynamic_cast<DescriptorScriptPubKeyMan*>(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/true)));
+    BOOST_REQUIRE(external_spk_man);
+    BOOST_REQUIRE(internal_spk_man);
+
+    auto& scheduler{*Assert(m_node.scheduler)};
+    std::promise<void> scheduler_blocked;
+    std::promise<void> release_scheduler;
+    auto release_scheduler_future{release_scheduler.get_future()};
+    scheduler.scheduleFromNow([&] {
+        scheduler_blocked.set_value();
+        release_scheduler_future.wait();
+    }, std::chrono::milliseconds{0});
+    scheduler_blocked.get_future().wait();
+
+    auto wallet_interface{interfaces::MakeWallet(context, wallet)};
+    BOOST_REQUIRE(wallet_interface);
+    BOOST_REQUIRE(wallet_interface->unlock(passphrase));
+    BOOST_CHECK(!wallet->IsLocked());
+    BOOST_CHECK(wallet->HasPendingInitialKeyPoolTopUp());
+    BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_CHECK(wallet->m_deferred_create_keypool_top_up_scheduled);
+    }
+
+    // Repeated scheduling while the first worker is pending must be a no-op.
+    MaybeSchedulePendingInitialKeyPoolTopUp(context, wallet);
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_CHECK(wallet->m_deferred_create_keypool_top_up_scheduled);
+    }
+
+    // Relocking before the worker runs must pause it and make a later unlock
+    // able to schedule a fresh worker.
+    BOOST_REQUIRE(wallet_interface->lock());
+    release_scheduler.set_value();
+    WaitForScheduler(scheduler);
+    BOOST_CHECK(wallet->IsLocked());
+    BOOST_CHECK(wallet->HasPendingInitialKeyPoolTopUp());
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_CHECK(!wallet->m_deferred_create_keypool_top_up_scheduled);
+    }
+
+    BOOST_REQUIRE(wallet_interface->unlock(passphrase));
+    for (int i = 0; i < 10 && wallet->HasPendingInitialKeyPoolTopUp(); ++i) {
+        WaitForScheduler(scheduler);
+    }
+
+    BOOST_CHECK(!wallet->HasPendingInitialKeyPoolTopUp());
+    BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), keypool_size);
+    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), keypool_size);
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_CHECK(!wallet->m_deferred_create_keypool_top_up_scheduled);
+    }
+
+    wallet_interface.reset();
+    BOOST_CHECK(RemoveWallet(context, wallet, std::nullopt));
+    WaitForDeleteWallet(std::move(wallet));
 }
 
 BOOST_AUTO_TEST_SUITE_END()
