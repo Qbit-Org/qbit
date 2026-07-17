@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <common/args.h>
 #include <common/system.h>
 #include <consensus/validation.h>
 #include <interfaces/chain.h>
@@ -16,6 +17,9 @@
 #include <wallet/receive.h>
 #include <wallet/spend.h>
 #include <wallet/wallet.h>
+
+#include <algorithm>
+#include <set>
 
 namespace wallet {
 //! Check whether transaction has descendant in wallet or mempool, or has been
@@ -143,6 +147,20 @@ static CFeeRate EstimateFeeRate(const CWallet& wallet, const CWalletTx& wtx, con
 }
 
 namespace feebumper {
+
+static bool SigningOnlyModifiedInputSignatures(const CMutableTransaction& before, const CMutableTransaction& after)
+{
+    if (before.version != after.version || before.nLockTime != after.nLockTime ||
+        before.vin.size() != after.vin.size() || before.vout != after.vout) {
+        return false;
+    }
+    for (size_t i = 0; i < before.vin.size(); ++i) {
+        if (before.vin[i].prevout != after.vin[i].prevout || before.vin[i].nSequence != after.vin[i].nSequence) {
+            return false;
+        }
+    }
+    return true;
+}
 
 bool TransactionCanBeBumped(const CWallet& wallet, const Txid& txid)
 {
@@ -326,10 +344,40 @@ Result CreateRateBumpTransaction(CWallet& wallet, const Txid& txid, const CCoinC
     return Result::OK;
 }
 
-bool SignTransaction(CWallet& wallet, CMutableTransaction& mtx) {
-    LOCK(wallet.cs_wallet);
+bool SignTransaction(CWallet& wallet,
+    CMutableTransaction& mtx,
+    const PQCSignatureCounterObserver& pqc_counter_observer,
+    const SigningProgressCallback& progress_callback)
+{
+    const CMutableTransaction unsigned_tx{mtx};
+    bool signed_ok{false};
+    PQCSignatureCounterObserver reservation_observer{pqc_counter_observer};
+    if (progress_callback) {
+        reservation_observer = [pqc_counter_observer, progress_callback](const CPQCPubKey& pubkey, uint32_t previous_counter, uint32_t reserved_counter) {
+            if (pqc_counter_observer) {
+                pqc_counter_observer(pubkey, previous_counter, reserved_counter);
+            }
+            // The observer runs after the wallet has durably committed the
+            // counter range and before serial PQC signature generation.
+            progress_callback({
+                .phase = SigningProgressPhase::RESERVING_PQC_COUNTERS,
+                .completed = 1,
+                .total = 1,
+                .cancellable = false,
+            });
+        };
+    }
 
     if (wallet.IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER)) {
+        if (progress_callback && !progress_callback({
+                .phase = SigningProgressPhase::PREPARING_TRANSACTION,
+                .completed = 0,
+                .total = static_cast<unsigned int>(mtx.vin.size()),
+                .cancellable = true,
+            })) {
+            return false;
+        }
+
         // Make a blank psbt
         PartiallySignedTransaction psbtx(mtx);
 
@@ -337,13 +385,123 @@ bool SignTransaction(CWallet& wallet, CMutableTransaction& mtx) {
         // so external signers are not asked to sign more than once.
         bool complete;
         wallet.FillPSBT(psbtx, complete, std::nullopt, /*sign=*/false, /*bip32derivs=*/true);
-        auto err{wallet.FillPSBT(psbtx, complete, std::nullopt, /*sign=*/true, /*bip32derivs=*/false)};
+        if (progress_callback && !progress_callback({
+                .phase = SigningProgressPhase::SIGNING_INPUTS,
+                .completed = 0,
+                .total = static_cast<unsigned int>(mtx.vin.size()),
+                .cancellable = true,
+            })) {
+            return false;
+        }
+        // External signer commands cannot be interrupted safely once started.
+        if (progress_callback) {
+            progress_callback({
+                .phase = SigningProgressPhase::SIGNING_INPUTS,
+                .completed = 0,
+                .total = static_cast<unsigned int>(mtx.vin.size()),
+                .cancellable = false,
+            });
+        }
+        auto err{wallet.FillPSBT(psbtx, complete, std::nullopt, /*sign=*/true, /*bip32derivs=*/false, /*n_signed=*/nullptr, /*finalize=*/true, reservation_observer)};
         if (err) return false;
-        complete = FinalizeAndExtractPSBT(psbtx, mtx);
-        return complete;
+        signed_ok = FinalizeAndExtractPSBT(psbtx, mtx);
+        if (progress_callback) {
+            progress_callback({
+                .phase = SigningProgressPhase::FINALIZING_TRANSACTION,
+                .completed = static_cast<unsigned int>(mtx.vin.size()),
+                .total = static_cast<unsigned int>(mtx.vin.size()),
+                .cancellable = false,
+            });
+        }
     } else {
-        return wallet.SignTransaction(mtx);
+        signed_ok = wallet.SignTransaction(mtx, reservation_observer, progress_callback);
     }
+
+    return signed_ok && SigningOnlyModifiedInputSignatures(unsigned_tx, mtx);
+}
+
+static Result RevalidateReplacement(const CWallet& wallet,
+    const CWalletTx& old_wtx,
+    const CMutableTransaction& mtx,
+    std::vector<bilingual_str>& errors) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    std::set<COutPoint> original_inputs;
+    for (const CTxIn& input : old_wtx.tx->vin) {
+        original_inputs.insert(input.prevout);
+    }
+    std::set<COutPoint> replacement_inputs;
+    CAmount replacement_input_value{0};
+    for (const CTxIn& input : mtx.vin) {
+        if (!replacement_inputs.insert(input.prevout).second) {
+            errors.emplace_back(Untranslated("Replacement transaction contains duplicate inputs"));
+            return Result::WALLET_ERROR;
+        }
+        const auto coin_it{wallet.mapWallet.find(input.prevout.hash)};
+        if (coin_it == wallet.mapWallet.end() || input.prevout.n >= coin_it->second.tx->vout.size()) {
+            errors.emplace_back(Untranslated(strprintf("Replacement input %s:%u is no longer available in the wallet", input.prevout.hash.GetHex(), input.prevout.n)));
+            return Result::WALLET_ERROR;
+        }
+        replacement_input_value += coin_it->second.tx->vout[input.prevout.n].nValue;
+
+        for (const auto& [candidate_txid, candidate_wtx] : wallet.mapWallet) {
+            if (candidate_txid == old_wtx.GetHash() || candidate_wtx.isAbandoned() ||
+                candidate_wtx.isBlockConflicted() || candidate_wtx.isMempoolConflicted()) {
+                continue;
+            }
+            if (std::ranges::any_of(candidate_wtx.tx->vin, [&](const CTxIn& candidate_input) {
+                    return candidate_input.prevout == input.prevout;
+                })) {
+                errors.emplace_back(Untranslated(strprintf("Replacement input %s:%u is already spent by wallet transaction %s", input.prevout.hash.GetHex(), input.prevout.n, candidate_txid.GetHex())));
+                return Result::WALLET_ERROR;
+            }
+        }
+    }
+    if (!std::ranges::all_of(original_inputs, [&](const COutPoint& input) { return replacement_inputs.contains(input); })) {
+        errors.emplace_back(Untranslated("Replacement transaction no longer spends every original input"));
+        return Result::WALLET_ERROR;
+    }
+
+    CAmount original_input_value{0};
+    for (const CTxIn& input : old_wtx.tx->vin) {
+        const auto coin_it{wallet.mapWallet.find(input.prevout.hash)};
+        if (coin_it == wallet.mapWallet.end() || input.prevout.n >= coin_it->second.tx->vout.size()) {
+            errors.emplace_back(Untranslated("Original transaction inputs are no longer available in the wallet"));
+            return Result::WALLET_ERROR;
+        }
+        original_input_value += coin_it->second.tx->vout[input.prevout.n].nValue;
+    }
+    const CAmount old_fee{original_input_value - CalculateOutputValue(*old_wtx.tx)};
+    const CAmount new_fee{replacement_input_value - CalculateOutputValue(mtx)};
+    if (new_fee <= old_fee) {
+        errors.emplace_back(Untranslated("Replacement transaction fee is no longer higher than the original fee"));
+        return Result::WALLET_ERROR;
+    }
+
+    const CTransactionRef replacement{MakeTransactionRef(mtx)};
+    if (GetTransactionWeight(*replacement) > MAX_STANDARD_TX_WEIGHT) {
+        errors.emplace_back(Untranslated("Replacement transaction is too large"));
+        return Result::WALLET_ERROR;
+    }
+    const int32_t vsize{static_cast<int32_t>(GetVirtualTransactionSize(*replacement))};
+    if (new_fee < old_fee + wallet.chain().relayIncrementalFee().GetFee(vsize)) {
+        errors.emplace_back(Untranslated("Replacement transaction no longer pays the current incremental relay fee"));
+        return Result::WALLET_ERROR;
+    }
+    if (CFeeRate{new_fee, vsize}.GetFeePerK() < wallet.chain().mempoolMinFee().GetFeePerK()) {
+        errors.emplace_back(Untranslated("Replacement transaction fee rate is below the current mempool minimum"));
+        return Result::WALLET_ERROR;
+    }
+    if (new_fee < GetRequiredFee(wallet, vsize) || new_fee > wallet.m_default_max_tx_fee) {
+        errors.emplace_back(Untranslated("Replacement transaction fee no longer satisfies wallet fee policy"));
+        return Result::WALLET_ERROR;
+    }
+    if (gArgs.GetBoolArg("-walletrejectlongchains", DEFAULT_WALLET_REJECT_LONG_CHAINS)) {
+        if (const auto chain_result{wallet.chain().checkChainLimits(replacement)}; !chain_result) {
+            errors.emplace_back(Untranslated("Replacement transaction no longer satisfies mempool chain limits") + Untranslated(": ") + util::ErrorString(chain_result));
+            return Result::WALLET_ERROR;
+        }
+    }
+    return Result::OK;
 }
 
 Result CommitTransaction(CWallet& wallet, const Txid& txid, CMutableTransaction&& mtx, std::vector<bilingual_str>& errors, Txid& bumped_txid)
@@ -361,6 +519,11 @@ Result CommitTransaction(CWallet& wallet, const Txid& txid, CMutableTransaction&
 
     // make sure the transaction still has no descendants and hasn't been mined in the meantime
     Result result = PreconditionChecks(wallet, oldWtx, /* require_mine=*/ false, errors);
+    if (result != Result::OK) {
+        return result;
+    }
+
+    result = RevalidateReplacement(wallet, oldWtx, mtx, errors);
     if (result != Result::OK) {
         return result;
     }

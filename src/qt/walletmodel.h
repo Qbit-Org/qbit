@@ -13,6 +13,9 @@
 #include <primitives/transaction_identifier.h>
 #include <support/allocators/secure.h>
 
+#include <atomic>
+#include <cstdint>
+#include <memory>
 #include <vector>
 
 #include <QObject>
@@ -43,6 +46,9 @@ class CCoinControl;
 
 QT_BEGIN_NAMESPACE
 class QTimer;
+class QProgressBar;
+class QProgressDialog;
+class QThread;
 QT_END_NAMESPACE
 
 /** Interface to Bitcoin wallet from Qt view code. */
@@ -132,7 +138,7 @@ public:
 
     UnlockContext requestUnlock();
 
-    bool bumpFee(Txid hash, Txid& new_hash);
+    bool bumpFee(Txid hash);
     void displayAddress(std::string sAddress) const;
 
     static bool isWalletEnabled();
@@ -170,6 +176,34 @@ private:
     std::unique_ptr<interfaces::Handler> m_handler_can_get_addrs_changed;
     ClientModel* m_client_model;
     interfaces::Node& m_node;
+
+    struct BumpFeeResult;
+    enum class BumpFeeProgressPhase {
+        Preparing,
+        Reserving,
+        Signing,
+        Finalizing,
+        Committing,
+    };
+    struct BumpFeeProgress;
+    QThread* m_bump_fee_thread{nullptr};
+    QPointer<QProgressDialog> m_bump_fee_progress_dialog;
+    QPointer<QProgressBar> m_bump_fee_progress_bar;
+    std::unique_ptr<UnlockContext> m_bump_fee_unlock_context;
+    uint64_t m_bump_fee_generation{0};
+    bool m_bump_fee_active{false};
+    std::atomic_bool m_bump_fee_cancel_requested{false};
+    std::atomic_bool m_bump_fee_counters_reserved{false};
+
+    void startBumpFeePreparation(Txid txid, std::unique_ptr<interfaces::Wallet> wallet);
+    void bumpFeePrepared(uint64_t generation, std::shared_ptr<BumpFeeResult> result);
+    void startBumpFeeSigning(std::shared_ptr<BumpFeeResult> result);
+    void bumpFeeProgress(uint64_t generation, BumpFeeProgress progress);
+    void bumpFeeFinished(uint64_t generation, std::shared_ptr<BumpFeeResult> result);
+    void cancelBumpFee();
+    void clearBumpFeeProgressDialog();
+    void finishBumpFeeThread();
+    void resetBumpFeeState();
 
     bool fForceCheckBalanceChanged{false};
 
@@ -222,6 +256,9 @@ Q_SIGNALS:
 
     // Notify that there are now keys in the keypool
     void canGetAddressesChanged();
+
+    // A fee-bump replacement was committed by the background worker.
+    void feeBumped(const Txid& original_txid, const Txid& bumped_txid);
 
     void timerTimeout();
 

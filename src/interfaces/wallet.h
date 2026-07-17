@@ -201,7 +201,9 @@ public:
         CMutableTransaction& mtx) = 0;
 
     //! Sign bump transaction.
-    virtual bool signBumpTransaction(CMutableTransaction& mtx) = 0;
+    virtual bool signBumpTransaction(CMutableTransaction& mtx,
+        wallet::PQCUsageReport* pqc_usage = nullptr,
+        const SigningProgressCallback& progress_callback = {}) = 0;
 
     //! Commit bump transaction.
     virtual bool commitBumpTransaction(const Txid& txid,

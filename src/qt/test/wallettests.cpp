@@ -53,6 +53,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -69,6 +70,7 @@
 #include <QObject>
 #include <QPointer>
 #include <QPlainTextEdit>
+#include <QProgressDialog>
 #include <QPushButton>
 #include <QSignalSpy>
 #include <QTabWidget>
@@ -171,6 +173,32 @@ bool WaitUntil(Predicate&& predicate, int timeout_ms)
     return predicate();
 }
 
+template <typename Predicate>
+bool SyntheticStateMatches(const std::shared_ptr<qt_test::SyntheticWalletState>& state, Predicate&& predicate)
+{
+    std::lock_guard lock{state->mutex};
+    return predicate(*state);
+}
+
+QProgressDialog* FindBumpFeeProgressDialog()
+{
+    for (QWidget* widget : QApplication::topLevelWidgets()) {
+        if (widget->objectName() == QStringLiteral("bumpFeeProgressDialog")) {
+            return qobject_cast<QProgressDialog*>(widget);
+        }
+    }
+    return nullptr;
+}
+
+void ReleaseSyntheticBumpSigning(const std::shared_ptr<qt_test::SyntheticWalletState>& state)
+{
+    {
+        std::lock_guard lock{state->mutex};
+        state->allow_bump_sign = true;
+    }
+    state->condition.notify_all();
+}
+
 class SendConfirmationClicker : public QObject
 {
 public:
@@ -191,7 +219,7 @@ public:
     bool eventFilter(QObject* watched, QEvent* event) override
     {
         if (event->type() == QEvent::Show && watched->inherits("SendConfirmationDialog")) {
-            click(qobject_cast<SendConfirmationDialog*>(watched));
+            m_dialog = qobject_cast<SendConfirmationDialog*>(watched);
         }
         return QObject::eventFilter(watched, event);
     }
@@ -199,8 +227,12 @@ public:
 private:
     void tryClickVisibleDialog()
     {
+        if (m_dialog) {
+            click(m_dialog);
+            return;
+        }
         for (QWidget* widget : QApplication::topLevelWidgets()) {
-            if (widget->inherits("SendConfirmationDialog")) {
+            if (widget->inherits("SendConfirmationDialog") && widget->isVisible()) {
                 click(qobject_cast<SendConfirmationDialog*>(widget));
                 return;
             }
@@ -214,7 +246,7 @@ private:
         if (m_text) *m_text = dialog->text();
         QAbstractButton* button = dialog->button(m_confirm_type);
         button->setEnabled(true);
-        QMetaObject::invokeMethod(dialog, "done", Qt::QueuedConnection, Q_ARG(int, static_cast<int>(m_confirm_type)));
+        button->click();
         m_timer.stop();
         deleteLater();
     }
@@ -222,14 +254,15 @@ private:
     QString* const m_text;
     const QMessageBox::StandardButton m_confirm_type;
     QTimer m_timer;
+    QPointer<SendConfirmationDialog> m_dialog;
     bool m_clicked{false};
 };
 
 class MessageBoxClicker : public QObject
 {
 public:
-    MessageBoxClicker(QString object_name, QMessageBox::StandardButton button)
-        : QObject(QApplication::instance()), m_object_name(std::move(object_name)), m_button(button)
+    MessageBoxClicker(QString object_name, QMessageBox::StandardButton button, QString* text = nullptr)
+        : QObject(QApplication::instance()), m_object_name(std::move(object_name)), m_button(button), m_text(text)
     {
         QApplication::instance()->installEventFilter(this);
         m_timer.setInterval(50);
@@ -245,16 +278,28 @@ public:
     bool eventFilter(QObject* watched, QEvent* event) override
     {
         if (event->type() == QEvent::Show && watched->inherits("QMessageBox")) {
-            click(qobject_cast<QMessageBox*>(watched));
+            QMessageBox* const dialog{qobject_cast<QMessageBox*>(watched)};
+            if (matches(dialog)) m_dialog = dialog;
         }
         return QObject::eventFilter(watched, event);
     }
 
 private:
+    bool matches(QMessageBox* dialog) const
+    {
+        if (!dialog) return false;
+        if (m_object_name.isEmpty()) return !dialog->inherits("SendConfirmationDialog");
+        return dialog->objectName() == m_object_name;
+    }
+
     void tryClickVisibleDialog()
     {
+        if (m_dialog) {
+            click(m_dialog);
+            return;
+        }
         for (QWidget* widget : QApplication::topLevelWidgets()) {
-            if (widget->inherits("QMessageBox")) {
+            if (widget->inherits("QMessageBox") && widget->isVisible()) {
                 click(qobject_cast<QMessageBox*>(widget));
                 if (m_clicked) return;
             }
@@ -263,9 +308,10 @@ private:
 
     void click(QMessageBox* dialog)
     {
-        if (m_clicked || m_click_pending || !dialog || dialog->objectName() != m_object_name) return;
+        if (m_clicked || m_click_pending || !matches(dialog)) return;
         QAbstractButton* button = dialog->button(m_button);
         if (!button) return;
+        if (m_text) *m_text = dialog->text();
         if (!m_finished_connected) {
             m_finished_connected = true;
             connect(dialog, &QMessageBox::finished, this, [this] {
@@ -275,18 +321,15 @@ private:
             });
         }
         m_click_pending = true;
-        QPointer<QAbstractButton> button_ptr{button};
-        QTimer::singleShot(50, this, [this, button_ptr] {
-            m_click_pending = false;
-            if (m_clicked || !button_ptr) return;
-            button_ptr->setEnabled(true);
-            button_ptr->click();
-        });
+        button->setEnabled(true);
+        button->click();
     }
 
     const QString m_object_name;
     const QMessageBox::StandardButton m_button;
+    QString* const m_text;
     QTimer m_timer;
+    QPointer<QMessageBox> m_dialog;
     bool m_clicked{false};
     bool m_click_pending{false};
     bool m_finished_connected{false};
@@ -379,12 +422,19 @@ void BumpFee(TransactionView& view, const Txid& txid, bool expectDisabled, std::
 
     action->setEnabled(true);
     QString text;
+    QSignalSpy bumped{&view, &TransactionView::bumpedFee};
+    QVERIFY(bumped.isValid());
     if (expectError.empty()) {
         ConfirmSend(&text, cancel ? QMessageBox::Cancel : QMessageBox::Yes);
     } else {
-        ConfirmMessage(&text, 0ms);
+        new MessageBoxClicker({}, QMessageBox::Ok, &text);
     }
     action->trigger();
+    if (!expectError.empty() || cancel) {
+        QVERIFY2(WaitUntil([&text] { return !text.isEmpty(); }, 60000), "Timed out waiting for fee-bump dialog");
+    } else {
+        QVERIFY2(WaitUntil([&bumped] { return bumped.count() == 1; }, 60000), "Timed out waiting for fee-bump completion");
+    }
     QVERIFY(text.indexOf(QString::fromStdString(expectError)) != -1);
 }
 
@@ -1512,6 +1562,202 @@ void TestSendPQCReportPropagation(interfaces::Node& node)
     QCOMPARE(pqc_usage.key_states.front().signatures_remaining, PQC_MAX_SIGNATURES - 7);
 }
 
+void TestAsyncFeeBumpLifecycle(interfaces::Node& node)
+{
+    TestChain100Setup test{ChainType::REGTEST, {.extra_args = {"-p2mronly=0"}}};
+    node.setContext(&test.m_node);
+
+    std::unique_ptr<const PlatformStyle> platform_style{PlatformStyle::instantiate("other")};
+    OptionsModel options_model{node};
+    bilingual_str error;
+    QVERIFY(options_model.Init(error));
+    ClientModel client_model{node, &options_model};
+
+    const auto make_model = [&](const std::shared_ptr<qt_test::SyntheticWalletState>& state) {
+        return std::make_unique<WalletModel>(
+            qt_test::MakeSyntheticWallet(wallet::PQCUsageReport{}, state),
+            client_model,
+            platform_style.get());
+    };
+    const auto start_bump = [](WalletModel& model) {
+        ConfirmSend(nullptr, QMessageBox::Yes);
+        return model.bumpFee(Txid{});
+    };
+
+    // Internal P2MR signing stays off the GUI thread. Once counters are
+    // durably reserved, an attempted cancellation is ignored and the
+    // replacement proceeds to commit.
+    {
+        auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+        {
+            std::lock_guard lock{state->mutex};
+            state->bump_enabled = true;
+            state->allow_bump_sign = false;
+        }
+        auto model{make_model(state)};
+        QSignalSpy completed{model.get(), &WalletModel::feeBumped};
+        QVERIFY(completed.isValid());
+
+        int gui_ticks{0};
+        QTimer gui_latch;
+        QObject::connect(&gui_latch, &QTimer::timeout, [&gui_ticks] { ++gui_ticks; });
+        gui_latch.start(0);
+        QVERIFY(start_bump(*model));
+        QVERIFY(WaitUntil([&] {
+            return SyntheticStateMatches(state, [](const auto& value) {
+                return value.bump_sign_entered && value.bump_counters_reserved;
+            });
+        }, 5000));
+
+        QPointer<QProgressDialog> progress;
+        QVERIFY(WaitUntil([&] {
+            progress = FindBumpFeeProgressDialog();
+            return progress && progress->isVisible() && progress->findChildren<QPushButton*>().empty();
+        }, 5000));
+        QVERIFY(WaitUntil([&gui_ticks] { return gui_ticks >= 3; }, 5000));
+
+        // Exercise the cancel/reservation race from the UI side. Escape can
+        // still produce a cancel event after the button has disappeared.
+        Q_EMIT progress->canceled();
+        QCoreApplication::processEvents();
+        QVERIFY(!SyntheticStateMatches(state, [](const auto& value) { return value.bump_cancel_observed; }));
+
+        ReleaseSyntheticBumpSigning(state);
+        QVERIFY(WaitUntil([&completed] { return completed.count() == 1; }, 5000));
+        QVERIFY(WaitUntil([&] {
+            return SyntheticStateMatches(state, [](const auto& value) { return value.background_clone_destroyed; });
+        }, 5000));
+        QVERIFY(SyntheticStateMatches(state, [](const auto& value) {
+            return value.bump_commit_entered && value.bump_committed && !value.bump_cancel_observed;
+        }));
+    }
+
+    // Before counter reservation, cancellation reaches the signer and no
+    // commit is attempted.
+    {
+        auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+        {
+            std::lock_guard lock{state->mutex};
+            state->bump_enabled = true;
+            state->allow_bump_reservation = false;
+        }
+        auto model{make_model(state)};
+        QSignalSpy completed{model.get(), &WalletModel::feeBumped};
+        QVERIFY(start_bump(*model));
+        QVERIFY(WaitUntil([&] {
+            return SyntheticStateMatches(state, [](const auto& value) { return value.bump_sign_entered; });
+        }, 5000));
+
+        QPointer<QProgressDialog> progress;
+        QVERIFY(WaitUntil([&] {
+            progress = FindBumpFeeProgressDialog();
+            return progress && progress->isVisible() && !progress->findChildren<QPushButton*>().empty();
+        }, 5000));
+        const QList<QPushButton*> cancel_buttons{progress->findChildren<QPushButton*>()};
+        QVERIFY(!cancel_buttons.empty());
+        cancel_buttons.front()->click();
+        QVERIFY(WaitUntil([&] {
+            return SyntheticStateMatches(state, [](const auto& value) { return value.bump_cancel_observed; });
+        }, 5000));
+        QVERIFY(WaitUntil([&] {
+            return SyntheticStateMatches(state, [](const auto& value) { return value.background_clone_destroyed; });
+        }, 5000));
+        QCOMPARE(completed.count(), 0);
+        QVERIFY(SyntheticStateMatches(state, [](const auto& value) {
+            return !value.bump_commit_entered && !value.bump_committed;
+        }));
+    }
+
+    // A state change discovered by the worker's final commit revalidation is
+    // surfaced, and a signed-but-stale replacement is not reported as bumped.
+    {
+        auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+        {
+            std::lock_guard lock{state->mutex};
+            state->bump_enabled = true;
+            state->bump_commit_success = false;
+        }
+        auto model{make_model(state)};
+        QSignalSpy completed{model.get(), &WalletModel::feeBumped};
+        QString commit_error;
+        new MessageBoxClicker({}, QMessageBox::Ok, &commit_error);
+        QVERIFY(start_bump(*model));
+        QVERIFY(WaitUntil([&commit_error] { return commit_error.contains("Original transaction changed while signing"); }, 5000));
+        QCOMPARE(completed.count(), 0);
+        QVERIFY(SyntheticStateMatches(state, [](const auto& value) {
+            return value.bump_commit_entered && !value.bump_committed;
+        }));
+    }
+
+    // The model owns the activity, so deleting a view and the progress dialog
+    // during an external-signer command does not invalidate the worker.
+    {
+        auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+        {
+            std::lock_guard lock{state->mutex};
+            state->bump_enabled = true;
+            state->external_signer = true;
+            state->bump_use_counters = false;
+            state->allow_bump_sign = false;
+        }
+        auto model{make_model(state)};
+        auto view{std::make_unique<TransactionView>(platform_style.get())};
+        view->setModel(model.get());
+        QSignalSpy completed{model.get(), &WalletModel::feeBumped};
+        QVERIFY(start_bump(*model));
+        QVERIFY(WaitUntil([&] {
+            return SyntheticStateMatches(state, [](const auto& value) { return value.bump_sign_entered; });
+        }, 5000));
+
+        QPointer<QProgressDialog> progress;
+        QVERIFY(WaitUntil([&] {
+            progress = FindBumpFeeProgressDialog();
+            return progress && progress->isVisible() && progress->findChildren<QPushButton*>().empty();
+        }, 5000));
+        progress->deleteLater();
+        view.reset();
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        QVERIFY(progress.isNull());
+
+        ReleaseSyntheticBumpSigning(state);
+        QVERIFY(WaitUntil([&completed] { return completed.count() == 1; }, 5000));
+        QVERIFY(SyntheticStateMatches(state, [](const auto& value) { return value.bump_committed; }));
+    }
+
+    // Wallet-model teardown waits for an irreversible signing operation and
+    // destroys the cloned wallet before returning, preventing queued callbacks
+    // from observing an unloaded wallet.
+    {
+        auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+        {
+            std::lock_guard lock{state->mutex};
+            state->bump_enabled = true;
+            state->allow_bump_sign = false;
+        }
+        auto model{make_model(state)};
+        QVERIFY(start_bump(*model));
+        QVERIFY(WaitUntil([&] {
+            return SyntheticStateMatches(state, [](const auto& value) {
+                return value.bump_sign_entered && value.bump_counters_reserved;
+            });
+        }, 5000));
+
+        std::thread signer_release{[state] {
+            std::this_thread::sleep_for(100ms);
+            ReleaseSyntheticBumpSigning(state);
+        }};
+        QPointer<WalletModel> model_guard{model.get()};
+        model.reset();
+        signer_release.join();
+        QVERIFY(model_guard.isNull());
+        QVERIFY(SyntheticStateMatches(state, [](const auto& value) {
+            return value.background_clone_destroyed && value.bump_committed;
+        }));
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::MetaCall);
+        QCoreApplication::processEvents();
+    }
+}
+
 void TestSendCompletionAfterModelDestruction(interfaces::Node& node)
 {
     TestChain100Setup test{ChainType::REGTEST, {.extra_args = {"-p2mronly=0"}}};
@@ -1653,6 +1899,9 @@ void TestGUI(interfaces::Node& node)
 
 void WalletTests::walletTests()
 {
+    // Modal test clickers need Qt dialogs so their timers remain active while
+    // the Cocoa platform plugin is running a nested dialog event loop.
+    QApplication::setAttribute(Qt::AA_DontUseNativeDialogs);
 #ifdef Q_OS_MACOS
     if (QApplication::platformName() == "minimal") {
         // Disable for mac on "minimal" platform to avoid crashes inside the Qt
@@ -1667,6 +1916,7 @@ void WalletTests::walletTests()
     TestGUI(m_node);
     TestP2MRReceiveAddressTypes(m_node);
     TestSendPQCReportPropagation(m_node);
+    TestAsyncFeeBumpLifecycle(m_node);
     TestSendCompletionAfterModelDestruction(m_node);
     TestUnlockContextModelLifetime(m_node);
     TestSendPQCWarningFormatting();

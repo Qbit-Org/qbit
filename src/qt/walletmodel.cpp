@@ -26,21 +26,49 @@
 #include <util/time.h>
 #include <util/translation.h>
 #include <wallet/coincontrol.h>
+#include <wallet/pqc_usage.h>
 #include <wallet/wallet.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <vector>
 
 #include <QDebug>
+#include <QMetaObject>
 #include <QMessageBox>
+#include <QProgressBar>
+#include <QProgressDialog>
 #include <QSet>
+#include <QThread>
 #include <QTimer>
 
 using wallet::CCoinControl;
 using wallet::CRecipient;
 using wallet::DEFAULT_DISABLE_WALLET;
+
+struct WalletModel::BumpFeeResult {
+    std::unique_ptr<interfaces::Wallet> wallet;
+    Txid original_txid;
+    Txid bumped_txid;
+    std::vector<bilingual_str> errors;
+    CAmount old_fee{0};
+    CAmount new_fee{0};
+    CMutableTransaction mtx;
+    wallet::PQCUsageReport pqc_usage;
+    bool prepared{false};
+    bool signed_ok{false};
+    bool committed{false};
+    bool canceled{false};
+};
+
+struct WalletModel::BumpFeeProgress {
+    BumpFeeProgressPhase phase{BumpFeeProgressPhase::Preparing};
+    unsigned int completed{0};
+    unsigned int total{0};
+};
 
 WalletModel::WalletModel(std::unique_ptr<interfaces::Wallet> wallet, ClientModel& client_model, const PlatformStyle *platformStyle, QObject *parent) :
     QObject(parent),
@@ -59,6 +87,10 @@ WalletModel::WalletModel(std::unique_ptr<interfaces::Wallet> wallet, ClientModel
 
 WalletModel::~WalletModel()
 {
+    m_bump_fee_cancel_requested = true;
+    clearBumpFeeProgressDialog();
+    finishBumpFeeThread();
+    m_bump_fee_unlock_context.reset();
     unsubscribeFromCoreSignals();
 }
 
@@ -576,18 +608,95 @@ WalletModel::UnlockContext::~UnlockContext()
     }
 }
 
-bool WalletModel::bumpFee(Txid hash, Txid& new_hash)
+bool WalletModel::bumpFee(Txid hash)
+{
+    if (m_bump_fee_active) {
+        Q_EMIT message(tr("Fee bump in progress"), tr("Wait for the current fee bump to finish."), CClientUIInterface::MSG_WARNING);
+        return false;
+    }
+
+    std::unique_ptr<interfaces::Wallet> wallet{m_wallet->clone()};
+    if (!wallet) {
+        QMessageBox::critical(nullptr, tr("Fee bump error"), tr("Wallet is no longer loaded."));
+        return false;
+    }
+
+    m_bump_fee_active = true;
+    startBumpFeePreparation(hash, std::move(wallet));
+    return true;
+}
+
+void WalletModel::startBumpFeePreparation(Txid txid, std::unique_ptr<interfaces::Wallet> wallet)
 {
     CCoinControl coin_control;
     coin_control.m_signal_bip125_rbf = true;
-    std::vector<bilingual_str> errors;
-    CAmount old_fee;
-    CAmount new_fee;
-    CMutableTransaction mtx;
-    if (!m_wallet->createBumpTransaction(hash, coin_control, errors, old_fee, new_fee, mtx)) {
-        QMessageBox::critical(nullptr, tr("Fee bump error"), tr("Increasing transaction fee failed") + "<br />(" +
-            (errors.size() ? QString::fromStdString(errors[0].translated) : "") +")");
-        return false;
+
+    clearBumpFeeProgressDialog();
+    const uint64_t generation{++m_bump_fee_generation};
+    m_bump_fee_cancel_requested = false;
+    m_bump_fee_counters_reserved = false;
+
+    m_bump_fee_progress_dialog = new QProgressDialog(nullptr);
+    m_bump_fee_progress_dialog->setObjectName(QStringLiteral("bumpFeeProgressDialog"));
+    m_bump_fee_progress_dialog->setWindowTitle(tr("Increasing Transaction Fee"));
+    m_bump_fee_progress_dialog->setLabelText(tr("Preparing fee-bump transaction..."));
+    m_bump_fee_progress_dialog->setCancelButtonText(tr("Cancel"));
+    m_bump_fee_progress_bar = new QProgressBar(m_bump_fee_progress_dialog);
+    m_bump_fee_progress_bar->setRange(0, 0);
+    m_bump_fee_progress_dialog->setBar(m_bump_fee_progress_bar);
+    m_bump_fee_progress_dialog->setMinimumDuration(250);
+    m_bump_fee_progress_dialog->setAutoClose(false);
+    m_bump_fee_progress_dialog->setAutoReset(false);
+    m_bump_fee_progress_dialog->setWindowModality(Qt::ApplicationModal);
+    GUIUtil::PolishProgressDialog(m_bump_fee_progress_dialog);
+    connect(m_bump_fee_progress_dialog, &QProgressDialog::canceled, this, &WalletModel::cancelBumpFee);
+    QTimer::singleShot(250, m_bump_fee_progress_dialog, [this, generation] {
+        if (generation == m_bump_fee_generation && m_bump_fee_progress_dialog) {
+            m_bump_fee_progress_dialog->show();
+        }
+    });
+
+    auto result{std::make_shared<BumpFeeResult>()};
+    result->wallet = std::move(wallet);
+    result->original_txid = txid;
+    QPointer<WalletModel> model{this};
+    std::atomic_bool* cancel_flag{&m_bump_fee_cancel_requested};
+    m_bump_fee_thread = QThread::create([model, generation, result, coin_control, cancel_flag] {
+        try {
+            result->prepared = result->wallet->createBumpTransaction(
+                result->original_txid,
+                coin_control,
+                result->errors,
+                result->old_fee,
+                result->new_fee,
+                result->mtx);
+        } catch (const std::exception& e) {
+            result->errors.emplace_back(Untranslated(e.what()));
+        }
+        result->canceled = cancel_flag->load();
+        if (!model) return;
+        QMetaObject::invokeMethod(model, [model, generation, result] {
+            if (model) model->bumpFeePrepared(generation, result);
+        }, Qt::QueuedConnection);
+    });
+    m_bump_fee_thread->start();
+}
+
+void WalletModel::bumpFeePrepared(uint64_t generation, std::shared_ptr<BumpFeeResult> result)
+{
+    if (generation != m_bump_fee_generation) return;
+    finishBumpFeeThread();
+    clearBumpFeeProgressDialog();
+
+    if (result->canceled || m_bump_fee_cancel_requested.load()) {
+        resetBumpFeeState();
+        return;
+    }
+    if (!result->prepared) {
+        const QString error{result->errors.empty() ? QString{} : QString::fromStdString(result->errors.front().translated)};
+        QMessageBox::critical(nullptr, tr("Fee bump error"), tr("Increasing transaction fee failed") + "<br />(" + error + ")");
+        resetBumpFeeState();
+        return;
     }
 
     // allow a user based fee verification
@@ -598,15 +707,15 @@ bool WalletModel::bumpFee(Txid hash, Txid& new_hash)
     questionString.append("<tr><td>");
     questionString.append(tr("Current fee:"));
     questionString.append("</td><td>");
-    questionString.append(QbitUnits::formatHtmlWithUnit(getOptionsModel()->getDisplayUnit(), old_fee));
+    questionString.append(QbitUnits::formatHtmlWithUnit(getOptionsModel()->getDisplayUnit(), result->old_fee));
     questionString.append("</td></tr><tr><td>");
     questionString.append(tr("Increase:"));
     questionString.append("</td><td>");
-    questionString.append(QbitUnits::formatHtmlWithUnit(getOptionsModel()->getDisplayUnit(), new_fee - old_fee));
+    questionString.append(QbitUnits::formatHtmlWithUnit(getOptionsModel()->getDisplayUnit(), result->new_fee - result->old_fee));
     questionString.append("</td></tr><tr><td>");
     questionString.append(tr("New fee:"));
     questionString.append("</td><td>");
-    questionString.append(QbitUnits::formatHtmlWithUnit(getOptionsModel()->getDisplayUnit(), new_fee));
+    questionString.append(QbitUnits::formatHtmlWithUnit(getOptionsModel()->getDisplayUnit(), result->new_fee));
     questionString.append("</td></tr></table>");
 
     // Display warning in the "Confirm fee bump" window if the "Coin Control Features" option is enabled
@@ -624,46 +733,246 @@ bool WalletModel::bumpFee(Txid hash, Txid& new_hash)
 
     // cancel sign&broadcast if user doesn't want to bump the fee
     if (retval != QMessageBox::Yes && retval != QMessageBox::Save) {
-        return false;
+        resetBumpFeeState();
+        return;
     }
 
     // Short-circuit if we are returning a bumped transaction PSBT to clipboard
     if (retval == QMessageBox::Save) {
         // "Create Unsigned" clicked
-        PartiallySignedTransaction psbtx(mtx);
+        PartiallySignedTransaction psbtx(result->mtx);
         bool complete = false;
-        const auto err{wallet().fillPSBT(std::nullopt, /*sign=*/false, /*bip32derivs=*/true, nullptr, psbtx, complete)};
+        const auto err{result->wallet->fillPSBT(std::nullopt, /*sign=*/false, /*bip32derivs=*/true, nullptr, psbtx, complete)};
         if (err || complete) {
             QMessageBox::critical(nullptr, tr("Fee bump error"), tr("Can't draft transaction."));
-            return false;
+            resetBumpFeeState();
+            return;
         }
         // Serialize the PSBT
         DataStream ssTx{};
         ssTx << psbtx;
         GUIUtil::setClipboard(EncodeBase64(ssTx.str()).c_str());
         Q_EMIT message(tr("PSBT copied"), tr("Fee-bump PSBT copied to clipboard"), CClientUIInterface::MSG_INFORMATION | CClientUIInterface::MODAL);
-        return true;
+        resetBumpFeeState();
+        return;
     }
 
-    WalletModel::UnlockContext ctx(requestUnlock());
-    if (!ctx.isValid()) {
-        return false;
+    m_bump_fee_unlock_context = std::make_unique<WalletModel::UnlockContext>(requestUnlock());
+    if (!m_bump_fee_unlock_context->isValid()) {
+        resetBumpFeeState();
+        return;
     }
 
     assert(!m_wallet->privateKeysDisabled() || wallet().hasExternalSigner());
 
-    // sign bumped transaction
-    if (!m_wallet->signBumpTransaction(mtx)) {
+    startBumpFeeSigning(std::move(result));
+}
+
+void WalletModel::startBumpFeeSigning(std::shared_ptr<BumpFeeResult> result)
+{
+    clearBumpFeeProgressDialog();
+    const uint64_t generation{++m_bump_fee_generation};
+    m_bump_fee_cancel_requested = false;
+    m_bump_fee_counters_reserved = false;
+
+    m_bump_fee_progress_dialog = new QProgressDialog(nullptr);
+    m_bump_fee_progress_dialog->setObjectName(QStringLiteral("bumpFeeProgressDialog"));
+    m_bump_fee_progress_dialog->setWindowTitle(tr("Increasing Transaction Fee"));
+    m_bump_fee_progress_dialog->setLabelText(tr("Preparing transaction for signing..."));
+    m_bump_fee_progress_dialog->setCancelButtonText(tr("Cancel"));
+    m_bump_fee_progress_bar = new QProgressBar(m_bump_fee_progress_dialog);
+    m_bump_fee_progress_bar->setRange(0, 0);
+    m_bump_fee_progress_dialog->setBar(m_bump_fee_progress_bar);
+    m_bump_fee_progress_dialog->setMinimumDuration(250);
+    m_bump_fee_progress_dialog->setAutoClose(false);
+    m_bump_fee_progress_dialog->setAutoReset(false);
+    m_bump_fee_progress_dialog->setWindowModality(Qt::ApplicationModal);
+    GUIUtil::PolishProgressDialog(m_bump_fee_progress_dialog);
+    connect(m_bump_fee_progress_dialog, &QProgressDialog::canceled, this, &WalletModel::cancelBumpFee);
+    QTimer::singleShot(250, m_bump_fee_progress_dialog, [this, generation] {
+        if (generation == m_bump_fee_generation && m_bump_fee_progress_dialog) {
+            m_bump_fee_progress_dialog->show();
+        }
+    });
+
+    QPointer<WalletModel> model{this};
+    std::atomic_bool* cancel_flag{&m_bump_fee_cancel_requested};
+    std::atomic_bool* counters_reserved_flag{&m_bump_fee_counters_reserved};
+    m_bump_fee_thread = QThread::create([model, generation, result, cancel_flag, counters_reserved_flag] {
+        const auto post_progress = [model, generation, cancel_flag](BumpFeeProgress progress, bool cancellable) {
+            if (!model || (cancellable && cancel_flag->load())) return false;
+            QMetaObject::invokeMethod(model, [model, generation, progress] {
+                if (model) model->bumpFeeProgress(generation, progress);
+            }, Qt::QueuedConnection);
+            return !cancellable || !cancel_flag->load();
+        };
+        const SigningProgressCallback progress_callback = [post_progress, counters_reserved_flag](const SigningProgress& progress) {
+            if (!progress.cancellable) counters_reserved_flag->store(true);
+            bool cancellable{progress.cancellable && !counters_reserved_flag->load()};
+            BumpFeeProgress mapped;
+            mapped.completed = progress.completed;
+            mapped.total = progress.total;
+            switch (progress.phase) {
+            case SigningProgressPhase::PREPARING_TRANSACTION:
+                mapped.phase = BumpFeeProgressPhase::Preparing;
+                break;
+            case SigningProgressPhase::RESERVING_PQC_COUNTERS:
+                mapped.phase = BumpFeeProgressPhase::Reserving;
+                if (progress.total > 0 && progress.completed >= progress.total) {
+                    counters_reserved_flag->store(true);
+                    cancellable = false;
+                }
+                break;
+            case SigningProgressPhase::SIGNING_INPUTS:
+                mapped.phase = BumpFeeProgressPhase::Signing;
+                break;
+            case SigningProgressPhase::FINALIZING_TRANSACTION:
+                mapped.phase = BumpFeeProgressPhase::Finalizing;
+                break;
+            }
+            return post_progress(mapped, cancellable);
+        };
+
+        try {
+            result->signed_ok = result->wallet->signBumpTransaction(result->mtx, &result->pqc_usage, progress_callback);
+            if (cancel_flag->load() && !counters_reserved_flag->load()) {
+                result->canceled = true;
+            } else if (result->signed_ok) {
+                post_progress(BumpFeeProgress{.phase = BumpFeeProgressPhase::Committing}, /*cancellable=*/false);
+                result->committed = result->wallet->commitBumpTransaction(
+                    result->original_txid, std::move(result->mtx), result->errors, result->bumped_txid);
+            }
+        } catch (const std::exception& e) {
+            result->errors.emplace_back(Untranslated(e.what()));
+        }
+
+        if (!model) return;
+        QMetaObject::invokeMethod(model, [model, generation, result] {
+            if (model) model->bumpFeeFinished(generation, result);
+        }, Qt::QueuedConnection);
+    });
+    m_bump_fee_thread->start();
+}
+
+void WalletModel::bumpFeeProgress(uint64_t generation, BumpFeeProgress progress)
+{
+    if (generation != m_bump_fee_generation || !m_bump_fee_progress_dialog || !m_bump_fee_progress_bar) return;
+
+    QPointer<QProgressDialog> dialog{m_bump_fee_progress_dialog};
+    QPointer<QProgressBar> bar{m_bump_fee_progress_bar};
+    if (m_bump_fee_counters_reserved.load()) {
+        dialog->setCancelButton(nullptr);
+        if (!dialog || !bar) return;
+    }
+
+    switch (progress.phase) {
+    case BumpFeeProgressPhase::Preparing:
+        dialog->setLabelText(tr("Preparing transaction for signing..."));
+        if (bar) bar->setRange(0, 0);
+        break;
+    case BumpFeeProgressPhase::Reserving:
+        dialog->setLabelText(tr("Reserving signing counters..."));
+        if (bar) bar->setRange(0, 0);
+        break;
+    case BumpFeeProgressPhase::Signing:
+        if (progress.total == 0) {
+            dialog->setLabelText(tr("Signing inputs..."));
+            if (bar) bar->setRange(0, 0);
+        } else {
+            progress.completed = std::min(progress.completed, progress.total);
+            dialog->setLabelText(tr("Signing inputs: %1 of %2 complete...").arg(progress.completed).arg(progress.total));
+            if (bar) {
+                bar->setRange(0, static_cast<int>(progress.total));
+                bar->setValue(static_cast<int>(progress.completed));
+            }
+        }
+        break;
+    case BumpFeeProgressPhase::Finalizing:
+        dialog->setLabelText(tr("Finalizing transaction..."));
+        if (bar) bar->setRange(0, 0);
+        break;
+    case BumpFeeProgressPhase::Committing:
+        dialog->setLabelText(tr("Committing fee-bump transaction..."));
+        if (bar) bar->setRange(0, 0);
+        break;
+    }
+}
+
+void WalletModel::bumpFeeFinished(uint64_t generation, std::shared_ptr<BumpFeeResult> result)
+{
+    if (generation != m_bump_fee_generation) return;
+    finishBumpFeeThread();
+    clearBumpFeeProgressDialog();
+    m_bump_fee_unlock_context.reset();
+
+    if (result->canceled) {
+        resetBumpFeeState();
+        return;
+    }
+    if (!result->signed_ok) {
         QMessageBox::critical(nullptr, tr("Fee bump error"), tr("Can't sign transaction."));
-        return false;
+        resetBumpFeeState();
+        return;
     }
-    // commit the bumped transaction
-    if(!m_wallet->commitBumpTransaction(hash, std::move(mtx), errors, new_hash)) {
-        QMessageBox::critical(nullptr, tr("Fee bump error"), tr("Could not commit transaction") + "<br />(" +
-            QString::fromStdString(errors[0].translated)+")");
-        return false;
+    if (!result->committed) {
+        const QString error{result->errors.empty() ? QString{} : QString::fromStdString(result->errors.front().translated)};
+        QMessageBox::critical(nullptr, tr("Fee bump error"), tr("Could not commit transaction") + "<br />(" + error + ")");
+        resetBumpFeeState();
+        return;
     }
-    return true;
+
+    const Txid original_txid{result->original_txid};
+    const Txid bumped_txid{result->bumped_txid};
+    resetBumpFeeState();
+    Q_EMIT feeBumped(original_txid, bumped_txid);
+}
+
+void WalletModel::cancelBumpFee()
+{
+    if (m_bump_fee_counters_reserved.load()) {
+        m_bump_fee_cancel_requested = false;
+        if (m_bump_fee_progress_dialog) {
+            m_bump_fee_progress_dialog->setCancelButton(nullptr);
+            m_bump_fee_progress_dialog->setLabelText(tr("Finalizing transaction..."));
+        }
+        return;
+    }
+    m_bump_fee_cancel_requested = true;
+    if (m_bump_fee_progress_dialog) {
+        m_bump_fee_progress_dialog->setCancelButton(nullptr);
+        m_bump_fee_progress_dialog->setLabelText(tr("Canceling fee bump..."));
+        if (m_bump_fee_progress_bar) m_bump_fee_progress_bar->setRange(0, 0);
+    }
+}
+
+void WalletModel::clearBumpFeeProgressDialog()
+{
+    if (!m_bump_fee_progress_dialog) return;
+    QProgressDialog* dialog{m_bump_fee_progress_dialog};
+    m_bump_fee_progress_dialog = nullptr;
+    m_bump_fee_progress_bar = nullptr;
+    disconnect(dialog, nullptr, this, nullptr);
+    dialog->close();
+    dialog->deleteLater();
+}
+
+void WalletModel::finishBumpFeeThread()
+{
+    if (!m_bump_fee_thread) return;
+    QThread* thread{m_bump_fee_thread};
+    m_bump_fee_thread = nullptr;
+    thread->wait();
+    delete thread;
+}
+
+void WalletModel::resetBumpFeeState()
+{
+    ++m_bump_fee_generation;
+    m_bump_fee_active = false;
+    m_bump_fee_cancel_requested = false;
+    m_bump_fee_counters_reserved = false;
+    clearBumpFeeProgressDialog();
+    m_bump_fee_unlock_context.reset();
 }
 
 void WalletModel::displayAddress(std::string sAddress) const

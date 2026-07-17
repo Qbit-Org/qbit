@@ -29,6 +29,21 @@ struct SyntheticWalletState {
     bool locked{false};
     int lock_calls{0};
     int unlock_calls{0};
+    bool bump_enabled{false};
+    bool bump_prepare_entered{false};
+    bool bump_prepare_success{true};
+    bool allow_bump_prepare{true};
+    bool bump_sign_entered{false};
+    bool bump_sign_success{true};
+    bool bump_use_counters{true};
+    bool allow_bump_reservation{true};
+    bool bump_counters_reserved{false};
+    bool allow_bump_sign{true};
+    bool bump_cancel_observed{false};
+    bool bump_commit_entered{false};
+    bool bump_commit_success{true};
+    bool bump_committed{false};
+    bool external_signer{false};
 };
 
 std::unique_ptr<interfaces::Wallet> MakeSyntheticWallet(

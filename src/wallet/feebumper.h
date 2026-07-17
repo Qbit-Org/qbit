@@ -6,8 +6,10 @@
 #define QBIT_WALLET_FEEBUMPER_H
 
 #include <consensus/consensus.h>
-#include <script/interpreter.h>
 #include <primitives/transaction.h>
+#include <script/interpreter.h>
+#include <script/signingprogress.h>
+#include <script/signingprovider.h>
 
 class uint256;
 enum class FeeEstimateMode;
@@ -60,7 +62,10 @@ Result CreateRateBumpTransaction(CWallet& wallet,
 //! Sign the new transaction,
 //! @return false if the tx couldn't be found or if it was
 //! impossible to create the signature(s)
-bool SignTransaction(CWallet& wallet, CMutableTransaction& mtx);
+bool SignTransaction(CWallet& wallet,
+    CMutableTransaction& mtx,
+    const PQCSignatureCounterObserver& pqc_counter_observer = {},
+    const SigningProgressCallback& progress_callback = {});
 
 //! Commit the bumpfee transaction.
 //! @return success in case of CWallet::CommitTransaction was successful,
