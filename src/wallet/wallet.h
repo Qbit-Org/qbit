@@ -823,6 +823,7 @@ public:
     /** Number of pre-generated keys/scripts by each spkm (part of the look-ahead process, used to detect payments) */
     int64_t m_keypool_size{DEFAULT_KEYPOOL_SIZE};
     bool m_deferred_create_keypool_top_up_scheduled GUARDED_BY(cs_wallet){false};
+    bool m_deferred_create_keypool_top_up_reschedule_requested GUARDED_BY(cs_wallet){false};
     bool m_p2mr_receive_keypool_refill_scheduled GUARDED_BY(cs_wallet){false};
     bool m_p2mr_change_keypool_refill_scheduled GUARDED_BY(cs_wallet){false};
 

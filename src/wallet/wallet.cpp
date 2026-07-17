@@ -356,6 +356,7 @@ struct DeferredCreateKeyPoolTopUpState {
     CScheduler* scheduler;
     int remaining_steps;
     std::optional<SteadyClock::time_point> refill_start;
+    std::function<void()> step_finished_fn;
 };
 
 struct P2MRKeyPoolRefillState {
@@ -382,19 +383,32 @@ void RunScheduledPendingInitialKeyPoolTopUp(const std::shared_ptr<DeferredCreate
         state->refill_start = SteadyClock::now();
     }
     const auto step_result = wallet->RunPendingInitialKeyPoolTopUpStep();
-    if (step_result == CWallet::PendingInitialKeyPoolTopUpStepResult::COMPLETE) {
-        WITH_LOCK(wallet->cs_wallet, wallet->m_deferred_create_keypool_top_up_scheduled = false);
-        wallet->WalletLogPrintf("Deferred create-time keypool top up completed in %15dms\n",
-            Ticks<std::chrono::milliseconds>(SteadyClock::now() - *state->refill_start));
-        return;
+    if (state->step_finished_fn) {
+        state->step_finished_fn();
     }
-    if (step_result == CWallet::PendingInitialKeyPoolTopUpStepResult::FAILED) {
-        WITH_LOCK(wallet->cs_wallet, wallet->m_deferred_create_keypool_top_up_scheduled = false);
-        wallet->WalletLogPrintf("Deferred create-time keypool top up paused after a failed background step\n");
-        return;
+
+    bool continue_refill{false};
+    {
+        LOCK(wallet->cs_wallet);
+        const bool can_continue{!wallet->IsLocked() && wallet->HasPendingInitialKeyPoolTopUp()};
+        if (can_continue &&
+            (step_result == CWallet::PendingInitialKeyPoolTopUpStepResult::PENDING ||
+             wallet->m_deferred_create_keypool_top_up_reschedule_requested)) {
+            wallet->m_deferred_create_keypool_top_up_reschedule_requested = false;
+            continue_refill = true;
+        } else {
+            wallet->m_deferred_create_keypool_top_up_scheduled = false;
+            wallet->m_deferred_create_keypool_top_up_reschedule_requested = false;
+        }
     }
-    if (wallet->IsLocked() || !wallet->HasPendingInitialKeyPoolTopUp()) {
-        WITH_LOCK(wallet->cs_wallet, wallet->m_deferred_create_keypool_top_up_scheduled = false);
+
+    if (!continue_refill) {
+        if (step_result == CWallet::PendingInitialKeyPoolTopUpStepResult::COMPLETE) {
+            wallet->WalletLogPrintf("Deferred create-time keypool top up completed in %15dms\n",
+                Ticks<std::chrono::milliseconds>(SteadyClock::now() - *state->refill_start));
+        } else if (step_result == CWallet::PendingInitialKeyPoolTopUpStepResult::FAILED) {
+            wallet->WalletLogPrintf("Deferred create-time keypool top up paused after a failed background step\n");
+        }
         return;
     }
     if (--state->remaining_steps == 0) {
@@ -411,10 +425,18 @@ void SchedulePendingInitialKeyPoolTopUp(WalletContext& context, const std::share
 
     {
         LOCK(wallet->cs_wallet);
-        if (wallet->m_deferred_create_keypool_top_up_scheduled || wallet->IsLocked() || !wallet->HasPendingInitialKeyPoolTopUp()) {
+        if (wallet->IsLocked() || !wallet->HasPendingInitialKeyPoolTopUp()) {
+            return;
+        }
+        if (wallet->m_deferred_create_keypool_top_up_scheduled) {
+            // Record the unlock/scheduling attempt so a worker that is about
+            // to retire hands ownership to a replacement instead of clearing
+            // the deduplication flag after the attempt returns.
+            wallet->m_deferred_create_keypool_top_up_reschedule_requested = true;
             return;
         }
         wallet->m_deferred_create_keypool_top_up_scheduled = true;
+        wallet->m_deferred_create_keypool_top_up_reschedule_requested = false;
     }
 
     auto state = std::make_shared<DeferredCreateKeyPoolTopUpState>(DeferredCreateKeyPoolTopUpState{
@@ -422,6 +444,7 @@ void SchedulePendingInitialKeyPoolTopUp(WalletContext& context, const std::share
         .scheduler = context.scheduler,
         .remaining_steps = GetDeferredCreateKeyPoolTopUpStepsPerBatch(),
         .refill_start = std::nullopt,
+        .step_finished_fn = context.deferred_keypool_top_up_step_finished_fn,
     });
     context.scheduler->scheduleFromNow([state] { RunScheduledPendingInitialKeyPoolTopUp(state); }, delay);
 }

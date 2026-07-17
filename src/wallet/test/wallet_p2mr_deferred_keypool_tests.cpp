@@ -504,11 +504,13 @@ BOOST_FIXTURE_TEST_CASE(WalletInterfaceUnlockSchedulesDeferredP2MRKeypoolTopUp, 
         BOOST_CHECK(wallet->m_deferred_create_keypool_top_up_scheduled);
     }
 
-    // Repeated scheduling while the first worker is pending must be a no-op.
+    // Repeated scheduling while the first worker is pending must not queue a
+    // second worker.
     MaybeSchedulePendingInitialKeyPoolTopUp(context, wallet);
     {
         LOCK(wallet->cs_wallet);
         BOOST_CHECK(wallet->m_deferred_create_keypool_top_up_scheduled);
+        BOOST_CHECK(wallet->m_deferred_create_keypool_top_up_reschedule_requested);
     }
 
     // Relocking before the worker runs must pause it and make a later unlock
@@ -521,9 +523,43 @@ BOOST_FIXTURE_TEST_CASE(WalletInterfaceUnlockSchedulesDeferredP2MRKeypoolTopUp, 
     {
         LOCK(wallet->cs_wallet);
         BOOST_CHECK(!wallet->m_deferred_create_keypool_top_up_scheduled);
+        BOOST_CHECK(!wallet->m_deferred_create_keypool_top_up_reschedule_requested);
     }
 
+    // Exercise the unlock race after a locked worker finishes its step but
+    // before it updates the scheduling flags.
+    std::promise<void> scheduler_blocked_again;
+    std::promise<void> release_scheduler_again;
+    auto release_scheduler_again_future{release_scheduler_again.get_future()};
+    scheduler.scheduleFromNow([&] {
+        scheduler_blocked_again.set_value();
+        release_scheduler_again_future.wait();
+    }, std::chrono::milliseconds{0});
+    scheduler_blocked_again.get_future().wait();
+
+    std::promise<void> step_finished;
+    std::promise<void> release_step;
+    auto release_step_future{release_step.get_future()};
+    std::atomic_bool pause_next_step{true};
+    context.deferred_keypool_top_up_step_finished_fn = [&] {
+        if (!pause_next_step.exchange(false)) return;
+        step_finished.set_value();
+        release_step_future.wait();
+    };
+
     BOOST_REQUIRE(wallet_interface->unlock(passphrase));
+    BOOST_REQUIRE(wallet_interface->lock());
+    release_scheduler_again.set_value();
+    step_finished.get_future().wait();
+
+    BOOST_REQUIRE(wallet_interface->unlock(passphrase));
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_CHECK(wallet->m_deferred_create_keypool_top_up_scheduled);
+        BOOST_CHECK(wallet->m_deferred_create_keypool_top_up_reschedule_requested);
+    }
+    release_step.set_value();
+
     for (int i = 0; i < 10 && wallet->HasPendingInitialKeyPoolTopUp(); ++i) {
         WaitForScheduler(scheduler);
     }
@@ -534,6 +570,7 @@ BOOST_FIXTURE_TEST_CASE(WalletInterfaceUnlockSchedulesDeferredP2MRKeypoolTopUp, 
     {
         LOCK(wallet->cs_wallet);
         BOOST_CHECK(!wallet->m_deferred_create_keypool_top_up_scheduled);
+        BOOST_CHECK(!wallet->m_deferred_create_keypool_top_up_reschedule_requested);
     }
 
     wallet_interface.reset();
