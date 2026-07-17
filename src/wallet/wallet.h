@@ -761,7 +761,8 @@ public:
                   bool bip32derivs = true,
                   size_t* n_signed = nullptr,
                   bool finalize = true,
-                  const PQCSignatureCounterObserver& pqc_counter_observer = {}) const;
+                  const PQCSignatureCounterObserver& pqc_counter_observer = {},
+                  const SigningProgressCallback& progress_callback = {}) const;
 
     /**
      * Submit the transaction to the node's mempool and then relay to peers.
