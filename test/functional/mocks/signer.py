@@ -17,7 +17,19 @@ from test_framework.address import (
     output_key_to_p2tr,
 )
 from test_framework.descriptors import descsum_create
+from test_framework.key import sign_schnorr, tweak_add_privkey
+from test_framework.messages import CTxOut, from_binary
+from test_framework.psbt import (
+    PSBT,
+    PSBT_IN_SIGHASH_TYPE,
+    PSBT_IN_TAP_KEY_SIG,
+    PSBT_IN_WITNESS_UTXO,
+)
 from test_framework.script import taproot_construct
+from test_framework.script import SIGHASH_DEFAULT, TaprootSignatureHash
+
+TAPROOT_RECEIVE_KEY = bytes.fromhex("b6f762e107af1dd4c73f7f1ce84298d71ec07a0a66fb8d8f24551f99435af082")
+TAPROOT_RECEIVE_INFO = taproot_construct(bytes.fromhex("c97dc3f4420402e01a113984311bf4a1b8de376cac0bdcfaf1b3ac81f13433c7"))
 
 def perform_pre_checks():
     mock_result_path = os.path.join(os.getcwd(), "mock_result")
@@ -73,6 +85,20 @@ def displayaddress(args):
 def signtx(args):
     if args.fingerprint != "00000001":
         return sys.stdout.write(json.dumps({"error": "Unexpected fingerprint", "fingerprint": args.fingerprint}))
+
+    if os.path.isfile(os.path.join(os.getcwd(), "mock_sign_taproot")):
+        psbt = PSBT.from_base64(args.psbt)
+        spent_outputs = [from_binary(CTxOut, tx_input.map[PSBT_IN_WITNESS_UTXO]) for tx_input in psbt.i]
+        tweaked_key = tweak_add_privkey(TAPROOT_RECEIVE_KEY, TAPROOT_RECEIVE_INFO.tweak)
+        for index in range(len(psbt.i)):
+            tx_input = psbt.i[index]
+            spent_output = spent_outputs[index]
+            if spent_output.scriptPubKey != TAPROOT_RECEIVE_INFO.scriptPubKey:
+                continue
+            hash_type = int.from_bytes(tx_input.map.get(PSBT_IN_SIGHASH_TYPE, SIGHASH_DEFAULT.to_bytes(4, "little")), "little")
+            sighash = TaprootSignatureHash(psbt.tx, spent_outputs, hash_type, index)
+            tx_input.map[PSBT_IN_TAP_KEY_SIG] = sign_schnorr(tweaked_key, sighash)
+        return sys.stdout.write(json.dumps({"psbt": psbt.to_base64(), "complete": True}))
 
     with open(os.path.join(os.getcwd(), "mock_psbt"), "r", encoding="utf8") as f:
         mock_psbt = f.read()

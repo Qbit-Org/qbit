@@ -147,6 +147,7 @@ public:
     interfaces::Wallet& wallet() const { return *m_wallet; }
     ClientModel& clientModel() const { return *m_client_model; }
     void setClientModel(ClientModel* client_model);
+    void prepareForShutdown();
 
     QString getWalletName() const;
     QString getDisplayName() const;

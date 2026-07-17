@@ -87,11 +87,17 @@ WalletModel::WalletModel(std::unique_ptr<interfaces::Wallet> wallet, ClientModel
 
 WalletModel::~WalletModel()
 {
-    m_bump_fee_cancel_requested = true;
-    clearBumpFeeProgressDialog();
+    prepareForShutdown();
     finishBumpFeeThread();
     m_bump_fee_unlock_context.reset();
     unsubscribeFromCoreSignals();
+}
+
+void WalletModel::prepareForShutdown()
+{
+    ++m_bump_fee_generation;
+    m_bump_fee_cancel_requested = true;
+    clearBumpFeeProgressDialog();
 }
 
 void WalletModel::startPollBalance()
@@ -650,7 +656,7 @@ void WalletModel::startBumpFeePreparation(Txid txid, std::unique_ptr<interfaces:
     m_bump_fee_progress_dialog->setWindowModality(Qt::ApplicationModal);
     GUIUtil::PolishProgressDialog(m_bump_fee_progress_dialog);
     connect(m_bump_fee_progress_dialog, &QProgressDialog::canceled, this, &WalletModel::cancelBumpFee);
-    QTimer::singleShot(250, m_bump_fee_progress_dialog, [this, generation] {
+    QTimer::singleShot(250, this, [this, generation] {
         if (generation == m_bump_fee_generation && m_bump_fee_progress_dialog) {
             m_bump_fee_progress_dialog->show();
         }
@@ -789,7 +795,7 @@ void WalletModel::startBumpFeeSigning(std::shared_ptr<BumpFeeResult> result)
     m_bump_fee_progress_dialog->setWindowModality(Qt::ApplicationModal);
     GUIUtil::PolishProgressDialog(m_bump_fee_progress_dialog);
     connect(m_bump_fee_progress_dialog, &QProgressDialog::canceled, this, &WalletModel::cancelBumpFee);
-    QTimer::singleShot(250, m_bump_fee_progress_dialog, [this, generation] {
+    QTimer::singleShot(250, this, [this, generation] {
         if (generation == m_bump_fee_generation && m_bump_fee_progress_dialog) {
             m_bump_fee_progress_dialog->show();
         }

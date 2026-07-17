@@ -120,7 +120,8 @@ BOOST_AUTO_TEST_CASE(commit_revalidates_fee_after_signing)
     CMutableTransaction stale_replacement{original};
     std::vector<bilingual_str> errors;
     Txid bumped_txid;
-    BOOST_CHECK(CommitTransaction(m_wallet, original.GetHash(), std::move(stale_replacement), errors, bumped_txid) == Result::WALLET_ERROR);
+    const Result commit_result{CommitTransaction(m_wallet, original.GetHash(), std::move(stale_replacement), errors, bumped_txid)};
+    BOOST_CHECK(commit_result == Result::WALLET_ERROR);
     BOOST_REQUIRE_EQUAL(errors.size(), 1U);
     BOOST_CHECK_EQUAL(errors.front().original, "Replacement transaction fee is no longer higher than the original fee");
     BOOST_CHECK(bumped_txid.IsNull());
@@ -147,7 +148,8 @@ BOOST_AUTO_TEST_CASE(commit_revalidates_competing_wallet_spend)
 
     std::vector<bilingual_str> errors;
     Txid bumped_txid;
-    BOOST_CHECK(CommitTransaction(m_wallet, original.GetHash(), std::move(replacement), errors, bumped_txid) == Result::WALLET_ERROR);
+    const Result commit_result{CommitTransaction(m_wallet, original.GetHash(), std::move(replacement), errors, bumped_txid)};
+    BOOST_CHECK(commit_result == Result::WALLET_ERROR);
     BOOST_REQUIRE_EQUAL(errors.size(), 1U);
     BOOST_CHECK(errors.front().original.find("is already spent by wallet transaction") != std::string::npos);
     BOOST_CHECK(bumped_txid.IsNull());
