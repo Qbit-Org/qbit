@@ -57,6 +57,13 @@ WalletFrame::WalletFrame(const PlatformStyle* _platformStyle, QWidget* parent)
 
 WalletFrame::~WalletFrame() = default;
 
+void WalletFrame::prepareForShutdown()
+{
+    for (WalletView* wallet_view : mapWalletViews) {
+        wallet_view->prepareForShutdown();
+    }
+}
+
 void WalletFrame::setClientModel(ClientModel *_clientModel)
 {
     this->clientModel = _clientModel;

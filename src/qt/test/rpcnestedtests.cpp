@@ -4,6 +4,7 @@
 
 #include <qt/test/rpcnestedtests.h>
 
+#include <chainparams.h>
 #include <common/system.h>
 #include <interfaces/node.h>
 #include <qt/rpcconsole.h>
@@ -82,7 +83,7 @@ void RPCNestedTests::rpcNestedTests()
     QVERIFY(result == result2);
 
     RPCConsole::RPCExecuteCommandLine(m_node, result, "getblock(getbestblockhash())[tx][0]", &filtered);
-    QVERIFY(result == "773941c57f540b7e0f841db6de90bf4f29d305d8233224c2581025c684387313");
+    QVERIFY(result == Params().GenesisBlock().vtx[0]->GetHash().GetHex());
     QVERIFY(filtered == "getblock(getbestblockhash())[tx][0]");
 
     RPCConsole::RPCParseCommandLine(nullptr, result, "signmessagewithprivkey abc", false, &filtered);

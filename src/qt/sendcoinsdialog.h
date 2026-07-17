@@ -61,6 +61,7 @@ public:
     void setAddress(const QString &address);
     void pasteEntry(const SendCoinsRecipient &rv);
     bool handlePaymentRequest(const SendCoinsRecipient &recipient);
+    void prepareForShutdown();
 
     // Only used for testing-purposes
     wallet::CCoinControl* getCoinControl() { return m_coin_control.get(); }

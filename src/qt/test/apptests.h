@@ -32,6 +32,7 @@ public:
 
 private Q_SLOTS:
     void appTests();
+    void cleanup();
     void guiTests(BitcoinGUI* window);
     void consoleTests(RPCConsole* console);
 
@@ -63,6 +64,7 @@ private:
     int64_t m_shutdown_elapsed_ms{-1};
     int m_shutdown_coins_sent{0};
     bool m_wallet_dependents_destroyed_before_model{false};
+    bool m_remove_test_wallet_settings{false};
 };
 
 #endif // QBIT_QT_TEST_APPTESTS_H

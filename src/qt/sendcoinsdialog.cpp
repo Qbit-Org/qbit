@@ -358,8 +358,7 @@ void SendCoinsDialog::setModel(WalletModel *_model)
 
 SendCoinsDialog::~SendCoinsDialog()
 {
-    m_prepare_cancel_requested = true;
-    clearPrepareProgressDialog();
+    prepareForShutdown();
     if (m_prepare_thread) {
         QThread* thread = m_prepare_thread;
         m_prepare_thread = nullptr;
@@ -376,6 +375,12 @@ SendCoinsDialog::~SendCoinsDialog()
     settings.setValue("nTransactionFee", (qint64)ui->customFee->value());
 
     delete ui;
+}
+
+void SendCoinsDialog::prepareForShutdown()
+{
+    m_prepare_cancel_requested = true;
+    clearPrepareProgressDialog();
 }
 
 bool SendCoinsDialog::PrepareSendText(QString& question_string, QString& informative_text, QString& detailed_text)

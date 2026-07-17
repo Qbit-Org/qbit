@@ -7,17 +7,38 @@
 #include <consensus/params.h>
 #include <headerssync.h>
 #include <net.h>
+#include <net_processing.h>
 #include <pow.h>
 #include <primitives/pureheader.h>
 #include <serialize.h>
 #include <test/util/setup_common.h>
 #include <util/chaintype.h>
+#include <util/time.h>
 #include <validation.h>
 
 #include <deque>
 #include <vector>
 
 #include <boost/test/unit_test.hpp>
+
+namespace {
+class ScopedMockTime
+{
+public:
+    explicit ScopedMockTime(std::chrono::seconds mock_time) : m_previous{GetMockTime()}
+    {
+        SetMockTime(mock_time);
+    }
+
+    ~ScopedMockTime()
+    {
+        SetMockTime(m_previous);
+    }
+
+private:
+    const std::chrono::seconds m_previous;
+};
+} // namespace
 
 struct HeadersGeneratorSetup : public RegTestingSetup {
     /** Search for a nonce to meet (regtest) proof of work */
@@ -290,6 +311,30 @@ BOOST_AUTO_TEST_CASE(headers_sync_state)
     BOOST_CHECK(result.success);
 }
 
+BOOST_AUTO_TEST_CASE(headers_sync_future_chain_start_does_not_wrap_commitment_limit)
+{
+    const CBlockIndex* chain_start = WITH_LOCK(::cs_main, return m_node.chainman->m_blockman.LookupBlockIndex(Params().GenesisBlock().GetHash()));
+    BOOST_REQUIRE(chain_start);
+
+    std::vector<CBlockHeader> headers;
+    GenerateHeaders(headers,
+                    MAX_HEADERS_RESULTS,
+                    chain_start->GetBlockHash(),
+                    chain_start->nVersion,
+                    chain_start->GetBlockTime(),
+                    ArithToUint256(0),
+                    chain_start->nBits);
+
+    // Make the signed commitment window negative enough that the old formula
+    // produced a negative quotient before converting it to uint64_t. A full
+    // headers batch is guaranteed to encounter a stored commitment, so a zero
+    // limit must abort presync instead of admitting an effectively unbounded
+    // number of commitments.
+    const ScopedMockTime mock_time{std::chrono::seconds{
+        chain_start->GetMedianTimePast() - MAX_FUTURE_BLOCK_TIME_LEGACY - MAX_HEADERS_RESULTS}};
+    AssertHeadersSyncRejects(Params().GetConsensus(), *chain_start, headers);
+}
+
 BOOST_AUTO_TEST_CASE(headers_sync_accepts_genesis_to_permissionless_anchor_jumps)
 {
     // These shipped networks fail on current develop because presync compares
@@ -395,6 +440,7 @@ BOOST_AUTO_TEST_CASE(headers_sync_uses_cached_starved_lane_history)
                                           chain.back().nTime + 1,
                                           /*n_bits=*/0);
         resumed.nBits = GetNextWorkRequired(&chain.back(), &resumed, consensus);
+        const ScopedMockTime mock_time{std::chrono::seconds{chain.back().GetMedianTimePast() + 1}};
         AssertHeadersSyncAccepts(consensus, chain.back(), {resumed});
     }
 }

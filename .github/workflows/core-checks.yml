@@ -231,6 +231,7 @@ jobs:
           suites=(
             pqc_tests
             asert_tests
+            auxpow_tests
             pow_tests
             subsidy_tests
             script_p2mr_tests

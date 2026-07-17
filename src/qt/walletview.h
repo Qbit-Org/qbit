@@ -44,6 +44,7 @@ public:
     */
     void setClientModel(ClientModel *clientModel);
     WalletModel* getWalletModel() const noexcept { return walletModel; }
+    void prepareForShutdown();
 
     bool handlePaymentRequest(const SendCoinsRecipient& recipient);
 
