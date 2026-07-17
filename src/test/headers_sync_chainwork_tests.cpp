@@ -7,6 +7,7 @@
 #include <consensus/params.h>
 #include <headerssync.h>
 #include <net.h>
+#include <net_processing.h>
 #include <pow.h>
 #include <primitives/pureheader.h>
 #include <serialize.h>
@@ -312,15 +313,26 @@ BOOST_AUTO_TEST_CASE(headers_sync_state)
 
 BOOST_AUTO_TEST_CASE(headers_sync_future_chain_start_does_not_wrap_commitment_limit)
 {
-    const auto chain_params = CreateChainParams(*m_node.args, ChainType::MAIN);
-    const auto& consensus = chain_params->GetConsensus();
-    CBlockIndex genesis{chain_params->GenesisBlock()};
-    const uint256 genesis_hash{chain_params->GenesisBlock().GetHash()};
-    FinalizeIndex(genesis, genesis_hash, /*pprev=*/nullptr, /*height=*/0, /*auxpow_count=*/0, GetBlockProof(genesis));
+    const CBlockIndex* chain_start = WITH_LOCK(::cs_main, return m_node.chainman->m_blockman.LookupBlockIndex(Params().GenesisBlock().GetHash()));
+    BOOST_REQUIRE(chain_start);
 
-    const ScopedMockTime mock_time{std::chrono::seconds{genesis.GetMedianTimePast() - MAX_FUTURE_BLOCK_TIME_LEGACY - 1}};
-    HeadersSyncState hss{/*id=*/0, consensus, &genesis, genesis.nChainWork};
-    BOOST_CHECK(hss.GetState() == HeadersSyncState::State::PRESYNC);
+    std::vector<CBlockHeader> headers;
+    GenerateHeaders(headers,
+                    MAX_HEADERS_RESULTS,
+                    chain_start->GetBlockHash(),
+                    chain_start->nVersion,
+                    chain_start->GetBlockTime(),
+                    ArithToUint256(0),
+                    chain_start->nBits);
+
+    // Make the signed commitment window negative enough that the old formula
+    // produced a negative quotient before converting it to uint64_t. A full
+    // headers batch is guaranteed to encounter a stored commitment, so a zero
+    // limit must abort presync instead of admitting an effectively unbounded
+    // number of commitments.
+    const ScopedMockTime mock_time{std::chrono::seconds{
+        chain_start->GetMedianTimePast() - MAX_FUTURE_BLOCK_TIME_LEGACY - MAX_HEADERS_RESULTS}};
+    AssertHeadersSyncRejects(Params().GetConsensus(), *chain_start, headers);
 }
 
 BOOST_AUTO_TEST_CASE(headers_sync_accepts_genesis_to_permissionless_anchor_jumps)
