@@ -33,6 +33,7 @@ struct SyntheticWalletState {
     bool bump_prepare_entered{false};
     bool bump_prepare_success{true};
     bool allow_bump_prepare{true};
+    bool bump_prepare_cancel_observed{false};
     bool bump_sign_entered{false};
     bool bump_sign_success{true};
     bool bump_use_counters{true};

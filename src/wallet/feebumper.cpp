@@ -174,8 +174,19 @@ bool TransactionCanBeBumped(const CWallet& wallet, const Txid& txid)
 }
 
 Result CreateRateBumpTransaction(CWallet& wallet, const Txid& txid, const CCoinControl& coin_control, std::vector<bilingual_str>& errors,
-                                 CAmount& old_fee, CAmount& new_fee, CMutableTransaction& mtx, bool require_mine, const std::vector<CTxOut>& outputs, std::optional<uint32_t> original_change_index)
+                                 CAmount& old_fee, CAmount& new_fee, CMutableTransaction& mtx, bool require_mine, const std::vector<CTxOut>& outputs, std::optional<uint32_t> original_change_index,
+                                 const SigningProgressCallback& progress_callback)
 {
+    const auto continue_preparation = [&] {
+        return !progress_callback || progress_callback({
+            .phase = SigningProgressPhase::PREPARING_TRANSACTION,
+            .completed = 0,
+            .total = 0,
+            .cancellable = true,
+        });
+    };
+    if (!continue_preparation()) return Result::MISC_ERROR;
+
     // For now, cannot specify both new outputs to use and an output index to send change
     if (!outputs.empty() && original_change_index.has_value()) {
         errors.emplace_back(Untranslated("The options 'outputs' and 'original_change_index' are incompatible. You can only either specify a new set of outputs, or designate a change output to be recycled."));
@@ -209,6 +220,7 @@ Result CreateRateBumpTransaction(CWallet& wallet, const Txid& txid, const CCoinC
         coins[txin.prevout]; // Create empty map entry keyed by prevout.
     }
     wallet.chain().findCoins(coins);
+    if (!continue_preparation()) return Result::MISC_ERROR;
     for (const CTxIn& txin : wtx.tx->vin) {
         const Coin& coin = coins.at(txin.prevout);
         if (coin.out.IsNull()) {
@@ -251,6 +263,7 @@ Result CreateRateBumpTransaction(CWallet& wallet, const Txid& txid, const CCoinC
     if (result != Result::OK) {
         return result;
     }
+    if (!continue_preparation()) return Result::MISC_ERROR;
 
     // Calculate the old output amount.
     CAmount output_value = 0;
@@ -328,11 +341,13 @@ Result CreateRateBumpTransaction(CWallet& wallet, const Txid& txid, const CCoinC
     // We cannot source new unconfirmed inputs(bip125 rule 2)
     new_coin_control.m_min_depth = 1;
 
+    if (!continue_preparation()) return Result::MISC_ERROR;
     auto res = CreateTransaction(wallet, recipients, /*change_pos=*/std::nullopt, new_coin_control, false);
     if (!res) {
         errors.emplace_back(Untranslated("Unable to create transaction.") + Untranslated(" ") + util::ErrorString(res));
         return Result::WALLET_ERROR;
     }
+    if (!continue_preparation()) return Result::MISC_ERROR;
 
     const auto& txr = *res;
     // Write back new fee if successful

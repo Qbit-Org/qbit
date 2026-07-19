@@ -198,7 +198,8 @@ public:
         std::vector<bilingual_str>& errors,
         CAmount& old_fee,
         CAmount& new_fee,
-        CMutableTransaction& mtx) = 0;
+        CMutableTransaction& mtx,
+        const SigningProgressCallback& progress_callback = {}) = 0;
 
     //! Sign bump transaction.
     virtual bool signBumpTransaction(CMutableTransaction& mtx,

@@ -193,12 +193,30 @@ public:
         std::vector<bilingual_str>& errors,
         CAmount& old_fee,
         CAmount& new_fee,
-        CMutableTransaction& mtx) override
+        CMutableTransaction& mtx,
+        const SigningProgressCallback& progress_callback) override
     {
         std::unique_lock lock{m_state->mutex};
         m_state->bump_prepare_entered = true;
         m_state->condition.notify_all();
-        m_state->condition.wait(lock, [this] { return m_state->allow_bump_prepare; });
+        const auto continue_preparation = [&] {
+            if (!progress_callback || progress_callback({
+                    .phase = SigningProgressPhase::PREPARING_TRANSACTION,
+                    .completed = 0,
+                    .total = 0,
+                    .cancellable = true,
+                })) {
+                return true;
+            }
+            m_state->bump_prepare_cancel_observed = true;
+            m_state->condition.notify_all();
+            return false;
+        };
+        while (!m_state->allow_bump_prepare) {
+            if (!continue_preparation()) return false;
+            m_state->condition.wait_for(lock, 10ms, [this] { return m_state->allow_bump_prepare; });
+        }
+        if (!continue_preparation()) return false;
         if (!m_state->bump_prepare_success) {
             errors.emplace_back(Untranslated("Synthetic fee-bump preparation failed"));
             return false;

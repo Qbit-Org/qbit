@@ -95,7 +95,6 @@ WalletModel::~WalletModel()
 
 void WalletModel::prepareForShutdown()
 {
-    ++m_bump_fee_generation;
     m_bump_fee_cancel_requested = true;
     clearBumpFeeProgressDialog();
 }
@@ -656,9 +655,10 @@ void WalletModel::startBumpFeePreparation(Txid txid, std::unique_ptr<interfaces:
     m_bump_fee_progress_dialog->setWindowModality(Qt::ApplicationModal);
     GUIUtil::PolishProgressDialog(m_bump_fee_progress_dialog);
     connect(m_bump_fee_progress_dialog, &QProgressDialog::canceled, this, &WalletModel::cancelBumpFee);
-    QTimer::singleShot(250, this, [this, generation] {
-        if (generation == m_bump_fee_generation && m_bump_fee_progress_dialog) {
-            m_bump_fee_progress_dialog->show();
+    QPointer<QProgressDialog> progress_dialog{m_bump_fee_progress_dialog};
+    QTimer::singleShot(250, this, [this, generation, progress_dialog] {
+        if (generation == m_bump_fee_generation && progress_dialog && progress_dialog == m_bump_fee_progress_dialog) {
+            progress_dialog->show();
         }
     });
 
@@ -668,6 +668,9 @@ void WalletModel::startBumpFeePreparation(Txid txid, std::unique_ptr<interfaces:
     QPointer<WalletModel> model{this};
     std::atomic_bool* cancel_flag{&m_bump_fee_cancel_requested};
     m_bump_fee_thread = QThread::create([model, generation, result, coin_control, cancel_flag] {
+        const SigningProgressCallback progress_callback = [cancel_flag](const SigningProgress&) {
+            return !cancel_flag->load();
+        };
         try {
             result->prepared = result->wallet->createBumpTransaction(
                 result->original_txid,
@@ -675,7 +678,8 @@ void WalletModel::startBumpFeePreparation(Txid txid, std::unique_ptr<interfaces:
                 result->errors,
                 result->old_fee,
                 result->new_fee,
-                result->mtx);
+                result->mtx,
+                progress_callback);
         } catch (const std::exception& e) {
             result->errors.emplace_back(Untranslated(e.what()));
         }
@@ -737,6 +741,11 @@ void WalletModel::bumpFeePrepared(uint64_t generation, std::shared_ptr<BumpFeeRe
     // TODO: Replace QDialog::exec() with safer QDialog::show().
     const auto retval = static_cast<QMessageBox::StandardButton>(confirmationDialog->exec());
 
+    if (generation != m_bump_fee_generation || m_bump_fee_cancel_requested.load()) {
+        resetBumpFeeState();
+        return;
+    }
+
     // cancel sign&broadcast if user doesn't want to bump the fee
     if (retval != QMessageBox::Yes && retval != QMessageBox::Save) {
         resetBumpFeeState();
@@ -768,17 +777,23 @@ void WalletModel::bumpFeePrepared(uint64_t generation, std::shared_ptr<BumpFeeRe
         resetBumpFeeState();
         return;
     }
+    if (generation != m_bump_fee_generation || m_bump_fee_cancel_requested.load()) {
+        resetBumpFeeState();
+        return;
+    }
 
     assert(!m_wallet->privateKeysDisabled() || wallet().hasExternalSigner());
 
-    startBumpFeeSigning(std::move(result));
+    startBumpFeeSigning(generation, std::move(result));
 }
 
-void WalletModel::startBumpFeeSigning(std::shared_ptr<BumpFeeResult> result)
+void WalletModel::startBumpFeeSigning(uint64_t generation, std::shared_ptr<BumpFeeResult> result)
 {
+    if (generation != m_bump_fee_generation || m_bump_fee_cancel_requested.load()) {
+        resetBumpFeeState();
+        return;
+    }
     clearBumpFeeProgressDialog();
-    const uint64_t generation{++m_bump_fee_generation};
-    m_bump_fee_cancel_requested = false;
     m_bump_fee_counters_reserved = false;
 
     m_bump_fee_progress_dialog = new QProgressDialog(nullptr);
@@ -795,9 +810,10 @@ void WalletModel::startBumpFeeSigning(std::shared_ptr<BumpFeeResult> result)
     m_bump_fee_progress_dialog->setWindowModality(Qt::ApplicationModal);
     GUIUtil::PolishProgressDialog(m_bump_fee_progress_dialog);
     connect(m_bump_fee_progress_dialog, &QProgressDialog::canceled, this, &WalletModel::cancelBumpFee);
-    QTimer::singleShot(250, this, [this, generation] {
-        if (generation == m_bump_fee_generation && m_bump_fee_progress_dialog) {
-            m_bump_fee_progress_dialog->show();
+    QPointer<QProgressDialog> progress_dialog{m_bump_fee_progress_dialog};
+    QTimer::singleShot(250, this, [this, generation, progress_dialog] {
+        if (generation == m_bump_fee_generation && progress_dialog && progress_dialog == m_bump_fee_progress_dialog) {
+            progress_dialog->show();
         }
     });
 

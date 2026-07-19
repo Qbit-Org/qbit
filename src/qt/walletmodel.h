@@ -198,7 +198,7 @@ private:
 
     void startBumpFeePreparation(Txid txid, std::unique_ptr<interfaces::Wallet> wallet);
     void bumpFeePrepared(uint64_t generation, std::shared_ptr<BumpFeeResult> result);
-    void startBumpFeeSigning(std::shared_ptr<BumpFeeResult> result);
+    void startBumpFeeSigning(uint64_t generation, std::shared_ptr<BumpFeeResult> result);
     void bumpFeeProgress(uint64_t generation, BumpFeeProgress progress);
     void bumpFeeFinished(uint64_t generation, std::shared_ptr<BumpFeeResult> result);
     void cancelBumpFee();

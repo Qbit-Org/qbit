@@ -48,6 +48,7 @@
 
 #include <array>
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <set>
 #include <span>
@@ -202,8 +203,8 @@ void ReleaseSyntheticBumpSigning(const std::shared_ptr<qt_test::SyntheticWalletS
 class SendConfirmationClicker : public QObject
 {
 public:
-    SendConfirmationClicker(QString* text, QMessageBox::StandardButton confirm_type)
-        : QObject(QApplication::instance()), m_text(text), m_confirm_type(confirm_type)
+    SendConfirmationClicker(QString* text, QMessageBox::StandardButton confirm_type, std::function<void()> before_click = {})
+        : QObject(QApplication::instance()), m_text(text), m_confirm_type(confirm_type), m_before_click(std::move(before_click))
     {
         QApplication::instance()->installEventFilter(this);
         m_timer.setInterval(50);
@@ -244,6 +245,7 @@ private:
         if (m_clicked || !dialog) return;
         m_clicked = true;
         if (m_text) *m_text = dialog->text();
+        if (m_before_click) m_before_click();
         QAbstractButton* button = dialog->button(m_confirm_type);
         button->setEnabled(true);
         button->click();
@@ -253,6 +255,7 @@ private:
 
     QString* const m_text;
     const QMessageBox::StandardButton m_confirm_type;
+    const std::function<void()> m_before_click;
     QTimer m_timer;
     QPointer<SendConfirmationDialog> m_dialog;
     bool m_clicked{false};
@@ -336,9 +339,9 @@ private:
 };
 
 //! Press "Yes" or "Cancel" buttons in modal send confirmation dialog.
-void ConfirmSend(QString* text = nullptr, QMessageBox::StandardButton confirm_type = QMessageBox::Yes)
+void ConfirmSend(QString* text = nullptr, QMessageBox::StandardButton confirm_type = QMessageBox::Yes, std::function<void()> before_click = {})
 {
-    new SendConfirmationClicker(text, confirm_type);
+    new SendConfirmationClicker(text, confirm_type, std::move(before_click));
 }
 
 //! Send coins to address and return txid.
@@ -1584,6 +1587,73 @@ void TestAsyncFeeBumpLifecycle(interfaces::Node& node)
         return model.bumpFee(Txid{});
     };
 
+    // Preparation cancellation is observed cooperatively while the cloned
+    // wallet is still preparing the replacement. Cleanup leaves the model
+    // ready for a later fee bump.
+    {
+        auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+        {
+            std::lock_guard lock{state->mutex};
+            state->bump_enabled = true;
+            state->allow_bump_prepare = false;
+        }
+        auto model{make_model(state)};
+        QSignalSpy completed{model.get(), &WalletModel::feeBumped};
+        QVERIFY(model->bumpFee(Txid{}));
+        QVERIFY(WaitUntil([&] {
+            return SyntheticStateMatches(state, [](const auto& value) { return value.bump_prepare_entered; });
+        }, 5000));
+
+        QPointer<QProgressDialog> progress;
+        QVERIFY(WaitUntil([&] {
+            progress = FindBumpFeeProgressDialog();
+            return progress && progress->isVisible() && !progress->findChildren<QPushButton*>().empty();
+        }, 5000));
+        progress->findChildren<QPushButton*>().front()->click();
+        QVERIFY(WaitUntil([&] {
+            return SyntheticStateMatches(state, [](const auto& value) {
+                return value.bump_prepare_cancel_observed && value.background_clone_destroyed;
+            });
+        }, 5000));
+        QCOMPARE(completed.count(), 0);
+        QVERIFY(SyntheticStateMatches(state, [](const auto& value) {
+            return !value.bump_sign_entered && !value.bump_commit_entered;
+        }));
+
+        {
+            std::lock_guard lock{state->mutex};
+            state->allow_bump_prepare = true;
+        }
+        state->condition.notify_all();
+        QVERIFY(start_bump(*model));
+        QVERIFY(WaitUntil([&completed] { return completed.count() == 1; }, 5000));
+    }
+
+    // Shutdown requested from the confirmation dialog must not be cleared by
+    // the transition to signing. The canceled activity is fully cleaned up and
+    // does not block a later fee bump.
+    {
+        auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+        {
+            std::lock_guard lock{state->mutex};
+            state->bump_enabled = true;
+        }
+        auto model{make_model(state)};
+        QSignalSpy completed{model.get(), &WalletModel::feeBumped};
+        ConfirmSend(nullptr, QMessageBox::Yes, [&] { model->prepareForShutdown(); });
+        QVERIFY(model->bumpFee(Txid{}));
+        QVERIFY(WaitUntil([&] {
+            return SyntheticStateMatches(state, [](const auto& value) { return value.background_clone_destroyed; });
+        }, 5000));
+        QCOMPARE(completed.count(), 0);
+        QVERIFY(SyntheticStateMatches(state, [](const auto& value) {
+            return !value.bump_sign_entered && !value.bump_commit_entered;
+        }));
+
+        QVERIFY(start_bump(*model));
+        QVERIFY(WaitUntil([&completed] { return completed.count() == 1; }, 5000));
+    }
+
     // Internal P2MR signing stays off the GUI thread. Once counters are
     // durably reserved, an attempted cancellation is ignored and the
     // replacement proceeds to commit.
@@ -1629,6 +1699,35 @@ void TestAsyncFeeBumpLifecycle(interfaces::Node& node)
         }, 5000));
         QVERIFY(SyntheticStateMatches(state, [](const auto& value) {
             return value.bump_commit_entered && value.bump_committed && !value.bump_cancel_observed;
+        }));
+    }
+
+    // Shutdown cannot invalidate the completion callback after counter
+    // reservation. The irreversible replacement commits and is still reported.
+    {
+        auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+        {
+            std::lock_guard lock{state->mutex};
+            state->bump_enabled = true;
+            state->allow_bump_sign = false;
+        }
+        auto model{make_model(state)};
+        QSignalSpy completed{model.get(), &WalletModel::feeBumped};
+        QVERIFY(start_bump(*model));
+        QVERIFY(WaitUntil([&] {
+            return SyntheticStateMatches(state, [](const auto& value) {
+                return value.bump_sign_entered && value.bump_counters_reserved;
+            });
+        }, 5000));
+
+        model->prepareForShutdown();
+        ReleaseSyntheticBumpSigning(state);
+        QVERIFY(WaitUntil([&completed] { return completed.count() == 1; }, 5000));
+        QVERIFY(WaitUntil([&] {
+            return SyntheticStateMatches(state, [](const auto& value) { return value.background_clone_destroyed; });
+        }, 5000));
+        QVERIFY(SyntheticStateMatches(state, [](const auto& value) {
+            return value.bump_commit_entered && value.bump_committed;
         }));
     }
 
