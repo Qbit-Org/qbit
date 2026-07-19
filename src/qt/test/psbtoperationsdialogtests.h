@@ -28,6 +28,7 @@ private Q_SLOTS:
     void eventLoopResponsiveWhileSigningPaused();
     void successfulCompletionUpdatesDisplayOnce();
     void cancellationBeforeCounterReservation();
+    void lateCancellationDoesNotDropCompletedPSBT();
     void cancellationAfterCounterReservationIsIgnored();
     void dialogDestructionBeforeCompletion();
     void walletUnloadDuringSigning();

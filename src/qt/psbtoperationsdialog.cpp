@@ -57,6 +57,7 @@ struct PSBTOperationsDialog::SignResult {
     std::string exception;
     size_t n_signed{0};
     bool complete{false};
+    bool cancel_observed{false};
     wallet::PQCUsageReport pqc_usage;
 };
 
@@ -174,7 +175,7 @@ void PSBTOperationsDialog::signTransaction()
                                        counters_reserved_flag]() mutable {
         auto result = std::make_shared<SignResult>();
         result->psbt = std::move(psbt);
-        SigningProgressCallback progress_callback = [dialog, generation, cancel_flag, counters_reserved_flag](const SigningProgress& progress) {
+        SigningProgressCallback progress_callback = [dialog, generation, result, cancel_flag, counters_reserved_flag](const SigningProgress& progress) {
             if (!progress.cancellable) counters_reserved_flag->store(true);
             const bool cancellable{progress.cancellable && !counters_reserved_flag->load()};
             if (dialog) {
@@ -183,7 +184,11 @@ void PSBTOperationsDialog::signTransaction()
                 }, Qt::QueuedConnection);
             }
             if (!cancellable) return true;
-            return dialog && !cancel_flag->load();
+            if (cancel_flag->load()) {
+                result->cancel_observed = true;
+                return false;
+            }
+            return bool{dialog};
         };
         try {
             result->error = wallet->fillPSBT(std::nullopt,
@@ -265,8 +270,6 @@ void PSBTOperationsDialog::signTransactionFinished(uint64_t generation, std::sha
     if (generation != m_sign_generation) return;
     ++m_sign_generation;
 
-    const bool cancel_requested{m_sign_cancel_requested.load()};
-    const bool counters_reserved{m_sign_counters_reserved.load()};
     const bool unlock_valid{m_sign_unlock_context && m_sign_unlock_context->isValid()};
     m_sign_cancel_requested = false;
     m_sign_counters_reserved = false;
@@ -279,7 +282,7 @@ void PSBTOperationsDialog::signTransactionFinished(uint64_t generation, std::sha
         setSigningControlsEnabled(true);
         return;
     }
-    if (cancel_requested && !counters_reserved) {
+    if (result->cancel_observed) {
         showStatus(tr("Transaction signing canceled."), StatusLevel::INFO);
         m_sign_unlock_context.reset();
         setSigningControlsEnabled(true);

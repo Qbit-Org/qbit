@@ -215,6 +215,27 @@ void PSBTOperationsDialogTests::cancellationBeforeCounterReservation()
     QCOMPARE(display_updates.count(), 0);
 }
 
+void PSBTOperationsDialogTests::lateCancellationDoesNotDropCompletedPSBT()
+{
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    DialogFixture fixture{*m_context->client_model, m_context->platform_style.get(), state};
+    QSignalSpy display_updates{fixture.description(), &QTextEdit::textChanged};
+
+    fixture.dialog->signTransaction();
+    {
+        std::unique_lock lock{state->mutex};
+        QVERIFY(state->condition.wait_for(lock, std::chrono::milliseconds{WAIT_TIMEOUT_MS}, [&] {
+            return state->psbt_sign_finished;
+        }));
+    }
+
+    QVERIFY(QMetaObject::invokeMethod(fixture.dialog.get(), "cancelSignTransaction"));
+    QVERIFY(WaitUntil([&] { return fixture.statusLabel()->text().contains(QStringLiteral("ready to broadcast")); }));
+
+    QVERIFY(!ReadState(state, [](const auto& value) { return value.psbt_cancel_observed; }));
+    QCOMPARE(display_updates.count(), 1);
+}
+
 void PSBTOperationsDialogTests::cancellationAfterCounterReservationIsIgnored()
 {
     auto state{std::make_shared<qt_test::SyntheticWalletState>()};
