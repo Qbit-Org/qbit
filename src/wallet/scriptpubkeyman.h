@@ -395,11 +395,13 @@ private:
         bool has_encryption_keys{false};
         std::optional<CKeyingMaterial> encryption_key;
     };
+    util::Result<CTxDestination> GetNewDestinationInternal(OutputType type, int64_t* index);
     TopUpPreparation PrepareTopUp(std::optional<bool> internal_hint) const;
+    util::Result<void> TopUpWithInternalHintResultNoNotify(std::optional<bool> internal_hint, unsigned int size);
     bool IsRangedP2MRDescriptorNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     unsigned int GetKeyPoolSizeNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     bool NeedsP2MRKeyPoolRefillNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
-    void MaybeTopUpInternalP2MRKeyPool() EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    void MaybeTopUpInternalP2MRKeyPool();
     unsigned int GetP2MRReceiveKeyPoolLowWatermarkNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     unsigned int GetP2MRReceiveKeyPoolRefillStepTargetNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
 
@@ -443,7 +445,7 @@ public:
     bool TopUp(unsigned int size = 0) override;
     util::Result<void> TopUpResult(unsigned int size = 0) override;
     bool TopUpWithInternalHint(std::optional<bool> internal_hint, unsigned int size = 0);
-    util::Result<void> TopUpWithInternalHintResult(std::optional<bool> internal_hint, unsigned int size = 0);
+    util::Result<void> TopUpWithInternalHintResult(std::optional<bool> internal_hint, unsigned int size = 0) LOCKS_EXCLUDED(cs_desc_man);
 
     std::vector<WalletDestination> MarkUnusedAddresses(const CScript& script, const MarkUnusedAddressesOptions& options = {}) override;
 
