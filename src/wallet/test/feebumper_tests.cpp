@@ -155,6 +155,55 @@ BOOST_AUTO_TEST_CASE(commit_revalidates_competing_wallet_spend)
     BOOST_CHECK(bumped_txid.IsNull());
 }
 
+BOOST_AUTO_TEST_CASE(commit_allows_replacing_replacement_chain)
+{
+    m_wallet.SetBroadcastTransactions(false);
+
+    CMutableTransaction funding;
+    funding.vout.emplace_back(10'000, CScript{} << OP_TRUE);
+    BOOST_REQUIRE(m_wallet.AddToWallet(MakeTransactionRef(funding), TxStateInactive{}));
+
+    CMutableTransaction original;
+    original.vin.emplace_back(COutPoint{funding.GetHash(), 0});
+    original.vout.emplace_back(9'000, CScript{} << OP_TRUE);
+
+    CMutableTransaction first_replacement{original};
+    first_replacement.vout.front().nValue = 8'900;
+
+    CMutableTransaction second_replacement{original};
+    second_replacement.vout.front().nValue = 8'800;
+
+    BOOST_REQUIRE(m_wallet.AddToWallet(MakeTransactionRef(original), TxStateInactive{}, [&](CWalletTx& wtx, bool) {
+        wtx.mapValue["replaced_by_txid"] = first_replacement.GetHash().ToString();
+        return true;
+    }));
+    BOOST_REQUIRE(m_wallet.AddToWallet(MakeTransactionRef(first_replacement), TxStateInactive{}, [&](CWalletTx& wtx, bool) {
+        wtx.mapValue["replaces_txid"] = original.GetHash().ToString();
+        wtx.mapValue["replaced_by_txid"] = second_replacement.GetHash().ToString();
+        return true;
+    }));
+    BOOST_REQUIRE(m_wallet.AddToWallet(MakeTransactionRef(second_replacement), TxStateInactive{}, [&](CWalletTx& wtx, bool) {
+        wtx.mapValue["replaces_txid"] = first_replacement.GetHash().ToString();
+        return true;
+    }));
+
+    {
+        LOCK(m_wallet.cs_wallet);
+        BOOST_CHECK(!m_wallet.mapWallet.at(original.GetHash()).isMempoolConflicted());
+        BOOST_CHECK(!m_wallet.mapWallet.at(first_replacement.GetHash()).isMempoolConflicted());
+    }
+
+    CMutableTransaction final_replacement{original};
+    final_replacement.vout.front().nValue = 8'700;
+    const Txid expected_bumped_txid{final_replacement.GetHash()};
+    std::vector<bilingual_str> errors;
+    Txid bumped_txid;
+    const Result commit_result{CommitTransaction(m_wallet, second_replacement.GetHash(), std::move(final_replacement), errors, bumped_txid)};
+    BOOST_CHECK(commit_result == Result::OK);
+    BOOST_CHECK(errors.empty());
+    BOOST_CHECK(bumped_txid == expected_bumped_txid);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 } // namespace feebumper
 } // namespace wallet

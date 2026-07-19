@@ -420,11 +420,40 @@ bool SignTransaction(CWallet& wallet,
     return signed_ok && SigningOnlyModifiedInputSignatures(unsigned_tx, mtx);
 }
 
+static std::set<Txid> GetReplacementAncestors(const CWallet& wallet, const CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    std::set<Txid> replacement_ancestors;
+    const CWalletTx* replacement{&wtx};
+    while (true) {
+        const auto replaces_it{replacement->mapValue.find("replaces_txid")};
+        if (replaces_it == replacement->mapValue.end()) break;
+
+        const auto replaced_txid{Txid::FromHex(replaces_it->second)};
+        if (!replaced_txid || replacement_ancestors.contains(*replaced_txid)) break;
+
+        const auto replaced_it{wallet.mapWallet.find(*replaced_txid)};
+        if (replaced_it == wallet.mapWallet.end()) break;
+
+        const auto replaced_by_it{replaced_it->second.mapValue.find("replaced_by_txid")};
+        if (replaced_by_it == replaced_it->second.mapValue.end() ||
+            replaced_by_it->second != replacement->GetHash().ToString()) {
+            break;
+        }
+
+        replacement_ancestors.insert(*replaced_txid);
+        replacement = &replaced_it->second;
+    }
+    return replacement_ancestors;
+}
+
 static Result RevalidateReplacement(const CWallet& wallet,
     const CWalletTx& old_wtx,
     const CMutableTransaction& mtx,
     std::vector<bilingual_str>& errors) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
 {
+    // Replacement metadata is updated synchronously, unlike mempool conflict
+    // state which may lag behind validation interface notifications.
+    const std::set<Txid> replacement_ancestors{GetReplacementAncestors(wallet, old_wtx)};
     std::set<COutPoint> original_inputs;
     for (const CTxIn& input : old_wtx.tx->vin) {
         original_inputs.insert(input.prevout);
@@ -444,7 +473,8 @@ static Result RevalidateReplacement(const CWallet& wallet,
         replacement_input_value += coin_it->second.tx->vout[input.prevout.n].nValue;
 
         for (const auto& [candidate_txid, candidate_wtx] : wallet.mapWallet) {
-            if (candidate_txid == old_wtx.GetHash() || candidate_wtx.isAbandoned() ||
+            if (candidate_txid == old_wtx.GetHash() ||
+                replacement_ancestors.contains(candidate_txid) || candidate_wtx.isAbandoned() ||
                 candidate_wtx.isBlockConflicted() || candidate_wtx.isMempoolConflicted()) {
                 continue;
             }
