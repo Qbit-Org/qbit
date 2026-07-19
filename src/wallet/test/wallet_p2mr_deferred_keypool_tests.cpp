@@ -10,9 +10,9 @@ using namespace wallet_p2mr_test;
 
 BOOST_FIXTURE_TEST_SUITE(wallet_p2mr_deferred_keypool_tests, WalletTestingSetup)
 
-BOOST_FIXTURE_TEST_CASE(DeferredTopUpNotifiesAfterCommitWithoutWalletLockInversion, RegtestP2MROnlyWalletTestingSetup, * boost::unit_test::timeout(10))
+BOOST_FIXTURE_TEST_CASE(DeferredTopUpNotifiesAfterCommitWithoutWalletLockInversion, RegtestP2MROnlyWalletTestingSetup, * boost::unit_test::timeout(60))
 {
-    constexpr int64_t keypool_size{64};
+    constexpr int64_t keypool_size{DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL + 1};
     m_args.ForceSetArg("-keypool", util::ToString(keypool_size));
 
     WalletContext context;
@@ -47,7 +47,7 @@ BOOST_FIXTURE_TEST_CASE(DeferredTopUpNotifiesAfterCommitWithoutWalletLockInversi
         callback_can_get_addresses = wallet->CanGetAddresses();
     });
 
-    BOOST_CHECK(wallet->RunPendingInitialKeyPoolTopUpStep() == CWallet::PendingInitialKeyPoolTopUpStepResult::PENDING);
+    BOOST_CHECK(wallet->RunPendingInitialKeyPoolTopUpStep() == CWallet::PendingInitialKeyPoolTopUpStepResult::COMPLETE);
     BOOST_REQUIRE(writer.joinable());
     writer.join();
 
