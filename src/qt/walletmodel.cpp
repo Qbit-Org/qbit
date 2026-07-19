@@ -882,6 +882,7 @@ void WalletModel::bumpFeeProgress(uint64_t generation, BumpFeeProgress progress)
 
     QPointer<QProgressDialog> dialog{m_bump_fee_progress_dialog};
     QPointer<QProgressBar> bar{m_bump_fee_progress_bar};
+    if (!dialog || !bar) return;
     if (m_bump_fee_counters_reserved.load()) {
         dialog->setCancelButton(nullptr);
         if (!dialog || !bar) return;
@@ -890,32 +891,37 @@ void WalletModel::bumpFeeProgress(uint64_t generation, BumpFeeProgress progress)
     switch (progress.phase) {
     case BumpFeeProgressPhase::Preparing:
         dialog->setLabelText(tr("Preparing transaction for signing..."));
-        if (bar) bar->setRange(0, 0);
+        if (!dialog || !bar) return;
+        bar->setRange(0, 0);
         break;
     case BumpFeeProgressPhase::Reserving:
         dialog->setLabelText(tr("Reserving signing counters..."));
-        if (bar) bar->setRange(0, 0);
+        if (!dialog || !bar) return;
+        bar->setRange(0, 0);
         break;
     case BumpFeeProgressPhase::Signing:
         if (progress.total == 0) {
             dialog->setLabelText(tr("Signing inputs..."));
-            if (bar) bar->setRange(0, 0);
+            if (!dialog || !bar) return;
+            bar->setRange(0, 0);
         } else {
             progress.completed = std::min(progress.completed, progress.total);
             dialog->setLabelText(tr("Signing inputs: %1 of %2 complete...").arg(progress.completed).arg(progress.total));
-            if (bar) {
-                bar->setRange(0, static_cast<int>(progress.total));
-                bar->setValue(static_cast<int>(progress.completed));
-            }
+            if (!dialog || !bar) return;
+            bar->setRange(0, static_cast<int>(progress.total));
+            if (!bar) return;
+            bar->setValue(static_cast<int>(progress.completed));
         }
         break;
     case BumpFeeProgressPhase::Finalizing:
         dialog->setLabelText(tr("Finalizing transaction..."));
-        if (bar) bar->setRange(0, 0);
+        if (!dialog || !bar) return;
+        bar->setRange(0, 0);
         break;
     case BumpFeeProgressPhase::Committing:
         dialog->setLabelText(tr("Committing fee-bump transaction..."));
-        if (bar) bar->setRange(0, 0);
+        if (!dialog || !bar) return;
+        bar->setRange(0, 0);
         break;
     }
 }

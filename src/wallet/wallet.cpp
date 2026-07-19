@@ -992,6 +992,17 @@ std::set<Txid> CWallet::GetConflicts(const Txid& txid) const
     return result;
 }
 
+std::set<Txid> CWallet::GetWalletSpenders(const COutPoint& outpoint) const
+{
+    AssertLockHeld(cs_wallet);
+    std::set<Txid> spenders;
+    const auto range{mapTxSpends.equal_range(outpoint)};
+    for (auto it{range.first}; it != range.second; ++it) {
+        spenders.insert(it->second);
+    }
+    return spenders;
+}
+
 bool CWallet::HasWalletSpend(const CTransactionRef& tx) const
 {
     AssertLockHeld(cs_wallet);

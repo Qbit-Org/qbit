@@ -487,18 +487,17 @@ static Result RevalidateReplacement(const CWallet& wallet,
         }
         replacement_input_value += coin_it->second.tx->vout[input.prevout.n].nValue;
 
-        for (const auto& [candidate_txid, candidate_wtx] : wallet.mapWallet) {
+        for (const Txid& candidate_txid : wallet.GetWalletSpenders(input.prevout)) {
+            const auto candidate_it{wallet.mapWallet.find(candidate_txid)};
+            if (candidate_it == wallet.mapWallet.end()) continue;
+            const CWalletTx& candidate_wtx{candidate_it->second};
             if (candidate_txid == old_wtx.GetHash() ||
                 replacement_ancestors.contains(candidate_txid) || candidate_wtx.isAbandoned() ||
                 candidate_wtx.isBlockConflicted() || candidate_wtx.isMempoolConflicted()) {
                 continue;
             }
-            if (std::ranges::any_of(candidate_wtx.tx->vin, [&](const CTxIn& candidate_input) {
-                    return candidate_input.prevout == input.prevout;
-                })) {
-                errors.emplace_back(Untranslated(strprintf("Replacement input %s:%u is already spent by wallet transaction %s", input.prevout.hash.GetHex(), input.prevout.n, candidate_txid.GetHex())));
-                return Result::WALLET_ERROR;
-            }
+            errors.emplace_back(Untranslated(strprintf("Replacement input %s:%u is already spent by wallet transaction %s", input.prevout.hash.GetHex(), input.prevout.n, candidate_txid.GetHex())));
+            return Result::WALLET_ERROR;
         }
     }
     if (!std::ranges::all_of(original_inputs, [&](const COutPoint& input) { return replacement_inputs.contains(input); })) {
