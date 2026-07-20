@@ -198,6 +198,7 @@ TransactionView::~TransactionView()
 
 void TransactionView::setModel(WalletModel *_model)
 {
+    QObject::disconnect(m_fee_bumped_connection);
     this->model = _model;
     if(_model)
     {
@@ -209,9 +210,9 @@ void TransactionView::setModel(WalletModel *_model)
         transactionProxyModel->setSortRole(Qt::EditRole);
         transactionView->setModel(transactionProxyModel);
         transactionView->sortByColumn(TransactionTableModel::Date, Qt::DescendingOrder);
-        connect(_model, &WalletModel::feeBumped, this, [this](const Txid& original_txid, const Txid& bumped_txid) {
+        m_fee_bumped_connection = connect(_model, &WalletModel::feeBumped, this, [this, _model](const Txid& original_txid, const Txid& bumped_txid) {
             transactionView->selectionModel()->clearSelection();
-            model->getTransactionTableModel()->updateTransaction(
+            _model->getTransactionTableModel()->updateTransaction(
                 QString::fromStdString(original_txid.ToString()), CT_UPDATED, true);
             Q_EMIT bumpedFee(bumped_txid);
         });

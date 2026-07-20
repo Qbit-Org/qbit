@@ -39,6 +39,8 @@ struct SyntheticWalletState {
     bool bump_use_counters{true};
     bool allow_bump_reservation{true};
     bool bump_counters_reserved{false};
+    bool external_bump_boundary_entered{false};
+    bool allow_external_bump_boundary{true};
     bool allow_bump_sign{true};
     bool bump_cancel_observed{false};
     bool bump_commit_entered{false};

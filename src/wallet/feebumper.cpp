@@ -409,13 +409,13 @@ bool SignTransaction(CWallet& wallet,
             return false;
         }
         // External signer commands cannot be interrupted safely once started.
-        if (progress_callback) {
-            progress_callback({
+        if (progress_callback && !progress_callback({
                 .phase = SigningProgressPhase::SIGNING_INPUTS,
                 .completed = 0,
                 .total = static_cast<unsigned int>(mtx.vin.size()),
                 .cancellable = false,
-            });
+            })) {
+            return false;
         }
         auto err{wallet.FillPSBT(psbtx, complete, std::nullopt, /*sign=*/true, /*bip32derivs=*/false, /*n_signed=*/nullptr, /*finalize=*/true, reservation_observer)};
         if (err) return false;

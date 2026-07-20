@@ -95,7 +95,8 @@ WalletModel::~WalletModel()
 
 void WalletModel::prepareForShutdown()
 {
-    m_bump_fee_cancel_requested = true;
+    BumpFeeCancellationState expected{BumpFeeCancellationState::Cancellable};
+    m_bump_fee_cancellation_state.compare_exchange_strong(expected, BumpFeeCancellationState::Canceled);
     clearBumpFeeProgressDialog();
 }
 
@@ -638,8 +639,7 @@ void WalletModel::startBumpFeePreparation(Txid txid, std::unique_ptr<interfaces:
 
     clearBumpFeeProgressDialog();
     const uint64_t generation{++m_bump_fee_generation};
-    m_bump_fee_cancel_requested = false;
-    m_bump_fee_counters_reserved = false;
+    m_bump_fee_cancellation_state = BumpFeeCancellationState::Cancellable;
 
     m_bump_fee_progress_dialog = new QProgressDialog(nullptr);
     m_bump_fee_progress_dialog->setObjectName(QStringLiteral("bumpFeeProgressDialog"));
@@ -666,10 +666,10 @@ void WalletModel::startBumpFeePreparation(Txid txid, std::unique_ptr<interfaces:
     result->wallet = std::move(wallet);
     result->original_txid = txid;
     QPointer<WalletModel> model{this};
-    std::atomic_bool* cancel_flag{&m_bump_fee_cancel_requested};
-    m_bump_fee_thread = QThread::create([model, generation, result, coin_control, cancel_flag] {
-        const SigningProgressCallback progress_callback = [cancel_flag](const SigningProgress&) {
-            return !cancel_flag->load();
+    std::atomic<BumpFeeCancellationState>* cancellation_state{&m_bump_fee_cancellation_state};
+    m_bump_fee_thread = QThread::create([model, generation, result, coin_control, cancellation_state] {
+        const SigningProgressCallback progress_callback = [cancellation_state](const SigningProgress&) {
+            return cancellation_state->load() != BumpFeeCancellationState::Canceled;
         };
         try {
             result->prepared = result->wallet->createBumpTransaction(
@@ -683,7 +683,7 @@ void WalletModel::startBumpFeePreparation(Txid txid, std::unique_ptr<interfaces:
         } catch (const std::exception& e) {
             result->errors.emplace_back(Untranslated(e.what()));
         }
-        result->canceled = cancel_flag->load();
+        result->canceled = cancellation_state->load() == BumpFeeCancellationState::Canceled;
         if (!model) return;
         QMetaObject::invokeMethod(model, [model, generation, result] {
             if (model) model->bumpFeePrepared(generation, result);
@@ -698,7 +698,7 @@ void WalletModel::bumpFeePrepared(uint64_t generation, std::shared_ptr<BumpFeeRe
     finishBumpFeeThread();
     clearBumpFeeProgressDialog();
 
-    if (result->canceled || m_bump_fee_cancel_requested.load()) {
+    if (result->canceled || m_bump_fee_cancellation_state.load() == BumpFeeCancellationState::Canceled) {
         resetBumpFeeState();
         return;
     }
@@ -741,7 +741,7 @@ void WalletModel::bumpFeePrepared(uint64_t generation, std::shared_ptr<BumpFeeRe
     // TODO: Replace QDialog::exec() with safer QDialog::show().
     const auto retval = static_cast<QMessageBox::StandardButton>(confirmationDialog->exec());
 
-    if (generation != m_bump_fee_generation || m_bump_fee_cancel_requested.load()) {
+    if (generation != m_bump_fee_generation || m_bump_fee_cancellation_state.load() == BumpFeeCancellationState::Canceled) {
         resetBumpFeeState();
         return;
     }
@@ -777,7 +777,7 @@ void WalletModel::bumpFeePrepared(uint64_t generation, std::shared_ptr<BumpFeeRe
         resetBumpFeeState();
         return;
     }
-    if (generation != m_bump_fee_generation || m_bump_fee_cancel_requested.load()) {
+    if (generation != m_bump_fee_generation || m_bump_fee_cancellation_state.load() == BumpFeeCancellationState::Canceled) {
         resetBumpFeeState();
         return;
     }
@@ -789,12 +789,11 @@ void WalletModel::bumpFeePrepared(uint64_t generation, std::shared_ptr<BumpFeeRe
 
 void WalletModel::startBumpFeeSigning(uint64_t generation, std::shared_ptr<BumpFeeResult> result)
 {
-    if (generation != m_bump_fee_generation || m_bump_fee_cancel_requested.load()) {
+    if (generation != m_bump_fee_generation || m_bump_fee_cancellation_state.load() == BumpFeeCancellationState::Canceled) {
         resetBumpFeeState();
         return;
     }
     clearBumpFeeProgressDialog();
-    m_bump_fee_counters_reserved = false;
 
     m_bump_fee_progress_dialog = new QProgressDialog(nullptr);
     m_bump_fee_progress_dialog->setObjectName(QStringLiteral("bumpFeeProgressDialog"));
@@ -818,19 +817,35 @@ void WalletModel::startBumpFeeSigning(uint64_t generation, std::shared_ptr<BumpF
     });
 
     QPointer<WalletModel> model{this};
-    std::atomic_bool* cancel_flag{&m_bump_fee_cancel_requested};
-    std::atomic_bool* counters_reserved_flag{&m_bump_fee_counters_reserved};
-    m_bump_fee_thread = QThread::create([model, generation, result, cancel_flag, counters_reserved_flag] {
-        const auto post_progress = [model, generation, cancel_flag](BumpFeeProgress progress, bool cancellable) {
-            if (!model || (cancellable && cancel_flag->load())) return false;
+    std::atomic<BumpFeeCancellationState>* cancellation_state{&m_bump_fee_cancellation_state};
+    m_bump_fee_thread = QThread::create([model, generation, result, cancellation_state] {
+        const auto enter_irreversible = [cancellation_state] {
+            BumpFeeCancellationState expected{BumpFeeCancellationState::Cancellable};
+            if (cancellation_state->compare_exchange_strong(expected, BumpFeeCancellationState::Irreversible)) return true;
+            return expected == BumpFeeCancellationState::Irreversible;
+        };
+        const auto post_progress = [model, generation, cancellation_state](BumpFeeProgress progress, bool cancellable) {
+            if (!model || (cancellable && cancellation_state->load() == BumpFeeCancellationState::Canceled)) return false;
             QMetaObject::invokeMethod(model, [model, generation, progress] {
                 if (model) model->bumpFeeProgress(generation, progress);
             }, Qt::QueuedConnection);
-            return !cancellable || !cancel_flag->load();
+            return !cancellable || cancellation_state->load() != BumpFeeCancellationState::Canceled;
         };
-        const SigningProgressCallback progress_callback = [post_progress, counters_reserved_flag](const SigningProgress& progress) {
-            if (!progress.cancellable) counters_reserved_flag->store(true);
-            bool cancellable{progress.cancellable && !counters_reserved_flag->load()};
+        const SigningProgressCallback progress_callback = [post_progress, cancellation_state, enter_irreversible](const SigningProgress& progress) {
+            bool cancellable{progress.cancellable};
+            if (!progress.cancellable) {
+                if (progress.phase == SigningProgressPhase::SIGNING_INPUTS) {
+                    // This notification is the external signer's pre-command
+                    // boundary. Whichever side wins the atomic transition --
+                    // cancellation or signing -- determines whether it starts.
+                    if (!enter_irreversible()) return false;
+                } else {
+                    // Reservation notifications arrive after the counters are
+                    // durably committed, so cancellation can no longer win.
+                    cancellation_state->store(BumpFeeCancellationState::Irreversible);
+                }
+                cancellable = false;
+            }
             BumpFeeProgress mapped;
             mapped.completed = progress.completed;
             mapped.total = progress.total;
@@ -841,7 +856,7 @@ void WalletModel::startBumpFeeSigning(uint64_t generation, std::shared_ptr<BumpF
             case SigningProgressPhase::RESERVING_PQC_COUNTERS:
                 mapped.phase = BumpFeeProgressPhase::Reserving;
                 if (progress.total > 0 && progress.completed >= progress.total) {
-                    counters_reserved_flag->store(true);
+                    cancellation_state->store(BumpFeeCancellationState::Irreversible);
                     cancellable = false;
                 }
                 break;
@@ -857,12 +872,14 @@ void WalletModel::startBumpFeeSigning(uint64_t generation, std::shared_ptr<BumpF
 
         try {
             result->signed_ok = result->wallet->signBumpTransaction(result->mtx, &result->pqc_usage, progress_callback);
-            if (cancel_flag->load() && !counters_reserved_flag->load()) {
+            if (cancellation_state->load() == BumpFeeCancellationState::Canceled) {
                 result->canceled = true;
-            } else if (result->signed_ok) {
+            } else if (result->signed_ok && enter_irreversible()) {
                 post_progress(BumpFeeProgress{.phase = BumpFeeProgressPhase::Committing}, /*cancellable=*/false);
                 result->committed = result->wallet->commitBumpTransaction(
                     result->original_txid, std::move(result->mtx), result->errors, result->bumped_txid);
+            } else if (cancellation_state->load() == BumpFeeCancellationState::Canceled) {
+                result->canceled = true;
             }
         } catch (const std::exception& e) {
             result->errors.emplace_back(Untranslated(e.what()));
@@ -883,7 +900,7 @@ void WalletModel::bumpFeeProgress(uint64_t generation, BumpFeeProgress progress)
     QPointer<QProgressDialog> dialog{m_bump_fee_progress_dialog};
     QPointer<QProgressBar> bar{m_bump_fee_progress_bar};
     if (!dialog || !bar) return;
-    if (m_bump_fee_counters_reserved.load()) {
+    if (m_bump_fee_cancellation_state.load() == BumpFeeCancellationState::Irreversible) {
         dialog->setCancelButton(nullptr);
         if (!dialog || !bar) return;
     }
@@ -957,15 +974,15 @@ void WalletModel::bumpFeeFinished(uint64_t generation, std::shared_ptr<BumpFeeRe
 
 void WalletModel::cancelBumpFee()
 {
-    if (m_bump_fee_counters_reserved.load()) {
-        m_bump_fee_cancel_requested = false;
+    BumpFeeCancellationState expected{BumpFeeCancellationState::Cancellable};
+    if (!m_bump_fee_cancellation_state.compare_exchange_strong(expected, BumpFeeCancellationState::Canceled)) {
+        if (expected != BumpFeeCancellationState::Irreversible) return;
         if (m_bump_fee_progress_dialog) {
             m_bump_fee_progress_dialog->setCancelButton(nullptr);
             m_bump_fee_progress_dialog->setLabelText(tr("Finalizing transaction..."));
         }
         return;
     }
-    m_bump_fee_cancel_requested = true;
     if (m_bump_fee_progress_dialog) {
         m_bump_fee_progress_dialog->setCancelButton(nullptr);
         m_bump_fee_progress_dialog->setLabelText(tr("Canceling fee bump..."));
@@ -997,8 +1014,7 @@ void WalletModel::resetBumpFeeState()
 {
     ++m_bump_fee_generation;
     m_bump_fee_active = false;
-    m_bump_fee_cancel_requested = false;
-    m_bump_fee_counters_reserved = false;
+    m_bump_fee_cancellation_state = BumpFeeCancellationState::Cancellable;
     clearBumpFeeProgressDialog();
     m_bump_fee_unlock_context.reset();
 }

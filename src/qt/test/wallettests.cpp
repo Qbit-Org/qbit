@@ -1625,8 +1625,13 @@ void TestAsyncFeeBumpLifecycle(interfaces::Node& node)
             state->allow_bump_prepare = true;
         }
         state->condition.notify_all();
+        TransactionView view{platform_style.get()};
+        view.setModel(model.get());
+        view.setModel(model.get());
+        QSignalSpy view_completed{&view, &TransactionView::bumpedFee};
         QVERIFY(start_bump(*model));
         QVERIFY(WaitUntil([&completed] { return completed.count() == 1; }, 5000));
+        QCOMPARE(view_completed.count(), 1);
     }
 
     // Shutdown requested from the confirmation dialog must not be cleared by
@@ -1760,6 +1765,47 @@ void TestAsyncFeeBumpLifecycle(interfaces::Node& node)
         }, 5000));
         QVERIFY(WaitUntil([&] {
             return SyntheticStateMatches(state, [](const auto& value) { return value.background_clone_destroyed; });
+        }, 5000));
+        QCOMPARE(completed.count(), 0);
+        QVERIFY(SyntheticStateMatches(state, [](const auto& value) {
+            return !value.bump_commit_entered && !value.bump_committed;
+        }));
+    }
+
+    // Cancellation and the external-signer command boundary race through one
+    // atomic state transition. If cancellation wins, the command is not run
+    // and no replacement is committed.
+    {
+        auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+        {
+            std::lock_guard lock{state->mutex};
+            state->bump_enabled = true;
+            state->external_signer = true;
+            state->bump_use_counters = false;
+            state->allow_external_bump_boundary = false;
+        }
+        auto model{make_model(state)};
+        QSignalSpy completed{model.get(), &WalletModel::feeBumped};
+        QVERIFY(start_bump(*model));
+        QVERIFY(WaitUntil([&] {
+            return SyntheticStateMatches(state, [](const auto& value) { return value.external_bump_boundary_entered; });
+        }, 5000));
+
+        QPointer<QProgressDialog> progress;
+        QVERIFY(WaitUntil([&] {
+            progress = FindBumpFeeProgressDialog();
+            return progress && progress->isVisible() && !progress->findChildren<QPushButton*>().empty();
+        }, 5000));
+        progress->findChildren<QPushButton*>().front()->click();
+        {
+            std::lock_guard lock{state->mutex};
+            state->allow_external_bump_boundary = true;
+        }
+        state->condition.notify_all();
+        QVERIFY(WaitUntil([&] {
+            return SyntheticStateMatches(state, [](const auto& value) {
+                return value.bump_cancel_observed && value.background_clone_destroyed;
+            });
         }, 5000));
         QCOMPARE(completed.count(), 0);
         QVERIFY(SyntheticStateMatches(state, [](const auto& value) {

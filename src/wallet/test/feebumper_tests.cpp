@@ -56,6 +56,19 @@ BOOST_AUTO_TEST_CASE(external_max_weight_test)
     CheckMaxWeightComputation("", {"3042021f5c4c29e6b686aae5b6d0751e90208592ea96d26bc81d78b0d3871a94a21fa8021f74dc2f971e438ccece8699c8fd15704c41df219ab37b63264f2147d15c34d801", "01", "6321024cf55e52ec8af7866617dc4e7ff8433758e98799906d80e066c6f32033f685f967029000b275210214827893e2dcbe4ad6c20bd743288edad21100404eb7f52ccd6062fd0e7808f268ac"}, "002089e84892873c679b1129edea246e484fd914c2601f776d4f2f4a001eb8059703", 195);
 }
 
+BOOST_AUTO_TEST_CASE(external_signer_honors_cancellation_at_command_boundary)
+{
+    m_wallet.SetWalletFlag(WALLET_FLAG_EXTERNAL_SIGNER);
+    CMutableTransaction mtx;
+    int progress_calls{0};
+
+    BOOST_CHECK(!feebumper::SignTransaction(m_wallet, mtx, {}, [&](const SigningProgress& progress) {
+        ++progress_calls;
+        return progress.cancellable;
+    }));
+    BOOST_CHECK_EQUAL(progress_calls, 3);
+}
+
 BOOST_AUTO_TEST_CASE(p2mr_signing_releases_wallet_lock)
 {
     using namespace std::chrono_literals;

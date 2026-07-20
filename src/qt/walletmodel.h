@@ -186,6 +186,11 @@ private:
         Finalizing,
         Committing,
     };
+    enum class BumpFeeCancellationState : uint8_t {
+        Cancellable,
+        Canceled,
+        Irreversible,
+    };
     struct BumpFeeProgress;
     QThread* m_bump_fee_thread{nullptr};
     QPointer<QProgressDialog> m_bump_fee_progress_dialog;
@@ -193,8 +198,7 @@ private:
     std::unique_ptr<UnlockContext> m_bump_fee_unlock_context;
     uint64_t m_bump_fee_generation{0};
     bool m_bump_fee_active{false};
-    std::atomic_bool m_bump_fee_cancel_requested{false};
-    std::atomic_bool m_bump_fee_counters_reserved{false};
+    std::atomic<BumpFeeCancellationState> m_bump_fee_cancellation_state{BumpFeeCancellationState::Cancellable};
 
     void startBumpFeePreparation(Txid txid, std::unique_ptr<interfaces::Wallet> wallet);
     void bumpFeePrepared(uint64_t generation, std::shared_ptr<BumpFeeResult> result);

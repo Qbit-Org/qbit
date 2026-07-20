@@ -298,13 +298,22 @@ public:
                 })) {
                 return false;
             }
+            {
+                std::lock_guard lock{m_state->mutex};
+                m_state->external_bump_boundary_entered = true;
+            }
+            m_state->condition.notify_all();
+            std::unique_lock lock{m_state->mutex};
+            m_state->condition.wait(lock, [this] { return m_state->allow_external_bump_boundary; });
         }
-        report_progress({
+        if (!report_progress({
             .phase = SigningProgressPhase::SIGNING_INPUTS,
             .completed = 0,
             .total = 1,
             .cancellable = !use_counters && !external_signer,
-        });
+        })) {
+            return false;
+        }
         {
             std::unique_lock lock{m_state->mutex};
             m_state->condition.wait(lock, [this] { return m_state->allow_bump_sign; });
