@@ -395,13 +395,13 @@ private:
         bool has_encryption_keys{false};
         std::optional<CKeyingMaterial> encryption_key;
     };
-    util::Result<CTxDestination> GetNewDestinationInternal(OutputType type, int64_t* index);
+    util::Result<CTxDestination> GetNewDestinationNoNotify(OutputType type, int64_t* index, bool& notify_can_get_addresses_changed) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     TopUpPreparation PrepareTopUp(std::optional<bool> internal_hint) const;
     util::Result<void> TopUpWithInternalHintResultNoNotify(std::optional<bool> internal_hint, unsigned int size);
     bool IsRangedP2MRDescriptorNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     unsigned int GetKeyPoolSizeNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     bool NeedsP2MRKeyPoolRefillNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
-    void MaybeTopUpInternalP2MRKeyPool();
+    bool MaybeTopUpInternalP2MRKeyPoolNoNotify() EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     unsigned int GetP2MRReceiveKeyPoolLowWatermarkNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     unsigned int GetP2MRReceiveKeyPoolRefillStepTargetNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
 

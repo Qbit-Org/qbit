@@ -942,63 +942,65 @@ bool LegacyDataSPKM::DeleteRecordsWithDB(WalletBatch& batch)
 
 util::Result<CTxDestination> DescriptorScriptPubKeyMan::GetNewDestination(const OutputType type)
 {
-    return GetNewDestinationInternal(type, /*index=*/nullptr);
+    bool notify_can_get_addresses_changed{false};
+    util::Result<CTxDestination> result{[&] {
+        LOCK(cs_desc_man);
+        return GetNewDestinationNoNotify(type, /*index=*/nullptr, notify_can_get_addresses_changed);
+    }()};
+    if (notify_can_get_addresses_changed) {
+        NotifyCanGetAddressesChanged();
+    }
+    return result;
 }
 
-util::Result<CTxDestination> DescriptorScriptPubKeyMan::GetNewDestinationInternal(const OutputType type, int64_t* index)
+util::Result<CTxDestination> DescriptorScriptPubKeyMan::GetNewDestinationNoNotify(const OutputType type, int64_t* index, bool& notify_can_get_addresses_changed)
 {
+    AssertLockHeld(cs_desc_man);
     // Returns true if this descriptor supports getting new addresses. Conditions where we may be unable to fetch them (e.g. locked) are caught later
     if (!CanGetAddresses()) {
         return util::Error{_("No addresses available")};
     }
 
-    bool notify_can_get_addresses_changed{false};
-    util::Result<CTxDestination> result{[&]() -> util::Result<CTxDestination> {
-        LOCK(cs_desc_man);
-        assert(m_wallet_descriptor.descriptor->IsSingleType()); // This is a combo descriptor which should not be an active descriptor
-        std::optional<OutputType> desc_addr_type = m_wallet_descriptor.descriptor->GetOutputType();
-        assert(desc_addr_type);
-        if (type != *desc_addr_type) {
-            throw std::runtime_error(std::string(__func__) + ": Types are inconsistent. Stored type does not match type of newly generated address");
-        }
+    assert(m_wallet_descriptor.descriptor->IsSingleType()); // This is a combo descriptor which should not be an active descriptor
+    std::optional<OutputType> desc_addr_type = m_wallet_descriptor.descriptor->GetOutputType();
+    assert(desc_addr_type);
+    if (type != *desc_addr_type) {
+        throw std::runtime_error(std::string(__func__) + ": Types are inconsistent. Stored type does not match type of newly generated address");
+    }
 
-        if (!m_deferred_create_keypool_top_up && !IsRangedP2MRDescriptorNoLock()) {
-            notify_can_get_addresses_changed = TopUpWithInternalHintResultNoNotify(std::nullopt, /*size=*/0).has_value();
-        }
-
-        // Get the scriptPubKey from the descriptor
-        FlatSigningProvider out_keys;
-        std::vector<CScript> scripts_temp;
-        if (m_wallet_descriptor.next_index >= m_wallet_descriptor.range_end) {
-            auto top_up{TopUpWithInternalHintResultNoNotify(std::nullopt, /*size=*/1)};
-            if (!top_up) {
-                // We can't generate anymore keys
-                return util::Error{_("Error: Keypool ran out, please call keypoolrefill first")};
-            }
+    if (!m_deferred_create_keypool_top_up && !IsRangedP2MRDescriptorNoLock()) {
+        if (TopUpWithInternalHintResultNoNotify(std::nullopt, /*size=*/0)) {
             notify_can_get_addresses_changed = true;
         }
-        if (!m_wallet_descriptor.descriptor->ExpandFromCache(m_wallet_descriptor.next_index, m_wallet_descriptor.cache, scripts_temp, out_keys)) {
+    }
+
+    // Get the scriptPubKey from the descriptor
+    FlatSigningProvider out_keys;
+    std::vector<CScript> scripts_temp;
+    if (m_wallet_descriptor.next_index >= m_wallet_descriptor.range_end) {
+        auto top_up{TopUpWithInternalHintResultNoNotify(std::nullopt, /*size=*/1)};
+        if (!top_up) {
             // We can't generate anymore keys
             return util::Error{_("Error: Keypool ran out, please call keypoolrefill first")};
         }
-
-        CTxDestination dest;
-        if (!ExtractDestination(scripts_temp[0], dest)) {
-            return util::Error{_("Error: Cannot extract destination from the generated scriptpubkey")}; // shouldn't happen
-        }
-        m_wallet_descriptor.next_index++;
-        if (index) *index = m_wallet_descriptor.next_index - 1;
-        if (IsRangedP2MRDescriptorNoLock() && !m_deferred_create_keypool_top_up) {
-            m_wallet_descriptor.deferred_create_keypool_top_up = false;
-        }
-        WalletBatch(m_storage.GetDatabase()).WriteDescriptor(GetID(), m_wallet_descriptor);
-        return dest;
-    }()};
-
-    if (notify_can_get_addresses_changed) {
-        NotifyCanGetAddressesChanged();
+        notify_can_get_addresses_changed = true;
     }
-    return result;
+    if (!m_wallet_descriptor.descriptor->ExpandFromCache(m_wallet_descriptor.next_index, m_wallet_descriptor.cache, scripts_temp, out_keys)) {
+        // We can't generate anymore keys
+        return util::Error{_("Error: Keypool ran out, please call keypoolrefill first")};
+    }
+
+    CTxDestination dest;
+    if (!ExtractDestination(scripts_temp[0], dest)) {
+        return util::Error{_("Error: Cannot extract destination from the generated scriptpubkey")}; // shouldn't happen
+    }
+    m_wallet_descriptor.next_index++;
+    if (index) *index = m_wallet_descriptor.next_index - 1;
+    if (IsRangedP2MRDescriptorNoLock() && !m_deferred_create_keypool_top_up) {
+        m_wallet_descriptor.deferred_create_keypool_top_up = false;
+    }
+    WalletBatch(m_storage.GetDatabase()).WriteDescriptor(GetID(), m_wallet_descriptor);
+    return dest;
 }
 
 bool DescriptorScriptPubKeyMan::IsMine(const CScript& script) const
@@ -1105,10 +1107,18 @@ bool DescriptorScriptPubKeyMan::Encrypt(const CKeyingMaterial& master_key, Walle
 
 util::Result<CTxDestination> DescriptorScriptPubKeyMan::GetReservedDestination(const OutputType type, bool internal, int64_t& index, bool allow_internal_p2mr_refill)
 {
-    if (internal && allow_internal_p2mr_refill) {
-        MaybeTopUpInternalP2MRKeyPool();
+    bool notify_can_get_addresses_changed{false};
+    util::Result<CTxDestination> result{[&] {
+        LOCK(cs_desc_man);
+        if (internal && allow_internal_p2mr_refill && MaybeTopUpInternalP2MRKeyPoolNoNotify()) {
+            notify_can_get_addresses_changed = true;
+        }
+        return GetNewDestinationNoNotify(type, &index, notify_can_get_addresses_changed);
+    }()};
+    if (notify_can_get_addresses_changed) {
+        NotifyCanGetAddressesChanged();
     }
-    return GetNewDestinationInternal(type, &index);
+    return result;
 }
 
 void DescriptorScriptPubKeyMan::ReturnDestination(int64_t index, bool internal, const CTxDestination& addr)
@@ -1797,31 +1807,26 @@ bool DescriptorScriptPubKeyMan::NeedsP2MRKeyPoolRefillNoLock() const
            GetKeyPoolSizeNoLock() <= GetP2MRReceiveKeyPoolLowWatermarkNoLock();
 }
 
-void DescriptorScriptPubKeyMan::MaybeTopUpInternalP2MRKeyPool()
+bool DescriptorScriptPubKeyMan::MaybeTopUpInternalP2MRKeyPoolNoNotify()
 {
-    bool notify_can_get_addresses_changed{false};
-    {
-        LOCK(cs_desc_man);
-        if (m_storage.IsLocked() || !NeedsP2MRKeyPoolRefillNoLock()) return;
+    AssertLockHeld(cs_desc_man);
+    if (m_storage.IsLocked() || !NeedsP2MRKeyPoolRefillNoLock()) return false;
 
-        const unsigned int target{GetP2MRReceiveKeyPoolRefillStepTargetNoLock()};
-        if (target == 0) return;
-        try {
-            util::Result<void> res{TopUpWithInternalHintResultNoNotify(/*internal_hint=*/true, target)};
-            if (!res) {
-                WalletLogPrintf("P2MR change keypool inline low-watermark refill failed (descriptor id %s, target=%u, remaining=%u): %s\n",
-                    GetID().ToString(), target, GetKeyPoolSizeNoLock(), util::ErrorString(res).original);
-            } else {
-                notify_can_get_addresses_changed = true;
-            }
-        } catch (const std::exception& e) {
+    const unsigned int target{GetP2MRReceiveKeyPoolRefillStepTargetNoLock()};
+    if (target == 0) return false;
+    try {
+        util::Result<void> res{TopUpWithInternalHintResultNoNotify(/*internal_hint=*/true, target)};
+        if (!res) {
             WalletLogPrintf("P2MR change keypool inline low-watermark refill failed (descriptor id %s, target=%u, remaining=%u): %s\n",
-                GetID().ToString(), target, GetKeyPoolSizeNoLock(), e.what());
+                GetID().ToString(), target, GetKeyPoolSizeNoLock(), util::ErrorString(res).original);
+            return false;
         }
+    } catch (const std::exception& e) {
+        WalletLogPrintf("P2MR change keypool inline low-watermark refill failed (descriptor id %s, target=%u, remaining=%u): %s\n",
+            GetID().ToString(), target, GetKeyPoolSizeNoLock(), e.what());
+        return false;
     }
-    if (notify_can_get_addresses_changed) {
-        NotifyCanGetAddressesChanged();
-    }
+    return true;
 }
 
 unsigned int DescriptorScriptPubKeyMan::GetP2MRReceiveKeyPoolLowWatermarkNoLock() const
