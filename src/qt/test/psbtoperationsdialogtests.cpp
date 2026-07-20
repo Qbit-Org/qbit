@@ -159,6 +159,31 @@ void PSBTOperationsDialogTests::cleanupTestCase()
     m_context.reset();
 }
 
+void PSBTOperationsDialogTests::canceledUnlockDoesNotStartSigning()
+{
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    state->encrypted = true;
+    state->locked = true;
+    DialogFixture fixture{*m_context->client_model, m_context->platform_style.get(), state};
+    const std::string original{SerializePSBT(fixture.original_psbt)};
+    QSignalSpy display_updates{fixture.description(), &QTextEdit::textChanged};
+
+    fixture.dialog->signTransaction();
+
+    QVERIFY(fixture.statusLabel()->text().contains(QStringLiteral("wallet is locked")));
+    QCOMPARE(ReadState(state, [](const auto& value) { return value.psbt_sign_calls; }), 0);
+    QCOMPARE(display_updates.count(), 0);
+    QVERIFY(!fixture.dialog->findChild<QProgressDialog*>(QStringLiteral("psbtSigningProgressDialog")));
+
+    fixture.dialog->copyToClipboard();
+    const auto decoded{DecodeBase64(QApplication::clipboard()->text().toStdString())};
+    QVERIFY(decoded);
+    PartiallySignedTransaction clipboard_psbt;
+    std::string error;
+    QVERIFY(DecodeRawPSBT(clipboard_psbt, MakeByteSpan(*decoded), error));
+    QCOMPARE(SerializePSBT(clipboard_psbt), original);
+}
+
 void PSBTOperationsDialogTests::eventLoopResponsiveWhileSigningPaused()
 {
     auto state{std::make_shared<qt_test::SyntheticWalletState>()};

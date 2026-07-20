@@ -126,6 +126,11 @@ void PSBTOperationsDialog::signTransaction()
     }
 
     m_sign_unlock_context = std::make_unique<WalletModel::UnlockContext>(m_wallet_model->requestUnlock());
+    if (!m_sign_unlock_context->isValid()) {
+        m_sign_unlock_context.reset();
+        showStatus(tr("Cannot sign inputs while wallet is locked."), StatusLevel::WARN);
+        return;
+    }
 
     std::unique_ptr<interfaces::Wallet> wallet = m_wallet_model->wallet().clone();
     if (!wallet) {
@@ -188,7 +193,7 @@ void PSBTOperationsDialog::signTransaction()
                 result->cancel_observed = true;
                 return false;
             }
-            return bool{dialog};
+            return !dialog.isNull();
         };
         try {
             result->error = wallet->fillPSBT(std::nullopt,
