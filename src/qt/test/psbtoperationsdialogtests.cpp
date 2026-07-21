@@ -23,9 +23,11 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 
 #include <QApplication>
 #include <QClipboard>
@@ -82,15 +84,35 @@ std::string SerializePSBT(const PartiallySignedTransaction& psbt)
     return stream.str();
 }
 
+wallet::PQCUsageReport MakePQCUsageReport(const CPQCPubKey& pubkey, uint32_t signature_count)
+{
+    wallet::PQCUsageReport report;
+    report.key_states.push_back({
+        .pubkey = pubkey,
+        .signature_count = signature_count,
+        .signature_limit = PQC_MAX_SIGNATURES,
+        .signatures_remaining = PQC_MAX_SIGNATURES - signature_count,
+        .limit_state = wallet::PQCSignatureLimitState::NORMAL,
+    });
+    report.overall_state = wallet::PQCSignatureLimitState::NORMAL;
+    return report;
+}
+
+QString PQCPubKeyHex(const CPQCPubKey& pubkey)
+{
+    return QString::fromStdString(HexStr(std::span<const unsigned char>{pubkey.begin(), pubkey.end()}));
+}
+
 class DialogFixture
 {
 public:
     DialogFixture(ClientModel& client_model,
                   const PlatformStyle* platform_style,
-                  std::shared_ptr<qt_test::SyntheticWalletState> state)
+                  std::shared_ptr<qt_test::SyntheticWalletState> state,
+                  wallet::PQCUsageReport pqc_usage = {})
         : state{std::move(state)},
           original_psbt{MakeUnsignedPSBT()},
-          wallet_model{std::make_unique<WalletModel>(qt_test::MakeSyntheticWallet({}, this->state), client_model, platform_style)},
+          wallet_model{std::make_unique<WalletModel>(qt_test::MakeSyntheticWallet(std::move(pqc_usage), this->state), client_model, platform_style)},
           dialog{std::make_unique<PSBTOperationsDialog>(nullptr, wallet_model.get(), &client_model)}
     {
         dialog->openWithPSBT(original_psbt);
@@ -208,7 +230,11 @@ void PSBTOperationsDialogTests::successfulCompletionUpdatesDisplayOnce()
 {
     auto state{std::make_shared<qt_test::SyntheticWalletState>()};
     state->allow_psbt_reservation = false;
-    DialogFixture fixture{*m_context->client_model, m_context->platform_style.get(), state};
+    state->psbt_simulate_pqc_reservation = true;
+    CPQCKey key;
+    key.MakeNewKey();
+    const wallet::PQCUsageReport pqc_usage{MakePQCUsageReport(key.GetPubKey(), 1)};
+    DialogFixture fixture{*m_context->client_model, m_context->platform_style.get(), state, pqc_usage};
     QVERIFY(fixture.description());
     QSignalSpy display_updates{fixture.description(), &QTextEdit::textChanged};
     QVERIFY(display_updates.isValid());
@@ -220,6 +246,9 @@ void PSBTOperationsDialogTests::successfulCompletionUpdatesDisplayOnce()
 
     QCOMPARE(display_updates.count(), 1);
     QVERIFY(!fixture.description()->toPlainText().contains(QStringLiteral("unsigned input")));
+    QVERIFY(fixture.statusLabel()->text().contains(QStringLiteral("PQC signature capacity was consumed")));
+    QVERIFY(fixture.statusLabel()->text().contains(PQCPubKeyHex(key.GetPubKey())));
+    QVERIFY(fixture.statusLabel()->text().contains(QStringLiteral("1 of %1 signatures used").arg(PQC_MAX_SIGNATURES)));
     QCOMPARE(ReadState(state, [](const auto& value) { return value.psbt_sign_calls; }), 1);
 }
 
@@ -323,13 +352,22 @@ void PSBTOperationsDialogTests::walletUnloadDuringSigning()
 void PSBTOperationsDialogTests::signingFailurePreservesOriginalPSBT()
 {
     auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    state->psbt_simulate_pqc_reservation = true;
     state->psbt_fail = true;
-    DialogFixture fixture{*m_context->client_model, m_context->platform_style.get(), state};
+    CPQCKey key;
+    key.MakeNewKey();
+    const wallet::PQCUsageReport pqc_usage{MakePQCUsageReport(key.GetPubKey(), 2)};
+    DialogFixture fixture{*m_context->client_model, m_context->platform_style.get(), state, pqc_usage};
     const std::string original{SerializePSBT(fixture.original_psbt)};
     QSignalSpy display_updates{fixture.description(), &QTextEdit::textChanged};
 
     fixture.dialog->signTransaction();
     QVERIFY(WaitUntil([&] { return fixture.statusLabel()->text().startsWith(QStringLiteral("Failed to sign transaction")); }));
+    QVERIFY(ReadState(state, [](const auto& value) { return value.psbt_counters_reserved; }));
+    QVERIFY(fixture.statusLabel()->text().contains(QStringLiteral("PQC signature capacity was consumed")));
+    QVERIFY(fixture.statusLabel()->text().contains(PQCPubKeyHex(key.GetPubKey())));
+    QVERIFY(fixture.statusLabel()->text().contains(QStringLiteral("2 of %1 signatures used").arg(PQC_MAX_SIGNATURES)));
+    QVERIFY(fixture.statusLabel()->text().contains(QStringLiteral("%1 remaining").arg(PQC_MAX_SIGNATURES - 2)));
     QCOMPARE(display_updates.count(), 0);
 
     fixture.dialog->copyToClipboard();
