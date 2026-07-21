@@ -90,7 +90,8 @@ public:
     virtual bool IsLocked() const = 0;
     virtual bool WithWalletLock(std::function<bool()> cb) const = 0;
     virtual std::optional<bool> IsInternalScriptPubKeyMan(const ScriptPubKeyMan* spk_man) const = 0;
-    //! Callback function for after TopUp completes containing any scripts that were added by a SPKMan
+    //! Publish scripts added by a SPKMan after its database transaction has
+    //! committed and its manager lock has been released.
     virtual void TopUpCallback(const std::set<CScript>&, ScriptPubKeyMan*) = 0;
 };
 
@@ -395,11 +396,14 @@ private:
         bool has_encryption_keys{false};
         std::optional<CKeyingMaterial> encryption_key;
     };
+    void PublishTopUp(const std::set<CScript>& new_spks, bool notify_can_get_addresses_changed) LOCKS_EXCLUDED(cs_desc_man);
+    util::Result<CTxDestination> GetNewDestinationNoNotify(OutputType type, int64_t* index, bool& notify_can_get_addresses_changed, std::set<CScript>& committed_spks) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     TopUpPreparation PrepareTopUp(std::optional<bool> internal_hint) const;
+    util::Result<void> TopUpWithInternalHintResultNoNotify(std::optional<bool> internal_hint, unsigned int size, std::set<CScript>& committed_spks);
     bool IsRangedP2MRDescriptorNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     unsigned int GetKeyPoolSizeNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     bool NeedsP2MRKeyPoolRefillNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
-    void MaybeTopUpInternalP2MRKeyPool() EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    bool MaybeTopUpInternalP2MRKeyPoolNoNotify(std::set<CScript>& committed_spks) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     unsigned int GetP2MRReceiveKeyPoolLowWatermarkNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     unsigned int GetP2MRReceiveKeyPoolRefillStepTargetNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
 
@@ -417,9 +421,9 @@ protected:
     WalletDescriptor m_wallet_descriptor GUARDED_BY(cs_desc_man);
 
     //! Same as 'TopUp' but designed for use within a batch transaction context
-    bool TopUpWithDB(WalletBatch& batch, unsigned int size = 0, std::optional<bool> internal_hint = std::nullopt);
-    util::Result<void> TopUpWithDBResult(WalletBatch& batch, unsigned int size = 0, std::optional<bool> internal_hint = std::nullopt, bool throw_on_persistence_error = false, bool rollback_state_on_error = true);
-    util::Result<void> TopUpWithDBPreparedResult(WalletBatch& batch, unsigned int size, const TopUpPreparation& prepared, bool throw_on_persistence_error, bool rollback_state_on_error) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    bool TopUpWithDB(WalletBatch& batch, unsigned int size = 0, std::optional<bool> internal_hint = std::nullopt) LOCKS_EXCLUDED(cs_desc_man);
+    util::Result<void> TopUpWithDBResult(WalletBatch& batch, unsigned int size = 0, std::optional<bool> internal_hint = std::nullopt, bool throw_on_persistence_error = false, bool rollback_state_on_error = true) LOCKS_EXCLUDED(cs_desc_man);
+    util::Result<void> TopUpWithDBPreparedResult(WalletBatch& batch, unsigned int size, const TopUpPreparation& prepared, bool throw_on_persistence_error, bool rollback_state_on_error, std::set<CScript>& new_spks) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
 
 public:
     DescriptorScriptPubKeyMan(WalletStorage& storage, WalletDescriptor& descriptor, int64_t keypool_size);
@@ -443,7 +447,7 @@ public:
     bool TopUp(unsigned int size = 0) override;
     util::Result<void> TopUpResult(unsigned int size = 0) override;
     bool TopUpWithInternalHint(std::optional<bool> internal_hint, unsigned int size = 0);
-    util::Result<void> TopUpWithInternalHintResult(std::optional<bool> internal_hint, unsigned int size = 0);
+    util::Result<void> TopUpWithInternalHintResult(std::optional<bool> internal_hint, unsigned int size = 0) LOCKS_EXCLUDED(cs_desc_man);
 
     std::vector<WalletDestination> MarkUnusedAddresses(const CScript& script, const MarkUnusedAddressesOptions& options = {}) override;
 

@@ -106,6 +106,7 @@ std::shared_ptr<CWallet> RestoreWallet(WalletContext& context, const fs::path& b
 std::unique_ptr<interfaces::Handler> HandleLoadWallet(WalletContext& context, LoadWalletFn load_wallet);
 void NotifyWalletLoaded(WalletContext& context, const std::shared_ptr<CWallet>& wallet);
 void SchedulePlaintextPQCKeyValidation(CScheduler& scheduler, const std::shared_ptr<CWallet>& wallet);
+void MaybeSchedulePendingInitialKeyPoolTopUp(WalletContext& context, const std::shared_ptr<CWallet>& wallet);
 void MaybeScheduleP2MRKeyPoolRefill(WalletContext& context, const std::shared_ptr<CWallet>& wallet, OutputType type, bool internal);
 std::unique_ptr<WalletDatabase> MakeWalletDatabase(const std::string& name, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error);
 
@@ -492,7 +493,7 @@ private:
     void SetWalletFlagWithDB(WalletBatch& batch, uint64_t flags);
 
     //! Cache of descriptor ScriptPubKeys used for IsMine. Maps ScriptPubKey to set of spkms
-    std::unordered_map<CScript, std::vector<ScriptPubKeyMan*>, SaltedSipHasher> m_cached_spks;
+    std::unordered_map<CScript, std::vector<ScriptPubKeyMan*>, SaltedSipHasher> m_cached_spks GUARDED_BY(cs_wallet);
 
     //! Set of both spent and unspent transaction outputs owned by this wallet
     std::unordered_map<COutPoint, WalletTXO, SaltedOutpointHasher> m_txos GUARDED_BY(cs_wallet);
@@ -821,6 +822,13 @@ public:
 
     /** Number of pre-generated keys/scripts by each spkm (part of the look-ahead process, used to detect payments) */
     int64_t m_keypool_size{DEFAULT_KEYPOOL_SIZE};
+    // Optional deterministic test hook invoked after descriptor persistence
+    // and before script cache publication takes cs_wallet. Configure it before
+    // starting concurrent wallet work and leave it unchanged until that work
+    // completes.
+    std::function<void()> m_before_script_pub_key_cache_publish;
+    bool m_deferred_create_keypool_top_up_scheduled GUARDED_BY(cs_wallet){false};
+    bool m_deferred_create_keypool_top_up_reschedule_requested GUARDED_BY(cs_wallet){false};
     bool m_p2mr_receive_keypool_refill_scheduled GUARDED_BY(cs_wallet){false};
     bool m_p2mr_change_keypool_refill_scheduled GUARDED_BY(cs_wallet){false};
 
@@ -1060,7 +1068,7 @@ public:
     ScriptPubKeyMan* GetScriptPubKeyMan(const OutputType& type, bool internal) const;
 
     //! Get all the ScriptPubKeyMans for a script
-    std::set<ScriptPubKeyMan*> GetScriptPubKeyMans(const CScript& script) const;
+    std::set<ScriptPubKeyMan*> GetScriptPubKeyMans(const CScript& script) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     //! Get the ScriptPubKeyMan by id
     ScriptPubKeyMan* GetScriptPubKeyMan(const uint256& id) const;
 
@@ -1166,7 +1174,7 @@ public:
     bool CanGrindR() const;
 
     //! Add scriptPubKeys for this ScriptPubKeyMan into the scriptPubKey cache
-    void CacheNewScriptPubKeys(const std::set<CScript>& spks, ScriptPubKeyMan* spkm);
+    void CacheNewScriptPubKeys(const std::set<CScript>& spks, ScriptPubKeyMan* spkm) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     void TopUpCallback(const std::set<CScript>& spks, ScriptPubKeyMan* spkm) override;
 

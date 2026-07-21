@@ -9,6 +9,7 @@
 #include <wallet/pqc_usage.h>
 
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 
@@ -29,6 +30,7 @@ struct SyntheticWalletState {
     bool locked{false};
     int lock_calls{0};
     int unlock_calls{0};
+    std::function<void()> can_get_addresses_changed;
 };
 
 std::unique_ptr<interfaces::Wallet> MakeSyntheticWallet(

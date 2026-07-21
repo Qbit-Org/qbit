@@ -356,6 +356,7 @@ struct DeferredCreateKeyPoolTopUpState {
     CScheduler* scheduler;
     int remaining_steps;
     std::optional<SteadyClock::time_point> refill_start;
+    std::function<void()> step_finished_fn;
 };
 
 struct P2MRKeyPoolRefillState {
@@ -382,16 +383,32 @@ void RunScheduledPendingInitialKeyPoolTopUp(const std::shared_ptr<DeferredCreate
         state->refill_start = SteadyClock::now();
     }
     const auto step_result = wallet->RunPendingInitialKeyPoolTopUpStep();
-    if (step_result == CWallet::PendingInitialKeyPoolTopUpStepResult::COMPLETE) {
-        wallet->WalletLogPrintf("Deferred create-time keypool top up completed in %15dms\n",
-            Ticks<std::chrono::milliseconds>(SteadyClock::now() - *state->refill_start));
-        return;
+    if (state->step_finished_fn) {
+        state->step_finished_fn();
     }
-    if (step_result == CWallet::PendingInitialKeyPoolTopUpStepResult::FAILED) {
-        wallet->WalletLogPrintf("Deferred create-time keypool top up paused after a failed background step\n");
-        return;
+
+    bool continue_refill{false};
+    {
+        LOCK(wallet->cs_wallet);
+        const bool can_continue{!wallet->IsLocked() && wallet->HasPendingInitialKeyPoolTopUp()};
+        if (can_continue &&
+            (step_result == CWallet::PendingInitialKeyPoolTopUpStepResult::PENDING ||
+             wallet->m_deferred_create_keypool_top_up_reschedule_requested)) {
+            wallet->m_deferred_create_keypool_top_up_reschedule_requested = false;
+            continue_refill = true;
+        } else {
+            wallet->m_deferred_create_keypool_top_up_scheduled = false;
+            wallet->m_deferred_create_keypool_top_up_reschedule_requested = false;
+        }
     }
-    if (wallet->IsLocked() || !wallet->HasPendingInitialKeyPoolTopUp()) {
+
+    if (!continue_refill) {
+        if (step_result == CWallet::PendingInitialKeyPoolTopUpStepResult::COMPLETE) {
+            wallet->WalletLogPrintf("Deferred create-time keypool top up completed in %15dms\n",
+                Ticks<std::chrono::milliseconds>(SteadyClock::now() - *state->refill_start));
+        } else if (step_result == CWallet::PendingInitialKeyPoolTopUpStepResult::FAILED) {
+            wallet->WalletLogPrintf("Deferred create-time keypool top up paused after a failed background step\n");
+        }
         return;
     }
     if (--state->remaining_steps == 0) {
@@ -402,10 +419,24 @@ void RunScheduledPendingInitialKeyPoolTopUp(const std::shared_ptr<DeferredCreate
     state->scheduler->scheduleFromNow([state] { RunScheduledPendingInitialKeyPoolTopUp(state); }, std::chrono::milliseconds{1});
 }
 
-void SchedulePendingInitialKeyPoolTopUp(WalletContext& context, const std::shared_ptr<CWallet>& wallet)
+void SchedulePendingInitialKeyPoolTopUp(WalletContext& context, const std::shared_ptr<CWallet>& wallet, std::chrono::milliseconds delay)
 {
-    if (!context.scheduler || wallet->IsLocked() || !wallet->HasPendingInitialKeyPoolTopUp()) {
-        return;
+    if (!context.scheduler) return;
+
+    {
+        LOCK(wallet->cs_wallet);
+        if (wallet->IsLocked() || !wallet->HasPendingInitialKeyPoolTopUp()) {
+            return;
+        }
+        if (wallet->m_deferred_create_keypool_top_up_scheduled) {
+            // Record the unlock/scheduling attempt so a worker that is about
+            // to retire hands ownership to a replacement instead of clearing
+            // the deduplication flag after the attempt returns.
+            wallet->m_deferred_create_keypool_top_up_reschedule_requested = true;
+            return;
+        }
+        wallet->m_deferred_create_keypool_top_up_scheduled = true;
+        wallet->m_deferred_create_keypool_top_up_reschedule_requested = false;
     }
 
     auto state = std::make_shared<DeferredCreateKeyPoolTopUpState>(DeferredCreateKeyPoolTopUpState{
@@ -413,10 +444,9 @@ void SchedulePendingInitialKeyPoolTopUp(WalletContext& context, const std::share
         .scheduler = context.scheduler,
         .remaining_steps = GetDeferredCreateKeyPoolTopUpStepsPerBatch(),
         .refill_start = std::nullopt,
+        .step_finished_fn = context.deferred_keypool_top_up_step_finished_fn,
     });
-    // Let wallet creation return and the first address calls finish before background
-    // PQC derivation starts competing for CPU.
-    context.scheduler->scheduleFromNow([state] { RunScheduledPendingInitialKeyPoolTopUp(state); }, std::chrono::seconds{30});
+    context.scheduler->scheduleFromNow([state] { RunScheduledPendingInitialKeyPoolTopUp(state); }, delay);
 }
 
 void RunScheduledP2MRKeyPoolRefill(const std::shared_ptr<P2MRKeyPoolRefillState>& state)
@@ -550,7 +580,9 @@ std::shared_ptr<CWallet> LoadWalletInternal(WalletContext& context, const std::s
         AddWallet(context, wallet);
         wallet->postInitProcess();
         if (context.scheduler) SchedulePlaintextPQCKeyValidationInternal(*context.scheduler, wallet);
-        SchedulePendingInitialKeyPoolTopUp(context, wallet);
+        // Let wallet loading return and initial address calls finish before
+        // background PQC derivation starts competing for CPU.
+        SchedulePendingInitialKeyPoolTopUp(context, wallet, std::chrono::seconds{30});
 
         // Write the wallet setting
         UpdateWalletSetting(*context.chain, name, load_on_start, warnings);
@@ -622,6 +654,11 @@ private:
 void SchedulePlaintextPQCKeyValidation(CScheduler& scheduler, const std::shared_ptr<CWallet>& wallet)
 {
     SchedulePlaintextPQCKeyValidationInternal(scheduler, wallet);
+}
+
+void MaybeSchedulePendingInitialKeyPoolTopUp(WalletContext& context, const std::shared_ptr<CWallet>& wallet)
+{
+    SchedulePendingInitialKeyPoolTopUp(context, wallet, std::chrono::milliseconds{1});
 }
 
 void MaybeScheduleP2MRKeyPoolRefill(WalletContext& context, const std::shared_ptr<CWallet>& wallet, OutputType type, bool internal)
@@ -732,7 +769,9 @@ std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string&
     NotifyWalletLoaded(context, wallet);
     AddWallet(context, wallet);
     wallet->postInitProcess();
-    SchedulePendingInitialKeyPoolTopUp(context, wallet);
+    // Let wallet creation return and initial address calls finish before
+    // background PQC derivation starts competing for CPU.
+    SchedulePendingInitialKeyPoolTopUp(context, wallet, std::chrono::seconds{30});
 
     // Write the wallet settings
     UpdateWalletSetting(*context.chain, name, load_on_start, warnings);
@@ -4549,6 +4588,7 @@ ScriptPubKeyMan* CWallet::GetScriptPubKeyMan(const OutputType& type, bool intern
 
 std::set<ScriptPubKeyMan*> CWallet::GetScriptPubKeyMans(const CScript& script) const
 {
+    AssertLockHeld(cs_wallet);
     std::set<ScriptPubKeyMan*> spk_mans;
 
     // Search the cache for relevant SPKMs instead of iterating m_spk_managers
@@ -4578,6 +4618,7 @@ std::unique_ptr<SigningProvider> CWallet::GetSolvingProvider(const CScript& scri
 
 std::unique_ptr<SigningProvider> CWallet::GetSolvingProvider(const CScript& script, SignatureData& sigdata) const
 {
+    LOCK(cs_wallet);
     // Search the cache for relevant SPKMs instead of iterating m_spk_managers
     const auto& it = m_cached_spks.find(script);
     if (it != m_cached_spks.end()) {
@@ -4591,6 +4632,7 @@ std::unique_ptr<SigningProvider> CWallet::GetSolvingProvider(const CScript& scri
 
 std::vector<WalletDescriptor> CWallet::GetWalletDescriptors(const CScript& script) const
 {
+    LOCK(cs_wallet);
     std::vector<WalletDescriptor> descs;
     for (const auto spk_man: GetScriptPubKeyMans(script)) {
         if (const auto desc_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(spk_man)) {
@@ -5064,8 +5106,8 @@ util::Result<void> CWallet::ApplyMigrationData(WalletBatch& local_wallet_batch, 
     // When the legacy wallet has no spendable scripts, the main wallet will be empty, leaving its script cache empty as well.
     // The watch-only and/or solvable wallet(s) will contain the scripts in their respective caches.
     if (!data.desc_spkms.empty()) Assume(!m_cached_spks.empty());
-    if (!data.watch_descs.empty()) Assume(!data.watchonly_wallet->m_cached_spks.empty());
-    if (!data.solvable_descs.empty()) Assume(!data.solvable_wallet->m_cached_spks.empty());
+    if (!data.watch_descs.empty()) Assume(WITH_LOCK(data.watchonly_wallet->cs_wallet, return !data.watchonly_wallet->m_cached_spks.empty()));
+    if (!data.solvable_descs.empty()) Assume(WITH_LOCK(data.solvable_wallet->cs_wallet, return !data.solvable_wallet->m_cached_spks.empty()));
 
     for (auto& desc_spkm : data.desc_spkms) {
         if (m_spk_managers.count(desc_spkm->GetID()) > 0) {
@@ -5627,6 +5669,10 @@ void CWallet::CacheNewScriptPubKeys(const std::set<CScript>& spks, ScriptPubKeyM
 
 void CWallet::TopUpCallback(const std::set<CScript>& spks, ScriptPubKeyMan* spkm)
 {
+    if (m_before_script_pub_key_cache_publish) {
+        m_before_script_pub_key_cache_publish();
+    }
+    LOCK(cs_wallet);
     // Update scriptPubKey cache
     CacheNewScriptPubKeys(spks, spkm);
 }
