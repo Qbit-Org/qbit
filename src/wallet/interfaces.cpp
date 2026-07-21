@@ -479,7 +479,8 @@ public:
         size_t* n_signed,
         PartiallySignedTransaction& psbtx,
         bool& complete,
-        wallet::PQCUsageReport* pqc_usage) override
+        wallet::PQCUsageReport* pqc_usage,
+        const SigningProgressCallback& progress_callback) override
     {
         if (sign) {
             if (GetPQCKeyValidationSigningError(*m_wallet)) {
@@ -497,7 +498,8 @@ public:
                                             bip32derivs,
                                             n_signed,
                                             /*finalize=*/true,
-                                            sign ? pqc_usage_recorder.GetObserver() : PQCSignatureCounterObserver{});
+                                            sign ? pqc_usage_recorder.GetObserver() : PQCSignatureCounterObserver{},
+                                            progress_callback);
         if (pqc_usage) {
             *pqc_usage = sign ? BuildSigningPQCUsageReport(pqc_usage_recorder) : PQCUsageReport{};
         }

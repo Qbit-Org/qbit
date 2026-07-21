@@ -17,16 +17,81 @@
 #include <qt/optionsmodel.h>
 #include <util/fs.h>
 #include <util/strencodings.h>
+#include <wallet/pqc_usage.h>
 
+#include <algorithm>
+#include <exception>
 #include <fstream>
 #include <iostream>
+#include <memory>
+#include <optional>
+#include <span>
 #include <string>
+
+#include <QMetaObject>
+#include <QProgressBar>
+#include <QProgressDialog>
+#include <QStringList>
+#include <QThread>
+#include <QTimer>
 
 using common::TransactionErrorString;
 using node::AnalyzePSBT;
 using node::DEFAULT_MAX_RAW_TX_FEE_RATE;
 using node::PSBTAnalysis;
 using node::TransactionError;
+
+namespace {
+QString BilingualToQString(const bilingual_str& message)
+{
+    return QString::fromStdString(message.translated.empty() ? message.original : message.translated);
+}
+
+QString AppendPQCUsageStatus(QString message, const wallet::PQCUsageReport& report)
+{
+    if (report.key_states.empty()) return message;
+
+    QStringList lines;
+    lines.append(std::move(message));
+    lines.append(PSBTOperationsDialog::tr("PQC signature capacity was consumed during this signing attempt."));
+    if (report.overall_state.has_value()) {
+        lines.append(PSBTOperationsDialog::tr("PQC usage state after this signing attempt: %1.")
+                         .arg(QString::fromStdString(std::string{wallet::PQCSignatureLimitStateName(*report.overall_state)})));
+    }
+    for (const wallet::PQCUsageSnapshot& key_state : report.key_states) {
+        lines.append(PSBTOperationsDialog::tr("PQC key %1: %2 of %3 signatures used, %4 remaining; state: %5.")
+                         .arg(QString::fromStdString(HexStr(std::span<const unsigned char>{key_state.pubkey.begin(), key_state.pubkey.end()})))
+                         .arg(key_state.signature_count)
+                         .arg(key_state.signature_limit)
+                         .arg(key_state.signatures_remaining)
+                         .arg(QString::fromStdString(std::string{wallet::PQCSignatureLimitStateName(key_state.limit_state)})));
+    }
+    for (const bilingual_str& warning : wallet::FormatPQCUsageWarnings(report.warnings)) {
+        lines.append(BilingualToQString(warning));
+    }
+    return lines.join("\n");
+}
+
+std::unique_ptr<interfaces::Wallet> GetBackgroundWallet(interfaces::Node& node, const std::string& wallet_name)
+{
+    for (auto& wallet : node.walletLoader().getWallets()) {
+        if (wallet && wallet->getWalletName() == wallet_name) {
+            return std::move(wallet);
+        }
+    }
+    return nullptr;
+}
+} // namespace
+
+struct PSBTOperationsDialog::SignResult {
+    PartiallySignedTransaction psbt;
+    std::optional<common::PSBTError> error;
+    std::string exception;
+    size_t n_signed{0};
+    bool complete{false};
+    bool cancel_observed{false};
+    wallet::PQCUsageReport pqc_usage;
+};
 
 PSBTOperationsDialog::PSBTOperationsDialog(
     QWidget* parent, WalletModel* wallet_model, ClientModel* client_model) : QDialog(parent, GUIUtil::dialog_flags),
@@ -35,6 +100,7 @@ PSBTOperationsDialog::PSBTOperationsDialog(
                                                                              m_client_model(client_model)
 {
     m_ui->setupUi(this);
+    m_ui->statusBar->setWordWrap(true);
 
     connect(m_ui->signTransactionButton, &QPushButton::clicked, this, &PSBTOperationsDialog::signTransaction);
     connect(m_ui->broadcastTransactionButton, &QPushButton::clicked, this, &PSBTOperationsDialog::broadcastTransaction);
@@ -49,6 +115,16 @@ PSBTOperationsDialog::PSBTOperationsDialog(
 
 PSBTOperationsDialog::~PSBTOperationsDialog()
 {
+    m_sign_cancel_requested = true;
+    clearSignProgressDialog();
+    if (m_sign_thread) {
+        QThread* thread = m_sign_thread;
+        m_sign_thread = nullptr;
+        disconnect(thread, nullptr, this, nullptr);
+        thread->wait();
+        delete thread;
+    }
+    m_sign_unlock_context.reset();
     delete m_ui;
 }
 
@@ -78,33 +154,262 @@ void PSBTOperationsDialog::openWithPSBT(PartiallySignedTransaction psbtx)
 
 void PSBTOperationsDialog::signTransaction()
 {
-    bool complete;
-    size_t n_signed;
-
-    WalletModel::UnlockContext ctx(m_wallet_model->requestUnlock());
-
-    const auto err{m_wallet_model->wallet().fillPSBT(std::nullopt, /*sign=*/true, /*bip32derivs=*/true, &n_signed, m_transaction_data, complete)};
-
-    if (err) {
-        showStatus(tr("Failed to sign transaction: %1")
-            .arg(QString::fromStdString(PSBTErrorString(*err).translated)), StatusLevel::ERR);
+    if (m_sign_thread || !m_wallet_model) {
         return;
     }
 
-    updateTransactionDisplay();
-
-    if (!complete && !ctx.isValid()) {
+    m_sign_unlock_context = std::make_unique<WalletModel::UnlockContext>(m_wallet_model->requestUnlock());
+    if (!m_sign_unlock_context->isValid()) {
+        m_sign_unlock_context.reset();
         showStatus(tr("Cannot sign inputs while wallet is locked."), StatusLevel::WARN);
-    } else if (!complete && n_signed < 1) {
-        showStatus(tr("Could not sign any more inputs."), StatusLevel::WARN);
-    } else if (!complete) {
-        showStatus(tr("Signed %1 inputs, but more signatures are still required.").arg(n_signed),
-            StatusLevel::INFO);
+        return;
+    }
+
+    std::unique_ptr<interfaces::Wallet> wallet = m_wallet_model->wallet().clone();
+    if (!wallet) {
+        wallet = GetBackgroundWallet(m_wallet_model->node(), m_wallet_model->wallet().getWalletName());
+    }
+    if (!wallet) {
+        showStatus(tr("Failed to sign transaction: Wallet is no longer loaded."), StatusLevel::ERR);
+        m_sign_unlock_context.reset();
+        return;
+    }
+
+    clearSignProgressDialog();
+    const uint64_t generation = ++m_sign_generation;
+    m_sign_cancel_requested = false;
+    m_sign_counters_reserved = false;
+    m_last_sign_pqc_usage.reset();
+    setSigningControlsEnabled(false);
+
+    m_sign_progress_dialog = new QProgressDialog(this);
+    m_sign_progress_dialog->setObjectName(QStringLiteral("psbtSigningProgressDialog"));
+    m_sign_progress_dialog->setWindowTitle(tr("Signing Transaction"));
+    m_sign_progress_dialog->setLabelText(tr("Preparing transaction..."));
+    m_sign_progress_dialog->setCancelButtonText(tr("Cancel"));
+    m_sign_progress_bar = new QProgressBar(m_sign_progress_dialog);
+    m_sign_progress_bar->setRange(0, 0);
+    m_sign_progress_dialog->setBar(m_sign_progress_bar);
+    m_sign_progress_dialog->setMinimumDuration(250);
+    m_sign_progress_dialog->setAutoClose(false);
+    m_sign_progress_dialog->setAutoReset(false);
+    m_sign_progress_dialog->setWindowModality(Qt::ApplicationModal);
+    GUIUtil::PolishProgressDialog(m_sign_progress_dialog);
+    connect(m_sign_progress_dialog, &QProgressDialog::canceled, this, &PSBTOperationsDialog::cancelSignTransaction);
+    QTimer::singleShot(250, m_sign_progress_dialog, [this, generation] {
+        if (generation == m_sign_generation && m_sign_progress_dialog) {
+            m_sign_progress_dialog->show();
+        }
+    });
+
+    QPointer<PSBTOperationsDialog> dialog(this);
+    std::atomic_bool* cancel_flag = &m_sign_cancel_requested;
+    std::atomic_bool* counters_reserved_flag = &m_sign_counters_reserved;
+    QThread* thread = QThread::create([dialog,
+                                       generation,
+                                       wallet = std::move(wallet),
+                                       psbt = m_transaction_data,
+                                       cancel_flag,
+                                       counters_reserved_flag]() mutable {
+        auto result = std::make_shared<SignResult>();
+        result->psbt = std::move(psbt);
+        SigningProgressCallback progress_callback = [dialog, generation, result, cancel_flag, counters_reserved_flag](const SigningProgress& progress) {
+            if (!progress.cancellable) counters_reserved_flag->store(true);
+            const bool cancellable{progress.cancellable && !counters_reserved_flag->load()};
+            if (dialog) {
+                QMetaObject::invokeMethod(dialog, [dialog, generation, progress] {
+                    if (dialog) dialog->signTransactionProgress(generation, progress);
+                }, Qt::QueuedConnection);
+            }
+            if (!cancellable) return true;
+            if (cancel_flag->load()) {
+                result->cancel_observed = true;
+                return false;
+            }
+            return !dialog.isNull();
+        };
+        try {
+            result->error = wallet->fillPSBT(std::nullopt,
+                                             /*sign=*/true,
+                                             /*bip32derivs=*/true,
+                                             &result->n_signed,
+                                             result->psbt,
+                                             result->complete,
+                                             &result->pqc_usage,
+                                             progress_callback);
+        } catch (const std::exception& e) {
+            result->exception = e.what();
+        }
+        if (!dialog) return;
+        QMetaObject::invokeMethod(dialog, [dialog, generation, result] {
+            if (dialog) dialog->signTransactionFinished(generation, result);
+        }, Qt::QueuedConnection);
+    });
+
+    m_sign_thread = thread;
+    connect(thread, &QThread::finished, this, [this, thread] {
+        if (m_sign_thread == thread) {
+            m_sign_thread = nullptr;
+            thread->deleteLater();
+        }
+    });
+    thread->start();
+}
+
+void PSBTOperationsDialog::signTransactionProgress(uint64_t generation, SigningProgress progress)
+{
+    if (generation != m_sign_generation || !m_sign_progress_dialog || !m_sign_progress_bar) return;
+
+    if (!progress.cancellable || m_sign_counters_reserved.load()) {
+        m_sign_counters_reserved = true;
+        m_sign_progress_dialog->setCancelButton(nullptr);
+    }
+    if (m_sign_cancel_requested.load() && !m_sign_counters_reserved.load()) return;
+
+    switch (progress.phase) {
+    case SigningProgressPhase::PREPARING_TRANSACTION:
+        m_sign_progress_dialog->setLabelText(tr("Preparing transaction..."));
+        m_sign_progress_bar->setRange(0, 0);
+        break;
+    case SigningProgressPhase::RESERVING_PQC_COUNTERS:
+        m_sign_progress_dialog->setLabelText(tr("Reserving signing counters..."));
+        m_sign_progress_bar->setRange(0, 0);
+        break;
+    case SigningProgressPhase::SIGNING_INPUTS:
+        if (progress.total == 0) {
+            m_sign_progress_dialog->setLabelText(tr("Signing inputs..."));
+            m_sign_progress_bar->setRange(0, 0);
+        } else {
+            progress.completed = std::min(progress.completed, progress.total);
+            m_sign_progress_dialog->setLabelText(tr("Signing inputs: %1 of %2 complete...").arg(progress.completed).arg(progress.total));
+            m_sign_progress_bar->setRange(0, static_cast<int>(progress.total));
+            m_sign_progress_bar->setValue(static_cast<int>(progress.completed));
+        }
+        break;
+    case SigningProgressPhase::FINALIZING_TRANSACTION:
+        m_sign_progress_dialog->setLabelText(tr("Finalizing transaction..."));
+        m_sign_progress_bar->setRange(0, 0);
+        break;
+    case SigningProgressPhase::VERIFYING_TRANSACTION:
+        m_sign_progress_dialog->setLabelText(tr("Verifying transaction..."));
+        if (progress.total == 0) {
+            m_sign_progress_bar->setRange(0, 0);
+        } else {
+            progress.completed = std::min(progress.completed, progress.total);
+            m_sign_progress_bar->setRange(0, static_cast<int>(progress.total));
+            m_sign_progress_bar->setValue(static_cast<int>(progress.completed));
+        }
+        break;
+    }
+}
+
+void PSBTOperationsDialog::signTransactionFinished(uint64_t generation, std::shared_ptr<SignResult> result)
+{
+    if (generation != m_sign_generation) return;
+    ++m_sign_generation;
+
+    const bool unlock_valid{m_sign_unlock_context && m_sign_unlock_context->isValid()};
+    m_sign_cancel_requested = false;
+    m_sign_counters_reserved = false;
+    clearSignProgressDialog();
+    m_last_sign_pqc_usage = std::make_shared<const wallet::PQCUsageReport>(std::move(result->pqc_usage));
+    const auto show_result_status = [this](QString message, StatusLevel level) {
+        showStatus(AppendPQCUsageStatus(std::move(message), *m_last_sign_pqc_usage), level);
+    };
+
+    if (!m_wallet_model) {
+        show_result_status(tr("Failed to sign transaction: Wallet is no longer loaded."), StatusLevel::ERR);
+        m_sign_unlock_context.reset();
+        setSigningControlsEnabled(true);
+        return;
+    }
+    if (result->cancel_observed) {
+        show_result_status(tr("Transaction signing canceled."), StatusLevel::INFO);
+        m_sign_unlock_context.reset();
+        setSigningControlsEnabled(true);
+        return;
+    }
+    if (!result->exception.empty()) {
+        show_result_status(tr("Failed to sign transaction: %1").arg(QString::fromLocal8Bit(result->exception.c_str())), StatusLevel::ERR);
+        m_sign_unlock_context.reset();
+        setSigningControlsEnabled(true);
+        return;
+    }
+    if (result->error) {
+        show_result_status(tr("Failed to sign transaction: %1")
+                               .arg(QString::fromStdString(PSBTErrorString(*result->error).translated)),
+                           StatusLevel::ERR);
+        m_sign_unlock_context.reset();
+        setSigningControlsEnabled(true);
+        return;
+    }
+
+    m_transaction_data = std::move(result->psbt);
+    updateTransactionDisplay();
+    setSigningControlsEnabled(true);
+
+    if (!result->complete && !unlock_valid) {
+        show_result_status(tr("Cannot sign inputs while wallet is locked."), StatusLevel::WARN);
+    } else if (!result->complete && result->n_signed < 1) {
+        show_result_status(tr("Could not sign any more inputs."), StatusLevel::WARN);
+    } else if (!result->complete) {
+        show_result_status(tr("Signed %1 inputs, but more signatures are still required.").arg(result->n_signed),
+                           StatusLevel::INFO);
     } else {
-        showStatus(tr("Signed transaction successfully. Transaction is ready to broadcast."),
-            StatusLevel::INFO);
+        show_result_status(tr("Signed transaction successfully. Transaction is ready to broadcast."),
+                           StatusLevel::INFO);
         m_ui->broadcastTransactionButton->setEnabled(true);
     }
+    m_sign_unlock_context.reset();
+}
+
+void PSBTOperationsDialog::cancelSignTransaction()
+{
+    if (m_sign_counters_reserved.load()) {
+        m_sign_cancel_requested = false;
+        if (m_sign_progress_dialog) {
+            m_sign_progress_dialog->setCancelButton(nullptr);
+            if (m_sign_progress_bar) m_sign_progress_bar->setRange(0, 0);
+            m_sign_progress_dialog->setLabelText(tr("Finishing transaction signing..."));
+            m_sign_progress_dialog->show();
+        }
+        return;
+    }
+    m_sign_cancel_requested = true;
+    if (m_sign_progress_dialog) {
+        m_sign_progress_dialog->setCancelButton(nullptr);
+        if (m_sign_progress_bar) m_sign_progress_bar->setRange(0, 0);
+        m_sign_progress_dialog->setLabelText(tr("Canceling transaction signing..."));
+    }
+}
+
+void PSBTOperationsDialog::clearSignProgressDialog()
+{
+    if (!m_sign_progress_dialog) return;
+    QProgressDialog* dialog = m_sign_progress_dialog;
+    m_sign_progress_dialog = nullptr;
+    m_sign_progress_bar = nullptr;
+    disconnect(dialog, nullptr, this, nullptr);
+    dialog->close();
+    dialog->deleteLater();
+}
+
+void PSBTOperationsDialog::setSigningControlsEnabled(bool enabled)
+{
+    m_ui->copyToClipboardButton->setEnabled(enabled);
+    m_ui->saveButton->setEnabled(enabled);
+    if (!enabled) {
+        m_ui->signTransactionButton->setEnabled(false);
+        m_ui->broadcastTransactionButton->setEnabled(false);
+        return;
+    }
+
+    PartiallySignedTransaction finalized{m_transaction_data};
+    const bool complete{FinalizePSBT(finalized)};
+    const size_t n_could_sign{m_wallet_model ? couldSignInputs(m_transaction_data) : 0};
+    m_ui->signTransactionButton->setEnabled(
+        m_wallet_model && !complete && !m_wallet_model->wallet().privateKeysDisabled() && n_could_sign > 0);
+    m_ui->broadcastTransactionButton->setEnabled(complete);
 }
 
 void PSBTOperationsDialog::broadcastTransaction()

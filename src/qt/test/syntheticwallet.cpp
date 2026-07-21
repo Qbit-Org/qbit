@@ -4,6 +4,7 @@
 
 #include <qt/test/syntheticwallet.h>
 
+#include <common/types.h>
 #include <interfaces/handler.h>
 #include <outputtype.h>
 #include <policy/fees.h>
@@ -192,7 +193,116 @@ public:
     std::set<interfaces::WalletTx> getWalletTxs() override { return {}; }
     bool tryGetTxStatus(const Txid&, interfaces::WalletTxStatus&, int&, int64_t&) override { return false; }
     interfaces::WalletTx getWalletTxDetails(const Txid&, interfaces::WalletTxStatus&, interfaces::WalletOrderForm&, bool&, int&) override { return {}; }
-    std::optional<common::PSBTError> fillPSBT(std::optional<int>, bool, bool, size_t*, PartiallySignedTransaction&, bool&, wallet::PQCUsageReport*) override { return std::nullopt; }
+    std::optional<common::PSBTError> fillPSBT(std::optional<int>,
+        bool sign,
+        bool,
+        size_t* n_signed,
+        PartiallySignedTransaction& psbtx,
+        bool& complete,
+        wallet::PQCUsageReport* pqc_usage,
+        const SigningProgressCallback& progress_callback) override
+    {
+        if (!sign) {
+            if (n_signed) *n_signed = 1;
+            complete = false;
+            if (pqc_usage) *pqc_usage = {};
+            return std::nullopt;
+        }
+
+        {
+            std::lock_guard lock{m_state->mutex};
+            m_state->psbt_sign_entered = true;
+            m_state->psbt_sign_thread = std::this_thread::get_id();
+            ++m_state->psbt_sign_calls;
+        }
+        m_state->condition.notify_all();
+
+        const auto finish = [this](bool cancel_observed) {
+            {
+                std::lock_guard lock{m_state->mutex};
+                m_state->psbt_cancel_observed = cancel_observed;
+                m_state->psbt_sign_finished = true;
+            }
+            m_state->condition.notify_all();
+        };
+        const auto wait_for_stage = [this, &progress_callback](bool SyntheticWalletState::*allow,
+                                                               SigningProgress progress) {
+            while (true) {
+                {
+                    std::lock_guard lock{m_state->mutex};
+                    if (m_state.get()->*allow) return true;
+                }
+                if (progress_callback && !progress_callback(progress) && progress.cancellable) return false;
+                std::unique_lock lock{m_state->mutex};
+                m_state->condition.wait_for(lock, 10ms, [this, allow] { return m_state.get()->*allow; });
+            }
+        };
+
+        if (!wait_for_stage(&SyntheticWalletState::allow_psbt_reservation, SigningProgress{
+                .phase = SigningProgressPhase::PREPARING_TRANSACTION,
+                .completed = 0,
+                .total = 1,
+                .cancellable = true,
+            })) {
+            finish(/*cancel_observed=*/true);
+            return common::PSBTError::INCOMPLETE;
+        }
+
+        bool simulate_reservation{false};
+        {
+            std::lock_guard lock{m_state->mutex};
+            simulate_reservation = m_state->psbt_simulate_pqc_reservation;
+        }
+        if (simulate_reservation) {
+            if (progress_callback && !progress_callback(SigningProgress{
+                    .phase = SigningProgressPhase::RESERVING_PQC_COUNTERS,
+                    .completed = 0,
+                    .total = 1,
+                    .cancellable = true,
+                })) {
+                finish(/*cancel_observed=*/true);
+                return common::PSBTError::INCOMPLETE;
+            }
+            {
+                std::lock_guard lock{m_state->mutex};
+                m_state->psbt_counters_reserved = true;
+            }
+            m_state->condition.notify_all();
+            if (progress_callback) {
+                progress_callback(SigningProgress{
+                    .phase = SigningProgressPhase::RESERVING_PQC_COUNTERS,
+                    .completed = 1,
+                    .total = 1,
+                    .cancellable = false,
+                });
+            }
+        }
+
+        if (!wait_for_stage(&SyntheticWalletState::allow_psbt_completion, SigningProgress{
+                .phase = SigningProgressPhase::SIGNING_INPUTS,
+                .completed = 0,
+                .total = 1,
+                .cancellable = !simulate_reservation,
+            })) {
+            finish(/*cancel_observed=*/true);
+            return common::PSBTError::INCOMPLETE;
+        }
+
+        if (!psbtx.inputs.empty()) {
+            psbtx.inputs.front().final_script_witness.stack = {{0x01}};
+        }
+        if (n_signed) *n_signed = psbtx.inputs.empty() ? 0 : 1;
+        if (pqc_usage) *pqc_usage = m_report;
+
+        bool fail{false};
+        {
+            std::lock_guard lock{m_state->mutex};
+            fail = m_state->psbt_fail;
+        }
+        complete = !fail;
+        finish(/*cancel_observed=*/false);
+        return fail ? std::make_optional(common::PSBTError::SIGHASH_MISMATCH) : std::nullopt;
+    }
     interfaces::WalletBalances getBalances() override { return {.balance = 50 * COIN}; }
     bool tryGetBalances(interfaces::WalletBalances& balances, uint256&) override
     {

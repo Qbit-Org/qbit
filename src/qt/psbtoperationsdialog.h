@@ -6,11 +6,23 @@
 #define QBIT_QT_PSBTOPERATIONSDIALOG_H
 
 #include <QDialog>
+#include <QPointer>
 #include <QString>
+
+#include <atomic>
+#include <cstdint>
+#include <memory>
 
 #include <psbt.h>
 #include <qt/clientmodel.h>
 #include <qt/walletmodel.h>
+
+class QProgressBar;
+class QProgressDialog;
+class QThread;
+namespace wallet {
+struct PQCUsageReport;
+} // namespace wallet
 
 namespace Ui {
 class PSBTOperationsDialog;
@@ -34,10 +46,20 @@ public Q_SLOTS:
     void saveTransaction();
 
 private:
+    struct SignResult;
+
     Ui::PSBTOperationsDialog* m_ui;
     PartiallySignedTransaction m_transaction_data;
-    WalletModel* m_wallet_model;
+    QPointer<WalletModel> m_wallet_model;
     ClientModel* m_client_model;
+    std::unique_ptr<WalletModel::UnlockContext> m_sign_unlock_context;
+    QPointer<QProgressDialog> m_sign_progress_dialog;
+    QPointer<QProgressBar> m_sign_progress_bar;
+    QThread* m_sign_thread{nullptr};
+    uint64_t m_sign_generation{0};
+    std::atomic_bool m_sign_cancel_requested{false};
+    std::atomic_bool m_sign_counters_reserved{false};
+    std::shared_ptr<const wallet::PQCUsageReport> m_last_sign_pqc_usage;
 
     enum class StatusLevel {
         INFO,
@@ -50,6 +72,15 @@ private:
     QString renderTransaction(const PartiallySignedTransaction &psbtx);
     void showStatus(const QString &msg, StatusLevel level);
     void showTransactionStatus(const PartiallySignedTransaction &psbtx);
+    void signTransactionProgress(uint64_t generation, SigningProgress progress);
+    void signTransactionFinished(uint64_t generation, std::shared_ptr<SignResult> result);
+
+private Q_SLOTS:
+    void cancelSignTransaction();
+
+private:
+    void clearSignProgressDialog();
+    void setSigningControlsEnabled(bool enabled);
 };
 
 #endif // QBIT_QT_PSBTOPERATIONSDIALOG_H

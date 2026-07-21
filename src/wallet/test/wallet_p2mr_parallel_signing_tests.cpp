@@ -9,6 +9,102 @@ using namespace wallet_p2mr_test;
 
 BOOST_FIXTURE_TEST_SUITE(wallet_p2mr_parallel_signing_tests, WalletTestingSetup)
 
+static PartiallySignedTransaction MakePSBT(const P2MRSigningWorkload& workload)
+{
+    PartiallySignedTransaction psbt{workload.spend_tx};
+    for (size_t i = 0; i < workload.spend_tx.vin.size(); ++i) {
+        psbt.inputs.at(i).witness_utxo = workload.coins.at(workload.spend_tx.vin.at(i).prevout).out;
+    }
+    return psbt;
+}
+
+BOOST_AUTO_TEST_CASE(P2MRWalletPSBTProgressCancelsBeforeReservation)
+{
+    static constexpr size_t INPUT_COUNT{2};
+    auto workload{MakeDistinctKeyP2MRSigningWorkload(*m_node.chain, INPUT_COUNT)};
+    PartiallySignedTransaction psbt{MakePSBT(workload)};
+
+    bool complete{false};
+    size_t n_signed{0};
+    bool saw_reserving{false};
+    std::vector<std::tuple<CPQCPubKey, uint32_t, uint32_t>> observed_ranges;
+    const auto error{workload.wallet->FillPSBT(
+        psbt,
+        complete,
+        std::nullopt,
+        /*sign=*/true,
+        /*bip32derivs=*/true,
+        &n_signed,
+        /*finalize=*/true,
+        [&](const CPQCPubKey& pubkey, uint32_t previous_counter, uint32_t reserved_counter) {
+            observed_ranges.emplace_back(pubkey, previous_counter, reserved_counter);
+        },
+        [&](const SigningProgress& progress) {
+            if (progress.phase == SigningProgressPhase::RESERVING_PQC_COUNTERS && progress.cancellable) {
+                saw_reserving = true;
+                return false;
+            }
+            return true;
+        })};
+
+    BOOST_REQUIRE(error);
+    BOOST_CHECK_EQUAL(*error, PSBTError::INCOMPLETE);
+    BOOST_CHECK(saw_reserving);
+    BOOST_CHECK(!complete);
+    BOOST_CHECK_EQUAL(n_signed, 0U);
+    BOOST_CHECK(observed_ranges.empty());
+    for (const auto& pubkeys : workload.pubkeys) {
+        BOOST_CHECK_EQUAL(GetProviderPQCCounter(*workload.p2mr_spk_man, pubkeys.descriptor_pubkey, pubkeys.pqc_pubkey), 0U);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(P2MRWalletPSBTProgressIgnoresCancelAfterReservation)
+{
+    static constexpr size_t INPUT_COUNT{2};
+    auto workload{MakeDistinctKeyP2MRSigningWorkload(*m_node.chain, INPUT_COUNT)};
+    PartiallySignedTransaction psbt{MakePSBT(workload)};
+
+    bool complete{false};
+    size_t n_signed{0};
+    bool saw_committed_reservation{false};
+    bool saw_signing_complete{false};
+    bool saw_verification_complete{false};
+    std::vector<std::tuple<CPQCPubKey, uint32_t, uint32_t>> observed_ranges;
+    const auto error{workload.wallet->FillPSBT(
+        psbt,
+        complete,
+        std::nullopt,
+        /*sign=*/true,
+        /*bip32derivs=*/true,
+        &n_signed,
+        /*finalize=*/true,
+        [&](const CPQCPubKey& pubkey, uint32_t previous_counter, uint32_t reserved_counter) {
+            observed_ranges.emplace_back(pubkey, previous_counter, reserved_counter);
+        },
+        [&](const SigningProgress& progress) {
+            if (!progress.cancellable) saw_committed_reservation = true;
+            if (progress.phase == SigningProgressPhase::SIGNING_INPUTS) {
+                BOOST_CHECK_EQUAL(progress.total, INPUT_COUNT);
+                saw_signing_complete |= progress.completed == INPUT_COUNT;
+            }
+            if (progress.phase == SigningProgressPhase::VERIFYING_TRANSACTION) {
+                saw_verification_complete |= progress.completed == INPUT_COUNT;
+            }
+            return progress.cancellable;
+        })};
+
+    BOOST_CHECK(!error);
+    BOOST_CHECK(complete);
+    BOOST_CHECK_EQUAL(n_signed, INPUT_COUNT);
+    BOOST_CHECK(saw_committed_reservation);
+    BOOST_CHECK(saw_signing_complete);
+    BOOST_CHECK(saw_verification_complete);
+    BOOST_REQUIRE_EQUAL(observed_ranges.size(), INPUT_COUNT);
+    for (const auto& pubkeys : workload.pubkeys) {
+        BOOST_CHECK_EQUAL(GetProviderPQCCounter(*workload.p2mr_spk_man, pubkeys.descriptor_pubkey, pubkeys.pqc_pubkey), 1U);
+    }
+}
+
 BOOST_AUTO_TEST_CASE(P2MRWalletParallelSignsManyInputSpend)
 {
     static constexpr size_t INPUT_COUNT{10};

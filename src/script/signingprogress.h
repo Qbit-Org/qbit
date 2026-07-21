@@ -13,6 +13,7 @@ enum class SigningProgressPhase {
     RESERVING_PQC_COUNTERS,
     SIGNING_INPUTS,
     FINALIZING_TRANSACTION,
+    VERIFYING_TRANSACTION,
 };
 
 struct SigningProgress {
