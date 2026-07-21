@@ -450,7 +450,11 @@ static std::set<Txid> GetReplacementAncestors(const CWallet& wallet, const CWall
         if (replaced_it == wallet.mapWallet.end()) break;
 
         const auto replaced_by_it{replaced_it->second.mapValue.find("replaced_by_txid")};
-        if (replaced_by_it == replaced_it->second.mapValue.end() ||
+        // CommitTransaction stores the replacement before MarkReplaced writes
+        // the reciprocal link. If that second write fails or the process exits
+        // between them, the backwards link is still sufficient to establish
+        // lineage. A conflicting forward link, however, is not.
+        if (replaced_by_it != replaced_it->second.mapValue.end() &&
             replaced_by_it->second != replacement->GetHash().ToString()) {
             break;
         }

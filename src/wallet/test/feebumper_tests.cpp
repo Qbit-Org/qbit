@@ -217,6 +217,40 @@ BOOST_AUTO_TEST_CASE(commit_allows_replacing_replacement_chain)
     BOOST_CHECK(bumped_txid == expected_bumped_txid);
 }
 
+BOOST_AUTO_TEST_CASE(commit_allows_replacement_with_missing_forward_lineage)
+{
+    m_wallet.SetBroadcastTransactions(false);
+
+    CMutableTransaction funding;
+    funding.vout.emplace_back(10'000, CScript{} << OP_TRUE);
+    BOOST_REQUIRE(m_wallet.AddToWallet(MakeTransactionRef(funding), TxStateInactive{}));
+
+    CMutableTransaction original;
+    original.vin.emplace_back(COutPoint{funding.GetHash(), 0});
+    original.vout.emplace_back(9'000, CScript{} << OP_TRUE);
+
+    CMutableTransaction first_replacement{original};
+    first_replacement.vout.front().nValue = 8'900;
+
+    // Simulate reloading after the replacement was persisted but the
+    // reciprocal MarkReplaced update was not.
+    BOOST_REQUIRE(m_wallet.AddToWallet(MakeTransactionRef(original), TxStateInactive{}));
+    BOOST_REQUIRE(m_wallet.AddToWallet(MakeTransactionRef(first_replacement), TxStateInactive{}, [&](CWalletTx& wtx, bool) {
+        wtx.mapValue["replaces_txid"] = original.GetHash().ToString();
+        return true;
+    }));
+
+    CMutableTransaction second_replacement{original};
+    second_replacement.vout.front().nValue = 8'800;
+    const Txid expected_bumped_txid{second_replacement.GetHash()};
+    std::vector<bilingual_str> errors;
+    Txid bumped_txid;
+    const Result commit_result{CommitTransaction(m_wallet, first_replacement.GetHash(), std::move(second_replacement), errors, bumped_txid)};
+    BOOST_CHECK(commit_result == Result::OK);
+    BOOST_CHECK(errors.empty());
+    BOOST_CHECK(bumped_txid == expected_bumped_txid);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 } // namespace feebumper
 } // namespace wallet
