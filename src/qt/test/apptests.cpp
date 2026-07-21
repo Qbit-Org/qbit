@@ -39,7 +39,9 @@
 #include <QDialogButtonBox>
 #include <QElapsedTimer>
 #include <QEvent>
+#include <QEventLoop>
 #include <QLineEdit>
+#include <QMessageBox>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QScopedPointer>
@@ -81,6 +83,43 @@ void AcceptWalletUnlock()
             return;
         }
     });
+}
+
+void AcceptFeeBumpConfirmation()
+{
+    auto* timer{new QTimer(qApp)};
+    timer->setInterval(10);
+    QObject::connect(timer, &QTimer::timeout, timer, [timer] {
+        for (QWidget* widget : QApplication::topLevelWidgets()) {
+            if (!widget->inherits("SendConfirmationDialog") || !widget->isVisible()) continue;
+            auto* dialog{qobject_cast<QMessageBox*>(widget)};
+            if (!dialog) return;
+            QAbstractButton* const yes_button{dialog->button(QMessageBox::Yes)};
+            if (!yes_button) return;
+            yes_button->setEnabled(true);
+            yes_button->click();
+            timer->stop();
+            timer->deleteLater();
+            return;
+        }
+    });
+    timer->start();
+}
+
+bool WaitForIrreversibleFeeBumpSigning(const std::shared_ptr<qt_test::SyntheticWalletState>& state, int timeout_ms)
+{
+    QElapsedTimer timer;
+    timer.start();
+    while (timer.elapsed() < timeout_ms) {
+        {
+            std::lock_guard lock{state->mutex};
+            if (state->bump_sign_entered && state->bump_counters_reserved) return true;
+        }
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+        QTest::qWait(10);
+    }
+    std::lock_guard lock{state->mutex};
+    return state->bump_sign_entered && state->bump_counters_reserved;
 }
 #endif // ENABLE_WALLET
 
@@ -153,6 +192,14 @@ void AppTests::appTests()
             state->condition.notify_all();
         }
     }};
+    std::thread bump_signer_release{[state] {
+        std::this_thread::sleep_for(100ms);
+        {
+            std::lock_guard lock{state->mutex};
+            state->allow_bump_sign = true;
+        }
+        state->condition.notify_all();
+    }};
 
     QElapsedTimer shutdown_timer;
     shutdown_timer.start();
@@ -167,6 +214,7 @@ void AppTests::appTests()
     }
     state->condition.notify_all();
     watchdog.join();
+    bump_signer_release.join();
 
     bool worker_destroyed{false};
     {
@@ -184,6 +232,8 @@ void AppTests::appTests()
     bool cancel_observed{false};
     bool watchdog_released{false};
     bool locked{false};
+    bool bump_committed{false};
+    bool bump_cancel_observed{false};
     int lock_calls{0};
     int unlock_calls{0};
     {
@@ -191,6 +241,8 @@ void AppTests::appTests()
         cancel_observed = state->cancel_observed;
         watchdog_released = state->watchdog_released;
         locked = state->locked;
+        bump_committed = state->bump_committed;
+        bump_cancel_observed = state->bump_cancel_observed;
         lock_calls = state->lock_calls;
         unlock_calls = state->unlock_calls;
     }
@@ -198,6 +250,8 @@ void AppTests::appTests()
     QVERIFY2(m_shutdown_elapsed_ms < 5000, "Qt wallet shutdown exceeded the five-second bound");
     QVERIFY(!watchdog_released);
     QVERIFY(cancel_observed);
+    QVERIFY(bump_committed);
+    QVERIFY(!bump_cancel_observed);
     QVERIFY(worker_destroyed);
     QVERIFY(m_shutdown_wallet_model.isNull());
     QVERIFY(m_shutdown_wallet_view.isNull());
@@ -274,6 +328,8 @@ void AppTests::guiTests(BitcoinGUI* window)
         m_shutdown_wallet_state->wait_for_cancel = true;
         m_shutdown_wallet_state->encrypted = true;
         m_shutdown_wallet_state->locked = true;
+        m_shutdown_wallet_state->bump_enabled = true;
+        m_shutdown_wallet_state->allow_bump_sign = false;
     }
 
     QSignalSpy wallet_added_spy(controller, &WalletController::walletAdded);
@@ -329,6 +385,10 @@ void AppTests::guiTests(BitcoinGUI* window)
         QCOMPARE(m_shutdown_wallet_state->unlock_calls, 1);
         QVERIFY(!m_shutdown_wallet_state->locked);
     }
+
+    AcceptFeeBumpConfirmation();
+    QVERIFY(m_shutdown_wallet_model->bumpFee(Txid{}));
+    QVERIFY(WaitForIrreversibleFeeBumpSigning(m_shutdown_wallet_state, 5000));
 
     QCOMPARE(window->findChildren<WalletView*>().size(), 3);
 #endif // ENABLE_WALLET

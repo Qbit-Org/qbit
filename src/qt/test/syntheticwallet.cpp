@@ -183,10 +183,194 @@ public:
     void commitTransaction(CTransactionRef, interfaces::WalletValueMap, interfaces::WalletOrderForm) override {}
     bool transactionCanBeAbandoned(const Txid&) override { return false; }
     bool abandonTransaction(const Txid&) override { return false; }
-    bool transactionCanBeBumped(const Txid&) override { return false; }
-    bool createBumpTransaction(const Txid&, const wallet::CCoinControl&, std::vector<bilingual_str>&, CAmount&, CAmount&, CMutableTransaction&) override { return false; }
-    bool signBumpTransaction(CMutableTransaction&) override { return false; }
-    bool commitBumpTransaction(const Txid&, CMutableTransaction&&, std::vector<bilingual_str>&, Txid&) override { return false; }
+    bool transactionCanBeBumped(const Txid&) override
+    {
+        std::lock_guard lock{m_state->mutex};
+        return m_state->bump_enabled;
+    }
+    bool createBumpTransaction(const Txid& txid,
+        const wallet::CCoinControl&,
+        std::vector<bilingual_str>& errors,
+        CAmount& old_fee,
+        CAmount& new_fee,
+        CMutableTransaction& mtx,
+        const SigningProgressCallback& progress_callback) override
+    {
+        std::unique_lock lock{m_state->mutex};
+        m_state->bump_prepare_entered = true;
+        m_state->condition.notify_all();
+        const auto continue_preparation = [&] {
+            if (!progress_callback || progress_callback({
+                    .phase = SigningProgressPhase::PREPARING_TRANSACTION,
+                    .completed = 0,
+                    .total = 0,
+                    .cancellable = true,
+                })) {
+                return true;
+            }
+            m_state->bump_prepare_cancel_observed = true;
+            m_state->condition.notify_all();
+            return false;
+        };
+        while (!m_state->allow_bump_prepare) {
+            if (!continue_preparation()) return false;
+            m_state->condition.wait_for(lock, 10ms, [this] { return m_state->allow_bump_prepare; });
+        }
+        if (!continue_preparation()) return false;
+        if (!m_state->bump_prepare_success) {
+            errors.emplace_back(Untranslated("Synthetic fee-bump preparation failed"));
+            return false;
+        }
+
+        old_fee = 1000;
+        new_fee = 2000;
+        mtx = CMutableTransaction{};
+        mtx.vin.emplace_back(COutPoint{txid, 0});
+        mtx.vout.emplace_back(COIN - new_fee, CScript{} << OP_TRUE);
+        return true;
+    }
+    bool signBumpTransaction(CMutableTransaction& mtx,
+        wallet::PQCUsageReport* pqc_usage,
+        const SigningProgressCallback& progress_callback) override
+    {
+        bool use_counters{false};
+        bool external_signer{false};
+        {
+            std::lock_guard lock{m_state->mutex};
+            m_state->bump_sign_entered = true;
+            use_counters = m_state->bump_use_counters;
+            external_signer = m_state->external_signer;
+        }
+        m_state->condition.notify_all();
+
+        const auto report_progress = [&](SigningProgress progress) {
+            if (!progress_callback || progress_callback(progress)) return true;
+            std::lock_guard lock{m_state->mutex};
+            m_state->bump_cancel_observed = true;
+            m_state->condition.notify_all();
+            return false;
+        };
+        while (true) {
+            {
+                std::lock_guard lock{m_state->mutex};
+                if (m_state->allow_bump_reservation) break;
+            }
+            if (!report_progress({
+                    .phase = SigningProgressPhase::PREPARING_TRANSACTION,
+                    .completed = 0,
+                    .total = 1,
+                    .cancellable = true,
+                })) {
+                return false;
+            }
+            std::unique_lock lock{m_state->mutex};
+            m_state->condition.wait_for(lock, 10ms, [this] { return m_state->allow_bump_reservation; });
+        }
+
+        if (use_counters) {
+            if (!report_progress({
+                    .phase = SigningProgressPhase::RESERVING_PQC_COUNTERS,
+                    .completed = 0,
+                    .total = 1,
+                    .cancellable = true,
+                })) {
+                return false;
+            }
+            {
+                std::unique_lock lock{m_state->mutex};
+                m_state->bump_counter_boundary_entered = true;
+                m_state->condition.notify_all();
+                m_state->condition.wait(lock, [this] { return m_state->allow_bump_counter_boundary; });
+            }
+            if (!report_progress({
+                    .phase = SigningProgressPhase::RESERVING_PQC_COUNTERS,
+                    .completed = 0,
+                    .total = 1,
+                    .cancellable = false,
+                })) {
+                return false;
+            }
+            {
+                std::lock_guard lock{m_state->mutex};
+                m_state->bump_counters_reserved = true;
+            }
+            m_state->condition.notify_all();
+            report_progress({
+                .phase = SigningProgressPhase::RESERVING_PQC_COUNTERS,
+                .completed = 1,
+                .total = 1,
+                .cancellable = false,
+            });
+        }
+
+        if (external_signer) {
+            if (!report_progress({
+                    .phase = SigningProgressPhase::SIGNING_INPUTS,
+                    .completed = 0,
+                    .total = 1,
+                    .cancellable = true,
+                })) {
+                return false;
+            }
+            {
+                std::lock_guard lock{m_state->mutex};
+                m_state->external_bump_boundary_entered = true;
+            }
+            m_state->condition.notify_all();
+            std::unique_lock lock{m_state->mutex};
+            m_state->condition.wait(lock, [this] { return m_state->allow_external_bump_boundary; });
+        }
+        if (!report_progress({
+            .phase = SigningProgressPhase::SIGNING_INPUTS,
+            .completed = 0,
+            .total = 1,
+            .cancellable = !use_counters && !external_signer,
+        })) {
+            return false;
+        }
+        {
+            std::unique_lock lock{m_state->mutex};
+            m_state->condition.wait(lock, [this] { return m_state->allow_bump_sign; });
+        }
+        if (!use_counters && !external_signer && !report_progress({
+                .phase = SigningProgressPhase::SIGNING_INPUTS,
+                .completed = 0,
+                .total = 1,
+                .cancellable = true,
+            })) {
+            return false;
+        }
+
+        {
+            std::lock_guard lock{m_state->mutex};
+            if (!m_state->bump_sign_success) return false;
+        }
+        mtx.vin.front().scriptWitness.stack.emplace_back(1, 1);
+        if (pqc_usage) *pqc_usage = m_report;
+        report_progress({
+            .phase = SigningProgressPhase::FINALIZING_TRANSACTION,
+            .completed = 1,
+            .total = 1,
+            .cancellable = false,
+        });
+        return true;
+    }
+    bool commitBumpTransaction(const Txid&,
+        CMutableTransaction&& mtx,
+        std::vector<bilingual_str>& errors,
+        Txid& bumped_txid) override
+    {
+        std::lock_guard lock{m_state->mutex};
+        m_state->bump_commit_entered = true;
+        if (!m_state->bump_commit_success) {
+            errors.emplace_back(Untranslated("Original transaction changed while signing"));
+            return false;
+        }
+        bumped_txid = mtx.GetHash();
+        m_state->bump_committed = true;
+        m_state->condition.notify_all();
+        return true;
+    }
     CTransactionRef getTx(const Txid&) override { return {}; }
     interfaces::WalletTx getWalletTx(const Txid&) override { return {}; }
     std::set<interfaces::WalletTx> getWalletTxs() override { return {}; }
@@ -219,7 +403,11 @@ public:
     bool canGetAddresses() override { return true; }
     bool privateKeysDisabled() override { return false; }
     bool taprootEnabled() override { return false; }
-    bool hasExternalSigner() override { return false; }
+    bool hasExternalSigner() override
+    {
+        std::lock_guard lock{m_state->mutex};
+        return m_state->external_signer;
+    }
     OutputType getDefaultAddressType() override { return OutputType::P2MR; }
     CAmount getDefaultMaxTxFee() override { return MAX_MONEY; }
     wallet::PQCKeyValidationInfo getPQCKeyValidationInfo() const override { return {}; }

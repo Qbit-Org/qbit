@@ -198,6 +198,7 @@ TransactionView::~TransactionView()
 
 void TransactionView::setModel(WalletModel *_model)
 {
+    QObject::disconnect(m_fee_bumped_connection);
     this->model = _model;
     if(_model)
     {
@@ -209,6 +210,12 @@ void TransactionView::setModel(WalletModel *_model)
         transactionProxyModel->setSortRole(Qt::EditRole);
         transactionView->setModel(transactionProxyModel);
         transactionView->sortByColumn(TransactionTableModel::Date, Qt::DescendingOrder);
+        m_fee_bumped_connection = connect(_model, &WalletModel::feeBumped, this, [this, _model](const Txid& original_txid, const Txid& bumped_txid) {
+            transactionView->selectionModel()->clearSelection();
+            _model->getTransactionTableModel()->updateTransaction(
+                QString::fromStdString(original_txid.ToString()), CT_UPDATED, true);
+            Q_EMIT bumpedFee(bumped_txid);
+        });
 
         if (_model->getOptionsModel())
         {
@@ -402,16 +409,9 @@ void TransactionView::bumpFee([[maybe_unused]] bool checked)
     QString hashQStr = selection.at(0).data(TransactionTableModel::TxHashRole).toString();
     Txid hash = Txid::FromHex(hashQStr.toStdString()).value();
 
-    // Bump tx fee over the walletModel
-    Txid newHash;
-    if (model->bumpFee(hash, newHash)) {
-        // Update the table
-        transactionView->selectionModel()->clearSelection();
-        model->getTransactionTableModel()->updateTransaction(hashQStr, CT_UPDATED, true);
-
-        qApp->processEvents();
-        Q_EMIT bumpedFee(newHash);
-    }
+    // Preparation, signing, and commit run asynchronously. The feeBumped
+    // signal updates the table after the replacement has been committed.
+    model->bumpFee(hash);
 }
 
 void TransactionView::copyAddress()

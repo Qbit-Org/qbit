@@ -220,6 +220,38 @@ BOOST_AUTO_TEST_CASE(P2MRWalletParallelIgnoresCancelAfterCounterReservation)
     }
 }
 
+BOOST_AUTO_TEST_CASE(P2MRWalletParallelHonorsCancelAtCounterReservationBoundary)
+{
+    m_node.args->ForceSetArg("-walletpqcparallel", "1");
+    m_node.args->ForceSetArg("-walletpqcsignthreads", "1");
+
+    auto workload{MakeDistinctKeyP2MRSigningWorkload(*m_node.chain, /*input_count=*/1)};
+    bool saw_cancellable_reservation{false};
+    bool saw_reservation_boundary{false};
+    std::map<int, bilingual_str> input_errors;
+    const bool signed_ok{workload.wallet->SignTransaction(workload.spend_tx, workload.coins, SIGHASH_DEFAULT, input_errors,
+        {},
+        [&](const SigningProgress& progress) {
+            if (progress.phase != SigningProgressPhase::RESERVING_PQC_COUNTERS) return true;
+            if (progress.cancellable) {
+                saw_cancellable_reservation = true;
+                return true;
+            }
+            if (progress.completed == 0) {
+                saw_reservation_boundary = true;
+                return false;
+            }
+            return true;
+        })};
+
+    BOOST_CHECK(!signed_ok);
+    BOOST_CHECK(saw_cancellable_reservation);
+    BOOST_CHECK(saw_reservation_boundary);
+    BOOST_CHECK(!input_errors.empty());
+    BOOST_CHECK_EQUAL(GetProviderPQCCounter(*workload.p2mr_spk_man, workload.pubkeys.front().descriptor_pubkey, workload.pubkeys.front().pqc_pubkey), 0U);
+    BOOST_CHECK(workload.spend_tx.vin.front().scriptWitness.IsNull());
+}
+
 BOOST_AUTO_TEST_CASE(P2MRWalletSerialIgnoresCancelAfterPQCSigning)
 {
     static constexpr size_t INPUT_COUNT{2};
@@ -253,6 +285,31 @@ BOOST_AUTO_TEST_CASE(P2MRWalletSerialIgnoresCancelAfterPQCSigning)
         BOOST_CHECK_EQUAL(GetProviderPQCCounter(*workload.p2mr_spk_man, workload.pubkeys.at(input_index).descriptor_pubkey, workload.pubkeys.at(input_index).pqc_pubkey), 1U);
         BOOST_CHECK(!workload.spend_tx.vin.at(input_index).scriptWitness.IsNull());
     }
+}
+
+BOOST_AUTO_TEST_CASE(P2MRWalletSerialHonorsCancelAtCounterReservationBoundary)
+{
+    m_node.args->ForceSetArg("-walletpqcparallel", "0");
+
+    auto workload{MakeDistinctKeyP2MRSigningWorkload(*m_node.chain, /*input_count=*/1)};
+    bool saw_reservation_boundary{false};
+    std::map<int, bilingual_str> input_errors;
+    const bool signed_ok{workload.wallet->SignTransaction(workload.spend_tx, workload.coins, SIGHASH_DEFAULT, input_errors,
+        {},
+        [&](const SigningProgress& progress) {
+            if (progress.phase == SigningProgressPhase::RESERVING_PQC_COUNTERS &&
+                !progress.cancellable && progress.completed == 0) {
+                saw_reservation_boundary = true;
+                return false;
+            }
+            return true;
+        })};
+
+    BOOST_CHECK(!signed_ok);
+    BOOST_CHECK(saw_reservation_boundary);
+    BOOST_CHECK(!input_errors.empty());
+    BOOST_CHECK_EQUAL(GetProviderPQCCounter(*workload.p2mr_spk_man, workload.pubkeys.front().descriptor_pubkey, workload.pubkeys.front().pqc_pubkey), 0U);
+    BOOST_CHECK(workload.spend_tx.vin.front().scriptWitness.IsNull());
 }
 
 BOOST_AUTO_TEST_CASE(P2MRWalletParallelSkipsCompleteInputs)

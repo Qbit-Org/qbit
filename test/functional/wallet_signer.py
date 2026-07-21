@@ -201,18 +201,20 @@ class WalletSignerTest(BitcoinTestFramework):
 
         self.log.info('Prepare fee bumped mock PSBT')
 
-        # Now that the transaction is broadcast, bump fee in mock wallet:
         orig_tx_id = res["txid"]
-        mock_psbt_bumped = mock_wallet.psbtbumpfee(orig_tx_id)["psbt"]
-        mock_psbt_bumped_signed = mock_wallet.walletprocesspsbt(psbt=mock_psbt_bumped, sign=True, sighashtype="ALL", bip32derivs=True)
-
-        with open(os.path.join(self.nodes[1].cwd, "mock_psbt"), "w", encoding="utf8") as f:
-            f.write(mock_psbt_bumped_signed["psbt"])
+        mock_sign_taproot = os.path.join(self.nodes[1].cwd, "mock_sign_taproot")
+        with open(mock_sign_taproot, "w", encoding="utf8"):
+            pass
 
         self.log.info('Test bumpfee using hww1')
 
-        # Bump fee
-        res = hww.bumpfee(orig_tx_id)
+        # Sign the PSBT passed to the mock instead of returning a separately
+        # constructed replacement, which may have a different output order or
+        # locktime. This also exercises the transaction-integrity check.
+        try:
+            res = hww.bumpfee(orig_tx_id)
+        finally:
+            os.remove(mock_sign_taproot)
         assert_greater_than(res["fee"], res["origfee"])
         assert_equal(res["errors"], [])
 
