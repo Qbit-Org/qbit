@@ -48,6 +48,7 @@
 #include <univalue.h>
 
 #include <chrono>
+#include <thread>
 
 using node::MAX_BLOCKFILE_SIZE;
 
@@ -583,6 +584,120 @@ BOOST_AUTO_TEST_CASE(DescriptorTopUpResultRestoresMemoryAfterWriteFailure)
     auto retry_res{spk_man->TopUpWithInternalHintResult(/*internal_hint=*/false, target_size)};
     BOOST_REQUIRE_MESSAGE(retry_res.has_value(), util::ErrorString(retry_res).original);
     BOOST_CHECK_EQUAL(spk_man->GetKeyPoolSize(), target_size);
+}
+
+BOOST_AUTO_TEST_CASE(DescriptorTopUpResultRestoresMemoryAfterCommitFailure)
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    LOCK(wallet.cs_wallet);
+    wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+    wallet.SetupDescriptorScriptPubKeyMans(BECH32_ONLY_OUTPUT_TYPES);
+
+    auto* spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(wallet.GetScriptPubKeyMan(OutputType::BECH32, /*internal=*/false));
+    BOOST_REQUIRE(spk_man);
+
+    auto& database = GetMockableDatabase(wallet);
+    const unsigned int previous_size{spk_man->GetKeyPoolSize()};
+    const unsigned int target_size{previous_size + 1};
+    int notifications{0};
+    boost::signals2::scoped_connection connection{spk_man->NotifyCanGetAddressesChanged.connect([&] { ++notifications; })};
+    database.ResetCounts();
+    database.m_txn_commit_pass = false;
+
+    BOOST_CHECK_THROW(
+        spk_man->TopUpWithInternalHintResult(/*internal_hint=*/false, target_size),
+        std::runtime_error);
+    BOOST_CHECK_EQUAL(database.m_txn_begin_count, 1);
+    BOOST_CHECK_EQUAL(database.m_txn_commit_count, 1);
+    BOOST_CHECK_EQUAL(database.m_txn_abort_count, 1);
+    BOOST_CHECK_EQUAL(spk_man->GetKeyPoolSize(), previous_size);
+    BOOST_CHECK_EQUAL(notifications, 0);
+
+    database.ResetCounts();
+    database.m_txn_commit_pass = true;
+    auto retry_res{spk_man->TopUpWithInternalHintResult(/*internal_hint=*/false, target_size)};
+    BOOST_REQUIRE_MESSAGE(retry_res.has_value(), util::ErrorString(retry_res).original);
+    BOOST_CHECK_EQUAL(spk_man->GetKeyPoolSize(), target_size);
+    BOOST_CHECK_EQUAL(notifications, 1);
+}
+
+BOOST_AUTO_TEST_CASE(DescriptorTopUpWithDBPublishesOnExternalTransactionCommit)
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    LOCK(wallet.cs_wallet);
+    wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+
+    CExtKey master_key;
+    master_key.SetSeed(GenerateRandomKey());
+    TestDescriptorScriptPubKeyMan spk_man{wallet, SINGLE_ADDRESS_KEYPOOL_SIZE};
+    WalletBatch setup_batch{wallet.GetDatabase()};
+    BOOST_REQUIRE(spk_man.SetupDescriptorGeneration(setup_batch, master_key, OutputType::BECH32, /*internal=*/false));
+
+    const unsigned int previous_size{spk_man.GetKeyPoolSize()};
+    const unsigned int target_size{previous_size + 1};
+    int notifications{0};
+    WalletBatch batch{wallet.GetDatabase()};
+    boost::signals2::scoped_connection connection{spk_man.NotifyCanGetAddressesChanged.connect([&] {
+        BOOST_CHECK(!batch.HasActiveTxn());
+        ++notifications;
+    })};
+
+    BOOST_REQUIRE(batch.TxnBegin());
+    BOOST_REQUIRE(spk_man.TopUpWithDB(batch, target_size, /*internal_hint=*/false));
+    BOOST_REQUIRE(spk_man.TopUpWithDB(batch, target_size + 1, /*internal_hint=*/false));
+    BOOST_CHECK_EQUAL(spk_man.GetKeyPoolSize(), target_size + 1);
+    BOOST_CHECK_EQUAL(notifications, 0);
+    BOOST_REQUIRE(batch.TxnAbort());
+    BOOST_CHECK_EQUAL(spk_man.GetKeyPoolSize(), previous_size);
+    BOOST_CHECK_EQUAL(notifications, 0);
+
+    BOOST_REQUIRE(batch.TxnBegin());
+    BOOST_REQUIRE(spk_man.TopUpWithDB(batch, target_size, /*internal_hint=*/false));
+    BOOST_CHECK_EQUAL(notifications, 0);
+    BOOST_REQUIRE(batch.TxnCommit());
+    BOOST_CHECK_EQUAL(spk_man.GetKeyPoolSize(), target_size);
+    BOOST_CHECK_EQUAL(notifications, 1);
+}
+
+BOOST_AUTO_TEST_CASE(DescriptorTopUpCacheSupportsConcurrentReaders)
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        wallet.SetupDescriptorScriptPubKeyMans(BECH32_ONLY_OUTPUT_TYPES);
+    }
+
+    DescriptorScriptPubKeyMan* spk_man{nullptr};
+    {
+        LOCK(wallet.cs_wallet);
+        spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(wallet.GetScriptPubKeyMan(OutputType::BECH32, /*internal=*/false));
+    }
+    BOOST_REQUIRE(spk_man);
+
+    std::atomic<bool> done{false};
+    std::atomic<bool> lookup_failed{false};
+    std::thread reader{[&] {
+        while (!done.load()) {
+            for (const CScript& script : spk_man->GetScriptPubKeys()) {
+                if (wallet.GetScriptPubKeyMans(script).empty()) lookup_failed = true;
+            }
+        }
+    }};
+
+    bool top_ups_succeeded{true};
+    const unsigned int initial_size{spk_man->GetKeyPoolSize()};
+    for (unsigned int target_size{initial_size + 1}; target_size <= initial_size + 50; ++target_size) {
+        if (!spk_man->TopUpWithInternalHintResult(/*internal_hint=*/false, target_size)) {
+            top_ups_succeeded = false;
+            break;
+        }
+    }
+    done = true;
+    reader.join();
+
+    BOOST_CHECK(top_ups_succeeded);
+    BOOST_CHECK(!lookup_failed);
 }
 
 BOOST_AUTO_TEST_CASE(DescriptorSetupPropagatesTopUpWithDBWriteFailure)

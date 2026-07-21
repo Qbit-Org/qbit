@@ -1946,7 +1946,14 @@ bool CWallet::IsMine(const CScript& script) const
         return res;
     }
 
-    return false;
+    // A committed descriptor top-up publishes into m_cached_spks immediately after
+    // the database transaction commits. Fall back to the managers during that
+    // narrow handoff so transaction processing cannot miss a newly durable script.
+    bool res{false};
+    for (const auto& [_, spkm] : m_spk_managers) {
+        res = spkm->IsMine(script) || res;
+    }
+    return res;
 }
 
 bool CWallet::IsMine(const CTransaction& tx) const
@@ -4549,12 +4556,18 @@ ScriptPubKeyMan* CWallet::GetScriptPubKeyMan(const OutputType& type, bool intern
 
 std::set<ScriptPubKeyMan*> CWallet::GetScriptPubKeyMans(const CScript& script) const
 {
+    LOCK(cs_wallet);
     std::set<ScriptPubKeyMan*> spk_mans;
 
     // Search the cache for relevant SPKMs instead of iterating m_spk_managers
     const auto& it = m_cached_spks.find(script);
     if (it != m_cached_spks.end()) {
         spk_mans.insert(it->second.begin(), it->second.end());
+    } else {
+        for (const auto& [_, spkm] : m_spk_managers) {
+            SignatureData sigdata;
+            if (spkm->CanProvide(script, sigdata)) spk_mans.insert(spkm.get());
+        }
     }
     SignatureData sigdata;
     Assume(std::all_of(spk_mans.begin(), spk_mans.end(), [&script, &sigdata](ScriptPubKeyMan* spkm) { return spkm->CanProvide(script, sigdata); }));
@@ -4578,12 +4591,17 @@ std::unique_ptr<SigningProvider> CWallet::GetSolvingProvider(const CScript& scri
 
 std::unique_ptr<SigningProvider> CWallet::GetSolvingProvider(const CScript& script, SignatureData& sigdata) const
 {
+    LOCK(cs_wallet);
     // Search the cache for relevant SPKMs instead of iterating m_spk_managers
     const auto& it = m_cached_spks.find(script);
     if (it != m_cached_spks.end()) {
         // All spkms for a given script must already be able to make a SigningProvider for the script, so just return the first one.
         Assume(it->second.at(0)->CanProvide(script, sigdata));
         return it->second.at(0)->GetSolvingProvider(script);
+    }
+
+    for (const auto& [_, spkm] : m_spk_managers) {
+        if (spkm->CanProvide(script, sigdata)) return spkm->GetSolvingProvider(script);
     }
 
     return nullptr;
@@ -4800,7 +4818,10 @@ void CWallet::SetupDescriptorScriptPubKeyMans(bool use_create_keypool_warmup)
         }
 
         // Ensure imported descriptors are committed to disk
-        if (!batch.TxnCommit()) throw std::runtime_error("Error: cannot commit db transaction for descriptors import");
+        if (!batch.TxnCommit()) {
+            if (batch.HasActiveTxn()) batch.TxnAbort();
+            throw std::runtime_error("Error: cannot commit db transaction for descriptors import");
+        }
     }
 }
 
@@ -5064,8 +5085,14 @@ util::Result<void> CWallet::ApplyMigrationData(WalletBatch& local_wallet_batch, 
     // When the legacy wallet has no spendable scripts, the main wallet will be empty, leaving its script cache empty as well.
     // The watch-only and/or solvable wallet(s) will contain the scripts in their respective caches.
     if (!data.desc_spkms.empty()) Assume(!m_cached_spks.empty());
-    if (!data.watch_descs.empty()) Assume(!data.watchonly_wallet->m_cached_spks.empty());
-    if (!data.solvable_descs.empty()) Assume(!data.solvable_wallet->m_cached_spks.empty());
+    if (!data.watch_descs.empty()) {
+        LOCK(data.watchonly_wallet->cs_wallet);
+        Assume(!data.watchonly_wallet->m_cached_spks.empty());
+    }
+    if (!data.solvable_descs.empty()) {
+        LOCK(data.solvable_wallet->cs_wallet);
+        Assume(!data.solvable_wallet->m_cached_spks.empty());
+    }
 
     for (auto& desc_spkm : data.desc_spkms) {
         if (m_spk_managers.count(desc_spkm->GetID()) > 0) {
@@ -5620,6 +5647,7 @@ util::Result<MigrationResult> MigrateLegacyToDescriptor(std::shared_ptr<CWallet>
 
 void CWallet::CacheNewScriptPubKeys(const std::set<CScript>& spks, ScriptPubKeyMan* spkm)
 {
+    AssertLockHeld(cs_wallet);
     for (const auto& script : spks) {
         m_cached_spks[script].push_back(spkm);
     }
@@ -5627,6 +5655,7 @@ void CWallet::CacheNewScriptPubKeys(const std::set<CScript>& spks, ScriptPubKeyM
 
 void CWallet::TopUpCallback(const std::set<CScript>& spks, ScriptPubKeyMan* spkm)
 {
+    LOCK(cs_wallet);
     // Update scriptPubKey cache
     CacheNewScriptPubKeys(spks, spkm);
 }
