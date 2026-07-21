@@ -199,6 +199,10 @@ bool FlatSigningProvider::SignPQC(const CPQCPubKey& pubkey, const uint256& hash,
     }
 
     if (pqc_counter_reserver) {
+        if (pqc_counter_reservation_guard && !pqc_counter_reservation_guard(/*range_count=*/1)) {
+            log_pqc_sign_timing(/*success=*/false, "reservation_canceled");
+            return false;
+        }
         const auto reserve_start{SteadyClock::now()};
         const bool reserved{pqc_counter_reserver(pubkey, /*count=*/1, reserved_previous_counter, reserved_counter)};
         reserve_time = SteadyClock::now() - reserve_start;
@@ -219,6 +223,10 @@ bool FlatSigningProvider::SignPQC(const CPQCPubKey& pubkey, const uint256& hash,
         // signer fails below; reusing it would be less safe than overcounting.
         observe_counter_advance(reserved_previous_counter, reserved_counter);
     } else if (pqc_counter_writer) {
+        if (pqc_counter_reservation_guard && !pqc_counter_reservation_guard(/*range_count=*/1)) {
+            log_pqc_sign_timing(/*success=*/false, "reservation_canceled");
+            return false;
+        }
         // Reserve exactly one counter value in authoritative storage first.
         const auto reserve_start{SteadyClock::now()};
         const bool reserved{pqc_counter_writer(pubkey, previous_counter, reserved_counter)};
@@ -323,6 +331,9 @@ FlatSigningProvider& FlatSigningProvider::Merge(FlatSigningProvider&& b)
     }
     if (!pqc_counter_batch_reserver && b.pqc_counter_batch_reserver) {
         pqc_counter_batch_reserver = std::move(b.pqc_counter_batch_reserver);
+    }
+    if (!pqc_counter_reservation_guard && b.pqc_counter_reservation_guard) {
+        pqc_counter_reservation_guard = std::move(b.pqc_counter_reservation_guard);
     }
     if (!pqc_counter_observer && b.pqc_counter_observer) {
         pqc_counter_observer = std::move(b.pqc_counter_observer);

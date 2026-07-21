@@ -277,6 +277,20 @@ public:
                 return false;
             }
             {
+                std::unique_lock lock{m_state->mutex};
+                m_state->bump_counter_boundary_entered = true;
+                m_state->condition.notify_all();
+                m_state->condition.wait(lock, [this] { return m_state->allow_bump_counter_boundary; });
+            }
+            if (!report_progress({
+                    .phase = SigningProgressPhase::RESERVING_PQC_COUNTERS,
+                    .completed = 0,
+                    .total = 1,
+                    .cancellable = false,
+                })) {
+                return false;
+            }
+            {
                 std::lock_guard lock{m_state->mutex};
                 m_state->bump_counters_reserved = true;
             }

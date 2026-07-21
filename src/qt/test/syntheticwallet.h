@@ -38,6 +38,8 @@ struct SyntheticWalletState {
     bool bump_sign_success{true};
     bool bump_use_counters{true};
     bool allow_bump_reservation{true};
+    bool bump_counter_boundary_entered{false};
+    bool allow_bump_counter_boundary{true};
     bool bump_counters_reserved{false};
     bool external_bump_boundary_entered{false};
     bool allow_external_bump_boundary{true};

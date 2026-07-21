@@ -3,6 +3,7 @@
 // file COPYING or https://www.opensource.org/licenses/mit-license.php.
 
 #include <consensus/validation.h>
+#include <node/context.h>
 #include <policy/policy.h>
 #include <primitives/transaction.h>
 #include <script/script.h>
@@ -11,6 +12,7 @@
 #include <wallet/test/util.h>
 #include <wallet/test/wallet_p2mr_test_util.h>
 #include <wallet/test/wallet_test_fixture.h>
+#include <validation.h>
 
 #include <boost/test/unit_test.hpp>
 
@@ -166,6 +168,42 @@ BOOST_AUTO_TEST_CASE(commit_revalidates_competing_wallet_spend)
     BOOST_REQUIRE_EQUAL(errors.size(), 1U);
     BOOST_CHECK(errors.front().original.find("is already spent by wallet transaction") != std::string::npos);
     BOOST_CHECK(bumped_txid.IsNull());
+}
+
+BOOST_AUTO_TEST_CASE(commit_revalidates_external_inputs_from_chain)
+{
+    m_wallet.SetBroadcastTransactions(false);
+
+    CMutableTransaction wallet_funding;
+    wallet_funding.vout.emplace_back(10'000, CScript{} << OP_TRUE);
+    BOOST_REQUIRE(m_wallet.AddToWallet(MakeTransactionRef(wallet_funding), TxStateInactive{}));
+
+    CMutableTransaction external_funding;
+    external_funding.vout.emplace_back(5'000, CScript{} << OP_TRUE);
+    const COutPoint external_outpoint{external_funding.GetHash(), 0};
+    {
+        LOCK(cs_main);
+        m_node.chainman->ActiveChainstate().CoinsTip().AddCoin(
+            external_outpoint,
+            Coin{external_funding.vout.front(), /*nHeightIn=*/1, /*fCoinBaseIn=*/false},
+            /*possible_overwrite=*/false);
+    }
+
+    CMutableTransaction original;
+    original.vin.emplace_back(COutPoint{wallet_funding.GetHash(), 0});
+    original.vin.emplace_back(external_outpoint);
+    original.vout.emplace_back(13'000, CScript{} << OP_TRUE);
+    BOOST_REQUIRE(m_wallet.AddToWallet(MakeTransactionRef(original), TxStateInactive{}));
+
+    CMutableTransaction replacement{original};
+    replacement.vout.front().nValue = 12'500;
+    const Txid expected_bumped_txid{replacement.GetHash()};
+    std::vector<bilingual_str> errors;
+    Txid bumped_txid;
+    const Result commit_result{CommitTransaction(m_wallet, original.GetHash(), std::move(replacement), errors, bumped_txid)};
+    BOOST_CHECK(commit_result == Result::OK);
+    BOOST_CHECK(errors.empty());
+    BOOST_CHECK(bumped_txid == expected_bumped_txid);
 }
 
 BOOST_AUTO_TEST_CASE(commit_allows_replacing_replacement_chain)

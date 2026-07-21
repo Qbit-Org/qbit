@@ -1707,6 +1707,45 @@ void TestAsyncFeeBumpLifecycle(interfaces::Node& node)
         }));
     }
 
+    // Cancellation that lands after the last cancellable progress update but
+    // before durable counter reservation wins the atomic boundary. No counter
+    // is consumed and no replacement is committed.
+    {
+        auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+        {
+            std::lock_guard lock{state->mutex};
+            state->bump_enabled = true;
+            state->allow_bump_counter_boundary = false;
+        }
+        auto model{make_model(state)};
+        QSignalSpy completed{model.get(), &WalletModel::feeBumped};
+        QVERIFY(start_bump(*model));
+        QVERIFY(WaitUntil([&] {
+            return SyntheticStateMatches(state, [](const auto& value) { return value.bump_counter_boundary_entered; });
+        }, 5000));
+
+        QPointer<QProgressDialog> progress;
+        QVERIFY(WaitUntil([&] {
+            progress = FindBumpFeeProgressDialog();
+            return progress && progress->isVisible() && !progress->findChildren<QPushButton*>().empty();
+        }, 5000));
+        progress->findChildren<QPushButton*>().front()->click();
+        {
+            std::lock_guard lock{state->mutex};
+            state->allow_bump_counter_boundary = true;
+        }
+        state->condition.notify_all();
+        QVERIFY(WaitUntil([&] {
+            return SyntheticStateMatches(state, [](const auto& value) {
+                return value.bump_cancel_observed && value.background_clone_destroyed;
+            });
+        }, 5000));
+        QCOMPARE(completed.count(), 0);
+        QVERIFY(SyntheticStateMatches(state, [](const auto& value) {
+            return !value.bump_counters_reserved && !value.bump_commit_entered && !value.bump_committed;
+        }));
+    }
+
     // Shutdown cannot invalidate the completion callback after counter
     // reservation. The irreversible replacement commits and is still reported.
     {

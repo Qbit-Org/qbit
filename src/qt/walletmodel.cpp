@@ -834,10 +834,12 @@ void WalletModel::startBumpFeeSigning(uint64_t generation, std::shared_ptr<BumpF
         const SigningProgressCallback progress_callback = [post_progress, cancellation_state, enter_irreversible](const SigningProgress& progress) {
             bool cancellable{progress.cancellable};
             if (!progress.cancellable) {
-                if (progress.phase == SigningProgressPhase::SIGNING_INPUTS) {
-                    // This notification is the external signer's pre-command
-                    // boundary. Whichever side wins the atomic transition --
-                    // cancellation or signing -- determines whether it starts.
+                if (progress.phase == SigningProgressPhase::SIGNING_INPUTS ||
+                    (progress.phase == SigningProgressPhase::RESERVING_PQC_COUNTERS && progress.completed == 0)) {
+                    // These notifications are the pre-command and pre-counter-
+                    // reservation boundaries. Whichever side wins the atomic
+                    // transition -- cancellation or signing -- determines
+                    // whether the irreversible operation starts.
                     if (!enter_irreversible()) return false;
                 } else {
                     // Reservation notifications arrive after the counters are
