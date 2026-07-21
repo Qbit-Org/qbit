@@ -4588,6 +4588,7 @@ ScriptPubKeyMan* CWallet::GetScriptPubKeyMan(const OutputType& type, bool intern
 
 std::set<ScriptPubKeyMan*> CWallet::GetScriptPubKeyMans(const CScript& script) const
 {
+    AssertLockHeld(cs_wallet);
     std::set<ScriptPubKeyMan*> spk_mans;
 
     // Search the cache for relevant SPKMs instead of iterating m_spk_managers
@@ -4617,6 +4618,7 @@ std::unique_ptr<SigningProvider> CWallet::GetSolvingProvider(const CScript& scri
 
 std::unique_ptr<SigningProvider> CWallet::GetSolvingProvider(const CScript& script, SignatureData& sigdata) const
 {
+    LOCK(cs_wallet);
     // Search the cache for relevant SPKMs instead of iterating m_spk_managers
     const auto& it = m_cached_spks.find(script);
     if (it != m_cached_spks.end()) {
@@ -4630,6 +4632,7 @@ std::unique_ptr<SigningProvider> CWallet::GetSolvingProvider(const CScript& scri
 
 std::vector<WalletDescriptor> CWallet::GetWalletDescriptors(const CScript& script) const
 {
+    LOCK(cs_wallet);
     std::vector<WalletDescriptor> descs;
     for (const auto spk_man: GetScriptPubKeyMans(script)) {
         if (const auto desc_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(spk_man)) {
@@ -5103,8 +5106,8 @@ util::Result<void> CWallet::ApplyMigrationData(WalletBatch& local_wallet_batch, 
     // When the legacy wallet has no spendable scripts, the main wallet will be empty, leaving its script cache empty as well.
     // The watch-only and/or solvable wallet(s) will contain the scripts in their respective caches.
     if (!data.desc_spkms.empty()) Assume(!m_cached_spks.empty());
-    if (!data.watch_descs.empty()) Assume(!data.watchonly_wallet->m_cached_spks.empty());
-    if (!data.solvable_descs.empty()) Assume(!data.solvable_wallet->m_cached_spks.empty());
+    if (!data.watch_descs.empty()) Assume(WITH_LOCK(data.watchonly_wallet->cs_wallet, return !data.watchonly_wallet->m_cached_spks.empty()));
+    if (!data.solvable_descs.empty()) Assume(WITH_LOCK(data.solvable_wallet->cs_wallet, return !data.solvable_wallet->m_cached_spks.empty()));
 
     for (auto& desc_spkm : data.desc_spkms) {
         if (m_spk_managers.count(desc_spkm->GetID()) > 0) {
@@ -5666,6 +5669,10 @@ void CWallet::CacheNewScriptPubKeys(const std::set<CScript>& spks, ScriptPubKeyM
 
 void CWallet::TopUpCallback(const std::set<CScript>& spks, ScriptPubKeyMan* spkm)
 {
+    if (m_before_script_pub_key_cache_publish) {
+        m_before_script_pub_key_cache_publish();
+    }
+    LOCK(cs_wallet);
     // Update scriptPubKey cache
     CacheNewScriptPubKeys(spks, spkm);
 }
