@@ -417,6 +417,16 @@ class SiteBuilderTest(unittest.TestCase):
                         "v1.0.0", "qbit v1.0.0", "release", path
                     )
 
+    def test_validate_publication_accepts_root_path(self) -> None:
+        publication = site_builder.validate_publication(
+            "v1.0.0", "qbit v1.0.0", "release", ""
+        )
+
+        self.assertEqual(publication["path"], "")
+        self.assertEqual(
+            site_builder.publication_context(publication)["pages_root"], "../"
+        )
+
     @unittest.skipUnless(MKDOCS_AVAILABLE, "MkDocs is required to generate HTML")
     def test_build_site_cli_generates_html_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
