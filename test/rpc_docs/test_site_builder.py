@@ -395,19 +395,24 @@ class SiteBuilderTest(unittest.TestCase):
                 out_dir, publication=publication
             )
             config_path = site_builder.write_mkdocs_config(
-                site_model, out_dir, display_version=publication["label"]
+                site_model,
+                out_dir,
+                display_version=publication["label"],
+                publication=publication,
             )
             context = site_builder.load_json(
                 assets_dir / "rpcdocs-version.json"
             )
+            config_text = config_path.read_text(encoding="utf-8")
 
             self.assertEqual(context["current"], publication)
             self.assertTrue(context["enabled"])
             self.assertEqual(context["pages_root"], "../../")
             self.assertIn(
                 'version: "main (development @ 01234567)"',
-                config_path.read_text(encoding="utf-8"),
+                config_text,
             )
+            self.assertIn("site_url: https://docs.qbit.org/main/", config_text)
 
     def test_validate_publication_rejects_unsafe_paths(self) -> None:
         for path in ("../v1.0.0", "/v1.0.0", "versions/v1.0.0"):
@@ -425,6 +430,10 @@ class SiteBuilderTest(unittest.TestCase):
         self.assertEqual(publication["path"], "")
         self.assertEqual(
             site_builder.publication_context(publication)["pages_root"], "../"
+        )
+        self.assertEqual(
+            site_builder.publication_site_url("https://docs.qbit.org/", publication),
+            "https://docs.qbit.org/",
         )
 
     @unittest.skipUnless(MKDOCS_AVAILABLE, "MkDocs is required to generate HTML")

@@ -69,6 +69,7 @@ def main() -> int:
         site_model,
         out_dir,
         display_version=publication["label"] if publication else None,
+        publication=publication,
     )
     site_builder.build_mkdocs_site(config_path)
 

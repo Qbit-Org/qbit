@@ -248,10 +248,20 @@ jobs:
           set -euo pipefail
           build_dir="${RUNNER_TEMP}/build-${PUBLICATION_ID}"
           site_dir="${RUNNER_TEMP}/site-${PUBLICATION_ID}"
+          baseline_path="source/doc/rpc/baselines/v30.2/rpc-docs.json"
+          overlay_path="source/doc/rpc/annotations/v30.2-delta.yml"
+          if [[ ! -f "${baseline_path}" ]]; then
+            baseline_path="publisher/doc/rpc/baselines/v30.2/rpc-docs.json"
+          fi
+          if [[ ! -f "${overlay_path}" ]]; then
+            overlay_path="publisher/doc/rpc/annotations/v30.2-delta.yml"
+          fi
+          test -f "${baseline_path}"
+          test -f "${overlay_path}"
           python3 publisher/doc/rpc/build_site.py \
             --manifest "${build_dir}/doc/rpc/rpc-docs.json" \
-            --baseline source/doc/rpc/baselines/v30.2/rpc-docs.json \
-            --overlay source/doc/rpc/annotations/v30.2-delta.yml \
+            --baseline "${baseline_path}" \
+            --overlay "${overlay_path}" \
             --out "${site_dir}" \
             --publication-id "${PUBLICATION_ID}" \
             --publication-label "${PUBLICATION_LABEL}" \

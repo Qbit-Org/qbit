@@ -869,6 +869,31 @@ def write_publication_context(
     return output
 
 
+def publication_site_url(base_site_url: str, publication: dict[str, str]) -> str:
+    site_url = base_site_url.rstrip("/") + "/"
+    if publication["path"]:
+        site_url = f"{site_url}{publication['path']}/"
+    return site_url
+
+
+def replace_site_url(base_config: str, site_url: str | None) -> str:
+    if site_url is None:
+        return base_config
+    lines = base_config.splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith("site_url:"):
+            lines[index] = f"site_url: {site_url}"
+            return "\n".join(lines)
+    return "\n".join([*lines, f"site_url: {site_url}"])
+
+
+def config_site_url(base_config: str) -> str:
+    for line in base_config.splitlines():
+        if line.startswith("site_url:"):
+            return line.split(":", 1)[1].strip()
+    raise SiteBuilderError("mkdocs base config missing site_url")
+
+
 def copy_site_assets(
     out_dir: str | Path, publication: dict[str, str] | None = None
 ) -> Path:
@@ -891,11 +916,16 @@ def write_mkdocs_config(
     site_model: dict[str, Any],
     out_dir: str | Path,
     display_version: str | None = None,
+    publication: dict[str, str] | None = None,
 ) -> Path:
     out_path = Path(out_dir)
     source_root = generated_source_root(out_dir).resolve()
     config_path = source_root / "mkdocs.yml"
     base_config = (ROOT_DIR / "mkdocs.base.yml").read_text(encoding="utf-8").rstrip()
+    site_url = None
+    if publication:
+        site_url = publication_site_url(config_site_url(base_config), publication)
+    base_config = replace_site_url(base_config, site_url)
 
     nav_lines = [
         "nav:",
