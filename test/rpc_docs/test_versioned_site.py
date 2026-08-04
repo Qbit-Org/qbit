@@ -10,6 +10,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -20,11 +21,18 @@ import site_builder  # noqa: E402
 import versioned_site  # noqa: E402
 
 
-def release(tag: str, *, draft: bool = False, prerelease: bool = False) -> dict:
+def release(
+    tag: str,
+    *,
+    draft: bool = False,
+    prerelease: bool = False,
+    immutable: bool = True,
+) -> dict:
     return {
         "tag_name": tag,
         "draft": draft,
         "prerelease": prerelease,
+        "immutable": immutable,
     }
 
 
@@ -54,7 +62,9 @@ class VersionDiscoveryTest(unittest.TestCase):
         ]
 
         entries = versioned_site.select_release_entries(
-            releases, tag_resolver=lambda tag: f"sha-{tag}"
+            releases,
+            repository="Qbit-Org/qbit",
+            release_resolver=lambda release: f"sha-{release['tag_name']}",
         )
 
         self.assertEqual(
@@ -70,7 +80,8 @@ class VersionDiscoveryTest(unittest.TestCase):
             development_ref="topic/ref",
             development_checkout_ref="refs/pull/12/merge",
             publisher_sha="2" * 40,
-            tag_resolver=lambda _tag: "1" * 40,
+            repository="Qbit-Org/qbit",
+            release_resolver=lambda _release: "1" * 40,
             development_resolver=lambda _ref: "3" * 40,
         )
 
@@ -88,8 +99,77 @@ class VersionDiscoveryTest(unittest.TestCase):
         ):
             versioned_site.select_release_entries(
                 [release("v1.0.0"), release("v1.0.0")],
-                tag_resolver=lambda _tag: "1" * 40,
+                repository="Qbit-Org/qbit",
+                release_resolver=lambda _release: "1" * 40,
             )
+
+    def test_published_mutable_release_is_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            versioned_site.VersionedSiteError, "release is not immutable"
+        ):
+            versioned_site.select_release_entries(
+                [release("v1.0.0", immutable=False)],
+                repository="Qbit-Org/qbit",
+                release_resolver=lambda _release: "1" * 40,
+            )
+
+    def test_resolve_trusted_release_tag_requires_remote_verified_tag(self) -> None:
+        def fake_git_output(arguments: list[str]) -> str:
+            if arguments == ["rev-parse", "--verify", "refs/tags/v1.0.0^{tag}"]:
+                return "a" * 40
+            if arguments == ["cat-file", "-t", "refs/tags/v1.0.0"]:
+                return "tag"
+            if arguments == ["rev-parse", "refs/tags/v1.0.0^{commit}"]:
+                return "b" * 40
+            raise AssertionError(arguments)
+
+        def fake_gh_api_json(path: str) -> dict:
+            if path == "repos/Qbit-Org/qbit/git/ref/tags/v1.0.0":
+                return {"object": {"type": "tag", "sha": "a" * 40}}
+            if path == f"repos/Qbit-Org/qbit/git/tags/{'a' * 40}":
+                return {
+                    "object": {"type": "commit", "sha": "b" * 40},
+                    "verification": {"verified": True, "reason": "valid"},
+                }
+            raise AssertionError(path)
+
+        with (
+            mock.patch.object(versioned_site, "git_output", side_effect=fake_git_output),
+            mock.patch.object(versioned_site, "gh_api_json", side_effect=fake_gh_api_json),
+        ):
+            self.assertEqual(
+                versioned_site.resolve_trusted_release_tag("Qbit-Org/qbit", "v1.0.0"),
+                "b" * 40,
+            )
+
+    def test_resolve_trusted_release_tag_rejects_unverified_tag(self) -> None:
+        def fake_git_output(arguments: list[str]) -> str:
+            if arguments == ["rev-parse", "--verify", "refs/tags/v1.0.0^{tag}"]:
+                return "a" * 40
+            if arguments == ["cat-file", "-t", "refs/tags/v1.0.0"]:
+                return "tag"
+            if arguments == ["rev-parse", "refs/tags/v1.0.0^{commit}"]:
+                return "b" * 40
+            raise AssertionError(arguments)
+
+        def fake_gh_api_json(path: str) -> dict:
+            if path == "repos/Qbit-Org/qbit/git/ref/tags/v1.0.0":
+                return {"object": {"type": "tag", "sha": "a" * 40}}
+            if path == f"repos/Qbit-Org/qbit/git/tags/{'a' * 40}":
+                return {
+                    "object": {"type": "commit", "sha": "b" * 40},
+                    "verification": {"verified": False, "reason": "unsigned"},
+                }
+            raise AssertionError(path)
+
+        with (
+            mock.patch.object(versioned_site, "git_output", side_effect=fake_git_output),
+            mock.patch.object(versioned_site, "gh_api_json", side_effect=fake_gh_api_json),
+        ):
+            with self.assertRaisesRegex(
+                versioned_site.VersionedSiteError, "not a valid signed tag"
+            ):
+                versioned_site.resolve_trusted_release_tag("Qbit-Org/qbit", "v1.0.0")
 
 
 class VersionAssemblyTest(unittest.TestCase):

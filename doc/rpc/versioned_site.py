@@ -84,6 +84,61 @@ def resolve_annotated_tag(tag: str) -> str:
     return git_output(["rev-parse", f"{ref}^{{commit}}"])
 
 
+def gh_api_json(path: str) -> dict[str, Any]:
+    try:
+        result = subprocess.run(
+            ["gh", "api", path],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        raise VersionedSiteError(f"unable to query GitHub API: {path}") from exc
+    payload = json.loads(result.stdout)
+    if not isinstance(payload, dict):
+        raise VersionedSiteError(f"GitHub API response must be an object: {path}")
+    return payload
+
+
+def resolve_trusted_release_tag(repository: str, tag: str) -> str:
+    try:
+        tag_object = git_output(["rev-parse", "--verify", f"refs/tags/{tag}^{{tag}}"])
+    except subprocess.CalledProcessError as exc:
+        raise VersionedSiteError(f"release tag is not annotated: {tag}") from exc
+    tag_target = resolve_annotated_tag(tag)
+
+    remote_ref = gh_api_json(f"repos/{repository}/git/ref/tags/{tag}")
+    remote_object = remote_ref.get("object")
+    if not isinstance(remote_object, dict):
+        raise VersionedSiteError(f"remote tag ref is malformed: {tag}")
+    remote_type = remote_object.get("type")
+    remote_sha = remote_object.get("sha")
+    if remote_type != "tag":
+        raise VersionedSiteError(f"remote release tag is not annotated: {tag}")
+    if not isinstance(remote_sha, str) or remote_sha.lower() != tag_object.lower():
+        raise VersionedSiteError(
+            f"remote release tag object for {tag} does not match local tag object"
+        )
+
+    remote_tag = gh_api_json(f"repos/{repository}/git/tags/{tag_object}")
+    target = remote_tag.get("object")
+    if not isinstance(target, dict):
+        raise VersionedSiteError(f"remote tag object is malformed: {tag}")
+    if target.get("type") != "commit":
+        raise VersionedSiteError(f"remote release tag does not target a commit: {tag}")
+    target_sha = target.get("sha")
+    if not isinstance(target_sha, str) or target_sha.lower() != tag_target.lower():
+        raise VersionedSiteError(
+            f"remote release tag target for {tag} does not match local tag target"
+        )
+    verification = remote_tag.get("verification")
+    if not isinstance(verification, dict):
+        raise VersionedSiteError(f"remote release tag lacks verification data: {tag}")
+    if verification.get("verified") is not True or verification.get("reason") != "valid":
+        raise VersionedSiteError(f"remote release tag is not a valid signed tag: {tag}")
+    return tag_target
+
+
 def resolve_commit(ref: str) -> str:
     candidates = (
         ref,
@@ -128,10 +183,14 @@ def load_github_releases(repository: str) -> list[dict[str, Any]]:
 
 def select_release_entries(
     releases: list[dict[str, Any]],
-    tag_resolver: Callable[[str], str] = resolve_annotated_tag,
+    repository: str,
+    release_resolver: Callable[[dict[str, Any]], str] | None = None,
 ) -> list[dict[str, str]]:
     entries: list[dict[str, str]] = []
     seen_tags: set[str] = set()
+    release_resolver = release_resolver or (
+        lambda release: resolve_trusted_release_tag(repository, release["tag_name"])
+    )
 
     for release in releases:
         if release.get("draft") or release.get("prerelease"):
@@ -139,10 +198,14 @@ def select_release_entries(
         tag = release.get("tag_name")
         if not isinstance(tag, str) or parse_release_tag(tag) is None:
             continue
+        if release.get("immutable") is not True:
+            raise VersionedSiteError(
+                f"published qbit release is not immutable: {tag}"
+            )
         if tag in seen_tags:
             raise VersionedSiteError(f"duplicate published release tag: {tag}")
         seen_tags.add(tag)
-        source_sha = tag_resolver(tag)
+        source_sha = release_resolver(release)
         entries.append(
             {
                 "id": tag,
@@ -165,11 +228,12 @@ def build_plan(
     releases: list[dict[str, Any]],
     development_ref: str,
     publisher_sha: str,
+    repository: str,
     development_checkout_ref: str = "",
-    tag_resolver: Callable[[str], str] = resolve_annotated_tag,
+    release_resolver: Callable[[dict[str, Any]], str] | None = None,
     development_resolver: Callable[[str], str] = resolve_commit,
 ) -> dict[str, Any]:
-    release_entries = select_release_entries(releases, tag_resolver)
+    release_entries = select_release_entries(releases, repository, release_resolver)
     development_sha = development_resolver(development_ref)
     development = {
         "id": "main",
@@ -394,6 +458,7 @@ def main() -> int:
             development_ref=args.development_ref,
             development_checkout_ref=args.development_checkout_ref,
             publisher_sha=args.publisher_sha,
+            repository=args.repository,
         )
         write_json(args.output, plan)
         if args.github_output:
