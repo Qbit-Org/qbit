@@ -7,16 +7,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import tempfile
 from typing import Any, Callable
 
 import site_builder
 
 
 SCHEMA_VERSION = "1"
+REPO_ROOT = Path(__file__).resolve().parents[2]
 TAG_PATTERN = re.compile(
     r"^v(?P<major>0|[1-9][0-9]*)\."
     r"(?P<minor>0|[1-9][0-9]*)\."
@@ -24,6 +27,7 @@ TAG_PATTERN = re.compile(
     r"(?:-(?P<suffix>[0-9A-Za-z][0-9A-Za-z.-]*))?$"
 )
 RC_SUFFIX_PATTERN = re.compile(r"(?:^|[.-])rc[0-9]+$", re.IGNORECASE)
+FINGERPRINT_PATTERN = re.compile(r"^[0-9A-F]{40}$")
 
 
 class VersionedSiteError(Exception):
@@ -100,6 +104,100 @@ def gh_api_json(path: str) -> dict[str, Any]:
     return payload
 
 
+def normalize_fingerprint(value: str) -> str:
+    fingerprint = re.sub(r"\s+", "", value).upper()
+    if not FINGERPRINT_PATTERN.fullmatch(fingerprint):
+        raise VersionedSiteError(f"invalid release signer fingerprint: {value!r}")
+    return fingerprint
+
+
+def release_line_for_tag(tag: str) -> str:
+    match = parse_release_tag(tag)
+    if match is None:
+        raise VersionedSiteError(f"unsupported qbit release tag: {tag}")
+    suffix = match.group("suffix") or ""
+    return "testnet" if "testnet" in suffix.lower() else "mainnet"
+
+
+def active_release_signers(release_line: str) -> dict[str, str]:
+    policy_path = REPO_ROOT / "contrib" / "keys" / "operator-keys" / "keys.json"
+    policy = _load_json(policy_path)
+    signers = policy.get("signers")
+    if not isinstance(signers, list):
+        raise VersionedSiteError("release key policy signers must be a list")
+
+    active: dict[str, str] = {}
+    for signer in signers:
+        if not isinstance(signer, dict):
+            raise VersionedSiteError("release key policy signer must be an object")
+        if signer.get("status") != "active":
+            continue
+        release_lines = signer.get("release_lines")
+        capabilities = signer.get("capabilities")
+        if not isinstance(release_lines, list) or release_line not in release_lines:
+            continue
+        if not isinstance(capabilities, list) or "release-signing" not in capabilities:
+            continue
+        public_key_file = signer.get("public_key_file")
+        if not isinstance(public_key_file, str) or not public_key_file:
+            raise VersionedSiteError("active release signer missing public_key_file")
+        active[normalize_fingerprint(str(signer.get("signing_fingerprint")))] = (
+            public_key_file
+        )
+    if not active:
+        raise VersionedSiteError(f"no active release signers for {release_line}")
+    return active
+
+
+def status_fingerprints(status_output: str) -> list[str]:
+    fingerprints: list[str] = []
+    for line in status_output.splitlines():
+        if not line.startswith("[GNUPG:] VALIDSIG "):
+            continue
+        fields = line.split()
+        if len(fields) >= 3:
+            fingerprints.append(normalize_fingerprint(fields[2]))
+    return fingerprints
+
+
+def verify_tag_signed_by_active_release_key(tag: str) -> None:
+    release_line = release_line_for_tag(tag)
+    active_signers = active_release_signers(release_line)
+    gpg = shutil.which("gpg")
+    if gpg is None:
+        raise VersionedSiteError("gpg is required to verify release tag signatures")
+
+    keys_dir = REPO_ROOT / "contrib" / "keys" / "operator-keys"
+    with tempfile.TemporaryDirectory() as tmpdir:
+        gnupg_home = Path(tmpdir) / "gnupg"
+        gnupg_home.mkdir(mode=0o700)
+        import_command = [
+            gpg,
+            "--batch",
+            "--homedir",
+            str(gnupg_home),
+            "--import",
+            *[str(keys_dir / path) for path in active_signers.values()],
+        ]
+        subprocess.run(import_command, check=True, capture_output=True, text=True)
+        result = subprocess.run(
+            ["git", "-c", f"gpg.program={gpg}", "verify-tag", "--raw", tag],
+            check=False,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "GNUPGHOME": str(gnupg_home)},
+        )
+    if result.returncode != 0:
+        raise VersionedSiteError(
+            f"release tag was not signed by an active qbit release key: {tag}"
+        )
+    counted = sorted(set(status_fingerprints(result.stdout + result.stderr)) & set(active_signers))
+    if not counted:
+        raise VersionedSiteError(
+            f"release tag signature did not come from an active qbit release key: {tag}"
+        )
+
+
 def resolve_trusted_release_tag(repository: str, tag: str) -> str:
     try:
         tag_object = git_output(["rev-parse", "--verify", f"refs/tags/{tag}^{{tag}}"])
@@ -136,6 +234,7 @@ def resolve_trusted_release_tag(repository: str, tag: str) -> str:
         raise VersionedSiteError(f"remote release tag lacks verification data: {tag}")
     if verification.get("verified") is not True or verification.get("reason") != "valid":
         raise VersionedSiteError(f"remote release tag is not a valid signed tag: {tag}")
+    verify_tag_signed_by_active_release_key(tag)
     return tag_target
 
 

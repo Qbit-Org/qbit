@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -136,11 +137,13 @@ class VersionDiscoveryTest(unittest.TestCase):
         with (
             mock.patch.object(versioned_site, "git_output", side_effect=fake_git_output),
             mock.patch.object(versioned_site, "gh_api_json", side_effect=fake_gh_api_json),
+            mock.patch.object(versioned_site, "verify_tag_signed_by_active_release_key") as verify_policy,
         ):
             self.assertEqual(
                 versioned_site.resolve_trusted_release_tag("Qbit-Org/qbit", "v1.0.0"),
                 "b" * 40,
             )
+            verify_policy.assert_called_once_with("v1.0.0")
 
     def test_resolve_trusted_release_tag_rejects_unverified_tag(self) -> None:
         def fake_git_output(arguments: list[str]) -> str:
@@ -165,11 +168,51 @@ class VersionDiscoveryTest(unittest.TestCase):
         with (
             mock.patch.object(versioned_site, "git_output", side_effect=fake_git_output),
             mock.patch.object(versioned_site, "gh_api_json", side_effect=fake_gh_api_json),
+            mock.patch.object(versioned_site, "verify_tag_signed_by_active_release_key"),
         ):
             with self.assertRaisesRegex(
                 versioned_site.VersionedSiteError, "not a valid signed tag"
             ):
                 versioned_site.resolve_trusted_release_tag("Qbit-Org/qbit", "v1.0.0")
+
+    def test_verify_tag_signature_requires_active_policy_fingerprint(self) -> None:
+        valid_signature = f"[GNUPG:] VALIDSIG {'A' * 40} 2026-01-01 0 4 0 1 10 00"
+        run_results = [
+            subprocess.CompletedProcess(["gpg"], 0, "", ""),
+            subprocess.CompletedProcess(["git"], 0, valid_signature, ""),
+        ]
+
+        with (
+            mock.patch.object(versioned_site.shutil, "which", return_value="/usr/bin/gpg"),
+            mock.patch.object(
+                versioned_site,
+                "active_release_signers",
+                return_value={"A" * 40: "public-keys/operator-01-release.asc"},
+            ),
+            mock.patch.object(versioned_site.subprocess, "run", side_effect=run_results),
+        ):
+            versioned_site.verify_tag_signed_by_active_release_key("v1.0.0")
+
+    def test_verify_tag_signature_rejects_inactive_policy_fingerprint(self) -> None:
+        inactive_signature = f"[GNUPG:] VALIDSIG {'B' * 40} 2026-01-01 0 4 0 1 10 00"
+        run_results = [
+            subprocess.CompletedProcess(["gpg"], 0, "", ""),
+            subprocess.CompletedProcess(["git"], 0, inactive_signature, ""),
+        ]
+
+        with (
+            mock.patch.object(versioned_site.shutil, "which", return_value="/usr/bin/gpg"),
+            mock.patch.object(
+                versioned_site,
+                "active_release_signers",
+                return_value={"A" * 40: "public-keys/operator-01-release.asc"},
+            ),
+            mock.patch.object(versioned_site.subprocess, "run", side_effect=run_results),
+        ):
+            with self.assertRaisesRegex(
+                versioned_site.VersionedSiteError, "active qbit release key"
+            ):
+                versioned_site.verify_tag_signed_by_active_release_key("v1.0.0")
 
 
 class VersionAssemblyTest(unittest.TestCase):

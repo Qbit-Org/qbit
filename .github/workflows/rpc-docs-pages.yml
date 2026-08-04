@@ -73,6 +73,12 @@ jobs:
             '+refs/heads/*:refs/remotes/origin/*' \
             '+refs/tags/*:refs/tags/*'
 
+      - name: Install release trust dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y gnupg
+
       - name: Select development ref
         id: development
         env:
