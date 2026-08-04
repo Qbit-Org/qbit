@@ -17,12 +17,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--baseline", required=True, help="Path to the baseline manifest JSON")
     parser.add_argument("--overlay", required=True, help="Path to the overlay annotations YAML")
     parser.add_argument("--out", required=True, help="Output directory for the generated site")
+    parser.add_argument("--publication-id", help="Published version identifier")
+    parser.add_argument("--publication-label", help="Published version display label")
+    parser.add_argument(
+        "--publication-kind",
+        choices=("release", "development"),
+        help="Published version kind",
+    )
+    parser.add_argument("--publication-path", help="Path below the Pages artifact root")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     out_dir = Path(args.out)
+    publication_values = (
+        args.publication_id,
+        args.publication_label,
+        args.publication_kind,
+        args.publication_path,
+    )
+    if any(value is not None for value in publication_values) and not all(
+        value is not None for value in publication_values
+    ):
+        raise site_builder.SiteBuilderError(
+            "publication id, label, kind, and path must be provided together"
+        )
+    publication = None
+    if all(value is not None for value in publication_values):
+        publication = site_builder.validate_publication(*publication_values)
 
     manifest = site_builder.load_manifest(args.manifest)
     baseline = site_builder.load_manifest(args.baseline)
@@ -41,8 +64,12 @@ def main() -> int:
     )
     site_model_path = site_builder.write_site_model(site_model, out_dir)
     docs_dir = site_builder.render_markdown_site(site_model, out_dir)
-    assets_dir = site_builder.copy_site_assets(out_dir)
-    config_path = site_builder.write_mkdocs_config(site_model, out_dir)
+    assets_dir = site_builder.copy_site_assets(out_dir, publication=publication)
+    config_path = site_builder.write_mkdocs_config(
+        site_model,
+        out_dir,
+        display_version=publication["label"] if publication else None,
+    )
     site_builder.build_mkdocs_site(config_path)
 
     print(f"Wrote site model to {site_model_path}")

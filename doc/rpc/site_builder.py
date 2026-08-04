@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -58,6 +59,8 @@ COMPONENT_FEATURE_KEYS = {
     "signer": "external_signer",
 }
 ROOT_DIR = Path(__file__).resolve().parent
+PUBLICATION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+PUBLICATION_KINDS = {"release", "development"}
 
 
 class SiteBuilderError(Exception):
@@ -815,7 +818,60 @@ def render_badge_span(badge: str, indent: str) -> str:
     )
 
 
-def copy_site_assets(out_dir: str | Path) -> Path:
+def validate_publication(
+    publication_id: str,
+    label: str,
+    kind: str,
+    path: str,
+) -> dict[str, str]:
+    if not PUBLICATION_ID_PATTERN.fullmatch(publication_id):
+        raise SiteBuilderError(f"invalid publication id: {publication_id}")
+    if not isinstance(label, str) or not label.strip():
+        raise SiteBuilderError("publication label must be non-empty")
+    if kind not in PUBLICATION_KINDS:
+        raise SiteBuilderError(f"invalid publication kind: {kind}")
+
+    publication_path = Path(path)
+    if publication_path.is_absolute() or ".." in publication_path.parts:
+        raise SiteBuilderError(f"invalid publication path: {path}")
+    if len(publication_path.parts) > 1:
+        raise SiteBuilderError(f"invalid publication path: {path}")
+    if any(not PUBLICATION_ID_PATTERN.fullmatch(part) for part in publication_path.parts):
+        raise SiteBuilderError(f"invalid publication path: {path}")
+    normalized_path = "" if path in {"", "."} else publication_path.as_posix().strip("/")
+    return {
+        "id": publication_id,
+        "label": label.strip(),
+        "kind": kind,
+        "path": normalized_path,
+    }
+
+
+def publication_context(publication: dict[str, str]) -> dict[str, Any]:
+    path_depth = len(Path(publication["path"]).parts) if publication["path"] else 0
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "enabled": True,
+        "current": publication,
+        "pages_root": "../" * (path_depth + 1),
+    }
+
+
+def write_publication_context(
+    assets_dir: str | Path, publication: dict[str, str]
+) -> Path:
+    output = Path(assets_dir) / "rpcdocs-version.json"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        json.dumps(publication_context(publication), indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return output
+
+
+def copy_site_assets(
+    out_dir: str | Path, publication: dict[str, str] | None = None
+) -> Path:
     source_root = generated_source_root(out_dir)
     docs_assets_dir = source_root / "docs" / "assets"
     docs_assets_dir.mkdir(parents=True, exist_ok=True)
@@ -825,10 +881,17 @@ def copy_site_assets(out_dir: str | Path) -> Path:
         if asset.is_file():
             shutil.copy2(asset, docs_assets_dir / asset.name)
 
+    if publication:
+        write_publication_context(docs_assets_dir, publication)
+
     return docs_assets_dir
 
 
-def write_mkdocs_config(site_model: dict[str, Any], out_dir: str | Path) -> Path:
+def write_mkdocs_config(
+    site_model: dict[str, Any],
+    out_dir: str | Path,
+    display_version: str | None = None,
+) -> Path:
     out_path = Path(out_dir)
     source_root = generated_source_root(out_dir).resolve()
     config_path = source_root / "mkdocs.yml"
@@ -865,7 +928,7 @@ def write_mkdocs_config(site_model: dict[str, Any], out_dir: str | Path) -> Path
             f"docs_dir: {json.dumps(str(source_root / 'docs'))}",
             f"site_dir: {json.dumps(str(out_path.resolve()))}",
             "extra:",
-            f"  version: {json.dumps(site_model['project_version'])}",
+            f"  version: {json.dumps(display_version or site_model['project_version'])}",
             "strict: true",
             *nav_lines,
             "",

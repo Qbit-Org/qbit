@@ -6,15 +6,30 @@ name: RPC Docs Pages
 run-name: RPC Docs Pages (${{ inputs.ref || github.ref_name }})
 
 on:
+  pull_request:
+    paths:
+      - .github/workflows/rpc-docs-pages.yml
+      - cmake/script/normalize_rpc_docs_site_paths.py
+      - doc/CMakeLists.txt
+      - doc/rpc/**
+      - src/CMakeLists.txt
+      - src/rpc/**
+      - test/rpc_docs/**
+  push:
+    branches:
+      - main
+  release:
+    types:
+      - published
   workflow_dispatch:
     inputs:
       ref:
-        description: Git ref to build for RPC docs publication
+        description: Git ref to publish as the rolling development RPC docs
         required: false
         default: ''
         type: string
       publish:
-        description: Deploy the built site to GitHub Pages
+        description: Deploy the complete versioned site to GitHub Pages
         required: true
         default: false
         type: boolean
@@ -23,7 +38,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: rpc-docs-pages
+  group: rpc-docs-pages-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'publish' }}
   cancel-in-progress: false
 
 defaults:
@@ -31,27 +46,141 @@ defaults:
     shell: bash
 
 jobs:
-  build:
-    name: build rpc docs site
+  discover:
+    name: discover rpc docs versions
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.discover.outputs.matrix }}
+      latest: ${{ steps.discover.outputs.latest }}
+      publisher_sha: ${{ steps.discover.outputs.publisher_sha }}
+      development_sha: ${{ steps.discover.outputs.development_sha }}
+      should_publish: ${{ steps.mode.outputs.should_publish }}
 
     steps:
-      - name: Checkout
+      - name: Checkout publishing tools
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          ref: ${{ inputs.ref || github.ref_name }}
+          ref: ${{ github.event_name == 'release' && github.event.repository.default_branch || github.sha }}
+          fetch-depth: 0
+          path: publisher
+
+      - name: Fetch release and development refs
+        working-directory: publisher
+        run: |
+          set -euo pipefail
+          git fetch --force origin \
+            '+refs/heads/*:refs/remotes/origin/*' \
+            '+refs/tags/*:refs/tags/*'
+
+      - name: Select development ref
+        id: development
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          DISPATCH_REF: ${{ inputs.ref || '' }}
+          EVENT_NAME: ${{ github.event_name }}
+          PULL_REQUEST_NUMBER: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || '' }}
+          PULL_REQUEST_SHA: ${{ github.event_name == 'pull_request' && github.sha || '' }}
+        run: |
+          set -euo pipefail
+          development_ref="${DEFAULT_BRANCH}"
+          development_checkout_ref=""
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            development_ref="${PULL_REQUEST_SHA}"
+            development_checkout_ref="refs/pull/${PULL_REQUEST_NUMBER}/merge"
+          elif [[ "${EVENT_NAME}" == "workflow_dispatch" && -n "${DISPATCH_REF}" ]]; then
+            development_ref="${DISPATCH_REF}"
+          fi
+          echo "ref=${development_ref}" >> "${GITHUB_OUTPUT}"
+          echo "checkout_ref=${development_checkout_ref}" >> "${GITHUB_OUTPUT}"
+
+      - name: Determine publication mode
+        id: mode
+        env:
+          DISPATCH_PUBLISH: ${{ inputs.publish || false }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          should_publish=false
+          if [[ "${EVENT_NAME}" == "push" || "${EVENT_NAME}" == "release" ]]; then
+            should_publish=true
+          elif [[ "${EVENT_NAME}" == "workflow_dispatch" && "${DISPATCH_PUBLISH}" == "true" ]]; then
+            should_publish=true
+          fi
+          echo "should_publish=${should_publish}" >> "${GITHUB_OUTPUT}"
+
+      - name: Discover published qbit versions
+        id: discover
+        working-directory: publisher
+        env:
+          DEVELOPMENT_REF: ${{ steps.development.outputs.ref }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          publisher_sha="$(git rev-parse HEAD)"
+          python3 doc/rpc/versioned_site.py discover \
+            --repository "${REPOSITORY}" \
+            --development-ref "${DEVELOPMENT_REF}" \
+            --development-checkout-ref "${{ steps.development.outputs.checkout_ref }}" \
+            --publisher-sha "${publisher_sha}" \
+            --output "${RUNNER_TEMP}/rpc-docs-build-plan.json" \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Upload build plan
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rpc-docs-build-plan
+          if-no-files-found: error
+          retention-days: 14
+          path: ${{ runner.temp }}/rpc-docs-build-plan.json
+
+  build-version:
+    name: build rpc docs (${{ matrix.id }})
+    needs: discover
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
+    env:
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_COMPILERCHECK: content
+      CCACHE_MAXSIZE: 750M
+
+    steps:
+      - name: Checkout publishing tools
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ needs.discover.outputs.publisher_sha }}
+          path: publisher
+
+      - name: Checkout version source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ matrix.source_checkout_ref }}
+          fetch-depth: 0
+          path: source
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: publisher/doc/rpc/requirements.txt
 
       - name: Install build dependencies
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
+            ccache \
             cmake \
             ninja-build \
             pkgconf \
-            python3 \
-            python3-pip \
             libboost-dev \
             libevent-dev \
             libsqlite3-dev \
@@ -59,88 +188,208 @@ jobs:
 
       - name: Install Python packages
         run: |
-          if [[ -f doc/rpc/requirements.txt ]]; then
-            pip3 install --break-system-packages -r doc/rpc/requirements.txt
+          set -euo pipefail
+          if [[ -f publisher/doc/rpc/requirements.txt ]]; then
+            python3 -m pip install -r publisher/doc/rpc/requirements.txt
           else
-            pip3 install --break-system-packages mkdocs PyYAML
+            python3 -m pip install mkdocs PyYAML
           fi
 
-      - name: Configure build
+      - name: Restore compiler cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: rpcdocs-ccache-${{ runner.os }}-${{ matrix.source_sha }}-v1
+          restore-keys: |
+            rpcdocs-ccache-${{ runner.os }}-
+
+      - name: Configure version source
+        env:
+          VERSION_ID: ${{ matrix.id }}
         run: |
-          cmake -B build -G Ninja \
+          set -euo pipefail
+          build_dir="${RUNNER_TEMP}/build-${VERSION_ID}"
+          cmake -S source -B "${build_dir}" -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DBUILD_GUI=OFF \
             -DBUILD_TESTS=OFF \
             -DBUILD_BENCH=OFF \
             -DENABLE_IPC=OFF \
-            -DWITH_ZMQ=ON
+            -DWITH_ZMQ=ON \
+            -DWITH_CCACHE=ON
 
-      - name: Build rpc docs
-        run: cmake --build build --target rpcdocs -j"$(nproc)"
-
-      - name: Validate rpc docs outputs
+      - name: Build version manifest
+        env:
+          VERSION_ID: ${{ matrix.id }}
         run: |
-          test -f build/doc/rpc-site/index.html
-          test -f build/doc/rpc-site/search/search_index.json
-          test -f build/doc/rpc/rpc-docs.json
-          test -f build/doc/rpc/rpc-docs-build-meta.json
-          test -f build/doc/rpc-site/assets/qbit.svg
-          if grep -R -nE "(href|src)=[\"']/" build/doc/rpc-site; then
-            echo "Found root-relative asset paths in build/doc/rpc-site"
-            exit 1
-          fi
-          if grep -R -nE "url\([[:space:]]*[\"']?/" build/doc/rpc-site; then
-            echo "Found root-relative CSS asset paths in build/doc/rpc-site"
-            exit 1
-          fi
-          if grep -R -nE 'cdn\.jsdelivr|unpkg\.com|cdnjs\.cloudflare\.com' build/doc/rpc-site; then
-            echo "Found external CDN dependency in build/doc/rpc-site"
-            exit 1
-          fi
+          set -euo pipefail
+          cmake --build "${RUNNER_TEMP}/build-${VERSION_ID}" \
+            --target rpcdocs-json -j"$(nproc)"
 
-      - name: Validate install layout
+      - name: Render version site
+        env:
+          PUBLICATION_ID: ${{ matrix.id }}
+          PUBLICATION_KIND: ${{ matrix.kind }}
+          PUBLICATION_LABEL: ${{ matrix.label }}
+          PUBLICATION_PATH: ${{ matrix.path }}
         run: |
-          cmake --install build --prefix "${RUNNER_TEMP}/rpcdocs-install" --component rpcdocs
-          test -f "${RUNNER_TEMP}/rpcdocs-install/share/doc/qbit/rpc/index.html"
-          test -f "${RUNNER_TEMP}/rpcdocs-install/share/doc/qbit/rpc/data/rpc-docs.json"
-          test -f "${RUNNER_TEMP}/rpcdocs-install/share/doc/qbit/rpc/data/rpc-docs-build-meta.json"
+          set -euo pipefail
+          build_dir="${RUNNER_TEMP}/build-${PUBLICATION_ID}"
+          site_dir="${RUNNER_TEMP}/site-${PUBLICATION_ID}"
+          python3 publisher/doc/rpc/build_site.py \
+            --manifest "${build_dir}/doc/rpc/rpc-docs.json" \
+            --baseline source/doc/rpc/baselines/v30.2/rpc-docs.json \
+            --overlay source/doc/rpc/annotations/v30.2-delta.yml \
+            --out "${site_dir}" \
+            --publication-id "${PUBLICATION_ID}" \
+            --publication-label "${PUBLICATION_LABEL}" \
+            --publication-kind "${PUBLICATION_KIND}" \
+            --publication-path "${PUBLICATION_PATH}"
+          python3 publisher/cmake/script/normalize_rpc_docs_site_paths.py \
+            "${site_dir}"
 
-      - name: Upload site artifact
+      - name: Validate version outputs
+        env:
+          VERSION_ID: ${{ matrix.id }}
+        run: |
+          set -euo pipefail
+          build_dir="${RUNNER_TEMP}/build-${VERSION_ID}"
+          site_dir="${RUNNER_TEMP}/site-${VERSION_ID}"
+          test -f "${site_dir}/index.html"
+          test -f "${site_dir}/search/search_index.json"
+          test -f "${site_dir}/assets/qbit.svg"
+          test -f "${site_dir}/assets/rpcdocs-version.json"
+          test -f "${build_dir}/doc/rpc/rpc-docs.json"
+          test -f "${build_dir}/doc/rpc/rpc-docs-build-meta.json"
+          if grep -R -nE "(href|src)=[\"']\/" "${site_dir}"; then
+            echo "Found root-relative asset paths in ${VERSION_ID}"
+            exit 1
+          fi
+          if grep -R -nE "url\([[:space:]]*[\"']?\/" "${site_dir}"; then
+            echo "Found root-relative CSS asset paths in ${VERSION_ID}"
+            exit 1
+          fi
+          if grep -R -nE 'cdn\.jsdelivr|unpkg\.com|cdnjs\.cloudflare\.com' "${site_dir}"; then
+            echo "Found external CDN dependency in ${VERSION_ID}"
+            exit 1
+          fi
+
+      - name: Package version artifact
+        env:
+          VERSION_ID: ${{ matrix.id }}
+        run: |
+          set -euo pipefail
+          build_dir="${RUNNER_TEMP}/build-${VERSION_ID}"
+          site_dir="${RUNNER_TEMP}/site-${VERSION_ID}"
+          artifact_dir="${RUNNER_TEMP}/artifact-${VERSION_ID}"
+          mkdir -p "${artifact_dir}/site" "${artifact_dir}/data"
+          cp -a "${site_dir}/." "${artifact_dir}/site/"
+          cp \
+            "${build_dir}/doc/rpc/rpc-docs.json" \
+            "${build_dir}/doc/rpc/rpc-docs-build-meta.json" \
+            "${artifact_dir}/data/"
+
+      - name: Upload version artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: rpc-docs-site
+          name: rpc-docs-version-${{ matrix.id }}
           if-no-files-found: error
-          path: |
-            build/doc/rpc-site/**
+          retention-days: 14
+          path: ${{ runner.temp }}/artifact-${{ matrix.id }}
 
-      - name: Upload data artifact
+  assemble:
+    name: assemble complete rpc docs site
+    needs:
+      - discover
+      - build-version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout publishing tools
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ needs.discover.outputs.publisher_sha }}
+          path: publisher
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Download build plan
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: rpc-docs-build-plan
+          path: ${{ runner.temp }}/plan
+
+      - name: Download version artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: rpc-docs-version-*
+          path: ${{ runner.temp }}/versions
+
+      - name: Assemble complete Pages tree
+        run: |
+          set -euo pipefail
+          python3 publisher/doc/rpc/versioned_site.py assemble \
+            --plan "${RUNNER_TEMP}/plan/rpc-docs-build-plan.json" \
+            --artifacts-root "${RUNNER_TEMP}/versions" \
+            --out "${RUNNER_TEMP}/rpc-docs-pages"
+
+      - name: Validate complete Pages tree
+        env:
+          LATEST: ${{ needs.discover.outputs.latest }}
+        run: |
+          set -euo pipefail
+          site_dir="${RUNNER_TEMP}/rpc-docs-pages"
+          test -f "${site_dir}/index.html"
+          test -f "${site_dir}/versions.json"
+          test -f "${site_dir}/main/index.html"
+          test -f "${site_dir}/${LATEST}/index.html"
+          test -f "${site_dir}/.nojekyll"
+          if find "${site_dir}" -type l -print -quit | grep -q .; then
+            echo "Found a symbolic link in the complete Pages tree"
+            exit 1
+          fi
+          if grep -R -nE "(href|src)=[\"']\/" "${site_dir}"; then
+            echo "Found root-relative asset paths in the complete Pages tree"
+            exit 1
+          fi
+          if grep -R -nE "url\([[:space:]]*[\"']?\/" "${site_dir}"; then
+            echo "Found root-relative CSS paths in the complete Pages tree"
+            exit 1
+          fi
+
+      - name: Upload complete site artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: rpc-docs-data
+          name: rpc-docs-pages-complete
           if-no-files-found: error
-          path: |
-            build/doc/rpc/**
+          include-hidden-files: true
+          retention-days: 14
+          path: ${{ runner.temp }}/rpc-docs-pages
 
       - name: Upload Pages artifact
-        if: ${{ inputs.publish }}
+        if: ${{ needs.discover.outputs.should_publish == 'true' }}
         uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
         with:
-          path: build/doc/rpc-site
+          path: ${{ runner.temp }}/rpc-docs-pages
 
       - name: Record dry-run result
-        if: ${{ !inputs.publish }}
+        if: ${{ needs.discover.outputs.should_publish != 'true' }}
         run: |
-          cat <<'EOF' >> "$GITHUB_STEP_SUMMARY"
-          RPC docs site was built and uploaded as artifacts only.
-
-          Re-run this manual workflow with `publish=true` to deploy the same
-          generated site shape to GitHub Pages.
+          cat <<'EOF' >> "${GITHUB_STEP_SUMMARY}"
+          The complete versioned RPC docs site was built and uploaded as a
+          normal workflow artifact. No GitHub Pages deployment was requested.
           EOF
 
   deploy:
     name: deploy rpc docs pages
-    needs: build
-    if: ${{ inputs.publish }}
+    needs:
+      - discover
+      - assemble
+    if: ${{ needs.discover.outputs.should_publish == 'true' }}
     runs-on: ubuntu-24.04
     permissions:
       pages: write
