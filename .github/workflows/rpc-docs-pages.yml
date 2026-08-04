@@ -164,6 +164,18 @@ jobs:
           fetch-depth: 0
           path: source
 
+      - name: Validate version source checkout
+        working-directory: source
+        env:
+          EXPECTED_SOURCE_SHA: ${{ matrix.source_sha }}
+        run: |
+          set -euo pipefail
+          actual_source_sha="$(git rev-parse HEAD)"
+          if [[ "${actual_source_sha}" != "${EXPECTED_SOURCE_SHA}" ]]; then
+            echo "Checked out ${actual_source_sha}, expected ${EXPECTED_SOURCE_SHA}"
+            exit 1
+          fi
+
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
