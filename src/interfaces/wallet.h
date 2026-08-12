@@ -238,7 +238,8 @@ public:
         size_t* n_signed,
         PartiallySignedTransaction& psbtx,
         bool& complete,
-        wallet::PQCUsageReport* pqc_usage = nullptr) = 0;
+        wallet::PQCUsageReport* pqc_usage = nullptr,
+        const SigningProgressCallback& progress_callback = {}) = 0;
 
     //! Get balances.
     virtual WalletBalances getBalances() = 0;

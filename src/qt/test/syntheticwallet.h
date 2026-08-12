@@ -12,6 +12,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <thread>
 
 namespace qt_test {
 
@@ -28,6 +29,18 @@ struct SyntheticWalletState {
     bool watchdog_released{false};
     bool encrypted{false};
     bool locked{false};
+    bool psbt_sign_entered{false};
+    bool allow_psbt_reservation{true};
+    bool allow_psbt_completion{true};
+    bool allow_psbt_post_signing{true};
+    bool psbt_simulate_pqc_reservation{false};
+    bool psbt_counters_reserved{false};
+    bool psbt_input_signed{false};
+    bool psbt_cancel_observed{false};
+    bool psbt_sign_finished{false};
+    bool psbt_fail{false};
+    int psbt_sign_calls{0};
+    std::thread::id psbt_sign_thread;
     int lock_calls{0};
     int unlock_calls{0};
     std::function<void()> can_get_addresses_changed;
