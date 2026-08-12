@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 from pathlib import Path
 import subprocess
@@ -235,7 +236,6 @@ class VersionAssemblyTest(unittest.TestCase):
         for page in pages:
             page_path = site_dir / page
             page_path.parent.mkdir(parents=True, exist_ok=True)
-            page_path.write_text(f"<html>{entry['id']} {page}</html>\n", encoding="utf-8")
         (site_dir / "search" / "search_index.json").write_text(
             "{}\n", encoding="utf-8"
         )
@@ -243,6 +243,32 @@ class VersionAssemblyTest(unittest.TestCase):
             entry["id"], entry["label"], entry["kind"], entry["path"]
         )
         site_builder.write_publication_context(assets_dir, publication)
+        publication_site_url = site_builder.publication_site_url(
+            "https://docs.qbit.org/", publication
+        )
+        sitemap_urls: list[str] = []
+        for page in pages:
+            page_path = site_dir / page
+            page_path.write_text(
+                "\n".join(
+                    [
+                        "<html>",
+                        f'<link rel="canonical" href="{publication_site_url}{page}">',
+                        f"<body>{entry['id']} {page}</body>",
+                        "</html>",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            sitemap_urls.append(
+                f"  <url><loc>{publication_site_url}{page}</loc></url>"
+            )
+        sitemap = "\n".join(["<urlset>", *sitemap_urls, "</urlset>", ""])
+        (site_dir / "sitemap.xml").write_text(sitemap, encoding="utf-8")
+        (site_dir / "sitemap.xml.gz").write_bytes(
+            gzip.compress(sitemap.encode("utf-8"), mtime=0)
+        )
 
         if project_version is None:
             project_version = entry["id"] if entry["kind"] == "release" else "v1.0.0"
@@ -339,6 +365,34 @@ class VersionAssemblyTest(unittest.TestCase):
             self.assertEqual(root_context["pages_root"], "../")
             self.assertEqual(root_context["current"]["path"], "")
             self.assertEqual(release_context["pages_root"], "../../")
+
+            root_index = (output / "index.html").read_text(encoding="utf-8")
+            release_index = (output / "v1.0.0" / "index.html").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn(
+                'href="https://docs.qbit.org/index.html"', root_index
+            )
+            self.assertNotIn("https://docs.qbit.org/v1.0.0/", root_index)
+            self.assertIn(
+                'href="https://docs.qbit.org/v1.0.0/index.html"',
+                release_index,
+            )
+
+            root_sitemap = (output / "sitemap.xml").read_text(encoding="utf-8")
+            compressed_root_sitemap = gzip.decompress(
+                (output / "sitemap.xml.gz").read_bytes()
+            ).decode("utf-8")
+            release_sitemap = (
+                output / "v1.0.0" / "sitemap.xml"
+            ).read_text(encoding="utf-8")
+            self.assertIn("https://docs.qbit.org/methods/common.html", root_sitemap)
+            self.assertEqual(compressed_root_sitemap, root_sitemap)
+            self.assertNotIn("https://docs.qbit.org/v1.0.0/", root_sitemap)
+            self.assertIn(
+                "https://docs.qbit.org/v1.0.0/methods/common.html",
+                release_sitemap,
+            )
 
     def test_missing_artifact_blocks_assembly(self) -> None:
         latest = plan_entry("v1.0.0", "release")

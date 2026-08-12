@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import os
 from pathlib import Path
@@ -459,6 +460,50 @@ def _published_entry(entry: dict[str, str], site_dir: Path) -> dict[str, Any]:
     }
 
 
+def _replace_url_prefix(path: Path, old_prefix: str, new_prefix: str) -> None:
+    content = path.read_text(encoding="utf-8")
+    updated = content.replace(old_prefix, new_prefix)
+    if updated != content:
+        path.write_text(updated, encoding="utf-8")
+
+
+def _replace_gzip_url_prefix(path: Path, old_prefix: str, new_prefix: str) -> None:
+    content = gzip.decompress(path.read_bytes()).decode("utf-8")
+    updated = content.replace(old_prefix, new_prefix)
+    if updated != content:
+        path.write_bytes(gzip.compress(updated.encode("utf-8"), mtime=0))
+
+
+def _rewrite_root_publication_urls(
+    versioned_dir: Path,
+    output_dir: Path,
+    versioned_publication: dict[str, str],
+    root_publication: dict[str, str],
+) -> None:
+    base_config = (site_builder.ROOT_DIR / "mkdocs.base.yml").read_text(
+        encoding="utf-8"
+    )
+    base_site_url = site_builder.config_site_url(base_config)
+    versioned_site_url = site_builder.publication_site_url(
+        base_site_url, versioned_publication
+    )
+    root_site_url = site_builder.publication_site_url(
+        base_site_url, root_publication
+    )
+
+    text_files = [
+        *versioned_dir.rglob("*.html"),
+        *versioned_dir.rglob("sitemap.xml"),
+    ]
+    for source in text_files:
+        destination = output_dir / source.relative_to(versioned_dir)
+        _replace_url_prefix(destination, versioned_site_url, root_site_url)
+
+    for source in versioned_dir.rglob("sitemap.xml.gz"):
+        destination = output_dir / source.relative_to(versioned_dir)
+        _replace_gzip_url_prefix(destination, versioned_site_url, root_site_url)
+
+
 def assemble_site(plan_path: str | Path, artifacts_root: str | Path, out: str | Path) -> Path:
     plan = _load_json(Path(plan_path))
     if plan.get("schema_version") != SCHEMA_VERSION:
@@ -510,6 +555,18 @@ def assemble_site(plan_path: str | Path, artifacts_root: str | Path, out: str | 
         ) from exc
     root_publication = site_builder.validate_publication(
         latest_entry["id"], latest_entry["label"], "release", ""
+    )
+    versioned_publication = site_builder.validate_publication(
+        latest_entry["id"],
+        latest_entry["label"],
+        "release",
+        latest_entry["path"],
+    )
+    _rewrite_root_publication_urls(
+        latest_dir,
+        output_dir,
+        versioned_publication,
+        root_publication,
     )
     site_builder.write_publication_context(output_dir / "assets", root_publication)
 
