@@ -826,7 +826,7 @@ public:
     // and before script cache publication takes cs_wallet. Configure it before
     // starting concurrent wallet work and leave it unchanged until that work
     // completes.
-    std::function<void()> m_before_script_pub_key_cache_publish;
+    std::function<void(const std::set<CScript>&, ScriptPubKeyMan*)> m_before_script_pub_key_cache_publish;
     bool m_deferred_create_keypool_top_up_scheduled GUARDED_BY(cs_wallet){false};
     bool m_deferred_create_keypool_top_up_reschedule_requested GUARDED_BY(cs_wallet){false};
     bool m_p2mr_receive_keypool_refill_scheduled GUARDED_BY(cs_wallet){false};

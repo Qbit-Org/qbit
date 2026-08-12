@@ -5670,7 +5670,7 @@ void CWallet::CacheNewScriptPubKeys(const std::set<CScript>& spks, ScriptPubKeyM
 void CWallet::TopUpCallback(const std::set<CScript>& spks, ScriptPubKeyMan* spkm)
 {
     if (m_before_script_pub_key_cache_publish) {
-        m_before_script_pub_key_cache_publish();
+        m_before_script_pub_key_cache_publish(spks, spkm);
     }
     LOCK(cs_wallet);
     // Update scriptPubKey cache

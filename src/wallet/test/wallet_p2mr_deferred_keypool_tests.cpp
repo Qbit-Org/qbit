@@ -151,8 +151,11 @@ BOOST_FIXTURE_TEST_CASE(WalletInterfaceUnlockSerializesDeferredTopUpCachePublica
     std::atomic_bool pause_next_publication{true};
     std::atomic_bool publication_lock_stack_empty{false};
     std::atomic_bool publication_transaction_inactive{false};
-    wallet->m_before_script_pub_key_cache_publish = [&] {
+    std::set<CScript> unpublished_scripts;
+    wallet->m_before_script_pub_key_cache_publish = [&](const std::set<CScript>& spks, ScriptPubKeyMan* spk_man) {
+        if (spk_man != external_spk_man) return;
         if (!pause_next_publication.exchange(false)) return;
+        unpublished_scripts = spks;
         publication_lock_stack_empty = LockStackEmpty();
         publication_transaction_inactive = !database.HasActiveTxn();
         publication_ready.set_value();
@@ -175,7 +178,8 @@ BOOST_FIXTURE_TEST_CASE(WalletInterfaceUnlockSerializesDeferredTopUpCachePublica
 
     // Descriptor state and its transaction are complete, but the new script
     // remains invisible until the publication batch acquires cs_wallet.
-    const CScript new_script{GetCachedScriptPubKey(*external_spk_man, DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL)};
+    BOOST_REQUIRE_EQUAL(unpublished_scripts.size(), 1U);
+    const CScript new_script{*unpublished_scripts.begin()};
     std::promise<void> reader_locked;
     std::promise<void> run_reader_checks;
     auto run_reader_checks_future{run_reader_checks.get_future()};
