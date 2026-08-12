@@ -31,8 +31,10 @@ struct SyntheticWalletState {
     bool psbt_sign_entered{false};
     bool allow_psbt_reservation{true};
     bool allow_psbt_completion{true};
+    bool allow_psbt_post_signing{true};
     bool psbt_simulate_pqc_reservation{false};
     bool psbt_counters_reserved{false};
+    bool psbt_input_signed{false};
     bool psbt_cancel_observed{false};
     bool psbt_sign_finished{false};
     bool psbt_fail{false};

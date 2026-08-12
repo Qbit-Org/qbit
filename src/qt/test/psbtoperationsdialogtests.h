@@ -29,6 +29,7 @@ private Q_SLOTS:
     void eventLoopResponsiveWhileSigningPaused();
     void successfulCompletionUpdatesDisplayOnce();
     void cancellationBeforeCounterReservation();
+    void acceptedCancellationAfterSigningPreservesOriginalPSBT();
     void lateCancellationDoesNotDropCompletedPSBT();
     void cancellationAfterCounterReservationIsIgnored();
     void dialogDestructionBeforeCompletion();

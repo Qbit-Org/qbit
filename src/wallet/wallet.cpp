@@ -2780,9 +2780,13 @@ std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bo
                     for (unsigned int i : unsigned_inputs) {
                         if (PSBTInputSigned(psbtx.inputs.at(i))) processed_inputs.insert(i);
                     }
-                    notify_progress(SigningProgressPhase::SIGNING_INPUTS,
-                                    static_cast<unsigned int>(processed_inputs.size()),
-                                    input_total);
+                    if (!notify_progress(SigningProgressPhase::SIGNING_INPUTS,
+                                         static_cast<unsigned int>(processed_inputs.size()),
+                                         input_total)) {
+                        provider_collect_time = SteadyClock::now() - provider_collect_start;
+                        log_fillpsbt_timing(/*success=*/false, "cancelled_after_external_signer");
+                        return PSBTError::INCOMPLETE;
+                    }
                     continue;
                 }
             }
@@ -2857,10 +2861,14 @@ std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bo
             }
             if (sign && signed_one && unsigned_inputs.contains(i)) {
                 processed_inputs.insert(i);
-                notify_progress(SigningProgressPhase::SIGNING_INPUTS,
-                                static_cast<unsigned int>(processed_inputs.size()),
-                                input_total,
-                                i);
+                if (!notify_progress(SigningProgressPhase::SIGNING_INPUTS,
+                                     static_cast<unsigned int>(processed_inputs.size()),
+                                     input_total,
+                                     i)) {
+                    sign_inputs_time += SteadyClock::now() - sign_inputs_start;
+                    log_fillpsbt_timing(/*success=*/false, "cancelled_after_signing");
+                    return PSBTError::INCOMPLETE;
+                }
             }
         }
         sign_inputs_time += SteadyClock::now() - sign_inputs_start;
@@ -2886,7 +2894,10 @@ std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bo
     RemoveUnnecessaryTransactions(psbtx);
     remove_unnecessary_time = SteadyClock::now() - remove_unnecessary_start;
     if (sign && finalize) {
-        notify_progress(SigningProgressPhase::FINALIZING_TRANSACTION, 1, 1);
+        if (!notify_progress(SigningProgressPhase::FINALIZING_TRANSACTION, 1, 1)) {
+            log_fillpsbt_timing(/*success=*/false, "cancelled_after_finalizing");
+            return PSBTError::INCOMPLETE;
+        }
     }
 
     // Complete if every input is now signed
@@ -2903,10 +2914,15 @@ std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bo
             return PSBTError::INCOMPLETE;
         }
         complete &= PSBTInputSignedAndVerified(psbtx, i, &txdata);
-        notify_progress(SigningProgressPhase::VERIFYING_TRANSACTION,
-                        static_cast<unsigned int>(i + 1),
-                        static_cast<unsigned int>(psbtx.inputs.size()),
-                        static_cast<unsigned int>(i));
+        if (!notify_progress(SigningProgressPhase::VERIFYING_TRANSACTION,
+                             static_cast<unsigned int>(i + 1),
+                             static_cast<unsigned int>(psbtx.inputs.size()),
+                             static_cast<unsigned int>(i))) {
+            complete = false;
+            final_verify_time = SteadyClock::now() - final_verify_start;
+            log_fillpsbt_timing(/*success=*/false, "cancelled_after_verifying");
+            return PSBTError::INCOMPLETE;
+        }
     }
     final_verify_time = SteadyClock::now() - final_verify_start;
     complete_metric = complete;

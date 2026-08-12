@@ -131,6 +131,7 @@ public:
             std::lock_guard lock{state->mutex};
             state->allow_psbt_reservation = true;
             state->allow_psbt_completion = true;
+            state->allow_psbt_post_signing = true;
         }
         state->condition.notify_all();
     }
@@ -267,6 +268,31 @@ void PSBTOperationsDialogTests::cancellationBeforeCounterReservation()
     QVERIFY(ReadState(state, [](const auto& value) { return value.psbt_cancel_observed; }));
     QVERIFY(!ReadState(state, [](const auto& value) { return value.psbt_counters_reserved; }));
     QCOMPARE(display_updates.count(), 0);
+}
+
+void PSBTOperationsDialogTests::acceptedCancellationAfterSigningPreservesOriginalPSBT()
+{
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    state->allow_psbt_post_signing = false;
+    DialogFixture fixture{*m_context->client_model, m_context->platform_style.get(), state};
+    const std::string original{SerializePSBT(fixture.original_psbt)};
+    QSignalSpy display_updates{fixture.description(), &QTextEdit::textChanged};
+
+    fixture.dialog->signTransaction();
+    QVERIFY(WaitUntil([&] { return ReadState(state, [](const auto& value) { return value.psbt_input_signed; }); }));
+    QVERIFY(QMetaObject::invokeMethod(fixture.dialog.get(), "cancelSignTransaction"));
+    QVERIFY(WaitUntil([&] { return fixture.statusLabel()->text().contains(QStringLiteral("canceled")); }));
+
+    QVERIFY(ReadState(state, [](const auto& value) { return value.psbt_cancel_observed; }));
+    QCOMPARE(display_updates.count(), 0);
+
+    fixture.dialog->copyToClipboard();
+    const auto decoded{DecodeBase64(QApplication::clipboard()->text().toStdString())};
+    QVERIFY(decoded);
+    PartiallySignedTransaction clipboard_psbt;
+    std::string error;
+    QVERIFY(DecodeRawPSBT(clipboard_psbt, MakeByteSpan(*decoded), error));
+    QCOMPARE(SerializePSBT(clipboard_psbt), original);
 }
 
 void PSBTOperationsDialogTests::lateCancellationDoesNotDropCompletedPSBT()

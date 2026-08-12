@@ -293,6 +293,21 @@ public:
         }
         if (n_signed) *n_signed = psbtx.inputs.empty() ? 0 : 1;
         if (pqc_usage) *pqc_usage = m_report;
+        {
+            std::lock_guard lock{m_state->mutex};
+            m_state->psbt_input_signed = true;
+        }
+        m_state->condition.notify_all();
+
+        if (!wait_for_stage(&SyntheticWalletState::allow_psbt_post_signing, SigningProgress{
+                .phase = SigningProgressPhase::SIGNING_INPUTS,
+                .completed = psbtx.inputs.empty() ? 0U : 1U,
+                .total = psbtx.inputs.empty() ? 0U : 1U,
+                .cancellable = !simulate_reservation,
+            })) {
+            finish(/*cancel_observed=*/true);
+            return common::PSBTError::INCOMPLETE;
+        }
 
         bool fail{false};
         {

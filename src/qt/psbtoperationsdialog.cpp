@@ -323,7 +323,7 @@ void PSBTOperationsDialog::signTransactionFinished(uint64_t generation, std::sha
         setSigningControlsEnabled(true);
         return;
     }
-    if (result->cancel_observed) {
+    if (result->cancel_observed && result->error == common::PSBTError::INCOMPLETE) {
         show_result_status(tr("Transaction signing canceled."), StatusLevel::INFO);
         m_sign_unlock_context.reset();
         setSigningControlsEnabled(true);

@@ -17,6 +17,80 @@ using namespace util::hex_literals;
 namespace wallet {
 BOOST_FIXTURE_TEST_SUITE(psbt_wallet_tests, WalletTestingSetup)
 
+static PartiallySignedTransaction MakeSignableNonP2MRPSBT(CWallet& wallet)
+{
+    const CKey key{GenerateRandomKey()};
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        FlatSigningProvider provider;
+        std::string error;
+        auto descriptors{Parse("wpkh(" + EncodeSecret(key) + ")", provider, error, /*require_checksum=*/false)};
+        BOOST_REQUIRE_EQUAL(descriptors.size(), 1U);
+        WalletDescriptor wallet_descriptor{std::move(descriptors.front()), 0, 0, 1, 1};
+        BOOST_REQUIRE(wallet.AddWalletDescriptor(wallet_descriptor, provider, "", /*internal=*/false));
+    }
+    const CScript script_pub_key{GetScriptForDestination(WitnessV0KeyHash{key.GetPubKey()})};
+
+    CMutableTransaction funding_mtx;
+    funding_mtx.vout.emplace_back(COIN, script_pub_key);
+    const CTransaction funding_tx{funding_mtx};
+
+    CMutableTransaction spend_tx;
+    spend_tx.vin.emplace_back(COutPoint{funding_tx.GetHash(), 0});
+    spend_tx.vout.emplace_back(COIN - 1'000, script_pub_key);
+
+    PartiallySignedTransaction psbt{spend_tx};
+    psbt.inputs.front().witness_utxo = funding_tx.vout.front();
+    return psbt;
+}
+
+static void CheckNonP2MRPSBTCancellation(CWallet& wallet, SigningProgressPhase cancel_phase)
+{
+    PartiallySignedTransaction psbt{MakeSignableNonP2MRPSBT(wallet)};
+    bool complete{false};
+    size_t n_signed{0};
+    bool cancellation_requested{false};
+
+    const auto error{wallet.FillPSBT(
+        psbt,
+        complete,
+        std::nullopt,
+        /*sign=*/true,
+        /*bip32derivs=*/true,
+        &n_signed,
+        /*finalize=*/true,
+        {},
+        [&](const SigningProgress& progress) {
+            if (progress.phase == cancel_phase && progress.completed == progress.total && progress.completed > 0) {
+                BOOST_CHECK(progress.cancellable);
+                cancellation_requested = true;
+                return false;
+            }
+            return true;
+        })};
+
+    BOOST_REQUIRE(error);
+    BOOST_CHECK_EQUAL(*error, PSBTError::INCOMPLETE);
+    BOOST_CHECK(cancellation_requested);
+    BOOST_CHECK(!complete);
+}
+
+BOOST_AUTO_TEST_CASE(non_p2mr_psbt_cancels_after_signing)
+{
+    CheckNonP2MRPSBTCancellation(m_wallet, SigningProgressPhase::SIGNING_INPUTS);
+}
+
+BOOST_AUTO_TEST_CASE(non_p2mr_psbt_cancels_after_finalization)
+{
+    CheckNonP2MRPSBTCancellation(m_wallet, SigningProgressPhase::FINALIZING_TRANSACTION);
+}
+
+BOOST_AUTO_TEST_CASE(non_p2mr_psbt_cancels_after_verification)
+{
+    CheckNonP2MRPSBTCancellation(m_wallet, SigningProgressPhase::VERIFYING_TRANSACTION);
+}
+
 static void import_descriptor(CWallet& wallet, const std::string& descriptor)
     EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
 {
