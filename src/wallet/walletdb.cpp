@@ -27,6 +27,7 @@
 #include <atomic>
 #include <algorithm>
 #include <array>
+#include <exception>
 #include <optional>
 #include <span>
 #include <string>
@@ -1558,15 +1559,75 @@ WalletBatch::~WalletBatch()
 
 bool WalletBatch::TxnCommit()
 {
-    bool res = m_batch->TxnCommit();
-    if (res) {
+    size_t prepared{0};
+    try {
         for (const auto& listener : m_txn_listeners) {
-            if (listener.on_commit) listener.on_commit();
+            ++prepared;
+            if (listener.on_commit_prepare) listener.on_commit_prepare();
         }
-        // txn finished, clear listeners
-        m_txn_listeners.clear();
+    } catch (...) {
+        const std::exception_ptr prepare_error{std::current_exception()};
+        for (size_t i{0}; i < prepared; ++i) {
+            try {
+                if (m_txn_listeners[i].on_commit_failure) m_txn_listeners[i].on_commit_failure();
+            } catch (...) {
+            }
+        }
+        std::rethrow_exception(prepare_error);
     }
-    return res;
+
+    bool res{false};
+    try {
+        res = m_batch->TxnCommit();
+    } catch (...) {
+        const std::exception_ptr commit_error{std::current_exception()};
+        for (const auto& listener : m_txn_listeners) {
+            try {
+                if (listener.on_commit_failure) listener.on_commit_failure();
+            } catch (...) {
+            }
+        }
+        std::rethrow_exception(commit_error);
+    }
+
+    if (!res) {
+        std::exception_ptr callback_error;
+        for (const auto& listener : m_txn_listeners) {
+            try {
+                if (listener.on_commit_failure) listener.on_commit_failure();
+            } catch (...) {
+                if (!callback_error) callback_error = std::current_exception();
+            }
+        }
+        if (callback_error) std::rethrow_exception(callback_error);
+        return false;
+    }
+
+    // The database is durable. Move listeners out so callbacks are never run
+    // again even if an outcome or publication callback throws.
+    std::vector<DbTxnListener> listeners{std::move(m_txn_listeners)};
+    m_txn_listeners.clear();
+    std::exception_ptr callback_error;
+    for (const auto& listener : listeners) {
+        try {
+            if (listener.on_commit_success) listener.on_commit_success();
+        } catch (...) {
+            if (!callback_error) callback_error = std::current_exception();
+        }
+    }
+    // Resolve every transaction outcome before a publication callback can
+    // acquire cs_wallet. This lets readers wait on COMMITTING safely.
+    if (!callback_error) {
+        for (const auto& listener : listeners) {
+            try {
+                if (listener.on_commit) listener.on_commit();
+            } catch (...) {
+                if (!callback_error) callback_error = std::current_exception();
+            }
+        }
+    }
+    if (callback_error) std::rethrow_exception(callback_error);
+    return true;
 }
 
 bool WalletBatch::TxnAbort()

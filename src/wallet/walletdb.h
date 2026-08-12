@@ -182,6 +182,11 @@ public:
 
 struct DbTxnListener
 {
+    // Commit outcome callbacks must not acquire wallet or descriptor locks.
+    // All success outcomes are resolved before any on_commit publication runs.
+    std::function<void()> on_commit_prepare;
+    std::function<void()> on_commit_success;
+    std::function<void()> on_commit_failure;
     std::function<void()> on_commit, on_abort;
 };
 

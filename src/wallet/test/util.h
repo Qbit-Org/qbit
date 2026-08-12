@@ -9,6 +9,7 @@
 #include <wallet/db.h>
 #include <wallet/scriptpubkeyman.h>
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -107,6 +108,9 @@ public:
     bool m_txn_commit_pass{true};
     bool m_txn_abort_pass{true};
     bool m_wallet_flags_write_pass{true};
+    //! Runs after a successful mock commit becomes durable, or immediately
+    //! before a failed commit returns, while WalletBatch listeners are COMMITTING.
+    std::function<void(bool)> m_txn_commit_result_hook;
     int m_write_fail_after{-1};
     int m_write_count{0};
     int m_txn_begin_count{0};

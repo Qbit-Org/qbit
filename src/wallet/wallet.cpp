@@ -1946,11 +1946,10 @@ bool CWallet::IsMine(const CScript& script) const
         return res;
     }
 
-    // A committed descriptor top-up publishes into m_cached_spks immediately after
-    // the database transaction commits. Fall back to the managers during that
-    // narrow handoff so transaction processing cannot miss a newly durable script.
+    // Consult only exact scripts whose database commit completed while their
+    // wallet cache publication is still pending.
     bool res{false};
-    for (const auto& [_, spkm] : m_spk_managers) {
+    for (ScriptPubKeyMan* spkm : GetCommittedTopUpScriptPubKeyMans(script)) {
         res = spkm->IsMine(script) || res;
     }
     return res;
@@ -4563,11 +4562,13 @@ std::set<ScriptPubKeyMan*> CWallet::GetScriptPubKeyMans(const CScript& script) c
     const auto& it = m_cached_spks.find(script);
     if (it != m_cached_spks.end()) {
         spk_mans.insert(it->second.begin(), it->second.end());
-    } else {
-        for (const auto& [_, spkm] : m_spk_managers) {
-            SignatureData sigdata;
-            if (spkm->CanProvide(script, sigdata)) spk_mans.insert(spkm.get());
-        }
+    }
+    // A second manager may have committed the same script while existing
+    // managers are already cached, so merge rather than treating this as a
+    // total-cache-miss-only fallback.
+    for (ScriptPubKeyMan* spkm : GetCommittedTopUpScriptPubKeyMans(script)) {
+        SignatureData sigdata;
+        if (spkm->CanProvide(script, sigdata)) spk_mans.insert(spkm);
     }
     SignatureData sigdata;
     Assume(std::all_of(spk_mans.begin(), spk_mans.end(), [&script, &sigdata](ScriptPubKeyMan* spkm) { return spkm->CanProvide(script, sigdata); }));
@@ -4600,7 +4601,7 @@ std::unique_ptr<SigningProvider> CWallet::GetSolvingProvider(const CScript& scri
         return it->second.at(0)->GetSolvingProvider(script);
     }
 
-    for (const auto& [_, spkm] : m_spk_managers) {
+    for (ScriptPubKeyMan* spkm : GetCommittedTopUpScriptPubKeyMans(script)) {
         if (spkm->CanProvide(script, sigdata)) return spkm->GetSolvingProvider(script);
     }
 
@@ -5650,15 +5651,119 @@ void CWallet::CacheNewScriptPubKeys(const std::set<CScript>& spks, ScriptPubKeyM
 {
     AssertLockHeld(cs_wallet);
     for (const auto& script : spks) {
-        m_cached_spks[script].push_back(spkm);
+        auto& managers{m_cached_spks[script]};
+        if (std::find(managers.begin(), managers.end(), spkm) == managers.end()) managers.push_back(spkm);
     }
 }
 
-void CWallet::TopUpCallback(const std::set<CScript>& spks, ScriptPubKeyMan* spkm)
+void CWallet::EraseTopUpPublication(TopUpPublicationId id)
+{
+    AssertLockHeld(m_topup_pub_mutex);
+    const auto publication_it{m_topup_publications.find(id)};
+    if (publication_it == m_topup_publications.end()) return;
+    for (const CScript& script : publication_it->second.scripts) {
+        const auto script_it{m_topup_publications_by_script.find(script)};
+        if (script_it == m_topup_publications_by_script.end()) continue;
+        std::erase(script_it->second, id);
+        if (script_it->second.empty()) m_topup_publications_by_script.erase(script_it);
+    }
+    m_topup_publications.erase(publication_it);
+}
+
+std::vector<ScriptPubKeyMan*> CWallet::GetCommittedTopUpScriptPubKeyMans(const CScript& script) const NO_THREAD_SAFETY_ANALYSIS
+{
+    AssertLockHeld(cs_wallet);
+    WAIT_LOCK(m_topup_pub_mutex, lock);
+    m_topup_pub_cv.wait(lock, [&]() EXCLUSIVE_LOCKS_REQUIRED(m_topup_pub_mutex) {
+        const auto script_it{m_topup_publications_by_script.find(script)};
+        if (script_it == m_topup_publications_by_script.end()) return true;
+        return std::none_of(script_it->second.begin(), script_it->second.end(), [&](TopUpPublicationId id) EXCLUSIVE_LOCKS_REQUIRED(m_topup_pub_mutex) {
+            const auto publication_it{m_topup_publications.find(id)};
+            return publication_it != m_topup_publications.end() && publication_it->second.state == TopUpPublicationState::COMMITTING;
+        });
+    });
+
+    std::vector<ScriptPubKeyMan*> managers;
+    const auto script_it{m_topup_publications_by_script.find(script)};
+    if (script_it == m_topup_publications_by_script.end()) return managers;
+    for (TopUpPublicationId id : script_it->second) {
+        const auto publication_it{m_topup_publications.find(id)};
+        if (publication_it == m_topup_publications.end()) continue;
+        const TopUpPublicationRecord& publication{publication_it->second};
+        if (publication.state != TopUpPublicationState::COMMITTED_PENDING_CACHE || publication.lifetime.expired()) continue;
+        if (std::find(managers.begin(), managers.end(), publication.spkm) == managers.end()) managers.push_back(publication.spkm);
+    }
+    return managers;
+}
+
+TopUpPublicationId CWallet::StageTopUpPublication(const std::set<CScript>& spks, ScriptPubKeyMan* spkm, std::weak_ptr<void> lifetime) NO_THREAD_SAFETY_ANALYSIS
+{
+    LOCK(m_topup_pub_mutex);
+    assert(m_next_topup_pub_id != INVALID_TOPUP_PUBLICATION_ID);
+    const TopUpPublicationId id{m_next_topup_pub_id++};
+    auto [publication_it, inserted]{m_topup_publications.emplace(id, TopUpPublicationRecord{spkm, std::move(lifetime), spks})};
+    assert(inserted);
+    try {
+        for (const CScript& script : spks) {
+            m_topup_publications_by_script[script].push_back(id);
+        }
+    } catch (...) {
+        EraseTopUpPublication(id);
+        throw;
+    }
+    return id;
+}
+
+void CWallet::BeginTopUpCommit(TopUpPublicationId id) NO_THREAD_SAFETY_ANALYSIS
+{
+    LOCK(m_topup_pub_mutex);
+    const auto it{m_topup_publications.find(id)};
+    assert(it != m_topup_publications.end());
+    assert(it->second.state == TopUpPublicationState::STAGED);
+    it->second.state = TopUpPublicationState::COMMITTING;
+}
+
+void CWallet::FinishTopUpCommit(TopUpPublicationId id, bool committed) NO_THREAD_SAFETY_ANALYSIS
+{
+    {
+        LOCK(m_topup_pub_mutex);
+        const auto it{m_topup_publications.find(id)};
+        if (it == m_topup_publications.end()) return;
+        assert(it->second.state == TopUpPublicationState::COMMITTING);
+        it->second.state = committed ? TopUpPublicationState::COMMITTED_PENDING_CACHE : TopUpPublicationState::STAGED;
+    }
+    m_topup_pub_cv.notify_all();
+}
+
+void CWallet::CancelTopUpPublication(TopUpPublicationId id) NO_THREAD_SAFETY_ANALYSIS
+{
+    if (id == INVALID_TOPUP_PUBLICATION_ID) return;
+    {
+        LOCK(m_topup_pub_mutex);
+        EraseTopUpPublication(id);
+    }
+    m_topup_pub_cv.notify_all();
+}
+
+bool CWallet::TopUpCallback(const std::set<CScript>& spks, ScriptPubKeyMan* spkm, TopUpPublicationId id) NO_THREAD_SAFETY_ANALYSIS
 {
     LOCK(cs_wallet);
+    if (id != INVALID_TOPUP_PUBLICATION_ID) {
+        LOCK(m_topup_pub_mutex);
+        const auto it{m_topup_publications.find(id)};
+        if (it == m_topup_publications.end()) return false;
+        assert(it->second.state == TopUpPublicationState::COMMITTED_PENDING_CACHE);
+        if (it->second.spkm != spkm || it->second.scripts != spks || it->second.lifetime.expired()) {
+            EraseTopUpPublication(id);
+            return false;
+        }
+        CacheNewScriptPubKeys(spks, spkm);
+        EraseTopUpPublication(id);
+        return true;
+    }
     // Update scriptPubKey cache
     CacheNewScriptPubKeys(spks, spkm);
+    return true;
 }
 
 std::set<CExtPubKey> CWallet::GetActiveHDPubKeys() const

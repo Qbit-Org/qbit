@@ -943,10 +943,17 @@ bool LegacyDataSPKM::DeleteRecordsWithDB(WalletBatch& batch)
 
 util::Result<CTxDestination> DescriptorScriptPubKeyMan::GetNewDestination(const OutputType type)
 {
+    return GetNewDestinationWithIndex(type, /*index=*/nullptr);
+}
+
+util::Result<CTxDestination> DescriptorScriptPubKeyMan::GetNewDestinationWithIndex(const OutputType type, int64_t* index)
+{
     // Returns true if this descriptor supports getting new addresses. Conditions where we may be unable to fetch them (e.g. locked) are caught later
     if (!CanGetAddresses()) {
         return util::Error{_("No addresses available")};
     }
+
+    bool top_up{false};
     {
         LOCK(cs_desc_man);
         assert(m_wallet_descriptor.descriptor->IsSingleType()); // This is a combo descriptor which should not be an active descriptor
@@ -955,33 +962,41 @@ util::Result<CTxDestination> DescriptorScriptPubKeyMan::GetNewDestination(const 
         if (type != *desc_addr_type) {
             throw std::runtime_error(std::string(__func__) + ": Types are inconsistent. Stored type does not match type of newly generated address");
         }
+        top_up = !m_deferred_create_keypool_top_up && !IsRangedP2MRDescriptorNoLock();
+    }
+    if (top_up) TopUp();
 
-        if (!m_deferred_create_keypool_top_up && !IsRangedP2MRDescriptorNoLock()) {
-            TopUp();
+    while (true) {
+        {
+            LOCK(cs_desc_man);
+            if (m_wallet_descriptor.next_index < m_wallet_descriptor.range_end) {
+                // Get the scriptPubKey from the descriptor and reserve its index
+                // atomically after any cache publication has completed.
+                FlatSigningProvider out_keys;
+                std::vector<CScript> scripts_temp;
+                if (!m_wallet_descriptor.descriptor->ExpandFromCache(m_wallet_descriptor.next_index, m_wallet_descriptor.cache, scripts_temp, out_keys)) {
+                    return util::Error{_("Error: Keypool ran out, please call keypoolrefill first")};
+                }
+
+                CTxDestination dest;
+                if (!ExtractDestination(scripts_temp[0], dest)) {
+                    return util::Error{_("Error: Cannot extract destination from the generated scriptpubkey")}; // shouldn't happen
+                }
+                if (index) *index = m_wallet_descriptor.next_index;
+                m_wallet_descriptor.next_index++;
+                if (IsRangedP2MRDescriptorNoLock() && !m_deferred_create_keypool_top_up) {
+                    m_wallet_descriptor.deferred_create_keypool_top_up = false;
+                }
+                WalletBatch(m_storage.GetDatabase()).WriteDescriptor(GetID(), m_wallet_descriptor);
+                return dest;
+            }
         }
 
-        // Get the scriptPubKey from the descriptor
-        FlatSigningProvider out_keys;
-        std::vector<CScript> scripts_temp;
-        if (m_wallet_descriptor.next_index >= m_wallet_descriptor.range_end && !TopUp(1)) {
-            // We can't generate anymore keys
+        // Another address consumer can exhaust the range after a top-up. Retry
+        // outside the descriptor lock instead of returning a spurious failure.
+        if (!TopUp(1)) {
             return util::Error{_("Error: Keypool ran out, please call keypoolrefill first")};
         }
-        if (!m_wallet_descriptor.descriptor->ExpandFromCache(m_wallet_descriptor.next_index, m_wallet_descriptor.cache, scripts_temp, out_keys)) {
-            // We can't generate anymore keys
-            return util::Error{_("Error: Keypool ran out, please call keypoolrefill first")};
-        }
-
-        CTxDestination dest;
-        if (!ExtractDestination(scripts_temp[0], dest)) {
-            return util::Error{_("Error: Cannot extract destination from the generated scriptpubkey")}; // shouldn't happen
-        }
-        m_wallet_descriptor.next_index++;
-        if (IsRangedP2MRDescriptorNoLock() && !m_deferred_create_keypool_top_up) {
-            m_wallet_descriptor.deferred_create_keypool_top_up = false;
-        }
-        WalletBatch(m_storage.GetDatabase()).WriteDescriptor(GetID(), m_wallet_descriptor);
-        return dest;
     }
 }
 
@@ -1089,13 +1104,10 @@ bool DescriptorScriptPubKeyMan::Encrypt(const CKeyingMaterial& master_key, Walle
 
 util::Result<CTxDestination> DescriptorScriptPubKeyMan::GetReservedDestination(const OutputType type, bool internal, int64_t& index, bool allow_internal_p2mr_refill)
 {
-    LOCK(cs_desc_man);
     if (internal && allow_internal_p2mr_refill) {
         MaybeTopUpInternalP2MRKeyPool();
     }
-    auto op_dest = GetNewDestination(type);
-    index = m_wallet_descriptor.next_index - 1;
-    return op_dest;
+    return GetNewDestinationWithIndex(type, &index);
 }
 
 void DescriptorScriptPubKeyMan::ReturnDestination(int64_t index, bool internal, const CTxDestination& addr)
@@ -1231,14 +1243,36 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithInternalHintResult(std::o
             return util::Error{util::ErrorString(res)};
         }
         change = *res;
-        if (!batch.TxnCommit()) {
+        try {
+            change->publication_id = m_storage.StageTopUpPublication(change->new_spks, this, change->lifetime);
+            m_storage.BeginTopUpCommit(change->publication_id);
+        } catch (...) {
+            if (batch.HasActiveTxn()) batch.TxnAbort();
+            RollbackTopUp(*change->rollback_state);
+            throw;
+        }
+
+        bool committed{false};
+        try {
+            committed = batch.TxnCommit();
+        } catch (...) {
+            m_storage.FinishTopUpCommit(change->publication_id, /*committed=*/false);
+            if (batch.HasActiveTxn()) batch.TxnAbort();
+            m_storage.CancelTopUpPublication(change->publication_id);
+            RollbackTopUp(*change->rollback_state);
+            throw;
+        }
+        if (!committed) {
+            m_storage.FinishTopUpCommit(change->publication_id, /*committed=*/false);
             const bool aborted{!batch.HasActiveTxn() || batch.TxnAbort()};
+            m_storage.CancelTopUpPublication(change->publication_id);
             RollbackTopUp(*change->rollback_state);
             if (!aborted) {
                 throw std::runtime_error(strprintf("Error during descriptors keypool top up. Cannot abort changes after commit failure for wallet [%s]", m_storage.LogName()));
             }
             throw std::runtime_error(strprintf("Error during descriptors keypool top up. Cannot commit changes for wallet [%s]", m_storage.LogName()));
         }
+        m_storage.FinishTopUpCommit(change->publication_id, /*committed=*/true);
     }
 
     PublishTopUp(*change);
@@ -1259,14 +1293,20 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBResult(WalletBatch& bat
         util::Result<std::shared_ptr<TopUpChange>> res{TopUpWithDBPreparedResult(batch, size, prepared, throw_on_persistence_error, rollback_state_on_error || batch.HasActiveTxn())};
         if (!res) return util::Error{util::ErrorString(res)};
         change = *res;
-        if (batch.HasActiveTxn()) {
-            try {
+        try {
+            change->publication_id = m_storage.StageTopUpPublication(change->new_spks, this, change->lifetime);
+            if (batch.HasActiveTxn()) {
                 RegisterTopUpTxnListener(batch, change);
-            } catch (...) {
-                RollbackTopUp(*change->rollback_state);
-                throw;
+                return {};
             }
-            return {};
+            // Without a caller-owned transaction, every successful write is
+            // already durable when TopUpWithDBPreparedResult() returns.
+            m_storage.BeginTopUpCommit(change->publication_id);
+            m_storage.FinishTopUpCommit(change->publication_id, /*committed=*/true);
+        } catch (...) {
+            m_storage.CancelTopUpPublication(change->publication_id);
+            RollbackTopUp(*change->rollback_state);
+            throw;
         }
     }
 
@@ -1497,6 +1537,7 @@ util::Result<std::shared_ptr<DescriptorScriptPubKeyMan::TopUpChange>> Descriptor
     auto change{std::make_shared<TopUpChange>()};
     change->new_spks = std::move(new_spks);
     change->rollback_state = std::move(rollback_state);
+    change->lifetime = m_lifetime;
     return change;
 }
 
@@ -1540,26 +1581,40 @@ void DescriptorScriptPubKeyMan::RollbackTopUp(const TopUpRollbackState& state)
 
 void DescriptorScriptPubKeyMan::PublishTopUp(const TopUpChange& change)
 {
-    m_storage.TopUpCallback(change.new_spks, this);
-    NotifyCanGetAddressesChanged();
+    AssertLockNotHeld(cs_desc_man);
+    if (m_storage.TopUpCallback(change.new_spks, this, change.publication_id)) {
+        NotifyCanGetAddressesChanged();
+    }
 }
 
 void DescriptorScriptPubKeyMan::RegisterTopUpTxnListener(WalletBatch& batch, const std::shared_ptr<TopUpChange>& change)
 {
-    const std::weak_ptr<void> lifetime{m_lifetime};
     DescriptorScriptPubKeyMan* const self{this};
     WalletStorage* const storage{&m_storage};
     batch.RegisterTxnListener({
-        .on_commit = [self, storage, change, lifetime] {
+        .on_commit_prepare = [storage, change] {
+            storage->BeginTopUpCommit(change->publication_id);
+        },
+        .on_commit_success = [storage, change] {
+            storage->FinishTopUpCommit(change->publication_id, /*committed=*/true);
+        },
+        .on_commit_failure = [storage, change] {
+            storage->FinishTopUpCommit(change->publication_id, /*committed=*/false);
+        },
+        .on_commit = [self, storage, change] {
             storage->WithWalletLock([&] {
-                if (lifetime.expired()) return true;
+                if (change->lifetime.expired()) {
+                    storage->CancelTopUpPublication(change->publication_id);
+                    return true;
+                }
                 self->PublishTopUp(*change);
                 return true;
             });
         },
-        .on_abort = [self, storage, change, lifetime] {
+        .on_abort = [self, storage, change] {
+            storage->CancelTopUpPublication(change->publication_id);
             storage->WithWalletLock([&] {
-                if (lifetime.expired()) return true;
+                if (change->lifetime.expired()) return true;
                 LOCK(self->cs_desc_man);
                 self->RollbackTopUp(*change->rollback_state);
                 return true;
@@ -1742,29 +1797,33 @@ bool DescriptorScriptPubKeyMan::AddDescriptorPQCKeyWithDB(WalletBatch& batch, co
 
 bool DescriptorScriptPubKeyMan::SetupDescriptorGeneration(WalletBatch& batch, const CExtKey& master_key, OutputType addr_type, bool internal, unsigned int initial_keypool_size)
 {
-    LOCK(cs_desc_man);
-    assert(m_storage.IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS));
+    unsigned int top_up_size;
+    {
+        LOCK(cs_desc_man);
+        assert(m_storage.IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS));
 
-    // Ignore when there is already a descriptor
-    if (m_wallet_descriptor.descriptor) {
-        return false;
+        // Ignore when there is already a descriptor
+        if (m_wallet_descriptor.descriptor) {
+            return false;
+        }
+
+        m_wallet_descriptor = GenerateWalletDescriptor(master_key.Neuter(), addr_type, internal);
+
+        // Store the master private key, and descriptor
+        if (!AddDescriptorKeyWithDB(batch, master_key.key, master_key.key.GetPubKey())) {
+            throw std::runtime_error(std::string(__func__) + ": writing descriptor master private key failed");
+        }
+        if (!batch.WriteDescriptor(GetID(), m_wallet_descriptor)) {
+            throw std::runtime_error(std::string(__func__) + ": writing descriptor failed");
+        }
+
+        // Wallet creation on P2MR-only chains seeds a small synchronous pool first,
+        // then refills the remainder after create returns.
+        m_deferred_create_keypool_top_up = initial_keypool_size > 0 && initial_keypool_size < m_keypool_size;
+        m_wallet_descriptor.deferred_create_keypool_top_up = m_deferred_create_keypool_top_up;
+        top_up_size = m_deferred_create_keypool_top_up ? initial_keypool_size : 0;
     }
 
-    m_wallet_descriptor = GenerateWalletDescriptor(master_key.Neuter(), addr_type, internal);
-
-    // Store the master private key, and descriptor
-    if (!AddDescriptorKeyWithDB(batch, master_key.key, master_key.key.GetPubKey())) {
-        throw std::runtime_error(std::string(__func__) + ": writing descriptor master private key failed");
-    }
-    if (!batch.WriteDescriptor(GetID(), m_wallet_descriptor)) {
-        throw std::runtime_error(std::string(__func__) + ": writing descriptor failed");
-    }
-
-    // Wallet creation on P2MR-only chains seeds a small synchronous pool first,
-    // then refills the remainder after create returns.
-    m_deferred_create_keypool_top_up = initial_keypool_size > 0 && initial_keypool_size < m_keypool_size;
-    m_wallet_descriptor.deferred_create_keypool_top_up = m_deferred_create_keypool_top_up;
-    const unsigned int top_up_size = m_deferred_create_keypool_top_up ? initial_keypool_size : 0;
     TopUpWithDB(batch, top_up_size, internal);
 
     m_storage.UnsetBlankWalletFlag(batch);
@@ -1815,20 +1874,24 @@ bool DescriptorScriptPubKeyMan::NeedsP2MRKeyPoolRefillNoLock() const
 
 void DescriptorScriptPubKeyMan::MaybeTopUpInternalP2MRKeyPool()
 {
-    AssertLockHeld(cs_desc_man);
-    if (m_storage.IsLocked() || !NeedsP2MRKeyPoolRefillNoLock()) return;
-
-    const unsigned int target{GetP2MRReceiveKeyPoolRefillStepTargetNoLock()};
-    if (target == 0) return;
+    unsigned int target;
+    std::string descriptor_id;
+    {
+        LOCK(cs_desc_man);
+        if (m_storage.IsLocked() || !NeedsP2MRKeyPoolRefillNoLock()) return;
+        target = GetP2MRReceiveKeyPoolRefillStepTargetNoLock();
+        if (target == 0) return;
+        descriptor_id = GetID().ToString();
+    }
     try {
         util::Result<void> res{TopUpWithInternalHintResult(/*internal_hint=*/true, target)};
         if (!res) {
             WalletLogPrintf("P2MR change keypool inline low-watermark refill failed (descriptor id %s, target=%u, remaining=%u): %s\n",
-                GetID().ToString(), target, GetKeyPoolSizeNoLock(), util::ErrorString(res).original);
+                descriptor_id, target, GetKeyPoolSize(), util::ErrorString(res).original);
         }
     } catch (const std::exception& e) {
         WalletLogPrintf("P2MR change keypool inline low-watermark refill failed (descriptor id %s, target=%u, remaining=%u): %s\n",
-            GetID().ToString(), target, GetKeyPoolSizeNoLock(), e.what());
+            descriptor_id, target, GetKeyPoolSize(), e.what());
     }
 }
 

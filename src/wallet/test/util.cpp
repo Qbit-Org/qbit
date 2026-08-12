@@ -256,10 +256,13 @@ bool MockableBatch::TxnBegin()
 bool MockableBatch::TxnCommit()
 {
     ++m_database.m_txn_commit_count;
-    if (!m_txn_active || !m_database.m_pass || !m_database.m_txn_commit_pass) return false;
-    m_txn_snapshot.reset();
-    m_txn_active = false;
-    return true;
+    const bool success{m_txn_active && m_database.m_pass && m_database.m_txn_commit_pass};
+    if (success) {
+        m_txn_snapshot.reset();
+        m_txn_active = false;
+    }
+    if (m_database.m_txn_commit_result_hook) m_database.m_txn_commit_result_hook(success);
+    return success;
 }
 
 bool MockableBatch::TxnAbort()
