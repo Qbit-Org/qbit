@@ -21,6 +21,7 @@ from test_framework.key import sign_schnorr, tweak_add_privkey
 from test_framework.messages import CTxOut, from_binary
 from test_framework.psbt import (
     PSBT,
+    PSBT_GLOBAL_UNSIGNED_TX,
     PSBT_IN_SIGHASH_TYPE,
     PSBT_IN_TAP_KEY_SIG,
     PSBT_IN_WITNESS_UTXO,
@@ -86,8 +87,19 @@ def signtx(args):
     if args.fingerprint != "00000001":
         return sys.stdout.write(json.dumps({"error": "Unexpected fingerprint", "fingerprint": args.fingerprint}))
 
-    if os.path.isfile(os.path.join(os.getcwd(), "mock_sign_taproot")):
+    mock_sign_taproot = os.path.join(os.getcwd(), "mock_sign_taproot")
+    if os.path.isfile(mock_sign_taproot):
+        with open(mock_sign_taproot, "r", encoding="utf8") as f:
+            signer_mode = f.read()
+        assert signer_mode in {"", "output", "sequence"}
+
         psbt = PSBT.from_base64(args.psbt)
+        if signer_mode == "output":
+            psbt.tx.vout[0].nValue -= 1
+        elif signer_mode == "sequence":
+            psbt.tx.vin[0].nSequence ^= 1
+        psbt.g.map[PSBT_GLOBAL_UNSIGNED_TX] = psbt.tx.serialize_without_witness()
+
         spent_outputs = [from_binary(CTxOut, tx_input.map[PSBT_IN_WITNESS_UTXO]) for tx_input in psbt.i]
         tweaked_key = tweak_add_privkey(TAPROOT_RECEIVE_KEY, TAPROOT_RECEIVE_INFO.tweak)
         for index in range(len(psbt.i)):
