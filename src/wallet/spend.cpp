@@ -140,6 +140,7 @@ int CalculateMaximumSignedInputSize(const CTxOut& txout, const CWallet* wallet, 
 static std::unique_ptr<Descriptor> GetDescriptor(const CWallet* wallet, const CCoinControl* coin_control,
                                                  const CScript script_pubkey)
 {
+    LOCK(wallet->cs_wallet);
     MultiSigningProvider providers;
     for (const auto spkman: wallet->GetScriptPubKeyMans(script_pubkey)) {
         providers.AddProvider(spkman->GetSolvingProvider(script_pubkey));

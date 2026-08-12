@@ -23,19 +23,21 @@ using common::PSBTError;
 namespace wallet {
 bool ExternalSignerScriptPubKeyMan::SetupDescriptor(WalletBatch& batch, std::unique_ptr<Descriptor> desc)
 {
-    LOCK(cs_desc_man);
-    assert(m_storage.IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS));
-    assert(m_storage.IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER));
+    {
+        LOCK(cs_desc_man);
+        assert(m_storage.IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS));
+        assert(m_storage.IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER));
 
-    int64_t creation_time = GetTime();
+        int64_t creation_time = GetTime();
 
-    // Make the descriptor
-    WalletDescriptor w_desc(std::move(desc), creation_time, 0, 0, 0);
-    m_wallet_descriptor = w_desc;
+        // Make the descriptor
+        WalletDescriptor w_desc(std::move(desc), creation_time, 0, 0, 0);
+        m_wallet_descriptor = w_desc;
 
-    // Store the descriptor
-    if (!batch.WriteDescriptor(GetID(), m_wallet_descriptor)) {
-        throw std::runtime_error(std::string(__func__) + ": writing descriptor failed");
+        // Store the descriptor
+        if (!batch.WriteDescriptor(GetID(), m_wallet_descriptor)) {
+            throw std::runtime_error(std::string(__func__) + ": writing descriptor failed");
+        }
     }
 
     // TopUp

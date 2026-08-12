@@ -116,9 +116,13 @@ class TestBitcoinCli(BitcoinTestFramework):
         initial_balance = (BLOCKS - COINBASE_MATURITY) * block_subsidy
 
         self.log.info("Compare responses from getblockchaininfo RPC and `qbit-cli getblockchaininfo`")
-        cli_response = self.nodes[0].cli.getblockchaininfo()
-        rpc_response = self.nodes[0].getblockchaininfo()
-        assert_equal(cli_response, rpc_response)
+        self.nodes[0].setmocktime(int(time.time()))
+        try:
+            cli_response = self.nodes[0].cli.getblockchaininfo()
+            rpc_response = self.nodes[0].getblockchaininfo()
+            assert_equal(cli_response, rpc_response)
+        finally:
+            self.nodes[0].setmocktime(0)
 
         self.log.info("Test named arguments")
         assert_equal(self.nodes[0].cli.echo(0, 1, arg3=3, arg5=5), ['0', '1', None, '3', None, '5'])
