@@ -71,15 +71,26 @@ BOOST_AUTO_TEST_CASE(external_signer_honors_cancellation_at_command_boundary)
     BOOST_CHECK_EQUAL(progress_calls, 3);
 }
 
-BOOST_AUTO_TEST_CASE(p2mr_signing_releases_wallet_lock)
+BOOST_AUTO_TEST_CASE(p2mr_parallel_signing_releases_wallet_lock_mid_batch)
 {
     using namespace std::chrono_literals;
     using namespace wallet_p2mr_test;
-    struct AbortBeforeCryptographicSigning {};
+
+    struct ResumeSigningGuard {
+        std::promise<void>& promise;
+        std::atomic_bool released{false};
+
+        void Release()
+        {
+            if (!released.exchange(true)) promise.set_value();
+        }
+
+        ~ResumeSigningGuard() { Release(); }
+    };
 
     m_node.args->ForceSetArg("-walletpqcparallel", "1");
     m_node.args->ForceSetArg("-walletpqcsignthreads", "1");
-    auto workload{MakeDistinctKeyP2MRSigningWorkload(*m_node.chain, /*input_count=*/1)};
+    auto workload{MakeDistinctKeyP2MRSigningWorkload(*m_node.chain, /*input_count=*/2)};
 
     CMutableTransaction funding_tx;
     funding_tx.vout.resize(workload.coins.size());
@@ -95,30 +106,39 @@ BOOST_AUTO_TEST_CASE(p2mr_signing_releases_wallet_lock)
     std::future<void> paused_future{signing_paused.get_future()};
     std::promise<void> resume_signing;
     std::shared_future<void> resume_future{resume_signing.get_future()};
+    ResumeSigningGuard resume_guard{resume_signing};
     std::atomic_bool pause_reported{false};
     auto sign_future{std::async(std::launch::async, [&] {
         return feebumper::SignTransaction(*workload.wallet, workload.spend_tx, {}, [&](const SigningProgress& progress) {
-            if (progress.phase == SigningProgressPhase::RESERVING_PQC_COUNTERS && !progress.cancellable &&
-                !pause_reported.exchange(true)) {
+            if (progress.phase == SigningProgressPhase::SIGNING_INPUTS && !progress.cancellable &&
+                progress.completed == 1 && progress.input_index.has_value() && !pause_reported.exchange(true)) {
                 signing_paused.set_value();
                 resume_future.wait();
-                throw AbortBeforeCryptographicSigning{};
             }
             return true;
         });
     })};
 
     if (paused_future.wait_for(5s) != std::future_status::ready) {
-        resume_signing.set_value();
+        resume_guard.Release();
         BOOST_FAIL("Timed out waiting for fee-bump signing pause");
+    }
+
+    BOOST_REQUIRE_EQUAL(workload.pubkeys.size(), 2U);
+    for (size_t input_index{0}; input_index < workload.pubkeys.size(); ++input_index) {
+        BOOST_CHECK_EQUAL(GetProviderPQCCounter(*workload.p2mr_spk_man, workload.pubkeys.at(input_index).descriptor_pubkey, workload.pubkeys.at(input_index).pqc_pubkey), 1U);
+        BOOST_CHECK(workload.spend_tx.vin.at(input_index).scriptWitness.IsNull());
     }
     {
         TRY_LOCK(workload.wallet->cs_wallet, wallet_lock);
         BOOST_CHECK(static_cast<bool>(wallet_lock));
     }
 
-    resume_signing.set_value();
-    BOOST_CHECK_THROW(sign_future.get(), AbortBeforeCryptographicSigning);
+    resume_guard.Release();
+    BOOST_REQUIRE(sign_future.get());
+    for (const CTxIn& input : workload.spend_tx.vin) {
+        BOOST_CHECK(!input.scriptWitness.IsNull());
+    }
 }
 
 BOOST_AUTO_TEST_CASE(commit_revalidates_fee_after_signing)
