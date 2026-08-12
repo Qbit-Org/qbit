@@ -14,6 +14,7 @@ from test_framework.util import (
     assert_raises_rpc_error,
     wallet_importprivkey,
 )
+from test_framework.wallet import MiniWallet
 from test_framework.wallet_util import generate_keypair
 
 from decimal import Decimal
@@ -44,6 +45,7 @@ class ListSinceBlockTest(BitcoinTestFramework):
         self.test_targetconfirmations()
         self.test_desc()
         self.test_send_to_self()
+        self.test_watchonly_send_to_self()
         self.test_op_return()
         self.test_label()
 
@@ -452,25 +454,110 @@ class ListSinceBlockTest(BitcoinTestFramework):
         assert_equal(coin_b["parent_descs"][0], multi_b)
 
     def test_send_to_self(self):
-        """We can make listsinceblock output our change outputs."""
-        self.log.info("Test the inclusion of change outputs in the output.")
+        """Fee-bearing change-only transactions remain visible without listing change."""
+        self.log.info("Test fee-only history for a spendable wallet change-only transaction.")
 
         # Create a UTxO paying to one of our change addresses.
         block_hash = self.nodes[2].getbestblockhash()
+        balance_before = self.nodes[2].getbalance()
         addr = self.nodes[2].getrawchangeaddress()
-        self.nodes[2].sendtoaddress(addr, 1)
+        txid = self.nodes[2].sendtoaddress(addr, 1)
+        assert_equal(self.nodes[2].getbalance() - balance_before, self.nodes[2].gettransaction(txid)["fee"])
+        self.sync_mempools()
+        self.generate(self.nodes[0], 1)
 
-        # If we don't list change, we won't have an entry for it.
-        coins = self.nodes[2].listsinceblock(blockhash=block_hash)["transactions"]
-        assert not any(c["address"] == addr for c in coins)
+        self.assert_fee_only_history(
+            wallet=self.nodes[2],
+            txid=txid,
+            block_hash=block_hash,
+        )
+
+        # The fee-only entry is transaction-level and does not expose a change
+        # address, while the real output records remain available on request.
+        default_entries = self.nodes[2].listsinceblock(blockhash=block_hash)["transactions"]
+        assert not any(entry.get("address") == addr for entry in default_entries)
 
         # Now if we list change, we'll get both the send (to a change address) and
         # the actual change.
         res = self.nodes[2].listsinceblock(blockhash=block_hash, include_change=True)
-        coins = [entry for entry in res["transactions"] if entry["category"] == "receive"]
+        coins = [entry for entry in res["transactions"] if entry["txid"] == txid and entry["category"] == "receive"]
         assert_equal(len(coins), 2)
         assert any(c["address"] == addr for c in coins)
         assert all(self.nodes[2].getaddressinfo(c["address"])["ischange"] for c in coins)
+
+    def test_watchonly_send_to_self(self):
+        self.log.info("Test fee-only history for a watch-only change-only transaction.")
+
+        miniwallet = MiniWallet(self.nodes[2], tag_name="change-only-history")
+        self.nodes[2].createwallet(wallet_name="change_only_watch", disable_private_keys=True, blank=True)
+        watch_wallet = self.nodes[2].get_wallet_rpc("change_only_watch")
+        result = watch_wallet.importdescriptors([{
+            "desc": miniwallet.get_descriptor(),
+            "internal": True,
+            "timestamp": "now",
+        }])
+        assert_equal(result[0]["success"], True)
+
+        funding_wallet = self.nodes[2].get_wallet_rpc(self.default_wallet_name)
+        funding_wallet.sendtoaddress(miniwallet.get_address(), 1)
+        self.sync_mempools()
+        self.generate(self.nodes[0], 1)
+        self.nodes[2].syncwithvalidationinterfacequeue()
+        miniwallet.rescan_utxos()
+        assert_equal(watch_wallet.getbalance(), 1)
+
+        block_hash = self.nodes[2].getbestblockhash()
+        balance_before = watch_wallet.getbalance()
+        transfer = miniwallet.send_self_transfer(from_node=self.nodes[2], fee=Decimal("0.001"))
+        self.nodes[2].syncwithvalidationinterfacequeue()
+        assert_equal(watch_wallet.getbalance() - balance_before, watch_wallet.gettransaction(transfer["txid"])["fee"])
+        self.sync_mempools()
+        self.generate(self.nodes[0], 1)
+
+        self.assert_fee_only_history(
+            wallet=watch_wallet,
+            txid=transfer["txid"],
+            block_hash=block_hash,
+        )
+        self.nodes[2].unloadwallet("change_only_watch")
+
+    def assert_fee_only_history(self, *, wallet, txid, block_hash):
+        tx = wallet.gettransaction(txid=txid, verbose=True)
+        assert tx["fee"] < 0
+        assert_equal(tx["amount"], 0)
+
+        def check_entry(entry):
+            assert_equal(entry["category"], "send")
+            assert_equal(entry["amount"], 0)
+            assert_equal(entry["fee"], tx["fee"])
+            assert "address" not in entry
+            assert "label" not in entry
+            assert "vout" not in entry
+
+        details = tx["details"]
+        assert_equal(len(details), 1)
+        check_entry(details[0])
+
+        listed = [entry for entry in wallet.listtransactions("*", 1000) if entry["txid"] == txid]
+        assert_equal(len(listed), 1)
+        check_entry(listed[0])
+
+        since = [entry for entry in wallet.listsinceblock(blockhash=block_hash)["transactions"] if entry["txid"] == txid]
+        assert_equal(len(since), 1)
+        check_entry(since[0])
+
+        with_change = [
+            entry for entry in wallet.listsinceblock(blockhash=block_hash, include_change=True)["transactions"]
+            if entry["txid"] == txid
+        ]
+        sent = {entry["vout"]: entry for entry in with_change if entry["category"] == "send"}
+        received = {entry["vout"]: entry for entry in with_change if entry["category"] == "receive"}
+        assert_equal(len(sent), len(tx["decoded"]["vout"]))
+        assert_equal(set(sent), set(received))
+        for vout, sent_entry in sent.items():
+            assert_equal(sent_entry["amount"], -received[vout]["amount"])
+            assert "address" in sent_entry
+            assert wallet.getaddressinfo(sent_entry["address"])["ischange"]
 
     def test_op_return(self):
         """Test if OP_RETURN outputs will be displayed correctly."""

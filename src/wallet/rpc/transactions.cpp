@@ -291,6 +291,32 @@ static void MaybePushAddress(UniValue & entry, const CTxDestination &dest)
     }
 }
 
+template <class Vec>
+static void PushSentTransaction(const CWallet& wallet, const CWalletTx& wtx, const COutputEntry* sent,
+                                CAmount fee, bool include_long, Vec& ret)
+    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    UniValue entry(UniValue::VOBJ);
+    if (sent) {
+        MaybePushAddress(entry, sent->destination);
+    }
+    entry.pushKV("category", "send");
+    entry.pushKV("amount", ValueFromAmount(sent ? -sent->amount : 0));
+    if (sent) {
+        const auto* address_book_entry = wallet.FindAddressBookEntry(sent->destination);
+        if (address_book_entry) {
+            entry.pushKV("label", address_book_entry->GetLabel());
+        }
+        entry.pushKV("vout", sent->vout);
+    }
+    entry.pushKV("fee", ValueFromAmount(-fee));
+    if (include_long) {
+        WalletTxToJSON(wallet, wtx, entry);
+    }
+    entry.pushKV("abandoned", wtx.isAbandoned());
+    ret.push_back(std::move(entry));
+}
+
 /**
  * List transactions based on the given criteria.
  *
@@ -318,20 +344,14 @@ static void ListTransactions(const CWallet& wallet, const CWalletTx& wtx, int nM
     {
         for (const COutputEntry& s : listSent)
         {
-            UniValue entry(UniValue::VOBJ);
-            MaybePushAddress(entry, s.destination);
-            entry.pushKV("category", "send");
-            entry.pushKV("amount", ValueFromAmount(-s.amount));
-            const auto* address_book_entry = wallet.FindAddressBookEntry(s.destination);
-            if (address_book_entry) {
-                entry.pushKV("label", address_book_entry->GetLabel());
-            }
-            entry.pushKV("vout", s.vout);
-            entry.pushKV("fee", ValueFromAmount(-nFee));
-            if (fLong)
-                WalletTxToJSON(wallet, wtx, entry);
-            entry.pushKV("abandoned", wtx.isAbandoned());
-            ret.push_back(std::move(entry));
+            PushSentTransaction(wallet, wtx, &s, nFee, fLong, ret);
+        }
+
+        // With change excluded, an all-inputs-owned transaction whose every
+        // output is change has no real sent entry to carry its fee. Add one
+        // transaction-level entry without pretending it corresponds to a vout.
+        if (!include_change && listSent.empty() && nFee > 0 && AllInputsMine(wallet, *wtx.tx)) {
+            PushSentTransaction(wallet, wtx, /*sent=*/nullptr, nFee, fLong, ret);
         }
     }
 
@@ -430,17 +450,17 @@ RPCHelpMan listtransactions()
                     {
                         {RPCResult::Type::OBJ, "", "", Cat(Cat<std::vector<RPCResult>>(
                         {
-                            {RPCResult::Type::STR, "address",  /*optional=*/true, "The qbit address of the transaction (not returned if the output does not have an address, e.g. OP_RETURN null data)."},
+                            {RPCResult::Type::STR, "address",  /*optional=*/true, "The qbit address of the transaction (not returned for a fee-only internal transfer or if the output does not have an address, e.g. OP_RETURN null data)."},
                             {RPCResult::Type::STR, "category", "The transaction category.\n"
                                 "\"send\"                  Transactions sent.\n"
                                 "\"receive\"               Non-coinbase transactions received.\n"
                                 "\"generate\"              Coinbase transactions received with more than 100 confirmations.\n"
                                 "\"immature\"              Coinbase transactions received with 100 or fewer confirmations.\n"
                                 "\"orphan\"                Orphaned coinbase transactions received."},
-                            {RPCResult::Type::STR_AMOUNT, "amount", "The amount in " + CURRENCY_UNIT + ". This is negative for the 'send' category, and is positive\n"
+                            {RPCResult::Type::STR_AMOUNT, "amount", "The amount in " + CURRENCY_UNIT + ". This is negative for the 'send' category except a fee-only internal transfer, which is zero, and is positive\n"
                                 "for all other categories"},
                             {RPCResult::Type::STR, "label", /*optional=*/true, "A comment for the address/transaction, if any"},
-                            {RPCResult::Type::NUM, "vout", "the vout value"},
+                            {RPCResult::Type::NUM, "vout", /*optional=*/true, "The vout value. Not returned for a fee-only internal transfer."},
                             {RPCResult::Type::STR_AMOUNT, "fee", /*optional=*/true, "The amount of the fee in " + CURRENCY_UNIT + ". This is negative and only available for the\n"
                                  "'send' category of transactions."},
                         },
@@ -539,16 +559,16 @@ RPCHelpMan listsinceblock()
                         {
                             {RPCResult::Type::OBJ, "", "", Cat(Cat<std::vector<RPCResult>>(
                             {
-                                {RPCResult::Type::STR, "address",  /*optional=*/true, "The qbit address of the transaction (not returned if the output does not have an address, e.g. OP_RETURN null data)."},
+                                {RPCResult::Type::STR, "address",  /*optional=*/true, "The qbit address of the transaction (not returned for a fee-only internal transfer or if the output does not have an address, e.g. OP_RETURN null data)."},
                                 {RPCResult::Type::STR, "category", "The transaction category.\n"
                                     "\"send\"                  Transactions sent.\n"
                                     "\"receive\"               Non-coinbase transactions received.\n"
                                     "\"generate\"              Coinbase transactions received with more than 100 confirmations.\n"
                                     "\"immature\"              Coinbase transactions received with 100 or fewer confirmations.\n"
                                     "\"orphan\"                Orphaned coinbase transactions received."},
-                                {RPCResult::Type::STR_AMOUNT, "amount", "The amount in " + CURRENCY_UNIT + ". This is negative for the 'send' category, and is positive\n"
+                                {RPCResult::Type::STR_AMOUNT, "amount", "The amount in " + CURRENCY_UNIT + ". This is negative for the 'send' category except a fee-only internal transfer, which is zero, and is positive\n"
                                     "for all other categories"},
-                                {RPCResult::Type::NUM, "vout", "the vout value"},
+                                {RPCResult::Type::NUM, "vout", /*optional=*/true, "The vout value. Not returned for a fee-only internal transfer."},
                                 {RPCResult::Type::STR_AMOUNT, "fee", /*optional=*/true, "The amount of the fee in " + CURRENCY_UNIT + ". This is negative and only available for the\n"
                                      "'send' category of transactions."},
                             },
@@ -679,7 +699,7 @@ RPCHelpMan gettransaction()
                         {
                             {RPCResult::Type::OBJ, "", "",
                             {
-                                {RPCResult::Type::STR, "address", /*optional=*/true, "The qbit address involved in the transaction."},
+                                {RPCResult::Type::STR, "address", /*optional=*/true, "The qbit address involved in the transaction. Not returned for a fee-only internal transfer."},
                                 {RPCResult::Type::STR, "category", "The transaction category.\n"
                                     "\"send\"                  Transactions sent.\n"
                                     "\"receive\"               Non-coinbase transactions received.\n"
@@ -688,7 +708,7 @@ RPCHelpMan gettransaction()
                                     "\"orphan\"                Orphaned coinbase transactions received."},
                                 {RPCResult::Type::STR_AMOUNT, "amount", "The amount in " + CURRENCY_UNIT},
                                 {RPCResult::Type::STR, "label", /*optional=*/true, "A comment for the address/transaction, if any"},
-                                {RPCResult::Type::NUM, "vout", "the vout value"},
+                                {RPCResult::Type::NUM, "vout", /*optional=*/true, "The vout value. Not returned for a fee-only internal transfer."},
                                 {RPCResult::Type::STR_AMOUNT, "fee", /*optional=*/true, "The amount of the fee in " + CURRENCY_UNIT + ". This is negative and only available for the \n"
                                     "'send' category of transactions."},
                                 {RPCResult::Type::BOOL, "abandoned", "'true' if the transaction has been abandoned (inputs are respendable)."},

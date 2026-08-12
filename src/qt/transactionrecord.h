@@ -70,6 +70,7 @@ public:
         SendToOther,
         RecvWithAddress,
         RecvFromOther,
+        PaymentToSelf,
     };
 
     /** Number of confirmation recommended for accepting a transaction */
