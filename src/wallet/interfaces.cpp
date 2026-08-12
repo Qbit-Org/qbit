@@ -392,15 +392,23 @@ public:
         std::vector<bilingual_str>& errors,
         CAmount& old_fee,
         CAmount& new_fee,
-        CMutableTransaction& mtx) override
+        CMutableTransaction& mtx,
+        const SigningProgressCallback& progress_callback) override
     {
         std::vector<CTxOut> outputs; // just an empty list of new recipients for now
-        return feebumper::CreateRateBumpTransaction(*m_wallet.get(), txid, coin_control, errors, old_fee, new_fee, mtx, /* require_mine= */ true, outputs) == feebumper::Result::OK;
+        return feebumper::CreateRateBumpTransaction(*m_wallet.get(), txid, coin_control, errors, old_fee, new_fee, mtx, /* require_mine= */ true, outputs, /*original_change_index=*/std::nullopt, progress_callback) == feebumper::Result::OK;
     }
-    bool signBumpTransaction(CMutableTransaction& mtx) override
+    bool signBumpTransaction(CMutableTransaction& mtx,
+        wallet::PQCUsageReport* pqc_usage,
+        const SigningProgressCallback& progress_callback) override
     {
         if (GetPQCKeyValidationSigningError(*m_wallet)) return false;
-        return feebumper::SignTransaction(*m_wallet.get(), mtx);
+        PQCUsageRecorder pqc_usage_recorder;
+        const bool success{feebumper::SignTransaction(*m_wallet.get(), mtx, pqc_usage_recorder.GetObserver(), progress_callback)};
+        if (pqc_usage) {
+            *pqc_usage = BuildSigningPQCUsageReport(pqc_usage_recorder);
+        }
+        return success;
     }
     bool commitBumpTransaction(const Txid& txid,
         CMutableTransaction&& mtx,

@@ -1011,6 +1011,10 @@ static std::optional<bool> TrySignTransactionPQCParallel(
         input_errors[0] = _("Signing cancelled");
         return false;
     }
+    if (provider.pqc_counter_reservation_guard && !provider.pqc_counter_reservation_guard(reservation_total)) {
+        input_errors[0] = _("Signing cancelled");
+        return false;
+    }
 
     std::map<CPQCPubKey, PQCSignatureCounterRange> ranges;
     if (!provider.pqc_counter_batch_reserver(counts, ranges)) {
@@ -1656,6 +1660,28 @@ bool SignTransaction(CMutableTransaction& mtx, const SigningProvider* keystore, 
         return should_continue || !cancellable;
     };
 
+    bool pqc_reservation_canceled{false};
+    bool pqc_reservation_irreversible{false};
+    std::optional<FlatSigningProvider> guarded_provider;
+    if (const auto* flat_provider{dynamic_cast<const FlatSigningProvider*>(keystore)}; flat_provider && progress_callback) {
+        guarded_provider.emplace(*flat_provider);
+        const auto previous_guard{guarded_provider->pqc_counter_reservation_guard};
+        guarded_provider->pqc_counter_reservation_guard = [previous_guard, progress_callback, &pqc_reservation_canceled, &pqc_reservation_irreversible](unsigned int range_count) {
+            if (previous_guard && !previous_guard(range_count)) return false;
+            const bool should_continue{progress_callback({
+                .phase = SigningProgressPhase::RESERVING_PQC_COUNTERS,
+                .completed = 0,
+                .total = range_count,
+                .cancellable = false,
+            })};
+            if (pqc_reservation_irreversible) return true;
+            pqc_reservation_canceled = !should_continue;
+            pqc_reservation_irreversible = should_continue;
+            return should_continue;
+        };
+        keystore = &*guarded_provider;
+    }
+
     if (const auto* flat_provider{dynamic_cast<const FlatSigningProvider*>(keystore)}) {
         if (std::optional<bool> parallel_result = TrySignTransactionPQCParallel(mtx, *flat_provider, coins, nHashType, txdata, input_errors, progress_callback)) {
             return *parallel_result;
@@ -1704,6 +1730,10 @@ bool SignTransaction(CMutableTransaction& mtx, const SigningProvider* keystore, 
             ProduceSignature(*keystore, MutableTransactionSignatureCreator(mtx, i, amount, &txdata, nHashType), prevPubKey, sigdata);
             produce_time += SteadyClock::now() - produce_start;
             ++produce_attempts;
+        }
+        if (pqc_reservation_canceled) {
+            input_errors[i] = _("Signing cancelled");
+            return false;
         }
         pqc_counter_committed |= sigdata.p2mr_script_sigs.size() > p2mr_sigs_before;
 

@@ -32,6 +32,7 @@ struct ShortestVectorFirstComparator
 
 using PQCSignatureCounterObserver = std::function<void(const CPQCPubKey&, uint32_t, uint32_t)>;
 using PQCSignatureCounterReserver = std::function<bool(const CPQCPubKey&, uint32_t, uint32_t&, uint32_t&)>;
+using PQCSignatureCounterReservationGuard = std::function<bool(unsigned int)>;
 using PQCRawSigner = std::function<bool(const CPQCKey&, const uint256&, std::vector<unsigned char>&, uint32_t&)>;
 
 struct PQCSignatureCounterRange {
@@ -290,6 +291,8 @@ struct FlatSigningProvider final : public SigningProvider
     std::function<bool(const CPQCPubKey&, uint32_t, uint32_t)> pqc_counter_writer;
     PQCSignatureCounterReserver pqc_counter_reserver;
     PQCSignatureCounterBatchReserver pqc_counter_batch_reserver;
+    /** Called immediately before durable reservation. Returning false aborts without consuming a counter. */
+    PQCSignatureCounterReservationGuard pqc_counter_reservation_guard;
     PQCSignatureCounterObserver pqc_counter_observer;
     PQCRawSigner pqc_raw_signer;
     std::map<uint32_t, CPQCPubKey> p2mr_pubkeys; /** Map key expression index -> derived P2MR pubkey */
