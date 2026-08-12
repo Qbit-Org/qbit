@@ -4629,8 +4629,9 @@ LegacyDataSPKM* CWallet::GetLegacyDataSPKM() const
     return dynamic_cast<LegacyDataSPKM*>(it->second);
 }
 
-void CWallet::AddScriptPubKeyMan(const uint256& id, std::unique_ptr<ScriptPubKeyMan> spkm_man)
+void CWallet::AddScriptPubKeyMan(const uint256& id, std::unique_ptr<ScriptPubKeyMan> spkm_man) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
 {
+    AssertLockHeld(cs_wallet);
     // Add spkm_man to m_spk_managers before calling any method
     // that might access it.
     const auto& spkm = m_spk_managers[id] = std::move(spkm_man);
@@ -4645,7 +4646,7 @@ LegacyDataSPKM* CWallet::GetOrCreateLegacyDataSPKM()
     return GetLegacyDataSPKM();
 }
 
-void CWallet::SetupLegacyScriptPubKeyMan()
+void CWallet::SetupLegacyScriptPubKeyMan() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
 {
     if (!m_internal_spk_managers.empty() || !m_external_spk_managers.empty() || !m_spk_managers.empty() || IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS)) {
         return;
@@ -4689,7 +4690,7 @@ void CWallet::ConnectScriptPubKeyManNotifiers()
     }
 }
 
-DescriptorScriptPubKeyMan& CWallet::LoadDescriptorScriptPubKeyMan(uint256 id, WalletDescriptor& desc)
+DescriptorScriptPubKeyMan& CWallet::LoadDescriptorScriptPubKeyMan(uint256 id, WalletDescriptor& desc) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
 {
     DescriptorScriptPubKeyMan* spk_manager;
     if (IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER)) {

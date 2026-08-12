@@ -659,6 +659,32 @@ BOOST_AUTO_TEST_CASE(DescriptorTopUpWithDBPublishesOnExternalTransactionCommit)
     BOOST_CHECK_EQUAL(notifications, 1);
 }
 
+BOOST_AUTO_TEST_CASE(DescriptorSetupAbortIgnoresDestroyedManager)
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    LOCK(wallet.cs_wallet);
+    wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+
+    auto& database{GetMockableDatabase(wallet)};
+    database.ResetCounts();
+    database.m_wallet_flags_write_pass = false;
+
+    {
+        WalletBatch batch{wallet.GetDatabase()};
+        BOOST_REQUIRE(batch.TxnBegin());
+        CExtKey master_key;
+        master_key.SetSeed(GenerateRandomKey());
+
+        BOOST_CHECK_THROW(
+            wallet.SetupDescriptorScriptPubKeyMan(batch, master_key, OutputType::BECH32, /*internal=*/false),
+            std::runtime_error);
+        BOOST_CHECK(batch.HasActiveTxn());
+        BOOST_CHECK(wallet.GetAllScriptPubKeyMans().empty());
+    }
+
+    BOOST_CHECK_EQUAL(database.m_txn_abort_count, 1);
+}
+
 BOOST_AUTO_TEST_CASE(DescriptorTopUpCacheSupportsConcurrentReaders)
 {
     CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());

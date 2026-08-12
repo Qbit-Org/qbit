@@ -167,11 +167,15 @@ bool MockableBatch::ReadKey(DataStream&& key, DataStream& value)
 bool MockableBatch::WriteKey(DataStream&& key, DataStream&& value, bool overwrite)
 {
     ++m_database.m_write_count;
+    SerializeData key_data{key.begin(), key.end()};
+    DataStream wallet_flags_key;
+    wallet_flags_key << DBKeys::FLAGS;
+    const bool is_wallet_flags_key{key_data == SerializeData{wallet_flags_key.begin(), wallet_flags_key.end()}};
     if (!m_database.m_pass || !m_database.m_write_pass ||
+        (!m_database.m_wallet_flags_write_pass && is_wallet_flags_key) ||
         (m_database.m_write_fail_after >= 0 && m_database.m_write_count > m_database.m_write_fail_after)) {
         return false;
     }
-    SerializeData key_data{key.begin(), key.end()};
     SerializeData value_data{value.begin(), value.end()};
     auto [it, inserted] = m_database.m_records.emplace(key_data, value_data);
     if (!inserted && overwrite) { // Overwrite if requested

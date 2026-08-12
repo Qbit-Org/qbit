@@ -1233,7 +1233,7 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithInternalHintResult(std::o
         change = *res;
         if (!batch.TxnCommit()) {
             const bool aborted{!batch.HasActiveTxn() || batch.TxnAbort()};
-            change->rollback();
+            RollbackTopUp(*change->rollback_state);
             if (!aborted) {
                 throw std::runtime_error(strprintf("Error during descriptors keypool top up. Cannot abort changes after commit failure for wallet [%s]", m_storage.LogName()));
             }
@@ -1263,7 +1263,7 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBResult(WalletBatch& bat
             try {
                 RegisterTopUpTxnListener(batch, change);
             } catch (...) {
-                change->rollback();
+                RollbackTopUp(*change->rollback_state);
                 throw;
             }
             return {};
@@ -1277,22 +1277,6 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBResult(WalletBatch& bat
 util::Result<std::shared_ptr<DescriptorScriptPubKeyMan::TopUpChange>> DescriptorScriptPubKeyMan::TopUpWithDBPreparedResult(WalletBatch& batch, unsigned int size, const TopUpPreparation& prepared, bool throw_on_persistence_error, bool rollback_state_on_error)
 {
     AssertLockHeld(cs_desc_man);
-    struct OldPQCKeyState {
-        std::optional<CPQCKey> key;
-        std::optional<CryptedPQCKeyRecord> crypted_key;
-        std::optional<uint32_t> sig_counter;
-    };
-    struct TopUpRollbackState {
-        int32_t old_range_start;
-        int32_t old_range_end;
-        std::optional<bool> old_descriptor_deferred_create_keypool_top_up;
-        int32_t old_max_cached_index;
-        bool old_deferred_create_keypool_top_up;
-        DescriptorCache added_cache_items;
-        std::map<CScript, std::optional<int32_t>> old_script_pub_key_values;
-        std::set<CPubKey> added_pubkeys;
-        std::map<CPQCPubKey, OldPQCKeyState> old_pqc_key_values;
-    };
     auto rollback_state{std::make_shared<TopUpRollbackState>(
         m_wallet_descriptor.range_start,
         m_wallet_descriptor.range_end,
@@ -1311,7 +1295,7 @@ util::Result<std::shared_ptr<DescriptorScriptPubKeyMan::TopUpChange>> Descriptor
     };
     const auto remember_pqc_key = [&](const CPQCPubKey& pubkey) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man) {
         if (old_pqc_key_values.contains(pubkey)) return;
-        OldPQCKeyState state;
+        TopUpOldPQCKeyState state;
         if (const auto it = m_map_pqc_keys.find(pubkey); it != m_map_pqc_keys.end()) {
             state.key = it->second;
         }
@@ -1323,44 +1307,9 @@ util::Result<std::shared_ptr<DescriptorScriptPubKeyMan::TopUpChange>> Descriptor
         }
         old_pqc_key_values.emplace(pubkey, std::move(state));
     };
-    const auto restore_top_up_state = [this, rollback_state]() EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man) {
-        m_wallet_descriptor.range_start = rollback_state->old_range_start;
-        m_wallet_descriptor.range_end = rollback_state->old_range_end;
-        m_wallet_descriptor.deferred_create_keypool_top_up = rollback_state->old_descriptor_deferred_create_keypool_top_up;
-        m_wallet_descriptor.cache.Remove(rollback_state->added_cache_items);
-        m_max_cached_index = rollback_state->old_max_cached_index;
-        for (const auto& [script, old_index] : rollback_state->old_script_pub_key_values) {
-            if (old_index) {
-                m_map_script_pub_keys[script] = *old_index;
-            } else {
-                m_map_script_pub_keys.erase(script);
-            }
-        }
-        for (const CPubKey& pubkey : rollback_state->added_pubkeys) {
-            m_map_pubkeys.erase(pubkey);
-        }
-        for (const auto& [pubkey, old_state] : rollback_state->old_pqc_key_values) {
-            if (old_state.key) {
-                m_map_pqc_keys[pubkey] = *old_state.key;
-            } else {
-                m_map_pqc_keys.erase(pubkey);
-            }
-            if (old_state.crypted_key) {
-                m_map_crypted_pqc_keys[pubkey] = *old_state.crypted_key;
-            } else {
-                m_map_crypted_pqc_keys.erase(pubkey);
-            }
-            if (old_state.sig_counter) {
-                m_map_pqc_sig_counters[pubkey] = *old_state.sig_counter;
-            } else {
-                m_map_pqc_sig_counters.erase(pubkey);
-            }
-        }
-        m_deferred_create_keypool_top_up = rollback_state->old_deferred_create_keypool_top_up;
-    };
     const auto restore_top_up_state_if_safe = [&](bool persistence_write_may_have_started) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man) {
         if (rollback_state_on_error || (!persistence_write_may_have_started && !has_persisted_top_up_writes)) {
-            restore_top_up_state();
+            RollbackTopUp(*rollback_state);
         }
     };
     const auto top_up_error = [&](bilingual_str error) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man) -> util::Result<std::shared_ptr<TopUpChange>> {
@@ -1547,8 +1496,46 @@ util::Result<std::shared_ptr<DescriptorScriptPubKeyMan::TopUpChange>> Descriptor
 
     auto change{std::make_shared<TopUpChange>()};
     change->new_spks = std::move(new_spks);
-    change->rollback = restore_top_up_state;
+    change->rollback_state = std::move(rollback_state);
     return change;
+}
+
+void DescriptorScriptPubKeyMan::RollbackTopUp(const TopUpRollbackState& state)
+{
+    AssertLockHeld(cs_desc_man);
+    m_wallet_descriptor.range_start = state.old_range_start;
+    m_wallet_descriptor.range_end = state.old_range_end;
+    m_wallet_descriptor.deferred_create_keypool_top_up = state.old_descriptor_deferred_create_keypool_top_up;
+    m_wallet_descriptor.cache.Remove(state.added_cache_items);
+    m_max_cached_index = state.old_max_cached_index;
+    for (const auto& [script, old_index] : state.old_script_pub_key_values) {
+        if (old_index) {
+            m_map_script_pub_keys[script] = *old_index;
+        } else {
+            m_map_script_pub_keys.erase(script);
+        }
+    }
+    for (const CPubKey& pubkey : state.added_pubkeys) {
+        m_map_pubkeys.erase(pubkey);
+    }
+    for (const auto& [pubkey, old_state] : state.old_pqc_key_values) {
+        if (old_state.key) {
+            m_map_pqc_keys[pubkey] = *old_state.key;
+        } else {
+            m_map_pqc_keys.erase(pubkey);
+        }
+        if (old_state.crypted_key) {
+            m_map_crypted_pqc_keys[pubkey] = *old_state.crypted_key;
+        } else {
+            m_map_crypted_pqc_keys.erase(pubkey);
+        }
+        if (old_state.sig_counter) {
+            m_map_pqc_sig_counters[pubkey] = *old_state.sig_counter;
+        } else {
+            m_map_pqc_sig_counters.erase(pubkey);
+        }
+    }
+    m_deferred_create_keypool_top_up = state.old_deferred_create_keypool_top_up;
 }
 
 void DescriptorScriptPubKeyMan::PublishTopUp(const TopUpChange& change)
@@ -1559,11 +1546,24 @@ void DescriptorScriptPubKeyMan::PublishTopUp(const TopUpChange& change)
 
 void DescriptorScriptPubKeyMan::RegisterTopUpTxnListener(WalletBatch& batch, const std::shared_ptr<TopUpChange>& change)
 {
+    const std::weak_ptr<void> lifetime{m_lifetime};
+    DescriptorScriptPubKeyMan* const self{this};
+    WalletStorage* const storage{&m_storage};
     batch.RegisterTxnListener({
-        .on_commit = [this, change] { PublishTopUp(*change); },
-        .on_abort = [this, change] {
-            LOCK(cs_desc_man);
-            change->rollback();
+        .on_commit = [self, storage, change, lifetime] {
+            storage->WithWalletLock([&] {
+                if (lifetime.expired()) return true;
+                self->PublishTopUp(*change);
+                return true;
+            });
+        },
+        .on_abort = [self, storage, change, lifetime] {
+            storage->WithWalletLock([&] {
+                if (lifetime.expired()) return true;
+                LOCK(self->cs_desc_man);
+                self->RollbackTopUp(*change->rollback_state);
+                return true;
+            });
         },
     });
 }

@@ -106,6 +106,7 @@ public:
     bool m_txn_begin_pass{true};
     bool m_txn_commit_pass{true};
     bool m_txn_abort_pass{true};
+    bool m_wallet_flags_write_pass{true};
     int m_write_fail_after{-1};
     int m_write_count{0};
     int m_txn_begin_count{0};

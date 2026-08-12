@@ -395,10 +395,29 @@ private:
         bool has_encryption_keys{false};
         std::optional<CKeyingMaterial> encryption_key;
     };
+    struct TopUpOldPQCKeyState {
+        std::optional<CPQCKey> key;
+        std::optional<CryptedPQCKeyRecord> crypted_key;
+        std::optional<uint32_t> sig_counter;
+    };
+    struct TopUpRollbackState {
+        int32_t old_range_start;
+        int32_t old_range_end;
+        std::optional<bool> old_descriptor_deferred_create_keypool_top_up;
+        int32_t old_max_cached_index;
+        bool old_deferred_create_keypool_top_up;
+        DescriptorCache added_cache_items;
+        std::map<CScript, std::optional<int32_t>> old_script_pub_key_values;
+        std::set<CPubKey> added_pubkeys;
+        std::map<CPQCPubKey, TopUpOldPQCKeyState> old_pqc_key_values;
+    };
     struct TopUpChange {
         std::set<CScript> new_spks;
-        std::function<void()> rollback;
+        // Detached state can outlive a manager destroyed while its caller-owned
+        // transaction is still active.
+        std::shared_ptr<TopUpRollbackState> rollback_state;
     };
+    void RollbackTopUp(const TopUpRollbackState& state) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     TopUpPreparation PrepareTopUp(std::optional<bool> internal_hint) const;
     void PublishTopUp(const TopUpChange& change);
     void RegisterTopUpTxnListener(WalletBatch& batch, const std::shared_ptr<TopUpChange>& change);
