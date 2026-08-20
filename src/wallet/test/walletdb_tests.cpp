@@ -9,6 +9,9 @@
 #include <wallet/test/util.h>
 #include <wallet/wallet.h>
 
+#include <string>
+#include <vector>
+
 #include <boost/test/unit_test.hpp>
 
 namespace wallet {
@@ -42,6 +45,44 @@ BOOST_AUTO_TEST_CASE(walletdb_writecryptedpqckey_overwrite)
 
     BOOST_CHECK(batch.WriteCryptedDescriptorPQCKey(descriptor_id, pubkey, secret, /*sig_counter=*/0));
     BOOST_CHECK(batch.WriteCryptedDescriptorPQCKey(descriptor_id, pubkey, secret, /*sig_counter=*/1));
+}
+
+BOOST_AUTO_TEST_CASE(walletdb_transaction_listener_commit_phases)
+{
+    auto database = std::make_unique<MockableDatabase>();
+    WalletBatch batch(*database);
+    std::vector<std::string> events;
+    const auto listener = [&](std::string name) {
+        return DbTxnListener{
+            .on_commit_prepare = [&, name] { events.push_back("prepare_" + name); },
+            .on_commit_success = [&, name] { events.push_back("success_" + name); },
+            .on_commit_failure = [&, name] { events.push_back("failure_" + name); },
+            .on_commit = [&, name] { events.push_back("commit_" + name); },
+            .on_abort = [&, name] { events.push_back("abort_" + name); },
+        };
+    };
+
+    BOOST_REQUIRE(batch.TxnBegin());
+    batch.RegisterTxnListener(listener("one"));
+    batch.RegisterTxnListener(listener("two"));
+    BOOST_REQUIRE(batch.TxnCommit());
+    const std::vector<std::string> expected_success{
+        "prepare_one", "prepare_two", "success_one", "success_two", "commit_one", "commit_two"};
+    BOOST_CHECK(events == expected_success);
+
+    events.clear();
+    database->m_txn_commit_pass = false;
+    BOOST_REQUIRE(batch.TxnBegin());
+    batch.RegisterTxnListener(listener("one"));
+    batch.RegisterTxnListener(listener("two"));
+    BOOST_CHECK(!batch.TxnCommit());
+    const std::vector<std::string> expected_failure{
+        "prepare_one", "prepare_two", "failure_one", "failure_two"};
+    BOOST_CHECK(events == expected_failure);
+    BOOST_REQUIRE(batch.TxnAbort());
+    const std::vector<std::string> expected_abort{
+        "prepare_one", "prepare_two", "failure_one", "failure_two", "abort_two", "abort_one"};
+    BOOST_CHECK(events == expected_abort);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

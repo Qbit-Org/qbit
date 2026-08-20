@@ -9,7 +9,9 @@
 #include <wallet/db.h>
 #include <wallet/scriptpubkeyman.h>
 
+#include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 
 class ArgsManager;
@@ -69,6 +71,8 @@ class MockableBatch : public DatabaseBatch
 {
 private:
     MockableDatabase& m_database;
+    bool m_txn_active{false};
+    std::optional<MockableData> m_txn_snapshot;
 
     bool ReadKey(DataStream&& key, DataStream& value) override;
     bool WriteKey(DataStream&& key, DataStream&& value, bool overwrite=true) override;
@@ -78,16 +82,16 @@ private:
 
 public:
     explicit MockableBatch(MockableDatabase& database) : m_database(database) {}
-    ~MockableBatch() = default;
+    ~MockableBatch() override;
 
-    void Close() override {}
+    void Close() override;
 
     std::unique_ptr<DatabaseCursor> GetNewCursor() override;
     std::unique_ptr<DatabaseCursor> GetNewPrefixCursor(std::span<const std::byte> prefix) override;
     bool TxnBegin() override;
     bool TxnCommit() override;
     bool TxnAbort() override;
-    bool HasActiveTxn() override { return false; }
+    bool HasActiveTxn() override { return m_txn_active; }
 };
 
 /** A WalletDatabase whose contents and return values can be modified as needed for testing
@@ -103,6 +107,10 @@ public:
     bool m_txn_begin_pass{true};
     bool m_txn_commit_pass{true};
     bool m_txn_abort_pass{true};
+    bool m_wallet_flags_write_pass{true};
+    //! Runs after a successful mock commit becomes durable, or immediately
+    //! before a failed commit returns, while WalletBatch listeners are COMMITTING.
+    std::function<void(bool)> m_txn_commit_result_hook;
     int m_write_fail_after{-1};
     int m_write_count{0};
     int m_txn_begin_count{0};
