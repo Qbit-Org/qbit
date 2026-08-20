@@ -1000,6 +1000,7 @@ BOOST_AUTO_TEST_CASE(DescriptorTopUpCacheSupportsConcurrentReaders)
     std::thread reader{[&] {
         while (!done.load()) {
             for (const CScript& script : spk_man->GetScriptPubKeys()) {
+                LOCK(wallet.cs_wallet);
                 if (wallet.GetScriptPubKeyMans(script).empty()) lookup_failed = true;
             }
         }

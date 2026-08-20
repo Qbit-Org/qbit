@@ -3192,22 +3192,28 @@ util::Result<void> CWallet::RemoveTxs(WalletBatch& batch, std::vector<Txid>& txs
     }
 
     // Register callback to update the memory state only when the db txn is actually dumped to disk
-    batch.RegisterTxnListener({.on_commit=[&, erased_txs]() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) {
-        // Update the in-memory state and notify upper layers about the removals
-        for (const auto& it : erased_txs) {
-            const Txid hash{it->first};
-            wtxOrdered.erase(it->second.m_it_wtxOrdered);
-            for (const auto& txin : it->second.tx->vin)
-                mapTxSpends.erase(txin.prevout);
-            for (unsigned int i = 0; i < it->second.tx->vout.size(); ++i) {
-                m_txos.erase(COutPoint(hash, i));
+    batch.RegisterTxnListener({
+        .on_commit_prepare = {},
+        .on_commit_success = {},
+        .on_commit_failure = {},
+        .on_commit = [&, erased_txs]() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) {
+            // Update the in-memory state and notify upper layers about the removals
+            for (const auto& it : erased_txs) {
+                const Txid hash{it->first};
+                wtxOrdered.erase(it->second.m_it_wtxOrdered);
+                for (const auto& txin : it->second.tx->vin)
+                    mapTxSpends.erase(txin.prevout);
+                for (unsigned int i = 0; i < it->second.tx->vout.size(); ++i) {
+                    m_txos.erase(COutPoint(hash, i));
+                }
+                mapWallet.erase(it);
+                NotifyTransactionChanged(hash, CT_DELETED);
             }
-            mapWallet.erase(it);
-            NotifyTransactionChanged(hash, CT_DELETED);
-        }
 
-        MarkDirty();
-    }, .on_abort={}});
+            MarkDirty();
+        },
+        .on_abort = {},
+    });
 
     return {};
 }
