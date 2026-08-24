@@ -182,6 +182,11 @@ public:
 
 struct DbTxnListener
 {
+    // Commit outcome callbacks must not acquire wallet or descriptor locks.
+    // All success outcomes are resolved before any on_commit publication runs.
+    std::function<void()> on_commit_prepare;
+    std::function<void()> on_commit_success;
+    std::function<void()> on_commit_failure;
     std::function<void()> on_commit, on_abort;
 };
 
@@ -220,6 +225,7 @@ public:
     }
     WalletBatch(const WalletBatch&) = delete;
     WalletBatch& operator=(const WalletBatch&) = delete;
+    ~WalletBatch();
 
     bool WriteName(const std::string& strAddress, const std::string& strName);
     bool EraseName(const std::string& strAddress);

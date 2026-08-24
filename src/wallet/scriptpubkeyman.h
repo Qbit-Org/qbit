@@ -25,6 +25,7 @@
 
 #include <boost/signals2/signal.hpp>
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -37,6 +38,8 @@ enum class OutputType;
 namespace wallet {
 struct MigrationData;
 class ScriptPubKeyMan;
+using TopUpPublicationId = uint64_t;
+static constexpr TopUpPublicationId INVALID_TOPUP_PUBLICATION_ID{0};
 std::vector<CPQCPubKey> ExtractP2MRPubkeys(const CScript& script);
 
 struct PSBTSigningProvider
@@ -90,9 +93,16 @@ public:
     virtual bool IsLocked() const = 0;
     virtual bool WithWalletLock(std::function<bool()> cb) const = 0;
     virtual std::optional<bool> IsInternalScriptPubKeyMan(const ScriptPubKeyMan* spk_man) const = 0;
+    //! Track descriptor scripts before their transaction outcome is known.
+    virtual TopUpPublicationId StageTopUpPublication(const std::set<CScript>&, ScriptPubKeyMan*, std::weak_ptr<void>) = 0;
+    //! Resolve the commit boundary without taking wallet or descriptor locks.
+    virtual void BeginTopUpCommit(TopUpPublicationId) = 0;
+    virtual void FinishTopUpCommit(TopUpPublicationId, bool committed) = 0;
+    //! Remove a staged or resolved publication without touching the manager.
+    virtual void CancelTopUpPublication(TopUpPublicationId) = 0;
     //! Publish scripts added by a SPKMan after its database transaction has
     //! committed and its manager lock has been released.
-    virtual void TopUpCallback(const std::set<CScript>&, ScriptPubKeyMan*) = 0;
+    virtual bool TopUpCallback(const std::set<CScript>&, ScriptPubKeyMan*, TopUpPublicationId = INVALID_TOPUP_PUBLICATION_ID) = 0;
 };
 
 //! Constant representing an unknown spkm creation time
@@ -396,14 +406,39 @@ private:
         bool has_encryption_keys{false};
         std::optional<CKeyingMaterial> encryption_key;
     };
-    void PublishTopUp(const std::set<CScript>& new_spks, bool notify_can_get_addresses_changed) LOCKS_EXCLUDED(cs_desc_man);
-    util::Result<CTxDestination> GetNewDestinationNoNotify(OutputType type, int64_t* index, bool& notify_can_get_addresses_changed, std::set<CScript>& committed_spks) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    struct TopUpOldPQCKeyState {
+        std::optional<CPQCKey> key;
+        std::optional<CryptedPQCKeyRecord> crypted_key;
+        std::optional<uint32_t> sig_counter;
+    };
+    struct TopUpRollbackState {
+        int32_t old_range_start;
+        int32_t old_range_end;
+        std::optional<bool> old_descriptor_deferred_create_keypool_top_up;
+        int32_t old_max_cached_index;
+        bool old_deferred_create_keypool_top_up;
+        DescriptorCache added_cache_items;
+        std::map<CScript, std::optional<int32_t>> old_script_pub_key_values;
+        std::set<CPubKey> added_pubkeys;
+        std::map<CPQCPubKey, TopUpOldPQCKeyState> old_pqc_key_values;
+    };
+    struct TopUpChange {
+        std::set<CScript> new_spks;
+        // Detached state can outlive a manager destroyed while its caller-owned
+        // transaction is still active.
+        std::shared_ptr<TopUpRollbackState> rollback_state;
+        std::weak_ptr<void> lifetime;
+        TopUpPublicationId publication_id{INVALID_TOPUP_PUBLICATION_ID};
+    };
+    void RollbackTopUp(const TopUpRollbackState& state) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     TopUpPreparation PrepareTopUp(std::optional<bool> internal_hint) const;
-    util::Result<void> TopUpWithInternalHintResultNoNotify(std::optional<bool> internal_hint, unsigned int size, std::set<CScript>& committed_spks);
+    util::Result<CTxDestination> GetNewDestinationWithIndex(OutputType type, int64_t* index);
+    void PublishTopUp(const TopUpChange& change);
+    void RegisterTopUpTxnListener(WalletBatch& batch, const std::shared_ptr<TopUpChange>& change);
     bool IsRangedP2MRDescriptorNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     unsigned int GetKeyPoolSizeNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     bool NeedsP2MRKeyPoolRefillNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
-    bool MaybeTopUpInternalP2MRKeyPoolNoNotify(std::set<CScript>& committed_spks) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    void MaybeTopUpInternalP2MRKeyPool();
     unsigned int GetP2MRReceiveKeyPoolLowWatermarkNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     unsigned int GetP2MRReceiveKeyPoolRefillStepTargetNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
 
@@ -423,7 +458,7 @@ protected:
     //! Same as 'TopUp' but designed for use within a batch transaction context
     bool TopUpWithDB(WalletBatch& batch, unsigned int size = 0, std::optional<bool> internal_hint = std::nullopt) LOCKS_EXCLUDED(cs_desc_man);
     util::Result<void> TopUpWithDBResult(WalletBatch& batch, unsigned int size = 0, std::optional<bool> internal_hint = std::nullopt, bool throw_on_persistence_error = false, bool rollback_state_on_error = true) LOCKS_EXCLUDED(cs_desc_man);
-    util::Result<void> TopUpWithDBPreparedResult(WalletBatch& batch, unsigned int size, const TopUpPreparation& prepared, bool throw_on_persistence_error, bool rollback_state_on_error, std::set<CScript>& new_spks) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    util::Result<std::shared_ptr<TopUpChange>> TopUpWithDBPreparedResult(WalletBatch& batch, unsigned int size, const TopUpPreparation& prepared, bool throw_on_persistence_error, bool rollback_state_on_error) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
 
 public:
     DescriptorScriptPubKeyMan(WalletStorage& storage, WalletDescriptor& descriptor, int64_t keypool_size);
