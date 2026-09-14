@@ -432,13 +432,14 @@ private:
     };
     void RollbackTopUp(const TopUpRollbackState& state) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     TopUpPreparation PrepareTopUp(std::optional<bool> internal_hint) const;
-    util::Result<CTxDestination> GetNewDestinationWithIndex(OutputType type, int64_t* index);
+    util::Result<CTxDestination> GetNewDestinationNoNotify(OutputType type, int64_t* index, bool& notify) LOCKS_EXCLUDED(cs_desc_man);
+    util::Result<void> TopUpWithInternalHintResultNoNotify(std::optional<bool> internal_hint, unsigned int size, bool& notify) LOCKS_EXCLUDED(cs_desc_man);
     void PublishTopUp(const TopUpChange& change);
     void RegisterTopUpTxnListener(WalletBatch& batch, const std::shared_ptr<TopUpChange>& change);
     bool IsRangedP2MRDescriptorNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     unsigned int GetKeyPoolSizeNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     bool NeedsP2MRKeyPoolRefillNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
-    void MaybeTopUpInternalP2MRKeyPool();
+    void MaybeTopUpInternalP2MRKeyPool(bool& notify) LOCKS_EXCLUDED(cs_desc_man);
     unsigned int GetP2MRReceiveKeyPoolLowWatermarkNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     unsigned int GetP2MRReceiveKeyPoolRefillStepTargetNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
 

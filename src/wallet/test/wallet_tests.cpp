@@ -23,6 +23,7 @@
 #include <hash.h>
 #include <interfaces/chain.h>
 #include <key_io.h>
+#include <kernel/chain.h>
 #include <node/blockstorage.h>
 #include <policy/policy.h>
 #include <rpc/server.h>
@@ -774,7 +775,11 @@ BOOST_AUTO_TEST_CASE(DescriptorTopUpPublicationFollowsExternalTransactionOutcome
     BOOST_CHECK(!IsTopUpScriptVisible(wallet, abort_script));
     BOOST_REQUIRE(abort_batch.TxnAbort());
     BOOST_CHECK(!IsTopUpScriptVisible(wallet, abort_script));
-    BOOST_CHECK(spk_man.GetScriptPubKeys() == previous_scripts);
+    // Each set has its own salted hasher; compare contents without requiring
+    // equal hash values from independently constructed hash functions.
+    const auto restored_scripts{spk_man.GetScriptPubKeys()};
+    BOOST_CHECK_EQUAL(restored_scripts.size(), previous_scripts.size());
+    for (const CScript& script : previous_scripts) BOOST_CHECK(restored_scripts.contains(script));
 
     WalletBatch failed_batch{wallet.GetDatabase()};
     BOOST_REQUIRE(failed_batch.TxnBegin());
@@ -794,6 +799,171 @@ BOOST_AUTO_TEST_CASE(DescriptorTopUpPublicationFollowsExternalTransactionOutcome
     BOOST_CHECK(!IsTopUpScriptVisible(wallet, committed_script));
     BOOST_REQUIRE(commit_batch.TxnCommit());
     BOOST_CHECK(IsTopUpScriptVisible(wallet, committed_script));
+}
+
+BOOST_AUTO_TEST_CASE(DescriptorTopUpDestroyedManagerTransactionOutcomes)
+{
+    // A manager can disappear after listener registration but before the
+    // caller commits, explicitly aborts, or unwinds its batch.
+    enum class Outcome { COMMIT, ABORT, FAILED_COMMIT, SCOPE_EXIT };
+    for (const auto outcome : {Outcome::COMMIT, Outcome::ABORT, Outcome::FAILED_COMMIT, Outcome::SCOPE_EXIT}) {
+        CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+        LOCK(wallet.cs_wallet);
+        wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        auto& database{GetMockableDatabase(wallet)};
+        CScript script;
+        int notifications{0};
+        {
+            WalletBatch batch{wallet.GetDatabase()};
+            BOOST_REQUIRE(batch.TxnBegin());
+            CExtKey master_key;
+            master_key.SetSeed(GenerateRandomKey());
+            auto spk_man{std::make_unique<TestDescriptorScriptPubKeyMan>(wallet, SINGLE_ADDRESS_KEYPOOL_SIZE)};
+            boost::signals2::scoped_connection connection{spk_man->NotifyCanGetAddressesChanged.connect([&] { ++notifications; })};
+            BOOST_REQUIRE(spk_man->SetupDescriptorGeneration(batch, master_key, OutputType::BECH32, /*internal=*/false));
+            script = *spk_man->GetScriptPubKeys().begin();
+            const auto lifetime{spk_man->GetLifetimeToken()};
+            spk_man.reset();
+            BOOST_CHECK(lifetime.expired());
+            BOOST_CHECK(!IsTopUpScriptVisible(wallet, script));
+            if (outcome == Outcome::COMMIT) {
+                BOOST_REQUIRE(batch.TxnCommit());
+            } else if (outcome == Outcome::ABORT) {
+                BOOST_REQUIRE(batch.TxnAbort());
+            } else if (outcome == Outcome::FAILED_COMMIT) {
+                database.m_txn_commit_pass = false;
+                BOOST_CHECK(!batch.TxnCommit());
+            }
+        }
+        BOOST_CHECK(!IsTopUpScriptVisible(wallet, script));
+        BOOST_CHECK_EQUAL(notifications, 0);
+        BOOST_CHECK_EQUAL(database.m_txn_abort_count, outcome == Outcome::COMMIT ? 0 : 1);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(DescriptorTopUpScopeExitRollsBackAndCommitRetryPublishesOnce)
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    LOCK(wallet.cs_wallet);
+    wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+    CExtKey master_key;
+    master_key.SetSeed(GenerateRandomKey());
+    TestDescriptorScriptPubKeyMan spk_man{wallet, SINGLE_ADDRESS_KEYPOOL_SIZE};
+    WalletBatch setup_batch{wallet.GetDatabase()};
+    BOOST_REQUIRE(spk_man.SetupDescriptorGeneration(setup_batch, master_key, OutputType::BECH32, /*internal=*/false));
+    const auto previous_scripts{spk_man.GetScriptPubKeys()};
+    const unsigned int previous_size{spk_man.GetKeyPoolSize()};
+    auto& database{GetMockableDatabase(wallet)};
+    const auto previous_records{database.m_records};
+    int notifications{0};
+    boost::signals2::scoped_connection connection{spk_man.NotifyCanGetAddressesChanged.connect([&] { ++notifications; })};
+    CScript script;
+    {
+        WalletBatch batch{wallet.GetDatabase()};
+        BOOST_REQUIRE(batch.TxnBegin());
+        BOOST_REQUIRE(spk_man.TopUpWithDB(batch, previous_size + 1, /*internal_hint=*/false));
+        BOOST_REQUIRE(spk_man.TopUpWithDB(batch, previous_size + 2, /*internal_hint=*/false));
+        script = FindNewScript(previous_scripts, spk_man.GetScriptPubKeys());
+        BOOST_CHECK(!IsTopUpScriptVisible(wallet, script));
+    }
+    BOOST_CHECK_EQUAL(spk_man.GetKeyPoolSize(), previous_size);
+    BOOST_CHECK(database.m_records == previous_records);
+    BOOST_CHECK(!IsTopUpScriptVisible(wallet, script));
+    BOOST_CHECK_EQUAL(notifications, 0);
+
+    WalletBatch batch{wallet.GetDatabase()};
+    BOOST_REQUIRE(batch.TxnBegin());
+    BOOST_REQUIRE(spk_man.TopUpWithDB(batch, previous_size + 1, /*internal_hint=*/false));
+    script = FindNewScript(previous_scripts, spk_man.GetScriptPubKeys());
+    database.m_txn_commit_pass = false;
+    BOOST_CHECK(!batch.TxnCommit());
+    BOOST_CHECK(batch.HasActiveTxn());
+    BOOST_CHECK(!IsTopUpScriptVisible(wallet, script));
+    BOOST_CHECK_EQUAL(notifications, 0);
+    database.m_txn_commit_pass = true;
+    BOOST_REQUIRE(batch.TxnCommit());
+    BOOST_CHECK(IsTopUpScriptVisible(wallet, script));
+    BOOST_CHECK_EQUAL(notifications, 1);
+    BOOST_CHECK(!batch.TxnCommit());
+    BOOST_CHECK_EQUAL(notifications, 1);
+}
+
+BOOST_AUTO_TEST_CASE(DescriptorTopUpConcurrentTransactionProcessingDuringPublication, * boost::unit_test::timeout(60))
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        // This test constructs its manager directly, so set the birthday that
+        // AddScriptPubKeyMan would normally initialize before block scanning.
+        wallet.MaybeUpdateBirthTime(1);
+    }
+    CExtKey master_key;
+    master_key.SetSeed(GenerateRandomKey());
+    TestDescriptorScriptPubKeyMan spk_man{wallet, SINGLE_ADDRESS_KEYPOOL_SIZE};
+    WalletBatch setup_batch{wallet.GetDatabase()};
+    BOOST_REQUIRE(spk_man.SetupDescriptorGeneration(setup_batch, master_key, OutputType::BECH32, /*internal=*/false));
+    const unsigned int target{spk_man.GetKeyPoolSize() + 1};
+    const auto previous_scripts{spk_man.GetScriptPubKeys()};
+    CScript script;
+    {
+        WalletBatch preview{wallet.GetDatabase()};
+        BOOST_REQUIRE(preview.TxnBegin());
+        BOOST_REQUIRE(spk_man.TopUpWithDB(preview, target, /*internal_hint=*/false));
+        script = FindNewScript(previous_scripts, spk_man.GetScriptPubKeys());
+        // The reader must finish while the caller-owned transaction is still
+        // open. It must neither observe ownership nor record the transaction.
+        auto reader{std::async(std::launch::async, [&] {
+            LOCK(wallet.cs_wallet);
+            CMutableTransaction tx;
+            tx.vout.emplace_back(COIN, script);
+            const auto tx_ref{MakeTransactionRef(tx)};
+            wallet.transactionAddedToMempool(tx_ref);
+            return !IsTopUpScriptVisible(wallet, script) && !wallet.mapWallet.contains(tx_ref->GetHash());
+        })};
+        BOOST_CHECK(reader.get());
+        BOOST_REQUIRE(preview.TxnAbort());
+    }
+
+    std::promise<void> publication_ready;
+    std::promise<void> release_publication;
+    auto release_future{release_publication.get_future()};
+    std::atomic<bool> pause_next{true};
+    std::atomic<bool> publication_locks_released{false};
+    wallet.m_before_script_pub_key_cache_publish = [&](const std::set<CScript>&, ScriptPubKeyMan*) {
+        if (!pause_next.exchange(false)) return;
+        publication_locks_released = LockStackEmpty();
+        publication_ready.set_value();
+        release_future.wait();
+    };
+    auto publisher{std::async(std::launch::async, [&] { return spk_man.TopUp(target); })};
+    publication_ready.get_future().wait();
+    bool visible{false};
+    bool recorded{false};
+    {
+        LOCK(wallet.cs_wallet);
+        visible = IsTopUpScriptVisible(wallet, script);
+        CMutableTransaction tx;
+        tx.vout.emplace_back(COIN, script);
+        const auto tx_ref{MakeTransactionRef(tx)};
+        CBlock block;
+        block.nTime = GetTime();
+        block.vtx.push_back(tx_ref);
+        const uint256 block_hash{block.GetHash()};
+        interfaces::BlockInfo block_info{block_hash};
+        block_info.data = &block;
+        block_info.height = 1;
+        block_info.chain_time_max = block.nTime;
+        wallet.blockConnected(ChainstateRole::NORMAL, block_info);
+        recorded = wallet.mapWallet.contains(tx_ref->GetHash());
+    }
+    release_publication.set_value();
+    BOOST_CHECK(publisher.get());
+    wallet.m_before_script_pub_key_cache_publish = {};
+    BOOST_CHECK(publication_locks_released);
+    BOOST_CHECK(visible);
+    BOOST_CHECK(recorded);
+    BOOST_CHECK(IsTopUpScriptVisible(wallet, script));
 }
 
 BOOST_AUTO_TEST_CASE(DescriptorTopUpCallerOwnedCommitBoundaryIsAtomic)

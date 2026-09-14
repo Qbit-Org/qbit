@@ -943,10 +943,13 @@ bool LegacyDataSPKM::DeleteRecordsWithDB(WalletBatch& batch)
 
 util::Result<CTxDestination> DescriptorScriptPubKeyMan::GetNewDestination(const OutputType type)
 {
-    return GetNewDestinationWithIndex(type, /*index=*/nullptr);
+    bool notify{false};
+    auto result{GetNewDestinationNoNotify(type, /*index=*/nullptr, notify)};
+    if (notify) NotifyCanGetAddressesChanged();
+    return result;
 }
 
-util::Result<CTxDestination> DescriptorScriptPubKeyMan::GetNewDestinationWithIndex(const OutputType type, int64_t* index)
+util::Result<CTxDestination> DescriptorScriptPubKeyMan::GetNewDestinationNoNotify(const OutputType type, int64_t* index, bool& notify)
 {
     // Returns true if this descriptor supports getting new addresses. Conditions where we may be unable to fetch them (e.g. locked) are caught later
     if (!CanGetAddresses()) {
@@ -964,7 +967,7 @@ util::Result<CTxDestination> DescriptorScriptPubKeyMan::GetNewDestinationWithInd
         }
         top_up = !m_deferred_create_keypool_top_up && !IsRangedP2MRDescriptorNoLock();
     }
-    if (top_up) TopUp();
+    if (top_up) TopUpWithInternalHintResultNoNotify(std::nullopt, /*size=*/0, notify);
 
     while (true) {
         {
@@ -994,7 +997,7 @@ util::Result<CTxDestination> DescriptorScriptPubKeyMan::GetNewDestinationWithInd
 
         // Another address consumer can exhaust the range after a top-up. Retry
         // outside the descriptor lock instead of returning a spurious failure.
-        if (!TopUp(1)) {
+        if (!TopUpWithInternalHintResultNoNotify(std::nullopt, /*size=*/1, notify)) {
             return util::Error{_("Error: Keypool ran out, please call keypoolrefill first")};
         }
     }
@@ -1104,10 +1107,13 @@ bool DescriptorScriptPubKeyMan::Encrypt(const CKeyingMaterial& master_key, Walle
 
 util::Result<CTxDestination> DescriptorScriptPubKeyMan::GetReservedDestination(const OutputType type, bool internal, int64_t& index, bool allow_internal_p2mr_refill)
 {
+    bool notify{false};
     if (internal && allow_internal_p2mr_refill) {
-        MaybeTopUpInternalP2MRKeyPool();
+        MaybeTopUpInternalP2MRKeyPool(notify);
     }
-    return GetNewDestinationWithIndex(type, &index);
+    auto result{GetNewDestinationNoNotify(type, &index, notify)};
+    if (notify) NotifyCanGetAddressesChanged();
+    return result;
 }
 
 void DescriptorScriptPubKeyMan::ReturnDestination(int64_t index, bool internal, const CTxDestination& addr)
@@ -1226,6 +1232,14 @@ DescriptorScriptPubKeyMan::TopUpPreparation DescriptorScriptPubKeyMan::PrepareTo
 
 util::Result<void> DescriptorScriptPubKeyMan::TopUpWithInternalHintResult(std::optional<bool> internal_hint, unsigned int size)
 {
+    bool notify{false};
+    auto result{TopUpWithInternalHintResultNoNotify(internal_hint, size, notify)};
+    if (notify) NotifyCanGetAddressesChanged();
+    return result;
+}
+
+util::Result<void> DescriptorScriptPubKeyMan::TopUpWithInternalHintResultNoNotify(std::optional<bool> internal_hint, unsigned int size, bool& notify)
+{
     AssertLockNotHeld(cs_desc_man);
     const TopUpPreparation prepared{PrepareTopUp(internal_hint)};
     std::shared_ptr<TopUpChange> change;
@@ -1278,7 +1292,9 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithInternalHintResult(std::o
         m_storage.FinishTopUpCommit(change->publication_id, /*committed=*/true);
     }
 
-    PublishTopUp(*change);
+    // Publish durable ownership now, but let address consumers reserve their
+    // index before notifying observers. No descriptor or database lock is held.
+    notify |= m_storage.TopUpCallback(change->new_spks, this, change->publication_id);
     return {};
 }
 
@@ -1879,7 +1895,7 @@ bool DescriptorScriptPubKeyMan::NeedsP2MRKeyPoolRefillNoLock() const
            GetKeyPoolSizeNoLock() <= GetP2MRReceiveKeyPoolLowWatermarkNoLock();
 }
 
-void DescriptorScriptPubKeyMan::MaybeTopUpInternalP2MRKeyPool()
+void DescriptorScriptPubKeyMan::MaybeTopUpInternalP2MRKeyPool(bool& notify)
 {
     unsigned int target;
     std::string descriptor_id;
@@ -1891,7 +1907,7 @@ void DescriptorScriptPubKeyMan::MaybeTopUpInternalP2MRKeyPool()
         descriptor_id = GetID().ToString();
     }
     try {
-        util::Result<void> res{TopUpWithInternalHintResult(/*internal_hint=*/true, target)};
+        util::Result<void> res{TopUpWithInternalHintResultNoNotify(/*internal_hint=*/true, target, notify)};
         if (!res) {
             WalletLogPrintf("P2MR change keypool inline low-watermark refill failed (descriptor id %s, target=%u, remaining=%u): %s\n",
                 descriptor_id, target, GetKeyPoolSize(), util::ErrorString(res).original);
