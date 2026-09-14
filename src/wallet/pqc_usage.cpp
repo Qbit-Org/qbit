@@ -247,6 +247,7 @@ PQCUsageReport BuildSigningPQCUsageReport(const PQCUsageRecorder& recorder)
 
 PQCUsageReport BuildGetAddressInfoPQCUsageReport(const CWallet& wallet, const CScript& script_pubkey)
 {
+    LOCK(wallet.cs_wallet);
     PQCUsageReport report;
     CTxDestination destination;
     if (!ExtractDestination(script_pubkey, destination)) {

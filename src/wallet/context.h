@@ -56,6 +56,10 @@ struct WalletContext {
     // creation starts and keep unchanged until creation has completed.
     CreateWalletStageFn create_wallet_stage_fn;
 
+    // Optional deterministic scheduler hook for tests. Copied into deferred
+    // keypool workers when they are scheduled.
+    std::function<void()> deferred_keypool_top_up_step_finished_fn;
+
     //! Declare default constructor and destructor that are not inline, so code
     //! instantiating the WalletContext struct doesn't need to #include class
     //! definitions for smart pointer and container members.

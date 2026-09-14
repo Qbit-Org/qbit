@@ -370,6 +370,71 @@ class SiteBuilderTest(unittest.TestCase):
             self.assertIn("favicon: assets/qbit.svg", config_text)
             self.assertIn('version: "v30.2-qbit-sample"', config_text)
             self.assertTrue((assets_dir / "logo-full.svg").exists())
+            self.assertFalse(
+                site_builder.load_json(assets_dir / "rpcdocs-version.json")["enabled"]
+            )
+
+    def test_publication_context_and_display_version(self) -> None:
+        manifest = site_builder.load_manifest(FIXTURE_MANIFEST)
+        baseline = site_builder.load_manifest(BASELINE_MANIFEST)
+        overlay = site_builder.load_overlay(
+            OVERLAY_FILE, set(site_builder.manifest_method_index(manifest))
+        )
+        site_model = site_builder.build_site_model(manifest, baseline, overlay)
+        publication = site_builder.validate_publication(
+            "main",
+            "main (development @ 01234567)",
+            "development",
+            "main",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_dir = Path(tmpdir) / "rpc-site"
+            site_builder.render_markdown_site(site_model, out_dir)
+            assets_dir = site_builder.copy_site_assets(
+                out_dir, publication=publication
+            )
+            config_path = site_builder.write_mkdocs_config(
+                site_model,
+                out_dir,
+                display_version=publication["label"],
+                publication=publication,
+            )
+            context = site_builder.load_json(
+                assets_dir / "rpcdocs-version.json"
+            )
+            config_text = config_path.read_text(encoding="utf-8")
+
+            self.assertEqual(context["current"], publication)
+            self.assertTrue(context["enabled"])
+            self.assertEqual(context["pages_root"], "../../")
+            self.assertIn(
+                'version: "main (development @ 01234567)"',
+                config_text,
+            )
+            self.assertIn("site_url: https://docs.qbit.org/main/", config_text)
+
+    def test_validate_publication_rejects_unsafe_paths(self) -> None:
+        for path in ("../v1.0.0", "/v1.0.0", "versions/v1.0.0"):
+            with self.subTest(path=path):
+                with self.assertRaises(site_builder.SiteBuilderError):
+                    site_builder.validate_publication(
+                        "v1.0.0", "qbit v1.0.0", "release", path
+                    )
+
+    def test_validate_publication_accepts_root_path(self) -> None:
+        publication = site_builder.validate_publication(
+            "v1.0.0", "qbit v1.0.0", "release", ""
+        )
+
+        self.assertEqual(publication["path"], "")
+        self.assertEqual(
+            site_builder.publication_context(publication)["pages_root"], "../"
+        )
+        self.assertEqual(
+            site_builder.publication_site_url("https://docs.qbit.org/", publication),
+            "https://docs.qbit.org/",
+        )
 
     @unittest.skipUnless(MKDOCS_AVAILABLE, "MkDocs is required to generate HTML")
     def test_build_site_cli_generates_html_output(self) -> None:
@@ -387,6 +452,14 @@ class SiteBuilderTest(unittest.TestCase):
                     str(OVERLAY_FILE),
                     "--out",
                     str(out_dir),
+                    "--publication-id",
+                    "main",
+                    "--publication-label",
+                    "main (development @ 01234567)",
+                    "--publication-kind",
+                    "development",
+                    "--publication-path",
+                    "main",
                 ],
                 cwd=tmpdir,
                 capture_output=True,
@@ -402,6 +475,9 @@ class SiteBuilderTest(unittest.TestCase):
             self.assertTrue((Path(tmpdir) / out_dir / "assets" / "qbit.svg").exists())
             self.assertTrue(
                 (Path(tmpdir) / out_dir / "assets" / "logo-full.svg").exists()
+            )
+            self.assertTrue(
+                (Path(tmpdir) / out_dir / "assets" / "rpcdocs-version.json").exists()
             )
             site_model_path = Path(tmpdir) / "rpc" / "site-model.json"
             self.assertTrue(site_model_path.exists())
@@ -438,9 +514,14 @@ class SiteBuilderTest(unittest.TestCase):
             self.assertNotIn("issue_links", site_model_text)
             self.assertNotIn("tags", site_model_text)
             self.assertNotIn("## Tracking", method_page_text)
-            self.assertIn('version: "v30.2-qbit-sample"', config_text)
+            self.assertIn(
+                'version: "main (development @ 01234567)"', config_text
+            )
             self.assertIn('src="assets/logo-full.svg"', index_html)
-            self.assertIn('<div class="version">\n          v30.2-qbit-sample', index_html)
+            self.assertIn(
+                '<div class="version">\n          main (development @ 01234567)',
+                index_html,
+            )
 
 
 if __name__ == "__main__":
