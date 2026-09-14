@@ -122,7 +122,9 @@ BOOST_AUTO_TEST_CASE(p2mr_parallel_signing_releases_wallet_lock_mid_batch)
     // Release the latch before the future joins, including assertion failures.
     ResumeSigningGuard resume_guard{resume_signing};
 
-    if (paused_future.wait_for(5s) != std::future_status::ready) {
+    // Reaching the latch requires a real PQC signature. Allow for sanitizer
+    // overhead and concurrent CI tests; the latch determines the signing state.
+    if (paused_future.wait_for(1min) != std::future_status::ready) {
         resume_guard.Release();
         BOOST_FAIL("Timed out waiting for fee-bump signing pause");
     }
