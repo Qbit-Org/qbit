@@ -3,12 +3,14 @@
 // file COPYING or https://www.opensource.org/licenses/mit-license.php.
 
 #include <consensus/validation.h>
+#include <interfaces/wallet.h>
 #include <node/context.h>
 #include <policy/policy.h>
 #include <primitives/transaction.h>
 #include <script/script.h>
 #include <util/strencodings.h>
 #include <wallet/feebumper.h>
+#include <wallet/pqc_usage.h>
 #include <wallet/test/util.h>
 #include <wallet/test/wallet_p2mr_test_util.h>
 #include <wallet/test/wallet_test_fixture.h>
@@ -106,7 +108,6 @@ BOOST_AUTO_TEST_CASE(p2mr_parallel_signing_releases_wallet_lock_mid_batch)
     std::future<void> paused_future{signing_paused.get_future()};
     std::promise<void> resume_signing;
     std::shared_future<void> resume_future{resume_signing.get_future()};
-    ResumeSigningGuard resume_guard{resume_signing};
     std::atomic_bool pause_reported{false};
     auto sign_future{std::async(std::launch::async, [&] {
         return feebumper::SignTransaction(*workload.wallet, workload.spend_tx, {}, [&](const SigningProgress& progress) {
@@ -118,6 +119,8 @@ BOOST_AUTO_TEST_CASE(p2mr_parallel_signing_releases_wallet_lock_mid_batch)
             return true;
         });
     })};
+    // Release the latch before the future joins, including assertion failures.
+    ResumeSigningGuard resume_guard{resume_signing};
 
     if (paused_future.wait_for(5s) != std::future_status::ready) {
         resume_guard.Release();
@@ -125,13 +128,17 @@ BOOST_AUTO_TEST_CASE(p2mr_parallel_signing_releases_wallet_lock_mid_batch)
     }
 
     BOOST_REQUIRE_EQUAL(workload.pubkeys.size(), 2U);
-    for (size_t input_index{0}; input_index < workload.pubkeys.size(); ++input_index) {
-        BOOST_CHECK_EQUAL(GetProviderPQCCounter(*workload.p2mr_spk_man, workload.pubkeys.at(input_index).descriptor_pubkey, workload.pubkeys.at(input_index).pqc_pubkey), 1U);
-        BOOST_CHECK(workload.spend_tx.vin.at(input_index).scriptWitness.IsNull());
-    }
     {
         TRY_LOCK(workload.wallet->cs_wallet, wallet_lock);
         BOOST_CHECK(static_cast<bool>(wallet_lock));
+        // Reading the provider can itself need cs_wallet. Do not block the
+        // test on that lookup when an outer-lock regression is present.
+        if (wallet_lock) {
+            for (size_t input_index{0}; input_index < workload.pubkeys.size(); ++input_index) {
+                BOOST_CHECK_EQUAL(GetProviderPQCCounter(*workload.p2mr_spk_man, workload.pubkeys.at(input_index).descriptor_pubkey, workload.pubkeys.at(input_index).pqc_pubkey), 1U);
+                BOOST_CHECK(workload.spend_tx.vin.at(input_index).scriptWitness.IsNull());
+            }
+        }
     }
 
     resume_guard.Release();
@@ -139,6 +146,36 @@ BOOST_AUTO_TEST_CASE(p2mr_parallel_signing_releases_wallet_lock_mid_batch)
     for (const CTxIn& input : workload.spend_tx.vin) {
         BOOST_CHECK(!input.scriptWitness.IsNull());
     }
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_signing_failure_preserves_consumed_usage)
+{
+    using namespace wallet_p2mr_test;
+    m_node.args->ForceSetArg("-walletpqcparallel", "0");
+    auto workload{MakeDistinctKeyP2MRSigningWorkload(*m_node.chain, /*input_count=*/1)};
+    std::shared_ptr<CWallet> wallet{std::move(workload.wallet)};
+
+    CMutableTransaction funding;
+    funding.vout.push_back(workload.coins.begin()->second.out);
+    BOOST_REQUIRE(wallet->AddToWallet(MakeTransactionRef(funding), TxStateInactive{}));
+    // The first input consumes a real, durable PQC counter. The second input
+    // cannot be signed, so the interface must return both failure and usage.
+    CMutableTransaction unsignable;
+    unsignable.vout.emplace_back(COIN, CScript{} << OP_FALSE);
+    BOOST_REQUIRE(wallet->AddToWallet(MakeTransactionRef(unsignable), TxStateInactive{}));
+    workload.spend_tx.vin.emplace_back(COutPoint{unsignable.GetHash(), 0});
+
+    WalletContext context;
+    auto wallet_interface{interfaces::MakeWallet(context, wallet)};
+    PQCUsageReport usage;
+    BOOST_CHECK(!wallet_interface->signBumpTransaction(workload.spend_tx, &usage));
+    BOOST_CHECK(!workload.spend_tx.vin.front().scriptWitness.IsNull());
+    BOOST_CHECK(workload.spend_tx.vin.back().scriptWitness.IsNull());
+    BOOST_REQUIRE_EQUAL(usage.key_states.size(), 1U);
+    BOOST_CHECK(usage.key_states.front().pubkey == workload.pubkeys.front().pqc_pubkey);
+    BOOST_CHECK_EQUAL(usage.key_states.front().signature_count, 1U);
+    BOOST_CHECK_EQUAL(GetProviderPQCCounter(*workload.p2mr_spk_man,
+        workload.pubkeys.front().descriptor_pubkey, workload.pubkeys.front().pqc_pubkey), 1U);
 }
 
 BOOST_AUTO_TEST_CASE(commit_revalidates_fee_after_signing)

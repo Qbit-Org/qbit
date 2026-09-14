@@ -866,6 +866,7 @@ void WalletModel::startBumpFeeSigning(uint64_t generation, std::shared_ptr<BumpF
                 mapped.phase = BumpFeeProgressPhase::Signing;
                 break;
             case SigningProgressPhase::FINALIZING_TRANSACTION:
+            case SigningProgressPhase::VERIFYING_TRANSACTION:
                 mapped.phase = BumpFeeProgressPhase::Finalizing;
                 break;
             }
@@ -981,12 +982,16 @@ void WalletModel::cancelBumpFee()
         if (expected != BumpFeeCancellationState::Irreversible) return;
         if (m_bump_fee_progress_dialog) {
             m_bump_fee_progress_dialog->setCancelButton(nullptr);
+            if (!m_bump_fee_progress_dialog) return;
             m_bump_fee_progress_dialog->setLabelText(tr("Finalizing transaction..."));
         }
         return;
     }
     if (m_bump_fee_progress_dialog) {
         m_bump_fee_progress_dialog->setCancelButton(nullptr);
+        // Removing the button can synchronously re-enter shutdown, which
+        // clears the dialog even while its deferred deletion is pending.
+        if (!m_bump_fee_progress_dialog) return;
         m_bump_fee_progress_dialog->setLabelText(tr("Canceling fee bump..."));
         if (m_bump_fee_progress_bar) m_bump_fee_progress_bar->setRange(0, 0);
     }

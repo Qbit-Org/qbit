@@ -1798,7 +1798,12 @@ void TestAsyncFeeBumpLifecycle(interfaces::Node& node)
         }, 5000));
         const QList<QPushButton*> cancel_buttons{progress->findChildren<QPushButton*>()};
         QVERIFY(!cancel_buttons.empty());
-        cancel_buttons.front()->click();
+        // Removing the cancel button can re-enter shutdown and clear the
+        // dialog before cancelBumpFee resumes updating it.
+        QObject::connect(cancel_buttons.front(), &QObject::destroyed, model.get(), [&] {
+            model->prepareForShutdown();
+        });
+        Q_EMIT progress->canceled();
         QVERIFY(WaitUntil([&] {
             return SyntheticStateMatches(state, [](const auto& value) { return value.bump_cancel_observed; });
         }, 5000));
