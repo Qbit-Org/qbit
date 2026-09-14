@@ -894,49 +894,47 @@ BOOST_AUTO_TEST_CASE(DescriptorTopUpConcurrentTransactionProcessingDuringPublica
     {
         LOCK(wallet.cs_wallet);
         wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
-        // This test constructs its manager directly, so set the birthday that
-        // AddScriptPubKeyMan would normally initialize before block scanning.
-        wallet.MaybeUpdateBirthTime(1);
+        wallet.m_keypool_size = SINGLE_ADDRESS_KEYPOOL_SIZE;
     }
     CExtKey master_key;
     master_key.SetSeed(GenerateRandomKey());
-    TestDescriptorScriptPubKeyMan spk_man{wallet, SINGLE_ADDRESS_KEYPOOL_SIZE};
     WalletBatch setup_batch{wallet.GetDatabase()};
-    BOOST_REQUIRE(spk_man.SetupDescriptorGeneration(setup_batch, master_key, OutputType::BECH32, /*internal=*/false));
-    const unsigned int target{spk_man.GetKeyPoolSize() + 1};
-    const auto previous_scripts{spk_man.GetScriptPubKeys()};
-    CScript script;
+    BOOST_REQUIRE(setup_batch.TxnBegin());
+    DescriptorScriptPubKeyMan* spk_man;
     {
-        WalletBatch preview{wallet.GetDatabase()};
-        BOOST_REQUIRE(preview.TxnBegin());
-        BOOST_REQUIRE(spk_man.TopUpWithDB(preview, target, /*internal_hint=*/false));
-        script = FindNewScript(previous_scripts, spk_man.GetScriptPubKeys());
-        // The reader must finish while the caller-owned transaction is still
-        // open. It must neither observe ownership nor record the transaction.
-        auto reader{std::async(std::launch::async, [&] {
-            LOCK(wallet.cs_wallet);
-            CMutableTransaction tx;
-            tx.vout.emplace_back(COIN, script);
-            const auto tx_ref{MakeTransactionRef(tx)};
-            wallet.transactionAddedToMempool(tx_ref);
-            return !IsTopUpScriptVisible(wallet, script) && !wallet.mapWallet.contains(tx_ref->GetHash());
-        })};
-        BOOST_CHECK(reader.get());
-        BOOST_REQUIRE(preview.TxnAbort());
+        LOCK(wallet.cs_wallet);
+        // Register the manager so an unconditional all-manager fallback would
+        // expose its staged scripts and fail the pre-commit reader checks.
+        spk_man = &wallet.SetupDescriptorScriptPubKeyMan(setup_batch, master_key, OutputType::BECH32, /*internal=*/false);
     }
+    CScript script{*spk_man->GetScriptPubKeys().begin()};
+    // The reader must finish while the caller-owned transaction is still
+    // open. It must neither observe ownership nor record the transaction.
+    auto reader{std::async(std::launch::async, [&] {
+        LOCK(wallet.cs_wallet);
+        CMutableTransaction tx;
+        tx.vout.emplace_back(COIN, script);
+        const auto tx_ref{MakeTransactionRef(tx)};
+        wallet.transactionAddedToMempool(tx_ref);
+        return !IsTopUpScriptVisible(wallet, script) && !wallet.mapWallet.contains(tx_ref->GetHash());
+    })};
+    BOOST_CHECK(reader.get());
+    BOOST_REQUIRE(setup_batch.TxnCommit());
+    const unsigned int target{spk_man->GetKeyPoolSize() + 1};
 
     std::promise<void> publication_ready;
     std::promise<void> release_publication;
     auto release_future{release_publication.get_future()};
     std::atomic<bool> pause_next{true};
     std::atomic<bool> publication_locks_released{false};
-    wallet.m_before_script_pub_key_cache_publish = [&](const std::set<CScript>&, ScriptPubKeyMan*) {
+    wallet.m_before_script_pub_key_cache_publish = [&](const std::set<CScript>& scripts, ScriptPubKeyMan*) {
         if (!pause_next.exchange(false)) return;
+        script = *scripts.begin();
         publication_locks_released = LockStackEmpty();
         publication_ready.set_value();
         release_future.wait();
     };
-    auto publisher{std::async(std::launch::async, [&] { return spk_man.TopUp(target); })};
+    auto publisher{std::async(std::launch::async, [&] { return spk_man->TopUp(target); })};
     publication_ready.get_future().wait();
     bool visible{false};
     bool recorded{false};
