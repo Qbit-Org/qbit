@@ -76,8 +76,23 @@ BOOST_FIXTURE_TEST_CASE(P2MRGetNewChangeAddressBoundsLowWatermarkRefill, Regtest
         range_end_at_watermark = internal_spk_man->GetWalletDescriptor().range_end;
     }
 
-    BOOST_REQUIRE(wallet->GetNewChangeDestination(OutputType::P2MR));
-    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), low_watermark + DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL - 1);
+    const unsigned int expected_keypool_size{low_watermark + DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL - 1};
+    int64_t reserved_index{-1};
+    int notification_count{0};
+    auto connection = internal_spk_man->NotifyCanGetAddressesChanged.connect([&] {
+        ++notification_count;
+        BOOST_CHECK(LockStackEmpty());
+        BOOST_CHECK_GE(reserved_index, 0);
+        BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), expected_keypool_size);
+        LOCK(internal_spk_man->cs_desc_man);
+        const WalletDescriptor descriptor{internal_spk_man->GetWalletDescriptor()};
+        BOOST_CHECK_EQUAL(descriptor.next_index, reserved_index + 1);
+        BOOST_CHECK_EQUAL(descriptor.range_end, range_end_at_watermark + DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+    });
+    BOOST_REQUIRE(internal_spk_man->GetReservedDestination(OutputType::P2MR, /*internal=*/true, reserved_index));
+    BOOST_CHECK_GE(reserved_index, 0);
+    BOOST_CHECK_EQUAL(notification_count, 1);
+    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), expected_keypool_size);
     BOOST_CHECK_LT(internal_spk_man->GetKeyPoolSize(), static_cast<unsigned int>(keypool_size));
     {
         LOCK(internal_spk_man->cs_desc_man);

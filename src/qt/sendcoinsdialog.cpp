@@ -626,6 +626,7 @@ void SendCoinsDialog::startPrepareTransaction(std::unique_ptr<WalletModelTransac
                     .total = progress.total,
                 }, cancellable);
             case SigningProgressPhase::FINALIZING_TRANSACTION:
+            case SigningProgressPhase::VERIFYING_TRANSACTION:
                 return post_progress(PrepareProgress{
                     .phase = PrepareProgressPhase::Finalizing,
                     .completed = progress.completed,

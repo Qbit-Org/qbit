@@ -160,7 +160,14 @@ public:
     }
     bool isCrypted() override { return m_wallet->IsCrypted(); }
     bool lock() override { return m_wallet->Lock(); }
-    bool unlock(const SecureString& wallet_passphrase) override { return m_wallet->Unlock(wallet_passphrase); }
+    bool unlock(const SecureString& wallet_passphrase) override
+    {
+        if (!m_wallet->Unlock(wallet_passphrase, /*run_pending_initial_keypool_top_up=*/false)) {
+            return false;
+        }
+        MaybeSchedulePendingInitialKeyPoolTopUp(m_context, m_wallet);
+        return true;
+    }
     bool isLocked() override { return m_wallet->IsLocked(); }
     bool changeWalletPassphrase(const SecureString& old_wallet_passphrase,
         const SecureString& new_wallet_passphrase) override
@@ -487,7 +494,8 @@ public:
         size_t* n_signed,
         PartiallySignedTransaction& psbtx,
         bool& complete,
-        wallet::PQCUsageReport* pqc_usage) override
+        wallet::PQCUsageReport* pqc_usage,
+        const SigningProgressCallback& progress_callback) override
     {
         if (sign) {
             if (GetPQCKeyValidationSigningError(*m_wallet)) {
@@ -505,7 +513,8 @@ public:
                                             bip32derivs,
                                             n_signed,
                                             /*finalize=*/true,
-                                            sign ? pqc_usage_recorder.GetObserver() : PQCSignatureCounterObserver{});
+                                            sign ? pqc_usage_recorder.GetObserver() : PQCSignatureCounterObserver{},
+                                            progress_callback);
         if (pqc_usage) {
             *pqc_usage = sign ? BuildSigningPQCUsageReport(pqc_usage_recorder) : PQCUsageReport{};
         }

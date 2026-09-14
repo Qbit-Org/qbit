@@ -419,13 +419,17 @@ class RESTTest (BitcoinTestFramework):
         self.log.info("Test the /chaininfo URI")
 
         bb_hash = self.nodes[0].getbestblockhash()
+        tip_time = self.nodes[0].getblockheader(bb_hash)['time']
+        self.nodes[0].setmocktime(tip_time)
+        try:
+            json_obj = self.test_rest_request("/chaininfo")
+            assert_equal(json_obj['bestblockhash'], bb_hash)
 
-        json_obj = self.test_rest_request("/chaininfo")
-        assert_equal(json_obj['bestblockhash'], bb_hash)
-
-        # Compare with normal RPC getblockchaininfo response
-        blockchain_info = self.nodes[0].getblockchaininfo()
-        assert_equal(blockchain_info, json_obj)
+            # Compare with normal RPC getblockchaininfo response
+            blockchain_info = self.nodes[0].getblockchaininfo()
+            assert_equal(blockchain_info, json_obj)
+        finally:
+            self.nodes[0].setmocktime(0)
 
         # Test compatibility of deprecated and newer endpoints
         self.log.info("Test compatibility of deprecated and newer endpoints")

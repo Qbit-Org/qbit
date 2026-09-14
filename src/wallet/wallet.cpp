@@ -356,6 +356,7 @@ struct DeferredCreateKeyPoolTopUpState {
     CScheduler* scheduler;
     int remaining_steps;
     std::optional<SteadyClock::time_point> refill_start;
+    std::function<void()> step_finished_fn;
 };
 
 struct P2MRKeyPoolRefillState {
@@ -382,16 +383,32 @@ void RunScheduledPendingInitialKeyPoolTopUp(const std::shared_ptr<DeferredCreate
         state->refill_start = SteadyClock::now();
     }
     const auto step_result = wallet->RunPendingInitialKeyPoolTopUpStep();
-    if (step_result == CWallet::PendingInitialKeyPoolTopUpStepResult::COMPLETE) {
-        wallet->WalletLogPrintf("Deferred create-time keypool top up completed in %15dms\n",
-            Ticks<std::chrono::milliseconds>(SteadyClock::now() - *state->refill_start));
-        return;
+    if (state->step_finished_fn) {
+        state->step_finished_fn();
     }
-    if (step_result == CWallet::PendingInitialKeyPoolTopUpStepResult::FAILED) {
-        wallet->WalletLogPrintf("Deferred create-time keypool top up paused after a failed background step\n");
-        return;
+
+    bool continue_refill{false};
+    {
+        LOCK(wallet->cs_wallet);
+        const bool can_continue{!wallet->IsLocked() && wallet->HasPendingInitialKeyPoolTopUp()};
+        if (can_continue &&
+            (step_result == CWallet::PendingInitialKeyPoolTopUpStepResult::PENDING ||
+             wallet->m_deferred_create_keypool_top_up_reschedule_requested)) {
+            wallet->m_deferred_create_keypool_top_up_reschedule_requested = false;
+            continue_refill = true;
+        } else {
+            wallet->m_deferred_create_keypool_top_up_scheduled = false;
+            wallet->m_deferred_create_keypool_top_up_reschedule_requested = false;
+        }
     }
-    if (wallet->IsLocked() || !wallet->HasPendingInitialKeyPoolTopUp()) {
+
+    if (!continue_refill) {
+        if (step_result == CWallet::PendingInitialKeyPoolTopUpStepResult::COMPLETE) {
+            wallet->WalletLogPrintf("Deferred create-time keypool top up completed in %15dms\n",
+                Ticks<std::chrono::milliseconds>(SteadyClock::now() - *state->refill_start));
+        } else if (step_result == CWallet::PendingInitialKeyPoolTopUpStepResult::FAILED) {
+            wallet->WalletLogPrintf("Deferred create-time keypool top up paused after a failed background step\n");
+        }
         return;
     }
     if (--state->remaining_steps == 0) {
@@ -402,10 +419,24 @@ void RunScheduledPendingInitialKeyPoolTopUp(const std::shared_ptr<DeferredCreate
     state->scheduler->scheduleFromNow([state] { RunScheduledPendingInitialKeyPoolTopUp(state); }, std::chrono::milliseconds{1});
 }
 
-void SchedulePendingInitialKeyPoolTopUp(WalletContext& context, const std::shared_ptr<CWallet>& wallet)
+void SchedulePendingInitialKeyPoolTopUp(WalletContext& context, const std::shared_ptr<CWallet>& wallet, std::chrono::milliseconds delay)
 {
-    if (!context.scheduler || wallet->IsLocked() || !wallet->HasPendingInitialKeyPoolTopUp()) {
-        return;
+    if (!context.scheduler) return;
+
+    {
+        LOCK(wallet->cs_wallet);
+        if (wallet->IsLocked() || !wallet->HasPendingInitialKeyPoolTopUp()) {
+            return;
+        }
+        if (wallet->m_deferred_create_keypool_top_up_scheduled) {
+            // Record the unlock/scheduling attempt so a worker that is about
+            // to retire hands ownership to a replacement instead of clearing
+            // the deduplication flag after the attempt returns.
+            wallet->m_deferred_create_keypool_top_up_reschedule_requested = true;
+            return;
+        }
+        wallet->m_deferred_create_keypool_top_up_scheduled = true;
+        wallet->m_deferred_create_keypool_top_up_reschedule_requested = false;
     }
 
     auto state = std::make_shared<DeferredCreateKeyPoolTopUpState>(DeferredCreateKeyPoolTopUpState{
@@ -413,10 +444,9 @@ void SchedulePendingInitialKeyPoolTopUp(WalletContext& context, const std::share
         .scheduler = context.scheduler,
         .remaining_steps = GetDeferredCreateKeyPoolTopUpStepsPerBatch(),
         .refill_start = std::nullopt,
+        .step_finished_fn = context.deferred_keypool_top_up_step_finished_fn,
     });
-    // Let wallet creation return and the first address calls finish before background
-    // PQC derivation starts competing for CPU.
-    context.scheduler->scheduleFromNow([state] { RunScheduledPendingInitialKeyPoolTopUp(state); }, std::chrono::seconds{30});
+    context.scheduler->scheduleFromNow([state] { RunScheduledPendingInitialKeyPoolTopUp(state); }, delay);
 }
 
 void RunScheduledP2MRKeyPoolRefill(const std::shared_ptr<P2MRKeyPoolRefillState>& state)
@@ -550,7 +580,9 @@ std::shared_ptr<CWallet> LoadWalletInternal(WalletContext& context, const std::s
         AddWallet(context, wallet);
         wallet->postInitProcess();
         if (context.scheduler) SchedulePlaintextPQCKeyValidationInternal(*context.scheduler, wallet);
-        SchedulePendingInitialKeyPoolTopUp(context, wallet);
+        // Let wallet loading return and initial address calls finish before
+        // background PQC derivation starts competing for CPU.
+        SchedulePendingInitialKeyPoolTopUp(context, wallet, std::chrono::seconds{30});
 
         // Write the wallet setting
         UpdateWalletSetting(*context.chain, name, load_on_start, warnings);
@@ -622,6 +654,11 @@ private:
 void SchedulePlaintextPQCKeyValidation(CScheduler& scheduler, const std::shared_ptr<CWallet>& wallet)
 {
     SchedulePlaintextPQCKeyValidationInternal(scheduler, wallet);
+}
+
+void MaybeSchedulePendingInitialKeyPoolTopUp(WalletContext& context, const std::shared_ptr<CWallet>& wallet)
+{
+    SchedulePendingInitialKeyPoolTopUp(context, wallet, std::chrono::milliseconds{1});
 }
 
 void MaybeScheduleP2MRKeyPoolRefill(WalletContext& context, const std::shared_ptr<CWallet>& wallet, OutputType type, bool internal)
@@ -732,7 +769,9 @@ std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string&
     NotifyWalletLoaded(context, wallet);
     AddWallet(context, wallet);
     wallet->postInitProcess();
-    SchedulePendingInitialKeyPoolTopUp(context, wallet);
+    // Let wallet creation return and initial address calls finish before
+    // background PQC derivation starts competing for CPU.
+    SchedulePendingInitialKeyPoolTopUp(context, wallet, std::chrono::seconds{30});
 
     // Write the wallet settings
     UpdateWalletSetting(*context.chain, name, load_on_start, warnings);
@@ -2614,7 +2653,7 @@ bool CWallet::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint,
     return false;
 }
 
-std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bool& complete, std::optional<int> sighash_type, bool sign, bool bip32derivs, size_t * n_signed, bool finalize, const PQCSignatureCounterObserver& pqc_counter_observer) const
+std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bool& complete, std::optional<int> sighash_type, bool sign, bool bip32derivs, size_t * n_signed, bool finalize, const PQCSignatureCounterObserver& pqc_counter_observer, const SigningProgressCallback& progress_callback) const
 {
     const bool timing_enabled{util::signing_timing::Enabled()};
     const uint64_t timing_id{timing_enabled ? util::signing_timing::CurrentOrNextId() : 0};
@@ -2666,6 +2705,50 @@ std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bo
 
     if (n_signed) {
         *n_signed = 0;
+    }
+    complete = false;
+
+    std::set<unsigned int> unsigned_inputs;
+    for (unsigned int i = 0; i < psbtx.inputs.size(); ++i) {
+        if (!PSBTInputSigned(psbtx.inputs.at(i))) unsigned_inputs.insert(i);
+    }
+    const unsigned int input_total{static_cast<unsigned int>(unsigned_inputs.size())};
+    std::set<unsigned int> processed_inputs;
+    bool counters_reserved{false};
+    unsigned int reservations_completed{0};
+    std::optional<unsigned int> signing_input_index;
+    const auto notify_progress = [&](SigningProgressPhase phase,
+                                     unsigned int completed,
+                                     unsigned int total,
+                                     std::optional<unsigned int> input_index = std::nullopt,
+                                     bool cancellable = true) {
+        if (!sign || !progress_callback) return true;
+        const bool may_cancel{cancellable && !counters_reserved};
+        const bool should_continue{progress_callback(SigningProgress{
+            .phase = phase,
+            .completed = completed,
+            .total = total,
+            .input_index = input_index,
+            .cancellable = may_cancel,
+        })};
+        return should_continue || !may_cancel;
+    };
+    const PQCSignatureCounterObserver progress_counter_observer = sign
+        ? PQCSignatureCounterObserver{[&](const CPQCPubKey& pubkey, uint32_t previous_counter, uint32_t reserved_counter) {
+              counters_reserved = true;
+              ++reservations_completed;
+              notify_progress(SigningProgressPhase::RESERVING_PQC_COUNTERS,
+                              reservations_completed,
+                              /*total=*/0,
+                              signing_input_index,
+                              /*cancellable=*/false);
+              if (pqc_counter_observer) pqc_counter_observer(pubkey, previous_counter, reserved_counter);
+          }}
+        : pqc_counter_observer;
+
+    if (!notify_progress(SigningProgressPhase::PREPARING_TRANSACTION, 0, input_total)) {
+        log_fillpsbt_timing(/*success=*/false, "cancelled_preparing");
+        return PSBTError::INCOMPLETE;
     }
 
     struct ActiveSigningProviderSnapshot {
@@ -2727,7 +2810,14 @@ std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bo
             if (sign) {
                 if (auto signer_spk_man = dynamic_cast<ExternalSignerScriptPubKeyMan*>(spk_man)) {
                     int n_signed_this_spkm = 0;
-                    const auto error{signer_spk_man->FillPSBT(psbtx, locked_txdata, sighash_type, sign, bip32derivs, &n_signed_this_spkm, finalize, pqc_counter_observer)};
+                    if (!notify_progress(SigningProgressPhase::SIGNING_INPUTS,
+                                         static_cast<unsigned int>(processed_inputs.size()),
+                                         input_total)) {
+                        provider_collect_time = SteadyClock::now() - provider_collect_start;
+                        log_fillpsbt_timing(/*success=*/false, "cancelled_external_signer");
+                        return PSBTError::INCOMPLETE;
+                    }
+                    const auto error{signer_spk_man->FillPSBT(psbtx, locked_txdata, sighash_type, sign, bip32derivs, &n_signed_this_spkm, finalize, progress_counter_observer)};
                     if (error) {
                         provider_collect_time = SteadyClock::now() - provider_collect_start;
                         log_fillpsbt_timing(/*success=*/false, "external_signer_failed");
@@ -2737,10 +2827,20 @@ std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bo
                         (*n_signed) += n_signed_this_spkm;
                     }
                     signed_count_metric += n_signed_this_spkm;
+                    for (unsigned int i : unsigned_inputs) {
+                        if (PSBTInputSigned(psbtx.inputs.at(i))) processed_inputs.insert(i);
+                    }
+                    if (!notify_progress(SigningProgressPhase::SIGNING_INPUTS,
+                                         static_cast<unsigned int>(processed_inputs.size()),
+                                         input_total)) {
+                        provider_collect_time = SteadyClock::now() - provider_collect_start;
+                        log_fillpsbt_timing(/*success=*/false, "cancelled_after_external_signer");
+                        return PSBTError::INCOMPLETE;
+                    }
                     continue;
                 }
             }
-            if (auto provider = spk_man->GetSigningProviderForPSBT(psbtx, sign, pqc_counter_observer)) {
+            if (auto provider = spk_man->GetSigningProviderForPSBT(psbtx, sign, progress_counter_observer)) {
                 providers.push_back(std::move(*provider));
             }
         }
@@ -2773,7 +2873,32 @@ std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bo
                 return PSBTError::MISSING_INPUTS;
             }
 
+            signing_input_index = i;
+            if (sign) {
+                CTxOut utxo;
+                std::vector<std::vector<unsigned char>> solutions;
+                const bool is_p2mr{psbtx.GetInputUTXO(utxo, i) && Solver(utxo.scriptPubKey, solutions) == TxoutType::WITNESS_V2_P2MR};
+                if (is_p2mr && !notify_progress(SigningProgressPhase::RESERVING_PQC_COUNTERS,
+                                                reservations_completed,
+                                                /*total=*/0,
+                                                i)) {
+                    signing_input_index.reset();
+                    sign_inputs_time += SteadyClock::now() - sign_inputs_start;
+                    log_fillpsbt_timing(/*success=*/false, "cancelled_before_reservation");
+                    return PSBTError::INCOMPLETE;
+                }
+                if (!notify_progress(SigningProgressPhase::SIGNING_INPUTS,
+                                     static_cast<unsigned int>(processed_inputs.size()),
+                                     input_total,
+                                     i)) {
+                    signing_input_index.reset();
+                    sign_inputs_time += SteadyClock::now() - sign_inputs_start;
+                    log_fillpsbt_timing(/*success=*/false, "cancelled_signing");
+                    return PSBTError::INCOMPLETE;
+                }
+            }
             PSBTError res = SignPSBTInput(input_provider, psbtx, i, &txdata, sighash_type, nullptr, finalize);
+            signing_input_index.reset();
             if (res != PSBTError::OK && res != PSBTError::INCOMPLETE) {
                 sign_inputs_time += SteadyClock::now() - sign_inputs_start;
                 log_fillpsbt_timing(/*success=*/false, "sign_input_failed");
@@ -2783,6 +2908,17 @@ std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bo
             const bool signed_one = PSBTInputSigned(input);
             if (signed_one || !sign) {
                 ++n_signed_this_spkm;
+            }
+            if (sign && signed_one && unsigned_inputs.contains(i)) {
+                processed_inputs.insert(i);
+                if (!notify_progress(SigningProgressPhase::SIGNING_INPUTS,
+                                     static_cast<unsigned int>(processed_inputs.size()),
+                                     input_total,
+                                     i)) {
+                    sign_inputs_time += SteadyClock::now() - sign_inputs_start;
+                    log_fillpsbt_timing(/*success=*/false, "cancelled_after_signing");
+                    return PSBTError::INCOMPLETE;
+                }
             }
         }
         sign_inputs_time += SteadyClock::now() - sign_inputs_start;
@@ -2800,15 +2936,43 @@ std::optional<PSBTError> CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bo
         signed_count_metric += n_signed_this_spkm;
     }
 
+    if (sign && finalize && !notify_progress(SigningProgressPhase::FINALIZING_TRANSACTION, 0, 1)) {
+        log_fillpsbt_timing(/*success=*/false, "cancelled_finalizing");
+        return PSBTError::INCOMPLETE;
+    }
     const auto remove_unnecessary_start{SteadyClock::now()};
     RemoveUnnecessaryTransactions(psbtx);
     remove_unnecessary_time = SteadyClock::now() - remove_unnecessary_start;
+    if (sign && finalize) {
+        if (!notify_progress(SigningProgressPhase::FINALIZING_TRANSACTION, 1, 1)) {
+            log_fillpsbt_timing(/*success=*/false, "cancelled_after_finalizing");
+            return PSBTError::INCOMPLETE;
+        }
+    }
 
     // Complete if every input is now signed
     const auto final_verify_start{SteadyClock::now()};
     complete = true;
     for (size_t i = 0; i < psbtx.inputs.size(); ++i) {
+        if (!notify_progress(SigningProgressPhase::VERIFYING_TRANSACTION,
+                             static_cast<unsigned int>(i),
+                             static_cast<unsigned int>(psbtx.inputs.size()),
+                             static_cast<unsigned int>(i))) {
+            complete = false;
+            final_verify_time = SteadyClock::now() - final_verify_start;
+            log_fillpsbt_timing(/*success=*/false, "cancelled_verifying");
+            return PSBTError::INCOMPLETE;
+        }
         complete &= PSBTInputSignedAndVerified(psbtx, i, &txdata);
+        if (!notify_progress(SigningProgressPhase::VERIFYING_TRANSACTION,
+                             static_cast<unsigned int>(i + 1),
+                             static_cast<unsigned int>(psbtx.inputs.size()),
+                             static_cast<unsigned int>(i))) {
+            complete = false;
+            final_verify_time = SteadyClock::now() - final_verify_start;
+            log_fillpsbt_timing(/*success=*/false, "cancelled_after_verifying");
+            return PSBTError::INCOMPLETE;
+        }
     }
     final_verify_time = SteadyClock::now() - final_verify_start;
     complete_metric = complete;
@@ -4562,6 +4726,7 @@ ScriptPubKeyMan* CWallet::GetScriptPubKeyMan(const OutputType& type, bool intern
 
 std::set<ScriptPubKeyMan*> CWallet::GetScriptPubKeyMans(const CScript& script) const
 {
+    AssertLockHeld(cs_wallet);
     std::set<ScriptPubKeyMan*> spk_mans;
 
     // Search the cache for relevant SPKMs instead of iterating m_spk_managers
@@ -4591,6 +4756,7 @@ std::unique_ptr<SigningProvider> CWallet::GetSolvingProvider(const CScript& scri
 
 std::unique_ptr<SigningProvider> CWallet::GetSolvingProvider(const CScript& script, SignatureData& sigdata) const
 {
+    LOCK(cs_wallet);
     // Search the cache for relevant SPKMs instead of iterating m_spk_managers
     const auto& it = m_cached_spks.find(script);
     if (it != m_cached_spks.end()) {
@@ -4604,6 +4770,7 @@ std::unique_ptr<SigningProvider> CWallet::GetSolvingProvider(const CScript& scri
 
 std::vector<WalletDescriptor> CWallet::GetWalletDescriptors(const CScript& script) const
 {
+    LOCK(cs_wallet);
     std::vector<WalletDescriptor> descs;
     for (const auto spk_man: GetScriptPubKeyMans(script)) {
         if (const auto desc_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(spk_man)) {
@@ -5077,8 +5244,8 @@ util::Result<void> CWallet::ApplyMigrationData(WalletBatch& local_wallet_batch, 
     // When the legacy wallet has no spendable scripts, the main wallet will be empty, leaving its script cache empty as well.
     // The watch-only and/or solvable wallet(s) will contain the scripts in their respective caches.
     if (!data.desc_spkms.empty()) Assume(!m_cached_spks.empty());
-    if (!data.watch_descs.empty()) Assume(!data.watchonly_wallet->m_cached_spks.empty());
-    if (!data.solvable_descs.empty()) Assume(!data.solvable_wallet->m_cached_spks.empty());
+    if (!data.watch_descs.empty()) Assume(WITH_LOCK(data.watchonly_wallet->cs_wallet, return !data.watchonly_wallet->m_cached_spks.empty()));
+    if (!data.solvable_descs.empty()) Assume(WITH_LOCK(data.solvable_wallet->cs_wallet, return !data.solvable_wallet->m_cached_spks.empty()));
 
     for (auto& desc_spkm : data.desc_spkms) {
         if (m_spk_managers.count(desc_spkm->GetID()) > 0) {
@@ -5640,6 +5807,10 @@ void CWallet::CacheNewScriptPubKeys(const std::set<CScript>& spks, ScriptPubKeyM
 
 void CWallet::TopUpCallback(const std::set<CScript>& spks, ScriptPubKeyMan* spkm)
 {
+    if (m_before_script_pub_key_cache_publish) {
+        m_before_script_pub_key_cache_publish(spks, spkm);
+    }
+    LOCK(cs_wallet);
     // Update scriptPubKey cache
     CacheNewScriptPubKeys(spks, spkm);
 }
