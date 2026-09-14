@@ -14,6 +14,7 @@
 #include <logging.h>
 #include <outputtype.h>
 #include <policy/feerate.h>
+#include <policy/policy.h>
 #include <primitives/transaction.h>
 #include <primitives/transaction_identifier.h>
 #include <script/interpreter.h>
@@ -112,8 +113,14 @@ std::unique_ptr<WalletDatabase> MakeWalletDatabase(const std::string& name, cons
 
 //! -paytxfee default
 constexpr CAmount DEFAULT_PAY_TX_FEE = 0;
-//! -fallbackfee default
-static const CAmount DEFAULT_FALLBACK_FEE = 0;
+//! -fallbackfee default. Unlike Bitcoin Core (which disables the fallback fee
+//! on mainnet), qbit defaults to the minimum relay fee rate so that wallets can
+//! create transactions while the chain is young and the fee estimator has no
+//! data (an empty mempool yields no estimates, see GetMinimumFeeRate()). The
+//! required-fee clamp in GetMinimumFeeRate() ensures this can never underpay
+//! relay policy, and organic fee estimates take precedence once available.
+//! Set -fallbackfee=0 to restore the upstream behavior of failing instead.
+static const CAmount DEFAULT_FALLBACK_FEE = DEFAULT_MIN_RELAY_TX_FEE;
 //! -discardfee default
 static const CAmount DEFAULT_DISCARD_FEE = 10000;
 //! -mintxfee default
