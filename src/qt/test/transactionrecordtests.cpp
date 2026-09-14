@@ -36,7 +36,7 @@ interfaces::WalletTx MakeWalletTx(const std::vector<CAmount>& output_amounts,
     wtx.txout_is_mine = output_is_mine;
     wtx.txout_is_change = output_is_change;
     wtx.txout_address.assign(output_amounts.size(), CNoDestination{});
-    wtx.txout_address_is_mine = output_is_mine;
+    wtx.txout_address_is_mine.assign(output_amounts.size(), false);
     wtx.credit = 0;
     wtx.change = 0;
     for (size_t i = 0; i < output_amounts.size(); ++i) {
@@ -65,6 +65,7 @@ void TransactionRecordTests::feeBearingChangeOnlyPayment()
     QCOMPARE(parts.front().debit, -1);
     QCOMPARE(parts.front().credit, 0);
     QCOMPARE(parts.front().getOutputIndex(), -1);
+    QVERIFY(parts.front().address.empty());
     QCOMPARE(parts.front().debit + parts.front().credit, wtx.credit - wtx.debit);
 }
 
@@ -94,4 +95,44 @@ void TransactionRecordTests::zeroFeeChangeOnlyPayment()
         /*debit=*/100)};
 
     QVERIFY(TransactionRecord::decomposeTransaction(wtx).empty());
+}
+
+void TransactionRecordTests::incomingPaymentToChange()
+{
+    interfaces::WalletTx wtx{MakeWalletTx({99}, {true}, {true}, /*debit=*/0)};
+    wtx.txin_is_mine = {false};
+
+    const auto parts{TransactionRecord::decomposeTransaction(wtx)};
+    QCOMPARE(parts.size(), 1);
+    QCOMPARE(parts.front().type, TransactionRecord::RecvFromOther);
+    QCOMPARE(parts.front().credit, 99);
+    QCOMPARE(parts.front().debit, 0);
+    QCOMPARE(parts.front().getOutputIndex(), 0);
+}
+
+void TransactionRecordTests::ordinaryPaymentToSelf()
+{
+    const auto wtx{MakeWalletTx({30, 69}, {true, true}, {false, true}, /*debit=*/100)};
+
+    const auto parts{TransactionRecord::decomposeTransaction(wtx)};
+    QCOMPARE(parts.size(), 2);
+    QCOMPARE(parts[0].type, TransactionRecord::SendToOther);
+    QCOMPARE(parts[1].type, TransactionRecord::RecvFromOther);
+    QCOMPARE(parts[0].debit, -31);
+    QCOMPARE(parts[1].credit, 30);
+    QCOMPARE(parts[0].debit + parts[1].credit, wtx.credit - wtx.debit);
+}
+
+void TransactionRecordTests::mixedInputPayment()
+{
+    interfaces::WalletTx wtx{MakeWalletTx({99}, {true}, {true}, /*debit=*/60)};
+    CMutableTransaction tx{*wtx.tx};
+    tx.vin.emplace_back(COutPoint{Txid::FromUint256(uint256::ONE), 1});
+    wtx.tx = MakeTransactionRef(std::move(tx));
+    wtx.txin_is_mine = {true, false};
+
+    const auto parts{TransactionRecord::decomposeTransaction(wtx)};
+    QCOMPARE(parts.size(), 1);
+    QCOMPARE(parts.front().type, TransactionRecord::Other);
+    QCOMPARE(parts.front().debit + parts.front().credit, wtx.credit - wtx.debit);
 }

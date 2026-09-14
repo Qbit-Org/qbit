@@ -15,6 +15,9 @@ private Q_SLOTS:
     void feeBearingChangeOnlyPayment();
     void ordinaryPaymentWithChange();
     void zeroFeeChangeOnlyPayment();
+    void incomingPaymentToChange();
+    void ordinaryPaymentToSelf();
+    void mixedInputPayment();
 };
 
 #endif // QBIT_QT_TEST_TRANSACTIONRECORDTESTS_H

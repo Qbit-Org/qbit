@@ -463,6 +463,7 @@ class ListSinceBlockTest(BitcoinTestFramework):
         addr = self.nodes[2].getrawchangeaddress()
         txid = self.nodes[2].sendtoaddress(addr, 1)
         assert_equal(self.nodes[2].getbalance() - balance_before, self.nodes[2].gettransaction(txid)["fee"])
+        self.assert_fee_only_history(wallet=self.nodes[2], txid=txid, block_hash=block_hash)
         self.sync_mempools()
         self.generate(self.nodes[0], 1)
 
@@ -511,6 +512,7 @@ class ListSinceBlockTest(BitcoinTestFramework):
         transfer = miniwallet.send_self_transfer(from_node=self.nodes[2], fee=Decimal("0.001"))
         self.nodes[2].syncwithvalidationinterfacequeue()
         assert_equal(watch_wallet.getbalance() - balance_before, watch_wallet.gettransaction(transfer["txid"])["fee"])
+        self.assert_fee_only_history(wallet=watch_wallet, txid=transfer["txid"], block_hash=block_hash)
         self.sync_mempools()
         self.generate(self.nodes[0], 1)
 
@@ -519,6 +521,12 @@ class ListSinceBlockTest(BitcoinTestFramework):
             txid=transfer["txid"],
             block_hash=block_hash,
         )
+        assert_equal(watch_wallet.getbalance(), Decimal("0.999"))
+        assert_equal(sum(coin["amount"] for coin in watch_wallet.listunspent()), Decimal("0.999"))
+        self.nodes[2].unloadwallet("change_only_watch")
+        self.nodes[2].loadwallet("change_only_watch")
+        self.assert_fee_only_history(wallet=watch_wallet, txid=transfer["txid"], block_hash=block_hash)
+        assert_equal(watch_wallet.getbalance(), Decimal("0.999"))
         self.nodes[2].unloadwallet("change_only_watch")
 
     def assert_fee_only_history(self, *, wallet, txid, block_hash):
@@ -546,16 +554,23 @@ class ListSinceBlockTest(BitcoinTestFramework):
         assert_equal(len(since), 1)
         check_entry(since[0])
 
+        # Label filters select incoming payments and must not invent a label
+        # for this transaction-level send.
+        assert not any(entry["txid"] == txid for entry in wallet.listtransactions("history-filter", 1000))
+        assert not any(entry["txid"] == txid for entry in wallet.listsinceblock(blockhash=block_hash, label="history-filter")["transactions"])
+
         with_change = [
             entry for entry in wallet.listsinceblock(blockhash=block_hash, include_change=True)["transactions"]
             if entry["txid"] == txid
         ]
+        assert_equal(len(with_change), 2 * len(tx["decoded"]["vout"]))
         sent = {entry["vout"]: entry for entry in with_change if entry["category"] == "send"}
         received = {entry["vout"]: entry for entry in with_change if entry["category"] == "receive"}
         assert_equal(len(sent), len(tx["decoded"]["vout"]))
         assert_equal(set(sent), set(received))
         for vout, sent_entry in sent.items():
             assert_equal(sent_entry["amount"], -received[vout]["amount"])
+            assert_equal(sent_entry["fee"], tx["fee"])
             assert "address" in sent_entry
             assert wallet.getaddressinfo(sent_entry["address"])["ischange"]
 

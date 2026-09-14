@@ -459,7 +459,7 @@ RPCHelpMan listtransactions()
                                 "\"orphan\"                Orphaned coinbase transactions received."},
                             {RPCResult::Type::STR_AMOUNT, "amount", "The amount in " + CURRENCY_UNIT + ". This is negative for the 'send' category except a fee-only internal transfer, which is zero, and is positive\n"
                                 "for all other categories"},
-                            {RPCResult::Type::STR, "label", /*optional=*/true, "A comment for the address/transaction, if any"},
+                            {RPCResult::Type::STR, "label", /*optional=*/true, "A comment for the address/transaction, if any. Not returned for a fee-only internal transfer."},
                             {RPCResult::Type::NUM, "vout", /*optional=*/true, "The vout value. Not returned for a fee-only internal transfer."},
                             {RPCResult::Type::STR_AMOUNT, "fee", /*optional=*/true, "The amount of the fee in " + CURRENCY_UNIT + ". This is negative and only available for the\n"
                                  "'send' category of transactions."},
@@ -549,7 +549,7 @@ RPCHelpMan listsinceblock()
                     {"include_watchonly", RPCArg::Type::BOOL, RPCArg::Default{false}, "(DEPRECATED) No longer used"},
                     {"include_removed", RPCArg::Type::BOOL, RPCArg::Default{true}, "Show transactions that were removed due to a reorg in the \"removed\" array\n"
                                                                        "(not guaranteed to work on pruned nodes)"},
-                    {"include_change", RPCArg::Type::BOOL, RPCArg::Default{false}, "Also add entries for change outputs.\n"},
+                    {"include_change", RPCArg::Type::BOOL, RPCArg::Default{false}, "Also add entries for change outputs. Uses output-level send and receive entries instead of a fee-only entry for change-only self-transfers.\n"},
                     {"label", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "Return only incoming transactions paying to addresses with the specified label.\n"},
                 },
                 RPCResult{
@@ -575,7 +575,7 @@ RPCHelpMan listsinceblock()
                             TransactionDescriptionString()),
                             {
                                 {RPCResult::Type::BOOL, "abandoned", "'true' if the transaction has been abandoned (inputs are respendable)."},
-                                {RPCResult::Type::STR, "label", /*optional=*/true, "A comment for the address/transaction, if any"},
+                                {RPCResult::Type::STR, "label", /*optional=*/true, "A comment for the address/transaction, if any. Not returned for a fee-only internal transfer."},
                             })},
                         }},
                         {RPCResult::Type::ARR, "removed", /*optional=*/true, "<structure is the same as \"transactions\" above, only present if include_removed=true>\n"
@@ -679,7 +679,9 @@ RPCHelpMan gettransaction()
 {
     return RPCHelpMan{
         "gettransaction",
-        "Get detailed information about in-wallet transaction <txid>\n",
+        "Get detailed information about in-wallet transaction <txid>\n"
+        "Fee-bearing self-transfers with only change outputs have one fee-only send detail: amount zero,\n"
+        "the negative fee, and no address, label, or vout.\n",
                 {
                     {"txid", RPCArg::Type::STR, RPCArg::Optional::NO, "The transaction id"},
                     {"include_watchonly", RPCArg::Type::BOOL, RPCArg::Default{false}, "(DEPRECATED) No longer used"},
@@ -707,7 +709,7 @@ RPCHelpMan gettransaction()
                                     "\"immature\"              Coinbase transactions received with 100 or fewer confirmations.\n"
                                     "\"orphan\"                Orphaned coinbase transactions received."},
                                 {RPCResult::Type::STR_AMOUNT, "amount", "The amount in " + CURRENCY_UNIT},
-                                {RPCResult::Type::STR, "label", /*optional=*/true, "A comment for the address/transaction, if any"},
+                                {RPCResult::Type::STR, "label", /*optional=*/true, "A comment for the address/transaction, if any. Not returned for a fee-only internal transfer."},
                                 {RPCResult::Type::NUM, "vout", /*optional=*/true, "The vout value. Not returned for a fee-only internal transfer."},
                                 {RPCResult::Type::STR_AMOUNT, "fee", /*optional=*/true, "The amount of the fee in " + CURRENCY_UNIT + ". This is negative and only available for the \n"
                                     "'send' category of transactions."},
