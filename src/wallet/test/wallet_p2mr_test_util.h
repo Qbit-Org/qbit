@@ -12,6 +12,8 @@
 #include <future>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <array>
 #include <set>
 #include <string>
@@ -476,20 +478,29 @@ struct ObservedCounterRange {
     uint64_t sequence{0};
 };
 
+struct ObservedSigningCall {
+    CPQCPubKey pubkey;
+    uint32_t counter{0};
+    uint64_t started{0};
+    uint64_t finished{0};
+    std::optional<bool> success;
+};
+
 //! Observes what the mock wallet database durably committed. A successful
 //! commit's ranges are diffed against the previous successful commit; a failed
 //! commit's ranges are the writes that its abort discards.
-class DurableCounterRecorder
+class DurableCounterRecorder : public PQCSigningObserver
 {
 public:
-    explicit DurableCounterRecorder(CWallet& wallet)
+    explicit DurableCounterRecorder(CWallet& wallet, bool observe_signing = false)
         : m_database{GetMockableDatabase(wallet)}, m_committed{ReadDurablePQCCounters(m_database.m_records)}
     {
+        if (observe_signing) m_signing_observer.emplace(*this);
         m_database.ResetCounts();
         m_database.m_txn_commit_result_hook = [this](bool success) { OnCommitResult(success); };
     }
 
-    ~DurableCounterRecorder()
+    ~DurableCounterRecorder() override
     {
         m_database.m_txn_commit_result_hook = {};
         m_database.m_txn_commit_pass = true;
@@ -502,8 +513,31 @@ public:
     std::function<void(const DurableCommit&)> on_commit;
 
     MockableDatabase& Database() const { return m_database; }
-    uint64_t Sequence() const { return m_sequence; }
     const std::vector<DurableCommit>& Commits() const { return m_commits; }
+
+    bool ObservingSigning() const { return m_signing_observer.has_value(); }
+
+    std::map<uint64_t, ObservedSigningCall> SigningCalls() const
+    {
+        std::lock_guard lock{m_observation_mutex};
+        return m_signing_calls;
+    }
+
+    uint64_t BeforeSign(const CPQCPubKey& pubkey, uint32_t counter) override
+    {
+        std::lock_guard lock{m_observation_mutex};
+        const uint64_t call{++m_sequence};
+        m_signing_calls.emplace(call, ObservedSigningCall{pubkey, counter, call, 0, std::nullopt});
+        return call;
+    }
+
+    void AfterSign(uint64_t call, bool success) override
+    {
+        std::lock_guard lock{m_observation_mutex};
+        auto& observation{m_signing_calls.at(call)};
+        observation.finished = ++m_sequence;
+        observation.success = success;
+    }
 
     std::vector<DurableCommit> PQCCommits(bool success) const
     {
@@ -517,6 +551,7 @@ public:
     PQCSignatureCounterObserver MakeObserver(std::vector<ObservedCounterRange>& observed) const
     {
         return [this, &observed](const CPQCPubKey& pubkey, uint32_t previous_counter, uint32_t reserved_counter) {
+            std::lock_guard lock{m_observation_mutex};
             observed.push_back({pubkey, previous_counter, reserved_counter, m_sequence});
         };
     }
@@ -551,7 +586,7 @@ private:
     void OnCommitResult(bool success)
     {
         auto current{ReadDurablePQCCounters(m_database.m_records)};
-        DurableCommit commit{.sequence = ++m_sequence, .success = success};
+        DurableCommit commit{.success = success};
         for (const auto& [key, counter] : current) {
             const auto committed_it{m_committed.find(key)};
             const uint32_t previous{committed_it == m_committed.end() ? 0 : committed_it->second};
@@ -560,14 +595,24 @@ private:
             }
         }
         if (success) m_committed = std::move(current);
-        m_commits.push_back(commit);
-        if (on_commit) on_commit(m_commits.back());
+        {
+            // Share ordering with the real signer callbacks, including a signer
+            // incorrectly started before this durable commit completed.
+            std::lock_guard lock{m_observation_mutex};
+            commit.sequence = ++m_sequence;
+            m_commits.push_back(commit);
+        }
+        if (on_commit) on_commit(commit);
     }
 
     MockableDatabase& m_database;
     std::map<PQCRecordKey, uint32_t> m_committed;
     std::vector<DurableCommit> m_commits;
+    mutable std::mutex m_observation_mutex;
     uint64_t m_sequence{0};
+    std::map<uint64_t, ObservedSigningCall> m_signing_calls;
+    // Declared last so the observer is detached before its recorded state dies.
+    std::optional<ScopedPQCSigningObserver> m_signing_observer;
 };
 
 //! Verifies every input of `signed_tx` against all real spent outputs in

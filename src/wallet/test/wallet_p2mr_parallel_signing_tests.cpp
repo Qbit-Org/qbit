@@ -867,6 +867,25 @@ static void CheckPQCCounters(interfaces::Chain& chain, const MixedManagerP2MRWor
     }
 }
 
+static void CheckActualSigningCalls(const DurableCounterRecorder& recorder, size_t expected_calls)
+{
+    BOOST_REQUIRE(recorder.ObservingSigning());
+    const auto calls{recorder.SigningCalls()};
+    BOOST_CHECK_EQUAL(calls.size(), expected_calls);
+    std::set<std::pair<CPQCPubKey, uint32_t>> used;
+    for (const auto& [id, call] : calls) {
+        BOOST_CHECK_EQUAL(id, call.started);
+        BOOST_CHECK_GT(call.finished, call.started);
+        BOOST_CHECK(call.success == std::optional<bool>{true});
+        BOOST_REQUIRE_LT(call.counter, PQC_MAX_SIGNATURES);
+        BOOST_CHECK_MESSAGE(used.emplace(call.pubkey, call.counter).second,
+            strprintf("actual signer reused counter %u", call.counter));
+        const ObservedCounterRange actual{call.pubkey, call.counter, call.counter + 1, call.started - 1};
+        BOOST_CHECK_MESSAGE(recorder.CommittedBefore(actual),
+            strprintf("actual signer used counter %u at sequence %u before durable reservation", call.counter, call.started));
+    }
+}
+
 static void CheckCountersCommittedBeforeUse(const DurableCounterRecorder& recorder, const std::vector<ObservedCounterRange>& observed)
 {
     for (const auto& observation : observed) {
@@ -874,6 +893,7 @@ static void CheckCountersCommittedBeforeUse(const DurableCounterRecorder& record
             strprintf("counter range [%u,%u) observed at sequence %u without an earlier durable commit",
                 observation.previous_counter, observation.reserved_counter, observation.sequence));
     }
+    CheckActualSigningCalls(recorder, observed.size());
 }
 
 static std::string FormatReloadedCounters(interfaces::Chain& chain, const MixedManagerP2MRWorkload& workload)
@@ -905,7 +925,7 @@ BOOST_AUTO_TEST_CASE(MixedManagersUseTwoDurableBatches)
         auto workload{MakeMixedManagerP2MRSigningWorkload(*m_node.chain, InterleavedMixedInputs(4, 4, external_first))};
         const CMutableTransaction unsigned_tx{workload.spend_tx};
 
-        DurableCounterRecorder recorder{*workload.wallet};
+        DurableCounterRecorder recorder{*workload.wallet, /*observe_signing=*/true};
         std::vector<ObservedCounterRange> observed;
         std::map<int, bilingual_str> input_errors;
         const bool signed_ok{workload.wallet->SignTransaction(workload.spend_tx, workload.coins, SIGHASH_DEFAULT, input_errors,
@@ -968,7 +988,7 @@ BOOST_AUTO_TEST_CASE(MixedManagersKeepForeignInputErrors)
 
         const auto oracle{RunSerialSigningOracle(*m_node.chain, *m_node.args, *workload.wallet, presigned_tx, workload.coins, SIGHASH_DEFAULT)};
 
-        DurableCounterRecorder recorder{*workload.wallet};
+        DurableCounterRecorder recorder{*workload.wallet, /*observe_signing=*/true};
         std::vector<ObservedCounterRange> observed;
         std::vector<SigningProgress> progress_events;
         std::map<int, bilingual_str> input_errors;
@@ -1083,12 +1103,13 @@ BOOST_AUTO_TEST_CASE(MixedManagersPreserveSighashContext)
         const CMutableTransaction presigned_tx{workload.spend_tx};
         BOOST_REQUIRE(!VerifyP2MRSpend(presigned_tx, presigned_tx, workload.coins).contains(UNOWNED_INPUT));
 
-        DurableCounterRecorder recorder{*workload.wallet};
+        DurableCounterRecorder recorder{*workload.wallet, /*observe_signing=*/true};
         std::map<int, bilingual_str> input_errors;
         const bool signed_ok{workload.wallet->SignTransaction(workload.spend_tx, workload.coins, sighash, input_errors)};
         LogDurableEvidence(strprintf("MixedManagersPreserveSighashContext sighash=0x%02x external_first=%d", sighash, external_first), *m_node.chain, workload, recorder);
 
         BOOST_REQUIRE_MESSAGE(signed_ok, FormatInputErrors(input_errors));
+        CheckActualSigningCalls(recorder, owners.size() - 1);
         const auto failures{VerifyP2MRSpend(presigned_tx, workload.spend_tx, workload.coins)};
         for (const auto& [input, error] : failures) {
             BOOST_ERROR(strprintf("sighash=0x%02x input %u failed independent verification: %s", sighash, input, error));
@@ -1121,7 +1142,7 @@ BOOST_AUTO_TEST_CASE(MixedManagersPreserveSighashContext)
 //! after another one succeeded, and returns {committed manager, failed manager}.
 static std::pair<MixedInputOwner, MixedInputOwner> SignWithSecondCommitFailure(interfaces::Chain& chain, MixedManagerP2MRWorkload& workload, const CMutableTransaction& unsigned_tx, const std::string& label)
 {
-    DurableCounterRecorder recorder{*workload.wallet};
+    DurableCounterRecorder recorder{*workload.wallet, /*observe_signing=*/true};
     bool injected{false};
     recorder.on_commit = [&](const DurableCommit& commit) {
         if (commit.success && !commit.ranges.empty() && !injected) {
@@ -1170,7 +1191,7 @@ BOOST_AUTO_TEST_CASE(MixedManagersPreserveDurableCountersOnFailure)
         {
             auto workload{MakeMixedManagerP2MRSigningWorkload(*m_node.chain, owners)};
             const CMutableTransaction unsigned_tx{workload.spend_tx};
-            DurableCounterRecorder recorder{*workload.wallet};
+            DurableCounterRecorder recorder{*workload.wallet, /*observe_signing=*/true};
             recorder.Database().m_txn_commit_pass = false;
             recorder.on_commit = [&](const DurableCommit& commit) {
                 if (!commit.success) recorder.Database().m_txn_commit_pass = true;
@@ -1213,7 +1234,7 @@ BOOST_AUTO_TEST_CASE(MixedManagersPreserveDurableCountersOnFailure)
             // The committed manager's own inputs are complete and it sees only
             // foreign inputs: its provider reports them and reserves nothing.
             {
-                DurableCounterRecorder direct_recorder{*workload.wallet};
+                DurableCounterRecorder direct_recorder{*workload.wallet, /*observe_signing=*/true};
                 CMutableTransaction direct_tx{workload.spend_tx};
                 const auto provider{workload.SpkMan(committed).GetSigningProviderForTransaction(workload.coins)};
                 BOOST_REQUIRE(provider);
@@ -1223,13 +1244,14 @@ BOOST_AUTO_TEST_CASE(MixedManagersPreserveDurableCountersOnFailure)
                 for (const unsigned int input : workload.InputsOwnedBy(failed_owner)) foreign_indices.insert(static_cast<int>(input));
                 BOOST_CHECK(ErrorIndices(direct_errors) == foreign_indices);
                 BOOST_CHECK(direct_recorder.Commits().empty());
+                CheckActualSigningCalls(direct_recorder, 0);
                 for (unsigned int input{0}; input < direct_tx.vin.size(); ++input) {
                     BOOST_CHECK(direct_tx.vin[input].scriptWitness.stack == workload.spend_tx.vin[input].scriptWitness.stack);
                 }
                 CheckPQCCounters(*m_node.chain, workload, workload.InputsOwnedBy(committed), 1);
             }
 
-            DurableCounterRecorder recorder{*workload.wallet};
+            DurableCounterRecorder recorder{*workload.wallet, /*observe_signing=*/true};
             std::vector<ObservedCounterRange> observed;
             std::map<int, bilingual_str> input_errors;
             const bool signed_ok{workload.wallet->SignTransaction(workload.spend_tx, workload.coins, SIGHASH_DEFAULT, input_errors, recorder.MakeObserver(observed), {})};
@@ -1255,7 +1277,7 @@ BOOST_AUTO_TEST_CASE(MixedManagersPreserveDurableCountersOnFailure)
                 strprintf("MixedManagersPreserveDurableCountersOnFailure(b->d) external_first=%d", external_first));
 
             workload.spend_tx = unsigned_tx;
-            DurableCounterRecorder recorder{*workload.wallet};
+            DurableCounterRecorder recorder{*workload.wallet, /*observe_signing=*/true};
             std::vector<ObservedCounterRange> observed;
             std::map<int, bilingual_str> input_errors;
             const bool signed_ok{workload.wallet->SignTransaction(workload.spend_tx, workload.coins, SIGHASH_DEFAULT, input_errors, recorder.MakeObserver(observed), {})};
@@ -1293,7 +1315,7 @@ BOOST_AUTO_TEST_CASE(MixedManagersHonorReservationBoundary)
         // (a) A one-shot cancel at the first manager's guard stops every manager.
         {
             auto workload{MakeMixedManagerP2MRSigningWorkload(*m_node.chain, owners)};
-            DurableCounterRecorder recorder{*workload.wallet};
+            DurableCounterRecorder recorder{*workload.wallet, /*observe_signing=*/true};
             unsigned int guard_events{0};
             std::map<int, bilingual_str> input_errors;
             const bool signed_ok{workload.wallet->SignTransaction(workload.spend_tx, workload.coins, SIGHASH_DEFAULT, input_errors, {},
@@ -1302,6 +1324,7 @@ BOOST_AUTO_TEST_CASE(MixedManagersHonorReservationBoundary)
                 })};
             LogDurableEvidence(strprintf("MixedManagersHonorReservationBoundary(a) external_first=%d errors={%s}", external_first, FormatInputErrors(input_errors)), *m_node.chain, workload, recorder);
 
+            CheckActualSigningCalls(recorder, 0);
             BOOST_CHECK(!signed_ok);
             BOOST_CHECK_EQUAL(guard_events, 1U);
             BOOST_CHECK(HasSigningCancelled(input_errors));
@@ -1315,7 +1338,7 @@ BOOST_AUTO_TEST_CASE(MixedManagersHonorReservationBoundary)
         {
             auto workload{MakeMixedManagerP2MRSigningWorkload(*m_node.chain, owners)};
             const CMutableTransaction unsigned_tx{workload.spend_tx};
-            DurableCounterRecorder recorder{*workload.wallet};
+            DurableCounterRecorder recorder{*workload.wallet, /*observe_signing=*/true};
             unsigned int guard_events{0};
             std::map<int, bilingual_str> input_errors;
             const bool signed_ok{workload.wallet->SignTransaction(workload.spend_tx, workload.coins, SIGHASH_DEFAULT, input_errors, {},
@@ -1324,6 +1347,7 @@ BOOST_AUTO_TEST_CASE(MixedManagersHonorReservationBoundary)
                 })};
             LogDurableEvidence(strprintf("MixedManagersHonorReservationBoundary(b) external_first=%d errors={%s}", external_first, FormatInputErrors(input_errors)), *m_node.chain, workload, recorder);
 
+            CheckActualSigningCalls(recorder, 2);
             BOOST_CHECK(!signed_ok);
             BOOST_CHECK_EQUAL(guard_events, 2U);
             BOOST_CHECK(HasSigningCancelled(input_errors));
@@ -1345,7 +1369,7 @@ BOOST_AUTO_TEST_CASE(MixedManagersHonorReservationBoundary)
         // guard stops the remaining manager too.
         {
             auto workload{MakeMixedManagerP2MRSigningWorkload(*m_node.chain, owners, /*output_count=*/owners.size() - 1)};
-            DurableCounterRecorder recorder{*workload.wallet};
+            DurableCounterRecorder recorder{*workload.wallet, /*observe_signing=*/true};
             unsigned int guard_events{0};
             bool saw_batch_reservation{false};
             std::map<int, bilingual_str> input_errors;
@@ -1356,6 +1380,7 @@ BOOST_AUTO_TEST_CASE(MixedManagersHonorReservationBoundary)
                 })};
             LogDurableEvidence(strprintf("MixedManagersHonorReservationBoundary(c) external_first=%d errors={%s}", external_first, FormatInputErrors(input_errors)), *m_node.chain, workload, recorder);
 
+            CheckActualSigningCalls(recorder, 0);
             BOOST_CHECK(!signed_ok);
             BOOST_CHECK(!saw_batch_reservation);
             BOOST_CHECK_EQUAL(guard_events, 1U);
@@ -1371,7 +1396,7 @@ BOOST_AUTO_TEST_CASE(MixedManagersHonorReservationBoundary)
         {
             auto workload{MakeMixedManagerP2MRSigningWorkload(*m_node.chain, owners)};
             const CMutableTransaction unsigned_tx{workload.spend_tx};
-            DurableCounterRecorder recorder{*workload.wallet};
+            DurableCounterRecorder recorder{*workload.wallet, /*observe_signing=*/true};
             bool reject{false};
             std::map<int, bilingual_str> input_errors;
             const bool signed_ok{workload.wallet->SignTransaction(workload.spend_tx, workload.coins, SIGHASH_DEFAULT, input_errors, {},
@@ -1381,6 +1406,7 @@ BOOST_AUTO_TEST_CASE(MixedManagersHonorReservationBoundary)
                 })};
             LogDurableEvidence(strprintf("MixedManagersHonorReservationBoundary(d) external_first=%d errors={%s}", external_first, FormatInputErrors(input_errors)), *m_node.chain, workload, recorder);
 
+            CheckActualSigningCalls(recorder, 2);
             BOOST_CHECK(!signed_ok);
             BOOST_CHECK(reject);
             BOOST_CHECK(HasSigningCancelled(input_errors));
