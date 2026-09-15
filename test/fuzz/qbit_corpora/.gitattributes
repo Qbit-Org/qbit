@@ -1,0 +1,2 @@
+# Seed inputs are binary even when their bytes happen to be printable.
+/*/* binary
