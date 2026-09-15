@@ -34,6 +34,7 @@ if(ENABLE_WALLET)
       addressbooktests.cpp
       psbtoperationsdialogtests.cpp
       syntheticwallet.cpp
+      transactionrecordtests.cpp
       walletcontrollertests.cpp
       walletactivitytests.cpp
       wallettests.cpp
