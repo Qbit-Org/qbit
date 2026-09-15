@@ -500,10 +500,26 @@ class IBDTimeoutWiringTest(unittest.TestCase):
         metadata_start = text.index(metadata_marker)
         metadata_end = text.index("      - name:", metadata_start + len(metadata_marker))
         metadata = text[metadata_start:metadata_end]
-        self.assertIn("source ci/ibd-perf-lanes.sh\n", metadata)
-        self.assertIn("write_ibd_timeout_evidence\n", metadata)
-        for key in ("replay_timeout", "network_headers_timeout", "network_tip_timeout", "network_ibd_exit_timeout"):
-            self.assertNotIn(f'echo "{key}=', metadata, "the helper is the only writer of the timeout evidence")
+        metadata_lines = [line.strip() for line in metadata.splitlines()]
+        # The evidence writer must run inside the command group whose output is
+        # redirected into host.env, after the helper is sourced, and nowhere
+        # else in the step; otherwise the markers never reach host.env.
+        group_end = '} > "$PERF_ARTIFACT_ROOT/summary/host.env"'
+        self.assertIn(group_end, metadata_lines)
+        host_env_group = metadata_lines[: metadata_lines.index(group_end)]
+        self.assertIn("source ci/ibd-perf-lanes.sh", host_env_group)
+        self.assertIn("write_ibd_timeout_evidence", host_env_group)
+        self.assertLess(
+            host_env_group.index("source ci/ibd-perf-lanes.sh"),
+            host_env_group.index("write_ibd_timeout_evidence"),
+        )
+        self.assertEqual(metadata_lines.count("write_ibd_timeout_evidence"), 1)
+        # The helper is the only writer of any timeout-named host.env line: the
+        # workflow may not echo a requested, effective or otherwise-labelled
+        # timeout key of its own.
+        for line in metadata_lines:
+            if line.startswith("echo "):
+                self.assertNotIn("timeout", line.lower(), f"timeout evidence must come from the helper only: {line}")
 
         self.assertIn(
             'QBIT_IBD_PERF_CONFIGFILE="$PERF_BUILD_DIR/test/config.ini" \\\n'
