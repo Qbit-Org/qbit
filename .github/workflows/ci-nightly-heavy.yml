@@ -156,6 +156,13 @@ jobs:
       CTEST_INCLUDE_RANGE: ${{ matrix.ctest_include_range || '' }}
       CI_DOCKER_RUN_CPUS: ${{ matrix.container-cpus || '8' }}
       CI_DOCKER_RUN_MEMORY: ${{ matrix.container-memory || '48g' }}
+      # Nightly-only seeded libFuzzer mutation phase. Only the native fuzz
+      # matrix entry sets a value; ci/test/03_test_script.sh reads it to add a
+      # second test/fuzz/test_runner.py invocation with --require_qbit_corpus
+      # --mutate_min_time=<seconds> on the six fixed qbit corpus targets, and
+      # ci/test/00_setup_env_native_fuzz.sh must export the variable so the
+      # container env file passes it through (see ci/test/02_run_container.py).
+      QBIT_FUZZ_MUTATE_MIN_TIME: ${{ matrix.fuzz-mutate-min-time || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -183,6 +190,7 @@ jobs:
             makejobs: '-j12'
             container-cpus: '12'
             container-memory: '64g'
+            fuzz-mutate-min-time: '60'
 
     steps:
       - name: Require resolved source

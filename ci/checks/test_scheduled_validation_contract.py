@@ -913,6 +913,25 @@ class ScheduledValidationContractTest(unittest.TestCase):
                     guard = run_job_step(fixture, workflow, job_id, GUARD_STEP, broken, fixture.root)
                     self.assertNotEqual(guard.returncode, 0)
 
+    def test_nightly_mutation_env_only_on_native_fuzz_matrix(self) -> None:
+        """Only the native fuzz nightly entry requests the seeded mutation phase."""
+        workflow = self.workflows["nightly"]
+        context, _outputs = self.resolve_schedule("nightly")
+        job = workflow["jobs"]["nightly-matrix"]
+        include = job["strategy"]["matrix"]["include"]
+        native_fuzz = [entry for entry in include if entry["file-env"].endswith("/00_setup_env_native_fuzz.sh")]
+        self.assertEqual(len(native_fuzz), 1)
+        for entry in include:
+            with self.subTest(matrix=entry["name"]):
+                env = job_env(workflow, job, dict(context, matrix=entry))
+                expected = "60" if entry in native_fuzz else ""
+                self.assertEqual(env["QBIT_FUZZ_MUTATE_MIN_TIME"], expected)
+        for job_id, other in workflow["jobs"].items():
+            if job_id != "nightly-matrix":
+                self.assertNotIn("QBIT_FUZZ_MUTATE_MIN_TIME", other.get("env") or {}, job_id)
+        for key in ("ibd", "rpc"):
+            self.assertNotIn("QBIT_FUZZ_MUTATE_MIN_TIME", self.workflow_text[key])
+
     def test_expression_evaluator_matches_actions_semantics(self) -> None:
         context = {"github": {"event_name": "schedule", "ref": "refs/heads/main"}, "inputs": {}}
         self.assertEqual(evaluate("github.event_name == 'schedule' && 'a' || 'b'", context), "a")
