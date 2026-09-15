@@ -289,6 +289,20 @@ QString FormatPQCUsageStatus(const wallet::PQCUsageReport& report)
     return lines.join("\n");
 }
 
+//! Append the wallet-local PQC usage consumed by a failed signing attempt to
+//! the status text. Both P2MR failure branches (wallet error and local proof
+//! verification failure) share this so the wording cannot drift. A null or
+//! empty report appends nothing: consumption is never claimed without a report.
+void AppendConsumedPQCUsageStatus(QString& status, const wallet::PQCUsageReport* pqc_usage)
+{
+    const QString pqc_usage_status{pqc_usage ? FormatPQCUsageStatus(*pqc_usage) : QString{}};
+    if (pqc_usage_status.isEmpty()) return;
+    status.append("\n");
+    status.append(SignVerifyMessageDialog::tr("The signing attempt failed after consuming PQC signature capacity."));
+    status.append("\n");
+    status.append(pqc_usage_status);
+}
+
 common::P2MRDataSignatureProof MakeP2MRDataSignatureProof(const interfaces::P2MRDataSignatureResult& result)
 {
     return {
@@ -662,13 +676,7 @@ void SignVerifyMessageDialog::on_signMessageButton_SM_clicked()
         const auto& result{attempt.result};
         if (!result) {
             QString status{BilingualToQString(util::ErrorString(result))};
-            const QString pqc_usage_status{attempt.pqc_usage ? FormatPQCUsageStatus(*attempt.pqc_usage) : QString{}};
-            if (!pqc_usage_status.isEmpty()) {
-                status.append("\n");
-                status.append(tr("The signing attempt failed after consuming PQC signature capacity."));
-                status.append("\n");
-                status.append(pqc_usage_status);
-            }
+            AppendConsumedPQCUsageStatus(status, attempt.pqc_usage.get());
             ui->statusLabel_SM->setStyleSheet("QLabel { color: red; }");
             ui->statusLabel_SM->setText(status);
             return;
@@ -677,8 +685,12 @@ void SignVerifyMessageDialog::on_signMessageButton_SM_clicked()
         const common::P2MRDataSignatureProof proof{MakeP2MRDataSignatureProof(*result)};
         const common::P2MRDataSignatureVerification verification{common::VerifyP2MRDataSignatureProof(proof)};
         if (!verification.valid) {
+            // The wallet already consumed signature capacity for this attempt
+            // even though the proof is rejected and never shown or exported.
+            QString status{tr("Generated proof failed local verification: %1").arg(ToQString(verification.error))};
+            AppendConsumedPQCUsageStatus(status, attempt.pqc_usage.get());
             ui->statusLabel_SM->setStyleSheet("QLabel { color: red; }");
-            ui->statusLabel_SM->setText(tr("Generated proof failed local verification: %1").arg(ToQString(verification.error)));
+            ui->statusLabel_SM->setText(status);
             return;
         }
 
