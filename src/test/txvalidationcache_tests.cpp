@@ -550,12 +550,14 @@ BOOST_FIXTURE_TEST_CASE(pqc_policy_consensus_reuse, P2MRPQCAdmissionSetup)
             BOOST_REQUIRE(!signature_cache.Get(entry, /*erase=*/false));
         }
     };
-    const auto admit = [&](const CMutableTransaction& tx, bool test_accept, std::vector<PQCCacheEvent>& events) {
+    const auto admit = [&](const CMutableTransaction& tx, bool test_accept, std::vector<PQCCacheEvent>& events, uint64_t expected_verifications) {
         RecordingPQCObserver observer;
         MempoolAcceptResult result{[&] {
             ScopedPQCObserver scoped{signature_cache, observer};
+            ScopedPQCVerificationCounter verifications;
             MempoolAcceptResult inner{WITH_LOCK(cs_main, return m_node.chainman->ProcessTransaction(MakeTransactionRef(tx), test_accept))};
             BOOST_REQUIRE(signature_cache.GetPQCObserver() == &observer);
+            BOOST_CHECK_EQUAL(verifications.GetCount(), expected_verifications);
             return inner;
         }()};
         events = observer.Take();
@@ -570,7 +572,7 @@ BOOST_FIXTURE_TEST_CASE(pqc_policy_consensus_reuse, P2MRPQCAdmissionSetup)
     // pass, reused by the consensus pass.
     const PQCSpend one{build_spend({0})};
     require_cold(one);
-    const MempoolAcceptResult result_one{admit(one.tx, /*test_accept=*/false, events)};
+    const MempoolAcceptResult result_one{admit(one.tx, /*test_accept=*/false, events, /*expected_verifications=*/1)};
     BOOST_TEST_MESSAGE("N=1 fresh admission: " << PQCEventsToString(events, 1));
     BOOST_CHECK_MESSAGE(result_one.m_result_type == MempoolAcceptResult::ResultType::VALID, result_one.m_state.ToString());
     BOOST_CHECK(events == (std::vector{PQCMiss(false), PQCVerifiedOk(true), PQCHit(false)}));
@@ -580,7 +582,7 @@ BOOST_FIXTURE_TEST_CASE(pqc_policy_consensus_reuse, P2MRPQCAdmissionSetup)
     // Fresh two-signature admission: two primitive verifications instead of four.
     const PQCSpend two{build_spend({1, 2})};
     require_cold(two);
-    const MempoolAcceptResult result_two{admit(two.tx, /*test_accept=*/false, events)};
+    const MempoolAcceptResult result_two{admit(two.tx, /*test_accept=*/false, events, /*expected_verifications=*/2)};
     BOOST_TEST_MESSAGE("N=2 fresh admission: " << PQCEventsToString(events, 2));
     BOOST_CHECK_MESSAGE(result_two.m_result_type == MempoolAcceptResult::ResultType::VALID, result_two.m_state.ToString());
     BOOST_CHECK(events == (std::vector{PQCMiss(false), PQCVerifiedOk(true), PQCMiss(false), PQCVerifiedOk(true), PQCHit(false), PQCHit(false)}));
@@ -589,7 +591,7 @@ BOOST_FIXTURE_TEST_CASE(pqc_policy_consensus_reuse, P2MRPQCAdmissionSetup)
     // test_accept still runs both passes on a fresh transaction.
     const PQCSpend probe{build_spend({3})};
     require_cold(probe);
-    const MempoolAcceptResult result_probe{admit(probe.tx, /*test_accept=*/true, events)};
+    const MempoolAcceptResult result_probe{admit(probe.tx, /*test_accept=*/true, events, /*expected_verifications=*/1)};
     BOOST_TEST_MESSAGE("N=1 fresh test_accept: " << PQCEventsToString(events, 1));
     BOOST_CHECK_MESSAGE(result_probe.m_result_type == MempoolAcceptResult::ResultType::VALID, result_probe.m_state.ToString());
     BOOST_CHECK(events == (std::vector{PQCMiss(false), PQCVerifiedOk(true), PQCHit(false)}));
@@ -598,14 +600,14 @@ BOOST_FIXTURE_TEST_CASE(pqc_policy_consensus_reuse, P2MRPQCAdmissionSetup)
     // Repeating test_accept re-executes the policy pass, which hits the
     // signature cache; the consensus pass is a full-script cache hit and emits
     // no events. A lone hit is not policy-to-consensus reuse evidence.
-    const MempoolAcceptResult result_repeat{admit(probe.tx, /*test_accept=*/true, events)};
+    const MempoolAcceptResult result_repeat{admit(probe.tx, /*test_accept=*/true, events, /*expected_verifications=*/0)};
     BOOST_TEST_MESSAGE("N=1 repeated test_accept: " << PQCEventsToString(events, 1));
     BOOST_CHECK_MESSAGE(result_repeat.m_result_type == MempoolAcceptResult::ResultType::VALID, result_repeat.m_state.ToString());
     BOOST_CHECK(events == (std::vector{PQCHit(false)}));
 
     // Resubmitting a transaction already in the mempool is rejected before
     // script checks: a valid zero, not reuse evidence.
-    const MempoolAcceptResult result_duplicate{admit(one.tx, /*test_accept=*/false, events)};
+    const MempoolAcceptResult result_duplicate{admit(one.tx, /*test_accept=*/false, events, /*expected_verifications=*/0)};
     BOOST_TEST_MESSAGE("N=1 duplicate submission: " << PQCEventsToString(events, 1) << " reject=" << result_duplicate.m_state.GetRejectReason());
     BOOST_CHECK(result_duplicate.m_result_type == MempoolAcceptResult::ResultType::INVALID);
     BOOST_CHECK_EQUAL(result_duplicate.m_state.GetRejectReason(), "txn-already-in-mempool");

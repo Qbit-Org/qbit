@@ -12,6 +12,7 @@
 #include <uint256.h>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <span>
@@ -29,6 +30,24 @@ static_assert(PQC_KEYGEN_RANDOM_DATA_SIZE >= 128);
 
 // SLH-DSA-SHA2-128s-bounded30 usage bound.
 constexpr uint32_t PQC_MAX_SIGNATURES = 1U << 30;
+
+/** Counts backend calls from CPQCPubKey::Verify for tests; production never
+ * installs one. Invalid keys and signature lengths do not reach the backend.
+ * Installation must not overlap another counter or any Verify call. Join all
+ * verification threads before destruction. Concurrent calls are counted safely.
+ */
+class ScopedPQCVerificationCounter
+{
+    friend class CPQCPubKey;
+    std::atomic<uint64_t> m_calls{0};
+
+public:
+    ScopedPQCVerificationCounter();
+    ~ScopedPQCVerificationCounter();
+    ScopedPQCVerificationCounter(const ScopedPQCVerificationCounter&) = delete;
+    ScopedPQCVerificationCounter& operator=(const ScopedPQCVerificationCounter&) = delete;
+    uint64_t GetCount() const { return m_calls.load(std::memory_order_relaxed); }
+};
 
 class CPQCPubKey
 {
@@ -49,11 +68,7 @@ public:
     }
 
     bool IsValid() const { return m_valid; }
-    bool Verify(const uint256& hash, std::span<const unsigned char> sig) const
-    {
-        if (!m_valid || sig.size() != PQC_SIG_SIZE) return false;
-        return slh_dsa_verify(sig.data(), sig.size(), hash.begin(), hash.size(), m_data.data()) == 0;
-    }
+    bool Verify(const uint256& hash, std::span<const unsigned char> sig) const;
     CKeyID GetID() const
     {
         if (!m_valid) return {};

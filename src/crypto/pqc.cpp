@@ -14,15 +14,40 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <stdexcept>
 #include <string_view>
 #include <utility>
 
 namespace {
 
+std::atomic<ScopedPQCVerificationCounter*> g_verification_counter{nullptr};
+
 constexpr size_t MAX_RAND_CHUNK_SIZE = 32;
 constexpr std::string_view PQC_HKDF_INFO_PREFIX{"qbit/sphincs+/1"};
 constexpr char PQC_HKDF_SALT[] = "qbit-sphincs-v1";
 } // namespace
+
+ScopedPQCVerificationCounter::ScopedPQCVerificationCounter()
+{
+    ScopedPQCVerificationCounter* expected{nullptr};
+    if (!g_verification_counter.compare_exchange_strong(expected, this)) {
+        throw std::logic_error("A PQC verification counter is already installed");
+    }
+}
+
+ScopedPQCVerificationCounter::~ScopedPQCVerificationCounter()
+{
+    g_verification_counter.store(nullptr);
+}
+
+bool CPQCPubKey::Verify(const uint256& hash, std::span<const unsigned char> sig) const
+{
+    if (!m_valid || sig.size() != PQC_SIG_SIZE) return false;
+    if (auto* counter = g_verification_counter.load()) {
+        counter->m_calls.fetch_add(1, std::memory_order_relaxed);
+    }
+    return slh_dsa_verify(sig.data(), sig.size(), hash.begin(), hash.size(), m_data.data()) == 0;
+}
 
 CPQCKey& CPQCKey::operator=(const CPQCKey& other)
 {

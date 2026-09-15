@@ -20,8 +20,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <numeric>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <boost/test/unit_test.hpp>
@@ -114,6 +117,47 @@ BOOST_AUTO_TEST_CASE(pqc_bounded30_profile_constants)
     BOOST_CHECK_EQUAL(bitcoin_pqc_public_key_size(), PQC_PUBKEY_SIZE);
     BOOST_CHECK_EQUAL(bitcoin_pqc_secret_key_size(), PQC_SECKEY_SIZE);
     BOOST_CHECK_EQUAL(bitcoin_pqc_signature_size(), PQC_SIG_SIZE);
+}
+
+BOOST_AUTO_TEST_CASE(pqc_verification_counter_lifetime_and_concurrency)
+{
+    CPQCKey key;
+    key.MakeNewKey();
+    const auto pubkey{key.GetPubKey()};
+    const auto hash{TestHash("verification counter")};
+    std::vector<unsigned char> signature;
+    uint32_t counter{0};
+    BOOST_REQUIRE(key.Sign(hash, signature, counter));
+    {
+        ScopedPQCVerificationCounter calls;
+        BOOST_CHECK_THROW(ScopedPQCVerificationCounter{}, std::logic_error);
+        BOOST_CHECK(!CPQCPubKey{}.Verify(hash, signature));
+        BOOST_CHECK(!pubkey.Verify(hash, {}));
+        BOOST_CHECK_EQUAL(calls.GetCount(), 0U);
+        BOOST_CHECK(pubkey.Verify(hash, signature));
+        BOOST_CHECK_EQUAL(calls.GetCount(), 1U);
+        auto invalid{signature};
+        invalid[0] ^= 1;
+        BOOST_CHECK(!pubkey.Verify(hash, invalid));
+        BOOST_CHECK_EQUAL(calls.GetCount(), 2U);
+
+        std::atomic_bool failed{false};
+        std::vector<std::thread> threads;
+        for (unsigned int i{0}; i < 4; ++i) {
+            threads.emplace_back([&] {
+                if (!pubkey.Verify(hash, signature)) failed.store(true);
+            });
+        }
+        for (auto& thread : threads) thread.join();
+        BOOST_CHECK(!failed.load());
+        BOOST_CHECK_EQUAL(calls.GetCount(), 6U);
+    }
+    // Detached calls do not belong to the next scope, which can install again.
+    BOOST_CHECK(pubkey.Verify(hash, signature));
+    ScopedPQCVerificationCounter next_calls;
+    BOOST_CHECK_EQUAL(next_calls.GetCount(), 0U);
+    BOOST_CHECK(pubkey.Verify(hash, signature));
+    BOOST_CHECK_EQUAL(next_calls.GetCount(), 1U);
 }
 
 BOOST_AUTO_TEST_CASE(pqc_bounded30_known_answer_vector)
