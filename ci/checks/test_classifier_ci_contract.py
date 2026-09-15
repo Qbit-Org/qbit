@@ -46,6 +46,26 @@ VERBOSE_HEADER = re.compile(r"^(?P<name>test_\w+) \([\w.]+\) \.\.\. ")
 VERBOSE_RESULT = re.compile(r"^(?:ok|FAIL|ERROR|skipped(?: .*)?|expected failure|unexpected success)$")
 RAN_LINE = re.compile(r"^Ran (?P<count>\d+) tests? in ")
 
+# The gate step may learn dependency results and classifier outputs only
+# through ``needs`` bindings.  A literal or any other expression would let the
+# gate pass without consulting the classifier, so nothing else is accepted.
+NEEDS_BINDING = re.compile(
+    r"^\$\{\{ needs\.(?P<job>[\w-]+)\.(?:result|outputs\.(?P<output>\w+)) \}\}$"
+)
+GATE_DEPENDENCY_INPUTS = frozenset(
+    {
+        "CLASSIFY_CHANGES_RESULT",
+        "OPERATOR_KEY_POLICY_VALIDATION_RESULT",
+        "RELEASE_POLICY_VALIDATION_RESULT",
+        "RPC_DOCS_VALIDATION_RESULT",
+        "PUBLIC_DOCS_VALIDATION_RESULT",
+        "GITHUB_METADATA_VALIDATION_RESULT",
+        "VALIDATION_PROFILE",
+        "SOURCE_VALIDATION_REQUIRED",
+        "TOUCHED_OPERATOR_KEYS",
+    }
+)
+
 
 class WorkflowLoader(yaml.SafeLoader):
     """SafeLoader that keeps the ``on:`` trigger key as the string ``"on"``.
@@ -194,23 +214,46 @@ class ClassifierCiContractTest(unittest.TestCase):
         self.assertNotIn("shell", matches[0])
         return matches[0]
 
-    def gate_env(self, fake_gh_dir: Path, modeled: dict[str, str]) -> dict[str, str]:
-        step_env_keys = set(self.gate_step()["env"])
-        unknown = set(modeled) - step_env_keys
-        self.assertFalse(unknown, f"modeled gate inputs not read by the gate step: {sorted(unknown)}")
-        env = {key: "" for key in step_env_keys}
-        env.update(modeled)
+    def gate_env(self, fake_gh_dir: Path, needs: dict[str, dict], **github: str) -> dict[str, str]:
+        """Evaluate the gate step's env bindings against a fake ``needs`` context.
+
+        Values are never assigned directly: each modeled input must be bound
+        to ``needs.<job>.result`` or ``needs.<job>.outputs.<name>`` of a
+        modeled dependency, and takes the value that binding yields.
+        """
+        step_env = self.gate_step()["env"]
+        missing = GATE_DEPENDENCY_INPUTS - set(step_env)
+        self.assertFalse(missing, f"modeled gate inputs not read by the gate step: {sorted(missing)}")
+        env = {}
+        for key, binding in step_env.items():
+            if key not in GATE_DEPENDENCY_INPUTS:
+                env[key] = github.get(key, "")
+                continue
+            match = NEEDS_BINDING.match(str(binding))
+            self.assertIsNotNone(
+                match,
+                f"gate env {key} must be exactly a needs.<job>.result or "
+                f"needs.<job>.outputs.<name> binding, got {binding!r}",
+            )
+            job, output = match.group("job"), match.group("output")
+            self.assertIn(job, needs, f"gate env {key} is bound to {binding!r}, not a modeled dependency")
+            if output is None:
+                env[key] = needs[job]["result"]
+            else:
+                self.assertIn(output, self.jobs[job].get("outputs", {}), f"gate env {key}: {binding!r} reads an undeclared output")
+                env[key] = needs[job]["outputs"].get(output, "")
         env["PATH"] = f"{fake_gh_dir}{os.pathsep}{os.environ.get('PATH', '')}"
         env["HOME"] = os.environ.get("HOME", "")
         return env
 
-    def modeled_dependency_results(self, classification: str) -> dict[str, str]:
-        """Dependency results as GitHub reports them when classification is not a success.
+    def modeled_needs(self, classification: str) -> dict[str, dict]:
+        """Fake ``needs`` context as GitHub reports it when classification is not a success.
 
         Every lightweight validation job is gated on
         ``needs.classify-changes.result == 'success'`` so it is reported as
-        ``skipped`` and the job-level outputs are empty strings.
+        ``skipped``; job-level outputs that were never written read as empty.
         """
+        needs: dict[str, dict] = {CLASSIFY_JOB: {"result": classification, "outputs": {}}}
         for name, job in self.jobs.items():
             if name in (CLASSIFY_JOB, GATE_JOB):
                 continue
@@ -219,17 +262,8 @@ class ClassifierCiContractTest(unittest.TestCase):
                 str(job.get("if", "")),
                 f"{name} must be conditioned on a successful classification",
             )
-        return {
-            "CLASSIFY_CHANGES_RESULT": classification,
-            "OPERATOR_KEY_POLICY_VALIDATION_RESULT": "skipped",
-            "RELEASE_POLICY_VALIDATION_RESULT": "skipped",
-            "RPC_DOCS_VALIDATION_RESULT": "skipped",
-            "PUBLIC_DOCS_VALIDATION_RESULT": "skipped",
-            "GITHUB_METADATA_VALIDATION_RESULT": "skipped",
-            "VALIDATION_PROFILE": "",
-            "SOURCE_VALIDATION_REQUIRED": "",
-            "TOUCHED_OPERATOR_KEYS": "",
-        }
+            needs[name] = {"result": "skipped", "outputs": {}}
+        return needs
 
     @staticmethod
     def write_fake_gh(directory: Path, *, conclusion: str | None) -> Path:
@@ -281,6 +315,25 @@ class ClassifierCiContractTest(unittest.TestCase):
         self.assertEqual({result for result in observed.values()}, {"ok"}, observed)
         self.assertEqual(ran_count(completed.stderr), len(expected), completed.stderr)
 
+    def test_job_level_gating_cannot_bypass_classifier_failure(self) -> None:
+        classify = self.jobs[CLASSIFY_JOB]
+        self.assertNotIn(
+            "continue-on-error",
+            classify,
+            f"{CLASSIFY_JOB} job must not report success when its steps fail (job-level continue-on-error)",
+        )
+        self.assertNotIn("if", classify, f"{CLASSIFY_JOB} job must run unconditionally")
+
+        # A job skipped by its own condition is reported as a success, so the
+        # gate may never be conditioned on a dependency result.
+        gate_if = str(self.jobs[GATE_JOB].get("if", ""))
+        self.assertIn("always()", gate_if, f"{GATE_JOB} must run even when classification fails")
+        self.assertNotIn(
+            "needs.",
+            gate_if,
+            f"{GATE_JOB} 'if' must not depend on a dependency result, got {gate_if!r}",
+        )
+
     def test_suite_failure_reaches_required_gate(self) -> None:
         _, step = self.classifier_test_step()
         expected = expected_suite_methods()
@@ -325,7 +378,7 @@ class ClassifierCiContractTest(unittest.TestCase):
                     fake = Path(tmpdir) / f"gh-{classification}"
                     fake.mkdir()
                     calls = self.write_fake_gh(fake, conclusion=None)
-                    env = self.gate_env(fake, self.modeled_dependency_results(classification))
+                    env = self.gate_env(fake, self.modeled_needs(classification))
                     completed = run_bash_step(gate["run"], cwd=sandbox, env=env)
                     self.assertNotEqual(completed.returncode, 0, completed.stdout + completed.stderr)
                     self.assertIn(
@@ -339,23 +392,18 @@ class ClassifierCiContractTest(unittest.TestCase):
             fake = Path(tmpdir) / "gh-success"
             fake.mkdir()
             calls = self.write_fake_gh(fake, conclusion="success")
-            metadata = self.modeled_dependency_results("success")
-            metadata.update(
-                VALIDATION_PROFILE="github-metadata",
-                GITHUB_METADATA_VALIDATION_RESULT="success",
-            )
+            metadata = self.modeled_needs("success")
+            metadata[CLASSIFY_JOB]["outputs"]["profile"] = "github-metadata"
+            metadata["github-metadata-validation"]["result"] = "success"
             completed = run_bash_step(gate["run"], cwd=sandbox, env=self.gate_env(fake, metadata))
             self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
             self.assertFalse(calls.exists(), "github-metadata profile must not poll checks")
 
-            rpc_docs = self.modeled_dependency_results("success")
-            rpc_docs.update(
-                VALIDATION_PROFILE="rpc-docs",
-                RPC_DOCS_VALIDATION_RESULT="success",
-                REPOSITORY="example/repo",
-                SHA="0" * 40,
-            )
-            completed = run_bash_step(gate["run"], cwd=sandbox, env=self.gate_env(fake, rpc_docs))
+            rpc_docs = self.modeled_needs("success")
+            rpc_docs[CLASSIFY_JOB]["outputs"]["profile"] = "rpc-docs"
+            rpc_docs["rpc-docs-validation"]["result"] = "success"
+            env = self.gate_env(fake, rpc_docs, REPOSITORY="example/repo", SHA="0" * 40)
+            completed = run_bash_step(gate["run"], cwd=sandbox, env=env)
             self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
             self.assertTrue(calls.exists(), "rpc-docs profile must poll the simulated check API")
             self.assertIn("rpc-docs: status=completed conclusion=success", completed.stdout)
