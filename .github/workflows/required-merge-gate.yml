@@ -111,6 +111,13 @@ jobs:
           cat "${changed_files}"
           echo "changed_files=${changed_files}" >> "$GITHUB_OUTPUT"
 
+      # The classifier decides which validation profile routes this change.
+      # Its own unit tests run here, in the job that produces the routing
+      # outputs, so a broken classifier fails this job (and therefore the
+      # Required Merge Gate) instead of routing itself to a lightweight profile.
+      - name: Test merge-profile classifier
+        run: python3 ci/checks/test_classify_merge_profile.py -v
+
       - name: Classify validation profile
         id: classify
         run: |
