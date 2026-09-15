@@ -1,7 +1,7 @@
 name: IBD Performance Benchmark
 run-name: >-
   IBD perf (${{ github.event_name == 'schedule' && 'nightly' || inputs.profile }},
-  branch=${{ github.event_name == 'schedule' && '0.1.x' || github.ref_name }})
+  branch=${{ github.event_name == 'schedule' && '1.x.x' || github.ref_name }})
 
 on:
   schedule:
@@ -99,21 +99,106 @@ on:
         type: string
 
 concurrency:
-  group: ibd-perf-${{ github.event_name == 'schedule' && 'nightly-0.1.x' || github.ref }}
+  group: ibd-perf-${{ github.event_name == 'schedule' && 'nightly-1.x.x' || github.ref }}
   cancel-in-progress: false
 
 permissions:
   contents: read
 
 jobs:
+  resolve-source:
+    name: Resolve source
+    runs-on: ${{ github.repository == 'Qbit-Org/qbit' && fromJSON('["self-hosted", "linux", "x64", "qbit-trusted-ci"]') || fromJSON('["self-hosted", "linux", "x64"]') }}
+    timeout-minutes: 10
+    outputs:
+      source_mode: ${{ steps.resolve.outputs.source_mode }}
+      requested_ref: ${{ steps.resolve.outputs.requested_ref }}
+      requested_ref_name: ${{ steps.resolve.outputs.requested_ref_name }}
+      resolved_sha: ${{ steps.resolve.outputs.resolved_sha }}
+    steps:
+      - name: Resolve source
+        id: resolve
+        shell: bash
+        env:
+          SOURCE_MODE: ${{ github.event_name == 'schedule' && 'maintained' || 'manual' }}
+          MAINTAINED_BRANCH: 1.x.x
+          REQUESTED_REF: ${{ github.event_name != 'schedule' && github.ref || '' }}
+          EVENT_SHA: ${{ github.sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          SOURCE_REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}.git
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Resolve the validation source once per run, before any checkout, so
+          # every job below builds and reports the same immutable commit. The
+          # scheduled source is the maintained branch; a manual run keeps the
+          # selected ref and its event commit.
+          fail() { echo "::error::$*" >&2; exit 1; }
+          is_full_sha() { printf '%s\n' "$1" | LC_ALL=C grep -Eq '^[0-9a-f]{40}$'; }
+
+          case "$SOURCE_MODE" in
+            maintained)
+              [ -n "$MAINTAINED_BRANCH" ] || fail "MAINTAINED_BRANCH is empty"
+              requested_ref="refs/heads/${MAINTAINED_BRANCH}"
+              git check-ref-format "$requested_ref" || fail "invalid maintained branch ref '$requested_ref'"
+              auth=()
+              if [ -n "${GITHUB_TOKEN:-}" ]; then
+                auth=(-c "http.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')")
+              fi
+              listing="$(git ${auth[@]+"${auth[@]}"} ls-remote --exit-code -- "$SOURCE_REPOSITORY_URL" "$requested_ref")" \
+                || fail "could not list '$requested_ref' from '$SOURCE_REPOSITORY_URL'"
+              resolved_sha="$(printf '%s\n' "$listing" | awk -v ref="$requested_ref" '$2 == ref { print $1 }')"
+              [ "$(printf '%s\n' "$resolved_sha" | grep -c .)" -eq 1 ] \
+                || fail "expected exactly one '$requested_ref' in remote listing: $listing"
+              ;;
+            manual)
+              requested_ref="$REQUESTED_REF"
+              resolved_sha="$EVENT_SHA"
+              ;;
+            *)
+              fail "unsupported SOURCE_MODE '$SOURCE_MODE'"
+              ;;
+          esac
+
+          case "$requested_ref" in
+            refs/heads/?*|refs/tags/?*) ;;
+            *) fail "requested ref '$requested_ref' must be a fully qualified branch or tag ref" ;;
+          esac
+          git check-ref-format "$requested_ref" || fail "requested ref '$requested_ref' is not a valid git ref name"
+          is_full_sha "$resolved_sha" || fail "resolved source '$resolved_sha' is not a full commit hash"
+          is_full_sha "$WORKFLOW_SHA" || fail "workflow revision '$WORKFLOW_SHA' is not a full commit hash"
+          requested_ref_name="${requested_ref#refs/heads/}"
+          requested_ref_name="${requested_ref_name#refs/tags/}"
+
+          {
+            echo "source_mode=$SOURCE_MODE"
+            echo "requested_ref=$requested_ref"
+            echo "requested_ref_name=$requested_ref_name"
+            echo "resolved_sha=$resolved_sha"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## Validation source"
+            echo
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| source_mode | $SOURCE_MODE |"
+            echo "| requested_ref | $requested_ref |"
+            echo "| resolved_sha | $resolved_sha |"
+            echo "| event_sha | $EVENT_SHA |"
+            echo "| workflow_sha | $WORKFLOW_SHA |"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
   ibd-perf:
     name: IBD perf
+    needs: resolve-source
     runs-on: ${{ github.repository == 'Qbit-Org/qbit' && fromJSON('["self-hosted", "linux", "x64", "qbit-trusted-ci"]') || fromJSON('["self-hosted", "linux", "x64"]') }}
     timeout-minutes: 720
     env:
       RUN_MODE: ${{ github.event_name == 'schedule' && 'nightly' || 'manual' }}
-      CHECKOUT_REF: ${{ github.event_name == 'schedule' && '0.1.x' || github.ref }}
-      BENCHMARK_REF_NAME: ${{ github.event_name == 'schedule' && '0.1.x' || github.ref_name }}
+      SOURCE_MODE: ${{ needs.resolve-source.outputs.source_mode }}
+      REQUESTED_REF: ${{ needs.resolve-source.outputs.requested_ref }}
+      RESOLVED_SHA: ${{ needs.resolve-source.outputs.resolved_sha }}
+      BENCHMARK_REF_NAME: ${{ needs.resolve-source.outputs.requested_ref_name }}
       PERF_BUILD_DIR: ${{ github.workspace }}/build-perf
       PERF_ARTIFACT_ROOT: ${{ github.workspace }}/build-perf-artifacts/ibd-perf-${{ github.run_id }}
       SELECTED_PROFILE: ${{ github.event_name == 'schedule' && 'nightly-smoke' || inputs.profile }}
@@ -134,11 +219,48 @@ jobs:
       NETWORK_TIP_TIMEOUT: ${{ github.event_name != 'schedule' && inputs.NETWORK_TIP_TIMEOUT || '' }}
       NETWORK_IBD_EXIT_TIMEOUT: ${{ github.event_name != 'schedule' && inputs.NETWORK_IBD_EXIT_TIMEOUT || '' }}
     steps:
+      - name: Require resolved source
+        shell: bash
+        env:
+          RESOLVED_SHA: ${{ needs.resolve-source.outputs.resolved_sha }}
+          REQUESTED_REF: ${{ needs.resolve-source.outputs.requested_ref }}
+        run: |
+          set -euo pipefail
+          # Refuse to check out anything but the per-run resolved commit; an
+          # empty ref would silently fall back to the triggering commit.
+          printf '%s\n' "$RESOLVED_SHA" | LC_ALL=C grep -Eq '^[0-9a-f]{40}$' \
+            || { echo "::error::resolved source '$RESOLVED_SHA' is not a full commit hash" >&2; exit 1; }
+          [ -n "$REQUESTED_REF" ] || { echo "::error::requested ref is empty" >&2; exit 1; }
+
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          ref: ${{ env.CHECKOUT_REF }}
+          ref: ${{ needs.resolve-source.outputs.resolved_sha }}
           fetch-depth: 1
+
+      - name: Verify checked-out source
+        shell: bash
+        env:
+          SOURCE_MODE: ${{ needs.resolve-source.outputs.source_mode }}
+          REQUESTED_REF: ${{ needs.resolve-source.outputs.requested_ref }}
+          RESOLVED_SHA: ${{ needs.resolve-source.outputs.resolved_sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          actual_head="$(git rev-parse --verify 'HEAD^{commit}')"
+          if [ "$actual_head" != "$RESOLVED_SHA" ]; then
+            echo "::error::checked-out HEAD $actual_head does not match resolved source $RESOLVED_SHA" >&2
+            exit 1
+          fi
+          {
+            echo "### Checked-out source: ${GITHUB_JOB}${MATRIX_NAME:+ ($MATRIX_NAME)}"
+            echo
+            echo "- source_mode: ${SOURCE_MODE}"
+            echo "- requested_ref: ${REQUESTED_REF}"
+            echo "- resolved_sha: ${RESOLVED_SHA}"
+            echo "- actual_head: ${actual_head}"
+            echo "- workflow_sha: ${WORKFLOW_SHA}"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
@@ -279,7 +401,12 @@ jobs:
             echo "benchmark_mode=${RUN_MODE}"
             echo "github_ref=${GITHUB_REF}"
             echo "github_ref_name=${GITHUB_REF_NAME}"
-            echo "checkout_ref=${CHECKOUT_REF}"
+            echo "github_sha=${GITHUB_SHA}"
+            echo "workflow_sha=${GITHUB_WORKFLOW_SHA}"
+            echo "source_mode=${SOURCE_MODE}"
+            echo "requested_ref=${REQUESTED_REF}"
+            echo "resolved_sha=${RESOLVED_SHA}"
+            echo "checkout_ref=${RESOLVED_SHA}"
             echo "benchmark_ref_name=${BENCHMARK_REF_NAME}"
             echo "profile=${SELECTED_PROFILE}"
             echo "runs_per_lane=${RUNS_PER_LANE}"
