@@ -85,7 +85,8 @@ TransactionView::TransactionView(const PlatformStyle *platformStyle, QWidget *pa
     typeWidget->addItem(tr("Sent to"), TransactionFilterProxy::TYPE(TransactionRecord::SendToAddress) |
                                   TransactionFilterProxy::TYPE(TransactionRecord::SendToOther));
     typeWidget->addItem(tr("Mined"), TransactionFilterProxy::TYPE(TransactionRecord::Generated));
-    typeWidget->addItem(tr("Other"), TransactionFilterProxy::TYPE(TransactionRecord::Other));
+    typeWidget->addItem(tr("Other"), TransactionFilterProxy::TYPE(TransactionRecord::Other) |
+                                     TransactionFilterProxy::TYPE(TransactionRecord::PaymentToSelf));
 
     hlayout->addWidget(typeWidget);
 

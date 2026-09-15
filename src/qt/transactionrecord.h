@@ -70,6 +70,7 @@ public:
         SendToOther,
         RecvWithAddress,
         RecvFromOther,
+        PaymentToSelf,
     };
 
     /** Number of confirmation recommended for accepting a transaction */
@@ -118,7 +119,7 @@ public:
     /** Return the unique identifier for this transaction (part) */
     QString getTxHash() const;
 
-    /** Return the output index of the subtransaction  */
+    /** Return the output index, or -1 for a transaction-level payment to self. */
     int getOutputIndex() const;
 
     /** Update status from core wallet tx.
