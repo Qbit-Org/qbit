@@ -924,7 +924,7 @@ class ScheduledValidationContractTest(unittest.TestCase):
         for entry in include:
             with self.subTest(matrix=entry["name"]):
                 env = job_env(workflow, job, dict(context, matrix=entry))
-                expected = "60" if entry in native_fuzz else ""
+                expected = "120" if entry in native_fuzz else ""
                 self.assertEqual(env["QBIT_FUZZ_MUTATE_MIN_TIME"], expected)
         for job_id, other in workflow["jobs"].items():
             if job_id != "nightly-matrix":

@@ -190,7 +190,7 @@ jobs:
             makejobs: '-j12'
             container-cpus: '12'
             container-memory: '64g'
-            fuzz-mutate-min-time: '60'
+            fuzz-mutate-min-time: '120'
 
     steps:
       - name: Require resolved source
