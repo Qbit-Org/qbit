@@ -16,8 +16,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -530,12 +532,208 @@ bool VerifySpend(const P2MRSpend& spend, unsigned int flags)
             MissingDataBehavior::ASSERT_FAIL),
         &err);
 }
-} // namespace
 
-FUZZ_TARGET(p2mr_script, .init = initialize_p2mr_script)
+enum class InputMode {
+    LEGACY,
+    FIXTURE,
+    GENERATION,
+    UNSUPPORTED_VERSION,
+};
+
+struct TaggedInput {
+    InputMode mode;
+    std::span<const uint8_t> data;
+};
+
+/**
+ * Tagged inputs start with "QBFX", a target tag byte and a format version byte
+ * (see test/fuzz/qbit_corpora/README.md). Version 1 is followed by a selector
+ * byte: a low nibble of 0xF (1/16 of selector values) runs the legacy
+ * generation body on the remaining bytes, every other value runs the fixture
+ * body. Inputs without the tag keep the legacy layout byte for byte.
+ */
+TaggedInput ParseTaggedInput(std::span<const uint8_t> buffer, uint8_t target_tag)
 {
-    FuzzedDataProvider fuzzed_data_provider(buffer.data(), buffer.size());
+    static constexpr std::array<uint8_t, 4> MAGIC{'Q', 'B', 'F', 'X'};
+    static constexpr uint8_t FORMAT_VERSION_1{0x01};
+    if (buffer.size() < MAGIC.size() + 2 || !std::equal(MAGIC.begin(), MAGIC.end(), buffer.begin()) ||
+        buffer[MAGIC.size()] != target_tag) {
+        return {InputMode::LEGACY, buffer};
+    }
+    // Unknown versions are ignored rather than reinterpreted as another layout.
+    if (buffer[MAGIC.size() + 1] != FORMAT_VERSION_1) return {InputMode::UNSUPPORTED_VERSION, {}};
+    const std::span<const uint8_t> body{buffer.subspan(MAGIC.size() + 2)};
+    if (body.empty()) return {InputMode::FIXTURE, body};
+    const bool generation{(body[0] & 0x0F) == 0x0F};
+    return {generation ? InputMode::GENERATION : InputMode::FIXTURE, body.subspan(1)};
+}
 
+struct P2MRFixture {
+    P2MRSpend spend;
+    uint256 wtxid;
+};
+
+/**
+ * Signed single-leaf spends for the VALID_CHECKSIGPQC, VERIFY_TRUE and
+ * CTV_WITH_CHECKSIGPQC leaf modes, each with SIGHASH_DEFAULT and SIGHASH_ALL.
+ * Built on first use so that legacy and generation inputs never pay for, or
+ * get coverage from, fixture signing.
+ */
+const std::vector<P2MRFixture>& GetP2MRFixtures()
+{
+    static const auto fixtures = [] {
+        std::array<unsigned char, PQC_KEYGEN_RANDOM_DATA_SIZE> random_data{};
+        for (size_t i = 0; i < random_data.size(); ++i) {
+            random_data[i] = static_cast<unsigned char>(0x5A ^ (i * 0x2F));
+        }
+        std::array<unsigned char, PQC_PUBKEY_SIZE> pubkey_bytes{};
+        std::array<unsigned char, PQC_SECKEY_SIZE> seckey_bytes{};
+        const int keygen_ret{slh_dsa_keygen(pubkey_bytes.data(), seckey_bytes.data(), random_data.data(), random_data.size())};
+        assert(keygen_ret == 0);
+
+        CPQCKey key;
+        key.Set(seckey_bytes.data(), seckey_bytes.data() + seckey_bytes.size());
+        assert(key.IsValid());
+        const CPQCPubKey pubkey{key.GetPubKey()};
+        assert(pubkey.IsValid());
+        const std::vector<unsigned char> pqc_pubkey(pubkey.begin(), pubkey.end());
+
+        const std::array<CScript, 3> leaves{
+            CScript{} << pqc_pubkey << OP_CHECKSIGPQC,
+            CScript{} << pqc_pubkey << OP_CHECKSIGPQC << OP_VERIFY << OP_TRUE,
+            CScript{} << BuildDefaultCTVHashBytes() << OP_CHECKTEMPLATEVERIFY << OP_DROP << pqc_pubkey << OP_CHECKSIGPQC,
+        };
+
+        std::vector<P2MRFixture> out;
+        out.reserve(leaves.size() * 2);
+        for (const CScript& leaf : leaves) {
+            for (const int hash_type : {SIGHASH_DEFAULT, SIGHASH_ALL}) {
+                TaprootBuilder builder;
+                builder.AddP2MR(/*depth=*/0, leaf, P2MR_LEAF_VERSION_V1).FinalizeP2MR();
+                const P2MRSpendData spenddata{builder.GetP2MRSpendData()};
+                const auto spend_it{spenddata.scripts.find(std::make_pair(ScriptBytes(leaf), int(P2MR_LEAF_VERSION_V1)))};
+                assert(spend_it != spenddata.scripts.end() && !spend_it->second.empty());
+
+                const CTransaction tx_credit{BuildCreditingTransaction(GetScriptForDestination(builder.GetP2MROutput()), /*nValue=*/1000)};
+                CScriptWitness witness;
+                witness.stack = {std::vector<unsigned char>(PQC_SIG_SIZE, 0x00), ScriptBytes(leaf), *spend_it->second.begin()};
+                P2MRSpend spend{
+                    .tx_credit = tx_credit,
+                    .tx_spend = BuildSpendingTransaction(CScript{}, witness, tx_credit),
+                    .txdata = {},
+                    .leaf_hash = ComputeP2MRLeafHash(P2MR_LEAF_VERSION_V1, ScriptBytes(leaf)),
+                };
+                spend.txdata.Init(spend.tx_spend, {spend.tx_credit.vout[0]});
+
+                FlatSigningProvider provider;
+                provider.pqc_keys.emplace(pubkey, key);
+                MutableTransactionSignatureCreator creator{
+                    spend.tx_spend,
+                    /*input_idx=*/0,
+                    spend.tx_credit.vout[0].nValue,
+                    &spend.txdata,
+                    hash_type,
+                };
+                std::vector<unsigned char> sig;
+                const bool signed_ok{creator.CreatePQCSignature(provider, sig, pubkey, &spend.leaf_hash, SigVersion::P2MR)};
+                assert(signed_ok);
+                spend.tx_spend.vin[0].scriptWitness.stack[0] = std::move(sig);
+                assert(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS));
+
+                const uint256 wtxid{CTransaction{spend.tx_spend}.GetWitnessHash().ToUint256()};
+                P2MRFixture fixture{.spend = std::move(spend), .wtxid = wtxid};
+                out.push_back(std::move(fixture));
+            }
+        }
+        return out;
+    }();
+    return fixtures;
+}
+
+void FixtureP2MRScriptInput(FuzzedDataProvider& fuzzed_data_provider)
+{
+    const auto& fixtures{GetP2MRFixtures()};
+    const P2MRFixture& fixture{fixtures[fuzzed_data_provider.ConsumeIntegralInRange<size_t>(0, fixtures.size() - 1)]};
+    P2MRSpend spend{fixture.spend};
+    std::vector<valtype>& stack{spend.tx_spend.vin[0].scriptWitness.stack};
+    unsigned int flags{P2MR_SCRIPT_VERIFY_FLAGS};
+    bool tx_changed{false};
+
+    // The fixture witness is [signature, leaf script, control block].
+    LIMITED_WHILE(fuzzed_data_provider.ConsumeBool(), 8) {
+        CallOneOf(
+            fuzzed_data_provider,
+            [&] {
+                if (stack.empty() || stack[0].empty()) return;
+                const size_t pos{fuzzed_data_provider.ConsumeIntegralInRange<size_t>(0, stack[0].size() - 1)};
+                stack[0][pos] ^= static_cast<unsigned char>(1U << fuzzed_data_provider.ConsumeIntegralInRange<uint8_t>(0, 7));
+            },
+            [&] {
+                if (stack.empty()) return;
+                stack[0].resize(PQC_SIG_SIZE + 1);
+                stack[0].back() = fuzzed_data_provider.ConsumeIntegral<unsigned char>();
+            },
+            [&] {
+                if (stack.empty()) return;
+                stack[0].resize(PQC_SIG_SIZE);
+            },
+            [&] {
+                if (stack.size() < 2) return;
+                stack[1] = ScriptBytes(ConsumeScript(fuzzed_data_provider));
+            },
+            [&] {
+                if (stack.size() < 3 || stack[2].empty()) return;
+                CallOneOf(
+                    fuzzed_data_provider,
+                    [&] { stack[2][0] ^= 0x01; },
+                    [&] { stack[2].pop_back(); },
+                    [&] { stack[2].push_back(fuzzed_data_provider.ConsumeIntegral<unsigned char>()); });
+            },
+            [&] {
+                stack.push_back(std::vector<unsigned char>{static_cast<unsigned char>(ANNEX_TAG), fuzzed_data_provider.ConsumeIntegral<unsigned char>()});
+            },
+            [&] {
+                stack.insert(stack.begin(), ConsumeRandomLengthByteVector(fuzzed_data_provider, /*max_length=*/128));
+            },
+            [&] {
+                if (!stack.empty()) stack.pop_back();
+            },
+            [&] {
+                spend.tx_spend.nLockTime = fuzzed_data_provider.ConsumeIntegral<uint32_t>();
+                tx_changed = true;
+            },
+            [&] {
+                spend.tx_spend.vout[0].nValue = fuzzed_data_provider.ConsumeIntegralInRange<CAmount>(0, 2000);
+                tx_changed = true;
+            },
+            [&] {
+                spend.tx_spend.vin[0].nSequence = fuzzed_data_provider.ConsumeIntegral<uint32_t>();
+                tx_changed = true;
+            },
+            [&] {
+                flags |= fuzzed_data_provider.PickValueInArray<unsigned int>({
+                    SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE,
+                    SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION,
+                    SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS,
+                });
+            });
+    }
+
+    if (tx_changed) {
+        // Witness data is not part of the precomputed hashes, transaction fields are.
+        spend.txdata = PrecomputedTransactionData{};
+        spend.txdata.Init(spend.tx_spend, {spend.tx_credit.vout[0]});
+    }
+
+    const bool untouched{flags == P2MR_SCRIPT_VERIFY_FLAGS &&
+                         CTransaction{spend.tx_spend}.GetWitnessHash().ToUint256() == fixture.wtxid};
+    const bool valid{VerifySpend(spend, flags)};
+    // The fixture was accepted when it was built, so an unmodified clone must still be accepted.
+    if (untouched) assert(valid);
+}
+
+void LegacyP2MRScriptInput(FuzzedDataProvider& fuzzed_data_provider)
+{
     const CPQCKey key = ConsumePQCKey(fuzzed_data_provider);
     if (!key.IsValid()) return;
     const CPQCPubKey pubkey = key.GetPubKey();
@@ -558,4 +756,22 @@ FUZZ_TARGET(p2mr_script, .init = initialize_p2mr_script)
     if (fuzzed_data_provider.ConsumeBool()) flags |= SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS;
 
     (void)VerifySpend(spend_value, flags);
+}
+} // namespace
+
+FUZZ_TARGET(p2mr_script, .init = initialize_p2mr_script)
+{
+    const TaggedInput input{ParseTaggedInput(buffer, 'M')};
+    FuzzedDataProvider fuzzed_data_provider(input.data.data(), input.data.size());
+    switch (input.mode) {
+    case InputMode::LEGACY:
+    case InputMode::GENERATION:
+        LegacyP2MRScriptInput(fuzzed_data_provider);
+        return;
+    case InputMode::FIXTURE:
+        FixtureP2MRScriptInput(fuzzed_data_provider);
+        return;
+    case InputMode::UNSUPPORTED_VERSION:
+        return;
+    }
 }
