@@ -176,8 +176,8 @@ BOOST_FIXTURE_TEST_CASE(WalletInterfaceUnlockSerializesDeferredTopUpCachePublica
     BOOST_CHECK(publication_lock_stack_empty);
     BOOST_CHECK(publication_transaction_inactive);
 
-    // Descriptor state and its transaction are complete, but the new script
-    // remains invisible until the publication batch acquires cs_wallet.
+    // Descriptor state and its transaction are complete, so the new script
+    // remains visible while publication into the wallet cache is pending.
     BOOST_REQUIRE_EQUAL(unpublished_scripts.size(), 1U);
     const CScript new_script{*unpublished_scripts.begin()};
     std::promise<void> reader_locked;
@@ -187,7 +187,7 @@ BOOST_FIXTURE_TEST_CASE(WalletInterfaceUnlockSerializesDeferredTopUpCachePublica
     std::promise<void> release_reader;
     auto release_reader_future{release_reader.get_future()};
     std::atomic_bool reader_observed_warm_script{true};
-    std::atomic_bool reader_observed_unpublished_script{false};
+    std::atomic_bool reader_observed_committed_script{false};
     std::thread reader{[&] {
         LOCK(wallet->cs_wallet);
         reader_locked.set_value();
@@ -198,7 +198,7 @@ BOOST_FIXTURE_TEST_CASE(WalletInterfaceUnlockSerializesDeferredTopUpCachePublica
             observed_warm_script &= !!wallet->GetSolvingProvider(warm_script);
         }
         reader_observed_warm_script = observed_warm_script;
-        reader_observed_unpublished_script = wallet->IsMine(new_script) || !!wallet->GetSolvingProvider(new_script);
+        reader_observed_committed_script = wallet->IsMine(new_script) && !!wallet->GetSolvingProvider(new_script);
         reader_checked.set_value();
         release_reader_future.wait();
     }};
@@ -208,7 +208,7 @@ BOOST_FIXTURE_TEST_CASE(WalletInterfaceUnlockSerializesDeferredTopUpCachePublica
     run_reader_checks.set_value();
     reader_checked.get_future().wait();
     BOOST_CHECK(reader_observed_warm_script);
-    BOOST_CHECK(!reader_observed_unpublished_script);
+    BOOST_CHECK(reader_observed_committed_script);
 
     // The publisher has been released, but must still be blocked by the
     // foreground reader's cs_wallet ownership.

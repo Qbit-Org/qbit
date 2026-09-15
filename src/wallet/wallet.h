@@ -502,6 +502,29 @@ private:
     //! Cache of descriptor ScriptPubKeys used for IsMine. Maps ScriptPubKey to set of spkms
     std::unordered_map<CScript, std::vector<ScriptPubKeyMan*>, SaltedSipHasher> m_cached_spks GUARDED_BY(cs_wallet);
 
+    enum class TopUpPublicationState {
+        STAGED,
+        COMMITTING,
+        COMMITTED_PENDING_CACHE,
+    };
+    struct TopUpPublicationRecord {
+        ScriptPubKeyMan* spkm;
+        std::weak_ptr<void> lifetime;
+        std::set<CScript> scripts;
+        TopUpPublicationState state{TopUpPublicationState::STAGED};
+    };
+
+    // Exact scripts crossing the database-commit-to-wallet-cache handoff. This
+    // mutex is never held while acquiring cs_wallet or a descriptor lock.
+    mutable Mutex m_topup_pub_mutex;
+    mutable std::condition_variable_any m_topup_pub_cv;
+    TopUpPublicationId m_next_topup_pub_id GUARDED_BY(m_topup_pub_mutex){1};
+    std::unordered_map<TopUpPublicationId, TopUpPublicationRecord> m_topup_publications GUARDED_BY(m_topup_pub_mutex);
+    std::unordered_map<CScript, std::vector<TopUpPublicationId>, SaltedSipHasher> m_topup_publications_by_script GUARDED_BY(m_topup_pub_mutex);
+
+    void EraseTopUpPublication(TopUpPublicationId id) EXCLUSIVE_LOCKS_REQUIRED(m_topup_pub_mutex);
+    std::vector<ScriptPubKeyMan*> GetCommittedTopUpScriptPubKeyMans(const CScript& script) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+
     //! Set of both spent and unspent transaction outputs owned by this wallet
     std::unordered_map<COutPoint, WalletTXO, SaltedOutpointHasher> m_txos GUARDED_BY(cs_wallet);
 
@@ -1184,7 +1207,11 @@ public:
     //! Add scriptPubKeys for this ScriptPubKeyMan into the scriptPubKey cache
     void CacheNewScriptPubKeys(const std::set<CScript>& spks, ScriptPubKeyMan* spkm) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
-    void TopUpCallback(const std::set<CScript>& spks, ScriptPubKeyMan* spkm) override;
+    TopUpPublicationId StageTopUpPublication(const std::set<CScript>& spks, ScriptPubKeyMan* spkm, std::weak_ptr<void> lifetime) override;
+    void BeginTopUpCommit(TopUpPublicationId id) override;
+    void FinishTopUpCommit(TopUpPublicationId id, bool committed) override;
+    void CancelTopUpPublication(TopUpPublicationId id) override;
+    bool TopUpCallback(const std::set<CScript>& spks, ScriptPubKeyMan* spkm, TopUpPublicationId id = INVALID_TOPUP_PUBLICATION_ID) override;
 
     //! Retrieve the xpubs in use by the active descriptors
     std::set<CExtPubKey> GetActiveHDPubKeys() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);

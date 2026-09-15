@@ -167,11 +167,15 @@ bool MockableBatch::ReadKey(DataStream&& key, DataStream& value)
 bool MockableBatch::WriteKey(DataStream&& key, DataStream&& value, bool overwrite)
 {
     ++m_database.m_write_count;
+    SerializeData key_data{key.begin(), key.end()};
+    DataStream wallet_flags_key;
+    wallet_flags_key << DBKeys::FLAGS;
+    const bool is_wallet_flags_key{key_data == SerializeData{wallet_flags_key.begin(), wallet_flags_key.end()}};
     if (!m_database.m_pass || !m_database.m_write_pass ||
+        (!m_database.m_wallet_flags_write_pass && is_wallet_flags_key) ||
         (m_database.m_write_fail_after >= 0 && m_database.m_write_count > m_database.m_write_fail_after)) {
         return false;
     }
-    SerializeData key_data{key.begin(), key.end()};
     SerializeData value_data{value.begin(), value.end()};
     auto [it, inserted] = m_database.m_records.emplace(key_data, value_data);
     if (!inserted && overwrite) { // Overwrite if requested
@@ -227,22 +231,48 @@ std::unique_ptr<DatabaseCursor> MockableBatch::GetNewPrefixCursor(std::span<cons
     return std::make_unique<MockableCursor>(m_database.m_records, m_database.m_pass && m_database.m_read_pass, prefix);
 }
 
+MockableBatch::~MockableBatch()
+{
+    Close();
+}
+
+void MockableBatch::Close()
+{
+    if (!m_txn_active) return;
+    m_database.m_records = std::move(*m_txn_snapshot);
+    m_txn_snapshot.reset();
+    m_txn_active = false;
+}
+
 bool MockableBatch::TxnBegin()
 {
     ++m_database.m_txn_begin_count;
-    return m_database.m_pass && m_database.m_txn_begin_pass;
+    if (m_txn_active || !m_database.m_pass || !m_database.m_txn_begin_pass) return false;
+    m_txn_snapshot = m_database.m_records;
+    m_txn_active = true;
+    return true;
 }
 
 bool MockableBatch::TxnCommit()
 {
     ++m_database.m_txn_commit_count;
-    return m_database.m_pass && m_database.m_txn_commit_pass;
+    const bool success{m_txn_active && m_database.m_pass && m_database.m_txn_commit_pass};
+    if (success) {
+        m_txn_snapshot.reset();
+        m_txn_active = false;
+    }
+    if (m_database.m_txn_commit_result_hook) m_database.m_txn_commit_result_hook(success);
+    return success;
 }
 
 bool MockableBatch::TxnAbort()
 {
     ++m_database.m_txn_abort_count;
-    return m_database.m_pass && m_database.m_txn_abort_pass;
+    if (!m_txn_active || !m_database.m_pass || !m_database.m_txn_abort_pass) return false;
+    m_database.m_records = std::move(*m_txn_snapshot);
+    m_txn_snapshot.reset();
+    m_txn_active = false;
+    return true;
 }
 
 std::unique_ptr<WalletDatabase> CreateMockableWalletDatabase(MockableData records)

@@ -84,6 +84,13 @@ BOOST_FIXTURE_TEST_CASE(P2MRGetNewChangeAddressBoundsLowWatermarkRefill, Regtest
         BOOST_CHECK(LockStackEmpty());
         BOOST_CHECK_GE(reserved_index, 0);
         BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), expected_keypool_size);
+        if (reserved_index >= 0) {
+            const CScript script{GetCachedScriptPubKey(*internal_spk_man, reserved_index)};
+            LOCK(wallet->cs_wallet);
+            BOOST_CHECK(wallet->IsMine(script));
+            BOOST_CHECK(wallet->GetScriptPubKeyMans(script).contains(internal_spk_man));
+            BOOST_CHECK(wallet->GetSolvingProvider(script));
+        }
         LOCK(internal_spk_man->cs_desc_man);
         const WalletDescriptor descriptor{internal_spk_man->GetWalletDescriptor()};
         BOOST_CHECK_EQUAL(descriptor.next_index, reserved_index + 1);
