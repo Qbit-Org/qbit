@@ -1072,11 +1072,14 @@ BOOST_AUTO_TEST_CASE(MixedManagersPreserveSighashContext)
         owners.insert(owners.begin() + UNOWNED_INPUT, UNOWNED);
         auto workload{MakeMixedManagerP2MRSigningWorkload(*m_node.chain, owners, /*output_count=*/owners.size())};
 
-        // The unowned input is completed by its own signer before the wallet signs.
+        // The unowned input is completed by its own signer before the wallet
+        // signs, serially so the fixture does not depend on the parallel planner.
         uint32_t unowned_counter{0};
         const FlatSigningProvider unowned_provider{MakeUnownedP2MRSigningProvider(workload, unowned_counter)};
         std::map<int, bilingual_str> unowned_errors;
+        m_node.args->ForceSetArg("-walletpqcparallel", "0");
         BOOST_CHECK(!SignTransaction(workload.spend_tx, &unowned_provider, workload.coins, sighash, unowned_errors));
+        m_node.args->ForceSetArg("-walletpqcparallel", "1");
         const CMutableTransaction presigned_tx{workload.spend_tx};
         BOOST_REQUIRE(!VerifyP2MRSpend(presigned_tx, presigned_tx, workload.coins).contains(UNOWNED_INPUT));
 
