@@ -85,9 +85,16 @@ if "max_total_time" in flags:
     if len(dirs) == 2:
         (Path(dirs[0]) / "new-unit").write_bytes(b"x")
     seconds = env_map("STUB_SECONDS").get(target, int(flags["max_total_time"]) + 1)
-    print("#100\tDONE   cov: 1 ft: 1 corp: 1/1b", file=sys.stderr)
-    print(f"Done 100 runs in {seconds} second(s)", file=sys.stderr)
+    inited = int(env_map("STUB_INITED").get(target, count + 1))
+    runs = int(env_map("STUB_RUNS").get(target, 100))
+    if target not in os.environ.get("STUB_NO_INITED", "").split(","):
+        print(f"#{inited}\tINITED cov: 1 ft: 1 corp: 1/1b exec/s: 0 rss: 1Mb", file=sys.stderr)
+    if runs > inited:
+        print(f"#{runs}\tNEW    cov: 2 ft: 2 corp: 2/2b lim: 4 exec/s: 1 rss: 1Mb", file=sys.stderr)
+    print(f"#{runs}\tDONE   cov: 1 ft: 1 corp: 1/1b lim: 4 exec/s: 1 rss: 1Mb", file=sys.stderr)
+    print(f"Done {runs} runs in {seconds} second(s)", file=sys.stderr)
 else:
+    print(f"#{count + 1}\tINITED cov: 1 ft: 1 corp: 1/1b exec/s: 0 rss: 1Mb", file=sys.stderr)
     print(f"#{count + 1}\tDONE   cov: 1 ft: 1 corp: 1/1b", file=sys.stderr)
     print(f"Done {count + 1} runs in 0 second(s)", file=sys.stderr)
 '''
@@ -243,8 +250,38 @@ class RunnerTransportTest(unittest.TestCase):
                 self.assertEqual(run["dirs_exist"], [True, True])
                 self.assertFalse(Path(output_dir).is_relative_to(self.corpus))
                 self.assertFalse(Path(output_dir).exists(), "temporary output directory must be removed")
-                self.assertRegex(result.stdout, rf"{run['target']}: rng seed 1234, 3 seed corpus inputs, 100 runs in 61s")
+                self.assertIn(f"{run['target']}: rng seed 1234, 3 seed corpus inputs, 4 initialization runs, "
+                              "96 runs after initialization, 100 runs in 61s", result.stdout)
         self.assertEqual(tree_digest(self.corpus), before, "the corpus must not be modified")
+
+    def test_mutation_requires_runs_after_initialization(self):
+        # Captured from a real pqc run: all 18 runs were spent loading the 16 seeds before the budget expired.
+        make_corpus(self.corpus, {t: 16 for t in REQUIRED})
+        failures = [
+            ("no runs after initialization", {"STUB_INITED": "pqc:18", "STUB_RUNS": "pqc:18", "STUB_SECONDS": "pqc:64"},
+             r"pqc: 18 initialization runs, 18 runs in total: no inputs were run after corpus initialization"),
+            ("initialization not reported", {"STUB_NO_INITED": "pqc", "STUB_RUNS": "pqc:18"},
+             r"pqc: libFuzzer did not report its initialization run count"),
+            ("fewer runs than initialization", {"STUB_INITED": "pqc:20", "STUB_RUNS": "pqc:18"},
+             r"pqc: 20 initialization runs, 18 runs in total: no inputs were run after corpus initialization"),
+        ]
+        for name, stub_env, pattern in failures:
+            with self.subTest(case=name):
+                self.log.unlink(missing_ok=True)
+                result = self.run_runner("--require_qbit_corpus", "--mutate_min_time=60", self.corpus, *REQUIRED, stub_env=stub_env)
+                self.assert_failed(result, pattern)
+                self.assertNotRegex(result.stdout, r"(?m)^pqc: rng seed", "a failed target must not be summarized")
+                self.assertEqual(len(self.spawned()), len(REQUIRED))
+                for run in self.spawned():
+                    self.assertFalse(Path(run["argv"][-2]).exists(), "temporary output directory must be removed")
+
+        for name, runs, after in (("one run after initialization", 19, 1), ("many runs after initialization", 5000, 4982)):
+            with self.subTest(case=name):
+                stub_env = {"STUB_INITED": "pqc:18", "STUB_RUNS": f"pqc:{runs}", "STUB_SECONDS": "pqc:64"}
+                result = self.run_runner("--require_qbit_corpus", "--mutate_min_time=60", self.corpus, *REQUIRED, stub_env=stub_env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"pqc: rng seed 1234, 16 seed corpus inputs, 18 initialization runs, "
+                              f"{after} runs after initialization, {runs} runs in 64s", result.stdout)
 
     def test_mutation_rejects_invalid_budgets(self):
         make_corpus(self.corpus, {t: 1 for t in REQUIRED})
@@ -405,7 +442,15 @@ class RealFuzzExecutableTest(unittest.TestCase):
         if "Check if using libFuzzer ... True" in result.stdout:
             self.assertEqual(result.returncode, 0, output)
             for target in REQUIRED:
-                self.assertRegex(result.stdout, rf"{target}: rng seed \d+, \d+ seed corpus inputs, \d+ runs in \d+s")
+                match = re.search(rf"^{target}: rng seed \d+, (\d+) seed corpus inputs, (\d+) initialization runs, "
+                                  rf"(\d+) runs after initialization, (\d+) runs in (\d+)s$", result.stdout, re.MULTILINE)
+                self.assertIsNotNone(match, f"{target} mutation evidence missing:\n{output}")
+                inputs, inited, after, runs, elapsed = map(int, match.groups())
+                self.assertGreaterEqual(inputs, len(self.manifest["targets"][target]))
+                self.assertGreater(inited, 0)
+                self.assertGreater(after, 0, f"{target} ran no inputs after corpus initialization")
+                self.assertEqual(inited + after, runs)
+                self.assertGreaterEqual(elapsed, seconds)
         else:
             self.assertEqual(result.returncode, 1, output)
             self.assertIn("--mutate_min_time requires a fuzz executable built with libFuzzer", output)
@@ -429,7 +474,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--build-dir", type=Path, help="Configured build tree with a fuzz executable; enables integration tests.")
     parser.add_argument("--fuzz-binary", type=Path, help="Fuzz executable to use instead of <build-dir>/bin/fuzz.")
-    parser.add_argument("--mutate-seconds", type=int, default=5, help="Mutation budget per target for the integration test.")
+    parser.add_argument("--mutate-seconds", type=int, default=120,
+                        help="Mutation budget per target for the integration test, including corpus initialization.")
     args, unittest_args = parser.parse_known_args()
 
     loader = unittest.TestLoader()

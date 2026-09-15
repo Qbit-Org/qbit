@@ -63,6 +63,18 @@ corpus unchanged. It fails on non-libFuzzer builds. The nightly native fuzz job
 sets `QBIT_FUZZ_MUTATE_MIN_TIME`, which makes `ci/test/03_test_script.sh` run
 this phase for the six targets after the normal replay.
 
+The budget is libFuzzer's `-max_total_time`, which counts time spent loading
+the seed corpus (libFuzzer's `INITED` line) as well as mutation. A run can end
+later than the budget because libFuzzer only stops once the current input
+finishes. A target whose seeds are slow can therefore use its whole budget
+before running a single mutated input, so the phase fails a target unless its
+final run count is greater than its `INITED` run count, in addition to failing
+on a non-zero exit, a timeout, a missing seed count or stopping before the
+budget. For each target the runner prints the initialization runs and the runs
+after initialization; the latter is a count of executions, not of new corpus
+files. The planned nightly budget is 120 seconds per target, which is also the
+default for `test_qbit_fuzz_runner.py --build-dir … --mutate-seconds`.
+
 `pqc` and `p2mr_script` cache real keys and signatures on first use of a
 tagged fixture input. To measure that one-off cost separately from the
 per-input cost, run the same fixture seed twice in one libFuzzer process and

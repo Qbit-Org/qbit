@@ -546,7 +546,8 @@ def run_mutation(*, fuzz_pool, corpus, test_list, src_dir, fuzz_bin, min_time, r
     libFuzzer writes new inputs to the first directory argument, so that is a
     fresh temporary directory removed when the job ends; the corpus directory
     is passed second and only read. Crash artifacts go to the working
-    directory, as for any libFuzzer run.
+    directory, as for any libFuzzer run. A target fails unless libFuzzer
+    reports more runs in total than it needed to initialize from the corpus.
     """
     timeout = min_time + MUTATION_TIMEOUT_GRACE_SECONDS
 
@@ -599,12 +600,19 @@ def run_mutation(*, fuzz_pool, corpus, test_list, src_dir, fuzz_bin, min_time, r
 
         problems = []
         done = last_int_match(r"^Done (\d+) runs in (\d+) second", output)
+        inited = last_int_match(r"^#(\d+)\s+INITED\b", output)
         rng_seed = last_int_match(r"^INFO: Seed: (\d+)$", output)
         loaded = reported_input_count(output=output, target=target, using_libfuzzer=True)
         if done is None:
             problems.append("libFuzzer did not report its run count")
         elif done[1] < min_time:
             problems.append(f"stopped after {done[1]}s, before the {min_time}s budget")
+        # The time budget includes loading the seed corpus, so a slow target can
+        # use all of it before a single mutated input runs.
+        if inited is None:
+            problems.append("libFuzzer did not report its initialization run count")
+        elif done is not None and done[0] <= inited:
+            problems.append(f"{inited} initialization runs, {done[0]} runs in total: no inputs were run after corpus initialization")
         if target in required_corpus_files:
             present = required_corpus_files[target]
             if loaded is None or loaded == 0 or loaded < present:
@@ -615,7 +623,10 @@ def run_mutation(*, fuzz_pool, corpus, test_list, src_dir, fuzz_bin, min_time, r
             failed = True
             continue
         runs, seconds = done
-        lines.append(f"{target}: rng seed {rng_seed}, {loaded} seed corpus inputs, {runs} runs in {seconds}s")
+        lines.append(
+            f"{target}: rng seed {rng_seed}, {loaded} seed corpus inputs, {inited} initialization runs, "
+            f"{runs - inited} runs after initialization, {runs} runs in {seconds}s"
+        )
 
     print("Mutation summary:")
     for line in sorted(lines):
