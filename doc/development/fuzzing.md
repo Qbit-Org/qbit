@@ -38,6 +38,57 @@ set from that mapping file:
 $ ctest --test-dir build_fuzz -R '^required_fuzz_targets$' --output-on-failure
 ```
 
+## qbit seed corpora
+
+`qa-assets` has no inputs for `asert_chain_transition`, `asert_edge_cases`,
+`asert_math`, `auxpow`, `p2mr_script` or `pqc`. Generated seeds for these
+targets, their manifest and the input format are described in
+[`test/fuzz/qbit_corpora/README.md`](../../test/fuzz/qbit_corpora/README.md).
+CI copies them into the `qa-assets` corpus and requires that they are replayed:
+
+```sh
+$ test/fuzz/qbit_corpora/overlay.py qa-assets/fuzz_corpora
+$ build_fuzz/test/fuzz/test_runner.py --require_qbit_corpus qa-assets/fuzz_corpora
+```
+
+`--require_qbit_corpus` fails if any of the six targets is not compiled or not
+selected (including through `--exclude`), has no regular input files, or is not
+reported as replayed by the fuzz executable. The runner prints the number of
+input files present and replayed for each target.
+
+With a libFuzzer build, `--mutate_min_time=<seconds>` replaces the single
+replay with a mutation phase of that many seconds per target. The phase starts
+from the corpus, writes new inputs to a temporary directory and leaves the
+corpus unchanged. It fails on non-libFuzzer builds. The nightly native fuzz job
+sets `QBIT_FUZZ_MUTATE_MIN_TIME`, which makes `ci/test/03_test_script.sh` run
+this phase for the six targets after the normal replay.
+
+`pqc` and `p2mr_script` cache real keys and signatures on first use of a
+tagged fixture input. To measure that one-off cost separately from the
+per-input cost, run the same fixture seed twice in one libFuzzer process and
+compare the reported times:
+
+```sh
+$ FUZZ=pqc build_fuzz/bin/fuzz test/fuzz/qbit_corpora/pqc/fixture-untouched-key0-msg0 test/fuzz/qbit_corpora/pqc/fixture-untouched-key0-msg0
+Running: test/fuzz/qbit_corpora/pqc/fixture-untouched-key0-msg0
+Executed test/fuzz/qbit_corpora/pqc/fixture-untouched-key0-msg0 in … ms
+```
+
+The first `Executed` time includes building the fixtures; the second does not.
+Legacy and generation seeds never build fixtures.
+
+Tests for the runner options and the seed corpora:
+
+```sh
+$ test/fuzz/test_qbit_fuzz_runner.py
+$ test/fuzz/test_qbit_fuzz_runner.py --build-dir build_fuzz      # also replays with the real fuzz executable
+$ test/fuzz/test_qbit_fuzz_coverage.py --fuzz-binary build_cov/bin/fuzz  # needs -fprofile-instr-generate -fcoverage-mapping
+```
+
+`test_qbit_fuzz_coverage.py` runs named seeds one at a time. It fails if key
+generation, signing or P2MR signature verification is no longer reached, or
+if an invalid spend is no longer rejected at the expected check.
+
 ## Overview of Bitcoin Core fuzzing
 
 [Google](https://github.com/google/fuzzing/) has a good overview of fuzzing in general, with contributions from key architects of some of the most-used fuzzers. [This paper](https://agroce.github.io/bitcoin_report.pdf) includes an external overview of the status of Bitcoin Core fuzzing, as of summer 2021.  [John Regehr](https://blog.regehr.org/archives/1687) provides good advice on writing code that assists fuzzers in finding bugs, which is useful for developers to keep in mind.

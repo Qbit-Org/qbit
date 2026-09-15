@@ -12,8 +12,25 @@ import configparser
 import logging
 import os
 import random
+import re
 import subprocess
 import sys
+import tempfile
+
+# Targets whose corpora must be replayed when --require_qbit_corpus is passed.
+# The seeds for them live in test/fuzz/qbit_corpora.
+QBIT_REQUIRED_CORPUS_TARGETS = (
+    "asert_chain_transition",
+    "asert_edge_cases",
+    "asert_math",
+    "auxpow",
+    "p2mr_script",
+    "pqc",
+)
+MUTATE_MIN_TIME_MAX_SECONDS = 3600
+# How long a mutation job may run past its budget (process start-up, a slow
+# final input) before it is stopped and reported as failed.
+MUTATION_TIMEOUT_GRACE_SECONDS = 600
 
 
 def get_fuzz_env(*, target, source_dir):
@@ -28,6 +45,15 @@ def get_fuzz_env(*, target, source_dir):
         'MSAN_SYMBOLIZER_PATH': symbolizer,
     }
     return fuzz_env
+
+
+def mutate_min_time(value):
+    """Parse a whole number of seconds, as accepted by libFuzzer's -max_total_time."""
+    if not re.fullmatch(r"[1-9][0-9]*", value) or int(value) > MUTATE_MIN_TIME_MAX_SECONDS:
+        raise argparse.ArgumentTypeError(
+            f"expected a whole number of seconds from 1 to {MUTATE_MIN_TIME_MAX_SECONDS}, got {value!r}"
+        )
+    return int(value)
 
 
 def main():
@@ -86,9 +112,36 @@ def main():
              ' the given targets for a finite number of times. Outputs them to'
              ' the passed corpus_dir.'
     )
+    parser.add_argument(
+        '--require_qbit_corpus',
+        action='store_true',
+        help="Fail unless all of {} are compiled and selected, each has at least one regular"
+             " input file in corpus_dir, and the fuzz binary reports replaying them.".format(
+                 ", ".join(QBIT_REQUIRED_CORPUS_TARGETS)),
+    )
+    parser.add_argument(
+        '--mutate_min_time',
+        type=mutate_min_time,
+        help="Instead of replaying once, run a libFuzzer mutation phase of this many seconds per"
+             " target, seeded from corpus_dir. New inputs go to a temporary directory; corpus_dir"
+             " is not modified.",
+    )
 
     args = parser.parse_args()
     args.corpus_dir = Path(args.corpus_dir)
+    if args.mutate_min_time is not None:
+        conflicting = [
+            name for name, used in (
+                ("--generate", args.generate),
+                ("--m_dir", args.m_dir),
+                ("--empty_min_time", args.empty_min_time is not None),
+                ("--valgrind", args.valgrind),
+            ) if used
+        ]
+        if conflicting:
+            parser.error("--mutate_min_time cannot be combined with {}".format(", ".join(conflicting)))
+    if args.require_qbit_corpus and (args.generate or args.m_dir):
+        parser.error("--require_qbit_corpus cannot be combined with --generate or --m_dir")
 
     # Set up logging
     logging.basicConfig(
@@ -136,6 +189,14 @@ def main():
 
     logging.info("{} of {} detected fuzz target(s) selected: {}".format(len(test_list_selection), len(test_list_all), " ".join(test_list_selection)))
 
+    required_corpus_files = {}
+    if args.require_qbit_corpus:
+        required_corpus_files = check_required_corpus(
+            corpus_dir=args.corpus_dir,
+            test_list_all=test_list_all,
+            test_list_selection=test_list_selection,
+        )
+
     if not args.generate:
         test_list_missing_corpus = []
         for t in test_list_selection:
@@ -167,6 +228,9 @@ def main():
     if (args.generate or args.m_dir) and not using_libfuzzer:
         logging.error("Must be built with libFuzzer")
         sys.exit(1)
+    if args.mutate_min_time is not None and not using_libfuzzer:
+        logging.error("--mutate_min_time requires a fuzz executable built with libFuzzer")
+        sys.exit(1)
 
     with ThreadPoolExecutor(max_workers=args.par) as fuzz_pool:
         if args.generate:
@@ -189,6 +253,18 @@ def main():
             )
             return
 
+        if args.mutate_min_time is not None:
+            run_mutation(
+                fuzz_pool=fuzz_pool,
+                corpus=args.corpus_dir,
+                test_list=test_list_selection,
+                src_dir=config['environment']['SRCDIR'],
+                fuzz_bin=fuzz_bin,
+                min_time=args.mutate_min_time,
+                required_corpus_files=required_corpus_files,
+            )
+            return
+
         run_once(
             fuzz_pool=fuzz_pool,
             corpus=args.corpus_dir,
@@ -198,7 +274,54 @@ def main():
             using_libfuzzer=using_libfuzzer,
             use_valgrind=args.valgrind,
             empty_min_time=args.empty_min_time,
+            required_corpus_files=required_corpus_files,
         )
+
+
+def check_required_corpus(*, corpus_dir, test_list_all, test_list_selection):
+    """Return {target: number of regular input files} for the required targets, or exit if any is unusable."""
+    errors = []
+    file_counts = {}
+    for t in QBIT_REQUIRED_CORPUS_TARGETS:
+        corpus_path = corpus_dir / t
+        if t not in test_list_all:
+            errors.append(f"{t}: not compiled into the fuzz executable")
+        elif t not in test_list_selection:
+            errors.append(f"{t}: not selected (check the target list and --exclude)")
+        elif not corpus_path.is_dir():
+            errors.append(f"{t}: corpus directory {corpus_path} does not exist")
+        else:
+            # Only regular files directly in the directory are replayed by every fuzz engine.
+            file_count = sum(1 for p in corpus_path.iterdir() if p.is_file())
+            if file_count == 0:
+                errors.append(f"{t}: corpus directory {corpus_path} has no regular input files")
+            file_counts[t] = file_count
+    if errors:
+        for error in errors:
+            logging.error(f"Required qbit corpus check failed: {error}")
+        sys.exit(1)
+    return file_counts
+
+
+def last_int_match(pattern, output):
+    """Return the integers captured by the only line matching pattern, or None if there is not exactly one."""
+    matches = re.findall(pattern, output, flags=re.MULTILINE)
+    if len(matches) != 1:
+        return None
+    return tuple(int(m) for m in matches[0]) if isinstance(matches[0], tuple) else int(matches[0])
+
+
+def reported_input_count(*, output, target, using_libfuzzer):
+    """Return how many inputs the fuzz executable reports having run from the corpus, or None."""
+    if using_libfuzzer:
+        return last_int_match(r"^INFO: seed corpus: files: (\d+) ", output)
+    return last_int_match(rf"^{re.escape(target)}: succeeded against (\d+) files in ", output)
+
+
+def as_text(stream):
+    if stream is None:
+        return ""
+    return stream.decode(errors="replace") if isinstance(stream, bytes) else stream
 
 
 def transform_process_message_target(targets, src_dir):
@@ -325,7 +448,7 @@ def merge_inputs(*, fuzz_pool, corpus, test_list, src_dir, fuzz_bin, merge_dirs)
         future.result()
 
 
-def run_once(*, fuzz_pool, corpus, test_list, src_dir, fuzz_bin, using_libfuzzer, use_valgrind, empty_min_time):
+def run_once(*, fuzz_pool, corpus, test_list, src_dir, fuzz_bin, using_libfuzzer, use_valgrind, empty_min_time, required_corpus_files):
     jobs = []
     for t in test_list:
         corpus_path = corpus / t
@@ -348,19 +471,25 @@ def run_once(*, fuzz_pool, corpus, test_list, src_dir, fuzz_bin, using_libfuzzer
             args = ['valgrind', '--quiet', '--error-exitcode=1'] + args
 
         def job(t, args):
-            output = 'Run {} with args {}'.format(t, args)
+            output = 'Run {} with args {}\n'.format(t, args)
             result = subprocess.run(
                 args,
                 env=get_fuzz_env(target=t, source_dir=src_dir),
+                stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
             )
             output += result.stderr
+            if not output.endswith("\n"):
+                output += "\n"
+            # Non-libFuzzer executables report the replayed input count on stdout.
+            output += result.stdout
             return output, result, t
 
         jobs.append(fuzz_pool.submit(job, t, args))
 
     stats = []
+    replay_evidence = []
     for future in as_completed(jobs):
         output, result, target = future.result()
         logging.debug(output)
@@ -377,6 +506,9 @@ def run_once(*, fuzz_pool, corpus, test_list, src_dir, fuzz_bin, using_libfuzzer
             done_stat = [l for l in output.splitlines() if "DONE" in l]
             assert len(done_stat) == 1
             stats.append((target, done_stat[0]))
+        if target in required_corpus_files:
+            replayed = reported_input_count(output=output, target=target, using_libfuzzer=using_libfuzzer)
+            replay_evidence.append((target, required_corpus_files[target], replayed))
 
     if using_libfuzzer:
         print("Summary:")
@@ -384,6 +516,112 @@ def run_once(*, fuzz_pool, corpus, test_list, src_dir, fuzz_bin, using_libfuzzer
         for t, s in sorted(stats):
             t = t.ljust(max_len + 1)
             print(f"{t}{s}")
+
+    if required_corpus_files and not report_replay_evidence(replay_evidence, required_corpus_files):
+        sys.exit(1)
+
+
+def report_replay_evidence(replay_evidence, required_corpus_files):
+    """Print per-target replay counts; return False unless every required target replayed all its files."""
+    ok = True
+    print("Required qbit corpus replay:")
+    reported = {target: (present, replayed) for target, present, replayed in replay_evidence}
+    for target in sorted(required_corpus_files):
+        present, replayed = reported.get(target, (required_corpus_files[target], None))
+        if replayed is None:
+            status = "FAILED: the fuzz executable did not report a replay count"
+            ok = False
+        elif replayed == 0 or replayed < present:
+            status = f"FAILED: {replayed} inputs replayed"
+            ok = False
+        else:
+            status = f"{replayed} inputs replayed"
+        print(f"{target}: {present} regular input files present, {status}")
+    return ok
+
+
+def run_mutation(*, fuzz_pool, corpus, test_list, src_dir, fuzz_bin, min_time, required_corpus_files):
+    """Run a libFuzzer mutation phase of min_time seconds per target, seeded from the corpus.
+
+    libFuzzer writes new inputs to the first directory argument, so that is a
+    fresh temporary directory removed when the job ends; the corpus directory
+    is passed second and only read. Crash artifacts go to the working
+    directory, as for any libFuzzer run.
+    """
+    timeout = min_time + MUTATION_TIMEOUT_GRACE_SECONDS
+
+    def job(t):
+        corpus_path = corpus / t
+        if not corpus_path.is_dir():
+            return t, [], "missing", f"corpus directory {corpus_path} does not exist"
+        with tempfile.TemporaryDirectory(prefix=f"fuzz_mutate_{t}_") as output_dir:
+            args = [
+                fuzz_bin,
+                f"-max_total_time={min_time}",
+                "-reload=0",
+                output_dir,
+                str(corpus_path),
+            ]
+            try:
+                result = subprocess.run(
+                    args,
+                    env=get_fuzz_env(target=t, source_dir=src_dir),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired as e:
+                return t, args, "timeout", as_text(e.stderr) + as_text(e.stdout)
+        return t, args, result.returncode, result.stderr + result.stdout
+
+    jobs = [fuzz_pool.submit(job, t) for t in test_list]
+
+    failed = False
+    lines = []
+    for future in as_completed(jobs):
+        target, args, returncode, output = future.result()
+        logging.debug(f"Run {target} with args {args}\n{output}")
+        if returncode == "missing":
+            logging.error(f"⚠️ {target}: {output}")
+            failed = True
+            continue
+        if returncode == "timeout":
+            logging.info(output)
+            logging.error(f"⚠️ {target}: mutation phase did not exit within {timeout}s and was stopped: {args}")
+            failed = True
+            continue
+        if returncode != 0:
+            logging.info(output)
+            logging.info(f"⚠️ Failure generated from target with exit code {returncode}: {args}")
+            failed = True
+            continue
+
+        problems = []
+        done = last_int_match(r"^Done (\d+) runs in (\d+) second", output)
+        rng_seed = last_int_match(r"^INFO: Seed: (\d+)$", output)
+        loaded = reported_input_count(output=output, target=target, using_libfuzzer=True)
+        if done is None:
+            problems.append("libFuzzer did not report its run count")
+        elif done[1] < min_time:
+            problems.append(f"stopped after {done[1]}s, before the {min_time}s budget")
+        if target in required_corpus_files:
+            present = required_corpus_files[target]
+            if loaded is None or loaded == 0 or loaded < present:
+                problems.append(f"seed corpus inputs run: {loaded}, regular input files present: {present}")
+        if problems:
+            logging.info(output)
+            logging.error(f"⚠️ {target}: " + "; ".join(problems))
+            failed = True
+            continue
+        runs, seconds = done
+        lines.append(f"{target}: rng seed {rng_seed}, {loaded} seed corpus inputs, {runs} runs in {seconds}s")
+
+    print("Mutation summary:")
+    for line in sorted(lines):
+        print(line)
+    if failed:
+        sys.exit(1)
 
 
 def parse_test_list(*, fuzz_bin, source_dir):
