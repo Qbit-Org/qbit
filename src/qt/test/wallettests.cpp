@@ -200,6 +200,26 @@ void ReleaseSyntheticBumpSigning(const std::shared_ptr<qt_test::SyntheticWalletS
     state->condition.notify_all();
 }
 
+// Declare after the model so a failed assertion releases the worker before
+// the model destructor joins it. Normal test paths still release each latch
+// explicitly at the boundary being exercised.
+struct ReleaseSyntheticBumpOnExit {
+    std::shared_ptr<qt_test::SyntheticWalletState> state;
+
+    ~ReleaseSyntheticBumpOnExit()
+    {
+        {
+            std::lock_guard lock{state->mutex};
+            state->allow_bump_prepare = true;
+            state->allow_bump_reservation = true;
+            state->allow_bump_counter_boundary = true;
+            state->allow_external_bump_boundary = true;
+            state->allow_bump_sign = true;
+        }
+        state->condition.notify_all();
+    }
+};
+
 class SendConfirmationClicker : public QObject
 {
 public:
@@ -1598,6 +1618,7 @@ void TestAsyncFeeBumpLifecycle(interfaces::Node& node)
             state->allow_bump_prepare = false;
         }
         auto model{make_model(state)};
+        const ReleaseSyntheticBumpOnExit release_on_exit{state};
         QSignalSpy completed{model.get(), &WalletModel::feeBumped};
         QVERIFY(model->bumpFee(Txid{}));
         QVERIFY(WaitUntil([&] {
@@ -1644,6 +1665,7 @@ void TestAsyncFeeBumpLifecycle(interfaces::Node& node)
             state->bump_enabled = true;
         }
         auto model{make_model(state)};
+        const ReleaseSyntheticBumpOnExit release_on_exit{state};
         QSignalSpy completed{model.get(), &WalletModel::feeBumped};
         ConfirmSend(nullptr, QMessageBox::Yes, [&] { model->prepareForShutdown(); });
         QVERIFY(model->bumpFee(Txid{}));
@@ -1670,6 +1692,7 @@ void TestAsyncFeeBumpLifecycle(interfaces::Node& node)
             state->allow_bump_sign = false;
         }
         auto model{make_model(state)};
+        const ReleaseSyntheticBumpOnExit release_on_exit{state};
         QSignalSpy completed{model.get(), &WalletModel::feeBumped};
         QVERIFY(completed.isValid());
 
@@ -1718,6 +1741,7 @@ void TestAsyncFeeBumpLifecycle(interfaces::Node& node)
             state->allow_bump_counter_boundary = false;
         }
         auto model{make_model(state)};
+        const ReleaseSyntheticBumpOnExit release_on_exit{state};
         QSignalSpy completed{model.get(), &WalletModel::feeBumped};
         QVERIFY(start_bump(*model));
         QVERIFY(WaitUntil([&] {
@@ -1756,6 +1780,7 @@ void TestAsyncFeeBumpLifecycle(interfaces::Node& node)
             state->allow_bump_sign = false;
         }
         auto model{make_model(state)};
+        const ReleaseSyntheticBumpOnExit release_on_exit{state};
         QSignalSpy completed{model.get(), &WalletModel::feeBumped};
         QVERIFY(start_bump(*model));
         QVERIFY(WaitUntil([&] {
@@ -1785,6 +1810,7 @@ void TestAsyncFeeBumpLifecycle(interfaces::Node& node)
             state->allow_bump_reservation = false;
         }
         auto model{make_model(state)};
+        const ReleaseSyntheticBumpOnExit release_on_exit{state};
         QSignalSpy completed{model.get(), &WalletModel::feeBumped};
         QVERIFY(start_bump(*model));
         QVERIFY(WaitUntil([&] {
@@ -1829,6 +1855,7 @@ void TestAsyncFeeBumpLifecycle(interfaces::Node& node)
             state->allow_external_bump_boundary = false;
         }
         auto model{make_model(state)};
+        const ReleaseSyntheticBumpOnExit release_on_exit{state};
         QSignalSpy completed{model.get(), &WalletModel::feeBumped};
         QVERIFY(start_bump(*model));
         QVERIFY(WaitUntil([&] {
@@ -1867,6 +1894,7 @@ void TestAsyncFeeBumpLifecycle(interfaces::Node& node)
             state->bump_commit_success = false;
         }
         auto model{make_model(state)};
+        const ReleaseSyntheticBumpOnExit release_on_exit{state};
         QSignalSpy completed{model.get(), &WalletModel::feeBumped};
         QString commit_error;
         new MessageBoxClicker({}, QMessageBox::Ok, &commit_error);
@@ -1890,6 +1918,7 @@ void TestAsyncFeeBumpLifecycle(interfaces::Node& node)
             state->allow_bump_sign = false;
         }
         auto model{make_model(state)};
+        const ReleaseSyntheticBumpOnExit release_on_exit{state};
         auto view{std::make_unique<TransactionView>(platform_style.get())};
         view->setModel(model.get());
         QSignalSpy completed{model.get(), &WalletModel::feeBumped};
@@ -1924,6 +1953,7 @@ void TestAsyncFeeBumpLifecycle(interfaces::Node& node)
             state->allow_bump_sign = false;
         }
         auto model{make_model(state)};
+        const ReleaseSyntheticBumpOnExit release_on_exit{state};
         QVERIFY(start_bump(*model));
         QVERIFY(WaitUntil([&] {
             return SyntheticStateMatches(state, [](const auto& value) {
