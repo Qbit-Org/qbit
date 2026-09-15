@@ -5,6 +5,7 @@
 
 #include <script/sigcache.h>
 
+#include <crypto/pqc.h>
 #include <crypto/sha256.h>
 #include <logging.h>
 #include <pubkey.h>
@@ -22,14 +23,17 @@ SignatureCache::SignatureCache(const size_t max_size_bytes)
     uint256 nonce = GetRandHash();
     // We want the nonce to be 64 bytes long to force the hasher to process
     // this chunk, which makes later hash computations more efficient. We
-    // just write our 32-byte entropy, and then pad with 'E' for ECDSA and
-    // 'S' for Schnorr (followed by 0 bytes).
+    // just write our 32-byte entropy, and then pad with 'E' for ECDSA,
+    // 'S' for Schnorr and 'P' for PQC (followed by 0 bytes).
     static constexpr unsigned char PADDING_ECDSA[32] = {'E'};
     static constexpr unsigned char PADDING_SCHNORR[32] = {'S'};
+    static constexpr unsigned char PADDING_PQC[32] = {'P'};
     m_salted_hasher_ecdsa.Write(nonce.begin(), 32);
     m_salted_hasher_ecdsa.Write(PADDING_ECDSA, 32);
     m_salted_hasher_schnorr.Write(nonce.begin(), 32);
     m_salted_hasher_schnorr.Write(PADDING_SCHNORR, 32);
+    m_salted_hasher_pqc.Write(nonce.begin(), 32);
+    m_salted_hasher_pqc.Write(PADDING_PQC, 32);
 
     const auto [num_elems, approx_size_bytes] = setValid.setup_bytes(max_size_bytes);
     LogInfo("Using %zu MiB out of %zu MiB requested for signature cache, able to store %zu elements",
@@ -45,6 +49,12 @@ void SignatureCache::ComputeEntryECDSA(uint256& entry, const uint256& hash, cons
 void SignatureCache::ComputeEntrySchnorr(uint256& entry, const uint256& hash, std::span<const unsigned char> sig, const XOnlyPubKey& pubkey) const
 {
     CSHA256 hasher = m_salted_hasher_schnorr;
+    hasher.Write(hash.begin(), 32).Write(pubkey.data(), pubkey.size()).Write(sig.data(), sig.size()).Finalize(entry.begin());
+}
+
+void SignatureCache::ComputeEntryPQC(uint256& entry, const uint256& hash, std::span<const unsigned char> sig, const CPQCPubKey& pubkey) const
+{
+    CSHA256 hasher = m_salted_hasher_pqc;
     hasher.Write(hash.begin(), 32).Write(pubkey.data(), pubkey.size()).Write(sig.data(), sig.size()).Finalize(entry.begin());
 }
 
@@ -81,4 +91,20 @@ bool CachingTransactionSignatureChecker::VerifySchnorrSignature(std::span<const 
     if (!TransactionSignatureChecker::VerifySchnorrSignature(sig, pubkey, sighash)) return false;
     if (store) m_signature_cache.Set(entry);
     return true;
+}
+
+bool CachingTransactionSignatureChecker::VerifyPQCSignature(std::span<const unsigned char> sig, const CPQCPubKey& pubkey, const uint256& sighash) const
+{
+    uint256 entry;
+    m_signature_cache.ComputeEntryPQC(entry, sighash, sig, pubkey);
+    PQCSignatureCacheObserver* const observer{m_signature_cache.GetPQCObserver()};
+    const bool hit{m_signature_cache.Get(entry, !store)};
+    if (observer) observer->Lookup(hit, !store);
+    if (hit) return true;
+    const bool valid{TransactionSignatureChecker::VerifyPQCSignature(sig, pubkey, sighash)};
+    // Only a verified success is published to the cache.
+    const bool insert{valid && store};
+    if (insert) m_signature_cache.Set(entry);
+    if (observer) observer->Verified(valid, insert);
+    return valid;
 }

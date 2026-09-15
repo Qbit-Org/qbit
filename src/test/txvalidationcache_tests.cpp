@@ -3,17 +3,27 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <consensus/validation.h>
+#include <crypto/pqc.h>
 #include <key.h>
 #include <random.h>
+#include <script/interpreter.h>
+#include <script/script.h>
 #include <script/sigcache.h>
 #include <script/sign.h>
 #include <script/signingprovider.h>
+#include <sync.h>
+#include <test/util/script.h>
 #include <test/util/setup_common.h>
+#include <tinyformat.h>
 #include <txmempool.h>
 #include <util/chaintype.h>
 #include <validation.h>
 
 #include <boost/test/unit_test.hpp>
+
+#include <string>
+#include <utility>
+#include <vector>
 
 struct Dersig100Setup : public TestChain100Setup {
     Dersig100Setup()
@@ -25,6 +35,89 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                        bool cacheFullScriptStore, PrecomputedTransactionData& txdata,
                        ValidationCache& validation_cache,
                        std::vector<CScriptCheck>* pvChecks) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
+struct P2MRPQCAdmissionSetup : public TestChain100Setup {
+    P2MRPQCAdmissionSetup()
+        : TestChain100Setup{ChainType::REGTEST, {.extra_args = {"-p2mronly=1"}}} {}
+};
+
+namespace {
+enum class PQCCacheEventType { LOOKUP_HIT, LOOKUP_MISS, VERIFIED_OK, VERIFIED_FAIL };
+
+struct PQCCacheEvent {
+    PQCCacheEventType type;
+    //! The erase flag for lookups, the inserted flag for verifications.
+    bool flag;
+    friend bool operator==(const PQCCacheEvent&, const PQCCacheEvent&) = default;
+};
+
+PQCCacheEvent PQCHit(bool erase) { return {PQCCacheEventType::LOOKUP_HIT, erase}; }
+PQCCacheEvent PQCMiss(bool erase) { return {PQCCacheEventType::LOOKUP_MISS, erase}; }
+PQCCacheEvent PQCVerifiedOk(bool inserted) { return {PQCCacheEventType::VERIFIED_OK, inserted}; }
+
+/**
+ * Render an admission event log. ATMP runs PolicyScriptChecks before
+ * ConsensusScriptChecks, each checking every input once in order, and a
+ * full-script cache hit emits no events. The pass label is therefore derived
+ * from event order: the first input_count lookups (with the verifications that
+ * follow them) belong to the policy pass, later ones to the consensus pass.
+ */
+std::string PQCEventsToString(const std::vector<PQCCacheEvent>& events, size_t input_count)
+{
+    std::string out;
+    size_t lookups{0};
+    for (const PQCCacheEvent& event : events) {
+        const bool lookup{event.type == PQCCacheEventType::LOOKUP_HIT || event.type == PQCCacheEventType::LOOKUP_MISS};
+        if (lookup) ++lookups;
+        const std::string pass{lookups <= input_count ? "policy" : "consensus"};
+        if (!out.empty()) out += ", ";
+        switch (event.type) {
+        case PQCCacheEventType::LOOKUP_HIT: out += strprintf("%s:HIT(erase=%d)", pass, event.flag); break;
+        case PQCCacheEventType::LOOKUP_MISS: out += strprintf("%s:MISS(erase=%d)", pass, event.flag); break;
+        case PQCCacheEventType::VERIFIED_OK: out += strprintf("%s:VERIFIED_OK(inserted=%d)", pass, event.flag); break;
+        case PQCCacheEventType::VERIFIED_FAIL: out += strprintf("%s:VERIFIED_FAIL(inserted=%d)", pass, event.flag); break;
+        }
+    }
+    return "[" + out + "]";
+}
+
+class RecordingPQCObserver final : public PQCSignatureCacheObserver
+{
+    Mutex m_mutex;
+    std::vector<PQCCacheEvent> m_events GUARDED_BY(m_mutex);
+
+public:
+    void Lookup(bool hit, bool erase) override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
+    {
+        LOCK(m_mutex);
+        m_events.push_back(hit ? PQCHit(erase) : PQCMiss(erase));
+    }
+    void Verified(bool valid, bool inserted) override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
+    {
+        LOCK(m_mutex);
+        m_events.push_back({valid ? PQCCacheEventType::VERIFIED_OK : PQCCacheEventType::VERIFIED_FAIL, inserted});
+    }
+    std::vector<PQCCacheEvent> Take() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
+    {
+        LOCK(m_mutex);
+        return std::exchange(m_events, {});
+    }
+};
+
+//! Attach an observer for one scope; the cache has none attached outside it.
+class ScopedPQCObserver
+{
+    SignatureCache& m_cache;
+
+public:
+    ScopedPQCObserver(SignatureCache& cache, PQCSignatureCacheObserver& observer) : m_cache{cache}
+    {
+        BOOST_REQUIRE(m_cache.GetPQCObserver() == nullptr);
+        m_cache.SetPQCObserverForTesting(&observer);
+    }
+    ~ScopedPQCObserver() { m_cache.SetPQCObserverForTesting(nullptr); }
+};
+} // namespace
 
 BOOST_AUTO_TEST_SUITE(txvalidationcache_tests)
 
@@ -383,6 +476,140 @@ BOOST_FIXTURE_TEST_CASE(checkinputs_test, Dersig100Setup)
         // Should get 2 script checks back -- caching is on a whole-transaction basis.
         BOOST_CHECK_EQUAL(scriptchecks.size(), 2U);
     }
+}
+
+BOOST_FIXTURE_TEST_CASE(pqc_policy_consensus_reuse, P2MRPQCAdmissionSetup)
+{
+    using valtype = std::vector<unsigned char>;
+    SignatureCache& signature_cache{m_node.chainman->m_validation_cache.m_signature_cache};
+
+    CPQCKey key;
+    key.MakeNewKey();
+    BOOST_REQUIRE(key.IsValid());
+    const CPQCPubKey pubkey{key.GetPubKey()};
+    uint32_t signature_counter{0};
+
+    const CScript leaf_script{CScript{} << valtype(pubkey.begin(), pubkey.end()) << OP_CHECKSIGPQC};
+    const valtype leaf_bytes(leaf_script.begin(), leaf_script.end());
+    const valtype control_block{static_cast<unsigned char>(P2MR_LEAF_VERSION_V1 | 1)};
+    const uint256 leaf_hash{ComputeP2MRLeafHash(P2MR_LEAF_VERSION_V1, leaf_bytes)};
+    const uint256 merkle_root{ComputeP2MRMerkleRoot(control_block, leaf_hash)};
+    const CScript pqc_script_pubkey{CScript{} << OP_2 << valtype(merkle_root.begin(), merkle_root.end())};
+
+    // Confirm four P2MR CHECKSIGPQC coins before any observer is attached.
+    const CAmount coin_value{m_coinbase_txns[0]->vout[0].nValue / 8};
+    const CMutableTransaction funding{CreateValidMempoolTransaction(
+        /*input_transactions=*/{m_coinbase_txns[0]},
+        /*inputs=*/{COutPoint{m_coinbase_txns[0]->GetHash(), 0}},
+        /*input_height=*/COINBASE_MATURITY,
+        /*input_signing_keys=*/{coinbaseKey},
+        /*outputs=*/std::vector<CTxOut>(4, CTxOut{coin_value, pqc_script_pubkey}),
+        /*submit=*/false)};
+    CreateAndProcessBlock({funding}, P2MROpTrueScript());
+    for (uint32_t n{0}; n < funding.vout.size(); ++n) {
+        BOOST_REQUIRE(WITH_LOCK(cs_main, return m_node.chainman->ActiveChainstate().CoinsTip().HaveCoin(COutPoint{funding.GetHash(), n})));
+    }
+
+    struct PQCSpend {
+        CMutableTransaction tx;
+        std::vector<uint256> entries;
+    };
+    const auto build_spend = [&](const std::vector<uint32_t>& vouts) {
+        PQCSpend spend;
+        spend.tx.version = 2;
+        std::vector<CTxOut> spent_outputs;
+        for (const uint32_t n : vouts) {
+            spend.tx.vin.emplace_back(COutPoint{funding.GetHash(), n});
+            spend.tx.vin.back().scriptWitness.stack = {valtype(PQC_SIG_SIZE, 0x00), leaf_bytes, control_block};
+            spent_outputs.push_back(funding.vout[n]);
+        }
+        spend.tx.vout.emplace_back(coin_value * static_cast<CAmount>(vouts.size()) - 100'000, P2MROpTrueScript());
+        PrecomputedTransactionData txdata;
+        txdata.Init(spend.tx, std::move(spent_outputs));
+        for (uint32_t i{0}; i < spend.tx.vin.size(); ++i) {
+            ScriptExecutionData execdata;
+            execdata.m_annex_init = true;
+            execdata.m_annex_present = false;
+            execdata.m_tapleaf_hash = leaf_hash;
+            execdata.m_tapleaf_hash_init = true;
+            execdata.m_codeseparator_pos = 0xFFFFFFFFUL;
+            execdata.m_codeseparator_pos_init = true;
+            uint256 sighash;
+            BOOST_REQUIRE(SignatureHashP2MR(sighash, execdata, spend.tx, i, SIGHASH_DEFAULT, txdata, MissingDataBehavior::ASSERT_FAIL));
+            valtype sig;
+            BOOST_REQUIRE(key.Sign(sighash, sig, signature_counter));
+            uint256 entry;
+            signature_cache.ComputeEntryPQC(entry, sighash, sig, pubkey);
+            spend.entries.push_back(entry);
+            spend.tx.vin[i].scriptWitness.stack[0] = std::move(sig);
+        }
+        return spend;
+    };
+    const auto require_cold = [&](const PQCSpend& spend) {
+        for (const uint256& entry : spend.entries) {
+            BOOST_REQUIRE(!signature_cache.Get(entry, /*erase=*/false));
+        }
+    };
+    const auto admit = [&](const CMutableTransaction& tx, bool test_accept, std::vector<PQCCacheEvent>& events) {
+        RecordingPQCObserver observer;
+        MempoolAcceptResult result{[&] {
+            ScopedPQCObserver scoped{signature_cache, observer};
+            MempoolAcceptResult inner{WITH_LOCK(cs_main, return m_node.chainman->ProcessTransaction(MakeTransactionRef(tx), test_accept))};
+            BOOST_REQUIRE(signature_cache.GetPQCObserver() == &observer);
+            return inner;
+        }()};
+        events = observer.Take();
+        return result;
+    };
+    const auto in_mempool = [&](const CMutableTransaction& tx) {
+        return WITH_LOCK(m_node.mempool->cs, return m_node.mempool->exists(tx.GetHash()));
+    };
+    std::vector<PQCCacheEvent> events;
+
+    // Fresh one-signature admission: one primitive verification in the policy
+    // pass, reused by the consensus pass.
+    const PQCSpend one{build_spend({0})};
+    require_cold(one);
+    const MempoolAcceptResult result_one{admit(one.tx, /*test_accept=*/false, events)};
+    BOOST_TEST_MESSAGE("N=1 fresh admission: " << PQCEventsToString(events, 1));
+    BOOST_CHECK_MESSAGE(result_one.m_result_type == MempoolAcceptResult::ResultType::VALID, result_one.m_state.ToString());
+    BOOST_CHECK(events == (std::vector{PQCMiss(false), PQCVerifiedOk(true), PQCHit(false)}));
+    BOOST_CHECK(in_mempool(one.tx));
+    BOOST_CHECK(signature_cache.Get(one.entries[0], /*erase=*/false));
+
+    // Fresh two-signature admission: two primitive verifications instead of four.
+    const PQCSpend two{build_spend({1, 2})};
+    require_cold(two);
+    const MempoolAcceptResult result_two{admit(two.tx, /*test_accept=*/false, events)};
+    BOOST_TEST_MESSAGE("N=2 fresh admission: " << PQCEventsToString(events, 2));
+    BOOST_CHECK_MESSAGE(result_two.m_result_type == MempoolAcceptResult::ResultType::VALID, result_two.m_state.ToString());
+    BOOST_CHECK(events == (std::vector{PQCMiss(false), PQCVerifiedOk(true), PQCMiss(false), PQCVerifiedOk(true), PQCHit(false), PQCHit(false)}));
+    BOOST_CHECK(in_mempool(two.tx));
+
+    // test_accept still runs both passes on a fresh transaction.
+    const PQCSpend probe{build_spend({3})};
+    require_cold(probe);
+    const MempoolAcceptResult result_probe{admit(probe.tx, /*test_accept=*/true, events)};
+    BOOST_TEST_MESSAGE("N=1 fresh test_accept: " << PQCEventsToString(events, 1));
+    BOOST_CHECK_MESSAGE(result_probe.m_result_type == MempoolAcceptResult::ResultType::VALID, result_probe.m_state.ToString());
+    BOOST_CHECK(events == (std::vector{PQCMiss(false), PQCVerifiedOk(true), PQCHit(false)}));
+    BOOST_CHECK(!in_mempool(probe.tx));
+
+    // Repeating test_accept re-executes the policy pass, which hits the
+    // signature cache; the consensus pass is a full-script cache hit and emits
+    // no events. A lone hit is not policy-to-consensus reuse evidence.
+    const MempoolAcceptResult result_repeat{admit(probe.tx, /*test_accept=*/true, events)};
+    BOOST_TEST_MESSAGE("N=1 repeated test_accept: " << PQCEventsToString(events, 1));
+    BOOST_CHECK_MESSAGE(result_repeat.m_result_type == MempoolAcceptResult::ResultType::VALID, result_repeat.m_state.ToString());
+    BOOST_CHECK(events == (std::vector{PQCHit(false)}));
+
+    // Resubmitting a transaction already in the mempool is rejected before
+    // script checks: a valid zero, not reuse evidence.
+    const MempoolAcceptResult result_duplicate{admit(one.tx, /*test_accept=*/false, events)};
+    BOOST_TEST_MESSAGE("N=1 duplicate submission: " << PQCEventsToString(events, 1) << " reject=" << result_duplicate.m_state.GetRejectReason());
+    BOOST_CHECK(result_duplicate.m_result_type == MempoolAcceptResult::ResultType::INVALID);
+    BOOST_CHECK_EQUAL(result_duplicate.m_state.GetRejectReason(), "txn-already-in-mempool");
+    BOOST_CHECK(events.empty());
 }
 
 BOOST_AUTO_TEST_SUITE_END()
