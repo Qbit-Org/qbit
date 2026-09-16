@@ -623,6 +623,7 @@ inline std::map<unsigned int, std::string> VerifyP2MRSpend(const CMutableTransac
     const CTransaction tx{signed_tx};
     BOOST_CHECK(CTransaction{unsigned_tx}.GetHash() == tx.GetHash());
     std::vector<CTxOut> spent_outputs;
+    spent_outputs.reserve(tx.vin.size());
     for (const CTxIn& input : tx.vin) {
         spent_outputs.push_back(coins.at(input.prevout).out);
     }

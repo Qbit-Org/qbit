@@ -973,6 +973,7 @@ BOOST_AUTO_TEST_CASE(MixedManagersRecognizeSatisfiedForeignLeaf)
         auto& foreign_coin{workload.coins.at(workload.spend_tx.vin[1].prevout)};
         foreign_coin.out.scriptPubKey = GetScriptForDestination(builder.GetP2MROutput());
         std::vector<CTxOut> spent_outputs;
+        spent_outputs.reserve(workload.spend_tx.vin.size());
         for (const auto& input : workload.spend_tx.vin) spent_outputs.push_back(workload.coins.at(input.prevout).out);
         PrecomputedTransactionData txdata;
         txdata.Init(CTransaction{workload.spend_tx}, std::move(spent_outputs), /*force=*/true);

@@ -268,7 +268,8 @@ BOOST_AUTO_TEST_CASE(commit_rejects_conflict_before_wallet_notification)
     }
     std::vector<bilingual_str> errors;
     Txid bumped_txid;
-    BOOST_CHECK(CommitTransaction(m_wallet, original.GetHash(), std::move(replacement), errors, bumped_txid) == Result::WALLET_ERROR);
+    const Result commit_result{CommitTransaction(m_wallet, original.GetHash(), std::move(replacement), errors, bumped_txid)};
+    BOOST_CHECK(commit_result == Result::WALLET_ERROR);
     BOOST_REQUIRE_EQUAL(errors.size(), 1U);
     BOOST_CHECK(errors.front().original.find("is already spent by mempool transaction") != std::string::npos);
     BOOST_CHECK(bumped_txid.IsNull());
@@ -286,7 +287,8 @@ BOOST_AUTO_TEST_CASE(commit_rejects_conflict_before_wallet_notification)
     errors.clear();
     CMutableTransaction retry{original};
     retry.vout.front().nValue = 8'900;
-    BOOST_CHECK(CommitTransaction(m_wallet, original.GetHash(), std::move(retry), errors, bumped_txid) == Result::OK);
+    const Result retry_result{CommitTransaction(m_wallet, original.GetHash(), std::move(retry), errors, bumped_txid)};
+    BOOST_CHECK(retry_result == Result::OK);
     BOOST_CHECK(errors.empty());
     BOOST_CHECK(bumped_txid == replacement_id);
 }
@@ -307,7 +309,8 @@ BOOST_AUTO_TEST_CASE(commit_rejects_spent_wallet_coin_before_notification)
     replacement.vout.front().nValue = 8'900;
     std::vector<bilingual_str> errors;
     Txid bumped_txid;
-    BOOST_CHECK(CommitTransaction(m_wallet, original.GetHash(), std::move(replacement), errors, bumped_txid) == Result::WALLET_ERROR);
+    const Result commit_result{CommitTransaction(m_wallet, original.GetHash(), std::move(replacement), errors, bumped_txid)};
+    BOOST_CHECK(commit_result == Result::WALLET_ERROR);
     BOOST_REQUIRE_EQUAL(errors.size(), 1U);
     BOOST_CHECK(errors.front().original.find("is no longer available") != std::string::npos);
     BOOST_CHECK(bumped_txid.IsNull());
