@@ -973,7 +973,13 @@ static std::optional<bool> TrySignTransactionPQCParallel(
         auto script_plan = SelectCompleteP2MRSigningPlan(provider, creator, output, input_plan.sigdata);
         if (!script_plan.has_value()) {
             if (!is_foreign_to_provider(input_plan.sigdata)) return std::nullopt;
-            input_plan.foreign_to_provider = true;
+            // DataFromTransaction verifies without spent outputs, and the
+            // planner only understands pk()/multi_a leaves. A foreign witness
+            // can still be complete; check it with the full sighash context.
+            const CTransaction tx{mtx};
+            input_plan.sigdata.complete = VerifyScript(tx.vin[i].scriptSig, txout.scriptPubKey, &tx.vin[i].scriptWitness,
+                STANDARD_SCRIPT_VERIFY_FLAGS, TransactionSignatureChecker(&tx, i, txout.nValue, txdata, MissingDataBehavior::FAIL));
+            input_plan.foreign_to_provider = !input_plan.sigdata.complete;
             input_plans.push_back(std::move(input_plan));
             continue;
         }

@@ -959,6 +959,50 @@ BOOST_AUTO_TEST_CASE(MixedManagersUseTwoDurableBatches)
     }
 }
 
+BOOST_AUTO_TEST_CASE(MixedManagersRecognizeSatisfiedForeignLeaf)
+{
+    m_node.args->ForceSetArg("-walletpqcsignthreads", "2");
+    for (const char* parallel : {"0", "1"}) {
+        m_node.args->ForceSetArg("-walletpqcparallel", parallel);
+        auto workload{MakeMixedManagerP2MRSigningWorkload(*m_node.chain, {EXTERNAL, UNOWNED})};
+        // A valid leaf outside the planner's pk()/multi_a shapes. Verification
+        // without the spent outputs cannot recognize its existing signature.
+        const CScript leaf{CScript{} << OP_TRUE << OP_DROP << ToByteVector(workload.unowned_key.GetPubKey()) << OP_CHECKSIGPQC};
+        TaprootBuilder builder;
+        builder.AddP2MR(0, ToBytes(leaf), P2MR_LEAF_VERSION_V1).FinalizeP2MR();
+        auto& foreign_coin{workload.coins.at(workload.spend_tx.vin[1].prevout)};
+        foreign_coin.out.scriptPubKey = GetScriptForDestination(builder.GetP2MROutput());
+        std::vector<CTxOut> spent_outputs;
+        for (const auto& input : workload.spend_tx.vin) spent_outputs.push_back(workload.coins.at(input.prevout).out);
+        PrecomputedTransactionData txdata;
+        txdata.Init(CTransaction{workload.spend_tx}, std::move(spent_outputs), /*force=*/true);
+        MutableTransactionSignatureCreator creator{workload.spend_tx, 1, foreign_coin.out.nValue, &txdata, SIGHASH_DEFAULT};
+        uint256 hash;
+        BOOST_REQUIRE(creator.CreatePQCSignatureHash(hash, ComputeP2MRLeafHash(P2MR_LEAF_VERSION_V1, ToBytes(leaf)), SigVersion::P2MR));
+        std::vector<unsigned char> signature;
+        uint32_t counter{0};
+        BOOST_REQUIRE(workload.unowned_key.Sign(hash, signature, counter));
+        const auto spenddata{builder.GetP2MRSpendData()};
+        workload.spend_tx.vin[1].scriptWitness.stack = {signature, ToBytes(leaf), *spenddata.scripts.begin()->second.begin()};
+        const CMutableTransaction before{workload.spend_tx};
+        BOOST_REQUIRE(!DataFromTransaction(before, 1, foreign_coin.out).complete);
+        BOOST_REQUIRE(!VerifyP2MRSpend(before, before, workload.coins).contains(1));
+
+        const auto provider{workload.external_spk_man->GetSigningProviderForTransaction(workload.coins)};
+        BOOST_REQUIRE(provider);
+        std::map<int, bilingual_str> errors;
+        // Both the batch containing work and the no-jobs retry must recognize
+        // the foreign witness without changing it or reporting "No error".
+        for (int attempt{0}; attempt < 2; ++attempt) {
+            errors[1] = Untranslated("stale error");
+            BOOST_CHECK_MESSAGE(::SignTransaction(workload.spend_tx, provider.get(), workload.coins, SIGHASH_DEFAULT, errors), FormatInputErrors(errors));
+            BOOST_CHECK(errors.empty());
+            BOOST_CHECK(workload.spend_tx.vin[1].scriptWitness.stack == before.vin[1].scriptWitness.stack);
+            BOOST_CHECK(VerifyP2MRSpend(before, workload.spend_tx, workload.coins).empty());
+        }
+    }
+}
+
 BOOST_AUTO_TEST_CASE(MixedManagersKeepForeignInputErrors)
 {
     m_node.args->ForceSetArg("-walletpqcparallel", "1");
