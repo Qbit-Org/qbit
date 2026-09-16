@@ -586,7 +586,7 @@ private:
     void OnCommitResult(bool success)
     {
         auto current{ReadDurablePQCCounters(m_database.m_records)};
-        DurableCommit commit{.success = success};
+        DurableCommit commit{.success = success, .ranges = {}};
         for (const auto& [key, counter] : current) {
             const auto committed_it{m_committed.find(key)};
             const uint32_t previous{committed_it == m_committed.end() ? 0 : committed_it->second};
@@ -689,7 +689,7 @@ inline SerialSigningOracleResult RunSerialSigningOracle(interfaces::Chain& chain
 
     const bool parallel{args.GetBoolArg("-walletpqcparallel", true)};
     args.ForceSetArg("-walletpqcparallel", "0");
-    SerialSigningOracleResult result{.tx = tx};
+    SerialSigningOracleResult result{.input_errors = {}, .tx = tx, .durable_counters = {}};
     result.signed_ok = oracle.SignTransaction(result.tx, coins, sighash, result.input_errors);
     args.ForceSetArg("-walletpqcparallel", parallel ? "1" : "0");
     result.durable_counters = ReadDurablePQCCounters(GetMockableDatabase(oracle).m_records);
