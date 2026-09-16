@@ -1,0 +1,402 @@
+{
+  "schema_version": 1,
+  "license": "MIT",
+  "generator": "test/fuzz/qbit_corpora/generate_seeds.py",
+  "limits": {
+    "max_seeds_per_target": 16,
+    "max_seed_bytes": 8192,
+    "max_target_bytes": 65536,
+    "max_total_bytes": 393216
+  },
+  "formats": {
+    "fdp": "Untagged FuzzedDataProvider layout for targets without a tagged format.",
+    "legacy": "Untagged pre-existing FuzzedDataProvider layout of pqc/p2mr_script, unchanged.",
+    "qbfx-v1-fixture": "b'QBFX' + target tag ('P' pqc, 'M' p2mr_script) + 0x01 + selector whose low nibble is not 0xF, then the FuzzedDataProvider layout of the cached-fixture body.",
+    "qbfx-v1-generation": "b'QBFX' + target tag + 0x01 + selector whose low nibble is 0xF, then the legacy FuzzedDataProvider layout."
+  },
+  "targets": {
+    "asert_chain_transition": [
+      {
+        "file": "permissionless-lane-on-schedule",
+        "format": "fdp",
+        "size": 2000,
+        "sha256": "f10ae9d2472c894f28ec1c081be39c85f87a8b8443dabb00b4eed2214b6518f2",
+        "semantics": "2000 permissionless-lane blocks at the 75 second lane spacing."
+      },
+      {
+        "file": "fast-blocks-raise-difficulty",
+        "format": "fdp",
+        "size": 1500,
+        "sha256": "6249da5c681dd8a542b8e38150a3026e02385d590a9dd94f4f83940fd856ee73",
+        "semantics": "1500 blocks one second apart: the target shrinks every block."
+      },
+      {
+        "file": "slow-blocks-reach-pow-limit",
+        "format": "fdp",
+        "size": 1500,
+        "sha256": "0da91fd06750a34343b8a20e0126a921955f82f62837d22d2dcf1eaaf6dc8821",
+        "semantics": "1500 blocks 240 seconds apart: the target grows until it is clamped to powLimit."
+      },
+      {
+        "file": "alternating-fast-slow",
+        "format": "fdp",
+        "size": 2000,
+        "sha256": "79580779de4c89c2bc82b15f085d8a25546c8977174076e1ae8896182016a359",
+        "semantics": "2000 blocks alternating 1 and 240 second spacing."
+      },
+      {
+        "file": "aggregate-cadence-then-slow",
+        "format": "fdp",
+        "size": 2000,
+        "sha256": "e66802c21e41b7adee88ab9c978e1b7472ddc0d109e3a7c6e793a4f5db34a5e1",
+        "semantics": "1000 blocks at the 60 second aggregate cadence followed by 1000 blocks at 150 seconds."
+      }
+    ],
+    "asert_edge_cases": [
+      {
+        "file": "exhaustive-grid-fallback-short-half-lives",
+        "format": "fdp",
+        "size": 4410,
+        "sha256": "6158a6303319939e3609baf63c93a30b834fa8560b8e0bf3aee74140c0eb6bde",
+        "semantics": "Anchor-target fallback over every height and skew choice for half-lives 1, 2 and 16."
+      },
+      {
+        "file": "exhaustive-grid-fallback-long-half-lives",
+        "format": "fdp",
+        "size": 4410,
+        "sha256": "d5dcf7808b3664dda0162dd259ad960ba897810be80a2a7419cca9333bbbf5f8",
+        "semantics": "Anchor-target fallback over every height and skew choice for half-lives 1024, nASERTHalfLife and INT32_MAX."
+      },
+      {
+        "file": "exhaustive-grid-pow-limit-short-half-lives",
+        "format": "fdp",
+        "size": 4410,
+        "sha256": "9c16d8ca1925c57442d605499247a253ddae1b3c4eadd56e9fda1dc7c4dee77f",
+        "semantics": "powLimit reference over every height and skew choice for half-lives 1, 2 and 16."
+      },
+      {
+        "file": "exhaustive-grid-pow-limit-long-half-lives",
+        "format": "fdp",
+        "size": 4410,
+        "sha256": "2a9bb38590c830c004bd0f06a4bcec36a1bc412791eaa378f91065346d8dcf89",
+        "semantics": "powLimit reference over every height and skew choice for half-lives 1024, nASERTHalfLife and INT32_MAX."
+      },
+      {
+        "file": "minimum-target-extreme-skews",
+        "format": "fdp",
+        "size": 840,
+        "sha256": "e08c4efa3f9a8a9a7df5df933d9019a966973f4304ff21d5d955a93bc025d071",
+        "semantics": "Reference target 1, height difference 1e7, skews of +/-(2^46-1) and +/-half-life for every half-life."
+      }
+    ],
+    "asert_math": [
+      {
+        "file": "anchor-target-on-schedule",
+        "format": "fdp",
+        "size": 39,
+        "sha256": "a9d5753bbe08bdbf573032ba920405754f0e904bdd398ed083b60c038102cb0f",
+        "semantics": "Zero reference target falls back to the anchor target; 1000 blocks exactly on schedule."
+      },
+      {
+        "file": "pow-limit-reference-slow-blocks",
+        "format": "fdp",
+        "size": 39,
+        "sha256": "ae3e84a908f73f4ae696c4498df62f8af85e33882b02020ea1c1607bb296badc",
+        "semantics": "powLimit reference with one block arriving 1e9 seconds late: result is clamped to powLimit."
+      },
+      {
+        "file": "minimum-target-fast-blocks",
+        "format": "fdp",
+        "size": 39,
+        "sha256": "c9700bbd90fd6f63859af26f09c592413b30e20da26f2f8258e073f5b56b7d05",
+        "semantics": "Reference target 1 with 1e6 blocks arriving 1e9 seconds early: result is clamped to at least 1."
+      },
+      {
+        "file": "above-pow-limit-fallback",
+        "format": "fdp",
+        "size": 78,
+        "sha256": "b8ba0f9b347c14ef87d21a79e06d499251e74afae8e9354eaa04a799f19bfff6",
+        "semantics": "Reference targets above powLimit fall back to the anchor target."
+      },
+      {
+        "file": "mixed-reference-height-skew-grid",
+        "format": "fdp",
+        "size": 2496,
+        "sha256": "67d9f198c7c02e2735b2bc506a2564e3f63a87fcb4b9ee744db9d495d795a2ea",
+        "semantics": "64 steps cycling reference targets {1, 2^128, powLimit, fallback}, heights and skews."
+      }
+    ],
+    "auxpow": [
+      {
+        "file": "payload-non-coinbase-rejected",
+        "format": "fdp",
+        "size": 145,
+        "sha256": "e7b326ee7671be01510becff1d69bc25fdbd0b9a8dc9e433b99b987ddd513237",
+        "semantics": "Standalone auxpow payload whose transaction has no inputs: rejected as bad-auxpow-coinbase."
+      },
+      {
+        "file": "payload-long-branches-negative-chain-index",
+        "format": "fdp",
+        "size": 1169,
+        "sha256": "39d513e26c14c99a6dcb7dcca3e75f5368a74e65f745eb85d600fa72f105ee7b",
+        "semantics": "Payload with 16-hash coinbase and chain branches and chain index -1; exercises branch hashing and expected-index derivation before rejection."
+      },
+      {
+        "file": "header-permissionless-pow-check",
+        "format": "fdp",
+        "size": 85,
+        "sha256": "21b8b3499dbd0afa114c9464ad95faa0731f081eb95a50116f8c711353f84cf8",
+        "semantics": "Header without the auxpow version bit or payload, validated with check_pow set."
+      },
+      {
+        "file": "header-auxpow-chainid-mismatch",
+        "format": "fdp",
+        "size": 186,
+        "sha256": "863f66a27e827c8adf8959837fb8137b0db9212a5c33b68b83d70154911560d4",
+        "semantics": "Header with auxpow payload and chain id 0 (mainnet expects 47): rejected as bad-auxpow-chainid."
+      },
+      {
+        "file": "checkblock-single-non-coinbase-tx",
+        "format": "fdp",
+        "size": 136,
+        "sha256": "b35f4f92d5c97491146a32cb0bd0aa0bb5ae96457b1984a05adea1d84f347542",
+        "semantics": "CheckBlock on a permissionless block whose only transaction is not a coinbase."
+      },
+      {
+        "file": "all-branches",
+        "format": "fdp",
+        "size": 461,
+        "sha256": "55a7a99a5c371b987005a3bfec51c5ccc4d7ffe6db95ff0ad05271e013f45658",
+        "semantics": "Payload validation, header validation and CheckBlock in one input."
+      }
+    ],
+    "p2mr_script": [
+      {
+        "file": "legacy-checksigpqc-default-valid",
+        "format": "legacy",
+        "size": 138,
+        "sha256": "0e32bfba843cd8069260f771911cffe796f4c632769a33a0cb4236820970724b",
+        "semantics": "Untagged legacy layout: generated key, <pubkey> OP_CHECKSIGPQC single leaf, SIGHASH_DEFAULT signature, no mutation; the spend is valid."
+      },
+      {
+        "file": "legacy-checksigpqc-all-valid",
+        "format": "legacy",
+        "size": 138,
+        "sha256": "4cd3a5571760d781a5f9e4e6a91db31faee456f263a0948fe3e39e3413ae7bc8",
+        "semantics": "As legacy-checksigpqc-default-valid with an explicit SIGHASH_ALL byte; the spend is valid."
+      },
+      {
+        "file": "legacy-verify-true-sibling-single-anyonecanpay-valid",
+        "format": "legacy",
+        "size": 139,
+        "sha256": "91480e3729c483686b71a05f33612ae7b62e2494c3000e33dabfd79b25544387",
+        "semantics": "OP_CHECKSIGPQC OP_VERIFY OP_TRUE leaf next to an OP_FALSE sibling (65-byte control block), SIGHASH_SINGLE|ANYONECANPAY; the spend is valid."
+      },
+      {
+        "file": "legacy-ctv-checksigpqc-all-valid",
+        "format": "legacy",
+        "size": 138,
+        "sha256": "348c4d83883e5a8fc7eba44b7e5a205a5ea699cec9ea089b2f914e1ad46e73cd",
+        "semantics": "Matching OP_CHECKTEMPLATEVERIFY followed by OP_CHECKSIGPQC, SIGHASH_ALL; the spend is valid."
+      },
+      {
+        "file": "legacy-signature-bit-flip",
+        "format": "legacy",
+        "size": 141,
+        "sha256": "464ee2f6ee40875074f53e29b8590a21a4867b6d9ff108305c991d37bf282506",
+        "semantics": "SIGHASH_DEFAULT signature with byte 100 xor 0x01: rejected with SCRIPT_ERR_P2MR_SIG."
+      },
+      {
+        "file": "legacy-signature-truncated",
+        "format": "legacy",
+        "size": 139,
+        "sha256": "c4b90159482bb51fa4ad6251884c3f3bab8901bc58c0828db85e525bc9a4f6c4",
+        "semantics": "SIGHASH_DEFAULT signature truncated by one byte: rejected with SCRIPT_ERR_P2MR_SIG_SIZE."
+      },
+      {
+        "file": "legacy-invalid-hashtype-appended",
+        "format": "legacy",
+        "size": 139,
+        "sha256": "522d6fcf9d7cf06e0f1097a319ac3c7b96f2a3a031f562ccf5c82faf7d76c08a",
+        "semantics": "SIGHASH_DEFAULT signature with 0x04 appended: rejected with SCRIPT_ERR_P2MR_SIG_HASHTYPE."
+      },
+      {
+        "file": "legacy-control-block-bit0-cleared",
+        "format": "legacy",
+        "size": 139,
+        "sha256": "f4836462f26a4a15aef131b1a19270a1e5ba0522188e86d187e0037235e1f6a0",
+        "semantics": "Control byte xor 0x01: rejected with SCRIPT_ERR_P2MR_CONTROL_BIT0."
+      },
+      {
+        "file": "legacy-control-block-truncated",
+        "format": "legacy",
+        "size": 139,
+        "sha256": "f343ca22ab4e2cbf0cb59d4d4d4b4805e03ffaa6c55b8a48706aa54f8213ce7e",
+        "semantics": "Control block missing its last byte: rejected with SCRIPT_ERR_P2MR_WRONG_CONTROL_SIZE."
+      },
+      {
+        "file": "legacy-checkdatasig-empty-signature",
+        "format": "legacy",
+        "size": 139,
+        "sha256": "b41728b2e7a24347290ee4c20bdd8211f4aa611e9022846917fbe704d96d5d41",
+        "semantics": "OP_CHECKDATASIGPQC with a 32-byte message, 32-byte key and empty signature; no signing, rejected."
+      },
+      {
+        "file": "legacy-annex-discouraged-flags",
+        "format": "legacy",
+        "size": 138,
+        "sha256": "4d9dcb3773db9838d4660aad4f41f6c9bd4900690ee2924a94901aaf5743537b",
+        "semantics": "Annex appended after annex-less signing, all discouragement flags set: rejected with SCRIPT_ERR_P2MR_SIG."
+      },
+      {
+        "file": "fixture-checksigpqc-default-untouched",
+        "format": "qbfx-v1-fixture",
+        "size": 9,
+        "sha256": "994863356efedb94fa91e757606abe12537b874f1b464089b829701a5dc9483b",
+        "semantics": "Unmodified clone of the signed OP_CHECKSIGPQC SIGHASH_DEFAULT fixture: must verify."
+      },
+      {
+        "file": "fixture-ctv-checksigpqc-all-untouched",
+        "format": "qbfx-v1-fixture",
+        "size": 9,
+        "sha256": "03cfbe9fb23a68ae34cad9a6837f0f11f070732c66a474b7226c36a8303e1818",
+        "semantics": "Unmodified clone of the signed CTV + OP_CHECKSIGPQC SIGHASH_ALL fixture: must verify."
+      },
+      {
+        "file": "fixture-ctv-locktime-changed",
+        "format": "qbfx-v1-fixture",
+        "size": 15,
+        "sha256": "539263aebc560c3dc2214331b6c5afd06a991033a8a590ecfa6304803140cf2c",
+        "semantics": "CTV fixture with nLockTime 1: rejected with SCRIPT_ERR_TEMPLATE_MISMATCH."
+      },
+      {
+        "file": "fixture-verify-true-explicit-default-hashtype",
+        "format": "qbfx-v1-fixture",
+        "size": 12,
+        "sha256": "2830d2657131ffac5dd8ee883f2f2dd4292f8d4a5da298c340185165b6e9c17d",
+        "semantics": "SIGHASH_ALL fixture with its hash type byte set to 0x00: rejected with SCRIPT_ERR_P2MR_SIG_HASHTYPE."
+      },
+      {
+        "file": "generation-checksigpqc-default-valid",
+        "format": "qbfx-v1-generation",
+        "size": 145,
+        "sha256": "382e822b4977cbd90e1b46e10db3131fd4aa05db3528341bbee42e93cbc6d4a4",
+        "semantics": "Tagged generation selector 0x0F followed by the legacy-checksigpqc-default-valid layout."
+      }
+    ],
+    "pqc": [
+      {
+        "file": "legacy-generated-valid-sign-verify",
+        "format": "legacy",
+        "size": 534,
+        "sha256": "0584ada914610d1eca3a3cd5a2e538f30e301af7ed85c2bc5f48a41273021943",
+        "semantics": "Untagged legacy layout: generate two keys, sign and verify, reject a flipped signature bit; import a generated secret (accepted by Set) and sign with counter 5."
+      },
+      {
+        "file": "legacy-import-corrupted-secret",
+        "format": "legacy",
+        "size": 536,
+        "sha256": "0b9fd2ce58608e8595579b17f1cb65f42811cd542c4d3b08d7a5534b0c5bd666",
+        "semantics": "Untagged legacy layout; block 4 flips bit 0 of a generated secret, which Set must reject."
+      },
+      {
+        "file": "legacy-counter-exhausted",
+        "format": "legacy",
+        "size": 534,
+        "sha256": "c8729c6e3c63054c8ba311ea9ce309226acb6850dac2705b77d35d18e3b7aa9a",
+        "semantics": "Untagged legacy layout; block 4 signs with a valid key at PQC_MAX_SIGNATURES, which must fail."
+      },
+      {
+        "file": "legacy-short-secret-import",
+        "format": "legacy",
+        "size": 358,
+        "sha256": "e7efdd63334743ed78bb3a4f47e46e7aa970a910e495bddb0394ceb2da3dcccc",
+        "semantics": "Untagged legacy layout; block 4 imports a 16-byte secret, which Set must reject."
+      },
+      {
+        "file": "fixture-untouched-key0-msg0",
+        "format": "qbfx-v1-fixture",
+        "size": 10,
+        "sha256": "92ca349cb45be5dc07a6fd7fa89b65728ed1f5826b11f9512bf5dbd62a96aaaa",
+        "semantics": "Fixture key 0 message 0 without mutation: the real signature must verify."
+      },
+      {
+        "file": "fixture-untouched-key1-msg1",
+        "format": "qbfx-v1-fixture",
+        "size": 10,
+        "sha256": "e7fccdf1ce9c43dc595dfd55664a721ca41ec2cfbe770beeb5659c2a7e296e36",
+        "semantics": "Fixture key 1 message 1 without mutation: the real signature must verify."
+      },
+      {
+        "file": "fixture-signature-bit-flip",
+        "format": "qbfx-v1-fixture",
+        "size": 15,
+        "sha256": "1d33588888d15d2e4dda4f1bbca40f44abad1b20a73ddc3466aa9e5fdd56d755",
+        "semantics": "Flip one signature bit: verification must fail."
+      },
+      {
+        "file": "fixture-signature-double-flip-restored",
+        "format": "qbfx-v1-fixture",
+        "size": 20,
+        "sha256": "7f324575ed4007d11e1da8ee6c0563f76a179f2fb8f8f10d08958fbfa10a7387",
+        "semantics": "Flip the same signature bit twice: bytes are unchanged, so verification must succeed."
+      },
+      {
+        "file": "fixture-signature-truncated",
+        "format": "qbfx-v1-fixture",
+        "size": 14,
+        "sha256": "979c130b6bab08f97245511095a7094ab54595ada41d8dd4c2b6eacdb662bc67",
+        "semantics": "Truncate the signature by one byte: verification must fail."
+      },
+      {
+        "file": "fixture-signature-extended",
+        "format": "qbfx-v1-fixture",
+        "size": 14,
+        "sha256": "88e3fbfe8148175768d7f9c94c8b469dad42c4769f2b63438bc9f3f5fae7a26f",
+        "semantics": "Extend the signature by one zero byte: verification must fail."
+      },
+      {
+        "file": "fixture-pubkey-bit-flip",
+        "format": "qbfx-v1-fixture",
+        "size": 14,
+        "sha256": "2e3f8b72f36ecf207c6224ce2955c79ef2c86fd43944ff7aafa1b146c7f0dfe6",
+        "semantics": "Flip the top bit of the last public key byte: verification must fail."
+      },
+      {
+        "file": "fixture-other-message",
+        "format": "qbfx-v1-fixture",
+        "size": 12,
+        "sha256": "cf4dcbff1af0233eaa75c465d4bbbf5a638865e90af116238c25b4033948e1e0",
+        "semantics": "Verify the signature against the key's other fixture message: verification must fail."
+      },
+      {
+        "file": "fixture-fuzzer-message",
+        "format": "qbfx-v1-fixture",
+        "size": 37,
+        "sha256": "ea52bffd01e905d818ae49c828cb8242f5c15ce25dceeed4bfcdee36b8d5f43b",
+        "semantics": "Verify against the hash of input-provided message bytes: verification must fail."
+      },
+      {
+        "file": "fixture-cross-key",
+        "format": "qbfx-v1-fixture",
+        "size": 12,
+        "sha256": "c86d5acd2527f9e2e929196768008ea1bc6b012415dc143edc069931a000940b",
+        "semantics": "Verify key 0's signature with key 1's public key: verification must fail."
+      },
+      {
+        "file": "generation-valid-sign-verify",
+        "format": "qbfx-v1-generation",
+        "size": 541,
+        "sha256": "c55e8ebd220cb346e3ea5258b53c28d19200fff6e98c27fe5c407ff29ae96c9f",
+        "semantics": "Tagged generation selector 0x0F followed by the legacy-generated-valid-sign-verify layout."
+      },
+      {
+        "file": "generation-import-corrupted-secret",
+        "format": "qbfx-v1-generation",
+        "size": 543,
+        "sha256": "62382cd39fc55bc37879aa1fe5a39b085a18f21c83d4d2017cc4b739d27a4fce",
+        "semantics": "Tagged generation selector 0xFF followed by the legacy-import-corrupted-secret layout."
+      }
+    ]
+  }
+}
