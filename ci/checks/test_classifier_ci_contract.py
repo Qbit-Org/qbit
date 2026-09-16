@@ -39,10 +39,10 @@ GATE_JOB = "required-merge-gate"
 INJECTED_FAILURE = "injected classifier contract failure"
 SUBPROCESS_TIMEOUT_SECONDS = 120
 
-# ``unittest -v`` reports ``<method> (<class>) ... <result>`` per executed
-# method.  A test that writes to stderr while running pushes the result word
-# onto a later line, so the header and result are matched separately.
-VERBOSE_HEADER = re.compile(r"^(?P<name>test_\w+) \([\w.]+\) \.\.\. ")
+# ``unittest -v`` reports ``<method> (<class>[.<method>]) ... <result>``
+# depending on the Python version.  Stderr written while a test runs pushes
+# the result onto a later line, so match the header and result separately.
+VERBOSE_HEADER = re.compile(r"^(?P<name>test_\w+) \((?P<qualified>[\w.]+)\) \.\.\. ")
 VERBOSE_RESULT = re.compile(r"^(?:ok|FAIL|ERROR|skipped(?: .*)?|expected failure|unexpected success)$")
 RAN_LINE = re.compile(r"^Ran (?P<count>\d+) tests? in ")
 
@@ -112,8 +112,8 @@ def run_bash_step(script: str, cwd: Path, env: dict[str, str]) -> subprocess.Com
         os.unlink(script_path)
 
 
-def executed_methods(stderr: str) -> dict[str, str]:
-    """Map every test method reported by unittest -v to its result word.
+def executed_test_ids(stderr: str) -> dict[str, str]:
+    """Map each full test ID reported by unittest -v to its result word.
 
     A method whose result never appears (for example the process died) is
     recorded as ``unknown`` so it is never mistaken for a pass.
@@ -123,7 +123,13 @@ def executed_methods(stderr: str) -> dict[str, str]:
     for line in stderr.splitlines():
         header = VERBOSE_HEADER.match(line)
         if header:
-            pending = header.group("name")
+            method = header.group("name")
+            pending = header.group("qualified")
+            if not pending.endswith(f".{method}"):
+                pending = f"{pending}.{method}"
+            # Direct script execution uses __main__; discovery imports the module.
+            if pending.startswith("__main__."):
+                pending = CLASSIFIER_SUITE.stem + pending[len("__main__"):]
             results[pending] = "unknown"
             line = line[header.end():]
         if pending is not None and VERBOSE_RESULT.match(line.strip()):
@@ -140,8 +146,8 @@ def ran_count(stderr: str) -> int | None:
     return None
 
 
-def expected_suite_methods() -> set[str]:
-    """Discover the classifier suite's methods with the real unittest loader."""
+def expected_suite_ids() -> set[str]:
+    """Discover the classifier suite's full test IDs with the real unittest loader."""
     checks_dir = str(REPO_ROOT / CHECKS_DIR)
     if checks_dir not in sys.path:
         sys.path.insert(0, checks_dir)
@@ -154,7 +160,7 @@ def expected_suite_methods() -> set[str]:
         if isinstance(item, unittest.TestSuite):
             stack.extend(item)
         else:
-            names.add(item._testMethodName)
+            names.add(item.id())
     return names
 
 
@@ -301,11 +307,11 @@ class ClassifierCiContractTest(unittest.TestCase):
                 "classifier suite must run before the step that produces routing outputs",
             )
 
-        expected = expected_suite_methods()
+        expected = expected_suite_ids()
         self.assertGreaterEqual(len(expected), 24, "classifier suite lost existing test methods")
 
         completed = run_bash_step(step["run"], cwd=REPO_ROOT, env=dict(os.environ))
-        observed = executed_methods(completed.stderr)
+        observed = executed_test_ids(completed.stderr)
         self.assertEqual(
             completed.returncode,
             0,
@@ -336,7 +342,7 @@ class ClassifierCiContractTest(unittest.TestCase):
 
     def test_suite_failure_reaches_required_gate(self) -> None:
         _, step = self.classifier_test_step()
-        expected = expected_suite_methods()
+        expected = expected_suite_ids()
 
         with tempfile.TemporaryDirectory() as tmpdir:
             sandbox = Path(tmpdir) / "checkout"
@@ -348,7 +354,7 @@ class ClassifierCiContractTest(unittest.TestCase):
             # is attributable to the injected assertion and nothing else.
             control = run_bash_step(step["run"], cwd=sandbox, env=dict(os.environ))
             self.assertEqual(control.returncode, 0, f"sandbox control run failed\n{control.stderr}")
-            self.assertEqual(set(executed_methods(control.stderr)), expected)
+            self.assertEqual(set(executed_test_ids(control.stderr)), expected)
 
             suite_copy = sandbox / CLASSIFIER_SUITE
             source = suite_copy.read_text(encoding="utf8")
@@ -363,7 +369,7 @@ class ClassifierCiContractTest(unittest.TestCase):
             suite_copy.write_text(mutated, encoding="utf8")
 
             failed = run_bash_step(step["run"], cwd=sandbox, env=dict(os.environ))
-            observed = executed_methods(failed.stderr)
+            observed = executed_test_ids(failed.stderr)
             self.assertNotEqual(failed.returncode, 0, "workflow step swallowed a failing classifier test")
             self.assertIn(INJECTED_FAILURE, failed.stderr)
             self.assertEqual(set(observed), expected, "failure must not stop the remaining methods")
@@ -407,6 +413,68 @@ class ClassifierCiContractTest(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
             self.assertTrue(calls.exists(), "rpc-docs profile must poll the simulated check API")
             self.assertIn("rpc-docs: status=completed conclusion=success", completed.stdout)
+
+
+class ClassifierSuiteIdentityTest(unittest.TestCase):
+    def test_verbose_ids_preserve_classes_and_results(self) -> None:
+        for module in ("__main__", CLASSIFIER_SUITE.stem):
+            for suffix in ("", ".test_shared"):
+                with self.subTest(module=module, suffix=suffix):
+                    output = (
+                        f"test_shared ({module}.First{suffix}) ... ok\n"
+                        f"test_shared ({module}.Second{suffix}) ... diagnostic\nFAIL\n"
+                        f"test_shared ({module}.Third{suffix}) ... interrupted\n"
+                    )
+                    self.assertEqual(executed_test_ids(output), {
+                        f"{CLASSIFIER_SUITE.stem}.First.test_shared": "ok",
+                        f"{CLASSIFIER_SUITE.stem}.Second.test_shared": "FAIL",
+                        f"{CLASSIFIER_SUITE.stem}.Third.test_shared": "unknown",
+                    })
+
+    def test_contract_accepts_duplicate_methods_but_rejects_omitted_class(self) -> None:
+        contract = Path(__file__).relative_to(REPO_ROOT)
+        workflow_path = WORKFLOW.relative_to(REPO_ROOT)
+        method = sorted(expected_suite_ids())[0].rsplit(".", 1)[-1]
+        extra_class = (
+            "class DuplicateMethodNamesTest(unittest.TestCase):\n"
+            f"    def {method}(self) -> None:\n"
+            "        pass\n\n\n"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sandbox = Path(tmpdir)
+            for relative in (CLASSIFIER, CLASSIFIER_SUITE, contract, workflow_path):
+                target = sandbox / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(REPO_ROOT / relative, target)
+            suite = sandbox / CLASSIFIER_SUITE
+            source = suite.read_text(encoding="utf8")
+            entrypoint = 'if __name__ == "__main__":'
+            self.assertEqual(source.count(entrypoint), 1)
+            suite.write_text(source.replace(entrypoint, extra_class + entrypoint), encoding="utf8")
+
+            command = [
+                sys.executable, str(contract),
+                "ClassifierCiContractTest.test_workflow_executes_all_classifier_tests", "-v",
+            ]
+            completed = subprocess.run(
+                command, cwd=sandbox, text=True, capture_output=True,
+                timeout=SUBPROCESS_TIMEOUT_SECONDS, check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+
+            # Running only the original class must still fail the completeness check.
+            workflow = load_workflow()
+            for step in workflow["jobs"][CLASSIFY_JOB]["steps"]:
+                if str(CLASSIFIER_SUITE) in str(step.get("run", "")):
+                    step["run"] = step["run"].rstrip() + " -k ClassifyMergeProfileTest\n"
+            (sandbox / workflow_path).write_text(yaml.safe_dump(workflow), encoding="utf8")
+            completed = subprocess.run(
+                command, cwd=sandbox, text=True, capture_output=True,
+                timeout=SUBPROCESS_TIMEOUT_SECONDS, check=False,
+            )
+            self.assertNotEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn("workflow step did not execute every suite method", completed.stderr)
+            self.assertIn("DuplicateMethodNamesTest", completed.stderr)
 
 
 if __name__ == "__main__":
