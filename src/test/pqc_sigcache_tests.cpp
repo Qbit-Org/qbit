@@ -651,6 +651,7 @@ BOOST_AUTO_TEST_CASE(store_consume_and_reclamation)
             tuples.push_back({(HashWriter{} << uint64_t{i}).GetSHA256(), valid.pubkey, valid.sig});
         }
         std::vector<uint256> entries;
+        entries.reserve(tuples.size());
         for (const PQCTuple& tuple : tuples) entries.push_back(EntryPQC(observed.cache, tuple));
 
         ReclamationCounts counts;
