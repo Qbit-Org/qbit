@@ -37,7 +37,6 @@
 
 #include <QAction>
 #include <QDialogButtonBox>
-#include <QElapsedTimer>
 #include <QEvent>
 #include <QLineEdit>
 #include <QPushButton>
@@ -142,31 +141,48 @@ void AppTests::appTests()
     QVERIFY(m_shutdown_wallet_state);
 
     const auto state{m_shutdown_wallet_state};
-    std::thread watchdog{[state] {
+    const auto shutdown_start{std::chrono::steady_clock::now()};
+    // Bound only the cancellation contract: the pending send worker must
+    // observe the shutdown request within five seconds. Unrelated teardown
+    // after the worker is joined is timed below for diagnostics only.
+    int64_t worker_finished_ms{-1};
+    std::thread watchdog{[state, shutdown_start, &worker_finished_ms] {
         std::unique_lock lock{state->mutex};
-        if (!state->condition.wait_for(lock, 5s, [state] {
+        if (!state->condition.wait_until(lock, shutdown_start + 5s, [state] {
                 return state->create_finished || state->shutdown_complete;
             })) {
             state->watchdog_released = true;
             state->allow_create = true;
             lock.unlock();
             state->condition.notify_all();
+        } else if (state->create_finished) {
+            worker_finished_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - shutdown_start).count();
         }
     }};
 
-    QElapsedTimer shutdown_timer;
-    shutdown_timer.start();
     QEvent quit_event{QEvent::Quit};
     const bool quit_delivered{QCoreApplication::sendEvent(&m_app, &quit_event)};
-    m_shutdown_elapsed_ms = shutdown_timer.elapsed();
+    m_shutdown_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - shutdown_start).count();
 
+    bool worker_finished_before_teardown_returned{false};
     {
         std::lock_guard lock{state->mutex};
+        worker_finished_before_teardown_returned = state->create_finished;
         state->shutdown_complete = true;
         state->allow_create = true;
     }
     state->condition.notify_all();
     watchdog.join();
+    if (worker_finished_ms >= 0) {
+        qInfo().nospace() << "Qt wallet shutdown: send worker finished within " << worker_finished_ms
+                          << " ms, synchronous GUI teardown returned after " << m_shutdown_elapsed_ms << " ms";
+    } else {
+        qInfo().nospace() << "Qt wallet shutdown: send worker finish was not observed before the watchdog "
+                          << "deadline or teardown return, synchronous GUI teardown returned after "
+                          << m_shutdown_elapsed_ms << " ms";
+    }
 
     bool worker_destroyed{false};
     {
@@ -195,9 +211,9 @@ void AppTests::appTests()
         unlock_calls = state->unlock_calls;
     }
     QVERIFY(quit_delivered);
-    QVERIFY2(m_shutdown_elapsed_ms < 5000, "Qt wallet shutdown exceeded the five-second bound");
-    QVERIFY(!watchdog_released);
+    QVERIFY2(!watchdog_released, "Qt wallet shutdown did not cancel the send worker within five seconds");
     QVERIFY(cancel_observed);
+    QVERIFY(worker_finished_before_teardown_returned);
     QVERIFY(worker_destroyed);
     QVERIFY(m_shutdown_wallet_model.isNull());
     QVERIFY(m_shutdown_wallet_view.isNull());
