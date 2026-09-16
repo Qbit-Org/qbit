@@ -582,6 +582,10 @@ jobs:
           echo "Using qa-assets repo from commit ..."
           git log -1
 
+      - name: Overlay qbit seed corpora
+        if: matrix.job-type == 'fuzz'
+        run: py -3 test/fuzz/qbit_corpora/overlay.py "${RUNNER_TEMP}/qa-assets/fuzz_corpora"
+
       - name: Run fuzz tests
         if: matrix.job-type == 'fuzz'
         working-directory: build
@@ -589,7 +593,7 @@ jobs:
           BITCOINFUZZ: '${{ github.workspace }}\build\bin\Release\fuzz.exe'
         run: |
           # TODO: Fix the Windows fail-fast in ephemeral_package_eval and re-enable it.
-          py -3 test/fuzz/test_runner.py --par "$NUMBER_OF_PROCESSORS" --loglevel DEBUG --exclude ephemeral_package_eval "${RUNNER_TEMP}/qa-assets/fuzz_corpora"
+          py -3 test/fuzz/test_runner.py --par "$NUMBER_OF_PROCESSORS" --loglevel DEBUG --exclude ephemeral_package_eval --require_qbit_corpus "${RUNNER_TEMP}/qa-assets/fuzz_corpora"
 
   windows-cross:
     name: 'Linux->Windows cross, no tests'

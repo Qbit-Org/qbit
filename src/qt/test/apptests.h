@@ -7,6 +7,7 @@
 
 #include <QObject>
 #include <QPointer>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <set>
@@ -61,7 +62,10 @@ private:
     QPointer<WalletView> m_shutdown_wallet_view;
     QPointer<SendCoinsDialog> m_shutdown_send_dialog;
     std::shared_ptr<qt_test::SyntheticWalletState> m_shutdown_wallet_state;
-    int64_t m_shutdown_elapsed_ms{-1};
+    //! Recorded under the synthetic wallet state mutex when the shutdown send
+    //! dialog is destroyed, after its destructor joined the prepare worker.
+    uint64_t m_shutdown_dialog_destroyed_sequence{0};
+    std::chrono::steady_clock::time_point m_shutdown_dialog_destroyed_time;
     int m_shutdown_coins_sent{0};
     bool m_wallet_dependents_destroyed_before_model{false};
     bool m_remove_test_wallet_settings{false};

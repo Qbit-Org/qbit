@@ -8,7 +8,9 @@
 #include <interfaces/wallet.h>
 #include <wallet/pqc_usage.h>
 
+#include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -24,6 +26,11 @@ struct SyntheticWalletState {
     bool wait_for_cancel{false};
     bool cancel_observed{false};
     bool create_finished{false};
+    //! Guarded by mutex. Each recorded event takes the next value, so events
+    //! recorded on different threads can be ordered; zero means not recorded.
+    uint64_t event_sequence{0};
+    uint64_t create_finished_sequence{0};
+    std::chrono::steady_clock::time_point create_finished_time;
     bool background_clone_destroyed{false};
     bool shutdown_complete{false};
     bool watchdog_released{false};
