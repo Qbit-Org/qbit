@@ -50,6 +50,26 @@ struct SyntheticWalletState {
     std::thread::id psbt_sign_thread;
     int lock_calls{0};
     int unlock_calls{0};
+    bool bump_enabled{false};
+    bool bump_prepare_entered{false};
+    bool bump_prepare_success{true};
+    bool allow_bump_prepare{true};
+    bool bump_prepare_cancel_observed{false};
+    bool bump_sign_entered{false};
+    bool bump_sign_success{true};
+    bool bump_use_counters{true};
+    bool allow_bump_reservation{true};
+    bool bump_counter_boundary_entered{false};
+    bool allow_bump_counter_boundary{true};
+    bool bump_counters_reserved{false};
+    bool external_bump_boundary_entered{false};
+    bool allow_external_bump_boundary{true};
+    bool allow_bump_sign{true};
+    bool bump_cancel_observed{false};
+    bool bump_commit_entered{false};
+    bool bump_commit_success{true};
+    bool bump_committed{false};
+    bool external_signer{false};
     std::function<void()> can_get_addresses_changed;
 };
 
