@@ -145,8 +145,7 @@ void AppTests::appTests()
     // Bound only the cancellation contract: the pending send worker must
     // observe the shutdown request within five seconds. Unrelated teardown
     // after the worker is joined is timed below for diagnostics only.
-    int64_t worker_finished_ms{-1};
-    std::thread watchdog{[state, shutdown_start, &worker_finished_ms] {
+    std::thread watchdog{[state, shutdown_start] {
         std::unique_lock lock{state->mutex};
         if (!state->condition.wait_until(lock, shutdown_start + 5s, [state] {
                 return state->create_finished || state->shutdown_complete;
@@ -155,42 +154,50 @@ void AppTests::appTests()
             state->allow_create = true;
             lock.unlock();
             state->condition.notify_all();
-        } else if (state->create_finished) {
-            worker_finished_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - shutdown_start).count();
         }
     }};
 
     QEvent quit_event{QEvent::Quit};
     const bool quit_delivered{QCoreApplication::sendEvent(&m_app, &quit_event)};
-    m_shutdown_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - shutdown_start).count();
+    const auto teardown_returned_time{std::chrono::steady_clock::now()};
 
-    bool worker_finished_before_teardown_returned{false};
+    // Worker completion, dialog destruction and this return marker each take
+    // a sequence number under state->mutex when they happen, so their order is
+    // not inferred from a later read.
+    uint64_t teardown_returned_sequence{0};
     {
         std::lock_guard lock{state->mutex};
-        worker_finished_before_teardown_returned = state->create_finished;
+        teardown_returned_sequence = ++state->event_sequence;
         state->shutdown_complete = true;
         state->allow_create = true;
     }
     state->condition.notify_all();
     watchdog.join();
-    if (worker_finished_ms >= 0) {
-        qInfo().nospace() << "Qt wallet shutdown: send worker finished within " << worker_finished_ms
-                          << " ms, synchronous GUI teardown returned after " << m_shutdown_elapsed_ms << " ms";
-    } else {
-        qInfo().nospace() << "Qt wallet shutdown: send worker finish was not observed before the watchdog "
-                          << "deadline or teardown return, synchronous GUI teardown returned after "
-                          << m_shutdown_elapsed_ms << " ms";
-    }
 
     bool worker_destroyed{false};
+    uint64_t create_finished_sequence{0};
+    uint64_t dialog_destroyed_sequence{0};
+    std::chrono::steady_clock::time_point create_finished_time;
+    std::chrono::steady_clock::time_point dialog_destroyed_time;
     {
         std::unique_lock lock{state->mutex};
         worker_destroyed = state->condition.wait_for(lock, 5s, [state] {
             return state->background_clone_destroyed;
         });
+        create_finished_sequence = state->create_finished_sequence;
+        create_finished_time = state->create_finished_time;
+        dialog_destroyed_sequence = m_shutdown_dialog_destroyed_sequence;
+        dialog_destroyed_time = m_shutdown_dialog_destroyed_time;
     }
+    const auto describe_event{[shutdown_start](uint64_t sequence, std::chrono::steady_clock::time_point time) {
+        if (sequence == 0) return QStringLiteral("not recorded");
+        return QStringLiteral("event %1 at %2 ms")
+            .arg(sequence)
+            .arg(std::chrono::duration_cast<std::chrono::milliseconds>(time - shutdown_start).count());
+    }};
+    qInfo().noquote() << "Qt wallet shutdown: send worker completion" << describe_event(create_finished_sequence, create_finished_time)
+                      << "| send dialog destroyed" << describe_event(dialog_destroyed_sequence, dialog_destroyed_time)
+                      << "| synchronous GUI teardown returned" << describe_event(teardown_returned_sequence, teardown_returned_time);
 #else
     m_app.requestShutdown();
 #endif // ENABLE_WALLET
@@ -213,7 +220,14 @@ void AppTests::appTests()
     QVERIFY(quit_delivered);
     QVERIFY2(!watchdog_released, "Qt wallet shutdown did not cancel the send worker within five seconds");
     QVERIFY(cancel_observed);
-    QVERIFY(worker_finished_before_teardown_returned);
+    // The dialog destroyed marker is recorded directly on this thread inside
+    // teardown, after ~SendCoinsDialog joined its worker. Requiring worker
+    // completion before it does not depend on scheduling after sendEvent
+    // returns, unlike a comparison with the return marker alone.
+    QVERIFY2(dialog_destroyed_sequence != 0 && dialog_destroyed_sequence < teardown_returned_sequence,
+             "Qt wallet shutdown did not destroy the send dialog before teardown returned");
+    QVERIFY2(create_finished_sequence != 0 && create_finished_sequence < dialog_destroyed_sequence,
+             "Qt wallet shutdown destroyed the send dialog before its worker finished");
     QVERIFY(worker_destroyed);
     QVERIFY(m_shutdown_wallet_model.isNull());
     QVERIFY(m_shutdown_wallet_view.isNull());
@@ -313,6 +327,11 @@ void AppTests::guiTests(BitcoinGUI* window)
     }
     QVERIFY(m_shutdown_wallet_view);
     QVERIFY(m_shutdown_send_dialog);
+    connect(m_shutdown_send_dialog, &QObject::destroyed, this, [this] {
+        std::lock_guard lock{m_shutdown_wallet_state->mutex};
+        m_shutdown_dialog_destroyed_sequence = ++m_shutdown_wallet_state->event_sequence;
+        m_shutdown_dialog_destroyed_time = std::chrono::steady_clock::now();
+    }, Qt::DirectConnection);
     connect(m_shutdown_wallet_model, &QObject::destroyed, this, [this] {
         m_wallet_dependents_destroyed_before_model =
             m_shutdown_wallet_view.isNull() && m_shutdown_send_dialog.isNull();
