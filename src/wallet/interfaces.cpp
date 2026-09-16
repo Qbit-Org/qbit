@@ -367,13 +367,13 @@ public:
                                      sign,
                                      sign ? pqc_usage_recorder.GetObserver() : PQCSignatureCounterObserver{},
                                      progress_callback);
+        if (pqc_usage) {
+            *pqc_usage = sign ? BuildSigningPQCUsageReport(pqc_usage_recorder) : PQCUsageReport{};
+        }
         if (!res) return util::Error{util::ErrorString(res)};
         const auto& txr = *res;
         fee = txr.fee;
         change_pos = txr.change_pos ? int(*txr.change_pos) : -1;
-        if (pqc_usage) {
-            *pqc_usage = sign ? BuildSigningPQCUsageReport(pqc_usage_recorder) : PQCUsageReport{};
-        }
 
         return txr.tx;
     }

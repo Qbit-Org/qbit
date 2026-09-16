@@ -19,6 +19,8 @@
 #include <streams.h>
 #include <test/util/setup_common.h>
 #include <util/strencodings.h>
+#include <util/translation.h>
+#include <wallet/pqc_usage.h>
 
 #include <chrono>
 #include <functional>
@@ -28,6 +30,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include <QApplication>
 #include <QClipboard>
@@ -101,6 +104,41 @@ wallet::PQCUsageReport MakePQCUsageReport(const CPQCPubKey& pubkey, uint32_t sig
 QString PQCPubKeyHex(const CPQCPubKey& pubkey)
 {
     return QString::fromStdString(HexStr(std::span<const unsigned char>{pubkey.begin(), pubkey.end()}));
+}
+
+QString PQCStateLabel(wallet::PQCSignatureLimitState state)
+{
+    switch (state) {
+    case wallet::PQCSignatureLimitState::NORMAL: return QStringLiteral("Normal");
+    case wallet::PQCSignatureLimitState::WARNING: return QStringLiteral("Warning");
+    case wallet::PQCSignatureLimitState::CRITICAL: return QStringLiteral("Critical");
+    case wallet::PQCSignatureLimitState::EXHAUSTED: return QStringLiteral("Exhausted");
+    }
+    return {};
+}
+
+const QString CONSUMED_SENTENCE{QStringLiteral("PQC signature capacity was consumed during this signing attempt.")};
+const QString FAILED_SENTENCE{QStringLiteral("The signing attempt failed after consuming PQC signature capacity.")};
+
+//! Check that a status lists the overall state, every key and every warning of a report.
+void VerifyStatusListsUsage(const QString& status, const wallet::PQCUsageReport& report)
+{
+    QVERIFY(report.overall_state.has_value());
+    QVERIFY(status.contains(QStringLiteral("PQC usage state after this signing attempt: %1.").arg(PQCStateLabel(*report.overall_state))));
+    for (const wallet::PQCUsageSnapshot& key_state : report.key_states) {
+        QVERIFY2(status.contains(QStringLiteral("PQC key %1: %2 of %3 signatures used, %4 remaining; state: %5.")
+                                     .arg(PQCPubKeyHex(key_state.pubkey))
+                                     .arg(key_state.signature_count)
+                                     .arg(key_state.signature_limit)
+                                     .arg(key_state.signatures_remaining)
+                                     .arg(PQCStateLabel(key_state.limit_state))),
+                 qPrintable(status));
+    }
+    const std::vector<bilingual_str> warnings{wallet::FormatPQCUsageWarnings(report.warnings)};
+    QCOMPARE(warnings.size(), report.warnings.size());
+    for (const bilingual_str& warning : warnings) {
+        QVERIFY2(status.contains(QString::fromStdString(warning.original)), qPrintable(status));
+    }
 }
 
 class DialogFixture
@@ -390,7 +428,7 @@ void PSBTOperationsDialogTests::signingFailurePreservesOriginalPSBT()
     fixture.dialog->signTransaction();
     QVERIFY(WaitUntil([&] { return fixture.statusLabel()->text().startsWith(QStringLiteral("Failed to sign transaction")); }));
     QVERIFY(ReadState(state, [](const auto& value) { return value.psbt_counters_reserved; }));
-    QVERIFY(fixture.statusLabel()->text().contains(QStringLiteral("PQC signature capacity was consumed")));
+    QVERIFY(fixture.statusLabel()->text().contains(QStringLiteral("failed after consuming PQC signature capacity")));
     QVERIFY(fixture.statusLabel()->text().contains(PQCPubKeyHex(key.GetPubKey())));
     QVERIFY(fixture.statusLabel()->text().contains(QStringLiteral("2 of %1 signatures used").arg(PQC_MAX_SIGNATURES)));
     QVERIFY(fixture.statusLabel()->text().contains(QStringLiteral("%1 remaining").arg(PQC_MAX_SIGNATURES - 2)));
@@ -403,4 +441,109 @@ void PSBTOperationsDialogTests::signingFailurePreservesOriginalPSBT()
     std::string error;
     QVERIFY(DecodeRawPSBT(clipboard_psbt, MakeByteSpan(*decoded), error));
     QCOMPARE(SerializePSBT(clipboard_psbt), original);
+}
+
+void PSBTOperationsDialogTests::usageStatesOnSuccessAndFailure()
+{
+    CPQCKey warning_key;
+    warning_key.MakeNewKey();
+    CPQCKey exhausted_key;
+    exhausted_key.MakeNewKey();
+    CPQCKey normal_key;
+    normal_key.MakeNewKey();
+    CPQCKey critical_key;
+    critical_key.MakeNewKey();
+
+    const wallet::PQCUsageReport warning_report{qt_test::MakeSyntheticPQCUsageReport({
+        {warning_key.GetPubKey(), wallet::PQC_WARNING_SIGNATURE_THRESHOLD},
+    })};
+    const wallet::PQCUsageReport multi_key_report{qt_test::MakeSyntheticPQCUsageReport({
+        {normal_key.GetPubKey(), 3},
+        {warning_key.GetPubKey(), wallet::PQC_WARNING_SIGNATURE_THRESHOLD},
+        {critical_key.GetPubKey(), wallet::PQC_CRITICAL_SIGNATURE_THRESHOLD},
+        {exhausted_key.GetPubKey(), PQC_MAX_SIGNATURES},
+    })};
+    QCOMPARE(*multi_key_report.overall_state, wallet::PQCSignatureLimitState::EXHAUSTED);
+    QCOMPARE(multi_key_report.warnings.size(), size_t{3});
+
+    for (const wallet::PQCUsageReport* report : {&warning_report, &multi_key_report}) {
+        // Success: the signed PSBT is displayed with the consumption sentence.
+        {
+            auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+            state->psbt_simulate_pqc_reservation = true;
+            DialogFixture fixture{*m_context->client_model, m_context->platform_style.get(), state, *report};
+            fixture.dialog->signTransaction();
+            QVERIFY(WaitUntil([&] { return fixture.statusLabel()->text().contains(QStringLiteral("ready to broadcast")); }));
+            const QString status{fixture.statusLabel()->text()};
+            QVERIFY(status.startsWith(QStringLiteral("Signed transaction successfully.")));
+            QVERIFY(status.contains(CONSUMED_SENTENCE));
+            QVERIFY(!status.contains(FAILED_SENTENCE));
+            VerifyStatusListsUsage(status, *report);
+            if (QTest::currentTestFailed()) return;
+
+            // The portable PSBT carries only the signature, never wallet-local usage.
+            fixture.dialog->copyToClipboard();
+            const auto decoded{DecodeBase64(QApplication::clipboard()->text().toStdString())};
+            QVERIFY(decoded);
+            PartiallySignedTransaction clipboard_psbt;
+            std::string error;
+            QVERIFY(DecodeRawPSBT(clipboard_psbt, MakeByteSpan(*decoded), error));
+            PartiallySignedTransaction expected{fixture.original_psbt};
+            expected.inputs.front().final_script_witness.stack = {{0x01}};
+            QCOMPARE(SerializePSBT(clipboard_psbt), SerializePSBT(expected));
+            QVERIFY(clipboard_psbt.unknown.empty());
+            QVERIFY(clipboard_psbt.m_proprietary.empty());
+        }
+
+        // Failure after reservation: original PSBT kept, failure sentence shown.
+        {
+            auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+            state->psbt_simulate_pqc_reservation = true;
+            state->psbt_fail = true;
+            DialogFixture fixture{*m_context->client_model, m_context->platform_style.get(), state, *report};
+            const std::string original{SerializePSBT(fixture.original_psbt)};
+            fixture.dialog->signTransaction();
+            QVERIFY(WaitUntil([&] { return fixture.statusLabel()->text().startsWith(QStringLiteral("Failed to sign transaction")); }));
+            const QString status{fixture.statusLabel()->text()};
+            QVERIFY(status.contains(FAILED_SENTENCE));
+            QVERIFY(!status.contains(CONSUMED_SENTENCE));
+            VerifyStatusListsUsage(status, *report);
+            if (QTest::currentTestFailed()) return;
+
+            fixture.dialog->copyToClipboard();
+            const auto decoded{DecodeBase64(QApplication::clipboard()->text().toStdString())};
+            QVERIFY(decoded);
+            PartiallySignedTransaction clipboard_psbt;
+            std::string error;
+            QVERIFY(DecodeRawPSBT(clipboard_psbt, MakeByteSpan(*decoded), error));
+            QCOMPARE(SerializePSBT(clipboard_psbt), original);
+        }
+    }
+
+    // Failure before counter reservation: no usage is invented even though the
+    // wallet would report usage had it reserved counters.
+    {
+        auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+        state->psbt_simulate_pqc_reservation = true;
+        state->psbt_fail_before_reservation = true;
+        DialogFixture fixture{*m_context->client_model, m_context->platform_style.get(), state, multi_key_report};
+        const std::string original{SerializePSBT(fixture.original_psbt)};
+        QSignalSpy display_updates{fixture.description(), &QTextEdit::textChanged};
+        fixture.dialog->signTransaction();
+        QVERIFY(WaitUntil([&] { return fixture.statusLabel()->text().startsWith(QStringLiteral("Failed to sign transaction")); }));
+        const QString status{fixture.statusLabel()->text()};
+        QVERIFY(!ReadState(state, [](const auto& value) { return value.psbt_counters_reserved; }));
+        QVERIFY2(!status.contains(QStringLiteral("PQC")), qPrintable(status));
+        QVERIFY(!status.contains(QStringLiteral("consum")));
+        QVERIFY(!status.contains(QStringLiteral("\n")));
+        QCOMPARE(display_updates.count(), 0);
+
+        fixture.dialog->copyToClipboard();
+        const auto decoded{DecodeBase64(QApplication::clipboard()->text().toStdString())};
+        QVERIFY(decoded);
+        PartiallySignedTransaction clipboard_psbt;
+        std::string error;
+        QVERIFY(DecodeRawPSBT(clipboard_psbt, MakeByteSpan(*decoded), error));
+        QCOMPARE(SerializePSBT(clipboard_psbt), original);
+    }
 }

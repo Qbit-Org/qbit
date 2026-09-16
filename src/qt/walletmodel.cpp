@@ -10,6 +10,7 @@
 #include <qt/guiutil.h>
 #include <qt/optionsmodel.h>
 #include <qt/paymentserver.h>
+#include <qt/pqcusageformat.h>
 #include <qt/recentrequeststablemodel.h>
 #include <qt/sendcoinsdialog.h>
 #include <qt/transactiontablemodel.h>
@@ -957,20 +958,40 @@ void WalletModel::bumpFeeFinished(uint64_t generation, std::shared_ptr<BumpFeeRe
         resetBumpFeeState();
         return;
     }
+    // Presentation below can enter a nested event loop that deletes this
+    // model, so later state changes check both the model and the attempt.
+    QPointer<WalletModel> model{this};
+    const auto still_current = [&model, this, generation] {
+        return model && generation == m_bump_fee_generation;
+    };
+    const auto show_error = [&result](QString text) {
+        const QString usage{FormatPQCSigningOutcomePlain(result->pqc_usage, PQCSigningOutcome::FailedAfterConsumption)};
+        if (!usage.isEmpty()) text += "\n\n" + usage;
+        QMessageBox box{QMessageBox::Critical, tr("Fee bump error"), text, QMessageBox::Ok};
+        box.setTextFormat(Qt::PlainText);
+        box.exec();
+    };
+
     if (!result->signed_ok) {
-        QMessageBox::critical(nullptr, tr("Fee bump error"), tr("Can't sign transaction."));
-        resetBumpFeeState();
+        show_error(tr("Can't sign transaction."));
+        if (still_current()) resetBumpFeeState();
         return;
     }
     if (!result->committed) {
         const QString error{result->errors.empty() ? QString{} : QString::fromStdString(result->errors.front().translated)};
-        QMessageBox::critical(nullptr, tr("Fee bump error"), tr("Could not commit transaction") + "<br />(" + error + ")");
-        resetBumpFeeState();
+        show_error(tr("Could not commit transaction") + "\n(" + error + ")");
+        if (still_current()) resetBumpFeeState();
         return;
     }
 
     const Txid original_txid{result->original_txid};
     const Txid bumped_txid{result->bumped_txid};
+    const QString usage{FormatPQCSigningOutcomePlain(result->pqc_usage, PQCSigningOutcome::Consumed)};
+    if (!usage.isEmpty()) {
+        Q_EMIT message(tr("Fee bump"), usage,
+                       result->pqc_usage.warnings.empty() ? CClientUIInterface::MSG_INFORMATION : CClientUIInterface::MSG_WARNING);
+        if (!still_current()) return;
+    }
     resetBumpFeeState();
     Q_EMIT feeBumped(original_txid, bumped_txid);
 }

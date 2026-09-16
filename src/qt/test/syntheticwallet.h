@@ -6,6 +6,7 @@
 #define QBIT_QT_TEST_SYNTHETICWALLET_H
 
 #include <interfaces/wallet.h>
+#include <primitives/transaction.h>
 #include <wallet/pqc_usage.h>
 
 #include <chrono>
@@ -14,7 +15,10 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 namespace qt_test {
 
@@ -31,6 +35,11 @@ struct SyntheticWalletState {
     uint64_t event_sequence{0};
     uint64_t create_finished_sequence{0};
     std::chrono::steady_clock::time_point create_finished_time;
+    bool create_success{true};
+    bool create_simulate_pqc_reservation{false};
+    bool create_fail_before_reservation{false};
+    bool create_counters_reserved{false};
+    bool allow_create_completion{true};
     bool background_clone_destroyed{false};
     bool shutdown_complete{false};
     bool watchdog_released{false};
@@ -46,6 +55,7 @@ struct SyntheticWalletState {
     bool psbt_cancel_observed{false};
     bool psbt_sign_finished{false};
     bool psbt_fail{false};
+    bool psbt_fail_before_reservation{false};
     int psbt_sign_calls{0};
     std::thread::id psbt_sign_thread;
     int lock_calls{0};
@@ -57,6 +67,7 @@ struct SyntheticWalletState {
     bool bump_prepare_cancel_observed{false};
     bool bump_sign_entered{false};
     bool bump_sign_success{true};
+    bool bump_fail_before_reservation{false};
     bool bump_use_counters{true};
     bool allow_bump_reservation{true};
     bool bump_counter_boundary_entered{false};
@@ -68,10 +79,19 @@ struct SyntheticWalletState {
     bool bump_cancel_observed{false};
     bool bump_commit_entered{false};
     bool bump_commit_success{true};
+    std::string bump_commit_error{"Original transaction changed while signing"};
     bool bump_committed{false};
+    CMutableTransaction bump_committed_tx;
     bool external_signer{false};
     std::function<void()> can_get_addresses_changed;
 };
+
+/**
+ * Build a signing usage report for keys advanced by one signature to the given
+ * counts, deriving each limit state and any state-transition warning the same
+ * way the wallet does.
+ */
+wallet::PQCUsageReport MakeSyntheticPQCUsageReport(const std::vector<std::pair<CPQCPubKey, uint32_t>>& key_counts);
 
 std::unique_ptr<interfaces::Wallet> MakeSyntheticWallet(
     wallet::PQCUsageReport report = {},

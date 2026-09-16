@@ -4,6 +4,9 @@
 
 #include <wallet/test/wallet_p2mr_test_util.h>
 
+#include <interfaces/wallet.h>
+#include <wallet/pqc_usage.h>
+
 namespace wallet {
 using namespace wallet_p2mr_test;
 
@@ -725,6 +728,47 @@ BOOST_AUTO_TEST_CASE(P2MRWalletParallelSerialParallelABBenchmark)
         static_cast<unsigned int>(INPUT_COUNT),
         serial_elapsed_us,
         parallel_elapsed_us));
+}
+
+BOOST_AUTO_TEST_CASE(P2MRCreateTransactionFailureReportsConsumedUsage)
+{
+    m_node.args->ForceSetArg("-walletpqcparallel", "0");
+    auto workload{MakeDistinctKeyP2MRSigningWorkload(*m_node.chain, /*input_count=*/1)};
+    std::shared_ptr<CWallet> wallet{std::move(workload.wallet)};
+    WITH_LOCK(wallet->cs_wallet, wallet->SetLastBlockProcessed(0, uint256{}));
+
+    CMutableTransaction funding;
+    funding.vout.push_back(workload.coins.begin()->second.out);
+    BOOST_REQUIRE(wallet->AddToWallet(MakeTransactionRef(funding), TxStateInactive{}));
+    // The P2MR input consumes a durable PQC counter before the second input
+    // fails to sign, so creation fails after counter reservation.
+    CMutableTransaction unsignable;
+    unsignable.vout.emplace_back(COIN, CScript{} << OP_FALSE);
+    BOOST_REQUIRE(wallet->AddToWallet(MakeTransactionRef(unsignable), TxStateInactive{}));
+
+    CCoinControl coin_control;
+    coin_control.m_allow_other_inputs = false;
+    coin_control.m_feerate = CFeeRate{1'000};
+    coin_control.destChange = PKHash{GenerateRandomKey().GetPubKey()};
+    coin_control.Select(workload.coins.begin()->first);
+    PreselectedInput& unsignable_input{coin_control.Select(COutPoint{unsignable.GetHash(), 0})};
+    unsignable_input.SetTxOut(unsignable.vout.front());
+    unsignable_input.SetInputWeight(GetTransactionInputWeight(CTxIn{}));
+
+    WalletContext context;
+    auto wallet_interface{interfaces::MakeWallet(context, wallet)};
+    const std::vector<CRecipient> recipients{{PKHash{GenerateRandomKey().GetPubKey()}, COIN, /*subtract_fee=*/false}};
+    int change_pos{-1};
+    CAmount fee{0};
+    PQCUsageReport usage;
+    const auto result{wallet_interface->createTransaction(recipients, coin_control, /*sign=*/true, change_pos, fee, &usage)};
+    BOOST_REQUIRE(!result);
+    BOOST_CHECK_EQUAL(util::ErrorString(result).original, "Signing transaction failed");
+    BOOST_REQUIRE_EQUAL(usage.key_states.size(), 1U);
+    BOOST_CHECK(usage.key_states.front().pubkey == workload.pubkeys.front().pqc_pubkey);
+    BOOST_CHECK_EQUAL(usage.key_states.front().signature_count, 1U);
+    BOOST_CHECK_EQUAL(GetProviderPQCCounter(*workload.p2mr_spk_man,
+        workload.pubkeys.front().descriptor_pubkey, workload.pubkeys.front().pqc_pubkey), 1U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

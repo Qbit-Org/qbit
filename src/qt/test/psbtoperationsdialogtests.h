@@ -35,6 +35,7 @@ private Q_SLOTS:
     void dialogDestructionBeforeCompletion();
     void walletUnloadDuringSigning();
     void signingFailurePreservesOriginalPSBT();
+    void usageStatesOnSuccessAndFailure();
 
 private:
     struct Context;

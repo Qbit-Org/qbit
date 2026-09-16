@@ -14,6 +14,7 @@
 #include <qt/guiutil.h>
 #include <qt/optionsmodel.h>
 #include <qt/platformstyle.h>
+#include <qt/pqcusageformat.h>
 #include <qt/sendcoinsentry.h>
 
 #include <chainparams.h>
@@ -736,8 +737,11 @@ void SendCoinsDialog::prepareTransactionFinished(uint64_t generation, std::share
 
     m_current_transaction = std::move(result->transaction);
 
+    // Present this attempt's usage report before the failure path below
+    // discards the prepared transaction that carries it.
     processSendCoinsReturn(result->status,
-        QbitUnits::formatWithUnit(model->getOptionsModel()->getDisplayUnit(), m_current_transaction->getTransactionFee()));
+        QbitUnits::formatWithUnit(model->getOptionsModel()->getDisplayUnit(), m_current_transaction->getTransactionFee()),
+        &m_current_transaction->getPQCUsageReport());
 
     if(result->status.status != WalletModel::OK) {
         fNewRecipientAllowed = true;
@@ -1198,7 +1202,7 @@ void SendCoinsDialog::refreshBalance()
     updateSmartFeeLabel();
 }
 
-void SendCoinsDialog::processSendCoinsReturn(const WalletModel::SendCoinsReturn &sendCoinsReturn, const QString &msgArg)
+void SendCoinsDialog::processSendCoinsReturn(const WalletModel::SendCoinsReturn &sendCoinsReturn, const QString &msgArg, const wallet::PQCUsageReport* pqc_usage)
 {
     QPair<QString, CClientUIInterface::MessageBoxFlags> msgParams;
     // Default to a warning message, override if error message is needed
@@ -1234,6 +1238,11 @@ void SendCoinsDialog::processSendCoinsReturn(const WalletModel::SendCoinsReturn 
     case WalletModel::OK:
     default:
         return;
+    }
+
+    if (pqc_usage) {
+        const QString usage{FormatPQCSigningOutcomePlain(*pqc_usage, PQCSigningOutcome::FailedAfterConsumption)};
+        if (!usage.isEmpty()) msgParams.first += "\n\n" + usage;
     }
 
     Q_EMIT message(tr("Send Coins"), msgParams.first, msgParams.second);
