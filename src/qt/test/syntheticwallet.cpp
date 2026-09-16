@@ -433,7 +433,10 @@ public:
     {
         if (!sign) {
             if (n_signed) *n_signed = 1;
-            complete = false;
+            {
+                std::lock_guard lock{m_state->mutex};
+                complete = m_state->psbt_draft_complete;
+            }
             if (pqc_usage) *pqc_usage = {};
             return std::nullopt;
         }
@@ -577,7 +580,11 @@ public:
     unsigned int getConfirmTarget() override { return 6; }
     bool hdEnabled() override { return true; }
     bool canGetAddresses() override { return true; }
-    bool privateKeysDisabled() override { return false; }
+    bool privateKeysDisabled() override
+    {
+        std::lock_guard lock{m_state->mutex};
+        return m_state->private_keys_disabled;
+    }
     bool taprootEnabled() override { return false; }
     bool hasExternalSigner() override
     {

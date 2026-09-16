@@ -581,8 +581,12 @@ WalletModel::UnlockContext WalletModel::requestUnlock()
     bool was_locked = getEncryptionStatus() == Locked;
     if(was_locked)
     {
-        // Request UI to unlock wallet
+        // Request UI to unlock wallet. The passphrase dialog runs a nested
+        // event loop, which can unload the wallet and delete this model, so
+        // report an invalid context rather than reading members afterwards.
+        QPointer<WalletModel> model{this};
         Q_EMIT requireUnlock();
+        if (!model) return UnlockContext(nullptr, /*valid=*/false, /*relock=*/false);
     }
     // If wallet is still locked, unlock was failed or cancelled, mark context as invalid
     bool valid = getEncryptionStatus() != Locked;
@@ -703,10 +707,19 @@ void WalletModel::bumpFeePrepared(uint64_t generation, std::shared_ptr<BumpFeeRe
         resetBumpFeeState();
         return;
     }
+    // Every presentation below can enter a nested event loop that unloads the
+    // wallet and deletes this model, so each state change past one of them
+    // checks both the model and the attempt. The short-circuit keeps the
+    // member read from happening once the model is gone.
+    QPointer<WalletModel> model{this};
+    const auto still_current = [&model, this, generation] {
+        return model && generation == m_bump_fee_generation;
+    };
+
     if (!result->prepared) {
         const QString error{result->errors.empty() ? QString{} : QString::fromStdString(result->errors.front().translated)};
         QMessageBox::critical(nullptr, tr("Fee bump error"), tr("Increasing transaction fee failed") + "<br />(" + error + ")");
-        resetBumpFeeState();
+        if (still_current()) resetBumpFeeState();
         return;
     }
 
@@ -742,8 +755,8 @@ void WalletModel::bumpFeePrepared(uint64_t generation, std::shared_ptr<BumpFeeRe
     // TODO: Replace QDialog::exec() with safer QDialog::show().
     const auto retval = static_cast<QMessageBox::StandardButton>(confirmationDialog->exec());
 
-    if (generation != m_bump_fee_generation || m_bump_fee_cancellation_state.load() == BumpFeeCancellationState::Canceled) {
-        resetBumpFeeState();
+    if (!still_current() || m_bump_fee_cancellation_state.load() == BumpFeeCancellationState::Canceled) {
+        if (model) resetBumpFeeState();
         return;
     }
 
@@ -761,24 +774,31 @@ void WalletModel::bumpFeePrepared(uint64_t generation, std::shared_ptr<BumpFeeRe
         const auto err{result->wallet->fillPSBT(std::nullopt, /*sign=*/false, /*bip32derivs=*/true, nullptr, psbtx, complete)};
         if (err || complete) {
             QMessageBox::critical(nullptr, tr("Fee bump error"), tr("Can't draft transaction."));
-            resetBumpFeeState();
+            if (still_current()) resetBumpFeeState();
             return;
         }
         // Serialize the PSBT
         DataStream ssTx{};
         ssTx << psbtx;
         GUIUtil::setClipboard(EncodeBase64(ssTx.str()).c_str());
+        // A modal message is presented in a nested event loop as well.
         Q_EMIT message(tr("PSBT copied"), tr("Fee-bump PSBT copied to clipboard"), CClientUIInterface::MSG_INFORMATION | CClientUIInterface::MODAL);
-        resetBumpFeeState();
+        if (still_current()) resetBumpFeeState();
         return;
     }
 
-    m_bump_fee_unlock_context = std::make_unique<WalletModel::UnlockContext>(requestUnlock());
+    // The passphrase dialog behind requestUnlock() is a nested event loop too.
+    // Hold the context locally until the model is known to have survived it: a
+    // destroyed model cannot take ownership, and dropping the context here
+    // releases the unlock instead of leaking it into the deleted model.
+    auto unlock_context{std::make_unique<WalletModel::UnlockContext>(requestUnlock())};
+    if (!model) return;
+    m_bump_fee_unlock_context = std::move(unlock_context);
     if (!m_bump_fee_unlock_context->isValid()) {
         resetBumpFeeState();
         return;
     }
-    if (generation != m_bump_fee_generation || m_bump_fee_cancellation_state.load() == BumpFeeCancellationState::Canceled) {
+    if (!still_current() || m_bump_fee_cancellation_state.load() == BumpFeeCancellationState::Canceled) {
         resetBumpFeeState();
         return;
     }

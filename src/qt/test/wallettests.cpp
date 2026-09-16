@@ -288,8 +288,8 @@ private:
 class MessageBoxClicker : public QObject
 {
 public:
-    MessageBoxClicker(QString object_name, QMessageBox::StandardButton button, QString* text = nullptr, Qt::TextFormat* text_format = nullptr)
-        : QObject(QApplication::instance()), m_object_name(std::move(object_name)), m_button(button), m_text(text), m_text_format(text_format)
+    MessageBoxClicker(QString object_name, QMessageBox::StandardButton button, QString* text = nullptr, Qt::TextFormat* text_format = nullptr, std::function<void()> before_click = {})
+        : QObject(QApplication::instance()), m_object_name(std::move(object_name)), m_button(button), m_text(text), m_text_format(text_format), m_before_click(std::move(before_click))
     {
         QApplication::instance()->installEventFilter(this);
         m_timer.setInterval(50);
@@ -340,6 +340,11 @@ private:
         if (!button) return;
         if (m_text) *m_text = dialog->text();
         if (m_text_format) *m_text_format = dialog->textFormat();
+        if (m_before_click) {
+            const std::function<void()> before_click{std::move(m_before_click)};
+            m_before_click = {};
+            before_click();
+        }
         if (!m_finished_connected) {
             m_finished_connected = true;
             connect(dialog, &QMessageBox::finished, this, [this] {
@@ -357,6 +362,7 @@ private:
     const QMessageBox::StandardButton m_button;
     QString* const m_text;
     Qt::TextFormat* const m_text_format;
+    std::function<void()> m_before_click;
     QTimer m_timer;
     QPointer<QMessageBox> m_dialog;
     bool m_clicked{false};
@@ -3033,6 +3039,136 @@ void TestUsageStaysOutOfPortableArtifacts(interfaces::Node& node)
     }
 }
 
+//! The "Increasing transaction fee failed" box is the first nested loop in
+//! bumpFeePrepared(). Losing the model inside it must not reset state through
+//! the deleted object.
+void TestFeeBumpModelDestroyedDuringPrepareFailure(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    state->bump_enabled = true;
+    state->bump_prepare_success = false;
+    auto model{env.makeModel(state)};
+    const ReleaseSyntheticBumpOnExit release_on_exit{state};
+    QSignalSpy completed{model.get(), &WalletModel::feeBumped};
+    QSignalSpy messages{model.get(), &WalletModel::message};
+    QPointer<WalletModel> model_guard{model.get()};
+
+    QString text;
+    new MessageBoxClicker({}, QMessageBox::Ok, &text, nullptr, [&model] { model.reset(); });
+    QVERIFY(model->bumpFee(Txid{}));
+    QVERIFY(WaitUntil([&model_guard] { return model_guard.isNull(); }, 5000));
+    QCoreApplication::processEvents();
+
+    QVERIFY2(text.startsWith("Increasing transaction fee failed"), qPrintable(text));
+    QVERIFY(SyntheticStateMatches(state, [](const auto& value) {
+        return value.bump_prepare_entered && !value.bump_sign_entered && !value.bump_commit_entered;
+    }));
+    QCOMPARE(completed.count(), 0);
+    QCOMPARE(messages.count(), 0);
+    QVERIFY(!FindBumpFeeProgressDialog());
+}
+
+//! Unloading the wallet while the fee-bump confirmation dialog runs its nested
+//! event loop deletes the model underneath the waiting call. The attempt has to
+//! be abandoned on the spot: no member of the deleted model may be read, no
+//! signal emitted, and signing must never start.
+void TestFeeBumpModelDestroyedDuringConfirmation(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    state->bump_enabled = true;
+    auto model{env.makeModel(state)};
+    const ReleaseSyntheticBumpOnExit release_on_exit{state};
+    QSignalSpy completed{model.get(), &WalletModel::feeBumped};
+    QSignalSpy messages{model.get(), &WalletModel::message};
+    QVERIFY(completed.isValid());
+    QVERIFY(messages.isValid());
+    QPointer<WalletModel> model_guard{model.get()};
+
+    // Destroy the model from inside the nested loop, then let the dialog
+    // return into the frame that no longer has an object to return to.
+    ConfirmSend(nullptr, QMessageBox::Yes, [&model] { model.reset(); });
+    QVERIFY(model->bumpFee(Txid{}));
+    QVERIFY(WaitUntil([&model_guard] { return model_guard.isNull(); }, 5000));
+
+    // The abandoned attempt still releases the worker's cloned wallet.
+    QVERIFY(WaitUntil([&state] {
+        return SyntheticStateMatches(state, [](const auto& value) { return value.background_clone_destroyed; });
+    }, 5000));
+    QCoreApplication::processEvents();
+    QVERIFY(SyntheticStateMatches(state, [](const auto& value) {
+        return value.bump_prepare_entered && !value.bump_sign_entered && !value.bump_commit_entered && !value.bump_committed;
+    }));
+    QCOMPARE(completed.count(), 0);
+    QCOMPARE(messages.count(), 0);
+    QVERIFY(!FindBumpFeeProgressDialog());
+    VerifyNoSendConfirmation();
+}
+
+//! "Create Unsigned" on a watch-only wallet reports a failed draft in a third
+//! nested loop. The model can be gone by the time that box closes.
+void TestFeeBumpModelDestroyedDuringDraftFailure(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    state->bump_enabled = true;
+    state->private_keys_disabled = true;
+    state->psbt_draft_complete = true;
+    auto model{env.makeModel(state)};
+    const ReleaseSyntheticBumpOnExit release_on_exit{state};
+    QSignalSpy completed{model.get(), &WalletModel::feeBumped};
+    QSignalSpy messages{model.get(), &WalletModel::message};
+    QPointer<WalletModel> model_guard{model.get()};
+
+    QString text;
+    new MessageBoxClicker({}, QMessageBox::Ok, &text, nullptr, [&model] { model.reset(); });
+    ConfirmSend(nullptr, QMessageBox::Save);
+    QVERIFY(model->bumpFee(Txid{}));
+    QVERIFY(WaitUntil([&model_guard] { return model_guard.isNull(); }, 5000));
+    QCoreApplication::processEvents();
+
+    QCOMPARE(text, QString{"Can't draft transaction."});
+    QVERIFY(SyntheticStateMatches(state, [](const auto& value) {
+        return value.bump_prepare_entered && !value.bump_sign_entered && !value.bump_commit_entered;
+    }));
+    QCOMPARE(completed.count(), 0);
+    QCOMPARE(messages.count(), 0);
+    QVERIFY(!FindBumpFeeProgressDialog());
+}
+
+//! requestUnlock() presents the passphrase dialog in the fourth nested loop.
+//! The unlock request stands in for it here: the model dies while the request
+//! is being serviced, so the acquired context must be released rather than
+//! handed to, or read back from, the deleted model.
+void TestFeeBumpModelDestroyedDuringUnlock(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    state->bump_enabled = true;
+    state->encrypted = true;
+    state->locked = true;
+    auto model{env.makeModel(state)};
+    const ReleaseSyntheticBumpOnExit release_on_exit{state};
+    QSignalSpy completed{model.get(), &WalletModel::feeBumped};
+    QSignalSpy messages{model.get(), &WalletModel::message};
+    QPointer<WalletModel> model_guard{model.get()};
+    QObject::connect(model.get(), &WalletModel::requireUnlock, model.get(), [&model] { model.reset(); });
+
+    ConfirmSend(nullptr, QMessageBox::Yes);
+    QVERIFY(model->bumpFee(Txid{}));
+    QVERIFY(WaitUntil([&model_guard] { return model_guard.isNull(); }, 5000));
+    QCoreApplication::processEvents();
+
+    QVERIFY(SyntheticStateMatches(state, [](const auto& value) {
+        // The wallet was never unlocked, so nothing may relock it either.
+        return value.bump_prepare_entered && !value.bump_sign_entered && value.unlock_calls == 0 && value.lock_calls == 0;
+    }));
+    QCOMPARE(completed.count(), 0);
+    QCOMPARE(messages.count(), 0);
+    QVERIFY(!FindBumpFeeProgressDialog());
+}
+
 void TestGUI(interfaces::Node& node)
 {
     // Set up a small funded wallet history instead of importing the full mature chain.
@@ -3083,4 +3219,8 @@ void WalletTests::walletTests()
     TestFeeBumpSuccessShowsUsage(m_node);
     TestUsageIsAttemptLocal(m_node);
     TestUsageStaysOutOfPortableArtifacts(m_node);
+    TestFeeBumpModelDestroyedDuringPrepareFailure(m_node);
+    TestFeeBumpModelDestroyedDuringConfirmation(m_node);
+    TestFeeBumpModelDestroyedDuringDraftFailure(m_node);
+    TestFeeBumpModelDestroyedDuringUnlock(m_node);
 }

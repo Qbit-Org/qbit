@@ -83,6 +83,12 @@ struct SyntheticWalletState {
     bool bump_committed{false};
     CMutableTransaction bump_committed_tx;
     bool external_signer{false};
+    //! Report the wallet as watch-only, so the fee-bump confirmation offers
+    //! "Create Unsigned" instead of a send button.
+    bool private_keys_disabled{false};
+    //! Make an unsigned PSBT draft come back already complete, which the
+    //! fee-bump path reports as "Can't draft transaction.".
+    bool psbt_draft_complete{false};
     std::function<void()> can_get_addresses_changed;
 };
 
