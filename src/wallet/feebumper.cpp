@@ -467,7 +467,7 @@ static std::set<Txid> GetReplacementAncestors(const CWallet& wallet, const CWall
 
 static const CTxOut* GetReplacementInputTxOut(
     const CWallet& wallet,
-    const std::map<COutPoint, Coin>& external_coins,
+    const std::map<COutPoint, Coin>& input_coins,
     const COutPoint& outpoint) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
 {
     const auto wallet_tx{wallet.mapWallet.find(outpoint.hash)};
@@ -475,8 +475,8 @@ static const CTxOut* GetReplacementInputTxOut(
         if (outpoint.n >= wallet_tx->second.tx->vout.size()) return nullptr;
         return &wallet_tx->second.tx->vout[outpoint.n];
     }
-    const auto external_coin{external_coins.find(outpoint)};
-    if (external_coin == external_coins.end() || external_coin->second.IsSpent()) return nullptr;
+    const auto external_coin{input_coins.find(outpoint)};
+    if (external_coin == input_coins.end() || external_coin->second.IsSpent()) return nullptr;
     return &external_coin->second.out;
 }
 
@@ -493,14 +493,15 @@ static Result RevalidateReplacement(const CWallet& wallet,
         original_inputs.insert(input.prevout);
     }
     std::set<COutPoint> replacement_inputs;
-    std::map<COutPoint, Coin> external_coins;
+    std::map<COutPoint, Coin> input_coins;
     for (const CTxIn& input : old_wtx.tx->vin) {
-        if (!wallet.mapWallet.contains(input.prevout.hash)) external_coins[input.prevout];
+        input_coins[input.prevout];
     }
     for (const CTxIn& input : mtx.vin) {
-        if (!wallet.mapWallet.contains(input.prevout.hash)) external_coins[input.prevout];
+        input_coins[input.prevout];
     }
-    wallet.chain().findCoins(external_coins);
+    std::map<COutPoint, Txid> mempool_spenders;
+    wallet.chain().findCoins(input_coins, &mempool_spenders);
 
     CAmount replacement_input_value{0};
     for (const CTxIn& input : mtx.vin) {
@@ -508,12 +509,22 @@ static Result RevalidateReplacement(const CWallet& wallet,
             errors.emplace_back(Untranslated("Replacement transaction contains duplicate inputs"));
             return Result::WALLET_ERROR;
         }
-        const CTxOut* txout{GetReplacementInputTxOut(wallet, external_coins, input.prevout)};
+        // Wallet notifications may still be waiting for cs_wallet. A cached
+        // parent output cannot establish availability in the live chain.
+        const Coin& live_coin{input_coins.at(input.prevout)};
+        const CTxOut* txout{live_coin.IsSpent() ? nullptr : &live_coin.out};
         if (!txout) {
             errors.emplace_back(Untranslated(strprintf("Replacement input %s:%u is no longer available", input.prevout.hash.GetHex(), input.prevout.n)));
             return Result::WALLET_ERROR;
         }
         replacement_input_value += txout->nValue;
+        const auto spender{mempool_spenders.find(input.prevout)};
+        if (spender != mempool_spenders.end() && spender->second != old_wtx.GetHash() &&
+            !replacement_ancestors.contains(spender->second)) {
+            errors.emplace_back(Untranslated(strprintf("Replacement input %s:%u is already spent by mempool transaction %s",
+                input.prevout.hash.GetHex(), input.prevout.n, spender->second.GetHex())));
+            return Result::WALLET_ERROR;
+        }
 
         for (const Txid& candidate_txid : wallet.GetWalletSpenders(input.prevout)) {
             const auto candidate_it{wallet.mapWallet.find(candidate_txid)};
@@ -535,7 +546,7 @@ static Result RevalidateReplacement(const CWallet& wallet,
 
     CAmount original_input_value{0};
     for (const CTxIn& input : old_wtx.tx->vin) {
-        const CTxOut* txout{GetReplacementInputTxOut(wallet, external_coins, input.prevout)};
+        const CTxOut* txout{GetReplacementInputTxOut(wallet, input_coins, input.prevout)};
         if (!txout) {
             errors.emplace_back(Untranslated("Original transaction inputs are no longer available"));
             return Result::WALLET_ERROR;

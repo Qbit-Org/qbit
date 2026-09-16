@@ -619,7 +619,20 @@ public:
                int{FillBlock(block1, block1_out, lock, active, chainman().m_blockman)} &
                int{FillBlock(block2, block2_out, lock, active, chainman().m_blockman)};
     }
-    void findCoins(std::map<COutPoint, Coin>& coins) override { return FindCoins(m_node, coins); }
+    void findCoins(std::map<COutPoint, Coin>& coins, std::map<COutPoint, Txid>* mempool_spenders) override
+    {
+        assert(m_node.mempool);
+        LOCK2(cs_main, m_node.mempool->cs);
+        FindCoins(m_node, coins);
+        if (mempool_spenders) {
+            mempool_spenders->clear();
+            for (const auto& [outpoint, _] : coins) {
+                if (const auto* spender = m_node.mempool->GetConflictTx(outpoint)) {
+                    mempool_spenders->emplace(outpoint, spender->GetHash());
+                }
+            }
+        }
+    }
     double guessVerificationProgress(const uint256& block_hash) override
     {
         LOCK(chainman().GetMutex());
