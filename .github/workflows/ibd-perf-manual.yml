@@ -114,6 +114,7 @@ jobs:
       RUN_MODE: ${{ github.event_name == 'schedule' && 'nightly' || 'manual' }}
       CHECKOUT_REF: ${{ github.event_name == 'schedule' && '0.1.x' || github.ref }}
       BENCHMARK_REF_NAME: ${{ github.event_name == 'schedule' && '0.1.x' || github.ref_name }}
+      IBD_WORKFLOW_SUPPORT_DIR: ${{ github.workspace }}/.workflow-support
       PERF_BUILD_DIR: ${{ github.workspace }}/build-perf
       PERF_ARTIFACT_ROOT: ${{ github.workspace }}/build-perf-artifacts/ibd-perf-${{ github.run_id }}
       SELECTED_PROFILE: ${{ github.event_name == 'schedule' && 'nightly-smoke' || inputs.profile }}
@@ -139,6 +140,18 @@ jobs:
         with:
           ref: ${{ env.CHECKOUT_REF }}
           fetch-depth: 1
+
+      # A scheduled run benchmarks 0.1.x, which may not contain the workflow's
+      # helpers. Keep them at the exact revision that supplied this workflow.
+      - name: Checkout workflow support
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .workflow-support
+          fetch-depth: 1
+          sparse-checkout: |
+            .github/workflows
+            ci
 
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
@@ -270,6 +283,7 @@ jobs:
           {
             echo "timestamp_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "git_commit=$(git rev-parse HEAD)"
+            echo "workflow_support_commit=$(git -C "$IBD_WORKFLOW_SUPPORT_DIR" rev-parse HEAD)"
             echo "github_repository=${GITHUB_REPOSITORY}"
             echo "github_workflow=${GITHUB_WORKFLOW}"
             echo "github_run_id=${GITHUB_RUN_ID}"
@@ -294,7 +308,7 @@ jobs:
             echo "enable_tracing=${ENABLE_TRACING}"
             echo "trace_threshold_ms=${TRACE_THRESHOLD_MS}"
             echo "bench_min_time_ms=${BENCH_MIN_TIME_MS}"
-            source ci/ibd-perf-lanes.sh
+            source "$IBD_WORKFLOW_SUPPORT_DIR/ci/ibd-perf-lanes.sh"
             write_ibd_timeout_evidence
             echo "runner_name=${RUNNER_NAME}"
             echo "runner_arch=${RUNNER_ARCH}"
@@ -339,8 +353,9 @@ jobs:
 
       - name: Run IBD timeout wiring checks
         run: |
+          QBIT_IBD_PERF_SOURCE_ROOT="$GITHUB_WORKSPACE" \
           QBIT_IBD_PERF_CONFIGFILE="$PERF_BUILD_DIR/test/config.ini" \
-            python3 ci/checks/test_ibd_timeout_wiring.py -v
+            python3 "$IBD_WORKFLOW_SUPPORT_DIR/ci/checks/test_ibd_timeout_wiring.py" -v
 
       - name: Run hotspot microbenchmarks
         run: |
@@ -362,7 +377,7 @@ jobs:
         run: |
           set -euo pipefail
           ulimit -n 10240
-          source ci/ibd-perf-lanes.sh
+          source "$IBD_WORKFLOW_SUPPORT_DIR/ci/ibd-perf-lanes.sh"
           preflight_ibd_timeouts
           run_ibd_lanes
 

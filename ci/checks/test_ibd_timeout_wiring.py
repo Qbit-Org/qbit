@@ -22,6 +22,8 @@ import importlib
 import io
 import json
 import os
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -30,10 +32,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-HELPER = REPO_ROOT / "ci" / "ibd-perf-lanes.sh"
-WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ibd-perf-manual.yml"
-CORE_CHECKS = REPO_ROOT / ".github" / "workflows" / "core-checks.yml"
+SUPPORT_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(os.environ.get("QBIT_IBD_PERF_SOURCE_ROOT", SUPPORT_ROOT)).resolve()
+HELPER = SUPPORT_ROOT / "ci" / "ibd-perf-lanes.sh"
+WORKFLOW = SUPPORT_ROOT / ".github" / "workflows" / "ibd-perf-manual.yml"
+CORE_CHECKS = SUPPORT_ROOT / ".github" / "workflows" / "core-checks.yml"
 FUNCTIONAL_DIR = REPO_ROOT / "test" / "functional"
 SUMMARIZER = REPO_ROOT / "contrib" / "devtools" / "summarize_ibd_perf.py"
 REAL_CONFIGFILE = os.environ.get("QBIT_IBD_PERF_CONFIGFILE") or None
@@ -205,7 +208,7 @@ class IBDTimeoutWiringTest(unittest.TestCase):
             env["SHIM_EXIT"] = str(shim_exit)
             env["SHIM_EXIT_ON_CALL"] = str(shim_exit_on_call or 1)
         proc = subprocess.run(
-            ["bash", "-c", f"set -euo pipefail; source {HELPER.relative_to(REPO_ROOT)}; {commands}"],
+            ["bash", "-c", f"set -euo pipefail; source {shlex.quote(str(HELPER))}; {commands}"],
             cwd=REPO_ROOT,
             env=env,
             text=True,
@@ -472,11 +475,46 @@ class IBDTimeoutWiringTest(unittest.TestCase):
     # Workflow wiring
     # ================================================================================
 
+    def test_workflow_support_survives_a_benchmark_tree_without_helpers(self) -> None:
+        # Model the scheduled layout: benchmark sources at the workspace root,
+        # workflow support from a different revision in its own checkout.
+        benchmark = self.tmp / "benchmark checkout"
+        benchmark.mkdir()
+        for directory in ("test", "share", "contrib"):
+            (benchmark / directory).symlink_to(REPO_ROOT / directory, target_is_directory=True)
+        support = benchmark / ".workflow-support"
+        for relative in (
+            "ci/checks/test_ibd_timeout_wiring.py",
+            "ci/ibd-perf-lanes.sh",
+            ".github/workflows/ibd-perf-manual.yml",
+            ".github/workflows/core-checks.yml",
+        ):
+            destination = support / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(SUPPORT_ROOT / relative, destination)
+        self.assertFalse((benchmark / "ci").exists())
+        env = dict(os.environ, QBIT_IBD_PERF_SOURCE_ROOT=str(benchmark))
+        env.pop("QBIT_IBD_PERF_CONFIGFILE", None)
+        result = subprocess.run(
+            [sys.executable, str(support / "ci/checks/test_ibd_timeout_wiring.py"),
+             "IBDTimeoutWiringTest.test_actual_commands_forward_each_timeout",
+             "IBDTimeoutWiringTest.test_workflow_sources_helper_and_calls_entry_points"],
+            cwd=benchmark, env=env, capture_output=True, text=True, timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_workflow_sources_helper_and_calls_entry_points(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("ref: ${{ env.CHECKOUT_REF }}", text)
+        support_start = text.index("      - name: Checkout workflow support\n")
+        support_end = text.index("      - name:", support_start + 1)
+        support_checkout = text[support_start:support_end]
+        self.assertIn("ref: ${{ github.workflow_sha }}", support_checkout)
+        self.assertIn("path: .workflow-support", support_checkout)
+        self.assertIn('QBIT_IBD_PERF_SOURCE_ROOT="$GITHUB_WORKSPACE"', text)
         sourced = [line.strip() for line in text.splitlines() if line.strip().startswith("source ")]
         self.assertTrue(sourced, "the workflow must source the helper")
-        self.assertEqual(set(sourced), {"source ci/ibd-perf-lanes.sh"})
+        self.assertEqual(set(sourced), {'source "$IBD_WORKFLOW_SUPPORT_DIR/ci/ibd-perf-lanes.sh"'})
         self.assertNotIn("feature_ibd_perf_replay.py", text, "the workflow must not carry a second command builder")
         self.assertNotIn("feature_ibd_perf_network.py", text)
         self.assertNotIn("cmd+=", text)
@@ -490,7 +528,7 @@ class IBDTimeoutWiringTest(unittest.TestCase):
             [
                 "set -euo pipefail",
                 "ulimit -n 10240",
-                "source ci/ibd-perf-lanes.sh",
+                'source "$IBD_WORKFLOW_SUPPORT_DIR/ci/ibd-perf-lanes.sh"',
                 "preflight_ibd_timeouts",
                 "run_ibd_lanes",
             ],
@@ -507,10 +545,10 @@ class IBDTimeoutWiringTest(unittest.TestCase):
         group_end = '} > "$PERF_ARTIFACT_ROOT/summary/host.env"'
         self.assertIn(group_end, metadata_lines)
         host_env_group = metadata_lines[: metadata_lines.index(group_end)]
-        self.assertIn("source ci/ibd-perf-lanes.sh", host_env_group)
+        self.assertIn('source "$IBD_WORKFLOW_SUPPORT_DIR/ci/ibd-perf-lanes.sh"', host_env_group)
         self.assertIn("write_ibd_timeout_evidence", host_env_group)
         self.assertLess(
-            host_env_group.index("source ci/ibd-perf-lanes.sh"),
+            host_env_group.index('source "$IBD_WORKFLOW_SUPPORT_DIR/ci/ibd-perf-lanes.sh"'),
             host_env_group.index("write_ibd_timeout_evidence"),
         )
         self.assertEqual(metadata_lines.count("write_ibd_timeout_evidence"), 1)
@@ -523,7 +561,7 @@ class IBDTimeoutWiringTest(unittest.TestCase):
 
         self.assertIn(
             'QBIT_IBD_PERF_CONFIGFILE="$PERF_BUILD_DIR/test/config.ini" \\\n'
-            "            python3 ci/checks/test_ibd_timeout_wiring.py -v\n",
+            '            python3 "$IBD_WORKFLOW_SUPPORT_DIR/ci/checks/test_ibd_timeout_wiring.py" -v\n',
             text,
         )
         self.assertIn("run: python3 ci/checks/test_ibd_timeout_wiring.py\n", CORE_CHECKS.read_text(encoding="utf-8"))
