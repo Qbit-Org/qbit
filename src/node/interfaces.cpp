@@ -737,6 +737,11 @@ public:
         LOCK(m_node.mempool->cs);
         return m_node.mempool->CheckPackageLimits({tx}, package_vsize);
     }
+    bool isFinalAtTip(const CTransactionRef& tx) override
+    {
+        LOCK(::cs_main);
+        return CheckFinalTxAtTip(*Assert(chainman().ActiveChain().Tip()), *tx);
+    }
     CFeeRate estimateSmartFee(int num_blocks, bool conservative, FeeCalculation* calc) override
     {
         if (!m_node.fee_estimator) return {};

@@ -578,6 +578,12 @@ static Result RevalidateReplacement(const CWallet& wallet,
         errors.emplace_back(Untranslated("Replacement transaction fee no longer satisfies wallet fee policy"));
         return Result::WALLET_ERROR;
     }
+    // A backward reorg during signing can push the tip below the replacement's
+    // anti-fee-sniping nLockTime, leaving it unbroadcastable.
+    if (!wallet.chain().isFinalAtTip(replacement)) {
+        errors.emplace_back(Untranslated("Replacement transaction is no longer final at the current chain tip"));
+        return Result::WALLET_ERROR;
+    }
     if (gArgs.GetBoolArg("-walletrejectlongchains", DEFAULT_WALLET_REJECT_LONG_CHAINS)) {
         if (const auto chain_result{wallet.chain().checkChainLimits(replacement)}; !chain_result) {
             errors.emplace_back(Untranslated("Replacement transaction no longer satisfies mempool chain limits") + Untranslated(": ") + util::ErrorString(chain_result));

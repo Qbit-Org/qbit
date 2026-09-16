@@ -264,6 +264,10 @@ public:
     //! Check if transaction will pass the mempool's chain limits.
     virtual util::Result<void> checkChainLimits(const CTransactionRef& tx, std::optional<int64_t> tx_vsize = std::nullopt) = 0;
 
+    //! Check if transaction is final at the current chain tip, applying the
+    //! same rule the mempool uses when it accepts a transaction.
+    virtual bool isFinalAtTip(const CTransactionRef& tx) = 0;
+
     //! Estimate smart fee.
     virtual CFeeRate estimateSmartFee(int num_blocks, bool conservative, FeeCalculation* calc = nullptr) = 0;
 
