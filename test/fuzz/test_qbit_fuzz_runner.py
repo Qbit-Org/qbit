@@ -363,23 +363,40 @@ class QbitCorporaTest(unittest.TestCase):
                 self.assertEqual(formats, {"legacy", "qbfx-v1-fixture", "qbfx-v1-generation"})
         self.assertLessEqual(total, 384 * 1024)
 
-    def test_overlay_keeps_existing_inputs_and_replaces_stale_overlay(self):
-        corpus = make_corpus(self.tmp / "fuzz_corpora", {"pqc": 2, "process_message": 3})
-        (corpus / "pqc" / "qbit-removed-case").write_bytes(b"stale")
+    def test_overlay_replaces_only_manifest_destinations(self):
+        corpus = make_corpus(self.tmp / "fuzz_corpora", {"pqc": 2, "auxpow": 1, "process_message": 3})
+        pqc_seed = "qbit-" + self.manifest["targets"]["pqc"][0]["file"]
+        auxpow_seed = "qbit-" + self.manifest["targets"]["auxpow"][0]["file"]
+        # qbit-prefixed inputs that the current manifest does not list for their target: an input
+        # added by hand, a seed name dropped from the manifest, and a pqc seed name under auxpow.
+        unmanaged = {
+            corpus / "pqc" / "qbit-found-by-fuzzing": b"\x00kept\xff",
+            corpus / "pqc" / "qbit-removed-case": b"historical",
+            corpus / "auxpow" / pqc_seed: b"not an auxpow seed",
+        }
+        for path, data in unmanaged.items():
+            path.write_bytes(data)
+        (corpus / "pqc" / pqc_seed).write_bytes(b"outdated")
         upstream_before = tree_digest(corpus / "process_message")
         for attempt in range(2):
             with self.subTest(attempt=attempt):
                 result = self.run_overlay(corpus)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertFalse((corpus / "pqc" / "qbit-removed-case").exists())
+                for path, data in unmanaged.items():
+                    self.assertEqual(path.read_bytes(), data, f"{path} must be preserved")
                 self.assertEqual((corpus / "pqc" / "input1").read_bytes(), b"\x01")
                 self.assertEqual(tree_digest(corpus / "process_message"), upstream_before)
                 for target, entries in self.manifest["targets"].items():
-                    names = sorted(p.name for p in (corpus / target).iterdir() if p.name.startswith("qbit-"))
+                    extra = {p.name for p in unmanaged if p.parent.name == target}
+                    names = sorted(p.name for p in (corpus / target).iterdir() if p.name.startswith("qbit-") and p.name not in extra)
                     self.assertEqual(names, sorted("qbit-" + e["file"] for e in entries))
                     for entry in entries:
                         self.assertEqual(hashlib.sha256((corpus / target / ("qbit-" + entry["file"])).read_bytes()).hexdigest(), entry["sha256"])
-                self.assertIn("pqc: overlaid 16 qbit seed files, kept 2 existing input files", result.stdout)
+                self.assertIn("pqc: overlaid 16 qbit seed files, kept 4 existing input files", result.stdout)
+                self.assertRegex(result.stdout, r"auxpow: overlaid \d+ qbit seed files, kept 2 existing input files")
+                # A rerun must restore managed names that were modified in between.
+                (corpus / "pqc" / pqc_seed).write_bytes(b"outdated")
+                (corpus / "auxpow" / auxpow_seed).unlink()
 
     def test_overlay_refuses_unsafe_destinations_and_inputs(self):
         entry = self.manifest["targets"]["auxpow"][0]["file"]
@@ -387,7 +404,32 @@ class QbitCorporaTest(unittest.TestCase):
         corpus.mkdir()
         (corpus / "auxpow" / f"qbit-{entry}").mkdir(parents=True)
         self.assertRegex(self.run_overlay(corpus).stderr, r"already exists and is not a replaceable overlay seed")
+        self.assertEqual(sorted(p.name for p in corpus.iterdir()), ["auxpow"], "no target may be overlaid when a destination is unsafe")
+        self.assertEqual([p.name for p in (corpus / "auxpow").iterdir()], [f"qbit-{entry}"])
         self.assertRegex(self.run_overlay(self.tmp / "missing").stderr, r"corpus directory does not exist")
+
+        outside = self.tmp / "outside"
+        outside.write_bytes(b"outside")
+        for link_target in (outside, self.tmp / "dangling"):
+            with self.subTest(symlink=link_target.name):
+                linked = self.tmp / f"linked-{link_target.name}"
+                (linked / "pqc").mkdir(parents=True)
+                (linked / "pqc" / ("qbit-" + self.manifest["targets"]["pqc"][0]["file"])).symlink_to(link_target)
+                result = self.run_overlay(linked)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertRegex(result.stderr, r"already exists and is not a replaceable overlay seed")
+                self.assertEqual(outside.read_bytes(), b"outside")
+                self.assertFalse((self.tmp / "dangling").exists())
+                self.assertEqual(sorted(p.name for p in linked.iterdir()), ["pqc"])
+                self.assertEqual(len(list((linked / "pqc").iterdir())), 1)
+
+        dangling_target = self.tmp / "dangling-target"
+        dangling_target.mkdir()
+        (dangling_target / "pqc").symlink_to(self.tmp / "dangling")
+        result = self.run_overlay(dangling_target)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertRegex(result.stderr, r"pqc: exists and is not a directory")
+        self.assertEqual([p.name for p in dangling_target.iterdir()], ["pqc"])
 
         for damage in ("modified", "extra-file", "subdirectory"):
             with self.subTest(damage=damage):

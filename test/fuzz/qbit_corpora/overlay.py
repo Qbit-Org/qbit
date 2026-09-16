@@ -6,9 +6,13 @@
 
     test/fuzz/qbit_corpora/overlay.py <qa-assets>/fuzz_corpora
 
-Each seed is copied to <corpus>/<target>/qbit-<name>. Existing files are never
-replaced. Files matching qbit-<name> left by an earlier overlay are removed
-first, so a reused corpus checkout replays exactly the committed seeds.
+Each seed listed in MANIFEST.json is copied to <corpus>/<target>/qbit-<name>.
+Only these destination names are managed: a regular file already at one of
+them is replaced, so rerunning the overlay updates the committed seeds. Every
+other file is left untouched, including qbit-* files that the current manifest
+does not list. A target path that is not a directory, or a symlink or non-file
+at a managed name, is an error; all of them are checked before any file is
+written.
 """
 
 from __future__ import annotations
@@ -38,7 +42,6 @@ LIMITS = {
 }
 SEED_NAME_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]*")
 OVERLAY_PREFIX = "qbit-"
-OVERLAY_NAME_PATTERN = re.compile(OVERLAY_PREFIX + SEED_NAME_PATTERN.pattern)
 CORPORA_DIR = Path(__file__).resolve().parent
 
 
@@ -106,15 +109,22 @@ def overlay(seeds: dict[str, list[tuple[str, bytes]]], corpus_dir: Path) -> None
         raise OverlayError(f"{corpus_dir}: corpus directory does not exist")
     for target, files in seeds.items():
         dest = corpus_dir / target
-        if dest.exists() and not dest.is_dir():
+        if (dest.exists() or dest.is_symlink()) and not dest.is_dir():
             raise OverlayError(f"{dest}: exists and is not a directory")
+        for name, _ in files:
+            out = dest / (OVERLAY_PREFIX + name)
+            if out.is_symlink() or (out.exists() and not out.is_file()):
+                raise OverlayError(f"{out}: already exists and is not a replaceable overlay seed")
+
+    for target, files in seeds.items():
+        dest = corpus_dir / target
         dest.mkdir(exist_ok=True)
-        for stale in dest.iterdir():
-            if OVERLAY_NAME_PATTERN.fullmatch(stale.name) and stale.is_file() and not stale.is_symlink():
-                stale.unlink()
-        kept = sum(1 for p in dest.iterdir() if p.is_file())
+        managed = {OVERLAY_PREFIX + name for name, _ in files}
+        kept = sum(1 for p in dest.iterdir() if p.name not in managed and p.is_file())
         for name, data in files:
             out = dest / (OVERLAY_PREFIX + name)
+            if out.is_file() and not out.is_symlink():
+                out.unlink()
             try:
                 with open(out, "xb") as f:
                     f.write(data)

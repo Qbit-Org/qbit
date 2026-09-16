@@ -54,7 +54,15 @@ and generation seeds keep key generation and signing covered in every replay.
 
 [`overlay.py`](overlay.py) copies each seed to
 `<fuzz_corpora>/<target>/qbit-<name>` after `qa-assets` is cloned or reused.
-Files already in the corpus are kept, and `qbit-*` files from an earlier
-overlay are replaced. `test/fuzz/test_runner.py --require_qbit_corpus` then
-fails unless all six targets are selected, each has at least one regular input
-file, and the fuzz binary reports replaying them.
+The managed names are exactly `qbit-<file>` for each `file` that the current
+`MANIFEST.json` lists under that target. A regular file at a managed name is
+replaced, so rerunning the overlay updates the seeds in place. All other files
+are kept byte-for-byte, including `qbit-*` files that the current manifest does
+not list, such as seeds removed from or renamed in the manifest; delete those
+from a reused corpus by hand if they are no longer wanted. A target path that
+is not a directory, or a symlink, directory or other non-regular file at a
+managed name, is an error; all target paths and managed names are checked
+before any file is written.
+`test/fuzz/test_runner.py --require_qbit_corpus` then fails unless all six
+targets are selected, each has at least one regular input file, and the fuzz
+binary reports replaying them.
