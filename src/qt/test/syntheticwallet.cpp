@@ -164,6 +164,8 @@ public:
             std::lock_guard lock{m_state->mutex};
             m_state->cancel_observed = cancel_observed;
             m_state->create_finished = true;
+            m_state->create_finished_sequence = ++m_state->event_sequence;
+            m_state->create_finished_time = std::chrono::steady_clock::now();
         }
         m_state->condition.notify_all();
         if (cancel_observed) {

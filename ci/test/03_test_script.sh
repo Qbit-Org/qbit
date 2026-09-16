@@ -64,6 +64,11 @@ echo "=== END env ==="
 EOF
 )
 
+if [ -n "${QBIT_FUZZ_MUTATE_MIN_TIME}" ] && [ "$RUN_FUZZ_TESTS" != "true" ]; then
+  echo "Error: QBIT_FUZZ_MUTATE_MIN_TIME is set, but RUN_FUZZ_TESTS is not true." >&2
+  exit 1
+fi
+
 if [ "$RUN_FUZZ_TESTS" = "true" ]; then
   export DIR_FUZZ_IN=${DIR_QA_ASSETS}/fuzz_corpora/
   if [ ! -d "$DIR_FUZZ_IN" ]; then
@@ -74,6 +79,9 @@ if [ "$RUN_FUZZ_TESTS" = "true" ]; then
     echo "Using qa-assets repo from commit ..."
     git log -1
   )
+  # Add the qbit seed corpora to fresh and reused qa-assets checkouts alike.
+  # Existing qa-assets inputs are never replaced.
+  python3 "${BASE_ROOT_DIR}/test/fuzz/qbit_corpora/overlay.py" "${DIR_FUZZ_IN}"
 elif [ "$RUN_UNIT_TESTS" = "true" ]; then
   export DIR_UNIT_TEST_DATA=${DIR_QA_ASSETS}/unit_test_data/
   if [ ! -d "$DIR_UNIT_TEST_DATA" ]; then
@@ -301,5 +309,19 @@ if [ "$RUN_FUZZ_TESTS" = "true" ]; then
     "${MAKEJOBS}" \
     -l DEBUG \
     "${DIR_FUZZ_IN}" \
-    --empty_min_time=60
+    --empty_min_time=60 \
+    --require_qbit_corpus
+  if [ -n "${QBIT_FUZZ_MUTATE_MIN_TIME}" ]; then
+    # Seeded mutation phase over the qbit seed corpora, after the replay above.
+    # shellcheck disable=SC2086
+    LD_LIBRARY_PATH="${DEPENDS_DIR}/${HOST}/lib" \
+    "${BASE_BUILD_DIR}/test/fuzz/test_runner.py" \
+      ${FUZZ_TESTS_CONFIG} \
+      "${MAKEJOBS}" \
+      -l DEBUG \
+      --require_qbit_corpus \
+      --mutate_min_time="${QBIT_FUZZ_MUTATE_MIN_TIME}" \
+      "${DIR_FUZZ_IN}" \
+      asert_chain_transition asert_edge_cases asert_math auxpow p2mr_script pqc
+  fi
 fi
