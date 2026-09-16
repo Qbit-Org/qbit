@@ -42,7 +42,9 @@ SUBPROCESS_TIMEOUT_SECONDS = 120
 # ``unittest -v`` reports ``<method> (<class>[.<method>]) ... <result>``
 # depending on the Python version.  Stderr written while a test runs pushes
 # the result onto a later line, so match the header and result separately.
-VERBOSE_HEADER = re.compile(r"^(?P<name>test_\w+) \((?P<qualified>[\w.]+)\) \.\.\. ")
+# With a docstring, the header ends at the test ID and the next line contains
+# the first line of the docstring followed by " ... " and the result.
+VERBOSE_HEADER = re.compile(r"^(?P<name>test_\w+) \((?P<qualified>[\w.]+)\)(?P<separator> \.\.\. |$)")
 VERBOSE_RESULT = re.compile(r"^(?:ok|FAIL|ERROR|skipped(?: .*)?|expected failure|unexpected success)$")
 RAN_LINE = re.compile(r"^Ran (?P<count>\d+) tests? in ")
 
@@ -120,8 +122,15 @@ def executed_test_ids(stderr: str) -> dict[str, str]:
     """
     results: dict[str, str] = {}
     pending: str | None = None
+    description_pending = False
     for line in stderr.splitlines():
-        header = VERBOSE_HEADER.match(line)
+        if description_pending:
+            # Descriptions can themselves contain the separator or resemble IDs.
+            line = line.rpartition(" ... ")[2]
+            description_pending = False
+            header = None
+        else:
+            header = VERBOSE_HEADER.match(line)
         if header:
             method = header.group("name")
             pending = header.group("qualified")
@@ -131,6 +140,7 @@ def executed_test_ids(stderr: str) -> dict[str, str]:
             if pending.startswith("__main__."):
                 pending = CLASSIFIER_SUITE.stem + pending[len("__main__"):]
             results[pending] = "unknown"
+            description_pending = not header.group("separator")
             line = line[header.end():]
         if pending is not None and VERBOSE_RESULT.match(line.strip()):
             results[pending] = line.strip().split(" ")[0]
@@ -419,17 +429,18 @@ class ClassifierSuiteIdentityTest(unittest.TestCase):
     def test_verbose_ids_preserve_classes_and_results(self) -> None:
         for module in ("__main__", CLASSIFIER_SUITE.stem):
             for suffix in ("", ".test_shared"):
-                with self.subTest(module=module, suffix=suffix):
-                    output = (
-                        f"test_shared ({module}.First{suffix}) ... ok\n"
-                        f"test_shared ({module}.Second{suffix}) ... diagnostic\nFAIL\n"
-                        f"test_shared ({module}.Third{suffix}) ... interrupted\n"
-                    )
-                    self.assertEqual(executed_test_ids(output), {
-                        f"{CLASSIFIER_SUITE.stem}.First.test_shared": "ok",
-                        f"{CLASSIFIER_SUITE.stem}.Second.test_shared": "FAIL",
-                        f"{CLASSIFIER_SUITE.stem}.Third.test_shared": "unknown",
-                    })
+                for separator in (" ... ", "\nDescription ... ", "\nDescription with ... punctuation ... "):
+                    with self.subTest(module=module, suffix=suffix, separator=separator):
+                        output = (
+                            f"test_shared ({module}.First{suffix}){separator}ok\n"
+                            f"test_shared ({module}.Second{suffix}){separator}diagnostic\nFAIL\n"
+                            f"test_shared ({module}.Third{suffix}){separator}interrupted\n"
+                        )
+                        self.assertEqual(executed_test_ids(output), {
+                            f"{CLASSIFIER_SUITE.stem}.First.test_shared": "ok",
+                            f"{CLASSIFIER_SUITE.stem}.Second.test_shared": "FAIL",
+                            f"{CLASSIFIER_SUITE.stem}.Third.test_shared": "unknown",
+                        })
 
     def test_contract_accepts_duplicate_methods_but_rejects_omitted_class(self) -> None:
         contract = Path(__file__).relative_to(REPO_ROOT)
@@ -438,6 +449,7 @@ class ClassifierSuiteIdentityTest(unittest.TestCase):
         extra_class = (
             "class DuplicateMethodNamesTest(unittest.TestCase):\n"
             f"    def {method}(self) -> None:\n"
+            '        """A documented test with ... punctuation."""\n'
             "        pass\n\n\n"
         )
         with tempfile.TemporaryDirectory() as tmpdir:
