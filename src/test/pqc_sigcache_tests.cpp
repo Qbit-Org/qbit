@@ -340,11 +340,24 @@ BOOST_AUTO_TEST_CASE(key_components_and_domain)
     observed.CheckEvents({Hit(false)}, "primed tuple hits");
 
     const PQCTuple wrong_sig{a.sighash, a.pubkey, FlipFirstByte(a.sig)};
-    const std::array<std::pair<std::string_view, PQCTuple>, 3> variants{{
+    std::vector<std::pair<std::string_view, PQCTuple>> variants{
         {"changed sighash", {b.sighash, a.pubkey, a.sig}},
         {"changed pubkey", {a.sighash, b.pubkey, a.sig}},
         {"changed signature", wrong_sig},
-    }};
+    };
+    // Bind every byte of each component, including changes that preserve a
+    // long prefix of a cached valid tuple.
+    for (const bool last : {false, true}) {
+        PQCTuple hash_variant{a};
+        hash_variant.sighash.begin()[last ? a.sighash.size() - 1 : a.sighash.size() / 2] ^= 1;
+        variants.emplace_back(last ? "last sighash byte" : "middle sighash byte", hash_variant);
+        valtype pubkey_bytes(a.pubkey.begin(), a.pubkey.end());
+        pubkey_bytes[last ? pubkey_bytes.size() - 1 : pubkey_bytes.size() / 2] ^= 1;
+        variants.emplace_back(last ? "last pubkey byte" : "middle pubkey byte", PQCTuple{a.sighash, CPQCPubKey{pubkey_bytes}, a.sig});
+        PQCTuple sig_variant{a};
+        sig_variant.sig[last ? a.sig.size() - 1 : a.sig.size() / 2] ^= 1;
+        variants.emplace_back(last ? "last signature byte" : "middle signature byte", sig_variant);
+    }
     for (const auto& [label, variant] : variants) {
         BOOST_CHECK_MESSAGE(EntryPQC(observed.cache, variant) != EntryPQC(observed.cache, a), label);
         BOOST_CHECK_MESSAGE(!ctx.Uncached().VerifyPQCSignature(variant.sig, variant.pubkey, variant.sighash), label);

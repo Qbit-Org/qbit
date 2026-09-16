@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 // Bounded SLH-DSA-SHA2-128s (h=30) constants from libbitcoinpqc.
@@ -39,11 +40,18 @@ constexpr uint32_t PQC_MAX_SIGNATURES = 1U << 30;
 class ScopedPQCVerificationCounter
 {
     friend class CPQCPubKey;
+    static inline std::atomic<ScopedPQCVerificationCounter*> g_counter{nullptr};
     std::atomic<uint64_t> m_calls{0};
 
 public:
-    ScopedPQCVerificationCounter();
-    ~ScopedPQCVerificationCounter();
+    ScopedPQCVerificationCounter()
+    {
+        ScopedPQCVerificationCounter* expected{nullptr};
+        if (!g_counter.compare_exchange_strong(expected, this)) {
+            throw std::logic_error("A PQC verification counter is already installed");
+        }
+    }
+    ~ScopedPQCVerificationCounter() { g_counter.store(nullptr); }
     ScopedPQCVerificationCounter(const ScopedPQCVerificationCounter&) = delete;
     ScopedPQCVerificationCounter& operator=(const ScopedPQCVerificationCounter&) = delete;
     uint64_t GetCount() const { return m_calls.load(std::memory_order_relaxed); }
@@ -68,7 +76,14 @@ public:
     }
 
     bool IsValid() const { return m_valid; }
-    bool Verify(const uint256& hash, std::span<const unsigned char> sig) const;
+    bool Verify(const uint256& hash, std::span<const unsigned char> sig) const
+    {
+        if (!m_valid || sig.size() != PQC_SIG_SIZE) return false;
+        if (auto* counter = ScopedPQCVerificationCounter::g_counter.load()) {
+            counter->m_calls.fetch_add(1, std::memory_order_relaxed);
+        }
+        return slh_dsa_verify(sig.data(), sig.size(), hash.begin(), hash.size(), m_data.data()) == 0;
+    }
     CKeyID GetID() const
     {
         if (!m_valid) return {};
