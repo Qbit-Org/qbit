@@ -12,6 +12,7 @@
 
 #include <QWidget>
 #include <QKeyEvent>
+#include <QMetaObject>
 
 class PlatformStyle;
 class TransactionDescDialog;
@@ -68,6 +69,7 @@ private:
     WalletModel *model{nullptr};
     TransactionFilterProxy *transactionProxyModel{nullptr};
     QTableView *transactionView{nullptr};
+    QMetaObject::Connection m_fee_bumped_connection;
 
     QComboBox *dateWidget;
     QComboBox *typeWidget;
