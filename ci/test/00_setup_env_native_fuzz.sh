@@ -17,6 +17,10 @@ export NO_DEPENDS=1
 export RUN_UNIT_TESTS=false
 export RUN_FUNCTIONAL_TESTS=false
 export RUN_FUZZ_TESTS=true
+# Seconds per target for the extra seeded mutation phase over the qbit seed
+# corpora; empty skips it. Exported here so ci/test/02_run_container.py passes
+# a workflow-provided value into the container.
+export QBIT_FUZZ_MUTATE_MIN_TIME=${QBIT_FUZZ_MUTATE_MIN_TIME:-}
 export GOAL="all"
 export CI_CONTAINER_CAP="--cap-add SYS_PTRACE"  # If run with (ASan + LSan), the container needs access to ptrace (https://github.com/google/sanitizers/issues/764)
 export BITCOIN_CONFIG="\

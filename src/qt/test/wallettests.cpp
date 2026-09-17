@@ -856,6 +856,239 @@ QString ProofWithNestedArrays(const UniValue& proof, size_t array_count)
     return QString::fromStdString(json);
 }
 
+//! Shared inputs for the P2MR sign-path cases where the wallet signs the
+//! data hash but the dialog's own local verification then rejects the proof.
+//! The key material and the valid synthetic result are built once inside
+//! TestP2MRReceiveAddressTypes and borrowed here by reference.
+struct P2MRProofDialogFixture {
+    const PlatformStyle* platform_style;
+    ClientModel& client_model;
+    const WitnessV2P2MR& output;
+    const uint256& message_hash;
+    const interfaces::P2MRDataSignatureResult& valid_result;
+    const CPQCPubKey& selected_pubkey;
+    const CPQCPubKey& alternate_pubkey;
+};
+
+struct P2MRSignDialogWidgets {
+    QValidatedLineEdit* address{nullptr};
+    QComboBox* sign_mode{nullptr};
+    QPlainTextEdit* message{nullptr};
+    QPushButton* sign_button{nullptr};
+    QPlainTextEdit* proof_output{nullptr};
+    QLabel* status_label{nullptr};
+    QPushButton* copy_button{nullptr};
+
+    bool valid() const
+    {
+        return address && sign_mode && message && sign_button && proof_output && status_label && copy_button;
+    }
+};
+
+P2MRSignDialogWidgets FindP2MRSignDialogWidgets(SignVerifyMessageDialog& dialog)
+{
+    return {
+        .address = dialog.findChild<QValidatedLineEdit*>("addressIn_SM"),
+        .sign_mode = dialog.findChild<QComboBox*>("p2mrDataInputMode_SM"),
+        .message = dialog.findChild<QPlainTextEdit*>("messageIn_SM"),
+        .sign_button = dialog.findChild<QPushButton*>("signMessageButton_SM"),
+        .proof_output = dialog.findChild<QPlainTextEdit*>("signatureOut_SM"),
+        .status_label = dialog.findChild<QLabel*>("statusLabel_SM"),
+        .copy_button = dialog.findChild<QPushButton*>("copySignatureButton_SM"),
+    };
+}
+
+//! Fill the sign tab in data-hash mode for the fixture output and click Sign.
+void SignP2MRDataHashInDialog(const P2MRSignDialogWidgets& widgets, const P2MRProofDialogFixture& fixture)
+{
+    widgets.address->setText(QString::fromStdString(EncodeDestination(CTxDestination{fixture.output})));
+    widgets.sign_mode->setCurrentIndex(1);
+    widgets.message->setPlainText(QString::fromStdString(HexStr(std::span<const unsigned char>{fixture.message_hash.begin(), fixture.message_hash.end()})));
+    widgets.sign_button->click();
+}
+
+//! A copy of the valid synthetic result whose signature no longer verifies.
+//! The wallet stub still reports success, so the dialog reaches the real
+//! verifier, which rejects the proof deterministically.
+interfaces::P2MRDataSignatureResult CorruptedP2MRResult(const P2MRProofDialogFixture& fixture)
+{
+    interfaces::P2MRDataSignatureResult corrupted{fixture.valid_result};
+    assert(!corrupted.signature.empty());
+    corrupted.signature[0] ^= 0x01;
+    return corrupted;
+}
+
+QString PubKeyHex(const CPQCPubKey& pubkey)
+{
+    return QString::fromStdString(HexStr(std::span<const unsigned char>{pubkey.begin(), pubkey.end()}));
+}
+
+//! Issue #129: when the wallet signs but the generated proof fails the
+//! dialog's local verification, the red status must still show the
+//! wallet-local PQC usage the attempt consumed, exactly like the ordinary
+//! wallet-error branch, while nothing is written to or exported from the
+//! proof output.
+void TestGeneratedProofVerificationFailureShowsUsage(const P2MRProofDialogFixture& fixture)
+{
+    const interfaces::P2MRDataSignatureResult corrupted_result{CorruptedP2MRResult(fixture)};
+    const QString selected_pubkey_hex{PubKeyHex(fixture.selected_pubkey)};
+    const QString alternate_pubkey_hex{PubKeyHex(fixture.alternate_pubkey)};
+
+    // Case A: a single NORMAL key with no warnings.
+    wallet::PQCUsageReport normal_report;
+    normal_report.key_states.push_back({
+        .pubkey = fixture.selected_pubkey,
+        .signature_count = 1,
+        .signature_limit = PQC_MAX_SIGNATURES,
+        .signatures_remaining = PQC_MAX_SIGNATURES - 1,
+        .limit_state = wallet::PQCSignatureLimitState::NORMAL,
+    });
+    normal_report.overall_state = wallet::PQCSignatureLimitState::NORMAL;
+    QVERIFY(normal_report.warnings.empty());
+
+    {
+        WalletModel wallet_model(qt_test::MakeSyntheticWallet(corrupted_result, normal_report), fixture.client_model, fixture.platform_style);
+        SignVerifyMessageDialog dialog(fixture.platform_style, nullptr);
+        dialog.setModel(&wallet_model);
+        const P2MRSignDialogWidgets widgets{FindP2MRSignDialogWidgets(dialog)};
+        QVERIFY(widgets.valid());
+
+        SignP2MRDataHashInDialog(widgets, fixture);
+
+        const QString status{widgets.status_label->text()};
+        QVERIFY(widgets.proof_output->toPlainText().isEmpty());
+        QVERIFY(widgets.status_label->styleSheet().contains("color: red"));
+        QVERIFY(status.contains("Generated proof failed local verification: signature does not verify"));
+        QVERIFY(status.contains("failed after consuming PQC signature capacity"));
+        QVERIFY(status.contains("PQC usage state after this signing attempt: normal."));
+        QVERIFY(status.contains(QString("PQC key %1: 1 of %2 signatures used, %3 remaining; state: normal.")
+                                    .arg(selected_pubkey_hex)
+                                    .arg(PQC_MAX_SIGNATURES)
+                                    .arg(PQC_MAX_SIGNATURES - 1)));
+        QCOMPARE(status.count("PQC key "), 1);
+        QVERIFY(!status.contains(alternate_pubkey_hex));
+        QVERIFY(!status.contains("entered "));
+        QVERIFY(!status.contains("reached the signature limit"));
+        QVERIFY(!status.contains("remains in "));
+        QVERIFY(!status.contains("proof signed"));
+
+        // The rejected proof is never exported.
+        QApplication::clipboard()->clear();
+        widgets.copy_button->click();
+        QCOMPARE(QApplication::clipboard()->text(), QString{});
+    }
+
+    // Case B: multi-key report with the selected key exhausted (same shape as
+    // the ordinary wallet-error case).
+    wallet::PQCUsageReport exhausted_report;
+    exhausted_report.key_states.push_back({
+        .pubkey = fixture.alternate_pubkey,
+        .signature_count = 1,
+        .signature_limit = PQC_MAX_SIGNATURES,
+        .signatures_remaining = PQC_MAX_SIGNATURES - 1,
+        .limit_state = wallet::PQCSignatureLimitState::NORMAL,
+    });
+    exhausted_report.key_states.push_back({
+        .pubkey = fixture.selected_pubkey,
+        .signature_count = PQC_MAX_SIGNATURES,
+        .signature_limit = PQC_MAX_SIGNATURES,
+        .signatures_remaining = 0,
+        .limit_state = wallet::PQCSignatureLimitState::EXHAUSTED,
+    });
+    exhausted_report.overall_state = wallet::PQCSignatureLimitState::EXHAUSTED;
+    exhausted_report.warnings.push_back({
+        .pubkey = fixture.selected_pubkey,
+        .previous_count = PQC_MAX_SIGNATURES - 1,
+        .new_count = PQC_MAX_SIGNATURES,
+        .previous_state = wallet::PQCSignatureLimitState::CRITICAL,
+        .current_state = wallet::PQCSignatureLimitState::EXHAUSTED,
+        .kind = wallet::PQCUsageWarningKind::TRANSITION,
+    });
+
+    {
+        WalletModel wallet_model(qt_test::MakeSyntheticWallet(corrupted_result, exhausted_report), fixture.client_model, fixture.platform_style);
+        SignVerifyMessageDialog dialog(fixture.platform_style, nullptr);
+        dialog.setModel(&wallet_model);
+        const P2MRSignDialogWidgets widgets{FindP2MRSignDialogWidgets(dialog)};
+        QVERIFY(widgets.valid());
+
+        SignP2MRDataHashInDialog(widgets, fixture);
+
+        const QString status{widgets.status_label->text()};
+        QVERIFY(widgets.proof_output->toPlainText().isEmpty());
+        QVERIFY(widgets.status_label->styleSheet().contains("color: red"));
+        QVERIFY(status.contains("Generated proof failed local verification: signature does not verify"));
+        QVERIFY(status.contains("failed after consuming PQC signature capacity"));
+        QVERIFY(status.contains("PQC usage state after this signing attempt: exhausted."));
+        QVERIFY(status.contains(QString("PQC key %1: 1 of %2 signatures used, %3 remaining; state: normal.")
+                                    .arg(alternate_pubkey_hex)
+                                    .arg(PQC_MAX_SIGNATURES)
+                                    .arg(PQC_MAX_SIGNATURES - 1)));
+        QVERIFY(status.contains(QString("PQC key %1: %2 of %2 signatures used, 0 remaining; state: exhausted.")
+                                    .arg(selected_pubkey_hex)
+                                    .arg(PQC_MAX_SIGNATURES)));
+        QVERIFY(status.contains(QString("PQC key %1 reached the signature limit (%2 of %2 signatures used, 0 remaining). Rotate to a new key/address.")
+                                    .arg(selected_pubkey_hex)
+                                    .arg(PQC_MAX_SIGNATURES)));
+        QCOMPARE(status.count("PQC key "), 3);
+        QVERIFY(!status.contains("proof signed"));
+
+        QApplication::clipboard()->clear();
+        widgets.copy_button->click();
+        QCOMPARE(QApplication::clipboard()->text(), QString{});
+    }
+}
+
+//! Issue #129: an empty usage report must produce exactly the verification
+//! error, and a prior attempt's report must never leak into the new status.
+void TestGeneratedProofFailureWithoutUsage(const P2MRProofDialogFixture& fixture)
+{
+    const interfaces::P2MRDataSignatureResult corrupted_result{CorruptedP2MRResult(fixture)};
+    const QString selected_pubkey_hex{PubKeyHex(fixture.selected_pubkey)};
+    const QString alternate_pubkey_hex{PubKeyHex(fixture.alternate_pubkey)};
+
+    wallet::PQCUsageReport prior_report;
+    prior_report.key_states.push_back({
+        .pubkey = fixture.selected_pubkey,
+        .signature_count = 1,
+        .signature_limit = PQC_MAX_SIGNATURES,
+        .signatures_remaining = PQC_MAX_SIGNATURES - 1,
+        .limit_state = wallet::PQCSignatureLimitState::NORMAL,
+    });
+    prior_report.overall_state = wallet::PQCSignatureLimitState::NORMAL;
+
+    SignVerifyMessageDialog dialog(fixture.platform_style, nullptr);
+    const P2MRSignDialogWidgets widgets{FindP2MRSignDialogWidgets(dialog)};
+    QVERIFY(widgets.valid());
+
+    // A prior attempt in the same dialog displays a non-empty usage report.
+    WalletModel prior_wallet_model(qt_test::MakeSyntheticWallet(corrupted_result, prior_report), fixture.client_model, fixture.platform_style);
+    dialog.setModel(&prior_wallet_model);
+    SignP2MRDataHashInDialog(widgets, fixture);
+    QVERIFY(widgets.status_label->text().contains("PQC key "));
+    QVERIFY(widgets.status_label->text().contains(selected_pubkey_hex));
+
+    // The next attempt fails verification with an empty report: only the
+    // verification error is shown, with nothing carried over.
+    WalletModel empty_report_wallet_model(qt_test::MakeSyntheticWallet(corrupted_result, wallet::PQCUsageReport{}), fixture.client_model, fixture.platform_style);
+    dialog.setModel(&empty_report_wallet_model);
+    SignP2MRDataHashInDialog(widgets, fixture);
+
+    const QString status{widgets.status_label->text()};
+    QVERIFY(widgets.proof_output->toPlainText().isEmpty());
+    QVERIFY(widgets.status_label->styleSheet().contains("color: red"));
+    QCOMPARE(status, QString("Generated proof failed local verification: signature does not verify"));
+    QVERIFY(!status.contains("failed after consuming PQC signature capacity"));
+    QVERIFY(!status.contains("PQC key "));
+    QVERIFY(!status.contains("PQC usage state"));
+    QVERIFY(!status.contains(selected_pubkey_hex));
+    QVERIFY(!status.contains(alternate_pubkey_hex));
+
+    QApplication::clipboard()->clear();
+    widgets.copy_button->click();
+    QCOMPARE(QApplication::clipboard()->text(), QString{});
+}
+
 void TestP2MRReceiveAddressTypes(interfaces::Node& node)
 {
     TestChain100Setup test{ChainType::REGTEST, {.extra_args = {"-p2mronly=1"}}};
@@ -1543,6 +1776,19 @@ void TestP2MRReceiveAddressTypes(interfaces::Node& node)
                                        .arg(PQC_MAX_SIGNATURES - 1)));
     QVERIFY(failed_status.contains(QString("%1 of %1 signatures used, 0 remaining; state: exhausted.").arg(PQC_MAX_SIGNATURES)));
     QVERIFY(failed_status.contains("reached the signature limit"));
+
+    // Issue #129: proofs the wallet signs but local verification rejects.
+    const P2MRProofDialogFixture proof_failure_fixture{
+        .platform_style = platformStyle.get(),
+        .client_model = *mini_gui.clientModel,
+        .output = output,
+        .message_hash = message_hash,
+        .valid_result = synthetic_result,
+        .selected_pubkey = selected_pubkey,
+        .alternate_pubkey = alternate_pubkey,
+    };
+    TestGeneratedProofVerificationFailureShowsUsage(proof_failure_fixture);
+    TestGeneratedProofFailureWithoutUsage(proof_failure_fixture);
 }
 
 void TestSendPQCReportPropagation(interfaces::Node& node)
