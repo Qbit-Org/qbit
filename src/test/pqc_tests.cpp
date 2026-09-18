@@ -21,6 +21,8 @@
 #include <algorithm>
 #include <array>
 #include <numeric>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -114,6 +116,61 @@ BOOST_AUTO_TEST_CASE(pqc_bounded30_profile_constants)
     BOOST_CHECK_EQUAL(bitcoin_pqc_public_key_size(), PQC_PUBKEY_SIZE);
     BOOST_CHECK_EQUAL(bitcoin_pqc_secret_key_size(), PQC_SECKEY_SIZE);
     BOOST_CHECK_EQUAL(bitcoin_pqc_signature_size(), PQC_SIG_SIZE);
+}
+
+BOOST_AUTO_TEST_CASE(pqc_signing_observer_lifetime_and_results)
+{
+    class Observer final : public PQCSigningObserver
+    {
+    public:
+        struct Call {
+            CPQCPubKey pubkey;
+            uint32_t counter;
+            std::optional<bool> success;
+        };
+        std::vector<Call> calls;
+        uint64_t BeforeSign(const CPQCPubKey& pubkey, uint32_t counter) override
+        {
+            calls.push_back({pubkey, counter, std::nullopt});
+            return calls.size() - 1;
+        }
+        void AfterSign(uint64_t call, bool success) override { calls.at(call).success = success; }
+    } observer;
+
+    CPQCKey key;
+    key.MakeNewKey();
+    const auto hash{TestHash("signer observation")};
+    std::vector<unsigned char> signature{0x42};
+    uint32_t counter{7};
+    {
+        ScopedPQCSigningObserver scope{observer};
+        // A rejected second installation must leave the first observer intact.
+        BOOST_CHECK_THROW(ScopedPQCSigningObserver{observer}, std::logic_error);
+        BOOST_CHECK(!CPQCKey{}.Sign(hash, signature, counter));
+        BOOST_CHECK_EQUAL(counter, 7U);
+        counter = PQC_MAX_SIGNATURES;
+        BOOST_CHECK(!key.Sign(hash, signature, counter));
+        BOOST_CHECK_EQUAL(counter, PQC_MAX_SIGNATURES);
+        BOOST_CHECK(signature == std::vector<unsigned char>{0x42});
+        counter = 7;
+        BOOST_REQUIRE(key.Sign(hash, signature, counter));
+        BOOST_CHECK_EQUAL(counter, 8U);
+        BOOST_CHECK(key.GetPubKey().Verify(hash, signature));
+    }
+    BOOST_REQUIRE_EQUAL(observer.calls.size(), 3U);
+    BOOST_CHECK(!observer.calls[0].pubkey.IsValid());
+    BOOST_CHECK_EQUAL(observer.calls[0].counter, 7U);
+    BOOST_CHECK(observer.calls[0].success == std::optional<bool>{false});
+    BOOST_CHECK(observer.calls[1].pubkey == key.GetPubKey());
+    BOOST_CHECK_EQUAL(observer.calls[1].counter, PQC_MAX_SIGNATURES);
+    BOOST_CHECK(observer.calls[1].success == std::optional<bool>{false});
+    BOOST_CHECK(observer.calls[2].pubkey == key.GetPubKey());
+    BOOST_CHECK_EQUAL(observer.calls[2].counter, 7U);
+    BOOST_CHECK(observer.calls[2].success == std::optional<bool>{true});
+    BOOST_CHECK(!CPQCKey{}.Sign(hash, signature, counter));
+    BOOST_CHECK_EQUAL(observer.calls.size(), 3U);
+    // A completed scope releases the slot for the next test.
+    ScopedPQCSigningObserver next_scope{observer};
 }
 
 BOOST_AUTO_TEST_CASE(pqc_bounded30_known_answer_vector)
