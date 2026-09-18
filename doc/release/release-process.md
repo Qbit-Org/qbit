@@ -293,7 +293,13 @@ release that is not immutable, whose immutable state is missing, or whose final
 tag pin differs. Release discovery uses a fully paginated listing so matching
 drafts remain resumable. A release is considered absent only after that listing
 succeeds without a matching tag; authentication, API, and other lookup failures
-stop validation rather than skipping the remote release checks.
+stop validation rather than skipping the remote release checks. Release asset
+inventories are likewise compared only after the complete paginated asset
+listing succeeds. A failed or partial listing is retried within the same
+bounded poll; if it still fails, the publisher stops with an error naming the
+asset-list request, before any upload, edit or publication. If that happens
+after publication, rerun the publisher in validation-only mode to verify the
+published assets once the listing is readable.
 
 Release immutability must be enabled under the target repository's release
 settings or enforced by its organization before publication. GitHub applies the
