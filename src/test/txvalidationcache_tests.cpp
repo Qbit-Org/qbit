@@ -54,6 +54,7 @@ struct PQCCacheEvent {
 PQCCacheEvent PQCHit(bool erase) { return {PQCCacheEventType::LOOKUP_HIT, erase}; }
 PQCCacheEvent PQCMiss(bool erase) { return {PQCCacheEventType::LOOKUP_MISS, erase}; }
 PQCCacheEvent PQCVerifiedOk(bool inserted) { return {PQCCacheEventType::VERIFIED_OK, inserted}; }
+PQCCacheEvent PQCVerifiedFail() { return {PQCCacheEventType::VERIFIED_FAIL, false}; }
 
 /**
  * Render an admission event log. ATMP runs PolicyScriptChecks before
@@ -496,14 +497,14 @@ BOOST_FIXTURE_TEST_CASE(pqc_policy_consensus_reuse, P2MRPQCAdmissionSetup)
     const uint256 merkle_root{ComputeP2MRMerkleRoot(control_block, leaf_hash)};
     const CScript pqc_script_pubkey{CScript{} << OP_2 << valtype(merkle_root.begin(), merkle_root.end())};
 
-    // Confirm four P2MR CHECKSIGPQC coins before any observer is attached.
+    // Confirm five P2MR CHECKSIGPQC coins before any observer is attached.
     const CAmount coin_value{m_coinbase_txns[0]->vout[0].nValue / 8};
     const CMutableTransaction funding{CreateValidMempoolTransaction(
         /*input_transactions=*/{m_coinbase_txns[0]},
         /*inputs=*/{COutPoint{m_coinbase_txns[0]->GetHash(), 0}},
         /*input_height=*/COINBASE_MATURITY,
         /*input_signing_keys=*/{coinbaseKey},
-        /*outputs=*/std::vector<CTxOut>(4, CTxOut{coin_value, pqc_script_pubkey}),
+        /*outputs=*/std::vector<CTxOut>(5, CTxOut{coin_value, pqc_script_pubkey}),
         /*submit=*/false)};
     CreateAndProcessBlock({funding}, P2MROpTrueScript());
     for (uint32_t n{0}; n < funding.vout.size(); ++n) {
@@ -512,6 +513,7 @@ BOOST_FIXTURE_TEST_CASE(pqc_policy_consensus_reuse, P2MRPQCAdmissionSetup)
 
     struct PQCSpend {
         CMutableTransaction tx;
+        std::vector<uint256> sighashes;
         std::vector<uint256> entries;
     };
     const auto build_spend = [&](const std::vector<uint32_t>& vouts) {
@@ -540,6 +542,7 @@ BOOST_FIXTURE_TEST_CASE(pqc_policy_consensus_reuse, P2MRPQCAdmissionSetup)
             BOOST_REQUIRE(key.Sign(sighash, sig, signature_counter));
             uint256 entry;
             signature_cache.ComputeEntryPQC(entry, sighash, sig, pubkey);
+            spend.sighashes.push_back(sighash);
             spend.entries.push_back(entry);
             spend.tx.vin[i].scriptWitness.stack[0] = std::move(sig);
         }
@@ -612,6 +615,27 @@ BOOST_FIXTURE_TEST_CASE(pqc_policy_consensus_reuse, P2MRPQCAdmissionSetup)
     BOOST_CHECK(result_duplicate.m_result_type == MempoolAcceptResult::ResultType::INVALID);
     BOOST_CHECK_EQUAL(result_duplicate.m_state.GetRejectReason(), "txn-already-in-mempool");
     BOOST_CHECK(events.empty());
+
+    // A failed verification is never cached. A spend whose signature has one
+    // flipped bit is rejected by the policy pass after one primitive
+    // verification, on the first and on a repeated submission alike: it never
+    // hits, and neither the corrupted nor the original tuple gains an entry.
+    PQCSpend invalid{build_spend({4})};
+    require_cold(invalid);
+    valtype& invalid_sig{invalid.tx.vin[0].scriptWitness.stack[0]};
+    invalid_sig[0] ^= 1;
+    uint256 invalid_entry;
+    signature_cache.ComputeEntryPQC(invalid_entry, invalid.sighashes[0], invalid_sig, pubkey);
+    for (const char* label : {"first", "repeated"}) {
+        const MempoolAcceptResult result_invalid{admit(invalid.tx, /*test_accept=*/false, events, /*expected_verifications=*/1)};
+        BOOST_TEST_MESSAGE("N=1 invalid signature, " << label << " submission: " << PQCEventsToString(events, 1) << " reject=" << result_invalid.m_state.GetRejectReason());
+        BOOST_CHECK_MESSAGE(result_invalid.m_result_type == MempoolAcceptResult::ResultType::INVALID, label);
+        BOOST_CHECK_EQUAL(result_invalid.m_state.GetRejectReason(), "mempool-script-verify-flag-failed (PQC signature verification failed)");
+        BOOST_CHECK_MESSAGE(events == (std::vector{PQCMiss(false), PQCVerifiedFail()}), label);
+        BOOST_CHECK_MESSAGE(!in_mempool(invalid.tx), label);
+        BOOST_CHECK_MESSAGE(!signature_cache.Get(invalid_entry, /*erase=*/false), label);
+        require_cold(invalid);
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()
