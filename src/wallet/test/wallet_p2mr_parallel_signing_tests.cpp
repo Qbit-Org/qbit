@@ -4,6 +4,9 @@
 
 #include <wallet/test/wallet_p2mr_test_util.h>
 
+#include <interfaces/wallet.h>
+#include <wallet/pqc_usage.h>
+
 namespace wallet {
 using namespace wallet_p2mr_test;
 
@@ -316,6 +319,38 @@ BOOST_AUTO_TEST_CASE(P2MRWalletParallelIgnoresCancelAfterCounterReservation)
     }
 }
 
+BOOST_AUTO_TEST_CASE(P2MRWalletParallelHonorsCancelAtCounterReservationBoundary)
+{
+    m_node.args->ForceSetArg("-walletpqcparallel", "1");
+    m_node.args->ForceSetArg("-walletpqcsignthreads", "1");
+
+    auto workload{MakeDistinctKeyP2MRSigningWorkload(*m_node.chain, /*input_count=*/1)};
+    bool saw_cancellable_reservation{false};
+    bool saw_reservation_boundary{false};
+    std::map<int, bilingual_str> input_errors;
+    const bool signed_ok{workload.wallet->SignTransaction(workload.spend_tx, workload.coins, SIGHASH_DEFAULT, input_errors,
+        {},
+        [&](const SigningProgress& progress) {
+            if (progress.phase != SigningProgressPhase::RESERVING_PQC_COUNTERS) return true;
+            if (progress.cancellable) {
+                saw_cancellable_reservation = true;
+                return true;
+            }
+            if (progress.completed == 0) {
+                saw_reservation_boundary = true;
+                return false;
+            }
+            return true;
+        })};
+
+    BOOST_CHECK(!signed_ok);
+    BOOST_CHECK(saw_cancellable_reservation);
+    BOOST_CHECK(saw_reservation_boundary);
+    BOOST_CHECK(!input_errors.empty());
+    BOOST_CHECK_EQUAL(GetProviderPQCCounter(*workload.p2mr_spk_man, workload.pubkeys.front().descriptor_pubkey, workload.pubkeys.front().pqc_pubkey), 0U);
+    BOOST_CHECK(workload.spend_tx.vin.front().scriptWitness.IsNull());
+}
+
 BOOST_AUTO_TEST_CASE(P2MRWalletSerialIgnoresCancelAfterPQCSigning)
 {
     static constexpr size_t INPUT_COUNT{2};
@@ -349,6 +384,31 @@ BOOST_AUTO_TEST_CASE(P2MRWalletSerialIgnoresCancelAfterPQCSigning)
         BOOST_CHECK_EQUAL(GetProviderPQCCounter(*workload.p2mr_spk_man, workload.pubkeys.at(input_index).descriptor_pubkey, workload.pubkeys.at(input_index).pqc_pubkey), 1U);
         BOOST_CHECK(!workload.spend_tx.vin.at(input_index).scriptWitness.IsNull());
     }
+}
+
+BOOST_AUTO_TEST_CASE(P2MRWalletSerialHonorsCancelAtCounterReservationBoundary)
+{
+    m_node.args->ForceSetArg("-walletpqcparallel", "0");
+
+    auto workload{MakeDistinctKeyP2MRSigningWorkload(*m_node.chain, /*input_count=*/1)};
+    bool saw_reservation_boundary{false};
+    std::map<int, bilingual_str> input_errors;
+    const bool signed_ok{workload.wallet->SignTransaction(workload.spend_tx, workload.coins, SIGHASH_DEFAULT, input_errors,
+        {},
+        [&](const SigningProgress& progress) {
+            if (progress.phase == SigningProgressPhase::RESERVING_PQC_COUNTERS &&
+                !progress.cancellable && progress.completed == 0) {
+                saw_reservation_boundary = true;
+                return false;
+            }
+            return true;
+        })};
+
+    BOOST_CHECK(!signed_ok);
+    BOOST_CHECK(saw_reservation_boundary);
+    BOOST_CHECK(!input_errors.empty());
+    BOOST_CHECK_EQUAL(GetProviderPQCCounter(*workload.p2mr_spk_man, workload.pubkeys.front().descriptor_pubkey, workload.pubkeys.front().pqc_pubkey), 0U);
+    BOOST_CHECK(workload.spend_tx.vin.front().scriptWitness.IsNull());
 }
 
 BOOST_AUTO_TEST_CASE(P2MRWalletParallelSkipsCompleteInputs)
@@ -668,6 +728,47 @@ BOOST_AUTO_TEST_CASE(P2MRWalletParallelSerialParallelABBenchmark)
         static_cast<unsigned int>(INPUT_COUNT),
         serial_elapsed_us,
         parallel_elapsed_us));
+}
+
+BOOST_AUTO_TEST_CASE(P2MRCreateTransactionFailureReportsConsumedUsage)
+{
+    m_node.args->ForceSetArg("-walletpqcparallel", "0");
+    auto workload{MakeDistinctKeyP2MRSigningWorkload(*m_node.chain, /*input_count=*/1)};
+    std::shared_ptr<CWallet> wallet{std::move(workload.wallet)};
+    WITH_LOCK(wallet->cs_wallet, wallet->SetLastBlockProcessed(0, uint256{}));
+
+    CMutableTransaction funding;
+    funding.vout.push_back(workload.coins.begin()->second.out);
+    BOOST_REQUIRE(wallet->AddToWallet(MakeTransactionRef(funding), TxStateInactive{}));
+    // The P2MR input consumes a durable PQC counter before the second input
+    // fails to sign, so creation fails after counter reservation.
+    CMutableTransaction unsignable;
+    unsignable.vout.emplace_back(COIN, CScript{} << OP_FALSE);
+    BOOST_REQUIRE(wallet->AddToWallet(MakeTransactionRef(unsignable), TxStateInactive{}));
+
+    CCoinControl coin_control;
+    coin_control.m_allow_other_inputs = false;
+    coin_control.m_feerate = CFeeRate{1'000};
+    coin_control.destChange = PKHash{GenerateRandomKey().GetPubKey()};
+    coin_control.Select(workload.coins.begin()->first);
+    PreselectedInput& unsignable_input{coin_control.Select(COutPoint{unsignable.GetHash(), 0})};
+    unsignable_input.SetTxOut(unsignable.vout.front());
+    unsignable_input.SetInputWeight(GetTransactionInputWeight(CTxIn{}));
+
+    WalletContext context;
+    auto wallet_interface{interfaces::MakeWallet(context, wallet)};
+    const std::vector<CRecipient> recipients{{PKHash{GenerateRandomKey().GetPubKey()}, COIN, /*subtract_fee=*/false}};
+    int change_pos{-1};
+    CAmount fee{0};
+    PQCUsageReport usage;
+    const auto result{wallet_interface->createTransaction(recipients, coin_control, /*sign=*/true, change_pos, fee, &usage)};
+    BOOST_REQUIRE(!result);
+    BOOST_CHECK_EQUAL(util::ErrorString(result).original, "Signing transaction failed");
+    BOOST_REQUIRE_EQUAL(usage.key_states.size(), 1U);
+    BOOST_CHECK(usage.key_states.front().pubkey == workload.pubkeys.front().pqc_pubkey);
+    BOOST_CHECK_EQUAL(usage.key_states.front().signature_count, 1U);
+    BOOST_CHECK_EQUAL(GetProviderPQCCounter(*workload.p2mr_spk_man,
+        workload.pubkeys.front().descriptor_pubkey, workload.pubkeys.front().pqc_pubkey), 1U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

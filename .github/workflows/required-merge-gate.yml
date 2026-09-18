@@ -111,6 +111,23 @@ jobs:
           cat "${changed_files}"
           echo "changed_files=${changed_files}" >> "$GITHUB_OUTPUT"
 
+      # The classifier decides which validation profile routes this change.
+      # Its own unit tests run here, in the job that produces the routing
+      # outputs, so a broken classifier fails this job (and therefore the
+      # Required Merge Gate) instead of routing itself to a lightweight profile.
+      - name: Test merge-profile classifier
+        run: python3 ci/checks/test_classify_merge_profile.py -v
+
+      - name: Install workflow contract dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-yaml
+
+      # Use the system Python that owns the distribution's PyYAML package.
+      # Wiring regressions must fail this job before it emits routing outputs.
+      - name: Test classifier workflow contract
+        run: /usr/bin/python3 ci/checks/test_classifier_ci_contract.py -v
+
       - name: Classify validation profile
         id: classify
         run: |
