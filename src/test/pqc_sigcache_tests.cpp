@@ -26,11 +26,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -730,6 +732,129 @@ BOOST_AUTO_TEST_CASE(store_consume_and_reclamation)
     BOOST_CHECK_GE(control.consumed_survivors, 3 * CAPACITY / 16);
     BOOST_CHECK_GE(control.kept_survivors, 3 * CAPACITY / 16);
     BOOST_CHECK(control.real_survived || !consumed.real_survived);
+}
+
+BOOST_AUTO_TEST_CASE(concurrent_checks_of_one_signature)
+{
+    // Script-check threads can verify one signature at the same time, and
+    // block connection (consume) can overlap mempool admission (store) on the
+    // same cache. The assertions below hold for every interleaving; none
+    // depends on timing. Runtime is bounded by 2 * THREADS * ROUNDS primitive
+    // verifications.
+    const std::vector<WitnessVector> vectors{LoadWitnessVectors()};
+    const PQCTuple valid{AcceptedTuple(FindVector(vectors, "single_key_default_sighash"))};
+    const PQCTuple invalid{valid.sighash, valid.pubkey, FlipFirstByte(valid.sig)};
+    constexpr size_t THREADS{8};
+    constexpr size_t ROUNDS{3};
+    constexpr size_t CHECKS{THREADS * ROUNDS};
+
+    TupleContext ctx;
+    ObservedCache observed{1 << 20};
+    std::atomic<size_t> valid_accepted{0};
+    std::atomic<size_t> invalid_accepted{0};
+    uint64_t backend_calls{0};
+    {
+        ScopedPQCVerificationCounter verifications;
+        std::vector<std::thread> threads;
+        for (size_t t{0}; t < THREADS; ++t) {
+            threads.emplace_back([&, store = t % 2 == 0] {
+                const auto checker{ctx.Caching(observed.cache, store)};
+                for (size_t r{0}; r < ROUNDS; ++r) {
+                    valid_accepted += checker.VerifyPQCSignature(valid.sig, valid.pubkey, valid.sighash);
+                    invalid_accepted += checker.VerifyPQCSignature(invalid.sig, invalid.pubkey, invalid.sighash);
+                }
+            });
+        }
+        for (std::thread& thread : threads) thread.join();
+        backend_calls = verifications.GetCount();
+    }
+
+    const std::vector<Event> events{observed.TakeEvents()};
+    const size_t hits{CountEvents(events, Hit(false)) + CountEvents(events, Hit(true))};
+    const size_t misses{CountEvents(events, Miss(false)) + CountEvents(events, Miss(true))};
+    const size_t verified_ok{CountEvents(events, Ok(false)) + CountEvents(events, Ok(true))};
+    const size_t verified_fail{CountEvents(events, Fail())};
+    BOOST_TEST_MESSAGE(strprintf("concurrent: hits=%u misses=%u verified_ok=%u verified_fail=%u backend_calls=%u",
+                                 hits, misses, verified_ok, verified_fail, backend_calls));
+
+    BOOST_CHECK_EQUAL(valid_accepted.load(), CHECKS);
+    BOOST_CHECK_EQUAL(invalid_accepted.load(), 0U);
+    // No false hit: every check of the invalid tuple missed and failed in the backend.
+    BOOST_CHECK_EQUAL(verified_fail, CHECKS);
+    // Every check of the valid tuple either hit or was verified, at least once.
+    BOOST_CHECK_EQUAL(hits + verified_ok, CHECKS);
+    BOOST_CHECK_GE(verified_ok, 1U);
+    // Each lookup is a hit or a miss, and each miss reaches the backend exactly once.
+    BOOST_CHECK_EQUAL(events.size(), hits + misses + verified_ok + verified_fail);
+    BOOST_CHECK_EQUAL(hits + misses, 2 * CHECKS);
+    BOOST_CHECK_EQUAL(misses, verified_ok + verified_fail);
+    BOOST_CHECK_EQUAL(backend_calls, misses);
+    // Racing stores leave the valid tuple cached and never the invalid one.
+    BOOST_CHECK(observed.cache.Get(EntryPQC(observed.cache, valid), /*erase=*/false));
+    BOOST_CHECK(!observed.cache.Get(EntryPQC(observed.cache, invalid), /*erase=*/false));
+}
+
+BOOST_AUTO_TEST_CASE(data_signatures_bypass_the_cache)
+{
+    // The cache is scoped to transaction signatures. OP_CHECKDATASIGPQC calls
+    // the primitive directly: under a caching checker it emits no cache
+    // events, stores nothing and cannot be satisfied by a cache entry.
+    CPQCKey key;
+    key.MakeNewKey();
+    BOOST_REQUIRE(key.IsValid());
+    const CPQCPubKey pubkey{key.GetPubKey()};
+    const uint256 msg_hash{(HashWriter{} << std::string{"pqc sigcache data signature"}).GetSHA256()};
+    const uint256 datasig_hash{ComputeQbitDataSigPQCHash(msg_hash)};
+    valtype sig;
+    uint32_t counter{0};
+    BOOST_REQUIRE(key.Sign(datasig_hash, sig, counter));
+    const valtype invalid_sig{FlipFirstByte(sig)};
+
+    const CScript leaf_script{CScript{} << valtype(msg_hash.begin(), msg_hash.end()) << valtype(pubkey.begin(), pubkey.end()) << OP_CHECKDATASIGPQC};
+    const valtype leaf_bytes(leaf_script.begin(), leaf_script.end());
+    const valtype control_block{static_cast<unsigned char>(P2MR_LEAF_VERSION_V1 | 1)};
+
+    struct EvalOutcome {
+        ScriptOutcome outcome;
+        int64_t weight_left;
+        bool operator==(const EvalOutcome&) const = default;
+    };
+    const auto eval = [&](const valtype& witness_sig, const BaseSignatureChecker& checker) {
+        std::vector<valtype> stack{witness_sig};
+        ScriptExecutionData execdata;
+        execdata.m_validation_weight_left = ::GetSerializeSize(std::vector<valtype>{witness_sig, leaf_bytes, control_block}) + VALIDATION_WEIGHT_OFFSET;
+        execdata.m_validation_weight_left_init = true;
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        const bool result{EvalScript(stack, leaf_script, P2MR_SCRIPT_VERIFY_FLAGS, checker, SigVersion::P2MR, execdata, &err)};
+        return EvalOutcome{{result, err}, execdata.m_validation_weight_left};
+    };
+
+    TupleContext ctx;
+    ObservedCache observed{1 << 20};
+    const auto uncached_checker{ctx.Uncached()};
+    const auto caching_checker{ctx.Caching(observed.cache, /*store=*/true)};
+
+    const EvalOutcome valid_uncached{eval(sig, uncached_checker)};
+    BOOST_CHECK(valid_uncached.outcome == (ScriptOutcome{true, SCRIPT_ERR_OK}));
+    for (int i{0}; i < 2; ++i) {
+        ScopedPQCVerificationCounter verifications;
+        BOOST_CHECK(eval(sig, caching_checker) == valid_uncached);
+        BOOST_CHECK_EQUAL(verifications.GetCount(), 1U);
+        observed.CheckEvents({}, "valid data signature");
+    }
+    BOOST_CHECK(!observed.cache.Get(EntryPQC(observed.cache, {datasig_hash, pubkey, sig}), /*erase=*/false));
+
+    // Prime the transaction-signature entry for the failing tuple. A data
+    // signature check that consulted the cache would now succeed.
+    const EvalOutcome invalid_uncached{eval(invalid_sig, uncached_checker)};
+    BOOST_CHECK(invalid_uncached.outcome == (ScriptOutcome{false, SCRIPT_ERR_P2MR_SIG}));
+    observed.cache.Set(EntryPQC(observed.cache, {datasig_hash, pubkey, invalid_sig}));
+    {
+        ScopedPQCVerificationCounter verifications;
+        BOOST_CHECK(eval(invalid_sig, caching_checker) == invalid_uncached);
+        BOOST_CHECK_EQUAL(verifications.GetCount(), 1U);
+        observed.CheckEvents({}, "invalid data signature with a primed entry");
+    }
 }
 
 BOOST_AUTO_TEST_CASE(shared_budget_and_eviction)
