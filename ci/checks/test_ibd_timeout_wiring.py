@@ -384,6 +384,16 @@ class IBDTimeoutWiringTest(unittest.TestCase):
         lanes_only = self.run_helper("run_ibd_lanes", self.all_set(), shim_exit=3, shim_exit_on_call=2)
         self.assertEqual(lanes_only.returncode, 3, lanes_only.stderr)
         self.assertEqual(len(lanes_only.argvs), 2)
+        # The network lane propagates its own status too, before a second run.
+        network_only = self.run_helper(
+            "run_ibd_lanes",
+            {**self.all_set(), "ENABLE_REPLAY_LANES": "false", "RUNS_PER_LANE": "2"},
+            shim_exit=3,
+            shim_exit_on_call=1,
+        )
+        self.assertEqual(network_only.returncode, 3, network_only.stderr)
+        self.assertEqual(len(self.lane_argvs(network_only, "network")), 1)
+        self.assertEqual(len(network_only.argvs), 1)
 
         # The real interpreter and the real argparse: a malformed value fails the
         # preflight with exit 2 before any lane, even when its lane is disabled.
