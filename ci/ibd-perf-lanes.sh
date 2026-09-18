@@ -91,11 +91,19 @@ build_network_cmd() {
   fi
 }
 
+# True when the lane loop in run_ibd_lanes iterates at least once. The
+# campaign's own `seq` decides, so no separate numeric rule is introduced
+# here: a resolved runs-per-lane that yields no iteration builds no command.
+ibd_perf_lane_runs() {
+  [ -n "$(seq 1 "$RUNS_PER_LANE" 2>/dev/null)" ]
+}
+
 # Writes the requested timeout strings plus an explicit forwarded marker to
 # stdout (the workflow redirects this into summary/host.env). The marker
-# mirrors the builder conditions above: a blank value is never forwarded, and
-# a value for a disabled lane is never reached by any command. Effective
-# values are only ever written by the harness reports.
+# mirrors the builder conditions above: a blank value is never forwarded, a
+# value for a disabled lane is never reached by any command, and neither is a
+# value for a lane that never iterates. Effective values are only ever written
+# by the harness reports.
 write_ibd_timeout_evidence() {
   ibd_timeout_evidence_lines replay_timeout "$REPLAY_TIMEOUT" "$ENABLE_REPLAY_LANES"
   ibd_timeout_evidence_lines network_headers_timeout "$NETWORK_HEADERS_TIMEOUT" "$ENABLE_NETWORK_IBD"
@@ -115,6 +123,9 @@ ibd_timeout_evidence_lines() {
   elif [ "$lane_enabled" != "true" ]; then
     forwarded=false
     reason=lane-disabled
+  elif ! ibd_perf_lane_runs; then
+    forwarded=false
+    reason=no-runs
   else
     forwarded=true
     reason=forwarded

@@ -61,6 +61,7 @@ BELOW_ONE = ["0", "-5"]
 MALFORMED = ["abc", "12x", "1e3", "0x10"]
 # Python int() strips surrounding whitespace, so the harness accepts this one.
 WHITESPACE_ACCEPTED = {" 12": 12}
+LANE_TOGGLE = {"replay": "ENABLE_REPLAY_LANES", "network": "ENABLE_NETWORK_IBD"}
 WORKFLOW_SEQUENCE = "preflight_ibd_timeouts; run_ibd_lanes"
 
 RECORD_SEPARATOR = "\x1e"
@@ -388,7 +389,7 @@ class IBDTimeoutWiringTest(unittest.TestCase):
         # preflight with exit 2 before any lane, even when its lane is disabled.
         # argparse rejects the value before setup(), so this needs no build.
         for name, (flag, _attribute, _default, lane) in TIMEOUTS.items():
-            disabled = "ENABLE_REPLAY_LANES" if lane == "replay" else "ENABLE_NETWORK_IBD"
+            disabled = LANE_TOGGLE[lane]
             run = self.run_helper(
                 WORKFLOW_SEQUENCE,
                 {name: "abc", disabled: "false"},
@@ -445,11 +446,24 @@ class IBDTimeoutWiringTest(unittest.TestCase):
         self.assertEqual(summary["replay"], [])
         self.assertEqual(summary["network"], [])
 
+        # Both lanes enabled but the resolved runs-per-lane never iterates: no
+        # command is built, so no request may be reported as forwarded either.
+        run = self.run_helper(evidence, {**self.all_set(), "RUNS_PER_LANE": "0"})
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(self.lane_argvs(run, "replay"), [], "no lane iterates")
+        self.assertEqual(self.lane_argvs(run, "network"), [], "no lane iterates")
+        host_env = self.host_env(run)
+        for name, (_flag, key, _default, _lane) in TIMEOUTS.items():
+            self.assertEqual(host_env[key], NONDEFAULT[name], "the request is still recorded")
+            self.assertEqual(host_env[f"{key}_forwarded"], "false", key)
+            self.assertEqual(host_env[f"{key}_forwarded_reason"], "no-runs", key)
+
         # The markers mirror what the command builder actually appended.
         for overrides, expected_forwarded in (
             (self.all_set(), True),
             ({}, False),
             ({**self.all_set(), "ENABLE_NETWORK_IBD": "false"}, None),
+            ({**self.all_set(), "RUNS_PER_LANE": "0"}, False),
         ):
             run = self.run_helper(evidence, overrides)
             self.assertEqual(run.returncode, 0, run.stderr)
@@ -466,8 +480,10 @@ class IBDTimeoutWiringTest(unittest.TestCase):
                 reason = host_env[f"{key}_forwarded_reason"]
                 if not overrides.get(name, ""):
                     self.assertEqual(reason, "blank")
-                elif not lanes:
+                elif overrides.get(LANE_TOGGLE[lane], "true") != "true":
                     self.assertEqual(reason, "lane-disabled")
+                elif not lanes:
+                    self.assertEqual(reason, "no-runs")
                 else:
                     self.assertEqual(reason, "forwarded")
 
@@ -640,7 +656,7 @@ class IBDTimeoutWiringTest(unittest.TestCase):
 
         for name, (flag, _attribute, _default, lane) in TIMEOUTS.items():
             for value in BELOW_ONE:
-                disabled = "ENABLE_REPLAY_LANES" if lane == "replay" else "ENABLE_NETWORK_IBD"
+                disabled = LANE_TOGGLE[lane]
                 run = self.run_helper(preflight, {name: value, disabled: "false"}, real_python=True)
                 self.assertEqual(run.returncode, 1, f"{name}={value}\n{run.stdout}\n{run.stderr}")
                 self.assertIn(f"{flag} must be at least 1", run.stdout)
