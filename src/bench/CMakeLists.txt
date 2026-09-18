@@ -18,6 +18,7 @@ add_executable(bench_bitcoin
   chacha20.cpp
   checkblock.cpp
   checkblockindex.cpp
+  checkinputs_p2mr_pqc.cpp
   checkqueue.cpp
   cluster_linearize.cpp
   connectblock.cpp
