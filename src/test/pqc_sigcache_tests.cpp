@@ -477,6 +477,39 @@ BOOST_AUTO_TEST_CASE(failures_never_populate)
     BOOST_CHECK_EQUAL(rejected, 4U);
 }
 
+BOOST_AUTO_TEST_CASE(warm_hits_skip_primitive_verification)
+{
+    // Cache events alone cannot show that a hit skips the backend: a checker
+    // that verified again on a hit and discarded the result would log the same
+    // events. Count actual backend calls for cold, warm store and warm consume
+    // checks of every accepted corpus spend.
+    size_t accepted{0};
+    for (const WitnessVector& vector : LoadWitnessVectors()) {
+        if (vector.expected_error != SCRIPT_ERR_OK) continue;
+        ++accepted;
+        const ScriptOutcome success{true, SCRIPT_ERR_OK};
+        InputUnderTest spend{vector.spend_tx, vector.spent_outputs, vector.input_index};
+        ObservedCache observed{1 << 20};
+
+        size_t checks{0};
+        {
+            ScopedPQCVerificationCounter verifications;
+            BOOST_CHECK_MESSAGE(spend.VerifyCaching(observed.cache, /*store=*/true, P2MR_SCRIPT_VERIFY_FLAGS) == success, vector.name);
+            checks = observed.TakeEvents().size() / 2;
+            BOOST_CHECK_MESSAGE(checks >= 1, vector.name);
+            BOOST_CHECK_MESSAGE(verifications.GetCount() == checks, vector.name << " cold backend calls " << verifications.GetCount());
+        }
+        for (const bool store : {true, false}) {
+            const std::string label{vector.name + (store ? " warm store" : " warm consume")};
+            ScopedPQCVerificationCounter verifications;
+            BOOST_CHECK_MESSAGE(spend.VerifyCaching(observed.cache, store, P2MR_SCRIPT_VERIFY_FLAGS) == success, label);
+            observed.CheckEvents(Repeat({Hit(/*erase=*/!store)}, checks), label);
+            BOOST_CHECK_MESSAGE(verifications.GetCount() == 0U, label << " backend calls " << verifications.GetCount());
+        }
+    }
+    BOOST_CHECK_EQUAL(accepted, 10U);
+}
+
 BOOST_AUTO_TEST_CASE(warm_cache_preserves_p2mr_errors_and_weight)
 {
     std::array<CPQCKey, 5> keys;
