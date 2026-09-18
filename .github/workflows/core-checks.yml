@@ -153,6 +153,9 @@ jobs:
       - name: Test integrated libbitcoinpqc build policy
         run: python3 ci/checks/test_libbitcoinpqc_build_policy.py
 
+      - name: Test IBD timeout wiring
+        run: python3 ci/checks/test_ibd_timeout_wiring.py
+
       - name: Configure build
         run: |
           cmake -B build -G Ninja \
