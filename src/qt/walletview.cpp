@@ -115,6 +115,7 @@ WalletView::~WalletView() = default;
 
 void WalletView::prepareForShutdown()
 {
+    walletModel->prepareForShutdown();
     sendCoinsPage->prepareForShutdown();
 }
 
