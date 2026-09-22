@@ -18,6 +18,7 @@ attached to a branch ruleset cannot be proven here.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -38,6 +39,11 @@ CLASSIFY_JOB = "classify-changes"
 GATE_JOB = "required-merge-gate"
 INJECTED_FAILURE = "injected classifier contract failure"
 SUBPROCESS_TIMEOUT_SECONDS = 120
+
+# Check names the gate's profiles poll for.  The simulated API answers for all
+# of them so the stub does not have to know which profile is under test;
+# ci/checks/test_merge_gate_poller.py owns the polling behaviour itself.
+POLLED_CHECK_NAMES = ("Core Checks Gate", "Full Validation Gate", "rpc-docs", "public-docs-lint")
 
 # ``unittest -v`` reports ``<method> (<class>[.<method>]) ... <result>``
 # depending on the Python version.  Stderr written while a test runs pushes
@@ -293,7 +299,18 @@ class ClassifierCiContractTest(unittest.TestCase):
         if conclusion is None:
             body = 'echo "gh must not be called: $*" >&2\nexit 99\n'
         else:
-            body = f'printf "completed\\t{conclusion}\\n"\n'
+            page = directory / "check-runs.json"
+            runs = [
+                {
+                    "name": name,
+                    "status": "completed",
+                    "conclusion": conclusion,
+                    "started_at": "2026-01-01T00:00:00Z",
+                }
+                for name in POLLED_CHECK_NAMES
+            ]
+            page.write_text(json.dumps({"total_count": len(runs), "check_runs": runs}), encoding="utf8")
+            body = f'cat "{page}"\n'
         gh.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{calls}"\n{body}', encoding="utf8")
         gh.chmod(0o755)
         return calls

@@ -871,6 +871,7 @@ struct ParallelPQCInputPlan {
     SignatureData sigdata;
     P2MRScriptSigningPlan script_plan;
     std::vector<size_t> job_indices;
+    bool foreign_to_provider{false};
 };
 
 static unsigned int GetParallelPQCSigningWorkerCount(size_t jobs)
@@ -925,6 +926,27 @@ static std::optional<bool> TrySignTransactionPQCParallel(
     std::vector<ParallelPQCSigningJob> jobs;
     std::map<CPQCPubKey, uint32_t> counts;
 
+    // An input is foreign when this provider cannot sign any key in any leaf it
+    // knows for it. Serial signing would neither sign it nor reserve a counter,
+    // so skipping it keeps this provider's batch local without changing results.
+    const auto is_foreign_to_provider = [&](const SignatureData& sigdata) {
+        if (!sigdata.invalid_p2mr_sigs.empty()) return false;
+        for (const auto& [leaf, _] : sigdata.p2mr_spenddata.scripts) {
+            std::vector<CPQCPubKey> pubkeys;
+            int threshold{0};
+            if (!ParseP2MRScript(leaf.first, pubkeys, threshold)) return false;
+            for (const CPQCPubKey& pubkey : pubkeys) {
+                if (provider.CanSignPQC(pubkey)) return false;
+            }
+        }
+        return true;
+    };
+    const auto report_foreign_input = [&](const CTransaction& tx, unsigned int i, const ParallelPQCInputPlan& input_plan) {
+        ScriptError serror = SCRIPT_ERR_OK;
+        VerifyScript(tx.vin[i].scriptSig, input_plan.prev_pub_key, &tx.vin[i].scriptWitness, STANDARD_SCRIPT_VERIFY_FLAGS, TransactionSignatureChecker(&tx, i, input_plan.amount, txdata, MissingDataBehavior::FAIL), &serror);
+        input_errors[i] = Untranslated(ScriptErrorString(serror));
+    };
+
     for (unsigned int i = 0; i < mtx.vin.size(); ++i) {
         if (fHashSingle && i >= mtx.vout.size()) return std::nullopt;
 
@@ -949,7 +971,18 @@ static std::optional<bool> TrySignTransactionPQCParallel(
         }
 
         auto script_plan = SelectCompleteP2MRSigningPlan(provider, creator, output, input_plan.sigdata);
-        if (!script_plan.has_value()) return std::nullopt;
+        if (!script_plan.has_value()) {
+            if (!is_foreign_to_provider(input_plan.sigdata)) return std::nullopt;
+            // DataFromTransaction verifies without spent outputs, and the
+            // planner only understands pk()/multi_a leaves. A foreign witness
+            // can still be complete; check it with the full sighash context.
+            const CTransaction tx{mtx};
+            input_plan.sigdata.complete = VerifyScript(tx.vin[i].scriptSig, txout.scriptPubKey, &tx.vin[i].scriptWitness,
+                STANDARD_SCRIPT_VERIFY_FLAGS, TransactionSignatureChecker(&tx, i, txout.nValue, txdata, MissingDataBehavior::FAIL));
+            input_plan.foreign_to_provider = !input_plan.sigdata.complete;
+            input_plans.push_back(std::move(input_plan));
+            continue;
+        }
         input_plan.script_plan = std::move(*script_plan);
 
         std::map<std::pair<CPQCPubKey, uint256>, size_t> queued_jobs;
@@ -996,6 +1029,25 @@ static std::optional<bool> TrySignTransactionPQCParallel(
     }
 
     if (jobs.empty()) {
+        const bool has_foreign_input{std::any_of(input_plans.begin(), input_plans.end(), [](const auto& input_plan) {
+            return input_plan.foreign_to_provider;
+        })};
+        const bool only_foreign_inputs_incomplete{std::all_of(input_plans.begin(), input_plans.end(), [](const auto& input_plan) {
+            return input_plan.sigdata.complete || input_plan.foreign_to_provider;
+        })};
+        if (has_foreign_input && only_foreign_inputs_incomplete) {
+            // Nothing here is this provider's to sign. The serial path would
+            // re-sign complete P2MR inputs and reserve fresh counters for them.
+            const CTransaction txConst{mtx};
+            for (unsigned int i = 0; i < input_plans.size(); ++i) {
+                if (input_plans[i].foreign_to_provider) {
+                    report_foreign_input(txConst, i, input_plans[i]);
+                } else {
+                    input_errors.erase(i);
+                }
+            }
+            return false;
+        }
         const bool all_inputs_complete{std::all_of(input_plans.begin(), input_plans.end(), [](const auto& input_plan) {
             return input_plan.sigdata.complete;
         })};
@@ -1067,7 +1119,9 @@ static std::optional<bool> TrySignTransactionPQCParallel(
     std::vector<std::atomic<unsigned int>> remaining_jobs_by_input(input_plans.size());
     for (size_t i = 0; i < input_plans.size(); ++i) {
         remaining_jobs_by_input[i].store(static_cast<unsigned int>(input_plans[i].job_indices.size()));
-        if (input_plans[i].job_indices.empty()) {
+        // Foreign inputs are not complete; counting them would make progress
+        // drop when the next provider in the same wallet operation starts.
+        if (input_plans[i].sigdata.complete) {
             ++completed_inputs;
         }
     }
@@ -1165,6 +1219,13 @@ static std::optional<bool> TrySignTransactionPQCParallel(
     unsigned int complete_inputs{0};
     for (unsigned int i = 0; i < input_plans.size(); ++i) {
         auto& input_plan{input_plans[i]};
+        if (input_plan.foreign_to_provider) {
+            // Leave another signer's input untouched; it keeps this call incomplete.
+            report_foreign_input(txConst, i, input_plan);
+            ++finalized_inputs;
+            NotifySigningProgressPhase(progress_callback, SigningProgressPhase::FINALIZING_TRANSACTION, finalized_inputs, static_cast<unsigned int>(mtx.vin.size()), i, /*cancellable=*/false);
+            continue;
+        }
         for (const size_t job_index : input_plan.job_indices) {
             const auto& job{jobs[job_index]};
             input_plan.sigdata.p2mr_script_sigs[std::make_pair(job.pubkey, job.leaf_hash)] = results[job_index].signature;

@@ -8,6 +8,8 @@
 #include <policy/policy.h>
 #include <primitives/transaction.h>
 #include <script/script.h>
+#include <test/util/txmempool.h>
+#include <util/rbf.h>
 #include <util/strencodings.h>
 #include <wallet/feebumper.h>
 #include <wallet/pqc_usage.h>
@@ -185,6 +187,11 @@ BOOST_AUTO_TEST_CASE(commit_revalidates_fee_after_signing)
     CMutableTransaction funding;
     funding.vout.emplace_back(10'000, CScript{} << OP_TRUE);
     BOOST_REQUIRE(m_wallet.AddToWallet(MakeTransactionRef(funding), TxStateInactive{}));
+    {
+        LOCK(cs_main);
+        m_node.chainman->ActiveChainstate().CoinsTip().AddCoin(
+            COutPoint{funding.GetHash(), 0}, Coin{funding.vout.front(), 1, false}, false);
+    }
 
     CMutableTransaction original;
     original.vin.emplace_back(COutPoint{funding.GetHash(), 0});
@@ -206,6 +213,11 @@ BOOST_AUTO_TEST_CASE(commit_revalidates_competing_wallet_spend)
     CMutableTransaction funding;
     funding.vout.emplace_back(10'000, CScript{} << OP_TRUE);
     BOOST_REQUIRE(m_wallet.AddToWallet(MakeTransactionRef(funding), TxStateInactive{}));
+    {
+        LOCK(cs_main);
+        m_node.chainman->ActiveChainstate().CoinsTip().AddCoin(
+            COutPoint{funding.GetHash(), 0}, Coin{funding.vout.front(), 1, false}, false);
+    }
 
     CMutableTransaction original;
     original.vin.emplace_back(COutPoint{funding.GetHash(), 0});
@@ -229,6 +241,116 @@ BOOST_AUTO_TEST_CASE(commit_revalidates_competing_wallet_spend)
     BOOST_CHECK(bumped_txid.IsNull());
 }
 
+BOOST_AUTO_TEST_CASE(commit_rejects_conflict_before_wallet_notification)
+{
+    m_wallet.SetBroadcastTransactions(false);
+    CMutableTransaction funding;
+    funding.vout.emplace_back(10'000, CScript{} << OP_TRUE);
+    BOOST_REQUIRE(m_wallet.AddToWallet(MakeTransactionRef(funding), TxStateInactive{}));
+    const COutPoint prevout{funding.GetHash(), 0};
+    {
+        LOCK(cs_main);
+        m_node.chainman->ActiveChainstate().CoinsTip().AddCoin(prevout, Coin{funding.vout.front(), 1, false}, false);
+    }
+    CMutableTransaction original;
+    original.vin.emplace_back(prevout);
+    original.vout.emplace_back(9'000, CScript{} << OP_TRUE);
+    BOOST_REQUIRE(m_wallet.AddToWallet(MakeTransactionRef(original), TxStateInactive{}));
+    CMutableTransaction replacement{original};
+    replacement.vout.front().nValue = 8'900;
+    const Txid replacement_id{replacement.GetHash()};
+    CMutableTransaction conflict{original};
+    conflict.vout.front().nValue = 8'800;
+    // Populate the real mempool without delivering a wallet notification.
+    AddToMempool(*m_node.mempool, TestMemPoolEntryHelper{}.Fee(1'200).FromTx(conflict));
+    {
+        LOCK(m_wallet.cs_wallet);
+        BOOST_REQUIRE(!m_wallet.mapWallet.contains(conflict.GetHash()));
+    }
+    std::vector<bilingual_str> errors;
+    Txid bumped_txid;
+    const Result commit_result{CommitTransaction(m_wallet, original.GetHash(), std::move(replacement), errors, bumped_txid)};
+    BOOST_CHECK(commit_result == Result::WALLET_ERROR);
+    BOOST_REQUIRE_EQUAL(errors.size(), 1U);
+    BOOST_CHECK(errors.front().original.find("is already spent by mempool transaction") != std::string::npos);
+    BOOST_CHECK(bumped_txid.IsNull());
+    {
+        LOCK(m_wallet.cs_wallet);
+        BOOST_CHECK(!m_wallet.mapWallet.contains(replacement_id));
+        BOOST_CHECK(!m_wallet.mapWallet.at(original.GetHash()).mapValue.contains("replaced_by_txid"));
+    }
+    {
+        LOCK(m_node.mempool->cs);
+        m_node.mempool->removeRecursive(CTransaction{conflict}, MemPoolRemovalReason::REPLACED);
+    }
+    // The original spender is expected during an RBF and must remain allowed.
+    AddToMempool(*m_node.mempool, TestMemPoolEntryHelper{}.Fee(1'000).FromTx(original));
+    errors.clear();
+    CMutableTransaction retry{original};
+    retry.vout.front().nValue = 8'900;
+    const Result retry_result{CommitTransaction(m_wallet, original.GetHash(), std::move(retry), errors, bumped_txid)};
+    BOOST_CHECK(retry_result == Result::OK);
+    BOOST_CHECK(errors.empty());
+    BOOST_CHECK(bumped_txid == replacement_id);
+}
+
+BOOST_AUTO_TEST_CASE(commit_rejects_spent_wallet_coin_before_notification)
+{
+    m_wallet.SetBroadcastTransactions(false);
+    CMutableTransaction funding;
+    funding.vout.emplace_back(10'000, CScript{} << OP_TRUE);
+    BOOST_REQUIRE(m_wallet.AddToWallet(MakeTransactionRef(funding), TxStateInactive{}));
+    // The parent remains in mapWallet, but its output is absent from the live
+    // UTXO set, as after a block spend whose wallet notification is pending.
+    CMutableTransaction original;
+    original.vin.emplace_back(COutPoint{funding.GetHash(), 0});
+    original.vout.emplace_back(9'000, CScript{} << OP_TRUE);
+    BOOST_REQUIRE(m_wallet.AddToWallet(MakeTransactionRef(original), TxStateInactive{}));
+    CMutableTransaction replacement{original};
+    replacement.vout.front().nValue = 8'900;
+    std::vector<bilingual_str> errors;
+    Txid bumped_txid;
+    const Result commit_result{CommitTransaction(m_wallet, original.GetHash(), std::move(replacement), errors, bumped_txid)};
+    BOOST_CHECK(commit_result == Result::WALLET_ERROR);
+    BOOST_REQUIRE_EQUAL(errors.size(), 1U);
+    BOOST_CHECK(errors.front().original.find("is no longer available") != std::string::npos);
+    BOOST_CHECK(bumped_txid.IsNull());
+}
+
+BOOST_AUTO_TEST_CASE(commit_rejects_non_final_replacement_after_reorg)
+{
+    m_wallet.SetBroadcastTransactions(false);
+    CMutableTransaction funding;
+    funding.vout.emplace_back(10'000, CScript{} << OP_TRUE);
+    BOOST_REQUIRE(m_wallet.AddToWallet(MakeTransactionRef(funding), TxStateInactive{}));
+    const COutPoint prevout{funding.GetHash(), 0};
+    {
+        LOCK(cs_main);
+        m_node.chainman->ActiveChainstate().CoinsTip().AddCoin(prevout, Coin{funding.vout.front(), 1, false}, false);
+    }
+    CMutableTransaction original;
+    original.vin.emplace_back(prevout);
+    original.vout.emplace_back(9'000, CScript{} << OP_TRUE);
+    BOOST_REQUIRE(m_wallet.AddToWallet(MakeTransactionRef(original), TxStateInactive{}));
+    // A backward reorg during signing leaves the replacement's anti-fee-sniping
+    // height ahead of the tip. The RBF sequence keeps that lock enforced.
+    CMutableTransaction replacement{original};
+    replacement.vout.front().nValue = 8'900;
+    replacement.vin.front().nSequence = MAX_BIP125_RBF_SEQUENCE;
+    replacement.nLockTime = static_cast<uint32_t>(WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Height())) + 10;
+    std::vector<bilingual_str> errors;
+    Txid bumped_txid;
+    const Result commit_result{CommitTransaction(m_wallet, original.GetHash(), std::move(replacement), errors, bumped_txid)};
+    BOOST_CHECK(commit_result == Result::WALLET_ERROR);
+    BOOST_REQUIRE_EQUAL(errors.size(), 1U);
+    BOOST_CHECK(errors.front().original.find("no longer final") != std::string::npos);
+    BOOST_CHECK(bumped_txid.IsNull());
+    {
+        LOCK(m_wallet.cs_wallet);
+        BOOST_CHECK(!m_wallet.mapWallet.at(original.GetHash()).mapValue.contains("replaced_by_txid"));
+    }
+}
+
 BOOST_AUTO_TEST_CASE(commit_revalidates_external_inputs_from_chain)
 {
     m_wallet.SetBroadcastTransactions(false);
@@ -236,6 +358,11 @@ BOOST_AUTO_TEST_CASE(commit_revalidates_external_inputs_from_chain)
     CMutableTransaction wallet_funding;
     wallet_funding.vout.emplace_back(10'000, CScript{} << OP_TRUE);
     BOOST_REQUIRE(m_wallet.AddToWallet(MakeTransactionRef(wallet_funding), TxStateInactive{}));
+    {
+        LOCK(cs_main);
+        m_node.chainman->ActiveChainstate().CoinsTip().AddCoin(
+            COutPoint{wallet_funding.GetHash(), 0}, Coin{wallet_funding.vout.front(), 1, false}, false);
+    }
 
     CMutableTransaction external_funding;
     external_funding.vout.emplace_back(5'000, CScript{} << OP_TRUE);
@@ -272,6 +399,11 @@ BOOST_AUTO_TEST_CASE(commit_allows_replacing_replacement_chain)
     CMutableTransaction funding;
     funding.vout.emplace_back(10'000, CScript{} << OP_TRUE);
     BOOST_REQUIRE(m_wallet.AddToWallet(MakeTransactionRef(funding), TxStateInactive{}));
+    {
+        LOCK(cs_main);
+        m_node.chainman->ActiveChainstate().CoinsTip().AddCoin(
+            COutPoint{funding.GetHash(), 0}, Coin{funding.vout.front(), 1, false}, false);
+    }
 
     CMutableTransaction original;
     original.vin.emplace_back(COutPoint{funding.GetHash(), 0});
@@ -321,6 +453,11 @@ BOOST_AUTO_TEST_CASE(commit_allows_replacement_with_missing_forward_lineage)
     CMutableTransaction funding;
     funding.vout.emplace_back(10'000, CScript{} << OP_TRUE);
     BOOST_REQUIRE(m_wallet.AddToWallet(MakeTransactionRef(funding), TxStateInactive{}));
+    {
+        LOCK(cs_main);
+        m_node.chainman->ActiveChainstate().CoinsTip().AddCoin(
+            COutPoint{funding.GetHash(), 0}, Coin{funding.vout.front(), 1, false}, false);
+    }
 
     CMutableTransaction original;
     original.vin.emplace_back(COutPoint{funding.GetHash(), 0});

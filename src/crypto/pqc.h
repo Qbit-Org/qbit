@@ -139,6 +139,30 @@ public:
     }
 };
 
+/** Test-only observation of actual signer calls, never private key material.
+ * Callbacks may run concurrently on signing threads and must not throw.
+ */
+class PQCSigningObserver
+{
+public:
+    virtual ~PQCSigningObserver() = default;
+    virtual uint64_t BeforeSign(const CPQCPubKey& pubkey, uint32_t counter) = 0;
+    virtual void AfterSign(uint64_t call, bool success) = 0;
+};
+
+/** Installs the process-wide test observer; production never installs one.
+ * Installation must not overlap another observer or any Sign call. The caller
+ * must join all signing threads before destruction and keep the observer alive.
+ */
+class ScopedPQCSigningObserver
+{
+public:
+    explicit ScopedPQCSigningObserver(PQCSigningObserver& observer);
+    ~ScopedPQCSigningObserver();
+    ScopedPQCSigningObserver(const ScopedPQCSigningObserver&) = delete;
+    ScopedPQCSigningObserver& operator=(const ScopedPQCSigningObserver&) = delete;
+};
+
 class CPQCKey
 {
 public:

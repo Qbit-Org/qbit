@@ -2623,13 +2623,26 @@ bool CWallet::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint,
             status);
     };
 
+    // A cancellation applies to the whole wallet operation. Once the caller
+    // declines, every later callback in this operation declines too, so the
+    // remaining ScriptPubKeyMans stop before their counter reservation boundary.
+    // Counters an earlier ScriptPubKeyMan already committed stay consumed.
+    std::atomic_bool signing_cancelled{false};
+    SigningProgressCallback operation_progress_callback;
+    if (progress_callback) {
+        operation_progress_callback = [&](const SigningProgress& progress) {
+            if (!progress_callback(progress)) signing_cancelled.store(true);
+            return !signing_cancelled.load();
+        };
+    }
+
     // Try to sign with all ScriptPubKeyMans
     for (const auto& provider : providers) {
         // SignTransaction will return true if the transaction is complete,
         // so we can exit early and return true if that happens
         ++provider_attempts;
         const auto provider_sign_start{SteadyClock::now()};
-        const bool provider_success{::SignTransaction(tx, provider.get(), coins, sighash, input_errors, progress_callback)};
+        const bool provider_success{::SignTransaction(tx, provider.get(), coins, sighash, input_errors, operation_progress_callback)};
         provider_sign_time += SteadyClock::now() - provider_sign_start;
         if (util::signing_timing::TraceEnabled()) {
             LogTrace(BCLog::BENCH,
@@ -2644,6 +2657,19 @@ bool CWallet::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint,
             log_wallet_sign_timing(/*success=*/true, "provider_complete");
             return true;
         }
+        if (signing_cancelled.load()) break;
+    }
+
+    if (signing_cancelled.load()) {
+        // Skip the dummy pass so the cancellation stays visible to the caller.
+        const bool cancel_reported{std::any_of(input_errors.begin(), input_errors.end(), [](const auto& entry) {
+            return entry.second.original == _("Signing cancelled").original;
+        })};
+        if (!cancel_reported && !tx.vin.empty()) {
+            input_errors[input_errors.empty() ? 0 : input_errors.begin()->first] = _("Signing cancelled");
+        }
+        log_wallet_sign_timing(/*success=*/false, "cancelled");
+        return false;
     }
 
     const auto dummy_sign_start{SteadyClock::now()};

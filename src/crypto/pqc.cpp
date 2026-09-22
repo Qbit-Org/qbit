@@ -12,6 +12,7 @@
 #include <support/cleanse.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -20,10 +21,25 @@
 
 namespace {
 
+std::atomic<PQCSigningObserver*> g_signing_observer{nullptr};
+
 constexpr size_t MAX_RAND_CHUNK_SIZE = 32;
 constexpr std::string_view PQC_HKDF_INFO_PREFIX{"qbit/sphincs+/1"};
 constexpr char PQC_HKDF_SALT[] = "qbit-sphincs-v1";
 } // namespace
+
+ScopedPQCSigningObserver::ScopedPQCSigningObserver(PQCSigningObserver& observer)
+{
+    PQCSigningObserver* expected{nullptr};
+    if (!g_signing_observer.compare_exchange_strong(expected, &observer)) {
+        throw std::logic_error("A PQC signing observer is already installed");
+    }
+}
+
+ScopedPQCSigningObserver::~ScopedPQCSigningObserver()
+{
+    g_signing_observer.store(nullptr);
+}
 
 CPQCKey& CPQCKey::operator=(const CPQCKey& other)
 {
@@ -107,19 +123,25 @@ void CPQCKey::Set(const unsigned char* begin, const unsigned char* end)
 
 bool CPQCKey::Sign(const uint256& hash, std::vector<unsigned char>& sig, uint32_t& counter_inout) const
 {
-    if (!IsValid() || counter_inout >= PQC_MAX_SIGNATURES) return false;
+    PQCSigningObserver* const observer{g_signing_observer.load()};
+    const uint64_t call{observer ? observer->BeforeSign(GetPubKey(), counter_inout) : 0};
+    const auto finish = [&](bool success) {
+        if (observer) observer->AfterSign(call, success);
+        return success;
+    };
+    if (!IsValid() || counter_inout >= PQC_MAX_SIGNATURES) return finish(false);
 
     std::vector<unsigned char> candidate_sig(PQC_SIG_SIZE);
     size_t siglen = candidate_sig.size();
     if (slh_dsa_sign(candidate_sig.data(), &siglen, hash.begin(), hash.size(), m_keydata->data()) != 0 ||
         siglen != PQC_SIG_SIZE) {
         memory_cleanse(candidate_sig.data(), candidate_sig.size());
-        return false;
+        return finish(false);
     }
 
     sig = std::move(candidate_sig);
     ++counter_inout;
-    return true;
+    return finish(true);
 }
 
 CPQCPubKey CPQCKey::GetPubKey() const
