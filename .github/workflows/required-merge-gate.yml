@@ -128,6 +128,13 @@ jobs:
       - name: Test classifier workflow contract
         run: /usr/bin/python3 ci/checks/test_classifier_ci_contract.py -v
 
+      # The gate's waiting loop is what turns other checks into this required
+      # check. Run its contract here, in a job the gate depends on, so a
+      # regression that would let the gate pass on an unread or failed check
+      # fails classification instead.
+      - name: Test merge gate polling contract
+        run: /usr/bin/python3 ci/checks/test_merge_gate_poller.py -v
+
       - name: Classify validation profile
         id: classify
         run: |
@@ -718,57 +725,207 @@ jobs:
             exit 1
           fi
 
+          # Waiting tunables. The defaults are the production values; the
+          # contract test overrides them so the real loop runs in seconds.
+          #
+          # GATE_WAIT_TIMEOUT_SECONDS must stay below this job's
+          # timeout-minutes (360, the GitHub-hosted maximum, which cannot be
+          # raised) so the loop reports which checks were still pending
+          # instead of being cancelled by the runner with no verdict. The
+          # deadline below is wall-clock, so time spent inside the API calls
+          # counts against it and not only the sleeps.
+          GATE_WAIT_TIMEOUT_SECONDS="${GATE_WAIT_TIMEOUT_SECONDS:-19800}"
+          GATE_POLL_INTERVAL_SECONDS="${GATE_POLL_INTERVAL_SECONDS:-30}"
+          GATE_QUERY_MAX_ATTEMPTS="${GATE_QUERY_MAX_ATTEMPTS:-6}"
+          GATE_QUERY_BACKOFF_SECONDS="${GATE_QUERY_BACKOFF_SECONDS:-10}"
+          GATE_QUERY_BACKOFF_CAP_SECONDS="${GATE_QUERY_BACKOFF_CAP_SECONDS:-60}"
+          GATE_QUERY_TIMEOUT_SECONDS="${GATE_QUERY_TIMEOUT_SECONDS:-60}"
+
+          for gate_tunable in \
+            GATE_WAIT_TIMEOUT_SECONDS \
+            GATE_POLL_INTERVAL_SECONDS \
+            GATE_QUERY_MAX_ATTEMPTS \
+            GATE_QUERY_BACKOFF_SECONDS \
+            GATE_QUERY_BACKOFF_CAP_SECONDS \
+            GATE_QUERY_TIMEOUT_SECONDS
+          do
+            if [[ ! "${!gate_tunable}" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error title=Required Merge Gate failed::${gate_tunable} must be a positive integer, got '${!gate_tunable}'."
+              exit 1
+            fi
+          done
+
+          # Selection contract, applied to the slurped pages of
+          # /commits/{sha}/check-runs:
+          #
+          # * a page without a check_runs array is malformed and must never be
+          #   mistaken for "this commit has no check runs";
+          # * a re-run check appears more than once, so the newest run by
+          #   started_at (created_at while a run has not started) wins;
+          # * "absent" means the query succeeded and reported no run with that
+          #   name, which is a different fact from a query that could not be
+          #   read at all.
+          # $name is a jq variable bound by --arg below, not a shell expansion.
+          # shellcheck disable=SC2016
+          check_run_filter='
+            if type != "array" or length == 0 then error("empty check-runs response") else . end
+            | map(if (.check_runs | type) == "array" then .check_runs else error("malformed check-runs page") end)
+            | add
+            | map(select(.name == $name))
+            | sort_by(.started_at // .created_at // "")
+            | last
+            | if . == null then "absent" else ["found", (.status // ""), (.conclusion // "")] | @tsv end
+          '
+
+          summarize_stderr() {
+            tr '\n' ' ' < "$1" | cut -c1-300
+          }
+
+          # Read the newest check run named $1 on ${SHA}.
+          #
+          # On success sets QUERY_OBSERVATION to "absent" or to
+          # "found<TAB>status<TAB>conclusion" and returns 0. Returns 1 when the
+          # query could not be read within GATE_QUERY_MAX_ATTEMPTS attempts or
+          # before $2, the wall-clock deadline shared with the caller: an
+          # unreadable query is never success and never "not found yet".
+          #
+          # The result travels in a variable rather than on stdout because this
+          # function also logs there, and errexit is not in force for a function
+          # called from a condition, so every failure is handled explicitly.
+          query_check_run() {
+            local check_name="$1"
+            local deadline="$2"
+            local attempt=1
+            local backoff="${GATE_QUERY_BACKOFF_SECONDS}"
+            local body fields observation reason status stderr_path now rc
+
+            QUERY_OBSERVATION=""
+
+            while (( attempt <= GATE_QUERY_MAX_ATTEMPTS )); do
+              stderr_path="$(mktemp)"
+              rc=0
+              body="$(
+                timeout "${GATE_QUERY_TIMEOUT_SECONDS}" gh api \
+                  -H "Accept: application/vnd.github+json" \
+                  --paginate \
+                  "/repos/${REPOSITORY}/commits/${SHA}/check-runs?per_page=100" \
+                  2>"${stderr_path}"
+              )" || rc=$?
+
+              if (( rc != 0 )); then
+                reason="check-runs query failed (exit ${rc}): $(summarize_stderr "${stderr_path}")"
+              else
+                rc=0
+                observation="$(
+                  printf '%s' "${body}" \
+                    | jq -e -r -s --arg name "${check_name}" "${check_run_filter}" 2>"${stderr_path}"
+                )" || rc=$?
+
+                if (( rc != 0 )); then
+                  reason="check-runs response could not be read (jq exit ${rc}): $(summarize_stderr "${stderr_path}")"
+                else
+                  case "${observation}" in
+                    absent)
+                      rm -f "${stderr_path}"
+                      QUERY_OBSERVATION="${observation}"
+                      return 0
+                      ;;
+                    found$'\t'*)
+                      fields="${observation#found$'\t'}"
+                      status="${fields%%$'\t'*}"
+                      if [[ "${status}" =~ ^[a-z_]+$ ]]; then
+                        rm -f "${stderr_path}"
+                        QUERY_OBSERVATION="${observation}"
+                        return 0
+                      fi
+                      ;;
+                  esac
+                  reason="check-runs response was malformed: ${observation}"
+                fi
+              fi
+
+              rm -f "${stderr_path}"
+              echo "::warning title=Required Merge Gate retrying::${check_name}: ${reason} (attempt ${attempt}/${GATE_QUERY_MAX_ATTEMPTS})"
+
+              attempt=$((attempt + 1))
+              if (( attempt > GATE_QUERY_MAX_ATTEMPTS )); then
+                break
+              fi
+
+              now="$(date +%s)"
+              if (( now + backoff > deadline )); then
+                echo "${check_name}: wait deadline reached while the check-runs query was unreadable"
+                break
+              fi
+
+              sleep "${backoff}"
+              backoff=$((backoff * 2))
+              if (( backoff > GATE_QUERY_BACKOFF_CAP_SECONDS )); then
+                backoff="${GATE_QUERY_BACKOFF_CAP_SECONDS}"
+              fi
+            done
+
+            return 1
+          }
+
+          # Wait until every named check on ${SHA} has concluded successfully.
+          #
+          # Returns 1 under three distinct error titles: a check concluded
+          # something other than success, the check runs could not be read, or
+          # the shared deadline passed with checks still pending. Only a
+          # completed check with a success conclusion is success.
           wait_for_checks() {
             local check_names=("$@")
-            local attempts=0
-            local max_attempts=720
-            local sleep_seconds=30
-            local pending_count
-            local check_name
-            local result
-            local status
-            local conclusion
+            local pending=()
+            local check_name conclusion fields now observation status deadline
 
-            while (( attempts < max_attempts )); do
-              pending_count=0
+            now="$(date +%s)"
+            deadline=$(( now + GATE_WAIT_TIMEOUT_SECONDS ))
+
+            while :; do
+              pending=()
 
               for check_name in "${check_names[@]}"; do
-                result="$(
-                  gh api \
-                    -H "Accept: application/vnd.github+json" \
-                    "/repos/${REPOSITORY}/commits/${SHA}/check-runs?per_page=100" \
-                    --jq ".check_runs | map(select(.name == \"${check_name}\")) | sort_by(.started_at // .created_at // \"\") | last // empty | [.status, (.conclusion // \"\")] | @tsv"
-                )"
+                if ! query_check_run "${check_name}" "${deadline}"; then
+                  echo "::error title=Required Merge Gate could not read check runs::Check runs for ${check_name} on ${SHA} could not be read after ${GATE_QUERY_MAX_ATTEMPTS} attempts; failing closed with no verdict for: ${check_names[*]}"
+                  return 1
+                fi
+                observation="${QUERY_OBSERVATION}"
 
-                if [[ -z "${result}" ]]; then
-                  echo "${check_name}: not found yet"
-                  pending_count=$((pending_count + 1))
+                if [[ "${observation}" == "absent" ]]; then
+                  echo "${check_name}: query succeeded, no such check run on ${SHA} yet"
+                  pending+=("${check_name}")
                   continue
                 fi
 
-                IFS=$'\t' read -r status conclusion <<< "${result}"
+                fields="${observation#found$'\t'}"
+                status="${fields%%$'\t'*}"
+                conclusion="${fields#*$'\t'}"
                 echo "${check_name}: status=${status} conclusion=${conclusion:-pending}"
+
                 if [[ "${status}" == "completed" ]]; then
                   if [[ "${conclusion}" != "success" ]]; then
-                    echo "::error title=Required Merge Gate failed::${check_name} concluded ${conclusion}."
+                    echo "::error title=Required Merge Gate failed::${check_name} concluded ${conclusion:-unknown}."
                     return 1
                   fi
                   continue
                 fi
 
-                pending_count=$((pending_count + 1))
+                pending+=("${check_name}")
               done
 
-              if (( pending_count == 0 )); then
+              if (( ${#pending[@]} == 0 )); then
                 return 0
               fi
 
-              attempts=$((attempts + 1))
-              sleep "${sleep_seconds}"
-            done
+              now="$(date +%s)"
+              if (( now + GATE_POLL_INTERVAL_SECONDS > deadline )); then
+                echo "::error title=Required Merge Gate timed out::Required checks did not complete within ${GATE_WAIT_TIMEOUT_SECONDS}s and are still pending: ${pending[*]}"
+                return 1
+              fi
 
-            echo "::error title=Required Merge Gate timed out::Required checks did not complete in time: ${check_names[*]}"
-            return 1
+              sleep "${GATE_POLL_INTERVAL_SECONDS}"
+            done
           }
 
           case "${VALIDATION_PROFILE}" in

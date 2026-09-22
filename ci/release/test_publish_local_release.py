@@ -210,6 +210,25 @@ if args and args[0] == "api":
             )
     elif "/releases/1/assets" in endpoint:
         assets = state / "assets.tsv"
+        list_result = sequence_value(
+            "FAKE_GH_ASSET_LIST_SEQUENCE", "ok", next_counter("asset-list-count")
+        )
+        with log.open("a", encoding="utf8") as output:
+            output.write("# asset-list-result " + list_result + "\n")
+        if list_result == "partial":
+            # gh --paginate emits the pages it fetched before a later page fails.
+            asset_lines = (
+                assets.read_text(encoding="utf8").splitlines()
+                if assets.exists()
+                else []
+            )
+            for line in asset_lines[:1]:
+                print(line)
+            print("simulated asset list failure: HTTP 502 on page 2", file=sys.stderr)
+            raise SystemExit(1)
+        if list_result == "fail":
+            print("simulated asset list failure: HTTP 502", file=sys.stderr)
+            raise SystemExit(1)
         if assets.exists():
             asset_text = assets.read_text(encoding="utf8")
             release_state = state / "release-state"
@@ -463,6 +482,7 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         verification_reason_sequence: tuple[str, ...] | None = None,
         tag_object_during_immutable_poll: str | None = None,
         mutate_notes_file: Path | None = None,
+        asset_list_sequence: tuple[str, ...] = ("ok",),
     ) -> subprocess.CompletedProcess[str]:
         env = dict(os.environ)
         env["PATH"] = f"{self.bin_dir}{os.pathsep}{env['PATH']}"
@@ -500,6 +520,7 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
                 "FAKE_GH_CAN_PUSH": str(can_push).lower(),
                 "FAKE_VALIDATOR_LOG": str(self.validator_log),
                 "FAKE_MUTATE_NOTES_FILE": str(mutate_notes_file or ""),
+                "FAKE_GH_ASSET_LIST_SEQUENCE": ",".join(asset_list_sequence),
             }
         )
         args = [
@@ -521,6 +542,37 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
             args.extend(["--testnet-posture-evidence", str(self.posture)])
         args.extend(extra_args)
         return subprocess.run(args, check=False, capture_output=True, text=True, env=env)
+
+    def assert_no_write_after_failed_asset_list(self) -> None:
+        """Fail if gh changed the release before a failed listing was superseded."""
+        listing_failed = False
+        for line in self.gh_log.read_text(encoding="utf8").splitlines():
+            if line.startswith("# asset-list-result "):
+                listing_failed = line.split()[-1] != "ok"
+                continue
+            is_write = line.startswith(
+                ("release create", "release upload", "release edit")
+            ) or "--method PATCH" in line
+            self.assertFalse(
+                listing_failed and is_write,
+                f"release write after a failed asset listing: {line}",
+            )
+
+    def asset_list_calls(self) -> int:
+        return self.gh_log.read_text(encoding="utf8").count("# asset-list-result ")
+
+    def write_remote_assets(self, *entries: tuple[Path, str | None]) -> None:
+        lines = []
+        for path, digest in entries:
+            if digest is None:
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            lines.append(f"{path.name}\tsha256:{digest}\n")
+        (self.gh_state / "assets.tsv").write_text("".join(lines), encoding="utf8")
+
+    def release_artifact(self) -> Path:
+        return next(
+            path for path in self.artifacts.iterdir() if path.name.startswith("qbit-")
+        )
 
     def test_validation_only_uses_pr84_source_binding_inputs(self) -> None:
         result = self.run_publisher()
@@ -1058,6 +1110,114 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         self.assertEqual(
             (self.gh_state / "immutable-view-count").read_text(encoding="utf8"), "5"
         )
+
+    def test_resume_aborts_when_asset_list_persistently_fails(self) -> None:
+        (self.gh_state / "release-state").write_text("draft\n", encoding="utf8")
+        self.write_remote_assets((self.release_artifact(), None))
+
+        result = self.run_publisher("--publish", asset_list_sequence=("fail",))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("simulated asset list failure", result.stderr)
+        self.assertIn("asset-list request for release", result.stderr)
+        self.assertIn("during draft resume verification", result.stderr)
+        self.assertNotIn("not a digest-matching subset", result.stderr)
+        self.assertNotIn("Found matching draft release", result.stdout)
+        self.assertEqual(self.asset_list_calls(), 5)
+        gh_log = self.gh_log.read_text(encoding="utf8")
+        self.assertNotIn("release upload", gh_log)
+        self.assertNotIn("release edit", gh_log)
+        self.assertNotIn("--method PATCH", gh_log)
+        self.assert_no_write_after_failed_asset_list()
+
+    def test_resume_retries_transient_asset_list_failure(self) -> None:
+        artifact = self.release_artifact()
+        (self.gh_state / "release-state").write_text("draft\n", encoding="utf8")
+        self.write_remote_assets((artifact, None))
+
+        result = self.run_publisher(
+            "--create-draft", asset_list_sequence=("fail", "fail", "ok")
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Found matching draft release", result.stdout)
+        self.assertIn(f"Keeping verified draft asset {artifact.name}", result.stdout)
+        uploads = [
+            line.split()[3]
+            for line in self.gh_log.read_text(encoding="utf8").splitlines()
+            if line.startswith("release upload ")
+        ]
+        self.assertEqual(
+            sorted(Path(upload).name for upload in uploads),
+            sorted(
+                path.name for path in self.artifacts.iterdir() if path != artifact
+            ),
+        )
+        self.assert_no_write_after_failed_asset_list()
+
+    def test_resume_does_not_compare_partial_paginated_asset_list(self) -> None:
+        artifact = self.release_artifact()
+        (self.gh_state / "release-state").write_text("draft\n", encoding="utf8")
+        # The first page matches; the unread second page holds a wrong digest.
+        self.write_remote_assets(
+            (artifact, None), (self.artifacts / "SHA256SUMS", "0" * 64)
+        )
+
+        result = self.run_publisher("--publish", asset_list_sequence=("partial",))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("HTTP 502 on page 2", result.stderr)
+        self.assertIn("asset-list request for release", result.stderr)
+        self.assertNotIn("Found matching draft release", result.stdout)
+        gh_log = self.gh_log.read_text(encoding="utf8")
+        self.assertNotIn("release upload", gh_log)
+        self.assertNotIn("release edit", gh_log)
+        self.assert_no_write_after_failed_asset_list()
+
+    def test_publish_final_verification_reports_persistent_asset_list_failure(self) -> None:
+        result = self.run_publisher(
+            "--publish", asset_list_sequence=("ok", "ok", "fail")
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("simulated asset list failure", result.stderr)
+        self.assertIn("during post-publication verification", result.stderr)
+        self.assertIn("already published", result.stderr)
+        self.assertNotIn("do not exactly match", result.stderr)
+        self.assertNotIn("Published immutable release assets exactly match", result.stdout)
+        self.assertEqual(
+            (self.gh_state / "release-state").read_text(encoding="utf8").strip(),
+            "published",
+        )
+        self.assertEqual(self.asset_list_calls(), 7)
+        self.assert_no_write_after_failed_asset_list()
+
+    def test_validation_only_aborts_when_published_asset_list_fails(self) -> None:
+        (self.gh_state / "release-state").write_text("published\n", encoding="utf8")
+        self.write_remote_assets(
+            *((path, None) for path in sorted(self.artifacts.iterdir()))
+        )
+
+        result = self.run_publisher(asset_list_sequence=("fail",))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("simulated asset list failure", result.stderr)
+        self.assertIn("during published release validation", result.stderr)
+        self.assertNotIn("do not exactly match", result.stderr)
+        self.assertNotIn("Validation-only mode complete", result.stdout)
+        self.assertEqual(self.asset_list_calls(), 1)
+
+    def test_validation_only_aborts_when_draft_asset_list_fails(self) -> None:
+        (self.gh_state / "release-state").write_text("draft\n", encoding="utf8")
+        self.write_remote_assets((self.release_artifact(), None))
+
+        result = self.run_publisher(asset_list_sequence=("fail",))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("during draft resume verification", result.stderr)
+        self.assertNotIn("Found matching draft release", result.stdout)
+        self.assertNotIn("gh release upload", result.stdout)
+        self.assertNotIn("Validation-only mode", result.stdout)
 
 
 if __name__ == "__main__":

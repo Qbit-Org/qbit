@@ -531,7 +531,7 @@ class IBDTimeoutWiringTest(unittest.TestCase):
 
     def test_workflow_sources_helper_and_calls_entry_points(self) -> None:
         text = WORKFLOW.read_text(encoding="utf-8")
-        self.assertIn("ref: ${{ env.CHECKOUT_REF }}", text)
+        self.assertIn("ref: ${{ needs.resolve-source.outputs.resolved_sha }}", text)
         support_start = text.index("      - name: Checkout workflow support\n")
         support_end = text.index("      - name:", support_start + 1)
         support_checkout = text[support_start:support_end]
