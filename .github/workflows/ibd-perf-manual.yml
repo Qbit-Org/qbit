@@ -435,8 +435,6 @@ jobs:
             echo "enable_tracing=${ENABLE_TRACING}"
             echo "trace_threshold_ms=${TRACE_THRESHOLD_MS}"
             echo "bench_min_time_ms=${BENCH_MIN_TIME_MS}"
-            source "$IBD_WORKFLOW_SUPPORT_DIR/ci/ibd-perf-lanes.sh"
-            write_ibd_timeout_evidence
             echo "runner_name=${RUNNER_NAME}"
             echo "runner_arch=${RUNNER_ARCH}"
             echo "kernel=$(uname -srmo)"
@@ -507,6 +505,14 @@ jobs:
           source "$IBD_WORKFLOW_SUPPORT_DIR/ci/ibd-perf-lanes.sh"
           preflight_ibd_timeouts
           run_ibd_lanes
+
+      - name: Record IBD timeout evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p "$PERF_ARTIFACT_ROOT/summary"
+          source "$IBD_WORKFLOW_SUPPORT_DIR/ci/ibd-perf-lanes.sh"
+          write_ibd_timeout_evidence >> "$PERF_ARTIFACT_ROOT/summary/host.env"
 
       - name: Summarize perf results
         run: |

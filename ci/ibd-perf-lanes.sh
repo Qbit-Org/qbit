@@ -98,37 +98,58 @@ ibd_perf_lane_runs() {
   [ -n "$(seq 1 "$RUNS_PER_LANE" 2>/dev/null)" ]
 }
 
+# Each lane records itself here immediately before its first command runs, so
+# the evidence below can tell a lane that was invoked from one the campaign
+# never reached (a failed build, a rejected preflight, an earlier lane failing).
+ibd_perf_lane_invocations() {
+  echo "$PERF_ARTIFACT_ROOT/summary/lane-invocations.txt"
+}
+
+ibd_perf_record_lane_invocation() {
+  mkdir -p "$PERF_ARTIFACT_ROOT/summary"
+  echo "$1" >> "$(ibd_perf_lane_invocations)"
+}
+
+ibd_perf_lane_invoked() {
+  grep -qx -- "$1" "$(ibd_perf_lane_invocations)" 2>/dev/null
+}
+
 # Writes the requested timeout strings plus an explicit forwarded marker to
-# stdout (the workflow redirects this into summary/host.env). The marker
-# mirrors the builder conditions above: a blank value is never forwarded, a
-# value for a disabled lane is never reached by any command, and neither is a
-# value for a lane that never iterates. Effective values are only ever written
-# by the harness reports.
+# stdout (the workflow appends this to summary/host.env after the lanes step,
+# whatever its outcome). The marker mirrors what actually happened: a blank
+# value is never forwarded, a value for a disabled lane is never reached by any
+# command, neither is a value for a lane that never iterates, and a lane the
+# campaign never reached forwarded nothing. Effective values are only ever
+# written by the harness reports.
 write_ibd_timeout_evidence() {
-  ibd_timeout_evidence_lines replay_timeout "$REPLAY_TIMEOUT" "$ENABLE_REPLAY_LANES"
-  ibd_timeout_evidence_lines network_headers_timeout "$NETWORK_HEADERS_TIMEOUT" "$ENABLE_NETWORK_IBD"
-  ibd_timeout_evidence_lines network_tip_timeout "$NETWORK_TIP_TIMEOUT" "$ENABLE_NETWORK_IBD"
-  ibd_timeout_evidence_lines network_ibd_exit_timeout "$NETWORK_IBD_EXIT_TIMEOUT" "$ENABLE_NETWORK_IBD"
+  ibd_timeout_evidence_lines replay_timeout "$REPLAY_TIMEOUT" "$ENABLE_REPLAY_LANES" replay
+  ibd_timeout_evidence_lines network_headers_timeout "$NETWORK_HEADERS_TIMEOUT" "$ENABLE_NETWORK_IBD" network
+  ibd_timeout_evidence_lines network_tip_timeout "$NETWORK_TIP_TIMEOUT" "$ENABLE_NETWORK_IBD" network
+  ibd_timeout_evidence_lines network_ibd_exit_timeout "$NETWORK_IBD_EXIT_TIMEOUT" "$ENABLE_NETWORK_IBD" network
 }
 
 ibd_timeout_evidence_lines() {
   local key="$1"
   local value="$2"
   local lane_enabled="$3"
+  local lane="$4"
   local forwarded reason
 
   if [ -z "$value" ]; then
     forwarded=false
-    reason=blank
+    reason="blank"
   elif [ "$lane_enabled" != "true" ]; then
     forwarded=false
-    reason=lane-disabled
+    reason="lane-disabled"
   elif ! ibd_perf_lane_runs; then
     forwarded=false
-    reason=no-runs
+    reason="no-runs"
+  elif ! ibd_perf_lane_invoked "$lane"; then
+    forwarded=false
+    reason="not-reached"
   else
     forwarded=true
-    reason=forwarded
+    reason="forwarded"
   fi
   echo "${key}=${value}"
   echo "${key}_forwarded=${forwarded}"
@@ -179,6 +200,7 @@ run_replay() {
   echo "=== replay ${workload} ${history_mode} ${reindex_mode} run ${run_id} ==="
   build_replay_cmd "$workload" "$history_mode" "$reindex_mode" "$history_tail" \
     "$PERF_ARTIFACT_ROOT/replay/$report_name" "$trace_file"
+  ibd_perf_record_lane_invocation replay
   "${IBD_PERF_CMD[@]}"
 }
 
@@ -195,6 +217,7 @@ run_network() {
   mkdir -p "$PERF_ARTIFACT_ROOT/network"
   echo "=== network ${workload} run ${run_id} ==="
   build_network_cmd "$workload" "$PERF_ARTIFACT_ROOT/network/$report_name" "$trace_file"
+  ibd_perf_record_lane_invocation network
   "${IBD_PERF_CMD[@]}"
 }
 

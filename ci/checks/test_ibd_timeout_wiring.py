@@ -468,6 +468,37 @@ class IBDTimeoutWiringTest(unittest.TestCase):
             self.assertEqual(host_env[f"{key}_forwarded"], "false", key)
             self.assertEqual(host_env[f"{key}_forwarded_reason"], "no-runs", key)
 
+        # The evidence is recorded after the lanes step whatever its outcome. A
+        # request is forwarded only if its lane actually invoked a command: when
+        # the preflight rejects a value nothing is reached, and when a replay
+        # lane fails first the network lane is never reached.
+        lanes_step = shlex.quote(f"source {shlex.quote(str(HELPER))}; {WORKFLOW_SEQUENCE}")
+        aborted = (
+            f"status=0; bash -euo pipefail -c {lanes_step} || status=$?; "
+            'write_ibd_timeout_evidence > "$PERF_ARTIFACT_ROOT/summary/host.env"; exit "$status"'
+        )
+        for exit_on_call, invoked in ((1, set()), (3, {"replay"})):
+            run = self.run_helper(aborted, self.all_set(), shim_exit=3, shim_exit_on_call=exit_on_call)
+            self.assertEqual(run.returncode, 3, run.stderr)
+            self.assertEqual(len(run.argvs), exit_on_call)
+            host_env = self.host_env(run)
+            for name, (_flag, key, _default, lane) in TIMEOUTS.items():
+                self.assertEqual(host_env[key], NONDEFAULT[name], "the request is still recorded")
+                if lane in invoked:
+                    self.assertEqual(host_env[f"{key}_forwarded"], "true", (exit_on_call, key))
+                    self.assertEqual(host_env[f"{key}_forwarded_reason"], "forwarded", (exit_on_call, key))
+                else:
+                    self.assertEqual(host_env[f"{key}_forwarded"], "false", (exit_on_call, key))
+                    self.assertEqual(host_env[f"{key}_forwarded_reason"], "not-reached", (exit_on_call, key))
+        # A campaign that never reached the lanes step at all.
+        run = self.run_helper('write_ibd_timeout_evidence > "$PERF_ARTIFACT_ROOT/summary/host.env"', self.all_set())
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.argvs, [])
+        host_env = self.host_env(run)
+        for _name, (_flag, key, _default, _lane) in TIMEOUTS.items():
+            self.assertEqual(host_env[f"{key}_forwarded"], "false", key)
+            self.assertEqual(host_env[f"{key}_forwarded_reason"], "not-reached", key)
+
         # The markers mirror what the command builder actually appended.
         for overrides, expected_forwarded in (
             (self.all_set(), True),
@@ -492,8 +523,10 @@ class IBDTimeoutWiringTest(unittest.TestCase):
                     self.assertEqual(reason, "blank")
                 elif overrides.get(LANE_TOGGLE[lane], "true") != "true":
                     self.assertEqual(reason, "lane-disabled")
-                elif not lanes:
+                elif overrides.get("RUNS_PER_LANE", "1") == "0":
                     self.assertEqual(reason, "no-runs")
+                elif not lanes:
+                    self.assertEqual(reason, "not-reached")
                 else:
                     self.assertEqual(reason, "forwarded")
 
@@ -560,29 +593,31 @@ class IBDTimeoutWiringTest(unittest.TestCase):
             ],
         )
 
-        metadata_marker = "      - name: Capture host metadata\n"
-        metadata_start = text.index(metadata_marker)
-        metadata_end = text.index("      - name:", metadata_start + len(metadata_marker))
-        metadata = text[metadata_start:metadata_end]
-        metadata_lines = [line.strip() for line in metadata.splitlines()]
-        # The evidence writer must run inside the command group whose output is
-        # redirected into host.env, after the helper is sourced, and nowhere
-        # else in the step; otherwise the markers never reach host.env.
-        group_end = '} > "$PERF_ARTIFACT_ROOT/summary/host.env"'
-        self.assertIn(group_end, metadata_lines)
-        host_env_group = metadata_lines[: metadata_lines.index(group_end)]
-        self.assertIn('source "$IBD_WORKFLOW_SUPPORT_DIR/ci/ibd-perf-lanes.sh"', host_env_group)
-        self.assertIn("write_ibd_timeout_evidence", host_env_group)
-        self.assertLess(
-            host_env_group.index('source "$IBD_WORKFLOW_SUPPORT_DIR/ci/ibd-perf-lanes.sh"'),
-            host_env_group.index("write_ibd_timeout_evidence"),
+        # The evidence is appended to host.env only after the lanes step has
+        # settled, from a step that runs whatever happened before it, so the
+        # markers describe the lanes that were actually invoked and still reach
+        # the always-uploaded summary when the campaign aborts.
+        evidence_marker = "      - name: Record IBD timeout evidence\n        if: always()\n        run: |\n"
+        evidence_start = text.index(evidence_marker)
+        self.assertLess(text.index("      - name: Run IBD lanes\n"), evidence_start)
+        self.assertLess(evidence_start, text.index("      - name: Summarize perf results\n"))
+        evidence_end = text.index("      - name:", evidence_start + len(evidence_marker))
+        evidence_body = [line.strip() for line in text[evidence_start + len(evidence_marker):evidence_end].splitlines() if line.strip()]
+        self.assertEqual(
+            evidence_body,
+            [
+                "set -euo pipefail",
+                'mkdir -p "$PERF_ARTIFACT_ROOT/summary"',
+                'source "$IBD_WORKFLOW_SUPPORT_DIR/ci/ibd-perf-lanes.sh"',
+                'write_ibd_timeout_evidence >> "$PERF_ARTIFACT_ROOT/summary/host.env"',
+            ],
         )
-        self.assertEqual(metadata_lines.count("write_ibd_timeout_evidence"), 1)
+        self.assertEqual(text.count("write_ibd_timeout_evidence"), 1, "the evidence is recorded exactly once")
         # The helper is the only writer of any timeout-named host.env line: the
         # workflow may not echo a requested, effective or otherwise-labelled
         # timeout key of its own.
-        for line in metadata_lines:
-            if line.startswith("echo "):
+        for line in text.splitlines():
+            if line.strip().startswith("echo "):
                 self.assertNotIn("timeout", line.lower(), f"timeout evidence must come from the helper only: {line}")
 
         self.assertIn(
