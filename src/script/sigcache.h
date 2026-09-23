@@ -14,10 +14,12 @@
 #include <uint256.h>
 #include <util/hasher.h>
 
+#include <atomic>
 #include <cstddef>
 #include <shared_mutex>
 #include <vector>
 
+class CPQCPubKey;
 class CPubKey;
 class CTransaction;
 class XOnlyPubKey;
@@ -31,19 +33,35 @@ static constexpr size_t DEFAULT_SCRIPT_EXECUTION_CACHE_BYTES{DEFAULT_VALIDATION_
 static_assert(DEFAULT_VALIDATION_CACHE_BYTES == DEFAULT_SIGNATURE_CACHE_BYTES + DEFAULT_SCRIPT_EXECUTION_CACHE_BYTES);
 
 /**
- * Valid signature cache, to avoid doing expensive ECDSA signature checking
- * twice for every transaction (once when accepted into memory pool, and
- * again when accepted into the block chain)
+ * Test-only observer of PQC transaction-signature cache activity. Production
+ * code never installs one; it must not influence validation results.
+ */
+class PQCSignatureCacheObserver
+{
+public:
+    virtual ~PQCSignatureCacheObserver() = default;
+    //! Called once per PQC transaction-signature cache lookup.
+    virtual void Lookup(bool hit, bool erase) = 0;
+    //! Called once per primitive PQC verification performed after a cache miss.
+    virtual void Verified(bool valid, bool inserted) = 0;
+};
+
+/**
+ * Valid signature cache, to avoid doing expensive ECDSA, Schnorr and PQC
+ * signature checking twice for every transaction (once when accepted into
+ * memory pool, and again when accepted into the block chain)
  */
 class SignatureCache
 {
 private:
-    //! Entries are SHA256(nonce || 'E' or 'S' || 31 zero bytes || signature hash || public key || signature):
+    //! Entries are SHA256(nonce || 'E', 'S' or 'P' || 31 zero bytes || signature hash || public key || signature):
     CSHA256 m_salted_hasher_ecdsa;
     CSHA256 m_salted_hasher_schnorr;
+    CSHA256 m_salted_hasher_pqc;
     typedef CuckooCache::cache<uint256, SignatureCacheHasher> map_type;
     map_type setValid;
     std::shared_mutex cs_sigcache;
+    std::atomic<PQCSignatureCacheObserver*> m_pqc_observer{nullptr};
 
 public:
     SignatureCache(size_t max_size_bytes);
@@ -55,9 +73,15 @@ public:
 
     void ComputeEntrySchnorr(uint256& entry, const uint256 &hash, std::span<const unsigned char> sig, const XOnlyPubKey& pubkey) const;
 
+    void ComputeEntryPQC(uint256& entry, const uint256& hash, std::span<const unsigned char> sig, const CPQCPubKey& pubkey) const;
+
     bool Get(const uint256& entry, const bool erase);
 
     void Set(const uint256& entry);
+
+    //! Test-only. Production code never installs an observer.
+    void SetPQCObserverForTesting(PQCSignatureCacheObserver* observer) { m_pqc_observer.store(observer); }
+    PQCSignatureCacheObserver* GetPQCObserver() const { return m_pqc_observer.load(std::memory_order_relaxed); }
 };
 
 class CachingTransactionSignatureChecker : public TransactionSignatureChecker
@@ -71,6 +95,7 @@ public:
 
     bool VerifyECDSASignature(const std::vector<unsigned char>& vchSig, const CPubKey& vchPubKey, const uint256& sighash) const override;
     bool VerifySchnorrSignature(std::span<const unsigned char> sig, const XOnlyPubKey& pubkey, const uint256& sighash) const override;
+    bool VerifyPQCSignature(std::span<const unsigned char> sig, const CPQCPubKey& pubkey, const uint256& sighash) const override;
 };
 
 #endif // QBIT_SCRIPT_SIGCACHE_H
