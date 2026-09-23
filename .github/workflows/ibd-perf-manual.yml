@@ -78,22 +78,22 @@ on:
         default: ""
         type: string
       REPLAY_TIMEOUT:
-        description: Reserved for PR B --replay-timeout harness flag; leave blank until supported
+        description: Optional seconds forwarded verbatim as --replay-timeout to the replay lanes; blank keeps the harness default (3600); the harness rejects values below 1 or non-integers
         required: false
         default: ""
         type: string
       NETWORK_HEADERS_TIMEOUT:
-        description: Reserved for PR B --network-headers-timeout harness flag; leave blank until supported
+        description: Optional seconds forwarded verbatim as --network-headers-timeout to the network lane; blank keeps the harness default (600); the harness rejects values below 1 or non-integers
         required: false
         default: ""
         type: string
       NETWORK_TIP_TIMEOUT:
-        description: Reserved for PR B --network-tip-timeout harness flag; leave blank until supported
+        description: Optional seconds forwarded verbatim as --network-tip-timeout to the network lane; blank keeps the harness default (1800); the harness rejects values below 1 or non-integers
         required: false
         default: ""
         type: string
       NETWORK_IBD_EXIT_TIMEOUT:
-        description: Reserved for PR B --network-ibd-exit-timeout harness flag; leave blank until supported
+        description: Optional seconds forwarded verbatim as --network-ibd-exit-timeout to the network lane; blank keeps the harness default (600); the harness rejects values below 1 or non-integers
         required: false
         default: ""
         type: string
@@ -199,6 +199,7 @@ jobs:
       REQUESTED_REF: ${{ needs.resolve-source.outputs.requested_ref }}
       RESOLVED_SHA: ${{ needs.resolve-source.outputs.resolved_sha }}
       BENCHMARK_REF_NAME: ${{ needs.resolve-source.outputs.requested_ref_name }}
+      IBD_WORKFLOW_SUPPORT_DIR: ${{ github.workspace }}/.workflow-support
       PERF_BUILD_DIR: ${{ github.workspace }}/build-perf
       PERF_ARTIFACT_ROOT: ${{ github.workspace }}/build-perf-artifacts/ibd-perf-${{ github.run_id }}
       SELECTED_PROFILE: ${{ github.event_name == 'schedule' && 'nightly-smoke' || inputs.profile }}
@@ -261,6 +262,18 @@ jobs:
             echo "- actual_head: ${actual_head}"
             echo "- workflow_sha: ${WORKFLOW_SHA}"
           } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+      # A scheduled run benchmarks the maintained source, which may not contain
+      # the workflow's helpers. Keep them at the exact revision that supplied
+      # this workflow.
+      - name: Checkout workflow support
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .workflow-support
+          fetch-depth: 1
+          sparse-checkout: |
+            .github/workflows
+            ci
 
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
@@ -392,6 +405,7 @@ jobs:
           {
             echo "timestamp_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             echo "git_commit=$(git rev-parse HEAD)"
+            echo "workflow_support_commit=$(git -C "$IBD_WORKFLOW_SUPPORT_DIR" rev-parse HEAD)"
             echo "github_repository=${GITHUB_REPOSITORY}"
             echo "github_workflow=${GITHUB_WORKFLOW}"
             echo "github_run_id=${GITHUB_RUN_ID}"
@@ -421,10 +435,6 @@ jobs:
             echo "enable_tracing=${ENABLE_TRACING}"
             echo "trace_threshold_ms=${TRACE_THRESHOLD_MS}"
             echo "bench_min_time_ms=${BENCH_MIN_TIME_MS}"
-            echo "replay_timeout=${REPLAY_TIMEOUT}"
-            echo "network_headers_timeout=${NETWORK_HEADERS_TIMEOUT}"
-            echo "network_tip_timeout=${NETWORK_TIP_TIMEOUT}"
-            echo "network_ibd_exit_timeout=${NETWORK_IBD_EXIT_TIMEOUT}"
             echo "runner_name=${RUNNER_NAME}"
             echo "runner_arch=${RUNNER_ARCH}"
             echo "kernel=$(uname -srmo)"
@@ -466,6 +476,12 @@ jobs:
           python3 test/functional/feature_ibd_perf_validation.py \
             --configfile="$PERF_BUILD_DIR/test/config.ini"
 
+      - name: Run IBD timeout wiring checks
+        run: |
+          QBIT_IBD_PERF_SOURCE_ROOT="$GITHUB_WORKSPACE" \
+          QBIT_IBD_PERF_CONFIGFILE="$PERF_BUILD_DIR/test/config.ini" \
+            python3 "$IBD_WORKFLOW_SUPPORT_DIR/ci/checks/test_ibd_timeout_wiring.py" -v
+
       - name: Run hotspot microbenchmarks
         run: |
           set -euo pipefail
@@ -486,105 +502,17 @@ jobs:
         run: |
           set -euo pipefail
           ulimit -n 10240
+          source "$IBD_WORKFLOW_SUPPORT_DIR/ci/ibd-perf-lanes.sh"
+          preflight_ibd_timeouts
+          run_ibd_lanes
 
-          effective_witness_tail="$TAIL_BLOCKS"
-          required_tail=$((1002 - BLOCKS))
-          if [ "$required_tail" -gt "$effective_witness_tail" ]; then
-            effective_witness_tail="$required_tail"
-          fi
-          if [ "$effective_witness_tail" -lt 0 ]; then
-            effective_witness_tail=0
-          fi
-          echo "effective_witness_tail_blocks=$effective_witness_tail" \
-            > "$PERF_ARTIFACT_ROOT/summary/replay-parameters.env"
-
-          run_replay() {
-            local workload="$1"
-            local history_mode="$2"
-            local reindex_mode="$3"
-            local run_id="$4"
-            local tail_blocks="$TAIL_BLOCKS"
-            local report_name="${workload}-${history_mode}-${reindex_mode}-run${run_id}.json"
-            local trace_file=""
-            local cmd=()
-
-            if [ "$history_mode" = "witness-pruned" ]; then
-              tail_blocks="$effective_witness_tail"
-            fi
-
-            if [ "$ENABLE_TRACING" = "true" ] && [ "$workload" = "w2-replay-mixed" ] && [ "$reindex_mode" = "full" ]; then
-              trace_file="$PERF_ARTIFACT_ROOT/replay/${workload}-${history_mode}-${reindex_mode}-run${run_id}.trace.txt"
-            fi
-
-            echo "=== replay ${workload} ${history_mode} ${reindex_mode} run ${run_id} ==="
-            cmd=(
-              python3 test/functional/feature_ibd_perf_replay.py
-              --configfile="$PERF_BUILD_DIR/test/config.ini"
-              --blocks="$BLOCKS"
-              --workload="$workload"
-              --txs-per-block="$TXS_PER_BLOCK"
-              --p2mr-spends-per-block="$P2MR_SPENDS_PER_BLOCK"
-              --tail-blocks="$tail_blocks"
-              --history-mode="$history_mode"
-              --reindex-mode="$reindex_mode"
-              --report-file="$PERF_ARTIFACT_ROOT/replay/$report_name"
-              --connectblock-threshold-ms="$TRACE_THRESHOLD_MS"
-            )
-            if [ -n "$trace_file" ]; then
-              cmd+=(--connectblock-trace-file="$trace_file")
-            fi
-            if [ "$FASTPRUNE" = "true" ]; then
-              cmd+=(--fastprune)
-            fi
-            "${cmd[@]}"
-          }
-
-          run_network() {
-            local workload="$1"
-            local run_id="$2"
-            local report_name="w3-network-${workload}-run${run_id}.json"
-            local trace_file=""
-            local cmd=()
-
-            if [ "$ENABLE_TRACING" = "true" ]; then
-              trace_file="$PERF_ARTIFACT_ROOT/network/${workload}-run${run_id}.trace.txt"
-            fi
-
-            mkdir -p "$PERF_ARTIFACT_ROOT/network"
-            echo "=== network ${workload} run ${run_id} ==="
-            cmd=(
-              python3 test/functional/feature_ibd_perf_network.py
-              --configfile="$PERF_BUILD_DIR/test/config.ini"
-              --blocks="$BLOCKS"
-              --workload="$workload"
-              --txs-per-block="$TXS_PER_BLOCK"
-              --p2mr-spends-per-block="$P2MR_SPENDS_PER_BLOCK"
-              --lane-name="w3-network-mixed"
-              --report-file="$PERF_ARTIFACT_ROOT/network/$report_name"
-              --connectblock-threshold-ms="$TRACE_THRESHOLD_MS"
-            )
-            if [ -n "$trace_file" ]; then
-              cmd+=(--connectblock-trace-file="$trace_file")
-            fi
-            if [ "$FASTPRUNE" = "true" ]; then
-              cmd+=(--fastprune)
-            fi
-            "${cmd[@]}"
-          }
-
-          for run in $(seq 1 "$RUNS_PER_LANE"); do
-            if [ "$ENABLE_REPLAY_LANES" = "true" ]; then
-              run_replay w1-replay-floor archive chainstate "$run"
-              run_replay w1-replay-floor archive full "$run"
-              run_replay w1-replay-floor witness-pruned chainstate "$run"
-              run_replay w2-replay-mixed archive chainstate "$run"
-              run_replay w2-replay-mixed archive full "$run"
-              run_replay w2-replay-mixed witness-pruned chainstate "$run"
-            fi
-            if [ "$ENABLE_NETWORK_IBD" = "true" ]; then
-              run_network w2-replay-mixed "$run"
-            fi
-          done
+      - name: Record IBD timeout evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p "$PERF_ARTIFACT_ROOT/summary"
+          source "$IBD_WORKFLOW_SUPPORT_DIR/ci/ibd-perf-lanes.sh"
+          write_ibd_timeout_evidence >> "$PERF_ARTIFACT_ROOT/summary/host.env"
 
       - name: Summarize perf results
         run: |

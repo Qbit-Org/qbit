@@ -28,7 +28,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
@@ -51,12 +51,15 @@ RESOLVER_JOB = "resolve-source"
 RESOLVER_STEP = "Resolve source"
 GUARD_STEP = "Require resolved source"
 CHECKOUT_STEP = "Checkout"
+SUPPORT_STEP = "Checkout workflow support"
+SUPPORT_DIR = ".workflow-support"
 VERIFY_STEP = "Verify checked-out source"
 METADATA_STEP = "Capture host metadata"
 MAINTAINED_BRANCH = "1.x.x"
 MAINTAINED_REF = f"refs/heads/{MAINTAINED_BRANCH}"
 RETIRED_BRANCH = "0.1.x"
 MANIFEST_PATH = Path("test/functional/data/rpc_perf_manifest.json")
+HELPER_PATH = Path("ci/ibd-perf-lanes.sh")
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -303,6 +306,9 @@ class Fixture:
         manifest = seed / MANIFEST_PATH
         manifest.parent.mkdir(parents=True)
         shutil.copyfile(REPO_ROOT / MANIFEST_PATH, manifest)
+        helper = seed / HELPER_PATH
+        helper.parent.mkdir(parents=True)
+        shutil.copyfile(REPO_ROOT / HELPER_PATH, helper)
         self.git("add", ".", cwd=seed)
         self.git("commit", "-q", "-m", "default branch commit", cwd=seed)
         self.default_sha = self.rev_parse("HEAD", cwd=seed)
@@ -330,6 +336,11 @@ class Fixture:
         self.git("clone", "-q", str(self.remote), str(self.work), cwd=self.root)
         self.workspace = self.root / "workspace"
         self.workspace.mkdir()
+        # The IBD workflow keeps its helpers in a second, path-scoped checkout
+        # at the workflow revision, beside the benchmarked source.
+        self.support = self.workspace / SUPPORT_DIR
+        self.git("clone", "-q", "--no-checkout", str(self.remote), str(self.support), cwd=self.root)
+        self.git("checkout", "-q", "--detach", self.default_sha, cwd=self.support)
 
         assert len({self.default_sha, self.maintained_sha, self.manual_sha}) == 3
 
@@ -553,8 +564,11 @@ def check_source_wiring(workflow: dict[str, Any], context: dict[str, Any]) -> di
         needs = [needs] if isinstance(needs, str) else list(needs or [])
         assert RESOLVER_JOB in needs, f"{job_id} must depend on {RESOLVER_JOB}"
         checkout_steps = [step for step in job["steps"] if "actions/checkout@" in str(step.get("uses", ""))]
-        assert len(checkout_steps) == 1, f"{job_id} must check out exactly once"
-        checkout = checkout_steps[0]
+        # Only one checkout may populate the workspace root; a checkout with a
+        # path is workflow support, which never replaces the benchmarked source.
+        source_checkouts = [step for step in checkout_steps if not (step.get("with") or {}).get("path")]
+        assert len(source_checkouts) == 1, f"{job_id} must check out the source exactly once"
+        checkout = source_checkouts[0]
         assert checkout.get("name") == CHECKOUT_STEP, job_id
         checkout_context = dict(context, env=job_env(workflow, job, context))
         ref = _to_text(render(checkout["with"].get("ref"), checkout_context))
@@ -566,6 +580,18 @@ def check_source_wiring(workflow: dict[str, Any], context: dict[str, Any]) -> di
         assert all(job["steps"][index].get("uses") is None for index in range(0, checkout_position)), (
             f"{job_id} runs an action before the checkout guard"
         )
+        for support in checkout_steps:
+            if support is checkout:
+                continue
+            path = PurePosixPath(support["with"]["path"])
+            assert not path.is_absolute() and ".." not in path.parts and str(path) not in {".", ""}, (
+                f"{job_id} support checkout must stay inside the workspace: {path}"
+            )
+            support_ref = _to_text(render(support["with"].get("ref"), checkout_context))
+            assert support_ref == context["github"]["workflow_sha"], (
+                f"{job_id} support checkout {support_ref!r} must be the workflow commit"
+            )
+            assert job["steps"].index(support) > verify, f"{job_id} support checkout before the source is verified"
         refs[job_id] = ref
     return refs
 
@@ -701,6 +727,16 @@ class ScheduledValidationContractTest(unittest.TestCase):
             "guard removed": lambda job: job["steps"].pop(step_index(job, GUARD_STEP)),
             "verify removed": lambda job: job["steps"].pop(step_index(job, VERIFY_STEP)),
         }
+        if any(step.get("name") == SUPPORT_STEP for step in workflow["jobs"][job_id]["steps"]):
+            mutations["support checkout into the workspace root"] = lambda job: find_step(job, SUPPORT_STEP)[
+                "with"
+            ].pop("path")
+            mutations["support checkout at the benchmarked source"] = lambda job: find_step(job, SUPPORT_STEP)[
+                "with"
+            ].__setitem__("ref", "${{ needs.resolve-source.outputs.resolved_sha }}")
+            mutations["support checkout before the source is verified"] = lambda job: job["steps"].insert(
+                step_index(job, VERIFY_STEP), job["steps"].pop(step_index(job, SUPPORT_STEP))
+            )
         for label, mutate in mutations.items():
             mutated = copy.deepcopy(workflow)
             mutate(mutated["jobs"][job_id])
@@ -729,6 +765,8 @@ class ScheduledValidationContractTest(unittest.TestCase):
                 self.assertEqual(metadata["source_mode"], "maintained")
                 self.assertEqual(metadata["github_sha"], trigger_sha)
                 self.assertEqual(metadata["workflow_sha"], trigger_sha)
+                if any(step.get("name") == SUPPORT_STEP for step in workflow["jobs"][job_id]["steps"]):
+                    self.assertEqual(metadata["workflow_support_commit"], trigger_sha)
                 self.assertEqual(metadata["benchmark_mode"], "nightly")
                 self.assertNotEqual(metadata["git_commit"], metadata["github_sha"])
                 self.assertNotEqual(metadata["git_commit"], metadata["workflow_sha"])
