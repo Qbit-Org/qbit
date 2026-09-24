@@ -263,7 +263,9 @@ Q_SIGNALS:
     void canGetAddressesChanged();
 
     // A fee-bump replacement was committed by the background worker.
-    void feeBumped(const Txid& original_txid, const Txid& bumped_txid);
+    // pqc_usage is the formatted PQC signing usage the bump consumed, or empty
+    // when it consumed none.
+    void feeBumped(const Txid& original_txid, const Txid& bumped_txid, const QString& pqc_usage);
 
     void timerTimeout();
 

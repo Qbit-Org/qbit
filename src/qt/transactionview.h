@@ -23,6 +23,7 @@ QT_BEGIN_NAMESPACE
 class QComboBox;
 class QDateTimeEdit;
 class QFrame;
+class QLabel;
 class QLineEdit;
 class QMenu;
 class QModelIndex;
@@ -81,12 +82,16 @@ private:
     QFrame *dateRangeWidget;
     QDateTimeEdit *dateFrom;
     QDateTimeEdit *dateTo;
+    QFrame* m_fee_bump_usage_widget{nullptr};
+    QLabel* m_fee_bump_usage_label{nullptr};
     QAction *abandonAction{nullptr};
     QAction *bumpFeeAction{nullptr};
     QAction *copyAddressAction{nullptr};
     QAction *copyLabelAction{nullptr};
 
     QWidget *createDateRangeWidget();
+    QWidget* createFeeBumpUsageWidget();
+    void showFeeBumpUsage(const Txid& bumped_txid, const QString& pqc_usage);
 
     bool eventFilter(QObject *obj, QEvent *event) override;
 

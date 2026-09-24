@@ -1013,7 +1013,7 @@ void WalletModel::bumpFeeFinished(uint64_t generation, std::shared_ptr<BumpFeeRe
         if (!still_current()) return;
     }
     resetBumpFeeState();
-    Q_EMIT feeBumped(original_txid, bumped_txid);
+    Q_EMIT feeBumped(original_txid, bumped_txid, usage);
 }
 
 void WalletModel::cancelBumpFee()
