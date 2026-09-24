@@ -115,7 +115,8 @@ public:
     // encryptWalletFinished(). Returns false, and starts nothing, while an
     // earlier encryption is still running. The worker holds the wallet locks
     // until it returns, so getEncryptionStatus() and getPQCKeyValidationInfo()
-    // answer from the values taken before it started while it runs. An
+    // answer from the values taken before it started while it runs, and the
+    // transaction table holds back updates that would read the wallet. An
     // exception from the wallet is rethrown on the GUI thread rather than
     // reported as a failure: the encryption may already have committed.
     bool encryptWallet(const SecureString& passphrase);

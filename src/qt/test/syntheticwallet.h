@@ -13,8 +13,10 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -61,6 +63,14 @@ struct SyntheticWalletState {
     int encrypt_calls{0};
     std::thread::id encrypt_thread;
     std::function<void()> status_changed;
+    //! Transaction-changed listeners by handler id, so a test can raise the
+    //! notification the wallet sends when a transaction arrives.
+    std::map<uint64_t, interfaces::Wallet::TransactionChangedFn> transaction_changed;
+    uint64_t transaction_changed_next_id{0};
+    //! The one transaction the wallet holds, returned by getTx() and
+    //! getWalletTx() for its hash. Reading it waits on the encryption latch
+    //! like the wallet locks it stands in for.
+    std::optional<interfaces::WalletTx> wallet_tx;
     bool psbt_sign_entered{false};
     bool allow_psbt_reservation{true};
     bool allow_psbt_completion{true};

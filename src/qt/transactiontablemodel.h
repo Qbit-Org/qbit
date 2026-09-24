@@ -10,7 +10,9 @@
 #include <QAbstractTableModel>
 #include <QStringList>
 
+#include <functional>
 #include <memory>
+#include <vector>
 
 namespace interfaces {
 class Handler;
@@ -77,6 +79,10 @@ public:
     QVariant headerData(int section, Qt::Orientation orientation, int role) const override;
     QModelIndex index(int row, int column, const QModelIndex & parent = QModelIndex()) const override;
     bool processingQueuedTransactions() const { return fProcessingQueuedTransactions; }
+    /** Replay, in arrival order, the updates held back while the wallet was
+        being encrypted. Called by the wallet model once its encryption
+        worker has released the wallet. */
+    void deliverDeferredUpdates();
 
 private:
     WalletModel *walletModel;
@@ -85,6 +91,11 @@ private:
     QStringList columns;
     TransactionTablePriv *priv;
     bool fProcessingQueuedTransactions{false};
+    /** Transaction updates and balloon-limit changes received from the event
+        loop while the wallet was being encrypted. Applying an update reads
+        the wallet, which blocks while the encryption worker holds its locks,
+        so they wait here for deliverDeferredUpdates(). */
+    std::vector<std::function<void()>> m_deferred_updates;
     const PlatformStyle *platformStyle;
 
     void subscribeToCoreSignals();
@@ -109,7 +120,7 @@ public Q_SLOTS:
     /** Updates the column title to "Amount (DisplayUnit)" and emits headerDataChanged() signal for table headers to react. */
     void updateAmountColumnTitle();
     /* Needed to update fProcessingQueuedTransactions through a QueuedConnection */
-    void setProcessingQueuedTransactions(bool value) { fProcessingQueuedTransactions = value; }
+    void setProcessingQueuedTransactions(bool value);
 
     friend class TransactionTablePriv;
 };

@@ -3379,6 +3379,112 @@ void TestEncryptWalletKeepsGuiResponsive(interfaces::Node& node)
     }));
 }
 
+//! The wallet announces a new transaction through the event loop, and the
+//! table model reads it from the wallet on arrival. Delivered while the
+//! encryption worker holds the wallet locks, that read would block the GUI
+//! thread, so the update is held back and the row appears once the worker
+//! has returned.
+void TestEncryptWalletDefersTransactionUpdates(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    state->allow_encrypt = false;
+    auto model{env.makeModel(state)};
+    const ReleaseSyntheticEncryptionOnExit release_on_exit{state};
+    TransactionTableModel* const table{model->getTransactionTableModel()};
+    QSignalSpy rows_inserted{table, &QAbstractItemModel::rowsInserted};
+    QVERIFY(rows_inserted.isValid());
+    QCOMPARE(table->rowCount({}), 0);
+
+    // A payment received from elsewhere, arriving after the model loaded the
+    // wallet's history.
+    CMutableTransaction mtx;
+    mtx.vin.emplace_back(COutPoint{Txid{}, 0});
+    mtx.vout.emplace_back(COIN, CScript{} << OP_TRUE);
+    const CTransactionRef tx{MakeTransactionRef(mtx)};
+    std::vector<interfaces::Wallet::TransactionChangedFn> notify_transaction;
+    {
+        std::lock_guard lock{state->mutex};
+        state->wallet_tx = interfaces::WalletTx{
+            .tx = tx,
+            .txin_is_mine = {false},
+            .txout_is_mine = {true},
+            .txout_is_change = {false},
+            .txout_address = {CNoDestination{}},
+            .txout_address_is_mine = {false},
+            .credit = COIN,
+            .debit = 0,
+            .change = 0,
+            .time = 1,
+            .value_map = {},
+            .is_coinbase = false,
+        };
+        for (const auto& [id, notify] : state->transaction_changed) notify_transaction.push_back(notify);
+    }
+    QVERIFY(!notify_transaction.empty());
+
+    int gui_ticks{0};
+    QTimer gui_latch;
+    QObject::connect(&gui_latch, &QTimer::timeout, [&gui_ticks] { ++gui_ticks; });
+    gui_latch.start(0);
+
+    // Release the latch if the GUI thread stops servicing events, so an
+    // update that reads the encrypting wallet fails the assertions below
+    // instead of hanging the test.
+    bool gui_alive{false};
+    std::thread watchdog{[state, &gui_alive] {
+        std::unique_lock lock{state->mutex};
+        if (!state->condition.wait_for(lock, std::chrono::seconds{5}, [&] { return gui_alive || state->encrypt_finished; })) {
+            state->watchdog_released = true;
+            state->allow_encrypt = true;
+            lock.unlock();
+            state->condition.notify_all();
+        }
+    }};
+    const JoinOnExit join_watchdog{watchdog};
+
+    auto* dialog{new AskPassphraseDialog(AskPassphraseDialog::Encrypt, nullptr)};
+    QPointer<AskPassphraseDialog> dialog_guard{dialog};
+    dialog->setModel(model.get());
+    GUIUtil::ShowModalDialogAsynchronously(dialog);
+    QString result_text;
+    VisibleMessageBoxClicker result{QMessageBox::Ok, &result_text};
+    SubmitEncryption(*dialog, QStringLiteral("test-passphrase"));
+    QVERIFY(WaitUntil([&state] {
+        return SyntheticStateMatches(state, [](const auto& value) { return value.encrypt_entered && value.encrypt_in_progress; });
+    }, 5000));
+
+    // Announce the transaction the way the wallet does. The table model's
+    // update is queued to the event loop and dispatched while the worker
+    // holds the locks.
+    for (const auto& notify : notify_transaction) notify(tx->GetHash(), CT_NEW);
+    const int ticks_at_notify{gui_ticks};
+    const bool responsive{WaitUntil([&gui_ticks, ticks_at_notify] { return gui_ticks > ticks_at_notify + 20; }, 5000)};
+    {
+        std::lock_guard lock{state->mutex};
+        gui_alive = true;
+    }
+    state->condition.notify_all();
+    watchdog.join();
+    QVERIFY2(!SyntheticStateMatches(state, [](const auto& value) { return value.watchdog_released; }),
+             "GUI thread blocked on the encrypting wallet while adding a transaction to the table");
+    QVERIFY(responsive);
+    QCOMPARE(rows_inserted.count(), 0);
+    QCOMPARE(table->rowCount({}), 0);
+    QVERIFY(SyntheticStateMatches(state, [](const auto& value) { return value.encrypt_calls == 1 && value.encrypt_in_progress; }));
+
+    ReleaseSyntheticEncryption(state);
+    QVERIFY(WaitUntil([&dialog_guard] { return dialog_guard.isNull(); }, 5000));
+    QVERIFY(result.clicked());
+    QVERIFY2(result_text.startsWith("<qt>Your wallet is now encrypted."), qPrintable(result_text));
+    QCOMPARE(rows_inserted.count(), 1);
+    QCOMPARE(table->rowCount({}), 1);
+    QCOMPARE(table->index(0, 0).data(TransactionTableModel::TxHashRole).toString(), QString::fromStdString(tx->GetHash().GetHex()));
+    QVERIFY(WaitUntil([&state] {
+        return SyntheticStateMatches(state, [](const auto& value) { return value.background_clone_destroyed; });
+    }, 5000));
+}
+
 //! BitcoinGUI::updateWalletStatus reads the current wallet whenever any wallet
 //! reports a status change, so another wallet's notification while the
 //! current one is being encrypted must not send the GUI thread into the
@@ -3788,6 +3894,7 @@ void WalletTests::walletTests()
     TestFeeBumpModelDestroyedDuringDraftFailure(m_node);
     TestFeeBumpModelDestroyedDuringUnlock(m_node);
     TestEncryptWalletKeepsGuiResponsive(m_node);
+    TestEncryptWalletDefersTransactionUpdates(m_node);
     TestEncryptWalletOtherWalletStatusChange(m_node);
     TestEncryptWalletFailureReportsError(m_node);
     TestEncryptWalletExceptionEscapes(m_node);

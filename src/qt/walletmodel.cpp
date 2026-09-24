@@ -564,6 +564,10 @@ void WalletModel::finishEncryptWallet(uint64_t generation, bool success, std::ex
         Q_EMIT canGetAddressesChanged();
         if (!model) return;
     }
+    if (transactionTableModel) {
+        transactionTableModel->deliverDeferredUpdates();
+        if (!model) return;
+    }
     Q_EMIT encryptWalletFinished(success);
 }
 

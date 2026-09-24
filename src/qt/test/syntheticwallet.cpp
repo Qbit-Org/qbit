@@ -466,11 +466,35 @@ public:
         m_state->condition.notify_all();
         return true;
     }
-    CTransactionRef getTx(const Txid&) override { return {}; }
-    interfaces::WalletTx getWalletTx(const Txid&) override { return {}; }
-    std::set<interfaces::WalletTx> getWalletTxs() override { return {}; }
+    // The real wallet reads transactions under its locks; tryGetTxStatus()
+    // gives up instead of waiting for them.
+    CTransactionRef getTx(const Txid& txid) override
+    {
+        std::unique_lock lock{m_state->mutex};
+        WaitForEncryption(lock);
+        if (m_state->wallet_tx && m_state->wallet_tx->tx->GetHash() == txid) return m_state->wallet_tx->tx;
+        return {};
+    }
+    interfaces::WalletTx getWalletTx(const Txid& txid) override
+    {
+        std::unique_lock lock{m_state->mutex};
+        WaitForEncryption(lock);
+        if (m_state->wallet_tx && m_state->wallet_tx->tx->GetHash() == txid) return *m_state->wallet_tx;
+        return {};
+    }
+    std::set<interfaces::WalletTx> getWalletTxs() override
+    {
+        std::unique_lock lock{m_state->mutex};
+        WaitForEncryption(lock);
+        return {};
+    }
     bool tryGetTxStatus(const Txid&, interfaces::WalletTxStatus&, int&, int64_t&) override { return false; }
-    interfaces::WalletTx getWalletTxDetails(const Txid&, interfaces::WalletTxStatus&, interfaces::WalletOrderForm&, bool&, int&) override { return {}; }
+    interfaces::WalletTx getWalletTxDetails(const Txid&, interfaces::WalletTxStatus&, interfaces::WalletOrderForm&, bool&, int&) override
+    {
+        std::unique_lock lock{m_state->mutex};
+        WaitForEncryption(lock);
+        return {};
+    }
     std::optional<common::PSBTError> fillPSBT(std::optional<int>,
         bool sign,
         bool,
@@ -675,7 +699,22 @@ public:
         });
     }
     std::unique_ptr<interfaces::Handler> handleAddressBookChanged(AddressBookChangedFn) override { return interfaces::MakeCleanupHandler([] {}); }
-    std::unique_ptr<interfaces::Handler> handleTransactionChanged(TransactionChangedFn) override { return interfaces::MakeCleanupHandler([] {}); }
+    std::unique_ptr<interfaces::Handler> handleTransactionChanged(TransactionChangedFn fn) override
+    {
+        uint64_t id;
+        {
+            std::lock_guard lock{m_state->mutex};
+            id = ++m_state->transaction_changed_next_id;
+            m_state->transaction_changed.emplace(id, std::move(fn));
+        }
+        std::weak_ptr<SyntheticWalletState> weak_state{m_state};
+        return interfaces::MakeCleanupHandler([weak_state, id] {
+            if (auto state = weak_state.lock()) {
+                std::lock_guard lock{state->mutex};
+                state->transaction_changed.erase(id);
+            }
+        });
+    }
     std::unique_ptr<interfaces::Handler> handleCanGetAddressesChanged(CanGetAddressesChangedFn fn) override
     {
         {
