@@ -1,8 +1,8 @@
 # qbit 1.0.0 Release Trust Reference
 
-This note anchors the reviewed policy and validation commit used to publish
-qbit 1.0.0 mainnet artifacts. The signed tag fixes the release source; this
-later trust reference does not replace or modify that source.
+This note anchors the reviewed policy and validation commit designated for
+publishing qbit 1.0.0 mainnet artifacts. The signed tag fixes the release
+source; this later trust reference does not replace or modify that source.
 
 The first revision of this note merged as
 `70fea84f5becfb57463247af09790df5ddd424f8`
@@ -42,7 +42,12 @@ not represented as its ancestor.
 
 Exact-target
 [Core Checks](https://github.com/Qbit-Org/qbit/actions/runs/29431717879)
-completed successfully. Full Validation run
+completed successfully. Its `mainnet publication posture` job was skipped:
+the workflow enables that job only for changes targeting the `1.0.0` branch,
+and this run was a `main` push, so no Core Checks run at the tag target
+exercised the mainnet posture validator. The release process assigns that
+check to the local publisher, whose run is not publicly recorded. Full
+Validation run
 [29431717977](https://github.com/Qbit-Org/qbit/actions/runs/29431717977)
 at the same commit concluded `failure` and is not represented as passing. Its
 complete job inventory follows.
@@ -52,8 +57,8 @@ complete job inventory follows.
 The run executed on the `main` push of the peeled tag target and completed at
 `2026-07-15T17:54:18Z` with 10 successful, 9 failed, and 2 skipped jobs. The
 table lists every job in the archived run. Cause keys are explained below the
-table; each classification cites the archived job log, which was still
-retained when this revision was prepared.
+table; each classification cites the archived job log, which was retained as
+of `2026-09-24`. GitHub keeps run logs and artifacts for a limited period.
 
 | Job | Conclusion | Failing step | Cause |
 | --- | --- | --- | --- |
@@ -84,10 +89,11 @@ Cause keys:
 - **A: stale AuxPoW slot-index test expectations (known).** The unit test
   `auxpow_tests/auxpow_expected_index_vectors_document_qbit_slot_math` failed
   four `BOOST_CHECK_EQUAL` checks at `src/test/auxpow_tests.cpp` lines
-  400-403 with identical values in every job that ran the unit suite: expected
-  `12` and got `1`, expected `4` and got `9`, expected `882684108` and got
-  `-414942079`, and expected `838473315` and got `614588952`. The later
-  maintenance fix
+  400-406 (the fourth check spans lines 403-406 and the logs report it at
+  line 403 or 406 depending on the toolchain) with identical values in every
+  job that ran the unit suite: expected `12` and got `1`, expected `4` and
+  got `9`, expected `882684108` and got `-414942079`, and expected
+  `838473315` and got `614588952`. The later maintenance fix
   [Qbit-Org/qbit#137](https://github.com/Qbit-Org/qbit/pull/137) attributes
   this to expectations left stale by the finalized mainnet parameters and
   changed only the expected values in the test. `auxpow::GetExpectedIndex`
@@ -102,29 +108,35 @@ Cause keys:
   the value derived from the selected chain parameters and did not change the
   RPC code under test.
 - **C: Windows-native Qt test exit (cause not established).** The step
-  `Run Qt test with diagnostics` ran `test_qbit-qt.exe -v2` three times:
-  it exited `1` under `QT_QPA_PLATFORM=offscreen`, exited `0xc0000409` under
-  `windows`, and exited `1` under `minimal`. The archived log contains no
-  per-test output for any of the three runs, so this record does not name
-  the failing test. ProcDump captured one dump per platform; they are retained
-  in the run artifact `windows-qt-crash-diagnostics-29431717977` and were not
-  analyzed for this note. Because the job stopped at `Fail after Qt
-  diagnostics`, its `Run test suite` and `Run functional tests` steps were
-  skipped, so this leg produced no Windows-native unit or functional test
-  result. #137 later changed Qt wallet-view teardown and `AppTests` cleanup
-  and describes a blocked send worker that cascaded into later Qt test
-  failures; that description is #137's stated root cause, not evidence from
-  this job's log.
+  `Run Qt test with diagnostics` ran `test_qbit-qt.exe -v2` once per QPA
+  platform and, after each nonzero exit, once more under ProcDump, six runs
+  in total. The direct runs exited `1` under `QT_QPA_PLATFORM=offscreen`,
+  `0xc0000409` under `windows`, and `1` under `minimal`. None of the six runs
+  logged per-test output, so this record does not name the failing test;
+  ProcDump logged only C++ exception notices without test context and wrote
+  one dump per platform. As of `2026-09-24` those dumps were retained in the
+  run artifact `windows-qt-crash-diagnostics-29431717977` (expires
+  `2026-10-13`) and were not analyzed for this note. Because the job stopped
+  at `Fail after Qt diagnostics`, its `Run test suite` and
+  `Run functional tests` steps were skipped, so this leg produced no
+  Windows-native unit or functional test result. #137 later changed Qt
+  wallet-view teardown and `AppTests` cleanup and describes a blocked send
+  worker that cascaded into later Qt test failures; that description is
+  #137's stated root cause, not evidence from this job's log.
 - **D: aggregate gate (known).** `Check validation results` reported
   `Windows native DLL result was failure`, `Windows cross-built tests result
   was failure`, and `CI matrix result was failure`. Every other gate input
   (`classify validation profile`, `determine runners`, `Linux->Windows
   cross`, `lint`, `public docs lint`, `rpc docs`) was `success`.
-- **S: disabled by workflow condition (known).** At the tag target,
-  `test each commit` ran only for pull requests with the
-  `QBIT_ENABLE_TEST_EACH_COMMIT` repository variable set, and the macOS
-  native job ran only with `QBIT_ENABLE_MACOS_NATIVE_ARM64` set. Both are
-  annotated `Disabled by default` in the workflow. Neither skip is a failure.
+- **S: skipped by workflow condition (known).** At the tag target,
+  `test each commit` runs only on a `pull_request` event, only when the
+  `QBIT_ENABLE_TEST_EACH_COMMIT` repository variable is `true`, and only when
+  the pull request head is in this repository or carries the
+  `ci:qbit-trusted` label; this run was a `main` push, so it could not run.
+  The macOS native job runs only when `QBIT_ENABLE_MACOS_NATIVE_ARM64` is
+  `true`; because its matrix never expanded, the API reports its name
+  literally as `matrix.job-name`. Both conditions carry a
+  `Disabled by default` comment in the workflow. Neither skip is a failure.
 
 A failed job is not by itself proof of a product defect. Causes A and B were
 resolved by changing test expectations only. Cause C is unattributed; this
@@ -172,8 +184,10 @@ The `trusted_release_ref` designated for qbit 1.0.0 release validation and
 publication is `70fea84f5becfb57463247af09790df5ddd424f8`, the protected-`main`
 commit that merged the first revision of this note. It differs from both the
 annotated tag object and the peeled tag target, and its history contains the
-peeled tag target. Later revisions of this note, including this correction,
-do not move that ref.
+peeled tag target. That commit was created at `2026-07-15T23:23:40Z`, and the
+release was published at `2026-07-16T00:31:52Z`; no public artifact records
+the ref the publisher ran from. Later revisions of this note, including this
+correction, do not move that ref.
 
 That trusted commit retains the public release validators, local publisher,
 mainnet posture checks, P2MR gate, operator policy, and five public
@@ -217,7 +231,8 @@ succeeded there, and the same two conditional jobs were skipped. Core Checks
 run [35894000253](https://github.com/Qbit-Org/qbit/actions/runs/35894000253)
 and Required Merge Gate run
 [35894000393](https://github.com/Qbit-Org/qbit/actions/runs/35894000393)
-also passed at that commit. Those results describe maintenance-branch source
-only. They do not change the `v1.0.0` tag, its artifacts, or the result of
-run 29431717977, and integrators verifying `v1.0.0` must use the release
-source identity recorded above.
+also passed at that commit; the Core Checks `mainnet publication posture`
+job was again skipped by the same branch condition. Those results describe
+maintenance-branch source only. They do not change the `v1.0.0` tag, its
+artifacts, or the result of run 29431717977, and integrators verifying
+`v1.0.0` must use the release source identity recorded above.
