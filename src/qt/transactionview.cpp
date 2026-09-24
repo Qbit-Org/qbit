@@ -24,6 +24,7 @@
 
 #include <QApplication>
 #include <QComboBox>
+#include <QDateTime>
 #include <QDateTimeEdit>
 #include <QDesktopServices>
 #include <QDoubleValidator>
@@ -34,6 +35,7 @@
 #include <QMenu>
 #include <QPoint>
 #include <QPushButton>
+#include <QScrollArea>
 #include <QScrollBar>
 #include <QSettings>
 #include <QTableView>
@@ -202,6 +204,8 @@ TransactionView::~TransactionView()
 void TransactionView::setModel(WalletModel *_model)
 {
     QObject::disconnect(m_fee_bumped_connection);
+    // A usage report belongs to the model whose bump produced it.
+    m_fee_bump_usage_widget->setVisible(false);
     this->model = _model;
     if(_model)
     {
@@ -570,7 +574,17 @@ QWidget* TransactionView::createFeeBumpUsageWidget()
     m_fee_bump_usage_label->setTextFormat(Qt::PlainText);
     m_fee_bump_usage_label->setTextInteractionFlags(Qt::TextSelectableByMouse);
     m_fee_bump_usage_label->setWordWrap(true);
-    layout->addWidget(m_fee_bump_usage_label, 1);
+    // A bump that touches many keys scrolls here instead of squeezing the
+    // transaction list.
+    QScrollArea* scroll = new QScrollArea(m_fee_bump_usage_widget);
+    scroll->setObjectName("feeBumpUsageScrollArea");
+    scroll->setFrameShape(QFrame::NoFrame);
+    scroll->setWidgetResizable(true);
+    scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    scroll->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    scroll->setMaximumHeight(fontMetrics().lineSpacing() * 8);
+    scroll->setWidget(m_fee_bump_usage_label);
+    layout->addWidget(scroll, 1);
     QPushButton* dismiss = new QPushButton(tr("Dismiss"), m_fee_bump_usage_widget);
     dismiss->setObjectName("feeBumpUsageDismissButton");
     layout->addWidget(dismiss, 0, Qt::AlignTop);
@@ -587,7 +601,10 @@ void TransactionView::showFeeBumpUsage(const Txid& bumped_txid, const QString& p
         m_fee_bump_usage_widget->setVisible(false);
         return;
     }
-    m_fee_bump_usage_label->setText(tr("Fee bump replacement %1").arg(QString::fromStdString(bumped_txid.ToString())) + "\n\n" + pqc_usage);
+    //: Header of the panel showing the PQC signing usage a fee bump consumed.
+    //: %1 is the replacement transaction ID, %2 the local time it was committed.
+    const QString header{tr("Fee bump replacement %1 (%2)").arg(QString::fromStdString(bumped_txid.ToString()), GUIUtil::dateTimeStr(QDateTime::currentDateTime()))};
+    m_fee_bump_usage_label->setText(header + "\n\n" + pqc_usage);
     m_fee_bump_usage_widget->setVisible(true);
 }
 

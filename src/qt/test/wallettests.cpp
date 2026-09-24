@@ -2938,24 +2938,34 @@ void TestFeeBumpSuccessKeepsUsageVisible(interfaces::Node& node)
     // The notification itself stays non-modal.
     QCOMPARE(messages.count(), 1);
     QCOMPARE(MessageAt(messages, 0).style, static_cast<unsigned int>(CClientUIInterface::MSG_INFORMATION));
-    QVERIFY(!usage_widget->isHidden());
-    const QString text{usage_label->text()};
-    QVERIFY2(text.contains(QString::fromStdString(bumped_txid.ToString())), qPrintable(text));
-    QVERIFY2(text.contains(USAGE_CONSUMED_SENTENCE), qPrintable(text));
-    VerifyUsageListed(text, report);
-    QCOMPARE(usage_label->textFormat(), Qt::PlainText);
+    const auto verify_shown = [&] {
+        QVERIFY(!usage_widget->isHidden());
+        const QString text{usage_label->text()};
+        QVERIFY2(text.startsWith(QString{"Fee bump replacement %1 ("}.arg(QString::fromStdString(bumped_txid.ToString()))), qPrintable(text));
+        QVERIFY2(text.contains(USAGE_CONSUMED_SENTENCE), qPrintable(text));
+        VerifyUsageListed(text, report);
+        QCOMPARE(usage_label->textFormat(), Qt::PlainText);
+    };
+    verify_shown();
 
     dismiss->click();
     QVERIFY(usage_widget->isHidden());
     bump();
-    QVERIFY(!usage_widget->isHidden());
+    verify_shown();
+
+    // A report never outlives the model that produced it.
+    view.setModel(nullptr);
+    QVERIFY(usage_widget->isHidden());
+    view.setModel(model.get());
+    bump();
+    verify_shown();
 
     {
         std::lock_guard lock{state->mutex};
         state->bump_use_counters = false;
     }
     bump();
-    QCOMPARE(messages.count(), 2);
+    QCOMPARE(messages.count(), 3);
     QVERIFY(usage_widget->isHidden());
 }
 
