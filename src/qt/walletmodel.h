@@ -15,6 +15,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <exception>
 #include <memory>
 #include <vector>
 
@@ -112,7 +113,11 @@ public:
     // Wallet encryption. Runs the wallet's encryption on a worker thread so
     // the GUI keeps processing events, and reports the outcome through
     // encryptWalletFinished(). Returns false, and starts nothing, while an
-    // earlier encryption is still running.
+    // earlier encryption is still running. The worker holds the wallet locks
+    // until it returns, so getEncryptionStatus() and getPQCKeyValidationInfo()
+    // answer from the values taken before it started while it runs. An
+    // exception from the wallet is rethrown on the GUI thread rather than
+    // reported as a failure: the encryption may already have committed.
     bool encryptWallet(const SecureString& passphrase);
     bool isEncryptingWallet() const { return m_encrypt_wallet_active; }
     // Passphrase only needed when unlocking
@@ -217,12 +222,16 @@ private:
     QThread* m_encrypt_wallet_thread{nullptr};
     uint64_t m_encrypt_wallet_generation{0};
     bool m_encrypt_wallet_active{false};
+    // PQC validation status from before the encryption started, reported
+    // while the worker holds the wallet locks. cachedEncryptionStatus serves
+    // the encryption status the same way.
+    wallet::PQCKeyValidationInfo m_encrypt_wallet_pqc_info;
     // The wallet raises this notification while it still holds its locks
     // during encryption. It is held back until the worker returns so no
     // listener blocks the GUI thread on those locks.
     bool m_can_get_addresses_changed_deferred{false};
 
-    void finishEncryptWallet(uint64_t generation, bool success);
+    void finishEncryptWallet(uint64_t generation, bool success, std::exception_ptr exception);
     void finishEncryptWalletThread();
 
     bool fForceCheckBalanceChanged{false};

@@ -53,6 +53,9 @@ struct SyntheticWalletState {
     bool encrypt_in_progress{false};
     bool allow_encrypt{true};
     bool encrypt_success{true};
+    //! Throw once the latch is released, as CWallet::EncryptWallet can after
+    //! its database transaction has committed.
+    bool encrypt_throw{false};
     bool encrypt_finished{false};
     uint64_t encrypt_finished_sequence{0};
     int encrypt_calls{0};

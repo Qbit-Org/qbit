@@ -11,6 +11,8 @@
 
 #include <support/allocators/secure.h>
 
+#include <cassert>
+
 #include <QKeyEvent>
 #include <QMessageBox>
 #include <QProgressBar>
@@ -90,11 +92,13 @@ void AskPassphraseDialog::setModel(WalletModel *_model)
     if (!_model) return;
     connect(_model, &WalletModel::encryptWalletFinished, this, &AskPassphraseDialog::encryptWalletFinished);
     // A model deleted mid-encryption can no longer report a result, so stop
-    // waiting for one.
+    // waiting for one. Close without done(): its finished() listeners refresh
+    // the wallet status from the model that is being destroyed.
     connect(_model, &QObject::destroyed, this, [this] {
         if (!m_encryption_in_progress) return;
         m_encryption_in_progress = false;
-        QDialog::reject();
+        hide();
+        if (testAttribute(Qt::WA_DeleteOnClose)) deleteLater();
     });
 }
 
@@ -150,12 +154,9 @@ void AskPassphraseDialog::accept()
                         return;
                     }
                 } else {
-                    // The confirmation above ran a nested event loop; the
-                    // wallet may have been unloaded meanwhile.
-                    if (!model) {
-                        QDialog::reject();
-                        return;
-                    }
+                    // Wallet unload is deferred while a modal dialog is open,
+                    // so the model outlives the confirmation above.
+                    assert(model);
                     if (!model->encryptWallet(newpass1)) {
                         showEncryptionResult(/*success=*/false);
                         return;

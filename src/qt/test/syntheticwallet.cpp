@@ -16,6 +16,7 @@
 #include <chrono>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <utility>
 
 namespace qt_test {
@@ -66,6 +67,10 @@ public:
             m_state->encrypt_entered = true;
             m_state->encrypt_in_progress = true;
             m_state->encrypt_finished = false;
+            // CWallet::EncryptWallet stores the master key first, so the
+            // wallet reports itself encrypted for the rest of the operation
+            // and a status query goes on to wait for the wallet lock.
+            m_state->encrypted = true;
             ++m_state->encrypt_calls;
             m_state->encrypt_thread = std::this_thread::get_id();
             status_changed = m_state->status_changed;
@@ -76,19 +81,27 @@ public:
         if (status_changed) status_changed();
 
         bool success{false};
+        bool throw_after_commit{false};
         {
             std::unique_lock lock{m_state->mutex};
             m_state->condition.wait(lock, [this] { return m_state->allow_encrypt; });
             success = m_state->encrypt_success;
+            throw_after_commit = m_state->encrypt_throw;
             if (success) {
-                m_state->encrypted = true;
                 m_state->locked = true;
+            } else {
+                // A clean failure leaves the wallet unencrypted.
+                m_state->encrypted = false;
             }
             m_state->encrypt_in_progress = false;
             m_state->encrypt_finished = true;
             m_state->encrypt_finished_sequence = ++m_state->event_sequence;
         }
         m_state->condition.notify_all();
+        // An exception after the database transaction committed leaves the
+        // wallet encrypted, releases the locks by unwinding and skips the
+        // final status notification.
+        if (throw_after_commit) throw std::runtime_error{"synthetic encryption failure after commit"};
         if (status_changed) status_changed();
         return success;
     }

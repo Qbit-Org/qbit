@@ -1500,8 +1500,17 @@ bool BitcoinGUI::eventFilter(QObject *object, QEvent *event)
 #ifdef ENABLE_WALLET
 bool BitcoinGUI::handlePaymentRequest(const SendCoinsRecipient& recipient)
 {
+    if (!walletFrame) return false;
+    // Filling in the Send page reads the address book, which the encryption
+    // worker keeps locked. Deliver the request once the wallet has finished
+    // encrypting; a dropped model drops the request with it.
+    WalletModel* const wallet_model{walletFrame->currentWalletModel()};
+    if (wallet_model && wallet_model->isEncryptingWallet()) {
+        connect(wallet_model, &WalletModel::encryptWalletFinished, this, [this, recipient] { handlePaymentRequest(recipient); }, Qt::SingleShotConnection);
+        return true;
+    }
     // URI has to be valid
-    if (walletFrame && walletFrame->handlePaymentRequest(recipient))
+    if (walletFrame->handlePaymentRequest(recipient))
     {
         showNormalIfMinimized();
         gotoSendCoinsPage();
@@ -1558,10 +1567,6 @@ void BitcoinGUI::updateWalletPQCValidationStatus()
     WalletView* const walletView = walletFrame->currentWalletView();
     if (!walletView) return;
     WalletModel* const walletModel = walletView->getWalletModel();
-    // Block tips can arrive while the wallet is being encrypted, and the
-    // wallet holds its locks throughout. The model refreshes the status once
-    // the encryption has finished.
-    if (walletModel->isEncryptingWallet()) return;
     const wallet::PQCKeyValidationInfo info{walletModel->getPQCKeyValidationInfo()};
 
     if (walletModel->getEncryptionStatus() == WalletModel::Unencrypted) {
@@ -1617,7 +1622,14 @@ void BitcoinGUI::updateWalletStatus()
     }
     WalletModel * const walletModel = walletView->getWalletModel();
     setEncryptionStatus(walletModel->getEncryptionStatus());
-    setHDStatus(walletModel->wallet().privateKeysDisabled(), walletModel->wallet().hdEnabled());
+    // Any wallet's status change lands here while another one may be
+    // encrypting. The model answers the queries above from cached values
+    // meanwhile, but the HD status query reads the descriptor managers the
+    // encryption worker is replacing; it cannot change during the encryption
+    // and the model refreshes the status once the worker has returned.
+    if (!walletModel->isEncryptingWallet()) {
+        setHDStatus(walletModel->wallet().privateKeysDisabled(), walletModel->wallet().hdEnabled());
+    }
     updateWalletPQCValidationStatus();
 }
 #endif // ENABLE_WALLET
