@@ -109,8 +109,12 @@ public:
     // Send coins to a list of recipients
     void sendCoins(WalletModelTransaction& transaction);
 
-    // Wallet encryption
-    bool setWalletEncrypted(const SecureString& passphrase);
+    // Wallet encryption. Runs the wallet's encryption on a worker thread so
+    // the GUI keeps processing events, and reports the outcome through
+    // encryptWalletFinished(). Returns false, and starts nothing, while an
+    // earlier encryption is still running.
+    bool encryptWallet(const SecureString& passphrase);
+    bool isEncryptingWallet() const { return m_encrypt_wallet_active; }
     // Passphrase only needed when unlocking
     bool setWalletLocked(bool locked, const SecureString &passPhrase=SecureString());
     bool changePassphrase(const SecureString &oldPass, const SecureString &newPass);
@@ -210,6 +214,17 @@ private:
     void finishBumpFeeThread();
     void resetBumpFeeState();
 
+    QThread* m_encrypt_wallet_thread{nullptr};
+    uint64_t m_encrypt_wallet_generation{0};
+    bool m_encrypt_wallet_active{false};
+    // The wallet raises this notification while it still holds its locks
+    // during encryption. It is held back until the worker returns so no
+    // listener blocks the GUI thread on those locks.
+    bool m_can_get_addresses_changed_deferred{false};
+
+    void finishEncryptWallet(uint64_t generation, bool success);
+    void finishEncryptWalletThread();
+
     bool fForceCheckBalanceChanged{false};
 
     // Wallet has an options model for wallet-specific options
@@ -262,6 +277,10 @@ Q_SIGNALS:
     // Notify that there are now keys in the keypool
     void canGetAddressesChanged();
 
+    // Outcome of an encryptWallet() request, emitted on the GUI thread after
+    // the worker has released the wallet.
+    void encryptWalletFinished(bool success);
+
     // A fee-bump replacement was committed by the background worker.
     void feeBumped(const Txid& original_txid, const Txid& bumped_txid);
 
@@ -277,6 +296,8 @@ public Q_SLOTS:
     void updateTransaction();
     /* New, updated or removed address book entry */
     void updateAddressBook(const QString &address, const QString &label, bool isMine, wallet::AddressPurpose purpose, int status);
+    /* Keypool availability might have changed */
+    void updateCanGetAddresses();
     /* Current, immature or unconfirmed balance might have changed - emit 'balanceChanged' if so */
     void pollBalanceChanged();
 };

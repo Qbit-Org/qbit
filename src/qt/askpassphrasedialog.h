@@ -6,6 +6,7 @@
 #define QBIT_QT_ASKPASSPHRASEDIALOG_H
 
 #include <QDialog>
+#include <QPointer>
 
 #include <support/allocators/secure.h>
 
@@ -33,20 +34,28 @@ public:
     ~AskPassphraseDialog();
 
     void accept() override;
+    //! Ignored while an encryption is running: the dialog is the in-progress
+    //! indicator and the operation cannot be cancelled.
+    void reject() override;
 
     void setModel(WalletModel *model);
 
 private:
     Ui::AskPassphraseDialog *ui;
     Mode mode;
-    WalletModel* model{nullptr};
+    QPointer<WalletModel> model;
     bool fCapsLock{false};
     SecureString* m_passphrase_out;
+    bool m_encryption_in_progress{false};
+
+    void showEncryptionInProgress();
+    void showEncryptionResult(bool success);
 
 private Q_SLOTS:
     void textChanged();
     void secureClearPassFields();
     void toggleShowPassword(bool);
+    void encryptWalletFinished(bool success);
 
 protected:
     bool event(QEvent *event) override;

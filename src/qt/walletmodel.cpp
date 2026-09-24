@@ -90,6 +90,9 @@ WalletModel::~WalletModel()
 {
     prepareForShutdown();
     finishBumpFeeThread();
+    // Encryption is not cancellable: wait for the worker so the wallet is
+    // released and the encryption it commits is complete before teardown.
+    finishEncryptWalletThread();
     m_bump_fee_unlock_context.reset();
     unsubscribeFromCoreSignals();
 }
@@ -123,6 +126,11 @@ void WalletModel::setClientModel(ClientModel* client_model)
 
 void WalletModel::updateStatus()
 {
+    // The wallet notifies from inside the encryption while it still holds
+    // its locks. Reading the status here would block the GUI thread on those
+    // locks, so finishEncryptWallet() refreshes once the worker has returned.
+    if (m_encrypt_wallet_active) return;
+
     EncryptionStatus newEncryptionStatus = getEncryptionStatus();
 
     if(cachedEncryptionStatus != newEncryptionStatus) {
@@ -184,6 +192,17 @@ void WalletModel::updateAddressBook(const QString &address, const QString &label
 {
     if(addressTableModel)
         addressTableModel->updateEntry(address, label, isMine, purpose, status);
+}
+
+void WalletModel::updateCanGetAddresses()
+{
+    // Listeners query the wallet, which blocks while the encryption worker
+    // holds its locks; finishEncryptWallet() re-emits once it has returned.
+    if (m_encrypt_wallet_active) {
+        m_can_get_addresses_changed_deferred = true;
+        return;
+    }
+    Q_EMIT canGetAddressesChanged();
 }
 
 bool WalletModel::validateAddress(const QString& address) const
@@ -466,9 +485,67 @@ wallet::PQCKeyValidationInfo WalletModel::getPQCKeyValidationInfo() const
     return m_wallet->getPQCKeyValidationInfo();
 }
 
-bool WalletModel::setWalletEncrypted(const SecureString& passphrase)
+bool WalletModel::encryptWallet(const SecureString& passphrase)
 {
-    return m_wallet->encryptWallet(passphrase);
+    if (m_encrypt_wallet_active) return false;
+
+    // The worker keeps its own reference to the wallet so the operation can
+    // run to completion even if this model is deleted underneath it.
+    std::shared_ptr<interfaces::Wallet> wallet{m_wallet->clone()};
+    if (!wallet) return false;
+
+    finishEncryptWalletThread();
+    m_encrypt_wallet_active = true;
+    const uint64_t generation{++m_encrypt_wallet_generation};
+    QPointer<WalletModel> model{this};
+    m_encrypt_wallet_thread = QThread::create([model, generation, wallet, passphrase = SecureString{passphrase}]() mutable {
+        bool success{false};
+        try {
+            success = wallet->encryptWallet(passphrase);
+        } catch (const std::exception& e) {
+            LogWarning("Wallet encryption failed: %s\n", e.what());
+        }
+        // Release the passphrase and the wallet reference on this thread, so
+        // a pending unload only waits for the encryption itself and not for
+        // the GUI thread to consume the result.
+        SecureString{}.swap(passphrase);
+        wallet.reset();
+        if (!model) return;
+        QMetaObject::invokeMethod(model, [model, generation, success] {
+            if (model) model->finishEncryptWallet(generation, success);
+        }, Qt::QueuedConnection);
+    });
+    m_encrypt_wallet_thread->start();
+    return true;
+}
+
+void WalletModel::finishEncryptWallet(uint64_t generation, bool success)
+{
+    if (generation != m_encrypt_wallet_generation) return;
+    finishEncryptWalletThread();
+    m_encrypt_wallet_active = false;
+
+    // Deliver what was held back while the worker owned the wallet locks.
+    // Listeners may run nested event loops that delete this model, so check
+    // it after each emission.
+    QPointer<WalletModel> model{this};
+    updateStatus();
+    if (!model) return;
+    if (m_can_get_addresses_changed_deferred) {
+        m_can_get_addresses_changed_deferred = false;
+        Q_EMIT canGetAddressesChanged();
+        if (!model) return;
+    }
+    Q_EMIT encryptWalletFinished(success);
+}
+
+void WalletModel::finishEncryptWalletThread()
+{
+    if (!m_encrypt_wallet_thread) return;
+    QThread* thread{m_encrypt_wallet_thread};
+    m_encrypt_wallet_thread = nullptr;
+    thread->wait();
+    delete thread;
 }
 
 bool WalletModel::setWalletLocked(bool locked, const SecureString &passPhrase)
@@ -542,7 +619,7 @@ static void ShowProgress(WalletModel *walletmodel, const std::string &title, int
 
 static void NotifyCanGetAddressesChanged(WalletModel* walletmodel)
 {
-    bool invoked = QMetaObject::invokeMethod(walletmodel, "canGetAddressesChanged", Qt::QueuedConnection);
+    bool invoked = QMetaObject::invokeMethod(walletmodel, "updateCanGetAddresses", Qt::QueuedConnection);
     assert(invoked);
 }
 
@@ -577,6 +654,12 @@ WalletModel::UnlockContext WalletModel::requestUnlock()
     // that indicates the wallet is not encrypted.
     if (m_wallet->privateKeysDisabled()) {
         return UnlockContext(this, /*valid=*/true, /*relock=*/false);
+    }
+    // Nothing may use the keys while they are being encrypted: the wallet
+    // would block until the encryption finishes and then be locked anyway.
+    if (m_encrypt_wallet_active) {
+        Q_EMIT message(tr("Wallet encryption in progress"), tr("Wait for the wallet encryption to finish."), CClientUIInterface::MSG_WARNING);
+        return UnlockContext(this, /*valid=*/false, /*relock=*/false);
     }
     bool was_locked = getEncryptionStatus() == Locked;
     if(was_locked)
@@ -623,6 +706,10 @@ bool WalletModel::bumpFee(Txid hash)
 {
     if (m_bump_fee_active) {
         Q_EMIT message(tr("Fee bump in progress"), tr("Wait for the current fee bump to finish."), CClientUIInterface::MSG_WARNING);
+        return false;
+    }
+    if (m_encrypt_wallet_active) {
+        Q_EMIT message(tr("Wallet encryption in progress"), tr("Wait for the wallet encryption to finish."), CClientUIInterface::MSG_WARNING);
         return false;
     }
 

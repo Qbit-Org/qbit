@@ -1558,6 +1558,10 @@ void BitcoinGUI::updateWalletPQCValidationStatus()
     WalletView* const walletView = walletFrame->currentWalletView();
     if (!walletView) return;
     WalletModel* const walletModel = walletView->getWalletModel();
+    // Block tips can arrive while the wallet is being encrypted, and the
+    // wallet holds its locks throughout. The model refreshes the status once
+    // the encryption has finished.
+    if (walletModel->isEncryptingWallet()) return;
     const wallet::PQCKeyValidationInfo info{walletModel->getPQCKeyValidationInfo()};
 
     if (walletModel->getEncryptionStatus() == WalletModel::Unencrypted) {

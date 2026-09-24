@@ -58,7 +58,40 @@ public:
         m_state->condition.notify_all();
     }
 
-    bool encryptWallet(const SecureString&) override { return false; }
+    bool encryptWallet(const SecureString&) override
+    {
+        std::function<void()> status_changed;
+        {
+            std::lock_guard lock{m_state->mutex};
+            m_state->encrypt_entered = true;
+            m_state->encrypt_in_progress = true;
+            m_state->encrypt_finished = false;
+            ++m_state->encrypt_calls;
+            m_state->encrypt_thread = std::this_thread::get_id();
+            status_changed = m_state->status_changed;
+        }
+        m_state->condition.notify_all();
+        // Like CWallet::EncryptWallet, which unlocks the freshly encrypted keys
+        // and notifies while it still holds the wallet locks.
+        if (status_changed) status_changed();
+
+        bool success{false};
+        {
+            std::unique_lock lock{m_state->mutex};
+            m_state->condition.wait(lock, [this] { return m_state->allow_encrypt; });
+            success = m_state->encrypt_success;
+            if (success) {
+                m_state->encrypted = true;
+                m_state->locked = true;
+            }
+            m_state->encrypt_in_progress = false;
+            m_state->encrypt_finished = true;
+            m_state->encrypt_finished_sequence = ++m_state->event_sequence;
+        }
+        m_state->condition.notify_all();
+        if (status_changed) status_changed();
+        return success;
+    }
     bool isCrypted() override
     {
         std::lock_guard lock{m_state->mutex};
@@ -66,21 +99,24 @@ public:
     }
     bool lock() override
     {
-        std::lock_guard lock{m_state->mutex};
+        std::unique_lock lock{m_state->mutex};
+        WaitForEncryption(lock);
         m_state->locked = true;
         ++m_state->lock_calls;
         return true;
     }
     bool unlock(const SecureString&) override
     {
-        std::lock_guard lock{m_state->mutex};
+        std::unique_lock lock{m_state->mutex};
+        WaitForEncryption(lock);
         m_state->locked = false;
         ++m_state->unlock_calls;
         return true;
     }
     bool isLocked() override
     {
-        std::lock_guard lock{m_state->mutex};
+        std::unique_lock lock{m_state->mutex};
+        WaitForEncryption(lock);
         return m_state->locked;
     }
     bool changeWalletPassphrase(const SecureString&, const SecureString&) override { return false; }
@@ -559,6 +595,10 @@ public:
     interfaces::WalletBalances getBalances() override { return {.balance = 50 * COIN}; }
     bool tryGetBalances(interfaces::WalletBalances& balances, uint256&) override
     {
+        {
+            std::lock_guard lock{m_state->mutex};
+            if (m_state->encrypt_in_progress) return false;
+        }
         balances = getBalances();
         return true;
     }
@@ -579,7 +619,12 @@ public:
     }
     unsigned int getConfirmTarget() override { return 6; }
     bool hdEnabled() override { return true; }
-    bool canGetAddresses() override { return true; }
+    bool canGetAddresses() override
+    {
+        std::unique_lock lock{m_state->mutex};
+        WaitForEncryption(lock);
+        return true;
+    }
     bool privateKeysDisabled() override
     {
         std::lock_guard lock{m_state->mutex};
@@ -593,11 +638,29 @@ public:
     }
     OutputType getDefaultAddressType() override { return OutputType::P2MR; }
     CAmount getDefaultMaxTxFee() override { return MAX_MONEY; }
-    wallet::PQCKeyValidationInfo getPQCKeyValidationInfo() const override { return {}; }
+    wallet::PQCKeyValidationInfo getPQCKeyValidationInfo() const override
+    {
+        std::unique_lock lock{m_state->mutex};
+        WaitForEncryption(lock);
+        return {};
+    }
     void remove() override {}
     std::unique_ptr<interfaces::Handler> handleUnload(UnloadFn) override { return interfaces::MakeCleanupHandler([] {}); }
     std::unique_ptr<interfaces::Handler> handleShowProgress(ShowProgressFn) override { return interfaces::MakeCleanupHandler([] {}); }
-    std::unique_ptr<interfaces::Handler> handleStatusChanged(StatusChangedFn) override { return interfaces::MakeCleanupHandler([] {}); }
+    std::unique_ptr<interfaces::Handler> handleStatusChanged(StatusChangedFn fn) override
+    {
+        {
+            std::lock_guard lock{m_state->mutex};
+            m_state->status_changed = std::move(fn);
+        }
+        std::weak_ptr<SyntheticWalletState> weak_state{m_state};
+        return interfaces::MakeCleanupHandler([weak_state] {
+            if (auto state = weak_state.lock()) {
+                std::lock_guard lock{state->mutex};
+                state->status_changed = {};
+            }
+        });
+    }
     std::unique_ptr<interfaces::Handler> handleAddressBookChanged(AddressBookChangedFn) override { return interfaces::MakeCleanupHandler([] {}); }
     std::unique_ptr<interfaces::Handler> handleTransactionChanged(TransactionChangedFn) override { return interfaces::MakeCleanupHandler([] {}); }
     std::unique_ptr<interfaces::Handler> handleCanGetAddressesChanged(CanGetAddressesChangedFn fn) override
@@ -616,6 +679,13 @@ public:
     }
 
 private:
+    //! Stand in for the wallet locks that CWallet::EncryptWallet holds for
+    //! the whole operation.
+    void WaitForEncryption(std::unique_lock<std::mutex>& lock) const
+    {
+        m_state->condition.wait(lock, [this] { return !m_state->encrypt_in_progress; });
+    }
+
     wallet::PQCUsageReport m_report;
     std::optional<interfaces::P2MRDataSignatureResult> m_p2mr_result;
     std::optional<bilingual_str> m_p2mr_error;

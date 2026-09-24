@@ -45,6 +45,19 @@ struct SyntheticWalletState {
     bool watchdog_released{false};
     bool encrypted{false};
     bool locked{false};
+    //! Encryption latch. While encrypt_in_progress is set, calls that need
+    //! the wallet locks in the real wallet block until the latch is released,
+    //! so a GUI-thread call into the wallet during encryption stalls the test
+    //! the same way it stalls the application.
+    bool encrypt_entered{false};
+    bool encrypt_in_progress{false};
+    bool allow_encrypt{true};
+    bool encrypt_success{true};
+    bool encrypt_finished{false};
+    uint64_t encrypt_finished_sequence{0};
+    int encrypt_calls{0};
+    std::thread::id encrypt_thread;
+    std::function<void()> status_changed;
     bool psbt_sign_entered{false};
     bool allow_psbt_reservation{true};
     bool allow_psbt_completion{true};
