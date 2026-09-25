@@ -858,6 +858,10 @@ public:
     // starting concurrent wallet work and leave it unchanged until that work
     // completes.
     std::function<void(const std::set<CScript>&, ScriptPubKeyMan*)> m_before_script_pub_key_cache_publish;
+    // Optional deterministic test hook invoked by EncryptWallet after it has
+    // derived the encryption key and before it takes the wallet locks. Same
+    // configuration rules as m_before_script_pub_key_cache_publish.
+    std::function<void()> m_before_encrypt_wallet_locks;
     bool m_deferred_create_keypool_top_up_scheduled GUARDED_BY(cs_wallet){false};
     bool m_deferred_create_keypool_top_up_reschedule_requested GUARDED_BY(cs_wallet){false};
     bool m_p2mr_receive_keypool_refill_scheduled GUARDED_BY(cs_wallet){false};
@@ -1092,8 +1096,8 @@ public:
     };
 
     //! Returns all unique ScriptPubKeyMans in m_internal_spk_managers and m_external_spk_managers
-    std::set<ScriptPubKeyMan*> GetActiveScriptPubKeyMans() const;
-    bool IsActiveScriptPubKeyMan(const ScriptPubKeyMan& spkm) const;
+    std::set<ScriptPubKeyMan*> GetActiveScriptPubKeyMans() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool IsActiveScriptPubKeyMan(const ScriptPubKeyMan& spkm) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     //! Returns all unique ScriptPubKeyMans
     std::set<ScriptPubKeyMan*> GetAllScriptPubKeyMans() const;
@@ -1144,7 +1148,7 @@ public:
     void WriteBestBlock() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     //! Connect the signals from ScriptPubKeyMans to the signals in CWallet
-    void ConnectScriptPubKeyManNotifiers();
+    void ConnectScriptPubKeyManNotifiers() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     //! Instantiate a descriptor ScriptPubKeyMan from the WalletDescriptor and load it
     DescriptorScriptPubKeyMan& LoadDescriptorScriptPubKeyMan(uint256 id, WalletDescriptor& desc);
