@@ -19,6 +19,7 @@
 #include <future>
 #include <memory>
 #include <string>
+#include <utility>
 
 namespace wallet {
 namespace {
@@ -57,6 +58,10 @@ BOOST_AUTO_TEST_CASE(ConcurrentEncryptWalletLoserFailsCleanly)
     std::promise<void> loser_key_derived;
     std::promise<void> release_loser;
     auto release_future{release_loser.get_future()};
+    bool loser_released{false};
+    const auto release = [&] {
+        if (!std::exchange(loser_released, true)) release_loser.set_value();
+    };
     std::atomic<bool> hold_next{true};
     wallet->m_before_encrypt_wallet_locks = [&] {
         if (!hold_next.exchange(false)) return;
@@ -64,12 +69,18 @@ BOOST_AUTO_TEST_CASE(ConcurrentEncryptWalletLoserFailsCleanly)
         release_future.wait();
     };
     auto loser{std::async(std::launch::async, [&] { return wallet->EncryptWallet(loser_passphrase); })};
+    // Destroying the future waits for the parked caller, so release it when a
+    // failed assertion unwinds past this point.
+    struct ReleaseOnExit {
+        decltype(release)& fn;
+        ~ReleaseOnExit() { fn(); }
+    } const release_on_exit{release};
     loser_key_derived.get_future().wait();
 
     // The parked caller holds no wallet lock, so this encryption runs to
     // completion before it resumes.
     BOOST_REQUIRE(wallet->EncryptWallet(winner_passphrase));
-    release_loser.set_value();
+    release();
     BOOST_CHECK(!loser.get());
     wallet->m_before_encrypt_wallet_locks = {};
 

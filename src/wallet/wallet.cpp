@@ -1144,9 +1144,11 @@ bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase, bool use_cr
     Assert(IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS));
 
     // The key derivation below is tuned to take a noticeable amount of time,
-    // so it runs before the wallet locks are taken and does not stall other
-    // wallet users. Whether the wallet may be encrypted is decided under the
-    // locks, after the derivation, so the check and the encryption cannot be
+    // so it runs before the wallet locks are taken. A caller that does not
+    // hold them, such as the GUI's encryption worker, does not stall other
+    // wallet users during it; the encryptwallet RPC holds them for the whole
+    // call. Whether the wallet may be encrypted is decided under the locks,
+    // after the derivation, so the check and the encryption cannot be
     // interleaved with another EncryptWallet caller.
     CKeyingMaterial plain_master_key;
 
