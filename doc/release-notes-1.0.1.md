@@ -17,32 +17,6 @@ format change.
 
 Please report bugs using the Qbit issue tracker.
 
-Maintainer TODO before publication
-==================================
-
-Resolve every item below and delete this section before the notes are passed
-to the release publisher. The publisher snapshots the exact bytes of the file
-given with `--notes-file`.
-
-- [ ] **Pending merge, not yet on `1.x.x` at the time of drafting.** The
-      entries marked `pending merge` below describe #176, #177, and #178 as
-      proposed in those pull requests. Confirm each has merged into the release
-      source and remove the marker, or remove the entry if it did not merge.
-      #178 and #177 both touch `walletmodel.h`; whichever merges second needs a
-      conflict resolution.
-- [ ] **qbit P2MR v1 conformance statement.** Replace the placeholder sentence
-      in "Release verification" with exactly one of the two forms required by
-      `doc/release/release-process.md`, using the digests and the signed tag
-      target of this release.
-- [ ] **Platform signing disposition (#70).** State in "Known limitations"
-      whether macOS and Windows artifacts are signed and notarized, or record
-      the unsigned-platform waiver for this release under the release policy.
-- [ ] **Fuzz evidence (#173).** Update the "Known limitations" entry once
-      instrumented llvm-cov coverage and libFuzzer mutation evidence exist for
-      the release source.
-- [ ] Confirm the release-trust reference for this version exists and that the
-      trusted validation ref named there contains the final release tooling.
-
 How to Upgrade
 ==============
 
@@ -230,8 +204,9 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   that verify and mutate real SLH-DSA signatures and signed P2MR spends, and
   deterministic seed corpora with a manifest were added for the six
   qbit-specific targets. The fuzz runner can require corpus replay for those
-  targets and run a seeded libFuzzer mutation phase; CI replays the corpora
-  and the nightly native-fuzz job runs the mutation phase (#164, #165).
+  targets and run a seeded libFuzzer mutation phase. CI replays the corpora;
+  the nightly native-fuzz job runs the mutation phase once its workflow
+  revision reaches `main` (see Known limitations) (#164, #165).
 - `pending merge` The fuzz coverage checker's `pqc_sign_refused` source anchor
   is re-anchored to the current refusal line, and anchor resolution gained
   its own tests. This restores the `--anchors-only` check; it does not by
@@ -239,11 +214,12 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
 
 ### Release engineering, CI, and documentation
 
-- Published a versioned RPC documentation site that builds each immutable,
-  signed non-candidate release from its tag target next to rolling
-  development documentation, verifies the release signer against the release
-  key policy, and requires each build's reported project version to match
-  its tag. Release candidates are not published to the versioned site (#148).
+- Added a Pages workflow for a versioned RPC documentation site. It builds
+  each immutable, signed non-candidate release from its tag target next to
+  rolling development documentation, verifies the release signer against the
+  release key policy, and requires each build's reported project version to
+  match its tag. Release candidates are not published to the versioned site.
+  The site is not deployed yet (#148).
 - The local release publisher fails closed when the paginated release asset
   listing cannot be read, instead of treating an empty or partial listing as
   a valid draft and uploading assets it believed were missing (#170,
@@ -262,9 +238,9 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   Full Validation run with its conclusion, quote the accepted deviation as
   recorded, remove a retained-file reference that did not exist at the tag,
   and separate the historical `v1.0.0` source from later maintenance results
-  (#136, #175, fixes #156).
-- Stabilized the REST chain-info comparison, Qt shutdown, and wallet timing
-  tests (#137, #149, #164, #165).
+  (#175, fixes #156). The record itself was created by #136.
+- Stabilized the REST chain-info comparison and Qt shutdown tests (#137,
+  #149).
 
 Release verification
 ====================
@@ -275,8 +251,9 @@ against `SHA256SUMS`. The release page is the source of truth for supported
 platform artifacts, signer policy, builder attestations, and the final release
 state.
 
-TODO(maintainer): replace this sentence with exactly one of the two P2MR v1
-conformance statements required by the release process.
+TODO(maintainer): replace this sentence with the P2MR v1 "Conforms to ...
+source commit <SHA>" statement required for mainnet by the release process,
+using this release's signed tag target (it differs between rc1 and final).
 
 Known limitations
 =================
@@ -291,9 +268,9 @@ Known limitations
   checksums, and builder attestations apply either way.
 - Instrumented fuzz coverage evidence for the release source is not yet
   available. The source-anchor mismatch reported in #173 is a test-tool
-  failure, not evidence that PQC verification fails; its fix (#176) restores
-  the anchor check, but the llvm-cov coverage run and libFuzzer mutation phase
-  still need a clang/LLVM host (#173).
+  failure, not evidence that PQC verification fails. Its fix (#176, pending
+  merge) restores the anchor check, but the llvm-cov coverage run and
+  libFuzzer mutation phase still need a clang/LLVM host (#173).
 - The scheduled-validation source selection (#165) and IBD timeout forwarding
   (#159) are present on `1.x.x`, but GitHub schedules run the default branch.
   Their deployment is complete only after the same workflow revisions reach
