@@ -3561,30 +3561,51 @@ void TestEncryptWalletDefersTransactionUpdates(interfaces::Node& node)
     }, 5000));
 }
 
+//! The encoded addresses TestEncryptWalletRepaintUsesCachedLabels pays and
+//! files in its synthetic address book.
+struct LabelTestAddresses {
+    QString labelled;   //!< legacy receiving address labelled "alice", paid by output 0
+    QString unlabelled; //!< paid by output 1, not in the address book
+    QString p2mr;       //!< P2MR receiving address labelled "carol", paid by output 2
+    QString sending;    //!< P2MR sending address labelled "bob"
+    QString refund;     //!< P2MR refund address, hidden from the address book views
+};
+
 //! Check the label-bearing roles and columns a repaint of the transaction
-//! list, the overview page or a tooltip requests for a payment to a labelled
-//! address and to one the address book does not know.
-void VerifyTransactionLabels(const TransactionTableModel& table, const AddressTableModel& addresses, const QString& labelled_address, const QString& unlabelled_address)
+//! list, the overview page or a tooltip requests for payments to labelled
+//! addresses and to one the address book does not know, and the label and
+//! purpose of every address book row.
+void VerifyTransactionLabels(const TransactionTableModel& table, const AddressTableModel& addresses, const LabelTestAddresses& expected)
 {
-    const QModelIndex labelled{table.index(0, TransactionTableModel::ToAddress)};
+    const auto verify_labelled{[&table](int row, const QString& label, const QString& labelled_address) {
+        const QModelIndex labelled{table.index(row, TransactionTableModel::ToAddress)};
+        QVERIFY(labelled.isValid());
+        QCOMPARE(labelled.data(Qt::DisplayRole).toString(), label);
+        QCOMPARE(labelled.data(Qt::EditRole).toString(), QStringLiteral("%1 (%2)").arg(label, labelled_address));
+        QVERIFY(labelled.data(Qt::ToolTipRole).toString().endsWith(QStringLiteral("%1 (%2)").arg(label, labelled_address)));
+        QVERIFY(!labelled.data(Qt::ForegroundRole).isValid());
+        QCOMPARE(labelled.data(TransactionTableModel::LabelRole).toString(), label);
+        QVERIFY(labelled.data(TransactionTableModel::TxPlainTextRole).toString().contains(QStringLiteral("(%1) %2").arg(label, labelled_address)));
+    }};
+    verify_labelled(0, QStringLiteral("alice"), expected.labelled);
+    verify_labelled(2, QStringLiteral("carol"), expected.p2mr);
     const QModelIndex unlabelled{table.index(1, TransactionTableModel::ToAddress)};
-    QVERIFY(labelled.isValid());
     QVERIFY(unlabelled.isValid());
-    QCOMPARE(labelled.data(Qt::DisplayRole).toString(), QStringLiteral("alice"));
-    QCOMPARE(labelled.data(Qt::EditRole).toString(), QStringLiteral("alice (%1)").arg(labelled_address));
-    QVERIFY(labelled.data(Qt::ToolTipRole).toString().endsWith(QStringLiteral("alice (%1)").arg(labelled_address)));
-    QVERIFY(!labelled.data(Qt::ForegroundRole).isValid());
-    QCOMPARE(labelled.data(TransactionTableModel::LabelRole).toString(), QStringLiteral("alice"));
-    QVERIFY(labelled.data(TransactionTableModel::TxPlainTextRole).toString().contains(QStringLiteral("(alice) %1").arg(labelled_address)));
-    QCOMPARE(unlabelled.data(Qt::DisplayRole).toString(), QStringLiteral(" (%1)").arg(unlabelled_address));
-    QCOMPARE(unlabelled.data(Qt::EditRole).toString(), QStringLiteral(" (%1)").arg(unlabelled_address));
+    QCOMPARE(unlabelled.data(Qt::DisplayRole).toString(), QStringLiteral(" (%1)").arg(expected.unlabelled));
+    QCOMPARE(unlabelled.data(Qt::EditRole).toString(), QStringLiteral(" (%1)").arg(expected.unlabelled));
     QCOMPARE(qvariant_cast<QColor>(unlabelled.data(Qt::ForegroundRole)), COLOR_BAREADDRESS);
     QCOMPARE(unlabelled.data(TransactionTableModel::LabelRole).toString(), QString{});
-    QVERIFY(unlabelled.data(TransactionTableModel::TxPlainTextRole).toString().contains(QStringLiteral("(no label) %1").arg(unlabelled_address)));
-    QCOMPARE(addresses.labelForAddress(labelled_address), QStringLiteral("alice"));
-    QVERIFY(addresses.purposeForAddress(labelled_address) == wallet::AddressPurpose::RECEIVE);
-    QCOMPARE(addresses.labelForAddress(unlabelled_address), QString{});
-    QVERIFY(addresses.purposeForAddress(unlabelled_address) == std::nullopt);
+    QVERIFY(unlabelled.data(TransactionTableModel::TxPlainTextRole).toString().contains(QStringLiteral("(no label) %1").arg(expected.unlabelled)));
+    QCOMPARE(addresses.labelForAddress(expected.labelled), QStringLiteral("alice"));
+    QVERIFY(addresses.purposeForAddress(expected.labelled) == wallet::AddressPurpose::RECEIVE);
+    QCOMPARE(addresses.labelForAddress(expected.unlabelled), QString{});
+    QVERIFY(addresses.purposeForAddress(expected.unlabelled) == std::nullopt);
+    QCOMPARE(addresses.labelForAddress(expected.p2mr), QStringLiteral("carol"));
+    QVERIFY(addresses.purposeForAddress(expected.p2mr) == wallet::AddressPurpose::RECEIVE);
+    QCOMPARE(addresses.labelForAddress(expected.sending), QStringLiteral("bob"));
+    QVERIFY(addresses.purposeForAddress(expected.sending) == wallet::AddressPurpose::SEND);
+    QCOMPARE(addresses.labelForAddress(expected.refund), QString{});
+    QVERIFY(addresses.purposeForAddress(expected.refund) == wallet::AddressPurpose::REFUND);
 }
 
 //! A repaint of the transaction list or the overview page resolves address
@@ -3599,26 +3620,41 @@ void TestEncryptWalletRepaintUsesCachedLabels(interfaces::Node& node)
     auto state{std::make_shared<qt_test::SyntheticWalletState>()};
     state->allow_encrypt = false;
 
-    // A confirmed payment to a labelled receiving address and to one the
-    // address book does not know, loaded with the wallet's history.
+    // A confirmed payment to two labelled receiving addresses, one of them
+    // P2MR like every address a release chain's wallet hands out, and to one
+    // the address book does not know, loaded with the wallet's history. The
+    // address book also holds a sending and a hidden refund address, and its
+    // rows mix both encodings in the order the model searches them in.
     const CTxDestination labelled{PKHash{*uint160::FromHex("0000000000000000000000000000000000000001")}};
     const CTxDestination unlabelled{PKHash{*uint160::FromHex("0000000000000000000000000000000000000002")}};
-    const QString labelled_address{QString::fromStdString(EncodeDestination(labelled))};
-    const QString unlabelled_address{QString::fromStdString(EncodeDestination(unlabelled))};
+    const CTxDestination p2mr{WitnessV2P2MR{*uint256::FromHex("0000000000000000000000000000000000000000000000000000000000000003")}};
+    const CTxDestination sending{WitnessV2P2MR{*uint256::FromHex("0000000000000000000000000000000000000000000000000000000000000004")}};
+    const CTxDestination refund{WitnessV2P2MR{*uint256::FromHex("0000000000000000000000000000000000000000000000000000000000000005")}};
+    const LabelTestAddresses label_addresses{
+        .labelled = QString::fromStdString(EncodeDestination(labelled)),
+        .unlabelled = QString::fromStdString(EncodeDestination(unlabelled)),
+        .p2mr = QString::fromStdString(EncodeDestination(p2mr)),
+        .sending = QString::fromStdString(EncodeDestination(sending)),
+        .refund = QString::fromStdString(EncodeDestination(refund)),
+    };
     state->address_book.emplace_back(labelled, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "alice");
+    state->address_book.emplace_back(p2mr, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "carol");
+    state->address_book.emplace_back(sending, /*is_mine=*/false, wallet::AddressPurpose::SEND, "bob");
+    state->address_book.emplace_back(refund, /*is_mine=*/true, wallet::AddressPurpose::REFUND, "");
     CMutableTransaction mtx;
     mtx.vin.emplace_back(COutPoint{Txid{}, 0});
     mtx.vout.emplace_back(COIN, GetScriptForDestination(labelled));
     mtx.vout.emplace_back(2 * COIN, GetScriptForDestination(unlabelled));
+    mtx.vout.emplace_back(3 * COIN, GetScriptForDestination(p2mr));
     const CTransactionRef tx{MakeTransactionRef(mtx)};
     state->wallet_tx = interfaces::WalletTx{
         .tx = tx,
         .txin_is_mine = {false},
-        .txout_is_mine = {true, true},
-        .txout_is_change = {false, false},
-        .txout_address = {labelled, unlabelled},
-        .txout_address_is_mine = {true, true},
-        .credit = 3 * COIN,
+        .txout_is_mine = {true, true, true},
+        .txout_is_change = {false, false, false},
+        .txout_address = {labelled, unlabelled, p2mr},
+        .txout_address_is_mine = {true, true, true},
+        .credit = 6 * COIN,
         .debit = 0,
         .change = 0,
         .time = 1,
@@ -3634,10 +3670,10 @@ void TestEncryptWalletRepaintUsesCachedLabels(interfaces::Node& node)
     const ReleaseSyntheticEncryptionOnExit release_on_exit{state};
     TransactionTableModel* const table{model->getTransactionTableModel()};
     AddressTableModel* const addresses{model->getAddressTableModel()};
-    QCOMPARE(table->rowCount({}), 2);
-    QCOMPARE(addresses->rowCount({}), 1);
+    QCOMPARE(table->rowCount({}), 3);
+    QCOMPARE(addresses->rowCount({}), 4);
     QCOMPARE(table->index(0, 0).data(TransactionTableModel::StatusRole).toInt(), static_cast<int>(TransactionStatus::Confirming));
-    VerifyTransactionLabels(*table, *addresses, labelled_address, unlabelled_address);
+    VerifyTransactionLabels(*table, *addresses, label_addresses);
 
     // The overview page paints its recent transactions through TxViewDelegate,
     // which asks the ToAddress column for its display text and colour.
@@ -3647,8 +3683,8 @@ void TestEncryptWalletRepaintUsesCachedLabels(interfaces::Node& node)
     QListView* const recent{overview.findChild<QListView*>("listTransactions")};
     QVERIFY(recent);
     overview.grab();
-    QCOMPARE(recent->model()->rowCount({}), 2);
-    QVERIFY(recent->viewport()->rect().contains(recent->visualRect(recent->model()->index(1, TransactionTableModel::ToAddress))));
+    QCOMPARE(recent->model()->rowCount({}), 3);
+    QVERIFY(recent->viewport()->rect().contains(recent->visualRect(recent->model()->index(2, TransactionTableModel::ToAddress))));
 
     int gui_ticks{0};
     QTimer gui_latch;
@@ -3684,7 +3720,7 @@ void TestEncryptWalletRepaintUsesCachedLabels(interfaces::Node& node)
     // Repaint the overview page and request what the transaction list and its
     // tooltips ask for while the worker holds the wallet.
     overview.grab();
-    VerifyTransactionLabels(*table, *addresses, labelled_address, unlabelled_address);
+    VerifyTransactionLabels(*table, *addresses, label_addresses);
     const int ticks_at_repaint{gui_ticks};
     const bool responsive{WaitUntil([&gui_ticks, ticks_at_repaint] { return gui_ticks > ticks_at_repaint + 20; }, 5000)};
     {
@@ -3704,7 +3740,7 @@ void TestEncryptWalletRepaintUsesCachedLabels(interfaces::Node& node)
     QVERIFY2(result_text.startsWith("<qt>Your wallet is now encrypted."), qPrintable(result_text));
     QVERIFY(!model->isEncryptingWallet());
     overview.grab();
-    VerifyTransactionLabels(*table, *addresses, labelled_address, unlabelled_address);
+    VerifyTransactionLabels(*table, *addresses, label_addresses);
     QVERIFY(WaitUntil([&state] {
         return SyntheticStateMatches(state, [](const auto& value) { return value.background_clone_destroyed; });
     }, 5000));
