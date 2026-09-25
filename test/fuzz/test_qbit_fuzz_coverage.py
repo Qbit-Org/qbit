@@ -66,7 +66,7 @@ ANCHORS = {
     "sign_pqc_append_hashtype": Anchor("src/script/sign.cpp", ("sig = std::move(raw_sig);", "if (nHashType) sig.push_back(nHashType);"), "sig.push_back"),
     "pqc_set_reject": Anchor("src/crypto/pqc.cpp", ("slh_dsa_secret_key_validate(begin, SIZE) != 0) {", "ClearKeyData();"), "ClearKeyData"),
     "pqc_set_accept": Anchor("src/crypto/pqc.cpp", ("MakeKeyData();", "std::memcpy(m_keydata->data(), begin, SIZE);"), "std::memcpy"),
-    "pqc_sign_refused": Anchor("src/crypto/pqc.cpp", ("if (!IsValid() || counter_inout >= PQC_MAX_SIGNATURES) return false;",), "return"),
+    "pqc_sign_refused": Anchor("src/crypto/pqc.cpp", ("if (!IsValid() || counter_inout >= PQC_MAX_SIGNATURES) return finish(false);",), "return"),
     "pqc_sign_call": Anchor("src/crypto/pqc.cpp", ("if (slh_dsa_sign(candidate_sig.data(), &siglen, hash.begin(), hash.size(), m_keydata->data()) != 0 ||",), "slh_dsa_sign"),
     "pqc_sign_accept": Anchor("src/crypto/pqc.cpp", ("sig = std::move(candidate_sig);",), "sig"),
     "pqc_verify_call": Anchor("src/crypto/pqc.h", ("return slh_dsa_verify(sig.data(), sig.size(), hash.begin(), hash.size(), m_data.data()) == 0;",), "slh_dsa_verify"),
@@ -165,6 +165,43 @@ def run(command, **kwargs):
     return subprocess.run(command, capture_output=True, text=True, timeout=3600, **kwargs)
 
 
+class AnchorResolutionTest(unittest.TestCase):
+    """A stale or ambiguous anchor must fail rather than read counts from another region."""
+
+    def resolve(self, anchor, source):
+        source_dir = Path(tempfile.mkdtemp(prefix="qbit_fuzz_anchor_"))
+        self.addCleanup(shutil.rmtree, source_dir)
+        (source_dir / anchor.file).parent.mkdir(parents=True)
+        (source_dir / anchor.file).write_text(source, encoding="utf8")
+        return resolve_anchor(anchor, source_dir)
+
+    def test_refusal_branch_resolves_to_its_return(self):
+        # Sign() also has `return finish(false);` for a failed slh_dsa_sign, which must not be chosen.
+        anchor = ANCHORS["pqc_sign_refused"]
+        source = f"{{\n    {anchor.lines[0]}\n    if (failed) {{\n        return finish(false);\n    }}\n}}\n"
+        self.assertEqual(self.resolve(anchor, source), (2, 4 + anchor.lines[0].index("return finish(false);") + 1))
+
+    def test_multi_line_anchor_resolves_on_last_line(self):
+        anchor = Anchor("src/crypto/pqc.cpp", ("return finish(false);", "return finish(true);"), "return")
+        self.assertEqual(self.resolve(anchor, "{\nreturn finish(false);\n    return finish(true);\n}\n"), (3, 5))
+
+    def test_missing_anchor_fails(self):
+        anchor = ANCHORS["pqc_sign_refused"]
+        stale = "if (!IsValid() || counter_inout >= PQC_MAX_SIGNATURES) return false;\n"
+        with self.assertRaisesRegex(AssertionError, "matched 0 times"):
+            self.resolve(anchor, stale)
+
+    def test_ambiguous_anchor_fails(self):
+        anchor = ANCHORS["pqc_sign_refused"]
+        with self.assertRaisesRegex(AssertionError, "matched 2 times"):
+            self.resolve(anchor, f"{anchor.lines[0]}\n{anchor.lines[0]}\n")
+
+    def test_missing_token_fails(self):
+        anchor = Anchor("src/crypto/pqc.cpp", ("return finish(false);",), "finish(true)")
+        with self.assertRaisesRegex(AssertionError, "not on line 1"):
+            self.resolve(anchor, "return finish(false);\n")
+
+
 class CoverageContractTest(unittest.TestCase):
     def test_generation_and_verification_paths_remain_covered(self):
         if "fuzz_binary" not in CONFIG:
@@ -228,7 +265,7 @@ def main():
     parser.add_argument("--llvm-cov", default="llvm-cov")
     parser.add_argument("--source-dir", type=Path, default=SRC_DIR, help="Source tree the executable was built from.")
     parser.add_argument("--path-equivalence", help="Passed to llvm-cov export when build paths differ from --source-dir.")
-    parser.add_argument("--anchors-only", action="store_true", help="Only resolve anchors and named seeds; does not evaluate coverage.")
+    parser.add_argument("--anchors-only", action="store_true", help="Only resolve anchors and named seeds and test anchor resolution; does not evaluate coverage.")
     args = parser.parse_args()
 
     if args.anchors_only:
@@ -239,12 +276,14 @@ def main():
                 assert (CORPORA_DIR / target / case).is_file(), f"missing seed {target}/{case}"
                 assert set(expectations) <= set(ANCHORS), f"unknown anchor in {target}/{case}"
         print("Anchors resolved. Coverage was NOT evaluated.")
-        return 0
+        suite = unittest.TestLoader().loadTestsFromTestCase(AnchorResolutionTest)
+        return 0 if unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful() else 1
 
     if args.fuzz_binary:
         CONFIG.update(fuzz_binary=args.fuzz_binary.resolve(), llvm_profdata=args.llvm_profdata, llvm_cov=args.llvm_cov,
                       source_dir=args.source_dir.resolve(), path_equivalence=args.path_equivalence)
-    suite = unittest.TestLoader().loadTestsFromTestCase(CoverageContractTest)
+    loader = unittest.TestLoader()
+    suite = unittest.TestSuite([loader.loadTestsFromTestCase(AnchorResolutionTest), loader.loadTestsFromTestCase(CoverageContractTest)])
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     return 0 if result.wasSuccessful() else 1
 
