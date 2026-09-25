@@ -17,6 +17,7 @@
 #include <qt/bitcoinamountfield.h>
 #include <qt/qbitunits.h>
 #include <qt/clientmodel.h>
+#include <qt/guiconstants.h>
 #include <qt/guiutil.h>
 #include <qt/optionsmodel.h>
 #include <qt/overviewpage.h>
@@ -30,6 +31,7 @@
 #include <qt/sendcoinsentry.h>
 #include <qt/signverifymessagedialog.h>
 #include <qt/test/syntheticwallet.h>
+#include <qt/transactionrecord.h>
 #include <qt/transactiontablemodel.h>
 #include <qt/transactionview.h>
 #include <qt/walletmodel.h>
@@ -55,6 +57,7 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <span>
@@ -69,6 +72,7 @@
 #include <QApplication>
 #include <QCheckBox>
 #include <QClipboard>
+#include <QColor>
 #include <QComboBox>
 #include <QElapsedTimer>
 #include <QEvent>
@@ -3557,6 +3561,191 @@ void TestEncryptWalletDefersTransactionUpdates(interfaces::Node& node)
     }, 5000));
 }
 
+//! The encoded addresses TestEncryptWalletRepaintUsesCachedLabels pays and
+//! files in its synthetic address book.
+struct LabelTestAddresses {
+    QString labelled;   //!< legacy receiving address labelled "alice", paid by output 0
+    QString unlabelled; //!< paid by output 1, not in the address book
+    QString p2mr;       //!< P2MR receiving address labelled "carol", paid by output 2
+    QString sending;    //!< P2MR sending address labelled "bob"
+    QString refund;     //!< P2MR refund address, hidden from the address book views
+};
+
+//! Check the label-bearing roles and columns a repaint of the transaction
+//! list, the overview page or a tooltip requests for payments to labelled
+//! addresses and to one the address book does not know, and the label and
+//! purpose of every address book row.
+void VerifyTransactionLabels(const TransactionTableModel& table, const AddressTableModel& addresses, const LabelTestAddresses& expected)
+{
+    const auto verify_labelled{[&table](int row, const QString& label, const QString& labelled_address) {
+        const QModelIndex labelled{table.index(row, TransactionTableModel::ToAddress)};
+        QVERIFY(labelled.isValid());
+        QCOMPARE(labelled.data(Qt::DisplayRole).toString(), label);
+        QCOMPARE(labelled.data(Qt::EditRole).toString(), QStringLiteral("%1 (%2)").arg(label, labelled_address));
+        QVERIFY(labelled.data(Qt::ToolTipRole).toString().endsWith(QStringLiteral("%1 (%2)").arg(label, labelled_address)));
+        QVERIFY(!labelled.data(Qt::ForegroundRole).isValid());
+        QCOMPARE(labelled.data(TransactionTableModel::LabelRole).toString(), label);
+        QVERIFY(labelled.data(TransactionTableModel::TxPlainTextRole).toString().contains(QStringLiteral("(%1) %2").arg(label, labelled_address)));
+    }};
+    verify_labelled(0, QStringLiteral("alice"), expected.labelled);
+    verify_labelled(2, QStringLiteral("carol"), expected.p2mr);
+    const QModelIndex unlabelled{table.index(1, TransactionTableModel::ToAddress)};
+    QVERIFY(unlabelled.isValid());
+    QCOMPARE(unlabelled.data(Qt::DisplayRole).toString(), QStringLiteral(" (%1)").arg(expected.unlabelled));
+    QCOMPARE(unlabelled.data(Qt::EditRole).toString(), QStringLiteral(" (%1)").arg(expected.unlabelled));
+    QCOMPARE(qvariant_cast<QColor>(unlabelled.data(Qt::ForegroundRole)), COLOR_BAREADDRESS);
+    QCOMPARE(unlabelled.data(TransactionTableModel::LabelRole).toString(), QString{});
+    QVERIFY(unlabelled.data(TransactionTableModel::TxPlainTextRole).toString().contains(QStringLiteral("(no label) %1").arg(expected.unlabelled)));
+    QCOMPARE(addresses.labelForAddress(expected.labelled), QStringLiteral("alice"));
+    QVERIFY(addresses.purposeForAddress(expected.labelled) == wallet::AddressPurpose::RECEIVE);
+    QCOMPARE(addresses.labelForAddress(expected.unlabelled), QString{});
+    QVERIFY(addresses.purposeForAddress(expected.unlabelled) == std::nullopt);
+    QCOMPARE(addresses.labelForAddress(expected.p2mr), QStringLiteral("carol"));
+    QVERIFY(addresses.purposeForAddress(expected.p2mr) == wallet::AddressPurpose::RECEIVE);
+    QCOMPARE(addresses.labelForAddress(expected.sending), QStringLiteral("bob"));
+    QVERIFY(addresses.purposeForAddress(expected.sending) == wallet::AddressPurpose::SEND);
+    QCOMPARE(addresses.labelForAddress(expected.refund), QString{});
+    QVERIFY(addresses.purposeForAddress(expected.refund) == wallet::AddressPurpose::REFUND);
+}
+
+//! A repaint of the transaction list or the overview page resolves address
+//! labels through the address table model, which asked the wallet under its
+//! locks: an expose event while the encryption worker held them stalled the
+//! GUI thread until the encryption finished. The address book cannot change
+//! while the worker holds the wallet, so the model answers from the rows it
+//! already holds, and from the wallet again once the worker has returned.
+void TestEncryptWalletRepaintUsesCachedLabels(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    state->allow_encrypt = false;
+
+    // A confirmed payment to two labelled receiving addresses, one of them
+    // P2MR like every address a release chain's wallet hands out, and to one
+    // the address book does not know, loaded with the wallet's history. The
+    // address book also holds a sending and a hidden refund address, and its
+    // rows mix both encodings in the order the model searches them in.
+    const CTxDestination labelled{PKHash{*uint160::FromHex("0000000000000000000000000000000000000001")}};
+    const CTxDestination unlabelled{PKHash{*uint160::FromHex("0000000000000000000000000000000000000002")}};
+    const CTxDestination p2mr{WitnessV2P2MR{*uint256::FromHex("0000000000000000000000000000000000000000000000000000000000000003")}};
+    const CTxDestination sending{WitnessV2P2MR{*uint256::FromHex("0000000000000000000000000000000000000000000000000000000000000004")}};
+    const CTxDestination refund{WitnessV2P2MR{*uint256::FromHex("0000000000000000000000000000000000000000000000000000000000000005")}};
+    const LabelTestAddresses label_addresses{
+        .labelled = QString::fromStdString(EncodeDestination(labelled)),
+        .unlabelled = QString::fromStdString(EncodeDestination(unlabelled)),
+        .p2mr = QString::fromStdString(EncodeDestination(p2mr)),
+        .sending = QString::fromStdString(EncodeDestination(sending)),
+        .refund = QString::fromStdString(EncodeDestination(refund)),
+    };
+    state->address_book.emplace_back(labelled, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "alice");
+    state->address_book.emplace_back(p2mr, /*is_mine=*/true, wallet::AddressPurpose::RECEIVE, "carol");
+    state->address_book.emplace_back(sending, /*is_mine=*/false, wallet::AddressPurpose::SEND, "bob");
+    state->address_book.emplace_back(refund, /*is_mine=*/true, wallet::AddressPurpose::REFUND, "");
+    CMutableTransaction mtx;
+    mtx.vin.emplace_back(COutPoint{Txid{}, 0});
+    mtx.vout.emplace_back(COIN, GetScriptForDestination(labelled));
+    mtx.vout.emplace_back(2 * COIN, GetScriptForDestination(unlabelled));
+    mtx.vout.emplace_back(3 * COIN, GetScriptForDestination(p2mr));
+    const CTransactionRef tx{MakeTransactionRef(mtx)};
+    state->wallet_tx = interfaces::WalletTx{
+        .tx = tx,
+        .txin_is_mine = {false},
+        .txout_is_mine = {true, true, true},
+        .txout_is_change = {false, false, false},
+        .txout_address = {labelled, unlabelled, p2mr},
+        .txout_address_is_mine = {true, true, true},
+        .credit = 6 * COIN,
+        .debit = 0,
+        .change = 0,
+        .time = 1,
+        .value_map = {},
+        .is_coinbase = false,
+    };
+    state->wallet_tx_status.block_height = 1;
+    state->wallet_tx_status.depth_in_main_chain = 1;
+    state->wallet_tx_status.is_trusted = true;
+    state->wallet_tx_status.is_in_main_chain = true;
+
+    auto model{env.makeModel(state)};
+    const ReleaseSyntheticEncryptionOnExit release_on_exit{state};
+    TransactionTableModel* const table{model->getTransactionTableModel()};
+    AddressTableModel* const addresses{model->getAddressTableModel()};
+    QCOMPARE(table->rowCount({}), 3);
+    QCOMPARE(addresses->rowCount({}), 4);
+    QCOMPARE(table->index(0, 0).data(TransactionTableModel::StatusRole).toInt(), static_cast<int>(TransactionStatus::Confirming));
+    VerifyTransactionLabels(*table, *addresses, label_addresses);
+
+    // The overview page paints its recent transactions through TxViewDelegate,
+    // which asks the ToAddress column for its display text and colour.
+    OverviewPage overview{env.platform_style.get()};
+    overview.setWalletModel(model.get());
+    overview.resize(640, 480);
+    QListView* const recent{overview.findChild<QListView*>("listTransactions")};
+    QVERIFY(recent);
+    overview.grab();
+    QCOMPARE(recent->model()->rowCount({}), 3);
+    QVERIFY(recent->viewport()->rect().contains(recent->visualRect(recent->model()->index(2, TransactionTableModel::ToAddress))));
+
+    int gui_ticks{0};
+    QTimer gui_latch;
+    QObject::connect(&gui_latch, &QTimer::timeout, [&gui_ticks] { ++gui_ticks; });
+    gui_latch.start(0);
+
+    // Release the latch if the GUI thread stops servicing events, so a label
+    // lookup that reads the encrypting wallet fails the assertions below
+    // instead of hanging the test.
+    bool gui_alive{false};
+    std::thread watchdog{[state, &gui_alive] {
+        std::unique_lock lock{state->mutex};
+        if (!state->condition.wait_for(lock, std::chrono::seconds{5}, [&] { return gui_alive || state->encrypt_finished; })) {
+            state->watchdog_released = true;
+            state->allow_encrypt = true;
+            lock.unlock();
+            state->condition.notify_all();
+        }
+    }};
+    const JoinOnExit join_watchdog{watchdog};
+
+    auto* dialog{new AskPassphraseDialog(AskPassphraseDialog::Encrypt, nullptr)};
+    QPointer<AskPassphraseDialog> dialog_guard{dialog};
+    dialog->setModel(model.get());
+    GUIUtil::ShowModalDialogAsynchronously(dialog);
+    QString result_text;
+    VisibleMessageBoxClicker result{QMessageBox::Ok, &result_text};
+    SubmitEncryption(*dialog, QStringLiteral("test-passphrase"));
+    QVERIFY(WaitUntil([&state] {
+        return SyntheticStateMatches(state, [](const auto& value) { return value.encrypt_entered && value.encrypt_in_progress; });
+    }, 5000));
+
+    // Repaint the overview page and request what the transaction list and its
+    // tooltips ask for while the worker holds the wallet.
+    overview.grab();
+    VerifyTransactionLabels(*table, *addresses, label_addresses);
+    const int ticks_at_repaint{gui_ticks};
+    const bool responsive{WaitUntil([&gui_ticks, ticks_at_repaint] { return gui_ticks > ticks_at_repaint + 20; }, 5000)};
+    {
+        std::lock_guard lock{state->mutex};
+        gui_alive = true;
+    }
+    state->condition.notify_all();
+    watchdog.join();
+    QVERIFY2(!SyntheticStateMatches(state, [](const auto& value) { return value.watchdog_released; }),
+             "GUI thread blocked on the encrypting wallet while resolving transaction labels");
+    QVERIFY(responsive);
+    QVERIFY(SyntheticStateMatches(state, [](const auto& value) { return value.encrypt_calls == 1 && value.encrypt_in_progress; }));
+
+    ReleaseSyntheticEncryption(state);
+    QVERIFY(WaitUntil([&dialog_guard] { return dialog_guard.isNull(); }, 5000));
+    QVERIFY(result.clicked());
+    QVERIFY2(result_text.startsWith("<qt>Your wallet is now encrypted."), qPrintable(result_text));
+    QVERIFY(!model->isEncryptingWallet());
+    overview.grab();
+    VerifyTransactionLabels(*table, *addresses, label_addresses);
+    QVERIFY(WaitUntil([&state] {
+        return SyntheticStateMatches(state, [](const auto& value) { return value.background_clone_destroyed; });
+    }, 5000));
+}
+
 //! BitcoinGUI::updateWalletStatus reads the current wallet whenever any wallet
 //! reports a status change, so another wallet's notification while the
 //! current one is being encrypted must not send the GUI thread into the
@@ -3969,6 +4158,7 @@ void WalletTests::walletTests()
     TestFeeBumpModelDestroyedDuringUnlock(m_node);
     TestEncryptWalletKeepsGuiResponsive(m_node);
     TestEncryptWalletDefersTransactionUpdates(m_node);
+    TestEncryptWalletRepaintUsesCachedLabels(m_node);
     TestEncryptWalletOtherWalletStatusChange(m_node);
     TestEncryptWalletFailureReportsError(m_node);
     TestEncryptWalletExceptionEscapes(m_node);
