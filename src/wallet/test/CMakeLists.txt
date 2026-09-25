@@ -19,6 +19,7 @@ target_sources(test_bitcoin
     scriptpubkeyman_tests.cpp
     spend_tests.cpp
     wallet_crypto_tests.cpp
+    wallet_encryption_tests.cpp
     wallet_p2mr_basic_tests.cpp
     wallet_p2mr_batch_reservation_tests.cpp
     wallet_p2mr_change_keypool_tests.cpp

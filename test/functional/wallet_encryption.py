@@ -6,12 +6,15 @@
 
 import time
 import subprocess
+from threading import Thread
 
+from test_framework.authproxy import JSONRPCException
 from test_framework.messages import hash256
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_raises_rpc_error,
     assert_equal,
+    get_rpc_proxy,
 )
 from test_framework.wallet_util import WalletUnlock
 
@@ -102,6 +105,42 @@ class WalletEncryptionTest(BitcoinTestFramework):
             with WalletUnlock(self.nodes[0], passphrase_with_nulls):
                 sig = self.nodes[0].signmessage(address, msg)
                 assert self.nodes[0].verifymessage(address, sig, msg)
+
+        self.log.info("Test that overlapping encryptwallet calls encrypt the wallet once")
+        self.nodes[0].createwallet(wallet_name="overlap")
+        passphrases = ["first passphrase", "second passphrase"]
+        results = [None] * len(passphrases)
+
+        def encrypt(index):
+            # Each thread needs its own RPC connection.
+            if self.options.usecli:
+                rpc = self.nodes[0].cli("-rpcwallet=overlap")
+            else:
+                rpc = get_rpc_proxy(self.nodes[0].url, 0, timeout=600, coveragedir=self.nodes[0].coverage_dir) / "wallet/overlap"
+            try:
+                results[index] = rpc.encryptwallet(passphrases[index])
+            except JSONRPCException as e:
+                results[index] = e
+
+        threads = [Thread(target=encrypt, args=(index,)) for index in range(len(passphrases))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        winners = [index for index, result in enumerate(results) if isinstance(result, str)]
+        losers = [index for index, result in enumerate(results) if isinstance(result, JSONRPCException)]
+        assert_equal(len(winners), 1)
+        assert_equal(len(losers), 1)
+        # The call that did not encrypt the wallet reports the wallet as
+        # already encrypted, the same error as any later encryptwallet call.
+        assert_equal(results[losers[0]].error["code"], -15)
+        assert_equal(results[losers[0]].error["message"], "Error: running with an encrypted wallet, but encryptwallet was called.")
+        overlap_wallet = self.nodes[0].get_wallet_rpc("overlap")
+        assert_equal(overlap_wallet.getwalletinfo()["unlocked_until"], 0)
+        assert_raises_rpc_error(-14, "wallet passphrase entered was incorrect", overlap_wallet.walletpassphrase, passphrases[losers[0]], 10)
+        with WalletUnlock(overlap_wallet, passphrases[winners[0]]):
+            assert overlap_wallet.getwalletinfo()["unlocked_until"] > 0
+        overlap_wallet.unloadwallet()
 
         self.log.info("Test that wallets without private keys cannot be encrypted")
         self.nodes[0].createwallet(wallet_name="noprivs", disable_private_keys=True)

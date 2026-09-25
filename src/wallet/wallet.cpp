@@ -160,7 +160,7 @@ bool AddWallet(WalletContext& context, const std::shared_ptr<CWallet>& wallet)
     std::vector<std::shared_ptr<CWallet>>::const_iterator i = std::find(context.wallets.begin(), context.wallets.end(), wallet);
     if (i != context.wallets.end()) return false;
     context.wallets.push_back(wallet);
-    wallet->ConnectScriptPubKeyManNotifiers();
+    WITH_LOCK(wallet->cs_wallet, wallet->ConnectScriptPubKeyManNotifiers());
     wallet->NotifyCanGetAddressesChanged();
     return true;
 }
@@ -1143,14 +1143,13 @@ bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase, bool use_cr
     // Only descriptor wallets can be encrypted
     Assert(IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS));
 
-    if (IsCrypted())
-        return false;
-
-    if (!IsPQCKeyValidationReadyForPrivateKeyUse()) {
-        WalletLogPrintf("Refusing wallet encryption while plaintext PQC key validation is pending or failed\n");
-        return false;
-    }
-
+    // The key derivation below is tuned to take a noticeable amount of time,
+    // so it runs before the wallet locks are taken. A caller that does not
+    // hold them, such as the GUI's encryption worker, does not stall other
+    // wallet users during it; the encryptwallet RPC holds them for the whole
+    // call. Whether the wallet may be encrypted is decided under the locks,
+    // after the derivation, so the check and the encryption cannot be
+    // interleaved with another EncryptWallet caller.
     CKeyingMaterial plain_master_key;
 
     plain_master_key.resize(WALLET_CRYPTO_KEY_SIZE);
@@ -1164,18 +1163,38 @@ bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase, bool use_cr
     if (!EncryptMasterKey(strWalletPassphrase, plain_master_key, master_key)) {
         return false;
     }
-    WalletLogPrintf("Encrypting Wallet with an nDeriveIterations of %i\n", master_key.nDeriveIterations);
+    if (m_before_encrypt_wallet_locks) m_before_encrypt_wallet_locks();
 
     {
         LOCK2(m_relock_mutex, cs_wallet);
-        mapMasterKeys[++nMasterKeyMaxID] = master_key;
+        if (IsCrypted()) {
+            WalletLogPrintf("Refusing wallet encryption because the wallet is already encrypted\n");
+            return false;
+        }
+        if (!IsPQCKeyValidationReadyForPrivateKeyUse()) {
+            WalletLogPrintf("Refusing wallet encryption while plaintext PQC key validation is pending or failed\n");
+            return false;
+        }
+        WalletLogPrintf("Encrypting Wallet with an nDeriveIterations of %i\n", master_key.nDeriveIterations);
+
         WalletBatch* encrypted_batch = new WalletBatch(GetDatabase());
         if (!encrypted_batch->TxnBegin()) {
             delete encrypted_batch;
             encrypted_batch = nullptr;
             return false;
         }
-        encrypted_batch->WriteMasterKey(nMasterKeyMaxID, master_key);
+        // The master key becomes visible in memory only once it is part of
+        // the open transaction, so a failure up to here leaves the wallet
+        // unencrypted in memory as well as on disk.
+        const unsigned int master_key_id{nMasterKeyMaxID + 1};
+        if (!encrypted_batch->WriteMasterKey(master_key_id, master_key)) {
+            encrypted_batch->TxnAbort();
+            delete encrypted_batch;
+            encrypted_batch = nullptr;
+            return false;
+        }
+        nMasterKeyMaxID = master_key_id;
+        mapMasterKeys[master_key_id] = master_key;
 
         for (const auto& spk_man_pair : m_spk_managers) {
             auto spk_man = spk_man_pair.second.get();
@@ -2050,6 +2069,7 @@ CAmount CWallet::GetDebit(const CTransaction& tx) const
 
 bool CWallet::IsHDEnabled() const
 {
+    LOCK(cs_wallet);
     // All Active ScriptPubKeyMans must be HD for this to be true
     bool result = false;
     for (const auto& spk_man : GetActiveScriptPubKeyMans()) {
@@ -4253,6 +4273,7 @@ std::shared_ptr<CWallet> CWallet::Create(WalletContext& context, const std::stri
         error = strprintf(_("Error loading %s: Private keys can only be disabled during creation"), walletFile);
         return nullptr;
     } else if (walletInstance->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
+        LOCK(walletInstance->cs_wallet);
         for (auto spk_man : walletInstance->GetActiveScriptPubKeyMans()) {
             if (spk_man->HavePrivateKeys()) {
                 warnings.push_back(strprintf(_("Warning: Private keys detected in wallet {%s} with disabled private keys"), walletFile));
@@ -4718,6 +4739,7 @@ bool CWallet::Unlock(const CKeyingMaterial& vMasterKeyIn)
 
 std::set<ScriptPubKeyMan*> CWallet::GetActiveScriptPubKeyMans() const
 {
+    AssertLockHeld(cs_wallet);
     std::set<ScriptPubKeyMan*> spk_mans;
     for (const auto& [_, spk_man] : m_external_spk_managers) {
         if (spk_man) {
@@ -4734,6 +4756,7 @@ std::set<ScriptPubKeyMan*> CWallet::GetActiveScriptPubKeyMans() const
 
 bool CWallet::IsActiveScriptPubKeyMan(const ScriptPubKeyMan& spkm) const
 {
+    AssertLockHeld(cs_wallet);
     for (const auto& [_, ext_spkm] : m_external_spk_managers) {
         if (ext_spkm == &spkm) return true;
     }
@@ -4895,6 +4918,7 @@ bool CWallet::HaveCryptedKeys() const
 
 void CWallet::ConnectScriptPubKeyManNotifiers()
 {
+    AssertLockHeld(cs_wallet);
     for (const auto& spk_man : GetActiveScriptPubKeyMans()) {
         spk_man->NotifyCanGetAddressesChanged.connect(NotifyCanGetAddressesChanged);
         spk_man->NotifyFirstKeyTimeChanged.connect(std::bind(&CWallet::MaybeUpdateBirthTime, this, std::placeholders::_2));
