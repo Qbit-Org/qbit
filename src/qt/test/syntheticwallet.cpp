@@ -159,8 +159,24 @@ public:
     bool isSpendable(const CTxDestination&) override { return false; }
     bool setAddressBook(const CTxDestination&, const std::string&, const std::optional<wallet::AddressPurpose>&) override { return false; }
     bool delAddressBook(const CTxDestination&) override { return false; }
-    bool getAddress(const CTxDestination&, std::string*, wallet::AddressPurpose*) override { return false; }
-    std::vector<interfaces::WalletAddress> getAddresses() override { return {}; }
+    bool getAddress(const CTxDestination& dest, std::string* name, wallet::AddressPurpose* purpose) override
+    {
+        std::unique_lock lock{m_state->mutex};
+        WaitForEncryption(lock);
+        for (const auto& entry : m_state->address_book) {
+            if (entry.dest != dest) continue;
+            if (name) *name = entry.name;
+            if (purpose) *purpose = entry.purpose;
+            return true;
+        }
+        return false;
+    }
+    std::vector<interfaces::WalletAddress> getAddresses() override
+    {
+        std::unique_lock lock{m_state->mutex};
+        WaitForEncryption(lock);
+        return m_state->address_book;
+    }
     std::vector<OutputType> getAvailableAddressTypes() override { return {OutputType::P2MR}; }
     std::vector<std::string> getAddressReceiveRequests() override { return {}; }
     bool setAddressReceiveRequest(const CTxDestination&, const std::string&, const std::string&) override { return false; }
@@ -486,9 +502,18 @@ public:
     {
         std::unique_lock lock{m_state->mutex};
         WaitForEncryption(lock);
+        if (m_state->wallet_tx) return {*m_state->wallet_tx};
         return {};
     }
-    bool tryGetTxStatus(const Txid&, interfaces::WalletTxStatus&, int&, int64_t&) override { return false; }
+    bool tryGetTxStatus(const Txid& txid, interfaces::WalletTxStatus& tx_status, int& num_blocks, int64_t& block_time) override
+    {
+        std::lock_guard lock{m_state->mutex};
+        if (m_state->encrypt_in_progress || !m_state->wallet_tx || m_state->wallet_tx->tx->GetHash() != txid) return false;
+        tx_status = m_state->wallet_tx_status;
+        num_blocks = tx_status.block_height;
+        block_time = 0;
+        return true;
+    }
     interfaces::WalletTx getWalletTxDetails(const Txid&, interfaces::WalletTxStatus&, interfaces::WalletOrderForm&, bool&, int&) override
     {
         std::unique_lock lock{m_state->mutex};

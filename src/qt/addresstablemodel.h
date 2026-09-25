@@ -95,7 +95,9 @@ private:
     QStringList columns;
     EditStatus editStatus = OK;
 
-    /** Look up address book data given an address string. */
+    /** Look up address book data given an address string. Answered from the
+        cached rows while the wallet is being encrypted, as the wallet would
+        block on its locks until the encryption finishes. */
     bool getAddressData(const QString &address, std::string* name, wallet::AddressPurpose* purpose) const;
 
     /** Notify listeners that data changed. */

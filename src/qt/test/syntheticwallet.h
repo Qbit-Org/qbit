@@ -67,10 +67,16 @@ struct SyntheticWalletState {
     //! notification the wallet sends when a transaction arrives.
     std::map<uint64_t, interfaces::Wallet::TransactionChangedFn> transaction_changed;
     uint64_t transaction_changed_next_id{0};
-    //! The one transaction the wallet holds, returned by getTx() and
-    //! getWalletTx() for its hash. Reading it waits on the encryption latch
-    //! like the wallet locks it stands in for.
+    //! The one transaction the wallet holds, returned by getTx(),
+    //! getWalletTx() and getWalletTxs(). Reading it waits on the encryption
+    //! latch like the wallet locks it stands in for; tryGetTxStatus() reports
+    //! this status for it, or gives up while the latch is held like the
+    //! TRY_LOCK it stands in for.
     std::optional<interfaces::WalletTx> wallet_tx;
+    interfaces::WalletTxStatus wallet_tx_status{};
+    //! The address book, returned by getAddresses() and searched by
+    //! getAddress(). Both wait on the encryption latch.
+    std::vector<interfaces::WalletAddress> address_book;
     bool psbt_sign_entered{false};
     bool allow_psbt_reservation{true};
     bool allow_psbt_completion{true};
