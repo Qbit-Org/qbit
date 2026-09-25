@@ -24,6 +24,7 @@
 
 #include <QApplication>
 #include <QComboBox>
+#include <QDateTime>
 #include <QDateTimeEdit>
 #include <QDesktopServices>
 #include <QDoubleValidator>
@@ -33,6 +34,8 @@
 #include <QLineEdit>
 #include <QMenu>
 #include <QPoint>
+#include <QPushButton>
+#include <QScrollArea>
 #include <QScrollBar>
 #include <QSettings>
 #include <QTableView>
@@ -127,6 +130,7 @@ TransactionView::TransactionView(const PlatformStyle *platformStyle, QWidget *pa
     transactionView->setObjectName("transactionView");
     vlayout->addLayout(hlayout);
     vlayout->addWidget(createDateRangeWidget());
+    vlayout->addWidget(createFeeBumpUsageWidget());
     vlayout->addWidget(transactionView);
     vlayout->setSpacing(0);
     int width = transactionView->verticalScrollBar()->sizeHint().width();
@@ -200,6 +204,8 @@ TransactionView::~TransactionView()
 void TransactionView::setModel(WalletModel *_model)
 {
     QObject::disconnect(m_fee_bumped_connection);
+    // A usage report belongs to the model whose bump produced it.
+    m_fee_bump_usage_widget->setVisible(false);
     this->model = _model;
     if(_model)
     {
@@ -211,7 +217,8 @@ void TransactionView::setModel(WalletModel *_model)
         transactionProxyModel->setSortRole(Qt::EditRole);
         transactionView->setModel(transactionProxyModel);
         transactionView->sortByColumn(TransactionTableModel::Date, Qt::DescendingOrder);
-        m_fee_bumped_connection = connect(_model, &WalletModel::feeBumped, this, [this, _model](const Txid& original_txid, const Txid& bumped_txid) {
+        m_fee_bumped_connection = connect(_model, &WalletModel::feeBumped, this, [this, _model](const Txid& original_txid, const Txid& bumped_txid, const QString& pqc_usage) {
+            showFeeBumpUsage(bumped_txid, pqc_usage);
             transactionView->selectionModel()->clearSelection();
             _model->getTransactionTableModel()->updateTransaction(
                 QString::fromStdString(original_txid.ToString()), CT_UPDATED, true);
@@ -551,6 +558,54 @@ QWidget *TransactionView::createDateRangeWidget()
     connect(dateTo, &QDateTimeEdit::dateChanged, this, &TransactionView::dateRangeChanged);
 
     return dateRangeWidget;
+}
+
+QWidget* TransactionView::createFeeBumpUsageWidget()
+{
+    // A healthy usage report is sent as a non-modal notification, which is
+    // dropped when no notification backend is available and expires when one
+    // is. Keep the latest report here until the user dismisses it.
+    m_fee_bump_usage_widget = new QFrame(this);
+    m_fee_bump_usage_widget->setObjectName("feeBumpUsageWidget");
+    m_fee_bump_usage_widget->setFrameStyle(static_cast<int>(QFrame::StyledPanel) | static_cast<int>(QFrame::Raised));
+    QHBoxLayout* layout = new QHBoxLayout(m_fee_bump_usage_widget);
+    m_fee_bump_usage_label = new QLabel(m_fee_bump_usage_widget);
+    m_fee_bump_usage_label->setObjectName("feeBumpUsageLabel");
+    m_fee_bump_usage_label->setTextFormat(Qt::PlainText);
+    m_fee_bump_usage_label->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    m_fee_bump_usage_label->setWordWrap(true);
+    // A bump that touches many keys scrolls here instead of squeezing the
+    // transaction list.
+    QScrollArea* scroll = new QScrollArea(m_fee_bump_usage_widget);
+    scroll->setObjectName("feeBumpUsageScrollArea");
+    scroll->setFrameShape(QFrame::NoFrame);
+    scroll->setWidgetResizable(true);
+    scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    scroll->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    scroll->setMaximumHeight(fontMetrics().lineSpacing() * 8);
+    scroll->setWidget(m_fee_bump_usage_label);
+    layout->addWidget(scroll, 1);
+    QPushButton* dismiss = new QPushButton(tr("Dismiss"), m_fee_bump_usage_widget);
+    dismiss->setObjectName("feeBumpUsageDismissButton");
+    layout->addWidget(dismiss, 0, Qt::AlignTop);
+    connect(dismiss, &QPushButton::clicked, m_fee_bump_usage_widget, &QWidget::hide);
+    m_fee_bump_usage_widget->setVisible(false);
+    return m_fee_bump_usage_widget;
+}
+
+void TransactionView::showFeeBumpUsage(const Txid& bumped_txid, const QString& pqc_usage)
+{
+    // A bump that consumed nothing must not leave an earlier report looking
+    // like its own.
+    if (pqc_usage.isEmpty()) {
+        m_fee_bump_usage_widget->setVisible(false);
+        return;
+    }
+    //: Header of the panel showing the PQC signing usage a fee bump consumed.
+    //: %1 is the replacement transaction ID, %2 the local time it was committed.
+    const QString header{tr("Fee bump replacement %1 (%2)").arg(QString::fromStdString(bumped_txid.ToString()), GUIUtil::dateTimeStr(QDateTime::currentDateTime()))};
+    m_fee_bump_usage_label->setText(header + "\n\n" + pqc_usage);
+    m_fee_bump_usage_widget->setVisible(true);
 }
 
 void TransactionView::dateRangeChanged()

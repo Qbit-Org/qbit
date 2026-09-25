@@ -69,6 +69,7 @@
 #include <QComboBox>
 #include <QElapsedTimer>
 #include <QEvent>
+#include <QFrame>
 #include <QLabel>
 #include <QLineEdit>
 #include <QObject>
@@ -2897,6 +2898,77 @@ void TestFeeBumpSuccessShowsUsage(interfaces::Node& node)
     }
 }
 
+//! A healthy fee-bump usage report is only a non-modal notification, which is
+//! dropped when no notification backend exists. The transaction view must keep
+//! it visible on its own, and must not attribute it to a later bump that
+//! consumed nothing.
+void TestFeeBumpSuccessKeepsUsageVisible(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    const wallet::PQCUsageReport report{qt_test::MakeSyntheticPQCUsageReport({{NewPQCPubKey(), 1}})};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    state->bump_enabled = true;
+    auto model{env.makeModel(state, report)};
+    const ReleaseSyntheticBumpOnExit release_on_exit{state};
+    TransactionView view{env.platform_style.get()};
+    view.setModel(model.get());
+    QFrame* const usage_widget{view.findChild<QFrame*>("feeBumpUsageWidget")};
+    QLabel* const usage_label{view.findChild<QLabel*>("feeBumpUsageLabel")};
+    QPushButton* const dismiss{view.findChild<QPushButton*>("feeBumpUsageDismissButton")};
+    QVERIFY(usage_widget && usage_label && dismiss);
+    QVERIFY(usage_widget->isHidden());
+
+    QSignalSpy completed{model.get(), &WalletModel::feeBumped};
+    QSignalSpy messages{model.get(), &WalletModel::message};
+    Txid bumped_txid;
+    QObject::connect(model.get(), &WalletModel::feeBumped, [&bumped_txid](const Txid&, const Txid& bumped) { bumped_txid = bumped; });
+    const auto bump = [&] {
+        {
+            std::lock_guard lock{state->mutex};
+            state->background_clone_destroyed = false;
+        }
+        const qsizetype previous{completed.count()};
+        ConfirmSend(nullptr, QMessageBox::Yes);
+        QVERIFY(WaitUntil([&] { return model->bumpFee(Txid{}); }, 5000));
+        QVERIFY(WaitUntil([&] { return completed.count() == previous + 1; }, 5000));
+        QVERIFY(WaitUntil([&] { return SyntheticStateMatches(state, [](const auto& value) { return value.background_clone_destroyed; }); }, 5000));
+    };
+
+    bump();
+    // The notification itself stays non-modal.
+    QCOMPARE(messages.count(), 1);
+    QCOMPARE(MessageAt(messages, 0).style, static_cast<unsigned int>(CClientUIInterface::MSG_INFORMATION));
+    const auto verify_shown = [&] {
+        QVERIFY(!usage_widget->isHidden());
+        const QString text{usage_label->text()};
+        QVERIFY2(text.startsWith(QString{"Fee bump replacement %1 ("}.arg(QString::fromStdString(bumped_txid.ToString()))), qPrintable(text));
+        QVERIFY2(text.contains(USAGE_CONSUMED_SENTENCE), qPrintable(text));
+        VerifyUsageListed(text, report);
+        QCOMPARE(usage_label->textFormat(), Qt::PlainText);
+    };
+    verify_shown();
+
+    dismiss->click();
+    QVERIFY(usage_widget->isHidden());
+    bump();
+    verify_shown();
+
+    // A report never outlives the model that produced it.
+    view.setModel(nullptr);
+    QVERIFY(usage_widget->isHidden());
+    view.setModel(model.get());
+    bump();
+    verify_shown();
+
+    {
+        std::lock_guard lock{state->mutex};
+        state->bump_use_counters = false;
+    }
+    bump();
+    QCOMPARE(messages.count(), 3);
+    QVERIFY(usage_widget->isHidden());
+}
+
 void TestUsageIsAttemptLocal(interfaces::Node& node)
 {
     const wallet::PQCUsageReport report{qt_test::MakeSyntheticPQCUsageReport({{NewPQCPubKey(), 6}, {NewPQCPubKey(), PQC_MAX_SIGNATURES}})};
@@ -3217,6 +3289,7 @@ void WalletTests::walletTests()
     TestFeeBumpFailureShowsConsumedUsage(m_node);
     TestFeeBumpCommitFailureKeepsUsage(m_node);
     TestFeeBumpSuccessShowsUsage(m_node);
+    TestFeeBumpSuccessKeepsUsageVisible(m_node);
     TestUsageIsAttemptLocal(m_node);
     TestUsageStaysOutOfPortableArtifacts(m_node);
     TestFeeBumpModelDestroyedDuringPrepareFailure(m_node);
