@@ -13,8 +13,10 @@
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -45,6 +47,30 @@ struct SyntheticWalletState {
     bool watchdog_released{false};
     bool encrypted{false};
     bool locked{false};
+    //! Encryption latch. While encrypt_in_progress is set, calls that need
+    //! the wallet locks in the real wallet block until the latch is released,
+    //! so a GUI-thread call into the wallet during encryption stalls the test
+    //! the same way it stalls the application.
+    bool encrypt_entered{false};
+    bool encrypt_in_progress{false};
+    bool allow_encrypt{true};
+    bool encrypt_success{true};
+    //! Throw once the latch is released, as CWallet::EncryptWallet can after
+    //! its database transaction has committed.
+    bool encrypt_throw{false};
+    bool encrypt_finished{false};
+    uint64_t encrypt_finished_sequence{0};
+    int encrypt_calls{0};
+    std::thread::id encrypt_thread;
+    std::function<void()> status_changed;
+    //! Transaction-changed listeners by handler id, so a test can raise the
+    //! notification the wallet sends when a transaction arrives.
+    std::map<uint64_t, interfaces::Wallet::TransactionChangedFn> transaction_changed;
+    uint64_t transaction_changed_next_id{0};
+    //! The one transaction the wallet holds, returned by getTx() and
+    //! getWalletTx() for its hash. Reading it waits on the encryption latch
+    //! like the wallet locks it stands in for.
+    std::optional<interfaces::WalletTx> wallet_tx;
     bool psbt_sign_entered{false};
     bool allow_psbt_reservation{true};
     bool allow_psbt_completion{true};

@@ -12,9 +12,12 @@
 #include <interfaces/node.h>
 #include <key_io.h>
 #include <node/interface_ui.h>
+#include <qt/addresstablemodel.h>
+#include <qt/askpassphrasedialog.h>
 #include <qt/bitcoinamountfield.h>
 #include <qt/qbitunits.h>
 #include <qt/clientmodel.h>
+#include <qt/guiutil.h>
 #include <qt/optionsmodel.h>
 #include <qt/overviewpage.h>
 #include <qt/platformstyle.h>
@@ -75,6 +78,7 @@
 #include <QObject>
 #include <QPointer>
 #include <QPlainTextEdit>
+#include <QProgressBar>
 #include <QProgressDialog>
 #include <QPushButton>
 #include <QSignalSpy>
@@ -91,7 +95,10 @@
 using wallet::AddWallet;
 using wallet::CWallet;
 using wallet::CreateMockableWalletDatabase;
+using wallet::DuplicateMockDatabase;
 using wallet::RemoveWallet;
+using wallet::TestLoadWallet;
+using wallet::TestUnloadWallet;
 using wallet::WALLET_FLAG_DESCRIPTORS;
 using wallet::WALLET_FLAG_DISABLE_PRIVATE_KEYS;
 using wallet::WalletContext;
@@ -3241,6 +3248,670 @@ void TestFeeBumpModelDestroyedDuringUnlock(interfaces::Node& node)
     QVERIFY(!FindBumpFeeProgressDialog());
 }
 
+void ReleaseSyntheticEncryption(const std::shared_ptr<qt_test::SyntheticWalletState>& state)
+{
+    {
+        std::lock_guard lock{state->mutex};
+        state->allow_encrypt = true;
+    }
+    state->condition.notify_all();
+}
+
+// Declare after the model so a failed assertion releases the worker before
+// the model destructor joins it.
+struct ReleaseSyntheticEncryptionOnExit {
+    std::shared_ptr<qt_test::SyntheticWalletState> state;
+
+    ~ReleaseSyntheticEncryptionOnExit() { ReleaseSyntheticEncryption(state); }
+};
+
+//! Join a helper thread when an assertion returns early.
+struct JoinOnExit {
+    std::thread& thread;
+
+    ~JoinOnExit()
+    {
+        if (thread.joinable()) thread.join();
+    }
+};
+
+//! Click the given button on the next visible message box that offers it.
+//! Unlike MessageBoxClicker this never latches onto a box without the button,
+//! so an "Ok" clicker created ahead of the encryption confirmation still
+//! reaches the result box a synchronous implementation shows inside accept().
+class VisibleMessageBoxClicker : public QObject
+{
+public:
+    explicit VisibleMessageBoxClicker(QMessageBox::StandardButton button, QString* text = nullptr)
+        : m_button(button), m_text(text)
+    {
+        m_timer.setInterval(50);
+        connect(&m_timer, &QTimer::timeout, this, &VisibleMessageBoxClicker::tryClickVisibleDialog);
+        m_timer.start();
+    }
+
+    bool clicked() const { return m_clicked; }
+
+private:
+    void tryClickVisibleDialog()
+    {
+        for (QWidget* widget : QApplication::topLevelWidgets()) {
+            if (!widget->isVisible() || !widget->inherits("QMessageBox") || widget->inherits("SendConfirmationDialog")) continue;
+            QMessageBox* const dialog{qobject_cast<QMessageBox*>(widget)};
+            QAbstractButton* const button{dialog ? dialog->button(m_button) : nullptr};
+            if (!button) continue;
+            if (m_text) *m_text = dialog->text();
+            m_clicked = true;
+            m_timer.stop();
+            button->click();
+            return;
+        }
+    }
+
+    const QMessageBox::StandardButton m_button;
+    QString* const m_text;
+    QTimer m_timer;
+    bool m_clicked{false};
+};
+
+//! Fill in both passphrase fields and submit the encryption dialog, answering
+//! "Continue" to the confirmation it shows.
+void SubmitEncryption(AskPassphraseDialog& dialog, const QString& passphrase)
+{
+    dialog.findChild<QLineEdit*>("passEdit2")->setText(passphrase);
+    dialog.findChild<QLineEdit*>("passEdit3")->setText(passphrase);
+    VisibleMessageBoxClicker confirm{QMessageBox::Yes};
+    dialog.accept();
+    QVERIFY(confirm.clicked());
+}
+
+bool DialogShowsEncryptionInProgress(AskPassphraseDialog& dialog)
+{
+    QProgressBar* const progress{dialog.findChild<QProgressBar*>("progressBar")};
+    QDialogButtonBox* const buttons{dialog.findChild<QDialogButtonBox*>("buttonBox")};
+    return dialog.isVisible() && progress && progress->isVisible() && buttons && !buttons->isEnabled();
+}
+
+//! Encryption of an existing wallet runs on a worker thread while the GUI
+//! thread keeps servicing events. Notifications the wallet raises while it
+//! holds its locks are held back until the worker returns, so listeners that
+//! read the wallet never block the GUI, and incompatible wallet actions are
+//! refused instead of queueing behind the locks. The dialog is the progress
+//! indicator: it cannot be dismissed or resubmitted until the result arrives.
+void TestEncryptWalletKeepsGuiResponsive(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    state->allow_encrypt = false;
+    auto model{env.makeModel(state)};
+    const ReleaseSyntheticEncryptionOnExit release_on_exit{state};
+    model->startPollBalance();
+
+    QSignalSpy status_changed{model.get(), &WalletModel::encryptionStatusChanged};
+    QSignalSpy addresses_changed{model.get(), &WalletModel::canGetAddressesChanged};
+    QSignalSpy messages{model.get(), &WalletModel::message};
+    QVERIFY(status_changed.isValid());
+    QVERIFY(addresses_changed.isValid());
+    QVERIFY(messages.isValid());
+    // Query the wallet from the notifications the way the main window and the
+    // receive page do. The synthetic wallet blocks these calls while its
+    // encryption latch is held, so a premature delivery stalls this thread.
+    QObject::connect(model.get(), &WalletModel::encryptionStatusChanged, model.get(), [&model] { model->getEncryptionStatus(); });
+    QObject::connect(model.get(), &WalletModel::pqcKeyValidationChanged, model.get(), [&model] { model->getPQCKeyValidationInfo(); });
+    QObject::connect(model.get(), &WalletModel::canGetAddressesChanged, model.get(), [&model] { model->wallet().canGetAddresses(); });
+
+    int gui_ticks{0};
+    QTimer gui_latch;
+    QObject::connect(&gui_latch, &QTimer::timeout, [&gui_ticks] { ++gui_ticks; });
+    gui_latch.start(0);
+
+    // Release the latch if the GUI thread stops servicing events, so a
+    // synchronous implementation fails the assertions below instead of
+    // hanging the test.
+    bool gui_alive{false};
+    std::thread watchdog{[state, &gui_alive] {
+        std::unique_lock lock{state->mutex};
+        if (!state->condition.wait_for(lock, std::chrono::seconds{5}, [&] { return gui_alive || state->encrypt_finished; })) {
+            state->watchdog_released = true;
+            state->allow_encrypt = true;
+            lock.unlock();
+            state->condition.notify_all();
+        }
+    }};
+    const JoinOnExit join_watchdog{watchdog};
+
+    auto* dialog{new AskPassphraseDialog(AskPassphraseDialog::Encrypt, nullptr)};
+    QPointer<AskPassphraseDialog> dialog_guard{dialog};
+    dialog->setModel(model.get());
+    GUIUtil::ShowModalDialogAsynchronously(dialog);
+    QString result_text;
+    VisibleMessageBoxClicker result{QMessageBox::Ok, &result_text};
+    SubmitEncryption(*dialog, QStringLiteral("test-passphrase"));
+
+    const int ticks_at_submit{gui_ticks};
+    const bool responsive{WaitUntil([&] {
+        return gui_ticks > ticks_at_submit + 3 && SyntheticStateMatches(state, [](const auto& value) {
+            return value.encrypt_entered && value.encrypt_in_progress;
+        });
+    }, 5000)};
+    {
+        std::lock_guard lock{state->mutex};
+        gui_alive = true;
+    }
+    state->condition.notify_all();
+    watchdog.join();
+    QVERIFY2(!SyntheticStateMatches(state, [](const auto& value) { return value.watchdog_released; }),
+             "GUI thread stopped processing events while the wallet was being encrypted");
+    QVERIFY(responsive);
+    QVERIFY(SyntheticStateMatches(state, [](const auto& value) { return value.encrypt_thread != std::this_thread::get_id(); }));
+
+    // The wallet notified from inside the encryption; the keypool change is
+    // raised the same way. Neither reaches a listener until the worker returns.
+    std::function<void()> notify_addresses;
+    {
+        std::lock_guard lock{state->mutex};
+        notify_addresses = state->can_get_addresses_changed;
+    }
+    QVERIFY(notify_addresses);
+    notify_addresses();
+    QVERIFY(WaitUntil([&gui_ticks, ticks_at_submit] { return gui_ticks > ticks_at_submit + 20; }, 5000));
+    QCOMPARE(status_changed.count(), 0);
+    QCOMPARE(addresses_changed.count(), 0);
+
+    QVERIFY(dialog_guard);
+    QVERIFY(DialogShowsEncryptionInProgress(*dialog));
+    dialog->reject();
+    dialog->close();
+    QTest::keyClick(dialog, Qt::Key_Escape);
+    dialog->accept();
+    QCoreApplication::processEvents();
+    QVERIFY(dialog_guard);
+    QVERIFY(DialogShowsEncryptionInProgress(*dialog));
+    QVERIFY(SyntheticStateMatches(state, [](const auto& value) { return value.encrypt_calls == 1 && value.encrypt_in_progress; }));
+
+    // Anything that would use the keys is refused rather than left to block
+    // on the wallet locks behind the modal dialog.
+    QVERIFY(!model->requestUnlock().isValid());
+    QVERIFY(!model->bumpFee(Txid{}));
+    QCOMPARE(messages.count(), 2);
+    QVERIFY(SyntheticStateMatches(state, [](const auto& value) { return value.unlock_calls == 0 && !value.bump_prepare_entered; }));
+
+    ReleaseSyntheticEncryption(state);
+    QVERIFY(WaitUntil([&dialog_guard] { return dialog_guard.isNull(); }, 5000));
+    QVERIFY(result.clicked());
+    QVERIFY2(result_text.startsWith("<qt>Your wallet is now encrypted."), qPrintable(result_text));
+    QCOMPARE(model->getEncryptionStatus(), WalletModel::Locked);
+    QCOMPARE(status_changed.count(), 1);
+    QCOMPARE(addresses_changed.count(), 1);
+    QVERIFY(WaitUntil([&state] {
+        return SyntheticStateMatches(state, [](const auto& value) { return value.background_clone_destroyed; });
+    }, 5000));
+    QVERIFY(SyntheticStateMatches(state, [](const auto& value) {
+        return value.encrypted && value.locked && value.encrypt_calls == 1 && !value.encrypt_in_progress;
+    }));
+}
+
+//! The wallet announces a new transaction through the event loop, and the
+//! table model reads it from the wallet on arrival. Delivered while the
+//! encryption worker holds the wallet locks, that read would block the GUI
+//! thread, so the update is held back and the row appears once the worker
+//! has returned.
+void TestEncryptWalletDefersTransactionUpdates(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    state->allow_encrypt = false;
+    auto model{env.makeModel(state)};
+    const ReleaseSyntheticEncryptionOnExit release_on_exit{state};
+    TransactionTableModel* const table{model->getTransactionTableModel()};
+    QSignalSpy rows_inserted{table, &QAbstractItemModel::rowsInserted};
+    QVERIFY(rows_inserted.isValid());
+    QCOMPARE(table->rowCount({}), 0);
+
+    // A payment received from elsewhere, arriving after the model loaded the
+    // wallet's history.
+    CMutableTransaction mtx;
+    mtx.vin.emplace_back(COutPoint{Txid{}, 0});
+    mtx.vout.emplace_back(COIN, CScript{} << OP_TRUE);
+    const CTransactionRef tx{MakeTransactionRef(mtx)};
+    std::vector<interfaces::Wallet::TransactionChangedFn> notify_transaction;
+    {
+        std::lock_guard lock{state->mutex};
+        state->wallet_tx = interfaces::WalletTx{
+            .tx = tx,
+            .txin_is_mine = {false},
+            .txout_is_mine = {true},
+            .txout_is_change = {false},
+            .txout_address = {CNoDestination{}},
+            .txout_address_is_mine = {false},
+            .credit = COIN,
+            .debit = 0,
+            .change = 0,
+            .time = 1,
+            .value_map = {},
+            .is_coinbase = false,
+        };
+        for (const auto& [id, notify] : state->transaction_changed) notify_transaction.push_back(notify);
+    }
+    QVERIFY(!notify_transaction.empty());
+
+    int gui_ticks{0};
+    QTimer gui_latch;
+    QObject::connect(&gui_latch, &QTimer::timeout, [&gui_ticks] { ++gui_ticks; });
+    gui_latch.start(0);
+
+    // Release the latch if the GUI thread stops servicing events, so an
+    // update that reads the encrypting wallet fails the assertions below
+    // instead of hanging the test.
+    bool gui_alive{false};
+    std::thread watchdog{[state, &gui_alive] {
+        std::unique_lock lock{state->mutex};
+        if (!state->condition.wait_for(lock, std::chrono::seconds{5}, [&] { return gui_alive || state->encrypt_finished; })) {
+            state->watchdog_released = true;
+            state->allow_encrypt = true;
+            lock.unlock();
+            state->condition.notify_all();
+        }
+    }};
+    const JoinOnExit join_watchdog{watchdog};
+
+    auto* dialog{new AskPassphraseDialog(AskPassphraseDialog::Encrypt, nullptr)};
+    QPointer<AskPassphraseDialog> dialog_guard{dialog};
+    dialog->setModel(model.get());
+    GUIUtil::ShowModalDialogAsynchronously(dialog);
+    QString result_text;
+    VisibleMessageBoxClicker result{QMessageBox::Ok, &result_text};
+    SubmitEncryption(*dialog, QStringLiteral("test-passphrase"));
+    QVERIFY(WaitUntil([&state] {
+        return SyntheticStateMatches(state, [](const auto& value) { return value.encrypt_entered && value.encrypt_in_progress; });
+    }, 5000));
+
+    // Announce the transaction the way the wallet does. The table model's
+    // update is queued to the event loop and dispatched while the worker
+    // holds the locks.
+    for (const auto& notify : notify_transaction) notify(tx->GetHash(), CT_NEW);
+    const int ticks_at_notify{gui_ticks};
+    const bool responsive{WaitUntil([&gui_ticks, ticks_at_notify] { return gui_ticks > ticks_at_notify + 20; }, 5000)};
+    {
+        std::lock_guard lock{state->mutex};
+        gui_alive = true;
+    }
+    state->condition.notify_all();
+    watchdog.join();
+    QVERIFY2(!SyntheticStateMatches(state, [](const auto& value) { return value.watchdog_released; }),
+             "GUI thread blocked on the encrypting wallet while adding a transaction to the table");
+    QVERIFY(responsive);
+    QCOMPARE(rows_inserted.count(), 0);
+    QCOMPARE(table->rowCount({}), 0);
+    QVERIFY(SyntheticStateMatches(state, [](const auto& value) { return value.encrypt_calls == 1 && value.encrypt_in_progress; }));
+
+    ReleaseSyntheticEncryption(state);
+    QVERIFY(WaitUntil([&dialog_guard] { return dialog_guard.isNull(); }, 5000));
+    QVERIFY(result.clicked());
+    QVERIFY2(result_text.startsWith("<qt>Your wallet is now encrypted."), qPrintable(result_text));
+    QCOMPARE(rows_inserted.count(), 1);
+    QCOMPARE(table->rowCount({}), 1);
+    QCOMPARE(table->index(0, 0).data(TransactionTableModel::TxHashRole).toString(), QString::fromStdString(tx->GetHash().GetHex()));
+    QVERIFY(WaitUntil([&state] {
+        return SyntheticStateMatches(state, [](const auto& value) { return value.background_clone_destroyed; });
+    }, 5000));
+}
+
+//! BitcoinGUI::updateWalletStatus reads the current wallet whenever any wallet
+//! reports a status change, so another wallet's notification while the
+//! current one is being encrypted must not send the GUI thread into the
+//! encrypting wallet's locks. The model answers those queries from the values
+//! it took before the worker started.
+void TestEncryptWalletOtherWalletStatusChange(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    state->allow_encrypt = false;
+    auto model{env.makeModel(state)};
+    const ReleaseSyntheticEncryptionOnExit release_on_exit{state};
+    auto other_state{std::make_shared<qt_test::SyntheticWalletState>()};
+    auto other{env.makeModel(other_state)};
+
+    QSignalSpy status_changed{model.get(), &WalletModel::encryptionStatusChanged};
+    QVERIFY(status_changed.isValid());
+    // What BitcoinGUI::updateWalletStatus does for the current wallet when any
+    // wallet's status changes.
+    int refreshes{0};
+    WalletModel::EncryptionStatus refreshed_status{WalletModel::NoKeys};
+    const auto refresh_current_wallet = [&] {
+        refreshed_status = model->getEncryptionStatus();
+        model->getPQCKeyValidationInfo();
+        ++refreshes;
+    };
+    QObject::connect(other.get(), &WalletModel::encryptionStatusChanged, other.get(), refresh_current_wallet);
+    QObject::connect(other.get(), &WalletModel::pqcKeyValidationChanged, other.get(), refresh_current_wallet);
+
+    int gui_ticks{0};
+    QTimer gui_latch;
+    QObject::connect(&gui_latch, &QTimer::timeout, [&gui_ticks] { ++gui_ticks; });
+    gui_latch.start(0);
+
+    // Release the latch if the GUI thread stops servicing events, so a query
+    // that reaches the encrypting wallet fails the assertions below instead
+    // of hanging the test.
+    bool gui_alive{false};
+    std::thread watchdog{[state, &gui_alive] {
+        std::unique_lock lock{state->mutex};
+        if (!state->condition.wait_for(lock, std::chrono::seconds{5}, [&] { return gui_alive || state->encrypt_finished; })) {
+            state->watchdog_released = true;
+            state->allow_encrypt = true;
+            lock.unlock();
+            state->condition.notify_all();
+        }
+    }};
+    const JoinOnExit join_watchdog{watchdog};
+
+    auto* dialog{new AskPassphraseDialog(AskPassphraseDialog::Encrypt, nullptr)};
+    QPointer<AskPassphraseDialog> dialog_guard{dialog};
+    dialog->setModel(model.get());
+    GUIUtil::ShowModalDialogAsynchronously(dialog);
+    QString result_text;
+    VisibleMessageBoxClicker result{QMessageBox::Ok, &result_text};
+    SubmitEncryption(*dialog, QStringLiteral("test-passphrase"));
+    QVERIFY(WaitUntil([&state] {
+        return SyntheticStateMatches(state, [](const auto& value) { return value.encrypt_entered && value.encrypt_in_progress; });
+    }, 5000));
+
+    // The other wallet reports a status change, as its plaintext PQC key
+    // validation or a relock does, and the GUI refreshes the current wallet.
+    std::function<void()> other_status_changed;
+    {
+        std::lock_guard lock{other_state->mutex};
+        other_status_changed = other_state->status_changed;
+    }
+    QVERIFY(other_status_changed);
+    const int ticks_before{gui_ticks};
+    other_status_changed();
+    const bool responsive{WaitUntil([&] { return refreshes > 0 && gui_ticks > ticks_before + 3; }, 5000)};
+    {
+        std::lock_guard lock{state->mutex};
+        gui_alive = true;
+    }
+    state->condition.notify_all();
+    watchdog.join();
+    QVERIFY2(!SyntheticStateMatches(state, [](const auto& value) { return value.watchdog_released; }),
+             "GUI thread blocked on the encrypting wallet while refreshing the status for another wallet");
+    QVERIFY(responsive);
+    QCOMPARE(refreshed_status, WalletModel::Unencrypted);
+    QCOMPARE(model->getEncryptionStatus(), WalletModel::Unencrypted);
+    QCOMPARE(status_changed.count(), 0);
+    QVERIFY(SyntheticStateMatches(state, [](const auto& value) { return value.encrypt_in_progress; }));
+
+    ReleaseSyntheticEncryption(state);
+    QVERIFY(WaitUntil([&dialog_guard] { return dialog_guard.isNull(); }, 5000));
+    QVERIFY(result.clicked());
+    QVERIFY2(result_text.startsWith("<qt>Your wallet is now encrypted."), qPrintable(result_text));
+    QCOMPARE(model->getEncryptionStatus(), WalletModel::Locked);
+    QCOMPARE(status_changed.count(), 1);
+}
+
+//! A failed encryption reports the error, leaves the wallet unencrypted, and
+//! releases the model so a later attempt can run.
+void TestEncryptWalletFailureReportsError(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    state->encrypt_success = false;
+    auto model{env.makeModel(state)};
+    QSignalSpy status_changed{model.get(), &WalletModel::encryptionStatusChanged};
+    QVERIFY(status_changed.isValid());
+
+    const auto encrypt = [&](QString& result_text) {
+        auto* dialog{new AskPassphraseDialog(AskPassphraseDialog::Encrypt, nullptr)};
+        QPointer<AskPassphraseDialog> dialog_guard{dialog};
+        dialog->setModel(model.get());
+        GUIUtil::ShowModalDialogAsynchronously(dialog);
+        VisibleMessageBoxClicker result{QMessageBox::Ok, &result_text};
+        SubmitEncryption(*dialog, QStringLiteral("test-passphrase"));
+        QVERIFY(WaitUntil([&dialog_guard] { return dialog_guard.isNull(); }, 5000));
+        QVERIFY(result.clicked());
+    };
+
+    QString result_text;
+    encrypt(result_text);
+    QCOMPARE(result_text, QString{"Wallet encryption failed due to an internal error. Your wallet was not encrypted."});
+    QCOMPARE(model->getEncryptionStatus(), WalletModel::Unencrypted);
+    QCOMPARE(status_changed.count(), 0);
+    QVERIFY(WaitUntil([&state] {
+        return SyntheticStateMatches(state, [](const auto& value) { return value.background_clone_destroyed; });
+    }, 5000));
+    QVERIFY(SyntheticStateMatches(state, [](const auto& value) {
+        return value.encrypt_calls == 1 && !value.encrypt_in_progress && !value.encrypted && !value.locked;
+    }));
+
+    {
+        std::lock_guard lock{state->mutex};
+        state->encrypt_success = true;
+    }
+    encrypt(result_text);
+    QVERIFY2(result_text.startsWith("<qt>Your wallet is now encrypted."), qPrintable(result_text));
+    QCOMPARE(model->getEncryptionStatus(), WalletModel::Locked);
+    QCOMPARE(status_changed.count(), 1);
+    QVERIFY(SyntheticStateMatches(state, [](const auto& value) { return value.encrypt_calls == 2; }));
+}
+
+//! CWallet::EncryptWallet can throw after its database transaction has
+//! committed, so an exception is neither a success nor a clean failure: the
+//! wallet on disk may already need the new passphrase. The model rethrows it
+//! on the GUI thread, where it escapes the event loop into the application's
+//! runaway-exception handler and ends the process the way the synchronous
+//! call did, instead of telling the user the wallet was not encrypted.
+void TestEncryptWalletExceptionEscapes(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    state->encrypt_throw = true;
+    auto model{env.makeModel(state)};
+    QSignalSpy finished{model.get(), &WalletModel::encryptWalletFinished};
+    QSignalSpy status_changed{model.get(), &WalletModel::encryptionStatusChanged};
+    QVERIFY(finished.isValid());
+    QVERIFY(status_changed.isValid());
+
+    auto* dialog{new AskPassphraseDialog(AskPassphraseDialog::Encrypt, nullptr)};
+    QPointer<AskPassphraseDialog> dialog_guard{dialog};
+    dialog->setModel(model.get());
+    GUIUtil::ShowModalDialogAsynchronously(dialog);
+    QString result_text;
+    VisibleMessageBoxClicker result{QMessageBox::Ok, &result_text};
+    SubmitEncryption(*dialog, QStringLiteral("test-passphrase"));
+
+    QString escaped;
+    try {
+        WaitUntil([&dialog_guard] { return dialog_guard.isNull(); }, 5000);
+    } catch (const std::runtime_error& e) {
+        escaped = QString::fromUtf8(e.what());
+    }
+    QCOMPARE(escaped, QStringLiteral("synthetic encryption failure after commit"));
+    QCOMPARE(finished.count(), 0);
+    QCOMPARE(status_changed.count(), 0);
+    QVERIFY(!result.clicked());
+    QVERIFY(dialog_guard);
+    QVERIFY(DialogShowsEncryptionInProgress(*dialog));
+    // The outcome stays unknown, so nothing may use the keys.
+    QVERIFY(model->isEncryptingWallet());
+    QVERIFY(!model->requestUnlock().isValid());
+    QVERIFY(WaitUntil([&state] {
+        return SyntheticStateMatches(state, [](const auto& value) { return value.background_clone_destroyed; });
+    }, 5000));
+    QVERIFY(SyntheticStateMatches(state, [](const auto& value) {
+        return value.encrypt_calls == 1 && !value.encrypt_in_progress && value.encrypted && value.locked;
+    }));
+
+    // The handler ends the process; here the model goes away instead, and the
+    // dialog closes without reporting a result.
+    model.reset();
+    QVERIFY(WaitUntil([&dialog_guard] { return dialog_guard.isNull(); }, 5000));
+    QVERIFY(!result.clicked());
+}
+
+//! Wallet unload and shutdown delete the model. Encryption cannot be
+//! cancelled, so the model waits for the worker to finish and the operation
+//! completes; the worker then touches nothing of the deleted model and the
+//! dialog closes without a result to report and without finished(), whose
+//! listeners would refresh the wallet status from the dying model.
+void TestEncryptWalletModelDestroyedWhileEncrypting(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    state->allow_encrypt = false;
+    auto model{env.makeModel(state)};
+    const ReleaseSyntheticEncryptionOnExit release_on_exit{state};
+    QPointer<WalletModel> model_guard{model.get()};
+
+    // Release the latch only once this thread is inside the model destructor,
+    // so the sequence check below proves the destructor waited for the
+    // worker. A synchronous implementation never gets there; the bound keeps
+    // it from hanging instead of failing.
+    bool destroying{false};
+    std::thread release{[state, &destroying] {
+        {
+            std::unique_lock lock{state->mutex};
+            state->condition.wait_for(lock, std::chrono::seconds{5}, [&destroying] { return destroying; });
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        ReleaseSyntheticEncryption(state);
+    }};
+    const JoinOnExit join_release{release};
+
+    auto* dialog{new AskPassphraseDialog(AskPassphraseDialog::Encrypt, nullptr)};
+    QPointer<AskPassphraseDialog> dialog_guard{dialog};
+    dialog->setModel(model.get());
+    GUIUtil::ShowModalDialogAsynchronously(dialog);
+    QString result_text;
+    VisibleMessageBoxClicker result{QMessageBox::Ok, &result_text};
+    QSignalSpy finished{dialog, &QDialog::finished};
+    QVERIFY(finished.isValid());
+    SubmitEncryption(*dialog, QStringLiteral("test-passphrase"));
+    QVERIFY(WaitUntil([&state] {
+        return SyntheticStateMatches(state, [](const auto& value) { return value.encrypt_entered; });
+    }, 5000));
+    QVERIFY(dialog_guard);
+    QVERIFY(DialogShowsEncryptionInProgress(*dialog));
+
+    {
+        std::lock_guard lock{state->mutex};
+        destroying = true;
+    }
+    state->condition.notify_all();
+    model.reset();
+    uint64_t destroyed_sequence{0};
+    {
+        std::lock_guard lock{state->mutex};
+        destroyed_sequence = ++state->event_sequence;
+    }
+    release.join();
+    QVERIFY(model_guard.isNull());
+
+    uint64_t finished_sequence{0};
+    {
+        std::lock_guard lock{state->mutex};
+        finished_sequence = state->encrypt_finished_sequence;
+    }
+    QVERIFY2(finished_sequence != 0 && finished_sequence < destroyed_sequence,
+             "Model destruction returned before the encryption worker finished");
+    QVERIFY(WaitUntil([&state] {
+        return SyntheticStateMatches(state, [](const auto& value) { return value.background_clone_destroyed; });
+    }, 5000));
+    QVERIFY(WaitUntil([&dialog_guard] { return dialog_guard.isNull(); }, 5000));
+    QVERIFY(!result.clicked());
+    QCOMPARE(finished.count(), 0);
+    QVERIFY(SyntheticStateMatches(state, [](const auto& value) { return value.encrypted && value.locked; }));
+    for (QWidget* widget : QApplication::topLevelWidgets()) {
+        QVERIFY(!widget->isVisible() || !widget->inherits("QMessageBox"));
+    }
+}
+
+//! Encrypting a real, funded descriptor wallet through the dialog leaves it
+//! encrypted and locked with its history and address book intact, and the
+//! keys stay usable through an unlock, spend and relock. Reopened from its
+//! records, as after a restart or from a backup, the wallet is encrypted and
+//! locked, still has the history and addresses, and unlocks with the
+//! passphrase.
+void TestEncryptWalletRealWallet(interfaces::Node& node)
+{
+    TestChain100Setup test{ChainType::REGTEST, {.extra_args = {"-p2mronly=0", "-keypool=1"}}};
+    auto wallet_loader = interfaces::MakeWalletLoader(*test.m_node.chain, *Assert(test.m_node.args));
+    test.m_node.wallet_loader = wallet_loader.get();
+    node.setContext(&test.m_node);
+
+    const std::shared_ptr<CWallet> wallet{SetupDescriptorsWallet(node, test)};
+    std::unique_ptr<const PlatformStyle> platform_style{PlatformStyle::instantiate("other")};
+    MiniGUI mini_gui{node, platform_style.get()};
+    mini_gui.initModelForWallet(node, wallet, platform_style.get());
+    WalletModel& wallet_model{*mini_gui.walletModel};
+    wallet_model.pollBalanceChanged();
+
+    TransactionTableModel* const transactions{wallet_model.getTransactionTableModel()};
+    AddressTableModel* const addresses{wallet_model.getAddressTableModel()};
+    QCOMPARE(transactions->rowCount({}), QT_WALLET_FUNDING_TXS);
+    const int address_rows{addresses->rowCount({})};
+    QVERIFY(address_rows > 0);
+    QCOMPARE(wallet_model.getEncryptionStatus(), WalletModel::Unencrypted);
+    QSignalSpy status_changed{&wallet_model, &WalletModel::encryptionStatusChanged};
+    QVERIFY(status_changed.isValid());
+
+    const SecureString passphrase{"test-passphrase"};
+    AskPassphraseDialog dialog{AskPassphraseDialog::Encrypt, nullptr};
+    dialog.setModel(&wallet_model);
+    QSignalSpy finished{&dialog, &QDialog::finished};
+    QVERIFY(finished.isValid());
+    QString result_text;
+    VisibleMessageBoxClicker result{QMessageBox::Ok, &result_text};
+    SubmitEncryption(dialog, QString::fromStdString(std::string{passphrase}));
+    QVERIFY2(WaitUntil([&finished] { return finished.count() == 1; }, 60000), "Timed out waiting for wallet encryption");
+    QVERIFY(result.clicked());
+    QVERIFY2(result_text.startsWith("<qt>Your wallet is now encrypted."), qPrintable(result_text));
+    QCOMPARE(finished.front().front().toInt(), static_cast<int>(QDialog::Accepted));
+
+    QVERIFY(wallet->IsCrypted());
+    QVERIFY(wallet->IsLocked());
+    QCOMPARE(wallet_model.getEncryptionStatus(), WalletModel::Locked);
+    QCOMPARE(status_changed.count(), 1);
+    qApp->processEvents();
+    QCOMPARE(transactions->rowCount({}), QT_WALLET_FUNDING_TXS);
+    QCOMPARE(addresses->rowCount({}), address_rows);
+
+    QVERIFY(wallet_model.setWalletLocked(false, passphrase));
+    QCOMPARE(wallet_model.getEncryptionStatus(), WalletModel::Unlocked);
+    const Txid txid{SendCoins(*wallet, mini_gui.sendCoinsDialog, PKHash{}, 5 * COIN, /*rbf=*/false)};
+    QVERIFY(!txid.IsNull());
+    QVERIFY(wallet_model.setWalletLocked(true));
+    QCOMPARE(wallet_model.getEncryptionStatus(), WalletModel::Locked);
+    qApp->processEvents();
+    QCOMPARE(transactions->rowCount({}), QT_WALLET_FUNDING_TXS + 1);
+    QVERIFY(FindTx(*transactions, txid).isValid());
+
+    const auto count_address_book = [](const CWallet& w) {
+        LOCK(w.cs_wallet);
+        size_t entries{0};
+        w.ForEachAddrBookEntry([&entries](const CTxDestination&, const std::string&, bool, const std::optional<wallet::AddressPurpose>) { ++entries; });
+        return entries;
+    };
+    const size_t address_book_entries{count_address_book(*wallet)};
+    QVERIFY(address_book_entries > 0);
+
+    WalletContext& context{*node.walletLoader().context()};
+    std::shared_ptr<CWallet> reopened{TestLoadWallet(DuplicateMockDatabase(wallet->GetDatabase()), context, WALLET_FLAG_DESCRIPTORS)};
+    QVERIFY(reopened);
+    QVERIFY(reopened->IsCrypted());
+    QVERIFY(reopened->IsLocked());
+    QCOMPARE(WITH_LOCK(reopened->cs_wallet, return reopened->mapWallet.size()), static_cast<size_t>(QT_WALLET_FUNDING_TXS + 1));
+    QCOMPARE(count_address_book(*reopened), address_book_entries);
+    const wallet::PQCKeyValidationInfo reopened_pqc{reopened->GetPQCKeyValidationInfo()};
+    QCOMPARE(reopened_pqc.pending_records, size_t{0});
+    QCOMPARE(reopened_pqc.failed_records, size_t{0});
+    QVERIFY(reopened->Unlock(passphrase));
+    QVERIFY(!reopened->IsLocked());
+    QVERIFY(reopened->Lock());
+    QVERIFY(reopened->IsLocked());
+    TestUnloadWallet(std::move(reopened));
+}
+
 void TestGUI(interfaces::Node& node)
 {
     // Set up a small funded wallet history instead of importing the full mature chain.
@@ -3296,4 +3967,11 @@ void WalletTests::walletTests()
     TestFeeBumpModelDestroyedDuringConfirmation(m_node);
     TestFeeBumpModelDestroyedDuringDraftFailure(m_node);
     TestFeeBumpModelDestroyedDuringUnlock(m_node);
+    TestEncryptWalletKeepsGuiResponsive(m_node);
+    TestEncryptWalletDefersTransactionUpdates(m_node);
+    TestEncryptWalletOtherWalletStatusChange(m_node);
+    TestEncryptWalletFailureReportsError(m_node);
+    TestEncryptWalletExceptionEscapes(m_node);
+    TestEncryptWalletModelDestroyedWhileEncrypting(m_node);
+    TestEncryptWalletRealWallet(m_node);
 }

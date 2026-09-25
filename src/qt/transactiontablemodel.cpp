@@ -30,6 +30,7 @@
 #include <QLatin1Char>
 #include <QLatin1String>
 #include <QList>
+#include <QPointer>
 
 
 // Amount column is right-aligned it contains numbers
@@ -275,9 +276,41 @@ void TransactionTableModel::updateAmountColumnTitle()
 
 void TransactionTableModel::updateTransaction(const QString &hash, int status, bool showTransaction)
 {
+    // A new transaction is read from the wallet, which blocks while the
+    // encryption worker holds the wallet locks. Hold the update back until
+    // the wallet model reports that the worker has returned.
+    if (walletModel->isEncryptingWallet()) {
+        m_deferred_updates.emplace_back([this, hash, status, showTransaction] { updateTransaction(hash, status, showTransaction); });
+        return;
+    }
+
     Txid updated = Txid::FromHex(hash.toStdString()).value();
 
     priv->updateWallet(walletModel->wallet(), updated, status, showTransaction);
+}
+
+void TransactionTableModel::setProcessingQueuedTransactions(bool value)
+{
+    // Keep the balloon limit in step with the updates it brackets.
+    if (walletModel->isEncryptingWallet()) {
+        m_deferred_updates.emplace_back([this, value] { setProcessingQueuedTransactions(value); });
+        return;
+    }
+
+    fProcessingQueuedTransactions = value;
+}
+
+void TransactionTableModel::deliverDeferredUpdates()
+{
+    // Inserting a row notifies the views, which may run a nested event loop
+    // that deletes this model, so check it after each update.
+    QPointer<TransactionTableModel> model{this};
+    std::vector<std::function<void()>> updates;
+    updates.swap(m_deferred_updates);
+    for (const auto& update : updates) {
+        update();
+        if (!model) return;
+    }
 }
 
 void TransactionTableModel::updateConfirmations()
