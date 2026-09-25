@@ -3814,12 +3814,13 @@ void TestEncryptWalletRealWallet(interfaces::Node& node)
     QCOMPARE(transactions->rowCount({}), QT_WALLET_FUNDING_TXS + 1);
     QVERIFY(FindTx(*transactions, txid).isValid());
 
-    const auto count_address_book = [](const CWallet& w) EXCLUSIVE_LOCKS_REQUIRED(w.cs_wallet) {
+    const auto count_address_book = [](const CWallet& w) {
+        LOCK(w.cs_wallet);
         size_t entries{0};
         w.ForEachAddrBookEntry([&entries](const CTxDestination&, const std::string&, bool, const std::optional<wallet::AddressPurpose>) { ++entries; });
         return entries;
     };
-    const size_t address_book_entries{WITH_LOCK(wallet->cs_wallet, return count_address_book(*wallet))};
+    const size_t address_book_entries{count_address_book(*wallet)};
     QVERIFY(address_book_entries > 0);
 
     WalletContext& context{*node.walletLoader().context()};
@@ -3828,7 +3829,7 @@ void TestEncryptWalletRealWallet(interfaces::Node& node)
     QVERIFY(reopened->IsCrypted());
     QVERIFY(reopened->IsLocked());
     QCOMPARE(WITH_LOCK(reopened->cs_wallet, return reopened->mapWallet.size()), static_cast<size_t>(QT_WALLET_FUNDING_TXS + 1));
-    QCOMPARE(WITH_LOCK(reopened->cs_wallet, return count_address_book(*reopened)), address_book_entries);
+    QCOMPARE(count_address_book(*reopened), address_book_entries);
     const wallet::PQCKeyValidationInfo reopened_pqc{reopened->GetPQCKeyValidationInfo()};
     QCOMPARE(reopened_pqc.pending_records, size_t{0});
     QCOMPARE(reopened_pqc.failed_records, size_t{0});
