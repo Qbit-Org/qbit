@@ -64,6 +64,18 @@ constexpr AddressTableEntry::Type translateTransactionType(wallet::AddressPurpos
     assert(false);
 }
 
+/* Recover the address purpose from the address type, the inverse of
+   translateTransactionType */
+constexpr wallet::AddressPurpose translateAddressPurpose(AddressTableEntry::Type type)
+{
+    switch (type) {
+    case AddressTableEntry::Sending: return wallet::AddressPurpose::SEND;
+    case AddressTableEntry::Receiving: return wallet::AddressPurpose::RECEIVE;
+    case AddressTableEntry::Hidden: return wallet::AddressPurpose::REFUND;
+    } // no default case, so the compiler can warn about missing cases
+    assert(false);
+}
+
 // Private implementation
 class AddressTablePriv
 {
@@ -146,6 +158,16 @@ public:
     int size()
     {
         return cachedAddressTable.size();
+    }
+
+    /* Find the entry for an encoded address, or nullptr if the address book
+       has none */
+    const AddressTableEntry* find(const QString& address) const
+    {
+        QList<AddressTableEntry>::const_iterator it = std::lower_bound(
+            cachedAddressTable.begin(), cachedAddressTable.end(), address, AddressTableEntryLessThan());
+        if (it == cachedAddressTable.end() || it->address != address) return nullptr;
+        return &*it;
     }
 
     AddressTableEntry *index(int idx)
@@ -429,6 +451,17 @@ bool AddressTableModel::getAddressData(const QString &address,
         std::string* name,
         wallet::AddressPurpose* purpose) const {
     CTxDestination destination = DecodeDestination(address.toStdString());
+    // The wallet blocks while the encryption worker holds its locks, and the
+    // address book cannot change until it returns, so answer from the rows
+    // this model already holds. A repaint of the transaction list looks up
+    // its labels here without any user input.
+    if (walletModel->isEncryptingWallet()) {
+        const AddressTableEntry* entry = priv->find(QString::fromStdString(EncodeDestination(destination)));
+        if (!entry) return false;
+        if (name) *name = entry->label.toStdString();
+        if (purpose) *purpose = translateAddressPurpose(entry->type);
+        return true;
+    }
     return walletModel->wallet().getAddress(destination, name, purpose);
 }
 
