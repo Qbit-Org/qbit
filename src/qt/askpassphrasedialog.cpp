@@ -285,8 +285,18 @@ void AskPassphraseDialog::showEncryptionResult(bool success)
                              "will become useless as soon as you start using the new, encrypted wallet.") +
                              "</b></qt>");
     } else {
-        QMessageBox::critical(this, tr("Wallet encryption failed"),
-                             tr("Wallet encryption failed due to an internal error. Your wallet was not encrypted."));
+        // Another request, such as the encryptwallet RPC, can encrypt the
+        // wallet while this one derives its key; the wallet then needs that
+        // request's passphrase. The model reads the wallet again once the
+        // worker has returned.
+        const WalletModel::EncryptionStatus status{model ? model->getEncryptionStatus() : WalletModel::Unencrypted};
+        if (status == WalletModel::Locked || status == WalletModel::Unlocked) {
+            QMessageBox::critical(this, tr("Wallet encryption failed"),
+                                 tr("The wallet was already encrypted by another request. Your passphrase was not used."));
+        } else {
+            QMessageBox::critical(this, tr("Wallet encryption failed"),
+                                 tr("Wallet encryption failed due to an internal error. Your wallet was not encrypted."));
+        }
     }
     if (!dialog) return;
     QDialog::accept();

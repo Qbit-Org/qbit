@@ -63,7 +63,7 @@ BOOST_FIXTURE_TEST_CASE(DefaultAddressTypeUsesP2MROnRegtestP2MROnly, RegtestP2MR
 BOOST_FIXTURE_TEST_CASE(WalletOutputAvailabilityRequiresAllowedTypeAndManager, RegtestP2MROnlyWalletTestingSetup)
 {
     CWallet bare_wallet{m_node.chain.get(), "", CreateMockableWalletDatabase()};
-    BOOST_CHECK(bare_wallet.GetActiveScriptPubKeyMans().empty());
+    BOOST_CHECK(WITH_LOCK(bare_wallet.cs_wallet, return bare_wallet.GetActiveScriptPubKeyMans().empty()));
     BOOST_CHECK(!HasWalletOutputTypeManager(bare_wallet, OutputType::P2MR, /*internal=*/false));
     BOOST_CHECK(!IsAvailableWalletOutputType(bare_wallet, OutputType::P2MR, /*internal=*/false));
 

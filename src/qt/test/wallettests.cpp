@@ -3695,6 +3695,35 @@ void TestEncryptWalletFailureReportsError(interfaces::Node& node)
     QVERIFY(SyntheticStateMatches(state, [](const auto& value) { return value.encrypt_calls == 2; }));
 }
 
+//! Another request, such as the encryptwallet RPC, can encrypt the wallet
+//! while the dialog is open or its own request is under way. The dialog's
+//! request then fails, and the dialog must not claim the wallet was left
+//! unencrypted.
+void TestEncryptWalletAlreadyEncryptedByAnotherRequest(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    auto model{env.makeModel(state)};
+
+    auto* dialog{new AskPassphraseDialog(AskPassphraseDialog::Encrypt, nullptr)};
+    QPointer<AskPassphraseDialog> dialog_guard{dialog};
+    dialog->setModel(model.get());
+    GUIUtil::ShowModalDialogAsynchronously(dialog);
+    {
+        std::lock_guard lock{state->mutex};
+        state->encrypted = true;
+        state->locked = true;
+    }
+    QString result_text;
+    VisibleMessageBoxClicker result{QMessageBox::Ok, &result_text};
+    SubmitEncryption(*dialog, QStringLiteral("test-passphrase"));
+    QVERIFY(WaitUntil([&dialog_guard] { return dialog_guard.isNull(); }, 5000));
+    QVERIFY(result.clicked());
+    QCOMPARE(result_text, QString{"The wallet was already encrypted by another request. Your passphrase was not used."});
+    QCOMPARE(model->getEncryptionStatus(), WalletModel::Locked);
+    QVERIFY(SyntheticStateMatches(state, [](const auto& value) { return value.encrypt_calls == 1; }));
+}
+
 //! CWallet::EncryptWallet can throw after its database transaction has
 //! committed, so an exception is neither a success nor a clean failure: the
 //! wallet on disk may already need the new passphrase. The model rethrows it
@@ -3971,6 +4000,7 @@ void WalletTests::walletTests()
     TestEncryptWalletDefersTransactionUpdates(m_node);
     TestEncryptWalletOtherWalletStatusChange(m_node);
     TestEncryptWalletFailureReportsError(m_node);
+    TestEncryptWalletAlreadyEncryptedByAnotherRequest(m_node);
     TestEncryptWalletExceptionEscapes(m_node);
     TestEncryptWalletModelDestroyedWhileEncrypting(m_node);
     TestEncryptWalletRealWallet(m_node);

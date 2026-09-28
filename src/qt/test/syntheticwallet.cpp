@@ -64,6 +64,12 @@ public:
         std::function<void()> status_changed;
         {
             std::lock_guard lock{m_state->mutex};
+            // Like CWallet::EncryptWallet, which refuses a wallet that another
+            // caller has encrypted and leaves it untouched.
+            if (m_state->encrypted) {
+                ++m_state->encrypt_calls;
+                return false;
+            }
             m_state->encrypt_entered = true;
             m_state->encrypt_in_progress = true;
             m_state->encrypt_finished = false;

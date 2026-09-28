@@ -257,6 +257,11 @@ RPCHelpMan encryptwallet()
         throw JSONRPCError(RPC_WALLET_ENCRYPTION_FAILED, "Error: wallet does not contain private keys, nothing to encrypt.");
     }
 
+    // Hold the locks from the encryption-state check through the encryption
+    // itself, so a call that overlaps another encryption reports the wallet
+    // as already encrypted once that encryption has finished.
+    LOCK2(pwallet->m_relock_mutex, pwallet->cs_wallet);
+
     if (pwallet->IsCrypted()) {
         throw JSONRPCError(RPC_WALLET_WRONG_ENC_STATE, "Error: running with an encrypted wallet, but encryptwallet was called.");
     }
@@ -272,8 +277,6 @@ RPCHelpMan encryptwallet()
     if (pqc_validation.failed_records > 0) {
         throw JSONRPCError(RPC_WALLET_ERROR, "Error: plaintext PQC wallet key validation failed. Wallet encryption is disabled until the wallet is restored or repaired.");
     }
-
-    LOCK2(pwallet->m_relock_mutex, pwallet->cs_wallet);
 
     SecureString strWalletPass;
     strWalletPass.reserve(100);
