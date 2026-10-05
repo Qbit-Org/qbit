@@ -12,6 +12,7 @@ upstream `qa-assets` corpus:
 | `mlkem` | [`mlkem/`](mlkem) |
 | `mlkem_backend_diff` | [`mlkem_backend_diff/`](mlkem_backend_diff) |
 | `p2mr_script` | [`p2mr_script/`](p2mr_script) |
+| `pq_records` | [`pq_records/`](pq_records) |
 | `pqc` | [`pqc/`](pqc) |
 
 ## Provenance
@@ -62,6 +63,13 @@ The fixture bodies check that an unmodified fixture verifies. `pqc` also
 checks that any modified signature, public key or message is rejected. Legacy
 and generation seeds keep key generation and signing covered in every replay.
 
+`pq_records` takes the whole input, untagged (`raw`), as BIP324 version-packet
+contents: records `CompactSize(len) || header || payload`. The seeds are the
+offer and accept records of `src/test/data/pq_transport_vectors.json`, records
+of the wrong length, duplicate and unknown records, and framing errors that make
+the whole contents invalid. The harness checks the parser against an
+independent reading of the grammar.
+
 ## Use in CI
 
 [`overlay.py`](overlay.py) copies each seed to
@@ -75,6 +83,6 @@ from a reused corpus by hand if they are no longer wanted. A target path that
 is not a directory, or a symlink, directory or other non-regular file at a
 managed name, is an error; all target paths and managed names are checked
 before any file is written.
-`test/fuzz/test_runner.py --require_qbit_corpus` then fails unless all eight
+`test/fuzz/test_runner.py --require_qbit_corpus` then fails unless all nine
 targets are selected, each has at least one regular input file, and the fuzz
 binary reports replaying them.

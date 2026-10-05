@@ -2,10 +2,16 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <test/data/pq_transport_vectors.json.h>
+
+#include <bip324_pq.h>
 #include <chainparams.h>
 #include <clientversion.h>
 #include <common/args.h>
 #include <compat/compat.h>
+#include <crypto/common.h>
+#include <crypto/mlkem.h>
+#include <crypto/sha256.h>
 #include <cstdint>
 #include <net.h>
 #include <net_processing.h>
@@ -24,12 +30,16 @@
 #include <validation.h>
 
 #include <boost/test/unit_test.hpp>
+#include <univalue.h>
 
 #include <algorithm>
+#include <array>
+#include <deque>
 #include <ios>
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 using namespace std::literals;
 using namespace util::hex_literals;
@@ -1580,6 +1590,454 @@ BOOST_AUTO_TEST_CASE(v2transport_test)
         tester.SendV1Version(CChainParams::Main()->MessageStart());
         auto ret = tester.Interact();
         BOOST_CHECK(!ret);
+    }
+}
+
+namespace {
+
+/** Deterministic PQ entropy: the queued 32-byte values in order, then SHA256(seed || counter). */
+struct TestPQEntropy {
+    std::deque<std::array<uint8_t, 32>> queued;
+    uint256 seed;
+    uint64_t counter{0};
+
+    explicit TestPQEntropy(const uint256& seed_in) : seed{seed_in} {}
+
+    static void Fill(void* context, std::span<uint8_t, 32> out) noexcept
+    {
+        auto& self{*static_cast<TestPQEntropy*>(context)};
+        if (!self.queued.empty()) {
+            std::ranges::copy(self.queued.front(), out.begin());
+            self.queued.pop_front();
+            return;
+        }
+        uint8_t counter_le[8];
+        WriteLE64(counter_le, self.counter++);
+        CSHA256().Write(self.seed.begin(), self.seed.size()).Write(counter_le, sizeof(counter_le)).Finalize(out.data());
+    }
+
+    PQRandomSource Source() { return {.fill32 = &Fill, .context = this}; }
+
+    void Queue(std::span<const uint8_t> bytes)
+    {
+        BOOST_REQUIRE(bytes.size() % 32 == 0);
+        for (size_t i{0}; i < bytes.size(); i += 32) {
+            std::array<uint8_t, 32> value;
+            std::ranges::copy(bytes.subspan(i, 32), value.begin());
+            queued.push_back(value);
+        }
+    }
+};
+
+/** How often each ML-KEM operation ran through COUNTING_KEM_OPS. */
+struct KemCallCounts {
+    int keygen{0}, check{0}, encaps{0}, decaps{0};
+    int total() const { return keygen + check + encaps + decaps; }
+};
+KemCallCounts g_kem_calls;
+
+const PQKemOps COUNTING_KEM_OPS{
+    .keygen = [](std::span<const uint8_t, mlkem::KEYGEN_SEED_BYTES> seed, mlkem::PublicKey& ek, mlkem::DecapsulationKey& dk) noexcept {
+        ++g_kem_calls.keygen;
+        return mlkem::KeyGen(seed, ek, dk);
+    },
+    .check_public_key = [](std::span<const uint8_t, mlkem::PUBLIC_KEY_BYTES> ek) noexcept {
+        ++g_kem_calls.check;
+        return mlkem::CheckPublicKey(ek);
+    },
+    .encaps = [](std::span<const uint8_t, mlkem::PUBLIC_KEY_BYTES> ek, std::span<const uint8_t, mlkem::ENCAPS_COINS_BYTES> coins,
+                 mlkem::Ciphertext& ct, mlkem::SharedSecret& ss) noexcept {
+        ++g_kem_calls.encaps;
+        return mlkem::Encaps(ek, coins, ct, ss);
+    },
+    .decaps = [](const mlkem::DecapsulationKey& dk, std::span<const uint8_t, mlkem::CIPHERTEXT_BYTES> ct, mlkem::SharedSecret& ss) noexcept {
+        ++g_kem_calls.decaps;
+        return mlkem::Decaps(dk, ct, ss);
+    },
+};
+
+std::vector<std::byte> HexBytes(std::string_view hex)
+{
+    auto bytes{TryParseHex<std::byte>(hex)};
+    BOOST_REQUIRE(bytes);
+    return std::move(*bytes);
+}
+
+std::vector<std::byte> Concat(std::initializer_list<std::span<const std::byte>> parts)
+{
+    std::vector<std::byte> out;
+    for (const auto& part : parts) out.insert(out.end(), part.begin(), part.end());
+    return out;
+}
+
+/** A record CompactSize(1 + payload size) || header || payload. */
+std::vector<std::byte> MakeRecord(uint8_t header, std::span<const std::byte> payload)
+{
+    DataStream stream;
+    WriteCompactSize(stream, 1 + payload.size());
+    stream << header;
+    stream.write(payload);
+    return {stream.begin(), stream.end()};
+}
+
+/** A valid encapsulation key, from a fixed seed. */
+mlkem::PublicKey TestEncapsulationKey()
+{
+    std::array<uint8_t, mlkem::KEYGEN_SEED_BYTES> seed{};
+    seed.fill(0x5a);
+    mlkem::PublicKey ek;
+    mlkem::DecapsulationKey dk;
+    BOOST_REQUIRE(mlkem::KeyGen(seed, ek, dk) == mlkem::Error::NONE);
+    return ek;
+}
+
+/** ek with its first coefficient set to q = 3329, which fails the modulus check. */
+mlkem::PublicKey BadModulusKey(mlkem::PublicKey ek)
+{
+    ek[0] = 0x01;
+    ek[1] = (ek[1] & 0xF0) | 0x0D;
+    return ek;
+}
+
+void CheckParse(std::span<const std::byte> contents, PQHandshake::ParseKind kind, std::optional<std::pair<size_t, size_t>> payload = std::nullopt)
+{
+    const auto parsed{PQHandshake::ParseContents(contents)};
+    BOOST_CHECK(parsed.kind == kind);
+    if (payload) {
+        BOOST_CHECK(parsed.payload.data() == contents.data() + payload->first);
+        BOOST_CHECK_EQUAL(parsed.payload.size(), payload->second);
+    } else {
+        BOOST_CHECK(parsed.payload.empty());
+    }
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(pq_records_grammar)
+{
+    using enum PQHandshake::ParseKind;
+    // Empty contents, as every BIP324 implementation sends today: no features.
+    CheckParse({}, NO_RECORD);
+    // Unknown and reserved headers, with and without payload, are ignored.
+    CheckParse(HexBytes("0100"), NO_RECORD);
+    CheckParse(HexBytes("0301aabb"), NO_RECORD);
+    CheckParse(HexBytes("0100" "02f1aa" "01ff"), NO_RECORD);
+    // An own record with an empty payload parses; its length is checked later, by the role.
+    CheckParse(HexBytes("01f0"), OWN_RECORD, std::pair{2, 0});
+    CheckParse(HexBytes("0201aa" "03f0bbcc"), OWN_RECORD, std::pair{5, 2});
+    // len = 0, alone or after valid records.
+    CheckParse(HexBytes("00"), INVALID_GRAMMAR);
+    CheckParse(HexBytes("0201aa" "00"), INVALID_GRAMMAR);
+    CheckParse(HexBytes("00" "01f0"), INVALID_GRAMMAR);
+    // Truncated records and truncated CompactSize encodings.
+    CheckParse(HexBytes("05f0aabb"), INVALID_GRAMMAR);
+    CheckParse(HexBytes("02f0"), INVALID_GRAMMAR);
+    CheckParse(HexBytes("fd"), INVALID_GRAMMAR);
+    CheckParse(HexBytes("fd21"), INVALID_GRAMMAR);
+    CheckParse(HexBytes("fe010000"), INVALID_GRAMMAR);
+    CheckParse(HexBytes("ff01000000000000"), INVALID_GRAMMAR);
+    // Non-canonical CompactSize encodings of lengths that would otherwise fit.
+    CheckParse(HexBytes("fd0200" "f0aa"), INVALID_GRAMMAR);
+    CheckParse(HexBytes("fe02000000" "f0aa"), INVALID_GRAMMAR);
+    CheckParse(HexBytes("ff0200000000000000" "f0aa"), INVALID_GRAMMAR);
+    // Oversized lengths: beyond the contents (one byte, and far), exactly MAX_SIZE (which
+    // ReadCompactSize accepts), beyond MAX_SIZE (which it rejects), and beyond size_t on 32-bit
+    // platforms. None is used to skip bytes before it is checked.
+    static_assert(MAX_SIZE == 0x02000000);
+    CheckParse(HexBytes("03f0aa"), INVALID_GRAMMAR);
+    CheckParse(HexBytes("fdfd00" "f0aa"), INVALID_GRAMMAR);
+    CheckParse(HexBytes("fe00000002" "f0aa"), INVALID_GRAMMAR);
+    CheckParse(HexBytes("fe01000002" "f0aa"), INVALID_GRAMMAR);
+    CheckParse(HexBytes("ffffffffffffffffff" "f0aa"), INVALID_GRAMMAR);
+    CheckParse(HexBytes("ff0000000001000000" "f0aa"), INVALID_GRAMMAR);
+    // Trailing corruption after valid records, including after a valid own record.
+    CheckParse(HexBytes("0201aa" "07"), INVALID_GRAMMAR);
+    CheckParse(HexBytes("02f0aa" "fd"), INVALID_GRAMMAR);
+    CheckParse(HexBytes("02f0aa" "0301aa"), INVALID_GRAMMAR);
+    // Canonical 3-byte CompactSize lengths parse.
+    std::vector<std::byte> long_unknown{HexBytes("fdfd00" "01")};
+    long_unknown.resize(long_unknown.size() + 0xfc);
+    CheckParse(long_unknown, NO_RECORD);
+}
+
+BOOST_AUTO_TEST_CASE(pq_records_first_wins)
+{
+    using enum PQHandshake::ParseKind;
+    const mlkem::PublicKey ek{TestEncapsulationKey()};
+    const auto offer{PQHandshake::SerializeRecord(ek)};
+    BOOST_CHECK_EQUAL(HexStr(std::span{offer}.first(4)), "fd2106f0");
+    BOOST_CHECK(std::ranges::equal(std::span{offer}.subspan(4), std::as_bytes(std::span{ek})));
+    const auto malformed{MakeRecord(PQ_MLKEM1024, HexBytes("aabb"))};
+    const auto unknown{MakeRecord(0xf1, HexBytes("cc"))};
+
+    // A valid first own record wins over a malformed duplicate, wherever unknown records are.
+    CheckParse(offer, OWN_RECORD, std::pair{4, mlkem::PUBLIC_KEY_BYTES});
+    CheckParse(Concat({offer, malformed}), OWN_RECORD, std::pair{4, mlkem::PUBLIC_KEY_BYTES});
+    CheckParse(Concat({unknown, offer, unknown, malformed}), OWN_RECORD, std::pair{unknown.size() + 4, mlkem::PUBLIC_KEY_BYTES});
+    // A malformed first own record wins over a valid second one; the role's length check then fails.
+    CheckParse(Concat({malformed, offer}), OWN_RECORD, std::pair{2, 2});
+    CheckParse(Concat({unknown, malformed, offer}), OWN_RECORD, std::pair{unknown.size() + 2, 2});
+    // Any later framing corruption means no features, even after a valid own record.
+    CheckParse(Concat({offer, HexBytes("00")}), INVALID_GRAMMAR);
+    CheckParse(Concat({offer, unknown, HexBytes("05f0")}), INVALID_GRAMMAR);
+    CheckParse(Concat({offer, HexBytes("fd0300f0aabb")}), INVALID_GRAMMAR);
+    auto truncated{Concat({unknown, offer})};
+    truncated.pop_back();
+    CheckParse(truncated, INVALID_GRAMMAR);
+}
+
+BOOST_AUTO_TEST_CASE(pq_record_semantics)
+{
+    const mlkem::PublicKey ek{TestEncapsulationKey()};
+    for (const size_t size : {size_t{0}, mlkem::PUBLIC_KEY_BYTES - 1, mlkem::PUBLIC_KEY_BYTES + 1}) {
+        std::vector<std::byte> payload(size, std::byte{0x42});
+        // The responder's offer, at the initiator.
+        PQHandshake initiator{/*initiating=*/true, PQMode::NEGOTIATE};
+        const auto contents{MakeRecord(PQ_MLKEM1024, payload)};
+        const auto parsed{PQHandshake::ParseContents(contents)};
+        BOOST_REQUIRE(parsed.kind == PQHandshake::ParseKind::OWN_RECORD);
+        BOOST_CHECK(!initiator.CheckRecordLength(parsed.payload));
+        BOOST_CHECK(initiator.GetSnapshot().failure == PQFailure::EK_LENGTH);
+        BOOST_CHECK(initiator.GetSnapshot().offer == PQOfferState::NONE);
+        // The initiator's accept, at the responder, which wipes its key.
+        PQHandshake responder{/*initiating=*/false, PQMode::NEGOTIATE};
+        PQHandshake::Record offer;
+        BOOST_REQUIRE(responder.MakeOffer(offer) == mlkem::Error::NONE);
+        BOOST_CHECK(!responder.CheckRecordLength(parsed.payload));
+        BOOST_CHECK(responder.GetSnapshot().failure == PQFailure::CT_LENGTH);
+        BOOST_CHECK(!responder.HasDecapsulationKey());
+    }
+
+    // A key of the right length that fails the modulus check.
+    g_kem_calls = {};
+    TestPQEntropy entropy{uint256::ONE};
+    PQHandshake initiator{/*initiating=*/true, PQMode::NEGOTIATE, entropy.Source(), COUNTING_KEM_OPS};
+    const auto contents{PQHandshake::SerializeRecord(BadModulusKey(ek))};
+    const auto payload{initiator.CheckRecordLength(PQHandshake::ParseContents(contents).payload)};
+    BOOST_REQUIRE(payload);
+    PQHandshake::Record accept;
+    accept.fill(std::byte{0x33});
+    mlkem::SharedSecret ss;
+    BOOST_CHECK(initiator.AcceptOffer(*payload, accept, ss) == mlkem::Error::INVALID_PUBLIC_KEY);
+    BOOST_CHECK(initiator.GetSnapshot().failure == PQFailure::EK_MODULUS);
+    BOOST_CHECK(initiator.GetSnapshot().offer == PQOfferState::RECEIVED);
+    BOOST_CHECK(std::ranges::all_of(accept, [](std::byte b) { return b == std::byte{0x33}; }));
+    BOOST_CHECK_EQUAL(g_kem_calls.check, 1);
+    BOOST_CHECK_EQUAL(g_kem_calls.total(), 1);
+    // No entropy was drawn for a rejected key.
+    BOOST_CHECK_EQUAL(entropy.counter, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(pq_records_max_contents)
+{
+    using enum PQHandshake::ParseKind;
+    // The largest contents a v2 packet can carry (1 + 12 + 4,000,000 bytes), as minimal unknown
+    // records. One pass, no copies, no exception.
+    constexpr size_t MAX_CONTENTS{4'000'013};
+    std::vector<std::byte> contents;
+    contents.reserve(MAX_CONTENTS);
+    while (contents.size() + 2 < MAX_CONTENTS) {
+        contents.push_back(std::byte{0x01});
+        contents.push_back(std::byte{0x01});
+    }
+    // Ending in a malformed record: no features.
+    std::vector<std::byte> malformed{contents};
+    malformed.push_back(std::byte{0x05});
+    BOOST_REQUIRE_EQUAL(malformed.size(), MAX_CONTENTS);
+    CheckParse(malformed, INVALID_GRAMMAR);
+    // Ending in a valid unknown record: still no features.
+    std::vector<std::byte> valid{contents.begin(), contents.end() - 2};
+    for (const auto b : HexBytes("0201aa")) valid.push_back(b);
+    BOOST_REQUIRE_EQUAL(valid.size(), MAX_CONTENTS);
+    CheckParse(valid, NO_RECORD);
+    // Ending in an own record: found at the very end.
+    const auto offer{PQHandshake::SerializeRecord(TestEncapsulationKey())};
+    std::vector<std::byte> own{HexBytes("0201aa")};
+    while (own.size() + 2 + offer.size() <= MAX_CONTENTS) {
+        own.push_back(std::byte{0x01});
+        own.push_back(std::byte{0x01});
+    }
+    own.insert(own.end(), offer.begin(), offer.end());
+    BOOST_REQUIRE_EQUAL(own.size(), MAX_CONTENTS);
+    CheckParse(own, OWN_RECORD, std::pair{MAX_CONTENTS - mlkem::PUBLIC_KEY_BYTES, mlkem::PUBLIC_KEY_BYTES});
+}
+
+BOOST_AUTO_TEST_CASE(pq_handshake_negotiation)
+{
+    UniValue doc;
+    BOOST_REQUIRE(doc.read(json_tests::pq_transport_vectors));
+    const UniValue& vector{doc["vectors"][0]};
+    const auto keygen_seed{ParseHex(vector["mlkem_keygen_seed"].get_str())};
+    const auto encaps_m{ParseHex(vector["mlkem_encaps_m"].get_str())};
+
+    // With the vector's entropy, MakeOffer draws d then z and AcceptOffer draws m, so the offer,
+    // the accept and both secrets are the vector's.
+    {
+        TestPQEntropy responder_entropy{uint256::ZERO}, initiator_entropy{uint256::ONE};
+        responder_entropy.Queue(keygen_seed);
+        initiator_entropy.Queue(encaps_m);
+        PQHandshake responder{/*initiating=*/false, PQMode::NEGOTIATE, responder_entropy.Source(), DefaultPQKemOps()};
+        PQHandshake initiator{/*initiating=*/true, PQMode::NEGOTIATE, initiator_entropy.Source(), DefaultPQKemOps()};
+
+        PQHandshake::Record offer;
+        BOOST_REQUIRE(responder.MakeOffer(offer) == mlkem::Error::NONE);
+        BOOST_CHECK_EQUAL(HexStr(offer), "fd2106f0" + vector["ek"].get_str());
+        BOOST_CHECK(responder.HasDecapsulationKey());
+        // SENT means queued, which only the caller knows.
+        BOOST_CHECK(responder.GetSnapshot().offer == PQOfferState::NONE);
+        responder.SetOfferSent();
+        BOOST_CHECK(responder.GetSnapshot().offer == PQOfferState::SENT);
+        BOOST_CHECK(responder_entropy.queued.empty());
+
+        const auto ek{initiator.CheckRecordLength(PQHandshake::ParseContents(offer).payload)};
+        BOOST_REQUIRE(ek);
+        PQHandshake::Record accept;
+        mlkem::SharedSecret ss_initiator;
+        BOOST_REQUIRE(initiator.AcceptOffer(*ek, accept, ss_initiator) == mlkem::Error::NONE);
+        BOOST_CHECK_EQUAL(HexStr(accept), "fd2106f0" + vector["ct"].get_str());
+        BOOST_CHECK_EQUAL(HexStr(ss_initiator.Bytes()), vector["ss_mlkem"].get_str());
+        BOOST_CHECK(initiator.GetSnapshot().offer == PQOfferState::RECEIVED);
+        BOOST_CHECK(initiator.GetSnapshot().failure == PQFailure::NONE);
+
+        const auto ct{responder.CheckRecordLength(PQHandshake::ParseContents(accept).payload)};
+        BOOST_REQUIRE(ct);
+        mlkem::SharedSecret ss_responder;
+        BOOST_REQUIRE(responder.DecapsulateAccept(*ct, ss_responder) == mlkem::Error::NONE);
+        BOOST_CHECK_EQUAL(HexStr(ss_responder.Bytes()), vector["ss_mlkem"].get_str());
+        // The decapsulation key is single use.
+        BOOST_CHECK(!responder.HasDecapsulationKey());
+        BOOST_CHECK(responder.GetSnapshot().failure == PQFailure::NONE);
+    }
+
+    // Random production entropy: both sides agree, and every handshake has fresh keys.
+    std::optional<std::vector<uint8_t>> previous;
+    for (int i = 0; i < 2; ++i) {
+        PQHandshake responder{/*initiating=*/false, PQMode::NEGOTIATE};
+        PQHandshake initiator{/*initiating=*/true, PQMode::NEGOTIATE};
+        PQHandshake::Record offer, accept;
+        mlkem::SharedSecret ss_initiator, ss_responder;
+        BOOST_REQUIRE(responder.MakeOffer(offer) == mlkem::Error::NONE);
+        BOOST_REQUIRE(initiator.AcceptOffer(*initiator.CheckRecordLength(PQHandshake::ParseContents(offer).payload), accept, ss_initiator) == mlkem::Error::NONE);
+        BOOST_REQUIRE(responder.DecapsulateAccept(*responder.CheckRecordLength(PQHandshake::ParseContents(accept).payload), ss_responder) == mlkem::Error::NONE);
+        BOOST_CHECK(std::ranges::equal(ss_initiator.Bytes(), ss_responder.Bytes()));
+        std::vector<uint8_t> current(offer.size());
+        std::ranges::copy(MakeUCharSpan(offer), current.begin());
+        if (previous) BOOST_CHECK(*previous != current);
+        previous = current;
+    }
+
+    // A corrupted ciphertext of the right length is not an error: it yields a different secret.
+    {
+        PQHandshake responder{/*initiating=*/false, PQMode::NEGOTIATE};
+        PQHandshake initiator{/*initiating=*/true, PQMode::NEGOTIATE};
+        PQHandshake::Record offer, accept;
+        mlkem::SharedSecret ss_initiator, ss_responder;
+        BOOST_REQUIRE(responder.MakeOffer(offer) == mlkem::Error::NONE);
+        BOOST_REQUIRE(initiator.AcceptOffer(*initiator.CheckRecordLength(PQHandshake::ParseContents(offer).payload), accept, ss_initiator) == mlkem::Error::NONE);
+        accept[100] ^= std::byte{0x01};
+        BOOST_REQUIRE(responder.DecapsulateAccept(*responder.CheckRecordLength(PQHandshake::ParseContents(accept).payload), ss_responder) == mlkem::Error::NONE);
+        BOOST_CHECK(!std::ranges::equal(ss_initiator.Bytes(), ss_responder.Bytes()));
+    }
+
+    using mlkem::InjectResultForTesting;
+    using mlkem::Operation;
+    namespace upstream = mlkem::upstream;
+    const auto all_bytes_are = [](std::span<const uint8_t> bytes, uint8_t value) {
+        return std::ranges::all_of(bytes, [&](uint8_t b) { return b == value; });
+    };
+
+    // Key generation fails: no offer, no key, a recorded internal error.
+    {
+        PQHandshake responder{/*initiating=*/false, PQMode::NEGOTIATE};
+        PQHandshake::Record offer;
+        offer.fill(std::byte{0x33});
+        {
+            InjectResultForTesting inject{Operation::KEYGEN, upstream::ERR_FAIL};
+            BOOST_CHECK(responder.MakeOffer(offer) == mlkem::Error::INTERNAL);
+        }
+        BOOST_CHECK(std::ranges::all_of(offer, [](std::byte b) { return b == std::byte{0x33}; }));
+        BOOST_CHECK(!responder.HasDecapsulationKey());
+        BOOST_CHECK(responder.GetSnapshot().offer == PQOfferState::NONE);
+        BOOST_CHECK(responder.GetSnapshot().failure == PQFailure::KEYGEN_INTERNAL);
+    }
+
+    // The key check or encapsulation fails internally: no accept, the secret cleared.
+    for (const auto& [op, failure] : {std::pair{Operation::CHECK_PUBLIC_KEY, PQFailure::CHECK_EK_INTERNAL},
+                                      std::pair{Operation::ENCAPS, PQFailure::ENCAPS_INTERNAL}}) {
+        for (const int result : {upstream::ERR_FAIL, upstream::ERR_OUT_OF_MEMORY}) {
+            PQHandshake initiator{/*initiating=*/true, PQMode::NEGOTIATE};
+            const mlkem::PublicKey ek{TestEncapsulationKey()};
+            PQHandshake::Record accept;
+            accept.fill(std::byte{0x33});
+            mlkem::SharedSecret ss;
+            std::ranges::fill(ss.Bytes(), 0x44);
+            {
+                InjectResultForTesting inject{op, result};
+                BOOST_CHECK(initiator.AcceptOffer(ek, accept, ss) == mlkem::Error::INTERNAL);
+            }
+            BOOST_CHECK(std::ranges::all_of(accept, [](std::byte b) { return b == std::byte{0x33}; }));
+            BOOST_CHECK(all_bytes_are(ss.Bytes(), 0));
+            BOOST_CHECK(initiator.GetSnapshot().failure == failure);
+        }
+    }
+    // An encapsulation that rejects the key after the check passed is a local fault too.
+    {
+        PQHandshake initiator{/*initiating=*/true, PQMode::NEGOTIATE};
+        PQHandshake::Record accept;
+        mlkem::SharedSecret ss;
+        InjectResultForTesting inject{Operation::ENCAPS, upstream::ERR_INVALID_PK};
+        BOOST_CHECK(initiator.AcceptOffer(TestEncapsulationKey(), accept, ss) == mlkem::Error::INTERNAL);
+        BOOST_CHECK(initiator.GetSnapshot().failure == PQFailure::ENCAPS_INTERNAL);
+    }
+
+    // Decapsulation fails internally (including a failed key hash check): the secret cleared, the
+    // key wiped.
+    for (const int result : {upstream::ERR_FAIL, upstream::ERR_INVALID_SK}) {
+        PQHandshake responder{/*initiating=*/false, PQMode::NEGOTIATE};
+        PQHandshake initiator{/*initiating=*/true, PQMode::NEGOTIATE};
+        PQHandshake::Record offer, accept;
+        mlkem::SharedSecret ss_initiator, ss_responder;
+        BOOST_REQUIRE(responder.MakeOffer(offer) == mlkem::Error::NONE);
+        BOOST_REQUIRE(initiator.AcceptOffer(*initiator.CheckRecordLength(PQHandshake::ParseContents(offer).payload), accept, ss_initiator) == mlkem::Error::NONE);
+        std::ranges::fill(ss_responder.Bytes(), 0x44);
+        {
+            InjectResultForTesting inject{Operation::DECAPS, result};
+            BOOST_CHECK(responder.DecapsulateAccept(*responder.CheckRecordLength(PQHandshake::ParseContents(accept).payload), ss_responder) == mlkem::Error::INTERNAL);
+        }
+        BOOST_CHECK(all_bytes_are(ss_responder.Bytes(), 0));
+        BOOST_CHECK(!responder.HasDecapsulationKey());
+        BOOST_CHECK(responder.GetSnapshot().failure == PQFailure::DECAPS_INTERNAL);
+    }
+
+    // ClearSecrets() and any recorded failure wipe the key; the first failure is kept.
+    {
+        PQHandshake responder{/*initiating=*/false, PQMode::NEGOTIATE};
+        PQHandshake::Record offer;
+        BOOST_REQUIRE(responder.MakeOffer(offer) == mlkem::Error::NONE);
+        responder.ClearSecrets();
+        BOOST_CHECK(!responder.HasDecapsulationKey());
+        BOOST_CHECK(responder.GetSnapshot().failure == PQFailure::NONE);
+    }
+    {
+        PQHandshake responder{/*initiating=*/false, PQMode::NEGOTIATE};
+        PQHandshake::Record offer;
+        BOOST_REQUIRE(responder.MakeOffer(offer) == mlkem::Error::NONE);
+        responder.SetFailure(PQFailure::CONFIRM_TAG);
+        BOOST_CHECK(!responder.HasDecapsulationKey());
+        responder.SetFailure(PQFailure::CONFIRM_LENGTH);
+        BOOST_CHECK(responder.GetSnapshot().failure == PQFailure::CONFIRM_TAG);
+    }
+
+    // The snapshot records progress.
+    {
+        PQHandshake initiator{/*initiating=*/true, PQMode::NEGOTIATE};
+        BOOST_CHECK(!initiator.GetSnapshot().version_received);
+        initiator.SetVersionReceived();
+        initiator.SetSwitched();
+        initiator.SetConfirmed();
+        const auto snapshot{initiator.GetSnapshot()};
+        BOOST_CHECK(snapshot.version_received && snapshot.switched && snapshot.confirmed);
+        BOOST_CHECK(snapshot.failure == PQFailure::NONE);
     }
 }
 
