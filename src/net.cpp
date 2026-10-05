@@ -1211,6 +1211,12 @@ bool V2Transport::ProcessReceivedKeyBytes() noexcept
         } else if (m_initiating) {
             // Hold the version packet until the responder's arrives: it answers their offer.
             SetSendState(SendState::AWAITING_VERSION);
+        } else if (const PQOfferGate& gate{m_pq_options.offer_gate}; gate.allow && !gate.allow(gate.context)) {
+            // Load shedding: no offer, which is exactly plain v2.
+            m_pq_shed = true;
+            ClearHybridSecrets();
+            SetSendState(SendState::READY);
+            AppendVersionPacket(VERSION_CONTENTS);
         } else {
             // Offer an encapsulation key in the version packet, and send nothing else until the
             // initiator's version packet is processed. The key is generated only now that the
@@ -1863,6 +1869,7 @@ PQStatus V2Transport::GetPQStatus() const noexcept
     case PQMode::FALLBACK: return PQStatus::FALLBACK;
     case PQMode::NEGOTIATE: break;
     }
+    if (m_pq_shed) return PQStatus::OFF;
     const PQHandshake::Snapshot snapshot{m_pq.GetSnapshot()};
     if (snapshot.confirmed) return PQStatus::HYBRID;
     switch (snapshot.failure) {
@@ -2170,7 +2177,7 @@ void CConnman::CreateNodeFromAcceptedSocket(std::unique_ptr<Sock>&& sock,
                                  .prefer_evict = discouraged,
                                  .recv_flood_size = nReceiveFloodSize,
                                  .use_v2transport = use_v2transport,
-                                 .pq = {.mode = m_pq_mode},
+                                 .pq = {.mode = m_pq_mode, .offer_gate = {.allow = &CConnman::AllowPQOffer, .context = this}},
                                  // The actual remote address and source port.
                                  .pq_endpoint = addr,
                              });
@@ -2603,6 +2610,15 @@ void CConnman::LogPQLocalFault() const
 PQTransportStats CConnman::GetPQTransportStats() const
 {
     AssertLockNotHeld(m_pq_mutex);
+    AssertLockNotHeld(m_pq_shed_mutex);
+    // The two mutexes never nest.
+    PQLoadSheddingStats load_shedding;
+    {
+        LOCK(m_pq_shed_mutex);
+        load_shedding = {.active = m_pq_shedding_since.has_value(),
+                         .threshold_per_s = m_pq_shed_threshold,
+                         .since = m_pq_shedding_since.value_or(NodeSeconds{})};
+    }
     LOCK(m_pq_mutex);
     PQTransportStats stats{
         .instance_id = m_pq_instance_id,
@@ -2613,6 +2629,7 @@ PQTransportStats CConnman::GetPQTransportStats() const
         .outbound_failures = m_pq_failures[PQDirection(/*inbound=*/false)],
         .fallback_set = {},
         .failure_streaks = {},
+        .load_shedding = load_shedding,
     };
     const NodeSeconds now{Now<NodeSeconds>()};
     for (const auto& [endpoint, history] : m_pq_history) {
@@ -2626,6 +2643,73 @@ PQTransportStats CConnman::GetPQTransportStats() const
         }
     }
     return stats;
+}
+
+bool CConnman::AllowPQOffer(void* connman) noexcept
+{
+    return static_cast<CConnman*>(connman)->AllowPQOffer();
+}
+
+bool CConnman::AllowPQOffer() noexcept
+{
+    AssertLockNotHeld(m_pq_shed_mutex);
+    const PQShedSeconds now{PQShedNow()};
+    bool stopped;
+    std::optional<uint64_t> started;
+    bool offer;
+    {
+        LOCK(m_pq_shed_mutex);
+        stopped = AdvancePQShedding(now);
+        ++m_pq_shed_attempts;
+        if (!m_pq_shedding_since && m_pq_shed_attempts > m_pq_shed_threshold) {
+            m_pq_shedding_since = Now<NodeSeconds>();
+            // The quiet seconds before the flood don't count toward its end.
+            m_pq_quiet_since.reset();
+            started = m_pq_shed_threshold;
+        }
+        offer = !m_pq_shedding_since;
+    }
+    if (!offer) ++m_pq_counters[PQDirection(/*inbound=*/true)].shed;
+    if (stopped) LogPQShedding(std::nullopt);
+    if (started) LogPQShedding(started);
+    return offer;
+}
+
+bool CConnman::AdvancePQShedding(PQShedSeconds now)
+{
+    AssertLockHeld(m_pq_shed_mutex);
+    if (now > m_pq_shed_second) {
+        // Close the current second, and the seconds without attempts since: a second is quiet
+        // with fewer than half the threshold's attempts.
+        if (2 * m_pq_shed_attempts >= m_pq_shed_threshold) {
+            m_pq_quiet_since.reset();
+            if (now > m_pq_shed_second + 1s) m_pq_quiet_since = m_pq_shed_second + 1s;
+        } else if (!m_pq_quiet_since) {
+            m_pq_quiet_since = m_pq_shed_second;
+        }
+        m_pq_shed_second = now;
+        m_pq_shed_attempts = 0;
+    }
+    if (m_pq_shedding_since && m_pq_quiet_since && now - *m_pq_quiet_since >= PQ_SHED_QUIET_PERIOD) {
+        m_pq_shedding_since.reset();
+        return true;
+    }
+    return false;
+}
+
+void CConnman::UpdatePQShedding(PQShedSeconds now)
+{
+    AssertLockNotHeld(m_pq_shed_mutex);
+    if (WITH_LOCK(m_pq_shed_mutex, return AdvancePQShedding(now))) LogPQShedding(std::nullopt);
+}
+
+void CConnman::LogPQShedding(std::optional<uint64_t> started_threshold)
+{
+    if (started_threshold) {
+        LogInfo("v2 pq: load_shedding started threshold_per_s=%u", *started_threshold);
+    } else {
+        LogInfo("v2 pq: load_shedding stopped");
+    }
 }
 
 void CConnman::DisconnectNodes()
@@ -2966,6 +3050,7 @@ void CConnman::ThreadSocketHandler()
     {
         DisconnectNodes();
         NotifyNumConnectionsChanged();
+        if (m_pq_mode == PQMode::NEGOTIATE) UpdatePQShedding(PQShedNow());
         SocketHandler();
     }
 }

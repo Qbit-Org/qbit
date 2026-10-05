@@ -16,6 +16,7 @@
 #include <span.h>
 #include <sync.h>
 #include <util/sock.h>
+#include <util/thread.h>
 
 #include <algorithm>
 #include <array>
@@ -106,6 +107,22 @@ struct ConnmanTestMsg : public CConnman {
     }
 
     void SetPQMode(PQMode mode) { m_pq_mode = mode; }
+
+    void UpdatePQSheddingPublic() EXCLUSIVE_LOCKS_REQUIRED(!m_pq_shed_mutex) { UpdatePQShedding(PQShedNow()); }
+
+    /** Run the socket handler thread, as Start() does. */
+    void StartSocketHandlerThread()
+    {
+        threadSocketHandler = std::thread(&util::TraceThread, "net", [this] { ThreadSocketHandler(); });
+    }
+
+    /** Stop the socket handler thread, and let the connection manager run again. */
+    void StopSocketHandlerThread()
+    {
+        interruptNet();
+        if (threadSocketHandler.joinable()) threadSocketHandler.join();
+        interruptNet.reset();
+    }
 
     void ObservePQPublic(CNode& node, bool finalizing) EXCLUSIVE_LOCKS_REQUIRED(!m_pq_mutex)
     {
