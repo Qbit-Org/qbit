@@ -15,6 +15,7 @@ upstream `qa-assets` corpus, and for the v2 transport targets, whose
 | `p2mr_script` | [`p2mr_script/`](p2mr_script) |
 | `p2p_transport_bidirectional_v1v2` | [`p2p_transport_bidirectional_v1v2/`](p2p_transport_bidirectional_v1v2) |
 | `p2p_transport_bidirectional_v2` | [`p2p_transport_bidirectional_v2/`](p2p_transport_bidirectional_v2) |
+| `p2p_v2_pq_malicious_peer` | [`p2p_v2_pq_malicious_peer/`](p2p_v2_pq_malicious_peer) |
 | `pq_records` | [`pq_records/`](pq_records) |
 | `pqc` | [`pqc/`](pqc) |
 
@@ -83,6 +84,18 @@ so the final flush completes the handshake, and some add a fixed pattern that
 drives the loop first. The v2 harness checks that the keys are hybrid on both
 sides exactly when both negotiate.
 
+`p2p_v2_pq_malicious_peer` drives a v2 transport from a malicious peer that
+completes the ECDH part honestly, so every packet it sends authenticates, and
+chooses the negotiation plaintext. Its layout: the tested transport's role and
+mode, both keys, both garbage lengths and a seed (everything else random comes
+from it), then a script of steps, each a choice byte and a fixed-width
+parameter: send our key, terminator, a decoy, a version packet variant, a
+confirmation variant or an application packet; deliver or take some bytes;
+flush; give the transport a message; send unauthenticated bytes; disconnect.
+The seeds script honest hybrid exchanges in both roles, each malformed record
+and confirmation failure, a damaged ciphertext, a legacy peer, a fallback
+initiator, an unsolicited record and a disconnect while the offer is pending.
+
 ## Use in CI
 
 [`overlay.py`](overlay.py) copies each seed to
@@ -96,6 +109,6 @@ from a reused corpus by hand if they are no longer wanted. A target path that
 is not a directory, or a symlink, directory or other non-regular file at a
 managed name, is an error; all target paths and managed names are checked
 before any file is written.
-`test/fuzz/test_runner.py --require_qbit_corpus` then fails unless all eleven
+`test/fuzz/test_runner.py --require_qbit_corpus` then fails unless all twelve
 targets are selected, each has at least one regular input file, and the fuzz
 binary reports replaying them.

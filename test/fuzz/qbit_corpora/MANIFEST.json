@@ -538,6 +538,120 @@
         "semantics": "An initiator in fallback never parses the offer; a fixed 48-byte pattern drives the interleaving loop, then the final flush completes the handshake: ECDH keys."
       }
     ],
+    "p2p_v2_pq_malicious_peer": [
+      {
+        "file": "initiator-hybrid",
+        "format": "fdp",
+        "size": 90,
+        "sha256": "96925cdab372557e025a9cac0dc3b5e3ca71d1b4b9499077b0e7f1d5a6e9c211",
+        "semantics": "The transport initiates; we offer honestly and switch on its accept: hybrid, confirmed, messages both ways."
+      },
+      {
+        "file": "responder-hybrid",
+        "format": "fdp",
+        "size": 90,
+        "sha256": "796086e85f8379e80d9f7cdb75f60544d260051be35af905e966c33773bde94c",
+        "semantics": "The transport offers; we accept honestly and switch: hybrid, confirmed, messages both ways."
+      },
+      {
+        "file": "initiator-hybrid-extras-fragmented",
+        "format": "fdp",
+        "size": 309,
+        "sha256": "f45f8b17efcd2bfc33d6ade02c70da02d30dbdd2bfdf1d19a1fe69a65ef16eec",
+        "semantics": "Maximum garbage both ways, own records inside decoys, an offer between unknown and duplicate records, delivered in 97-byte and then 1-byte pieces: hybrid."
+      },
+      {
+        "file": "responder-hybrid-extras",
+        "format": "fdp",
+        "size": 97,
+        "sha256": "bb33f24d2a9e2696ee9428633897934427610f8681bc2e65e941ec010a88afcc",
+        "semantics": "Decoys, then an accept between unknown and duplicate records: hybrid."
+      },
+      {
+        "file": "initiator-ek-length",
+        "format": "fdp",
+        "size": 83,
+        "sha256": "1727485faecda04ec7f676fe38b5dd837d06554f4bc76cc0e0b91a3665860467",
+        "semantics": "A 1,567-byte offer: the transport closes with ek_length and never sends its version packet."
+      },
+      {
+        "file": "initiator-ek-modulus",
+        "format": "fdp",
+        "size": 83,
+        "sha256": "032bd86ffdea759d3b842e38891187a844f2d27713e5d5704fff6086d06bca4f",
+        "semantics": "An offer whose coefficients are all above q: the transport closes with ek_modulus."
+      },
+      {
+        "file": "responder-ct-length",
+        "format": "fdp",
+        "size": 83,
+        "sha256": "42661de0c7b810020c0c76d463661a203c262faab397d6f3e9c09dd40fc7281a",
+        "semantics": "A 1,569-byte accept: the transport closes with ct_length."
+      },
+      {
+        "file": "responder-corrupt-ct",
+        "format": "fdp",
+        "size": 90,
+        "sha256": "f7ba2b5a427de4fb48e9fe038386188f5a28d1ff8d3d1a270878135bcbf46c0d",
+        "semantics": "An accept with one ciphertext bit flipped: the transport switches to other keys and our confirmation fails."
+      },
+      {
+        "file": "responder-disconnect-after-offer",
+        "format": "fdp",
+        "size": 81,
+        "sha256": "612b7d3ab9f066d1a40a408047aac95b3d78ddd9408a716ac0ecf52ea5b34737",
+        "semantics": "The transport offers and we disconnect before sending our version packet."
+      },
+      {
+        "file": "initiator-confirmation-length",
+        "format": "fdp",
+        "size": 86,
+        "sha256": "2ca916c42ec30c4e55391852d1e45b46666d312e15ebd821ff4d1da9aa3db3ec",
+        "semantics": "An honest exchange, then a nonzero-length first hybrid packet: the transport fails it at byte 3."
+      },
+      {
+        "file": "initiator-confirmation-tag",
+        "format": "fdp",
+        "size": 86,
+        "sha256": "23721132e8dba8e0d357b1f99ca1a51fd44e6b8a2e8b79309f629d8fb1bc23b4",
+        "semantics": "An honest offer followed by a duplicate record, then a confirmation with a damaged header or tag."
+      },
+      {
+        "file": "responder-confirmation-not-decoy",
+        "format": "fdp",
+        "size": 86,
+        "sha256": "2b7d387a3b986e3dfea29386069868d90441e69bf02e869adf920b4fcc79e185",
+        "semantics": "An honest exchange, then an empty first hybrid packet without the ignore bit."
+      },
+      {
+        "file": "responder-legacy-peer-burst",
+        "format": "fdp",
+        "size": 89,
+        "sha256": "079588a0165c1ca65c75ac701e625169401a08909479b05ca704b1f18a6a3102",
+        "semantics": "We ignore the offer like a legacy peer and send application messages at once: plain v2, legacy_peer."
+      },
+      {
+        "file": "initiator-fallback-ignores-offer",
+        "format": "fdp",
+        "size": 88,
+        "sha256": "549406bb7e9c49617e70b98e2bb336f2a8424d6e1fb153a8009a527eca77bc91",
+        "semantics": "An initiator in fallback sends plain v2 at once and never parses our offer: no ML-KEM operation."
+      },
+      {
+        "file": "initiator-noncompliant-responder",
+        "format": "fdp",
+        "size": 85,
+        "sha256": "e2156d55b4e66ccf22a17b4c4d7bb0d66d6b8000f2db1322111c7f6dd122bc9c",
+        "semantics": "We offer and then send a decoy under the ECDH keys where our confirmation belongs: the transport fails it."
+      },
+      {
+        "file": "responder-off-unsolicited-accept",
+        "format": "fdp",
+        "size": 87,
+        "sha256": "600263bb14d01a4deefa4ec87a235eae35154b976a7866f594bd4635bb7578b4",
+        "semantics": "A responder that is off gets an accept-shaped record it never asked for: ignored, plain v2."
+      }
+    ],
     "pq_records": [
       {
         "file": "offer",

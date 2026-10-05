@@ -32,7 +32,8 @@ SRC_DIR = Path(__file__).resolve().parents[2]
 RUNNER = SRC_DIR / "test" / "fuzz" / "test_runner.py"
 CORPORA_DIR = SRC_DIR / "test" / "fuzz" / "qbit_corpora"
 REQUIRED = ("asert_chain_transition", "asert_edge_cases", "asert_math", "auxpow", "mlkem", "mlkem_backend_diff", "p2mr_script",
-            "p2p_transport_bidirectional_v1v2", "p2p_transport_bidirectional_v2", "pq_records", "pqc")
+            "p2p_transport_bidirectional_v1v2", "p2p_transport_bidirectional_v2",
+            "p2p_v2_pq_malicious_peer", "pq_records", "pqc")
 INTEGRATION = {}
 
 STUB_SOURCE = r'''
