@@ -35,7 +35,9 @@
 #include <util/threadinterrupt.h>
 #include <util/time.h>
 
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -45,6 +47,7 @@
 #include <memory>
 #include <optional>
 #include <queue>
+#include <set>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -860,6 +863,58 @@ struct PQFailureRing {
 /** At most this many entries in each failure ring. */
 inline constexpr size_t PQ_FAILURE_RING_SIZE{256};
 
+/** Consecutive counted failures (outbound malformed_record, first_packet_failed and
+ *  closed_after_switch) that put an endpoint in the fallback set. */
+inline constexpr uint32_t PQ_FAILURE_THRESHOLD{3};
+/** An endpoint's fallback windows: its first entry, its second, then every later one. */
+inline constexpr std::array<std::chrono::seconds, 3> PQ_FALLBACK_WINDOWS{
+    std::chrono::seconds{3600}, std::chrono::seconds{14400}, std::chrono::seconds{86400}};
+/** At most this many endpoints in the fallback, streak and escalation history. */
+inline constexpr size_t PQ_MAX_ENDPOINT_HISTORY{1000};
+/** Distinct endpoints with counted failures, and no success since startup, that suggest a local fault. */
+inline constexpr size_t PQ_LOCAL_FAULT_THRESHOLD{8};
+
+/** An endpoint's counted failures and fallback windows. */
+struct PQEndpointHistory {
+    //! Consecutive counted failures since the last fallback window ended.
+    uint32_t streak{0};
+    //! Fallback windows that ended; saturates at PQ_FALLBACK_WINDOWS.size().
+    uint8_t completed_windows{0};
+    //! The active fallback window, if any.
+    std::optional<NodeSeconds> entered{};
+    std::optional<NodeSeconds> expires{};
+    //! The latest counted failure.
+    NodeSeconds last_failure{};
+    PQOutcome cause{PQOutcome::MALFORMED_RECORD};
+    //! Assigned only from the fixed reason vocabulary.
+    std::string reason{};
+    //! The oldest insertion is evicted first; unique, so equal times can't tie.
+    uint64_t insertion_order{0};
+};
+
+/** An endpoint in the fallback set. */
+struct PQFallbackStats {
+    PQEndpointKey endpoint;
+    //! The failure that completed the streak, and its reason.
+    PQOutcome cause;
+    std::string reason;
+    uint32_t streak;
+    NodeSeconds entered;
+    NodeSeconds expires;
+};
+
+/** An endpoint with counted failures that is not in the fallback set. */
+struct PQStreakStats {
+    PQEndpointKey endpoint;
+    //! The latest counted failure, and its reason.
+    PQOutcome cause;
+    std::string reason;
+    uint32_t streak;
+    NodeSeconds last_failure;
+    //! The window the endpoint would enter at PQ_FAILURE_THRESHOLD.
+    std::chrono::seconds next_window;
+};
+
 /** An owning copy of the hybrid transport statistics, without atomics. */
 struct PQTransportStats {
     //! Random per process start; counters, rings and history count from since.
@@ -870,6 +925,8 @@ struct PQTransportStats {
     PQFailureRing inbound_failures;
     //! Outbound connections, manual ones included.
     PQFailureRing outbound_failures;
+    std::vector<PQFallbackStats> fallback_set;
+    std::vector<PQStreakStats> failure_streaks;
 };
 
 struct CNodeOptions
@@ -1377,7 +1434,7 @@ public:
     bool GetNetworkActive() const { return fNetworkActive; };
     bool GetUseAddrmanOutgoing() const { return m_use_addrman_outgoing; };
     void SetNetworkActive(bool active);
-    void OpenNetworkConnection(const CAddress& addrConnect, bool fCountFailure, CountingSemaphoreGrant<>&& grant_outbound, const char* strDest, ConnectionType conn_type, bool use_v2transport, bool is_archive_connection = false) EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex);
+    void OpenNetworkConnection(const CAddress& addrConnect, bool fCountFailure, CountingSemaphoreGrant<>&& grant_outbound, const char* strDest, ConnectionType conn_type, bool use_v2transport, bool is_archive_connection = false) EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex, !m_pq_mutex);
     bool CheckIncomingNonce(uint64_t nonce);
     void ASMapHealthCheck();
 
@@ -1473,7 +1530,7 @@ public:
      *                          - Max total outbound connection capacity filled
      *                          - Max connection capacity for type is filled
      */
-    bool AddConnection(const std::string& address, ConnectionType conn_type, bool use_v2transport) EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex);
+    bool AddConnection(const std::string& address, ConnectionType conn_type, bool use_v2transport) EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex, !m_pq_mutex);
 
     size_t GetNodeCount(ConnectionDirection) const;
     std::map<CNetAddr, LocalServiceInfo> getNetLocalAddresses() const;
@@ -1522,8 +1579,12 @@ public:
     uint64_t GetTotalBytesRecv() const;
     uint64_t GetTotalBytesSent() const EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex);
 
-    /** An owning copy of the hybrid transport counters and failure rings. */
+    /** An owning copy of the hybrid transport counters, failure rings and endpoint history. */
     PQTransportStats GetPQTransportStats() const EXCLUSIVE_LOCKS_REQUIRED(!m_pq_mutex);
+
+    /** Whether new outbound connections to endpoint run plain v2, because repeated hybrid
+     *  failures put it in the fallback set. Ends a window that expired. */
+    bool IsPQFallback(const PQEndpointKey& endpoint, NodeSeconds now) EXCLUSIVE_LOCKS_REQUIRED(!m_pq_mutex);
 
     /** Get a unique deterministic randomizer. */
     CSipHasher GetDeterministicRandomizer(uint64_t id) const;
@@ -1557,10 +1618,10 @@ private:
     bool Bind(const CService& addr, unsigned int flags, NetPermissionFlags permissions);
     bool InitBinds(const Options& options);
 
-    void ThreadOpenAddedConnections() EXCLUSIVE_LOCKS_REQUIRED(!m_added_nodes_mutex, !m_unused_i2p_sessions_mutex, !m_reconnections_mutex);
+    void ThreadOpenAddedConnections() EXCLUSIVE_LOCKS_REQUIRED(!m_added_nodes_mutex, !m_unused_i2p_sessions_mutex, !m_reconnections_mutex, !m_pq_mutex);
     void AddAddrFetch(const std::string& strDest) EXCLUSIVE_LOCKS_REQUIRED(!m_addr_fetches_mutex);
-    void ProcessAddrFetch() EXCLUSIVE_LOCKS_REQUIRED(!m_addr_fetches_mutex, !m_unused_i2p_sessions_mutex);
-    void ThreadOpenConnections(std::vector<std::string> connect, std::span<const std::string> seed_nodes) EXCLUSIVE_LOCKS_REQUIRED(!m_addr_fetches_mutex, !m_added_nodes_mutex, !m_nodes_mutex, !m_unused_i2p_sessions_mutex, !m_reconnections_mutex);
+    void ProcessAddrFetch() EXCLUSIVE_LOCKS_REQUIRED(!m_addr_fetches_mutex, !m_unused_i2p_sessions_mutex, !m_pq_mutex);
+    void ThreadOpenConnections(std::vector<std::string> connect, std::span<const std::string> seed_nodes) EXCLUSIVE_LOCKS_REQUIRED(!m_addr_fetches_mutex, !m_added_nodes_mutex, !m_nodes_mutex, !m_unused_i2p_sessions_mutex, !m_reconnections_mutex, !m_pq_mutex);
     void ThreadMessageHandler() EXCLUSIVE_LOCKS_REQUIRED(!mutexMsgProc);
     void ThreadI2PAcceptIncoming();
     void AcceptConnection(const ListenSocket& hListenSocket);
@@ -1626,7 +1687,7 @@ private:
     bool AlreadyConnectedToAddress(const CAddress& addr);
 
     bool AttemptToEvictConnection();
-    CNode* ConnectNode(CAddress addrConnect, const char *pszDest, bool fCountFailure, ConnectionType conn_type, bool use_v2transport, bool is_archive_connection = false) EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex);
+    CNode* ConnectNode(CAddress addrConnect, const char *pszDest, bool fCountFailure, ConnectionType conn_type, bool use_v2transport, bool is_archive_connection = false) EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex, !m_pq_mutex);
     void AddWhitelistPermissionFlags(NetPermissionFlags& flags, std::optional<CNetAddr> addr, const std::vector<NetWhitelistPermissions>& ranges) const;
 
     void DeleteNode(CNode* pnode);
@@ -1891,7 +1952,7 @@ private:
     std::list<ReconnectionInfo> m_reconnections GUARDED_BY(m_reconnections_mutex);
 
     /** Attempt reconnections, if m_reconnections non-empty. */
-    void PerformReconnections() EXCLUSIVE_LOCKS_REQUIRED(!m_reconnections_mutex, !m_unused_i2p_sessions_mutex);
+    void PerformReconnections() EXCLUSIVE_LOCKS_REQUIRED(!m_reconnections_mutex, !m_unused_i2p_sessions_mutex, !m_pq_mutex);
 
     /**
      * Cap on the size of `m_unused_i2p_sessions`, to ensure it does not
@@ -1940,6 +2001,15 @@ private:
     struct PQLogLine {
         PQOutcome outcome;
         std::string_view reason;
+        //! FALLBACK: the end of the window.
+        std::optional<NodeSeconds> until{};
+    };
+
+    /** What AccountPQ() leaves to log. */
+    struct PQLogLines {
+        std::vector<PQLogLine> outcomes;
+        //! Whether the one-time local-fault warning is due.
+        bool local_fault{false};
     };
 
     /**
@@ -1956,10 +2026,19 @@ private:
      */
     void ObservePQ(CNode& node, bool finalizing) EXCLUSIVE_LOCKS_REQUIRED(!m_pq_mutex);
 
-    /** Count each event of snapshot not yet accounted for node, once, and add a ring entry for
-     *  each non-success outcome. Returns the lines to log. */
-    std::vector<PQLogLine> AccountPQ(CNode& node, const PQHandshake::Snapshot& snapshot, NodeCloseCause cause,
-                                     bool finalizing, NodeSeconds now) EXCLUSIVE_LOCKS_REQUIRED(m_pq_mutex);
+    /** Count each event of snapshot not yet accounted for node, once, add a ring entry for each
+     *  non-success outcome, and update the endpoint history. Returns what to log. */
+    PQLogLines AccountPQ(CNode& node, const PQHandshake::Snapshot& snapshot, NodeCloseCause cause,
+                         bool finalizing, NodeSeconds now) EXCLUSIVE_LOCKS_REQUIRED(m_pq_mutex);
+
+    /**
+     * Count an outbound connection's failure against its endpoint. The third consecutive one
+     * enters the fallback set, unless the endpoint completed a hybrid handshake since startup.
+     * A failure during an active window neither extends it nor enters again. Returns the end of
+     * a window it started, and sets local_fault when the local-fault warning is due.
+     */
+    std::optional<NodeSeconds> CountPQFailure(const CNode& node, PQOutcome outcome, std::string_view reason, NodeSeconds now,
+                                              bool& local_fault) EXCLUSIVE_LOCKS_REQUIRED(m_pq_mutex);
 
     /** Add a non-success outcome to the ring of its direction. */
     void AddPQFailure(PQFailureEntry entry) EXCLUSIVE_LOCKS_REQUIRED(m_pq_mutex);
@@ -1967,6 +2046,9 @@ private:
     /** Log one event of node: inbound and outbound lines come from separate call sites, because
      *  the logger rate-limits per call site. */
     void LogPQOutcome(const CNode& node, const PQLogLine& line) const;
+
+    /** Warn that this node's own ML-KEM code may be at fault. */
+    void LogPQLocalFault() const;
 
     /** The hybrid negotiation mode of new v2 connections. Off until the option sets it (part 6);
      *  set before the connection threads start. */
@@ -1979,6 +2061,15 @@ private:
     std::array<PQFailureRing, 2> m_pq_failures GUARDED_BY(m_pq_mutex);
     const uint256 m_pq_instance_id{GetRandHash()};
     const NodeSeconds m_pq_since{Now<NodeSeconds>()};
+    //! Outbound endpoints with counted failures: streaks, fallback windows and escalation.
+    std::map<PQEndpointKey, PQEndpointHistory> m_pq_history GUARDED_BY(m_pq_mutex);
+    uint64_t m_pq_history_insertions GUARDED_BY(m_pq_mutex){0};
+    //! Outbound endpoints that completed a hybrid handshake since startup. Never evicted; its
+    //! size is bounded by the distinct successful outbound endpoints.
+    std::set<PQEndpointKey> m_pq_successful_endpoints GUARDED_BY(m_pq_mutex);
+    //! Distinct endpoints with counted failures, up to PQ_LOCAL_FAULT_THRESHOLD.
+    std::set<PQEndpointKey> m_pq_failed_endpoints_for_warning GUARDED_BY(m_pq_mutex);
+    bool m_pq_local_fault_warned GUARDED_BY(m_pq_mutex){false};
 
     const CChainParams& m_params;
 
