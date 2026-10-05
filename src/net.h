@@ -468,6 +468,14 @@ public:
     bool ShouldReconnectV1() const noexcept override { return false; }
 };
 
+/** Asked by a negotiating responder, at its key generation point, whether to offer: load
+ *  shedding (#184 part 5). Each call counts one attempted offer. */
+struct PQOfferGate {
+    using Allow = bool (*)(void* context) noexcept;
+    Allow allow{nullptr};
+    void* context{nullptr};
+};
+
 /** The hybrid post-quantum negotiation of one v2 connection (doc/design/pq-transport.md). */
 struct V2PQOptions {
     PQMode mode{PQMode::OFF};
@@ -477,6 +485,8 @@ struct V2PQOptions {
     /** Test only: invert byte 0 of the local ML-KEM shared secret before deriving keys, so the
      *  peer's key confirmation check fails. EK and CT are unchanged. */
     bool corrupt_shared_secret{false};
+    /** Responders only; without one, a negotiating responder always offers. */
+    PQOfferGate offer_gate{};
 };
 
 class V2Transport final : public Transport
@@ -653,6 +663,8 @@ private:
     RecvState m_recv_state GUARDED_BY(m_recv_mutex);
     /** The hybrid negotiation state: KEM secrets and progress. */
     PQHandshake m_pq GUARDED_BY(m_recv_mutex);
+    /** Whether the offer gate declined to offer (load shedding): plain v2, status off. */
+    bool m_pq_shed GUARDED_BY(m_recv_mutex){false};
 
     /** Lock for sending-side fields. If both sending and receiving fields are accessed,
      *  m_recv_mutex must be acquired before m_send_mutex. */
@@ -877,6 +889,20 @@ inline constexpr size_t PQ_MAX_ENDPOINT_HISTORY{1000};
 /** Distinct endpoints with counted failures, and no success since startup, that suggest a local fault. */
 inline constexpr size_t PQ_LOCAL_FAULT_THRESHOLD{8};
 
+/** Inbound offers attempted within one second above which responders stop offering. R3's flood
+ *  measurement (#222) sets the final value; CConnman::Options can override it. */
+inline constexpr uint64_t DEFAULT_PQ_SHED_THRESHOLD_PER_S{1000};
+/** Consecutive seconds with fewer than half the threshold's attempts that end load shedding. */
+inline constexpr std::chrono::seconds PQ_SHED_QUIET_PERIOD{10};
+
+/** Inbound offer load shedding. */
+struct PQLoadSheddingStats {
+    bool active;
+    uint64_t threshold_per_s;
+    //! When the current shedding period started; the epoch (0) when inactive.
+    NodeSeconds since;
+};
+
 /** An endpoint's counted failures and fallback windows. */
 struct PQEndpointHistory {
     //! Consecutive counted failures since the last fallback window ended.
@@ -930,6 +956,7 @@ struct PQTransportStats {
     PQFailureRing outbound_failures;
     std::vector<PQFallbackStats> fallback_set;
     std::vector<PQStreakStats> failure_streaks;
+    PQLoadSheddingStats load_shedding;
 };
 
 struct CNodeOptions
@@ -1382,9 +1409,11 @@ public:
         bool m_i2p_accept_incoming;
         bool whitelist_forcerelay = DEFAULT_WHITELISTFORCERELAY;
         bool whitelist_relay = DEFAULT_WHITELISTRELAY;
+        //! Inbound offer load shedding threshold (unit tests and the flood lab).
+        uint64_t pq_shed_threshold_per_s{DEFAULT_PQ_SHED_THRESHOLD_PER_S};
     };
 
-    void Init(const Options& connOptions) EXCLUSIVE_LOCKS_REQUIRED(!m_added_nodes_mutex, !m_total_bytes_sent_mutex)
+    void Init(const Options& connOptions) EXCLUSIVE_LOCKS_REQUIRED(!m_added_nodes_mutex, !m_total_bytes_sent_mutex, !m_pq_shed_mutex)
     {
         AssertLockNotHeld(m_total_bytes_sent_mutex);
 
@@ -1416,6 +1445,11 @@ public:
         m_onion_binds = connOptions.onion_binds;
         whitelist_forcerelay = connOptions.whitelist_forcerelay;
         whitelist_relay = connOptions.whitelist_relay;
+        {
+            LOCK(m_pq_shed_mutex);
+            // At least 1: a threshold of 0 would shed every offer and never stop.
+            m_pq_shed_threshold = std::max<uint64_t>(connOptions.pq_shed_threshold_per_s, 1);
+        }
     }
 
     CConnman(uint64_t seed0, uint64_t seed1, AddrMan& addrman, const NetGroupManager& netgroupman,
@@ -1423,7 +1457,7 @@ public:
 
     ~CConnman();
 
-    bool Start(CScheduler& scheduler, const Options& options) EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !m_added_nodes_mutex, !m_addr_fetches_mutex, !mutexMsgProc);
+    bool Start(CScheduler& scheduler, const Options& options) EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !m_added_nodes_mutex, !m_addr_fetches_mutex, !mutexMsgProc, !m_pq_shed_mutex);
 
     void StopThreads();
     void StopNodes();
@@ -1583,7 +1617,7 @@ public:
     uint64_t GetTotalBytesSent() const EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex);
 
     /** An owning copy of the hybrid transport counters, failure rings and endpoint history. */
-    PQTransportStats GetPQTransportStats() const EXCLUSIVE_LOCKS_REQUIRED(!m_pq_mutex);
+    PQTransportStats GetPQTransportStats() const EXCLUSIVE_LOCKS_REQUIRED(!m_pq_mutex, !m_pq_shed_mutex);
 
     /** Whether new outbound connections to endpoint run plain v2, because repeated hybrid
      *  failures put it in the fallback set. Ends a window that expired. */
@@ -1674,7 +1708,7 @@ private:
      */
     void SocketHandlerListening(const Sock::EventsPerSock& events_per_sock);
 
-    void ThreadSocketHandler() EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !mutexMsgProc, !m_nodes_mutex, !m_reconnections_mutex, !m_pq_mutex);
+    void ThreadSocketHandler() EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !mutexMsgProc, !m_nodes_mutex, !m_reconnections_mutex, !m_pq_mutex, !m_pq_shed_mutex);
     void ThreadDNSAddressSeed() EXCLUSIVE_LOCKS_REQUIRED(!m_addr_fetches_mutex, !m_nodes_mutex);
 
     uint64_t CalculateKeyedNetGroup(const CNetAddr& ad) const;
@@ -2058,7 +2092,8 @@ private:
     PQMode m_pq_mode{PQMode::OFF};
 
     mutable Mutex m_pq_mutex;
-    //! Event counters, inbound [0] and outbound [1]. Written under m_pq_mutex.
+    //! Event counters, inbound [0] and outbound [1]. Written under m_pq_mutex, except shed,
+    //! which the offer gate counts under m_pq_shed_mutex.
     std::array<PQCounters, 2> m_pq_counters;
     //! Failure rings, inbound [0] and outbound [1]: inbound noise can't evict outbound evidence.
     std::array<PQFailureRing, 2> m_pq_failures GUARDED_BY(m_pq_mutex);
@@ -2073,6 +2108,41 @@ private:
     //! Distinct endpoints with counted failures, up to PQ_LOCAL_FAULT_THRESHOLD.
     std::set<PQEndpointKey> m_pq_failed_endpoints_for_warning GUARDED_BY(m_pq_mutex);
     bool m_pq_local_fault_warned GUARDED_BY(m_pq_mutex){false};
+
+    /**
+     * Inbound offer load shedding, with one-second counters. The seconds come from the steady
+     * clock, so a wall clock step can't merge or stretch them; only the reported start time is
+     * wall-clock time. Its own mutex is taken under the transport's locks (the offer gate runs
+     * inside V2Transport), so nothing holding it calls into a transport, and it never nests with
+     * m_pq_mutex.
+     */
+    using PQShedSeconds = std::chrono::time_point<MockableSteadyClock, std::chrono::seconds>;
+    static PQShedSeconds PQShedNow() noexcept { return std::chrono::time_point_cast<std::chrono::seconds>(MockableSteadyClock::now()); }
+    mutable Mutex m_pq_shed_mutex;
+    uint64_t m_pq_shed_threshold GUARDED_BY(m_pq_shed_mutex){DEFAULT_PQ_SHED_THRESHOLD_PER_S};
+    //! The current second, and the offers attempted in it.
+    PQShedSeconds m_pq_shed_second GUARDED_BY(m_pq_shed_mutex){};
+    uint64_t m_pq_shed_attempts GUARDED_BY(m_pq_shed_mutex){0};
+    //! The first of the run of complete seconds with fewer than half the threshold's attempts.
+    std::optional<PQShedSeconds> m_pq_quiet_since GUARDED_BY(m_pq_shed_mutex);
+    //! When the current shedding period started (wall clock, for the stats); unset when offering.
+    std::optional<NodeSeconds> m_pq_shedding_since GUARDED_BY(m_pq_shed_mutex);
+
+    /** The offer gate of inbound transports: count one attempted offer, and decline it while
+     *  shedding, counting it as shed. */
+    bool AllowPQOffer() noexcept EXCLUSIVE_LOCKS_REQUIRED(!m_pq_shed_mutex);
+    //! The PQOfferGate function; the transport calls it under its own locks, never under m_pq_shed_mutex.
+    static bool AllowPQOffer(void* connman) noexcept NO_THREAD_SAFETY_ANALYSIS;
+
+    /** Close the seconds before now, and stop shedding after PQ_SHED_QUIET_PERIOD quiet ones.
+     *  Returns whether shedding stopped. */
+    bool AdvancePQShedding(PQShedSeconds now) EXCLUSIVE_LOCKS_REQUIRED(m_pq_shed_mutex);
+
+    /** Stop shedding when the flood is over, even if no new offer is attempted. */
+    void UpdatePQShedding(PQShedSeconds now) EXCLUSIVE_LOCKS_REQUIRED(!m_pq_shed_mutex);
+
+    /** Log a load shedding transition: started (with the threshold) or stopped. */
+    static void LogPQShedding(std::optional<uint64_t> started_threshold);
 
     const CChainParams& m_params;
 

@@ -216,19 +216,44 @@ struct PQNetSetup : public RegTestingSetup {
     PQNetSetup()
     {
         static_assert(PQ_FAILURE_THRESHOLD == 3);
-        CConnman::Options options;
-        options.m_max_automatic_connections = DEFAULT_MAX_PEER_CONNECTIONS;
-        m_connman.Init(options);
-        m_connman.SetMsgProc(&m_events);
+        InitConnman();
         m_connman.SetPeerConnectTimeout(60s);
         m_connman.SetPQMode(PQMode::NEGOTIATE);
         SetMockTime(GetTime<std::chrono::seconds>());
+        MockableSteadyClock::SetMockTime(STEADY_START);
     }
 
     ~PQNetSetup()
     {
         m_connman.Stop();
         SetMockTime(0s);
+        MockableSteadyClock::ClearMockTime();
+    }
+
+    //! Where the mocked steady clock, which drives load shedding, starts.
+    static constexpr std::chrono::seconds STEADY_START{3600};
+
+    /** Init() with room for inbound peers, v2 accepted, and the given load shedding threshold. */
+    void InitConnman(uint64_t shed_threshold = DEFAULT_PQ_SHED_THRESHOLD_PER_S)
+    {
+        CConnman::Options options;
+        options.m_max_automatic_connections = DEFAULT_MAX_PEER_CONNECTIONS;
+        options.m_local_services = NODE_P2P_V2;
+        options.pq_shed_threshold_per_s = shed_threshold;
+        m_connman.Init(options);
+        m_connman.SetMsgProc(&m_events);
+    }
+
+    /** An inbound connection through the accept path, with the transport options it gives. */
+    Link Accept(const CService& addr = LookupNumeric("10.9.0.1", 50000))
+    {
+        auto pipes{std::make_shared<DynSock::Pipes>()};
+        m_connman.CreateNodeFromAcceptedSocketPublic(std::make_unique<FailingSock>(pipes, std::make_shared<DynSock::Queue>()),
+                                                     LookupNumeric("127.0.0.1", 18444), addr);
+        CNode* node{m_connman.TestNodes().back()};
+        auto sock{std::static_pointer_cast<FailingSock>(WITH_LOCK(node->m_sock_mutex, return node->m_sock))};
+        BOOST_REQUIRE(node->IsInboundConn());
+        return {pipes, sock, node};
     }
 
     /** A connection the connection manager holds, as ConnectNode() or the accept path would add it. */
@@ -1404,6 +1429,184 @@ BOOST_AUTO_TEST_CASE(pq_fallback_connection)
     const PQTransportStats stats{Stats()};
     BOOST_CHECK_EQUAL(stats.outbound.switched + stats.outbound.legacy_peer + stats.outbound.malformed_record, 0U);
     BOOST_CHECK(stats.outbound_failures.entries.empty());
+}
+
+BOOST_AUTO_TEST_CASE(pq_load_shedding)
+{
+    BOOST_CHECK_EQUAL(Stats().load_shedding.threshold_per_s, DEFAULT_PQ_SHED_THRESHOLD_PER_S);
+    // A low threshold, as unit tests and the flood lab set it.
+    InitConnman(/*shed_threshold=*/10);
+    BOOST_CHECK_EQUAL(Stats().load_shedding.threshold_per_s, 10U);
+    LogLineCounter started{"v2 pq: load_shedding started"};
+    LogLineCounter stopped{"v2 pq: load_shedding stopped"};
+
+    // One attempted offer: an inbound connection whose 64-byte key arrived.
+    const auto attempt{[&] {
+        Link link{Accept()};
+        Receive(link, InitiatorKey());
+        Pass(link);
+        return link.node->m_transport->GetPQSnapshot().offer == PQOfferState::SENT;
+    }};
+    // The steady clock drives the seconds; the wall clock only dates the start.
+    const NodeSeconds start{Now<NodeSeconds>()};
+    const auto at{[&](std::chrono::seconds offset) {
+        SetMockTime(TicksSinceEpoch<std::chrono::seconds>(start + offset));
+        MockableSteadyClock::SetMockTime(STEADY_START + offset);
+    }};
+
+    // Up to the threshold in one second, responders offer.
+    for (int i{0}; i < 10; ++i) BOOST_CHECK(attempt());
+    BOOST_CHECK(!Stats().load_shedding.active);
+    BOOST_CHECK_EQUAL(started.m_count, 0);
+
+    // More than the threshold within the second starts shedding, with one line.
+    {
+        const std::string text{"v2 pq: load_shedding started threshold_per_s=10"};
+        DebugLogHelper expect{text, AtLevel({text}, LineLevel::INFO)};
+        BOOST_CHECK(!attempt());
+    }
+    // A shed responder sends empty contents, which is exactly plain v2: the peer sees a legacy
+    // responder, and the connection's status is off.
+    Link shed{Accept()};
+    V2Transport peer{Initiator()};
+    Exchange(shed, peer);
+    BOOST_CHECK(!shed.node->fDisconnect);
+    BOOST_CHECK(shed.node->m_transport->GetInfo().transport_type == TransportProtocolType::V2);
+    BOOST_CHECK(shed.node->m_transport->GetInfo().transport_pq_status == PQStatus::OFF);
+    BOOST_CHECK(peer.GetInfo().transport_pq_status == PQStatus::LEGACY_PEER);
+    BOOST_CHECK(shed.node->m_transport->GetPQSnapshot().legacy == PQLegacyReason::NONE);
+    PQTransportStats stats{Stats()};
+    BOOST_CHECK(stats.load_shedding.active);
+    BOOST_CHECK(stats.load_shedding.since == start);
+    BOOST_CHECK_EQUAL(stats.inbound.shed, 2U);
+    BOOST_CHECK_EQUAL(started.m_count, 1);
+
+    // Outbound connections are never affected.
+    Link outbound{Add(ConnectionType::OUTBOUND_FULL_RELAY)};
+    V2Transport responder{Responder()};
+    Exchange(outbound, responder);
+    BOOST_CHECK(outbound.node->m_transport->GetInfo().transport_pq_status == PQStatus::HYBRID);
+
+    // Nine quiet seconds (fewer than half the threshold), then a second at half: not quiet, so
+    // shedding goes on and the run starts over.
+    for (int second{1}; second <= 10; ++second) {
+        at(std::chrono::seconds{second});
+        for (int i{0}; i < (second == 10 ? 5 : 4); ++i) BOOST_CHECK(!attempt());
+    }
+    // Ten quiet seconds: offers resume in the eleventh, with one line.
+    for (int second{11}; second <= 20; ++second) {
+        at(std::chrono::seconds{second});
+        for (int i{0}; i < 4; ++i) BOOST_CHECK(!attempt());
+    }
+    BOOST_CHECK(Stats().load_shedding.active);
+    at(21s);
+    {
+        const std::string text{"v2 pq: load_shedding stopped"};
+        DebugLogHelper expect{text, AtLevel({text}, LineLevel::INFO)};
+        BOOST_CHECK(attempt());
+    }
+    stats = Stats();
+    BOOST_CHECK(!stats.load_shedding.active);
+    BOOST_CHECK(stats.load_shedding.since == NodeSeconds{});
+    BOOST_CHECK_EQUAL(stats.inbound.shed, 2U + 9 * 4 + 5 + 10 * 4);
+    // Shed offers add no ring entries: a flood can't wash out the evidence.
+    BOOST_CHECK(stats.inbound_failures.entries.empty());
+
+    // A second flood, which then stops entirely: the socket handler ends shedding on time even
+    // though no offer is attempted.
+    for (int i{0}; i < 11; ++i) attempt();
+    BOOST_CHECK(Stats().load_shedding.active);
+    BOOST_CHECK(Stats().load_shedding.since == start + 21s);
+    at(31s);
+    m_connman.UpdatePQSheddingPublic();
+    BOOST_CHECK(Stats().load_shedding.active);
+    at(32s);
+    m_connman.UpdatePQSheddingPublic();
+    m_connman.UpdatePQSheddingPublic();
+    BOOST_CHECK(!Stats().load_shedding.active);
+    BOOST_CHECK_EQUAL(started.m_count, 2);
+    BOOST_CHECK_EQUAL(stopped.m_count, 2);
+}
+
+BOOST_AUTO_TEST_CASE(pq_load_shedding_off)
+{
+    // With the switch off, inbound transports never ask the gate: nothing is counted or shed.
+    InitConnman(/*shed_threshold=*/1);
+    m_connman.SetPQMode(PQMode::OFF);
+    for (int i{0}; i < 5; ++i) {
+        Link link{Accept()};
+        Receive(link, InitiatorKey());
+        Pass(link);
+        BOOST_CHECK(link.node->m_transport->GetInfo().transport_pq_status == PQStatus::OFF);
+    }
+    BOOST_CHECK(!Stats().load_shedding.active);
+    BOOST_CHECK_EQUAL(Stats().inbound.shed, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(pq_load_shedding_wall_clock_step)
+{
+    // Offers trickle in, one per second, far below the threshold, while the wall clock steps back
+    // an hour (an NTP correction or a VM restore). The steady clock still tells the seconds apart,
+    // so nothing is shed.
+    InitConnman(/*shed_threshold=*/5);
+    const auto attempt{[&] {
+        Link link{Accept()};
+        Receive(link, InitiatorKey());
+        Pass(link);
+        const bool offered{link.node->m_transport->GetPQSnapshot().offer == PQOfferState::SENT};
+        link.node->RequestDisconnect();
+        Disconnect();
+        return offered;
+    }};
+    const NodeSeconds wall{Now<NodeSeconds>()};
+    BOOST_CHECK(attempt());
+    for (int i{1}; i <= 120; ++i) {
+        SetMockTime(TicksSinceEpoch<std::chrono::seconds>(wall - 3600s + std::chrono::seconds{i}));
+        MockableSteadyClock::SetMockTime(STEADY_START + std::chrono::seconds{i});
+        m_connman.UpdatePQSheddingPublic();
+        BOOST_CHECK(attempt());
+    }
+    BOOST_CHECK(!Stats().load_shedding.active);
+    BOOST_CHECK_EQUAL(Stats().inbound.shed, 0U);
+
+    // A flood within one steady second starts shedding, and a wall clock step forward doesn't
+    // end it early: only ten quiet steady seconds do.
+    MockableSteadyClock::SetMockTime(STEADY_START + 200s);
+    for (int i{0}; i < 6; ++i) attempt();
+    BOOST_CHECK(Stats().load_shedding.active);
+    SetMockTime(TicksSinceEpoch<std::chrono::seconds>(wall + 3600s));
+    m_connman.UpdatePQSheddingPublic();
+    BOOST_CHECK(!attempt());
+    BOOST_CHECK(Stats().load_shedding.active);
+    MockableSteadyClock::SetMockTime(STEADY_START + 211s);
+    m_connman.UpdatePQSheddingPublic();
+    BOOST_CHECK(!Stats().load_shedding.active);
+    BOOST_CHECK(attempt());
+}
+
+BOOST_AUTO_TEST_CASE(pq_load_shedding_socket_thread)
+{
+    // The socket handler thread ends shedding on time when the flood stops entirely, without a
+    // further offer: the real thread function runs, as Start() runs it.
+    InitConnman(/*shed_threshold=*/2);
+    LogLineCounter stopped{"v2 pq: load_shedding stopped"};
+    for (int i{0}; i < 3; ++i) {
+        Link link{Accept()};
+        Receive(link, InitiatorKey());
+        Pass(link);
+        link.node->RequestDisconnect();
+    }
+    Disconnect(); // so the thread has no sockets to serve
+    BOOST_REQUIRE(Stats().load_shedding.active);
+    MockableSteadyClock::SetMockTime(STEADY_START + PQ_SHED_QUIET_PERIOD + 1s);
+    m_connman.StartSocketHandlerThread();
+    const auto deadline{SteadyClock::now() + 10s};
+    while (Stats().load_shedding.active && SteadyClock::now() < deadline) {
+        std::this_thread::sleep_for(10ms);
+    }
+    m_connman.StopSocketHandlerThread();
+    BOOST_CHECK(!Stats().load_shedding.active);
+    BOOST_CHECK_EQUAL(stopped.m_count, 1);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
