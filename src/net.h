@@ -749,6 +749,27 @@ public:
     void DiscardHybridSecretForTesting() noexcept EXCLUSIVE_LOCKS_REQUIRED(!m_recv_mutex, !m_send_mutex);
 };
 
+/**
+ * Why a connection closed. The first recorded cause wins (see
+ * CNode::RequestDisconnect()), so cleanup that runs after a peer closed the
+ * connection never relabels it.
+ */
+enum class NodeCloseCause : uint8_t {
+    //! No cause recorded. A node that reaches DisconnectNodes() without one
+    //! (fDisconnect set directly) is finalized there as LOCAL.
+    NONE = 0,
+    //! Our own decision: operator, eviction, feeler, protocol policy, network off or shutdown.
+    LOCAL = 1,
+    //! recv() returned 0: the peer closed the connection.
+    PEER_EOF = 2,
+    //! recv() failed with a non-transient error, such as a connection reset.
+    PEER_RESET = 3,
+    //! send() failed with a non-transient error.
+    SEND_ERROR = 4,
+    //! The peer stopped responding: InactivityCheck() or the ping timeout.
+    TIMEOUT = 5,
+};
+
 struct CNodeOptions
 {
     NetPermissionFlags permission_flags = NetPermissionFlags::None;
@@ -818,7 +839,7 @@ public:
     /** fSuccessfullyConnected is set to true on receiving VERACK from the peer. */
     std::atomic_bool fSuccessfullyConnected{false};
     // Setting fDisconnect to true will cause the node to be disconnected the
-    // next time DisconnectNodes() runs
+    // next time DisconnectNodes() runs. Set it with RequestDisconnect().
     std::atomic_bool fDisconnect{false};
     CountingSemaphoreGrant<> grantOutbound;
     std::atomic<int> nRefCount{0};
@@ -1033,7 +1054,19 @@ public:
         nRefCount--;
     }
 
-    void CloseSocketDisconnect() EXCLUSIVE_LOCKS_REQUIRED(!m_sock_mutex);
+    /**
+     * Mark the node for disconnection and record why. Only the first cause is
+     * kept: later or concurrent calls, including cleanup, leave it unchanged.
+     * The cause is recorded before fDisconnect is set, so a thread that sees
+     * fDisconnect also sees the cause.
+     */
+    void RequestDisconnect(NodeCloseCause cause = NodeCloseCause::LOCAL) noexcept;
+
+    /** RequestDisconnect(cause), then close the socket. */
+    void CloseSocketDisconnect(NodeCloseCause cause = NodeCloseCause::LOCAL) EXCLUSIVE_LOCKS_REQUIRED(!m_sock_mutex);
+
+    /** The first recorded close cause, or NONE if none has been recorded. */
+    NodeCloseCause GetCloseCause() const noexcept { return m_close_cause.load(); }
 
     void CopyStats(CNodeStats& stats) EXCLUSIVE_LOCKS_REQUIRED(!m_subver_mutex, !m_addr_local_mutex, !cs_vSend, !cs_vRecv);
 
@@ -1065,6 +1098,9 @@ private:
     const NodeId id;
     const uint64_t nLocalHostNonce;
     std::atomic<int> m_greatest_common_version{INIT_PROTO_VERSION};
+
+    /** Written only by RequestDisconnect(), which keeps the first cause. */
+    std::atomic<NodeCloseCause> m_close_cause{NodeCloseCause::NONE};
 
     const size_t m_recv_flood_size;
     std::list<CNetMessage> vRecvMsg; // Used only by SocketHandler thread

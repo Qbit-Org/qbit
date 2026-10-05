@@ -93,6 +93,19 @@ struct ConnmanTestMsg : public CConnman {
 
     CNode* ConnectNodePublic(PeerManager& peerman, const char* pszDest, ConnectionType conn_type)
         EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex);
+
+    void SocketHandlerConnectedPublic(const std::vector<CNode*>& nodes, const Sock::EventsPerSock& events_per_sock)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !mutexMsgProc)
+    {
+        SocketHandlerConnected(nodes, events_per_sock);
+    }
+
+    void DisconnectNodesPublic() EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex, !m_reconnections_mutex)
+    {
+        DisconnectNodes();
+    }
+
+    bool AttemptToEvictConnectionPublic() { return AttemptToEvictConnection(); }
 };
 
 constexpr ServiceFlags ALL_SERVICE_FLAGS[]{
