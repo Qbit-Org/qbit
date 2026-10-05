@@ -712,6 +712,113 @@ def pq_records_cases() -> list[dict]:
     ]
 
 
+# --- p2p_transport_bidirectional_v2, p2p_transport_bidirectional_v1v2 ---------
+
+SECP256K1_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+V2_MAX_GARBAGE_LEN = 4095
+PQ_MODES = {"off": 0, "negotiate": 1, "fallback": 2}
+# A responder never falls back, so the harness picks its mode from the first two only.
+PQ_RESPONDER_MODES = 2
+SIMULATION_MAX_MESSAGE = 75000
+SIMULATION_ACTIONS = 6
+
+
+def transport_key(label: str) -> bytes:
+    key = hashlib.sha256(f"qbit fuzz seed key/{label}".encode()).digest()
+    assert 0 < int.from_bytes(key, "big") < SECP256K1_ORDER
+    return key
+
+
+def v2_transport_side(enc: FdpEncoder, label: str, garbage_len: int, mode: str, initiator: bool) -> None:
+    """MakeV2Transport: key, compression flag, garbage, ellswift entropy, PQ mode and ML-KEM seed."""
+    enc.raw(transport_key(label))
+    enc.boolean(True)
+    enc.integral(garbage_len, SIZE_T, 0, V2_MAX_GARBAGE_LEN)
+    if garbage_len <= 64:
+        enc.raw(pattern(garbage_len, 0x31))
+    enc.raw(hashlib.sha256(f"qbit fuzz seed ent/{label}".encode()).digest())
+    if not initiator and PQ_MODES[mode] >= PQ_RESPONDER_MODES:
+        raise ValueError(f"{label}: a responder cannot be in {mode} mode")
+    enc.pick(PQ_MODES[mode], len(PQ_MODES) if initiator else PQ_RESPONDER_MODES)
+    enc.raw(hashlib.sha256(f"qbit fuzz seed mlkem/{label}".encode()).digest())
+
+
+def transport_v2_input(name: str, initiator: tuple[int, str], responder: tuple[int, str], tail: int) -> bytes:
+    enc = FdpEncoder()
+    enc.integral(int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "big"), UINT64)
+    v2_transport_side(enc, f"{name}/initiator", *initiator, initiator=True)
+    v2_transport_side(enc, f"{name}/responder", *responder, initiator=False)
+    # Both sides' first message ("version") sizes.
+    enc.integral(1000, UINT32, 0, SIMULATION_MAX_MESSAGE)
+    enc.integral(200, UINT32, 0, SIMULATION_MAX_MESSAGE)
+    # Further bytes drive the interleaving loop from the back; the final flush completes the rest.
+    enc.raw(pattern(tail, 0x47))
+    return enc.build()
+
+
+def transport_v2_cases() -> list[dict]:
+    flush = "the final flush completes the handshake"
+    loop = "a fixed 48-byte pattern drives the interleaving loop, then the final flush completes the handshake"
+    cases = [
+        ("negotiate-both", (0, "negotiate"), (0, "negotiate"), 0,
+         f"Both sides negotiate, no garbage; {flush}: hybrid keys, confirmed both ways."),
+        ("negotiate-both-max-garbage", (V2_MAX_GARBAGE_LEN, "negotiate"), (V2_MAX_GARBAGE_LEN, "negotiate"), 0,
+         f"Both sides negotiate with 4,095 bytes of garbage each, so the held version packet's AAD is the longest; {flush}."),
+        ("negotiate-both-interleaved", (64, "negotiate"), (17, "negotiate"), 48,
+         f"Both sides negotiate, 64 and 17 bytes of garbage; {loop}: hybrid."),
+        ("negotiate-both-interleaved-long-garbage", (1000, "negotiate"), (64, "negotiate"), 48,
+         f"Both sides negotiate, 1,000 and 64 bytes of garbage; {loop}: hybrid."),
+        ("initiator-negotiates-responder-off", (0, "negotiate"), (0, "off"), 0,
+         f"The initiator holds its version packet for an empty one; {flush}: legacy_peer, ECDH keys."),
+        ("initiator-negotiates-responder-off-interleaved", (64, "negotiate"), (5, "off"), 48,
+         f"The initiator negotiates, the responder is off; {loop}: ECDH keys."),
+        ("initiator-off-responder-offers", (0, "off"), (0, "negotiate"), 0,
+         f"The responder offers to an initiator that is off and ignores it; {flush}: ECDH keys."),
+        ("initiator-off-responder-offers-interleaved", (33, "off"), (64, "negotiate"), 48,
+         f"The responder offers to an initiator that is off; {loop}: ECDH keys."),
+        ("initiator-fallback-responder-offers", (0, "fallback"), (0, "negotiate"), 0,
+         f"An initiator in fallback sends plain v2 and never parses the offer; {flush}: ECDH keys."),
+        ("both-off", (0, "off"), (0, "off"), 0, f"Today's v2 on both sides; {flush}."),
+        ("both-off-interleaved", (64, "off"), (64, "off"), 48, f"Today's v2 on both sides; {loop}."),
+        ("initiator-fallback-responder-off", (2, "fallback"), (3, "off"), 0, f"Plain v2 on both sides; {flush}."),
+        ("initiator-fallback-responder-offers-interleaved", (64, "fallback"), (17, "negotiate"), 48,
+         f"An initiator in fallback never parses the offer; {loop}: ECDH keys."),
+    ]
+    return [case(name, "fdp", transport_v2_input(name, initiator, responder, tail), semantics)
+            for name, initiator, responder, tail, semantics in cases]
+
+
+def transport_v1v2_input(name: str, responder: tuple[int, str], v1_message: bool) -> bytes:
+    enc = FdpEncoder()
+    enc.integral(int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "big"), UINT64)
+    v2_transport_side(enc, f"{name}/responder", *responder, initiator=False)
+    enc.integral(500, UINT32, 0, SIMULATION_MAX_MESSAGE)
+    enc.integral(300, UINT32, 0, SIMULATION_MAX_MESSAGE)
+    if v1_message:
+        # One loop step: the v1 initiator takes its version message (the next message's type index
+        # and size are drawn when it is queued); the final flush delivers it.
+        enc.pick(0, SIMULATION_ACTIONS)
+        enc.integral(0, UINT8)
+        enc.integral(100, UINT32, 0, SIMULATION_MAX_MESSAGE)
+    return enc.build()
+
+
+def transport_v1v2_cases() -> list[dict]:
+    return [
+        case("v1-version-to-negotiating-responder", "fdp", transport_v1v2_input("v1-negotiate", (0, "negotiate"), True),
+             "A v1 initiator's version message reaches a responder with the negotiation on: v1 detected, no key "
+             "generated."),
+        case("v1-version-to-off-responder", "fdp", transport_v1v2_input("v1-off", (64, "off"), True),
+             "A v1 initiator's version message reaches a responder with the negotiation off: v1 detected."),
+        case("v1-version-to-negotiating-responder-max-garbage", "fdp",
+             transport_v1v2_input("v1-negotiate-max-garbage", (V2_MAX_GARBAGE_LEN, "negotiate"), True),
+             "A v1 initiator's version message reaches a negotiating responder configured with 4,095 bytes of garbage, "
+             "which it never sends: v1 detected."),
+        case("v1-silent-negotiating-responder", "fdp", transport_v1v2_input("v1-silent", (0, "negotiate"), False),
+             "A v1 initiator that sends nothing: the negotiating responder stays undecided and sends nothing."),
+    ]
+
+
 def case(name: str, fmt: str, data: bytes, semantics: str) -> dict:
     return {"name": name, "format": fmt, "data": data, "semantics": semantics}
 
@@ -724,6 +831,8 @@ CASE_BUILDERS = {
     "mlkem": mlkem_cases,
     "mlkem_backend_diff": mlkem_cases,
     "p2mr_script": p2mr_cases,
+    "p2p_transport_bidirectional_v1v2": transport_v1v2_cases,
+    "p2p_transport_bidirectional_v2": transport_v2_cases,
     "pq_records": pq_records_cases,
     "pqc": pqc_cases,
 }
