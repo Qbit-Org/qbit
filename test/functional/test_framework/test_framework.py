@@ -14,7 +14,6 @@ import os
 import platform
 import pdb
 import random
-import re
 import shlex
 import shutil
 import subprocess
@@ -28,7 +27,7 @@ from .authproxy import JSONRPCException
 from .blocktools import COINBASE_MATURITY
 from . import coverage
 from .p2p import NetworkThread
-from .test_node import TestNode
+from .test_node import TestNode, release_info
 from .util import (
     MAX_NODES,
     PortSeed,
@@ -74,10 +73,13 @@ class Binaries:
         bin_dir: An optional string containing a directory path to look for
             binaries, which takes precedence over the paths above, if specified.
             This is used by tests calling binaries from previous releases.
+        binary_prefix: The binary names used in bin_dir: "bitcoin" for
+            bitcoind, bitcoin-cli, ... or "qbit" for qbitd, qbit-cli, ...
     """
-    def __init__(self, paths, bin_dir):
+    def __init__(self, paths, bin_dir, binary_prefix="bitcoin"):
         self.paths = paths
         self.bin_dir = bin_dir
+        self.binary_prefix = binary_prefix
 
     def node_argv(self, **kwargs):
         "Return argv array that should be used to invoke bitcoind"
@@ -111,13 +113,14 @@ class Binaries:
         bin_dir is set (by tests calling binaries from previous releases) it
         always uses the direct path."""
         if self.bin_dir is not None:
+            prefix = self.binary_prefix
             prev_release_binary = {
-                "node": "bitcoind",
-                "rpc": "bitcoin-cli",
-                "tx": "bitcoin-tx",
-                "util": "bitcoin-util",
-                "wallet": "bitcoin-wallet",
-                "chainstate": "bitcoin-chainstate",
+                "node": f"{prefix}d",
+                "rpc": f"{prefix}-cli",
+                "tx": f"{prefix}-tx",
+                "util": f"{prefix}-util",
+                "wallet": f"{prefix}-wallet",
+                "chainstate": f"{prefix}-chainstate",
             }.get(command, os.path.basename(bin_path))
             if "." in os.path.basename(bin_path) and "." not in prev_release_binary:
                 prev_release_binary = prev_release_binary + os.path.splitext(bin_path)[1]
@@ -338,8 +341,8 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
         paths.bitcoin_cmd = shlex.split(os.getenv("BITCOIN_CMD", "")) or None
         return paths
 
-    def get_binaries(self, bin_dir=None):
-        return Binaries(self.binary_paths, bin_dir)
+    def get_binaries(self, bin_dir=None, binary_prefix="bitcoin"):
+        return Binaries(self.binary_paths, bin_dir, binary_prefix)
 
     def setup(self):
         """Call this method to start up the test framework object with options set."""
@@ -540,27 +543,12 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
 
         Should only be called once after the nodes have been specified in
         set_test_params()."""
-        def bin_dir_from_version(version):
+        def binaries_from_version(version):
             if not version:
-                return None
-            if version > 219999:
-                # Starting at client version 220000 the first two digits represent
-                # the major version, e.g. v22.0 instead of v0.22.0.
-                version *= 100
-            return os.path.join(
-                self.options.previous_releases_path,
-                re.sub(
-                    r'\.0$' if version <= 219999 else r'(\.0){1,2}$',
-                    '', # Remove trailing dot for point releases, after 22.0 also remove double trailing dot.
-                    'v{}.{}.{}.{}'.format(
-                        (version % 100000000) // 1000000,
-                        (version % 1000000) // 10000,
-                        (version % 10000) // 100,
-                        (version % 100) // 1,
-                    ),
-                ),
-                'bin',
-            )
+                return self.get_binaries()
+            release = release_info(version)
+            bin_dir = os.path.join(self.options.previous_releases_path, release.tag, 'bin')
+            return self.get_binaries(bin_dir, release.binary_prefix)
 
         if self.bind_to_localhost_only:
             extra_confs = [["bind=127.0.0.1"]] * num_nodes
@@ -574,13 +562,12 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
                 extra_args[i] = extra_args[i] + ["-whitelist=noban,in,out@127.0.0.1"]
         if versions is None:
             versions = [None] * num_nodes
-        bin_dirs = []
+        node_binaries = []
         for v in versions:
-            bin_dir = bin_dir_from_version(v)
+            binaries = binaries_from_version(v)
 
             # Fail test if any of the needed release binaries is missing
-            for bin_path in (argv[0] for binaries in (self.get_binaries(bin_dir),)
-                                     for argv in (binaries.node_argv(), binaries.rpc_argv())):
+            for bin_path in (argv[0] for argv in (binaries.node_argv(), binaries.rpc_argv())):
 
                 if shutil.which(bin_path) is None:
                     self.log.error(f"Binary not found: {bin_path}")
@@ -589,14 +576,14 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
                     raise AssertionError("At least one release binary is missing. "
                                          "Previous releases binaries can be downloaded via `test/get_previous_releases.py`.")
 
-            bin_dirs.append(bin_dir)
+            node_binaries.append(binaries)
 
         extra_init = [{}] * num_nodes if self.extra_init is None else self.extra_init # type: ignore[var-annotated]
         assert_equal(len(extra_init), num_nodes)
         assert_equal(len(extra_confs), num_nodes)
         assert_equal(len(extra_args), num_nodes)
         assert_equal(len(versions), num_nodes)
-        assert_equal(len(bin_dirs), num_nodes)
+        assert_equal(len(node_binaries), num_nodes)
         for i in range(num_nodes):
             args = list(extra_args[i])
             init = dict(
@@ -604,7 +591,7 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
                 rpchost=rpchost,
                 timewait=self.rpc_timeout,
                 timeout_factor=self.options.timeout_factor,
-                binaries=self.get_binaries(bin_dirs[i]),
+                binaries=node_binaries[i],
                 version=versions[i],
                 coverage_dir=self.options.coveragedir,
                 cwd=self.options.tmpdir,
