@@ -350,6 +350,16 @@ if [ "$RUN_FUZZ_TESTS" = "true" ]; then
     "${DIR_FUZZ_IN}" \
     --empty_min_time=60 \
     --require_qbit_corpus
+  # Replay the ML-KEM targets again on portable C, which they select at start-up.
+  # shellcheck disable=SC2086
+  MLKEM_FORCE_PORTABLE=1 \
+  LD_LIBRARY_PATH="${DEPENDS_DIR}/${HOST}/lib" \
+  "${BASE_BUILD_DIR}/test/fuzz/test_runner.py" \
+    ${FUZZ_TESTS_CONFIG} \
+    "${MAKEJOBS}" \
+    -l DEBUG \
+    "${DIR_FUZZ_IN}" \
+    mlkem mlkem_backend_diff
   if [ -n "${QBIT_FUZZ_MUTATE_MIN_TIME}" ]; then
     # Seeded mutation phase over the qbit seed corpora, after the replay above.
     # shellcheck disable=SC2086
@@ -361,6 +371,6 @@ if [ "$RUN_FUZZ_TESTS" = "true" ]; then
       --require_qbit_corpus \
       --mutate_min_time="${QBIT_FUZZ_MUTATE_MIN_TIME}" \
       "${DIR_FUZZ_IN}" \
-      asert_chain_transition asert_edge_cases asert_math auxpow p2mr_script pqc
+      asert_chain_transition asert_edge_cases asert_math auxpow mlkem mlkem_backend_diff p2mr_script pqc
   fi
 fi
