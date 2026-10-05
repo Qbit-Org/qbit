@@ -396,6 +396,7 @@ BASE_SCRIPTS = [
     'rpc_help.py',
     'tool_rpcauth.py',
     'tool_qbit_release_resolution.py',
+    'tool_pq_canary.py',
     'p2p_handshake.py',
     'p2p_handshake.py --v2transport',
     'feature_dirsymlinks.py',
