@@ -16,10 +16,12 @@
 #include <util/string.h>
 #include <util/time.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <memory>
 
@@ -733,6 +735,20 @@ bool GetNameProxy(Proxy &nameProxyOut) {
         return false;
     nameProxyOut = nameProxy;
     return true;
+}
+
+ProxySettingsRestorerForTesting::ProxySettingsRestorerForTesting()
+{
+    LOCK(g_proxyinfo_mutex);
+    std::copy(std::begin(proxyInfo), std::end(proxyInfo), m_proxies.begin());
+    m_name_proxy = nameProxy;
+}
+
+ProxySettingsRestorerForTesting::~ProxySettingsRestorerForTesting()
+{
+    LOCK(g_proxyinfo_mutex);
+    std::copy(m_proxies.begin(), m_proxies.end(), std::begin(proxyInfo));
+    nameProxy = m_name_proxy;
 }
 
 bool HaveNameProxy() {
