@@ -29,6 +29,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <functional>
+#include <list>
 #include <map>
 #include <memory>
 #include <optional>
@@ -181,6 +182,32 @@ std::string Backends()
     return strprintf(" arith=%s keccak=%s", backends.arith, backends.keccak);
 }
 
+/** Counts the log lines that contain text while alive. */
+class LogLineCounter
+{
+    const std::string m_text;
+    std::list<std::function<void(const std::string&)>>::iterator m_callback;
+
+public:
+    std::atomic<int> m_count{0};
+
+    explicit LogLineCounter(std::string text) : m_text{std::move(text)}
+    {
+        m_callback = LogInstance().PushBackCallback([this](const std::string& line) {
+            if (line.find(m_text) != std::string::npos) ++m_count;
+        });
+    }
+    ~LogLineCounter() { LogInstance().DeleteCallback(m_callback); }
+};
+
+/** Our outbound node's peer: a responder. */
+V2Transport Responder(V2PQOptions pq = {.mode = PQMode::NEGOTIATE}) { return {/*nodeid=*/1000, /*initiating=*/false, pq}; }
+/** Our inbound node's peer: an initiator. */
+V2Transport Initiator(V2PQOptions pq = {.mode = PQMode::NEGOTIATE}) { return {/*nodeid=*/1000, /*initiating=*/true, pq}; }
+
+/** 64 bytes an initiator could send as its key: any 64 bytes are a valid ElligatorSwift key. */
+std::vector<uint8_t> InitiatorKey() { return FastRandomContext{}.randbytes<uint8_t>(EllSwiftPubKey::size()); }
+
 struct PQNetSetup : public RegTestingSetup {
     NoMessages m_events;
     ConnmanTestMsg m_connman{0x1337, 0x1337, *m_node.addrman, *m_node.netgroupman, Params()};
@@ -188,6 +215,7 @@ struct PQNetSetup : public RegTestingSetup {
 
     PQNetSetup()
     {
+        static_assert(PQ_FAILURE_THRESHOLD == 3);
         CConnman::Options options;
         options.m_max_automatic_connections = DEFAULT_MAX_PEER_CONNECTIONS;
         m_connman.Init(options);
@@ -303,15 +331,83 @@ struct PQNetSetup : public RegTestingSetup {
     void Disconnect() { m_connman.DisconnectNodesPublic(); }
 
     PQTransportStats Stats() const { return m_connman.GetPQTransportStats(); }
+
+    /** How a test connection ends. */
+    enum class End { MALFORMED, CONFIRMATION, PEER_EOF, PEER_RESET, TIMEOUT, LOCAL, SEND_ERROR, LEGACY, SUCCESS };
+
+    /** One outbound connection to endpoint that ends as end; the connection manager finalizes it. */
+    void Connect(const PQEndpointKey& endpoint, End end)
+    {
+        Link link{Add(ConnectionType::OUTBOUND_FULL_RELAY, PQMode::NEGOTIATE, endpoint)};
+        switch (end) {
+        case End::MALFORMED: { // an offer of the wrong length
+            Pass(link);
+            RawPeer peer{/*initiator=*/false};
+            peer.Initialize(NodeKey(link));
+            Receive(link, peer.Key());
+            Receive(link, peer.TerminatorAndVersion(MakeRecord(PQ_MLKEM1024, 100)));
+            Pass(link);
+            break;
+        }
+        case End::CONFIRMATION: {
+            V2Transport peer{Responder({.mode = PQMode::NEGOTIATE, .corrupt_shared_secret = true})};
+            Exchange(link, peer);
+            break;
+        }
+        case End::LEGACY:
+        case End::SUCCESS: {
+            V2Transport peer{end == End::LEGACY ? Responder({}) : Responder()};
+            Exchange(link, peer);
+            BOOST_REQUIRE(link.node->m_transport->GetPQSnapshot().confirmed == (end == End::SUCCESS));
+            link.node->RequestDisconnect();
+            break;
+        }
+        case End::PEER_EOF:
+        case End::PEER_RESET:
+        case End::TIMEOUT:
+        case End::LOCAL:
+        case End::SEND_ERROR: { // we switch, and the connection closes before the peer's confirmation
+            V2Transport peer{Responder()};
+            Pass(link);
+            BOOST_REQUIRE(NodeToPeer(link, peer));
+            PeerToNode(link, peer);
+            if (end == End::SEND_ERROR) link.sock->m_fail_send = true;
+            Pass(link);
+            BOOST_REQUIRE(link.node->m_transport->GetPQSnapshot().switched);
+            if (end == End::PEER_EOF) link.pipes->recv.Eof();
+            if (end == End::PEER_RESET) link.sock->m_fail_recv = true;
+            if (end == End::TIMEOUT) SetMockTime(GetTime<std::chrono::seconds>() + 61s);
+            if (end == End::LOCAL) link.node->RequestDisconnect();
+            Pass(link);
+            break;
+        }
+        }
+        BOOST_REQUIRE(link.node->fDisconnect);
+        Disconnect();
+    }
+
+    std::optional<PQStreakStats> Streak(const PQEndpointKey& endpoint) const
+    {
+        for (const PQStreakStats& streak : Stats().failure_streaks) {
+            if (streak.endpoint == endpoint) return streak;
+        }
+        return std::nullopt;
+    }
+
+    std::optional<PQFallbackStats> Fallback(const PQEndpointKey& endpoint) const
+    {
+        for (const PQFallbackStats& fallback : Stats().fallback_set) {
+            if (fallback.endpoint == endpoint) return fallback;
+        }
+        return std::nullopt;
+    }
 };
 
-/** Our outbound node's peer: a responder. */
-V2Transport Responder(V2PQOptions pq = {.mode = PQMode::NEGOTIATE}) { return {/*nodeid=*/1000, /*initiating=*/false, pq}; }
-/** Our inbound node's peer: an initiator. */
-V2Transport Initiator(V2PQOptions pq = {.mode = PQMode::NEGOTIATE}) { return {/*nodeid=*/1000, /*initiating=*/true, pq}; }
-
-/** 64 bytes an initiator could send as its key: any 64 bytes are a valid ElligatorSwift key. */
-std::vector<uint8_t> InitiatorKey() { return FastRandomContext{}.randbytes<uint8_t>(EllSwiftPubKey::size()); }
+/** A distinct outbound endpoint per index. */
+PQEndpointKey TestEndpoint(uint8_t subnet, int index)
+{
+    return LookupNumeric(strprintf("10.%d.%d.%d", subnet, index / 250, 1 + index % 250), 8333);
+}
 
 } // namespace
 
@@ -633,8 +729,10 @@ BOOST_AUTO_TEST_CASE(pq_abandoned)
 BOOST_AUTO_TEST_CASE(pq_closed_after_switch)
 {
     // We switched, and the peer closed or stopped responding before its confirmation arrived.
+    // Each connection goes to its own endpoint, so none enters the fallback set.
+    uint16_t port{8000};
     for (const std::string cause : {"eof", "reset", "timeout", "local", "send_error"}) {
-        Link link{Add(ConnectionType::OUTBOUND_FULL_RELAY)};
+        Link link{Add(ConnectionType::OUTBOUND_FULL_RELAY, PQMode::NEGOTIATE, LookupNumeric("1.2.3.4", ++port))};
         V2Transport peer{Responder()};
         Pass(link); // our key and garbage
         BOOST_REQUIRE(NodeToPeer(link, peer));
@@ -936,6 +1034,10 @@ BOOST_AUTO_TEST_CASE(pq_cipher_state_closes)
             BOOST_CHECK(entry.outcome == PQOutcome::INTERNAL_ERROR);
             BOOST_CHECK_EQUAL(entry.reason, "cipher_state");
         }
+        // A local fault never counts toward the fallback.
+        BOOST_CHECK(!Streak(endpoint));
+        BOOST_CHECK(!m_connman.IsPQFallback(endpoint, Now<NodeSeconds>()));
+        BOOST_CHECK_EQUAL(stats.outbound.fallback, 0U);
     }
 }
 
@@ -1011,6 +1113,297 @@ BOOST_AUTO_TEST_CASE(pq_finalization_wipes)
         link.node->Release();
         Disconnect();
     }
+}
+
+BOOST_AUTO_TEST_CASE(pq_fallback_threshold)
+{
+    using enum End;
+    struct Case {
+        End end;
+        std::string cause;
+        std::vector<std::string> reasons;
+    };
+    int index{0};
+    for (const Case& test : {Case{MALFORMED, "malformed_record", {"ek_length"}}, Case{CONFIRMATION, "first_packet_failed", {"length", "tag"}},
+                             Case{PEER_EOF, "closed_after_switch", {"eof"}}, Case{PEER_RESET, "closed_after_switch", {"reset"}},
+                             Case{TIMEOUT, "closed_after_switch", {"timeout"}}}) {
+        BOOST_TEST_MESSAGE("counted failure: " + test.cause + " " + test.reasons.front());
+        const PQEndpointKey endpoint{TestEndpoint(3, index++)};
+        Connect(endpoint, test.end);
+        Connect(endpoint, test.end);
+        // Our own closes, send errors and legacy outcomes are neutral: they neither advance nor
+        // reset the streak.
+        Connect(endpoint, LOCAL);
+        Connect(endpoint, SEND_ERROR);
+        Connect(endpoint, LEGACY);
+        BOOST_CHECK(!m_connman.IsPQFallback(endpoint, Now<NodeSeconds>()));
+        const auto streak{Streak(endpoint)};
+        BOOST_REQUIRE(streak);
+        BOOST_CHECK_EQUAL(streak->streak, 2U);
+        BOOST_CHECK_EQUAL(PQOutcomeString(streak->cause), test.cause);
+        BOOST_CHECK(std::ranges::count(test.reasons, streak->reason) == 1);
+        BOOST_CHECK(streak->next_window == 3600s);
+
+        // The third enters the fallback set once, with one warning.
+        const uint64_t fallbacks{Stats().outbound.fallback};
+        const NodeSeconds failure_time{Now<NodeSeconds>() + (test.end == TIMEOUT ? 61s : 0s)};
+        {
+            const std::string until{FormatISO8601DateTime(TicksSinceEpoch<std::chrono::seconds>(failure_time + 3600s))};
+            const std::string text{strprintf("v2 pq: fallback cause=%s until=%s role=initiator conn_type=outbound-full-relay peer=%d%s",
+                                             test.cause, until, m_next_id, Backends())};
+            DebugLogHelper expect{text, AtLevel({text}, LineLevel::WARNING)};
+            Connect(endpoint, test.end);
+        }
+        BOOST_CHECK(m_connman.IsPQFallback(endpoint, Now<NodeSeconds>()));
+        PQTransportStats stats{Stats()};
+        BOOST_CHECK_EQUAL(stats.outbound.fallback, fallbacks + 1);
+        const auto fallback{Fallback(endpoint)};
+        BOOST_REQUIRE(fallback);
+        BOOST_CHECK_EQUAL(PQOutcomeString(fallback->cause), test.cause);
+        BOOST_CHECK_EQUAL(fallback->streak, 3U);
+        BOOST_CHECK(fallback->entered == failure_time);
+        BOOST_CHECK(fallback->expires == failure_time + 3600s);
+        BOOST_CHECK(!Streak(endpoint));
+        const PQFailureEntry& entry{stats.outbound_failures.entries.back()};
+        BOOST_CHECK(entry.outcome == PQOutcome::FALLBACK);
+        BOOST_CHECK_EQUAL(entry.reason, test.cause);
+        BOOST_CHECK(entry.endpoint == endpoint);
+        BOOST_CHECK(!entry.inbound);
+
+        // A failure from a connection that was already running doesn't enter again.
+        Connect(endpoint, test.end);
+        stats = Stats();
+        BOOST_CHECK_EQUAL(stats.outbound.fallback, fallbacks + 1);
+        BOOST_CHECK(Fallback(endpoint)->expires == failure_time + 3600s);
+    }
+
+    // Inbound failures never count: inbound connections never fall back.
+    const CService inbound_addr{LookupNumeric("10.3.1.1", 50000)};
+    for (int i{0}; i < 3; ++i) {
+        Link link{Add(ConnectionType::INBOUND, PQMode::NEGOTIATE, std::nullopt, inbound_addr)};
+        RawPeer peer{/*initiator=*/true};
+        Receive(link, peer.Key());
+        Pass(link);
+        peer.Initialize(NodeKey(link));
+        Receive(link, peer.TerminatorAndVersion(MakeRecord(PQ_MLKEM1024, 100)));
+        Pass(link);
+        BOOST_REQUIRE(link.node->fDisconnect);
+        Disconnect();
+    }
+    BOOST_CHECK_EQUAL(Stats().inbound.malformed_record, 3U);
+    BOOST_CHECK(!Streak(inbound_addr));
+    BOOST_CHECK(!m_connman.IsPQFallback(inbound_addr, Now<NodeSeconds>()));
+}
+
+BOOST_AUTO_TEST_CASE(pq_fallback_windows)
+{
+    const PQEndpointKey endpoint{LookupNumeric("5.6.7.8", 18555)};
+    const auto create_sock_orig{CreateSock};
+    CreateSock = [](int, int, int) -> std::unique_ptr<Sock> { return std::make_unique<ZeroSock>(); };
+    // A new outbound connection to the endpoint, as the connection logic opens one.
+    const auto new_status{[&] {
+        const std::unique_ptr<CNode> node{m_connman.ConnectNodeOnly("5.6.7.8:18555", ConnectionType::OUTBOUND_FULL_RELAY, /*use_v2transport=*/true)};
+        BOOST_REQUIRE(node);
+        return node->m_transport->GetInfo().transport_pq_status;
+    }};
+    BOOST_CHECK(new_status() == PQStatus::PENDING);
+    // A session that is running when the endpoint enters the fallback set.
+    Link running{Add(ConnectionType::OUTBOUND_FULL_RELAY, PQMode::NEGOTIATE, endpoint)};
+
+    for (const std::chrono::seconds window : {3600s, 14400s, 86400s, 86400s}) {
+        Connect(endpoint, End::MALFORMED);
+        Connect(endpoint, End::MALFORMED);
+        BOOST_REQUIRE(Streak(endpoint));
+        BOOST_CHECK(Streak(endpoint)->next_window == window);
+        const NodeSeconds start{Now<NodeSeconds>()};
+        const uint64_t fallbacks{Stats().outbound.fallback};
+        Connect(endpoint, End::MALFORMED);
+        BOOST_CHECK_EQUAL(Stats().outbound.fallback, fallbacks + 1);
+        BOOST_REQUIRE(Fallback(endpoint));
+        BOOST_CHECK(Fallback(endpoint)->expires == start + window);
+        BOOST_CHECK(new_status() == PQStatus::FALLBACK);
+
+        // A failure during the window neither extends it nor enters again.
+        SetMockTime(TicksSinceEpoch<std::chrono::seconds>(start + window - 1s));
+        Connect(endpoint, End::MALFORMED);
+        BOOST_CHECK(m_connman.IsPQFallback(endpoint, Now<NodeSeconds>()));
+        BOOST_CHECK(Fallback(endpoint)->expires == start + window);
+        BOOST_CHECK_EQUAL(Stats().outbound.fallback, fallbacks + 1);
+
+        // At expiry the window ends, and the streak restarts at 0.
+        SetMockTime(TicksSinceEpoch<std::chrono::seconds>(start + window));
+        BOOST_CHECK(!Fallback(endpoint));
+        BOOST_CHECK(!m_connman.IsPQFallback(endpoint, Now<NodeSeconds>()));
+        BOOST_CHECK(!Streak(endpoint));
+        BOOST_CHECK(new_status() == PQStatus::PENDING);
+    }
+    // Existing sessions never renegotiate.
+    BOOST_CHECK(running.node->m_transport->GetInfo().transport_pq_status == PQStatus::PENDING);
+    CreateSock = create_sock_orig;
+}
+
+BOOST_AUTO_TEST_CASE(pq_success_protection)
+{
+    const PQEndpointKey endpoint{TestEndpoint(4, 0)};
+    // A connection that will fail late: we switch now, and the peer's bad confirmation waits.
+    Link late{Add(ConnectionType::OUTBOUND_FULL_RELAY, PQMode::NEGOTIATE, endpoint)};
+    V2Transport bad_peer{Responder({.mode = PQMode::NEGOTIATE, .corrupt_shared_secret = true})};
+    Pass(late);
+    BOOST_REQUIRE(NodeToPeer(late, bad_peer));
+    PeerToNode(late, bad_peer);
+    Pass(late);
+    BOOST_REQUIRE(late.node->m_transport->GetPQSnapshot().switched);
+    BOOST_CHECK(!NodeToPeer(late, bad_peer)); // the peer switched to other keys, and fails ours
+    const std::vector<uint8_t> late_confirmation{PeerBytes(bad_peer)};
+
+    // An earlier failure, then a success: the history goes, and the endpoint is protected.
+    Connect(endpoint, End::MALFORMED);
+    BOOST_CHECK(Streak(endpoint));
+    Connect(endpoint, End::SUCCESS);
+    BOOST_CHECK(!Streak(endpoint));
+
+    // The late failure arrives after the success, and can't undo it.
+    Receive(late, late_confirmation);
+    Pass(late);
+    BOOST_REQUIRE(late.node->m_transport->GetPQSnapshot().failure != PQFailure::NONE);
+    Disconnect();
+    BOOST_CHECK(!Streak(endpoint));
+
+    // More than PQ_MAX_ENDPOINT_HISTORY other endpoints churn the history.
+    for (int i{1}; i <= int{PQ_MAX_ENDPOINT_HISTORY} + 1; ++i) Connect(TestEndpoint(4, i), End::MALFORMED);
+    BOOST_CHECK_EQUAL(Stats().failure_streaks.size(), PQ_MAX_ENDPOINT_HISTORY);
+
+    // The protected endpoint never falls back; its failures are still counted.
+    for (const End end : {End::MALFORMED, End::CONFIRMATION, End::PEER_EOF, End::MALFORMED}) Connect(endpoint, end);
+    BOOST_CHECK(!m_connman.IsPQFallback(endpoint, Now<NodeSeconds>()));
+    BOOST_CHECK(!Streak(endpoint));
+    BOOST_CHECK(!Fallback(endpoint));
+    const PQTransportStats stats{Stats()};
+    BOOST_CHECK_EQUAL(stats.outbound.fallback, 0U);
+    BOOST_CHECK_EQUAL(stats.outbound.first_packet_failed, 2U);
+    BOOST_CHECK_EQUAL(stats.outbound.closed_after_switch, 1U);
+}
+
+BOOST_AUTO_TEST_CASE(pq_history_eviction)
+{
+    // 1,001 endpoints fail once each, all at the same time, inserted in descending key order so
+    // that insertion order and map order disagree.
+    const int newest{int{PQ_MAX_ENDPOINT_HISTORY}};
+    for (int i{newest}; i >= 0; --i) Connect(TestEndpoint(6, i), End::MALFORMED);
+    PQTransportStats stats{Stats()};
+    BOOST_CHECK_EQUAL(stats.failure_streaks.size(), PQ_MAX_ENDPOINT_HISTORY);
+    // The first insertion, which has the largest key, is the one evicted.
+    BOOST_CHECK(!Streak(TestEndpoint(6, newest)));
+    BOOST_CHECK(Streak(TestEndpoint(6, 0)));
+    BOOST_CHECK(Streak(TestEndpoint(6, 1)));
+    BOOST_CHECK(Streak(TestEndpoint(6, newest - 1)));
+    // The rings keep their own bound and counts.
+    BOOST_CHECK_EQUAL(stats.outbound.malformed_record, PQ_MAX_ENDPOINT_HISTORY + 1);
+    BOOST_CHECK_EQUAL(stats.outbound_failures.last_sequence, PQ_MAX_ENDPOINT_HISTORY + 1);
+    BOOST_CHECK_EQUAL(stats.outbound_failures.entries.size(), PQ_FAILURE_RING_SIZE);
+    BOOST_CHECK_EQUAL(stats.outbound_failures.dropped, PQ_MAX_ENDPOINT_HISTORY + 1 - PQ_FAILURE_RING_SIZE);
+
+    // Eviction follows insertion, not the latest failure or the key: the oldest remaining
+    // insertion fails again, later than every other, and is still the next to go.
+    SetMockTime(GetTime<std::chrono::seconds>() + 1s);
+    Connect(TestEndpoint(6, newest - 1), End::MALFORMED);
+    BOOST_CHECK_EQUAL(Streak(TestEndpoint(6, newest - 1))->streak, 2U);
+    Connect(TestEndpoint(6, newest + 1), End::MALFORMED);
+    BOOST_CHECK(!Streak(TestEndpoint(6, newest - 1)));
+    BOOST_CHECK(Streak(TestEndpoint(6, newest - 2)));
+    BOOST_CHECK(Streak(TestEndpoint(6, 0)));
+    BOOST_CHECK(Streak(TestEndpoint(6, newest + 1)));
+    BOOST_CHECK_EQUAL(Stats().failure_streaks.size(), PQ_MAX_ENDPOINT_HISTORY);
+}
+
+namespace {
+/** The warning names the backends that ran, and no remedy: no option forces portable code yet. */
+std::string LocalFaultLine()
+{
+    const auto backends{mlkem::GetBackendNames()};
+    return strprintf("v2 pq: local_fault arith=%s keccak=%s: hybrid handshakes failed with 8 distinct endpoints and none succeeded "
+                     "since startup, so this node's own ML-KEM code may be at fault.",
+                     backends.arith, backends.keccak);
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(pq_local_fault_warning)
+{
+    // Whatever backends this machine runs.
+    LogLineCounter warnings{"v2 pq: local_fault"};
+    for (int i{0}; i < 7; ++i) Connect(TestEndpoint(7, i), End::MALFORMED);
+    BOOST_CHECK_EQUAL(warnings.m_count, 0);
+    {
+        const std::string text{LocalFaultLine()};
+        DebugLogHelper expect{text, AtLevel({text}, LineLevel::WARNING)};
+        Connect(TestEndpoint(7, 7), End::MALFORMED);
+    }
+    BOOST_CHECK_EQUAL(warnings.m_count, 1);
+    // It warns once, and behavior doesn't change.
+    for (int i{0}; i < 12; ++i) Connect(TestEndpoint(7, i), End::MALFORMED);
+    BOOST_CHECK_EQUAL(warnings.m_count, 1);
+    BOOST_CHECK(m_connman.IsPQFallback(TestEndpoint(7, 0), Now<NodeSeconds>()) == false);
+    BOOST_CHECK_EQUAL(Streak(TestEndpoint(7, 0))->streak, 2U);
+}
+
+BOOST_AUTO_TEST_CASE(pq_local_fault_warning_portable)
+{
+    mlkem::ForcePortableForTesting portable;
+    BOOST_CHECK_EQUAL(mlkem::GetBackendNames().arith, "portable");
+    const std::string text{LocalFaultLine()};
+    BOOST_CHECK(text.find("arith=portable keccak=portable:") != std::string::npos);
+    LogLineCounter warnings{"v2 pq: local_fault"};
+    {
+        DebugLogHelper expect{text, AtLevel({text}, LineLevel::WARNING)};
+        for (int i{0}; i < 8; ++i) Connect(TestEndpoint(7, i), End::MALFORMED);
+    }
+    BOOST_CHECK_EQUAL(warnings.m_count, 1);
+}
+
+BOOST_AUTO_TEST_CASE(pq_local_fault_after_success)
+{
+    // One success since startup rules out a local fault.
+    LogLineCounter warnings{"v2 pq: local_fault"};
+    Connect(TestEndpoint(8, 0), End::SUCCESS);
+    for (int i{1}; i <= 12; ++i) Connect(TestEndpoint(8, i), End::MALFORMED);
+    BOOST_CHECK_EQUAL(warnings.m_count, 0);
+}
+
+BOOST_AUTO_TEST_CASE(pq_fallback_connection)
+{
+    // A fallback connection to a peer that sends a malformed offer: plain v2, with the offer
+    // neither parsed nor validated.
+    Link link{Add(ConnectionType::OUTBOUND_FULL_RELAY, PQMode::FALLBACK)};
+    Pass(link);
+    RawPeer raw{/*initiator=*/false};
+    raw.Initialize(NodeKey(link));
+    Receive(link, raw.Key());
+    Receive(link, raw.TerminatorAndVersion(MakeRecord(PQ_MLKEM1024, 100)));
+    Pass(link);
+    BOOST_CHECK(!link.node->fDisconnect);
+    Transport::Info info{link.node->m_transport->GetInfo()};
+    BOOST_CHECK(info.transport_type == TransportProtocolType::V2);
+    BOOST_CHECK(info.transport_pq_status == PQStatus::FALLBACK);
+    BOOST_CHECK(!info.transport_pq);
+
+    // Toward an upgraded responder, which offers: our version stays empty, and the peer sees a
+    // legacy initiator.
+    Link upgraded{Add(ConnectionType::OUTBOUND_FULL_RELAY, PQMode::FALLBACK)};
+    V2Transport peer{Responder()};
+    Exchange(upgraded, peer);
+    BOOST_CHECK(!upgraded.node->fDisconnect);
+    info = upgraded.node->m_transport->GetInfo();
+    BOOST_CHECK(info.transport_type == TransportProtocolType::V2);
+    BOOST_CHECK(info.transport_pq_status == PQStatus::FALLBACK);
+    BOOST_CHECK(peer.GetInfo().transport_pq_status == PQStatus::LEGACY_PEER);
+
+    // Nothing is counted for either.
+    link.node->RequestDisconnect();
+    upgraded.node->RequestDisconnect();
+    Disconnect();
+    const PQTransportStats stats{Stats()};
+    BOOST_CHECK_EQUAL(stats.outbound.switched + stats.outbound.legacy_peer + stats.outbound.malformed_record, 0U);
+    BOOST_CHECK(stats.outbound_failures.entries.empty());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

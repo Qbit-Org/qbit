@@ -92,7 +92,7 @@ struct ConnmanTestMsg : public CConnman {
     bool AlreadyConnectedPublic(const CAddress& addr) { return AlreadyConnectedToAddress(addr); };
 
     CNode* ConnectNodePublic(PeerManager& peerman, const char* pszDest, ConnectionType conn_type)
-        EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex);
+        EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex, !m_pq_mutex);
 
     void SocketHandlerConnectedPublic(const std::vector<CNode*>& nodes, const Sock::EventsPerSock& events_per_sock)
         EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !mutexMsgProc, !m_pq_mutex)
@@ -114,7 +114,7 @@ struct ConnmanTestMsg : public CConnman {
 
     /** ConnectNode() without adding the node to the connection manager; the caller owns it. */
     CNode* ConnectNodeOnly(const char* dest, ConnectionType conn_type, bool use_v2transport)
-        EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex, !m_pq_mutex)
     {
         return ConnectNode(CAddress{}, dest, /*fCountFailure=*/false, conn_type, use_v2transport);
     }
