@@ -92,6 +92,7 @@ add_executable(fuzz
   policy_estimator_io.cpp
   poolresource.cpp
   pow.cpp
+  pq_records.cpp
   pqc.cpp
   prevector.cpp
   primitives_transaction.cpp

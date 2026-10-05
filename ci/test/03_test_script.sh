@@ -371,6 +371,6 @@ if [ "$RUN_FUZZ_TESTS" = "true" ]; then
       --require_qbit_corpus \
       --mutate_min_time="${QBIT_FUZZ_MUTATE_MIN_TIME}" \
       "${DIR_FUZZ_IN}" \
-      asert_chain_transition asert_edge_cases asert_math auxpow mlkem mlkem_backend_diff p2mr_script pqc
+      asert_chain_transition asert_edge_cases asert_math auxpow mlkem mlkem_backend_diff p2mr_script pq_records pqc
   fi
 fi
