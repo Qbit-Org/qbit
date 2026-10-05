@@ -121,6 +121,51 @@ You can use the `getnodeaddresses` RPC to fetch a number of I2P peers known to y
 qbit uses the [SAM v3.1](https://geti2p.net/en/docs/api/samv3) protocol
 to connect to the I2P network. Any I2P router that supports it can be used.
 
+### Post-quantum encryption of I2P sessions
+
+qbit asks the I2P router to encrypt its sessions with the post-quantum hybrid
+type MLKEM768-X25519, and with ECIES-X25519 for peers that lack it
+(`i2cp.leaseSetEncType=6,4`). Whether you get the post-quantum type depends on
+your router:
+
+- Java I2P 2.10.0 or newer, and i2pd 2.58.0 or newer built with OpenSSL 3.5 or
+  newer, use it.
+- Other i2pd versions ignore it and use ECIES-X25519 as before.
+- Java I2P older than 2.10.0 rejects it and refuses to create the session.
+
+When the router rejects the session, qbit retries once without the
+post-quantum type (`i2cp.leaseSetEncType=4,0`, what earlier versions of qbit
+used). Java I2P older than 2.10.0 names the encryption type in its rejection,
+for example `Unsupported crypto type: 6`. The first time such a rejection is
+followed by a working retry with a router, qbit logs a warning such as:
+
+```
+I2P: the router rejected leaseSetEncType=6,4 (RESULT=I2P_ERROR) and accepted 4,0, so this session has no post-quantum leaseset. Java I2P older than 2.10.0 does this; upgrade the router to get it.
+```
+
+One such rejection may be a passing router error, so qbit asks for the
+post-quantum type again in the next session. Only when the router rejects it
+this way and accepts `4,0` in two sessions in a row does qbit stop asking:
+later sessions through that router use `4,0` until qbit restarts. A session in
+which the router accepts the post-quantum type starts the count anew.
+
+Only a rejection that names the encryption type counts and warns. Other
+rejections, such as a failure to build tunnels or a SAM `RESULT=TIMEOUT` reply,
+are retried the same way but do not count: they neither add to the count nor
+start it anew. qbit logs that the session uses `4,0` and that the next session
+asks for the post-quantum type again.
+
+Upgrade the router to get the post-quantum type, then restart qbit so that it
+asks for it again. The retry is specific to qbit; Bitcoin Core has none. qbit
+retries only when the router answers with a rejection, and not when the
+rejection is about the session id or the destination. A SAM `RESULT=TIMEOUT`
+reply is a rejection and is retried. No reply at all is not: a timeout while
+waiting for the router, or a closed or broken connection to it, fails as
+before.
+
+Creating an I2P session, with the retry, must complete within 3 minutes, and
+stops promptly when qbit shuts down. Use `-debug=i2p` to see each attempt.
+
 ## Ports in I2P and qbit
 
 One particularity of SAM v3.1 is that it does not support ports,
