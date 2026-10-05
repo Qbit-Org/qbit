@@ -1,0 +1,8 @@
+# mlkem-native vendored into src/mlkem-native. Written by
+# contrib/devtools/update-mlkem-native.sh; checked by
+# test/lint/mlkem-native-check.sh. See doc/subtrees/mlkem-native.md.
+url=https://github.com/pq-code-package/mlkem-native.git
+tag=v2.0.0
+commit=d1b2fe782888bdb761a50336012923180be7f502
+mlkem_tree=d9d581290ea1e6fa37462bfbc61b9b4266a2e9e5
+license_blob=79c71b1fdcc53cc17b1df99a0f4d4d48121ac174
