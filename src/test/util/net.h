@@ -95,14 +95,33 @@ struct ConnmanTestMsg : public CConnman {
         EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex);
 
     void SocketHandlerConnectedPublic(const std::vector<CNode*>& nodes, const Sock::EventsPerSock& events_per_sock)
-        EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !mutexMsgProc)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !mutexMsgProc, !m_pq_mutex)
     {
         SocketHandlerConnected(nodes, events_per_sock);
     }
 
-    void DisconnectNodesPublic() EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex, !m_reconnections_mutex)
+    void DisconnectNodesPublic() EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex, !m_reconnections_mutex, !m_pq_mutex)
     {
         DisconnectNodes();
+    }
+
+    void SetPQMode(PQMode mode) { m_pq_mode = mode; }
+
+    void ObservePQPublic(CNode& node, bool finalizing) EXCLUSIVE_LOCKS_REQUIRED(!m_pq_mutex)
+    {
+        ObservePQ(node, finalizing);
+    }
+
+    /** ConnectNode() without adding the node to the connection manager; the caller owns it. */
+    CNode* ConnectNodeOnly(const char* dest, ConnectionType conn_type, bool use_v2transport)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex)
+    {
+        return ConnectNode(CAddress{}, dest, /*fCountFailure=*/false, conn_type, use_v2transport);
+    }
+
+    void CreateNodeFromAcceptedSocketPublic(std::unique_ptr<Sock>&& sock, const CService& addr_bind, const CService& addr)
+    {
+        CreateNodeFromAcceptedSocket(std::move(sock), NetPermissionFlags::None, addr_bind, addr);
     }
 
     bool AttemptToEvictConnectionPublic() { return AttemptToEvictConnection(); }

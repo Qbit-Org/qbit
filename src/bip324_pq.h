@@ -70,6 +70,13 @@ enum class PQFailure : uint8_t {
     CIPHER_STATE_INTERNAL = 11,
 };
 
+/** Why the peer counts as a legacy peer: its contents carried no own record, or did not parse. */
+enum class PQLegacyReason : uint8_t { NONE = 0, NO_FEATURES = 1, PARSE_ERROR = 2 };
+
+/** Why the transport closed before the peer's version packet authenticated (the transport's own
+ *  reasons for an abandoned offer). The first one recorded is kept. */
+enum class PQAbort : uint8_t { NONE = 0, GARBAGE_TERMINATOR = 1, VERSION_LENGTH = 2, VERSION_TAG = 3 };
+
 /** Entropy for key generation and encapsulation, 32 bytes per call. */
 struct PQRandomSource {
     using Fill32 = void (*)(void*, std::span<uint8_t, 32>) noexcept;
@@ -118,6 +125,9 @@ public:
         //! The peer's key confirmation verified.
         bool confirmed{false};
         PQFailure failure{PQFailure::NONE};
+        //! Set when the negotiation ended with a legacy peer.
+        PQLegacyReason legacy{PQLegacyReason::NONE};
+        PQAbort abort{PQAbort::NONE};
     };
 
     /**
@@ -180,6 +190,15 @@ public:
     void SetVersionReceived() noexcept { m_snapshot.version_received = true; }
     void SetSwitched() noexcept { m_snapshot.switched = true; }
     void SetConfirmed() noexcept { m_snapshot.confirmed = true; }
+    /** The peer's contents parsed as kind, without an own record: a legacy peer. */
+    void SetLegacy(ParseKind kind) noexcept
+    {
+        m_snapshot.legacy = kind == ParseKind::INVALID_GRAMMAR ? PQLegacyReason::PARSE_ERROR : PQLegacyReason::NO_FEATURES;
+    }
+    void SetAbort(PQAbort abort) noexcept
+    {
+        if (m_snapshot.abort == PQAbort::NONE) m_snapshot.abort = abort;
+    }
     /** Record a failure unless one is recorded already, and wipe the secrets. */
     void SetFailure(PQFailure failure) noexcept;
     Snapshot GetSnapshot() const noexcept { return m_snapshot; }

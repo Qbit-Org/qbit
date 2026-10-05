@@ -33,6 +33,7 @@
 #include <util/check.h>
 #include <util/sock.h>
 #include <util/threadinterrupt.h>
+#include <util/time.h>
 
 #include <atomic>
 #include <condition_variable>
@@ -44,8 +45,11 @@
 #include <memory>
 #include <optional>
 #include <queue>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_set>
+#include <variant>
 #include <vector>
 
 class AddrMan;
@@ -371,6 +375,12 @@ public:
 
     /** Whether upon disconnections, a reconnect with V1 is warranted. */
     virtual bool ShouldReconnectV1() const noexcept = 0;
+
+    /** The hybrid negotiation's progress and first failure (nothing, without a negotiation). */
+    virtual PQHandshake::Snapshot GetPQSnapshot() const noexcept { return {}; }
+
+    /** Wipe the hybrid negotiation's pending secrets; the current keys stay in use. */
+    virtual void ClearPQSecrets() noexcept {}
 };
 
 class V1Transport final : public Transport
@@ -739,8 +749,8 @@ public:
     // Miscellaneous functions.
     bool ShouldReconnectV1() const noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_recv_mutex, !m_send_mutex);
     Info GetInfo() const noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_recv_mutex);
-    /** The hybrid negotiation's progress and first failure. */
-    PQHandshake::Snapshot GetPQSnapshot() const noexcept EXCLUSIVE_LOCKS_REQUIRED(!m_recv_mutex);
+    PQHandshake::Snapshot GetPQSnapshot() const noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_recv_mutex);
+    void ClearPQSecrets() noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_recv_mutex, !m_send_mutex);
 
     /** Test only: whether the decapsulation key or the retained ECDH secret is still held. */
     bool HoldsHybridSecretsForTesting() const noexcept EXCLUSIVE_LOCKS_REQUIRED(!m_recv_mutex);
@@ -770,6 +780,101 @@ enum class NodeCloseCause : uint8_t {
     TIMEOUT = 5,
 };
 
+/** A name-proxy destination: the SOCKS destination hostname and the effective port. */
+struct PQNameEndpoint {
+    std::string hostname;
+    uint16_t port{0};
+    friend bool operator==(const PQNameEndpoint&, const PQNameEndpoint&) = default;
+    friend auto operator<=>(const PQNameEndpoint&, const PQNameEndpoint&) = default;
+};
+
+/**
+ * The endpoint a connection's hybrid negotiation outcomes are accounted to. A resolved
+ * destination, and an inbound peer, is its CService: the address, of any network, and the port
+ * (for an inbound peer, its source port). A name-proxy destination, never resolved locally, is
+ * its normalized hostname and port; never the proxy's own address.
+ */
+using PQEndpointKey = std::variant<CService, PQNameEndpoint>;
+
+/** The endpoint of a name-proxy destination: hostname in lowercase ASCII, one trailing root dot removed. */
+PQNameEndpoint MakePQNameEndpoint(std::string_view hostname, uint16_t port);
+
+/** A hybrid negotiation event. Each one's word (PQOutcomeString) is its counter key and log word. */
+enum class PQOutcome : uint8_t {
+    SWITCHED = 0,
+    //! The peer's key confirmation verified: a success, not counted (switched counted it).
+    CONFIRMED = 1,
+    LEGACY_PEER = 2,
+    MALFORMED_RECORD = 3,
+    FIRST_PACKET_FAILED = 4,
+    //! A responder's offer was queued, but no authenticated version arrived before the close.
+    ABANDONED = 5,
+    //! Outbound: the peer closed (or timed out) after we switched, before its confirmation.
+    CLOSED_AFTER_SWITCH = 6,
+    //! Outbound: an endpoint entered the fallback set.
+    FALLBACK = 7,
+    INTERNAL_ERROR = 8,
+};
+
+std::string_view PQOutcomeString(PQOutcome outcome) noexcept;
+
+/** Hybrid negotiation event counts of one direction. They count events, not exclusive final
+ *  states: a switch whose confirmation then fails counts switched and first_packet_failed. */
+template <typename T>
+struct PQCountsBase {
+    T switched{0};
+    T legacy_peer{0};
+    T malformed_record{0};
+    T first_packet_failed{0};
+    //! Inbound only: only responders offer.
+    T abandoned{0};
+    T internal_error{0};
+    //! Outbound only.
+    T closed_after_switch{0};
+    T fallback{0};
+    //! Inbound only: offers not made because of load shedding.
+    T shed{0};
+};
+using PQCounters = PQCountsBase<std::atomic<uint64_t>>;
+using PQCounts = PQCountsBase<uint64_t>;
+
+/** A non-success hybrid negotiation outcome, as kept in a failure ring. */
+struct PQFailureEntry {
+    uint64_t sequence;
+    NodeSeconds time;
+    PQEndpointKey endpoint;
+    bool inbound;
+    ConnectionType connection_type;
+    NodeId peer_id;
+    PQOutcome outcome;
+    //! Assigned only from the fixed reason vocabulary, never from peer bytes.
+    std::string reason;
+};
+
+/** The most recent failures of one direction, oldest first, with their own sequence. */
+struct PQFailureRing {
+    //! The sequence of the newest entry ever added (the first is 1); 0 if none.
+    uint64_t last_sequence{0};
+    //! How many entries were evicted to keep the bound.
+    uint64_t dropped{0};
+    std::deque<PQFailureEntry> entries;
+};
+
+/** At most this many entries in each failure ring. */
+inline constexpr size_t PQ_FAILURE_RING_SIZE{256};
+
+/** An owning copy of the hybrid transport statistics, without atomics. */
+struct PQTransportStats {
+    //! Random per process start; counters, rings and history count from since.
+    uint256 instance_id;
+    NodeSeconds since;
+    PQCounts inbound;
+    PQCounts outbound;
+    PQFailureRing inbound_failures;
+    //! Outbound connections, manual ones included.
+    PQFailureRing outbound_failures;
+};
+
 struct CNodeOptions
 {
     NetPermissionFlags permission_flags = NetPermissionFlags::None;
@@ -778,6 +883,10 @@ struct CNodeOptions
     size_t recv_flood_size{DEFAULT_MAXRECEIVEBUFFER * 1000};
     bool use_v2transport = false;
     bool is_archive_connection = false;
+    //! The hybrid negotiation of a v2 transport; off unless set.
+    V2PQOptions pq{};
+    //! The endpoint key of the connection; the peer's address and port if unset.
+    std::optional<PQEndpointKey> pq_endpoint{};
 };
 
 /** Information about a peer */
@@ -850,6 +959,13 @@ public:
 
     const ConnectionType m_conn_type;
     const bool m_is_archive_connection{false};
+    //! The endpoint this connection's hybrid negotiation outcomes are accounted to.
+    const PQEndpointKey m_pq_endpoint;
+
+    //! The PQOutcome events already accounted for this connection (a bit per outcome), and
+    //! whether its accounting is final. Accessed only by CConnman, under its m_pq_mutex.
+    uint16_t m_pq_accounted_events{0};
+    bool m_pq_finalized{false};
 
     /** Move all messages from the received queue to the processing queue. */
     void MarkReceivedMsgsForProcessing()
@@ -1409,6 +1525,9 @@ public:
     uint64_t GetTotalBytesRecv() const;
     uint64_t GetTotalBytesSent() const EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex);
 
+    /** An owning copy of the hybrid transport counters and failure rings. */
+    PQTransportStats GetPQTransportStats() const EXCLUSIVE_LOCKS_REQUIRED(!m_pq_mutex);
+
     /** Get a unique deterministic randomizer. */
     CSipHasher GetDeterministicRandomizer(uint64_t id) const;
 
@@ -1462,7 +1581,7 @@ private:
                                       const CService& addr_bind,
                                       const CService& addr);
 
-    void DisconnectNodes() EXCLUSIVE_LOCKS_REQUIRED(!m_reconnections_mutex, !m_nodes_mutex);
+    void DisconnectNodes() EXCLUSIVE_LOCKS_REQUIRED(!m_reconnections_mutex, !m_nodes_mutex, !m_pq_mutex);
     void NotifyNumConnectionsChanged();
     /** Return true if the peer is inactive and should be disconnected. */
     bool InactivityCheck(const CNode& node) const;
@@ -1477,7 +1596,7 @@ private:
     /**
      * Check connected and listening sockets for IO readiness and process them accordingly.
      */
-    void SocketHandler() EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !mutexMsgProc);
+    void SocketHandler() EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !mutexMsgProc, !m_pq_mutex);
 
     /**
      * Do the read/write for connected sockets that are ready for IO.
@@ -1486,7 +1605,7 @@ private:
      */
     void SocketHandlerConnected(const std::vector<CNode*>& nodes,
                                 const Sock::EventsPerSock& events_per_sock)
-        EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !mutexMsgProc);
+        EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !mutexMsgProc, !m_pq_mutex);
 
     /**
      * Accept incoming connections, one from each read-ready listening socket.
@@ -1494,7 +1613,7 @@ private:
      */
     void SocketHandlerListening(const Sock::EventsPerSock& events_per_sock);
 
-    void ThreadSocketHandler() EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !mutexMsgProc, !m_nodes_mutex, !m_reconnections_mutex);
+    void ThreadSocketHandler() EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !mutexMsgProc, !m_nodes_mutex, !m_reconnections_mutex, !m_pq_mutex);
     void ThreadDNSAddressSeed() EXCLUSIVE_LOCKS_REQUIRED(!m_addr_fetches_mutex, !m_nodes_mutex);
 
     uint64_t CalculateKeyedNetGroup(const CNetAddr& ad) const;
@@ -1819,6 +1938,50 @@ private:
     private:
         std::vector<CNode*> m_nodes_copy;
     };
+
+    /** One hybrid negotiation event of a connection, to log once m_pq_mutex is released. */
+    struct PQLogLine {
+        PQOutcome outcome;
+        std::string_view reason;
+    };
+
+    /**
+     * Account the hybrid negotiation events of node that are new since its last observation. It
+     * runs after the node received bytes, and once more, finalizing, before DisconnectNodes()
+     * hands the node to the disconnected pool: that derives closed_after_switch and abandoned
+     * from the close cause, marks the node finalized so no later observation counts anything,
+     * and wipes the transport's pending secrets. With the network off, every close is our own
+     * decision, so nothing is recorded, but finalization still wipes.
+     *
+     * The transport is snapshotted under its own lock, which is released before m_pq_mutex is
+     * taken; nothing calls into the transport, socket, peer manager or node enumeration while
+     * holding m_pq_mutex.
+     */
+    void ObservePQ(CNode& node, bool finalizing) EXCLUSIVE_LOCKS_REQUIRED(!m_pq_mutex);
+
+    /** Count each event of snapshot not yet accounted for node, once, and add a ring entry for
+     *  each non-success outcome. Returns the lines to log. */
+    std::vector<PQLogLine> AccountPQ(CNode& node, const PQHandshake::Snapshot& snapshot, NodeCloseCause cause,
+                                     bool finalizing, NodeSeconds now) EXCLUSIVE_LOCKS_REQUIRED(m_pq_mutex);
+
+    /** Add a non-success outcome to the ring of its direction. */
+    void AddPQFailure(PQFailureEntry entry) EXCLUSIVE_LOCKS_REQUIRED(m_pq_mutex);
+
+    /** Log one event of node: inbound and outbound lines come from separate call sites, because
+     *  the logger rate-limits per call site. */
+    void LogPQOutcome(const CNode& node, const PQLogLine& line) const;
+
+    /** The hybrid negotiation mode of new v2 connections. Off until the option sets it (part 6);
+     *  set before the connection threads start. */
+    PQMode m_pq_mode{PQMode::OFF};
+
+    mutable Mutex m_pq_mutex;
+    //! Event counters, inbound [0] and outbound [1]. Written under m_pq_mutex.
+    std::array<PQCounters, 2> m_pq_counters;
+    //! Failure rings, inbound [0] and outbound [1]: inbound noise can't evict outbound evidence.
+    std::array<PQFailureRing, 2> m_pq_failures GUARDED_BY(m_pq_mutex);
+    const uint256 m_pq_instance_id{GetRandHash()};
+    const NodeSeconds m_pq_since{Now<NodeSeconds>()};
 
     const CChainParams& m_params;
 
