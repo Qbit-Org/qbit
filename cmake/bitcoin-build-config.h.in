@@ -70,6 +70,9 @@
 /* Define this symbol if you have malloc_info */
 #cmakedefine HAVE_MALLOC_INFO 1
 
+/* Define this symbol if __builtin_cpu_supports links for the target */
+#cmakedefine HAVE_BUILTIN_CPU_SUPPORTS 1
+
 /* Define this symbol if you have mallopt with M_ARENA_MAX */
 #cmakedefine HAVE_MALLOPT_ARENA_MAX 1
 

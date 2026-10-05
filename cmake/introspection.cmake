@@ -39,6 +39,18 @@ check_cxx_source_compiles("
   " STRERROR_R_CHAR_P
 )
 
+# Check that __builtin_cpu_supports links for the target. It needs __cpu_model
+# from the compiler's runtime library, which some cross toolchains (macOS from
+# depends) don't provide. Tests use it only as an independent CPU check.
+check_cxx_source_compiles("
+  int main()
+  {
+    __builtin_cpu_init();
+    return __builtin_cpu_supports(\"avx2\") ? 0 : 1;
+  }
+  " HAVE_BUILTIN_CPU_SUPPORTS
+)
+
 # Check for malloc_info (for memory statistics information in getmemoryinfo).
 check_cxx_symbol_exists(malloc_info "malloc.h" HAVE_MALLOC_INFO)
 

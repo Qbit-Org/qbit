@@ -22,5 +22,13 @@ void static inline GetCPUID(uint32_t leaf, uint32_t subleaf, uint32_t& a, uint32
 #endif
 }
 
+/** Read extended control register `index` (XCR0 for 0). Faults unless CPUID leaf 1 reports OSXSAVE. */
+static inline uint64_t XGetBV(uint32_t index) noexcept
+{
+    uint32_t a, d;
+    __asm__("xgetbv" : "=a"(a), "=d"(d) : "c"(index));
+    return (uint64_t{d} << 32) | a;
+}
+
 #endif // defined(__x86_64__) || defined(__amd64__) || defined(__i386__)
 #endif // QBIT_COMPAT_CPUID_H
