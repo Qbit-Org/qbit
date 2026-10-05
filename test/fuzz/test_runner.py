@@ -29,6 +29,7 @@ QBIT_REQUIRED_CORPUS_TARGETS = (
     "p2mr_script",
     "p2p_transport_bidirectional_v1v2",
     "p2p_transport_bidirectional_v2",
+    "p2p_v2_pq_malicious_peer",
     "pq_records",
     "pqc",
 )
