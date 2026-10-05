@@ -138,6 +138,14 @@ jobs:
       - name: Test merge gate polling contract
         run: /usr/bin/python3 ci/checks/test_merge_gate_poller.py -v
 
+      # Job selection, source resolution and unit-test evidence of the PQ and
+      # nightly workflows, which run outside pull requests, and the nightly
+      # workflow's scheduled source.
+      - name: Test PQ CI workflow contract
+        run: |
+          /usr/bin/python3 ci/checks/test_ci_pq_contract.py -v
+          /usr/bin/python3 ci/checks/test_scheduled_validation_contract.py -v
+
       - name: Classify validation profile
         id: classify
         run: |
