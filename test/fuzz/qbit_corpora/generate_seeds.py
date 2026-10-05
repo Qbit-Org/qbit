@@ -650,6 +650,68 @@ def mlkem_cases() -> list[dict]:
     ]
 
 
+# --- pq_records ---------------------------------------------------------------
+
+PQ_VECTORS = CORPORA_DIR.parents[2] / "src" / "test" / "data" / "pq_transport_vectors.json"
+PQ_MLKEM1024 = 0xF0
+
+
+def compact_size(n: int) -> bytes:
+    if n < 0xFD:
+        return bytes([n])
+    if n <= 0xFFFF:
+        return b"\xfd" + n.to_bytes(2, "little")
+    if n <= 0xFFFFFFFF:
+        return b"\xfe" + n.to_bytes(4, "little")
+    return b"\xff" + n.to_bytes(8, "little")
+
+
+def pq_record(header: int, payload: bytes) -> bytes:
+    """A version-contents record: CompactSize(1 + len(payload)) || header || payload."""
+    return compact_size(1 + len(payload)) + bytes([header]) + payload
+
+
+def pq_records_cases() -> list[dict]:
+    vectors = json.loads(PQ_VECTORS.read_text(encoding="utf-8"))["vectors"]
+    ordinary, extra = vectors[0], vectors[2]
+    offer = pq_record(PQ_MLKEM1024, bytes.fromhex(ordinary["ek"]))
+    accept = pq_record(PQ_MLKEM1024, bytes.fromhex(ordinary["ct"]))
+    unknown = pq_record(0xF1, b"qbit")
+    minimal_unknown = pq_record(0x01, b"") * 1000
+    return [
+        case("offer", "raw", offer,
+             "The ordinary offer of vector 0 of src/test/data/pq_transport_vectors.json: fd 21 06 f0 || ek."),
+        case("accept", "raw", accept, "The ordinary accept of vector 0: fd 21 06 f0 || ct."),
+        case("offer-duplicate-unknown", "raw", bytes.fromhex(extra["contents_responder"]),
+             "Vector 2's responder contents: its offer, a second valid offer and an unknown 0xf1 record. The first wins."),
+        case("unknown-then-accept", "raw", bytes.fromhex(extra["contents_initiator"]),
+             "Vector 2's initiator contents: an unknown 0x01 record, then the accept."),
+        case("reserved-and-unknown-headers", "raw", pq_record(0x00, b"") + pq_record(0xF1, b"\xaa") + pq_record(0xFF, b""),
+             "Valid grammar without an own record: no features."),
+        case("empty-own-record", "raw", pq_record(PQ_MLKEM1024, b""),
+             "An own record with an empty payload: parses, and fails the role's length check later."),
+        case("short-offer", "raw", pq_record(PQ_MLKEM1024, bytes.fromhex(ordinary["ek"])[:-1]),
+             "A 1,567-byte own payload (ek_length or ct_length)."),
+        case("long-offer", "raw", pq_record(PQ_MLKEM1024, bytes.fromhex(ordinary["ek"]) + b"\x00"),
+             "A 1,569-byte own payload (ek_length or ct_length)."),
+        case("malformed-first-then-offer", "raw", pq_record(PQ_MLKEM1024, b"\xaa\xbb") + offer,
+             "A malformed first own record before a valid one: the first wins."),
+        case("offer-trailing-byte", "raw", offer + b"\xfd",
+             "A valid offer followed by a truncated CompactSize: invalid grammar, no features."),
+        case("zero-length", "raw", unknown + b"\x00", "A record with len = 0 after a valid one: invalid grammar."),
+        case("one-past-end", "raw", b"\x03\xf0\xaa",
+             "A length one byte past the end of the contents: invalid grammar."),
+        case("truncated-wide-length", "raw", b"\x02\x01\xaa\xfe\x00\x00",
+             "A valid record, then a 0xfe CompactSize cut off after two of its four bytes: invalid grammar."),
+        case("non-canonical-length", "raw", b"\xfd\x02\x00\xf0\xaa",
+             "Length 2 in a 3-byte CompactSize: invalid grammar."),
+        case("oversized-length", "raw", b"\xfe\x01\x00\x00\x02\xf0\xaa",
+             "Length MAX_SIZE + 1 (0x02000001), which ReadCompactSize rejects: invalid grammar."),
+        case("minimal-unknown-records", "raw", minimal_unknown + b"\x05",
+             "1,000 one-byte unknown records ending in a truncated one: invalid grammar after a long valid prefix."),
+    ]
+
+
 def case(name: str, fmt: str, data: bytes, semantics: str) -> dict:
     return {"name": name, "format": fmt, "data": data, "semantics": semantics}
 
@@ -662,6 +724,7 @@ CASE_BUILDERS = {
     "mlkem": mlkem_cases,
     "mlkem_backend_diff": mlkem_cases,
     "p2mr_script": p2mr_cases,
+    "pq_records": pq_records_cases,
     "pqc": pqc_cases,
 }
 
@@ -681,6 +744,7 @@ def build_all() -> tuple[dict, dict[str, list[dict]]]:
                                "is not 0xF, then the FuzzedDataProvider layout of the cached-fixture body.",
             "qbfx-v1-generation": "b'QBFX' + target tag + 0x01 + selector whose low nibble is 0xF, then the legacy "
                                   "FuzzedDataProvider layout.",
+            "raw": "The whole input is the data the target parses, without a FuzzedDataProvider layout.",
         },
         "targets": {
             target: [

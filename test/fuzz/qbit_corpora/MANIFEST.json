@@ -12,7 +12,8 @@
     "fdp": "Untagged FuzzedDataProvider layout for targets without a tagged format.",
     "legacy": "Untagged pre-existing FuzzedDataProvider layout of pqc/p2mr_script, unchanged.",
     "qbfx-v1-fixture": "b'QBFX' + target tag ('P' pqc, 'M' p2mr_script) + 0x01 + selector whose low nibble is not 0xF, then the FuzzedDataProvider layout of the cached-fixture body.",
-    "qbfx-v1-generation": "b'QBFX' + target tag + 0x01 + selector whose low nibble is 0xF, then the legacy FuzzedDataProvider layout."
+    "qbfx-v1-generation": "b'QBFX' + target tag + 0x01 + selector whose low nibble is 0xF, then the legacy FuzzedDataProvider layout.",
+    "raw": "The whole input is the data the target parses, without a FuzzedDataProvider layout."
   },
   "targets": {
     "asert_chain_transition": [
@@ -412,6 +413,120 @@
         "size": 145,
         "sha256": "382e822b4977cbd90e1b46e10db3131fd4aa05db3528341bbee42e93cbc6d4a4",
         "semantics": "Tagged generation selector 0x0F followed by the legacy-checksigpqc-default-valid layout."
+      }
+    ],
+    "pq_records": [
+      {
+        "file": "offer",
+        "format": "raw",
+        "size": 1572,
+        "sha256": "4db1dcc35718f86fbfacd7a3169154ce9b90ac4899d8e1ba77e607e807829335",
+        "semantics": "The ordinary offer of vector 0 of src/test/data/pq_transport_vectors.json: fd 21 06 f0 || ek."
+      },
+      {
+        "file": "accept",
+        "format": "raw",
+        "size": 1572,
+        "sha256": "f55f95816bc7d6c6e5f6879842f244866bb908c313cb7065fd610f16d38638cd",
+        "semantics": "The ordinary accept of vector 0: fd 21 06 f0 || ct."
+      },
+      {
+        "file": "offer-duplicate-unknown",
+        "format": "raw",
+        "size": 3148,
+        "sha256": "ec7fa0f262d470033d09f505582b1025f84a482d55b66fc3331a4e235c43cd10",
+        "semantics": "Vector 2's responder contents: its offer, a second valid offer and an unknown 0xf1 record. The first wins."
+      },
+      {
+        "file": "unknown-then-accept",
+        "format": "raw",
+        "size": 1578,
+        "sha256": "144903f355c909a634fc4807c3a0ec127296f12892493ffb2fae80e771078f9e",
+        "semantics": "Vector 2's initiator contents: an unknown 0x01 record, then the accept."
+      },
+      {
+        "file": "reserved-and-unknown-headers",
+        "format": "raw",
+        "size": 7,
+        "sha256": "6cf59e77bd2bad687e0f9dd4576f15cfa41ee211c670b123613ca60183984c2e",
+        "semantics": "Valid grammar without an own record: no features."
+      },
+      {
+        "file": "empty-own-record",
+        "format": "raw",
+        "size": 2,
+        "sha256": "6cc0ab95752bf25ec58c91b1d603c5eb41b8fbd7ee1694d5a85005056efb1ab3",
+        "semantics": "An own record with an empty payload: parses, and fails the role's length check later."
+      },
+      {
+        "file": "short-offer",
+        "format": "raw",
+        "size": 1571,
+        "sha256": "ce05ab17bb9a676487edda33fdbfd01306de9e7aa41ef39ef2a0094c2f82be2a",
+        "semantics": "A 1,567-byte own payload (ek_length or ct_length)."
+      },
+      {
+        "file": "long-offer",
+        "format": "raw",
+        "size": 1573,
+        "sha256": "ebc5c90456da104eae9bd81785e97a6d0031aede95adaae5b5f880e6dd4fb0f5",
+        "semantics": "A 1,569-byte own payload (ek_length or ct_length)."
+      },
+      {
+        "file": "malformed-first-then-offer",
+        "format": "raw",
+        "size": 1576,
+        "sha256": "7933842445af30e309967eb36ccec32f3ebd76f062aadbba6cb2f9e7b369b765",
+        "semantics": "A malformed first own record before a valid one: the first wins."
+      },
+      {
+        "file": "offer-trailing-byte",
+        "format": "raw",
+        "size": 1573,
+        "sha256": "01e1fbb6a72ae6bd158ef5902e60d37de318f2d831271ec7eed4179f473d92fe",
+        "semantics": "A valid offer followed by a truncated CompactSize: invalid grammar, no features."
+      },
+      {
+        "file": "zero-length",
+        "format": "raw",
+        "size": 7,
+        "sha256": "e034a290523f42c301c35ac085df2ed5293c495c58689bbff1b939f071f22507",
+        "semantics": "A record with len = 0 after a valid one: invalid grammar."
+      },
+      {
+        "file": "one-past-end",
+        "format": "raw",
+        "size": 3,
+        "sha256": "19b27e599c63eef9fedd1c64bbb785530914c07f4f03ab723eae7474994d3c51",
+        "semantics": "A length one byte past the end of the contents: invalid grammar."
+      },
+      {
+        "file": "truncated-wide-length",
+        "format": "raw",
+        "size": 6,
+        "sha256": "0d8bf907c7f5c26d45de142db505a5389e1b79c301614ba42178e88275eb2d13",
+        "semantics": "A valid record, then a 0xfe CompactSize cut off after two of its four bytes: invalid grammar."
+      },
+      {
+        "file": "non-canonical-length",
+        "format": "raw",
+        "size": 5,
+        "sha256": "0682a6be8935622a35773009dfb0e26c0857c4e72424029c526122b1dec714cd",
+        "semantics": "Length 2 in a 3-byte CompactSize: invalid grammar."
+      },
+      {
+        "file": "oversized-length",
+        "format": "raw",
+        "size": 7,
+        "sha256": "a70a4eb5f4febe8115e5b1feefcf4591c2589f5e5da8b1889ab858f7aa51eca9",
+        "semantics": "Length MAX_SIZE + 1 (0x02000001), which ReadCompactSize rejects: invalid grammar."
+      },
+      {
+        "file": "minimal-unknown-records",
+        "format": "raw",
+        "size": 2001,
+        "sha256": "38a04844262d1d0d0a74e3ad0989c2a3cb206b859f8f084ff774ed7d5fca85cc",
+        "semantics": "1,000 one-byte unknown records ending in a truncated one: invalid grammar after a long valid prefix."
       }
     ],
     "pqc": [

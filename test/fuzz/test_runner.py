@@ -27,6 +27,7 @@ QBIT_REQUIRED_CORPUS_TARGETS = (
     "mlkem",
     "mlkem_backend_diff",
     "p2mr_script",
+    "pq_records",
     "pqc",
 )
 MUTATE_MIN_TIME_MAX_SECONDS = 3600
