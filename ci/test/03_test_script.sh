@@ -372,6 +372,6 @@ if [ "$RUN_FUZZ_TESTS" = "true" ]; then
       --mutate_min_time="${QBIT_FUZZ_MUTATE_MIN_TIME}" \
       "${DIR_FUZZ_IN}" \
       asert_chain_transition asert_edge_cases asert_math auxpow mlkem mlkem_backend_diff p2mr_script \
-      p2p_transport_bidirectional_v1v2 p2p_transport_bidirectional_v2 pq_records pqc
+      p2p_transport_bidirectional_v1v2 p2p_transport_bidirectional_v2 p2p_v2_pq_malicious_peer pq_records pqc
   fi
 fi
