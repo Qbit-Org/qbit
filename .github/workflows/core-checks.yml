@@ -156,6 +156,34 @@ jobs:
       - name: Test integrated libbitcoinpqc build policy
         run: python3 ci/checks/test_libbitcoinpqc_build_policy.py
 
+      # Every compiler the build-policy test uses, each listed as required so
+      # that none of its cases can skip: the AArch64 cross compiler proves that
+      # AArch64 ELF builds refuse native ML-KEM (no BTI landing pads), MinGW and
+      # Clang cover the Windows and Clang builds, and cc -m32 an x86 target
+      # without a backend. gcc-aarch64-linux-gnu only recommends its libc
+      # headers, so they are installed explicitly. For -m32, libc6-dev-i386
+      # provides the 32-bit headers: gcc-multilib conflicts with the AArch64
+      # cross compiler on Ubuntu 24.04. clang-21 comes from apt.llvm.org, as in
+      # ci/test/01_base_install.sh.
+      - name: Test integrated mlkem-native build policy
+        env:
+          MLKEM_POLICY_REQUIRED_COMPILERS: cc cc-m32 clang-21 aarch64-linux-gnu-gcc x86_64-w64-mingw32-gcc-posix
+          APT_LLVM_V: 21
+        run: |
+          sudo install -d -m 0755 /etc/apt/keyrings
+          curl --fail --silent --show-error --location --retry 5 https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/keyrings/apt.llvm.org.asc > /dev/null
+          codename="$(. /etc/os-release && echo "${VERSION_CODENAME}")"
+          echo "deb [signed-by=/etc/apt/keyrings/apt.llvm.org.asc] http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-${APT_LLVM_V} main" \
+            | sudo tee "/etc/apt/sources.list.d/llvm-toolchain-${codename}-${APT_LLVM_V}.list" > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
+            gcc-mingw-w64-x86-64-posix \
+            libc6-dev-i386 \
+            "clang-${APT_LLVM_V}" "llvm-${APT_LLVM_V}"
+          python3 ci/checks/test_mlkem_build_policy.py -v
+
       - name: Test IBD timeout wiring
         run: python3 ci/checks/test_ibd_timeout_wiring.py
 
