@@ -573,9 +573,7 @@ bool SelfTest() {
 /** Check whether the OS has enabled AVX registers. */
 bool AVXEnabled()
 {
-    uint32_t a, d;
-    __asm__("xgetbv" : "=a"(a), "=d"(d) : "c"(0));
-    return (a & 6) == 6;
+    return (XGetBV(0) & 6) == 6;
 }
 #endif
 #endif // DISABLE_OPTIMIZED_SHA256
