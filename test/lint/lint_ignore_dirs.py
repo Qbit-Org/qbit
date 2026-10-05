@@ -10,5 +10,6 @@ SHARED_EXCLUDED_SUBTREES = ["src/leveldb/",
                  "src/minisketch/",
                  "src/ipc/libmultiprocess/",
                  "src/libbitcoinpqc/",
+                 "src/mlkem-native/",
                  "contrib/photon/src/vendor/",
                 ]
