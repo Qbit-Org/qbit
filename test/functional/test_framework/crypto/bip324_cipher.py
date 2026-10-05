@@ -3,7 +3,8 @@
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-"""Test-only implementation of ChaCha20 Poly1305 AEAD Construction in RFC 8439 and FSChaCha20Poly1305 for BIP 324
+"""Test-only implementation of ChaCha20 Poly1305 AEAD Construction in RFC 8439 and FSChaCha20Poly1305 for BIP 324,
+and of qbit's hybrid post-quantum v2 key schedule (doc/design/pq-transport.md).
 
 It is designed for ease of understanding, not performance.
 
@@ -11,9 +12,11 @@ WARNING: This code is slow and trivially vulnerable to side channel attacks. Do 
 anything but tests.
 """
 
+import hashlib
 import unittest
 
-from .chacha20 import chacha20_block, REKEY_INTERVAL
+from .chacha20 import chacha20_block, FSChaCha20, REKEY_INTERVAL
+from .hkdf import hkdf_sha256, hmac_sha256
 from .poly1305 import Poly1305
 
 
@@ -86,6 +89,81 @@ class FSChaCha20Poly1305:
 
     def encrypt(self, aad, plaintext):
         return self._crypt(aad, plaintext, False)
+
+
+LENGTH_LEN = 3
+IGNORE_BIT = 0x80
+
+
+def encrypt_packet(send_l, send_p, contents, aad=b"", ignore=False):
+    """Encrypt one BIP324 packet with the sender's FSChaCha20 (length) and FSChaCha20Poly1305."""
+    header = bytes([IGNORE_BIT if ignore else 0])
+    return send_l.crypt(len(contents).to_bytes(LENGTH_LEN, 'little')) + send_p.encrypt(aad, header + contents)
+
+
+def decrypt_packet(recv_l, recv_p, packet, aad=b""):
+    """Decrypt one complete BIP324 packet.
+
+    Returns (length, None) if the decrypted length does not match the packet size or the tag
+    fails, and (length, (ignore, contents)) otherwise."""
+    length = int.from_bytes(recv_l.crypt(packet[:LENGTH_LEN]), 'little')
+    if len(packet) != LENGTH_LEN + 1 + length + 16:
+        return length, None
+    plaintext = recv_p.decrypt(aad, packet[LENGTH_LEN:])
+    if plaintext is None:
+        return length, None
+    return length, (bool(plaintext[0] & IGNORE_BIT), plaintext[1:])
+
+
+# qbit hybrid v2 key schedule: the ML-KEM-1024 recipe under version-contents header 0xF0. Any change
+# to this recipe needs a new header with its own salt label (doc/design/pq-transport.md).
+HYBRID_SALT_LABEL = b"qbit_v2_hybrid_mlkem1024"
+HYBRID_KEY_LABELS = ("initiator_L", "initiator_P", "responder_L", "responder_P", "session_id")
+
+
+def ser_compact_size(n):
+    """Serialize n as a Bitcoin CompactSize."""
+    if n < 253:
+        return n.to_bytes(1, 'little')
+    if n <= 0xffff:
+        return b"\xfd" + n.to_bytes(2, 'little')
+    if n <= 0xffffffff:
+        return b"\xfe" + n.to_bytes(4, 'little')
+    return b"\xff" + n.to_bytes(8, 'little')
+
+
+def hybrid_transcript_input(ellswift_initiator, ellswift_responder, contents_responder, contents_initiator):
+    """Return the bytes the transcript hash TH covers.
+
+    Both EllSwift keys in role order, then the full version packet contents each side sent, the
+    responder's first, each preceded by its CompactSize length."""
+    assert len(ellswift_initiator) == 64 and len(ellswift_responder) == 64
+    return (ellswift_initiator + ellswift_responder +
+            ser_compact_size(len(contents_responder)) + contents_responder +
+            ser_compact_size(len(contents_initiator)) + contents_initiator)
+
+
+def hybrid_derive_keys(ss_ecdh, ss_mlkem, transcript_hash, magic):
+    """Derive the hybrid v2 keys with HKDF-SHA256 (RFC 5869).
+
+    ss_ecdh is the 32-byte BIP324 ECDH secret, ss_mlkem the 32-byte ML-KEM-1024 shared secret,
+    transcript_hash = SHA256(hybrid_transcript_input(...)) and magic the 4 network magic bytes
+    in wire order. Returns a dict with the salt, IKM and PRK, and the five derived 32-byte
+    values keyed by label."""
+    assert len(ss_ecdh) == 32 and len(ss_mlkem) == 32 and len(transcript_hash) == 32 and len(magic) == 4
+    salt = HYBRID_SALT_LABEL + magic
+    ikm = ss_ecdh + ss_mlkem + transcript_hash
+    keys = {"salt": salt, "ikm": ikm, "prk": hmac_sha256(salt, ikm)}
+    for label in HYBRID_KEY_LABELS:
+        keys[label] = hkdf_sha256(length=32, ikm=ikm, salt=salt, info=label.encode('ascii'))
+    return keys
+
+
+def hybrid_ciphers(keys, initiator):
+    """Return fresh (send_L, send_P, recv_L, recv_P) ciphers for one side from hybrid_derive_keys()."""
+    ours, theirs = ("initiator", "responder") if initiator else ("responder", "initiator")
+    return (FSChaCha20(keys[ours + "_L"]), FSChaCha20Poly1305(keys[ours + "_P"]),
+            FSChaCha20(keys[theirs + "_L"]), FSChaCha20Poly1305(keys[theirs + "_P"]))
 
 
 # Test vectors from RFC8439 consisting of plaintext, aad, 32 byte key, 12 byte nonce and ciphertext
@@ -201,3 +279,69 @@ class TestFrameworkAEAD(unittest.TestCase):
                 dec_aead.decrypt(b"", None)
             plaintext = dec_aead.decrypt(aad, ciphertext)
             self.assertEqual(plain, plaintext)
+
+
+class TestFrameworkHybridKeys(unittest.TestCase):
+    ELLSWIFT_I = bytes(range(64))
+    ELLSWIFT_R = bytes(range(64, 128))
+    OFFER = b"\xfd\x21\x06\xf0" + bytes([0x11]) * 1568
+    ACCEPT = b"\xfd\x21\x06\xf0" + bytes([0x22]) * 1568
+    SS_ECDH = bytes([0x33]) * 32
+    SS_MLKEM = bytes([0x44]) * 32
+    MAINNET = bytes.fromhex("444f24a8")
+
+    def derive(self, ellswift_i=ELLSWIFT_I, ellswift_r=ELLSWIFT_R, contents_r=OFFER, contents_i=ACCEPT,
+               ss_ecdh=SS_ECDH, ss_mlkem=SS_MLKEM, magic=MAINNET):
+        th_input = hybrid_transcript_input(ellswift_i, ellswift_r, contents_r, contents_i)
+        return hybrid_derive_keys(ss_ecdh, ss_mlkem, hashlib.sha256(th_input).digest(), magic)
+
+    def test_layout(self):
+        """Transcript and HKDF input sizes match the specification."""
+        self.assertEqual(len(hybrid_transcript_input(self.ELLSWIFT_I, self.ELLSWIFT_R, self.OFFER, self.ACCEPT)), 3278)
+        self.assertEqual(hybrid_transcript_input(self.ELLSWIFT_I, self.ELLSWIFT_R, b"", b""),
+                         self.ELLSWIFT_I + self.ELLSWIFT_R + b"\x00\x00")
+        keys = self.derive()
+        self.assertEqual(keys["salt"], b"qbit_v2_hybrid_mlkem1024\x44\x4f\x24\xa8")
+        self.assertEqual(len(keys["ikm"]), 96)
+        for label in HYBRID_KEY_LABELS:
+            self.assertEqual(keys[label], hmac_sha256(keys["prk"], label.encode('ascii') + b"\x01"))
+        for n, encoding in ((252, "fc"), (253, "fdfd00"), (0xffff, "fdffff"), (0x10000, "fe00000100"),
+                            (0x100000000, "ff0000000001000000")):
+            self.assertEqual(ser_compact_size(n).hex(), encoding)
+
+    def test_binding(self):
+        """Every input changes all five derived values."""
+        base = self.derive()
+        variants = [
+            self.derive(ellswift_i=b"\x01" + self.ELLSWIFT_I[1:]),
+            self.derive(ellswift_r=self.ELLSWIFT_R[:-1] + b"\x00"),
+            self.derive(contents_r=self.OFFER[:-1] + b"\x00"),
+            self.derive(contents_i=self.ACCEPT[:-1] + b"\x00"),
+            self.derive(contents_r=self.ACCEPT, contents_i=self.OFFER),
+            self.derive(contents_r=self.OFFER + self.ACCEPT[:1], contents_i=self.ACCEPT[1:]),
+            self.derive(contents_i=self.ACCEPT + b"\x01\xf1"),
+            self.derive(ss_ecdh=self.SS_MLKEM, ss_mlkem=self.SS_ECDH),
+            self.derive(magic=bytes.fromhex("a66b1fda")),
+        ]
+        seen = {base["session_id"]}
+        for keys in variants:
+            for label in HYBRID_KEY_LABELS:
+                self.assertNotEqual(keys[label], base[label])
+            seen.add(keys["session_id"])
+        self.assertEqual(len(seen), len(variants) + 1)
+
+    def test_packets(self):
+        """Both sides' hybrid ciphers agree, across a rekey."""
+        keys = self.derive()
+        i_send_l, i_send_p, i_recv_l, i_recv_p = hybrid_ciphers(keys, initiator=True)
+        r_send_l, r_send_p, r_recv_l, r_recv_p = hybrid_ciphers(keys, initiator=False)
+        confirmation = encrypt_packet(i_send_l, i_send_p, b"", ignore=True)
+        self.assertEqual(len(confirmation), 20)
+        self.assertEqual(decrypt_packet(r_recv_l, r_recv_p, confirmation), (0, (True, b"")))
+        for i in range(REKEY_INTERVAL + 1):
+            contents = i.to_bytes(2, 'little')
+            self.assertEqual(decrypt_packet(i_recv_l, i_recv_p, encrypt_packet(r_send_l, r_send_p, contents)),
+                             (2, (False, contents)))
+        damaged = bytearray(encrypt_packet(r_send_l, r_send_p, b"x"))
+        damaged[-1] ^= 1
+        self.assertEqual(decrypt_packet(i_recv_l, i_recv_p, bytes(damaged)), (1, None))

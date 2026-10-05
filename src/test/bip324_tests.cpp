@@ -2,11 +2,19 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <test/data/pq_transport_vectors.json.h>
+
 #include <bip324.h>
 #include <chainparams.h>
+#include <crypto/chacha20.h>
+#include <crypto/chacha20poly1305.h>
+#include <crypto/hmac_sha256.h>
+#include <crypto/sha256.h>
 #include <key.h>
 #include <pubkey.h>
+#include <serialize.h>
 #include <span.h>
+#include <streams.h>
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
 #include <util/strencodings.h>
@@ -15,11 +23,87 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <initializer_list>
+#include <memory>
+#include <optional>
+#include <set>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include <boost/test/unit_test.hpp>
+#include <univalue.h>
 
 namespace {
+
+using Bytes = std::vector<std::byte>;
+
+Bytes ToBytes(std::span<const std::byte> bytes) { return {bytes.begin(), bytes.end()}; }
+
+Bytes Concat(std::initializer_list<std::span<const std::byte>> parts)
+{
+    Bytes out;
+    for (const auto& part : parts) out.insert(out.end(), part.begin(), part.end());
+    return out;
+}
+
+Bytes CompactSize(uint64_t size)
+{
+    DataStream stream;
+    WriteCompactSize(stream, size);
+    return {stream.begin(), stream.end()};
+}
+
+/** A version-contents record: CompactSize(1 + payload size) || header || payload. */
+Bytes Record(uint8_t header, std::span<const std::byte> payload)
+{
+    return Concat({CompactSize(1 + payload.size()), std::as_bytes(std::span{&header, 1}), payload});
+}
+
+Bytes EncryptPacket(BIP324Cipher& sender, std::span<const std::byte> contents, bool ignore)
+{
+    Bytes packet(contents.size() + BIP324Cipher::EXPANSION);
+    sender.Encrypt(contents, {}, ignore, packet);
+    return packet;
+}
+
+/** Decrypt one complete packet: nullopt if its decrypted length doesn't fit the packet or its tag fails. */
+std::optional<std::pair<bool, Bytes>> DecryptPacket(BIP324Cipher& receiver, std::span<const std::byte> packet, uint32_t& length)
+{
+    length = receiver.DecryptLength(packet.first(BIP324Cipher::LENGTH_LEN));
+    if (packet.size() != length + BIP324Cipher::EXPANSION) return std::nullopt;
+    Bytes contents(length);
+    bool ignore{false};
+    if (!receiver.Decrypt(packet.subspan(BIP324Cipher::LENGTH_LEN), {}, ignore, contents)) return std::nullopt;
+    return std::make_pair(ignore, std::move(contents));
+}
+
+bool Receives(BIP324Cipher& receiver, std::span<const std::byte> packet, std::span<const std::byte> contents, bool ignore)
+{
+    uint32_t length;
+    const auto result = DecryptPacket(receiver, packet, length);
+    return result && result->first == ignore && std::ranges::equal(result->second, contents);
+}
+
+/** Add both version contents (responder's first) and switch to the hybrid keys. */
+bool SwitchWith(BIP324Cipher& cipher, std::span<const std::byte> contents_first, std::span<const std::byte> contents_second,
+                std::span<const std::byte, 32> ss_mlkem)
+{
+    return cipher.AddVersionContents(contents_first) && cipher.AddVersionContents(contents_second) && cipher.SwitchToHybrid(ss_mlkem);
+}
+
+void InitializePair(BIP324Cipher& initiator, BIP324Cipher& responder, bool retain_for_hybrid)
+{
+    initiator.Initialize(responder.GetOurPubKey(), /*initiator=*/true, /*self_decrypt=*/false, retain_for_hybrid);
+    responder.Initialize(initiator.GetOurPubKey(), /*initiator=*/false, /*self_decrypt=*/false, retain_for_hybrid);
+}
+
+/** Check one packet each way between an initiator and a responder. */
+void CheckPair(BIP324Cipher& initiator, BIP324Cipher& responder, std::span<const std::byte> contents)
+{
+    BOOST_CHECK(Receives(responder, EncryptPacket(initiator, contents, false), contents, false));
+    BOOST_CHECK(Receives(initiator, EncryptPacket(responder, contents, false), contents, false));
+}
 
 struct BIP324Test : BasicTestingSetup {
 void TestBIP324PacketVector(
@@ -298,6 +382,378 @@ BOOST_AUTO_TEST_CASE(packet_test_vectors) {
         "3c8beba28a6289999ec2abbad36179d022f61b74b0c48bf236d4d04024f5d2ee",
         "",
         "27cf3c977dec7a089ae3660b0ec0bf5e15d9704df4e3d9e54831552dddbb07afabc03b42c9f912a5225c855850a30fc74db1d04ee00b19085fbfe6786084f559cf8531bffbd706db7a6bec021b2c946d1dd5ecbc84299205434bbde2910fb3543f75a08153e1471e02649be9c4f2e1767b7415243fa8eeedc55cb77a36651966");
+}
+
+BOOST_AUTO_TEST_CASE(hybrid_vectors)
+{
+    // The vectors come from an independent Python reference (contrib/devtools/generate-pq-transport-vectors.py).
+    UniValue doc;
+    BOOST_REQUIRE(doc.read(json_tests::pq_transport_vectors));
+    BOOST_CHECK_EQUAL(doc["header"].get_str(), "f0");
+    BOOST_CHECK_EQUAL(doc["salt_label"].get_str(), "qbit_v2_hybrid_mlkem1024");
+    const std::vector<std::string> labels{"initiator_L", "initiator_P", "responder_L", "responder_P", "session_id"};
+    BOOST_REQUIRE_EQUAL(doc["labels"].size(), labels.size());
+    for (size_t i = 0; i < labels.size(); ++i) BOOST_CHECK_EQUAL(doc["labels"][i].get_str(), labels[i]);
+
+    const UniValue& vectors = doc["vectors"];
+    BOOST_REQUIRE(vectors.size() >= 4);
+    for (size_t index = 0; index < vectors.size(); ++index) {
+        const UniValue& vec = vectors[index];
+        BOOST_TEST_MESSAGE("hybrid vector " << index << ": " << vec["comment"].get_str());
+        const auto hex = [&](const std::string& key) { return ParseHex<std::byte>(vec[key].get_str()); };
+        const std::string chain = vec["chain"].get_str();
+        BOOST_REQUIRE(chain == "main" || chain == "regtest");
+        SelectParams(chain == "main" ? ChainType::MAIN : ChainType::REGTEST);
+        BOOST_CHECK(std::ranges::equal(hex("magic"), MakeByteSpan(Params().MessageStart())));
+
+        CKey key_i, key_r;
+        const auto priv_i = ParseHex(vec["initiator_privkey"].get_str()), priv_r = ParseHex(vec["responder_privkey"].get_str());
+        key_i.Set(priv_i.begin(), priv_i.end(), true);
+        key_r.Set(priv_r.begin(), priv_r.end(), true);
+        BOOST_REQUIRE(key_i.IsValid() && key_r.IsValid());
+        const Bytes ellswift_i = hex("initiator_ellswift"), ellswift_r = hex("responder_ellswift");
+        const EllSwiftPubKey pub_i{ellswift_i}, pub_r{ellswift_r};
+        const Bytes ss_ecdh = hex("ss_ecdh"), contents_r = hex("contents_responder"), contents_i = hex("contents_initiator");
+        const Bytes ss_mlkem_bytes = hex("ss_mlkem");
+        BOOST_REQUIRE_EQUAL(ss_mlkem_bytes.size(), 32U);
+        const std::span<const std::byte, 32> ss_mlkem{ss_mlkem_bytes};
+
+        // The inputs and every intermediate agree with qbit's own primitives.
+        BOOST_CHECK(std::ranges::equal(key_i.ComputeBIP324ECDHSecret(pub_r, pub_i, /*initiating=*/true), ss_ecdh));
+        BOOST_CHECK(std::ranges::equal(key_r.ComputeBIP324ECDHSecret(pub_i, pub_r, /*initiating=*/false), ss_ecdh));
+        BOOST_CHECK(!std::ranges::search(contents_r, Record(0xF0, hex("ek"))).empty());
+        BOOST_CHECK(!std::ranges::search(contents_i, Record(0xF0, hex("ct"))).empty());
+        const Bytes transcript_input = Concat({ellswift_i, ellswift_r, CompactSize(contents_r.size()), contents_r,
+                                               CompactSize(contents_i.size()), contents_i});
+        BOOST_CHECK(transcript_input == hex("transcript_input"));
+        Bytes transcript_hash(CSHA256::OUTPUT_SIZE);
+        CSHA256().Write(UCharCast(transcript_input.data()), transcript_input.size()).Finalize(UCharCast(transcript_hash.data()));
+        BOOST_CHECK(transcript_hash == hex("transcript_hash"));
+        const std::string salt_label{"qbit_v2_hybrid_mlkem1024"};
+        const Bytes salt = Concat({std::as_bytes(std::span{salt_label}), MakeByteSpan(Params().MessageStart())});
+        BOOST_CHECK(salt == hex("salt"));
+        const Bytes ikm = Concat({ss_ecdh, ss_mlkem, transcript_hash});
+        BOOST_CHECK(ikm == hex("ikm"));
+        Bytes prk(CHMAC_SHA256::OUTPUT_SIZE);
+        CHMAC_SHA256(UCharCast(salt.data()), salt.size()).Write(UCharCast(ikm.data()), ikm.size()).Finalize(UCharCast(prk.data()));
+        BOOST_CHECK(prk == hex("prk"));
+        for (const auto& label : labels) {
+            Bytes okm(CHMAC_SHA256::OUTPUT_SIZE);
+            const uint8_t one{1};
+            CHMAC_SHA256(UCharCast(prk.data()), prk.size()).Write(UCharCast(label.data()), label.size()).Write(&one, 1).Finalize(UCharCast(okm.data()));
+            BOOST_CHECK_MESSAGE(okm == hex(label), label);
+        }
+
+        // The derived length and packet keys produce each side's key confirmation.
+        for (const std::string role : {"initiator", "responder"}) {
+            FSChaCha20 l_cipher{hex(role + "_L"), BIP324Cipher::REKEY_INTERVAL};
+            FSChaCha20Poly1305 p_cipher{hex(role + "_P"), BIP324Cipher::REKEY_INTERVAL};
+            Bytes confirmation(BIP324Cipher::EXPANSION);
+            const std::array<std::byte, BIP324Cipher::LENGTH_LEN> zero_length{};
+            const std::array<std::byte, BIP324Cipher::HEADER_LEN> header{BIP324Cipher::IGNORE_BIT};
+            l_cipher.Crypt(zero_length, std::span{confirmation}.first(BIP324Cipher::LENGTH_LEN));
+            p_cipher.Encrypt(header, {}, {}, std::span{confirmation}.subspan(BIP324Cipher::LENGTH_LEN));
+            BOOST_CHECK(confirmation == hex(role + "_confirmation"));
+        }
+
+        // BIP324Cipher in both roles, and in self-decrypt mode, which decrypts its own role's packets.
+        for (const bool self_decrypt : {false, true}) {
+            for (const bool initiator : {true, false}) {
+                const std::string ours{initiator ? "initiator" : "responder"}, theirs{initiator ? "responder" : "initiator"};
+                BIP324Cipher cipher(initiator ? key_i : key_r, initiator ? pub_i : pub_r);
+                cipher.Initialize(initiator ? pub_r : pub_i, initiator, self_decrypt, /*retain_for_hybrid=*/true);
+                BOOST_CHECK(std::ranges::equal(cipher.GetSessionID(), hex("ecdh_session_id")));
+                const Bytes send_terminator = ToBytes(cipher.GetSendGarbageTerminator());
+                const Bytes recv_terminator = ToBytes(cipher.GetReceiveGarbageTerminator());
+                BOOST_CHECK(send_terminator == hex(ours + "_garbage_terminator"));
+                BOOST_CHECK(recv_terminator == hex(theirs + "_garbage_terminator"));
+
+                BOOST_REQUIRE(SwitchWith(cipher, contents_r, contents_i, ss_mlkem));
+                BOOST_CHECK(std::ranges::equal(cipher.GetSessionID(), hex("session_id")));
+                BOOST_CHECK(std::ranges::equal(cipher.GetSendGarbageTerminator(), send_terminator));
+                BOOST_CHECK(std::ranges::equal(cipher.GetReceiveGarbageTerminator(), recv_terminator));
+
+                const std::string sender{self_decrypt ? ours : theirs};
+                BOOST_CHECK(Receives(cipher, hex(sender + "_confirmation"), {}, /*ignore=*/true));
+                BOOST_CHECK(Receives(cipher, hex(sender + "_first_packet"), hex(sender + "_first_contents"), /*ignore=*/false));
+                if (!self_decrypt) {
+                    BOOST_CHECK(EncryptPacket(cipher, {}, /*ignore=*/true) == hex(ours + "_confirmation"));
+                    BOOST_CHECK(EncryptPacket(cipher, hex(ours + "_first_contents"), /*ignore=*/false) == hex(ours + "_first_packet"));
+                }
+            }
+        }
+    }
+
+    const auto hex = [](const UniValue& obj, const std::string& key) { return ParseHex<std::byte>(obj[key].get_str()); };
+    // A cipher in one role of a vector, initialized with the hybrid state retained.
+    const auto make_cipher = [&](const UniValue& vec, bool as_initiator) {
+        SelectParams(vec["chain"].get_str() == "main" ? ChainType::MAIN : ChainType::REGTEST);
+        CKey key;
+        const auto priv = ParseHex(vec[as_initiator ? "initiator_privkey" : "responder_privkey"].get_str());
+        key.Set(priv.begin(), priv.end(), true);
+        const EllSwiftPubKey pub_i{hex(vec, "initiator_ellswift")}, pub_r{hex(vec, "responder_ellswift")};
+        auto cipher = std::make_unique<BIP324Cipher>(key, as_initiator ? pub_i : pub_r);
+        cipher->Initialize(as_initiator ? pub_r : pub_i, as_initiator, /*self_decrypt=*/false, /*retain_for_hybrid=*/true);
+        return cipher;
+    };
+    // Why a receiver's key confirmation check rejects a first hybrid packet ("none" if it passes).
+    const auto confirmation_failure = [](BIP324Cipher& receiver, std::span<const std::byte> packet, uint32_t& length) -> std::string {
+        const auto result = DecryptPacket(receiver, packet, length);
+        if (length != 0) return "length";
+        if (!result) return "tag";
+        return result->first ? "none" : "not_decoy";
+    };
+
+    // First hybrid packets that fail the receiver's check under the honest keys, one per reason.
+    const UniValue& failures = doc["confirmation_failures"];
+    BOOST_REQUIRE_EQUAL(failures.size(), 3U);
+    std::set<std::string> reasons;
+    for (size_t index = 0; index < failures.size(); ++index) {
+        const UniValue& fail = failures[index];
+        BOOST_TEST_MESSAGE("confirmation failure " << index << ": " << fail["comment"].get_str());
+        const UniValue& vec = vectors[fail["vector"].getInt<size_t>()];
+        const bool initiator{fail["receiver"].get_str() == "initiator"};
+        BOOST_REQUIRE(initiator || fail["receiver"].get_str() == "responder");
+        const Bytes ss_mlkem = hex(vec, "ss_mlkem"), packet = hex(fail, "packet");
+        BOOST_REQUIRE_EQUAL(ss_mlkem.size(), 32U);
+        BOOST_REQUIRE_EQUAL(packet.size(), BIP324Cipher::EXPANSION);
+        auto receiver = make_cipher(vec, initiator);
+        BOOST_REQUIRE(SwitchWith(*receiver, hex(vec, "contents_responder"), hex(vec, "contents_initiator"),
+                                 std::span<const std::byte, 32>{ss_mlkem}));
+        uint32_t length;
+        BOOST_CHECK_EQUAL(confirmation_failure(*receiver, packet, length), fail["failure"].get_str());
+        BOOST_CHECK_EQUAL(length, fail["decrypted_length"].getInt<uint32_t>());
+        reasons.insert(fail["failure"].get_str());
+    }
+    BOOST_CHECK((reasons == std::set<std::string>{"length", "tag", "not_decoy"}));
+
+    // One side derives from a different transcript or ML-KEM secret than its honest peer, so each
+    // side's key confirmation fails at the other: at once on a nonzero length, else on the tag.
+    const UniValue& negatives = doc["negative_vectors"];
+    BOOST_REQUIRE(negatives.size() >= 3);
+    for (size_t index = 0; index < negatives.size(); ++index) {
+        const UniValue& neg = negatives[index];
+        BOOST_TEST_MESSAGE("negative hybrid vector " << index << ": " << neg["comment"].get_str());
+        const UniValue& vec = vectors[neg["vector"].getInt<size_t>()];
+        const bool initiator{neg["role"].get_str() == "initiator"};
+        BOOST_REQUIRE(initiator || neg["role"].get_str() == "responder");
+
+        const Bytes ss_bad = hex(neg, "ss_mlkem"), ss_good = hex(vec, "ss_mlkem");
+        BOOST_REQUIRE(ss_bad.size() == 32 && ss_good.size() == 32);
+        auto mismatched = make_cipher(vec, initiator);
+        const UniValue& transcript_contents = neg["transcript_contents"];
+        BOOST_REQUIRE_EQUAL(transcript_contents.size(), 2U);
+        BOOST_REQUIRE(SwitchWith(*mismatched, ParseHex<std::byte>(transcript_contents[0].get_str()),
+                                 ParseHex<std::byte>(transcript_contents[1].get_str()), std::span<const std::byte, 32>{ss_bad}));
+        BOOST_CHECK(std::ranges::equal(mismatched->GetSessionID(), hex(neg, "session_id")));
+        BOOST_CHECK(!std::ranges::equal(mismatched->GetSessionID(), hex(vec, "session_id")));
+        BOOST_CHECK(EncryptPacket(*mismatched, {}, /*ignore=*/true) == hex(neg, "confirmation"));
+        uint32_t length;
+        BOOST_CHECK_EQUAL(confirmation_failure(*mismatched, hex(vec, initiator ? "responder_confirmation" : "initiator_confirmation"), length),
+                          neg["failure"].get_str());
+        BOOST_CHECK_EQUAL(length, neg["decrypted_length"].getInt<uint32_t>());
+
+        auto honest = make_cipher(vec, !initiator);
+        BOOST_REQUIRE(SwitchWith(*honest, hex(vec, "contents_responder"), hex(vec, "contents_initiator"),
+                                 std::span<const std::byte, 32>{ss_good}));
+        BOOST_CHECK_EQUAL(confirmation_failure(*honest, hex(neg, "confirmation"), length), neg["peer_failure"].get_str());
+        BOOST_CHECK_EQUAL(length, neg["peer_decrypted_length"].getInt<uint32_t>());
+    }
+}
+
+BOOST_AUTO_TEST_CASE(hybrid_transcript_binding)
+{
+    const CKey key_i = GenerateRandomKey(), key_r = GenerateRandomKey();
+    const Bytes ent_i = m_rng.randbytes<std::byte>(32), ent_r = m_rng.randbytes<std::byte>(32);
+    const Bytes other_ent_i = m_rng.randbytes<std::byte>(32), other_ent_r = m_rng.randbytes<std::byte>(32);
+    const Bytes offer = Record(0xF0, m_rng.randbytes<std::byte>(1568)), accept = Record(0xF0, m_rng.randbytes<std::byte>(1568));
+    BOOST_REQUIRE_EQUAL(offer.size(), 1572U);
+    const Bytes unknown = Record(0xF1, std::vector{std::byte{0x00}, std::byte{0x01}});
+    const Bytes other_unknown = Record(0xF1, std::vector{std::byte{0x00}, std::byte{0x02}});
+    std::array<std::byte, 32> ss;
+    m_rng.fillrand(ss);
+    std::array<std::byte, 32> other_ss{ss};
+    other_ss[31] ^= std::byte{0x80};
+    const auto flip = [](Bytes bytes, size_t pos) { bytes.at(pos) ^= std::byte{0x01}; return bytes; };
+
+    struct Case {
+        std::string name;
+        bool ecdh_changes;
+        ChainType chain;
+        Bytes ent_i, ent_r, contents_r, contents_i;
+        std::array<std::byte, 32> ss;
+    };
+    const std::vector<Case> cases{
+        {"base", false, ChainType::MAIN, ent_i, ent_r, offer, accept, ss},
+        {"initiator ellswift", true, ChainType::MAIN, other_ent_i, ent_r, offer, accept, ss},
+        {"responder ellswift", true, ChainType::MAIN, ent_i, other_ent_r, offer, accept, ss},
+        {"ek", false, ChainType::MAIN, ent_i, ent_r, flip(offer, 1000), accept, ss},
+        {"ct", false, ChainType::MAIN, ent_i, ent_r, offer, flip(accept, 1000), ss},
+        {"unknown record", false, ChainType::MAIN, ent_i, ent_r, Concat({offer, unknown}), accept, ss},
+        {"unknown record payload", false, ChainType::MAIN, ent_i, ent_r, Concat({offer, other_unknown}), accept, ss},
+        {"duplicate record", false, ChainType::MAIN, ent_i, ent_r, Concat({offer, offer}), accept, ss},
+        {"record order", false, ChainType::MAIN, ent_i, ent_r, Concat({unknown, offer}), accept, ss},
+        {"initiator records", false, ChainType::MAIN, ent_i, ent_r, offer, Concat({accept, unknown}), ss},
+        {"length prefix", false, ChainType::MAIN, ent_i, ent_r, Concat({offer, std::span{accept}.first(1)}), Bytes(accept.begin() + 1, accept.end()), ss},
+        {"swapped contents", false, ChainType::MAIN, ent_i, ent_r, accept, offer, ss},
+        {"ml-kem secret", false, ChainType::MAIN, ent_i, ent_r, offer, accept, other_ss},
+        {"magic", true, ChainType::REGTEST, ent_i, ent_r, offer, accept, ss},
+    };
+
+    std::vector<std::array<Bytes, 3>> derived;
+    Bytes base_ecdh_session_id;
+    for (const auto& c : cases) {
+        BOOST_TEST_MESSAGE("binding case: " << c.name);
+        SelectParams(c.chain);
+        BIP324Cipher initiator(key_i, c.ent_i), responder(key_r, c.ent_r);
+        InitializePair(initiator, responder, /*retain_for_hybrid=*/true);
+        const Bytes ecdh_session_id = ToBytes(initiator.GetSessionID());
+        if (base_ecdh_session_id.empty()) base_ecdh_session_id = ecdh_session_id;
+        // Only the hybrid layer sees the version contents and the ML-KEM secret.
+        BOOST_CHECK((ecdh_session_id != base_ecdh_session_id) == c.ecdh_changes);
+
+        // Two honest sides still agree.
+        BOOST_REQUIRE(SwitchWith(initiator, c.contents_r, c.contents_i, c.ss));
+        BOOST_REQUIRE(SwitchWith(responder, c.contents_r, c.contents_i, c.ss));
+        BOOST_CHECK(std::ranges::equal(initiator.GetSessionID(), responder.GetSessionID()));
+        const Bytes confirmation_i = EncryptPacket(initiator, {}, /*ignore=*/true);
+        const Bytes confirmation_r = EncryptPacket(responder, {}, /*ignore=*/true);
+        BOOST_CHECK(Receives(responder, confirmation_i, {}, /*ignore=*/true));
+        BOOST_CHECK(Receives(initiator, confirmation_r, {}, /*ignore=*/true));
+        CheckPair(initiator, responder, unknown);
+        derived.push_back({ToBytes(initiator.GetSessionID()), confirmation_i, confirmation_r});
+    }
+
+    // Every change gives a different session id and different keys in both directions.
+    for (size_t a = 0; a < cases.size(); ++a) {
+        for (size_t b = a + 1; b < cases.size(); ++b) {
+            for (size_t value = 0; value < 3; ++value) {
+                BOOST_CHECK_MESSAGE(derived[a][value] != derived[b][value], cases[a].name << " vs " << cases[b].name << " value " << value);
+            }
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(hybrid_api_order)
+{
+    SelectParams(ChainType::MAIN);
+    const CKey key_i = GenerateRandomKey(), key_r = GenerateRandomKey();
+    const Bytes ent_i = m_rng.randbytes<std::byte>(32), ent_r = m_rng.randbytes<std::byte>(32);
+    const Bytes contents_r = Record(0xF0, m_rng.randbytes<std::byte>(1568)), contents_i = Record(0xF0, m_rng.randbytes<std::byte>(1568));
+    std::array<std::byte, 32> ss;
+    m_rng.fillrand(ss);
+    const Bytes message = m_rng.randbytes<std::byte>(40);
+
+    // Before Initialize, nothing is accepted.
+    {
+        BIP324Cipher cipher(key_i, ent_i);
+        BOOST_CHECK(!cipher.SwitchToHybrid(ss));
+        BOOST_CHECK(!cipher.AddVersionContents(contents_r));
+        BOOST_CHECK(!cipher.SwitchToHybrid(ss));
+        cipher.DiscardHybridSecret();
+        BOOST_CHECK(!cipher);
+    }
+
+    // Without retain_for_hybrid (the default), today's secret lifetime: nothing to switch with.
+    {
+        BIP324Cipher initiator(key_i, ent_i), responder(key_r, ent_r);
+        InitializePair(initiator, responder, /*retain_for_hybrid=*/false);
+        const Bytes session_id = ToBytes(initiator.GetSessionID());
+        BOOST_CHECK(!initiator.AddVersionContents(contents_r));
+        BOOST_CHECK(!initiator.SwitchToHybrid(ss));
+        BOOST_CHECK(std::ranges::equal(initiator.GetSessionID(), session_id));
+        CheckPair(initiator, responder, message);
+    }
+
+    // With retention: switching early or twice, and a third contents call, are rejected and change nothing.
+    {
+        BIP324Cipher initiator(key_i, ent_i), responder(key_r, ent_r);
+        InitializePair(initiator, responder, /*retain_for_hybrid=*/true);
+        const Bytes ecdh_session_id = ToBytes(initiator.GetSessionID());
+        BOOST_CHECK(!initiator.SwitchToHybrid(ss));
+        BOOST_CHECK(initiator.AddVersionContents(contents_r));
+        BOOST_CHECK(!initiator.SwitchToHybrid(ss));
+        BOOST_CHECK(std::ranges::equal(initiator.GetSessionID(), ecdh_session_id));
+        // The ECDH keys keep working while the switch is pending.
+        CheckPair(initiator, responder, message);
+        BOOST_CHECK(initiator.AddVersionContents(contents_i));
+        BOOST_CHECK(!initiator.AddVersionContents(contents_i));
+        BOOST_CHECK(responder.AddVersionContents(contents_r));
+        BOOST_CHECK(responder.AddVersionContents(contents_i));
+        BOOST_CHECK(!responder.AddVersionContents({}));
+
+        BOOST_CHECK(initiator.SwitchToHybrid(ss));
+        BOOST_CHECK(responder.SwitchToHybrid(ss));
+        const Bytes hybrid_session_id = ToBytes(initiator.GetSessionID());
+        BOOST_CHECK(hybrid_session_id != ecdh_session_id);
+        BOOST_CHECK(std::ranges::equal(responder.GetSessionID(), hybrid_session_id));
+        BOOST_CHECK(!initiator.SwitchToHybrid(ss));
+        BOOST_CHECK(!initiator.AddVersionContents(contents_i));
+        BOOST_CHECK(std::ranges::equal(initiator.GetSessionID(), hybrid_session_id));
+        CheckPair(initiator, responder, message);
+        initiator.DiscardHybridSecret();
+        CheckPair(initiator, responder, message);
+    }
+
+    // DiscardHybridSecret (a legacy outcome): the ECDH keys stay in use and nothing can switch later.
+    {
+        BIP324Cipher initiator(key_i, ent_i), responder(key_r, ent_r);
+        InitializePair(initiator, responder, /*retain_for_hybrid=*/true);
+        const Bytes ecdh_session_id = ToBytes(initiator.GetSessionID());
+        BOOST_CHECK(initiator.AddVersionContents(contents_r));
+        BOOST_CHECK(initiator.AddVersionContents(contents_i));
+        initiator.DiscardHybridSecret();
+        initiator.DiscardHybridSecret();
+        responder.DiscardHybridSecret();
+        BOOST_CHECK(!initiator.SwitchToHybrid(ss));
+        BOOST_CHECK(!initiator.AddVersionContents(contents_i));
+        BOOST_CHECK(!responder.AddVersionContents(contents_r));
+        BOOST_CHECK(!responder.SwitchToHybrid(ss));
+        BOOST_CHECK(std::ranges::equal(initiator.GetSessionID(), ecdh_session_id));
+        CheckPair(initiator, responder, message);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(hybrid_rekey_boundaries)
+{
+    SelectParams(ChainType::MAIN);
+    const CKey key_i = GenerateRandomKey(), key_r = GenerateRandomKey();
+    const Bytes ent_i = m_rng.randbytes<std::byte>(32), ent_r = m_rng.randbytes<std::byte>(32);
+    const Bytes contents_r = Record(0xF0, m_rng.randbytes<std::byte>(1568)), contents_i = Record(0xF0, m_rng.randbytes<std::byte>(1568));
+    std::array<std::byte, 32> ss;
+    m_rng.fillrand(ss);
+    // Hybrid packets 0..449 in each direction cross the rekeys after packets 223 and 447.
+    constexpr unsigned HYBRID_PACKETS{2 * BIP324Cipher::REKEY_INTERVAL + 2};
+
+    std::optional<std::vector<Bytes>> fresh_stream;
+    for (const unsigned ecdh_packets : {0U, 1U, 223U, 224U, 447U}) {
+        BOOST_TEST_MESSAGE("switch after " << ecdh_packets << " ECDH packets each way");
+        BIP324Cipher initiator(key_i, ent_i), responder(key_r, ent_r);
+        InitializePair(initiator, responder, /*retain_for_hybrid=*/true);
+        for (unsigned i = 0; i < ecdh_packets; ++i) {
+            BOOST_REQUIRE(Receives(responder, EncryptPacket(initiator, {}, /*ignore=*/true), {}, /*ignore=*/true));
+            BOOST_REQUIRE(Receives(initiator, EncryptPacket(responder, {}, /*ignore=*/true), {}, /*ignore=*/true));
+        }
+        BOOST_REQUIRE(SwitchWith(initiator, contents_r, contents_i, ss));
+        BOOST_REQUIRE(SwitchWith(responder, contents_r, contents_i, ss));
+
+        std::vector<Bytes> stream;
+        for (unsigned i = 0; i < HYBRID_PACKETS; ++i) {
+            // Packet 0 is the key confirmation, an empty decoy.
+            const bool ignore{i == 0};
+            const Bytes contents(ignore ? 0 : 1 + i % 7, std::byte(i & 0xff));
+            stream.push_back(EncryptPacket(initiator, contents, ignore));
+            BOOST_REQUIRE_MESSAGE(Receives(responder, stream.back(), contents, ignore), "initiator packet " << i);
+            stream.push_back(EncryptPacket(responder, contents, ignore));
+            BOOST_REQUIRE_MESSAGE(Receives(initiator, stream.back(), contents, ignore), "responder packet " << i);
+        }
+        // All four hybrid ciphers start at 0, whatever the ECDH ciphers carried before the switch.
+        if (!fresh_stream) {
+            fresh_stream = std::move(stream);
+        } else {
+            BOOST_CHECK(stream == *fresh_stream);
+        }
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()
