@@ -601,7 +601,12 @@ std::string SHA256AutoDetect(sha256_implementation::UseImplementation use_implem
     uint32_t eax, ebx, ecx, edx;
     GetCPUID(1, 0, eax, ebx, ecx, edx);
     if (use_implementation & sha256_implementation::USE_SSE4) {
-        have_sse4 = (ecx >> 19) & 1;
+        // Fixes an upstream Bitcoin Core bug, which checks SSE4.1 only. The
+        // SSE4 code and the SSE4.1 and SHA-NI code chosen under this check
+        // also execute SSSE3 instructions (pshufb, palignr), which a CPU with
+        // SSE4.1 need not report: a virtual machine can mask SSSE3 alone, and
+        // the self-test below would then die with SIGILL.
+        have_sse4 = ((ecx >> 19) & 1) && ((ecx >> 9) & 1);
     }
     have_xsave = (ecx >> 27) & 1;
     have_avx = (ecx >> 28) & 1;
