@@ -136,6 +136,9 @@ if(WITH_USDT)
   find_package(USDT MODULE REQUIRED)
 endif()
 
+set(WITH_MLKEM_NATIVE "AUTO" CACHE STRING "Build the x86_64 and AArch64 ML-KEM assembly, selected at run time: AUTO, ON or OFF.")
+set_property(CACHE WITH_MLKEM_NATIVE PROPERTY STRINGS AUTO ON OFF)
+
 option(ENABLE_EXTERNAL_SIGNER "Enable external signer support." ON)
 
 cmake_dependent_option(WITH_QRENCODE "Enable QR code support." ON "BUILD_GUI" OFF)
@@ -426,6 +429,9 @@ include(cmake/introspection.cmake)
 
 include(cmake/ccache.cmake)
 
+include(cmake/mlkem-native.cmake)
+mlkem_native_configure()
+
 add_library(warn_interface INTERFACE)
 target_link_libraries(core_interface INTERFACE warn_interface)
 if(MSVC)
@@ -689,6 +695,7 @@ message("  IPC ................................. ${ipc_status}")
 message("  USDT tracing ........................ ${WITH_USDT}")
 message("  QR code (GUI) ....................... ${WITH_QRENCODE}")
 message("  DBus (GUI) .......................... ${WITH_DBUS}")
+message("  ML-KEM-1024 backend ................. ${MLKEM_NATIVE_SUMMARY}")
 message("Tests:")
 message("  test_qbit ........................... ${BUILD_TESTS}")
 message("  test_qbit-qt ........................ ${BUILD_GUI_TESTS}")
