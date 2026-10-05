@@ -1,8 +1,69 @@
 name: Nightly CI
 
+# Heavy validation, entered three ways:
+# - schedule: validates the maintained branch 1.x.x, with the repository
+#   variables CI_NIGHTLY_HEAVY_RUN_TEST_MATRIX and CI_NIGHTLY_HEAVY_RUN_SCANNERS
+#   and the scheduled defaults below. GitHub schedules only the default
+#   branch's copy of a workflow.
+# - workflow_dispatch: validates the selected ref at its event commit, with
+#   the dispatch inputs.
+# - workflow_call: main's callers (C4, part 2 of #184) run this copy on their
+#   schedule or on demand. A called run gets its caller's github context
+#   (GitHub's "Reusing workflows" reference), so github.event_name, github.ref
+#   and github.sha describe main's caller and cannot choose the source or the
+#   settings. A called run is recognized by its source_ref input instead: only
+#   workflow_call declares it, and its default is not empty. It validates
+#   source_ref and honors every input, whatever its caller's event. A caller
+#   must not pass an empty source_ref; the first step fails a run whose
+#   source_ref disagrees with GitHub's job.workflow_ref.
+# The source is resolved once to a commit; every job checks out and verifies
+# that commit, and the summaries record the source_ref input and source_mode
+# (maintained, manual, or requested for a called run that names another source).
+
 on:
   schedule:
     - cron: '30 3 * * *'
+  # The inputs mirror workflow_dispatch, plus source_ref.
+  workflow_call:
+    inputs:
+      source_ref:
+        description: 'Branch, tag or full commit hash to validate; defaults to the maintained branch 1.x.x; must not be empty'
+        required: false
+        type: string
+        default: '1.x.x'
+      run_test_matrix:
+        description: 'Run the existing heavy test matrix'
+        required: false
+        type: boolean
+        default: true
+      run_scanners:
+        description: 'Run scanners'
+        required: false
+        type: boolean
+        default: true
+      scanner_set:
+        description: 'Scanner set'
+        required: false
+        type: string
+        default: minimum
+      scanner_fail_policy:
+        description: 'Scanner failure policy'
+        required: false
+        type: string
+        default: infra-and-secrets
+      skip_build_scanners:
+        description: 'Skip build-backed scanners such as scan-build'
+        required: false
+        type: boolean
+        default: false
+      jobs:
+        description: 'Comma-separated jobs to run (arm32-unit-1, arm32-unit-2, previous-releases, fuzz, scanner); empty runs all'
+        required: false
+        type: string
+        default: ''
+    secrets:
+      LIBBITCOINPQC_READ_TOKEN:
+        required: false
   workflow_dispatch:
     inputs:
       run_test_matrix:
@@ -42,9 +103,22 @@ on:
         required: false
         type: boolean
         default: false
+      jobs:
+        description: 'Comma-separated jobs to run (arm32-unit-1, arm32-unit-2, previous-releases, fuzz, scanner); empty runs all'
+        required: false
+        type: string
+        default: ''
 
+# Concurrency groups are repository-wide, and every call from main shares
+# main's github.ref. A called run's group therefore names its caller's event and
+# its source_ref, so callers for different sources, and an on-demand call beside
+# the scheduled one, never cancel each other; direct runs keep their groups.
+# GitHub's "Reusing workflows" reference warns that a caller and a called
+# workflow sharing a group with cancel-in-progress cancel the run already in
+# progress, and that github.workflow is the caller's name in a called run: a
+# caller must not use a nightly-heavy-call-* group.
 concurrency:
-  group: nightly-heavy-${{ github.event_name == 'schedule' && 'nightly-1.x.x' || github.ref }}
+  group: nightly-heavy-${{ inputs.source_ref != '' && format('call-{0}-{1}', github.event_name, inputs.source_ref) || github.event_name == 'schedule' && 'nightly-1.x.x' || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -62,14 +136,81 @@ jobs:
     name: Resolve source
     runs-on: ${{ github.repository == 'Qbit-Org/qbit' && fromJSON('["self-hosted", "linux", "x64", "qbit-trusted-ci"]') || fromJSON('["self-hosted", "linux", "x64"]') }}
     timeout-minutes: 10
+    # Exactly one resolver step runs: resolve for a direct run, requested for a
+    # called one.
     outputs:
-      source_mode: ${{ steps.resolve.outputs.source_mode }}
-      requested_ref: ${{ steps.resolve.outputs.requested_ref }}
-      requested_ref_name: ${{ steps.resolve.outputs.requested_ref_name }}
-      resolved_sha: ${{ steps.resolve.outputs.resolved_sha }}
+      source_mode: ${{ steps.resolve.outputs.source_mode || steps.requested.outputs.source_mode }}
+      requested_ref: ${{ steps.resolve.outputs.requested_ref || steps.requested.outputs.requested_ref }}
+      requested_ref_name: ${{ steps.resolve.outputs.requested_ref_name || steps.requested.outputs.requested_ref_name }}
+      resolved_sha: ${{ steps.resolve.outputs.resolved_sha || steps.requested.outputs.resolved_sha }}
+      matrix: ${{ steps.select.outputs.matrix }}
+      matrix_count: ${{ steps.select.outputs.matrix_count }}
+      selected: ${{ steps.select.outputs.selected }}
+      run_scanner: ${{ steps.select.outputs.run_scanner }}
     steps:
+      # Fail closed when the source_ref rule and GitHub's record of how the run
+      # started disagree, for example a caller that passes an empty source_ref,
+      # which GitHub's loose equality cannot tell from no source_ref. The
+      # Contexts reference says of job.workflow_ref: "For jobs defined directly
+      # in a workflow file, this is the same as github.workflow_ref. For jobs
+      # defined in a [reusable workflow], this refers to the reusable workflow
+      # file." The full refs are compared, including @ref, so that main's own
+      # ci-nightly-heavy.yml calling this copy is still a called run. The value
+      # is read from toJSON(job) because actionlint does not know the property;
+      # where GitHub does not provide it (GitHub Enterprise Server), the check
+      # is skipped and the summary says so.
+      - name: Check how the run started
+        id: trigger
+        shell: python3 {0}
+        env:
+          RUN_KIND: ${{ inputs.source_ref != '' && 'called' || 'direct' }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          JOB_CONTEXT: ${{ toJSON(job) }}
+          RUN_WORKFLOW_REF: ${{ github.workflow_ref }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          import json
+          import os
+          import sys
+
+
+          def fail(message):
+              print(f"::error::{message}", file=sys.stderr)
+              sys.exit(1)
+
+
+          kind = os.environ["RUN_KIND"]
+          run_ref = os.environ.get("RUN_WORKFLOW_REF", "")
+          try:
+              job = json.loads(os.environ.get("JOB_CONTEXT") or "null") or {}
+          except ValueError:
+              fail("the job context is not JSON")
+          job_ref = job.get("workflow_ref") or ""
+          if not job_ref:
+              check = "skipped: job.workflow_ref is not available"
+          else:
+              started = "direct" if job_ref == run_ref else "called"
+              if started == "called" and kind != "called":
+                  fail(f"this run was called (job.workflow_ref {job_ref} is not github.workflow_ref {run_ref}) "
+                       "with an empty source_ref; the caller must pass the branch, tag or commit to validate")
+              if started == "direct" and kind != "direct":
+                  fail(f"source_ref '{os.environ.get('SOURCE_REF', '')}' is set, but this run was not called "
+                       f"(job.workflow_ref is github.workflow_ref {run_ref})")
+              check = f"passed: {started}"
+          with open(os.environ.get("GITHUB_STEP_SUMMARY", os.devnull), "a", encoding="utf8") as summary:
+              summary.write("## Run\n\n| field | value |\n| --- | --- |\n"
+                            f"| run | {kind} ({'source_ref given' if kind == 'called' else 'no source_ref'}) |\n"
+                            f"| event | {os.environ.get('EVENT_NAME', '')} |\n"
+                            f"| job.workflow_ref | {job_ref or '(not available)'} |\n"
+                            f"| github.workflow_ref | {run_ref} |\n"
+                            f"| cross-check | {check} |\n\n")
+
+      # A direct run: a schedule validates the maintained branch, a dispatch
+      # its selected ref. This script is identical in the IBD and RPC perf
+      # workflows.
       - name: Resolve source
         id: resolve
+        if: ${{ inputs.source_ref == '' }}
         shell: bash
         env:
           SOURCE_MODE: ${{ github.event_name == 'schedule' && 'maintained' || 'manual' }}
@@ -140,8 +281,169 @@ jobs:
             echo "| workflow_sha | $WORKFLOW_SHA |"
           } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
 
+      # A called run: its source_ref names the source, resolved exactly as
+      # ci-pq.yml resolves its own. github.ref and github.sha are the caller's,
+      # so this step never reads them.
+      - name: Resolve requested source
+        id: requested
+        if: ${{ inputs.source_ref != '' }}
+        shell: bash
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+          MAINTAINED_BRANCH: 1.x.x
+          CALLER_EVENT: ${{ github.event_name }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          SOURCE_REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}.git
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Resolve the validation source once per run, before any checkout, so
+          # every job builds and reports the same immutable commit. source_mode
+          # is maintained when source_ref names the maintained branch, and
+          # requested otherwise.
+          fail() { echo "::error::$*" >&2; exit 1; }
+          is_full_sha() { printf '%s\n' "$1" | LC_ALL=C grep -Eq '^[0-9a-f]{40}$'; }
+
+          # Sets requested_ref and resolved_sha from a non-empty source_ref, or
+          # fails the run: a full commit hash is used as is; a branch or tag
+          # name is looked up on the remote, and an annotated tag is peeled to
+          # its commit. ci-pq.yml and ci-nightly-heavy.yml (for a called run)
+          # share this function; ci/checks/test_ci_pq_contract.py keeps the two
+          # copies identical.
+          resolve_source_ref() {
+            local source_ref="$1" candidate status listing matches peeled
+            local -a candidates patterns auth
+            if is_full_sha "$source_ref"; then
+              requested_ref="$source_ref"
+              resolved_sha="$source_ref"
+              return 0
+            fi
+            case "$source_ref" in
+              refs/heads/?*|refs/tags/?*) candidates=("$source_ref") ;;
+              refs/*) fail "source_ref '$source_ref' must be a branch, a tag or a full commit hash" ;;
+              *) candidates=("refs/heads/$source_ref" "refs/tags/$source_ref") ;;
+            esac
+            patterns=()
+            for candidate in "${candidates[@]}"; do
+              git check-ref-format "$candidate" || fail "source_ref '$source_ref' is not a valid ref name"
+              patterns+=("$candidate" "$candidate^{}")
+            done
+            auth=()
+            if [ -n "${GITHUB_TOKEN:-}" ]; then
+              auth=(-c "http.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')")
+            fi
+            status=0
+            listing="$(git ${auth[@]+"${auth[@]}"} ls-remote --exit-code -- "$SOURCE_REPOSITORY_URL" "${patterns[@]}")" || status=$?
+            case "$status" in
+              0) ;;
+              2) fail "no branch or tag '$source_ref' in '$SOURCE_REPOSITORY_URL'" ;;
+              *) fail "could not list refs from '$SOURCE_REPOSITORY_URL' (git exit code $status)" ;;
+            esac
+            matches="$(printf '%s\n' "$listing" | awk -v a="${candidates[0]}" -v b="${candidates[1]:-}" '$2 == a || $2 == b { print $2 }')"
+            [ "$(printf '%s\n' "$matches" | grep -c .)" -eq 1 ] \
+              || fail "source_ref '$source_ref' must name exactly one branch or tag, found: ${matches:-none}"
+            requested_ref="$matches"
+            peeled="$(printf '%s\n' "$listing" | awk -v ref="$requested_ref^{}" '$2 == ref { print $1 }')"
+            resolved_sha="${peeled:-$(printf '%s\n' "$listing" | awk -v ref="$requested_ref" '$2 == ref { print $1 }')}"
+          }
+
+          source_ref="$(printf '%s' "$SOURCE_REF" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+          [ -n "$source_ref" ] || fail "source_ref is empty; a called run must name the branch, tag or commit to validate"
+          [ -n "$MAINTAINED_BRANCH" ] || fail "MAINTAINED_BRANCH is empty"
+          resolve_source_ref "$source_ref"
+          if [ "$requested_ref" = "refs/heads/${MAINTAINED_BRANCH}" ]; then
+            source_mode=maintained
+          else
+            source_mode=requested
+          fi
+          is_full_sha "$resolved_sha" || fail "resolved source '$resolved_sha' is not a full commit hash"
+          is_full_sha "$WORKFLOW_SHA" || fail "workflow revision '$WORKFLOW_SHA' is not a full commit hash"
+          requested_ref_name="${requested_ref#refs/heads/}"
+          requested_ref_name="${requested_ref_name#refs/tags/}"
+
+          {
+            echo "source_mode=$source_mode"
+            echo "requested_ref=$requested_ref"
+            echo "requested_ref_name=$requested_ref_name"
+            echo "resolved_sha=$resolved_sha"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## Validation source"
+            echo
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| source_ref input | $source_ref |"
+            echo "| source_mode | $source_mode |"
+            echo "| requested_ref | $requested_ref |"
+            echo "| resolved_sha | $resolved_sha |"
+            echo "| caller_event | $CALLER_EVENT |"
+            echo "| workflow_sha | $WORKFLOW_SHA |"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+      - name: Select jobs
+        id: select
+        shell: python3 {0}
+        env:
+          JOBS_INPUT: ${{ inputs.jobs }}
+          # The nightly-matrix entries; "job" is the name the jobs input uses.
+          JOB_CATALOG: |
+            [
+              {"job": "arm32-unit-1", "name": "32 bit ARM, unit tests shard 1/2, no functional tests", "timeout-minutes": 180, "file-env": "./ci/test/00_setup_env_arm.sh", "ctest_include_range": "1,139", "container-cpus": "8", "container-memory": "48g"},
+              {"job": "arm32-unit-2", "name": "32 bit ARM, unit tests shard 2/2, no functional tests", "timeout-minutes": 180, "file-env": "./ci/test/00_setup_env_arm.sh", "ctest_include_range": "140,99999", "container-cpus": "8", "container-memory": "48g"},
+              {"job": "previous-releases", "name": "previous releases, depends DEBUG", "timeout-minutes": 180, "file-env": "./ci/test/00_setup_env_native_previous_releases.sh", "container-cpus": "8", "container-memory": "48g"},
+              {"job": "fuzz", "name": "fuzzer,address,undefined,integer, no depends", "timeout-minutes": 240, "file-env": "./ci/test/00_setup_env_native_fuzz.sh", "makejobs": "-j12", "container-cpus": "12", "container-memory": "64g", "fuzz-mutate-min-time": "120"}
+            ]
+          # Selectable jobs that are not matrix entries; each gets a run_<job> output.
+          NON_MATRIX_JOBS: scanner
+        run: |
+          # Turn the comma-separated jobs input into the matrix: empty selects
+          # every job; an empty, unknown or repeated name fails the run.
+          import json
+          import os
+          import sys
+
+
+          def fail(message):
+              print(f"::error::{message}", file=sys.stderr)
+              sys.exit(1)
+
+
+          catalog = json.loads(os.environ["JOB_CATALOG"])
+          non_matrix = os.environ.get("NON_MATRIX_JOBS", "").split()
+          known = [entry["job"] for entry in catalog] + non_matrix
+          if len(set(known)) != len(known):
+              fail(f"job catalog repeats a name: {known}")
+
+          raw = os.environ.get("JOBS_INPUT", "")
+          if raw.strip():
+              requested = [name.strip() for name in raw.split(",")]
+              if "" in requested:
+                  fail(f"jobs input '{raw}' contains an empty name")
+              repeated = sorted({name for name in requested if requested.count(name) > 1})
+              if repeated:
+                  fail(f"jobs input names a job more than once: {', '.join(repeated)}")
+              unknown = [name for name in requested if name not in known]
+              if unknown:
+                  fail(f"unknown job(s) {', '.join(unknown)}; known jobs: {', '.join(known)}")
+          else:
+              requested = known
+
+          include = [entry for entry in catalog if entry["job"] in requested]
+          selected = [name for name in known if name in requested]
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf8") as out:
+              out.write(f"matrix={json.dumps({'include': include}, separators=(',', ':'))}\n")
+              out.write(f"matrix_count={len(include)}\n")
+              out.write(f"selected={json.dumps(selected, separators=(',', ':'))}\n")
+              for name in non_matrix:
+                  out.write(f"run_{name.replace('-', '_')}={'true' if name in requested else 'false'}\n")
+          with open(os.environ.get("GITHUB_STEP_SUMMARY", os.devnull), "a", encoding="utf8") as summary:
+              summary.write(f"\nSelected jobs: {', '.join(selected) or 'none'} (jobs input: {raw.strip() or 'all'})\n")
+
   nightly-matrix:
-    if: ${{ (github.event_name == 'schedule' && vars.CI_NIGHTLY_HEAVY_RUN_TEST_MATRIX != 'false') || (github.event_name == 'workflow_dispatch' && inputs.run_test_matrix) }}
+    # A direct scheduled run follows the repository variable; a called run or a
+    # direct dispatch follows its inputs. A called run reports its caller's
+    # event, so github.event_name alone cannot tell it from a direct one.
+    if: ${{ ((inputs.source_ref == '' && github.event_name == 'schedule' && vars.CI_NIGHTLY_HEAVY_RUN_TEST_MATRIX != 'false') || ((inputs.source_ref != '' || github.event_name != 'schedule') && inputs.run_test_matrix)) && needs.resolve-source.outputs.matrix_count != '0' }}
     name: ${{ matrix.name }}
     needs: resolve-source
     runs-on: ${{ github.repository == 'Qbit-Org/qbit' && fromJSON('["self-hosted", "linux", "x64", "qbit-trusted-ci"]') || fromJSON('["self-hosted", "linux", "x64"]') }}
@@ -165,32 +467,8 @@ jobs:
       QBIT_FUZZ_MUTATE_MIN_TIME: ${{ matrix.fuzz-mutate-min-time || '' }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - name: '32 bit ARM, unit tests shard 1/2, no functional tests'
-            timeout-minutes: 180
-            file-env: './ci/test/00_setup_env_arm.sh'
-            ctest_include_range: '1,139'
-            container-cpus: '8'
-            container-memory: '48g'
-          - name: '32 bit ARM, unit tests shard 2/2, no functional tests'
-            timeout-minutes: 180
-            file-env: './ci/test/00_setup_env_arm.sh'
-            ctest_include_range: '140,99999'
-            container-cpus: '8'
-            container-memory: '48g'
-          - name: 'previous releases, depends DEBUG'
-            timeout-minutes: 180
-            file-env: './ci/test/00_setup_env_native_previous_releases.sh'
-            container-cpus: '8'
-            container-memory: '48g'
-          - name: 'fuzzer,address,undefined,integer, no depends'
-            timeout-minutes: 240
-            file-env: './ci/test/00_setup_env_native_fuzz.sh'
-            makejobs: '-j12'
-            container-cpus: '12'
-            container-memory: '64g'
-            fuzz-mutate-min-time: '120'
+      # The entries are JOB_CATALOG in resolve-source, filtered by the jobs input.
+      matrix: ${{ fromJSON(needs.resolve-source.outputs.matrix) }}
 
     steps:
       - name: Require resolved source
@@ -215,6 +493,7 @@ jobs:
       - name: Verify checked-out source
         shell: bash
         env:
+          SOURCE_REF_INPUT: ${{ inputs.source_ref }}
           SOURCE_MODE: ${{ needs.resolve-source.outputs.source_mode }}
           REQUESTED_REF: ${{ needs.resolve-source.outputs.requested_ref }}
           RESOLVED_SHA: ${{ needs.resolve-source.outputs.resolved_sha }}
@@ -230,6 +509,7 @@ jobs:
           {
             echo "### Checked-out source: ${GITHUB_JOB}${MATRIX_NAME:+ ($MATRIX_NAME)}"
             echo
+            echo "- source_ref input: ${SOURCE_REF_INPUT:-(none)}"
             echo "- source_mode: ${SOURCE_MODE}"
             echo "- requested_ref: ${REQUESTED_REF}"
             echo "- resolved_sha: ${RESOLVED_SHA}"
@@ -256,7 +536,8 @@ jobs:
         uses: ./.github/actions/save-caches
 
   scanner-readiness:
-    if: ${{ (github.event_name == 'schedule' && vars.CI_NIGHTLY_HEAVY_RUN_SCANNERS != 'false') || (github.event_name == 'workflow_dispatch' && inputs.run_scanners) }}
+    # The same rule as nightly-matrix, with the scanner's variable and input.
+    if: ${{ ((inputs.source_ref == '' && github.event_name == 'schedule' && vars.CI_NIGHTLY_HEAVY_RUN_SCANNERS != 'false') || ((inputs.source_ref != '' || github.event_name != 'schedule') && inputs.run_scanners)) && needs.resolve-source.outputs.run_scanner == 'true' }}
     name: Scanner
     needs: resolve-source
     runs-on: ${{ github.repository == 'Qbit-Org/qbit' && fromJSON('["self-hosted", "linux", "x64", "qbit-trusted-ci"]') || fromJSON('["self-hosted", "linux", "x64"]') }}
@@ -264,7 +545,13 @@ jobs:
     env:
       SCANNER_SET: ${{ inputs.scanner_set || 'minimum' }}
       SCANNER_FAIL_POLICY: ${{ inputs.scanner_fail_policy || 'infra-and-secrets' }}
-      SKIP_BUILD_SCANNERS: ${{ github.event_name == 'schedule' && 'true' || inputs.skip_build_scanners && 'true' || 'false' }}
+      # A direct scheduled run skips build-backed scanners; a called run or a
+      # direct dispatch follows skip_build_scanners.
+      SKIP_BUILD_SCANNERS: ${{ inputs.source_ref == '' && github.event_name == 'schedule' && 'true' || inputs.skip_build_scanners && 'true' || 'false' }}
+      # The run's purpose, which the caller's event does give: nightly for a
+      # scheduled run, direct or called by main's scheduled caller, and a manual
+      # dry run for anything on demand.
+      SCANNER_MODE: ${{ github.event_name == 'schedule' && 'nightly' || 'manual_dry_run' }}
     steps:
       - name: Require resolved source
         shell: bash
@@ -288,6 +575,7 @@ jobs:
       - name: Verify checked-out source
         shell: bash
         env:
+          SOURCE_REF_INPUT: ${{ inputs.source_ref }}
           SOURCE_MODE: ${{ needs.resolve-source.outputs.source_mode }}
           REQUESTED_REF: ${{ needs.resolve-source.outputs.requested_ref }}
           RESOLVED_SHA: ${{ needs.resolve-source.outputs.resolved_sha }}
@@ -302,6 +590,7 @@ jobs:
           {
             echo "### Checked-out source: ${GITHUB_JOB}${MATRIX_NAME:+ ($MATRIX_NAME)}"
             echo
+            echo "- source_ref input: ${SOURCE_REF_INPUT:-(none)}"
             echo "- source_mode: ${SOURCE_MODE}"
             echo "- requested_ref: ${REQUESTED_REF}"
             echo "- resolved_sha: ${RESOLVED_SHA}"
@@ -321,10 +610,7 @@ jobs:
           LIBBITCOINPQC_READ_TOKEN: ${{ secrets.LIBBITCOINPQC_READ_TOKEN }}
         run: |
           set -euo pipefail
-          mode="nightly"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            mode="manual_dry_run"
-          fi
+          mode="$SCANNER_MODE"
           git fetch --no-tags origin +main:refs/remotes/origin/main
           source_commit="$(git rev-parse HEAD)"
           history_diff_base_ref="origin/main"
