@@ -557,9 +557,19 @@ CNode* CConnman::ConnectNode(CAddress addrConnect, const char *pszDest, bool fCo
     return nullptr;
 }
 
-void CNode::CloseSocketDisconnect()
+void CNode::RequestDisconnect(NodeCloseCause cause) noexcept
 {
+    Assume(cause != NodeCloseCause::NONE);
+    // Compare-exchange from NONE so the first cause wins, and record it before
+    // setting fDisconnect so a thread that sees fDisconnect also sees the cause.
+    NodeCloseCause expected{NodeCloseCause::NONE};
+    m_close_cause.compare_exchange_strong(expected, cause);
     fDisconnect = true;
+}
+
+void CNode::CloseSocketDisconnect(NodeCloseCause cause)
+{
+    RequestDisconnect(cause);
     LOCK(m_sock_mutex);
     if (m_sock) {
         LogDebug(BCLog::NET, "Resetting socket for peer=%d%s", GetId(), LogIP(fLogIPs));
@@ -1947,7 +1957,7 @@ std::pair<size_t, bool> CConnman::SocketSendData(CNode& node) const
                 int nErr = WSAGetLastError();
                 if (nErr != WSAEWOULDBLOCK && nErr != WSAEMSGSIZE && nErr != WSAEINTR && nErr != WSAEINPROGRESS) {
                     LogDebug(BCLog::NET, "socket send error, %s: %s\n", node.DisconnectMsg(fLogIPs), NetworkErrorString(nErr));
-                    node.CloseSocketDisconnect();
+                    node.CloseSocketDisconnect(NodeCloseCause::SEND_ERROR);
                 }
             }
             break;
@@ -2013,7 +2023,7 @@ bool CConnman::AttemptToEvictConnection()
                 pnode->ConnectionTypeAsString().c_str(),
                 pnode->ConnectedThroughNetwork(),
                 Ticks<std::chrono::seconds>(pnode->m_connected));
-            pnode->fDisconnect = true;
+            pnode->RequestDisconnect();
             return true;
         }
     }
@@ -2207,7 +2217,7 @@ void CConnman::DisconnectNodes()
             for (CNode* pnode : m_nodes) {
                 if (!pnode->fDisconnect) {
                     LogDebug(BCLog::NET, "Network not active, %s\n", pnode->DisconnectMsg(fLogIPs));
-                    pnode->fDisconnect = true;
+                    pnode->RequestDisconnect();
                 }
             }
         }
@@ -2238,7 +2248,7 @@ void CConnman::DisconnectNodes()
                 // release outbound grant (if any)
                 pnode->grantOutbound.Release();
 
-                // close socket and cleanup
+                // close socket and cleanup; a node with no recorded close cause counts as LOCAL
                 pnode->CloseSocketDisconnect();
 
                 // update connection count by network
@@ -2481,7 +2491,7 @@ void CConnman::SocketHandlerConnected(const std::vector<CNode*>& nodes,
                 if (!pnode->fDisconnect) {
                     LogDebug(BCLog::NET, "socket closed, %s\n", pnode->DisconnectMsg(fLogIPs));
                 }
-                pnode->CloseSocketDisconnect();
+                pnode->CloseSocketDisconnect(NodeCloseCause::PEER_EOF);
             }
             else if (nBytes < 0)
             {
@@ -2492,12 +2502,12 @@ void CConnman::SocketHandlerConnected(const std::vector<CNode*>& nodes,
                     if (!pnode->fDisconnect) {
                         LogDebug(BCLog::NET, "socket recv error, %s: %s\n", pnode->DisconnectMsg(fLogIPs), NetworkErrorString(nErr));
                     }
-                    pnode->CloseSocketDisconnect();
+                    pnode->CloseSocketDisconnect(NodeCloseCause::PEER_RESET);
                 }
             }
         }
 
-        if (InactivityCheck(*pnode)) pnode->fDisconnect = true;
+        if (InactivityCheck(*pnode)) pnode->RequestDisconnect(NodeCloseCause::TIMEOUT);
     }
 }
 
@@ -3941,7 +3951,7 @@ bool CConnman::DisconnectNode(const std::string& strNode)
     LOCK(m_nodes_mutex);
     if (CNode* pnode = FindNode(strNode)) {
         LogDebug(BCLog::NET, "disconnect by address%s match, %s", (fLogIPs ? strprintf("=%s", strNode) : ""), pnode->DisconnectMsg(fLogIPs));
-        pnode->fDisconnect = true;
+        pnode->RequestDisconnect();
         return true;
     }
     return false;
@@ -3954,7 +3964,7 @@ bool CConnman::DisconnectNode(const CSubNet& subnet)
     for (CNode* pnode : m_nodes) {
         if (subnet.Match(pnode->addr)) {
             LogDebug(BCLog::NET, "disconnect by subnet%s match, %s", (fLogIPs ? strprintf("=%s", subnet.ToString()) : ""), pnode->DisconnectMsg(fLogIPs));
-            pnode->fDisconnect = true;
+            pnode->RequestDisconnect();
             disconnected = true;
         }
     }
@@ -3972,7 +3982,7 @@ bool CConnman::DisconnectNode(NodeId id)
     for(CNode* pnode : m_nodes) {
         if (id == pnode->GetId()) {
             LogDebug(BCLog::NET, "disconnect by id, %s", pnode->DisconnectMsg(fLogIPs));
-            pnode->fDisconnect = true;
+            pnode->RequestDisconnect();
             return true;
         }
     }
