@@ -139,9 +139,11 @@ doc/subtrees/mlkem-native.md, in particular:
   - qbit's src/crypto/mlkem_config.h, mlkem_arith_backend.h and
     mlkem_fips202_backend.h include upstream paths and config macros; check
     them against the new upstream tree and its release notes;
-  - rebuild and run: test_qbit --run_test=mlkem_tests (native and with
-    MLKEM_FORCE_PORTABLE=1), the mlkem and mlkem_backend_diff fuzz targets,
-    bench_qbit -filter='MLKEM.*', and ci/checks/test_mlkem_build_policy.py;
+  - diff upstream's x1_scalar.h against qbit's AArch64 Keccak mirror;
+  - repeat the x86_64 instruction-set audit of the assembly;
+  - rebuild and run: test_qbit --run_test=mlkem_tests, the mlkem and
+    mlkem_backend_diff fuzz targets, bench_qbit -filter='MLKEM.*', and
+    ci/checks/test_mlkem_build_policy.py;
   - repeat the readelf GNU property comparison and the Guix build;
   - after committing, run test/lint/mlkem-native-check.sh.
 EOF

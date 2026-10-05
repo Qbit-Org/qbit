@@ -67,6 +67,7 @@ add_executable(test_bitcoin
   miner_tests.cpp
   miniminer_tests.cpp
   miniscript_tests.cpp
+  mlkem_tests.cpp
   minisketch_tests.cpp
   multisig_tests.cpp
   net_peer_connection_tests.cpp
@@ -158,6 +159,7 @@ target_json_data_sources(test_bitcoin
   data/key_io_invalid.json
   data/key_io_valid.json
   data/mainnet_launch_difficulty.json
+  data/mlkem1024_vectors.json
   data/p2mr_cross_profile_vectors.json
   data/p2mr_datapqchash_vectors.json
   data/p2mr_pqc_witness_vectors.json
