@@ -1,7 +1,8 @@
 # qbit fuzz seed corpora
 
 Flat binary seed inputs for the qbit-specific fuzz targets that have no
-upstream `qa-assets` corpus:
+upstream `qa-assets` corpus, and for the v2 transport targets, whose
+`qa-assets` inputs predate the hybrid negotiation:
 
 | Target | Directory |
 | --- | --- |
@@ -12,6 +13,8 @@ upstream `qa-assets` corpus:
 | `mlkem` | [`mlkem/`](mlkem) |
 | `mlkem_backend_diff` | [`mlkem_backend_diff/`](mlkem_backend_diff) |
 | `p2mr_script` | [`p2mr_script/`](p2mr_script) |
+| `p2p_transport_bidirectional_v1v2` | [`p2p_transport_bidirectional_v1v2/`](p2p_transport_bidirectional_v1v2) |
+| `p2p_transport_bidirectional_v2` | [`p2p_transport_bidirectional_v2/`](p2p_transport_bidirectional_v2) |
 | `pq_records` | [`pq_records/`](pq_records) |
 | `pqc` | [`pqc/`](pqc) |
 
@@ -70,6 +73,16 @@ of the wrong length, duplicate and unknown records, and framing errors that make
 the whole contents invalid. The harness checks the parser against an
 independent reading of the grammar.
 
+`p2p_transport_bidirectional_v2` and `p2p_transport_bidirectional_v1v2` use
+their harness's untagged layout: each v2 side's key, garbage and ellswift
+entropy, then its hybrid negotiation mode (off, negotiate or fallback for an
+initiator; off or negotiate for a responder, which never falls back) and the
+32-byte seed of its ML-KEM entropy, then the simulation steps. The seeds cover
+every pair of modes and the v1 detection; some end before the simulation loop,
+so the final flush completes the handshake, and some add a fixed pattern that
+drives the loop first. The v2 harness checks that the keys are hybrid on both
+sides exactly when both negotiate.
+
 ## Use in CI
 
 [`overlay.py`](overlay.py) copies each seed to
@@ -83,6 +96,6 @@ from a reused corpus by hand if they are no longer wanted. A target path that
 is not a directory, or a symlink, directory or other non-regular file at a
 managed name, is an error; all target paths and managed names are checked
 before any file is written.
-`test/fuzz/test_runner.py --require_qbit_corpus` then fails unless all nine
+`test/fuzz/test_runner.py --require_qbit_corpus` then fails unless all eleven
 targets are selected, each has at least one regular input file, and the fuzz
 binary reports replaying them.

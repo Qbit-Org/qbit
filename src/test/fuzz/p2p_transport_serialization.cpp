@@ -2,7 +2,10 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <bip324_pq.h>
 #include <chainparams.h>
+#include <crypto/common.h>
+#include <crypto/sha256.h>
 #include <hash.h>
 #include <net.h>
 #include <netmessagemaker.h>
@@ -13,10 +16,12 @@
 #include <util/chaintype.h>
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace {
@@ -336,8 +341,23 @@ std::unique_ptr<Transport> MakeV1Transport(NodeId nodeid) noexcept
     return std::make_unique<V1Transport>(nodeid);
 }
 
+/** One side's ML-KEM entropy, SHA256(seed || counter), with the seed from the fuzzer input. */
+struct FuzzPQEntropy {
+    std::array<uint8_t, 32> seed{};
+    uint32_t counter{0};
+
+    static void Fill(void* context, std::span<uint8_t, 32> out) noexcept
+    {
+        auto& self{*static_cast<FuzzPQEntropy*>(context)};
+        uint8_t counter_le[4];
+        WriteLE32(counter_le, self.counter++);
+        CSHA256().Write(self.seed.data(), self.seed.size()).Write(counter_le, sizeof(counter_le)).Finalize(out.data());
+    }
+};
+
 template<RandomNumberGenerator RNG>
-std::unique_ptr<Transport> MakeV2Transport(NodeId nodeid, bool initiator, RNG& rng, FuzzedDataProvider& provider)
+std::unique_ptr<Transport> MakeV2Transport(NodeId nodeid, bool initiator, RNG& rng, FuzzedDataProvider& provider,
+                                           FuzzPQEntropy& entropy, PQMode& mode)
 {
     // Retrieve key
     auto key = ConsumePrivateKey(provider);
@@ -366,8 +386,15 @@ std::unique_ptr<Transport> MakeV2Transport(NodeId nodeid, bool initiator, RNG& r
     CSHA256().Write(UCharCast(ent.data()), ent.size())
              .Write(garb.data(), garb.size())
              .Finalize(UCharCast(ent.data()));
+    // Retrieve the hybrid negotiation mode (only an initiator falls back), and the seed of this
+    // side's ML-KEM entropy.
+    mode = initiator ? provider.PickValueInArray({PQMode::OFF, PQMode::NEGOTIATE, PQMode::FALLBACK}) :
+                       provider.PickValueInArray({PQMode::OFF, PQMode::NEGOTIATE});
+    const auto pq_seed{provider.ConsumeBytes<uint8_t>(entropy.seed.size())};
+    std::ranges::copy(pq_seed, entropy.seed.begin());
 
-    return std::make_unique<V2Transport>(nodeid, initiator, key, ent, std::move(garb));
+    return std::make_unique<V2Transport>(nodeid, initiator, key, ent, std::move(garb), V2PQOptions{.mode = mode},
+                                         PQRandomSource{.fill32 = &FuzzPQEntropy::Fill, .context = &entropy}, DefaultPQKemOps());
 }
 
 } // namespace
@@ -385,22 +412,32 @@ FUZZ_TARGET(p2p_transport_bidirectional, .init = initialize_p2p_transport_serial
 
 FUZZ_TARGET(p2p_transport_bidirectional_v2, .init = initialize_p2p_transport_serialization)
 {
-    // Test with two V2 transports talking to each other.
+    // Test with two V2 transports talking to each other, each with or without the hybrid
+    // negotiation.
     FuzzedDataProvider provider{buffer.data(), buffer.size()};
     InsecureRandomContext rng(provider.ConsumeIntegral<uint64_t>());
-    auto t1 = MakeV2Transport(NodeId{0}, true, rng, provider);
-    auto t2 = MakeV2Transport(NodeId{1}, false, rng, provider);
+    FuzzPQEntropy entropy1, entropy2;
+    PQMode mode1, mode2;
+    auto t1 = MakeV2Transport(NodeId{0}, true, rng, provider, entropy1, mode1);
+    auto t2 = MakeV2Transport(NodeId{1}, false, rng, provider, entropy2, mode2);
     if (!t1 || !t2) return;
     SimulationTest(*t1, *t2, rng, provider);
+    // The keys are hybrid, and confirmed on both sides, exactly when both sides negotiate.
+    const bool hybrid{mode1 == PQMode::NEGOTIATE && mode2 == PQMode::NEGOTIATE};
+    assert(t1->GetInfo().transport_pq == hybrid);
+    assert(t2->GetInfo().transport_pq == hybrid);
 }
 
 FUZZ_TARGET(p2p_transport_bidirectional_v1v2, .init = initialize_p2p_transport_serialization)
 {
-    // Test with a V1 initiator talking to a V2 responder.
+    // Test with a V1 initiator talking to a V2 responder, with or without the hybrid negotiation.
     FuzzedDataProvider provider{buffer.data(), buffer.size()};
     InsecureRandomContext rng(provider.ConsumeIntegral<uint64_t>());
+    FuzzPQEntropy entropy;
+    PQMode mode;
     auto t1 = MakeV1Transport(NodeId{0});
-    auto t2 = MakeV2Transport(NodeId{1}, false, rng, provider);
+    auto t2 = MakeV2Transport(NodeId{1}, false, rng, provider, entropy, mode);
     if (!t1 || !t2) return;
     SimulationTest(*t1, *t2, rng, provider);
+    assert(!t2->GetInfo().transport_pq);
 }
