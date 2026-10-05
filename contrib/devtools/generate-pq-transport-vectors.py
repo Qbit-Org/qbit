@@ -11,19 +11,24 @@ code under test. Every input is derived from a fixed label, so the output is rep
 byte. The recipe is specified in doc/design/pq-transport.md.
 
 Run without arguments to rewrite the file, or with --check (as the lint does) to fail when the
-committed file differs from what the reference produces.
+committed file differs from what the reference produces. Both modes also fail when a value the
+specification quotes in a "pq-transport-vectors" block differs from the vectors.
 """
 
 import argparse
 import hashlib
 import importlib
 import json
+import re
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 FUNCTIONAL_DIR = ROOT / "test" / "functional"
 OUTPUT = ROOT / "src" / "test" / "data" / "pq_transport_vectors.json"
+SPEC = ROOT / "doc" / "design" / "pq-transport.md"
+# A block of "name = hex" lines quoting one vector, introduced by an HTML comment.
+SPEC_BLOCK = re.compile(r"<!-- pq-transport-vectors: vector (\d+) -->\n```text\n(.*?)\n```", re.DOTALL)
 
 PQ_MLKEM1024 = 0xF0
 # Network magic in wire order (src/kernel/chainparams.cpp); bip324_tests checks it against the chain.
@@ -323,7 +328,26 @@ def generate():
         "confirmation_failures": confirmation_failures,
         "negative_vectors": negatives,
     }
-    return json.dumps(document, indent=2) + "\n"
+    return document
+
+
+def check_spec(document):
+    """Return every value the specification quotes that differs from the vectors."""
+    spec = SPEC.relative_to(ROOT)
+    blocks = SPEC_BLOCK.findall(SPEC.read_text(encoding="utf8"))
+    if not blocks:
+        return [f"{spec}: no quoted vector block found"]
+    errors = []
+    for index, body in blocks:
+        if int(index) >= len(document["vectors"]):
+            errors.append(f"{spec}: quotes vector {index}, which does not exist")
+            continue
+        vector = document["vectors"][int(index)]
+        for line in body.splitlines():
+            name, _, value = line.partition(" = ")
+            if vector.get(name) != value:
+                errors.append(f"{spec}: vector {index} quotes {name} = {value}, which does not match the vectors")
+    return errors
 
 
 def main():
@@ -331,7 +355,11 @@ def main():
     parser.add_argument("--check", action="store_true", help=f"fail if {OUTPUT.relative_to(ROOT)} is stale")
     args = parser.parse_args()
 
-    text = generate()
+    document = generate()
+    text = json.dumps(document, indent=2) + "\n"
+    spec_errors = check_spec(document)
+    for error in spec_errors:
+        print(error, file=sys.stderr)
     if args.check:
         current = OUTPUT.read_text(encoding="utf8") if OUTPUT.exists() else None
         if current != text:
@@ -339,10 +367,14 @@ def main():
                   "intended, it needs a new version-contents header (doc/design/pq-transport.md); then run "
                   f"{Path(__file__).relative_to(ROOT)} to regenerate it.", file=sys.stderr)
             sys.exit(1)
-        print(f"{OUTPUT.relative_to(ROOT)} matches the Python reference.")
+        if spec_errors:
+            sys.exit(1)
+        print(f"{OUTPUT.relative_to(ROOT)} and the values {SPEC.relative_to(ROOT)} quotes match the Python reference.")
         return
     OUTPUT.write_text(text, encoding="utf8")
     print(f"Wrote {OUTPUT.relative_to(ROOT)}")
+    if spec_errors:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
