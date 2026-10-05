@@ -20,7 +20,7 @@ export RUN_FUNCTIONAL_TESTS=false
 export CI_BUILD_TARGET=test_bitcoin
 # The suites this job must run; ctest_evidence.py fails the job unless each was
 # selected, executed and passed. CTEST_REGEX is derived from the same list.
-export CTEST_EXPECTED_SUITES="bip324_tests net_tests"
+export CTEST_EXPECTED_SUITES="mlkem_tests bip324_tests net_tests"
 export CTEST_REGEX="^(${CTEST_EXPECTED_SUITES// /|})\$"
 # -Wno-psabi silences GCC's AArch64 "parameter passing ... changed" notes.
 export BITCOIN_CONFIG="\

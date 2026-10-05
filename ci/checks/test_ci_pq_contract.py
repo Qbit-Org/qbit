@@ -2,7 +2,7 @@
 # Copyright (c) 2026-present The qbit core developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or https://opensource.org/license/mit/.
-"""Executable contract for the PQ CI entry points (#184 part 2, work item C1).
+"""Executable contract for the PQ CI entry points (#184 part 2, work item C1; part 3, C2).
 
 ``ci-pq.yml`` and ``ci-nightly-heavy.yml`` are reusable and job-selectable, and
 the PQ unit job proves which suites ran. These tests read the real workflow
@@ -64,7 +64,12 @@ SELECT_STEP = "Select jobs"
 REPORT_STEP = "Report unit-test evidence"
 PQ_UNIT_JOB = "unit"
 AARCH64_JOB = "aarch64-unit"
-AARCH64_SUITES = ["bip324_tests", "net_tests"]
+S390X_JOB = "s390x-unit"
+MACOS_JOB = "macos-arm64-unit"
+PQ_MATRIX_JOBS = [AARCH64_JOB, S390X_JOB]
+ALL_PQ_JOBS = {PQ_UNIT_JOB: PQ_MATRIX_JOBS, MACOS_JOB: []}
+PQ_SUITES = ["mlkem_tests", "bip324_tests", "net_tests"]
+AARCH64_SUITES = PQ_SUITES
 NIGHTLY_MATRIX_JOBS = ["arm32-unit-1", "arm32-unit-2", "previous-releases", "fuzz"]
 NIGHTLY_ALL_JOBS: dict[str, list[str]] = {"nightly-matrix": NIGHTLY_MATRIX_JOBS, "scanner-readiness": []}
 NIGHTLY_VARS_OFF = {"CI_NIGHTLY_HEAVY_RUN_TEST_MATRIX": "false", "CI_NIGHTLY_HEAVY_RUN_SCANNERS": "false"}
@@ -74,7 +79,7 @@ CALLER_WORKFLOW = "ci-maintained-heavy.yml"  # main's heavy caller (C4)
 MATRIX_EXPRESSION = "${{ fromJSON(needs." + RESOLVER_JOB + ".outputs.matrix) }}"
 ANNOTATED_TAG = "v9.9.9-annotated"
 AMBIGUOUS_NAME = "dup"
-SUITE_INVENTORY = ["addrman_tests", "bip324_tests", "bip324_tests_extra", "net_tests", "netbase_tests", "util_tests"]
+SUITE_INVENTORY = ["addrman_tests", "bip324_tests", "bip324_tests_extra", "mlkem_tests", "net_tests", "netbase_tests", "util_tests"]
 
 
 # ---------------------------------------------------------------------------
@@ -455,7 +460,10 @@ class PQWorkflowContractTest(unittest.TestCase):
     def test_named_dispatch_runs_only_selected_jobs(self) -> None:
         cases: list[tuple[str, dict[str, Any], dict[str, list[str]]]] = [
             (PQ, {"jobs": AARCH64_JOB}, {PQ_UNIT_JOB: [AARCH64_JOB]}),
-            (PQ, {"jobs": ""}, {PQ_UNIT_JOB: [AARCH64_JOB]}),
+            (PQ, {"jobs": S390X_JOB}, {PQ_UNIT_JOB: [S390X_JOB]}),
+            (PQ, {"jobs": MACOS_JOB}, {MACOS_JOB: []}),
+            (PQ, {"jobs": f" {MACOS_JOB} , {AARCH64_JOB} "}, {PQ_UNIT_JOB: [AARCH64_JOB], MACOS_JOB: []}),
+            (PQ, {"jobs": ""}, ALL_PQ_JOBS),
             (NIGHTLY, {"run_test_matrix": True, "run_scanners": False, "jobs": "previous-releases"},
              {"nightly-matrix": ["previous-releases"]}),
             (NIGHTLY, {"jobs": ""}, {"nightly-matrix": NIGHTLY_MATRIX_JOBS, "scanner-readiness": []}),
@@ -488,7 +496,7 @@ class PQWorkflowContractTest(unittest.TestCase):
         outputs = context["needs"][RESOLVER_JOB]["outputs"]
         self.assertEqual(outputs["resolved_sha"], self.fixture.maintained_sha)
         self.assertNotEqual(outputs["resolved_sha"], context["github"]["sha"])
-        self.assertEqual(running_jobs(self.workflows[PQ], context), {PQ_UNIT_JOB: [AARCH64_JOB]})
+        self.assertEqual(running_jobs(self.workflows[PQ], context), ALL_PQ_JOBS)
 
     # -- called and direct nightly runs ---------------------------------------------
 
@@ -729,7 +737,8 @@ class PQWorkflowContractTest(unittest.TestCase):
 
     def test_rejects_unknown_repeated_and_empty_job_names(self) -> None:
         bad = {
-            PQ: ["aarch64", "AARCH64-UNIT", f"{AARCH64_JOB},{AARCH64_JOB}", f"{AARCH64_JOB},", ",", "s390x-unit"],
+            PQ: ["aarch64", "AARCH64-UNIT", f"{AARCH64_JOB},{AARCH64_JOB}", f"{AARCH64_JOB},", ",", "s390x", "macos-arm64",
+                 f"{MACOS_JOB},{MACOS_JOB}"],
             NIGHTLY: ["previous_releases", "previous-releases,previous-releases", "previous-releases,,fuzz", "unit"],
         }
         for key, values in bad.items():
@@ -784,7 +793,11 @@ class PQWorkflowContractTest(unittest.TestCase):
         workflow = self.workflows[PQ]
         context = self.resolve(PQ, self.dispatch(PQ, source_ref=svc.MAINTAINED_BRANCH, jobs=AARCH64_JOB))
         refs = svc.check_source_wiring(workflow, context)
-        self.assertEqual(refs, {PQ_UNIT_JOB: fixture.maintained_sha})
+        self.assertEqual(refs, {PQ_UNIT_JOB: fixture.maintained_sha, MACOS_JOB: fixture.maintained_sha})
+        # The macOS job shares the unit job's guard, checkout and verification steps.
+        for step_name in (svc.GUARD_STEP, svc.CHECKOUT_STEP, svc.VERIFY_STEP):
+            self.assertEqual(svc.find_step(workflow["jobs"][MACOS_JOB], step_name),
+                             svc.find_step(workflow["jobs"][PQ_UNIT_JOB], step_name), step_name)
 
         mutated = copy.deepcopy(workflow)
         checkout = svc.find_step(mutated["jobs"][PQ_UNIT_JOB], svc.CHECKOUT_STEP)
@@ -812,7 +825,7 @@ class PQWorkflowContractTest(unittest.TestCase):
         workflow = self.workflows[PQ]
         (entry,) = [entry for entry in catalog(workflow) if entry["job"] == AARCH64_JOB]
         self.assertEqual(entry["runs-on"], "ubuntu-24.04-arm")
-        self.assertIn("pre-library", entry["name"])
+        self.assertIn("mlkem_tests", entry["phase"])
         env_file = entry["file-env"]
         self.assertTrue(os.access(REPO_ROOT / env_file, os.X_OK), env_file)
 
@@ -834,7 +847,7 @@ class PQWorkflowContractTest(unittest.TestCase):
         self.assertEqual(effective["CI_IMAGE_NAME_TAG"], "docker.io/library/ubuntu:24.04")
         self.assertEqual(effective["RUN_FUNCTIONAL_TESTS"], "false")
         regex = re.compile(effective["CTEST_REGEX"])
-        self.assertEqual([name for name in SUITE_INVENTORY if regex.search(name)], AARCH64_SUITES)
+        self.assertEqual([name for name in SUITE_INVENTORY if regex.search(name)], sorted(AARCH64_SUITES))
 
         # 02_run_container.py passes only variables exported by some ci/test/00_setup_env*.sh into the container.
         exported = set()
@@ -842,6 +855,126 @@ class PQWorkflowContractTest(unittest.TestCase):
             exported.update(re.findall(r"^\s*export ([A-Z_][A-Z0-9_]*)=", path.read_text(encoding="utf8"), re.M))
         for name in ("CI_BUILD_TARGET", "CTEST_REGEX", "CTEST_EXPECTED_SUITES", "CTEST_INCLUDE_RANGE"):
             self.assertIn(name, exported)
+
+    def test_s390x_job_cross_compiles_and_emulates_only_the_tests(self) -> None:
+        workflow = self.workflows[PQ]
+        (entry,) = [entry for entry in catalog(workflow) if entry["job"] == S390X_JOB]
+        self.assertEqual(entry["runs-on"], "ubuntu-24.04", "built on an x64 runner, not in an emulated container")
+        self.assertEqual(entry["timeout-minutes"], 180)
+        env_file = entry["file-env"]
+        self.assertTrue(os.access(REPO_ROOT / env_file, os.X_OK), env_file)
+
+        context = dict(self.resolve(PQ, self.dispatch(PQ, jobs=S390X_JOB)), matrix=entry)
+        env = svc.job_env(workflow, workflow["jobs"][PQ_UNIT_JOB], context)
+        self.assertEqual(env["FILE_ENV"], env_file)
+        names = ["HOST", "PACKAGES", "DEP_OPTS", "NO_DEPENDS", "CI_IMAGE_PLATFORM", "CI_BUILD_TARGET", "CTEST_REGEX",
+                 "CTEST_EXPECTED_SUITES", "CTEST_INCLUDE_RANGE", "RUN_FUNCTIONAL_TESTS", "BITCOIN_CONFIG"]
+        effective = source_env(env_file, names, {key: env[key] for key in ("CI_IMAGE_REGISTRY_PREFIX", "CI_ENFORCE_INTERNAL_REGISTRY")})
+        self.assertEqual(effective["HOST"], "s390x-linux-gnu")
+        self.assertEqual(effective["NO_DEPENDS"], "", "the depends tree is built for s390x")
+        self.assertEqual(effective["CI_IMAGE_PLATFORM"], "", "only the tests run emulated")
+        self.assertIn("g++-s390x-linux-gnu", effective["PACKAGES"].split())
+        self.assertIn("qemu-user", effective["PACKAGES"].split())
+        self.assertEqual(effective["CI_BUILD_TARGET"], "test_bitcoin")
+        self.assertEqual(effective["CTEST_EXPECTED_SUITES"].split(), PQ_SUITES)
+        self.assertEqual(effective["CTEST_INCLUDE_RANGE"], "")
+        self.assertEqual(effective["RUN_FUNCTIONAL_TESTS"], "false")
+        regex = re.compile(effective["CTEST_REGEX"])
+        self.assertEqual([name for name in SUITE_INVENTORY if regex.search(name)], sorted(PQ_SUITES))
+        # ctest runs each test through the emulator, so test_qbit is never started directly.
+        self.assertIn("-DCMAKE_CROSSCOMPILING_EMULATOR='qemu-s390x;-L;/usr/s390x-linux-gnu'", effective["BITCOIN_CONFIG"])
+
+    def test_macos_job_runs_natively_on_apple_silicon(self) -> None:
+        fixture = self.fixture
+        workflow = self.workflows[PQ]
+        job = workflow["jobs"][MACOS_JOB]
+        self.assertNotIn(MACOS_JOB, [entry["job"] for entry in catalog(workflow)])
+        self.assertEqual(job["runs-on"], "macos-14")
+        context = self.resolve(PQ, self.dispatch(PQ, jobs=MACOS_JOB))
+        env = svc.job_env(workflow, job, context)
+        self.assertEqual(env["DANGER_RUN_CI_ON_HOST"], "1", "no Docker on the macOS host")
+        env_file = env["FILE_ENV"]
+        self.assertTrue(os.access(REPO_ROOT / env_file, os.X_OK), env_file)
+        self.assertEqual(env["MATRIX_NAME"], job["name"])
+        names = ["CI_OS_NAME", "NO_DEPENDS", "CI_BUILD_TARGET", "CTEST_REGEX", "CTEST_EXPECTED_SUITES", "RUN_FUNCTIONAL_TESTS",
+                 "BITCOIN_CONFIG"]
+        effective = source_env(env_file, names)
+        # Losing the native AArch64 backend must fail the configure step, not fall back quietly.
+        self.assertIn("-DWITH_MLKEM_NATIVE=ON", effective["BITCOIN_CONFIG"].split())
+        self.assertEqual(effective["CI_OS_NAME"], "macos")
+        self.assertEqual(effective["NO_DEPENDS"], "1")
+        self.assertEqual(effective["CI_BUILD_TARGET"], "test_bitcoin")
+        self.assertEqual(effective["CTEST_EXPECTED_SUITES"].split(), PQ_SUITES)
+        self.assertEqual(effective["RUN_FUNCTIONAL_TESTS"], "false")
+        regex = re.compile(effective["CTEST_REGEX"])
+        self.assertEqual([name for name in SUITE_INVENTORY if regex.search(name)], sorted(PQ_SUITES))
+
+        # The report step reads the evidence from BASE_BUILD_DIR, which a step
+        # sets from RUNNER_TEMP: the runner context is unavailable in job env.
+        self.assertNotIn("BASE_BUILD_DIR", job["env"])
+        set_dir = svc.find_step(job, "Set build directory")
+        self.assertLess(svc.step_index(job, "Set build directory"), svc.step_index(job, "CI script"))
+        with tempfile.TemporaryDirectory(dir=fixture.root) as tmp:
+            github_env_file = Path(tmp) / "github-env"
+            github_env_file.touch()
+            step_env = svc.step_env(workflow, job, set_dir, context)
+            step_env.update({"RUNNER_TEMP": "/runner/temp", "GITHUB_ENV": str(github_env_file)})
+            result = svc.run_step(fixture, set_dir, step_env, fixture.root, svc.github_env_for(context, MACOS_JOB, workflow["name"]))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(github_env_file.read_text(encoding="utf8"), "BASE_BUILD_DIR=/runner/temp/build\n")
+
+        # The architecture check refuses anything but arm64.
+        step = svc.find_step(job, "Require Apple Silicon")
+        self.assertLess(svc.step_index(job, "Require Apple Silicon"), svc.step_index(job, "CI script"))
+        with tempfile.TemporaryDirectory(dir=fixture.root) as tmp:
+            stubs = Path(tmp)
+            (stubs / "uname").write_text('#!/bin/sh\necho "$STUB_MACHINE"\n', encoding="utf8")
+            (stubs / "uname").chmod(0o755)
+            for machine, ok in (("arm64", True), ("x86_64", False)):
+                with self.subTest(machine=machine):
+                    step_env = svc.step_env(workflow, job, step, context)
+                    step_env.update({"PATH": f"{stubs}:{os.environ['PATH']}", "STUB_MACHINE": machine})
+                    result = svc.run_step(fixture, step, step_env, fixture.root, svc.github_env_for(context, MACOS_JOB, workflow["name"]))
+                    self.assertEqual(result.returncode == 0, ok, result.stderr)
+                    if not ok:
+                        self.assertIn("must run on arm64", result.stderr)
+
+        # Evidence is reported exactly as for the matrix jobs.
+        report = svc.find_step(job, REPORT_STEP)
+        self.assertEqual(report.get("if"), "${{ always() }}")
+        self.assertEqual(report["run"], svc.find_step(workflow["jobs"][PQ_UNIT_JOB], REPORT_STEP)["run"])
+        with tempfile.TemporaryDirectory(dir=fixture.root) as tmp:
+            build = Path(tmp)
+            (build / "ctest-evidence").mkdir()
+            (build / "ctest-evidence" / "summary.md").write_text("| mlkem_tests | passed | 0.5 |\n", encoding="utf8")
+            step_env = svc.step_env(workflow, job, report, context)
+            step_env["BASE_BUILD_DIR"] = str(build)
+            result = svc.run_step(fixture, report, step_env, fixture.root, svc.github_env_for(context, MACOS_JOB, workflow["name"]))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("## macOS arm64 unit tests", result.summary)
+            self.assertIn("native AArch64", result.summary)
+            self.assertIn("| mlkem_tests | passed | 0.5 |", result.summary)
+
+    def test_contexts_are_available_where_used(self) -> None:
+        """Mirror actionlint's context-availability rule for the places these workflows use expressions.
+
+        GitHub refuses to load a workflow that reads, say, runner in a job's env,
+        while this file's expression evaluator would render it as empty.
+        """
+        expression = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+        root = re.compile(r"(?<![\w.'\"-])([a-z_]+)(?=\.|\[)")
+        job_env_contexts = {"github", "needs", "strategy", "matrix", "vars", "secrets", "inputs"}
+        for key, workflow in self.workflows.items():
+            for job_id, job in workflow["jobs"].items():
+                with self.subTest(workflow=key, job=job_id):
+                    for name, value in (job.get("env") or {}).items():
+                        for expr in expression.findall(str(value)):
+                            self.assertLessEqual(set(root.findall(expr)), job_env_contexts,
+                                                 f"{job_id} env {name}: {value!r} uses a context unavailable in job env")
+                    # A step shared by YAML anchor must not read matrix in a job that has none.
+                    if "matrix" not in (job.get("strategy") or {}):
+                        uses_matrix = "matrix." in json.dumps(job.get("steps", []))
+                        self.assertFalse(uses_matrix, f"{job_id} has no matrix, but one of its steps reads matrix")
 
     def test_build_target_reaches_both_build_commands(self) -> None:
         block = shell_block(TEST_SCRIPT.read_text(encoding="utf8"), "CI_BUILD_TARGET=${CI_BUILD_TARGET:-all}", ")")
@@ -858,7 +991,7 @@ class PQWorkflowContractTest(unittest.TestCase):
 
     def test_ctest_selection_reaches_listing_run_and_evidence(self) -> None:
         block = shell_block(TEST_SCRIPT.read_text(encoding="utf8"), 'if [ "$RUN_UNIT_TESTS" = "true" ]; then', "fi")
-        regex = "^(bip324_tests|net_tests)$"
+        regex = "^(mlkem_tests|bip324_tests|net_tests)$"
         expected = " ".join(AARCH64_SUITES)
 
         run = run_test_script_block(block, {"CTEST_REGEX": regex, "CTEST_EXPECTED_SUITES": expected})
@@ -880,12 +1013,12 @@ class PQWorkflowContractTest(unittest.TestCase):
         failures = {
             "skipped suite": ({"CTEST_REGEX": regex, "CTEST_EXPECTED_SUITES": expected,
                                "STUB_OUTCOMES": json.dumps({"bip324_tests": "notrun"})}, "bip324_tests: skipped"),
-            "regex selects too little": ({"CTEST_REGEX": "^(net_tests)$", "CTEST_EXPECTED_SUITES": expected},
+            "regex selects too little": ({"CTEST_REGEX": "^(mlkem_tests|net_tests)$", "CTEST_EXPECTED_SUITES": expected},
                                          "did not select expected suite(s): bip324_tests"),
-            "regex selects too much": ({"CTEST_REGEX": "^bip324_tests|^net_tests$", "CTEST_EXPECTED_SUITES": expected},
+            "regex selects too much": ({"CTEST_REGEX": "^mlkem_tests$|^bip324_tests|^net_tests$", "CTEST_EXPECTED_SUITES": expected},
                                        "not expected: bip324_tests_extra"),
-            "suite missing from the build": ({"CTEST_REGEX": "^(bip324_tests|net_tests|mlkem_tests)$",
-                                              "CTEST_EXPECTED_SUITES": expected + " mlkem_tests"}, "mlkem_tests"),
+            "suite missing from the build": ({"CTEST_REGEX": "^(mlkem_tests|bip324_tests|net_tests|pq_records_tests)$",
+                                              "CTEST_EXPECTED_SUITES": expected + " pq_records_tests"}, "pq_records_tests"),
             "range and regex together": ({"CTEST_REGEX": regex, "CTEST_INCLUDE_RANGE": "1,2"}, "set only one"),
             "nothing selected": ({"CTEST_REGEX": "^nothing$"}, "No tests were found"),
         }
@@ -929,7 +1062,7 @@ class PQWorkflowContractTest(unittest.TestCase):
             report = svc.run_step(fixture, step, env, fixture.root, github_env)
             self.assertEqual(report.returncode, 0, report.stderr)
             self.assertIn(f"- source: {fixture.manual_sha} (refs/heads/{fixture.manual_branch})", report.summary)
-            self.assertIn("Pre-library phase", report.summary)
+            self.assertIn("mlkem_tests, bip324_tests and net_tests on AArch64", report.summary)
             self.assertIn("| bip324_tests | passed | 0.5 |", report.summary)
 
     def test_required_gate_runs_the_contracts(self) -> None:
