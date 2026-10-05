@@ -729,7 +729,7 @@ V1Transport::V1Transport(const NodeId node_id) noexcept
 
 Transport::Info V1Transport::GetInfo() const noexcept
 {
-    return {.transport_type = TransportProtocolType::V1, .session_id = {}};
+    return {.transport_type = TransportProtocolType::V1, .session_id = {}, .transport_pq = false, .transport_pq_status = PQStatus::V1};
 }
 
 int V1Transport::readHeader(std::span<const uint8_t> msg_bytes)
@@ -1000,10 +1000,13 @@ void V2Transport::StartSendingHandshake() noexcept
     // We cannot wipe m_send_garbage as it will still be used as AAD later in the handshake.
 }
 
-V2Transport::V2Transport(NodeId nodeid, bool initiating, const CKey& key, std::span<const std::byte> ent32, std::vector<uint8_t> garbage) noexcept
+V2Transport::V2Transport(NodeId nodeid, bool initiating, const CKey& key, std::span<const std::byte> ent32,
+                         std::vector<uint8_t> garbage, V2PQOptions pq, PQRandomSource random, const PQKemOps& ops) noexcept
     : m_cipher{key, ent32}, m_initiating{initiating}, m_nodeid{nodeid},
       m_v1_fallback{nodeid},
+      m_pq_options{EffectivePQOptions(initiating, pq)},
       m_recv_state{initiating ? RecvState::KEY : RecvState::KEY_MAYBE_V1},
+      m_pq{initiating, m_pq_options.mode, random, ops},
       m_send_garbage{std::move(garbage)},
       m_send_state{initiating ? SendState::AWAITING_KEY : SendState::MAYBE_V1}
 {
@@ -1015,9 +1018,20 @@ V2Transport::V2Transport(NodeId nodeid, bool initiating, const CKey& key, std::s
     }
 }
 
-V2Transport::V2Transport(NodeId nodeid, bool initiating) noexcept
+V2PQOptions V2Transport::EffectivePQOptions(bool initiating, V2PQOptions pq) noexcept
+{
+    // Inbound connections never fall back (#184): a responder in fallback mode is a caller bug.
+    if (!Assume(initiating || pq.mode != PQMode::FALLBACK)) pq.mode = PQMode::OFF;
+    return pq;
+}
+
+V2Transport::V2Transport(NodeId nodeid, bool initiating, const CKey& key, std::span<const std::byte> ent32, std::vector<uint8_t> garbage) noexcept
+    : V2Transport{nodeid, initiating, key, ent32, std::move(garbage), V2PQOptions{}, DefaultPQRandomSource(), DefaultPQKemOps()} {}
+
+V2Transport::V2Transport(NodeId nodeid, bool initiating, V2PQOptions pq) noexcept
     : V2Transport{nodeid, initiating, GenerateRandomKey(),
-                  MakeByteSpan(GetRandHash()), GenerateRandomGarbage()} {}
+                  MakeByteSpan(GetRandHash()), GenerateRandomGarbage(),
+                  pq, DefaultPQRandomSource(), DefaultPQKemOps()} {}
 
 void V2Transport::SetReceiveState(RecvState recv_state) noexcept
 {
@@ -1034,6 +1048,9 @@ void V2Transport::SetReceiveState(RecvState recv_state) noexcept
         Assume(recv_state == RecvState::VERSION);
         break;
     case RecvState::VERSION:
+        Assume(recv_state == RecvState::APP || recv_state == RecvState::CONFIRM);
+        break;
+    case RecvState::CONFIRM:
         Assume(recv_state == RecvState::APP);
         break;
     case RecvState::APP:
@@ -1059,6 +1076,9 @@ void V2Transport::SetSendState(SendState send_state) noexcept
         Assume(send_state == SendState::V1 || send_state == SendState::AWAITING_KEY);
         break;
     case SendState::AWAITING_KEY:
+        Assume(send_state == SendState::READY || send_state == SendState::AWAITING_VERSION);
+        break;
+    case SendState::AWAITING_VERSION:
         Assume(send_state == SendState::READY);
         break;
     case SendState::READY:
@@ -1144,17 +1164,16 @@ bool V2Transport::ProcessReceivedKeyBytes() noexcept
         // Other side's key has been fully received, and can now be Diffie-Hellman combined with
         // our key to initialize the encryption ciphers.
 
-        // Initialize the ciphers.
+        // Initialize the ciphers. The hybrid negotiation needs the ECDH secret and the transcript
+        // until the switch decision.
         EllSwiftPubKey ellswift(MakeByteSpan(m_recv_buffer));
+        const bool negotiate{m_pq_options.mode == PQMode::NEGOTIATE};
         LOCK(m_send_mutex);
-        m_cipher.Initialize(ellswift, m_initiating);
+        m_cipher.Initialize(ellswift, m_initiating, /*self_decrypt=*/false, /*retain_for_hybrid=*/negotiate);
 
         // Switch receiver state to GARB_GARBTERM.
         SetReceiveState(RecvState::GARB_GARBTERM);
         m_recv_buffer.clear();
-
-        // Switch sender state to READY.
-        SetSendState(SendState::READY);
 
         // Append the garbage terminator to the send buffer.
         m_send_buffer.resize(m_send_buffer.size() + BIP324Cipher::GARBAGE_TERMINATOR_LEN);
@@ -1162,15 +1181,32 @@ bool V2Transport::ProcessReceivedKeyBytes() noexcept
                   m_cipher.GetSendGarbageTerminator().end(),
                   MakeWritableByteSpan(m_send_buffer).last(BIP324Cipher::GARBAGE_TERMINATOR_LEN).begin());
 
-        // Construct version packet in the send buffer, with the sent garbage data as AAD.
-        m_send_buffer.resize(m_send_buffer.size() + BIP324Cipher::EXPANSION + VERSION_CONTENTS.size());
-        m_cipher.Encrypt(
-            /*contents=*/VERSION_CONTENTS,
-            /*aad=*/MakeByteSpan(m_send_garbage),
-            /*ignore=*/false,
-            /*output=*/MakeWritableByteSpan(m_send_buffer).last(BIP324Cipher::EXPANSION + VERSION_CONTENTS.size()));
-        // We no longer need the garbage.
-        ClearShrink(m_send_garbage);
+        if (!negotiate) {
+            // Switch sender state to READY, and send an empty version packet.
+            SetSendState(SendState::READY);
+            AppendVersionPacket(VERSION_CONTENTS);
+        } else if (m_initiating) {
+            // Hold the version packet until the responder's arrives: it answers their offer.
+            SetSendState(SendState::AWAITING_VERSION);
+        } else {
+            // Offer an encapsulation key in the version packet, and send nothing else until the
+            // initiator's version packet is processed. The key is generated only now that the
+            // initiator's whole public key has arrived.
+            PQHandshake::Record offer;
+            if (m_pq.MakeOffer(offer) == mlkem::Error::NONE) {
+                // Unreachable failure: the transcript was just started.
+                if (!Assume(m_cipher.AddVersionContents(offer))) return FailCipherState();
+                SetSendState(SendState::AWAITING_VERSION);
+                AppendVersionPacket(offer);
+                m_pq.SetOfferSent();
+            } else {
+                // A local fault: continue without the hybrid negotiation, as plain v2.
+                LogDebug(BCLog::NET, "V2 transport: no hybrid offer after an internal error (keygen), peer=%d\n", m_nodeid);
+                ClearHybridSecrets();
+                SetSendState(SendState::READY);
+                AppendVersionPacket(VERSION_CONTENTS);
+            }
+        }
     } else {
         // We still have to receive more key bytes.
     }
@@ -1207,7 +1243,8 @@ bool V2Transport::ProcessReceivedGarbageBytes() noexcept
 bool V2Transport::ProcessReceivedPacketBytes() noexcept
 {
     AssertLockHeld(m_recv_mutex);
-    Assume(m_recv_state == RecvState::VERSION || m_recv_state == RecvState::APP);
+    AssertLockNotHeld(m_send_mutex);
+    Assume(m_recv_state == RecvState::VERSION || m_recv_state == RecvState::CONFIRM || m_recv_state == RecvState::APP);
 
     // The maximum permitted contents length for a packet, consisting of:
     // - 0x00 byte: indicating long message type encoding
@@ -1220,11 +1257,20 @@ bool V2Transport::ProcessReceivedPacketBytes() noexcept
     if (m_recv_buffer.size() == BIP324Cipher::LENGTH_LEN) {
         // Length descriptor received.
         m_recv_len = m_cipher.DecryptLength(MakeByteSpan(m_recv_buffer));
+        if (m_recv_state == RecvState::CONFIRM && m_recv_len != 0) {
+            // The key confirmation is empty. With mismatched keys the length decrypts to a random
+            // value: fail now instead of waiting for bytes that may never come.
+            m_pq.SetFailure(PQFailure::CONFIRM_LENGTH);
+            LogDebug(BCLog::NET, "V2 transport error: key confirmation failed (length), peer=%d\n", m_nodeid);
+            return false;
+        }
         if (m_recv_len > MAX_CONTENTS_LEN) {
             LogDebug(BCLog::NET, "V2 transport error: packet too large (%u bytes), peer=%d\n", m_recv_len, m_nodeid);
             return false;
         }
     } else if (m_recv_buffer.size() > BIP324Cipher::LENGTH_LEN && m_recv_buffer.size() == m_recv_len + BIP324Cipher::EXPANSION) {
+        // The key confirmation is handled before, and never as, an ordinary decoy.
+        if (m_recv_state == RecvState::CONFIRM) return ProcessConfirmation();
         // Ciphertext received, decrypt it into m_recv_decode_buffer.
         // Note that it is impossible to reach this branch without hitting the branch above first,
         // as GetMaxBytesToProcess only allows up to LENGTH_LEN into the buffer before that point.
@@ -1248,11 +1294,14 @@ bool V2Transport::ProcessReceivedPacketBytes() noexcept
         // decoy, which we simply ignore, use the current state to decide what to do with it.
         if (!ignore) {
             switch (m_recv_state) {
-            case RecvState::VERSION:
-                // Version message received; transition to application phase. The contents is
-                // ignored, but can be used for future extensions.
-                SetReceiveState(RecvState::APP);
+            case RecvState::VERSION: {
+                // Version message received; act on its contents (or ignore them), and transition
+                // to the key confirmation or the application phase. The send lock makes a switch
+                // of all ciphers atomic.
+                LOCK(m_send_mutex);
+                if (!ProcessVersionContents(MakeByteSpan(m_recv_decode_buffer))) return false;
                 break;
+            }
             case RecvState::APP:
                 // Application message decrypted correctly. It can be extracted using GetMessage().
                 SetReceiveState(RecvState::APP_READY);
@@ -1271,6 +1320,165 @@ bool V2Transport::ProcessReceivedPacketBytes() noexcept
         // than 3 bytes but less than the packet's full ciphertext. Wait until those arrive.
     }
     return true;
+}
+
+bool V2Transport::ProcessConfirmation() noexcept
+{
+    AssertLockHeld(m_recv_mutex);
+    Assume(m_recv_state == RecvState::CONFIRM);
+    Assume(m_recv_len == 0 && m_recv_buffer.size() == PQ_CONFIRMATION_BYTES);
+    // The peer's first packet under the hybrid keys: an empty decoy, with empty AAD.
+    bool ignore{false};
+    if (!m_cipher.Decrypt(
+            /*input=*/MakeByteSpan(m_recv_buffer).subspan(BIP324Cipher::LENGTH_LEN),
+            /*aad=*/{},
+            /*ignore=*/ignore,
+            /*contents=*/{})) {
+        m_pq.SetFailure(PQFailure::CONFIRM_TAG);
+        LogDebug(BCLog::NET, "V2 transport error: key confirmation failed (tag), peer=%d\n", m_nodeid);
+        return false;
+    }
+    if (!ignore) {
+        m_pq.SetFailure(PQFailure::CONFIRM_NOT_DECOY);
+        LogDebug(BCLog::NET, "V2 transport error: key confirmation failed (not_decoy), peer=%d\n", m_nodeid);
+        return false;
+    }
+    // Feed the last 4 bytes of the Poly1305 authentication tag (and its timing) into our RNG.
+    RandAddEvent(ReadLE32(m_recv_buffer.data() + m_recv_buffer.size() - 4));
+    m_pq.SetConfirmed();
+    ClearShrink(m_recv_buffer);
+    SetReceiveState(RecvState::APP);
+    return true;
+}
+
+bool V2Transport::ProcessVersionContents(std::span<const std::byte> contents) noexcept
+{
+    AssertLockHeld(m_recv_mutex);
+    AssertLockHeld(m_send_mutex);
+    Assume(m_recv_state == RecvState::VERSION);
+    m_pq.SetVersionReceived();
+
+    // Without the negotiation (switch off, fallback, or a responder that could not offer), the
+    // contents are neither parsed nor validated.
+    if (m_send_state != SendState::AWAITING_VERSION) {
+        SetReceiveState(RecvState::APP);
+        return true;
+    }
+    Assume(m_pq_options.mode == PQMode::NEGOTIATE);
+
+    // A legacy peer: empty contents, no own record, or contents that do not parse. Keep the ECDH
+    // keys; an initiator now sends its empty version packet.
+    const auto parsed{PQHandshake::ParseContents(contents)};
+    if (parsed.kind != PQHandshake::ParseKind::OWN_RECORD) {
+        ClearHybridSecrets();
+        SetSendState(SendState::READY);
+        if (m_initiating) AppendVersionPacket(VERSION_CONTENTS);
+        SetReceiveState(RecvState::APP);
+        return true;
+    }
+
+    // The first own record is the responder's offer or the initiator's accept, and has one length.
+    const auto payload{m_pq.CheckRecordLength(parsed.payload)};
+    if (!payload) {
+        if (m_pq.GetSnapshot().failure == PQFailure::CIPHER_STATE_INTERNAL) return FailCipherState();
+        LogDebug(BCLog::NET, "V2 transport error: malformed hybrid record (%s), peer=%d\n",
+                 m_initiating ? "ek_length" : "ct_length", m_nodeid);
+        ClearHybridSecrets();
+        return false;
+    }
+
+    // Both contents go into the transcript, the responder's first. The unreachable cipher state
+    // failures close, whatever was committed.
+    if (!Assume(m_cipher.AddVersionContents(contents))) return FailCipherState();
+    mlkem::SharedSecret ss;
+    if (m_initiating) {
+        PQHandshake::Record accept;
+        const mlkem::Error result{m_pq.AcceptOffer(*payload, accept, ss)};
+        if (result == mlkem::Error::INVALID_PUBLIC_KEY) {
+            LogDebug(BCLog::NET, "V2 transport error: malformed hybrid record (ek_modulus), peer=%d\n", m_nodeid);
+            ClearHybridSecrets();
+            return false;
+        }
+        if (result != mlkem::Error::NONE) {
+            // A local fault before we committed to anything (AcceptOffer recorded which):
+            // continue as if the switch were off.
+            LogDebug(BCLog::NET, "V2 transport: no hybrid accept after an internal error, peer=%d\n", m_nodeid);
+            ClearHybridSecrets();
+            SetSendState(SendState::READY);
+            AppendVersionPacket(VERSION_CONTENTS);
+            SetReceiveState(RecvState::APP);
+            return true;
+        }
+        if (!Assume(m_cipher.AddVersionContents(accept))) return FailCipherState();
+        if (m_pq_options.corrupt_shared_secret) ss.Bytes()[0] ^= 0xff;
+        // The accept travels under the ECDH keys, then both directions switch.
+        SetSendState(SendState::READY);
+        AppendVersionPacket(accept);
+    } else {
+        // The initiator has committed to the hybrid keys, so every failure from here closes.
+        if (m_pq.DecapsulateAccept(*payload, ss) != mlkem::Error::NONE) {
+            LogDebug(BCLog::NET, "V2 transport error: hybrid key exchange failed (decaps), peer=%d\n", m_nodeid);
+            ClearHybridSecrets();
+            return false;
+        }
+        if (m_pq_options.corrupt_shared_secret) ss.Bytes()[0] ^= 0xff;
+        SetSendState(SendState::READY);
+    }
+
+    // Unreachable failure: both contents are in the transcript.
+    if (!Assume(m_cipher.SwitchToHybrid(std::as_bytes(ss.Bytes())))) return FailCipherState();
+    m_pq.SetSwitched();
+    // Our first packet under the hybrid keys is the key confirmation, and theirs must be too.
+    AppendConfirmationPacket();
+    SetReceiveState(RecvState::CONFIRM);
+    return true;
+}
+
+void V2Transport::AppendVersionPacket(std::span<const std::byte> contents) noexcept
+{
+    AssertLockHeld(m_recv_mutex);
+    AssertLockHeld(m_send_mutex);
+    // Construct version packet in the send buffer, after any unsent bytes, with the sent garbage
+    // data as AAD.
+    m_send_buffer.resize(m_send_buffer.size() + BIP324Cipher::EXPANSION + contents.size());
+    m_cipher.Encrypt(
+        /*contents=*/contents,
+        /*aad=*/MakeByteSpan(m_send_garbage),
+        /*ignore=*/false,
+        /*output=*/MakeWritableByteSpan(m_send_buffer).last(BIP324Cipher::EXPANSION + contents.size()));
+    // We no longer need the garbage.
+    ClearShrink(m_send_garbage);
+}
+
+void V2Transport::AppendConfirmationPacket() noexcept
+{
+    AssertLockHeld(m_recv_mutex);
+    AssertLockHeld(m_send_mutex);
+    static_assert(BIP324Cipher::EXPANSION == PQ_CONFIRMATION_BYTES);
+    m_send_buffer.resize(m_send_buffer.size() + PQ_CONFIRMATION_BYTES);
+    m_cipher.Encrypt(
+        /*contents=*/{},
+        /*aad=*/{},
+        /*ignore=*/true,
+        /*output=*/MakeWritableByteSpan(m_send_buffer).last(PQ_CONFIRMATION_BYTES));
+}
+
+void V2Transport::ClearHybridSecrets() noexcept
+{
+    AssertLockHeld(m_recv_mutex);
+    AssertLockHeld(m_send_mutex);
+    m_pq.ClearSecrets();
+    m_cipher.DiscardHybridSecret();
+}
+
+bool V2Transport::FailCipherState() noexcept
+{
+    AssertLockHeld(m_recv_mutex);
+    AssertLockHeld(m_send_mutex);
+    m_pq.SetFailure(PQFailure::CIPHER_STATE_INTERNAL);
+    LogDebug(BCLog::NET, "V2 transport error: hybrid key exchange failed (cipher_state), peer=%d\n", m_nodeid);
+    ClearHybridSecrets();
+    return false;
 }
 
 size_t V2Transport::GetMaxBytesToProcess() noexcept
@@ -1297,8 +1505,9 @@ size_t V2Transport::GetMaxBytesToProcess() noexcept
         // Process garbage bytes one by one (because terminator may appear anywhere).
         return 1;
     case RecvState::VERSION:
+    case RecvState::CONFIRM:
     case RecvState::APP:
-        // These three states all involve decoding a packet. Process the length descriptor first,
+        // These states all involve decoding a packet. Process the length descriptor first,
         // so that we know where the current packet ends (and we don't process bytes from the next
         // packet or decoy yet). Then, process the ciphertext bytes of the current packet.
         if (m_recv_buffer.size() < BIP324Cipher::LENGTH_LEN) {
@@ -1350,6 +1559,7 @@ bool V2Transport::ReceivedBytes(std::span<const uint8_t>& msg_bytes) noexcept
                 m_recv_buffer.reserve(MAX_GARBAGE_LEN + BIP324Cipher::GARBAGE_TERMINATOR_LEN);
                 break;
             case RecvState::VERSION:
+            case RecvState::CONFIRM:
             case RecvState::APP: {
                 // During states where a packet is being received, as much as is expected but never
                 // more than MAX_RESERVE_AHEAD bytes in addition to what is received so far.
@@ -1389,12 +1599,25 @@ bool V2Transport::ReceivedBytes(std::span<const uint8_t>& msg_bytes) noexcept
             break;
 
         case RecvState::GARB_GARBTERM:
-            if (!ProcessReceivedGarbageBytes()) return false;
+            if (!ProcessReceivedGarbageBytes()) {
+                if (m_pq_options.mode == PQMode::NEGOTIATE) {
+                    LOCK(m_send_mutex);
+                    ClearHybridSecrets();
+                }
+                return false;
+            }
             break;
 
         case RecvState::VERSION:
+        case RecvState::CONFIRM:
         case RecvState::APP:
-            if (!ProcessReceivedPacketBytes()) return false;
+            if (!ProcessReceivedPacketBytes()) {
+                if (m_pq_options.mode == PQMode::NEGOTIATE) {
+                    LOCK(m_send_mutex);
+                    ClearHybridSecrets();
+                }
+                return false;
+            }
             break;
 
         case RecvState::APP_READY:
@@ -1587,16 +1810,78 @@ Transport::Info V2Transport::GetInfo() const noexcept
     Transport::Info info;
 
     // Do not report v2 and session ID until the version packet has been received
-    // and verified (confirming that the other side very likely has the same keys as us).
+    // and verified (confirming that the other side very likely has the same keys as us), and after
+    // a switch to hybrid keys, until the peer's key confirmation has verified.
     if (m_recv_state != RecvState::KEY_MAYBE_V1 && m_recv_state != RecvState::KEY &&
-        m_recv_state != RecvState::GARB_GARBTERM && m_recv_state != RecvState::VERSION) {
+        m_recv_state != RecvState::GARB_GARBTERM && m_recv_state != RecvState::VERSION &&
+        m_recv_state != RecvState::CONFIRM) {
         info.transport_type = TransportProtocolType::V2;
         info.session_id = uint256(MakeUCharSpan(m_cipher.GetSessionID()));
     } else {
         info.transport_type = TransportProtocolType::DETECTING;
     }
+    info.transport_pq = m_pq.GetSnapshot().confirmed;
+    info.transport_pq_status = GetPQStatus();
 
     return info;
+}
+
+PQStatus V2Transport::GetPQStatus() const noexcept
+{
+    AssertLockHeld(m_recv_mutex);
+    switch (m_pq_options.mode) {
+    case PQMode::OFF: return PQStatus::OFF;
+    case PQMode::FALLBACK: return PQStatus::FALLBACK;
+    case PQMode::NEGOTIATE: break;
+    }
+    const PQHandshake::Snapshot snapshot{m_pq.GetSnapshot()};
+    if (snapshot.confirmed) return PQStatus::HYBRID;
+    switch (snapshot.failure) {
+    case PQFailure::NONE:
+        // The peer's version packet had no usable offer or accept: the ECDH keys stay.
+        if (snapshot.version_received && !snapshot.switched) return PQStatus::LEGACY_PEER;
+        return PQStatus::PENDING;
+    case PQFailure::KEYGEN_INTERNAL:
+    case PQFailure::CHECK_EK_INTERNAL:
+    case PQFailure::ENCAPS_INTERNAL:
+        // A local fault before anything was committed: the connection continues as plain v2.
+        return PQStatus::OFF;
+    case PQFailure::EK_LENGTH:
+    case PQFailure::EK_MODULUS:
+    case PQFailure::CT_LENGTH:
+    case PQFailure::CONFIRM_LENGTH:
+    case PQFailure::CONFIRM_TAG:
+    case PQFailure::CONFIRM_NOT_DECOY:
+    case PQFailure::DECAPS_INTERNAL:
+    case PQFailure::CIPHER_STATE_INTERNAL:
+        // The connection closes. There is no failed status, so it reports pending until it is
+        // removed, local faults included.
+        return PQStatus::PENDING;
+    }
+    Assume(false);
+    return PQStatus::PENDING;
+}
+
+PQHandshake::Snapshot V2Transport::GetPQSnapshot() const noexcept
+{
+    AssertLockNotHeld(m_recv_mutex);
+    LOCK(m_recv_mutex);
+    return m_pq.GetSnapshot();
+}
+
+bool V2Transport::HoldsHybridSecretsForTesting() const noexcept
+{
+    AssertLockNotHeld(m_recv_mutex);
+    LOCK(m_recv_mutex);
+    return m_pq.HasDecapsulationKey() || m_cipher.HoldsHybridSecret();
+}
+
+void V2Transport::DiscardHybridSecretForTesting() noexcept
+{
+    AssertLockNotHeld(m_recv_mutex);
+    AssertLockNotHeld(m_send_mutex);
+    LOCK2(m_recv_mutex, m_send_mutex);
+    m_cipher.DiscardHybridSecret();
 }
 
 std::pair<size_t, bool> CConnman::SocketSendData(CNode& node) const

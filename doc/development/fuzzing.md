@@ -42,7 +42,8 @@ $ ctest --test-dir build_fuzz -R '^required_fuzz_targets$' --output-on-failure
 
 `qa-assets` has no inputs for `asert_chain_transition`, `asert_edge_cases`,
 `asert_math`, `auxpow`, `mlkem`, `mlkem_backend_diff`, `p2mr_script`, `pq_records`
-or `pqc`.
+or `pqc`, and its inputs for `p2p_transport_bidirectional_v2` and
+`p2p_transport_bidirectional_v1v2` predate the hybrid v2 negotiation.
 Generated seeds for these
 targets, their manifest and the input format are described in
 [`test/fuzz/qbit_corpora/README.md`](../../test/fuzz/qbit_corpora/README.md).
@@ -53,7 +54,7 @@ $ test/fuzz/qbit_corpora/overlay.py qa-assets/fuzz_corpora
 $ build_fuzz/test/fuzz/test_runner.py --require_qbit_corpus qa-assets/fuzz_corpora
 ```
 
-`--require_qbit_corpus` fails if any of the nine targets is not compiled or not
+`--require_qbit_corpus` fails if any of the eleven targets is not compiled or not
 selected (including through `--exclude`), has no regular input files, or is not
 reported as replayed by the fuzz executable. The runner prints the number of
 input files present and replayed for each target.
@@ -69,7 +70,7 @@ replay with a mutation phase of that many seconds per target. The phase starts
 from the corpus, writes new inputs to a temporary directory and leaves the
 corpus unchanged. It fails on non-libFuzzer builds. The nightly native fuzz job
 sets `QBIT_FUZZ_MUTATE_MIN_TIME`, which makes `ci/test/03_test_script.sh` run
-this phase for the nine targets after the normal replay.
+this phase for the eleven targets after the normal replay.
 
 The budget is libFuzzer's `-max_total_time`, which counts time spent loading
 the seed corpus (libFuzzer's `INITED` line) as well as mutation. A run can end

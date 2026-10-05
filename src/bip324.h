@@ -100,6 +100,9 @@ public:
     /** Wipe the retained ECDH secret and reset the transcript; the current ciphers stay in use. */
     void DiscardHybridSecret() noexcept;
 
+    /** Whether the retained ECDH secret or the transcript is still held. */
+    bool HoldsHybridSecret() const noexcept { return m_retained_ecdh.has_value() || m_hybrid_transcript.has_value(); }
+
     /** Determine whether this cipher is fully initialized. */
     explicit operator bool() const noexcept { return m_send_l_cipher.has_value(); }
 

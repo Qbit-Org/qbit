@@ -32,6 +32,8 @@ REQUIRED_TARGETS = (
     "mlkem",
     "mlkem_backend_diff",
     "p2mr_script",
+    "p2p_transport_bidirectional_v1v2",
+    "p2p_transport_bidirectional_v2",
     "pq_records",
     "pqc",
 )

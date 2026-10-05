@@ -415,6 +415,129 @@
         "semantics": "Tagged generation selector 0x0F followed by the legacy-checksigpqc-default-valid layout."
       }
     ],
+    "p2p_transport_bidirectional_v1v2": [
+      {
+        "file": "v1-version-to-negotiating-responder",
+        "format": "fdp",
+        "size": 119,
+        "sha256": "35e6f63d5ac205b1e4d48389eeea77e0d1e55d798fb7a156233754548fca1a19",
+        "semantics": "A v1 initiator's version message reaches a responder with the negotiation on: v1 detected, no key generated."
+      },
+      {
+        "file": "v1-version-to-off-responder",
+        "format": "fdp",
+        "size": 183,
+        "sha256": "19e798b8d20825d67726f8067d7283dddb834821e7ae0e7fd4940f790ac43ad2",
+        "semantics": "A v1 initiator's version message reaches a responder with the negotiation off: v1 detected."
+      },
+      {
+        "file": "v1-version-to-negotiating-responder-max-garbage",
+        "format": "fdp",
+        "size": 119,
+        "sha256": "69c2c84bdbe6b60ec78bab5775ce5e65ff6eab9529aee686530b93625438bbc7",
+        "semantics": "A v1 initiator's version message reaches a negotiating responder configured with 4,095 bytes of garbage, which it never sends: v1 detected."
+      },
+      {
+        "file": "v1-silent-negotiating-responder",
+        "format": "fdp",
+        "size": 114,
+        "sha256": "28ff6ed50c2b9700aaee84e470ec094fc48d2698e55cc4282cda42dd9d12530c",
+        "semantics": "A v1 initiator that sends nothing: the negotiating responder stays undecided and sends nothing."
+      }
+    ],
+    "p2p_transport_bidirectional_v2": [
+      {
+        "file": "negotiate-both",
+        "format": "fdp",
+        "size": 214,
+        "sha256": "513f1a34d1c2e612ef36e2d5c34f8c48776acff59ad10169392b114925bf0581",
+        "semantics": "Both sides negotiate, no garbage; the final flush completes the handshake: hybrid keys, confirmed both ways."
+      },
+      {
+        "file": "negotiate-both-max-garbage",
+        "format": "fdp",
+        "size": 214,
+        "sha256": "d49337112b58a48f382feb53e798c218a9bd7d6459d0f83054c0af71924a3b79",
+        "semantics": "Both sides negotiate with 4,095 bytes of garbage each, so the held version packet's AAD is the longest; the final flush completes the handshake."
+      },
+      {
+        "file": "negotiate-both-interleaved",
+        "format": "fdp",
+        "size": 343,
+        "sha256": "8b793b1259c0a61cf02a467c4302840314635f52e593f5f920976992d8dfc9ef",
+        "semantics": "Both sides negotiate, 64 and 17 bytes of garbage; a fixed 48-byte pattern drives the interleaving loop, then the final flush completes the handshake: hybrid."
+      },
+      {
+        "file": "negotiate-both-interleaved-long-garbage",
+        "format": "fdp",
+        "size": 326,
+        "sha256": "978e1df57d71dc44cca090e6fe25415e2e1f4e5050cacfc16610bce1d484875a",
+        "semantics": "Both sides negotiate, 1,000 and 64 bytes of garbage; a fixed 48-byte pattern drives the interleaving loop, then the final flush completes the handshake: hybrid."
+      },
+      {
+        "file": "initiator-negotiates-responder-off",
+        "format": "fdp",
+        "size": 214,
+        "sha256": "9306059152bd46f04435b2b6dbe8bafe816102d4810cb2927a8d8af6f249fa83",
+        "semantics": "The initiator holds its version packet for an empty one; the final flush completes the handshake: legacy_peer, ECDH keys."
+      },
+      {
+        "file": "initiator-negotiates-responder-off-interleaved",
+        "format": "fdp",
+        "size": 331,
+        "sha256": "bd1fbf465f64843526c618a09ed968336afb0ef65d95add1b2bf088fc0a75f2a",
+        "semantics": "The initiator negotiates, the responder is off; a fixed 48-byte pattern drives the interleaving loop, then the final flush completes the handshake: ECDH keys."
+      },
+      {
+        "file": "initiator-off-responder-offers",
+        "format": "fdp",
+        "size": 214,
+        "sha256": "0e8c0e8cc82faf65135f7a440a25f65fcfffbfdc11b01ab35573ec3d35695f55",
+        "semantics": "The responder offers to an initiator that is off and ignores it; the final flush completes the handshake: ECDH keys."
+      },
+      {
+        "file": "initiator-off-responder-offers-interleaved",
+        "format": "fdp",
+        "size": 359,
+        "sha256": "3b68416cfaec3415673d47174ec0512b788cbe3062109708336b8ade9929e445",
+        "semantics": "The responder offers to an initiator that is off; a fixed 48-byte pattern drives the interleaving loop, then the final flush completes the handshake: ECDH keys."
+      },
+      {
+        "file": "initiator-fallback-responder-offers",
+        "format": "fdp",
+        "size": 214,
+        "sha256": "e1cd4020339b10060518069f2434f25dea38db0fe8cfa0e80885a946d32d7461",
+        "semantics": "An initiator in fallback sends plain v2 and never parses the offer; the final flush completes the handshake: ECDH keys."
+      },
+      {
+        "file": "both-off",
+        "format": "fdp",
+        "size": 214,
+        "sha256": "3ad084a8e2f8494a595d9c44ebd9b72db47efda77c76d531c197ca6d686334f0",
+        "semantics": "Today's v2 on both sides; the final flush completes the handshake."
+      },
+      {
+        "file": "both-off-interleaved",
+        "format": "fdp",
+        "size": 390,
+        "sha256": "9378972edb1ddf9b65d7ae33ec515901e11aa937ec1ebd355c4834d96dd6192a",
+        "semantics": "Today's v2 on both sides; a fixed 48-byte pattern drives the interleaving loop, then the final flush completes the handshake."
+      },
+      {
+        "file": "initiator-fallback-responder-off",
+        "format": "fdp",
+        "size": 219,
+        "sha256": "f315c712be3bad0f7bf8eb9484ffa876675bc4bd90932dac84b13ac051e746ad",
+        "semantics": "Plain v2 on both sides; the final flush completes the handshake."
+      },
+      {
+        "file": "initiator-fallback-responder-offers-interleaved",
+        "format": "fdp",
+        "size": 343,
+        "sha256": "cec2460db80a9d17fcd35bb12215b7517034cf9d732b0e328f6a6e2026fe7aff",
+        "semantics": "An initiator in fallback never parses the offer; a fixed 48-byte pattern drives the interleaving loop, then the final flush completes the handshake: ECDH keys."
+      }
+    ],
     "pq_records": [
       {
         "file": "offer",
