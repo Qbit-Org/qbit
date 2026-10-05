@@ -1002,5 +1002,73 @@ class CtestEvidenceTest(unittest.TestCase):
             self.assertIn("unreadable ctest test listing", summary.read_text(encoding="utf8"))
 
 
+
+class FuzzReplayContractTest(unittest.TestCase):
+    """The fuzz phase of 03_test_script.sh replays the ML-KEM targets on portable C too (#190 D5)."""
+
+    STUB_RUNNER = r'''#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ["STUB_LOG"], "a", encoding="utf8") as log:
+    log.write(json.dumps({"args": sys.argv[1:], "MLKEM_FORCE_PORTABLE": os.environ.get("MLKEM_FORCE_PORTABLE")}) + "\n")
+'''
+
+    @staticmethod
+    def fuzz_block() -> str:
+        """The last RUN_FUZZ_TESTS block of 03_test_script.sh: the replay and mutation phase."""
+        lines = TEST_SCRIPT.read_text(encoding="utf8").splitlines()
+        first = max(index for index, line in enumerate(lines) if line == 'if [ "$RUN_FUZZ_TESTS" = "true" ]; then')
+        last = next(index for index in range(first + 1, len(lines)) if lines[index] == "fi")
+        return "\n".join(lines[first:last + 1]) + "\n"
+
+    @staticmethod
+    def required_targets() -> list[str]:
+        """QBIT_REQUIRED_CORPUS_TARGETS from test/fuzz/test_runner.py, read without importing it."""
+        import ast
+        tree = ast.parse((REPO_ROOT / "test" / "fuzz" / "test_runner.py").read_text(encoding="utf8"))
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == "QBIT_REQUIRED_CORPUS_TARGETS" for t in node.targets):
+                return list(ast.literal_eval(node.value))
+        raise AssertionError("QBIT_REQUIRED_CORPUS_TARGETS not found")
+
+    def run_block(self, mutate_min_time: str) -> list[dict[str, Any]]:
+        with tempfile.TemporaryDirectory(prefix="ci-fuzz-") as tmp:
+            root = Path(tmp)
+            runner = root / "build" / "test" / "fuzz" / "test_runner.py"
+            runner.parent.mkdir(parents=True)
+            runner.write_text(self.STUB_RUNNER, encoding="utf8")
+            runner.chmod(0o755)
+            log = root / "calls.jsonl"
+            log.touch()
+            env = {"PATH": os.environ["PATH"], "HOME": tmp, "LC_ALL": "C", "RUN_FUZZ_TESTS": "true",
+                   "BASE_BUILD_DIR": str(root / "build"), "DEPENDS_DIR": str(root / "depends"), "HOST": "x86_64-pc-linux-gnu",
+                   "MAKEJOBS": "-j2", "DIR_FUZZ_IN": str(root / "corpora"), "FUZZ_TESTS_CONFIG": "",
+                   "QBIT_FUZZ_MUTATE_MIN_TIME": mutate_min_time, "STUB_LOG": str(log)}
+            script = root / "block.sh"
+            script.write_text("set -ex\n" + self.fuzz_block(), encoding="utf8")
+            completed = subprocess.run(["bash", str(script)], env=env, text=True, capture_output=True)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            return [json.loads(line) for line in log.read_text(encoding="utf8").splitlines()]
+
+    def test_mlkem_targets_replay_on_portable_c(self) -> None:
+        replay, portable = self.run_block(mutate_min_time="")
+        self.assertIn("--require_qbit_corpus", replay["args"])
+        self.assertIsNone(replay["MLKEM_FORCE_PORTABLE"])
+        self.assertEqual(portable["MLKEM_FORCE_PORTABLE"], "1")
+        self.assertEqual(portable["args"][-2:], ["mlkem", "mlkem_backend_diff"])
+        corpus = [arg for arg in replay["args"] if arg.endswith("/corpora")]
+        self.assertEqual(len(corpus), 1, replay["args"])
+        self.assertIn(corpus[0], portable["args"], "the portable replay uses the same corpus")
+
+    def test_mutation_phase_covers_every_required_target(self) -> None:
+        calls = self.run_block(mutate_min_time="60")
+        self.assertEqual(len(calls), 3)
+        mutate = calls[2]
+        self.assertIn("--mutate_min_time=60", mutate["args"])
+        self.assertIsNone(mutate["MLKEM_FORCE_PORTABLE"])
+        targets = self.required_targets()
+        self.assertIn("mlkem", targets)
+        self.assertEqual(mutate["args"][-len(targets):], targets)
+
+
 if __name__ == "__main__":
     unittest.main()

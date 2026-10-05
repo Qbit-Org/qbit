@@ -9,6 +9,8 @@ upstream `qa-assets` corpus:
 | `asert_edge_cases` | [`asert_edge_cases/`](asert_edge_cases) |
 | `asert_math` | [`asert_math/`](asert_math) |
 | `auxpow` | [`auxpow/`](auxpow) |
+| `mlkem` | [`mlkem/`](mlkem) |
+| `mlkem_backend_diff` | [`mlkem_backend_diff/`](mlkem_backend_diff) |
 | `p2mr_script` | [`p2mr_script/`](p2mr_script) |
 | `pqc` | [`pqc/`](pqc) |
 
@@ -46,6 +48,16 @@ arrays and strings from the front of the input, integers from the back.
   real keys and signatures that are built once per process, on first use.
   Tagged inputs with another version byte are ignored.
 
+`mlkem` and `mlkem_backend_diff` share one untagged layout: the key generation
+seed `d || z` (64 bytes), encapsulation coins (32), an arbitrary encapsulation
+key (1568), ciphertext (1568) and decapsulation key (3168), then, from the back,
+whether to flip one bit of the honest ciphertext and which. Fields cut off by
+the end of the input are zero. The seeds use the C2SP CCTV modulus key, the
+3328/3329 coefficient boundary and NIST ACVP decapsulation vectors from
+`src/test/data/mlkem1024_vectors.json`. Both targets run on native code where
+the CPU has it, or on portable C with `MLKEM_FORCE_PORTABLE=1`;
+`mlkem_backend_diff` also compares every result with forced portable C.
+
 The fixture bodies check that an unmodified fixture verifies. `pqc` also
 checks that any modified signature, public key or message is rejected. Legacy
 and generation seeds keep key generation and signing covered in every replay.
@@ -63,6 +75,6 @@ from a reused corpus by hand if they are no longer wanted. A target path that
 is not a directory, or a symlink, directory or other non-regular file at a
 managed name, is an error; all target paths and managed names are checked
 before any file is written.
-`test/fuzz/test_runner.py --require_qbit_corpus` then fails unless all six
+`test/fuzz/test_runner.py --require_qbit_corpus` then fails unless all eight
 targets are selected, each has at least one regular input file, and the fuzz
 binary reports replaying them.

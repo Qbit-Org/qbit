@@ -31,7 +31,7 @@ sys.dont_write_bytecode = True
 SRC_DIR = Path(__file__).resolve().parents[2]
 RUNNER = SRC_DIR / "test" / "fuzz" / "test_runner.py"
 CORPORA_DIR = SRC_DIR / "test" / "fuzz" / "qbit_corpora"
-REQUIRED = ("asert_chain_transition", "asert_edge_cases", "asert_math", "auxpow", "p2mr_script", "pqc")
+REQUIRED = ("asert_chain_transition", "asert_edge_cases", "asert_math", "auxpow", "mlkem", "mlkem_backend_diff", "p2mr_script", "pqc")
 INTEGRATION = {}
 
 STUB_SOURCE = r'''

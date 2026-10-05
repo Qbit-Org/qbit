@@ -24,6 +24,8 @@ QBIT_REQUIRED_CORPUS_TARGETS = (
     "asert_edge_cases",
     "asert_math",
     "auxpow",
+    "mlkem",
+    "mlkem_backend_diff",
     "p2mr_script",
     "pqc",
 )

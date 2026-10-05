@@ -557,6 +557,99 @@ def auxpow_cases() -> list[dict]:
 # --- manifest ----------------------------------------------------------------
 
 
+# --- mlkem, mlkem_backend_diff -----------------------------------------------
+
+MLKEM_SEED_BYTES = 64
+MLKEM_COINS_BYTES = 32
+MLKEM_EK_BYTES = 1568
+MLKEM_CT_BYTES = 1568
+MLKEM_DK_BYTES = 3168
+MLKEM_Q = 3329
+MLKEM_VECTORS = CORPORA_DIR.parents[2] / "src" / "test" / "data" / "mlkem1024_vectors.json"
+
+
+def mlkem_vectors() -> dict:
+    return json.loads(MLKEM_VECTORS.read_text(encoding="utf-8"))
+
+
+def mlkem_set_coefficient(ek: bytes, poly: int, index: int, value: int) -> bytes:
+    """Overwrite one 12-bit coefficient of an encapsulation key (FIPS 203 ByteEncode_12)."""
+    out = bytearray(ek)
+    pos = 384 * poly + 3 * (index // 2)
+    if index % 2 == 0:
+        out[pos] = value & 0xFF
+        out[pos + 1] = (out[pos + 1] & 0xF0) | (value >> 8)
+    else:
+        out[pos + 1] = (out[pos + 1] & 0x0F) | ((value & 0x0F) << 4)
+        out[pos + 2] = value >> 4
+    return bytes(out)
+
+
+def mlkem_input(*, ek: bytes | None = None, ct: bytes | None = None, dk: bytes | None = None,
+                flip_bit: int | None = None) -> bytes:
+    """The shared layout of both ML-KEM targets.
+
+    Front: key generation seed d || z (64 bytes), encapsulation coins (32), an
+    arbitrary encapsulation key (1568), ciphertext (1568) and decapsulation key
+    (3168). Back: whether to flip a bit of the honest ciphertext, and which.
+    The harness zero-fills fields cut off by the end of the input, so a seed
+    may stop after any field. A bit flip needs every front field present.
+    """
+    enc = FdpEncoder()
+    enc.raw(pattern(MLKEM_SEED_BYTES, 0x61))
+    enc.raw(pattern(MLKEM_COINS_BYTES, 0x71))
+    fields = [(ek, MLKEM_EK_BYTES), (ct, MLKEM_CT_BYTES), (dk, MLKEM_DK_BYTES)]
+    if flip_bit is not None:
+        fields = [(value if value is not None else bytes(size), size) for value, size in fields]
+    while fields and fields[-1][0] is None:
+        fields.pop()
+    for value, size in fields:
+        value = value if value is not None else bytes(size)
+        if len(value) != size:
+            raise ValueError(f"ML-KEM field of {len(value)} bytes, expected {size}")
+        enc.raw(value)
+    if flip_bit is not None:
+        enc.boolean(True)
+        enc.integral(flip_bit, SIZE_T, 0, MLKEM_CT_BYTES * 8 - 1)
+    return enc.build()
+
+
+def mlkem_cases() -> list[dict]:
+    vectors = mlkem_vectors()
+    base_ek = bytes.fromhex(vectors["cctv_modulus"]["base_ek"])
+    acvp = vectors["acvp"]
+    decaps = {tc["tcId"]: tc for tc in acvp["decapsulation"]}
+    valid = next(tc for tc in decaps.values() if tc["reason"] == "valid decapsulation")
+    modified = next(tc for tc in decaps.values() if tc["reason"] == "modified ciphertext")
+    bad_dk = next(tc for tc in acvp["decapsulationKeyCheck"] if not tc["testPassed"])
+    return [
+        case("honest-round-trip", "fdp", mlkem_input(),
+             "Key generation, encapsulation and decapsulation from fixed seed and coins agree; the all-zero "
+             "encapsulation key is in range, and the all-zero decapsulation key fails its hash check."),
+        case("cctv-base-key", "fdp", mlkem_input(ek=base_ek),
+             "The key shared by the C2SP CCTV modulus vectors, every coefficient in range: accepted."),
+        case("coefficient-3328", "fdp", mlkem_input(ek=mlkem_set_coefficient(base_ek, 0, 0, MLKEM_Q - 1)),
+             "First coefficient q - 1 = 3328, the largest valid value: accepted."),
+        case("coefficient-3329", "fdp", mlkem_input(ek=mlkem_set_coefficient(base_ek, 0, 0, MLKEM_Q)),
+             "First coefficient q = 3329, the smallest invalid value: rejected, outputs cleared."),
+        case("last-coefficient-4095", "fdp", mlkem_input(ek=mlkem_set_coefficient(base_ek, 3, 255, (1 << 12) - 1)),
+             "Last coefficient of the last polynomial 4095: rejected, outputs cleared."),
+        case("acvp-valid-decapsulation", "fdp",
+             mlkem_input(ek=bytes.fromhex(valid["dk"])[1536:1536 + MLKEM_EK_BYTES], ct=bytes.fromhex(valid["c"]),
+                         dk=bytes.fromhex(valid["dk"])),
+             f"NIST ACVP decapsulation tcId {valid['tcId']} (valid): its key, ciphertext and decapsulation key."),
+        case("acvp-modified-ciphertext", "fdp",
+             mlkem_input(ek=bytes.fromhex(modified["dk"])[1536:1536 + MLKEM_EK_BYTES], ct=bytes.fromhex(modified["c"]),
+                         dk=bytes.fromhex(modified["dk"])),
+             f"NIST ACVP decapsulation tcId {modified['tcId']} (modified ciphertext): implicit rejection."),
+        case("acvp-modified-key-hash", "fdp",
+             mlkem_input(ct=bytes.fromhex(modified["c"]), dk=bytes.fromhex(bad_dk["dk"])),
+             f"NIST ACVP decapsulation key check tcId {bad_dk['tcId']} (modified H): rejected, secret cleared."),
+        case("honest-ciphertext-bit-flip", "fdp", mlkem_input(flip_bit=4321),
+             "Flip bit 4321 of the honest ciphertext: decapsulation still yields a secret, a different one."),
+    ]
+
+
 def case(name: str, fmt: str, data: bytes, semantics: str) -> dict:
     return {"name": name, "format": fmt, "data": data, "semantics": semantics}
 
@@ -566,6 +659,8 @@ CASE_BUILDERS = {
     "asert_edge_cases": asert_edge_cases_cases,
     "asert_math": asert_math_cases,
     "auxpow": auxpow_cases,
+    "mlkem": mlkem_cases,
+    "mlkem_backend_diff": mlkem_cases,
     "p2mr_script": p2mr_cases,
     "pqc": pqc_cases,
 }
