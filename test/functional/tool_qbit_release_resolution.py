@@ -10,10 +10,14 @@ binary names on every host qbit publishes for, that the Bitcoin Core mappings
 are unchanged, and that a qbit release gets Core-era options by its Core base
 and qbit-only options only when it supports them.
 """
+import argparse
+import contextlib
 import importlib
+import io
 import os
 from pathlib import Path
 import sys
+from unittest import mock
 
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.test_node import MIN_BITCOIN_CORE_VERSION, QBIT_RELEASES, TestNode, release_info
@@ -69,6 +73,7 @@ class QbitReleaseResolutionTest(BitcoinTestFramework):
         self.exeext = self.config["environment"]["EXEEXT"]
 
         self.test_qbit_downloads()
+        self.test_default_tags()
         self.test_qbit_release_info()
         self.test_core_mappings_unchanged()
         self.test_node_options()
@@ -94,6 +99,33 @@ class QbitReleaseResolutionTest(BitcoinTestFramework):
         # A qbit tag must not shadow a Bitcoin Core one.
         core_tags = {v["tag"] for v in self.releases.SHA256_SUMS.values()}
         assert_equal(framework_tags & core_tags, set())
+
+    def test_default_tags(self):
+        self.log.info("The default tags leave out qbit releases without an archive for the host")
+        core_tags = {v["tag"] for v in self.releases.SHA256_SUMS.values()}
+        assert_equal(self.releases.default_tags("x86_64-linux-gnu"), sorted(core_tags | {"v1.0.0"}))
+        # powerpc64le is a host set_host() recognizes, but v1.0.0 has no archive for it.
+        assert_equal(self.releases.default_tags("powerpc64le-linux-gnu"), sorted(core_tags))
+
+        self.log.info("Without tags nothing unavailable is fetched; an explicit unavailable tag is still an error")
+        target_dir = Path(self.options.tmpdir) / "previous_releases"
+        for tag in core_tags:
+            (target_dir / tag).mkdir(parents=True)  # cached, so nothing is downloaded
+
+        def main(tags):
+            args = argparse.Namespace(target_dir=str(target_dir), remove_dir=False, tags=tags)
+            out, err = io.StringIO(), io.StringIO()
+            # set_host() runs depends/config.guess relative to the source directory.
+            with mock.patch.dict(os.environ, {"HOST": "powerpc64le-unknown-linux-gnu"}), \
+                 self.releases.pushd(self.config["environment"]["SRCDIR"]), \
+                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                return self.releases.main(args), out.getvalue(), err.getvalue()
+        ret, out, err = main([])
+        assert_equal((ret, err), (0, ""))
+        assert "Skipping v1.0.0: no qbit v1.0.0 archive for host powerpc64le-linux-gnu" in out, out
+        ret, out, err = main(["v1.0.0"])
+        assert_equal((ret, err), (1, "No qbit v1.0.0 archive for host powerpc64le-linux-gnu\n"))
+        assert not (target_dir / "v1.0.0").exists()
 
     def test_qbit_release_info(self):
         self.log.info("Client version 10000 is qbit v1.0.0, based on Core v30.2")
