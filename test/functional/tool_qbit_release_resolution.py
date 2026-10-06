@@ -112,12 +112,16 @@ class QbitReleaseResolutionTest(BitcoinTestFramework):
         for tag in core_tags:
             (target_dir / tag).mkdir(parents=True)  # cached, so nothing is downloaded
 
+        def set_powerpc64le_host(args):
+            # set_host() itself is upstream's and answers win64 on any Windows
+            # machine, so stand in for it: this checks main()'s use of the host.
+            args.host = "powerpc64le-linux-gnu"
+            return 0
+
         def main(tags):
             args = argparse.Namespace(target_dir=str(target_dir), remove_dir=False, tags=tags)
             out, err = io.StringIO(), io.StringIO()
-            # set_host() runs depends/config.guess relative to the source directory.
-            with mock.patch.dict(os.environ, {"HOST": "powerpc64le-unknown-linux-gnu"}), \
-                 self.releases.pushd(self.config["environment"]["SRCDIR"]), \
+            with mock.patch.object(self.releases, "set_host", set_powerpc64le_host), \
                  contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                 return self.releases.main(args), out.getvalue(), err.getvalue()
         ret, out, err = main([])
