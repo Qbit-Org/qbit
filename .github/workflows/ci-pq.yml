@@ -9,10 +9,14 @@
 # - on-demand runs go through main's PQ caller (C4, part 2 of #184), which takes
 #   workflow_dispatch inputs source_ref and jobs and calls ci-pq.yml@1.x.x, for
 #   example gh workflow run ci-maintained-pq.yml -f source_ref=<branch> -f jobs=aarch64-unit.
-#   That caller lands on main after this part merges.
+#   That caller lands on main after this part merges;
+# - Full Validation (ci.yml) calls it with aarch64-unit, macos-arm64-unit and
+#   macos-x86_64-unit for every change that ci/checks/classify_merge_profile.py
+#   says needs them.
 # The workflow_dispatch trigger below stays for when this file is on main itself;
 # until then GitHub rejects gh workflow run ci-pq.yml.
-# Jobs: aarch64-unit, s390x-unit (big-endian, emulated) and macos-arm64-unit.
+# Jobs: aarch64-unit, s390x-unit (big-endian, emulated), macos-arm64-unit and
+# macos-x86_64-unit.
 # The source is resolved once to a commit, every job checks out and verifies
 # that commit, and the summaries record it.
 
@@ -28,7 +32,7 @@ on:
         type: string
         default: ''
       jobs:
-        description: 'Comma-separated jobs to run (aarch64-unit, s390x-unit, macos-arm64-unit); empty runs all'
+        description: 'Comma-separated jobs to run (aarch64-unit, s390x-unit, macos-arm64-unit, macos-x86_64-unit); empty runs all'
         required: false
         type: string
         default: ''
@@ -40,7 +44,7 @@ on:
         type: string
         default: ''
       jobs:
-        description: 'Comma-separated jobs to run (aarch64-unit, s390x-unit, macos-arm64-unit); empty runs all'
+        description: 'Comma-separated jobs to run (aarch64-unit, s390x-unit, macos-arm64-unit, macos-x86_64-unit); empty runs all'
         required: false
         type: string
         default: ''
@@ -61,6 +65,7 @@ jobs:
       matrix_count: ${{ steps.select.outputs.matrix_count }}
       selected: ${{ steps.select.outputs.selected }}
       run_macos_arm64_unit: ${{ steps.select.outputs.run_macos_arm64_unit }}
+      run_macos_x86_64_unit: ${{ steps.select.outputs.run_macos_x86_64_unit }}
     steps:
       - name: Resolve source
         id: resolve
@@ -185,7 +190,7 @@ jobs:
               }
             ]
           # Selectable jobs that are not matrix entries; each gets a run_<job> output.
-          NON_MATRIX_JOBS: 'macos-arm64-unit'
+          NON_MATRIX_JOBS: 'macos-arm64-unit macos-x86_64-unit'
         run: |
           # Turn the comma-separated jobs input into the matrix: empty selects
           # every job; an empty, unknown or repeated name fails the run.
@@ -243,7 +248,7 @@ jobs:
       CI_FAILFAST_TEST_LEAVE_DANGLING: 1
       DANGER_CI_ON_HOST_FOLDERS: 1
       FILE_ENV: ${{ matrix.file-env }}
-      # Read by the steps macos-arm64-unit shares, so it is set per job.
+      # Read by the steps the macOS jobs share, so it is set per job.
       MATRIX_NAME: ${{ matrix.name }}
       TEST_RUNNER_FAILFAST: 'false'
       MAKEJOBS: '-j4'
@@ -315,7 +320,8 @@ jobs:
         with:
           cache-provider: gha
 
-      - name: CI script
+      - &CI_SCRIPT
+        name: CI script
         run: ./ci/test_run_all.sh
 
       - name: Report unit-test evidence
@@ -347,14 +353,15 @@ jobs:
       - name: Save caches
         uses: ./.github/actions/save-caches
 
-  # Apple Silicon runs natively on the host, without Docker, so it is a job of
-  # its own rather than a matrix entry of unit. It shares unit's source checks
-  # and evidence report.
+  # macOS runs natively on the host, without Docker, so each architecture is a
+  # job of its own rather than a matrix entry of unit. Both share unit's source
+  # checks, CI script and evidence report, and build with WITH_MLKEM_NATIVE=ON:
+  # these are the only jobs that run ML-KEM's native code on macOS.
   macos-arm64-unit:
     name: macOS arm64 unit tests
     needs: resolve-source
     if: ${{ needs.resolve-source.outputs.run_macos_arm64_unit == 'true' }}
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 120
     env:
       DANGER_RUN_CI_ON_HOST: 1
@@ -365,41 +372,97 @@ jobs:
       MAKEJOBS: '-j3'
       TEST_RUNNER_JOBS: '3'
       CTEST_JOBS: '3'
+      # Read by the steps the macOS jobs share: the runner's uname -m, the
+      # ML-KEM backend (arithmetic/Keccak) that must run, and the evidence line.
+      EXPECTED_MACHINE: arm64
+      MLKEM_EXPECTED_BACKEND: aarch64-neon/aarch64
+      PHASE: mlkem_tests, bip324_tests and net_tests natively on Apple Silicon, where ML-KEM runs its native AArch64 code.
     steps:
       - *REQUIRE_SOURCE
       - *CHECKOUT_SOURCE
       - *VERIFY_SOURCE
 
-      - name: Require Apple Silicon
+      - &REQUIRE_MACHINE
+        name: Require runner architecture
         shell: bash
         run: |
           set -euo pipefail
           machine="$(uname -m)"
-          if [ "$machine" != "arm64" ]; then
-            echo "::error::macos-arm64-unit must run on arm64, but uname -m reports '$machine'" >&2
+          if [ "$machine" != "$EXPECTED_MACHINE" ]; then
+            echo "::error::${GITHUB_JOB} must run on ${EXPECTED_MACHINE}, but uname -m reports '$machine'" >&2
             exit 1
           fi
           echo "uname -m: $machine"
 
       # The runner context is not available in job-level env, so the build
-      # directory, which the report step reads, is set here.
-      - name: Set build directory
+      # directory, which the later steps read, is set here.
+      - &SET_BUILD_DIR
+        name: Set build directory
         shell: bash
         run: echo "BASE_BUILD_DIR=${RUNNER_TEMP}/build" >> "$GITHUB_ENV"
 
-      - name: Install Homebrew packages
+      - &INSTALL_HOMEBREW_PACKAGES
+        name: Install Homebrew packages
         env:
           HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
         run: brew install --quiet coreutils ninja pkgconf gnu-getopt ccache boost libevent
 
-      - name: CI script
-        run: ./ci/test_run_all.sh
+      - *CI_SCRIPT
 
-      - name: Report unit-test evidence
+      # The suites passed, but on which code? A runner whose CPU lacks an
+      # extension the native code needs would pass them on portable C, so
+      # require the native backend by name. mlkem_tests/backend_selection logs
+      # the compiled and the active backend.
+      - &REQUIRE_NATIVE_MLKEM
+        name: Require native ML-KEM
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="compiled ${MLKEM_EXPECTED_BACKEND}, active ${MLKEM_EXPECTED_BACKEND}"
+          log="$("${BASE_BUILD_DIR}/bin/test_qbit" --run_test=mlkem_tests/backend_selection --log_level=message --color_output=no 2>&1)" \
+            || { printf '%s\n' "$log"; echo "::error::mlkem_tests/backend_selection failed" >&2; exit 1; }
+          printf '%s\n' "$log"
+          if ! printf '%s\n' "$log" | grep -qxF "$expected"; then
+            echo "::error::${GITHUB_JOB} must run native ML-KEM, but the test log lacks '${expected}'" >&2
+            sysctl machdep.cpu.brand_string machdep.cpu.features machdep.cpu.leaf7_features 2>/dev/null || true
+            exit 1
+          fi
+
+      - &MACOS_REPORT_EVIDENCE
+        name: Report unit-test evidence
         if: ${{ always() }}
         shell: bash
         env:
           RESOLVED_SHA: ${{ needs.resolve-source.outputs.resolved_sha }}
           REQUESTED_REF: ${{ needs.resolve-source.outputs.requested_ref }}
-          PHASE: mlkem_tests, bip324_tests and net_tests natively on Apple Silicon, where ML-KEM runs its native AArch64 code.
         run: *REPORT_EVIDENCE
+
+  macos-x86_64-unit:
+    name: macOS x86_64 unit tests
+    needs: resolve-source
+    if: ${{ needs.resolve-source.outputs.run_macos_x86_64_unit == 'true' }}
+    # GitHub's Intel macOS image (4 CPUs); macos-15 itself is Apple Silicon.
+    runs-on: macos-15-intel
+    timeout-minutes: 120
+    env:
+      DANGER_RUN_CI_ON_HOST: 1
+      FILE_ENV: ./ci/test/00_setup_env_mac_native_pq.sh
+      MATRIX_NAME: macOS x86_64 unit tests
+      BASE_ROOT_DIR: ${{ github.workspace }}
+      TEST_RUNNER_FAILFAST: 'false'
+      MAKEJOBS: '-j4'
+      TEST_RUNNER_JOBS: '4'
+      CTEST_JOBS: '4'
+      EXPECTED_MACHINE: x86_64
+      MLKEM_EXPECTED_BACKEND: x86_64-avx2/x86_64-avx2
+      PHASE: mlkem_tests, bip324_tests and net_tests natively on an Intel Mac, where ML-KEM runs its native x86_64 code.
+    steps:
+      - *REQUIRE_SOURCE
+      - *CHECKOUT_SOURCE
+      - *VERIFY_SOURCE
+      - *REQUIRE_MACHINE
+      - *SET_BUILD_DIR
+      - *INSTALL_HOMEBREW_PACKAGES
+      - *CI_SCRIPT
+      - *REQUIRE_NATIVE_MLKEM
+      - *MACOS_REPORT_EVIDENCE

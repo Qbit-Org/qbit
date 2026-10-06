@@ -56,6 +56,8 @@ WORKFLOWS = {
 }
 GATE_WORKFLOW = svc.WORKFLOW_DIR / "required-merge-gate.yml"
 TEST_SCRIPT = REPO_ROOT / "ci" / "test" / "03_test_script.sh"
+MLKEM_TESTS = REPO_ROOT / "src" / "test" / "mlkem_tests.cpp"
+MLKEM_BACKEND_HEADERS = [REPO_ROOT / "src" / "crypto" / name for name in ("mlkem_arith_backend.h", "mlkem_fips202_backend.h")]
 RESOLVER_JOB = svc.RESOLVER_JOB
 TRIGGER_STEP = "Check how the run started"
 REQUESTED_STEP = "Resolve requested source"
@@ -66,8 +68,15 @@ PQ_UNIT_JOB = "unit"
 AARCH64_JOB = "aarch64-unit"
 S390X_JOB = "s390x-unit"
 MACOS_JOB = "macos-arm64-unit"
+MACOS_X86_64_JOB = "macos-x86_64-unit"
+# Each macOS job: (runner label, uname -m, the ML-KEM backend that must run, its
+# word in the evidence line). The backend is read from the headers that name it.
+MACOS_JOBS = {
+    MACOS_JOB: ("macos-15", "arm64", "aarch64", "native AArch64"),
+    MACOS_X86_64_JOB: ("macos-15-intel", "x86_64", "x86_64", "native x86_64"),
+}
 PQ_MATRIX_JOBS = [AARCH64_JOB, S390X_JOB]
-ALL_PQ_JOBS = {PQ_UNIT_JOB: PQ_MATRIX_JOBS, MACOS_JOB: []}
+ALL_PQ_JOBS = {PQ_UNIT_JOB: PQ_MATRIX_JOBS, MACOS_JOB: [], MACOS_X86_64_JOB: []}
 PQ_SUITES = ["mlkem_tests", "bip324_tests", "net_tests"]
 AARCH64_SUITES = PQ_SUITES
 NIGHTLY_MATRIX_JOBS = ["arm32-unit-1", "arm32-unit-2", "previous-releases", "fuzz"]
@@ -155,6 +164,18 @@ def running_jobs(workflow: dict[str, Any], context: dict[str, Any]) -> dict[str,
         assert matrix == MATRIX_EXPRESSION, f"{job_id} matrix must come from the resolver: {matrix!r}"
         running[job_id] = [entry["job"] for entry in json.loads(outputs["matrix"])["include"]]
     return running
+
+
+def mlkem_backend_names() -> dict[str, str]:
+    """The arithmetic/Keccak backend names GetBackendNames() reports, per architecture, read from the backend headers."""
+    names: dict[str, list[str]] = {}
+    for header in MLKEM_BACKEND_HEADERS:
+        text = header.read_text(encoding="utf8")
+        for arch, name in re.findall(r'^#(?:el)?if defined\(MLK_SYS_(X86_64|AARCH64)\)\n#define QBIT_MLKEM_\w+_BACKEND_NAME "([^"]+)"',
+                                     text, re.M):
+            names.setdefault(arch.lower(), []).append(name)
+    assert all(len(pair) == 2 for pair in names.values()) and set(names) == {"x86_64", "aarch64"}, names
+    return {arch: "/".join(pair) for arch, pair in names.items()}
 
 
 def source_env(env_file: str, names: list[str], extra_env: dict[str, str] | None = None) -> dict[str, str]:
@@ -462,7 +483,11 @@ class PQWorkflowContractTest(unittest.TestCase):
             (PQ, {"jobs": AARCH64_JOB}, {PQ_UNIT_JOB: [AARCH64_JOB]}),
             (PQ, {"jobs": S390X_JOB}, {PQ_UNIT_JOB: [S390X_JOB]}),
             (PQ, {"jobs": MACOS_JOB}, {MACOS_JOB: []}),
+            (PQ, {"jobs": MACOS_X86_64_JOB}, {MACOS_X86_64_JOB: []}),
             (PQ, {"jobs": f" {MACOS_JOB} , {AARCH64_JOB} "}, {PQ_UNIT_JOB: [AARCH64_JOB], MACOS_JOB: []}),
+            # What Full Validation's pq-unit job passes.
+            (PQ, {"jobs": f"{AARCH64_JOB},{MACOS_JOB},{MACOS_X86_64_JOB}"},
+             {PQ_UNIT_JOB: [AARCH64_JOB], MACOS_JOB: [], MACOS_X86_64_JOB: []}),
             (PQ, {"jobs": ""}, ALL_PQ_JOBS),
             (NIGHTLY, {"run_test_matrix": True, "run_scanners": False, "jobs": "previous-releases"},
              {"nightly-matrix": ["previous-releases"]}),
@@ -738,7 +763,7 @@ class PQWorkflowContractTest(unittest.TestCase):
     def test_rejects_unknown_repeated_and_empty_job_names(self) -> None:
         bad = {
             PQ: ["aarch64", "AARCH64-UNIT", f"{AARCH64_JOB},{AARCH64_JOB}", f"{AARCH64_JOB},", ",", "s390x", "macos-arm64",
-                 f"{MACOS_JOB},{MACOS_JOB}"],
+                 f"{MACOS_JOB},{MACOS_JOB}", "macos-x86_64", "macos-intel"],
             NIGHTLY: ["previous_releases", "previous-releases,previous-releases", "previous-releases,,fuzz", "unit"],
         }
         for key, values in bad.items():
@@ -793,11 +818,12 @@ class PQWorkflowContractTest(unittest.TestCase):
         workflow = self.workflows[PQ]
         context = self.resolve(PQ, self.dispatch(PQ, source_ref=svc.MAINTAINED_BRANCH, jobs=AARCH64_JOB))
         refs = svc.check_source_wiring(workflow, context)
-        self.assertEqual(refs, {PQ_UNIT_JOB: fixture.maintained_sha, MACOS_JOB: fixture.maintained_sha})
-        # The macOS job shares the unit job's guard, checkout and verification steps.
-        for step_name in (svc.GUARD_STEP, svc.CHECKOUT_STEP, svc.VERIFY_STEP):
-            self.assertEqual(svc.find_step(workflow["jobs"][MACOS_JOB], step_name),
-                             svc.find_step(workflow["jobs"][PQ_UNIT_JOB], step_name), step_name)
+        self.assertEqual(refs, {job: fixture.maintained_sha for job in ALL_PQ_JOBS})
+        # The macOS jobs share the unit job's guard, checkout and verification steps.
+        for macos_job in MACOS_JOBS:
+            for step_name in (svc.GUARD_STEP, svc.CHECKOUT_STEP, svc.VERIFY_STEP):
+                self.assertEqual(svc.find_step(workflow["jobs"][macos_job], step_name),
+                                 svc.find_step(workflow["jobs"][PQ_UNIT_JOB], step_name), (macos_job, step_name))
 
         mutated = copy.deepcopy(workflow)
         checkout = svc.find_step(mutated["jobs"][PQ_UNIT_JOB], svc.CHECKOUT_STEP)
@@ -884,22 +910,34 @@ class PQWorkflowContractTest(unittest.TestCase):
         # ctest runs each test through the emulator, so test_qbit is never started directly.
         self.assertIn("-DCMAKE_CROSSCOMPILING_EMULATOR='qemu-s390x;-L;/usr/s390x-linux-gnu'", effective["BITCOIN_CONFIG"])
 
-    def test_macos_job_runs_natively_on_apple_silicon(self) -> None:
-        fixture = self.fixture
+    def test_macos_jobs_run_natively_on_apple_silicon_and_intel(self) -> None:
         workflow = self.workflows[PQ]
-        job = workflow["jobs"][MACOS_JOB]
-        self.assertNotIn(MACOS_JOB, [entry["job"] for entry in catalog(workflow)])
-        self.assertEqual(job["runs-on"], "macos-14")
-        context = self.resolve(PQ, self.dispatch(PQ, jobs=MACOS_JOB))
+        catalog_names = [entry["job"] for entry in catalog(workflow)]
+        # Both jobs run the same steps; only their runner and job env differ.
+        self.assertEqual(workflow["jobs"][MACOS_JOB]["steps"], workflow["jobs"][MACOS_X86_64_JOB]["steps"])
+        backends = mlkem_backend_names()
+        for job_id, (runner, machine, arch, evidence_word) in MACOS_JOBS.items():
+            with self.subTest(job=job_id):
+                self.assertNotIn(job_id, catalog_names)
+                self.check_macos_job(workflow, job_id, runner, machine, backends[arch], evidence_word)
+
+    def check_macos_job(self, workflow: dict[str, Any], job_id: str, runner: str, machine: str, backend: str,
+                        evidence_word: str) -> None:
+        fixture = self.fixture
+        job = workflow["jobs"][job_id]
+        self.assertEqual(job["runs-on"], runner)
+        context = self.resolve(PQ, self.dispatch(PQ, jobs=job_id))
         env = svc.job_env(workflow, job, context)
         self.assertEqual(env["DANGER_RUN_CI_ON_HOST"], "1", "no Docker on the macOS host")
         env_file = env["FILE_ENV"]
         self.assertTrue(os.access(REPO_ROOT / env_file, os.X_OK), env_file)
         self.assertEqual(env["MATRIX_NAME"], job["name"])
+        self.assertEqual(env["EXPECTED_MACHINE"], machine)
+        self.assertEqual(env["MLKEM_EXPECTED_BACKEND"], backend)
         names = ["CI_OS_NAME", "NO_DEPENDS", "CI_BUILD_TARGET", "CTEST_REGEX", "CTEST_EXPECTED_SUITES", "RUN_FUNCTIONAL_TESTS",
                  "BITCOIN_CONFIG"]
         effective = source_env(env_file, names)
-        # Losing the native AArch64 backend must fail the configure step, not fall back quietly.
+        # Losing the native backend must fail the configure step, not fall back quietly.
         self.assertIn("-DWITH_MLKEM_NATIVE=ON", effective["BITCOIN_CONFIG"].split())
         self.assertEqual(effective["CI_OS_NAME"], "macos")
         self.assertEqual(effective["NO_DEPENDS"], "1")
@@ -908,9 +946,10 @@ class PQWorkflowContractTest(unittest.TestCase):
         self.assertEqual(effective["RUN_FUNCTIONAL_TESTS"], "false")
         regex = re.compile(effective["CTEST_REGEX"])
         self.assertEqual([name for name in SUITE_INVENTORY if regex.search(name)], sorted(PQ_SUITES))
+        github_env = svc.github_env_for(context, job_id, workflow["name"])
 
-        # The report step reads the evidence from BASE_BUILD_DIR, which a step
-        # sets from RUNNER_TEMP: the runner context is unavailable in job env.
+        # The report and native checks read the build from BASE_BUILD_DIR, which
+        # a step sets from RUNNER_TEMP: the runner context is unavailable in job env.
         self.assertNotIn("BASE_BUILD_DIR", job["env"])
         set_dir = svc.find_step(job, "Set build directory")
         self.assertLess(svc.step_index(job, "Set build directory"), svc.step_index(job, "CI script"))
@@ -919,25 +958,59 @@ class PQWorkflowContractTest(unittest.TestCase):
             github_env_file.touch()
             step_env = svc.step_env(workflow, job, set_dir, context)
             step_env.update({"RUNNER_TEMP": "/runner/temp", "GITHUB_ENV": str(github_env_file)})
-            result = svc.run_step(fixture, set_dir, step_env, fixture.root, svc.github_env_for(context, MACOS_JOB, workflow["name"]))
+            result = svc.run_step(fixture, set_dir, step_env, fixture.root, github_env)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(github_env_file.read_text(encoding="utf8"), "BASE_BUILD_DIR=/runner/temp/build\n")
 
-        # The architecture check refuses anything but arm64.
-        step = svc.find_step(job, "Require Apple Silicon")
-        self.assertLess(svc.step_index(job, "Require Apple Silicon"), svc.step_index(job, "CI script"))
+        # The architecture check refuses any other machine.
+        step = svc.find_step(job, "Require runner architecture")
+        self.assertLess(svc.step_index(job, "Require runner architecture"), svc.step_index(job, "CI script"))
         with tempfile.TemporaryDirectory(dir=fixture.root) as tmp:
             stubs = Path(tmp)
             (stubs / "uname").write_text('#!/bin/sh\necho "$STUB_MACHINE"\n', encoding="utf8")
             (stubs / "uname").chmod(0o755)
-            for machine, ok in (("arm64", True), ("x86_64", False)):
-                with self.subTest(machine=machine):
+            for other in ("arm64", "x86_64"):
+                with self.subTest(machine=other):
                     step_env = svc.step_env(workflow, job, step, context)
-                    step_env.update({"PATH": f"{stubs}:{os.environ['PATH']}", "STUB_MACHINE": machine})
-                    result = svc.run_step(fixture, step, step_env, fixture.root, svc.github_env_for(context, MACOS_JOB, workflow["name"]))
-                    self.assertEqual(result.returncode == 0, ok, result.stderr)
-                    if not ok:
-                        self.assertIn("must run on arm64", result.stderr)
+                    step_env.update({"PATH": f"{stubs}:{os.environ['PATH']}", "STUB_MACHINE": other})
+                    result = svc.run_step(fixture, step, step_env, fixture.root, github_env)
+                    self.assertEqual(result.returncode == 0, other == machine, result.stderr)
+                    if other != machine:
+                        self.assertIn(f"{job_id} must run on {machine}", result.stderr)
+
+        # After the suites pass, the native backend must be the one that ran.
+        step = svc.find_step(job, "Require native ML-KEM")
+        self.assertLess(svc.step_index(job, "CI script"), svc.step_index(job, "Require native ML-KEM"))
+        self.assertLess(svc.step_index(job, "Require native ML-KEM"), svc.step_index(job, REPORT_STEP))
+        native_line = f"compiled {backend}, active {backend}"
+        cases = [
+            ("native", native_line, 0, True),
+            ("portable on a CPU without an extension", f"compiled {backend}, active portable/portable", 0, False),
+            ("portable build", "compiled portable/portable, active portable/portable", 0, False),
+            ("other native backend", "compiled other/other, active other/other", 0, False),
+            ("only part of the line", f"compiled {backend}, active {backend}x", 0, False),
+            ("test failed", native_line, 201, False),
+        ]
+        for label, line, exit_code, ok in cases:
+            with self.subTest(job=job_id, native_check=label), tempfile.TemporaryDirectory(dir=fixture.root) as tmp:
+                build = Path(tmp)
+                (build / "bin").mkdir()
+                stub = build / "bin" / "test_qbit"
+                stub.write_text("#!/bin/sh\n"
+                                'printf "%s\\n" "$*" > "$(dirname "$0")/args"\n'
+                                f"echo 'Running 1 test case...'\necho '{line}'\nexit {exit_code}\n", encoding="utf8")
+                stub.chmod(0o755)
+                step_env = svc.step_env(workflow, job, step, context)
+                step_env["BASE_BUILD_DIR"] = str(build)
+                result = svc.run_step(fixture, step, step_env, fixture.root, github_env)
+                self.assertEqual(result.returncode == 0, ok, result.completed.stdout + result.stderr)
+                self.assertEqual((build / "bin" / "args").read_text(encoding="utf8").split(),
+                                 ["--run_test=mlkem_tests/backend_selection", "--log_level=message", "--color_output=no"])
+                if not ok:
+                    self.assertIn("::error::", result.stderr)
+        # The line the step looks for is the one backend_selection logs.
+        self.assertIn('BOOST_TEST_MESSAGE("compiled " << compiled_arith << "/" << compiled_keccak << ", active " << '
+                      'active.arith << "/" << active.keccak);', MLKEM_TESTS.read_text(encoding="utf8"))
 
         # Evidence is reported exactly as for the matrix jobs.
         report = svc.find_step(job, REPORT_STEP)
@@ -949,10 +1022,10 @@ class PQWorkflowContractTest(unittest.TestCase):
             (build / "ctest-evidence" / "summary.md").write_text("| mlkem_tests | passed | 0.5 |\n", encoding="utf8")
             step_env = svc.step_env(workflow, job, report, context)
             step_env["BASE_BUILD_DIR"] = str(build)
-            result = svc.run_step(fixture, report, step_env, fixture.root, svc.github_env_for(context, MACOS_JOB, workflow["name"]))
+            result = svc.run_step(fixture, report, step_env, fixture.root, github_env)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("## macOS arm64 unit tests", result.summary)
-            self.assertIn("native AArch64", result.summary)
+            self.assertIn(f"## {job['name']}", result.summary)
+            self.assertIn(evidence_word, result.summary)
             self.assertIn("| mlkem_tests | passed | 0.5 |", result.summary)
 
     def test_contexts_are_available_where_used(self) -> None:

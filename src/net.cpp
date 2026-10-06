@@ -1191,7 +1191,8 @@ bool V2Transport::ProcessReceivedKeyBytes() noexcept
         EllSwiftPubKey ellswift(MakeByteSpan(m_recv_buffer));
         const bool negotiate{m_pq_options.mode == PQMode::NEGOTIATE};
         LOCK(m_send_mutex);
-        m_cipher.Initialize(ellswift, m_initiating, /*self_decrypt=*/false, /*retain_for_hybrid=*/negotiate);
+        m_cipher.Initialize(ellswift, m_initiating, /*self_decrypt=*/false,
+                            /*retain_for_hybrid=*/negotiate || m_pq_options.retain_without_negotiation);
 
         // Switch receiver state to GARB_GARBTERM.
         SetReceiveState(RecvState::GARB_GARBTERM);
@@ -1390,8 +1391,10 @@ bool V2Transport::ProcessVersionContents(std::span<const std::byte> contents) no
     m_pq.SetVersionReceived();
 
     // Without the negotiation (switch off, fallback, or a responder that could not offer), the
-    // contents are neither parsed nor validated.
+    // contents are neither parsed nor validated. Nothing is held for a switch past this point,
+    // whichever path declined it (a no-op unless that path kept a secret).
     if (m_send_state != SendState::AWAITING_VERSION) {
+        ClearHybridSecrets();
         SetReceiveState(RecvState::APP);
         return true;
     }

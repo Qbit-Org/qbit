@@ -329,7 +329,6 @@ def build_plan(
     development_ref: str,
     publisher_sha: str,
     repository: str,
-    development_checkout_ref: str = "",
     release_resolver: Callable[[dict[str, Any]], str] | None = None,
     development_resolver: Callable[[str], str] = resolve_commit,
 ) -> dict[str, Any]:
@@ -342,7 +341,7 @@ def build_plan(
         "path": "main",
         "source_ref": development_ref,
         "source_sha": development_sha,
-        "source_checkout_ref": development_checkout_ref or development_sha,
+        "source_checkout_ref": development_sha,
     }
     return {
         "schema_version": SCHEMA_VERSION,
@@ -588,7 +587,6 @@ def parse_args() -> argparse.Namespace:
     discover = subparsers.add_parser("discover")
     discover.add_argument("--repository", required=True)
     discover.add_argument("--development-ref", required=True)
-    discover.add_argument("--development-checkout-ref", default="")
     discover.add_argument("--publisher-sha", required=True)
     discover.add_argument("--output", required=True)
     discover.add_argument("--github-output")
@@ -612,7 +610,6 @@ def main() -> int:
         plan = build_plan(
             releases,
             development_ref=args.development_ref,
-            development_checkout_ref=args.development_checkout_ref,
             publisher_sha=args.publisher_sha,
             repository=args.repository,
         )

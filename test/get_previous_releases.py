@@ -170,6 +170,14 @@ def resolve_download(tag, host):
     )
 
 
+def default_tags(host):
+    """Return the release tags the backwards compatibility tests use, without
+    the qbit releases that have no archive for the host."""
+    core_tags = {v['tag'] for v in SHA256_SUMS.values()}
+    qbit_tags = {tag for tag in QBIT_RELEASES if resolve_download(tag, host) is not None}
+    return sorted(core_tags | qbit_tags)
+
+
 @contextlib.contextmanager
 def pushd(new_dir) -> None:
     previous_dir = os.getcwd()
@@ -338,8 +346,15 @@ def main(args) -> int:
     ret = set_host(args)
     if ret:
         return ret
+    tags = args.tags
+    if not tags:
+        # A tag that is asked for explicitly but has no archive for the host
+        # still fails in download_binary.
+        tags = default_tags(args.host)
+        for tag in sorted(set(QBIT_RELEASES) - set(tags)):
+            print(f"Skipping {tag}: no qbit {tag} archive for host {args.host}")
     with pushd(args.target_dir):
-        for tag in args.tags:
+        for tag in tags:
             ret = download_binary(tag, args)
             if ret:
                 return ret
@@ -358,11 +373,11 @@ if __name__ == '__main__':
                         help='remove existing directory.')
     parser.add_argument('-t', '--target-dir', action='store',
                         help='target directory.', default='releases')
-    all_tags = sorted([*set([v['tag'] for v in SHA256_SUMS.values()]), *QBIT_RELEASES])
-    parser.add_argument('tags', nargs='*', default=all_tags,
+    parser.add_argument('tags', nargs='*', default=[],
                         help='release tags. e.g.: v0.18.1 v0.20.0rc2 '
                         '(if not specified, the full list needed for '
-                        'backwards compatibility tests will be used)'
+                        'backwards compatibility tests will be used, without '
+                        'qbit releases that have no archive for the host)'
                         )
     args = parser.parse_args()
     sys.exit(main(args))

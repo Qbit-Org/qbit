@@ -593,7 +593,23 @@ static void LogConnectFailure(bool manual_connection, util::ConstevalFormatStrin
     }
 }
 
-static bool ConnectToSocket(const Sock& sock, struct sockaddr* sockaddr, socklen_t len, const std::string& dest_str, bool manual_connection)
+namespace {
+/** Limits of a connection attempt made by `Proxy::Connect(deadline, interrupt)`. */
+struct ConnectBound {
+    /** Give up at this time. */
+    std::chrono::steady_clock::time_point deadline;
+    /** Give up as soon as this is signaled. */
+    CThreadInterrupt& interrupt;
+};
+} // namespace
+
+/**
+ * Connect to `sockaddr` using `sock`.
+ * @param[in] bound If null, wait at most `nConnectTimeout` for the connection to be established.
+ * Otherwise wait until `bound->deadline` in slices of at most `MAX_CONNECT_POLL_INTERVAL` and
+ * give up as soon as `bound->interrupt` is signaled.
+ */
+static bool ConnectToSocket(const Sock& sock, struct sockaddr* sockaddr, socklen_t len, const std::string& dest_str, bool manual_connection, const ConnectBound* bound)
 {
     // Connect to `sockaddr` using `sock`.
     if (sock.Connect(sockaddr, len) == SOCKET_ERROR) {
@@ -605,13 +621,34 @@ static bool ConnectToSocket(const Sock& sock, struct sockaddr* sockaddr, socklen
             // asynchronously. Thus, use async I/O api (select/poll)
             // synchronously to check for successful connection with a timeout.
             const Sock::Event requested = Sock::RECV | Sock::SEND;
-            Sock::Event occurred;
-            if (!sock.Wait(std::chrono::milliseconds{nConnectTimeout}, requested, &occurred)) {
-                LogPrintf("wait for connect to %s failed: %s\n",
-                          dest_str,
-                          NetworkErrorString(WSAGetLastError()));
-                return false;
-            } else if (occurred == 0) {
+            Sock::Event occurred{0};
+            if (bound == nullptr) {
+                if (!sock.Wait(std::chrono::milliseconds{nConnectTimeout}, requested, &occurred)) {
+                    LogPrintf("wait for connect to %s failed: %s\n",
+                              dest_str,
+                              NetworkErrorString(WSAGetLastError()));
+                    return false;
+                }
+            } else {
+                // Wait in short slices, so that an interrupt is noticed promptly.
+                while (occurred == 0) {
+                    if (bound->interrupt) {
+                        LogPrintLevel(BCLog::NET, BCLog::Level::Debug, "connection attempt to %s interrupted\n", dest_str);
+                        return false;
+                    }
+                    const auto now{std::chrono::steady_clock::now()};
+                    if (now >= bound->deadline) break;
+                    const auto slice{std::min(std::chrono::ceil<std::chrono::milliseconds>(bound->deadline - now),
+                                              MAX_CONNECT_POLL_INTERVAL)};
+                    if (!sock.Wait(slice, requested, &occurred)) {
+                        LogPrintf("wait for connect to %s failed: %s\n",
+                                  dest_str,
+                                  NetworkErrorString(WSAGetLastError()));
+                        return false;
+                    }
+                }
+            }
+            if (occurred == 0) {
                 LogPrintLevel(BCLog::NET, BCLog::Level::Debug, "connection attempt to %s timed out\n", dest_str);
                 return false;
             }
@@ -648,7 +685,7 @@ static bool ConnectToSocket(const Sock& sock, struct sockaddr* sockaddr, socklen
     return true;
 }
 
-std::unique_ptr<Sock> ConnectDirectly(const CService& dest, bool manual_connection)
+static std::unique_ptr<Sock> ConnectDirectly(const CService& dest, bool manual_connection, const ConnectBound* bound)
 {
     auto sock = CreateSock(dest.GetSAFamily(), SOCK_STREAM, IPPROTO_TCP);
     if (!sock) {
@@ -664,27 +701,32 @@ std::unique_ptr<Sock> ConnectDirectly(const CService& dest, bool manual_connecti
         return {};
     }
 
-    if (!ConnectToSocket(*sock, (struct sockaddr*)&sockaddr, len, dest.ToStringAddrPort(), manual_connection)) {
+    if (!ConnectToSocket(*sock, (struct sockaddr*)&sockaddr, len, dest.ToStringAddrPort(), manual_connection, bound)) {
         return {};
     }
 
     return sock;
 }
 
-std::unique_ptr<Sock> Proxy::Connect() const
+std::unique_ptr<Sock> ConnectDirectly(const CService& dest, bool manual_connection)
 {
-    if (!IsValid()) return {};
+    return ConnectDirectly(dest, manual_connection, /*bound=*/nullptr);
+}
 
-    if (!m_is_unix_socket) return ConnectDirectly(proxy, /*manual_connection=*/true);
+static std::unique_ptr<Sock> ConnectToProxy(const Proxy& proxy, const ConnectBound* bound)
+{
+    if (!proxy.IsValid()) return {};
+
+    if (!proxy.m_is_unix_socket) return ConnectDirectly(proxy.proxy, /*manual_connection=*/true, bound);
 
 #ifdef HAVE_SOCKADDR_UN
     auto sock = CreateSock(AF_UNIX, SOCK_STREAM, 0);
     if (!sock) {
-        LogPrintLevel(BCLog::NET, BCLog::Level::Error, "Cannot create a socket for connecting to %s\n", m_unix_socket_path);
+        LogPrintLevel(BCLog::NET, BCLog::Level::Error, "Cannot create a socket for connecting to %s\n", proxy.m_unix_socket_path);
         return {};
     }
 
-    const std::string path{m_unix_socket_path.substr(ADDR_PREFIX_UNIX.length())};
+    const std::string path{proxy.m_unix_socket_path.substr(ADDR_PREFIX_UNIX.length())};
 
     struct sockaddr_un addrun;
     memset(&addrun, 0, sizeof(addrun));
@@ -693,7 +735,7 @@ std::unique_ptr<Sock> Proxy::Connect() const
     memcpy(addrun.sun_path, path.c_str(), std::min(sizeof(addrun.sun_path) - 1, path.length()));
     socklen_t len = sizeof(addrun);
 
-    if(!ConnectToSocket(*sock, (struct sockaddr*)&addrun, len, path, /*manual_connection=*/true)) {
+    if(!ConnectToSocket(*sock, (struct sockaddr*)&addrun, len, path, /*manual_connection=*/true, bound)) {
         return {};
     }
 
@@ -701,6 +743,19 @@ std::unique_ptr<Sock> Proxy::Connect() const
 #else
     return {};
 #endif
+}
+
+std::unique_ptr<Sock> Proxy::Connect() const
+{
+    return ConnectToProxy(*this, /*bound=*/nullptr);
+}
+
+std::unique_ptr<Sock> Proxy::Connect(std::chrono::steady_clock::time_point deadline,
+                                     CThreadInterrupt& interrupt) const
+{
+    if (interrupt || std::chrono::steady_clock::now() >= deadline) return {};
+    const ConnectBound bound{.deadline = deadline, .interrupt = interrupt};
+    return ConnectToProxy(*this, &bound);
 }
 
 bool SetProxy(enum Network net, const Proxy &addrProxy) {
