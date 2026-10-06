@@ -261,7 +261,12 @@ ssize_t DynSock::Pipe::GetBytes(void* buf, size_t len, int flags)
         if (m_eof) {
             return 0;
         }
-        errno = EAGAIN; // Same as recv(2) on a non-blocking socket.
+        // Same as recv(2) on a non-blocking socket, reported where callers read it:
+        // WSAGetLastError() is errno except on Windows, where it is Winsock's own error.
+        errno = EAGAIN;
+#ifdef WIN32
+        WSASetLastError(WSAEWOULDBLOCK);
+#endif
         return -1;
     }
 
