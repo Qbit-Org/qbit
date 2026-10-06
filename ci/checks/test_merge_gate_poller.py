@@ -216,6 +216,10 @@ class MergeGatePollerTest(unittest.TestCase):
             "GH_TOKEN": "fake-token",
             "REPOSITORY": "example/repo",
             "SHA": "0" * 40,
+            "RUN_ID": "12345",
+            "RUN_ATTEMPT": "1",
+            # Tests that model the start-time lookup clear this.
+            "GATE_RUN_STARTED_AT": "2026-10-06T14:12:00Z",
         }
         declared = set(self.step["env"])
         self.assertFalse(
@@ -548,6 +552,37 @@ class MergeGatePollerTest(unittest.TestCase):
         )
         completed = self.run_gate(fake, GATE_RUN_STARTED_AT=self.GATE_START)
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+
+    def test_the_gate_start_is_the_workflow_runs_not_the_steps(self) -> None:
+        # The step starts after the jobs it needs, so a failure from this run can
+        # complete before it; the run's own start time keeps it a current failure.
+        attempt = ok(json.dumps({"run_started_at": "2026-10-06T14:00:00Z"}))
+        fake = FakeGh(
+            self.tmp("run-start"),
+            responses=[attempt],
+            default=ok(body(page(
+                check_run("Core Checks Gate", "completed", "failure", started_at="2026-10-06T14:01:00Z", completed_at="2026-10-06T14:05:00Z"),
+                check_run("Full Validation Gate", "completed", "success", started_at="2026-10-06T14:01:00Z", completed_at="2026-10-06T14:05:00Z"),
+            ))),
+        )
+        completed = self.run_gate(fake, GATE_RUN_STARTED_AT="")
+        self.assertGateFailed(completed, f"{ERROR_CHECK_FAILED}Core Checks Gate concluded failure.",
+                              forbidden=(ERROR_TIMED_OUT,))
+        self.assertIn("Gate run started at 2026-10-06T14:00:00Z", completed.stdout)
+        self.assertIn("/actions/runs/12345/attempts/1", " ".join(fake.calls))
+
+    def test_an_unreadable_run_start_falls_back_with_a_warning(self) -> None:
+        fake = FakeGh(
+            self.tmp("run-start-unreadable"),
+            responses=[ok("not json")],
+            default=ok(body(page(
+                check_run("Core Checks Gate", "completed", "success", started_at="1"),
+                check_run("Full Validation Gate", "completed", "success", started_at="1"),
+            ))),
+        )
+        completed = self.run_gate(fake, GATE_RUN_STARTED_AT="")
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertIn("Required Merge Gate start time unknown", completed.stdout + completed.stderr)
 
     def test_a_queued_rerun_falls_back_to_created_at_and_is_pending(self) -> None:
         # A re-run that has not started yet has no started_at at all; ordering

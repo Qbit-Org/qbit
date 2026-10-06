@@ -711,6 +711,8 @@ jobs:
           TOUCHED_OPERATOR_KEYS: ${{ needs.classify-changes.outputs.touched_operator_keys }}
           REPOSITORY: ${{ github.repository }}
           SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
 
@@ -740,12 +742,6 @@ jobs:
           GATE_QUERY_BACKOFF_SECONDS="${GATE_QUERY_BACKOFF_SECONDS:-10}"
           GATE_QUERY_BACKOFF_CAP_SECONDS="${GATE_QUERY_BACKOFF_CAP_SECONDS:-60}"
           GATE_QUERY_TIMEOUT_SECONDS="${GATE_QUERY_TIMEOUT_SECONDS:-60}"
-          # When this gate run started, in the API's UTC format. A check that
-          # failed before then belongs to an earlier run on the same commit (a
-          # re-run, a reopen, a label); its newer run may not have created its
-          # check yet, so it is waited on rather than trusted. The test suite
-          # sets it.
-          GATE_RUN_STARTED_AT="${GATE_RUN_STARTED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 
           for gate_tunable in \
             GATE_WAIT_TIMEOUT_SECONDS \
@@ -874,6 +870,25 @@ jobs:
             return 1
           }
 
+          # When this gate run (this attempt of the workflow run) started, in
+          # the API's UTC format. A check that failed before then belongs to an
+          # earlier run on the same commit (a re-run, a reopen, a label); its
+          # newer run may not have created its check yet, so it is waited on
+          # rather than trusted. It is the workflow run's start, not this step's:
+          # this step starts after the jobs it needs, so a current failure can
+          # complete before it. Read only when checks are polled; the test suite
+          # sets it.
+          resolve_gate_run_started_at() {
+            if [[ -z "${GATE_RUN_STARTED_AT:-}" ]]; then
+              GATE_RUN_STARTED_AT="$(gh api "/repos/${REPOSITORY}/actions/runs/${RUN_ID}/attempts/${RUN_ATTEMPT}" 2>/dev/null | jq -r '.run_started_at // empty' 2>/dev/null || true)"
+              if [[ ! "${GATE_RUN_STARTED_AT}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
+                GATE_RUN_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+                echo "::warning title=Required Merge Gate start time unknown::Could not read this workflow run's start time; using the step's start time (${GATE_RUN_STARTED_AT}), so a failure that completed before this step may be waited on instead of failing at once."
+              fi
+            fi
+            echo "Gate run started at ${GATE_RUN_STARTED_AT}"
+          }
+
           # Wait until every named check on ${SHA} has concluded successfully.
           #
           # Returns 1 under three distinct error titles: a check concluded
@@ -888,6 +903,7 @@ jobs:
             local pending=()
             local check_name completed_at conclusion fields now observation status deadline rest
 
+            resolve_gate_run_started_at
             now="$(date +%s)"
             deadline=$(( now + GATE_WAIT_TIMEOUT_SECONDS ))
 
