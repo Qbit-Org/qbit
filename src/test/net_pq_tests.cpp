@@ -37,6 +37,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -198,6 +199,44 @@ public:
         });
     }
     ~LogLineCounter() { LogInstance().DeleteCallback(m_callback); }
+};
+
+/** Sets a global while alive, and puts the old value back on every path: a failed BOOST_REQUIRE
+ *  throws past the end of the test, and later suites in the same process must not see it. */
+template <typename T>
+class GlobalOverride
+{
+    T& m_global;
+    T m_previous;
+
+public:
+    GlobalOverride(T& global, T value) : m_global{global}, m_previous{std::exchange(global, std::move(value))} {}
+    ~GlobalOverride() { m_global = std::move(m_previous); }
+    GlobalOverride(const GlobalOverride&) = delete;
+    GlobalOverride& operator=(const GlobalOverride&) = delete;
+};
+
+/** A CreateSock that hands out sockets with contents, or ZeroSocks without. */
+GlobalOverride<decltype(CreateSock)> MockCreateSock(std::string contents = {})
+{
+    if (contents.empty()) return {CreateSock, [](int, int, int) -> std::unique_ptr<Sock> { return std::make_unique<ZeroSock>(); }};
+    return {CreateSock, [contents](int, int, int) -> std::unique_ptr<Sock> { return std::make_unique<StaticContentsSock>(contents); }};
+}
+
+/** Clears the SOCKS5 interrupt while alive, and sets it again on every path if it was set. Every
+ *  CConnman::Interrupt() sets it, such as an earlier test's at teardown. */
+class Socks5InterruptCleared
+{
+    const bool m_was_set{g_socks5_interrupt};
+
+public:
+    Socks5InterruptCleared() { g_socks5_interrupt.reset(); }
+    ~Socks5InterruptCleared()
+    {
+        if (m_was_set) g_socks5_interrupt();
+    }
+    Socks5InterruptCleared(const Socks5InterruptCleared&) = delete;
+    Socks5InterruptCleared& operator=(const Socks5InterruptCleared&) = delete;
 };
 
 /** Our outbound node's peer: a responder. */
@@ -474,9 +513,8 @@ BOOST_AUTO_TEST_CASE(pq_endpoint_identity)
     BOOST_CHECK(named.node->m_pq_endpoint == PQEndpointKey{(PQNameEndpoint{"seed.example", 18444})});
 
     // Outbound construction captures the resolved destination and port.
-    const auto create_sock_orig{CreateSock};
-    CreateSock = [](int, int, int) -> std::unique_ptr<Sock> { return std::make_unique<ZeroSock>(); };
     {
+        const auto create_sock{MockCreateSock()};
         const std::unique_ptr<CNode> outbound{m_connman.ConnectNodeOnly("5.6.7.8:18555", ConnectionType::MANUAL, /*use_v2transport=*/true)};
         BOOST_REQUIRE(outbound);
         BOOST_CHECK(outbound->m_pq_endpoint == PQEndpointKey{LookupNumeric("5.6.7.8", 18555)});
@@ -484,7 +522,6 @@ BOOST_AUTO_TEST_CASE(pq_endpoint_identity)
         BOOST_REQUIRE(ipv6);
         BOOST_CHECK(ipv6->m_pq_endpoint == PQEndpointKey{LookupNumeric("2a01:4f8::2", 18555)});
     }
-    CreateSock = create_sock_orig;
 
     // Inbound uses the actual remote address and source port.
     m_connman.CreateNodeFromAcceptedSocketPublic(std::make_unique<ZeroSock>(), LookupNumeric("127.0.0.1", 18444), LookupNumeric("9.8.7.6", 51234));
@@ -522,17 +559,12 @@ BOOST_AUTO_TEST_CASE(pq_name_proxy_endpoint)
     // the proxy for it, and the endpoint key is the normalized SOCKS destination and the
     // effective port, never the proxy's own address.
     const CService proxy{LookupNumeric("127.0.0.9", 9050)};
-    const auto create_sock_orig{CreateSock};
-    // Every CConnman's Interrupt(), such as an earlier test's at teardown, interrupts SOCKS5.
-    const bool socks5_interrupted{g_socks5_interrupt};
-    g_socks5_interrupt.reset();
     {
+        const Socks5InterruptCleared socks5_interrupt;
         ProxySettingsRestorerForTesting restore_proxies;
         BOOST_REQUIRE(SetNameProxy(Proxy{proxy}));
         // The proxy accepts without authentication, then reports the connection made.
-        CreateSock = [](int, int, int) -> std::unique_ptr<Sock> {
-            return std::make_unique<StaticContentsSock>(std::string{"\x05\x00" "\x05\x00\x00\x01" "\x00\x00\x00\x00" "\x00\x00", 12});
-        };
+        const auto create_sock{MockCreateSock(std::string{"\x05\x00" "\x05\x00\x00\x01" "\x00\x00\x00\x00" "\x00\x00", 12})};
         for (const auto& [dest, key] : {std::pair{"Seed.Example.COM.:18555", PQNameEndpoint{"seed.example.com", 18555}},
                                         std::pair{"seed.example.com", PQNameEndpoint{"seed.example.com", Params().GetDefaultPort()}},
                                         std::pair{"other.example:18555", PQNameEndpoint{"other.example", 18555}}}) {
@@ -541,9 +573,7 @@ BOOST_AUTO_TEST_CASE(pq_name_proxy_endpoint)
             BOOST_CHECK(node->m_pq_endpoint == PQEndpointKey{key});
             BOOST_CHECK(node->m_pq_endpoint != PQEndpointKey{proxy});
         }
-        CreateSock = create_sock_orig;
     }
-    if (socks5_interrupted) g_socks5_interrupt();
     // No later test sees the name proxy.
     BOOST_CHECK(!HaveNameProxy());
 }
@@ -1001,12 +1031,10 @@ BOOST_AUTO_TEST_CASE(pq_log_lines)
     {
         Link link{Add(ConnectionType::MANUAL)};
         V2Transport peer{Responder()};
-        const bool log_ips{fLogIPs};
-        fLogIPs = true;
+        const GlobalOverride log_ips{fLogIPs, true};
         const auto expect{ExpectLine(strprintf("v2 pq: switched role=initiator conn_type=manual peer=%d peeraddr=1.2.3.4:8333", link.node->GetId()),
                                      LineLevel::NET_DEBUG)};
         Exchange(link, peer);
-        fLogIPs = log_ips;
     }
     Disconnect();
 
@@ -1247,8 +1275,7 @@ BOOST_AUTO_TEST_CASE(pq_fallback_threshold)
 BOOST_AUTO_TEST_CASE(pq_fallback_windows)
 {
     const PQEndpointKey endpoint{LookupNumeric("5.6.7.8", 18555)};
-    const auto create_sock_orig{CreateSock};
-    CreateSock = [](int, int, int) -> std::unique_ptr<Sock> { return std::make_unique<ZeroSock>(); };
+    const auto create_sock{MockCreateSock()};
     // A new outbound connection to the endpoint, as the connection logic opens one.
     const auto new_status{[&] {
         const std::unique_ptr<CNode> node{m_connman.ConnectNodeOnly("5.6.7.8:18555", ConnectionType::OUTBOUND_FULL_RELAY, /*use_v2transport=*/true)};
@@ -1288,7 +1315,6 @@ BOOST_AUTO_TEST_CASE(pq_fallback_windows)
     }
     // Existing sessions never renegotiate.
     BOOST_CHECK(running.node->m_transport->GetInfo().transport_pq_status == PQStatus::PENDING);
-    CreateSock = create_sock_orig;
 }
 
 BOOST_AUTO_TEST_CASE(pq_success_protection)
