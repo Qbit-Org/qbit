@@ -420,7 +420,9 @@ struct PQNetSetup : public RegTestingSetup {
         }
         case End::LEGACY:
         case End::SUCCESS: {
-            V2Transport peer{end == End::LEGACY ? Responder({}) : Responder()};
+            // Not `cond ? a : b`: MSVC requires a copy constructor for a conditional of
+            // prvalues, and V2Transport has none.
+            V2Transport peer{[&] { if (end == End::LEGACY) return Responder({}); return Responder(); }()};
             Exchange(link, peer);
             BOOST_REQUIRE(link.node->m_transport->GetPQSnapshot().confirmed == (end == End::SUCCESS));
             link.node->RequestDisconnect();
@@ -687,8 +689,9 @@ BOOST_AUTO_TEST_CASE(pq_switched_then_failed)
 {
     for (const bool inbound : {false, true}) {
         Link link{Add(inbound ? ConnectionType::INBOUND : ConnectionType::OUTBOUND_FULL_RELAY)};
-        V2Transport peer{inbound ? Initiator({.mode = PQMode::NEGOTIATE, .corrupt_shared_secret = true}) :
-                                   Responder({.mode = PQMode::NEGOTIATE, .corrupt_shared_secret = true})};
+        // Not `cond ? a : b`: MSVC requires a copy constructor for a conditional of
+        // prvalues, and V2Transport has none.
+        V2Transport peer{[&] { if (inbound) return Initiator({.mode = PQMode::NEGOTIATE, .corrupt_shared_secret = true}); return Responder({.mode = PQMode::NEGOTIATE, .corrupt_shared_secret = true}); }()};
         Exchange(link, peer);
         const PQHandshake::Snapshot snapshot{link.node->m_transport->GetPQSnapshot()};
         BOOST_CHECK(snapshot.switched);
