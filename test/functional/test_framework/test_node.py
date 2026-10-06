@@ -956,7 +956,7 @@ class TestNode():
                     assert_msg += "with expected error " + expected_msg
                 self._raise_assertion_error(assert_msg)
 
-    def add_p2p_connection(self, p2p_conn, *, wait_for_verack=True, send_version=True, supports_v2_p2p=None, wait_for_v2_handshake=True, expect_success=True, **kwargs):
+    def add_p2p_connection(self, p2p_conn, *, wait_for_verack=True, send_version=True, supports_v2_p2p=None, supports_v2_pq=False, wait_for_v2_handshake=True, expect_success=True, **kwargs):
         """Add an inbound p2p connection to the node.
 
         This method adds the p2p connection to the self.p2ps list and also
@@ -968,6 +968,8 @@ class TestNode():
         - if TestNode doesn't advertise NODE_P2P_V2 service, P2PConnection sends version message and v1 P2P is followed
         - if TestNode advertises NODE_P2P_V2 service, (and if P2PConnections supports v2 P2P)
                 P2PConnection sends ellswift bytes and v2 P2P is followed
+        - supports_v2_pq: a v2 P2PConnection also negotiates hybrid post-quantum keys (opt-in; framework
+                peers are legacy BIP324 peers by default)
         """
         if 'dstport' not in kwargs:
             kwargs['dstport'] = p2p_port(self.index)
@@ -979,7 +981,8 @@ class TestNode():
         if self.use_v2transport:
             kwargs['services'] = kwargs.get('services', P2P_SERVICES) | NODE_P2P_V2
         supports_v2_p2p = self.use_v2transport and supports_v2_p2p
-        p2p_conn.peer_connect(**kwargs, send_version=send_version, net=self.chain, timeout_factor=self.timeout_factor, supports_v2_p2p=supports_v2_p2p)()
+        assert supports_v2_p2p or not supports_v2_pq
+        p2p_conn.peer_connect(**kwargs, send_version=send_version, net=self.chain, timeout_factor=self.timeout_factor, supports_v2_p2p=supports_v2_p2p, supports_v2_pq=supports_v2_pq)()
 
         self.p2ps.append(p2p_conn)
         if not expect_success:
@@ -1015,7 +1018,7 @@ class TestNode():
 
         return p2p_conn
 
-    def add_outbound_p2p_connection(self, p2p_conn, *, wait_for_verack=True, wait_for_disconnect=False, p2p_idx, connection_type="outbound-full-relay", supports_v2_p2p=None, advertise_v2_p2p=None, **kwargs):
+    def add_outbound_p2p_connection(self, p2p_conn, *, wait_for_verack=True, wait_for_disconnect=False, p2p_idx, connection_type="outbound-full-relay", supports_v2_p2p=None, advertise_v2_p2p=None, supports_v2_pq=False, wait_for_v2_handshake=True, **kwargs):
         """Add an outbound p2p connection from node. Must be an
         "outbound-full-relay", "block-relay-only", "addr-fetch" or "feeler" connection.
 
@@ -1029,6 +1032,8 @@ class TestNode():
         Parameters:
             supports_v2_p2p: whether p2p_conn supports v2 P2P or not
             advertise_v2_p2p: whether p2p_conn is advertised to support v2 P2P or not
+            supports_v2_pq: whether a v2 p2p_conn also negotiates hybrid post-quantum keys (opt-in)
+            wait_for_v2_handshake: whether to wait until the v2 handshake, including a hybrid key confirmation, is complete
 
         An outbound connection is made from TestNode -------> P2PConnection
             - if P2PConnection doesn't advertise_v2_p2p, TestNode sends version message and v1 P2P is followed
@@ -1056,7 +1061,8 @@ class TestNode():
         reconnect = advertise_v2_p2p and not supports_v2_p2p
         # P2PConnection needs to be advertised to support v2 P2P so that ellswift bytes are sent instead of msg_version
         supports_v2_p2p = supports_v2_p2p and advertise_v2_p2p
-        p2p_conn.peer_accept_connection(connect_cb=addconnection_callback, connect_id=p2p_idx + 1, net=self.chain, timeout_factor=self.timeout_factor, supports_v2_p2p=supports_v2_p2p, reconnect=reconnect, **kwargs)()
+        assert supports_v2_p2p or not supports_v2_pq
+        p2p_conn.peer_accept_connection(connect_cb=addconnection_callback, connect_id=p2p_idx + 1, net=self.chain, timeout_factor=self.timeout_factor, supports_v2_p2p=supports_v2_p2p, reconnect=reconnect, supports_v2_pq=supports_v2_pq, **kwargs)()
 
         if reconnect:
             p2p_conn.wait_for_reconnect()
@@ -1069,6 +1075,8 @@ class TestNode():
             p2p_conn.wait_for_connect()
             self.p2ps.append(p2p_conn)
 
+            if supports_v2_p2p and not wait_for_v2_handshake:
+                return p2p_conn
             if supports_v2_p2p:
                 p2p_conn.wait_until(lambda: p2p_conn.v2_state.tried_v2_handshake)
             p2p_conn.wait_until(lambda: not p2p_conn.on_connection_send_msg)
