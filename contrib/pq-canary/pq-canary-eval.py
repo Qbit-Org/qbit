@@ -35,6 +35,9 @@ Evidence rules:
   endpoint is missing or malformed makes its figure unknown.
 - The report names known-good peers by their label, never by address; peer
   addresses stay in failures.jsonl and the known-good list on the node.
+- --pool, --archive and --control are three different nodes: samples that share
+  a file, a host label or an instance_id, or one file with several host labels,
+  are rejected as bad input rather than compared with themselves.
 
 Exit status: 0 when the verdict (figures 1, 2 and 4) is pass, 1 when any of
 them fails, 3 when none fails but one is unknown, 2 for bad arguments or input.
@@ -667,6 +670,33 @@ def file_arg(text: str) -> Path:
     return path
 
 
+def role_error(roles: list[tuple[str, Path, list[dict[str, str | None]]]]) -> str | None:
+    """Why the samples given for --pool, --archive and --control are not each one distinct node, or None.
+
+    A role's samples carry one host label; no two roles share a file, a host
+    label or an instance_id, so no node is compared with itself.
+    """
+    hosts: dict[str, str] = {}
+    instances: dict[str, str] = {}
+    for index, (role, path, rows) in enumerate(roles):
+        for other, other_path, _ in roles[:index]:
+            if path.samefile(other_path):
+                return f"--{other} and --{role} are the same file; each role needs its own node's samples"
+        labels = {row["host"] for row in rows}
+        if any(label is None or not LABEL.match(label) for label in labels):
+            return f"--{role} has a row without a valid host label"
+        if len(labels) > 1:
+            return f"--{role} mixes the host labels {', '.join(sorted(map(str, labels)))}; give one node's samples per role"
+        for label in map(str, labels):
+            if label in hosts:
+                return f"--{hosts[label]} and --{role} both have the host label {label}; each role needs its own node"
+            hosts[label] = role
+        for instance in {row["instance_id"] for row in rows if row["instance_id"] is not None}:
+            if instances.setdefault(instance, role) != role:
+                return f"--{instances[instance]} and --{role} report the same instance_id; each role needs its own node"
+    return None
+
+
 def hosts_arg(text: str) -> list[str]:
     hosts = [host.strip() for host in text.split(",")]
     if not all(LABEL.match(host) for host in hosts) or len(set(hosts)) != len(hosts):
@@ -719,6 +749,12 @@ def main(argv: list[str] | None = None) -> int:
         known_good = read_known_good(args.known_good) if args.known_good else None
     except (OSError, ValueError) as e:
         print(f"Error: {e}", file=sys.stderr)
+        return 2
+    error = role_error([(role, path, rows) for role, path, rows in
+                        (("pool", args.pool, pool), ("archive", args.archive, archive), ("control", args.control, control))
+                        if path is not None and rows is not None])
+    if error is not None:
+        print(f"Error: {error}", file=sys.stderr)
         return 2
     for record in records or []:
         if not isinstance(record, dict) or not isinstance(record.get("time"), int) or not isinstance(record.get("host"), str):

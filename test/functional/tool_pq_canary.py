@@ -135,15 +135,19 @@ class PQCanaryToolTest(BitcoinTestFramework):
 
     def test_evaluator_reads_the_samples(self):
         self.log.info("The evaluator prints every figure, unknown for evidence that does not cover a canary")
-        result = subprocess.run([sys.executable, str(self.tool_dir / "pq-canary-eval.py"), "--canary-start", "0",
-                                 "--pool", str(self.out / "current-pool" / "samples.csv"),
-                                 "--archive", str(self.out / "current" / "samples.csv")],
-                                capture_output=True, text=True)
+        evaluator = [sys.executable, str(self.tool_dir / "pq-canary-eval.py"), "--canary-start", "0"]
+        result = subprocess.run(evaluator + ["--pool", str(self.out / "current-pool" / "samples.csv")], capture_output=True, text=True)
         assert_equal(result.returncode, 3)
         figures = [line for line in result.stdout.splitlines() if line.split(" ", 1)[0] in ("pass", "fail", "unknown")]
         assert_equal(len(figures), 4)
         assert result.stdout.rstrip().endswith("canary verdict (figures 1, 2 and 4): unknown"), result.stdout
         assert os.path.getsize(self.out / "current" / "samples.csv") > 0
+
+        self.log.info("The evaluator never compares a node with itself")
+        same = str(self.out / "current" / "samples.csv")
+        result = subprocess.run(evaluator + ["--archive", same, "--control", same], capture_output=True, text=True)
+        assert_equal(result.returncode, 2)
+        assert "--archive and --control are the same file" in result.stderr, result.stderr
 
 
 if __name__ == '__main__':
