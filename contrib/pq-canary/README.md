@@ -163,13 +163,21 @@ bad arguments or input.
   `instance_id`, is a restart. For the pinned link, the samples from the last
   sample before the restart to 10 minutes after it (`--restart-grace`) are a
   gap: neither pass nor fail. The restarts are listed at the top of the report.
+  An uptime whose boot time differs from the one already seen for the same
+  `instance_id` contradicts it: that uptime is unknown, not a restart.
 - **Coverage.** Coverage is the share of the expected 5-minute samples that are
   present and usable. Below `--min-coverage`, the pinned link, a monitored
   node's failure evidence and an inbound-connections day are unknown, not
   judged.
 - **Unknown, never clean.** A sample with `sample_ok=0`, an `NA` where the
   figure needs a value, or a missing sample (for example while cron was not
-  running) is unknown. The pinned link passes only if it would pass with every
+  running) is unknown. So is a malformed value: a `time`, `uptime` or
+  `connections_in` that is not a plain non-negative integer (a row without a
+  usable `time` counts as missing), a row with more or fewer fields than the
+  header (such as a line cut short by a crash), and a connected pinned peer
+  whose connection type, `transport_pq` or `transport_pq_status` is missing or
+  malformed, or whose `transport_pq` is not 1 exactly when the status is
+  `hybrid`. The pinned link passes only if it would pass with every
   unknown sample counted as a failure, and fails only if it would fail with
   every unknown sample counted as a success; otherwise it is unknown.
 - **Rings.** Failure entries are read from each ring (`inbound`, `outbound`) by

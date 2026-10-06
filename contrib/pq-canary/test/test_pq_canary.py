@@ -201,6 +201,19 @@ class SampleRowTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 pq_canary.append_row(path, row)
 
+    def test_rows_with_the_wrong_number_of_fields_are_not_samples(self) -> None:
+        pool = Node("pool", boot=T0 - DAY, pinned=PINNED)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "samples.csv"
+            for index in range(3):
+                pq_canary.append_row(path, {key: NA if value is None else value for key, value in pool.sample(T0 + index * INTERVAL).items()})
+            header, first, second, third = path.read_text(encoding="utf8").splitlines()
+            # A crash cut the second row short and the next sample continued its line;
+            # a later crash left a short last line.
+            path.write_text("\n".join([header, first, second[:len(second) // 2] + third, first[:40]]) + "\n", encoding="utf8")
+            rows = pq_canary.read_rows(path)
+        self.assertEqual([row["time"] for row in rows], [str(T0)])
+
 
 @unittest.skipIf(shutil.which("bash") is None, "needs bash")
 class SamplerScriptTest(unittest.TestCase):
@@ -365,6 +378,73 @@ class PinnedLinkTest(unittest.TestCase):
         pool = Node("pool", boot=T0 - DAY, pinned=PINNED)
         self.assertEqual(self.evaluate([pool.sample(T0), pool.sample(T0)], 1).samples, 2)
         self.assertEqual(pq_eval.evaluate_pinned(None, None, window(10), INTERVAL, 600, 0.9).result, "unknown")
+
+    def test_malformed_numbers_are_missing(self) -> None:
+        pool = Node("pool", boot=T0 - DAY, pinned=PINNED)
+        rows = [pool.sample(T0 + i * INTERVAL, pinned_peer=None if i in (40, 41) else "manual-hybrid") for i in range(100)]
+        # The link was down in two samples: 98 of 100 fails.
+        self.assertEqual(self.evaluate(rows, 100).result, "fail")
+        for label, uptime in (("negative", "-30"), ("decimal", "30.0"), ("spaced", " 30"), ("non-ASCII digits", "\u0663\u0660"),
+                              ("underscored", "3_0")):
+            with self.subTest(uptime=label):
+                # Not an uptime, so not a restart: the two samples are judged, not excluded.
+                figure = self.evaluate([dict(row, uptime=uptime) if index in (40, 41) else row for index, row in enumerate(rows)], 100)
+                self.assertEqual(figure.result, "fail", figure.summary)
+                self.assertIn("unknown=0 excluded=0", figure.summary)
+        good = [pool.sample(T0 + i * INTERVAL) for i in range(100)]
+        for label, time in (("text", "soon"), ("decimal", f"{T0 + 40 * INTERVAL}.0"), ("negative", "-1"),
+                            ("beyond year 9999", str(10**14))):
+            with self.subTest(time=label):
+                # A row without a time is a missing sample: unknown.
+                figure = self.evaluate([dict(row, time=time) if index == 40 else row for index, row in enumerate(good)], 100)
+                self.assertIn("hybrid=99 not_hybrid=0 unknown=1", figure.summary)
+
+    def test_malformed_pinned_peer_is_unknown(self) -> None:
+        pool = Node("pool", boot=T0 - DAY, pinned=PINNED)
+        rows = [pool.sample(T0 + i * INTERVAL) for i in range(100)]
+        malformed = {
+            "pinned_present not 0 or 1": {"pinned_present": "yes"},
+            "no connection type": {"pinned_connection_type": None},
+            "malformed connection type": {"pinned_connection_type": "Manual connection"},
+            "transport_pq not 0 or 1": {"pinned_transport_pq": "true"},
+            "no transport_pq": {"pinned_transport_pq": None},
+            "no status": {"pinned_transport_pq_status": None},
+            "unknown status": {"pinned_transport_pq_status": "quantum"},
+            "unknown status, not hybrid": {"pinned_transport_pq": "0", "pinned_transport_pq_status": "quantum"},
+            "no status, not hybrid": {"pinned_transport_pq": "0", "pinned_transport_pq_status": None},
+            "hybrid without transport_pq": {"pinned_transport_pq": "0"},
+            "transport_pq without hybrid": {"pinned_transport_pq_status": "pending"},
+        }
+        for label, change in malformed.items():
+            with self.subTest(label):
+                # Neither hybrid nor a miss: two unknown samples in 100 cannot be judged against 99%.
+                figure = self.evaluate([dict(row, **change) if index in (10, 11) else row for index, row in enumerate(rows)], 100)
+                self.assertEqual(figure.result, "unknown", figure.summary)
+                self.assertIn("hybrid=98 not_hybrid=0 unknown=2", figure.summary)
+        # Well-formed values that are not a manual hybrid link are misses.
+        misses = {
+            "not connected": {"pinned_present": "0", "pinned_connection_type": None, "pinned_transport_pq": None,
+                              "pinned_transport_pq_status": None},
+            "not hybrid": {"pinned_transport_pq": "0", "pinned_transport_pq_status": "fallback"},
+            "automatic": {"pinned_connection_type": "outbound-full-relay"},
+        }
+        for label, change in misses.items():
+            with self.subTest(label):
+                figure = self.evaluate([dict(row, **change) if index in (10, 11) else row for index, row in enumerate(rows)], 100)
+                self.assertEqual(figure.result, "fail", figure.summary)
+                self.assertIn("hybrid=98 not_hybrid=2 unknown=0", figure.summary)
+
+    def test_uptime_that_contradicts_the_instance_is_unknown(self) -> None:
+        pool = Node("pool", boot=T0 - DAY, pinned=PINNED)
+        rows = [pool.sample(T0 + i * INTERVAL, pinned_peer=None if i in (40, 41) else "manual-hybrid") for i in range(100)]
+        # The node reports a fresh boot in the two samples where the link was down,
+        # but its instance_id did not change: that is no restart, so they are judged.
+        rows[40]["uptime"], rows[41]["uptime"] = "30", "330"
+        figure = self.evaluate(rows, 100)
+        self.assertEqual(figure.result, "fail", figure.summary)
+        self.assertIn("excluded=0", figure.summary)
+        self.assertEqual(pq_eval.restarts(rows), [])
+        self.assertEqual([row["uptime"] for _, row in pq_eval.samples(rows)[39:43]], [rows[39]["uptime"], None, None, rows[42]["uptime"]])
 
     def test_low_coverage_is_unknown_not_judged(self) -> None:
         pool = Node("pool", boot=T0 - DAY, pinned=PINNED)
@@ -845,6 +925,31 @@ class ConnectionsTest(unittest.TestCase):
                 # A given ratio still judges the canary days.
                 self.assertEqual(self.evaluate(archive_rows, control_rows, win, baseline_ratio=1.2).result, "pass")
 
+    def test_malformed_numbers_are_missing(self) -> None:
+        # Day 0 holds the baseline ratio; the archive then loses a third of its connections.
+        archive_rows, control_rows, win = self.series(lambda i: 36 if i < 288 else 24, lambda i: 30)
+        self.assertEqual(self.evaluate(archive_rows, control_rows, win).result, "fail")
+        later = T0 + DAY
+        for label, uptime in (("negative", "-1"), ("non-ASCII digits", "\u0661")):
+            with self.subTest(uptime=label):
+                # Not an uptime, so not a restart: the later days are unknown, not excluded.
+                broken = [dict(row, uptime=uptime) if int(row["time"]) >= later else row for row in archive_rows]
+                figure = self.evaluate(broken, control_rows, win)
+                self.assertEqual(figure.result, "unknown", figure.details)
+                self.assertFalse(any(" excluded:" in line for line in figure.details), figure.details)
+        for label, count in (("negative", "-30"), ("decimal", "30.5")):
+            with self.subTest(connections_in=label):
+                broken = [dict(row, connections_in=count) if int(row["time"]) >= later else row for row in control_rows]
+                self.assertEqual(self.evaluate(archive_rows, broken, win).result, "unknown")
+
+    def test_unanswered_samples_are_not_pairs(self) -> None:
+        archive_rows, control_rows, win = self.series(lambda i: 36, lambda i: 30)
+        # sample_ok=0 says a call failed: its values are not a measurement, even when present.
+        control_rows = [dict(row, sample_ok="0") if T0 + DAY <= int(row["time"]) < T0 + 2 * DAY else row for row in control_rows]
+        figure = self.evaluate(archive_rows, control_rows, win)
+        self.assertEqual(figure.result, "unknown", figure.details)
+        self.assertEqual(figure.samples, (self.CANARY_DAYS - 1) * DAY // INTERVAL)
+
     def test_days_need_coverage(self) -> None:
         # 30 of a full day's 288 samples missing on the control: 89.6% coverage.
         archive_rows, control_rows, win = self.series(lambda i: 36, lambda i: 30)
@@ -912,6 +1017,17 @@ class EvaluatorCommandTest(unittest.TestCase):
         self.assertTrue(failures_line.startswith("unknown "), failures_line)
         self.assertIn("unknown pool: coverage 0.0%", one_node.stdout)
 
+    def test_sample_time_beyond_year_9999_is_not_a_sample(self) -> None:
+        pool = Node("pool", boot=T0 - DAY, pinned=PINNED)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "pool.csv"
+            for index in range(3):
+                row = pool.sample(T0 + index * INTERVAL)
+                pq_canary.append_row(path, {key: NA if value is None else value for key, value in dict(row, time=str(10**14) if index == 2 else row["time"]).items()})
+            result = self.run_evaluator("--canary-start", str(T0), "--pool", str(path))
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertIn(f"PQ canary evaluation: {pq_eval.utc(T0)} to {pq_eval.utc(T0 + INTERVAL)}", result.stdout)
+
     def test_zero_baseline_is_reported_not_raised(self) -> None:
         archive, control = Node("archive", boot=T0 - 60 * DAY), Node("control", boot=T0 - 60 * DAY, v1_0_0=True)
         with tempfile.TemporaryDirectory() as tmp:
@@ -948,6 +1064,7 @@ class EvaluatorCommandTest(unittest.TestCase):
             cases = {
                 "the following arguments are required: --canary-start": ["--pool", pool],
                 "expected Unix seconds or an ISO 8601 time": ["--canary-start", "yesterday", "--pool", pool],
+                "expected a time from 1970 to 9999, got '99999999999999'": start + ["--pool", pool, "--end", "99999999999999"],
                 "give at least one of --pool": start,
                 "unrecognized arguments: --bogus": start + ["--pool", pool, "--bogus"],
                 "unrecognized arguments: --pool-csv": start + ["--pool-csv", pool],
