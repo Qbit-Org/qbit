@@ -12,6 +12,7 @@
 #include <cassert>
 #include <cstdint>
 #include <cstdlib>
+#include <iostream>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -22,9 +23,24 @@ namespace {
 
 void Initialize()
 {
-    // MLKEM_FORCE_PORTABLE=1 runs every operation on portable C.
-    const char* force_portable{std::getenv("MLKEM_FORCE_PORTABLE")};
-    InitializeRuntime(force_portable != nullptr && std::string_view{force_portable} == "1");
+    // MLKEM_FORCE_PORTABLE=1 runs every operation on portable C; unset, empty
+    // or 0 runs the detected backend. Any other value is refused, so that a
+    // misspelled setting cannot turn CI's portable replay into a second
+    // native one, and the portable replay checks that portable C is what runs.
+    const char* env{std::getenv("MLKEM_FORCE_PORTABLE")};
+    const std::string_view setting{env != nullptr ? env : ""};
+    if (setting != "" && setting != "0" && setting != "1") {
+        std::cerr << "MLKEM_FORCE_PORTABLE must be unset, 0 or 1, not '" << setting << "'" << std::endl;
+        std::abort();
+    }
+    InitializeRuntime(/*force_portable=*/setting == "1");
+    const BackendNames active{GetBackendNames()};
+    std::cerr << "ML-KEM backend: " << active.arith << "/" << active.keccak
+              << (setting == "1" ? " (MLKEM_FORCE_PORTABLE=1)" : "") << std::endl;
+    if (setting == "1" && (active.arith != "portable" || active.keccak != "portable")) {
+        std::cerr << "MLKEM_FORCE_PORTABLE=1, but the active backend is not portable" << std::endl;
+        std::abort();
+    }
 }
 
 template <size_t N>
