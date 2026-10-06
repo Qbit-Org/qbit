@@ -102,6 +102,8 @@ static const size_t DEFAULT_MAXRECEIVEBUFFER = 5 * 1000;
 static const size_t DEFAULT_MAXSENDBUFFER    = 1 * 1000;
 
 static constexpr bool DEFAULT_V2_TRANSPORT{true};
+/** -v2pqtransport default: off until the default-on change of #184 part 9. */
+static constexpr bool DEFAULT_V2_PQ_TRANSPORT{false};
 
 typedef int64_t NodeId;
 
@@ -956,6 +958,21 @@ struct PQTransportStats {
     PQLoadSheddingStats load_shedding;
 };
 
+/**
+ * The hybrid post-quantum v2 transport configuration: computed once at startup from the effective
+ * -v2transport, -v2pqtransport and -test settings, and used unchanged for the startup warnings,
+ * the startup line, every new connection and RPC.
+ */
+struct PQTransportConfig {
+    //! -v2transport.
+    bool v2_enabled{false};
+    //! -v2pqtransport, which has no effect without v2_enabled.
+    bool pq_requested{false};
+    //! -test=pq_fail_first_packet: corrupt the local ML-KEM shared secret of every hybrid handshake.
+    bool fail_first_packet{false};
+    bool Enabled() const noexcept { return v2_enabled && pq_requested; }
+};
+
 struct CNodeOptions
 {
     NetPermissionFlags permission_flags = NetPermissionFlags::None;
@@ -1408,6 +1425,8 @@ public:
         bool whitelist_relay = DEFAULT_WHITELISTRELAY;
         //! Inbound offer load shedding threshold (unit tests and the flood lab).
         uint64_t pq_shed_threshold_per_s{DEFAULT_PQ_SHED_THRESHOLD_PER_S};
+        //! The hybrid post-quantum v2 transport configuration; off unless set.
+        PQTransportConfig m_pq{};
     };
 
     void Init(const Options& connOptions) EXCLUSIVE_LOCKS_REQUIRED(!m_added_nodes_mutex, !m_total_bytes_sent_mutex, !m_pq_shed_mutex)
@@ -1447,6 +1466,8 @@ public:
             // At least 1: a threshold of 0 would shed every offer and never stop.
             m_pq_shed_threshold = std::max<uint64_t>(connOptions.pq_shed_threshold_per_s, 1);
         }
+        m_pq_config = connOptions.m_pq;
+        m_pq_mode = m_pq_config.Enabled() ? PQMode::NEGOTIATE : PQMode::OFF;
     }
 
     CConnman(uint64_t seed0, uint64_t seed1, AddrMan& addrman, const NetGroupManager& netgroupman,
@@ -2084,8 +2105,10 @@ private:
     /** Warn that this node's own ML-KEM code may be at fault. */
     void LogPQLocalFault() const;
 
-    /** The hybrid negotiation mode of new v2 connections. Off until the option sets it (part 6);
-     *  set before the connection threads start. */
+    /** The hybrid post-quantum v2 transport configuration (Options::m_pq), and the negotiation
+     *  mode of new v2 connections it gives. Both are set by Init(), before the connection
+     *  threads start, and never change afterwards. */
+    PQTransportConfig m_pq_config{};
     PQMode m_pq_mode{PQMode::OFF};
 
     mutable Mutex m_pq_mutex;

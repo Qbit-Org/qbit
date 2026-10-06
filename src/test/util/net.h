@@ -106,8 +106,6 @@ struct ConnmanTestMsg : public CConnman {
         DisconnectNodes();
     }
 
-    void SetPQMode(PQMode mode) { m_pq_mode = mode; }
-
     void UpdatePQSheddingPublic() EXCLUSIVE_LOCKS_REQUIRED(!m_pq_shed_mutex) { UpdatePQShedding(PQShedNow()); }
 
     /** Run the socket handler thread, as Start() does. */

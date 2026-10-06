@@ -20,6 +20,7 @@
 #include <common/system.h>
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
+#include <crypto/mlkem.h>
 #include <deploymentstatus.h>
 #include <hash.h>
 #include <httprpc.h>
@@ -565,6 +566,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-i2pacceptincoming", strprintf("Whether to accept inbound I2P connections (default: %i). Ignored if -i2psam is not set. Listening for inbound I2P connections is done through the SAM proxy, not by binding to a local address and port.", DEFAULT_I2P_ACCEPT_INCOMING), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-onlynet=<net>", "Make automatic outbound connections only to network <net> (" + Join(GetNetworkNames(), ", ") + "). Inbound and manual connections are not affected by this option. It can be specified multiple times to allow multiple networks.", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-v2transport", strprintf("Support v2 transport (default: %u)", DEFAULT_V2_TRANSPORT), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-v2pqtransport", strprintf("Support hybrid post-quantum key exchange (ML-KEM-1024) in v2 transport. Has no effect with -v2transport=0 (default: %u)", DEFAULT_V2_PQ_TRANSPORT), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-peerbloomfilters", strprintf("Support filtering of blocks and transaction with bloom filters (default: %u)", DEFAULT_PEERBLOOMFILTERS), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-peerblockfilters", strprintf("Serve compact block filters to peers per BIP 157 (default: %u)", DEFAULT_PEERBLOCKFILTERS), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-txreconciliation", strprintf("Enable transaction reconciliations per BIP 330 (default: %d)", DEFAULT_TXRECONCILIATION_ENABLE), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CONNECTION);
@@ -649,6 +651,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-limitdescendantsize=<n>", strprintf("Do not accept transactions if any ancestor would have more than <n> kilobytes of in-mempool descendants (default: %u).", DEFAULT_DESCENDANT_SIZE_LIMIT_KVB), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-test=<option>", "Pass a test-only option. Options include : " + Join(TEST_OPTIONS_DOC, ", ") + ".", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-capturemessages", "Capture all P2P messages to disk", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-mlkemportable", "Use the portable ML-KEM-1024 code instead of native code, in case native code misbehaves on this CPU (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-mocktime=<n>", "Replace actual time with " + UNIX_EPOCH_TIME + " (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-maxsigcachesize=<n>", strprintf("Limit sum of signature cache and script execution cache sizes to <n> MiB (default: %u)", DEFAULT_VALIDATION_CACHE_BYTES >> 20), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-maxtipage=<n>",
@@ -847,6 +850,44 @@ int available_fds;
 ServiceFlags g_local_services = ServiceFlags(NODE_NETWORK_LIMITED | NODE_WITNESS);
 int64_t peer_connect_timeout;
 std::set<BlockFilterType> g_enabled_filter_types;
+//! Set once by AppInitParameterInteraction(), for the startup line and the connection manager.
+PQTransportConfig g_pq_transport_config;
+
+/**
+ * Whether a boolean setting means what it says. Booleans are read as integers (InterpretBool()),
+ * so a string that isn't one completely, under the same whitespace and sign rules, is read as
+ * something its text doesn't say: "true" as 0, "1abc" as 1, an overflowing number as 1. An empty
+ * value means true, and a negated setting is already a boolean.
+ */
+bool IsNumericBoolSetting(const common::SettingsValue& value)
+{
+    if (!value.isStr() || value.get_str().empty()) return true;
+    std::string_view number{util::TrimStringView(value.get_str())};
+    if (number.starts_with('+') && !number.starts_with("+-")) number.remove_prefix(1);
+    return ToIntegral<int>(number).has_value();
+}
+
+/** The hybrid post-quantum v2 transport configuration of the effective settings, and the warnings
+ *  they need. */
+PQTransportConfig GetPQTransportConfig(const ArgsManager& args, std::vector<bilingual_str>& warnings)
+{
+    const common::SettingsValue pq_setting{args.GetSetting("-v2pqtransport")};
+    const std::optional<bool> pq_explicit{SettingToBool(pq_setting)};
+    const PQTransportConfig config{
+        .v2_enabled = args.GetBoolArg("-v2transport", DEFAULT_V2_TRANSPORT),
+        .pq_requested = pq_explicit.value_or(DEFAULT_V2_PQ_TRANSPORT),
+        .fail_first_packet = HasTestOption(args, "pq_fail_first_packet"),
+    };
+    if (!IsNumericBoolSetting(pq_setting)) {
+        warnings.push_back(strprintf(_("-v2pqtransport=%s is not a number, so it is read as -v2pqtransport=%d. Set -v2pqtransport=1 or -v2pqtransport=0."),
+                                     pq_setting.get_str(), config.pq_requested));
+    }
+    // Only an explicit request warns, never the default.
+    if (pq_explicit == true && !config.v2_enabled) {
+        warnings.push_back(_("-v2pqtransport=1 has no effect because -v2transport=0. Set -v2transport=1 to use hybrid post-quantum v2 transport."));
+    }
+    return config;
+}
 
 } // namespace
 
@@ -967,8 +1008,14 @@ bool AppInitParameterInteraction(const ArgsManager& args)
         }
     }
 
+    // The v2 transport configuration: the hybrid post-quantum key exchange's warnings, startup line,
+    // connections and RPC all use this one.
+    std::vector<bilingual_str> pq_warnings;
+    g_pq_transport_config = GetPQTransportConfig(args, pq_warnings);
+    for (const bilingual_str& warning : pq_warnings) InitWarning(warning);
+
     // Signal NODE_P2P_V2 if BIP324 v2 transport is enabled.
-    if (args.GetBoolArg("-v2transport", DEFAULT_V2_TRANSPORT)) {
+    if (g_pq_transport_config.v2_enabled) {
         g_local_services = ServiceFlags(g_local_services | NODE_P2P_V2);
     }
 
@@ -1620,6 +1667,17 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         node.addrman = std::move(*addrman);
     }
 
+    // Select the ML-KEM-1024 code before any networking object exists, and name it.
+    mlkem::InitializeRuntime(/*force_portable=*/args.GetBoolArg("-mlkemportable", false) || HasTestOption(args, "mlkem_portable"));
+    {
+        const mlkem::BackendNames backends{mlkem::GetBackendNames()};
+        LogInfo("v2 pq: %s arith=%s keccak=%s",
+                !g_pq_transport_config.v2_enabled    ? "disabled (-v2transport=0)" :
+                !g_pq_transport_config.pq_requested ? "disabled (-v2pqtransport=0)" :
+                                                      "enabled",
+                backends.arith, backends.keccak);
+    }
+
     FastRandomContext rng;
     assert(!node.banman);
     node.banman = std::make_unique<BanMan>(args.GetDataDirNet() / "banlist", &uiInterface, args.GetIntArg("-bantime", DEFAULT_MISBEHAVING_BANTIME));
@@ -2113,6 +2171,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     connOptions.m_peer_connect_timeout = peer_connect_timeout;
     connOptions.whitelist_forcerelay = args.GetBoolArg("-whitelistforcerelay", DEFAULT_WHITELISTFORCERELAY);
     connOptions.whitelist_relay = args.GetBoolArg("-whitelistrelay", DEFAULT_WHITELISTRELAY);
+    connOptions.m_pq = g_pq_transport_config;
 
     // Port to bind to if `-bind=addr` is provided without a `:port` suffix.
     const uint16_t default_bind_port =
