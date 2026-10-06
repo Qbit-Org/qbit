@@ -339,8 +339,13 @@ def unknown_intervals(records: list[dict[str, Any]], end: int, interval: int) ->
     for host, host_records in by_host.items():
         host_records.sort(key=lambda record: record.get("time", 0))
         state: dict[str, RingState] = {}
+        previous_time: int | None = None
         for record in host_records:
             time = record.get("time", 0)
+            if not isinstance(record.get("fallback_set"), list):
+                # Missing fallback evidence is unknown, never an empty set.
+                found.append((host, "fallback_set", time if previous_time is None else previous_time, time,
+                              "fallback_set missing or malformed"))
             instance = record.get("instance_id")
             since = record.get("since") if isinstance(record.get("since"), int) else time
             for direction in RINGS:
@@ -370,6 +375,7 @@ def unknown_intervals(records: list[dict[str, Any]], end: int, interval: int) ->
                     found.append((host, direction, before.time, max(before.time, oldest_time),
                                   f"sequences {before.last_sequence + 1}..{oldest_sequence - 1} were lost when the ring wrapped"))
                 state[direction] = RingState(instance, ring["last_sequence"], ring["dropped"], time)
+            previous_time = time
         if host_records and host_records[-1].get("time", 0) < end - 2 * interval:
             for direction in RINGS:
                 found.append((host, direction, host_records[-1]["time"], end, "no samples since"))
@@ -426,7 +432,8 @@ def evaluate_failures(records: list[dict[str, Any]] | None, known_good: KnownGoo
                     found_triage.append(describe(host, entry, label))
         if not window.contains(record.get("time", 0)):
             continue
-        for item in record.get("fallback_set") or []:
+        fallback_set = record.get("fallback_set")
+        for item in fallback_set if isinstance(fallback_set, list) else []:
             if not isinstance(item, dict):
                 continue
             label = known_good.label(item.get("endpoint"))
