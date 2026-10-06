@@ -19,6 +19,7 @@ on:
       - 1.0.0
       - 1.x.x
       - develop
+      - feature/pq-transport
   push:
     branches:
       - main
@@ -26,6 +27,7 @@ on:
       - 1.0.0
       - 1.x.x
       - develop
+      - feature/pq-transport
   merge_group:
     branches:
       - main
@@ -33,6 +35,7 @@ on:
       - 1.0.0
       - 1.x.x
       - develop
+      - feature/pq-transport
 
 permissions:
   contents: read
@@ -137,7 +140,7 @@ jobs:
 
       # Job selection, source resolution and unit-test evidence of the PQ and
       # nightly workflows, which run outside pull requests, the nightly
-      # workflow's scheduled source, the PQ canary tools, and the aarch64 PQ job
+      # workflow's scheduled source, the PQ canary tools, and the PQ unit jobs
       # that Full Validation requires for ML-KEM and transport changes.
       - name: Test PQ CI workflow contract
         run: |

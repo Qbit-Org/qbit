@@ -27,8 +27,8 @@ Requirements: bash, Python 3.10 or later, and `qbit-cli` able to reach the node.
    a checkout of the repository.
 2. Pick an output directory owned by the user that runs the sampler, for example
    `/var/lib/qbit-canary`.
-3. Add a cron line (`crontab -e`) for that user. Use a short `--host` label;
-   the evaluator tells nodes apart by it.
+3. Add a cron line (`crontab -e`) for that user. Use a short `--host` label,
+   other than `NA`; the evaluator tells nodes apart by it.
 
 Canary archive node:
 
@@ -73,7 +73,9 @@ when `getpqtransportinfo` answers, one line to `failures.jsonl`.
   and `pinned_transport_pq_status`.
 
 Booleans are written as 1 or 0. A failed call, or a field the node does not
-report, is `NA`, never 0; a real 0 stays 0. A v1.0.0 node therefore writes `NA`
+report, is `NA`, never 0; a real 0 stays 0. So is a value of the wrong type: a
+count that is not a non-negative integer (`true` is never written as 1), a flag
+that is not a boolean, or an `instance_id` that is not 64 lowercase hex digits. A v1.0.0 node therefore writes `NA`
 for every `getpqtransportinfo` column and for `connections_pq`, with
 `sample_ok=1`. The CSV holds no peer addresses.
 
@@ -131,7 +133,11 @@ from there to `--end`, or to the latest sample. Other options:
 
 Unknown, misspelled or abbreviated options, malformed times or numbers, missing
 files, `--failures` without `--known-good` (or the reverse) and an `--end`
-before `--canary-start` are rejected with exit status 2 and a message.
+before `--canary-start` are rejected with exit status 2 and a message. So are
+samples that would compare a node with itself: `--pool`, `--archive` and
+`--control` must each be one node, so a file given for two roles, two roles
+with the same host label or `instance_id`, or a file whose rows carry more than
+one host label (or none) is rejected.
 
 Output: one line per figure, `<result> <figure>: samples=<n> coverage=<c> <details>`,
 where the result is `pass`, `fail` or `unknown`, followed by indented details,
@@ -159,13 +165,21 @@ bad arguments or input.
   `instance_id`, is a restart. For the pinned link, the samples from the last
   sample before the restart to 10 minutes after it (`--restart-grace`) are a
   gap: neither pass nor fail. The restarts are listed at the top of the report.
+  An uptime whose boot time differs from the one most samples with the same
+  `instance_id` agree on contradicts it: that uptime is unknown, not a restart.
 - **Coverage.** Coverage is the share of the expected 5-minute samples that are
   present and usable. Below `--min-coverage`, the pinned link, a monitored
   node's failure evidence and an inbound-connections day are unknown, not
   judged.
 - **Unknown, never clean.** A sample with `sample_ok=0`, an `NA` where the
   figure needs a value, or a missing sample (for example while cron was not
-  running) is unknown. The pinned link passes only if it would pass with every
+  running) is unknown. So is a malformed value: a `time`, `uptime` or
+  `connections_in` that is not a plain non-negative integer (a row without a
+  usable `time` counts as missing), a row with more or fewer fields than the
+  header (such as a line cut short by a crash), and a connected pinned peer
+  whose connection type, `transport_pq` or `transport_pq_status` is missing or
+  malformed, or whose `transport_pq` is not 1 exactly when the status is
+  `hybrid`. The pinned link passes only if it would pass with every
   unknown sample counted as a failure, and fails only if it would fail with
   every unknown sample counted as a success; otherwise it is unknown.
 - **Rings.** Failure entries are read from each ring (`inbound`, `outbound`) by
@@ -176,7 +190,22 @@ bad arguments or input.
   entries never read (the oldest entry read is past that point), across a
   changed `instance_id`, or when a ring is malformed or goes backwards. A flood
   of inbound failures therefore cannot hide an outbound one: the rings are
-  separate. Unrelated endpoints never fail the canary.
+  separate. Unrelated endpoints never fail the canary, but only a well-formed
+  endpoint is unrelated: a `malformed_record`, `first_packet_failed`,
+  `fallback` or `closed_after_switch` entry whose endpoint is missing or
+  malformed makes its figure unknown.
+- **Malformed evidence is unknown.** Only values of the `getpqtransportinfo`
+  types count as evidence. A record whose `instance_id` or `since` is missing
+  or malformed, whose `since` is after the sample, or whose `since` changed
+  within one `instance_id`; a ring that is not an object with non-negative
+  integer counters; a failure entry whose `outcome` is outside the vocabulary,
+  or whose `time` is missing, malformed, before its process started or more
+  than 5 minutes after the sample that read it; and a fallback-set entry
+  without a well-formed endpoint: each makes that stretch unknown. A
+  `failures.jsonl` line without a time in Unix seconds and a valid host label
+  is bad input (exit status 2). A known-good failure whose other fields are
+  malformed is still a failure, and those fields print as `malformed`, so a
+  malformed field can never put an address in the report.
 
 ### When the pinned link is not manual
 

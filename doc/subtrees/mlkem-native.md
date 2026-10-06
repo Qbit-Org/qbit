@@ -64,9 +64,14 @@ says what was chosen and why:
 | `SANITIZERS` contains `memory` | portable (MSan cannot see assembly writes) | configure error |
 | anything else (riscv64, powerpc64, armv7, s390x, i686, ...) | portable | configure error |
 
-`ci/checks/test_mlkem_build_policy.py` also links the glue with every x86_64
-assembly routine wrapped by a call counter, and fails if any of them runs
-while portable C is forced.
+`ci/checks/test_mlkem_build_policy.py` also links the glue with every
+assembly routine wrapped by a call counter, and fails if any of them runs while
+portable C is forced, or when an entry point run alone on a new thread uses
+assembly although portable C is forced (it entered the library without taking
+the override). It checks the x86_64 backend natively and the AArch64 backend
+as a static binary under `qemu-aarch64`, built from a copy of
+`src/crypto/mlkem_config.h` without its AArch64 ELF refusal. CI's build smoke
+job requires both.
 
 ### x86_64 instruction set
 
@@ -155,6 +160,30 @@ aarch64 and, if no marking is lost, drop the `aarch64-elf` rule in
 marking by force-marking objects that lack landing pads. macOS arm64 (Mach-O,
 no GNU property notes) keeps the native backend.
 
+### x86_64 CET marking
+
+The x86_64 assembly keeps a binary's Intel CET marking. Upstream's `sys.h`
+includes `<cet.h>` in the assembly whenever the compiler defines `__CET__`, so
+with `-fcf-protection=full`, which qbit's hardening flags pass to the assembly
+as to the C (`ci/checks/test_mlkem_build_policy.py` checks that the C flags
+reach it), the object gets `endbr64` landing pads and the GNU property note.
+Measured for the initial vendoring (v2.0.0) with Ubuntu's gcc 15.2.0 and GNU ld
+2.46, `RelWithDebInfo` with qbit's default hardening, native x86_64 enabled:
+
+```text
+mlkem_native_asm.S.o, mlkem_native.c.o,     x86 feature: IBT, SHSTK
+mlkem_backend.c.o, mlkem.cpp.o
+test_qbit, fuzz (both link the native       x86 feature: IBT, SHSTK
+backend)                                    x86 ISA needed: x86-64-baseline
+mlkem_native_asm.S.o assembled with         (no x86 feature note)
+-fcf-protection=none
+```
+
+The release evidence is still outstanding for the initial vendoring: Guix
+builds of every release host, reproduced, with this comparison for `qbitd`,
+`qbit-cli`, `qbit-qt` and `test_qbit` (see the PR checklist below). It is
+required before the post-quantum feature branch (#184) merges into `1.x.x`.
+
 ### The AArch64 single-lane Keccak mirror
 
 Upstream's `fips202/native/aarch64/x1_scalar.h` runs its scalar assembly
@@ -164,6 +193,11 @@ ran. `src/crypto/mlkem_fips202_backend.h` therefore mirrors that header's
 dispatch glue (the same macros and the same proved assembly routine) with a
 capability check added. Every other native entry point in the x86_64 and
 AArch64 backends checks the hook itself.
+
+The build-policy test's AArch64 case shows the mirror at work: the harness
+makes 252 assembly calls natively and none with portable C forced. Its negative
+control builds upstream's `x1_scalar.h` in place of the mirror, and then 221
+assembly calls leak into a forced-portable run.
 
 ## Update Procedure
 
@@ -175,7 +209,8 @@ contrib/devtools/update-mlkem-native.sh v2.0.1     # a new release
 ```
 
 The script fetches the tag or commit from `REMOTE_URL` (default: the pinned
-repository), replaces `src/mlkem-native` with upstream's `mlkem/` and
+repository) into a temporary repository, so the qbit clone does not become
+shallow, replaces `src/mlkem-native` with upstream's `mlkem/` and
 `LICENSE` byte for byte, rewrites the pin from the object ids of the fetched
 upstream commit, stages both, and checks that the staged tree has exactly those
 ids. `REMOTE_REF` selects the ref when no argument is given. It refuses to

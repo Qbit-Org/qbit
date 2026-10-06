@@ -106,6 +106,12 @@ struct ConnmanTestMsg : public CConnman {
         DisconnectNodes();
     }
 
+    /** How many distinct failing endpoints the local-fault warning has counted. */
+    size_t PQLocalFaultEndpoints() const EXCLUSIVE_LOCKS_REQUIRED(!m_pq_mutex)
+    {
+        return WITH_LOCK(m_pq_mutex, return m_pq_failed_endpoints_for_warning.size());
+    }
+
     void UpdatePQSheddingPublic() EXCLUSIVE_LOCKS_REQUIRED(!m_pq_shed_mutex) { UpdatePQShedding(PQShedNow()); }
 
     /** Run the socket handler thread, as Start() does. */

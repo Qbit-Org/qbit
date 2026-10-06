@@ -29,12 +29,14 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <new>
 #include <ostream>
 #include <span>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace mlkem {
@@ -85,6 +87,12 @@ DecapsulationKey DecapsulationKeyFromHex(const UniValue& value)
 bool AllBytesAre(std::span<const uint8_t> bytes, uint8_t value)
 {
     return std::ranges::all_of(bytes, [&](uint8_t b) { return b == value; });
+}
+
+/** Whether the capability hooks would let native code run now, on this thread, per its copy of the override. */
+bool HooksAllowNative()
+{
+    return qbit_mlkem_has_avx2() != 0 || qbit_mlkem_has_neon() != 0;
 }
 
 /** Run `check` with the active backend, then again with portable C forced. */
@@ -563,6 +571,90 @@ BOOST_AUTO_TEST_CASE(backend_selection)
     BOOST_CHECK_EQUAL(GetBackendNames().keccak, active.keccak);
 }
 
+BOOST_AUTO_TEST_CASE(every_entry_point_takes_the_override)
+{
+    // Each entry point fixes the backend for its operation at entry, from its
+    // own thread's copy of the override. Run each alone on a new thread, whose
+    // copy starts unset, and then ask the hooks what that copy says. The
+    // hooks can say native only where this CPU and build allow it.
+    (void)GetBackendNames();
+    const bool native_possible{HooksAllowNative()};
+    BOOST_TEST_MESSAGE("hooks can allow native code here: " << native_possible);
+
+    std::array<uint8_t, KEYGEN_SEED_BYTES> seed;
+    seed.fill(0x11);
+    const std::array<uint8_t, ENCAPS_COINS_BYTES> coins{};
+    PublicKey ek;
+    DecapsulationKey dk;
+    Ciphertext ct;
+    SharedSecret ss;
+    BOOST_REQUIRE_EQUAL(KeyGen(seed, ek, dk), Error::NONE);
+    BOOST_REQUIRE_EQUAL(Encaps(ek, coins, ct, ss), Error::NONE);
+    const std::vector<std::pair<std::string_view, std::function<void()>>> entry_points{
+        {"KeyGen", [&] { PublicKey e; DecapsulationKey d; (void)KeyGen(seed, e, d); }},
+        {"CheckPublicKey", [&] { (void)CheckPublicKey(ek); }},
+        {"Encaps", [&] { Ciphertext c; SharedSecret s; (void)Encaps(ek, coins, c, s); }},
+        {"Decaps", [&] { SharedSecret s; (void)Decaps(dk, ct, s); }},
+        {"GetBackendNames", [] { (void)GetBackendNames(); }},
+    };
+    for (const auto& entry : entry_points) {
+        const std::string_view name{entry.first};
+        const std::function<void()>& entry_point{entry.second};
+        bool native_while_forced{true};
+        bool native_after{!native_possible};
+        std::thread{[&] {
+            {
+                ForcePortableForTesting portable;
+                entry_point();
+                native_while_forced = HooksAllowNative();
+            }
+            entry_point();
+            native_after = HooksAllowNative();
+        }}.join();
+        BOOST_CHECK_MESSAGE(!native_while_forced, "FAIL: after mlkem::" << name << " on a new thread with portable C forced, the hooks allow native code. "
+                                                  << "Cause: it entered the library without taking the override, so native code can run. "
+                                                  << "Fix: call BeginOperation() first in every entry point of src/crypto/mlkem.cpp.");
+        BOOST_CHECK_MESSAGE(native_after == native_possible, "FAIL: after mlkem::" << name << " with the override cleared, the hooks allow native code: "
+                                                             << native_after << ", expected " << native_possible << ".");
+    }
+}
+
+BOOST_AUTO_TEST_CASE(override_copy_is_per_thread)
+{
+    // Thread A takes the override unset; thread B then takes it set. A's copy
+    // must not change: a copy shared between threads would switch A's running
+    // operation to the other backend.
+    (void)GetBackendNames();
+    const bool native_possible{HooksAllowNative()};
+    std::promise<void> a_took, b_took;
+    std::future<void> a_took_future{a_took.get_future()};
+    std::future<void> b_took_future{b_took.get_future()};
+    bool a_before{!native_possible};
+    bool a_after{!native_possible};
+    std::thread a{[&] {
+        (void)GetBackendNames();
+        a_before = HooksAllowNative();
+        a_took.set_value();
+        b_took_future.wait();
+        a_after = HooksAllowNative();
+    }};
+    a_took_future.wait();
+    bool b_native{true};
+    {
+        ForcePortableForTesting portable;
+        std::thread{[&] {
+            (void)GetBackendNames();
+            b_native = HooksAllowNative();
+        }}.join();
+    }
+    b_took.set_value();
+    a.join();
+    BOOST_CHECK(!b_native);
+    BOOST_CHECK_EQUAL(a_before, native_possible);
+    BOOST_CHECK_MESSAGE(a_after == a_before, "FAIL: thread A's override changed when thread B took it. "
+                                             << "Cause: the copy the hooks read is shared between threads. Fix: keep t_force_portable thread_local in src/crypto/mlkem.cpp.");
+}
+
 BOOST_AUTO_TEST_CASE(override_changed_by_another_thread)
 {
     const BackendNames before{GetBackendNames()};
@@ -578,9 +670,10 @@ BOOST_AUTO_TEST_CASE(override_changed_by_another_thread)
     BOOST_REQUIRE_EQUAL(KeyGen(seed, expected_ek, expected_dk), Error::NONE);
     BOOST_REQUIRE_EQUAL(Encaps(expected_ek, coins, expected_ct, expected_ss), Error::NONE);
 
-    // Another thread flips the override as fast as it can while this one runs
-    // operations. Each operation must finish on the backend it started with:
-    // on x86_64, one that mixed backends would give wrong outputs.
+    // A third thread flips the override as fast as it can while two threads
+    // run operations at once. Each operation must finish on the backend it
+    // started with: on x86_64, one that mixed backends would give wrong
+    // outputs, and under ThreadSanitizer a shared copy of the override races.
     std::atomic_bool stop{false};
     std::atomic<uint64_t> flips{0};
     std::thread flipper{[&] {
@@ -590,28 +683,33 @@ BOOST_AUTO_TEST_CASE(override_changed_by_another_thread)
         }
     }};
     while (flips.load(std::memory_order_relaxed) == 0) std::this_thread::yield();
-    int wrong{0};
-    int portable_seen{0};
+    std::atomic<int> wrong{0};
+    std::atomic<int> portable_seen{0};
     constexpr int ROUNDS{50};
-    for (int round{0}; round < ROUNDS; ++round) {
-        PublicKey ek;
-        DecapsulationKey dk;
-        Ciphertext ct;
-        SharedSecret ss;
-        SharedSecret decapsulated;
-        const bool ok{KeyGen(seed, ek, dk) == Error::NONE && Encaps(ek, coins, ct, ss) == Error::NONE &&
-                      Decaps(dk, ct, decapsulated) == Error::NONE};
-        if (!ok || ek != expected_ek || !std::ranges::equal(dk.Bytes(), expected_dk.Bytes()) || ct != expected_ct ||
-            !std::ranges::equal(ss.Bytes(), expected_ss.Bytes()) || !std::ranges::equal(decapsulated.Bytes(), expected_ss.Bytes())) {
-            ++wrong;
+    const auto run_rounds{[&] {
+        for (int round{0}; round < ROUNDS; ++round) {
+            PublicKey ek;
+            DecapsulationKey dk;
+            Ciphertext ct;
+            SharedSecret ss;
+            SharedSecret decapsulated;
+            const bool ok{KeyGen(seed, ek, dk) == Error::NONE && Encaps(ek, coins, ct, ss) == Error::NONE &&
+                          Decaps(dk, ct, decapsulated) == Error::NONE};
+            if (!ok || ek != expected_ek || !std::ranges::equal(dk.Bytes(), expected_dk.Bytes()) || ct != expected_ct ||
+                !std::ranges::equal(ss.Bytes(), expected_ss.Bytes()) || !std::ranges::equal(decapsulated.Bytes(), expected_ss.Bytes())) {
+                ++wrong;
+            }
+            if (GetBackendNames().arith == "portable") ++portable_seen;
         }
-        if (GetBackendNames().arith == "portable") ++portable_seen;
-    }
+    }};
+    std::thread second{run_rounds};
+    run_rounds();
+    second.join();
     stop.store(true, std::memory_order_relaxed);
     flipper.join();
-    BOOST_TEST_MESSAGE(flips.load() << " flips; portable active at " << portable_seen << " of " << ROUNDS << " checks");
-    BOOST_CHECK_MESSAGE(wrong == 0, "FAIL: " << wrong << " of " << ROUNDS << " rounds gave wrong outputs while another thread changed the override. "
-                                    << "Cause: an operation mixed backends. Fix: the capability hooks in src/crypto/mlkem.cpp must read the copy taken at entry.");
+    BOOST_TEST_MESSAGE(flips.load() << " flips; portable active at " << portable_seen.load() << " of " << 2 * ROUNDS << " checks");
+    BOOST_CHECK_MESSAGE(wrong.load() == 0, "FAIL: " << wrong.load() << " of " << 2 * ROUNDS << " rounds gave wrong outputs while another thread changed the override. "
+                                           << "Cause: an operation mixed backends. Fix: the capability hooks in src/crypto/mlkem.cpp must read the thread_local copy taken at entry.");
     BOOST_CHECK_EQUAL(GetBackendNames().arith, before.arith);
 }
 

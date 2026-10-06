@@ -38,6 +38,7 @@ done
 [ -n "$host" ] && [ -n "$out" ] && [ $# -gt 0 ] || usage
 case "$host" in
   *[!A-Za-z0-9._-]*) echo "Error: --host must be letters, digits, '.', '_' or '-'" >&2; exit 1 ;;
+  NA) echo "Error: --host NA would read back as a missing value; pick another label" >&2; exit 1 ;;
 esac
 # The pinned peer as getpeerinfo shows it: host:port or [ipv6]:port (I2P peers show port 0).
 if [ -n "$pinned" ]; then
