@@ -242,6 +242,82 @@ class ClassifyMergeProfileTest(unittest.TestCase):
         self.assertEqual(outputs["source_validation_required"], "false")
         self.assertEqual(outputs["touched_github_metadata"], "true")
 
+    def test_pq_unit_jobs_required_for_mlkem_and_transport_paths(self) -> None:
+        required = [
+            "src/mlkem-native/mlkem/src/kem.c",
+            "src/crypto/mlkem.cpp",
+            "src/crypto/mlkem_config.h",
+            "cmake/mlkem-native.cmake",
+            "src/bip324.cpp",
+            "src/bip324.h",
+            "src/bip324_pq.cpp",
+            "src/bip324_pq.h",
+            "src/net.h",
+            "src/net.cpp",
+            "src/compat/cpuid.h",
+            "src/compat/cpu_features.h",
+            "src/compat/cpu_features.cpp",
+            ".github/workflows/ci-pq.yml",
+            "ci/test/00_setup_env_native_aarch64_pq.sh",
+            "ci/test/00_setup_env_s390x_unit.sh",
+            "ci/test/00_setup_env_mac_native_pq.sh",
+            "src/test/mlkem_tests.cpp",
+            "src/test/bip324_tests.cpp",
+            "src/test/net_tests.cpp",
+            "src/test/data/pq_transport_vectors.json",
+            "src/test/data/mlkem1024_vectors.json",
+            # Build wiring.
+            "CMakeLists.txt",
+            "src/CMakeLists.txt",
+            "src/util/CMakeLists.txt",
+            "src/test/CMakeLists.txt",
+            "src/test/fuzz/CMakeLists.txt",
+            "src/bench/CMakeLists.txt",
+            "cmake/bitcoin-build-config.h.in",
+            # Gate and CI wiring, and its tests.
+            ".github/workflows/ci.yml",
+            ".github/workflows/core-checks.yml",
+            ".github/workflows/required-merge-gate.yml",
+            "ci/checks/classify_merge_profile.py",
+            "ci/checks/ctest_evidence.py",
+            "ci/checks/test_ci_pq_contract.py",
+            "ci/checks/test_classify_merge_profile.py",
+            "ci/checks/test_mlkem_build_policy.py",
+            "ci/checks/test_pq_merge_gate_contract.py",
+            "ci/test/03_test_script.sh",
+        ]
+        for path in required:
+            with self.subTest(path=path):
+                classification = self.classify([path])
+                self.assertTrue(classification.pq_unit_required)
+                self.assertEqual(classify_merge_profile.github_outputs(classification)["pq_unit_required"], "true")
+                self.assertEqual(classification.profile, classify_merge_profile.SOURCE_PROFILE)
+        # One matching path among others is enough.
+        self.assertTrue(self.classify(["doc/user/README.md", "src/bip324.cpp"]).pq_unit_required)
+
+    def test_pq_unit_jobs_not_required_elsewhere(self) -> None:
+        for paths in (
+            ["src/wallet/wallet.cpp"],
+            ["src/netbase.cpp", "src/net_processing.cpp", "src/compat/compat.h"],
+            ["src/test/net_peer_eviction_tests.cpp"],
+            ["ci/test/00_setup_env_native_asan.sh", ".github/workflows/rpc-perf-manual.yml"],
+            # Wiring shared by every CI job, and ML-KEM tooling the PQ unit jobs never run.
+            ["ci/test/01_base_install.sh", "ci/test/02_run_container.py", ".github/actions/configure-docker/action.yml"],
+            ["src/crypto/CMakeLists.txt", "src/test/cpu_features_tests.cpp"],
+            ["test/lint/mlkem-native-check.sh", "contrib/devtools/mlkem-native.pin", "contrib/devtools/update-mlkem-native.sh"],
+            ["doc/user/README.md"],
+            RPC_DOCS_PATHS,
+            PUBLIC_DOCS_PATHS,
+        ):
+            with self.subTest(paths=paths):
+                classification = self.classify(paths)
+                self.assertFalse(classification.pq_unit_required)
+                self.assertEqual(classify_merge_profile.github_outputs(classification)["pq_unit_required"], "false")
+
+    def test_pq_unit_jobs_required_for_unreadable_paths(self) -> None:
+        self.assertTrue(self.classify(["../src/bip324.cpp"]).pq_unit_required)
+        self.assertTrue(self.classify(["/abs/path"]).pq_unit_required)
+
     def test_require_release_policy_only_cli_rejects_outside_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             changed_files = Path(tmpdir) / "changed-files.txt"

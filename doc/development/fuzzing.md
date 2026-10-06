@@ -41,7 +41,8 @@ $ ctest --test-dir build_fuzz -R '^required_fuzz_targets$' --output-on-failure
 ## qbit seed corpora
 
 `qa-assets` has no inputs for `asert_chain_transition`, `asert_edge_cases`,
-`asert_math`, `auxpow`, `p2mr_script` or `pqc`. Generated seeds for these
+`asert_math`, `auxpow`, `mlkem`, `mlkem_backend_diff`, `p2mr_script` or `pqc`.
+Generated seeds for these
 targets, their manifest and the input format are described in
 [`test/fuzz/qbit_corpora/README.md`](../../test/fuzz/qbit_corpora/README.md).
 CI copies them into the `qa-assets` corpus and requires that they are replayed:
@@ -51,17 +52,23 @@ $ test/fuzz/qbit_corpora/overlay.py qa-assets/fuzz_corpora
 $ build_fuzz/test/fuzz/test_runner.py --require_qbit_corpus qa-assets/fuzz_corpora
 ```
 
-`--require_qbit_corpus` fails if any of the six targets is not compiled or not
+`--require_qbit_corpus` fails if any of the eight targets is not compiled or not
 selected (including through `--exclude`), has no regular input files, or is not
 reported as replayed by the fuzz executable. The runner prints the number of
 input files present and replayed for each target.
+
+The ML-KEM targets use native code where the CPU has it, and print the backend
+they run at start-up. CI replays `mlkem` and `mlkem_backend_diff` a second time
+with `MLKEM_FORCE_PORTABLE=1`, which makes them run portable C throughout; they
+abort if portable C is not what runs, and on any value other than unset, `0` or
+`1`.
 
 With a libFuzzer build, `--mutate_min_time=<seconds>` replaces the single
 replay with a mutation phase of that many seconds per target. The phase starts
 from the corpus, writes new inputs to a temporary directory and leaves the
 corpus unchanged. It fails on non-libFuzzer builds. The nightly native fuzz job
 sets `QBIT_FUZZ_MUTATE_MIN_TIME`, which makes `ci/test/03_test_script.sh` run
-this phase for the six targets after the normal replay.
+this phase for the eight targets after the normal replay.
 
 The budget is libFuzzer's `-max_total_time`, which counts time spent loading
 the seed corpus (libFuzzer's `INITED` line) as well as mutation. A run can end

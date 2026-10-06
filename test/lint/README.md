@@ -130,6 +130,22 @@ The check accepts the exact documented downstream lockfile patch for
 `RUSTSEC-2026-0204-crossbeam-epoch-0.9.20`. Any other subtree drift remains a
 failure.
 
+mlkem-native-check.sh
+=====================
+Run this script from the root of the repository to verify offline that the
+vendored `src/mlkem-native` tree is byte-identical to the mlkem-native release
+pinned in `contrib/devtools/mlkem-native.pin`:
+
+```
+test/lint/mlkem-native-check.sh
+```
+
+It compares the git tree id of `src/mlkem-native/mlkem` and the blob id of
+`src/mlkem-native/LICENSE` in `HEAD` with the pinned ids, and fails on any other
+entry or uncommitted change under `src/mlkem-native`. The lint runner's
+`subtree` lint runs it. For the update workflow, see
+[`doc/subtrees/mlkem-native.md`](../../doc/subtrees/mlkem-native.md).
+
 lint-libbitcoinpqc-vectors.py
 =============================
 Run this script from the root of the repository to verify bounded30 SPHINCS+

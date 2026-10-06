@@ -66,6 +66,7 @@ add_executable(fuzz
   message.cpp
   miniscript.cpp
   minisketch.cpp
+  mlkem.cpp
   mini_miner.cpp
   muhash.cpp
   multiplication_overflow.cpp

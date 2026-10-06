@@ -86,7 +86,7 @@ jobs:
               echo "::error::Pull request base SHA is unavailable."
               exit 1
             fi
-            git diff --name-only "${BASE_SHA}...HEAD" > "${changed_files}"
+            git diff --name-only --no-renames "${BASE_SHA}...HEAD" > "${changed_files}"
           elif [[ "${EVENT_NAME}" == "merge_group" ]]; then
             base_branch="${BASE_REF#refs/heads/}"
             if [[ -z "${base_branch}" ]]; then
@@ -94,15 +94,15 @@ jobs:
               exit 1
             fi
             git fetch --no-tags --prune origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"
-            git diff --name-only "origin/${base_branch}...HEAD" > "${changed_files}"
+            git diff --name-only --no-renames "origin/${base_branch}...HEAD" > "${changed_files}"
           elif [[ "${EVENT_NAME}" == "push" ]]; then
             if [[ -n "${BEFORE_SHA}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
-              git diff --name-only "${BEFORE_SHA}..HEAD" > "${changed_files}"
+              git diff --name-only --no-renames "${BEFORE_SHA}..HEAD" > "${changed_files}"
             else
               git fetch --no-tags --prune origin "${DEFAULT_BRANCH}"
               merge_base="$(git merge-base "origin/${DEFAULT_BRANCH}" HEAD 2>/dev/null || true)"
               if [[ -n "${merge_base}" ]]; then
-                git diff --name-only "${merge_base}...HEAD" > "${changed_files}"
+                git diff --name-only --no-renames "${merge_base}...HEAD" > "${changed_files}"
               else
                 git diff-tree --no-commit-id --name-only -r HEAD > "${changed_files}"
               fi
@@ -140,12 +140,14 @@ jobs:
 
       # Job selection, source resolution and unit-test evidence of the PQ and
       # nightly workflows, which run outside pull requests, the nightly
-      # workflow's scheduled source, and the PQ canary tools.
+      # workflow's scheduled source, the PQ canary tools, and the PQ unit jobs
+      # that Full Validation requires for ML-KEM and transport changes.
       - name: Test PQ CI workflow contract
         run: |
           /usr/bin/python3 ci/checks/test_ci_pq_contract.py -v
           /usr/bin/python3 ci/checks/test_scheduled_validation_contract.py -v
           /usr/bin/python3 contrib/pq-canary/test/test_pq_canary.py -v
+          /usr/bin/python3 ci/checks/test_pq_merge_gate_contract.py -v
 
       - name: Classify validation profile
         id: classify
