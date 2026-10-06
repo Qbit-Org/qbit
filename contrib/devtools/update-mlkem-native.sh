@@ -71,13 +71,22 @@ if [[ -z "${REMOTE_URL}" || -z "${REMOTE_REF}" ]]; then
     "restore ${PIN_FILE} from git, or set REMOTE_URL and pass a tag"
 fi
 
+# Fetch into a temporary repository: a depth-1 fetch into this one would
+# write .git/shallow and turn it into a shallow clone.
+upstream_git="$(mktemp -d "${TMPDIR:-/tmp}/update-mlkem-native.XXXXXX")"
+trap 'rm -rf -- "${upstream_git}"' EXIT
+git init --quiet --bare "${upstream_git}"
+upstream() {
+  git --git-dir="${upstream_git}" "$@"
+}
+
 echo "Fetching mlkem-native ${REMOTE_REF} from ${REMOTE_URL}"
-if ! git fetch --quiet --depth=1 --no-tags "${REMOTE_URL}" "${REMOTE_REF}"; then
+if ! upstream fetch --quiet --depth=1 --no-tags "${REMOTE_URL}" "${REMOTE_REF}"; then
   fail "git fetch ${REMOTE_URL} ${REMOTE_REF} failed" \
     "the ref does not exist upstream, or the network is unavailable" \
     "check the tag name at ${REMOTE_URL}, or retry with network access"
 fi
-commit="$(git rev-parse "FETCH_HEAD^{commit}")"
+commit="$(upstream rev-parse "FETCH_HEAD^{commit}")"
 
 # A tag that resolves to a different commit than the pin means upstream moved
 # it; never follow that silently.
@@ -97,13 +106,13 @@ if [[ "${REMOTE_REF}" =~ ^[0-9a-f]{40}$ ]]; then
   fi
 fi
 
-upstream_tree="$(git rev-parse "${commit}:mlkem")"
-upstream_license="$(git rev-parse "${commit}:LICENSE")"
+upstream_tree="$(upstream rev-parse "${commit}:mlkem")"
+upstream_license="$(upstream rev-parse "${commit}:LICENSE")"
 
 echo "Replacing ${PREFIX} with ${commit}:mlkem and ${commit}:LICENSE"
 rm -rf -- "${PREFIX}"
 mkdir -p -- "${PREFIX}"
-git archive --format=tar "${commit}" mlkem LICENSE | tar -xf - -C "${PREFIX}"
+upstream archive --format=tar "${commit}" mlkem LICENSE | tar -xf - -C "${PREFIX}"
 
 cat > "${PIN_FILE}" <<EOF
 # mlkem-native vendored into src/mlkem-native. Written by
