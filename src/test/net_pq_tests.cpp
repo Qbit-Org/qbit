@@ -751,6 +751,30 @@ BOOST_AUTO_TEST_CASE(pq_abandoned)
     BOOST_CHECK_EQUAL(Stats().inbound.legacy_peer, 1U);
 }
 
+BOOST_AUTO_TEST_CASE(pq_outbound_never_abandoned)
+{
+    // Only responders offer, so an outbound connection that closes before the peer's version is
+    // never abandoned, whoever closes it: the outbound count stays 0 and its ring stays empty.
+    for (const bool peer_closes : {true, false}) {
+        Link link{Add(ConnectionType::OUTBOUND_FULL_RELAY, PQMode::NEGOTIATE, TestEndpoint(10, peer_closes ? 1 : 2))};
+        Pass(link);
+        Receive(link, InitiatorKey()); // any 64 bytes are a valid key, here the responder's
+        Pass(link);
+        BOOST_REQUIRE(!link.node->m_transport->GetPQSnapshot().version_received);
+        if (peer_closes) {
+            link.pipes->recv.Eof();
+        } else {
+            link.node->RequestDisconnect();
+        }
+        Pass(link);
+        BOOST_REQUIRE(link.node->fDisconnect);
+        Disconnect();
+    }
+    const PQTransportStats stats{Stats()};
+    BOOST_CHECK_EQUAL(stats.outbound.abandoned, 0U);
+    BOOST_CHECK(stats.outbound_failures.entries.empty());
+}
+
 BOOST_AUTO_TEST_CASE(pq_closed_after_switch)
 {
     // We switched, and the peer closed or stopped responding before its confirmation arrived.
@@ -1394,6 +1418,27 @@ BOOST_AUTO_TEST_CASE(pq_local_fault_after_success)
     BOOST_CHECK_EQUAL(warnings.m_count, 0);
 }
 
+BOOST_AUTO_TEST_CASE(pq_inbound_success_does_not_protect)
+{
+    // Only outbound successes enter the success set, which is never evicted. An inbound peer's
+    // key is its address and source port, so letting inbound successes in would let a peer that
+    // reconnects grow the set without bound, and silence the local-fault warning.
+    const CService addr{LookupNumeric("10.7.0.1", 8333)};
+    Link inbound{Add(ConnectionType::INBOUND, PQMode::NEGOTIATE, std::nullopt, addr)};
+    V2Transport peer{Initiator()};
+    Exchange(inbound, peer);
+    BOOST_REQUIRE(inbound.node->m_transport->GetPQSnapshot().confirmed);
+    inbound.node->RequestDisconnect();
+    Disconnect();
+    LogLineCounter warnings{"v2 pq: local_fault"};
+    // An outbound failure to the same address and port still starts a streak...
+    Connect(addr, End::MALFORMED);
+    BOOST_CHECK(Streak(addr));
+    // ...and with no outbound success, eight failing endpoints still warn.
+    for (int i{1}; i < 8; ++i) Connect(TestEndpoint(9, i), End::MALFORMED);
+    BOOST_CHECK_EQUAL(warnings.m_count, 1);
+}
+
 BOOST_AUTO_TEST_CASE(pq_fallback_connection)
 {
     // A fallback connection to a peer that sends a malformed offer: plain v2, with the offer
@@ -1541,6 +1586,25 @@ BOOST_AUTO_TEST_CASE(pq_load_shedding_off)
     }
     BOOST_CHECK(!Stats().load_shedding.active);
     BOOST_CHECK_EQUAL(Stats().inbound.shed, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(pq_shed_wipes_secrets)
+{
+    // A shed responder runs plain v2 for the rest of the connection, so it keeps no hybrid
+    // secret: the retained ECDH secret and transcript go at once, not at finalization.
+    InitConnman(/*shed_threshold=*/1);
+    Link offered{Accept()};
+    Receive(offered, InitiatorKey());
+    Pass(offered);
+    BOOST_REQUIRE(offered.node->m_transport->GetPQSnapshot().offer == PQOfferState::SENT);
+    BOOST_CHECK(dynamic_cast<const V2Transport&>(*offered.node->m_transport).HoldsHybridSecretsForTesting());
+    Link shed{Accept(LookupNumeric("10.9.0.2", 50001))};
+    Receive(shed, InitiatorKey());
+    Pass(shed);
+    BOOST_REQUIRE(Stats().load_shedding.active);
+    BOOST_REQUIRE(shed.node->m_transport->GetPQSnapshot().offer == PQOfferState::NONE);
+    BOOST_REQUIRE(!shed.node->fDisconnect);
+    BOOST_CHECK(!dynamic_cast<const V2Transport&>(*shed.node->m_transport).HoldsHybridSecretsForTesting());
 }
 
 BOOST_AUTO_TEST_CASE(pq_load_shedding_wall_clock_step)
