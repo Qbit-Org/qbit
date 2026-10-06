@@ -318,6 +318,26 @@ class MlkemBuildTest(unittest.TestCase):
                         self.assertIn("no BTI landing pads", combined)
         self.assertGreater(found, 0, "no usable C compiler found")
 
+    def test_append_flags_change_the_detected_target(self) -> None:
+        """APPEND_CPPFLAGS/APPEND_CFLAGS reach the library, so the target probes must see them: -m32 is not x86_64."""
+        if host_arch() != "x86_64":
+            self.skipTest("needs an x86_64 host")
+        compiler = shutil.which("cc")
+        assert compiler is not None
+        if run([compiler, "-m32", "-x", "c", "-c", "-o", os.devnull, "-"], input="#include <stdint.h>\nint x;\n").returncode != 0:
+            skip_missing_compiler(self, "cc-m32", "has no 32-bit headers")
+        name = "append_m32"
+        configured = self.configure(name, compiler, "-DWITH_MLKEM_NATIVE=AUTO", "-DAPPEND_CPPFLAGS=-m32", "-DAPPEND_CFLAGS=-m32")
+        output = configured.stdout + configured.stderr
+        self.assertEqual(configured.returncode, 0, output)
+        self.assertIn("SUMMARY portable", output,
+            f"FAIL: APPEND_CFLAGS=-m32 still detected x86_64\nCause: the target probes ran without the appended flags\nFix: mlkem_native_detect_arch in {MODULE}")
+        built = self.build(name)
+        self.assertEqual(built.returncode, 0, built.stdout + built.stderr)
+        # A reconfigure without the flag probes again and goes back to native.
+        configured = self.configure(name, compiler, "-DWITH_MLKEM_NATIVE=AUTO", "-DAPPEND_CPPFLAGS=", "-DAPPEND_CFLAGS=")
+        self.assertIn("SUMMARY native", configured.stdout + configured.stderr, configured.stdout + configured.stderr)
+
     def test_memory_sanitizer(self) -> None:
         compiler = shutil.which("cc")
         self.assertIsNotNone(compiler)
