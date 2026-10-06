@@ -19,6 +19,7 @@ on:
       - 1.0.0
       - 1.x.x
       - develop
+      - feature/pq-transport
   push:
     branches:
       - main
@@ -26,6 +27,7 @@ on:
       - 1.0.0
       - 1.x.x
       - develop
+      - feature/pq-transport
   merge_group:
     branches:
       - main
@@ -33,6 +35,7 @@ on:
       - 1.0.0
       - 1.x.x
       - develop
+      - feature/pq-transport
 
 permissions:
   contents: read
