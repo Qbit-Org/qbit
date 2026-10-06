@@ -574,6 +574,13 @@ class MergeGatePollerTest(unittest.TestCase):
         completed = self.run_gate(fake, GATE_RUN_STARTED_AT=self.GATE_START)
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
 
+    def test_the_workflow_token_can_read_its_run_start(self) -> None:
+        # Get a workflow run attempt needs Actions: read; without it the lookup
+        # always falls back to the step's start time.
+        permissions = self.workflow["permissions"]
+        self.assertEqual(permissions.get("actions"), "read", permissions)
+        self.assertEqual(permissions.get("checks"), "read", permissions)
+
     def test_the_gate_start_is_the_workflow_runs_not_the_steps(self) -> None:
         # The step starts after the jobs it needs, so a failure from this run can
         # complete before it; the run's own start time keeps it a current failure.

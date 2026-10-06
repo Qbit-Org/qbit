@@ -37,6 +37,8 @@ on:
 permissions:
   contents: read
   checks: read
+  # The gate reads its own run attempt's start time (run_started_at).
+  actions: read
 
 concurrency:
   group: required-merge-gate-${{ github.event_name != 'pull_request' && github.run_id || github.ref }}
