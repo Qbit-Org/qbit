@@ -889,7 +889,7 @@ class PQWorkflowContractTest(unittest.TestCase):
         workflow = self.workflows[PQ]
         job = workflow["jobs"][MACOS_JOB]
         self.assertNotIn(MACOS_JOB, [entry["job"] for entry in catalog(workflow)])
-        self.assertEqual(job["runs-on"], "macos-14")
+        self.assertEqual(job["runs-on"], "macos-15")
         context = self.resolve(PQ, self.dispatch(PQ, jobs=MACOS_JOB))
         env = svc.job_env(workflow, job, context)
         self.assertEqual(env["DANGER_RUN_CI_ON_HOST"], "1", "no Docker on the macOS host")
