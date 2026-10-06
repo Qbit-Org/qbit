@@ -36,12 +36,24 @@ enum UseImplementation : uint8_t {
     USE_SSE4_AND_SHANI = USE_SSE4 | USE_SHANI,
     USE_ALL = USE_SSE4 | USE_AVX2 | USE_SHANI,
 };
+
+/** The x86 CPUID and XGETBV queries, as compat/cpuid.h's GetCPUID and XGetBV. */
+using CpuidFn = void (*)(uint32_t leaf, uint32_t subleaf, uint32_t& a, uint32_t& b, uint32_t& c, uint32_t& d);
+using XGetBVFn = uint64_t (*)(uint32_t index);
 }
 
 /** Autodetect the best available SHA256 implementation.
  *  Returns the name of the implementation.
  */
 std::string SHA256AutoDetect(sha256_implementation::UseImplementation use_implementation = sha256_implementation::USE_ALL);
+
+/** SHA256AutoDetect with the x86 CPUID and XGETBV queries answered by the
+ *  given functions, so that tests can present synthetic CPUs; other targets
+ *  ignore them. The selected code runs its self-test, so a synthetic CPU must
+ *  not claim an extension this one lacks.
+ */
+std::string SHA256AutoDetect(sha256_implementation::UseImplementation use_implementation,
+                             sha256_implementation::CpuidFn cpuid, sha256_implementation::XGetBVFn xgetbv);
 
 /** Compute multiple double-SHA256's of 64-byte blobs.
  *  output:  pointer to a blocks*32 byte output buffer

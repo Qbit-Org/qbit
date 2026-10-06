@@ -55,6 +55,58 @@ OPERATOR_KEYS_PREFIXES = (
     "contrib/keys/operator-keys/",
     "contrib/guix/repo-templates/qbit-guix.sigs/operator-keys/",
 )
+# Changes to the ML-KEM library, the v2 transport, or their build and CI wiring
+# must pass the aarch64-unit, macos-arm64-unit and macos-x86_64-unit jobs of
+# .github/workflows/ci-pq.yml before they merge (the pq-unit job of ci.yml).
+# ci/checks/test_pq_merge_gate_contract.py fails if a CMake file, workflow or
+# ci/ file that mentions ML-KEM is missing here.
+PQ_UNIT_FILES = frozenset(
+    {
+        # The build: the WITH_MLKEM_NATIVE option, the library and its link
+        # into bitcoin_node, the run-time CPU detection, the configure header,
+        # and the tests, fuzz targets and benchmarks that exercise it.
+        "CMakeLists.txt",
+        "cmake/bitcoin-build-config.h.in",
+        "cmake/mlkem-native.cmake",
+        "src/CMakeLists.txt",
+        "src/bench/CMakeLists.txt",
+        "src/test/CMakeLists.txt",
+        "src/test/fuzz/CMakeLists.txt",
+        "src/util/CMakeLists.txt",
+        # The jobs and the gate: this classifier, the workflows that run it and
+        # the PQ jobs, the scripts and evidence check of those jobs, and the
+        # tests of that wiring.
+        ".github/workflows/ci-pq.yml",
+        ".github/workflows/ci.yml",
+        ".github/workflows/core-checks.yml",
+        ".github/workflows/required-merge-gate.yml",
+        "ci/checks/classify_merge_profile.py",
+        "ci/checks/ctest_evidence.py",
+        "ci/checks/test_ci_pq_contract.py",
+        "ci/checks/test_classify_merge_profile.py",
+        "ci/checks/test_mlkem_build_policy.py",
+        "ci/checks/test_pq_merge_gate_contract.py",
+        "ci/test/00_setup_env_mac_native_pq.sh",
+        "ci/test/00_setup_env_native_aarch64_pq.sh",
+        "ci/test/00_setup_env_s390x_unit.sh",
+        "ci/test/03_test_script.sh",
+        # The sources and tests.
+        "src/compat/cpuid.h",
+        "src/net.cpp",
+        "src/net.h",
+        "src/test/bip324_tests.cpp",
+        "src/test/data/mlkem1024_vectors.json",
+        "src/test/data/pq_transport_vectors.json",
+        "src/test/mlkem_tests.cpp",
+        "src/test/net_tests.cpp",
+    }
+)
+PQ_UNIT_PREFIXES = (
+    "src/bip324",
+    "src/compat/cpu_features.",
+    "src/crypto/mlkem",
+    "src/mlkem-native/",
+)
 
 
 @dataclass(frozen=True)
@@ -105,6 +157,11 @@ class Classification:
     def github_metadata_only(self) -> bool:
         return self.profile == GITHUB_METADATA_PROFILE
 
+    @property
+    def pq_unit_required(self) -> bool:
+        """Whether the PQ unit jobs must pass. A path that cannot be read requires them."""
+        return bool(self.invalid_paths) or any(is_pq_unit_path(path) for path in self.paths)
+
 
 def normalize_path(path: str) -> str | None:
     path = path.strip()
@@ -145,6 +202,10 @@ def is_public_docs_path(path: str) -> bool:
 
 def is_github_metadata_path(path: str) -> bool:
     return path in GITHUB_METADATA_FILES or path.startswith(GITHUB_METADATA_PREFIXES)
+
+
+def is_pq_unit_path(path: str) -> bool:
+    return path in PQ_UNIT_FILES or path.startswith(PQ_UNIT_PREFIXES)
 
 
 def classify_paths(paths: list[str] | tuple[str, ...]) -> Classification:
@@ -223,6 +284,7 @@ def github_outputs(classification: Classification) -> dict[str, str]:
         "touched_rpc_docs": bool_output(bool(classification.rpc_docs_paths)),
         "touched_public_docs": bool_output(bool(classification.public_docs_paths)),
         "touched_github_metadata": bool_output(bool(classification.github_metadata_paths)),
+        "pq_unit_required": bool_output(classification.pq_unit_required),
     }
 
 
@@ -236,6 +298,7 @@ def describe_classification(classification: Classification) -> str:
     lines = [
         f"validation_profile={classification.profile}",
         f"changed_count={len(classification.paths)}",
+        f"pq_unit_required={bool_output(classification.pq_unit_required)}",
     ]
 
     if classification.release_policy_paths:

@@ -40,6 +40,7 @@ add_executable(test_bitcoin
   common_url_tests.cpp
   compilerbug_tests.cpp
   compress_tests.cpp
+  cpu_features_tests.cpp
   crypto_tests.cpp
   cuckoocache_tests.cpp
   dbwrapper_tests.cpp
@@ -66,6 +67,7 @@ add_executable(test_bitcoin
   miner_tests.cpp
   miniminer_tests.cpp
   miniscript_tests.cpp
+  mlkem_tests.cpp
   minisketch_tests.cpp
   multisig_tests.cpp
   net_peer_connection_tests.cpp
@@ -157,6 +159,7 @@ target_json_data_sources(test_bitcoin
   data/key_io_invalid.json
   data/key_io_valid.json
   data/mainnet_launch_difficulty.json
+  data/mlkem1024_vectors.json
   data/p2mr_cross_profile_vectors.json
   data/p2mr_datapqchash_vectors.json
   data/p2mr_pqc_witness_vectors.json

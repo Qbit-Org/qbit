@@ -71,6 +71,7 @@ jobs:
       profile: ${{ steps.classify.outputs.profile }}
       release_policy_only: ${{ steps.classify.outputs.release_policy_only }}
       source_validation_required: ${{ steps.classify.outputs.source_validation_required }}
+      pq_unit_required: ${{ steps.classify.outputs.pq_unit_required }}
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -96,7 +97,7 @@ jobs:
               echo "::error::Pull request base SHA is unavailable."
               exit 1
             fi
-            git diff --name-only "${BASE_SHA}...HEAD" > "${changed_files}"
+            git diff --name-only --no-renames "${BASE_SHA}...HEAD" > "${changed_files}"
           elif [[ "${EVENT_NAME}" == "merge_group" ]]; then
             base_branch="${BASE_REF#refs/heads/}"
             if [[ -z "${base_branch}" ]]; then
@@ -104,15 +105,15 @@ jobs:
               exit 1
             fi
             git fetch --no-tags --prune origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"
-            git diff --name-only "origin/${base_branch}...HEAD" > "${changed_files}"
+            git diff --name-only --no-renames "origin/${base_branch}...HEAD" > "${changed_files}"
           elif [[ "${EVENT_NAME}" == "push" ]]; then
             if [[ -n "${BEFORE_SHA}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
-              git diff --name-only "${BEFORE_SHA}..HEAD" > "${changed_files}"
+              git diff --name-only --no-renames "${BEFORE_SHA}..HEAD" > "${changed_files}"
             else
               git fetch --no-tags --prune origin "${DEFAULT_BRANCH}"
               merge_base="$(git merge-base "origin/${DEFAULT_BRANCH}" HEAD 2>/dev/null || true)"
               if [[ -n "${merge_base}" ]]; then
-                git diff --name-only "${merge_base}...HEAD" > "${changed_files}"
+                git diff --name-only --no-renames "${merge_base}...HEAD" > "${changed_files}"
               else
                 git diff-tree --no-commit-id --name-only -r HEAD > "${changed_files}"
               fi
@@ -1071,6 +1072,20 @@ jobs:
           path: |
             build/doc/rpc/**
 
+  # Changes to the ML-KEM library, the v2 transport, or their build and CI
+  # wiring (ci/checks/classify_merge_profile.py) must pass these jobs of the PQ
+  # workflow on the change itself (for a pull request, its merge commit), on
+  # GitHub-hosted runners: AArch64 Linux, and macOS on Apple Silicon and on
+  # Intel, the only jobs that build and run ML-KEM's native code on macOS.
+  pq-unit:
+    name: 'PQ unit tests'
+    needs: classify-changes
+    if: ${{ needs.classify-changes.outputs.pq_unit_required == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft != true) }}
+    uses: ./.github/workflows/ci-pq.yml
+    with:
+      source_ref: ${{ github.sha }}
+      jobs: aarch64-unit,macos-arm64-unit,macos-x86_64-unit
+
   full-validation-gate:
     name: 'Full Validation Gate'
     runs-on: ubuntu-24.04
@@ -1084,6 +1099,7 @@ jobs:
       - lint
       - public-docs-lint
       - rpc-docs
+      - pq-unit
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.draft != true) }}
     steps:
       - name: Require trusted label for fork PRs
@@ -1106,6 +1122,8 @@ jobs:
           LINT_RESULT: ${{ needs.lint.result }}
           PUBLIC_DOCS_LINT_RESULT: ${{ needs.public-docs-lint.result }}
           RPC_DOCS_RESULT: ${{ needs.rpc-docs.result }}
+          PQ_UNIT_REQUIRED: ${{ needs.classify-changes.outputs.pq_unit_required }}
+          PQ_UNIT_RESULT: ${{ needs.pq-unit.result }}
         run: |
           set -euo pipefail
 
@@ -1123,6 +1141,25 @@ jobs:
 
           check_result "classify validation profile" "${CLASSIFY_CHANGES_RESULT}"
           echo "CI profile: ${CI_PROFILE:-unavailable}"
+
+          # The PQ unit jobs (AArch64 Linux, macOS arm64 and x86_64) may be
+          # skipped only when the classifier says this change does not need them.
+          case "${PQ_UNIT_REQUIRED}" in
+            true)
+              check_result "PQ unit tests" "${PQ_UNIT_RESULT}"
+              ;;
+            false)
+              echo "PQ unit tests: ${PQ_UNIT_RESULT} (not required for this change)"
+              if [[ "${PQ_UNIT_RESULT}" != "skipped" && "${PQ_UNIT_RESULT}" != "success" ]]; then
+                echo "::error title=Full Validation failed::PQ unit tests result was ${PQ_UNIT_RESULT}."
+                failed=1
+              fi
+              ;;
+            *)
+              echo "::error title=Full Validation failed::The classifier did not report whether the PQ unit jobs are required (pq_unit_required='${PQ_UNIT_REQUIRED}')."
+              failed=1
+              ;;
+          esac
 
           if [[ "${SOURCE_VALIDATION_REQUIRED}" != "true" ]]; then
             echo "Validation profile ${VALIDATION_PROFILE} does not require full source validation."

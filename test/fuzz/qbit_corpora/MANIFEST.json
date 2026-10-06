@@ -170,6 +170,136 @@
         "semantics": "Payload validation, header validation and CheckBlock in one input."
       }
     ],
+    "mlkem": [
+      {
+        "file": "honest-round-trip",
+        "format": "fdp",
+        "size": 96,
+        "sha256": "60563d6bf3a00873f259f212eb2916e929f9a2912b6738402345c16a2fc6cb51",
+        "semantics": "Key generation, encapsulation and decapsulation from fixed seed and coins agree; the all-zero encapsulation key is in range, and the all-zero decapsulation key fails its hash check."
+      },
+      {
+        "file": "cctv-base-key",
+        "format": "fdp",
+        "size": 1664,
+        "sha256": "fc04cec04516e98b8c4c8c855bc74c30e5d672a04d7be3a44415274c05c1ff4c",
+        "semantics": "The key shared by the C2SP CCTV modulus vectors, every coefficient in range: accepted."
+      },
+      {
+        "file": "coefficient-3328",
+        "format": "fdp",
+        "size": 1664,
+        "sha256": "6c274898e6747f79cb4fec2dde374e46f37e578d1e4ee605e0a8ce9c377212b0",
+        "semantics": "First coefficient q - 1 = 3328, the largest valid value: accepted."
+      },
+      {
+        "file": "coefficient-3329",
+        "format": "fdp",
+        "size": 1664,
+        "sha256": "9dea64bc7eef0413f8c5bdfea2f74b4cf1acb148ed1bfa846935db0de425eb2e",
+        "semantics": "First coefficient q = 3329, the smallest invalid value: rejected, outputs cleared."
+      },
+      {
+        "file": "last-coefficient-4095",
+        "format": "fdp",
+        "size": 1664,
+        "sha256": "465c31c294e5e8a5e0effcedf2e346b2de1643635a66309d7f9856c3fb9a0a42",
+        "semantics": "Last coefficient of the last polynomial 4095: rejected, outputs cleared."
+      },
+      {
+        "file": "acvp-valid-decapsulation",
+        "format": "fdp",
+        "size": 6400,
+        "sha256": "22599a5c645de5def70e8e074118f35683d5a324fbc17cd817cc5623c19d5746",
+        "semantics": "NIST ACVP decapsulation tcId 97 (valid): its key, ciphertext and decapsulation key."
+      },
+      {
+        "file": "acvp-modified-ciphertext",
+        "format": "fdp",
+        "size": 6400,
+        "sha256": "fea33fe3acf805c569b6d4804a257b82275dcd6dba1269fa7ff330091563e563",
+        "semantics": "NIST ACVP decapsulation tcId 96 (modified ciphertext): implicit rejection."
+      },
+      {
+        "file": "acvp-modified-key-hash",
+        "format": "fdp",
+        "size": 6400,
+        "sha256": "b937bf76921e91b22e043794ca5b8780b35f60e8384d90faa558ef0e15da9497",
+        "semantics": "NIST ACVP decapsulation key check tcId 146 (modified H): rejected, secret cleared."
+      },
+      {
+        "file": "honest-ciphertext-bit-flip",
+        "format": "fdp",
+        "size": 6403,
+        "sha256": "c555ad9f071c42fb7772c778d34a769259a926cae98b853ad5ce4b72f1bbc1a2",
+        "semantics": "Flip bit 4321 of the honest ciphertext: decapsulation still yields a secret, a different one."
+      }
+    ],
+    "mlkem_backend_diff": [
+      {
+        "file": "honest-round-trip",
+        "format": "fdp",
+        "size": 96,
+        "sha256": "60563d6bf3a00873f259f212eb2916e929f9a2912b6738402345c16a2fc6cb51",
+        "semantics": "Key generation, encapsulation and decapsulation from fixed seed and coins agree; the all-zero encapsulation key is in range, and the all-zero decapsulation key fails its hash check."
+      },
+      {
+        "file": "cctv-base-key",
+        "format": "fdp",
+        "size": 1664,
+        "sha256": "fc04cec04516e98b8c4c8c855bc74c30e5d672a04d7be3a44415274c05c1ff4c",
+        "semantics": "The key shared by the C2SP CCTV modulus vectors, every coefficient in range: accepted."
+      },
+      {
+        "file": "coefficient-3328",
+        "format": "fdp",
+        "size": 1664,
+        "sha256": "6c274898e6747f79cb4fec2dde374e46f37e578d1e4ee605e0a8ce9c377212b0",
+        "semantics": "First coefficient q - 1 = 3328, the largest valid value: accepted."
+      },
+      {
+        "file": "coefficient-3329",
+        "format": "fdp",
+        "size": 1664,
+        "sha256": "9dea64bc7eef0413f8c5bdfea2f74b4cf1acb148ed1bfa846935db0de425eb2e",
+        "semantics": "First coefficient q = 3329, the smallest invalid value: rejected, outputs cleared."
+      },
+      {
+        "file": "last-coefficient-4095",
+        "format": "fdp",
+        "size": 1664,
+        "sha256": "465c31c294e5e8a5e0effcedf2e346b2de1643635a66309d7f9856c3fb9a0a42",
+        "semantics": "Last coefficient of the last polynomial 4095: rejected, outputs cleared."
+      },
+      {
+        "file": "acvp-valid-decapsulation",
+        "format": "fdp",
+        "size": 6400,
+        "sha256": "22599a5c645de5def70e8e074118f35683d5a324fbc17cd817cc5623c19d5746",
+        "semantics": "NIST ACVP decapsulation tcId 97 (valid): its key, ciphertext and decapsulation key."
+      },
+      {
+        "file": "acvp-modified-ciphertext",
+        "format": "fdp",
+        "size": 6400,
+        "sha256": "fea33fe3acf805c569b6d4804a257b82275dcd6dba1269fa7ff330091563e563",
+        "semantics": "NIST ACVP decapsulation tcId 96 (modified ciphertext): implicit rejection."
+      },
+      {
+        "file": "acvp-modified-key-hash",
+        "format": "fdp",
+        "size": 6400,
+        "sha256": "b937bf76921e91b22e043794ca5b8780b35f60e8384d90faa558ef0e15da9497",
+        "semantics": "NIST ACVP decapsulation key check tcId 146 (modified H): rejected, secret cleared."
+      },
+      {
+        "file": "honest-ciphertext-bit-flip",
+        "format": "fdp",
+        "size": 6403,
+        "sha256": "c555ad9f071c42fb7772c778d34a769259a926cae98b853ad5ce4b72f1bbc1a2",
+        "semantics": "Flip bit 4321 of the honest ciphertext: decapsulation still yields a secret, a different one."
+      }
+    ],
     "p2mr_script": [
       {
         "file": "legacy-checksigpqc-default-valid",

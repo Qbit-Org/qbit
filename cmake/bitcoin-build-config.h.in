@@ -39,6 +39,10 @@
 /* Define to 1 to enable wallet functions. */
 #cmakedefine ENABLE_WALLET 1
 
+/* Define to 1 if mlkem-native's native ML-KEM backends are compiled in, and to
+   0 if not. */
+#cmakedefine01 ENABLE_MLKEM_NATIVE
+
 /* Define to 1 if you have the declaration of `fork', and to 0 if you don't.
    */
 #cmakedefine01 HAVE_DECL_FORK
@@ -69,6 +73,9 @@
 
 /* Define this symbol if you have malloc_info */
 #cmakedefine HAVE_MALLOC_INFO 1
+
+/* Define this symbol if __builtin_cpu_supports links for the target */
+#cmakedefine HAVE_BUILTIN_CPU_SUPPORTS 1
 
 /* Define this symbol if you have mallopt with M_ARENA_MAX */
 #cmakedefine HAVE_MALLOPT_ARENA_MAX 1
