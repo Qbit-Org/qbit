@@ -19,9 +19,11 @@ in MLKEM_POLICY_REQUIRED_COMPILERS (space-separated), as CI does for the ones
 it installs: then a missing one fails. "cc-m32" stands for cc -m32 with 32-bit
 headers. Failures print the signature, cause and fix.
 
-A fourth layer runs on x86_64 hosts: it links qbit's glue and wrapper with
-every assembly routine wrapped by a call counter, and checks that the portable
-override reaches each of them.
+A fourth layer links qbit's glue and wrapper with every assembly routine
+wrapped by a call counter, and checks that the portable override reaches each
+of them: the x86_64 backend on x86_64 hosts, the AArch64 backend under
+qemu-aarch64 (listed as qemu-aarch64 and aarch64-linux-gnu-g++ in
+MLKEM_POLICY_REQUIRED_COMPILERS when required).
 """
 
 from __future__ import annotations
@@ -499,104 +501,249 @@ class MlkemConfigHeaderTest(unittest.TestCase):
 
 COVERAGE_HARNESS = r"""
 #include <crypto/mlkem.h>
+#include <array>
 #include <cstdio>
+#include <functional>
+#include <thread>
 #include <vector>
 unsigned long AsmCalls();
 using namespace mlkem;
-static std::vector<uint8_t> RoundTrip()
+static std::array<uint8_t, KEYGEN_SEED_BYTES> Seed()
 {
     std::array<uint8_t, KEYGEN_SEED_BYTES> seed{};
     for (size_t i = 0; i < seed.size(); ++i) seed[i] = uint8_t(i * 7 + 1);
-    const std::array<uint8_t, ENCAPS_COINS_BYTES> coins{};
+    return seed;
+}
+static const std::array<uint8_t, ENCAPS_COINS_BYTES> COINS{};
+static std::vector<uint8_t> RoundTrip()
+{
     PublicKey ek; DecapsulationKey dk; Ciphertext ct; SharedSecret sent, received;
-    if (KeyGen(seed, ek, dk) != Error::NONE || CheckPublicKey(ek) != Error::NONE ||
-        Encaps(ek, coins, ct, sent) != Error::NONE || Decaps(dk, ct, received) != Error::NONE) return {};
+    if (KeyGen(Seed(), ek, dk) != Error::NONE || CheckPublicKey(ek) != Error::NONE ||
+        Encaps(ek, COINS, ct, sent) != Error::NONE || Decaps(dk, ct, received) != Error::NONE) return {};
     std::vector<uint8_t> out(ek.begin(), ek.end());
     out.insert(out.end(), ct.begin(), ct.end());
     out.insert(out.end(), received.Bytes().begin(), received.Bytes().end());
     return out;
+}
+// The assembly calls of each entry point, run alone on a new thread, whose
+// copy of the override is unset until the entry point takes it.
+static std::array<unsigned long, 4> EachOperationOnAFreshThread(const PublicKey& ek, const DecapsulationKey& dk, const Ciphertext& ct)
+{
+    const std::function<void()> operations[4]{
+        [] { PublicKey e; DecapsulationKey d; (void)KeyGen(Seed(), e, d); },
+        [&] { (void)CheckPublicKey(ek); },
+        [&] { Ciphertext c; SharedSecret s; (void)Encaps(ek, COINS, c, s); },
+        [&] { SharedSecret s; (void)Decaps(dk, ct, s); },
+    };
+    std::array<unsigned long, 4> calls{};
+    for (size_t i = 0; i < calls.size(); ++i) {
+        AsmCalls();
+        std::thread{operations[i]}.join();
+        calls[i] = AsmCalls();
+    }
+    return calls;
 }
 int main()
 {
     const auto detected{RoundTrip()};
     const unsigned long detected_calls{AsmCalls()};
     const auto active{GetBackendNames().arith};
+    PublicKey ek; DecapsulationKey dk; Ciphertext ct; SharedSecret ss;
+    const bool inputs{KeyGen(Seed(), ek, dk) == Error::NONE && Encaps(ek, COINS, ct, ss) == Error::NONE};
+    const auto fresh_detected{EachOperationOnAFreshThread(ek, dk, ct)};
     std::vector<uint8_t> portable;
     unsigned long portable_calls;
+    std::array<unsigned long, 4> fresh_portable;
     {
         ForcePortableForTesting force;
+        AsmCalls();
         portable = RoundTrip();
         portable_calls = AsmCalls();
+        fresh_portable = EachOperationOnAFreshThread(ek, dk, ct);
     }
-    std::printf("active=%.*s detected_calls=%lu portable_calls=%lu equal=%d ok=%d\n", int(active.size()), active.data(),
-                detected_calls, portable_calls, int(detected == portable), int(!detected.empty()));
+    std::printf("active=%.*s detected_calls=%lu portable_calls=%lu equal=%d ok=%d "
+                "fresh_detected=%lu,%lu,%lu,%lu fresh_portable=%lu,%lu,%lu,%lu\n",
+                int(active.size()), active.data(), detected_calls, portable_calls, int(detected == portable),
+                int(!detected.empty() && inputs), fresh_detected[0], fresh_detected[1], fresh_detected[2], fresh_detected[3],
+                fresh_portable[0], fresh_portable[1], fresh_portable[2], fresh_portable[3]);
 }
 """
 
+# The entry points EachOperationOnAFreshThread runs, in its order.
+OPERATIONS = ("KeyGen", "CheckPublicKey", "Encaps", "Decaps")
+
+# Test-only edits that let qbit's AArch64 glue build for AArch64 ELF, which
+# release builds refuse (src/crypto/mlkem_config.h: no BTI landing pads), so
+# that it can run under qemu-aarch64 on a Linux host. Each must match exactly once.
+AARCH64_ELF_CONFIG_EDITS = (
+    ("#if defined(MLK_SYS_AARCH64) && defined(__ELF__)\n"
+     "#error \"mlkem-native AArch64 assembly has no BTI landing pads or GNU property note; AArch64 ELF builds are portable only.\"\n"
+     "#endif\n", ""),
+    ("(defined(MLK_SYS_AARCH64) && defined(MLK_SYS_AARCH64_NEON) && defined(MLK_SYS_APPLE))",
+     "(defined(MLK_SYS_AARCH64) && defined(MLK_SYS_AARCH64_NEON))"),
+)
+# The negative control: upstream's single-lane Keccak glue, which runs its
+# assembly without asking the capability hook, in place of qbit's mirror.
+UPSTREAM_X1_EDIT = (
+    re.compile(r"#define MLK_USE_NATIVE_FIPS202_X1\n.*?#endif // !__ASSEMBLER__\n", re.S),
+    "#include <mlkem/src/fips202/native/aarch64/x1_scalar.h>\n",
+)
+
+
+def edited(source: Path, edits: tuple) -> str:
+    text = source.read_text(encoding="utf8")
+    for old, new in edits:
+        count = len(old.findall(text)) if isinstance(old, re.Pattern) else text.count(old)
+        if count != 1:
+            raise AssertionError(
+                f"FAIL: test edit matched {count} times in {source}\n"
+                f"Cause: {source.name} changed, so the test can no longer derive its AArch64 ELF build\n"
+                f"Fix: update the edits in {Path(__file__).name} to the new text: {old if isinstance(old, str) else old.pattern!r}")
+        text = old.sub(new, text) if isinstance(old, re.Pattern) else text.replace(old, new)
+    return text
+
 
 class MlkemOverrideCoverageTest(unittest.TestCase):
-    """The portable override reaches every assembly routine of the x86_64 backend.
+    """The portable override reaches every assembly routine of each native backend.
 
     Every global symbol the assembly object defines is wrapped (ld --wrap) by a
     counter. A missed entry point would still give identical outputs, so only
-    counting the calls can show it.
+    counting the calls can show it. Each wrapper entry point is also run alone
+    on a fresh thread, which shows one that runs the library without taking
+    the override first.
+
+    x86_64 runs on x86_64 hosts. AArch64 is cross-built as a static Linux
+    binary and run under qemu-aarch64; release builds enable it only on macOS,
+    so the test builds a copy of src/crypto/mlkem_config.h without its AArch64
+    ELF refusal. CI requires the AArch64 tools through
+    MLKEM_POLICY_REQUIRED_COMPILERS (aarch64-linux-gnu-g++ and qemu-aarch64).
     """
 
-    def test_override_reaches_every_assembly_routine(self) -> None:
+    def build_harness(self, out: Path, *, cc: str, cxx: str, nm: str, args: int, overrides: dict[str, str],
+                      link_flags: tuple[str, ...] = ()) -> Path:
+        """Compile the library, qbit's glue and the counting harness; return the binary."""
+        src = REPO_ROOT / "src"
+        include = out / "include"
+        for name, text in overrides.items():
+            (include / "crypto").mkdir(parents=True, exist_ok=True)
+            (include / "crypto" / name).write_text(text, encoding="utf8")
+        # Overridden glue headers come first; qbit's own files fill in the rest.
+        flags = ['-DMLK_CONFIG_FILE="crypto/mlkem_config.h"', "-DQBIT_MLKEM_NATIVE", f"-I{include}", f"-I{src}",
+                 f"-I{src / 'mlkem-native'}", "-O1"]
+
+        def compile_(compiler: str, source: Path, *extra: str) -> Path:
+            obj = out / (source.name + ".o")
+            result = run([compiler, *flags, *extra, "-c", str(source), "-o", str(obj)])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return obj
+
+        objects = [
+            compile_(cc, src / "mlkem-native" / "mlkem" / "mlkem_native.c"),
+            compile_(cc, src / "mlkem-native" / "mlkem" / "mlkem_native_asm.S"),
+            compile_(cc, src / "crypto" / "mlkem_backend.c"),
+        ]
+        asm_symbols = sorted(line.split()[2] for line in run([nm, "--defined-only", "-g", str(objects[1])]).stdout.splitlines()
+                             if len(line.split()) == 3 and line.split()[1] == "T")
+        self.assertGreater(len(asm_symbols), 0, "no assembly routines: is the native backend compiled?")
+        # Every routine takes only integer or pointer arguments, at most as many
+        # as the ABI passes in registers (args), so a generic forwarder keeps them.
+        params = ", ".join("void*" for _ in range(args))
+        named = ", ".join(f"void* a{i}" for i in range(args))
+        forwarded = ", ".join(f"a{i}" for i in range(args))
+        wrappers = ["#include <atomic>", "#include <cstdint>", "static std::atomic<unsigned long> g_calls{0};", 'extern "C" {']
+        for symbol in asm_symbols:
+            wrappers.append(f"uint64_t __real_{symbol}({params});")
+            wrappers.append(f"uint64_t __wrap_{symbol}({named}) {{ ++g_calls; return __real_{symbol}({forwarded}); }}")
+        wrappers += ["}", "unsigned long AsmCalls() { return g_calls.exchange(0); }"]
+        (out / "wrap.cpp").write_text("\n".join(wrappers) + "\n", encoding="utf8")
+        (out / "harness.cpp").write_text(COVERAGE_HARNESS, encoding="utf8")
+        for source in (src / "crypto" / "mlkem.cpp", src / "compat" / "cpu_features.cpp", src / "support" / "cleanse.cpp",
+                       out / "harness.cpp", out / "wrap.cpp"):
+            objects.append(compile_(cxx, source, "-std=c++20", "-pthread"))
+        binary = out / "harness"
+        link = run([cxx, "-pthread", *link_flags, "-o", str(binary), *map(str, objects),
+                    *(f"-Wl,--wrap={symbol}" for symbol in asm_symbols)])
+        self.assertEqual(link.returncode, 0, link.stderr)
+        return binary
+
+    def run_harness(self, command: list[str]) -> dict[str, str]:
+        result = run(command)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        values = dict(item.split("=", 1) for item in result.stdout.split())
+        self.assertEqual(values["ok"], "1", result.stdout)
+        self.assertEqual(values["equal"], "1", "the backends disagree")
+        return values
+
+    def check_coverage(self, values: dict[str, str], native: str, mirror_hint: str) -> None:
+        self.assertEqual(values["active"], native, values)
+        self.assertGreater(int(values["detected_calls"]), 0, values)
+        self.assertEqual(values["portable_calls"], "0",
+            f"FAIL: assembly ran {values['portable_calls']} times with portable C forced\n"
+            "Cause: a native entry point does not ask mlk_sys_check_capability\n"
+            f"Fix: mirror its dispatch glue with a capability check, {mirror_hint}")
+        fresh_detected = [int(count) for count in values["fresh_detected"].split(",")]
+        fresh_portable = [int(count) for count in values["fresh_portable"].split(",")]
+        for operation, native_calls, portable_calls in zip(OPERATIONS, fresh_detected, fresh_portable):
+            # Without native calls of its own, an operation's portable count proves nothing.
+            self.assertGreater(native_calls, 0, f"{operation} runs no assembly natively: {values}")
+            self.assertEqual(portable_calls, 0,
+                f"FAIL: mlkem::{operation} ran assembly {portable_calls} times on a fresh thread with portable C forced\n"
+                "Cause: it enters the library without BeginOperation(), so this thread's copy of the override is stale\n"
+                "Fix: call BeginOperation() first in every entry point of src/crypto/mlkem.cpp")
+
+    def test_x86_64_override_reaches_every_assembly_routine(self) -> None:
         if host_arch() != "x86_64":
             self.skipTest("the x86_64 backend runs only on x86_64 hosts")
         cc, cxx, nm = shutil.which("cc"), shutil.which("c++"), shutil.which("nm")
         if not (cc and cxx and nm):
             self.skipTest("cc, c++ and nm are required")
         assert cc is not None and cxx is not None and nm is not None
-        src = REPO_ROOT / "src"
-        flags = ['-DMLK_CONFIG_FILE="crypto/mlkem_config.h"', "-DQBIT_MLKEM_NATIVE", f"-I{src}", f"-I{src / 'mlkem-native'}", "-O1"]
         with tempfile.TemporaryDirectory() as tmp:
-            out = Path(tmp)
+            binary = self.build_harness(Path(tmp), cc=cc, cxx=cxx, nm=nm, args=6, overrides={})
+            values = self.run_harness([str(binary)])
+        if values["active"] != "x86_64-avx2":
+            # A CPU without the extensions runs portable C only: nothing to count.
+            self.assertEqual(values["detected_calls"], "0", values)
+            self.assertEqual(values["portable_calls"], "0", values)
+            self.skipTest("this CPU cannot run the x86_64 backend")
+        self.check_coverage(values, "x86_64-avx2", "as for AArch64's x1 Keccak in src/crypto/mlkem_fips202_backend.h")
 
-            def compile_(compiler: str, source: Path, *extra: str) -> Path:
-                obj = out / (source.name + ".o")
-                result = run([compiler, *flags, *extra, "-c", str(source), "-o", str(obj)])
-                self.assertEqual(result.returncode, 0, result.stderr)
-                return obj
+    def aarch64_tools(self) -> tuple[str, str, str, str]:
+        tools = []
+        for executable in ("aarch64-linux-gnu-gcc", "aarch64-linux-gnu-g++", "aarch64-linux-gnu-nm", "qemu-aarch64"):
+            path = shutil.which(executable)
+            if path is None:
+                skip_missing_compiler(self, executable)
+            assert path is not None
+            tools.append(path)
+        return tools[0], tools[1], tools[2], tools[3]
 
-            objects = [
-                compile_(cc, src / "mlkem-native" / "mlkem" / "mlkem_native.c"),
-                compile_(cc, src / "mlkem-native" / "mlkem" / "mlkem_native_asm.S"),
-                compile_(cc, src / "crypto" / "mlkem_backend.c"),
-            ]
-            asm_symbols = sorted(line.split()[2] for line in run([nm, "--defined-only", "-g", str(objects[1])]).stdout.splitlines()
-                                 if len(line.split()) == 3 and line.split()[1] == "T")
-            self.assertGreater(len(asm_symbols), 0, "no assembly routines: is the native backend compiled?")
-            wrappers = ["#include <atomic>", "#include <cstdint>", "static std::atomic<unsigned long> g_calls{0};", 'extern "C" {']
-            for symbol in asm_symbols:
-                # Every routine takes at most six integer or pointer arguments, which the
-                # SysV ABI passes in registers, so a generic forwarder preserves them.
-                wrappers.append(f"uint64_t __real_{symbol}(void*, void*, void*, void*, void*, void*);")
-                wrappers.append(f"uint64_t __wrap_{symbol}(void* a, void* b, void* c, void* d, void* e, void* f) "
-                                f"{{ ++g_calls; return __real_{symbol}(a, b, c, d, e, f); }}")
-            wrappers += ["}", "unsigned long AsmCalls() { return g_calls.exchange(0); }"]
-            (out / "wrap.cpp").write_text("\n".join(wrappers) + "\n", encoding="utf8")
-            (out / "harness.cpp").write_text(COVERAGE_HARNESS, encoding="utf8")
-            for source in (src / "crypto" / "mlkem.cpp", src / "compat" / "cpu_features.cpp", src / "support" / "cleanse.cpp",
-                           out / "harness.cpp", out / "wrap.cpp"):
-                objects.append(compile_(cxx, source, "-std=c++20"))
-            binary = out / "harness"
-            link = run([cxx, "-o", str(binary), *map(str, objects), *(f"-Wl,--wrap={symbol}" for symbol in asm_symbols)])
-            self.assertEqual(link.returncode, 0, link.stderr)
-            result = run([str(binary)])
-            self.assertEqual(result.returncode, 0, result.stderr)
-            values = dict(item.split("=", 1) for item in result.stdout.split())
-            self.assertEqual(values["ok"], "1", result.stdout)
-            self.assertEqual(values["equal"], "1", "the backends disagree")
-            self.assertEqual(values["portable_calls"], "0",
-                f"FAIL: assembly ran {values['portable_calls']} times with portable C forced\n"
-                "Cause: a native entry point does not ask mlk_sys_check_capability\n"
-                "Fix: mirror its dispatch glue with a capability check, as for AArch64's x1 Keccak in src/crypto/mlkem_fips202_backend.h")
-            if values["active"] == "x86_64-avx2":
-                self.assertGreater(int(values["detected_calls"]), 0, result.stdout)
-            else:
-                self.assertEqual(values["detected_calls"], "0", result.stdout)
+    def test_aarch64_override_reaches_every_assembly_routine(self) -> None:
+        cc, cxx, nm, qemu = self.aarch64_tools()
+        src = REPO_ROOT / "src"
+        config = edited(src / "crypto" / "mlkem_config.h", AARCH64_ELF_CONFIG_EDITS)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "qbit"
+            out.mkdir()
+            binary = self.build_harness(out, cc=cc, cxx=cxx, nm=nm, args=8, overrides={"mlkem_config.h": config},
+                                        link_flags=("-static",))
+            values = self.run_harness([qemu, str(binary)])
+            self.check_coverage(values, "aarch64-neon",
+                                "as src/crypto/mlkem_fips202_backend.h does for upstream's x1_scalar.h")
+
+            # Negative control: with upstream's x1 glue in place of qbit's
+            # mirror, forced portable runs leak assembly calls, and the count sees them.
+            upstream = Path(tmp) / "upstream-x1"
+            upstream.mkdir()
+            fips202 = edited(src / "crypto" / "mlkem_fips202_backend.h", (UPSTREAM_X1_EDIT,))
+            binary = self.build_harness(upstream, cc=cc, cxx=cxx, nm=nm, args=8,
+                                        overrides={"mlkem_config.h": config, "mlkem_fips202_backend.h": fips202},
+                                        link_flags=("-static",))
+            control = self.run_harness([qemu, str(binary)])
+            self.assertGreater(int(control["portable_calls"]), 0,
+                f"FAIL: upstream's x1 glue leaked no assembly calls with portable C forced: {control}\n"
+                "Cause: the counter no longer sees the x1 Keccak routine, so this test cannot catch a missing capability check\n"
+                "Fix: check that the --wrap list covers every global symbol of mlkem_native_asm.S")
 
 
 if __name__ == "__main__":
