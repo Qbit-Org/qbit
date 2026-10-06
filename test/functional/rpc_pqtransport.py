@@ -7,9 +7,10 @@
 Options and startup line:
 - test_configuration: -v2pqtransport on the command line, in qbit.conf, negated and
   across restarts, observed on a live connection between two nodes; the warnings for a
-  contradictory or non-numeric setting; -help; the three startup lines.
+  contradictory or non-numeric setting, or a double negative; -help; the three startup lines.
 - test_portable_options: -mlkemportable and -test=mlkem_portable make the startup line
-  report portable code; the test options are regtest only and print nothing to stderr.
+  report portable code, and a non-numeric -mlkemportable or a double negative warns; the
+  test options are regtest only and print nothing to stderr.
 
 RPC (getpqtransportinfo, and the getpeerinfo and getnetworkinfo fields):
 - test_states: every getpqtransportinfo field with the switch off, with v2 off, on, and
@@ -67,9 +68,21 @@ RING_SIZE = 256
 FIRST_WINDOW = 3600
 
 
-def non_numeric_warning(value, read_as):
-    return (f"Warning: -v2pqtransport={value} is not a number, so it is read as -v2pqtransport={read_as}. "
-            "Set -v2pqtransport=1 or -v2pqtransport=0.")
+# The effect each warning states.
+PQ_ON = "hybrid transport is ON"
+PQ_OFF = "hybrid transport is OFF"
+PORTABLE = "ML-KEM-1024 uses portable code"
+NATIVE = "ML-KEM-1024 uses native code where the CPU supports it"
+
+
+def non_numeric_warning(value, read_as, effect, option="v2pqtransport"):
+    return (f"Warning: -{option}={value} is not a number and was read as -{option}={read_as}: {effect}. "
+            f"Use -{option}=1 or -{option}=0.")
+
+
+def double_negative_warning(effect, option="v2pqtransport"):
+    return (f"Warning: -no{option} was given 0 or a non-numeric value, so it was read as -{option}=1: {effect}. "
+            f"Use -{option}=0 to switch it off.")
 
 
 def zero_counts():
@@ -163,10 +176,13 @@ class PQTransportTest(BitcoinTestFramework):
         return lines[-1]
 
     def check_start(self, args, state, *, expected_stderr=""):
-        """Start node 0 with args, check its startup line's state and stderr, and stop it."""
+        """Start node 0 with args, check its startup line's state and stderr, and stop it. Returns
+        the startup line."""
         self.start_node(0, extra_args=args)
-        assert_equal(self.startup_line(self.nodes[0])[0], state)
+        line = self.startup_line(self.nodes[0])
+        assert_equal(line[0], state)
         self.stop_node(0, expected_stderr=expected_stderr)
+        return line
 
     def check_connection(self, *, hybrid):
         """Connect node 0 to node 1, check whether both switched to hybrid keys, and disconnect."""
@@ -262,15 +278,35 @@ class PQTransportTest(BitcoinTestFramework):
         self.check_start(["-v2transport=0", "-nov2pqtransport"], DISABLED_V2)
         self.check_start(["-v2transport=0"], DISABLED_V2)
 
-        self.log.info("Test a non-numeric -v2pqtransport warns with the value it is read as")
-        self.check_start(["-v2transport=1", "-v2pqtransport=true"], DISABLED_PQ, expected_stderr=non_numeric_warning("true", 0))
-        self.check_start(["-v2transport=1", "-v2pqtransport=1abc"], ENABLED, expected_stderr=non_numeric_warning("1abc", 1))
+        self.log.info("Test a non-numeric -v2pqtransport warns with the value given, what it was read as, and the effect")
+        for value in ["true", "yes", "on"]:
+            self.check_start(["-v2transport=1", f"-v2pqtransport={value}"], DISABLED_PQ,
+                             expected_stderr=non_numeric_warning(value, 0, PQ_OFF))
+        self.check_start(["-v2transport=1", "-v2pqtransport=1abc"], ENABLED, expected_stderr=non_numeric_warning("1abc", 1, PQ_ON))
         # Out of range: read as 1, the saturated value.
         self.check_start(["-v2transport=1", "-v2pqtransport=99999999999"], ENABLED,
-                         expected_stderr=non_numeric_warning("99999999999", 1))
-        # A sign is allowed, as InterpretBool reads it.
-        self.check_start(["-v2transport=1", "-v2pqtransport=+1"], ENABLED)
-        self.check_start(["-v2transport=1", "-v2pqtransport=-1"], ENABLED)
+                         expected_stderr=non_numeric_warning("99999999999", 1, PQ_ON))
+        # Whitespace and a sign are allowed, as InterpretBool reads them.
+        for value in [" 1", "+1", "-1"]:
+            self.check_start(["-v2transport=1", f"-v2pqtransport={value}"], ENABLED)
+        # With v2 off the effect is off, and the contradiction warns too.
+        self.check_start(["-v2transport=0", "-v2pqtransport=1abc"], DISABLED_V2,
+                         expected_stderr=non_numeric_warning("1abc", 1, PQ_OFF) + "\n" + CONTRADICTION_WARNING)
+
+        self.log.info("Test a double negative, which switches the hybrid transport on, warns")
+        for value in ["0", "true", "on"]:
+            self.check_start(["-v2transport=1", f"-nov2pqtransport={value}"], ENABLED, expected_stderr=double_negative_warning(PQ_ON))
+        self.check_start(["-v2transport=0", "-nov2pqtransport=true"], DISABLED_V2,
+                         expected_stderr=double_negative_warning(PQ_OFF) + "\n" + CONTRADICTION_WARNING)
+        append_config(node0.datadir_path, ["nov2pqtransport=true"])
+        self.check_start(["-v2transport=1"], ENABLED, expected_stderr=double_negative_warning(PQ_ON))
+        node0.replace_in_config([("nov2pqtransport=true\n", "")])
+
+        self.log.info("Test -nov2pqtransport and -nov2pqtransport=1 switch it off without a warning")
+        # ArgsManager keeps only a negation's result, so -nov2pqtransport=1abc, read as off like
+        # -nov2pqtransport, can't warn.
+        for option in ["-nov2pqtransport", "-nov2pqtransport=1", "-nov2pqtransport=1abc"]:
+            self.check_start(["-v2transport=1", option], DISABLED_PQ)
 
         self.log.info("Test -help lists -v2pqtransport, and -help-debug the hidden options")
         help_text = subprocess.run(node0.binaries.node_argv() + ["-help"], capture_output=True, text=True, check=True).stdout
@@ -292,6 +328,24 @@ class PQTransportTest(BitcoinTestFramework):
             assert_equal(self.startup_line(node0)[1:], ("portable", "portable"))
             info = node0.getpqtransportinfo()
             assert_equal((info["arith_backend"], info["keccak_backend"]), ("portable", "portable"))
+        self.stop_node(0)
+
+        self.log.info("Test a non-numeric -mlkemportable, or a double negative, warns and states which code runs")
+        default = self.check_start(["-v2transport=1"], DISABLED_PQ)[1:]
+        # -mlkemportable=true is read as 0: the default code stays.
+        assert_equal(self.check_start(["-v2transport=1", "-mlkemportable=true"], DISABLED_PQ,
+                                      expected_stderr=non_numeric_warning("true", 0, NATIVE, "mlkemportable"))[1:], default)
+        assert_equal(self.check_start(["-v2transport=1", "-mlkemportable=1abc"], DISABLED_PQ,
+                                      expected_stderr=non_numeric_warning("1abc", 1, PORTABLE, "mlkemportable"))[1:], ("portable", "portable"))
+        for value in ["0", "true"]:
+            assert_equal(self.check_start(["-v2transport=1", f"-nomlkemportable={value}"], DISABLED_PQ,
+                                          expected_stderr=double_negative_warning(PORTABLE, "mlkemportable"))[1:], ("portable", "portable"))
+        for option in ["-nomlkemportable", "-nomlkemportable=1", "-mlkemportable=0"]:
+            assert_equal(self.check_start(["-v2transport=1", option], DISABLED_PQ)[1:], default)
+        # The test option forces portable code, whatever -mlkemportable is read as; the effect says so.
+        assert_equal(self.check_start(["-v2transport=1", "-mlkemportable=true", "-test=mlkem_portable"], DISABLED_PQ,
+                                      expected_stderr=non_numeric_warning("true", 0, PORTABLE, "mlkemportable"))[1:], ("portable", "portable"))
+        self.start_node(0)
 
         self.log.info("Test -test=pq_fail_first_packet starts cleanly")
         self.restart_node(0, extra_args=PQ_FAIL)
