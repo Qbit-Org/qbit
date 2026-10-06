@@ -25,6 +25,31 @@
         "Lane-specific estimates filter which blocks contribute work while using the same active-chain elapsed-time window as the all-lane estimate; they do not use a lane-local timestamp window."
       ]
     },
+    "getpqtransportinfo": {
+      "status_override": "new_since_v30_2",
+      "delta_summary": "Adds the hybrid post-quantum v2 transport (ML-KEM-1024 and ECDH) diagnostics RPC.",
+      "delta_notes": [
+        "This method does not exist in Bitcoin Core v30.2.",
+        "Every field is always present, and empty collections are [].",
+        "Counters count events since startup, not exclusive outcomes; they start over when instance_id changes."
+      ]
+    },
+    "getpeerinfo": {
+      "status_override": "semantic_changed_since_v30_2",
+      "delta_summary": "Adds transport_pq and transport_pq_status, and session_id is the hybrid session id for a hybrid post-quantum peer.",
+      "delta_notes": [
+        "transport_pq is true once the peer's key confirmation verified.",
+        "transport_pq_status is pending, hybrid, legacy_peer, fallback, off or v1. A connection that closes on a hybrid failure reports pending until it is removed.",
+        "transport_protocol_type keeps its values: detecting until the handshake completes, then v2."
+      ]
+    },
+    "getnetworkinfo": {
+      "status_override": "surface_changed_since_v30_2",
+      "delta_summary": "Adds connections_pq, the number of hybrid post-quantum connections.",
+      "delta_notes": [
+        "connections_pq counts transport_pq over the same peers getpeerinfo lists."
+      ]
+    },
     "getmininginfo": {
       "status_override": "semantic_changed_since_v30_2",
       "delta_summary": "networkhashps is the default total qbit chainwork hashrate estimate, and next is the permissionless/native candidate.",

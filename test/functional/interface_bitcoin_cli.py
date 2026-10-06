@@ -5,12 +5,14 @@
 """Test qbit-cli"""
 
 from decimal import Decimal
+import itertools
 import re
 import socket
 import time
 
 from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.netutil import test_ipv6_local
+from test_framework.p2p import P2PInterface
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_equal,
@@ -90,11 +92,16 @@ def can_connect_to_ipv6_rpc(port):
 class TestBitcoinCli(BitcoinTestFramework):
     def set_test_params(self):
         self.setup_clean_chain = True
-        self.num_nodes = 1
+        # Node 1 is the hybrid post-quantum peer of test_netinfo_pq.
+        self.num_nodes = 2
         self.uses_wallet = None
 
     def skip_test_if_missing_module(self):
         self.skip_if_no_cli()
+
+    def setup_network(self):
+        # Node 1 is only test_netinfo_pq's peer: nothing connects or syncs to it before.
+        self.setup_nodes()
 
     def test_netinfo(self):
         """Test -netinfo output format."""
@@ -109,9 +116,33 @@ class TestBitcoinCli(BitcoinTestFramework):
         assert re.match(rf"^{re.escape(self.config['environment']['CLIENT_NAME'])} client.+services nwl(?:2)?a$", det[0])
         assert not any(line.startswith("Local services:") for line in det)
 
+    def test_netinfo_pq(self):
+        """Test -netinfo marks hybrid post-quantum peers 2p, and explains it."""
+        self.log.info("Test -netinfo shows 2p for a hybrid post-quantum peer and 2 for a legacy v2 peer")
+        pq_args = ["-v2transport=1", "-v2pqtransport=1"]
+        self.restart_node(0, extra_args=pq_args)
+        self.restart_node(1, extra_args=pq_args)
+        self.connect_nodes(0, 1)
+        # A Python v2 peer, which answers without an offer: a legacy peer.
+        self.nodes[0].add_outbound_p2p_connection(P2PInterface(), p2p_idx=0, supports_v2_p2p=True, advertise_v2_p2p=True)
+        assert_equal(sorted(peer["transport_pq_status"] for peer in self.nodes[0].getpeerinfo()), ["hybrid", "legacy_peer"])
+        out = self.nodes[0].cli('-netinfo', '1').send_cli().splitlines()
+        header = next(i for i, line in enumerate(out) if line.startswith("<->"))
+        rows = list(itertools.takewhile(lambda line: line.startswith(("out ", " in ")), out[header + 1:]))
+        # The two-character v column ends at the header's "v".
+        v_end = out[header].index("  v  ") + 3
+        assert_equal(sorted(row[v_end - 2:v_end] for row in rows), [" 2", "2p"])
+
+        self.log.info("Test the -netinfo legend explains 2p")
+        legend = self.nodes[0].cli('-netinfo', 'help').send_cli()
+        assert '"2p" - v2 with hybrid post-quantum session keys (getpeerinfo "transport_pq" is true)' in legend
+
+        self.nodes[0].disconnect_p2ps()
+        self.stop_node(1)
+
     def run_test(self):
         """Main test logic"""
-        self.generate(self.nodes[0], BLOCKS)
+        self.generate(self.nodes[0], BLOCKS, sync_fun=self.no_op)
         block_subsidy = self.nodes[0].getblock(self.nodes[0].getblockhash(1), 2)["tx"][0]["vout"][0]["value"]
         initial_balance = (BLOCKS - COINBASE_MATURITY) * block_subsidy
 
@@ -274,7 +305,7 @@ class TestBitcoinCli(BitcoinTestFramework):
             w1.sendtoaddress(w3.getnewaddress(), send_amount_2)
 
             # Mine a block to confirm.
-            self.generate(self.nodes[0], 1)
+            self.generate(self.nodes[0], 1, sync_fun=self.no_op)
             amounts = [w1.getbalance(), w2.getbalance(), w3.getbalance()]
 
             self.log.info("Test -getinfo with multiple wallets and -rpcwallet returns specified wallet balance")
@@ -416,9 +447,10 @@ class TestBitcoinCli(BitcoinTestFramework):
             assert_raises_rpc_error(-19, WALLET_NOT_SPECIFIED, self.nodes[0].cli('-generate', 1, 2, 3).echo)
         else:
             self.log.info("*** Wallet not compiled; cli getwalletinfo and -getinfo wallet tests skipped")
-            self.generate(self.nodes[0], 25)  # maintain block parity with the wallet_compiled conditional branch
+            self.generate(self.nodes[0], 25, sync_fun=self.no_op)  # maintain block parity with the wallet_compiled conditional branch
 
         self.test_netinfo()
+        self.test_netinfo_pq()
 
         self.log.info("Test -version with node stopped")
         self.stop_node(0)

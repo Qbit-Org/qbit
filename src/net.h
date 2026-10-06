@@ -233,8 +233,12 @@ public:
     bool m_is_archive_connection;
     /** Transport protocol type. */
     TransportProtocolType m_transport_type;
-    /** BIP324 session id string in hex, if any. */
+    /** BIP324 session id string in hex, if any: the hybrid one if m_transport_pq. */
     std::string m_session_id;
+    /** Whether the session keys are hybrid post-quantum: the peer's key confirmation verified. */
+    bool m_transport_pq{false};
+    /** The hybrid post-quantum negotiation's status. */
+    PQStatus m_transport_pq_status{PQStatus::OFF};
 };
 
 
@@ -834,6 +838,9 @@ enum class PQOutcome : uint8_t {
 };
 
 std::string_view PQOutcomeString(PQOutcome outcome) noexcept;
+
+/** The getpeerinfo transport_pq_status token of a status. */
+std::string_view PQStatusString(PQStatus status) noexcept;
 
 /** Hybrid negotiation event counts of one direction. They count events, not exclusive final
  *  states: a switch whose confirmation then fails counts switched and first_packet_failed. */
@@ -1639,6 +1646,9 @@ public:
 
     /** An owning copy of the hybrid transport counters, failure rings and endpoint history. */
     PQTransportStats GetPQTransportStats() const EXCLUSIVE_LOCKS_REQUIRED(!m_pq_mutex, !m_pq_shed_mutex);
+
+    /** The hybrid post-quantum v2 transport configuration, as Init() received it. */
+    const PQTransportConfig& GetPQTransportConfig() const noexcept { return m_pq_config; }
 
     /** Whether new outbound connections to endpoint run plain v2, because repeated hybrid
      *  failures put it in the fallback set. Ends a window that expired. */

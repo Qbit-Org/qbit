@@ -21,12 +21,15 @@ change lands:
 - test_limits: v1.0.0 disconnects at once when a packet's length exceeds
   MAX_CONTENTS_LEN (4,000,013 bytes), not at that length, and disconnects a
   stalled handshake at -peertimeout.
+- test_netinfo: this release's qbit-cli -netinfo against v1.0.0, whose getpeerinfo
+  has no transport_pq, shows a v2 peer as 2, without errors.
 
 The peer is a BIP324 implementation on a plain socket, so the test decides
 every byte it sends and when.
 """
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
+import itertools
 import socket
 import time
 
@@ -44,6 +47,7 @@ from test_framework.p2p import (
     P2P_VERSION_RELAY,
 )
 from test_framework.test_framework import BitcoinTestFramework
+from test_framework.test_node import TestNodeCLI
 from test_framework.util import (
     MAX_NODES,
     assert_equal,
@@ -255,6 +259,8 @@ class P2PV2PreviousReleaseTest(BitcoinTestFramework):
 
         self.test_version_contents()
         self.test_limits()
+        if self.is_cli_compiled():
+            self.test_netinfo()
 
     def open_peers(self, roles):
         """Open one raw v2 connection per role: "responder" means v1.0.0 responds (we
@@ -334,6 +340,21 @@ class P2PV2PreviousReleaseTest(BitcoinTestFramework):
         self.check_cases(delay=0)
         self.log.info(f"... and after a {VERSION_DELAY} s pause before the version packet")
         self.check_cases(delay=VERSION_DELAY)
+
+    def test_netinfo(self):
+        self.log.info("This release's qbit-cli -netinfo against v1.0.0 shows a v2 peer as 2")
+        peer, = self.open_peers(["responder"])
+        self.run_handshake(peer, "responder", b"", delay=0)
+        assert "transport_pq" not in self.peer_info(peer, "responder")
+        cli = TestNodeCLI(self.get_binaries(), self.node.datadir_path)
+        out = cli("-netinfo", "1").send_cli().splitlines()
+        header = next(i for i, line in enumerate(out) if line.startswith("<->"))
+        rows = list(itertools.takewhile(lambda line: line.startswith(("out ", " in ")), out[header + 1:]))
+        # The two-character v column ends at the header's "v".
+        v_end = out[header].index("  v  ") + 3
+        assert_equal([row[v_end - 2:v_end] for row in rows], [" 2"])
+        peer.close()
+        self.wait_until(lambda: not self.node.getpeerinfo())
 
     def test_limits(self):
         for role in ("responder", "initiator"):

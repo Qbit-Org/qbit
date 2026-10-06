@@ -671,6 +671,8 @@ void CNode::CopyStats(CNodeStats& stats)
         Transport::Info info = m_transport->GetInfo();
         stats.m_transport_type = info.transport_type;
         if (info.session_id) stats.m_session_id = HexStr(*info.session_id);
+        stats.m_transport_pq = info.transport_pq;
+        stats.m_transport_pq_status = info.transport_pq_status;
     }
     X(m_permission_flags);
 
@@ -2257,6 +2259,19 @@ std::string_view PQOutcomeString(PQOutcome outcome) noexcept
     case PQOutcome::CLOSED_AFTER_SWITCH: return "closed_after_switch";
     case PQOutcome::FALLBACK: return "fallback";
     case PQOutcome::INTERNAL_ERROR: return "internal_error";
+    } // no default case, so the compiler can warn about missing cases
+    assert(false);
+}
+
+std::string_view PQStatusString(PQStatus status) noexcept
+{
+    switch (status) {
+    case PQStatus::V1: return "v1";
+    case PQStatus::OFF: return "off";
+    case PQStatus::PENDING: return "pending";
+    case PQStatus::HYBRID: return "hybrid";
+    case PQStatus::LEGACY_PEER: return "legacy_peer";
+    case PQStatus::FALLBACK: return "fallback";
     } // no default case, so the compiler can warn about missing cases
     assert(false);
 }
