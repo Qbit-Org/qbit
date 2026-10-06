@@ -20,7 +20,8 @@ unknown:
 Evidence rules:
 - A jump in a node's boot time (time - uptime) is a restart. The samples from
   the last sample before it to the end of the grace period after it are a gap,
-  not a failure.
+  not a failure. An uptime whose boot time contradicts the one already seen for
+  the same instance_id is unknown, not a restart.
 - Coverage is the share of the expected 5-minute samples that are present and
   usable. A figure, node or day below --min-coverage (default 90%) is unknown,
   not judged.
@@ -30,7 +31,10 @@ Evidence rules:
   (a wrap between samples that hid unread entries), and across a changed
   instance_id. A lost stretch makes that interval unknown for that ring.
 - Missing evidence is unknown, never clean: the pinned link passes only if it
-  would pass with every unknown sample counted against it.
+  would pass with every unknown sample counted against it. A malformed value is
+  missing: a time, uptime or connections_in that is not a plain non-negative
+  integer, a samples.csv row with the wrong number of fields, and a connected
+  pinned peer whose fields are malformed or disagree.
 - Only well-formed evidence is clean. A malformed ring, a record whose
   instance_id or since is missing, malformed or contradictory, a failure entry
   whose outcome, time or endpoint is missing, malformed or implausible, and a
@@ -77,6 +81,7 @@ OUTCOMES = MONITORED_OUTCOMES | TRIAGE_OUTCOMES | {"legacy_peer", "abandoned", "
 CLOCK_SLACK = 300
 MAX_TIME = 253402300799  # 9999-12-31T23:59:59Z, the latest time the report can print
 RINGS = ("inbound", "outbound")
+TRANSPORT_STATUSES = {"pending", "hybrid", "legacy_peer", "fallback", "off", "v1"}  # getpeerinfo transport_pq_status
 ENDPOINT_KINDS = {"address", "name_proxy"}
 NETWORKS = {"ipv4", "ipv6", "onion", "i2p", "cjdns", "name_proxy"}
 LABEL = re.compile(r"[A-Za-z0-9._-]+")  # use with fullmatch
@@ -89,15 +94,19 @@ REMEDY = ("an automatic connection held the pinned address in {count} sample(s),
 def parse_time(text: str) -> int:
     """Epoch seconds from Unix seconds or an ISO 8601 time such as 2026-10-20T00:00:00Z (UTC unless it says otherwise)."""
     text = text.strip()
-    if text.isdigit():
-        return int(text)
-    try:
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
-        raise ValueError(f"expected Unix seconds or an ISO 8601 time such as 2026-11-02T00:00:00Z, got {text!r}") from None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return int(parsed.timestamp())
+    if re.fullmatch(r"[0-9]+", text):
+        value = int(text)
+    else:
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            raise ValueError(f"expected Unix seconds or an ISO 8601 time such as 2026-11-02T00:00:00Z, got {text!r}") from None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        value = int(parsed.timestamp())
+    if not is_time(value):
+        raise ValueError(f"expected a time from 1970 to 9999, got {text!r}")
+    return value
 
 
 def utc(epoch: int | float) -> str:
@@ -127,11 +136,9 @@ def number(value: Any) -> str:
     return str(value) if is_count(value) else "malformed"
 
 
-def as_int(value: str | None) -> int | None:
-    try:
-        return None if value is None else int(value)
-    except ValueError:
-        return None
+def as_count(value: str | None) -> int | None:
+    """A CSV value that is a plain non-negative decimal integer, else None."""
+    return int(value) if value is not None and re.fullmatch(r"[0-9]{1,18}", value) else None
 
 
 def percent(share: float | None) -> str:
@@ -178,13 +185,38 @@ class Restart:
     boot: int       # boot time of the new run
 
 
-def restarts(rows: list[dict[str, str | None]]) -> list[Restart]:
+Row = dict[str, str | None]  # a samples.csv row, with NA as None
+
+
+def samples(rows: Iterable[Row]) -> list[tuple[int, Row]]:
+    """The rows that are samples with their times, in time order, with the values the figures read checked.
+
+    A row without a time in Unix seconds is not a sample: it counts as missing.
+    An uptime that is not a non-negative integer, or whose boot time (time -
+    uptime) contradicts the boot time already seen for the same instance_id,
+    becomes None: unknown, never a restart.
+    """
+    timed = sorted(((time, row) for row in rows if is_time(time := as_count(row["time"]))), key=lambda item: item[0])
+    checked = []
+    boots: dict[str, int] = {}  # instance_id -> boot time
+    for time, row in timed:
+        row = dict(row)
+        uptime, instance = as_count(row["uptime"]), row["instance_id"]
+        if uptime is not None and valid_instance_id(instance):
+            if abs(time - uptime - boots.setdefault(instance, time - uptime)) > RESTART_TOLERANCE:
+                uptime = None
+        row["time"], row["uptime"] = str(time), None if uptime is None else str(uptime)
+        checked.append((time, row))
+    return checked
+
+
+def restarts(rows: list[Row]) -> list[Restart]:
     """Restarts seen as a jump in boot time (time - uptime) or a new instance_id."""
     found = []
     previous: tuple[int, int, str | None] | None = None
-    for row in rows:
-        time, uptime = as_int(row["time"]), as_int(row["uptime"])
-        if time is None or uptime is None:
+    for time, row in samples(rows):
+        uptime = as_count(row["uptime"])
+        if uptime is None:
             continue
         boot, instance = time - uptime, row["instance_id"]
         if previous is not None:
@@ -226,15 +258,23 @@ def missing_samples(after: int, before: int, interval: int, gaps: list[tuple[int
 # ---------------------------------------------------------------------------
 
 
-def evaluate_pinned(pool: list[dict[str, str | None]] | None, archive: list[dict[str, str | None]] | None,
+def pinned_peer_ok(row: Row) -> bool:
+    """Whether a connected pinned peer's fields are well formed and agree: transport_pq is 1
+    exactly when transport_pq_status is hybrid."""
+    connection_type, transport_pq, status = (row[name] for name in
+                                             ("pinned_connection_type", "pinned_transport_pq", "pinned_transport_pq_status"))
+    return (connection_type is not None and TOKEN.fullmatch(connection_type) is not None and transport_pq in ("0", "1")
+            and status in TRANSPORT_STATUSES and (transport_pq == "1") == (status == "hybrid"))
+
+
+def evaluate_pinned(pool: list[Row] | None, archive: list[Row] | None,
                     window: Window, interval: int, grace: int, min_coverage: float) -> Figure:
     name = "pinned link manual and hybrid in >= 99% of samples, excluding restarts"
     if not pool:
         return Figure(name, UNKNOWN, 0, None, "no pool node samples")
     gaps = merged_gaps(restarts(pool) + (restarts(archive) if archive else []), grace)
     good = bad = unknown = excluded = automatic = 0
-    rows = sorted(((int(row["time"]), row) for row in pool if row["time"] is not None and window.contains(int(row["time"]))),
-                  key=lambda item: item[0])
+    rows: list[tuple[int, Row | None]] = [(time, row) for time, row in samples(pool) if window.contains(time)]
     previous = window.start - interval
     for time, row in rows + [(window.end + interval, None)]:
         missing, skipped = missing_samples(previous, time, interval, gaps)
@@ -243,16 +283,20 @@ def evaluate_pinned(pool: list[dict[str, str | None]] | None, archive: list[dict
         previous = time
         if row is None:
             break
-        uptime = as_int(row["uptime"])
+        uptime = as_count(row["uptime"])
         if any(low < time <= high for low, high in gaps) or (uptime is not None and uptime < grace):
             excluded += 1
-        elif row["sample_ok"] != "1" or row["pinned_present"] is None:
+        elif row["sample_ok"] != "1" or row["pinned_present"] not in ("0", "1"):
             unknown += 1
-        elif row["pinned_present"] == "1" and row["pinned_connection_type"] == "manual" and row["pinned_transport_pq"] == "1":
+        elif row["pinned_present"] == "0":
+            bad += 1
+        elif not pinned_peer_ok(row):
+            unknown += 1
+        elif row["pinned_connection_type"] == "manual" and row["pinned_transport_pq"] == "1":
             good += 1
         else:
             bad += 1
-            if row["pinned_present"] == "1" and row["pinned_connection_type"] not in (None, "manual"):
+            if row["pinned_connection_type"] != "manual":
                 automatic += 1
     total = good + bad + unknown
     if total == 0:
@@ -604,7 +648,7 @@ def evaluate_failures(records: list[dict[str, Any]] | None, known_good: KnownGoo
 # ---------------------------------------------------------------------------
 
 
-def evaluate_connections(archive: list[dict[str, str | None]] | None, control: list[dict[str, str | None]] | None,
+def evaluate_connections(archive: list[Row] | None, control: list[Row] | None,
                          canary_start: int, window: Window, interval: int, baseline_ratio: float | None,
                          min_coverage: float) -> Figure:
     """Daily archive/control connections_in ratios, relative to the baseline ratio.
@@ -617,8 +661,8 @@ def evaluate_connections(archive: list[dict[str, str | None]] | None, control: l
     if not archive or not control:
         return Figure(name, UNKNOWN, 0, None, "needs both archive and control samples")
 
-    def by_slot(rows: list[dict[str, str | None]]) -> dict[int, dict[str, str | None]]:
-        return {int(int(row["time"]) / interval + 0.5): row for row in rows if row["time"] is not None}
+    def by_slot(rows: list[Row]) -> dict[int, Row]:
+        return {int(time / interval + 0.5): row for time, row in samples(rows)}
 
     archive_slots, control_slots = by_slot(archive), by_slot(control)
     baseline = [0, 0, 0]  # archive sum, control sum, pairs
@@ -626,10 +670,11 @@ def evaluate_connections(archive: list[dict[str, str | None]] | None, control: l
     for slot in sorted(set(archive_slots) | set(control_slots)):
         pair = (archive_slots.get(slot), control_slots.get(slot))
         time = min(int(row["time"]) for row in pair if row is not None)  # type: ignore[arg-type]
-        uptimes = [as_int(row["uptime"]) if row else None for row in pair]
-        counts = [as_int(row["connections_in"]) if row else None for row in pair]
+        uptimes = [as_count(row["uptime"]) if row else None for row in pair]
+        counts = [as_count(row["connections_in"]) if row else None for row in pair]
         restarted = any(uptime is not None and uptime < CONNECTIONS_RESTART_EXCLUSION for uptime in uptimes)
-        valid = not restarted and None not in uptimes and None not in counts
+        answered = all(row is not None and row["sample_ok"] == "1" for row in pair)
+        valid = answered and not restarted and None not in uptimes and None not in counts
         if time < canary_start:
             if valid:
                 baseline[0] += counts[0]  # type: ignore[operator]
@@ -753,7 +798,7 @@ def file_arg(text: str) -> Path:
     return path
 
 
-def role_error(roles: list[tuple[str, Path, list[dict[str, str | None]]]]) -> str | None:
+def role_error(roles: list[tuple[str, Path, list[Row]]]) -> str | None:
     """Why the samples given for --pool, --archive and --control are not each one distinct node, or None.
 
     A role's samples carry one host label; no two roles share a file, a host
@@ -850,7 +895,7 @@ def main(argv: list[str] | None = None) -> int:
         monitored = sorted({row["host"] for rows in (pool, archive) if rows for row in rows if row["host"]})
 
     start = args.canary_start
-    latest = [int(row["time"]) for rows in (pool, archive, control) if rows for row in rows if row["time"] is not None]
+    latest = [time for rows in (pool, archive, control) if rows for time, _ in samples(rows)]
     latest += [record["time"] for record in records or []]
     end = args.end if args.end is not None else max(latest, default=start)
     window = Window(start, end)

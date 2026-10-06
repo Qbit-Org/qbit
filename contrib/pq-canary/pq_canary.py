@@ -139,12 +139,19 @@ def append_row(path: Path, row: dict[str, str]) -> None:
 
 
 def read_rows(path: Path) -> list[dict[str, str | None]]:
-    """Rows of a samples file, with NA turned into None."""
+    """Rows of a samples file, with NA turned into None.
+
+    A row with more or fewer fields than the header, such as one cut short by a
+    crash mid-write and continued by the next sample, is not a sample: its values
+    may sit in the wrong columns, so it is left out and counts as missing.
+    """
     with path.open(encoding="utf8", newline="") as source:
-        reader = csv.DictReader(source)
-        if reader.fieldnames != COLUMNS:
-            raise ValueError(f"{path}: unexpected header {reader.fieldnames}")
-        return [{key: (None if value == NA else value) for key, value in row.items()} for row in reader]
+        reader = csv.reader(source)
+        header = next(reader, None)
+        if header != COLUMNS:
+            raise ValueError(f"{path}: unexpected header {header}")
+        return [{key: (None if value == NA else value) for key, value in zip(COLUMNS, fields)}
+                for fields in reader if len(fields) == len(COLUMNS)]
 
 
 def read_failures(path: Path) -> Iterator[dict[str, Any]]:
