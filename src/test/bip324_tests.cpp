@@ -659,6 +659,7 @@ BOOST_AUTO_TEST_CASE(hybrid_api_order)
         BIP324Cipher initiator(key_i, ent_i), responder(key_r, ent_r);
         InitializePair(initiator, responder, /*retain_for_hybrid=*/false);
         const Bytes session_id = ToBytes(initiator.GetSessionID());
+        BOOST_CHECK(!initiator.HoldsHybridSecret());
         BOOST_CHECK(!initiator.AddVersionContents(contents_r));
         BOOST_CHECK(!initiator.SwitchToHybrid(ss));
         BOOST_CHECK(std::ranges::equal(initiator.GetSessionID(), session_id));
@@ -682,8 +683,11 @@ BOOST_AUTO_TEST_CASE(hybrid_api_order)
         BOOST_CHECK(responder.AddVersionContents(contents_i));
         BOOST_CHECK(!responder.AddVersionContents({}));
 
+        // The switch wipes the retained secret and the transcript.
+        BOOST_CHECK(initiator.HoldsHybridSecret() && responder.HoldsHybridSecret());
         BOOST_CHECK(initiator.SwitchToHybrid(ss));
         BOOST_CHECK(responder.SwitchToHybrid(ss));
+        BOOST_CHECK(!initiator.HoldsHybridSecret() && !responder.HoldsHybridSecret());
         const Bytes hybrid_session_id = ToBytes(initiator.GetSessionID());
         BOOST_CHECK(hybrid_session_id != ecdh_session_id);
         BOOST_CHECK(std::ranges::equal(responder.GetSessionID(), hybrid_session_id));
@@ -702,9 +706,12 @@ BOOST_AUTO_TEST_CASE(hybrid_api_order)
         const Bytes ecdh_session_id = ToBytes(initiator.GetSessionID());
         BOOST_CHECK(initiator.AddVersionContents(contents_r));
         BOOST_CHECK(initiator.AddVersionContents(contents_i));
+        BOOST_CHECK(initiator.HoldsHybridSecret());
         initiator.DiscardHybridSecret();
+        BOOST_CHECK(!initiator.HoldsHybridSecret());
         initiator.DiscardHybridSecret();
         responder.DiscardHybridSecret();
+        BOOST_CHECK(!responder.HoldsHybridSecret());
         BOOST_CHECK(!initiator.SwitchToHybrid(ss));
         BOOST_CHECK(!initiator.AddVersionContents(contents_i));
         BOOST_CHECK(!responder.AddVersionContents(contents_r));
