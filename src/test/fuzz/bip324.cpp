@@ -11,7 +11,10 @@
 #include <test/fuzz/util.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <optional>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -43,15 +46,20 @@ FUZZ_TARGET(bip324_cipher_roundtrip, .init=Initialize)
     auto resp_ent = provider.ConsumeBytes<std::byte>(32);
     resp_ent.resize(32);
 
-    // Initialize ciphers by exchanging public keys.
+    // Initialize ciphers by exchanging public keys, optionally retaining the hybrid key state.
+    const bool hybrid = provider.ConsumeBool();
     BIP324Cipher initiator(init_key, init_ent);
     assert(!initiator);
     BIP324Cipher responder(resp_key, resp_ent);
     assert(!responder);
-    initiator.Initialize(responder.GetOurPubKey(), true);
+    std::array<std::byte, 32> ss_init{};
+    assert(!initiator.SwitchToHybrid(ss_init));
+    initiator.Initialize(responder.GetOurPubKey(), true, /*self_decrypt=*/false, hybrid);
     assert(initiator);
-    responder.Initialize(initiator.GetOurPubKey(), false);
+    responder.Initialize(initiator.GetOurPubKey(), false, /*self_decrypt=*/false, hybrid);
     assert(responder);
+    // Switching needs both version contents first.
+    assert(!initiator.SwitchToHybrid(ss_init));
 
     // Initialize RNG deterministically, to generate contents and AAD. We assume that there are no
     // (potentially buggy) edge cases triggered by specific values of contents/AAD, so we can avoid
@@ -63,8 +71,72 @@ FUZZ_TARGET(bip324_cipher_roundtrip, .init=Initialize)
     assert(std::ranges::equal(initiator.GetSessionID(), responder.GetSessionID()));
     assert(std::ranges::equal(initiator.GetSendGarbageTerminator(), responder.GetReceiveGarbageTerminator()));
     assert(std::ranges::equal(initiator.GetReceiveGarbageTerminator(), responder.GetSendGarbageTerminator()));
+    const std::vector<std::byte> garbage_terminators{initiator.GetSendGarbageTerminator().begin(), initiator.GetSendGarbageTerminator().end()};
 
+    // With the hybrid state retained, both sides switch keys (or discard the state, as on a legacy
+    // outcome) before a chosen packet. The version contents and the ML-KEM secret come from the
+    // RNG; the responder may hash a mutated transcript or use a mutated secret, after which every
+    // packet must fail to decrypt.
+    std::optional<unsigned> switch_before;
+    bool discard{false};
+    std::vector<std::byte> contents_r, contents_i, resp_first, resp_second;
+    std::array<std::byte, 32> ss_resp{};
+    if (hybrid) {
+        switch_before = provider.ConsumeIntegralInRange<unsigned>(0, 1000);
+        contents_r = rng.randbytes<std::byte>(provider.ConsumeIntegralInRange<unsigned>(0, 4096));
+        contents_i = rng.randbytes<std::byte>(provider.ConsumeIntegralInRange<unsigned>(0, 4096));
+        rng.fillrand(ss_init);
+        resp_first = contents_r;
+        resp_second = contents_i;
+        ss_resp = ss_init;
+        const auto mutate = [&](std::vector<std::byte>& bytes) {
+            if (bytes.empty()) {
+                bytes.push_back(std::byte{0});
+            } else {
+                bytes[provider.ConsumeIntegralInRange<size_t>(0, bytes.size() - 1)] ^= std::byte(1U << provider.ConsumeIntegralInRange<unsigned>(0, 7));
+            }
+        };
+        switch (provider.ConsumeIntegralInRange<int>(0, 5)) {
+        case 0: break;
+        case 1: mutate(resp_first); break;
+        case 2: mutate(resp_second); break;
+        case 3: std::swap(resp_first, resp_second); break;
+        case 4: ss_resp[provider.ConsumeIntegralInRange<size_t>(0, ss_resp.size() - 1)] ^= std::byte(1U << provider.ConsumeIntegralInRange<unsigned>(0, 7)); break;
+        case 5: discard = true; break;
+        }
+    } else {
+        assert(!initiator.AddVersionContents({}));
+    }
+    const bool views_differ{resp_first != contents_r || resp_second != contents_i || ss_resp != ss_init};
+    bool keys_differ{false};
+
+    unsigned packet{0};
     LIMITED_WHILE(provider.remaining_bytes(), 1000) {
+        if (switch_before == packet++) {
+            if (discard) {
+                initiator.DiscardHybridSecret();
+                responder.DiscardHybridSecret();
+                assert(!initiator.AddVersionContents(contents_r));
+                assert(!responder.SwitchToHybrid(ss_resp));
+            } else {
+                const std::vector<std::byte> ecdh_session_id{initiator.GetSessionID().begin(), initiator.GetSessionID().end()};
+                assert(initiator.AddVersionContents(contents_r));
+                assert(initiator.AddVersionContents(contents_i));
+                assert(!initiator.AddVersionContents(contents_i));
+                assert(initiator.SwitchToHybrid(ss_init));
+                assert(responder.AddVersionContents(resp_first));
+                assert(responder.AddVersionContents(resp_second));
+                assert(responder.SwitchToHybrid(ss_resp));
+                assert(!initiator.SwitchToHybrid(ss_init));
+                assert(!responder.AddVersionContents({}));
+                keys_differ = views_differ;
+                assert(std::ranges::equal(initiator.GetSessionID(), responder.GetSessionID()) == !keys_differ);
+                assert(!std::ranges::equal(initiator.GetSessionID(), ecdh_session_id));
+                assert(std::ranges::equal(initiator.GetSendGarbageTerminator(), garbage_terminators));
+                assert(std::ranges::equal(responder.GetReceiveGarbageTerminator(), garbage_terminators));
+            }
+        }
+
         // Mode:
         // - Bit 0: whether the ignore bit is set in message
         // - Bit 1: whether the responder (0) or initiator (1) sends
@@ -107,7 +179,8 @@ FUZZ_TARGET(bip324_cipher_roundtrip, .init=Initialize)
 
         // Decrypt length
         uint32_t dec_length = receiver.DecryptLength(std::span{ciphertext}.first(initiator.LENGTH_LEN));
-        if (!damage) {
+        const bool expect_failure{damage || keys_differ};
+        if (!expect_failure) {
             assert(dec_length == length);
         } else {
             // For performance reasons, don't try to decode if length got increased too much.
@@ -120,8 +193,9 @@ FUZZ_TARGET(bip324_cipher_roundtrip, .init=Initialize)
         std::vector<std::byte> decrypt(dec_length);
         bool dec_ignore{false};
         bool ok = receiver.Decrypt(std::span{ciphertext}.subspan(initiator.LENGTH_LEN), aad, dec_ignore, decrypt);
-        // Decryption *must* fail if the packet was damaged, and succeed if it wasn't.
-        assert(!ok == damage);
+        // Decryption *must* fail if the packet was damaged or the sides derived different hybrid
+        // keys, and succeed otherwise.
+        assert(!ok == expect_failure);
         if (!ok) break;
         assert(ignore == dec_ignore);
         assert(decrypt == contents);

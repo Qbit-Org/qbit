@@ -12,7 +12,8 @@
     "fdp": "Untagged FuzzedDataProvider layout for targets without a tagged format.",
     "legacy": "Untagged pre-existing FuzzedDataProvider layout of pqc/p2mr_script, unchanged.",
     "qbfx-v1-fixture": "b'QBFX' + target tag ('P' pqc, 'M' p2mr_script) + 0x01 + selector whose low nibble is not 0xF, then the FuzzedDataProvider layout of the cached-fixture body.",
-    "qbfx-v1-generation": "b'QBFX' + target tag + 0x01 + selector whose low nibble is 0xF, then the legacy FuzzedDataProvider layout."
+    "qbfx-v1-generation": "b'QBFX' + target tag + 0x01 + selector whose low nibble is 0xF, then the legacy FuzzedDataProvider layout.",
+    "raw": "The whole input is the data the target parses, without a FuzzedDataProvider layout."
   },
   "targets": {
     "asert_chain_transition": [
@@ -412,6 +413,357 @@
         "size": 145,
         "sha256": "382e822b4977cbd90e1b46e10db3131fd4aa05db3528341bbee42e93cbc6d4a4",
         "semantics": "Tagged generation selector 0x0F followed by the legacy-checksigpqc-default-valid layout."
+      }
+    ],
+    "p2p_transport_bidirectional_v1v2": [
+      {
+        "file": "v1-version-to-negotiating-responder",
+        "format": "fdp",
+        "size": 119,
+        "sha256": "35e6f63d5ac205b1e4d48389eeea77e0d1e55d798fb7a156233754548fca1a19",
+        "semantics": "A v1 initiator's version message reaches a responder with the negotiation on: v1 detected, no key generated."
+      },
+      {
+        "file": "v1-version-to-off-responder",
+        "format": "fdp",
+        "size": 183,
+        "sha256": "19e798b8d20825d67726f8067d7283dddb834821e7ae0e7fd4940f790ac43ad2",
+        "semantics": "A v1 initiator's version message reaches a responder with the negotiation off: v1 detected."
+      },
+      {
+        "file": "v1-version-to-negotiating-responder-max-garbage",
+        "format": "fdp",
+        "size": 119,
+        "sha256": "69c2c84bdbe6b60ec78bab5775ce5e65ff6eab9529aee686530b93625438bbc7",
+        "semantics": "A v1 initiator's version message reaches a negotiating responder configured with 4,095 bytes of garbage, which it never sends: v1 detected."
+      },
+      {
+        "file": "v1-silent-negotiating-responder",
+        "format": "fdp",
+        "size": 114,
+        "sha256": "28ff6ed50c2b9700aaee84e470ec094fc48d2698e55cc4282cda42dd9d12530c",
+        "semantics": "A v1 initiator that sends nothing: the negotiating responder stays undecided and sends nothing."
+      }
+    ],
+    "p2p_transport_bidirectional_v2": [
+      {
+        "file": "negotiate-both",
+        "format": "fdp",
+        "size": 214,
+        "sha256": "513f1a34d1c2e612ef36e2d5c34f8c48776acff59ad10169392b114925bf0581",
+        "semantics": "Both sides negotiate, no garbage; the final flush completes the handshake: hybrid keys, confirmed both ways."
+      },
+      {
+        "file": "negotiate-both-max-garbage",
+        "format": "fdp",
+        "size": 214,
+        "sha256": "d49337112b58a48f382feb53e798c218a9bd7d6459d0f83054c0af71924a3b79",
+        "semantics": "Both sides negotiate with 4,095 bytes of garbage each, so the held version packet's AAD is the longest; the final flush completes the handshake."
+      },
+      {
+        "file": "negotiate-both-interleaved",
+        "format": "fdp",
+        "size": 343,
+        "sha256": "8b793b1259c0a61cf02a467c4302840314635f52e593f5f920976992d8dfc9ef",
+        "semantics": "Both sides negotiate, 64 and 17 bytes of garbage; a fixed 48-byte pattern drives the interleaving loop, then the final flush completes the handshake: hybrid."
+      },
+      {
+        "file": "negotiate-both-interleaved-long-garbage",
+        "format": "fdp",
+        "size": 326,
+        "sha256": "978e1df57d71dc44cca090e6fe25415e2e1f4e5050cacfc16610bce1d484875a",
+        "semantics": "Both sides negotiate, 1,000 and 64 bytes of garbage; a fixed 48-byte pattern drives the interleaving loop, then the final flush completes the handshake: hybrid."
+      },
+      {
+        "file": "initiator-negotiates-responder-off",
+        "format": "fdp",
+        "size": 214,
+        "sha256": "9306059152bd46f04435b2b6dbe8bafe816102d4810cb2927a8d8af6f249fa83",
+        "semantics": "The initiator holds its version packet for an empty one; the final flush completes the handshake: legacy_peer, ECDH keys."
+      },
+      {
+        "file": "initiator-negotiates-responder-off-interleaved",
+        "format": "fdp",
+        "size": 331,
+        "sha256": "bd1fbf465f64843526c618a09ed968336afb0ef65d95add1b2bf088fc0a75f2a",
+        "semantics": "The initiator negotiates, the responder is off; a fixed 48-byte pattern drives the interleaving loop, then the final flush completes the handshake: ECDH keys."
+      },
+      {
+        "file": "initiator-off-responder-offers",
+        "format": "fdp",
+        "size": 214,
+        "sha256": "0e8c0e8cc82faf65135f7a440a25f65fcfffbfdc11b01ab35573ec3d35695f55",
+        "semantics": "The responder offers to an initiator that is off and ignores it; the final flush completes the handshake: ECDH keys."
+      },
+      {
+        "file": "initiator-off-responder-offers-interleaved",
+        "format": "fdp",
+        "size": 359,
+        "sha256": "3b68416cfaec3415673d47174ec0512b788cbe3062109708336b8ade9929e445",
+        "semantics": "The responder offers to an initiator that is off; a fixed 48-byte pattern drives the interleaving loop, then the final flush completes the handshake: ECDH keys."
+      },
+      {
+        "file": "initiator-fallback-responder-offers",
+        "format": "fdp",
+        "size": 214,
+        "sha256": "e1cd4020339b10060518069f2434f25dea38db0fe8cfa0e80885a946d32d7461",
+        "semantics": "An initiator in fallback sends plain v2 and never parses the offer; the final flush completes the handshake: ECDH keys."
+      },
+      {
+        "file": "both-off",
+        "format": "fdp",
+        "size": 214,
+        "sha256": "3ad084a8e2f8494a595d9c44ebd9b72db47efda77c76d531c197ca6d686334f0",
+        "semantics": "Today's v2 on both sides; the final flush completes the handshake."
+      },
+      {
+        "file": "both-off-interleaved",
+        "format": "fdp",
+        "size": 390,
+        "sha256": "9378972edb1ddf9b65d7ae33ec515901e11aa937ec1ebd355c4834d96dd6192a",
+        "semantics": "Today's v2 on both sides; a fixed 48-byte pattern drives the interleaving loop, then the final flush completes the handshake."
+      },
+      {
+        "file": "initiator-fallback-responder-off",
+        "format": "fdp",
+        "size": 219,
+        "sha256": "f315c712be3bad0f7bf8eb9484ffa876675bc4bd90932dac84b13ac051e746ad",
+        "semantics": "Plain v2 on both sides; the final flush completes the handshake."
+      },
+      {
+        "file": "initiator-fallback-responder-offers-interleaved",
+        "format": "fdp",
+        "size": 343,
+        "sha256": "cec2460db80a9d17fcd35bb12215b7517034cf9d732b0e328f6a6e2026fe7aff",
+        "semantics": "An initiator in fallback never parses the offer; a fixed 48-byte pattern drives the interleaving loop, then the final flush completes the handshake: ECDH keys."
+      }
+    ],
+    "p2p_v2_pq_malicious_peer": [
+      {
+        "file": "initiator-hybrid",
+        "format": "fdp",
+        "size": 90,
+        "sha256": "96925cdab372557e025a9cac0dc3b5e3ca71d1b4b9499077b0e7f1d5a6e9c211",
+        "semantics": "The transport initiates; we offer honestly and switch on its accept: hybrid, confirmed, messages both ways."
+      },
+      {
+        "file": "responder-hybrid",
+        "format": "fdp",
+        "size": 90,
+        "sha256": "796086e85f8379e80d9f7cdb75f60544d260051be35af905e966c33773bde94c",
+        "semantics": "The transport offers; we accept honestly and switch: hybrid, confirmed, messages both ways."
+      },
+      {
+        "file": "initiator-hybrid-extras-fragmented",
+        "format": "fdp",
+        "size": 309,
+        "sha256": "f45f8b17efcd2bfc33d6ade02c70da02d30dbdd2bfdf1d19a1fe69a65ef16eec",
+        "semantics": "Maximum garbage both ways, own records inside decoys, an offer between unknown and duplicate records, delivered in 97-byte and then 1-byte pieces: hybrid."
+      },
+      {
+        "file": "responder-hybrid-extras",
+        "format": "fdp",
+        "size": 97,
+        "sha256": "bb33f24d2a9e2696ee9428633897934427610f8681bc2e65e941ec010a88afcc",
+        "semantics": "Decoys, then an accept between unknown and duplicate records: hybrid."
+      },
+      {
+        "file": "initiator-ek-length",
+        "format": "fdp",
+        "size": 83,
+        "sha256": "1727485faecda04ec7f676fe38b5dd837d06554f4bc76cc0e0b91a3665860467",
+        "semantics": "A 1,567-byte offer: the transport closes with ek_length and never sends its version packet."
+      },
+      {
+        "file": "initiator-ek-modulus",
+        "format": "fdp",
+        "size": 83,
+        "sha256": "032bd86ffdea759d3b842e38891187a844f2d27713e5d5704fff6086d06bca4f",
+        "semantics": "An offer whose coefficients are all above q: the transport closes with ek_modulus."
+      },
+      {
+        "file": "responder-ct-length",
+        "format": "fdp",
+        "size": 83,
+        "sha256": "42661de0c7b810020c0c76d463661a203c262faab397d6f3e9c09dd40fc7281a",
+        "semantics": "A 1,569-byte accept: the transport closes with ct_length."
+      },
+      {
+        "file": "responder-corrupt-ct",
+        "format": "fdp",
+        "size": 90,
+        "sha256": "f7ba2b5a427de4fb48e9fe038386188f5a28d1ff8d3d1a270878135bcbf46c0d",
+        "semantics": "An accept with one ciphertext bit flipped: the transport switches to other keys and our confirmation fails."
+      },
+      {
+        "file": "responder-disconnect-after-offer",
+        "format": "fdp",
+        "size": 81,
+        "sha256": "612b7d3ab9f066d1a40a408047aac95b3d78ddd9408a716ac0ecf52ea5b34737",
+        "semantics": "The transport offers and we disconnect before sending our version packet."
+      },
+      {
+        "file": "initiator-confirmation-length",
+        "format": "fdp",
+        "size": 86,
+        "sha256": "2ca916c42ec30c4e55391852d1e45b46666d312e15ebd821ff4d1da9aa3db3ec",
+        "semantics": "An honest exchange, then a nonzero-length first hybrid packet: the transport fails it at byte 3."
+      },
+      {
+        "file": "initiator-confirmation-tag",
+        "format": "fdp",
+        "size": 86,
+        "sha256": "23721132e8dba8e0d357b1f99ca1a51fd44e6b8a2e8b79309f629d8fb1bc23b4",
+        "semantics": "An honest offer followed by a duplicate record, then a confirmation with a damaged header or tag."
+      },
+      {
+        "file": "responder-confirmation-not-decoy",
+        "format": "fdp",
+        "size": 86,
+        "sha256": "2b7d387a3b986e3dfea29386069868d90441e69bf02e869adf920b4fcc79e185",
+        "semantics": "An honest exchange, then an empty first hybrid packet without the ignore bit."
+      },
+      {
+        "file": "responder-legacy-peer-burst",
+        "format": "fdp",
+        "size": 89,
+        "sha256": "079588a0165c1ca65c75ac701e625169401a08909479b05ca704b1f18a6a3102",
+        "semantics": "We ignore the offer like a legacy peer and send application messages at once: plain v2, legacy_peer."
+      },
+      {
+        "file": "initiator-fallback-ignores-offer",
+        "format": "fdp",
+        "size": 88,
+        "sha256": "549406bb7e9c49617e70b98e2bb336f2a8424d6e1fb153a8009a527eca77bc91",
+        "semantics": "An initiator in fallback sends plain v2 at once and never parses our offer: no ML-KEM operation."
+      },
+      {
+        "file": "initiator-noncompliant-responder",
+        "format": "fdp",
+        "size": 85,
+        "sha256": "e2156d55b4e66ccf22a17b4c4d7bb0d66d6b8000f2db1322111c7f6dd122bc9c",
+        "semantics": "We offer and then send a decoy under the ECDH keys where our confirmation belongs: the transport fails it."
+      },
+      {
+        "file": "responder-off-unsolicited-accept",
+        "format": "fdp",
+        "size": 87,
+        "sha256": "600263bb14d01a4deefa4ec87a235eae35154b976a7866f594bd4635bb7578b4",
+        "semantics": "A responder that is off gets an accept-shaped record it never asked for: ignored, plain v2."
+      }
+    ],
+    "pq_records": [
+      {
+        "file": "offer",
+        "format": "raw",
+        "size": 1572,
+        "sha256": "4db1dcc35718f86fbfacd7a3169154ce9b90ac4899d8e1ba77e607e807829335",
+        "semantics": "The ordinary offer of vector 0 of src/test/data/pq_transport_vectors.json: fd 21 06 f0 || ek."
+      },
+      {
+        "file": "accept",
+        "format": "raw",
+        "size": 1572,
+        "sha256": "f55f95816bc7d6c6e5f6879842f244866bb908c313cb7065fd610f16d38638cd",
+        "semantics": "The ordinary accept of vector 0: fd 21 06 f0 || ct."
+      },
+      {
+        "file": "offer-duplicate-unknown",
+        "format": "raw",
+        "size": 3148,
+        "sha256": "ec7fa0f262d470033d09f505582b1025f84a482d55b66fc3331a4e235c43cd10",
+        "semantics": "Vector 2's responder contents: its offer, a second valid offer and an unknown 0xf1 record. The first wins."
+      },
+      {
+        "file": "unknown-then-accept",
+        "format": "raw",
+        "size": 1578,
+        "sha256": "144903f355c909a634fc4807c3a0ec127296f12892493ffb2fae80e771078f9e",
+        "semantics": "Vector 2's initiator contents: an unknown 0x01 record, then the accept."
+      },
+      {
+        "file": "reserved-and-unknown-headers",
+        "format": "raw",
+        "size": 7,
+        "sha256": "6cf59e77bd2bad687e0f9dd4576f15cfa41ee211c670b123613ca60183984c2e",
+        "semantics": "Valid grammar without an own record: no features."
+      },
+      {
+        "file": "empty-own-record",
+        "format": "raw",
+        "size": 2,
+        "sha256": "6cc0ab95752bf25ec58c91b1d603c5eb41b8fbd7ee1694d5a85005056efb1ab3",
+        "semantics": "An own record with an empty payload: parses, and fails the role's length check later."
+      },
+      {
+        "file": "short-offer",
+        "format": "raw",
+        "size": 1571,
+        "sha256": "ce05ab17bb9a676487edda33fdbfd01306de9e7aa41ef39ef2a0094c2f82be2a",
+        "semantics": "A 1,567-byte own payload (ek_length or ct_length)."
+      },
+      {
+        "file": "long-offer",
+        "format": "raw",
+        "size": 1573,
+        "sha256": "ebc5c90456da104eae9bd81785e97a6d0031aede95adaae5b5f880e6dd4fb0f5",
+        "semantics": "A 1,569-byte own payload (ek_length or ct_length)."
+      },
+      {
+        "file": "malformed-first-then-offer",
+        "format": "raw",
+        "size": 1576,
+        "sha256": "7933842445af30e309967eb36ccec32f3ebd76f062aadbba6cb2f9e7b369b765",
+        "semantics": "A malformed first own record before a valid one: the first wins."
+      },
+      {
+        "file": "offer-trailing-byte",
+        "format": "raw",
+        "size": 1573,
+        "sha256": "01e1fbb6a72ae6bd158ef5902e60d37de318f2d831271ec7eed4179f473d92fe",
+        "semantics": "A valid offer followed by a truncated CompactSize: invalid grammar, no features."
+      },
+      {
+        "file": "zero-length",
+        "format": "raw",
+        "size": 7,
+        "sha256": "e034a290523f42c301c35ac085df2ed5293c495c58689bbff1b939f071f22507",
+        "semantics": "A record with len = 0 after a valid one: invalid grammar."
+      },
+      {
+        "file": "one-past-end",
+        "format": "raw",
+        "size": 3,
+        "sha256": "19b27e599c63eef9fedd1c64bbb785530914c07f4f03ab723eae7474994d3c51",
+        "semantics": "A length one byte past the end of the contents: invalid grammar."
+      },
+      {
+        "file": "truncated-wide-length",
+        "format": "raw",
+        "size": 6,
+        "sha256": "0d8bf907c7f5c26d45de142db505a5389e1b79c301614ba42178e88275eb2d13",
+        "semantics": "A valid record, then a 0xfe CompactSize cut off after two of its four bytes: invalid grammar."
+      },
+      {
+        "file": "non-canonical-length",
+        "format": "raw",
+        "size": 5,
+        "sha256": "0682a6be8935622a35773009dfb0e26c0857c4e72424029c526122b1dec714cd",
+        "semantics": "Length 2 in a 3-byte CompactSize: invalid grammar."
+      },
+      {
+        "file": "oversized-length",
+        "format": "raw",
+        "size": 7,
+        "sha256": "a70a4eb5f4febe8115e5b1feefcf4591c2589f5e5da8b1889ab858f7aa51eca9",
+        "semantics": "Length MAX_SIZE + 1 (0x02000001), which ReadCompactSize rejects: invalid grammar."
+      },
+      {
+        "file": "minimal-unknown-records",
+        "format": "raw",
+        "size": 2001,
+        "sha256": "38a04844262d1d0d0a74e3ad0989c2a3cb206b859f8f084ff774ed7d5fca85cc",
+        "semantics": "1,000 one-byte unknown records ending in a truncated one: invalid grammar after a long valid prefix."
       }
     ],
     "pqc": [

@@ -7,6 +7,7 @@
 #define QBIT_NET_H
 
 #include <bip324.h>
+#include <bip324_pq.h>
 #include <chainparams.h>
 #include <common/bloom.h>
 #include <compat/compat.h>
@@ -264,6 +265,9 @@ public:
     {
         TransportProtocolType transport_type;
         std::optional<uint256> session_id;
+        /** Whether the session keys are hybrid: true only once the peer's key confirmation verified. */
+        bool transport_pq{false};
+        PQStatus transport_pq_status{PQStatus::OFF};
     };
 
     /** Retrieve information about this transport. */
@@ -451,12 +455,24 @@ public:
     bool ShouldReconnectV1() const noexcept override { return false; }
 };
 
+/** The hybrid post-quantum negotiation of one v2 connection (doc/design/pq-transport.md). */
+struct V2PQOptions {
+    PQMode mode{PQMode::OFF};
+    /** Test only: retain the ECDH secret and the transcript at the key exchange even without the
+     *  negotiation, as a path that declines it afterwards without wiping them would. */
+    bool retain_without_negotiation{false};
+    /** Test only: invert byte 0 of the local ML-KEM shared secret before deriving keys, so the
+     *  peer's key confirmation check fails. EK and CT are unchanged. */
+    bool corrupt_shared_secret{false};
+};
+
 class V2Transport final : public Transport
 {
 private:
-    /** Contents of the version packet to send. BIP324 stipulates that senders should leave this
-     *  empty, and receivers should ignore it. Future extensions can change what is sent as long as
-     *  an empty version packet contents is interpreted as no extensions supported. */
+    /** Contents of the version packet to send without an offer or accept. BIP324 stipulates that
+     *  senders should leave this empty, and receivers should ignore it. Extensions (such as the
+     *  hybrid negotiation, see PQHandshake) change what is sent, and an empty version packet
+     *  contents is interpreted as no extensions supported. */
     static constexpr std::array<std::byte, 0> VERSION_CONTENTS = {};
 
     /** The length of the V1 prefix to match bytes initially received by responders with to
@@ -475,12 +491,12 @@ private:
      *
      *   start(responder)
      *        |
-     *        |  start(initiator)                           /---------\
-     *        |          |                                  |         |
-     *        v          v                                  v         |
-     *  KEY_MAYBE_V1 -> KEY -> GARB_GARBTERM -> VERSION -> APP -> APP_READY
-     *        |
-     *        \-------> V1
+     *        |  start(initiator)                                       /---------\
+     *        |          |                                              |         |
+     *        v          v                                              v         |
+     *  KEY_MAYBE_V1 -> KEY -> GARB_GARBTERM -> VERSION ------------> APP -> APP_READY
+     *        |                                    |                  ^
+     *        \-------> V1                         \----> CONFIRM ----/
      */
     enum class RecvState : uint8_t {
         /** (Responder only) either v2 public key or v1 header.
@@ -511,9 +527,19 @@ private:
          * first received packet in this state (whether it's a decoy or not) is expected to
          * authenticate the garbage received during the GARB_GARBTERM state as associated
          * authenticated data (AAD). The first non-decoy packet in this state is interpreted as
-         * version negotiation (currently, that means ignoring the contents, but it can be used for
-         * negotiating future extensions), and afterwards the state becomes APP. */
+         * version negotiation. Without the hybrid negotiation its contents are ignored, and the
+         * state becomes APP. With it, the contents are an offer or an accept (or a legacy peer's),
+         * see ProcessVersionContents(): the state becomes CONFIRM if the keys switched to hybrid,
+         * and APP otherwise. */
         VERSION,
+
+        /** Key confirmation (hybrid keys only).
+         *
+         * The first packet under the hybrid keys must be an empty decoy. Its length is checked as
+         * soon as its 3 bytes arrive, then its tag and ignore bit. If that fails, the connection
+         * aborts; otherwise the peer is confirmed, nothing is delivered and the state becomes
+         * APP. */
+        CONFIRM,
 
         /** Application packet.
          *
@@ -543,9 +569,9 @@ private:
      *      |      start(initiator)
      *      |            |
      *      v            v
-     *  MAYBE_V1 -> AWAITING_KEY -> READY
-     *      |
-     *      \-----> V1
+     *  MAYBE_V1 -> AWAITING_KEY ---------------------> READY
+     *      |            |                               ^
+     *      \-----> V1   \-----> AWAITING_VERSION ------/
      */
     enum class SendState : uint8_t {
         /** (Responder only) Not sending until v1 or v2 is detected.
@@ -560,15 +586,26 @@ private:
          *
          * This is the initial state for initiators. The public key and garbage is sent out. When
          * the receiver receives the other side's public key and transitions to GARB_GARBTERM, the
-         * sender state becomes READY. */
+         * sender state becomes READY, or AWAITING_VERSION with the hybrid negotiation. */
         AWAITING_KEY,
+
+        /** (Hybrid negotiation only) Waiting for the other side's version packet.
+         *
+         * The ciphers are initialized and the garbage terminator is queued. A responder has also
+         * queued its version packet with the offer; an initiator holds its version packet, which
+         * answers the offer. Nothing else is sent, so no message can be provided, and bytes still
+         * in the send buffer go out. When the receiver processes the other side's version packet,
+         * the sender state becomes READY, and the version packet (initiator) and the key
+         * confirmation (after a switch to hybrid keys) are appended to the send buffer. */
+        AWAITING_VERSION,
 
         /** Normal sending state.
          *
          * In this state, the ciphers are initialized, so packets can be sent. When this state is
-         * entered, the garbage terminator and version packet are appended to the send buffer (in
-         * addition to the key and garbage which may still be there). In this state a message can be
-         * provided if the send buffer is empty. */
+         * entered, the garbage terminator and version packet (and, after a switch to hybrid keys,
+         * the key confirmation) have been appended to the send buffer (in addition to the key and
+         * garbage which may still be there). In this state a message can be provided if the send
+         * buffer is empty. */
         READY,
 
         /** This transport is using v1 fallback.
@@ -585,6 +622,8 @@ private:
     const NodeId m_nodeid;
     /** Encapsulate a V1Transport to fall back to. */
     V1Transport m_v1_fallback;
+    /** The hybrid negotiation options of this connection. */
+    const V2PQOptions m_pq_options;
 
     /** Lock for receiver-side fields. */
     mutable Mutex m_recv_mutex ACQUIRED_BEFORE(m_send_mutex);
@@ -599,6 +638,8 @@ private:
     std::vector<uint8_t> m_recv_decode_buffer GUARDED_BY(m_recv_mutex);
     /** Current receiver state. */
     RecvState m_recv_state GUARDED_BY(m_recv_mutex);
+    /** The hybrid negotiation state: KEM secrets and progress. */
+    PQHandshake m_pq GUARDED_BY(m_recv_mutex);
 
     /** Lock for sending-side fields. If both sending and receiving fields are accessed,
      *  m_recv_mutex must be acquired before m_send_mutex. */
@@ -632,8 +673,32 @@ private:
     bool ProcessReceivedKeyBytes() noexcept EXCLUSIVE_LOCKS_REQUIRED(m_recv_mutex, !m_send_mutex);
     /** Process bytes in m_recv_buffer, while in GARB_GARBTERM state. */
     bool ProcessReceivedGarbageBytes() noexcept EXCLUSIVE_LOCKS_REQUIRED(m_recv_mutex);
-    /** Process bytes in m_recv_buffer, while in VERSION/APP state. */
-    bool ProcessReceivedPacketBytes() noexcept EXCLUSIVE_LOCKS_REQUIRED(m_recv_mutex);
+    /** Process bytes in m_recv_buffer, while in VERSION/CONFIRM/APP state. */
+    bool ProcessReceivedPacketBytes() noexcept EXCLUSIVE_LOCKS_REQUIRED(m_recv_mutex, !m_send_mutex);
+    /** Process the peer's key confirmation in m_recv_buffer, while in CONFIRM state. */
+    bool ProcessConfirmation() noexcept EXCLUSIVE_LOCKS_REQUIRED(m_recv_mutex);
+    /** Act on the contents of the peer's version packet, and leave the VERSION state. Returns
+     *  false if the connection must close. */
+    bool ProcessVersionContents(std::span<const std::byte> contents) noexcept EXCLUSIVE_LOCKS_REQUIRED(m_recv_mutex, m_send_mutex);
+    /** Append our version packet to the send buffer, under the current (ECDH) keys, with our
+     *  garbage as AAD, and wipe the garbage. */
+    void AppendVersionPacket(std::span<const std::byte> contents) noexcept EXCLUSIVE_LOCKS_REQUIRED(m_recv_mutex, m_send_mutex);
+    /** Append our key confirmation (an empty decoy, empty AAD) under the hybrid keys. */
+    void AppendConfirmationPacket() noexcept EXCLUSIVE_LOCKS_REQUIRED(m_recv_mutex, m_send_mutex);
+    /** Wipe the decapsulation key and the retained ECDH secret, keeping the current keys. */
+    void ClearHybridSecrets() noexcept EXCLUSIVE_LOCKS_REQUIRED(m_recv_mutex, m_send_mutex);
+    /** Close after an inconsistent hybrid cipher state, a local bug: record and log
+     *  CIPHER_STATE_INTERNAL, wipe, and return false. */
+    bool FailCipherState() noexcept EXCLUSIVE_LOCKS_REQUIRED(m_recv_mutex, m_send_mutex);
+    /** The options this side uses: a responder never falls back, so its FALLBACK becomes OFF. */
+    static V2PQOptions EffectivePQOptions(bool initiating, V2PQOptions pq) noexcept;
+    /** The status getpeerinfo reports for the hybrid negotiation. OFF and FALLBACK follow the
+     *  mode. With the negotiation on: HYBRID once the peer's confirmation verified, LEGACY_PEER
+     *  when the peer's version packet carried no usable offer or accept, OFF after a key
+     *  generation, key check or encapsulation fault that continued as plain v2, and PENDING
+     *  otherwise. There is no failed status: a connection closing on any other failure, local
+     *  faults included, reports PENDING until it is removed. */
+    PQStatus GetPQStatus() const noexcept EXCLUSIVE_LOCKS_REQUIRED(m_recv_mutex);
 
 public:
     static constexpr uint32_t MAX_GARBAGE_LEN = 4095;
@@ -642,11 +707,23 @@ public:
      *
      * @param[in] nodeid      the node's NodeId (only for debug log output).
      * @param[in] initiating  whether we are the initiator side.
+     * @param[in] pq          the hybrid negotiation options (off by default). Only an initiator
+     *                        falls back: PQMode::FALLBACK on a responder is a caller bug
+     *                        (Assume), and it runs and reports as PQMode::OFF.
      */
-    V2Transport(NodeId nodeid, bool initiating) noexcept;
+    V2Transport(NodeId nodeid, bool initiating, V2PQOptions pq = {}) noexcept;
 
-    /** Construct a V2 transport with specified keys and garbage (test use only). */
+    /** Construct a V2 transport with specified keys and garbage, without the hybrid negotiation
+     *  (test use only). */
     V2Transport(NodeId nodeid, bool initiating, const CKey& key, std::span<const std::byte> ent32, std::vector<uint8_t> garbage) noexcept;
+
+    /** Construct a V2 transport with specified keys, garbage, hybrid negotiation options, ML-KEM
+     *  entropy and operations (test use only). ops must have static lifetime. A responder's
+     *  PQMode::FALLBACK is handled as in the constructor above. */
+    V2Transport(NodeId nodeid, bool initiating, const CKey& key, std::span<const std::byte> ent32,
+                std::vector<uint8_t> garbage, V2PQOptions pq, PQRandomSource random, const PQKemOps& ops) noexcept;
+    V2Transport(NodeId nodeid, bool initiating, const CKey& key, std::span<const std::byte> ent32,
+                std::vector<uint8_t> garbage, V2PQOptions pq, PQRandomSource random, const PQKemOps&& ops) = delete;
 
     // Receive side functions.
     bool ReceivedMessageComplete() const noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_recv_mutex);
@@ -662,6 +739,14 @@ public:
     // Miscellaneous functions.
     bool ShouldReconnectV1() const noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_recv_mutex, !m_send_mutex);
     Info GetInfo() const noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_recv_mutex);
+    /** The hybrid negotiation's progress and first failure. */
+    PQHandshake::Snapshot GetPQSnapshot() const noexcept EXCLUSIVE_LOCKS_REQUIRED(!m_recv_mutex);
+
+    /** Test only: whether the decapsulation key or the retained ECDH secret is still held. */
+    bool HoldsHybridSecretsForTesting() const noexcept EXCLUSIVE_LOCKS_REQUIRED(!m_recv_mutex);
+    /** Test only: discard the retained ECDH secret and transcript, as an inconsistent cipher state
+     *  would. Every later use of them fails closed. */
+    void DiscardHybridSecretForTesting() noexcept EXCLUSIVE_LOCKS_REQUIRED(!m_recv_mutex, !m_send_mutex);
 };
 
 struct CNodeOptions
