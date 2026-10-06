@@ -459,6 +459,51 @@ class FailureEntriesTest(unittest.TestCase):
         self.assertEqual(triage.result, "pass")
         self.assertAlmostEqual(figure.coverage, 1.0)
 
+    def test_malformed_endpoint_is_unknown(self) -> None:
+        start = record(T0, inbound=ring(0, 0, []), outbound=ring(0, 0, []))
+
+        def evaluate(outcome: str, endpoint: Any) -> tuple[Any, Any]:
+            failure = entry(1, T0 + 5, "192.0.2.9", 8333, outcome)
+            if endpoint is ...:
+                del failure["endpoint"]
+            else:
+                failure["endpoint"] = endpoint
+            return self.evaluate([start, record(T0 + INTERVAL, inbound=ring(0, 0, []), outbound=ring(1, 0, [failure]))])
+
+        good = {"kind": "address", "network": "ipv4", "address": "192.0.2.9", "port": 8333}
+        malformed = {
+            "absent": ..., "null": None, "not an object": "192.0.2.9:8333",
+            "no address": {key: value for key, value in good.items() if key != "address"},
+            "address not a string": dict(good, address=3221225993), "empty address": dict(good, address=""),
+            "address with a port": dict(good, address="192.0.2.9:8333"), "ipv6 address as ipv4": dict(good, address="2001:db8::9"),
+            "no port": {key: value for key, value in good.items() if key != "port"}, "port as text": dict(good, port="8333"),
+            "port true": dict(good, port=True), "port out of range": dict(good, port=65536), "negative port": dict(good, port=-1),
+            "unknown kind": dict(good, kind="service"), "unknown network": dict(good, network="tor"),
+            "kind and network disagree": dict(good, kind="name_proxy"),
+        }
+        for outcome in ("malformed_record", "first_packet_failed", "fallback", "closed_after_switch"):
+            monitored = outcome != "closed_after_switch"
+            for label, endpoint in malformed.items():
+                with self.subTest(outcome=outcome, endpoint=label):
+                    figure, triage = evaluate(outcome, endpoint)
+                    judged, other = (figure, triage) if monitored else (triage, figure)
+                    self.assertEqual((judged.result, other.result), ("unknown", "pass"), judged.details)
+                    self.assertIn(f"{outcome} entry 1 has a missing or malformed endpoint", " ".join(judged.details))
+                    self.assert_no_addresses(figure, triage)
+        # Valid endpoints of unrelated peers, on every network, are judged clean.
+        valid = [good, dict(good, network="ipv6", address="2001:db8::9"), dict(good, network="cjdns", address="fc00::9"),
+                 dict(good, network="onion", address="example.onion"), dict(good, network="i2p", address="example.b32.i2p", port=0),
+                 {"kind": "name_proxy", "network": "name_proxy", "address": "seed.example.org", "port": 8333}]
+        for endpoint in valid:
+            with self.subTest(valid=endpoint["network"]):
+                self.assertEqual(tuple(figure.result for figure in evaluate("fallback", endpoint)), ("pass", "pass"))
+        # Outcomes outside both figures do not need an endpoint.
+        self.assertEqual(evaluate("legacy_peer", None)[0].result, "pass")
+        # A malformed endpoint that still names a known-good peer is that peer's failure.
+        figure, _ = evaluate("fallback", {"address": "203.0.113.5", "port": 8333})
+        self.assertEqual(figure.result, "fail")
+        self.assertIn("known_good=archive", figure.details[0])
+
     def test_restart_is_an_unknown_interval(self) -> None:
         first = record(T0, inbound=ring(0, 0, []), outbound=ring(0, 0, []))
         restarted = record(T0 + 2 * INTERVAL, inbound=ring(0, 0, []), outbound=ring(0, 0, []),

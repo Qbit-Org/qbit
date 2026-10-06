@@ -176,7 +176,10 @@ bad arguments or input.
   entries never read (the oldest entry read is past that point), across a
   changed `instance_id`, or when a ring is malformed or goes backwards. A flood
   of inbound failures therefore cannot hide an outbound one: the rings are
-  separate. Unrelated endpoints never fail the canary.
+  separate. Unrelated endpoints never fail the canary, but only a well-formed
+  endpoint is unrelated: a `malformed_record`, `first_packet_failed`,
+  `fallback` or `closed_after_switch` entry whose endpoint is missing or
+  malformed makes its figure unknown.
 
 ### When the pinned link is not manual
 

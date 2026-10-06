@@ -31,6 +31,8 @@ Evidence rules:
   instance_id. A lost stretch makes that interval unknown for that ring.
 - Missing evidence is unknown, never clean: the pinned link passes only if it
   would pass with every unknown sample counted against it.
+- Only a well-formed endpoint is an unrelated peer: a failure entry whose
+  endpoint is missing or malformed makes its figure unknown.
 - The report names known-good peers by their label, never by address; peer
   addresses stay in failures.jsonl and the known-good list on the node.
 
@@ -41,6 +43,7 @@ them fails, 3 when none fails but one is unknown, 2 for bad arguments or input.
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import re
 import sys
 from collections import defaultdict
@@ -61,6 +64,8 @@ RESTART_TOLERANCE = 120  # seconds of boot-time jitter that is not a restart
 MONITORED_OUTCOMES = {"malformed_record", "first_packet_failed", "fallback"}
 TRIAGE_OUTCOMES = {"closed_after_switch"}
 RINGS = ("inbound", "outbound")
+ENDPOINT_KINDS = {"address", "name_proxy"}
+NETWORKS = {"ipv4", "ipv6", "onion", "i2p", "cjdns", "name_proxy"}
 LABEL = re.compile(r"^[A-Za-z0-9._-]+$")
 REMEDY = ("an automatic connection held the pinned address in {count} sample(s), so the -addnode thread "
           "(GetAddedNodeInfo) skipped it. Remedy: run `qbit-cli disconnectnode <pinned address>` once; "
@@ -239,6 +244,24 @@ def evaluate_pinned(pool: list[dict[str, str | None]] | None, archive: list[dict
 def endpoint_key(address: str, port: Any) -> str:
     address = address.strip().lower()
     return f"[{address}]:{port}" if ":" in address else f"{address}:{port}"
+
+
+def valid_endpoint(endpoint: Any) -> bool:
+    """Whether endpoint has the getpqtransportinfo Endpoint shape: a kind and network that
+    agree, an address of that network without a port, and a port from 0 to 65535."""
+    if not isinstance(endpoint, dict):
+        return False
+    kind, network, address, port = (endpoint.get(key) for key in ("kind", "network", "address", "port"))
+    if kind not in ENDPOINT_KINDS or network not in NETWORKS or (kind == "name_proxy") != (network == "name_proxy"):
+        return False
+    if not isinstance(port, int) or isinstance(port, bool) or not 0 <= port <= 65535 or not isinstance(address, str):
+        return False
+    if network in ("ipv4", "ipv6", "cjdns"):
+        try:
+            return ipaddress.ip_address(address).version == (4 if network == "ipv4" else 6)
+        except ValueError:
+            return False
+    return LABEL.match(address) is not None
 
 
 class KnownGood:
@@ -435,6 +458,9 @@ def evaluate_failures(records: list[dict[str, Any]] | None, known_good: KnownGoo
     seen: set[tuple[Any, ...]] = set()
     found_monitored: list[str] = []
     found_triage: list[str] = []
+    # Entries that may be between known-good endpoints but cannot be told apart, per figure.
+    unknown_monitored: list[str] = []
+    unknown_triage: list[str] = []
     for record in records:
         host = str(record.get("host"))
         for direction in RINGS:
@@ -444,13 +470,20 @@ def evaluate_failures(records: list[dict[str, Any]] | None, known_good: KnownGoo
                 if key in seen or not window.contains(entry.get("time", 0)):
                     continue
                 seen.add(key)
-                label = known_good.label(entry.get("endpoint"))
-                if label is None:
+                outcome = entry.get("outcome")
+                if outcome in MONITORED_OUTCOMES:
+                    found, unknown = found_monitored, unknown_monitored
+                elif outcome in TRIAGE_OUTCOMES:
+                    found, unknown = found_triage, unknown_triage
+                else:
                     continue
-                if entry.get("outcome") in MONITORED_OUTCOMES:
-                    found_monitored.append(describe(host, entry, label))
-                elif entry.get("outcome") in TRIAGE_OUTCOMES:
-                    found_triage.append(describe(host, entry, label))
+                label = known_good.label(entry.get("endpoint"))
+                if label is not None:
+                    found.append(describe(host, entry, label))
+                elif not valid_endpoint(entry.get("endpoint")):
+                    # Not a valid unrelated peer either: the entry may be between known-good endpoints.
+                    unknown.append(f"unknown {host} {direction} {utc(entry['time'])}: {outcome} entry {entry['sequence']} "
+                                   "has a missing or malformed endpoint")
         if not window.contains(record.get("time", 0)):
             continue
         fallback_set = record.get("fallback_set")
@@ -471,12 +504,13 @@ def evaluate_failures(records: list[dict[str, Any]] | None, known_good: KnownGoo
     samples = sum(len(slots[host]) for host in monitored)
     per_host = ",".join(f"{host}:{percent(coverage[host])}" for host in monitored)
 
-    def figure(name: str, found: list[str]) -> Figure:
-        result = FAIL if found else (UNKNOWN if gaps or low else PASS)
+    def figure(name: str, found: list[str], unknown: list[str]) -> Figure:
+        result = FAIL if found else (UNKNOWN if gaps or low or unknown else PASS)
         return Figure(name, result, samples, min(coverage.values()),
-                      f"entries={len(found)} unknown_intervals={len(gaps)} nodes={per_host}", found + notes)
+                      f"entries={len(found)} unknown_intervals={len(gaps) + len(unknown)} nodes={per_host}",
+                      found + unknown + notes)
 
-    return figure(monitored_name, found_monitored), figure(triage_name, found_triage)
+    return figure(monitored_name, found_monitored, unknown_monitored), figure(triage_name, found_triage, unknown_triage)
 
 
 # ---------------------------------------------------------------------------
