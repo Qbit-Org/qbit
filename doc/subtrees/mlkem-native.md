@@ -185,7 +185,8 @@ contrib/devtools/update-mlkem-native.sh v2.0.1     # a new release
 ```
 
 The script fetches the tag or commit from `REMOTE_URL` (default: the pinned
-repository), replaces `src/mlkem-native` with upstream's `mlkem/` and
+repository) into a temporary repository, so the qbit clone does not become
+shallow, replaces `src/mlkem-native` with upstream's `mlkem/` and
 `LICENSE` byte for byte, rewrites the pin from the object ids of the fetched
 upstream commit, stages both, and checks that the staged tree has exactly those
 ids. `REMOTE_REF` selects the ref when no argument is given. It refuses to
