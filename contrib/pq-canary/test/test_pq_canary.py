@@ -398,9 +398,9 @@ class PinnedLinkTest(unittest.TestCase):
 
     def test_no_samples_is_unknown(self) -> None:
         self.assertEqual(self.evaluate([], 10).result, "unknown")
-        # Two rows with the same time (for example a manual run beside cron) are both counted.
+        # Two rows for one expected sample (for example a manual run beside cron) are one sample.
         pool = Node("pool", boot=T0 - DAY, pinned=PINNED)
-        self.assertEqual(self.evaluate([pool.sample(T0), pool.sample(T0)], 1).samples, 2)
+        self.assertEqual(self.evaluate([pool.sample(T0), pool.sample(T0)], 1).samples, 1)
         self.assertEqual(pq_eval.evaluate_pinned(None, None, window(10), INTERVAL, 600, 0.9).result, "unknown")
 
     def test_malformed_numbers_are_missing(self) -> None:
@@ -497,6 +497,75 @@ class PinnedLinkTest(unittest.TestCase):
         self.assertEqual(figure.result, "unknown", figure.summary)
         self.assertAlmostEqual(figure.coverage, 0.85)
         self.assertEqual(self.evaluate(rows, 100, min_coverage=0.8).result, "fail")
+
+    def test_each_expected_sample_counts_once(self) -> None:
+        pool = Node("pool", boot=T0 - DAY, pinned=PINNED)
+        # 95 of 100 expected samples cannot show 99%, however often each one is recorded.
+        rows = [pool.sample(T0 + i * INTERVAL) for i in range(100) if i % 20]
+        self.assertEqual(len(rows), 95)
+        cases = {
+            "once": rows,
+            "each row six times": [row for row in rows for _ in range(6)],
+            "files that overlap": rows + rows[10:] + rows[40:],
+            "six sampler runs per expected sample":
+                [pool.sample(T0 + i * INTERVAL + offset) for i in range(100) if i % 20 for offset in range(-100, 101, 40)],
+        }
+        for label, case in cases.items():
+            with self.subTest(label):
+                figure = self.evaluate(case, 100)
+                self.assertEqual((figure.result, figure.samples), ("unknown", 100), figure.summary)
+                self.assertIn("hybrid=95 not_hybrid=0 unknown=5 excluded=0", figure.summary)
+                self.assertAlmostEqual(figure.coverage, 0.95)
+
+    def test_several_samples_for_one_expected_sample_count_as_the_least_favorable(self) -> None:
+        pool = Node("pool", boot=T0 - DAY, pinned=PINNED)
+        rows = [pool.sample(T0 + i * INTERVAL) for i in range(100)]
+
+        def with_extra(extra: Any, before: bool) -> list[Any]:
+            """rows with an extra sample a minute before or after expected samples 10 and 11."""
+            offset = -60 if before else 60
+            return rows + [extra(T0 + i * INTERVAL + offset) for i in (10, 11)]
+        cases = {
+            "not connected": (lambda time: pool.sample(time, pinned_peer=None), "fail", "hybrid=98 not_hybrid=2 unknown=0"),
+            "unanswered": (lambda time: pool.sample(time, down=True), "unknown", "hybrid=98 not_hybrid=0 unknown=2"),
+            "hybrid": (pool.sample, "pass", "hybrid=100 not_hybrid=0 unknown=0"),
+        }
+        for label, (extra, result, summary) in cases.items():
+            for before in (True, False):
+                with self.subTest(label, before=before):
+                    figure = self.evaluate(with_extra(extra, before), 100)
+                    self.assertEqual((figure.result, figure.samples), (result, 100), figure.summary)
+                    self.assertIn(summary, figure.summary)
+        # Not connected in one sample and unanswered in the other is a miss.
+        unanswered = [dict(row, sample_ok="0") if index in (10, 11) else row for index, row in enumerate(rows)]
+        figure = self.evaluate(unanswered + [pool.sample(T0 + i * INTERVAL + 60, pinned_peer=None) for i in (10, 11)], 100)
+        self.assertIn("hybrid=98 not_hybrid=2 unknown=0", figure.summary)
+
+        # In a restart gap (the archive node restarts after expected sample 49), a sample
+        # excludes its expected sample from the figure, unless another one is a miss.
+        archive = Node("archive", boot=T0 - DAY)
+        archive_rows = [archive.sample(T0 + i * INTERVAL) for i in range(50)]
+        archive.restart(T0 + 50 * INTERVAL - 60)
+        archive_rows += [archive.sample(T0 + i * INTERVAL) for i in range(50, 100)]
+        figure = self.evaluate(rows, 100, archive_rows)
+        self.assertIn("hybrid=98 not_hybrid=0 unknown=0 excluded=2", figure.summary)
+        in_gap = pool.sample(T0 + 49 * INTERVAL + 60)
+        figure = self.evaluate(rows + [in_gap], 100, archive_rows)
+        self.assertIn("hybrid=97 not_hybrid=0 unknown=0 excluded=3", figure.summary)
+        missed = [dict(row, pinned_present="0") if index == 49 else row for index, row in enumerate(rows)]
+        figure = self.evaluate(missed + [in_gap], 100, archive_rows)
+        self.assertIn("hybrid=97 not_hybrid=1 unknown=0 excluded=2", figure.summary)
+
+    def test_repeated_rows_do_not_outvote_the_boot_time(self) -> None:
+        pool = Node("pool", boot=T0 - DAY, pinned=PINNED)
+        rows = [pool.sample(T0 + i * INTERVAL, pinned_peer=None if i in (40, 41) else "manual-hybrid") for i in range(100)]
+        # A fresh boot in the two misses, without a new instance_id, is no restart: they are judged.
+        rows[40]["uptime"], rows[41]["uptime"] = "30", "330"
+        for copies in (1, 100):
+            with self.subTest(copies=copies):
+                figure = self.evaluate(rows + [dict(rows[index]) for index in (40, 41) for _ in range(copies - 1)], 100)
+                self.assertEqual(figure.result, "fail", figure.summary)
+                self.assertIn("hybrid=98 not_hybrid=2 unknown=0 excluded=0", figure.summary)
 
 
 # ---------------------------------------------------------------------------
@@ -856,6 +925,36 @@ class FailureEntriesTest(unittest.TestCase):
         self.assertEqual(figure.result, "unknown")
         self.assertAlmostEqual(figure.coverage, 0.5)
         self.assertEqual(self.evaluate(records, end=T0 + 9 * INTERVAL, min_coverage=0.5)[0].result, "pass")
+        # Repeated records, files given twice and extra sampler runs add no coverage.
+        for label, case in (("repeated", records * 3),
+                            ("extra runs", records + [dict(item, time=item["time"] + offset) for item in records for offset in (-100, 100)])):
+            with self.subTest(label):
+                figure, _ = self.evaluate(case, end=T0 + 9 * INTERVAL)
+                self.assertEqual((figure.result, figure.samples), ("unknown", 5))
+                self.assertAlmostEqual(figure.coverage, 0.5)
+
+    def test_coverage_counts_only_expected_samples_in_the_window(self) -> None:
+        # Records for expected samples 0 to 8, and one 160 s after sample 9: nearest to
+        # sample 10, which is after the window, so sample 9 is missing.
+        def empty(time: int) -> dict[str, Any]:
+            return record(time, inbound=ring(0, 0, []), outbound=ring(0, 0, []))
+        records = [empty(T0 + i * INTERVAL) for i in range(9)] + [empty(T0 + 9 * INTERVAL + 160)]
+        figure, _ = self.evaluate(records, min_coverage=0.95)
+        self.assertEqual((figure.result, figure.samples), ("unknown", 9))
+        self.assertAlmostEqual(figure.coverage, 0.9)
+        # Likewise a record 100 s before the window starts is nearest to sample 0, but not in the window.
+        records = [empty(T0 - 100)] + [empty(T0 + i * INTERVAL) for i in range(1, 10)]
+        figure, _ = self.evaluate(records, min_coverage=0.95)
+        self.assertEqual((figure.result, figure.samples), ("unknown", 9))
+
+    def test_repeated_records_count_each_entry_once(self) -> None:
+        start = record(T0, inbound=ring(0, 0, []), outbound=ring(0, 0, []))
+        failed = record(T0 + INTERVAL, inbound=ring(0, 0, []), outbound=ring(1, 0, [entry(1, T0 + 5, "203.0.113.5", 8333, "first_packet_failed")]))
+        once = self.evaluate([start, failed])
+        twice = self.evaluate([start, failed, start, failed])
+        self.assertEqual([(figure.result, figure.samples, figure.summary, figure.details) for figure in twice],
+                         [(figure.result, figure.samples, figure.summary, figure.details) for figure in once])
+        self.assertIn("entries=1", twice[0].summary)
 
     def test_missing_evidence_is_unknown(self) -> None:
         records = [record(T0, inbound=ring(0, 0, []), outbound=ring(0, 0, []))]
@@ -1004,6 +1103,46 @@ class ConnectionsTest(unittest.TestCase):
         self.assertEqual(figure.result, "unknown")
         self.assertTrue(any(line.startswith("2025-10-10 unknown:") and "coverage=89.6%" in line for line in figure.details), figure.details)
         self.assertEqual(self.evaluate(archive_rows, control_rows, win, min_coverage=0.85).result, "pass")
+        # Recording the other samples twice does not fill the gap.
+        twice = control_rows + [dict(row, time=str(int(row["time"]) + 60)) for row in control_rows]
+        figure = self.evaluate(archive_rows * 2, twice, win)
+        self.assertEqual(figure.result, "unknown")
+        self.assertTrue(any(line.startswith("2025-10-10 unknown:") and "coverage=89.6%" in line for line in figure.details), figure.details)
+
+    def test_several_samples_for_one_expected_sample_count_as_the_least_favorable(self) -> None:
+        archive_rows, control_rows, win = self.series(lambda i: 36, lambda i: 30)
+        full = self.CANARY_DAYS * DAY // INTERVAL
+        self.assertEqual(self.evaluate(archive_rows, control_rows, win).samples, full)
+
+        def shifted(rows: list[Any], indexes: range, offset: int, **changes: str) -> list[Any]:
+            """Copies of the canary samples at indexes, offset seconds later, with changes."""
+            return [dict(rows[self.BASELINE_DAYS * 288 + index], time=str(T0 + index * INTERVAL + offset), **changes) for index in indexes]
+        cases = {
+            # An unanswered sample a minute before some expected samples and after others.
+            "unanswered": shifted(control_rows, range(300, 310), -60, sample_ok="0") + shifted(control_rows, range(400, 410), 60, sample_ok="0"),
+            # A second measurement that disagrees with the first.
+            "disagreeing": shifted(control_rows, range(300, 310), -60, connections_in="31") + shifted(control_rows, range(400, 410), 60, connections_in="29"),
+        }
+        for label, extra in cases.items():
+            with self.subTest(label):
+                figure = self.evaluate(archive_rows, control_rows + extra, win)
+                self.assertEqual(figure.samples, full - 20, figure.details)
+        # A measurement that agrees is the same measurement.
+        figure = self.evaluate(archive_rows, control_rows + shifted(control_rows, range(300, 310), -60), win)
+        self.assertEqual((figure.result, figure.samples), ("pass", full))
+
+        # A sample of the node 30 s after a restart excludes its expected sample,
+        # unless another sample for it is unusable.
+        restarted = Node("archive", boot=T0 + 300 * INTERVAL + 30)
+        restarted.instance = 1
+        after_restart = restarted.sample(T0 + 300 * INTERVAL + 60)
+        figure = self.evaluate(archive_rows + [after_restart], control_rows, win)
+        self.assertEqual(figure.samples, full - 1)
+        self.assertTrue(any(" excluded=1 " in line for line in figure.details), figure.details)
+        unanswered = [dict(row, sample_ok="0") if int(row["time"]) == T0 + 300 * INTERVAL else row for row in archive_rows]
+        figure = self.evaluate(unanswered + [after_restart], control_rows, win)
+        self.assertEqual(figure.samples, full - 1)
+        self.assertFalse(any(" excluded=1 " in line for line in figure.details), figure.details)
 
 
 # ---------------------------------------------------------------------------

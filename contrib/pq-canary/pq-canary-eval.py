@@ -25,6 +25,12 @@ Evidence rules:
 - Coverage is the share of the expected 5-minute samples that are present and
   usable. A figure, node or day below --min-coverage (default 90%) is unknown,
   not judged.
+- The expected samples are --interval apart from --canary-start (so give one on
+  the sampler's schedule, such as a whole hour), and a sample stands for the
+  expected one nearest to it. Every figure counts an expected sample once,
+  however many samples stand for it: several count as the least favorable of
+  them, so a repeated row, overlapping files or an extra sampler run never add
+  evidence. A row repeated exactly is one sample.
 - Failure rings are read by their per-ring sequence. A ring that wrapped is
   still complete when the entries read continue from the last sequence already
   processed; entries are lost only when the oldest entry read is past that point
@@ -174,6 +180,26 @@ class Window:
         return begin <= self.end and finish >= self.start
 
 
+def slot_of(time: int, window: Window, interval: int) -> int | None:
+    """The expected sample window.start + k * interval that a sample at time stands for, as k, or None.
+
+    A sample stands for the expected sample nearest to it; k < 0 is before the
+    window (the connections baseline). A sample on the other side of the
+    window's start or end from that expected sample stands for none.
+    """
+    slot = (time - window.start + interval // 2) // interval
+    if (slot < 0) != (time < window.start) or time > window.end or slot > (window.end - window.start) // interval:
+        return None
+    return slot
+
+
+# A sample's state, from the most to the least favorable: several samples that stand for one
+# expected sample count as the least favorable of them. Figure 1 uses all four; figure 4 the
+# first three, where the first is a connections_in measurement rather than a hybrid link.
+HYBRID = MEASURED = 0
+EXCLUDED, UNUSABLE, NOT_HYBRID = 1, 2, 3
+
+
 # ---------------------------------------------------------------------------
 # Restarts
 # ---------------------------------------------------------------------------
@@ -192,6 +218,8 @@ def sample_rows(rows: Iterable[Row]) -> list[tuple[int, Row]]:
     """The rows that are samples with their times, in time order, with the values the figures read checked.
 
     A row without a time in Unix seconds is not a sample: it counts as missing.
+    A row repeated exactly, as in overlapping or concatenated files, is one
+    sample, so repeating rows cannot outvote the others' boot time.
     An uptime that is not a non-negative integer, or whose boot time (time -
     uptime) contradicts the boot time of its instance_id, becomes None: unknown,
     never a restart. A process's boot time is the median over its samples, so
@@ -199,9 +227,11 @@ def sample_rows(rows: Iterable[Row]) -> list[tuple[int, Row]]:
     getpqtransportinfo calls (the old uptime with the new instance_id) moves it.
     """
     timed = []
+    seen: set[frozenset[tuple[str, str | None]]] = set()
     for row in rows:
-        time = as_count(row["time"])
-        if is_time(time):
+        time, key = as_count(row["time"]), frozenset(row.items())
+        if is_time(time) and key not in seen:
+            seen.add(key)
             timed.append((time, row))
     timed.sort(key=lambda item: item[0])
     boots: dict[str, list[int]] = defaultdict(list)
@@ -250,16 +280,16 @@ def merged_gaps(node_restarts: Iterable[Restart], grace: int) -> list[tuple[int,
     return merged
 
 
-def missing_samples(after: int, before: int, interval: int, gaps: list[tuple[int, int]]) -> tuple[int, int]:
-    """(unknown, excluded) counts of the samples expected strictly between two sample times."""
-    count = int((before - after) / interval + 0.5) - 1
+def missing_samples(after: int, before: int, start: int, interval: int, gaps: list[tuple[int, int]]) -> tuple[int, int]:
+    """(unknown, excluded) counts of the expected samples start + k * interval with after < k < before."""
+    count = before - after - 1
     if count <= 0:
         return 0, 0
     excluded = 0
     for low, high in gaps:
-        # Expected times after + i * interval, 1 <= i <= count, inside (low, high].
-        first = max(1, (low - after) // interval + 1)
-        last = min(count, (high - after) // interval)
+        # Expected times inside (low, high].
+        first = max(after + 1, (low - start) // interval + 1)
+        last = min(before - 1, (high - start) // interval)
         excluded += max(0, last - first + 1)
     return count - excluded, excluded
 
@@ -284,31 +314,38 @@ def evaluate_pinned(pool: list[Row] | None, archive: list[Row] | None,
     if not pool:
         return Figure(name, UNKNOWN, 0, None, "no pool node samples")
     gaps = merged_gaps(restarts(pool) + (restarts(archive) if archive else []), grace)
-    good = bad = unknown = excluded = automatic = 0
-    rows: list[tuple[int, Row | None]] = [(time, row) for time, row in sample_rows(pool) if window.contains(time)]
-    previous = window.start - interval
-    for time, row in rows + [(window.end + interval, None)]:
-        missing, skipped = missing_samples(previous, time, interval, gaps)
-        unknown += missing
-        excluded += skipped
-        previous = time
-        if row is None:
-            break
+    # Each expected sample once: several samples for it count as the least favorable.
+    states: dict[int, int] = {}
+    automatic: set[int] = set()
+    for time, row in sample_rows(pool):
+        slot = slot_of(time, window, interval)
+        if slot is None or slot < 0:
+            continue
         uptime = as_count(row["uptime"])
         if any(low < time <= high for low, high in gaps) or (uptime is not None and uptime < grace):
-            excluded += 1
+            state = EXCLUDED
         elif row["sample_ok"] != "1" or row["pinned_present"] not in ("0", "1"):
-            unknown += 1
+            state = UNUSABLE
         elif row["pinned_present"] == "0":
-            bad += 1
+            state = NOT_HYBRID
         elif not pinned_peer_ok(row):
-            unknown += 1
+            state = UNUSABLE
         elif row["pinned_connection_type"] == "manual" and row["pinned_transport_pq"] == "1":
-            good += 1
+            state = HYBRID
         else:
-            bad += 1
+            state = NOT_HYBRID
             if row["pinned_connection_type"] != "manual":
-                automatic += 1
+                automatic.add(slot)
+        states[slot] = max(states.get(slot, state), state)
+    good, excluded, unknown, bad = (sum(state == value for state in states.values())
+                                    for value in (HYBRID, EXCLUDED, UNUSABLE, NOT_HYBRID))
+    # Expected samples without a sample are unknown, or excluded inside a restart gap.
+    previous = -1
+    for slot in sorted(states) + [(window.end - window.start) // interval + 1]:
+        missing, skipped = missing_samples(previous, slot, window.start, interval, gaps)
+        unknown += missing
+        excluded += skipped
+        previous = slot
     total = good + bad + unknown
     if total == 0:
         return Figure(name, UNKNOWN, 0, None, f"no samples outside restarts (excluded={excluded})")
@@ -324,7 +361,7 @@ def evaluate_pinned(pool: list[Row] | None, archive: list[Row] | None,
     figure = Figure(name, result, total, coverage,
                     f"hybrid={good} not_hybrid={bad} unknown={unknown} excluded={excluded} ({100 * good / total:.2f}% hybrid)")
     if automatic:
-        figure.details.append(REMEDY.format(count=automatic))
+        figure.details.append(REMEDY.format(count=len(automatic)))
     return figure
 
 
@@ -566,8 +603,9 @@ def evaluate_failures(records: list[dict[str, Any]] | None, known_good: KnownGoo
     expected = expected_samples(window.start, window.end, interval)
     slots: dict[str, set[int]] = defaultdict(set)
     for record in records:
-        if window.contains(record["time"]):
-            slots[str(record.get("host"))].add(int((record["time"] - window.start) / interval + 0.5))
+        slot = slot_of(record["time"], window, interval)
+        if slot is not None and slot >= 0:
+            slots[str(record.get("host"))].add(slot)
     coverage = {host: min(1.0, len(slots[host]) / expected) if expected else 0.0 for host in monitored}
     low = [host for host in monitored if coverage[host] < min_coverage]
 
@@ -667,35 +705,50 @@ def evaluate_connections(archive: list[Row] | None, control: list[Row] | None,
                          min_coverage: float) -> Figure:
     """Daily archive/control connections_in ratios, relative to the baseline ratio.
 
-    Samples are paired by sampling slot. A day is judged only when its valid
-    pairs cover at least min_coverage of the samples expected outside restart
-    exclusions; otherwise the day is unknown.
+    Samples are paired by the expected sample they stand for. A day is judged
+    only when its valid pairs cover at least min_coverage of the samples
+    expected outside restart exclusions; otherwise the day is unknown.
     """
     name = "archive connections_in within +-20% of control, relative to the baseline ratio, excluding 48 h after restarts"
     if not archive or not control:
         return Figure(name, UNKNOWN, 0, None, "needs both archive and control samples")
 
-    def by_slot(rows: list[Row]) -> dict[int, Row]:
-        return {int(time / interval + 0.5): row for time, row in sample_rows(rows)}
+    def by_slot(rows: list[Row]) -> dict[int, tuple[int, int | None]]:
+        """(state, connections_in) per expected sample: EXCLUDED within 48 h of a restart. Several
+        samples for one count as the least favorable, and measurements that disagree as unusable."""
+        slots: dict[int, tuple[int, int | None]] = {}
+        for time, row in sample_rows(rows):
+            slot = slot_of(time, window, interval)
+            if slot is None:
+                continue
+            uptime, count = as_count(row["uptime"]), as_count(row["connections_in"])
+            if uptime is not None and uptime < CONNECTIONS_RESTART_EXCLUSION:
+                sample: tuple[int, int | None] = (EXCLUDED, None)
+            elif row["sample_ok"] == "1" and uptime is not None and count is not None:
+                sample = (MEASURED, count)
+            else:
+                sample = (UNUSABLE, None)
+            held = slots.setdefault(slot, sample)
+            if held != sample:
+                slots[slot] = max(held, sample) if held[0] != sample[0] else (UNUSABLE, None)
+        return slots
 
     archive_slots, control_slots = by_slot(archive), by_slot(control)
     baseline = [0, 0, 0]  # archive sum, control sum, pairs
     days: dict[str, dict[str, int]] = defaultdict(lambda: {"archive": 0, "control": 0, "pairs": 0, "excluded": 0})
     for slot in sorted(set(archive_slots) | set(control_slots)):
-        pair = (archive_slots.get(slot), control_slots.get(slot))
-        time = min(int(row["time"]) for row in pair if row is not None)  # type: ignore[arg-type]
-        uptimes = [as_count(row["uptime"]) if row else None for row in pair]
-        counts = [as_count(row["connections_in"]) if row else None for row in pair]
-        restarted = any(uptime is not None and uptime < CONNECTIONS_RESTART_EXCLUSION for uptime in uptimes)
-        answered = all(row is not None and row["sample_ok"] == "1" for row in pair)
-        valid = answered and not restarted and None not in uptimes and None not in counts
+        pair = [node_slots.get(slot, (UNUSABLE, None)) for node_slots in (archive_slots, control_slots)]
+        counts = [count for _, count in pair]
+        restarted = any(state == EXCLUDED for state, _ in pair)
+        valid = all(state == MEASURED for state, _ in pair)
+        time = window.start + slot * interval
         if time < canary_start:
             if valid:
                 baseline[0] += counts[0]  # type: ignore[operator]
                 baseline[1] += counts[1]  # type: ignore[operator]
                 baseline[2] += 1
             continue
-        if not window.contains(time):
+        if slot < 0:
             continue
         day = days[utc(time)[:10]]
         if restarted:

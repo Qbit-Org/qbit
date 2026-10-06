@@ -171,6 +171,16 @@ bad arguments or input.
   present and usable. Below `--min-coverage`, the pinned link, a monitored
   node's failure evidence and an inbound-connections day are unknown, not
   judged.
+- **One sample per expected sample.** The expected samples are `--interval`
+  apart from `--canary-start`, and a sample stands for the expected one nearest
+  to it. However many samples stand for one expected sample (a repeated row,
+  overlapping files, a manual run beside cron), every figure counts it once, as
+  the least favorable of them: for the pinned link a miss, then unknown, then
+  excluded, then hybrid; for inbound connections unknown, then excluded, then a
+  measurement, where two measurements that disagree are unknown. A row
+  repeated exactly is one sample. Give `--canary-start` on the sampler's
+  5-minute schedule, such as a whole hour, so that each sample is near the
+  expected sample it stands for.
 - **Unknown, never clean.** A sample with `sample_ok=0`, an `NA` where the
   figure needs a value, or a missing sample (for example while cron was not
   running) is unknown. So is a malformed value: a `time`, `uptime` or
