@@ -1414,11 +1414,15 @@ BOOST_AUTO_TEST_CASE(pq_local_fault_warning)
         Connect(TestEndpoint(7, 7), End::MALFORMED);
     }
     BOOST_CHECK_EQUAL(warnings.m_count, 1);
+    BOOST_CHECK_EQUAL(m_connman.PQLocalFaultEndpoints(), PQ_LOCAL_FAULT_THRESHOLD);
     // It warns once, and behavior doesn't change.
     for (int i{0}; i < 12; ++i) Connect(TestEndpoint(7, i), End::MALFORMED);
     BOOST_CHECK_EQUAL(warnings.m_count, 1);
     BOOST_CHECK(m_connman.IsPQFallback(TestEndpoint(7, 0), Now<NodeSeconds>()) == false);
     BOOST_CHECK_EQUAL(Streak(TestEndpoint(7, 0))->streak, 2U);
+    // The set of failing endpoints stops growing at the threshold: it is never evicted, so the
+    // cap is its only bound.
+    BOOST_CHECK_EQUAL(m_connman.PQLocalFaultEndpoints(), PQ_LOCAL_FAULT_THRESHOLD);
 }
 
 BOOST_AUTO_TEST_CASE(pq_local_fault_warning_portable)
