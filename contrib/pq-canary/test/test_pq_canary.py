@@ -10,6 +10,7 @@ Standard library only, so the Required Merge Gate can run it as is.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -72,7 +73,8 @@ class Node:
         if self.v1_0_0:
             return None
         info = fixture("getpqtransportinfo.json")
-        info["instance_id"] = f"{self.instance:064x}"
+        # Random per process start on a real node; distinct per node and run here.
+        info["instance_id"] = hashlib.sha256(f"{self.host}/{self.instance}".encode()).hexdigest()
         info["since"] = self.boot
         return info
 
@@ -794,6 +796,14 @@ class EvaluatorCommandTest(unittest.TestCase):
             bad_csv.write_text("not,a,sample\n", encoding="utf8")
             bad_good = root / "bad-known-good.txt"
             bad_good.write_text("203.0.113.5:99999\n", encoding="utf8")
+            archive, control = str(root / "archive.csv"), str(root / "control.csv")
+
+            def samples(name: str, *sources: str, **changes: str) -> str:
+                """A samples file with the rows of sources, with changes applied to each row."""
+                for source in sources:
+                    for row in pq_canary.read_rows(Path(source)):
+                        pq_canary.append_row(root / name, {key: NA if value is None else value for key, value in dict(row, **changes).items()})
+                return str(root / name)
             start = ["--canary-start", str(T0)]
             cases = {
                 "the following arguments are required: --canary-start": ["--pool", pool],
@@ -814,6 +824,16 @@ class EvaluatorCommandTest(unittest.TestCase):
                 "expected distinct comma-separated host labels": start + ["--failures", failures, "--known-good", good, "--monitored", "pool,pool"],
                 "--end is before --canary-start": start + ["--pool", pool, "--end", str(T0 - 1)],
                 "unexpected header": start + ["--pool", str(bad_csv)],
+                # Each role is a different node: never compare a node with itself.
+                "--archive and --control are the same file": start + ["--archive", archive, "--control", archive],
+                "--archive and --control both have the host label archive":
+                    start + ["--archive", archive, "--control", samples("relabeled.csv", control, host="archive")],
+                "--archive mixes the host labels archive, control": start + ["--archive", samples("mixed.csv", archive, control)],
+                "--pool has a row without a valid host label": start + ["--pool", samples("no-host.csv", pool, host=NA)],
+                "--archive and --control report the same instance_id":
+                    start + ["--archive", archive, "--control", samples("same-node.csv", archive, host="control")],
+                "--pool and --archive both have the host label pool":
+                    start + ["--pool", pool, "--archive", samples("pool-as-archive.csv", archive, host="pool")],
                 "expected address or address:port with a port from 1 to 65535": start + ["--failures", failures, "--known-good", str(bad_good)],
             }
             for message, args in cases.items():

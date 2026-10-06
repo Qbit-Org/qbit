@@ -131,7 +131,11 @@ from there to `--end`, or to the latest sample. Other options:
 
 Unknown, misspelled or abbreviated options, malformed times or numbers, missing
 files, `--failures` without `--known-good` (or the reverse) and an `--end`
-before `--canary-start` are rejected with exit status 2 and a message.
+before `--canary-start` are rejected with exit status 2 and a message. So are
+samples that would compare a node with itself: `--pool`, `--archive` and
+`--control` must each be one node, so a file given for two roles, two roles
+with the same host label or `instance_id`, or a file whose rows carry more than
+one host label (or none) is rejected.
 
 Output: one line per figure, `<result> <figure>: samples=<n> coverage=<c> <details>`,
 where the result is `pass`, `fail` or `unknown`, followed by indented details,
