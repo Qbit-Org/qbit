@@ -495,6 +495,19 @@ class FailureEntriesTest(unittest.TestCase):
                 self.assertIn(f"known_good={name}", figure.details[0])
                 self.assert_no_addresses(figure, triage)
 
+    def test_missing_fallback_set_is_unknown(self) -> None:
+        start = record(T0, inbound=ring(0, 0, []), outbound=ring(0, 0, []))
+        for label, value in (("null", None), ("not a list", {"endpoint": "x"}), ("absent", ...)):
+            with self.subTest(label):
+                later = record(T0 + INTERVAL, inbound=ring(0, 0, []), outbound=ring(0, 0, []))
+                if value is ...:
+                    del later["fallback_set"]
+                else:
+                    later["fallback_set"] = value
+                figure, _ = self.evaluate([start, later])
+                self.assertEqual(figure.result, "unknown")
+                self.assertTrue(any("fallback_set missing or malformed" in detail for detail in figure.details))
+
     def test_closed_after_switch_is_listed_for_triage(self) -> None:
         closed = entry(1, T0 + 5, "2001:db8::5", 8333, "closed_after_switch", reason="eof", connection_type="block-relay-only")
         records = [record(T0, inbound=ring(0, 0, []), outbound=ring(0, 0, [])),
