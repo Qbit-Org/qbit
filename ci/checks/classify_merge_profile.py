@@ -73,6 +73,7 @@ PQ_UNIT_FILES = frozenset(
         "src/test/CMakeLists.txt",
         "src/test/fuzz/CMakeLists.txt",
         "src/util/CMakeLists.txt",
+        "test/CMakeLists.txt",
         # The jobs and the gate: this classifier, the workflows that run it and
         # the PQ jobs, the scripts and evidence check of those jobs, and the
         # tests of that wiring.
