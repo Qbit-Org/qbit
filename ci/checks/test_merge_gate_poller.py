@@ -169,6 +169,12 @@ class FakeGh:
         return self.calls_path.read_text(encoding="utf8").splitlines()
 
 
+def load_yaml(path: Path) -> dict:
+    import yaml
+    from test_classifier_ci_contract import WorkflowLoader  # noqa: E402  keeps "on" a string key
+    return yaml.load(path.read_text(encoding="utf8"), Loader=WorkflowLoader)
+
+
 class MergeGatePollerTest(unittest.TestCase):
     maxDiff = None
 
@@ -573,6 +579,15 @@ class MergeGatePollerTest(unittest.TestCase):
         )
         completed = self.run_gate(fake, GATE_RUN_STARTED_AT=self.GATE_START)
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+
+    def test_every_gate_event_can_start_the_checks_it_waits_for(self) -> None:
+        # The gate waits for a newer run instead of trusting an earlier failure,
+        # so each event that starts the gate must also start the gated workflows.
+        gate_types = set(self.workflow["on"]["pull_request"]["types"])
+        for name in ("core-checks.yml", "ci.yml"):
+            other = load_yaml(REPO_ROOT / ".github" / "workflows" / name)
+            types = set(other["on"]["pull_request"].get("types", ["opened", "synchronize", "reopened"]))
+            self.assertEqual(gate_types - types, set(), f"{name} misses events that start the Required Merge Gate")
 
     def test_the_workflow_token_can_read_its_run_start(self) -> None:
         # Get a workflow run attempt needs Actions: read; without it the lookup
