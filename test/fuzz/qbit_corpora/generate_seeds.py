@@ -650,6 +650,268 @@ def mlkem_cases() -> list[dict]:
     ]
 
 
+# --- pq_records ---------------------------------------------------------------
+
+PQ_VECTORS = CORPORA_DIR.parents[2] / "src" / "test" / "data" / "pq_transport_vectors.json"
+PQ_MLKEM1024 = 0xF0
+
+
+def compact_size(n: int) -> bytes:
+    if n < 0xFD:
+        return bytes([n])
+    if n <= 0xFFFF:
+        return b"\xfd" + n.to_bytes(2, "little")
+    if n <= 0xFFFFFFFF:
+        return b"\xfe" + n.to_bytes(4, "little")
+    return b"\xff" + n.to_bytes(8, "little")
+
+
+def pq_record(header: int, payload: bytes) -> bytes:
+    """A version-contents record: CompactSize(1 + len(payload)) || header || payload."""
+    return compact_size(1 + len(payload)) + bytes([header]) + payload
+
+
+def pq_records_cases() -> list[dict]:
+    vectors = json.loads(PQ_VECTORS.read_text(encoding="utf-8"))["vectors"]
+    ordinary, extra = vectors[0], vectors[2]
+    offer = pq_record(PQ_MLKEM1024, bytes.fromhex(ordinary["ek"]))
+    accept = pq_record(PQ_MLKEM1024, bytes.fromhex(ordinary["ct"]))
+    unknown = pq_record(0xF1, b"qbit")
+    minimal_unknown = pq_record(0x01, b"") * 1000
+    return [
+        case("offer", "raw", offer,
+             "The ordinary offer of vector 0 of src/test/data/pq_transport_vectors.json: fd 21 06 f0 || ek."),
+        case("accept", "raw", accept, "The ordinary accept of vector 0: fd 21 06 f0 || ct."),
+        case("offer-duplicate-unknown", "raw", bytes.fromhex(extra["contents_responder"]),
+             "Vector 2's responder contents: its offer, a second valid offer and an unknown 0xf1 record. The first wins."),
+        case("unknown-then-accept", "raw", bytes.fromhex(extra["contents_initiator"]),
+             "Vector 2's initiator contents: an unknown 0x01 record, then the accept."),
+        case("reserved-and-unknown-headers", "raw", pq_record(0x00, b"") + pq_record(0xF1, b"\xaa") + pq_record(0xFF, b""),
+             "Valid grammar without an own record: no features."),
+        case("empty-own-record", "raw", pq_record(PQ_MLKEM1024, b""),
+             "An own record with an empty payload: parses, and fails the role's length check later."),
+        case("short-offer", "raw", pq_record(PQ_MLKEM1024, bytes.fromhex(ordinary["ek"])[:-1]),
+             "A 1,567-byte own payload (ek_length or ct_length)."),
+        case("long-offer", "raw", pq_record(PQ_MLKEM1024, bytes.fromhex(ordinary["ek"]) + b"\x00"),
+             "A 1,569-byte own payload (ek_length or ct_length)."),
+        case("malformed-first-then-offer", "raw", pq_record(PQ_MLKEM1024, b"\xaa\xbb") + offer,
+             "A malformed first own record before a valid one: the first wins."),
+        case("offer-trailing-byte", "raw", offer + b"\xfd",
+             "A valid offer followed by a truncated CompactSize: invalid grammar, no features."),
+        case("zero-length", "raw", unknown + b"\x00", "A record with len = 0 after a valid one: invalid grammar."),
+        case("one-past-end", "raw", b"\x03\xf0\xaa",
+             "A length one byte past the end of the contents: invalid grammar."),
+        case("truncated-wide-length", "raw", b"\x02\x01\xaa\xfe\x00\x00",
+             "A valid record, then a 0xfe CompactSize cut off after two of its four bytes: invalid grammar."),
+        case("non-canonical-length", "raw", b"\xfd\x02\x00\xf0\xaa",
+             "Length 2 in a 3-byte CompactSize: invalid grammar."),
+        case("oversized-length", "raw", b"\xfe\x01\x00\x00\x02\xf0\xaa",
+             "Length MAX_SIZE + 1 (0x02000001), which ReadCompactSize rejects: invalid grammar."),
+        case("minimal-unknown-records", "raw", minimal_unknown + b"\x05",
+             "1,000 one-byte unknown records ending in a truncated one: invalid grammar after a long valid prefix."),
+    ]
+
+
+# --- p2p_transport_bidirectional_v2, p2p_transport_bidirectional_v1v2 ---------
+
+SECP256K1_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+V2_MAX_GARBAGE_LEN = 4095
+PQ_MODES = {"off": 0, "negotiate": 1, "fallback": 2}
+# A responder never falls back, so the harness picks its mode from the first two only.
+PQ_RESPONDER_MODES = 2
+SIMULATION_MAX_MESSAGE = 75000
+SIMULATION_ACTIONS = 6
+
+
+def transport_key(label: str) -> bytes:
+    key = hashlib.sha256(f"qbit fuzz seed key/{label}".encode()).digest()
+    assert 0 < int.from_bytes(key, "big") < SECP256K1_ORDER
+    return key
+
+
+def v2_transport_side(enc: FdpEncoder, label: str, garbage_len: int, mode: str, initiator: bool) -> None:
+    """MakeV2Transport: key, compression flag, garbage, ellswift entropy, PQ mode and ML-KEM seed."""
+    enc.raw(transport_key(label))
+    enc.boolean(True)
+    enc.integral(garbage_len, SIZE_T, 0, V2_MAX_GARBAGE_LEN)
+    if garbage_len <= 64:
+        enc.raw(pattern(garbage_len, 0x31))
+    enc.raw(hashlib.sha256(f"qbit fuzz seed ent/{label}".encode()).digest())
+    if not initiator and PQ_MODES[mode] >= PQ_RESPONDER_MODES:
+        raise ValueError(f"{label}: a responder cannot be in {mode} mode")
+    enc.pick(PQ_MODES[mode], len(PQ_MODES) if initiator else PQ_RESPONDER_MODES)
+    enc.raw(hashlib.sha256(f"qbit fuzz seed mlkem/{label}".encode()).digest())
+
+
+def transport_v2_input(name: str, initiator: tuple[int, str], responder: tuple[int, str], tail: int) -> bytes:
+    enc = FdpEncoder()
+    enc.integral(int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "big"), UINT64)
+    v2_transport_side(enc, f"{name}/initiator", *initiator, initiator=True)
+    v2_transport_side(enc, f"{name}/responder", *responder, initiator=False)
+    # Both sides' first message ("version") sizes.
+    enc.integral(1000, UINT32, 0, SIMULATION_MAX_MESSAGE)
+    enc.integral(200, UINT32, 0, SIMULATION_MAX_MESSAGE)
+    # Further bytes drive the interleaving loop from the back; the final flush completes the rest.
+    enc.raw(pattern(tail, 0x47))
+    return enc.build()
+
+
+def transport_v2_cases() -> list[dict]:
+    flush = "the final flush completes the handshake"
+    loop = "a fixed 48-byte pattern drives the interleaving loop, then the final flush completes the handshake"
+    cases = [
+        ("negotiate-both", (0, "negotiate"), (0, "negotiate"), 0,
+         f"Both sides negotiate, no garbage; {flush}: hybrid keys, confirmed both ways."),
+        ("negotiate-both-max-garbage", (V2_MAX_GARBAGE_LEN, "negotiate"), (V2_MAX_GARBAGE_LEN, "negotiate"), 0,
+         f"Both sides negotiate with 4,095 bytes of garbage each, so the held version packet's AAD is the longest; {flush}."),
+        ("negotiate-both-interleaved", (64, "negotiate"), (17, "negotiate"), 48,
+         f"Both sides negotiate, 64 and 17 bytes of garbage; {loop}: hybrid."),
+        ("negotiate-both-interleaved-long-garbage", (1000, "negotiate"), (64, "negotiate"), 48,
+         f"Both sides negotiate, 1,000 and 64 bytes of garbage; {loop}: hybrid."),
+        ("initiator-negotiates-responder-off", (0, "negotiate"), (0, "off"), 0,
+         f"The initiator holds its version packet for an empty one; {flush}: legacy_peer, ECDH keys."),
+        ("initiator-negotiates-responder-off-interleaved", (64, "negotiate"), (5, "off"), 48,
+         f"The initiator negotiates, the responder is off; {loop}: ECDH keys."),
+        ("initiator-off-responder-offers", (0, "off"), (0, "negotiate"), 0,
+         f"The responder offers to an initiator that is off and ignores it; {flush}: ECDH keys."),
+        ("initiator-off-responder-offers-interleaved", (33, "off"), (64, "negotiate"), 48,
+         f"The responder offers to an initiator that is off; {loop}: ECDH keys."),
+        ("initiator-fallback-responder-offers", (0, "fallback"), (0, "negotiate"), 0,
+         f"An initiator in fallback sends plain v2 and never parses the offer; {flush}: ECDH keys."),
+        ("both-off", (0, "off"), (0, "off"), 0, f"Today's v2 on both sides; {flush}."),
+        ("both-off-interleaved", (64, "off"), (64, "off"), 48, f"Today's v2 on both sides; {loop}."),
+        ("initiator-fallback-responder-off", (2, "fallback"), (3, "off"), 0, f"Plain v2 on both sides; {flush}."),
+        ("initiator-fallback-responder-offers-interleaved", (64, "fallback"), (17, "negotiate"), 48,
+         f"An initiator in fallback never parses the offer; {loop}: ECDH keys."),
+    ]
+    return [case(name, "fdp", transport_v2_input(name, initiator, responder, tail), semantics)
+            for name, initiator, responder, tail, semantics in cases]
+
+
+def transport_v1v2_input(name: str, responder: tuple[int, str], v1_message: bool) -> bytes:
+    enc = FdpEncoder()
+    enc.integral(int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "big"), UINT64)
+    v2_transport_side(enc, f"{name}/responder", *responder, initiator=False)
+    enc.integral(500, UINT32, 0, SIMULATION_MAX_MESSAGE)
+    enc.integral(300, UINT32, 0, SIMULATION_MAX_MESSAGE)
+    if v1_message:
+        # One loop step: the v1 initiator takes its version message (the next message's type index
+        # and size are drawn when it is queued); the final flush delivers it.
+        enc.pick(0, SIMULATION_ACTIONS)
+        enc.integral(0, UINT8)
+        enc.integral(100, UINT32, 0, SIMULATION_MAX_MESSAGE)
+    return enc.build()
+
+
+def transport_v1v2_cases() -> list[dict]:
+    return [
+        case("v1-version-to-negotiating-responder", "fdp", transport_v1v2_input("v1-negotiate", (0, "negotiate"), True),
+             "A v1 initiator's version message reaches a responder with the negotiation on: v1 detected, no key "
+             "generated."),
+        case("v1-version-to-off-responder", "fdp", transport_v1v2_input("v1-off", (64, "off"), True),
+             "A v1 initiator's version message reaches a responder with the negotiation off: v1 detected."),
+        case("v1-version-to-negotiating-responder-max-garbage", "fdp",
+             transport_v1v2_input("v1-negotiate-max-garbage", (V2_MAX_GARBAGE_LEN, "negotiate"), True),
+             "A v1 initiator's version message reaches a negotiating responder configured with 4,095 bytes of garbage, "
+             "which it never sends: v1 detected."),
+        case("v1-silent-negotiating-responder", "fdp", transport_v1v2_input("v1-silent", (0, "negotiate"), False),
+             "A v1 initiator that sends nothing: the negotiating responder stays undecided and sends nothing."),
+    ]
+
+
+# --- p2p_v2_pq_malicious_peer ---------------------------------------------------
+
+# The harness's steps, in its CallOneOf order, and the range of each step's parameter.
+MALPEER_STEPS = {
+    "key": None, "terminator": None, "decoy": (UINT8, 0, 3), "version": (UINT8, 0, 9),
+    "confirmation": (UINT8, 0, 4), "application": (UINT8, 0, 3), "deliver": (UINT32, 1, 1 << 16),
+    "collect": (UINT32, 1, 1 << 16), "flush": None, "queue": (UINT8, 0, 3), "raw": (UINT8, 1, 64),
+    "disconnect": None,
+}
+MALPEER_INITIATOR_MODES = {"off": 0, "negotiate": 1, "fallback": 2}
+MALPEER_RESPONDER_MODES = {"off": 0, "negotiate": 1}
+
+
+def malpeer_input(name: str, test_initiator: bool, mode: str, steps: list, garbage: tuple[int, int] = (0, 0)) -> bytes:
+    """The tested transport's role and mode, both keys, both garbage lengths, a seed, then the steps."""
+    enc = FdpEncoder()
+    modes = MALPEER_INITIATOR_MODES if test_initiator else MALPEER_RESPONDER_MODES
+    enc.integral((modes[mode] << 1) | int(test_initiator), UINT8)
+    enc.raw(transport_key(f"{name}/transport"))
+    enc.raw(transport_key(f"{name}/peer"))
+    enc.integral(garbage[0], UINT16, 0, V2_MAX_GARBAGE_LEN)
+    enc.integral(garbage[1], UINT16, 0, V2_MAX_GARBAGE_LEN)
+    enc.integral(int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "big"), UINT64)
+    names = list(MALPEER_STEPS)
+    for step in steps:
+        step_name, param = (step, None) if isinstance(step, str) else step
+        enc.pick(names.index(step_name), len(names))
+        spec = MALPEER_STEPS[step_name]
+        if spec is not None:
+            type_name, lo, hi = spec
+            enc.integral(param, type_name, lo, hi)
+    return enc.build()
+
+
+def malpeer_cases() -> list[dict]:
+    # Version variants (see SendVersion): as responder 5, 6 and 9 are honest offers, 3 a key that
+    # fails the modulus check, 8 a 1,567-byte key; as initiator 5 and 6 are honest accepts after
+    # which we switch, 3 a blind ciphertext, 4 a damaged one, 7 an honest accept without our
+    # switch, 8 a 1,569-byte ciphertext. Confirmation variants: 0 honest, 1 nonzero length, 2 not
+    # a decoy, 4 damaged tag.
+    as_responder = ["flush", "key", "terminator"]       # the transport initiates
+    as_initiator = ["key", "flush", "terminator"]       # the transport responds and offers
+    finish = [("confirmation", 0), ("application", 0), ("queue", 0), "flush"]
+    cases = [
+        ("initiator-hybrid", True, "negotiate", as_responder + [("version", 5), "flush"] + finish, (0, 0),
+         "The transport initiates; we offer honestly and switch on its accept: hybrid, confirmed, messages both ways."),
+        ("responder-hybrid", False, "negotiate", as_initiator + [("version", 5), "flush"] + finish, (0, 0),
+         "The transport offers; we accept honestly and switch: hybrid, confirmed, messages both ways."),
+        ("initiator-hybrid-extras-fragmented", True, "negotiate",
+         as_responder + [("decoy", 1), ("decoy", 2), ("version", 6)] + [("deliver", 97)] * 40 +
+         ["flush", ("confirmation", 0), ("decoy", 0), ("application", 1)] + [("deliver", 1)] * 30 +
+         [("collect", 5), ("queue", 1), "flush"], (V2_MAX_GARBAGE_LEN, V2_MAX_GARBAGE_LEN),
+         "Maximum garbage both ways, own records inside decoys, an offer between unknown and duplicate records, "
+         "delivered in 97-byte and then 1-byte pieces: hybrid."),
+        ("responder-hybrid-extras", False, "negotiate",
+         as_initiator + [("decoy", 0), ("decoy", 1), ("version", 6), ("collect", 3), "flush"] + finish,
+         (V2_MAX_GARBAGE_LEN, 17), "Decoys, then an accept between unknown and duplicate records: hybrid."),
+        ("initiator-ek-length", True, "negotiate", as_responder + [("version", 8), "flush"], (0, 0),
+         "A 1,567-byte offer: the transport closes with ek_length and never sends its version packet."),
+        ("initiator-ek-modulus", True, "negotiate", as_responder + [("version", 3), "flush"], (0, 0),
+         "An offer whose coefficients are all above q: the transport closes with ek_modulus."),
+        ("responder-ct-length", False, "negotiate", as_initiator + [("version", 8), "flush"], (0, 0),
+         "A 1,569-byte accept: the transport closes with ct_length."),
+        ("responder-corrupt-ct", False, "negotiate", as_initiator + [("version", 4), "flush"] + finish, (0, 0),
+         "An accept with one ciphertext bit flipped: the transport switches to other keys and our confirmation fails."),
+        ("responder-disconnect-after-offer", False, "negotiate", as_initiator + ["disconnect"], (0, 0),
+         "The transport offers and we disconnect before sending our version packet."),
+        ("initiator-confirmation-length", True, "negotiate",
+         as_responder + [("version", 5), "flush", ("confirmation", 1), "flush"], (0, 0),
+         "An honest exchange, then a nonzero-length first hybrid packet: the transport fails it at byte 3."),
+        ("initiator-confirmation-tag", True, "negotiate",
+         as_responder + [("version", 9), "flush", ("confirmation", 4), "flush"], (0, 0),
+         "An honest offer followed by a duplicate record, then a confirmation with a damaged header or tag."),
+        ("responder-confirmation-not-decoy", False, "negotiate",
+         as_initiator + [("version", 5), "flush", ("confirmation", 2), "flush"], (0, 0),
+         "An honest exchange, then an empty first hybrid packet without the ignore bit."),
+        ("responder-legacy-peer-burst", False, "negotiate",
+         as_initiator + [("version", 0), ("application", 0), ("application", 1), ("queue", 0), "flush"], (0, 64),
+         "We ignore the offer like a legacy peer and send application messages at once: plain v2, legacy_peer."),
+        ("initiator-fallback-ignores-offer", True, "fallback",
+         as_responder + ["flush", ("version", 5), ("application", 0), ("queue", 0), "flush"], (5, 5),
+         "An initiator in fallback sends plain v2 at once and never parses our offer: no ML-KEM operation."),
+        ("initiator-noncompliant-responder", True, "negotiate",
+         as_responder + [("version", 5), ("decoy", 2), "flush"], (0, 0),
+         "We offer and then send a decoy under the ECDH keys where our confirmation belongs: the transport fails it."),
+        ("responder-off-unsolicited-accept", False, "off",
+         as_initiator + [("version", 3), ("application", 0), ("queue", 2), "flush"], (0, 0),
+         "A responder that is off gets an accept-shaped record it never asked for: ignored, plain v2."),
+    ]
+    return [case(name, "fdp", malpeer_input(name, ti, mode, steps, garbage), semantics)
+            for name, ti, mode, steps, garbage, semantics in cases]
+
+
 def case(name: str, fmt: str, data: bytes, semantics: str) -> dict:
     return {"name": name, "format": fmt, "data": data, "semantics": semantics}
 
@@ -662,6 +924,10 @@ CASE_BUILDERS = {
     "mlkem": mlkem_cases,
     "mlkem_backend_diff": mlkem_cases,
     "p2mr_script": p2mr_cases,
+    "p2p_transport_bidirectional_v1v2": transport_v1v2_cases,
+    "p2p_transport_bidirectional_v2": transport_v2_cases,
+    "p2p_v2_pq_malicious_peer": malpeer_cases,
+    "pq_records": pq_records_cases,
     "pqc": pqc_cases,
 }
 
@@ -681,6 +947,7 @@ def build_all() -> tuple[dict, dict[str, list[dict]]]:
                                "is not 0xF, then the FuzzedDataProvider layout of the cached-fixture body.",
             "qbfx-v1-generation": "b'QBFX' + target tag + 0x01 + selector whose low nibble is 0xF, then the legacy "
                                   "FuzzedDataProvider layout.",
+            "raw": "The whole input is the data the target parses, without a FuzzedDataProvider layout.",
         },
         "targets": {
             target: [
