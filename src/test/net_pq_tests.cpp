@@ -49,8 +49,20 @@ namespace {
 class NoMessages final : public NetEventsInterface
 {
 public:
+    //! Nodes deleted, and of those, the ones deleted unfinalized or still holding hybrid secrets.
+    int m_deleted{0};
+    int m_deleted_unfinalized{0};
+    int m_deleted_with_secrets{0};
+
     void InitializeNode(const CNode&, ServiceFlags) override {}
-    void FinalizeNode(const CNode&) override {}
+    //! CConnman calls this right before it deletes the node.
+    void FinalizeNode(const CNode& node) override
+    {
+        ++m_deleted;
+        if (!node.m_pq_finalized) ++m_deleted_unfinalized;
+        const auto* transport{dynamic_cast<const V2Transport*>(node.m_transport.get())};
+        if (transport && transport->HoldsHybridSecretsForTesting()) ++m_deleted_with_secrets;
+    }
     bool HasAllDesirableServiceFlags(ServiceFlags) const override { return true; }
     bool HasUndesirableServiceFlags(ServiceFlags) const override { return false; }
     bool ProcessMessages(CNode*, std::atomic<bool>&) override EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex) { return false; }
@@ -1193,6 +1205,41 @@ BOOST_AUTO_TEST_CASE(pq_finalization_wipes)
         link.node->Release();
         Disconnect();
     }
+}
+
+BOOST_AUTO_TEST_CASE(pq_shutdown_finalizes)
+{
+    // Shutdown deletes the connections it still holds itself, without DisconnectNodes(). It
+    // finalizes them first: no node is deleted holding hybrid secrets, but a shutdown close is
+    // our own decision, so nothing is recorded, as with the network off.
+    Link inbound{Add(ConnectionType::INBOUND)}; // its offer is pending: decapsulation key and ECDH secret
+    Receive(inbound, InitiatorKey());
+    Pass(inbound);
+    BOOST_REQUIRE(inbound.node->m_transport->GetPQSnapshot().offer == PQOfferState::SENT);
+    Link outbound{Add(ConnectionType::OUTBOUND_FULL_RELAY)}; // awaiting the version: the ECDH secret
+    Pass(outbound);
+    Receive(outbound, InitiatorKey());
+    Pass(outbound);
+    Link hybrid{Add(ConnectionType::MANUAL)};
+    V2Transport peer{Responder()};
+    Exchange(hybrid, peer);
+    BOOST_REQUIRE(hybrid.node->m_transport->GetPQSnapshot().confirmed);
+    for (const Link& link : {inbound, outbound}) {
+        BOOST_REQUIRE(dynamic_cast<const V2Transport&>(*link.node->m_transport).HoldsHybridSecretsForTesting());
+    }
+    const PQTransportStats before{Stats()};
+    const int deleted{m_events.m_deleted};
+    m_connman.Stop();
+    BOOST_CHECK_EQUAL(m_events.m_deleted - deleted, 3);
+    BOOST_CHECK_EQUAL(m_events.m_deleted_with_secrets, 0);
+    BOOST_CHECK_EQUAL(m_events.m_deleted_unfinalized, 0);
+    // No outcome: the pending offer isn't abandoned, and no ring entry is added.
+    const PQTransportStats after{Stats()};
+    BOOST_CHECK_EQUAL(after.inbound.abandoned, before.inbound.abandoned);
+    BOOST_CHECK_EQUAL(after.inbound.switched, before.inbound.switched);
+    BOOST_CHECK_EQUAL(after.outbound.switched, before.outbound.switched);
+    BOOST_CHECK_EQUAL(after.inbound_failures.last_sequence, before.inbound_failures.last_sequence);
+    BOOST_CHECK_EQUAL(after.outbound_failures.last_sequence, before.outbound_failures.last_sequence);
 }
 
 BOOST_AUTO_TEST_CASE(pq_fallback_threshold)

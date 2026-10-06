@@ -1460,8 +1460,8 @@ public:
     bool Start(CScheduler& scheduler, const Options& options) EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !m_added_nodes_mutex, !m_addr_fetches_mutex, !mutexMsgProc, !m_pq_shed_mutex);
 
     void StopThreads();
-    void StopNodes();
-    void Stop()
+    void StopNodes() EXCLUSIVE_LOCKS_REQUIRED(!m_pq_mutex);
+    void Stop() EXCLUSIVE_LOCKS_REQUIRED(!m_pq_mutex)
     {
         StopThreads();
         StopNodes();
@@ -2055,13 +2055,15 @@ private:
      * hands the node to the disconnected pool: that derives closed_after_switch and abandoned
      * from the close cause, marks the node finalized so no later observation counts anything,
      * and wipes the transport's pending secrets. With the network off, every close is our own
-     * decision, so nothing is recorded, but finalization still wipes.
+     * decision, so nothing is recorded, but finalization still wipes. StopNodes() finalizes the
+     * connections it deletes at shutdown the same way, with record_outcomes false: shutdown
+     * closes are our own too.
      *
      * The transport is snapshotted under its own lock, which is released before m_pq_mutex is
      * taken; nothing calls into the transport, socket, peer manager or node enumeration while
      * holding m_pq_mutex.
      */
-    void ObservePQ(CNode& node, bool finalizing) EXCLUSIVE_LOCKS_REQUIRED(!m_pq_mutex);
+    void ObservePQ(CNode& node, bool finalizing, bool record_outcomes = true) EXCLUSIVE_LOCKS_REQUIRED(!m_pq_mutex);
 
     /** Count each event of snapshot not yet accounted for node, once, add a ring entry for each
      *  non-success outcome, and update the endpoint history. Returns what to log. */
