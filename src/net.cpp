@@ -555,7 +555,7 @@ CNode* CConnman::ConnectNode(CAddress addrConnect, const char *pszDest, bool fCo
                                     .recv_flood_size = nReceiveFloodSize,
                                     .use_v2transport = use_v2transport,
                                     .is_archive_connection = is_archive_connection,
-                                    .pq = {.mode = pq_mode},
+                                    .pq = {.mode = pq_mode, .corrupt_shared_secret = m_pq_config.fail_first_packet},
                                     .pq_endpoint = std::move(pq_endpoint),
                                 });
         pnode->AddRef();
@@ -2177,7 +2177,9 @@ void CConnman::CreateNodeFromAcceptedSocket(std::unique_ptr<Sock>&& sock,
                                  .prefer_evict = discouraged,
                                  .recv_flood_size = nReceiveFloodSize,
                                  .use_v2transport = use_v2transport,
-                                 .pq = {.mode = m_pq_mode, .offer_gate = {.allow = &CConnman::AllowPQOffer, .context = this}},
+                                 .pq = {.mode = m_pq_mode,
+                                        .corrupt_shared_secret = m_pq_config.fail_first_packet,
+                                        .offer_gate = {.allow = &CConnman::AllowPQOffer, .context = this}},
                                  // The actual remote address and source port.
                                  .pq_endpoint = addr,
                              });
@@ -2602,9 +2604,12 @@ void CConnman::LogPQOutcome(const CNode& node, const PQLogLine& line) const
 void CConnman::LogPQLocalFault() const
 {
     const auto backends{mlkem::GetBackendNames()};
+    // -mlkemportable is the remedy only while native code runs.
+    const bool native{backends.arith != "portable" || backends.keccak != "portable"};
     LogWarning("v2 pq: local_fault arith=%s keccak=%s: hybrid handshakes failed with %u distinct endpoints and none succeeded "
-               "since startup, so this node's own ML-KEM code may be at fault.",
-               backends.arith, backends.keccak, PQ_LOCAL_FAULT_THRESHOLD);
+               "since startup, so this node's own ML-KEM code may be at fault.%s",
+               backends.arith, backends.keccak, PQ_LOCAL_FAULT_THRESHOLD,
+               native ? " Restart with -mlkemportable to use the portable implementation." : "");
 }
 
 PQTransportStats CConnman::GetPQTransportStats() const
@@ -4616,10 +4621,10 @@ ServiceFlags CConnman::GetLocalServices() const
     return m_local_services;
 }
 
-static std::unique_ptr<Transport> MakeTransport(NodeId id, bool use_v2transport, bool inbound, const V2PQOptions& pq) noexcept
+static std::unique_ptr<Transport> MakeTransport(NodeId id, const CNodeOptions& options, bool inbound) noexcept
 {
-    if (use_v2transport) {
-        return std::make_unique<V2Transport>(id, /*initiating=*/!inbound, pq);
+    if (options.use_v2transport) {
+        return std::make_unique<V2Transport>(id, /*initiating=*/!inbound, options.pq);
     } else {
         return std::make_unique<V1Transport>(id);
     }
@@ -4635,7 +4640,7 @@ CNode::CNode(NodeId idIn,
              ConnectionType conn_type_in,
              bool inbound_onion,
              CNodeOptions&& node_opts)
-    : m_transport{MakeTransport(idIn, node_opts.use_v2transport, conn_type_in == ConnectionType::INBOUND, node_opts.pq)},
+    : m_transport{MakeTransport(idIn, node_opts, conn_type_in == ConnectionType::INBOUND)},
       m_permission_flags{node_opts.permission_flags},
       m_sock{sock},
       m_connected{GetTime<std::chrono::seconds>()},

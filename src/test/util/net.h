@@ -106,8 +106,6 @@ struct ConnmanTestMsg : public CConnman {
         DisconnectNodes();
     }
 
-    void SetPQMode(PQMode mode) { m_pq_mode = mode; }
-
     /** How many distinct failing endpoints the local-fault warning has counted. */
     size_t PQLocalFaultEndpoints() const EXCLUSIVE_LOCKS_REQUIRED(!m_pq_mutex)
     {

@@ -269,7 +269,6 @@ struct PQNetSetup : public RegTestingSetup {
         static_assert(PQ_FAILURE_THRESHOLD == 3);
         InitConnman();
         m_connman.SetPeerConnectTimeout(60s);
-        m_connman.SetPQMode(PQMode::NEGOTIATE);
         SetMockTime(GetTime<std::chrono::seconds>());
         MockableSteadyClock::SetMockTime(STEADY_START);
     }
@@ -284,13 +283,16 @@ struct PQNetSetup : public RegTestingSetup {
     //! Where the mocked steady clock, which drives load shedding, starts.
     static constexpr std::chrono::seconds STEADY_START{3600};
 
-    /** Init() with room for inbound peers, v2 accepted, and the given load shedding threshold. */
-    void InitConnman(uint64_t shed_threshold = DEFAULT_PQ_SHED_THRESHOLD_PER_S)
+    /** Init() with room for inbound peers, v2 accepted, the given load shedding threshold, and
+     *  the given hybrid transport configuration: on by default. */
+    void InitConnman(uint64_t shed_threshold = DEFAULT_PQ_SHED_THRESHOLD_PER_S,
+                     PQTransportConfig pq = {.v2_enabled = true, .pq_requested = true})
     {
         CConnman::Options options;
         options.m_max_automatic_connections = DEFAULT_MAX_PEER_CONNECTIONS;
         options.m_local_services = NODE_P2P_V2;
         options.pq_shed_threshold_per_s = shed_threshold;
+        options.m_pq = pq;
         m_connman.Init(options);
         m_connman.SetMsgProc(&m_events);
     }
@@ -1442,13 +1444,15 @@ BOOST_AUTO_TEST_CASE(pq_history_eviction)
 }
 
 namespace {
-/** The warning names the backends that ran, and no remedy: no option forces portable code yet. */
+/** The warning names the backends that ran, and -mlkemportable as the remedy while native code runs. */
 std::string LocalFaultLine()
 {
     const auto backends{mlkem::GetBackendNames()};
+    const bool native{backends.arith != "portable" || backends.keccak != "portable"};
     return strprintf("v2 pq: local_fault arith=%s keccak=%s: hybrid handshakes failed with 8 distinct endpoints and none succeeded "
-                     "since startup, so this node's own ML-KEM code may be at fault.",
-                     backends.arith, backends.keccak);
+                     "since startup, so this node's own ML-KEM code may be at fault.%s",
+                     backends.arith, backends.keccak,
+                     native ? " Restart with -mlkemportable to use the portable implementation." : "");
 }
 } // namespace
 
@@ -1481,6 +1485,8 @@ BOOST_AUTO_TEST_CASE(pq_local_fault_warning_portable)
     BOOST_CHECK_EQUAL(mlkem::GetBackendNames().arith, "portable");
     const std::string text{LocalFaultLine()};
     BOOST_CHECK(text.find("arith=portable keccak=portable:") != std::string::npos);
+    // Portable code already runs: no remedy to name.
+    BOOST_CHECK(text.find("-mlkemportable") == std::string::npos);
     LogLineCounter warnings{"v2 pq: local_fault"};
     {
         DebugLogHelper expect{text, AtLevel({text}, LineLevel::WARNING)};
@@ -1656,8 +1662,7 @@ BOOST_AUTO_TEST_CASE(pq_load_shedding)
 BOOST_AUTO_TEST_CASE(pq_load_shedding_off)
 {
     // With the switch off, inbound transports never ask the gate: nothing is counted or shed.
-    InitConnman(/*shed_threshold=*/1);
-    m_connman.SetPQMode(PQMode::OFF);
+    InitConnman(/*shed_threshold=*/1, {.v2_enabled = true, .pq_requested = false});
     for (int i{0}; i < 5; ++i) {
         Link link{Accept()};
         Receive(link, InitiatorKey());
@@ -1754,6 +1759,45 @@ BOOST_AUTO_TEST_CASE(pq_load_shedding_socket_thread)
     m_connman.StopSocketHandlerThread();
     BOOST_CHECK(!Stats().load_shedding.active);
     BOOST_CHECK_EQUAL(stopped.m_count, 1);
+}
+
+BOOST_AUTO_TEST_CASE(pq_config)
+{
+    // Init() takes the negotiation of new connections, inbound and outbound, from the
+    // configuration: on only with both switches on.
+    const auto create_sock_orig{CreateSock};
+    CreateSock = [](int, int, int) -> std::unique_ptr<Sock> { return std::make_unique<ZeroSock>(); };
+    for (const auto& [config, enabled] : std::vector<std::pair<PQTransportConfig, bool>>{
+             {{.v2_enabled = false, .pq_requested = true}, false},
+             {{.v2_enabled = true, .pq_requested = false}, false},
+             {{.v2_enabled = true, .pq_requested = true}, true},
+         }) {
+        BOOST_CHECK_EQUAL(config.Enabled(), enabled);
+        InitConnman(DEFAULT_PQ_SHED_THRESHOLD_PER_S, config);
+        Link inbound{Accept()};
+        V2Transport peer{Initiator()};
+        Exchange(inbound, peer);
+        const Transport::Info info{inbound.node->m_transport->GetInfo()};
+        BOOST_CHECK_EQUAL(info.transport_pq, enabled);
+        BOOST_CHECK(info.transport_pq_status == (enabled ? PQStatus::HYBRID : PQStatus::OFF));
+        const std::unique_ptr<CNode> outbound{m_connman.ConnectNodeOnly("5.6.7.8:18555", ConnectionType::MANUAL, /*use_v2transport=*/true)};
+        BOOST_REQUIRE(outbound);
+        BOOST_CHECK(outbound->m_transport->GetInfo().transport_pq_status == (enabled ? PQStatus::PENDING : PQStatus::OFF));
+    }
+
+    // -test=pq_fail_first_packet corrupts this side's shared secret, so its check of the peer's key
+    // confirmation fails (and it closes before its own confirmation is sent).
+    InitConnman(DEFAULT_PQ_SHED_THRESHOLD_PER_S, {.v2_enabled = true, .pq_requested = true, .fail_first_packet = true});
+    Link inbound{Accept()};
+    V2Transport peer{Initiator()};
+    Exchange(inbound, peer);
+    const PQHandshake::Snapshot ours{inbound.node->m_transport->GetPQSnapshot()};
+    BOOST_CHECK(ours.switched);
+    BOOST_CHECK(!ours.confirmed);
+    BOOST_CHECK(ours.failure == PQFailure::CONFIRM_LENGTH || ours.failure == PQFailure::CONFIRM_TAG);
+    BOOST_CHECK(inbound.node->fDisconnect);
+    BOOST_CHECK(peer.GetPQSnapshot().switched);
+    CreateSock = create_sock_orig;
 }
 
 BOOST_AUTO_TEST_SUITE_END()
