@@ -2291,9 +2291,13 @@ BOOST_AUTO_TEST_CASE(v2_pq_pair)
         {
             V2TransportTester tester(m_rng, test_initiator, PQ_ON);
             auto& transport{tester.GetTransport()};
+            // Pending from the start of the handshake.
+            CheckPQ(transport, PQStatus::PENDING);
+            BOOST_CHECK(!transport.GetPQSnapshot().version_received);
             const uint256 ecdh_session_id{HybridHandshake(tester, test_initiator, /*send_confirmation=*/false)};
 
-            // Switched, not confirmed: pending, still detecting, and no session id.
+            // Switched, not confirmed: pending, still detecting, and no session id. The switch
+            // wiped the decapsulation key and the retained ECDH secret.
             auto info{transport.GetInfo()};
             BOOST_CHECK(info.transport_type == TransportProtocolType::DETECTING);
             BOOST_CHECK(!info.session_id);
@@ -2301,6 +2305,7 @@ BOOST_AUTO_TEST_CASE(v2_pq_pair)
             auto snapshot{transport.GetPQSnapshot()};
             BOOST_CHECK(snapshot.version_received && snapshot.switched && !snapshot.confirmed);
             BOOST_CHECK(snapshot.offer == (test_initiator ? PQOfferState::RECEIVED : PQOfferState::SENT));
+            BOOST_CHECK(!transport.HoldsHybridSecretsForTesting());
 
             // The transport sends application messages without waiting for our confirmation.
             const auto msg_data_1{m_rng.randbytes<uint8_t>(m_rng.randrange(100000))};
@@ -2355,6 +2360,10 @@ BOOST_AUTO_TEST_CASE(v2_pq_legacy_matrix)
                         tester.SendMessage(uint8_t(14), burst_1); // inv short id
                         tester.SendMessage("foobar", burst_2);
                     };
+                    // Until the peer's version packet is processed, the negotiation is pending.
+                    const PQStatus initial_status{local == PQMode::OFF ? PQStatus::OFF :
+                                                  local == PQMode::FALLBACK ? PQStatus::FALLBACK : PQStatus::PENDING};
+                    CheckPQ(transport, initial_status);
 
                     if (test_initiator) {
                         auto ret{tester.Interact()};
@@ -2368,6 +2377,13 @@ BOOST_AUTO_TEST_CASE(v2_pq_legacy_matrix)
                     }
                     tester.ReceiveKey(/*retain_for_hybrid=*/peer_hybrid);
                     tester.SendGarbageTerm();
+                    // After the key exchange, before the peer's version packet: still pending, and
+                    // only the negotiation holds secrets for the switch.
+                    auto ret{tester.Interact()};
+                    BOOST_REQUIRE(ret && ret->empty());
+                    CheckPQ(transport, initial_status);
+                    BOOST_CHECK(!transport.GetPQSnapshot().version_received);
+                    BOOST_CHECK_EQUAL(transport.HoldsHybridSecretsForTesting(), local == PQMode::NEGOTIATE);
                     if (!peer_hybrid) {
                         tester.SendVersion();
                         send_burst();
@@ -2375,7 +2391,7 @@ BOOST_AUTO_TEST_CASE(v2_pq_legacy_matrix)
                         // A hybrid responder offers at once.
                         tester.SendOffer();
                     }
-                    auto ret{tester.Interact()};
+                    ret = tester.Interact();
                     BOOST_REQUIRE(ret);
                     BOOST_CHECK_EQUAL(ret->size(), peer_hybrid ? 0U : 2U);
                     tester.ReceiveGarbage();
@@ -2424,6 +2440,8 @@ BOOST_AUTO_TEST_CASE(v2_pq_legacy_matrix)
                                           local == PQMode::FALLBACK ? PQStatus::FALLBACK :
                                           hybrid ? PQStatus::HYBRID : PQStatus::LEGACY_PEER};
                     CheckPQ(transport, status);
+                    // The switch and a legacy outcome both wiped what the switch needed.
+                    BOOST_CHECK(!transport.HoldsHybridSecretsForTesting());
 
                     // Off and fallback neither generate, parse nor validate anything; a responder
                     // never decapsulates without an accept.
@@ -2455,6 +2473,8 @@ BOOST_AUTO_TEST_CASE(v2_pq_legacy_matrix)
                 };
                 CheckPQ(initiator, expected(initiator_mode));
                 CheckPQ(responder, expected(responder_mode));
+                BOOST_CHECK(!initiator.HoldsHybridSecretsForTesting());
+                BOOST_CHECK(!responder.HoldsHybridSecretsForTesting());
             }
         }
     }
@@ -2903,8 +2923,9 @@ BOOST_AUTO_TEST_CASE(v2_pq_internal_errors)
         }
     }
 
-    // Decapsulation fails after the initiator committed to its accept: close. There is no failed
-    // status, so the closing connection reports pending.
+    // Decapsulation fails after the initiator committed to its accept: close at once, on the
+    // version packet, without queuing a confirmation. There is no failed status, so the closing
+    // connection reports pending.
     {
         V2TransportTester tester(m_rng, false, PQ_ON);
         auto& transport{tester.GetTransport()};
@@ -2915,9 +2936,10 @@ BOOST_AUTO_TEST_CASE(v2_pq_internal_errors)
         tester.SendGarbageTerm();
         tester.ReceiveGarbage();
         tester.AcceptOfferAndSwitch();
-        tester.SendConfirmation();
         InjectResultForTesting inject{Operation::DECAPS, upstream::ERR_FAIL};
-        BOOST_CHECK(!tester.Interact());
+        BOOST_CHECK(!tester.Deliver());
+        BOOST_CHECK(tester.ToSend().empty());
+        BOOST_CHECK(std::get<0>(transport.GetBytesToSend(false)).empty());
         const auto snapshot{transport.GetPQSnapshot()};
         BOOST_CHECK(snapshot.version_received && !snapshot.switched);
         CheckPQ(transport, PQStatus::PENDING, PQFailure::DECAPS_INTERNAL);
@@ -3012,6 +3034,56 @@ BOOST_AUTO_TEST_CASE(v2_pq_malformed_record)
             BOOST_CHECK_EQUAL(g_kem_calls.check, c.failure == PQFailure::EK_MODULUS ? 1 : 0);
             BOOST_CHECK_EQUAL(g_kem_calls.encaps + g_kem_calls.decaps, 0);
             BOOST_CHECK_EQUAL(g_kem_calls.keygen, c.test_initiator ? 0 : 1);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(v2_pq_close_wipes)
+{
+    // A close the transport detects before the peer's version packet authenticated (a missing
+    // garbage terminator, or a version packet that is too long or fails its tag) wipes the
+    // retained ECDH secret and a responder's decapsulation key at once.
+    enum class Close { GARBAGE_TERMINATOR, VERSION_LENGTH, VERSION_TAG };
+    for (const bool test_initiator : {true, false}) {
+        for (const Close close : {Close::GARBAGE_TERMINATOR, Close::VERSION_LENGTH, Close::VERSION_TAG}) {
+            BOOST_TEST_CONTEXT("test_initiator=" << test_initiator << " close=" << int(close))
+            {
+                V2TransportTester tester(m_rng, test_initiator, PQ_ON);
+                auto& transport{tester.GetTransport()};
+                if (test_initiator) tester.Collect();
+                tester.SendKey();
+                BOOST_REQUIRE(tester.Deliver());
+                tester.Collect();
+                tester.ReceiveKey();
+                if (close == Close::GARBAGE_TERMINATOR) {
+                    tester.SendGarbage(V2Transport::MAX_GARBAGE_LEN + BIP324Cipher::GARBAGE_TERMINATOR_LEN);
+                } else {
+                    tester.SendGarbage();
+                    tester.SendGarbageTerm();
+                    const size_t version_start{tester.ToSend().size()};
+                    if (close == Close::VERSION_LENGTH) {
+                        // Only the length of a version packet one byte over the maximum arrives.
+                        tester.SendVersion(std::vector<uint8_t>(4'000'014));
+                        tester.ToSend().resize(version_start + BIP324Cipher::LENGTH_LEN);
+                    } else {
+                        tester.SendVersion();
+                        tester.ToSend().back() ^= 1 << m_rng.randrange(8);
+                    }
+                }
+                // Nothing fails before the last byte, and the secrets for the switch are held.
+                const std::vector<uint8_t> last{tester.ToSend().back()};
+                tester.ToSend().pop_back();
+                BOOST_REQUIRE(tester.Deliver());
+                BOOST_CHECK(transport.HoldsHybridSecretsForTesting());
+                tester.Send(last);
+                BOOST_CHECK(!tester.Deliver());
+                BOOST_CHECK(!transport.HoldsHybridSecretsForTesting());
+                // No PQ failure: the close is the transport's, before the peer's version packet.
+                const auto snapshot{transport.GetPQSnapshot()};
+                BOOST_CHECK(!snapshot.version_received && !snapshot.switched);
+                BOOST_CHECK(snapshot.offer == (test_initiator ? PQOfferState::NONE : PQOfferState::SENT));
+                CheckPQ(transport, PQStatus::PENDING);
+            }
         }
     }
 }
