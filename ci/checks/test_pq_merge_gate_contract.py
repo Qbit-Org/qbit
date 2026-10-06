@@ -2,18 +2,20 @@
 # Copyright (c) 2026-present The qbit core developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or https://opensource.org/license/mit/.
-"""Contract for the aarch64 PQ job in Full Validation (#184 part 3, work item C3).
+"""Contract for the PQ unit jobs in Full Validation (#184 part 3, work item C3).
 
 Pull requests that touch the ML-KEM library, the v2 transport, or their build
-and CI wiring must pass the aarch64-unit job of ci-pq.yml before they merge;
-others skip it. These tests run the real pieces of that chain:
+and CI wiring must pass the aarch64-unit, macos-arm64-unit and
+macos-x86_64-unit jobs of ci-pq.yml before they merge; others skip all three.
+These tests run the real pieces of that chain:
 
 * ci/checks/classify_merge_profile.py, as the classify-changes job runs it,
-  reports pq_aarch64_required;
-* the pq-aarch64 job of ci.yml calls ci-pq.yml with jobs aarch64-unit on the
+  reports pq_unit_required;
+* the pq-unit job of ci.yml calls ci-pq.yml with those three jobs on the
   change's own commit (a pull request's merge commit) exactly when that output
-  is true, and ci-pq.yml's selection step then selects only aarch64-unit;
-* full-validation-gate's shell accepts a skipped job only when the classifier
+  is true, and ci-pq.yml then runs exactly those three, so one output and one
+  call make each of them required exactly when the others are;
+* full-validation-gate's shell accepts a skipped call only when the classifier
   says it is not required, and fails on a missing classifier output;
 * the changed-file lists that feed the classifier name both sides of a rename;
 * every CMake file, workflow or ci/ file that mentions ML-KEM classifies as
@@ -42,11 +44,15 @@ PQ_WORKFLOW = svc.WORKFLOW_DIR / "ci-pq.yml"
 GATE_WORKFLOW = svc.WORKFLOW_DIR / "required-merge-gate.yml"
 CLASSIFIER = REPO_ROOT / "ci" / "checks" / "classify_merge_profile.py"
 CLASSIFY_JOB = "classify-changes"
-PQ_JOB = "pq-aarch64"
+PQ_JOB = "pq-unit"
 GATE_JOB = "full-validation-gate"
 GATE_STEP = "Check validation results"
 AARCH64_JOB = "aarch64-unit"
-OUTPUT = "pq_aarch64_required"
+# The ci-pq.yml jobs Full Validation requires: matrix entries of its unit job,
+# and jobs of their own (the macOS ones), by the name the jobs input uses.
+REQUIRED_PQ_JOBS = [AARCH64_JOB, "macos-arm64-unit", "macos-x86_64-unit"]
+PQ_UNIT_MATRIX_JOB = "unit"
+OUTPUT = "pq_unit_required"
 MERGE_SHA = "1234567890abcdef1234567890abcdef12345678"
 HEAD_SHA = "fedcba0987654321fedcba0987654321fedcba09"
 CHANGED_FILES_STEP = "Write changed file list"
@@ -148,18 +154,32 @@ class PQMergeGateContractTest(unittest.TestCase):
         self.assertIn("ci/checks/classify_merge_profile.py", classify_step["run"])
         self.assertIn('--github-output "$GITHUB_OUTPUT"', classify_step["run"])
 
-    def test_pq_job_calls_only_aarch64_on_the_change_itself(self) -> None:
+    def running_pq_jobs(self, outputs: dict[str, str]) -> dict[str, list[str]]:
+        """The ci-pq.yml jobs whose if passes with these selection outputs, with their matrix entries."""
+        context = {"needs": {svc.RESOLVER_JOB: {"outputs": outputs, "result": "success"}}}
+        running: dict[str, list[str]] = {}
+        for job_id, job in self.pq["jobs"].items():
+            if job_id == svc.RESOLVER_JOB or not svc._truthy(svc.render(job["if"], context)):
+                continue
+            matrix = (job.get("strategy") or {}).get("matrix")
+            running[job_id] = [entry["job"] for entry in json.loads(outputs["matrix"])["include"]] if matrix else []
+        return running
+
+    def test_pq_job_calls_the_required_jobs_on_the_change_itself(self) -> None:
         job = self.ci["jobs"][PQ_JOB]
         self.assertEqual(job["uses"], "./.github/workflows/ci-pq.yml")
         self.assertEqual(job["needs"], CLASSIFY_JOB)
         context = pull_request_context({OUTPUT: "true"})
         rendered = {key: svc._to_text(svc.render(value, context)) for key, value in job["with"].items()}
-        self.assertEqual(rendered, {"source_ref": MERGE_SHA, "jobs": AARCH64_JOB})
+        self.assertEqual(rendered, {"source_ref": MERGE_SHA, "jobs": ",".join(REQUIRED_PQ_JOBS)})
         self.assertEqual(set(job["with"]), set(self.pq["on"]["workflow_call"]["inputs"]))
 
         outputs = self.select_pq_jobs(rendered["jobs"])
-        self.assertEqual([entry["job"] for entry in json.loads(outputs["matrix"])["include"]], [AARCH64_JOB])
-        self.assertEqual(outputs["run_macos_arm64_unit"], "false")
+        self.assertEqual(json.loads(outputs["selected"]), REQUIRED_PQ_JOBS)
+        # Exactly these run: aarch64-unit as the unit job's only entry, each
+        # macOS job as itself, and nothing else (s390x-unit stays on demand).
+        self.assertEqual(self.running_pq_jobs(outputs),
+                         {PQ_UNIT_MATRIX_JOB: [AARCH64_JOB], "macos-arm64-unit": [], "macos-x86_64-unit": []})
 
     def test_required_merge_gate_runs_this_contract(self) -> None:
         gate = svc.load_workflow(GATE_WORKFLOW)
@@ -212,8 +232,8 @@ class PQMergeGateContractTest(unittest.TestCase):
         self.assertIn(PQ_JOB, gate["needs"])
         self.assertIn("always()", gate["if"])
         env = svc.find_step(gate, GATE_STEP)["env"]
-        self.assertEqual(env["PQ_AARCH64_REQUIRED"], "${{ needs." + CLASSIFY_JOB + ".outputs." + OUTPUT + " }}")
-        self.assertEqual(env["PQ_AARCH64_RESULT"], "${{ needs." + PQ_JOB + ".result }}")
+        self.assertEqual(env["PQ_UNIT_REQUIRED"], "${{ needs." + CLASSIFY_JOB + ".outputs." + OUTPUT + " }}")
+        self.assertEqual(env["PQ_UNIT_RESULT"], "${{ needs." + PQ_JOB + ".result }}")
 
     def test_job_condition(self) -> None:
         self.assertTrue(self.job_runs(pull_request_context({OUTPUT: "true"})))
@@ -229,23 +249,23 @@ class PQMergeGateContractTest(unittest.TestCase):
     def test_gate_outcomes(self) -> None:
         cases = [
             ("required and passed", "true", "success", True, ""),
-            ("required but skipped", "true", "skipped", False, "PQ aarch64 unit tests result was skipped"),
-            ("required but failed", "true", "failure", False, "PQ aarch64 unit tests result was failure"),
-            ("required but cancelled", "true", "cancelled", False, "PQ aarch64 unit tests result was cancelled"),
+            ("required but skipped", "true", "skipped", False, "PQ unit tests result was skipped"),
+            ("required but failed", "true", "failure", False, "PQ unit tests result was failure"),
+            ("required but cancelled", "true", "cancelled", False, "PQ unit tests result was cancelled"),
             ("not required, skipped", "false", "skipped", True, ""),
-            ("not required, failed anyway", "false", "failure", False, "PQ aarch64 unit tests result was failure"),
-            ("classifier output missing", "", "skipped", False, "did not report whether the PQ aarch64 job is required"),
-            ("classifier output garbled", "yes", "success", False, "did not report whether the PQ aarch64 job is required"),
+            ("not required, failed anyway", "false", "failure", False, "PQ unit tests result was failure"),
+            ("classifier output missing", "", "skipped", False, "did not report whether the PQ unit jobs are required"),
+            ("classifier output garbled", "yes", "success", False, "did not report whether the PQ unit jobs are required"),
         ]
         for label, required, result, ok, message in cases:
             with self.subTest(label):
-                run = self.run_gate(PQ_AARCH64_REQUIRED=required, PQ_AARCH64_RESULT=result)
+                run = self.run_gate(PQ_UNIT_REQUIRED=required, PQ_UNIT_RESULT=result)
                 self.assertEqual(run.returncode == 0, ok, run.stdout + run.stderr)
                 if message:
                     self.assertIn(message, run.stdout)
 
         # A missing output fails even a change that needs no source validation.
-        run = self.run_gate(PQ_AARCH64_REQUIRED="", PQ_AARCH64_RESULT="skipped",
+        run = self.run_gate(PQ_UNIT_REQUIRED="", PQ_UNIT_RESULT="skipped",
                             SOURCE_VALIDATION_REQUIRED="false", VALIDATION_PROFILE="public-docs")
         self.assertNotEqual(run.returncode, 0)
 
@@ -257,7 +277,7 @@ class PQMergeGateContractTest(unittest.TestCase):
         runs = self.job_runs(pull_request_context(outputs))
         source = outputs["source_validation_required"]
         others = OTHER_GATE_RESULTS if source == "true" else {key: "skipped" for key in OTHER_GATE_RESULTS}
-        gate = self.run_gate(PQ_AARCH64_REQUIRED=outputs[OUTPUT], PQ_AARCH64_RESULT="success" if runs else "skipped",
+        gate = self.run_gate(PQ_UNIT_REQUIRED=outputs[OUTPUT], PQ_UNIT_RESULT="success" if runs else "skipped",
                              SOURCE_VALIDATION_REQUIRED=source, VALIDATION_PROFILE=outputs["profile"], **others)
         return runs, gate
 
@@ -265,10 +285,10 @@ class PQMergeGateContractTest(unittest.TestCase):
         runs, gate = self.gate_for_pull_request(MATCHING_PR)
         self.assertTrue(runs)
         self.assertEqual(gate.returncode, 0, gate.stdout + gate.stderr)
-        self.assertIn("PQ aarch64 unit tests: success", gate.stdout)
+        self.assertIn("PQ unit tests: success", gate.stdout)
         # Skipping it would fail the gate.
         outputs = classify(MATCHING_PR)
-        self.assertNotEqual(self.run_gate(PQ_AARCH64_REQUIRED=outputs[OUTPUT], PQ_AARCH64_RESULT="skipped").returncode, 0)
+        self.assertNotEqual(self.run_gate(PQ_UNIT_REQUIRED=outputs[OUTPUT], PQ_UNIT_RESULT="skipped").returncode, 0)
 
     def test_other_pull_requests_skip_the_job_and_pass(self) -> None:
         for paths in (DOCS_ONLY_PR, OTHER_SOURCE_PR):
@@ -298,9 +318,9 @@ class MlkemWiringContractTest(unittest.TestCase):
             self.assertIn(known, wiring)
         missing = [path for path in wiring if classify([path])[OUTPUT] != "true"]
         self.assertEqual(missing, [],
-            "FAIL: these files mention ML-KEM but do not require the aarch64 PQ job\n"
-            "Cause: a change to only one of them would skip pq-aarch64, and Full Validation accepts the skip\n"
-            "Fix: add them to PQ_AARCH64_FILES in ci/checks/classify_merge_profile.py")
+            "FAIL: these files mention ML-KEM but do not require the PQ unit jobs\n"
+            "Cause: a change to only one of them would skip pq-unit, and Full Validation accepts the skip\n"
+            "Fix: add them to PQ_UNIT_FILES in ci/checks/classify_merge_profile.py")
 
 
 if __name__ == "__main__":

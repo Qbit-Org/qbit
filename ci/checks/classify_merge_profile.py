@@ -56,10 +56,11 @@ OPERATOR_KEYS_PREFIXES = (
     "contrib/guix/repo-templates/qbit-guix.sigs/operator-keys/",
 )
 # Changes to the ML-KEM library, the v2 transport, or their build and CI wiring
-# must pass the aarch64 job of .github/workflows/ci-pq.yml before they merge.
+# must pass the aarch64-unit, macos-arm64-unit and macos-x86_64-unit jobs of
+# .github/workflows/ci-pq.yml before they merge (the pq-unit job of ci.yml).
 # ci/checks/test_pq_merge_gate_contract.py fails if a CMake file, workflow or
 # ci/ file that mentions ML-KEM is missing here.
-PQ_AARCH64_FILES = frozenset(
+PQ_UNIT_FILES = frozenset(
     {
         # The build: the WITH_MLKEM_NATIVE option, the library and its link
         # into bitcoin_node, the run-time CPU detection, the configure header,
@@ -100,7 +101,7 @@ PQ_AARCH64_FILES = frozenset(
         "src/test/net_tests.cpp",
     }
 )
-PQ_AARCH64_PREFIXES = (
+PQ_UNIT_PREFIXES = (
     "src/bip324",
     "src/compat/cpu_features.",
     "src/crypto/mlkem",
@@ -157,9 +158,9 @@ class Classification:
         return self.profile == GITHUB_METADATA_PROFILE
 
     @property
-    def pq_aarch64_required(self) -> bool:
-        """Whether the aarch64 PQ job must pass. A path that cannot be read requires it."""
-        return bool(self.invalid_paths) or any(is_pq_aarch64_path(path) for path in self.paths)
+    def pq_unit_required(self) -> bool:
+        """Whether the PQ unit jobs must pass. A path that cannot be read requires them."""
+        return bool(self.invalid_paths) or any(is_pq_unit_path(path) for path in self.paths)
 
 
 def normalize_path(path: str) -> str | None:
@@ -203,8 +204,8 @@ def is_github_metadata_path(path: str) -> bool:
     return path in GITHUB_METADATA_FILES or path.startswith(GITHUB_METADATA_PREFIXES)
 
 
-def is_pq_aarch64_path(path: str) -> bool:
-    return path in PQ_AARCH64_FILES or path.startswith(PQ_AARCH64_PREFIXES)
+def is_pq_unit_path(path: str) -> bool:
+    return path in PQ_UNIT_FILES or path.startswith(PQ_UNIT_PREFIXES)
 
 
 def classify_paths(paths: list[str] | tuple[str, ...]) -> Classification:
@@ -283,7 +284,7 @@ def github_outputs(classification: Classification) -> dict[str, str]:
         "touched_rpc_docs": bool_output(bool(classification.rpc_docs_paths)),
         "touched_public_docs": bool_output(bool(classification.public_docs_paths)),
         "touched_github_metadata": bool_output(bool(classification.github_metadata_paths)),
-        "pq_aarch64_required": bool_output(classification.pq_aarch64_required),
+        "pq_unit_required": bool_output(classification.pq_unit_required),
     }
 
 
@@ -297,7 +298,7 @@ def describe_classification(classification: Classification) -> str:
     lines = [
         f"validation_profile={classification.profile}",
         f"changed_count={len(classification.paths)}",
-        f"pq_aarch64_required={bool_output(classification.pq_aarch64_required)}",
+        f"pq_unit_required={bool_output(classification.pq_unit_required)}",
     ]
 
     if classification.release_policy_paths:
