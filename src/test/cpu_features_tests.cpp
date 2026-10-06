@@ -6,10 +6,12 @@
 
 #include <compat/cpu_features.h>
 #include <compat/cpuid.h>
+#include <crypto/sha256.h>
 
 #include <boost/test/unit_test.hpp>
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 using namespace cpu_features;
@@ -181,6 +183,35 @@ BOOST_AUTO_TEST_CASE(mlkem_x86_native_matrix)
     BOOST_CHECK(HasMlkemX86Native(DetectFake(MLKEM_X86_NATIVE)));
     BOOST_CHECK(!HasMlkemX86Native(DetectFake(without_leaf7(LEAF7_EBX_BMI2))));
     BOOST_CHECK(!HasMlkemX86Native(DetectFake(without_leaf1(LEAF1_ECX_POPCNT))));
+}
+
+BOOST_AUTO_TEST_CASE(sha256_x86_code_needs_ssse3)
+{
+#if defined(HAVE_GETCPUID)
+    // SHA256AutoDetect, given synthetic CPUs derived from this one so that the
+    // code it selects can run its self-test here. Its SSE4, SSE4.1 4-way and
+    // SHA-NI code all execute SSSE3 instructions (pshufb), so a CPU that
+    // masks SSSE3 alone, as a virtual machine can, must get the standard code,
+    // like one without SSE4.1.
+    const X86Features host{DetectX86Features()};
+    const auto detect_masked{[&](uint32_t leaf1_ecx_mask) {
+        g_cpu = FakeCpu{};
+        g_cpu.features = host;
+        g_cpu.features.leaf1_ecx &= ~leaf1_ecx_mask;
+        return SHA256AutoDetect(sha256_implementation::USE_ALL, FakeCpuid, FakeXGetBV);
+    }};
+    const std::string host_choice{SHA256AutoDetect()};
+    BOOST_TEST_MESSAGE("SHA256 on this CPU: " << host_choice);
+    // Unmasked, the synthetic CPU gets what this one does.
+    BOOST_CHECK_EQUAL(detect_masked(0), host_choice);
+    BOOST_CHECK_EQUAL(detect_masked(LEAF1_ECX_SSSE3), "standard");
+    BOOST_CHECK_EQUAL(detect_masked(LEAF1_ECX_SSE41), "standard");
+    // Restore this CPU's selection.
+    BOOST_CHECK_EQUAL(SHA256AutoDetect(), host_choice);
+#else
+    // Other targets ignore the x86 queries.
+    BOOST_CHECK_EQUAL(SHA256AutoDetect(sha256_implementation::USE_ALL, nullptr, nullptr), SHA256AutoDetect());
+#endif
 }
 
 BOOST_AUTO_TEST_CASE(usable_avx2_host)

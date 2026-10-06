@@ -571,9 +571,9 @@ bool SelfTest() {
 #if !defined(DISABLE_OPTIMIZED_SHA256)
 #if (defined(__x86_64__) || defined(__amd64__) || defined(__i386__))
 /** Check whether the OS has enabled AVX registers. */
-bool AVXEnabled()
+bool AVXEnabled(sha256_implementation::XGetBVFn xgetbv)
 {
-    return (XGetBV(0) & 6) == 6;
+    return (xgetbv(0) & 6) == 6;
 }
 #endif
 #endif // DISABLE_OPTIMIZED_SHA256
@@ -581,6 +581,17 @@ bool AVXEnabled()
 
 
 std::string SHA256AutoDetect(sha256_implementation::UseImplementation use_implementation)
+{
+#if defined(HAVE_GETCPUID)
+    return SHA256AutoDetect(use_implementation, GetCPUID, XGetBV);
+#else
+    return SHA256AutoDetect(use_implementation, nullptr, nullptr);
+#endif
+}
+
+std::string SHA256AutoDetect(sha256_implementation::UseImplementation use_implementation,
+                             [[maybe_unused]] sha256_implementation::CpuidFn cpuid,
+                             [[maybe_unused]] sha256_implementation::XGetBVFn xgetbv)
 {
     std::string ret = "standard";
     Transform = sha256::Transform;
@@ -599,7 +610,7 @@ std::string SHA256AutoDetect(sha256_implementation::UseImplementation use_implem
     [[maybe_unused]] bool enabled_avx = false;
 
     uint32_t eax, ebx, ecx, edx;
-    GetCPUID(1, 0, eax, ebx, ecx, edx);
+    cpuid(1, 0, eax, ebx, ecx, edx);
     if (use_implementation & sha256_implementation::USE_SSE4) {
         // Fixes an upstream Bitcoin Core bug, which checks SSE4.1 only. The
         // SSE4 code and the SSE4.1 and SHA-NI code chosen under this check
@@ -611,10 +622,10 @@ std::string SHA256AutoDetect(sha256_implementation::UseImplementation use_implem
     have_xsave = (ecx >> 27) & 1;
     have_avx = (ecx >> 28) & 1;
     if (have_xsave && have_avx) {
-        enabled_avx = AVXEnabled();
+        enabled_avx = AVXEnabled(xgetbv);
     }
     if (have_sse4) {
-        GetCPUID(7, 0, eax, ebx, ecx, edx);
+        cpuid(7, 0, eax, ebx, ecx, edx);
         if (use_implementation & sha256_implementation::USE_AVX2) {
             have_avx2 = (ebx >> 5) & 1;
         }
