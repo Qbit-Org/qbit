@@ -27,6 +27,8 @@ every byte it sends and when.
 """
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
+import os
+import shutil
 import socket
 import time
 
@@ -43,7 +45,8 @@ from test_framework.p2p import (
     P2P_VERSION,
     P2P_VERSION_RELAY,
 )
-from test_framework.test_framework import BitcoinTestFramework
+from test_framework.test_framework import BitcoinTestFramework, SkipTest
+from test_framework.test_node import release_info
 from test_framework.util import (
     MAX_NODES,
     assert_equal,
@@ -242,6 +245,11 @@ class P2PV2PreviousReleaseTest(BitcoinTestFramework):
 
     def skip_test_if_missing_module(self):
         self.skip_if_no_previous_releases()
+        # The releases directory can hold other releases, such as Bitcoin Core's, without v1.0.0.
+        release = release_info(V1_0_0)
+        binaries = self.get_binaries(os.path.join(self.options.previous_releases_path, release.tag, "bin"), release.binary_prefix)
+        if any(shutil.which(argv[0]) is None for argv in (binaries.node_argv(), binaries.rpc_argv())):
+            raise SkipTest(f"the qbit {release.tag} release is not downloaded")
 
     def setup_nodes(self):
         self.add_nodes(self.num_nodes, self.extra_args, versions=[V1_0_0])
