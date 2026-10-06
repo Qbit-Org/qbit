@@ -273,6 +273,7 @@ class ClassifyMergeProfileTest(unittest.TestCase):
             "src/test/CMakeLists.txt",
             "src/test/fuzz/CMakeLists.txt",
             "src/bench/CMakeLists.txt",
+            "test/CMakeLists.txt",
             "cmake/bitcoin-build-config.h.in",
             # Gate and CI wiring, and its tests.
             ".github/workflows/ci.yml",
