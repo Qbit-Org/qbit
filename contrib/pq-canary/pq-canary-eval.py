@@ -304,6 +304,11 @@ def read_known_good(path: Path) -> KnownGood:
     return KnownGood(endpoints, addresses)
 
 
+def valid_instance_id(value: Any) -> bool:
+    """Whether value is the 64-hex-digit instance_id that getpqtransportinfo reports."""
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
 def ring_of(record: dict[str, Any], direction: str) -> dict[str, Any] | None:
     """A structurally valid ring: integer counters and entries with consecutive sequences ending at last_sequence."""
     ring = (record.get("recent_failures") or {}).get(direction)
@@ -340,6 +345,8 @@ def unknown_intervals(records: list[dict[str, Any]], end: int, interval: int) ->
         host_records.sort(key=lambda record: record.get("time", 0))
         state: dict[str, RingState] = {}
         previous_time: int | None = None
+        # Time of the latest record without a valid instance_id, until a valid one follows.
+        identity_lost_at: int | None = None
         for record in host_records:
             time = record.get("time", 0)
             if not isinstance(record.get("fallback_set"), list):
@@ -347,6 +354,20 @@ def unknown_intervals(records: list[dict[str, Any]], end: int, interval: int) ->
                 found.append((host, "fallback_set", time if previous_time is None else previous_time, time,
                               "fallback_set missing or malformed"))
             instance = record.get("instance_id")
+            if not valid_instance_id(instance):
+                # Without the process identity a restart can't be told apart from
+                # a continuing run, so neither ring is judged across this record.
+                for direction in RINGS:
+                    found.append((host, direction, time if previous_time is None else previous_time, time,
+                                  "instance_id missing or malformed"))
+                state.clear()
+                identity_lost_at = time
+                previous_time = time
+                continue
+            if identity_lost_at is not None:
+                for direction in RINGS:
+                    found.append((host, direction, identity_lost_at, time, "instance_id missing or malformed"))
+                identity_lost_at = None
             since = record.get("since") if isinstance(record.get("since"), int) else time
             for direction in RINGS:
                 ring = ring_of(record, direction)
