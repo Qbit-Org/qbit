@@ -16,6 +16,7 @@
 #include <span.h>
 #include <sync.h>
 #include <util/sock.h>
+#include <util/thread.h>
 
 #include <algorithm>
 #include <array>
@@ -92,7 +93,61 @@ struct ConnmanTestMsg : public CConnman {
     bool AlreadyConnectedPublic(const CAddress& addr) { return AlreadyConnectedToAddress(addr); };
 
     CNode* ConnectNodePublic(PeerManager& peerman, const char* pszDest, ConnectionType conn_type)
-        EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex);
+        EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex, !m_pq_mutex);
+
+    void SocketHandlerConnectedPublic(const std::vector<CNode*>& nodes, const Sock::EventsPerSock& events_per_sock)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !mutexMsgProc, !m_pq_mutex)
+    {
+        SocketHandlerConnected(nodes, events_per_sock);
+    }
+
+    void DisconnectNodesPublic() EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex, !m_reconnections_mutex, !m_pq_mutex)
+    {
+        DisconnectNodes();
+    }
+
+    void SetPQMode(PQMode mode) { m_pq_mode = mode; }
+
+    /** How many distinct failing endpoints the local-fault warning has counted. */
+    size_t PQLocalFaultEndpoints() const EXCLUSIVE_LOCKS_REQUIRED(!m_pq_mutex)
+    {
+        return WITH_LOCK(m_pq_mutex, return m_pq_failed_endpoints_for_warning.size());
+    }
+
+    void UpdatePQSheddingPublic() EXCLUSIVE_LOCKS_REQUIRED(!m_pq_shed_mutex) { UpdatePQShedding(PQShedNow()); }
+
+    /** Run the socket handler thread, as Start() does. */
+    void StartSocketHandlerThread()
+    {
+        threadSocketHandler = std::thread(&util::TraceThread, "net", [this] { ThreadSocketHandler(); });
+    }
+
+    /** Stop the socket handler thread, and let the connection manager run again. */
+    void StopSocketHandlerThread()
+    {
+        interruptNet();
+        if (threadSocketHandler.joinable()) threadSocketHandler.join();
+        interruptNet.reset();
+    }
+
+    void ObservePQPublic(CNode& node, bool finalizing) EXCLUSIVE_LOCKS_REQUIRED(!m_pq_mutex)
+    {
+        ObservePQ(node, finalizing);
+    }
+
+    /** ConnectNode() without adding the node to the connection manager; the caller owns it. */
+    CNode* ConnectNodeOnly(const char* dest, ConnectionType conn_type, bool use_v2transport)
+        EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex, !m_pq_mutex)
+    {
+        return ConnectNode(CAddress{}, dest, /*fCountFailure=*/false, conn_type, use_v2transport);
+    }
+
+    void CreateNodeFromAcceptedSocketPublic(std::unique_ptr<Sock>&& sock, const CService& addr_bind, const CService& addr)
+    {
+        CreateNodeFromAcceptedSocket(std::move(sock), NetPermissionFlags::None, addr_bind, addr);
+    }
+
+    bool AttemptToEvictConnectionPublic() { return AttemptToEvictConnection(); }
 };
 
 constexpr ServiceFlags ALL_SERVICE_FLAGS[]{
