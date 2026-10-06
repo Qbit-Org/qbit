@@ -1,0 +1,335 @@
+# Copyright (c) 2026-present The qbit core developers
+# Distributed under the MIT software license, see the accompanying
+# file COPYING or https://opensource.org/license/mit.
+
+# Post-quantum transport validation (#184). One reusable workflow, run through
+# callers on main, because GitHub schedules and dispatches only workflows whose
+# file is on the default branch:
+# - main's nightly caller runs it on a schedule with source_ref: 1.x.x;
+# - on-demand runs go through main's PQ caller (C4, part 2 of #184), which takes
+#   workflow_dispatch inputs source_ref and jobs and calls ci-pq.yml@1.x.x, for
+#   example gh workflow run ci-maintained-pq.yml -f source_ref=<branch> -f jobs=aarch64-unit.
+#   That caller lands on main after this part merges.
+# The workflow_dispatch trigger below stays for when this file is on main itself;
+# until then GitHub rejects gh workflow run ci-pq.yml.
+# The source is resolved once to a commit, every job checks out and verifies
+# that commit, and the summaries record it.
+
+name: PQ CI
+run-name: "PQ CI: ${{ inputs.source_ref || github.ref_name }} (${{ inputs.jobs || 'all jobs' }})"
+
+on:
+  workflow_call:
+    inputs:
+      source_ref:
+        description: 'Branch, tag or full commit hash to validate; empty validates the triggering commit'
+        required: false
+        type: string
+        default: ''
+      jobs:
+        description: 'Comma-separated jobs to run (aarch64-unit); empty runs all'
+        required: false
+        type: string
+        default: ''
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Branch, tag or full commit hash to validate; empty validates the selected ref'
+        required: false
+        type: string
+        default: ''
+      jobs:
+        description: 'Comma-separated jobs to run (aarch64-unit); empty runs all'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  resolve-source:
+    name: Resolve source and jobs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      source_mode: ${{ steps.resolve.outputs.source_mode }}
+      requested_ref: ${{ steps.resolve.outputs.requested_ref }}
+      resolved_sha: ${{ steps.resolve.outputs.resolved_sha }}
+      matrix: ${{ steps.select.outputs.matrix }}
+      matrix_count: ${{ steps.select.outputs.matrix_count }}
+      selected: ${{ steps.select.outputs.selected }}
+    steps:
+      - name: Resolve source
+        id: resolve
+        shell: bash
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+          EVENT_REF: ${{ github.ref }}
+          EVENT_SHA: ${{ github.sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          SOURCE_REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}.git
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Resolve the validation source once per run, before any checkout, so
+          # every job builds and reports the same immutable commit. An empty
+          # source_ref keeps the triggering ref and commit; otherwise
+          # resolve_source_ref resolves it.
+          fail() { echo "::error::$*" >&2; exit 1; }
+          is_full_sha() { printf '%s\n' "$1" | LC_ALL=C grep -Eq '^[0-9a-f]{40}$'; }
+
+          # Sets requested_ref and resolved_sha from a non-empty source_ref, or
+          # fails the run: a full commit hash is used as is; a branch or tag
+          # name is looked up on the remote, and an annotated tag is peeled to
+          # its commit. ci-pq.yml and ci-nightly-heavy.yml (for a called run)
+          # share this function; ci/checks/test_ci_pq_contract.py keeps the two
+          # copies identical.
+          resolve_source_ref() {
+            local source_ref="$1" candidate status listing matches peeled
+            local -a candidates patterns auth
+            if is_full_sha "$source_ref"; then
+              requested_ref="$source_ref"
+              resolved_sha="$source_ref"
+              return 0
+            fi
+            case "$source_ref" in
+              refs/heads/?*|refs/tags/?*) candidates=("$source_ref") ;;
+              refs/*) fail "source_ref '$source_ref' must be a branch, a tag or a full commit hash" ;;
+              *) candidates=("refs/heads/$source_ref" "refs/tags/$source_ref") ;;
+            esac
+            patterns=()
+            for candidate in "${candidates[@]}"; do
+              git check-ref-format "$candidate" || fail "source_ref '$source_ref' is not a valid ref name"
+              patterns+=("$candidate" "$candidate^{}")
+            done
+            auth=()
+            if [ -n "${GITHUB_TOKEN:-}" ]; then
+              auth=(-c "http.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')")
+            fi
+            status=0
+            listing="$(git ${auth[@]+"${auth[@]}"} ls-remote --exit-code -- "$SOURCE_REPOSITORY_URL" "${patterns[@]}")" || status=$?
+            case "$status" in
+              0) ;;
+              2) fail "no branch or tag '$source_ref' in '$SOURCE_REPOSITORY_URL'" ;;
+              *) fail "could not list refs from '$SOURCE_REPOSITORY_URL' (git exit code $status)" ;;
+            esac
+            matches="$(printf '%s\n' "$listing" | awk -v a="${candidates[0]}" -v b="${candidates[1]:-}" '$2 == a || $2 == b { print $2 }')"
+            [ "$(printf '%s\n' "$matches" | grep -c .)" -eq 1 ] \
+              || fail "source_ref '$source_ref' must name exactly one branch or tag, found: ${matches:-none}"
+            requested_ref="$matches"
+            peeled="$(printf '%s\n' "$listing" | awk -v ref="$requested_ref^{}" '$2 == ref { print $1 }')"
+            resolved_sha="${peeled:-$(printf '%s\n' "$listing" | awk -v ref="$requested_ref" '$2 == ref { print $1 }')}"
+          }
+
+          source_ref="$(printf '%s' "$SOURCE_REF" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+          if [ -z "$source_ref" ]; then
+            source_mode=event
+            requested_ref="$EVENT_REF"
+            resolved_sha="$EVENT_SHA"
+          else
+            resolve_source_ref "$source_ref"
+            if is_full_sha "$source_ref"; then
+              source_mode=commit
+            else
+              source_mode=ref
+            fi
+          fi
+
+          is_full_sha "$resolved_sha" || fail "resolved source '$resolved_sha' is not a full commit hash"
+          [ -n "$requested_ref" ] || fail "requested ref is empty"
+
+          {
+            echo "source_mode=$source_mode"
+            echo "requested_ref=$requested_ref"
+            echo "resolved_sha=$resolved_sha"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## Validation source"
+            echo
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| source_ref input | ${source_ref:-(empty)} |"
+            echo "| source_mode | $source_mode |"
+            echo "| requested_ref | $requested_ref |"
+            echo "| resolved_sha | $resolved_sha |"
+            echo "| event_sha | $EVENT_SHA |"
+            echo "| workflow_sha | $WORKFLOW_SHA |"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+      - name: Select jobs
+        id: select
+        shell: python3 {0}
+        env:
+          JOBS_INPUT: ${{ inputs.jobs }}
+          # Jobs run as matrix entries; "job" is the name the jobs input uses.
+          JOB_CATALOG: |
+            [
+              {
+                "job": "aarch64-unit",
+                "name": "AArch64 unit tests (pre-library phase)",
+                "runs-on": "ubuntu-24.04-arm",
+                "timeout-minutes": 120,
+                "file-env": "./ci/test/00_setup_env_native_aarch64_pq.sh",
+                "phase": "Pre-library phase: bip324_tests and net_tests on AArch64. Part 3 (#190) adds mlkem_tests with the ML-KEM library."
+              }
+            ]
+          # Selectable jobs that are not matrix entries; each gets a run_<job> output.
+          NON_MATRIX_JOBS: ''
+        run: |
+          # Turn the comma-separated jobs input into the matrix: empty selects
+          # every job; an empty, unknown or repeated name fails the run.
+          import json
+          import os
+          import sys
+
+
+          def fail(message):
+              print(f"::error::{message}", file=sys.stderr)
+              sys.exit(1)
+
+
+          catalog = json.loads(os.environ["JOB_CATALOG"])
+          non_matrix = os.environ.get("NON_MATRIX_JOBS", "").split()
+          known = [entry["job"] for entry in catalog] + non_matrix
+          if len(set(known)) != len(known):
+              fail(f"job catalog repeats a name: {known}")
+
+          raw = os.environ.get("JOBS_INPUT", "")
+          if raw.strip():
+              requested = [name.strip() for name in raw.split(",")]
+              if "" in requested:
+                  fail(f"jobs input '{raw}' contains an empty name")
+              repeated = sorted({name for name in requested if requested.count(name) > 1})
+              if repeated:
+                  fail(f"jobs input names a job more than once: {', '.join(repeated)}")
+              unknown = [name for name in requested if name not in known]
+              if unknown:
+                  fail(f"unknown job(s) {', '.join(unknown)}; known jobs: {', '.join(known)}")
+          else:
+              requested = known
+
+          include = [entry for entry in catalog if entry["job"] in requested]
+          selected = [name for name in known if name in requested]
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf8") as out:
+              out.write(f"matrix={json.dumps({'include': include}, separators=(',', ':'))}\n")
+              out.write(f"matrix_count={len(include)}\n")
+              out.write(f"selected={json.dumps(selected, separators=(',', ':'))}\n")
+              for name in non_matrix:
+                  out.write(f"run_{name.replace('-', '_')}={'true' if name in requested else 'false'}\n")
+          with open(os.environ.get("GITHUB_STEP_SUMMARY", os.devnull), "a", encoding="utf8") as summary:
+              summary.write(f"\nSelected jobs: {', '.join(selected) or 'none'} (jobs input: {raw.strip() or 'all'})\n")
+
+  unit:
+    name: ${{ matrix.name }}
+    needs: resolve-source
+    if: ${{ needs.resolve-source.outputs.matrix_count != '0' }}
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: ${{ matrix.timeout-minutes }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.resolve-source.outputs.matrix) }}
+    env:
+      CI_FAILFAST_TEST_LEAVE_DANGLING: 1
+      DANGER_CI_ON_HOST_FOLDERS: 1
+      FILE_ENV: ${{ matrix.file-env }}
+      TEST_RUNNER_FAILFAST: 'false'
+      MAKEJOBS: '-j4'
+      TEST_RUNNER_JOBS: '4'
+      CTEST_JOBS: '4'
+      # GitHub-hosted runners use the public registry and resolvers, not the
+      # internal registry and tailnet DNS that the self-hosted jobs use.
+      CI_PROFILE: public
+      CI_IMAGE_REGISTRY_PREFIX: docker.io/library
+      CI_ENFORCE_INTERNAL_REGISTRY: '0'
+      CI_BUILDKIT_DNS_NAMESERVERS: '1.1.1.1,8.8.8.8'
+      CI_BUILDKIT_DNS_SEARCH_DOMAINS: ''
+    steps:
+      - name: Require resolved source
+        shell: bash
+        env:
+          RESOLVED_SHA: ${{ needs.resolve-source.outputs.resolved_sha }}
+          REQUESTED_REF: ${{ needs.resolve-source.outputs.requested_ref }}
+        run: |
+          set -euo pipefail
+          # Refuse to check out anything but the per-run resolved commit; an
+          # empty ref would silently fall back to the triggering commit.
+          printf '%s\n' "$RESOLVED_SHA" | LC_ALL=C grep -Eq '^[0-9a-f]{40}$' \
+            || { echo "::error::resolved source '$RESOLVED_SHA' is not a full commit hash" >&2; exit 1; }
+          [ -n "$REQUESTED_REF" ] || { echo "::error::requested ref is empty" >&2; exit 1; }
+
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ needs.resolve-source.outputs.resolved_sha }}
+          fetch-depth: 0
+
+      - name: Verify checked-out source
+        shell: bash
+        env:
+          SOURCE_MODE: ${{ needs.resolve-source.outputs.source_mode }}
+          REQUESTED_REF: ${{ needs.resolve-source.outputs.requested_ref }}
+          RESOLVED_SHA: ${{ needs.resolve-source.outputs.resolved_sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          MATRIX_NAME: ${{ matrix.name }}
+        run: |
+          set -euo pipefail
+          actual_head="$(git rev-parse --verify 'HEAD^{commit}')"
+          if [ "$actual_head" != "$RESOLVED_SHA" ]; then
+            echo "::error::checked-out HEAD $actual_head does not match resolved source $RESOLVED_SHA" >&2
+            exit 1
+          fi
+          {
+            echo "### Checked-out source: ${GITHUB_JOB}${MATRIX_NAME:+ ($MATRIX_NAME)}"
+            echo
+            echo "- source_mode: ${SOURCE_MODE}"
+            echo "- requested_ref: ${REQUESTED_REF}"
+            echo "- resolved_sha: ${RESOLVED_SHA}"
+            echo "- actual_head: ${actual_head}"
+            echo "- workflow_sha: ${WORKFLOW_SHA}"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+      - name: Configure environment
+        uses: ./.github/actions/configure-environment
+
+      - name: Restore caches
+        id: restore-cache
+        uses: ./.github/actions/restore-caches
+
+      - name: Configure Docker
+        uses: ./.github/actions/configure-docker
+        with:
+          cache-provider: gha
+
+      - name: CI script
+        run: ./ci/test_run_all.sh
+
+      - name: Report unit-test evidence
+        if: ${{ always() }}
+        shell: bash
+        env:
+          RESOLVED_SHA: ${{ needs.resolve-source.outputs.resolved_sha }}
+          REQUESTED_REF: ${{ needs.resolve-source.outputs.requested_ref }}
+          MATRIX_NAME: ${{ matrix.name }}
+          PHASE: ${{ matrix.phase }}
+        run: |
+          set -euo pipefail
+          # ci/test/03_test_script.sh writes this after ctest_evidence.py has
+          # checked that every expected suite was selected, executed and passed.
+          evidence="${BASE_BUILD_DIR}/ctest-evidence/summary.md"
+          {
+            echo "## ${MATRIX_NAME}"
+            echo
+            echo "- source: ${RESOLVED_SHA} (${REQUESTED_REF})"
+            echo "- ${PHASE}"
+            echo
+            if [ -f "$evidence" ]; then
+              cat "$evidence"
+            else
+              echo "No unit-test evidence was produced."
+            fi
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          [ -f "$evidence" ] || { echo "::error::no unit-test evidence at $evidence" >&2; exit 1; }
+
+      - name: Save caches
+        uses: ./.github/actions/save-caches

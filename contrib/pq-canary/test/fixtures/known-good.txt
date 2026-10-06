@@ -1,0 +1,7 @@
+# endpoint [label]: the report prints the label, never the address.
+# The archive node, as the pool node dials it.
+203.0.113.5:8333 archive
+# The pool node, as the archive node sees its inbound connection (any source port).
+198.51.100.7 pool
+# An IPv6 canary peer, unlabeled: it is reported as known-good-3.
+[2001:db8::5]:8333
