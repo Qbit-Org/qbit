@@ -83,8 +83,10 @@ MACOS_JOBS = {
     MACOS_JOB: ("macos-15", "arm64", "aarch64", "native AArch64"),
     MACOS_X86_64_JOB: ("macos-15-intel", "x86_64", "x86_64", "native x86_64"),
 }
+PQ_FUNCTIONAL_JOB = "pq-functional"
 PQ_MATRIX_JOBS = [AARCH64_JOB, S390X_JOB]
-ALL_PQ_JOBS = {PQ_UNIT_JOB: PQ_MATRIX_JOBS, MACOS_JOB: [], MACOS_X86_64_JOB: []}
+ALL_PQ_JOBS = {PQ_UNIT_JOB: PQ_MATRIX_JOBS, MACOS_JOB: [], MACOS_X86_64_JOB: [], PQ_FUNCTIONAL_JOB: []}
+I686_ENV = "ci/test/00_setup_env_i686_no_ipc.sh"
 PQ_SUITES = ["mlkem_tests", "bip324_tests", "net_tests"]
 AARCH64_SUITES = PQ_SUITES
 NIGHTLY_MATRIX_JOBS = ["arm32-unit-1", "arm32-unit-2", "previous-releases", "fuzz"]
@@ -504,6 +506,7 @@ class PQWorkflowContractTest(unittest.TestCase):
             # What Full Validation's pq-unit job passes.
             (PQ, {"jobs": f"{AARCH64_JOB},{MACOS_JOB},{MACOS_X86_64_JOB}"},
              {PQ_UNIT_JOB: [AARCH64_JOB], MACOS_JOB: [], MACOS_X86_64_JOB: []}),
+            (PQ, {"jobs": PQ_FUNCTIONAL_JOB}, {PQ_FUNCTIONAL_JOB: []}),
             (PQ, {"jobs": ""}, ALL_PQ_JOBS),
             (NIGHTLY, {"run_test_matrix": True, "run_scanners": False, "jobs": "previous-releases"},
              {"nightly-matrix": ["previous-releases"]}),
@@ -779,7 +782,7 @@ class PQWorkflowContractTest(unittest.TestCase):
     def test_rejects_unknown_repeated_and_empty_job_names(self) -> None:
         bad = {
             PQ: ["aarch64", "AARCH64-UNIT", f"{AARCH64_JOB},{AARCH64_JOB}", f"{AARCH64_JOB},", ",", "s390x", "macos-arm64",
-                 f"{MACOS_JOB},{MACOS_JOB}", "macos-x86_64", "macos-intel"],
+                 f"{MACOS_JOB},{MACOS_JOB}", "macos-x86_64", "macos-intel", "pq_functional", "functional"],
             NIGHTLY: ["previous_releases", "previous-releases,previous-releases", "previous-releases,,fuzz", "unit"],
         }
         for key, values in bad.items():
@@ -835,11 +838,11 @@ class PQWorkflowContractTest(unittest.TestCase):
         context = self.resolve(PQ, self.dispatch(PQ, source_ref=svc.MAINTAINED_BRANCH, jobs=AARCH64_JOB))
         refs = svc.check_source_wiring(workflow, context)
         self.assertEqual(refs, {job: fixture.maintained_sha for job in ALL_PQ_JOBS})
-        # The macOS jobs share the unit job's guard, checkout and verification steps.
-        for macos_job in MACOS_JOBS:
+        # The macOS and functional jobs share the unit job's guard, checkout and verification steps.
+        for job_id in (*MACOS_JOBS, PQ_FUNCTIONAL_JOB):
             for step_name in (svc.GUARD_STEP, svc.CHECKOUT_STEP, svc.VERIFY_STEP):
-                self.assertEqual(svc.find_step(workflow["jobs"][macos_job], step_name),
-                                 svc.find_step(workflow["jobs"][PQ_UNIT_JOB], step_name), (macos_job, step_name))
+                self.assertEqual(svc.find_step(workflow["jobs"][job_id], step_name),
+                                 svc.find_step(workflow["jobs"][PQ_UNIT_JOB], step_name), (job_id, step_name))
 
         mutated = copy.deepcopy(workflow)
         checkout = svc.find_step(mutated["jobs"][PQ_UNIT_JOB], svc.CHECKOUT_STEP)
@@ -1190,6 +1193,38 @@ class PQWorkflowContractTest(unittest.TestCase):
                 else:
                     self.assertIn("::error::", result.stderr)
                     self.assertIn(error.format(prefix=prefix), result.stderr)
+
+    def test_functional_job_runs_the_whole_suite_with_hybrid_transport(self) -> None:
+        workflow = self.workflows[PQ]
+        job = workflow["jobs"][PQ_FUNCTIONAL_JOB]
+        self.assertNotIn(PQ_FUNCTIONAL_JOB, [entry["job"] for entry in catalog(workflow)])
+        self.assertEqual(job["runs-on"], "ubuntu-24.04")
+        context = self.resolve(PQ, self.dispatch(PQ, jobs=PQ_FUNCTIONAL_JOB))
+        env = svc.job_env(workflow, job, context)
+        self.assertEqual(env["MATRIX_NAME"], job["name"])
+        self.assertEqual(env["CI_IMAGE_REGISTRY_PREFIX"], "docker.io/library")
+        self.assertEqual(env["CI_ENFORCE_INTERNAL_REGISTRY"], "0")
+        self.assertEqual(env["CI_PROFILE"], "public")
+        env_file = env["FILE_ENV"]
+        self.assertTrue(os.access(REPO_ROOT / env_file, os.X_OK), env_file)
+        self.assertLess(svc.step_index(job, svc.VERIFY_STEP), svc.step_index(job, "CI script"))
+        self.assertEqual(svc.find_step(job, "CI script")["run"], "./ci/test_run_all.sh")
+
+        names = ["RUN_UNIT_TESTS", "RUN_FUNCTIONAL_TESTS", "TEST_RUNNER_EXTRA", "CI_BUILD_TARGET", "NO_DEPENDS", "BITCOIN_CONFIG",
+                 "CI_IMAGE_NAME_TAG"]
+        effective = source_env(env_file, names, {key: env[key] for key in ("CI_IMAGE_REGISTRY_PREFIX", "CI_ENFORCE_INTERNAL_REGISTRY")})
+        # The whole suite (no test selection), with hybrid transport between all nodes.
+        self.assertEqual(effective["TEST_RUNNER_EXTRA"].split(), ["--v2pqtransport"])
+        self.assertEqual((effective["RUN_FUNCTIONAL_TESTS"], effective["RUN_UNIT_TESTS"]), ("true", "false"))
+        self.assertEqual(effective["CI_BUILD_TARGET"], "", "every binary the suite runs is built")
+        self.assertIn("-DWITH_ZMQ=ON", effective["BITCOIN_CONFIG"].split())
+        self.assertEqual(effective["CI_IMAGE_NAME_TAG"], "docker.io/library/ubuntu:24.04")
+
+        # The i686 job of ci.yml keeps covering plain v2: --v2transport without --v2pqtransport, for which
+        # the test framework passes -v2pqtransport=0 explicitly.
+        extra = source_env(I686_ENV, ["TEST_RUNNER_EXTRA"])["TEST_RUNNER_EXTRA"].split()
+        self.assertIn("--v2transport", extra)
+        self.assertNotIn("--v2pqtransport", extra)
 
     def test_contexts_are_available_where_used(self) -> None:
         """Mirror actionlint's context-availability rule for the places these workflows use expressions.

@@ -178,9 +178,10 @@ class NetTest(BitcoinTestFramework):
                 "synced_headers": -1,
                 "timeoffset": 0,
                 "transport_protocol_type": "v1" if not self.options.v2transport else "v2",
-                # A Python peer has no hybrid post-quantum transport, and this node's switch is off.
+                # Framework peers are legacy BIP324 peers: with hybrid transport on, the node offers and
+                # the peer answers with empty contents.
                 "transport_pq": False,
-                "transport_pq_status": "v1" if not self.options.v2transport else "off",
+                "transport_pq_status": "v1" if not self.options.v2transport else "legacy_peer" if self.options.v2pqtransport else "off",
                 "version": 0,
             },
         )
@@ -215,8 +216,8 @@ class NetTest(BitcoinTestFramework):
         assert_equal(info['connections'], 2)
         assert_equal(info['connections_in'], 1)
         assert_equal(info['connections_out'], 1)
-        # The hybrid post-quantum switch is off.
-        assert_equal(info['connections_pq'], 0)
+        # Both connections link two nodes, so they are hybrid exactly when the run mode switches it on.
+        assert_equal(info['connections_pq'], 2 if self.options.v2pqtransport else 0)
 
         with self.nodes[0].assert_debug_log(expected_msgs=['SetNetworkActive: false\n']):
             self.nodes[0].setnetworkactive(state=False)

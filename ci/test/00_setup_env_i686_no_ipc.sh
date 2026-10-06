@@ -17,6 +17,8 @@ export PACKAGES="llvm clang g++-multilib"
 export DEP_OPTS="DEBUG=1 NO_IPC=1"
 export GOAL="install"
 export CI_LIMIT_STACK_SIZE=1
+# Plain v2: without --v2pqtransport, the test framework starts every node with
+# -v2pqtransport=0, so this job keeps covering plain v2 whatever the default.
 export TEST_RUNNER_EXTRA="--v2transport --usecli"
 export BITCOIN_CONFIG="\
  -DCMAKE_BUILD_TYPE=Debug \
