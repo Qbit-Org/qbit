@@ -1,0 +1,89 @@
+{
+  "enabled": true,
+  "status": "enabled",
+  "instance_id": "5e1f0c3a9b7d4e2f8a6c1b3d5f7e9a0c2e4f6a8b0d1c3e5f7a9b0c2d4e6f8a1b",
+  "arith_backend": "x86_64-avx2",
+  "keccak_backend": "x86_64-avx2",
+  "since": 1760000000,
+  "handshakes": {
+    "inbound": {
+      "switched": 120,
+      "legacy_peer": 30,
+      "malformed_record": 1,
+      "first_packet_failed": 0,
+      "abandoned": 2,
+      "internal_error": 0,
+      "shed": 0
+    },
+    "outbound": {
+      "switched": 40,
+      "legacy_peer": 8,
+      "malformed_record": 0,
+      "first_packet_failed": 1,
+      "abandoned": 0,
+      "internal_error": 0,
+      "closed_after_switch": 1,
+      "fallback": 0
+    }
+  },
+  "load_shedding": {
+    "active": false,
+    "threshold_per_s": 1000,
+    "since": 0
+  },
+  "fallback_set": [],
+  "failure_streaks": [
+    {
+      "endpoint": {"kind": "address", "network": "ipv4", "address": "203.0.113.9", "port": 8333},
+      "cause": "first_packet_failed",
+      "reason": "tag",
+      "streak": 1,
+      "last_failure": 1760003000,
+      "next_window_seconds": 3600
+    }
+  ],
+  "recent_failures": {
+    "inbound": {
+      "last_sequence": 1,
+      "dropped": 0,
+      "entries": [
+        {
+          "sequence": 1,
+          "time": 1760001000,
+          "endpoint": {"kind": "address", "network": "ipv4", "address": "198.51.100.77", "port": 51234},
+          "direction": "inbound",
+          "connection_type": "inbound",
+          "peer_id": 17,
+          "outcome": "malformed_record",
+          "reason": "ek_length"
+        }
+      ]
+    },
+    "outbound": {
+      "last_sequence": 2,
+      "dropped": 0,
+      "entries": [
+        {
+          "sequence": 1,
+          "time": 1760003000,
+          "endpoint": {"kind": "address", "network": "ipv4", "address": "203.0.113.9", "port": 8333},
+          "direction": "outbound",
+          "connection_type": "outbound-full-relay",
+          "peer_id": 21,
+          "outcome": "first_packet_failed",
+          "reason": "tag"
+        },
+        {
+          "sequence": 2,
+          "time": 1760004000,
+          "endpoint": {"kind": "address", "network": "ipv6", "address": "2001:db8::5", "port": 8333},
+          "direction": "outbound",
+          "connection_type": "block-relay-only",
+          "peer_id": 25,
+          "outcome": "closed_after_switch",
+          "reason": "eof"
+        }
+      ]
+    }
+  }
+}

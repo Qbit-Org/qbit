@@ -5,6 +5,7 @@
 """Class for bitcoind node under test"""
 
 import contextlib
+from dataclasses import dataclass
 import decimal
 import errno
 from enum import Enum
@@ -80,6 +81,66 @@ else:                            # safest portable value
     UNIX_PATH_MAX = 92
 
 
+@dataclass(frozen=True)
+class ReleaseInfo:
+    """A previous release that a test can run through versions=[...]."""
+    family: str               # "qbit" or "bitcoin"
+    client_version: int       # the release's own CLIENT_VERSION
+    tag: str                  # directory under the previous-releases dir, e.g. "v1.0.0"
+    core_compat_version: int  # the Bitcoin Core version whose options and RPCs it has
+    binary_prefix: str        # "qbit" (qbitd, qbit-cli) or "bitcoin" (bitcoind, bitcoin-cli)
+    supports_v2_pq: bool      # accepts -v2pqtransport
+
+
+# qbit releases are listed explicitly: their client versions restart at 1.0.0,
+# so neither the tag nor the Core interface can be derived from the number.
+# test/get_previous_releases.py downloads each tag listed here.
+QBIT_RELEASES = {r.client_version: r for r in (
+    ReleaseInfo(family="qbit", client_version=10000, tag="v1.0.0",
+                core_compat_version=300200, binary_prefix="qbit", supports_v2_pq=False),
+)}
+
+
+def bitcoin_core_release_tag(version):
+    """Return the Bitcoin Core release tag for a Core client version, e.g. 280200 -> "v28.2"."""
+    if version > 219999:
+        # Starting at client version 220000 the first two digits represent
+        # the major version, e.g. v22.0 instead of v0.22.0.
+        version *= 100
+    return re.sub(
+        r'\.0$' if version <= 219999 else r'(\.0){1,2}$',
+        '', # Remove trailing dot for point releases, after 22.0 also remove double trailing dot.
+        'v{}.{}.{}.{}'.format(
+            (version % 100000000) // 1000000,
+            (version % 1000000) // 10000,
+            (version % 10000) // 100,
+            (version % 100) // 1,
+        ),
+    )
+
+
+# The oldest Bitcoin Core client version the previous-release tooling runs (v0.14).
+# Lower client versions are qbit's, which must be listed in QBIT_RELEASES.
+MIN_BITCOIN_CORE_VERSION = 140000
+
+
+def release_info(version):
+    """Return the ReleaseInfo for a previous release's client version.
+
+    A version listed in QBIT_RELEASES is that qbit release. A version from
+    MIN_BITCOIN_CORE_VERSION up is the Bitcoin Core release with that client
+    version. Any other version is an unknown qbit release and is rejected rather
+    than read as a Core version."""
+    if version in QBIT_RELEASES:
+        return QBIT_RELEASES[version]
+    if not isinstance(version, int) or version < MIN_BITCOIN_CORE_VERSION:
+        known = ", ".join(f"{r.client_version} ({r.tag})" for r in QBIT_RELEASES.values())
+        raise ValueError(f"client version {version!r} is not a known qbit release ({known}) "
+                         f"and is below the oldest Bitcoin Core release the tests run ({MIN_BITCOIN_CORE_VERSION})")
+    return ReleaseInfo(family="bitcoin", client_version=version, tag=bitcoin_core_release_tag(version),
+                       core_compat_version=version, binary_prefix="bitcoin", supports_v2_pq=False)
+
+
 class FailedToStartError(Exception):
     """Raised when a node fails to start correctly."""
 
@@ -134,7 +195,12 @@ class TestNode():
         self.extra_args = extra_args
         self.running_args = list(extra_args or [])
         self.version = version
-        self.supports_p2mronly = self.version is None if supports_p2mronly is None else supports_p2mronly
+        # None for the build under test.
+        self.release = None if version is None else release_info(version)
+        self.supports_p2mronly = self.qbit_version_is_at_least(10000) if supports_p2mronly is None else supports_p2mronly
+        # qbit-only options such as -v2pqtransport go only to the build under test
+        # or to a release whose metadata advertises them.
+        self.supports_v2_pq = self.release is None or self.release.supports_v2_pq
         # Configuration for logging is set as command-line args rather than in the qbit.conf file.
         # This means that starting a bitcoind using the temp dir to debug a failed test won't
         # spam debug.log.
@@ -566,7 +632,14 @@ class TestNode():
             return self._rpc / wallet_path
 
     def version_is_at_least(self, ver):
-        return self.version is None or self.version >= ver
+        """Whether the node has the options and RPCs of Bitcoin Core client version ver.
+
+        qbit releases are compared by the Core version they are based on."""
+        return self.release is None or self.release.core_compat_version >= ver
+
+    def qbit_version_is_at_least(self, ver):
+        """Whether the node is the build under test or a qbit release of at least client version ver."""
+        return self.release is None or (self.release.family == "qbit" and self.release.client_version >= ver)
 
     def stop_node(self, expected_stderr='', *, wait=0, wait_until_stopped=True):
         """Stop the node."""

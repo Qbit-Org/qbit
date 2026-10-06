@@ -29,7 +29,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Callable
 
 import yaml
 
@@ -136,10 +136,56 @@ def _to_text(value: Any) -> str:
     return str(value)
 
 
+_JSON_NUMBER = re.compile(r"-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?")
+
+
+def _to_number(value: Any) -> float:
+    """GitHub's conversion of an operand when the types of a comparison differ."""
+    if value is None:
+        return 0.0
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        if value == "":
+            return 0.0
+        return float(value) if _JSON_NUMBER.fullmatch(value) else float("nan")
+    return float("nan")
+
+
 def _equal(left: Any, right: Any) -> bool:
-    if isinstance(left, str) or isinstance(right, str) or left is None or right is None:
-        return _to_text(left).casefold() == _to_text(right).casefold()
-    return left == right
+    """GitHub's loose equality: strings compare case-insensitively, and operands
+    of different types compare as numbers, so null, '' and false are all equal."""
+    if isinstance(left, str) and isinstance(right, str):
+        return left.casefold() == right.casefold()
+    if type(left) is type(right):
+        return bool(left == right)
+    return _to_number(left) == _to_number(right)
+
+
+def _format(template: Any, *values: Any) -> str:
+    """format(): {N} is replaced by the Nth value, and {{ and }} are literal braces."""
+    if not values:
+        raise ExpressionError("format() needs at least one replacement value")
+
+    def replace(match: re.Match[str]) -> str:
+        if match.group(1) is None:
+            return match.group(0)[0]
+        index = int(match.group(1))
+        if index >= len(values):
+            raise ExpressionError(f"format() has no value {{{index}}}")
+        return _to_text(values[index])
+
+    return re.sub(r"\{\{|\}\}|\{(\d+)\}", replace, _to_text(template))
+
+
+def _to_json(value: Any) -> str:
+    """toJSON(): pretty-printed JSON, as GitHub prints it."""
+    return json.dumps(value, indent=2)
+
+
+_FUNCTIONS: dict[str, Callable[..., Any]] = {"format": _format, "tojson": _to_json}
 
 
 class _Parser:
@@ -211,7 +257,7 @@ class _Parser:
             return float(text) if "." in text else int(text)
         if kind == "path":
             if self._peek() == ("op", "("):
-                raise ExpressionError(f"function calls are not supported: {text}")
+                return self._call(text)
             if text == "true":
                 return True
             if text == "false":
@@ -220,6 +266,20 @@ class _Parser:
                 return None
             return self._lookup(text)
         raise ExpressionError(f"unexpected token {text!r}")
+
+    def _call(self, name: str) -> Any:
+        function = _FUNCTIONS.get(name.casefold())
+        if function is None:
+            raise ExpressionError(f"function calls are not supported: {name}")
+        self._take("(")
+        arguments = []
+        if self._peek() != ("op", ")"):
+            arguments.append(self._parse_or())
+            while self._peek() == ("op", ","):
+                self._take()
+                arguments.append(self._parse_or())
+        self._take(")")
+        return function(*arguments)
 
     def _lookup(self, path: str) -> Any:
         value: Any = self.context
@@ -610,9 +670,19 @@ def run_job_step(
     return run_step(fixture, step, env, cwd, github_env_for(context, job_id, workflow["name"]))
 
 
-def matrix_context(workflow: dict[str, Any], job_id: str, context: dict[str, Any]) -> dict[str, Any]:
+def matrix_include(workflow: dict[str, Any], job_id: str) -> list[dict[str, Any]]:
+    """A job's matrix entries: inline, or the resolver's job catalog that its matrix is selected from."""
     strategy = workflow["jobs"][job_id].get("strategy") or {}
-    include = (strategy.get("matrix") or {}).get("include") or []
+    matrix = strategy.get("matrix") or {}
+    if isinstance(matrix, str):
+        assert matrix == "${{ fromJSON(needs." + RESOLVER_JOB + ".outputs.matrix) }}", matrix
+        catalog = find_step(workflow["jobs"][RESOLVER_JOB], "Select jobs")["env"]["JOB_CATALOG"]
+        return json.loads(catalog)
+    return matrix.get("include") or []
+
+
+def matrix_context(workflow: dict[str, Any], job_id: str, context: dict[str, Any]) -> dict[str, Any]:
+    include = matrix_include(workflow, job_id)
     if not include:
         return context
     return dict(context, matrix=include[-1])
@@ -659,7 +729,7 @@ class ScheduledValidationContractTest(unittest.TestCase):
                 self.assertIn("workflow_dispatch", workflow["on"])
                 self.assertNotIn(RETIRED_BRANCH, self.workflow_text[key])
                 self.assertEqual(
-                    workflow["jobs"][RESOLVER_JOB]["steps"][0]["env"]["MAINTAINED_BRANCH"], MAINTAINED_BRANCH
+                    find_step(workflow["jobs"][RESOLVER_JOB], RESOLVER_STEP)["env"]["MAINTAINED_BRANCH"], MAINTAINED_BRANCH
                 )
 
     def test_scheduled_jobs_use_approved_source(self) -> None:
@@ -956,7 +1026,7 @@ class ScheduledValidationContractTest(unittest.TestCase):
         workflow = self.workflows["nightly"]
         context, _outputs = self.resolve_schedule("nightly")
         job = workflow["jobs"]["nightly-matrix"]
-        include = job["strategy"]["matrix"]["include"]
+        include = matrix_include(workflow, "nightly-matrix")
         native_fuzz = [entry for entry in include if entry["file-env"].endswith("/00_setup_env_native_fuzz.sh")]
         self.assertEqual(len(native_fuzz), 1)
         for entry in include:
@@ -981,6 +1051,23 @@ class ScheduledValidationContractTest(unittest.TestCase):
         self.assertEqual(json.dumps(render("${{ inputs.missing }}", context)), "null")
         with self.assertRaises(ExpressionError):
             evaluate("fromJSON('[]')", context)
+        # Loose equality: operands of different types compare as numbers, so an
+        # absent input, an empty string and false are indistinguishable.
+        context["inputs"] = {"empty": "", "no": False, "yes": True, "one": "1", "word": "false"}
+        for expression in ("inputs.missing == ''", "inputs.empty == null", "inputs.no == ''", "inputs.no == null",
+                           "inputs.missing == 0", "inputs.one == 1", "inputs.yes == 1", "'ABC' == 'abc'"):
+            with self.subTest(expression=expression):
+                self.assertIs(evaluate(expression, context), True)
+        for expression in ("inputs.word == inputs.no", "'true' == inputs.yes", "inputs.missing != ''", "'abc' == 0",
+                           "'1.x.x' == ''"):
+            with self.subTest(expression=expression):
+                self.assertIs(evaluate(expression, context), False)
+        self.assertEqual(evaluate("format('call-{0}-{1}', github.event_name, '1.x.x')", context), "call-schedule-1.x.x")
+        self.assertEqual(evaluate("FORMAT('{{{0}}} {1}', 'a', inputs.missing)", context), "{a} ")
+        self.assertEqual(json.loads(evaluate("toJSON(github)", context)), context["github"])
+        self.assertEqual(evaluate("toJSON(inputs.missing)", context), "null")
+        with self.assertRaises(ExpressionError):
+            evaluate("format('{1}', 'a')", context)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@
 
 import argparse
 import contextlib
+from dataclasses import dataclass
 from fnmatch import fnmatch
 import hashlib
 import os
@@ -93,6 +94,89 @@ SHA256_SUMS = {
     "da0869639c323bbf6f264f1829083b9514e10179b90c34b09d8cbcab8a1897e3": {"tag": "v28.2", "archive": "bitcoin-28.2-win64.zip"},
 }
 
+# qbit releases are GitHub release assets. Each hash is copied verbatim from
+# the release's SHA256SUMS. v1.0.0 has no signed macOS or Windows archives, so
+# those hosts use the "-unsigned" ones; the macOS "-unsigned.zip" holds only the
+# GUI app bundle, so the macOS tarball is used. The functional test framework
+# maps client versions to these tags (QBIT_RELEASES in test_node.py).
+QBIT_RELEASE_URL = "https://github.com/Qbit-Org/qbit/releases/download/{tag}/{archive}"
+QBIT_RELEASES = {
+    "v1.0.0": {
+        "archive_root": "qbit-1.0.0",
+        "archives": {
+            "aarch64-linux-gnu": ("qbit-1.0.0-aarch64-linux-gnu.tar.gz", "a0242e5941eec64070f386e80c848220e2ec2292984a9b2ab1fd93f57436b31d"),
+            "arm-linux-gnueabihf": ("qbit-1.0.0-arm-linux-gnueabihf.tar.gz", "5607d03b68d804934ae5918f7b8bdf4c6e0da3507e809bc05b97146de13156d7"),
+            "arm64-apple-darwin": ("qbit-1.0.0-arm64-apple-darwin-unsigned.tar.gz", "a98310136b57f49471bb19b7bbba1ccf3801da9a1d64202cf7dcf6756db0b3a1"),
+            "powerpc64-linux-gnu": ("qbit-1.0.0-powerpc64-linux-gnu.tar.gz", "acfc5098de60029e359fffda6438f29822e12a0ed5504b1a5940409c627f0384"),
+            "riscv64-linux-gnu": ("qbit-1.0.0-riscv64-linux-gnu.tar.gz", "02455e62c33c0fac5ad65c3d8c8aa0c05be191cf7ad915a9d6dd4892c6b74cc4"),
+            "win64": ("qbit-1.0.0-win64-unsigned.zip", "93ca27facf73f736c1e1b152ad19f11eba0f075b800053bd07de9068fbe885b4"),
+            "x86_64-apple-darwin": ("qbit-1.0.0-x86_64-apple-darwin-unsigned.tar.gz", "e49b48469432e6f8bef26416b1660fc2a64809e0415f3b80cd6cb7b3f2109a2a"),
+            "x86_64-linux-gnu": ("qbit-1.0.0-x86_64-linux-gnu.tar.gz", "ae121af03263b55d530e3f3e8719a71362d0950cba82f54a2bc2d6c437a029b5"),
+        },
+    },
+}
+
+
+@dataclass(frozen=True)
+class ReleaseDownload:
+    url: str
+    archive: str            # file name; ends in .zip for win64, .tar.gz otherwise
+    archive_root: str       # the single top-level directory in the archive
+    sha256: str | None      # None when no hash is registered for this archive
+    adhoc_sign: bool        # unsigned arm64 macOS binaries must be self-signed to run
+
+
+def resolve_download(tag, host):
+    """Return the ReleaseDownload for a release tag on a host, or None if
+    that qbit release has no archive for the host."""
+    if tag in QBIT_RELEASES:
+        release = QBIT_RELEASES[tag]
+        if host not in release["archives"]:
+            return None
+        archive, sha256 = release["archives"][host]
+        return ReleaseDownload(
+            url=QBIT_RELEASE_URL.format(tag=tag, archive=archive),
+            archive=archive,
+            archive_root=release["archive_root"],
+            sha256=sha256,
+            adhoc_sign=host == "arm64-apple-darwin",
+        )
+
+    bin_path = 'bin/bitcoin-core-{}'.format(tag[1:])
+
+    match = re.compile('v(.*)(rc[0-9]+)$').search(tag)
+    if match:
+        bin_path = 'bin/bitcoin-core-{}/test.{}'.format(
+            match.group(1), match.group(2))
+
+    archive_host = host
+    if tag < "v23" and host in ["x86_64-apple-darwin", "arm64-apple-darwin"]:
+        archive_host = "osx64"
+
+    archive_format = 'tar.gz'
+    if archive_host == 'win64':
+        archive_format = 'zip'
+
+    archive = f'bitcoin-{tag[1:]}-{archive_host}.{archive_format}'
+    sha256 = next((h for h, v in SHA256_SUMS.items() if v['archive'] == archive), None)
+    return ReleaseDownload(
+        url=f'https://bitcoincore.org/{bin_path}/{archive}',
+        archive=archive,
+        archive_root=f'bitcoin-{tag[1:]}',
+        sha256=sha256,
+        # Starting with v23 there are arm64 binaries for ARM (e.g. M1, M2) mac.
+        # Until v28.2 they had to be signed to run.
+        adhoc_sign=tag >= "v23" and tag < "v28.2" and host == "arm64-apple-darwin",
+    )
+
+
+def default_tags(host):
+    """Return the release tags the backwards compatibility tests use, without
+    the qbit releases that have no archive for the host."""
+    core_tags = {v['tag'] for v in SHA256_SUMS.values()}
+    qbit_tags = {tag for tag in QBIT_RELEASES if resolve_download(tag, host) is not None}
+    return sorted(core_tags | qbit_tags)
+
 
 @contextlib.contextmanager
 def pushd(new_dir) -> None:
@@ -144,23 +228,12 @@ def download_binary(tag, args) -> int:
             return 0
         shutil.rmtree(tag)
 
-    bin_path = 'bin/bitcoin-core-{}'.format(tag[1:])
-
-    match = re.compile('v(.*)(rc[0-9]+)$').search(tag)
-    if match:
-        bin_path = 'bin/bitcoin-core-{}/test.{}'.format(
-            match.group(1), match.group(2))
-
-    host = args.host
-    if tag < "v23" and host in ["x86_64-apple-darwin", "arm64-apple-darwin"]:
-        host = "osx64"
-
-    archive_format = 'tar.gz'
-    if host == 'win64':
-        archive_format = 'zip'
-
-    archive = f'bitcoin-{tag[1:]}-{host}.{archive_format}'
-    archive_url = f'https://bitcoincore.org/{bin_path}/{archive}'
+    download = resolve_download(tag, args.host)
+    if download is None:
+        print(f"No qbit {tag} archive for host {args.host}", file=sys.stderr)
+        return 1
+    archive = download.archive
+    archive_url = download.url
 
     print(f'Fetching: {archive_url}')
 
@@ -175,8 +248,8 @@ def download_binary(tag, args) -> int:
         hasher.update(afile.read())
     archiveHash = hasher.hexdigest()
 
-    if archiveHash not in SHA256_SUMS or SHA256_SUMS[archiveHash]['archive'] != archive:
-        if archive in [v['archive'] for v in SHA256_SUMS.values()]:
+    if archiveHash != download.sha256:
+        if download.sha256 is not None:
             print(f"Checksum {archiveHash} did not match", file=sys.stderr)
         else:
             print("Checksum for given version doesn't exist", file=sys.stderr)
@@ -186,7 +259,7 @@ def download_binary(tag, args) -> int:
     Path(tag).mkdir()
 
     # Extract archive
-    if host == 'win64':
+    if archive.endswith('.zip'):
         try:
             with zipfile.ZipFile(archive, 'r') as zip:
                 zip.extractall(tag)
@@ -204,16 +277,14 @@ def download_binary(tag, args) -> int:
     else:
         ret = subprocess.run(['tar', '-zxf', archive, '-C', tag,
                               '--strip-components=1',
-                              'bitcoin-{tag}'.format(tag=tag[1:])]).returncode
+                              download.archive_root]).returncode
         if ret != 0:
             print(f"Failed to extract the {tag} tarball", file=sys.stderr)
             return ret
 
     Path(archive).unlink()
 
-    if tag >= "v23" and tag < "v28.2" and args.host == "arm64-apple-darwin":
-        # Starting with v23 there are arm64 binaries for ARM (e.g. M1, M2) mac.
-        # Until v28.2 they had to be signed to run.
+    if download.adhoc_sign:
         binary_path = f'{os.getcwd()}/{tag}/bin/'
 
         for arm_binary in os.listdir(binary_path):
@@ -275,8 +346,15 @@ def main(args) -> int:
     ret = set_host(args)
     if ret:
         return ret
+    tags = args.tags
+    if not tags:
+        # A tag that is asked for explicitly but has no archive for the host
+        # still fails in download_binary.
+        tags = default_tags(args.host)
+        for tag in sorted(set(QBIT_RELEASES) - set(tags)):
+            print(f"Skipping {tag}: no qbit {tag} archive for host {args.host}")
     with pushd(args.target_dir):
-        for tag in args.tags:
+        for tag in tags:
             ret = download_binary(tag, args)
             if ret:
                 return ret
@@ -295,11 +373,11 @@ if __name__ == '__main__':
                         help='remove existing directory.')
     parser.add_argument('-t', '--target-dir', action='store',
                         help='target directory.', default='releases')
-    all_tags = sorted([*set([v['tag'] for v in SHA256_SUMS.values()])])
-    parser.add_argument('tags', nargs='*', default=all_tags,
+    parser.add_argument('tags', nargs='*', default=[],
                         help='release tags. e.g.: v0.18.1 v0.20.0rc2 '
                         '(if not specified, the full list needed for '
-                        'backwards compatibility tests will be used)'
+                        'backwards compatibility tests will be used, without '
+                        'qbit releases that have no archive for the host)'
                         )
     args = parser.parse_args()
     sys.exit(main(args))
