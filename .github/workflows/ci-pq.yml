@@ -354,7 +354,7 @@ jobs:
     name: macOS arm64 unit tests
     needs: resolve-source
     if: ${{ needs.resolve-source.outputs.run_macos_arm64_unit == 'true' }}
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 120
     env:
       DANGER_RUN_CI_ON_HOST: 1
