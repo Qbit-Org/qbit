@@ -597,7 +597,9 @@ BOOST_AUTO_TEST_CASE(every_entry_point_takes_the_override)
         {"Decaps", [&] { SharedSecret s; (void)Decaps(dk, ct, s); }},
         {"GetBackendNames", [] { (void)GetBackendNames(); }},
     };
-    for (const auto& [name, entry_point] : entry_points) {
+    for (const auto& entry : entry_points) {
+        const std::string_view name{entry.first};
+        const std::function<void()>& entry_point{entry.second};
         bool native_while_forced{true};
         bool native_after{!native_possible};
         std::thread{[&] {
