@@ -493,7 +493,9 @@ RPCConsole::RPCConsole(interfaces::Node& node, const PlatformStyle *_platformSty
         //: Explanatory text for v1 transport type.
         tr("v1: unencrypted, plaintext transport protocol"),
         //: Explanatory text for v2 transport type.
-        tr("v2: BIP324 encrypted transport protocol")};
+        tr("v2: BIP324 encrypted transport protocol"),
+        //: Explanatory text for the v2 transport type with hybrid post-quantum session keys.
+        tr("v2 (hybrid post-quantum): v2 with session keys from both ECDH and ML-KEM-1024")};
     const QString transport_types_list{"<ul><li>" + Join(TRANSPORT_TYPE_DOC, QString("</li><li>")) + "</li></ul>"};
     ui->peerTransportTypeLabel->setToolTip(ui->peerTransportTypeLabel->toolTip().arg(transport_types_list));
     const QString hb_list{"<ul><li>\""
@@ -1179,7 +1181,10 @@ void RPCConsole::updateDetailWidget()
         ui->peerSubversion->setText(QString::fromStdString(stats->nodeStats.cleanSubVer));
     }
     ui->peerConnectionType->setText(GUIUtil::ConnectionTypeToQString(stats->nodeStats.m_conn_type, /*prepend_direction=*/true));
-    ui->peerTransportType->setText(QString::fromStdString(TransportTypeAsString(stats->nodeStats.m_transport_type)));
+    ui->peerTransportType->setText(stats->nodeStats.m_transport_pq ?
+                                       //: Transport type of a v2 peer whose session keys are hybrid post-quantum.
+                                       tr("v2 (hybrid post-quantum)") :
+                                       QString::fromStdString(TransportTypeAsString(stats->nodeStats.m_transport_type)));
     if (stats->nodeStats.m_transport_type == TransportProtocolType::V2) {
         ui->peerSessionIdLabel->setVisible(true);
         ui->peerSessionId->setVisible(true);
