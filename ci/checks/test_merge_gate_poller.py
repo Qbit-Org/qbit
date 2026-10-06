@@ -474,6 +474,81 @@ class MergeGatePollerTest(unittest.TestCase):
             f"{ERROR_CHECK_FAILED}rpc-docs concluded failure.",
         )
 
+    # -- results from an earlier run on the same commit ---------------------
+
+    GATE_START = "2026-10-06T14:12:00Z"
+    BEFORE = "2026-10-05T20:47:00Z"
+    AFTER = "2026-10-06T14:40:00Z"
+
+    def test_a_failure_from_before_this_gate_run_is_waited_on_not_trusted(self) -> None:
+        # A reopen, label or re-run starts this gate seconds after the new
+        # workflows, before their own gate checks exist. The newest check of
+        # that name is then the previous run's, which says nothing about the
+        # run under way.
+        for conclusion in ("cancelled", "failure", "timed_out"):
+            with self.subTest(conclusion=conclusion):
+                fake = FakeGh(
+                    self.tmp(f"stale-{conclusion}"),
+                    default=ok(body(page(
+                        check_run("Core Checks Gate", "completed", conclusion, started_at=self.BEFORE, completed_at=self.BEFORE),
+                        check_run("Full Validation Gate", "completed", "success", started_at=self.BEFORE, completed_at=self.BEFORE),
+                    ))),
+                )
+                completed = self.run_gate(fake, GATE_WAIT_TIMEOUT_SECONDS="3", GATE_RUN_STARTED_AT=self.GATE_START)
+                self.assertGateFailed(
+                    completed,
+                    f"{ERROR_TIMED_OUT}Required checks did not complete within 3s and are still pending: "
+                    f"Core Checks Gate (last {conclusion} before this gate run)",
+                    forbidden=(ERROR_CHECK_FAILED, ERROR_UNREADABLE),
+                )
+                self.assertIn("waiting for a newer run", completed.stdout)
+                self.assertGreater(len(fake.calls), 1, "a stale failure must be polled again, not judged once")
+
+    def test_the_newer_run_replaces_a_stale_failure(self) -> None:
+        stale = check_run("Core Checks Gate", "completed", "cancelled", started_at=self.BEFORE, completed_at=self.BEFORE)
+        validation = check_run("Full Validation Gate", "completed", "success", started_at=self.AFTER, completed_at=self.AFTER)
+        fresh_running = check_run("Core Checks Gate", "in_progress", None, started_at=self.AFTER)
+        fresh_green = check_run("Core Checks Gate", "completed", "success", started_at=self.AFTER, completed_at=self.AFTER)
+        fake = FakeGh(
+            self.tmp("stale-then-green"),
+            responses=[
+                ok(body(page(stale, validation))),
+                ok(body(page(stale, validation))),
+                ok(body(page(stale, fresh_running, validation))),
+                ok(body(page(stale, fresh_running, validation))),
+            ],
+            default=ok(body(page(stale, fresh_green, validation))),
+        )
+        completed = self.run_gate(fake, GATE_RUN_STARTED_AT=self.GATE_START)
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertIn("Core Checks Gate: status=completed conclusion=success", completed.stdout)
+
+    def test_a_failure_after_this_gate_run_started_still_fails_at_once(self) -> None:
+        fake = FakeGh(
+            self.tmp("fresh-failure"),
+            default=ok(body(page(
+                check_run("Core Checks Gate", "completed", "failure", started_at=self.AFTER, completed_at=self.AFTER),
+                check_run("Full Validation Gate", "completed", "success", started_at=self.AFTER, completed_at=self.AFTER),
+            ))),
+        )
+        completed = self.run_gate(fake, GATE_RUN_STARTED_AT=self.GATE_START)
+        self.assertGateFailed(completed, f"{ERROR_CHECK_FAILED}Core Checks Gate concluded failure.",
+                              forbidden=(ERROR_TIMED_OUT,))
+        self.assertEqual(len(fake.calls), 1, fake.calls)
+
+    def test_a_success_from_before_this_gate_run_still_counts(self) -> None:
+        # A label starts the gate and Full Validation but not Core Checks, whose
+        # earlier green result on the same commit is still the right answer.
+        fake = FakeGh(
+            self.tmp("stale-success"),
+            default=ok(body(page(
+                check_run("Core Checks Gate", "completed", "success", started_at=self.BEFORE, completed_at=self.BEFORE),
+                check_run("Full Validation Gate", "completed", "success", started_at=self.AFTER, completed_at=self.AFTER),
+            ))),
+        )
+        completed = self.run_gate(fake, GATE_RUN_STARTED_AT=self.GATE_START)
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+
     def test_a_queued_rerun_falls_back_to_created_at_and_is_pending(self) -> None:
         # A re-run that has not started yet has no started_at at all; ordering
         # by created_at keeps it, so an old green run cannot pass the gate.

@@ -740,6 +740,12 @@ jobs:
           GATE_QUERY_BACKOFF_SECONDS="${GATE_QUERY_BACKOFF_SECONDS:-10}"
           GATE_QUERY_BACKOFF_CAP_SECONDS="${GATE_QUERY_BACKOFF_CAP_SECONDS:-60}"
           GATE_QUERY_TIMEOUT_SECONDS="${GATE_QUERY_TIMEOUT_SECONDS:-60}"
+          # When this gate run started, in the API's UTC format. A check that
+          # failed before then belongs to an earlier run on the same commit (a
+          # re-run, a reopen, a label); its newer run may not have created its
+          # check yet, so it is waited on rather than trusted. The test suite
+          # sets it.
+          GATE_RUN_STARTED_AT="${GATE_RUN_STARTED_AT:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 
           for gate_tunable in \
             GATE_WAIT_TIMEOUT_SECONDS \
@@ -774,7 +780,7 @@ jobs:
             | map(select(.name == $name))
             | sort_by(.started_at // .created_at // "")
             | last
-            | if . == null then "absent" else ["found", (.status // ""), (.conclusion // "")] | @tsv end
+            | if . == null then "absent" else ["found", (.status // ""), (.conclusion // ""), (.completed_at // "")] | @tsv end
           '
 
           summarize_stderr() {
@@ -784,7 +790,7 @@ jobs:
           # Read the newest check run named $1 on ${SHA}.
           #
           # On success sets QUERY_OBSERVATION to "absent" or to
-          # "found<TAB>status<TAB>conclusion" and returns 0. Returns 1 when the
+          # "found<TAB>status<TAB>conclusion<TAB>completed_at" and returns 0. Returns 1 when the
           # query could not be read within GATE_QUERY_MAX_ATTEMPTS attempts or
           # before $2, the wall-clock deadline shared with the caller: an
           # unreadable query is never success and never "not found yet".
@@ -873,11 +879,14 @@ jobs:
           # Returns 1 under three distinct error titles: a check concluded
           # something other than success, the check runs could not be read, or
           # the shared deadline passed with checks still pending. Only a
-          # completed check with a success conclusion is success.
+          # completed check with a success conclusion is success. A check that
+          # concluded otherwise before this gate run started is still pending:
+          # it is the previous run on this commit, and its newer run may not
+          # have reported yet.
           wait_for_checks() {
             local check_names=("$@")
             local pending=()
-            local check_name conclusion fields now observation status deadline
+            local check_name completed_at conclusion fields now observation status deadline rest
 
             now="$(date +%s)"
             deadline=$(( now + GATE_WAIT_TIMEOUT_SECONDS ))
@@ -900,11 +909,22 @@ jobs:
 
                 fields="${observation#found$'\t'}"
                 status="${fields%%$'\t'*}"
-                conclusion="${fields#*$'\t'}"
+                rest="${fields#*$'\t'}"
+                conclusion="${rest%%$'\t'*}"
+                completed_at=""
+                if [[ "${rest}" == *$'\t'* ]]; then
+                  completed_at="${rest#*$'\t'}"
+                fi
                 echo "${check_name}: status=${status} conclusion=${conclusion:-pending}"
 
                 if [[ "${status}" == "completed" ]]; then
                   if [[ "${conclusion}" != "success" ]]; then
+                    # ISO 8601 UTC timestamps of the same format order as strings.
+                    if [[ -n "${completed_at}" && "${completed_at}" < "${GATE_RUN_STARTED_AT}" ]]; then
+                      echo "${check_name}: concluded ${conclusion:-unknown} at ${completed_at}, before this gate run started at ${GATE_RUN_STARTED_AT}; waiting for a newer run"
+                      pending+=("${check_name} (last ${conclusion:-unknown} before this gate run)")
+                      continue
+                    fi
                     echo "::error title=Required Merge Gate failed::${check_name} concluded ${conclusion:-unknown}."
                     return 1
                   fi
