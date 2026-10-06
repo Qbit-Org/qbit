@@ -22,15 +22,24 @@ RPC (getpqtransportinfo, and the getpeerinfo and getnetworkinfo fields):
   handshake times out, counts one abandoned offer and no switch.
 - test_rings: 300 inbound failures keep the newest 256, with contiguous sequences, and
   don't evict the outbound ring's entry.
+- test_endpoints: a name-proxy destination (through a SOCKS5 proxy) and, with local IPv6, an
+  IPv6 address, as getpqtransportinfo renders their endpoints.
 - test_connection_count: connections_pq counts the peers getpeerinfo shows with
   transport_pq, and is 0 with the switch off.
 """
 from concurrent.futures import ThreadPoolExecutor
+import platform
 import re
 import socket
 import subprocess
+import sys
 import time
 
+from test_framework.netutil import test_ipv6_local
+from test_framework.socks5 import (
+    Socks5Configuration,
+    Socks5Server,
+)
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     append_config,
@@ -83,6 +92,27 @@ def non_numeric_warning(value, read_as, effect, option="v2pqtransport"):
 def double_negative_warning(effect, option="v2pqtransport"):
     return (f"Warning: -no{option} was given 0 or a non-numeric value, so it was read as -{option}=1: {effect}. "
             f"Use -{option}=0 to switch it off.")
+
+
+def expected_default_backends(config):
+    """The ML-KEM-1024 backends a node runs here by default, or None if this test can't tell."""
+    if not config["components"].getboolean("ENABLE_MLKEM_NATIVE", fallback=False):
+        return ("portable", "portable")
+    machine = platform.machine().lower()
+    if sys.platform == "linux" and machine in ("x86_64", "amd64"):
+        flags = set()
+        with open("/proc/cpuinfo", encoding="utf8") as cpuinfo:
+            for line in cpuinfo:
+                if line.startswith("flags"):
+                    flags = set(line.split(":", 1)[1].split())
+                    break
+        # What the x86_64 assembly needs (cpu_features::HasMlkemX86Native()); Linux lists AVX and
+        # AVX2 only when the OS saves YMM state.
+        native = {"avx", "avx2", "ssse3", "sse4_1", "popcnt", "bmi2"} <= flags
+        return ("x86_64-avx2", "x86_64-avx2") if native else ("portable", "portable")
+    if sys.platform == "darwin" and machine == "arm64":
+        return ("aarch64-neon", "aarch64")
+    return None
 
 
 def zero_counts():
@@ -330,8 +360,15 @@ class PQTransportTest(BitcoinTestFramework):
             assert_equal((info["arith_backend"], info["keccak_backend"]), ("portable", "portable"))
         self.stop_node(0)
 
-        self.log.info("Test a non-numeric -mlkemportable, or a double negative, warns and states which code runs")
+        self.log.info("Test a default node runs native code where this build and CPU have it")
         default = self.check_start(["-v2transport=1"], DISABLED_PQ)[1:]
+        expected = expected_default_backends(self.config)
+        if expected is None:
+            self.log.info("This test can't tell which code runs here by default; not checked")
+        else:
+            assert_equal(default, expected)
+
+        self.log.info("Test a non-numeric -mlkemportable, or a double negative, warns and states which code runs")
         # -mlkemportable=true is read as 0: the default code stays.
         assert_equal(self.check_start(["-v2transport=1", "-mlkemportable=true"], DISABLED_PQ,
                                       expected_stderr=non_numeric_warning("true", 0, NATIVE, "mlkemportable"))[1:], default)
@@ -410,6 +447,12 @@ class PQTransportTest(BitcoinTestFramework):
         self.check_info(node0, start_time=start_time, enabled=False, status="disabled_v2pqtransport")
         instance_ids = [node0.getpqtransportinfo()["instance_id"]]
         self.check_peers(0, 2, "off", "off")
+
+        self.log.info("Test getpqtransportinfo with v2 off and the switch off: status names v2")
+        start_time = int(time.time())
+        self.restart_node(0, extra_args=["-v2transport=0"])
+        self.check_info(node0, start_time=start_time, enabled=False, status="disabled_v2transport")
+        instance_ids.append(node0.getpqtransportinfo()["instance_id"])
 
         self.log.info("Test getpqtransportinfo with v2 off; getpeerinfo v1 on both sides")
         start_time = int(time.time())
@@ -578,6 +621,51 @@ class PQTransportTest(BitcoinTestFramework):
         assert_equal({(entry["outcome"], entry["direction"]) for entry in inbound["entries"]}, {("abandoned", "inbound")})
         self.restart_node(1, extra_args=PQ)
 
+    def outbound_failure(self, dest):
+        """Node 0 connects to dest, which ends at node 1, whose confirmation check fails. Returns node 0's
+        outbound ring entry."""
+        node0, node1, _ = self.nodes
+        before = self.handshakes(node0)
+        node0.addnode(dest, "onetry")
+        self.wait_for_handshakes(node0, before, *[{"outbound": {"switched": 1, outcome: 1}}
+                                                  for outcome in ["closed_after_switch", "first_packet_failed"]])
+        self.wait_for_no_peers(node0, node1)
+        return node0.getpqtransportinfo()["recent_failures"]["outbound"]["entries"][-1]
+
+    def test_endpoints(self):
+        node0, node1, _ = self.nodes
+        self.restart_node(1, extra_args=PQ_FAIL)
+
+        self.log.info("Test a name-proxy destination is accounted to its normalized hostname and port")
+        proxy_port = p2p_port(self.num_nodes)
+        conf = Socks5Configuration()
+        conf.addr = ("127.0.0.1", proxy_port)
+        conf.unauth = True
+        conf.auth = True
+        # The proxy resolves every name to node 1.
+        conf.destinations_factory = lambda addr, port: {"actual_to_addr": "127.0.0.1", "actual_to_port": p2p_port(1)}
+        proxy = Socks5Server(conf)
+        proxy.start()
+        self.restart_node(0, extra_args=PQ + [f"-proxy=127.0.0.1:{proxy_port}"])
+        endpoint = {"kind": "name_proxy", "network": "name_proxy", "address": "pqtest.example", "port": 8333}
+        entry = self.outbound_failure("PQTest.Example.:8333")
+        assert_equal((entry["endpoint"], entry["connection_type"]), (endpoint, "manual"))
+        assert_equal([streak["endpoint"] for streak in node0.getpqtransportinfo()["failure_streaks"]], [endpoint])
+        proxy.stop()
+
+        if not test_ipv6_local():
+            self.log.info("Skipping the IPv6 endpoint: no local IPv6")
+        else:
+            self.log.info("Test an IPv6 endpoint is accounted to its address and port, on both sides")
+            # Node 1 listens on ::1 too, besides qbit.conf's 127.0.0.1.
+            self.restart_node(1, extra_args=PQ_FAIL + ["-bind=[::1]"])
+            self.restart_node(0, extra_args=PQ)
+            entry = self.outbound_failure(f"[::1]:{p2p_port(1)}")
+            assert_equal(entry["endpoint"], {"kind": "address", "network": "ipv6", "address": "::1", "port": p2p_port(1)})
+            inbound = node1.getpqtransportinfo()["recent_failures"]["inbound"]["entries"][-1]["endpoint"]
+            assert_equal((inbound["kind"], inbound["network"], inbound["address"]), ("address", "ipv6", "::1"))
+        self.restart_node(1, extra_args=PQ)
+
     def test_connection_count(self):
         node0, node1, node2 = self.nodes
 
@@ -611,6 +699,7 @@ class PQTransportTest(BitcoinTestFramework):
         self.test_counts()
         self.test_abandoned()
         self.test_rings()
+        self.test_endpoints()
         self.test_connection_count()
 
 
