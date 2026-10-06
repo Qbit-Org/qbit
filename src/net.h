@@ -33,8 +33,11 @@
 #include <util/check.h>
 #include <util/sock.h>
 #include <util/threadinterrupt.h>
+#include <util/time.h>
 
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -44,8 +47,12 @@
 #include <memory>
 #include <optional>
 #include <queue>
+#include <set>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_set>
+#include <variant>
 #include <vector>
 
 class AddrMan;
@@ -371,6 +378,12 @@ public:
 
     /** Whether upon disconnections, a reconnect with V1 is warranted. */
     virtual bool ShouldReconnectV1() const noexcept = 0;
+
+    /** The hybrid negotiation's progress and first failure (nothing, without a negotiation). */
+    virtual PQHandshake::Snapshot GetPQSnapshot() const noexcept { return {}; }
+
+    /** Wipe the hybrid negotiation's pending secrets; the current keys stay in use. */
+    virtual void ClearPQSecrets() noexcept {}
 };
 
 class V1Transport final : public Transport
@@ -455,6 +468,14 @@ public:
     bool ShouldReconnectV1() const noexcept override { return false; }
 };
 
+/** Asked by a negotiating responder, at its key generation point, whether to offer: load
+ *  shedding (#184 part 5). Each call counts one attempted offer. */
+struct PQOfferGate {
+    using Allow = bool (*)(void* context) noexcept;
+    Allow allow{nullptr};
+    void* context{nullptr};
+};
+
 /** The hybrid post-quantum negotiation of one v2 connection (doc/design/pq-transport.md). */
 struct V2PQOptions {
     PQMode mode{PQMode::OFF};
@@ -464,6 +485,8 @@ struct V2PQOptions {
     /** Test only: invert byte 0 of the local ML-KEM shared secret before deriving keys, so the
      *  peer's key confirmation check fails. EK and CT are unchanged. */
     bool corrupt_shared_secret{false};
+    /** Responders only; without one, a negotiating responder always offers. */
+    PQOfferGate offer_gate{};
 };
 
 class V2Transport final : public Transport
@@ -640,6 +663,8 @@ private:
     RecvState m_recv_state GUARDED_BY(m_recv_mutex);
     /** The hybrid negotiation state: KEM secrets and progress. */
     PQHandshake m_pq GUARDED_BY(m_recv_mutex);
+    /** Whether the offer gate declined to offer (load shedding): plain v2, status off. */
+    bool m_pq_shed GUARDED_BY(m_recv_mutex){false};
 
     /** Lock for sending-side fields. If both sending and receiving fields are accessed,
      *  m_recv_mutex must be acquired before m_send_mutex. */
@@ -739,14 +764,199 @@ public:
     // Miscellaneous functions.
     bool ShouldReconnectV1() const noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_recv_mutex, !m_send_mutex);
     Info GetInfo() const noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_recv_mutex);
-    /** The hybrid negotiation's progress and first failure. */
-    PQHandshake::Snapshot GetPQSnapshot() const noexcept EXCLUSIVE_LOCKS_REQUIRED(!m_recv_mutex);
+    PQHandshake::Snapshot GetPQSnapshot() const noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_recv_mutex);
+    void ClearPQSecrets() noexcept override EXCLUSIVE_LOCKS_REQUIRED(!m_recv_mutex, !m_send_mutex);
 
     /** Test only: whether the decapsulation key or the retained ECDH secret is still held. */
     bool HoldsHybridSecretsForTesting() const noexcept EXCLUSIVE_LOCKS_REQUIRED(!m_recv_mutex);
     /** Test only: discard the retained ECDH secret and transcript, as an inconsistent cipher state
      *  would. Every later use of them fails closed. */
     void DiscardHybridSecretForTesting() noexcept EXCLUSIVE_LOCKS_REQUIRED(!m_recv_mutex, !m_send_mutex);
+};
+
+/**
+ * Why a connection closed. The first recorded cause wins (see
+ * CNode::RequestDisconnect()), so cleanup that runs after a peer closed the
+ * connection never relabels it.
+ */
+enum class NodeCloseCause : uint8_t {
+    //! No cause recorded. A node that reaches DisconnectNodes() without one
+    //! (fDisconnect set directly) is finalized there as LOCAL.
+    NONE = 0,
+    //! Our own decision: operator, eviction, feeler, protocol policy, network off or shutdown.
+    LOCAL = 1,
+    //! recv() returned 0: the peer closed the connection.
+    PEER_EOF = 2,
+    //! recv() failed with a non-transient error, such as a connection reset.
+    PEER_RESET = 3,
+    //! send() failed with a non-transient error.
+    SEND_ERROR = 4,
+    //! The peer stopped responding: InactivityCheck() or the ping timeout.
+    TIMEOUT = 5,
+};
+
+/** A name-proxy destination: the SOCKS destination hostname and the effective port. */
+struct PQNameEndpoint {
+    std::string hostname;
+    uint16_t port{0};
+    friend bool operator==(const PQNameEndpoint&, const PQNameEndpoint&) = default;
+    friend auto operator<=>(const PQNameEndpoint&, const PQNameEndpoint&) = default;
+};
+
+/**
+ * The endpoint a connection's hybrid negotiation outcomes are accounted to. A resolved
+ * destination, and an inbound peer, is its CService: the address, of any network, and the port
+ * (for an inbound peer, its source port). A name-proxy destination, never resolved locally, is
+ * its normalized hostname and port; never the proxy's own address.
+ */
+using PQEndpointKey = std::variant<CService, PQNameEndpoint>;
+
+/** The endpoint of a name-proxy destination: hostname in lowercase ASCII, one trailing root dot removed. */
+PQNameEndpoint MakePQNameEndpoint(std::string_view hostname, uint16_t port);
+
+/** A hybrid negotiation event. Each one's word (PQOutcomeString) is its counter key and log word. */
+enum class PQOutcome : uint8_t {
+    SWITCHED = 0,
+    //! The peer's key confirmation verified: a success, not counted (switched counted it).
+    CONFIRMED = 1,
+    LEGACY_PEER = 2,
+    MALFORMED_RECORD = 3,
+    FIRST_PACKET_FAILED = 4,
+    //! A responder's offer was queued, but no authenticated version arrived before the close.
+    ABANDONED = 5,
+    //! Outbound: the peer closed (or timed out) after we switched, before its confirmation.
+    CLOSED_AFTER_SWITCH = 6,
+    //! Outbound: an endpoint entered the fallback set.
+    FALLBACK = 7,
+    INTERNAL_ERROR = 8,
+};
+
+std::string_view PQOutcomeString(PQOutcome outcome) noexcept;
+
+/** Hybrid negotiation event counts of one direction. They count events, not exclusive final
+ *  states: a switch whose confirmation then fails counts switched and first_packet_failed. */
+template <typename T>
+struct PQCountsBase {
+    T switched{0};
+    T legacy_peer{0};
+    T malformed_record{0};
+    T first_packet_failed{0};
+    //! Inbound only: only responders offer.
+    T abandoned{0};
+    T internal_error{0};
+    //! Outbound only.
+    T closed_after_switch{0};
+    T fallback{0};
+    //! Inbound only: offers not made because of load shedding.
+    T shed{0};
+};
+using PQCounters = PQCountsBase<std::atomic<uint64_t>>;
+using PQCounts = PQCountsBase<uint64_t>;
+
+/** A non-success hybrid negotiation outcome, as kept in a failure ring. */
+struct PQFailureEntry {
+    uint64_t sequence;
+    NodeSeconds time;
+    PQEndpointKey endpoint;
+    bool inbound;
+    ConnectionType connection_type;
+    NodeId peer_id;
+    PQOutcome outcome;
+    //! Assigned only from the fixed reason vocabulary, never from peer bytes.
+    std::string reason;
+};
+
+/** The most recent failures of one direction, oldest first, with their own sequence. */
+struct PQFailureRing {
+    //! The sequence of the newest entry ever added (the first is 1); 0 if none.
+    uint64_t last_sequence{0};
+    //! How many entries were evicted to keep the bound.
+    uint64_t dropped{0};
+    std::deque<PQFailureEntry> entries;
+};
+
+/** At most this many entries in each failure ring. */
+inline constexpr size_t PQ_FAILURE_RING_SIZE{256};
+
+/** Consecutive counted failures (outbound malformed_record, first_packet_failed and
+ *  closed_after_switch) that put an endpoint in the fallback set. */
+inline constexpr uint32_t PQ_FAILURE_THRESHOLD{3};
+/** An endpoint's fallback windows: its first entry, its second, then every later one. */
+inline constexpr std::array<std::chrono::seconds, 3> PQ_FALLBACK_WINDOWS{
+    std::chrono::seconds{3600}, std::chrono::seconds{14400}, std::chrono::seconds{86400}};
+/** At most this many endpoints in the fallback, streak and escalation history. */
+inline constexpr size_t PQ_MAX_ENDPOINT_HISTORY{1000};
+/** Distinct endpoints with counted failures, and no success since startup, that suggest a local fault. */
+inline constexpr size_t PQ_LOCAL_FAULT_THRESHOLD{8};
+
+/** Inbound offers attempted within one second above which responders stop offering. R3's flood
+ *  measurement (#222) sets the final value; CConnman::Options can override it. */
+inline constexpr uint64_t DEFAULT_PQ_SHED_THRESHOLD_PER_S{1000};
+/** Consecutive seconds with fewer than half the threshold's attempts that end load shedding. */
+inline constexpr std::chrono::seconds PQ_SHED_QUIET_PERIOD{10};
+
+/** Inbound offer load shedding. */
+struct PQLoadSheddingStats {
+    bool active;
+    uint64_t threshold_per_s;
+    //! When the current shedding period started; the epoch (0) when inactive.
+    NodeSeconds since;
+};
+
+/** An endpoint's counted failures and fallback windows. */
+struct PQEndpointHistory {
+    //! Consecutive counted failures since the last fallback window ended.
+    uint32_t streak{0};
+    //! Fallback windows that ended; saturates at PQ_FALLBACK_WINDOWS.size().
+    uint8_t completed_windows{0};
+    //! The active fallback window, if any.
+    std::optional<NodeSeconds> entered{};
+    std::optional<NodeSeconds> expires{};
+    //! The latest counted failure.
+    NodeSeconds last_failure{};
+    PQOutcome cause{PQOutcome::MALFORMED_RECORD};
+    //! Assigned only from the fixed reason vocabulary.
+    std::string reason{};
+    //! The oldest insertion is evicted first; unique, so equal times can't tie.
+    uint64_t insertion_order{0};
+};
+
+/** An endpoint in the fallback set. */
+struct PQFallbackStats {
+    PQEndpointKey endpoint;
+    //! The failure that completed the streak, and its reason.
+    PQOutcome cause;
+    std::string reason;
+    uint32_t streak;
+    NodeSeconds entered;
+    NodeSeconds expires;
+};
+
+/** An endpoint with counted failures that is not in the fallback set. */
+struct PQStreakStats {
+    PQEndpointKey endpoint;
+    //! The latest counted failure, and its reason.
+    PQOutcome cause;
+    std::string reason;
+    uint32_t streak;
+    NodeSeconds last_failure;
+    //! The window the endpoint would enter at PQ_FAILURE_THRESHOLD.
+    std::chrono::seconds next_window;
+};
+
+/** An owning copy of the hybrid transport statistics, without atomics. */
+struct PQTransportStats {
+    //! Random per process start; counters, rings and history count from since.
+    uint256 instance_id;
+    NodeSeconds since;
+    PQCounts inbound;
+    PQCounts outbound;
+    PQFailureRing inbound_failures;
+    //! Outbound connections, manual ones included.
+    PQFailureRing outbound_failures;
+    std::vector<PQFallbackStats> fallback_set;
+    std::vector<PQStreakStats> failure_streaks;
+    PQLoadSheddingStats load_shedding;
 };
 
 struct CNodeOptions
@@ -757,6 +967,10 @@ struct CNodeOptions
     size_t recv_flood_size{DEFAULT_MAXRECEIVEBUFFER * 1000};
     bool use_v2transport = false;
     bool is_archive_connection = false;
+    //! The hybrid negotiation of a v2 transport; off unless set.
+    V2PQOptions pq{};
+    //! The endpoint key of the connection; the peer's address and port if unset.
+    std::optional<PQEndpointKey> pq_endpoint{};
 };
 
 /** Information about a peer */
@@ -818,7 +1032,7 @@ public:
     /** fSuccessfullyConnected is set to true on receiving VERACK from the peer. */
     std::atomic_bool fSuccessfullyConnected{false};
     // Setting fDisconnect to true will cause the node to be disconnected the
-    // next time DisconnectNodes() runs
+    // next time DisconnectNodes() runs. Set it with RequestDisconnect().
     std::atomic_bool fDisconnect{false};
     CountingSemaphoreGrant<> grantOutbound;
     std::atomic<int> nRefCount{0};
@@ -829,6 +1043,13 @@ public:
 
     const ConnectionType m_conn_type;
     const bool m_is_archive_connection{false};
+    //! The endpoint this connection's hybrid negotiation outcomes are accounted to.
+    const PQEndpointKey m_pq_endpoint;
+
+    //! The PQOutcome events already accounted for this connection (a bit per outcome), and
+    //! whether its accounting is final. Accessed only by CConnman, under its m_pq_mutex.
+    uint16_t m_pq_accounted_events{0};
+    bool m_pq_finalized{false};
 
     /** Move all messages from the received queue to the processing queue. */
     void MarkReceivedMsgsForProcessing()
@@ -1033,7 +1254,19 @@ public:
         nRefCount--;
     }
 
-    void CloseSocketDisconnect() EXCLUSIVE_LOCKS_REQUIRED(!m_sock_mutex);
+    /**
+     * Mark the node for disconnection and record why. Only the first cause is
+     * kept: later or concurrent calls, including cleanup, leave it unchanged.
+     * The cause is recorded before fDisconnect is set, so a thread that sees
+     * fDisconnect also sees the cause.
+     */
+    void RequestDisconnect(NodeCloseCause cause = NodeCloseCause::LOCAL) noexcept;
+
+    /** RequestDisconnect(cause), then close the socket. */
+    void CloseSocketDisconnect(NodeCloseCause cause = NodeCloseCause::LOCAL) EXCLUSIVE_LOCKS_REQUIRED(!m_sock_mutex);
+
+    /** The first recorded close cause, or NONE if none has been recorded. */
+    NodeCloseCause GetCloseCause() const noexcept { return m_close_cause.load(); }
 
     void CopyStats(CNodeStats& stats) EXCLUSIVE_LOCKS_REQUIRED(!m_subver_mutex, !m_addr_local_mutex, !cs_vSend, !cs_vRecv);
 
@@ -1065,6 +1298,9 @@ private:
     const NodeId id;
     const uint64_t nLocalHostNonce;
     std::atomic<int> m_greatest_common_version{INIT_PROTO_VERSION};
+
+    /** Written only by RequestDisconnect(), which keeps the first cause. */
+    std::atomic<NodeCloseCause> m_close_cause{NodeCloseCause::NONE};
 
     const size_t m_recv_flood_size;
     std::list<CNetMessage> vRecvMsg; // Used only by SocketHandler thread
@@ -1173,9 +1409,11 @@ public:
         bool m_i2p_accept_incoming;
         bool whitelist_forcerelay = DEFAULT_WHITELISTFORCERELAY;
         bool whitelist_relay = DEFAULT_WHITELISTRELAY;
+        //! Inbound offer load shedding threshold (unit tests and the flood lab).
+        uint64_t pq_shed_threshold_per_s{DEFAULT_PQ_SHED_THRESHOLD_PER_S};
     };
 
-    void Init(const Options& connOptions) EXCLUSIVE_LOCKS_REQUIRED(!m_added_nodes_mutex, !m_total_bytes_sent_mutex)
+    void Init(const Options& connOptions) EXCLUSIVE_LOCKS_REQUIRED(!m_added_nodes_mutex, !m_total_bytes_sent_mutex, !m_pq_shed_mutex)
     {
         AssertLockNotHeld(m_total_bytes_sent_mutex);
 
@@ -1207,6 +1445,11 @@ public:
         m_onion_binds = connOptions.onion_binds;
         whitelist_forcerelay = connOptions.whitelist_forcerelay;
         whitelist_relay = connOptions.whitelist_relay;
+        {
+            LOCK(m_pq_shed_mutex);
+            // At least 1: a threshold of 0 would shed every offer and never stop.
+            m_pq_shed_threshold = std::max<uint64_t>(connOptions.pq_shed_threshold_per_s, 1);
+        }
     }
 
     CConnman(uint64_t seed0, uint64_t seed1, AddrMan& addrman, const NetGroupManager& netgroupman,
@@ -1214,11 +1457,11 @@ public:
 
     ~CConnman();
 
-    bool Start(CScheduler& scheduler, const Options& options) EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !m_added_nodes_mutex, !m_addr_fetches_mutex, !mutexMsgProc);
+    bool Start(CScheduler& scheduler, const Options& options) EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !m_added_nodes_mutex, !m_addr_fetches_mutex, !mutexMsgProc, !m_pq_shed_mutex);
 
     void StopThreads();
-    void StopNodes();
-    void Stop()
+    void StopNodes() EXCLUSIVE_LOCKS_REQUIRED(!m_pq_mutex);
+    void Stop() EXCLUSIVE_LOCKS_REQUIRED(!m_pq_mutex)
     {
         StopThreads();
         StopNodes();
@@ -1228,7 +1471,7 @@ public:
     bool GetNetworkActive() const { return fNetworkActive; };
     bool GetUseAddrmanOutgoing() const { return m_use_addrman_outgoing; };
     void SetNetworkActive(bool active);
-    void OpenNetworkConnection(const CAddress& addrConnect, bool fCountFailure, CountingSemaphoreGrant<>&& grant_outbound, const char* strDest, ConnectionType conn_type, bool use_v2transport, bool is_archive_connection = false) EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex);
+    void OpenNetworkConnection(const CAddress& addrConnect, bool fCountFailure, CountingSemaphoreGrant<>&& grant_outbound, const char* strDest, ConnectionType conn_type, bool use_v2transport, bool is_archive_connection = false) EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex, !m_pq_mutex);
     bool CheckIncomingNonce(uint64_t nonce);
     void ASMapHealthCheck();
 
@@ -1324,7 +1567,7 @@ public:
      *                          - Max total outbound connection capacity filled
      *                          - Max connection capacity for type is filled
      */
-    bool AddConnection(const std::string& address, ConnectionType conn_type, bool use_v2transport) EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex);
+    bool AddConnection(const std::string& address, ConnectionType conn_type, bool use_v2transport) EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex, !m_pq_mutex);
 
     size_t GetNodeCount(ConnectionDirection) const;
     std::map<CNetAddr, LocalServiceInfo> getNetLocalAddresses() const;
@@ -1373,6 +1616,13 @@ public:
     uint64_t GetTotalBytesRecv() const;
     uint64_t GetTotalBytesSent() const EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex);
 
+    /** An owning copy of the hybrid transport counters, failure rings and endpoint history. */
+    PQTransportStats GetPQTransportStats() const EXCLUSIVE_LOCKS_REQUIRED(!m_pq_mutex, !m_pq_shed_mutex);
+
+    /** Whether new outbound connections to endpoint run plain v2, because repeated hybrid
+     *  failures put it in the fallback set. Ends a window that expired. */
+    bool IsPQFallback(const PQEndpointKey& endpoint, NodeSeconds now) EXCLUSIVE_LOCKS_REQUIRED(!m_pq_mutex);
+
     /** Get a unique deterministic randomizer. */
     CSipHasher GetDeterministicRandomizer(uint64_t id) const;
 
@@ -1405,10 +1655,10 @@ private:
     bool Bind(const CService& addr, unsigned int flags, NetPermissionFlags permissions);
     bool InitBinds(const Options& options);
 
-    void ThreadOpenAddedConnections() EXCLUSIVE_LOCKS_REQUIRED(!m_added_nodes_mutex, !m_unused_i2p_sessions_mutex, !m_reconnections_mutex);
+    void ThreadOpenAddedConnections() EXCLUSIVE_LOCKS_REQUIRED(!m_added_nodes_mutex, !m_unused_i2p_sessions_mutex, !m_reconnections_mutex, !m_pq_mutex);
     void AddAddrFetch(const std::string& strDest) EXCLUSIVE_LOCKS_REQUIRED(!m_addr_fetches_mutex);
-    void ProcessAddrFetch() EXCLUSIVE_LOCKS_REQUIRED(!m_addr_fetches_mutex, !m_unused_i2p_sessions_mutex);
-    void ThreadOpenConnections(std::vector<std::string> connect, std::span<const std::string> seed_nodes) EXCLUSIVE_LOCKS_REQUIRED(!m_addr_fetches_mutex, !m_added_nodes_mutex, !m_nodes_mutex, !m_unused_i2p_sessions_mutex, !m_reconnections_mutex);
+    void ProcessAddrFetch() EXCLUSIVE_LOCKS_REQUIRED(!m_addr_fetches_mutex, !m_unused_i2p_sessions_mutex, !m_pq_mutex);
+    void ThreadOpenConnections(std::vector<std::string> connect, std::span<const std::string> seed_nodes) EXCLUSIVE_LOCKS_REQUIRED(!m_addr_fetches_mutex, !m_added_nodes_mutex, !m_nodes_mutex, !m_unused_i2p_sessions_mutex, !m_reconnections_mutex, !m_pq_mutex);
     void ThreadMessageHandler() EXCLUSIVE_LOCKS_REQUIRED(!mutexMsgProc);
     void ThreadI2PAcceptIncoming();
     void AcceptConnection(const ListenSocket& hListenSocket);
@@ -1426,7 +1676,7 @@ private:
                                       const CService& addr_bind,
                                       const CService& addr);
 
-    void DisconnectNodes() EXCLUSIVE_LOCKS_REQUIRED(!m_reconnections_mutex, !m_nodes_mutex);
+    void DisconnectNodes() EXCLUSIVE_LOCKS_REQUIRED(!m_reconnections_mutex, !m_nodes_mutex, !m_pq_mutex);
     void NotifyNumConnectionsChanged();
     /** Return true if the peer is inactive and should be disconnected. */
     bool InactivityCheck(const CNode& node) const;
@@ -1441,7 +1691,7 @@ private:
     /**
      * Check connected and listening sockets for IO readiness and process them accordingly.
      */
-    void SocketHandler() EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !mutexMsgProc);
+    void SocketHandler() EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !mutexMsgProc, !m_pq_mutex);
 
     /**
      * Do the read/write for connected sockets that are ready for IO.
@@ -1450,7 +1700,7 @@ private:
      */
     void SocketHandlerConnected(const std::vector<CNode*>& nodes,
                                 const Sock::EventsPerSock& events_per_sock)
-        EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !mutexMsgProc);
+        EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !mutexMsgProc, !m_pq_mutex);
 
     /**
      * Accept incoming connections, one from each read-ready listening socket.
@@ -1458,7 +1708,7 @@ private:
      */
     void SocketHandlerListening(const Sock::EventsPerSock& events_per_sock);
 
-    void ThreadSocketHandler() EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !mutexMsgProc, !m_nodes_mutex, !m_reconnections_mutex);
+    void ThreadSocketHandler() EXCLUSIVE_LOCKS_REQUIRED(!m_total_bytes_sent_mutex, !mutexMsgProc, !m_nodes_mutex, !m_reconnections_mutex, !m_pq_mutex, !m_pq_shed_mutex);
     void ThreadDNSAddressSeed() EXCLUSIVE_LOCKS_REQUIRED(!m_addr_fetches_mutex, !m_nodes_mutex);
 
     uint64_t CalculateKeyedNetGroup(const CNetAddr& ad) const;
@@ -1474,7 +1724,7 @@ private:
     bool AlreadyConnectedToAddress(const CAddress& addr);
 
     bool AttemptToEvictConnection();
-    CNode* ConnectNode(CAddress addrConnect, const char *pszDest, bool fCountFailure, ConnectionType conn_type, bool use_v2transport, bool is_archive_connection = false) EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex);
+    CNode* ConnectNode(CAddress addrConnect, const char *pszDest, bool fCountFailure, ConnectionType conn_type, bool use_v2transport, bool is_archive_connection = false) EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex, !m_pq_mutex);
     void AddWhitelistPermissionFlags(NetPermissionFlags& flags, std::optional<CNetAddr> addr, const std::vector<NetWhitelistPermissions>& ranges) const;
 
     void DeleteNode(CNode* pnode);
@@ -1739,7 +1989,7 @@ private:
     std::list<ReconnectionInfo> m_reconnections GUARDED_BY(m_reconnections_mutex);
 
     /** Attempt reconnections, if m_reconnections non-empty. */
-    void PerformReconnections() EXCLUSIVE_LOCKS_REQUIRED(!m_reconnections_mutex, !m_unused_i2p_sessions_mutex);
+    void PerformReconnections() EXCLUSIVE_LOCKS_REQUIRED(!m_reconnections_mutex, !m_unused_i2p_sessions_mutex, !m_pq_mutex);
 
     /**
      * Cap on the size of `m_unused_i2p_sessions`, to ensure it does not
@@ -1783,6 +2033,118 @@ private:
     private:
         std::vector<CNode*> m_nodes_copy;
     };
+
+    /** One hybrid negotiation event of a connection, to log once m_pq_mutex is released. */
+    struct PQLogLine {
+        PQOutcome outcome;
+        std::string_view reason;
+        //! FALLBACK: the end of the window.
+        std::optional<NodeSeconds> until{};
+    };
+
+    /** What AccountPQ() leaves to log. */
+    struct PQLogLines {
+        std::vector<PQLogLine> outcomes;
+        //! Whether the one-time local-fault warning is due.
+        bool local_fault{false};
+    };
+
+    /**
+     * Account the hybrid negotiation events of node that are new since its last observation. It
+     * runs after the node received bytes, and once more, finalizing, before DisconnectNodes()
+     * hands the node to the disconnected pool: that derives closed_after_switch and abandoned
+     * from the close cause, marks the node finalized so no later observation counts anything,
+     * and wipes the transport's pending secrets. With the network off, every close is our own
+     * decision, so nothing is recorded, but finalization still wipes. StopNodes() finalizes the
+     * connections it deletes at shutdown the same way, with record_outcomes false: shutdown
+     * closes are our own too.
+     *
+     * The transport is snapshotted under its own lock, which is released before m_pq_mutex is
+     * taken; nothing calls into the transport, socket, peer manager or node enumeration while
+     * holding m_pq_mutex.
+     */
+    void ObservePQ(CNode& node, bool finalizing, bool record_outcomes = true) EXCLUSIVE_LOCKS_REQUIRED(!m_pq_mutex);
+
+    /** Count each event of snapshot not yet accounted for node, once, add a ring entry for each
+     *  non-success outcome, and update the endpoint history. Returns what to log. */
+    PQLogLines AccountPQ(CNode& node, const PQHandshake::Snapshot& snapshot, NodeCloseCause cause,
+                         bool finalizing, NodeSeconds now) EXCLUSIVE_LOCKS_REQUIRED(m_pq_mutex);
+
+    /**
+     * Count an outbound connection's failure against its endpoint. The third consecutive one
+     * enters the fallback set, unless the endpoint completed a hybrid handshake since startup.
+     * A failure during an active window neither extends it nor enters again. Returns the end of
+     * a window it started, and sets local_fault when the local-fault warning is due.
+     */
+    std::optional<NodeSeconds> CountPQFailure(const CNode& node, PQOutcome outcome, std::string_view reason, NodeSeconds now,
+                                              bool& local_fault) EXCLUSIVE_LOCKS_REQUIRED(m_pq_mutex);
+
+    /** Add a non-success outcome to the ring of its direction. */
+    void AddPQFailure(PQFailureEntry entry) EXCLUSIVE_LOCKS_REQUIRED(m_pq_mutex);
+
+    /** Log one event of node: inbound and outbound lines come from separate call sites, because
+     *  the logger rate-limits per call site. */
+    void LogPQOutcome(const CNode& node, const PQLogLine& line) const;
+
+    /** Warn that this node's own ML-KEM code may be at fault. */
+    void LogPQLocalFault() const;
+
+    /** The hybrid negotiation mode of new v2 connections. Off until the option sets it (part 6);
+     *  set before the connection threads start. */
+    PQMode m_pq_mode{PQMode::OFF};
+
+    mutable Mutex m_pq_mutex;
+    //! Event counters, inbound [0] and outbound [1]. Written under m_pq_mutex, except shed,
+    //! which the offer gate counts under m_pq_shed_mutex.
+    std::array<PQCounters, 2> m_pq_counters;
+    //! Failure rings, inbound [0] and outbound [1]: inbound noise can't evict outbound evidence.
+    std::array<PQFailureRing, 2> m_pq_failures GUARDED_BY(m_pq_mutex);
+    const uint256 m_pq_instance_id{GetRandHash()};
+    const NodeSeconds m_pq_since{Now<NodeSeconds>()};
+    //! Outbound endpoints with counted failures: streaks, fallback windows and escalation.
+    std::map<PQEndpointKey, PQEndpointHistory> m_pq_history GUARDED_BY(m_pq_mutex);
+    uint64_t m_pq_history_insertions GUARDED_BY(m_pq_mutex){0};
+    //! Outbound endpoints that completed a hybrid handshake since startup. Never evicted; its
+    //! size is bounded by the distinct successful outbound endpoints.
+    std::set<PQEndpointKey> m_pq_successful_endpoints GUARDED_BY(m_pq_mutex);
+    //! Distinct endpoints with counted failures, up to PQ_LOCAL_FAULT_THRESHOLD.
+    std::set<PQEndpointKey> m_pq_failed_endpoints_for_warning GUARDED_BY(m_pq_mutex);
+    bool m_pq_local_fault_warned GUARDED_BY(m_pq_mutex){false};
+
+    /**
+     * Inbound offer load shedding, with one-second counters. The seconds come from the steady
+     * clock, so a wall clock step can't merge or stretch them; only the reported start time is
+     * wall-clock time. Its own mutex is taken under the transport's locks (the offer gate runs
+     * inside V2Transport), so nothing holding it calls into a transport, and it never nests with
+     * m_pq_mutex.
+     */
+    using PQShedSeconds = std::chrono::time_point<MockableSteadyClock, std::chrono::seconds>;
+    static PQShedSeconds PQShedNow() noexcept { return std::chrono::time_point_cast<std::chrono::seconds>(MockableSteadyClock::now()); }
+    mutable Mutex m_pq_shed_mutex;
+    uint64_t m_pq_shed_threshold GUARDED_BY(m_pq_shed_mutex){DEFAULT_PQ_SHED_THRESHOLD_PER_S};
+    //! The current second, and the offers attempted in it.
+    PQShedSeconds m_pq_shed_second GUARDED_BY(m_pq_shed_mutex){};
+    uint64_t m_pq_shed_attempts GUARDED_BY(m_pq_shed_mutex){0};
+    //! The first of the run of complete seconds with fewer than half the threshold's attempts.
+    std::optional<PQShedSeconds> m_pq_quiet_since GUARDED_BY(m_pq_shed_mutex);
+    //! When the current shedding period started (wall clock, for the stats); unset when offering.
+    std::optional<NodeSeconds> m_pq_shedding_since GUARDED_BY(m_pq_shed_mutex);
+
+    /** The offer gate of inbound transports: count one attempted offer, and decline it while
+     *  shedding, counting it as shed. */
+    bool AllowPQOffer() noexcept EXCLUSIVE_LOCKS_REQUIRED(!m_pq_shed_mutex);
+    //! The PQOfferGate function; the transport calls it under its own locks, never under m_pq_shed_mutex.
+    static bool AllowPQOffer(void* connman) noexcept NO_THREAD_SAFETY_ANALYSIS;
+
+    /** Close the seconds before now, and stop shedding after PQ_SHED_QUIET_PERIOD quiet ones.
+     *  Returns whether shedding stopped. */
+    bool AdvancePQShedding(PQShedSeconds now) EXCLUSIVE_LOCKS_REQUIRED(m_pq_shed_mutex);
+
+    /** Stop shedding when the flood is over, even if no new offer is attempted. */
+    void UpdatePQShedding(PQShedSeconds now) EXCLUSIVE_LOCKS_REQUIRED(!m_pq_shed_mutex);
+
+    /** Log a load shedding transition: started (with the threshold) or stopped. */
+    static void LogPQShedding(std::optional<uint64_t> started_threshold);
 
     const CChainParams& m_params;
 

@@ -11,6 +11,7 @@
 #include <util/sock.h>
 #include <util/threadinterrupt.h>
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -218,6 +219,23 @@ bool IsProxy(const CNetAddr &addr);
 bool SetNameProxy(const Proxy &addrProxy);
 bool HaveNameProxy();
 bool GetNameProxy(Proxy &nameProxyOut);
+
+/**
+ * Test only: saves every proxy setting (each network's proxy and the name proxy) when created,
+ * and restores them when destroyed. The settings can't be unset otherwise, so a test that sets a
+ * proxy uses this to keep it from leaking into later tests.
+ */
+class ProxySettingsRestorerForTesting
+{
+    std::array<Proxy, NET_MAX> m_proxies;
+    Proxy m_name_proxy;
+
+public:
+    ProxySettingsRestorerForTesting();
+    ~ProxySettingsRestorerForTesting();
+    ProxySettingsRestorerForTesting(const ProxySettingsRestorerForTesting&) = delete;
+    ProxySettingsRestorerForTesting& operator=(const ProxySettingsRestorerForTesting&) = delete;
+};
 
 using DNSLookupFn = std::function<std::vector<CNetAddr>(const std::string&, bool)>;
 extern DNSLookupFn g_dns_lookup;
