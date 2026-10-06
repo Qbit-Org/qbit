@@ -309,8 +309,9 @@ qbit reports each v2 connection's negotiation status as one of these values:
 - `hybrid` once the peer's confirmation verifies;
 - `legacy_peer` when the peer's version packet carries no usable offer or
   accept, so the ECDH keys stay;
-- `off` when the switch is off, or after a local key generation, key check or
-  encapsulation fault that left the connection on plain v2;
+- `off` when the switch is off, when a responder sheds its offer under load,
+  or after a local key generation, key check or encapsulation fault that left
+  the connection on plain v2;
 - `fallback` for an outbound connection that runs plain v2 because of earlier
   failures; inbound connections never fall back.
 
