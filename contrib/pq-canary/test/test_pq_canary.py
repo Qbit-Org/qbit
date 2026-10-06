@@ -69,13 +69,17 @@ class Node:
         self.boot = boot
         self.instance += 1
 
-    def pqinfo(self) -> dict[str, Any] | None:
+    def pqinfo(self, time: int) -> dict[str, Any] | None:
+        """getpqtransportinfo at time: the rings hold the fixture's failures recorded by then."""
         if self.v1_0_0:
             return None
         info = fixture("getpqtransportinfo.json")
         # Random per process start on a real node; distinct per node and run here.
         info["instance_id"] = hashlib.sha256(f"{self.host}/{self.instance}".encode()).hexdigest()
         info["since"] = self.boot
+        for failures in info["recent_failures"].values():
+            failures["entries"] = [item for item in failures["entries"] if item["time"] <= time]
+            failures["last_sequence"] = failures["entries"][-1]["sequence"] if failures["entries"] else 0
         return info
 
     def sample(self, time: int, *, down: bool = False, connections_in: int | None = 30,
@@ -96,7 +100,7 @@ class Node:
         row = pq_canary.build_row(
             time=time, utc=pq_eval.utc(time), host=self.host,
             uptime=None if down else time - self.boot,
-            netinfo=netinfo, pqinfo=None if down else self.pqinfo(), peers=peers, pinned=self.pinned)
+            netinfo=netinfo, pqinfo=None if down else self.pqinfo(time), peers=peers, pinned=self.pinned)
         return parsed(row)
 
 
@@ -112,12 +116,12 @@ def entry(sequence: int, time: int, address: str, port: int, outcome: str, *, di
             "endpoint": {"kind": "address", "network": network, "address": address, "port": port}}
 
 
-def ring(last_sequence: int, dropped: int, entries: list[dict[str, Any]]) -> dict[str, Any]:
+def ring(last_sequence: Any, dropped: Any, entries: list[Any]) -> dict[str, Any]:
     return {"last_sequence": last_sequence, "dropped": dropped, "entries": entries}
 
 
-def record(time: int, *, inbound: dict[str, Any], outbound: dict[str, Any], host: str = "archive",
-           instance: str = "a" * 64, since: int = T0 - DAY, fallback_set: list[Any] | None = None) -> dict[str, Any]:
+def record(time: int, *, inbound: Any, outbound: Any, host: str = "archive",
+           instance: Any = "a" * 64, since: Any = T0 - DAY, fallback_set: list[Any] | None = None) -> dict[str, Any]:
     return {"time": time, "host": host, "instance_id": instance, "since": since,
             "recent_failures": {"inbound": inbound, "outbound": outbound}, "fallback_set": fallback_set or []}
 
@@ -480,7 +484,8 @@ class FailureEntriesTest(unittest.TestCase):
             "address with a port": dict(good, address="192.0.2.9:8333"), "ipv6 address as ipv4": dict(good, address="2001:db8::9"),
             "no port": {key: value for key, value in good.items() if key != "port"}, "port as text": dict(good, port="8333"),
             "port true": dict(good, port=True), "port out of range": dict(good, port=65536), "negative port": dict(good, port=-1),
-            "unknown kind": dict(good, kind="service"), "unknown network": dict(good, network="tor"),
+            "unknown kind": dict(good, kind="service"), "kind a list": dict(good, kind=["address"]),
+            "unknown network": dict(good, network="tor"),
             "kind and network disagree": dict(good, kind="name_proxy"),
         }
         for outcome in ("malformed_record", "first_packet_failed", "fallback", "closed_after_switch"):
@@ -505,6 +510,140 @@ class FailureEntriesTest(unittest.TestCase):
         figure, _ = evaluate("fallback", {"address": "203.0.113.5", "port": 8333})
         self.assertEqual(figure.result, "fail")
         self.assertIn("known_good=archive", figure.details[0])
+
+    def test_malformed_rings_are_unknown(self) -> None:
+        start = record(T0, inbound=ring(0, 0, []), outbound=ring(0, 0, []))
+        failure = entry(1, T0 + 5, "192.0.2.9", 8333, "malformed_record", direction="inbound")
+        cases: dict[str, Any] = {
+            "recent_failures absent": ..., "recent_failures null": None, "recent_failures a list": [failure],
+            "recent_failures text": "inbound",
+            "last_sequence true": ring(True, 0, [failure]), "dropped true": ring(1, True, [failure]),
+            "negative dropped": ring(1, -1, [failure]), "sequence true": ring(1, 0, [dict(failure, sequence=True)]),
+            "sequence 0": ring(0, 0, [dict(failure, sequence=0)]), "entry not an object": ring(1, 0, ["entry"]),
+        }
+        for label, value in cases.items():
+            with self.subTest(label):
+                later = record(T0 + INTERVAL, inbound=value, outbound=ring(0, 0, []))
+                if label.startswith("recent_failures"):
+                    if value is ...:
+                        del later["recent_failures"]
+                    else:
+                        later["recent_failures"] = value
+                figure, triage = self.evaluate([start, later])
+                self.assertEqual((figure.result, triage.result), ("unknown", "unknown"))
+                self.assertIn("malformed ring", " ".join(figure.details))
+
+    def test_malformed_outcome_is_unknown(self) -> None:
+        start = record(T0, inbound=ring(0, 0, []), outbound=ring(0, 0, []))
+
+        def evaluate(outcome: Any) -> tuple[Any, Any]:
+            failure = entry(1, T0 + 5, "192.0.2.9", 8333, "fallback")
+            if outcome is ...:
+                del failure["outcome"]
+            else:
+                failure["outcome"] = outcome
+            return self.evaluate([start, record(T0 + INTERVAL, inbound=ring(0, 0, []), outbound=ring(1, 0, [failure]))])
+
+        # A malformed outcome may be a monitored or a triage one: both figures are unknown.
+        for label, outcome in (("absent", ...), ("null", None), ("unknown word", "timeout"), ("capitalized", "Fallback"),
+                               ("number", 3), ("object", {"outcome": "fallback"})):
+            with self.subTest(label):
+                figures = evaluate(outcome)
+                self.assertEqual(tuple(figure.result for figure in figures), ("unknown", "unknown"))
+                for figure in figures:
+                    self.assertIn("entry 1 has a missing or malformed outcome", " ".join(figure.details))
+        # The other outcomes in the vocabulary count towards neither figure.
+        for outcome in ("legacy_peer", "abandoned", "internal_error"):
+            with self.subTest(outcome):
+                self.assertEqual(tuple(figure.result for figure in evaluate(outcome)), ("pass", "pass"))
+
+    def test_implausible_entry_time_is_unknown(self) -> None:
+        start = record(T0, inbound=ring(0, 0, []), outbound=ring(0, 0, []))
+
+        def evaluate(time: Any) -> Any:
+            # A known-good failure: with its time it fails the figure, or is outside the window.
+            failure = entry(1, T0 + 5, "203.0.113.5", 8333, "first_packet_failed")
+            if time is ...:
+                del failure["time"]
+            else:
+                failure["time"] = time
+            later = record(T0 + INTERVAL, inbound=ring(0, 0, []), outbound=ring(1, 0, [failure]))
+            return self.evaluate([start, later], end=T0 + 2 * INTERVAL)[0]
+
+        implausible = {"absent": ..., "null": None, "text": str(T0 + 5), "true": True, "negative": -1,
+                       "beyond year 9999": 10**12, "milliseconds": (T0 + 5) * 1000,
+                       "after the sample that read it": T0 + INTERVAL + 301, "before its process started": T0 - DAY - 301}
+        for label, time in implausible.items():
+            with self.subTest(label):
+                figure = evaluate(time)
+                self.assertEqual(figure.result, "unknown", figure.details)
+                self.assertIn("entry 1 has a missing or implausible time", " ".join(figure.details))
+                self.assert_no_addresses(figure)
+        # Within the clock slack it is judged by its time: in the window, or before it.
+        self.assertEqual(evaluate(T0 + INTERVAL + 300).result, "fail")
+        figure = evaluate(T0 - DAY - 300)
+        self.assertEqual(figure.result, "unknown")  # only the coverage: 2 of 3 samples
+        self.assertIn("entries=0 unknown_intervals=0", figure.summary)
+
+    def test_malformed_fallback_set_entry_is_unknown(self) -> None:
+        start = record(T0, inbound=ring(0, 0, []), outbound=ring(0, 0, []))
+        unrelated = {"endpoint": {"kind": "address", "network": "ipv4", "address": "192.0.2.9", "port": 8333},
+                     "cause": "first_packet_failed", "reason": "tag", "streak": 3, "entered": T0 + 5, "expires": T0 + 3605,
+                     "window_seconds": 3600}
+        malformed = {"not an object": "192.0.2.9:8333", "null": None, "a list": [unrelated],
+                     "no endpoint": {key: value for key, value in unrelated.items() if key != "endpoint"},
+                     "malformed endpoint": dict(unrelated, endpoint={"address": "192.0.2.9"})}
+        for label, item in malformed.items():
+            with self.subTest(label):
+                # Held over three samples, it is one unknown entry.
+                records = [start] + [record(T0 + i * INTERVAL, inbound=ring(0, 0, []), outbound=ring(0, 0, []), fallback_set=[item])
+                                     for i in (1, 2, 3)]
+                figure, triage = self.evaluate(records)
+                self.assertEqual((figure.result, triage.result), ("unknown", "pass"))
+                self.assertEqual(sum("fallback_set" in detail and "without a well-formed endpoint" in detail
+                                     for detail in figure.details), 1, figure.details)
+                self.assert_no_addresses(figure, triage)
+        figure, _ = self.evaluate([start, record(T0 + INTERVAL, inbound=ring(0, 0, []), outbound=ring(0, 0, []), fallback_set=[unrelated])])
+        self.assertEqual(figure.result, "pass")
+
+    def test_malformed_since_is_unknown(self) -> None:
+        start = record(T0, inbound=ring(0, 0, []), outbound=ring(0, 0, []))
+        cases = {"absent": ..., "null": None, "text": str(T0 - DAY), "true": True, "negative": -1, "beyond year 9999": 10**12,
+                 "after the sample": T0 + INTERVAL + 301}
+        reasons = dict.fromkeys(cases, "since missing, malformed or after the sample")
+        cases["changed within one instance_id"] = T0 - DAY + 1
+        reasons["changed within one instance_id"] = "since changed within one instance_id"
+        for label, since in cases.items():
+            with self.subTest(label):
+                later = record(T0 + INTERVAL, inbound=ring(0, 0, []), outbound=ring(0, 0, []), since=since)
+                if since is ...:
+                    del later["since"]
+                after = record(T0 + 2 * INTERVAL, inbound=ring(0, 0, []), outbound=ring(0, 0, []))
+                figure, _ = self.evaluate([start, later, after])
+                self.assertEqual(figure.result, "unknown")
+                self.assertIn(reasons[label], " ".join(figure.details))
+        # A process that started while the sampler ran is not after the sample.
+        self.assertEqual(self.evaluate([record(T0, inbound=ring(0, 0, []), outbound=ring(0, 0, []), since=T0 + 300)])[0].result, "pass")
+
+    def test_report_prints_only_well_formed_values(self) -> None:
+        start = record(T0, inbound=ring(0, 0, []), outbound=ring(0, 0, []))
+        # Known-good failures whose other fields are malformed: still failures, and an
+        # address in a malformed field never reaches the report.
+        failure = dict(entry(1, T0 + 5, "203.0.113.5", 8333, "first_packet_failed"),
+                       reason="203.0.113.9", connection_type="2001:db8::7", peer_id="198.51.100.20")
+        held = {"endpoint": {"kind": "address", "network": "ipv6", "address": "2001:db8::5", "port": 8333}, "cause": ["tag"],
+                "reason": "198.51.100.20", "streak": True, "entered": {"time": T0}, "expires": 10**30}
+        later = record(T0 + INTERVAL, inbound=ring(0, 0, []), outbound=ring(1, 0, [failure]), fallback_set=[held, held])
+        figure, triage = self.evaluate([start, later])
+        self.assertEqual(figure.result, "fail")
+        self.assertIn("entries=2", figure.summary)
+        self.assertIn("first_packet_failed/malformed conn_type=malformed peer_id=malformed known_good=archive", figure.details[0])
+        self.assertEqual(figure.details[1], "malformed archive fallback_set cause=malformed/malformed streak=malformed "
+                                            "expires=malformed known_good=known-good-3")
+        text = " ".join(figure.details + triage.details)
+        for address in ("203.0.113.9", "2001:db8::7", "198.51.100.20"):
+            self.assertNotIn(address, text)
+        self.assert_no_addresses(figure, triage)
 
     def test_restart_is_an_unknown_interval(self) -> None:
         first = record(T0, inbound=ring(0, 0, []), outbound=ring(0, 0, []))
@@ -544,9 +683,10 @@ class FailureEntriesTest(unittest.TestCase):
 
     def test_missing_instance_id_is_unknown(self) -> None:
         start = record(T0, inbound=ring(0, 0, []), outbound=ring(0, 0, []))
-        for label, value in (("null", None), ("short", "abc"), ("number", 7)):
+        for label, value in (("null", None), ("short", "abc"), ("number", 7), ("list", ["a" * 64])):
             with self.subTest(label):
-                broken = record(T0 + INTERVAL, inbound=ring(0, 0, []), outbound=ring(0, 0, []), instance=value)
+                broken = record(T0 + INTERVAL, inbound=ring(0, 0, []), outbound=ring(1, 0, [entry(1, T0 + 5, "192.0.2.9", 1, "fallback")]),
+                                instance=value)
                 after = record(T0 + 2 * INTERVAL, inbound=ring(0, 0, []), outbound=ring(0, 0, []))
                 figure, _ = self.evaluate([start, broken, after])
                 self.assertEqual(figure.result, "unknown")
@@ -730,14 +870,14 @@ class EvaluatorCommandTest(unittest.TestCase):
         return subprocess.run([sys.executable, str(EVALUATOR), *args], text=True, capture_output=True)
 
     def write_samples(self, root: Path) -> None:
-        nodes = {"pool": Node("pool", boot=T0 - 60, pinned=PINNED), "archive": Node("archive", boot=T0 - 60),
+        nodes = {"pool": Node("pool", boot=T0 - 3 * DAY, pinned=PINNED), "archive": Node("archive", boot=T0 - 3 * DAY),
                  "control": Node("control", boot=T0 - 10 * DAY, v1_0_0=True)}
         for index in range(-2 * 288, 3 * 288):
             time = T0 + index * INTERVAL
             for name, node in nodes.items():
                 row = node.sample(time)
                 pq_canary.append_row(root / f"{name}.csv", {key: NA if value is None else value for key, value in row.items()})
-                failures = pq_canary.build_failures_record(time=time, host=name, pqinfo=node.pqinfo())
+                failures = pq_canary.build_failures_record(time=time, host=name, pqinfo=node.pqinfo(time))
                 if failures is not None and name != "control":
                     with (root / f"{name}.jsonl").open("a", encoding="utf8") as out:
                         out.write(json.dumps(failures) + "\n")
@@ -843,6 +983,18 @@ class EvaluatorCommandTest(unittest.TestCase):
                     self.assertIn(message, result.stderr)
                     self.assertNotIn("Traceback", result.stderr)
                     self.assertNotIn("203.0.113.5", result.stderr)
+            # A failures.jsonl line that cannot be placed in time or attributed to a node.
+            for label, change in (("time true", {"time": True}), ("time text", {"time": str(T0)}), ("time negative", {"time": -1}),
+                                  ("time beyond year 9999", {"time": 10**12}), ("host null", {"host": None}),
+                                  ("host not a label", {"host": "archive node"}), ("host with a newline", {"host": "archive\n"})):
+                with self.subTest(label):
+                    bad_failures = root / "bad.jsonl"
+                    line = dict(record(T0, inbound=ring(0, 0, []), outbound=ring(0, 0, [])), **change)
+                    bad_failures.write_text(json.dumps(line) + "\n", encoding="utf8")
+                    result = self.run_evaluator(*start, "--failures", str(bad_failures), "--known-good", good)
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("a failures.jsonl line lacks a time in Unix seconds or a host label", result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
 
     def test_time_parsing(self) -> None:
         self.assertEqual(pq_eval.parse_time("1760000000"), T0)

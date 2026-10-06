@@ -184,6 +184,18 @@ bad arguments or input.
   endpoint is unrelated: a `malformed_record`, `first_packet_failed`,
   `fallback` or `closed_after_switch` entry whose endpoint is missing or
   malformed makes its figure unknown.
+- **Malformed evidence is unknown.** Only values of the `getpqtransportinfo`
+  types count as evidence. A record whose `instance_id` or `since` is missing
+  or malformed, whose `since` is after the sample, or whose `since` changed
+  within one `instance_id`; a ring that is not an object with non-negative
+  integer counters; a failure entry whose `outcome` is outside the vocabulary,
+  or whose `time` is missing, malformed, before its process started or more
+  than 5 minutes after the sample that read it; and a fallback-set entry
+  without a well-formed endpoint: each makes that stretch unknown. A
+  `failures.jsonl` line without a time in Unix seconds and a valid host label
+  is bad input (exit status 2). A known-good failure whose other fields are
+  malformed is still a failure, and those fields print as `malformed`, so a
+  malformed field can never put an address in the report.
 
 ### When the pinned link is not manual
 
