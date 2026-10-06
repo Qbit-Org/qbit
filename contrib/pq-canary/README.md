@@ -165,8 +165,8 @@ bad arguments or input.
   `instance_id`, is a restart. For the pinned link, the samples from the last
   sample before the restart to 10 minutes after it (`--restart-grace`) are a
   gap: neither pass nor fail. The restarts are listed at the top of the report.
-  An uptime whose boot time differs from the one already seen for the same
-  `instance_id` contradicts it: that uptime is unknown, not a restart.
+  An uptime whose boot time differs from the one most samples with the same
+  `instance_id` agree on contradicts it: that uptime is unknown, not a restart.
 - **Coverage.** Coverage is the share of the expected 5-minute samples that are
   present and usable. Below `--min-coverage`, the pinned link, a monitored
   node's failure evidence and an inbound-connections day are unknown, not

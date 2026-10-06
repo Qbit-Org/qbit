@@ -468,7 +468,24 @@ class PinnedLinkTest(unittest.TestCase):
         self.assertEqual(figure.result, "fail", figure.summary)
         self.assertIn("excluded=0", figure.summary)
         self.assertEqual(pq_eval.restarts(rows), [])
-        self.assertEqual([row["uptime"] for _, row in pq_eval.samples(rows)[39:43]], [rows[39]["uptime"], None, None, rows[42]["uptime"]])
+        self.assertEqual([row["uptime"] for _, row in pq_eval.sample_rows(rows)[39:43]], [rows[39]["uptime"], None, None, rows[42]["uptime"]])
+
+        # A restart between the sampler's uptime and getpqtransportinfo calls pairs the
+        # old uptime with the new instance_id once: only that uptime is unknown.
+        pool = Node("pool", boot=T0 - DAY, pinned=PINNED)
+        rows = []
+        for i in range(100):
+            time = T0 + i * INTERVAL
+            if i == 50:
+                old_uptime = str(time - pool.boot)
+                pool.restart(time - 30)
+            rows.append(pool.sample(time))
+        rows[50]["uptime"] = old_uptime
+        self.assertEqual([index for index, (_, row) in enumerate(pq_eval.sample_rows(rows)) if row["uptime"] is None], [50])
+        self.assertEqual([restart.last_seen for restart in pq_eval.restarts(rows)], [T0 + 49 * INTERVAL])
+        figure = self.evaluate(rows, 100)
+        self.assertEqual(figure.result, "pass", figure.summary)
+        self.assertIn("excluded=2", figure.summary)  # 30 s and 330 s after the restart
 
     def test_low_coverage_is_unknown_not_judged(self) -> None:
         pool = Node("pool", boot=T0 - DAY, pinned=PINNED)
@@ -685,6 +702,10 @@ class FailureEntriesTest(unittest.TestCase):
                 self.assert_no_addresses(figure)
         # Within the clock slack it is judged by its time: in the window, or before it.
         self.assertEqual(evaluate(T0 + INTERVAL + 300).result, "fail")
+        # First read long before the window, it was recorded before the window, whatever its time says.
+        held = ring(1, 0, [dict(entry(1, 0, "203.0.113.5", 8333, "fallback"), time="x")])
+        early, later = (record(time, inbound=ring(0, 0, []), outbound=held) for time in (T0 - DAY + 600, T0))
+        self.assertEqual(self.evaluate([early, later])[0].result, "pass")
         figure = evaluate(T0 - DAY - 300)
         self.assertEqual(figure.result, "unknown")  # only the coverage: 2 of 3 samples
         self.assertIn("entries=0 unknown_intervals=0", figure.summary)

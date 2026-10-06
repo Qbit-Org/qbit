@@ -20,8 +20,8 @@ unknown:
 Evidence rules:
 - A jump in a node's boot time (time - uptime) is a restart. The samples from
   the last sample before it to the end of the grace period after it are a gap,
-  not a failure. An uptime whose boot time contradicts the one already seen for
-  the same instance_id is unknown, not a restart.
+  not a failure. An uptime whose boot time contradicts the one most samples of
+  the same instance_id agree on is unknown, not a restart.
 - Coverage is the share of the expected 5-minute samples that are present and
   usable. A figure, node or day below --min-coverage (default 90%) is unknown,
   not judged.
@@ -188,23 +188,34 @@ class Restart:
 Row = dict[str, str | None]  # a samples.csv row, with NA as None
 
 
-def samples(rows: Iterable[Row]) -> list[tuple[int, Row]]:
+def sample_rows(rows: Iterable[Row]) -> list[tuple[int, Row]]:
     """The rows that are samples with their times, in time order, with the values the figures read checked.
 
     A row without a time in Unix seconds is not a sample: it counts as missing.
     An uptime that is not a non-negative integer, or whose boot time (time -
-    uptime) contradicts the boot time already seen for the same instance_id,
-    becomes None: unknown, never a restart.
+    uptime) contradicts the boot time of its instance_id, becomes None: unknown,
+    never a restart. A process's boot time is the median over its samples, so
+    neither a malformed uptime nor a restart between the sampler's uptime and
+    getpqtransportinfo calls (the old uptime with the new instance_id) moves it.
     """
-    timed = sorted(((time, row) for row in rows if is_time(time := as_count(row["time"]))), key=lambda item: item[0])
+    timed = []
+    for row in rows:
+        time = as_count(row["time"])
+        if is_time(time):
+            timed.append((time, row))
+    timed.sort(key=lambda item: item[0])
+    boots: dict[str, list[int]] = defaultdict(list)
+    for time, row in timed:
+        uptime, instance = as_count(row["uptime"]), row["instance_id"]
+        if uptime is not None and valid_instance_id(instance):
+            boots[instance].append(time - uptime)
+    boot_of = {instance: sorted(values)[len(values) // 2] for instance, values in boots.items()}
     checked = []
-    boots: dict[str, int] = {}  # instance_id -> boot time
     for time, row in timed:
         row = dict(row)
         uptime, instance = as_count(row["uptime"]), row["instance_id"]
-        if uptime is not None and valid_instance_id(instance):
-            if abs(time - uptime - boots.setdefault(instance, time - uptime)) > RESTART_TOLERANCE:
-                uptime = None
+        if uptime is not None and valid_instance_id(instance) and abs(time - uptime - boot_of[instance]) > RESTART_TOLERANCE:
+            uptime = None
         row["time"], row["uptime"] = str(time), None if uptime is None else str(uptime)
         checked.append((time, row))
     return checked
@@ -214,7 +225,7 @@ def restarts(rows: list[Row]) -> list[Restart]:
     """Restarts seen as a jump in boot time (time - uptime) or a new instance_id."""
     found = []
     previous: tuple[int, int, str | None] | None = None
-    for time, row in samples(rows):
+    for time, row in sample_rows(rows):
         uptime = as_count(row["uptime"])
         if uptime is None:
             continue
@@ -274,7 +285,7 @@ def evaluate_pinned(pool: list[Row] | None, archive: list[Row] | None,
         return Figure(name, UNKNOWN, 0, None, "no pool node samples")
     gaps = merged_gaps(restarts(pool) + (restarts(archive) if archive else []), grace)
     good = bad = unknown = excluded = automatic = 0
-    rows: list[tuple[int, Row | None]] = [(time, row) for time, row in samples(pool) if window.contains(time)]
+    rows: list[tuple[int, Row | None]] = [(time, row) for time, row in sample_rows(pool) if window.contains(time)]
     previous = window.start - interval
     for time, row in rows + [(window.end + interval, None)]:
         missing, skipped = missing_samples(previous, time, interval, gaps)
@@ -589,7 +600,10 @@ def evaluate_failures(records: list[dict[str, Any]] | None, known_good: KnownGoo
                 else:
                     targets = [(found_monitored, unknown_monitored), (found_triage, unknown_triage)]
                 # An entry is recorded after its process started and before the sample that read it.
-                if not is_time(time) or time > record["time"] + CLOCK_SLACK or (is_time(since) and time < since - CLOCK_SLACK):
+                earliest = since - CLOCK_SLACK if is_time(since) else 0
+                if not is_time(time) or time > record["time"] + CLOCK_SLACK or time < earliest:
+                    if not window.overlaps(earliest, record["time"] + CLOCK_SLACK):
+                        continue  # whenever it was recorded, it was outside the window
                     problem = f"unknown {host} {direction}: entry {entry['sequence']} has a missing or implausible time"
                 elif not window.contains(time):
                     continue
@@ -662,7 +676,7 @@ def evaluate_connections(archive: list[Row] | None, control: list[Row] | None,
         return Figure(name, UNKNOWN, 0, None, "needs both archive and control samples")
 
     def by_slot(rows: list[Row]) -> dict[int, Row]:
-        return {int(time / interval + 0.5): row for time, row in samples(rows)}
+        return {int(time / interval + 0.5): row for time, row in sample_rows(rows)}
 
     archive_slots, control_slots = by_slot(archive), by_slot(control)
     baseline = [0, 0, 0]  # archive sum, control sum, pairs
@@ -895,7 +909,7 @@ def main(argv: list[str] | None = None) -> int:
         monitored = sorted({row["host"] for rows in (pool, archive) if rows for row in rows if row["host"]})
 
     start = args.canary_start
-    latest = [time for rows in (pool, archive, control) if rows for time, _ in samples(rows)]
+    latest = [time for rows in (pool, archive, control) if rows for time, _ in sample_rows(rows)]
     latest += [record["time"] for record in records or []]
     end = args.end if args.end is not None else max(latest, default=start)
     window = Window(start, end)
