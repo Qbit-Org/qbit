@@ -745,6 +745,8 @@ const std::vector<std::string> TEST_OPTIONS_DOC{
     "reindex_after_failure_noninteractive_yes (When asked for a reindex after failure interactively, simulate as-if answered with 'yes')",
     "bip94 (enforce BIP94 consensus rules)",
     "disable_witness_pruning (disable witness pruning in regtest)",
+    "pq_fail_first_packet (corrupt this node's ML-KEM shared secret on every hybrid post-quantum v2 handshake, so the peer's key confirmation fails)",
+    "mlkem_portable (use the portable ML-KEM-1024 code instead of native code)",
 };
 
 bool HasTestOption(const ArgsManager& args, const std::string& test_option)
