@@ -13,7 +13,11 @@ export LC_ALL=C.UTF-8
 export CONTAINER_NAME="ci_mac_native_pq"  # macos does not use a container, but the env var is needed for logging
 export CMAKE_GENERATOR="Ninja"
 export CI_OS_NAME="macos"
-export NO_DEPENDS=1
+# Boost and libevent come from depends, built natively for the runner, so the
+# jobs compile against the versions qbit releases with. Homebrew's Boost moves
+# on its own: 1.92 stopped compiling the multi_index declarations in
+# txmempool.h (fixed upstream by bitcoin/bitcoin#35175).
+export DEP_OPTS="NO_QT=1 NO_QR=1 NO_ZMQ=1 NO_WALLET=1 NO_USDT=1 NO_IPC=1"
 export OSX_SDK=""
 export RUN_UNIT_TESTS=true
 export RUN_FUNCTIONAL_TESTS=false
