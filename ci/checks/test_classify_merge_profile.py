@@ -242,7 +242,7 @@ class ClassifyMergeProfileTest(unittest.TestCase):
         self.assertEqual(outputs["source_validation_required"], "false")
         self.assertEqual(outputs["touched_github_metadata"], "true")
 
-    def test_pq_aarch64_job_required_for_mlkem_and_transport_paths(self) -> None:
+    def test_pq_unit_jobs_required_for_mlkem_and_transport_paths(self) -> None:
         required = [
             "src/mlkem-native/mlkem/src/kem.c",
             "src/crypto/mlkem.cpp",
@@ -289,19 +289,19 @@ class ClassifyMergeProfileTest(unittest.TestCase):
         for path in required:
             with self.subTest(path=path):
                 classification = self.classify([path])
-                self.assertTrue(classification.pq_aarch64_required)
-                self.assertEqual(classify_merge_profile.github_outputs(classification)["pq_aarch64_required"], "true")
+                self.assertTrue(classification.pq_unit_required)
+                self.assertEqual(classify_merge_profile.github_outputs(classification)["pq_unit_required"], "true")
                 self.assertEqual(classification.profile, classify_merge_profile.SOURCE_PROFILE)
         # One matching path among others is enough.
-        self.assertTrue(self.classify(["doc/user/README.md", "src/bip324.cpp"]).pq_aarch64_required)
+        self.assertTrue(self.classify(["doc/user/README.md", "src/bip324.cpp"]).pq_unit_required)
 
-    def test_pq_aarch64_job_not_required_elsewhere(self) -> None:
+    def test_pq_unit_jobs_not_required_elsewhere(self) -> None:
         for paths in (
             ["src/wallet/wallet.cpp"],
             ["src/netbase.cpp", "src/net_processing.cpp", "src/compat/compat.h"],
             ["src/test/net_peer_eviction_tests.cpp"],
             ["ci/test/00_setup_env_native_asan.sh", ".github/workflows/rpc-perf-manual.yml"],
-            # Wiring shared by every CI job, and ML-KEM tooling the aarch64 job never runs.
+            # Wiring shared by every CI job, and ML-KEM tooling the PQ unit jobs never run.
             ["ci/test/01_base_install.sh", "ci/test/02_run_container.py", ".github/actions/configure-docker/action.yml"],
             ["src/crypto/CMakeLists.txt", "src/test/cpu_features_tests.cpp"],
             ["test/lint/mlkem-native-check.sh", "contrib/devtools/mlkem-native.pin", "contrib/devtools/update-mlkem-native.sh"],
@@ -311,12 +311,12 @@ class ClassifyMergeProfileTest(unittest.TestCase):
         ):
             with self.subTest(paths=paths):
                 classification = self.classify(paths)
-                self.assertFalse(classification.pq_aarch64_required)
-                self.assertEqual(classify_merge_profile.github_outputs(classification)["pq_aarch64_required"], "false")
+                self.assertFalse(classification.pq_unit_required)
+                self.assertEqual(classify_merge_profile.github_outputs(classification)["pq_unit_required"], "false")
 
-    def test_pq_aarch64_job_required_for_unreadable_paths(self) -> None:
-        self.assertTrue(self.classify(["../src/bip324.cpp"]).pq_aarch64_required)
-        self.assertTrue(self.classify(["/abs/path"]).pq_aarch64_required)
+    def test_pq_unit_jobs_required_for_unreadable_paths(self) -> None:
+        self.assertTrue(self.classify(["../src/bip324.cpp"]).pq_unit_required)
+        self.assertTrue(self.classify(["/abs/path"]).pq_unit_required)
 
     def test_require_release_policy_only_cli_rejects_outside_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

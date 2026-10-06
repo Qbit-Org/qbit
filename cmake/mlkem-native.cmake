@@ -77,6 +77,13 @@ endfunction()
 function(mlkem_native_detect_arch var)
   include(CheckCSourceCompiles)
   set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+  # The library's compiles get APPEND_CPPFLAGS and APPEND_CFLAGS, which can
+  # change the target (-m32, say), so the probes must see them too. Probe
+  # afresh on every configure, as those flags may have changed.
+  string(STRIP "${CMAKE_REQUIRED_FLAGS} ${APPEND_CPPFLAGS} ${APPEND_CFLAGS}" CMAKE_REQUIRED_FLAGS)
+  unset(MLKEM_NATIVE_TARGET_X86_64 CACHE)
+  unset(MLKEM_NATIVE_TARGET_AARCH64_MACHO CACHE)
+  unset(MLKEM_NATIVE_TARGET_AARCH64_ELF CACHE)
   check_c_source_compiles("
     #if !((defined(__x86_64__) || defined(_M_X64) || defined(_M_AMD64)) && !defined(__ILP32__))
     #error not LP64 x86_64

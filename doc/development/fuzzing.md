@@ -60,9 +60,11 @@ selected (including through `--exclude`), has no regular input files, or is not
 reported as replayed by the fuzz executable. The runner prints the number of
 input files present and replayed for each target.
 
-The ML-KEM targets use native code where the CPU has it. CI replays `mlkem` and
-`mlkem_backend_diff` a second time with `MLKEM_FORCE_PORTABLE=1`, which makes
-them run portable C throughout.
+The ML-KEM targets use native code where the CPU has it, and print the backend
+they run at start-up. CI replays `mlkem` and `mlkem_backend_diff` a second time
+with `MLKEM_FORCE_PORTABLE=1`, which makes them run portable C throughout; they
+abort if portable C is not what runs, and on any value other than unset, `0` or
+`1`.
 
 With a libFuzzer build, `--mutate_min_time=<seconds>` replaces the single
 replay with a mutation phase of that many seconds per target. The phase starts

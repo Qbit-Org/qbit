@@ -20,7 +20,8 @@ unknown:
 Evidence rules:
 - A jump in a node's boot time (time - uptime) is a restart. The samples from
   the last sample before it to the end of the grace period after it are a gap,
-  not a failure.
+  not a failure. An uptime whose boot time contradicts the one most samples of
+  the same instance_id agree on is unknown, not a restart.
 - Coverage is the share of the expected 5-minute samples that are present and
   usable. A figure, node or day below --min-coverage (default 90%) is unknown,
   not judged.
@@ -30,9 +31,21 @@ Evidence rules:
   (a wrap between samples that hid unread entries), and across a changed
   instance_id. A lost stretch makes that interval unknown for that ring.
 - Missing evidence is unknown, never clean: the pinned link passes only if it
-  would pass with every unknown sample counted against it.
+  would pass with every unknown sample counted against it. A malformed value is
+  missing: a time, uptime or connections_in that is not a plain non-negative
+  integer, a samples.csv row with the wrong number of fields, and a connected
+  pinned peer whose fields are malformed or disagree.
+- Only well-formed evidence is clean. A malformed ring, a record whose
+  instance_id or since is missing, malformed or contradictory, a failure entry
+  whose outcome, time or endpoint is missing, malformed or implausible, and a
+  fallback-set entry without a well-formed endpoint make that stretch unknown.
+  A failure entry is implausible when it is dated before its process started or
+  more than CLOCK_SLACK after the sample that read it.
 - The report names known-good peers by their label, never by address; peer
   addresses stay in failures.jsonl and the known-good list on the node.
+- --pool, --archive and --control are three different nodes: samples that share
+  a file, a host label or an instance_id, or one file with several host labels,
+  are rejected as bad input rather than compared with themselves.
 
 Exit status: 0 when the verdict (figures 1, 2 and 4) is pass, 1 when any of
 them fails, 3 when none fails but one is unknown, 2 for bad arguments or input.
@@ -41,13 +54,15 @@ them fails, 3 when none fails but one is unknown, 2 for bad arguments or input.
 from __future__ import annotations
 
 import argparse
+import ipaddress
+import json
 import re
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, TypeGuard
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pq_canary  # noqa: E402
@@ -60,8 +75,17 @@ DEFAULT_MIN_COVERAGE = 0.90
 RESTART_TOLERANCE = 120  # seconds of boot-time jitter that is not a restart
 MONITORED_OUTCOMES = {"malformed_record", "first_packet_failed", "fallback"}
 TRIAGE_OUTCOMES = {"closed_after_switch"}
+OUTCOMES = MONITORED_OUTCOMES | TRIAGE_OUTCOMES | {"legacy_peer", "abandoned", "internal_error"}
+# Seconds a node's own times may lead the sample time: the sampler takes the
+# time, then makes up to three RPC calls of at most 60 s each.
+CLOCK_SLACK = 300
+MAX_TIME = 253402300799  # 9999-12-31T23:59:59Z, the latest time the report can print
 RINGS = ("inbound", "outbound")
-LABEL = re.compile(r"^[A-Za-z0-9._-]+$")
+TRANSPORT_STATUSES = {"pending", "hybrid", "legacy_peer", "fallback", "off", "v1"}  # getpeerinfo transport_pq_status
+ENDPOINT_KINDS = {"address", "name_proxy"}
+NETWORKS = {"ipv4", "ipv6", "onion", "i2p", "cjdns", "name_proxy"}
+LABEL = re.compile(r"[A-Za-z0-9._-]+")  # use with fullmatch
+TOKEN = re.compile(r"[a-z_-]{1,40}")  # a vocabulary word, such as a reason or a connection type
 REMEDY = ("an automatic connection held the pinned address in {count} sample(s), so the -addnode thread "
           "(GetAddedNodeInfo) skipped it. Remedy: run `qbit-cli disconnectnode <pinned address>` once; "
           "the -addnode thread reconnects it as manual within about 60 s.")
@@ -70,26 +94,51 @@ REMEDY = ("an automatic connection held the pinned address in {count} sample(s),
 def parse_time(text: str) -> int:
     """Epoch seconds from Unix seconds or an ISO 8601 time such as 2026-10-20T00:00:00Z (UTC unless it says otherwise)."""
     text = text.strip()
-    if text.isdigit():
-        return int(text)
-    try:
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
-        raise ValueError(f"expected Unix seconds or an ISO 8601 time such as 2026-11-02T00:00:00Z, got {text!r}") from None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return int(parsed.timestamp())
+    if re.fullmatch(r"[0-9]+", text):
+        value = int(text)
+    else:
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            raise ValueError(f"expected Unix seconds or an ISO 8601 time such as 2026-11-02T00:00:00Z, got {text!r}") from None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        value = int(parsed.timestamp())
+    if not is_time(value):
+        raise ValueError(f"expected a time from 1970 to 9999, got {text!r}")
+    return value
 
 
 def utc(epoch: int | float) -> str:
     return datetime.fromtimestamp(epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def as_int(value: str | None) -> int | None:
-    try:
-        return None if value is None else int(value)
-    except ValueError:
-        return None
+def is_count(value: Any) -> TypeGuard[int]:
+    """Whether a JSON value is a non-negative integer (not a boolean)."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def is_time(value: Any) -> TypeGuard[int]:
+    """Whether a JSON value is Unix seconds that the report can print."""
+    return is_count(value) and value <= MAX_TIME
+
+
+def when(value: Any) -> str:
+    return utc(value) if is_time(value) else "malformed"
+
+
+def token(value: Any) -> str:
+    """A vocabulary word for the report, or "malformed": a malformed value may hold an address."""
+    return value if isinstance(value, str) and TOKEN.fullmatch(value) else "malformed"
+
+
+def number(value: Any) -> str:
+    return str(value) if is_count(value) else "malformed"
+
+
+def as_count(value: str | None) -> int | None:
+    """A CSV value that is a plain non-negative decimal integer, else None."""
+    return int(value) if value is not None and re.fullmatch(r"[0-9]{1,18}", value) else None
 
 
 def percent(share: float | None) -> str:
@@ -136,13 +185,49 @@ class Restart:
     boot: int       # boot time of the new run
 
 
-def restarts(rows: list[dict[str, str | None]]) -> list[Restart]:
+Row = dict[str, str | None]  # a samples.csv row, with NA as None
+
+
+def sample_rows(rows: Iterable[Row]) -> list[tuple[int, Row]]:
+    """The rows that are samples with their times, in time order, with the values the figures read checked.
+
+    A row without a time in Unix seconds is not a sample: it counts as missing.
+    An uptime that is not a non-negative integer, or whose boot time (time -
+    uptime) contradicts the boot time of its instance_id, becomes None: unknown,
+    never a restart. A process's boot time is the median over its samples, so
+    neither a malformed uptime nor a restart between the sampler's uptime and
+    getpqtransportinfo calls (the old uptime with the new instance_id) moves it.
+    """
+    timed = []
+    for row in rows:
+        time = as_count(row["time"])
+        if is_time(time):
+            timed.append((time, row))
+    timed.sort(key=lambda item: item[0])
+    boots: dict[str, list[int]] = defaultdict(list)
+    for time, row in timed:
+        uptime, instance = as_count(row["uptime"]), row["instance_id"]
+        if uptime is not None and valid_instance_id(instance):
+            boots[instance].append(time - uptime)
+    boot_of = {instance: sorted(values)[len(values) // 2] for instance, values in boots.items()}
+    checked = []
+    for time, row in timed:
+        row = dict(row)
+        uptime, instance = as_count(row["uptime"]), row["instance_id"]
+        if uptime is not None and valid_instance_id(instance) and abs(time - uptime - boot_of[instance]) > RESTART_TOLERANCE:
+            uptime = None
+        row["time"], row["uptime"] = str(time), None if uptime is None else str(uptime)
+        checked.append((time, row))
+    return checked
+
+
+def restarts(rows: list[Row]) -> list[Restart]:
     """Restarts seen as a jump in boot time (time - uptime) or a new instance_id."""
     found = []
     previous: tuple[int, int, str | None] | None = None
-    for row in rows:
-        time, uptime = as_int(row["time"]), as_int(row["uptime"])
-        if time is None or uptime is None:
+    for time, row in sample_rows(rows):
+        uptime = as_count(row["uptime"])
+        if uptime is None:
             continue
         boot, instance = time - uptime, row["instance_id"]
         if previous is not None:
@@ -184,15 +269,23 @@ def missing_samples(after: int, before: int, interval: int, gaps: list[tuple[int
 # ---------------------------------------------------------------------------
 
 
-def evaluate_pinned(pool: list[dict[str, str | None]] | None, archive: list[dict[str, str | None]] | None,
+def pinned_peer_ok(row: Row) -> bool:
+    """Whether a connected pinned peer's fields are well formed and agree: transport_pq is 1
+    exactly when transport_pq_status is hybrid."""
+    connection_type, transport_pq, status = (row[name] for name in
+                                             ("pinned_connection_type", "pinned_transport_pq", "pinned_transport_pq_status"))
+    return (connection_type is not None and TOKEN.fullmatch(connection_type) is not None and transport_pq in ("0", "1")
+            and status in TRANSPORT_STATUSES and (transport_pq == "1") == (status == "hybrid"))
+
+
+def evaluate_pinned(pool: list[Row] | None, archive: list[Row] | None,
                     window: Window, interval: int, grace: int, min_coverage: float) -> Figure:
     name = "pinned link manual and hybrid in >= 99% of samples, excluding restarts"
     if not pool:
         return Figure(name, UNKNOWN, 0, None, "no pool node samples")
     gaps = merged_gaps(restarts(pool) + (restarts(archive) if archive else []), grace)
     good = bad = unknown = excluded = automatic = 0
-    rows = sorted(((int(row["time"]), row) for row in pool if row["time"] is not None and window.contains(int(row["time"]))),
-                  key=lambda item: item[0])
+    rows: list[tuple[int, Row | None]] = [(time, row) for time, row in sample_rows(pool) if window.contains(time)]
     previous = window.start - interval
     for time, row in rows + [(window.end + interval, None)]:
         missing, skipped = missing_samples(previous, time, interval, gaps)
@@ -201,16 +294,20 @@ def evaluate_pinned(pool: list[dict[str, str | None]] | None, archive: list[dict
         previous = time
         if row is None:
             break
-        uptime = as_int(row["uptime"])
+        uptime = as_count(row["uptime"])
         if any(low < time <= high for low, high in gaps) or (uptime is not None and uptime < grace):
             excluded += 1
-        elif row["sample_ok"] != "1" or row["pinned_present"] is None:
+        elif row["sample_ok"] != "1" or row["pinned_present"] not in ("0", "1"):
             unknown += 1
-        elif row["pinned_present"] == "1" and row["pinned_connection_type"] == "manual" and row["pinned_transport_pq"] == "1":
+        elif row["pinned_present"] == "0":
+            bad += 1
+        elif not pinned_peer_ok(row):
+            unknown += 1
+        elif row["pinned_connection_type"] == "manual" and row["pinned_transport_pq"] == "1":
             good += 1
         else:
             bad += 1
-            if row["pinned_present"] == "1" and row["pinned_connection_type"] not in (None, "manual"):
+            if row["pinned_connection_type"] != "manual":
                 automatic += 1
     total = good + bad + unknown
     if total == 0:
@@ -239,6 +336,26 @@ def evaluate_pinned(pool: list[dict[str, str | None]] | None, archive: list[dict
 def endpoint_key(address: str, port: Any) -> str:
     address = address.strip().lower()
     return f"[{address}]:{port}" if ":" in address else f"{address}:{port}"
+
+
+def valid_endpoint(endpoint: Any) -> bool:
+    """Whether endpoint has the getpqtransportinfo Endpoint shape: a kind and network that
+    agree, an address of that network without a port, and a port from 0 to 65535."""
+    if not isinstance(endpoint, dict):
+        return False
+    kind, network, address, port = (endpoint.get(key) for key in ("kind", "network", "address", "port"))
+    if not (isinstance(kind, str) and isinstance(network, str) and isinstance(address, str)):
+        return False
+    if not is_count(port) or port > 65535:
+        return False
+    if kind not in ENDPOINT_KINDS or network not in NETWORKS or (kind == "name_proxy") != (network == "name_proxy"):
+        return False
+    if network in ("ipv4", "ipv6", "cjdns"):
+        try:
+            return ipaddress.ip_address(address).version == (4 if network == "ipv4" else 6)
+        except ValueError:
+            return False
+    return LABEL.fullmatch(address) is not None
 
 
 class KnownGood:
@@ -294,7 +411,7 @@ def read_known_good(path: Path) -> KnownGood:
             raise ValueError(f"{path}:{number}: expected address or address:port with a port from 1 to 65535")
         count += 1
         label = fields[1] if len(fields) == 2 else f"known-good-{count}"
-        if not LABEL.match(label):
+        if not LABEL.fullmatch(label):
             raise ValueError(f"{path}:{number}: a label is letters, digits, '.', '_' or '-'")
         target = addresses if port is None else endpoints
         key = address if port is None else endpoint_key(address, int(port))
@@ -304,22 +421,44 @@ def read_known_good(path: Path) -> KnownGood:
     return KnownGood(endpoints, addresses)
 
 
+def valid_instance_id(value: Any) -> TypeGuard[str]:
+    """Whether value is the 64-hex-digit instance_id that getpqtransportinfo reports."""
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
 def ring_of(record: dict[str, Any], direction: str) -> dict[str, Any] | None:
-    """A structurally valid ring: integer counters and entries with consecutive sequences ending at last_sequence."""
-    ring = (record.get("recent_failures") or {}).get(direction)
+    """A structurally valid ring: non-negative integer counters and entries with consecutive
+    sequences from 1 up, ending at last_sequence."""
+    rings = record.get("recent_failures")
+    ring = rings.get(direction) if isinstance(rings, dict) else None
     if not isinstance(ring, dict) or not isinstance(ring.get("entries"), list):
         return None
-    last, dropped = ring.get("last_sequence"), ring.get("dropped")
-    if not isinstance(last, int) or not isinstance(dropped, int) or last < 0 or dropped < 0:
+    last = ring.get("last_sequence")
+    if not is_count(last) or not is_count(ring.get("dropped")):
         return None
     sequences: list[Any] = [entry.get("sequence") if isinstance(entry, dict) else None for entry in ring["entries"]]
-    if any(not isinstance(sequence, int) for sequence in sequences):
+    if any(not is_count(sequence) or sequence == 0 for sequence in sequences):
         return None
     if any(after != before + 1 for before, after in zip(sequences, sequences[1:])):
         return None
     if sequences and sequences[-1] != last:
         return None
     return ring
+
+
+def identity_problem(record: dict[str, Any], started: dict[str, int]) -> str | None:
+    """Why a record's process identity, its instance_id and since, cannot be used, or None.
+
+    started holds the since of each instance_id seen so far.
+    """
+    instance, since = record.get("instance_id"), record.get("since")
+    if not valid_instance_id(instance):
+        return "instance_id missing or malformed"
+    if not is_time(since) or since > record["time"] + CLOCK_SLACK:
+        return "since missing, malformed or after the sample"
+    if started.setdefault(instance, since) != since:
+        return "since changed within one instance_id"
+    return None
 
 
 @dataclass
@@ -337,12 +476,33 @@ def unknown_intervals(records: list[dict[str, Any]], end: int, interval: int) ->
     for record in records:
         by_host[str(record.get("host"))].append(record)
     for host, host_records in by_host.items():
-        host_records.sort(key=lambda record: record.get("time", 0))
+        host_records.sort(key=lambda record: record["time"])
         state: dict[str, RingState] = {}
+        started: dict[str, int] = {}  # instance_id -> since
+        previous_time: int | None = None
+        # Time and reason of the latest record without a usable process identity, until a usable one follows.
+        identity_lost: tuple[int, str] | None = None
         for record in host_records:
-            time = record.get("time", 0)
-            instance = record.get("instance_id")
-            since = record.get("since") if isinstance(record.get("since"), int) else time
+            time = record["time"]
+            if not isinstance(record.get("fallback_set"), list):
+                # Missing fallback evidence is unknown, never an empty set.
+                found.append((host, "fallback_set", time if previous_time is None else previous_time, time,
+                              "fallback_set missing or malformed"))
+            problem = identity_problem(record, started)
+            if problem is not None:
+                # Without the process identity a restart can't be told apart from
+                # a continuing run, so neither ring is judged across this record.
+                for direction in RINGS:
+                    found.append((host, direction, time if previous_time is None else previous_time, time, problem))
+                state.clear()
+                identity_lost = (time, problem)
+                previous_time = time
+                continue
+            if identity_lost is not None:
+                for direction in RINGS:
+                    found.append((host, direction, identity_lost[0], time, identity_lost[1]))
+                identity_lost = None
+            instance, since = record["instance_id"], record["since"]
             for direction in RINGS:
                 ring = ring_of(record, direction)
                 before = state.get(direction)
@@ -351,7 +511,7 @@ def unknown_intervals(records: list[dict[str, Any]], end: int, interval: int) ->
                     continue
                 entries = ring["entries"]
                 oldest_sequence = entries[0]["sequence"] if entries else ring["last_sequence"] + 1
-                oldest_time = entries[0].get("time", time) if entries else time
+                oldest_time = entries[0]["time"] if entries and is_time(entries[0].get("time")) else time
                 if before is None or before.instance != instance:
                     if before is not None:
                         found.append((host, direction, before.time, max(before.time, since),
@@ -370,15 +530,21 @@ def unknown_intervals(records: list[dict[str, Any]], end: int, interval: int) ->
                     found.append((host, direction, before.time, max(before.time, oldest_time),
                                   f"sequences {before.last_sequence + 1}..{oldest_sequence - 1} were lost when the ring wrapped"))
                 state[direction] = RingState(instance, ring["last_sequence"], ring["dropped"], time)
-        if host_records and host_records[-1].get("time", 0) < end - 2 * interval:
+            previous_time = time
+        if host_records and host_records[-1]["time"] < end - 2 * interval:
             for direction in RINGS:
                 found.append((host, direction, host_records[-1]["time"], end, "no samples since"))
     return found
 
 
-def describe(host: str, entry: dict[str, Any], label: str) -> str:
-    return (f"{utc(entry.get('time', 0))} {host} {entry.get('direction')} {entry.get('outcome')}/{entry.get('reason')} "
-            f"conn_type={entry.get('connection_type')} peer_id={entry.get('peer_id')} known_good={label}")
+def fingerprint(value: Any) -> str:
+    """A hashable stand-in for a JSON value."""
+    return json.dumps(value, sort_keys=True)
+
+
+def describe(host: str, direction: str, entry: dict[str, Any], label: str) -> str:
+    return (f"{utc(entry['time'])} {host} {direction} {entry['outcome']}/{token(entry.get('reason'))} "
+            f"conn_type={token(entry.get('connection_type'))} peer_id={number(entry.get('peer_id'))} known_good={label}")
 
 
 def evaluate_failures(records: list[dict[str, Any]] | None, known_good: KnownGood | None, monitored: list[str],
@@ -400,7 +566,7 @@ def evaluate_failures(records: list[dict[str, Any]] | None, known_good: KnownGoo
     expected = expected_samples(window.start, window.end, interval)
     slots: dict[str, set[int]] = defaultdict(set)
     for record in records:
-        if window.contains(record.get("time", 0)):
+        if window.contains(record["time"]):
             slots[str(record.get("host"))].add(int((record["time"] - window.start) / interval + 0.5))
     coverage = {host: min(1.0, len(slots[host]) / expected) if expected else 0.0 for host in monitored}
     low = [host for host in monitored if coverage[host] < min_coverage]
@@ -408,33 +574,72 @@ def evaluate_failures(records: list[dict[str, Any]] | None, known_good: KnownGoo
     seen: set[tuple[Any, ...]] = set()
     found_monitored: list[str] = []
     found_triage: list[str] = []
+    # Entries that may be between known-good endpoints but cannot be told apart, per figure.
+    unknown_monitored: list[str] = []
+    unknown_triage: list[str] = []
     for record in records:
         host = str(record.get("host"))
+        instance, since = record.get("instance_id"), record.get("since")
         for direction in RINGS:
             ring = ring_of(record, direction)
             for entry in (ring or {}).get("entries", []):
-                key: tuple[Any, ...] = (host, record.get("instance_id"), direction, entry.get("sequence"))
-                if key in seen or not window.contains(entry.get("time", 0)):
+                key: tuple[Any, ...] = (host, instance if valid_instance_id(instance) else None, direction, entry["sequence"])
+                if key in seen:
                     continue
                 seen.add(key)
-                label = known_good.label(entry.get("endpoint"))
-                if label is None:
+                outcome, time = entry.get("outcome"), entry.get("time")
+                outcome = outcome if isinstance(outcome, str) else None
+                # The figures the entry may count towards, as (found, unknown); an
+                # entry with a malformed outcome may belong to either.
+                if outcome in MONITORED_OUTCOMES:
+                    targets = [(found_monitored, unknown_monitored)]
+                elif outcome in TRIAGE_OUTCOMES:
+                    targets = [(found_triage, unknown_triage)]
+                elif outcome in OUTCOMES:
                     continue
-                if entry.get("outcome") in MONITORED_OUTCOMES:
-                    found_monitored.append(describe(host, entry, label))
-                elif entry.get("outcome") in TRIAGE_OUTCOMES:
-                    found_triage.append(describe(host, entry, label))
-        if not window.contains(record.get("time", 0)):
+                else:
+                    targets = [(found_monitored, unknown_monitored), (found_triage, unknown_triage)]
+                # An entry is recorded after its process started and before the sample that read it.
+                earliest = since - CLOCK_SLACK if is_time(since) else 0
+                if not is_time(time) or time > record["time"] + CLOCK_SLACK or time < earliest:
+                    if not window.overlaps(earliest, record["time"] + CLOCK_SLACK):
+                        continue  # whenever it was recorded, it was outside the window
+                    problem = f"unknown {host} {direction}: entry {entry['sequence']} has a missing or implausible time"
+                elif not window.contains(time):
+                    continue
+                elif outcome not in OUTCOMES:
+                    problem = f"unknown {host} {direction} {utc(time)}: entry {entry['sequence']} has a missing or malformed outcome"
+                else:
+                    label = known_good.label(entry.get("endpoint"))
+                    if label is not None:
+                        targets[0][0].append(describe(host, direction, entry, label))
+                        continue
+                    if valid_endpoint(entry.get("endpoint")):
+                        continue
+                    # Not a valid unrelated peer either: the entry may be between known-good endpoints.
+                    problem = (f"unknown {host} {direction} {utc(time)}: {outcome} entry {entry['sequence']} "
+                               "has a missing or malformed endpoint")
+                for _, unknown in targets:
+                    unknown.append(problem)
+        if not window.contains(record["time"]):
             continue
-        for item in record.get("fallback_set") or []:
-            if not isinstance(item, dict):
+        fallback_set = record.get("fallback_set")
+        for item in fallback_set if isinstance(fallback_set, list) else []:
+            endpoint = item.get("endpoint") if isinstance(item, dict) else None
+            label = known_good.label(endpoint)
+            if label is None:
+                key = (host, "fallback_set", fingerprint(item))
+                if not valid_endpoint(endpoint) and key not in seen:
+                    seen.add(key)
+                    unknown_monitored.append(f"unknown {host} fallback_set {utc(record['time'])}: "
+                                             "an entry without a well-formed endpoint")
                 continue
-            label = known_good.label(item.get("endpoint"))
-            key = (host, "fallback_set", label, item.get("entered"))
-            if label is not None and key not in seen:
+            key = (host, "fallback_set", label, fingerprint(item.get("entered")))
+            if key not in seen:
                 seen.add(key)
-                found_monitored.append(f"{utc(item.get('entered', 0))} {host} fallback_set cause={item.get('cause')}/{item.get('reason')} "
-                                       f"streak={item.get('streak')} expires={utc(item.get('expires', 0))} known_good={label}")
+                found_monitored.append(f"{when(item.get('entered'))} {host} fallback_set cause={token(item.get('cause'))}/"
+                                       f"{token(item.get('reason'))} streak={number(item.get('streak'))} "
+                                       f"expires={when(item.get('expires'))} known_good={label}")
 
     gaps = [gap for gap in unknown_intervals(records, window.end, interval) if window.overlaps(gap[2], gap[3])]
     notes = [f"unknown {host} {ring} {utc(max(begin, window.start))}..{utc(min(finish, window.end))}: {reason}"
@@ -443,12 +648,13 @@ def evaluate_failures(records: list[dict[str, Any]] | None, known_good: KnownGoo
     samples = sum(len(slots[host]) for host in monitored)
     per_host = ",".join(f"{host}:{percent(coverage[host])}" for host in monitored)
 
-    def figure(name: str, found: list[str]) -> Figure:
-        result = FAIL if found else (UNKNOWN if gaps or low else PASS)
+    def figure(name: str, found: list[str], unknown: list[str]) -> Figure:
+        result = FAIL if found else (UNKNOWN if gaps or low or unknown else PASS)
         return Figure(name, result, samples, min(coverage.values()),
-                      f"entries={len(found)} unknown_intervals={len(gaps)} nodes={per_host}", found + notes)
+                      f"entries={len(found)} unknown_intervals={len(gaps) + len(unknown)} nodes={per_host}",
+                      found + unknown + notes)
 
-    return figure(monitored_name, found_monitored), figure(triage_name, found_triage)
+    return figure(monitored_name, found_monitored, unknown_monitored), figure(triage_name, found_triage, unknown_triage)
 
 
 # ---------------------------------------------------------------------------
@@ -456,7 +662,7 @@ def evaluate_failures(records: list[dict[str, Any]] | None, known_good: KnownGoo
 # ---------------------------------------------------------------------------
 
 
-def evaluate_connections(archive: list[dict[str, str | None]] | None, control: list[dict[str, str | None]] | None,
+def evaluate_connections(archive: list[Row] | None, control: list[Row] | None,
                          canary_start: int, window: Window, interval: int, baseline_ratio: float | None,
                          min_coverage: float) -> Figure:
     """Daily archive/control connections_in ratios, relative to the baseline ratio.
@@ -469,8 +675,8 @@ def evaluate_connections(archive: list[dict[str, str | None]] | None, control: l
     if not archive or not control:
         return Figure(name, UNKNOWN, 0, None, "needs both archive and control samples")
 
-    def by_slot(rows: list[dict[str, str | None]]) -> dict[int, dict[str, str | None]]:
-        return {int(int(row["time"]) / interval + 0.5): row for row in rows if row["time"] is not None}
+    def by_slot(rows: list[Row]) -> dict[int, Row]:
+        return {int(time / interval + 0.5): row for time, row in sample_rows(rows)}
 
     archive_slots, control_slots = by_slot(archive), by_slot(control)
     baseline = [0, 0, 0]  # archive sum, control sum, pairs
@@ -478,10 +684,11 @@ def evaluate_connections(archive: list[dict[str, str | None]] | None, control: l
     for slot in sorted(set(archive_slots) | set(control_slots)):
         pair = (archive_slots.get(slot), control_slots.get(slot))
         time = min(int(row["time"]) for row in pair if row is not None)  # type: ignore[arg-type]
-        uptimes = [as_int(row["uptime"]) if row else None for row in pair]
-        counts = [as_int(row["connections_in"]) if row else None for row in pair]
+        uptimes = [as_count(row["uptime"]) if row else None for row in pair]
+        counts = [as_count(row["connections_in"]) if row else None for row in pair]
         restarted = any(uptime is not None and uptime < CONNECTIONS_RESTART_EXCLUSION for uptime in uptimes)
-        valid = not restarted and None not in uptimes and None not in counts
+        answered = all(row is not None and row["sample_ok"] == "1" for row in pair)
+        valid = answered and not restarted and None not in uptimes and None not in counts
         if time < canary_start:
             if valid:
                 baseline[0] += counts[0]  # type: ignore[operator]
@@ -605,9 +812,36 @@ def file_arg(text: str) -> Path:
     return path
 
 
+def role_error(roles: list[tuple[str, Path, list[Row]]]) -> str | None:
+    """Why the samples given for --pool, --archive and --control are not each one distinct node, or None.
+
+    A role's samples carry one host label; no two roles share a file, a host
+    label or an instance_id, so no node is compared with itself.
+    """
+    hosts: dict[str, str] = {}
+    instances: dict[str, str] = {}
+    for index, (role, path, rows) in enumerate(roles):
+        for other, other_path, _ in roles[:index]:
+            if path.samefile(other_path):
+                return f"--{other} and --{role} are the same file; each role needs its own node's samples"
+        labels = {row["host"] for row in rows}
+        if any(label is None or not LABEL.fullmatch(label) for label in labels):
+            return f"--{role} has a row without a valid host label"
+        if len(labels) > 1:
+            return f"--{role} mixes the host labels {', '.join(sorted(map(str, labels)))}; give one node's samples per role"
+        for label in map(str, labels):
+            if label in hosts:
+                return f"--{hosts[label]} and --{role} both have the host label {label}; each role needs its own node"
+            hosts[label] = role
+        for instance in {row["instance_id"] for row in rows if row["instance_id"] is not None}:
+            if instances.setdefault(instance, role) != role:
+                return f"--{instances[instance]} and --{role} report the same instance_id; each role needs its own node"
+    return None
+
+
 def hosts_arg(text: str) -> list[str]:
     hosts = [host.strip() for host in text.split(",")]
-    if not all(LABEL.match(host) for host in hosts) or len(set(hosts)) != len(hosts):
+    if not all(LABEL.fullmatch(host) for host in hosts) or len(set(hosts)) != len(hosts):
         raise argparse.ArgumentTypeError(f"expected distinct comma-separated host labels, got {text!r}")
     return hosts
 
@@ -658,9 +892,16 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError) as e:
         print(f"Error: {e}", file=sys.stderr)
         return 2
+    error = role_error([(role, path, rows) for role, path, rows in
+                        (("pool", args.pool, pool), ("archive", args.archive, archive), ("control", args.control, control))
+                        if path is not None and rows is not None])
+    if error is not None:
+        print(f"Error: {error}", file=sys.stderr)
+        return 2
     for record in records or []:
-        if not isinstance(record, dict) or not isinstance(record.get("time"), int) or not isinstance(record.get("host"), str):
-            print("Error: a failures.jsonl line lacks an integer time or a host label", file=sys.stderr)
+        if not isinstance(record, dict) or not is_time(record.get("time")) or not isinstance(record.get("host"), str) \
+                or not LABEL.fullmatch(record["host"]):
+            print("Error: a failures.jsonl line lacks a time in Unix seconds or a host label", file=sys.stderr)
             return 2
 
     monitored = args.monitored
@@ -668,7 +909,7 @@ def main(argv: list[str] | None = None) -> int:
         monitored = sorted({row["host"] for rows in (pool, archive) if rows for row in rows if row["host"]})
 
     start = args.canary_start
-    latest = [int(row["time"]) for rows in (pool, archive, control) if rows for row in rows if row["time"] is not None]
+    latest = [time for rows in (pool, archive, control) if rows for time, _ in sample_rows(rows)]
     latest += [record["time"] for record in records or []]
     end = args.end if args.end is not None else max(latest, default=start)
     window = Window(start, end)

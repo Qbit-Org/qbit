@@ -85,20 +85,20 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           DISPATCH_REF: ${{ inputs.ref || '' }}
           EVENT_NAME: ${{ github.event_name }}
-          PULL_REQUEST_NUMBER: ${{ github.event_name == 'pull_request' && github.event.pull_request.number || '' }}
           PULL_REQUEST_SHA: ${{ github.event_name == 'pull_request' && github.sha || '' }}
         run: |
           set -euo pipefail
           development_ref="${DEFAULT_BRANCH}"
-          development_checkout_ref=""
+          # A pull request builds its event merge commit, checked out by hash:
+          # refs/pull/<n>/merge moves whenever the base branch or the pull
+          # request's stack changes, so it can name a different commit by the
+          # time the build job checks it out.
           if [[ "${EVENT_NAME}" == "pull_request" ]]; then
             development_ref="${PULL_REQUEST_SHA}"
-            development_checkout_ref="refs/pull/${PULL_REQUEST_NUMBER}/merge"
           elif [[ "${EVENT_NAME}" == "workflow_dispatch" && -n "${DISPATCH_REF}" ]]; then
             development_ref="${DISPATCH_REF}"
           fi
           echo "ref=${development_ref}" >> "${GITHUB_OUTPUT}"
-          echo "checkout_ref=${development_checkout_ref}" >> "${GITHUB_OUTPUT}"
 
       - name: Determine publication mode
         id: mode
@@ -128,7 +128,6 @@ jobs:
           python3 doc/rpc/versioned_site.py discover \
             --repository "${REPOSITORY}" \
             --development-ref "${DEVELOPMENT_REF}" \
-            --development-checkout-ref "${{ steps.development.outputs.checkout_ref }}" \
             --publisher-sha "${publisher_sha}" \
             --output "${RUNNER_TEMP}/rpc-docs-build-plan.json" \
             --github-output "${GITHUB_OUTPUT}"
