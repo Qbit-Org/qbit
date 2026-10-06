@@ -20,6 +20,7 @@
 #include <common/system.h>
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
+#include <crypto/mlkem.h>
 #include <deploymentstatus.h>
 #include <hash.h>
 #include <httprpc.h>
@@ -565,6 +566,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-i2pacceptincoming", strprintf("Whether to accept inbound I2P connections (default: %i). Ignored if -i2psam is not set. Listening for inbound I2P connections is done through the SAM proxy, not by binding to a local address and port.", DEFAULT_I2P_ACCEPT_INCOMING), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-onlynet=<net>", "Make automatic outbound connections only to network <net> (" + Join(GetNetworkNames(), ", ") + "). Inbound and manual connections are not affected by this option. It can be specified multiple times to allow multiple networks.", ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-v2transport", strprintf("Support v2 transport (default: %u)", DEFAULT_V2_TRANSPORT), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
+    argsman.AddArg("-v2pqtransport", strprintf("Support hybrid post-quantum key exchange (ML-KEM-1024) in v2 transport. Has no effect with -v2transport=0. A non-numeric value, or a double negative such as -nov2pqtransport=0, warns at startup and states how it was read (default: %u)", DEFAULT_V2_PQ_TRANSPORT), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-peerbloomfilters", strprintf("Support filtering of blocks and transaction with bloom filters (default: %u)", DEFAULT_PEERBLOOMFILTERS), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-peerblockfilters", strprintf("Serve compact block filters to peers per BIP 157 (default: %u)", DEFAULT_PEERBLOCKFILTERS), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION);
     argsman.AddArg("-txreconciliation", strprintf("Enable transaction reconciliations per BIP 330 (default: %d)", DEFAULT_TXRECONCILIATION_ENABLE), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::CONNECTION);
@@ -649,6 +651,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-limitdescendantsize=<n>", strprintf("Do not accept transactions if any ancestor would have more than <n> kilobytes of in-mempool descendants (default: %u).", DEFAULT_DESCENDANT_SIZE_LIMIT_KVB), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-test=<option>", "Pass a test-only option. Options include : " + Join(TEST_OPTIONS_DOC, ", ") + ".", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-capturemessages", "Capture all P2P messages to disk", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-mlkemportable", "Use the portable ML-KEM-1024 code instead of native code, in case native code misbehaves on this CPU. A non-numeric value, or a double negative such as -nomlkemportable=0, warns at startup and states how it was read (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-mocktime=<n>", "Replace actual time with " + UNIX_EPOCH_TIME + " (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-maxsigcachesize=<n>", strprintf("Limit sum of signature cache and script execution cache sizes to <n> MiB (default: %u)", DEFAULT_VALIDATION_CACHE_BYTES >> 20), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-maxtipage=<n>",
@@ -847,6 +850,69 @@ int available_fds;
 ServiceFlags g_local_services = ServiceFlags(NODE_NETWORK_LIMITED | NODE_WITNESS);
 int64_t peer_connect_timeout;
 std::set<BlockFilterType> g_enabled_filter_types;
+//! Set once by AppInitParameterInteraction(), for the startup line and the connection manager.
+PQTransportConfig g_pq_transport_config;
+//! Set once by AppInitParameterInteraction(): -mlkemportable or -test=mlkem_portable.
+bool g_mlkem_force_portable{false};
+
+/**
+ * How a boolean setting's text relates to what it is read as. Booleans are read as integers
+ * (InterpretBool()), so a string that isn't one completely, under the same whitespace and sign
+ * rules, is NON_NUMERIC: -X=true is read as 0, and -X=1abc or an overflowing number as 1. An empty
+ * value means 1. ArgsManager keeps a negated setting only as a bool, false for -noX and -noX=1, and
+ * true for a DOUBLE_NEGATIVE, -noX given 0 or any non-numeric value, which switches X on. Its text
+ * is gone, so -noX=1abc, read as 0 like -noX, is PLAIN.
+ */
+enum class BoolSettingText { PLAIN, NON_NUMERIC, DOUBLE_NEGATIVE };
+
+BoolSettingText GetBoolSettingText(const common::SettingsValue& value)
+{
+    if (value.isBool()) return value.get_bool() ? BoolSettingText::DOUBLE_NEGATIVE : BoolSettingText::PLAIN;
+    if (!value.isStr() || value.get_str().empty()) return BoolSettingText::PLAIN;
+    std::string_view number{util::TrimStringView(value.get_str())};
+    if (number.starts_with('+') && !number.starts_with("+-")) number.remove_prefix(1);
+    return ToIntegral<int>(number) ? BoolSettingText::PLAIN : BoolSettingText::NON_NUMERIC;
+}
+
+/** The warning for the boolean option -name when its setting's text doesn't say what it is read
+ *  as: the value given, if ArgsManager kept it, what it was read as, and the effect. */
+std::optional<bilingual_str> BoolSettingWarning(const std::string& name, const common::SettingsValue& value, bool read_as,
+                                                const bilingual_str& effect)
+{
+    switch (GetBoolSettingText(value)) {
+    case BoolSettingText::PLAIN:
+        return std::nullopt;
+    case BoolSettingText::NON_NUMERIC:
+        return strprintf(_("-%s=%s is not a number and was read as -%s=%d: %s. Use -%s=1 or -%s=0."),
+                         name, value.get_str(), name, read_as, effect, name, name);
+    case BoolSettingText::DOUBLE_NEGATIVE:
+        return strprintf(_("-no%s was given 0 or a non-numeric value, so it was read as -%s=1: %s. Use -%s=0 to switch it off."),
+                         name, name, effect, name);
+    } // no default case, so the compiler can warn about missing cases
+    assert(false);
+}
+
+/** The hybrid post-quantum v2 transport configuration of the effective settings, and the warnings
+ *  they need. */
+PQTransportConfig GetPQTransportConfig(const ArgsManager& args, std::vector<bilingual_str>& warnings)
+{
+    const common::SettingsValue pq_setting{args.GetSetting("-v2pqtransport")};
+    const std::optional<bool> pq_explicit{SettingToBool(pq_setting)};
+    const PQTransportConfig config{
+        .v2_enabled = args.GetBoolArg("-v2transport", DEFAULT_V2_TRANSPORT),
+        .pq_requested = pq_explicit.value_or(DEFAULT_V2_PQ_TRANSPORT),
+        .fail_first_packet = HasTestOption(args, "pq_fail_first_packet"),
+    };
+    if (auto warning{BoolSettingWarning("v2pqtransport", pq_setting, config.pq_requested,
+                                        config.Enabled() ? _("hybrid transport is ON") : _("hybrid transport is OFF"))}) {
+        warnings.push_back(std::move(*warning));
+    }
+    // Only an explicit request warns, never the default.
+    if (pq_explicit == true && !config.v2_enabled) {
+        warnings.push_back(_("-v2pqtransport=1 has no effect because -v2transport=0. Set -v2transport=1 to use hybrid post-quantum v2 transport."));
+    }
+    return config;
+}
 
 } // namespace
 
@@ -967,8 +1033,24 @@ bool AppInitParameterInteraction(const ArgsManager& args)
         }
     }
 
+    // The v2 transport configuration: the hybrid post-quantum key exchange's warnings, startup line,
+    // connections and RPC all use this one.
+    std::vector<bilingual_str> pq_warnings;
+    g_pq_transport_config = GetPQTransportConfig(args, pq_warnings);
+    for (const bilingual_str& warning : pq_warnings) InitWarning(warning);
+
+    // The ML-KEM-1024 code, selected before any networking object exists (AppInitMain()).
+    const common::SettingsValue portable_setting{args.GetSetting("-mlkemportable")};
+    const bool portable{SettingToBool(portable_setting).value_or(false)};
+    g_mlkem_force_portable = portable || HasTestOption(args, "mlkem_portable");
+    if (auto warning{BoolSettingWarning("mlkemportable", portable_setting, portable,
+                                        g_mlkem_force_portable ? _("ML-KEM-1024 uses portable code") :
+                                                                 _("ML-KEM-1024 uses native code where the CPU supports it"))}) {
+        InitWarning(*warning);
+    }
+
     // Signal NODE_P2P_V2 if BIP324 v2 transport is enabled.
-    if (args.GetBoolArg("-v2transport", DEFAULT_V2_TRANSPORT)) {
+    if (g_pq_transport_config.v2_enabled) {
         g_local_services = ServiceFlags(g_local_services | NODE_P2P_V2);
     }
 
@@ -1620,6 +1702,17 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         node.addrman = std::move(*addrman);
     }
 
+    // Select the ML-KEM-1024 code before any networking object exists, and name it.
+    mlkem::InitializeRuntime(/*force_portable=*/g_mlkem_force_portable);
+    {
+        const mlkem::BackendNames backends{mlkem::GetBackendNames()};
+        LogInfo("v2 pq: %s arith=%s keccak=%s",
+                !g_pq_transport_config.v2_enabled    ? "disabled (-v2transport=0)" :
+                !g_pq_transport_config.pq_requested ? "disabled (-v2pqtransport=0)" :
+                                                      "enabled",
+                backends.arith, backends.keccak);
+    }
+
     FastRandomContext rng;
     assert(!node.banman);
     node.banman = std::make_unique<BanMan>(args.GetDataDirNet() / "banlist", &uiInterface, args.GetIntArg("-bantime", DEFAULT_MISBEHAVING_BANTIME));
@@ -2113,6 +2206,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     connOptions.m_peer_connect_timeout = peer_connect_timeout;
     connOptions.whitelist_forcerelay = args.GetBoolArg("-whitelistforcerelay", DEFAULT_WHITELISTFORCERELAY);
     connOptions.whitelist_relay = args.GetBoolArg("-whitelistrelay", DEFAULT_WHITELISTRELAY);
+    connOptions.m_pq = g_pq_transport_config;
 
     // Port to bind to if `-bind=addr` is provided without a `:port` suffix.
     const uint16_t default_bind_port =

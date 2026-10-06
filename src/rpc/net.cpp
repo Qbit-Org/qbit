@@ -10,6 +10,7 @@
 #include <chainparams.h>
 #include <clientversion.h>
 #include <core_io.h>
+#include <crypto/mlkem.h>
 #include <net_permissions.h>
 #include <net_processing.h>
 #include <net_types.h>
@@ -36,6 +37,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <variant>
 #include <vector>
 
 using node::NodeContext;
@@ -55,6 +57,15 @@ const std::vector<std::string> TRANSPORT_TYPE_DOC{
     "detecting (peer could be v1 or v2)",
     "v1 (plaintext transport protocol)",
     "v2 (BIP324 encrypted transport protocol)"
+};
+
+const std::vector<std::string> PQ_STATUS_DOC{
+    "pending (negotiating, or closing: a connection that closes on any hybrid failure reports pending until it is removed)",
+    "hybrid (the peer's key confirmation verified: the session keys are hybrid)",
+    "legacy_peer (the peer's version packet carried no usable offer or accept: ECDH keys)",
+    "fallback (plain v2 to an endpoint in the fallback set after repeated hybrid failures)",
+    "off (plain v2: -v2pqtransport is off, the offer was shed, or a local ML-KEM fault happened before anything was committed)",
+    "v1 (v1 transport protocol)"
 };
 
 static RPCHelpMan getconnectioncount()
@@ -115,6 +126,32 @@ static UniValue GetServicesNames(ServiceFlags services)
     }
 
     return servicesNames;
+}
+
+/** A peer getpeerinfo lists, with its node state. */
+struct ListedPeer {
+    CNodeStats stats;
+    CNodeStateStats statestats;
+};
+
+/** The peers getpeerinfo lists; getnetworkinfo counts over the same ones. */
+static std::vector<ListedPeer> GetListedPeers(const CConnman& connman, const PeerManager& peerman)
+{
+    std::vector<CNodeStats> vstats;
+    connman.GetNodeStats(vstats);
+    std::vector<ListedPeer> peers;
+    peers.reserve(vstats.size());
+    for (CNodeStats& stats : vstats) {
+        CNodeStateStats statestats;
+        // GetNodeStateStats() requires the existence of a CNodeState and a Peer object
+        // to succeed for this peer. These are created at connection initialisation and
+        // exist for the duration of the connection - except if there is a race where the
+        // peer got disconnected in between the GetNodeStats() and the GetNodeStateStats()
+        // calls. In this case, the peer doesn't need to be reported here.
+        if (!peerman.GetNodeStateStats(stats.nodeid, statestats)) continue;
+        peers.push_back({std::move(stats), std::move(statestats)});
+    }
+    return peers;
 }
 
 static RPCHelpMan getpeerinfo()
@@ -191,7 +228,11 @@ static RPCHelpMan getpeerinfo()
                                                               "Please note this output is unlikely to be stable in upcoming releases as we iterate to\n"
                                                               "best capture connection behaviors."},
                     {RPCResult::Type::STR, "transport_protocol_type", "Type of transport protocol: \n" + Join(TRANSPORT_TYPE_DOC, ",\n") + ".\n"},
-                    {RPCResult::Type::STR, "session_id", "The session ID for this connection, or \"\" if there is none (\"v2\" transport protocol only).\n"},
+                    {RPCResult::Type::STR, "session_id", "The session ID for this connection, or \"\" if there is none (\"v2\" transport protocol only).\n"
+                                                         "With hybrid post-quantum session keys (transport_pq), the hybrid session ID.\n"},
+                    {RPCResult::Type::BOOL, "transport_pq", "Whether the session keys are hybrid post-quantum (ML-KEM-1024 and ECDH): true once the peer's key confirmation verified"},
+                    {RPCResult::Type::STR, "transport_pq_status", "Status of the hybrid post-quantum key exchange: \n" + Join(PQ_STATUS_DOC, ",\n") + ".\n"
+                                                                  "There is no failed status: every hybrid negotiation failure that closes the connection reports pending until the peer is removed.\n"},
                 }},
             }},
         },
@@ -205,23 +246,10 @@ static RPCHelpMan getpeerinfo()
     const CConnman& connman = EnsureConnman(node);
     const PeerManager& peerman = EnsurePeerman(node);
 
-    std::vector<CNodeStats> vstats;
-    connman.GetNodeStats(vstats);
-
     UniValue ret(UniValue::VARR);
 
-    for (const CNodeStats& stats : vstats) {
+    for (const auto& [stats, statestats] : GetListedPeers(connman, peerman)) {
         UniValue obj(UniValue::VOBJ);
-        CNodeStateStats statestats;
-        bool fStateStats = peerman.GetNodeStateStats(stats.nodeid, statestats);
-        // GetNodeStateStats() requires the existence of a CNodeState and a Peer object
-        // to succeed for this peer. These are created at connection initialisation and
-        // exist for the duration of the connection - except if there is a race where the
-        // peer got disconnected in between the GetNodeStats() and the GetNodeStateStats()
-        // calls. In this case, the peer doesn't need to be reported here.
-        if (!fStateStats) {
-            continue;
-        }
         obj.pushKV("id", stats.nodeid);
         obj.pushKV("addr", stats.m_addr_name);
         if (stats.addrBind.IsValid()) {
@@ -298,6 +326,8 @@ static RPCHelpMan getpeerinfo()
         obj.pushKV("connection_type", ConnectionTypeAsString(stats.m_conn_type));
         obj.pushKV("transport_protocol_type", TransportTypeAsString(stats.m_transport_type));
         obj.pushKV("session_id", stats.m_session_id);
+        obj.pushKV("transport_pq", stats.m_transport_pq);
+        obj.pushKV("transport_pq_status", std::string{PQStatusString(stats.m_transport_pq_status)});
 
         ret.push_back(std::move(obj));
     }
@@ -792,6 +822,7 @@ static RPCHelpMan getnetworkinfo()
                         {RPCResult::Type::NUM, "connections", "the total number of connections"},
                         {RPCResult::Type::NUM, "connections_in", "the number of inbound connections"},
                         {RPCResult::Type::NUM, "connections_out", "the number of outbound connections"},
+                        {RPCResult::Type::NUM, "connections_pq", "the number of connections with hybrid post-quantum session keys: the peers getpeerinfo lists with transport_pq true"},
                         {RPCResult::Type::BOOL, "networkactive", "whether p2p networking is enabled"},
                         {RPCResult::Type::ARR, "networks", "information per network",
                         {
@@ -831,12 +862,19 @@ static RPCHelpMan getnetworkinfo()
                 },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
+    NodeContext& node = EnsureAnyNodeContext(request.context);
+    // Counted before cs_main is taken, as getpeerinfo lists the peers.
+    int connections_pq{0};
+    if (node.connman && node.peerman) {
+        for (const ListedPeer& peer : GetListedPeers(*node.connman, *node.peerman)) {
+            if (peer.stats.m_transport_pq) ++connections_pq;
+        }
+    }
     LOCK(cs_main);
     UniValue obj(UniValue::VOBJ);
     obj.pushKV("version",       CLIENT_VERSION);
     obj.pushKV("subversion",    strSubVersion);
     obj.pushKV("protocolversion",PROTOCOL_VERSION);
-    NodeContext& node = EnsureAnyNodeContext(request.context);
     if (node.connman) {
         ServiceFlags services = node.connman->GetLocalServices();
         obj.pushKV("localservices", strprintf("%016x", services));
@@ -852,6 +890,7 @@ static RPCHelpMan getnetworkinfo()
         obj.pushKV("connections", node.connman->GetNodeCount(ConnectionDirection::Both));
         obj.pushKV("connections_in", node.connman->GetNodeCount(ConnectionDirection::In));
         obj.pushKV("connections_out", node.connman->GetNodeCount(ConnectionDirection::Out));
+        obj.pushKV("connections_pq", connections_pq);
     }
     obj.pushKV("networks",      GetNetworksInfo());
     if (node.mempool) {
@@ -1339,6 +1378,282 @@ static RPCHelpMan getrawaddrman()
     };
 }
 
+/** The getpqtransportinfo help of an endpoint. */
+static std::vector<RPCResult> PQEndpointDoc()
+{
+    return {
+        {RPCResult::Type::STR, "kind", "\"address\" (a resolved destination, or an inbound peer) or \"name_proxy\" (a hostname connected through a proxy that resolves it)"},
+        {RPCResult::Type::STR, "network", "ipv4, ipv6, onion, i2p, cjdns or name_proxy"},
+        {RPCResult::Type::STR, "address", "The canonical address, or the normalized hostname, without the port"},
+        {RPCResult::Type::NUM, "port", "The port; for an inbound peer, its source port"},
+    };
+}
+
+/** The getpqtransportinfo help of one direction's counters. */
+static std::vector<RPCResult> PQCountsDoc(bool inbound)
+{
+    std::vector<RPCResult> doc{
+        {RPCResult::Type::NUM, "switched", "Switches to hybrid keys, including those whose key confirmation then failed"},
+        {RPCResult::Type::NUM, "legacy_peer", "Peers whose version packet carried no usable offer or accept"},
+        {RPCResult::Type::NUM, "malformed_record", "Peers whose first hybrid record was malformed"},
+        {RPCResult::Type::NUM, "first_packet_failed", "Key confirmations of the peer that failed"},
+        {RPCResult::Type::NUM, "abandoned", "Offers whose initiator sent no authenticated version packet before the connection closed (only responders offer: 0 outbound)"},
+        {RPCResult::Type::NUM, "internal_error", "Local ML-KEM or cipher state errors"},
+    };
+    if (inbound) {
+        doc.push_back({RPCResult::Type::NUM, "shed", "Offers not made because of load shedding"});
+    } else {
+        doc.push_back({RPCResult::Type::NUM, "closed_after_switch", "Connections the peer closed, or that timed out, after we switched and before its key confirmation verified"});
+        doc.push_back({RPCResult::Type::NUM, "fallback", "Entries of an endpoint into the fallback set (not the plain v2 connections it gives)"});
+    }
+    return doc;
+}
+
+/** The getpqtransportinfo help of one direction's failure ring. */
+static RPCResult PQRingDoc(const std::string& name, const std::string& description)
+{
+    return {RPCResult::Type::OBJ, name, description,
+        {
+            {RPCResult::Type::NUM, "last_sequence", "The sequence of the newest entry ever added (the first is 1), or 0 if none"},
+            {RPCResult::Type::NUM, "dropped", strprintf("How many entries were evicted to keep at most %u", PQ_FAILURE_RING_SIZE)},
+            {RPCResult::Type::ARR, "entries", "The most recent failures, oldest first",
+            {
+                {RPCResult::Type::OBJ, "", "",
+                {
+                    {RPCResult::Type::NUM, "sequence", "The entry's sequence in this ring"},
+                    {RPCResult::Type::NUM_TIME, "time", "The " + UNIX_EPOCH_TIME + " of the outcome"},
+                    {RPCResult::Type::OBJ, "endpoint", "The endpoint the outcome is accounted to", PQEndpointDoc()},
+                    {RPCResult::Type::STR, "direction", "\"inbound\" or \"outbound\""},
+                    {RPCResult::Type::STR, "connection_type", "The connection type, as in getpeerinfo"},
+                    {RPCResult::Type::NUM, "peer_id", "The peer index, as in getpeerinfo"},
+                    {RPCResult::Type::STR, "outcome", "legacy_peer, malformed_record, first_packet_failed, abandoned, closed_after_switch, fallback or internal_error"},
+                    {RPCResult::Type::STR, "reason", "The outcome's reason (see above)"},
+                }},
+            }},
+        }};
+}
+
+/** The network of an endpoint's address, as getpqtransportinfo names it. */
+static std::string PQEndpointNetwork(const CService& service)
+{
+    // The address's own network: a local or private address is still ipv4 or ipv6.
+    if (service.IsIPv4()) return "ipv4";
+    if (service.IsIPv6()) return "ipv6";
+    if (service.IsTor()) return "onion";
+    if (service.IsI2P()) return "i2p";
+    if (service.IsCJDNS()) return "cjdns";
+    // Internal addresses are never connected to.
+    return GetNetworkName(service.GetNetwork());
+}
+
+static UniValue PQEndpointToUniv(const PQEndpointKey& endpoint)
+{
+    UniValue obj(UniValue::VOBJ);
+    if (const CService* service{std::get_if<CService>(&endpoint)}) {
+        obj.pushKV("kind", "address");
+        obj.pushKV("network", PQEndpointNetwork(*service));
+        obj.pushKV("address", service->ToStringAddr());
+        obj.pushKV("port", service->GetPort());
+    } else {
+        const PQNameEndpoint& name{std::get<PQNameEndpoint>(endpoint)};
+        obj.pushKV("kind", "name_proxy");
+        obj.pushKV("network", "name_proxy");
+        obj.pushKV("address", name.hostname);
+        obj.pushKV("port", name.port);
+    }
+    return obj;
+}
+
+static UniValue PQCountsToUniv(const PQCounts& counts, bool inbound)
+{
+    UniValue obj(UniValue::VOBJ);
+    obj.pushKV("switched", counts.switched);
+    obj.pushKV("legacy_peer", counts.legacy_peer);
+    obj.pushKV("malformed_record", counts.malformed_record);
+    obj.pushKV("first_packet_failed", counts.first_packet_failed);
+    obj.pushKV("abandoned", counts.abandoned);
+    obj.pushKV("internal_error", counts.internal_error);
+    if (inbound) {
+        obj.pushKV("shed", counts.shed);
+    } else {
+        obj.pushKV("closed_after_switch", counts.closed_after_switch);
+        obj.pushKV("fallback", counts.fallback);
+    }
+    return obj;
+}
+
+static UniValue PQRingToUniv(const PQFailureRing& ring)
+{
+    UniValue entries(UniValue::VARR);
+    for (const PQFailureEntry& entry : ring.entries) {
+        UniValue obj(UniValue::VOBJ);
+        obj.pushKV("sequence", entry.sequence);
+        obj.pushKV("time", TicksSinceEpoch<std::chrono::seconds>(entry.time));
+        obj.pushKV("endpoint", PQEndpointToUniv(entry.endpoint));
+        obj.pushKV("direction", entry.inbound ? "inbound" : "outbound");
+        obj.pushKV("connection_type", ConnectionTypeAsString(entry.connection_type));
+        obj.pushKV("peer_id", entry.peer_id);
+        obj.pushKV("outcome", std::string{PQOutcomeString(entry.outcome)});
+        obj.pushKV("reason", entry.reason);
+        entries.push_back(std::move(obj));
+    }
+    UniValue obj(UniValue::VOBJ);
+    obj.pushKV("last_sequence", ring.last_sequence);
+    obj.pushKV("dropped", ring.dropped);
+    obj.pushKV("entries", std::move(entries));
+    return obj;
+}
+
+static RPCHelpMan getpqtransportinfo()
+{
+    const std::string causes{"malformed_record, first_packet_failed or closed_after_switch"};
+    const std::string windows{"3600, 14400 or 86400"};
+    return RPCHelpMan{
+        "getpqtransportinfo",
+        "Returns the state of the hybrid post-quantum key exchange (ML-KEM-1024 and ECDH) in v2 transport:\n"
+        "its configuration, the handshake outcomes since startup, load shedding, the fallback set, failure\n"
+        "streaks and the most recent failures. Every field is always present.\n"
+        "\n"
+        "-v2transport and -v2pqtransport are read once, at startup. A non-numeric -v2pqtransport value\n"
+        "(true reads as 0), or a double negative such as -nov2pqtransport=0 (read as 1), warns there and\n"
+        "states how it was read.\n"
+        "\n"
+        "Counters count events, not exclusive outcomes: switched counts key installations, even if the key\n"
+        "confirmation then fails; fallback counts entries into the fallback set, not plain v2 connections;\n"
+        "abandoned counts offers whose initiator sent no authenticated version packet before the connection\n"
+        "closed. Counters, rings and endpoint history are kept in memory only, and start over when\n"
+        "instance_id changes.\n"
+        "\n"
+        "A connection that closes on a hybrid failure reports transport_pq_status \"pending\" in getpeerinfo\n"
+        "until it is removed; its outcome is counted here.\n"
+        "\n"
+        "Reasons, by outcome:\n"
+        "legacy_peer: no_features, parse_error\n"
+        "malformed_record: ek_length, ek_modulus, ct_length\n"
+        "first_packet_failed: length, tag, not_decoy\n"
+        "closed_after_switch: eof, reset, timeout\n"
+        "abandoned: eof, reset, timeout, send_error, local, garbage_terminator, version_length, version_tag\n"
+        "fallback: malformed_record, first_packet_failed, closed_after_switch (the failure that completed the streak)\n"
+        "internal_error: keygen, check_public_key, encaps, decaps, cipher_state\n",
+        {},
+        RPCResult{
+            RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::BOOL, "enabled", "Whether new v2 connections negotiate hybrid keys: -v2transport and -v2pqtransport are both on"},
+                {RPCResult::Type::STR, "status", "enabled, disabled_v2pqtransport (-v2pqtransport=0) or disabled_v2transport (-v2transport=0, whatever -v2pqtransport is)"},
+                {RPCResult::Type::STR_HEX, "instance_id", "Random per process start"},
+                {RPCResult::Type::STR, "arith_backend", "The ML-KEM-1024 arithmetic code that runs: x86_64-avx2, aarch64-neon or portable"},
+                {RPCResult::Type::STR, "keccak_backend", "The Keccak code that runs: x86_64-avx2, aarch64 or portable"},
+                {RPCResult::Type::NUM_TIME, "since", "The " + UNIX_EPOCH_TIME + " of startup, from which the counters count"},
+                {RPCResult::Type::OBJ, "handshakes", "Hybrid negotiation events",
+                {
+                    {RPCResult::Type::OBJ, "inbound", "Of inbound connections", PQCountsDoc(/*inbound=*/true)},
+                    {RPCResult::Type::OBJ, "outbound", "Of outbound connections, manual ones included", PQCountsDoc(/*inbound=*/false)},
+                }},
+                {RPCResult::Type::OBJ, "load_shedding", "Inbound offer load shedding",
+                {
+                    {RPCResult::Type::BOOL, "active", "Whether responders stop offering, because more than threshold_per_s inbound offers were attempted in one second"},
+                    {RPCResult::Type::NUM, "threshold_per_s", "The threshold, in offers attempted per second"},
+                    {RPCResult::Type::NUM_TIME, "since", "The " + UNIX_EPOCH_TIME + " the current shedding period started, or 0 when inactive"},
+                }},
+                {RPCResult::Type::ARR, "fallback_set", "Endpoints that outbound connections reach with plain v2, after repeated hybrid failures",
+                {
+                    {RPCResult::Type::OBJ, "", "",
+                    {
+                        {RPCResult::Type::OBJ, "endpoint", "", PQEndpointDoc()},
+                        {RPCResult::Type::STR, "cause", "The failure that completed the streak: " + causes},
+                        {RPCResult::Type::STR, "reason", "Its reason"},
+                        {RPCResult::Type::NUM, "streak", "Consecutive counted failures"},
+                        {RPCResult::Type::NUM_TIME, "entered", "The " + UNIX_EPOCH_TIME + " the endpoint entered the set"},
+                        {RPCResult::Type::NUM_TIME, "expires", "The " + UNIX_EPOCH_TIME + " the window ends"},
+                        {RPCResult::Type::NUM, "window_seconds", "The window: " + windows},
+                    }},
+                }},
+                {RPCResult::Type::ARR, "failure_streaks", "Outbound endpoints with counted failures, not in the fallback set",
+                {
+                    {RPCResult::Type::OBJ, "", "",
+                    {
+                        {RPCResult::Type::OBJ, "endpoint", "", PQEndpointDoc()},
+                        {RPCResult::Type::STR, "cause", "The latest counted failure: " + causes},
+                        {RPCResult::Type::STR, "reason", "Its reason"},
+                        {RPCResult::Type::NUM, "streak", strprintf("Consecutive counted failures, below %u", PQ_FAILURE_THRESHOLD)},
+                        {RPCResult::Type::NUM_TIME, "last_failure", "The " + UNIX_EPOCH_TIME + " of the latest counted failure"},
+                        {RPCResult::Type::NUM, "next_window_seconds", "The window the endpoint enters at the threshold: " + windows},
+                    }},
+                }},
+                {RPCResult::Type::OBJ, "recent_failures", "The most recent non-success outcomes",
+                {
+                    PQRingDoc("inbound", "Of inbound connections"),
+                    PQRingDoc("outbound", "Of outbound connections, manual ones included"),
+                }},
+            }},
+        RPCExamples{
+            HelpExampleCli("getpqtransportinfo", "")
+            + HelpExampleRpc("getpqtransportinfo", "")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    NodeContext& node = EnsureAnyNodeContext(request.context);
+    const CConnman& connman = EnsureConnman(node);
+    const PQTransportConfig& config{connman.GetPQTransportConfig()};
+    const PQTransportStats stats{connman.GetPQTransportStats()};
+    const mlkem::BackendNames backends{mlkem::GetBackendNames()};
+
+    UniValue obj(UniValue::VOBJ);
+    obj.pushKV("enabled", config.Enabled());
+    obj.pushKV("status", !config.v2_enabled ? "disabled_v2transport" : !config.pq_requested ? "disabled_v2pqtransport" : "enabled");
+    obj.pushKV("instance_id", HexStr(stats.instance_id));
+    obj.pushKV("arith_backend", std::string{backends.arith});
+    obj.pushKV("keccak_backend", std::string{backends.keccak});
+    obj.pushKV("since", TicksSinceEpoch<std::chrono::seconds>(stats.since));
+
+    UniValue handshakes(UniValue::VOBJ);
+    handshakes.pushKV("inbound", PQCountsToUniv(stats.inbound, /*inbound=*/true));
+    handshakes.pushKV("outbound", PQCountsToUniv(stats.outbound, /*inbound=*/false));
+    obj.pushKV("handshakes", std::move(handshakes));
+
+    UniValue load_shedding(UniValue::VOBJ);
+    load_shedding.pushKV("active", stats.load_shedding.active);
+    load_shedding.pushKV("threshold_per_s", stats.load_shedding.threshold_per_s);
+    load_shedding.pushKV("since", TicksSinceEpoch<std::chrono::seconds>(stats.load_shedding.since));
+    obj.pushKV("load_shedding", std::move(load_shedding));
+
+    UniValue fallback_set(UniValue::VARR);
+    for (const PQFallbackStats& fallback : stats.fallback_set) {
+        UniValue entry(UniValue::VOBJ);
+        entry.pushKV("endpoint", PQEndpointToUniv(fallback.endpoint));
+        entry.pushKV("cause", std::string{PQOutcomeString(fallback.cause)});
+        entry.pushKV("reason", fallback.reason);
+        entry.pushKV("streak", uint64_t{fallback.streak});
+        entry.pushKV("entered", TicksSinceEpoch<std::chrono::seconds>(fallback.entered));
+        entry.pushKV("expires", TicksSinceEpoch<std::chrono::seconds>(fallback.expires));
+        entry.pushKV("window_seconds", Ticks<std::chrono::seconds>(fallback.expires - fallback.entered));
+        fallback_set.push_back(std::move(entry));
+    }
+    obj.pushKV("fallback_set", std::move(fallback_set));
+
+    UniValue failure_streaks(UniValue::VARR);
+    for (const PQStreakStats& streak : stats.failure_streaks) {
+        UniValue entry(UniValue::VOBJ);
+        entry.pushKV("endpoint", PQEndpointToUniv(streak.endpoint));
+        entry.pushKV("cause", std::string{PQOutcomeString(streak.cause)});
+        entry.pushKV("reason", streak.reason);
+        entry.pushKV("streak", uint64_t{streak.streak});
+        entry.pushKV("last_failure", TicksSinceEpoch<std::chrono::seconds>(streak.last_failure));
+        entry.pushKV("next_window_seconds", Ticks<std::chrono::seconds>(streak.next_window));
+        failure_streaks.push_back(std::move(entry));
+    }
+    obj.pushKV("failure_streaks", std::move(failure_streaks));
+
+    UniValue recent_failures(UniValue::VOBJ);
+    recent_failures.pushKV("inbound", PQRingToUniv(stats.inbound_failures));
+    recent_failures.pushKV("outbound", PQRingToUniv(stats.outbound_failures));
+    obj.pushKV("recent_failures", std::move(recent_failures));
+    return obj;
+},
+    };
+}
+
 void RegisterNetRPCCommands(CRPCTable& t)
 {
     static const CRPCCommand commands[]{
@@ -1357,6 +1672,7 @@ void RegisterNetRPCCommands(CRPCTable& t)
         {"network", &setnetworkactive},
         {"network", &getnodeaddresses},
         {"network", &getaddrmaninfo},
+        {"network", &getpqtransportinfo},
         {"hidden", &addconnection},
         {"hidden", &addpeeraddress},
         {"hidden", &sendmsgtopeer},

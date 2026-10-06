@@ -9,15 +9,20 @@
 #include <key.h>
 #include <logging.h>
 #include <net.h>
+#include <net_processing.h>
 #include <netaddress.h>
 #include <netbase.h>
+#include <node/context.h>
 #include <random.h>
+#include <rpc/request.h>
+#include <rpc/server.h>
 #include <serialize.h>
 #include <span.h>
 #include <streams.h>
 #include <test/util/logging.h>
 #include <test/util/net.h>
 #include <test/util/setup_common.h>
+#include <univalue.h>
 #include <util/sock.h>
 #include <util/time.h>
 
@@ -33,6 +38,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -257,7 +263,6 @@ struct PQNetSetup : public RegTestingSetup {
         static_assert(PQ_FAILURE_THRESHOLD == 3);
         InitConnman();
         m_connman.SetPeerConnectTimeout(60s);
-        m_connman.SetPQMode(PQMode::NEGOTIATE);
         SetMockTime(GetTime<std::chrono::seconds>());
         MockableSteadyClock::SetMockTime(STEADY_START);
     }
@@ -272,13 +277,16 @@ struct PQNetSetup : public RegTestingSetup {
     //! Where the mocked steady clock, which drives load shedding, starts.
     static constexpr std::chrono::seconds STEADY_START{3600};
 
-    /** Init() with room for inbound peers, v2 accepted, and the given load shedding threshold. */
-    void InitConnman(uint64_t shed_threshold = DEFAULT_PQ_SHED_THRESHOLD_PER_S)
+    /** Init() with room for inbound peers, v2 accepted, the given load shedding threshold, and
+     *  the given hybrid transport configuration: on by default. */
+    void InitConnman(uint64_t shed_threshold = DEFAULT_PQ_SHED_THRESHOLD_PER_S,
+                     PQTransportConfig pq = {.v2_enabled = true, .pq_requested = true})
     {
         CConnman::Options options;
         options.m_max_automatic_connections = DEFAULT_MAX_PEER_CONNECTIONS;
         options.m_local_services = NODE_P2P_V2;
         options.pq_shed_threshold_per_s = shed_threshold;
+        options.m_pq = pq;
         m_connman.Init(options);
         m_connman.SetMsgProc(&m_events);
     }
@@ -395,6 +403,34 @@ struct PQNetSetup : public RegTestingSetup {
     void Disconnect() { m_connman.DisconnectNodesPublic(); }
 
     PQTransportStats Stats() const { return m_connman.GetPQTransportStats(); }
+
+    /** An RPC's result, with context as the node. */
+    static UniValue CallRPC(node::NodeContext& context, const std::string& method)
+    {
+        JSONRPCRequest request;
+        request.context = &context;
+        request.strMethod = method;
+        request.params = UniValue{UniValue::VARR};
+        if (RPCIsInWarmup(nullptr)) SetRPCWarmupFinished();
+        return tableRPC.execute(request);
+    }
+
+    /** getpqtransportinfo, with this fixture's connection manager as the node's. */
+    UniValue PQTransportInfo()
+    {
+        node::NodeContext context;
+        // Borrowed for the call, and released before the context is destroyed.
+        context.connman.reset(&m_connman);
+        std::optional<UniValue> result;
+        try {
+            result = CallRPC(context, "getpqtransportinfo");
+        } catch (...) {
+            (void)context.connman.release();
+            throw;
+        }
+        (void)context.connman.release();
+        return *result;
+    }
 
     /** How a test connection ends. */
     enum class End { MALFORMED, CONFIRMATION, PEER_EOF, PEER_RESET, TIMEOUT, LOCAL, SEND_ERROR, LEGACY, SUCCESS };
@@ -1395,13 +1431,15 @@ BOOST_AUTO_TEST_CASE(pq_history_eviction)
 }
 
 namespace {
-/** The warning names the backends that ran, and no remedy: no option forces portable code yet. */
+/** The warning names the backends that ran, and -mlkemportable as the remedy while native code runs. */
 std::string LocalFaultLine()
 {
     const auto backends{mlkem::GetBackendNames()};
+    const bool native{backends.arith != "portable" || backends.keccak != "portable"};
     return strprintf("v2 pq: local_fault arith=%s keccak=%s: hybrid handshakes failed with 8 distinct endpoints and none succeeded "
-                     "since startup, so this node's own ML-KEM code may be at fault.",
-                     backends.arith, backends.keccak);
+                     "since startup, so this node's own ML-KEM code may be at fault.%s",
+                     backends.arith, backends.keccak,
+                     native ? " Restart with -mlkemportable to use the portable implementation." : "");
 }
 } // namespace
 
@@ -1434,6 +1472,8 @@ BOOST_AUTO_TEST_CASE(pq_local_fault_warning_portable)
     BOOST_CHECK_EQUAL(mlkem::GetBackendNames().arith, "portable");
     const std::string text{LocalFaultLine()};
     BOOST_CHECK(text.find("arith=portable keccak=portable:") != std::string::npos);
+    // Portable code already runs: no remedy to name.
+    BOOST_CHECK(text.find("-mlkemportable") == std::string::npos);
     LogLineCounter warnings{"v2 pq: local_fault"};
     {
         DebugLogHelper expect{text, AtLevel({text}, LineLevel::WARNING)};
@@ -1609,8 +1649,7 @@ BOOST_AUTO_TEST_CASE(pq_load_shedding)
 BOOST_AUTO_TEST_CASE(pq_load_shedding_off)
 {
     // With the switch off, inbound transports never ask the gate: nothing is counted or shed.
-    InitConnman(/*shed_threshold=*/1);
-    m_connman.SetPQMode(PQMode::OFF);
+    InitConnman(/*shed_threshold=*/1, {.v2_enabled = true, .pq_requested = false});
     for (int i{0}; i < 5; ++i) {
         Link link{Accept()};
         Receive(link, InitiatorKey());
@@ -1707,6 +1746,201 @@ BOOST_AUTO_TEST_CASE(pq_load_shedding_socket_thread)
     m_connman.StopSocketHandlerThread();
     BOOST_CHECK(!Stats().load_shedding.active);
     BOOST_CHECK_EQUAL(stopped.m_count, 1);
+}
+
+BOOST_AUTO_TEST_CASE(pq_config)
+{
+    // Init() takes the negotiation of new connections, inbound and outbound, from the
+    // configuration: on only with both switches on.
+    const auto create_sock_orig{CreateSock};
+    CreateSock = [](int, int, int) -> std::unique_ptr<Sock> { return std::make_unique<ZeroSock>(); };
+    for (const auto& [config, enabled] : std::vector<std::pair<PQTransportConfig, bool>>{
+             {{.v2_enabled = false, .pq_requested = true}, false},
+             {{.v2_enabled = true, .pq_requested = false}, false},
+             {{.v2_enabled = true, .pq_requested = true}, true},
+         }) {
+        BOOST_CHECK_EQUAL(config.Enabled(), enabled);
+        InitConnman(DEFAULT_PQ_SHED_THRESHOLD_PER_S, config);
+        Link inbound{Accept()};
+        V2Transport peer{Initiator()};
+        Exchange(inbound, peer);
+        const Transport::Info info{inbound.node->m_transport->GetInfo()};
+        BOOST_CHECK_EQUAL(info.transport_pq, enabled);
+        BOOST_CHECK(info.transport_pq_status == (enabled ? PQStatus::HYBRID : PQStatus::OFF));
+        const std::unique_ptr<CNode> outbound{m_connman.ConnectNodeOnly("5.6.7.8:18555", ConnectionType::MANUAL, /*use_v2transport=*/true)};
+        BOOST_REQUIRE(outbound);
+        BOOST_CHECK(outbound->m_transport->GetInfo().transport_pq_status == (enabled ? PQStatus::PENDING : PQStatus::OFF));
+    }
+
+    // -test=pq_fail_first_packet corrupts this side's shared secret, so its check of the peer's key
+    // confirmation fails (and it closes before its own confirmation is sent).
+    InitConnman(DEFAULT_PQ_SHED_THRESHOLD_PER_S, {.v2_enabled = true, .pq_requested = true, .fail_first_packet = true});
+    Link inbound{Accept()};
+    V2Transport peer{Initiator()};
+    Exchange(inbound, peer);
+    const PQHandshake::Snapshot ours{inbound.node->m_transport->GetPQSnapshot()};
+    BOOST_CHECK(ours.switched);
+    BOOST_CHECK(!ours.confirmed);
+    BOOST_CHECK(ours.failure == PQFailure::CONFIRM_LENGTH || ours.failure == PQFailure::CONFIRM_TAG);
+    BOOST_CHECK(inbound.node->fDisconnect);
+    BOOST_CHECK(peer.GetPQSnapshot().switched);
+    CreateSock = create_sock_orig;
+}
+
+BOOST_AUTO_TEST_CASE(pq_rpc_status)
+{
+    // status names the first switch that is off: v2 before the hybrid key exchange.
+    for (const auto& [config, status] : std::vector<std::pair<PQTransportConfig, std::string>>{
+             {{.v2_enabled = false, .pq_requested = false}, "disabled_v2transport"},
+             {{.v2_enabled = false, .pq_requested = true}, "disabled_v2transport"},
+             {{.v2_enabled = true, .pq_requested = false}, "disabled_v2pqtransport"},
+             {{.v2_enabled = true, .pq_requested = true}, "enabled"},
+         }) {
+        InitConnman(DEFAULT_PQ_SHED_THRESHOLD_PER_S, config);
+        const UniValue info{PQTransportInfo()};
+        BOOST_CHECK_EQUAL(info["status"].get_str(), status);
+        BOOST_CHECK_EQUAL(info["enabled"].get_bool(), config.Enabled());
+    }
+}
+
+BOOST_AUTO_TEST_CASE(pq_rpc_load_shedding)
+{
+    // The second offer within one second, above a threshold of 1, is shed: load_shedding is active
+    // since now, and the inbound shed counter counts it.
+    InitConnman(/*shed_threshold=*/1);
+    for (int i{0}; i < 2; ++i) {
+        Link link{Accept()};
+        Receive(link, InitiatorKey());
+        Pass(link);
+    }
+    const UniValue info{PQTransportInfo()};
+    BOOST_CHECK_EQUAL(info["load_shedding"].write(),
+                      strprintf(R"({"active":true,"threshold_per_s":1,"since":%d})", TicksSinceEpoch<std::chrono::seconds>(Now<NodeSeconds>())));
+    BOOST_CHECK_EQUAL(info["handshakes"]["inbound"]["shed"].getInt<uint64_t>(), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(pq_rpc_endpoints)
+{
+    // Each kind of endpoint, as the outbound ring and the failure streaks render it: an address's
+    // own network, whether or not it is publicly routable, its canonical text without the port.
+    CNetAddr onion, i2p;
+    BOOST_REQUIRE(onion.SetSpecial("pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion"));
+    BOOST_REQUIRE(i2p.SetSpecial("udhdrtrcetjm5sxzskjyr5ztpeszydbh4dpl3pl4utgqqw2v4jna.b32.i2p"));
+    const std::vector<std::pair<PQEndpointKey, std::string>> endpoints{
+        {LookupNumeric("10.1.2.3", 8333), R"({"kind":"address","network":"ipv4","address":"10.1.2.3","port":8333})"},
+        {LookupNumeric("::ffff:1.2.3.4", 8334), R"({"kind":"address","network":"ipv4","address":"1.2.3.4","port":8334})"},
+        {LookupNumeric("2001:db8::1", 18444), R"({"kind":"address","network":"ipv6","address":"2001:db8::1","port":18444})"},
+        {LookupNumeric("::1", 18445), R"({"kind":"address","network":"ipv6","address":"::1","port":18445})"},
+        {CService{onion, 8333}, R"({"kind":"address","network":"onion","address":"pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion","port":8333})"},
+        {CService{i2p, 0}, R"({"kind":"address","network":"i2p","address":"udhdrtrcetjm5sxzskjyr5ztpeszydbh4dpl3pl4utgqqw2v4jna.b32.i2p","port":0})"},
+        {MakePQNameEndpoint("PQTest.Example.", 8333), R"({"kind":"name_proxy","network":"name_proxy","address":"pqtest.example","port":8333})"},
+    };
+    for (const auto& [endpoint, _] : endpoints) Connect(endpoint, End::MALFORMED);
+    const UniValue info{PQTransportInfo()};
+    const UniValue& entries{info["recent_failures"]["outbound"]["entries"]};
+    const UniValue& streaks{info["failure_streaks"]};
+    BOOST_REQUIRE_EQUAL(entries.size(), endpoints.size());
+    BOOST_REQUIRE_EQUAL(streaks.size(), endpoints.size());
+    std::set<std::string> streak_endpoints;
+    for (size_t i{0}; i < endpoints.size(); ++i) {
+        BOOST_CHECK_EQUAL(entries[i]["endpoint"].write(), endpoints[i].second);
+        streak_endpoints.insert(streaks[i]["endpoint"].write());
+    }
+    for (const auto& [_, rendered] : endpoints) BOOST_CHECK(streak_endpoints.contains(rendered));
+}
+
+BOOST_AUTO_TEST_CASE(pq_rpc_windows)
+{
+    // An endpoint's windows escalate, 1 h, 4 h, then 24 h: window_seconds and next_window_seconds
+    // show the escalated values.
+    const PQEndpointKey endpoint{TestEndpoint(9, 0)};
+    const auto window{[&](const std::string& field) {
+        const UniValue info{PQTransportInfo()};
+        BOOST_REQUIRE_EQUAL(info["fallback_set"].size(), 1U);
+        BOOST_REQUIRE(info["failure_streaks"].empty());
+        const UniValue& entry{info["fallback_set"][0]};
+        BOOST_CHECK_EQUAL(entry["expires"].getInt<int64_t>() - entry["entered"].getInt<int64_t>(), entry[field].getInt<int64_t>());
+        return entry[field].getInt<int64_t>();
+    }};
+    const auto next_window{[&] {
+        const UniValue info{PQTransportInfo()};
+        BOOST_REQUIRE(info["fallback_set"].empty());
+        BOOST_REQUIRE_EQUAL(info["failure_streaks"].size(), 1U);
+        return info["failure_streaks"][0]["next_window_seconds"].getInt<int64_t>();
+    }};
+    const auto expire{[&](std::chrono::seconds window) {
+        SetMockTime(GetTime<std::chrono::seconds>() + window + 1s);
+        // An expired window isn't listed, and the streak starts again with the next failure.
+        const UniValue info{PQTransportInfo()};
+        BOOST_CHECK(info["fallback_set"].empty());
+        BOOST_CHECK(info["failure_streaks"].empty());
+    }};
+
+    Connect(endpoint, End::MALFORMED);
+    BOOST_CHECK_EQUAL(next_window(), 3600);
+    Connect(endpoint, End::MALFORMED);
+    Connect(endpoint, End::MALFORMED);
+    BOOST_CHECK_EQUAL(window("window_seconds"), 3600);
+    expire(3600s);
+    Connect(endpoint, End::MALFORMED);
+    BOOST_CHECK_EQUAL(next_window(), 14400);
+    Connect(endpoint, End::MALFORMED);
+    Connect(endpoint, End::MALFORMED);
+    BOOST_CHECK_EQUAL(window("window_seconds"), 14400);
+    expire(14400s);
+    Connect(endpoint, End::MALFORMED);
+    BOOST_CHECK_EQUAL(next_window(), 86400);
+    Connect(endpoint, End::MALFORMED);
+    Connect(endpoint, End::MALFORMED);
+    BOOST_CHECK_EQUAL(window("window_seconds"), 86400);
+    expire(86400s);
+    Connect(endpoint, End::MALFORMED);
+    BOOST_CHECK_EQUAL(next_window(), 86400);
+}
+
+BOOST_AUTO_TEST_CASE(pq_rpc_listed_peers)
+{
+    // getnetworkinfo's connections_pq counts exactly the peers getpeerinfo lists: a hybrid
+    // connection the peer manager doesn't know yet is in the connection count, but not listed or
+    // counted as hybrid.
+    auto& connman{static_cast<ConnmanTestMsg&>(*m_node.connman)};
+    CNode* node{new CNode{/*id=*/100000, std::make_shared<ZeroSock>(), CAddress{LookupNumeric("10.8.0.1", 50000), NODE_NONE},
+                          /*nKeyedNetGroupIn=*/0, /*nLocalHostNonceIn=*/0, CAddress{}, /*addrNameIn=*/"", ConnectionType::INBOUND,
+                          /*inbound_onion=*/false, CNodeOptions{.use_v2transport = true, .pq = {.mode = PQMode::NEGOTIATE}}}};
+    V2Transport peer{Initiator()};
+    const auto deliver{[](Transport& from, Transport& to) {
+        const std::vector<uint8_t> bytes{PeerBytes(from)};
+        std::span<const uint8_t> remaining{bytes};
+        while (!remaining.empty()) {
+            BOOST_REQUIRE(to.ReceivedBytes(remaining));
+            if (to.ReceivedMessageComplete()) {
+                bool reject{false};
+                to.GetReceivedMessage({}, reject);
+            }
+        }
+    }};
+    for (int round{0}; round < 4; ++round) {
+        deliver(peer, *node->m_transport);
+        deliver(*node->m_transport, peer);
+    }
+    BOOST_REQUIRE(node->m_transport->GetInfo().transport_pq);
+    connman.AddTestNode(*node);
+
+    UniValue networkinfo{CallRPC(m_node, "getnetworkinfo")};
+    BOOST_CHECK_EQUAL(networkinfo["connections"].getInt<int>(), 1);
+    BOOST_CHECK_EQUAL(networkinfo["connections_pq"].getInt<int>(), 0);
+    BOOST_CHECK(CallRPC(m_node, "getpeerinfo").empty());
+
+    m_node.peerman->InitializeNode(*node, NODE_NONE);
+    networkinfo = CallRPC(m_node, "getnetworkinfo");
+    BOOST_CHECK_EQUAL(networkinfo["connections_pq"].getInt<int>(), 1);
+    const UniValue peers{CallRPC(m_node, "getpeerinfo")};
+    BOOST_REQUIRE_EQUAL(peers.size(), 1U);
+    BOOST_CHECK(peers[0]["transport_pq"].get_bool());
+    BOOST_CHECK_EQUAL(peers[0]["transport_pq_status"].get_str(), "hybrid");
+
+    m_node.peerman->FinalizeNode(*node);
+    connman.ClearTestNodes();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

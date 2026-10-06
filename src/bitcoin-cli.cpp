@@ -407,6 +407,7 @@ private:
         std::string age;
         std::string services;
         std::string transport_protocol_type;
+        bool is_transport_pq;
         double min_ping;
         double ping;
         int64_t addr_processed;
@@ -555,10 +556,12 @@ public:
                 const std::string services{FormatServices(services_names)};
                 const std::string sub_version{peer["subver"].isNull() ? "" : peer["subver"].get_str()};
                 const std::string transport{peer["transport_protocol_type"].isNull() ? "v1" : peer["transport_protocol_type"].get_str()};
+                // A server without hybrid post-quantum transport, such as v1.0.0, has no transport_pq.
+                const bool is_transport_pq{peer["transport_pq"].isNull() ? false : peer["transport_pq"].get_bool()};
                 const bool is_addr_relay_enabled{peer["addr_relay_enabled"].isNull() ? false : peer["addr_relay_enabled"].get_bool()};
                 const bool is_bip152_hb_from{peer["bip152_hb_from"].isNull() ? false : peer["bip152_hb_from"].get_bool()};
                 const bool is_bip152_hb_to{peer["bip152_hb_to"].isNull() ? false : peer["bip152_hb_to"].get_bool()};
-                m_peers.push_back({addr, sub_version, conn_type, NETWORK_SHORT_NAMES[network_id], age, services, transport, min_ping, ping, addr_processed, addr_rate_limited, last_blck, last_recv, last_send, last_trxn, peer_id, mapped_as, version, is_addr_relay_enabled, is_bip152_hb_from, is_bip152_hb_to, is_outbound, is_tx_relay});
+                m_peers.push_back({addr, sub_version, conn_type, NETWORK_SHORT_NAMES[network_id], age, services, transport, is_transport_pq, min_ping, ping, addr_processed, addr_rate_limited, last_blck, last_recv, last_send, last_trxn, peer_id, mapped_as, version, is_addr_relay_enabled, is_bip152_hb_from, is_bip152_hb_to, is_outbound, is_tx_relay});
                 m_max_addr_length = std::max(addr.length() + 1, m_max_addr_length);
                 m_max_addr_processed_length = std::max(ToString(addr_processed).length(), m_max_addr_processed_length);
                 m_max_addr_rate_limited_length = std::max(ToString(addr_rate_limited).length(), m_max_addr_rate_limited_length);
@@ -593,7 +596,7 @@ public:
                     peer.network,
                     m_max_services_length, // variable spacing
                     peer.services,
-                    (peer.transport_protocol_type.size() == 2 && peer.transport_protocol_type[0] == 'v') ? peer.transport_protocol_type[1] : ' ',
+                    peer.is_transport_pq ? "2p" : (peer.transport_protocol_type.size() == 2 && peer.transport_protocol_type[0] == 'v') ? peer.transport_protocol_type.substr(1) : "",
                     PingTimeToString(peer.min_ping),
                     PingTimeToString(peer.ping),
                     peer.last_send ? ToString(time_now - peer.last_send) : "",
@@ -720,6 +723,7 @@ public:
         "           \"2\" - P2P_V2: peer supports version 2 P2P transport protocol, as defined in BIP 324\n"
         "           \"u\" - UNKNOWN: unrecognized bit flag\n"
         "  v        Version of transport protocol used for the connection\n"
+        "           \"2p\" - v2 with hybrid post-quantum session keys (getpeerinfo \"transport_pq\" is true)\n"
         "  mping    Minimum observed ping time, in milliseconds (ms)\n"
         "  ping     Last observed ping time, in milliseconds (ms)\n"
         "  send     Time since last message sent to the peer, in seconds\n"

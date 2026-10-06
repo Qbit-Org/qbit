@@ -102,6 +102,8 @@ static const size_t DEFAULT_MAXRECEIVEBUFFER = 5 * 1000;
 static const size_t DEFAULT_MAXSENDBUFFER    = 1 * 1000;
 
 static constexpr bool DEFAULT_V2_TRANSPORT{true};
+/** -v2pqtransport default: off until the default-on change of #184 part 9. */
+static constexpr bool DEFAULT_V2_PQ_TRANSPORT{false};
 
 typedef int64_t NodeId;
 
@@ -231,8 +233,12 @@ public:
     bool m_is_archive_connection;
     /** Transport protocol type. */
     TransportProtocolType m_transport_type;
-    /** BIP324 session id string in hex, if any. */
+    /** BIP324 session id string in hex, if any: the hybrid one if m_transport_pq. */
     std::string m_session_id;
+    /** Whether the session keys are hybrid post-quantum: the peer's key confirmation verified. */
+    bool m_transport_pq{false};
+    /** The hybrid post-quantum negotiation's status. */
+    PQStatus m_transport_pq_status{PQStatus::OFF};
 };
 
 
@@ -833,6 +839,9 @@ enum class PQOutcome : uint8_t {
 
 std::string_view PQOutcomeString(PQOutcome outcome) noexcept;
 
+/** The getpeerinfo transport_pq_status token of a status. */
+std::string_view PQStatusString(PQStatus status) noexcept;
+
 /** Hybrid negotiation event counts of one direction. They count events, not exclusive final
  *  states: a switch whose confirmation then fails counts switched and first_packet_failed. */
 template <typename T>
@@ -957,6 +966,21 @@ struct PQTransportStats {
     std::vector<PQFallbackStats> fallback_set;
     std::vector<PQStreakStats> failure_streaks;
     PQLoadSheddingStats load_shedding;
+};
+
+/**
+ * The hybrid post-quantum v2 transport configuration: computed once at startup from the effective
+ * -v2transport, -v2pqtransport and -test settings, and used unchanged for the startup warnings,
+ * the startup line, every new connection and RPC.
+ */
+struct PQTransportConfig {
+    //! -v2transport.
+    bool v2_enabled{false};
+    //! -v2pqtransport, which has no effect without v2_enabled.
+    bool pq_requested{false};
+    //! -test=pq_fail_first_packet: corrupt the local ML-KEM shared secret of every hybrid handshake.
+    bool fail_first_packet{false};
+    bool Enabled() const noexcept { return v2_enabled && pq_requested; }
 };
 
 struct CNodeOptions
@@ -1411,6 +1435,8 @@ public:
         bool whitelist_relay = DEFAULT_WHITELISTRELAY;
         //! Inbound offer load shedding threshold (unit tests and the flood lab).
         uint64_t pq_shed_threshold_per_s{DEFAULT_PQ_SHED_THRESHOLD_PER_S};
+        //! The hybrid post-quantum v2 transport configuration; off unless set.
+        PQTransportConfig m_pq{};
     };
 
     void Init(const Options& connOptions) EXCLUSIVE_LOCKS_REQUIRED(!m_added_nodes_mutex, !m_total_bytes_sent_mutex, !m_pq_shed_mutex)
@@ -1450,6 +1476,8 @@ public:
             // At least 1: a threshold of 0 would shed every offer and never stop.
             m_pq_shed_threshold = std::max<uint64_t>(connOptions.pq_shed_threshold_per_s, 1);
         }
+        m_pq_config = connOptions.m_pq;
+        m_pq_mode = m_pq_config.Enabled() ? PQMode::NEGOTIATE : PQMode::OFF;
     }
 
     CConnman(uint64_t seed0, uint64_t seed1, AddrMan& addrman, const NetGroupManager& netgroupman,
@@ -1618,6 +1646,9 @@ public:
 
     /** An owning copy of the hybrid transport counters, failure rings and endpoint history. */
     PQTransportStats GetPQTransportStats() const EXCLUSIVE_LOCKS_REQUIRED(!m_pq_mutex, !m_pq_shed_mutex);
+
+    /** The hybrid post-quantum v2 transport configuration, as Init() received it. */
+    const PQTransportConfig& GetPQTransportConfig() const noexcept { return m_pq_config; }
 
     /** Whether new outbound connections to endpoint run plain v2, because repeated hybrid
      *  failures put it in the fallback set. Ends a window that expired. */
@@ -2087,8 +2118,10 @@ private:
     /** Warn that this node's own ML-KEM code may be at fault. */
     void LogPQLocalFault() const;
 
-    /** The hybrid negotiation mode of new v2 connections. Off until the option sets it (part 6);
-     *  set before the connection threads start. */
+    /** The hybrid post-quantum v2 transport configuration (Options::m_pq), and the negotiation
+     *  mode of new v2 connections it gives. Both are set by Init(), before the connection
+     *  threads start, and never change afterwards. */
+    PQTransportConfig m_pq_config{};
     PQMode m_pq_mode{PQMode::OFF};
 
     mutable Mutex m_pq_mutex;
