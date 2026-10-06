@@ -6,8 +6,8 @@ name: Core Checks
 
 on:
   pull_request:
-    # The same activity types as the Required Merge Gate, which waits for a
-    # newer Core Checks Gate whenever it reruns on a commit.
+    # The same activity types as the Required Merge Gate, which waits for
+    # its own event's Core Checks Gate instead of an earlier event's failure.
     types:
       - opened
       - synchronize
