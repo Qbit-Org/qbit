@@ -2894,8 +2894,10 @@ BOOST_AUTO_TEST_CASE(v2_pq_internal_errors)
                     InjectResultForTesting inject{op, upstream::ERR_FAIL};
                     BOOST_REQUIRE(tester.Interact());
                 }
-                // No offer was queued.
+                // No offer was queued, and the retained secret is wiped at once, not only when the
+                // initiator's version packet arrives.
                 BOOST_CHECK(transport.GetPQSnapshot().offer == PQOfferState::NONE);
+                BOOST_CHECK(!transport.HoldsHybridSecretsForTesting());
                 tester.ReceiveKey(/*retain_for_hybrid=*/true);
                 tester.SendGarbageTerm();
             }
@@ -3084,6 +3086,47 @@ BOOST_AUTO_TEST_CASE(v2_pq_close_wipes)
                 BOOST_CHECK(snapshot.offer == (test_initiator ? PQOfferState::NONE : PQOfferState::SENT));
                 CheckPQ(transport, PQStatus::PENDING);
             }
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(v2_pq_version_wipes)
+{
+    // However a transport came to send its version packet without the negotiation, processing the
+    // peer's version packet wipes anything still held for a switch. A test option retains the ECDH
+    // secret and the transcript with the negotiation off, as a path that declined it after the key
+    // exchange without wiping them would.
+    for (const bool test_initiator : {true, false}) {
+        BOOST_TEST_CONTEXT("test_initiator=" << test_initiator)
+        {
+            V2TransportTester tester(m_rng, test_initiator, {.mode = PQMode::OFF, .retain_without_negotiation = true});
+            auto& transport{tester.GetTransport()};
+            if (test_initiator) tester.Collect();
+            tester.SendKey();
+            tester.SendGarbage();
+            BOOST_REQUIRE(tester.Deliver());
+            tester.Collect();
+            tester.ReceiveKey();
+            tester.SendGarbageTerm();
+            BOOST_REQUIRE(tester.Deliver());
+            // The transport sent its empty version packet, and still holds the retained secret.
+            BOOST_CHECK(transport.HoldsHybridSecretsForTesting());
+            tester.ReceiveGarbage();
+            tester.ReceiveVersion();
+            tester.SendVersion();
+            BOOST_REQUIRE(tester.Deliver());
+            BOOST_CHECK(!transport.HoldsHybridSecretsForTesting());
+
+            // The connection continues as plain v2.
+            const auto payload{m_rng.randbytes<uint8_t>(100)};
+            tester.SendMessage("foobar", payload);
+            tester.AddMessage("barfoo", payload);
+            const auto ret{tester.Interact()};
+            BOOST_REQUIRE(ret && ret->size() == 1);
+            BOOST_CHECK((*ret)[0] && (*ret)[0]->m_type == "foobar" && std::ranges::equal((*ret)[0]->m_recv, MakeByteSpan(payload)));
+            tester.ReceiveMessage("barfoo", payload);
+            tester.CompareSessionIDs();
+            CheckPQ(transport, PQStatus::OFF);
         }
     }
 }

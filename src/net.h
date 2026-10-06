@@ -458,6 +458,9 @@ public:
 /** The hybrid post-quantum negotiation of one v2 connection (doc/design/pq-transport.md). */
 struct V2PQOptions {
     PQMode mode{PQMode::OFF};
+    /** Test only: retain the ECDH secret and the transcript at the key exchange even without the
+     *  negotiation, as a path that declines it afterwards without wiping them would. */
+    bool retain_without_negotiation{false};
     /** Test only: invert byte 0 of the local ML-KEM shared secret before deriving keys, so the
      *  peer's key confirmation check fails. EK and CT are unchanged. */
     bool corrupt_shared_secret{false};
