@@ -71,7 +71,7 @@ jobs:
       profile: ${{ steps.classify.outputs.profile }}
       release_policy_only: ${{ steps.classify.outputs.release_policy_only }}
       source_validation_required: ${{ steps.classify.outputs.source_validation_required }}
-      pq_aarch64_required: ${{ steps.classify.outputs.pq_aarch64_required }}
+      pq_unit_required: ${{ steps.classify.outputs.pq_unit_required }}
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -1073,16 +1073,18 @@ jobs:
             build/doc/rpc/**
 
   # Changes to the ML-KEM library, the v2 transport, or their build and CI
-  # wiring (ci/checks/classify_merge_profile.py) must pass the aarch64 job of
-  # the PQ workflow on the change itself: for a pull request, its merge commit.
-  pq-aarch64:
-    name: 'PQ aarch64 unit tests'
+  # wiring (ci/checks/classify_merge_profile.py) must pass these jobs of the PQ
+  # workflow on the change itself (for a pull request, its merge commit), on
+  # GitHub-hosted runners: AArch64 Linux, and macOS on Apple Silicon and on
+  # Intel, the only jobs that build and run ML-KEM's native code on macOS.
+  pq-unit:
+    name: 'PQ unit tests'
     needs: classify-changes
-    if: ${{ needs.classify-changes.outputs.pq_aarch64_required == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft != true) }}
+    if: ${{ needs.classify-changes.outputs.pq_unit_required == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft != true) }}
     uses: ./.github/workflows/ci-pq.yml
     with:
       source_ref: ${{ github.sha }}
-      jobs: aarch64-unit
+      jobs: aarch64-unit,macos-arm64-unit,macos-x86_64-unit
 
   full-validation-gate:
     name: 'Full Validation Gate'
@@ -1097,7 +1099,7 @@ jobs:
       - lint
       - public-docs-lint
       - rpc-docs
-      - pq-aarch64
+      - pq-unit
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.draft != true) }}
     steps:
       - name: Require trusted label for fork PRs
@@ -1120,8 +1122,8 @@ jobs:
           LINT_RESULT: ${{ needs.lint.result }}
           PUBLIC_DOCS_LINT_RESULT: ${{ needs.public-docs-lint.result }}
           RPC_DOCS_RESULT: ${{ needs.rpc-docs.result }}
-          PQ_AARCH64_REQUIRED: ${{ needs.classify-changes.outputs.pq_aarch64_required }}
-          PQ_AARCH64_RESULT: ${{ needs.pq-aarch64.result }}
+          PQ_UNIT_REQUIRED: ${{ needs.classify-changes.outputs.pq_unit_required }}
+          PQ_UNIT_RESULT: ${{ needs.pq-unit.result }}
         run: |
           set -euo pipefail
 
@@ -1140,21 +1142,21 @@ jobs:
           check_result "classify validation profile" "${CLASSIFY_CHANGES_RESULT}"
           echo "CI profile: ${CI_PROFILE:-unavailable}"
 
-          # The aarch64 PQ job may be skipped only when the classifier says this
-          # change does not need it.
-          case "${PQ_AARCH64_REQUIRED}" in
+          # The PQ unit jobs (AArch64 Linux, macOS arm64 and x86_64) may be
+          # skipped only when the classifier says this change does not need them.
+          case "${PQ_UNIT_REQUIRED}" in
             true)
-              check_result "PQ aarch64 unit tests" "${PQ_AARCH64_RESULT}"
+              check_result "PQ unit tests" "${PQ_UNIT_RESULT}"
               ;;
             false)
-              echo "PQ aarch64 unit tests: ${PQ_AARCH64_RESULT} (not required for this change)"
-              if [[ "${PQ_AARCH64_RESULT}" != "skipped" && "${PQ_AARCH64_RESULT}" != "success" ]]; then
-                echo "::error title=Full Validation failed::PQ aarch64 unit tests result was ${PQ_AARCH64_RESULT}."
+              echo "PQ unit tests: ${PQ_UNIT_RESULT} (not required for this change)"
+              if [[ "${PQ_UNIT_RESULT}" != "skipped" && "${PQ_UNIT_RESULT}" != "success" ]]; then
+                echo "::error title=Full Validation failed::PQ unit tests result was ${PQ_UNIT_RESULT}."
                 failed=1
               fi
               ;;
             *)
-              echo "::error title=Full Validation failed::The classifier did not report whether the PQ aarch64 job is required (pq_aarch64_required='${PQ_AARCH64_REQUIRED}')."
+              echo "::error title=Full Validation failed::The classifier did not report whether the PQ unit jobs are required (pq_unit_required='${PQ_UNIT_REQUIRED}')."
               failed=1
               ;;
           esac
