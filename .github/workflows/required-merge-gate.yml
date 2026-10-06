@@ -934,6 +934,15 @@ jobs:
                 echo "${check_name}: status=${status} conclusion=${conclusion:-pending}"
 
                 if [[ "${status}" == "completed" ]]; then
+                  if [[ "${conclusion}" == "cancelled" ]]; then
+                    # A cancelled check is never a verdict: it was superseded (a
+                    # newer push, reopen or label cancels the running workflow,
+                    # possibly after this gate started) or it never ran. Wait for
+                    # the run that replaces it; the deadline still fails the gate.
+                    echo "${check_name}: cancelled; waiting for the run that replaces it"
+                    pending+=("${check_name} (cancelled)")
+                    continue
+                  fi
                   if [[ "${conclusion}" != "success" ]]; then
                     # ISO 8601 UTC timestamps of the same format order as strings.
                     if [[ -n "${completed_at}" && "${completed_at}" < "${GATE_RUN_STARTED_AT}" ]]; then

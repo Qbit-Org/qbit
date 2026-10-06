@@ -306,7 +306,7 @@ class MergeGatePollerTest(unittest.TestCase):
             self.assertIn("Full Validation Gate: status=completed conclusion=success", completed.stdout)
 
     def test_failed_conclusion_fails_as_a_failed_check_not_as_pending(self) -> None:
-        for conclusion in ("failure", "cancelled", "timed_out", "action_required", "neutral", "skipped"):
+        for conclusion in ("failure", "timed_out", "action_required", "neutral", "skipped"):
             with self.subTest(conclusion=conclusion):
                 fake = FakeGh(
                     self.tmp(f"concluded-{conclusion}"),
@@ -489,7 +489,7 @@ class MergeGatePollerTest(unittest.TestCase):
         # workflows, before their own gate checks exist. The newest check of
         # that name is then the previous run's, which says nothing about the
         # run under way.
-        for conclusion in ("cancelled", "failure", "timed_out"):
+        for conclusion in ("failure", "timed_out"):
             with self.subTest(conclusion=conclusion):
                 fake = FakeGh(
                     self.tmp(f"stale-{conclusion}"),
@@ -549,6 +549,27 @@ class MergeGatePollerTest(unittest.TestCase):
                 check_run("Core Checks Gate", "completed", "success", started_at=self.BEFORE, completed_at=self.BEFORE),
                 check_run("Full Validation Gate", "completed", "success", started_at=self.AFTER, completed_at=self.AFTER),
             ))),
+        )
+        completed = self.run_gate(fake, GATE_RUN_STARTED_AT=self.GATE_START)
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+
+    def test_a_cancelled_check_is_never_a_verdict(self) -> None:
+        # A newer push or label cancels the running Full Validation, and that
+        # cancellation can complete after this gate run started.
+        cancelled = check_run("Full Validation Gate", "completed", "cancelled", started_at=self.BEFORE, completed_at=self.AFTER)
+        core = check_run("Core Checks Gate", "completed", "success", started_at=self.AFTER, completed_at=self.AFTER)
+        fake = FakeGh(self.tmp("cancelled-alone"), default=ok(body(page(core, cancelled))))
+        completed = self.run_gate(fake, GATE_WAIT_TIMEOUT_SECONDS="3", GATE_RUN_STARTED_AT=self.GATE_START)
+        self.assertGateFailed(
+            completed,
+            f"{ERROR_TIMED_OUT}Required checks did not complete within 3s and are still pending: Full Validation Gate (cancelled)",
+            forbidden=(ERROR_CHECK_FAILED, ERROR_UNREADABLE),
+        )
+        newer_green = check_run("Full Validation Gate", "completed", "success", started_at=self.AFTER, completed_at="2026-10-06T15:00:00Z")
+        fake = FakeGh(
+            self.tmp("cancelled-then-green"),
+            responses=[ok(body(page(core, cancelled))), ok(body(page(core, cancelled)))],
+            default=ok(body(page(core, cancelled, newer_green))),
         )
         completed = self.run_gate(fake, GATE_RUN_STARTED_AT=self.GATE_START)
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
