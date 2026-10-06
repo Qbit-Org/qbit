@@ -495,6 +495,16 @@ class FailureEntriesTest(unittest.TestCase):
                 self.assertIn(f"known_good={name}", figure.details[0])
                 self.assert_no_addresses(figure, triage)
 
+    def test_missing_instance_id_is_unknown(self) -> None:
+        start = record(T0, inbound=ring(0, 0, []), outbound=ring(0, 0, []))
+        for label, value in (("null", None), ("short", "abc"), ("number", 7)):
+            with self.subTest(label):
+                broken = record(T0 + INTERVAL, inbound=ring(0, 0, []), outbound=ring(0, 0, []), instance=value)
+                after = record(T0 + 2 * INTERVAL, inbound=ring(0, 0, []), outbound=ring(0, 0, []))
+                figure, _ = self.evaluate([start, broken, after])
+                self.assertEqual(figure.result, "unknown")
+                self.assertTrue(any("instance_id missing or malformed" in detail for detail in figure.details))
+
     def test_missing_fallback_set_is_unknown(self) -> None:
         start = record(T0, inbound=ring(0, 0, []), outbound=ring(0, 0, []))
         for label, value in (("null", None), ("not a list", {"endpoint": "x"}), ("absent", ...)):
