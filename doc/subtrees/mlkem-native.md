@@ -64,9 +64,14 @@ says what was chosen and why:
 | `SANITIZERS` contains `memory` | portable (MSan cannot see assembly writes) | configure error |
 | anything else (riscv64, powerpc64, armv7, s390x, i686, ...) | portable | configure error |
 
-`ci/checks/test_mlkem_build_policy.py` also links the glue with every x86_64
-assembly routine wrapped by a call counter, and fails if any of them runs
-while portable C is forced.
+`ci/checks/test_mlkem_build_policy.py` also links the glue with every
+assembly routine wrapped by a call counter, and fails if any of them runs while
+portable C is forced, or when an entry point run alone on a new thread uses
+assembly although portable C is forced (it entered the library without taking
+the override). It checks the x86_64 backend natively and the AArch64 backend
+as a static binary under `qemu-aarch64`, built from a copy of
+`src/crypto/mlkem_config.h` without its AArch64 ELF refusal. CI's build smoke
+job requires both.
 
 ### x86_64 instruction set
 
@@ -164,6 +169,11 @@ ran. `src/crypto/mlkem_fips202_backend.h` therefore mirrors that header's
 dispatch glue (the same macros and the same proved assembly routine) with a
 capability check added. Every other native entry point in the x86_64 and
 AArch64 backends checks the hook itself.
+
+The build-policy test's AArch64 case shows the mirror at work: the harness
+makes 252 assembly calls natively and none with portable C forced. Its negative
+control builds upstream's `x1_scalar.h` in place of the mirror, and then 221
+assembly calls leak into a forced-portable run.
 
 ## Update Procedure
 
