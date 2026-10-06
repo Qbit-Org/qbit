@@ -136,7 +136,7 @@ if(WITH_USDT)
   find_package(USDT MODULE REQUIRED)
 endif()
 
-set(WITH_MLKEM_NATIVE "AUTO" CACHE STRING "Build the x86_64 and AArch64 ML-KEM assembly, selected at run time: AUTO, ON or OFF.")
+set(WITH_MLKEM_NATIVE "AUTO" CACHE STRING "Build ML-KEM native code for x86_64 (GCC or Clang) and macOS arm64, used when the CPU allows it: AUTO, ON or OFF.")
 set_property(CACHE WITH_MLKEM_NATIVE PROPERTY STRINGS AUTO ON OFF)
 
 option(ENABLE_EXTERNAL_SIGNER "Enable external signer support." ON)

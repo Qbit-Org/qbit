@@ -16,9 +16,11 @@
 /**
  * ML-KEM-1024 (FIPS 203), backed by the vendored mlkem-native library.
  *
- * Native code runs where it is supported and the CPU allows it (x86_64 with
- * AVX2, AArch64), and portable C everywhere else. The library is built into
- * bitcoin_node only.
+ * Native code runs where it is built and the CPU allows it: x86_64 with AVX2,
+ * SSSE3, SSE4.1, POPCNT and BMI2 (and the OS saving AVX state), and AArch64 on
+ * macOS. Everything else runs portable C, AArch64 ELF (Linux, BSD) included,
+ * whose builds leave the assembly out to keep their BTI and PAC marking. See
+ * doc/subtrees/mlkem-native.md. The library is built into bitcoin_node only.
  *
  * Fixed-size spans make wrong-sized calls impossible; callers check network
  * lengths before constructing them. Entropy is the caller's job: key
