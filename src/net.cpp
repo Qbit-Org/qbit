@@ -2382,7 +2382,7 @@ PQCounts LoadPQCounts(const PQCounters& counters) noexcept
 }
 } // namespace
 
-void CConnman::ObservePQ(CNode& node, bool finalizing)
+void CConnman::ObservePQ(CNode& node, bool finalizing, bool record_outcomes)
 {
     AssertLockNotHeld(m_pq_mutex);
     // The transport takes and releases its own lock.
@@ -2390,7 +2390,7 @@ void CConnman::ObservePQ(CNode& node, bool finalizing)
     // Nothing to account yet, as on every connection without the negotiation.
     if (!finalizing && !snapshot.switched && snapshot.legacy == PQLegacyReason::NONE && snapshot.failure == PQFailure::NONE) return;
     const NodeCloseCause cause{node.GetCloseCause()};
-    const bool record{fNetworkActive};
+    const bool record{record_outcomes && fNetworkActive};
     PQLogLines lines;
     {
         LOCK(m_pq_mutex);
@@ -4307,6 +4307,9 @@ void CConnman::StopNodes()
     for (CNode* pnode : nodes) {
         LogDebug(BCLog::NET, "Stopping node, %s", pnode->DisconnectMsg(fLogIPs));
         pnode->CloseSocketDisconnect();
+        // Wipe the hybrid negotiation's pending secrets before the node goes, as DisconnectNodes()
+        // does. A shutdown close is our own decision, so it records no outcome.
+        ObservePQ(*pnode, /*finalizing=*/true, /*record_outcomes=*/false);
         DeleteNode(pnode);
     }
 
