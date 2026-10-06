@@ -187,6 +187,29 @@ class SampleRowTest(unittest.TestCase):
         row = pq_canary.build_row(time=T0, utc="x", host="pool", uptime=10, netinfo={}, pqinfo=None, peers=None, pinned=PINNED)
         self.assertEqual((row["sample_ok"], row["pinned_present"]), ("0", NA))
 
+    def test_values_of_the_wrong_type_are_na(self) -> None:
+        info = fixture("getpqtransportinfo.json")
+        info.update(enabled="yes", instance_id=info["instance_id"].upper(), arith_backend=3, since=-5)
+        info["handshakes"]["inbound"]["switched"] = True
+        info["handshakes"]["outbound"]["fallback"] = -1
+        info["handshakes"]["outbound"]["switched"] = "40"
+        info["load_shedding"]["active"] = 1
+        info["recent_failures"]["inbound"]["last_sequence"] = 1.0
+        netinfo = dict(fixture("getnetworkinfo.json"), version="10100", connections_in=True, connections_pq=-2)
+        peers = [{"addr": PINNED, "connection_type": 5, "transport_pq": "true", "transport_pq_status": ["hybrid"]}]
+        wrong = ["uptime", "version", "connections_in", "connections_pq", "pq_enabled", "instance_id", "arith_backend", "since",
+                 "in_switched", "out_fallback", "out_switched", "load_shedding_active", "in_ring_last_sequence",
+                 "pinned_connection_type", "pinned_transport_pq", "pinned_transport_pq_status"]
+        for uptime in (-1, True, 12.5, "4300"):
+            with self.subTest(uptime=uptime):
+                row = pq_canary.build_row(time=T0, utc="x", host="pool", uptime=uptime, netinfo=netinfo, pqinfo=info,
+                                          peers=peers, pinned=PINNED)
+                self.assertEqual({name: row[name] for name in wrong}, dict.fromkeys(wrong, NA))
+                # The values of the right type are kept.
+                self.assertEqual((row["keccak_backend"], row["in_legacy_peer"], row["out_ring_dropped"], row["pinned_present"]),
+                                 ("x86_64-avx2", "30", "0", "1"))
+                self.assertEqual(row["sample_ok"], "0", "a sample without a valid uptime is incomplete")
+
     def test_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "samples.csv"
@@ -286,7 +309,8 @@ class SamplerScriptTest(unittest.TestCase):
             root = Path(tmp)
             bad_pinned = [("--host", "pool", "--out", tmp, "--pinned", value)
                           for value in ("pool-node", "203.0.113.5", "[2001:db8::5", "203.0.113.5:99999", "a b:8333", ":8333")]
-            for args in ((), ("--host", "pool"), ("--host", "bad label", "--out", tmp), ("--host", "pool", "--out", tmp, "--bogus"),
+            for args in ((), ("--host", "pool"), ("--host", "bad label", "--out", tmp), ("--host", "NA", "--out", tmp),
+                         ("--host", "pool", "--out", tmp, "--bogus"),
                          *bad_pinned):
                 result = subprocess.run(["bash", str(SAMPLER), *args, "--", "true"], text=True, capture_output=True)
                 self.assertEqual(result.returncode, 1, args)

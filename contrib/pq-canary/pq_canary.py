@@ -10,6 +10,9 @@ evidence honest:
 
 * a field that is missing, or whose RPC failed, is written as NA, never 0;
   v1.0.0 has neither getnetworkinfo.connections_pq nor getpqtransportinfo;
+* so is a value of the wrong type: a count that is not a non-negative integer,
+  a flag that is not a boolean, an instance_id that is not 64 lowercase hex
+  digits; true is never written as a count of 1;
 * a real 0 stays 0;
 * sample_ok is 1 only when uptime, getnetworkinfo and, on the pool node,
   getpeerinfo all answered.
@@ -25,6 +28,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any, Iterator
@@ -47,15 +51,24 @@ COLUMNS = (
 )
 
 
-def field(value: Any) -> str:
-    """CSV text for a JSON value: NA when absent, 1/0 for booleans, else the value."""
-    if value is None:
-        return NA
-    if isinstance(value, bool):
-        return "1" if value else "0"
-    if isinstance(value, (int, str)):
-        return str(value)
-    return NA
+def count(value: Any) -> str:
+    """CSV text for a JSON non-negative integer, else NA."""
+    return str(value) if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else NA
+
+
+def flag(value: Any) -> str:
+    """CSV text for a JSON boolean, 1 or 0, else NA."""
+    return ("1" if value else "0") if isinstance(value, bool) else NA
+
+
+def text(value: Any) -> str:
+    """CSV text for a JSON string, else NA."""
+    return value if isinstance(value, str) else NA
+
+
+def instance_id(value: Any) -> str:
+    """The 64-lowercase-hex-digit instance_id, else NA."""
+    return value if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) else NA
 
 
 def lookup(document: Any, *path: str) -> Any:
@@ -73,23 +86,24 @@ def build_row(*, time: int, utc: str, host: str, uptime: Any, netinfo: Any, pqin
     when the call failed; peers and pinned are None on nodes that do not pin a peer."""
     row = {name: NA for name in COLUMNS}
     row.update(time=str(time), utc=utc, host=host)
-    if isinstance(uptime, int) and not isinstance(uptime, bool):
-        row["uptime"] = str(uptime)
-    row["version"] = field(lookup(netinfo, "version"))
-    row["connections_in"] = field(lookup(netinfo, "connections_in"))
-    row["connections_pq"] = field(lookup(netinfo, "connections_pq"))
+    row["uptime"] = count(uptime)
+    row["version"] = count(lookup(netinfo, "version"))
+    row["connections_in"] = count(lookup(netinfo, "connections_in"))
+    row["connections_pq"] = count(lookup(netinfo, "connections_pq"))
 
-    row["pq_enabled"] = field(lookup(pqinfo, "enabled"))
-    for name in ("instance_id", "arith_backend", "keccak_backend", "since"):
-        row[name] = field(lookup(pqinfo, name))
+    row["pq_enabled"] = flag(lookup(pqinfo, "enabled"))
+    row["instance_id"] = instance_id(lookup(pqinfo, "instance_id"))
+    row["arith_backend"] = text(lookup(pqinfo, "arith_backend"))
+    row["keccak_backend"] = text(lookup(pqinfo, "keccak_backend"))
+    row["since"] = count(lookup(pqinfo, "since"))
     for name in INBOUND_COUNTS:
-        row[f"in_{name}"] = field(lookup(pqinfo, "handshakes", "inbound", name))
+        row[f"in_{name}"] = count(lookup(pqinfo, "handshakes", "inbound", name))
     for name in OUTBOUND_COUNTS:
-        row[f"out_{name}"] = field(lookup(pqinfo, "handshakes", "outbound", name))
-    row["load_shedding_active"] = field(lookup(pqinfo, "load_shedding", "active"))
+        row[f"out_{name}"] = count(lookup(pqinfo, "handshakes", "outbound", name))
+    row["load_shedding_active"] = flag(lookup(pqinfo, "load_shedding", "active"))
     for prefix, direction in (("in", "inbound"), ("out", "outbound")):
-        row[f"{prefix}_ring_last_sequence"] = field(lookup(pqinfo, "recent_failures", direction, "last_sequence"))
-        row[f"{prefix}_ring_dropped"] = field(lookup(pqinfo, "recent_failures", direction, "dropped"))
+        row[f"{prefix}_ring_last_sequence"] = count(lookup(pqinfo, "recent_failures", direction, "last_sequence"))
+        row[f"{prefix}_ring_dropped"] = count(lookup(pqinfo, "recent_failures", direction, "dropped"))
 
     pool_node = pinned is not None
     peers_ok = isinstance(peers, list)
@@ -100,9 +114,9 @@ def build_row(*, time: int, utc: str, host: str, uptime: Any, netinfo: Any, pqin
         row["pinned_present"] = "1" if matches else "0"
         if matches:
             peer = matches[0]
-            row["pinned_connection_type"] = field(peer.get("connection_type"))
-            row["pinned_transport_pq"] = field(peer.get("transport_pq"))
-            row["pinned_transport_pq_status"] = field(peer.get("transport_pq_status"))
+            row["pinned_connection_type"] = text(peer.get("connection_type"))
+            row["pinned_transport_pq"] = flag(peer.get("transport_pq"))
+            row["pinned_transport_pq_status"] = text(peer.get("transport_pq_status"))
 
     answered = row["uptime"] != NA and isinstance(netinfo, dict) and (peers_ok or not pool_node)
     row["sample_ok"] = "1" if answered else "0"
