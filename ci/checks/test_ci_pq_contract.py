@@ -37,12 +37,14 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import ctest_evidence
 import test_scheduled_validation_contract as svc
@@ -57,6 +59,7 @@ WORKFLOWS = {
 GATE_WORKFLOW = svc.WORKFLOW_DIR / "required-merge-gate.yml"
 TEST_SCRIPT = REPO_ROOT / "ci" / "test" / "03_test_script.sh"
 MLKEM_TESTS = REPO_ROOT / "src" / "test" / "mlkem_tests.cpp"
+BOOST_RECIPE = REPO_ROOT / "depends" / "packages" / "boost.mk"
 MLKEM_BACKEND_HEADERS = [REPO_ROOT / "src" / "crypto" / name for name in ("mlkem_arith_backend.h", "mlkem_fips202_backend.h")]
 RESOLVER_JOB = svc.RESOLVER_JOB
 TRIGGER_STEP = "Check how the run started"
@@ -64,6 +67,11 @@ REQUESTED_STEP = "Resolve requested source"
 SHARED_RESOLVER = "resolve_source_ref"
 SELECT_STEP = "Select jobs"
 REPORT_STEP = "Report unit-test evidence"
+DEPENDS_INSTALL_STEP = "Install Homebrew packages"
+DEPENDS_IDENTIFY_STEP = "Identify depends build"
+DEPENDS_RESTORE_STEP = "Restore depends cache"
+DEPENDS_SAVE_STEP = "Save depends cache"
+DEPENDS_REQUIRE_STEP = "Require depends build"
 PQ_UNIT_JOB = "unit"
 AARCH64_JOB = "aarch64-unit"
 S390X_JOB = "s390x-unit"
@@ -185,6 +193,14 @@ def source_env(env_file: str, names: list[str], extra_env: dict[str, str] | None
     env.update(extra_env or {})
     completed = subprocess.run(["bash", "-c", script], cwd=REPO_ROOT, env=env, text=True, capture_output=True, check=True)
     return svc.parse_key_values(completed.stdout)
+
+
+def depends_print(host: str, dep_opts: str, *names: str) -> dict[str, str]:
+    """Values depends/Makefile computes for host with dep_opts, read with its print- rule (nothing is built)."""
+    targets = " ".join(f"print-{name}" for name in names)
+    completed = subprocess.run(["bash", "-c", f"make -s -C depends HOST={host} {dep_opts} {targets}"], cwd=REPO_ROOT,
+                               text=True, capture_output=True, check=True)
+    return {name: value.strip() for name, value in svc.parse_key_values(completed.stdout).items()}
 
 
 def shell_block(text: str, start: str, end_line: str) -> str:
@@ -940,7 +956,7 @@ class PQWorkflowContractTest(unittest.TestCase):
         # Losing the native backend must fail the configure step, not fall back quietly.
         self.assertIn("-DWITH_MLKEM_NATIVE=ON", effective["BITCOIN_CONFIG"].split())
         self.assertEqual(effective["CI_OS_NAME"], "macos")
-        self.assertEqual(effective["NO_DEPENDS"], "1")
+        self.assertEqual(effective["NO_DEPENDS"], "", "Boost and libevent come from depends, not Homebrew")
         self.assertEqual(effective["CI_BUILD_TARGET"], "test_bitcoin")
         self.assertEqual(effective["CTEST_EXPECTED_SUITES"].split(), PQ_SUITES)
         self.assertEqual(effective["RUN_FUNCTIONAL_TESTS"], "false")
@@ -1027,6 +1043,153 @@ class PQWorkflowContractTest(unittest.TestCase):
             self.assertIn(f"## {job['name']}", result.summary)
             self.assertIn(evidence_word, result.summary)
             self.assertIn("| mlkem_tests | passed | 0.5 |", result.summary)
+
+    def test_macos_jobs_build_boost_and_libevent_through_depends(self) -> None:
+        workflow = self.workflows[PQ]
+        for job_id, (_runner, _machine, arch, _evidence_word) in MACOS_JOBS.items():
+            with self.subTest(job=job_id):
+                self.check_macos_depends(workflow, job_id, f"{arch}-apple-darwin24.6.0")
+
+    def check_macos_depends(self, workflow: dict[str, Any], job_id: str, runner_host: str) -> None:
+        fixture = self.fixture
+        job = workflow["jobs"][job_id]
+        context = self.resolve(PQ, self.dispatch(PQ, jobs=job_id))
+        github_env = svc.github_env_for(context, job_id, workflow["name"])
+        env_file = svc.job_env(workflow, job, context)["FILE_ENV"]
+        dep_opts = source_env(env_file, ["DEP_OPTS"])["DEP_OPTS"]
+
+        # For the runner's host, depends builds Boost and libevent and nothing else.
+        printed = depends_print(runner_host, dep_opts, "packages", "native_packages")
+        self.assertEqual(printed["packages"].split(), ["boost", "libevent"])
+        self.assertEqual(printed["native_packages"].split(), [])
+
+        order = [DEPENDS_INSTALL_STEP, DEPENDS_IDENTIFY_STEP, DEPENDS_RESTORE_STEP, "CI script", DEPENDS_SAVE_STEP,
+                 DEPENDS_REQUIRE_STEP, "Require native ML-KEM", REPORT_STEP]
+        self.assertEqual([svc.step_index(job, name) for name in order], sorted(svc.step_index(job, name) for name in order))
+
+        # Homebrew provides GNU Make 4 as the make on PATH, but neither library.
+        step = svc.find_step(job, DEPENDS_INSTALL_STEP)
+        with tempfile.TemporaryDirectory(dir=fixture.root) as tmp:
+            stubs = Path(tmp)
+            (stubs / "brew").write_text('#!/bin/sh\nif [ "$1" = --prefix ]; then echo "/stub/opt/$2"; '
+                                        'else echo "$*" >> "$STUB_LOG"; fi\n', encoding="utf8")
+            (stubs / "brew").chmod(0o755)
+            step_env = svc.step_env(workflow, job, step, context)
+            step_env.update({"PATH": f"{stubs}:{os.environ['PATH']}", "STUB_LOG": str(stubs / "log"),
+                             "GITHUB_PATH": str(stubs / "github-path")})
+            result = svc.run_step(fixture, step, step_env, fixture.root, github_env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            installed = (stubs / "log").read_text(encoding="utf8").split()
+            self.assertEqual(installed[:2], ["install", "--quiet"])
+            self.assertIn("make", installed)
+            self.assertNotIn("boost", installed)
+            self.assertNotIn("libevent", installed)
+            self.assertEqual((stubs / "github-path").read_text(encoding="utf8"), "/stub/opt/make/libexec/gnubin\n")
+
+        # HOST and the cache key's id are what depends reports for this build.
+        step = svc.find_step(job, DEPENDS_IDENTIFY_STEP)
+        host = subprocess.run([str(REPO_ROOT / "depends" / "config.guess")], text=True, capture_output=True,
+                              check=True).stdout.strip()
+        expected_id = depends_print(host, dep_opts, "final_build_id")["final_build_id"]
+        self.assertRegex(expected_id, r"^[0-9a-f]+$")
+        with tempfile.TemporaryDirectory(dir=fixture.root) as tmp:
+            # A working make that reports macOS's own GNU Make 3.81.
+            stubs = Path(tmp) / "stubs"
+            stubs.mkdir()
+            (stubs / "make").write_text("#!/bin/sh\n"
+                                        "if [ \"$1\" = --version ]; then echo 'GNU Make 3.81'; exit 0; fi\n"
+                                        f"exec {shutil.which('make')} \"$@\"\n", encoding="utf8")
+            (stubs / "make").chmod(0o755)
+            for label, path, ok in (("GNU Make 4", os.environ["PATH"], True), ("GNU Make 3.81", f"{stubs}:{os.environ['PATH']}", False)):
+                with self.subTest(job=job_id, make=label):
+                    github_env_file = Path(tmp) / f"github-env-{ok}"
+                    github_env_file.touch()
+                    step_env = svc.step_env(workflow, job, step, context)
+                    step_env.update({"PATH": path, "BASE_ROOT_DIR": str(REPO_ROOT), "GITHUB_ENV": str(github_env_file)})
+                    result = svc.run_step(fixture, step, step_env, REPO_ROOT, github_env)
+                    self.assertEqual(result.returncode == 0, ok, result.completed.stdout + result.stderr)
+                    if ok:
+                        self.assertEqual(github_env_file.read_text(encoding="utf8"), f"HOST={host}\nDEPENDS_BUILD_ID={expected_id}\n")
+                    else:
+                        self.assertIn("::error::depends needs GNU Make 4 or later", result.stderr)
+                        self.assertEqual(github_env_file.read_text(encoding="utf8"), "")
+
+        # The cache holds depends/built under that key, and is saved under the
+        # same key once the CI script wrote the toolchain file.
+        restore = svc.find_step(job, DEPENDS_RESTORE_STEP)
+        save = svc.find_step(job, DEPENDS_SAVE_STEP)
+        self.assertEqual(restore["uses"].split("@"), ["actions/cache/restore", save["uses"].split("@")[1]])
+        self.assertEqual(save["uses"].split("@")[0], "actions/cache/save")
+        self.assertEqual(restore["with"]["path"], "depends/built")
+        self.assertEqual(save["with"]["path"], restore["with"]["path"])
+        self.assertEqual(save["with"]["key"], "${{ steps." + restore["id"] + ".outputs.cache-primary-key }}")
+        step_context = dict(context, env={"HOST": runner_host, "DEPENDS_BUILD_ID": "0123456789a"})
+        self.assertEqual(svc.render(restore["with"]["key"], step_context), f"depends-{runner_host}-0123456789a")
+        toolchain = f"depends/{runner_host}/toolchain.cmake"
+        save_cases = [
+            ("built on a miss", "", [toolchain], False, True),
+            ("restore-key match", "false", [toolchain], False, True),
+            ("exact hit", "true", [toolchain], False, False),
+            ("depends did not finish", "", [], False, False),
+            ("cancelled", "", [toolchain], True, False),
+        ]
+        for label, cache_hit, files, cancelled, saves in save_cases:
+            with self.subTest(job=job_id, save=label):
+                functions = {"cancelled": lambda cancelled=cancelled: cancelled,
+                             "hashfiles": lambda pattern, files=files: "f00d" if pattern in files else ""}
+                save_context = dict(step_context, steps={restore["id"]: {"outputs": {"cache-hit": cache_hit}}})
+                with mock.patch.dict(svc._FUNCTIONS, functions):
+                    self.assertIs(svc._truthy(svc.render(save["if"], save_context)), saves)
+
+        # Afterwards the build must have used that depends tree: its toolchain,
+        # libevent, and Boost at the version boost.mk pins.
+        step = svc.find_step(job, DEPENDS_REQUIRE_STEP)
+        pinned = re.search(r"^\$\(package\)_version *= *(\S+)$", BOOST_RECIPE.read_text(encoding="utf8"), re.M)
+        assert pinned is not None, BOOST_RECIPE
+        boost_version = pinned.group(1)
+        build_id = "0123456789a"
+        build_cases: list[tuple[str, dict[str, str | None], str, str | None]] = [
+            ("depends", {}, build_id, None),
+            ("depends, other entry type", {"CMAKE_TOOLCHAIN_FILE:FILEPATH": None,
+                                           "CMAKE_TOOLCHAIN_FILE:UNINITIALIZED": "{prefix}/toolchain.cmake"}, build_id, None),
+            ("stale cache key", {}, "fedcba98765", "depends did not build 0123456789a"),
+            ("no depends", {"CMAKE_TOOLCHAIN_FILE:FILEPATH": None,
+                            "Boost_DIR:PATH": "/opt/homebrew/Cellar/boost/1.92.0/lib/cmake/Boost-1.92.0"},
+             build_id, "CMAKE_TOOLCHAIN_FILE unset"),
+            ("Homebrew Boost", {"Boost_DIR:PATH": "/opt/homebrew/Cellar/boost/1.92.0/lib/cmake/Boost-1.92.0"},
+             build_id, "Boost_DIR must be {prefix}/lib/cmake/Boost-" + boost_version),
+            ("other depends Boost", {"Boost_DIR:PATH": "{prefix}/lib/cmake/Boost-1.0.0"}, build_id, "Boost-1.0.0"),
+            ("Homebrew libevent", {"Libevent_DIR:PATH": "/opt/homebrew/lib/cmake/libevent"}, build_id, "Libevent_DIR must be"),
+        ]
+        for label, changes, stamp_id, error in build_cases:
+            with self.subTest(job=job_id, depends_build=label), tempfile.TemporaryDirectory(dir=fixture.root) as tmp:
+                root = Path(tmp) / "workspace"
+                prefix = root / "depends" / runner_host
+                prefix.mkdir(parents=True)
+                (prefix / f".stamp_{stamp_id}").touch()
+                (root / "depends" / "packages").mkdir()
+                shutil.copy(BOOST_RECIPE, root / "depends" / "packages")
+                entries: dict[str, str | None] = {
+                    "CMAKE_TOOLCHAIN_FILE:FILEPATH": "{prefix}/toolchain.cmake",
+                    "Boost_DIR:PATH": "{prefix}/lib/cmake/Boost-" + boost_version,
+                    "Libevent_DIR:PATH": "{prefix}/lib/cmake/libevent",
+                }
+                entries.update(changes)
+                build = Path(tmp) / "build"
+                build.mkdir()
+                (build / "CMakeCache.txt").write_text(
+                    "".join(f"{key}={value.format(prefix=prefix)}\n" for key, value in entries.items() if value is not None),
+                    encoding="utf8")
+                step_env = svc.step_env(workflow, job, step, context)
+                step_env.update({"BASE_ROOT_DIR": str(root), "BASE_BUILD_DIR": str(build), "HOST": runner_host,
+                                 "DEPENDS_BUILD_ID": build_id})
+                result = svc.run_step(fixture, step, step_env, fixture.root, github_env)
+                self.assertEqual(result.returncode == 0, error is None, result.completed.stdout + result.stderr)
+                if error is None:
+                    self.assertIn(f"Built with Boost {boost_version} and libevent from {prefix}", result.completed.stdout)
+                else:
+                    self.assertIn("::error::", result.stderr)
+                    self.assertIn(error.format(prefix=prefix), result.stderr)
 
     def test_contexts_are_available_where_used(self) -> None:
         """Mirror actionlint's context-availability rule for the places these workflows use expressions.
