@@ -273,6 +273,7 @@ BASE_SCRIPTS = [
     'p2p_v2_transport.py',
     'p2p_v2_encrypted.py',
     'p2p_v2_misbehaving.py',
+    'p2p_v2_pq.py',
     'example_test.py',
     'feature_minchainwork_requested_block.py',
     'mempool_truc.py',
