@@ -149,8 +149,10 @@ class PQTransportTest(BitcoinTestFramework):
     def set_test_params(self):
         self.num_nodes = 3
         self.setup_clean_chain = True
-        # Whatever the suite's transport flag, these nodes use v2.
+        # Whatever the suite's transport flag, these nodes use v2, and -v2pqtransport is only what each
+        # test passes: this test checks the option's own defaults and settings.
         self.extra_args = [NO_PQ] * self.num_nodes
+        self.v2pqtransport_from_run_mode = False
 
     def setup_network(self):
         # Connections are made by the tests.

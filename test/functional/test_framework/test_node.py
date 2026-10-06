@@ -165,7 +165,7 @@ class TestNode():
     To make things easier for the test writer, any unrecognised messages will
     be dispatched to the RPC connection."""
 
-    def __init__(self, i, datadir_path, *, chain, rpchost, timewait, timeout_factor, binaries, coverage_dir, cwd, extra_conf=None, extra_args=None, use_cli=False, start_perf=False, use_valgrind=False, version=None, v2transport=False, uses_wallet=False, ipcbind=False, supports_p2mronly=None):
+    def __init__(self, i, datadir_path, *, chain, rpchost, timewait, timeout_factor, binaries, coverage_dir, cwd, extra_conf=None, extra_args=None, use_cli=False, start_perf=False, use_valgrind=False, version=None, v2transport=False, v2pqtransport=False, uses_wallet=False, ipcbind=False, supports_p2mronly=None):
         """
         Kwargs:
             start_perf (bool): If True, begin profiling the node with `perf` as soon as
@@ -259,6 +259,9 @@ class TestNode():
             else:
                 self.args.append("-v2transport=0")
         # if v2transport is requested via global flag but not supported for node version, ignore it
+        # With the global -v2transport flag, hybrid post-quantum transport follows the global -v2pqtransport
+        # flag, explicitly either way, on nodes that know the option (see start()). None passes nothing.
+        self.default_to_v2pq = v2pqtransport
 
         self.cli = TestNodeCLI(binaries, self.datadir_path)
         self.use_cli = use_cli
@@ -463,6 +466,12 @@ class TestNode():
             extra_args.append(f"-bind=127.0.0.1:{tor_port(self.index)}=onion")
 
         self.use_v2transport = "-v2transport=1" in extra_args or (self.default_to_v2 and "-v2transport=0" not in extra_args)
+        # Only a node that uses v2 gets the global hybrid transport setting: an explicit -v2pqtransport=1 with
+        # -v2transport=0 warns. Plain --v2transport passes 0, so that it keeps covering plain v2 whatever the
+        # default. The test's own extra_args come later and win.
+        transport_args = []
+        if self.supports_v2_pq and self.default_to_v2 and self.use_v2transport and self.default_to_v2pq is not None:
+            transport_args.append(f"-v2pqtransport={int(self.default_to_v2pq)}")
 
         # Add a new stdout and stderr file each time bitcoind is started
         if stderr is None:
@@ -485,7 +494,7 @@ class TestNode():
         if env is not None:
             subp_env.update(env)
 
-        self.process = subprocess.Popen(self.args + extra_args, env=subp_env, stdout=stdout, stderr=stderr, cwd=cwd, **kwargs)
+        self.process = subprocess.Popen(self.args + transport_args + extra_args, env=subp_env, stdout=stdout, stderr=stderr, cwd=cwd, **kwargs)
 
         self.running = True
         self.log.debug("bitcoind started, waiting for RPC to come up")

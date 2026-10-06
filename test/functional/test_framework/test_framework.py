@@ -198,6 +198,10 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
         # Disable ThreadOpenConnections by default, so that adding entries to
         # addrman will not result in automatic connections to them.
         self.disable_autoconnect = True
+        # Whether nodes get the run mode's hybrid transport setting (-v2pqtransport=1 with --v2pqtransport,
+        # 0 with plain --v2transport). Tests of the option itself set this to False in set_test_params(),
+        # so that their nodes start with only their own arguments.
+        self.v2pqtransport_from_run_mode = True
         self.set_test_params()
         assert self.wallet_names is None or len(self.wallet_names) <= self.num_nodes
         self.rpc_timeout = int(self.rpc_timeout * self.options.timeout_factor) # optionally, increase timeout by a factor
@@ -271,6 +275,9 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
                             help="use BIP324 v2 connections between all nodes by default")
         parser.add_argument("--v1transport", dest="v1transport", default=False, action="store_true",
                             help="Explicitly use v1 transport (can be used to overwrite global --v2transport option)")
+        parser.add_argument("--v2pqtransport", dest="v2pqtransport", default=False, action="store_true",
+                            help="use hybrid post-quantum v2 connections between all nodes by default (implies --v2transport). "
+                                 "Without it, --v2transport switches hybrid transport off explicitly")
         parser.add_argument("--test_methods", dest="test_methods", nargs='*',
                             help="Run specified test methods sequentially instead of the full test. Use only for methods that do not depend on any context set up in run_test or other methods.")
 
@@ -288,8 +295,11 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
         self.config = configparser.ConfigParser()
         self.config.read_file(open(self.options.configfile))
         self.binary_paths = self.get_binary_paths()
+        if self.options.v2pqtransport:
+            self.options.v2transport = True
         if self.options.v1transport:
             self.options.v2transport=False
+            self.options.v2pqtransport = False
 
         PortSeed.n = self.options.port_seed
 
@@ -601,6 +611,7 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
                 start_perf=self.options.perf,
                 use_valgrind=self.options.valgrind,
                 v2transport=self.options.v2transport,
+                v2pqtransport=self.options.v2pqtransport if self.v2pqtransport_from_run_mode else None,
                 uses_wallet=self.uses_wallet,
             )
             init.update(extra_init[i])
