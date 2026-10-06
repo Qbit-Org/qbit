@@ -27,8 +27,8 @@ Requirements: bash, Python 3.10 or later, and `qbit-cli` able to reach the node.
    a checkout of the repository.
 2. Pick an output directory owned by the user that runs the sampler, for example
    `/var/lib/qbit-canary`.
-3. Add a cron line (`crontab -e`) for that user. Use a short `--host` label;
-   the evaluator tells nodes apart by it.
+3. Add a cron line (`crontab -e`) for that user. Use a short `--host` label,
+   other than `NA`; the evaluator tells nodes apart by it.
 
 Canary archive node:
 
@@ -73,7 +73,9 @@ when `getpqtransportinfo` answers, one line to `failures.jsonl`.
   and `pinned_transport_pq_status`.
 
 Booleans are written as 1 or 0. A failed call, or a field the node does not
-report, is `NA`, never 0; a real 0 stays 0. A v1.0.0 node therefore writes `NA`
+report, is `NA`, never 0; a real 0 stays 0. So is a value of the wrong type: a
+count that is not a non-negative integer (`true` is never written as 1), a flag
+that is not a boolean, or an `instance_id` that is not 64 lowercase hex digits. A v1.0.0 node therefore writes `NA`
 for every `getpqtransportinfo` column and for `connections_pq`, with
 `sample_ok=1`. The CSV holds no peer addresses.
 
