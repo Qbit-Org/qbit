@@ -491,6 +491,32 @@ PQEndpointKey TestEndpoint(uint8_t subnet, int index)
 
 BOOST_FIXTURE_TEST_SUITE(net_pq_tests, PQNetSetup)
 
+BOOST_AUTO_TEST_CASE(mock_socket_would_block)
+{
+    // These tests drive the socket handler through DynSock. An empty pipe must read like a
+    // non-blocking socket without data: -1, with the would-block error where the socket handler
+    // reads it, WSAGetLastError(). That is errno except on Windows, which keeps Winsock's error
+    // apart; with errno alone, Windows saw error 0 and closed every idle connection as a reset.
+    auto pipes{std::make_shared<DynSock::Pipes>()};
+    const DynSock sock{pipes, std::make_shared<DynSock::Queue>()};
+    uint8_t buf[1];
+    errno = 0;
+#ifdef WIN32
+    WSASetLastError(0);
+#endif
+    BOOST_CHECK_EQUAL(sock.Recv(buf, sizeof(buf), 0), -1);
+    const int err{WSAGetLastError()};
+    BOOST_CHECK(err == WSAEWOULDBLOCK || err == WSAEAGAIN);
+    pipes->recv.Eof();
+    BOOST_CHECK_EQUAL(sock.Recv(buf, sizeof(buf), 0), 0);
+
+    // So a socket handler pass over a connection with nothing to read keeps it open.
+    Link link{Add(ConnectionType::OUTBOUND_FULL_RELAY)};
+    Pass(link);
+    BOOST_CHECK(!link.node->fDisconnect);
+    BOOST_CHECK(link.node->GetCloseCause() == NodeCloseCause::NONE);
+}
+
 BOOST_AUTO_TEST_CASE(pq_endpoint_identity)
 {
     // Name-proxy destinations: lowercase ASCII, one trailing root dot removed, the port kept.
@@ -1301,6 +1327,7 @@ BOOST_AUTO_TEST_CASE(pq_fallback_threshold)
         Connect(endpoint, test.end);
         stats = Stats();
         BOOST_CHECK_EQUAL(stats.outbound.fallback, fallbacks + 1);
+        BOOST_REQUIRE(Fallback(endpoint));
         BOOST_CHECK(Fallback(endpoint)->expires == failure_time + 3600s);
     }
 
@@ -1353,6 +1380,7 @@ BOOST_AUTO_TEST_CASE(pq_fallback_windows)
         SetMockTime(TicksSinceEpoch<std::chrono::seconds>(start + window - 1s));
         Connect(endpoint, End::MALFORMED);
         BOOST_CHECK(m_connman.IsPQFallback(endpoint, Now<NodeSeconds>()));
+        BOOST_REQUIRE(Fallback(endpoint));
         BOOST_CHECK(Fallback(endpoint)->expires == start + window);
         BOOST_CHECK_EQUAL(Stats().outbound.fallback, fallbacks + 1);
 
@@ -1432,6 +1460,7 @@ BOOST_AUTO_TEST_CASE(pq_history_eviction)
     // insertion fails again, later than every other, and is still the next to go.
     SetMockTime(GetTime<std::chrono::seconds>() + 1s);
     Connect(TestEndpoint(6, newest - 1), End::MALFORMED);
+    BOOST_REQUIRE(Streak(TestEndpoint(6, newest - 1)));
     BOOST_CHECK_EQUAL(Streak(TestEndpoint(6, newest - 1))->streak, 2U);
     Connect(TestEndpoint(6, newest + 1), End::MALFORMED);
     BOOST_CHECK(!Streak(TestEndpoint(6, newest - 1)));
@@ -1469,6 +1498,7 @@ BOOST_AUTO_TEST_CASE(pq_local_fault_warning)
     for (int i{0}; i < 12; ++i) Connect(TestEndpoint(7, i), End::MALFORMED);
     BOOST_CHECK_EQUAL(warnings.m_count, 1);
     BOOST_CHECK(m_connman.IsPQFallback(TestEndpoint(7, 0), Now<NodeSeconds>()) == false);
+    BOOST_REQUIRE(Streak(TestEndpoint(7, 0)));
     BOOST_CHECK_EQUAL(Streak(TestEndpoint(7, 0))->streak, 2U);
     // The set of failing endpoints stops growing at the threshold: it is never evicted, so the
     // cap is its only bound.
