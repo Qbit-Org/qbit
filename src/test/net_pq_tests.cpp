@@ -1630,6 +1630,9 @@ BOOST_AUTO_TEST_CASE(pq_shed_wipes_secrets)
     BOOST_REQUIRE(Stats().load_shedding.active);
     BOOST_REQUIRE(shed.node->m_transport->GetPQSnapshot().offer == PQOfferState::NONE);
     BOOST_REQUIRE(!shed.node->fDisconnect);
+    // Check before the initiator's version arrives: processing it wipes whatever is still held,
+    // which would hide a shed branch that didn't wipe.
+    BOOST_REQUIRE(!shed.node->m_transport->GetPQSnapshot().version_received);
     BOOST_CHECK(!dynamic_cast<const V2Transport&>(*shed.node->m_transport).HoldsHybridSecretsForTesting());
 }
 
