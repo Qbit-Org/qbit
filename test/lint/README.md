@@ -200,6 +200,10 @@ checks near misses. Fenced code blocks aren't checked here: the quick start's
 commands and outputs, and the warnings the guide shows, are checked by
 `test/functional/feature_pq_quickstart.py`.
 
+A pull request that changes only public documentation skips the lint job, so
+the `public-docs-lint` job in `.github/workflows/ci.yml` runs this check too,
+without binaries.
+
 lint-qbit-node-defaults.py
 ==========================
 Run this script from the root of the repository to verify curated qbit-owned
