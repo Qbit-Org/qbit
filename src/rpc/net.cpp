@@ -1401,10 +1401,10 @@ static std::vector<RPCResult> PQCountsDoc(bool inbound)
         {RPCResult::Type::NUM, "internal_error", "Local ML-KEM or cipher state errors"},
     };
     if (inbound) {
-        doc.push_back({RPCResult::Type::NUM, "shed", "Offers not made because of load shedding"});
+        doc.emplace_back(RPCResult::Type::NUM, "shed", "Offers not made because of load shedding");
     } else {
-        doc.push_back({RPCResult::Type::NUM, "closed_after_switch", "Connections the peer closed, or that timed out, after we switched and before its key confirmation verified"});
-        doc.push_back({RPCResult::Type::NUM, "fallback", "Entries of an endpoint into the fallback set (not the plain v2 connections it gives)"});
+        doc.emplace_back(RPCResult::Type::NUM, "closed_after_switch", "Connections the peer closed, or that timed out, after we switched and before its key confirmation verified");
+        doc.emplace_back(RPCResult::Type::NUM, "fallback", "Entries of an endpoint into the fallback set (not the plain v2 connections it gives)");
     }
     return doc;
 }
