@@ -322,13 +322,20 @@ def set_host(args) -> int:
         return 0
     host = os.environ.get('HOST', subprocess.check_output(
         './depends/config.guess').decode())
+    # A qbit host matches both its depends triplet (aarch64-linux-gnu) and
+    # config.guess output (aarch64-unknown-linux-gnu, newline included).
     platforms = {
-        'aarch64-*-linux*': 'aarch64-linux-gnu',
+        'aarch64-*linux*': 'aarch64-linux-gnu',
+        # The ARM archives are little-endian ARMv7 hard-float binaries.
+        'arm-*linux-gnueabihf*': 'arm-linux-gnueabihf',
+        'armv[78]l-*linux-gnueabihf*': 'arm-linux-gnueabihf',
+        'powerpc64-*linux*': 'powerpc64-linux-gnu',
         'powerpc64le-*-linux-*': 'powerpc64le-linux-gnu',
-        'riscv64-*-linux*': 'riscv64-linux-gnu',
+        'riscv64-*linux*': 'riscv64-linux-gnu',
         'x86_64-*-linux*': 'x86_64-linux-gnu',
         'x86_64-apple-darwin*': 'x86_64-apple-darwin',
         'aarch64-apple-darwin*': 'arm64-apple-darwin',
+        'arm64-apple-darwin*': 'arm64-apple-darwin',
     }
     args.host = ''
     for pattern, target in platforms.items():

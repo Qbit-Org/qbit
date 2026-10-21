@@ -6,7 +6,8 @@
 
 Checks, without downloading anything or starting a node, that a qbit client
 version resolves to the right tag, download URL, archive, archive root, hash and
-binary names on every host qbit publishes for, that the Bitcoin Core mappings
+binary names on every host qbit publishes for, that get_previous_releases.py
+detects each of those hosts, that the Bitcoin Core mappings
 are unchanged, and that a qbit release gets Core-era options by its Core base
 and qbit-only options only when it supports them.
 """
@@ -51,6 +52,37 @@ QBIT_V1_0_0_ARCHIVES = {
     "win64": "qbit-1.0.0-win64-unsigned.zip",
 }
 
+# What set_host() picks for each depends/README.md triplet given in HOST.
+DEPENDS_HOSTS = {
+    "x86_64-pc-linux-gnu": "x86_64-linux-gnu",
+    "aarch64-linux-gnu": "aarch64-linux-gnu",
+    "arm-linux-gnueabihf": "arm-linux-gnueabihf",
+    "riscv64-linux-gnu": "riscv64-linux-gnu",
+    "powerpc64-linux-gnu": "powerpc64-linux-gnu",
+    "x86_64-apple-darwin": "x86_64-apple-darwin",
+    "arm64-apple-darwin": "arm64-apple-darwin",
+}
+
+# What set_host() picks for depends/config.guess output, newline included, or
+# None when no archive runs on that host.
+CONFIG_GUESS_HOSTS = {
+    "x86_64-pc-linux-gnu\n": "x86_64-linux-gnu",
+    "aarch64-unknown-linux-gnu\n": "aarch64-linux-gnu",
+    "armv7l-unknown-linux-gnueabihf\n": "arm-linux-gnueabihf",
+    "armv8l-unknown-linux-gnueabihf\n": "arm-linux-gnueabihf",
+    "riscv64-unknown-linux-gnu\n": "riscv64-linux-gnu",
+    "powerpc64-unknown-linux-gnu\n": "powerpc64-linux-gnu",
+    "powerpc64le-unknown-linux-gnu\n": "powerpc64le-linux-gnu",
+    "x86_64-apple-darwin23.6.0\n": "x86_64-apple-darwin",
+    "aarch64-apple-darwin23.6.0\n": "arm64-apple-darwin",
+    # No archive: ARMv6, soft-float or big-endian ARM (the ARM archives are
+    # little-endian ARMv7 hard-float binaries), and 32-bit POWER.
+    "armv6l-unknown-linux-gnueabihf\n": None,
+    "armv7l-unknown-linux-gnueabi\n": None,
+    "armv7b-unknown-linux-gnueabihf\n": None,
+    "powerpc-unknown-linux-gnu\n": None,
+}
+
 
 def core_client_version(tag):
     """Bitcoin Core client version for a release tag, e.g. v0.20.1 -> 200100, v24.0.1 -> 240001."""
@@ -73,6 +105,7 @@ class QbitReleaseResolutionTest(BitcoinTestFramework):
         self.exeext = self.config["environment"]["EXEEXT"]
 
         self.test_qbit_downloads()
+        self.test_set_host()
         self.test_default_tags()
         self.test_qbit_release_info()
         self.test_core_mappings_unchanged()
@@ -99,6 +132,38 @@ class QbitReleaseResolutionTest(BitcoinTestFramework):
         # A qbit tag must not shadow a Bitcoin Core one.
         core_tags = {v["tag"] for v in self.releases.SHA256_SUMS.values()}
         assert_equal(framework_tags & core_tags, set())
+
+    def set_host(self, *, host=None, guess="", system="Linux", machine="x86_64"):
+        """Run set_host() as on a machine with this platform, HOST and
+        config.guess output. Return its status, chosen host and stderr."""
+        args = argparse.Namespace()
+        fake_platform = mock.Mock(**{"system.return_value": system, "machine.return_value": machine})
+        fake_subprocess = mock.Mock(**{"check_output.return_value": guess.encode()})
+        err = io.StringIO()
+        with mock.patch.object(self.releases, "platform", fake_platform), \
+             mock.patch.object(self.releases, "subprocess", fake_subprocess), \
+             mock.patch.dict(os.environ), contextlib.redirect_stderr(err):
+            os.environ.pop("HOST", None)
+            if host is not None:
+                os.environ["HOST"] = host
+            ret = self.releases.set_host(args)
+        return ret, args.host, err.getvalue()
+
+    def test_set_host(self):
+        self.log.info("set_host() finds every host qbit publishes for, from HOST or from config.guess")
+        assert_equal(set(DEPENDS_HOSTS.values()) | {"win64"}, set(QBIT_V1_0_0_ARCHIVES))
+        assert set(QBIT_V1_0_0_ARCHIVES) - {"win64"} <= set(CONFIG_GUESS_HOSTS.values())
+        for triplet, expected in DEPENDS_HOSTS.items():
+            # config.guess runs even when HOST is set; HOST wins.
+            assert_equal(self.set_host(host=triplet, guess="powerpc64le-unknown-linux-gnu\n"), (0, expected, ""))
+            assert_equal(self.releases.resolve_download("v1.0.0", expected).archive, QBIT_V1_0_0_ARCHIVES[expected])
+        for guess, expected in CONFIG_GUESS_HOSTS.items():
+            system = "Darwin" if "-apple-darwin" in guess else "Linux"
+            if expected is None:
+                assert_equal(self.set_host(guess=guess, system=system), (1, "", f"Not sure which binary to download for {guess}\n"))
+            else:
+                assert_equal(self.set_host(guess=guess, system=system), (0, expected, ""))
+        assert_equal(self.set_host(host="x86_64-pc-linux-gnu", system="Windows", machine="AMD64"), (0, "win64", ""))
 
     def test_default_tags(self):
         self.log.info("The default tags leave out qbit releases without an archive for the host")
