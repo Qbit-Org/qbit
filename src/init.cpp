@@ -2207,6 +2207,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     connOptions.whitelist_forcerelay = args.GetBoolArg("-whitelistforcerelay", DEFAULT_WHITELISTFORCERELAY);
     connOptions.whitelist_relay = args.GetBoolArg("-whitelistrelay", DEFAULT_WHITELISTRELAY);
     connOptions.m_pq = g_pq_transport_config;
+    if (HasTestOption(args, "pq_low_shed_threshold")) connOptions.pq_shed_threshold_per_s = TEST_PQ_SHED_THRESHOLD_PER_S;
 
     // Port to bind to if `-bind=addr` is provided without a `:port` suffix.
     const uint16_t default_bind_port =

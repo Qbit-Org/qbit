@@ -747,6 +747,8 @@ const std::vector<std::string> TEST_OPTIONS_DOC{
     "disable_witness_pruning (disable witness pruning in regtest)",
     "pq_fail_first_packet (corrupt this node's ML-KEM shared secret on every hybrid post-quantum v2 handshake, so the peer's key confirmation fails)",
     "mlkem_portable (use the portable ML-KEM-1024 code instead of native code)",
+    "pq_low_shed_threshold (start shedding inbound hybrid post-quantum v2 offers above 5 attempts per second instead of 1000)",
+    "mock_steady_clock (setmocktime also sets the steady clock that durations such as load shedding's seconds are measured on; setmocktime 0 clears both)",
 };
 
 bool HasTestOption(const ArgsManager& args, const std::string& test_option)
