@@ -98,9 +98,12 @@ ERROR_UNCORRELATED = "::error title=Required Merge Gate could not correlate chec
 ERROR_TIMED_OUT = "::error title=Required Merge Gate timed out::"
 WARNING_RETRYING = "::warning title=Required Merge Gate retrying::"
 
-# The documented allowance between the workflow runs one event creates.
+# The documented allowance between the workflow runs one event creates: 325
+# pull request events on this repository (June to October 2026) spread their
+# runs over at most 4 s, and the closest two events on one commit were 28 s
+# apart.
 EVENT_SKEW = re.compile(r"^\s*EVENT_SKEW_SECONDS=(?P<seconds>\d+)\s*$", re.MULTILINE)
-DOCUMENTED_EVENT_SKEW_SECONDS = 60
+DOCUMENTED_EVENT_SKEW_SECONDS = 10
 
 # -- the events a commit has seen -------------------------------------------
 #
@@ -117,22 +120,30 @@ CORE_WORKFLOW, FULL_WORKFLOW, RPC_DOCS_WORKFLOW = 7001, 7002, 7003
 CORE_EARLIER, FULL_EARLIER = 101, 102
 CORE_THIS, FULL_THIS, RPC_DOCS_THIS = 201, 202, 203
 CORE_LATER = 301
-# check suite: (workflow id, run_number, created_at) of the run that owns it
+# check suite: (workflow id, run_number, created_at) of the run that owns it.
+# These are the workflow runs on the commit unless a test says otherwise; the
+# later event's run is on it only in the tests that ask for it.
 SUITE_RUNS = {
     CORE_EARLIER: (CORE_WORKFLOW, 452, EARLIER_EVENT),
     FULL_EARLIER: (FULL_WORKFLOW, 445, EARLIER_EVENT),
     CORE_THIS: (CORE_WORKFLOW, 457, THIS_EVENT),
     FULL_THIS: (FULL_WORKFLOW, 450, THIS_EVENT),
     RPC_DOCS_THIS: (RPC_DOCS_WORKFLOW, 30, THIS_EVENT),
-    CORE_LATER: (CORE_WORKFLOW, 460, LATER_EVENT),
 }
+LATER_RUNS = {CORE_LATER: (CORE_WORKFLOW, 460, LATER_EVENT)}
 
+SHA = "0" * 40
 GATE_RUN_PATH = re.escape(f"/actions/runs/{GATE_RUN_ID}") + "$"
 
 
 def suite_lookup(suite: int) -> str:
     """The route for the lookup of the workflow run that owns ``suite``."""
     return re.escape(f"/actions/runs?check_suite_id={suite}&exclude_pull_requests=true&per_page=100") + "$"
+
+
+def commit_runs_lookup(workflow: int) -> str:
+    """The route for the listing of ``workflow``'s runs on the commit."""
+    return re.escape(f"/actions/workflows/{workflow}/runs?head_sha={SHA}&exclude_pull_requests=true&per_page=100") + "$"
 
 
 def check_run(
@@ -153,6 +164,7 @@ def workflow_run(
         "workflow_id": workflow,
         "run_number": number,
         "check_suite_id": suite,
+        "head_sha": SHA,
         "created_at": created_at,
         "run_started_at": created_at,
         "run_attempt": 1,
@@ -173,12 +185,17 @@ def suite_run(suite: int, owner: tuple[int, int, str]) -> dict:
 def event_routes(
     gate_run: dict | None = None, suites: dict[int, tuple[int, int, str]] | None = None
 ) -> dict[str, tuple]:
-    """Answers for the gate's own run and for the run behind each check suite."""
+    """Answers for the gate's own run, for the run behind each check suite, and
+    for each workflow's runs on the commit: exactly the runs in ``suites``."""
     routes: dict[str, tuple] = {
         GATE_RUN_PATH: ok(json.dumps(gate_run or workflow_run(GATE_RUN_ID, 999, THIS_EVENT))),
     }
+    by_workflow: dict[int, list[dict]] = {}
     for suite, owner in (SUITE_RUNS if suites is None else suites).items():
         routes[suite_lookup(suite)] = ok(workflow_runs(suite_run(suite, owner)))
+        by_workflow.setdefault(owner[0], []).append(suite_run(suite, owner))
+    for workflow, runs in by_workflow.items():
+        routes[commit_runs_lookup(workflow)] = ok(workflow_runs(*runs))
     return routes
 
 
@@ -347,7 +364,7 @@ class MergeGatePollerTest(unittest.TestCase):
             "SOURCE_VALIDATION_REQUIRED": "true",
             "GH_TOKEN": "fake-token",
             "REPOSITORY": "example/repo",
-            "SHA": "0" * 40,
+            "SHA": SHA,
             "RUN_ID": str(GATE_RUN_ID),
         }
         declared = set(self.step["env"])
@@ -799,7 +816,7 @@ class MergeGatePollerTest(unittest.TestCase):
         fake = FakeGh(
             self.tmp("later-event"),
             default=ok(body(page(self.failed_core(CORE_LATER, started_at=LATER_EVENT), self.green_validation()))),
-            routes=event_routes(),
+            routes=event_routes(suites={**SUITE_RUNS, **LATER_RUNS}),
         )
         completed = self.run_gate(fake)
         self.assertGateFailed(
@@ -1038,6 +1055,180 @@ class MergeGatePollerTest(unittest.TestCase):
                         forbidden=(ERROR_CHECK_FAILED, ERROR_UNCORRELATED),
                     )
 
+    # -- two events on one commit, close together ----------------------------
+    #
+    # No marker names a workflow run's event, so events are told apart by when
+    # their runs were created and, closer together than the allowance, by a
+    # newer run of the same workflow on the commit.  A newer event cancels the
+    # earlier event's run, whose always() gate job then concludes failure,
+    # after the newer run exists.
+
+    def earlier_events_failure(self, suite: int) -> dict:
+        # Concluded after this event, as a cancelled run's gate job does.
+        return check_run(
+            "Core Checks Gate", "completed", "failure", suite=suite,
+            started_at="2026-10-06T14:12:40Z", completed_at="2026-10-06T14:12:45Z",
+        )
+
+    def test_an_earlier_event_seconds_before_waits_for_this_events_run(self) -> None:
+        # 0 s is two labels applied at once.  Inside the allowance only the
+        # newer run of the workflow tells the earlier event's failure apart.
+        gate = parse_iso(THIS_EVENT)
+        first = 401
+        for seconds in (0, 2, DOCUMENTED_EVENT_SKEW_SECONDS):
+            with self.subTest(seconds_apart=seconds):
+                created = iso(gate - timedelta(seconds=seconds))
+                suites = {
+                    first: (CORE_WORKFLOW, 456, created),
+                    CORE_THIS: SUITE_RUNS[CORE_THIS],
+                    FULL_THIS: SUITE_RUNS[FULL_THIS],
+                }
+                stale = self.earlier_events_failure(first)
+                validation = self.green_validation()
+                running = self.this_events_core("in_progress", None)
+                fake = FakeGh(
+                    self.tmp(f"apart-{seconds}"),
+                    responses=[ok(body(page(stale, validation)))] * 4 + [ok(body(page(stale, running, validation)))] * 2,
+                    default=ok(body(page(stale, self.this_events_core("completed", "success"), validation))),
+                    routes=event_routes(suites=suites),
+                )
+                completed = self.run_gate(fake)
+                self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+                self.assertIn(
+                    f"Core Checks Gate: concluded failure in run #456 of its workflow, created at {created}, "
+                    f"but run #457, created at {THIS_EVENT}, has since started on {SHA}; waiting for its result",
+                    completed.stdout,
+                )
+                self.assertIn("Core Checks Gate: status=in_progress conclusion=pending", completed.stdout)
+                # Listed once: a newer run, once seen, stays on the commit.
+                self.assertEqual(len(fake.calls_matching(commit_runs_lookup(CORE_WORKFLOW))), 1, fake.calls)
+
+    def test_a_superseded_failure_is_named_by_the_timeout(self) -> None:
+        gate = parse_iso(THIS_EVENT)
+        suites = {
+            401: (CORE_WORKFLOW, 456, iso(gate - timedelta(seconds=2))),
+            CORE_THIS: SUITE_RUNS[CORE_THIS],
+            FULL_THIS: SUITE_RUNS[FULL_THIS],
+        }
+        fake = FakeGh(
+            self.tmp("superseded-timeout"),
+            default=ok(body(page(self.earlier_events_failure(401), self.green_validation()))),
+            routes=event_routes(suites=suites),
+        )
+        completed = self.run_gate(fake, GATE_WAIT_TIMEOUT_SECONDS="3")
+        self.assertGateFailed(
+            completed,
+            f"{ERROR_TIMED_OUT}Required checks did not complete within 3s and are still pending: "
+            "Core Checks Gate (last failure superseded by a newer run)",
+            forbidden=(ERROR_CHECK_FAILED, ERROR_UNCORRELATED, ERROR_UNREADABLE),
+        )
+
+    def test_an_earlier_event_30_seconds_before_is_told_apart_by_time(self) -> None:
+        # Outside the allowance the failure is an earlier event's whether or
+        # not this event's run of the workflow is listed yet, and no listing
+        # is read for it.
+        gate = parse_iso(THIS_EVENT)
+        first = 401
+        for label, listed in {"this event's run listed": True, "not listed yet": False}.items():
+            with self.subTest(case=label):
+                suites = {
+                    first: (CORE_WORKFLOW, 456, iso(gate - timedelta(seconds=30))),
+                    FULL_THIS: SUITE_RUNS[FULL_THIS],
+                }
+                if listed:
+                    suites[CORE_THIS] = SUITE_RUNS[CORE_THIS]
+                fake = FakeGh(
+                    self.tmp(f"apart-30-{listed}"),
+                    default=ok(body(page(self.earlier_events_failure(first), self.green_validation()))),
+                    routes=event_routes(suites=suites),
+                )
+                completed = self.run_gate(fake, GATE_WAIT_TIMEOUT_SECONDS="2")
+                self.assertGateFailed(
+                    completed,
+                    f"{ERROR_TIMED_OUT}Required checks did not complete within 2s and are still pending: "
+                    "Core Checks Gate (last failure from an earlier event)",
+                    forbidden=(ERROR_CHECK_FAILED, ERROR_UNCORRELATED),
+                )
+                self.assertEqual(fake.calls_matching(commit_runs_lookup(CORE_WORKFLOW)), [], fake.calls)
+
+    def test_a_current_failure_with_no_newer_run_fails_at_once(self) -> None:
+        # One event's runs are created seconds apart, this gate's up to 3 s
+        # after another's: such a failure is this event's, and with no newer
+        # run of its workflow on the commit it fails at once, also when only
+        # this gate is re-run, hours later.
+        gate = parse_iso(THIS_EVENT)
+        rerun = workflow_run(GATE_RUN_ID, 999, THIS_EVENT, run_attempt=3, run_started_at="2026-10-06T19:40:00Z")
+        for label, gate_run in {"first attempt": None, "gate-only re-run": rerun}.items():
+            for seconds in (3, DOCUMENTED_EVENT_SKEW_SECONDS):
+                with self.subTest(gate=label, seconds_before=seconds):
+                    suites = {
+                        CORE_EARLIER: SUITE_RUNS[CORE_EARLIER],
+                        401: (CORE_WORKFLOW, 457, iso(gate - timedelta(seconds=seconds))),
+                        FULL_THIS: SUITE_RUNS[FULL_THIS],
+                    }
+                    fake = FakeGh(
+                        self.tmp(f"current-{label}-{seconds}"),
+                        default=ok(body(page(self.failed_core(401), self.green_validation()))),
+                        routes=event_routes(gate_run=gate_run, suites=suites),
+                    )
+                    completed = self.run_gate(fake)
+                    self.assertGateFailed(
+                        completed,
+                        f"{ERROR_CHECK_FAILED}Core Checks Gate concluded failure.",
+                        forbidden=(ERROR_TIMED_OUT, ERROR_UNCORRELATED),
+                    )
+                    self.assertEqual(len(fake.check_run_calls), 1, fake.calls)
+                    self.assertEqual(len(fake.calls_matching(commit_runs_lookup(CORE_WORKFLOW))), 1, fake.calls)
+
+    def test_runs_of_another_workflow_or_commit_never_supersede(self) -> None:
+        # Even were the listing's filters ignored.
+        routes = event_routes()
+        routes[commit_runs_lookup(CORE_WORKFLOW)] = ok(workflow_runs(
+            suite_run(CORE_THIS, SUITE_RUNS[CORE_THIS]),
+            workflow_run(60_001, 901, LATER_EVENT, workflow=FULL_WORKFLOW, number=999),
+            dict(workflow_run(60_002, 902, LATER_EVENT, number=999), head_sha="1" * 40),
+        ))
+        fake = FakeGh(
+            self.tmp("other-runs"),
+            default=ok(body(page(self.failed_core(CORE_THIS), self.green_validation()))),
+            routes=routes,
+        )
+        completed = self.run_gate(fake)
+        self.assertGateFailed(
+            completed,
+            f"{ERROR_CHECK_FAILED}Core Checks Gate concluded failure.",
+            forbidden=(ERROR_TIMED_OUT, ERROR_UNCORRELATED),
+        )
+
+    def test_a_later_events_run_decides_over_this_events_failure(self) -> None:
+        # An event after this gate's has already started a newer run of the
+        # workflow: this event's failure is waited on, and that run decides.
+        suites = {**SUITE_RUNS, **LATER_RUNS}
+        validation = self.green_validation()
+        this_failed = self.failed_core(CORE_THIS)
+        for conclusion in ("success", "failure"):
+            with self.subTest(later=conclusion):
+                later = check_run(
+                    "Core Checks Gate", "completed", conclusion, suite=CORE_LATER,
+                    started_at="2026-10-06T14:50:00Z", completed_at="2026-10-06T15:04:00Z",
+                )
+                fake = FakeGh(
+                    self.tmp(f"later-decides-{conclusion}"),
+                    responses=[ok(body(page(this_failed, validation)))] * 2,
+                    default=ok(body(page(this_failed, later, validation))),
+                    routes=event_routes(suites=suites),
+                )
+                completed = self.run_gate(fake)
+                self.assertIn("but run #460, created at " + LATER_EVENT, completed.stdout)
+                if conclusion == "success":
+                    self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+                else:
+                    self.assertGateFailed(
+                        completed,
+                        f"{ERROR_CHECK_FAILED}Core Checks Gate concluded failure.",
+                        forbidden=(ERROR_TIMED_OUT, ERROR_UNCORRELATED),
+                    )
+
     def test_a_success_from_an_earlier_event_still_counts(self) -> None:
         # A success on this commit is a verdict whichever event produced it,
         # so it is never dated: no workflow run is read for it.
@@ -1104,6 +1295,9 @@ class MergeGatePollerTest(unittest.TestCase):
         forbidden = (1, "", "gh: Resource not accessible by integration (HTTP 403)\n")
         failed = self.failed_core(CORE_THIS)
         suite_route = suite_lookup(CORE_THIS)
+        own_run = suite_run(CORE_THIS, SUITE_RUNS[CORE_THIS])
+        dated = {GATE_RUN_PATH: gate_run, suite_route: ok(workflow_runs(own_run))}
+        listing = commit_runs_lookup(CORE_WORKFLOW)
         # case: (routes, check run, env overrides, the route read until it gave up)
         cases = {
             "the check's run cannot be read": ({GATE_RUN_PATH: gate_run, suite_route: server_error}, failed, {}, suite_route),
@@ -1125,6 +1319,10 @@ class MergeGatePollerTest(unittest.TestCase):
                 {GATE_RUN_PATH: gate_run, suite_route: ok(workflow_runs(workflow_run(1, CORE_THIS, THIS_EVENT, number=None)))},
                 failed, {}, suite_route,
             ),
+            "the check's run names no workflow": (
+                {GATE_RUN_PATH: gate_run, suite_route: ok(workflow_runs(workflow_run(1, CORE_THIS, THIS_EVENT, workflow=None)))},
+                failed, {}, suite_route,
+            ),
             "the check's run has fractional seconds": (
                 {GATE_RUN_PATH: gate_run, suite_route: ok(workflow_runs(workflow_run(1, CORE_THIS, "2026-10-06T14:12:00.5Z")))},
                 failed, {}, suite_route,
@@ -1138,6 +1336,25 @@ class MergeGatePollerTest(unittest.TestCase):
                 {GATE_RUN_PATH: ok(json.dumps(workflow_run(GATE_RUN_ID, 999, "")))}, failed, {}, GATE_RUN_PATH,
             ),
             "this gate's run id is missing": ({}, failed, {"RUN_ID": ""}, None),
+            # Whether a newer run of the check's workflow is on the commit.
+            "its workflow's runs cannot be listed": ({**dated, listing: server_error}, failed, {}, listing),
+            "the token cannot list its workflow's runs": ({**dated, listing: forbidden}, failed, {}, listing),
+            "the listing is not json": ({**dated, listing: ok("<html>502</html>")}, failed, {}, listing),
+            "the listing is empty": ({**dated, listing: ok(workflow_runs())}, failed, {}, listing),
+            "the listing lacks the check's own run": (
+                {**dated, listing: ok(workflow_runs(suite_run(CORE_EARLIER, SUITE_RUNS[CORE_EARLIER])))},
+                failed, {}, listing,
+            ),
+            "the listing has the run under another workflow": (
+                {**dated, listing: ok(workflow_runs(dict(own_run, workflow_id=FULL_WORKFLOW)))}, failed, {}, listing,
+            ),
+            "the listing has the run under another commit": (
+                {**dated, listing: ok(workflow_runs(dict(own_run, head_sha="1" * 40)))}, failed, {}, listing,
+            ),
+            "a listed run has no run_number": (
+                {**dated, listing: ok(workflow_runs(own_run, workflow_run(1, 999, LATER_EVENT, number=None)))},
+                failed, {}, listing,
+            ),
             "the check run names no check suite": (
                 {GATE_RUN_PATH: gate_run},
                 check_run("Core Checks Gate", "completed", "failure", started_at="2026-10-06T14:20:00Z"),
@@ -1163,13 +1380,13 @@ class MergeGatePollerTest(unittest.TestCase):
                 if gave_up is not None:
                     # Bounded by the same retries as the check-runs query.
                     self.assertEqual(len(fake.calls_matching(gave_up)), 2, fake.calls)
-                    self.assertIn(f"{WARNING_RETRYING}Core Checks Gate: workflow-run ", completed.stdout)
+                    self.assertIn(f"{WARNING_RETRYING}Core Checks Gate: workflow-run", completed.stdout)
 
     def test_a_transient_lookup_failure_is_retried(self) -> None:
         routes = event_routes()
         routes[suite_lookup(CORE_THIS)] = [
             (1, "", "gh: Server Error (HTTP 502)\n"),
-            ok(workflow_runs(workflow_run(60_201, CORE_THIS, THIS_EVENT))),
+            ok(workflow_runs(suite_run(CORE_THIS, SUITE_RUNS[CORE_THIS]))),
         ]
         fake = FakeGh(
             self.tmp("lookup-transient"),
