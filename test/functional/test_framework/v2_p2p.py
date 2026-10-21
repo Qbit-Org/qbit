@@ -191,6 +191,7 @@ class EncryptedP2PState:
         self.confirmation_sent = False
         self.peer_confirmed = False
         self.confirmation_len = -1  # the decrypted length of the peer's key confirmation, once received
+        self.confirmation_failure = None  # the check the peer's key confirmation failed: "length", "tag" or "not_decoy"
 
     @staticmethod
     def v2_ecdh(priv, ellswift_theirs, ellswift_ours, initiating):
@@ -430,11 +431,16 @@ class EncryptedP2PState:
             self.confirmation_len = int.from_bytes(self.peer['recv_L'].crypt(response[:LENGTH_FIELD_LEN]), 'little')
             # A key mismatch decrypts to a random length: fail now rather than wait for its bytes.
             if self.confirmation_len != 0:
+                self.confirmation_failure = "length"
                 return 0, False
         if len(response) < PQ_CONFIRMATION_LEN:
             return 0, True
         plaintext = self.peer['recv_P'].decrypt(b"", response[LENGTH_FIELD_LEN:PQ_CONFIRMATION_LEN])
-        if plaintext is None or not plaintext[0] & (1 << IGNORE_BIT_POS):
+        if plaintext is None:
+            self.confirmation_failure = "tag"
+            return 0, False
+        if not plaintext[0] & (1 << IGNORE_BIT_POS):
+            self.confirmation_failure = "not_decoy"
             return 0, False
         self.peer_confirmed = True
         self.pq_status = "hybrid"
@@ -686,18 +692,22 @@ class TestFrameworkV2P2P(unittest.TestCase):
         self.assertTrue(responder.tried_v2_handshake)
 
     def test_bad_confirmation(self):
-        """A confirmation with a nonzero length, a bad tag or a clear ignore bit fails."""
-        for damage in ("length", "tag", "not_decoy"):
+        """A confirmation with a nonzero length, a bad tag or a clear ignore bit fails that check."""
+        def flip_tag(packet):
+            return packet[:-1] + bytes([packet[-1] ^ 1])
+        damages = {
+            "length": lambda state: state.v2_enc_packet(b"\x00", ignore=True),
+            "tag": lambda state: flip_tag(state.v2_enc_packet(b"", ignore=True)),
+            "not_decoy": lambda state: state.v2_enc_packet(b"", ignore=False),
+        }
+        for damage, make_confirmation in damages.items():
             initiator = EncryptedP2PState(initiating=True, net="regtest", supports_v2_pq=True)
             responder = EncryptedP2PState(initiating=False, net="regtest", supports_v2_pq=True)
+            # The damaged confirmation must be hybrid packet 0, as a real one is: a packet encrypted after
+            # it decrypts to a random length, so it would fail the length check whatever the damage.
+            initiator.make_confirmation = lambda state=initiator, make=make_confirmation: make(state)
             initiator.withhold_confirmation = True
             _, responder_buf = _run_handshake(initiator, responder)
-            initiator.release_confirmation()
-            if damage == "length":
-                confirmation = initiator.v2_enc_packet(b"\x00", ignore=True)
-            elif damage == "tag":
-                confirmation = initiator.v2_enc_packet(b"", ignore=True)
-                confirmation = confirmation[:-1] + bytes([confirmation[-1] ^ 1])
-            else:
-                confirmation = initiator.v2_enc_packet(b"", ignore=False)
+            confirmation = initiator.release_confirmation()
             self.assertEqual(responder.authenticate_handshake(responder_buf + confirmation)[1], False)
+            self.assertEqual(responder.confirmation_failure, damage)
