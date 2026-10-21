@@ -104,6 +104,10 @@ The report names a known-good peer by its label and never prints an address,
 so it can be posted. Unlabeled entries are `known-good-1`, `known-good-2`, ...
 in file order. Errors about the list name the line, not the address.
 
+An IP address matches however it is written: `[2001:0db8:0:0:0:0:0:5]:8333` is
+the same entry as `[2001:db8::5]:8333`, and `[::ffff:203.0.113.5]:8333` the same
+as `203.0.113.5:8333`, as the node reports them.
+
 ## Running the evaluator
 
 Figure 2 needs the failures of every monitored canary node, by default the

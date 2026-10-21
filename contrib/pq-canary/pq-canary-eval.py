@@ -371,8 +371,21 @@ def evaluate_pinned(pool: list[Row] | None, archive: list[Row] | None,
 # ---------------------------------------------------------------------------
 
 
-def endpoint_key(address: str, port: Any) -> str:
+def canonical_address(address: str) -> str:
+    """An IP address in one spelling, compressed, and an IPv4-mapped IPv6 address
+    as IPv4, as the node reports it; any other address lower-cased."""
     address = address.strip().lower()
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return address
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return str(ip)
+
+
+def endpoint_key(address: str, port: Any) -> str:
+    address = canonical_address(address)
     return f"[{address}]:{port}" if ":" in address else f"{address}:{port}"
 
 
@@ -415,14 +428,15 @@ class KnownGood:
         if not isinstance(endpoint, dict) or not isinstance(endpoint.get("address"), str):
             return None
         key = endpoint_key(endpoint["address"], endpoint.get("port"))
-        return self.endpoints.get(key) or self.addresses.get(endpoint["address"].strip().lower())
+        return self.endpoints.get(key) or self.addresses.get(canonical_address(endpoint["address"]))
 
 
 def read_known_good(path: Path) -> KnownGood:
     """One endpoint per line, then an optional label: address:port, [ipv6]:port, an address or [ipv6].
 
     # starts a comment. Unlabeled entries are known-good-1, known-good-2, ... in file
-    order. Errors name the line, never its address.
+    order. An IP address matches however it is written. Errors name the line, never
+    its address.
     """
     endpoints: dict[str, str] = {}
     addresses: dict[str, str] = {}
@@ -452,7 +466,7 @@ def read_known_good(path: Path) -> KnownGood:
         if not LABEL.fullmatch(label):
             raise ValueError(f"{path}:{number}: a label is letters, digits, '.', '_' or '-'")
         target = addresses if port is None else endpoints
-        key = address if port is None else endpoint_key(address, int(port))
+        key = canonical_address(address) if port is None else endpoint_key(address, int(port))
         if key in target:
             raise ValueError(f"{path}:{number}: endpoint listed twice")
         target[key] = label

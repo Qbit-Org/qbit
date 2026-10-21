@@ -876,6 +876,25 @@ class FailureEntriesTest(unittest.TestCase):
                 self.assertIn(f"known_good={name}", figure.details[0])
                 self.assert_no_addresses(figure, triage)
 
+    def test_known_good_address_in_any_spelling(self) -> None:
+        # The node reports an IPv6 address compressed; the list may spell it out, and either
+        # side may write an IPv4 address as IPv4-mapped IPv6.
+        start = record(T0, inbound=ring(0, 0, []), outbound=ring(0, 0, []))
+        cases = (("[2001:0DB8:0:0:0:0:0:5]:8333 peer", "2001:db8::5"), ("[2001:db8:0:0::5] peer", "2001:db8::5"),
+                 ("[2001:db8::5]:8333 peer", "2001:0db8:0:0:0:0:0:5"), ("[2001:db8::5] peer", "2001:0db8:0:0:0:0:0:5"),
+                 ("203.0.113.5:8333 peer", "::ffff:203.0.113.5"))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "known-good.txt"
+            for line, address in cases:
+                with self.subTest(line=line, address=address):
+                    path.write_text(line + "\n", encoding="utf8")
+                    failed = record(T0 + INTERVAL, inbound=ring(0, 0, []),
+                                    outbound=ring(1, 0, [entry(1, T0 + 5, address, 8333, "first_packet_failed")]))
+                    figure, triage = self.evaluate([start, failed], good=pq_eval.read_known_good(path))
+                    self.assertEqual(figure.result, "fail", figure.details)
+                    self.assertIn("known_good=peer", figure.details[0])
+                    self.assert_no_addresses(figure, triage)
+
     def test_missing_instance_id_is_unknown(self) -> None:
         start = record(T0, inbound=ring(0, 0, []), outbound=ring(0, 0, []))
         for label, value in (("null", None), ("short", "abc"), ("number", 7), ("list", ["a" * 64])):
@@ -979,7 +998,8 @@ class FailureEntriesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "known-good.txt"
             bad = ["2001:db8::1:8333", "198.51.100.1:port", "[2001:db8::1", ":8333", "198.51.100.1:0", "198.51.100.1:70000",
-                   "198.51.100.1 two labels", "198.51.100.1 bad/label", "198.51.100.1\n198.51.100.1"]
+                   "198.51.100.1 two labels", "198.51.100.1 bad/label", "198.51.100.1\n198.51.100.1",
+                   "[2001:db8::1]\n[2001:0db8:0:0:0:0:0:1]", "198.51.100.1:8333\n[::ffff:198.51.100.1]:8333"]
             for line in bad:
                 path.write_text(line.replace("\\n", "\n") + "\n", encoding="utf8")
                 with self.subTest(line), self.assertRaises(ValueError) as raised:
@@ -989,6 +1009,11 @@ class FailureEntriesTest(unittest.TestCase):
             path.write_text("[2001:db8::1]\nExample.org:8333 seed  # comment\n", encoding="utf8")
             good = pq_eval.read_known_good(path)
             self.assertEqual((good.endpoints, good.addresses), ({"example.org:8333": "seed"}, {"2001:db8::1": "known-good-1"}))
+            # Each IP address has one spelling: compressed, lower case, and IPv4 for an IPv4-mapped address.
+            path.write_text("[2001:0DB8:0:0:0:0:0:1]\n[2001:db8:0::0:5]:8333 peer\n[::ffff:203.0.113.5]:8333 archive\n", encoding="utf8")
+            good = pq_eval.read_known_good(path)
+            self.assertEqual(good.endpoints, {"[2001:db8::5]:8333": "peer", "203.0.113.5:8333": "archive"})
+            self.assertEqual(good.addresses, {"2001:db8::1": "known-good-1"})
 
 
 # ---------------------------------------------------------------------------
