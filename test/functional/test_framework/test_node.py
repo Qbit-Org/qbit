@@ -467,8 +467,9 @@ class TestNode():
 
         self.use_v2transport = "-v2transport=1" in extra_args or (self.default_to_v2 and "-v2transport=0" not in extra_args)
         # Only a node that uses v2 gets the global hybrid transport setting: an explicit -v2pqtransport=1 with
-        # -v2transport=0 warns. Plain --v2transport passes 0, so that it keeps covering plain v2 whatever the
-        # default. The test's own extra_args come later and win.
+        # -v2transport=0 warns. It is explicit either way, so that each mode keeps its transport whatever the
+        # node's default: plain --v2transport passes 0 and covers plain v2, --v2pqtransport passes 1. The
+        # test's own extra_args come later and win.
         transport_args = []
         if self.supports_v2_pq and self.default_to_v2 and self.use_v2transport and self.default_to_v2pq is not None:
             transport_args.append(f"-v2pqtransport={int(self.default_to_v2pq)}")

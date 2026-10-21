@@ -198,9 +198,10 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
         # Disable ThreadOpenConnections by default, so that adding entries to
         # addrman will not result in automatic connections to them.
         self.disable_autoconnect = True
-        # Whether nodes get the run mode's hybrid transport setting (-v2pqtransport=1 with --v2pqtransport,
-        # 0 with plain --v2transport). Tests of the option itself set this to False in set_test_params(),
-        # so that their nodes start with only their own arguments.
+        # Whether nodes get the run mode's hybrid transport setting, explicitly whatever the node's default
+        # (on): -v2pqtransport=1 with --v2pqtransport, 0 with plain --v2transport. The default mode passes
+        # none, so a node a test starts with -v2transport=1 runs the default. Tests of the option itself set
+        # this to False in set_test_params(), so that their nodes start with only their own arguments.
         self.v2pqtransport_from_run_mode = True
         self.set_test_params()
         assert self.wallet_names is None or len(self.wallet_names) <= self.num_nodes
@@ -272,12 +273,13 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
                             help="set a random seed for deterministically reproducing a previous test run")
         parser.add_argument("--timeout-factor", dest="timeout_factor", type=float, help="adjust test timeouts by a factor. Setting it to 0 disables all timeouts")
         parser.add_argument("--v2transport", dest="v2transport", default=False, action="store_true",
-                            help="use BIP324 v2 connections between all nodes by default")
+                            help="use BIP324 v2 connections between all nodes by default, with hybrid post-quantum "
+                                 "transport switched off explicitly (plain v2) unless --v2pqtransport is given")
         parser.add_argument("--v1transport", dest="v1transport", default=False, action="store_true",
                             help="Explicitly use v1 transport (can be used to overwrite global --v2transport option)")
         parser.add_argument("--v2pqtransport", dest="v2pqtransport", default=False, action="store_true",
-                            help="use hybrid post-quantum v2 connections between all nodes by default (implies --v2transport). "
-                                 "Without it, --v2transport switches hybrid transport off explicitly")
+                            help="use hybrid post-quantum v2 connections between all nodes by default (implies --v2transport), "
+                                 "switched on explicitly whatever the node's default")
         parser.add_argument("--test_methods", dest="test_methods", nargs='*',
                             help="Run specified test methods sequentially instead of the full test. Use only for methods that do not depend on any context set up in run_test or other methods.")
 

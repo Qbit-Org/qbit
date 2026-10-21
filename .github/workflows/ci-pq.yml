@@ -552,8 +552,10 @@ jobs:
 
   # The whole functional suite with hybrid post-quantum v2 transport between all
   # nodes (--v2pqtransport, #184 part 7), so the feature can't quietly break
-  # unrelated behavior. It shares unit's source checks; the test runner's result
-  # is the job's.
+  # unrelated behavior. The mode passes -v2pqtransport=1 explicitly: with the
+  # default on, this is still the only whole-suite hybrid run, since the default
+  # mode runs v1 between nodes and the i686 job of ci.yml plain v2. It shares
+  # unit's source checks; the test runner's result is the job's.
   pq-functional:
     name: Functional tests with hybrid transport
     needs: resolve-source

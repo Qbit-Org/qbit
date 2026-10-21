@@ -10,9 +10,11 @@ export LC_ALL=C.UTF-8
 source "$( dirname "${BASH_SOURCE[0]}" )/00_setup_env_base_image.sh"
 
 # The pq-functional job of .github/workflows/ci-pq.yml: the whole functional
-# suite with hybrid post-quantum v2 transport between all nodes. Framework Python
-# peers stay legacy BIP324 peers, so the suite pays no pure-Python KEM cost;
-# p2p_v2_pq*.py exercise the Python hybrid peer in every run.
+# suite with hybrid post-quantum v2 transport between all nodes. --v2pqtransport
+# passes -v2pqtransport=1 explicitly, so the job runs hybrid whatever the node's
+# default; the default mode runs v1 between nodes, and the i686 job plain v2.
+# Framework Python peers stay legacy BIP324 peers, so the suite pays no
+# pure-Python KEM cost; p2p_v2_pq*.py exercise the Python hybrid peer in every run.
 export CONTAINER_NAME=ci_native_pq_functional
 ci_set_base_image_name_tag "ubuntu:24.04"
 export PACKAGES="python3-zmq libevent-dev libboost-dev libzmq3-dev libsqlite3-dev"
