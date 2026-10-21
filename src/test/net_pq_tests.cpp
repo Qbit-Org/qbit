@@ -1470,6 +1470,44 @@ BOOST_AUTO_TEST_CASE(pq_history_eviction)
     BOOST_CHECK_EQUAL(Stats().failure_streaks.size(), PQ_MAX_ENDPOINT_HISTORY);
 }
 
+BOOST_AUTO_TEST_CASE(pq_history_eviction_spares_fallback)
+{
+    // The oldest insertion is in a fallback window; every later endpoint has one failure.
+    const PQEndpointKey in_window{TestEndpoint(8, 0)};
+    for (uint32_t i{0}; i < PQ_FAILURE_THRESHOLD; ++i) Connect(in_window, End::MALFORMED);
+    BOOST_REQUIRE(Fallback(in_window));
+    for (int i{1}; i < int{PQ_MAX_ENDPOINT_HISTORY}; ++i) Connect(TestEndpoint(8, i), End::MALFORMED);
+    // A new endpoint evicts the oldest insertion outside a window, and the window stays.
+    Connect(TestEndpoint(8, int{PQ_MAX_ENDPOINT_HISTORY}), End::MALFORMED);
+    BOOST_CHECK(m_connman.IsPQFallback(in_window, Now<NodeSeconds>()));
+    BOOST_CHECK(Fallback(in_window));
+    BOOST_CHECK(!Streak(TestEndpoint(8, 1)));
+    BOOST_CHECK(Streak(TestEndpoint(8, 2)));
+    BOOST_CHECK(Streak(TestEndpoint(8, int{PQ_MAX_ENDPOINT_HISTORY})));
+}
+
+BOOST_AUTO_TEST_CASE(pq_history_eviction_all_in_fallback)
+{
+    // The oldest insertion fails once now and enters its window last, so it ends last.
+    const PQEndpointKey oldest{TestEndpoint(9, 0)};
+    Connect(oldest, End::MALFORMED);
+    for (int i{1}; i < int{PQ_MAX_ENDPOINT_HISTORY}; ++i) {
+        for (uint32_t n{0}; n < PQ_FAILURE_THRESHOLD; ++n) Connect(TestEndpoint(9, i), End::MALFORMED);
+    }
+    SetMockTime(GetTime<std::chrono::seconds>() + 600s);
+    for (uint32_t n{1}; n < PQ_FAILURE_THRESHOLD; ++n) Connect(oldest, End::MALFORMED);
+    BOOST_REQUIRE(Fallback(oldest));
+    BOOST_REQUIRE_EQUAL(Stats().fallback_set.size(), PQ_MAX_ENDPOINT_HISTORY);
+    // With every endpoint in a window, the window that ends first goes; of those that end
+    // together, the oldest insertion.
+    Connect(TestEndpoint(9, int{PQ_MAX_ENDPOINT_HISTORY}), End::MALFORMED);
+    BOOST_CHECK(Fallback(oldest));
+    BOOST_CHECK(!Fallback(TestEndpoint(9, 1)));
+    BOOST_CHECK(!m_connman.IsPQFallback(TestEndpoint(9, 1), Now<NodeSeconds>()));
+    BOOST_CHECK(Fallback(TestEndpoint(9, 2)));
+    BOOST_CHECK(Streak(TestEndpoint(9, int{PQ_MAX_ENDPOINT_HISTORY})));
+}
+
 namespace {
 /** The warning names the backends that ran, and no remedy: no option forces portable code yet. */
 std::string LocalFaultLine()

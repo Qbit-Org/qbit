@@ -884,7 +884,8 @@ inline constexpr uint32_t PQ_FAILURE_THRESHOLD{3};
 /** An endpoint's fallback windows: its first entry, its second, then every later one. */
 inline constexpr std::array<std::chrono::seconds, 3> PQ_FALLBACK_WINDOWS{
     std::chrono::seconds{3600}, std::chrono::seconds{14400}, std::chrono::seconds{86400}};
-/** At most this many endpoints in the fallback, streak and escalation history. */
+/** At most this many endpoints in the fallback, streak and escalation history. Eviction spares
+ *  endpoints in an active fallback window while any other is left. */
 inline constexpr size_t PQ_MAX_ENDPOINT_HISTORY{1000};
 /** Distinct endpoints with counted failures, and no success since startup, that suggest a local fault. */
 inline constexpr size_t PQ_LOCAL_FAULT_THRESHOLD{8};
@@ -917,7 +918,7 @@ struct PQEndpointHistory {
     PQOutcome cause{PQOutcome::MALFORMED_RECORD};
     //! Assigned only from the fixed reason vocabulary.
     std::string reason{};
-    //! The oldest insertion is evicted first; unique, so equal times can't tie.
+    //! Outside fallback windows, the oldest insertion is evicted first; unique, so equal times can't tie.
     uint64_t insertion_order{0};
 };
 

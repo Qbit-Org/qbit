@@ -45,6 +45,7 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <tuple>
 #include <unordered_map>
 
 TRACEPOINT_SEMAPHORE(net, closed_connection);
@@ -2485,7 +2486,13 @@ std::optional<NodeSeconds> CConnman::CountPQFailure(const CNode& node, PQOutcome
     auto it{m_pq_history.find(endpoint)};
     if (it == m_pq_history.end()) {
         if (m_pq_history.size() >= PQ_MAX_ENDPOINT_HISTORY) {
-            m_pq_history.erase(std::ranges::min_element(m_pq_history, {}, [](const auto& entry) { return entry.second.insertion_order; }));
+            // Spare active fallback windows: evict the oldest insertion outside one, and only when
+            // every endpoint is in one, the window that ends first.
+            m_pq_history.erase(std::ranges::min_element(m_pq_history, {}, [now](const auto& entry) {
+                const PQEndpointHistory& history{entry.second};
+                const bool active{history.expires && now < *history.expires};
+                return std::tuple{active, active ? *history.expires : NodeSeconds{}, history.insertion_order};
+            }));
         }
         it = m_pq_history.emplace(endpoint, PQEndpointHistory{.insertion_order = m_pq_history_insertions++}).first;
     }
