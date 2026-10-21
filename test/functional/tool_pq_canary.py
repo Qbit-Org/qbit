@@ -14,6 +14,7 @@ evidence that does not cover the canary.
 import csv
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -31,8 +32,10 @@ PQ_COLUMNS = ["pq_enabled", "instance_id", "arith_backend", "keccak_backend", "s
 
 class PQCanaryToolTest(BitcoinTestFramework):
     def set_test_params(self):
-        v1_0_0_bin = Path(self.options.previous_releases_path) / release_info(V1_0_0).tag / "bin"
-        self.with_v1_0_0 = self.options.prev_releases and v1_0_0_bin.is_dir()
+        # A partial download can leave v1.0.0/bin without qbitd or qbit-cli.
+        release = release_info(V1_0_0)
+        binaries = self.get_binaries(os.path.join(self.options.previous_releases_path, release.tag, "bin"), release.binary_prefix)
+        self.with_v1_0_0 = self.options.prev_releases and all(shutil.which(argv[0]) is not None for argv in (binaries.node_argv(), binaries.rpc_argv()))
         self.num_nodes = 2 if self.with_v1_0_0 else 1
         self.setup_clean_chain = True
 
