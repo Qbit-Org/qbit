@@ -152,11 +152,22 @@ bash -c "cmake -S $BASE_ROOT_DIR -B ${BASE_BUILD_DIR} $BITCOIN_CONFIG_ALL $BITCO
   false
 )
 
+# CI_BUILD_TARGET narrows the build to the named target(s), e.g. test_bitcoin
+# for a job that only runs unit tests. GOAL's install and deploy targets need
+# the whole build, so they apply only when everything is built.
+CI_BUILD_TARGET=${CI_BUILD_TARGET:-all}
+if [ "${CI_BUILD_TARGET}" = "all" ]; then
+  BUILD_TARGETS="all ${GOAL}"
+else
+  BUILD_TARGETS="${CI_BUILD_TARGET}"
+fi
+echo "Building target(s): ${BUILD_TARGETS}"
+
 # shellcheck disable=SC2086
-cmake --build "${BASE_BUILD_DIR}" "$MAKEJOBS" --target all $GOAL || (
+cmake --build "${BASE_BUILD_DIR}" "$MAKEJOBS" --target ${BUILD_TARGETS} || (
   echo "Build failure. Verbose build follows."
   # shellcheck disable=SC2086
-  cmake --build "${BASE_BUILD_DIR}" -j1 --target all $GOAL --verbose
+  cmake --build "${BASE_BUILD_DIR}" -j1 --target ${BUILD_TARGETS} --verbose
   false
 )
 
@@ -218,19 +229,47 @@ if [ "$RUN_CHECK_DEPS" = "true" ]; then
 fi
 
 if [ "$RUN_UNIT_TESTS" = "true" ]; then
+  # Select tests by ordinal range (CTEST_INCLUDE_RANGE, for shards) or by name
+  # (CTEST_REGEX), never both.
+  if [ -n "${CTEST_INCLUDE_RANGE}" ] && [ -n "${CTEST_REGEX}" ]; then
+    echo "Error: CTEST_INCLUDE_RANGE and CTEST_REGEX are both set; set only one." >&2
+    exit 1
+  fi
   CTEST_ARGS=()
   if [ -n "${CTEST_INCLUDE_RANGE}" ]; then
     CTEST_ARGS+=(-I "${CTEST_INCLUDE_RANGE}")
   fi
+  if [ -n "${CTEST_REGEX}" ]; then
+    CTEST_ARGS+=(-R "${CTEST_REGEX}")
+  fi
+
+  # List the selected tests before running them, with the same arguments.
+  CTEST_EVIDENCE_DIR="${BASE_BUILD_DIR}/ctest-evidence"
+  rm -rf "${CTEST_EVIDENCE_DIR}"
+  mkdir -p "${CTEST_EVIDENCE_DIR}"
+  ctest --test-dir "${BASE_BUILD_DIR}" --show-only=json-v1 "${CTEST_ARGS[@]}" > "${CTEST_EVIDENCE_DIR}/selected.json"
+  ctest --test-dir "${BASE_BUILD_DIR}" --show-only "${CTEST_ARGS[@]}"
 
   DIR_UNIT_TEST_DATA="${DIR_UNIT_TEST_DATA}" \
   LD_LIBRARY_PATH="${DEPENDS_DIR}/${HOST}/lib" \
   CTEST_OUTPUT_ON_FAILURE=ON \
   ctest --test-dir "${BASE_BUILD_DIR}" \
     --stop-on-failure \
+    --no-tests=error \
+    --output-junit "${CTEST_EVIDENCE_DIR}/junit.xml" \
     -j "${CTEST_JOBS}" \
     --timeout $(( TEST_RUNNER_TIMEOUT_FACTOR * 60 )) \
     "${CTEST_ARGS[@]}"
+
+  # ctest passes a skipped test, so a job that names its suites checks that
+  # each one was selected, executed and passed.
+  if [ -n "${CTEST_EXPECTED_SUITES}" ]; then
+    python3 "${BASE_ROOT_DIR}/ci/checks/ctest_evidence.py" \
+      --expected "${CTEST_EXPECTED_SUITES}" \
+      --listing "${CTEST_EVIDENCE_DIR}/selected.json" \
+      --junit "${CTEST_EVIDENCE_DIR}/junit.xml" \
+      --summary "${CTEST_EVIDENCE_DIR}/summary.md"
+  fi
 fi
 
 # Build qbit-photon relay daemon for integration tests.
