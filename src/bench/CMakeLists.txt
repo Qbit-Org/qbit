@@ -57,6 +57,7 @@ add_executable(bench_bitcoin
   txgraph.cpp
   txorphanage.cpp
   util_time.cpp
+  v2_transport.cpp
   verify_script.cpp
 )
 set_target_properties(bench_bitcoin PROPERTIES OUTPUT_NAME bench_qbit)
