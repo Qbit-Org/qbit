@@ -67,6 +67,7 @@ import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Iterable, TypeGuard
 
@@ -75,7 +76,7 @@ import pq_canary  # noqa: E402
 
 PASS, FAIL, UNKNOWN = "pass", "fail", "unknown"
 PINNED_THRESHOLD = 0.99
-CONNECTIONS_TOLERANCE = 0.20
+CONNECTIONS_TOLERANCE = Fraction(1, 5)
 CONNECTIONS_RESTART_EXCLUSION = 48 * 3600
 DEFAULT_MIN_COVERAGE = 0.90
 RESTART_TOLERANCE = 120  # seconds of boot-time jitter that is not a restart
@@ -701,7 +702,7 @@ def evaluate_failures(records: list[dict[str, Any]] | None, known_good: KnownGoo
 
 
 def evaluate_connections(archive: list[Row] | None, control: list[Row] | None,
-                         canary_start: int, window: Window, interval: int, baseline_ratio: float | None,
+                         canary_start: int, window: Window, interval: int, baseline_ratio: Fraction | None,
                          min_coverage: float) -> Figure:
     """Daily archive/control connections_in ratios, relative to the baseline ratio.
 
@@ -767,10 +768,10 @@ def evaluate_connections(archive: list[Row] | None, control: list[Row] | None,
             if total == 0:
                 return Figure(name, UNKNOWN, 0, None,
                               f"no baseline: {node} connections_in summed to 0 over {baseline[2]} valid pre-canary pairs")
-        baseline_ratio = baseline[0] / baseline[1]
-        baseline_text = f"baseline_ratio={baseline_ratio:.3f} baseline_pairs={baseline[2]}"
+        baseline_ratio = Fraction(baseline[0], baseline[1])
+        baseline_text = f"baseline_ratio={float(baseline_ratio):.3f} baseline_pairs={baseline[2]}"
     else:
-        baseline_text = f"baseline_ratio={baseline_ratio:.3f} (given)"
+        baseline_text = f"baseline_ratio={float(baseline_ratio):.3f} (given)"
     details = []
     results = []
     pairs = judged_expected = 0
@@ -793,10 +794,12 @@ def evaluate_connections(archive: list[Row] | None, control: list[Row] | None,
             details.append(f"{label} unknown: {counts_text}")
             results.append(UNKNOWN)
             continue
-        relative = (day["archive"] / day["control"]) / baseline_ratio
+        # Exact, so a day exactly 20% off passes: in floats, 24/10 against a
+        # baseline of 3 is 0.7999999999999999.
+        relative = Fraction(day["archive"], day["control"]) / baseline_ratio
         state = PASS if abs(relative - 1) <= CONNECTIONS_TOLERANCE else FAIL
         results.append(state)
-        details.append(f"{label} {state}: relative={relative:.3f} {counts_text}")
+        details.append(f"{label} {state}: relative={float(relative):.3f} {counts_text}")
     if FAIL in results:
         result = FAIL
     elif UNKNOWN in results or PASS not in results:
@@ -848,12 +851,14 @@ def share_arg(text: str) -> float:
     return value
 
 
-def ratio_arg(text: str) -> float:
+def ratio_arg(text: str) -> Fraction:
+    """The ratio as written, exactly: 1.2 is 6/5, not the float nearest it."""
     try:
-        value = float(text)
+        # float() rejects nan and infinity, and keeps the exponent within its range.
+        value = Fraction(text) if 0 < float(text) < float("inf") else Fraction(0)
     except ValueError:
-        value = -1.0
-    if not 0 < value < float("inf"):
+        value = Fraction(0)
+    if value <= 0:
         raise argparse.ArgumentTypeError(f"expected a positive ratio, got {text!r}")
     return value
 

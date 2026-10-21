@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -1015,7 +1016,7 @@ class ConnectionsTest(unittest.TestCase):
         end = T0 + (self.CANARY_DAYS * per_day - 1) * INTERVAL
         return archive_rows, control_rows, pq_eval.Window(T0, end)
 
-    def evaluate(self, archive_rows: Any, control_rows: Any, win: Any, baseline_ratio: float | None = None,
+    def evaluate(self, archive_rows: Any, control_rows: Any, win: Any, baseline_ratio: Fraction | None = None,
                  min_coverage: float = 0.9) -> Any:
         return pq_eval.evaluate_connections(archive_rows, control_rows, T0, win, INTERVAL, baseline_ratio, min_coverage)
 
@@ -1030,6 +1031,19 @@ class ConnectionsTest(unittest.TestCase):
         figure = self.evaluate(*self.series(lambda i: 36 if i < 288 else 25, lambda i: 30))
         self.assertEqual(figure.result, "fail")
         self.assertTrue(any(" fail: relative=0.694" in line for line in figure.details))
+
+    def test_tolerance_is_inclusive(self) -> None:
+        # Exactly 20% off the baseline ratio passes. In floats, 24/10 against a
+        # baseline of 3 is 0.7999999999999999, and 108/10 against 9 is 1.2000000000000002.
+        for baseline_in, canary_in, result in ((30, 24, "pass"), (30, 23, "fail"), (90, 108, "pass"), (90, 109, "fail")):
+            with self.subTest(baseline_in=baseline_in, canary_in=canary_in):
+                figure = self.evaluate(*self.series(lambda i, b=baseline_in, c=canary_in: b if i < 0 else c, lambda i: 10))
+                self.assertEqual(figure.result, result, figure.details)
+        # A given ratio is read exactly too: the float nearest 1.2 is below it,
+        # which would put 36/25 against it just outside 20%.
+        self.assertEqual(pq_eval.ratio_arg("1.2"), Fraction(6, 5))
+        archive_rows, control_rows, win = self.series(lambda i: 36, lambda i: 25)
+        self.assertEqual(self.evaluate(archive_rows, control_rows, win, baseline_ratio=pq_eval.ratio_arg("1.2")).result, "pass")
 
     def test_48_hours_after_a_restart_are_excluded(self) -> None:
         # Inbound connections recover slowly after the restart at the canary start.
@@ -1049,7 +1063,7 @@ class ConnectionsTest(unittest.TestCase):
         archive_rows, control_rows, win = self.series(lambda i: 36, lambda i: 30)
         canary_only = ([row for row in archive_rows if int(row["time"]) >= T0], [row for row in control_rows if int(row["time"]) >= T0])
         self.assertEqual(self.evaluate(*canary_only, win).result, "unknown")
-        self.assertEqual(self.evaluate(*canary_only, win, baseline_ratio=1.2).result, "pass")
+        self.assertEqual(self.evaluate(*canary_only, win, baseline_ratio=Fraction(6, 5)).result, "pass")
         self.assertEqual(pq_eval.evaluate_connections(archive_rows, None, T0, win, INTERVAL, None, 0.9).result, "unknown")
 
     def test_zero_baseline_is_unknown(self) -> None:
@@ -1067,7 +1081,7 @@ class ConnectionsTest(unittest.TestCase):
                 self.assertEqual(figure.summary, f"no baseline: {node} connections_in summed to 0 over {pairs} valid pre-canary pairs")
                 self.assertEqual((figure.samples, figure.coverage), (0, None))
                 # A given ratio still judges the canary days.
-                self.assertEqual(self.evaluate(archive_rows, control_rows, win, baseline_ratio=1.2).result, "pass")
+                self.assertEqual(self.evaluate(archive_rows, control_rows, win, baseline_ratio=Fraction(6, 5)).result, "pass")
 
     def test_malformed_numbers_are_missing(self) -> None:
         # Day 0 holds the baseline ratio; the archive then loses a third of its connections.
