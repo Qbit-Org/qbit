@@ -6,12 +6,13 @@
 
 - test_quickstart: the guide's three quick-start steps run as written, in one bash shell, with this
   build's qbitd and qbit-cli first on PATH. Only the data directory and the four ports are replaced,
-  by the framework's. Each step must print what the guide shows, where numbers, dates and the
-  ML-KEM-1024 backend names may differ, and nothing on stderr. The two nodes are stopped and their
-  data removed even when a step fails.
-- test_switch: the qbit.conf line the guide gives switches the feature on, as the startup line and
-  getpqtransportinfo show, and -nov2pqtransport on the command line overrides it; the startup
-  warnings the guide shows are what qbitd prints.
+  by the framework's. The steps don't set -v2pqtransport, so they show the default. Each step must
+  print what the guide shows, where numbers, dates and the ML-KEM-1024 backend names may differ,
+  and nothing on stderr. The two nodes are stopped and their data removed even when a step fails.
+- test_switch: the feature is on by default, the qbit.conf line the guide gives switches it off, as
+  the startup line and getpqtransportinfo show, and -v2pqtransport=1 on the command line overrides
+  it, as -nov2pqtransport does the default; the startup warnings the guide shows are what qbitd
+  prints.
 - test_doc_tokens: the interface names the PQ transport docs quote exist, with options checked
   against this build's -help and -help-debug output (test/lint/lint-pq-doc-tokens.py).
 """
@@ -99,6 +100,7 @@ class PQQuickstartTest(BitcoinTestFramework):
         assert_equal(sorted(blocks), sorted(STEPS + tuple(f"{step} output" for step in STEPS)))
         datadir = Path(self.options.tmpdir) / "qbit-pq-quickstart"
         steps = "\n".join(f"echo {SENTINEL.format(step)}\n{blocks[step]}" for step in STEPS)
+        assert "v2pqtransport" not in steps, "the quick start shows the default: it sets no -v2pqtransport"
         assert_equal(steps.count(GUIDE_DATADIR_LINE), 1)
         steps = steps.replace(GUIDE_DATADIR_LINE, f"Q={shlex.quote(str(datadir))}")
         ports = {}
@@ -167,18 +169,29 @@ class PQQuickstartTest(BitcoinTestFramework):
         node = self.nodes[0]
         guide = self.guide()
 
-        self.log.info("Test the qbit.conf line the guide gives switches the feature on")
-        conf = re.search(r"```ini\n(.*?)\n```", guide, re.DOTALL).group(1)
-        assert_equal(conf, "v2pqtransport=1")
-        append_config(node.datadir_path, [conf])
+        self.log.info("Test the feature is on by default")
         self.start_node(0)
         assert_equal(self.startup_state(node), "enabled")
         assert_equal(node.getpqtransportinfo()["status"], "enabled")
 
-        self.log.info("Test -nov2pqtransport on the command line overrides it")
+        self.log.info("Test -nov2pqtransport on the command line switches it off")
         self.restart_node(0, extra_args=["-v2transport=1", "-nov2pqtransport"])
         assert_equal(self.startup_state(node), "disabled (-v2pqtransport=0)")
         assert_equal(node.getpqtransportinfo()["status"], "disabled_v2pqtransport")
+        self.stop_node(0)
+
+        self.log.info("Test the qbit.conf line the guide gives switches it off")
+        conf = re.search(r"```ini\n(.*?)\n```", guide, re.DOTALL).group(1)
+        assert_equal(conf, "v2pqtransport=0")
+        append_config(node.datadir_path, [conf])
+        self.start_node(0)
+        assert_equal(self.startup_state(node), "disabled (-v2pqtransport=0)")
+        assert_equal(node.getpqtransportinfo()["status"], "disabled_v2pqtransport")
+
+        self.log.info("Test -v2pqtransport=1 on the command line overrides it")
+        self.restart_node(0, extra_args=["-v2transport=1", "-v2pqtransport=1"])
+        assert_equal(self.startup_state(node), "enabled")
+        assert_equal(node.getpqtransportinfo()["status"], "enabled")
         self.stop_node(0)
         node.replace_in_config([(f"{conf}\n", "")])
 

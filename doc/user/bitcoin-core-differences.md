@@ -12,7 +12,7 @@ qbit is based on Bitcoin Core v30.2, but it is not a Bitcoin network with differ
 - qbit uses ASERT difficulty adjustment and Cadence mining lanes instead of Bitcoin's 2016-block retarget.
 - qbit keeps full witness history by default. Witness pruning is an explicit opt-in mode.
 - Some RPC names are inherited, but several have qbit-specific behavior. qbit also adds new RPCs for AuxPoW, archive peers, orphan metrics, confirmation targets, P2MR watch-only workflows, and hybrid post-quantum v2 transport.
-- qbit's v2 P2P transport can add an ML-KEM-1024 key exchange to BIP324 (`-v2pqtransport=1`, off by default in this release); peers without it, qbit v1.0.0 included, keep plain v2. See [Hybrid post-quantum v2 transport](network/pq-transport.md).
+- qbit's v2 P2P transport adds an ML-KEM-1024 key exchange to BIP324 (`-v2pqtransport`, on by default in this release; `-v2pqtransport=0` switches it off); peers without it, qbit v1.0.0 included, keep plain v2. See [Hybrid post-quantum v2 transport](network/pq-transport.md).
 - Bitcoin Lightning is not a drop-in port. A qbit channel network would need new protocol work.
 
 ## Network Identity
@@ -42,12 +42,13 @@ The payment URI scheme is `qbit:`. qbit deliberately rejects `bitcoin:`, `bitcoi
 
 ## P2P Transport
 
-qbit uses the BIP324 v2 transport by default, as Bitcoin Core does, and can add
-a post-quantum key exchange to it: with `-v2pqtransport=1` on both nodes, a v2
-connection mixes an ML-KEM-1024 secret into its session keys, so that recorded
-traffic stays confidential unless both ECDH and ML-KEM-1024 are broken. It is
-off by default in this release. Peers without it, qbit v1.0.0 included, keep
-today's v2 keys; it does not authenticate peers. `getpeerinfo` reports
+qbit uses the BIP324 v2 transport by default, as Bitcoin Core does, and adds
+a post-quantum key exchange to it: when both nodes have `-v2pqtransport` on, a
+v2 connection mixes an ML-KEM-1024 secret into its session keys, so that
+recorded traffic stays confidential unless both ECDH and ML-KEM-1024 are
+broken. It is on by default in this release, and `-v2pqtransport=0` switches
+it off. Peers without it, qbit v1.0.0 included, keep today's v2 keys; it does
+not authenticate peers. `getpeerinfo` reports
 `transport_pq` and `transport_pq_status`, `getnetworkinfo` reports
 `connections_pq`, `qbit-cli -netinfo` marks hybrid peers `2p`, and the new
 `getpqtransportinfo` RPC reports the rest. See

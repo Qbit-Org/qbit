@@ -5,12 +5,14 @@
 
 qbit nodes can add a post-quantum key exchange, ML-KEM-1024, to the encrypted
 v2 P2P transport. This guide shows how to try it on your own machine, switch it
-on for a real node, check that it works and troubleshoot it. The wire format is
-specified in [Hybrid post-quantum v2 transport](../../design/pq-transport.md),
-and the [release note](../../release-notes-240.md) summarizes the change.
+off or on for a real node, check that it works and troubleshoot it. The wire
+format is specified in
+[Hybrid post-quantum v2 transport](../../design/pq-transport.md), and the
+[release note](../../release-notes-240.md) summarizes the change.
 
-In this release the feature is **off by default**. Switch it on with
-<!--pq:opt-->`-v2pqtransport=1`.
+In this release the feature is **on by default**: a node with v2 transport,
+also on by default, uses hybrid keys with every upgraded peer that has it on
+too. Switch it off with <!--pq:opt-->`-v2pqtransport=0`.
 
 ## BIP324 in Two Lines
 
@@ -35,10 +37,11 @@ or macOS shell (on Windows, use WSL). Run the three steps in the same terminal.
 The nodes listen on 127.0.0.1 ports 18501 and 18511 and answer RPC on 18502 and
 18512; if one of those is taken, change it everywhere it appears.
 
-Using qbit-qt? Open **Settings → Options → Open Configuration File** (on macOS,
-Options is in the application menu), add the line `v2pqtransport=1`, save, and
-restart qbit-qt. Then type `getpqtransportinfo` in **Window → Console**, and
-see [Verify](#verify).
+Using qbit-qt? The feature is on there too: type `getpqtransportinfo` in
+**Window → Console**, and see [Verify](#verify). To change the setting, open
+**Settings → Options → Open Configuration File** (on macOS, Options is in the
+application menu), add a line as shown in
+[Switch It On or Off](#switch-it-on-or-off), save, and restart qbit-qt.
 
 ### Step 1: start two nodes
 
@@ -46,16 +49,17 @@ see [Verify](#verify).
 ```sh
 Q=~/qbit-pq-quickstart
 mkdir -p "$Q/a" "$Q/b"
-qbitd -regtest -datadir="$Q/a" -bind=127.0.0.1:18501 -rpcport=18502 -v2pqtransport=1 -daemon
-qbitd -regtest -datadir="$Q/b" -bind=127.0.0.1:18511 -rpcport=18512 -v2pqtransport=1 -daemon
+qbitd -regtest -datadir="$Q/a" -bind=127.0.0.1:18501 -rpcport=18502 -daemon
+qbitd -regtest -datadir="$Q/b" -bind=127.0.0.1:18511 -rpcport=18512 -daemon
 a() { qbit-cli -regtest -datadir="$Q/a" -rpcport=18502 -rpcwait -rpcwaittimeout=60 "$@"; }
 b() { qbit-cli -regtest -datadir="$Q/b" -rpcport=18512 -rpcwait -rpcwaittimeout=60 "$@"; }
 a getpqtransportinfo | grep '"status"'
 b getpqtransportinfo | grep '"status"'
 ```
 
-`a` and `b` are shorthands for asking each node; they wait up to 60 seconds for
-it to answer. You should see:
+The nodes start with the feature on, the default, so no option is needed. `a`
+and `b` are shorthands for asking each node; they wait up to 60 seconds for it
+to answer. You should see:
 
 <!-- quickstart: step 1 output -->
 ```text
@@ -115,22 +119,26 @@ qbit stopping
 
 ## Switch It On or Off
 
-Add this line to `qbit.conf` and restart the node:
+The feature is on by default. To switch it off, add this line to `qbit.conf`
+and restart the node:
 
 ```ini
-v2pqtransport=1
+v2pqtransport=0
 ```
 
-A <!--pq:opt-->`-v2pqtransport` given on the command line overrides
-`qbit.conf`. The setting is read once, at startup, and has no effect when
-<!--pq:opt-->`-v2transport` is 0; v2 transport is on by default. To switch the
-feature off, set `v2pqtransport=0` or delete the line, and restart.
+To switch it back on, delete the line, or set `v2pqtransport=1` to say so
+explicitly, and restart. On the command line, `-v2pqtransport=0` (or
+<!--pq:opt-->`-nov2pqtransport`) switches it off and
+<!--pq:opt-->`-v2pqtransport=1` on, and either overrides `qbit.conf`. The
+setting is read once, at startup, and has no effect when
+<!--pq:opt-->`-v2transport` is 0; v2 transport is on by default.
 
 The value must be a number. `v2pqtransport=true` (or `yes`, or `on`) is read as
-0, which leaves the feature off, and a double negative such as
-<!--pq:opt-->`-nov2pqtransport=0` is read as 1. In both cases, and when it has
-no effect because v2 transport is off, the node warns at startup and says what
-it did:
+0, which switches the feature off, and a double negative such as
+<!--pq:opt-->`-nov2pqtransport=0` is read as 1, which leaves it on. In both
+cases, and when `-v2pqtransport=1` has no effect because v2 transport is off,
+the node warns at startup and says what it did; the default and
+`-v2pqtransport=0` never warn:
 
 ```text
 Warning: -v2pqtransport=true is not a number and was read as -v2pqtransport=0: hybrid transport is OFF. Use -v2pqtransport=1 or -v2pqtransport=0.
@@ -198,10 +206,10 @@ two operators can compare out of band.
 <!--pq:field-->`connections_pq`, the number of peers whose `transport_pq` is
 true.
 
-With the feature off, `enabled` is false, every counter stays 0, v2 peers show
-`off` and `connections_pq` is 0. With it on but no upgraded peers, the
-`legacy_peer` counters grow and `connections_pq` stays 0, which is expected
-while the network upgrades.
+With the feature on, the default, but no upgraded peers yet, the `legacy_peer`
+counters grow and `connections_pq` stays 0, which is expected while the network
+upgrades. With it switched off, `enabled` is false, every counter stays 0, v2
+peers show `off` and `connections_pq` is 0.
 
 ## Fallback and Load Shedding
 
@@ -245,7 +253,7 @@ It does not:
   end. A spy peer sees everything you send it, and an active man-in-the-middle
   can still relay two separate sessions, each of which may be hybrid. Comparing
   `session_id` out of band detects that.
-- **Protect traffic to v1.0.0 nodes,** or to any peer without the feature on:
+- **Protect traffic to v1.0.0 nodes,** or to any peer that has the feature off:
   those connections use ECDH keys (v2) or no encryption (v1), as before. The
   fallback, load shedding and local faults also leave some connections on ECDH
   keys; `transport_pq` reports which.
@@ -287,8 +295,8 @@ details such as `role=`, `peer=` and the ML-KEM-1024 backends; counters are in
 
 | Log line or counter | Meaning | Likely causes | What to do |
 |---|---|---|---|
-| The startup line says `disabled (-v2pqtransport=0)` | The feature is off. | Not set; set to `true`, which reads as 0; set under another network's section of `qbit.conf`; `-nov2pqtransport` on the command line. | Set `v2pqtransport=1`, restart, and read the startup warnings. |
-| The startup line says `disabled (-v2transport=0)` | v2 transport is off, so hybrid keys can't be used. | `-v2transport=0`. | Remove it. With `-v2pqtransport=1` also set, the node warned <!--pq:log-->`has no effect because -v2transport=0`. |
+| The startup line says `disabled (-v2pqtransport=0)` | The feature is off. | `v2pqtransport=0` in `qbit.conf`; set to `true`, which reads as 0; `-v2pqtransport=0` or `-nov2pqtransport` on the command line. | Delete the setting or set `v2pqtransport=1`, restart, and read the startup warnings. |
+| The startup line says `disabled (-v2transport=0)` | v2 transport is off, so hybrid keys can't be used. | `-v2transport=0`. | Remove it. Only with `-v2pqtransport=1` also set did the node warn <!--pq:log-->`has no effect because -v2transport=0`. |
 | <!--pq:log-->`is not a number and was read as` | A non-numeric value, such as `true`, was read as 0 or 1. | `true`, `yes`, `on` or a typo. | Use 1 or 0. |
 | <!--pq:log-->`was given 0 or a non-numeric value, so it was read as` | A double negative switched the feature on. | `-nov2pqtransport=0` or `nov2pqtransport=true`. | Use `v2pqtransport=0` to switch it off. |
 | <!--pq:field-->`legacy_peer` (counter and status) | The peer sent no hybrid offer or accept (reason <!--pq:value-->`no_features`), or contents qbit can't parse (<!--pq:value-->`parse_error`). | The peer runs v1.0.0 or has the feature off. `parse_error`: another implementation or a bug. | Nothing for `no_features`; it is normal while the network upgrades. `parse_error` from many peers: open an issue. |
@@ -318,23 +326,31 @@ keys are not what `transport_pq` reports.
 
 ## Upgrading and Rolling Back
 
-- **Upgrading.** With the feature off, the default in this release, an upgraded
-  node behaves on the wire as v1.0.0 does; it gains the RPC fields and the
-  startup line. Switch it on as described [above](#switch-it-on-or-off) and
-  check `getpqtransportinfo`.
+- **Upgrading.** An upgrade switches the feature on: with v2 transport on, also
+  the default, the upgraded node offers and accepts hybrid keys on new v2
+  connections, and keeps the ECDH keys with peers that don't have it. It also
+  gains the RPC fields and the startup line. Check `getpqtransportinfo` after
+  the upgrade.
+- **Upgrading with the feature off.** Before upgrading, add `v2pqtransport=0`
+  to `qbit.conf`. v1.0.0 ignores the line, logging
+  `Ignoring unknown configuration value v2pqtransport`, so it can be added
+  while the node still runs v1.0.0, and the upgraded node starts with the
+  feature off. Don't put `-v2pqtransport=0` on v1.0.0's command line: it
+  refuses to start (see below). Add it to command lines only after the upgrade.
 - **Mixed versions.** Peers running v1.0.0 keep connecting in both directions:
-  over v2 they show `legacy_peer` (with the feature on) or `off` (with it off),
-  and over v1 `v1`. Between two upgraded nodes, the connection is hybrid only
-  when both have the feature on; otherwise the side that has it on shows
-  `legacy_peer`.
+  over v2 they show `legacy_peer` (with the feature on, the default) or `off`
+  (with it switched off), and over v1 `v1`. Between two upgraded nodes, the
+  connection is hybrid unless one of them switched the feature off; the side
+  that has it on then shows `legacy_peer`.
 - **Nothing persists.** The counters, failure history and fallback set live in
   memory and start over at every restart. The feature changes no file in the
   data directory.
-- **Rolling back to v1.0.0.** v1.0.0 doesn't know the option. It ignores
+- **Rolling back to v1.0.0.** If you never set the option, there is nothing to
+  remove. v1.0.0 doesn't know it: it ignores `v2pqtransport=0` or
   `v2pqtransport=1` in `qbit.conf`, logging
   `Ignoring unknown configuration value v2pqtransport`, but refuses to start
-  with it on the command line:
-  `Error: Error parsing command line arguments: Invalid parameter -v2pqtransport=1`.
+  with any form of it on the command line, `-nov2pqtransport` included:
+  `Error: Error parsing command line arguments: Invalid parameter -v2pqtransport=0`.
   Remove it from command lines, service files and scripts before downgrading.
 - **The escape hatch.** If the native ML-KEM-1024 code misbehaves on your CPU,
   for example with `local_fault` in the log, restart with
