@@ -38,6 +38,24 @@ set from that mapping file:
 $ ctest --test-dir build_fuzz -R '^required_fuzz_targets$' --output-on-failure
 ```
 
+## qbit hybrid v2 transport targets
+
+These targets cover the [hybrid post-quantum v2 transport](../design/pq-transport.md):
+
+| Target | What it checks |
+|---|---|
+| `pq_records` | The version-contents record parser, against an independent reading of the grammar. |
+| `mlkem` | ML-KEM-1024 round trips, the encapsulation key check, implicit rejection and the decapsulation key check. |
+| `mlkem_backend_diff` | That the detected ML-KEM-1024 backend and portable C agree on every status and output. |
+| `bip324_cipher_roundtrip` | The switch to hybrid keys, mismatched transcripts, damaged packets and rekeys. |
+| `p2p_transport_bidirectional_v2` | Two V2 transports, each with or without the hybrid negotiation: the keys are hybrid exactly when both negotiate. |
+| `p2p_transport_bidirectional_v1v2` | A v1 initiator against a V2 responder, with or without the negotiation. |
+| `p2p_v2_pq_malicious_peer` | A peer that completes ECDH honestly and then chooses the negotiation, packet boundaries and timing, against the transport's invariants: when it may call ML-KEM, that its secrets are wiped, and that only a verified confirmation makes a connection hybrid. |
+
+```sh
+$ FUZZ=p2p_v2_pq_malicious_peer build_fuzz/bin/fuzz
+```
+
 ## qbit seed corpora
 
 `qa-assets` has no inputs for `asert_chain_transition`, `asert_edge_cases`,

@@ -11,7 +11,8 @@ qbit is based on Bitcoin Core v30.2, but it is not a Bitcoin network with differ
 - qbit has no witness discount. A 3,680-byte PQC signature counts at full weight.
 - qbit uses ASERT difficulty adjustment and Cadence mining lanes instead of Bitcoin's 2016-block retarget.
 - qbit keeps full witness history by default. Witness pruning is an explicit opt-in mode.
-- Some RPC names are inherited, but several have qbit-specific behavior. qbit also adds new RPCs for AuxPoW, archive peers, orphan metrics, confirmation targets, and P2MR watch-only workflows.
+- Some RPC names are inherited, but several have qbit-specific behavior. qbit also adds new RPCs for AuxPoW, archive peers, orphan metrics, confirmation targets, P2MR watch-only workflows, and hybrid post-quantum v2 transport.
+- qbit's v2 P2P transport can add an ML-KEM-1024 key exchange to BIP324 (`-v2pqtransport=1`, off by default in this release); peers without it, qbit v1.0.0 included, keep plain v2. See [Hybrid post-quantum v2 transport](network/pq-transport.md).
 - Bitcoin Lightning is not a drop-in port. A qbit channel network would need new protocol work.
 
 ## Network Identity
@@ -38,6 +39,19 @@ Only qbit-published artifacts, tags, release notes, seed resources, and
 qbit.org announcements define official qbit networks.
 
 The payment URI scheme is `qbit:`. qbit deliberately rejects `bitcoin:`, `bitcoin://`, and `qbit://` payment URI variants.
+
+## P2P Transport
+
+qbit uses the BIP324 v2 transport by default, as Bitcoin Core does, and can add
+a post-quantum key exchange to it: with `-v2pqtransport=1` on both nodes, a v2
+connection mixes an ML-KEM-1024 secret into its session keys, so that recorded
+traffic stays confidential unless both ECDH and ML-KEM-1024 are broken. It is
+off by default in this release. Peers without it, qbit v1.0.0 included, keep
+today's v2 keys; it does not authenticate peers. `getpeerinfo` reports
+`transport_pq` and `transport_pq_status`, `getnetworkinfo` reports
+`connections_pq`, `qbit-cli -netinfo` marks hybrid peers `2p`, and the new
+`getpqtransportinfo` RPC reports the rest. See
+[Hybrid post-quantum v2 transport](network/pq-transport.md).
 
 ## Consensus Parameters
 
@@ -261,11 +275,13 @@ qbit-only or qbit-specific public RPCs include:
 - `getdefaultctvhash`
 - `exportpubkeydb`
 - `importpubkeydb`
+- `getpqtransportinfo`
 
 Inherited RPC names with changed or qbit-specific semantics include:
 
 - `getblocktemplate`, because of Cadence and AuxPoW.
-- `getnetworkinfo`, because archive and witness-pruned service bits matter.
+- `getnetworkinfo`, because archive and witness-pruned service bits matter, and it counts hybrid post-quantum connections in `connections_pq`.
+- `getpeerinfo`, which reports each peer's hybrid post-quantum transport state in `transport_pq` and `transport_pq_status`.
 - `getblock`, because verbose historical witness data can be unavailable on witness-pruned nodes.
 - `getnewaddress`, `getrawchangeaddress`, and `createwalletdescriptor`, because public launch chains are P2MR-only.
 - `getaddressinfo`, `validateaddress`, `decodescript`, wallet signing, and PSBT RPCs, because P2MR carries additional script, key, signature, and watch-only data.
