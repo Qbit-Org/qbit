@@ -5,6 +5,7 @@
 """Class for v2 P2P protocol (see BIP 324), with qbit's opt-in hybrid post-quantum key exchange
 (doc/design/pq-transport.md)"""
 
+import configparser
 from enum import Enum
 from io import BytesIO
 import hashlib
@@ -577,6 +578,18 @@ def _run_handshake(initiator, responder):
     return initiator_buf, responder_buf
 
 
+def pq_transport_vectors_path():
+    """src/test/data/pq_transport_vectors.json. The build symlinks this module to the source tree, except
+    on Windows, which links or copies it: there the source tree is the SRCDIR of the build's config.ini."""
+    vectors = Path("src", "test", "data", "pq_transport_vectors.json")
+    source_dir = Path(__file__).resolve().parents[3]
+    if (source_dir / vectors).exists():
+        return source_dir / vectors
+    config = configparser.ConfigParser()
+    config.read_string((Path(__file__).absolute().parents[2] / "config.ini").read_text(encoding="utf8"))
+    return Path(config["environment"]["SRCDIR"]) / vectors
+
+
 class TestFrameworkV2P2P(unittest.TestCase):
     def test_parse_version_contents(self):
         """The contents parser follows the node's grammar: all records must parse, the first own record wins."""
@@ -605,8 +618,7 @@ class TestFrameworkV2P2P(unittest.TestCase):
 
     def test_vectors(self):
         """Two hybrid states fed the inputs of src/test/data/pq_transport_vectors.json reproduce its values."""
-        vectors_path = Path(__file__).resolve().parents[3] / "src" / "test" / "data" / "pq_transport_vectors.json"
-        vectors = json.loads(vectors_path.read_text(encoding="utf8"))["vectors"]
+        vectors = json.loads(pq_transport_vectors_path().read_text(encoding="utf8"))["vectors"]
         self.assertEqual(len(vectors), 4)
         for vector in vectors:
             v = {key: bytes.fromhex(value) for key, value in vector.items() if key not in ("comment", "chain")}
