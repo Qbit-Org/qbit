@@ -15,6 +15,7 @@ method arguments, result schemas, examples, and command semantics.
 - Exchange and integrator quickstart: [Exchange and Integrator Quickstart](exchange-integrator-quickstart.md)
 - Full-validation and archive bootstrap guide: [Full-Validation Bootstrap](../user/full-validation-bootstrap.md)
 - P2MR watch-only pubkey database guide: [P2MR Watch-Only Pubkey Database Guide](../user/wallet/p2mr-pubkeydb.md)
+- Hybrid post-quantum v2 transport: [operator guide](../user/network/pq-transport.md) and [specification](../design/pq-transport.md)
 
 The in-tree RPC documentation pipeline lives under `doc/rpc/`. Release builds
 install generated RPC artifacts under `share/doc/qbit/rpc/`, and the public
@@ -30,6 +31,7 @@ qbit keeps the Bitcoin Core RPC shape where that is still accurate, but adds or 
 - future block-time activation and candidate timestamp headroom
 - archive-by-default node behavior and witness-pruned peers
 - stale block metrics and qbit confirmation-target estimation
+- hybrid post-quantum (ML-KEM-1024) v2 P2P transport state
 
 For protocol constants behind these RPCs, use the protocol specification rather
 than older Bitcoin Core assumptions. Mainnet values include
@@ -251,6 +253,36 @@ Integrator notes:
 - The RPC uses the same C++ helper as P2MR script execution, so it is the canonical node-exposed way to generate CTV test vectors.
 - The hash commits to transaction version, locktime, optional scriptSig hash, input count, sequences hash, output count, outputs hash, and input index. It does not commit to prevouts, spent amounts, spent scripts, or witness data.
 
+### `getpqtransportinfo`
+
+Canonical RPC reference: `getpqtransportinfo` at `docs.qbit.org`
+
+Reports the hybrid post-quantum v2 transport: whether new v2 connections
+negotiate an ML-KEM-1024 key exchange, which ML-KEM-1024 code runs, and the
+handshake outcomes since startup.
+
+Request:
+
+```bash
+qbit-cli <chain option> getpqtransportinfo
+```
+
+Important result fields:
+
+- `enabled`, and `status`: `enabled`, `disabled_v2pqtransport` or `disabled_v2transport`
+- `arith_backend` (`x86_64-avx2`, `aarch64-neon` or `portable`) and `keccak_backend` (`x86_64-avx2`, `aarch64` or `portable`): the ML-KEM-1024 code that runs
+- `instance_id` and `since`: the process start the counters count from
+- `handshakes.inbound` and `handshakes.outbound`: event counters, such as `switched`, `legacy_peer`, `first_packet_failed` and, inbound only, `shed`
+- `load_shedding`: `active`, `threshold_per_s` and `since`
+- `fallback_set` and `failure_streaks`: outbound endpoints that fall back to plain v2, or are on their way there
+- `recent_failures.inbound` and `recent_failures.outbound`: the most recent non-success outcomes, with sequence numbers
+
+Integrator notes:
+
+- Every field is always present. The counters, rings and endpoint history are kept in memory only and start over when `instance_id` changes.
+- Counters count events, not exclusive outcomes: a switch whose key confirmation then fails counts `switched` and `first_packet_failed`.
+- Endpoints contain peer addresses; treat the output as sensitive.
+
 ## Shared RPC Names With qbit-Specific Semantics
 
 ### `getblocktemplate`
@@ -279,6 +311,7 @@ Fields to watch:
 - `localservicesnames`
 - `connections`
 - `connections_out`
+- `connections_pq`: connections with hybrid post-quantum session keys, the peers `getpeerinfo` lists with `transport_pq` true
 - `networkactive`
 - `warnings`
 
@@ -292,6 +325,20 @@ Integrator notes:
 - Default qbit nodes are archive/full-history nodes.
 - Nodes started with witness pruning can withdraw archive service and advertise witness-pruned service.
 - For archive bootstrap diagnostics, prefer `getarchivepeers` over parsing only `getnetworkinfo`.
+
+### `getpeerinfo`
+
+Canonical RPC reference: `getpeerinfo` at `docs.qbit.org`
+
+Each peer gains two fields:
+
+- `transport_pq`: true once the peer's key confirmation verified and the session keys are hybrid post-quantum (ML-KEM-1024 and ECDH); `session_id` is then the hybrid session id
+- `transport_pq_status`: `pending`, `hybrid`, `legacy_peer`, `fallback`, `off` or `v1`
+
+Integrator notes:
+
+- `pending` also covers a connection that is closing after a hybrid failure; there is no failed status.
+- A v1.0.0 server returns neither field. `qbit-cli -netinfo` treats a missing `transport_pq` as false, and marks hybrid peers `2p` in its `v` column.
 
 ### `getblock`
 
@@ -524,6 +571,8 @@ The generated RPC reference should include current entries for:
 - `getarchivepeers`
 - `getblocktemplate`
 - `getnetworkinfo`
+- `getpeerinfo`
+- `getpqtransportinfo`
 - `getblock`
 - `createwalletdescriptor`
 - `exportpubkeydb`

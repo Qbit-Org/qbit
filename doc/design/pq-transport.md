@@ -6,7 +6,12 @@ P2P transport, so that their session keys stay confidential unless both
 secp256k1 ECDH and ML-KEM-1024 are broken. It is written so that another
 implementation can interoperate, and it is the starting point for outside
 review. The tracking issue is
-[Qbit-Org/qbit#184](https://github.com/Qbit-Org/qbit/issues/184).
+[Qbit-Org/qbit#184](https://github.com/Qbit-Org/qbit/issues/184). Operators
+should read the [operator guide](../user/network/pq-transport.md) instead; the
+[release note](../release-notes-240.md) summarizes the change.
+
+<!-- Interface names quoted in this document are marked for test/lint/lint-pq-doc-tokens.py;
+     see test/lint/README.md. -->
 
 The key words MUST, MUST NOT, SHOULD and MAY are to be interpreted as described
 in [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) and
@@ -300,20 +305,22 @@ would wait until its handshake timeout for bytes that never arrive.
 
 How qbit counts, logs and reports these outcomes, its fallback after repeated
 failures and its load shedding are local policy, described in
-[#184](https://github.com/Qbit-Org/qbit/issues/184); they don't change the wire
+[#184](https://github.com/Qbit-Org/qbit/issues/184) and, for operators, in the
+[operator guide](../user/network/pq-transport.md); they don't change the wire
 behavior above.
 
 qbit reports each v2 connection's negotiation status as one of these values:
 
-- `pending` from the start of the handshake until one of the outcomes below;
-- `hybrid` once the peer's confirmation verifies;
-- `legacy_peer` when the peer's version packet carries no usable offer or
-  accept, so the ECDH keys stay;
-- `off` when the switch is off, when a responder sheds its offer under load,
-  or after a local key generation, key check or encapsulation fault that left
-  the connection on plain v2;
-- `fallback` for an outbound connection that runs plain v2 because of earlier
-  failures; inbound connections never fall back.
+- <!--pq:value-->`pending` from the start of the handshake until one of the
+  outcomes below;
+- <!--pq:value-->`hybrid` once the peer's confirmation verifies;
+- <!--pq:value-->`legacy_peer` when the peer's version packet carries no usable
+  offer or accept, so the ECDH keys stay;
+- <!--pq:value-->`off` when the switch is off, when a responder sheds its offer
+  under load, or after a local key generation, key check or encapsulation fault
+  that left the connection on plain v2;
+- <!--pq:value-->`fallback` for an outbound connection that runs plain v2
+  because of earlier failures; inbound connections never fall back.
 
 There is no failed status. A connection that closes on any failure above or
 in key confirmation, local faults included, reports `pending` until it is
@@ -327,8 +334,8 @@ removed.
   record that carries secrets.
 - **The guarantee holds for confirmed hybrid connections.** A switch that is
   off on either side, a local fault, load shedding and fallback all permit
-  ECDH-only sessions. `getpeerinfo` reports `transport_pq` only once the peer's
-  confirmation verified.
+  ECDH-only sessions. <!--pq:rpc-->`getpeerinfo` reports
+  <!--pq:field-->`transport_pq` only once the peer's confirmation verified.
 - **This is not authentication.** BIP324 stays unauthenticated, and an active
   man-in-the-middle can still relay two separate sessions. The hybrid session
   id can be compared out of band the same way BIP324's can.
@@ -476,9 +483,10 @@ pads or GNU property note, so linking it would drop BTI/PAC/GCS marking from the
 whole binary, and hardening wins. The CMake option
 `WITH_MLKEM_NATIVE=AUTO|ON|OFF` controls the build: `OFF` builds portable C
 only, and `ON` makes missing native support a configure error, as on AArch64
-ELF. At runtime, the hidden `-mlkemportable` option, and
-`-test=mlkem_portable` on regtest, force portable C; they arrive with the
-operator options ([#209](https://github.com/Qbit-Org/qbit/issues/209)).
+ELF. At runtime, the hidden <!--pq:opt-->`-mlkemportable` option, and
+<!--pq:opt-->`-test=mlkem_portable` on regtest, force portable C; the
+[operator guide](../user/network/pq-transport.md) describes when to use the
+former.
 
 ### Regenerating the vectors
 

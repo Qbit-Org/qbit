@@ -977,6 +977,7 @@ jobs:
       - name: Run public docs lint
         run: |
           test/lint/lint-qbit-public-docs.py
+          test/lint/lint-pq-doc-tokens.py
           python3 -m unittest \
             ci.release.test_verify_p2mr_v1_conformance.CheckedInP2MRIntegrationMatrixTest
 

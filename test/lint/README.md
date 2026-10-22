@@ -162,6 +162,48 @@ bounded30 guard checks. A partially present KAT payload, or a missing
 implementation directory, is treated as an error so accidental subtree
 corruption does not silently bypass vector coverage.
 
+lint-pq-doc-tokens.py
+=====================
+Run this script from the root of the repository to check that the interface
+names the hybrid post-quantum v2 transport documents quote still exist:
+
+```
+test/lint/lint-pq-doc-tokens.py
+test/lint/lint-pq-doc-tokens.py --qbitd build/bin/qbitd --qbit-cli build/bin/qbit-cli
+```
+
+A document marks a name with an HTML comment directly before an inline code
+span, such as `<!--pq:opt-->` before `` `-v2pqtransport` ``. The comment doesn't
+render, and the kind says what the name must match:
+
+| Kind | Token | Must be |
+|---|---|---|
+| `opt` | `-name`, `-name=value` or `-noname` | listed by `qbitd -help` or `-help-debug`, or `qbit-cli -help` (a value isn't checked) |
+| `rpc` | an RPC method | registered with `RPCHelpMan` |
+| `field` | an RPC result field, or a dotted path of them | set with `pushKV()` |
+| `value` | a status, reason or other value | exactly a C++ string literal |
+| `log` | a log or warning text, with `…` for each `%s`, `%u` and other conversion | part of a C++ string literal, starting and ending at word boundaries |
+
+It checks every Markdown file under `doc/` with a marker, except the archived
+release notes in `doc/release-notes/`; the specification and the operator guide
+must have marked names. Without binaries, options are checked against the
+`AddArg()` calls that `-help` prints; `feature_pq_quickstart.py` runs the check
+with the build's `qbitd` and `qbit-cli`. Everything else is checked against the
+C++ sources in `src/`, without tests, benchmarks and subtrees.
+
+A malformed, unterminated or empty marker, a marker in a fenced code block and
+an unclosed code block fail with their file and line, so that a typo can't drop
+a name. Every run also tests the check: in memory, it renames `-v2pqtransport`,
+the `transport_pq_status` field and the load shedding log string and requires
+that exactly those names fail, and it feeds the parser malformed markers and the
+checks near misses. Fenced code blocks aren't checked here: the quick start's
+commands and outputs, and the warnings the guide shows, are checked by
+`test/functional/feature_pq_quickstart.py`.
+
+A pull request that changes only public documentation skips the lint job, so
+the `public-docs-lint` job in `.github/workflows/ci.yml` runs this check too,
+without binaries.
+
 lint-qbit-node-defaults.py
 ==========================
 Run this script from the root of the repository to verify curated qbit-owned
