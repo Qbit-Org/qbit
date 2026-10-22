@@ -46,11 +46,11 @@ Behavior changes to review before upgrading
   `fee` and without `address`, `label`, or `vout`, for a self-transfer whose
   outputs are all change. Integrations that assume every `send` entry has an
   address or a non-zero amount should be checked (#150).
-- An `encryptwallet` call that overlaps another encryption of the same wallet,
-  or that repeats after it succeeded, now fails deterministically with error
-  code `-15` (`RPC_WALLET_WRONG_ENC_STATE`) instead of `-16` "Failed to
-  encrypt". `-16` now means only a real database failure. Scripts that match
-  on the `-16` code for this case should be updated (#183).
+- An `encryptwallet` call that overlaps another encryption of the same wallet
+  now fails deterministically with error code `-15`
+  (`RPC_WALLET_WRONG_ENC_STATE`), the code a call on an already encrypted
+  wallet already returned. Previously it could fail with `-16` "Failed to
+  encrypt". Other `encryptwallet` failures still return `-16` (#183).
 
 Compatibility
 =============
