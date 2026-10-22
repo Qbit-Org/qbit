@@ -556,6 +556,7 @@ class PQWorkflowContractTest(unittest.TestCase):
             # What Full Validation's pq-unit job passes.
             (PQ, {"jobs": f"{AARCH64_JOB},{MACOS_JOB},{MACOS_X86_64_JOB}"},
              {PQ_UNIT_JOB: [AARCH64_JOB], MACOS_JOB: [], MACOS_X86_64_JOB: []}),
+            # What Full Validation's pq-functional job passes.
             (PQ, {"jobs": PQ_FUNCTIONAL_JOB}, {PQ_FUNCTIONAL_JOB: []}),
             (PQ, {"jobs": ""}, ALL_PQ_JOBS),
             (NIGHTLY, {"run_test_matrix": True, "run_scanners": False, "jobs": "previous-releases"},

@@ -319,6 +319,69 @@ class ClassifyMergeProfileTest(unittest.TestCase):
         self.assertTrue(self.classify(["../src/bip324.cpp"]).pq_unit_required)
         self.assertTrue(self.classify(["/abs/path"]).pq_unit_required)
 
+    def test_pq_functional_job_required_for_hybrid_transport_paths(self) -> None:
+        """Paths that can break the hybrid functional suite without touching what the PQ unit jobs build."""
+        required = [
+            "src/init.cpp",
+            "src/rpc/net.cpp",
+            "test/functional/rpc_net.py",
+            "test/functional/p2p_v2_encrypted.py",
+            "test/functional/p2p_v2_misbehaving.py",
+            "test/functional/p2p_v2_pq_fallback.py",
+            "test/functional/p2p_v2_transport.py",
+            "test/functional/test_framework/test_framework.py",
+            "test/functional/test_framework/test_node.py",
+            "test/functional/test_framework/v2_p2p.py",
+            "test/functional/test_framework/crypto/mlkem.py",
+            "ci/test/00_setup_env_native_pq_functional.sh",
+        ]
+        for path in required:
+            with self.subTest(path=path):
+                classification = self.classify([path])
+                outputs = classify_merge_profile.github_outputs(classification)
+                self.assertTrue(classification.pq_functional_required)
+                self.assertEqual(outputs["pq_functional_required"], "true")
+                # The macOS and AArch64 unit jobs don't start for them.
+                self.assertFalse(classification.pq_unit_required)
+                self.assertEqual(outputs["pq_unit_required"], "false")
+                self.assertEqual(classification.profile, classify_merge_profile.SOURCE_PROFILE)
+        self.assertTrue(self.classify(["doc/user/README.md", "src/init.cpp"]).pq_functional_required)
+
+    def test_pq_functional_job_required_whenever_pq_unit_jobs_are(self) -> None:
+        paths = sorted(classify_merge_profile.PQ_UNIT_FILES) + [
+            "src/mlkem-native/mlkem/src/kem.c",
+            "src/bip324_pq.cpp",
+            "src/crypto/mlkem.cpp",
+            "src/compat/cpu_features.cpp",
+            "../src/bip324.cpp",
+        ]
+        for path in paths:
+            with self.subTest(path=path):
+                classification = self.classify([path])
+                self.assertTrue(classification.pq_unit_required)
+                self.assertTrue(classification.pq_functional_required)
+                self.assertEqual(classify_merge_profile.github_outputs(classification)["pq_functional_required"], "true")
+
+    def test_pq_functional_job_not_required_elsewhere(self) -> None:
+        for paths in (
+            ["src/wallet/wallet.cpp"],
+            ["src/net_processing.cpp", "src/netbase.cpp", "src/protocol.cpp", "src/bitcoin-cli.cpp", "src/qt/rpcconsole.cpp"],
+            ["src/rpc/blockchain.cpp", "src/test/net_pq_tests.cpp"],
+            # Tests that set every transport option themselves, or that run alike over plain and hybrid v2.
+            ["test/functional/rpc_pqtransport.py", "test/functional/feature_pq_quickstart.py"],
+            ["test/functional/tool_pq_canary.py", "contrib/pq-canary/pq-canary-eval.py"],
+            ["test/functional/p2p_handshake.py", "test/functional/interface_bitcoin_cli.py", "test/functional/test_runner.py"],
+            # The other CI jobs, and the wiring every CI job shares.
+            ["ci/test/00_setup_env_i686_no_ipc.sh", "ci/test/00_setup_env_base_image.sh", "ci/test_run_all.sh"],
+            ["doc/user/network/pq-transport.md"],
+            RPC_DOCS_PATHS,
+            PUBLIC_DOCS_PATHS,
+        ):
+            with self.subTest(paths=paths):
+                classification = self.classify(paths)
+                self.assertFalse(classification.pq_functional_required)
+                self.assertEqual(classify_merge_profile.github_outputs(classification)["pq_functional_required"], "false")
+
     def test_require_release_policy_only_cli_rejects_outside_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             changed_files = Path(tmpdir) / "changed-files.txt"
