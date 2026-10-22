@@ -22,6 +22,7 @@
 #include <serialize.h>
 #include <span.h>
 #include <streams.h>
+#include <test/util/net.h>
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
 #include <test/util/validation.h>
@@ -34,11 +35,16 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cassert>
 #include <deque>
 #include <ios>
+#include <iterator>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace std::literals;
@@ -177,6 +183,221 @@ BOOST_AUTO_TEST_CASE(cnode_simple_test)
     BOOST_CHECK(pnode4->IsInboundConn() == true);
     BOOST_CHECK(pnode4->m_inbound_onion == true);
     BOOST_CHECK_EQUAL(pnode4->ConnectedThroughNetwork(), Network::NET_ONION);
+}
+
+namespace {
+//! A socket whose Send() and Recv() fail as if the peer reset the connection.
+class ResetSock : public ZeroSock
+{
+public:
+    ssize_t Send(const void*, size_t, int) const override { return Fail(); }
+    ssize_t Recv(void*, size_t, int) const override { return Fail(); }
+
+private:
+    static ssize_t Fail()
+    {
+#ifdef WIN32
+        WSASetLastError(WSAECONNRESET);
+#else
+        errno = ECONNRESET;
+#endif
+        return -1;
+    }
+
+    ResetSock& operator=(Sock&&) override
+    {
+        assert(false && "Move of Sock into ResetSock not allowed.");
+        return *this;
+    }
+};
+
+//! Message processing that only records each node's close cause when CConnman deletes it.
+class CloseCauseRecorder final : public NetEventsInterface
+{
+public:
+    std::map<NodeId, NodeCloseCause> m_finalized;
+
+    void InitializeNode(const CNode&, ServiceFlags) override {}
+    void FinalizeNode(const CNode& node) override { m_finalized.emplace(node.GetId(), node.GetCloseCause()); }
+    bool HasAllDesirableServiceFlags(ServiceFlags) const override { return true; }
+    bool HasUndesirableServiceFlags(ServiceFlags) const override { return false; }
+    bool ProcessMessages(CNode*, std::atomic<bool>&) override EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex) { return false; }
+    bool SendMessages(CNode*) override EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex) { return false; }
+};
+} // namespace
+
+BOOST_AUTO_TEST_CASE(close_cause_first_wins)
+{
+    constexpr std::array causes{NodeCloseCause::PEER_EOF, NodeCloseCause::PEER_RESET, NodeCloseCause::SEND_ERROR,
+                                NodeCloseCause::TIMEOUT, NodeCloseCause::LOCAL};
+    NodeId id{0};
+    const auto new_node{[&](std::shared_ptr<Sock> sock, ConnectionType conn_type = ConnectionType::OUTBOUND_FULL_RELAY) {
+        return new CNode{id++,
+                         std::move(sock),
+                         CAddress{LookupNumeric("1.2.3.4", 8333), NODE_NONE},
+                         /*nKeyedNetGroupIn=*/0,
+                         /*nLocalHostNonceIn=*/0,
+                         CAddress{},
+                         /*addrNameIn=*/"",
+                         conn_type,
+                         /*inbound_onion=*/false};
+    }};
+
+    // Each cause is recorded, and repeated cleanup keeps it.
+    for (const auto cause : causes) {
+        const std::unique_ptr<CNode> node{new_node(nullptr)};
+        BOOST_CHECK(node->GetCloseCause() == NodeCloseCause::NONE);
+        BOOST_CHECK(!node->fDisconnect);
+        node->RequestDisconnect(cause);
+        BOOST_CHECK(node->GetCloseCause() == cause);
+        BOOST_CHECK(node->fDisconnect);
+        for (const auto later : causes) {
+            node->RequestDisconnect(later);
+            node->CloseSocketDisconnect(later);
+        }
+        node->CloseSocketDisconnect();
+        BOOST_CHECK(node->GetCloseCause() == cause);
+    }
+
+    // Racing writers, like the socket, message handler and RPC threads, all
+    // see the same cause once their own call returns.
+    for (int round{0}; round < 50; ++round) {
+        const std::unique_ptr<CNode> node{new_node(nullptr)};
+        std::atomic<bool> start{false};
+        std::array<NodeCloseCause, causes.size()> seen{};
+        std::vector<std::thread> threads;
+        for (size_t i{0}; i < causes.size(); ++i) {
+            threads.emplace_back([&, i] {
+                while (!start) std::this_thread::yield();
+                node->CloseSocketDisconnect(causes[i]);
+                node->RequestDisconnect();
+                seen[i] = node->GetCloseCause();
+            });
+        }
+        start = true;
+        for (auto& thread : threads) thread.join();
+        const NodeCloseCause winner{node->GetCloseCause()};
+        BOOST_CHECK(winner != NodeCloseCause::NONE);
+        for (const auto cause : seen) BOOST_CHECK(cause == winner);
+    }
+
+    // Each disconnect site records its cause.
+    CloseCauseRecorder events;
+    ConnmanTestMsg connman{0x1337, 0x1337, *m_node.addrman, *m_node.netgroupman, Params()};
+    connman.SetMsgProc(&events);
+    connman.SetPeerConnectTimeout(60s);
+    const auto now{GetTime<std::chrono::seconds>()};
+    SetMockTime(now);
+
+    const std::shared_ptr<Sock> eof_sock{std::make_shared<StaticContentsSock>("")};
+    const std::shared_ptr<Sock> reset_sock{std::make_shared<ResetSock>()};
+    CNode* eof_node{new_node(eof_sock)};
+    CNode* reset_node{new_node(reset_sock)};
+    CNode* send_node{new_node(std::make_shared<ResetSock>())};
+    CNode* timeout_node{new_node(std::make_shared<ZeroSock>())};
+    CNode* local_node{new_node(std::make_shared<ZeroSock>())};
+    CNode* unexplained_node{new_node(std::make_shared<ZeroSock>())};
+    // Zeros never start with the network magic, so the transport rejects them.
+    const std::shared_ptr<Sock> garbage_sock{std::make_shared<ZeroSock>()};
+    CNode* garbage_node{new_node(garbage_sock)};
+    CNode* network_off_node{new_node(std::make_shared<ZeroSock>())};
+    const std::vector nodes{eof_node, reset_node, send_node, timeout_node, local_node, unexplained_node, garbage_node, network_off_node};
+    for (CNode* node : nodes) {
+        node->AddRef(); // the reference m_nodes holds, as in ConnectNode()
+        node->AddRef(); // keeps the node alive through DisconnectNodes() below
+        connman.AddTestNode(*node);
+    }
+
+    // Our own decision, as from the RPC thread.
+    BOOST_CHECK(connman.DisconnectNode(local_node->GetId()));
+    BOOST_CHECK(local_node->GetCloseCause() == NodeCloseCause::LOCAL);
+    // A failed optimistic send, as from the message handler thread.
+    connman.PushMessage(send_node, NetMsg::Make(NetMsgType::VERACK));
+    BOOST_CHECK(send_node->GetCloseCause() == NodeCloseCause::SEND_ERROR);
+    // Setting fDisconnect directly leaves the cause unknown.
+    unexplained_node->fDisconnect = true;
+
+    // One socket handler pass after the inactivity timeout, so the timeout
+    // check runs for every node with an open socket after it was read.
+    SetMockTime(now + 61s);
+    Sock::EventsPerSock events_per_sock;
+    for (const auto& sock : {eof_sock, reset_sock, garbage_sock}) {
+        events_per_sock.emplace(sock, Sock::Events{Sock::RECV}).first->second.occurred = Sock::RECV;
+    }
+    connman.SocketHandlerConnectedPublic({eof_node, reset_node, send_node, timeout_node, local_node, garbage_node}, events_per_sock);
+    BOOST_CHECK(eof_node->GetCloseCause() == NodeCloseCause::PEER_EOF);
+    BOOST_CHECK(reset_node->GetCloseCause() == NodeCloseCause::PEER_RESET);
+    BOOST_CHECK(send_node->GetCloseCause() == NodeCloseCause::SEND_ERROR);
+    BOOST_CHECK(timeout_node->GetCloseCause() == NodeCloseCause::TIMEOUT);
+    BOOST_CHECK(local_node->GetCloseCause() == NodeCloseCause::LOCAL);
+    BOOST_CHECK(garbage_node->GetCloseCause() == NodeCloseCause::LOCAL);
+    BOOST_CHECK(unexplained_node->GetCloseCause() == NodeCloseCause::NONE);
+    BOOST_CHECK(network_off_node->GetCloseCause() == NodeCloseCause::NONE);
+
+    // With the network off, DisconnectNodes() disconnects the remaining node
+    // as LOCAL. Finalization counts the unexplained disconnect as LOCAL and
+    // keeps every recorded cause.
+    connman.SetNetworkActive(false);
+    connman.DisconnectNodesPublic();
+    connman.SetNetworkActive(true);
+    BOOST_CHECK(connman.TestNodes().empty());
+    BOOST_CHECK(eof_node->GetCloseCause() == NodeCloseCause::PEER_EOF);
+    BOOST_CHECK(reset_node->GetCloseCause() == NodeCloseCause::PEER_RESET);
+    BOOST_CHECK(send_node->GetCloseCause() == NodeCloseCause::SEND_ERROR);
+    BOOST_CHECK(timeout_node->GetCloseCause() == NodeCloseCause::TIMEOUT);
+    BOOST_CHECK(local_node->GetCloseCause() == NodeCloseCause::LOCAL);
+    BOOST_CHECK(garbage_node->GetCloseCause() == NodeCloseCause::LOCAL);
+    BOOST_CHECK(unexplained_node->GetCloseCause() == NodeCloseCause::LOCAL);
+    BOOST_CHECK(network_off_node->GetCloseCause() == NodeCloseCause::LOCAL);
+
+    for (CNode* node : nodes) node->Release();
+    connman.DisconnectNodesPublic(); // deletes the released nodes
+
+    // Eviction records LOCAL. Enough inbound candidates that some survive the
+    // protections in SelectNodeToEvict(); outbound connections are never evicted.
+    std::vector<CNode*> inbound_nodes;
+    for (int i{0}; i < 40; ++i) {
+        inbound_nodes.push_back(new_node(nullptr, ConnectionType::INBOUND));
+    }
+    CNode* shutdown_node{new_node(std::make_shared<ZeroSock>())};
+    for (CNode* node : inbound_nodes) {
+        node->AddRef();
+        connman.AddTestNode(*node);
+    }
+    shutdown_node->AddRef();
+    connman.AddTestNode(*shutdown_node);
+    BOOST_CHECK(connman.AttemptToEvictConnectionPublic());
+    std::vector<CNode*> evicted;
+    std::copy_if(inbound_nodes.begin(), inbound_nodes.end(), std::back_inserter(evicted), [](const CNode* node) { return node->fDisconnect.load(); });
+    BOOST_CHECK_EQUAL(evicted.size(), 1U);
+    for (const CNode* node : evicted) BOOST_CHECK(node->GetCloseCause() == NodeCloseCause::LOCAL);
+
+    // Shutdown deletes the remaining nodes and records LOCAL for any without a cause.
+    const NodeId shutdown_id{shutdown_node->GetId()};
+    connman.Stop();
+    BOOST_CHECK(connman.TestNodes().empty());
+    BOOST_CHECK(events.m_finalized.at(shutdown_id) == NodeCloseCause::LOCAL);
+    for (const auto& [finalized_id, cause] : events.m_finalized) BOOST_CHECK(cause != NodeCloseCause::NONE);
+
+    // The ping timeout records TIMEOUT, from the message handler thread.
+    {
+        LOCK(NetEventsInterface::g_msgproc_mutex);
+        auto& fixture_connman{static_cast<ConnmanTestMsg&>(*m_node.connman)};
+        const std::unique_ptr<CNode> ping_node{new_node(nullptr, ConnectionType::INBOUND)};
+        // The handshake ends by sending the first ping.
+        fixture_connman.Handshake(*ping_node,
+                                  /*successfully_connected=*/true,
+                                  /*remote_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                                  /*local_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                                  /*version=*/PROTOCOL_VERSION,
+                                  /*relay_txs=*/true);
+        BOOST_CHECK(!ping_node->fDisconnect);
+        SetMockTime(GetTime<std::chrono::seconds>() + TIMEOUT_INTERVAL + 1s);
+        m_node.peerman->SendMessages(ping_node.get());
+        BOOST_CHECK(ping_node->GetCloseCause() == NodeCloseCause::TIMEOUT);
+        m_node.peerman->FinalizeNode(*ping_node);
+    }
+    SetMockTime(0s);
 }
 
 BOOST_AUTO_TEST_CASE(cnetaddr_basic)
