@@ -102,13 +102,15 @@ class PQQuickstartTest(BitcoinTestFramework):
         assert_equal(steps.count(GUIDE_DATADIR_LINE), 1)
         steps = steps.replace(GUIDE_DATADIR_LINE, f"Q={shlex.quote(str(datadir))}")
         ports = {}
+        replacements = {}
         for name, (guide_p2p, guide_rpc) in GUIDE_PORTS.items():
             node = PORT_NODES[name]
             ports[name] = (p2p_port(node), rpc_port(node))
             for guide_port, port in zip((guide_p2p, guide_rpc), ports[name]):
-                pattern = rf"\b{guide_port}\b"
-                assert re.search(pattern, steps), f"the guide no longer uses port {guide_port}"
-                steps = re.sub(pattern, str(port), steps)
+                assert re.search(rf"\b{guide_port}\b", steps), f"the guide no longer uses port {guide_port}"
+                replacements[str(guide_port)] = str(port)
+        # One pass: a port put in for one guide port can equal another guide port, and must not be replaced again.
+        steps = re.sub(rf"\b({'|'.join(replacements)})\b", lambda match: replacements[match.group(1)], steps)
         return datadir, ports, steps, {step: blocks[f"{step} output"] for step in STEPS}
 
     def stop_quickstart_nodes(self, datadir, ports):
