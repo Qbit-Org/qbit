@@ -282,10 +282,14 @@ Known limitations
   limit state differently: the PSBT dialog uses a translatable label such as
   "Normal", while the Sign/Verify dialog shows the raw state name such as
   "NORMAL". The meaning is identical; only the wording differs (#166).
-- TODO(maintainer): platform signing disposition for macOS and Windows
-  artifacts (#70). Either record that the artifacts are signed and notarized,
-  or record the unsigned-platform waiver applied to this release. Signed tags,
-  checksums, and builder attestations apply either way.
+- Unsigned-platform waiver: the macOS and Windows artifacts for this release
+  are not code-signed or notarized. They are published with `-unsigned` in
+  their names, and codesigning payloads are not published. macOS Gatekeeper
+  and Windows SmartScreen may warn when they are first opened. The signed
+  release tag, the signed `SHA256SUMS`, and the builder attestations still
+  apply to every artifact; verify downloads as described in "Release
+  verification". This waiver remains until macOS and Windows signing accounts
+  are available (#70).
 - Instrumented fuzz coverage evidence for the release source is not yet
   available. The source-anchor mismatch reported in #173 is a test-tool
   failure, not evidence that PQC verification fails. Its fix (#176) restores
