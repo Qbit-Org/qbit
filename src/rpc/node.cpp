@@ -6,6 +6,7 @@
 #include <bitcoin-build-config.h> // IWYU pragma: keep
 
 #include <chainparams.h>
+#include <common/args.h>
 #include <httpserver.h>
 #include <index/blockfilterindex.h>
 #include <index/coinstatsindex.h>
@@ -64,6 +65,13 @@ static RPCHelpMan setmocktime()
     }
 
     SetMockTime(time);
+    if (HasTestOption(EnsureAnyArgsman(request.context), "mock_steady_clock")) {
+        if (time) {
+            MockableSteadyClock::SetMockTime(std::chrono::seconds{time});
+        } else {
+            MockableSteadyClock::ClearMockTime();
+        }
+    }
     const NodeContext& node_context{EnsureAnyNodeContext(request.context)};
     for (const auto& chain_client : node_context.chain_clients) {
         chain_client->setMockTime(time);

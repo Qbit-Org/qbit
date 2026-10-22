@@ -9,8 +9,10 @@ Options and startup line:
   across restarts, observed on a live connection between two nodes; the warnings for a
   contradictory or non-numeric setting, or a double negative; -help; the three startup lines.
 - test_portable_options: -mlkemportable and -test=mlkem_portable make the startup line
-  report portable code, and a non-numeric -mlkemportable or a double negative warns; the
-  test options are regtest only and print nothing to stderr.
+  report portable code, and a non-numeric -mlkemportable or a double negative warns;
+  -test=pq_low_shed_threshold sets the load shedding threshold to 5; the test options are
+  regtest only and print nothing to stderr. (p2p_v2_pq_misbehaving.py drives load shedding
+  with -test=mock_steady_clock.)
 
 RPC (getpqtransportinfo, and the getpeerinfo and getnetworkinfo fields):
 - test_states: every getpqtransportinfo field with the switch off, with v2 off, on, and
@@ -193,8 +195,10 @@ class PQTransportTest(BitcoinTestFramework):
     def set_test_params(self):
         self.num_nodes = 3
         self.setup_clean_chain = True
-        # Whatever the suite's transport flag, these nodes use v2.
+        # Whatever the suite's transport flag, these nodes use v2, and -v2pqtransport is only what each
+        # test passes: this test checks the option's own defaults and settings.
         self.extra_args = [NO_PQ] * self.num_nodes
+        self.v2pqtransport_from_run_mode = False
 
     def setup_network(self):
         # Connections are made by the tests.
@@ -345,7 +349,7 @@ class PQTransportTest(BitcoinTestFramework):
         assert "-mlkemportable" not in help_text
         help_debug = subprocess.run(node0.binaries.node_argv() + ["-help-debug"], capture_output=True, text=True, check=True).stdout
         assert "  -mlkemportable\n" in help_debug
-        for option in ["pq_fail_first_packet (", "mlkem_portable ("]:
+        for option in ["pq_fail_first_packet (", "mlkem_portable (", "pq_low_shed_threshold (", "mock_steady_clock ("]:
             assert option in help_debug
 
         self.start_node(0)
@@ -391,12 +395,17 @@ class PQTransportTest(BitcoinTestFramework):
         # Nothing is printed to stderr (checked at stop).
         self.stop_node(0)
 
+        self.log.info("Test -test=pq_low_shed_threshold lowers the threshold, and -test=mock_steady_clock starts cleanly")
+        self.start_node(0, extra_args=PQ + ["-test=pq_low_shed_threshold", "-test=mock_steady_clock"])
+        assert_equal(node0.getpqtransportinfo()["load_shedding"], {"active": False, "threshold_per_s": 5, "since": 0})
+        self.stop_node(0)
+
         self.log.info("Test the test options are regtest only, and -mlkemportable works on any chain")
         conf_file = node0.datadir_path / "qbit.conf"
         regtest_conf = conf_file.read_text(encoding="utf-8")
         write_config(conf_file, n=0, chain="signet")
         node0.chain = "signet"
-        for option in ["-test=mlkem_portable", "-test=pq_fail_first_packet"]:
+        for option in ["-test=mlkem_portable", "-test=pq_fail_first_packet", "-test=pq_low_shed_threshold", "-test=mock_steady_clock"]:
             node0.assert_start_raises_init_error(extra_args=[option], expected_msg=TEST_OPTION_ERROR)
         self.start_node(0, extra_args=["-v2transport=1", "-mlkemportable"])
         assert_equal(self.startup_line(node0), (DISABLED_PQ, "portable", "portable"))

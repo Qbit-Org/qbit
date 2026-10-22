@@ -15,8 +15,9 @@
 #   says needs them.
 # The workflow_dispatch trigger below stays for when this file is on main itself;
 # until then GitHub rejects gh workflow run ci-pq.yml.
-# Jobs: aarch64-unit, s390x-unit (big-endian, emulated), macos-arm64-unit and
-# macos-x86_64-unit.
+# Jobs: aarch64-unit, s390x-unit (big-endian, emulated), macos-arm64-unit,
+# macos-x86_64-unit and pq-functional (the whole functional suite with
+# --v2pqtransport).
 # The source is resolved once to a commit, every job checks out and verifies
 # that commit, and the summaries record it.
 
@@ -32,7 +33,7 @@ on:
         type: string
         default: ''
       jobs:
-        description: 'Comma-separated jobs to run (aarch64-unit, s390x-unit, macos-arm64-unit, macos-x86_64-unit); empty runs all'
+        description: 'Comma-separated jobs to run (aarch64-unit, s390x-unit, macos-arm64-unit, macos-x86_64-unit, pq-functional); empty runs all'
         required: false
         type: string
         default: ''
@@ -44,7 +45,7 @@ on:
         type: string
         default: ''
       jobs:
-        description: 'Comma-separated jobs to run (aarch64-unit, s390x-unit, macos-arm64-unit, macos-x86_64-unit); empty runs all'
+        description: 'Comma-separated jobs to run (aarch64-unit, s390x-unit, macos-arm64-unit, macos-x86_64-unit, pq-functional); empty runs all'
         required: false
         type: string
         default: ''
@@ -66,6 +67,7 @@ jobs:
       selected: ${{ steps.select.outputs.selected }}
       run_macos_arm64_unit: ${{ steps.select.outputs.run_macos_arm64_unit }}
       run_macos_x86_64_unit: ${{ steps.select.outputs.run_macos_x86_64_unit }}
+      run_pq_functional: ${{ steps.select.outputs.run_pq_functional }}
     steps:
       - name: Resolve source
         id: resolve
@@ -190,7 +192,7 @@ jobs:
               }
             ]
           # Selectable jobs that are not matrix entries; each gets a run_<job> output.
-          NON_MATRIX_JOBS: 'macos-arm64-unit macos-x86_64-unit'
+          NON_MATRIX_JOBS: 'macos-arm64-unit macos-x86_64-unit pq-functional'
         run: |
           # Turn the comma-separated jobs input into the matrix: empty selects
           # every job; an empty, unknown or repeated name fails the run.
@@ -547,3 +549,52 @@ jobs:
       - *REQUIRE_DEPENDS_BUILD
       - *REQUIRE_NATIVE_MLKEM
       - *MACOS_REPORT_EVIDENCE
+
+  # The whole functional suite with hybrid post-quantum v2 transport between all
+  # nodes (--v2pqtransport, #184 part 7), so the feature can't quietly break
+  # unrelated behavior. It shares unit's source checks; the test runner's result
+  # is the job's.
+  pq-functional:
+    name: Functional tests with hybrid transport
+    needs: resolve-source
+    if: ${{ needs.resolve-source.outputs.run_pq_functional == 'true' }}
+    runs-on: ubuntu-24.04
+    # Twice a measured local run, rounded up: a cold build at -j 4 on 4 cores
+    # (475 s) plus the whole suite at -j 4 (727 s) is 1,202 s; x 2 = 40.1 min.
+    timeout-minutes: 45
+    env:
+      CI_FAILFAST_TEST_LEAVE_DANGLING: 1
+      DANGER_CI_ON_HOST_FOLDERS: 1
+      FILE_ENV: ./ci/test/00_setup_env_native_pq_functional.sh
+      MATRIX_NAME: Functional tests with hybrid transport
+      TEST_RUNNER_FAILFAST: 'false'
+      MAKEJOBS: '-j4'
+      TEST_RUNNER_JOBS: '4'
+      CTEST_JOBS: '4'
+      CI_PROFILE: public
+      CI_IMAGE_REGISTRY_PREFIX: docker.io/library
+      CI_ENFORCE_INTERNAL_REGISTRY: '0'
+      CI_BUILDKIT_DNS_NAMESERVERS: '1.1.1.1,8.8.8.8'
+      CI_BUILDKIT_DNS_SEARCH_DOMAINS: ''
+    steps:
+      - *REQUIRE_SOURCE
+      - *CHECKOUT_SOURCE
+      - *VERIFY_SOURCE
+
+      - name: Configure environment
+        uses: ./.github/actions/configure-environment
+
+      - name: Restore caches
+        id: restore-cache
+        uses: ./.github/actions/restore-caches
+
+      - name: Configure Docker
+        uses: ./.github/actions/configure-docker
+        with:
+          cache-provider: gha
+
+      - name: CI script
+        run: ./ci/test_run_all.sh
+
+      - name: Save caches
+        uses: ./.github/actions/save-caches
