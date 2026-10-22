@@ -28,6 +28,7 @@ RPC (getpqtransportinfo, and the getpeerinfo and getnetworkinfo fields):
   transport_pq, and is 0 with the switch off.
 """
 from concurrent.futures import ThreadPoolExecutor
+import os
 import platform
 import re
 import socket
@@ -321,13 +322,13 @@ class PQTransportTest(BitcoinTestFramework):
             self.check_start(["-v2transport=1", f"-v2pqtransport={value}"], ENABLED)
         # With v2 off the effect is off, and the contradiction warns too.
         self.check_start(["-v2transport=0", "-v2pqtransport=1abc"], DISABLED_V2,
-                         expected_stderr=non_numeric_warning("1abc", 1, PQ_OFF) + "\n" + CONTRADICTION_WARNING)
+                         expected_stderr=non_numeric_warning("1abc", 1, PQ_OFF) + os.linesep + CONTRADICTION_WARNING)
 
         self.log.info("Test a double negative, which switches the hybrid transport on, warns")
         for value in ["0", "true", "on"]:
             self.check_start(["-v2transport=1", f"-nov2pqtransport={value}"], ENABLED, expected_stderr=double_negative_warning(PQ_ON))
         self.check_start(["-v2transport=0", "-nov2pqtransport=true"], DISABLED_V2,
-                         expected_stderr=double_negative_warning(PQ_OFF) + "\n" + CONTRADICTION_WARNING)
+                         expected_stderr=double_negative_warning(PQ_OFF) + os.linesep + CONTRADICTION_WARNING)
         append_config(node0.datadir_path, ["nov2pqtransport=true"])
         self.check_start(["-v2transport=1"], ENABLED, expected_stderr=double_negative_warning(PQ_ON))
         node0.replace_in_config([("nov2pqtransport=true\n", "")])
