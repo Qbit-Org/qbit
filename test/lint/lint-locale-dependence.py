@@ -56,6 +56,7 @@ REGEXP_EXTERNAL_DEPENDENCIES_EXCLUSIONS = [
     "src/leveldb/",
     "src/secp256k1/",
     "src/minisketch/",
+    "src/mlkem-native/",
     "src/tinyformat.h",
 ]
 

@@ -2,7 +2,7 @@
 # Copyright (c) 2026-present The qbit core developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or https://opensource.org/license/mit/.
-"""Executable contract for the PQ CI entry points (#184 part 2, work item C1).
+"""Executable contract for the PQ CI entry points (#184 part 2, work item C1; part 3, C2).
 
 ``ci-pq.yml`` and ``ci-nightly-heavy.yml`` are reusable and job-selectable, and
 the PQ unit job proves which suites ran. These tests read the real workflow
@@ -37,12 +37,14 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 import ctest_evidence
 import test_scheduled_validation_contract as svc
@@ -56,15 +58,35 @@ WORKFLOWS = {
 }
 GATE_WORKFLOW = svc.WORKFLOW_DIR / "required-merge-gate.yml"
 TEST_SCRIPT = REPO_ROOT / "ci" / "test" / "03_test_script.sh"
+MLKEM_TESTS = REPO_ROOT / "src" / "test" / "mlkem_tests.cpp"
+BOOST_RECIPE = REPO_ROOT / "depends" / "packages" / "boost.mk"
+MLKEM_BACKEND_HEADERS = [REPO_ROOT / "src" / "crypto" / name for name in ("mlkem_arith_backend.h", "mlkem_fips202_backend.h")]
 RESOLVER_JOB = svc.RESOLVER_JOB
 TRIGGER_STEP = "Check how the run started"
 REQUESTED_STEP = "Resolve requested source"
 SHARED_RESOLVER = "resolve_source_ref"
 SELECT_STEP = "Select jobs"
 REPORT_STEP = "Report unit-test evidence"
+DEPENDS_INSTALL_STEP = "Install Homebrew packages"
+DEPENDS_IDENTIFY_STEP = "Identify depends build"
+DEPENDS_RESTORE_STEP = "Restore depends cache"
+DEPENDS_SAVE_STEP = "Save depends cache"
+DEPENDS_REQUIRE_STEP = "Require depends build"
 PQ_UNIT_JOB = "unit"
 AARCH64_JOB = "aarch64-unit"
-AARCH64_SUITES = ["bip324_tests", "net_tests"]
+S390X_JOB = "s390x-unit"
+MACOS_JOB = "macos-arm64-unit"
+MACOS_X86_64_JOB = "macos-x86_64-unit"
+# Each macOS job: (runner label, uname -m, the ML-KEM backend that must run, its
+# word in the evidence line). The backend is read from the headers that name it.
+MACOS_JOBS = {
+    MACOS_JOB: ("macos-15", "arm64", "aarch64", "native AArch64"),
+    MACOS_X86_64_JOB: ("macos-15-intel", "x86_64", "x86_64", "native x86_64"),
+}
+PQ_MATRIX_JOBS = [AARCH64_JOB, S390X_JOB]
+ALL_PQ_JOBS = {PQ_UNIT_JOB: PQ_MATRIX_JOBS, MACOS_JOB: [], MACOS_X86_64_JOB: []}
+PQ_SUITES = ["mlkem_tests", "bip324_tests", "net_tests"]
+AARCH64_SUITES = PQ_SUITES
 NIGHTLY_MATRIX_JOBS = ["arm32-unit-1", "arm32-unit-2", "previous-releases", "fuzz"]
 NIGHTLY_ALL_JOBS: dict[str, list[str]] = {"nightly-matrix": NIGHTLY_MATRIX_JOBS, "scanner-readiness": []}
 NIGHTLY_VARS_OFF = {"CI_NIGHTLY_HEAVY_RUN_TEST_MATRIX": "false", "CI_NIGHTLY_HEAVY_RUN_SCANNERS": "false"}
@@ -74,7 +96,7 @@ CALLER_WORKFLOW = "ci-maintained-heavy.yml"  # main's heavy caller (C4)
 MATRIX_EXPRESSION = "${{ fromJSON(needs." + RESOLVER_JOB + ".outputs.matrix) }}"
 ANNOTATED_TAG = "v9.9.9-annotated"
 AMBIGUOUS_NAME = "dup"
-SUITE_INVENTORY = ["addrman_tests", "bip324_tests", "bip324_tests_extra", "net_tests", "netbase_tests", "util_tests"]
+SUITE_INVENTORY = ["addrman_tests", "bip324_tests", "bip324_tests_extra", "mlkem_tests", "net_tests", "netbase_tests", "util_tests"]
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +174,18 @@ def running_jobs(workflow: dict[str, Any], context: dict[str, Any]) -> dict[str,
     return running
 
 
+def mlkem_backend_names() -> dict[str, str]:
+    """The arithmetic/Keccak backend names GetBackendNames() reports, per architecture, read from the backend headers."""
+    names: dict[str, list[str]] = {}
+    for header in MLKEM_BACKEND_HEADERS:
+        text = header.read_text(encoding="utf8")
+        for arch, name in re.findall(r'^#(?:el)?if defined\(MLK_SYS_(X86_64|AARCH64)\)\n#define QBIT_MLKEM_\w+_BACKEND_NAME "([^"]+)"',
+                                     text, re.M):
+            names.setdefault(arch.lower(), []).append(name)
+    assert all(len(pair) == 2 for pair in names.values()) and set(names) == {"x86_64", "aarch64"}, names
+    return {arch: "/".join(pair) for arch, pair in names.items()}
+
+
 def source_env(env_file: str, names: list[str], extra_env: dict[str, str] | None = None) -> dict[str, str]:
     """Source a ci/test env file in bash and return the effective values of names."""
     script = f"set -e\nsource {env_file}\n" + "".join(f'printf "%s=%s\\n" {name} "${{{name}:-}}"\n' for name in names)
@@ -159,6 +193,14 @@ def source_env(env_file: str, names: list[str], extra_env: dict[str, str] | None
     env.update(extra_env or {})
     completed = subprocess.run(["bash", "-c", script], cwd=REPO_ROOT, env=env, text=True, capture_output=True, check=True)
     return svc.parse_key_values(completed.stdout)
+
+
+def depends_print(host: str, dep_opts: str, *names: str) -> dict[str, str]:
+    """Values depends/Makefile computes for host with dep_opts, read with its print- rule (nothing is built)."""
+    targets = " ".join(f"print-{name}" for name in names)
+    completed = subprocess.run(["bash", "-c", f"make -s -C depends HOST={host} {dep_opts} {targets}"], cwd=REPO_ROOT,
+                               text=True, capture_output=True, check=True)
+    return {name: value.strip() for name, value in svc.parse_key_values(completed.stdout).items()}
 
 
 def shell_block(text: str, start: str, end_line: str) -> str:
@@ -455,7 +497,14 @@ class PQWorkflowContractTest(unittest.TestCase):
     def test_named_dispatch_runs_only_selected_jobs(self) -> None:
         cases: list[tuple[str, dict[str, Any], dict[str, list[str]]]] = [
             (PQ, {"jobs": AARCH64_JOB}, {PQ_UNIT_JOB: [AARCH64_JOB]}),
-            (PQ, {"jobs": ""}, {PQ_UNIT_JOB: [AARCH64_JOB]}),
+            (PQ, {"jobs": S390X_JOB}, {PQ_UNIT_JOB: [S390X_JOB]}),
+            (PQ, {"jobs": MACOS_JOB}, {MACOS_JOB: []}),
+            (PQ, {"jobs": MACOS_X86_64_JOB}, {MACOS_X86_64_JOB: []}),
+            (PQ, {"jobs": f" {MACOS_JOB} , {AARCH64_JOB} "}, {PQ_UNIT_JOB: [AARCH64_JOB], MACOS_JOB: []}),
+            # What Full Validation's pq-unit job passes.
+            (PQ, {"jobs": f"{AARCH64_JOB},{MACOS_JOB},{MACOS_X86_64_JOB}"},
+             {PQ_UNIT_JOB: [AARCH64_JOB], MACOS_JOB: [], MACOS_X86_64_JOB: []}),
+            (PQ, {"jobs": ""}, ALL_PQ_JOBS),
             (NIGHTLY, {"run_test_matrix": True, "run_scanners": False, "jobs": "previous-releases"},
              {"nightly-matrix": ["previous-releases"]}),
             (NIGHTLY, {"jobs": ""}, {"nightly-matrix": NIGHTLY_MATRIX_JOBS, "scanner-readiness": []}),
@@ -488,7 +537,7 @@ class PQWorkflowContractTest(unittest.TestCase):
         outputs = context["needs"][RESOLVER_JOB]["outputs"]
         self.assertEqual(outputs["resolved_sha"], self.fixture.maintained_sha)
         self.assertNotEqual(outputs["resolved_sha"], context["github"]["sha"])
-        self.assertEqual(running_jobs(self.workflows[PQ], context), {PQ_UNIT_JOB: [AARCH64_JOB]})
+        self.assertEqual(running_jobs(self.workflows[PQ], context), ALL_PQ_JOBS)
 
     # -- called and direct nightly runs ---------------------------------------------
 
@@ -729,7 +778,8 @@ class PQWorkflowContractTest(unittest.TestCase):
 
     def test_rejects_unknown_repeated_and_empty_job_names(self) -> None:
         bad = {
-            PQ: ["aarch64", "AARCH64-UNIT", f"{AARCH64_JOB},{AARCH64_JOB}", f"{AARCH64_JOB},", ",", "s390x-unit"],
+            PQ: ["aarch64", "AARCH64-UNIT", f"{AARCH64_JOB},{AARCH64_JOB}", f"{AARCH64_JOB},", ",", "s390x", "macos-arm64",
+                 f"{MACOS_JOB},{MACOS_JOB}", "macos-x86_64", "macos-intel"],
             NIGHTLY: ["previous_releases", "previous-releases,previous-releases", "previous-releases,,fuzz", "unit"],
         }
         for key, values in bad.items():
@@ -784,7 +834,12 @@ class PQWorkflowContractTest(unittest.TestCase):
         workflow = self.workflows[PQ]
         context = self.resolve(PQ, self.dispatch(PQ, source_ref=svc.MAINTAINED_BRANCH, jobs=AARCH64_JOB))
         refs = svc.check_source_wiring(workflow, context)
-        self.assertEqual(refs, {PQ_UNIT_JOB: fixture.maintained_sha})
+        self.assertEqual(refs, {job: fixture.maintained_sha for job in ALL_PQ_JOBS})
+        # The macOS jobs share the unit job's guard, checkout and verification steps.
+        for macos_job in MACOS_JOBS:
+            for step_name in (svc.GUARD_STEP, svc.CHECKOUT_STEP, svc.VERIFY_STEP):
+                self.assertEqual(svc.find_step(workflow["jobs"][macos_job], step_name),
+                                 svc.find_step(workflow["jobs"][PQ_UNIT_JOB], step_name), (macos_job, step_name))
 
         mutated = copy.deepcopy(workflow)
         checkout = svc.find_step(mutated["jobs"][PQ_UNIT_JOB], svc.CHECKOUT_STEP)
@@ -812,7 +867,7 @@ class PQWorkflowContractTest(unittest.TestCase):
         workflow = self.workflows[PQ]
         (entry,) = [entry for entry in catalog(workflow) if entry["job"] == AARCH64_JOB]
         self.assertEqual(entry["runs-on"], "ubuntu-24.04-arm")
-        self.assertIn("pre-library", entry["name"])
+        self.assertIn("mlkem_tests", entry["phase"])
         env_file = entry["file-env"]
         self.assertTrue(os.access(REPO_ROOT / env_file, os.X_OK), env_file)
 
@@ -834,7 +889,7 @@ class PQWorkflowContractTest(unittest.TestCase):
         self.assertEqual(effective["CI_IMAGE_NAME_TAG"], "docker.io/library/ubuntu:24.04")
         self.assertEqual(effective["RUN_FUNCTIONAL_TESTS"], "false")
         regex = re.compile(effective["CTEST_REGEX"])
-        self.assertEqual([name for name in SUITE_INVENTORY if regex.search(name)], AARCH64_SUITES)
+        self.assertEqual([name for name in SUITE_INVENTORY if regex.search(name)], sorted(AARCH64_SUITES))
 
         # 02_run_container.py passes only variables exported by some ci/test/00_setup_env*.sh into the container.
         exported = set()
@@ -842,6 +897,320 @@ class PQWorkflowContractTest(unittest.TestCase):
             exported.update(re.findall(r"^\s*export ([A-Z_][A-Z0-9_]*)=", path.read_text(encoding="utf8"), re.M))
         for name in ("CI_BUILD_TARGET", "CTEST_REGEX", "CTEST_EXPECTED_SUITES", "CTEST_INCLUDE_RANGE"):
             self.assertIn(name, exported)
+
+    def test_s390x_job_cross_compiles_and_emulates_only_the_tests(self) -> None:
+        workflow = self.workflows[PQ]
+        (entry,) = [entry for entry in catalog(workflow) if entry["job"] == S390X_JOB]
+        self.assertEqual(entry["runs-on"], "ubuntu-24.04", "built on an x64 runner, not in an emulated container")
+        self.assertEqual(entry["timeout-minutes"], 180)
+        env_file = entry["file-env"]
+        self.assertTrue(os.access(REPO_ROOT / env_file, os.X_OK), env_file)
+
+        context = dict(self.resolve(PQ, self.dispatch(PQ, jobs=S390X_JOB)), matrix=entry)
+        env = svc.job_env(workflow, workflow["jobs"][PQ_UNIT_JOB], context)
+        self.assertEqual(env["FILE_ENV"], env_file)
+        names = ["HOST", "PACKAGES", "DEP_OPTS", "NO_DEPENDS", "CI_IMAGE_PLATFORM", "CI_BUILD_TARGET", "CTEST_REGEX",
+                 "CTEST_EXPECTED_SUITES", "CTEST_INCLUDE_RANGE", "RUN_FUNCTIONAL_TESTS", "BITCOIN_CONFIG"]
+        effective = source_env(env_file, names, {key: env[key] for key in ("CI_IMAGE_REGISTRY_PREFIX", "CI_ENFORCE_INTERNAL_REGISTRY")})
+        self.assertEqual(effective["HOST"], "s390x-linux-gnu")
+        self.assertEqual(effective["NO_DEPENDS"], "", "the depends tree is built for s390x")
+        self.assertEqual(effective["CI_IMAGE_PLATFORM"], "", "only the tests run emulated")
+        self.assertIn("g++-s390x-linux-gnu", effective["PACKAGES"].split())
+        self.assertIn("qemu-user", effective["PACKAGES"].split())
+        self.assertEqual(effective["CI_BUILD_TARGET"], "test_bitcoin")
+        self.assertEqual(effective["CTEST_EXPECTED_SUITES"].split(), PQ_SUITES)
+        self.assertEqual(effective["CTEST_INCLUDE_RANGE"], "")
+        self.assertEqual(effective["RUN_FUNCTIONAL_TESTS"], "false")
+        regex = re.compile(effective["CTEST_REGEX"])
+        self.assertEqual([name for name in SUITE_INVENTORY if regex.search(name)], sorted(PQ_SUITES))
+        # ctest runs each test through the emulator, so test_qbit is never started directly.
+        self.assertIn("-DCMAKE_CROSSCOMPILING_EMULATOR='qemu-s390x;-L;/usr/s390x-linux-gnu'", effective["BITCOIN_CONFIG"])
+
+    def test_macos_jobs_run_natively_on_apple_silicon_and_intel(self) -> None:
+        workflow = self.workflows[PQ]
+        catalog_names = [entry["job"] for entry in catalog(workflow)]
+        # Both jobs run the same steps; only their runner and job env differ.
+        self.assertEqual(workflow["jobs"][MACOS_JOB]["steps"], workflow["jobs"][MACOS_X86_64_JOB]["steps"])
+        backends = mlkem_backend_names()
+        for job_id, (runner, machine, arch, evidence_word) in MACOS_JOBS.items():
+            with self.subTest(job=job_id):
+                self.assertNotIn(job_id, catalog_names)
+                self.check_macos_job(workflow, job_id, runner, machine, backends[arch], evidence_word)
+
+    def check_macos_job(self, workflow: dict[str, Any], job_id: str, runner: str, machine: str, backend: str,
+                        evidence_word: str) -> None:
+        fixture = self.fixture
+        job = workflow["jobs"][job_id]
+        self.assertEqual(job["runs-on"], runner)
+        context = self.resolve(PQ, self.dispatch(PQ, jobs=job_id))
+        env = svc.job_env(workflow, job, context)
+        self.assertEqual(env["DANGER_RUN_CI_ON_HOST"], "1", "no Docker on the macOS host")
+        env_file = env["FILE_ENV"]
+        self.assertTrue(os.access(REPO_ROOT / env_file, os.X_OK), env_file)
+        self.assertEqual(env["MATRIX_NAME"], job["name"])
+        self.assertEqual(env["EXPECTED_MACHINE"], machine)
+        self.assertEqual(env["MLKEM_EXPECTED_BACKEND"], backend)
+        names = ["CI_OS_NAME", "NO_DEPENDS", "CI_BUILD_TARGET", "CTEST_REGEX", "CTEST_EXPECTED_SUITES", "RUN_FUNCTIONAL_TESTS",
+                 "BITCOIN_CONFIG"]
+        effective = source_env(env_file, names)
+        # Losing the native backend must fail the configure step, not fall back quietly.
+        self.assertIn("-DWITH_MLKEM_NATIVE=ON", effective["BITCOIN_CONFIG"].split())
+        self.assertEqual(effective["CI_OS_NAME"], "macos")
+        self.assertEqual(effective["NO_DEPENDS"], "", "Boost and libevent come from depends, not Homebrew")
+        self.assertEqual(effective["CI_BUILD_TARGET"], "test_bitcoin")
+        self.assertEqual(effective["CTEST_EXPECTED_SUITES"].split(), PQ_SUITES)
+        self.assertEqual(effective["RUN_FUNCTIONAL_TESTS"], "false")
+        regex = re.compile(effective["CTEST_REGEX"])
+        self.assertEqual([name for name in SUITE_INVENTORY if regex.search(name)], sorted(PQ_SUITES))
+        github_env = svc.github_env_for(context, job_id, workflow["name"])
+
+        # The report and native checks read the build from BASE_BUILD_DIR, which
+        # a step sets from RUNNER_TEMP: the runner context is unavailable in job env.
+        self.assertNotIn("BASE_BUILD_DIR", job["env"])
+        set_dir = svc.find_step(job, "Set build directory")
+        self.assertLess(svc.step_index(job, "Set build directory"), svc.step_index(job, "CI script"))
+        with tempfile.TemporaryDirectory(dir=fixture.root) as tmp:
+            github_env_file = Path(tmp) / "github-env"
+            github_env_file.touch()
+            step_env = svc.step_env(workflow, job, set_dir, context)
+            step_env.update({"RUNNER_TEMP": "/runner/temp", "GITHUB_ENV": str(github_env_file)})
+            result = svc.run_step(fixture, set_dir, step_env, fixture.root, github_env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(github_env_file.read_text(encoding="utf8"), "BASE_BUILD_DIR=/runner/temp/build\n")
+
+        # The architecture check refuses any other machine.
+        step = svc.find_step(job, "Require runner architecture")
+        self.assertLess(svc.step_index(job, "Require runner architecture"), svc.step_index(job, "CI script"))
+        with tempfile.TemporaryDirectory(dir=fixture.root) as tmp:
+            stubs = Path(tmp)
+            (stubs / "uname").write_text('#!/bin/sh\necho "$STUB_MACHINE"\n', encoding="utf8")
+            (stubs / "uname").chmod(0o755)
+            for other in ("arm64", "x86_64"):
+                with self.subTest(machine=other):
+                    step_env = svc.step_env(workflow, job, step, context)
+                    step_env.update({"PATH": f"{stubs}:{os.environ['PATH']}", "STUB_MACHINE": other})
+                    result = svc.run_step(fixture, step, step_env, fixture.root, github_env)
+                    self.assertEqual(result.returncode == 0, other == machine, result.stderr)
+                    if other != machine:
+                        self.assertIn(f"{job_id} must run on {machine}", result.stderr)
+
+        # After the suites pass, the native backend must be the one that ran.
+        step = svc.find_step(job, "Require native ML-KEM")
+        self.assertLess(svc.step_index(job, "CI script"), svc.step_index(job, "Require native ML-KEM"))
+        self.assertLess(svc.step_index(job, "Require native ML-KEM"), svc.step_index(job, REPORT_STEP))
+        native_line = f"compiled {backend}, active {backend}"
+        cases = [
+            ("native", native_line, 0, True),
+            ("portable on a CPU without an extension", f"compiled {backend}, active portable/portable", 0, False),
+            ("portable build", "compiled portable/portable, active portable/portable", 0, False),
+            ("other native backend", "compiled other/other, active other/other", 0, False),
+            ("only part of the line", f"compiled {backend}, active {backend}x", 0, False),
+            ("test failed", native_line, 201, False),
+        ]
+        for label, line, exit_code, ok in cases:
+            with self.subTest(job=job_id, native_check=label), tempfile.TemporaryDirectory(dir=fixture.root) as tmp:
+                build = Path(tmp)
+                (build / "bin").mkdir()
+                stub = build / "bin" / "test_qbit"
+                stub.write_text("#!/bin/sh\n"
+                                'printf "%s\\n" "$*" > "$(dirname "$0")/args"\n'
+                                f"echo 'Running 1 test case...'\necho '{line}'\nexit {exit_code}\n", encoding="utf8")
+                stub.chmod(0o755)
+                step_env = svc.step_env(workflow, job, step, context)
+                step_env["BASE_BUILD_DIR"] = str(build)
+                result = svc.run_step(fixture, step, step_env, fixture.root, github_env)
+                self.assertEqual(result.returncode == 0, ok, result.completed.stdout + result.stderr)
+                self.assertEqual((build / "bin" / "args").read_text(encoding="utf8").split(),
+                                 ["--run_test=mlkem_tests/backend_selection", "--log_level=message", "--color_output=no"])
+                if not ok:
+                    self.assertIn("::error::", result.stderr)
+        # The line the step looks for is the one backend_selection logs.
+        self.assertIn('BOOST_TEST_MESSAGE("compiled " << compiled_arith << "/" << compiled_keccak << ", active " << '
+                      'active.arith << "/" << active.keccak);', MLKEM_TESTS.read_text(encoding="utf8"))
+
+        # Evidence is reported exactly as for the matrix jobs.
+        report = svc.find_step(job, REPORT_STEP)
+        self.assertEqual(report.get("if"), "${{ always() }}")
+        self.assertEqual(report["run"], svc.find_step(workflow["jobs"][PQ_UNIT_JOB], REPORT_STEP)["run"])
+        with tempfile.TemporaryDirectory(dir=fixture.root) as tmp:
+            build = Path(tmp)
+            (build / "ctest-evidence").mkdir()
+            (build / "ctest-evidence" / "summary.md").write_text("| mlkem_tests | passed | 0.5 |\n", encoding="utf8")
+            step_env = svc.step_env(workflow, job, report, context)
+            step_env["BASE_BUILD_DIR"] = str(build)
+            result = svc.run_step(fixture, report, step_env, fixture.root, github_env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(f"## {job['name']}", result.summary)
+            self.assertIn(evidence_word, result.summary)
+            self.assertIn("| mlkem_tests | passed | 0.5 |", result.summary)
+
+    def test_macos_jobs_build_boost_and_libevent_through_depends(self) -> None:
+        workflow = self.workflows[PQ]
+        for job_id, (_runner, _machine, arch, _evidence_word) in MACOS_JOBS.items():
+            with self.subTest(job=job_id):
+                self.check_macos_depends(workflow, job_id, f"{arch}-apple-darwin24.6.0")
+
+    def check_macos_depends(self, workflow: dict[str, Any], job_id: str, runner_host: str) -> None:
+        fixture = self.fixture
+        job = workflow["jobs"][job_id]
+        context = self.resolve(PQ, self.dispatch(PQ, jobs=job_id))
+        github_env = svc.github_env_for(context, job_id, workflow["name"])
+        env_file = svc.job_env(workflow, job, context)["FILE_ENV"]
+        dep_opts = source_env(env_file, ["DEP_OPTS"])["DEP_OPTS"]
+
+        # For the runner's host, depends builds Boost and libevent and nothing else.
+        printed = depends_print(runner_host, dep_opts, "packages", "native_packages")
+        self.assertEqual(printed["packages"].split(), ["boost", "libevent"])
+        self.assertEqual(printed["native_packages"].split(), [])
+
+        order = [DEPENDS_INSTALL_STEP, DEPENDS_IDENTIFY_STEP, DEPENDS_RESTORE_STEP, "CI script", DEPENDS_SAVE_STEP,
+                 DEPENDS_REQUIRE_STEP, "Require native ML-KEM", REPORT_STEP]
+        self.assertEqual([svc.step_index(job, name) for name in order], sorted(svc.step_index(job, name) for name in order))
+
+        # Homebrew provides GNU Make 4 as the make on PATH, but neither library.
+        step = svc.find_step(job, DEPENDS_INSTALL_STEP)
+        with tempfile.TemporaryDirectory(dir=fixture.root) as tmp:
+            stubs = Path(tmp)
+            (stubs / "brew").write_text('#!/bin/sh\nif [ "$1" = --prefix ]; then echo "/stub/opt/$2"; '
+                                        'else echo "$*" >> "$STUB_LOG"; fi\n', encoding="utf8")
+            (stubs / "brew").chmod(0o755)
+            step_env = svc.step_env(workflow, job, step, context)
+            step_env.update({"PATH": f"{stubs}:{os.environ['PATH']}", "STUB_LOG": str(stubs / "log"),
+                             "GITHUB_PATH": str(stubs / "github-path")})
+            result = svc.run_step(fixture, step, step_env, fixture.root, github_env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            installed = (stubs / "log").read_text(encoding="utf8").split()
+            self.assertEqual(installed[:2], ["install", "--quiet"])
+            self.assertIn("make", installed)
+            self.assertNotIn("boost", installed)
+            self.assertNotIn("libevent", installed)
+            self.assertEqual((stubs / "github-path").read_text(encoding="utf8"), "/stub/opt/make/libexec/gnubin\n")
+
+        # HOST and the cache key's id are what depends reports for this build.
+        step = svc.find_step(job, DEPENDS_IDENTIFY_STEP)
+        host = subprocess.run([str(REPO_ROOT / "depends" / "config.guess")], text=True, capture_output=True,
+                              check=True).stdout.strip()
+        expected_id = depends_print(host, dep_opts, "final_build_id")["final_build_id"]
+        self.assertRegex(expected_id, r"^[0-9a-f]+$")
+        with tempfile.TemporaryDirectory(dir=fixture.root) as tmp:
+            # A working make that reports macOS's own GNU Make 3.81.
+            stubs = Path(tmp) / "stubs"
+            stubs.mkdir()
+            (stubs / "make").write_text("#!/bin/sh\n"
+                                        "if [ \"$1\" = --version ]; then echo 'GNU Make 3.81'; exit 0; fi\n"
+                                        f"exec {shutil.which('make')} \"$@\"\n", encoding="utf8")
+            (stubs / "make").chmod(0o755)
+            for label, path, ok in (("GNU Make 4", os.environ["PATH"], True), ("GNU Make 3.81", f"{stubs}:{os.environ['PATH']}", False)):
+                with self.subTest(job=job_id, make=label):
+                    github_env_file = Path(tmp) / f"github-env-{ok}"
+                    github_env_file.touch()
+                    step_env = svc.step_env(workflow, job, step, context)
+                    step_env.update({"PATH": path, "BASE_ROOT_DIR": str(REPO_ROOT), "GITHUB_ENV": str(github_env_file)})
+                    result = svc.run_step(fixture, step, step_env, REPO_ROOT, github_env)
+                    self.assertEqual(result.returncode == 0, ok, result.completed.stdout + result.stderr)
+                    if ok:
+                        self.assertEqual(github_env_file.read_text(encoding="utf8"), f"HOST={host}\nDEPENDS_BUILD_ID={expected_id}\n")
+                    else:
+                        self.assertIn("::error::depends needs GNU Make 4 or later", result.stderr)
+                        self.assertEqual(github_env_file.read_text(encoding="utf8"), "")
+
+        # The cache holds depends/built under that key, and is saved under the
+        # same key once the CI script wrote the toolchain file.
+        restore = svc.find_step(job, DEPENDS_RESTORE_STEP)
+        save = svc.find_step(job, DEPENDS_SAVE_STEP)
+        self.assertEqual(restore["uses"].split("@"), ["actions/cache/restore", save["uses"].split("@")[1]])
+        self.assertEqual(save["uses"].split("@")[0], "actions/cache/save")
+        self.assertEqual(restore["with"]["path"], "depends/built")
+        self.assertEqual(save["with"]["path"], restore["with"]["path"])
+        self.assertEqual(save["with"]["key"], "${{ steps." + restore["id"] + ".outputs.cache-primary-key }}")
+        step_context = dict(context, env={"HOST": runner_host, "DEPENDS_BUILD_ID": "0123456789a"})
+        self.assertEqual(svc.render(restore["with"]["key"], step_context), f"depends-{runner_host}-0123456789a")
+        toolchain = f"depends/{runner_host}/toolchain.cmake"
+        save_cases = [
+            ("built on a miss", "", [toolchain], False, True),
+            ("restore-key match", "false", [toolchain], False, True),
+            ("exact hit", "true", [toolchain], False, False),
+            ("depends did not finish", "", [], False, False),
+            ("cancelled", "", [toolchain], True, False),
+        ]
+        for label, cache_hit, files, cancelled, saves in save_cases:
+            with self.subTest(job=job_id, save=label):
+                functions = {"cancelled": lambda cancelled=cancelled: cancelled,
+                             "hashfiles": lambda pattern, files=files: "f00d" if pattern in files else ""}
+                save_context = dict(step_context, steps={restore["id"]: {"outputs": {"cache-hit": cache_hit}}})
+                with mock.patch.dict(svc._FUNCTIONS, functions):
+                    self.assertIs(svc._truthy(svc.render(save["if"], save_context)), saves)
+
+        # Afterwards the build must have used that depends tree: its toolchain,
+        # libevent, and Boost at the version boost.mk pins.
+        step = svc.find_step(job, DEPENDS_REQUIRE_STEP)
+        pinned = re.search(r"^\$\(package\)_version *= *(\S+)$", BOOST_RECIPE.read_text(encoding="utf8"), re.M)
+        assert pinned is not None, BOOST_RECIPE
+        boost_version = pinned.group(1)
+        build_id = "0123456789a"
+        build_cases: list[tuple[str, dict[str, str | None], str, str | None]] = [
+            ("depends", {}, build_id, None),
+            ("depends, other entry type", {"CMAKE_TOOLCHAIN_FILE:FILEPATH": None,
+                                           "CMAKE_TOOLCHAIN_FILE:UNINITIALIZED": "{prefix}/toolchain.cmake"}, build_id, None),
+            ("stale cache key", {}, "fedcba98765", "depends did not build 0123456789a"),
+            ("no depends", {"CMAKE_TOOLCHAIN_FILE:FILEPATH": None,
+                            "Boost_DIR:PATH": "/opt/homebrew/Cellar/boost/1.92.0/lib/cmake/Boost-1.92.0"},
+             build_id, "CMAKE_TOOLCHAIN_FILE unset"),
+            ("Homebrew Boost", {"Boost_DIR:PATH": "/opt/homebrew/Cellar/boost/1.92.0/lib/cmake/Boost-1.92.0"},
+             build_id, "Boost_DIR must be {prefix}/lib/cmake/Boost-" + boost_version),
+            ("other depends Boost", {"Boost_DIR:PATH": "{prefix}/lib/cmake/Boost-1.0.0"}, build_id, "Boost-1.0.0"),
+            ("Homebrew libevent", {"Libevent_DIR:PATH": "/opt/homebrew/lib/cmake/libevent"}, build_id, "Libevent_DIR must be"),
+        ]
+        for label, changes, stamp_id, error in build_cases:
+            with self.subTest(job=job_id, depends_build=label), tempfile.TemporaryDirectory(dir=fixture.root) as tmp:
+                root = Path(tmp) / "workspace"
+                prefix = root / "depends" / runner_host
+                prefix.mkdir(parents=True)
+                (prefix / f".stamp_{stamp_id}").touch()
+                (root / "depends" / "packages").mkdir()
+                shutil.copy(BOOST_RECIPE, root / "depends" / "packages")
+                entries: dict[str, str | None] = {
+                    "CMAKE_TOOLCHAIN_FILE:FILEPATH": "{prefix}/toolchain.cmake",
+                    "Boost_DIR:PATH": "{prefix}/lib/cmake/Boost-" + boost_version,
+                    "Libevent_DIR:PATH": "{prefix}/lib/cmake/libevent",
+                }
+                entries.update(changes)
+                build = Path(tmp) / "build"
+                build.mkdir()
+                (build / "CMakeCache.txt").write_text(
+                    "".join(f"{key}={value.format(prefix=prefix)}\n" for key, value in entries.items() if value is not None),
+                    encoding="utf8")
+                step_env = svc.step_env(workflow, job, step, context)
+                step_env.update({"BASE_ROOT_DIR": str(root), "BASE_BUILD_DIR": str(build), "HOST": runner_host,
+                                 "DEPENDS_BUILD_ID": build_id})
+                result = svc.run_step(fixture, step, step_env, fixture.root, github_env)
+                self.assertEqual(result.returncode == 0, error is None, result.completed.stdout + result.stderr)
+                if error is None:
+                    self.assertIn(f"Built with Boost {boost_version} and libevent from {prefix}", result.completed.stdout)
+                else:
+                    self.assertIn("::error::", result.stderr)
+                    self.assertIn(error.format(prefix=prefix), result.stderr)
+
+    def test_contexts_are_available_where_used(self) -> None:
+        """Mirror actionlint's context-availability rule for the places these workflows use expressions.
+
+        GitHub refuses to load a workflow that reads, say, runner in a job's env,
+        while this file's expression evaluator would render it as empty.
+        """
+        expression = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+        root = re.compile(r"(?<![\w.'\"-])([a-z_]+)(?=\.|\[)")
+        job_env_contexts = {"github", "needs", "strategy", "matrix", "vars", "secrets", "inputs"}
+        for key, workflow in self.workflows.items():
+            for job_id, job in workflow["jobs"].items():
+                with self.subTest(workflow=key, job=job_id):
+                    for name, value in (job.get("env") or {}).items():
+                        for expr in expression.findall(str(value)):
+                            self.assertLessEqual(set(root.findall(expr)), job_env_contexts,
+                                                 f"{job_id} env {name}: {value!r} uses a context unavailable in job env")
+                    # A step shared by YAML anchor must not read matrix in a job that has none.
+                    if "matrix" not in (job.get("strategy") or {}):
+                        uses_matrix = "matrix." in json.dumps(job.get("steps", []))
+                        self.assertFalse(uses_matrix, f"{job_id} has no matrix, but one of its steps reads matrix")
 
     def test_build_target_reaches_both_build_commands(self) -> None:
         block = shell_block(TEST_SCRIPT.read_text(encoding="utf8"), "CI_BUILD_TARGET=${CI_BUILD_TARGET:-all}", ")")
@@ -858,7 +1227,7 @@ class PQWorkflowContractTest(unittest.TestCase):
 
     def test_ctest_selection_reaches_listing_run_and_evidence(self) -> None:
         block = shell_block(TEST_SCRIPT.read_text(encoding="utf8"), 'if [ "$RUN_UNIT_TESTS" = "true" ]; then', "fi")
-        regex = "^(bip324_tests|net_tests)$"
+        regex = "^(mlkem_tests|bip324_tests|net_tests)$"
         expected = " ".join(AARCH64_SUITES)
 
         run = run_test_script_block(block, {"CTEST_REGEX": regex, "CTEST_EXPECTED_SUITES": expected})
@@ -880,12 +1249,12 @@ class PQWorkflowContractTest(unittest.TestCase):
         failures = {
             "skipped suite": ({"CTEST_REGEX": regex, "CTEST_EXPECTED_SUITES": expected,
                                "STUB_OUTCOMES": json.dumps({"bip324_tests": "notrun"})}, "bip324_tests: skipped"),
-            "regex selects too little": ({"CTEST_REGEX": "^(net_tests)$", "CTEST_EXPECTED_SUITES": expected},
+            "regex selects too little": ({"CTEST_REGEX": "^(mlkem_tests|net_tests)$", "CTEST_EXPECTED_SUITES": expected},
                                          "did not select expected suite(s): bip324_tests"),
-            "regex selects too much": ({"CTEST_REGEX": "^bip324_tests|^net_tests$", "CTEST_EXPECTED_SUITES": expected},
+            "regex selects too much": ({"CTEST_REGEX": "^mlkem_tests$|^bip324_tests|^net_tests$", "CTEST_EXPECTED_SUITES": expected},
                                        "not expected: bip324_tests_extra"),
-            "suite missing from the build": ({"CTEST_REGEX": "^(bip324_tests|net_tests|mlkem_tests)$",
-                                              "CTEST_EXPECTED_SUITES": expected + " mlkem_tests"}, "mlkem_tests"),
+            "suite missing from the build": ({"CTEST_REGEX": "^(mlkem_tests|bip324_tests|net_tests|pq_records_tests)$",
+                                              "CTEST_EXPECTED_SUITES": expected + " pq_records_tests"}, "pq_records_tests"),
             "range and regex together": ({"CTEST_REGEX": regex, "CTEST_INCLUDE_RANGE": "1,2"}, "set only one"),
             "nothing selected": ({"CTEST_REGEX": "^nothing$"}, "No tests were found"),
         }
@@ -929,7 +1298,7 @@ class PQWorkflowContractTest(unittest.TestCase):
             report = svc.run_step(fixture, step, env, fixture.root, github_env)
             self.assertEqual(report.returncode, 0, report.stderr)
             self.assertIn(f"- source: {fixture.manual_sha} (refs/heads/{fixture.manual_branch})", report.summary)
-            self.assertIn("Pre-library phase", report.summary)
+            self.assertIn("mlkem_tests, bip324_tests and net_tests on AArch64", report.summary)
             self.assertIn("| bip324_tests | passed | 0.5 |", report.summary)
 
     def test_required_gate_runs_the_contracts(self) -> None:
@@ -1000,6 +1369,74 @@ class CtestEvidenceTest(unittest.TestCase):
             listing.unlink()
             self.assertEqual(main(), 1)
             self.assertIn("unreadable ctest test listing", summary.read_text(encoding="utf8"))
+
+
+
+class FuzzReplayContractTest(unittest.TestCase):
+    """The fuzz phase of 03_test_script.sh replays the ML-KEM targets on portable C too (#190 D5)."""
+
+    STUB_RUNNER = r'''#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ["STUB_LOG"], "a", encoding="utf8") as log:
+    log.write(json.dumps({"args": sys.argv[1:], "MLKEM_FORCE_PORTABLE": os.environ.get("MLKEM_FORCE_PORTABLE")}) + "\n")
+'''
+
+    @staticmethod
+    def fuzz_block() -> str:
+        """The last RUN_FUZZ_TESTS block of 03_test_script.sh: the replay and mutation phase."""
+        lines = TEST_SCRIPT.read_text(encoding="utf8").splitlines()
+        first = max(index for index, line in enumerate(lines) if line == 'if [ "$RUN_FUZZ_TESTS" = "true" ]; then')
+        last = next(index for index in range(first + 1, len(lines)) if lines[index] == "fi")
+        return "\n".join(lines[first:last + 1]) + "\n"
+
+    @staticmethod
+    def required_targets() -> list[str]:
+        """QBIT_REQUIRED_CORPUS_TARGETS from test/fuzz/test_runner.py, read without importing it."""
+        import ast
+        tree = ast.parse((REPO_ROOT / "test" / "fuzz" / "test_runner.py").read_text(encoding="utf8"))
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == "QBIT_REQUIRED_CORPUS_TARGETS" for t in node.targets):
+                return list(ast.literal_eval(node.value))
+        raise AssertionError("QBIT_REQUIRED_CORPUS_TARGETS not found")
+
+    def run_block(self, mutate_min_time: str) -> list[dict[str, Any]]:
+        with tempfile.TemporaryDirectory(prefix="ci-fuzz-") as tmp:
+            root = Path(tmp)
+            runner = root / "build" / "test" / "fuzz" / "test_runner.py"
+            runner.parent.mkdir(parents=True)
+            runner.write_text(self.STUB_RUNNER, encoding="utf8")
+            runner.chmod(0o755)
+            log = root / "calls.jsonl"
+            log.touch()
+            env = {"PATH": os.environ["PATH"], "HOME": tmp, "LC_ALL": "C", "RUN_FUZZ_TESTS": "true",
+                   "BASE_BUILD_DIR": str(root / "build"), "DEPENDS_DIR": str(root / "depends"), "HOST": "x86_64-pc-linux-gnu",
+                   "MAKEJOBS": "-j2", "DIR_FUZZ_IN": str(root / "corpora"), "FUZZ_TESTS_CONFIG": "",
+                   "QBIT_FUZZ_MUTATE_MIN_TIME": mutate_min_time, "STUB_LOG": str(log)}
+            script = root / "block.sh"
+            script.write_text("set -ex\n" + self.fuzz_block(), encoding="utf8")
+            completed = subprocess.run(["bash", str(script)], env=env, text=True, capture_output=True)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            return [json.loads(line) for line in log.read_text(encoding="utf8").splitlines()]
+
+    def test_mlkem_targets_replay_on_portable_c(self) -> None:
+        replay, portable = self.run_block(mutate_min_time="")
+        self.assertIn("--require_qbit_corpus", replay["args"])
+        self.assertIsNone(replay["MLKEM_FORCE_PORTABLE"])
+        self.assertEqual(portable["MLKEM_FORCE_PORTABLE"], "1")
+        self.assertEqual(portable["args"][-2:], ["mlkem", "mlkem_backend_diff"])
+        corpus = [arg for arg in replay["args"] if arg.endswith("/corpora")]
+        self.assertEqual(len(corpus), 1, replay["args"])
+        self.assertIn(corpus[0], portable["args"], "the portable replay uses the same corpus")
+
+    def test_mutation_phase_covers_every_required_target(self) -> None:
+        calls = self.run_block(mutate_min_time="60")
+        self.assertEqual(len(calls), 3)
+        mutate = calls[2]
+        self.assertIn("--mutate_min_time=60", mutate["args"])
+        self.assertIsNone(mutate["MLKEM_FORCE_PORTABLE"])
+        targets = self.required_targets()
+        self.assertIn("mlkem", targets)
+        self.assertEqual(mutate["args"][-len(targets):], targets)
 
 
 if __name__ == "__main__":

@@ -9,9 +9,14 @@
 # - on-demand runs go through main's PQ caller (C4, part 2 of #184), which takes
 #   workflow_dispatch inputs source_ref and jobs and calls ci-pq.yml@1.x.x, for
 #   example gh workflow run ci-maintained-pq.yml -f source_ref=<branch> -f jobs=aarch64-unit.
-#   That caller lands on main after this part merges.
+#   That caller lands on main after this part merges;
+# - Full Validation (ci.yml) calls it with aarch64-unit, macos-arm64-unit and
+#   macos-x86_64-unit for every change that ci/checks/classify_merge_profile.py
+#   says needs them.
 # The workflow_dispatch trigger below stays for when this file is on main itself;
 # until then GitHub rejects gh workflow run ci-pq.yml.
+# Jobs: aarch64-unit, s390x-unit (big-endian, emulated), macos-arm64-unit and
+# macos-x86_64-unit.
 # The source is resolved once to a commit, every job checks out and verifies
 # that commit, and the summaries record it.
 
@@ -27,7 +32,7 @@ on:
         type: string
         default: ''
       jobs:
-        description: 'Comma-separated jobs to run (aarch64-unit); empty runs all'
+        description: 'Comma-separated jobs to run (aarch64-unit, s390x-unit, macos-arm64-unit, macos-x86_64-unit); empty runs all'
         required: false
         type: string
         default: ''
@@ -39,7 +44,7 @@ on:
         type: string
         default: ''
       jobs:
-        description: 'Comma-separated jobs to run (aarch64-unit); empty runs all'
+        description: 'Comma-separated jobs to run (aarch64-unit, s390x-unit, macos-arm64-unit, macos-x86_64-unit); empty runs all'
         required: false
         type: string
         default: ''
@@ -59,6 +64,8 @@ jobs:
       matrix: ${{ steps.select.outputs.matrix }}
       matrix_count: ${{ steps.select.outputs.matrix_count }}
       selected: ${{ steps.select.outputs.selected }}
+      run_macos_arm64_unit: ${{ steps.select.outputs.run_macos_arm64_unit }}
+      run_macos_x86_64_unit: ${{ steps.select.outputs.run_macos_x86_64_unit }}
     steps:
       - name: Resolve source
         id: resolve
@@ -167,15 +174,23 @@ jobs:
             [
               {
                 "job": "aarch64-unit",
-                "name": "AArch64 unit tests (pre-library phase)",
+                "name": "AArch64 unit tests",
                 "runs-on": "ubuntu-24.04-arm",
                 "timeout-minutes": 120,
                 "file-env": "./ci/test/00_setup_env_native_aarch64_pq.sh",
-                "phase": "Pre-library phase: bip324_tests and net_tests on AArch64. Part 3 (#190) adds mlkem_tests with the ML-KEM library."
+                "phase": "mlkem_tests, bip324_tests and net_tests on AArch64 Linux. ML-KEM runs portable C here: its AArch64 assembly has no BTI landing pads."
+              },
+              {
+                "job": "s390x-unit",
+                "name": "s390x big-endian unit tests (emulated)",
+                "runs-on": "ubuntu-24.04",
+                "timeout-minutes": 180,
+                "file-env": "./ci/test/00_setup_env_s390x_unit.sh",
+                "phase": "mlkem_tests, bip324_tests and net_tests cross-built for big-endian s390x and run under qemu-s390x. The timeout stays 180 minutes until runs are measured, then becomes twice the measured time."
               }
             ]
           # Selectable jobs that are not matrix entries; each gets a run_<job> output.
-          NON_MATRIX_JOBS: ''
+          NON_MATRIX_JOBS: 'macos-arm64-unit macos-x86_64-unit'
         run: |
           # Turn the comma-separated jobs input into the matrix: empty selects
           # every job; an empty, unknown or repeated name fails the run.
@@ -233,6 +248,8 @@ jobs:
       CI_FAILFAST_TEST_LEAVE_DANGLING: 1
       DANGER_CI_ON_HOST_FOLDERS: 1
       FILE_ENV: ${{ matrix.file-env }}
+      # Read by the steps the macOS jobs share, so it is set per job.
+      MATRIX_NAME: ${{ matrix.name }}
       TEST_RUNNER_FAILFAST: 'false'
       MAKEJOBS: '-j4'
       TEST_RUNNER_JOBS: '4'
@@ -245,7 +262,8 @@ jobs:
       CI_BUILDKIT_DNS_NAMESERVERS: '1.1.1.1,8.8.8.8'
       CI_BUILDKIT_DNS_SEARCH_DOMAINS: ''
     steps:
-      - name: Require resolved source
+      - &REQUIRE_SOURCE
+        name: Require resolved source
         shell: bash
         env:
           RESOLVED_SHA: ${{ needs.resolve-source.outputs.resolved_sha }}
@@ -258,20 +276,21 @@ jobs:
             || { echo "::error::resolved source '$RESOLVED_SHA' is not a full commit hash" >&2; exit 1; }
           [ -n "$REQUESTED_REF" ] || { echo "::error::requested ref is empty" >&2; exit 1; }
 
-      - name: Checkout
+      - &CHECKOUT_SOURCE
+        name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           ref: ${{ needs.resolve-source.outputs.resolved_sha }}
           fetch-depth: 0
 
-      - name: Verify checked-out source
+      - &VERIFY_SOURCE
+        name: Verify checked-out source
         shell: bash
         env:
           SOURCE_MODE: ${{ needs.resolve-source.outputs.source_mode }}
           REQUESTED_REF: ${{ needs.resolve-source.outputs.requested_ref }}
           RESOLVED_SHA: ${{ needs.resolve-source.outputs.resolved_sha }}
           WORKFLOW_SHA: ${{ github.workflow_sha }}
-          MATRIX_NAME: ${{ matrix.name }}
         run: |
           set -euo pipefail
           actual_head="$(git rev-parse --verify 'HEAD^{commit}')"
@@ -301,7 +320,8 @@ jobs:
         with:
           cache-provider: gha
 
-      - name: CI script
+      - &CI_SCRIPT
+        name: CI script
         run: ./ci/test_run_all.sh
 
       - name: Report unit-test evidence
@@ -310,9 +330,8 @@ jobs:
         env:
           RESOLVED_SHA: ${{ needs.resolve-source.outputs.resolved_sha }}
           REQUESTED_REF: ${{ needs.resolve-source.outputs.requested_ref }}
-          MATRIX_NAME: ${{ matrix.name }}
           PHASE: ${{ matrix.phase }}
-        run: |
+        run: &REPORT_EVIDENCE |
           set -euo pipefail
           # ci/test/03_test_script.sh writes this after ctest_evidence.py has
           # checked that every expected suite was selected, executed and passed.
@@ -333,3 +352,198 @@ jobs:
 
       - name: Save caches
         uses: ./.github/actions/save-caches
+
+  # macOS runs natively on the host, without Docker, so each architecture is a
+  # job of its own rather than a matrix entry of unit. Both share unit's source
+  # checks, CI script and evidence report, and build with WITH_MLKEM_NATIVE=ON:
+  # these are the only jobs that run ML-KEM's native code on macOS.
+  macos-arm64-unit:
+    name: macOS arm64 unit tests
+    needs: resolve-source
+    if: ${{ needs.resolve-source.outputs.run_macos_arm64_unit == 'true' }}
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      DANGER_RUN_CI_ON_HOST: 1
+      FILE_ENV: ./ci/test/00_setup_env_mac_native_pq.sh
+      MATRIX_NAME: macOS arm64 unit tests
+      BASE_ROOT_DIR: ${{ github.workspace }}
+      TEST_RUNNER_FAILFAST: 'false'
+      MAKEJOBS: '-j3'
+      TEST_RUNNER_JOBS: '3'
+      CTEST_JOBS: '3'
+      # Read by the steps the macOS jobs share: the runner's uname -m, the
+      # ML-KEM backend (arithmetic/Keccak) that must run, and the evidence line.
+      EXPECTED_MACHINE: arm64
+      MLKEM_EXPECTED_BACKEND: aarch64-neon/aarch64
+      PHASE: mlkem_tests, bip324_tests and net_tests natively on Apple Silicon, where ML-KEM runs its native AArch64 code.
+    steps:
+      - *REQUIRE_SOURCE
+      - *CHECKOUT_SOURCE
+      - *VERIFY_SOURCE
+
+      - &REQUIRE_MACHINE
+        name: Require runner architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          machine="$(uname -m)"
+          if [ "$machine" != "$EXPECTED_MACHINE" ]; then
+            echo "::error::${GITHUB_JOB} must run on ${EXPECTED_MACHINE}, but uname -m reports '$machine'" >&2
+            exit 1
+          fi
+          echo "uname -m: $machine"
+
+      # The runner context is not available in job-level env, so the build
+      # directory, which the later steps read, is set here.
+      - &SET_BUILD_DIR
+        name: Set build directory
+        shell: bash
+        run: echo "BASE_BUILD_DIR=${RUNNER_TEMP}/build" >> "$GITHUB_ENV"
+
+      # Boost and libevent come from depends (see FILE_ENV), not Homebrew.
+      # depends needs GNU Make 4, which Homebrew installs as gmake; its gnubin
+      # directory makes it the make that 03_test_script.sh runs.
+      - &INSTALL_HOMEBREW_PACKAGES
+        name: Install Homebrew packages
+        env:
+          HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
+        run: |
+          brew install --quiet coreutils ninja pkgconf gnu-getopt ccache make
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      # 03_test_script.sh builds depends for HOST. Set HOST once here, and ask
+      # depends for the id of that build (its packages, recipes and compilers),
+      # so the cache key names exactly what the CI script builds.
+      - &IDENTIFY_DEPENDS
+        name: Identify depends build
+        shell: bash
+        run: |
+          set -euo pipefail
+          make_version="$(make --version | head -n 1)"
+          case "$make_version" in
+            "GNU Make "[4-9].*) echo "make: $make_version" ;;
+            *) echo "::error::depends needs GNU Make 4 or later, but make is '$make_version'" >&2; exit 1 ;;
+          esac
+          host="$("${BASE_ROOT_DIR}/depends/config.guess")"
+          # shellcheck source=/dev/null
+          source "$FILE_ENV"
+          # As in 03_test_script.sh, bash -c splits DEP_OPTS into make arguments.
+          id="$(bash -c "make -s -C '${BASE_ROOT_DIR}/depends' HOST=$host $DEP_OPTS print-final_build_id")"
+          id="${id#final_build_id=}"
+          printf '%s\n' "$id" | LC_ALL=C grep -Eq '^[0-9a-f]+$' \
+            || { echo "::error::depends gave no build id for $host: '$id'" >&2; exit 1; }
+          echo "depends build $id for $host"
+          {
+            echo "HOST=$host"
+            echo "DEPENDS_BUILD_ID=$id"
+          } >> "$GITHUB_ENV"
+
+      # Only the built packages are cached; depends rebuilds any whose id
+      # does not match.
+      - &RESTORE_DEPENDS
+        name: Restore depends cache
+        id: depends-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: depends/built
+          key: depends-${{ env.HOST }}-${{ env.DEPENDS_BUILD_ID }}
+
+      - *CI_SCRIPT
+
+      # Saved even when the suites fail, but only once depends wrote the
+      # toolchain file, which needs every package built.
+      - &SAVE_DEPENDS
+        name: Save depends cache
+        if: ${{ !cancelled() && steps.depends-cache.outputs.cache-hit != 'true' && hashFiles(format('depends/{0}/toolchain.cmake', env.HOST)) != '' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: depends/built
+          key: ${{ steps.depends-cache.outputs.cache-primary-key }}
+
+      # Which libraries did the suites run against? Require the depends build
+      # the cache key named, its toolchain, its libevent, and Boost at the
+      # version depends/packages/boost.mk pins.
+      - &REQUIRE_DEPENDS_BUILD
+        name: Require depends build
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*" >&2; exit 1; }
+          prefix="${BASE_ROOT_DIR}/depends/${HOST}"
+          [ -f "${prefix}/.stamp_${DEPENDS_BUILD_ID}" ] \
+            || fail "depends did not build ${DEPENDS_BUILD_ID} for ${HOST}, the build the cache key names"
+          boost_version="$(sed -n 's/^[$](package)_version *= *//p' "${BASE_ROOT_DIR}/depends/packages/boost.mk")"
+          [ -n "$boost_version" ] || fail "no Boost version in depends/packages/boost.mk"
+          # Compares the value of a CMakeCache.txt entry, whatever its type.
+          require_cache_entry() {
+            local actual
+            actual="$(sed -n "s/^$1:[A-Z]*=//p" "${BASE_BUILD_DIR}/CMakeCache.txt")"
+            [ "$actual" = "$2" ] || fail "$1 must be $2, but the build has: ${actual:-$1 unset}"
+          }
+          require_cache_entry CMAKE_TOOLCHAIN_FILE "${prefix}/toolchain.cmake"
+          require_cache_entry Boost_DIR "${prefix}/lib/cmake/Boost-${boost_version}"
+          require_cache_entry Libevent_DIR "${prefix}/lib/cmake/libevent"
+          echo "Built with Boost ${boost_version} and libevent from ${prefix}"
+
+      # The suites passed, but on which code? A runner whose CPU lacks an
+      # extension the native code needs would pass them on portable C, so
+      # require the native backend by name. mlkem_tests/backend_selection logs
+      # the compiled and the active backend.
+      - &REQUIRE_NATIVE_MLKEM
+        name: Require native ML-KEM
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="compiled ${MLKEM_EXPECTED_BACKEND}, active ${MLKEM_EXPECTED_BACKEND}"
+          log="$("${BASE_BUILD_DIR}/bin/test_qbit" --run_test=mlkem_tests/backend_selection --log_level=message --color_output=no 2>&1)" \
+            || { printf '%s\n' "$log"; echo "::error::mlkem_tests/backend_selection failed" >&2; exit 1; }
+          printf '%s\n' "$log"
+          if ! printf '%s\n' "$log" | grep -qxF "$expected"; then
+            echo "::error::${GITHUB_JOB} must run native ML-KEM, but the test log lacks '${expected}'" >&2
+            sysctl machdep.cpu.brand_string machdep.cpu.features machdep.cpu.leaf7_features 2>/dev/null || true
+            exit 1
+          fi
+
+      - &MACOS_REPORT_EVIDENCE
+        name: Report unit-test evidence
+        if: ${{ always() }}
+        shell: bash
+        env:
+          RESOLVED_SHA: ${{ needs.resolve-source.outputs.resolved_sha }}
+          REQUESTED_REF: ${{ needs.resolve-source.outputs.requested_ref }}
+        run: *REPORT_EVIDENCE
+
+  macos-x86_64-unit:
+    name: macOS x86_64 unit tests
+    needs: resolve-source
+    if: ${{ needs.resolve-source.outputs.run_macos_x86_64_unit == 'true' }}
+    # GitHub's Intel macOS image (4 CPUs); macos-15 itself is Apple Silicon.
+    runs-on: macos-15-intel
+    timeout-minutes: 120
+    env:
+      DANGER_RUN_CI_ON_HOST: 1
+      FILE_ENV: ./ci/test/00_setup_env_mac_native_pq.sh
+      MATRIX_NAME: macOS x86_64 unit tests
+      BASE_ROOT_DIR: ${{ github.workspace }}
+      TEST_RUNNER_FAILFAST: 'false'
+      MAKEJOBS: '-j4'
+      TEST_RUNNER_JOBS: '4'
+      CTEST_JOBS: '4'
+      EXPECTED_MACHINE: x86_64
+      MLKEM_EXPECTED_BACKEND: x86_64-avx2/x86_64-avx2
+      PHASE: mlkem_tests, bip324_tests and net_tests natively on an Intel Mac, where ML-KEM runs its native x86_64 code.
+    steps:
+      - *REQUIRE_SOURCE
+      - *CHECKOUT_SOURCE
+      - *VERIFY_SOURCE
+      - *REQUIRE_MACHINE
+      - *SET_BUILD_DIR
+      - *INSTALL_HOMEBREW_PACKAGES
+      - *IDENTIFY_DEPENDS
+      - *RESTORE_DEPENDS
+      - *CI_SCRIPT
+      - *SAVE_DEPENDS
+      - *REQUIRE_DEPENDS_BUILD
+      - *REQUIRE_NATIVE_MLKEM
+      - *MACOS_REPORT_EVIDENCE
