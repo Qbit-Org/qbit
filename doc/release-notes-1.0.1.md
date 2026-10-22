@@ -46,6 +46,11 @@ Behavior changes to review before upgrading
   `fee` and without `address`, `label`, or `vout`, for a self-transfer whose
   outputs are all change. Integrations that assume every `send` entry has an
   address or a non-zero amount should be checked (#150).
+- An `encryptwallet` call that overlaps another encryption of the same wallet,
+  or that repeats after it succeeded, now fails deterministically with error
+  code `-15` (`RPC_WALLET_WRONG_ENC_STATE`) instead of `-16` "Failed to
+  encrypt". `-16` now means only a real database failure. Scripts that match
+  on the `-16` code for this case should be updated (#183).
 
 Compatibility
 =============
@@ -125,6 +130,15 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   during batched signing (#163).
 - qbit-qt cancels active send workers before wallet views are torn down and
   joins already-cancelled workers during destruction (#137).
+- Wallet encryption now checks that the wallet is not already encrypted, and
+  validates its PQC state, under the wallet locks, so two overlapping
+  encryption requests can no longer both proceed and abort the process. A new
+  master key is kept in memory only after it has been written inside a
+  database transaction, and a failed write aborts that transaction. Readers of
+  the active descriptor managers now hold the wallet lock. If another request
+  encrypts the wallet first, qbit-qt's Encrypt Wallet dialog reports that the
+  wallet was already encrypted and the entered passphrase was not used. There
+  is no wallet format or encryption semantics change (#183, fixes #179).
 
 ### Fallback fee
 
@@ -169,13 +183,13 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   data-hash proof fails, the error status now appends the wallet-local PQC
   usage the attempt consumed. No proof JSON is written or exported for a
   rejected proof (#161, refs #129).
-- `pending merge` A successful fee bump now shows the PQC usage it consumed
+- A successful fee bump now shows the PQC usage it consumed
   in a dismissible panel above the transaction list, labelled with the
   replacement txid and the local commit time, so the report remains visible
   on desktops without a notification backend (no D-Bus, no tray). The
   existing non-modal information message and modal warning are unchanged
   (#177, fixes #168).
-- `pending merge` Encrypting an existing wallet from qbit-qt runs on a worker
+- Encrypting an existing wallet from qbit-qt runs on a worker
   thread. The passphrase dialog stays open as a busy indicator and ignores a
   second submit, GUI reads that would block on the wallet lock are served
   from cached state or deferred until encryption finishes, and unlock,
@@ -184,6 +198,10 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   after the database may already have been written stops the application
   rather than misreporting the outcome. The wallet's own encryption logic is
   unchanged (#178, fixes #172).
+- While an existing wallet is being encrypted, repainting the transaction list
+  or overview page resolves address labels from the address book rows qbit-qt
+  already holds, instead of waiting for the wallet lock until encryption
+  finishes (#182, fixes #180).
 
 ### Validation and performance work
 
@@ -207,7 +225,7 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   targets and run a seeded libFuzzer mutation phase. CI replays the corpora;
   the nightly native-fuzz job runs the mutation phase once its workflow
   revision reaches `main` (see Known limitations) (#164, #165).
-- `pending merge` The fuzz coverage checker's `pqc_sign_refused` source anchor
+- The fuzz coverage checker's `pqc_sign_refused` source anchor
   is re-anchored to the current refusal line, and anchor resolution gained
   its own tests. This restores the `--anchors-only` check; it does not by
   itself produce instrumented coverage evidence (#176, refs #173).
@@ -268,8 +286,8 @@ Known limitations
   checksums, and builder attestations apply either way.
 - Instrumented fuzz coverage evidence for the release source is not yet
   available. The source-anchor mismatch reported in #173 is a test-tool
-  failure, not evidence that PQC verification fails. Its fix (#176, pending
-  merge) restores the anchor check, but the llvm-cov coverage run and
+  failure, not evidence that PQC verification fails. Its fix (#176) restores
+  the anchor check, but the llvm-cov coverage run and
   libFuzzer mutation phase still need a clang/LLVM host (#173).
 - The scheduled-validation source selection (#165) and IBD timeout forwarding
   (#159) are present on `1.x.x`, but GitHub schedules run the default branch.
