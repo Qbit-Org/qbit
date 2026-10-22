@@ -290,11 +290,17 @@ Known limitations
   apply to every artifact; verify downloads as described in "Release
   verification". This waiver remains until macOS and Windows signing accounts
   are available (#70).
-- Instrumented fuzz coverage evidence for the release source is not yet
-  available. The source-anchor mismatch reported in #173 is a test-tool
-  failure, not evidence that PQC verification fails. Its fix (#176) restores
-  the anchor check, but the llvm-cov coverage run and
-  libFuzzer mutation phase still need a clang/LLVM host (#173).
+- Fuzz evidence for this release is limited in depth. It was produced with
+  LLVM 20.1.8 on the #176 source, and later `1.x.x` changes touch only wallet,
+  qbit-qt, and functional-test code, none of which the qbit fuzz targets
+  build. The llvm-cov coverage checker met every expectation, including the
+  `pqc_sign_refused` refusal path. libFuzzer with ASan and UBSan replayed all
+  53 seed inputs for the six qbit-specific targets and ran a mutation phase of
+  at least 120 seconds per target, with no crashes or sanitizer reports.
+  Because SLH-DSA signing is slow, the `p2mr_script` and `pqc` targets reached
+  only a few hundred mutated executions under ASan. No multi-hour campaign,
+  sanitizer-free libFuzzer run, macOS run, or other LLVM version was used
+  (#173).
 - The scheduled-validation source selection (#165) and IBD timeout forwarding
   (#159) are present on `1.x.x`, but GitHub schedules run the default branch.
   Their deployment is complete only after the same workflow revisions reach
