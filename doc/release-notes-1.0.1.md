@@ -269,9 +269,11 @@ against `SHA256SUMS`. The release page is the source of truth for supported
 platform artifacts, signer policy, builder attestations, and the final release
 state.
 
-TODO(maintainer): replace this sentence with the P2MR v1 "Conforms to ...
-source commit <SHA>" statement required for mainnet by the release process,
-using this release's signed tag target (it differs between rc1 and final).
+Mainnet publication requires completed qbit P2MR v1 conformance evidence for
+the exact signed tag target. The release page states the corpus digest, source
+commit, and independent oracle report digest. Those values are produced from the
+tagged commit, so they cannot be recorded in this file. Each release candidate
+and the final release have their own tag target and their own statement.
 
 Known limitations
 =================
