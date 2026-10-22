@@ -32,6 +32,10 @@ REQUIRED_TARGETS = (
     "mlkem",
     "mlkem_backend_diff",
     "p2mr_script",
+    "p2p_transport_bidirectional_v1v2",
+    "p2p_transport_bidirectional_v2",
+    "p2p_v2_pq_malicious_peer",
+    "pq_records",
     "pqc",
 )
 MANIFEST_NAME = "MANIFEST.json"

@@ -2,10 +2,16 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <test/data/pq_transport_vectors.json.h>
+
+#include <bip324_pq.h>
 #include <chainparams.h>
 #include <clientversion.h>
 #include <common/args.h>
 #include <compat/compat.h>
+#include <crypto/common.h>
+#include <crypto/mlkem.h>
+#include <crypto/sha256.h>
 #include <cstdint>
 #include <net.h>
 #include <net_processing.h>
@@ -24,12 +30,16 @@
 #include <validation.h>
 
 #include <boost/test/unit_test.hpp>
+#include <univalue.h>
 
 #include <algorithm>
+#include <array>
+#include <deque>
 #include <ios>
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 using namespace std::literals;
 using namespace util::hex_literals;
@@ -1054,6 +1064,7 @@ class V2TransportTester
     V2Transport m_transport; //!< V2Transport being tested
     BIP324Cipher m_cipher; //!< Cipher to help with the other side
     bool m_test_initiator; //!< Whether m_transport is the initiator (true) or responder (false)
+    PQHandshake m_peer_pq; //!< The other side's hybrid negotiation state
 
     std::vector<uint8_t> m_sent_garbage; //!< The garbage we've sent to m_transport.
     std::vector<uint8_t> m_recv_garbage; //!< The garbage we've received from m_transport.
@@ -1064,11 +1075,21 @@ class V2TransportTester
 
 public:
     /** Construct a tester object. test_initiator: whether the tested transport is initiator. */
-    explicit V2TransportTester(FastRandomContext& rng, bool test_initiator)
+    explicit V2TransportTester(FastRandomContext& rng, bool test_initiator, V2PQOptions pq = {})
         : m_rng{rng},
-          m_transport{0, test_initiator},
+          m_transport{0, test_initiator, pq},
           m_cipher{GenerateRandomTestKey(m_rng), MakeByteSpan(m_rng.rand256())},
-          m_test_initiator(test_initiator) {}
+          m_test_initiator(test_initiator),
+          m_peer_pq{!test_initiator, PQMode::NEGOTIATE} {}
+
+    /** Construct a tester object whose transport uses the given ML-KEM entropy and operations. */
+    V2TransportTester(FastRandomContext& rng, bool test_initiator, V2PQOptions pq, PQRandomSource random, const PQKemOps& ops)
+        : m_rng{rng},
+          m_transport{0, test_initiator, GenerateRandomTestKey(rng), MakeByteSpan(rng.rand256()),
+                      rng.randbytes<uint8_t>(rng.randrange(V2Transport::MAX_GARBAGE_LEN + 1)), pq, random, ops},
+          m_cipher{GenerateRandomTestKey(m_rng), MakeByteSpan(m_rng.rand256())},
+          m_test_initiator(test_initiator),
+          m_peer_pq{!test_initiator, PQMode::NEGOTIATE} {}
 
     /** Data type returned by Interact:
      *
@@ -1135,6 +1156,43 @@ public:
     /** Expose the cipher. */
     BIP324Cipher& GetCipher() { return m_cipher; }
 
+    /** Expose the transport being tested. */
+    V2Transport& GetTransport() { return m_transport; }
+
+    /** The bytes scheduled to be sent to the transport. */
+    std::vector<uint8_t>& ToSend() { return m_to_send; }
+
+    /** The bytes received from the transport and not processed yet. */
+    std::vector<uint8_t>& Received() { return m_received; }
+
+    /** Deliver scheduled bytes to the transport, all in one call or one byte per call. Returns false
+     *  (leaving the rest scheduled) at the first transport error. */
+    bool Deliver(bool byte_by_byte = false)
+    {
+        while (!m_to_send.empty()) {
+            std::span<const uint8_t> to_send{m_to_send};
+            if (byte_by_byte) to_send = to_send.first(1);
+            const size_t old_len{to_send.size()};
+            const bool ret{m_transport.ReceivedBytes(to_send)};
+            m_to_send.erase(m_to_send.begin(), m_to_send.begin() + (old_len - to_send.size()));
+            if (!ret) return false;
+            BOOST_REQUIRE(to_send.empty() || m_transport.ReceivedMessageComplete());
+            if (!to_send.empty()) return true;
+        }
+        return true;
+    }
+
+    /** Take every byte the transport has to send. */
+    void Collect()
+    {
+        while (true) {
+            const auto& [bytes, _more, _msg_type] = m_transport.GetBytesToSend(false);
+            if (bytes.empty()) break;
+            m_received.insert(m_received.end(), bytes.begin(), bytes.end());
+            m_transport.MarkBytesSent(bytes.size());
+        }
+    }
+
     /** Schedule bytes to be sent to the transport. */
     void Send(std::span<const uint8_t> data)
     {
@@ -1192,12 +1250,13 @@ public:
      * Many other V2TransportTester functions cannot be called until after ReceiveKey() has been
      * called, as no encryption keys are set up before that point.
      */
-    void ReceiveKey()
+    void ReceiveKey(bool retain_for_hybrid = false)
     {
         // When processing a key, enough bytes need to have been received already.
         BOOST_REQUIRE(m_received.size() >= EllSwiftPubKey::size());
         // Initialize the cipher using it (acting as the opposite side of the tested transport).
-        m_cipher.Initialize(MakeByteSpan(m_received).first(EllSwiftPubKey::size()), !m_test_initiator);
+        m_cipher.Initialize(MakeByteSpan(m_received).first(EllSwiftPubKey::size()), !m_test_initiator,
+                            /*self_decrypt=*/false, retain_for_hybrid);
         // Strip the processed bytes off the front of the receive buffer.
         m_received.erase(m_received.begin(), m_received.begin() + EllSwiftPubKey::size());
     }
@@ -1294,6 +1353,78 @@ public:
         // this class supports *sending* non-empty version packets (to test that BIP324 peers
         // correctly ignore version packet contents).
         BOOST_CHECK(contents.empty());
+    }
+
+    /** Expect a version packet to have been received, process it and return its contents (only
+     *  after ReceiveKey). */
+    std::vector<uint8_t> ReceiveVersionContents()
+    {
+        return ReceivePacket(/*aad=*/MakeByteSpan(m_recv_garbage));
+    }
+
+    /** Expect a key confirmation: exactly one empty decoy packet (only after a switch). */
+    void ReceiveConfirmation()
+    {
+        BOOST_REQUIRE(m_received.size() >= PQ_CONFIRMATION_BYTES);
+        const auto packet{MakeByteSpan(std::span{m_received}.first(PQ_CONFIRMATION_BYTES))};
+        BOOST_CHECK_EQUAL(m_cipher.DecryptLength(packet.first(BIP324Cipher::LENGTH_LEN)), 0U);
+        bool ignore{false};
+        BOOST_CHECK(m_cipher.Decrypt(packet.subspan(BIP324Cipher::LENGTH_LEN), /*aad=*/{}, ignore, /*contents=*/{}));
+        BOOST_CHECK(ignore);
+        m_received.erase(m_received.begin(), m_received.begin() + PQ_CONFIRMATION_BYTES);
+    }
+
+    /** Schedule our key confirmation, an empty decoy (only after a switch). */
+    void SendConfirmation() { SendPacket(/*content=*/{}, /*aad=*/{}, /*ignore=*/true); }
+
+    /** As a hybrid responder (after ReceiveKey(true) and SendGarbageTerm): schedule our version
+     *  packet with an offer, followed by extra contents. */
+    void SendOffer(std::span<const std::byte> extra = {})
+    {
+        PQHandshake::Record offer;
+        BOOST_REQUIRE(m_peer_pq.MakeOffer(offer) == mlkem::Error::NONE);
+        std::vector<std::byte> contents{offer.begin(), offer.end()};
+        contents.insert(contents.end(), extra.begin(), extra.end());
+        BOOST_REQUIRE(m_cipher.AddVersionContents(contents));
+        SendVersion(MakeUCharSpan(contents));
+    }
+
+    /** As a hybrid responder: process the transport's version packet, which must carry a valid
+     *  accept, and switch keys; invert_ss inverts byte 0 of our ML-KEM secret first. */
+    void ReceiveAcceptAndSwitch(bool invert_ss = false)
+    {
+        const auto contents{ReceiveVersionContents()};
+        BOOST_REQUIRE(m_cipher.AddVersionContents(MakeByteSpan(contents)));
+        const auto parsed{PQHandshake::ParseContents(MakeByteSpan(contents))};
+        BOOST_REQUIRE(parsed.kind == PQHandshake::ParseKind::OWN_RECORD);
+        const auto ct{m_peer_pq.CheckRecordLength(parsed.payload)};
+        BOOST_REQUIRE(ct);
+        mlkem::SharedSecret ss;
+        BOOST_REQUIRE(m_peer_pq.DecapsulateAccept(*ct, ss) == mlkem::Error::NONE);
+        if (invert_ss) ss.Bytes()[0] ^= 0xff;
+        BOOST_REQUIRE(m_cipher.SwitchToHybrid(std::as_bytes(ss.Bytes())));
+    }
+
+    /** As a hybrid initiator (after ReceiveKey(true) and SendGarbageTerm): process the transport's
+     *  version packet, which must carry a valid offer, schedule our version packet with the accept
+     *  under the ECDH keys, and switch keys. damage_ct flips a ciphertext bit after hashing it;
+     *  invert_ss inverts byte 0 of our ML-KEM secret before switching. */
+    void AcceptOfferAndSwitch(bool damage_ct = false, bool invert_ss = false)
+    {
+        const auto contents{ReceiveVersionContents()};
+        BOOST_REQUIRE(m_cipher.AddVersionContents(MakeByteSpan(contents)));
+        const auto parsed{PQHandshake::ParseContents(MakeByteSpan(contents))};
+        BOOST_REQUIRE(parsed.kind == PQHandshake::ParseKind::OWN_RECORD);
+        const auto ek{m_peer_pq.CheckRecordLength(parsed.payload)};
+        BOOST_REQUIRE(ek);
+        PQHandshake::Record accept;
+        mlkem::SharedSecret ss;
+        BOOST_REQUIRE(m_peer_pq.AcceptOffer(*ek, accept, ss) == mlkem::Error::NONE);
+        BOOST_REQUIRE(m_cipher.AddVersionContents(accept));
+        if (damage_ct) accept[4 + m_rng.randrange(mlkem::CIPHERTEXT_BYTES)] ^= std::byte(1 << m_rng.randrange(8));
+        SendVersion(MakeUCharSpan(accept));
+        if (invert_ss) ss.Bytes()[0] ^= 0xff;
+        BOOST_REQUIRE(m_cipher.SwitchToHybrid(std::as_bytes(ss.Bytes())));
     }
 
     /** Expect application packet to have been received, with specified short id and payload.
@@ -1438,8 +1569,11 @@ BOOST_AUTO_TEST_CASE(v2transport_test)
         BOOST_CHECK(!ret);
     }
 
-    // Various valid but unusual scenarios.
-    for (int i = 0; i < 50; ++i) {
+    // Various valid but unusual scenarios. The last 50 have the hybrid negotiation on, with a legacy
+    // peer.
+    for (int i = 0; i < 100; ++i) {
+        /** Whether the tested transport negotiates hybrid keys. */
+        const bool pq{i >= 50};
         /** Whether an initiator or responder is being tested. */
         bool initiator = m_rng.randbool();
         /** Use either 0 bytes or the maximum possible (4095 bytes) garbage length. */
@@ -1448,11 +1582,15 @@ BOOST_AUTO_TEST_CASE(v2transport_test)
         unsigned num_ignore_version = m_rng.randrange(10);
         /** What data to send in the version packet (ignored by BIP324 peers, but reserved for future extensions). */
         auto ver_data = m_rng.randbytes<uint8_t>(m_rng.randbool() ? 0 : m_rng.randrange(1000));
+        // A legacy peer's random contents never carry an own record.
+        while (pq && PQHandshake::ParseContents(MakeByteSpan(ver_data)).kind == PQHandshake::ParseKind::OWN_RECORD) {
+            ver_data = m_rng.randbytes<uint8_t>(m_rng.randrange(1000));
+        }
         /** Whether to immediately send key and garbage out (required for responders, optional otherwise). */
         bool send_immediately = !initiator || m_rng.randbool();
         /** How many decoy packets to send before the first and second real message. */
         unsigned num_decoys_1 = m_rng.randrange(1000), num_decoys_2 = m_rng.randrange(1000);
-        V2TransportTester tester(m_rng, initiator);
+        V2TransportTester tester(m_rng, initiator, {.mode = pq ? PQMode::NEGOTIATE : PQMode::OFF});
         if (send_immediately) {
             tester.SendKey();
             tester.SendGarbage(garb_len);
@@ -1474,7 +1612,13 @@ BOOST_AUTO_TEST_CASE(v2transport_test)
         ret = tester.Interact();
         BOOST_REQUIRE(ret && ret->empty());
         tester.ReceiveGarbage();
-        tester.ReceiveVersion();
+        if (pq && !initiator) {
+            // The tested responder offered; the legacy peer ignores the offer.
+            const auto contents{tester.ReceiveVersionContents()};
+            BOOST_CHECK(PQHandshake::ParseContents(MakeByteSpan(contents)).kind == PQHandshake::ParseKind::OWN_RECORD);
+        } else {
+            tester.ReceiveVersion();
+        }
         tester.CompareSessionIDs();
         for (unsigned d = 0; d < num_decoys_1; ++d) {
             auto decoy_data = m_rng.randbytes<uint8_t>(m_rng.randrange(1000));
@@ -1499,6 +1643,9 @@ BOOST_AUTO_TEST_CASE(v2transport_test)
         BOOST_CHECK(!(*ret)[2]);
         BOOST_CHECK((*ret)[3] && (*ret)[3]->m_type == "foobar" && (*ret)[3]->m_recv.empty());
         tester.ReceiveMessage("barfoo", {});
+        const auto info{tester.GetTransport().GetInfo()};
+        BOOST_CHECK(!info.transport_pq);
+        BOOST_CHECK(info.transport_pq_status == (pq ? PQStatus::LEGACY_PEER : PQStatus::OFF));
     }
 
     // Too long garbage (initiator).
@@ -1580,6 +1727,1462 @@ BOOST_AUTO_TEST_CASE(v2transport_test)
         tester.SendV1Version(CChainParams::Main()->MessageStart());
         auto ret = tester.Interact();
         BOOST_CHECK(!ret);
+    }
+}
+
+namespace {
+
+/** Deterministic PQ entropy: the queued 32-byte values in order, then SHA256(seed || counter). */
+struct TestPQEntropy {
+    std::deque<std::array<uint8_t, 32>> queued;
+    uint256 seed;
+    uint64_t counter{0};
+
+    explicit TestPQEntropy(const uint256& seed_in) : seed{seed_in} {}
+
+    static void Fill(void* context, std::span<uint8_t, 32> out) noexcept
+    {
+        auto& self{*static_cast<TestPQEntropy*>(context)};
+        if (!self.queued.empty()) {
+            std::ranges::copy(self.queued.front(), out.begin());
+            self.queued.pop_front();
+            return;
+        }
+        uint8_t counter_le[8];
+        WriteLE64(counter_le, self.counter++);
+        CSHA256().Write(self.seed.begin(), self.seed.size()).Write(counter_le, sizeof(counter_le)).Finalize(out.data());
+    }
+
+    PQRandomSource Source() { return {.fill32 = &Fill, .context = this}; }
+
+    void Queue(std::span<const uint8_t> bytes)
+    {
+        BOOST_REQUIRE(bytes.size() % 32 == 0);
+        for (size_t i{0}; i < bytes.size(); i += 32) {
+            std::array<uint8_t, 32> value;
+            std::ranges::copy(bytes.subspan(i, 32), value.begin());
+            queued.push_back(value);
+        }
+    }
+};
+
+/** How often each ML-KEM operation ran through COUNTING_KEM_OPS. */
+struct KemCallCounts {
+    int keygen{0}, check{0}, encaps{0}, decaps{0};
+    int total() const { return keygen + check + encaps + decaps; }
+};
+KemCallCounts g_kem_calls;
+
+const PQKemOps COUNTING_KEM_OPS{
+    .keygen = [](std::span<const uint8_t, mlkem::KEYGEN_SEED_BYTES> seed, mlkem::PublicKey& ek, mlkem::DecapsulationKey& dk) noexcept {
+        ++g_kem_calls.keygen;
+        return mlkem::KeyGen(seed, ek, dk);
+    },
+    .check_public_key = [](std::span<const uint8_t, mlkem::PUBLIC_KEY_BYTES> ek) noexcept {
+        ++g_kem_calls.check;
+        return mlkem::CheckPublicKey(ek);
+    },
+    .encaps = [](std::span<const uint8_t, mlkem::PUBLIC_KEY_BYTES> ek, std::span<const uint8_t, mlkem::ENCAPS_COINS_BYTES> coins,
+                 mlkem::Ciphertext& ct, mlkem::SharedSecret& ss) noexcept {
+        ++g_kem_calls.encaps;
+        return mlkem::Encaps(ek, coins, ct, ss);
+    },
+    .decaps = [](const mlkem::DecapsulationKey& dk, std::span<const uint8_t, mlkem::CIPHERTEXT_BYTES> ct, mlkem::SharedSecret& ss) noexcept {
+        ++g_kem_calls.decaps;
+        return mlkem::Decaps(dk, ct, ss);
+    },
+};
+
+std::vector<std::byte> HexBytes(std::string_view hex)
+{
+    auto bytes{TryParseHex<std::byte>(hex)};
+    BOOST_REQUIRE(bytes);
+    return std::move(*bytes);
+}
+
+std::vector<std::byte> Concat(std::initializer_list<std::span<const std::byte>> parts)
+{
+    std::vector<std::byte> out;
+    for (const auto& part : parts) out.insert(out.end(), part.begin(), part.end());
+    return out;
+}
+
+/** A record CompactSize(1 + payload size) || header || payload. */
+std::vector<std::byte> MakeRecord(uint8_t header, std::span<const std::byte> payload)
+{
+    DataStream stream;
+    WriteCompactSize(stream, 1 + payload.size());
+    stream << header;
+    stream.write(payload);
+    return {stream.begin(), stream.end()};
+}
+
+/** A valid encapsulation key, from a fixed seed. */
+mlkem::PublicKey TestEncapsulationKey()
+{
+    std::array<uint8_t, mlkem::KEYGEN_SEED_BYTES> seed{};
+    seed.fill(0x5a);
+    mlkem::PublicKey ek;
+    mlkem::DecapsulationKey dk;
+    BOOST_REQUIRE(mlkem::KeyGen(seed, ek, dk) == mlkem::Error::NONE);
+    return ek;
+}
+
+/** ek with its first coefficient set to q = 3329, which fails the modulus check. */
+mlkem::PublicKey BadModulusKey(mlkem::PublicKey ek)
+{
+    ek[0] = 0x01;
+    ek[1] = (ek[1] & 0xF0) | 0x0D;
+    return ek;
+}
+
+void CheckParse(std::span<const std::byte> contents, PQHandshake::ParseKind kind, std::optional<std::pair<size_t, size_t>> payload = std::nullopt)
+{
+    const auto parsed{PQHandshake::ParseContents(contents)};
+    BOOST_CHECK(parsed.kind == kind);
+    if (payload) {
+        BOOST_CHECK(parsed.payload.data() == contents.data() + payload->first);
+        BOOST_CHECK_EQUAL(parsed.payload.size(), payload->second);
+    } else {
+        BOOST_CHECK(parsed.payload.empty());
+    }
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(pq_records_grammar)
+{
+    using enum PQHandshake::ParseKind;
+    // Empty contents, as every BIP324 implementation sends today: no features.
+    CheckParse({}, NO_RECORD);
+    // Unknown and reserved headers, with and without payload, are ignored.
+    CheckParse(HexBytes("0100"), NO_RECORD);
+    CheckParse(HexBytes("0301aabb"), NO_RECORD);
+    CheckParse(HexBytes("0100" "02f1aa" "01ff"), NO_RECORD);
+    // An own record with an empty payload parses; its length is checked later, by the role.
+    CheckParse(HexBytes("01f0"), OWN_RECORD, std::pair{2, 0});
+    CheckParse(HexBytes("0201aa" "03f0bbcc"), OWN_RECORD, std::pair{5, 2});
+    // len = 0, alone or after valid records.
+    CheckParse(HexBytes("00"), INVALID_GRAMMAR);
+    CheckParse(HexBytes("0201aa" "00"), INVALID_GRAMMAR);
+    CheckParse(HexBytes("00" "01f0"), INVALID_GRAMMAR);
+    // Truncated records and truncated CompactSize encodings.
+    CheckParse(HexBytes("05f0aabb"), INVALID_GRAMMAR);
+    CheckParse(HexBytes("02f0"), INVALID_GRAMMAR);
+    CheckParse(HexBytes("fd"), INVALID_GRAMMAR);
+    CheckParse(HexBytes("fd21"), INVALID_GRAMMAR);
+    CheckParse(HexBytes("fe010000"), INVALID_GRAMMAR);
+    CheckParse(HexBytes("ff01000000000000"), INVALID_GRAMMAR);
+    // Non-canonical CompactSize encodings of lengths that would otherwise fit.
+    CheckParse(HexBytes("fd0200" "f0aa"), INVALID_GRAMMAR);
+    CheckParse(HexBytes("fe02000000" "f0aa"), INVALID_GRAMMAR);
+    CheckParse(HexBytes("ff0200000000000000" "f0aa"), INVALID_GRAMMAR);
+    // Oversized lengths: beyond the contents (one byte, and far), exactly MAX_SIZE (which
+    // ReadCompactSize accepts), beyond MAX_SIZE (which it rejects), and beyond size_t on 32-bit
+    // platforms. None is used to skip bytes before it is checked.
+    static_assert(MAX_SIZE == 0x02000000);
+    CheckParse(HexBytes("03f0aa"), INVALID_GRAMMAR);
+    CheckParse(HexBytes("fdfd00" "f0aa"), INVALID_GRAMMAR);
+    CheckParse(HexBytes("fe00000002" "f0aa"), INVALID_GRAMMAR);
+    CheckParse(HexBytes("fe01000002" "f0aa"), INVALID_GRAMMAR);
+    CheckParse(HexBytes("ffffffffffffffffff" "f0aa"), INVALID_GRAMMAR);
+    CheckParse(HexBytes("ff0000000001000000" "f0aa"), INVALID_GRAMMAR);
+    // Trailing corruption after valid records, including after a valid own record.
+    CheckParse(HexBytes("0201aa" "07"), INVALID_GRAMMAR);
+    CheckParse(HexBytes("02f0aa" "fd"), INVALID_GRAMMAR);
+    CheckParse(HexBytes("02f0aa" "0301aa"), INVALID_GRAMMAR);
+    // Canonical 3-byte CompactSize lengths parse.
+    std::vector<std::byte> long_unknown{HexBytes("fdfd00" "01")};
+    long_unknown.resize(long_unknown.size() + 0xfc);
+    CheckParse(long_unknown, NO_RECORD);
+}
+
+BOOST_AUTO_TEST_CASE(pq_records_first_wins)
+{
+    using enum PQHandshake::ParseKind;
+    const mlkem::PublicKey ek{TestEncapsulationKey()};
+    const auto offer{PQHandshake::SerializeRecord(ek)};
+    BOOST_CHECK_EQUAL(HexStr(std::span{offer}.first(4)), "fd2106f0");
+    BOOST_CHECK(std::ranges::equal(std::span{offer}.subspan(4), std::as_bytes(std::span{ek})));
+    const auto malformed{MakeRecord(PQ_MLKEM1024, HexBytes("aabb"))};
+    const auto unknown{MakeRecord(0xf1, HexBytes("cc"))};
+
+    // A valid first own record wins over a malformed duplicate, wherever unknown records are.
+    CheckParse(offer, OWN_RECORD, std::pair{4, mlkem::PUBLIC_KEY_BYTES});
+    CheckParse(Concat({offer, malformed}), OWN_RECORD, std::pair{4, mlkem::PUBLIC_KEY_BYTES});
+    CheckParse(Concat({unknown, offer, unknown, malformed}), OWN_RECORD, std::pair{unknown.size() + 4, mlkem::PUBLIC_KEY_BYTES});
+    // A malformed first own record wins over a valid second one; the role's length check then fails.
+    CheckParse(Concat({malformed, offer}), OWN_RECORD, std::pair{2, 2});
+    CheckParse(Concat({unknown, malformed, offer}), OWN_RECORD, std::pair{unknown.size() + 2, 2});
+    // Any later framing corruption means no features, even after a valid own record.
+    CheckParse(Concat({offer, HexBytes("00")}), INVALID_GRAMMAR);
+    CheckParse(Concat({offer, unknown, HexBytes("05f0")}), INVALID_GRAMMAR);
+    CheckParse(Concat({offer, HexBytes("fd0300f0aabb")}), INVALID_GRAMMAR);
+    auto truncated{Concat({unknown, offer})};
+    truncated.pop_back();
+    CheckParse(truncated, INVALID_GRAMMAR);
+}
+
+BOOST_AUTO_TEST_CASE(pq_record_semantics)
+{
+    const mlkem::PublicKey ek{TestEncapsulationKey()};
+    for (const size_t size : {size_t{0}, mlkem::PUBLIC_KEY_BYTES - 1, mlkem::PUBLIC_KEY_BYTES + 1}) {
+        std::vector<std::byte> payload(size, std::byte{0x42});
+        // The responder's offer, at the initiator.
+        PQHandshake initiator{/*initiating=*/true, PQMode::NEGOTIATE};
+        const auto contents{MakeRecord(PQ_MLKEM1024, payload)};
+        const auto parsed{PQHandshake::ParseContents(contents)};
+        BOOST_REQUIRE(parsed.kind == PQHandshake::ParseKind::OWN_RECORD);
+        BOOST_CHECK(!initiator.CheckRecordLength(parsed.payload));
+        BOOST_CHECK(initiator.GetSnapshot().failure == PQFailure::EK_LENGTH);
+        BOOST_CHECK(initiator.GetSnapshot().offer == PQOfferState::NONE);
+        // The initiator's accept, at the responder, which wipes its key.
+        PQHandshake responder{/*initiating=*/false, PQMode::NEGOTIATE};
+        PQHandshake::Record offer;
+        BOOST_REQUIRE(responder.MakeOffer(offer) == mlkem::Error::NONE);
+        BOOST_CHECK(!responder.CheckRecordLength(parsed.payload));
+        BOOST_CHECK(responder.GetSnapshot().failure == PQFailure::CT_LENGTH);
+        BOOST_CHECK(!responder.HasDecapsulationKey());
+    }
+
+    // A key of the right length that fails the modulus check.
+    g_kem_calls = {};
+    TestPQEntropy entropy{uint256::ONE};
+    PQHandshake initiator{/*initiating=*/true, PQMode::NEGOTIATE, entropy.Source(), COUNTING_KEM_OPS};
+    const auto contents{PQHandshake::SerializeRecord(BadModulusKey(ek))};
+    const auto payload{initiator.CheckRecordLength(PQHandshake::ParseContents(contents).payload)};
+    BOOST_REQUIRE(payload);
+    PQHandshake::Record accept;
+    accept.fill(std::byte{0x33});
+    mlkem::SharedSecret ss;
+    BOOST_CHECK(initiator.AcceptOffer(*payload, accept, ss) == mlkem::Error::INVALID_PUBLIC_KEY);
+    BOOST_CHECK(initiator.GetSnapshot().failure == PQFailure::EK_MODULUS);
+    BOOST_CHECK(initiator.GetSnapshot().offer == PQOfferState::RECEIVED);
+    BOOST_CHECK(std::ranges::all_of(accept, [](std::byte b) { return b == std::byte{0x33}; }));
+    BOOST_CHECK_EQUAL(g_kem_calls.check, 1);
+    BOOST_CHECK_EQUAL(g_kem_calls.total(), 1);
+    // No entropy was drawn for a rejected key.
+    BOOST_CHECK_EQUAL(entropy.counter, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(pq_records_max_contents)
+{
+    using enum PQHandshake::ParseKind;
+    // The largest contents a v2 packet can carry (1 + 12 + 4,000,000 bytes), as minimal unknown
+    // records. One pass, no copies, no exception.
+    constexpr size_t MAX_CONTENTS{4'000'013};
+    std::vector<std::byte> contents;
+    contents.reserve(MAX_CONTENTS);
+    while (contents.size() + 2 < MAX_CONTENTS) {
+        contents.push_back(std::byte{0x01});
+        contents.push_back(std::byte{0x01});
+    }
+    // Ending in a malformed record: no features.
+    std::vector<std::byte> malformed{contents};
+    malformed.push_back(std::byte{0x05});
+    BOOST_REQUIRE_EQUAL(malformed.size(), MAX_CONTENTS);
+    CheckParse(malformed, INVALID_GRAMMAR);
+    // Ending in a valid unknown record: still no features.
+    std::vector<std::byte> valid{contents.begin(), contents.end() - 2};
+    for (const auto b : HexBytes("0201aa")) valid.push_back(b);
+    BOOST_REQUIRE_EQUAL(valid.size(), MAX_CONTENTS);
+    CheckParse(valid, NO_RECORD);
+    // Ending in an own record: found at the very end.
+    const auto offer{PQHandshake::SerializeRecord(TestEncapsulationKey())};
+    std::vector<std::byte> own{HexBytes("0201aa")};
+    while (own.size() + 2 + offer.size() <= MAX_CONTENTS) {
+        own.push_back(std::byte{0x01});
+        own.push_back(std::byte{0x01});
+    }
+    own.insert(own.end(), offer.begin(), offer.end());
+    BOOST_REQUIRE_EQUAL(own.size(), MAX_CONTENTS);
+    CheckParse(own, OWN_RECORD, std::pair{MAX_CONTENTS - mlkem::PUBLIC_KEY_BYTES, mlkem::PUBLIC_KEY_BYTES});
+}
+
+BOOST_AUTO_TEST_CASE(pq_handshake_negotiation)
+{
+    UniValue doc;
+    BOOST_REQUIRE(doc.read(json_tests::pq_transport_vectors));
+    const UniValue& vector{doc["vectors"][0]};
+    const auto keygen_seed{ParseHex(vector["mlkem_keygen_seed"].get_str())};
+    const auto encaps_m{ParseHex(vector["mlkem_encaps_m"].get_str())};
+
+    // With the vector's entropy, MakeOffer draws d then z and AcceptOffer draws m, so the offer,
+    // the accept and both secrets are the vector's.
+    {
+        TestPQEntropy responder_entropy{uint256::ZERO}, initiator_entropy{uint256::ONE};
+        responder_entropy.Queue(keygen_seed);
+        initiator_entropy.Queue(encaps_m);
+        PQHandshake responder{/*initiating=*/false, PQMode::NEGOTIATE, responder_entropy.Source(), DefaultPQKemOps()};
+        PQHandshake initiator{/*initiating=*/true, PQMode::NEGOTIATE, initiator_entropy.Source(), DefaultPQKemOps()};
+
+        PQHandshake::Record offer;
+        BOOST_REQUIRE(responder.MakeOffer(offer) == mlkem::Error::NONE);
+        BOOST_CHECK_EQUAL(HexStr(offer), "fd2106f0" + vector["ek"].get_str());
+        BOOST_CHECK(responder.HasDecapsulationKey());
+        // SENT means queued, which only the caller knows.
+        BOOST_CHECK(responder.GetSnapshot().offer == PQOfferState::NONE);
+        responder.SetOfferSent();
+        BOOST_CHECK(responder.GetSnapshot().offer == PQOfferState::SENT);
+        BOOST_CHECK(responder_entropy.queued.empty());
+
+        const auto ek{initiator.CheckRecordLength(PQHandshake::ParseContents(offer).payload)};
+        BOOST_REQUIRE(ek);
+        PQHandshake::Record accept;
+        mlkem::SharedSecret ss_initiator;
+        BOOST_REQUIRE(initiator.AcceptOffer(*ek, accept, ss_initiator) == mlkem::Error::NONE);
+        BOOST_CHECK_EQUAL(HexStr(accept), "fd2106f0" + vector["ct"].get_str());
+        BOOST_CHECK_EQUAL(HexStr(ss_initiator.Bytes()), vector["ss_mlkem"].get_str());
+        BOOST_CHECK(initiator.GetSnapshot().offer == PQOfferState::RECEIVED);
+        BOOST_CHECK(initiator.GetSnapshot().failure == PQFailure::NONE);
+
+        const auto ct{responder.CheckRecordLength(PQHandshake::ParseContents(accept).payload)};
+        BOOST_REQUIRE(ct);
+        mlkem::SharedSecret ss_responder;
+        BOOST_REQUIRE(responder.DecapsulateAccept(*ct, ss_responder) == mlkem::Error::NONE);
+        BOOST_CHECK_EQUAL(HexStr(ss_responder.Bytes()), vector["ss_mlkem"].get_str());
+        // The decapsulation key is single use.
+        BOOST_CHECK(!responder.HasDecapsulationKey());
+        BOOST_CHECK(responder.GetSnapshot().failure == PQFailure::NONE);
+    }
+
+    // Random production entropy: both sides agree, and every handshake has fresh keys.
+    std::optional<std::vector<uint8_t>> previous;
+    for (int i = 0; i < 2; ++i) {
+        PQHandshake responder{/*initiating=*/false, PQMode::NEGOTIATE};
+        PQHandshake initiator{/*initiating=*/true, PQMode::NEGOTIATE};
+        PQHandshake::Record offer, accept;
+        mlkem::SharedSecret ss_initiator, ss_responder;
+        BOOST_REQUIRE(responder.MakeOffer(offer) == mlkem::Error::NONE);
+        BOOST_REQUIRE(initiator.AcceptOffer(*initiator.CheckRecordLength(PQHandshake::ParseContents(offer).payload), accept, ss_initiator) == mlkem::Error::NONE);
+        BOOST_REQUIRE(responder.DecapsulateAccept(*responder.CheckRecordLength(PQHandshake::ParseContents(accept).payload), ss_responder) == mlkem::Error::NONE);
+        BOOST_CHECK(std::ranges::equal(ss_initiator.Bytes(), ss_responder.Bytes()));
+        std::vector<uint8_t> current(offer.size());
+        std::ranges::copy(MakeUCharSpan(offer), current.begin());
+        if (previous) BOOST_CHECK(*previous != current);
+        previous = current;
+    }
+
+    // A corrupted ciphertext of the right length is not an error: it yields a different secret.
+    {
+        PQHandshake responder{/*initiating=*/false, PQMode::NEGOTIATE};
+        PQHandshake initiator{/*initiating=*/true, PQMode::NEGOTIATE};
+        PQHandshake::Record offer, accept;
+        mlkem::SharedSecret ss_initiator, ss_responder;
+        BOOST_REQUIRE(responder.MakeOffer(offer) == mlkem::Error::NONE);
+        BOOST_REQUIRE(initiator.AcceptOffer(*initiator.CheckRecordLength(PQHandshake::ParseContents(offer).payload), accept, ss_initiator) == mlkem::Error::NONE);
+        accept[100] ^= std::byte{0x01};
+        BOOST_REQUIRE(responder.DecapsulateAccept(*responder.CheckRecordLength(PQHandshake::ParseContents(accept).payload), ss_responder) == mlkem::Error::NONE);
+        BOOST_CHECK(!std::ranges::equal(ss_initiator.Bytes(), ss_responder.Bytes()));
+    }
+
+    using mlkem::InjectResultForTesting;
+    using mlkem::Operation;
+    namespace upstream = mlkem::upstream;
+    const auto all_bytes_are = [](std::span<const uint8_t> bytes, uint8_t value) {
+        return std::ranges::all_of(bytes, [&](uint8_t b) { return b == value; });
+    };
+
+    // Key generation fails: no offer, no key, a recorded internal error.
+    {
+        PQHandshake responder{/*initiating=*/false, PQMode::NEGOTIATE};
+        PQHandshake::Record offer;
+        offer.fill(std::byte{0x33});
+        {
+            InjectResultForTesting inject{Operation::KEYGEN, upstream::ERR_FAIL};
+            BOOST_CHECK(responder.MakeOffer(offer) == mlkem::Error::INTERNAL);
+        }
+        BOOST_CHECK(std::ranges::all_of(offer, [](std::byte b) { return b == std::byte{0x33}; }));
+        BOOST_CHECK(!responder.HasDecapsulationKey());
+        BOOST_CHECK(responder.GetSnapshot().offer == PQOfferState::NONE);
+        BOOST_CHECK(responder.GetSnapshot().failure == PQFailure::KEYGEN_INTERNAL);
+    }
+
+    // The key check or encapsulation fails internally: no accept, the secret cleared.
+    for (const auto& [op, failure] : {std::pair{Operation::CHECK_PUBLIC_KEY, PQFailure::CHECK_EK_INTERNAL},
+                                      std::pair{Operation::ENCAPS, PQFailure::ENCAPS_INTERNAL}}) {
+        for (const int result : {upstream::ERR_FAIL, upstream::ERR_OUT_OF_MEMORY}) {
+            PQHandshake initiator{/*initiating=*/true, PQMode::NEGOTIATE};
+            const mlkem::PublicKey ek{TestEncapsulationKey()};
+            PQHandshake::Record accept;
+            accept.fill(std::byte{0x33});
+            mlkem::SharedSecret ss;
+            std::ranges::fill(ss.Bytes(), 0x44);
+            {
+                InjectResultForTesting inject{op, result};
+                BOOST_CHECK(initiator.AcceptOffer(ek, accept, ss) == mlkem::Error::INTERNAL);
+            }
+            BOOST_CHECK(std::ranges::all_of(accept, [](std::byte b) { return b == std::byte{0x33}; }));
+            BOOST_CHECK(all_bytes_are(ss.Bytes(), 0));
+            BOOST_CHECK(initiator.GetSnapshot().failure == failure);
+        }
+    }
+    // An encapsulation that rejects the key after the check passed is a local fault too.
+    {
+        PQHandshake initiator{/*initiating=*/true, PQMode::NEGOTIATE};
+        PQHandshake::Record accept;
+        mlkem::SharedSecret ss;
+        InjectResultForTesting inject{Operation::ENCAPS, upstream::ERR_INVALID_PK};
+        BOOST_CHECK(initiator.AcceptOffer(TestEncapsulationKey(), accept, ss) == mlkem::Error::INTERNAL);
+        BOOST_CHECK(initiator.GetSnapshot().failure == PQFailure::ENCAPS_INTERNAL);
+    }
+
+    // Decapsulation fails internally (including a failed key hash check): the secret cleared, the
+    // key wiped.
+    for (const int result : {upstream::ERR_FAIL, upstream::ERR_INVALID_SK}) {
+        PQHandshake responder{/*initiating=*/false, PQMode::NEGOTIATE};
+        PQHandshake initiator{/*initiating=*/true, PQMode::NEGOTIATE};
+        PQHandshake::Record offer, accept;
+        mlkem::SharedSecret ss_initiator, ss_responder;
+        BOOST_REQUIRE(responder.MakeOffer(offer) == mlkem::Error::NONE);
+        BOOST_REQUIRE(initiator.AcceptOffer(*initiator.CheckRecordLength(PQHandshake::ParseContents(offer).payload), accept, ss_initiator) == mlkem::Error::NONE);
+        std::ranges::fill(ss_responder.Bytes(), 0x44);
+        {
+            InjectResultForTesting inject{Operation::DECAPS, result};
+            BOOST_CHECK(responder.DecapsulateAccept(*responder.CheckRecordLength(PQHandshake::ParseContents(accept).payload), ss_responder) == mlkem::Error::INTERNAL);
+        }
+        BOOST_CHECK(all_bytes_are(ss_responder.Bytes(), 0));
+        BOOST_CHECK(!responder.HasDecapsulationKey());
+        BOOST_CHECK(responder.GetSnapshot().failure == PQFailure::DECAPS_INTERNAL);
+    }
+
+    // ClearSecrets() and any recorded failure wipe the key; the first failure is kept.
+    {
+        PQHandshake responder{/*initiating=*/false, PQMode::NEGOTIATE};
+        PQHandshake::Record offer;
+        BOOST_REQUIRE(responder.MakeOffer(offer) == mlkem::Error::NONE);
+        responder.ClearSecrets();
+        BOOST_CHECK(!responder.HasDecapsulationKey());
+        BOOST_CHECK(responder.GetSnapshot().failure == PQFailure::NONE);
+    }
+    {
+        PQHandshake responder{/*initiating=*/false, PQMode::NEGOTIATE};
+        PQHandshake::Record offer;
+        BOOST_REQUIRE(responder.MakeOffer(offer) == mlkem::Error::NONE);
+        responder.SetFailure(PQFailure::CONFIRM_TAG);
+        BOOST_CHECK(!responder.HasDecapsulationKey());
+        responder.SetFailure(PQFailure::CONFIRM_LENGTH);
+        BOOST_CHECK(responder.GetSnapshot().failure == PQFailure::CONFIRM_TAG);
+    }
+
+    // The snapshot records progress.
+    {
+        PQHandshake initiator{/*initiating=*/true, PQMode::NEGOTIATE};
+        BOOST_CHECK(!initiator.GetSnapshot().version_received);
+        initiator.SetVersionReceived();
+        initiator.SetSwitched();
+        initiator.SetConfirmed();
+        const auto snapshot{initiator.GetSnapshot()};
+        BOOST_CHECK(snapshot.version_received && snapshot.switched && snapshot.confirmed);
+        BOOST_CHECK(snapshot.failure == PQFailure::NONE);
+    }
+}
+
+namespace {
+
+constexpr V2PQOptions PQ_ON{.mode = PQMode::NEGOTIATE};
+
+/** Drive a tester, as the hybrid peer, through the handshake with its transport: both sides
+ *  switch, and the tester checks the transport's key confirmation. The tester's own confirmation
+ *  is scheduled (not delivered) if send_confirmation. Returns the ECDH session id. */
+uint256 HybridHandshake(V2TransportTester& tester, bool test_initiator, bool send_confirmation = true)
+{
+    uint256 ecdh_session_id;
+    if (test_initiator) {
+        // The transport initiates and holds its version packet; we (the responder) offer at once.
+        auto ret{tester.Interact()};
+        BOOST_REQUIRE(ret && ret->empty());
+        tester.SendKey();
+        tester.SendGarbage();
+        tester.ReceiveKey(/*retain_for_hybrid=*/true);
+        ecdh_session_id = uint256(MakeUCharSpan(tester.GetCipher().GetSessionID()));
+        tester.SendGarbageTerm();
+        tester.SendOffer();
+        ret = tester.Interact();
+        BOOST_REQUIRE(ret && ret->empty());
+        tester.ReceiveGarbage();
+        tester.ReceiveAcceptAndSwitch();
+    } else {
+        // The transport responds with an offer; we (the initiator) accept it.
+        tester.SendKey();
+        tester.SendGarbage();
+        auto ret{tester.Interact()};
+        BOOST_REQUIRE(ret && ret->empty());
+        tester.ReceiveKey(/*retain_for_hybrid=*/true);
+        ecdh_session_id = uint256(MakeUCharSpan(tester.GetCipher().GetSessionID()));
+        tester.SendGarbageTerm();
+        tester.ReceiveGarbage();
+        tester.AcceptOfferAndSwitch();
+        ret = tester.Interact();
+        BOOST_REQUIRE(ret && ret->empty());
+    }
+    tester.ReceiveConfirmation();
+    if (send_confirmation) tester.SendConfirmation();
+    return ecdh_session_id;
+}
+
+void CheckPQ(V2Transport& transport, PQStatus status, PQFailure failure = PQFailure::NONE)
+{
+    const auto info{transport.GetInfo()};
+    BOOST_CHECK(info.transport_pq_status == status);
+    BOOST_CHECK_EQUAL(info.transport_pq, status == PQStatus::HYBRID);
+    BOOST_CHECK(transport.GetPQSnapshot().failure == failure);
+}
+
+/** Exchange count messages each way between two connected transports, fragmenting the bytes at
+ *  random, and check that each arrives intact and in order. */
+void ExchangeMessages(FastRandomContext& rng, V2Transport& initiator, V2Transport& responder, int count)
+{
+    const std::array<V2Transport*, 2> transports{&initiator, &responder};
+    std::array<std::deque<CSerializedNetMsg>, 2> to_send;
+    std::array<std::deque<CSerializedNetMsg>, 2> expected;
+    std::array<std::vector<uint8_t>, 2> in_flight;
+    for (int side = 0; side < 2; ++side) {
+        for (int i = 0; i < count; ++i) {
+            CSerializedNetMsg msg;
+            msg.m_type = i == 0 ? "version" : "ping";
+            msg.data = rng.randbytes<uint8_t>(rng.randrange(1000));
+            expected[side].push_back(msg.Copy());
+            to_send[side].push_back(std::move(msg));
+        }
+    }
+    bool progress{true};
+    while (progress) {
+        progress = false;
+        for (int side = 0; side < 2; ++side) {
+            if (!to_send[side].empty() && transports[side]->SetMessageToSend(to_send[side].front())) {
+                to_send[side].pop_front();
+                progress = true;
+            }
+            const auto& [bytes, _more, _type] = transports[side]->GetBytesToSend(!to_send[side].empty());
+            if (!bytes.empty()) {
+                const size_t n{1 + rng.randrange(bytes.size())};
+                in_flight[side].insert(in_flight[side].end(), bytes.begin(), bytes.begin() + n);
+                transports[side]->MarkBytesSent(n);
+                progress = true;
+            }
+            if (!in_flight[side].empty()) {
+                std::span<const uint8_t> received{std::span{in_flight[side]}.first(1 + rng.randrange(in_flight[side].size()))};
+                const size_t old_size{received.size()};
+                BOOST_REQUIRE(transports[!side]->ReceivedBytes(received));
+                in_flight[side].erase(in_flight[side].begin(), in_flight[side].begin() + (old_size - received.size()));
+                if (received.size() != old_size) progress = true;
+            }
+            while (transports[!side]->ReceivedMessageComplete()) {
+                bool reject{false};
+                const CNetMessage msg{transports[!side]->GetReceivedMessage({}, reject)};
+                BOOST_REQUIRE(!reject && !expected[side].empty());
+                BOOST_CHECK_EQUAL(msg.m_type, expected[side].front().m_type);
+                BOOST_CHECK(std::ranges::equal(MakeUCharSpan(msg.m_recv), expected[side].front().data));
+                expected[side].pop_front();
+                progress = true;
+            }
+        }
+    }
+    BOOST_CHECK(expected[0].empty() && expected[1].empty());
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(v2_pq_pair)
+{
+    for (const bool test_initiator : {true, false}) {
+        BOOST_TEST_CONTEXT("test_initiator=" << test_initiator)
+        {
+            V2TransportTester tester(m_rng, test_initiator, PQ_ON);
+            auto& transport{tester.GetTransport()};
+            // Pending from the start of the handshake.
+            CheckPQ(transport, PQStatus::PENDING);
+            BOOST_CHECK(!transport.GetPQSnapshot().version_received);
+            const uint256 ecdh_session_id{HybridHandshake(tester, test_initiator, /*send_confirmation=*/false)};
+
+            // Switched, not confirmed: pending, still detecting, and no session id. The switch
+            // wiped the decapsulation key and the retained ECDH secret.
+            auto info{transport.GetInfo()};
+            BOOST_CHECK(info.transport_type == TransportProtocolType::DETECTING);
+            BOOST_CHECK(!info.session_id);
+            CheckPQ(transport, PQStatus::PENDING);
+            auto snapshot{transport.GetPQSnapshot()};
+            BOOST_CHECK(snapshot.version_received && snapshot.switched && !snapshot.confirmed);
+            BOOST_CHECK(snapshot.offer == (test_initiator ? PQOfferState::RECEIVED : PQOfferState::SENT));
+            BOOST_CHECK(!transport.HoldsHybridSecretsForTesting());
+
+            // The transport sends application messages without waiting for our confirmation.
+            const auto msg_data_1{m_rng.randbytes<uint8_t>(m_rng.randrange(100000))};
+            tester.AddMessage("barfoo", msg_data_1);
+            auto ret{tester.Interact()};
+            BOOST_REQUIRE(ret && ret->empty());
+            tester.ReceiveMessage("barfoo", msg_data_1);
+
+            // It delivers ours only after our confirmation.
+            const auto msg_data_2{m_rng.randbytes<uint8_t>(m_rng.randrange(100000))};
+            tester.SendConfirmation();
+            tester.SendMessage(uint8_t(4), msg_data_2); // cmpctblock short id
+            tester.SendMessage("tx", msg_data_1);
+            ret = tester.Interact();
+            BOOST_REQUIRE(ret && ret->size() == 2);
+            BOOST_CHECK((*ret)[0] && (*ret)[0]->m_type == "cmpctblock" && std::ranges::equal((*ret)[0]->m_recv, MakeByteSpan(msg_data_2)));
+            BOOST_CHECK((*ret)[1] && (*ret)[1]->m_type == "tx" && std::ranges::equal((*ret)[1]->m_recv, MakeByteSpan(msg_data_1)));
+
+            // Hybrid: v2 with the hybrid session id, which both sides share.
+            info = transport.GetInfo();
+            BOOST_CHECK(info.transport_type == TransportProtocolType::V2);
+            CheckPQ(transport, PQStatus::HYBRID);
+            tester.CompareSessionIDs();
+            BOOST_CHECK(info.session_id && *info.session_id != ecdh_session_id);
+            snapshot = transport.GetPQSnapshot();
+            BOOST_CHECK(snapshot.switched && snapshot.confirmed);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(v2_pq_legacy_matrix)
+{
+    // The tested transport (on, off or in fallback) against a scripted peer (hybrid or legacy), in
+    // both roles. A legacy peer sends its version packet and an application burst as soon as it
+    // can, without waiting for ours.
+    for (const bool test_initiator : {true, false}) {
+        for (const PQMode local : {PQMode::OFF, PQMode::NEGOTIATE, PQMode::FALLBACK}) {
+            // Inbound connections never fall back.
+            if (local == PQMode::FALLBACK && !test_initiator) continue;
+            for (const bool peer_hybrid : {false, true}) {
+                BOOST_TEST_CONTEXT("test_initiator=" << test_initiator << " local=" << int(local) << " peer_hybrid=" << peer_hybrid)
+                {
+                    g_kem_calls = {};
+                    TestPQEntropy entropy{m_rng.rand256()};
+                    V2TransportTester tester(m_rng, test_initiator, {.mode = local}, entropy.Source(), COUNTING_KEM_OPS);
+                    auto& transport{tester.GetTransport()};
+                    const bool hybrid{local == PQMode::NEGOTIATE && peer_hybrid};
+                    const bool offered{local == PQMode::NEGOTIATE && !test_initiator};
+                    const auto burst_1{m_rng.randbytes<uint8_t>(m_rng.randrange(10000))};
+                    const auto burst_2{m_rng.randbytes<uint8_t>(m_rng.randrange(1000))};
+                    const auto send_burst = [&] {
+                        tester.SendMessage(uint8_t(14), burst_1); // inv short id
+                        tester.SendMessage("foobar", burst_2);
+                    };
+                    // Until the peer's version packet is processed, the negotiation is pending.
+                    const PQStatus initial_status{local == PQMode::OFF ? PQStatus::OFF :
+                                                  local == PQMode::FALLBACK ? PQStatus::FALLBACK : PQStatus::PENDING};
+                    CheckPQ(transport, initial_status);
+
+                    if (test_initiator) {
+                        auto ret{tester.Interact()};
+                        BOOST_REQUIRE(ret && ret->empty());
+                    }
+                    tester.SendKey();
+                    tester.SendGarbage();
+                    if (!test_initiator) {
+                        auto ret{tester.Interact()};
+                        BOOST_REQUIRE(ret && ret->empty());
+                    }
+                    tester.ReceiveKey(/*retain_for_hybrid=*/peer_hybrid);
+                    tester.SendGarbageTerm();
+                    // After the key exchange, before the peer's version packet: still pending, and
+                    // only the negotiation holds secrets for the switch.
+                    auto ret{tester.Interact()};
+                    BOOST_REQUIRE(ret && ret->empty());
+                    CheckPQ(transport, initial_status);
+                    BOOST_CHECK(!transport.GetPQSnapshot().version_received);
+                    BOOST_CHECK_EQUAL(transport.HoldsHybridSecretsForTesting(), local == PQMode::NEGOTIATE);
+                    if (!peer_hybrid) {
+                        tester.SendVersion();
+                        send_burst();
+                    } else if (test_initiator) {
+                        // A hybrid responder offers at once.
+                        tester.SendOffer();
+                    }
+                    ret = tester.Interact();
+                    BOOST_REQUIRE(ret);
+                    BOOST_CHECK_EQUAL(ret->size(), peer_hybrid ? 0U : 2U);
+                    tester.ReceiveGarbage();
+                    if (!peer_hybrid) {
+                        // A legacy peer ignores an offer.
+                        const auto contents{tester.ReceiveVersionContents()};
+                        BOOST_CHECK(offered ? PQHandshake::ParseContents(MakeByteSpan(contents)).kind == PQHandshake::ParseKind::OWN_RECORD : contents.empty());
+                    } else if (test_initiator) {
+                        if (hybrid) {
+                            tester.ReceiveAcceptAndSwitch();
+                            tester.ReceiveConfirmation();
+                            tester.SendConfirmation();
+                        } else {
+                            BOOST_CHECK(tester.ReceiveVersionContents().empty());
+                            tester.GetCipher().DiscardHybridSecret();
+                        }
+                        send_burst();
+                    } else {
+                        // A hybrid initiator answers the responder's version packet.
+                        if (hybrid) {
+                            tester.AcceptOfferAndSwitch();
+                            tester.SendConfirmation();
+                        } else {
+                            BOOST_CHECK(tester.ReceiveVersionContents().empty());
+                            tester.GetCipher().DiscardHybridSecret();
+                            tester.SendVersion();
+                        }
+                        send_burst();
+                    }
+                    if (peer_hybrid) {
+                        ret = tester.Interact();
+                        BOOST_REQUIRE(ret && ret->size() == 2);
+                        if (hybrid && !test_initiator) tester.ReceiveConfirmation();
+                    }
+                    BOOST_CHECK((*ret)[0] && (*ret)[0]->m_type == "inv" && std::ranges::equal((*ret)[0]->m_recv, MakeByteSpan(burst_1)));
+                    BOOST_CHECK((*ret)[1] && (*ret)[1]->m_type == "foobar" && std::ranges::equal((*ret)[1]->m_recv, MakeByteSpan(burst_2)));
+
+                    // The transport's messages arrive under the keys the peer expects.
+                    tester.AddMessage("barfoo", burst_2);
+                    ret = tester.Interact();
+                    BOOST_REQUIRE(ret && ret->empty());
+                    tester.ReceiveMessage("barfoo", burst_2);
+                    BOOST_CHECK(tester.Received().empty());
+                    tester.CompareSessionIDs();
+                    const PQStatus status{local == PQMode::OFF ? PQStatus::OFF :
+                                          local == PQMode::FALLBACK ? PQStatus::FALLBACK :
+                                          hybrid ? PQStatus::HYBRID : PQStatus::LEGACY_PEER};
+                    CheckPQ(transport, status);
+                    // The switch and a legacy outcome both wiped what the switch needed.
+                    BOOST_CHECK(!transport.HoldsHybridSecretsForTesting());
+
+                    // Off and fallback neither generate, parse nor validate anything; a responder
+                    // never decapsulates without an accept.
+                    BOOST_CHECK_EQUAL(g_kem_calls.keygen, offered ? 1 : 0);
+                    BOOST_CHECK_EQUAL(g_kem_calls.check, hybrid && test_initiator ? 1 : 0);
+                    BOOST_CHECK_EQUAL(g_kem_calls.encaps, hybrid && test_initiator ? 1 : 0);
+                    BOOST_CHECK_EQUAL(g_kem_calls.decaps, hybrid && !test_initiator ? 1 : 0);
+                }
+            }
+        }
+    }
+
+    // Two transports in every combination of modes.
+    for (const PQMode initiator_mode : {PQMode::OFF, PQMode::NEGOTIATE, PQMode::FALLBACK}) {
+        for (const PQMode responder_mode : {PQMode::OFF, PQMode::NEGOTIATE}) {
+            BOOST_TEST_CONTEXT("initiator=" << int(initiator_mode) << " responder=" << int(responder_mode))
+            {
+                V2Transport initiator{0, /*initiating=*/true, {.mode = initiator_mode}};
+                V2Transport responder{1, /*initiating=*/false, {.mode = responder_mode}};
+                ExchangeMessages(m_rng, initiator, responder, 5);
+                const auto initiator_info{initiator.GetInfo()}, responder_info{responder.GetInfo()};
+                BOOST_CHECK(initiator_info.transport_type == TransportProtocolType::V2);
+                BOOST_CHECK(initiator_info.session_id && initiator_info.session_id == responder_info.session_id);
+                const bool hybrid{initiator_mode == PQMode::NEGOTIATE && responder_mode == PQMode::NEGOTIATE};
+                const auto expected = [&](PQMode mode) {
+                    if (mode == PQMode::OFF) return PQStatus::OFF;
+                    if (mode == PQMode::FALLBACK) return PQStatus::FALLBACK;
+                    return hybrid ? PQStatus::HYBRID : PQStatus::LEGACY_PEER;
+                };
+                CheckPQ(initiator, expected(initiator_mode));
+                CheckPQ(responder, expected(responder_mode));
+                BOOST_CHECK(!initiator.HoldsHybridSecretsForTesting());
+                BOOST_CHECK(!responder.HoldsHybridSecretsForTesting());
+            }
+        }
+    }
+
+    // A responder never falls back: its FALLBACK is a caller bug (Assume), and it runs and reports
+    // as off. Debug builds abort on the Assume instead.
+    if constexpr (!G_FUZZING_BUILD && !G_ABORT_ON_FAILED_ASSUME) {
+        V2Transport initiator{0, /*initiating=*/true, PQ_ON};
+        V2Transport responder{1, /*initiating=*/false, {.mode = PQMode::FALLBACK}};
+        ExchangeMessages(m_rng, initiator, responder, 2);
+        CheckPQ(initiator, PQStatus::LEGACY_PEER);
+        CheckPQ(responder, PQStatus::OFF);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(v2_pq_v1_detection)
+{
+    // A responder with the negotiation on detects v1 peers and peers from another network as
+    // before, without generating a key.
+    g_kem_calls = {};
+    {
+        TestPQEntropy entropy{m_rng.rand256()};
+        V2TransportTester tester(m_rng, false, PQ_ON, entropy.Source(), COUNTING_KEM_OPS);
+        tester.SendV1Version(Params().MessageStart());
+        BOOST_CHECK(tester.Interact());
+        const auto info{tester.GetTransport().GetInfo()};
+        BOOST_CHECK(info.transport_type == TransportProtocolType::V1);
+        BOOST_CHECK(info.transport_pq_status == PQStatus::V1);
+        BOOST_CHECK(!info.transport_pq);
+    }
+    {
+        TestPQEntropy entropy{m_rng.rand256()};
+        V2TransportTester tester(m_rng, false, PQ_ON, entropy.Source(), COUNTING_KEM_OPS);
+        tester.SendV1Version(CChainParams::Main()->MessageStart());
+        BOOST_CHECK(!tester.Interact());
+    }
+    BOOST_CHECK_EQUAL(g_kem_calls.total(), 0);
+
+    // An initiator asks for the v1 retry exactly as before: after sending at least 24 bytes and
+    // before receiving anything.
+    for (const PQMode mode : {PQMode::OFF, PQMode::NEGOTIATE, PQMode::FALLBACK}) {
+        V2TransportTester tester(m_rng, true, {.mode = mode});
+        auto& transport{tester.GetTransport()};
+        BOOST_CHECK(!transport.ShouldReconnectV1());
+        BOOST_REQUIRE(tester.Interact());
+        BOOST_CHECK(transport.ShouldReconnectV1());
+        tester.SendKey();
+        tester.ToSend().resize(1);
+        BOOST_REQUIRE(tester.Deliver());
+        BOOST_CHECK(!transport.ShouldReconnectV1());
+    }
+}
+
+BOOST_AUTO_TEST_CASE(v2_pq_send_hold)
+{
+    for (const bool test_initiator : {true, false}) {
+        BOOST_TEST_CONTEXT("test_initiator=" << test_initiator)
+        {
+            V2TransportTester tester(m_rng, test_initiator, PQ_ON);
+            auto& transport{tester.GetTransport()};
+            if (test_initiator) tester.Collect();
+            tester.SendKey();
+            tester.SendGarbage();
+            BOOST_REQUIRE(tester.Deliver());
+
+            // A responder's offer counts as sent once it is queued.
+            BOOST_CHECK(transport.GetPQSnapshot().offer == (test_initiator ? PQOfferState::NONE : PQOfferState::SENT));
+
+            // Holding: the terminator (initiator) or the key, garbage, terminator and offer
+            // (responder) is queued. Send part of it, and look at all of it.
+            auto [bytes, more, _type] = transport.GetBytesToSend(/*have_next_message=*/true);
+            BOOST_CHECK(!more);
+            BOOST_REQUIRE(bytes.size() > (test_initiator ? 0U : PQ_RECORD_BYTES));
+            const std::vector<uint8_t> queued{bytes.begin(), bytes.end()};
+            tester.Received().insert(tester.Received().end(), queued.begin(), queued.end());
+            const size_t sent{test_initiator ? 1 + m_rng.randrange(queued.size() - 1) : queued.size() - 1 - m_rng.randrange(PQ_RECORD_BYTES)};
+            transport.MarkBytesSent(sent);
+
+            // No message is taken, and nothing more will be sendable.
+            CSerializedNetMsg msg;
+            msg.m_type = "ping";
+            msg.data = m_rng.randbytes<uint8_t>(8);
+            const auto data{msg.data};
+            BOOST_CHECK(!transport.SetMessageToSend(msg));
+            BOOST_CHECK(msg.m_type == "ping" && msg.data == data);
+            for (const bool have_next : {false, true}) {
+                const auto& [rest, rest_more, _rest_type] = transport.GetBytesToSend(have_next);
+                BOOST_CHECK(!rest_more);
+                BOOST_CHECK(std::ranges::equal(rest, std::span{queued}.subspan(sent)));
+            }
+
+            // The peer's version packet: the transport appends after the unsent bytes.
+            tester.ReceiveKey(/*retain_for_hybrid=*/true);
+            tester.SendGarbageTerm();
+            if (test_initiator) {
+                tester.SendOffer();
+            } else {
+                tester.ReceiveGarbage();
+                tester.AcceptOfferAndSwitch();
+            }
+            BOOST_REQUIRE(tester.Deliver());
+            const auto& [after, after_more, _after_type] = transport.GetBytesToSend(/*have_next_message=*/true);
+            BOOST_CHECK(after_more);
+            const size_t appended{(test_initiator ? BIP324Cipher::EXPANSION + PQ_RECORD_BYTES : 0) + PQ_CONFIRMATION_BYTES};
+            BOOST_REQUIRE_EQUAL(after.size(), queued.size() - sent + appended);
+            BOOST_CHECK(std::ranges::equal(after.first(queued.size() - sent), std::span{queued}.subspan(sent)));
+            tester.Received().insert(tester.Received().end(), after.end() - appended, after.end());
+            transport.MarkBytesSent(after.size());
+            if (test_initiator) {
+                tester.ReceiveGarbage();
+                tester.ReceiveAcceptAndSwitch();
+            }
+            tester.ReceiveConfirmation();
+
+            // Now the held message goes out under the hybrid keys.
+            BOOST_CHECK(transport.SetMessageToSend(msg));
+            tester.Collect();
+            tester.ReceiveMessage(uint8_t(18), data); // ping short id
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(v2_pq_switch_boundary)
+{
+    for (const bool test_initiator : {true, false}) {
+        for (const bool byte_by_byte : {false, true}) {
+            BOOST_TEST_CONTEXT("test_initiator=" << test_initiator << " byte_by_byte=" << byte_by_byte)
+            {
+                V2TransportTester tester(m_rng, test_initiator, PQ_ON);
+                auto& transport{tester.GetTransport()};
+                const auto payload{m_rng.randbytes<uint8_t>(m_rng.randrange(1000))};
+                if (test_initiator) {
+                    // The offer (ECDH keys), then confirmation and message (hybrid keys).
+                    tester.Collect();
+                    tester.SendKey();
+                    tester.SendGarbage();
+                    tester.ReceiveKey(/*retain_for_hybrid=*/true);
+                    tester.SendGarbageTerm();
+                    tester.SendOffer();
+                    BOOST_REQUIRE(tester.Deliver(byte_by_byte));
+                    tester.Collect();
+                    tester.ReceiveGarbage();
+                    tester.ReceiveAcceptAndSwitch();
+                    tester.ReceiveConfirmation();
+                } else {
+                    // The accept (ECDH keys), confirmation and message (hybrid keys), coalesced.
+                    tester.SendKey();
+                    tester.SendGarbage();
+                    BOOST_REQUIRE(tester.Deliver(byte_by_byte));
+                    tester.Collect();
+                    tester.ReceiveKey(/*retain_for_hybrid=*/true);
+                    tester.SendGarbageTerm();
+                    tester.ReceiveGarbage();
+                    tester.AcceptOfferAndSwitch();
+                }
+                tester.SendConfirmation();
+                const size_t before_message{tester.ToSend().size()};
+                tester.SendMessage(uint8_t(14), payload); // inv short id
+                std::vector<uint8_t> message{tester.ToSend().begin() + before_message, tester.ToSend().end()};
+                tester.ToSend().resize(before_message);
+
+                // Up to the end of the confirmation: confirmed, and no message.
+                BOOST_REQUIRE(tester.Deliver(byte_by_byte));
+                BOOST_CHECK(!transport.ReceivedMessageComplete());
+                CheckPQ(transport, PQStatus::HYBRID);
+                if (!test_initiator) {
+                    tester.Collect();
+                    tester.ReceiveConfirmation();
+                }
+
+                // Then the message, under the hybrid keys.
+                tester.Send(message);
+                BOOST_REQUIRE(tester.Deliver(byte_by_byte));
+                BOOST_REQUIRE(transport.ReceivedMessageComplete());
+                bool reject{false};
+                const CNetMessage msg{transport.GetReceivedMessage({}, reject)};
+                BOOST_CHECK(!reject && msg.m_type == "inv" && std::ranges::equal(msg.m_recv, MakeByteSpan(payload)));
+                BOOST_CHECK(!transport.ReceivedMessageComplete());
+                tester.CompareSessionIDs();
+            }
+        }
+    }
+
+    // All at once: the accept, the confirmation and a message coalesced in one delivery.
+    {
+        V2TransportTester tester(m_rng, false, PQ_ON);
+        auto& transport{tester.GetTransport()};
+        const auto payload{m_rng.randbytes<uint8_t>(100)};
+        tester.SendKey();
+        tester.SendGarbage();
+        BOOST_REQUIRE(tester.Deliver());
+        tester.Collect();
+        tester.ReceiveKey(/*retain_for_hybrid=*/true);
+        tester.SendGarbageTerm();
+        tester.ReceiveGarbage();
+        tester.AcceptOfferAndSwitch();
+        tester.SendConfirmation();
+        tester.SendMessage(uint8_t(14), payload);
+        BOOST_REQUIRE(tester.Deliver());
+        BOOST_REQUIRE(transport.ReceivedMessageComplete());
+        bool reject{false};
+        const CNetMessage msg{transport.GetReceivedMessage({}, reject)};
+        BOOST_CHECK(!reject && msg.m_type == "inv" && std::ranges::equal(msg.m_recv, MakeByteSpan(payload)));
+        CheckPQ(transport, PQStatus::HYBRID);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(v2_pq_confirmation_length)
+{
+    for (const bool test_initiator : {true, false}) {
+        for (const size_t length : {size_t{1}, size_t{17}, size_t{4'000'014}}) {
+            BOOST_TEST_CONTEXT("test_initiator=" << test_initiator << " length=" << length)
+            {
+                V2TransportTester tester(m_rng, test_initiator, PQ_ON);
+                auto& transport{tester.GetTransport()};
+                HybridHandshake(tester, test_initiator, /*send_confirmation=*/false);
+                // An authenticated decoy with a nonzero length, of which only the length arrives.
+                tester.SendPacket(std::vector<uint8_t>(length), /*aad=*/{}, /*ignore=*/true);
+                tester.ToSend().resize(BIP324Cipher::LENGTH_LEN);
+                BOOST_CHECK(!tester.Deliver(/*byte_by_byte=*/true));
+                BOOST_CHECK(tester.ToSend().empty());
+                CheckPQ(transport, PQStatus::PENDING, PQFailure::CONFIRM_LENGTH);
+                BOOST_CHECK(!transport.ShouldReconnectV1());
+            }
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(v2_pq_confirmation_tag)
+{
+    for (const bool test_initiator : {true, false}) {
+        for (const bool damage_header : {false, true}) {
+            BOOST_TEST_CONTEXT("test_initiator=" << test_initiator << " damage_header=" << damage_header)
+            {
+                V2TransportTester tester(m_rng, test_initiator, PQ_ON);
+                auto& transport{tester.GetTransport()};
+                HybridHandshake(tester, test_initiator, /*send_confirmation=*/false);
+                tester.SendConfirmation();
+                BOOST_REQUIRE_EQUAL(tester.ToSend().size(), PQ_CONFIRMATION_BYTES);
+                tester.ToSend()[damage_header ? BIP324Cipher::LENGTH_LEN : PQ_CONFIRMATION_BYTES - 1] ^= 1 << m_rng.randrange(8);
+                // Nothing fails before byte 20.
+                std::vector<uint8_t> last{tester.ToSend().back()};
+                tester.ToSend().pop_back();
+                BOOST_REQUIRE(tester.Deliver(/*byte_by_byte=*/true));
+                CheckPQ(transport, PQStatus::PENDING);
+                tester.Send(last);
+                BOOST_CHECK(!tester.Deliver());
+                CheckPQ(transport, PQStatus::PENDING, PQFailure::CONFIRM_TAG);
+            }
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(v2_pq_confirmation_not_decoy)
+{
+    for (const bool test_initiator : {true, false}) {
+        BOOST_TEST_CONTEXT("test_initiator=" << test_initiator)
+        {
+            V2TransportTester tester(m_rng, test_initiator, PQ_ON);
+            auto& transport{tester.GetTransport()};
+            HybridHandshake(tester, test_initiator, /*send_confirmation=*/false);
+            // An authenticated empty packet without the ignore bit (an empty application message).
+            tester.SendPacket(/*content=*/{}, /*aad=*/{}, /*ignore=*/false);
+            BOOST_CHECK(!tester.Deliver(/*byte_by_byte=*/true));
+            BOOST_CHECK(tester.ToSend().empty());
+            BOOST_CHECK(!transport.ReceivedMessageComplete());
+            CheckPQ(transport, PQStatus::PENDING, PQFailure::CONFIRM_NOT_DECOY);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(v2_pq_corrupt_ct)
+{
+    // A ciphertext damaged in transit, of the right length: the responder switches to different
+    // keys, and the first packet under them fails. No continuation with ECDH keys.
+    {
+        V2TransportTester tester(m_rng, false, PQ_ON);
+        auto& transport{tester.GetTransport()};
+        tester.SendKey();
+        tester.SendGarbage();
+        BOOST_REQUIRE(tester.Interact());
+        tester.ReceiveKey(/*retain_for_hybrid=*/true);
+        tester.SendGarbageTerm();
+        tester.ReceiveGarbage();
+        tester.AcceptOfferAndSwitch(/*damage_ct=*/true);
+        tester.SendConfirmation();
+        BOOST_CHECK(!tester.Interact());
+        const auto snapshot{transport.GetPQSnapshot()};
+        BOOST_CHECK(snapshot.switched && !snapshot.confirmed);
+        BOOST_CHECK(snapshot.failure == PQFailure::CONFIRM_LENGTH || snapshot.failure == PQFailure::CONFIRM_TAG);
+        BOOST_CHECK(transport.GetInfo().transport_pq_status == PQStatus::PENDING);
+    }
+
+    // The local fault injection: the transport inverts byte 0 of its ML-KEM secret. Each side
+    // rejects the other's confirmation, and an initiator does not retry with v1.
+    for (const bool test_initiator : {true, false}) {
+        BOOST_TEST_CONTEXT("test_initiator=" << test_initiator)
+        {
+            V2TransportTester tester(m_rng, test_initiator, {.mode = PQMode::NEGOTIATE, .corrupt_shared_secret = true});
+            auto& transport{tester.GetTransport()};
+            if (test_initiator) {
+                BOOST_REQUIRE(tester.Interact());
+                tester.SendKey();
+                tester.SendGarbage();
+                tester.ReceiveKey(/*retain_for_hybrid=*/true);
+                tester.SendGarbageTerm();
+                tester.SendOffer();
+                BOOST_REQUIRE(tester.Interact());
+                tester.ReceiveGarbage();
+                tester.ReceiveAcceptAndSwitch();
+            } else {
+                tester.SendKey();
+                tester.SendGarbage();
+                BOOST_REQUIRE(tester.Interact());
+                tester.ReceiveKey(/*retain_for_hybrid=*/true);
+                tester.SendGarbageTerm();
+                tester.ReceiveGarbage();
+                tester.AcceptOfferAndSwitch();
+                BOOST_REQUIRE(tester.Interact());
+            }
+            // The transport's confirmation does not verify under our honest keys.
+            BOOST_REQUIRE_EQUAL(tester.Received().size(), PQ_CONFIRMATION_BYTES);
+            const auto packet{MakeByteSpan(tester.Received())};
+            bool ignore{false};
+            BOOST_CHECK(tester.GetCipher().DecryptLength(packet.first(BIP324Cipher::LENGTH_LEN)) != 0 ||
+                        !tester.GetCipher().Decrypt(packet.subspan(BIP324Cipher::LENGTH_LEN), {}, ignore, {}));
+            tester.SendConfirmation();
+            BOOST_CHECK(!tester.Interact());
+            const auto snapshot{transport.GetPQSnapshot()};
+            BOOST_CHECK(snapshot.switched && !snapshot.confirmed);
+            BOOST_CHECK(snapshot.failure == PQFailure::CONFIRM_LENGTH || snapshot.failure == PQFailure::CONFIRM_TAG);
+            BOOST_CHECK(!transport.ShouldReconnectV1());
+        }
+    }
+
+    // The injected fault is exactly byte 0 of the ML-KEM secret inverted, EK and CT untouched: a
+    // peer that inverts the same byte derives the transport's keys. pq_transport_vectors.json
+    // models the same change in a negative vector.
+    for (const bool test_initiator : {true, false}) {
+        BOOST_TEST_CONTEXT("test_initiator=" << test_initiator)
+        {
+            V2TransportTester tester(m_rng, test_initiator, {.mode = PQMode::NEGOTIATE, .corrupt_shared_secret = true});
+            auto& transport{tester.GetTransport()};
+            if (test_initiator) {
+                BOOST_REQUIRE(tester.Interact());
+                tester.SendKey();
+                tester.SendGarbage();
+                tester.ReceiveKey(/*retain_for_hybrid=*/true);
+                tester.SendGarbageTerm();
+                tester.SendOffer();
+                BOOST_REQUIRE(tester.Interact());
+                tester.ReceiveGarbage();
+                tester.ReceiveAcceptAndSwitch(/*invert_ss=*/true);
+            } else {
+                tester.SendKey();
+                tester.SendGarbage();
+                BOOST_REQUIRE(tester.Interact());
+                tester.ReceiveKey(/*retain_for_hybrid=*/true);
+                tester.SendGarbageTerm();
+                tester.ReceiveGarbage();
+                tester.AcceptOfferAndSwitch(/*damage_ct=*/false, /*invert_ss=*/true);
+                BOOST_REQUIRE(tester.Interact());
+            }
+            tester.ReceiveConfirmation();
+            tester.SendConfirmation();
+            BOOST_REQUIRE(tester.Interact());
+            CheckPQ(transport, PQStatus::HYBRID);
+            tester.CompareSessionIDs();
+        }
+    }
+    UniValue doc;
+    BOOST_REQUIRE(doc.read(json_tests::pq_transport_vectors));
+    int modeled{0};
+    for (const UniValue& neg : doc["negative_vectors"].getValues()) {
+        const UniValue& vec{doc["vectors"][neg["vector"].getInt<size_t>()]};
+        auto ss{ParseHex(vec["ss_mlkem"].get_str())};
+        ss[0] ^= 0xff;
+        const UniValue& contents{neg["transcript_contents"]};
+        if (HexStr(ss) == neg["ss_mlkem"].get_str() && contents[0].get_str() == vec["contents_responder"].get_str() &&
+            contents[1].get_str() == vec["contents_initiator"].get_str()) {
+            ++modeled;
+        }
+    }
+    BOOST_CHECK_EQUAL(modeled, 1);
+}
+
+BOOST_AUTO_TEST_CASE(v2_pq_internal_errors)
+{
+    using mlkem::InjectResultForTesting;
+    using mlkem::Operation;
+    namespace upstream = mlkem::upstream;
+
+    // Failures before anything is committed: an empty version packet, and plain v2 continues.
+    for (const auto& [op, failure] : {std::pair{Operation::KEYGEN, PQFailure::KEYGEN_INTERNAL},
+                                      std::pair{Operation::CHECK_PUBLIC_KEY, PQFailure::CHECK_EK_INTERNAL},
+                                      std::pair{Operation::ENCAPS, PQFailure::ENCAPS_INTERNAL}}) {
+        const bool test_initiator{op != Operation::KEYGEN};
+        BOOST_TEST_CONTEXT("failure=" << int(failure))
+        {
+            g_kem_calls = {};
+            TestPQEntropy entropy{m_rng.rand256()};
+            V2TransportTester tester(m_rng, test_initiator, PQ_ON, entropy.Source(), COUNTING_KEM_OPS);
+            auto& transport{tester.GetTransport()};
+            if (test_initiator) {
+                BOOST_REQUIRE(tester.Interact());
+                tester.SendKey();
+                tester.SendGarbage();
+                tester.ReceiveKey(/*retain_for_hybrid=*/true);
+                tester.SendGarbageTerm();
+                tester.SendOffer();
+                InjectResultForTesting inject{op, upstream::ERR_FAIL};
+                BOOST_REQUIRE(tester.Interact());
+            } else {
+                tester.SendKey();
+                tester.SendGarbage();
+                {
+                    InjectResultForTesting inject{op, upstream::ERR_FAIL};
+                    BOOST_REQUIRE(tester.Interact());
+                }
+                // No offer was queued, and the retained secret is wiped at once, not only when the
+                // initiator's version packet arrives.
+                BOOST_CHECK(transport.GetPQSnapshot().offer == PQOfferState::NONE);
+                BOOST_CHECK(!transport.HoldsHybridSecretsForTesting());
+                tester.ReceiveKey(/*retain_for_hybrid=*/true);
+                tester.SendGarbageTerm();
+            }
+            tester.ReceiveGarbage();
+            BOOST_CHECK(tester.ReceiveVersionContents().empty());
+            tester.GetCipher().DiscardHybridSecret();
+            if (!test_initiator) {
+                // An unsolicited own record (an accept to an offer never made) is ignored and
+                // never decapsulated.
+                tester.SendVersion(MakeUCharSpan(MakeRecord(PQ_MLKEM1024, MakeByteSpan(m_rng.randbytes<uint8_t>(mlkem::CIPHERTEXT_BYTES)))));
+            }
+            const auto payload{m_rng.randbytes<uint8_t>(100)};
+            tester.SendMessage(uint8_t(14), payload);
+            tester.AddMessage("barfoo", payload);
+            const auto ret{tester.Interact()};
+            BOOST_REQUIRE(ret && ret->size() == 1);
+            BOOST_CHECK((*ret)[0] && (*ret)[0]->m_type == "inv" && std::ranges::equal((*ret)[0]->m_recv, MakeByteSpan(payload)));
+            tester.ReceiveMessage("barfoo", payload);
+            tester.CompareSessionIDs();
+            CheckPQ(transport, PQStatus::OFF, failure);
+            BOOST_CHECK(!transport.GetPQSnapshot().switched);
+            BOOST_CHECK(!transport.HoldsHybridSecretsForTesting());
+            BOOST_CHECK_EQUAL(g_kem_calls.decaps, 0);
+            BOOST_CHECK_EQUAL(g_kem_calls.keygen, test_initiator ? 0 : 1);
+        }
+    }
+
+    // Decapsulation fails after the initiator committed to its accept: close at once, on the
+    // version packet, without queuing a confirmation. There is no failed status, so the closing
+    // connection reports pending.
+    {
+        V2TransportTester tester(m_rng, false, PQ_ON);
+        auto& transport{tester.GetTransport()};
+        tester.SendKey();
+        tester.SendGarbage();
+        BOOST_REQUIRE(tester.Interact());
+        tester.ReceiveKey(/*retain_for_hybrid=*/true);
+        tester.SendGarbageTerm();
+        tester.ReceiveGarbage();
+        tester.AcceptOfferAndSwitch();
+        InjectResultForTesting inject{Operation::DECAPS, upstream::ERR_FAIL};
+        BOOST_CHECK(!tester.Deliver());
+        BOOST_CHECK(tester.ToSend().empty());
+        BOOST_CHECK(std::get<0>(transport.GetBytesToSend(false)).empty());
+        const auto snapshot{transport.GetPQSnapshot()};
+        BOOST_CHECK(snapshot.version_received && !snapshot.switched);
+        CheckPQ(transport, PQStatus::PENDING, PQFailure::DECAPS_INTERNAL);
+        BOOST_CHECK(!transport.HoldsHybridSecretsForTesting());
+    }
+
+    // An inconsistent cipher state (a local bug, behind Assume) closes in both roles, also before
+    // the initiator committed to anything. Debug builds abort on the Assume instead.
+    if constexpr (!G_FUZZING_BUILD && !G_ABORT_ON_FAILED_ASSUME) {
+        for (const bool test_initiator : {true, false}) {
+            BOOST_TEST_CONTEXT("cipher_state test_initiator=" << test_initiator)
+            {
+                g_kem_calls = {};
+                TestPQEntropy entropy{m_rng.rand256()};
+                V2TransportTester tester(m_rng, test_initiator, PQ_ON, entropy.Source(), COUNTING_KEM_OPS);
+                auto& transport{tester.GetTransport()};
+                if (test_initiator) tester.Collect();
+                tester.SendKey();
+                tester.SendGarbage();
+                BOOST_REQUIRE(tester.Deliver());
+                tester.Collect();
+                tester.ReceiveKey(/*retain_for_hybrid=*/true);
+                tester.SendGarbageTerm();
+                transport.DiscardHybridSecretForTesting();
+                if (test_initiator) {
+                    tester.SendOffer();
+                } else {
+                    tester.ReceiveGarbage();
+                    tester.AcceptOfferAndSwitch();
+                }
+                BOOST_CHECK(!tester.Deliver());
+                // Nothing more is queued: no version packet from the initiator, no confirmation.
+                BOOST_CHECK(std::get<0>(transport.GetBytesToSend(false)).empty());
+                BOOST_CHECK(!transport.GetPQSnapshot().switched);
+                CheckPQ(transport, PQStatus::PENDING, PQFailure::CIPHER_STATE_INTERNAL);
+                BOOST_CHECK(!transport.HoldsHybridSecretsForTesting());
+                BOOST_CHECK_EQUAL(g_kem_calls.check + g_kem_calls.encaps + g_kem_calls.decaps, 0);
+            }
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(v2_pq_malformed_record)
+{
+    // The first own record of the peer's version packet has the wrong length, or (offer only) a
+    // key that fails the modulus check: close with that failure, wipe both secrets, and queue
+    // nothing, without any encapsulation or decapsulation.
+    const auto valid_offer{PQHandshake::SerializeRecord(TestEncapsulationKey())};
+    const auto bad_payload = [&](size_t size) { return MakeRecord(PQ_MLKEM1024, MakeByteSpan(m_rng.randbytes<uint8_t>(size))); };
+    struct Case {
+        std::string name;
+        bool test_initiator;
+        std::vector<std::byte> contents;
+        PQFailure failure;
+    };
+    std::vector<Case> cases{
+        {"ek 1567", true, bad_payload(mlkem::PUBLIC_KEY_BYTES - 1), PQFailure::EK_LENGTH},
+        {"ek 1569", true, bad_payload(mlkem::PUBLIC_KEY_BYTES + 1), PQFailure::EK_LENGTH},
+        {"ek modulus", true, MakeRecord(PQ_MLKEM1024, std::vector<std::byte>(mlkem::PUBLIC_KEY_BYTES, std::byte{0xff})), PQFailure::EK_MODULUS},
+        {"malformed first, valid second", true, Concat({bad_payload(2), valid_offer}), PQFailure::EK_LENGTH},
+    };
+    for (const size_t size : {size_t{0}, mlkem::CIPHERTEXT_BYTES - 1, mlkem::CIPHERTEXT_BYTES + 1, size_t{3000}}) {
+        cases.push_back({strprintf("ct %u", size), false, bad_payload(size), PQFailure::CT_LENGTH});
+    }
+    for (const auto& c : cases) {
+        BOOST_TEST_CONTEXT(c.name)
+        {
+            g_kem_calls = {};
+            TestPQEntropy entropy{m_rng.rand256()};
+            V2TransportTester tester(m_rng, c.test_initiator, PQ_ON, entropy.Source(), COUNTING_KEM_OPS);
+            auto& transport{tester.GetTransport()};
+            if (c.test_initiator) tester.Collect();
+            tester.SendKey();
+            tester.SendGarbage();
+            BOOST_REQUIRE(tester.Deliver());
+            // Everything queued so far: the key, garbage and terminator, and a responder's offer.
+            tester.Collect();
+            BOOST_CHECK(transport.HoldsHybridSecretsForTesting());
+            tester.ReceiveKey();
+            tester.SendGarbageTerm();
+            if (!c.test_initiator) {
+                tester.ReceiveGarbage();
+                BOOST_CHECK(PQHandshake::ParseContents(MakeByteSpan(tester.ReceiveVersionContents())).kind == PQHandshake::ParseKind::OWN_RECORD);
+            }
+            tester.SendVersion(MakeUCharSpan(c.contents));
+            BOOST_CHECK(!tester.Deliver());
+            BOOST_CHECK(std::get<0>(transport.GetBytesToSend(false)).empty());
+            const auto snapshot{transport.GetPQSnapshot()};
+            BOOST_CHECK(snapshot.version_received && !snapshot.switched);
+            CheckPQ(transport, PQStatus::PENDING, c.failure);
+            BOOST_CHECK(!transport.HoldsHybridSecretsForTesting());
+            BOOST_CHECK_EQUAL(g_kem_calls.check, c.failure == PQFailure::EK_MODULUS ? 1 : 0);
+            BOOST_CHECK_EQUAL(g_kem_calls.encaps + g_kem_calls.decaps, 0);
+            BOOST_CHECK_EQUAL(g_kem_calls.keygen, c.test_initiator ? 0 : 1);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(v2_pq_close_wipes)
+{
+    // A close the transport detects before the peer's version packet authenticated (a missing
+    // garbage terminator, or a version packet that is too long or fails its tag) wipes the
+    // retained ECDH secret and a responder's decapsulation key at once.
+    enum class Close { GARBAGE_TERMINATOR, VERSION_LENGTH, VERSION_TAG };
+    for (const bool test_initiator : {true, false}) {
+        for (const Close close : {Close::GARBAGE_TERMINATOR, Close::VERSION_LENGTH, Close::VERSION_TAG}) {
+            BOOST_TEST_CONTEXT("test_initiator=" << test_initiator << " close=" << int(close))
+            {
+                V2TransportTester tester(m_rng, test_initiator, PQ_ON);
+                auto& transport{tester.GetTransport()};
+                if (test_initiator) tester.Collect();
+                tester.SendKey();
+                BOOST_REQUIRE(tester.Deliver());
+                tester.Collect();
+                tester.ReceiveKey();
+                if (close == Close::GARBAGE_TERMINATOR) {
+                    tester.SendGarbage(V2Transport::MAX_GARBAGE_LEN + BIP324Cipher::GARBAGE_TERMINATOR_LEN);
+                } else {
+                    tester.SendGarbage();
+                    tester.SendGarbageTerm();
+                    const size_t version_start{tester.ToSend().size()};
+                    if (close == Close::VERSION_LENGTH) {
+                        // Only the length of a version packet one byte over the maximum arrives.
+                        tester.SendVersion(std::vector<uint8_t>(4'000'014));
+                        tester.ToSend().resize(version_start + BIP324Cipher::LENGTH_LEN);
+                    } else {
+                        tester.SendVersion();
+                        tester.ToSend().back() ^= 1 << m_rng.randrange(8);
+                    }
+                }
+                // Nothing fails before the last byte, and the secrets for the switch are held.
+                const std::vector<uint8_t> last{tester.ToSend().back()};
+                tester.ToSend().pop_back();
+                BOOST_REQUIRE(tester.Deliver());
+                BOOST_CHECK(transport.HoldsHybridSecretsForTesting());
+                tester.Send(last);
+                BOOST_CHECK(!tester.Deliver());
+                BOOST_CHECK(!transport.HoldsHybridSecretsForTesting());
+                // No PQ failure: the close is the transport's, before the peer's version packet.
+                const auto snapshot{transport.GetPQSnapshot()};
+                BOOST_CHECK(!snapshot.version_received && !snapshot.switched);
+                BOOST_CHECK(snapshot.offer == (test_initiator ? PQOfferState::NONE : PQOfferState::SENT));
+                CheckPQ(transport, PQStatus::PENDING);
+            }
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(v2_pq_version_wipes)
+{
+    // However a transport came to send its version packet without the negotiation, processing the
+    // peer's version packet wipes anything still held for a switch. A test option retains the ECDH
+    // secret and the transcript with the negotiation off, as a path that declined it after the key
+    // exchange without wiping them would.
+    for (const bool test_initiator : {true, false}) {
+        BOOST_TEST_CONTEXT("test_initiator=" << test_initiator)
+        {
+            V2TransportTester tester(m_rng, test_initiator, {.mode = PQMode::OFF, .retain_without_negotiation = true});
+            auto& transport{tester.GetTransport()};
+            if (test_initiator) tester.Collect();
+            tester.SendKey();
+            tester.SendGarbage();
+            BOOST_REQUIRE(tester.Deliver());
+            tester.Collect();
+            tester.ReceiveKey();
+            tester.SendGarbageTerm();
+            BOOST_REQUIRE(tester.Deliver());
+            // The transport sent its empty version packet, and still holds the retained secret.
+            BOOST_CHECK(transport.HoldsHybridSecretsForTesting());
+            tester.ReceiveGarbage();
+            tester.ReceiveVersion();
+            tester.SendVersion();
+            BOOST_REQUIRE(tester.Deliver());
+            BOOST_CHECK(!transport.HoldsHybridSecretsForTesting());
+
+            // The connection continues as plain v2.
+            const auto payload{m_rng.randbytes<uint8_t>(100)};
+            tester.SendMessage("foobar", payload);
+            tester.AddMessage("barfoo", payload);
+            const auto ret{tester.Interact()};
+            BOOST_REQUIRE(ret && ret->size() == 1);
+            BOOST_CHECK((*ret)[0] && (*ret)[0]->m_type == "foobar" && std::ranges::equal((*ret)[0]->m_recv, MakeByteSpan(payload)));
+            tester.ReceiveMessage("barfoo", payload);
+            tester.CompareSessionIDs();
+            CheckPQ(transport, PQStatus::OFF);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(v2_pq_rekey)
+{
+    for (const bool test_initiator : {true, false}) {
+        BOOST_TEST_CONTEXT("test_initiator=" << test_initiator)
+        {
+            V2TransportTester tester(m_rng, test_initiator, PQ_ON);
+            auto& transport{tester.GetTransport()};
+            // 222 decoys before our version packet: the transport's ECDH receive counter is at 223,
+            // one packet before a rekey, when it switches.
+            constexpr int DECOYS{BIP324Cipher::REKEY_INTERVAL - 2};
+            if (test_initiator) {
+                BOOST_REQUIRE(tester.Interact());
+                tester.SendKey();
+                tester.SendGarbage();
+                tester.ReceiveKey(/*retain_for_hybrid=*/true);
+                tester.SendGarbageTerm();
+                for (int i = 0; i < DECOYS; ++i) tester.SendVersion(m_rng.randbytes<uint8_t>(m_rng.randrange(10)), /*vers_ignore=*/true);
+                tester.SendOffer();
+                BOOST_REQUIRE(tester.Interact());
+                tester.ReceiveGarbage();
+                tester.ReceiveAcceptAndSwitch();
+            } else {
+                tester.SendKey();
+                tester.SendGarbage();
+                BOOST_REQUIRE(tester.Interact());
+                tester.ReceiveKey(/*retain_for_hybrid=*/true);
+                tester.SendGarbageTerm();
+                tester.ReceiveGarbage();
+                for (int i = 0; i < DECOYS; ++i) tester.SendVersion(m_rng.randbytes<uint8_t>(m_rng.randrange(10)), /*vers_ignore=*/true);
+                tester.AcceptOfferAndSwitch();
+                BOOST_REQUIRE(tester.Interact());
+            }
+            tester.ReceiveConfirmation();
+            tester.SendConfirmation();
+
+            // More than two rekey intervals of hybrid packets each way.
+            constexpr int MESSAGES{2 * BIP324Cipher::REKEY_INTERVAL + 2};
+            std::vector<std::vector<uint8_t>> payloads;
+            for (int i = 0; i < MESSAGES; ++i) {
+                payloads.push_back(m_rng.randbytes<uint8_t>(m_rng.randrange(100)));
+                tester.SendMessage(uint8_t(14), payloads.back());
+                tester.AddMessage("barfoo", payloads.back());
+            }
+            const auto ret{tester.Interact()};
+            BOOST_REQUIRE(ret && ret->size() == MESSAGES);
+            for (int i = 0; i < MESSAGES; ++i) {
+                BOOST_CHECK((*ret)[i] && (*ret)[i]->m_type == "inv" && std::ranges::equal((*ret)[i]->m_recv, MakeByteSpan(payloads[i])));
+                tester.ReceiveMessage("barfoo", payloads[i]);
+            }
+            CheckPQ(transport, PQStatus::HYBRID);
+            tester.CompareSessionIDs();
+        }
     }
 }
 

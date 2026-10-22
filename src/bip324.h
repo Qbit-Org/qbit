@@ -7,10 +7,12 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 
 #include <crypto/chacha20.h>
 #include <crypto/chacha20poly1305.h>
+#include <crypto/sha256.h>
 #include <key.h>
 #include <pubkey.h>
 #include <span.h>
@@ -40,9 +42,22 @@ private:
     std::array<std::byte, GARBAGE_TERMINATOR_LEN> m_send_garbage_terminator;
     std::array<std::byte, GARBAGE_TERMINATOR_LEN> m_recv_garbage_terminator;
 
+    /** Hybrid key schedule state, only kept when Initialize() was called with retain_for_hybrid. */
+    std::optional<ECDHSecret> m_retained_ecdh;
+    std::optional<CSHA256> m_hybrid_transcript;
+    std::array<uint8_t, 4> m_hybrid_magic{};
+    uint8_t m_version_contents_count{0};
+    bool m_hybrid_send_is_initiator{false};
+    bool m_hybrid_switched{false};
+
 public:
     /** No default constructor; keys must be provided to create a BIP324Cipher. */
     BIP324Cipher() = delete;
+
+    /** Wipes any retained hybrid secret. */
+    ~BIP324Cipher();
+    BIP324Cipher(const BIP324Cipher&) = delete;
+    BIP324Cipher& operator=(const BIP324Cipher&) = delete;
 
     /** Initialize a BIP324 cipher with specified key and encoding entropy (testing only). */
     BIP324Cipher(const CKey& key, std::span<const std::byte> ent32) noexcept;
@@ -58,8 +73,35 @@ public:
      * initiator is set to true if we are the initiator establishing the v2 P2P connection.
      * self_decrypt is only for testing, and swaps encryption/decryption keys, so that encryption
      * and decryption can be tested without knowing the other side's private key.
+     * retain_for_hybrid keeps the ECDH secret and starts the hybrid transcript, so that
+     * SwitchToHybrid() can later replace the keys. Without it, the ECDH secret is wiped here.
      */
-    void Initialize(const EllSwiftPubKey& their_pubkey, bool initiator, bool self_decrypt = false) noexcept;
+    void Initialize(const EllSwiftPubKey& their_pubkey, bool initiator, bool self_decrypt = false,
+                    bool retain_for_hybrid = false) noexcept;
+
+    /** Add the full version packet contents of one side to the hybrid transcript, the
+     *  responder's first and the initiator's second.
+     *
+     * Returns false, changing nothing, unless Initialize() retained the hybrid state, no
+     * DiscardHybridSecret() or SwitchToHybrid() happened since, and fewer than two contents
+     * were added.
+     */
+    [[nodiscard]] bool AddVersionContents(std::span<const std::byte> contents) noexcept;
+
+    /** Replace all four packet ciphers (counters at 0) and the session id with keys derived from
+     *  the retained ECDH secret, the ML-KEM shared secret and the transcript. The garbage
+     *  terminators are unchanged, and the retained secret is wiped.
+     *
+     * Returns false, changing nothing, unless the cipher is initialized, the hybrid state is
+     * retained, both version contents were added and no earlier switch happened.
+     */
+    [[nodiscard]] bool SwitchToHybrid(std::span<const std::byte, 32> ss_mlkem) noexcept;
+
+    /** Wipe the retained ECDH secret and reset the transcript; the current ciphers stay in use. */
+    void DiscardHybridSecret() noexcept;
+
+    /** Whether the retained ECDH secret or the transcript is still held. */
+    bool HoldsHybridSecret() const noexcept { return m_retained_ecdh.has_value() || m_hybrid_transcript.has_value(); }
 
     /** Determine whether this cipher is fully initialized. */
     explicit operator bool() const noexcept { return m_send_l_cipher.has_value(); }

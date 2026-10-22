@@ -166,6 +166,7 @@ target_json_data_sources(test_bitcoin
   data/p2mr_script_boundary_vectors.json
   data/p2mr_v1_manifest.json
   data/p2mr_vectors.json
+  data/pq_transport_vectors.json
   data/script_tests.json
   data/sighash.json
   data/testnet4_launch_difficulty.json
