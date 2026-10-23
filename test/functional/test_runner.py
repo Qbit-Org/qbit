@@ -256,6 +256,7 @@ BASE_SCRIPTS = [
     'rpc_net.py --v1transport',
     'rpc_net.py --v2transport',
     'rpc_pqtransport.py',
+    'feature_pq_settings.py',
     'feature_pq_quickstart.py',
     'wallet_keypool.py',
     'wallet_descriptor.py',

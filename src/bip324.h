@@ -16,6 +16,7 @@
 #include <key.h>
 #include <pubkey.h>
 #include <span.h>
+#include <support/allocators/secure.h>
 
 /** The BIP324 packet cipher, encapsulating its key derivation, stream cipher, and AEAD. */
 class BIP324Cipher
@@ -42,8 +43,9 @@ private:
     std::array<std::byte, GARBAGE_TERMINATOR_LEN> m_send_garbage_terminator;
     std::array<std::byte, GARBAGE_TERMINATOR_LEN> m_recv_garbage_terminator;
 
-    /** Hybrid key schedule state, only kept when Initialize() was called with retain_for_hybrid. */
-    std::optional<ECDHSecret> m_retained_ecdh;
+    /** Hybrid key schedule state, only kept when Initialize() was called with retain_for_hybrid.
+     *  The ECDH secret is in locked memory, excluded from core dumps, like m_key. */
+    secure_unique_ptr<ECDHSecret> m_retained_ecdh;
     std::optional<CSHA256> m_hybrid_transcript;
     std::array<uint8_t, 4> m_hybrid_magic{};
     uint8_t m_version_contents_count{0};
@@ -101,7 +103,7 @@ public:
     void DiscardHybridSecret() noexcept;
 
     /** Whether the retained ECDH secret or the transcript is still held. */
-    bool HoldsHybridSecret() const noexcept { return m_retained_ecdh.has_value() || m_hybrid_transcript.has_value(); }
+    bool HoldsHybridSecret() const noexcept { return m_retained_ecdh != nullptr || m_hybrid_transcript.has_value(); }
 
     /** Determine whether this cipher is fully initialized. */
     explicit operator bool() const noexcept { return m_send_l_cipher.has_value(); }

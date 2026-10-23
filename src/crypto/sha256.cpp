@@ -610,6 +610,13 @@ std::string SHA256AutoDetect(sha256_implementation::UseImplementation use_implem
     [[maybe_unused]] bool enabled_avx = false;
 
     uint32_t eax, ebx, ecx, edx;
+    // Fixes an upstream Bitcoin Core bug, which reads leaf 7 without checking
+    // the maximum basic leaf. A CPU answers a leaf above it with the data of
+    // another leaf: in a virtual machine limited to leaf 1, leaf 7's EBX is
+    // leaf 1's, whose bits 31:24 are the APIC ID, so bit 29 can claim SHA-NI
+    // and the self-test below would then die with SIGILL.
+    cpuid(0, 0, eax, ebx, ecx, edx);
+    const uint32_t max_basic_leaf{eax};
     cpuid(1, 0, eax, ebx, ecx, edx);
     if (use_implementation & sha256_implementation::USE_SSE4) {
         // Fixes an upstream Bitcoin Core bug, which checks SSE4.1 only. The
@@ -624,7 +631,7 @@ std::string SHA256AutoDetect(sha256_implementation::UseImplementation use_implem
     if (have_xsave && have_avx) {
         enabled_avx = AVXEnabled(xgetbv);
     }
-    if (have_sse4) {
+    if (have_sse4 && max_basic_leaf >= 7) {
         cpuid(7, 0, eax, ebx, ecx, edx);
         if (use_implementation & sha256_implementation::USE_AVX2) {
             have_avx2 = (ebx >> 5) & 1;

@@ -861,25 +861,44 @@ bool g_mlkem_force_portable{false};
  * rules, is NON_NUMERIC: -X=true is read as 0, and -X=1abc or an overflowing number as 1. An empty
  * value means 1. ArgsManager keeps a negated setting only as a bool, false for -noX and -noX=1, and
  * true for a DOUBLE_NEGATIVE, -noX given 0 or any non-numeric value, which switches X on. Its text
- * is gone, so -noX=1abc, read as 0 like -noX, is PLAIN.
+ * is gone, so -noX=1abc, read as 0 like -noX, is PLAIN. settings.json keeps JSON types, so a bool
+ * from there (from_settings_file) is the value written, true or false, and PLAIN.
  */
 enum class BoolSettingText { PLAIN, NON_NUMERIC, DOUBLE_NEGATIVE };
 
-BoolSettingText GetBoolSettingText(const common::SettingsValue& value)
+BoolSettingText GetBoolSettingText(const common::SettingsValue& value, bool from_settings_file)
 {
-    if (value.isBool()) return value.get_bool() ? BoolSettingText::DOUBLE_NEGATIVE : BoolSettingText::PLAIN;
+    if (value.isBool()) {
+        return value.get_bool() && !from_settings_file ? BoolSettingText::DOUBLE_NEGATIVE : BoolSettingText::PLAIN;
+    }
     if (!value.isStr() || value.get_str().empty()) return BoolSettingText::PLAIN;
     std::string_view number{util::TrimStringView(value.get_str())};
     if (number.starts_with('+') && !number.starts_with("+-")) number.remove_prefix(1);
     return ToIntegral<int>(number) ? BoolSettingText::PLAIN : BoolSettingText::NON_NUMERIC;
 }
 
-/** The warning for the boolean option -name when its setting's text doesn't say what it is read
- *  as: the value given, if ArgsManager kept it, what it was read as, and the effect. */
-std::optional<bilingual_str> BoolSettingWarning(const std::string& name, const common::SettingsValue& value, bool read_as,
-                                                const bilingual_str& effect)
+/** Whether the effective setting of -name comes from settings.json: it has a value there and no
+ *  forced or command-line value, which take precedence (common::GetSetting()), overrides it. */
+bool IsFromSettingsFile(const ArgsManager& args, const std::string& name)
 {
-    switch (GetBoolSettingText(value)) {
+    bool from_settings_file{false};
+    args.LockSettings([&](const common::Settings& settings) {
+        if (!settings.rw_settings.contains(name)) return;
+        common::Settings overriding;
+        if (auto* value{common::FindKey(settings.forced_settings, name)}) overriding.forced_settings.emplace(name, *value);
+        if (auto* values{common::FindKey(settings.command_line_options, name)}) overriding.command_line_options.emplace(name, *values);
+        from_settings_file = common::GetSetting(overriding, /*section=*/"", name, /*ignore_default_section_config=*/false,
+                                                /*ignore_nonpersistent=*/false, /*get_chain_type=*/false).isNull();
+    });
+    return from_settings_file;
+}
+
+/** The warning for the boolean option -name when its effective setting value's text doesn't say
+ *  what it is read as: the value given, if ArgsManager kept it, what it was read as, and the effect. */
+std::optional<bilingual_str> BoolSettingWarning(const ArgsManager& args, const std::string& name, const common::SettingsValue& value,
+                                                bool read_as, const bilingual_str& effect)
+{
+    switch (GetBoolSettingText(value, IsFromSettingsFile(args, name))) {
     case BoolSettingText::PLAIN:
         return std::nullopt;
     case BoolSettingText::NON_NUMERIC:
@@ -903,7 +922,7 @@ PQTransportConfig GetPQTransportConfig(const ArgsManager& args, std::vector<bili
         .pq_requested = pq_explicit.value_or(DEFAULT_V2_PQ_TRANSPORT),
         .fail_first_packet = HasTestOption(args, "pq_fail_first_packet"),
     };
-    if (auto warning{BoolSettingWarning("v2pqtransport", pq_setting, config.pq_requested,
+    if (auto warning{BoolSettingWarning(args, "v2pqtransport", pq_setting, config.pq_requested,
                                         config.Enabled() ? _("hybrid transport is ON") : _("hybrid transport is OFF"))}) {
         warnings.push_back(std::move(*warning));
     }
@@ -1043,7 +1062,7 @@ bool AppInitParameterInteraction(const ArgsManager& args)
     const common::SettingsValue portable_setting{args.GetSetting("-mlkemportable")};
     const bool portable{SettingToBool(portable_setting).value_or(false)};
     g_mlkem_force_portable = portable || HasTestOption(args, "mlkem_portable");
-    if (auto warning{BoolSettingWarning("mlkemportable", portable_setting, portable,
+    if (auto warning{BoolSettingWarning(args, "mlkemportable", portable_setting, portable,
                                         g_mlkem_force_portable ? _("ML-KEM-1024 uses portable code") :
                                                                  _("ML-KEM-1024 uses native code where the CPU supports it"))}) {
         InitWarning(*warning);

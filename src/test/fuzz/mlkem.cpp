@@ -2,7 +2,9 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or https://opensource.org/license/mit.
 
+#include <compat/cpu_features.h>
 #include <crypto/mlkem.h>
+#include <crypto/mlkem_shim.h>
 #include <crypto/sha3.h>
 #include <test/fuzz/FuzzedDataProvider.h>
 #include <test/fuzz/fuzz.h>
@@ -21,6 +23,20 @@ using namespace mlkem;
 
 namespace {
 
+constexpr std::string_view PORTABLE{"portable"};
+
+//! Whether a native backend is active, so mlkem_backend_diff has two backends to compare.
+bool g_native_active{false};
+
+/** The backend a compiled-in backend name runs as on this CPU without the portable override,
+ *  decided from the CPU features rather than the library's own selection. */
+std::string_view ExpectedBackend(std::string_view compiled)
+{
+    if (compiled == "x86_64-avx2") return cpu_features::HasMlkemX86Native() ? compiled : PORTABLE;
+    // AArch64 code needs only NEON, which is mandatory there.
+    return compiled;
+}
+
 void Initialize()
 {
     // MLKEM_FORCE_PORTABLE=1 runs every operation on portable C; unset, empty
@@ -37,9 +53,28 @@ void Initialize()
     const BackendNames active{GetBackendNames()};
     std::cerr << "ML-KEM backend: " << active.arith << "/" << active.keccak
               << (setting == "1" ? " (MLKEM_FORCE_PORTABLE=1)" : "") << std::endl;
-    if (setting == "1" && (active.arith != "portable" || active.keccak != "portable")) {
+    if (setting == "1" && (active.arith != PORTABLE || active.keccak != PORTABLE)) {
         std::cerr << "MLKEM_FORCE_PORTABLE=1, but the active backend is not portable" << std::endl;
         std::abort();
+    }
+    // Without the override, the native code the build has must be what runs where the CPU can
+    // run it; otherwise the native replay would quietly test portable C a second time.
+    const std::string_view expected_arith{ExpectedBackend(qbit_mlkem_compiled_arith_backend())};
+    const std::string_view expected_keccak{ExpectedBackend(qbit_mlkem_compiled_keccak_backend())};
+    if (setting != "1" && (active.arith != expected_arith || active.keccak != expected_keccak)) {
+        std::cerr << "ML-KEM backend should be " << expected_arith << "/" << expected_keccak
+                  << " for this build and CPU, but it is " << active.arith << "/" << active.keccak << std::endl;
+        std::abort();
+    }
+    g_native_active = active.arith != PORTABLE || active.keccak != PORTABLE;
+}
+
+void InitializeBackendDiff()
+{
+    Initialize();
+    if (!g_native_active) {
+        std::cerr << "mlkem_backend_diff: only portable C is active (forced, not compiled in, or not supported by this CPU), "
+                  << "so there is no native backend to compare with: each input runs once, without a diff" << std::endl;
     }
 }
 
@@ -226,14 +261,17 @@ FUZZ_TARGET(mlkem, .init = Initialize)
     }
 }
 
-FUZZ_TARGET(mlkem_backend_diff, .init = Initialize)
+FUZZ_TARGET(mlkem_backend_diff, .init = InitializeBackendDiff)
 {
     FuzzedDataProvider provider{buffer.data(), buffer.size()};
     const Inputs in{ConsumeInputs(provider)};
 
-    // The detected backend and portable C agree on every status and output.
+    // The native backend and portable C agree on every status and output.
     const BackendNames detected{GetBackendNames()};
+    assert((detected.arith != PORTABLE || detected.keccak != PORTABLE) == g_native_active);
     const std::vector<uint8_t> native_results{RunAll(in)};
+    // Comparing portable C with itself would check nothing (stated at start-up).
+    if (!g_native_active) return;
     {
         ForcePortableForTesting portable;
         assert(GetBackendNames().arith == "portable" && GetBackendNames().keccak == "portable");

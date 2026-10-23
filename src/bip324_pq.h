@@ -6,6 +6,7 @@
 #define QBIT_BIP324_PQ_H
 
 #include <crypto/mlkem.h>
+#include <support/allocators/secure.h>
 
 #include <array>
 #include <cstddef>
@@ -212,7 +213,9 @@ private:
     const PQMode m_mode;
     PQRandomSource m_random;
     const PQKemOps& m_ops;
-    std::unique_ptr<mlkem::DecapsulationKey> m_dk;
+    //! In locked memory, excluded from core dumps, like CKey: a responder holds it until the
+    //! accept arrives.
+    secure_unique_ptr<mlkem::DecapsulationKey> m_dk;
     Snapshot m_snapshot;
 };
 
