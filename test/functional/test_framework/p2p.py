@@ -438,9 +438,10 @@ class P2PConnection(asyncio.Protocol):
         """Write the bytes send_raw_message() queued so far, in order. Only on the network thread."""
         with self._unwritten_lock:
             unwritten, self._unwritten = self._unwritten, []
-        if not self._transport or self._transport.is_closing():
-            return
         for data in unwritten:
+            # A failed write closes the transport, and asyncio warns on stderr about writes after that.
+            if not self._transport or self._transport.is_closing():
+                return
             self._transport.write(data)
 
     # Class utility methods
