@@ -1,13 +1,14 @@
 package=openssl
-$(package)_version=3.0.15
+$(package)_version=3.5.9
 $(package)_download_path=https://github.com/openssl/openssl/releases/download/openssl-$($(package)_version)
 $(package)_file_name=$(package)-$($(package)_version).tar.gz
-$(package)_sha256_hash=23c666d0edf20f14249b3d8f0368acaee9ab585b09e1de82107c66e1f3ec9533
+$(package)_sha256_hash=603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
 
 define $(package)_set_vars
   $(package)_config_env=AR="$($(package)_ar)" RANLIB="$($(package)_ranlib)" CC="$($(package)_cc)"
   $(package)_config_opts=--prefix=$(host_prefix) --openssldir=$(host_prefix)/etc/openssl --libdir=$(host_prefix)/lib
-  $(package)_config_opts+=no-shared no-tests no-legacy
+  $(package)_config_opts+=no-shared no-tests no-legacy no-apps no-engine no-dso no-sock
+  $(package)_config_opts+=no-quic no-argon2 no-thread-pool no-ml-dsa no-ml-kem no-slh-dsa no-sm2-precomp
   $(package)_config_opts+=$(filter-out -std=c11,$($(package)_cflags)) $($(package)_cppflags)
   $(package)_config_opts+=-pipe
   $(package)_config_opts_linux=-fPIC -Wa,--noexecstack
@@ -31,5 +32,5 @@ define $(package)_stage_cmds
 endef
 
 define $(package)_postprocess_cmds
-  rm -rf share bin etc lib/pkgconfig
+  rm -rf share bin etc lib/pkgconfig lib/cmake
 endef
