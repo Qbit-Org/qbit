@@ -22,15 +22,19 @@ The documents are the Markdown files under doc/ with a marker, except the archiv
 doc/release-notes/; the specification and the operator guide must be among them. Options are
 checked against the -help and -help-debug output of the binaries given with --qbitd and --qbit-cli,
 as test/functional/feature_pq_quickstart.py does, and otherwise against the AddArg() calls that
--help prints. Everything else is checked against the C++ sources in src/, without tests, benchmarks
-and subtrees.
+-help or -help-debug prints: all but those of OptionsCategory::HIDDEN. Everything else is checked
+against the C++ sources in src/, without tests, benchmarks and subtrees.
 
-A marker that doesn't parse fails, with its file and line, so a typo can't drop a token silently.
+A marker that doesn't parse fails, with its file and line, so a typo can't drop a token silently. So
+does any other comment that starts with pq, except a block of quoted vectors in the specification that
+contrib/devtools/generate-pq-transport-vectors.py reads.
 Each run first tests the check itself: it renames an option, an RPC field and a log string in
-memory and makes sure each is caught, and feeds it malformed markers.
+memory, and without binaries hides the option, and makes sure each is caught, and feeds it
+malformed markers.
 """
 
 import argparse
+import importlib.util
 import re
 import subprocess
 import sys
@@ -44,10 +48,10 @@ SOURCE_SUFFIXES = (".cpp", ".h")
 SUBTREES = ("src/crc32c/", "src/crypto/ctaes/", "src/ipc/libmultiprocess/", "src/leveldb/", "src/libbitcoinpqc/",
             "src/minisketch/", "src/mlkem-native/", "src/secp256k1/")
 
-# Anything that looks like the start of a marker, so that a malformed one is reported, not skipped;
-# not other comments, such as <!-- pq-transport-vectors: ... -->.
-MARKER_START = re.compile(r"<!--\s*pq(?![\w-])", re.IGNORECASE)
+# Anything that looks like the start of a marker, so that a malformed one is reported, not skipped.
+MARKER_START = re.compile(r"<!--\s*pq", re.IGNORECASE)
 MARKER_PREFIX = "<!--pq:"
+VECTORS_LIKE = re.compile(r"<!--\s*pq-transport-vectors", re.IGNORECASE)
 FENCE = re.compile(r"^ {0,3}(```|~~~)")
 
 # C++ comments, raw strings, numbers (with digit separators), character literals and string literals.
@@ -64,6 +68,7 @@ PRINTF_CONVERSION = re.compile(r"%(?:%|[-+ #0]*(?:\d+|\*)?(?:\.(?:\d+|\*))?(?:hh
 RPC_NAME = re.compile(r"RPCHelpMan\s*\{\s*\"([A-Za-z0-9_]+)\"")
 PUSHKV = re.compile(r"pushKV\(\s*\"([^\"\\]+)\"")
 ADDARG = re.compile(r"AddArg\(\s*\"(-[^\"=]+)")
+HIDDEN_CATEGORY = re.compile(r"\bOptionsCategory::HIDDEN\b")
 HELP_OPTION = re.compile(r"^  (-[A-Za-z0-9?][A-Za-z0-9_-]*)", re.MULTILINE)
 OPTION_TOKEN = re.compile(r"-?[A-Za-z0-9?][A-Za-z0-9_-]*(=.*)?")
 FIELD_TOKEN = re.compile(r"[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*")
@@ -92,6 +97,15 @@ class Corpus:
 # check in a tree without a git checkout.
 ROOT = Path(__file__).resolve().parents[2]
 
+# The document and the pattern of a block of quoted vectors that the generator checks, taken from it so
+# that a block it doesn't read fails here.
+VECTORS_GENERATOR = "contrib/devtools/generate-pq-transport-vectors.py"
+_generator_spec = importlib.util.spec_from_file_location("generate_pq_transport_vectors", ROOT / VECTORS_GENERATOR)
+_generator = importlib.util.module_from_spec(_generator_spec)
+_generator_spec.loader.exec_module(_generator)
+VECTORS_SPEC = _generator.SPEC.relative_to(ROOT).as_posix()
+VECTORS_BLOCK = _generator.SPEC_BLOCK
+
 
 def files(directory, suffixes):
     """The files under directory with one of the suffixes, as sorted paths relative to ROOT."""
@@ -99,10 +113,22 @@ def files(directory, suffixes):
                   if path.suffix in suffixes and path.is_file())
 
 
+def vector_blocks(path, text):
+    """Where each block of quoted vectors that the generator reads starts, as (line, column)."""
+    if path != VECTORS_SPEC:
+        return set()
+    starts = set()
+    for match in VECTORS_BLOCK.finditer(text):
+        line_start = text.rfind("\n", 0, match.start()) + 1
+        starts.add((text.count("\n", 0, line_start) + 1, match.start() - line_start))
+    return starts
+
+
 def parse_markers(path, text):
     """The tokens marked in a document, and an error for each marker that doesn't parse."""
     tokens, errors = [], []
     fence_line = None
+    blocks = vector_blocks(path, text)
     for number, line in enumerate(text.splitlines(), start=1):
         if FENCE.match(line):
             fence_line = None if fence_line is not None else number
@@ -112,9 +138,15 @@ def parse_markers(path, text):
             if fence_line is not None:
                 errors.append(f"{where}: marker inside a code block, where it isn't hidden: {line.strip()}")
                 continue
+            if (number, start.start()) in blocks:
+                continue
             rest = line[start.start():]
             if not rest.startswith(MARKER_PREFIX):
-                errors.append(f"{where}: malformed marker, expected <!--pq:KIND-->: {rest}")
+                if VECTORS_LIKE.match(rest):
+                    errors.append(f"{where}: not a block of quoted vectors that {VECTORS_GENERATOR} reads, which is "
+                                  f"<!-- pq-transport-vectors: vector N --> before a ```text block in {VECTORS_SPEC}: {rest}")
+                else:
+                    errors.append(f"{where}: malformed marker, expected <!--pq:KIND-->: {rest}")
                 continue
             end = rest.find("-->")
             if end == -1:
@@ -183,6 +215,25 @@ def scan_source(text):
     return "".join(code), literals
 
 
+def help_options(code):
+    """The options of the AddArg() calls in code, without comments, that -help or -help-debug lists:
+    all but those of OptionsCategory::HIDDEN."""
+    if "AddArg" not in code:
+        return set()
+    # The code with its literals blanked, so that a parenthesis in one doesn't end a call early.
+    bare = CPP_TOKEN.sub(lambda match: " " * len(match.group(0)), code)
+    options = set()
+    for match in ADDARG.finditer(code):
+        start, depth = match.start() + len("AddArg"), 0
+        for end in range(start, len(bare)):
+            depth += {"(": 1, ")": -1}.get(bare[end], 0)
+            if depth == 0:
+                break
+        if not HIDDEN_CATEGORY.search(bare, start, end + 1):
+            options.add(match.group(1))
+    return options
+
+
 def read_sources():
     sources = {}
     for path in files("src", SOURCE_SUFFIXES):
@@ -206,7 +257,7 @@ def build_corpus(sources, help_text):
         code, file_literals = scan_source(text)
         rpcs.update(RPC_NAME.findall(code))
         fields.update(PUSHKV.findall(code))
-        options.update(ADDARG.findall(code))
+        options.update(help_options(code))
         literals.update(file_literals)
     if help_text is not None:
         options = set(HELP_OPTION.findall(help_text))
@@ -313,6 +364,11 @@ def self_test(docs_tokens, sources, help_text):
                                          '"v2 pq: load_shedding began threshold_per_s=%u"'), help_text),
          {("log", "v2 pq: load_shedding started threshold_per_s=…")}),
     ]
+    if help_text is None:
+        # An option that -help-debug doesn't list either.
+        mutations.append(("a hidden option", (mutate("src/init.cpp", "DEFAULT_V2_PQ_TRANSPORT), ArgsManager::ALLOW_ANY, OptionsCategory::CONNECTION)",
+                                                     "DEFAULT_V2_PQ_TRANSPORT), ArgsManager::ALLOW_ANY, OptionsCategory::HIDDEN)"), None),
+                          {("opt", "-v2pqtransport")}))
     for name, (mutated_sources, mutated_help), expected in mutations:
         caught = failing(mutated_sources, mutated_help) - baseline
         if caught != expected:
@@ -331,14 +387,39 @@ def self_test(docs_tokens, sources, help_text):
         ("<!--pq:opt--> `-v2pqtransport`", 3),
         ("```\n<!--pq:opt-->`-v2pqtransport`\n```", 4),
         ("```", 3),
+        ("<!--pq-opt-->`-v2pqtransport`", 3),
+        ("<!--pqopt-->`-v2pqtransport`", 3),
+        ("<!--pq_field-->`transport_pq_status`", 3),
+        ("<!-- pqopt -->`-v2pqtransport`", 3),
+        # A block of quoted vectors anywhere but the specification, where the generator doesn't read it.
+        ("<!-- pq-transport-vectors: vector 0 -->\n```text\nmagic = 444f24a8\n```", 3),
     ]
     for case, line in malformed:
         tokens, errors = parse_markers("self-test.md", "Some text.\n\n" + case + "\n")
         if tokens or len(errors) != 1 or not errors[0].startswith(f"self-test.md:{line}: "):
             problems.append(f"self-test: {case!r} should give one error at self-test.md:{line}, but gave {errors} and tokens {tokens}")
 
+    # In the specification, a block of quoted vectors that the generator reads is no marker, and a near miss fails.
+    block = "<!-- pq-transport-vectors: vector 0 -->\n```text\nmagic = 444f24a8\n```"
+    vectors = [
+        (block, None),
+        ("Text " + block, None),
+        (block.replace("vectors:", "vector:"), 3),
+        (block.replace("<!-- pq", "<!--pq"), 3),
+        (block.replace("```text", "```"), 3),
+        (block.replace("-->\n", "-->\n\n"), 3),
+    ]
+    for case, line in vectors:
+        tokens, errors = parse_markers(VECTORS_SPEC, "Some text.\n\n" + case + "\n")
+        if line is None:
+            if tokens or errors:
+                problems.append(f"self-test: {case!r} in {VECTORS_SPEC} should pass, but gave {errors} and tokens {tokens}")
+        elif tokens or len(errors) != 1 or not errors[0].startswith(f"{VECTORS_SPEC}:{line}: "):
+            problems.append(f"self-test: {case!r} should give one error at {VECTORS_SPEC}:{line}, but gave {errors} and tokens {tokens}")
+
     exact = [
         ("opt", "-v2pqtransport", True), ("opt", "-v2pqtranspor", False), ("opt", "-nov2pqtransport", True),
+        ("opt", "-checkpoints", False),
         ("rpc", "getpqtransportinfo", True), ("rpc", "getpqtransport", False),
         ("field", "transport_pq_status", True), ("field", "transport_pq_stat", False), ("field", "load_shedding.active", True),
         ("value", "hybrid", True), ("value", "hybri", False),

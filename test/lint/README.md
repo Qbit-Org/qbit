@@ -187,22 +187,30 @@ render, and the kind says what the name must match:
 It checks every Markdown file under `doc/` with a marker, except the archived
 release notes in `doc/release-notes/`; the specification and the operator guide
 must have marked names. Without binaries, options are checked against the
-`AddArg()` calls that `-help` prints; `feature_pq_quickstart.py` runs the check
-with the build's `qbitd` and `qbit-cli`. Everything else is checked against the
-C++ sources in `src/`, without tests, benchmarks and subtrees.
+`AddArg()` calls that `-help` or `-help-debug` prints, which leaves out those of
+`OptionsCategory::HIDDEN`; `feature_pq_quickstart.py` runs the check with the
+build's `qbitd` and `qbit-cli`. Everything else is checked against the C++
+sources in `src/`, without tests, benchmarks and subtrees.
 
 A malformed, unterminated or empty marker, a marker in a fenced code block and
 an unclosed code block fail with their file and line, so that a typo can't drop
-a name. Every run also tests the check: in memory, it renames `-v2pqtransport`,
-the `transport_pq_status` field and the load shedding log string and requires
-that exactly those names fail, and it feeds the parser malformed markers and the
-checks near misses. Fenced code blocks aren't checked here: the quick start's
-commands and outputs, and the warnings the guide shows, are checked by
+a name. So does any other comment that starts with `<!--pq`, such as
+`<!--pq-opt-->` or `<!--pqopt-->`, except a
+`<!-- pq-transport-vectors: vector N -->` block in the specification that
+`contrib/devtools/generate-pq-transport-vectors.py` reads. Every run also tests
+the check: in memory, it renames `-v2pqtransport`, the `transport_pq_status`
+field and the load shedding log string, and without binaries moves
+`-v2pqtransport` to `OptionsCategory::HIDDEN`, and requires that exactly those
+names fail, and it feeds the parser malformed markers and the checks near
+misses. Fenced code blocks aren't checked here: the quick start's commands and
+outputs, and the warnings the guide shows, are checked by
 `test/functional/feature_pq_quickstart.py`.
 
 A pull request that changes only public documentation skips the lint job, so
 the `public-docs-lint` job in `.github/workflows/ci.yml` runs this check too,
-without binaries.
+without binaries. The specification and the operator guide classify as source
+instead, so a change to only them still runs the lint job and
+`feature_pq_quickstart.py`.
 
 lint-qbit-node-defaults.py
 ==========================

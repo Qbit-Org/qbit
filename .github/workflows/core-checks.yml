@@ -65,6 +65,10 @@ jobs:
         with:
           fetch-depth: 0
 
+      # The same git commands as in ci.yml and required-merge-gate.yml, so that
+      # all three classify a change alike (ci/checks/test_pq_merge_gate_contract.py).
+      # --no-renames lists both paths of a rename: the old one alone may need
+      # the source checks.
       - name: Write changed file list
         id: changed-files
         env:
@@ -84,7 +88,7 @@ jobs:
               echo "::error::Pull request base SHA is unavailable."
               exit 1
             fi
-            git diff --name-only "${BASE_SHA}...HEAD" > "${changed_files}"
+            git diff --name-only --no-renames "${BASE_SHA}...HEAD" > "${changed_files}"
           elif [[ "${EVENT_NAME}" == "merge_group" ]]; then
             base_branch="${BASE_REF#refs/heads/}"
             if [[ -z "${base_branch}" ]]; then
@@ -92,15 +96,15 @@ jobs:
               exit 1
             fi
             git fetch --no-tags --prune origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"
-            git diff --name-only "origin/${base_branch}...HEAD" > "${changed_files}"
+            git diff --name-only --no-renames "origin/${base_branch}...HEAD" > "${changed_files}"
           elif [[ "${EVENT_NAME}" == "push" ]]; then
             if [[ -n "${BEFORE_SHA}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
-              git diff --name-only "${BEFORE_SHA}..HEAD" > "${changed_files}"
+              git diff --name-only --no-renames "${BEFORE_SHA}..HEAD" > "${changed_files}"
             else
               git fetch --no-tags --prune origin "${DEFAULT_BRANCH}"
               merge_base="$(git merge-base "origin/${DEFAULT_BRANCH}" HEAD 2>/dev/null || true)"
               if [[ -n "${merge_base}" ]]; then
-                git diff --name-only "${merge_base}...HEAD" > "${changed_files}"
+                git diff --name-only --no-renames "${merge_base}...HEAD" > "${changed_files}"
               else
                 git diff-tree --no-commit-id --name-only -r HEAD > "${changed_files}"
               fi
@@ -443,6 +447,7 @@ jobs:
         with:
           fetch-depth: 0
 
+      # --no-renames, so that moving a release file away still runs the tests.
       - name: Detect release file changes
         id: release_changes
         env:
@@ -458,11 +463,11 @@ jobs:
               git fetch --no-tags --prune origin main
               merge_base="$(git merge-base origin/main HEAD 2>/dev/null || true)"
               if [[ -n "${merge_base}" ]]; then
-                git diff --name-only "${merge_base}" HEAD > "${changed_files}"
+                git diff --name-only --no-renames "${merge_base}" HEAD > "${changed_files}"
               else
                 git diff-tree --no-commit-id --name-only -r HEAD > "${changed_files}"
               fi
-            elif ! git diff --name-only "${before}" HEAD > "${changed_files}"; then
+            elif ! git diff --name-only --no-renames "${before}" HEAD > "${changed_files}"; then
               echo "Could not diff push range; running release validator tests."
               echo "changed=true" >> "$GITHUB_OUTPUT"
               exit 0
@@ -477,7 +482,7 @@ jobs:
             fi
 
             git fetch --no-tags --prune origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"
-            if ! git diff --name-only "origin/${base_branch}...HEAD" > "${changed_files}"; then
+            if ! git diff --name-only --no-renames "origin/${base_branch}...HEAD" > "${changed_files}"; then
               echo "Could not diff against origin/${base_branch}; running release validator tests."
               echo "changed=true" >> "$GITHUB_OUTPUT"
               exit 0

@@ -129,6 +129,30 @@ class ClassifyMergeProfileTest(unittest.TestCase):
         self.assertTrue(classification.public_docs_only)
         self.assertEqual(classification.outside_paths, ())
 
+    def test_docs_that_source_checks_read_require_source_validation(self) -> None:
+        """The specification's quoted vectors (generate-pq-transport-vectors.py --check, in the lint job) and the
+        operator guide's quick start (feature_pq_quickstart.py) fail only in source validation."""
+        for path in ("doc/design/pq-transport.md", "doc/user/network/pq-transport.md"):
+            with self.subTest(path=path):
+                classification = self.classify([path])
+                outputs = classify_merge_profile.github_outputs(classification)
+
+                self.assertEqual(classification.profile, classify_merge_profile.SOURCE_PROFILE)
+                self.assertEqual(classification.outside_paths, (path,))
+                self.assertEqual(classification.public_docs_paths, ())
+                self.assertEqual(outputs["source_validation_required"], "true")
+                self.assertEqual(outputs["public_docs_only"], "false")
+                # The lint job and the CI matrix run those checks, not the PQ jobs.
+                self.assertEqual(outputs["pq_unit_required"], "false")
+                self.assertEqual(outputs["pq_functional_required"], "false")
+                # Also among other public docs.
+                self.assertEqual(self.classify(PUBLIC_DOCS_PATHS + [path]).profile, classify_merge_profile.SOURCE_PROFILE)
+
+        # Other docs beside them stay public docs.
+        for path in ("doc/design/p2mr-datapqchash.md", "doc/user/network/README.md", "doc/user/pq-transport.md"):
+            with self.subTest(path=path):
+                self.assertEqual(self.classify([path]).profile, classify_merge_profile.PUBLIC_DOCS_PROFILE)
+
     def test_github_metadata_paths_are_github_metadata_only(self) -> None:
         classification = self.classify(GITHUB_METADATA_PATHS)
 

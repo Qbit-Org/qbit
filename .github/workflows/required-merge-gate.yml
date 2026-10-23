@@ -308,7 +308,7 @@ jobs:
               exit 1
             fi
             diff_range="${BASE_SHA}...HEAD"
-            git diff --name-only "${diff_range}" > "${changed_files}"
+            git diff --name-only --no-renames "${diff_range}" > "${changed_files}"
           elif [[ "${EVENT_NAME}" == "merge_group" ]]; then
             base_branch="${BASE_REF#refs/heads/}"
             if [[ -z "${base_branch}" ]]; then
@@ -317,17 +317,17 @@ jobs:
             fi
             git fetch --no-tags --prune origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"
             diff_range="origin/${base_branch}...HEAD"
-            git diff --name-only "${diff_range}" > "${changed_files}"
+            git diff --name-only --no-renames "${diff_range}" > "${changed_files}"
           elif [[ "${EVENT_NAME}" == "push" ]]; then
             if [[ -n "${BEFORE_SHA}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
               diff_range="${BEFORE_SHA}..HEAD"
-              git diff --name-only "${diff_range}" > "${changed_files}"
+              git diff --name-only --no-renames "${diff_range}" > "${changed_files}"
             else
               git fetch --no-tags --prune origin "${DEFAULT_BRANCH}"
               merge_base="$(git merge-base "origin/${DEFAULT_BRANCH}" HEAD 2>/dev/null || true)"
               if [[ -n "${merge_base}" ]]; then
                 diff_range="${merge_base}...HEAD"
-                git diff --name-only "${diff_range}" > "${changed_files}"
+                git diff --name-only --no-renames "${diff_range}" > "${changed_files}"
               else
                 git diff-tree --no-commit-id --name-only -r HEAD > "${changed_files}"
               fi
@@ -427,7 +427,7 @@ jobs:
               exit 1
             fi
             diff_range="${BASE_SHA}...HEAD"
-            git diff --name-only "${diff_range}" > "${changed_files}"
+            git diff --name-only --no-renames "${diff_range}" > "${changed_files}"
           elif [[ "${EVENT_NAME}" == "merge_group" ]]; then
             base_branch="${BASE_REF#refs/heads/}"
             if [[ -z "${base_branch}" ]]; then
@@ -436,17 +436,17 @@ jobs:
             fi
             git fetch --no-tags --prune origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"
             diff_range="origin/${base_branch}...HEAD"
-            git diff --name-only "${diff_range}" > "${changed_files}"
+            git diff --name-only --no-renames "${diff_range}" > "${changed_files}"
           elif [[ "${EVENT_NAME}" == "push" ]]; then
             if [[ -n "${BEFORE_SHA}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
               diff_range="${BEFORE_SHA}..HEAD"
-              git diff --name-only "${diff_range}" > "${changed_files}"
+              git diff --name-only --no-renames "${diff_range}" > "${changed_files}"
             else
               git fetch --no-tags --prune origin "${DEFAULT_BRANCH}"
               merge_base="$(git merge-base "origin/${DEFAULT_BRANCH}" HEAD 2>/dev/null || true)"
               if [[ -n "${merge_base}" ]]; then
                 diff_range="${merge_base}...HEAD"
-                git diff --name-only "${diff_range}" > "${changed_files}"
+                git diff --name-only --no-renames "${diff_range}" > "${changed_files}"
               else
                 git diff-tree --no-commit-id --name-only -r HEAD > "${changed_files}"
               fi
@@ -513,7 +513,7 @@ jobs:
               exit 1
             fi
             diff_range="${BASE_SHA}...HEAD"
-            git diff --name-only "${diff_range}" > "${changed_files}"
+            git diff --name-only --no-renames "${diff_range}" > "${changed_files}"
           elif [[ "${EVENT_NAME}" == "merge_group" ]]; then
             base_branch="${BASE_REF#refs/heads/}"
             if [[ -z "${base_branch}" ]]; then
@@ -522,17 +522,17 @@ jobs:
             fi
             git fetch --no-tags --prune origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"
             diff_range="origin/${base_branch}...HEAD"
-            git diff --name-only "${diff_range}" > "${changed_files}"
+            git diff --name-only --no-renames "${diff_range}" > "${changed_files}"
           elif [[ "${EVENT_NAME}" == "push" ]]; then
             if [[ -n "${BEFORE_SHA}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
               diff_range="${BEFORE_SHA}..HEAD"
-              git diff --name-only "${diff_range}" > "${changed_files}"
+              git diff --name-only --no-renames "${diff_range}" > "${changed_files}"
             else
               git fetch --no-tags --prune origin "${DEFAULT_BRANCH}"
               merge_base="$(git merge-base "origin/${DEFAULT_BRANCH}" HEAD 2>/dev/null || true)"
               if [[ -n "${merge_base}" ]]; then
                 diff_range="${merge_base}...HEAD"
-                git diff --name-only "${diff_range}" > "${changed_files}"
+                git diff --name-only --no-renames "${diff_range}" > "${changed_files}"
               else
                 git diff-tree --no-commit-id --name-only -r HEAD > "${changed_files}"
               fi
@@ -596,7 +596,7 @@ jobs:
               exit 1
             fi
             diff_range="${BASE_SHA}...HEAD"
-            git diff --name-only "${diff_range}" > "${changed_files}"
+            git diff --name-only --no-renames "${diff_range}" > "${changed_files}"
           elif [[ "${EVENT_NAME}" == "merge_group" ]]; then
             base_branch="${BASE_REF#refs/heads/}"
             if [[ -z "${base_branch}" ]]; then
@@ -605,17 +605,17 @@ jobs:
             fi
             git fetch --no-tags --prune origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"
             diff_range="origin/${base_branch}...HEAD"
-            git diff --name-only "${diff_range}" > "${changed_files}"
+            git diff --name-only --no-renames "${diff_range}" > "${changed_files}"
           elif [[ "${EVENT_NAME}" == "push" ]]; then
             if [[ -n "${BEFORE_SHA}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
               diff_range="${BEFORE_SHA}..HEAD"
-              git diff --name-only "${diff_range}" > "${changed_files}"
+              git diff --name-only --no-renames "${diff_range}" > "${changed_files}"
             else
               git fetch --no-tags --prune origin "${DEFAULT_BRANCH}"
               merge_base="$(git merge-base "origin/${DEFAULT_BRANCH}" HEAD 2>/dev/null || true)"
               if [[ -n "${merge_base}" ]]; then
                 diff_range="${merge_base}...HEAD"
-                git diff --name-only "${diff_range}" > "${changed_files}"
+                git diff --name-only --no-renames "${diff_range}" > "${changed_files}"
               else
                 git diff-tree --no-commit-id --name-only -r HEAD > "${changed_files}"
               fi
