@@ -20,4 +20,5 @@ reply from the router (a timeout while waiting for it, or a closed or broken
 connection) is not retried.
 
 Creating an I2P session now has a single 3-minute limit that covers every
-step, and stops promptly when qbit shuts down. (#223)
+step, and stops promptly when qbit shuts down. The limit is measured in
+elapsed time, so a change to the system clock does not extend it. (#223)

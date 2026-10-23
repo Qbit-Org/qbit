@@ -169,6 +169,9 @@ class P2PConnection(asyncio.Protocol):
         # This lock is acquired before sending messages over the socket. There's an implied lock order and
         # p2p_lock must not be acquired after _send_lock as it could result in deadlocks.
         self._send_lock = threading.Lock()
+        # Bytes sent but not yet written to the transport, in the order sent. Acquired after _send_lock.
+        self._unwritten_lock = threading.Lock()
+        self._unwritten = []
         self.v2_state = None  # EncryptedP2PState object needed for v2 p2p connections
         self.reconnect = False  # set if reconnection needs to happen
 
@@ -298,7 +301,12 @@ class P2PConnection(asyncio.Protocol):
         if pending:
             self.send_raw_message(pending)
         if not is_mac_auth:
-            raise ValueError("invalid v2 mac tag in handshake authentication")
+            # Disconnect like a real peer: write out everything sent so far, which close() still delivers.
+            # An exception from this asyncio callback would drop it (and report a fatal error on stderr).
+            logger.warning(f"Disconnecting from {self.dstaddr}:{self.dstport}: invalid v2 mac tag in handshake authentication")
+            self._write_unwritten()
+            self._transport.close()
+            return
         self.recvbuf = self.recvbuf[length:]
         self._maybe_finish_v2_handshake()
 
@@ -419,16 +427,21 @@ class P2PConnection(asyncio.Protocol):
             return self.send_raw_message(tmsg)
 
     def send_raw_message(self, raw_message_bytes):
+        """Queue raw bytes for the transport, after everything sent before."""
         if not self.is_connected:
             raise IOError('Not connected')
+        with self._unwritten_lock:
+            self._unwritten.append(raw_message_bytes)
+        NetworkThread.network_event_loop.call_soon_threadsafe(self._write_unwritten)
 
-        def maybe_write():
-            if not self._transport:
-                return
-            if self._transport.is_closing():
-                return
-            self._transport.write(raw_message_bytes)
-        NetworkThread.network_event_loop.call_soon_threadsafe(maybe_write)
+    def _write_unwritten(self):
+        """Write the bytes send_raw_message() queued so far, in order. Only on the network thread."""
+        with self._unwritten_lock:
+            unwritten, self._unwritten = self._unwritten, []
+        if not self._transport or self._transport.is_closing():
+            return
+        for data in unwritten:
+            self._transport.write(data)
 
     # Class utility methods
 
