@@ -32,10 +32,12 @@ handshake outcomes, load shedding and the fallback set. `getpeerinfo` gains
 <!--pq:field-->`transport_pq` and <!--pq:field-->`transport_pq_status`,
 `getnetworkinfo` gains <!--pq:field-->`connections_pq`, `qbit-cli -netinfo`
 marks hybrid peers <!--pq:value-->`2p`, and the log states the setting at
-startup in a <!--pq:log-->`v2 pq: … arith=… keccak=…` line. Outbound
-connections to an address whose hybrid handshakes keep failing fall back to
-plain v2 for a while, and a node under an inbound connection flood stops
-offering hybrid keys until it subsides.
+startup in a <!--pq:log-->`v2 pq: … arith=… keccak=…` line. Automatic
+outbound connections to an address whose hybrid handshakes keep failing fall
+back to plain v2 for a while. Someone on the network path can cause such
+failures, so peers added with `addnode` or `-connect` never fall back. A node
+under an inbound connection flood stops offering hybrid keys until it
+subsides.
 
 See the [operator guide](user/network/pq-transport.md) to try it, check it and
 troubleshoot it, and the [specification](design/pq-transport.md). (#240)

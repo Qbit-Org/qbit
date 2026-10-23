@@ -151,13 +151,13 @@ public:
     }
 };
 
-/** A record CompactSize(1 + payload size) || header || payload. */
-std::vector<std::byte> MakeRecord(uint8_t header, size_t payload_size)
+/** A record CompactSize(1 + payload size) || header || payload, every payload byte fill. */
+std::vector<std::byte> MakeRecord(uint8_t header, size_t payload_size, std::byte fill = std::byte{0x42})
 {
     DataStream stream;
     WriteCompactSize(stream, 1 + payload_size);
     stream << header;
-    stream.write(std::vector<std::byte>(payload_size, std::byte{0x42}));
+    stream.write(std::vector<std::byte>(payload_size, fill));
     return {stream.begin(), stream.end()};
 }
 
@@ -380,6 +380,20 @@ struct PQNetSetup : public RegTestingSetup {
     /** Queue what peer has to send for the node. */
     static void PeerToNode(const Link& link, Transport& peer) { Receive(link, PeerBytes(peer)); }
 
+    /** Hand to what from has to send, without a socket; to must accept all of it. */
+    static void Deliver(Transport& from, Transport& to)
+    {
+        const std::vector<uint8_t> bytes{PeerBytes(from)};
+        std::span<const uint8_t> remaining{bytes};
+        while (!remaining.empty()) {
+            BOOST_REQUIRE(to.ReceivedBytes(remaining));
+            if (to.ReceivedMessageComplete()) {
+                bool reject{false};
+                to.GetReceivedMessage({}, reject);
+            }
+        }
+    }
+
     /** Feed peer what the node sent; false if peer failed. */
     static bool NodeToPeer(const Link& link, Transport& peer)
     {
@@ -445,19 +459,22 @@ struct PQNetSetup : public RegTestingSetup {
     }
 
     /** How a test connection ends. */
-    enum class End { MALFORMED, CONFIRMATION, PEER_EOF, PEER_RESET, TIMEOUT, LOCAL, SEND_ERROR, LEGACY, SUCCESS };
+    enum class End { MALFORMED, BAD_MODULUS, CONFIRMATION, PEER_EOF, PEER_RESET, TIMEOUT, LOCAL, SEND_ERROR, LEGACY, SUCCESS };
 
-    /** One outbound connection to endpoint that ends as end; the connection manager finalizes it. */
-    void Connect(const PQEndpointKey& endpoint, End end)
+    /** One outbound connection of conn_type to endpoint that ends as end; the connection manager
+     *  finalizes it. */
+    void Connect(const PQEndpointKey& endpoint, End end, ConnectionType conn_type = ConnectionType::OUTBOUND_FULL_RELAY)
     {
-        Link link{Add(ConnectionType::OUTBOUND_FULL_RELAY, PQMode::NEGOTIATE, endpoint)};
+        Link link{Add(conn_type, PQMode::NEGOTIATE, endpoint)};
         switch (end) {
-        case End::MALFORMED: { // an offer of the wrong length
+        case End::MALFORMED: // an offer of the wrong length
+        case End::BAD_MODULUS: { // an offer whose key fails the modulus check: every coefficient is 4095
             Pass(link);
             RawPeer peer{/*initiator=*/false};
             peer.Initialize(NodeKey(link));
             Receive(link, peer.Key());
-            Receive(link, peer.TerminatorAndVersion(MakeRecord(PQ_MLKEM1024, 100)));
+            Receive(link, peer.TerminatorAndVersion(end == End::MALFORMED ? MakeRecord(PQ_MLKEM1024, 100) :
+                                                                            MakeRecord(PQ_MLKEM1024, mlkem::PUBLIC_KEY_BYTES, std::byte{0xff})));
             Pass(link);
             break;
         }
@@ -1273,7 +1290,7 @@ BOOST_AUTO_TEST_CASE(pq_shutdown_finalizes)
 {
     // Shutdown deletes the connections it still holds itself, without DisconnectNodes(). It
     // finalizes them first: no node is deleted holding hybrid secrets, but a shutdown close is
-    // our own decision, so nothing is recorded, as with the network off.
+    // our own decision, so no close outcome is recorded, as with the network off.
     Link inbound{Add(ConnectionType::INBOUND)}; // its offer is pending: decapsulation key and ECDH secret
     Receive(inbound, InitiatorKey());
     Pass(inbound);
@@ -1544,6 +1561,182 @@ BOOST_AUTO_TEST_CASE(pq_history_eviction_all_in_fallback)
     BOOST_CHECK(Streak(TestEndpoint(9, int{PQ_MAX_ENDPOINT_HISTORY})));
 }
 
+BOOST_AUTO_TEST_CASE(pq_manual_never_falls_back)
+{
+    // An attacker on the path can make hybrid handshakes fail without breaking a key: damage the
+    // peer's confirmation in transit, reset the connection or drop its traffic. A manual
+    // connection's failures never count toward the fallback, but are counted, kept in the ring
+    // and logged like any other.
+    const PQEndpointKey endpoint{TestEndpoint(12, 0)};
+    const std::vector<End> failures{End::CONFIRMATION, End::PEER_RESET, End::TIMEOUT, End::PEER_EOF, End::MALFORMED};
+    {
+        const std::string text{strprintf("v2 pq: closed_after_switch cause=reset role=initiator conn_type=manual peer=%d%s",
+                                         m_next_id + 1, Backends())};
+        DebugLogHelper expect{text, AtLevel({text}, LineLevel::INFO)};
+        for (const End end : failures) Connect(endpoint, end, ConnectionType::MANUAL);
+    }
+    BOOST_CHECK(!Streak(endpoint));
+    BOOST_CHECK(!Fallback(endpoint));
+    BOOST_CHECK(!m_connman.IsPQFallback(endpoint, Now<NodeSeconds>()));
+    const PQTransportStats stats{Stats()};
+    BOOST_CHECK_EQUAL(stats.outbound.first_packet_failed, 1U);
+    BOOST_CHECK_EQUAL(stats.outbound.closed_after_switch, 3U);
+    BOOST_CHECK_EQUAL(stats.outbound.malformed_record, 1U);
+    BOOST_CHECK_EQUAL(stats.outbound.fallback, 0U);
+    BOOST_REQUIRE_EQUAL(stats.outbound_failures.entries.size(), failures.size());
+    for (const PQFailureEntry& entry : stats.outbound_failures.entries) {
+        BOOST_CHECK(entry.connection_type == ConnectionType::MANUAL);
+        BOOST_CHECK(entry.endpoint == endpoint);
+    }
+    // They still count toward the local-fault warning, so a node with only -connect peers gets it.
+    BOOST_CHECK_EQUAL(m_connman.PQLocalFaultEndpoints(), 1U);
+
+    // The same failures on automatic connections put the endpoint in the fallback set.
+    for (uint32_t i{0}; i < PQ_FAILURE_THRESHOLD; ++i) Connect(endpoint, End::PEER_RESET);
+    BOOST_REQUIRE(Fallback(endpoint));
+    // New automatic connections to it run plain v2, but a new manual one negotiates, and completes
+    // a hybrid handshake.
+    const auto create_sock{MockCreateSock()};
+    const auto connect{[&](ConnectionType conn_type) {
+        std::unique_ptr<CNode> node{m_connman.ConnectNodeOnly("10.12.0.1:8333", conn_type, /*use_v2transport=*/true)};
+        BOOST_REQUIRE(node);
+        BOOST_REQUIRE(node->m_pq_endpoint == endpoint);
+        return node;
+    }};
+    for (const ConnectionType conn_type : {ConnectionType::OUTBOUND_FULL_RELAY, ConnectionType::BLOCK_RELAY, ConnectionType::FEELER}) {
+        BOOST_CHECK(connect(conn_type)->m_transport->GetInfo().transport_pq_status == PQStatus::FALLBACK);
+    }
+    const std::unique_ptr<CNode> manual{connect(ConnectionType::MANUAL)};
+    BOOST_CHECK(manual->m_transport->GetInfo().transport_pq_status == PQStatus::PENDING);
+    V2Transport peer{Responder()};
+    for (int round{0}; round < 4; ++round) {
+        Deliver(*manual->m_transport, peer);
+        Deliver(peer, *manual->m_transport);
+    }
+    BOOST_CHECK(manual->m_transport->GetInfo().transport_pq);
+    BOOST_CHECK(manual->m_transport->GetInfo().transport_pq_status == PQStatus::HYBRID);
+    // Its confirmation shows the endpoint works: the window ends for every connection.
+    m_connman.ObservePQPublic(*manual, /*finalizing=*/false);
+    BOOST_CHECK(!Fallback(endpoint));
+    BOOST_CHECK(connect(ConnectionType::OUTBOUND_FULL_RELAY)->m_transport->GetInfo().transport_pq_status == PQStatus::PENDING);
+}
+
+BOOST_AUTO_TEST_CASE(pq_success_set_bound)
+{
+    // An attacker who advertises many endpoints can get feelers to confirm hybrid handshakes with
+    // each. The success set keeps the PQ_MAX_SUCCESSFUL_ENDPOINTS most recently confirmed ones,
+    // and evicts the least recently confirmed first.
+    const int cap{int{PQ_MAX_SUCCESSFUL_ENDPOINTS}};
+    for (int i{0}; i < cap; ++i) Connect(TestEndpoint(13, i), End::SUCCESS);
+    // Confirming again refreshes an endpoint, so the second one is now the least recent.
+    Connect(TestEndpoint(13, 0), End::SUCCESS);
+    Connect(TestEndpoint(13, cap), End::SUCCESS);
+    // The evicted endpoint's failures count again; every other stays protected.
+    Connect(TestEndpoint(13, 1), End::MALFORMED);
+    BOOST_CHECK(Streak(TestEndpoint(13, 1)));
+    for (const int i : {0, 2, 3, cap - 1, cap}) {
+        Connect(TestEndpoint(13, i), End::MALFORMED);
+        BOOST_CHECK(!Streak(TestEndpoint(13, i)));
+    }
+    // Each new endpoint evicts exactly one, the next least recent: the set stays at its bound.
+    Connect(TestEndpoint(13, cap + 1), End::SUCCESS);
+    Connect(TestEndpoint(13, 2), End::MALFORMED);
+    BOOST_CHECK(Streak(TestEndpoint(13, 2)));
+    Connect(TestEndpoint(13, 3), End::MALFORMED);
+    BOOST_CHECK(!Streak(TestEndpoint(13, 3)));
+
+    // Eviction never forgets that a handshake succeeded since startup: eight endpoints failing in
+    // a way a local fault could cause don't warn.
+    LogLineCounter warnings{"v2 pq: local_fault"};
+    for (int i{0}; i < 8; ++i) Connect(TestEndpoint(14, i), End::CONFIRMATION);
+    BOOST_CHECK_EQUAL(m_connman.PQLocalFaultEndpoints(), PQ_LOCAL_FAULT_THRESHOLD);
+    BOOST_CHECK_EQUAL(warnings.m_count, 0);
+}
+
+BOOST_AUTO_TEST_CASE(pq_fallback_window_clock_step)
+{
+    // A wall clock step back (an NTP correction or a VM restore) can't stretch a fallback window:
+    // it also ends once its length has passed on the steady clock. The stats keep the wall clock
+    // times it entered with.
+    const PQEndpointKey endpoint{TestEndpoint(15, 0)};
+    const NodeSeconds start{Now<NodeSeconds>()};
+    const auto at{[&](std::chrono::seconds wall, std::chrono::seconds steady) {
+        SetMockTime(TicksSinceEpoch<std::chrono::seconds>(start + wall));
+        MockableSteadyClock::SetMockTime(STEADY_START + steady);
+    }};
+    for (uint32_t i{0}; i < PQ_FAILURE_THRESHOLD; ++i) Connect(endpoint, End::MALFORMED);
+    BOOST_REQUIRE(Fallback(endpoint));
+
+    // Half an hour in, the wall clock steps back two hours.
+    at(-90min, 30min);
+    BOOST_CHECK(m_connman.IsPQFallback(endpoint, Now<NodeSeconds>()));
+    BOOST_REQUIRE(Fallback(endpoint));
+    BOOST_CHECK(Fallback(endpoint)->entered == start);
+    BOOST_CHECK(Fallback(endpoint)->expires == start + 1h);
+    // An hour after it began on the steady clock, it ends, though the wall clock is still two
+    // hours from expires.
+    at(-60min - 1s, 1h - 1s);
+    BOOST_CHECK(Fallback(endpoint));
+    BOOST_CHECK(m_connman.IsPQFallback(endpoint, Now<NodeSeconds>()));
+    at(-60min, 1h);
+    BOOST_CHECK(!Fallback(endpoint));
+    BOOST_CHECK(!m_connman.IsPQFallback(endpoint, Now<NodeSeconds>()));
+    // It ended like any window: the streak restarts, and the next window is the second.
+    Connect(endpoint, End::MALFORMED);
+    BOOST_REQUIRE(Streak(endpoint));
+    BOOST_CHECK_EQUAL(Streak(endpoint)->streak, 1U);
+    BOOST_CHECK(Streak(endpoint)->next_window == 4h);
+
+    // A wall clock step forward may end a window early, which only fails toward hybrid keys.
+    for (uint32_t i{1}; i < PQ_FAILURE_THRESHOLD; ++i) Connect(endpoint, End::MALFORMED);
+    BOOST_REQUIRE(Fallback(endpoint));
+    BOOST_CHECK(Fallback(endpoint)->expires == start - 60min + 4h);
+    at(-60min + 4h, 1h + 1s);
+    BOOST_CHECK(!Fallback(endpoint));
+    BOOST_CHECK(!m_connman.IsPQFallback(endpoint, Now<NodeSeconds>()));
+}
+
+BOOST_AUTO_TEST_CASE(pq_network_off_confirmation)
+{
+    // setnetworkactive false can land in the socket handler pass in which a peer's confirmation
+    // verifies. That confirmation is a success all the same: it ends the endpoint's streak and
+    // protects it, so later closed_after_switch failures can't put it in the fallback set. The
+    // closes the network switch then causes are ours, and count nothing.
+    const PQEndpointKey endpoint{TestEndpoint(10, 0)};
+    for (uint32_t i{1}; i < PQ_FAILURE_THRESHOLD; ++i) Connect(endpoint, End::PEER_EOF);
+    BOOST_REQUIRE(Streak(endpoint));
+
+    Link inbound{Accept()}; // an offer that would count as abandoned if our close counted
+    Receive(inbound, InitiatorKey());
+    Pass(inbound);
+    BOOST_REQUIRE(inbound.node->m_transport->GetPQSnapshot().offer == PQOfferState::SENT);
+    // Our confirmation reaches the peer, which switches and verifies it; its own is on the way.
+    Link link{Add(ConnectionType::OUTBOUND_FULL_RELAY, PQMode::NEGOTIATE, endpoint)};
+    V2Transport peer{Responder()};
+    Pass(link);
+    BOOST_REQUIRE(NodeToPeer(link, peer));
+    PeerToNode(link, peer);
+    Pass(link);
+    BOOST_REQUIRE(link.node->m_transport->GetPQSnapshot().switched);
+    BOOST_REQUIRE(NodeToPeer(link, peer));
+    m_connman.SetNetworkActive(false);
+    PeerToNode(link, peer);
+    Pass(link);
+    BOOST_REQUIRE(link.node->m_transport->GetPQSnapshot().confirmed);
+    const uint64_t abandoned{Stats().inbound.abandoned};
+    Disconnect();
+    m_connman.SetNetworkActive(true);
+    BOOST_CHECK(m_connman.TestNodes().empty());
+    BOOST_CHECK_EQUAL(Stats().inbound.abandoned, abandoned);
+
+    BOOST_CHECK(!Streak(endpoint));
+    for (uint32_t i{0}; i < PQ_FAILURE_THRESHOLD; ++i) Connect(endpoint, End::PEER_EOF);
+    BOOST_CHECK(!Streak(endpoint));
+    BOOST_CHECK(!Fallback(endpoint));
+    BOOST_CHECK(!m_connman.IsPQFallback(endpoint, Now<NodeSeconds>()));
+    BOOST_CHECK_EQUAL(Stats().outbound.closed_after_switch, 2U * PQ_FAILURE_THRESHOLD - 1);
+}
+
 namespace {
 /** The warning names the backends that ran, and -mlkemportable as the remedy while native code runs. */
 std::string LocalFaultLine()
@@ -1561,17 +1754,17 @@ BOOST_AUTO_TEST_CASE(pq_local_fault_warning)
 {
     // Whatever backends this machine runs.
     LogLineCounter warnings{"v2 pq: local_fault"};
-    for (int i{0}; i < 7; ++i) Connect(TestEndpoint(7, i), End::MALFORMED);
+    for (int i{0}; i < 7; ++i) Connect(TestEndpoint(7, i), End::CONFIRMATION);
     BOOST_CHECK_EQUAL(warnings.m_count, 0);
     {
         const std::string text{LocalFaultLine()};
         DebugLogHelper expect{text, AtLevel({text}, LineLevel::WARNING)};
-        Connect(TestEndpoint(7, 7), End::MALFORMED);
+        Connect(TestEndpoint(7, 7), End::CONFIRMATION);
     }
     BOOST_CHECK_EQUAL(warnings.m_count, 1);
     BOOST_CHECK_EQUAL(m_connman.PQLocalFaultEndpoints(), PQ_LOCAL_FAULT_THRESHOLD);
     // It warns once, and behavior doesn't change.
-    for (int i{0}; i < 12; ++i) Connect(TestEndpoint(7, i), End::MALFORMED);
+    for (int i{0}; i < 12; ++i) Connect(TestEndpoint(7, i), End::CONFIRMATION);
     BOOST_CHECK_EQUAL(warnings.m_count, 1);
     BOOST_CHECK(m_connman.IsPQFallback(TestEndpoint(7, 0), Now<NodeSeconds>()) == false);
     BOOST_REQUIRE(Streak(TestEndpoint(7, 0)));
@@ -1592,7 +1785,7 @@ BOOST_AUTO_TEST_CASE(pq_local_fault_warning_portable)
     LogLineCounter warnings{"v2 pq: local_fault"};
     {
         DebugLogHelper expect{text, AtLevel({text}, LineLevel::WARNING)};
-        for (int i{0}; i < 8; ++i) Connect(TestEndpoint(7, i), End::MALFORMED);
+        for (int i{0}; i < 8; ++i) Connect(TestEndpoint(7, i), End::CONFIRMATION);
     }
     BOOST_CHECK_EQUAL(warnings.m_count, 1);
 }
@@ -1602,15 +1795,44 @@ BOOST_AUTO_TEST_CASE(pq_local_fault_after_success)
     // One success since startup rules out a local fault.
     LogLineCounter warnings{"v2 pq: local_fault"};
     Connect(TestEndpoint(8, 0), End::SUCCESS);
-    for (int i{1}; i <= 12; ++i) Connect(TestEndpoint(8, i), End::MALFORMED);
+    for (int i{1}; i <= 12; ++i) Connect(TestEndpoint(8, i), End::CONFIRMATION);
     BOOST_CHECK_EQUAL(warnings.m_count, 0);
+}
+
+BOOST_AUTO_TEST_CASE(pq_local_fault_reasons)
+{
+    // Only failures this node's own ML-KEM code can cause count toward the warning. A record of
+    // the wrong length, and a peer that stops responding after the switch, are the peer's or the
+    // path's alone, however many endpoints fail that way: buggy or hostile peers can't raise it.
+    LogLineCounter warnings{"v2 pq: local_fault"};
+    int index{0};
+    for (int i{0}; i < 8; ++i) Connect(TestEndpoint(11, index++), End::MALFORMED);
+    for (int i{0}; i < 8; ++i) Connect(TestEndpoint(11, index++), End::TIMEOUT);
+    BOOST_CHECK_EQUAL(m_connman.PQLocalFaultEndpoints(), 0U);
+    // A key our check rejects, keys that don't match, and a peer that closes after the switch, as
+    // one whose check of our confirmation failed does, all count.
+    size_t counted{0};
+    for (const End end : {End::BAD_MODULUS, End::CONFIRMATION, End::PEER_EOF, End::PEER_RESET}) {
+        Connect(TestEndpoint(11, index++), end);
+        BOOST_CHECK_EQUAL(m_connman.PQLocalFaultEndpoints(), ++counted);
+    }
+    BOOST_CHECK_EQUAL(warnings.m_count, 0);
+    {
+        const std::string text{LocalFaultLine()};
+        DebugLogHelper expect{text, AtLevel({text}, LineLevel::WARNING)};
+        for (int i{0}; i < 4; ++i) Connect(TestEndpoint(11, index++), End::CONFIRMATION);
+    }
+    BOOST_CHECK_EQUAL(warnings.m_count, 1);
+    const PQTransportStats stats{Stats()};
+    BOOST_CHECK_EQUAL(stats.outbound.malformed_record, 9U);
+    BOOST_CHECK_EQUAL(stats.outbound.closed_after_switch, 10U);
 }
 
 BOOST_AUTO_TEST_CASE(pq_inbound_success_does_not_protect)
 {
-    // Only outbound successes enter the success set, which is never evicted. An inbound peer's
-    // key is its address and source port, so letting inbound successes in would let a peer that
-    // reconnects grow the set without bound, and silence the local-fault warning.
+    // Only outbound successes enter the success set. An inbound peer's key is its address and
+    // source port, so letting inbound successes in would let a peer that reconnects churn the
+    // set, and silence the local-fault warning.
     const CService addr{LookupNumeric("10.7.0.1", 8333)};
     Link inbound{Add(ConnectionType::INBOUND, PQMode::NEGOTIATE, std::nullopt, addr)};
     V2Transport peer{Initiator()};
@@ -1620,10 +1842,10 @@ BOOST_AUTO_TEST_CASE(pq_inbound_success_does_not_protect)
     Disconnect();
     LogLineCounter warnings{"v2 pq: local_fault"};
     // An outbound failure to the same address and port still starts a streak...
-    Connect(addr, End::MALFORMED);
+    Connect(addr, End::CONFIRMATION);
     BOOST_CHECK(Streak(addr));
     // ...and with no outbound success, eight failing endpoints still warn.
-    for (int i{1}; i < 8; ++i) Connect(TestEndpoint(9, i), End::MALFORMED);
+    for (int i{1}; i < 8; ++i) Connect(TestEndpoint(9, i), End::CONFIRMATION);
     BOOST_CHECK_EQUAL(warnings.m_count, 1);
 }
 
@@ -1838,6 +2060,42 @@ BOOST_AUTO_TEST_CASE(pq_load_shedding_wall_clock_step)
     BOOST_CHECK(attempt());
 }
 
+BOOST_AUTO_TEST_CASE(pq_load_shedding_steady_clock_step_back)
+{
+    // Only a test's mocked steady clock steps back: setmocktime 0 after a later time, with
+    // -test=mock_steady_clock. The seconds start over from the new time, so attempts on either
+    // side of the step don't add up, and shedding still ends after the quiet period.
+    InitConnman(/*shed_threshold=*/5);
+    const auto attempt{[&] {
+        Link link{Accept()};
+        Receive(link, InitiatorKey());
+        Pass(link);
+        const bool offered{link.node->m_transport->GetPQSnapshot().offer == PQOfferState::SENT};
+        link.node->RequestDisconnect();
+        Disconnect();
+        return offered;
+    }};
+    for (int i{0}; i < 3; ++i) BOOST_CHECK(attempt());
+    MockableSteadyClock::SetMockTime(STEADY_START - 3000s);
+    for (int i{0}; i < 3; ++i) BOOST_CHECK(attempt());
+    BOOST_CHECK(!Stats().load_shedding.active);
+    BOOST_CHECK_EQUAL(Stats().inbound.shed, 0U);
+
+    // A flood starts shedding; then the clock steps back again, and nothing more is attempted.
+    for (int i{0}; i < 3; ++i) attempt();
+    BOOST_REQUIRE(Stats().load_shedding.active);
+    constexpr std::chrono::seconds back{100s};
+    MockableSteadyClock::SetMockTime(back);
+    m_connman.UpdatePQSheddingPublic();
+    MockableSteadyClock::SetMockTime(back + PQ_SHED_QUIET_PERIOD - 1s);
+    m_connman.UpdatePQSheddingPublic();
+    BOOST_CHECK(Stats().load_shedding.active);
+    MockableSteadyClock::SetMockTime(back + PQ_SHED_QUIET_PERIOD);
+    m_connman.UpdatePQSheddingPublic();
+    BOOST_CHECK(!Stats().load_shedding.active);
+    BOOST_CHECK(attempt());
+}
+
 BOOST_AUTO_TEST_CASE(pq_load_shedding_socket_thread)
 {
     // The socket handler thread ends shedding on time when the flood stops entirely, without a
@@ -1867,8 +2125,7 @@ BOOST_AUTO_TEST_CASE(pq_config)
 {
     // Init() takes the negotiation of new connections, inbound and outbound, from the
     // configuration: on only with both switches on.
-    const auto create_sock_orig{CreateSock};
-    CreateSock = [](int, int, int) -> std::unique_ptr<Sock> { return std::make_unique<ZeroSock>(); };
+    const auto create_sock{MockCreateSock()};
     for (const auto& [config, enabled] : std::vector<std::pair<PQTransportConfig, bool>>{
              {{.v2_enabled = false, .pq_requested = true}, false},
              {{.v2_enabled = true, .pq_requested = false}, false},
@@ -1899,7 +2156,6 @@ BOOST_AUTO_TEST_CASE(pq_config)
     BOOST_CHECK(ours.failure == PQFailure::CONFIRM_LENGTH || ours.failure == PQFailure::CONFIRM_TAG);
     BOOST_CHECK(inbound.node->fDisconnect);
     BOOST_CHECK(peer.GetPQSnapshot().switched);
-    CreateSock = create_sock_orig;
 }
 
 BOOST_AUTO_TEST_CASE(pq_rpc_status)
@@ -2013,48 +2269,41 @@ BOOST_AUTO_TEST_CASE(pq_rpc_windows)
     BOOST_CHECK_EQUAL(next_window(), 86400);
 }
 
-BOOST_AUTO_TEST_CASE(pq_rpc_listed_peers)
+BOOST_AUTO_TEST_CASE(pq_rpc_connections_pq)
 {
-    // getnetworkinfo's connections_pq counts exactly the peers getpeerinfo lists: a hybrid
-    // connection the peer manager doesn't know yet is in the connection count, but not listed or
-    // counted as hybrid.
+    // getnetworkinfo's connections_pq counts the hybrid connections in the connection manager's
+    // node list, without per-peer statistics or cs_main, and matches the peers getpeerinfo lists
+    // with transport_pq true: as in production, the peer manager knows each node before the list
+    // has it. A connection that is still negotiating isn't counted.
     auto& connman{static_cast<ConnmanTestMsg&>(*m_node.connman)};
-    CNode* node{new CNode{/*id=*/100000, std::make_shared<ZeroSock>(), CAddress{LookupNumeric("10.8.0.1", 50000), NODE_NONE},
-                          /*nKeyedNetGroupIn=*/0, /*nLocalHostNonceIn=*/0, CAddress{}, /*addrNameIn=*/"", ConnectionType::INBOUND,
-                          /*inbound_onion=*/false, CNodeOptions{.use_v2transport = true, .pq = {.mode = PQMode::NEGOTIATE}}}};
-    V2Transport peer{Initiator()};
-    const auto deliver{[](Transport& from, Transport& to) {
-        const std::vector<uint8_t> bytes{PeerBytes(from)};
-        std::span<const uint8_t> remaining{bytes};
-        while (!remaining.empty()) {
-            BOOST_REQUIRE(to.ReceivedBytes(remaining));
-            if (to.ReceivedMessageComplete()) {
-                bool reject{false};
-                to.GetReceivedMessage({}, reject);
-            }
-        }
-    }};
-    for (int round{0}; round < 4; ++round) {
-        deliver(peer, *node->m_transport);
-        deliver(*node->m_transport, peer);
+    std::vector<CNode*> nodes;
+    for (const auto& [id, addr] : std::vector<std::pair<NodeId, std::string>>{{100000, "10.8.0.1"}, {100001, "10.8.0.2"}}) {
+        nodes.push_back(new CNode{id, std::make_shared<ZeroSock>(), CAddress{LookupNumeric(addr, 50000), NODE_NONE},
+                                  /*nKeyedNetGroupIn=*/0, /*nLocalHostNonceIn=*/0, CAddress{}, /*addrNameIn=*/"", ConnectionType::INBOUND,
+                                  /*inbound_onion=*/false, CNodeOptions{.use_v2transport = true, .pq = {.mode = PQMode::NEGOTIATE}}});
+        m_node.peerman->InitializeNode(*nodes.back(), NODE_NONE);
     }
-    BOOST_REQUIRE(node->m_transport->GetInfo().transport_pq);
-    connman.AddTestNode(*node);
+    V2Transport peer{Initiator()};
+    for (int round{0}; round < 4; ++round) {
+        Deliver(peer, *nodes[0]->m_transport);
+        Deliver(*nodes[0]->m_transport, peer);
+    }
+    BOOST_REQUIRE(nodes[0]->m_transport->GetInfo().transport_pq);
+    for (CNode* node : nodes) connman.AddTestNode(*node);
 
-    UniValue networkinfo{CallRPC(m_node, "getnetworkinfo")};
-    BOOST_CHECK_EQUAL(networkinfo["connections"].getInt<int>(), 1);
-    BOOST_CHECK_EQUAL(networkinfo["connections_pq"].getInt<int>(), 0);
-    BOOST_CHECK(CallRPC(m_node, "getpeerinfo").empty());
-
-    m_node.peerman->InitializeNode(*node, NODE_NONE);
-    networkinfo = CallRPC(m_node, "getnetworkinfo");
+    const UniValue networkinfo{CallRPC(m_node, "getnetworkinfo")};
+    BOOST_CHECK_EQUAL(networkinfo["connections"].getInt<int>(), 2);
     BOOST_CHECK_EQUAL(networkinfo["connections_pq"].getInt<int>(), 1);
     const UniValue peers{CallRPC(m_node, "getpeerinfo")};
-    BOOST_REQUIRE_EQUAL(peers.size(), 1U);
-    BOOST_CHECK(peers[0]["transport_pq"].get_bool());
-    BOOST_CHECK_EQUAL(peers[0]["transport_pq_status"].get_str(), "hybrid");
+    BOOST_REQUIRE_EQUAL(peers.size(), 2U);
+    std::map<std::string, std::pair<bool, std::string>> listed;
+    for (size_t i{0}; i < peers.size(); ++i) {
+        listed[peers[i]["addr"].get_str()] = {peers[i]["transport_pq"].get_bool(), peers[i]["transport_pq_status"].get_str()};
+    }
+    BOOST_CHECK(listed["10.8.0.1:50000"] == std::make_pair(true, std::string{"hybrid"}));
+    BOOST_CHECK(listed["10.8.0.2:50000"] == std::make_pair(false, std::string{"pending"}));
 
-    m_node.peerman->FinalizeNode(*node);
+    for (CNode* node : nodes) m_node.peerman->FinalizeNode(*node);
     connman.ClearTestNodes();
 }
 

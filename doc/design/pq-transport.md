@@ -319,8 +319,9 @@ qbit reports each v2 connection's negotiation status as one of these values:
 - <!--pq:value-->`off` when the switch is off, when a responder sheds its offer
   under load, or after a local key generation, key check or encapsulation fault
   that left the connection on plain v2;
-- <!--pq:value-->`fallback` for an outbound connection that runs plain v2
-  because of earlier failures; inbound connections never fall back.
+- <!--pq:value-->`fallback` for an automatic outbound connection that runs
+  plain v2 because of earlier failures; manual and inbound connections never
+  fall back.
 
 There is no failed status. A connection that closes on any failure above or
 in key confirmation, local faults included, reports `pending` until it is
@@ -342,7 +343,15 @@ removed.
 - **Downgrade.** Stripping an offer or an accept means forging packets under
   the ECDH keys, so it takes an active attacker who breaks ECDH in real time
   or sits in the middle, and an unauthenticated session can't stop the latter
-  anyway. A passive recorder can't downgrade a connection.
+  anyway. A passive recorder can't downgrade a connection. qbit's fallback
+  policy is weaker: an attacker on the network path, without any keys, can
+  make hybrid handshakes with an endpoint fail after the switch, by damaging
+  the peer's key confirmation in transit, resetting the connection or
+  dropping its traffic. Three such failures in a row put an automatic
+  outbound peer in the fallback set, so that new connections to it use ECDH
+  keys only, for 1 hour, then 4, then 24, and the attacker can repeat this.
+  Manual peers (<!--pq:rpc-->`addnode`, <!--pq:opt-->`-connect`) are exempt:
+  their failures never count, and they always negotiate.
 - **Transcript binding.** Both keys, both contents and the network magic feed
   the derivation, so two sides that saw different negotiation bytes derive
   different keys and fail the confirmation instead of continuing.

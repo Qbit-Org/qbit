@@ -134,7 +134,7 @@ struct ListedPeer {
     CNodeStateStats statestats;
 };
 
-/** The peers getpeerinfo lists; getnetworkinfo counts over the same ones. */
+/** The peers getpeerinfo lists. */
 static std::vector<ListedPeer> GetListedPeers(const CConnman& connman, const PeerManager& peerman)
 {
     std::vector<CNodeStats> vstats;
@@ -863,13 +863,10 @@ static RPCHelpMan getnetworkinfo()
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
     NodeContext& node = EnsureAnyNodeContext(request.context);
-    // Counted before cs_main is taken, as getpeerinfo lists the peers.
-    int connections_pq{0};
-    if (node.connman && node.peerman) {
-        for (const ListedPeer& peer : GetListedPeers(*node.connman, *node.peerman)) {
-            if (peer.stats.m_transport_pq) ++connections_pq;
-        }
-    }
+    // Counted before cs_main is taken, from the connection manager's own node list: every
+    // connection in it is one getpeerinfo lists, as the peer manager knows a node before the list
+    // has it, and until after the list dropped it.
+    const size_t connections_pq{node.connman ? node.connman->GetPQNodeCount() : 0};
     LOCK(cs_main);
     UniValue obj(UniValue::VOBJ);
     obj.pushKV("version",       CLIENT_VERSION);
@@ -1520,9 +1517,14 @@ static RPCHelpMan getpqtransportinfo()
         "\n"
         "Counters count events, not exclusive outcomes: switched counts key installations, even if the key\n"
         "confirmation then fails; fallback counts entries into the fallback set, not plain v2 connections;\n"
-        "abandoned counts offers whose initiator sent no authenticated version packet before the connection\n"
-        "closed. Counters, rings and endpoint history are kept in memory only, and start over when\n"
-        "instance_id changes.\n"
+        "abandoned counts offers after which no authenticated version packet arrived before the connection\n"
+        "closed, whichever side closed it: reason local is this node's own close, such as an eviction (a\n"
+        "close because the network was switched off, or at shutdown, counts nothing). Counters, rings and\n"
+        "endpoint history are kept in memory only, and start over when instance_id changes.\n"
+        "\n"
+        "Only automatic outbound connections fall back. Manual ones (addnode, -connect) always negotiate,\n"
+        "and their failures never count toward a streak, as an attacker on the path can cause them without\n"
+        "breaking a key. Their outcomes are counted, kept and logged all the same.\n"
         "\n"
         "A connection that closes on a hybrid failure reports transport_pq_status \"pending\" in getpeerinfo\n"
         "until it is removed; its outcome is counted here.\n"
@@ -1556,7 +1558,7 @@ static RPCHelpMan getpqtransportinfo()
                     {RPCResult::Type::NUM, "threshold_per_s", "The threshold, in offers attempted per second"},
                     {RPCResult::Type::NUM_TIME, "since", "The " + UNIX_EPOCH_TIME + " the current shedding period started, or 0 when inactive"},
                 }},
-                {RPCResult::Type::ARR, "fallback_set", "Endpoints that outbound connections reach with plain v2, after repeated hybrid failures",
+                {RPCResult::Type::ARR, "fallback_set", "Endpoints that automatic outbound connections reach with plain v2, after repeated hybrid failures",
                 {
                     {RPCResult::Type::OBJ, "", "",
                     {
@@ -1565,11 +1567,11 @@ static RPCHelpMan getpqtransportinfo()
                         {RPCResult::Type::STR, "reason", "Its reason"},
                         {RPCResult::Type::NUM, "streak", "Consecutive counted failures"},
                         {RPCResult::Type::NUM_TIME, "entered", "The " + UNIX_EPOCH_TIME + " the endpoint entered the set"},
-                        {RPCResult::Type::NUM_TIME, "expires", "The " + UNIX_EPOCH_TIME + " the window ends"},
+                        {RPCResult::Type::NUM_TIME, "expires", "The " + UNIX_EPOCH_TIME + " the window ends, at the latest: it also ends once window_seconds have passed on the monotonic clock, so a clock step back can't lengthen it"},
                         {RPCResult::Type::NUM, "window_seconds", "The window: " + windows},
                     }},
                 }},
-                {RPCResult::Type::ARR, "failure_streaks", "Outbound endpoints with counted failures, not in the fallback set",
+                {RPCResult::Type::ARR, "failure_streaks", "Endpoints of automatic outbound connections with counted failures, not in the fallback set",
                 {
                     {RPCResult::Type::OBJ, "", "",
                     {

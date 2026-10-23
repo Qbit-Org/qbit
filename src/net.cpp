@@ -527,9 +527,14 @@ CNode* CConnman::ConnectNode(CAddress addrConnect, const char *pszDest, bool fCo
 
         // Repeated hybrid failures to this endpoint put it in the fallback set: plain v2, without
         // parsing or validating the peer's offer. The next attempt, whenever the connection logic
-        // makes one, asks again.
+        // makes one, asks again. A manual connection (addnode, -connect) always negotiates, even
+        // to an endpoint an automatic connection put in the set: an attacker on the path can make
+        // handshakes fail without breaking a key, and pinning a peer keeps its hybrid keys.
         PQMode pq_mode{m_pq_mode};
-        if (pq_mode == PQMode::NEGOTIATE && use_v2transport && IsPQFallback(pq_endpoint, Now<NodeSeconds>())) pq_mode = PQMode::FALLBACK;
+        if (pq_mode == PQMode::NEGOTIATE && use_v2transport && conn_type != ConnectionType::MANUAL &&
+            IsPQFallback(pq_endpoint, Now<NodeSeconds>())) {
+            pq_mode = PQMode::FALLBACK;
+        }
 
         NetPermissionFlags permission_flags = NetPermissionFlags::None;
         std::vector<NetWhitelistPermissions> whitelist_permissions = conn_type == ConnectionType::MANUAL ? vWhitelistedRangeOutgoing : std::vector<NetWhitelistPermissions>{};
@@ -2325,6 +2330,32 @@ std::string_view PQFailureReason(PQFailure failure) noexcept
     assert(false);
 }
 
+/** Whether this node's own code can cause a negotiation failure: its key check rejecting the
+ *  peer's key, keys that don't match (the confirmation's length or tag), or an internal error. A
+ *  record of the wrong length, and a confirmation that verified under the hybrid keys but isn't a
+ *  decoy, are the peer's alone. */
+bool PQFailureMayBeLocal(PQFailure failure) noexcept
+{
+    switch (failure) {
+    case PQFailure::EK_MODULUS:
+    case PQFailure::CONFIRM_LENGTH:
+    case PQFailure::CONFIRM_TAG:
+    case PQFailure::KEYGEN_INTERNAL:
+    case PQFailure::CHECK_EK_INTERNAL:
+    case PQFailure::ENCAPS_INTERNAL:
+    case PQFailure::DECAPS_INTERNAL:
+    case PQFailure::CIPHER_STATE_INTERNAL:
+        return true;
+    case PQFailure::EK_LENGTH:
+    case PQFailure::CT_LENGTH:
+    case PQFailure::CONFIRM_NOT_DECOY:
+        return false;
+    case PQFailure::NONE:
+        break;
+    } // no default case, so the compiler can warn about missing cases
+    assert(false);
+}
+
 /** The reason word of a close cause. A node without one is finalized as LOCAL. */
 std::string_view PQCloseCauseReason(NodeCloseCause cause) noexcept
 {
@@ -2374,12 +2405,20 @@ std::chrono::seconds PQFallbackWindow(const PQEndpointHistory& history) noexcept
     return PQ_FALLBACK_WINDOWS[std::min<size_t>(history.completed_windows, PQ_FALLBACK_WINDOWS.size() - 1)];
 }
 
-/** End an expired fallback window: the streak restarts at 0, and the escalation level stays. */
-void ExpirePQFallback(PQEndpointHistory& history, NodeSeconds now) noexcept
+/** Whether an endpoint's fallback window is still running: it ends at expires, or once its length
+ *  has passed on the steady clock, whichever comes first, so a wall clock step back can't stretch it. */
+bool PQFallbackActive(const PQEndpointHistory& history, NodeSeconds now, MockableSteadyClock::time_point steady_now) noexcept
 {
-    if (!history.expires || now < *history.expires) return;
+    return history.expires && now < *history.expires && steady_now < *history.steady_expires;
+}
+
+/** End an expired fallback window: the streak restarts at 0, and the escalation level stays. */
+void ExpirePQFallback(PQEndpointHistory& history, NodeSeconds now, MockableSteadyClock::time_point steady_now) noexcept
+{
+    if (!history.expires || PQFallbackActive(history, now, steady_now)) return;
     history.entered.reset();
     history.expires.reset();
+    history.steady_expires.reset();
     history.streak = 0;
     history.completed_windows = static_cast<uint8_t>(std::min<size_t>(history.completed_windows + 1, PQ_FALLBACK_WINDOWS.size()));
 }
@@ -2400,7 +2439,7 @@ PQCounts LoadPQCounts(const PQCounters& counters) noexcept
 }
 } // namespace
 
-void CConnman::ObservePQ(CNode& node, bool finalizing, bool record_outcomes)
+void CConnman::ObservePQ(CNode& node, bool finalizing, bool attribute_close)
 {
     AssertLockNotHeld(m_pq_mutex);
     // The transport takes and releases its own lock.
@@ -2408,12 +2447,11 @@ void CConnman::ObservePQ(CNode& node, bool finalizing, bool record_outcomes)
     // Nothing to account yet, as on every connection without the negotiation.
     if (!finalizing && !snapshot.switched && snapshot.legacy == PQLegacyReason::NONE && snapshot.failure == PQFailure::NONE) return;
     const NodeCloseCause cause{node.GetCloseCause()};
-    const bool record{record_outcomes && fNetworkActive};
     PQLogLines lines;
     {
         LOCK(m_pq_mutex);
         if (node.m_pq_finalized) return;
-        if (record) lines = AccountPQ(node, snapshot, cause, finalizing, Now<NodeSeconds>());
+        lines = AccountPQ(node, snapshot, cause, /*account_close=*/finalizing && attribute_close, Now<NodeSeconds>());
         if (finalizing) node.m_pq_finalized = true;
     }
     if (finalizing) node.m_transport->ClearPQSecrets();
@@ -2422,22 +2460,29 @@ void CConnman::ObservePQ(CNode& node, bool finalizing, bool record_outcomes)
 }
 
 CConnman::PQLogLines CConnman::AccountPQ(CNode& node, const PQHandshake::Snapshot& snapshot, NodeCloseCause cause,
-                                          bool finalizing, NodeSeconds now)
+                                          bool account_close, NodeSeconds now)
 {
     AssertLockHeld(m_pq_mutex);
     const bool inbound{node.IsInboundConn()};
     PQLogLines lines;
     // Each event counts once per connection, however often it is observed.
-    const auto account{[&](PQOutcome outcome, std::string_view reason) EXCLUSIVE_LOCKS_REQUIRED(m_pq_mutex) {
+    const auto account{[&](PQOutcome outcome, std::string_view reason, bool may_be_local = false) EXCLUSIVE_LOCKS_REQUIRED(m_pq_mutex) {
         const uint16_t bit{static_cast<uint16_t>(1U << static_cast<uint8_t>(outcome))};
         if (node.m_pq_accounted_events & bit) return;
         node.m_pq_accounted_events |= bit;
         if (std::atomic<uint64_t>* counter{PQCounter(m_pq_counters[PQDirection(inbound)], outcome)}) ++*counter;
         if (outcome == PQOutcome::CONFIRMED) {
-            // A confirmed hybrid handshake protects an outbound endpoint until restart: no
-            // failure, however late, can count against it again.
+            // A confirmed hybrid handshake protects an outbound endpoint while it stays in the
+            // success set: no failure, however late, can count against it.
             if (!inbound) {
-                m_pq_successful_endpoints.insert(node.m_pq_endpoint);
+                m_pq_any_success = true;
+                // A new endpoint in a full set evicts the least recently confirmed one.
+                if (!m_pq_successful_endpoints.contains(node.m_pq_endpoint) &&
+                    m_pq_successful_endpoints.size() >= PQ_MAX_SUCCESSFUL_ENDPOINTS) {
+                    m_pq_successful_endpoints.erase(
+                        std::ranges::min_element(m_pq_successful_endpoints, {}, [](const auto& entry) { return entry.second; }));
+                }
+                m_pq_successful_endpoints.insert_or_assign(node.m_pq_endpoint, m_pq_success_confirmations++);
                 m_pq_history.erase(node.m_pq_endpoint);
             }
             return;
@@ -2456,7 +2501,7 @@ CConnman::PQLogLines CConnman::AccountPQ(CNode& node, const PQHandshake::Snapsho
         // Only failures the peer side caused count toward the fallback, and only outbound.
         if (!inbound && (outcome == PQOutcome::MALFORMED_RECORD || outcome == PQOutcome::FIRST_PACKET_FAILED ||
                          outcome == PQOutcome::CLOSED_AFTER_SWITCH)) {
-            if (const auto until{CountPQFailure(node, outcome, reason, now, lines.local_fault)}) {
+            if (const auto until{CountPQFailure(node, outcome, reason, may_be_local, now, lines.local_fault)}) {
                 lines.outcomes.push_back({PQOutcome::FALLBACK, PQOutcomeString(outcome), until});
             }
         }
@@ -2468,13 +2513,17 @@ CConnman::PQLogLines CConnman::AccountPQ(CNode& node, const PQHandshake::Snapsho
     if (snapshot.legacy != PQLegacyReason::NONE) {
         account(PQOutcome::LEGACY_PEER, snapshot.legacy == PQLegacyReason::PARSE_ERROR ? "parse_error" : "no_features");
     }
-    if (snapshot.failure != PQFailure::NONE) account(PQFailureOutcome(snapshot.failure), PQFailureReason(snapshot.failure));
-    if (finalizing && snapshot.failure == PQFailure::NONE) {
+    if (snapshot.failure != PQFailure::NONE) {
+        account(PQFailureOutcome(snapshot.failure), PQFailureReason(snapshot.failure), PQFailureMayBeLocal(snapshot.failure));
+    }
+    if (account_close && snapshot.failure == PQFailure::NONE) {
         // We switched, and the peer closed or stopped responding before its confirmation
-        // verified. Our own closes and send errors are not the peer's doing.
+        // verified. Our own closes and send errors are not the peer's doing. A peer that closes
+        // may have failed its check of our confirmation, as keys our own ML-KEM code got wrong
+        // would make it; one that stops responding has no such reason.
         if (!inbound && snapshot.switched && !snapshot.confirmed &&
             (cause == NodeCloseCause::PEER_EOF || cause == NodeCloseCause::PEER_RESET || cause == NodeCloseCause::TIMEOUT)) {
-            account(PQOutcome::CLOSED_AFTER_SWITCH, PQCloseCauseReason(cause));
+            account(PQOutcome::CLOSED_AFTER_SWITCH, PQCloseCauseReason(cause), /*may_be_local=*/cause != NodeCloseCause::TIMEOUT);
         }
         // Our offer was queued, but no authenticated version arrived before the close. An offer
         // that failed internally is internal_error only.
@@ -2485,36 +2534,46 @@ CConnman::PQLogLines CConnman::AccountPQ(CNode& node, const PQHandshake::Snapsho
     return lines;
 }
 
-std::optional<NodeSeconds> CConnman::CountPQFailure(const CNode& node, PQOutcome outcome, std::string_view reason, NodeSeconds now,
-                                                    bool& local_fault)
+std::optional<NodeSeconds> CConnman::CountPQFailure(const CNode& node, PQOutcome outcome, std::string_view reason, bool may_be_local,
+                                                    NodeSeconds now, bool& local_fault)
 {
     AssertLockHeld(m_pq_mutex);
     const PQEndpointKey& endpoint{node.m_pq_endpoint};
     if (m_pq_successful_endpoints.contains(endpoint)) return std::nullopt;
 
-    // Many endpoints failing, and none succeeding, points at this node's own ML-KEM code.
-    if (m_pq_failed_endpoints_for_warning.size() < PQ_LOCAL_FAULT_THRESHOLD) m_pq_failed_endpoints_for_warning.insert(endpoint);
-    if (!m_pq_local_fault_warned && m_pq_failed_endpoints_for_warning.size() >= PQ_LOCAL_FAULT_THRESHOLD &&
-        m_pq_successful_endpoints.empty()) {
-        m_pq_local_fault_warned = true;
-        local_fault = true;
+    // Many endpoints failing in a way this node's own ML-KEM code can cause, and none succeeding,
+    // points at that code. Manual connections count here too: a node with only -connect peers
+    // still gets the warning.
+    if (may_be_local) {
+        if (m_pq_failed_endpoints_for_warning.size() < PQ_LOCAL_FAULT_THRESHOLD) m_pq_failed_endpoints_for_warning.insert(endpoint);
+        if (!m_pq_local_fault_warned && m_pq_failed_endpoints_for_warning.size() >= PQ_LOCAL_FAULT_THRESHOLD && !m_pq_any_success) {
+            m_pq_local_fault_warned = true;
+            local_fault = true;
+        }
     }
 
+    // An attacker on the path can make an endpoint's handshakes fail without breaking a key, by
+    // damaging the peer's confirmation, resetting the connection or dropping its traffic. A
+    // manual connection's failures never count toward the fallback, so a pinned peer keeps its
+    // hybrid keys; they are still counted, kept in the ring and logged.
+    if (node.m_conn_type == ConnectionType::MANUAL) return std::nullopt;
+
+    const MockableSteadyClock::time_point steady_now{MockableSteadyClock::now()};
     auto it{m_pq_history.find(endpoint)};
     if (it == m_pq_history.end()) {
         if (m_pq_history.size() >= PQ_MAX_ENDPOINT_HISTORY) {
             // Spare active fallback windows: evict the oldest insertion outside one, and only when
             // every endpoint is in one, the window that ends first.
-            m_pq_history.erase(std::ranges::min_element(m_pq_history, {}, [now](const auto& entry) {
+            m_pq_history.erase(std::ranges::min_element(m_pq_history, {}, [now, steady_now](const auto& entry) {
                 const PQEndpointHistory& history{entry.second};
-                const bool active{history.expires && now < *history.expires};
+                const bool active{PQFallbackActive(history, now, steady_now)};
                 return std::tuple{active, active ? *history.expires : NodeSeconds{}, history.insertion_order};
             }));
         }
         it = m_pq_history.emplace(endpoint, PQEndpointHistory{.insertion_order = m_pq_history_insertions++}).first;
     }
     PQEndpointHistory& history{it->second};
-    ExpirePQFallback(history, now);
+    ExpirePQFallback(history, now, steady_now);
     // A connection that was already running when the window began can't extend it.
     if (history.expires) return std::nullopt;
     ++history.streak;
@@ -2523,8 +2582,10 @@ std::optional<NodeSeconds> CConnman::CountPQFailure(const CNode& node, PQOutcome
     history.reason = reason;
     if (history.streak < PQ_FAILURE_THRESHOLD) return std::nullopt;
 
+    const std::chrono::seconds window{PQFallbackWindow(history)};
     history.entered = now;
-    history.expires = now + PQFallbackWindow(history);
+    history.expires = now + window;
+    history.steady_expires = steady_now + window;
     ++m_pq_counters[PQDirection(/*inbound=*/false)].fallback;
     AddPQFailure({.sequence = 0,
                   .time = now,
@@ -2543,7 +2604,7 @@ bool CConnman::IsPQFallback(const PQEndpointKey& endpoint, NodeSeconds now)
     LOCK(m_pq_mutex);
     const auto it{m_pq_history.find(endpoint)};
     if (it == m_pq_history.end()) return false;
-    ExpirePQFallback(it->second, now);
+    ExpirePQFallback(it->second, now, MockableSteadyClock::now());
     return it->second.expires.has_value();
 }
 
@@ -2659,10 +2720,11 @@ PQTransportStats CConnman::GetPQTransportStats() const
         .load_shedding = load_shedding,
     };
     const NodeSeconds now{Now<NodeSeconds>()};
+    const MockableSteadyClock::time_point steady_now{MockableSteadyClock::now()};
     for (const auto& [endpoint, history] : m_pq_history) {
         if (history.expires) {
             // A window that expired ended the streak; nothing to report until the next failure.
-            if (now < *history.expires) {
+            if (PQFallbackActive(history, now, steady_now)) {
                 stats.fallback_set.push_back({endpoint, history.cause, history.reason, history.streak, *history.entered, *history.expires});
             }
         } else if (history.streak > 0) {
@@ -2705,6 +2767,14 @@ bool CConnman::AllowPQOffer() noexcept
 bool CConnman::AdvancePQShedding(PQShedSeconds now)
 {
     AssertLockHeld(m_pq_shed_mutex);
+    if (now < m_pq_shed_second) {
+        // Only a test's mocked steady clock steps back (setmocktime 0 after a later time, with
+        // -test=mock_steady_clock). Start the current second, and the run of quiet seconds, over
+        // from now: otherwise the current second would never close, and shedding never end.
+        m_pq_shed_second = now;
+        m_pq_shed_attempts = 0;
+        m_pq_quiet_since.reset();
+    }
     if (now > m_pq_shed_second) {
         // Close the current second, and the seconds without attempts since: a second is quiet
         // with fewer than half the threshold's attempts.
@@ -2792,8 +2862,9 @@ void CConnman::DisconnectNodes()
                 pnode->CloseSocketDisconnect();
 
                 // account the hybrid negotiation's close outcome and wipe its pending secrets
-                // before the disconnected pool keeps the node
-                ObservePQ(*pnode, /*finalizing=*/true);
+                // before the disconnected pool keeps the node; with the network off, as this pass
+                // saw it when it closed every connection, the close is ours
+                ObservePQ(*pnode, /*finalizing=*/true, /*attribute_close=*/network_active);
 
                 // update connection count by network
                 if (pnode->IsManualOrFullOutboundConn()) --m_network_conn_counts[pnode->addr.GetNetwork()];
@@ -4335,8 +4406,8 @@ void CConnman::StopNodes()
         LogDebug(BCLog::NET, "Stopping node, %s", pnode->DisconnectMsg(fLogIPs));
         pnode->CloseSocketDisconnect();
         // Wipe the hybrid negotiation's pending secrets before the node goes, as DisconnectNodes()
-        // does. A shutdown close is our own decision, so it records no outcome.
-        ObservePQ(*pnode, /*finalizing=*/true, /*record_outcomes=*/false);
+        // does. A shutdown close is our own decision, so no close outcome is derived from it.
+        ObservePQ(*pnode, /*finalizing=*/true, /*attribute_close=*/false);
         DeleteNode(pnode);
     }
 
@@ -4453,6 +4524,12 @@ bool CConnman::AddedNodesContain(const CAddress& addr) const
     return (m_added_node_params.size() < 24 // bound the query to a reasonable limit
             && std::any_of(m_added_node_params.cbegin(), m_added_node_params.cend(),
                            [&](const auto& p) { return p.m_added_node == addr_str || p.m_added_node == addr_port_str; }));
+}
+
+size_t CConnman::GetPQNodeCount() const
+{
+    LOCK(m_nodes_mutex);
+    return std::ranges::count_if(m_nodes, [](const CNode* node) { return node->m_transport->GetInfo().transport_pq; });
 }
 
 size_t CConnman::GetNodeCount(ConnectionDirection flags) const
