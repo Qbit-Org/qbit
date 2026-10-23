@@ -87,7 +87,7 @@ void BIP324Cipher::Initialize(const EllSwiftPubKey& their_pubkey, bool initiator
     // Keep what SwitchToHybrid() needs: the ECDH secret itself, the transcript started with the
     // actual-role public keys (initiator first), the network magic and the cipher direction.
     if (retain_for_hybrid) {
-        m_retained_ecdh = ecdh_secret;
+        m_retained_ecdh = make_secure_unique<ECDHSecret>(ecdh_secret);
         m_hybrid_transcript.emplace();
         const EllSwiftPubKey& ellswift_initiator{initiator ? m_our_pubkey : their_pubkey};
         const EllSwiftPubKey& ellswift_responder{initiator ? their_pubkey : m_our_pubkey};

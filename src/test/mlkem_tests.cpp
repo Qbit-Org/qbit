@@ -31,6 +31,7 @@
 #include <functional>
 #include <future>
 #include <new>
+#include <optional>
 #include <ostream>
 #include <span>
 #include <string>
@@ -558,6 +559,19 @@ BOOST_AUTO_TEST_CASE(backend_selection)
         }
         BOOST_CHECK_EQUAL(GetBackendNames().arith, "portable");
         BOOST_CHECK_EQUAL(GetBackendNames().keccak, "portable");
+    }
+    BOOST_CHECK_EQUAL(GetBackendNames().arith, active.arith);
+    BOOST_CHECK_EQUAL(GetBackendNames().keccak, active.keccak);
+
+    // Guards whose lifetimes overlap without nesting, as on two threads: portable C stays
+    // forced until the last one goes, and then the earlier selection is back.
+    {
+        std::optional<ForcePortableForTesting> first{std::in_place};
+        std::optional<ForcePortableForTesting> second{std::in_place};
+        first.reset();
+        BOOST_CHECK_EQUAL(GetBackendNames().arith, "portable");
+        BOOST_CHECK_EQUAL(GetBackendNames().keccak, "portable");
+        second.reset();
     }
     BOOST_CHECK_EQUAL(GetBackendNames().arith, active.arith);
     BOOST_CHECK_EQUAL(GetBackendNames().keccak, active.keccak);

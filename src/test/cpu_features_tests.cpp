@@ -10,6 +10,7 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -38,6 +39,8 @@ constexpr X86Features MLKEM_X86_NATIVE{
 struct FakeCpu {
     X86Features features;
     std::vector<uint32_t> leaves;
+    //! Leaf 7's EBX when the CPU does not support leaf 7: another leaf's data.
+    uint32_t unsupported_leaf7_ebx{LEAF7_EBX_AVX2};
     int xgetbv_calls{0};
     bool xgetbv_faulted{false};
 };
@@ -49,8 +52,8 @@ void FakeCpuid(uint32_t leaf, uint32_t subleaf, uint32_t& a, uint32_t& b, uint32
     const bool supported{leaf <= g_cpu.features.max_basic_leaf};
     a = leaf == 0 ? g_cpu.features.max_basic_leaf : 0;
     // Real CPUs answer an unsupported leaf with another leaf's data; report
-    // AVX2 there so that reading it would show up as a wrong result.
-    b = leaf == 7 ? (supported ? g_cpu.features.leaf7_ebx : LEAF7_EBX_AVX2) : 0;
+    // AVX2 there by default so that reading it would show up as a wrong result.
+    b = leaf == 7 ? (supported ? g_cpu.features.leaf7_ebx : g_cpu.unsupported_leaf7_ebx) : 0;
     c = leaf == 1 ? g_cpu.features.leaf1_ecx : 0;
     d = 0;
     (void)subleaf;
@@ -210,6 +213,39 @@ BOOST_AUTO_TEST_CASE(sha256_x86_code_needs_ssse3)
     BOOST_CHECK_EQUAL(SHA256AutoDetect(), host_choice);
 #else
     // Other targets ignore the x86 queries.
+    BOOST_CHECK_EQUAL(SHA256AutoDetect(sha256_implementation::USE_ALL, nullptr, nullptr), SHA256AutoDetect());
+#endif
+}
+
+BOOST_AUTO_TEST_CASE(sha256_x86_checks_max_leaf)
+{
+#if defined(HAVE_GETCPUID)
+    // A virtual machine limited to leaf 1 (or any maximum below 7) answers
+    // leaf 7 with another leaf's data, here claiming SHA-NI and AVX2. Reading
+    // it would select SHA-NI: on a CPU without it the self-test dies with
+    // SIGILL, and on one with it the result below differs. Synthetic CPUs are
+    // derived from this one so that the selected code can run here.
+    const X86Features host{DetectX86Features()};
+    const auto detect{[&](uint32_t max_basic_leaf, uint32_t leaf7_ebx) {
+        g_cpu = FakeCpu{};
+        g_cpu.features = host;
+        g_cpu.features.max_basic_leaf = max_basic_leaf;
+        g_cpu.features.leaf7_ebx = leaf7_ebx;
+        g_cpu.unsupported_leaf7_ebx = LEAF7_EBX_SHA | LEAF7_EBX_AVX2;
+        return SHA256AutoDetect(sha256_implementation::USE_ALL, FakeCpuid, FakeXGetBV);
+    }};
+    // What this CPU gets without any leaf-7 feature.
+    const std::string without_leaf7{detect(/*max_basic_leaf=*/7, /*leaf7_ebx=*/0)};
+    BOOST_TEST_MESSAGE("SHA256 on this CPU without leaf 7: " << without_leaf7);
+    BOOST_CHECK(without_leaf7.find("shani") == std::string::npos);
+    BOOST_CHECK(without_leaf7.find("avx2") == std::string::npos);
+    for (const uint32_t max_basic_leaf : {1U, 6U}) {
+        BOOST_CHECK_EQUAL(detect(max_basic_leaf, /*leaf7_ebx=*/0), without_leaf7);
+        BOOST_CHECK(std::ranges::find(g_cpu.leaves, 7U) == g_cpu.leaves.end());
+    }
+    // Restore this CPU's selection.
+    SHA256AutoDetect();
+#else
     BOOST_CHECK_EQUAL(SHA256AutoDetect(sha256_implementation::USE_ALL, nullptr, nullptr), SHA256AutoDetect());
 #endif
 }

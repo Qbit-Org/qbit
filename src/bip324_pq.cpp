@@ -115,7 +115,7 @@ mlkem::Error PQHandshake::MakeOffer(Record& offer) noexcept
     mlkem::Secret<mlkem::KEYGEN_SEED_BYTES> seed;
     m_random.fill32(m_random.context, seed.Bytes().first<32>());
     m_random.fill32(m_random.context, seed.Bytes().last<32>());
-    auto dk{std::make_unique<mlkem::DecapsulationKey>()};
+    auto dk{make_secure_unique<mlkem::DecapsulationKey>()};
     mlkem::PublicKey ek;
     if (m_ops.keygen(seed.Bytes(), ek, *dk) != mlkem::Error::NONE) {
         SetFailure(PQFailure::KEYGEN_INTERNAL);

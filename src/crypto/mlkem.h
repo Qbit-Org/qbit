@@ -106,14 +106,15 @@ void InitializeRuntime(bool force_portable) noexcept;
 BackendNames GetBackendNames() noexcept;
 
 /**
- * Forces portable C while alive, then restores the previous override (RAII).
- * Each operation reads the override once, at entry, so one that is already
- * running finishes on the backend it started with. Test code only.
+ * Forces portable C while alive (RAII). Guards are counted, so they may be
+ * created and destroyed in any order, on any thread: portable C is forced
+ * while at least one is alive, and afterwards the startup override
+ * (InitializeRuntime()) applies again. Each operation reads the override
+ * once, at entry, so one that is already running finishes on the backend it
+ * started with. Test code only.
  */
 class ForcePortableForTesting
 {
-    bool m_previous;
-
 public:
     ForcePortableForTesting() noexcept;
     ~ForcePortableForTesting();

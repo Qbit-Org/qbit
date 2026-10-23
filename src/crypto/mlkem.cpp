@@ -33,6 +33,9 @@ constexpr std::string_view PORTABLE{"portable"};
 //! When set, every operation that starts afterwards runs portable C only.
 std::atomic_bool g_force_portable{false};
 
+//! Live ForcePortableForTesting guards; while any is alive, operations that start run portable C only.
+std::atomic_int g_force_portable_guards{0};
+
 /**
  * g_force_portable as the operation running on this thread read it at entry.
  * The capability hooks read only this copy, so a change on another thread
@@ -65,7 +68,8 @@ void DetectCapabilities() noexcept
 void BeginOperation() noexcept
 {
     DetectCapabilities();
-    t_force_portable = g_force_portable.load(std::memory_order_relaxed);
+    t_force_portable = g_force_portable.load(std::memory_order_relaxed) ||
+                       g_force_portable_guards.load(std::memory_order_relaxed) > 0;
 }
 
 int Injected(mlkem::Operation op, int result) noexcept
@@ -173,13 +177,13 @@ BackendNames GetBackendNames() noexcept
 }
 
 ForcePortableForTesting::ForcePortableForTesting() noexcept
-    : m_previous{g_force_portable.exchange(true)}
 {
+    g_force_portable_guards.fetch_add(1);
 }
 
 ForcePortableForTesting::~ForcePortableForTesting()
 {
-    g_force_portable.store(m_previous);
+    g_force_portable_guards.fetch_sub(1);
 }
 
 InjectResultForTesting::InjectResultForTesting(Operation op, int upstream_result) noexcept

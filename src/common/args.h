@@ -18,6 +18,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -416,6 +417,16 @@ protected:
     {
         LOCK(cs_args);
         fn(m_settings);
+    }
+
+    /**
+     * Read settings with lock held.
+     */
+    template <typename Fn>
+    void LockSettings(Fn&& fn) const
+    {
+        LOCK(cs_args);
+        fn(std::as_const(m_settings));
     }
 
     /**

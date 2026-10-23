@@ -5,6 +5,7 @@
 #include <test/data/pq_transport_vectors.json.h>
 
 #include <bip324.h>
+#include <bip324_pq.h>
 #include <chainparams.h>
 #include <crypto/chacha20.h>
 #include <crypto/chacha20poly1305.h>
@@ -15,6 +16,7 @@
 #include <serialize.h>
 #include <span.h>
 #include <streams.h>
+#include <support/lockedpool.h>
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
 #include <util/strencodings.h>
@@ -761,6 +763,32 @@ BOOST_AUTO_TEST_CASE(hybrid_rekey_boundaries)
             BOOST_CHECK(stream == *fresh_stream);
         }
     }
+}
+
+BOOST_AUTO_TEST_CASE(hybrid_secrets_locked_memory)
+{
+    // The retained ECDH secret and a responder's decapsulation key live in the locked pool
+    // (mlock'd and excluded from core dumps, like CKey), and their wipe returns the memory.
+    const auto locked_used{[] { return LockedPoolManager::Instance().stats().used; }};
+
+    BIP324Cipher initiator(GenerateRandomKey(), m_rng.randbytes<std::byte>(32));
+    BIP324Cipher responder(GenerateRandomKey(), m_rng.randbytes<std::byte>(32));
+    InitializePair(initiator, responder, /*retain_for_hybrid=*/true);
+    BOOST_REQUIRE(initiator.HoldsHybridSecret());
+    const size_t with_ecdh{locked_used()};
+    initiator.DiscardHybridSecret();
+    BOOST_CHECK(!initiator.HoldsHybridSecret());
+    BOOST_CHECK_EQUAL(with_ecdh - locked_used(), ECDH_SECRET_SIZE);
+
+    PQHandshake handshake{/*initiating=*/false, PQMode::NEGOTIATE};
+    PQHandshake::Record offer;
+    const size_t before_offer{locked_used()};
+    BOOST_REQUIRE(handshake.MakeOffer(offer) == mlkem::Error::NONE);
+    BOOST_REQUIRE(handshake.HasDecapsulationKey());
+    BOOST_CHECK_EQUAL(locked_used() - before_offer, mlkem::SECRET_KEY_BYTES);
+    handshake.ClearSecrets();
+    BOOST_CHECK(!handshake.HasDecapsulationKey());
+    BOOST_CHECK_EQUAL(locked_used(), before_offer);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
