@@ -197,6 +197,56 @@ def source_env(env_file: str, names: list[str], extra_env: dict[str, str] | None
     return svc.parse_key_values(completed.stdout)
 
 
+# Prints, for each case of argv[2] (a JSON list of [run-mode flags, v2pqtransport_from_run_mode, the
+# test's node arguments]), the -v2transport and -v2pqtransport arguments, in order, that the functional
+# framework starts a node of the build under test with. The node isn't started: Popen is replaced.
+RUN_MODE_PROBE = r'''
+import json
+import sys
+import tempfile
+import types
+from pathlib import Path
+from unittest import mock
+
+sys.path.insert(0, sys.argv[1])
+from test_framework import test_node
+from test_framework.test_framework import BitcoinTestFramework
+from test_framework.util import get_datadir_path
+
+BINARIES = ("bitcoin_bin", "bitcoind", "bitcoincli", "bitcoinutil", "bitcointx", "bitcoinchainstate", "bitcoinwallet")
+
+
+class RunMode(BitcoinTestFramework):
+    def set_test_params(self):
+        self.num_nodes = 1
+        self.v2pqtransport_from_run_mode = FROM_RUN_MODE
+
+    def get_binary_paths(self):
+        return types.SimpleNamespace(**dict.fromkeys(BINARIES, sys.executable), bitcoin_cmd=None)
+
+    def run_test(self):
+        pass
+
+
+results = []
+for flags, FROM_RUN_MODE, node_args in json.loads(sys.argv[2]):
+    with tempfile.TemporaryDirectory() as tmp:
+        config = Path(tmp) / "config.ini"
+        config.write_text("[environment]\n", encoding="utf8")
+        with mock.patch.object(sys, "argv", ["probe", f"--configfile={config}", f"--tmpdir={tmp}"] + flags):
+            framework = RunMode(str(Path(sys.argv[1]) / "probe.py"))
+        datadir = Path(get_datadir_path(tmp, 0))
+        for directory in ("stdout", "stderr"):
+            (datadir / directory).mkdir(parents=True)
+        framework.add_nodes(1)
+        with mock.patch.object(test_node.subprocess, "Popen") as popen:
+            framework.nodes[0].start(extra_args=list(node_args))
+        argv = popen.call_args.args[0]
+        results.append([arg for arg in argv if arg.startswith(("-v2transport", "-v2pqtransport"))])
+print(json.dumps(results))
+'''
+
+
 def depends_print(host: str, dep_opts: str, *names: str) -> dict[str, str]:
     """Values depends/Makefile computes for host with dep_opts, read with its print- rule (nothing is built)."""
     targets = " ".join(f"print-{name}" for name in names)
@@ -506,6 +556,7 @@ class PQWorkflowContractTest(unittest.TestCase):
             # What Full Validation's pq-unit job passes.
             (PQ, {"jobs": f"{AARCH64_JOB},{MACOS_JOB},{MACOS_X86_64_JOB}"},
              {PQ_UNIT_JOB: [AARCH64_JOB], MACOS_JOB: [], MACOS_X86_64_JOB: []}),
+            # What Full Validation's pq-functional job passes.
             (PQ, {"jobs": PQ_FUNCTIONAL_JOB}, {PQ_FUNCTIONAL_JOB: []}),
             (PQ, {"jobs": ""}, ALL_PQ_JOBS),
             (NIGHTLY, {"run_test_matrix": True, "run_scanners": False, "jobs": "previous-releases"},
@@ -1221,10 +1272,38 @@ class PQWorkflowContractTest(unittest.TestCase):
         self.assertEqual(effective["CI_IMAGE_NAME_TAG"], "docker.io/library/ubuntu:24.04")
 
         # The i686 job of ci.yml keeps covering plain v2: --v2transport without --v2pqtransport, for which
-        # the test framework passes -v2pqtransport=0 explicitly.
+        # the test framework passes -v2pqtransport=0 explicitly (test_run_modes_set_hybrid_transport_explicitly).
         extra = source_env(I686_ENV, ["TEST_RUNNER_EXTRA"])["TEST_RUNNER_EXTRA"].split()
         self.assertIn("--v2transport", extra)
         self.assertNotIn("--v2pqtransport", extra)
+
+    def test_run_modes_set_hybrid_transport_explicitly(self) -> None:
+        """Each run mode of the functional framework keeps its transport whatever the node's -v2pqtransport
+        default, which #222 turns on and its release-cut decision may turn off again: --v2pqtransport
+        (pq-functional) passes -v2pqtransport=1 and plain --v2transport (the i686 job) -v2pqtransport=0.
+        The default mode runs v1, and a test that starts a node with v2 gets the node's default."""
+        cases = [
+            # (run-mode flags, v2pqtransport_from_run_mode, the test's node arguments), expected arguments
+            (([], True, []), ["-v2transport=0"]),
+            (([], True, ["-v2transport=1"]), ["-v2transport=0", "-v2transport=1"]),
+            ((["--v2transport"], True, []), ["-v2transport=1", "-v2pqtransport=0"]),
+            ((["--v2pqtransport"], True, []), ["-v2transport=1", "-v2pqtransport=1"]),
+            # The test's own arguments come later and win.
+            ((["--v2pqtransport"], True, ["-v2pqtransport=0"]), ["-v2transport=1", "-v2pqtransport=1", "-v2pqtransport=0"]),
+            # A node the test starts without v2 gets no -v2pqtransport, which would warn.
+            ((["--v2pqtransport"], True, ["-v2transport=0"]), ["-v2transport=1", "-v2transport=0"]),
+            ((["--v2pqtransport", "--v1transport"], True, []), ["-v2transport=0"]),
+            # Tests of the option itself opt out of the run mode's setting.
+            ((["--v2pqtransport"], False, []), ["-v2transport=1"]),
+            ((["--v2transport"], False, []), ["-v2transport=1"]),
+        ]
+        completed = subprocess.run([sys.executable, "-I", "-c", RUN_MODE_PROBE, str(REPO_ROOT / "test" / "functional"),
+                                    json.dumps([case for case, _ in cases])],
+                                   cwd=REPO_ROOT, text=True, capture_output=True, check=False)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        for (case, expected), actual in zip(cases, json.loads(completed.stdout), strict=True):
+            with self.subTest(case=case):
+                self.assertEqual(actual, expected)
 
     def test_contexts_are_available_where_used(self) -> None:
         """Mirror actionlint's context-availability rule for the places these workflows use expressions.

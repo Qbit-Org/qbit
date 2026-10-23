@@ -8,21 +8,24 @@ protects traffic recorded today from decryption by a future quantum computer.
 It needs no extra round trip, and costs 3,184 bytes and one ML-KEM key
 generation, encapsulation and decapsulation per connection.
 
-It is off by default in this release. To switch it on, set
-<!--pq:opt-->`-v2pqtransport=1` (or `v2pqtransport=1` in `qbit.conf`) and
-restart; to switch it off again, set `-v2pqtransport=0` or remove the setting
-and restart. It has no effect with `-v2transport=0`. The value must be a
-number: `v2pqtransport=true` is read as 0, and qbit warns at startup and says
-how it read such a value. If native ML-KEM-1024 code misbehaves on a CPU, the
-hidden option <!--pq:opt-->`-mlkemportable` selects portable code.
+It is on by default in this release, so upgrading switches it on. To switch
+it off, set <!--pq:opt-->`-v2pqtransport=0` (or `v2pqtransport=0` in
+`qbit.conf`) and restart; to switch it back on, remove the setting or set
+`-v2pqtransport=1`, and restart. It has no effect with `-v2transport=0`. The
+value must be a number: `v2pqtransport=true` is read as 0, which switches it
+off, and qbit warns at startup and says how it read such a value. If native
+ML-KEM-1024 code misbehaves on a CPU, the hidden option
+<!--pq:opt-->`-mlkemportable` selects portable code.
 
 It does not authenticate peers, or protect against spy peers or an active
 man-in-the-middle, and it does nothing for traffic with v1.0.0 nodes or any
 peer without it, nor for transaction-origin privacy. Hybrid sessions can be
 recognized by their packet sizes; where that matters, use Tor or I2P. Peers
 without it, including v1.0.0 nodes, keep connecting as before. Nothing it
-records persists across a restart, but v1.0.0 refuses to start with
-`-v2pqtransport` on its command line, so remove it there before downgrading.
+records persists across a restart. To upgrade with it off, add
+`v2pqtransport=0` to `qbit.conf` first: v1.0.0 ignores the line there. v1.0.0
+refuses to start with `-v2pqtransport` in any form on its command line, so
+don't add it there before upgrading, and remove it before downgrading.
 
 The new <!--pq:rpc-->`getpqtransportinfo` RPC reports the configuration,
 handshake outcomes, load shedding and the fallback set. `getpeerinfo` gains

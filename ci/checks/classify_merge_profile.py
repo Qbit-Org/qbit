@@ -108,6 +108,36 @@ PQ_UNIT_PREFIXES = (
     "src/crypto/mlkem",
     "src/mlkem-native/",
 )
+# Changes that can break hybrid post-quantum v2 transport must also pass the
+# whole functional suite with it, the pq-functional job of ci-pq.yml (the
+# pq-functional job of ci.yml): every change that needs the PQ unit jobs, and
+# these, which those jobs neither build nor run. Only that job runs the suite
+# hybrid; the other functional jobs run v1 between nodes, and the i686 job
+# plain v2.
+PQ_FUNCTIONAL_FILES = frozenset(
+    {
+        # The job's own setup: --v2pqtransport and its build.
+        "ci/test/00_setup_env_native_pq_functional.sh",
+        # Turns -v2transport and -v2pqtransport into the node's hybrid
+        # setting, its startup warnings and line, and the connection
+        # manager's options.
+        "src/init.cpp",
+        # The hybrid fields of getpeerinfo, getnetworkinfo and
+        # getpqtransportinfo that the suite reads.
+        "src/rpc/net.cpp",
+        # Its checks of those fields for hybrid peers run only in the hybrid
+        # suite (options.v2pqtransport).
+        "test/functional/rpc_net.py",
+    }
+)
+PQ_FUNCTIONAL_PREFIXES = (
+    # The tests of v2 transport, whose nodes take hybrid transport from the run
+    # mode, and whose expectations depend on it.
+    "test/functional/p2p_v2_",
+    # The run modes, which give each node its transport options, and the
+    # Python peers (BIP324 and hybrid) that the nodes talk to.
+    "test/functional/test_framework/",
+)
 
 
 @dataclass(frozen=True)
@@ -163,6 +193,12 @@ class Classification:
         """Whether the PQ unit jobs must pass. A path that cannot be read requires them."""
         return bool(self.invalid_paths) or any(is_pq_unit_path(path) for path in self.paths)
 
+    @property
+    def pq_functional_required(self) -> bool:
+        """Whether the hybrid functional suite must pass: whenever the PQ unit jobs must, and for the hybrid
+        transport paths those jobs do not cover."""
+        return self.pq_unit_required or any(is_pq_functional_path(path) for path in self.paths)
+
 
 def normalize_path(path: str) -> str | None:
     path = path.strip()
@@ -207,6 +243,10 @@ def is_github_metadata_path(path: str) -> bool:
 
 def is_pq_unit_path(path: str) -> bool:
     return path in PQ_UNIT_FILES or path.startswith(PQ_UNIT_PREFIXES)
+
+
+def is_pq_functional_path(path: str) -> bool:
+    return path in PQ_FUNCTIONAL_FILES or path.startswith(PQ_FUNCTIONAL_PREFIXES)
 
 
 def classify_paths(paths: list[str] | tuple[str, ...]) -> Classification:
@@ -286,6 +326,7 @@ def github_outputs(classification: Classification) -> dict[str, str]:
         "touched_public_docs": bool_output(bool(classification.public_docs_paths)),
         "touched_github_metadata": bool_output(bool(classification.github_metadata_paths)),
         "pq_unit_required": bool_output(classification.pq_unit_required),
+        "pq_functional_required": bool_output(classification.pq_functional_required),
     }
 
 
@@ -300,6 +341,7 @@ def describe_classification(classification: Classification) -> str:
         f"validation_profile={classification.profile}",
         f"changed_count={len(classification.paths)}",
         f"pq_unit_required={bool_output(classification.pq_unit_required)}",
+        f"pq_functional_required={bool_output(classification.pq_functional_required)}",
     ]
 
     if classification.release_policy_paths:

@@ -5,9 +5,10 @@
 """Test the hybrid post-quantum v2 transport's operator surface (#184 part 6).
 
 Options and startup line:
-- test_configuration: -v2pqtransport on the command line, in qbit.conf, negated and
-  across restarts, observed on a live connection between two nodes; the warnings for a
-  contradictory or non-numeric setting, or a double negative; -help; the three startup lines.
+- test_configuration: the default (on), and -v2pqtransport on the command line, in qbit.conf,
+  negated and across restarts, observed on a live connection between two nodes; the warnings
+  for a contradictory or non-numeric setting, or a double negative, and that the default and an
+  explicit 0 never warn; -help; the three startup lines.
 - test_portable_options: -mlkemportable and -test=mlkem_portable make the startup line
   report portable code, and a non-numeric -mlkemportable or a double negative warns;
   -test=pq_low_shed_threshold sets the load shedding threshold to 5; the test options are
@@ -15,9 +16,9 @@ Options and startup line:
   with -test=mock_steady_clock.)
 
 RPC (getpqtransportinfo, and the getpeerinfo and getnetworkinfo fields):
-- test_states: every getpqtransportinfo field with the switch off, with v2 off, on, and
-  with an endpoint in the fallback set; instance_id changes on restart; each
-  transport_pq_status.
+- test_states: every getpqtransportinfo field, the startup line and transport_pq_status on
+  both sides of a connection, for each -v2transport (0, 1) and -v2pqtransport (default, 0, 1),
+  and with an endpoint in the fallback set; instance_id changes on restart.
 - test_counts: exact per-direction counts of hybrid, legacy and failing connections.
   -test=pq_fail_first_packet on one node makes hybrid handshakes fail in both directions.
 - test_abandoned: an initiator that reads the offer and closes, or stalls until the
@@ -64,12 +65,16 @@ STARTUP_LINE = re.compile(
 ENABLED = "enabled"
 DISABLED_PQ = "disabled (-v2pqtransport=0)"
 DISABLED_V2 = "disabled (-v2transport=0)"
+# The startup line's state for each getpqtransportinfo status.
+STARTUP_STATE = {"enabled": ENABLED, "disabled_v2pqtransport": DISABLED_PQ, "disabled_v2transport": DISABLED_V2}
 CONTRADICTION_WARNING = ("Warning: -v2pqtransport=1 has no effect because -v2transport=0. "
                          "Set -v2transport=1 to use hybrid post-quantum v2 transport.")
 TEST_OPTION_ERROR = "Error: -test=<option> can only be used with regtest"
 
-# Node arguments: v2 without and with the hybrid key exchange, and with failing confirmations.
-NO_PQ = ["-v2transport=1"]
+# Node arguments: v2 with the hybrid key exchange's default (on), with it switched off and on
+# explicitly, and with failing confirmations.
+DEFAULT = ["-v2transport=1"]
+NO_PQ = ["-v2transport=1", "-v2pqtransport=0"]
 PQ = ["-v2transport=1", "-v2pqtransport=1"]
 PQ_FAIL = PQ + ["-test=pq_fail_first_packet"]
 
@@ -196,8 +201,8 @@ class PQTransportTest(BitcoinTestFramework):
         self.num_nodes = 3
         self.setup_clean_chain = True
         # Whatever the suite's transport flag, these nodes use v2, and -v2pqtransport is only what each
-        # test passes: this test checks the option's own defaults and settings.
-        self.extra_args = [NO_PQ] * self.num_nodes
+        # test passes: this test checks the option's own defaults and settings. Node 2 has the switch off.
+        self.extra_args = [DEFAULT, DEFAULT, NO_PQ]
         self.v2pqtransport_from_run_mode = False
 
     def setup_network(self):
@@ -271,36 +276,48 @@ class PQTransportTest(BitcoinTestFramework):
     def test_configuration(self):
         node0, node1, _ = self.nodes
 
-        self.log.info("Test the switch is off by default")
-        assert_equal(self.startup_line(node0)[0], DISABLED_PQ)
-        assert_equal(self.startup_line(node1)[0], DISABLED_PQ)
-        self.check_connection(hybrid=False)
+        self.log.info("Test the switch is on by default")
+        assert_equal(self.startup_line(node0)[0], ENABLED)
+        assert_equal(self.startup_line(node1)[0], ENABLED)
+        self.check_connection(hybrid=True)
 
-        self.log.info("Test -v2pqtransport=1 on one side only keeps the ECDH keys")
+        self.log.info("Test -v2pqtransport=0 on one side only keeps the ECDH keys")
         with node0.assert_debug_log(["v2 pq: legacy_peer reason=no_features role=initiator"]):
-            self.restart_node(0, extra_args=PQ)
-            assert_equal(self.startup_line(node0)[0], ENABLED)
+            self.restart_node(1, extra_args=NO_PQ)
+            assert_equal(self.startup_line(node1)[0], DISABLED_PQ)
             self.check_connection(hybrid=False)
 
-        self.log.info("Test v2pqtransport=1 in qbit.conf, with the command line's on the other side")
-        append_config(node1.datadir_path, ["v2pqtransport=1"])
+        self.log.info("Test v2pqtransport=0 in qbit.conf switches it off, with the default on the other side")
+        append_config(node1.datadir_path, ["v2pqtransport=0"])
+        with node0.assert_debug_log(["v2 pq: legacy_peer reason=no_features role=initiator"]):
+            self.restart_node(1)
+            assert_equal(self.startup_line(node1)[0], DISABLED_PQ)
+            self.check_connection(hybrid=False)
+
+        self.log.info("Test -v2pqtransport=1 overrides qbit.conf")
+        self.restart_node(1, extra_args=PQ)
+        assert_equal(self.startup_line(node1)[0], ENABLED)
+        self.check_connection(hybrid=True)
+
+        self.log.info("Test a restart without it switches back off, and without qbit.conf's line back on")
+        self.restart_node(1)
+        assert_equal(self.startup_line(node1)[0], DISABLED_PQ)
+        self.check_connection(hybrid=False)
+        node1.replace_in_config([("v2pqtransport=0\n", "")])
         self.restart_node(1)
         assert_equal(self.startup_line(node1)[0], ENABLED)
         self.check_connection(hybrid=True)
 
-        self.log.info("Test -nov2pqtransport overrides qbit.conf")
+        self.log.info("Test v2pqtransport=1 in qbit.conf, and -nov2pqtransport on the command line overrides it")
+        append_config(node1.datadir_path, ["v2pqtransport=1"])
+        self.restart_node(1)
+        assert_equal(self.startup_line(node1)[0], ENABLED)
         with node0.assert_debug_log(["v2 pq: legacy_peer reason=no_features role=initiator"]):
             self.restart_node(1, extra_args=["-v2transport=1", "-nov2pqtransport"])
             assert_equal(self.startup_line(node1)[0], DISABLED_PQ)
             self.check_connection(hybrid=False)
-
-        self.log.info("Test a restart without it switches back on")
-        self.restart_node(1)
-        assert_equal(self.startup_line(node1)[0], ENABLED)
-        self.check_connection(hybrid=True)
         node1.replace_in_config([("v2pqtransport=1\n", "")])
         self.restart_node(1)
-        assert_equal(self.startup_line(node1)[0], DISABLED_PQ)
 
         self.log.info("Test an explicit -v2pqtransport=1 with -v2transport=0 warns, and has no effect")
         self.stop_node(0)
@@ -308,15 +325,26 @@ class PQTransportTest(BitcoinTestFramework):
         # An empty value means 1.
         self.check_start(["-v2transport=0", "-v2pqtransport"], DISABLED_V2, expected_stderr=CONTRADICTION_WARNING)
 
-        self.log.info("Test an explicit -v2pqtransport=0, or -v2transport=0 alone, doesn't warn")
+        # In qbit.conf too.
+        append_config(node0.datadir_path, ["v2pqtransport=1"])
+        self.check_start(["-v2transport=0"], DISABLED_V2, expected_stderr=CONTRADICTION_WARNING)
+        node0.replace_in_config([("v2pqtransport=1\n", "")])
+
+        self.log.info("Test an explicit -v2pqtransport=0, or -v2transport=0 alone with the default on, doesn't warn")
         self.check_start(["-v2transport=0", "-v2pqtransport=0"], DISABLED_V2)
         self.check_start(["-v2transport=0", "-nov2pqtransport"], DISABLED_V2)
         self.check_start(["-v2transport=0"], DISABLED_V2)
+        append_config(node0.datadir_path, ["v2pqtransport=0"])
+        self.check_start(["-v2transport=0"], DISABLED_V2)
+        node0.replace_in_config([("v2pqtransport=0\n", "")])
 
         self.log.info("Test a non-numeric -v2pqtransport warns with the value given, what it was read as, and the effect")
+        # Read as 0, these switch the default off.
         for value in ["true", "yes", "on"]:
             self.check_start(["-v2transport=1", f"-v2pqtransport={value}"], DISABLED_PQ,
                              expected_stderr=non_numeric_warning(value, 0, PQ_OFF))
+        # Read as 0 with v2 off: not an explicit request, so the contradiction doesn't warn.
+        self.check_start(["-v2transport=0", "-v2pqtransport=true"], DISABLED_V2, expected_stderr=non_numeric_warning("true", 0, PQ_OFF))
         self.check_start(["-v2transport=1", "-v2pqtransport=1abc"], ENABLED, expected_stderr=non_numeric_warning("1abc", 1, PQ_ON))
         # Out of range: read as 1, the saturated value.
         self.check_start(["-v2transport=1", "-v2pqtransport=99999999999"], ENABLED,
@@ -331,8 +359,9 @@ class PQTransportTest(BitcoinTestFramework):
         self.log.info("Test a double negative, which switches the hybrid transport on, warns")
         for value in ["0", "true", "on"]:
             self.check_start(["-v2transport=1", f"-nov2pqtransport={value}"], ENABLED, expected_stderr=double_negative_warning(PQ_ON))
-        self.check_start(["-v2transport=0", "-nov2pqtransport=true"], DISABLED_V2,
-                         expected_stderr=double_negative_warning(PQ_OFF) + os.linesep + CONTRADICTION_WARNING)
+        for value in ["0", "true"]:
+            self.check_start(["-v2transport=0", f"-nov2pqtransport={value}"], DISABLED_V2,
+                             expected_stderr=double_negative_warning(PQ_OFF) + os.linesep + CONTRADICTION_WARNING)
         append_config(node0.datadir_path, ["nov2pqtransport=true"])
         self.check_start(["-v2transport=1"], ENABLED, expected_stderr=double_negative_warning(PQ_ON))
         node0.replace_in_config([("nov2pqtransport=true\n", "")])
@@ -359,14 +388,14 @@ class PQTransportTest(BitcoinTestFramework):
 
         self.log.info("Test -mlkemportable and -test=mlkem_portable select portable code")
         for option in ["-mlkemportable", "-test=mlkem_portable"]:
-            self.restart_node(0, extra_args=["-v2transport=1", option])
+            self.restart_node(0, extra_args=DEFAULT + [option])
             assert_equal(self.startup_line(node0)[1:], ("portable", "portable"))
             info = node0.getpqtransportinfo()
             assert_equal((info["arith_backend"], info["keccak_backend"]), ("portable", "portable"))
         self.stop_node(0)
 
         self.log.info("Test a default node runs native code where this build and CPU have it")
-        default = self.check_start(["-v2transport=1"], DISABLED_PQ)[1:]
+        default = self.check_start(DEFAULT, ENABLED)[1:]
         expected = expected_default_backends(self.config)
         if expected is None:
             self.log.info("This test can't tell which code runs here by default; not checked")
@@ -375,17 +404,17 @@ class PQTransportTest(BitcoinTestFramework):
 
         self.log.info("Test a non-numeric -mlkemportable, or a double negative, warns and states which code runs")
         # -mlkemportable=true is read as 0: the default code stays.
-        assert_equal(self.check_start(["-v2transport=1", "-mlkemportable=true"], DISABLED_PQ,
+        assert_equal(self.check_start(DEFAULT + ["-mlkemportable=true"], ENABLED,
                                       expected_stderr=non_numeric_warning("true", 0, NATIVE, "mlkemportable"))[1:], default)
-        assert_equal(self.check_start(["-v2transport=1", "-mlkemportable=1abc"], DISABLED_PQ,
+        assert_equal(self.check_start(DEFAULT + ["-mlkemportable=1abc"], ENABLED,
                                       expected_stderr=non_numeric_warning("1abc", 1, PORTABLE, "mlkemportable"))[1:], ("portable", "portable"))
         for value in ["0", "true"]:
-            assert_equal(self.check_start(["-v2transport=1", f"-nomlkemportable={value}"], DISABLED_PQ,
+            assert_equal(self.check_start(DEFAULT + [f"-nomlkemportable={value}"], ENABLED,
                                           expected_stderr=double_negative_warning(PORTABLE, "mlkemportable"))[1:], ("portable", "portable"))
         for option in ["-nomlkemportable", "-nomlkemportable=1", "-mlkemportable=0"]:
-            assert_equal(self.check_start(["-v2transport=1", option], DISABLED_PQ)[1:], default)
+            assert_equal(self.check_start(DEFAULT + [option], ENABLED)[1:], default)
         # The test option forces portable code, whatever -mlkemportable is read as; the effect says so.
-        assert_equal(self.check_start(["-v2transport=1", "-mlkemportable=true", "-test=mlkem_portable"], DISABLED_PQ,
+        assert_equal(self.check_start(DEFAULT + ["-mlkemportable=true", "-test=mlkem_portable"], ENABLED,
                                       expected_stderr=non_numeric_warning("true", 0, PORTABLE, "mlkemportable"))[1:], ("portable", "portable"))
         self.start_node(0)
 
@@ -407,21 +436,23 @@ class PQTransportTest(BitcoinTestFramework):
         node0.chain = "signet"
         for option in ["-test=mlkem_portable", "-test=pq_fail_first_packet", "-test=pq_low_shed_threshold", "-test=mock_steady_clock"]:
             node0.assert_start_raises_init_error(extra_args=[option], expected_msg=TEST_OPTION_ERROR)
-        self.start_node(0, extra_args=["-v2transport=1", "-mlkemportable"])
-        assert_equal(self.startup_line(node0), (DISABLED_PQ, "portable", "portable"))
+        self.start_node(0, extra_args=DEFAULT + ["-mlkemportable"])
+        assert_equal(self.startup_line(node0), (ENABLED, "portable", "portable"))
         self.stop_node(0)
         conf_file.write_text(regtest_conf, encoding="utf-8")
         node0.chain = "regtest"
         self.start_node(0)
 
     def check_info(self, node, *, start_time, enabled, status, **expected):
-        """Check every getpqtransportinfo field: the configuration, the backends the startup line
-        named, since, and the given fields (none counted, empty and inactive unless given)."""
+        """Check every getpqtransportinfo field: the configuration, which the startup line states
+        too, the backends it named, since, and the given fields (none counted, empty and inactive
+        unless given)."""
         info = node.getpqtransportinfo()
         assert re.fullmatch("[0-9a-f]{64}", info.pop("instance_id"))
         since = info.pop("since")
         assert start_time <= since <= time.time() + 1
-        _, arith, keccak = self.startup_line(node)
+        state, arith, keccak = self.startup_line(node)
+        assert_equal(state, STARTUP_STATE[status])
         assert_equal(info, {
             "enabled": enabled,
             "status": status,
@@ -451,36 +482,34 @@ class PQTransportTest(BitcoinTestFramework):
     def test_states(self):
         node0, node1, node2 = self.nodes
 
-        self.log.info("Test getpqtransportinfo with the switch off; getpeerinfo off on both sides")
-        start_time = int(time.time())
-        self.restart_node(0, extra_args=NO_PQ)
-        self.check_info(node0, start_time=start_time, enabled=False, status="disabled_v2pqtransport")
-        instance_ids = [node0.getpqtransportinfo()["instance_id"]]
-        self.check_peers(0, 2, "off", "off")
-
-        self.log.info("Test getpqtransportinfo with v2 off and the switch off: status names v2")
-        start_time = int(time.time())
-        self.restart_node(0, extra_args=["-v2transport=0"])
-        self.check_info(node0, start_time=start_time, enabled=False, status="disabled_v2transport")
-        instance_ids.append(node0.getpqtransportinfo()["instance_id"])
-
-        self.log.info("Test getpqtransportinfo with v2 off; getpeerinfo v1 on both sides")
-        start_time = int(time.time())
-        self.restart_node(0, extra_args=["-v2transport=0", "-v2pqtransport=1"])
-        self.check_info(node0, start_time=start_time, enabled=False, status="disabled_v2transport")
-        instance_ids.append(node0.getpqtransportinfo()["instance_id"])
-        self.check_peers(0, 2, "v1", "v1", peer_advertises_v2=False)
-        self.stop_node(0, expected_stderr=CONTRADICTION_WARNING)
-
-        self.log.info("Test getpqtransportinfo with the switch on; getpeerinfo hybrid, legacy_peer and off")
-        start_time = int(time.time())
-        self.start_node(0, extra_args=PQ)
+        # Node 1 has the switch on and node 2 off. For each of node 0's -v2transport and -v2pqtransport
+        # settings (none for the default), the getpqtransportinfo status, which the startup line must
+        # state too, and transport_pq_status on both sides of a connection from node 0 to node 1, one
+        # from node 1 to node 0, and one from node 0 to node 2.
         self.restart_node(1, extra_args=PQ)
-        self.check_info(node0, start_time=start_time, enabled=True, status="enabled")
-        instance_ids.append(node0.getpqtransportinfo()["instance_id"])
-        self.check_peers(0, 1, "hybrid", "hybrid")
-        self.check_peers(0, 2, "legacy_peer", "off")
-        self.check_peers(2, 0, "off", "legacy_peer")
+        self.stop_node(0)
+        instance_ids = []
+        on, off, legacy, v1 = "hybrid", "off", "legacy_peer", "v1"
+        for args, status, to_on, from_on, to_off in [
+            (DEFAULT, "enabled", (on, on), (on, on), (legacy, off)),
+            (PQ, "enabled", (on, on), (on, on), (legacy, off)),
+            (NO_PQ, "disabled_v2pqtransport", (off, legacy), (legacy, off), (off, off)),
+            (["-v2transport=0"], "disabled_v2transport", (v1, v1), (v1, v1), (v1, v1)),
+            (["-v2transport=0", "-v2pqtransport=0"], "disabled_v2transport", (v1, v1), (v1, v1), (v1, v1)),
+            (["-v2transport=0", "-v2pqtransport=1"], "disabled_v2transport", (v1, v1), (v1, v1), (v1, v1)),
+        ]:
+            self.log.info(f"Test getpqtransportinfo, the startup line and getpeerinfo agree with {' '.join(args)}: {status}")
+            start_time = int(time.time())
+            self.start_node(0, extra_args=args)
+            self.check_info(node0, start_time=start_time, enabled=status == "enabled", status=status)
+            instance_ids.append(node0.getpqtransportinfo()["instance_id"])
+            v2 = status != "disabled_v2transport"
+            self.check_peers(0, 1, *to_on)
+            self.check_peers(1, 0, *from_on, peer_advertises_v2=v2)
+            self.check_peers(0, 2, *to_off)
+            # Only the explicit request warns.
+            self.stop_node(0, expected_stderr=CONTRADICTION_WARNING if "-v2pqtransport=1" in args and not v2 else "")
+        self.start_node(0, extra_args=PQ)
 
         self.log.info("Test instance_id changes on restart")
         assert_equal(len(set(instance_ids)), len(instance_ids))

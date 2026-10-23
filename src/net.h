@@ -102,8 +102,8 @@ static const size_t DEFAULT_MAXRECEIVEBUFFER = 5 * 1000;
 static const size_t DEFAULT_MAXSENDBUFFER    = 1 * 1000;
 
 static constexpr bool DEFAULT_V2_TRANSPORT{true};
-/** -v2pqtransport default: off until the default-on change of #184 part 9. */
-static constexpr bool DEFAULT_V2_PQ_TRANSPORT{false};
+/** -v2pqtransport default: on. It has no effect without -v2transport, and -v2pqtransport=0 switches it off. */
+static constexpr bool DEFAULT_V2_PQ_TRANSPORT{true};
 
 typedef int64_t NodeId;
 

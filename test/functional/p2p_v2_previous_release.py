@@ -23,6 +23,11 @@ change lands:
   stalled handshake at -peertimeout.
 - test_netinfo: this release's qbit-cli -netinfo against v1.0.0, whose getpeerinfo
   has no transport_pq, shows a v2 peer as 2, without errors.
+- test_mixed_versions: this build, with hybrid transport on by default, and v1.0.0
+  connect in both directions, over v2 as legacy_peer with the same plain BIP324
+  session id on both sides, and over v1.
+- test_rollback_settings: v1.0.0 ignores v2pqtransport=0 or =1 in qbit.conf, so it
+  can be set before an upgrade, and refuses every form of it on its command line.
 
 The peer is a BIP324 implementation on a plain socket, so the test decides
 every byte it sends and when.
@@ -52,6 +57,7 @@ from test_framework.test_framework import BitcoinTestFramework, SkipTest
 from test_framework.test_node import TestNodeCLI, release_info
 from test_framework.util import (
     MAX_NODES,
+    append_config,
     assert_equal,
     assert_greater_than_or_equal,
     p2p_port,
@@ -242,9 +248,11 @@ def our_version_message():
 
 class P2PV2PreviousReleaseTest(BitcoinTestFramework):
     def set_test_params(self):
-        self.num_nodes = 1
+        self.num_nodes = 2
         self.setup_clean_chain = True
-        self.extra_args = [["-v2transport=1", f"-peertimeout={DEFAULT_PEER_TIMEOUT}"]]
+        # Node 0 is v1.0.0. Node 1 is this build with hybrid transport's default, whatever the run mode.
+        self.extra_args = [["-v2transport=1", f"-peertimeout={DEFAULT_PEER_TIMEOUT}"], ["-v2transport=1"]]
+        self.v2pqtransport_from_run_mode = False
 
     def skip_test_if_missing_module(self):
         self.skip_if_no_previous_releases()
@@ -254,8 +262,9 @@ class P2PV2PreviousReleaseTest(BitcoinTestFramework):
         if any(shutil.which(argv[0]) is None for argv in (binaries.node_argv(), binaries.rpc_argv())):
             raise SkipTest(f"the qbit {release.tag} release is not downloaded")
 
-    def setup_nodes(self):
-        self.add_nodes(self.num_nodes, self.extra_args, versions=[V1_0_0])
+    def setup_network(self):
+        # Connections are made by the tests.
+        self.add_nodes(self.num_nodes, self.extra_args, versions=[V1_0_0, None])
         self.start_nodes()
 
     def run_test(self):
@@ -268,6 +277,8 @@ class P2PV2PreviousReleaseTest(BitcoinTestFramework):
         self.test_limits()
         if self.is_cli_compiled():
             self.test_netinfo()
+        self.test_mixed_versions()
+        self.test_rollback_settings()
 
     def open_peers(self, roles):
         """Open one raw v2 connection per role: "responder" means v1.0.0 responds (we
@@ -362,6 +373,47 @@ class P2PV2PreviousReleaseTest(BitcoinTestFramework):
         assert_equal([row[v_end - 2:v_end] for row in rows], [" 2"])
         peer.close()
         self.wait_until(lambda: not self.node.getpeerinfo())
+
+    def test_mixed_versions(self):
+        old, new = self.nodes
+        assert_equal(new.getpqtransportinfo()["status"], "enabled")
+        before = new.getpqtransportinfo()["handshakes"]
+        for v2, transport in [(True, "v2"), (False, "v1")]:
+            for a, b in [(1, 0), (0, 1)]:
+                self.log.info(f"This build, with hybrid transport on by default, and v1.0.0 connect over {transport}, "
+                              f"{'this build' if a == 1 else 'v1.0.0'} initiating")
+                self.connect_nodes(a, b, peer_advertises_v2=v2)
+                new_peer, = new.getpeerinfo()
+                old_peer, = old.getpeerinfo()
+                assert_equal((new_peer["transport_protocol_type"], new_peer["transport_pq"], new_peer["transport_pq_status"]),
+                             (transport, False, "legacy_peer" if v2 else "v1"))
+                assert_equal(old_peer["transport_protocol_type"], transport)
+                assert "transport_pq" not in old_peer
+                # The ECDH keys: both sides agree on the plain BIP324 session id.
+                assert_equal(new_peer["session_id"], old_peer["session_id"])
+                self.disconnect_nodes(a, b)
+        handshakes = new.getpqtransportinfo()["handshakes"]
+        for direction in ("inbound", "outbound"):
+            assert_equal(handshakes[direction]["legacy_peer"], before[direction]["legacy_peer"] + 1)
+            assert_equal(handshakes[direction]["switched"], before[direction]["switched"])
+
+    def test_rollback_settings(self):
+        old = self.nodes[0]
+        self.log.info("v1.0.0 ignores v2pqtransport in qbit.conf, so it can be set there before an upgrade")
+        self.stop_node(0)
+        for line in ["v2pqtransport=0", "v2pqtransport=1"]:
+            append_config(old.datadir_path, [line])
+            # qbit.conf's lines are in its [regtest] section.
+            with old.assert_debug_log(["Ignoring unknown configuration value regtest.v2pqtransport"]):
+                self.start_node(0)
+            self.stop_node(0)
+            old.replace_in_config([(f"{line}\n", "")])
+
+        self.log.info("v1.0.0 refuses to start with any form of -v2pqtransport on its command line")
+        for option in ["-v2pqtransport=0", "-nov2pqtransport", "-v2pqtransport=1"]:
+            old.assert_start_raises_init_error(extra_args=[option],
+                                               expected_msg=f"Error: Error parsing command line arguments: Invalid parameter {option}")
+        self.start_node(0)
 
     def test_limits(self):
         for role in ("responder", "initiator"):

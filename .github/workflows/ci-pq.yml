@@ -11,8 +11,8 @@
 #   example gh workflow run ci-maintained-pq.yml -f source_ref=<branch> -f jobs=aarch64-unit.
 #   That caller lands on main after this part merges;
 # - Full Validation (ci.yml) calls it with aarch64-unit, macos-arm64-unit and
-#   macos-x86_64-unit for every change that ci/checks/classify_merge_profile.py
-#   says needs them.
+#   macos-x86_64-unit, and in a second call with pq-functional, for every change
+#   that ci/checks/classify_merge_profile.py says needs them.
 # The workflow_dispatch trigger below stays for when this file is on main itself;
 # until then GitHub rejects gh workflow run ci-pq.yml.
 # Jobs: aarch64-unit, s390x-unit (big-endian, emulated), macos-arm64-unit,
@@ -552,8 +552,10 @@ jobs:
 
   # The whole functional suite with hybrid post-quantum v2 transport between all
   # nodes (--v2pqtransport, #184 part 7), so the feature can't quietly break
-  # unrelated behavior. It shares unit's source checks; the test runner's result
-  # is the job's.
+  # unrelated behavior. The mode passes -v2pqtransport=1 explicitly: with the
+  # default on, this is still the only whole-suite hybrid run, since the default
+  # mode runs v1 between nodes and the i686 job of ci.yml plain v2. It shares
+  # unit's source checks; the test runner's result is the job's.
   pq-functional:
     name: Functional tests with hybrid transport
     needs: resolve-source
