@@ -24,10 +24,14 @@ tests run the real pieces of that chain:
   says it is not required, and fails on a missing classifier output;
 * a pull request's changed files reach each job's if and the gate's env
   through classify-changes' outputs;
-* the changed-file lists that feed the classifier name both sides of a rename;
+* Full Validation, the Required Merge Gate and Core Checks list the changed
+  files for the classifier with the same git commands, and every list of
+  changed files in those workflows names both sides of a rename;
 * every CMake file, workflow or ci/ file that mentions ML-KEM classifies as
   requiring the jobs, so new wiring cannot be missed silently, and every path
-  the classifier names exists.
+  the classifier names exists;
+* every document that a source check reads classifies as source, so that a
+  change to it alone runs the check.
 
 GitHub itself is not called.
 """
@@ -52,6 +56,7 @@ REPO_ROOT = svc.REPO_ROOT
 CI_WORKFLOW = svc.WORKFLOW_DIR / "ci.yml"
 PQ_WORKFLOW = svc.WORKFLOW_DIR / "ci-pq.yml"
 GATE_WORKFLOW = svc.WORKFLOW_DIR / "required-merge-gate.yml"
+CORE_CHECKS_WORKFLOW = svc.WORKFLOW_DIR / "core-checks.yml"
 CLASSIFIER = REPO_ROOT / "ci" / "checks" / "classify_merge_profile.py"
 CLASSIFY_JOB = "classify-changes"
 CLASSIFY_STEP_ID = "classify"
@@ -71,6 +76,45 @@ FUNCTIONAL_OUTPUT = "pq_functional_required"
 MERGE_SHA = "1234567890abcdef1234567890abcdef12345678"
 HEAD_SHA = "fedcba0987654321fedcba0987654321fedcba09"
 CHANGED_FILES_STEP = "Write changed file list"
+# The workflows whose classify-changes job lists the changed files for the classifier. The Required Merge
+# Gate trusts Core Checks Gate and Full Validation Gate for the checks only they run, so all three must list
+# the same files: Core Checks seeing only the new side of a rename into public docs would skip all its jobs.
+CHANGED_FILES_WORKFLOWS = (CI_WORKFLOW, GATE_WORKFLOW, CORE_CHECKS_WORKFLOW)
+# Core Checks' release validator tests list the changed files again, for release paths.
+RELEASE_TESTS_JOB = "release-validator-tests"
+RELEASE_CHANGES_STEP = "Detect release file changes"
+# Every list of changed files in those workflows known today, by workflow and (job, step): the classify-changes
+# jobs, the Required Merge Gate's jobs that confirm a lightweight profile, and the release-file detector.
+KNOWN_FILE_LISTS = {
+    CI_WORKFLOW: [(CLASSIFY_JOB, CHANGED_FILES_STEP)],
+    GATE_WORKFLOW: [(job_id, CHANGED_FILES_STEP) for job_id in (
+        CLASSIFY_JOB, "release-policy-validation", "rpc-docs-validation", "public-docs-validation",
+        "github-metadata-validation")],
+    CORE_CHECKS_WORKFLOW: [(CLASSIFY_JOB, CHANGED_FILES_STEP), (RELEASE_TESTS_JOB, RELEASE_CHANGES_STEP)],
+}
+# A git command, and the options that make it list files. git diff, log and show detect renames unless given
+# --no-renames; the plumbing commands only when asked to.
+GIT_COMMAND_RE = re.compile(r"\bgit\s+(diff(?:-tree|-index|-files)?|log|show|whatchanged)\b[^\n]*")
+FILE_LIST_OPTIONS = {"--name-only", "--name-status"}
+RENAME_DETECTING_COMMANDS = {"diff", "log", "show", "whatchanged"}
+RENAME_OPTIONS = ("-M", "-C", "--find-renames", "--find-copies")
+# Renames that a changed-file list without --no-renames reduces to their new path, and what the classifier
+# reports for both sides: out of the PQ unit jobs' paths, and out of source and release policy into public
+# docs, whose profile alone runs no Core Checks job.
+RENAMES = [
+    ("src/crypto/mlkem.cpp", "src/crypto/kem/kyber.cpp", {OUTPUT: "true", FUNCTIONAL_OUTPUT: "true"}),
+    ("src/foo.cpp", "doc/user/foo.cpp", {"profile": "source", "source_validation_required": "true"}),
+    ("ci/release/mainnet_ci_posture.json", "doc/reference/mainnet_ci_posture.json",
+     {"profile": "source", "source_validation_required": "true"}),
+]
+# Markers that a source check reads from a document, with the check and a document known to have them. A
+# document with one must classify as source, so that a change to it alone runs the check.
+CHECKED_DOC_MARKERS = {
+    # In the lint job.
+    "<!-- pq-transport-vectors: ": ("contrib/devtools/generate-pq-transport-vectors.py", "doc/design/pq-transport.md"),
+    # In the functional tests of the CI matrix.
+    "<!-- quickstart: ": ("test/functional/feature_pq_quickstart.py", "doc/user/network/pq-transport.md"),
+}
 # Files that can wire ML-KEM into the build or CI: CMake files, workflows and
 # composite actions, and everything under ci/.
 WIRING_PATH_RE = re.compile(r"(^|/)CMakeLists[.]txt$|[.]cmake([.]in)?$|^cmake/|^[.]github/(workflows|actions)/|^ci/")
@@ -143,6 +187,70 @@ def pull_request_context(outputs: dict[str, str], *, draft: bool = False) -> dic
         },
         "needs": {CLASSIFY_JOB: {"outputs": outputs, "result": "success"}},
     }
+
+
+def changed_files_steps() -> dict[tuple[str, str], dict[str, Any]]:
+    """Every step that writes a changed-file list for the classifier, by workflow and job."""
+    return {(workflow_path.name, job_id): step
+            for workflow_path in CHANGED_FILES_WORKFLOWS
+            for job_id, job in svc.load_workflow(workflow_path)["jobs"].items()
+            for step in job.get("steps", []) if step.get("name") == CHANGED_FILES_STEP}
+
+
+def release_changes_step() -> dict[str, Any]:
+    return svc.find_step(svc.load_workflow(CORE_CHECKS_WORKFLOW)["jobs"][RELEASE_TESTS_JOB], RELEASE_CHANGES_STEP)
+
+
+def file_lists(workflow_path: Path) -> dict[tuple[str, str], list[str]]:
+    """The git commands that list files in each step of a workflow, by (job, step), with spaces normalized."""
+    lists = {}
+    for job_id, job in svc.load_workflow(workflow_path)["jobs"].items():
+        for step in job.get("steps", []):
+            script = step.get("run", "").replace("\\\n", " ")
+            commands = [" ".join(match.group(0).split()) for match in GIT_COMMAND_RE.finditer(script)]
+            commands = [command for command in commands if FILE_LIST_OPTIONS & set(command.split())]
+            if commands:
+                lists[(job_id, step.get("name", ""))] = commands
+    return lists
+
+
+def rename_repo(tmp: str, old: str, new: str) -> tuple[Path, dict[str, str], str]:
+    """A repository, its own origin, whose main branch has old and whose HEAD renames and edits it to new.
+    Returns the repository, an environment to run git in, and main's commit."""
+    repo = Path(tmp) / "repo"
+    repo.mkdir()
+    env = {"PATH": os.environ["PATH"], "HOME": tmp, "GIT_CONFIG_NOSYSTEM": "1",
+           "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+
+    def git(*args: str) -> str:
+        return subprocess.run(["git", "-c", "commit.gpgsign=false", *args], cwd=repo, env=env, text=True,
+                              capture_output=True, check=True).stdout.strip()
+
+    git("init", "-q", "-b", "main")
+    (repo / old).parent.mkdir(parents=True, exist_ok=True)
+    (repo / old).write_text("".join(f"line {i}\n" for i in range(50)), encoding="utf8")
+    git("add", "-A")
+    git("commit", "-q", "-m", "base")
+    base = git("rev-parse", "HEAD")
+    git("remote", "add", "origin", str(repo))
+    git("checkout", "-q", "-b", "topic")
+    (repo / new).parent.mkdir(parents=True, exist_ok=True)
+    git("mv", old, new)
+    with open(repo / new, "a", encoding="utf8") as handle:
+        handle.write("edited\n")
+    git("commit", "-q", "-am", "rename")
+    assert git("diff", "--name-only", f"{base}...HEAD") == new, "git detects the rename"
+    return repo, env, base
+
+
+def run_step(step: dict[str, Any], repo: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    """Run a step in repo as GitHub runs a bash step, with each variable of its env set, empty unless given."""
+    with tempfile.TemporaryDirectory() as tmp:
+        script = Path(tmp) / "step.sh"
+        script.write_text(step["run"], encoding="utf8")
+        return subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", str(script)], cwd=repo,
+                              env={**{key: "" for key in step.get("env", {})}, **env},
+                              text=True, capture_output=True, check=False)
 
 
 class PQMergeGateContractTest(unittest.TestCase):
@@ -235,47 +343,79 @@ class PQMergeGateContractTest(unittest.TestCase):
         commands = "\n".join(step.get("run", "") for step in gate["jobs"][CLASSIFY_JOB]["steps"])
         self.assertIn(f"ci/checks/{Path(__file__).name}", commands)
 
+    def test_changed_file_lists_use_the_same_git_commands(self) -> None:
+        """Each workflow classifies the change from its own list of the changed files; listed differently, they
+        could pick different profiles, and the Required Merge Gate would trust a gate that skipped its checks."""
+        reference = file_lists(CI_WORKFLOW)[(CLASSIFY_JOB, CHANGED_FILES_STEP)]
+        for workflow_path in CHANGED_FILES_WORKFLOWS:
+            with self.subTest(workflow=workflow_path.name):
+                self.assertEqual(file_lists(workflow_path)[(CLASSIFY_JOB, CHANGED_FILES_STEP)], reference)
+
+    def test_every_changed_file_list_turns_rename_detection_off(self) -> None:
+        """Every git command in these workflows that lists files names both sides of a rename, so that a new list
+        cannot reintroduce the gap."""
+        for workflow_path, known in KNOWN_FILE_LISTS.items():
+            lists = file_lists(workflow_path)
+            with self.subTest(workflow=workflow_path.name):
+                # The scan proves nothing unless it finds the lists known today.
+                self.assertLessEqual(set(known), set(lists))
+            for (job_id, step_name), commands in lists.items():
+                for command in commands:
+                    with self.subTest(workflow=workflow_path.name, job=job_id, step=step_name, command=command):
+                        options = command.split()
+                        if options[1] in RENAME_DETECTING_COMMANDS:
+                            self.assertIn("--no-renames", options)
+                        self.assertFalse(any(option.startswith(RENAME_OPTIONS) for option in options))
+
     def test_changed_files_name_both_sides_of_a_rename(self) -> None:
-        """A rename out of a gated path must still require the job: git diff lists only the new path by default."""
-        with tempfile.TemporaryDirectory() as tmp:
-            repo = Path(tmp) / "repo"
-            repo.mkdir()
-            git_env = {"PATH": os.environ["PATH"], "HOME": tmp, "GIT_CONFIG_NOSYSTEM": "1",
-                       "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        """A rename out of a gated path must still require its checks: git diff lists only the new path by default."""
+        steps = changed_files_steps()
+        self.assertLessEqual({(workflow_path.name, job_id) for workflow_path, known in KNOWN_FILE_LISTS.items()
+                              for job_id, step_name in known if step_name == CHANGED_FILES_STEP}, set(steps))
+        for old, new, expected in RENAMES:
+            with tempfile.TemporaryDirectory() as tmp:
+                repo, git_env, base = rename_repo(tmp, old, new)
+                events = {
+                    "pull_request": {"EVENT_NAME": "pull_request", "BASE_SHA": base},
+                    "merge_group": {"EVENT_NAME": "merge_group", "BASE_REF": "refs/heads/main"},
+                    "push": {"EVENT_NAME": "push", "BEFORE_SHA": base},
+                    "push of a new branch": {"EVENT_NAME": "push", "BEFORE_SHA": "0" * 40, "DEFAULT_BRANCH": "main"},
+                    "other": {"EVENT_NAME": "schedule"},
+                }
+                for (workflow, job_id), step in steps.items():
+                    for event, event_env in events.items():
+                        with self.subTest(rename=old, workflow=workflow, job=job_id, event=event):
+                            output = Path(tmp) / "github-output"
+                            output.write_text("", encoding="utf8")
+                            completed = run_step(step, repo, dict(git_env, **event_env, RUNNER_TEMP=tmp, GITHUB_OUTPUT=str(output)))
+                            self.assertEqual(completed.returncode, 0, completed.stderr)
+                            changed = Path(svc.parse_key_values(output.read_text(encoding="utf8"))["changed_files"])
+                            self.assertEqual(sorted(changed.read_text(encoding="utf8").split()), sorted([old, new]))
+            with self.subTest(rename=old):
+                outputs = classify([old, new])
+                self.assertEqual({key: outputs[key] for key in expected}, expected)
 
-            def git(*args: str) -> str:
-                return subprocess.run(["git", "-c", "commit.gpgsign=false", *args], cwd=repo, env=git_env, text=True,
-                                      capture_output=True, check=True).stdout.strip()
-
-            git("init", "-q")
-            (repo / "src" / "crypto").mkdir(parents=True)
-            (repo / "src" / "crypto" / "mlkem.cpp").write_text("".join(f"line {i}\n" for i in range(50)), encoding="utf8")
-            git("add", "-A")
-            git("commit", "-q", "-m", "base")
-            base = git("rev-parse", "HEAD")
-            (repo / "src" / "crypto" / "kem").mkdir()
-            git("mv", "src/crypto/mlkem.cpp", "src/crypto/kem/kyber.cpp")
-            with open(repo / "src" / "crypto" / "kem" / "kyber.cpp", "a", encoding="utf8") as handle:
-                handle.write("edited\n")
-            git("commit", "-q", "-am", "rename")
-            self.assertEqual(git("diff", "--name-only", f"{base}...HEAD"), "src/crypto/kem/kyber.cpp", "git detects the rename")
-
-            for workflow_path in (CI_WORKFLOW, GATE_WORKFLOW):
-                with self.subTest(workflow=workflow_path.name):
-                    step = svc.find_step(svc.load_workflow(workflow_path)["jobs"][CLASSIFY_JOB], CHANGED_FILES_STEP)
-                    output = Path(tmp) / "github-output"
-                    output.write_text("", encoding="utf8")
-                    env = dict(git_env, EVENT_NAME="pull_request", BASE_SHA=base, RUNNER_TEMP=tmp, GITHUB_OUTPUT=str(output))
-                    script = Path(tmp) / "step.sh"
-                    script.write_text(step["run"], encoding="utf8")
-                    completed = subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", str(script)],
-                                               cwd=repo, env=env, text=True, capture_output=True, check=False)
-                    self.assertEqual(completed.returncode, 0, completed.stderr)
-                    changed = Path(svc.parse_key_values(output.read_text(encoding="utf8"))["changed_files"])
-                    paths = changed.read_text(encoding="utf8").split()
-                    self.assertEqual(sorted(paths), ["src/crypto/kem/kyber.cpp", "src/crypto/mlkem.cpp"])
-                    self.assertEqual(classify(paths)[OUTPUT], "true")
-                    self.assertEqual(classify(paths)[FUNCTIONAL_OUTPUT], "true")
+    def test_release_file_detection_names_both_sides_of_a_rename(self) -> None:
+        """Core Checks' release validator tests run for a change that moves a release file away, and only then."""
+        for old, new, changed in (("ci/release/mainnet_ci_posture.json", "doc/reference/mainnet_ci_posture.json", "true"),
+                                  ("src/foo.cpp", "doc/user/foo.cpp", "false")):
+            with tempfile.TemporaryDirectory() as tmp:
+                repo, git_env, base = rename_repo(tmp, old, new)
+                events = {
+                    "pull_request": {"EVENT_NAME": "pull_request", "RELEASE_BASE_REF": "main"},
+                    "merge_group": {"EVENT_NAME": "merge_group", "RELEASE_BASE_REF": "refs/heads/main"},
+                    "push": {"EVENT_NAME": "push", "EVENT_BEFORE": base},
+                    "push of a new branch": {"EVENT_NAME": "push", "EVENT_BEFORE": "0" * 40},
+                }
+                for event, event_env in events.items():
+                    with self.subTest(rename=old, event=event):
+                        output = Path(tmp) / "github-output"
+                        output.write_text("", encoding="utf8")
+                        completed = run_step(release_changes_step(), repo, dict(git_env, **event_env, GITHUB_OUTPUT=str(output)))
+                        self.assertEqual(completed.returncode, 0, completed.stderr)
+                        # From the list itself, not the fallback for a range that cannot be diffed.
+                        self.assertNotIn("Could not", completed.stdout)
+                        self.assertEqual(svc.parse_key_values(output.read_text(encoding="utf8")), {"changed": changed})
 
     def test_gate_reads_the_jobs_and_the_classifier(self) -> None:
         gate = self.ci["jobs"][GATE_JOB]
@@ -414,12 +554,32 @@ class MlkemWiringContractTest(unittest.TestCase):
             "Fix: add them to PQ_UNIT_FILES in ci/checks/classify_merge_profile.py")
 
 
+class CheckedDocsContractTest(unittest.TestCase):
+    """A change to only a document that a source check reads runs that check."""
+
+    def test_documents_a_source_check_reads_classify_as_source(self) -> None:
+        files = repository_files()
+        for marker, (check, known) in CHECKED_DOC_MARKERS.items():
+            with self.subTest(marker=marker):
+                # The check still reads this marker, and the scan finds the document known to have it.
+                self.assertIn(marker, (REPO_ROOT / check).read_text(encoding="utf8"))
+                docs = [path for path in files if path.endswith(".md") and marker.encode() in (REPO_ROOT / path).read_bytes()]
+                self.assertIn(known, docs)
+                wrong = {path: profile for path in docs if (profile := classify([path])["profile"]) != "source"}
+                self.assertEqual(wrong, {},
+                    f"FAIL: these documents have {marker.strip()}, which {check} checks, but do not classify as source\n"
+                    "Cause: a change to only them would skip the check, and the next source change would fail it\n"
+                    "Fix: add them to CHECKED_DOCS_FILES in ci/checks/classify_merge_profile.py")
+
+
 class PQPathsContractTest(unittest.TestCase):
-    """Every path the classifier names for the PQ jobs exists, so a rename cannot silently stop requiring them."""
+    """Every path the classifier names for the PQ jobs and checked documents exists, so a rename cannot silently stop
+    requiring their checks."""
 
     def test_classifier_paths_exist(self) -> None:
         files = repository_files()
-        for path in sorted(classify_merge_profile.PQ_UNIT_FILES | classify_merge_profile.PQ_FUNCTIONAL_FILES):
+        for path in sorted(classify_merge_profile.PQ_UNIT_FILES | classify_merge_profile.PQ_FUNCTIONAL_FILES
+                           | classify_merge_profile.CHECKED_DOCS_FILES):
             with self.subTest(path=path):
                 self.assertIn(path, files)
         for prefix in classify_merge_profile.PQ_UNIT_PREFIXES + classify_merge_profile.PQ_FUNCTIONAL_PREFIXES:

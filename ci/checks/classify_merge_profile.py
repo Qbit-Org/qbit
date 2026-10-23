@@ -39,6 +39,17 @@ PUBLIC_DOCS_PREFIXES = (
     "doc/reference/",
     "doc/user/",
 )
+# Public docs that source checks read, which classify as source so that a change to only them runs
+# those checks: the vectors the specification quotes, compared by
+# contrib/devtools/generate-pq-transport-vectors.py --check in the lint job, and the operator guide's
+# quick start, run by test/functional/feature_pq_quickstart.py.
+# ci/checks/test_pq_merge_gate_contract.py fails if a document with their markers is missing here.
+CHECKED_DOCS_FILES = frozenset(
+    {
+        "doc/design/pq-transport.md",
+        "doc/user/network/pq-transport.md",
+    }
+)
 GITHUB_METADATA_FILES = frozenset(
     {
         ".github/PULL_REQUEST_TEMPLATE.md",
@@ -230,7 +241,7 @@ def is_rpc_docs_path(path: str) -> bool:
 
 
 def is_public_docs_path(path: str) -> bool:
-    return (
+    return path not in CHECKED_DOCS_FILES and (
         path in PUBLIC_DOCS_ROOT_FILES
         or path.startswith(PUBLIC_DOCS_PREFIXES)
         or PUBLIC_RELEASE_NOTES_RE.fullmatch(path) is not None
