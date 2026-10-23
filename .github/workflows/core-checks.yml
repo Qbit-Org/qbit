@@ -6,6 +6,15 @@ name: Core Checks
 
 on:
   pull_request:
+    # The same activity types as the Required Merge Gate, which waits for
+    # its own event's Core Checks Gate instead of an earlier event's failure.
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+      - labeled
+      - unlabeled
     branches:
       - main
       - 1.0.0
@@ -59,6 +68,10 @@ jobs:
         with:
           fetch-depth: 0
 
+      # The same git commands as in ci.yml and required-merge-gate.yml, so that
+      # all three classify a change alike (ci/checks/test_pq_merge_gate_contract.py).
+      # --no-renames lists both paths of a rename: the old one alone may need
+      # the source checks.
       - name: Write changed file list
         id: changed-files
         env:
@@ -78,7 +91,7 @@ jobs:
               echo "::error::Pull request base SHA is unavailable."
               exit 1
             fi
-            git diff --name-only "${BASE_SHA}...HEAD" > "${changed_files}"
+            git diff --name-only --no-renames "${BASE_SHA}...HEAD" > "${changed_files}"
           elif [[ "${EVENT_NAME}" == "merge_group" ]]; then
             base_branch="${BASE_REF#refs/heads/}"
             if [[ -z "${base_branch}" ]]; then
@@ -86,15 +99,15 @@ jobs:
               exit 1
             fi
             git fetch --no-tags --prune origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"
-            git diff --name-only "origin/${base_branch}...HEAD" > "${changed_files}"
+            git diff --name-only --no-renames "origin/${base_branch}...HEAD" > "${changed_files}"
           elif [[ "${EVENT_NAME}" == "push" ]]; then
             if [[ -n "${BEFORE_SHA}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
-              git diff --name-only "${BEFORE_SHA}..HEAD" > "${changed_files}"
+              git diff --name-only --no-renames "${BEFORE_SHA}..HEAD" > "${changed_files}"
             else
               git fetch --no-tags --prune origin "${DEFAULT_BRANCH}"
               merge_base="$(git merge-base "origin/${DEFAULT_BRANCH}" HEAD 2>/dev/null || true)"
               if [[ -n "${merge_base}" ]]; then
-                git diff --name-only "${merge_base}...HEAD" > "${changed_files}"
+                git diff --name-only --no-renames "${merge_base}...HEAD" > "${changed_files}"
               else
                 git diff-tree --no-commit-id --name-only -r HEAD > "${changed_files}"
               fi
@@ -155,6 +168,38 @@ jobs:
 
       - name: Test integrated libbitcoinpqc build policy
         run: python3 ci/checks/test_libbitcoinpqc_build_policy.py
+
+      # Every compiler and tool the build-policy test uses, each listed as
+      # required so that none of its cases can skip: the AArch64 cross compiler
+      # proves that AArch64 ELF builds refuse native ML-KEM (no BTI landing
+      # pads), MinGW and Clang cover the Windows and Clang builds, and cc -m32
+      # an x86 target without a backend. The AArch64 C++ cross compiler, its nm
+      # and qemu-aarch64 run the AArch64 backend's portable-override check: a
+      # static test binary under emulation. gcc-aarch64-linux-gnu only
+      # recommends its libc headers, so they are installed explicitly. For -m32,
+      # libc6-dev-i386 provides the 32-bit headers: gcc-multilib conflicts with
+      # the AArch64 cross compiler on Ubuntu 24.04. clang-21 comes from
+      # apt.llvm.org, as in ci/test/01_base_install.sh.
+      - name: Test integrated mlkem-native build policy
+        env:
+          MLKEM_POLICY_REQUIRED_COMPILERS: >-
+            cc cc-m32 clang-21 aarch64-linux-gnu-gcc aarch64-linux-gnu-g++ aarch64-linux-gnu-nm qemu-aarch64
+            x86_64-w64-mingw32-gcc-posix
+          APT_LLVM_V: 21
+        run: |
+          sudo install -d -m 0755 /etc/apt/keyrings
+          curl --fail --silent --show-error --location --retry 5 https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/keyrings/apt.llvm.org.asc > /dev/null
+          codename="$(. /etc/os-release && echo "${VERSION_CODENAME}")"
+          echo "deb [signed-by=/etc/apt/keyrings/apt.llvm.org.asc] http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-${APT_LLVM_V} main" \
+            | sudo tee "/etc/apt/sources.list.d/llvm-toolchain-${codename}-${APT_LLVM_V}.list" > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user \
+            gcc-mingw-w64-x86-64-posix \
+            libc6-dev-i386 \
+            "clang-${APT_LLVM_V}" "llvm-${APT_LLVM_V}"
+          python3 ci/checks/test_mlkem_build_policy.py -v
 
       - name: Test IBD timeout wiring
         run: python3 ci/checks/test_ibd_timeout_wiring.py
@@ -405,6 +450,7 @@ jobs:
         with:
           fetch-depth: 0
 
+      # --no-renames, so that moving a release file away still runs the tests.
       - name: Detect release file changes
         id: release_changes
         env:
@@ -420,11 +466,11 @@ jobs:
               git fetch --no-tags --prune origin main
               merge_base="$(git merge-base origin/main HEAD 2>/dev/null || true)"
               if [[ -n "${merge_base}" ]]; then
-                git diff --name-only "${merge_base}" HEAD > "${changed_files}"
+                git diff --name-only --no-renames "${merge_base}" HEAD > "${changed_files}"
               else
                 git diff-tree --no-commit-id --name-only -r HEAD > "${changed_files}"
               fi
-            elif ! git diff --name-only "${before}" HEAD > "${changed_files}"; then
+            elif ! git diff --name-only --no-renames "${before}" HEAD > "${changed_files}"; then
               echo "Could not diff push range; running release validator tests."
               echo "changed=true" >> "$GITHUB_OUTPUT"
               exit 0
@@ -439,7 +485,7 @@ jobs:
             fi
 
             git fetch --no-tags --prune origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"
-            if ! git diff --name-only "origin/${base_branch}...HEAD" > "${changed_files}"; then
+            if ! git diff --name-only --no-renames "origin/${base_branch}...HEAD" > "${changed_files}"; then
               echo "Could not diff against origin/${base_branch}; running release validator tests."
               echo "changed=true" >> "$GITHUB_OUTPUT"
               exit 0

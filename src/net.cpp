@@ -15,6 +15,7 @@
 #include <common/netif.h>
 #include <compat/compat.h>
 #include <consensus/consensus.h>
+#include <crypto/mlkem.h>
 #include <crypto/sha256.h>
 #include <i2p.h>
 #include <key.h>
@@ -44,6 +45,7 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <tuple>
 #include <unordered_map>
 
 TRACEPOINT_SEMAPHORE(net, closed_connection);
@@ -462,6 +464,8 @@ CNode* CConnman::ConnectNode(CAddress addrConnect, const char *pszDest, bool fCo
     std::unique_ptr<i2p::sam::Session> i2p_transient_session;
 
     for (auto& target_addr: connect_to) {
+        // What the hybrid negotiation is accounted to: the destination, never a proxy.
+        PQEndpointKey pq_endpoint{CService{target_addr}};
         if (target_addr.IsValid()) {
             const bool use_proxy{GetProxy(target_addr.GetNetwork(), proxy)};
             bool proxyConnectionFailed = false;
@@ -512,12 +516,24 @@ CNode* CConnman::ConnectNode(CAddress addrConnect, const char *pszDest, bool fCo
             std::string host;
             uint16_t port{default_port};
             SplitHostPort(std::string(pszDest), port, host);
+            pq_endpoint = MakePQNameEndpoint(host, port);
             bool proxyConnectionFailed;
             sock = ConnectThroughProxy(proxy, host, port, proxyConnectionFailed);
         }
         // Check any other resolved address (if any) if we fail to connect
         if (!sock) {
             continue;
+        }
+
+        // Repeated hybrid failures to this endpoint put it in the fallback set: plain v2, without
+        // parsing or validating the peer's offer. The next attempt, whenever the connection logic
+        // makes one, asks again. A manual connection (addnode, -connect) always negotiates, even
+        // to an endpoint an automatic connection put in the set: an attacker on the path can make
+        // handshakes fail without breaking a key, and pinning a peer keeps its hybrid keys.
+        PQMode pq_mode{m_pq_mode};
+        if (pq_mode == PQMode::NEGOTIATE && use_v2transport && conn_type != ConnectionType::MANUAL &&
+            IsPQFallback(pq_endpoint, Now<NodeSeconds>())) {
+            pq_mode = PQMode::FALLBACK;
         }
 
         NetPermissionFlags permission_flags = NetPermissionFlags::None;
@@ -545,6 +561,8 @@ CNode* CConnman::ConnectNode(CAddress addrConnect, const char *pszDest, bool fCo
                                     .recv_flood_size = nReceiveFloodSize,
                                     .use_v2transport = use_v2transport,
                                     .is_archive_connection = is_archive_connection,
+                                    .pq = {.mode = pq_mode, .corrupt_shared_secret = m_pq_config.fail_first_packet},
+                                    .pq_endpoint = std::move(pq_endpoint),
                                 });
         pnode->AddRef();
 
@@ -557,9 +575,19 @@ CNode* CConnman::ConnectNode(CAddress addrConnect, const char *pszDest, bool fCo
     return nullptr;
 }
 
-void CNode::CloseSocketDisconnect()
+void CNode::RequestDisconnect(NodeCloseCause cause) noexcept
 {
+    Assume(cause != NodeCloseCause::NONE);
+    // Compare-exchange from NONE so the first cause wins, and record it before
+    // setting fDisconnect so a thread that sees fDisconnect also sees the cause.
+    NodeCloseCause expected{NodeCloseCause::NONE};
+    m_close_cause.compare_exchange_strong(expected, cause);
     fDisconnect = true;
+}
+
+void CNode::CloseSocketDisconnect(NodeCloseCause cause)
+{
+    RequestDisconnect(cause);
     LOCK(m_sock_mutex);
     if (m_sock) {
         LogDebug(BCLog::NET, "Resetting socket for peer=%d%s", GetId(), LogIP(fLogIPs));
@@ -649,6 +677,8 @@ void CNode::CopyStats(CNodeStats& stats)
         Transport::Info info = m_transport->GetInfo();
         stats.m_transport_type = info.transport_type;
         if (info.session_id) stats.m_session_id = HexStr(*info.session_id);
+        stats.m_transport_pq = info.transport_pq;
+        stats.m_transport_pq_status = info.transport_pq_status;
     }
     X(m_permission_flags);
 
@@ -729,7 +759,7 @@ V1Transport::V1Transport(const NodeId node_id) noexcept
 
 Transport::Info V1Transport::GetInfo() const noexcept
 {
-    return {.transport_type = TransportProtocolType::V1, .session_id = {}};
+    return {.transport_type = TransportProtocolType::V1, .session_id = {}, .transport_pq = false, .transport_pq_status = PQStatus::V1};
 }
 
 int V1Transport::readHeader(std::span<const uint8_t> msg_bytes)
@@ -1000,10 +1030,13 @@ void V2Transport::StartSendingHandshake() noexcept
     // We cannot wipe m_send_garbage as it will still be used as AAD later in the handshake.
 }
 
-V2Transport::V2Transport(NodeId nodeid, bool initiating, const CKey& key, std::span<const std::byte> ent32, std::vector<uint8_t> garbage) noexcept
+V2Transport::V2Transport(NodeId nodeid, bool initiating, const CKey& key, std::span<const std::byte> ent32,
+                         std::vector<uint8_t> garbage, V2PQOptions pq, PQRandomSource random, const PQKemOps& ops) noexcept
     : m_cipher{key, ent32}, m_initiating{initiating}, m_nodeid{nodeid},
       m_v1_fallback{nodeid},
+      m_pq_options{EffectivePQOptions(initiating, pq)},
       m_recv_state{initiating ? RecvState::KEY : RecvState::KEY_MAYBE_V1},
+      m_pq{initiating, m_pq_options.mode, random, ops},
       m_send_garbage{std::move(garbage)},
       m_send_state{initiating ? SendState::AWAITING_KEY : SendState::MAYBE_V1}
 {
@@ -1015,9 +1048,20 @@ V2Transport::V2Transport(NodeId nodeid, bool initiating, const CKey& key, std::s
     }
 }
 
-V2Transport::V2Transport(NodeId nodeid, bool initiating) noexcept
+V2PQOptions V2Transport::EffectivePQOptions(bool initiating, V2PQOptions pq) noexcept
+{
+    // Inbound connections never fall back (#184): a responder in fallback mode is a caller bug.
+    if (!Assume(initiating || pq.mode != PQMode::FALLBACK)) pq.mode = PQMode::OFF;
+    return pq;
+}
+
+V2Transport::V2Transport(NodeId nodeid, bool initiating, const CKey& key, std::span<const std::byte> ent32, std::vector<uint8_t> garbage) noexcept
+    : V2Transport{nodeid, initiating, key, ent32, std::move(garbage), V2PQOptions{}, DefaultPQRandomSource(), DefaultPQKemOps()} {}
+
+V2Transport::V2Transport(NodeId nodeid, bool initiating, V2PQOptions pq) noexcept
     : V2Transport{nodeid, initiating, GenerateRandomKey(),
-                  MakeByteSpan(GetRandHash()), GenerateRandomGarbage()} {}
+                  MakeByteSpan(GetRandHash()), GenerateRandomGarbage(),
+                  pq, DefaultPQRandomSource(), DefaultPQKemOps()} {}
 
 void V2Transport::SetReceiveState(RecvState recv_state) noexcept
 {
@@ -1034,6 +1078,9 @@ void V2Transport::SetReceiveState(RecvState recv_state) noexcept
         Assume(recv_state == RecvState::VERSION);
         break;
     case RecvState::VERSION:
+        Assume(recv_state == RecvState::APP || recv_state == RecvState::CONFIRM);
+        break;
+    case RecvState::CONFIRM:
         Assume(recv_state == RecvState::APP);
         break;
     case RecvState::APP:
@@ -1059,6 +1106,9 @@ void V2Transport::SetSendState(SendState send_state) noexcept
         Assume(send_state == SendState::V1 || send_state == SendState::AWAITING_KEY);
         break;
     case SendState::AWAITING_KEY:
+        Assume(send_state == SendState::READY || send_state == SendState::AWAITING_VERSION);
+        break;
+    case SendState::AWAITING_VERSION:
         Assume(send_state == SendState::READY);
         break;
     case SendState::READY:
@@ -1144,17 +1194,17 @@ bool V2Transport::ProcessReceivedKeyBytes() noexcept
         // Other side's key has been fully received, and can now be Diffie-Hellman combined with
         // our key to initialize the encryption ciphers.
 
-        // Initialize the ciphers.
+        // Initialize the ciphers. The hybrid negotiation needs the ECDH secret and the transcript
+        // until the switch decision.
         EllSwiftPubKey ellswift(MakeByteSpan(m_recv_buffer));
+        const bool negotiate{m_pq_options.mode == PQMode::NEGOTIATE};
         LOCK(m_send_mutex);
-        m_cipher.Initialize(ellswift, m_initiating);
+        m_cipher.Initialize(ellswift, m_initiating, /*self_decrypt=*/false,
+                            /*retain_for_hybrid=*/negotiate || m_pq_options.retain_without_negotiation);
 
         // Switch receiver state to GARB_GARBTERM.
         SetReceiveState(RecvState::GARB_GARBTERM);
         m_recv_buffer.clear();
-
-        // Switch sender state to READY.
-        SetSendState(SendState::READY);
 
         // Append the garbage terminator to the send buffer.
         m_send_buffer.resize(m_send_buffer.size() + BIP324Cipher::GARBAGE_TERMINATOR_LEN);
@@ -1162,15 +1212,38 @@ bool V2Transport::ProcessReceivedKeyBytes() noexcept
                   m_cipher.GetSendGarbageTerminator().end(),
                   MakeWritableByteSpan(m_send_buffer).last(BIP324Cipher::GARBAGE_TERMINATOR_LEN).begin());
 
-        // Construct version packet in the send buffer, with the sent garbage data as AAD.
-        m_send_buffer.resize(m_send_buffer.size() + BIP324Cipher::EXPANSION + VERSION_CONTENTS.size());
-        m_cipher.Encrypt(
-            /*contents=*/VERSION_CONTENTS,
-            /*aad=*/MakeByteSpan(m_send_garbage),
-            /*ignore=*/false,
-            /*output=*/MakeWritableByteSpan(m_send_buffer).last(BIP324Cipher::EXPANSION + VERSION_CONTENTS.size()));
-        // We no longer need the garbage.
-        ClearShrink(m_send_garbage);
+        if (!negotiate) {
+            // Switch sender state to READY, and send an empty version packet.
+            SetSendState(SendState::READY);
+            AppendVersionPacket(VERSION_CONTENTS);
+        } else if (m_initiating) {
+            // Hold the version packet until the responder's arrives: it answers their offer.
+            SetSendState(SendState::AWAITING_VERSION);
+        } else if (const PQOfferGate& gate{m_pq_options.offer_gate}; gate.allow && !gate.allow(gate.context)) {
+            // Load shedding: no offer, which is exactly plain v2.
+            m_pq_shed = true;
+            ClearHybridSecrets();
+            SetSendState(SendState::READY);
+            AppendVersionPacket(VERSION_CONTENTS);
+        } else {
+            // Offer an encapsulation key in the version packet, and send nothing else until the
+            // initiator's version packet is processed. The key is generated only now that the
+            // initiator's whole public key has arrived.
+            PQHandshake::Record offer;
+            if (m_pq.MakeOffer(offer) == mlkem::Error::NONE) {
+                // Unreachable failure: the transcript was just started.
+                if (!Assume(m_cipher.AddVersionContents(offer))) return FailCipherState();
+                SetSendState(SendState::AWAITING_VERSION);
+                AppendVersionPacket(offer);
+                m_pq.SetOfferSent();
+            } else {
+                // A local fault: continue without the hybrid negotiation, as plain v2.
+                LogDebug(BCLog::NET, "V2 transport: no hybrid offer after an internal error (keygen), peer=%d\n", m_nodeid);
+                ClearHybridSecrets();
+                SetSendState(SendState::READY);
+                AppendVersionPacket(VERSION_CONTENTS);
+            }
+        }
     } else {
         // We still have to receive more key bytes.
     }
@@ -1193,6 +1266,7 @@ bool V2Transport::ProcessReceivedGarbageBytes() noexcept
             // We've reached the maximum length for garbage + garbage terminator, and the
             // terminator still does not match. Abort.
             LogDebug(BCLog::NET, "V2 transport error: missing garbage terminator, peer=%d\n", m_nodeid);
+            m_pq.SetAbort(PQAbort::GARBAGE_TERMINATOR);
             return false;
         } else {
             // We still need to receive more garbage and/or garbage terminator bytes.
@@ -1207,7 +1281,8 @@ bool V2Transport::ProcessReceivedGarbageBytes() noexcept
 bool V2Transport::ProcessReceivedPacketBytes() noexcept
 {
     AssertLockHeld(m_recv_mutex);
-    Assume(m_recv_state == RecvState::VERSION || m_recv_state == RecvState::APP);
+    AssertLockNotHeld(m_send_mutex);
+    Assume(m_recv_state == RecvState::VERSION || m_recv_state == RecvState::CONFIRM || m_recv_state == RecvState::APP);
 
     // The maximum permitted contents length for a packet, consisting of:
     // - 0x00 byte: indicating long message type encoding
@@ -1220,11 +1295,21 @@ bool V2Transport::ProcessReceivedPacketBytes() noexcept
     if (m_recv_buffer.size() == BIP324Cipher::LENGTH_LEN) {
         // Length descriptor received.
         m_recv_len = m_cipher.DecryptLength(MakeByteSpan(m_recv_buffer));
+        if (m_recv_state == RecvState::CONFIRM && m_recv_len != 0) {
+            // The key confirmation is empty. With mismatched keys the length decrypts to a random
+            // value: fail now instead of waiting for bytes that may never come.
+            m_pq.SetFailure(PQFailure::CONFIRM_LENGTH);
+            LogDebug(BCLog::NET, "V2 transport error: key confirmation failed (length), peer=%d\n", m_nodeid);
+            return false;
+        }
         if (m_recv_len > MAX_CONTENTS_LEN) {
             LogDebug(BCLog::NET, "V2 transport error: packet too large (%u bytes), peer=%d\n", m_recv_len, m_nodeid);
+            if (m_recv_state == RecvState::VERSION) m_pq.SetAbort(PQAbort::VERSION_LENGTH);
             return false;
         }
     } else if (m_recv_buffer.size() > BIP324Cipher::LENGTH_LEN && m_recv_buffer.size() == m_recv_len + BIP324Cipher::EXPANSION) {
+        // The key confirmation is handled before, and never as, an ordinary decoy.
+        if (m_recv_state == RecvState::CONFIRM) return ProcessConfirmation();
         // Ciphertext received, decrypt it into m_recv_decode_buffer.
         // Note that it is impossible to reach this branch without hitting the branch above first,
         // as GetMaxBytesToProcess only allows up to LENGTH_LEN into the buffer before that point.
@@ -1237,6 +1322,7 @@ bool V2Transport::ProcessReceivedPacketBytes() noexcept
             /*contents=*/MakeWritableByteSpan(m_recv_decode_buffer));
         if (!ret) {
             LogDebug(BCLog::NET, "V2 transport error: packet decryption failure (%u bytes), peer=%d\n", m_recv_len, m_nodeid);
+            if (m_recv_state == RecvState::VERSION) m_pq.SetAbort(PQAbort::VERSION_TAG);
             return false;
         }
         // We have decrypted a valid packet with the AAD we expected, so clear the expected AAD.
@@ -1248,11 +1334,14 @@ bool V2Transport::ProcessReceivedPacketBytes() noexcept
         // decoy, which we simply ignore, use the current state to decide what to do with it.
         if (!ignore) {
             switch (m_recv_state) {
-            case RecvState::VERSION:
-                // Version message received; transition to application phase. The contents is
-                // ignored, but can be used for future extensions.
-                SetReceiveState(RecvState::APP);
+            case RecvState::VERSION: {
+                // Version message received; act on its contents (or ignore them), and transition
+                // to the key confirmation or the application phase. The send lock makes a switch
+                // of all ciphers atomic.
+                LOCK(m_send_mutex);
+                if (!ProcessVersionContents(MakeByteSpan(m_recv_decode_buffer))) return false;
                 break;
+            }
             case RecvState::APP:
                 // Application message decrypted correctly. It can be extracted using GetMessage().
                 SetReceiveState(RecvState::APP_READY);
@@ -1271,6 +1360,168 @@ bool V2Transport::ProcessReceivedPacketBytes() noexcept
         // than 3 bytes but less than the packet's full ciphertext. Wait until those arrive.
     }
     return true;
+}
+
+bool V2Transport::ProcessConfirmation() noexcept
+{
+    AssertLockHeld(m_recv_mutex);
+    Assume(m_recv_state == RecvState::CONFIRM);
+    Assume(m_recv_len == 0 && m_recv_buffer.size() == PQ_CONFIRMATION_BYTES);
+    // The peer's first packet under the hybrid keys: an empty decoy, with empty AAD.
+    bool ignore{false};
+    if (!m_cipher.Decrypt(
+            /*input=*/MakeByteSpan(m_recv_buffer).subspan(BIP324Cipher::LENGTH_LEN),
+            /*aad=*/{},
+            /*ignore=*/ignore,
+            /*contents=*/{})) {
+        m_pq.SetFailure(PQFailure::CONFIRM_TAG);
+        LogDebug(BCLog::NET, "V2 transport error: key confirmation failed (tag), peer=%d\n", m_nodeid);
+        return false;
+    }
+    if (!ignore) {
+        m_pq.SetFailure(PQFailure::CONFIRM_NOT_DECOY);
+        LogDebug(BCLog::NET, "V2 transport error: key confirmation failed (not_decoy), peer=%d\n", m_nodeid);
+        return false;
+    }
+    // Feed the last 4 bytes of the Poly1305 authentication tag (and its timing) into our RNG.
+    RandAddEvent(ReadLE32(m_recv_buffer.data() + m_recv_buffer.size() - 4));
+    m_pq.SetConfirmed();
+    ClearShrink(m_recv_buffer);
+    SetReceiveState(RecvState::APP);
+    return true;
+}
+
+bool V2Transport::ProcessVersionContents(std::span<const std::byte> contents) noexcept
+{
+    AssertLockHeld(m_recv_mutex);
+    AssertLockHeld(m_send_mutex);
+    Assume(m_recv_state == RecvState::VERSION);
+    m_pq.SetVersionReceived();
+
+    // Without the negotiation (switch off, fallback, or a responder that could not offer), the
+    // contents are neither parsed nor validated. Nothing is held for a switch past this point,
+    // whichever path declined it (a no-op unless that path kept a secret).
+    if (m_send_state != SendState::AWAITING_VERSION) {
+        ClearHybridSecrets();
+        SetReceiveState(RecvState::APP);
+        return true;
+    }
+    Assume(m_pq_options.mode == PQMode::NEGOTIATE);
+
+    // A legacy peer: empty contents, no own record, or contents that do not parse. Keep the ECDH
+    // keys; an initiator now sends its empty version packet.
+    const auto parsed{PQHandshake::ParseContents(contents)};
+    if (parsed.kind != PQHandshake::ParseKind::OWN_RECORD) {
+        m_pq.SetLegacy(parsed.kind);
+        ClearHybridSecrets();
+        SetSendState(SendState::READY);
+        if (m_initiating) AppendVersionPacket(VERSION_CONTENTS);
+        SetReceiveState(RecvState::APP);
+        return true;
+    }
+
+    // The first own record is the responder's offer or the initiator's accept, and has one length.
+    const auto payload{m_pq.CheckRecordLength(parsed.payload)};
+    if (!payload) {
+        if (m_pq.GetSnapshot().failure == PQFailure::CIPHER_STATE_INTERNAL) return FailCipherState();
+        LogDebug(BCLog::NET, "V2 transport error: malformed hybrid record (%s), peer=%d\n",
+                 m_initiating ? "ek_length" : "ct_length", m_nodeid);
+        ClearHybridSecrets();
+        return false;
+    }
+
+    // Both contents go into the transcript, the responder's first. The unreachable cipher state
+    // failures close, whatever was committed.
+    if (!Assume(m_cipher.AddVersionContents(contents))) return FailCipherState();
+    mlkem::SharedSecret ss;
+    if (m_initiating) {
+        PQHandshake::Record accept;
+        const mlkem::Error result{m_pq.AcceptOffer(*payload, accept, ss)};
+        if (result == mlkem::Error::INVALID_PUBLIC_KEY) {
+            LogDebug(BCLog::NET, "V2 transport error: malformed hybrid record (ek_modulus), peer=%d\n", m_nodeid);
+            ClearHybridSecrets();
+            return false;
+        }
+        if (result != mlkem::Error::NONE) {
+            // A local fault before we committed to anything (AcceptOffer recorded which):
+            // continue as if the switch were off.
+            LogDebug(BCLog::NET, "V2 transport: no hybrid accept after an internal error, peer=%d\n", m_nodeid);
+            ClearHybridSecrets();
+            SetSendState(SendState::READY);
+            AppendVersionPacket(VERSION_CONTENTS);
+            SetReceiveState(RecvState::APP);
+            return true;
+        }
+        if (!Assume(m_cipher.AddVersionContents(accept))) return FailCipherState();
+        if (m_pq_options.corrupt_shared_secret) ss.Bytes()[0] ^= 0xff;
+        // The accept travels under the ECDH keys, then both directions switch.
+        SetSendState(SendState::READY);
+        AppendVersionPacket(accept);
+    } else {
+        // The initiator has committed to the hybrid keys, so every failure from here closes.
+        if (m_pq.DecapsulateAccept(*payload, ss) != mlkem::Error::NONE) {
+            LogDebug(BCLog::NET, "V2 transport error: hybrid key exchange failed (decaps), peer=%d\n", m_nodeid);
+            ClearHybridSecrets();
+            return false;
+        }
+        if (m_pq_options.corrupt_shared_secret) ss.Bytes()[0] ^= 0xff;
+        SetSendState(SendState::READY);
+    }
+
+    // Unreachable failure: both contents are in the transcript.
+    if (!Assume(m_cipher.SwitchToHybrid(std::as_bytes(ss.Bytes())))) return FailCipherState();
+    m_pq.SetSwitched();
+    // Our first packet under the hybrid keys is the key confirmation, and theirs must be too.
+    AppendConfirmationPacket();
+    SetReceiveState(RecvState::CONFIRM);
+    return true;
+}
+
+void V2Transport::AppendVersionPacket(std::span<const std::byte> contents) noexcept
+{
+    AssertLockHeld(m_recv_mutex);
+    AssertLockHeld(m_send_mutex);
+    // Construct version packet in the send buffer, after any unsent bytes, with the sent garbage
+    // data as AAD.
+    m_send_buffer.resize(m_send_buffer.size() + BIP324Cipher::EXPANSION + contents.size());
+    m_cipher.Encrypt(
+        /*contents=*/contents,
+        /*aad=*/MakeByteSpan(m_send_garbage),
+        /*ignore=*/false,
+        /*output=*/MakeWritableByteSpan(m_send_buffer).last(BIP324Cipher::EXPANSION + contents.size()));
+    // We no longer need the garbage.
+    ClearShrink(m_send_garbage);
+}
+
+void V2Transport::AppendConfirmationPacket() noexcept
+{
+    AssertLockHeld(m_recv_mutex);
+    AssertLockHeld(m_send_mutex);
+    static_assert(BIP324Cipher::EXPANSION == PQ_CONFIRMATION_BYTES);
+    m_send_buffer.resize(m_send_buffer.size() + PQ_CONFIRMATION_BYTES);
+    m_cipher.Encrypt(
+        /*contents=*/{},
+        /*aad=*/{},
+        /*ignore=*/true,
+        /*output=*/MakeWritableByteSpan(m_send_buffer).last(PQ_CONFIRMATION_BYTES));
+}
+
+void V2Transport::ClearHybridSecrets() noexcept
+{
+    AssertLockHeld(m_recv_mutex);
+    AssertLockHeld(m_send_mutex);
+    m_pq.ClearSecrets();
+    m_cipher.DiscardHybridSecret();
+}
+
+bool V2Transport::FailCipherState() noexcept
+{
+    AssertLockHeld(m_recv_mutex);
+    AssertLockHeld(m_send_mutex);
+    m_pq.SetFailure(PQFailure::CIPHER_STATE_INTERNAL);
+    LogDebug(BCLog::NET, "V2 transport error: hybrid key exchange failed (cipher_state), peer=%d\n", m_nodeid);
+    ClearHybridSecrets();
+    return false;
 }
 
 size_t V2Transport::GetMaxBytesToProcess() noexcept
@@ -1297,8 +1548,9 @@ size_t V2Transport::GetMaxBytesToProcess() noexcept
         // Process garbage bytes one by one (because terminator may appear anywhere).
         return 1;
     case RecvState::VERSION:
+    case RecvState::CONFIRM:
     case RecvState::APP:
-        // These three states all involve decoding a packet. Process the length descriptor first,
+        // These states all involve decoding a packet. Process the length descriptor first,
         // so that we know where the current packet ends (and we don't process bytes from the next
         // packet or decoy yet). Then, process the ciphertext bytes of the current packet.
         if (m_recv_buffer.size() < BIP324Cipher::LENGTH_LEN) {
@@ -1350,6 +1602,7 @@ bool V2Transport::ReceivedBytes(std::span<const uint8_t>& msg_bytes) noexcept
                 m_recv_buffer.reserve(MAX_GARBAGE_LEN + BIP324Cipher::GARBAGE_TERMINATOR_LEN);
                 break;
             case RecvState::VERSION:
+            case RecvState::CONFIRM:
             case RecvState::APP: {
                 // During states where a packet is being received, as much as is expected but never
                 // more than MAX_RESERVE_AHEAD bytes in addition to what is received so far.
@@ -1389,12 +1642,25 @@ bool V2Transport::ReceivedBytes(std::span<const uint8_t>& msg_bytes) noexcept
             break;
 
         case RecvState::GARB_GARBTERM:
-            if (!ProcessReceivedGarbageBytes()) return false;
+            if (!ProcessReceivedGarbageBytes()) {
+                if (m_pq_options.mode == PQMode::NEGOTIATE) {
+                    LOCK(m_send_mutex);
+                    ClearHybridSecrets();
+                }
+                return false;
+            }
             break;
 
         case RecvState::VERSION:
+        case RecvState::CONFIRM:
         case RecvState::APP:
-            if (!ProcessReceivedPacketBytes()) return false;
+            if (!ProcessReceivedPacketBytes()) {
+                if (m_pq_options.mode == PQMode::NEGOTIATE) {
+                    LOCK(m_send_mutex);
+                    ClearHybridSecrets();
+                }
+                return false;
+            }
             break;
 
         case RecvState::APP_READY:
@@ -1587,16 +1853,87 @@ Transport::Info V2Transport::GetInfo() const noexcept
     Transport::Info info;
 
     // Do not report v2 and session ID until the version packet has been received
-    // and verified (confirming that the other side very likely has the same keys as us).
+    // and verified (confirming that the other side very likely has the same keys as us), and after
+    // a switch to hybrid keys, until the peer's key confirmation has verified.
     if (m_recv_state != RecvState::KEY_MAYBE_V1 && m_recv_state != RecvState::KEY &&
-        m_recv_state != RecvState::GARB_GARBTERM && m_recv_state != RecvState::VERSION) {
+        m_recv_state != RecvState::GARB_GARBTERM && m_recv_state != RecvState::VERSION &&
+        m_recv_state != RecvState::CONFIRM) {
         info.transport_type = TransportProtocolType::V2;
         info.session_id = uint256(MakeUCharSpan(m_cipher.GetSessionID()));
     } else {
         info.transport_type = TransportProtocolType::DETECTING;
     }
+    info.transport_pq = m_pq.GetSnapshot().confirmed;
+    info.transport_pq_status = GetPQStatus();
 
     return info;
+}
+
+PQStatus V2Transport::GetPQStatus() const noexcept
+{
+    AssertLockHeld(m_recv_mutex);
+    switch (m_pq_options.mode) {
+    case PQMode::OFF: return PQStatus::OFF;
+    case PQMode::FALLBACK: return PQStatus::FALLBACK;
+    case PQMode::NEGOTIATE: break;
+    }
+    if (m_pq_shed) return PQStatus::OFF;
+    const PQHandshake::Snapshot snapshot{m_pq.GetSnapshot()};
+    if (snapshot.confirmed) return PQStatus::HYBRID;
+    switch (snapshot.failure) {
+    case PQFailure::NONE:
+        // The peer's version packet had no usable offer or accept: the ECDH keys stay.
+        if (snapshot.version_received && !snapshot.switched) return PQStatus::LEGACY_PEER;
+        return PQStatus::PENDING;
+    case PQFailure::KEYGEN_INTERNAL:
+    case PQFailure::CHECK_EK_INTERNAL:
+    case PQFailure::ENCAPS_INTERNAL:
+        // A local fault before anything was committed: the connection continues as plain v2.
+        return PQStatus::OFF;
+    case PQFailure::EK_LENGTH:
+    case PQFailure::EK_MODULUS:
+    case PQFailure::CT_LENGTH:
+    case PQFailure::CONFIRM_LENGTH:
+    case PQFailure::CONFIRM_TAG:
+    case PQFailure::CONFIRM_NOT_DECOY:
+    case PQFailure::DECAPS_INTERNAL:
+    case PQFailure::CIPHER_STATE_INTERNAL:
+        // The connection closes. There is no failed status, so it reports pending until it is
+        // removed, local faults included.
+        return PQStatus::PENDING;
+    }
+    Assume(false);
+    return PQStatus::PENDING;
+}
+
+PQHandshake::Snapshot V2Transport::GetPQSnapshot() const noexcept
+{
+    AssertLockNotHeld(m_recv_mutex);
+    LOCK(m_recv_mutex);
+    return m_pq.GetSnapshot();
+}
+
+bool V2Transport::HoldsHybridSecretsForTesting() const noexcept
+{
+    AssertLockNotHeld(m_recv_mutex);
+    LOCK(m_recv_mutex);
+    return m_pq.HasDecapsulationKey() || m_cipher.HoldsHybridSecret();
+}
+
+void V2Transport::DiscardHybridSecretForTesting() noexcept
+{
+    AssertLockNotHeld(m_recv_mutex);
+    AssertLockNotHeld(m_send_mutex);
+    LOCK2(m_recv_mutex, m_send_mutex);
+    m_cipher.DiscardHybridSecret();
+}
+
+void V2Transport::ClearPQSecrets() noexcept
+{
+    AssertLockNotHeld(m_recv_mutex);
+    AssertLockNotHeld(m_send_mutex);
+    LOCK2(m_recv_mutex, m_send_mutex);
+    ClearHybridSecrets();
 }
 
 std::pair<size_t, bool> CConnman::SocketSendData(CNode& node) const
@@ -1662,7 +1999,7 @@ std::pair<size_t, bool> CConnman::SocketSendData(CNode& node) const
                 int nErr = WSAGetLastError();
                 if (nErr != WSAEWOULDBLOCK && nErr != WSAEMSGSIZE && nErr != WSAEINTR && nErr != WSAEINPROGRESS) {
                     LogDebug(BCLog::NET, "socket send error, %s: %s\n", node.DisconnectMsg(fLogIPs), NetworkErrorString(nErr));
-                    node.CloseSocketDisconnect();
+                    node.CloseSocketDisconnect(NodeCloseCause::SEND_ERROR);
                 }
             }
             break;
@@ -1728,7 +2065,7 @@ bool CConnman::AttemptToEvictConnection()
                 pnode->ConnectionTypeAsString().c_str(),
                 pnode->ConnectedThroughNetwork(),
                 Ticks<std::chrono::seconds>(pnode->m_connected));
-            pnode->fDisconnect = true;
+            pnode->RequestDisconnect();
             return true;
         }
     }
@@ -1848,6 +2185,11 @@ void CConnman::CreateNodeFromAcceptedSocket(std::unique_ptr<Sock>&& sock,
                                  .prefer_evict = discouraged,
                                  .recv_flood_size = nReceiveFloodSize,
                                  .use_v2transport = use_v2transport,
+                                 .pq = {.mode = m_pq_mode,
+                                        .corrupt_shared_secret = m_pq_config.fail_first_packet,
+                                        .offer_gate = {.allow = &CConnman::AllowPQOffer, .context = this}},
+                                 // The actual remote address and source port.
+                                 .pq_endpoint = addr,
                              });
     pnode->AddRef();
     m_msgproc->InitializeNode(*pnode, local_services);
@@ -1904,6 +2246,569 @@ bool CConnman::AddConnection(const std::string& address, ConnectionType conn_typ
     return true;
 }
 
+PQNameEndpoint MakePQNameEndpoint(std::string_view hostname, uint16_t port)
+{
+    // DNS names are case-insensitive, and "example.com." is the fully qualified "example.com".
+    if (hostname.ends_with('.')) hostname.remove_suffix(1);
+    return {.hostname = ToLower(hostname), .port = port};
+}
+
+std::string_view PQOutcomeString(PQOutcome outcome) noexcept
+{
+    switch (outcome) {
+    case PQOutcome::SWITCHED: return "switched";
+    case PQOutcome::CONFIRMED: return "confirmed";
+    case PQOutcome::LEGACY_PEER: return "legacy_peer";
+    case PQOutcome::MALFORMED_RECORD: return "malformed_record";
+    case PQOutcome::FIRST_PACKET_FAILED: return "first_packet_failed";
+    case PQOutcome::ABANDONED: return "abandoned";
+    case PQOutcome::CLOSED_AFTER_SWITCH: return "closed_after_switch";
+    case PQOutcome::FALLBACK: return "fallback";
+    case PQOutcome::INTERNAL_ERROR: return "internal_error";
+    } // no default case, so the compiler can warn about missing cases
+    assert(false);
+}
+
+std::string_view PQStatusString(PQStatus status) noexcept
+{
+    switch (status) {
+    case PQStatus::V1: return "v1";
+    case PQStatus::OFF: return "off";
+    case PQStatus::PENDING: return "pending";
+    case PQStatus::HYBRID: return "hybrid";
+    case PQStatus::LEGACY_PEER: return "legacy_peer";
+    case PQStatus::FALLBACK: return "fallback";
+    } // no default case, so the compiler can warn about missing cases
+    assert(false);
+}
+
+namespace {
+/** The index of a direction in the hybrid negotiation counters and failure rings. */
+size_t PQDirection(bool inbound) { return inbound ? 0 : 1; }
+
+/** The outcome a negotiation failure counts as. */
+PQOutcome PQFailureOutcome(PQFailure failure) noexcept
+{
+    switch (failure) {
+    case PQFailure::EK_LENGTH:
+    case PQFailure::EK_MODULUS:
+    case PQFailure::CT_LENGTH:
+        return PQOutcome::MALFORMED_RECORD;
+    case PQFailure::CONFIRM_LENGTH:
+    case PQFailure::CONFIRM_TAG:
+    case PQFailure::CONFIRM_NOT_DECOY:
+        return PQOutcome::FIRST_PACKET_FAILED;
+    case PQFailure::KEYGEN_INTERNAL:
+    case PQFailure::CHECK_EK_INTERNAL:
+    case PQFailure::ENCAPS_INTERNAL:
+    case PQFailure::DECAPS_INTERNAL:
+    case PQFailure::CIPHER_STATE_INTERNAL:
+        return PQOutcome::INTERNAL_ERROR;
+    case PQFailure::NONE:
+        break;
+    } // no default case, so the compiler can warn about missing cases
+    assert(false);
+}
+
+/** The reason word of a negotiation failure. */
+std::string_view PQFailureReason(PQFailure failure) noexcept
+{
+    switch (failure) {
+    case PQFailure::EK_LENGTH: return "ek_length";
+    case PQFailure::EK_MODULUS: return "ek_modulus";
+    case PQFailure::CT_LENGTH: return "ct_length";
+    case PQFailure::CONFIRM_LENGTH: return "length";
+    case PQFailure::CONFIRM_TAG: return "tag";
+    case PQFailure::CONFIRM_NOT_DECOY: return "not_decoy";
+    case PQFailure::KEYGEN_INTERNAL: return "keygen";
+    case PQFailure::CHECK_EK_INTERNAL: return "check_public_key";
+    case PQFailure::ENCAPS_INTERNAL: return "encaps";
+    case PQFailure::DECAPS_INTERNAL: return "decaps";
+    case PQFailure::CIPHER_STATE_INTERNAL: return "cipher_state";
+    case PQFailure::NONE: break;
+    } // no default case, so the compiler can warn about missing cases
+    assert(false);
+}
+
+/** Whether this node's own code can cause a negotiation failure: its key check rejecting the
+ *  peer's key, keys that don't match (the confirmation's length or tag), or an internal error. A
+ *  record of the wrong length, and a confirmation that verified under the hybrid keys but isn't a
+ *  decoy, are the peer's alone. */
+bool PQFailureMayBeLocal(PQFailure failure) noexcept
+{
+    switch (failure) {
+    case PQFailure::EK_MODULUS:
+    case PQFailure::CONFIRM_LENGTH:
+    case PQFailure::CONFIRM_TAG:
+    case PQFailure::KEYGEN_INTERNAL:
+    case PQFailure::CHECK_EK_INTERNAL:
+    case PQFailure::ENCAPS_INTERNAL:
+    case PQFailure::DECAPS_INTERNAL:
+    case PQFailure::CIPHER_STATE_INTERNAL:
+        return true;
+    case PQFailure::EK_LENGTH:
+    case PQFailure::CT_LENGTH:
+    case PQFailure::CONFIRM_NOT_DECOY:
+        return false;
+    case PQFailure::NONE:
+        break;
+    } // no default case, so the compiler can warn about missing cases
+    assert(false);
+}
+
+/** The reason word of a close cause. A node without one is finalized as LOCAL. */
+std::string_view PQCloseCauseReason(NodeCloseCause cause) noexcept
+{
+    switch (cause) {
+    case NodeCloseCause::PEER_EOF: return "eof";
+    case NodeCloseCause::PEER_RESET: return "reset";
+    case NodeCloseCause::TIMEOUT: return "timeout";
+    case NodeCloseCause::SEND_ERROR: return "send_error";
+    case NodeCloseCause::NONE:
+    case NodeCloseCause::LOCAL: return "local";
+    } // no default case, so the compiler can warn about missing cases
+    assert(false);
+}
+
+/** The reason word of the transport closing before the peer's version arrived. */
+std::string_view PQAbortReason(PQAbort abort) noexcept
+{
+    switch (abort) {
+    case PQAbort::GARBAGE_TERMINATOR: return "garbage_terminator";
+    case PQAbort::VERSION_LENGTH: return "version_length";
+    case PQAbort::VERSION_TAG: return "version_tag";
+    case PQAbort::NONE: break;
+    } // no default case, so the compiler can warn about missing cases
+    assert(false);
+}
+
+/** The counter of an outcome, or nullptr for a success, which isn't counted. */
+std::atomic<uint64_t>* PQCounter(PQCounters& counters, PQOutcome outcome) noexcept
+{
+    switch (outcome) {
+    case PQOutcome::SWITCHED: return &counters.switched;
+    case PQOutcome::CONFIRMED: return nullptr;
+    case PQOutcome::LEGACY_PEER: return &counters.legacy_peer;
+    case PQOutcome::MALFORMED_RECORD: return &counters.malformed_record;
+    case PQOutcome::FIRST_PACKET_FAILED: return &counters.first_packet_failed;
+    case PQOutcome::ABANDONED: return &counters.abandoned;
+    case PQOutcome::CLOSED_AFTER_SWITCH: return &counters.closed_after_switch;
+    case PQOutcome::FALLBACK: return &counters.fallback;
+    case PQOutcome::INTERNAL_ERROR: return &counters.internal_error;
+    } // no default case, so the compiler can warn about missing cases
+    assert(false);
+}
+
+/** The window an endpoint enters next: escalating per completed window, then the last one. */
+std::chrono::seconds PQFallbackWindow(const PQEndpointHistory& history) noexcept
+{
+    return PQ_FALLBACK_WINDOWS[std::min<size_t>(history.completed_windows, PQ_FALLBACK_WINDOWS.size() - 1)];
+}
+
+/** Whether an endpoint's fallback window is still running: it ends at expires, or once its length
+ *  has passed on the steady clock, whichever comes first, so a wall clock step back can't stretch it. */
+bool PQFallbackActive(const PQEndpointHistory& history, NodeSeconds now, MockableSteadyClock::time_point steady_now) noexcept
+{
+    return history.expires && now < *history.expires && steady_now < *history.steady_expires;
+}
+
+/** End an expired fallback window: the streak restarts at 0, and the escalation level stays. */
+void ExpirePQFallback(PQEndpointHistory& history, NodeSeconds now, MockableSteadyClock::time_point steady_now) noexcept
+{
+    if (!history.expires || PQFallbackActive(history, now, steady_now)) return;
+    history.entered.reset();
+    history.expires.reset();
+    history.steady_expires.reset();
+    history.streak = 0;
+    history.completed_windows = static_cast<uint8_t>(std::min<size_t>(history.completed_windows + 1, PQ_FALLBACK_WINDOWS.size()));
+}
+
+PQCounts LoadPQCounts(const PQCounters& counters) noexcept
+{
+    return {
+        .switched = counters.switched.load(),
+        .legacy_peer = counters.legacy_peer.load(),
+        .malformed_record = counters.malformed_record.load(),
+        .first_packet_failed = counters.first_packet_failed.load(),
+        .abandoned = counters.abandoned.load(),
+        .internal_error = counters.internal_error.load(),
+        .closed_after_switch = counters.closed_after_switch.load(),
+        .fallback = counters.fallback.load(),
+        .shed = counters.shed.load(),
+    };
+}
+} // namespace
+
+void CConnman::ObservePQ(CNode& node, bool finalizing, bool attribute_close)
+{
+    AssertLockNotHeld(m_pq_mutex);
+    // The transport takes and releases its own lock.
+    const PQHandshake::Snapshot snapshot{node.m_transport->GetPQSnapshot()};
+    // Nothing to account yet, as on every connection without the negotiation.
+    if (!finalizing && !snapshot.switched && snapshot.legacy == PQLegacyReason::NONE && snapshot.failure == PQFailure::NONE) return;
+    const NodeCloseCause cause{node.GetCloseCause()};
+    PQLogLines lines;
+    {
+        LOCK(m_pq_mutex);
+        if (node.m_pq_finalized) return;
+        lines = AccountPQ(node, snapshot, cause, /*account_close=*/finalizing && attribute_close, Now<NodeSeconds>());
+        if (finalizing) node.m_pq_finalized = true;
+    }
+    if (finalizing) node.m_transport->ClearPQSecrets();
+    for (const PQLogLine& line : lines.outcomes) LogPQOutcome(node, line);
+    if (lines.local_fault) LogPQLocalFault();
+}
+
+CConnman::PQLogLines CConnman::AccountPQ(CNode& node, const PQHandshake::Snapshot& snapshot, NodeCloseCause cause,
+                                          bool account_close, NodeSeconds now)
+{
+    AssertLockHeld(m_pq_mutex);
+    const bool inbound{node.IsInboundConn()};
+    PQLogLines lines;
+    // Each event counts once per connection, however often it is observed.
+    const auto account{[&](PQOutcome outcome, std::string_view reason, bool may_be_local = false) EXCLUSIVE_LOCKS_REQUIRED(m_pq_mutex) {
+        const uint16_t bit{static_cast<uint16_t>(1U << static_cast<uint8_t>(outcome))};
+        if (node.m_pq_accounted_events & bit) return;
+        node.m_pq_accounted_events |= bit;
+        if (std::atomic<uint64_t>* counter{PQCounter(m_pq_counters[PQDirection(inbound)], outcome)}) ++*counter;
+        if (outcome == PQOutcome::CONFIRMED) {
+            // A confirmed hybrid handshake protects an outbound endpoint while it stays in the
+            // success set: no failure, however late, can count against it.
+            if (!inbound) {
+                m_pq_any_success = true;
+                // A new endpoint in a full set evicts the least recently confirmed one.
+                if (!m_pq_successful_endpoints.contains(node.m_pq_endpoint) &&
+                    m_pq_successful_endpoints.size() >= PQ_MAX_SUCCESSFUL_ENDPOINTS) {
+                    m_pq_successful_endpoints.erase(
+                        std::ranges::min_element(m_pq_successful_endpoints, {}, [](const auto& entry) { return entry.second; }));
+                }
+                m_pq_successful_endpoints.insert_or_assign(node.m_pq_endpoint, m_pq_success_confirmations++);
+                m_pq_history.erase(node.m_pq_endpoint);
+            }
+            return;
+        }
+        if (outcome != PQOutcome::SWITCHED) {
+            AddPQFailure({.sequence = 0,
+                          .time = now,
+                          .endpoint = node.m_pq_endpoint,
+                          .inbound = inbound,
+                          .connection_type = node.m_conn_type,
+                          .peer_id = node.GetId(),
+                          .outcome = outcome,
+                          .reason = std::string{reason}});
+        }
+        lines.outcomes.push_back({outcome, reason});
+        // Only failures the peer side caused count toward the fallback, and only outbound.
+        if (!inbound && (outcome == PQOutcome::MALFORMED_RECORD || outcome == PQOutcome::FIRST_PACKET_FAILED ||
+                         outcome == PQOutcome::CLOSED_AFTER_SWITCH)) {
+            if (const auto until{CountPQFailure(node, outcome, reason, may_be_local, now, lines.local_fault)}) {
+                lines.outcomes.push_back({PQOutcome::FALLBACK, PQOutcomeString(outcome), until});
+            }
+        }
+    }};
+
+    // switched counts the key installation, even if the confirmation fails later.
+    if (snapshot.switched) account(PQOutcome::SWITCHED, {});
+    if (snapshot.confirmed) account(PQOutcome::CONFIRMED, {});
+    if (snapshot.legacy != PQLegacyReason::NONE) {
+        account(PQOutcome::LEGACY_PEER, snapshot.legacy == PQLegacyReason::PARSE_ERROR ? "parse_error" : "no_features");
+    }
+    if (snapshot.failure != PQFailure::NONE) {
+        account(PQFailureOutcome(snapshot.failure), PQFailureReason(snapshot.failure), PQFailureMayBeLocal(snapshot.failure));
+    }
+    if (account_close && snapshot.failure == PQFailure::NONE) {
+        // We switched, and the peer closed or stopped responding before its confirmation
+        // verified. Our own closes and send errors are not the peer's doing. A peer that closes
+        // may have failed its check of our confirmation, as keys our own ML-KEM code got wrong
+        // would make it; one that stops responding has no such reason.
+        if (!inbound && snapshot.switched && !snapshot.confirmed &&
+            (cause == NodeCloseCause::PEER_EOF || cause == NodeCloseCause::PEER_RESET || cause == NodeCloseCause::TIMEOUT)) {
+            account(PQOutcome::CLOSED_AFTER_SWITCH, PQCloseCauseReason(cause), /*may_be_local=*/cause != NodeCloseCause::TIMEOUT);
+        }
+        // Our offer was queued, but no authenticated version arrived before the close. An offer
+        // that failed internally is internal_error only.
+        if (snapshot.offer == PQOfferState::SENT && !snapshot.version_received) {
+            account(PQOutcome::ABANDONED, snapshot.abort != PQAbort::NONE ? PQAbortReason(snapshot.abort) : PQCloseCauseReason(cause));
+        }
+    }
+    return lines;
+}
+
+std::optional<NodeSeconds> CConnman::CountPQFailure(const CNode& node, PQOutcome outcome, std::string_view reason, bool may_be_local,
+                                                    NodeSeconds now, bool& local_fault)
+{
+    AssertLockHeld(m_pq_mutex);
+    const PQEndpointKey& endpoint{node.m_pq_endpoint};
+    if (m_pq_successful_endpoints.contains(endpoint)) return std::nullopt;
+
+    // Many endpoints failing in a way this node's own ML-KEM code can cause, and none succeeding,
+    // points at that code. Manual connections count here too: a node with only -connect peers
+    // still gets the warning.
+    if (may_be_local) {
+        if (m_pq_failed_endpoints_for_warning.size() < PQ_LOCAL_FAULT_THRESHOLD) m_pq_failed_endpoints_for_warning.insert(endpoint);
+        if (!m_pq_local_fault_warned && m_pq_failed_endpoints_for_warning.size() >= PQ_LOCAL_FAULT_THRESHOLD && !m_pq_any_success) {
+            m_pq_local_fault_warned = true;
+            local_fault = true;
+        }
+    }
+
+    // An attacker on the path can make an endpoint's handshakes fail without breaking a key, by
+    // damaging the peer's confirmation, resetting the connection or dropping its traffic. A
+    // manual connection's failures never count toward the fallback, so a pinned peer keeps its
+    // hybrid keys; they are still counted, kept in the ring and logged.
+    if (node.m_conn_type == ConnectionType::MANUAL) return std::nullopt;
+
+    const MockableSteadyClock::time_point steady_now{MockableSteadyClock::now()};
+    auto it{m_pq_history.find(endpoint)};
+    if (it == m_pq_history.end()) {
+        if (m_pq_history.size() >= PQ_MAX_ENDPOINT_HISTORY) {
+            // Spare active fallback windows: evict the oldest insertion outside one, and only when
+            // every endpoint is in one, the window that ends first.
+            m_pq_history.erase(std::ranges::min_element(m_pq_history, {}, [now, steady_now](const auto& entry) {
+                const PQEndpointHistory& history{entry.second};
+                const bool active{PQFallbackActive(history, now, steady_now)};
+                return std::tuple{active, active ? *history.expires : NodeSeconds{}, history.insertion_order};
+            }));
+        }
+        it = m_pq_history.emplace(endpoint, PQEndpointHistory{.insertion_order = m_pq_history_insertions++}).first;
+    }
+    PQEndpointHistory& history{it->second};
+    ExpirePQFallback(history, now, steady_now);
+    // A connection that was already running when the window began can't extend it.
+    if (history.expires) return std::nullopt;
+    ++history.streak;
+    history.last_failure = now;
+    history.cause = outcome;
+    history.reason = reason;
+    if (history.streak < PQ_FAILURE_THRESHOLD) return std::nullopt;
+
+    const std::chrono::seconds window{PQFallbackWindow(history)};
+    history.entered = now;
+    history.expires = now + window;
+    history.steady_expires = steady_now + window;
+    ++m_pq_counters[PQDirection(/*inbound=*/false)].fallback;
+    AddPQFailure({.sequence = 0,
+                  .time = now,
+                  .endpoint = endpoint,
+                  .inbound = false,
+                  .connection_type = node.m_conn_type,
+                  .peer_id = node.GetId(),
+                  .outcome = PQOutcome::FALLBACK,
+                  .reason = std::string{PQOutcomeString(outcome)}});
+    return history.expires;
+}
+
+bool CConnman::IsPQFallback(const PQEndpointKey& endpoint, NodeSeconds now)
+{
+    AssertLockNotHeld(m_pq_mutex);
+    LOCK(m_pq_mutex);
+    const auto it{m_pq_history.find(endpoint)};
+    if (it == m_pq_history.end()) return false;
+    ExpirePQFallback(it->second, now, MockableSteadyClock::now());
+    return it->second.expires.has_value();
+}
+
+void CConnman::AddPQFailure(PQFailureEntry entry)
+{
+    AssertLockHeld(m_pq_mutex);
+    PQFailureRing& ring{m_pq_failures[PQDirection(entry.inbound)]};
+    entry.sequence = ++ring.last_sequence;
+    ring.entries.push_back(std::move(entry));
+    if (ring.entries.size() > PQ_FAILURE_RING_SIZE) {
+        ring.entries.pop_front();
+        ++ring.dropped;
+    }
+}
+
+void CConnman::LogPQOutcome(const CNode& node, const PQLogLine& line) const
+{
+    const auto backends{mlkem::GetBackendNames()};
+    const std::string_view word{PQOutcomeString(line.outcome)};
+    const std::string conn_type{node.ConnectionTypeAsString()};
+    const std::string peeraddr{node.LogIP(fLogIPs)};
+    if (node.IsInboundConn()) {
+        // Outsiders can cause every inbound outcome at will, so these are debug lines.
+        switch (line.outcome) {
+        case PQOutcome::SWITCHED:
+            LogDebug(BCLog::NET, "v2 pq: switched role=responder conn_type=%s peer=%d%s", conn_type, node.GetId(), peeraddr);
+            return;
+        case PQOutcome::LEGACY_PEER:
+        case PQOutcome::ABANDONED:
+            LogDebug(BCLog::NET, "v2 pq: %s reason=%s role=responder conn_type=%s peer=%d%s", word, line.reason, conn_type, node.GetId(), peeraddr);
+            return;
+        case PQOutcome::MALFORMED_RECORD:
+        case PQOutcome::FIRST_PACKET_FAILED:
+        case PQOutcome::INTERNAL_ERROR:
+            LogDebug(BCLog::NET, "v2 pq: %s reason=%s role=responder conn_type=%s peer=%d%s arith=%s keccak=%s",
+                     word, line.reason, conn_type, node.GetId(), peeraddr, backends.arith, backends.keccak);
+            return;
+        case PQOutcome::CONFIRMED:
+        case PQOutcome::CLOSED_AFTER_SWITCH:
+        case PQOutcome::FALLBACK:
+            return;
+        } // no default case, so the compiler can warn about missing cases
+        return;
+    }
+    // Outbound failures are logged at info level, each from its own call site.
+    switch (line.outcome) {
+    case PQOutcome::SWITCHED:
+        LogDebug(BCLog::NET, "v2 pq: switched role=initiator conn_type=%s peer=%d%s", conn_type, node.GetId(), peeraddr);
+        return;
+    case PQOutcome::LEGACY_PEER:
+    case PQOutcome::ABANDONED:
+        LogDebug(BCLog::NET, "v2 pq: %s reason=%s role=initiator conn_type=%s peer=%d%s", word, line.reason, conn_type, node.GetId(), peeraddr);
+        return;
+    case PQOutcome::MALFORMED_RECORD:
+        LogInfo("v2 pq: malformed_record reason=%s role=initiator conn_type=%s peer=%d%s arith=%s keccak=%s",
+                line.reason, conn_type, node.GetId(), peeraddr, backends.arith, backends.keccak);
+        return;
+    case PQOutcome::FIRST_PACKET_FAILED:
+        LogInfo("v2 pq: first_packet_failed reason=%s role=initiator conn_type=%s peer=%d%s arith=%s keccak=%s",
+                line.reason, conn_type, node.GetId(), peeraddr, backends.arith, backends.keccak);
+        return;
+    case PQOutcome::CLOSED_AFTER_SWITCH:
+        LogInfo("v2 pq: closed_after_switch cause=%s role=initiator conn_type=%s peer=%d%s arith=%s keccak=%s",
+                line.reason, conn_type, node.GetId(), peeraddr, backends.arith, backends.keccak);
+        return;
+    case PQOutcome::INTERNAL_ERROR:
+        LogInfo("v2 pq: internal_error reason=%s role=initiator conn_type=%s peer=%d%s arith=%s keccak=%s",
+                line.reason, conn_type, node.GetId(), peeraddr, backends.arith, backends.keccak);
+        return;
+    case PQOutcome::FALLBACK:
+        LogWarning("v2 pq: fallback cause=%s until=%s role=initiator conn_type=%s peer=%d%s arith=%s keccak=%s",
+                   line.reason, FormatISO8601DateTime(TicksSinceEpoch<std::chrono::seconds>(line.until.value_or(NodeSeconds{}))),
+                   conn_type, node.GetId(), peeraddr, backends.arith, backends.keccak);
+        return;
+    case PQOutcome::CONFIRMED:
+        return;
+    } // no default case, so the compiler can warn about missing cases
+}
+
+void CConnman::LogPQLocalFault() const
+{
+    const auto backends{mlkem::GetBackendNames()};
+    // -mlkemportable is the remedy only while native code runs.
+    const bool native{backends.arith != "portable" || backends.keccak != "portable"};
+    LogWarning("v2 pq: local_fault arith=%s keccak=%s: hybrid handshakes failed with %u distinct endpoints and none succeeded "
+               "since startup, so this node's own ML-KEM code may be at fault.%s",
+               backends.arith, backends.keccak, PQ_LOCAL_FAULT_THRESHOLD,
+               native ? " Restart with -mlkemportable to use the portable implementation." : "");
+}
+
+PQTransportStats CConnman::GetPQTransportStats() const
+{
+    AssertLockNotHeld(m_pq_mutex);
+    AssertLockNotHeld(m_pq_shed_mutex);
+    // The two mutexes never nest.
+    PQLoadSheddingStats load_shedding;
+    {
+        LOCK(m_pq_shed_mutex);
+        load_shedding = {.active = m_pq_shedding_since.has_value(),
+                         .threshold_per_s = m_pq_shed_threshold,
+                         .since = m_pq_shedding_since.value_or(NodeSeconds{})};
+    }
+    LOCK(m_pq_mutex);
+    PQTransportStats stats{
+        .instance_id = m_pq_instance_id,
+        .since = m_pq_since,
+        .inbound = LoadPQCounts(m_pq_counters[PQDirection(/*inbound=*/true)]),
+        .outbound = LoadPQCounts(m_pq_counters[PQDirection(/*inbound=*/false)]),
+        .inbound_failures = m_pq_failures[PQDirection(/*inbound=*/true)],
+        .outbound_failures = m_pq_failures[PQDirection(/*inbound=*/false)],
+        .fallback_set = {},
+        .failure_streaks = {},
+        .load_shedding = load_shedding,
+    };
+    const NodeSeconds now{Now<NodeSeconds>()};
+    const MockableSteadyClock::time_point steady_now{MockableSteadyClock::now()};
+    for (const auto& [endpoint, history] : m_pq_history) {
+        if (history.expires) {
+            // A window that expired ended the streak; nothing to report until the next failure.
+            if (PQFallbackActive(history, now, steady_now)) {
+                stats.fallback_set.push_back({endpoint, history.cause, history.reason, history.streak, *history.entered, *history.expires});
+            }
+        } else if (history.streak > 0) {
+            stats.failure_streaks.push_back({endpoint, history.cause, history.reason, history.streak, history.last_failure, PQFallbackWindow(history)});
+        }
+    }
+    return stats;
+}
+
+bool CConnman::AllowPQOffer(void* connman) noexcept
+{
+    return static_cast<CConnman*>(connman)->AllowPQOffer();
+}
+
+bool CConnman::AllowPQOffer() noexcept
+{
+    AssertLockNotHeld(m_pq_shed_mutex);
+    const PQShedSeconds now{PQShedNow()};
+    bool stopped;
+    std::optional<uint64_t> started;
+    bool offer;
+    {
+        LOCK(m_pq_shed_mutex);
+        stopped = AdvancePQShedding(now);
+        ++m_pq_shed_attempts;
+        if (!m_pq_shedding_since && m_pq_shed_attempts > m_pq_shed_threshold) {
+            m_pq_shedding_since = Now<NodeSeconds>();
+            // The quiet seconds before the flood don't count toward its end.
+            m_pq_quiet_since.reset();
+            started = m_pq_shed_threshold;
+        }
+        offer = !m_pq_shedding_since;
+    }
+    if (!offer) ++m_pq_counters[PQDirection(/*inbound=*/true)].shed;
+    if (stopped) LogPQShedding(std::nullopt);
+    if (started) LogPQShedding(started);
+    return offer;
+}
+
+bool CConnman::AdvancePQShedding(PQShedSeconds now)
+{
+    AssertLockHeld(m_pq_shed_mutex);
+    if (now < m_pq_shed_second) {
+        // Only a test's mocked steady clock steps back (setmocktime 0 after a later time, with
+        // -test=mock_steady_clock). Start the current second, and the run of quiet seconds, over
+        // from now: otherwise the current second would never close, and shedding never end.
+        m_pq_shed_second = now;
+        m_pq_shed_attempts = 0;
+        m_pq_quiet_since.reset();
+    }
+    if (now > m_pq_shed_second) {
+        // Close the current second, and the seconds without attempts since: a second is quiet
+        // with fewer than half the threshold's attempts.
+        if (2 * m_pq_shed_attempts >= m_pq_shed_threshold) {
+            m_pq_quiet_since.reset();
+            if (now > m_pq_shed_second + 1s) m_pq_quiet_since = m_pq_shed_second + 1s;
+        } else if (!m_pq_quiet_since) {
+            m_pq_quiet_since = m_pq_shed_second;
+        }
+        m_pq_shed_second = now;
+        m_pq_shed_attempts = 0;
+    }
+    if (m_pq_shedding_since && m_pq_quiet_since && now - *m_pq_quiet_since >= PQ_SHED_QUIET_PERIOD) {
+        m_pq_shedding_since.reset();
+        return true;
+    }
+    return false;
+}
+
+void CConnman::UpdatePQShedding(PQShedSeconds now)
+{
+    AssertLockNotHeld(m_pq_shed_mutex);
+    if (WITH_LOCK(m_pq_shed_mutex, return AdvancePQShedding(now))) LogPQShedding(std::nullopt);
+}
+
+void CConnman::LogPQShedding(std::optional<uint64_t> started_threshold)
+{
+    if (started_threshold) {
+        LogInfo("v2 pq: load_shedding started threshold_per_s=%u", *started_threshold);
+    } else {
+        LogInfo("v2 pq: load_shedding stopped");
+    }
+}
+
 void CConnman::DisconnectNodes()
 {
     AssertLockNotHeld(m_nodes_mutex);
@@ -1922,7 +2827,7 @@ void CConnman::DisconnectNodes()
             for (CNode* pnode : m_nodes) {
                 if (!pnode->fDisconnect) {
                     LogDebug(BCLog::NET, "Network not active, %s\n", pnode->DisconnectMsg(fLogIPs));
-                    pnode->fDisconnect = true;
+                    pnode->RequestDisconnect();
                 }
             }
         }
@@ -1953,8 +2858,13 @@ void CConnman::DisconnectNodes()
                 // release outbound grant (if any)
                 pnode->grantOutbound.Release();
 
-                // close socket and cleanup
+                // close socket and cleanup; a node with no recorded close cause counts as LOCAL
                 pnode->CloseSocketDisconnect();
+
+                // account the hybrid negotiation's close outcome and wipe its pending secrets
+                // before the disconnected pool keeps the node; with the network off, as this pass
+                // saw it when it closed every connection, the close is ours
+                ObservePQ(*pnode, /*finalizing=*/true, /*attribute_close=*/network_active);
 
                 // update connection count by network
                 if (pnode->IsManualOrFullOutboundConn()) --m_network_conn_counts[pnode->addr.GetNetwork()];
@@ -2184,6 +3094,7 @@ void CConnman::SocketHandlerConnected(const std::vector<CNode*>& nodes,
                     );
                     pnode->CloseSocketDisconnect();
                 }
+                ObservePQ(*pnode, /*finalizing=*/false);
                 RecordBytesRecv(nBytes);
                 if (notify) {
                     pnode->MarkReceivedMsgsForProcessing();
@@ -2196,7 +3107,7 @@ void CConnman::SocketHandlerConnected(const std::vector<CNode*>& nodes,
                 if (!pnode->fDisconnect) {
                     LogDebug(BCLog::NET, "socket closed, %s\n", pnode->DisconnectMsg(fLogIPs));
                 }
-                pnode->CloseSocketDisconnect();
+                pnode->CloseSocketDisconnect(NodeCloseCause::PEER_EOF);
             }
             else if (nBytes < 0)
             {
@@ -2207,12 +3118,12 @@ void CConnman::SocketHandlerConnected(const std::vector<CNode*>& nodes,
                     if (!pnode->fDisconnect) {
                         LogDebug(BCLog::NET, "socket recv error, %s: %s\n", pnode->DisconnectMsg(fLogIPs), NetworkErrorString(nErr));
                     }
-                    pnode->CloseSocketDisconnect();
+                    pnode->CloseSocketDisconnect(NodeCloseCause::PEER_RESET);
                 }
             }
         }
 
-        if (InactivityCheck(*pnode)) pnode->fDisconnect = true;
+        if (InactivityCheck(*pnode)) pnode->RequestDisconnect(NodeCloseCause::TIMEOUT);
     }
 }
 
@@ -2237,6 +3148,7 @@ void CConnman::ThreadSocketHandler()
     {
         DisconnectNodes();
         NotifyNumConnectionsChanged();
+        if (m_pq_mode == PQMode::NEGOTIATE) UpdatePQShedding(PQShedNow());
         SocketHandler();
     }
 }
@@ -3493,6 +4405,9 @@ void CConnman::StopNodes()
     for (CNode* pnode : nodes) {
         LogDebug(BCLog::NET, "Stopping node, %s", pnode->DisconnectMsg(fLogIPs));
         pnode->CloseSocketDisconnect();
+        // Wipe the hybrid negotiation's pending secrets before the node goes, as DisconnectNodes()
+        // does. A shutdown close is our own decision, so no close outcome is derived from it.
+        ObservePQ(*pnode, /*finalizing=*/true, /*attribute_close=*/false);
         DeleteNode(pnode);
     }
 
@@ -3611,6 +4526,12 @@ bool CConnman::AddedNodesContain(const CAddress& addr) const
                            [&](const auto& p) { return p.m_added_node == addr_str || p.m_added_node == addr_port_str; }));
 }
 
+size_t CConnman::GetPQNodeCount() const
+{
+    LOCK(m_nodes_mutex);
+    return std::ranges::count_if(m_nodes, [](const CNode* node) { return node->m_transport->GetInfo().transport_pq; });
+}
+
 size_t CConnman::GetNodeCount(ConnectionDirection flags) const
 {
     LOCK(m_nodes_mutex);
@@ -3656,7 +4577,7 @@ bool CConnman::DisconnectNode(const std::string& strNode)
     LOCK(m_nodes_mutex);
     if (CNode* pnode = FindNode(strNode)) {
         LogDebug(BCLog::NET, "disconnect by address%s match, %s", (fLogIPs ? strprintf("=%s", strNode) : ""), pnode->DisconnectMsg(fLogIPs));
-        pnode->fDisconnect = true;
+        pnode->RequestDisconnect();
         return true;
     }
     return false;
@@ -3669,7 +4590,7 @@ bool CConnman::DisconnectNode(const CSubNet& subnet)
     for (CNode* pnode : m_nodes) {
         if (subnet.Match(pnode->addr)) {
             LogDebug(BCLog::NET, "disconnect by subnet%s match, %s", (fLogIPs ? strprintf("=%s", subnet.ToString()) : ""), pnode->DisconnectMsg(fLogIPs));
-            pnode->fDisconnect = true;
+            pnode->RequestDisconnect();
             disconnected = true;
         }
     }
@@ -3687,7 +4608,7 @@ bool CConnman::DisconnectNode(NodeId id)
     for(CNode* pnode : m_nodes) {
         if (id == pnode->GetId()) {
             LogDebug(BCLog::NET, "disconnect by id, %s", pnode->DisconnectMsg(fLogIPs));
-            pnode->fDisconnect = true;
+            pnode->RequestDisconnect();
             return true;
         }
     }
@@ -3799,10 +4720,10 @@ ServiceFlags CConnman::GetLocalServices() const
     return m_local_services;
 }
 
-static std::unique_ptr<Transport> MakeTransport(NodeId id, bool use_v2transport, bool inbound) noexcept
+static std::unique_ptr<Transport> MakeTransport(NodeId id, const CNodeOptions& options, bool inbound) noexcept
 {
-    if (use_v2transport) {
-        return std::make_unique<V2Transport>(id, /*initiating=*/!inbound);
+    if (options.use_v2transport) {
+        return std::make_unique<V2Transport>(id, /*initiating=*/!inbound, options.pq);
     } else {
         return std::make_unique<V1Transport>(id);
     }
@@ -3818,7 +4739,7 @@ CNode::CNode(NodeId idIn,
              ConnectionType conn_type_in,
              bool inbound_onion,
              CNodeOptions&& node_opts)
-    : m_transport{MakeTransport(idIn, node_opts.use_v2transport, conn_type_in == ConnectionType::INBOUND)},
+    : m_transport{MakeTransport(idIn, node_opts, conn_type_in == ConnectionType::INBOUND)},
       m_permission_flags{node_opts.permission_flags},
       m_sock{sock},
       m_connected{GetTime<std::chrono::seconds>()},
@@ -3831,6 +4752,7 @@ CNode::CNode(NodeId idIn,
       nKeyedNetGroup{nKeyedNetGroupIn},
       m_conn_type{conn_type_in},
       m_is_archive_connection{node_opts.is_archive_connection},
+      m_pq_endpoint{node_opts.pq_endpoint ? std::move(*node_opts.pq_endpoint) : PQEndpointKey{CService{addrIn}}},
       id{idIn},
       nLocalHostNonce{nLocalHostNonceIn},
       m_recv_flood_size{node_opts.recv_flood_size},

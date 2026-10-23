@@ -12,7 +12,6 @@
 #include <primitives/block.h>
 #include <util/chaintype.h>
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -73,9 +72,15 @@ private:
     CBlockHeader m_next_auxpow;
 };
 
+//! Legacy blocks since the last AuxPoW block when -asymptote does not set one.
+constexpr size_t DEFAULT_STARVATION_DISTANCE{10'000};
+
 size_t StarvationDistance(const benchmark::Bench& bench)
 {
-    return std::max<size_t>(1, static_cast<size_t>(bench.complexityN()));
+    // complexityN() is -1 unless -asymptote sets it: never cast that to size_t,
+    // which would build a chain until memory runs out.
+    const double n{bench.complexityN()};
+    return n >= 1 ? static_cast<size_t>(n) : DEFAULT_STARVATION_DISTANCE;
 }
 
 void CadenceLaneLookup(benchmark::Bench& bench)

@@ -129,6 +129,30 @@ class ClassifyMergeProfileTest(unittest.TestCase):
         self.assertTrue(classification.public_docs_only)
         self.assertEqual(classification.outside_paths, ())
 
+    def test_docs_that_source_checks_read_require_source_validation(self) -> None:
+        """The specification's quoted vectors (generate-pq-transport-vectors.py --check, in the lint job) and the
+        operator guide's quick start (feature_pq_quickstart.py) fail only in source validation."""
+        for path in ("doc/design/pq-transport.md", "doc/user/network/pq-transport.md"):
+            with self.subTest(path=path):
+                classification = self.classify([path])
+                outputs = classify_merge_profile.github_outputs(classification)
+
+                self.assertEqual(classification.profile, classify_merge_profile.SOURCE_PROFILE)
+                self.assertEqual(classification.outside_paths, (path,))
+                self.assertEqual(classification.public_docs_paths, ())
+                self.assertEqual(outputs["source_validation_required"], "true")
+                self.assertEqual(outputs["public_docs_only"], "false")
+                # The lint job and the CI matrix run those checks, not the PQ jobs.
+                self.assertEqual(outputs["pq_unit_required"], "false")
+                self.assertEqual(outputs["pq_functional_required"], "false")
+                # Also among other public docs.
+                self.assertEqual(self.classify(PUBLIC_DOCS_PATHS + [path]).profile, classify_merge_profile.SOURCE_PROFILE)
+
+        # Other docs beside them stay public docs.
+        for path in ("doc/design/p2mr-datapqchash.md", "doc/user/network/README.md", "doc/user/pq-transport.md"):
+            with self.subTest(path=path):
+                self.assertEqual(self.classify([path]).profile, classify_merge_profile.PUBLIC_DOCS_PROFILE)
+
     def test_github_metadata_paths_are_github_metadata_only(self) -> None:
         classification = self.classify(GITHUB_METADATA_PATHS)
 
@@ -241,6 +265,146 @@ class ClassifyMergeProfileTest(unittest.TestCase):
         self.assertEqual(outputs["github_metadata_only"], "true")
         self.assertEqual(outputs["source_validation_required"], "false")
         self.assertEqual(outputs["touched_github_metadata"], "true")
+
+    def test_pq_unit_jobs_required_for_mlkem_and_transport_paths(self) -> None:
+        required = [
+            "src/mlkem-native/mlkem/src/kem.c",
+            "src/crypto/mlkem.cpp",
+            "src/crypto/mlkem_config.h",
+            "cmake/mlkem-native.cmake",
+            "src/bip324.cpp",
+            "src/bip324.h",
+            "src/bip324_pq.cpp",
+            "src/bip324_pq.h",
+            "src/net.h",
+            "src/net.cpp",
+            "src/compat/cpuid.h",
+            "src/compat/cpu_features.h",
+            "src/compat/cpu_features.cpp",
+            ".github/workflows/ci-pq.yml",
+            "ci/test/00_setup_env_native_aarch64_pq.sh",
+            "ci/test/00_setup_env_s390x_unit.sh",
+            "ci/test/00_setup_env_mac_native_pq.sh",
+            "src/test/mlkem_tests.cpp",
+            "src/test/bip324_tests.cpp",
+            "src/test/net_tests.cpp",
+            "src/test/data/pq_transport_vectors.json",
+            "src/test/data/mlkem1024_vectors.json",
+            # Build wiring.
+            "CMakeLists.txt",
+            "src/CMakeLists.txt",
+            "src/util/CMakeLists.txt",
+            "src/test/CMakeLists.txt",
+            "src/test/fuzz/CMakeLists.txt",
+            "src/bench/CMakeLists.txt",
+            "test/CMakeLists.txt",
+            "cmake/bitcoin-build-config.h.in",
+            # Gate and CI wiring, and its tests.
+            ".github/workflows/ci.yml",
+            ".github/workflows/core-checks.yml",
+            ".github/workflows/required-merge-gate.yml",
+            "ci/checks/classify_merge_profile.py",
+            "ci/checks/ctest_evidence.py",
+            "ci/checks/test_ci_pq_contract.py",
+            "ci/checks/test_classify_merge_profile.py",
+            "ci/checks/test_mlkem_build_policy.py",
+            "ci/checks/test_pq_merge_gate_contract.py",
+            "ci/test/03_test_script.sh",
+        ]
+        for path in required:
+            with self.subTest(path=path):
+                classification = self.classify([path])
+                self.assertTrue(classification.pq_unit_required)
+                self.assertEqual(classify_merge_profile.github_outputs(classification)["pq_unit_required"], "true")
+                self.assertEqual(classification.profile, classify_merge_profile.SOURCE_PROFILE)
+        # One matching path among others is enough.
+        self.assertTrue(self.classify(["doc/user/README.md", "src/bip324.cpp"]).pq_unit_required)
+
+    def test_pq_unit_jobs_not_required_elsewhere(self) -> None:
+        for paths in (
+            ["src/wallet/wallet.cpp"],
+            ["src/netbase.cpp", "src/net_processing.cpp", "src/compat/compat.h"],
+            ["src/test/net_peer_eviction_tests.cpp"],
+            ["ci/test/00_setup_env_native_asan.sh", ".github/workflows/rpc-perf-manual.yml"],
+            # Wiring shared by every CI job, and ML-KEM tooling the PQ unit jobs never run.
+            ["ci/test/01_base_install.sh", "ci/test/02_run_container.py", ".github/actions/configure-docker/action.yml"],
+            ["src/crypto/CMakeLists.txt", "src/test/cpu_features_tests.cpp"],
+            ["test/lint/mlkem-native-check.sh", "contrib/devtools/mlkem-native.pin", "contrib/devtools/update-mlkem-native.sh"],
+            ["doc/user/README.md"],
+            RPC_DOCS_PATHS,
+            PUBLIC_DOCS_PATHS,
+        ):
+            with self.subTest(paths=paths):
+                classification = self.classify(paths)
+                self.assertFalse(classification.pq_unit_required)
+                self.assertEqual(classify_merge_profile.github_outputs(classification)["pq_unit_required"], "false")
+
+    def test_pq_unit_jobs_required_for_unreadable_paths(self) -> None:
+        self.assertTrue(self.classify(["../src/bip324.cpp"]).pq_unit_required)
+        self.assertTrue(self.classify(["/abs/path"]).pq_unit_required)
+
+    def test_pq_functional_job_required_for_hybrid_transport_paths(self) -> None:
+        """Paths that can break the hybrid functional suite without touching what the PQ unit jobs build."""
+        required = [
+            "src/init.cpp",
+            "src/rpc/net.cpp",
+            "test/functional/rpc_net.py",
+            "test/functional/p2p_v2_encrypted.py",
+            "test/functional/p2p_v2_misbehaving.py",
+            "test/functional/p2p_v2_pq_fallback.py",
+            "test/functional/p2p_v2_transport.py",
+            "test/functional/test_framework/test_framework.py",
+            "test/functional/test_framework/test_node.py",
+            "test/functional/test_framework/v2_p2p.py",
+            "test/functional/test_framework/crypto/mlkem.py",
+            "ci/test/00_setup_env_native_pq_functional.sh",
+        ]
+        for path in required:
+            with self.subTest(path=path):
+                classification = self.classify([path])
+                outputs = classify_merge_profile.github_outputs(classification)
+                self.assertTrue(classification.pq_functional_required)
+                self.assertEqual(outputs["pq_functional_required"], "true")
+                # The macOS and AArch64 unit jobs don't start for them.
+                self.assertFalse(classification.pq_unit_required)
+                self.assertEqual(outputs["pq_unit_required"], "false")
+                self.assertEqual(classification.profile, classify_merge_profile.SOURCE_PROFILE)
+        self.assertTrue(self.classify(["doc/user/README.md", "src/init.cpp"]).pq_functional_required)
+
+    def test_pq_functional_job_required_whenever_pq_unit_jobs_are(self) -> None:
+        paths = sorted(classify_merge_profile.PQ_UNIT_FILES) + [
+            "src/mlkem-native/mlkem/src/kem.c",
+            "src/bip324_pq.cpp",
+            "src/crypto/mlkem.cpp",
+            "src/compat/cpu_features.cpp",
+            "../src/bip324.cpp",
+        ]
+        for path in paths:
+            with self.subTest(path=path):
+                classification = self.classify([path])
+                self.assertTrue(classification.pq_unit_required)
+                self.assertTrue(classification.pq_functional_required)
+                self.assertEqual(classify_merge_profile.github_outputs(classification)["pq_functional_required"], "true")
+
+    def test_pq_functional_job_not_required_elsewhere(self) -> None:
+        for paths in (
+            ["src/wallet/wallet.cpp"],
+            ["src/net_processing.cpp", "src/netbase.cpp", "src/protocol.cpp", "src/bitcoin-cli.cpp", "src/qt/rpcconsole.cpp"],
+            ["src/rpc/blockchain.cpp", "src/test/net_pq_tests.cpp"],
+            # Tests that set every transport option themselves, or that run alike over plain and hybrid v2.
+            ["test/functional/rpc_pqtransport.py", "test/functional/feature_pq_quickstart.py"],
+            ["test/functional/tool_pq_canary.py", "contrib/pq-canary/pq-canary-eval.py"],
+            ["test/functional/p2p_handshake.py", "test/functional/interface_bitcoin_cli.py", "test/functional/test_runner.py"],
+            # The other CI jobs, and the wiring every CI job shares.
+            ["ci/test/00_setup_env_i686_no_ipc.sh", "ci/test/00_setup_env_base_image.sh", "ci/test_run_all.sh"],
+            ["doc/user/network/pq-transport.md"],
+            RPC_DOCS_PATHS,
+            PUBLIC_DOCS_PATHS,
+        ):
+            with self.subTest(paths=paths):
+                classification = self.classify(paths)
+                self.assertFalse(classification.pq_functional_required)
+                self.assertEqual(classify_merge_profile.github_outputs(classification)["pq_functional_required"], "false")
 
     def test_require_release_policy_only_cli_rejects_outside_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

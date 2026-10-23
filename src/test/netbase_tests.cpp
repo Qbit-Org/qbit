@@ -2,6 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <bitcoin-build-config.h> // IWYU pragma: keep
+
 #include <net_permissions.h>
 #include <netaddress.h>
 #include <netbase.h>
@@ -9,12 +11,22 @@
 #include <protocol.h>
 #include <serialize.h>
 #include <streams.h>
+#include <test/util/net.h>
 #include <test/util/setup_common.h>
 #include <util/strencodings.h>
+#include <util/threadinterrupt.h>
 #include <util/translation.h>
 
-#include <string>
+#include <algorithm>
+#include <cassert>
+#include <cerrno>
+#include <chrono>
+#include <functional>
+#include <memory>
 #include <numeric>
+#include <string>
+#include <thread>
+#include <vector>
 
 #include <boost/test/unit_test.hpp>
 
@@ -608,6 +620,164 @@ BOOST_AUTO_TEST_CASE(isbadport)
     std::list<int> ports(std::numeric_limits<uint16_t>::max());
     std::iota(ports.begin(), ports.end(), 1);
     BOOST_CHECK_EQUAL(std::ranges::count_if(ports, IsBadPort), 85);
+}
+
+namespace {
+/** What happened to the sockets of `PendingConnectSock`. */
+struct PendingConnectLog {
+    /** Sockets created. */
+    size_t socks{0};
+    /** The timeout of every `Wait()` for the connection to be established. */
+    std::vector<std::chrono::milliseconds> waits;
+    /** If set, the connection is established on this `Wait()` (1-based). */
+    size_t connect_on_wait{0};
+    /** Called on every `Wait()` with its 1-based number, before the wait. */
+    std::function<void(size_t)> on_wait;
+};
+
+/** A socket whose connect stays in progress, see `PendingConnectLog`. */
+class PendingConnectSock : public ZeroSock
+{
+public:
+    explicit PendingConnectSock(PendingConnectLog& log) : m_log{log} { ++m_log.socks; }
+
+    int Connect(const sockaddr*, socklen_t) const override
+    {
+#ifdef WIN32
+        WSASetLastError(WSAEWOULDBLOCK);
+#else
+        errno = EINPROGRESS;
+#endif
+        return SOCKET_ERROR;
+    }
+
+    bool Wait(std::chrono::milliseconds timeout, Event requested, Event* occurred) const override
+    {
+        m_log.waits.push_back(timeout);
+        if (m_log.on_wait) m_log.on_wait(m_log.waits.size());
+        if (m_log.waits.size() == m_log.connect_on_wait) {
+            *occurred = requested;
+            return true;
+        }
+        std::this_thread::sleep_for(timeout);
+        *occurred = 0;
+        return true;
+    }
+
+    PendingConnectSock& operator=(Sock&&) override
+    {
+        assert(false && "Move of Sock into PendingConnectSock not allowed.");
+        return *this;
+    }
+
+private:
+    PendingConnectLog& m_log;
+};
+
+/** Make `CreateSock` return `PendingConnectSock`s while alive. */
+class PendingConnectSetup
+{
+public:
+    PendingConnectSetup()
+        : m_create_sock_orig{CreateSock}
+    {
+        CreateSock = [this](int, int, int) { return std::make_unique<PendingConnectSock>(log); };
+    }
+    ~PendingConnectSetup() { CreateSock = m_create_sock_orig; }
+
+    PendingConnectLog log;
+
+private:
+    const decltype(CreateSock) m_create_sock_orig;
+};
+
+std::vector<Proxy> TestProxies()
+{
+    std::vector<Proxy> proxies{Proxy{CService{in6_addr(IN6ADDR_LOOPBACK_INIT), 7656}}};
+#ifdef HAVE_SOCKADDR_UN
+    proxies.emplace_back("unix:/tmp/qbit-netbase-tests-sam.sock");
+#endif
+    return proxies;
+}
+
+bool WithinPollInterval(const std::vector<std::chrono::milliseconds>& waits)
+{
+    return std::ranges::all_of(waits, [](auto w) { return w > 0ms && w <= MAX_CONNECT_POLL_INTERVAL; });
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(proxy_connect_without_deadline_unchanged)
+{
+    const int connect_timeout_orig{nConnectTimeout};
+    nConnectTimeout = 20;
+    for (const auto& proxy : TestProxies()) {
+        PendingConnectSetup setup;
+        BOOST_CHECK(!proxy.Connect());
+        // One wait of -timeout, as before the deadline overload was added.
+        BOOST_REQUIRE_EQUAL(setup.log.waits.size(), 1U);
+        BOOST_CHECK(setup.log.waits[0] == 20ms);
+    }
+    nConnectTimeout = connect_timeout_orig;
+}
+
+BOOST_AUTO_TEST_CASE(proxy_connect_deadline_connects)
+{
+    for (const auto& proxy : TestProxies()) {
+        PendingConnectSetup setup;
+        setup.log.connect_on_wait = 3;
+        CThreadInterrupt interrupt;
+        BOOST_CHECK(proxy.Connect(std::chrono::steady_clock::now() + 1h, interrupt));
+        BOOST_CHECK_EQUAL(setup.log.waits.size(), 3U);
+        BOOST_CHECK(WithinPollInterval(setup.log.waits));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(proxy_connect_deadline_expires)
+{
+    const int connect_timeout_orig{nConnectTimeout};
+    // The deadline, not -timeout, ends the attempt.
+    nConnectTimeout = 50;
+    for (const auto& proxy : TestProxies()) {
+        PendingConnectSetup setup;
+        CThreadInterrupt interrupt;
+        const auto start{std::chrono::steady_clock::now()};
+        const auto deadline{start + 350ms};
+        BOOST_CHECK(!proxy.Connect(deadline, interrupt));
+        const auto end{std::chrono::steady_clock::now()};
+        BOOST_CHECK(end >= deadline);
+        BOOST_CHECK(end - start < 60s);
+        BOOST_CHECK(!setup.log.waits.empty());
+        BOOST_CHECK(WithinPollInterval(setup.log.waits));
+    }
+    nConnectTimeout = connect_timeout_orig;
+}
+
+BOOST_AUTO_TEST_CASE(proxy_connect_deadline_interrupted)
+{
+    for (const auto& proxy : TestProxies()) {
+        PendingConnectSetup setup;
+        CThreadInterrupt interrupt;
+        setup.log.on_wait = [&](size_t wait) {
+            if (wait == 3) interrupt();
+        };
+        BOOST_CHECK(!proxy.Connect(std::chrono::steady_clock::now() + 30s, interrupt));
+        // Noticed right after the wait in progress when it was signaled, not at the deadline.
+        BOOST_CHECK_EQUAL(setup.log.waits.size(), 3U);
+        BOOST_CHECK(WithinPollInterval(setup.log.waits));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(proxy_connect_deadline_already_over)
+{
+    for (const auto& proxy : TestProxies()) {
+        PendingConnectSetup setup;
+        CThreadInterrupt interrupt;
+        BOOST_CHECK(!proxy.Connect(std::chrono::steady_clock::now(), interrupt));
+        interrupt();
+        BOOST_CHECK(!proxy.Connect(std::chrono::steady_clock::now() + 1h, interrupt));
+        // No socket is created at all.
+        BOOST_CHECK_EQUAL(setup.log.socks, 0U);
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

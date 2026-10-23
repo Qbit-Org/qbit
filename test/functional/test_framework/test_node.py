@@ -5,6 +5,7 @@
 """Class for bitcoind node under test"""
 
 import contextlib
+from dataclasses import dataclass
 import decimal
 import errno
 from enum import Enum
@@ -80,6 +81,66 @@ else:                            # safest portable value
     UNIX_PATH_MAX = 92
 
 
+@dataclass(frozen=True)
+class ReleaseInfo:
+    """A previous release that a test can run through versions=[...]."""
+    family: str               # "qbit" or "bitcoin"
+    client_version: int       # the release's own CLIENT_VERSION
+    tag: str                  # directory under the previous-releases dir, e.g. "v1.0.0"
+    core_compat_version: int  # the Bitcoin Core version whose options and RPCs it has
+    binary_prefix: str        # "qbit" (qbitd, qbit-cli) or "bitcoin" (bitcoind, bitcoin-cli)
+    supports_v2_pq: bool      # accepts -v2pqtransport
+
+
+# qbit releases are listed explicitly: their client versions restart at 1.0.0,
+# so neither the tag nor the Core interface can be derived from the number.
+# test/get_previous_releases.py downloads each tag listed here.
+QBIT_RELEASES = {r.client_version: r for r in (
+    ReleaseInfo(family="qbit", client_version=10000, tag="v1.0.0",
+                core_compat_version=300200, binary_prefix="qbit", supports_v2_pq=False),
+)}
+
+
+def bitcoin_core_release_tag(version):
+    """Return the Bitcoin Core release tag for a Core client version, e.g. 280200 -> "v28.2"."""
+    if version > 219999:
+        # Starting at client version 220000 the first two digits represent
+        # the major version, e.g. v22.0 instead of v0.22.0.
+        version *= 100
+    return re.sub(
+        r'\.0$' if version <= 219999 else r'(\.0){1,2}$',
+        '', # Remove trailing dot for point releases, after 22.0 also remove double trailing dot.
+        'v{}.{}.{}.{}'.format(
+            (version % 100000000) // 1000000,
+            (version % 1000000) // 10000,
+            (version % 10000) // 100,
+            (version % 100) // 1,
+        ),
+    )
+
+
+# The oldest Bitcoin Core client version the previous-release tooling runs (v0.14).
+# Lower client versions are qbit's, which must be listed in QBIT_RELEASES.
+MIN_BITCOIN_CORE_VERSION = 140000
+
+
+def release_info(version):
+    """Return the ReleaseInfo for a previous release's client version.
+
+    A version listed in QBIT_RELEASES is that qbit release. A version from
+    MIN_BITCOIN_CORE_VERSION up is the Bitcoin Core release with that client
+    version. Any other version is an unknown qbit release and is rejected rather
+    than read as a Core version."""
+    if version in QBIT_RELEASES:
+        return QBIT_RELEASES[version]
+    if not isinstance(version, int) or version < MIN_BITCOIN_CORE_VERSION:
+        known = ", ".join(f"{r.client_version} ({r.tag})" for r in QBIT_RELEASES.values())
+        raise ValueError(f"client version {version!r} is not a known qbit release ({known}) "
+                         f"and is below the oldest Bitcoin Core release the tests run ({MIN_BITCOIN_CORE_VERSION})")
+    return ReleaseInfo(family="bitcoin", client_version=version, tag=bitcoin_core_release_tag(version),
+                       core_compat_version=version, binary_prefix="bitcoin", supports_v2_pq=False)
+
+
 class FailedToStartError(Exception):
     """Raised when a node fails to start correctly."""
 
@@ -104,7 +165,7 @@ class TestNode():
     To make things easier for the test writer, any unrecognised messages will
     be dispatched to the RPC connection."""
 
-    def __init__(self, i, datadir_path, *, chain, rpchost, timewait, timeout_factor, binaries, coverage_dir, cwd, extra_conf=None, extra_args=None, use_cli=False, start_perf=False, use_valgrind=False, version=None, v2transport=False, uses_wallet=False, ipcbind=False, supports_p2mronly=None):
+    def __init__(self, i, datadir_path, *, chain, rpchost, timewait, timeout_factor, binaries, coverage_dir, cwd, extra_conf=None, extra_args=None, use_cli=False, start_perf=False, use_valgrind=False, version=None, v2transport=False, v2pqtransport=False, uses_wallet=False, ipcbind=False, supports_p2mronly=None):
         """
         Kwargs:
             start_perf (bool): If True, begin profiling the node with `perf` as soon as
@@ -134,7 +195,12 @@ class TestNode():
         self.extra_args = extra_args
         self.running_args = list(extra_args or [])
         self.version = version
-        self.supports_p2mronly = self.version is None if supports_p2mronly is None else supports_p2mronly
+        # None for the build under test.
+        self.release = None if version is None else release_info(version)
+        self.supports_p2mronly = self.qbit_version_is_at_least(10000) if supports_p2mronly is None else supports_p2mronly
+        # qbit-only options such as -v2pqtransport go only to the build under test
+        # or to a release whose metadata advertises them.
+        self.supports_v2_pq = self.release is None or self.release.supports_v2_pq
         # Configuration for logging is set as command-line args rather than in the qbit.conf file.
         # This means that starting a bitcoind using the temp dir to debug a failed test won't
         # spam debug.log.
@@ -193,6 +259,9 @@ class TestNode():
             else:
                 self.args.append("-v2transport=0")
         # if v2transport is requested via global flag but not supported for node version, ignore it
+        # With the global -v2transport flag, hybrid post-quantum transport follows the global -v2pqtransport
+        # flag, explicitly either way, on nodes that know the option (see start()). None passes nothing.
+        self.default_to_v2pq = v2pqtransport
 
         self.cli = TestNodeCLI(binaries, self.datadir_path)
         self.use_cli = use_cli
@@ -397,6 +466,13 @@ class TestNode():
             extra_args.append(f"-bind=127.0.0.1:{tor_port(self.index)}=onion")
 
         self.use_v2transport = "-v2transport=1" in extra_args or (self.default_to_v2 and "-v2transport=0" not in extra_args)
+        # Only a node that uses v2 gets the global hybrid transport setting: an explicit -v2pqtransport=1 with
+        # -v2transport=0 warns. It is explicit either way, so that each mode keeps its transport whatever the
+        # node's default: plain --v2transport passes 0 and covers plain v2, --v2pqtransport passes 1. The
+        # test's own extra_args come later and win.
+        transport_args = []
+        if self.supports_v2_pq and self.default_to_v2 and self.use_v2transport and self.default_to_v2pq is not None:
+            transport_args.append(f"-v2pqtransport={int(self.default_to_v2pq)}")
 
         # Add a new stdout and stderr file each time bitcoind is started
         if stderr is None:
@@ -419,7 +495,7 @@ class TestNode():
         if env is not None:
             subp_env.update(env)
 
-        self.process = subprocess.Popen(self.args + extra_args, env=subp_env, stdout=stdout, stderr=stderr, cwd=cwd, **kwargs)
+        self.process = subprocess.Popen(self.args + transport_args + extra_args, env=subp_env, stdout=stdout, stderr=stderr, cwd=cwd, **kwargs)
 
         self.running = True
         self.log.debug("bitcoind started, waiting for RPC to come up")
@@ -566,7 +642,14 @@ class TestNode():
             return self._rpc / wallet_path
 
     def version_is_at_least(self, ver):
-        return self.version is None or self.version >= ver
+        """Whether the node has the options and RPCs of Bitcoin Core client version ver.
+
+        qbit releases are compared by the Core version they are based on."""
+        return self.release is None or self.release.core_compat_version >= ver
+
+    def qbit_version_is_at_least(self, ver):
+        """Whether the node is the build under test or a qbit release of at least client version ver."""
+        return self.release is None or (self.release.family == "qbit" and self.release.client_version >= ver)
 
     def stop_node(self, expected_stderr='', *, wait=0, wait_until_stopped=True):
         """Stop the node."""
@@ -883,7 +966,7 @@ class TestNode():
                     assert_msg += "with expected error " + expected_msg
                 self._raise_assertion_error(assert_msg)
 
-    def add_p2p_connection(self, p2p_conn, *, wait_for_verack=True, send_version=True, supports_v2_p2p=None, wait_for_v2_handshake=True, expect_success=True, **kwargs):
+    def add_p2p_connection(self, p2p_conn, *, wait_for_verack=True, send_version=True, supports_v2_p2p=None, supports_v2_pq=False, wait_for_v2_handshake=True, expect_success=True, **kwargs):
         """Add an inbound p2p connection to the node.
 
         This method adds the p2p connection to the self.p2ps list and also
@@ -895,6 +978,8 @@ class TestNode():
         - if TestNode doesn't advertise NODE_P2P_V2 service, P2PConnection sends version message and v1 P2P is followed
         - if TestNode advertises NODE_P2P_V2 service, (and if P2PConnections supports v2 P2P)
                 P2PConnection sends ellswift bytes and v2 P2P is followed
+        - supports_v2_pq: a v2 P2PConnection also negotiates hybrid post-quantum keys (opt-in; framework
+                peers are legacy BIP324 peers by default)
         """
         if 'dstport' not in kwargs:
             kwargs['dstport'] = p2p_port(self.index)
@@ -906,7 +991,8 @@ class TestNode():
         if self.use_v2transport:
             kwargs['services'] = kwargs.get('services', P2P_SERVICES) | NODE_P2P_V2
         supports_v2_p2p = self.use_v2transport and supports_v2_p2p
-        p2p_conn.peer_connect(**kwargs, send_version=send_version, net=self.chain, timeout_factor=self.timeout_factor, supports_v2_p2p=supports_v2_p2p)()
+        assert supports_v2_p2p or not supports_v2_pq
+        p2p_conn.peer_connect(**kwargs, send_version=send_version, net=self.chain, timeout_factor=self.timeout_factor, supports_v2_p2p=supports_v2_p2p, supports_v2_pq=supports_v2_pq)()
 
         self.p2ps.append(p2p_conn)
         if not expect_success:
@@ -942,7 +1028,7 @@ class TestNode():
 
         return p2p_conn
 
-    def add_outbound_p2p_connection(self, p2p_conn, *, wait_for_verack=True, wait_for_disconnect=False, p2p_idx, connection_type="outbound-full-relay", supports_v2_p2p=None, advertise_v2_p2p=None, **kwargs):
+    def add_outbound_p2p_connection(self, p2p_conn, *, wait_for_verack=True, wait_for_disconnect=False, p2p_idx, connection_type="outbound-full-relay", supports_v2_p2p=None, advertise_v2_p2p=None, supports_v2_pq=False, wait_for_v2_handshake=True, **kwargs):
         """Add an outbound p2p connection from node. Must be an
         "outbound-full-relay", "block-relay-only", "addr-fetch" or "feeler" connection.
 
@@ -956,6 +1042,8 @@ class TestNode():
         Parameters:
             supports_v2_p2p: whether p2p_conn supports v2 P2P or not
             advertise_v2_p2p: whether p2p_conn is advertised to support v2 P2P or not
+            supports_v2_pq: whether a v2 p2p_conn also negotiates hybrid post-quantum keys (opt-in)
+            wait_for_v2_handshake: whether to wait until the v2 handshake, including a hybrid key confirmation, is complete
 
         An outbound connection is made from TestNode -------> P2PConnection
             - if P2PConnection doesn't advertise_v2_p2p, TestNode sends version message and v1 P2P is followed
@@ -983,7 +1071,8 @@ class TestNode():
         reconnect = advertise_v2_p2p and not supports_v2_p2p
         # P2PConnection needs to be advertised to support v2 P2P so that ellswift bytes are sent instead of msg_version
         supports_v2_p2p = supports_v2_p2p and advertise_v2_p2p
-        p2p_conn.peer_accept_connection(connect_cb=addconnection_callback, connect_id=p2p_idx + 1, net=self.chain, timeout_factor=self.timeout_factor, supports_v2_p2p=supports_v2_p2p, reconnect=reconnect, **kwargs)()
+        assert supports_v2_p2p or not supports_v2_pq
+        p2p_conn.peer_accept_connection(connect_cb=addconnection_callback, connect_id=p2p_idx + 1, net=self.chain, timeout_factor=self.timeout_factor, supports_v2_p2p=supports_v2_p2p, reconnect=reconnect, supports_v2_pq=supports_v2_pq, **kwargs)()
 
         if reconnect:
             p2p_conn.wait_for_reconnect()
@@ -996,6 +1085,8 @@ class TestNode():
             p2p_conn.wait_for_connect()
             self.p2ps.append(p2p_conn)
 
+            if supports_v2_p2p and not wait_for_v2_handshake:
+                return p2p_conn
             if supports_v2_p2p:
                 p2p_conn.wait_until(lambda: p2p_conn.v2_state.tried_v2_handshake)
             p2p_conn.wait_until(lambda: not p2p_conn.on_connection_send_msg)

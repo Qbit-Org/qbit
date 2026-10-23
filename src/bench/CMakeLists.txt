@@ -38,6 +38,7 @@ add_executable(bench_bitcoin
   mempool_eviction.cpp
   mempool_stress.cpp
   merkle_root.cpp
+  mlkem.cpp
   obfuscation.cpp
   parse_hex.cpp
   peer_eviction.cpp
@@ -56,6 +57,7 @@ add_executable(bench_bitcoin
   txgraph.cpp
   txorphanage.cpp
   util_time.cpp
+  v2_transport.cpp
   verify_script.cpp
 )
 set_target_properties(bench_bitcoin PROPERTIES OUTPUT_NAME bench_qbit)
@@ -69,6 +71,7 @@ target_link_libraries(bench_bitcoin
   core_interface
   test_util
   bitcoin_node
+  bitcoinpqc
   Boost::headers
 )
 

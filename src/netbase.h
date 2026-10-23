@@ -11,6 +11,8 @@
 #include <util/sock.h>
 #include <util/threadinterrupt.h>
 
+#include <array>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -26,6 +28,12 @@ extern bool fNameLookup;
 static const int DEFAULT_CONNECT_TIMEOUT = 5000;
 //! -dns default
 static const int DEFAULT_NAME_LOOKUP = true;
+
+/**
+ * Longest single wait of `Proxy::Connect(deadline, interrupt)` for the connection to be
+ * established, before it checks the interrupt and the deadline again.
+ */
+static constexpr std::chrono::milliseconds MAX_CONNECT_POLL_INTERVAL{100};
 
 /** Prefix for unix domain socket addresses (which are local filesystem paths) */
 const std::string ADDR_PREFIX_UNIX = "unix:";
@@ -86,6 +94,18 @@ public:
     }
 
     std::unique_ptr<Sock> Connect() const;
+
+    /**
+     * Connect to the proxy, giving up at `deadline` or as soon as `interrupt` is signaled.
+     * Unlike `Connect()`, this does not use `nConnectTimeout`. It waits for the connection in
+     * slices of at most `MAX_CONNECT_POLL_INTERVAL`, so it returns promptly after an interrupt.
+     * No socket is created if `interrupt` is already signaled or `deadline` has already passed.
+     * @param[in] deadline Give up at this time.
+     * @param[in] interrupt Give up as soon as this is signaled.
+     * @returns the connected socket if the operation succeeded, empty unique_ptr otherwise
+     */
+    std::unique_ptr<Sock> Connect(std::chrono::steady_clock::time_point deadline,
+                                  CThreadInterrupt& interrupt) const;
 };
 
 /** Credentials for proxy authentication */
@@ -199,6 +219,23 @@ bool IsProxy(const CNetAddr &addr);
 bool SetNameProxy(const Proxy &addrProxy);
 bool HaveNameProxy();
 bool GetNameProxy(Proxy &nameProxyOut);
+
+/**
+ * Test only: saves every proxy setting (each network's proxy and the name proxy) when created,
+ * and restores them when destroyed. The settings can't be unset otherwise, so a test that sets a
+ * proxy uses this to keep it from leaking into later tests.
+ */
+class ProxySettingsRestorerForTesting
+{
+    std::array<Proxy, NET_MAX> m_proxies;
+    Proxy m_name_proxy;
+
+public:
+    ProxySettingsRestorerForTesting();
+    ~ProxySettingsRestorerForTesting();
+    ProxySettingsRestorerForTesting(const ProxySettingsRestorerForTesting&) = delete;
+    ProxySettingsRestorerForTesting& operator=(const ProxySettingsRestorerForTesting&) = delete;
+};
 
 using DNSLookupFn = std::function<std::vector<CNetAddr>(const std::string&, bool)>;
 extern DNSLookupFn g_dns_lookup;
