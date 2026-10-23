@@ -18,6 +18,7 @@ on:
       - 0.1.x
       - 1.0.0
       - 1.x.x
+      - 1.1.0
       - develop
   push:
     branches:
@@ -25,6 +26,7 @@ on:
       - 0.1.x
       - 1.0.0
       - 1.x.x
+      - 1.1.0
       - develop
   merge_group:
     branches:
@@ -32,6 +34,7 @@ on:
       - 0.1.x
       - 1.0.0
       - 1.x.x
+      - 1.1.0
       - develop
 
 permissions:
@@ -645,6 +648,7 @@ jobs:
               Path(".github/rulesets/main.json"),
               Path(".github/rulesets/1.0.0.json"),
               Path(".github/rulesets/1.x.x.json"),
+              Path(".github/rulesets/1.1.0.json"),
               Path(".github/rulesets/0.1.x.json"),
           ):
               data = json.loads(path.read_text(encoding="utf8"))

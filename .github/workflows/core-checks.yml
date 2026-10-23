@@ -12,6 +12,7 @@ on:
       - 0.1.x
       - 1.0.0
       - 1.x.x
+      - 1.1.0
       - develop
   push:
     branches:
@@ -20,6 +21,7 @@ on:
       - 0.1.x
       - 1.0.0
       - 1.x.x
+      - 1.1.0
       - develop
   merge_group:
     branches:
@@ -28,6 +30,7 @@ on:
       - 0.1.x
       - 1.0.0
       - 1.x.x
+      - 1.1.0
       - develop
 
 permissions:
