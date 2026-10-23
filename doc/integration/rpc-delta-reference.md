@@ -274,13 +274,14 @@ Important result fields:
 - `instance_id` and `since`: the process start the counters count from
 - `handshakes.inbound` and `handshakes.outbound`: event counters, such as `switched`, `legacy_peer`, `first_packet_failed` and, inbound only, `shed`
 - `load_shedding`: `active`, `threshold_per_s` and `since`
-- `fallback_set` and `failure_streaks`: outbound endpoints that fall back to plain v2, or are on their way there
+- `fallback_set` and `failure_streaks`: automatic outbound endpoints that fall back to plain v2, or are on their way there; manual connections (`addnode`, `-connect`) never fall back
 - `recent_failures.inbound` and `recent_failures.outbound`: the most recent non-success outcomes, with sequence numbers
 
 Integrator notes:
 
 - Every field is always present. The counters, rings and endpoint history are kept in memory only and start over when `instance_id` changes.
 - Counters count events, not exclusive outcomes: a switch whose key confirmation then fails counts `switched` and `first_packet_failed`.
+- A `fallback_set` entry's `expires` is the latest its window ends: the window also ends once `window_seconds` have passed on the node's monotonic clock, so after a clock step back it can end earlier.
 - Endpoints contain peer addresses; treat the output as sensitive.
 
 ## Shared RPC Names With qbit-Specific Semantics

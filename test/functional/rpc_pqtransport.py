@@ -253,9 +253,21 @@ class PQTransportTest(BitcoinTestFramework):
         for node in nodes:
             self.wait_until(lambda: node.getpeerinfo() == [])
 
-    def failing_connection(self, a, b, *, enters_fallback=False):
+    def connect_automatic(self, a, b):
+        """Open an automatic outbound connection from node a to node b, as the connection logic would,
+        and wait until both sides completed the version handshake (a pong arrived, as connect_nodes()
+        checks)."""
+        node_a, node_b = self.nodes[a], self.nodes[b]
+        node_a.addconnection(f"127.0.0.1:{p2p_port(b)}", "outbound-full-relay", True)
+        for node, inbound in [(node_a, False), (node_b, True)]:
+            self.wait_until(lambda node=node, inbound=inbound: any(
+                peer["inbound"] == inbound and peer["bytesrecv_per_msg"].get("pong", 0) >= 29 for peer in node.getpeerinfo()))
+
+    def failing_connection(self, a, b, *, enters_fallback=False, automatic=False):
         """Connect node a to node b, whose hybrid handshake fails its key confirmation
-        (-test=pq_fail_first_packet on either side), and wait until both removed the peer.
+        (-test=pq_fail_first_packet on either side), and wait until both removed the peer. The
+        connection is a manual one, or with automatic an outbound-full-relay one: only those count
+        toward the fallback.
 
         The initiator's version packet and confirmation travel together, so the responder's
         check of that confirmation fails, and it closes before its own confirmation leaves: the
@@ -264,7 +276,10 @@ class PQTransportTest(BitcoinTestFramework):
         failure completes a streak and the initiator also counts fallback."""
         initiator, responder = self.nodes[a], self.nodes[b]
         before_initiator, before_responder = self.handshakes(initiator), self.handshakes(responder)
-        initiator.addnode(f"127.0.0.1:{p2p_port(b)}", "onetry")
+        if automatic:
+            initiator.addconnection(f"127.0.0.1:{p2p_port(b)}", "outbound-full-relay", True)
+        else:
+            initiator.addnode(f"127.0.0.1:{p2p_port(b)}", "onetry")
         self.wait_for_handshakes(responder, before_responder, {"inbound": {"switched": 1, "first_packet_failed": 1}})
         outcomes = ["closed_after_switch", "first_packet_failed"]
         fallback = {"fallback": 1} if enters_fallback else {}
@@ -471,9 +486,13 @@ class PQTransportTest(BitcoinTestFramework):
         assert_equal(len(peers), 1)
         return peers[0]
 
-    def check_peers(self, a, b, status_a, status_b, **kwargs):
-        """Connect node a to node b and check each side's transport_pq_status; then disconnect."""
-        self.connect_nodes(a, b, **kwargs)
+    def check_peers(self, a, b, status_a, status_b, *, automatic=False, **kwargs):
+        """Connect node a to node b (with automatic, as an automatic outbound connection) and check
+        each side's transport_pq_status; then disconnect."""
+        if automatic:
+            self.connect_automatic(a, b)
+        else:
+            self.connect_nodes(a, b, **kwargs)
         for node, status, inbound in [(self.nodes[a], status_a, False), (self.nodes[b], status_b, True)]:
             peer = self.peer(node, inbound=inbound)
             assert_equal((peer["transport_pq"], peer["transport_pq_status"]), (status == "hybrid", status))
@@ -524,7 +543,7 @@ class PQTransportTest(BitcoinTestFramework):
         reasons = {"closed_after_switch": ["eof", "reset"], "first_packet_failed": ["length", "tag"]}
         outcomes = []
         for streak in range(1, 4):
-            outcomes.append(self.failing_connection(0, 1, enters_fallback=streak == 3))
+            outcomes.append(self.failing_connection(0, 1, enters_fallback=streak == 3, automatic=True))
             info = node0.getpqtransportinfo()
             if streak < 3:
                 assert_equal(info["fallback_set"], [])
@@ -539,7 +558,7 @@ class PQTransportTest(BitcoinTestFramework):
         # The fallback entry names the failure that completed the streak, on the same connection.
         assert_equal((entries[3]["reason"], entries[3]["peer_id"]), (outcomes[-1], entries[2]["peer_id"]))
         assert entries[0]["peer_id"] < entries[1]["peer_id"] < entries[2]["peer_id"]
-        expected_entries = [{"sequence": sequence, "time": now, "endpoint": endpoint, "direction": "outbound", "connection_type": "manual",
+        expected_entries = [{"sequence": sequence, "time": now, "endpoint": endpoint, "direction": "outbound", "connection_type": "outbound-full-relay",
                              "peer_id": entry["peer_id"], "outcome": outcome, "reason": entry["reason"]}
                             for sequence, (outcome, entry) in enumerate(zip(outcomes + ["fallback"], entries), start=1)]
         counts = zero_counts()
@@ -554,8 +573,8 @@ class PQTransportTest(BitcoinTestFramework):
                         failure_streaks=[],
                         recent_failures={"inbound": empty_ring(), "outbound": {"last_sequence": 4, "dropped": 0, "entries": expected_entries}})
 
-        self.log.info("Test a connection to an endpoint in the fallback set runs plain v2: getpeerinfo fallback")
-        self.check_peers(0, 1, "fallback", "legacy_peer")
+        self.log.info("Test an automatic connection to an endpoint in the fallback set runs plain v2: getpeerinfo fallback")
+        self.check_peers(0, 1, "fallback", "legacy_peer", automatic=True)
         node0.setmocktime(0)
 
     def test_counts(self):
@@ -661,11 +680,11 @@ class PQTransportTest(BitcoinTestFramework):
         self.restart_node(1, extra_args=PQ)
 
     def outbound_failure(self, dest):
-        """Node 0 connects to dest, which ends at node 1, whose confirmation check fails. Returns node 0's
-        outbound ring entry."""
+        """Node 0 opens an automatic outbound connection to dest, which ends at node 1, whose confirmation
+        check fails. Returns node 0's outbound ring entry."""
         node0, node1, _ = self.nodes
         before = self.handshakes(node0)
-        node0.addnode(dest, "onetry")
+        node0.addconnection(dest, "outbound-full-relay", True)
         self.wait_for_handshakes(node0, before, *[{"outbound": {"switched": 1, outcome: 1}}
                                                   for outcome in ["closed_after_switch", "first_packet_failed"]])
         self.wait_for_no_peers(node0, node1)
@@ -688,7 +707,7 @@ class PQTransportTest(BitcoinTestFramework):
         self.restart_node(0, extra_args=PQ + [f"-proxy=127.0.0.1:{proxy_port}"])
         endpoint = {"kind": "name_proxy", "network": "name_proxy", "address": "pqtest.example", "port": 8333}
         entry = self.outbound_failure("PQTest.Example.:8333")
-        assert_equal((entry["endpoint"], entry["connection_type"]), (endpoint, "manual"))
+        assert_equal((entry["endpoint"], entry["connection_type"]), (endpoint, "outbound-full-relay"))
         assert_equal([streak["endpoint"] for streak in node0.getpqtransportinfo()["failure_streaks"]], [endpoint])
         proxy.stop()
 

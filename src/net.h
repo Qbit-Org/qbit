@@ -887,8 +887,8 @@ struct PQFailureRing {
 /** At most this many entries in each failure ring. */
 inline constexpr size_t PQ_FAILURE_RING_SIZE{256};
 
-/** Consecutive counted failures (outbound malformed_record, first_packet_failed and
- *  closed_after_switch) that put an endpoint in the fallback set. */
+/** Consecutive counted failures (malformed_record, first_packet_failed and closed_after_switch of
+ *  automatic outbound connections) that put an endpoint in the fallback set. */
 inline constexpr uint32_t PQ_FAILURE_THRESHOLD{3};
 /** An endpoint's fallback windows: its first entry, its second, then every later one. */
 inline constexpr std::array<std::chrono::seconds, 3> PQ_FALLBACK_WINDOWS{
@@ -896,7 +896,10 @@ inline constexpr std::array<std::chrono::seconds, 3> PQ_FALLBACK_WINDOWS{
 /** At most this many endpoints in the fallback, streak and escalation history. Eviction spares
  *  endpoints in an active fallback window while any other is left. */
 inline constexpr size_t PQ_MAX_ENDPOINT_HISTORY{1000};
-/** Distinct endpoints with counted failures, and no success since startup, that suggest a local fault. */
+/** At most this many endpoints in the success set; the least recently confirmed is evicted first. */
+inline constexpr size_t PQ_MAX_SUCCESSFUL_ENDPOINTS{1000};
+/** Distinct endpoints with failures this node's own ML-KEM code can cause, and no success since
+ *  startup, that suggest a local fault. */
 inline constexpr size_t PQ_LOCAL_FAULT_THRESHOLD{8};
 
 /** Inbound offers attempted within one second above which responders stop offering. R3's flood
@@ -921,9 +924,11 @@ struct PQEndpointHistory {
     uint32_t streak{0};
     //! Fallback windows that ended; saturates at PQ_FALLBACK_WINDOWS.size().
     uint8_t completed_windows{0};
-    //! The active fallback window, if any.
+    //! The active fallback window, if any. It ends at expires, or once its length has passed on the
+    //! steady clock (steady_expires), whichever comes first: a wall clock step back can't stretch it.
     std::optional<NodeSeconds> entered{};
     std::optional<NodeSeconds> expires{};
+    std::optional<MockableSteadyClock::time_point> steady_expires{};
     //! The latest counted failure.
     NodeSeconds last_failure{};
     PQOutcome cause{PQOutcome::MALFORMED_RECORD};
@@ -1601,6 +1606,8 @@ public:
     bool AddConnection(const std::string& address, ConnectionType conn_type, bool use_v2transport) EXCLUSIVE_LOCKS_REQUIRED(!m_unused_i2p_sessions_mutex, !m_pq_mutex);
 
     size_t GetNodeCount(ConnectionDirection) const;
+    /** The number of connections with hybrid session keys (transport_pq). */
+    size_t GetPQNodeCount() const EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex);
     std::map<CNetAddr, LocalServiceInfo> getNetLocalAddresses() const;
     uint32_t GetMappedAS(const CNetAddr& addr) const;
     void GetNodeStats(std::vector<CNodeStats>& vstats) const;
@@ -1653,8 +1660,8 @@ public:
     /** The hybrid post-quantum v2 transport configuration, as Init() received it. */
     const PQTransportConfig& GetPQTransportConfig() const noexcept { return m_pq_config; }
 
-    /** Whether new outbound connections to endpoint run plain v2, because repeated hybrid
-     *  failures put it in the fallback set. Ends a window that expired. */
+    /** Whether new automatic outbound connections to endpoint run plain v2, because repeated
+     *  hybrid failures put it in the fallback set. Ends a window that expired. */
     bool IsPQFallback(const PQEndpointKey& endpoint, NodeSeconds now) EXCLUSIVE_LOCKS_REQUIRED(!m_pq_mutex);
 
     /** Get a unique deterministic randomizer. */
@@ -2088,30 +2095,35 @@ private:
      * runs after the node received bytes, and once more, finalizing, before DisconnectNodes()
      * hands the node to the disconnected pool: that derives closed_after_switch and abandoned
      * from the close cause, marks the node finalized so no later observation counts anything,
-     * and wipes the transport's pending secrets. With the network off, every close is our own
-     * decision, so nothing is recorded, but finalization still wipes. StopNodes() finalizes the
-     * connections it deletes at shutdown the same way, with record_outcomes false: shutdown
-     * closes are our own too.
+     * and wipes the transport's pending secrets. attribute_close is false when this node closed
+     * the connection along with every other one: DisconnectNodes() with the network off, as the
+     * pass that closed them saw it, and StopNodes() at shutdown. Such a close is our own decision,
+     * so neither outcome is derived from it. The events the peer's bytes caused, a verified
+     * confirmation included, are accounted either way.
      *
      * The transport is snapshotted under its own lock, which is released before m_pq_mutex is
      * taken; nothing calls into the transport, socket, peer manager or node enumeration while
      * holding m_pq_mutex.
      */
-    void ObservePQ(CNode& node, bool finalizing, bool record_outcomes = true) EXCLUSIVE_LOCKS_REQUIRED(!m_pq_mutex);
+    void ObservePQ(CNode& node, bool finalizing, bool attribute_close = true) EXCLUSIVE_LOCKS_REQUIRED(!m_pq_mutex);
 
     /** Count each event of snapshot not yet accounted for node, once, add a ring entry for each
-     *  non-success outcome, and update the endpoint history. Returns what to log. */
+     *  non-success outcome, and update the endpoint history. With account_close, also derive
+     *  closed_after_switch and abandoned from the close cause. Returns what to log. */
     PQLogLines AccountPQ(CNode& node, const PQHandshake::Snapshot& snapshot, NodeCloseCause cause,
-                         bool finalizing, NodeSeconds now) EXCLUSIVE_LOCKS_REQUIRED(m_pq_mutex);
+                         bool account_close, NodeSeconds now) EXCLUSIVE_LOCKS_REQUIRED(m_pq_mutex);
 
     /**
-     * Count an outbound connection's failure against its endpoint. The third consecutive one
-     * enters the fallback set, unless the endpoint completed a hybrid handshake since startup.
-     * A failure during an active window neither extends it nor enters again. Returns the end of
-     * a window it started, and sets local_fault when the local-fault warning is due.
+     * Count an outbound connection's failure against its endpoint, unless the endpoint is in the
+     * success set. A failure this node's own ML-KEM code can cause (may_be_local) counts toward
+     * the local-fault warning. A manual connection's failure never counts toward the fallback:
+     * an attacker on the path can make any handshake fail without breaking a key. Otherwise the
+     * third consecutive one enters the fallback set. A failure during an active window neither
+     * extends it nor enters again. Returns the end of a window it started, and sets local_fault
+     * when the local-fault warning is due.
      */
-    std::optional<NodeSeconds> CountPQFailure(const CNode& node, PQOutcome outcome, std::string_view reason, NodeSeconds now,
-                                              bool& local_fault) EXCLUSIVE_LOCKS_REQUIRED(m_pq_mutex);
+    std::optional<NodeSeconds> CountPQFailure(const CNode& node, PQOutcome outcome, std::string_view reason, bool may_be_local,
+                                              NodeSeconds now, bool& local_fault) EXCLUSIVE_LOCKS_REQUIRED(m_pq_mutex);
 
     /** Add a non-success outcome to the ring of its direction. */
     void AddPQFailure(PQFailureEntry entry) EXCLUSIVE_LOCKS_REQUIRED(m_pq_mutex);
@@ -2140,10 +2152,13 @@ private:
     //! Outbound endpoints with counted failures: streaks, fallback windows and escalation.
     std::map<PQEndpointKey, PQEndpointHistory> m_pq_history GUARDED_BY(m_pq_mutex);
     uint64_t m_pq_history_insertions GUARDED_BY(m_pq_mutex){0};
-    //! Outbound endpoints that completed a hybrid handshake since startup. Never evicted; its
-    //! size is bounded by the distinct successful outbound endpoints.
-    std::set<PQEndpointKey> m_pq_successful_endpoints GUARDED_BY(m_pq_mutex);
-    //! Distinct endpoints with counted failures, up to PQ_LOCAL_FAULT_THRESHOLD.
+    //! Outbound endpoints that completed a hybrid handshake, each with the order of its latest
+    //! confirmation: at most PQ_MAX_SUCCESSFUL_ENDPOINTS, the least recently confirmed evicted first.
+    std::map<PQEndpointKey, uint64_t> m_pq_successful_endpoints GUARDED_BY(m_pq_mutex);
+    uint64_t m_pq_success_confirmations GUARDED_BY(m_pq_mutex){0};
+    //! Whether an outbound hybrid handshake completed since startup; eviction from the set can't clear it.
+    bool m_pq_any_success GUARDED_BY(m_pq_mutex){false};
+    //! Distinct endpoints with failures this node's own ML-KEM code can cause, up to PQ_LOCAL_FAULT_THRESHOLD.
     std::set<PQEndpointKey> m_pq_failed_endpoints_for_warning GUARDED_BY(m_pq_mutex);
     bool m_pq_local_fault_warned GUARDED_BY(m_pq_mutex){false};
 

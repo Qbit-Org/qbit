@@ -5,20 +5,26 @@
 """Test the bounded fallback to plain v2 after repeated hybrid post-quantum failures with one
 endpoint (#184, doc/design/pq-transport.md).
 
-- test_three_failures: three explicit outbound attempts whose key confirmation fails put the
-  endpoint in the fallback set; the fourth connection is plain v2 with status fallback, and one
-  warning line says so.
-- test_malformed_offer_fallback: against a responder that always sends a malformed offer, the
-  fourth connection succeeds, because a fallback connection neither parses nor validates offers.
-- test_inbound_and_success_exclusion: inbound failures never lead to a fallback, and neither do
-  outbound failures after a hybrid success with the same endpoint.
+Only automatic outbound connections fall back, so the attempts that count use addconnection
+(outbound-full-relay). Manual connections (addnode onetry) never count toward a streak and never
+fall back: an attacker on the path can make handshakes fail without breaking a key.
+
+- test_three_failures: three automatic attempts whose key confirmation fails put the endpoint in
+  the fallback set; the fourth connection is plain v2 with status fallback, and one warning line
+  says so.
+- test_manual_exempt: a manual connection to that endpoint still negotiates hybrid keys, and its
+  failure is counted and logged but leaves the fallback set alone.
 - test_expiry_and_restart: the hybrid negotiation is tried again once the window expires (and the
   next window is longer), and a restart clears all of it under a new instance_id.
+- test_malformed_offer_fallback: against a responder that always sends a malformed offer, manual
+  failures start no streak; after three automatic ones, the fourth automatic connection
+  succeeds, because a fallback connection neither parses nor validates offers, while a manual one
+  still sees the malformed offer.
+- test_inbound_and_success_exclusion: inbound failures never lead to a fallback, and neither do
+  outbound failures after a hybrid success with the same endpoint.
 - test_endpoint_separation: through a SOCKS5 proxy, two hostnames (in any letter case, with or
   without the root dot), one hostname on two ports, and one address on two ports each keep their
   own history: a name-proxy destination is its hostname and port, never the proxy.
-
-addconnection can't open manual connections, so explicit outbound attempts use addnode onetry.
 """
 
 import threading
@@ -96,6 +102,7 @@ class P2PV2PQFallbackTest(BitcoinTestFramework):
 
     def run_test(self):
         self.test_three_failures()
+        self.test_manual_exempt()
         self.test_expiry_and_restart()
         self.test_malformed_offer_fallback()
         self.test_inbound_and_success_exclusion()
@@ -105,9 +112,20 @@ class P2PV2PQFallbackTest(BitcoinTestFramework):
         for node in nodes:
             self.wait_until(lambda node=node: len(node.getpeerinfo()) == 0)
 
-    def connect_responder(self, node, peer, *, idx, target=None):
-        """Let a Python responder listen on its own port and make node open a manual connection to it
-        (to target, through a proxy that leads there, if given)."""
+    def connect_automatic(self, a, b):
+        """Open an automatic outbound connection from node a to node b, as the connection logic would,
+        and wait until both sides completed the version handshake (a pong arrived, as connect_nodes()
+        checks)."""
+        node_a, node_b = self.nodes[a], self.nodes[b]
+        node_a.addconnection(f"127.0.0.1:{p2p_port(b)}", "outbound-full-relay", True)
+        for node, inbound in [(node_a, False), (node_b, True)]:
+            self.wait_until(lambda node=node, inbound=inbound: any(
+                peer["inbound"] == inbound and peer["bytesrecv_per_msg"].get("pong", 0) >= 29 for peer in node.getpeerinfo()))
+
+    def connect_responder(self, node, peer, *, idx, target=None, automatic=False):
+        """Let a Python responder listen on its own port and make node open a connection to it (to
+        target, through a proxy that leads there, if given): a manual one, or with automatic an
+        outbound-full-relay one."""
         listening = threading.Event()
         peer.peer_accept_connection(connect_cb=lambda addr, port: listening.set(), connect_id=idx, net=node.chain,
                                     timeout_factor=node.timeout_factor, supports_v2_p2p=True,
@@ -116,7 +134,11 @@ class P2PV2PQFallbackTest(BitcoinTestFramework):
         # The RPC call comes from this thread, not the network thread's callback: the RPC connection is
         # not shared across threads.
         self.wait_until(listening.is_set)
-        node.addnode(node=target or f"127.0.0.1:{responder_port(idx)}", command="onetry")
+        target = target or f"127.0.0.1:{responder_port(idx)}"
+        if automatic:
+            node.addconnection(target, "outbound-full-relay", True)
+        else:
+            node.addnode(node=target, command="onetry")
         return responder_port(idx)
 
     def test_three_failures(self):
@@ -126,13 +148,13 @@ class P2PV2PQFallbackTest(BitcoinTestFramework):
         target = f"127.0.0.1:{p2p_port(1)}"
         b_before = counters(node_b)
         for attempt in range(1, 4):
-            expected = ["v2 pq: switched role=initiator conn_type=manual peer="]
+            expected = ["v2 pq: switched role=initiator conn_type=outbound-full-relay peer="]
             unexpected = ["v2 pq: fallback"]
             if attempt == 3:
                 expected.append("v2 pq: fallback cause=")
                 unexpected = []
             with node_a.assert_debug_log(expected, unexpected_msgs=unexpected):
-                node_a.addnode(node=target, command="onetry")
+                node_a.addconnection(target, "outbound-full-relay", True)
                 self.wait_until(lambda: counted_failures(node_a) == attempt)
                 self.wait_no_peers(node_a, node_b)
         a_counts = counters(node_a)
@@ -159,12 +181,12 @@ class P2PV2PQFallbackTest(BitcoinTestFramework):
             warnings = [line for line in log if "v2 pq: fallback cause=" in line]
         assert_equal(len(warnings), 1)
         assert f"v2 pq: fallback cause={entry['cause']} until=" in warnings[0]
-        assert "role=initiator conn_type=manual" in warnings[0]
+        assert "role=initiator conn_type=outbound-full-relay" in warnings[0]
 
         self.log.info("The fourth connection is plain v2, with status fallback")
         before = counters(node_a)
         with node_a.assert_debug_log([], unexpected_msgs=["v2 pq: switched", "v2 pq: fallback"]):
-            self.connect_nodes(0, 1)
+            self.connect_automatic(0, 1)
         [outbound] = node_a.getpeerinfo()
         [inbound] = node_b.getpeerinfo()
         assert_equal((outbound["transport_protocol_type"], outbound["transport_pq"], outbound["transport_pq_status"]),
@@ -175,16 +197,37 @@ class P2PV2PQFallbackTest(BitcoinTestFramework):
         assert_equal(counters(node_a), before)
         self.disconnect_nodes(0, 1)
 
+    def test_manual_exempt(self):
+        node_a, node_b = self.nodes
+        self.log.info("A manual connection to an endpoint in the fallback set still negotiates hybrid keys")
+        info = node_a.getpqtransportinfo()
+        [entry] = info["fallback_set"]
+        before = counters(node_a)
+        # Node A still damages its own shared secret, so the handshake fails: counted and logged, but
+        # the fallback set stays as it was.
+        with node_a.assert_debug_log(["v2 pq: switched role=initiator conn_type=manual peer="],
+                                     unexpected_msgs=["v2 pq: fallback cause="]):
+            node_a.addnode(node=f"127.0.0.1:{p2p_port(1)}", command="onetry")
+            self.wait_until(lambda: counted_failures(node_a) == sum(before[key] for key in COUNTED) + 1)
+            self.wait_no_peers(node_a, node_b)
+        after = node_a.getpqtransportinfo()
+        assert_equal((after["fallback_set"], after["failure_streaks"]), ([entry], []))
+        assert_equal(counters(node_a)["outbound_switched"], before["outbound_switched"] + 1)
+        assert_equal(counters(node_a)["outbound_fallback"], before["outbound_fallback"])
+        last = after["recent_failures"]["outbound"]["entries"][-1]
+        assert_equal((last["connection_type"], last["endpoint"]), ("manual", entry["endpoint"]))
+
     def test_expiry_and_restart(self):
         node_a, node_b = self.nodes
         self.log.info("Once the window expires, the next connection tries the hybrid keys again")
         [entry] = node_a.getpqtransportinfo()["fallback_set"]
+        before = counted_failures(node_a)
         for node in self.nodes:
             node.setmocktime(entry["expires"])
-        with node_a.assert_debug_log(["v2 pq: switched role=initiator conn_type=manual"],
+        with node_a.assert_debug_log(["v2 pq: switched role=initiator conn_type=outbound-full-relay"],
                                      unexpected_msgs=["v2 pq: fallback cause="]):
-            node_a.addnode(node=f"127.0.0.1:{p2p_port(1)}", command="onetry")
-            self.wait_until(lambda: counted_failures(node_a) == 4)
+            node_a.addconnection(f"127.0.0.1:{p2p_port(1)}", "outbound-full-relay", True)
+            self.wait_until(lambda: counted_failures(node_a) == before + 1)
             self.wait_no_peers(node_a, node_b)
         info = node_a.getpqtransportinfo()
         assert_equal(info["fallback_set"], [])
@@ -204,30 +247,45 @@ class P2PV2PQFallbackTest(BitcoinTestFramework):
         assert_equal(len(info["instance_id"]), 64)
         assert_equal((info["fallback_set"], info["failure_streaks"]), ([], []))
         assert_equal(set(counters(node_a).values()), {0})
-        self.connect_nodes(0, 1)
+        self.connect_automatic(0, 1)
         assert_equal(node_a.getpeerinfo()[0]["transport_pq_status"], "hybrid")
         self.disconnect_nodes(0, 1)
 
     def test_malformed_offer_fallback(self):
         node_a = self.nodes[0]
-        self.log.info("Three malformed offers from one responder put it in the fallback set")
+        self.log.info("Malformed offers on manual connections are counted and logged, but start no streak")
         self.restart_node(0, extra_args=PQ_ON)
         port = None
-        for attempt in range(1, 4):
+        attempts = 0
+        for _ in range(4):
+            attempts += 1
             with node_a.assert_debug_log(["v2 pq: malformed_record reason=ek_modulus role=initiator conn_type=manual"]):
                 peer = MalformedOfferPeer()
                 port = self.connect_responder(node_a, peer, idx=1)
-                self.wait_until(lambda: counters(node_a)["outbound_malformed_record"] == attempt)
+                self.wait_until(lambda: counters(node_a)["outbound_malformed_record"] == attempts)
+                peer.wait_for_disconnect()
+                self.wait_no_peers(node_a)
+        info = node_a.getpqtransportinfo()
+        assert_equal((info["fallback_set"], info["failure_streaks"]), ([], []))
+        assert_equal(len(info["recent_failures"]["outbound"]["entries"]), 4)
+
+        self.log.info("Three malformed offers on automatic connections put the responder in the fallback set")
+        for _ in range(3):
+            attempts += 1
+            with node_a.assert_debug_log(["v2 pq: malformed_record reason=ek_modulus role=initiator conn_type=outbound-full-relay"]):
+                peer = MalformedOfferPeer()
+                self.connect_responder(node_a, peer, idx=1, automatic=True)
+                self.wait_until(lambda: counters(node_a)["outbound_malformed_record"] == attempts)
                 peer.wait_for_disconnect()
                 self.wait_no_peers(node_a)
         [entry] = node_a.getpqtransportinfo()["fallback_set"]
         assert_equal(entry["endpoint"], address_endpoint("127.0.0.1", port))
         assert_equal((entry["cause"], entry["reason"], entry["streak"]), ("malformed_record", "ek_modulus", 3))
 
-        self.log.info("The fourth connection ignores the malformed offer and completes as plain v2")
+        self.log.info("The next automatic connection ignores the malformed offer and completes as plain v2")
         before = counters(node_a)
         peer = MalformedOfferPeer()
-        self.connect_responder(node_a, peer, idx=1)
+        self.connect_responder(node_a, peer, idx=1, automatic=True)
         peer.wait_for_connect()
         peer.wait_for_verack()
         peer.sync_with_ping()
@@ -238,6 +296,15 @@ class P2PV2PQFallbackTest(BitcoinTestFramework):
         assert_equal(counters(node_a), before)
         node_a.disconnect_p2ps()
         self.wait_no_peers(node_a)
+
+        self.log.info("A manual connection to it still negotiates, and so still sees the malformed offer")
+        with node_a.assert_debug_log(["v2 pq: malformed_record reason=ek_modulus role=initiator conn_type=manual"]):
+            peer = MalformedOfferPeer()
+            self.connect_responder(node_a, peer, idx=1)
+            self.wait_until(lambda: counters(node_a)["outbound_malformed_record"] == attempts + 1)
+            peer.wait_for_disconnect()
+            self.wait_no_peers(node_a)
+        assert_equal(node_a.getpqtransportinfo()["fallback_set"], [entry])
 
     def test_inbound_and_success_exclusion(self):
         node_a = self.nodes[0]
@@ -259,7 +326,7 @@ class P2PV2PQFallbackTest(BitcoinTestFramework):
 
         self.log.info("Outbound failures after a hybrid success with the same endpoint never lead to a fallback")
         peer = P2PInterface()
-        self.connect_responder(node_a, peer, idx=2)
+        self.connect_responder(node_a, peer, idx=2, automatic=True)
         peer.wait_for_connect()
         peer.wait_for_verack()
         assert_equal(node_a.getpeerinfo()[0]["transport_pq_status"], "hybrid")
@@ -267,7 +334,7 @@ class P2PV2PQFallbackTest(BitcoinTestFramework):
         self.wait_no_peers(node_a)
         for attempt in range(1, 5):
             peer = MalformedOfferPeer()
-            self.connect_responder(node_a, peer, idx=2)
+            self.connect_responder(node_a, peer, idx=2, automatic=True)
             self.wait_until(lambda: counters(node_a)["outbound_malformed_record"] == attempt)
             peer.wait_for_disconnect()
             self.wait_no_peers(node_a)
@@ -302,7 +369,7 @@ class P2PV2PQFallbackTest(BitcoinTestFramework):
         for i, (target, endpoint) in enumerate(attempts, start=1):
             self.log.info(f"- {target}")
             peer = MalformedOfferPeer()
-            self.connect_responder(node_a, peer, idx=3, target=target)
+            self.connect_responder(node_a, peer, idx=3, target=target, automatic=True)
             self.wait_until(lambda: counters(node_a)["outbound_malformed_record"] == i)
             peer.wait_for_disconnect()
             self.wait_no_peers(node_a)
@@ -326,7 +393,7 @@ class P2PV2PQFallbackTest(BitcoinTestFramework):
         self.log.info("Only the endpoint in the fallback set runs plain v2")
         before = counters(node_a)
         peer = MalformedOfferPeer()
-        self.connect_responder(node_a, peer, idx=3, target="alpha.pqtest.:9001")
+        self.connect_responder(node_a, peer, idx=3, target="alpha.pqtest.:9001", automatic=True)
         peer.wait_for_connect()
         peer.wait_for_verack()
         assert_equal(node_a.getpeerinfo()[0]["transport_pq_status"], "fallback")
@@ -334,7 +401,7 @@ class P2PV2PQFallbackTest(BitcoinTestFramework):
         self.wait_no_peers(node_a)
         assert_equal(counters(node_a), before)
         peer = MalformedOfferPeer()
-        self.connect_responder(node_a, peer, idx=3, target="beta.pqtest:9001")
+        self.connect_responder(node_a, peer, idx=3, target="beta.pqtest:9001", automatic=True)
         self.wait_until(lambda: counters(node_a)["outbound_malformed_record"] == len(attempts) + 1)
         peer.wait_for_disconnect()
         self.wait_no_peers(node_a)

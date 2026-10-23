@@ -191,7 +191,7 @@ verified, and <!--pq:field-->`transport_pq_status`:
 | <!--pq:value-->`pending` | Still negotiating. A connection that is closing after a hybrid failure also stays `pending` until it is removed: there is no failed status, and the failure is counted in `getpqtransportinfo`. A handshake that doesn't finish within 60 seconds (`-peertimeout`) is closed. |
 | <!--pq:value-->`hybrid` | The session keys are hybrid. |
 | <!--pq:value-->`legacy_peer` | The peer's handshake carried no hybrid offer or accept, so the connection keeps the ECDH keys, as before. Peers running v1.0.0, or with the feature off, show this. |
-| <!--pq:value-->`fallback` | Plain v2 to an address in the fallback set (outbound only). |
+| <!--pq:value-->`fallback` | Plain v2 to an address in the fallback set (automatic outbound connections only). |
 | <!--pq:value-->`off` | Plain v2 because the feature is off on this node, the offer was shed under load, or a local ML-KEM fault happened before anything was committed. |
 | <!--pq:value-->`v1` | An unencrypted v1 connection. |
 
@@ -213,18 +213,30 @@ peers show `off` and `connections_pq` is 0.
 
 ## Fallback and Load Shedding
 
-**Fallback.** If hybrid handshakes with the same outbound address fail three
-times in a row, the node stops trying hybrid keys with that address for an hour,
-and connects to it with plain v2 instead, so that a broken peer or a middlebox
-that mangles the handshake can't keep the connection from working. The second
-time the address falls back it stays out for 4 hours, and from then on for 24
-hours. Only failures the peer side can cause count:
-<!--pq:value-->`malformed_record`, <!--pq:value-->`first_packet_failed` and
-<!--pq:value-->`closed_after_switch`. An address that completed a hybrid
-handshake since startup never falls back, inbound connections never fall back,
-and a restart forgets the whole history. `getpqtransportinfo` lists the
-addresses in <!--pq:field-->`fallback_set`, with <!--pq:field-->`expires`, and
-those on their way there in <!--pq:field-->`failure_streaks`.
+**Fallback.** If hybrid handshakes of automatic outbound connections with the
+same address fail three times in a row, the node stops trying hybrid keys with
+that address for an hour, and connects to it with plain v2 instead, so that a
+broken peer or a middlebox that mangles the handshake can't keep the connection
+from working. The second time the address falls back it stays out for 4 hours,
+and from then on for 24 hours. Each window is also measured on the node's
+monotonic clock, so setting the clock back can't lengthen it. Only failures the
+peer side can cause count: <!--pq:value-->`malformed_record`,
+<!--pq:value-->`first_packet_failed` and <!--pq:value-->`closed_after_switch`.
+An address that completed a hybrid handshake since startup never falls back
+(the node remembers the 1,000 that did so most recently), inbound connections
+never fall back, and a restart forgets the whole history. `getpqtransportinfo`
+lists the addresses in <!--pq:field-->`fallback_set`, with
+<!--pq:field-->`expires`, and those on their way there in
+<!--pq:field-->`failure_streaks`.
+
+**Manual peers never fall back.** Someone on the network path between you and
+a peer can cause those failures without breaking any keys, by damaging or
+dropping packets, and so keep an automatic peer on ECDH keys. Connections you
+make yourself, with <!--pq:rpc-->`addnode` or <!--pq:opt-->`-connect` (also
+<!--pq:opt-->`-addnode`), always negotiate hybrid keys, even to an address in
+the fallback set, and their failures never count toward it; they are still
+counted, listed in `recent_failures` and logged. If hybrid keys with particular
+peers matter to you, add them with `addnode`.
 
 **Load shedding.** An offer costs the responding node an ML-KEM key generation,
 and a decapsulation when the peer accepts. If more inbound v2 connections than
@@ -255,8 +267,9 @@ It does not:
   `session_id` out of band detects that.
 - **Protect traffic to v1.0.0 nodes,** or to any peer that has the feature off:
   those connections use ECDH keys (v2) or no encryption (v1), as before. The
-  fallback, load shedding and local faults also leave some connections on ECDH
-  keys; `transport_pq` reports which.
+  fallback, which someone on the network path can trigger for automatic peers,
+  load shedding and local faults also leave some connections on ECDH keys;
+  `transport_pq` reports which.
 - **Hide where transactions come from.** Your peers see which transactions you
   announce, and when, as before, which can reveal that one started at your node.
 - **Hide that you use it.** Hybrid sessions can be told apart from plain v2 by
@@ -301,13 +314,13 @@ details such as `role=`, `peer=` and the ML-KEM-1024 backends; counters are in
 | <!--pq:log-->`was given 0 or a non-numeric value, so it was read as` | A double negative switched the feature on. | `-nov2pqtransport=0` or `nov2pqtransport=true`. | Use `v2pqtransport=0` to switch it off. |
 | <!--pq:field-->`legacy_peer` (counter and status) | The peer sent no hybrid offer or accept (reason <!--pq:value-->`no_features`), or contents qbit can't parse (<!--pq:value-->`parse_error`). | The peer runs v1.0.0 or has the feature off. `parse_error`: another implementation or a bug. | Nothing for `no_features`; it is normal while the network upgrades. `parse_error` from many peers: open an issue. |
 | <!--pq:log-->`v2 pq: load_shedding started threshold_per_s=…`, <!--pq:log-->`v2 pq: load_shedding stopped`, counter `shed` | Load shedding started or stopped. | A connection flood, or many peers reconnecting at once. | Nothing; those connections continue as plain v2. If it stays on, check where inbound connections come from (`qbit-cli -netinfo 4`), and consider firewall rules or `-maxconnections`. |
-| <!--pq:log-->`v2 pq: malformed_record reason=…`, counter <!--pq:field-->`malformed_record` | The peer's offer (<!--pq:value-->`ek_length`, <!--pq:value-->`ek_modulus`) or accept (<!--pq:value-->`ct_length`) was malformed. The connection closes; outbound, it counts toward the fallback. | A non-conforming implementation, or tampering in transit. | One-off: nothing. From many peers: report it. |
-| <!--pq:log-->`v2 pq: first_packet_failed reason=…`, counter `first_packet_failed` | The peer's key confirmation failed (<!--pq:value-->`length`, <!--pq:value-->`tag` or <!--pq:value-->`not_decoy`): the two sides derived different keys. The connection closes; outbound, it counts toward the fallback. | Tampering in transit, a peer bug, or this node's ML-KEM code (see `local_fault`). | One-off: nothing. From many peers: report it. |
-| <!--pq:log-->`v2 pq: closed_after_switch cause=…`, counter <!--pq:field-->`closed_after_switch` | After this node switched to hybrid keys, the peer closed (<!--pq:value-->`eof`), reset (<!--pq:value-->`reset`) or timed out (<!--pq:value-->`timeout`) before its key confirmation arrived. Counts toward the fallback. | The peer restarted, the network dropped, or the peer's check of our confirmation failed. | One-off: nothing. Often with one peer: ask its operator for their side's log. |
+| <!--pq:log-->`v2 pq: malformed_record reason=…`, counter <!--pq:field-->`malformed_record` | The peer's offer (<!--pq:value-->`ek_length`, <!--pq:value-->`ek_modulus`) or accept (<!--pq:value-->`ct_length`) was malformed. The connection closes; on an automatic outbound connection, it counts toward the fallback. | A non-conforming implementation, or tampering in transit. | One-off: nothing. From many peers: report it. |
+| <!--pq:log-->`v2 pq: first_packet_failed reason=…`, counter `first_packet_failed` | The peer's key confirmation failed (<!--pq:value-->`length`, <!--pq:value-->`tag` or <!--pq:value-->`not_decoy`): the two sides derived different keys. The connection closes; on an automatic outbound connection, it counts toward the fallback. | Tampering in transit, a peer bug, or this node's ML-KEM code (see `local_fault`). | One-off: nothing. From many peers: report it. |
+| <!--pq:log-->`v2 pq: closed_after_switch cause=…`, counter <!--pq:field-->`closed_after_switch` | After this node switched to hybrid keys, the peer closed (<!--pq:value-->`eof`), reset (<!--pq:value-->`reset`) or timed out (<!--pq:value-->`timeout`) before its key confirmation arrived. On an automatic connection, it counts toward the fallback. | The peer restarted, the network dropped, or the peer's check of our confirmation failed. | One-off: nothing. Often with one peer: ask its operator for their side's log. |
 | <!--pq:log-->`v2 pq: internal_error reason=…`, counter <!--pq:field-->`internal_error` | A local ML-KEM or cipher-state error (<!--pq:value-->`keygen`, <!--pq:value-->`check_public_key`, <!--pq:value-->`encaps`, <!--pq:value-->`decaps`, <!--pq:value-->`cipher_state`). Peer data never causes it. | A fault in this node's ML-KEM code or its CPU. | Report it. Try <!--pq:opt-->`-mlkemportable`. If a peer can trigger it, use `SECURITY.md`. |
-| <!--pq:log-->`v2 pq: fallback cause=… until=…`, counter <!--pq:field-->`fallback` | An outbound address failed three times in a row, and gets plain v2 until the time given (UTC). | See the failure it names. | Usually nothing: the window ends by itself, and a restart clears it. Many addresses: see `local_fault`. |
-| <!--pq:log-->`v2 pq: local_fault` | Hybrid handshakes failed with 8 different outbound addresses and none succeeded since startup, so this node's own ML-KEM code may be at fault. | A miscompiled or misbehaving native ML-KEM path, or a broken CPU. | If the line names native code, restart with `-mlkemportable`, as it suggests. Report it either way. |
-| <!--pq:field-->`abandoned` (inbound) | An initiator read our offer and closed before sending its version packet. | Port scanners, peers giving up, flaky links. | Nothing at low rates. Many, together with `shed`: a flood. |
+| <!--pq:log-->`v2 pq: fallback cause=… until=…`, counter <!--pq:field-->`fallback` | An address failed three times in a row on automatic outbound connections, and gets plain v2 on them until the time given (UTC). | See the failure it names. | Usually nothing: the window ends by itself, and a restart clears it. To keep hybrid keys with a peer, add it with `addnode`. Many addresses: see `local_fault`. |
+| <!--pq:log-->`v2 pq: local_fault` | Hybrid handshakes failed with 8 different outbound addresses, in ways this node's own ML-KEM code can cause (`ek_modulus`, `length`, `tag`, or `closed_after_switch` with `eof` or `reset`), and none succeeded since startup, so that code may be at fault. Failures only the peer can cause (`ek_length`, `not_decoy`) and `timeout` don't count. | A miscompiled or misbehaving native ML-KEM path, or a broken CPU. | If the line names native code, restart with `-mlkemportable`, as it suggests. Report it either way. |
+| <!--pq:field-->`abandoned` (inbound) | This node offered, and the connection closed before the initiator's version packet authenticated, whichever side closed it. The reason is the close cause, or what failed (<!--pq:value-->`garbage_terminator`, <!--pq:value-->`version_length`, <!--pq:value-->`version_tag`); <!--pq:value-->`local` is this node's own close, such as an eviction. Closes because the network was switched off, or at shutdown, aren't counted. | Port scanners, peers giving up, flaky links; with `local`, evictions when the inbound slots are full. | Nothing at low rates. Many, together with `shed`: a flood. |
 | `transport_pq_status` stays `pending` | The handshake is still running, or the connection is closing after a failure. | A slow link, or a failure counted above. | It ends within 60 seconds. Look for the peer's `peer_id` in `recent_failures`. |
 | `transport_pq_status` is `off` while `enabled` is true | This connection is plain v2. | The offer was shed, or a local fault (`internal_error`) before anything was committed. | Check `shed` and `internal_error`. |
 
