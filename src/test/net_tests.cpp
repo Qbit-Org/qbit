@@ -1282,6 +1282,8 @@ CKey GenerateRandomTestKey(FastRandomContext& rng) noexcept
 class V2TransportTester
 {
     FastRandomContext& m_rng;
+    //! The ML-KEM operations m_transport uses, which keeps a reference to them: declared before it to outlive it.
+    const PQKemOps m_kem_ops;
     V2Transport m_transport; //!< V2Transport being tested
     BIP324Cipher m_cipher; //!< Cipher to help with the other side
     bool m_test_initiator; //!< Whether m_transport is the initiator (true) or responder (false)
@@ -1298,16 +1300,18 @@ public:
     /** Construct a tester object. test_initiator: whether the tested transport is initiator. */
     explicit V2TransportTester(FastRandomContext& rng, bool test_initiator, V2PQOptions pq = {})
         : m_rng{rng},
+          m_kem_ops{DefaultPQKemOps()},
           m_transport{0, test_initiator, pq},
           m_cipher{GenerateRandomTestKey(m_rng), MakeByteSpan(m_rng.rand256())},
           m_test_initiator(test_initiator),
           m_peer_pq{!test_initiator, PQMode::NEGOTIATE} {}
 
-    /** Construct a tester object whose transport uses the given ML-KEM entropy and operations. */
+    /** Construct a tester object whose transport uses the given ML-KEM entropy and (a copy of the) operations. */
     V2TransportTester(FastRandomContext& rng, bool test_initiator, V2PQOptions pq, PQRandomSource random, const PQKemOps& ops)
         : m_rng{rng},
+          m_kem_ops{ops},
           m_transport{0, test_initiator, GenerateRandomTestKey(rng), MakeByteSpan(rng.rand256()),
-                      rng.randbytes<uint8_t>(rng.randrange(V2Transport::MAX_GARBAGE_LEN + 1)), pq, random, ops},
+                      rng.randbytes<uint8_t>(rng.randrange(V2Transport::MAX_GARBAGE_LEN + 1)), pq, random, m_kem_ops},
           m_cipher{GenerateRandomTestKey(m_rng), MakeByteSpan(m_rng.rand256())},
           m_test_initiator(test_initiator),
           m_peer_pq{!test_initiator, PQMode::NEGOTIATE} {}

@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <map>
@@ -289,6 +290,43 @@ bool NamesEncType(std::string_view message)
     const std::string lower{ToLower(message)};
     return std::ranges::any_of(phrases, [&](std::string_view phrase) { return lower.find(phrase) != std::string::npos; });
 }
+
+/**
+ * `sock`, with every wait ending by `deadline` on the steady clock. `Sock::SendComplete()` and
+ * `Sock::RecvUntilTerminator()` measure their timeout on the mockable clock, which a wall clock
+ * step moves and `setmocktime` freezes. Called through this, they also give up once `deadline`
+ * passes, at their next wait. Only for those two.
+ */
+class SteadyDeadlineSock final : public Sock
+{
+public:
+    SteadyDeadlineSock(const Sock& sock, SAMDeadline deadline, const std::string& request)
+        : Sock{INVALID_SOCKET}, m_sock{sock}, m_deadline{deadline}, m_request{request} {}
+
+    ssize_t Send(const void* data, size_t len, int flags) const override { return m_sock.Send(data, len, flags); }
+    ssize_t Recv(void* buf, size_t len, int flags) const override { return m_sock.Recv(buf, len, flags); }
+
+    bool Wait(std::chrono::milliseconds timeout, Event requested, Event* occurred = nullptr) const override
+    {
+        const auto now{std::chrono::steady_clock::now()};
+        if (now >= m_deadline) {
+            throw std::runtime_error(strprintf("Timed out during \"%s\"", m_request));
+        }
+        return m_sock.Wait(std::min(timeout, std::chrono::ceil<std::chrono::milliseconds>(m_deadline - now)), requested, occurred);
+    }
+
+    SteadyDeadlineSock& operator=(Sock&&) override
+    {
+        assert(false && "Move of Sock into SteadyDeadlineSock not allowed.");
+        return *this;
+    }
+
+private:
+    const Sock& m_sock;
+    const SAMDeadline m_deadline;
+    /** The request as logged. */
+    const std::string& m_request;
+};
 } // namespace
 
 void ResetRouterHybridStateForTest()
@@ -501,7 +539,10 @@ Session::Reply Session::SendRequestAndGetReply(const Sock& sock,
         return std::chrono::ceil<std::chrono::milliseconds>(deadline - now);
     };
 
-    sock.SendComplete(request + "\n", std::min<std::chrono::milliseconds>(MAX_WAIT_FOR_IO, time_left()), *m_interrupt);
+    // The timeouts below are on the mockable clock, `bounded` holds `deadline` on the steady one.
+    const SteadyDeadlineSock bounded{sock, deadline, reply.request};
+
+    bounded.SendComplete(request + "\n", std::min<std::chrono::milliseconds>(MAX_WAIT_FOR_IO, time_left()), *m_interrupt);
 
     // It could take a few minutes for the I2P router to reply as it is querying the I2P network
     // (when doing name lookup, for example). Notice: `RecvUntilTerminator()` is checking
@@ -509,7 +550,7 @@ Session::Reply Session::SendRequestAndGetReply(const Sock& sock,
     // signaled.
     static constexpr auto recv_timeout = 3min;
 
-    reply.full = sock.RecvUntilTerminator('\n', std::min<std::chrono::milliseconds>(recv_timeout, time_left()), *m_interrupt, MAX_MSG_SIZE);
+    reply.full = bounded.RecvUntilTerminator('\n', std::min<std::chrono::milliseconds>(recv_timeout, time_left()), *m_interrupt, MAX_MSG_SIZE);
 
     for (const auto& kv : Split(reply.full, ' ')) {
         const auto pos{std::ranges::find(kv, '=')};

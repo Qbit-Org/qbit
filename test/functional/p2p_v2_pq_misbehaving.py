@@ -388,6 +388,12 @@ class P2PV2PQMisbehavingTest(BitcoinTestFramework):
                       logs=["V2 transport error: key confirmation failed (length)",
                             "v2 pq: first_packet_failed reason=length role=initiator"],
                       deltas={"outbound_switched": 1, "outbound_first_packet_failed": 1})
+        self.log.info("The same responder failing the node's confirmation in turn: it sends its own first, so the node "
+                      "fails the confirmation rather than see the connection close")
+        self.run_case(inbound=False, peer=ScriptedPeer(hybrid_shared_secret=wrong_secret), kept=False,
+                      logs=["V2 transport error: key confirmation failed (length)",
+                            "v2 pq: first_packet_failed reason=length role=initiator"],
+                      deltas={"outbound_switched": 1, "outbound_first_packet_failed": 1})
 
     def test_decoys_and_partial_writes(self):
         def decoys(state):

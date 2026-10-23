@@ -17,6 +17,7 @@
 #include <util/readwritefile.h>
 #include <util/string.h>
 #include <util/threadinterrupt.h>
+#include <util/time.h>
 
 #include <boost/test/unit_test.hpp>
 
@@ -113,6 +114,12 @@ std::string UnnamedRejectionInfo(const Proxy& router, const std::string& session
 /** Errors when creating a session runs out of time, depending on the step it was at. */
 const std::vector<std::string> TIMEOUT_ERRORS{"Receive timeout", "Timed out during", "Timed out connecting to"};
 
+/**
+ * How much later than a test's `start` plus the creation timeout a wait may end: the session
+ * sets its deadline just after `start`, and waits are rounded up to milliseconds.
+ */
+constexpr auto DEADLINE_SLACK{50ms};
+
 void SetSockError(int err)
 {
 #ifdef WIN32
@@ -178,15 +185,15 @@ public:
     }
 
     /**
-     * The timeout of every reply a router's connections waited for, per connection. On a
-     * connection, the n-th one is for the n-th request.
+     * The latest time a wait on each of a router's connections, other than for a pending connect,
+     * could have ended (or `time_point::min()` if it had none), per connection.
      */
-    std::vector<std::vector<std::chrono::milliseconds>> RecvTimeouts(const std::string& name) const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
+    std::vector<std::chrono::steady_clock::time_point> LatestWaitEnds(const std::string& name) const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
     {
         LOCK(m_mutex);
-        auto recv_timeouts{m_routers.at(name).recv_timeouts};
-        recv_timeouts.resize(m_routers.at(name).requests.size());
-        return recv_timeouts;
+        auto wait_ends{m_routers.at(name).latest_wait_ends};
+        wait_ends.resize(m_routers.at(name).requests.size(), std::chrono::steady_clock::time_point::min());
+        return wait_ends;
     }
 
     /** The timeout of every wait for a pending connect to a router. */
@@ -221,7 +228,7 @@ private:
     struct RouterState {
         Router router;
         std::vector<std::vector<std::string>> requests{};
-        std::vector<std::vector<std::chrono::milliseconds>> recv_timeouts{};
+        std::vector<std::chrono::steady_clock::time_point> latest_wait_ends{};
         std::vector<std::chrono::milliseconds> connect_waits{};
     };
 
@@ -304,15 +311,6 @@ private:
         return len;
     }
 
-    void RecordRecvTimeout(uint64_t id, std::chrono::milliseconds timeout) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
-    {
-        LOCK(m_mutex);
-        const SockState& sock{m_socks.at(id)};
-        RouterState& router{m_routers.at(sock.router)};
-        router.recv_timeouts.resize(router.requests.size());
-        router.recv_timeouts.at(sock.conn).push_back(timeout);
-    }
-
     ssize_t Recv(uint64_t id, void* buf, size_t len, int flags) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)
     {
         LOCK(m_mutex);
@@ -335,19 +333,24 @@ private:
         {
             LOCK(m_mutex);
             const SockState& sock{m_socks.at(id)};
+            RouterState& router{m_routers.at(sock.router)};
             if (sock.connect_pending) {
-                RouterState& router{m_routers.at(sock.router)};
                 router.connect_waits.push_back(timeout);
                 on_connect_wait = router.router.on_connect_wait;
                 wait_number = router.connect_waits.size();
-            } else if ((requested & Sock::RECV) && Readable(sock)) {
-                if (occurred) *occurred = Sock::RECV;
-                return true;
-            } else if (requested & Sock::SEND) {
-                if (occurred) *occurred = Sock::SEND;
-                return true;
-            } else if (!sock.inbox.empty()) {
-                sleep = std::min(sleep, sock.inbox_ready - std::chrono::steady_clock::now());
+            } else {
+                router.latest_wait_ends.resize(router.requests.size(), std::chrono::steady_clock::time_point::min());
+                auto& latest{router.latest_wait_ends.at(sock.conn)};
+                latest = std::max(latest, std::chrono::steady_clock::now() + timeout);
+                if ((requested & Sock::RECV) && Readable(sock)) {
+                    if (occurred) *occurred = Sock::RECV;
+                    return true;
+                } else if (requested & Sock::SEND) {
+                    if (occurred) *occurred = Sock::SEND;
+                    return true;
+                } else if (!sock.inbox.empty()) {
+                    sleep = std::min(sleep, sock.inbox_ready - std::chrono::steady_clock::now());
+                }
             }
         }
         if (on_connect_wait) on_connect_wait(wait_number);
@@ -379,15 +382,6 @@ public:
         return m_routers.Wait(m_id, timeout, requested, occurred);
     }
     bool IsConnected(std::string&) const override { return true; }
-
-    std::string RecvUntilTerminator(uint8_t terminator,
-                                    std::chrono::milliseconds timeout,
-                                    CThreadInterrupt& interrupt,
-                                    size_t max_data) const override
-    {
-        m_routers.RecordRecvTimeout(m_id, timeout);
-        return Sock::RecvUntilTerminator(terminator, timeout, interrupt, max_data);
-    }
 
     MockSamSock& operator=(Sock&&) override
     {
@@ -1249,13 +1243,12 @@ BOOST_AUTO_TEST_CASE(hybrid_retry_deadline_and_interrupt)
 
         const auto requests{routers.Requests(router.ToString())};
         BOOST_CHECK_EQUAL(CountEncTypes(Creates(requests), "4,0"), 0U);
-        // Every wait for an answer ends by the deadline: the retry's waits got what was left
-        // after the first attempt's two answers. Deadlines are rounded up to milliseconds.
-        const auto recv_timeouts{routers.RecvTimeouts(router.ToString())};
-        for (size_t c{0}; c < recv_timeouts.size(); ++c) {
-            for (const auto timeout : recv_timeouts[c]) {
-                BOOST_CHECK(timeout <= (c == 0 ? create_timeout : create_timeout - 2 * delay) + 1ms);
-            }
+        // Every wait for an answer ends by the deadline: the retry's waits got only what was
+        // left after the first attempt's two answers.
+        const auto wait_ends{routers.LatestWaitEnds(router.ToString())};
+        BOOST_REQUIRE_EQUAL(wait_ends.size(), 2U);
+        for (const auto end : wait_ends) {
+            BOOST_CHECK(end <= start + create_timeout + DEADLINE_SLACK);
         }
         BOOST_CHECK_EQUAL(routers.OpenSocks(), 0U);
 
@@ -1322,15 +1315,63 @@ BOOST_AUTO_TEST_CASE(hybrid_deadline_covers_dest_generate)
     BOOST_CHECK(requests[0][1].starts_with("DEST GENERATE"));
     BOOST_CHECK_EQUAL(Creates(requests).size(), 0U);
     // The wait for the new key ends by the deadline, not after the usual 3 minutes.
-    const auto recv_timeouts{routers.RecvTimeouts(router.ToString())};
-    BOOST_REQUIRE_EQUAL(recv_timeouts[0].size(), 2U);
-    BOOST_CHECK(recv_timeouts[0][1] <= create_timeout + 1ms);
+    const auto wait_ends{routers.LatestWaitEnds(router.ToString())};
+    BOOST_REQUIRE_EQUAL(wait_ends.size(), 1U);
+    BOOST_CHECK(wait_ends[0] <= start + create_timeout + DEADLINE_SLACK);
     BOOST_CHECK(!fs::exists(key_file));
     BOOST_CHECK_EQUAL(routers.OpenSocks(), 0U);
 
     accept = true;
     BOOST_REQUIRE(session.Listen(conn));
     BOOST_CHECK(fs::exists(key_file));
+}
+
+BOOST_AUTO_TEST_CASE(hybrid_deadline_steady_clock)
+{
+    MockSamRouters routers;
+    CreateSock = [&routers](int, int, int) { return routers.NewSock(); };
+    LogCapture log;
+
+    // The router never answers "SESSION CREATE". The socket's own timeouts are on the mockable
+    // clock: frozen, or stepped back while the router stalls, it never ends the wait. The
+    // creation deadline is on the steady clock and still does. (Should it not, the interrupt
+    // ends the wait eventually, with another error.)
+    constexpr auto create_timeout{500ms};
+    uint16_t port{17094};
+    for (const bool step_back : {false, true}) {
+        BOOST_TEST_MESSAGE((step_back ? "mockable clock stepped back" : "mockable clock frozen"));
+        const Proxy router{TestRouter(port++)};
+        routers.AddRouter(router.ToString(), {.script = RouterScript([&](const std::string&) {
+                                                  if (step_back) SetMockTime(GetMockTime() - 1h);
+                                                  return Response{.action = Action::STALL};
+                                              })});
+        SetMockTime(GetTime<std::chrono::seconds>());
+
+        CThreadInterrupt interrupt;
+        CThreadInterrupt stop_watchdog;
+        std::thread watchdog{[&] {
+            if (stop_watchdog.sleep_for(20s)) interrupt();
+        }};
+        i2p::sam::Session session{router, &interrupt, create_timeout};
+        i2p::Connection conn;
+        const auto start{std::chrono::steady_clock::now()};
+        BOOST_CHECK(!session.Listen(conn));
+        const auto elapsed{std::chrono::steady_clock::now() - start};
+        stop_watchdog();
+        watchdog.join();
+        SetMockTime(0s);
+
+        BOOST_CHECK(ListenFailedWith(log, {"Timed out during \"SESSION CREATE ...\""}));
+        BOOST_CHECK(elapsed >= create_timeout);
+        BOOST_CHECK(elapsed < 15s);
+        const auto requests{routers.Requests(router.ToString())};
+        BOOST_REQUIRE_EQUAL(requests.size(), 1U);
+        BOOST_CHECK_EQUAL(Creates(requests).size(), 1U);
+        const auto wait_ends{routers.LatestWaitEnds(router.ToString())};
+        BOOST_REQUIRE_EQUAL(wait_ends.size(), 1U);
+        BOOST_CHECK(wait_ends[0] <= start + create_timeout + DEADLINE_SLACK);
+        BOOST_CHECK_EQUAL(routers.OpenSocks(), 0U);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(hybrid_connect_capped_by_timeout)
