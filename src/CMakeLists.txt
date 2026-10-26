@@ -27,6 +27,7 @@ include(../cmake/secp256k1.cmake)
 add_secp256k1(secp256k1)
 include(../cmake/libbitcoinpqc.cmake)
 add_libbitcoinpqc(libbitcoinpqc)
+add_mlkem_native()
 
 # Set top-level target output locations.
 if(NOT CMAKE_RUNTIME_OUTPUT_DIRECTORY)
@@ -190,9 +191,11 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   auxpow_validation.cpp
   banman.cpp
   bip324.cpp
+  bip324_pq.cpp
   blockencodings.cpp
   blockfilter.cpp
   consensus/tx_verify.cpp
+  crypto/mlkem.cpp
   dbwrapper.cpp
   deploymentstatus.cpp
   flatfile.cpp
@@ -292,6 +295,7 @@ target_link_libraries(bitcoin_node
     $<TARGET_NAME_IF_EXISTS:bitcoin_zmq>
     leveldb
     minisketch
+    mlkem_native
     univalue
     Boost::headers
     $<TARGET_NAME_IF_EXISTS:libevent::core>

@@ -23,6 +23,7 @@ TEST_FRAMEWORK_MODULES = [
     "crypto.ellswift",
     "key",
     "messages",
+    "crypto.mlkem",
     "network_sim",
     "crypto.muhash",
     "crypto.poly1305",
@@ -31,6 +32,7 @@ TEST_FRAMEWORK_MODULES = [
     "script",
     "script_util",
     "segwit_addr",
+    "v2_p2p",
     "wallet_util",
 ]
 

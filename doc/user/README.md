@@ -39,3 +39,4 @@ network-resource status pages.
 
 - [Tor Support](network/tor.md)
 - [I2P Support](network/i2p.md)
+- [Hybrid Post-Quantum v2 Transport](network/pq-transport.md)

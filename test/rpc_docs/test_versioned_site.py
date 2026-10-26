@@ -80,7 +80,6 @@ class VersionDiscoveryTest(unittest.TestCase):
         plan = versioned_site.build_plan(
             [release("v1.0.0")],
             development_ref="topic/ref",
-            development_checkout_ref="refs/pull/12/merge",
             publisher_sha="2" * 40,
             repository="Qbit-Org/qbit",
             release_resolver=lambda _release: "1" * 40,
@@ -90,9 +89,9 @@ class VersionDiscoveryTest(unittest.TestCase):
         self.assertEqual(plan["latest"], "v1.0.0")
         self.assertEqual([entry["id"] for entry in plan["builds"]], ["v1.0.0", "main"])
         self.assertEqual(plan["development"]["source_ref"], "topic/ref")
-        self.assertEqual(
-            plan["development"]["source_checkout_ref"], "refs/pull/12/merge"
-        )
+        # The build checks out the resolved commit itself, never a ref that can move.
+        self.assertEqual(plan["development"]["source_sha"], "3" * 40)
+        self.assertEqual(plan["development"]["source_checkout_ref"], "3" * 40)
         self.assertIn("33333333", plan["development"]["label"])
 
     def test_duplicate_release_tag_is_rejected(self) -> None:

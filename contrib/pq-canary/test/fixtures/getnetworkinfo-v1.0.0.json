@@ -1,0 +1,10 @@
+{
+  "version": 10000,
+  "subversion": "/qbit:1.0.0/",
+  "protocolversion": 70016,
+  "localrelay": true,
+  "networkactive": true,
+  "connections": 38,
+  "connections_in": 28,
+  "connections_out": 10
+}

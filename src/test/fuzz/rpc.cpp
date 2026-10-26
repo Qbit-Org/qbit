@@ -182,6 +182,7 @@ const std::vector<std::string> RPC_COMMANDS_SAFE_FOR_FUZZING{
     "getorphanmetrics",
     "getorphantxs",
     "getpeerinfo",
+    "getpqtransportinfo",
     "getprioritisedtransactions",
     "getrawaddrman",
     "getrawmempool",
@@ -412,6 +413,8 @@ FUZZ_TARGET(rpc,
     FuzzedDataProvider fuzzed_data_provider{buffer.data(), buffer.size()};
     bool good_data{true};
     SetMockTime(ConsumeTime(fuzzed_data_provider));
+    // getpqtransportinfo reads the steady clock, which bounds fallback windows.
+    MockableSteadyClock::SetMockTime(MockableSteadyClock::INITIAL_MOCK_TIME);
     const std::string rpc_command = g_limit_to_rpc_command.empty() ? fuzzed_data_provider.ConsumeRandomLengthString(64) : g_limit_to_rpc_command;
     const bool safe_for_fuzzing = std::find(RPC_COMMANDS_SAFE_FOR_FUZZING.begin(), RPC_COMMANDS_SAFE_FOR_FUZZING.end(), rpc_command) != RPC_COMMANDS_SAFE_FOR_FUZZING.end();
     if (!safe_for_fuzzing) {

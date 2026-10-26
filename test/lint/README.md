@@ -130,6 +130,22 @@ The check accepts the exact documented downstream lockfile patch for
 `RUSTSEC-2026-0204-crossbeam-epoch-0.9.20`. Any other subtree drift remains a
 failure.
 
+mlkem-native-check.sh
+=====================
+Run this script from the root of the repository to verify offline that the
+vendored `src/mlkem-native` tree is byte-identical to the mlkem-native release
+pinned in `contrib/devtools/mlkem-native.pin`:
+
+```
+test/lint/mlkem-native-check.sh
+```
+
+It compares the git tree id of `src/mlkem-native/mlkem` and the blob id of
+`src/mlkem-native/LICENSE` in `HEAD` with the pinned ids, and fails on any other
+entry or uncommitted change under `src/mlkem-native`. The lint runner's
+`subtree` lint runs it. For the update workflow, see
+[`doc/subtrees/mlkem-native.md`](../../doc/subtrees/mlkem-native.md).
+
 lint-libbitcoinpqc-vectors.py
 =============================
 Run this script from the root of the repository to verify bounded30 SPHINCS+
@@ -145,6 +161,56 @@ sources are absent from the upstream tag, the lint falls back to static
 bounded30 guard checks. A partially present KAT payload, or a missing
 implementation directory, is treated as an error so accidental subtree
 corruption does not silently bypass vector coverage.
+
+lint-pq-doc-tokens.py
+=====================
+Run this script from the root of the repository to check that the interface
+names the hybrid post-quantum v2 transport documents quote still exist:
+
+```
+test/lint/lint-pq-doc-tokens.py
+test/lint/lint-pq-doc-tokens.py --qbitd build/bin/qbitd --qbit-cli build/bin/qbit-cli
+```
+
+A document marks a name with an HTML comment directly before an inline code
+span, such as `<!--pq:opt-->` before `` `-v2pqtransport` ``. The comment doesn't
+render, and the kind says what the name must match:
+
+| Kind | Token | Must be |
+|---|---|---|
+| `opt` | `-name`, `-name=value` or `-noname` | listed by `qbitd -help` or `-help-debug`, or `qbit-cli -help` (a value isn't checked) |
+| `rpc` | an RPC method | registered with `RPCHelpMan` |
+| `field` | an RPC result field, or a dotted path of them | set with `pushKV()` |
+| `value` | a status, reason or other value | exactly a C++ string literal |
+| `log` | a log or warning text, with `…` for each `%s`, `%u` and other conversion | part of a C++ string literal, starting and ending at word boundaries |
+
+It checks every Markdown file under `doc/` with a marker, except the archived
+release notes in `doc/release-notes/`; the specification and the operator guide
+must have marked names. Without binaries, options are checked against the
+`AddArg()` calls that `-help` or `-help-debug` prints, which leaves out those of
+`OptionsCategory::HIDDEN`; `feature_pq_quickstart.py` runs the check with the
+build's `qbitd` and `qbit-cli`. Everything else is checked against the C++
+sources in `src/`, without tests, benchmarks and subtrees.
+
+A malformed, unterminated or empty marker, a marker in a fenced code block and
+an unclosed code block fail with their file and line, so that a typo can't drop
+a name. So does any other comment that starts with `<!--pq`, such as
+`<!--pq-opt-->` or `<!--pqopt-->`, except a
+`<!-- pq-transport-vectors: vector N -->` block in the specification that
+`contrib/devtools/generate-pq-transport-vectors.py` reads. Every run also tests
+the check: in memory, it renames `-v2pqtransport`, the `transport_pq_status`
+field and the load shedding log string, and without binaries moves
+`-v2pqtransport` to `OptionsCategory::HIDDEN`, and requires that exactly those
+names fail, and it feeds the parser malformed markers and the checks near
+misses. Fenced code blocks aren't checked here: the quick start's commands and
+outputs, and the warnings the guide shows, are checked by
+`test/functional/feature_pq_quickstart.py`.
+
+A pull request that changes only public documentation skips the lint job, so
+the `public-docs-lint` job in `.github/workflows/ci.yml` runs this check too,
+without binaries. The specification and the operator guide classify as source
+instead, so a change to only them still runs the lint job and
+`feature_pq_quickstart.py`.
 
 lint-qbit-node-defaults.py
 ==========================

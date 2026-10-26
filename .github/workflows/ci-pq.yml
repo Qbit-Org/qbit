@@ -1,0 +1,602 @@
+# Copyright (c) 2026-present The qbit core developers
+# Distributed under the MIT software license, see the accompanying
+# file COPYING or https://opensource.org/license/mit.
+
+# Post-quantum transport validation (#184). One reusable workflow, run through
+# callers on main, because GitHub schedules and dispatches only workflows whose
+# file is on the default branch:
+# - main's nightly caller runs it on a schedule with source_ref: 1.x.x;
+# - on-demand runs go through main's PQ caller (C4, part 2 of #184), which takes
+#   workflow_dispatch inputs source_ref and jobs and calls ci-pq.yml@1.x.x, for
+#   example gh workflow run ci-maintained-pq.yml -f source_ref=<branch> -f jobs=aarch64-unit.
+#   That caller lands on main after this part merges;
+# - Full Validation (ci.yml) calls it with aarch64-unit, macos-arm64-unit and
+#   macos-x86_64-unit, and in a second call with pq-functional, for every change
+#   that ci/checks/classify_merge_profile.py says needs them.
+# The workflow_dispatch trigger below stays for when this file is on main itself;
+# until then GitHub rejects gh workflow run ci-pq.yml.
+# Jobs: aarch64-unit, s390x-unit (big-endian, emulated), macos-arm64-unit,
+# macos-x86_64-unit and pq-functional (the whole functional suite with
+# --v2pqtransport).
+# The source is resolved once to a commit, every job checks out and verifies
+# that commit, and the summaries record it.
+
+name: PQ CI
+run-name: "PQ CI: ${{ inputs.source_ref || github.ref_name }} (${{ inputs.jobs || 'all jobs' }})"
+
+on:
+  workflow_call:
+    inputs:
+      source_ref:
+        description: 'Branch, tag or full commit hash to validate; empty validates the triggering commit'
+        required: false
+        type: string
+        default: ''
+      jobs:
+        description: 'Comma-separated jobs to run (aarch64-unit, s390x-unit, macos-arm64-unit, macos-x86_64-unit, pq-functional); empty runs all'
+        required: false
+        type: string
+        default: ''
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Branch, tag or full commit hash to validate; empty validates the selected ref'
+        required: false
+        type: string
+        default: ''
+      jobs:
+        description: 'Comma-separated jobs to run (aarch64-unit, s390x-unit, macos-arm64-unit, macos-x86_64-unit, pq-functional); empty runs all'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  resolve-source:
+    name: Resolve source and jobs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      source_mode: ${{ steps.resolve.outputs.source_mode }}
+      requested_ref: ${{ steps.resolve.outputs.requested_ref }}
+      resolved_sha: ${{ steps.resolve.outputs.resolved_sha }}
+      matrix: ${{ steps.select.outputs.matrix }}
+      matrix_count: ${{ steps.select.outputs.matrix_count }}
+      selected: ${{ steps.select.outputs.selected }}
+      run_macos_arm64_unit: ${{ steps.select.outputs.run_macos_arm64_unit }}
+      run_macos_x86_64_unit: ${{ steps.select.outputs.run_macos_x86_64_unit }}
+      run_pq_functional: ${{ steps.select.outputs.run_pq_functional }}
+    steps:
+      - name: Resolve source
+        id: resolve
+        shell: bash
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+          EVENT_REF: ${{ github.ref }}
+          EVENT_SHA: ${{ github.sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          SOURCE_REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}.git
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Resolve the validation source once per run, before any checkout, so
+          # every job builds and reports the same immutable commit. An empty
+          # source_ref keeps the triggering ref and commit; otherwise
+          # resolve_source_ref resolves it.
+          fail() { echo "::error::$*" >&2; exit 1; }
+          is_full_sha() { printf '%s\n' "$1" | LC_ALL=C grep -Eq '^[0-9a-f]{40}$'; }
+
+          # Sets requested_ref and resolved_sha from a non-empty source_ref, or
+          # fails the run: a full commit hash is used as is; a branch or tag
+          # name is looked up on the remote, and an annotated tag is peeled to
+          # its commit. ci-pq.yml and ci-nightly-heavy.yml (for a called run)
+          # share this function; ci/checks/test_ci_pq_contract.py keeps the two
+          # copies identical.
+          resolve_source_ref() {
+            local source_ref="$1" candidate status listing matches peeled
+            local -a candidates patterns auth
+            if is_full_sha "$source_ref"; then
+              requested_ref="$source_ref"
+              resolved_sha="$source_ref"
+              return 0
+            fi
+            case "$source_ref" in
+              refs/heads/?*|refs/tags/?*) candidates=("$source_ref") ;;
+              refs/*) fail "source_ref '$source_ref' must be a branch, a tag or a full commit hash" ;;
+              *) candidates=("refs/heads/$source_ref" "refs/tags/$source_ref") ;;
+            esac
+            patterns=()
+            for candidate in "${candidates[@]}"; do
+              git check-ref-format "$candidate" || fail "source_ref '$source_ref' is not a valid ref name"
+              patterns+=("$candidate" "$candidate^{}")
+            done
+            auth=()
+            if [ -n "${GITHUB_TOKEN:-}" ]; then
+              auth=(-c "http.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')")
+            fi
+            status=0
+            listing="$(git ${auth[@]+"${auth[@]}"} ls-remote --exit-code -- "$SOURCE_REPOSITORY_URL" "${patterns[@]}")" || status=$?
+            case "$status" in
+              0) ;;
+              2) fail "no branch or tag '$source_ref' in '$SOURCE_REPOSITORY_URL'" ;;
+              *) fail "could not list refs from '$SOURCE_REPOSITORY_URL' (git exit code $status)" ;;
+            esac
+            matches="$(printf '%s\n' "$listing" | awk -v a="${candidates[0]}" -v b="${candidates[1]:-}" '$2 == a || $2 == b { print $2 }')"
+            [ "$(printf '%s\n' "$matches" | grep -c .)" -eq 1 ] \
+              || fail "source_ref '$source_ref' must name exactly one branch or tag, found: ${matches:-none}"
+            requested_ref="$matches"
+            peeled="$(printf '%s\n' "$listing" | awk -v ref="$requested_ref^{}" '$2 == ref { print $1 }')"
+            resolved_sha="${peeled:-$(printf '%s\n' "$listing" | awk -v ref="$requested_ref" '$2 == ref { print $1 }')}"
+          }
+
+          source_ref="$(printf '%s' "$SOURCE_REF" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+          if [ -z "$source_ref" ]; then
+            source_mode=event
+            requested_ref="$EVENT_REF"
+            resolved_sha="$EVENT_SHA"
+          else
+            resolve_source_ref "$source_ref"
+            if is_full_sha "$source_ref"; then
+              source_mode=commit
+            else
+              source_mode=ref
+            fi
+          fi
+
+          is_full_sha "$resolved_sha" || fail "resolved source '$resolved_sha' is not a full commit hash"
+          [ -n "$requested_ref" ] || fail "requested ref is empty"
+
+          {
+            echo "source_mode=$source_mode"
+            echo "requested_ref=$requested_ref"
+            echo "resolved_sha=$resolved_sha"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## Validation source"
+            echo
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| source_ref input | ${source_ref:-(empty)} |"
+            echo "| source_mode | $source_mode |"
+            echo "| requested_ref | $requested_ref |"
+            echo "| resolved_sha | $resolved_sha |"
+            echo "| event_sha | $EVENT_SHA |"
+            echo "| workflow_sha | $WORKFLOW_SHA |"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+      - name: Select jobs
+        id: select
+        shell: python3 {0}
+        env:
+          JOBS_INPUT: ${{ inputs.jobs }}
+          # Jobs run as matrix entries; "job" is the name the jobs input uses.
+          JOB_CATALOG: |
+            [
+              {
+                "job": "aarch64-unit",
+                "name": "AArch64 unit tests",
+                "runs-on": "ubuntu-24.04-arm",
+                "timeout-minutes": 120,
+                "file-env": "./ci/test/00_setup_env_native_aarch64_pq.sh",
+                "phase": "mlkem_tests, bip324_tests and net_tests on AArch64 Linux. ML-KEM runs portable C here: its AArch64 assembly has no BTI landing pads."
+              },
+              {
+                "job": "s390x-unit",
+                "name": "s390x big-endian unit tests (emulated)",
+                "runs-on": "ubuntu-24.04",
+                "timeout-minutes": 180,
+                "file-env": "./ci/test/00_setup_env_s390x_unit.sh",
+                "phase": "mlkem_tests, bip324_tests and net_tests cross-built for big-endian s390x and run under qemu-s390x. The timeout stays 180 minutes until runs are measured, then becomes twice the measured time."
+              }
+            ]
+          # Selectable jobs that are not matrix entries; each gets a run_<job> output.
+          NON_MATRIX_JOBS: 'macos-arm64-unit macos-x86_64-unit pq-functional'
+        run: |
+          # Turn the comma-separated jobs input into the matrix: empty selects
+          # every job; an empty, unknown or repeated name fails the run.
+          import json
+          import os
+          import sys
+
+
+          def fail(message):
+              print(f"::error::{message}", file=sys.stderr)
+              sys.exit(1)
+
+
+          catalog = json.loads(os.environ["JOB_CATALOG"])
+          non_matrix = os.environ.get("NON_MATRIX_JOBS", "").split()
+          known = [entry["job"] for entry in catalog] + non_matrix
+          if len(set(known)) != len(known):
+              fail(f"job catalog repeats a name: {known}")
+
+          raw = os.environ.get("JOBS_INPUT", "")
+          if raw.strip():
+              requested = [name.strip() for name in raw.split(",")]
+              if "" in requested:
+                  fail(f"jobs input '{raw}' contains an empty name")
+              repeated = sorted({name for name in requested if requested.count(name) > 1})
+              if repeated:
+                  fail(f"jobs input names a job more than once: {', '.join(repeated)}")
+              unknown = [name for name in requested if name not in known]
+              if unknown:
+                  fail(f"unknown job(s) {', '.join(unknown)}; known jobs: {', '.join(known)}")
+          else:
+              requested = known
+
+          include = [entry for entry in catalog if entry["job"] in requested]
+          selected = [name for name in known if name in requested]
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf8") as out:
+              out.write(f"matrix={json.dumps({'include': include}, separators=(',', ':'))}\n")
+              out.write(f"matrix_count={len(include)}\n")
+              out.write(f"selected={json.dumps(selected, separators=(',', ':'))}\n")
+              for name in non_matrix:
+                  out.write(f"run_{name.replace('-', '_')}={'true' if name in requested else 'false'}\n")
+          with open(os.environ.get("GITHUB_STEP_SUMMARY", os.devnull), "a", encoding="utf8") as summary:
+              summary.write(f"\nSelected jobs: {', '.join(selected) or 'none'} (jobs input: {raw.strip() or 'all'})\n")
+
+  unit:
+    name: ${{ matrix.name }}
+    needs: resolve-source
+    if: ${{ needs.resolve-source.outputs.matrix_count != '0' }}
+    runs-on: ${{ matrix.runs-on }}
+    timeout-minutes: ${{ matrix.timeout-minutes }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.resolve-source.outputs.matrix) }}
+    env:
+      CI_FAILFAST_TEST_LEAVE_DANGLING: 1
+      DANGER_CI_ON_HOST_FOLDERS: 1
+      FILE_ENV: ${{ matrix.file-env }}
+      # Read by the steps the macOS jobs share, so it is set per job.
+      MATRIX_NAME: ${{ matrix.name }}
+      TEST_RUNNER_FAILFAST: 'false'
+      MAKEJOBS: '-j4'
+      TEST_RUNNER_JOBS: '4'
+      CTEST_JOBS: '4'
+      # GitHub-hosted runners use the public registry and resolvers, not the
+      # internal registry and tailnet DNS that the self-hosted jobs use.
+      CI_PROFILE: public
+      CI_IMAGE_REGISTRY_PREFIX: docker.io/library
+      CI_ENFORCE_INTERNAL_REGISTRY: '0'
+      CI_BUILDKIT_DNS_NAMESERVERS: '1.1.1.1,8.8.8.8'
+      CI_BUILDKIT_DNS_SEARCH_DOMAINS: ''
+    steps:
+      - &REQUIRE_SOURCE
+        name: Require resolved source
+        shell: bash
+        env:
+          RESOLVED_SHA: ${{ needs.resolve-source.outputs.resolved_sha }}
+          REQUESTED_REF: ${{ needs.resolve-source.outputs.requested_ref }}
+        run: |
+          set -euo pipefail
+          # Refuse to check out anything but the per-run resolved commit; an
+          # empty ref would silently fall back to the triggering commit.
+          printf '%s\n' "$RESOLVED_SHA" | LC_ALL=C grep -Eq '^[0-9a-f]{40}$' \
+            || { echo "::error::resolved source '$RESOLVED_SHA' is not a full commit hash" >&2; exit 1; }
+          [ -n "$REQUESTED_REF" ] || { echo "::error::requested ref is empty" >&2; exit 1; }
+
+      - &CHECKOUT_SOURCE
+        name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ needs.resolve-source.outputs.resolved_sha }}
+          fetch-depth: 0
+
+      - &VERIFY_SOURCE
+        name: Verify checked-out source
+        shell: bash
+        env:
+          SOURCE_MODE: ${{ needs.resolve-source.outputs.source_mode }}
+          REQUESTED_REF: ${{ needs.resolve-source.outputs.requested_ref }}
+          RESOLVED_SHA: ${{ needs.resolve-source.outputs.resolved_sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          actual_head="$(git rev-parse --verify 'HEAD^{commit}')"
+          if [ "$actual_head" != "$RESOLVED_SHA" ]; then
+            echo "::error::checked-out HEAD $actual_head does not match resolved source $RESOLVED_SHA" >&2
+            exit 1
+          fi
+          {
+            echo "### Checked-out source: ${GITHUB_JOB}${MATRIX_NAME:+ ($MATRIX_NAME)}"
+            echo
+            echo "- source_mode: ${SOURCE_MODE}"
+            echo "- requested_ref: ${REQUESTED_REF}"
+            echo "- resolved_sha: ${RESOLVED_SHA}"
+            echo "- actual_head: ${actual_head}"
+            echo "- workflow_sha: ${WORKFLOW_SHA}"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+      - name: Configure environment
+        uses: ./.github/actions/configure-environment
+
+      - name: Restore caches
+        id: restore-cache
+        uses: ./.github/actions/restore-caches
+
+      - name: Configure Docker
+        uses: ./.github/actions/configure-docker
+        with:
+          cache-provider: gha
+
+      - &CI_SCRIPT
+        name: CI script
+        run: ./ci/test_run_all.sh
+
+      - name: Report unit-test evidence
+        if: ${{ always() }}
+        shell: bash
+        env:
+          RESOLVED_SHA: ${{ needs.resolve-source.outputs.resolved_sha }}
+          REQUESTED_REF: ${{ needs.resolve-source.outputs.requested_ref }}
+          PHASE: ${{ matrix.phase }}
+        run: &REPORT_EVIDENCE |
+          set -euo pipefail
+          # ci/test/03_test_script.sh writes this after ctest_evidence.py has
+          # checked that every expected suite was selected, executed and passed.
+          evidence="${BASE_BUILD_DIR}/ctest-evidence/summary.md"
+          {
+            echo "## ${MATRIX_NAME}"
+            echo
+            echo "- source: ${RESOLVED_SHA} (${REQUESTED_REF})"
+            echo "- ${PHASE}"
+            echo
+            if [ -f "$evidence" ]; then
+              cat "$evidence"
+            else
+              echo "No unit-test evidence was produced."
+            fi
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+          [ -f "$evidence" ] || { echo "::error::no unit-test evidence at $evidence" >&2; exit 1; }
+
+      - name: Save caches
+        uses: ./.github/actions/save-caches
+
+  # macOS runs natively on the host, without Docker, so each architecture is a
+  # job of its own rather than a matrix entry of unit. Both share unit's source
+  # checks, CI script and evidence report, and build with WITH_MLKEM_NATIVE=ON:
+  # these are the only jobs that run ML-KEM's native code on macOS.
+  macos-arm64-unit:
+    name: macOS arm64 unit tests
+    needs: resolve-source
+    if: ${{ needs.resolve-source.outputs.run_macos_arm64_unit == 'true' }}
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      DANGER_RUN_CI_ON_HOST: 1
+      FILE_ENV: ./ci/test/00_setup_env_mac_native_pq.sh
+      MATRIX_NAME: macOS arm64 unit tests
+      BASE_ROOT_DIR: ${{ github.workspace }}
+      TEST_RUNNER_FAILFAST: 'false'
+      MAKEJOBS: '-j3'
+      TEST_RUNNER_JOBS: '3'
+      CTEST_JOBS: '3'
+      # Read by the steps the macOS jobs share: the runner's uname -m, the
+      # ML-KEM backend (arithmetic/Keccak) that must run, and the evidence line.
+      EXPECTED_MACHINE: arm64
+      MLKEM_EXPECTED_BACKEND: aarch64-neon/aarch64
+      PHASE: mlkem_tests, bip324_tests and net_tests natively on Apple Silicon, where ML-KEM runs its native AArch64 code.
+    steps:
+      - *REQUIRE_SOURCE
+      - *CHECKOUT_SOURCE
+      - *VERIFY_SOURCE
+
+      - &REQUIRE_MACHINE
+        name: Require runner architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          machine="$(uname -m)"
+          if [ "$machine" != "$EXPECTED_MACHINE" ]; then
+            echo "::error::${GITHUB_JOB} must run on ${EXPECTED_MACHINE}, but uname -m reports '$machine'" >&2
+            exit 1
+          fi
+          echo "uname -m: $machine"
+
+      # The runner context is not available in job-level env, so the build
+      # directory, which the later steps read, is set here.
+      - &SET_BUILD_DIR
+        name: Set build directory
+        shell: bash
+        run: echo "BASE_BUILD_DIR=${RUNNER_TEMP}/build" >> "$GITHUB_ENV"
+
+      # Boost and libevent come from depends (see FILE_ENV), not Homebrew.
+      # depends needs GNU Make 4, which Homebrew installs as gmake; its gnubin
+      # directory makes it the make that 03_test_script.sh runs.
+      - &INSTALL_HOMEBREW_PACKAGES
+        name: Install Homebrew packages
+        env:
+          HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: 1
+        run: |
+          brew install --quiet coreutils ninja pkgconf gnu-getopt ccache make
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      # 03_test_script.sh builds depends for HOST. Set HOST once here, and ask
+      # depends for the id of that build (its packages, recipes and compilers),
+      # so the cache key names exactly what the CI script builds.
+      - &IDENTIFY_DEPENDS
+        name: Identify depends build
+        shell: bash
+        run: |
+          set -euo pipefail
+          make_version="$(make --version | head -n 1)"
+          case "$make_version" in
+            "GNU Make "[4-9].*) echo "make: $make_version" ;;
+            *) echo "::error::depends needs GNU Make 4 or later, but make is '$make_version'" >&2; exit 1 ;;
+          esac
+          host="$("${BASE_ROOT_DIR}/depends/config.guess")"
+          # shellcheck source=/dev/null
+          source "$FILE_ENV"
+          # As in 03_test_script.sh, bash -c splits DEP_OPTS into make arguments.
+          id="$(bash -c "make -s -C '${BASE_ROOT_DIR}/depends' HOST=$host $DEP_OPTS print-final_build_id")"
+          id="${id#final_build_id=}"
+          printf '%s\n' "$id" | LC_ALL=C grep -Eq '^[0-9a-f]+$' \
+            || { echo "::error::depends gave no build id for $host: '$id'" >&2; exit 1; }
+          echo "depends build $id for $host"
+          {
+            echo "HOST=$host"
+            echo "DEPENDS_BUILD_ID=$id"
+          } >> "$GITHUB_ENV"
+
+      # Only the built packages are cached; depends rebuilds any whose id
+      # does not match.
+      - &RESTORE_DEPENDS
+        name: Restore depends cache
+        id: depends-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: depends/built
+          key: depends-${{ env.HOST }}-${{ env.DEPENDS_BUILD_ID }}
+
+      - *CI_SCRIPT
+
+      # Saved even when the suites fail, but only once depends wrote the
+      # toolchain file, which needs every package built.
+      - &SAVE_DEPENDS
+        name: Save depends cache
+        if: ${{ !cancelled() && steps.depends-cache.outputs.cache-hit != 'true' && hashFiles(format('depends/{0}/toolchain.cmake', env.HOST)) != '' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: depends/built
+          key: ${{ steps.depends-cache.outputs.cache-primary-key }}
+
+      # Which libraries did the suites run against? Require the depends build
+      # the cache key named, its toolchain, its libevent, and Boost at the
+      # version depends/packages/boost.mk pins.
+      - &REQUIRE_DEPENDS_BUILD
+        name: Require depends build
+        shell: bash
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*" >&2; exit 1; }
+          prefix="${BASE_ROOT_DIR}/depends/${HOST}"
+          [ -f "${prefix}/.stamp_${DEPENDS_BUILD_ID}" ] \
+            || fail "depends did not build ${DEPENDS_BUILD_ID} for ${HOST}, the build the cache key names"
+          boost_version="$(sed -n 's/^[$](package)_version *= *//p' "${BASE_ROOT_DIR}/depends/packages/boost.mk")"
+          [ -n "$boost_version" ] || fail "no Boost version in depends/packages/boost.mk"
+          # Compares the value of a CMakeCache.txt entry, whatever its type.
+          require_cache_entry() {
+            local actual
+            actual="$(sed -n "s/^$1:[A-Z]*=//p" "${BASE_BUILD_DIR}/CMakeCache.txt")"
+            [ "$actual" = "$2" ] || fail "$1 must be $2, but the build has: ${actual:-$1 unset}"
+          }
+          require_cache_entry CMAKE_TOOLCHAIN_FILE "${prefix}/toolchain.cmake"
+          require_cache_entry Boost_DIR "${prefix}/lib/cmake/Boost-${boost_version}"
+          require_cache_entry Libevent_DIR "${prefix}/lib/cmake/libevent"
+          echo "Built with Boost ${boost_version} and libevent from ${prefix}"
+
+      # The suites passed, but on which code? A runner whose CPU lacks an
+      # extension the native code needs would pass them on portable C, so
+      # require the native backend by name. mlkem_tests/backend_selection logs
+      # the compiled and the active backend.
+      - &REQUIRE_NATIVE_MLKEM
+        name: Require native ML-KEM
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="compiled ${MLKEM_EXPECTED_BACKEND}, active ${MLKEM_EXPECTED_BACKEND}"
+          log="$("${BASE_BUILD_DIR}/bin/test_qbit" --run_test=mlkem_tests/backend_selection --log_level=message --color_output=no 2>&1)" \
+            || { printf '%s\n' "$log"; echo "::error::mlkem_tests/backend_selection failed" >&2; exit 1; }
+          printf '%s\n' "$log"
+          if ! printf '%s\n' "$log" | grep -qxF "$expected"; then
+            echo "::error::${GITHUB_JOB} must run native ML-KEM, but the test log lacks '${expected}'" >&2
+            sysctl machdep.cpu.brand_string machdep.cpu.features machdep.cpu.leaf7_features 2>/dev/null || true
+            exit 1
+          fi
+
+      - &MACOS_REPORT_EVIDENCE
+        name: Report unit-test evidence
+        if: ${{ always() }}
+        shell: bash
+        env:
+          RESOLVED_SHA: ${{ needs.resolve-source.outputs.resolved_sha }}
+          REQUESTED_REF: ${{ needs.resolve-source.outputs.requested_ref }}
+        run: *REPORT_EVIDENCE
+
+  macos-x86_64-unit:
+    name: macOS x86_64 unit tests
+    needs: resolve-source
+    if: ${{ needs.resolve-source.outputs.run_macos_x86_64_unit == 'true' }}
+    # GitHub's Intel macOS image (4 CPUs); macos-15 itself is Apple Silicon.
+    runs-on: macos-15-intel
+    timeout-minutes: 120
+    env:
+      DANGER_RUN_CI_ON_HOST: 1
+      FILE_ENV: ./ci/test/00_setup_env_mac_native_pq.sh
+      MATRIX_NAME: macOS x86_64 unit tests
+      BASE_ROOT_DIR: ${{ github.workspace }}
+      TEST_RUNNER_FAILFAST: 'false'
+      MAKEJOBS: '-j4'
+      TEST_RUNNER_JOBS: '4'
+      CTEST_JOBS: '4'
+      EXPECTED_MACHINE: x86_64
+      MLKEM_EXPECTED_BACKEND: x86_64-avx2/x86_64-avx2
+      PHASE: mlkem_tests, bip324_tests and net_tests natively on an Intel Mac, where ML-KEM runs its native x86_64 code.
+    steps:
+      - *REQUIRE_SOURCE
+      - *CHECKOUT_SOURCE
+      - *VERIFY_SOURCE
+      - *REQUIRE_MACHINE
+      - *SET_BUILD_DIR
+      - *INSTALL_HOMEBREW_PACKAGES
+      - *IDENTIFY_DEPENDS
+      - *RESTORE_DEPENDS
+      - *CI_SCRIPT
+      - *SAVE_DEPENDS
+      - *REQUIRE_DEPENDS_BUILD
+      - *REQUIRE_NATIVE_MLKEM
+      - *MACOS_REPORT_EVIDENCE
+
+  # The whole functional suite with hybrid post-quantum v2 transport between all
+  # nodes (--v2pqtransport, #184 part 7), so the feature can't quietly break
+  # unrelated behavior. The mode passes -v2pqtransport=1 explicitly: with the
+  # default on, this is still the only whole-suite hybrid run, since the default
+  # mode runs v1 between nodes and the i686 job of ci.yml plain v2. It shares
+  # unit's source checks; the test runner's result is the job's.
+  pq-functional:
+    name: Functional tests with hybrid transport
+    needs: resolve-source
+    if: ${{ needs.resolve-source.outputs.run_pq_functional == 'true' }}
+    runs-on: ubuntu-24.04
+    # Twice a measured local run, rounded up: a cold build at -j 4 on 4 cores
+    # (475 s) plus the whole suite at -j 4 (727 s) is 1,202 s; x 2 = 40.1 min.
+    timeout-minutes: 45
+    env:
+      CI_FAILFAST_TEST_LEAVE_DANGLING: 1
+      DANGER_CI_ON_HOST_FOLDERS: 1
+      FILE_ENV: ./ci/test/00_setup_env_native_pq_functional.sh
+      MATRIX_NAME: Functional tests with hybrid transport
+      TEST_RUNNER_FAILFAST: 'false'
+      MAKEJOBS: '-j4'
+      TEST_RUNNER_JOBS: '4'
+      CTEST_JOBS: '4'
+      CI_PROFILE: public
+      CI_IMAGE_REGISTRY_PREFIX: docker.io/library
+      CI_ENFORCE_INTERNAL_REGISTRY: '0'
+      CI_BUILDKIT_DNS_NAMESERVERS: '1.1.1.1,8.8.8.8'
+      CI_BUILDKIT_DNS_SEARCH_DOMAINS: ''
+    steps:
+      - *REQUIRE_SOURCE
+      - *CHECKOUT_SOURCE
+      - *VERIFY_SOURCE
+
+      - name: Configure environment
+        uses: ./.github/actions/configure-environment
+
+      - name: Restore caches
+        id: restore-cache
+        uses: ./.github/actions/restore-caches
+
+      - name: Configure Docker
+        uses: ./.github/actions/configure-docker
+        with:
+          cache-provider: gha
+
+      - name: CI script
+        run: ./ci/test_run_all.sh
+
+      - name: Save caches
+        uses: ./.github/actions/save-caches

@@ -13,6 +13,7 @@
 #include <util/sock.h>
 #include <util/threadinterrupt.h>
 
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <string>
@@ -51,6 +52,43 @@ namespace sam {
 static constexpr size_t MAX_MSG_SIZE{65536};
 
 /**
+ * Point in time by which a multi-step exchange with the SAM proxy must complete.
+ */
+using SAMDeadline = std::chrono::steady_clock::time_point;
+
+/**
+ * Bound on creating a SAM session. It covers connecting to the SAM proxy, "HELLO", the
+ * optional "DEST GENERATE" and every "SESSION CREATE" attempt together.
+ */
+static constexpr auto SAM_CREATE_TIMEOUT = std::chrono::seconds{180};
+
+/**
+ * Most "SESSION CREATE" attempts when creating one session: the first one with
+ * i2cp.leaseSetEncType=6,4 and, if the router explicitly rejects it, one with 4,0.
+ */
+static constexpr unsigned SAM_CREATE_MAX_ATTEMPTS = 2;
+
+/**
+ * Sessions in a row in which a router rejects i2cp.leaseSetEncType=6,4 naming the encryption type
+ * and accepts 4,0, after which later sessions through it start with 4,0 until qbit restarts. A
+ * session created with 6,4 starts the count anew, so one transient rejection does not turn 6,4
+ * off. A session whose rejection does not name the encryption type neither counts nor starts the
+ * count anew.
+ */
+static constexpr unsigned SAM_HYBRID_FALLBACKS_TO_REMEMBER = 2;
+
+/**
+ * Most SAM routers whose rejections of i2cp.leaseSetEncType=6,4 are remembered. Beyond that,
+ * the least recently updated router is forgotten.
+ */
+static constexpr size_t SAM_MAX_REMEMBERED_ROUTERS = 64;
+
+/**
+ * Forget the rejections of i2cp.leaseSetEncType=6,4 remembered for all routers. Only for tests.
+ */
+void ResetRouterHybridStateForTest();
+
+/**
  * I2P SAM session.
  */
 class Session
@@ -66,10 +104,12 @@ public:
      * possible and executing methods throw an exception. Notice: only a pointer to the
      * `CThreadInterrupt` object is saved, so it must not be destroyed earlier than this
      * `Session` object.
+     * @param[in] create_timeout Bound on creating the SAM session, see `SAM_CREATE_TIMEOUT`.
      */
     Session(const fs::path& private_key_file,
             const Proxy& control_host,
-            CThreadInterrupt* interrupt);
+            CThreadInterrupt* interrupt,
+            std::chrono::steady_clock::duration create_timeout = SAM_CREATE_TIMEOUT);
 
     /**
      * Construct a transient session which will generate its own I2P private key
@@ -81,8 +121,11 @@ public:
      * possible and executing methods throw an exception. Notice: only a pointer to the
      * `CThreadInterrupt` object is saved, so it must not be destroyed earlier than this
      * `Session` object.
+     * @param[in] create_timeout Bound on creating the SAM session, see `SAM_CREATE_TIMEOUT`.
      */
-    Session(const Proxy& control_host, CThreadInterrupt* interrupt);
+    Session(const Proxy& control_host,
+            CThreadInterrupt* interrupt,
+            std::chrono::steady_clock::duration create_timeout = SAM_CREATE_TIMEOUT);
 
     /**
      * Destroy the session, closing the internally used sockets. The sockets that have been
@@ -169,11 +212,35 @@ private:
                                  bool check_result_ok = true) const;
 
     /**
+     * Send request and get a reply from the SAM proxy, giving up at `deadline`.
+     * Like the overload above, except that sending and receiving also end at `deadline`.
+     * @param[in] sock A socket that is connected to the SAM proxy.
+     * @param[in] request Raw request to send, a newline terminator is appended to it.
+     * @param[in] check_result_ok If true then after receiving the reply a check is made
+     * whether it contains "RESULT=OK" and an exception is thrown if it does not.
+     * @param[in] deadline Give up at this time.
+     * @throws std::runtime_error if an error occurs, `deadline` passes or `m_interrupt` is signaled
+     */
+    Reply SendRequestAndGetReply(const Sock& sock,
+                                 const std::string& request,
+                                 bool check_result_ok,
+                                 SAMDeadline deadline) const;
+
+    /**
      * Open a new connection to the SAM proxy.
      * @return a connected socket
      * @throws std::runtime_error if an error occurs
      */
     std::unique_ptr<Sock> Hello() const EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
+
+    /**
+     * Open a new connection to the SAM proxy, giving up at `deadline` or when `m_interrupt` is
+     * signaled. Connecting is also limited by `nConnectTimeout`, whichever ends first.
+     * @param[in] deadline Give up at this time.
+     * @return a connected socket
+     * @throws std::runtime_error if an error occurs
+     */
+    std::unique_ptr<Sock> Hello(SAMDeadline deadline) const EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
 
     /**
      * Check the control socket for errors and possibly disconnect.
@@ -183,17 +250,19 @@ private:
     /**
      * Generate a new destination with the SAM proxy and set `m_private_key` to it.
      * @param[in] sock Socket to use for talking to the SAM proxy.
+     * @param[in] deadline Give up at this time.
      * @throws std::runtime_error if an error occurs
      */
-    void DestGenerate(const Sock& sock) EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
+    void DestGenerate(const Sock& sock, SAMDeadline deadline) EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
 
     /**
      * Generate a new destination with the SAM proxy, set `m_private_key` to it and save
      * it on disk to `m_private_key_file`.
      * @param[in] sock Socket to use for talking to the SAM proxy.
+     * @param[in] deadline Give up at this time.
      * @throws std::runtime_error if an error occurs
      */
-    void GenerateAndSavePrivateKey(const Sock& sock) EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
+    void GenerateAndSavePrivateKey(const Sock& sock, SAMDeadline deadline) EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
 
     /**
      * Derive own destination from `m_private_key`.
@@ -204,7 +273,9 @@ private:
 
     /**
      * Create the session if not already created. Reads the private key file and connects to the
-     * SAM proxy.
+     * SAM proxy. Asks for i2cp.leaseSetEncType=6,4 unless this router is known to reject it, and
+     * retries once with 4,0 if the router explicitly rejects it. All of it must complete within
+     * `m_create_timeout`. `m_session_id` and `m_control_sock` are set only on success.
      * @throws std::runtime_error if an error occurs
      */
     void CreateIfNotCreatedAlready() EXCLUSIVE_LOCKS_REQUIRED(m_mutex);
@@ -236,6 +307,11 @@ private:
      * Cease network activity when this is signaled.
      */
     CThreadInterrupt* const m_interrupt;
+
+    /**
+     * Bound on creating the SAM session, see `SAM_CREATE_TIMEOUT`.
+     */
+    const std::chrono::steady_clock::duration m_create_timeout;
 
     /**
      * Mutex protecting the members that can be concurrently accessed.

@@ -224,6 +224,8 @@ fn get_pathspecs_default_excludes() -> Vec<String> {
             // qbit-specific vendored source. Public release snapshot branches may not
             // carry git-subtree metadata until the public upstream repository exists.
             "src/libbitcoinpqc",
+            // Vendored byte for byte and pinned by tree id; never reformatted.
+            "src/mlkem-native",
             "doc/release-notes/release-notes-*", // archived notes
             "contrib/photon/src/vendor/",        // externally sourced vendored code
         ])
@@ -243,6 +245,10 @@ fn lint_subtree() -> LintResult {
             .success();
     }
     good &= Command::new("test/lint/libbitcoinpqc-subtree-check.sh")
+        .status()
+        .expect("command_error")
+        .success();
+    good &= Command::new("test/lint/mlkem-native-check.sh")
         .status()
         .expect("command_error")
         .success();
@@ -697,6 +703,8 @@ fn lint_markdown() -> LintResult {
     let bin_name = "mlc";
     let mut md_ignore_paths = get_subtrees();
     md_ignore_paths.push("./doc/development/README_doxygen.md");
+    // Upstream's READMEs link to files outside the vendored mlkem/ directory.
+    md_ignore_paths.push("src/mlkem-native");
     let md_ignore_path_str = md_ignore_paths.join(",");
 
     let mut cmd = Command::new(bin_name);

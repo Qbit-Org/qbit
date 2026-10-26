@@ -26,4 +26,11 @@ target/
 
 /guix-build-*
 
+# libFuzzer artifacts, written to the working directory
+/crash-*
+/leak-*
+/oom-*
+/slow-unit-*
+/timeout-*
+
 /ci/scratch/
