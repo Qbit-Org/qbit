@@ -8,7 +8,7 @@ implementation can interoperate, and it is the starting point for outside
 review. The tracking issue is
 [Qbit-Org/qbit#184](https://github.com/Qbit-Org/qbit/issues/184). Operators
 should read the [operator guide](../user/network/pq-transport.md) instead; the
-[release note](../release-notes-240.md) summarizes the change.
+[release note](../release-notes-1.1.0.md#hybrid-post-quantum-v2-transport) summarizes the change.
 
 <!-- Interface names quoted in this document are marked for test/lint/lint-pq-doc-tokens.py;
      see test/lint/README.md. -->
