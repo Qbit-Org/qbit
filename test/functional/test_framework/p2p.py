@@ -172,6 +172,9 @@ class P2PConnection(asyncio.Protocol):
         # Bytes sent but not yet written to the transport, in the order sent. Acquired after _send_lock.
         self._unwritten_lock = threading.Lock()
         self._unwritten = []
+        # Set once this side has ended its stream after a failed handshake: later sends are dropped, and the
+        # node's bytes are discarded until it closes the connection.
+        self._stream_ended = False
         self.v2_state = None  # EncryptedP2PState object needed for v2 p2p connections
         self.reconnect = False  # set if reconnection needs to happen
 
@@ -233,6 +236,7 @@ class P2PConnection(asyncio.Protocol):
         self.dstaddr = them[0]
         self.dstport = them[1]
         self._transport = transport
+        self._stream_ended = False
         # in an inbound connection to the TestNode with P2PConnection as the initiator, [TestNode <---- P2PConnection]
         # send the initial handshake immediately
         if self.supports_v2_p2p and self.v2_state.initiating and not self.v2_state.tried_v2_handshake:
@@ -301,11 +305,15 @@ class P2PConnection(asyncio.Protocol):
         if pending:
             self.send_raw_message(pending)
         if not is_mac_auth:
-            # Disconnect like a real peer: write out everything sent so far, which close() still delivers.
-            # An exception from this asyncio callback would drop it (and report a fatal error on stderr).
+            # Disconnect like a real peer without losing what it sent: write out everything sent so far, end the
+            # stream after it, and let the node close the connection. close() would reset the connection if the
+            # node's later bytes were still unread here, and a reset can discard what the node has not read yet
+            # (Windows does). An exception from this asyncio callback would drop it too (and report a fatal
+            # error on stderr).
             logger.warning(f"Disconnecting from {self.dstaddr}:{self.dstport}: invalid v2 mac tag in handshake authentication")
             self._write_unwritten()
-            self._transport.close()
+            self._stream_ended = True
+            self._transport.write_eof()
             return
         self.recvbuf = self.recvbuf[length:]
         self._maybe_finish_v2_handshake()
@@ -335,6 +343,8 @@ class P2PConnection(asyncio.Protocol):
 
     def data_received(self, t):
         """asyncio callback when data is read from the socket."""
+        if self._stream_ended:
+            return
         if len(t) > 0:
             self.recvbuf += t
             if self.supports_v2_p2p and not self.v2_state.tried_v2_handshake:
@@ -439,8 +449,9 @@ class P2PConnection(asyncio.Protocol):
         with self._unwritten_lock:
             unwritten, self._unwritten = self._unwritten, []
         for data in unwritten:
-            # A failed write closes the transport, and asyncio warns on stderr about writes after that.
-            if not self._transport or self._transport.is_closing():
+            # A failed write closes the transport, and asyncio warns on stderr about writes after that. After
+            # write_eof(), a write raises.
+            if not self._transport or self._transport.is_closing() or self._stream_ended:
                 return
             self._transport.write(data)
 
