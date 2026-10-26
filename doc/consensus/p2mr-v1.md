@@ -483,7 +483,7 @@ consensus. Wallet support is narrower still.
 | Non-exception OP_SUCCESS byte | Immediate success | Nonstandard: discourage-OP_SUCCESS policy | Not a supported spending construction |
 | `OP_CHECKTEMPLATEVERIFY` with non-32-byte top item | No-op | Nonstandard: discourage-OP_SUCCESS policy | — |
 | P2SH-wrapped v2/32 witness program | Never qbit P2MR v1. Unrestricted chain: inherited unknown-witness behavior. Restricted-output mode: the outer P2SH output cannot be funded | Nonstandard | — |
-| Native witness version other than the assigned v2/32 | Outside this profile; forward-compatible success. Restricted-output mode permits funding reserved v3..v16 only after its separate outer-witness activation | Normally nonstandard | — |
+| Native unknown witness version other than the assigned v2/32 | Outside this profile; forward-compatible success. Restricted-output mode permits funding reserved v3..v16 only after its separate outer-witness activation | Normally nonstandard | — |
 | Empty/insufficient witness, malformed control, marker bit clear, or commitment mismatch | Invalid | — | — |
 | Known `0xc0` leaf over an initial-stack or runtime resource limit | Invalid | Same initial-stack bounds | — |
 | Known `0xc0` leaf with script error, extra final items, or false result | Invalid | — | — |
