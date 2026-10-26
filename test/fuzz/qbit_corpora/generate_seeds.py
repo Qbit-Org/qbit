@@ -614,6 +614,42 @@ def mlkem_input(*, ek: bytes | None = None, ct: bytes | None = None, dk: bytes |
     return enc.build()
 
 
+MLKEM_K = 4
+MLKEM_N = 256
+SHAKE128_RATE = 168
+MLKEM_GEN_MATRIX_NBLOCKS = 3  # SHAKE128 blocks squeezed for every matrix entry before rejection sampling continues
+
+
+def mlkem_entry_fits_initial_blocks(rho: bytes, index: bytes) -> bool:
+    """Whether SampleNTT(rho || index) accepts 256 coefficients from the first three SHAKE128 blocks."""
+    stream = hashlib.shake_128(rho + index).digest(MLKEM_GEN_MATRIX_NBLOCKS * SHAKE128_RATE)
+    accepted = 0
+    for k in range(0, len(stream), 3):
+        for value in (stream[k] | ((stream[k + 1] & 0x0F) << 8), (stream[k + 1] >> 4) | (stream[k + 2] << 4)):
+            accepted += value < MLKEM_Q
+            if accepted == MLKEM_N:
+                return True
+    return False
+
+
+def mlkem_rho_lane3_extra_block() -> bytes:
+    """The first rho = SHA256("qbit fuzz seed rho/<n>") for which, in a group of four entries of the transposed
+    matrix that Encaps samples together, only the last entry needs a fourth block.
+
+    Encaps samples entry i of A^T, in row-major order, as SampleNTT(rho || i // K || i % K), four at a time.
+    This models mlkem-native's sampling. After upgrading mlkem-native, run test_qbit_fuzz_coverage.py
+    against a coverage build: it checks that the seed still needs an extra block, but not in which lane.
+    """
+    for n in range(1 << 16):
+        rho = hashlib.sha256(f"qbit fuzz seed rho/{n}".encode()).digest()
+        for group in range(MLKEM_K * MLKEM_K // 4):
+            fits = [mlkem_entry_fits_initial_blocks(rho, bytes([i // MLKEM_K, i % MLKEM_K]))
+                    for i in range(4 * group, 4 * group + 4)]
+            if fits == [True, True, True, False]:
+                return rho
+    raise ValueError("no rho found")
+
+
 def mlkem_cases() -> list[dict]:
     vectors = mlkem_vectors()
     base_ek = bytes.fromhex(vectors["cctv_modulus"]["base_ek"])
@@ -647,6 +683,9 @@ def mlkem_cases() -> list[dict]:
              f"NIST ACVP decapsulation key check tcId {bad_dk['tcId']} (modified H): rejected, secret cleared."),
         case("honest-ciphertext-bit-flip", "fdp", mlkem_input(flip_bit=4321),
              "Flip bit 4321 of the honest ciphertext: decapsulation still yields a secret, a different one."),
+        case("matrix-lane3-extra-block", "fdp", mlkem_input(ek=base_ek[:-32] + mlkem_rho_lane3_extra_block()),
+             "The CCTV base key with a seed rho for which, in one group of four matrix entries Encaps samples together, "
+             "only the last needs a fourth SHAKE128 block: all four lanes squeeze one more, and only the last samples from it."),
     ]
 
 
@@ -707,6 +746,10 @@ def pq_records_cases() -> list[dict]:
              "Length 2 in a 3-byte CompactSize: invalid grammar."),
         case("oversized-length", "raw", b"\xfe\x01\x00\x00\x02\xf0\xaa",
              "Length MAX_SIZE + 1 (0x02000001), which ReadCompactSize rejects: invalid grammar."),
+        case("non-canonical-length-5-byte", "raw", b"\xfe\x02\x00\x00\x00\xf0\xaa",
+             "Length 2 in a 5-byte (0xfe) CompactSize: invalid grammar."),
+        case("non-canonical-length-9-byte", "raw", b"\xff" + (2).to_bytes(8, "little") + b"\xf0\xaa",
+             "Length 2 in a 9-byte (0xff) CompactSize: invalid grammar."),
         case("minimal-unknown-records", "raw", minimal_unknown + b"\x05",
              "1,000 one-byte unknown records ending in a truncated one: invalid grammar after a long valid prefix."),
     ]
@@ -729,14 +772,16 @@ def transport_key(label: str) -> bytes:
     return key
 
 
-def v2_transport_side(enc: FdpEncoder, label: str, garbage_len: int, mode: str, initiator: bool) -> None:
+def v2_transport_side(enc: FdpEncoder, label: str, garbage_len: int, mode: str, initiator: bool,
+                      ent_nonce: int | None = None) -> None:
     """MakeV2Transport: key, compression flag, garbage, ellswift entropy, PQ mode and ML-KEM seed."""
     enc.raw(transport_key(label))
     enc.boolean(True)
     enc.integral(garbage_len, SIZE_T, 0, V2_MAX_GARBAGE_LEN)
     if garbage_len <= 64:
         enc.raw(pattern(garbage_len, 0x31))
-    enc.raw(hashlib.sha256(f"qbit fuzz seed ent/{label}".encode()).digest())
+    ent_label = label if ent_nonce is None else f"{label}/{ent_nonce}"
+    enc.raw(hashlib.sha256(f"qbit fuzz seed ent/{ent_label}".encode()).digest())
     if not initiator and PQ_MODES[mode] >= PQ_RESPONDER_MODES:
         raise ValueError(f"{label}: a responder cannot be in {mode} mode")
     enc.pick(PQ_MODES[mode], len(PQ_MODES) if initiator else PQ_RESPONDER_MODES)
@@ -753,6 +798,37 @@ def transport_v2_input(name: str, initiator: tuple[int, str], responder: tuple[i
     enc.integral(200, UINT32, 0, SIMULATION_MAX_MESSAGE)
     # Further bytes drive the interleaving loop from the back; the final flush completes the rest.
     enc.raw(pattern(tail, 0x47))
+    return enc.build()
+
+
+# The simulation loop's actions, in the harness's CallOneOf order.
+SIMULATION_NEW_MESSAGE_0, SIMULATION_NEW_MESSAGE_1, SIMULATION_SEND_0, SIMULATION_SEND_1, SIMULATION_RECV_0, \
+    SIMULATION_RECV_1 = range(SIMULATION_ACTIONS)
+# Chosen so that the initiator's ElligatorSwift key for the case below begins with 0xa6, the
+# first byte of the regtest message start. This script cannot check that; run
+# test_qbit_fuzz_coverage.py against a coverage build after changing the harness or libsecp256k1.
+V1_MAGIC_PREFIX_KEY_ENT_NONCE = 145
+
+
+def transport_v1_magic_prefix_input() -> bytes:
+    """A negotiating initiator whose 64-byte key begins with the first byte of the v1 message start.
+
+    The loop sends the whole key and hands the responder one byte of it, which matches the
+    v1 prefix so far, so the responder waits; the final flush delivers the rest, which does
+    not match, and the handshake continues as v2.
+    """
+    name = "v1-magic-prefix-key"
+    enc = FdpEncoder()
+    enc.integral(int.from_bytes(hashlib.sha256(name.encode()).digest()[:8], "big"), UINT64)
+    v2_transport_side(enc, f"{name}/initiator", 0, "negotiate", initiator=True, ent_nonce=V1_MAGIC_PREFIX_KEY_ENT_NONCE)
+    v2_transport_side(enc, f"{name}/responder", 0, "negotiate", initiator=False)
+    enc.integral(1000, UINT32, 0, SIMULATION_MAX_MESSAGE)
+    enc.integral(200, UINT32, 0, SIMULATION_MAX_MESSAGE)
+    key_len = 64  # no garbage
+    enc.pick(SIMULATION_SEND_0, SIMULATION_ACTIONS)
+    enc.integral(key_len, SIZE_T, 0, key_len)
+    enc.pick(SIMULATION_RECV_0, SIMULATION_ACTIONS)
+    enc.integral(1, SIZE_T, 0, key_len)
     return enc.build()
 
 
@@ -785,7 +861,11 @@ def transport_v2_cases() -> list[dict]:
          f"An initiator in fallback never parses the offer; {loop}: ECDH keys."),
     ]
     return [case(name, "fdp", transport_v2_input(name, initiator, responder, tail), semantics)
-            for name, initiator, responder, tail, semantics in cases]
+            for name, initiator, responder, tail, semantics in cases] + [
+        case("v1-magic-prefix-key", "fdp", transport_v1_magic_prefix_input(),
+             "Both sides negotiate; the initiator's key begins with the regtest message start's first byte, and the "
+             "responder gets that byte alone: it waits, then detects v2 on the next byte; hybrid."),
+    ]
 
 
 def transport_v1v2_input(name: str, responder: tuple[int, str], v1_message: bool) -> bytes:
@@ -828,6 +908,7 @@ MALPEER_STEPS = {
     "collect": (UINT32, 1, 1 << 16), "flush": None, "queue": (UINT8, 0, 3), "raw": (UINT8, 1, 64),
     "disconnect": None,
 }
+REKEY_INTERVAL = 224  # packets per BIP324 cipher key
 MALPEER_INITIATOR_MODES = {"off": 0, "negotiate": 1, "fallback": 2}
 MALPEER_RESPONDER_MODES = {"off": 0, "negotiate": 1}
 
@@ -907,6 +988,36 @@ def malpeer_cases() -> list[dict]:
         ("responder-off-unsolicited-accept", False, "off",
          as_initiator + [("version", 3), ("application", 0), ("queue", 2), "flush"], (0, 0),
          "A responder that is off gets an accept-shaped record it never asked for: ignored, plain v2."),
+        ("initiator-invalid-grammar-legacy", True, "negotiate",
+         [("collect", 5), ("collect", 7)] + as_responder +
+         [("version", 4), "flush", ("application", 2), ("application", 3), ("application", 3), ("queue", 0),
+          ("queue", 1), "flush"], (0, 0),
+         "We offer honestly but end the contents with a truncated CompactSize: the transport takes the invalid "
+         "grammar as a legacy peer and sends its held empty version packet; then empty and random application "
+         "contents, which it rejects, and a message queued while another is unsent, which it refuses."),
+        ("responder-garbage-terminator-missing", False, "negotiate",
+         [("collect", 1), ("queue", 0), "key", ("deliver", 1), ("deliver", 1), ("raw", 16), "flush"], (0, 4095),
+         "Before its first byte the transport has nothing to send and takes no message; our key's first two bytes "
+         "arrive one at a time (v2 detected on the first, the key incomplete), then the rest, 4,095 bytes of garbage "
+         "and 16 more without a terminator: the transport, holding its offer, aborts with garbage_terminator and "
+         "clears its hybrid secrets."),
+        ("initiator-version-damaged-tag", True, "negotiate", as_responder + [("confirmation", 4), "flush"], (0, 0),
+         "Our first packet, where our version packet belongs, has a damaged header or tag: the transport aborts "
+         "with version_tag."),
+        ("responder-version-oversized-length", False, "negotiate", as_initiator + [("raw", 3), "flush"], (0, 0),
+         "Three unauthenticated bytes where our version packet belongs decrypt to a length above the maximum: "
+         "the transport aborts with version_length."),
+        ("initiator-off-app-damaged-tag", True, "off",
+         as_responder + [("version", 0), ("application", 0), ("queue", 0), "flush", ("confirmation", 4), "flush"],
+         (0, 0),
+         "Plain v2 with the negotiation off and messages both ways, then a packet with a damaged header or tag: "
+         "the transport closes on the decryption failure."),
+        ("responder-hybrid-rekey-oversized-length", False, "negotiate",
+         as_initiator + [("version", 5), "flush"] + finish + [("decoy", 2)] * REKEY_INTERVAL +
+         [("application", 0), "flush", ("raw", 3), "flush"], (0, 0),
+         "A confirmed hybrid exchange with messages both ways; 224 empty decoys take the transport's receive "
+         "ciphers past the rekey interval under the hybrid keys, and an application message follows; then three "
+         "unauthenticated bytes that decrypt to a length above the maximum: the transport closes."),
     ]
     return [case(name, "fdp", malpeer_input(name, ti, mode, steps, garbage), semantics)
             for name, ti, mode, steps, garbage, semantics in cases]

@@ -41,7 +41,7 @@ REQUIRED_TARGETS = (
 MANIFEST_NAME = "MANIFEST.json"
 MANIFEST_SCHEMA_VERSION = 1
 LIMITS = {
-    "max_seeds_per_target": 16,
+    "max_seeds_per_target": 22,
     "max_seed_bytes": 8 * 1024,
     "max_target_bytes": 64 * 1024,
     "max_total_bytes": 384 * 1024,
