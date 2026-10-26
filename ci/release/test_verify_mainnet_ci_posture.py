@@ -186,6 +186,8 @@ class VerifyMainnetCIPostureTest(unittest.TestCase):
             release_target,
         )
         self.assertIn('"${VALIDATION_PROFILE}" == "release-policy"', release_target)
+        self.assertIn('"${target_branch}" == "1.0.0"', release_target)
+        self.assertIn('"${target_branch}" == "1.1.0"', release_target)
 
         job_start = core_checks.index("  mainnet-publish-gate:")
         job_end = core_checks.index("  core-checks-gate:", job_start)
