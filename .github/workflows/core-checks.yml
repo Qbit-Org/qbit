@@ -144,11 +144,44 @@ jobs:
     needs: classify-changes
     if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # Room for a run that misses the package cache below to download its
+    # packages from a slower mirror.
+    timeout-minutes: 90
 
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      # Hosted runners fetch packages from an Azure mirror in their own region
+      # first, and apt falls back to the next mirror only on an error, not when
+      # a mirror is slow. One region's mirror has served packages at 30 kB/s,
+      # so this job tries the main archive first and keeps the regional
+      # mirror as the last fallback.
+      - name: Prefer the main Ubuntu archive
+        run: |
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            sudo sed -i -E 's#^(http://azure\.archive\.ubuntu\.com/ubuntu/[[:space:]]+priority:)[0-9]+$#\19#' /etc/apt/apt-mirrors.txt
+            cat /etc/apt/apt-mirrors.txt
+          fi
+
+      # The packages the steps below install, so that a slow mirror delays
+      # only a run that misses the cache. apt reuses a cached package of the
+      # expected size without checking its hash, so only push runs save the
+      # cache, as with the ccache caches: a pull request cannot change what
+      # another run installs.
+      - name: Restore apt package cache
+        id: apt-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/apt-archives
+          key: build-smoke-apt-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/workflows/core-checks.yml') }}
+          restore-keys: build-smoke-apt-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Keep downloaded packages in the cache directory
+        run: |
+          mkdir -p "${RUNNER_TEMP}/apt-archives/partial"
+          printf 'Dir::Cache::Archives "%s/apt-archives/";\nAPT::Keep-Downloaded-Packages "true";\n' "${RUNNER_TEMP}" \
+            | sudo tee /etc/apt/apt.conf.d/90build-smoke-cache > /dev/null
 
       - name: Install build dependencies
         run: |
@@ -233,6 +266,18 @@ jobs:
           test -x build/bin/qbit-cli
           build/bin/qbitd -version
           build/bin/qbit-cli -version
+
+      # apt leaves its lock and partial directory readable only by root.
+      - name: Make the apt package cache readable
+        if: ${{ !cancelled() && github.event_name != 'pull_request' && steps.apt-cache.outputs.cache-hit != 'true' }}
+        run: sudo chown -R "$(id -u):$(id -g)" "${RUNNER_TEMP}/apt-archives"
+
+      - name: Save apt package cache
+        if: ${{ !cancelled() && github.event_name != 'pull_request' && steps.apt-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/apt-archives
+          key: ${{ steps.apt-cache.outputs.cache-primary-key }}
 
   focused-unit-suites:
     name: focused unit suites
