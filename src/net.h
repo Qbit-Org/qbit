@@ -902,8 +902,8 @@ inline constexpr size_t PQ_MAX_SUCCESSFUL_ENDPOINTS{1000};
  *  startup, that suggest a local fault. */
 inline constexpr size_t PQ_LOCAL_FAULT_THRESHOLD{8};
 
-/** Inbound offers attempted within one second above which responders stop offering. R3's flood
- *  measurement (#222) sets the final value; CConnman::Options can override it. */
+/** Inbound offers attempted within one second above which responders stop offering. CPU
+ *  benchmarks of the handshake set this value (#222, R3); CConnman::Options can override it. */
 inline constexpr uint64_t DEFAULT_PQ_SHED_THRESHOLD_PER_S{1000};
 /** The threshold of -test=pq_low_shed_threshold, which functional tests reach with a few connections. */
 inline constexpr uint64_t TEST_PQ_SHED_THRESHOLD_PER_S{5};

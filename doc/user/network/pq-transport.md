@@ -8,7 +8,7 @@ v2 P2P transport. This guide shows how to try it on your own machine, switch it
 off or on for a real node, check that it works and troubleshoot it. The wire
 format is specified in
 [Hybrid post-quantum v2 transport](../../design/pq-transport.md), and the
-[release note](../../release-notes-240.md) summarizes the change.
+[release note](../../release-notes-1.1.0.md#hybrid-post-quantum-v2-transport) summarizes the change.
 
 In this release the feature is **on by default**: a node with v2 transport,
 also on by default, uses hybrid keys with every upgraded peer that has it on
@@ -377,5 +377,5 @@ keys are not what `transport_pq` reports.
 
 - [Hybrid post-quantum v2 transport](../../design/pq-transport.md), the
   specification.
-- The [release note](../../release-notes-240.md).
+- The [release note](../../release-notes-1.1.0.md#hybrid-post-quantum-v2-transport).
 - [Tor](tor.md) and [I2P](i2p.md) support.

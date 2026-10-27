@@ -98,11 +98,11 @@ target. The validator does not inspect mutable working-tree replacements for
 tagged source files and has no waiver.
 
 Core Checks also runs this same validator in the required `mainnet publication
-posture` job for source and release-policy changes targeting the `1.0.0` branch.
-This explicitly includes the lightweight profile used by changes to release
-validators and publishing scripts. CI creates an annotated tag at the exact
-checked-out candidate commit so that this early check exercises the validator's
-immutable tag-target path.
+posture` job for source and release-policy changes targeting the `1.0.0` or
+`1.1.0` branch. This explicitly includes the lightweight profile used by changes
+to release validators and publishing scripts. CI creates an annotated tag at the
+exact checked-out candidate commit so that this early check exercises the
+validator's immutable tag-target path.
 
 `ci/release/mainnet_ci_posture.json` separates merge posture from publication
 posture without weakening the publisher. In `staging` phase, Core Checks

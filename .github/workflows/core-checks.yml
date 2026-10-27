@@ -135,7 +135,7 @@ jobs:
           set -euo pipefail
 
           target_branch="${TARGET_REF#refs/heads/}"
-          if [[ "${target_branch}" == "1.0.0" ]] && \
+          if [[ "${target_branch}" == "1.0.0" || "${target_branch}" == "1.1.0" ]] && \
              [[ "${VALIDATION_PROFILE}" == "source" || "${VALIDATION_PROFILE}" == "release-policy" ]]; then
             echo "mainnet_publish_gate_required=true" >> "$GITHUB_OUTPUT"
           else
@@ -654,7 +654,8 @@ jobs:
       - mainnet-publish-gate
     # Aggregate core check input for Required Merge Gate. The phase-aware
     # mainnet posture runs for source and release-policy changes targeting
-    # 1.0.0; source build/test jobs remain conditional on source validation.
+    # 1.0.0 or 1.1.0; source build/test jobs remain conditional on source
+    # validation.
     if: ${{ always() }}
     steps:
       - name: Check core check results
