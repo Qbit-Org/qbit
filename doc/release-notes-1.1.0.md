@@ -325,10 +325,10 @@ to #254).
   interoperability with the v1.0.0 release binary (#224, #241), misbehaving
   peers, fallback and load shedding (#239), and the fuzz targets `mlkem`,
   `mlkem_backend_diff`, `pq_records` and `p2p_v2_pq_malicious_peer`, with
-  seeds in the required corpus (#225, #230, #248). The functional test runner's
-  `--v2pqtransport` mode runs the whole suite over the hybrid transport
-  (#239, #241). Two regtest-only `-test` options make load shedding testable
-  (#239).
+  seeds in the required corpus (#225, #230, #248, #255). The functional test
+  runner's `--v2pqtransport` mode runs the whole suite over the hybrid
+  transport (#239, #241). Two regtest-only `-test` options make load shedding
+  testable (#239).
 - Full Validation runs the ML-KEM-1024 unit tests on AArch64 Linux and on
   macOS, and the whole functional suite over the hybrid transport, for changes
   that can affect them, through a new reusable PQ workflow (#224, #225, #239,
