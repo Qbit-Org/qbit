@@ -127,7 +127,10 @@ $ test/fuzz/test_qbit_fuzz_coverage.py --fuzz-binary build_cov/bin/fuzz  # needs
 
 `test_qbit_fuzz_coverage.py` runs named seeds one at a time. It fails if key
 generation, signing or P2MR signature verification is no longer reached, or
-if an invalid spend is no longer rejected at the expected check.
+if an invalid spend is no longer rejected at the expected check. It also
+fails if a seed that depends on a value found by search no longer reaches its
+path: the transport key that begins like a v1 message, and the ML-KEM key
+whose matrix needs an extra block.
 
 ## Overview of Bitcoin Core fuzzing
 

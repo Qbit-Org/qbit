@@ -27,7 +27,7 @@ third-party corpora. The seeds, [`MANIFEST.json`](MANIFEST.json) and the
 scripts are distributed under the MIT license (see `COPYING`).
 
 `MANIFEST.json` records the size, SHA-256 and meaning of each seed. Limits
-enforced by the generator and by [`overlay.py`](overlay.py): at most 16 seeds
+enforced by the generator and by [`overlay.py`](overlay.py): at most 22 seeds
 per target, 8 KiB per seed, 64 KiB per target and 384 KiB in total. Target
 directories contain only seed files.
 
@@ -58,10 +58,12 @@ seed `d || z` (64 bytes), encapsulation coins (32), an arbitrary encapsulation
 key (1568), ciphertext (1568) and decapsulation key (3168), then, from the back,
 whether to flip one bit of the honest ciphertext and which. Fields cut off by
 the end of the input are zero. The seeds use the C2SP CCTV modulus key, the
-3328/3329 coefficient boundary and NIST ACVP decapsulation vectors from
-`src/test/data/mlkem1024_vectors.json`. Both targets run on native code where
-the CPU has it, or on portable C with `MLKEM_FORCE_PORTABLE=1`;
-`mlkem_backend_diff` also compares every result with forced portable C.
+3328/3329 coefficient boundary, NIST ACVP decapsulation vectors from
+`src/test/data/mlkem1024_vectors.json`, and a key whose matrix seed makes
+rejection sampling continue in one lane of a four-way batch alone. Both targets
+run on native code where the CPU has it, or on portable C with
+`MLKEM_FORCE_PORTABLE=1`; `mlkem_backend_diff` also compares every result with
+forced portable C.
 
 The fixture bodies check that an unmodified fixture verifies. `pqc` also
 checks that any modified signature, public key or message is rejected. Legacy
@@ -71,17 +73,19 @@ and generation seeds keep key generation and signing covered in every replay.
 contents: records `CompactSize(len) || header || payload`. The seeds are the
 offer and accept records of `src/test/data/pq_transport_vectors.json`, records
 of the wrong length, duplicate and unknown records, and framing errors that make
-the whole contents invalid. The harness checks the parser against an
-independent reading of the grammar.
+the whole contents invalid, including non-canonical lengths in every CompactSize
+width. The harness checks the parser against an independent reading of the
+grammar.
 
 `p2p_transport_bidirectional_v2` and `p2p_transport_bidirectional_v1v2` use
 their harness's untagged layout: each v2 side's key, garbage and ellswift
 entropy, then its hybrid negotiation mode (off, negotiate or fallback for an
 initiator; off or negotiate for a responder, which never falls back) and the
 32-byte seed of its ML-KEM entropy, then the simulation steps. The seeds cover
-every pair of modes and the v1 detection; some end before the simulation loop,
-so the final flush completes the handshake, and some add a fixed pattern that
-drives the loop first. The v2 harness checks that the keys are hybrid on both
+every pair of modes, the v1 detection, and a v2 key that begins with the v1
+message start; some end before the simulation loop, so the final flush
+completes the handshake, and some add a fixed pattern or explicit steps that
+drive the loop first. The v2 harness checks that the keys are hybrid on both
 sides exactly when both negotiate.
 
 `p2p_v2_pq_malicious_peer` drives a v2 transport from a malicious peer that
@@ -93,8 +97,12 @@ parameter: send our key, terminator, a decoy, a version packet variant, a
 confirmation variant or an application packet; deliver or take some bytes;
 flush; give the transport a message; send unauthenticated bytes; disconnect.
 The seeds script honest hybrid exchanges in both roles, each malformed record
-and confirmation failure, a damaged ciphertext, a legacy peer, a fallback
-initiator, an unsolicited record and a disconnect while the offer is pending.
+and confirmation failure, a damaged ciphertext, a legacy peer, version contents
+of invalid grammar, a fallback initiator, an unsolicited record, a disconnect
+while the offer is pending, each abort before the version packet (missing
+garbage terminator, damaged packet, oversized length), damaged and oversized
+packets after the handshake, rejected application contents and a rekey under
+the hybrid keys.
 
 ## Use in CI
 

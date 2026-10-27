@@ -346,7 +346,7 @@ class QbitCorporaTest(unittest.TestCase):
         self.assertEqual(tuple(sorted(self.manifest["targets"])), REQUIRED)
         total = 0
         for target, entries in self.manifest["targets"].items():
-            self.assertLessEqual(len(entries), 16)
+            self.assertLessEqual(len(entries), 22)
             target_bytes = 0
             for entry in entries:
                 data = (CORPORA_DIR / target / entry["file"]).read_bytes()

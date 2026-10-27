@@ -3,7 +3,7 @@
   "license": "MIT",
   "generator": "test/fuzz/qbit_corpora/generate_seeds.py",
   "limits": {
-    "max_seeds_per_target": 16,
+    "max_seeds_per_target": 22,
     "max_seed_bytes": 8192,
     "max_target_bytes": 65536,
     "max_total_bytes": 393216
@@ -234,6 +234,13 @@
         "size": 6403,
         "sha256": "c555ad9f071c42fb7772c778d34a769259a926cae98b853ad5ce4b72f1bbc1a2",
         "semantics": "Flip bit 4321 of the honest ciphertext: decapsulation still yields a secret, a different one."
+      },
+      {
+        "file": "matrix-lane3-extra-block",
+        "format": "fdp",
+        "size": 1664,
+        "sha256": "f9fe096d3ce566a554b554e543de8638e9da6730328c83b8f1528287a58ed38f",
+        "semantics": "The CCTV base key with a seed rho for which, in one group of four matrix entries Encaps samples together, only the last needs a fourth SHAKE128 block: all four lanes squeeze one more, and only the last samples from it."
       }
     ],
     "mlkem_backend_diff": [
@@ -299,6 +306,13 @@
         "size": 6403,
         "sha256": "c555ad9f071c42fb7772c778d34a769259a926cae98b853ad5ce4b72f1bbc1a2",
         "semantics": "Flip bit 4321 of the honest ciphertext: decapsulation still yields a secret, a different one."
+      },
+      {
+        "file": "matrix-lane3-extra-block",
+        "format": "fdp",
+        "size": 1664,
+        "sha256": "f9fe096d3ce566a554b554e543de8638e9da6730328c83b8f1528287a58ed38f",
+        "semantics": "The CCTV base key with a seed rho for which, in one group of four matrix entries Encaps samples together, only the last needs a fourth SHAKE128 block: all four lanes squeeze one more, and only the last samples from it."
       }
     ],
     "p2mr_script": [
@@ -536,6 +550,13 @@
         "size": 343,
         "sha256": "cec2460db80a9d17fcd35bb12215b7517034cf9d732b0e328f6a6e2026fe7aff",
         "semantics": "An initiator in fallback never parses the offer; a fixed 48-byte pattern drives the interleaving loop, then the final flush completes the handshake: ECDH keys."
+      },
+      {
+        "file": "v1-magic-prefix-key",
+        "format": "fdp",
+        "size": 218,
+        "sha256": "595667c0d0282a5f5292f17f9e77adff510e367626f29eb20a214f591770bc1f",
+        "semantics": "Both sides negotiate; the initiator's key begins with the regtest message start's first byte, and the responder gets that byte alone: it waits, then detects v2 on the next byte; hybrid."
       }
     ],
     "p2p_v2_pq_malicious_peer": [
@@ -650,6 +671,48 @@
         "size": 87,
         "sha256": "600263bb14d01a4deefa4ec87a235eae35154b976a7866f594bd4635bb7578b4",
         "semantics": "A responder that is off gets an accept-shaped record it never asked for: ignored, plain v2."
+      },
+      {
+        "file": "initiator-invalid-grammar-legacy",
+        "format": "fdp",
+        "size": 100,
+        "sha256": "fbd2f2131e536ae225c37a2b6adfa76781e45bd6b6f30e260bbc24e0a345d6dd",
+        "semantics": "We offer honestly but end the contents with a truncated CompactSize: the transport takes the invalid grammar as a legacy peer and sends its held empty version packet; then empty and random application contents, which it rejects, and a message queued while another is unsent, which it refuses."
+      },
+      {
+        "file": "responder-garbage-terminator-missing",
+        "format": "fdp",
+        "size": 92,
+        "sha256": "8d341ecaa68f50512f96bceb59b8b482eb250c8b53a74902d3b09a0444967ee4",
+        "semantics": "Before its first byte the transport has nothing to send and takes no message; our key's first two bytes arrive one at a time (v2 detected on the first, the key incomplete), then the rest, 4,095 bytes of garbage and 16 more without a terminator: the transport, holding its offer, aborts with garbage_terminator and clears its hybrid secrets."
+      },
+      {
+        "file": "initiator-version-damaged-tag",
+        "format": "fdp",
+        "size": 83,
+        "sha256": "2727a75c182b85396b59cd7803f27e550fa2b717b0bee5ac9519f39b626ee0f9",
+        "semantics": "Our first packet, where our version packet belongs, has a damaged header or tag: the transport aborts with version_tag."
+      },
+      {
+        "file": "responder-version-oversized-length",
+        "format": "fdp",
+        "size": 83,
+        "sha256": "41645e5e9b622e1d4c7b40aedbfec9d3afc339bdc668cf9dd34778e88e1a2e90",
+        "semantics": "Three unauthenticated bytes where our version packet belongs decrypt to a length above the maximum: the transport aborts with version_length."
+      },
+      {
+        "file": "initiator-off-app-damaged-tag",
+        "format": "fdp",
+        "size": 90,
+        "sha256": "5a85d98afa4f9345f18064115041749457f614b1d702b31aff6ee889f4cf6ede",
+        "semantics": "Plain v2 with the negotiation off and messages both ways, then a packet with a damaged header or tag: the transport closes on the decryption failure."
+      },
+      {
+        "file": "responder-hybrid-rekey-oversized-length",
+        "format": "fdp",
+        "size": 544,
+        "sha256": "0380e5513be0760e2a4643192ea6aef74ce5d3524fbc0322371596a54cdefcdb",
+        "semantics": "A confirmed hybrid exchange with messages both ways; 224 empty decoys take the transport's receive ciphers past the rekey interval under the hybrid keys, and an application message follows; then three unauthenticated bytes that decrypt to a length above the maximum: the transport closes."
       }
     ],
     "pq_records": [
@@ -757,6 +820,20 @@
         "size": 7,
         "sha256": "a70a4eb5f4febe8115e5b1feefcf4591c2589f5e5da8b1889ab858f7aa51eca9",
         "semantics": "Length MAX_SIZE + 1 (0x02000001), which ReadCompactSize rejects: invalid grammar."
+      },
+      {
+        "file": "non-canonical-length-5-byte",
+        "format": "raw",
+        "size": 7,
+        "sha256": "b5326b0e7d0aa0a4fe1a771705821c1fc2614a6f9b0b41bd34760d70b6c88dc6",
+        "semantics": "Length 2 in a 5-byte (0xfe) CompactSize: invalid grammar."
+      },
+      {
+        "file": "non-canonical-length-9-byte",
+        "format": "raw",
+        "size": 11,
+        "sha256": "cb529afe7b47920342c5c2666487499b0328fe619b6536bfe44223d0c73f1976",
+        "semantics": "Length 2 in a 9-byte (0xff) CompactSize: invalid grammar."
       },
       {
         "file": "minimal-unknown-records",

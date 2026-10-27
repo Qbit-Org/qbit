@@ -2,7 +2,11 @@
 # Copyright (c) 2026-present The qbit core developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or https://opensource.org/license/mit.
-"""Check that named qbit seeds still reach key generation, signing and P2MR verification.
+"""Check that named qbit seeds still reach the code they were made for.
+
+That is key generation, signing and P2MR verification, and the paths that
+some transport and ML-KEM seeds reach only through a value found by search,
+which generate_seeds.py cannot confirm against the built code.
 
 Each named seed runs alone in a fuzz executable built with
 -fprofile-instr-generate -fcoverage-mapping. Its profile is exported with
@@ -80,6 +84,10 @@ ANCHORS = {
     "pqc_harness_import_sign": Anchor("src/test/fuzz/pqc.cpp", ("const bool signed_ok{key.Sign(hash, sig, counter)};",), "key.Sign"),
     "pqc_fixture_sign": Anchor("src/test/fuzz/pqc.cpp", ("const bool signed_ok{key.Sign(out[key_index].hashes[msg_index], out[key_index].sigs[msg_index], counter)};",), "key.Sign"),
     "pqc_fixture_final_verify": Anchor("src/test/fuzz/pqc.cpp", ("const CPQCPubKey pubkey{pubkey_mut};",), "pubkey"),
+    # Paths reached only through a value found by search.
+    "v1_prefix_match": Anchor("src/net.cpp", ("} else if (m_recv_buffer.size() == v1_prefix.size()) {",), "m_recv_buffer"),
+    "v1_fallback": Anchor("src/net.cpp", ("bool ret = m_v1_fallback.ReceivedBytes(feedback);",), "m_v1_fallback"),
+    "mlkem_x4_extra_block": Anchor("src/mlkem-native/mlkem/src/sampling.c", ("mlk_xof_x4_squeezeblocks(buf, 1, &statex);",), "mlk_xof_x4_squeezeblocks"),
 }
 
 HIT, MISS = "hit", "miss"
@@ -133,6 +141,15 @@ CASES = {
         },
         "fixture-signature-bit-flip": {"pqc_fixture_final_verify": HIT, "pqc_verify_call": at_least(6), "pqc_harness_keygen": MISS},
     },
+    # The responder holds one byte that matches the v1 message start, then the rest of the key shows v2.
+    "p2p_transport_bidirectional_v2": {
+        "v1-magic-prefix-key": {"v1_prefix_match": HIT, "v1_fallback": MISS},
+        "negotiate-both": {"v1_prefix_match": MISS},
+    },
+    # A group of four matrix entries still needs a fourth SHAKE128 block. Which entry needs it is invisible
+    # here, since the four entries share their source lines.
+    "mlkem": {"matrix-lane3-extra-block": {"mlkem_x4_extra_block": HIT}},
+    "mlkem_backend_diff": {"matrix-lane3-extra-block": {"mlkem_x4_extra_block": HIT}},
 }
 
 
