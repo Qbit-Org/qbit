@@ -434,6 +434,7 @@ For a known `0xc0` leaf, after annex, script, and control removal:
 | Each initial item | 16 KiB | consensus and policy |
 | Aggregate initial-item bytes | 128 KiB | consensus and policy |
 | Main stack plus alt-stack while executing | 1,000 items | consensus |
+| Main stack plus alt-stack bytes after each opcode | 1 MiB | policy |
 | Literal pushed by script bytecode when OP_SUCCESS does not short circuit | 520 bytes | consensus |
 | Validation-weight initial value | serialized full witness size + 50 | consensus |
 | Charge for each nonempty PQC signature attempt | 3,683 | consensus |

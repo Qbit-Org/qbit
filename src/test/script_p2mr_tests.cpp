@@ -4869,6 +4869,77 @@ BOOST_AUTO_TEST_CASE(p2mr_rejects_stack_copy_amplification_item)
     BOOST_CHECK_EQUAL(err, SCRIPT_ERR_PUSH_SIZE);
 }
 
+BOOST_AUTO_TEST_CASE(p2mr_dup_drop_leaf_runtime_stack_bytes)
+{
+    // One maximum-size initial item duplicated to the 1,000-item runtime limit.
+    CScript leaf_script;
+    for (int i = 0; i < MAX_STACK_SIZE - 1; ++i) leaf_script << OP_DUP;
+    for (int i = 0; i < MAX_STACK_SIZE - 1; ++i) leaf_script << OP_DROP;
+
+    const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+    const P2MRSpendContext spend = BuildP2MRSpend(
+        leaf_script,
+        /*stack_items=*/{valtype(MAX_P2MR_V1_STACK_ITEM_SIZE, 0x42)},
+        /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+        program_root);
+
+    // Consensus validity is unchanged.
+    ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+    BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+
+    for (const unsigned int flags : {P2MR_SCRIPT_VERIFY_FLAGS | SCRIPT_VERIFY_P2MR_STACK_BYTES, STANDARD_SCRIPT_VERIFY_FLAGS}) {
+        err = SCRIPT_ERR_UNKNOWN_ERROR;
+        BOOST_CHECK(!VerifySpend(spend, flags, err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_STACK_SIZE);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(p2mr_runtime_stack_bytes_boundary)
+{
+    static_assert(MAX_STANDARD_P2MR_V1_STACK_BYTES % MAX_P2MR_V1_STACK_ITEM_SIZE == 0);
+    constexpr int max_items{MAX_STANDARD_P2MR_V1_STACK_BYTES / MAX_P2MR_V1_STACK_ITEM_SIZE};
+
+    enum class ExtraByte { NONE, WITH_ALTSTACK, AT_END };
+    // Reach exactly the byte bound through every element-copying opcode, with
+    // part of the stack moved to the altstack and reordered by OP_ROLL and
+    // OP_2ROT, then optionally push one more byte.
+    const auto build_leaf{[&](ExtraByte extra) {
+        CScript script;
+        for (int i = 0; i < 31; ++i) script << OP_DUP;
+        for (int i = 0; i < 16; ++i) script << OP_TOALTSTACK;
+        script << OP_1 << OP_PICK << OP_2DUP << OP_3DUP << OP_OVER << OP_2OVER << OP_TUCK << OP_IFDUP;
+        script << OP_16 << OP_ROLL << OP_2ROT << OP_2SWAP << OP_ROT << OP_SWAP << OP_NIP << OP_DUP;
+        // 43 copies of the item are held so far.
+        for (int i = 43; i < max_items; ++i) script << OP_DUP;
+        if (extra == ExtraByte::WITH_ALTSTACK) script << OP_1 << OP_DROP;
+        for (int i = 0; i < 16; ++i) script << OP_FROMALTSTACK;
+        for (int i = 0; i < 8; ++i) script << OP_DROP << OP_DUP;
+        if (extra == ExtraByte::AT_END) script << OP_1 << OP_DROP;
+        for (int i = 1; i < max_items; ++i) script << OP_DROP;
+        return script;
+    }};
+
+    for (const ExtraByte extra : {ExtraByte::NONE, ExtraByte::WITH_ALTSTACK, ExtraByte::AT_END}) {
+        const CScript leaf_script{build_leaf(extra)};
+        const uint256 program_root = ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script);
+        const P2MRSpendContext spend = BuildP2MRSpend(
+            leaf_script,
+            /*stack_items=*/{valtype(MAX_P2MR_V1_STACK_ITEM_SIZE, 0x42)},
+            /*control_block=*/{P2MR_LEAF_VERSION_V1_CONTROL},
+            program_root);
+
+        ScriptError err{SCRIPT_ERR_UNKNOWN_ERROR};
+        BOOST_CHECK(VerifySpend(spend, P2MR_SCRIPT_VERIFY_FLAGS, err));
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+
+        err = SCRIPT_ERR_UNKNOWN_ERROR;
+        const bool accepted{VerifySpend(spend, STANDARD_SCRIPT_VERIFY_FLAGS, err)};
+        BOOST_CHECK_EQUAL(accepted, extra == ExtraByte::NONE);
+        BOOST_CHECK_EQUAL(err, extra == ExtraByte::NONE ? SCRIPT_ERR_OK : SCRIPT_ERR_STACK_SIZE);
+    }
+}
+
 BOOST_AUTO_TEST_CASE(p2mr_rejects_too_many_initial_stack_items)
 {
     {

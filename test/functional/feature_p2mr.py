@@ -513,6 +513,23 @@ class FeatureP2MRTest(BitcoinTestFramework):
         txid = self.nodes[0].sendrawtransaction(tx.serialize().hex())
         assert txid in self.nodes[0].getrawmempool()
 
+    def test_runtime_stack_bytes_policy_rejection(self):
+        self.log.info("Reject P2MR leaf whose runtime stack exceeds the standard byte bound, accept it in a block")
+        leaf_script = CScript([OP_DUP] * 999 + [OP_DROP] * 999)
+        utxo = self.fund_p2mr_output(p2mr_tapleaf_hash(leaf_script))
+
+        stack_item = bytes([0x42]) * MAX_STANDARD_P2MR_STACK_ITEM_SIZE
+        tx = self.create_spend_tx(utxo, [stack_item, bytes(leaf_script), p2mr_control_block()], fee=10_000)
+        assert tx.get_weight() <= MAX_STANDARD_TX_WEIGHT
+        policy_result = self.nodes[0].testmempoolaccept([tx.serialize().hex()])[0]
+        assert_equal(policy_result["allowed"], False)
+        assert_equal(policy_result["reject-reason"], "mempool-script-verify-flag-failed (Stack size limit exceeded)")
+
+        block = self.make_witness_block(tx)
+        assert_equal(None, self.nodes[0].submitblock(block.serialize().hex()))
+        assert_equal(self.nodes[0].getbestblockhash(), block.hash_hex)
+        self.script_wallet.rescan_utxos()
+
     def test_op_success_policy_rejection(self):
         self.log.info("Reject P2MR OP_SUCCESS leaf under standard policy")
         leaf_script = CScript([OP_RESERVED])
@@ -1347,6 +1364,7 @@ class FeatureP2MRTest(BitcoinTestFramework):
         self.test_non_32_byte_pubkey_consensus_rejection()
         self.test_stack_item_policy_rejection()
         self.test_large_stack_policy_acceptance()
+        self.test_runtime_stack_bytes_policy_rejection()
         self.test_op_success_policy_rejection()
 
         self.log.info("19/20 regtest -p2mronly=1 still defaults a fresh descriptor wallet to P2MR")
