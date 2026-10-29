@@ -638,4 +638,63 @@ BOOST_FIXTURE_TEST_CASE(pqc_policy_consensus_reuse, P2MRPQCAdmissionSetup)
     }
 }
 
+BOOST_FIXTURE_TEST_CASE(pqc_data_signature_reuse, P2MRPQCAdmissionSetup)
+{
+    // Mempool acceptance verifies a valid OP_CHECKDATASIGPQC signature once:
+    // the consensus pass reuses the result of the policy pass. A failed data
+    // signature is never cached; it is verified on every submission and the
+    // transaction is rejected each time.
+    using valtype = std::vector<unsigned char>;
+    CPQCKey key;
+    key.MakeNewKey();
+    BOOST_REQUIRE(key.IsValid());
+    const CPQCPubKey pubkey{key.GetPubKey()};
+    const uint256 msg_hash{(HashWriter{} << std::string{"pqc data signature reuse"}).GetSHA256()};
+    const uint256 datasig_hash{ComputeQbitDataSigPQCHash(msg_hash)};
+    valtype sig;
+    uint32_t signature_counter{0};
+    BOOST_REQUIRE(key.Sign(datasig_hash, sig, signature_counter));
+    valtype invalid_sig{sig};
+    invalid_sig.back() ^= 1;
+
+    const valtype control_block{static_cast<unsigned char>(P2MR_LEAF_VERSION_V1 | 1)};
+    const CScript leaf_script{CScript{} << valtype(msg_hash.begin(), msg_hash.end()) << valtype(pubkey.begin(), pubkey.end()) << OP_CHECKDATASIGPQC};
+    const valtype leaf_bytes(leaf_script.begin(), leaf_script.end());
+    const uint256 merkle_root{ComputeP2MRMerkleRoot(control_block, ComputeP2MRLeafHash(P2MR_LEAF_VERSION_V1, leaf_bytes))};
+    const CScript script_pubkey{CScript{} << OP_2 << valtype(merkle_root.begin(), merkle_root.end())};
+
+    const CAmount coin_value{m_coinbase_txns[0]->vout[0].nValue / 2};
+    const CMutableTransaction funding{CreateValidMempoolTransaction(
+        /*input_transactions=*/{m_coinbase_txns[0]},
+        /*inputs=*/{COutPoint{m_coinbase_txns[0]->GetHash(), 0}},
+        /*input_height=*/COINBASE_MATURITY,
+        /*input_signing_keys=*/{coinbaseKey},
+        /*outputs=*/{CTxOut{coin_value, script_pubkey}},
+        /*submit=*/false)};
+    CreateAndProcessBlock({funding}, P2MROpTrueScript());
+
+    const auto submit = [&](const valtype& witness_sig, CAmount fee, uint64_t expected_verifications, const std::string& label) {
+        CMutableTransaction tx;
+        tx.version = 2;
+        tx.vin.emplace_back(COutPoint{funding.GetHash(), 0});
+        tx.vin[0].scriptWitness.stack = {witness_sig, leaf_bytes, control_block};
+        tx.vout.emplace_back(coin_value - fee, P2MROpTrueScript());
+        ScopedPQCVerificationCounter verifications;
+        const MempoolAcceptResult result{WITH_LOCK(cs_main, return m_node.chainman->ProcessTransaction(MakeTransactionRef(tx)))};
+        BOOST_TEST_MESSAGE(label << ": backend calls " << verifications.GetCount() << " reject=" << result.m_state.GetRejectReason());
+        BOOST_CHECK_MESSAGE(verifications.GetCount() == expected_verifications, label << ": backend calls " << verifications.GetCount());
+        return result;
+    };
+
+    for (const CAmount fee : {100'000, 100'001}) {
+        const std::string label{strprintf("invalid data signature, fee %d", fee)};
+        const MempoolAcceptResult result{submit(invalid_sig, fee, /*expected_verifications=*/1, label)};
+        BOOST_CHECK_MESSAGE(result.m_result_type == MempoolAcceptResult::ResultType::INVALID, label);
+        BOOST_CHECK_EQUAL(result.m_state.GetRejectReason(), "mempool-script-verify-flag-failed (PQC signature verification failed)");
+    }
+
+    const MempoolAcceptResult result{submit(sig, 100'002, /*expected_verifications=*/1, "valid data signature")};
+    BOOST_CHECK_MESSAGE(result.m_result_type == MempoolAcceptResult::ResultType::VALID, result.m_state.ToString());
+}
+
 BOOST_AUTO_TEST_SUITE_END()

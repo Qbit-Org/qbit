@@ -794,11 +794,12 @@ BOOST_AUTO_TEST_CASE(concurrent_checks_of_one_signature)
     BOOST_CHECK(!observed.cache.Get(EntryPQC(observed.cache, invalid), /*erase=*/false));
 }
 
-BOOST_AUTO_TEST_CASE(data_signatures_bypass_the_cache)
+BOOST_AUTO_TEST_CASE(data_signatures_use_the_cache)
 {
-    // The cache is scoped to transaction signatures. OP_CHECKDATASIGPQC calls
-    // the primitive directly: under a caching checker it emits no cache
-    // events, stores nothing and cannot be satisfied by a cache entry.
+    // OP_CHECKDATASIGPQC verifies through the checker. A caching checker
+    // stores a verified data signature in its own signature cache domain and
+    // never stores a failed one. Results, script errors and the remaining
+    // validation weight match the uncached checker.
     CPQCKey key;
     key.MakeNewKey();
     BOOST_REQUIRE(key.IsValid());
@@ -829,31 +830,60 @@ BOOST_AUTO_TEST_CASE(data_signatures_bypass_the_cache)
         return EvalOutcome{{result, err}, execdata.m_validation_weight_left};
     };
 
+    const auto check = [&](const valtype& witness_sig, const BaseSignatureChecker& checker, const EvalOutcome& expected, uint64_t expected_verifications, const std::string& label) {
+        ScopedPQCVerificationCounter verifications;
+        BOOST_CHECK_MESSAGE(eval(witness_sig, checker) == expected, label);
+        BOOST_CHECK_MESSAGE(verifications.GetCount() == expected_verifications, label << ": backend calls " << verifications.GetCount());
+    };
+
     TupleContext ctx;
-    ObservedCache observed{1 << 20};
-    const auto uncached_checker{ctx.Uncached()};
-    const auto caching_checker{ctx.Caching(observed.cache, /*store=*/true)};
+    const EvalOutcome valid{eval(sig, ctx.Uncached())};
+    const EvalOutcome invalid{eval(invalid_sig, ctx.Uncached())};
+    BOOST_CHECK(valid.outcome == (ScriptOutcome{true, SCRIPT_ERR_OK}));
+    BOOST_CHECK(invalid.outcome == (ScriptOutcome{false, SCRIPT_ERR_P2MR_SIG}));
 
-    const EvalOutcome valid_uncached{eval(sig, uncached_checker)};
-    BOOST_CHECK(valid_uncached.outcome == (ScriptOutcome{true, SCRIPT_ERR_OK}));
-    for (int i{0}; i < 2; ++i) {
-        ScopedPQCVerificationCounter verifications;
-        BOOST_CHECK(eval(sig, caching_checker) == valid_uncached);
-        BOOST_CHECK_EQUAL(verifications.GetCount(), 1U);
-        observed.CheckEvents({}, "valid data signature");
-    }
-    BOOST_CHECK(!observed.cache.Get(EntryPQC(observed.cache, {datasig_hash, pubkey, sig}), /*erase=*/false));
-
-    // Prime the transaction-signature entry for the failing tuple. A data
-    // signature check that consulted the cache would now succeed.
-    const EvalOutcome invalid_uncached{eval(invalid_sig, uncached_checker)};
-    BOOST_CHECK(invalid_uncached.outcome == (ScriptOutcome{false, SCRIPT_ERR_P2MR_SIG}));
-    observed.cache.Set(EntryPQC(observed.cache, {datasig_hash, pubkey, invalid_sig}));
     {
-        ScopedPQCVerificationCounter verifications;
-        BOOST_CHECK(eval(invalid_sig, caching_checker) == invalid_uncached);
-        BOOST_CHECK_EQUAL(verifications.GetCount(), 1U);
-        observed.CheckEvents({}, "invalid data signature with a primed entry");
+        ObservedCache observed{1 << 20};
+        uint256 valid_entry;
+        observed.cache.ComputeEntryDataSigPQC(valid_entry, datasig_hash, sig, pubkey);
+        uint256 invalid_entry;
+        observed.cache.ComputeEntryDataSigPQC(invalid_entry, datasig_hash, invalid_sig, pubkey);
+
+        const auto storer{ctx.Caching(observed.cache, /*store=*/true)};
+        check(sig, storer, valid, 1, "valid data signature, cold");
+        check(sig, storer, valid, 0, "valid data signature, warm");
+        BOOST_CHECK(observed.cache.Get(valid_entry, /*erase=*/false));
+        // Data signatures use their own domain and emit no transaction-signature events.
+        BOOST_CHECK(!observed.cache.Get(EntryPQC(observed.cache, {datasig_hash, pubkey, sig}), /*erase=*/false));
+
+        // A failed data signature is verified on every check and never stored.
+        // A transaction-signature entry for the same bytes does not satisfy it.
+        observed.cache.Set(EntryPQC(observed.cache, {datasig_hash, pubkey, invalid_sig}));
+        check(invalid_sig, storer, invalid, 1, "invalid data signature");
+        check(invalid_sig, storer, invalid, 1, "invalid data signature, repeated");
+        BOOST_CHECK(!observed.cache.Get(invalid_entry, /*erase=*/false));
+
+        // A consuming checker, as in block connection, uses the stored entry.
+        const auto consumer{ctx.Caching(observed.cache, /*store=*/false)};
+        check(sig, consumer, valid, 0, "valid data signature, consume");
+        check(invalid_sig, consumer, invalid, 1, "invalid data signature, consume");
+        BOOST_CHECK(!observed.cache.Get(invalid_entry, /*erase=*/false));
+        observed.CheckEvents({}, "data signatures");
+    }
+
+    {
+        // Without storing, the cache gains no entry.
+        SignatureCache cache{1 << 20};
+        const auto consumer{ctx.Caching(cache, /*store=*/false)};
+        for (int i{0}; i < 2; ++i) {
+            check(sig, consumer, valid, 1, "valid data signature, non-store");
+            check(invalid_sig, consumer, invalid, 1, "invalid data signature, non-store");
+        }
+        uint256 entry;
+        cache.ComputeEntryDataSigPQC(entry, datasig_hash, sig, pubkey);
+        BOOST_CHECK(!cache.Get(entry, /*erase=*/false));
+        cache.ComputeEntryDataSigPQC(entry, datasig_hash, invalid_sig, pubkey);
+        BOOST_CHECK(!cache.Get(entry, /*erase=*/false));
     }
 }
 

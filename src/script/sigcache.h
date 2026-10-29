@@ -54,10 +54,12 @@ public:
 class SignatureCache
 {
 private:
-    //! Entries are SHA256(nonce || 'E', 'S' or 'P' || 31 zero bytes || signature hash || public key || signature):
+    //! Entries are SHA256(nonce || 'E', 'S', 'P' or 'D' || 31 zero bytes || signature hash || public key || signature),
+    //! where 'P' is a PQC transaction signature and 'D' a PQC data signature:
     CSHA256 m_salted_hasher_ecdsa;
     CSHA256 m_salted_hasher_schnorr;
     CSHA256 m_salted_hasher_pqc;
+    CSHA256 m_salted_hasher_datasig_pqc;
     typedef CuckooCache::cache<uint256, SignatureCacheHasher> map_type;
     map_type setValid;
     std::shared_mutex cs_sigcache;
@@ -74,6 +76,8 @@ public:
     void ComputeEntrySchnorr(uint256& entry, const uint256 &hash, std::span<const unsigned char> sig, const XOnlyPubKey& pubkey) const;
 
     void ComputeEntryPQC(uint256& entry, const uint256& hash, std::span<const unsigned char> sig, const CPQCPubKey& pubkey) const;
+
+    void ComputeEntryDataSigPQC(uint256& entry, const uint256& hash, std::span<const unsigned char> sig, const CPQCPubKey& pubkey) const;
 
     bool Get(const uint256& entry, const bool erase);
 
@@ -96,6 +100,7 @@ public:
     bool VerifyECDSASignature(const std::vector<unsigned char>& vchSig, const CPubKey& vchPubKey, const uint256& sighash) const override;
     bool VerifySchnorrSignature(std::span<const unsigned char> sig, const XOnlyPubKey& pubkey, const uint256& sighash) const override;
     bool VerifyPQCSignature(std::span<const unsigned char> sig, const CPQCPubKey& pubkey, const uint256& sighash) const override;
+    bool VerifyDataSigPQC(std::span<const unsigned char> sig, const CPQCPubKey& pubkey, const uint256& hash) const override;
 };
 
 #endif // QBIT_SCRIPT_SIGCACHE_H

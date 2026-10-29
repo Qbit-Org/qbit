@@ -307,6 +307,11 @@ public:
         return false;
     }
 
+    /** Verify a PQC data signature over its tagged message hash. Unlike the
+     *  other checks this does not depend on a transaction, so every checker
+     *  verifies; the result depends only on the arguments. */
+    virtual bool VerifyDataSigPQC(std::span<const unsigned char> sig, const CPQCPubKey& pubkey, const uint256& hash) const;
+
     virtual bool CheckTemplateVerifyHash(std::span<const unsigned char> expected, ScriptError* serror = nullptr) const
     {
         return false;
@@ -390,6 +395,11 @@ public:
     bool CheckPQCSignature(std::span<const unsigned char> sig, std::span<const unsigned char> pubkey, SigVersion sigversion, ScriptExecutionData& execdata, ScriptError* serror = nullptr) const override
     {
         return m_checker.CheckPQCSignature(sig, pubkey, sigversion, execdata, serror);
+    }
+
+    bool VerifyDataSigPQC(std::span<const unsigned char> sig, const CPQCPubKey& pubkey, const uint256& hash) const override
+    {
+        return m_checker.VerifyDataSigPQC(sig, pubkey, hash);
     }
 
     bool CheckTemplateVerifyHash(std::span<const unsigned char> expected, ScriptError* serror = nullptr) const override
