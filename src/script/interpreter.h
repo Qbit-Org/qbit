@@ -151,6 +151,10 @@ enum : uint32_t {
     // removed at the height-activated validation-weight-v2 consensus change.
     SCRIPT_VERIFY_P2MR_LEGACY_VALIDATION_WEIGHT = (1U << 22),
 
+    // Bound the total bytes held on the stack and altstack while a P2MR v1
+    // script executes to MAX_STANDARD_P2MR_V1_STACK_BYTES (policy only).
+    SCRIPT_VERIFY_P2MR_STACK_BYTES = (1U << 23),
+
     // Constants to point to the highest flag in use. Add new flags above this line.
     //
     SCRIPT_VERIFY_END_MARKER
