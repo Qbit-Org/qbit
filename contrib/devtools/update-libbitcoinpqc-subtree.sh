@@ -29,7 +29,7 @@ resolve_remote_commit() {
 readonly PREFIX="src/libbitcoinpqc"
 DEFAULT_REMOTE_URL="$(derive_default_remote_url)"
 readonly DEFAULT_REMOTE_URL
-readonly DEFAULT_REMOTE_REF="v0.3.0"
+readonly DEFAULT_REMOTE_REF="v0.3.1"
 
 REMOTE_URL="${LIBBITCOINPQC_REMOTE_URL:-$DEFAULT_REMOTE_URL}"
 REMOTE_REF="${LIBBITCOINPQC_REMOTE_REF:-$DEFAULT_REMOTE_REF}"
