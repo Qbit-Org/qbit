@@ -400,9 +400,13 @@ Fields to watch:
 
 On P2MR-only chains, legacy WIF private keys are disabled for this path; use `pqc(KEY)` expressions.
 
+`signrawtransactionwithkey` and `descriptorprocesspsbt` do not track PQC signature counts across calls for keys passed to them. The caller must keep each PQC key within its limit of `1,073,741,824` (`2^30`) signatures, and should rotate high-volume keys well before then. See [P2MR Signature Security Margin](../reference/p2mr-signature-security.md).
+
 ### PSBT Handling
 
 qbit PSBT support signs and finalizes current P2MR script-path inputs. The current implementation uses dedicated P2MR PSBT input data plus qbit-proprietary fields where there is not yet a stable generic encoding.
+
+`descriptorprocesspsbt` does not track PQC signature counts across calls for keys in caller-supplied private descriptors; see [Raw Transaction Signing](#raw-transaction-signing).
 
 Integrator notes:
 

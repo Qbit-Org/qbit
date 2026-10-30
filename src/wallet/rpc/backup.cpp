@@ -5,6 +5,7 @@
 #include <chain.h>
 #include <clientversion.h>
 #include <core_io.h>
+#include <crypto/pqc.h>
 #include <hash.h>
 #include <interfaces/chain.h>
 #include <key_io.h>
@@ -1022,6 +1023,7 @@ RPCHelpMan importdescriptors()
         "Import descriptors. This will trigger a rescan of the blockchain based on the earliest timestamp of all descriptors being imported. Requires a new wallet backup.\n"
         "When importing descriptors with multipath key expressions, if the multipath specifier contains exactly two elements, the descriptor produced from the second element will be imported as an internal descriptor.\n"
         "P2MR descriptors that depend only on BIP32 extended public keys are not accepted; use importpubkeydb for watch-only P2MR tracking.\n"
+        + strprintf("PQC signature counters for imported keys do not include signatures the same keys made outside this wallet, so the caller is responsible for keeping each PQC key within its limit of %u signatures.\n", PQC_MAX_SIGNATURES) +
             "\nNote: This call can take over an hour to complete if using an early timestamp; during that time, other rpc calls\n"
             "may report that the imported keys, addresses or scripts exist but related transactions are still missing.\n"
             "The rescan is significantly faster if block filters are available (using startup option \"-blockfilterindex=1\").\n",

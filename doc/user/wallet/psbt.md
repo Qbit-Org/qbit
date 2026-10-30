@@ -45,6 +45,11 @@ Common PSBT RPCs still exist:
 - `converttopsbt`
 - `joinpsbts`
 
+`descriptorprocesspsbt` signs with private descriptors supplied by the caller
+and does not track PQC signature counts across calls. Keep your own count for
+each key and stay well within its signature limit; see
+[P2MR Signature Security Margin](../../reference/p2mr-signature-security.md).
+
 For ordinary P2MR wallet use, prefer wallet RPCs that keep qbit P2MR metadata
 inside qbit Core. Use `decodepsbt` and `analyzepsbt` for diagnostics, but do
 not assume third-party tools understand every qbit P2MR field.
