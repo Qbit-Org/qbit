@@ -18,7 +18,7 @@ option(SPX_ENABLE_TEST_BENCH_ENV_KNOBS "Enable test/benchmark-only runtime SPHIN
 # Set version
 set(BITCOINPQC_VERSION_MAJOR 0)
 set(BITCOINPQC_VERSION_MINOR 3)
-set(BITCOINPQC_VERSION_PATCH 0)
+set(BITCOINPQC_VERSION_PATCH 1)
 
 # Library output settings
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
@@ -136,6 +136,15 @@ if(BUILD_TESTING)
     add_test(
         NAME slh_dsa_sign_failure_cleanup_test
         COMMAND slh_dsa_sign_failure_cleanup_test
+    )
+
+    add_executable(slh_dsa_stack_scrub_test
+        tests/c/slh_dsa_stack_scrub_test.c
+    )
+    target_link_libraries(slh_dsa_stack_scrub_test PRIVATE bitcoinpqc)
+    add_test(
+        NAME slh_dsa_stack_scrub_test
+        COMMAND slh_dsa_stack_scrub_test
     )
 endif()
 

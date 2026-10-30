@@ -57,7 +57,7 @@ static int derive_keygen_seed_v1(
     return 0;
 }
 
-int slh_dsa_keygen(
+static int slh_dsa_keygen_impl(
     uint8_t *pk,
     uint8_t *sk,
     const uint8_t *random_data,
@@ -75,5 +75,19 @@ int slh_dsa_keygen(
     int result = crypto_sign_seed_keypair(pk, sk, seed);
     bitcoin_pqc_secure_zero(seed, sizeof(seed));
 
+    return result;
+}
+
+/* Wraps the implementation so the stack it released is burned on every
+   return path; see bitcoin_pqc_burn_stack(). */
+int slh_dsa_keygen(
+    uint8_t *pk,
+    uint8_t *sk,
+    const uint8_t *random_data,
+    size_t random_data_size
+) {
+    int result = slh_dsa_keygen_impl(pk, sk, random_data, random_data_size);
+
+    bitcoin_pqc_burn_stack();
     return result;
 }

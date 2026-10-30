@@ -96,7 +96,9 @@ void custom_slh_randombytes_impl(uint8_t *out, size_t outlen) {
     }
 }
 
-void slh_dsa_derandomize(uint8_t *seed, const uint8_t *m, size_t mlen, const uint8_t *sk) {
+/* Internal: slh_dsa_sign_with_stats derandomizes through this and burns once
+   for the whole call. */
+void slh_dsa_derandomize_unburned(uint8_t *seed, const uint8_t *m, size_t mlen, const uint8_t *sk) {
     if (!seed || (!m && mlen != 0) || !sk) {
         if (seed) {
             bitcoin_pqc_secure_zero(seed, 64);
@@ -123,4 +125,11 @@ void slh_dsa_derandomize(uint8_t *seed, const uint8_t *m, size_t mlen, const uin
     bitcoin_pqc_secure_zero(state, sizeof(state));
     bitcoin_pqc_secure_zero(digest0, sizeof(digest0));
     bitcoin_pqc_secure_zero(digest1_input, sizeof(digest1_input));
+}
+
+/* Burns the stack the SHA-256 over the secret key released; see
+   bitcoin_pqc_burn_stack(). */
+void slh_dsa_derandomize(uint8_t *seed, const uint8_t *m, size_t mlen, const uint8_t *sk) {
+    slh_dsa_derandomize_unburned(seed, m, mlen, sk);
+    bitcoin_pqc_burn_stack();
 }

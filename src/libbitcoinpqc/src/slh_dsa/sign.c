@@ -23,7 +23,8 @@ extern void slh_dsa_setup_custom_random(void);
 extern void slh_dsa_restore_original_random(void);
 extern void slh_dsa_random_source_clear_failure(void);
 extern int slh_dsa_random_source_failed(void);
-extern void slh_dsa_derandomize(uint8_t *seed, const uint8_t *m, size_t mlen, const uint8_t *sk);
+extern void slh_dsa_derandomize_unburned(uint8_t *seed, const uint8_t *m, size_t mlen, const uint8_t *sk);
+extern int slh_dsa_secret_key_validate_unburned(const uint8_t *sk, size_t sk_size);
 
 int slh_dsa_sign(
     uint8_t *sig,
@@ -35,7 +36,7 @@ int slh_dsa_sign(
     return slh_dsa_sign_with_stats(sig, siglen, m, mlen, sk, NULL);
 }
 
-int slh_dsa_sign_with_stats(
+static int slh_dsa_sign_with_stats_impl(
     uint8_t *sig,
     size_t *siglen,
     const uint8_t *m,
@@ -47,7 +48,7 @@ int slh_dsa_sign_with_stats(
         return -1;
     }
 
-    if (slh_dsa_secret_key_validate(sk, SLH_DSA_SECRET_KEY_SIZE) != 0) {
+    if (slh_dsa_secret_key_validate_unburned(sk, SLH_DSA_SECRET_KEY_SIZE) != 0) {
         bitcoin_pqc_secure_zero(sig, CRYPTO_BYTES);
         *siglen = 0;
         return -1;
@@ -64,7 +65,7 @@ int slh_dsa_sign_with_stats(
     bitcoin_pqc_sign_stats_t *active_stats = stats ? stats : &scratch_stats;
 
     slh_dsa_random_source_clear_failure();
-    slh_dsa_derandomize(deterministic_seed, message, mlen, sk);
+    slh_dsa_derandomize_unburned(deterministic_seed, message, mlen, sk);
     if (slh_dsa_random_source_failed()) {
         bitcoin_pqc_secure_zero(sig, CRYPTO_BYTES);
         *siglen = 0;
@@ -95,5 +96,21 @@ int slh_dsa_sign_with_stats(
         *siglen = 0;
     }
 
+    return result;
+}
+
+/* Wraps the implementation so the stack it released is burned on every
+   return path; see bitcoin_pqc_burn_stack(). */
+int slh_dsa_sign_with_stats(
+    uint8_t *sig,
+    size_t *siglen,
+    const uint8_t *m,
+    size_t mlen,
+    const uint8_t *sk,
+    bitcoin_pqc_sign_stats_t *stats
+) {
+    int result = slh_dsa_sign_with_stats_impl(sig, siglen, m, mlen, sk, stats);
+
+    bitcoin_pqc_burn_stack();
     return result;
 }

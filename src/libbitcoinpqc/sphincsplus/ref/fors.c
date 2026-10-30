@@ -21,6 +21,7 @@
 #if defined(__APPLE__) || defined(__unix__)
 #include <pthread.h>
 #define SPX_FORS_USE_PTHREADS 1
+#include "../../src/secure_zero.h"
 #endif
 
 static void fors_gen_sk(unsigned char *sk, const spx_ctx *ctx,
@@ -246,6 +247,9 @@ static void *fors_sign_worker(void *arg)
         fors_sign_tree(sig_tree, root_out, args->ctx, args->fors_addr, args->indices[i], i);
     }
 
+    /* The worker hashed SK_SEED-derived leaves on its own stack, which the
+       signer's burn on the calling thread cannot reach. */
+    bitcoin_pqc_burn_stack();
     return NULL;
 }
 

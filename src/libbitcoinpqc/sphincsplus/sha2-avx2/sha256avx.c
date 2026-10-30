@@ -5,6 +5,10 @@
 #include "sha256avx.h"
 #include "utils.h"
 
+/* Zero scratch through a volatile function pointer so the stores are not
+   removed as dead; message words and their transposes can hold SK_SEED. */
+static void *(*const volatile sha256avx_memset)(void *, int, size_t) = memset;
+
 // Transpose 8 vectors containing 32-bit values
 void transpose(u256 s[8]) {
     u256 tmp0[8];
@@ -33,6 +37,9 @@ void transpose(u256 s[8]) {
     s[5] = _mm256_permute2x128_si256(tmp1[1], tmp1[5], 0x31);
     s[6] = _mm256_permute2x128_si256(tmp1[2], tmp1[6], 0x31);
     s[7] = _mm256_permute2x128_si256(tmp1[3], tmp1[7], 0x31);    
+
+    sha256avx_memset(tmp0, 0, sizeof(tmp0));
+    sha256avx_memset(tmp1, 0, sizeof(tmp1));
 }
 
 void sha256_init8x(sha256ctx *ctx) {
@@ -285,4 +292,7 @@ void sha256_transform8x(sha256ctx *ctx,
     ctx->s[5] = ADD32(s[5], ctx->s[5]);
     ctx->s[6] = ADD32(s[6], ctx->s[6]);
     ctx->s[7] = ADD32(s[7], ctx->s[7]);
+
+    sha256avx_memset(w, 0, sizeof(w));
+    sha256avx_memset(s, 0, sizeof(s));
 }

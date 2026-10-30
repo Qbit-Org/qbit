@@ -26,6 +26,15 @@ extern "C" {
 #define SLH_DSA_SHA2_128S_BOUNDED30_SECRET_KEY_SIZE SLH_DSA_SECRET_KEY_SIZE
 #define SLH_DSA_SHA2_128S_BOUNDED30_SIGNATURE_SIZE SLH_DSA_SIGNATURE_SIZE
 
+/*
+ * Stack requirement: slh_dsa_keygen(), slh_dsa_secret_key_validate(),
+ * slh_dsa_sign(), slh_dsa_sign_with_stats() and slh_dsa_derandomize()
+ * overwrite the stack they released before returning, so callers need about
+ * 16 KiB of free stack in optimized native builds (about 208 KiB unoptimized,
+ * 4 KiB under Emscripten). The size is BITCOIN_PQC_BURN_STACK_BYTES in
+ * src/secure_zero.h and can be overridden at build time.
+ */
+
 /**
  * @brief Generate an SLH-DSA-SHA2-128s-bounded30 key pair.
  *
