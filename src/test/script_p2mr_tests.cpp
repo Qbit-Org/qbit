@@ -4891,7 +4891,7 @@ BOOST_AUTO_TEST_CASE(p2mr_dup_drop_leaf_runtime_stack_bytes)
     for (const unsigned int flags : {P2MR_SCRIPT_VERIFY_FLAGS | SCRIPT_VERIFY_P2MR_STACK_BYTES, STANDARD_SCRIPT_VERIFY_FLAGS}) {
         err = SCRIPT_ERR_UNKNOWN_ERROR;
         BOOST_CHECK(!VerifySpend(spend, flags, err));
-        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_STACK_SIZE);
+        BOOST_CHECK_EQUAL(err, SCRIPT_ERR_P2MR_STACK_BYTES);
     }
 }
 
@@ -4936,7 +4936,7 @@ BOOST_AUTO_TEST_CASE(p2mr_runtime_stack_bytes_boundary)
         err = SCRIPT_ERR_UNKNOWN_ERROR;
         const bool accepted{VerifySpend(spend, STANDARD_SCRIPT_VERIFY_FLAGS, err)};
         BOOST_CHECK_EQUAL(accepted, extra == ExtraByte::NONE);
-        BOOST_CHECK_EQUAL(err, extra == ExtraByte::NONE ? SCRIPT_ERR_OK : SCRIPT_ERR_STACK_SIZE);
+        BOOST_CHECK_EQUAL(err, extra == ExtraByte::NONE ? SCRIPT_ERR_OK : SCRIPT_ERR_P2MR_STACK_BYTES);
     }
 }
 

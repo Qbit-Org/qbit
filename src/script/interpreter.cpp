@@ -1412,7 +1412,7 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                 return set_error(serror, SCRIPT_ERR_STACK_SIZE);
             if (check_p2mr_stack_bytes) {
                 p2mr_stack_bytes = p2mr_stack_bytes - window_bytes + StackBytesFrom(stack, stack_window_begin) + StackBytesFrom(altstack, altstack_window_begin);
-                if (p2mr_stack_bytes > MAX_STANDARD_P2MR_V1_STACK_BYTES) return set_error(serror, SCRIPT_ERR_STACK_SIZE);
+                if (p2mr_stack_bytes > MAX_STANDARD_P2MR_V1_STACK_BYTES) return set_error(serror, SCRIPT_ERR_P2MR_STACK_BYTES);
             }
         }
     }
