@@ -182,7 +182,7 @@ then runs `test/lint/libbitcoinpqc-subtree-check.sh` to verify that the vendored
 tree and recorded `git-subtree-split` match the peeled tag commit.
 
 The default source is
-`https://github.com/Qbit-Org/qbit-libbitcoinpqc.git` tag `v0.3.0`. For the
+`https://github.com/Qbit-Org/qbit-libbitcoinpqc.git` tag `v0.3.1`. For the
 full release-tag import workflow, see
 [`doc/subtrees/libbitcoinpqc.md`](../../doc/subtrees/libbitcoinpqc.md).
 
@@ -196,6 +196,6 @@ Optional overrides:
 
 ```bash
 LIBBITCOINPQC_REMOTE_URL=git@github.com:Qbit-Org/qbit-libbitcoinpqc.git \
-LIBBITCOINPQC_REMOTE_REF=v0.3.0 \
+LIBBITCOINPQC_REMOTE_REF=v0.3.1 \
 contrib/devtools/update-libbitcoinpqc-subtree.sh
 ```

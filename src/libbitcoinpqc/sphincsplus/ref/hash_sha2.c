@@ -25,6 +25,14 @@
 #define mgf1_X mgf1_256
 #endif
 
+static void secure_zero_local(void *ptr, size_t len)
+{
+    volatile unsigned char *p = (volatile unsigned char *)ptr;
+    while (len > 0) {
+        *p++ = 0;
+        len--;
+    }
+}
 
 /* For SHA, there is no immediate reason to initialize at the start,
    so this function is an empty operation. */
@@ -53,6 +61,12 @@ void prf_addr(unsigned char *out, const spx_ctx *ctx,
     sha256_inc_finalize(outbuf, sha2_state, buf, SPX_SHA256_ADDR_BYTES + SPX_N);
 
     memcpy(out, outbuf, SPX_N);
+
+    /* buf holds an exact SK_SEED copy and outbuf the secret PRF output;
+       neither may survive on the stack after the call. */
+    secure_zero_local(sha2_state, sizeof(sha2_state));
+    secure_zero_local(buf, sizeof(buf));
+    secure_zero_local(outbuf, sizeof(outbuf));
 }
 
 /**
@@ -112,6 +126,11 @@ void gen_message_random(unsigned char *R, const unsigned char *sk_prf,
 
     shaX(buf, buf, SPX_SHAX_BLOCK_BYTES + SPX_SHAX_OUTPUT_BYTES);
     memcpy(R, buf, SPX_N);
+
+    /* buf and state carry SK_PRF-keyed HMAC scratch (pad-XORed key block and
+       inner digest); neither may survive on the stack after the call. */
+    secure_zero_local(state, sizeof(state));
+    secure_zero_local(buf, sizeof(buf));
 }
 
 /*

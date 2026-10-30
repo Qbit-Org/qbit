@@ -25,7 +25,9 @@ static int bytes_equal(const uint8_t *lhs, const uint8_t *rhs, size_t len) {
     return diff == 0;
 }
 
-int slh_dsa_secret_key_validate(const uint8_t *sk, size_t sk_size) {
+/* Internal: slh_dsa_sign_with_stats validates through this and burns once
+   for the whole call. */
+int slh_dsa_secret_key_validate_unburned(const uint8_t *sk, size_t sk_size) {
     spx_ctx ctx;
     uint8_t root[SPX_N];
     int result = -1;
@@ -53,5 +55,14 @@ int slh_dsa_secret_key_validate(const uint8_t *sk, size_t sk_size) {
 cleanup:
     bitcoin_pqc_secure_zero(root, sizeof(root));
     bitcoin_pqc_secure_zero(&ctx, sizeof(ctx));
+    return result;
+}
+
+/* Wraps the implementation so the stack it released is burned on every
+   return path; see bitcoin_pqc_burn_stack(). */
+int slh_dsa_secret_key_validate(const uint8_t *sk, size_t sk_size) {
+    int result = slh_dsa_secret_key_validate_unburned(sk, sk_size);
+
+    bitcoin_pqc_burn_stack();
     return result;
 }

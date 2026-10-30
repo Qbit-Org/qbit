@@ -114,6 +114,43 @@ Local changes are security-sensitive and should be reviewed by category:
 - portability and sanitizer hardening: unsigned-overflow handling, integer
   conversion cleanup, unaligned vector access handling, and Windows-safe
   vendored tree adjustments.
+- secret-key scratch zeroization: wiping SK_SEED and SK_PRF copies and the
+  SHA-2 scratch derived from them before keygen, signing and PRF helpers
+  return, and burning FORS worker thread stacks.
+
+## Vendored Changes In 0.3.1
+
+`0.3.1` changes these vendored SPHINCS+ files so that secret-key scratch does
+not outlive keygen and signing calls. Keys, signatures and verification
+results are unchanged, and the golden vectors pass unmodified.
+
+- `sphincsplus/ref/sign.c`: `crypto_sign_seed_keypair` and
+  `crypto_sign_signature` return through one cleanup path that zeroes the
+  stack `spx_ctx` (an exact SK_SEED copy) and `optrand`; WOTS+C counter
+  exhaustion also resets `*siglen` (#5).
+- `sphincsplus/ref/hash_sha2.c`: `prf_addr` and `gen_message_random` zero
+  their SK_SEED and SK_PRF-keyed scratch before returning (#5).
+- `sphincsplus/ref/sha2.c`: `sha256_inc_finalize` and `sha512_inc_finalize`
+  zero their padding buffers, and `sha256()` and `sha512()` zero their local
+  state (#5, with #6 removing the per-block stack burn #5 had added).
+- `sphincsplus/ref/fors.c`: each FORS worker thread burns its own stack
+  before returning, because the burn on the calling thread cannot reach it.
+  Worker threads run only when the test/benchmark knob `SPX_FORS_THREADS`
+  is enabled (#6).
+- `sphincsplus/sha2-avx2/hash_sha2x8.c`: `prf_addrx8` zeroes its eight
+  SK_SEED copies and PRF outputs (#5).
+- `sphincsplus/sha2-avx2/sha256avx.c`: `transpose` and `sha256_transform8x`
+  zero their temporaries, message schedule and working state (#5).
+- `sphincsplus/sha2-avx2/sha256x8.c`: `sha256x8_seeded` zeroes its context
+  (#5).
+- The `secure_zero_local` helpers in `sign.c`, `hash_sha2.c` and
+  `hash_sha2x8.c` count down without wrapping `len` past zero, so
+  `-fsanitize=unsigned-integer-overflow` builds do not trap (#14).
+
+The stack burn, `bitcoin_pqc_burn_stack()` in `src/secure_zero.h`, is
+repo-owned. It runs when `slh_dsa_keygen()`, `slh_dsa_sign_with_stats()`
+(and so `slh_dsa_sign()`), `slh_dsa_secret_key_validate()` and
+`slh_dsa_derandomize()` return (#6).
 
 ## Patch Policy
 

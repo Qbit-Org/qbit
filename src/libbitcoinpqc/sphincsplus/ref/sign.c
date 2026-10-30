@@ -22,8 +22,9 @@ extern int slh_dsa_random_source_failed(void);
 static void secure_zero_local(void *ptr, size_t len)
 {
     volatile unsigned char *p = (volatile unsigned char *)ptr;
-    while (len-- > 0) {
+    while (len > 0) {
         *p++ = 0;
+        len--;
     }
 }
 
@@ -68,6 +69,7 @@ int crypto_sign_seed_keypair(unsigned char *pk, unsigned char *sk,
                              const unsigned char *seed)
 {
     spx_ctx ctx;
+    int result = -1;
 
     /* Initialize SK_SEED, SK_PRF and PUB_SEED from seed. */
     memcpy(sk, seed, CRYPTO_SEEDBYTES);
@@ -83,12 +85,18 @@ int crypto_sign_seed_keypair(unsigned char *pk, unsigned char *sk,
 
     /* Compute root node of the top-most subtree. */
     if (merkle_gen_root(sk + 3*SPX_N, &ctx) != 0) {
-        return -1;
+        goto cleanup;
     }
 
     memcpy(pk + SPX_N, sk + 3*SPX_N, SPX_N);
 
-    return 0;
+    result = 0;
+
+cleanup:
+    /* ctx holds an exact SK_SEED copy; every return must pass through this
+       single cleanup path so the stack copy cannot outlive the call. */
+    secure_zero_local(&ctx, sizeof(ctx));
+    return result;
 }
 
 /*
@@ -156,6 +164,7 @@ int crypto_sign_signature(uint8_t *sig, size_t *siglen,
     uint32_t idx_leaf;
     uint32_t wots_addr[8] = {0};
     uint32_t tree_addr[8] = {0};
+    int result = -1;
 
     memcpy(ctx.sk_seed, sk, SPX_N);
     memcpy(ctx.pub_seed, pk, SPX_N);
@@ -177,9 +186,8 @@ int crypto_sign_signature(uint8_t *sig, size_t *siglen,
     randombytes(optrand, SPX_N);
 #if defined(CUSTOM_RANDOMBYTES)
     if (slh_dsa_random_source_failed()) {
-        secure_zero_local(optrand, sizeof(optrand));
         *siglen = 0;
-        return -1;
+        goto cleanup;
     }
 #endif
     gen_message_random(sig, sk_prf, optrand, m, mlen, &ctx);
@@ -204,13 +212,15 @@ int crypto_sign_signature(uint8_t *sig, size_t *siglen,
                 bitcoin_pqc_sign_stats_record_forsc_attempts(attempts);
                 bitcoin_pqc_sign_stats_record_forsc_cap();
                 *siglen = 0;
-                return BITCOINPQC_SIGN_LIMIT_EXCEEDED;
+                result = BITCOINPQC_SIGN_LIMIT_EXCEEDED;
+                goto cleanup;
             }
 
             ctr++;
             /* Exhausted all 2^32 tweaks of sig[0..3] without a hit. */
             if (ctr == 0) {
-                return -1;
+                *siglen = 0;
+                goto cleanup;
             }
             memcpy(sig, r_base, SPX_N);
             sig[0] ^= (unsigned char)(ctr);
@@ -241,7 +251,8 @@ int crypto_sign_signature(uint8_t *sig, size_t *siglen,
         int merkle_result = merkle_sign(sig, root, &ctx, wots_addr, tree_addr, idx_leaf);
         if (merkle_result != 0) {
             *siglen = 0;
-            return merkle_result;
+            result = merkle_result;
+            goto cleanup;
         }
         sig += SPX_WOTS_BYTES + SPX_TREE_HEIGHT * SPX_N;
 
@@ -251,8 +262,15 @@ int crypto_sign_signature(uint8_t *sig, size_t *siglen,
     }
 
     *siglen = SPX_BYTES;
+    result = 0;
 
-    return 0;
+cleanup:
+    /* ctx holds an exact SK_SEED copy and optrand is derived from the secret
+       key in the deterministic build; every return must pass through this
+       single cleanup path so the stack copies cannot outlive the call. */
+    secure_zero_local(&ctx, sizeof(ctx));
+    secure_zero_local(optrand, sizeof(optrand));
+    return result;
 }
 
 /**

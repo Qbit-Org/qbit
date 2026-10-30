@@ -25,8 +25,8 @@
       "smoke_check": false,
       "upstream": {
         "repo": "Qbit-Org/qbit-libbitcoinpqc",
-        "tag": "v0.3.0",
-        "peeled_commit": "ac72d1ffa0ef486f08d37334a43f5db1adb731db",
+        "tag": "v0.3.1",
+        "peeled_commit": "ebd9092b2a0e3f5699a5eb0f6c8be388024736a4",
         "fuzz_manifest": "fuzz/Cargo.toml",
         "runner": "fuzz/run_all_fuzzers.sh",
         "commands": [

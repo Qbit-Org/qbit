@@ -4,8 +4,8 @@
 
 Current metadata values:
 
-- Rust package (`Cargo.toml`): `qbit-libbitcoinpqc` `0.3.0`
-- CMake project variables (`CMakeLists.txt`): `0.3.0`
+- Rust package (`Cargo.toml`): `qbit-libbitcoinpqc` `0.3.1`
+- CMake project variables (`CMakeLists.txt`): `0.3.1`
 
 Rust and CMake track the core single-profile library version.
 

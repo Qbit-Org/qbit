@@ -21,14 +21,35 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdint>
+#include <cstring>
 #include <numeric>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include <boost/test/unit_test.hpp>
+
+// The stack-residue test inspects a thread stack the test allocates itself.
+// ASan, HWASan and SafeStack move locals off that stack and MSan tracks the
+// initialization of every byte, so the inspection only runs without them.
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(hwaddress_sanitizer) || __has_feature(memory_sanitizer) || \
+    __has_feature(safe_stack)
+#define PQC_STACK_RESIDUE_SANITIZED
+#endif
+#endif
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_HWADDRESS__)
+#define PQC_STACK_RESIDUE_SANITIZED
+#endif
+#if !defined(WIN32) && !defined(PQC_STACK_RESIDUE_SANITIZED)
+#define PQC_STACK_RESIDUE_TEST
+#include <pthread.h>
+#include <sys/mman.h>
+#endif
 
 BOOST_FIXTURE_TEST_SUITE(pqc_tests, BasicTestingSetup)
 
@@ -93,6 +114,101 @@ void CheckInvalidPQCKey(const CPQCKey& key, const char* tag)
     BOOST_REQUIRE_EQUAL(sig.size(), 1U);
     BOOST_CHECK_EQUAL(sig.front(), 0x42);
 }
+
+#ifdef PQC_STACK_RESIDUE_TEST
+constexpr size_t PAINTED_STACK_SIZE{1U << 20};
+constexpr unsigned char STACK_PAINT{0xa5};
+
+struct PaintedStack {
+    //! Every byte of the thread's stack mapping after the thread exited.
+    std::vector<unsigned char> bytes;
+    //! Offset of a local in the thread's outermost test frame. Frames the
+    //! calls under test used lie below it; TLS and thread bookkeeping above.
+    size_t frame_offset{0};
+};
+
+/**
+ * Run fn on a thread whose stack is a painted mapping owned by the test and
+ * return that stack once the thread has exited, so the stack a call released
+ * can be inspected without reading outside a live object. fn must not throw.
+ */
+template <typename Fn>
+[[nodiscard]] PaintedStack RunOnPaintedStack(Fn fn)
+{
+    int flags{MAP_PRIVATE | MAP_ANONYMOUS};
+#ifdef MAP_STACK
+    flags |= MAP_STACK;
+#endif
+    void* const stack{mmap(nullptr, PAINTED_STACK_SIZE, PROT_READ | PROT_WRITE, flags, -1, 0)};
+    BOOST_REQUIRE(stack != MAP_FAILED);
+    std::memset(stack, STACK_PAINT, PAINTED_STACK_SIZE);
+
+    struct Context {
+        Fn* fn;
+        uintptr_t frame;
+    } context{&fn, 0};
+    const auto trampoline{[](void* arg) -> void* {
+        auto& ctx{*static_cast<Context*>(arg)};
+        volatile unsigned char frame_marker{0};
+        ctx.frame = reinterpret_cast<uintptr_t>(&frame_marker);
+        (*ctx.fn)();
+        return nullptr;
+    }};
+
+    pthread_attr_t attr;
+    BOOST_REQUIRE_EQUAL(pthread_attr_init(&attr), 0);
+    BOOST_REQUIRE_EQUAL(pthread_attr_setstack(&attr, stack, PAINTED_STACK_SIZE), 0);
+    pthread_t thread;
+    BOOST_REQUIRE_EQUAL(pthread_create(&thread, &attr, trampoline, &context), 0);
+    BOOST_REQUIRE_EQUAL(pthread_join(thread, nullptr), 0);
+    BOOST_REQUIRE_EQUAL(pthread_attr_destroy(&attr), 0);
+
+    const auto* const begin{static_cast<const unsigned char*>(stack)};
+    PaintedStack out{{begin, begin + PAINTED_STACK_SIZE}, 0};
+    BOOST_REQUIRE_EQUAL(munmap(stack, PAINTED_STACK_SIZE), 0);
+    const uintptr_t base{reinterpret_cast<uintptr_t>(begin)};
+    BOOST_REQUIRE(context.frame > base && context.frame < base + PAINTED_STACK_SIZE);
+    out.frame_offset = context.frame - base;
+    return out;
+}
+
+[[nodiscard]] bool ContainsBytes(std::span<const unsigned char> haystack, std::span<const unsigned char> needle)
+{
+    return std::search(haystack.begin(), haystack.end(), needle.begin(), needle.end()) != haystack.end();
+}
+
+//! Count the zero bytes upwards from the deepest byte written below a frame.
+//! The stack grows down, so that is the lowest byte no longer painted.
+[[nodiscard]] size_t ZeroRunFromDeepestWrite(std::span<const unsigned char> below_frame)
+{
+    const auto deepest{std::find_if(below_frame.begin(), below_frame.end(), [](unsigned char byte) { return byte != STACK_PAINT; })};
+    return static_cast<size_t>(std::find_if(deepest, below_frame.end(), [](unsigned char byte) { return byte != 0; }) - deepest);
+}
+
+/**
+ * Check the stack a secret-key call released: no exact SK_SEED or SK_PRF copy
+ * may remain anywhere on it, and the deepest stack written below the caller
+ * must start the zeroed window libbitcoinpqc burns when keygen, sign or
+ * secret-key validation returns, so no frame of the call ran below the burn.
+ * The burn also covers SHA-2 message-schedule spills, which hold the secret
+ * only in transformed form.
+ */
+void CheckScrubbedStack(const PaintedStack& stack, const CPQCKey& key)
+{
+    // Secret key layout: [SK_SEED || SK_PRF || PUB_SEED || root], n bytes each.
+    constexpr size_t n{PQC_SECKEY_SIZE / 4};
+    // slh_dsa.h documents a 16 KiB burn in optimized builds (more unoptimized).
+    // Requiring 12 KiB leaves room for the frames that ran after the burn.
+    constexpr size_t MIN_BURNED_BYTES{12 * 1024};
+
+    BOOST_REQUIRE(key.IsValid());
+    const std::span<const unsigned char> secret{key.data(), key.size()};
+    BOOST_CHECK_MESSAGE(!ContainsBytes(stack.bytes, secret.first(n)), "SK_SEED copy left on the released stack");
+    BOOST_CHECK_MESSAGE(!ContainsBytes(stack.bytes, secret.subspan(n, n)), "SK_PRF copy left on the released stack");
+    const size_t burned{ZeroRunFromDeepestWrite(std::span<const unsigned char>{stack.bytes}.first(stack.frame_offset))};
+    BOOST_CHECK_MESSAGE(burned >= MIN_BURNED_BYTES, "zeroed run from the deepest write below the caller is " << burned << " bytes");
+}
+#endif
 
 #ifdef ENABLE_WALLET
 [[nodiscard]] bool ContainsWarningSubstring(const std::vector<bilingual_str>& warnings, const std::string& needle)
@@ -460,6 +576,43 @@ BOOST_AUTO_TEST_CASE(pqc_low_wots_cap_sign_failure_cleans_output)
     BOOST_CHECK_EQUAL(siglen, 0U);
     BOOST_CHECK_EQUAL(stats.cap_exceeded & BITCOIN_PQC_SIGN_LIMIT_WOTSC, BITCOIN_PQC_SIGN_LIMIT_WOTSC);
     BOOST_CHECK(std::all_of(sig.begin(), sig.end(), [](unsigned char byte) { return byte == 0; }));
+}
+
+BOOST_AUTO_TEST_CASE(pqc_secret_key_calls_scrub_released_stack)
+{
+#ifndef PQC_STACK_RESIDUE_TEST
+    BOOST_TEST_MESSAGE("skipping: needs POSIX threads and a build without ASan, HWASan or MSan");
+#else
+    CPQCKey generated;
+    const PaintedStack keygen_stack{RunOnPaintedStack([&] { generated.MakeNewKey(); })};
+    BOOST_TEST_CONTEXT("CPQCKey::MakeNewKey") CheckScrubbedStack(keygen_stack, generated);
+
+    const std::vector<unsigned char> secret{generated.data(), generated.data() + generated.size()};
+    CPQCKey imported;
+    const PaintedStack validate_stack{RunOnPaintedStack([&] { imported.Set(secret.data(), secret.data() + secret.size()); })};
+    BOOST_REQUIRE(imported == generated);
+    BOOST_TEST_CONTEXT("CPQCKey::Set") CheckScrubbedStack(validate_stack, imported);
+
+    const uint256 hash{TestHash("pqc_secret_key_calls_scrub_released_stack")};
+    std::vector<unsigned char> sig;
+    uint32_t counter{0};
+    bool signed_ok{false};
+    const PaintedStack sign_stack{RunOnPaintedStack([&] { signed_ok = generated.Sign(hash, sig, counter); })};
+    BOOST_REQUIRE(signed_ok);
+    BOOST_CHECK(generated.GetPubKey().Verify(hash, sig));
+    BOOST_TEST_CONTEXT("CPQCKey::Sign") CheckScrubbedStack(sign_stack, generated);
+
+    std::array<unsigned char, 64> master_seed{};
+    std::iota(master_seed.begin(), master_seed.end(), 0x42);
+    CPQCKey derived;
+    bool derived_ok{false};
+    const PaintedStack derive_stack{RunOnPaintedStack([&] {
+        derived_ok = DerivePQCKey(std::span<const unsigned char>{master_seed.data(), master_seed.size()},
+                                  /*account=*/0, /*change=*/0, /*index=*/0, derived);
+    })};
+    BOOST_REQUIRE(derived_ok);
+    BOOST_TEST_CONTEXT("DerivePQCKey") CheckScrubbedStack(derive_stack, derived);
+#endif
 }
 
 BOOST_AUTO_TEST_CASE(pqc_wrong_message_rejected)

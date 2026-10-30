@@ -9,9 +9,7 @@ set -euo pipefail
 
 PREFIX="${LIBBITCOINPQC_PATH:-src/libbitcoinpqc}"
 REMOTE_URL="${LIBBITCOINPQC_REMOTE_URL:-https://github.com/Qbit-Org/qbit-libbitcoinpqc.git}"
-REMOTE_REF="${LIBBITCOINPQC_REMOTE_REF:-v0.3.0}"
-APPROVED_RUSTSEC_CROSSBEAM_PATCH="RUSTSEC-2026-0204-crossbeam-epoch-0.9.20"
-APPROVED_RUSTSEC_CROSSBEAM_DIFF_LINES=$'-version = "0.9.18"\n+version = "0.9.20"\n-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"\n+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"'
+REMOTE_REF="${LIBBITCOINPQC_REMOTE_REF:-v0.3.1}"
 
 usage() {
   cat <<EOF
@@ -22,7 +20,7 @@ Verify that $PREFIX matches the tagged upstream libbitcoinpqc tree.
 Environment overrides:
   LIBBITCOINPQC_PATH        default: src/libbitcoinpqc
   LIBBITCOINPQC_REMOTE_URL  default: https://github.com/Qbit-Org/qbit-libbitcoinpqc.git
-  LIBBITCOINPQC_REMOTE_REF  default: v0.3.0
+  LIBBITCOINPQC_REMOTE_REF  default: v0.3.1
 EOF
 }
 
@@ -41,35 +39,12 @@ resolve_remote_commit() {
   fi
 }
 
-approved_downstream_patch() {
-  local base_tree="$1"
-  local current_tree="$2"
-  local changed_paths
-  local changed_lines
-
-  changed_paths="$(git diff --name-only "${base_tree}" "${current_tree}")"
-  if [[ "${changed_paths}" != "Cargo.lock" ]]; then
-    return 1
-  fi
-
-  changed_lines="$(
-    git diff --unified=0 --no-ext-diff "${base_tree}" "${current_tree}" -- Cargo.lock |
-    awk '/^[-+]/ && $0 !~ /^(---|\+\+\+)/ {print}'
-  )"
-  [[ "${changed_lines}" == "${APPROVED_RUSTSEC_CROSSBEAM_DIFF_LINES}" ]]
-}
-
-verify_tree_match_or_approved_patch() {
+verify_tree_match() {
   local base_tree="$1"
   local current_tree="$2"
   local failure_message="$3"
 
   if [[ "${current_tree}" == "${base_tree}" ]]; then
-    return 0
-  fi
-
-  if approved_downstream_patch "${base_tree}" "${current_tree}"; then
-    echo "GOOD: approved downstream libbitcoinpqc patch ${APPROVED_RUSTSEC_CROSSBEAM_PATCH}"
     return 0
   fi
 
@@ -158,12 +133,12 @@ if [[ "${metadata_split}" != "${upstream_commit}" ]]; then
   exit 1
 fi
 
-verify_tree_match_or_approved_patch \
+verify_tree_match \
   "${metadata_tree}" \
   "${current_tree}" \
   "${PREFIX} tree differs from latest subtree import commit ${metadata_commit}"
 
-verify_tree_match_or_approved_patch \
+verify_tree_match \
   "${upstream_tree}" \
   "${current_tree}" \
   "${PREFIX} tree differs from upstream tag ${REMOTE_REF}"
