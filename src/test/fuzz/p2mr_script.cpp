@@ -715,6 +715,7 @@ void FixtureP2MRScriptInput(FuzzedDataProvider& fuzzed_data_provider)
                     SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE,
                     SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION,
                     SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS,
+                    SCRIPT_VERIFY_P2MR_STACK_BYTES,
                 });
             });
     }
@@ -754,6 +755,7 @@ void LegacyP2MRScriptInput(FuzzedDataProvider& fuzzed_data_provider)
     if (fuzzed_data_provider.ConsumeBool()) flags |= SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE;
     if (fuzzed_data_provider.ConsumeBool()) flags |= SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION;
     if (fuzzed_data_provider.ConsumeBool()) flags |= SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS;
+    if (fuzzed_data_provider.ConsumeBool()) flags |= SCRIPT_VERIFY_P2MR_STACK_BYTES;
 
     (void)VerifySpend(spend_value, flags);
 }
