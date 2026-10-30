@@ -459,6 +459,13 @@ Compared with legacy script limits:
   conditional correctness, numeric encoding rules, validation weight, and
   transaction/block limits.
 
+The 1 MiB stack-byte limit is policy only. Standard policy enforces it through
+`SCRIPT_VERIFY_P2MR_STACK_BYTES`: a script whose main stack plus alt-stack holds
+more than 1 MiB after any opcode fails `P2MR_STACK_BYTES`. Consensus bounds the
+runtime stack only by its 1,000-item count, so a block may still contain such a
+spend. The limit exceeds 128 KiB of initial items plus 1,000 maximum-size
+pushed literals, so only scripts that copy stack elements can reach it.
+
 OP_SUCCESS has only the exceptions in section 8 and cannot bypass the
 initial-stack limits, which are checked before pre-scan.
 
@@ -486,7 +493,8 @@ consensus. Wallet support is narrower still.
 | P2SH-wrapped v2/32 witness program | Never qbit P2MR v1. Unrestricted chain: inherited unknown-witness behavior. Restricted-output mode: the outer P2SH output cannot be funded | Nonstandard | — |
 | Native unknown witness version other than the assigned v2/32 | Outside this profile; forward-compatible success. Restricted-output mode permits funding reserved v3..v16 only after its separate outer-witness activation | Normally nonstandard | — |
 | Empty/insufficient witness, malformed control, marker bit clear, or commitment mismatch | Invalid | — | — |
-| Known `0xc0` leaf over an initial-stack or runtime resource limit | Invalid | Same initial-stack bounds | — |
+| Known `0xc0` leaf over an initial-stack or consensus runtime resource limit | Invalid | Same initial-stack bounds | — |
+| Otherwise valid known `0xc0` leaf whose main stack plus alt-stack exceeds 1 MiB after an opcode | Valid | Nonstandard: P2MR stack-byte policy | Signing/finalization reports it incomplete |
 | Known `0xc0` leaf with script error, extra final items, or false result | Invalid | — | — |
 | Restricted-output native v2/32 funding output with arbitrary 32 bytes | Accepted by restricted-output shape rules; spendability not proven | — | `rawmr()` and unknown roots are expert-only and generally unsupported |
 | Restricted-output `OP_RETURN`, PayToAnchor, or activated reserved outer witness output | May be an allowed funding exemption; not qbit P2MR v1 | Own treatment | Own treatment |
