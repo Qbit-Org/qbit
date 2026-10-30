@@ -4,6 +4,7 @@
 
 #include <consensus/validation.h>
 #include <crypto/pqc.h>
+#include <hash.h>
 #include <key.h>
 #include <random.h>
 #include <script/interpreter.h>
@@ -21,6 +22,7 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -635,6 +637,109 @@ BOOST_FIXTURE_TEST_CASE(pqc_policy_consensus_reuse, P2MRPQCAdmissionSetup)
         BOOST_CHECK_MESSAGE(!in_mempool(invalid.tx), label);
         BOOST_CHECK_MESSAGE(!signature_cache.Get(invalid_entry, /*erase=*/false), label);
         require_cold(invalid);
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(pqc_data_signature_reuse_across_mutated_spends, P2MRPQCAdmissionSetup)
+{
+    // A data-signature digest does not commit to the spending transaction,
+    // and each mutated spend has a new txid and wtxid, so neither the
+    // full-script cache nor a reject filter stops a replay. Spend one coin
+    // whose leaf verifies a valid data signature and then fails on OP_NOT:
+    // only the first submission verifies the signature, and every mutated
+    // resubmission hits the cache and is rejected identically.
+    using valtype = std::vector<unsigned char>;
+    SignatureCache& signature_cache{m_node.chainman->m_validation_cache.m_signature_cache};
+
+    CPQCKey key;
+    key.MakeNewKey();
+    BOOST_REQUIRE(key.IsValid());
+    const CPQCPubKey pubkey{key.GetPubKey()};
+    const uint256 msg_hash{(HashWriter{} << std::string{"txvalidationcache data signature"}).GetSHA256()};
+    const uint256 datasig_hash{ComputeQbitDataSigPQCHash(msg_hash)};
+    valtype data_sig;
+    uint32_t signature_counter{0};
+    BOOST_REQUIRE(key.Sign(datasig_hash, data_sig, signature_counter));
+
+    const CScript leaf_script{CScript{} << valtype(msg_hash.begin(), msg_hash.end()) << valtype(pubkey.begin(), pubkey.end()) << OP_CHECKDATASIGPQC << OP_NOT};
+    const valtype leaf_bytes(leaf_script.begin(), leaf_script.end());
+    const valtype control_block{static_cast<unsigned char>(P2MR_LEAF_VERSION_V1 | 1)};
+    const uint256 merkle_root{ComputeP2MRMerkleRoot(control_block, ComputeP2MRLeafHash(P2MR_LEAF_VERSION_V1, leaf_bytes))};
+    const CScript leaf_script_pubkey{CScript{} << OP_2 << valtype(merkle_root.begin(), merkle_root.end())};
+
+    // Confirm the coin before any observer is attached.
+    const CAmount coin_value{m_coinbase_txns[0]->vout[0].nValue / 2};
+    const CMutableTransaction funding{CreateValidMempoolTransaction(
+        /*input_transactions=*/{m_coinbase_txns[0]},
+        /*inputs=*/{COutPoint{m_coinbase_txns[0]->GetHash(), 0}},
+        /*input_height=*/COINBASE_MATURITY,
+        /*input_signing_keys=*/{coinbaseKey},
+        /*outputs=*/{CTxOut{coin_value, leaf_script_pubkey}},
+        /*submit=*/false)};
+    CreateAndProcessBlock({funding}, P2MROpTrueScript());
+    BOOST_REQUIRE(WITH_LOCK(cs_main, return m_node.chainman->ActiveChainstate().CoinsTip().HaveCoin(COutPoint{funding.GetHash(), 0})));
+
+    // Spends differ only in their fee, so each has a new txid and wtxid.
+    const auto build_spend = [&](uint32_t n, const valtype& sig) {
+        CMutableTransaction tx;
+        tx.version = 2;
+        tx.vin.emplace_back(COutPoint{funding.GetHash(), 0});
+        tx.vin[0].scriptWitness.stack = {sig, leaf_bytes, control_block};
+        tx.vout.emplace_back(coin_value - 100'000 - static_cast<CAmount>(n), P2MROpTrueScript());
+        return tx;
+    };
+    const auto admit = [&](const CMutableTransaction& tx, std::vector<PQCCacheEvent>& events, uint64_t expected_verifications) {
+        RecordingPQCObserver observer;
+        MempoolAcceptResult result{[&] {
+            ScopedPQCObserver scoped{signature_cache, observer};
+            ScopedPQCVerificationCounter verifications;
+            MempoolAcceptResult inner{WITH_LOCK(cs_main, return m_node.chainman->ProcessTransaction(MakeTransactionRef(tx)))};
+            BOOST_REQUIRE(signature_cache.GetPQCObserver() == &observer);
+            BOOST_CHECK_EQUAL(verifications.GetCount(), expected_verifications);
+            return inner;
+        }()};
+        events = observer.Take();
+        return result;
+    };
+    const auto in_mempool = [&](const CMutableTransaction& tx) {
+        return WITH_LOCK(m_node.mempool->cs, return m_node.mempool->exists(tx.GetHash()));
+    };
+    std::vector<PQCCacheEvent> events;
+    std::set<Wtxid> wtxids;
+
+    uint256 data_entry;
+    signature_cache.ComputeEntryPQCData(data_entry, datasig_hash, data_sig, pubkey);
+    BOOST_REQUIRE(!signature_cache.Get(data_entry, /*erase=*/false));
+    constexpr uint32_t SUBMISSIONS{4};
+    for (uint32_t n{0}; n < SUBMISSIONS; ++n) {
+        const CMutableTransaction tx{build_spend(n, data_sig)};
+        BOOST_REQUIRE(wtxids.insert(CTransaction{tx}.GetWitnessHash()).second);
+        const MempoolAcceptResult result{admit(tx, events, /*expected_verifications=*/n == 0 ? 1 : 0)};
+        BOOST_TEST_MESSAGE("valid data signature, submission " << n << ": " << PQCEventsToString(events, 1) << " reject=" << result.m_state.GetRejectReason());
+        BOOST_CHECK(result.m_result_type == MempoolAcceptResult::ResultType::INVALID);
+        BOOST_CHECK_EQUAL(result.m_state.GetRejectReason(), "mempool-script-verify-flag-failed (Script evaluated without error but finished with a false/empty top stack element)");
+        BOOST_CHECK(events == (n == 0 ? std::vector{PQCMiss(false), PQCVerifiedOk(true)} : std::vector{PQCHit(false)}));
+        BOOST_CHECK(!in_mempool(tx));
+        BOOST_CHECK(signature_cache.Get(data_entry, /*erase=*/false));
+    }
+
+    // A failed verification is still never cached: a data signature with one
+    // flipped bit costs one primitive verification on every mutated
+    // submission and never gains an entry.
+    valtype invalid_sig{data_sig};
+    invalid_sig[0] ^= 1;
+    uint256 invalid_entry;
+    signature_cache.ComputeEntryPQCData(invalid_entry, datasig_hash, invalid_sig, pubkey);
+    for (uint32_t n{SUBMISSIONS}; n < SUBMISSIONS + 2; ++n) {
+        const CMutableTransaction tx{build_spend(n, invalid_sig)};
+        BOOST_REQUIRE(wtxids.insert(CTransaction{tx}.GetWitnessHash()).second);
+        const MempoolAcceptResult result{admit(tx, events, /*expected_verifications=*/1)};
+        BOOST_TEST_MESSAGE("invalid data signature, submission " << n << ": " << PQCEventsToString(events, 1) << " reject=" << result.m_state.GetRejectReason());
+        BOOST_CHECK(result.m_result_type == MempoolAcceptResult::ResultType::INVALID);
+        BOOST_CHECK_EQUAL(result.m_state.GetRejectReason(), "mempool-script-verify-flag-failed (PQC signature verification failed)");
+        BOOST_CHECK(events == (std::vector{PQCMiss(false), PQCVerifiedFail()}));
+        BOOST_CHECK(!in_mempool(tx));
+        BOOST_CHECK(!signature_cache.Get(invalid_entry, /*erase=*/false));
     }
 }
 
