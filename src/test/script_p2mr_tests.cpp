@@ -1228,6 +1228,7 @@ ScriptError BoundaryScriptError(std::string_view name)
     if (name == "SCRIPT_ERR_P2MR_SIG_SIZE") return SCRIPT_ERR_P2MR_SIG_SIZE;
     if (name == "SCRIPT_ERR_P2MR_SIG") return SCRIPT_ERR_P2MR_SIG;
     if (name == "SCRIPT_ERR_P2MR_CHECKSIG") return SCRIPT_ERR_P2MR_CHECKSIG;
+    if (name == "SCRIPT_ERR_P2MR_STACK_BYTES") return SCRIPT_ERR_P2MR_STACK_BYTES;
     if (name == "SCRIPT_ERR_TEMPLATE_MISMATCH") return SCRIPT_ERR_TEMPLATE_MISMATCH;
     BOOST_FAIL("unknown P2MR boundary error: " + std::string{name});
     return SCRIPT_ERR_UNKNOWN_ERROR;
@@ -1519,6 +1520,30 @@ BoundaryExecution ExecuteP2MRBoundaryCase(const UniValue& test, unsigned int fla
                                             ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script)),
                                         flags);
         }
+        if (kind == "runtime-stack-bytes") {
+            // The witness holds the remainder of `value` modulo the item size,
+            // if any, below one maximum-size item. The leaf duplicates that item
+            // until the stack holds `value` bytes, then drops the copies and
+            // the remainder.
+            CheckExactObjectKeys(parameters, {"kind", "value"}, "boundary runtime stack resource parameters");
+            const int value{parameters["value"].getInt<int>()};
+            const int item_size{static_cast<int>(MAX_P2MR_V1_STACK_ITEM_SIZE)};
+            const int copies{value / item_size};
+            const int remainder{value % item_size};
+            BOOST_REQUIRE_GE(copies, 1);
+            BOOST_REQUIRE_LE(copies + (remainder > 0), MAX_STACK_SIZE);
+            std::vector<valtype> stack_items;
+            if (remainder > 0) stack_items.emplace_back(remainder, 0x01);
+            stack_items.emplace_back(item_size, 0x01);
+            CScript leaf_script;
+            for (int i = 1; i < copies; ++i) leaf_script << OP_DUP;
+            for (int i = 1; i < copies; ++i) leaf_script << OP_DROP;
+            if (remainder > 0) leaf_script << OP_SWAP << OP_DROP;
+            return ExecuteBoundarySpend(BuildP2MRSpend(
+                                            leaf_script, stack_items, {P2MR_LEAF_VERSION_V1_CONTROL},
+                                            ComputeMerkleRootSingleLeaf(P2MR_LEAF_VERSION_V1, leaf_script)),
+                                        flags);
+        }
         if (kind == "validation-weight") {
             CheckExactObjectKeys(parameters, {"kind", "nonempty_checks", "fixture_file", "fixture_id", "artifact"}, "boundary validation resource parameters");
             const int checks{parameters["nonempty_checks"].getInt<int>()};
@@ -1772,8 +1797,8 @@ BOOST_AUTO_TEST_CASE(p2mr_v1_manifest_matches_embedded_corpus)
     BOOST_CHECK_EQUAL(counts["commitment_invalid"].getInt<int>(), 7);
     BOOST_CHECK_EQUAL(counts["witness"].getInt<int>(), 14);
     BOOST_CHECK_EQUAL(counts["cross_profile"].getInt<int>(), 2);
-    BOOST_CHECK_EQUAL(counts["script_boundary"].getInt<int>(), 51);
-    BOOST_CHECK_EQUAL(manifest["case_count"].getInt<int>(), 78);
+    BOOST_CHECK_EQUAL(counts["script_boundary"].getInt<int>(), 53);
+    BOOST_CHECK_EQUAL(manifest["case_count"].getInt<int>(), 80);
 
     struct ManifestFile {
         std::string_view bytes;
@@ -1786,7 +1811,7 @@ BOOST_AUTO_TEST_CASE(p2mr_v1_manifest_matches_embedded_corpus)
         {"src/test/data/p2mr_pqc_witness_vectors.json",
          {json_tests::p2mr_pqc_witness_vectors, 14, "PQC sighash and witness vectors"}},
         {"src/test/data/p2mr_script_boundary_vectors.json",
-         {json_tests::p2mr_script_boundary_vectors, 51, "script, control, leaf, opcode, and resource boundary vectors"}},
+         {json_tests::p2mr_script_boundary_vectors, 53, "script, control, leaf, opcode, and resource boundary vectors"}},
         {"src/test/data/p2mr_vectors.json",
          {json_tests::p2mr_vectors, 11, "commitment, control block, root, and address vectors"}},
     };
@@ -5101,7 +5126,7 @@ BOOST_AUTO_TEST_CASE(p2mr_v1_script_boundary_vectors)
 
     const UniValue& cases{corpus["cases"]};
     BOOST_REQUIRE(cases.isArray());
-    BOOST_REQUIRE_EQUAL(cases.size(), 51U);
+    BOOST_REQUIRE_EQUAL(cases.size(), 53U);
     std::set<std::string> ids;
     std::map<std::string, size_t> category_counts;
     const std::map<std::string, std::string> category_scenarios{
@@ -5153,7 +5178,7 @@ BOOST_AUTO_TEST_CASE(p2mr_v1_script_boundary_vectors)
     BOOST_CHECK_EQUAL(category_counts["witness-control"], 10U);
     BOOST_CHECK_EQUAL(category_counts["leaf-version"], 7U);
     BOOST_CHECK_EQUAL(category_counts["opcode"], 22U);
-    BOOST_CHECK_EQUAL(category_counts["resource"], 12U);
+    BOOST_CHECK_EQUAL(category_counts["resource"], 14U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

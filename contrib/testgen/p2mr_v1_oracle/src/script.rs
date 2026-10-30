@@ -1,6 +1,7 @@
-const MAX_STACK_ITEMS: usize = 1000;
-const MAX_STACK_ITEM_BYTES: usize = 16 * 1024;
+pub const MAX_STACK_ITEMS: usize = 1000;
+pub const MAX_STACK_ITEM_BYTES: usize = 16 * 1024;
 const MAX_TOTAL_STACK_BYTES: usize = 128 * 1024;
+const MAX_POLICY_STACK_BYTES: usize = 1024 * 1024;
 
 fn truthy(value: &[u8]) -> bool {
     value
@@ -64,6 +65,48 @@ fn serialize_script_num(value: i64) -> Vec<u8> {
 pub fn evaluate<T, D>(
     script: &[u8],
     initial_stack: &[Vec<u8>],
+    check_signature: T,
+    check_data_signature: D,
+) -> Result<(), String>
+where
+    T: FnMut(&[u8], &[u8], u32) -> Result<bool, String>,
+    D: FnMut(&[u8], &[u8], &[u8]) -> Result<bool, String>,
+{
+    execute(
+        script,
+        initial_stack,
+        None,
+        check_signature,
+        check_data_signature,
+    )
+}
+
+/// Like `evaluate`, plus standard policy's limit on the bytes held on the
+/// stack after each opcode. This evaluator has no alt-stack, so the main stack
+/// is the whole total.
+pub fn evaluate_policy<T, D>(
+    script: &[u8],
+    initial_stack: &[Vec<u8>],
+    check_signature: T,
+    check_data_signature: D,
+) -> Result<(), String>
+where
+    T: FnMut(&[u8], &[u8], u32) -> Result<bool, String>,
+    D: FnMut(&[u8], &[u8], &[u8]) -> Result<bool, String>,
+{
+    execute(
+        script,
+        initial_stack,
+        Some(MAX_POLICY_STACK_BYTES),
+        check_signature,
+        check_data_signature,
+    )
+}
+
+fn execute<T, D>(
+    script: &[u8],
+    initial_stack: &[Vec<u8>],
+    max_stack_bytes: Option<usize>,
     mut check_signature: T,
     mut check_data_signature: D,
 ) -> Result<(), String>
@@ -135,6 +178,20 @@ where
             0x68 => {
                 if conditionals.pop().is_none() {
                     return Err("SCRIPT_ERR_UNBALANCED_CONDITIONAL".to_string());
+                }
+            }
+            0x75 => {
+                if executing {
+                    stack.pop().ok_or("SCRIPT_ERR_INVALID_STACK_OPERATION")?;
+                }
+            }
+            0x76 => {
+                if executing {
+                    let top = stack
+                        .last()
+                        .ok_or("SCRIPT_ERR_INVALID_STACK_OPERATION")?
+                        .clone();
+                    stack.push(top);
                 }
             }
             0x7c => {
@@ -223,6 +280,9 @@ where
             .ok_or("script opcode position overflow")?;
         if stack.len() > MAX_STACK_ITEMS {
             return Err("SCRIPT_ERR_STACK_SIZE".to_string());
+        }
+        if max_stack_bytes.is_some_and(|max| stack.iter().map(Vec::len).sum::<usize>() > max) {
+            return Err("SCRIPT_ERR_P2MR_STACK_BYTES".to_string());
         }
     }
     if !conditionals.is_empty() {
@@ -396,6 +456,75 @@ mod tests {
             )
             .unwrap_err(),
             "SCRIPT_ERR_PUSH_SIZE"
+        );
+    }
+
+    #[test]
+    fn duplicates_and_drops_the_top_item() {
+        assert!(evaluate(
+            &[0x76, 0x87],
+            &[vec![2]],
+            |_, _, _| unreachable!(),
+            |_, _, _| unreachable!()
+        )
+        .is_ok());
+        assert!(evaluate(
+            &[0x75],
+            &[vec![1], Vec::new()],
+            |_, _, _| unreachable!(),
+            |_, _, _| unreachable!()
+        )
+        .is_ok());
+        for opcode in [0x75, 0x76] {
+            assert_eq!(
+                evaluate(
+                    &[opcode],
+                    &[],
+                    |_, _, _| unreachable!(),
+                    |_, _, _| unreachable!()
+                )
+                .unwrap_err(),
+                "SCRIPT_ERR_INVALID_STACK_OPERATION"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_limits_stack_bytes_after_each_opcode() {
+        let copies = MAX_POLICY_STACK_BYTES / MAX_STACK_ITEM_BYTES;
+        let initial_stack = [vec![1; MAX_STACK_ITEM_BYTES]];
+        let mut at_limit = vec![0x76; copies - 1];
+        at_limit.extend(vec![0x75; copies - 1]);
+        // Push and drop one more byte while the stack is at the limit.
+        let mut over_limit = vec![0x76; copies - 1];
+        over_limit.extend([0x51, 0x75]);
+        over_limit.extend(vec![0x75; copies - 1]);
+
+        for script in [&at_limit, &over_limit] {
+            assert!(evaluate(
+                script,
+                &initial_stack,
+                |_, _, _| unreachable!(),
+                |_, _, _| unreachable!()
+            )
+            .is_ok());
+        }
+        assert!(evaluate_policy(
+            &at_limit,
+            &initial_stack,
+            |_, _, _| unreachable!(),
+            |_, _, _| unreachable!()
+        )
+        .is_ok());
+        assert_eq!(
+            evaluate_policy(
+                &over_limit,
+                &initial_stack,
+                |_, _, _| unreachable!(),
+                |_, _, _| unreachable!()
+            )
+            .unwrap_err(),
+            "SCRIPT_ERR_P2MR_STACK_BYTES"
         );
     }
 
