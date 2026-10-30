@@ -49,6 +49,10 @@ static constexpr unsigned int MAX_P2MR_V1_STACK_ITEM_SIZE{16 * 1024};
 static constexpr unsigned int MAX_P2MR_V1_TOTAL_INITIAL_STACK_BYTES{128 * 1024};
 // Reserved cap for future P2MR v1 data-manipulation opcodes such as OP_CAT.
 static constexpr unsigned int MAX_P2MR_V1_CAT_RESULT_SIZE{16 * 1024};
+// Standard-policy cap for the main stack plus altstack bytes at every opcode
+// boundary of P2MR script execution. Enforced only with
+// SCRIPT_VERIFY_P2MR_RUNTIME_STACK_BYTES; block validation does not apply it.
+static constexpr unsigned int MAX_STANDARD_P2MR_RUNTIME_STACK_BYTES{1024 * 1024};
 
 // Threshold for nLockTime: below this value it is interpreted as block number,
 // otherwise as UNIX timestamp.

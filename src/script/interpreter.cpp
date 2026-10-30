@@ -12,9 +12,11 @@
 #include <pubkey.h>
 #include <script/script.h>
 #include <uint256.h>
+#include <util/check.h>
 
 #include <algorithm>
 #include <limits>
+#include <optional>
 
 typedef std::vector<unsigned char> valtype;
 
@@ -45,6 +47,65 @@ bool CheckP2MRV1InitialStackResourceLimits(const std::span<const valtype>& stack
     }
     return true;
 }
+
+size_t StackBytesFrom(const std::vector<valtype>& stack, size_t begin)
+{
+    size_t bytes{0};
+    for (size_t i{begin}; i < stack.size(); ++i) bytes += stack[i].size();
+    return bytes;
+}
+
+/**
+ * Running byte total of the main stack plus altstack during P2MR execution,
+ * for SCRIPT_VERIFY_P2MR_RUNTIME_STACK_BYTES.
+ *
+ * Every opcode that P2MR executes, except OP_ROLL, changes at most the top
+ * STACK_WINDOW main-stack items (OP_2ROT reaches deepest; OP_CHECKMULTISIG
+ * fails in P2MR before touching the stack) and the top altstack item. Each
+ * opcode is therefore accounted by re-summing only those windows, which keeps
+ * the cost constant per opcode. OP_ROLL only moves an item, so its net effect
+ * is popping its numeric argument. Debug and fuzz builds check the total
+ * against a full rescan after every opcode.
+ */
+class P2MRStackBytes
+{
+    static constexpr size_t STACK_WINDOW{6};
+    static constexpr size_t ALTSTACK_WINDOW{1};
+
+    size_t m_total;
+    size_t m_stack_begin{0};
+    size_t m_stack_window_bytes{0};
+    size_t m_altstack_begin{0};
+    size_t m_altstack_window_bytes{0};
+    size_t m_top_bytes{0};
+
+public:
+    explicit P2MRStackBytes(const std::vector<valtype>& stack) : m_total{StackBytesFrom(stack, 0)} {}
+
+    size_t Total() const { return m_total; }
+
+    void BeforeOpcode(const std::vector<valtype>& stack, const std::vector<valtype>& altstack)
+    {
+        m_stack_begin = stack.size() - std::min(stack.size(), STACK_WINDOW);
+        m_stack_window_bytes = StackBytesFrom(stack, m_stack_begin);
+        m_altstack_begin = altstack.size() - std::min(altstack.size(), ALTSTACK_WINDOW);
+        m_altstack_window_bytes = StackBytesFrom(altstack, m_altstack_begin);
+        m_top_bytes = stack.empty() ? 0 : stack.back().size();
+    }
+
+    void AfterOpcode(const std::vector<valtype>& stack, const std::vector<valtype>& altstack, bool executed_roll)
+    {
+        if (executed_roll) {
+            m_total -= m_top_bytes;
+        } else {
+            m_total = m_total - m_stack_window_bytes - m_altstack_window_bytes +
+                      StackBytesFrom(stack, m_stack_begin) + StackBytesFrom(altstack, m_altstack_begin);
+        }
+        if constexpr (G_FUZZING_BUILD || G_ABORT_ON_FAILED_ASSUME) {
+            Assume(m_total == StackBytesFrom(stack, 0) + StackBytesFrom(altstack, 0));
+        }
+    }
+};
 
 } // namespace
 
@@ -516,6 +577,13 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
     if ((sigversion == SigVersion::BASE || sigversion == SigVersion::WITNESS_V0) && script.size() > MAX_SCRIPT_SIZE) {
         return set_error(serror, SCRIPT_ERR_SCRIPT_SIZE);
     }
+    std::optional<P2MRStackBytes> p2mr_stack_bytes;
+    if (sigversion == SigVersion::P2MR && (flags & SCRIPT_VERIFY_P2MR_RUNTIME_STACK_BYTES)) {
+        p2mr_stack_bytes.emplace(stack);
+        if (p2mr_stack_bytes->Total() > MAX_STANDARD_P2MR_RUNTIME_STACK_BYTES) {
+            return set_error(serror, SCRIPT_ERR_P2MR_RUNTIME_STACK_BYTES);
+        }
+    }
     int nOpCount = 0;
     bool fRequireMinimal = (flags & SCRIPT_VERIFY_MINIMALDATA) != 0;
     uint32_t opcode_pos = 0;
@@ -562,6 +630,8 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
             // With SCRIPT_VERIFY_CONST_SCRIPTCODE, OP_CODESEPARATOR in non-segwit script is rejected even in an unexecuted branch
             if (opcode == OP_CODESEPARATOR && sigversion == SigVersion::BASE && (flags & SCRIPT_VERIFY_CONST_SCRIPTCODE))
                 return set_error(serror, SCRIPT_ERR_OP_CODESEPARATOR);
+
+            if (p2mr_stack_bytes) p2mr_stack_bytes->BeforeOpcode(stack, altstack);
 
             if (fExec && 0 <= opcode && opcode <= OP_PUSHDATA4) {
                 if (fRequireMinimal && !CheckMinimalPush(vchPushValue, opcode)) {
@@ -1387,6 +1457,12 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
             // Size limits
             if (stack.size() + altstack.size() > MAX_STACK_SIZE)
                 return set_error(serror, SCRIPT_ERR_STACK_SIZE);
+            if (p2mr_stack_bytes) {
+                p2mr_stack_bytes->AfterOpcode(stack, altstack, /*executed_roll=*/fExec && opcode == OP_ROLL);
+                if (p2mr_stack_bytes->Total() > MAX_STANDARD_P2MR_RUNTIME_STACK_BYTES) {
+                    return set_error(serror, SCRIPT_ERR_P2MR_RUNTIME_STACK_BYTES);
+                }
+            }
         }
     }
     catch (...)

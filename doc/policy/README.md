@@ -16,3 +16,4 @@ not be read as a substitute for qbit launch-chain wallet or address guidance.
 - [Mempool Limits](mempool-limits.md)
 - [Mempool Replacements](mempool-replacements.md)
 - [Packages](packages.md)
+- [P2MR Script Policy Limits](p2mr-script-limits.md)

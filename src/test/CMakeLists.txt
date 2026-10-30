@@ -100,6 +100,7 @@ add_executable(test_bitcoin
   sanity_tests.cpp
   scheduler_tests.cpp
   script_assets_tests.cpp
+  script_p2mr_runtime_stack_tests.cpp
   script_p2mr_tests.cpp
   script_p2sh_tests.cpp
   script_parse_tests.cpp

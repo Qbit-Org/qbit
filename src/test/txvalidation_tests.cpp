@@ -13,6 +13,7 @@
 #include <primitives/transaction.h>
 #include <random.h>
 #include <script/script.h>
+#include <script/script_error.h>
 #include <test/util/setup_common.h>
 #include <test/util/script.h>
 #include <test/util/txmempool.h>
@@ -336,6 +337,74 @@ BOOST_FIXTURE_TEST_CASE(tx_mempool_reject_reserved_witness_namespace_spends, Res
     BOOST_CHECK(result.m_state.IsInvalid());
     BOOST_CHECK_EQUAL(result.m_state.GetRejectReason(), "bad-txns-nonstandard-inputs");
     BOOST_CHECK(result.m_state.GetResult() == TxValidationResult::TX_INPUTS_NOT_STANDARD);
+}
+
+BOOST_FIXTURE_TEST_CASE(p2mr_runtime_stack_bytes_is_policy_only, RestrictedOutputModeSetup)
+{
+    // One 16 KiB witness item duplicated `copies` times and dropped again.
+    const auto dup_drop_leaf{[](int copies) {
+        CScript leaf;
+        for (int i{0}; i < copies; ++i) leaf << OP_DUP;
+        for (int i{0}; i < copies; ++i) leaf << OP_DROP;
+        return leaf;
+    }};
+    const auto leaf_output{[](const CScript& leaf) {
+        const std::vector<unsigned char> leaf_bytes{leaf.begin(), leaf.end()};
+        const uint256 root{ComputeP2MRMerkleRoot(P2MROpTrueControl(), ComputeP2MRLeafHash(P2MR_LEAF_VERSION_V1, leaf_bytes))};
+        return WitnessProgramScript(/*witness_version=*/2, ToByteVector(root));
+    }};
+    // 999 copies hold about 16 MiB; 63 copies reach exactly the 1 MiB cap.
+    const CScript over_cap_leaf{dup_drop_leaf(999)};
+    const CScript at_cap_leaf{dup_drop_leaf(63)};
+    static_assert(64 * MAX_P2MR_V1_STACK_ITEM_SIZE == MAX_STANDARD_P2MR_RUNTIME_STACK_BYTES);
+
+    // Only the first coinbase is mature, so one funding transaction pays both leaves.
+    const CAmount output_amount{(m_coinbase_txns[0]->vout[0].nValue - 1000) / 2};
+    const CMutableTransaction funding{CreateValidMempoolTransaction(
+        /*input_transactions=*/{m_coinbase_txns[0]},
+        /*inputs=*/{COutPoint{m_coinbase_txns[0]->GetHash(), 0}},
+        /*input_height=*/COINBASE_MATURITY,
+        /*input_signing_keys=*/{coinbaseKey},
+        /*outputs=*/{CTxOut{output_amount, leaf_output(over_cap_leaf)}, CTxOut{output_amount, leaf_output(at_cap_leaf)}},
+        /*submit=*/false)};
+
+    std::vector<CMutableTransaction> spends;
+    for (const CScript& leaf : {over_cap_leaf, at_cap_leaf}) {
+        CMutableTransaction spend;
+        spend.version = 2;
+        spend.vin.emplace_back(COutPoint{funding.GetHash(), static_cast<uint32_t>(spends.size())});
+        spend.vin[0].scriptWitness.stack = {
+            std::vector<unsigned char>(MAX_P2MR_V1_STACK_ITEM_SIZE, 0x01),
+            std::vector<unsigned char>(leaf.begin(), leaf.end()),
+            P2MROpTrueControl(),
+        };
+        spend.vout.emplace_back(output_amount - 100'000, P2MROutputScript(/*fill=*/0x24));
+        spends.push_back(spend);
+    }
+    CreateAndProcessBlock({funding}, CoinbaseScriptPubKey());
+    SetMockTime(GetTime() + 1);
+    BOOST_REQUIRE(WITH_LOCK(cs_main, return m_node.chainman->ActiveChainstate().CoinsTip().HaveCoin(spends[1].vin[0].prevout)));
+
+    {
+        LOCK(cs_main);
+        const MempoolAcceptResult over_cap{m_node.chainman->ProcessTransaction(MakeTransactionRef(spends[0]))};
+        BOOST_CHECK(over_cap.m_result_type == MempoolAcceptResult::ResultType::INVALID);
+        BOOST_CHECK(over_cap.m_state.GetResult() == TxValidationResult::TX_NOT_STANDARD);
+        BOOST_CHECK_EQUAL(over_cap.m_state.GetRejectReason(),
+                          "mempool-script-verify-flag-failed (" + ScriptErrorString(SCRIPT_ERR_P2MR_RUNTIME_STACK_BYTES) + ")");
+
+        const MempoolAcceptResult at_cap{m_node.chainman->ProcessTransaction(MakeTransactionRef(spends[1]), /*test_accept=*/true)};
+        BOOST_CHECK_MESSAGE(at_cap.m_result_type == MempoolAcceptResult::ResultType::VALID, at_cap.m_state.ToString());
+    }
+    BOOST_CHECK_EQUAL(m_node.mempool->size(), 0U);
+
+    // Block validation does not apply the policy limit.
+    const int height{WITH_LOCK(cs_main, return m_node.chainman->ActiveChain().Height())};
+    const CBlock block{CreateAndProcessBlock({spends[0]}, CoinbaseScriptPubKey())};
+    LOCK(cs_main);
+    BOOST_CHECK_EQUAL(m_node.chainman->ActiveChain().Height(), height + 1);
+    BOOST_CHECK_EQUAL(m_node.chainman->ActiveChain().Tip()->GetBlockHash(), block.GetHash());
+    BOOST_CHECK(m_node.chainman->ActiveChainstate().CoinsTip().HaveCoin(COutPoint{spends[0].GetHash(), 0}));
 }
 
 // Generate a number of random, nonexistent outpoints.

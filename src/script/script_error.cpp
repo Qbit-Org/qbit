@@ -127,6 +127,8 @@ std::string ScriptErrorString(const ScriptError serror)
             return "OP_CHECKSIG(VERIFY) is not available in P2MR";
         case SCRIPT_ERR_TEMPLATE_MISMATCH:
             return "Transaction template hash does not match";
+        case SCRIPT_ERR_P2MR_RUNTIME_STACK_BYTES:
+            return "P2MR stack and altstack bytes exceed the standard runtime limit";
         case SCRIPT_ERR_OP_CODESEPARATOR:
             return "Using OP_CODESEPARATOR in non-witness script";
         case SCRIPT_ERR_SIG_FINDANDDELETE:
