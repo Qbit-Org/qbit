@@ -523,7 +523,7 @@ class FeatureP2MRTest(BitcoinTestFramework):
         assert tx.get_weight() <= MAX_STANDARD_TX_WEIGHT
         policy_result = self.nodes[0].testmempoolaccept([tx.serialize().hex()])[0]
         assert_equal(policy_result["allowed"], False)
-        assert_equal(policy_result["reject-reason"], "mempool-script-verify-flag-failed (Stack size limit exceeded)")
+        assert_equal(policy_result["reject-reason"], "mempool-script-verify-flag-failed (Standard P2MR stack byte limit exceeded)")
 
         block = self.make_witness_block(tx)
         assert_equal(None, self.nodes[0].submitblock(block.serialize().hex()))
