@@ -307,6 +307,12 @@ public:
         return false;
     }
 
+    /** Verify an OP_CHECKDATASIGPQC/OP_CHECKDATASIGADDPQC signature over its
+     *  QbitDataSigPQC digest. The interpreter performs every weight, size and
+     *  digest step first; this only decides whether the signature is valid.
+     *  The default runs the primitive verification. */
+    virtual bool VerifyPQCDataSignature(std::span<const unsigned char> sig, const CPQCPubKey& pubkey, const uint256& datasig_hash) const;
+
     virtual bool CheckTemplateVerifyHash(std::span<const unsigned char> expected, ScriptError* serror = nullptr) const
     {
         return false;
@@ -390,6 +396,11 @@ public:
     bool CheckPQCSignature(std::span<const unsigned char> sig, std::span<const unsigned char> pubkey, SigVersion sigversion, ScriptExecutionData& execdata, ScriptError* serror = nullptr) const override
     {
         return m_checker.CheckPQCSignature(sig, pubkey, sigversion, execdata, serror);
+    }
+
+    bool VerifyPQCDataSignature(std::span<const unsigned char> sig, const CPQCPubKey& pubkey, const uint256& datasig_hash) const override
+    {
+        return m_checker.VerifyPQCDataSignature(sig, pubkey, datasig_hash);
     }
 
     bool CheckTemplateVerifyHash(std::span<const unsigned char> expected, ScriptError* serror = nullptr) const override

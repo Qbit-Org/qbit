@@ -434,7 +434,7 @@ static bool EvalChecksigP2MR(const valtype& sig, const valtype& pubkey, ScriptEx
     return true;
 }
 
-static bool EvalCheckDataSigPQC(const valtype& sig, const valtype& msg_hash, const valtype& pubkey, ScriptExecutionData& execdata, unsigned int flags, ScriptError* serror, bool& success)
+static bool EvalCheckDataSigPQC(const valtype& sig, const valtype& msg_hash, const valtype& pubkey, ScriptExecutionData& execdata, unsigned int flags, const BaseSignatureChecker& checker, ScriptError* serror, bool& success)
 {
     success = !sig.empty();
     if (success) {
@@ -464,7 +464,7 @@ static bool EvalCheckDataSigPQC(const valtype& sig, const valtype& msg_hash, con
 
     const CPQCPubKey pqc_pubkey{pubkey};
     const uint256 datasig_hash = ComputeQbitDataSigPQCHash(msg_hash);
-    if (!pqc_pubkey.Verify(datasig_hash, sig)) {
+    if (!checker.VerifyPQCDataSignature(sig, pqc_pubkey, datasig_hash)) {
         return set_error(serror, SCRIPT_ERR_P2MR_SIG);
     }
     return true;
@@ -1238,7 +1238,7 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                     const valtype& pubkey = stacktop(-1);
 
                     bool success{false};
-                    if (!EvalCheckDataSigPQC(sig, msg_hash, pubkey, execdata, flags, serror, success)) return false;
+                    if (!EvalCheckDataSigPQC(sig, msg_hash, pubkey, execdata, flags, checker, serror, success)) return false;
                     popstack(stack);
                     popstack(stack);
                     popstack(stack);
@@ -1259,7 +1259,7 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                     const valtype& pubkey = stacktop(-1);
 
                     bool success{false};
-                    if (!EvalCheckDataSigPQC(sig, msg_hash, pubkey, execdata, flags, serror, success)) return false;
+                    if (!EvalCheckDataSigPQC(sig, msg_hash, pubkey, execdata, flags, checker, serror, success)) return false;
                     popstack(stack);
                     popstack(stack);
                     popstack(stack);
@@ -1995,6 +1995,11 @@ bool GenericTransactionSignatureChecker<T>::CheckSchnorrSignature(std::span<cons
     }
     if (!VerifySchnorrSignature(sig, pubkey, sighash)) return set_error(serror, SCRIPT_ERR_SCHNORR_SIG);
     return true;
+}
+
+bool BaseSignatureChecker::VerifyPQCDataSignature(std::span<const unsigned char> sig, const CPQCPubKey& pubkey, const uint256& datasig_hash) const
+{
+    return pubkey.Verify(datasig_hash, sig);
 }
 
 template <class T>
