@@ -409,6 +409,8 @@ def build_boundary_corpus() -> dict[str, Any]:
         boundary_case("resource-item-bytes-16385", "resource", "resource", {"kind": "item-bytes", "value": 16385}, expected(False, "initial-stack", "SCRIPT_ERR_PUSH_SIZE")),
         boundary_case("resource-total-bytes-131072", "resource", "resource", {"kind": "total-bytes", "value": 131072}, ok),
         boundary_case("resource-total-bytes-131073", "resource", "resource", {"kind": "total-bytes", "value": 131073}, expected(False, "initial-stack", "SCRIPT_ERR_PUSH_SIZE")),
+        boundary_case("resource-runtime-stack-bytes-1048576", "resource", "resource", {"kind": "runtime-stack-bytes", "value": 1048576}, ok),
+        boundary_case("resource-runtime-stack-bytes-1048577", "resource", "resource", {"kind": "runtime-stack-bytes", "value": 1048577}, ok, expected(False, "policy", "SCRIPT_ERR_P2MR_STACK_BYTES")),
         boundary_case("resource-validation-weight-one", "resource", "resource", {"kind": "validation-weight", "nonempty_checks": 1, **fixture, "artifact": "transaction-checksigpqc"}, ok),
         boundary_case("resource-validation-weight-multiple", "resource", "resource", {"kind": "validation-weight", "nonempty_checks": 2, **fixture, "artifact": "dataSigAdd"}, ok),
         boundary_case("resource-validation-weight-exceeded", "resource", "resource", {"kind": "validation-weight-exceeded", "nonempty_checks": 2}, expected(False, "validation-weight", "SCRIPT_ERR_P2MR_VALIDATION_WEIGHT")),
