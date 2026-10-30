@@ -9,6 +9,7 @@
 #include <consensus/amount.h>
 #include <consensus/validation.h>
 #include <core_io.h>
+#include <crypto/pqc.h>
 #include <index/txindex.h>
 #include <key_io.h>
 #include <node/blockstorage.h>
@@ -805,7 +806,8 @@ static RPCHelpMan signrawtransactionwithkey()
         "Sign inputs for raw transaction (serialized, hex-encoded).\n"
                 "The second argument is an array of private keys that will be the only keys used to sign the transaction.\n"
                 "Accepted formats are legacy base58 WIF keys and explicit pqc(KEY) expressions.\n"
-                + strprintf("For pqc(KEY), KEY must be either a hex-encoded raw PQC secret key (%u bytes) or a concrete non-ranged extended private key expression accepted by mr(pk(...)) descriptors.\n", CPQCKey::SIZE) +
+                + strprintf("For pqc(KEY), KEY must be either a hex-encoded raw PQC secret key (%u bytes) or a concrete non-ranged extended private key expression accepted by mr(pk(...)) descriptors.\n", CPQCKey::SIZE)
+                + strprintf("PQC signature counts for keys passed here are not tracked across calls; each call treats every key as unused. The caller is responsible for keeping each PQC key within its limit of %u signatures, including signatures made elsewhere.\n", PQC_MAX_SIGNATURES) +
                 "The third optional argument (may be null) is an array of previous transaction outputs that\n"
                 "this transaction depends on but may not yet be in the block chain.\n",
                 {
@@ -2192,7 +2194,8 @@ RPCHelpMan descriptorprocesspsbt()
     return RPCHelpMan{
         "descriptorprocesspsbt",
         "Update all segwit inputs in a PSBT with information from output descriptors, the UTXO set or the mempool. \n"
-                "Then, sign the inputs we are able to with information from the output descriptors. ",
+                "Then, sign the inputs we are able to with information from the output descriptors.\n"
+                + strprintf("PQC signature counts for keys in private descriptors are not tracked across calls; each call treats every key as unused. The caller is responsible for keeping each PQC key within its limit of %u signatures, including signatures made elsewhere.\n", PQC_MAX_SIGNATURES),
                 {
                     {"psbt", RPCArg::Type::STR, RPCArg::Optional::NO, "The transaction base64 string"},
                     {"descriptors", RPCArg::Type::ARR, RPCArg::Optional::NO, "An array of either strings or objects", {

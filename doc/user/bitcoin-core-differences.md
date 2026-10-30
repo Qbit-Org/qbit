@@ -103,6 +103,13 @@ The active signature profile is bounded `SLH-DSA-SHA2-128s`:
 | Optional transaction-signature suffix | A nonzero sighash byte; `0x01` means `SIGHASH_ALL` |
 | P2MR leaf version | `0xc0` |
 
+Signers must keep each PQC key to at most `2^30` signatures. This is a
+signer-side usage contract: consensus does not count signatures, and a
+signature made past the limit still verifies. The security margin depends on
+how many signatures a key produces: the full 128-bit classical level up to
+about `2^26` signatures, and about 118 bits at the `2^30` limit. See
+[P2MR Signature Security Margin](../reference/p2mr-signature-security.md).
+
 ### P2MR Data-Signature Opcodes
 
 `OP_CHECKDATASIGPQC` and `OP_CHECKDATASIGADDPQC` verify PQC attestations over caller-supplied 32-byte message hashes, rather than over the qbit transaction sighash. They are intended for protocols where offchain attestors sign a structured message, such as a bridge message that also commits to a transaction template. qbit verifies the signature threshold and any separate script covenant/template checks; it does not independently prove external-chain finality, burn validity, or nullifier uniqueness.

@@ -4,4 +4,5 @@ These documents contain public qbit reference material.
 
 - [Assets Attribution](assets-attribution.md)
 - [P2MR OP_CHECKTEMPLATEVERIFY](ctv.md)
+- [P2MR Signature Security Margin](p2mr-signature-security.md)
 - [P2P Bad Ports](p2p-bad-ports.md)

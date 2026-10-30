@@ -417,12 +417,19 @@ any size other than 32 bytes fails. Section 7 defines the transaction-signature
 digest and optional sighash suffix; section 8 defines the separate
 data-signature digest and forbids a sighash suffix.
 
-qbit wallet signing counters enforce the `2^30` contract operationally.
+The `2^30` contract binds signers. qbit wallet signing counters enforce it
+operationally for wallet-held keys. Signing with caller-supplied keys outside
+a wallet does not track usage across calls, so the caller is responsible for
+it.
 Secret-key serialization, seed derivation, counter persistence, reservation,
 backup, and wallet refusal are wallet-safety rules, not script-verification
 inputs.
 Consensus verifiers receive only the public key, digest, and signature, and
 consult no usage counter.
+
+The non-normative
+[P2MR signature security margin](../reference/p2mr-signature-security.md) note
+explains how the profile's security margin depends on signatures per key.
 
 ## 10. Resource limits and final result
 
