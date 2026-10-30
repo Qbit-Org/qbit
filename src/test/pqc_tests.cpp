@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <numeric>
 #include <optional>
 #include <span>
@@ -582,23 +583,29 @@ PQC_TESTS_NOINLINE void PaintReleasedStack()
 }
 
 //! Copy the stack region a call made from the caller's frame has just
-//! released, deepest byte first. Must not be inlined, so the probe buffer
-//! occupies that region.
-PQC_TESTS_NOINLINE std::vector<unsigned char> SnapshotReleasedStack()
+//! released into `snapshot`, deepest byte first. The copy reads below this
+//! function's own small frame and calls nothing. A frame large enough to hold
+//! the region would be probed by -fstack-clash-protection when allocated, and
+//! on most targets the probes store to it (Clang on x86 and GCC on AArch64
+//! store zeros), which the checks would read as stack the operation wrote.
+//! Must not be inlined.
+PQC_TESTS_NOINLINE void SnapshotReleasedStack(unsigned char* snapshot, size_t size)
 {
-    volatile unsigned char probe[RELEASED_STACK_PROBE_BYTES];
-    std::vector<unsigned char> snapshot(RELEASED_STACK_PROBE_BYTES);
-    for (size_t i{0}; i < snapshot.size(); ++i) snapshot[i] = probe[i];
-    return snapshot;
+    volatile unsigned char top{0};
+    const auto* released{reinterpret_cast<const volatile unsigned char*>(reinterpret_cast<uintptr_t>(&top) - size)};
+    for (size_t i{0}; i < size; ++i) snapshot[i] = released[i];
 }
 
-//! Paint the stack, run `op`, and copy the stack region it released.
+//! Paint the stack, run `op`, and copy the stack region it released. The
+//! snapshot is allocated first, so no allocation runs between `op` and the copy.
 template <typename Op>
 std::vector<unsigned char> ProbeReleasedStack(Op op)
 {
+    std::vector<unsigned char> snapshot(RELEASED_STACK_PROBE_BYTES);
     PaintReleasedStack();
     op();
-    return SnapshotReleasedStack();
+    SnapshotReleasedStack(snapshot.data(), snapshot.size());
+    return snapshot;
 }
 
 //! Check that the stack burn covered every byte the operation wrote: below
