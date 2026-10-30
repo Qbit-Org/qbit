@@ -541,6 +541,16 @@ BOOST_AUTO_TEST_CASE(pqc_deterministic_signing)
 #if !defined(WIN32) && !defined(PQC_TESTS_SANITIZER)
 #define PQC_TESTS_SMALL_THREAD_STACK
 #endif
+// Valgrind's Memcheck treats the released stack as unaddressable and the
+// copying function's own frame as undefined. When its client requests are
+// available, the probes exempt the copied range from address errors and mark
+// the copy defined, so they also run cleanly under Valgrind.
+#if !defined(PQC_TESTS_NO_STACK_PROBES) && defined(__has_include)
+#if __has_include(<valgrind/memcheck.h>)
+#include <valgrind/memcheck.h>
+#define PQC_TESTS_MEMCHECK
+#endif
+#endif
 
 #if !defined(PQC_TESTS_NO_STACK_PROBES) || defined(PQC_TESTS_SMALL_THREAD_STACK)
 namespace {
@@ -593,7 +603,14 @@ PQC_TESTS_NOINLINE void SnapshotReleasedStack(unsigned char* snapshot, size_t si
 {
     volatile unsigned char top{0};
     const auto* released{reinterpret_cast<const volatile unsigned char*>(reinterpret_cast<uintptr_t>(&top) - size)};
+#ifdef PQC_TESTS_MEMCHECK
+    (void)VALGRIND_DISABLE_ADDR_ERROR_REPORTING_IN_RANGE(released, size);
+#endif
     for (size_t i{0}; i < size; ++i) snapshot[i] = released[i];
+#ifdef PQC_TESTS_MEMCHECK
+    (void)VALGRIND_ENABLE_ADDR_ERROR_REPORTING_IN_RANGE(released, size);
+    (void)VALGRIND_MAKE_MEM_DEFINED(snapshot, size);
+#endif
 }
 
 //! Paint the stack, run `op`, and copy the stack region it released. The
