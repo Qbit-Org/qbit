@@ -9,9 +9,15 @@ This is a mainnet maintenance release built from the reviewed `1.x.x` branch
 changes since the signed `v1.0.0` tag. It focuses on wallet and qbit-qt
 reliability, the wallet fallback-fee default, visibility of consumed PQC
 signing capacity, validation and fuzz tooling, and release and CI hardening.
-It contains no consensus rule change, no scheduled network activation, no
-change to the mainnet or testnet4 network identity, and no wallet database
-format change.
+It also carries fixes from the v1.0.1 release review: a standard-policy limit
+on P2MR stack memory, signature caching for P2MR data signatures, `headers`
+messages that stay within the message size limit, and a vendored PQC library
+update that clears secret-key material from the stack it releases. The
+updated library also performs consensus signature verification; keys,
+signatures, and verification results are unchanged.
+It adds one standardness rule for P2MR spends, but contains no consensus rule
+change, no scheduled network activation, no change to the mainnet or testnet4
+network identity, and no wallet database format change.
 
 Please report bugs using the Qbit issue tracker.
 
@@ -48,7 +54,16 @@ Behavior changes to review before upgrading
   now fails deterministically with error code `-15`
   (`RPC_WALLET_WRONG_ENC_STATE`), the code a call on an already encrypted
   wallet already returned. Previously it could fail with `-16` "Failed to
-  encrypt". Other `encryptwallet` failures still return `-16` (#183).
+  encrypt". Other `encryptwallet` failures keep their previous error codes
+  (#183).
+- Standard policy now rejects a P2MR v1 spend whose main stack plus alt-stack
+  holds more than 1 MiB after any opcode, with the reject reason
+  `mempool-script-verify-flag-failed (Standard P2MR stack byte limit
+  exceeded)` and no peer penalty. Only scripts that copy stack elements can
+  reach the limit. Such a spend is still consensus-valid, so a block that
+  contains it is still accepted, and nodes running v1.0.0 still relay it.
+  Wallet signing and PSBT finalization check the same standard rules and
+  report such a spend as incomplete (#263, refs #257).
 
 Compatibility
 =============
@@ -207,12 +222,14 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   domain of the shared signature cache, following the Schnorr pattern. Only a
   verified success is inserted, so a fresh mempool admission verifies each PQC
   signature once in the policy pass and reuses the result in the consensus
-  pass. Interpreter checks, validation-weight charges, script flags, the
-  full-script cache, and data signatures are unchanged, and a benchmark for
-  the two-pass admission pattern was added (#162).
-- No throughput, initial block download, or signing-latency measurement
-  accompanies this release. The signature cache and descriptor batching above
-  are described by their behavior only; this release does not claim a speedup.
+  pass. Interpreter checks, validation-weight charges, script flags, and the
+  full-script cache are unchanged, data signatures were left uncached, and a
+  benchmark for the two-pass admission pattern was added (#162). #265 below
+  caches data signatures in a separate domain.
+- No throughput or initial block download measurement accompanies this
+  release. The signature caches and descriptor batching are described by their
+  behavior only; this release does not claim a speedup. The #268 entry below
+  gives the measured signing and verification cost of the PQC library update.
 - Header synchronization clamps a negative commitment window, which can occur
   when a chain start is ahead of the local clock, instead of converting it to
   an oversized unsigned bound (#137).
@@ -227,6 +244,63 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   is re-anchored to the current refusal line, and anchor resolution gained
   its own tests. This restores the `--anchors-only` check; it does not by
   itself produce instrumented coverage evidence (#176, refs #173).
+
+### Mempool, P2P, and PQC library hardening
+
+- Standard policy limits the bytes a P2MR v1 script holds on its main stack
+  plus alt-stack to 1 MiB after each opcode, through the new
+  `SCRIPT_VERIFY_P2MR_STACK_BYTES` flag and its own script error. Consensus
+  bounds the runtime stack only by its 1,000-item count, and each initial
+  witness item may be up to 16 KiB, so element-copying opcodes could grow one
+  input's stack to about 16 MiB without any validation-weight cost. The limit
+  is above 128 KiB of initial items plus 1,000 maximum-size pushes, so only
+  scripts that copy stack elements reach it. The P2MR v1 profile, the
+  conformance corpus, and the independent oracle cover the new limit. Block
+  validity is unchanged (#263, refs #257).
+- `OP_CHECKDATASIGPQC` and `OP_CHECKDATASIGADDPQC` checks now use the
+  signature cache, like P2MR transaction signatures since #162. A data
+  signature does not commit to the spending transaction, so a peer could
+  resubmit one valid signature in an unlimited number of mutated transactions,
+  each costing a full SLH-DSA verification during mempool admission. Such
+  replays now cost one verification. Only verified successes are cached, in a
+  separately salted domain, so an entry for a transaction signature can never
+  satisfy a data-signature check or the reverse. Validity, validation weight,
+  script errors, and script flags are unchanged. Failed checks are still not
+  cached (see Known limitations) (#265, refs #259).
+- A block header carries its whole AuxPoW proof, including the parent chain's
+  coinbase transaction, so a reply to `getheaders` covering blocks with large
+  AuxPoW payloads could exceed the 4,000,000 bytes a peer accepts in one
+  message. The receiving peer dropped the connection, so new or catching-up
+  nodes could not sync headers past those blocks. Nodes now end a `headers`
+  message before it would exceed that limit, always sending at least one
+  header, and announce a new block with `inv` when its headers do not fit in
+  one message. A node keeps requesting headers after a `headers` message with
+  2,000 headers, as before, or of at least 2,000,000 bytes, since such a
+  message may have been cut short. This applies to normal headers sync and to
+  low-work headers sync (presync and redownload). Replies made of ordinary
+  headers are unchanged: 2,000 headers per message, byte for byte as before.
+  The serving node must run v1.0.1 for its replies to fit, and a receiving
+  node still in low-work headers sync also needs v1.0.1 to continue past a
+  message cut short for size. Some cases can still stall headers sync between
+  v1.0.1 nodes (see Known limitations). Consensus rules and the protocol
+  version are unchanged (#266, refs #258).
+- The vendored libbitcoinpqc library is updated from v0.3.0 to v0.3.2.
+  Generating, importing, or signing with a PQC key previously left copies of
+  the secret SLH-DSA seeds, and hashing scratch derived from them, in stack
+  memory the library had released. The library's key generation, secret-key
+  validation, and signing now wipe those copies and overwrite the stack they
+  used before returning. The library also reports a failed memory allocation
+  during key generation or signing as a distinct out-of-memory error, and
+  signing with a secret key that fails validation as a key error rather than a
+  signature error. qbit treats every library error as a failed operation, as
+  before, so wallet and RPC behavior does not change. Keys and signatures are
+  byte-identical to those produced by v1.0.0, and verification accepts and
+  rejects the same signatures. #268 reports that key generation, secret-key
+  validation, and signing take about 10 to 12% longer and verification about
+  1% longer. Those figures were measured on v0.3.1, whose production code
+  differs from v0.3.2 only in error mapping and in the stack-wipe size of
+  unoptimized builds. Each key generation, validation, or signing call now
+  needs about 17 KiB of free stack (#268, refs #260).
 
 ### Release engineering, CI, and documentation
 
@@ -258,7 +332,25 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
 - Reorganized the P2MR v1 consensus profile (`doc/consensus/p2mr-v1.md`) for
   readability and fixed its hash-type table, whose combined `SIGHASH_*` rows
   were cut off when rendered. Every requirement, value, and error name is
-  unchanged (#252).
+  unchanged (#252). Later edits reword its signature-counter sentence to
+  separate wallet-held keys from caller-supplied keys (#264) and add the 1 MiB
+  stack-byte policy limit (#263); neither changes a consensus requirement.
+- Added a non-normative note, `doc/reference/p2mr-signature-security.md`, on
+  how the security margin of the `SLH-DSA-SHA2-128s-bounded30` signature
+  profile depends on how many signatures a key produces. A key keeps the full
+  128-bit classical level up to about `2^26` signatures, and about 118 bits at
+  the `2^30` per-key limit; rotate high-volume keys well before the limit. The
+  note includes a script that reproduces these figures. The help for
+  `signrawtransactionwithkey` and `descriptorprocesspsbt` now states that PQC
+  signature counts for keys passed to these RPCs are not tracked across calls.
+  Each call treats every key as unused, so the caller must keep each key
+  within its limit of 1,073,741,824 signatures. The `importdescriptors` help
+  now states that an imported key's counter does not include signatures made
+  outside this wallet. Signing behavior is unchanged (#264, refs #261).
+- The vendored libbitcoinpqc tree now equals its upstream release tag. The
+  `RUSTSEC-2026-0204` `crossbeam-epoch` lockfile update that qbit carried on
+  top of v0.3.0 is upstream since v0.3.1, so the subtree check no longer
+  accepts any downstream change (#268).
 - Stabilized the REST chain-info comparison and Qt shutdown tests (#137,
   #149).
 
@@ -291,10 +383,26 @@ Known limitations
   apply to every artifact; verify downloads as described in "Release
   verification". This waiver remains until macOS and Windows signing accounts
   are available (#70).
-- Fuzz evidence for this release is limited in depth. It was produced with
-  LLVM 20.1.8 on the #176 source, and later `1.x.x` changes touch only wallet,
-  qbit-qt, and functional-test code, none of which the qbit fuzz targets
-  build. The llvm-cov coverage checker met every expectation, including the
+- Fresh fuzz evidence on the release source is required before the release
+  is tagged. It is tracked in #173 and #174 and is not recorded in this file.
+  The earlier evidence summarized below was produced before #263, #265, #266,
+  and #268 merged, and does not cover their changes:
+  - #263 and #265 change the script interpreter that the `p2mr_script` target
+    runs, and #263 adds its new flag to that target's fuzzed flag sets.
+  - #268 replaces the vendored library whose key generation, secret-key
+    validation, signing, and verification the `pqc` and `p2mr_script` targets
+    call.
+  - #266 changes `headers` handling in `net_processing`, which none of the
+    six qbit-specific targets reaches. The inherited `process_message` and
+    `p2p_headers_presync` targets reach it but were not part of that
+    evidence. No fuzz target reaches the PQC domains of the signature cache
+    that #162 and #265 use.
+  - The other changes merged after the #176 source (#177, #178, #182, #183,
+    #252, and #264) touch only wallet, qbit-qt, RPC help, test, and
+    documentation code, which none of the six qbit-specific targets reaches.
+
+  The earlier evidence was produced with LLVM 20.1.8 on the #176 source. The
+  llvm-cov coverage checker met every expectation, including the
   `pqc_sign_refused` refusal path. libFuzzer with ASan and UBSan replayed all
   53 seed inputs for the six qbit-specific targets and ran a mutation phase of
   at least 120 seconds per target, with no crashes or sanitizer reports.
@@ -302,6 +410,40 @@ Known limitations
   only a few hundred mutated executions under ASan. No multi-hour campaign,
   sanitizer-free libFuzzer run, macOS run, or other LLVM version was used
   (#173).
+- Consensus still bounds a P2MR runtime stack only by its 1,000-item count,
+  so a block may contain a spend above the 1 MiB standard-policy limit. A
+  consensus limit, or a validation-weight charge for copied bytes, needs an
+  activated soft fork and is left for a later release (#263, refs #257).
+- Failed PQC signature checks are not cached. Anyone holding one valid
+  signature can derive unlimited distinct invalid PQC signatures that each
+  still cost a full verification, on both the data-signature and
+  transaction-signature paths. Because this release does not penalize peers
+  that relay consensus-invalid transactions, a peer can cost a node about
+  0.5 µs of message-handling and `cs_main` time per witness byte. Discouraging
+  peers whose P2MR PQC signatures fail, or budgeting script-validation cost
+  per peer, are possible follow-ups (#265, refs #259).
+- Large AuxPoW payloads still have these limits, deferred to later releases
+  (#266, refs #258):
+  - No consensus rule limits the size of an AuxPoW payload yet. Adding one
+    needs an activated soft fork.
+  - The block index still keeps every AuxPoW payload in memory.
+  - Nodes running v1.0.0 still stall or abort headers sync through ranges with
+    large AuxPoW headers. They take a message cut short for size as the end of
+    the peer's headers, and when they serve headers they still send the
+    oversized message, which upgraded nodes also reject.
+  - Low-work headers sync still gives up on a peer if the AuxPoW payloads it
+    holds while redownloading exceed its existing 36 MB per-peer bound. That
+    bound was derived for 2,000-header messages and has not been re-derived
+    for messages cut short by size.
+  - The block index keeps the first copy of a header it receives, with that
+    copy's AuxPoW. Producing a stored copy whose AuxPoW is larger than its
+    block's takes a second valid parent-chain proof of work. If a reply is cut
+    short just before such a header, the reply can be smaller than 2,000,000
+    bytes, and the receiver then treats it as the end of the peer's headers.
+    Review of #266 found that, below the minimum chain work, this can
+    disconnect an outbound peer during initial block download and stop
+    low-work presync at the same height on every retry, even when both nodes
+    run v1.0.1.
 - The scheduled-validation source selection (#165) and IBD timeout forwarding
   (#159) are present on `1.x.x`, but GitHub schedules run the default branch.
   Their deployment is complete only after the same workflow revisions reach
