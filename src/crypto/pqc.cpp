@@ -40,21 +40,24 @@ using SecretKeyBytes = std::array<unsigned char, PQC_SECKEY_SIZE>;
 using PubKeyBytes = std::array<unsigned char, PQC_PUBKEY_SIZE>;
 
 /**
- * libbitcoinpqc returns from SLH-DSA key generation, secret-key validation and
- * signing without clearing its stack frames, which hold secret-key material
- * (SK_SEED, SK_PRF and values derived from them). Key derivation also holds
- * the HD master seed and HMAC state in its own frame. Each of these operations
- * therefore runs in one of the non-inlined *Impl() functions below, and the
- * public function overwrites the stack it released with BurnReleasedStack()
- * once the Impl() function returns, on success and failure paths.
+ * The vendored libbitcoinpqc (v0.3.2) zeroes its secret-key scratch and burns
+ * the 16 KiB of stack it released before SLH-DSA key generation, secret-key
+ * validation and signing return. It cannot reach qbit's own frames: key
+ * derivation passes the HD master seed through HKDF, whose HMAC-SHA256 state
+ * is never wiped, in its own frame above the library's. Each of these
+ * operations therefore runs in one of the non-inlined *Impl() functions below,
+ * and the public function overwrites the stack it released with
+ * BurnReleasedStack() once the Impl() function returns, on success and failure
+ * paths. For DerivePQCKey() this burn is what clears the master-seed material;
+ * for the other operations it adds margin below the library's own burn.
  *
  * The integrated build always compiles the library with optimization. Measured
- * by painting the stack (x86-64 GCC -O2), the library calls use at most
- * 12,232 bytes and the Impl() frames add less than 1 KiB, so
- * PQC_STACK_BURN_BYTES (32 KiB) is about 2.5 times the deepest use;
- * pqc_tests checks that the burn covers every byte the operations write. It is
- * kept small because the burn adds its frame to the deepest signing call
- * chain, and musl gives threads only 128 KiB of stack by default.
+ * by painting the stack (x86-64 GCC -O2), the operations write at most about
+ * 17.3 KiB below their caller, most of it the library's burn, so
+ * PQC_STACK_BURN_BYTES (32 KiB) is nearly twice the deepest use; pqc_tests
+ * checks that the burn covers every byte the operations write. It is kept
+ * small because the burn adds its frame to the deepest signing call chain, and
+ * musl gives threads only 128 KiB of stack by default.
  */
 
 //! Overwrite the stack released by the Impl() function that just returned.
