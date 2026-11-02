@@ -9,13 +9,13 @@ release tags from that repository, not the moving `main` branch.
 ## Current Pin
 
 - Source repository: `https://github.com/Qbit-Org/qbit-libbitcoinpqc.git`
-- Source tag: `v0.3.0`
-- Peeled tag commit: `ac72d1ffa0ef486f08d37334a43f5db1adb731db`
+- Source tag: `v0.3.2`
+- Peeled tag commit: `1965d0da1eb4d9e196613b8f3a5d0d866a221c53`
 - qbit subtree path: `src/libbitcoinpqc`
 
-`v0.3.0` is an annotated tag. Git subtree metadata records the peeled commit,
+`v0.3.2` is an annotated tag. Git subtree metadata records the peeled commit,
 so the expected `git-subtree-split` value is
-`ac72d1ffa0ef486f08d37334a43f5db1adb731db`.
+`1965d0da1eb4d9e196613b8f3a5d0d866a221c53`.
 
 ## Downstream Build Policy
 
@@ -37,6 +37,27 @@ continues to accept the full two-byte WOTS+C counter range. See the subtree's
 [`bounded30` signature-limit documentation](../../src/libbitcoinpqc/docs/bounded30-signature-limit.md)
 for the complete distinction.
 
+Since `v0.3.1`, `slh_dsa_keygen()`, `slh_dsa_sign()`,
+`slh_dsa_sign_with_stats()`, `slh_dsa_secret_key_validate()` and
+`slh_dsa_derandomize()` overwrite the stack they released before returning,
+so SK_SEED, SK_PRF and SHA-2 scratch do not outlive the call. The burn is
+`BITCOIN_PQC_BURN_STACK_BYTES`: 16 KiB when the library is compiled with
+optimization and 288 KiB without it (208 KiB before `v0.3.2`). qbit compiles
+the subtree with its RelWithDebInfo C flags (`-O2`) in every build type.
+CMake places them after `CMAKE_C_FLAGS`, which is where `APPEND_CFLAGS` and
+`APPEND_CPPFLAGS` go, so an appended `-O0` does not take effect: the
+optimized size applies and each call needs about 17 KiB of free stack.
+Verification does not burn. qbit does not shrink
+the stacks of the threads that sign, so they keep the platform default, which
+is 512 KiB or more on qbit's release platforms.
+
+`v0.3.2` adds `BITCOIN_PQC_ERROR_OUT_OF_MEMORY` (`-6`), which keygen and sign
+return when an allocation fails, and signing with a secret key that fails
+`bitcoin_pqc_secret_key_validate()` now returns `BITCOIN_PQC_ERROR_BAD_KEY`
+(`slh_dsa_sign()` returns `SLH_DSA_SIGN_ERROR_BAD_KEY`). qbit's callers treat
+any nonzero result as a failure, so neither change alters how qbit signs.
+Keys, signatures and verification results are unchanged from `v0.3.1`.
+
 ## Import Or Refresh The Subtree
 
 Run in a clean `qbit` worktree:
@@ -47,7 +68,7 @@ git checkout <your-qbit-branch>
 contrib/devtools/update-libbitcoinpqc-subtree.sh
 ```
 
-The helper defaults to `Qbit-Org/qbit-libbitcoinpqc` tag `v0.3.0`. To test a
+The helper defaults to `Qbit-Org/qbit-libbitcoinpqc` tag `v0.3.2`. To test a
 future release candidate before changing the defaults:
 
 ```bash
@@ -74,15 +95,14 @@ test/lint/libbitcoinpqc-subtree-check.sh
 ```
 
 The check fetches the pinned tag if needed, should report `GOOD`, and should
-show the subtree split commit as `ac72d1ffa0ef486f08d37334a43f5db1adb731db`
+show the subtree split commit as `1965d0da1eb4d9e196613b8f3a5d0d866a221c53`
 for the current pin.
 
-The current qbit tree carries one approved downstream security delta on top of
-the pinned upstream tag: `RUSTSEC-2026-0204-crossbeam-epoch-0.9.20`, which
-updates only `src/libbitcoinpqc/Cargo.lock` from `crossbeam-epoch 0.9.18` to
-`0.9.20`. The subtree check accepts exactly that lockfile hunk and no other
-subtree drift. Drop the exception after `Qbit-Org/qbit-libbitcoinpqc` publishes
-an immutable tag containing the same advisory fix and qbit imports it.
+The current qbit tree carries no downstream delta: `HEAD:src/libbitcoinpqc`
+must equal the tagged upstream tree. Since `v0.3.1`, upstream contains the
+`RUSTSEC-2026-0204` `crossbeam-epoch 0.9.20` lockfile fix that qbit carried
+as a downstream patch on `v0.3.0`, so the subtree check no longer accepts any
+lockfile exception.
 
 ## PR Checklist For Subtree Updates
 

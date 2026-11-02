@@ -126,9 +126,7 @@ verifies that both `HEAD:src/libbitcoinpqc` and the recorded
 subtree workflow, see
 [`doc/subtrees/libbitcoinpqc.md`](../../doc/subtrees/libbitcoinpqc.md).
 
-The check accepts the exact documented downstream lockfile patch for
-`RUSTSEC-2026-0204-crossbeam-epoch-0.9.20`. Any other subtree drift remains a
-failure.
+Any subtree drift from the tagged upstream tree is a failure.
 
 lint-libbitcoinpqc-vectors.py
 =============================

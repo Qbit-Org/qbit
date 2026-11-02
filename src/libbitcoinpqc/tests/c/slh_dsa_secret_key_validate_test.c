@@ -46,6 +46,18 @@ static int expect_high_level(bitcoin_pqc_error_t actual,
     return 0;
 }
 
+static int expect_low_level_code(int actual, int expected, const char *message) {
+    if (actual != expected) {
+        fprintf(stderr, "%s: rc=%d expected=%d\n", message, actual, expected);
+        return 1;
+    }
+    return 0;
+}
+
+static int signature_output_is_empty(const bitcoin_pqc_signature_t *signature) {
+    return signature->signature == NULL && signature->signature_size == 0;
+}
+
 static int expect_bytes_equal(
     const uint8_t *actual,
     const uint8_t *expected,
@@ -166,9 +178,10 @@ static int test_secret_key_validate(void) {
     }
     memset(sig, 0xa5, sizeof(sig));
     siglen = sizeof(sig);
-    if (expect_low_level_reject(
+    if (expect_low_level_code(
             slh_dsa_sign(sig, &siglen, message, sizeof(message) - 1u, mutated),
-            "low-level signing should reject a mutated root tail")) {
+            SLH_DSA_SIGN_ERROR_BAD_KEY,
+            "low-level signing should reject a mutated root tail as a bad key")) {
         return 1;
     }
     if (siglen != 0) {
@@ -217,8 +230,134 @@ static int test_secret_key_validate(void) {
     return 0;
 }
 
+/* Signing must give the same verdict as the validator for a key the validator
+   rejects: SLH_DSA_SIGN_ERROR_BAD_KEY at the facade and
+   BITCOIN_PQC_ERROR_BAD_KEY at the public API, never the generic signing
+   failure, and the caller's signature struct must stay empty. */
+static int test_sign_rejects_inconsistent_secret_key(void) {
+    uint8_t entropy[MIN_ENTROPY_SIZE];
+    uint8_t pk[SLH_DSA_PUBLIC_KEY_SIZE];
+    uint8_t sk[SLH_DSA_SECRET_KEY_SIZE];
+    uint8_t mutated[SLH_DSA_SECRET_KEY_SIZE];
+    uint8_t sig[SLH_DSA_SIGNATURE_SIZE];
+    const uint8_t message[] = "inconsistent-secret-key";
+    const size_t message_len = sizeof(message) - 1u;
+    const size_t n = SLH_DSA_SECRET_KEY_SIZE / 4u;
+    /* [SK_SEED || SK_PRF || PUB_SEED || root]: every part the stored root
+       depends on. SK_PRF is covered by the control below. */
+    const size_t rejected_offsets[] = {0u, 2u * n, 3u * n};
+    const char *labels[] = {"SK_SEED", "PUB_SEED", "root"};
+    bitcoin_pqc_signature_t signature = {0};
+    size_t i;
+
+    if (SLH_DSA_SECRET_KEY_SIZE != 4u * n || SLH_DSA_PUBLIC_KEY_SIZE != 2u * n) {
+        return fail("unexpected SLH-DSA key layout constants");
+    }
+
+    fill_entropy(entropy, sizeof(entropy));
+    if (slh_dsa_keygen(pk, sk, entropy, sizeof(entropy)) != 0) {
+        return fail("slh_dsa_keygen should succeed");
+    }
+
+    for (i = 0; i < sizeof(rejected_offsets) / sizeof(rejected_offsets[0]); i++) {
+        bitcoin_pqc_sign_stats_t stats = {0};
+        char detail[128];
+        size_t siglen;
+
+        copy_and_mutate(mutated, sk, rejected_offsets[i]);
+
+        memset(sig, 0xa5, sizeof(sig));
+        siglen = sizeof(sig);
+        snprintf(detail, sizeof(detail),
+                 "slh_dsa_sign should report a bad key for a %s mutation", labels[i]);
+        if (expect_low_level_code(
+                slh_dsa_sign(sig, &siglen, message, message_len, mutated),
+                SLH_DSA_SIGN_ERROR_BAD_KEY,
+                detail)) {
+            return 1;
+        }
+        if (siglen != 0 || !signature_is_zero(sig, sizeof(sig))) {
+            return fail("rejected key should reset siglen and zero the signature buffer");
+        }
+
+        memset(sig, 0xa5, sizeof(sig));
+        siglen = sizeof(sig);
+        snprintf(detail, sizeof(detail),
+                 "slh_dsa_sign_with_stats should report a bad key for a %s mutation",
+                 labels[i]);
+        if (expect_low_level_code(
+                slh_dsa_sign_with_stats(sig, &siglen, message, message_len, mutated, &stats),
+                SLH_DSA_SIGN_ERROR_BAD_KEY,
+                detail)) {
+            return 1;
+        }
+        if (siglen != 0 || !signature_is_zero(sig, sizeof(sig))) {
+            return fail("rejected key should reset siglen and zero the signature buffer");
+        }
+
+        snprintf(detail, sizeof(detail),
+                 "bitcoin_pqc_sign should be BAD_KEY for a %s mutation", labels[i]);
+        if (expect_high_level(
+                bitcoin_pqc_sign(mutated, sizeof(mutated), message, message_len, &signature),
+                BITCOIN_PQC_ERROR_BAD_KEY,
+                detail)) {
+            return 1;
+        }
+        if (!signature_output_is_empty(&signature)) {
+            return fail("rejected key must leave the signature output empty");
+        }
+
+        snprintf(detail, sizeof(detail),
+                 "bitcoin_pqc_sign_with_stats should be BAD_KEY for a %s mutation",
+                 labels[i]);
+        if (expect_high_level(
+                bitcoin_pqc_sign_with_stats(
+                    mutated, sizeof(mutated), message, message_len, &signature, &stats),
+                BITCOIN_PQC_ERROR_BAD_KEY,
+                detail)) {
+            return 1;
+        }
+        if (!signature_output_is_empty(&signature)) {
+            return fail("rejected key must leave the signature output empty");
+        }
+
+        snprintf(detail, sizeof(detail),
+                 "validator should agree that a %s mutation is BAD_KEY", labels[i]);
+        if (expect_high_level(
+                bitcoin_pqc_secret_key_validate(mutated, sizeof(mutated)),
+                BITCOIN_PQC_ERROR_BAD_KEY,
+                detail)) {
+            return 1;
+        }
+    }
+
+    /* Control: SK_PRF does not feed the stored root, so the validator accepts
+       the mutation, signing succeeds, and the signature verifies under the
+       unchanged public key. */
+    copy_and_mutate(mutated, sk, n);
+    if (expect_high_level(
+            bitcoin_pqc_sign(mutated, sizeof(mutated), message, message_len, &signature),
+            BITCOIN_PQC_OK,
+            "SK_PRF-only mutation should still sign")) {
+        return 1;
+    }
+    if (expect_high_level(
+            bitcoin_pqc_verify(pk, sizeof(pk), message, message_len,
+                               signature.signature, signature.signature_size),
+            BITCOIN_PQC_OK,
+            "SK_PRF-only mutated signature should verify under the original public key")) {
+        bitcoin_pqc_signature_free(&signature);
+        return 1;
+    }
+    bitcoin_pqc_signature_free(&signature);
+
+    return 0;
+}
+
 int main(void) {
-    if (test_keygen_trusted_output_contract() || test_secret_key_validate()) {
+    if (test_keygen_trusted_output_contract() ||
+        test_secret_key_validate() ||
+        test_sign_rejects_inconsistent_secret_key()) {
         return 1;
     }
 

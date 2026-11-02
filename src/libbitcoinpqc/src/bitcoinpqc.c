@@ -60,14 +60,18 @@ bitcoin_pqc_error_t bitcoin_pqc_keygen(
         bitcoin_pqc_secure_zero(sk, sk_size);
         free(pk);
         free(sk);
-        return BITCOIN_PQC_ERROR_BAD_ARG;
+        return BITCOIN_PQC_ERROR_OUT_OF_MEMORY;
     }
 
-    if (slh_dsa_keygen(pk, sk, random_data, random_data_size) != 0) {
+    int keygen_result = slh_dsa_keygen(pk, sk, random_data, random_data_size);
+    if (keygen_result != 0) {
         bitcoin_pqc_secure_zero(pk, pk_size);
         bitcoin_pqc_secure_zero(sk, sk_size);
         free(pk);
         free(sk);
+        if (keygen_result == SLH_DSA_KEYGEN_ERROR_OUT_OF_MEMORY) {
+            return BITCOIN_PQC_ERROR_OUT_OF_MEMORY;
+        }
         return BITCOIN_PQC_ERROR_BAD_KEY;
     }
 
@@ -145,7 +149,7 @@ static bitcoin_pqc_error_t bitcoin_pqc_sign_impl(
     size_t expected_sig_size = bitcoin_pqc_signature_size();
     uint8_t *sig = malloc(expected_sig_size);
     if (!sig) {
-        return BITCOIN_PQC_ERROR_BAD_ARG;
+        return BITCOIN_PQC_ERROR_OUT_OF_MEMORY;
     }
 
     size_t actual_sig_len = 0;
@@ -163,6 +167,9 @@ static bitcoin_pqc_error_t bitcoin_pqc_sign_impl(
         free(sig);
         if (result == BITCOINPQC_SIGN_LIMIT_EXCEEDED) {
             return BITCOIN_PQC_ERROR_SIGNING_LIMIT;
+        }
+        if (result == SLH_DSA_SIGN_ERROR_BAD_KEY) {
+            return BITCOIN_PQC_ERROR_BAD_KEY;
         }
         return BITCOIN_PQC_ERROR_BAD_SIGNATURE;
     }

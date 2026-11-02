@@ -191,6 +191,8 @@ C API ownership rules:
 - `bitcoin_pqc_keypair_t` and `bitcoin_pqc_signature_t` must be zero-initialized before passing them to `bitcoin_pqc_keygen` or `bitcoin_pqc_sign`.
 - Output structs may be reused only after the corresponding free function has been called.
 - Passing a nonzero or already-owned output struct to `bitcoin_pqc_keygen` or `bitcoin_pqc_sign` returns `BITCOIN_PQC_ERROR_BAD_ARG` and leaves the struct unchanged.
+- `bitcoin_pqc_sign` and `bitcoin_pqc_sign_with_stats` return `BITCOIN_PQC_ERROR_BAD_KEY` for a secret key of the wrong size or one whose stored root does not match its seeds, the same check `bitcoin_pqc_secret_key_validate` performs. `BITCOIN_PQC_ERROR_BAD_SIGNATURE` from signing means the signing operation itself failed, not that the key was rejected.
+- `bitcoin_pqc_keygen` and `bitcoin_pqc_sign` return `BITCOIN_PQC_ERROR_OUT_OF_MEMORY` when any internal allocation fails (the key or signature output buffers, or the keygen seed-derivation buffer, which grows with the entropy size) and leave the output struct unchanged.
 - `bitcoin_pqc_keypair_free` and `bitcoin_pqc_signature_free` accept `NULL`, zeroize allocated buffers before release, reset pointers and sizes to zero, and are safe to call repeatedly on the same struct after the first free.
 - Zero-length messages are supported. At the C ABI boundary, `message` may be `NULL` only when `message_size == 0`.
 - Key generation uses caller-provided entropy. Signing is deterministic from
@@ -286,13 +288,17 @@ with `SecretKey::try_from_slice` or `SecretKey::from_str` and pass them to
 raw key export or interoperability code; do not log, serialize, or retain copies
 of that data unless the calling protocol requires it.
 
+Rust errors are `PqcError` values. The enum keeps the 0.3.0 variant set, so C
+codes without a dedicated variant, such as `BITCOIN_PQC_ERROR_OUT_OF_MEMORY`
+(-6), reach Rust as `PqcError::Other(code)`.
+
 The Rust `serde` feature serializes/deserializes public keys and signatures
 only. Secret key and whole `KeyPair` serde support requires the explicit
 `secret-key-serde` feature because it emits raw secret key material as hex.
 
 ## Versioning And Release Checks
 
-Rust and CMake package metadata currently identify the core library as `0.3.0`.
+Rust and CMake package metadata currently identify the core library as `0.3.2`.
 
 Release readiness and supply-chain validation are tracked in:
 
