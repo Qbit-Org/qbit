@@ -1489,6 +1489,29 @@ fn boundary_policy_pair(consensus: Expected) -> (Expected, Expected) {
     (consensus.clone(), consensus)
 }
 
+/// Builds the `runtime-stack-bytes` boundary spend. The witness holds the
+/// remainder of `value` modulo the item size, if any, below one maximum-size
+/// item. The leaf duplicates that item until the stack holds `value` bytes,
+/// then drops the copies and the remainder.
+fn runtime_stack_bytes_spend(value: usize) -> Option<(Vec<Vec<u8>>, Vec<u8>)> {
+    let copies = value / script::MAX_STACK_ITEM_BYTES;
+    let remainder = value % script::MAX_STACK_ITEM_BYTES;
+    if copies == 0 || copies + usize::from(remainder != 0) > script::MAX_STACK_ITEMS {
+        return None;
+    }
+    let mut initial_stack = Vec::new();
+    if remainder != 0 {
+        initial_stack.push(vec![1; remainder]);
+    }
+    initial_stack.push(vec![1; script::MAX_STACK_ITEM_BYTES]);
+    let mut leaf_script = vec![0x76; copies - 1];
+    leaf_script.extend(vec![0x75; copies - 1]);
+    if remainder != 0 {
+        leaf_script.extend([0x7c, 0x75]);
+    }
+    Some((initial_stack, leaf_script))
+}
+
 fn boundary_outcome(
     id: &str,
     scenario: &str,
@@ -1892,6 +1915,42 @@ fn boundary_outcome(
                             error: "SCRIPT_ERR_OK".to_string(),
                         },
                     }
+                }
+                "runtime-stack-bytes" => {
+                    exact_object_keys(parameters, &["kind", "value"], id)?;
+                    let value: usize = unsigned(parameters, "value", id)?
+                        .try_into()
+                        .map_err(|_| format!("{id}: resource value overflow"))?;
+                    let (initial_stack, leaf_script) = runtime_stack_bytes_spend(value)
+                        .ok_or_else(|| format!("{id}: unsupported runtime stack size {value}"))?;
+                    script::evaluate(
+                        &leaf_script,
+                        &initial_stack,
+                        |_, _, _| unreachable!(),
+                        |_, _, _| unreachable!(),
+                    )
+                    .map_err(|error| {
+                        format!("{id}: runtime stack spend fails consensus: {error}")
+                    })?;
+                    let consensus = Expected {
+                        accepted: true,
+                        stage: "script-complete".to_string(),
+                        error: "SCRIPT_ERR_OK".to_string(),
+                    };
+                    let policy = match script::evaluate_policy(
+                        &leaf_script,
+                        &initial_stack,
+                        |_, _, _| unreachable!(),
+                        |_, _, _| unreachable!(),
+                    ) {
+                        Ok(()) => consensus.clone(),
+                        Err(error) => Expected {
+                            accepted: false,
+                            stage: "policy".to_string(),
+                            error,
+                        },
+                    };
+                    return Ok((consensus, policy));
                 }
                 "validation-weight" => {
                     let checks = unsigned(parameters, "nonempty_checks", id)? as usize;
@@ -2436,5 +2495,30 @@ mod tests {
                 .unwrap_err(),
             "SCRIPT_ERR_P2MR_SIG_SIZE"
         );
+    }
+
+    #[test]
+    fn runtime_stack_bytes_limit_is_policy_only() {
+        let outcome = |value: usize| {
+            let parameters = json!({"kind": "runtime-stack-bytes", "value": value});
+            boundary_outcome("case", "resource", parameters.as_object().unwrap(), &[])
+        };
+
+        let (consensus, policy) = outcome(1 << 20).unwrap();
+        assert!(consensus.accepted);
+        assert!(policy.accepted);
+
+        let (consensus, policy) = outcome((1 << 20) + 1).unwrap();
+        assert!(consensus.accepted);
+        assert!(!policy.accepted);
+        assert_eq!(policy.stage, "policy");
+        assert_eq!(policy.error, "SCRIPT_ERR_P2MR_STACK_BYTES");
+
+        for value in [0, 16_383, 1000 * 16_384 + 1] {
+            assert_eq!(
+                outcome(value).err(),
+                Some(format!("case: unsupported runtime stack size {value}"))
+            );
+        }
     }
 }
