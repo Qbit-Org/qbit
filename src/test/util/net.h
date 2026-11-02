@@ -6,6 +6,7 @@
 #define QBIT_TEST_UTIL_NET_H
 
 #include <compat/compat.h>
+#include <consensus/consensus.h>
 #include <netmessagemaker.h>
 #include <net.h>
 #include <net_permissions.h>
@@ -13,6 +14,7 @@
 #include <netaddress.h>
 #include <node/connection_types.h>
 #include <node/eviction.h>
+#include <primitives/block.h>
 #include <span.h>
 #include <sync.h>
 #include <util/sock.h>
@@ -362,5 +364,25 @@ void DynSock::Pipe::PushNetMsg(const std::string& type, Args&&... payload)
 }
 
 std::vector<NodeEvictionCandidate> GetRandomNodeEvictionCandidates(int n_candidates, FastRandomContext& random_context);
+
+/** Serialized size of one header in a headers message: the header, including any AuxPoW payload,
+ *  followed by its 0x00 transaction count. */
+size_t HeadersMessageEntrySize(const CBlockHeader& header);
+
+/** Serialized size of a headers message carrying these headers. */
+size_t HeadersMessageSize(const std::vector<CBlockHeader>& headers);
+
+/** Split consecutive headers into headers messages the way PeerManager fills a getheaders reply: at
+ *  most MAX_HEADERS_RESULTS headers each, ending a message before a header that would make it larger
+ *  than MAX_PROTOCOL_MESSAGE_LENGTH. */
+std::vector<std::vector<CBlockHeader>> SplitIntoHeadersMessages(const std::vector<CBlockHeader>& headers);
+
+/** Smallest headers message with fewer than MAX_HEADERS_RESULTS headers that PeerManager treats as
+ *  possibly cut short by size (THRESHOLD_HEADERS_MESSAGE_SIZE in net_processing.cpp). */
+static constexpr size_t THRESHOLD_HEADERS_MESSAGE_SIZE{MAX_PROTOCOL_MESSAGE_LENGTH - MAX_BLOCK_SERIALIZED_SIZE};
+
+/** Whether PeerManager treats a headers message carrying these headers as possibly cut short, so
+ *  the peer may have more (PeerManagerImpl::MayHaveMoreHeaders()). */
+bool MayHaveMoreHeaders(const std::vector<CBlockHeader>& headers);
 
 #endif // QBIT_TEST_UTIL_NET_H
