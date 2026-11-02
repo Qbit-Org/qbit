@@ -53,13 +53,18 @@ Behavior changes to review before upgrading
   now include a fee-only `send` entry, with `amount` of zero and a negative
   `fee` and without `address`, `label`, or `vout`, for a self-transfer whose
   outputs are all change. Integrations that assume every `send` entry has an
-  address or a non-zero amount should be checked (#150).
+  address, a `vout`, or a non-zero amount should be checked (#150).
 - An `encryptwallet` call that overlaps another encryption of the same wallet
   now fails deterministically with error code `-15`
   (`RPC_WALLET_WRONG_ENC_STATE`), the code a call on an already encrypted
   wallet already returned. Previously it could fail with `-16` "Failed to
   encrypt". Other `encryptwallet` failures keep their previous error codes
   (#183).
+- `bumpfee` can now fail where it previously broadcast a replacement: when
+  signing changed anything other than the input signatures, and when the
+  replacement no longer passes the checks repeated at commit time. Automated
+  callers should expect these new `RPC_WALLET_ERROR` failures (see Updated
+  RPCs) (#167, includes #146).
 - Standard policy now rejects a P2MR v1 spend whose main stack plus alt-stack
   holds more than 1 MiB after any opcode, with the reject reason
   `mempool-script-verify-flag-failed (Standard P2MR stack byte limit
@@ -172,6 +177,28 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   cannot underpay relay policy. Set `-fallbackfee=0` to restore the previous
   behavior of failing instead (#151).
 
+### Updated RPCs
+
+- `bumpfee` now checks that signing changed nothing in the replacement except
+  its input signatures. If an external signer, or any other signing step,
+  returns a replacement with other changes, `bumpfee` fails instead of
+  broadcasting it: an external-signer wallet reports "Transaction incomplete.
+  Try psbtbumpfee instead." and other wallets report "Can't sign
+  transaction." Fee bumps from qbit-qt use the same check (#167,
+  includes #146).
+- `bumpfee` revalidates the replacement against the live wallet, chain, and
+  mempool when it commits it. It fails if an input is no longer available or
+  is already spent, or the replacement no longer spends every original input.
+  It also fails if the fee is no longer above the original fee, or no longer
+  meets the incremental relay fee, the mempool minimum fee rate, or wallet fee
+  policy, including `-maxtxfee`; if the replacement is too large; or, unless
+  `-walletrejectlongchains=0` is set, if it no longer meets mempool chain
+  limits (#167, includes #146). #163 adds the mempool-spender and finality
+  checks (see Wallet fixes).
+- `gettransaction`, `listtransactions`, and default `listsinceblock` can
+  return a `send` entry without `vout`, `address`, or `label` (see Behavior
+  changes) (#150).
+
 ### Signing-usage visibility and qbit-qt responsiveness
 
 - PSBT signing started from the PSBT operations dialog runs on a cloned-wallet
@@ -183,7 +210,7 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   consumed (#145, fixes #140).
 - P2MR fee-bump signing runs off the GUI thread. Signing failure, commit
   failure, and success each present the PQC usage the attempt consumed, and
-  cancellation and teardown races were closed (#167).
+  cancellation and teardown races were closed (#167, includes #146).
 - Transaction-signing flows preserve and display consumed PQC usage. A shared
   formatter renders the overall state, every affected key with its counter,
   limit, remaining capacity, and limit state, and every usage warning. An
@@ -302,13 +329,16 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   a key error rather than a signature error. qbit treats every library error
   as a failed operation, as before, so wallet and RPC behavior does not
   change. Keys and signatures are byte-identical to those produced by v1.0.0,
-  and verification accepts and rejects the same signatures. #268 reports that
-  key generation, secret-key validation, and signing take about 10 to 12%
-  longer and verification about 1% longer. Those figures were measured on
-  v0.3.1, whose production code differs from v0.3.2 only in error mapping and
-  in the stack-wipe size of unoptimized builds. Each key generation,
-  validation, or signing call now needs about 17 KiB of free stack (#268,
-  refs #260).
+  and verification accepts and rejects the same signatures. In measurements
+  made for the v1.0.1 release review, key generation takes about 11 to 14%
+  longer and signing about 14 to 18% longer. Verification is unchanged where
+  SHA-256 uses the x86 SHA-NI backend, and about 6.5% slower on the scalar SHA
+  backend, which x86 CPUs without SHA-NI and aarch64, armhf, riscv64, and
+  ppc64 Linux builds use. These figures do not cover Apple silicon Macs, which
+  hash through CommonCrypto, or secret-key validation; #268's earlier
+  measurement of v0.3.1 put validation about 12% slower, like key generation.
+  Each key generation, validation, or signing call now needs about 17 KiB of
+  free stack (#268, refs #260).
 
 ### Release engineering, CI, and documentation
 
@@ -469,6 +499,25 @@ Known limitations
   transaction that mixes P2MR and non-P2MR inputs, it re-signs the
   already-complete P2MR inputs it owns and consumes fresh signature counters.
   This predates v1.0.1 and is unchanged (#163).
+- PQC signature counters are kept per descriptor. A private key held in two
+  descriptors of one wallet has a separate counter in each, and each counter
+  is capped on its own, so the wallet does not enforce the `2^30` per-key
+  limit across those descriptors. Likewise, the same key in another wallet,
+  in a wallet restored from an older backup, or exported with
+  `listdescriptors true` counts only its own signatures. This predates
+  v1.0.1.
+- qbit-qt's Send dialog signs the transaction while preparing it, before the
+  confirmation dialog opens. Rejecting the confirmation, or choosing Create
+  Unsigned (offered for a wallet with private keys when PSBT controls are
+  enabled), discards that signed transaction, but the PQC capacity it
+  consumed stays consumed and is not shown unless a usage warning applies. A
+  PSBT made with Create Unsigned consumes capacity again when it is signed.
+  This predates v1.0.1.
+- The depth of the libbitcoinpqc stack wipe is verified only on Linux x86_64
+  and i686. The unit test that checks it skips Windows and sanitizer builds,
+  and CI runs no macOS or ARM unit tests. On macOS the library hashes through
+  CommonCrypto, whose SHA context it does not wipe, so it relies on the
+  16 KiB stack burn alone to clear that context (#268, refs #260).
 - The v1.0.1 release readiness inspection (#174) exercised a testnet4 wallet on
   macOS. Linux and Windows desktop notification behavior and a packaged-binary
   smoke check on each supported platform are separate release evidence.
