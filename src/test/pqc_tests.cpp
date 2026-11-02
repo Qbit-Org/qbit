@@ -209,32 +209,49 @@ struct ZeroRun {
 /**
  * Check the stack a secret-key call released: no exact SK_SEED or SK_PRF copy
  * may remain anywhere on it, and the deepest stack written below the caller
- * must be the zeroed window libbitcoinpqc burns when keygen, sign or
- * secret-key validation returns, so no frame of the call ran below the burn.
- * The burn also covers SHA-2 message-schedule spills, which hold the secret
- * only in transformed form.
+ * must be a zeroed burn window, so no frame of the call ran below the burn.
+ * Only the burn's own frames may write below the window, at most
+ * max_written_below_burn bytes. The burn also covers SHA-2 message-schedule
+ * spills, which hold the secret only in transformed form.
  */
-void CheckScrubbedStack(const PaintedStack& stack, const CPQCKey& key)
+void CheckReleasedStack(const PaintedStack& stack, std::span<const unsigned char> secret, size_t max_written_below_burn)
 {
     // Secret key layout: [SK_SEED || SK_PRF || PUB_SEED || root], n bytes each.
     constexpr size_t n{PQC_SECKEY_SIZE / 4};
     // slh_dsa.h documents a 16 KiB burn in optimized builds (more unoptimized).
     // Requiring 12 KiB leaves room for the frames that ran after the burn.
     constexpr size_t MIN_BURNED_BYTES{12 * 1024};
-    // The burn itself may write a few bytes below the array it zeroes: on
-    // i686, its position-independent prologue pushes a return address there
-    // to load the GOT pointer. More than that means a frame of the call ran
-    // below the burn.
-    constexpr size_t MAX_WRITTEN_BELOW_BURN{64};
 
-    BOOST_REQUIRE(key.IsValid());
-    const std::span<const unsigned char> secret{key.data(), key.size()};
+    BOOST_REQUIRE_EQUAL(secret.size(), PQC_SECKEY_SIZE);
     BOOST_CHECK_MESSAGE(!ContainsBytes(stack.bytes, secret.first(n)), "SK_SEED copy left on the released stack");
     BOOST_CHECK_MESSAGE(!ContainsBytes(stack.bytes, secret.subspan(n, n)), "SK_PRF copy left on the released stack");
     const ZeroRun burned{LongestZeroRun(std::span<const unsigned char>{stack.bytes}.first(stack.frame_offset))};
     BOOST_CHECK_MESSAGE(burned.length >= MIN_BURNED_BYTES, "longest zeroed run below the caller is " << burned.length << " bytes");
-    BOOST_CHECK_MESSAGE(burned.written_below <= MAX_WRITTEN_BELOW_BURN,
+    BOOST_CHECK_MESSAGE(burned.written_below <= max_written_below_burn,
                         burned.written_below << " bytes were written below the longest zeroed run");
+}
+
+//! Check the stack released by a direct libbitcoinpqc keygen, secret-key
+//! validation or signing call, whose deepest burn is the library's own.
+void CheckLibraryScrubbedStack(const PaintedStack& stack, std::span<const unsigned char> secret)
+{
+    // The library's burn may write a few bytes below the array it zeroes: on
+    // i686, its position-independent prologue pushes a return address there
+    // to load the GOT pointer.
+    constexpr size_t MAX_WRITTEN_BELOW_BURN{64};
+    CheckReleasedStack(stack, secret, MAX_WRITTEN_BELOW_BURN);
+}
+
+//! Check the stack released by a CPQCKey or DerivePQCKey call. Its deepest
+//! burn is qbit's BurnReleasedStack(), which reaches below the library's.
+void CheckScrubbedStack(const PaintedStack& stack, const CPQCKey& key)
+{
+    // BurnReleasedStack()'s memory_cleanse() and memset() frames write below
+    // the array it zeroes: 38 bytes measured at -O2 on x86-64, 64 on i686, and
+    // at most 78 at Clang -O0 (76 on i686).
+    constexpr size_t MAX_WRITTEN_BELOW_BURN{128};
+    BOOST_REQUIRE(key.IsValid());
+    CheckReleasedStack(stack, std::span<const unsigned char>{key.data(), key.size()}, MAX_WRITTEN_BELOW_BURN);
 }
 #endif
 
@@ -640,6 +657,35 @@ BOOST_AUTO_TEST_CASE(pqc_secret_key_calls_scrub_released_stack)
     })};
     BOOST_REQUIRE(derived_ok);
     BOOST_TEST_CONTEXT("DerivePQCKey") CheckScrubbedStack(derive_stack, derived);
+
+    // In the runs above, qbit's burn reaches below the library's and hides it,
+    // so also check the library's own burn on direct calls.
+    std::array<unsigned char, PQC_KEYGEN_RANDOM_DATA_SIZE> random_data;
+    std::iota(random_data.begin(), random_data.end(), 0x17);
+    std::array<unsigned char, PQC_PUBKEY_SIZE> library_pubkey{};
+    std::array<unsigned char, PQC_SECKEY_SIZE> library_seckey{};
+    int keygen_ret{-1};
+    const PaintedStack library_keygen_stack{RunOnPaintedStack([&] {
+        keygen_ret = slh_dsa_keygen(library_pubkey.data(), library_seckey.data(), random_data.data(), random_data.size());
+    })};
+    BOOST_REQUIRE_EQUAL(keygen_ret, 0);
+    BOOST_TEST_CONTEXT("slh_dsa_keygen") CheckLibraryScrubbedStack(library_keygen_stack, library_seckey);
+
+    int validate_ret{-1};
+    const PaintedStack library_validate_stack{RunOnPaintedStack([&] { validate_ret = slh_dsa_secret_key_validate(secret.data(), secret.size()); })};
+    BOOST_REQUIRE_EQUAL(validate_ret, 0);
+    BOOST_TEST_CONTEXT("slh_dsa_secret_key_validate") CheckLibraryScrubbedStack(library_validate_stack, secret);
+
+    std::vector<unsigned char> library_sig(PQC_SIG_SIZE);
+    size_t library_siglen{library_sig.size()};
+    int sign_ret{-1};
+    const PaintedStack library_sign_stack{RunOnPaintedStack([&] {
+        sign_ret = slh_dsa_sign(library_sig.data(), &library_siglen, hash.begin(), hash.size(), secret.data());
+    })};
+    BOOST_REQUIRE_EQUAL(sign_ret, 0);
+    BOOST_REQUIRE_EQUAL(library_siglen, PQC_SIG_SIZE);
+    BOOST_CHECK(generated.GetPubKey().Verify(hash, library_sig));
+    BOOST_TEST_CONTEXT("slh_dsa_sign") CheckLibraryScrubbedStack(library_sign_stack, secret);
 #endif
 }
 
