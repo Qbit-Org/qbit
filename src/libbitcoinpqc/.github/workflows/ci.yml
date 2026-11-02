@@ -20,7 +20,7 @@ jobs:
       matrix:
         include:
           - platform: linux
-            runs_on: '["self-hosted","linux","x64"]'
+            runs_on: '["self-hosted","linux","x64","qbit-trusted-ci"]'
             fork_runs_on: '"ubuntu-latest"'
           - platform: macos
             runs_on: '"macos-latest"'
@@ -122,22 +122,35 @@ jobs:
 
       - name: Run UBSan runtime smoke (Linux)
         if: matrix.platform == 'linux'
+        timeout-minutes: 60
         env:
           CC: clang
           CXX: clang++
+          # The cmake crate drops -O flags from CFLAGS and picks the CMake build type
+          # from the cargo opt-level, so opt-level 1 builds the sanitized C at -O2.
+          CARGO_PROFILE_DEV_OPT_LEVEL: "1"
           CFLAGS: "-fsanitize=undefined,unsigned-integer-overflow -fno-sanitize-recover=undefined,unsigned-integer-overflow -fno-omit-frame-pointer"
           LDFLAGS: "-fsanitize=undefined,unsigned-integer-overflow"
         run: |
+          UBSAN_RT="$(clang --print-file-name=libclang_rt.ubsan_standalone-x86_64.a)"
+          if [ ! -f "$UBSAN_RT" ]; then
+            echo "Could not find clang UBSan runtime: $UBSAN_RT" >&2
+            exit 1
+          fi
+          export RUSTFLAGS="-C linker=clang -C link-arg=$UBSAN_RT -C link-arg=-lpthread -C link-arg=-ldl -C link-arg=-lrt -C link-arg=-lm -C link-arg=-lc"
           cargo test --verbose --test sha2_backend_tests --test bounded_mode_correctness_tests
           cargo test --verbose --test bounded_mode_correctness_tests bounded_mode_soak_pr_smoke_100_roundtrips -- --ignored --nocapture
 
-      - name: Run backend differential tests under UBSan (test/bench env knobs)
+      - name: Run backend differential tests under UBSan (requested/effective backends)
         if: matrix.platform == 'linux'
         timeout-minutes: 15
         env:
           BACKEND_DIFFERENTIAL_CASES: "1"
           CC: clang
           CXX: clang++
+          # The cmake crate drops -O flags from CFLAGS and picks the CMake build type
+          # from the cargo opt-level, so opt-level 1 builds the sanitized C at -O2.
+          CARGO_PROFILE_DEV_OPT_LEVEL: "1"
           CFLAGS: "-fsanitize=undefined,unsigned-integer-overflow -fno-sanitize-recover=undefined,unsigned-integer-overflow -fno-omit-frame-pointer"
           LDFLAGS: "-fsanitize=undefined,unsigned-integer-overflow"
         run: |
@@ -147,15 +160,17 @@ jobs:
             exit 1
           fi
           RUSTFLAGS="-C linker=clang -C link-arg=$UBSAN_RT -C link-arg=-lpthread -C link-arg=-ldl -C link-arg=-lrt -C link-arg=-lm -C link-arg=-lc" \
-            cargo test --verbose --features test-bench-env-knobs --test backend_differential_tests
+            cargo test --verbose --features test-bench-env-knobs,test-helpers --test backend_differential_tests -- --nocapture
 
-      - name: Run backend differential tests (Linux x86/scalar/auto)
+      - name: Run backend differential tests (Linux requested/effective capability report)
         if: matrix.platform == 'linux'
-        run: cargo test --verbose --features test-bench-env-knobs --test backend_differential_tests
+        run: cargo test --verbose --features test-bench-env-knobs,test-helpers --test backend_differential_tests -- --nocapture
 
-      - name: Run backend differential tests (macOS CommonCrypto)
+      - name: Run backend differential tests (macOS required CommonCrypto)
         if: matrix.platform == 'macos'
-        run: cargo test --verbose --features test-bench-env-knobs --test backend_differential_tests
+        env:
+          BACKEND_DIFFERENTIAL_REQUIRE: commoncrypto
+        run: cargo test --verbose --features test-bench-env-knobs,test-helpers --test backend_differential_tests -- --nocapture
 
       - name: Run production env knob policy test (test-helpers feature)
         if: matrix.platform == 'linux'
@@ -234,9 +249,9 @@ jobs:
         shell: pwsh
         run: cargo test --verbose
 
-      - name: Run backend differential tests (test/bench env knobs)
+      - name: Run backend differential tests (scalar/auto with x86 capability report)
         shell: pwsh
-        run: cargo test --verbose --features test-bench-env-knobs --test backend_differential_tests
+        run: cargo test --verbose --features test-bench-env-knobs,test-helpers --test backend_differential_tests -- --nocapture
 
   param-benchmark:
     name: Param Benchmark (${{ matrix.platform }})
@@ -245,7 +260,7 @@ jobs:
       matrix:
         include:
           - platform: linux
-            runs_on: '["self-hosted","linux","x64"]'
+            runs_on: '["self-hosted","linux","x64","qbit-trusted-ci"]'
             fork_runs_on: '"ubuntu-latest"'
           - platform: macos
             runs_on: '"macos-latest"'
@@ -302,7 +317,7 @@ jobs:
   fuzz-smoke:
     name: Fuzz Smoke (nightly)
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, linux, x64]
+    runs-on: [self-hosted, linux, x64, "qbit-trusted-ci"]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -360,7 +375,7 @@ jobs:
 
   nightly-soak:
     name: Nightly Soak (10k roundtrips, threads=${{ matrix.threads }})
-    runs-on: [self-hosted, linux, x64]
+    runs-on: [self-hosted, linux, x64, "qbit-trusted-ci"]
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     strategy:
       matrix:
@@ -395,7 +410,7 @@ jobs:
 
   nightly-forsc-benchmark:
     name: Nightly FORS+C 64 KiB benchmark
-    runs-on: [self-hosted, linux, x64]
+    runs-on: [self-hosted, linux, x64, "qbit-trusted-ci"]
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -425,7 +440,7 @@ jobs:
   supply-chain:
     name: Supply Chain Audit
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, linux, x64]
+    runs-on: [self-hosted, linux, x64, "qbit-trusted-ci"]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 

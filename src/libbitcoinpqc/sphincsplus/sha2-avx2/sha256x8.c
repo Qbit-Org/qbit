@@ -4,6 +4,10 @@
 #include "sha256avx.h"
 #include "utils.h"
 
+/* Zero scratch through a volatile function pointer so the stores are not
+   removed as dead; seeded message blocks can hold SK_SEED copies. */
+static void *(*const volatile sha256x8_memset)(void *, int, size_t) = memset;
+
 static uint32_t load_bigendian_32(const uint8_t *x) {
     return (uint32_t)(x[3]) | (((uint32_t)(x[2])) << 8) |
            (((uint32_t)(x[1])) << 16) | (((uint32_t)(x[0])) << 24);
@@ -91,6 +95,7 @@ void sha256x8_seeded(
 
     _sha256x8(&ctx, out0, out1, out2, out3, out4, out5, out6, out7,
             in0, in1, in2, in3, in4, in5, in6, in7, inlen);
+    sha256x8_memset(&ctx, 0, sizeof(ctx));
 }
 
 /* This provides a wrapper around the internals of 8x parallel SHA256 */

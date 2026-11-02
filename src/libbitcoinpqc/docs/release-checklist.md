@@ -73,12 +73,22 @@ Capture these artifacts for each release candidate:
 - `cargo test --features serde`
 - `cargo test --features secret-key-serde`
 - `cargo test --features test-helpers`
-- Windows CI: `cargo build --verbose` and `cargo test --verbose`
+- `cargo test --verbose --features test-bench-env-knobs,test-helpers --test backend_differential_tests -- --nocapture`
+- macOS CI: run that differential command with
+  `BACKEND_DIFFERENTIAL_REQUIRE=commoncrypto`
+- Windows CI: `cargo build --verbose`, `cargo test --verbose`, and the
+  differential command above for scalar/auto coverage plus explicit x86
+  capability reporting; do not record fallback as x86 coverage
+- Linux CI: retain the requested/effective capability report. Set
+  `BACKEND_DIFFERENTIAL_REQUIRE=x86` only on a runner verified or provisioned
+  to select x86 SHA-NI for SHA-256 (SHA-512 may report scalar)
 
 ## C API Checks
 
 - Confirm keypair and signature output structs are zero-initialized before use.
 - Confirm reused output structs fail with `BITCOIN_PQC_ERROR_BAD_ARG` unless freed first.
+- Confirm signing with an inconsistent secret key fails with `BITCOIN_PQC_ERROR_BAD_KEY`, matching `bitcoin_pqc_secret_key_validate`, and leaves the signature struct empty.
+- Confirm a failed internal allocation in `bitcoin_pqc_keygen` or `bitcoin_pqc_sign` reports `BITCOIN_PQC_ERROR_OUT_OF_MEMORY` and leaves the output struct empty. `bitcoinpqc_c_api_contract_test` (ctest) and `c_api_edge_cases` (`cargo test`) drive the keygen seed-derivation allocation with an unsatisfiable entropy size.
 - Confirm `bitcoin_pqc_keypair_free` and `bitcoin_pqc_signature_free` are idempotent.
 - Confirm zero-length message sign/verify works through Rust and the C ABI.
 
@@ -110,21 +120,36 @@ For longer release candidates, run each target with a time budget recorded in th
 Run UBSan smoke for native C paths:
 
 ```bash
-CC=clang CXX=clang++ \
-CFLAGS="-fsanitize=undefined,unsigned-integer-overflow -fno-sanitize-recover=undefined,unsigned-integer-overflow -fno-omit-frame-pointer" \
-LDFLAGS="-fsanitize=undefined,unsigned-integer-overflow" \
-cargo test --test sha2_backend_tests --test backend_differential_tests --test bounded_mode_correctness_tests
+export CC=clang
+export CXX=clang++
+export CFLAGS="-fsanitize=undefined,unsigned-integer-overflow -fno-sanitize-recover=undefined,unsigned-integer-overflow -fno-omit-frame-pointer"
+export LDFLAGS="-fsanitize=undefined,unsigned-integer-overflow"
+cargo test --test sha2_backend_tests --test bounded_mode_correctness_tests
+cargo test --features test-bench-env-knobs,test-helpers \
+  --test backend_differential_tests -- --nocapture
 ```
+
+Do not run `backend_differential_tests` without both feature gates: doing so can
+compile out the intended coverage. Capture its requested/effective SHA-256 and
+SHA-512 summary in the release evidence. A requested accelerator that selects
+scalar is explicit unavailability, not accelerated-backend evidence. ARM is not
+part of this release gate.
 
 Run ASan smoke where the local platform supports the Rust/C link mode:
 
 ```bash
+ASAN_OPTIONS=allocator_may_return_null=1 \
 CC=clang CXX=clang++ \
 CFLAGS="-fsanitize=address -fno-omit-frame-pointer" \
 LDFLAGS="-fsanitize=address" \
 RUSTFLAGS="-Zsanitizer=address" \
 cargo +nightly test --target "$(rustc -vV | sed -n 's|host: ||p')"
 ```
+
+`allocator_may_return_null=1` is required:
+`c_api_keygen_reports_failed_allocation_as_out_of_memory` requests an
+unsatisfiable allocation and expects `malloc` to return NULL, which ASan
+otherwise turns into an abort.
 
 If ASan cannot link on the release host, record the linker/platform blocker and run the UBSan smoke plus fuzz smoke instead.
 
