@@ -574,7 +574,7 @@ BOOST_AUTO_TEST_CASE(headers_message_count_or_size_decides_whether_to_ask_for_mo
 
     const auto& consensus{m_node.chainman->GetConsensus()};
     SentMessages sent{*m_node.args};
-    const auto asks_for_more{[&](const std::vector<CBlockHeader>& headers) {
+    const auto asks_for_more{[&](const std::vector<CBlockHeader>& headers) EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex) {
         ReceiveHeadersFromPeer(*peerman, peer, headers);
         connman->FlushSendBuffer(peer);
         BOOST_CHECK(!peer.fDisconnect);
