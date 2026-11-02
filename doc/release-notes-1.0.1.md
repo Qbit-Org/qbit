@@ -12,9 +12,11 @@ signing capacity, validation and fuzz tooling, and release and CI hardening.
 It also carries fixes from the v1.0.1 release review: a standard-policy limit
 on P2MR stack memory, signature caching for P2MR data signatures, `headers`
 messages that stay within the message size limit, and a vendored PQC library
-update that clears secret-key material from the stack it releases. The
-updated library also performs consensus signature verification; keys,
-signatures, and verification results are unchanged.
+update that clears its own copies of secret-key material from the stack it
+releases. qbit's HD key derivation still leaves seed material on the stack
+(see Known limitations). The updated library also performs consensus
+signature verification; keys, signatures, and verification results are
+unchanged.
 It adds one standardness rule for P2MR spends, but contains no consensus rule
 change, no scheduled network activation, no change to the mainnet or testnet4
 network identity, and no wallet database format change.
@@ -30,8 +32,10 @@ installing v1.0.1. Then install the new binaries from the GitHub Release page.
 Existing v1.0.0 mainnet and testnet4 data directories, wallets, and wallet
 backups continue to work without a reindex, chain reset, or wallet migration.
 
-On Linux, replace the existing `qbitd`, `qbit-cli`, `qbit-tx`, `qbit-util`,
-and `qbit-wallet` binaries with the new versions.
+On Linux, replace the installed `qbit`, `qbitd`, `qbit-qt`, `qbit-cli`,
+`qbit-tx`, `qbit-util`, and `qbit-wallet` binaries, and any other files
+installed from the previous release archive, with the versions from the new
+archive.
 
 On macOS, replace the installed Qbit application bundle or unpack the updated
 archive into the desired location.
@@ -131,7 +135,8 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   transaction complete while a foreign input is still unsigned, and declining
   a signing prompt cancels the whole wallet signing operation. Counters an
   earlier descriptor already committed stay consumed; retrying the same
-  transaction reuses its witnesses (#163, refs #155).
+  transaction on the batched path reuses its witnesses. Signing that falls
+  back to the serial path does not (see Known limitations) (#163, refs #155).
 - Fee bumping now re-reads live coins and mempool spenders from one snapshot
   before committing a replacement. A replacement whose input is already spent
   by a mempool transaction outside its own replacement lineage, or that is no
@@ -279,37 +284,42 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   message may have been cut short. This applies to normal headers sync and to
   low-work headers sync (presync and redownload). Replies made of ordinary
   headers are unchanged: 2,000 headers per message, byte for byte as before.
-  The serving node must run v1.0.1 for its replies to fit, and a receiving
-  node still in low-work headers sync also needs v1.0.1 to continue past a
-  message cut short for size. Some cases can still stall headers sync between
-  v1.0.1 nodes (see Known limitations). Consensus rules and the protocol
-  version are unchanged (#266, refs #258).
+  The serving node must run v1.0.1 for its replies to fit. A receiving node
+  running v1.0.0 takes a message cut short for size as the end of the peer's
+  headers: during low-work headers sync it does not continue past it, and
+  otherwise it continues only at the next block announcement. Some cases can
+  still stall headers sync between v1.0.1 nodes (see Known limitations).
+  Consensus rules and the protocol version are unchanged (#266, refs #258).
 - The vendored libbitcoinpqc library is updated from v0.3.0 to v0.3.2.
   Generating, importing, or signing with a PQC key previously left copies of
   the secret SLH-DSA seeds, and hashing scratch derived from them, in stack
   memory the library had released. The library's key generation, secret-key
   validation, and signing now wipe those copies and overwrite the stack they
-  used before returning. The library also reports a failed memory allocation
-  during key generation or signing as a distinct out-of-memory error, and
-  signing with a secret key that fails validation as a key error rather than a
-  signature error. qbit treats every library error as a failed operation, as
-  before, so wallet and RPC behavior does not change. Keys and signatures are
-  byte-identical to those produced by v1.0.0, and verification accepts and
-  rejects the same signatures. #268 reports that key generation, secret-key
-  validation, and signing take about 10 to 12% longer and verification about
-  1% longer. Those figures were measured on v0.3.1, whose production code
-  differs from v0.3.2 only in error mapping and in the stack-wipe size of
-  unoptimized builds. Each key generation, validation, or signing call now
-  needs about 17 KiB of free stack (#268, refs #260).
+  used before returning. This does not reach the stack frame of qbit's own HD
+  key derivation (see Known limitations). The library also reports a failed
+  memory allocation during key generation or signing as a distinct
+  out-of-memory error, and signing with a secret key that fails validation as
+  a key error rather than a signature error. qbit treats every library error
+  as a failed operation, as before, so wallet and RPC behavior does not
+  change. Keys and signatures are byte-identical to those produced by v1.0.0,
+  and verification accepts and rejects the same signatures. #268 reports that
+  key generation, secret-key validation, and signing take about 10 to 12%
+  longer and verification about 1% longer. Those figures were measured on
+  v0.3.1, whose production code differs from v0.3.2 only in error mapping and
+  in the stack-wipe size of unoptimized builds. Each key generation,
+  validation, or signing call now needs about 17 KiB of free stack (#268,
+  refs #260).
 
 ### Release engineering, CI, and documentation
 
-- Added a Pages workflow for a versioned RPC documentation site. It builds
-  each immutable, signed non-candidate release from its tag target next to
-  rolling development documentation, verifies the release signer against the
-  release key policy, and requires each build's reported project version to
-  match its tag. Release candidates are not published to the versioned site.
-  The site is not deployed yet (#148).
+- Reworked the Pages workflow that publishes the RPC documentation at
+  docs.qbit.org to build a versioned site. It builds each immutable, signed
+  non-candidate release from its tag target next to rolling development
+  documentation, verifies the release signer against the release key policy,
+  and requires each build's reported project version to match its tag.
+  Release candidates are not published to the versioned site. The versioned
+  site is not deployed yet; docs.qbit.org still serves the documentation
+  deployed by the earlier workflow (#148).
 - The local release publisher fails closed when the paginated release asset
   listing cannot be read, instead of treating an empty or partial listing as
   a valid draft and uploading assets it believed were missing (#170,
@@ -352,7 +362,7 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   top of v0.3.0 is upstream since v0.3.1, so the subtree check no longer
   accepts any downstream change (#268).
 - Stabilized the REST chain-info comparison and Qt shutdown tests (#137,
-  #149).
+  #149, #164).
 
 Release verification
 ====================
@@ -444,10 +454,21 @@ Known limitations
     disconnect an outbound peer during initial block download and stop
     low-work presync at the same height on every retry, even when both nodes
     run v1.0.1.
-- The scheduled-validation source selection (#165) and IBD timeout forwarding
-  (#159) are present on `1.x.x`, but GitHub schedules run the default branch.
-  Their deployment is complete only after the same workflow revisions reach
-  `main` and a scheduled run reports the maintained source (#152, #158).
+- The scheduled-validation source selection (#165), the nightly native-fuzz
+  mutation phase (#164, #165), and IBD timeout forwarding (#159) are present
+  on `1.x.x`, but GitHub schedules run the default branch. Their deployment is
+  complete only after the same workflow revisions reach `main` and a
+  scheduled run reports the maintained source (#152, #158).
+- qbit's own HD key derivation (`DerivePQCKey`) still leaves HD master-seed
+  material and HKDF state on the stack it releases, in its own frame, which
+  the library's stack wipe (#268) does not reach. The stack-wipe unit test
+  checks only for SK_SEED and SK_PRF copies, so its passing `DerivePQCKey`
+  case does not cover this. #270, which clears that frame, is not part of
+  this release (refs #260).
+- When wallet signing falls back to the serial path, for example for a
+  transaction that mixes P2MR and non-P2MR inputs, it re-signs the
+  already-complete P2MR inputs it owns and consumes fresh signature counters.
+  This predates v1.0.1 and is unchanged (#163).
 - The v1.0.1 release readiness inspection (#174) exercised a testnet4 wallet on
   macOS. Linux and Windows desktop notification behavior and a packaged-binary
   smoke check on each supported platform are separate release evidence.
