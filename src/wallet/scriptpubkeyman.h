@@ -447,6 +447,9 @@ private:
     unsigned int GetP2MRReceiveKeyPoolRefillStepTargetNoLock() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
 
     KeyMap GetKeys() const;
+    //! Also returns the encryption state the keys were copied under and the
+    //! encryption key they were decrypted with, so that they agree.
+    KeyMap GetKeys(bool& has_encryption_keys, std::optional<CKeyingMaterial>& encryption_key) const;
 
     // Cached FlatSigningProviders to avoid regenerating them each time they are needed.
     mutable std::map<int32_t, FlatSigningProvider> m_map_signing_providers;

@@ -1131,11 +1131,26 @@ void DescriptorScriptPubKeyMan::ReturnDestination(int64_t index, bool internal, 
 
 std::map<CKeyID, CKey> DescriptorScriptPubKeyMan::GetKeys() const
 {
+    bool has_encryption_keys{false};
+    std::optional<CKeyingMaterial> encryption_key;
+    return GetKeys(has_encryption_keys, encryption_key);
+}
+
+std::map<CKeyID, CKey> DescriptorScriptPubKeyMan::GetKeys(bool& has_encryption_keys, std::optional<CKeyingMaterial>& encryption_key) const
+{
     KeyMap keys;
     CryptedKeyMap crypted_keys;
-    // Read under cs_desc_man, which EncryptWallet holds while it adds the first master key.
-    const bool has_encryption_keys = WITH_LOCK(cs_desc_man, return m_storage.HasEncryptionKeys());
-    std::optional<CKeyingMaterial> encryption_key;
+    {
+        // EncryptWallet holds cs_desc_man while it adds the first master key
+        // and encrypts the keys, so the state and the copy agree.
+        LOCK(cs_desc_man);
+        has_encryption_keys = m_storage.HasEncryptionKeys();
+        keys = m_map_keys;
+        if (has_encryption_keys) {
+            crypted_keys = m_map_crypted_keys;
+        }
+    }
+    encryption_key.reset();
     if (has_encryption_keys) {
         m_storage.WithEncryptionKey([&](const CKeyingMaterial& key) {
             if (!key.empty()) {
@@ -1143,13 +1158,6 @@ std::map<CKeyID, CKey> DescriptorScriptPubKeyMan::GetKeys() const
             }
             return true;
         });
-    }
-    {
-        LOCK(cs_desc_man);
-        keys = m_map_keys;
-        if (has_encryption_keys) {
-            crypted_keys = m_map_crypted_keys;
-        }
     }
 
     if (has_encryption_keys && !crypted_keys.empty()) {
@@ -1219,16 +1227,9 @@ DescriptorScriptPubKeyMan::TopUpPreparation DescriptorScriptPubKeyMan::PrepareTo
     AssertLockNotHeld(cs_desc_man);
     TopUpPreparation prepared;
     prepared.spkman_is_internal = internal_hint.has_value() ? internal_hint : m_storage.IsInternalScriptPubKeyMan(this);
-    prepared.provider.keys = GetKeys();
-    prepared.has_encryption_keys = WITH_LOCK(cs_desc_man, return m_storage.HasEncryptionKeys());
-    if (prepared.has_encryption_keys) {
-        m_storage.WithEncryptionKey([&](const CKeyingMaterial& key) {
-            if (!key.empty()) {
-                prepared.encryption_key = key;
-            }
-            return true;
-        });
-    }
+    // Take the keys, the encryption state and the encryption key together, so
+    // that CheckTopUpPreparation's check of the state also covers the keys.
+    prepared.provider.keys = GetKeys(prepared.has_encryption_keys, prepared.encryption_key);
     return prepared;
 }
 

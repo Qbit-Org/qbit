@@ -249,7 +249,9 @@ BOOST_FIXTURE_TEST_CASE(EncryptWalletAndBackgroundTopUpBothFinish, RegtestP2MROn
     change->m_after_prepare_top_up = [&] { top_up_prepared.Pass(); };
     wallet->m_after_encrypt_wallet_txn_begin = [&] { encrypt_txn_open.Pass(); };
 
-    auto top_up{std::async(std::launch::async, [&] { return change->TopUpWithInternalHintResult(/*internal_hint=*/true, target); })};
+    // MSVC's std::future needs an assignable result type, which util::Result
+    // is not, so the thread returns whether the top-up succeeded.
+    auto top_up{std::async(std::launch::async, [&] { return change->TopUpWithInternalHintResult(/*internal_hint=*/true, target).has_value(); })};
     const ReleaseOnExit release_top_up{top_up_prepared};
     top_up_prepared.WaitUntilReached("the top-up to take its snapshot");
     auto encrypt{std::async(std::launch::async, [&] { return wallet->EncryptWallet("passphrase"); })};
@@ -271,8 +273,7 @@ BOOST_FIXTURE_TEST_CASE(EncryptWalletAndBackgroundTopUpBothFinish, RegtestP2MROn
     BOOST_CHECK(wallet->IsCrypted());
     BOOST_CHECK(wallet->IsLocked());
     // The encryption committed first, so the top-up's snapshot is out of date.
-    const util::Result<void> top_up_result{top_up.get()};
-    BOOST_CHECK(!top_up_result);
+    BOOST_CHECK(!top_up.get());
     BOOST_CHECK_EQUAL(CountDatabaseRecords(*wallet, DBKeys::WALLETDESCRIPTORPQCKEY), 0U);
 
     TestUnloadWallet(std::move(wallet));
@@ -295,7 +296,7 @@ BOOST_FIXTURE_TEST_CASE(StaleTopUpSnapshotDoesNotWritePlaintextKeys, RegtestP2MR
 
     ParkingPoint top_up_prepared;
     change->m_after_prepare_top_up = [&] { top_up_prepared.Pass(); };
-    auto top_up{std::async(std::launch::async, [&] { return change->TopUpWithInternalHintResult(/*internal_hint=*/true, target); })};
+    auto top_up{std::async(std::launch::async, [&] { return change->TopUpWithInternalHintResult(/*internal_hint=*/true, target).has_value(); })};
     const ReleaseOnExit release_top_up{top_up_prepared};
     top_up_prepared.WaitUntilReached("the top-up to take its snapshot");
 
@@ -308,8 +309,7 @@ BOOST_FIXTURE_TEST_CASE(StaleTopUpSnapshotDoesNotWritePlaintextKeys, RegtestP2MR
     top_up_prepared.Release();
     WaitOrExit(top_up, "the top-up");
     change->m_after_prepare_top_up = {};
-    const util::Result<void> top_up_result{top_up.get()};
-    BOOST_CHECK(!top_up_result);
+    BOOST_CHECK(!top_up.get());
     BOOST_CHECK_EQUAL(change->GetKeyPoolSize(), keypool_size);
     BOOST_CHECK_EQUAL(CountDatabaseRecords(*wallet, DBKeys::WALLETDESCRIPTORPQCKEY), 0U);
 
