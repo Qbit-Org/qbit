@@ -15,6 +15,7 @@
 #include <wallet/wallet.h>
 #include <wallet/walletdb.h>
 
+#include <algorithm>
 #include <memory>
 
 namespace wallet {
@@ -192,6 +193,9 @@ bool MockableBatch::EraseKey(DataStream&& key)
         return false;
     }
     SerializeData key_data{key.begin(), key.end()};
+    if (const auto& prefix{m_database.m_erase_fail_prefix}; prefix && key_data.size() >= prefix->size() && std::equal(prefix->begin(), prefix->end(), key_data.begin())) {
+        return false;
+    }
     m_database.m_records.erase(key_data);
     return true;
 }

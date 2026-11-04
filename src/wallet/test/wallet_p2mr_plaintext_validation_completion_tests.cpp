@@ -45,6 +45,35 @@ BOOST_FIXTURE_TEST_CASE(PendingPlaintextPQCValidationCompletesWithOtherCryptedPQ
 
     const auto pqc_keys{spk_man.GetPQCKeys()};
     BOOST_CHECK_EQUAL(pqc_keys.size(), 2U);
+    BOOST_CHECK(!info.reencryption_required);
+    BOOST_CHECK(spk_man.GetSigningProvider(plaintext_pubkey));
+}
+
+BOOST_FIXTURE_TEST_CASE(PendingPlaintextPQCValidationIsNotAdoptedInEncryptedWallet, TestingSetup)
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    wallet.mapMasterKeys[1] = CMasterKey{};
+    DescriptorScriptPubKeyMan spk_man{wallet, SINGLE_ADDRESS_KEYPOOL_SIZE};
+
+    CPQCKey plaintext_key;
+    plaintext_key.MakeNewKey();
+    BOOST_REQUIRE(plaintext_key.IsValid());
+    const CPQCPubKey plaintext_pubkey{plaintext_key.GetPubKey()};
+    const CKeyingMaterial plaintext_secret{plaintext_key.data(), plaintext_key.data() + plaintext_key.size()};
+
+    BOOST_REQUIRE(spk_man.AddPendingPlaintextPQCKey(plaintext_pubkey, plaintext_secret, /*sig_counter=*/7));
+    BOOST_REQUIRE(spk_man.CompletePendingPlaintextPQCKeyValidation(plaintext_pubkey, plaintext_key, /*sig_counter=*/7));
+
+    // The key is validated but kept out of signing until it is re-encrypted.
+    const PQCKeyValidationInfo info{spk_man.GetPQCKeyValidationInfo()};
+    BOOST_CHECK(info.status == PQCKeyValidationStatus::COMPLETE);
+    BOOST_CHECK_EQUAL(info.plaintext_records, 1U);
+    BOOST_CHECK_EQUAL(info.validated_records, 1U);
+    BOOST_CHECK(info.reencryption_required);
+    BOOST_CHECK(info.signing_blocked);
+    BOOST_CHECK(!spk_man.GetSigningProvider(plaintext_pubkey));
+    BOOST_CHECK_EQUAL(*spk_man.GetPQCSignatureCounter(plaintext_pubkey), 7U);
+    BOOST_CHECK(WITH_LOCK(spk_man.cs_desc_man, return spk_man.HasPQCKeysToReencrypt()));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

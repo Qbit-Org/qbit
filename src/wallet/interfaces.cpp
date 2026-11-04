@@ -147,6 +147,9 @@ std::optional<bilingual_str> GetPQCKeyValidationSigningError(const CWallet& wall
     if (pqc_validation.failed_records > 0) {
         return Untranslated("Plaintext PQC wallet key validation failed. Wallet signing is disabled until the wallet is restored or repaired.");
     }
+    if (pqc_validation.reencryption_required) {
+        return Untranslated("This encrypted wallet still stores PQC private keys unencrypted, so signing is disabled. Unlocking the wallet re-encrypts them: unlock it again, and if this persists check the debug log and getwalletinfo.pqc_key_validation.");
+    }
     return std::nullopt;
 }
 
@@ -173,6 +176,7 @@ public:
         if (!m_wallet->Unlock(wallet_passphrase, /*run_pending_initial_keypool_top_up=*/false)) {
             return false;
         }
+        m_wallet->ReencryptPlaintextPQCKeys();
         MaybeSchedulePendingInitialKeyPoolTopUp(m_context, m_wallet);
         return true;
     }

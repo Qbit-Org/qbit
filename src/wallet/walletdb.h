@@ -257,6 +257,7 @@ public:
     bool WriteDescriptorKey(const uint256& desc_id, const CPubKey& pubkey, const CPrivKey& privkey);
     bool WriteCryptedDescriptorKey(const uint256& desc_id, const CPubKey& pubkey, const std::vector<unsigned char>& secret);
     bool WriteDescriptorPQCKey(const uint256& desc_id, const CPQCPubKey& pubkey, const CPQCKey& privkey, uint32_t sig_counter = 0);
+    //! Also erases the plaintext record of the key, and fails if that fails.
     bool WriteCryptedDescriptorPQCKey(const uint256& desc_id, const CPQCPubKey& pubkey, const std::vector<unsigned char>& secret, uint32_t sig_counter = 0, const uint256* auth_tag = nullptr);
     bool WriteDescriptor(const uint256& desc_id, const WalletDescriptor& descriptor);
     bool HasDescriptor(const uint256& desc_id);

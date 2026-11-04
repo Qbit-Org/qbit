@@ -93,6 +93,15 @@ RPCHelpMan walletpassphrase()
         relock_time = pwallet->nRelockTime;
     }
 
+    // Replace plaintext PQC key records left by older versions. This needs
+    // cs_wallet released, and runs before the relock below is scheduled. A
+    // failure must not leave the wallet unlocked without that relock.
+    try {
+        pwallet->ReencryptPlaintextPQCKeys();
+    } catch (const std::exception& e) {
+        pwallet->WalletLogPrintf("Warning: re-encrypting plaintext PQC key records failed: %s\n", e.what());
+    }
+
     WalletContext& context = EnsureWalletContext(request.context);
     // m_relock_mutex is still held, so the wallet cannot be relocked before
     // the non-P2MR top-up finishes. A background P2MR step that starts after
