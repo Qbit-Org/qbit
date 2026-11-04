@@ -1,0 +1,101 @@
+macOS: Don't let native a11y elements delete accessible interfaces
+
+Backported from:
+https://github.com/qt/qtbase/commit/8148c48deb8e4345bacb797cb75c011df6f797fa
+
+Fixes: https://qt-project.atlassian.net/browse/QTBUG-149612
+
+The fix is not part of Qt 6.8.4, which does include the commit it amends,
+b1ed5f656f064e553b33752f8e87d2f5b9553e38 (QTBUG-134784). The test changes
+are omitted.
+
+    QMacAccessibilityElement::invalidate() and dealloc() used to delete the
+    QAccessibleInterfaces behind table rows, columns and cells. Those
+    interfaces are owned by QAccessibleCache and by the item view:
+    QAccessibleTable caches the interfaces of its cells and resolves them
+    again after model changes and whenever a client asks for the selection.
+    Deleting them behind the table's back left that cache with dangling
+    entries, so the next accessibility call could read freed memory, and
+    when the cache lookup came up empty the selection was silently reported
+    as empty.
+
+    Amend b1ed5f656f064e553b33752f8e87d2f5b9553e38 by not deleting
+    interfaces when a native element goes away. The accessibility cache
+    already removes an interface when its QObject is destroyed, and
+    QAccessibleTable deletes the synthetic cell interfaces it owns, so
+    native elements can be invalidated and destroyed independently of the
+    interfaces they represent.
+
+Can be dropped once Qt is updated to a version that includes the fix.
+
+
+--- a/qtbase/src/plugins/platforms/cocoa/qcocoaaccessibilityelement.h
++++ b/qtbase/src/plugins/platforms/cocoa/qcocoaaccessibilityelement.h
+@@ -16,7 +16,6 @@ QT_DECLARE_NAMESPACED_OBJC_INTERFACE(QMacAccessibilityElement, NSObject <NSAcces
+ - (instancetype)initWithId:(QAccessible::Id)anId role:(NSAccessibilityRole)role;
+ + (instancetype)elementWithId:(QAccessible::Id)anId;
+ + (instancetype)elementWithInterface:(QAccessibleInterface *)iface;
+-+ (void)removeElementsFromCache:(NSArray *)array;
+ - (void)updateTableModel;
+ - (QAccessibleInterface *)qtInterface;
+ )
+--- a/qtbase/src/plugins/platforms/cocoa/qcocoaaccessibilityelement.mm
++++ b/qtbase/src/plugins/platforms/cocoa/qcocoaaccessibilityelement.mm
+@@ -219,25 +219,14 @@ + (instancetype)elementWithInterface:(QAccessibleInterface *)iface
+     return [self elementWithId:anId];
+ }
+
+-+ (void)removeElementsFromCache:(NSArray *)array {
+-    for (uint i = 0; i < array.count; ++i) {
+-        QMacAccessibilityElement *cell = [array objectAtIndex:i];
+-        if (cell->axid) { // it's a proper cell, remove from cache
+-            QAccessibleCache::instance()->deleteInterface(cell->axid);
+-        }
+-    }
+-}
+-
+ // called by QAccessibleCache::removeAccessibleElement, which also releases
+ - (void)invalidate {
+     axid = 0;
+     if (rows) {
+-        [QMacAccessibilityElement removeElementsFromCache:rows];
+         [rows autorelease];
+         rows = nil;
+     }
+     if (columns) {
+-        [QMacAccessibilityElement removeElementsFromCache:columns];
+         [columns autorelease];
+         columns = nil;
+     }
+@@ -246,27 +235,13 @@ - (void)invalidate {
+     NSAccessibilityPostNotification(self, NSAccessibilityUIElementDestroyedNotification);
+ }
+
+-/*!
+-    \internal
+-
+-    If this element represents a table, then the rows and columns array are both
+-    populated with elements representing the rows and columns. If this elements
+-    represents a row, then the columns array is populated with elements
+-    representing the cells. Not all of those synthesized elements might be in
+-    the cache, but those that are need to be removed so that we don't end up
+-    with stale representations of children when the higher-level element
+-    expires.
+-*/
++// The view and accessibility cache own the interfaces. Native element teardown
++// must not delete interfaces that the table still references.
+ - (void)dealloc {
+-    if (rows) {
+-        [QMacAccessibilityElement removeElementsFromCache:rows];
++    if (rows)
+         [rows release]; // will also release all entries first
+-    }
+-    if (columns) {
+-        [QMacAccessibilityElement removeElementsFromCache:columns];
++    if (columns)
+         [columns release]; // will also release all entries first
+-    }
+-    QAccessibleCache::instance()->deleteInterface(axid);
+     [super dealloc];
+ }
+
