@@ -3844,7 +3844,9 @@ PQCKeyValidationInfo CWallet::GetPQCKeyValidationInfo() const
         }
     }
 
-    info.signing_blocked = info.pending_records > 0 || info.failed_records > 0;
+    // Pending and failed records count too: they are plaintext on disk.
+    info.reencryption_required = encrypted && info.plaintext_records > 0;
+    info.signing_blocked = info.pending_records > 0 || info.failed_records > 0 || info.reencryption_required;
     info.encryption_recommended = !encrypted && info.plaintext_records > 0 && info.failed_records == 0;
     if (info.failed_records > 0) {
         info.status = PQCKeyValidationStatus::FAILED;
@@ -3905,8 +3907,128 @@ CWallet::PlaintextPQCKeyValidationStepResult CWallet::RunPlaintextPQCKeyValidati
     NotifyStatusChanged(this);
 
     if (info.pending_records > 0) return PlaintextPQCKeyValidationStepResult::IN_PROGRESS;
+    // Keys validated after the last unlock are re-encrypted now if the wallet
+    // is still unlocked, and otherwise at the next unlock.
+    ReencryptPlaintextPQCKeys();
     return info.failed_records > 0 ? PlaintextPQCKeyValidationStepResult::FAILED
                                    : PlaintextPQCKeyValidationStepResult::COMPLETE;
+}
+
+bool CWallet::HasPQCKeyReencryptionWork() const
+{
+    AssertLockHeld(cs_wallet);
+    for (const auto& [_, spk_man] : m_spk_managers) {
+        const auto* desc_spk_man{dynamic_cast<const DescriptorScriptPubKeyMan*>(spk_man.get())};
+        if (desc_spk_man && WITH_LOCK(desc_spk_man->cs_desc_man, return desc_spk_man->HasPQCKeysToReencrypt())) return true;
+    }
+    return false;
+}
+
+bool CWallet::ReencryptPlaintextPQCKeys()
+{
+    AssertLockNotHeld(cs_wallet);
+    if (!IsCrypted()) return true;
+    {
+        LOCK(cs_wallet);
+        if (!HasPQCKeyReencryptionWork()) return true;
+        if (vMasterKey.empty()) return false;
+    }
+    if (m_before_reencrypt_pqc_keys_locks) m_before_reencrypt_pqc_keys_locks();
+
+    bool success{false};
+    {
+        // Same protocol as Lock(). A signer may hold a descriptor lock while it
+        // waits for cs_wallet, so wait for active signers before taking
+        // cs_wallet and then every descriptor lock. Holding m_relock_mutex
+        // keeps walletlock and timed relocks out until the work is done.
+        LOCK(m_relock_mutex);
+        BlockAndWaitForActiveSigningProviderSnapshots();
+        const struct SigningUnblocker {
+            const CWallet& wallet;
+            ~SigningUnblocker() { wallet.UnblockActiveSigningProviderSnapshots(); }
+        } signing_unblocker{*this};
+
+        LOCK(cs_wallet);
+        if (vMasterKey.empty()) {
+            // Relocked since the check above. Re-encryption needs the master key.
+            WalletLogPrintf("Wallet was locked before its plaintext PQC keys could be re-encrypted; the next unlock retries\n");
+            return false;
+        }
+
+        // Background top-ups hold their manager's lock while they wait for the
+        // database writer, so take every descriptor lock before the
+        // transaction begins. UniqueLock cannot be moved, so the locks are
+        // constructed in place in a list.
+        std::vector<DescriptorScriptPubKeyMan*> desc_spk_mans;
+        std::forward_list<UniqueLock<RecursiveMutex>> desc_spk_man_locks;
+        for (const auto& [_, spk_man] : m_spk_managers) {
+            auto* desc_spk_man{dynamic_cast<DescriptorScriptPubKeyMan*>(spk_man.get())};
+            if (!desc_spk_man) continue;
+            desc_spk_mans.push_back(desc_spk_man);
+            desc_spk_man_locks.emplace_front(desc_spk_man->cs_desc_man, "desc_spk_man->cs_desc_man", __FILE__, __LINE__);
+        }
+
+        bool reencrypt{false};
+        for (DescriptorScriptPubKeyMan* desc_spk_man : desc_spk_mans) {
+            AssertDescriptorLockHeld(desc_spk_man);
+            reencrypt |= desc_spk_man->HasPQCKeysToReencrypt();
+        }
+
+        bool reencrypted{!reencrypt};
+        if (reencrypt) {
+            WalletBatch batch(GetDatabase());
+            std::string error;
+            std::vector<std::pair<DescriptorScriptPubKeyMan*, std::vector<ReencryptedPQCKey>>> updates;
+            size_t num_records{0};
+            if (!batch.TxnBegin()) {
+                error = "cannot begin a database transaction";
+            } else {
+                if (m_after_reencrypt_pqc_keys_txn_begin) m_after_reencrypt_pqc_keys_txn_begin();
+                // This transaction deletes plaintext key records, so the file
+                // needs a rewrite after it. See RewriteAfterEncryption.
+                if (!batch.ErasePostEncryptionRewrite()) {
+                    error = "cannot erase the post-encryption rewrite record";
+                }
+                for (DescriptorScriptPubKeyMan* desc_spk_man : desc_spk_mans) {
+                    if (!error.empty()) break;
+                    AssertDescriptorLockHeld(desc_spk_man);
+                    auto res{desc_spk_man->WriteReencryptedPQCKeys(batch, vMasterKey)};
+                    if (!res) {
+                        error = strprintf("descriptor %s: %s", desc_spk_man->GetID().ToString(), util::ErrorString(res).original);
+                        break;
+                    }
+                    num_records += res->size();
+                    if (!res->empty()) updates.emplace_back(desc_spk_man, std::move(*res));
+                }
+                if (error.empty() && !batch.TxnCommit()) {
+                    error = "cannot commit the database transaction";
+                }
+                if (!error.empty()) batch.TxnAbort();
+            }
+
+            if (error.empty()) {
+                // The records are crypted on disk; only now change the maps.
+                for (auto& [desc_spk_man, keys] : updates) {
+                    AssertDescriptorLockHeld(desc_spk_man);
+                    desc_spk_man->ApplyReencryptedPQCKeys(keys);
+                }
+                reencrypted = true;
+                WalletLogPrintf("Re-encrypted %u plaintext PQC key records\n", num_records);
+            } else {
+                WalletLogPrintf("Warning: re-encrypting plaintext PQC key records failed (%s). "
+                                "No record was changed; signing with PQC keys stays disabled and the next unlock retries.\n", error);
+            }
+        }
+
+        // The old records stay in the file's free space until it is
+        // rewritten. Keep the descriptor locks so that no top-up holds a
+        // transaction open meanwhile. If the process stops first or the
+        // rewrite fails, the wallet is rewritten at its next load or backup.
+        const bool rewritten{!reencrypt || !reencrypted || RewriteAfterEncryption()};
+        success = reencrypted && rewritten;
+    }
+    NotifyStatusChanged(this);
+    return success;
 }
 
 bool CWallet::IsPQCKeyValidationReadyForPrivateKeyUse() const

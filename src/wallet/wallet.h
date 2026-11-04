@@ -391,6 +391,8 @@ private:
     bool Unlock(const CKeyingMaterial& vMasterKeyIn);
     void ClearMasterKey() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
+    bool HasPQCKeyReencryptionWork() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+
     std::atomic<bool> fAbortRescan{false};
     std::atomic<bool> fScanningWallet{false}; // controlled by WalletRescanReserver
     std::atomic<bool> m_scanning_with_passphrase{false};
@@ -717,6 +719,20 @@ public:
     bool m_plaintext_pqc_key_validation_running GUARDED_BY(cs_wallet){false};
 
     bool Unlock(const SecureString& strWalletPassphrase, bool run_pending_initial_keypool_top_up = true);
+    /**
+     * Replace the plaintext PQC key records of an encrypted, unlocked wallet
+     * with crypted ones in one transaction, then rewrite the database file
+     * with RewriteAfterEncryption.
+     * User-initiated unlocks call this once the unlock has returned, and so
+     * does plaintext key validation when it finishes. It does nothing, and
+     * takes no lock beyond a brief state read, when there is nothing to do.
+     * Like Lock(), it waits for active signers before it takes cs_wallet.
+     * Returns false if the wallet was locked or a step failed. If the
+     * re-encryption failed, the records stay reported and refused and the
+     * next call retries; if only the rewrite failed, the next load or backup
+     * retries it.
+     */
+    bool ReencryptPlaintextPQCKeys() LOCKS_EXCLUDED(cs_wallet);
     bool ChangeWalletPassphrase(const SecureString& strOldWalletPassphrase, const SecureString& strNewWalletPassphrase);
     /**
      * Encrypt the wallet, then replace its active descriptors with ones from a
@@ -910,6 +926,12 @@ public:
     // transaction has committed and before it rewrites the database. Same
     // configuration rules as m_before_script_pub_key_cache_publish.
     std::function<void()> m_after_encrypt_wallet_commit;
+    // Optional deterministic test hooks invoked by ReencryptPlaintextPQCKeys
+    // once it has found work and before it waits for signers, and once its
+    // database transaction has begun.
+    // Same configuration rules as m_before_script_pub_key_cache_publish.
+    std::function<void()> m_before_reencrypt_pqc_keys_locks;
+    std::function<void()> m_after_reencrypt_pqc_keys_txn_begin;
     // Optional deterministic test hook invoked by send and sendall after they
     // sign a transaction and before they commit it. send holds no wallet lock
     // there; sendall holds cs_wallet. Same configuration rules as

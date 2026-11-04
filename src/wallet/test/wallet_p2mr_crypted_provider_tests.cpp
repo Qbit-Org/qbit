@@ -45,6 +45,10 @@ BOOST_AUTO_TEST_CASE(CryptedPQCSigningProviderIgnoresFailedStalePlaintextKey)
     BOOST_CHECK_EQUAL(blocked_descriptor_provider->pqc_keys.count(pubkeys.pqc_pubkey), 0U);
 
     BOOST_REQUIRE(p2mr_spk_man->CompletePendingPlaintextPQCKeyValidation(pubkeys.pqc_pubkey, crypted_private_key, crypted_sig_counter));
+    // The validated duplicate is a plaintext record in an encrypted wallet:
+    // the key stays refused until re-encryption keeps its crypted record.
+    BOOST_CHECK(!p2mr_spk_man->GetSigningProvider(pubkeys.pqc_pubkey));
+    BOOST_REQUIRE(wallet->ReencryptPlaintextPQCKeys());
 
     CPQCKey stale_key;
     stale_key.MakeNewKey();
@@ -99,10 +103,13 @@ BOOST_AUTO_TEST_CASE(MixedCryptedAndValidatedPlaintextPQCKeysRemainUnlockable)
     BOOST_REQUIRE(p2mr_spk_man->AddPendingPlaintextPQCKey(plaintext_pubkey, plaintext_secret, /*sig_counter=*/7));
     BOOST_REQUIRE(p2mr_spk_man->CompletePendingPlaintextPQCKeyValidation(plaintext_pubkey, plaintext_key, /*sig_counter=*/7));
 
-    const PQCKeyValidationInfo info{p2mr_spk_man->GetPQCKeyValidationInfo()};
+    // An encrypted wallet keeps a validated plaintext key out of signing
+    // until it is re-encrypted.
+    PQCKeyValidationInfo info{p2mr_spk_man->GetPQCKeyValidationInfo()};
     BOOST_CHECK(info.status == PQCKeyValidationStatus::COMPLETE);
     BOOST_CHECK_EQUAL(info.validated_records, 1U);
-    BOOST_CHECK(!info.signing_blocked);
+    BOOST_CHECK(info.reencryption_required);
+    BOOST_CHECK(info.signing_blocked);
 
     CScript p2mr_script;
     {
@@ -127,10 +134,24 @@ BOOST_AUTO_TEST_CASE(MixedCryptedAndValidatedPlaintextPQCKeysRemainUnlockable)
     BOOST_CHECK(!locked_tx_provider->GetPQCKey(plaintext_pubkey, provider_key));
 
     BOOST_REQUIRE(wallet->Unlock(passphrase));
+    BOOST_CHECK(!p2mr_spk_man->GetSigningProvider(plaintext_pubkey));
+    auto refused_tx_provider = p2mr_spk_man->GetSigningProviderForTransaction(coins);
+    BOOST_REQUIRE(refused_tx_provider);
+    BOOST_CHECK(!refused_tx_provider->GetPQCKey(plaintext_pubkey, provider_key));
+
+    BOOST_REQUIRE(wallet->ReencryptPlaintextPQCKeys());
+    info = p2mr_spk_man->GetPQCKeyValidationInfo();
+    BOOST_CHECK(info.status == PQCKeyValidationStatus::NOT_REQUIRED);
+    BOOST_CHECK(!info.signing_blocked);
+    BOOST_CHECK_EQUAL(*p2mr_spk_man->GetPQCSignatureCounter(plaintext_pubkey), 7U);
     BOOST_CHECK(p2mr_spk_man->GetSigningProvider(plaintext_pubkey));
     auto unlocked_tx_provider = p2mr_spk_man->GetSigningProviderForTransaction(coins);
     BOOST_REQUIRE(unlocked_tx_provider);
     BOOST_CHECK(unlocked_tx_provider->GetPQCKey(plaintext_pubkey, provider_key));
+
+    BOOST_REQUIRE(wallet->Lock());
+    BOOST_REQUIRE(wallet->Unlock(passphrase));
+    BOOST_CHECK(p2mr_spk_man->GetSigningProvider(plaintext_pubkey));
 }
 
 BOOST_AUTO_TEST_CASE(SignTransactionFreesDecryptedProvidersBeforeLockReturns)

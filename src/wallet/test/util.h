@@ -111,6 +111,9 @@ public:
     bool m_txn_abort_pass{true};
     bool m_wallet_flags_write_pass{true};
     bool m_rewrite_pass{true};
+    //! Erasing a key that starts with this prefix fails, without aborting an
+    //! open transaction.
+    std::optional<SerializeData> m_erase_fail_prefix;
     //! Runs after a successful mock commit becomes durable, or immediately
     //! before a failed commit returns, while WalletBatch listeners are COMMITTING.
     std::function<void(bool)> m_txn_commit_result_hook;
