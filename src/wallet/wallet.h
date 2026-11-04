@@ -651,6 +651,8 @@ public:
     bool IsTxImmatureCoinBase(const CWalletTx& wtx) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     bool IsSpent(const COutPoint& outpoint) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    //! Wallet transactions that spend outpoint, by the definition IsSpent() uses
+    std::set<Txid> GetSpendingTxs(const COutPoint& outpoint) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     // Whether this or any known scriptPubKey with the same single key has been spent.
     bool IsSpentKey(const CScript& scriptPubKey) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
@@ -866,6 +868,11 @@ public:
     // database transaction has begun. Same configuration rules as
     // m_before_script_pub_key_cache_publish.
     std::function<void()> m_after_encrypt_wallet_txn_begin;
+    // Optional deterministic test hook invoked by send and sendall after they
+    // sign a transaction and before they commit it. send holds no wallet lock
+    // there; sendall holds cs_wallet. Same configuration rules as
+    // m_before_script_pub_key_cache_publish.
+    std::function<void()> m_before_send_commit;
     bool m_deferred_create_keypool_top_up_scheduled GUARDED_BY(cs_wallet){false};
     bool m_deferred_create_keypool_top_up_reschedule_requested GUARDED_BY(cs_wallet){false};
     bool m_p2mr_receive_keypool_refill_scheduled GUARDED_BY(cs_wallet){false};

@@ -1097,6 +1097,12 @@ void CWallet::SyncMetaData(std::pair<TxSpends::iterator, TxSpends::iterator> ran
     }
 }
 
+//! Whether wtx spends its inputs: abandoned and conflicted transactions do not.
+static bool SpendsInputs(const CWalletTx& wtx)
+{
+    return !wtx.isAbandoned() && !wtx.isBlockConflicted() && !wtx.isMempoolConflicted();
+}
+
 /**
  * Outpoint is spent if any non-conflicted transaction
  * spends it:
@@ -1110,12 +1116,25 @@ bool CWallet::IsSpent(const COutPoint& outpoint) const
         const Txid& txid = it->second;
         const auto mit = mapWallet.find(txid);
         if (mit != mapWallet.end()) {
-            const auto& wtx = mit->second;
-            if (!wtx.isAbandoned() && !wtx.isBlockConflicted() && !wtx.isMempoolConflicted())
+            if (SpendsInputs(mit->second))
                 return true; // Spent
         }
     }
     return false;
+}
+
+std::set<Txid> CWallet::GetSpendingTxs(const COutPoint& outpoint) const
+{
+    AssertLockHeld(cs_wallet);
+    std::set<Txid> spenders;
+    const auto range{mapTxSpends.equal_range(outpoint)};
+    for (auto it{range.first}; it != range.second; ++it) {
+        const auto mit{mapWallet.find(it->second)};
+        if (mit != mapWallet.end() && SpendsInputs(mit->second)) {
+            spenders.insert(it->second);
+        }
+    }
+    return spenders;
 }
 
 void CWallet::AddToSpends(const COutPoint& outpoint, const Txid& txid)
