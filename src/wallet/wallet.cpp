@@ -3926,12 +3926,33 @@ bool CWallet::HasPQCKeyReencryptionWork() const
 
 bool CWallet::ReencryptPlaintextPQCKeys()
 {
+    // Callers run on the GUI thread, the scheduler thread or an RPC that must
+    // still schedule its relock, so a failure is logged, not thrown.
+    try {
+        return ReencryptPlaintextPQCKeysOrThrow();
+    } catch (const std::exception& e) {
+        WalletLogPrintf("Warning: re-encrypting plaintext PQC key records failed: %s\n", e.what());
+        return false;
+    }
+}
+
+bool CWallet::ReencryptPlaintextPQCKeysOrThrow()
+{
     AssertLockNotHeld(cs_wallet);
     if (!IsCrypted()) return true;
+    // Only a crypted key that decrypted at unlock shows that the master key
+    // is the wallet's. Without one, a wrong passphrase can unlock the wallet,
+    // and re-encrypting under it would lose the keys for good.
+    const auto master_key_unverified{[&]() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) {
+        if (HaveCryptedKeys()) return false;
+        WalletLogPrintf("Warning: not re-encrypting plaintext PQC key records, because no encrypted key in this wallet confirms its passphrase. "
+                        "They stay unencrypted and signing with PQC keys stays disabled.\n");
+        return true;
+    }};
     {
         LOCK(cs_wallet);
         if (!HasPQCKeyReencryptionWork()) return true;
-        if (vMasterKey.empty()) return false;
+        if (vMasterKey.empty() || master_key_unverified()) return false;
     }
     if (m_before_reencrypt_pqc_keys_locks) m_before_reencrypt_pqc_keys_locks();
 
@@ -3973,6 +3994,7 @@ bool CWallet::ReencryptPlaintextPQCKeys()
             AssertDescriptorLockHeld(desc_spk_man);
             reencrypt |= desc_spk_man->HasPQCKeysToReencrypt();
         }
+        if (reencrypt && master_key_unverified()) return false;
 
         bool reencrypted{!reencrypt};
         if (reencrypt) {

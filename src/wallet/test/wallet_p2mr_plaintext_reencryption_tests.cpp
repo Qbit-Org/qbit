@@ -263,6 +263,8 @@ BOOST_AUTO_TEST_CASE(EncryptedWalletReportsAndRefusesPlaintextPQCKeys)
     BOOST_CHECK(info.status == PQCKeyValidationStatus::PENDING);
     BOOST_CHECK_EQUAL(info.pending_records, 3U);
     CheckReported(*wallet, 3);
+    // Usage already reports the higher counter of a key's records.
+    BOOST_CHECK_EQUAL(*GetDescriptor(*wallet, desc_id).GetPQCSignatureCounter(keys.at(1).pubkey), 5U);
     // The load rewrote the file, but the plaintext records are still live.
     BOOST_CHECK_EQUAL(GetMockableDatabase(*wallet).m_rewrite_count, 1);
     BOOST_CHECK(HasRewriteRecord(GetMockableDatabase(*wallet).m_records));
@@ -343,6 +345,92 @@ BOOST_AUTO_TEST_CASE(UnlockReencryptsPlaintextPQCKeysAtTheHigherCounter)
     BOOST_CHECK(Sign(*reloaded, keys.at(0).script));
     BOOST_CHECK_EQUAL(*CryptedRecordCounter(GetMockableDatabase(*reloaded).m_records, desc_id, keys.at(0).pubkey), 4U);
     BOOST_CHECK_EQUAL(CountPlaintextPQCRecords(GetMockableDatabase(*reloaded).m_records), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(ReencryptionErrorDoesNotEscapeUnlockOrValidation)
+{
+    auto wallet{Load(AffectedRecords())};
+    wallet->m_before_reencrypt_pqc_keys_locks = [] { throw std::runtime_error{"injected re-encryption failure"}; };
+
+    // Validation can finish on the scheduler thread, which an exception would stop.
+    BOOST_REQUIRE(wallet->Unlock(PASSPHRASE, /*run_pending_initial_keypool_top_up=*/false));
+    BOOST_CHECK_NO_THROW(FinishValidation(*wallet));
+    CheckReported(*wallet, 3);
+    BOOST_REQUIRE(wallet->Lock());
+
+    // The GUI unlock still unlocks; the records stay reported and refused.
+    auto wallet_interface{interfaces::MakeWallet(context, wallet)};
+    bool unlocked{false};
+    BOOST_CHECK_NO_THROW(unlocked = wallet_interface->unlock(PASSPHRASE));
+    BOOST_CHECK(unlocked);
+    BOOST_CHECK(!wallet->IsLocked());
+    CheckReported(*wallet, 3);
+    BOOST_CHECK_EQUAL(CountPlaintextPQCRecords(GetMockableDatabase(*wallet).m_records), 3U);
+
+    wallet->m_before_reencrypt_pqc_keys_locks = nullptr;
+    BOOST_REQUIRE(wallet_interface->unlock(PASSPHRASE));
+    CheckNotReported(*wallet);
+}
+
+BOOST_AUTO_TEST_CASE(NoReencryptionWithoutACryptedKeyToVerifyThePassphrase)
+{
+    // Without any crypted key, unlocking cannot tell a wrong master key from
+    // the right one, so the plaintext records must stay as they are.
+    MockableData records{AffectedRecords()};
+    std::erase_if(records, [](const auto& record) {
+        DataStream key{record.first};
+        std::string type;
+        key >> type;
+        return type == DBKeys::WALLETDESCRIPTORCKEY || type == DBKeys::WALLETDESCRIPTORPQCCKEY;
+    });
+    auto wallet{LoadValidatedAndUnlocked(records)};
+    MockableDatabase& db{GetMockableDatabase(*wallet)};
+    db.ResetCounts();
+    const MockableData before{db.m_records};
+
+    BOOST_CHECK(!wallet->ReencryptPlaintextPQCKeys());
+    BOOST_CHECK(db.m_records == before);
+    BOOST_CHECK_EQUAL(db.m_txn_begin_count, 0);
+    BOOST_CHECK_EQUAL(CountPlaintextPQCRecords(db.m_records), 3U);
+    CheckReported(*wallet, 3);
+}
+
+BOOST_AUTO_TEST_CASE(TopUpLeavesAFailedRecordAlone)
+{
+    // Learn the key a top-up will derive at the next index.
+    auto source{CreateDescriptorWallet(*m_node.chain, P2MR_ONLY_OUTPUT_TYPES, FOUR_ADDRESS_KEYPOOL_SIZE)};
+    const MockableData unencrypted_records{GetMockableDatabase(*source).m_records};
+    auto* source_spk_man{dynamic_cast<DescriptorScriptPubKeyMan*>(WITH_LOCK(source->cs_wallet, return source->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false)))};
+    BOOST_REQUIRE(source_spk_man);
+    const uint256 source_desc_id{source_spk_man->GetID()};
+    BOOST_REQUIRE(source_spk_man->TopUp(FOUR_ADDRESS_KEYPOOL_SIZE + 1));
+    OldDescriptorKey next_key;
+    next_key.pubkey = GetCachedP2MRPubKeys(*source_spk_man, FOUR_ADDRESS_KEYPOOL_SIZE).pqc_pubkey;
+    DataStream value{GetMockableDatabase(*source).m_records.at(PQCKeyRecordKey(DBKeys::WALLETDESCRIPTORPQCKEY, source_desc_id, next_key.pubkey))};
+    value >> next_key.secret;
+
+    // Encrypt the wallet as it was before that top-up, then add a record for
+    // that key that fails validation.
+    auto encrypted{Load(unencrypted_records)};
+    FinishValidation(*encrypted);
+    BOOST_REQUIRE(encrypted->EncryptWallet(PASSPHRASE));
+    MockableData records{GetMockableDatabase(*encrypted).m_records};
+    encrypted.reset();
+    PutPlaintextRecord(records, source_desc_id, next_key, /*sig_counter=*/52, /*corrupt=*/true);
+    const SerializeData plaintext_key{PQCKeyRecordKey(DBKeys::WALLETDESCRIPTORPQCKEY, source_desc_id, next_key.pubkey)};
+    const SerializeData plaintext_value{records.at(plaintext_key)};
+
+    auto wallet{LoadValidatedAndUnlocked(records)};
+    BOOST_REQUIRE_EQUAL(wallet->GetPQCKeyValidationInfo().failed_records, 1U);
+    DescriptorScriptPubKeyMan& spk_man{GetDescriptor(*wallet, source_desc_id)};
+    BOOST_REQUIRE(spk_man.TopUp(FOUR_ADDRESS_KEYPOOL_SIZE + 1));
+
+    // The top-up kept the failed record and wrote no record at counter 0.
+    const MockableData& after{GetMockableDatabase(*wallet).m_records};
+    BOOST_CHECK(after.at(plaintext_key) == plaintext_value);
+    BOOST_CHECK(!CryptedRecordCounter(after, source_desc_id, next_key.pubkey));
+    BOOST_CHECK(!spk_man.GetSigningProvider(next_key.pubkey));
+    CheckReported(*wallet, 1);
 }
 
 BOOST_AUTO_TEST_CASE(NothingToReencryptIsANoOp)

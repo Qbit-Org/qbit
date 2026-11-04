@@ -406,6 +406,7 @@ private:
 
     bool AddDescriptorKeyWithDB(WalletBatch& batch, const CKey& key, const CPubKey &pubkey) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     bool AddDescriptorPQCKeyWithDB(WalletBatch& batch, const CPQCPubKey& pubkey, const CPQCKey& key, bool has_encryption_keys = false, const CKeyingMaterial* encryption_key = nullptr) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
+    bool HavePlaintextPQCKeyRecord(const CPQCPubKey& pubkey) const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     bool HavePQCKeyRecord(const CPQCPubKey& pubkey) const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     bool HasBlockedPlaintextPQCKeys() const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
     bool IsPlaintextPQCKeyBlocked(const CPQCPubKey& pubkey) const EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man);
