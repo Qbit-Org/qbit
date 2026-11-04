@@ -4,6 +4,8 @@
 
 #include <wallet/test/wallet_p2mr_test_util.h>
 
+#include <thread>
+
 namespace wallet {
 using namespace wallet_p2mr_test;
 
@@ -129,6 +131,73 @@ BOOST_AUTO_TEST_CASE(MixedCryptedAndValidatedPlaintextPQCKeysRemainUnlockable)
     auto unlocked_tx_provider = p2mr_spk_man->GetSigningProviderForTransaction(coins);
     BOOST_REQUIRE(unlocked_tx_provider);
     BOOST_CHECK(unlocked_tx_provider->GetPQCKey(plaintext_pubkey, provider_key));
+}
+
+BOOST_AUTO_TEST_CASE(SignTransactionFreesDecryptedProvidersBeforeLockReturns)
+{
+    auto workload{MakeDistinctKeyP2MRSigningWorkload(*m_node.chain, /*input_count=*/1)};
+    CWallet& wallet{*workload.wallet};
+    const SecureString passphrase{"test-passphrase"};
+    BOOST_REQUIRE(wallet.EncryptWallet(passphrase));
+    BOOST_REQUIRE(wallet.Unlock(passphrase));
+
+    // Each signing provider keeps a copy of the counter observer, so a copy is
+    // destroyed while its provider frees the decrypted keys. The first counter
+    // reservation starts a Lock(), which must not return before then.
+    struct LockProbeState {
+        explicit LockProbeState(CWallet& probe_wallet) : wallet{probe_wallet} {}
+
+        CWallet& wallet;
+        std::thread locker{};
+        std::atomic_bool lock_requested{false};
+        std::atomic_bool lock_returned{false};
+        std::atomic_bool probing{true};
+        std::atomic<int> probes{0};
+        std::atomic<int> lock_returned_before_free{0};
+    };
+    struct LockProbe {
+        std::shared_ptr<LockProbeState> state;
+
+        explicit LockProbe(std::shared_ptr<LockProbeState> probe_state) : state{std::move(probe_state)} {}
+        LockProbe(const LockProbe&) = default;
+        LockProbe(LockProbe&&) = default;
+        ~LockProbe()
+        {
+            if (!state || !state->probing || !state->lock_requested) return;
+            ++state->probes;
+            // Give a Lock() that is no longer waiting for signers time to return.
+            for (int i = 0; i < 50 && !state->lock_returned; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{5});
+            }
+            if (state->lock_returned) ++state->lock_returned_before_free;
+        }
+
+        void operator()(const CPQCPubKey&, uint32_t, uint32_t) const
+        {
+            if (state->lock_requested.exchange(true)) return;
+            state->locker = std::thread{[probe_state = state.get()] {
+                probe_state->wallet.Lock();
+                probe_state->lock_returned = true;
+            }};
+        }
+    };
+
+    auto state{std::make_shared<LockProbeState>(wallet)};
+    std::map<int, bilingual_str> input_errors;
+    bool signed_ok{false};
+    {
+        const PQCSignatureCounterObserver observer{LockProbe{state}};
+        signed_ok = wallet.SignTransaction(workload.spend_tx, workload.coins, SIGHASH_DEFAULT, input_errors, observer);
+        state->probing = false;
+    }
+    BOOST_REQUIRE(state->lock_requested);
+    state->locker.join();
+
+    BOOST_CHECK_MESSAGE(signed_ok, FormatInputErrors(input_errors));
+    BOOST_CHECK(state->lock_returned);
+    BOOST_CHECK(wallet.IsLocked());
+    BOOST_CHECK_GE(state->probes.load(), 1);
+    BOOST_CHECK_EQUAL(state->lock_returned_before_free.load(), 0);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

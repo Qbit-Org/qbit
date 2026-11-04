@@ -2578,7 +2578,8 @@ bool CWallet::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint,
     unsigned int provider_count{0};
     unsigned int provider_attempts{0};
 
-    std::vector<std::unique_ptr<SigningProvider>> providers;
+    // Declare the guard before the providers. Locals are destroyed in reverse
+    // order, so the decrypted key copies are freed before Lock() can proceed.
     struct ActiveSigningProviderSnapshot {
         const CWallet& wallet;
         bool active{false};
@@ -2594,6 +2595,7 @@ bool CWallet::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint,
         active_signing_snapshot.active = true;
     }
 
+    std::vector<std::unique_ptr<SigningProvider>> providers;
     {
         const auto provider_collect_start{SteadyClock::now()};
         LOCK(cs_wallet);
