@@ -6,8 +6,12 @@
 
 #include <interfaces/chain.h>
 #include <outputtype.h>
+#include <rpc/request.h>
+#include <rpc/util.h>
 #include <streams.h>
 #include <support/allocators/secure.h>
+#include <test/util/logging.h>
+#include <univalue.h>
 #include <wallet/test/util.h>
 #include <wallet/test/wallet_p2mr_test_util.h>
 #include <wallet/sqlite.h>
@@ -22,10 +26,12 @@
 #include <cstddef>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <iostream>
 #include <iterator>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <thread>
@@ -33,6 +39,10 @@
 #include <vector>
 
 namespace wallet {
+// These RPCs are not declared in a header.
+RPCHelpMan backupwallet();
+RPCHelpMan encryptwallet();
+
 namespace {
 
 // Allows for sanitizer overhead and concurrent CI tests. Only a stuck thread
@@ -206,6 +216,50 @@ size_t CountSecretsInFiles(const std::vector<fs::path>& files, const std::vector
 bool HasPostEncryptionRewrite(CWallet& wallet)
 {
     return WalletBatch(wallet.GetDatabase()).HasPostEncryptionRewrite();
+}
+
+//! Keeps a statement reading the database, which makes a VACUUM fail.
+class UnfinishedRead
+{
+public:
+    void Start(WalletDatabase& database)
+    {
+        m_batch = database.MakeBatch();
+        m_cursor = m_batch->GetNewCursor();
+        DataStream key, value;
+        BOOST_REQUIRE(m_cursor->Next(key, value) == DatabaseCursor::Status::MORE);
+    }
+    void Finish()
+    {
+        m_cursor.reset();
+        m_batch.reset();
+    }
+
+private:
+    std::unique_ptr<DatabaseBatch> m_batch;
+    std::unique_ptr<DatabaseCursor> m_cursor;
+};
+
+//! Calls an RPC with one string argument on the wallet with the empty name.
+UniValue CallWalletRPC(WalletContext& context, const RPCHelpMan& rpc, const std::string& argument)
+{
+    JSONRPCRequest request;
+    request.context = &context;
+    request.URI = "/wallet/";
+    request.params = UniValue{UniValue::VARR};
+    request.params.push_back(argument);
+    return rpc.HandleRequest(request);
+}
+
+//! The message of the RPC error that the call throws, or an empty string.
+std::string GetRPCError(const std::function<void()>& call)
+{
+    try {
+        call();
+    } catch (const UniValue& error) {
+        return error.find_value("message").get_str();
+    }
+    return "";
 }
 
 } // namespace
@@ -495,18 +549,11 @@ BOOST_FIXTURE_TEST_CASE(EncryptWalletFailedRewriteIsRetriedOnLoad, RegtestP2MROn
     const auto secrets{GetPlaintextSecrets(*wallet)};
     BOOST_REQUIRE(!secrets.empty());
 
-    std::unique_ptr<DatabaseBatch> reader_batch;
-    std::unique_ptr<DatabaseCursor> reader;
-    wallet->m_after_encrypt_wallet_commit = [&] {
-        reader_batch = wallet->GetDatabase().MakeBatch();
-        reader = reader_batch->GetNewCursor();
-        DataStream key, value;
-        BOOST_REQUIRE(reader->Next(key, value) == DatabaseCursor::Status::MORE);
-    };
+    UnfinishedRead read;
+    wallet->m_after_encrypt_wallet_commit = [&] { read.Start(wallet->GetDatabase()); };
     BOOST_REQUIRE(wallet->EncryptWallet("passphrase"));
     wallet->m_after_encrypt_wallet_commit = {};
-    reader.reset();
-    reader_batch.reset();
+    read.Finish();
     BOOST_CHECK(wallet->IsCrypted());
     BOOST_CHECK(!HasPostEncryptionRewrite(*wallet));
     TestUnloadWallet(std::move(wallet));
@@ -516,6 +563,104 @@ BOOST_FIXTURE_TEST_CASE(EncryptWalletFailedRewriteIsRetriedOnLoad, RegtestP2MROn
     BOOST_CHECK(wallet->IsCrypted());
     BOOST_CHECK(HasPostEncryptionRewrite(*wallet));
     BOOST_CHECK_EQUAL(CountSecretsInFiles(wallet->GetDatabase().Files(), secrets), 0U);
+    TestUnloadWallet(std::move(wallet));
+}
+
+// A backup copies the file's free pages. After a failed rewrite it must run the
+// rewrite first, or be refused while the rewrite still fails. Either way it must
+// not copy the deleted plaintext keys.
+BOOST_FIXTURE_TEST_CASE(BackupAfterFailedRewriteDoesNotCopyPlaintextKeys, RegtestP2MROnlyWalletTestingSetup)
+{
+    WalletContext context;
+    auto wallet{LoadWalletWithoutSecureDelete(context, m_args, *m_node.chain, "")};
+    BOOST_REQUIRE(wallet);
+    const auto secrets{GetPlaintextSecrets(*wallet)};
+    BOOST_REQUIRE(!secrets.empty());
+    AddWallet(context, wallet);
+
+    UnfinishedRead read;
+    wallet->m_after_encrypt_wallet_commit = [&] { read.Start(wallet->GetDatabase()); };
+    const std::string result{CallWalletRPC(context, encryptwallet(), "passphrase").get_str()};
+    wallet->m_after_encrypt_wallet_commit = {};
+    BOOST_CHECK(result.find("Warning: the wallet file could not be rewritten") != std::string::npos);
+    BOOST_CHECK(!HasPostEncryptionRewrite(*wallet));
+    BOOST_REQUIRE(CountSecretsInFiles(wallet->GetDatabase().Files(), secrets) > 0);
+
+    // While the rewrite still fails, the backup is refused.
+    const fs::path restored_dir{fs::PathFromString(wallet->GetDatabase().Filename()).parent_path() / "restored"};
+    fs::create_directories(restored_dir);
+    const fs::path backup{restored_dir / "wallet.dat"};
+    const std::string error{GetRPCError([&] { CallWalletRPC(context, backupwallet(), fs::PathToString(backup)); })};
+    BOOST_CHECK(error.find("Backup refused") != std::string::npos);
+    BOOST_CHECK(!fs::exists(backup));
+    BOOST_CHECK(!HasPostEncryptionRewrite(*wallet));
+
+    // Once it can succeed, the backup runs it first.
+    read.Finish();
+    CallWalletRPC(context, backupwallet(), fs::PathToString(backup));
+    BOOST_CHECK(HasPostEncryptionRewrite(*wallet));
+    BOOST_CHECK_EQUAL(CountSecretsInFiles(wallet->GetDatabase().Files(), secrets), 0U);
+    BOOST_REQUIRE(fs::exists(backup));
+    BOOST_CHECK_EQUAL(CountSecretsInFiles({backup}, secrets), 0U);
+    RemoveWallet(context, wallet, /*load_on_start=*/std::nullopt);
+    TestUnloadWallet(std::move(wallet));
+
+    // The backup is an encrypted wallet that needs no further rewrite.
+    bool rewrote{false};
+    {
+        DebugLogHelper log_helper{"Rewrote the wallet file", [&](const std::string* line) {
+            if (line) rewrote = true;
+            return false;
+        }};
+        auto restored{LoadWalletWithoutSecureDelete(context, m_args, *m_node.chain, "restored")};
+        BOOST_REQUIRE(restored);
+        BOOST_CHECK(restored->IsCrypted());
+        BOOST_CHECK(restored->Unlock("passphrase"));
+        TestUnloadWallet(std::move(restored));
+    }
+    BOOST_CHECK(!rewrote);
+}
+
+// With no rewrite pending, a backup does not rewrite the file, and encryptwallet
+// has nothing to warn about.
+BOOST_FIXTURE_TEST_CASE(BackupWithoutPendingRewriteDoesNotRewrite, RegtestP2MROnlyWalletTestingSetup)
+{
+    WalletContext context;
+    auto wallet{LoadWalletWithoutSecureDelete(context, m_args, *m_node.chain, "")};
+    BOOST_REQUIRE(wallet);
+    const auto secrets{GetPlaintextSecrets(*wallet)};
+    BOOST_REQUIRE(!secrets.empty());
+    AddWallet(context, wallet);
+    const fs::path wallet_dir{fs::PathFromString(wallet->GetDatabase().Filename()).parent_path()};
+
+    bool rewrote{false};
+    const auto note_rewrite{[&](const std::string* line) {
+        if (line) rewrote = true;
+        return false;
+    }};
+    const fs::path unencrypted_backup{wallet_dir / "unencrypted.bak"};
+    {
+        DebugLogHelper log_helper{"Rewrote the wallet file", note_rewrite};
+        BOOST_CHECK(wallet->BackupWallet(fs::PathToString(unencrypted_backup)));
+    }
+    BOOST_CHECK(!rewrote);
+    BOOST_CHECK(!HasPostEncryptionRewrite(*wallet));
+    // The keys of an unencrypted wallet are live records, so its backup has them all.
+    BOOST_CHECK_EQUAL(CountSecretsInFiles({unencrypted_backup}, secrets), secrets.size());
+
+    const std::string result{CallWalletRPC(context, encryptwallet(), "passphrase").get_str()};
+    BOOST_CHECK(result.find("Warning") == std::string::npos);
+    BOOST_CHECK(HasPostEncryptionRewrite(*wallet));
+
+    const fs::path encrypted_backup{wallet_dir / "encrypted.bak"};
+    {
+        DebugLogHelper log_helper{"Rewrote the wallet file", note_rewrite};
+        CallWalletRPC(context, backupwallet(), fs::PathToString(encrypted_backup));
+    }
+    BOOST_CHECK(!rewrote);
+    BOOST_CHECK_EQUAL(CountSecretsInFiles({encrypted_backup}, secrets), 0U);
+
+    RemoveWallet(context, wallet, /*load_on_start=*/std::nullopt);
     TestUnloadWallet(std::move(wallet));
 }
 

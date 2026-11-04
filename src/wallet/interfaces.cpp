@@ -175,7 +175,7 @@ public:
         return m_wallet->ChangeWalletPassphrase(old_wallet_passphrase, new_wallet_passphrase);
     }
     void abortRescan() override { m_wallet->AbortRescan(); }
-    bool backupWallet(const std::string& filename) override { return m_wallet->BackupWallet(filename); }
+    util::Result<void> backupWallet(const std::string& filename) override { return m_wallet->BackupWallet(filename); }
     std::string getWalletName() override { return m_wallet->GetName(); }
     std::unique_ptr<Wallet> clone() override { return std::make_unique<WalletImpl>(m_context, m_wallet); }
     util::Result<CTxDestination> getNewDestination(const OutputType type, const std::string& label) override

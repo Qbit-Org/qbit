@@ -718,6 +718,8 @@ public:
      * and leaves the record absent if the rewrite fails.
      */
     bool RewriteAfterEncryption() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    //! Whether this is an encrypted wallet without the POST_ENCRYPTION_REWRITE record.
+    bool NeedsRewriteAfterEncryption() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     unsigned int ComputeTimeSmart(const CWalletTx& wtx, bool rescanning_old_block) const;
 
@@ -1069,7 +1071,12 @@ public:
      */
     void postInitProcess();
 
-    bool BackupWallet(const std::string& strDest) const;
+    /**
+     * Copy the database to strDest. The copy includes the file's free space,
+     * so a rewrite that is still pending after encryption runs first, and the
+     * backup is refused if it fails.
+     */
+    util::Result<void> BackupWallet(const std::string& strDest);
 
     /* Returns true if HD is enabled */
     bool IsHDEnabled() const;

@@ -7,7 +7,7 @@
 try:
     import sqlite3
 except ImportError:
-    pass
+    sqlite3 = None
 
 import time
 import subprocess
@@ -34,7 +34,6 @@ class WalletEncryptionTest(BitcoinTestFramework):
 
     def skip_test_if_missing_module(self):
         self.skip_if_no_wallet()
-        self.skip_if_no_py_sqlite3()
 
     def test_rewrite_after_encryption(self):
         self.log.info("Test that an encrypted wallet without the rewrite record is rewritten once when loaded")
@@ -52,7 +51,8 @@ class WalletEncryptionTest(BitcoinTestFramework):
 
         node.createwallet(wallet_name="rewrite")
         with node.assert_debug_log([rewrite_log]):
-            node.get_wallet_rpc("rewrite").encryptwallet("pass")
+            result = node.get_wallet_rpc("rewrite").encryptwallet("pass")
+        assert "Warning" not in result
         node.unloadwallet("rewrite")
         assert_equal(count_records(), 1)
 
@@ -261,7 +261,10 @@ class WalletEncryptionTest(BitcoinTestFramework):
                 # Check there's nothing with an 'mkey' prefix
                 assert_equal(all([not line.startswith("046d6b6579") for line in f]), True)
 
-        self.test_rewrite_after_encryption()
+        if sqlite3 is None:
+            self.log.info("Skipping the rewrite checks: the Python sqlite3 module is not available")
+        else:
+            self.test_rewrite_after_encryption()
 
 
 if __name__ == '__main__':

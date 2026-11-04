@@ -1324,7 +1324,8 @@ bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase, bool use_cr
         // tens of seconds deriving keys, and while the descriptor locks keep
         // top-ups from writing. The new keys are written encrypted, so the
         // file needs no rewrite after them. If the process stops first or the
-        // rewrite fails, the wallet is rewritten when it is next loaded.
+        // rewrite fails, the wallet is rewritten when it is next loaded, or
+        // before its next backup.
         RewriteAfterEncryption();
         // Release in the reverse order of acquisition.
         while (!desc_spk_man_locks.empty()) desc_spk_man_locks.pop_front();
@@ -1359,6 +1360,12 @@ bool CWallet::RewriteAfterEncryption()
     }
     WalletLogPrintf("Rewrote the wallet file after encryption in %dms\n", Ticks<std::chrono::milliseconds>(SteadyClock::now() - start));
     return true;
+}
+
+bool CWallet::NeedsRewriteAfterEncryption()
+{
+    AssertLockHeld(cs_wallet);
+    return IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS) && IsCrypted() && !WalletBatch(GetDatabase()).HasPostEncryptionRewrite();
 }
 
 DBErrors CWallet::ReorderTransactions()
@@ -4398,11 +4405,9 @@ std::shared_ptr<CWallet> CWallet::Create(WalletContext& context, const std::stri
     // and the rewrite after it, or was encrypted by a version that did not
     // write the record. Rewrite it before any work on the wallet starts. A
     // failure is logged and retried at the next load.
-    if (walletInstance->IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS)) {
+    {
         LOCK(walletInstance->cs_wallet);
-        if (walletInstance->IsCrypted() && !WalletBatch(walletInstance->GetDatabase()).HasPostEncryptionRewrite()) {
-            walletInstance->RewriteAfterEncryption();
-        }
+        if (walletInstance->NeedsRewriteAfterEncryption()) walletInstance->RewriteAfterEncryption();
     }
 
     // This wallet is in its first run if there are no ScriptPubKeyMans and it isn't blank or no privkeys
@@ -4762,10 +4767,20 @@ void CWallet::postInitProcess()
     WITH_LOCK(cs_wallet, chain().requestMempoolTransactions(*this));
 }
 
-bool CWallet::BackupWallet(const std::string& strDest) const
+util::Result<void> CWallet::BackupWallet(const std::string& strDest)
 {
-    WITH_LOCK(cs_wallet, WriteBestBlock());
-    return GetDatabase().Backup(strDest);
+    // Hold cs_wallet for the whole copy. EncryptWallet holds it from before
+    // its commit through its rewrite, so an encryption cannot start between
+    // this check and the copy.
+    LOCK(cs_wallet);
+    // The copy includes free pages byte for byte, so deleted plaintext keys
+    // must be gone from the file before it is made.
+    if (NeedsRewriteAfterEncryption() && !RewriteAfterEncryption()) {
+        return util::Error{_("Backup refused: the wallet file may still contain deleted unencrypted keys, and rewriting it failed. Free space in the data and temporary directories, or reload the wallet, then try again.")};
+    }
+    WriteBestBlock();
+    if (!GetDatabase().Backup(strDest)) return util::Error{_("Wallet backup failed!")};
+    return {};
 }
 
 int CWallet::GetTxDepthInMainChain(const CWalletTx& wtx) const
