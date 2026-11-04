@@ -580,9 +580,7 @@ std::shared_ptr<CWallet> LoadWalletInternal(WalletContext& context, const std::s
         AddWallet(context, wallet);
         wallet->postInitProcess();
         if (context.scheduler) SchedulePlaintextPQCKeyValidationInternal(*context.scheduler, wallet);
-        // Let wallet loading return and initial address calls finish before
-        // background PQC derivation starts competing for CPU.
-        SchedulePendingInitialKeyPoolTopUp(context, wallet, std::chrono::seconds{30});
+        MaybeSchedulePendingInitialKeyPoolTopUpAfterLoad(context, wallet);
 
         // Write the wallet setting
         UpdateWalletSetting(*context.chain, name, load_on_start, warnings);
@@ -659,6 +657,13 @@ void SchedulePlaintextPQCKeyValidation(CScheduler& scheduler, const std::shared_
 void MaybeSchedulePendingInitialKeyPoolTopUp(WalletContext& context, const std::shared_ptr<CWallet>& wallet)
 {
     SchedulePendingInitialKeyPoolTopUp(context, wallet, std::chrono::milliseconds{1});
+}
+
+void MaybeSchedulePendingInitialKeyPoolTopUpAfterLoad(WalletContext& context, const std::shared_ptr<CWallet>& wallet)
+{
+    // Let wallet loading return and initial address calls finish before
+    // background PQC derivation starts competing for CPU.
+    SchedulePendingInitialKeyPoolTopUp(context, wallet, std::chrono::seconds{30});
 }
 
 void MaybeScheduleP2MRKeyPoolRefill(WalletContext& context, const std::shared_ptr<CWallet>& wallet, OutputType type, bool internal)

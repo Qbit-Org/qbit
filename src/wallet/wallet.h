@@ -108,6 +108,7 @@ std::unique_ptr<interfaces::Handler> HandleLoadWallet(WalletContext& context, Lo
 void NotifyWalletLoaded(WalletContext& context, const std::shared_ptr<CWallet>& wallet);
 void SchedulePlaintextPQCKeyValidation(CScheduler& scheduler, const std::shared_ptr<CWallet>& wallet);
 void MaybeSchedulePendingInitialKeyPoolTopUp(WalletContext& context, const std::shared_ptr<CWallet>& wallet);
+void MaybeSchedulePendingInitialKeyPoolTopUpAfterLoad(WalletContext& context, const std::shared_ptr<CWallet>& wallet);
 void MaybeScheduleP2MRKeyPoolRefill(WalletContext& context, const std::shared_ptr<CWallet>& wallet, OutputType type, bool internal);
 std::unique_ptr<WalletDatabase> MakeWalletDatabase(const std::string& name, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error);
 

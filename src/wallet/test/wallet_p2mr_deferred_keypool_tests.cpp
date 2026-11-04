@@ -405,6 +405,118 @@ BOOST_FIXTURE_TEST_CASE(LoadWalletSchedulerRefillsDeferredP2MRKeypoolAcrossBatch
     WaitForDeleteWallet(std::move(loaded_wallet));
 }
 
+BOOST_FIXTURE_TEST_CASE(StartWalletsSchedulesDeferredP2MRKeypoolTopUpForStartupWallets, RegtestP2MROnlyWalletTestingSetup)
+{
+    constexpr int64_t keypool_size{64};
+    const SecureString passphrase{"test-passphrase"};
+    m_node.args->ForceSetArg("-keypool", util::ToString(keypool_size));
+    DeferredCreateKeyPoolTopUpBatchStepOverride batch_step_override{1};
+
+    // Use the loader's context, which outlives the periodic tasks that
+    // StartWallets() registers on the scheduler.
+    WalletContext& context{*Assert(m_wallet_loader->context())};
+    BOOST_REQUIRE(!context.scheduler);
+
+    const auto check_keypool_size = [](CWallet& wallet, unsigned int expected) {
+        LOCK(wallet.cs_wallet);
+        for (const bool internal : {false, true}) {
+            auto* spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(wallet.GetScriptPubKeyMan(OutputType::P2MR, internal));
+            BOOST_REQUIRE(spk_man);
+            BOOST_CHECK_EQUAL(spk_man->GetKeyPoolSize(), expected);
+        }
+    };
+
+    // Without a scheduler no top-up is queued, as when the node stops before
+    // the deferred top-up has run.
+    const std::vector<std::pair<std::string, SecureString>> startup_wallets{
+        {"startup_plain", ""},
+        {"startup_encrypted", passphrase},
+        {"startup_unloaded", ""},
+    };
+    common::SettingsValue wallet_setting{common::SettingsValue::VARR};
+    for (const auto& [name, wallet_passphrase] : startup_wallets) {
+        DatabaseOptions create_options;
+        create_options.require_create = true;
+        create_options.create_flags = WALLET_FLAG_DESCRIPTORS;
+        create_options.create_passphrase = wallet_passphrase;
+
+        DatabaseStatus status;
+        bilingual_str error;
+        std::vector<bilingual_str> warnings;
+        auto wallet = CreateWallet(context, name, std::nullopt, create_options, status, error, warnings);
+        BOOST_REQUIRE(wallet);
+        BOOST_REQUIRE_EQUAL(status, DatabaseStatus::SUCCESS);
+        BOOST_REQUIRE(wallet->HasPendingInitialKeyPoolTopUp());
+        BOOST_CHECK(RemoveWallet(context, wallet, std::nullopt));
+        WaitForDeleteWallet(std::move(wallet));
+        wallet_setting.push_back(name);
+    }
+    m_node.chain->overwriteRwSetting("wallet", std::move(wallet_setting), interfaces::SettingsAction::SKIP_WRITE);
+
+    // Node startup loads the wallets with LoadWallets() and only then gives
+    // them the scheduler in StartWallets().
+    BOOST_REQUIRE(m_wallet_loader->load());
+    auto plain_wallet{GetWallet(context, "startup_plain")};
+    auto encrypted_wallet{GetWallet(context, "startup_encrypted")};
+    auto unloaded_wallet{GetWallet(context, "startup_unloaded")};
+    BOOST_REQUIRE(plain_wallet);
+    BOOST_REQUIRE(encrypted_wallet);
+    BOOST_REQUIRE(unloaded_wallet);
+    BOOST_REQUIRE(encrypted_wallet->IsLocked());
+    for (CWallet* wallet : {plain_wallet.get(), encrypted_wallet.get(), unloaded_wallet.get()}) {
+        BOOST_CHECK(wallet->HasPendingInitialKeyPoolTopUp());
+        check_keypool_size(*wallet, DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+    }
+
+    auto& scheduler = *Assert(m_node.scheduler);
+    m_wallet_loader->start(scheduler);
+    BOOST_CHECK(WITH_LOCK(plain_wallet->cs_wallet, return plain_wallet->m_deferred_create_keypool_top_up_scheduled));
+    // A locked wallet queues nothing and still finishes at its first unlock.
+    BOOST_CHECK(!WITH_LOCK(encrypted_wallet->cs_wallet, return encrypted_wallet->m_deferred_create_keypool_top_up_scheduled));
+
+    // A wallet unloaded while its top-up is queued must not be topped up.
+    BOOST_CHECK(RemoveWallet(context, unloaded_wallet, std::nullopt));
+    WaitForDeleteWallet(std::move(unloaded_wallet));
+
+    // Stay well inside the 30 second delay that loadwallet also uses.
+    scheduler.MockForward(std::chrono::seconds{25});
+    WaitForScheduler(scheduler);
+    BOOST_CHECK(plain_wallet->HasPendingInitialKeyPoolTopUp());
+    check_keypool_size(*plain_wallet, DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+
+    scheduler.MockForward(std::chrono::seconds{5});
+    WaitForScheduler(scheduler);
+    for (int i = 0; i < 10 && plain_wallet->HasPendingInitialKeyPoolTopUp(); ++i) {
+        scheduler.MockForward(std::chrono::seconds{1});
+        WaitForScheduler(scheduler);
+    }
+    BOOST_CHECK(!plain_wallet->HasPendingInitialKeyPoolTopUp());
+    check_keypool_size(*plain_wallet, keypool_size);
+
+    BOOST_CHECK(encrypted_wallet->IsLocked());
+    BOOST_CHECK(encrypted_wallet->HasPendingInitialKeyPoolTopUp());
+    check_keypool_size(*encrypted_wallet, DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+    BOOST_REQUIRE(encrypted_wallet->Unlock(passphrase));
+    BOOST_CHECK(!encrypted_wallet->HasPendingInitialKeyPoolTopUp());
+    check_keypool_size(*encrypted_wallet, keypool_size);
+
+    DatabaseOptions load_options;
+    load_options.require_existing = true;
+    DatabaseStatus status;
+    bilingual_str error;
+    std::vector<bilingual_str> warnings;
+    auto reloaded_wallet = LoadWallet(context, "startup_unloaded", std::nullopt, load_options, status, error, warnings);
+    BOOST_REQUIRE(reloaded_wallet);
+    BOOST_CHECK(reloaded_wallet->HasPendingInitialKeyPoolTopUp());
+    check_keypool_size(*reloaded_wallet, DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+    BOOST_CHECK(RemoveWallet(context, reloaded_wallet, std::nullopt));
+    WaitForDeleteWallet(std::move(reloaded_wallet));
+
+    plain_wallet.reset();
+    encrypted_wallet.reset();
+    m_wallet_loader->stop();
+}
+
 BOOST_FIXTURE_TEST_CASE(LoadWalletDoesNotRestoreDeferredP2MRTopUpAfterRefillAndAddressUse, RegtestP2MROnlyWalletTestingSetup)
 {
     constexpr int64_t keypool_size{64};
