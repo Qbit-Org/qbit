@@ -4409,10 +4409,13 @@ std::shared_ptr<CWallet> CWallet::Create(WalletContext& context, const std::stri
     // An encrypted wallet without the record stopped between its encryption
     // and the rewrite after it, or was encrypted by a version that did not
     // write the record. Rewrite it before any work on the wallet starts. A
-    // failure is logged and retried at the next load.
+    // failure does not fail the load; it is reported and retried at the next
+    // load.
     {
         LOCK(walletInstance->cs_wallet);
-        if (walletInstance->NeedsRewriteAfterEncryption()) walletInstance->RewriteAfterEncryption();
+        if (walletInstance->NeedsRewriteAfterEncryption() && !walletInstance->RewriteAfterEncryption()) {
+            warnings.push_back(_("The wallet file could not be rewritten after encryption, so it may still contain deleted unencrypted keys. The rewrite is retried when the wallet is next loaded, and before a backup."));
+        }
     }
 
     // This wallet is in its first run if there are no ScriptPubKeyMans and it isn't blank or no privkeys

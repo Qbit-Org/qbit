@@ -11,8 +11,8 @@ its existing funds.
 The file is now rewritten immediately after the keys are deleted, and the
 wallet records that this succeeded. An encrypted wallet without that record is
 rewritten when it is next loaded, before any other work on it starts. If that
-rewrite fails, a warning is logged, the wallet still loads, and the rewrite is
-tried again at the next load.
+rewrite fails, the wallet still loads, with a warning, and the rewrite is tried
+again at the next load.
 
 Backups copy a wallet file's free space byte for byte, so `backupwallet` and the
 GUI's backup now run a pending rewrite first. If it fails, the backup is refused
