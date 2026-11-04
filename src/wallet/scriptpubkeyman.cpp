@@ -1048,10 +1048,7 @@ bool DescriptorScriptPubKeyMan::CheckDecryptionKey(const CKeyingMaterial& master
             // Writing the crypted record erases a plaintext record for the
             // same key, so leave a key that still has one to re-encryption,
             // which keeps the higher of the two counters.
-            const bool has_plaintext_record{m_pending_plaintext_pqc_keys.contains(pubkey) ||
-                                            m_unencrypted_pqc_keys.contains(pubkey) ||
-                                            m_failed_plaintext_pqc_keys.contains(pubkey)};
-            if (legacy_auth_tag && !has_plaintext_record &&
+            if (legacy_auth_tag && !HavePlaintextPQCKeyRecord(pubkey) &&
                 batch.WriteCryptedDescriptorPQCKey(m_wallet_descriptor.id, pubkey, crypted_key.crypted_secret, sig_counter, &*legacy_auth_tag)) {
                 crypted_key.auth_tag = *legacy_auth_tag;
             }
@@ -2039,11 +2036,22 @@ bool DescriptorScriptPubKeyMan::HaveCryptedKeys() const
     return !m_map_crypted_keys.empty() || !m_map_crypted_pqc_keys.empty();
 }
 
+bool DescriptorScriptPubKeyMan::HavePlaintextPQCKeyRecord(const CPQCPubKey& pubkey) const
+{
+    AssertLockHeld(cs_desc_man);
+    // m_map_pqc_keys holds the expected plaintext keys of an unencrypted
+    // wallet, so it only counts in an encrypted one.
+    return m_pending_plaintext_pqc_keys.contains(pubkey) || m_unencrypted_pqc_keys.contains(pubkey) ||
+           m_failed_plaintext_pqc_keys.contains(pubkey) ||
+           (m_storage.HasEncryptionKeys() && m_map_pqc_keys.contains(pubkey));
+}
+
 bool DescriptorScriptPubKeyMan::HavePQCKeyRecord(const CPQCPubKey& pubkey) const
 {
     AssertLockHeld(cs_desc_man);
-    return m_map_pqc_keys.contains(pubkey) || m_map_crypted_pqc_keys.contains(pubkey) ||
-           m_pending_plaintext_pqc_keys.contains(pubkey) || m_unencrypted_pqc_keys.contains(pubkey);
+    // A record that failed validation counts too, so that a top-up never
+    // replaces it with a fresh record at counter 0.
+    return m_map_pqc_keys.contains(pubkey) || m_map_crypted_pqc_keys.contains(pubkey) || HavePlaintextPQCKeyRecord(pubkey);
 }
 
 bool DescriptorScriptPubKeyMan::HasBlockedPlaintextPQCKeys() const
@@ -2967,7 +2975,7 @@ std::unique_ptr<CKeyMetadata> DescriptorScriptPubKeyMan::GetMetadata(const CTxDe
 std::optional<uint32_t> DescriptorScriptPubKeyMan::GetPQCSignatureCounter(const CPQCPubKey& pubkey) const
 {
     LOCK(cs_desc_man);
-    const bool have_local_key = HavePQCKeyRecord(pubkey) || m_failed_plaintext_pqc_keys.contains(pubkey);
+    const bool have_local_key = HavePQCKeyRecord(pubkey);
     if (!have_local_key) {
         return std::nullopt;
     }
@@ -2975,9 +2983,12 @@ std::optional<uint32_t> DescriptorScriptPubKeyMan::GetPQCSignatureCounter(const 
     if (const auto counter_it = m_map_pqc_sig_counters.find(pubkey); counter_it != m_map_pqc_sig_counters.end()) {
         sig_counter = counter_it->second;
     }
-    // Re-encryption keeps the higher counter of a key's plaintext and crypted records.
-    if (const auto it = m_unencrypted_pqc_keys.find(pubkey); it != m_unencrypted_pqc_keys.end()) {
-        sig_counter = std::max(sig_counter, it->second.sig_counter);
+    // Re-encryption keeps the higher counter of a key's plaintext and crypted
+    // records, so report that one, also while the plaintext one is pending.
+    for (const auto* plaintext_keys : {&m_pending_plaintext_pqc_keys, &m_unencrypted_pqc_keys}) {
+        if (const auto it = plaintext_keys->find(pubkey); it != plaintext_keys->end()) {
+            sig_counter = std::max(sig_counter, it->second.sig_counter);
+        }
     }
     return sig_counter;
 }
@@ -3187,6 +3198,8 @@ util::Result<std::vector<ReencryptedPQCKey>> DescriptorScriptPubKeyMan::WriteRee
         if (auto res{reencrypt(pubkey, plaintext.secret, plaintext.sig_counter)}; !res) return util::Error{util::ErrorString(res)};
     }
     for (const auto& [pubkey, key] : m_map_pqc_keys) {
+        // Written above, with the higher of the counters.
+        if (m_unencrypted_pqc_keys.contains(pubkey)) continue;
         const auto counter_it{m_map_pqc_sig_counters.find(pubkey)};
         const uint32_t sig_counter{counter_it != m_map_pqc_sig_counters.end() ? counter_it->second : 0};
         if (auto res{reencrypt(pubkey, CKeyingMaterial{key.data(), key.data() + key.size()}, sig_counter)}; !res) return util::Error{util::ErrorString(res)};

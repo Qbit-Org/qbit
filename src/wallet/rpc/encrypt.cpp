@@ -94,12 +94,15 @@ RPCHelpMan walletpassphrase()
     }
 
     // Replace plaintext PQC key records left by older versions. This needs
-    // cs_wallet released, and runs before the relock below is scheduled. A
-    // failure must not leave the wallet unlocked without that relock.
-    try {
-        pwallet->ReencryptPlaintextPQCKeys();
-    } catch (const std::exception& e) {
-        pwallet->WalletLogPrintf("Warning: re-encrypting plaintext PQC key records failed: %s\n", e.what());
+    // cs_wallet released, and runs before the relock below is scheduled.
+    pwallet->ReencryptPlaintextPQCKeys();
+    // Move the deadline set above to after that work, which can include a
+    // long database rewrite, so the wallet relocks when unlocked_until says.
+    // Holding m_relock_mutex keeps an earlier relock callback out meanwhile.
+    {
+        LOCK(pwallet->cs_wallet);
+        pwallet->nRelockTime = GetTime() + nSleepTime;
+        relock_time = pwallet->nRelockTime;
     }
 
     WalletContext& context = EnsureWalletContext(request.context);

@@ -392,6 +392,7 @@ private:
     void ClearMasterKey() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     bool HasPQCKeyReencryptionWork() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool ReencryptPlaintextPQCKeysOrThrow() LOCKS_EXCLUDED(cs_wallet);
 
     std::atomic<bool> fAbortRescan{false};
     std::atomic<bool> fScanningWallet{false}; // controlled by WalletRescanReserver
@@ -730,7 +731,7 @@ public:
      * Returns false if the wallet was locked or a step failed. If the
      * re-encryption failed, the records stay reported and refused and the
      * next call retries; if only the rewrite failed, the next load or backup
-     * retries it.
+     * retries it. It logs an exception instead of throwing it.
      */
     bool ReencryptPlaintextPQCKeys() LOCKS_EXCLUDED(cs_wallet);
     bool ChangeWalletPassphrase(const SecureString& strOldWalletPassphrase, const SecureString& strNewWalletPassphrase);
