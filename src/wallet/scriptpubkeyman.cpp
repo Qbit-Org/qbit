@@ -1068,7 +1068,7 @@ bool DescriptorScriptPubKeyMan::CheckDecryptionKey(const CKeyingMaterial& master
 
 bool DescriptorScriptPubKeyMan::Encrypt(const CKeyingMaterial& master_key, WalletBatch* batch)
 {
-    LOCK(cs_desc_man);
+    AssertLockHeld(cs_desc_man);
     if (HasBlockedPlaintextPQCKeys()) {
         return false;
     }
@@ -1131,10 +1131,26 @@ void DescriptorScriptPubKeyMan::ReturnDestination(int64_t index, bool internal, 
 
 std::map<CKeyID, CKey> DescriptorScriptPubKeyMan::GetKeys() const
 {
+    bool has_encryption_keys{false};
+    std::optional<CKeyingMaterial> encryption_key;
+    return GetKeys(has_encryption_keys, encryption_key);
+}
+
+std::map<CKeyID, CKey> DescriptorScriptPubKeyMan::GetKeys(bool& has_encryption_keys, std::optional<CKeyingMaterial>& encryption_key) const
+{
     KeyMap keys;
     CryptedKeyMap crypted_keys;
-    const bool has_encryption_keys = m_storage.HasEncryptionKeys();
-    std::optional<CKeyingMaterial> encryption_key;
+    {
+        // EncryptWallet holds cs_desc_man while it adds the first master key
+        // and encrypts the keys, so the state and the copy agree.
+        LOCK(cs_desc_man);
+        has_encryption_keys = m_storage.HasEncryptionKeys();
+        keys = m_map_keys;
+        if (has_encryption_keys) {
+            crypted_keys = m_map_crypted_keys;
+        }
+    }
+    encryption_key.reset();
     if (has_encryption_keys) {
         m_storage.WithEncryptionKey([&](const CKeyingMaterial& key) {
             if (!key.empty()) {
@@ -1142,13 +1158,6 @@ std::map<CKeyID, CKey> DescriptorScriptPubKeyMan::GetKeys() const
             }
             return true;
         });
-    }
-    {
-        LOCK(cs_desc_man);
-        keys = m_map_keys;
-        if (has_encryption_keys) {
-            crypted_keys = m_map_crypted_keys;
-        }
     }
 
     if (has_encryption_keys && !crypted_keys.empty()) {
@@ -1215,19 +1224,27 @@ bool DescriptorScriptPubKeyMan::TopUpWithInternalHint(std::optional<bool> intern
 
 DescriptorScriptPubKeyMan::TopUpPreparation DescriptorScriptPubKeyMan::PrepareTopUp(std::optional<bool> internal_hint) const
 {
+    AssertLockNotHeld(cs_desc_man);
     TopUpPreparation prepared;
     prepared.spkman_is_internal = internal_hint.has_value() ? internal_hint : m_storage.IsInternalScriptPubKeyMan(this);
-    prepared.provider.keys = GetKeys();
-    prepared.has_encryption_keys = m_storage.HasEncryptionKeys();
-    if (prepared.has_encryption_keys) {
-        m_storage.WithEncryptionKey([&](const CKeyingMaterial& key) {
-            if (!key.empty()) {
-                prepared.encryption_key = key;
-            }
-            return true;
-        });
-    }
+    // Take the keys, the encryption state and the encryption key together, so
+    // that CheckTopUpPreparation's check of the state also covers the keys.
+    prepared.provider.keys = GetKeys(prepared.has_encryption_keys, prepared.encryption_key);
     return prepared;
+}
+
+util::Result<void> DescriptorScriptPubKeyMan::CheckTopUpPreparation(const TopUpPreparation& prepared) const
+{
+    AssertLockHeld(cs_desc_man);
+    // Encryption cannot be undone, and EncryptWallet adds the first master
+    // key while it holds the cs_desc_man of every manager in the wallet, so
+    // the answer stays valid until cs_desc_man is released. A plaintext
+    // snapshot taken before that would write plaintext keys into the
+    // encrypted wallet.
+    if (!prepared.has_encryption_keys && m_storage.HasEncryptionKeys()) {
+        return util::Error{Untranslated("wallet was encrypted after this keypool top-up took its key snapshot")};
+    }
+    return {};
 }
 
 util::Result<void> DescriptorScriptPubKeyMan::TopUpWithInternalHintResult(std::optional<bool> internal_hint, unsigned int size)
@@ -1242,9 +1259,15 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithInternalHintResultNoNotif
 {
     AssertLockNotHeld(cs_desc_man);
     const TopUpPreparation prepared{PrepareTopUp(internal_hint)};
+    if (m_after_prepare_top_up) m_after_prepare_top_up();
     std::shared_ptr<TopUpChange> change;
     {
         LOCK(cs_desc_man);
+        // Fail a stale attempt as a locked wallet would; a later attempt takes
+        // a new snapshot. Checking before the transaction begins keeps a stale
+        // top-up from waiting for the writer or holding a transaction open
+        // during EncryptWallet's database rewrite.
+        if (auto res{CheckTopUpPreparation(prepared)}; !res) return res;
         // Keep descriptor and database lock ordering aligned with address reservation.
         WalletBatch batch(m_storage.GetDatabase());
         if (!batch.TxnBegin()) {
@@ -1338,6 +1361,7 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBResult(WalletBatch& bat
 util::Result<std::shared_ptr<DescriptorScriptPubKeyMan::TopUpChange>> DescriptorScriptPubKeyMan::TopUpWithDBPreparedResult(WalletBatch& batch, unsigned int size, const TopUpPreparation& prepared, bool throw_on_persistence_error, bool rollback_state_on_error)
 {
     AssertLockHeld(cs_desc_man);
+    if (auto res{CheckTopUpPreparation(prepared)}; !res) return util::Error{util::ErrorString(res)};
     auto rollback_state{std::make_shared<TopUpRollbackState>(
         m_wallet_descriptor.range_start,
         m_wallet_descriptor.range_end,

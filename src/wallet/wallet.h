@@ -862,6 +862,10 @@ public:
     // derived the encryption key and before it takes the wallet locks. Same
     // configuration rules as m_before_script_pub_key_cache_publish.
     std::function<void()> m_before_encrypt_wallet_locks;
+    // Optional deterministic test hook invoked by EncryptWallet once its
+    // database transaction has begun. Same configuration rules as
+    // m_before_script_pub_key_cache_publish.
+    std::function<void()> m_after_encrypt_wallet_txn_begin;
     bool m_deferred_create_keypool_top_up_scheduled GUARDED_BY(cs_wallet){false};
     bool m_deferred_create_keypool_top_up_reschedule_requested GUARDED_BY(cs_wallet){false};
     bool m_p2mr_receive_keypool_refill_scheduled GUARDED_BY(cs_wallet){false};

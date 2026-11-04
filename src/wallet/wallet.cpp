@@ -79,6 +79,7 @@
 #include <cassert>
 #include <condition_variable>
 #include <exception>
+#include <forward_list>
 #include <optional>
 #include <stdexcept>
 #include <thread>
@@ -1138,6 +1139,14 @@ void CWallet::AddToSpends(const CWalletTx& wtx)
         AddToSpends(txin.prevout, wtx.GetHash());
 }
 
+//! EncryptWallet holds the descriptor locks in a list, which the thread-safety
+//! analysis cannot follow. Check that this one is held (with DEBUG_LOCKORDER)
+//! and tell the analysis, so that it still checks the calls that need it.
+static void AssertDescriptorLockHeld(const DescriptorScriptPubKeyMan* desc_spk_man) ASSERT_EXCLUSIVE_LOCK(desc_spk_man->cs_desc_man) NO_THREAD_SAFETY_ANALYSIS
+{
+    AssertLockHeld(desc_spk_man->cs_desc_man);
+}
+
 bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase, bool use_create_keypool_warmup)
 {
     // Only descriptor wallets can be encrypted
@@ -1177,12 +1186,30 @@ bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase, bool use_cr
         }
         WalletLogPrintf("Encrypting Wallet with an nDeriveIterations of %i\n", master_key.nDeriveIterations);
 
+        // Take every descriptor manager's lock before the transaction begins.
+        // A background top-up holds its manager's lock without cs_wallet while
+        // it waits for the database writer, so waiting for that lock with the
+        // transaction open would deadlock. Holding the locks until the commit
+        // also means a top-up that checks the encryption state under its lock
+        // sees the wallet either before the master key is added or after the
+        // encrypted keys are committed. UniqueLock cannot be moved, so the
+        // locks are constructed in place in a list.
+        std::vector<DescriptorScriptPubKeyMan*> desc_spk_mans;
+        std::forward_list<UniqueLock<RecursiveMutex>> desc_spk_man_locks;
+        for (const auto& [_, spk_man] : m_spk_managers) {
+            auto* desc_spk_man{dynamic_cast<DescriptorScriptPubKeyMan*>(spk_man.get())};
+            assert(desc_spk_man); // Only descriptor wallets can be encrypted
+            desc_spk_mans.push_back(desc_spk_man);
+            desc_spk_man_locks.emplace_front(desc_spk_man->cs_desc_man, "desc_spk_man->cs_desc_man", __FILE__, __LINE__);
+        }
+
         WalletBatch* encrypted_batch = new WalletBatch(GetDatabase());
         if (!encrypted_batch->TxnBegin()) {
             delete encrypted_batch;
             encrypted_batch = nullptr;
             return false;
         }
+        if (m_after_encrypt_wallet_txn_begin) m_after_encrypt_wallet_txn_begin();
         // The master key becomes visible in memory only once it is part of
         // the open transaction, so a failure up to here leaves the wallet
         // unencrypted in memory as well as on disk.
@@ -1196,9 +1223,9 @@ bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase, bool use_cr
         nMasterKeyMaxID = master_key_id;
         mapMasterKeys[master_key_id] = master_key;
 
-        for (const auto& spk_man_pair : m_spk_managers) {
-            auto spk_man = spk_man_pair.second.get();
-            if (!spk_man->Encrypt(plain_master_key, encrypted_batch)) {
+        for (DescriptorScriptPubKeyMan* desc_spk_man : desc_spk_mans) {
+            AssertDescriptorLockHeld(desc_spk_man);
+            if (!desc_spk_man->Encrypt(plain_master_key, encrypted_batch)) {
                 encrypted_batch->TxnAbort();
                 delete encrypted_batch;
                 encrypted_batch = nullptr;
@@ -1218,6 +1245,8 @@ bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase, bool use_cr
 
         delete encrypted_batch;
         encrypted_batch = nullptr;
+        // Release in the reverse order of acquisition.
+        while (!desc_spk_man_locks.empty()) desc_spk_man_locks.pop_front();
 
         ClearMasterKey();
         Unlock(strWalletPassphrase, /*run_pending_initial_keypool_top_up=*/false);
@@ -4946,8 +4975,11 @@ DescriptorScriptPubKeyMan& CWallet::SetupDescriptorScriptPubKeyMan(WalletBatch& 
         if (IsLocked()) {
             throw std::runtime_error(std::string(__func__) + ": Wallet is locked, cannot setup new descriptors");
         }
-        if (!spk_manager->CheckDecryptionKey(vMasterKey) && !spk_manager->Encrypt(vMasterKey, &batch)) {
-            throw std::runtime_error(std::string(__func__) + ": Could not encrypt new descriptors");
+        if (!spk_manager->CheckDecryptionKey(vMasterKey)) {
+            LOCK(spk_manager->cs_desc_man);
+            if (!spk_manager->Encrypt(vMasterKey, &batch)) {
+                throw std::runtime_error(std::string(__func__) + ": Could not encrypt new descriptors");
+            }
         }
     }
     const unsigned int initial_keypool_size = use_create_keypool_warmup ? GetCreateWalletWarmupKeypoolSize(output_type, m_keypool_size) : 0;
