@@ -101,6 +101,8 @@ while [ $# -gt 0 ]; do
     shift
 done
 grep -q '^UNSTRIPPED ' "$input" || { echo "fake dsymutil: no debug map in $input" >&2; exit 1; }
+# Stricter than dsymutil, which creates missing parents: build.sh creates them.
+[ -d "$(dirname "$out")" ] || { echo "fake dsymutil: no directory for $out" >&2; exit 1; }
 mkdir -p "$out/Contents/Resources/DWARF"
 echo "plist $(basename "$input")" > "$out/Contents/Info.plist"
 { printf 'DWARF '; cat "$input"; } > "$out/Contents/Resources/DWARF/$(basename "$input")"
