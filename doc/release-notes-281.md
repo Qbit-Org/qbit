@@ -32,4 +32,7 @@ Other wallet commands that send are unchanged by this fix, including
 `sendall`, `sendtoaddress` and `sendmany`, which hold the wallet lock from coin
 selection through commit, and the GUI send flow. Calls to `send` with
 `add_to_wallet=false` or `psbt=true`, and calls whose transaction is not fully
-signed, broadcast nothing and behave as before. (#281)
+signed, broadcast nothing and behave as before.
+
+The help for `walletcreatefundedpsbt` now says to set `lockUnspents` when
+funding PSBTs concurrently. (#281)
