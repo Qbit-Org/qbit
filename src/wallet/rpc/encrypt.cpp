@@ -264,6 +264,18 @@ RPCHelpMan encryptwallet()
         throw JSONRPCError(RPC_WALLET_ENCRYPTION_FAILED, "Error: wallet does not contain private keys, nothing to encrypt.");
     }
 
+    // A rescan or descriptor import holds m_relock_mutex for its whole run,
+    // and an import also holds cs_wallet while it derives keys. Fail at once,
+    // with the errors and in the order that encryptwallet used before it took
+    // the locks first, and like it read the encryption state without them.
+    // The checks are repeated under the locks.
+    if (pwallet->IsScanningWithPassphrase()) {
+        if (pwallet->IsCrypted()) {
+            throw JSONRPCError(RPC_WALLET_WRONG_ENC_STATE, "Error: running with an encrypted wallet, but encryptwallet was called.");
+        }
+        throw JSONRPCError(RPC_WALLET_ERROR, "Error: the wallet is currently being used to rescan the blockchain for related transactions. Please call `abortrescan` before encrypting the wallet.");
+    }
+
     // Hold the locks from the encryption-state check through the encryption
     // itself, so a call that overlaps another encryption reports the wallet
     // as already encrypted once that encryption has finished.

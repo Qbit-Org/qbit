@@ -91,6 +91,40 @@ class WalletEncryptionTest(BitcoinTestFramework):
             wallet.getnewaddress()
         wallet.unloadwallet()
 
+    def test_encrypt_during_rescan(self):
+        self.log.info("Test that encryptwallet fails at once while the wallet is rescanning")
+        node = self.nodes[0]
+        node.createwallet(wallet_name="rescan_source")
+        source = node.get_wallet_rpc("rescan_source")
+        desc = next(d["desc"] for d in source.listdescriptors(True)["descriptors"] if d["desc"].startswith("mr(") and not d["internal"])
+        source.unloadwallet()
+        node.createwallet(wallet_name="rescanning", blank=True)
+        wallet = node.get_wallet_rpc("rescanning")
+        assert_equal(wallet.importdescriptors([{"desc": desc, "timestamp": "now", "range": [0, 1]}]), [{"success": True}])
+        results = []
+
+        def import_descriptor():
+            if self.options.usecli:
+                rpc = node.cli("-rpcwallet=rescanning")
+            else:
+                rpc = get_rpc_proxy(node.url, 0, timeout=600, coveragedir=node.coverage_dir) / "wallet/rescanning"
+            results.append(rpc.importdescriptors([{"desc": desc, "timestamp": 0, "range": [0, 299]}]))
+
+        # Widening the range of the imported descriptor logs the update after
+        # the import has reserved the rescan, then derives the new P2MR keys,
+        # which is slow enough to keep the reservation for seconds.
+        importing = Thread(target=import_descriptor)
+        with node.busy_wait_for_debug_log([b"Update existing descriptor"]):
+            importing.start()
+        assert_raises_rpc_error(-4, "Error: the wallet is currently being used to rescan the blockchain for related transactions. Please call `abortrescan` before encrypting the wallet.", wallet.encryptwallet, "pass")
+        # It failed while the import was still running, rather than after it.
+        assert importing.is_alive()
+        importing.join()
+        assert_equal(results, [[{"success": True}]])
+        # The wallet was not encrypted after the import finished either.
+        assert_raises_rpc_error(-15, "Error: running with an unencrypted wallet, but walletlock was called.", wallet.walletlock)
+        wallet.unloadwallet()
+
     def run_test(self):
         passphrase = "WalletPassphrase"
         passphrase2 = "SecondWalletPassphrase"
@@ -266,6 +300,7 @@ class WalletEncryptionTest(BitcoinTestFramework):
                 assert_equal(all([not line.startswith("046d6b6579") for line in f]), True)
 
         self.test_rewrite_after_encryption()
+        self.test_encrypt_during_rescan()
 
 
 if __name__ == '__main__':
