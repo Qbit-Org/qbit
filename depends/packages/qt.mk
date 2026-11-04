@@ -10,16 +10,21 @@ endif
 $(package)_linux_dependencies := freetype fontconfig libxcb libxkbcommon libxcb_util libxcb_util_cursor libxcb_util_render libxcb_util_keysyms libxcb_util_image libxcb_util_wm
 $(package)_freebsd_dependencies := $($(package)_linux_dependencies)
 $(package)_patches_path := $(qt_details_patches_path)
-$(package)_patches := dont_hardcode_pwd.patch
+$(package)_patches := cocoa_compat.patch
+$(package)_patches += dont_hardcode_pwd.patch
 $(package)_patches += qtbase-moc-ignore-gcc-macro.patch
 $(package)_patches += qtbase_avoid_native_float16.patch
 $(package)_patches += qtbase_avoid_qmain.patch
-$(package)_patches += qtbase_platformsupport.patch
 $(package)_patches += qtbase_plugins_cocoa.patch
-$(package)_patches += qtbase_plugins_windows11style.patch
 $(package)_patches += qtbase_skip_tools.patch
 $(package)_patches += rcc_hardcode_timestamp.patch
 $(package)_patches += qttools_skip_dependencies.patch
+$(package)_patches += fix-gcc16-qcompare.patch
+$(package)_patches += fix-gcc16-sfinae-qregularexpression.patch
+$(package)_patches += fix-gcc16-sfinae-qchar.patch
+$(package)_patches += fix-gcc16-sfinae-qbitarray.patch
+$(package)_patches += fix-gcc16-sfinae-qanystringview.patch
+$(package)_patches += fix-qbytearray-include.patch
 
 $(package)_qttranslations_file_name=$(qt_details_qttranslations_file_name)
 $(package)_qttranslations_sha256_hash=$(qt_details_qttranslations_sha256_hash)
@@ -94,6 +99,9 @@ $(package)_config_opts += -no-feature-image_heuristic_mask
 $(package)_config_opts += -no-feature-keysequenceedit
 $(package)_config_opts += -no-feature-lcdnumber
 $(package)_config_opts += -no-feature-libresolv
+# Disable libstdcpp_assertions (_GLIBCXX_ASSERTIONS) to prevent embedding absolute
+# C++ standard library paths into object files, which breaks reproducible builds.
+$(package)_config_opts += -no-feature-libstdcpp_assertions
 $(package)_config_opts += -no-feature-networkdiskcache
 $(package)_config_opts += -no-feature-networkproxy
 $(package)_config_opts += -no-feature-printsupport
@@ -134,11 +142,10 @@ endif
 
 $(package)_config_opts_darwin := -no-dbus
 $(package)_config_opts_darwin += -no-feature-printsupport
-$(package)_config_opts_darwin += -no-freetype
+$(package)_config_opts_darwin += -no-feature-freetype
 $(package)_config_opts_darwin += -no-pkg-config
 
-$(package)_config_opts_linux := -dbus-runtime
-$(package)_config_opts_linux += -fontconfig
+$(package)_config_opts_linux := -fontconfig
 $(package)_config_opts_linux += -no-feature-process
 $(package)_config_opts_linux += -no-feature-xlib
 $(package)_config_opts_linux += -no-xcb-xlib
@@ -151,7 +158,7 @@ endif
 $(package)_config_opts_freebsd := $$($(package)_config_opts_linux)
 
 $(package)_config_opts_mingw32 := -no-dbus
-$(package)_config_opts_mingw32 += -no-freetype
+$(package)_config_opts_mingw32 += -no-feature-freetype
 $(package)_config_opts_mingw32 += -no-pkg-config
 
 # CMake build options.
@@ -162,13 +169,17 @@ $(package)_config_env_darwin += OBJCXX="$$($(package)_cxx)"
 
 $(package)_cmake_opts := -DCMAKE_PREFIX_PATH=$(host_prefix)
 $(package)_cmake_opts += -DQT_FEATURE_cxx20=ON
-$(package)_cmake_opts += -DQT_ENABLE_CXX_EXTENSIONS=OFF
+$(package)_cmake_opts += -DQT_GENERATE_SBOM=OFF
 ifneq ($(V),)
 $(package)_cmake_opts += --log-level=STATUS
 endif
 
 $(package)_cmake_opts += -DQT_USE_DEFAULT_CMAKE_OPTIMIZATION_FLAGS=ON
-$(package)_cmake_opts += -DCMAKE_C_FLAGS="$$($(package)_cppflags) $$($$($(package)_type)_CFLAGS) -ffile-prefix-map=$$($(package)_extract_dir)=/usr"
+# The bundled libpng 1.6.49 in Qt 6.8.4 introduced support for
+# the RISC-V Vector Extension (RVV). However, the resulting library
+# fails to link when cross-compiling for riscv64-linux-gnu.
+# Disable this feature for now.
+$(package)_cmake_opts += -DCMAKE_C_FLAGS="$$($(package)_cppflags) -DPNG_RISCV_RVV_OPT=0 $$($$($(package)_type)_CFLAGS) -ffile-prefix-map=$$($(package)_extract_dir)=/usr"
 $(package)_cmake_opts += -DCMAKE_C_FLAGS_RELEASE="$$($$($(package)_type)_release_CFLAGS)"
 $(package)_cmake_opts += -DCMAKE_C_FLAGS_DEBUG="$$($$($(package)_type)_debug_CFLAGS)"
 $(package)_cmake_opts += -DCMAKE_CXX_FLAGS="$$($(package)_cppflags) $$($$($(package)_type)_CXXFLAGS) -ffile-prefix-map=$$($(package)_extract_dir)=/usr"
@@ -198,6 +209,11 @@ $(package)_cmake_opts += -DCMAKE_DISABLE_FIND_PACKAGE_Libb2=TRUE
 $(package)_cmake_opts += -DCMAKE_DISABLE_FIND_PACKAGE_WrapSystemDoubleConversion=TRUE
 $(package)_cmake_opts += -DCMAKE_DISABLE_FIND_PACKAGE_WrapSystemMd4c=TRUE
 $(package)_cmake_opts += -DCMAKE_DISABLE_FIND_PACKAGE_WrapZSTD=TRUE
+endif
+ifeq ($(host_os),linux)
+# The `-dbus-runtime` configure option does not work
+# https://qt-project.atlassian.net/browse/QTBUG-144864
+$(package)_cmake_opts += -DINPUT_dbus=runtime
 endif
 ifeq ($(host_os),darwin)
 $(package)_cmake_opts += -DCMAKE_INSTALL_NAME_TOOL=true
@@ -256,15 +272,20 @@ endef
 endif
 
 define $(package)_preprocess_cmds
+  patch -p1 -i $($(package)_patch_dir)/cocoa_compat.patch && \
   patch -p1 -i $($(package)_patch_dir)/dont_hardcode_pwd.patch && \
   patch -p1 -i $($(package)_patch_dir)/qtbase-moc-ignore-gcc-macro.patch && \
   patch -p1 -i $($(package)_patch_dir)/qtbase_avoid_native_float16.patch && \
   patch -p1 -i $($(package)_patch_dir)/qtbase_avoid_qmain.patch && \
-  patch -p1 -i $($(package)_patch_dir)/qtbase_platformsupport.patch && \
   patch -p1 -i $($(package)_patch_dir)/qtbase_plugins_cocoa.patch && \
-  patch -p1 -i $($(package)_patch_dir)/qtbase_plugins_windows11style.patch && \
   patch -p1 -i $($(package)_patch_dir)/qtbase_skip_tools.patch && \
-  patch -p1 -i $($(package)_patch_dir)/rcc_hardcode_timestamp.patch
+  patch -p1 -i $($(package)_patch_dir)/rcc_hardcode_timestamp.patch && \
+  patch -p1 -i $($(package)_patch_dir)/fix-gcc16-qcompare.patch && \
+  patch -p1 -i $($(package)_patch_dir)/fix-gcc16-sfinae-qregularexpression.patch && \
+  patch -p1 -i $($(package)_patch_dir)/fix-gcc16-sfinae-qchar.patch && \
+  patch -p1 -i $($(package)_patch_dir)/fix-gcc16-sfinae-qbitarray.patch && \
+  patch -p1 -i $($(package)_patch_dir)/fix-gcc16-sfinae-qanystringview.patch && \
+  patch -p1 -i $($(package)_patch_dir)/fix-qbytearray-include.patch
 endef
 ifeq ($(host),$(build))
   $(package)_preprocess_cmds += && patch -p1 -i $($(package)_patch_dir)/qttools_skip_dependencies.patch
