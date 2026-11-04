@@ -12,5 +12,11 @@ The node now keeps track of the wallet files it has open, by device and inode,
 and recognizes them without opening them, so their locks stay held.
 `listwalletdir` output is unchanged.
 
+On those systems, `restorewallet` and the GUI's Restore Wallet action now
+refuse a backup file that is the database of a wallet loaded by the same node.
+Copying the live file released the lock on the loaded wallet, and the restored
+copy would then sign alongside the original. Run `backupwallet` first and
+restore from that backup.
+
 Windows behavior is unchanged: closing a file there does not release locks
 held through other handles.

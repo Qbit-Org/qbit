@@ -801,6 +801,13 @@ std::shared_ptr<CWallet> RestoreWallet(WalletContext& context, const fs::path& b
             return nullptr;
         }
 
+        // Copying the file would release this process's lock on a loaded wallet.
+        if (IsRegisteredSQLiteFile(backup_file)) {
+            error = Untranslated(strprintf("Failed to restore wallet. Backup file '%s' is the database of a loaded wallet. Run backupwallet first and restore from that backup.", fs::PathToString(backup_file)));
+            status = DatabaseStatus::FAILED_INVALID_BACKUP_FILE;
+            return nullptr;
+        }
+
         // Wallet directories are allowed to exist, but must not contain a .dat file.
         // Any existing wallet database is treated as a hard failure to prevent overwriting.
         if (fs::exists(wallet_path)) {
