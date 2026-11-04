@@ -5,8 +5,8 @@ Qbit: Post-quantum peer to peer digital value
 
 Qbit version v1.0.1 is available from the release page for that version.
 
-This is a mainnet maintenance release built from the reviewed `1.x.x` branch
-changes since the signed `v1.0.0` tag. It focuses on wallet and qbit-qt
+This is a mainnet maintenance release built from the `1.x.x` branch changes
+since the signed `v1.0.0` tag. It focuses on wallet and qbit-qt
 reliability, the wallet fallback-fee default, visibility of consumed PQC
 signing capacity, validation and fuzz tooling, and release and CI hardening.
 It also carries fixes from the v1.0.1 release review: a standard-policy limit
@@ -51,9 +51,10 @@ used, but a downgraded node loses the fixes in this release, including the
 wallet encryption fixes (#277).
 
 On Linux, replace the installed `qbit`, `qbitd`, `qbit-qt`, `qbit-cli`,
-`qbit-tx`, `qbit-util`, and `qbit-wallet` binaries, and any other files
-installed from the previous release archive, with the versions from the new
-archive.
+`qbit-tx`, `qbit-util`, and `qbit-wallet` binaries from the archive's `bin`
+directory, the `libexec/qbit-node` and `libexec/qbit-gui` binaries (the
+IPC-enabled node and GUI that `qbit -m` runs), and any other files installed
+from the previous release archive, with the versions from the new archive.
 
 On macOS, replace the installed Qbit application bundle or unpack the updated
 archive into the desired location.
@@ -65,15 +66,20 @@ Behavior changes to review before upgrading
 -------------------------------------------
 
 - The wallet `-fallbackfee` default changed from disabled to the minimum relay
-  fee rate. Operators who relied on transaction creation failing when no fee
-  estimate is available must set `-fallbackfee=0` explicitly (#151).
+  fee rate. When no fee estimate is available, the wallet now pays at least
+  that rate instead of failing, and peers with a stricter policy, or a
+  congested network, may not relay or mine such a transaction until its fee is
+  bumped (see Fallback fee). Operators who relied on transaction creation
+  failing when no fee estimate is available must set `-fallbackfee=0`
+  explicitly (#151).
 - `gettransaction`, `listtransactions`, and default `listsinceblock` output
   now include a fee-only `send` entry, with `amount` of zero and a negative
   `fee` and without `address`, `label`, or `vout`, for a self-transfer whose
   outputs are all change. Integrations that assume every `send` entry has an
   address, a `vout`, or a non-zero amount should be checked (#150).
-- An `encryptwallet` call that overlaps another encryption of the same wallet
-  now fails deterministically with error code `-15`
+- If another encryption of the same wallet completes first, for example a
+  concurrent `encryptwallet` call or qbit-qt's Encrypt Wallet dialog,
+  `encryptwallet` now fails with error code `-15`
   (`RPC_WALLET_WRONG_ENC_STATE`), the code a call on an already encrypted
   wallet already returned. Previously it could fail with `-16` "Failed to
   encrypt". Other `encryptwallet` failures keep their previous error codes
@@ -175,9 +181,9 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   longer final at the current chain tip after a reorg during asynchronous
   signing, is rejected instead of being recorded and then failing to
   broadcast (#163).
-- Foreign P2MR witnesses that are already satisfied, including valid
-  nonstandard leaves, are recognized as complete instead of incomplete
-  during batched signing (#163).
+- Foreign P2MR witnesses that already pass standard script verification,
+  including those for leaves the signing planner does not recognize, are
+  treated as complete instead of incomplete during batched signing (#163).
 - qbit-qt cancels active send workers before wallet views are torn down and
   joins already-cancelled workers during destruction (#137).
 - Wallet encryption now checks that the wallet is not already encrypted, and
@@ -210,13 +216,22 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   (250 sat/kvB, that is 0.0000025 QBT/kvB) instead of being disabled.
   Previously, when the fee estimator had no data, which is the normal state on
   a young chain with an empty mempool, transaction creation failed with
-  "Fee estimation failed. Fallbackfee is disabled." Wallets now pay the relay
-  floor in that case. The fallback is used only when no smart fee estimate is
-  available; live estimates take precedence as soon as the estimator has
-  observed confirming transactions, and the final feerate is still clamped to
-  at least the node's required and mempool minimum feerates, so the fallback
-  cannot underpay relay policy. Set `-fallbackfee=0` to restore the previous
-  behavior of failing instead (#151).
+  "Fee estimation failed. Fallbackfee is disabled." Wallets now pay the
+  fallback rate in that case. The fallback is used only when no smart fee
+  estimate is available; live estimates take precedence as soon as the
+  estimator has observed confirming transactions. A node that was stopped for
+  more than 60 hours discards its saved fee estimates at startup, so its
+  wallets use the fallback again until it has observed new ones (#151).
+- When it uses the fallback, the wallet never pays less than the highest of
+  this node's minimum relay fee, `-mintxfee`, and current mempool minimum fee.
+  Those are only this node's limits: peers with a higher minimum, or a
+  congested network, may not relay or mine a transaction paid at the fallback
+  rate, and it can stay unconfirmed until its fee is bumped. A `bumpfee`
+  without an explicit fee rate raises the rate by at least 5,000 sat/kvB, and
+  bumping a P2MR transaction re-signs every input, which consumes PQC signing
+  capacity. Services that prefer transaction creation to fail when no estimate
+  is available should set `-fallbackfee=0`, which restores the previous
+  behavior (#151).
 
 ### Updated RPCs
 
@@ -387,16 +402,21 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   a key error rather than a signature error. qbit treats every library error
   as a failed operation, as before, so wallet and RPC behavior does not
   change. Keys and signatures are byte-identical to those produced by v1.0.0,
-  and verification accepts and rejects the same signatures. In measurements
-  made for the v1.0.1 release review, key generation takes about 11 to 14%
-  longer and signing about 14 to 18% longer. Verification is unchanged where
-  SHA-256 uses the x86 SHA-NI backend, and about 6.5% slower on the scalar SHA
-  backend, which x86 CPUs without SHA-NI and aarch64, armhf, riscv64, and
-  ppc64 Linux builds use. These figures do not cover Apple silicon Macs, which
-  hash through CommonCrypto, or secret-key validation; #268's earlier
-  measurement of v0.3.1 put validation about 12% slower, like key generation.
-  Each key generation, validation, or signing call inside the library needs
-  about 17 KiB of free stack (#268, refs #260).
+  and verification accepts and rejects the same signatures. qbit builds the
+  library in production mode on every platform, which fixes its SHA-256 and
+  SHA-512 block functions to the library's portable code: its x86 SHA-NI,
+  ARMv8 SHA, and Apple CommonCrypto backends are never used. On x86 CPUs with
+  AVX2, key generation and signing also use the library's eight-way AVX2
+  SHA-256 code; verification does not. In measurements of production-mode
+  builds on x86-64 Linux with AVX2, made for the v1.0.1 release review, key
+  generation takes about 11 to 15% longer and signing about 11 to 18% longer,
+  and verification shows no change beyond measurement noise. Other CPUs and
+  platforms were not measured, including aarch64 and other non-x86 Linux
+  builds, Macs, and x86 CPUs without AVX2. Secret-key validation was not
+  measured either; #268's earlier measurement of v0.3.1 put it about 12%
+  slower, like key generation. A key generation, validation, or signing call
+  made directly to the library needs about 17 KiB of free stack; qbit's own
+  calls need more (see the next entry) (#268, refs #260).
 - After each PQC key generation, secret-key validation, signing, and HD key
   derivation call, qbit now overwrites 32 KiB of the stack the call released.
   This clears the HD master-seed material and HKDF state that qbit's own HD
@@ -413,8 +433,8 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   documentation, verifies the release signer against the release key policy,
   and requires each build's reported project version to match its tag.
   Release candidates are not published to the versioned site. The versioned
-  site is not deployed yet; docs.qbit.org still serves the documentation
-  deployed by the earlier workflow (#148).
+  site is not deployed yet: docs.qbit.org serves the documentation deployed
+  by the earlier workflow until this workflow reaches `main` (#148).
 - The local release publisher fails closed when the paginated release asset
   listing cannot be read, instead of treating an empty or partial listing as
   a valid draft and uploading assets it believed were missing (#170,
@@ -539,10 +559,16 @@ Known limitations
     large AuxPoW headers. They take a message cut short for size as the end of
     the peer's headers, and when they serve headers they still send the
     oversized message, which upgraded nodes also reject.
-  - Low-work headers sync still gives up on a peer if the AuxPoW payloads it
-    holds while redownloading exceed its existing 36 MB per-peer bound. That
-    bound was derived for 2,000-header messages and has not been re-derived
-    for messages cut short by size.
+  - Low-work headers sync holds at most 36 MB of AuxPoW payload while
+    redownloading, so it cannot complete, from any peer, through a range where
+    roughly 15,000 to 17,000 consecutive headers carry more than that. It
+    fails in that range with every peer and retries at each block
+    announcement, downloading the range again each time. The failure is logged
+    only with `-debug=net`. A node uses low-work headers sync for a chain with
+    less work than `-minimumchainwork`, which is zero by default, or than its
+    tip minus the work of its last 144 blocks. The 36 MB bound was derived for
+    2,000-header messages and has not been re-derived for messages cut short
+    by size (#309).
   - The block index keeps the first copy of a header it receives, with that
     copy's AuxPoW. Producing a stored copy whose AuxPoW is larger than its
     block's takes a second valid parent-chain proof of work. If a reply is cut
@@ -648,10 +674,9 @@ Known limitations
   over IPC, and discard a template after such a rejection.
 - The depth of the libbitcoinpqc and qbit stack wipes is verified only on
   Linux x86_64 and i686. The unit tests that check them skip Windows and
-  sanitizer builds, and CI runs no macOS or ARM unit tests. On macOS the
-  library hashes through CommonCrypto, whose SHA context it does not wipe, so
-  it relies on the library's 16 KiB stack burn and qbit's 32 KiB wipe to
-  clear that context (#268, #270, refs #260).
+  sanitizer builds, and CI runs no unit tests on macOS or on ARM, riscv64, or
+  ppc64, so the depth is unverified on macOS, Windows, and Linux on ARM,
+  riscv64, and ppc64, and in sanitizer builds (#268, #270, refs #260).
 - The v1.0.1 release readiness inspection (#174) exercised a testnet4 wallet on
   macOS. Linux and Windows desktop notification behavior and a packaged-binary
   smoke check on each supported platform are separate release evidence.
