@@ -62,6 +62,11 @@ void WalletFrame::prepareForShutdown()
     for (WalletView* wallet_view : mapWalletViews) {
         wallet_view->prepareForShutdown();
     }
+    // PSBT dialogs are children of this frame, not of a wallet view, and
+    // outlive the wallet views and models during shutdown.
+    for (PSBTOperationsDialog* dialog : findChildren<PSBTOperationsDialog*>()) {
+        dialog->prepareForShutdown();
+    }
 }
 
 void WalletFrame::setClientModel(ClientModel *_clientModel)

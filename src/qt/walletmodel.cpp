@@ -37,6 +37,7 @@
 #include <memory>
 #include <vector>
 
+#include <QDateTime>
 #include <QDebug>
 #include <QMetaObject>
 #include <QMessageBox>
@@ -59,6 +60,7 @@ struct WalletModel::BumpFeeResult {
     CAmount new_fee{0};
     CMutableTransaction mtx;
     wallet::PQCUsageReport pqc_usage;
+    QDateTime committed_at;
     bool prepared{false};
     bool signed_ok{false};
     bool committed{false};
@@ -1021,6 +1023,7 @@ void WalletModel::startBumpFeeSigning(uint64_t generation, std::shared_ptr<BumpF
                 post_progress(BumpFeeProgress{.phase = BumpFeeProgressPhase::Committing}, /*cancellable=*/false);
                 result->committed = result->wallet->commitBumpTransaction(
                     result->original_txid, std::move(result->mtx), result->errors, result->bumped_txid);
+                if (result->committed) result->committed_at = QDateTime::currentDateTime();
             } else if (cancellation_state->load() == BumpFeeCancellationState::Canceled) {
                 result->canceled = true;
             }
@@ -1125,6 +1128,7 @@ void WalletModel::bumpFeeFinished(uint64_t generation, std::shared_ptr<BumpFeeRe
 
     const Txid original_txid{result->original_txid};
     const Txid bumped_txid{result->bumped_txid};
+    const QDateTime committed_at{result->committed_at};
     const QString usage{FormatPQCSigningOutcomePlain(result->pqc_usage, PQCSigningOutcome::Consumed)};
     if (!usage.isEmpty()) {
         Q_EMIT message(tr("Fee bump"), usage,
@@ -1132,7 +1136,7 @@ void WalletModel::bumpFeeFinished(uint64_t generation, std::shared_ptr<BumpFeeRe
         if (!still_current()) return;
     }
     resetBumpFeeState();
-    Q_EMIT feeBumped(original_txid, bumped_txid, usage);
+    Q_EMIT feeBumped(original_txid, bumped_txid, usage, committed_at);
 }
 
 void WalletModel::cancelBumpFee()

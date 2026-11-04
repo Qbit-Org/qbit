@@ -141,7 +141,7 @@ public:
     bool changeWalletPassphrase(const SecureString&, const SecureString&) override { return false; }
     void abortRescan() override {}
     bool backupWallet(const std::string&) override { return false; }
-    std::string getWalletName() override { return "synthetic-pqc-report"; }
+    std::string getWalletName() override { return m_state->wallet_name; }
     std::unique_ptr<interfaces::Wallet> clone() override
     {
         return std::make_unique<SyntheticWallet>(m_report, m_state, /*background_clone=*/true);
@@ -606,7 +606,10 @@ public:
                 return common::PSBTError::INCOMPLETE;
             }
             {
-                std::lock_guard lock{m_state->mutex};
+                std::unique_lock lock{m_state->mutex};
+                m_state->psbt_counter_boundary_entered = true;
+                m_state->condition.notify_all();
+                m_state->condition.wait(lock, [this] { return m_state->allow_psbt_counter_boundary; });
                 m_state->psbt_counters_reserved = true;
             }
             m_state->condition.notify_all();

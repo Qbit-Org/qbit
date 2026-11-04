@@ -14,16 +14,20 @@
 #include <qt/platformstyle.h>
 #include <qt/psbtoperationsdialog.h>
 #include <qt/test/syntheticwallet.h>
+#include <qt/test/util.h>
 #include <qt/walletmodel.h>
 #include <script/script.h>
 #include <streams.h>
 #include <test/util/setup_common.h>
+#include <tinyformat.h>
+#include <util/fs.h>
 #include <util/strencodings.h>
 #include <util/translation.h>
 #include <wallet/pqc_usage.h>
 
 #include <chrono>
 #include <functional>
+#include <map>
 #include <memory>
 #include <span>
 #include <stdexcept>
@@ -34,6 +38,7 @@
 
 #include <QApplication>
 #include <QClipboard>
+#include <QCloseEvent>
 #include <QCoreApplication>
 #include <QElapsedTimer>
 #include <QEventLoop>
@@ -41,6 +46,7 @@
 #include <QMetaObject>
 #include <QPointer>
 #include <QProgressDialog>
+#include <QPushButton>
 #include <QSignalSpy>
 #include <QTextEdit>
 #include <QTimer>
@@ -85,6 +91,40 @@ std::string SerializePSBT(const PartiallySignedTransaction& psbt)
     DataStream stream;
     stream << psbt;
     return stream.str();
+}
+
+//! The PSBT the synthetic wallet produces when it signs the given one.
+PartiallySignedTransaction SyntheticSignedPSBT(PartiallySignedTransaction psbt)
+{
+    psbt.inputs.front().final_script_witness.stack = {{0x01}};
+    return psbt;
+}
+
+std::string ClipboardPSBT()
+{
+    const auto decoded{DecodeBase64(QApplication::clipboard()->text().toStdString())};
+    if (!decoded) return {};
+    PartiallySignedTransaction psbt;
+    std::string error;
+    if (!DecodeRawPSBT(psbt, MakeByteSpan(*decoded), error)) return {};
+    return SerializePSBT(psbt);
+}
+
+//! Check that a log line names the one PSBT file saved since before, that the
+//! file holds the expected PSBT, and that the line itself does not.
+void VerifyUnshownPSBTSaved(const std::string& line, const std::map<fs::path, std::string>& before, const std::string& expected)
+{
+    QVERIFY2(line.find("The signed PSBT was saved to ") != std::string::npos, line.c_str());
+    QVERIFY2(line.find(EncodeBase64(expected)) == std::string::npos, line.c_str());
+    const auto saved{NewUnshownPSBTFiles(before)};
+    QCOMPARE(saved.size(), size_t{1});
+    QVERIFY2(line.find(fs::PathToString(saved.begin()->first.filename())) != std::string::npos, line.c_str());
+    QVERIFY(saved.begin()->second == expected);
+}
+
+QProgressDialog* FindSigningProgress(const PSBTOperationsDialog& dialog)
+{
+    return dialog.findChild<QProgressDialog*>(QStringLiteral("psbtSigningProgressDialog"));
 }
 
 wallet::PQCUsageReport MakePQCUsageReport(const CPQCPubKey& pubkey, uint32_t signature_count)
@@ -168,6 +208,7 @@ public:
         {
             std::lock_guard lock{state->mutex};
             state->allow_psbt_reservation = true;
+            state->allow_psbt_counter_boundary = true;
             state->allow_psbt_completion = true;
             state->allow_psbt_post_signing = true;
         }
@@ -394,22 +435,235 @@ void PSBTOperationsDialogTests::dialogDestructionBeforeCompletion()
     QCoreApplication::processEvents();
 }
 
-void PSBTOperationsDialogTests::walletUnloadDuringSigning()
+void PSBTOperationsDialogTests::closeIgnoredWhileSigning()
 {
     auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    state->psbt_simulate_pqc_reservation = true;
     state->allow_psbt_completion = false;
     DialogFixture fixture{*m_context->client_model, m_context->platform_style.get(), state};
     QSignalSpy display_updates{fixture.description(), &QTextEdit::textChanged};
+    fixture.dialog->show();
 
     fixture.dialog->signTransaction();
-    QVERIFY(WaitUntil([&] { return ReadState(state, [](const auto& value) { return value.psbt_sign_entered; }); }));
+    QVERIFY(WaitUntil([&] { return ReadState(state, [](const auto& value) { return value.psbt_counters_reserved; }); }));
+
+    // The Close button, Escape and the window manager must not hide the
+    // dialog: deleting it would block the GUI thread on the worker and drop
+    // the signed PSBT.
+    QVERIFY(!fixture.dialog->close());
+    fixture.dialog->reject();
+    QCloseEvent close_event;
+    QCoreApplication::sendEvent(fixture.dialog.get(), &close_event);
+    QVERIFY(!close_event.isAccepted());
+    QVERIFY(fixture.dialog->isVisible());
+
+    // Its progress dialog stays up as well once Cancel is gone.
+    QVERIFY(WaitUntil([&] { return FindSigningProgress(*fixture.dialog) && FindSigningProgress(*fixture.dialog)->isVisible(); }));
+    QProgressDialog* const progress{FindSigningProgress(*fixture.dialog)};
+    QVERIFY(!progress->findChild<QPushButton*>());
+    progress->reject();
+    QVERIFY(!progress->close());
+    QVERIFY(progress->isVisible());
+
+    fixture.releaseWorker();
+    QVERIFY(WaitUntil([&] { return fixture.statusLabel()->text().contains(QStringLiteral("ready to broadcast")); }));
+    QCOMPARE(display_updates.count(), 1);
+    QVERIFY(WaitUntil([&] { return fixture.dialog->close(); }));
+    QVERIFY(!fixture.dialog->isVisible());
+}
+
+void PSBTOperationsDialogTests::canceledProgressStaysVisibleUntilWorkerReports()
+{
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    state->psbt_simulate_pqc_reservation = true;
+    state->allow_psbt_counter_boundary = false;
+    state->allow_psbt_completion = false;
+    DialogFixture fixture{*m_context->client_model, m_context->platform_style.get(), state};
+    QSignalSpy display_updates{fixture.description(), &QTextEdit::textChanged};
+    fixture.dialog->show();
+
+    fixture.dialog->signTransaction();
+    QVERIFY(WaitUntil([&] { return FindSigningProgress(*fixture.dialog) && FindSigningProgress(*fixture.dialog)->isVisible(); }));
+    QVERIFY(WaitUntil([&] { return ReadState(state, [](const auto& value) { return value.psbt_counter_boundary_entered; }); }));
+
+    // Cancel arrives after the worker's last cancellable check, so it cannot
+    // stop the reservation that follows. The progress must stay on screen,
+    // and the dialog open, until the worker reports.
+    QProgressDialog* const progress{FindSigningProgress(*fixture.dialog)};
+    QPushButton* const cancel{progress->findChild<QPushButton*>()};
+    QVERIFY(cancel);
+    cancel->click();
+    QVERIFY(progress->isVisible());
+    QVERIFY(progress->labelText().contains(QStringLiteral("Canceling")));
+    QVERIFY(!fixture.dialog->close());
+
+    {
+        std::lock_guard lock{state->mutex};
+        state->allow_psbt_counter_boundary = true;
+    }
+    state->condition.notify_all();
+    QVERIFY(WaitUntil([&] { return ReadState(state, [](const auto& value) { return value.psbt_counters_reserved; }); }));
+    QVERIFY(WaitUntil([&] { return progress->labelText().contains(QStringLiteral("Signing inputs")); }));
+    QVERIFY(progress->isVisible());
+
+    QPointer<QProgressDialog> progress_guard{progress};
+    fixture.releaseWorker();
+    QVERIFY(WaitUntil([&] { return fixture.statusLabel()->text().contains(QStringLiteral("ready to broadcast")); }));
+    QVERIFY(!ReadState(state, [](const auto& value) { return value.psbt_cancel_observed; }));
+    QCOMPARE(display_updates.count(), 1);
+    QVERIFY(progress_guard.isNull() || !progress_guard->isVisible());
+}
+
+void PSBTOperationsDialogTests::shutdownCancelsSigningBeforeReservation()
+{
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    state->psbt_simulate_pqc_reservation = true;
+    state->allow_psbt_reservation = false;
+    DialogFixture fixture{*m_context->client_model, m_context->platform_style.get(), state};
+    QSignalSpy display_updates{fixture.description(), &QTextEdit::textChanged};
+    const LogCapture log;
+
+    fixture.dialog->signTransaction();
+    QVERIFY(WaitUntil([&] { return FindSigningProgress(*fixture.dialog) && FindSigningProgress(*fixture.dialog)->isVisible(); }));
+    QVERIFY(ReadState(state, [](const auto& value) { return value.psbt_sign_entered; }));
+
+    QPointer<QProgressDialog> progress{FindSigningProgress(*fixture.dialog)};
+    fixture.dialog->prepareForShutdown();
+    QVERIFY(progress.isNull() || !progress->isVisible());
+    {
+        // The worker must stop without any event processing: shutdown runs
+        // synchronously on the GUI thread.
+        std::unique_lock lock{state->mutex};
+        QVERIFY(state->condition.wait_for(lock, std::chrono::milliseconds{WAIT_TIMEOUT_MS}, [&] {
+            return state->psbt_sign_finished;
+        }));
+        QVERIFY(state->psbt_cancel_observed);
+        QVERIFY(!state->psbt_counters_reserved);
+    }
+    QVERIFY(WaitUntil([&] { return !log.find({"PSBT signing was canceled because its dialog was shut down or destroyed."}).empty(); }));
+    QCOMPARE(display_updates.count(), 0);
+}
+
+void PSBTOperationsDialogTests::shutdownLogsSigningFinishedAfterReservation()
+{
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    state->psbt_simulate_pqc_reservation = true;
+    state->allow_psbt_completion = false;
+    CPQCKey key;
+    key.MakeNewKey();
+    const wallet::PQCUsageReport pqc_usage{MakePQCUsageReport(key.GetPubKey(), 3)};
+    DialogFixture fixture{*m_context->client_model, m_context->platform_style.get(), state, pqc_usage};
+    QSignalSpy display_updates{fixture.description(), &QTextEdit::textChanged};
+    const auto files_before{UnshownPSBTFiles()};
+    const LogCapture log;
+
+    fixture.dialog->signTransaction();
+    QVERIFY(WaitUntil([&] { return ReadState(state, [](const auto& value) { return value.psbt_counters_reserved; }); }));
+    fixture.dialog->prepareForShutdown();
+    // Shutdown deletes the wallet model before the worker can report.
+    fixture.wallet_model.reset();
+    fixture.releaseWorker();
+
+    // Nothing is shown during shutdown, so the outcome and the capacity it
+    // consumed go to the debug log, and the signed PSBT to the data directory.
+    const std::string finished{"PSBT signing finished after its dialog was shut down or destroyed, so the result was not shown"};
+    QVERIFY(WaitUntil([&] { return !log.find({finished}).empty(); }));
+    VerifyUnshownPSBTSaved(log.find({finished}), files_before, SerializePSBT(SyntheticSignedPSBT(fixture.original_psbt)));
+    const std::string line{log.find({finished})};
+    QVERIFY2(line.find("1 input(s) signed, transaction complete.") != std::string::npos, line.c_str());
+    QVERIFY2(line.find(strprintf("PQC key %s: 3 of %u signatures used, %u remaining, state normal.",
+                                 PQCPubKeyHex(key.GetPubKey()).toStdString(), PQC_MAX_SIGNATURES, PQC_MAX_SIGNATURES - 3)) != std::string::npos,
+             line.c_str());
+    QVERIFY(!ReadState(state, [](const auto& value) { return value.psbt_cancel_observed; }));
+    QCOMPARE(display_updates.count(), 0);
+}
+
+void PSBTOperationsDialogTests::destructionAfterReservationSavesSignedPSBT()
+{
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    state->psbt_simulate_pqc_reservation = true;
+    state->allow_psbt_completion = false;
+    DialogFixture fixture{*m_context->client_model, m_context->platform_style.get(), state};
+    const auto files_before{UnshownPSBTFiles()};
+    const LogCapture log;
+
+    fixture.dialog->signTransaction();
+    QVERIFY(WaitUntil([&] { return ReadState(state, [](const auto& value) { return value.psbt_counters_reserved; }); }));
+
+    // The event loop is gone, as at application exit: the worker can no
+    // longer deliver its result, and the destructor joins it.
+    std::thread release{[&fixture] {
+        std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        fixture.releaseWorker();
+    }};
+    fixture.dialog.reset();
+    release.join();
+
+    const std::string finished{"PSBT signing finished after its dialog was shut down or destroyed, so the result was not shown"};
+    QVERIFY(!log.find({finished}).empty());
+    VerifyUnshownPSBTSaved(log.find({finished}), files_before, SerializePSBT(SyntheticSignedPSBT(fixture.original_psbt)));
+    QVERIFY(!ReadState(state, [](const auto& value) { return value.psbt_cancel_observed; }));
+    QCoreApplication::processEvents();
+}
+
+void PSBTOperationsDialogTests::shutdownLogsUnexportedSignedPSBT()
+{
+    const std::string closed{"PSBT dialog was shut down before its signed PSBT was copied, saved or broadcast."};
+    // Kept in the dialog, copied, or discarded by closing the dialog, which
+    // is deleted only later and so is still found at shutdown.
+    for (const std::string handling : {"kept", "copied", "closed"}) {
+        auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+        DialogFixture fixture{*m_context->client_model, m_context->platform_style.get(), state};
+        fixture.dialog->show();
+        fixture.dialog->signTransaction();
+        QVERIFY(WaitUntil([&] { return fixture.statusLabel()->text().contains(QStringLiteral("ready to broadcast")); }));
+        if (handling == "copied") fixture.dialog->copyToClipboard();
+        if (handling == "closed") QVERIFY(WaitUntil([&] { return fixture.dialog->close(); }));
+
+        const auto files_before{UnshownPSBTFiles()};
+        const LogCapture log;
+        fixture.dialog->prepareForShutdown();
+        if (handling == "kept") {
+            VerifyUnshownPSBTSaved(log.find({closed}), files_before, SerializePSBT(SyntheticSignedPSBT(fixture.original_psbt)));
+        } else {
+            QVERIFY2(log.find({closed}).empty(), handling.c_str());
+            QVERIFY2(NewUnshownPSBTFiles(files_before).empty(), handling.c_str());
+        }
+    }
+}
+
+void PSBTOperationsDialogTests::walletUnloadDuringSigning()
+{
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    state->psbt_simulate_pqc_reservation = true;
+    state->allow_psbt_completion = false;
+    CPQCKey key;
+    key.MakeNewKey();
+    const wallet::PQCUsageReport pqc_usage{MakePQCUsageReport(key.GetPubKey(), 1)};
+    DialogFixture fixture{*m_context->client_model, m_context->platform_style.get(), state, pqc_usage};
+    QSignalSpy display_updates{fixture.description(), &QTextEdit::textChanged};
+
+    fixture.dialog->signTransaction();
+    QVERIFY(WaitUntil([&] { return ReadState(state, [](const auto& value) { return value.psbt_counters_reserved; }); }));
     QPointer<WalletModel> model_guard{fixture.wallet_model.get()};
     fixture.wallet_model.reset();
     QVERIFY(model_guard.isNull());
 
+    // The signatures do not need the wallet, so the signed PSBT is kept and
+    // reported as signed, with the capacity it consumed.
     fixture.releaseWorker();
-    QVERIFY(WaitUntil([&] { return fixture.statusLabel()->text().contains(QStringLiteral("no longer loaded")); }));
-    QCOMPARE(display_updates.count(), 0);
+    QVERIFY(WaitUntil([&] { return fixture.statusLabel()->text().contains(QStringLiteral("ready to broadcast")); }));
+    const QString status{fixture.statusLabel()->text()};
+    QVERIFY2(status.startsWith(QStringLiteral("Signed transaction successfully.")), qPrintable(status));
+    QVERIFY2(status.contains(QStringLiteral("The wallet was unloaded while signing.")), qPrintable(status));
+    QVERIFY2(status.contains(CONSUMED_SENTENCE), qPrintable(status));
+    QVERIFY2(!status.contains(FAILED_SENTENCE), qPrintable(status));
+    QCOMPARE(display_updates.count(), 1);
+    QVERIFY(fixture.dialog->findChild<QPushButton*>(QStringLiteral("broadcastTransactionButton"))->isEnabled());
+    QVERIFY(!fixture.dialog->findChild<QPushButton*>(QStringLiteral("signTransactionButton"))->isEnabled());
+
+    fixture.dialog->copyToClipboard();
+    QCOMPARE(ClipboardPSBT(), SerializePSBT(SyntheticSignedPSBT(fixture.original_psbt)));
     QVERIFY(WaitUntil([&] { return ReadState(state, [](const auto& value) { return value.background_clone_destroyed; }); }));
 }
 

@@ -19,6 +19,7 @@
 #include <memory>
 #include <vector>
 
+#include <QDateTime>
 #include <QObject>
 #include <QPointer>
 
@@ -293,8 +294,10 @@ Q_SIGNALS:
 
     // A fee-bump replacement was committed by the background worker.
     // pqc_usage is the formatted PQC signing usage the bump consumed, or empty
-    // when it consumed none.
-    void feeBumped(const Txid& original_txid, const Txid& bumped_txid, const QString& pqc_usage);
+    // when it consumed none. committed_at is the local time the commit
+    // returned, which can be well before this signal when a usage warning
+    // is shown modally first.
+    void feeBumped(const Txid& original_txid, const Txid& bumped_txid, const QString& pqc_usage, const QDateTime& committed_at);
 
     void timerTimeout();
 

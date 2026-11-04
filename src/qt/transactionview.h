@@ -21,6 +21,7 @@ class WalletModel;
 
 QT_BEGIN_NAMESPACE
 class QComboBox;
+class QDateTime;
 class QDateTimeEdit;
 class QFrame;
 class QLabel;
@@ -91,7 +92,7 @@ private:
 
     QWidget *createDateRangeWidget();
     QWidget* createFeeBumpUsageWidget();
-    void showFeeBumpUsage(const Txid& bumped_txid, const QString& pqc_usage);
+    void showFeeBumpUsage(const Txid& bumped_txid, const QString& pqc_usage, const QDateTime& committed_at);
 
     bool eventFilter(QObject *obj, QEvent *event) override;
 
