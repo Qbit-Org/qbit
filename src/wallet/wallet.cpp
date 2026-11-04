@@ -3493,7 +3493,10 @@ CWallet::PendingInitialKeyPoolTopUpStepResult CWallet::RunPendingInitialKeyPoolT
         const unsigned int next_target = std::min<int64_t>(
             m_keypool_size,
             int64_t{desc_spk_man->GetKeyPoolSize()} + DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
-        if (!desc_spk_man->TopUp(next_target)) {
+        util::Result<void> res{desc_spk_man->TopUpResult(next_target)};
+        if (!res) {
+            WalletLogPrintf("Deferred create-time keypool top up step failed (descriptor id %s, target=%u, remaining=%u): %s\n",
+                desc_spk_man->GetID().ToString(), next_target, desc_spk_man->GetKeyPoolSize(), util::ErrorString(res).original);
             return PendingInitialKeyPoolTopUpStepResult::FAILED;
         }
     }
