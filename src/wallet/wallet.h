@@ -110,6 +110,9 @@ void SchedulePlaintextPQCKeyValidation(CScheduler& scheduler, const std::shared_
 void MaybeSchedulePendingInitialKeyPoolTopUp(WalletContext& context, const std::shared_ptr<CWallet>& wallet);
 void MaybeSchedulePendingInitialKeyPoolTopUpAfterLoad(WalletContext& context, const std::shared_ptr<CWallet>& wallet);
 void MaybeScheduleP2MRKeyPoolRefill(WalletContext& context, const std::shared_ptr<CWallet>& wallet, OutputType type, bool internal);
+//! Top up the active keypools after an unlock: non-P2MR ones inline, P2MR ones
+//! (the pending create-time top-up or a low-watermark refill) in the background.
+void TopUpKeyPoolAfterUnlock(WalletContext& context, const std::shared_ptr<CWallet>& wallet);
 std::unique_ptr<WalletDatabase> MakeWalletDatabase(const std::string& name, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error);
 
 //! -paytxfee default

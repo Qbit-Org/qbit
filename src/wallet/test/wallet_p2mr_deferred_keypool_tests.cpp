@@ -3,10 +3,57 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <wallet/test/wallet_p2mr_test_util.h>
+#include <rpc/request.h>
+#include <rpc/util.h>
+#include <script/descriptor.h>
 #include <wallet/sqlite.h>
+
+#include <thread>
 
 namespace wallet {
 using namespace wallet_p2mr_test;
+
+RPCHelpMan walletpassphrase();
+
+namespace {
+void CallWalletPassphrase(WalletContext& context, const std::string& wallet_name, const std::string& passphrase, int64_t timeout)
+{
+    JSONRPCRequest request;
+    request.context = &context;
+    request.URI = "/wallet/" + wallet_name;
+    request.params = UniValue{UniValue::VARR};
+    request.params.push_back(passphrase);
+    request.params.push_back(timeout);
+    walletpassphrase().HandleRequest(request);
+}
+
+//! Holds the scheduler thread so that a test can see what an RPC did before
+//! any background step runs.
+class SchedulerBlocker
+{
+public:
+    explicit SchedulerBlocker(CScheduler& scheduler)
+    {
+        scheduler.scheduleFromNow([this, release = m_release.get_future().share()] {
+            m_blocked.set_value();
+            release.wait();
+        }, std::chrono::milliseconds{0});
+        m_blocked.get_future().wait();
+    }
+    ~SchedulerBlocker() { Release(); }
+    void Release()
+    {
+        if (m_released) return;
+        m_released = true;
+        m_release.set_value();
+    }
+
+private:
+    std::promise<void> m_blocked;
+    std::promise<void> m_release;
+    bool m_released{false};
+};
+} // namespace
 
 BOOST_FIXTURE_TEST_SUITE(wallet_p2mr_deferred_keypool_tests, WalletTestingSetup)
 
@@ -858,6 +905,290 @@ BOOST_FIXTURE_TEST_CASE(WalletInterfaceUnlockSchedulesDeferredP2MRKeypoolTopUp, 
     }
 
     wallet_interface.reset();
+    BOOST_CHECK(RemoveWallet(context, wallet, std::nullopt));
+    WaitForDeleteWallet(std::move(wallet));
+}
+
+BOOST_FIXTURE_TEST_CASE(WalletPassphraseSchedulesDeferredP2MRKeypoolTopUp, RegtestP2MROnlyWalletTestingSetup, * boost::unit_test::timeout(120))
+{
+    constexpr int64_t keypool_size{64};
+    const std::string wallet_name{"walletpassphrase_deferred_test"};
+    const std::string passphrase{"test-passphrase"};
+    m_args.ForceSetArg("-keypool", util::ToString(keypool_size));
+
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+    context.scheduler = Assert(m_node.scheduler).get();
+
+    DatabaseOptions options;
+    options.require_create = true;
+    options.create_flags = WALLET_FLAG_DESCRIPTORS;
+    options.create_passphrase = SecureString{passphrase};
+
+    DatabaseStatus status;
+    bilingual_str error;
+    std::vector<bilingual_str> warnings;
+    auto wallet = CreateWallet(context, wallet_name, std::nullopt, options, status, error, warnings);
+    BOOST_REQUIRE(wallet);
+    BOOST_REQUIRE_EQUAL(status, DatabaseStatus::SUCCESS);
+    BOOST_REQUIRE(wallet->IsLocked());
+    BOOST_REQUIRE(wallet->HasPendingInitialKeyPoolTopUp());
+
+    auto* external_spk_man = WITH_LOCK(wallet->cs_wallet, return dynamic_cast<DescriptorScriptPubKeyMan*>(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false)));
+    auto* internal_spk_man = WITH_LOCK(wallet->cs_wallet, return dynamic_cast<DescriptorScriptPubKeyMan*>(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/true)));
+    BOOST_REQUIRE(external_spk_man);
+    BOOST_REQUIRE(internal_spk_man);
+
+    auto& scheduler{*Assert(m_node.scheduler)};
+    SchedulerBlocker blocker{scheduler};
+    CallWalletPassphrase(context, wallet_name, passphrase, /*timeout=*/1000);
+
+    // The RPC returns unlocked without deriving the deferred keys itself.
+    BOOST_CHECK(!wallet->IsLocked());
+    BOOST_CHECK(wallet->HasPendingInitialKeyPoolTopUp());
+    BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_CHECK(wallet->m_deferred_create_keypool_top_up_scheduled);
+        BOOST_CHECK_GT(wallet->nRelockTime, 0);
+    }
+
+    blocker.Release();
+    for (int i = 0; i < 20 && wallet->HasPendingInitialKeyPoolTopUp(); ++i) {
+        WaitForScheduler(scheduler);
+    }
+    BOOST_CHECK(!wallet->HasPendingInitialKeyPoolTopUp());
+    BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), keypool_size);
+    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), keypool_size);
+    BOOST_CHECK(!wallet->IsLocked());
+    BOOST_CHECK(!WITH_LOCK(wallet->cs_wallet, return wallet->m_deferred_create_keypool_top_up_scheduled));
+
+    BOOST_REQUIRE(wallet->Lock());
+    BOOST_CHECK(RemoveWallet(context, wallet, std::nullopt));
+    WaitForDeleteWallet(std::move(wallet));
+}
+
+BOOST_FIXTURE_TEST_CASE(WalletLockWaitsForBackgroundKeyPoolTopUpStep, RegtestP2MROnlyWalletTestingSetup, * boost::unit_test::timeout(120))
+{
+    constexpr int64_t keypool_size{64};
+    const std::string wallet_name{"walletlock_background_step_test"};
+    const std::string passphrase{"test-passphrase"};
+    m_args.ForceSetArg("-keypool", util::ToString(keypool_size));
+
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+    context.scheduler = Assert(m_node.scheduler).get();
+
+    DatabaseOptions options;
+    options.require_create = true;
+    options.create_flags = WALLET_FLAG_DESCRIPTORS;
+    options.create_passphrase = SecureString{passphrase};
+
+    DatabaseStatus status;
+    bilingual_str error;
+    std::vector<bilingual_str> warnings;
+    auto wallet = CreateWallet(context, wallet_name, std::nullopt, options, status, error, warnings);
+    BOOST_REQUIRE(wallet);
+    BOOST_REQUIRE_EQUAL(status, DatabaseStatus::SUCCESS);
+    BOOST_REQUIRE(wallet->HasPendingInitialKeyPoolTopUp());
+
+    auto* external_spk_man = WITH_LOCK(wallet->cs_wallet, return dynamic_cast<DescriptorScriptPubKeyMan*>(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false)));
+    auto* internal_spk_man = WITH_LOCK(wallet->cs_wallet, return dynamic_cast<DescriptorScriptPubKeyMan*>(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/true)));
+    BOOST_REQUIRE(external_spk_man);
+    BOOST_REQUIRE(internal_spk_man);
+
+    // Pause the first background step after one of its top-ups, while it
+    // holds no wallet lock, and record whether Lock() returns meanwhile.
+    std::promise<void> in_step;
+    std::promise<void> lock_returned;
+    std::shared_future<void> lock_returned_future{lock_returned.get_future().share()};
+    std::atomic_bool first_notification{true};
+    std::atomic_bool lock_returned_during_step{false};
+    boost::signals2::scoped_connection connection{external_spk_man->NotifyCanGetAddressesChanged.connect([&] {
+        if (!first_notification.exchange(false)) return;
+        in_step.set_value();
+        lock_returned_during_step = lock_returned_future.wait_for(std::chrono::milliseconds{500}) == std::future_status::ready;
+    })};
+
+    CallWalletPassphrase(context, wallet_name, passphrase, /*timeout=*/1000);
+    in_step.get_future().wait();
+    std::thread lock_thread{[&] {
+        wallet->Lock();
+        lock_returned.set_value();
+    }};
+    lock_thread.join();
+    BOOST_CHECK(!lock_returned_during_step);
+    BOOST_CHECK(wallet->IsLocked());
+
+    // The step finished before the lock, and no later step derives keys.
+    auto& scheduler{*Assert(m_node.scheduler)};
+    for (int i = 0; i < 5; ++i) {
+        WaitForScheduler(scheduler);
+    }
+    BOOST_CHECK(wallet->HasPendingInitialKeyPoolTopUp());
+    BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), 2 * DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), 2 * DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+    BOOST_CHECK(!WITH_LOCK(wallet->cs_wallet, return wallet->m_deferred_create_keypool_top_up_scheduled));
+
+    connection.disconnect();
+    BOOST_CHECK(RemoveWallet(context, wallet, std::nullopt));
+    WaitForDeleteWallet(std::move(wallet));
+}
+
+BOOST_FIXTURE_TEST_CASE(WalletPassphraseSchedulesP2MRLowWatermarkRefill, RegtestP2MROnlyWalletTestingSetup, * boost::unit_test::timeout(120))
+{
+    constexpr int64_t keypool_size{64};
+    const std::string wallet_name{"walletpassphrase_low_watermark_test"};
+    const std::string passphrase{"test-passphrase"};
+    m_args.ForceSetArg("-keypool", util::ToString(keypool_size));
+
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+    context.scheduler = Assert(m_node.scheduler).get();
+
+    DatabaseOptions options;
+    options.require_create = true;
+    options.create_flags = WALLET_FLAG_DESCRIPTORS;
+    options.create_passphrase = SecureString{passphrase};
+
+    DatabaseStatus status;
+    bilingual_str error;
+    std::vector<bilingual_str> warnings;
+    auto wallet = CreateWallet(context, wallet_name, std::nullopt, options, status, error, warnings);
+    BOOST_REQUIRE(wallet);
+    BOOST_REQUIRE_EQUAL(status, DatabaseStatus::SUCCESS);
+
+    auto* external_spk_man = WITH_LOCK(wallet->cs_wallet, return dynamic_cast<DescriptorScriptPubKeyMan*>(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false)));
+    auto* internal_spk_man = WITH_LOCK(wallet->cs_wallet, return dynamic_cast<DescriptorScriptPubKeyMan*>(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/true)));
+    BOOST_REQUIRE(external_spk_man);
+    BOOST_REQUIRE(internal_spk_man);
+
+    // Finish the create-time top-up, then drain both pools to the low
+    // watermark while the wallet is locked, where they cannot refill.
+    BOOST_REQUIRE(wallet->Unlock(SecureString{passphrase}));
+    BOOST_REQUIRE(!wallet->HasPendingInitialKeyPoolTopUp());
+    BOOST_REQUIRE(wallet->Lock());
+    const unsigned int low_watermark{external_spk_man->GetP2MRReceiveKeyPoolLowWatermark()};
+    BOOST_REQUIRE_LT(int64_t{low_watermark}, keypool_size);
+    while (external_spk_man->GetKeyPoolSize() > low_watermark) {
+        BOOST_REQUIRE(wallet->GetNewDestination(OutputType::P2MR, ""));
+    }
+    while (internal_spk_man->GetKeyPoolSize() > low_watermark) {
+        BOOST_REQUIRE(wallet->GetNewChangeDestination(OutputType::P2MR));
+    }
+    BOOST_REQUIRE(external_spk_man->NeedsP2MRReceiveKeyPoolRefill());
+    BOOST_REQUIRE(internal_spk_man->NeedsP2MRReceiveKeyPoolRefill());
+
+    auto& scheduler{*Assert(m_node.scheduler)};
+    SchedulerBlocker blocker{scheduler};
+    CallWalletPassphrase(context, wallet_name, passphrase, /*timeout=*/1000);
+
+    // Both refills are queued rather than derived inline.
+    BOOST_CHECK(!wallet->IsLocked());
+    BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), low_watermark);
+    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), low_watermark);
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_CHECK(wallet->m_p2mr_receive_keypool_refill_scheduled);
+        BOOST_CHECK(wallet->m_p2mr_change_keypool_refill_scheduled);
+    }
+
+    blocker.Release();
+    for (int i = 0; i < 20 && (!external_spk_man->P2MRReceiveKeyPoolFull() || !internal_spk_man->P2MRReceiveKeyPoolFull()); ++i) {
+        WaitForScheduler(scheduler);
+    }
+    BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), keypool_size);
+    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), keypool_size);
+    {
+        LOCK(wallet->cs_wallet);
+        BOOST_CHECK(!wallet->m_p2mr_receive_keypool_refill_scheduled);
+        BOOST_CHECK(!wallet->m_p2mr_change_keypool_refill_scheduled);
+    }
+
+    BOOST_REQUIRE(wallet->Lock());
+    BOOST_CHECK(RemoveWallet(context, wallet, std::nullopt));
+    WaitForDeleteWallet(std::move(wallet));
+}
+
+BOOST_FIXTURE_TEST_CASE(WalletPassphraseTopsUpNonP2MRKeypoolInline, RegtestUnrestrictedWalletTestingSetup, * boost::unit_test::timeout(120))
+{
+    constexpr int64_t keypool_size{20};
+    const std::string wallet_name{"walletpassphrase_non_p2mr_test"};
+    const std::string passphrase{"test-passphrase"};
+    m_args.ForceSetArg("-keypool", util::ToString(keypool_size));
+
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+    context.scheduler = Assert(m_node.scheduler).get();
+
+    DatabaseOptions options;
+    options.require_create = true;
+    options.create_flags = WALLET_FLAG_DESCRIPTORS;
+    options.create_passphrase = SecureString{passphrase};
+
+    DatabaseStatus status;
+    bilingual_str error;
+    std::vector<bilingual_str> warnings;
+    auto wallet = CreateWallet(context, wallet_name, std::nullopt, options, status, error, warnings);
+    BOOST_REQUIRE(wallet);
+    BOOST_REQUIRE_EQUAL(status, DatabaseStatus::SUCCESS);
+    BOOST_REQUIRE(wallet->IsLocked());
+
+    // A hardened descriptor can only derive keys while the wallet is unlocked.
+    BOOST_REQUIRE(wallet->Unlock(SecureString{passphrase}));
+    DescriptorScriptPubKeyMan* hardened_spk_man{nullptr};
+    {
+        LOCK(wallet->cs_wallet);
+        CExtKey master_key;
+        master_key.SetSeed(GenerateRandomKey());
+        FlatSigningProvider provider;
+        std::string parse_error;
+        auto descriptors{Parse("wpkh(" + EncodeExtKey(master_key) + "/0h/*h)", provider, parse_error, /*require_checksum=*/false)};
+        BOOST_REQUIRE_MESSAGE(descriptors.size() == 1, parse_error);
+        WalletDescriptor w_desc{std::move(descriptors.front()), /*creation_time=*/0, /*range_start=*/0, /*range_end=*/0, /*next_index=*/0};
+        auto spk_man{wallet->AddWalletDescriptor(w_desc, provider, "", /*internal=*/false)};
+        BOOST_REQUIRE_MESSAGE(spk_man, util::ErrorString(spk_man).original);
+        hardened_spk_man = &spk_man->get();
+        wallet->AddActiveScriptPubKeyMan(hardened_spk_man->GetID(), OutputType::BECH32, /*internal=*/false);
+    }
+    BOOST_REQUIRE_EQUAL(hardened_spk_man->GetKeyPoolSize(), keypool_size);
+    auto* p2mr_spk_man = WITH_LOCK(wallet->cs_wallet, return dynamic_cast<DescriptorScriptPubKeyMan*>(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false)));
+    BOOST_REQUIRE(p2mr_spk_man);
+    BOOST_REQUIRE_EQUAL(p2mr_spk_man->GetKeyPoolSize(), keypool_size);
+
+    // Drain both pools while locked.
+    BOOST_REQUIRE(wallet->Lock());
+    while (hardened_spk_man->GetKeyPoolSize() > 0) {
+        BOOST_REQUIRE(wallet->GetNewDestination(OutputType::BECH32, ""));
+    }
+    BOOST_REQUIRE(!wallet->GetNewDestination(OutputType::BECH32, ""));
+    const unsigned int low_watermark{p2mr_spk_man->GetP2MRReceiveKeyPoolLowWatermark()};
+    while (p2mr_spk_man->GetKeyPoolSize() > low_watermark) {
+        BOOST_REQUIRE(wallet->GetNewDestination(OutputType::P2MR, ""));
+    }
+    BOOST_REQUIRE(p2mr_spk_man->NeedsP2MRReceiveKeyPoolRefill());
+
+    auto& scheduler{*Assert(m_node.scheduler)};
+    SchedulerBlocker blocker{scheduler};
+    CallWalletPassphrase(context, wallet_name, passphrase, /*timeout=*/1000);
+
+    // The non-P2MR pool is full when the RPC returns; the P2MR one is queued.
+    BOOST_CHECK_EQUAL(hardened_spk_man->GetKeyPoolSize(), keypool_size);
+    BOOST_CHECK_EQUAL(p2mr_spk_man->GetKeyPoolSize(), low_watermark);
+    BOOST_CHECK(WITH_LOCK(wallet->cs_wallet, return wallet->m_p2mr_receive_keypool_refill_scheduled));
+
+    blocker.Release();
+    for (int i = 0; i < 20 && !p2mr_spk_man->P2MRReceiveKeyPoolFull(); ++i) {
+        WaitForScheduler(scheduler);
+    }
+    BOOST_CHECK_EQUAL(p2mr_spk_man->GetKeyPoolSize(), keypool_size);
+
+    BOOST_REQUIRE(wallet->Lock());
     BOOST_CHECK(RemoveWallet(context, wallet, std::nullopt));
     WaitForDeleteWallet(std::move(wallet));
 }
