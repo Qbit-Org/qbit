@@ -259,6 +259,9 @@ void SQLiteDatabase::Open()
         if (ret != SQLITE_OK) {
             throw std::runtime_error(strprintf("SQLiteDatabase: Failed to open database: %s\n", sqlite3_errstr(ret)));
         }
+        if (!m_mock) {
+            m_file_registration.emplace(fs::PathFromString(m_file_path));
+        }
         ret = sqlite3_extended_result_codes(m_db, 1);
         if (ret != SQLITE_OK) {
             throw std::runtime_error(strprintf("SQLiteDatabase: Failed to enable extended result codes: %s\n", sqlite3_errstr(ret)));
@@ -377,6 +380,7 @@ void SQLiteDatabase::Close()
         throw std::runtime_error(strprintf("SQLiteDatabase: Failed to close database: %s\n", sqlite3_errstr(res)));
     }
     m_db = nullptr;
+    m_file_registration.reset();
 }
 
 bool SQLiteDatabase::HasActiveTxn()
