@@ -114,6 +114,8 @@ void MaybeScheduleP2MRKeyPoolRefill(WalletContext& context, const std::shared_pt
 //! (the pending create-time top-up, or a refill to -keypool) in the background.
 void TopUpKeyPoolAfterUnlock(WalletContext& context, const std::shared_ptr<CWallet>& wallet);
 std::unique_ptr<WalletDatabase> MakeWalletDatabase(const std::string& name, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error);
+//! The warning for an encrypted wallet whose rewrite after encryption is still pending.
+bilingual_str PendingRewriteWarning();
 
 //! -paytxfee default
 constexpr CAmount DEFAULT_PAY_TX_FEE = 0;

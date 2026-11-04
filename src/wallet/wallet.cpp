@@ -4333,6 +4333,13 @@ static util::Result<fs::path> GetWalletPath(const std::string& name)
     return wallet_path;
 }
 
+bilingual_str PendingRewriteWarning()
+{
+    // The rewrite may also have succeeded with only its record failing to be
+    // written, so this says the file may, not does, hold the keys.
+    return _("The rewrite of the wallet file after encryption did not complete, so the file may still contain deleted unencrypted keys. The rewrite is retried when the wallet is next loaded, and before a backup.");
+}
+
 std::unique_ptr<WalletDatabase> MakeWalletDatabase(const std::string& name, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error_string)
 {
     const auto& wallet_path = GetWalletPath(name);
@@ -4413,7 +4420,7 @@ std::shared_ptr<CWallet> CWallet::Create(WalletContext& context, const std::stri
     {
         LOCK(walletInstance->cs_wallet);
         if (walletInstance->NeedsRewriteAfterEncryption() && !walletInstance->RewriteAfterEncryption()) {
-            warnings.push_back(_("The wallet file could not be rewritten after encryption, so it may still contain deleted unencrypted keys. The rewrite is retried when the wallet is next loaded, and before a backup."));
+            warnings.push_back(PendingRewriteWarning());
         }
     }
 

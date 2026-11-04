@@ -13,10 +13,12 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <vector>
 
 class ArgsManager;
 class CChain;
 class CKey;
+struct bilingual_str;
 enum class OutputType;
 namespace interfaces {
 class Chain;
@@ -38,7 +40,7 @@ std::unique_ptr<CWallet> CreateSyncedWallet(interfaces::Chain& chain, CChain& cc
 std::unique_ptr<CWallet> CreateDescriptorWallet(interfaces::Chain& chain, std::span<const OutputType> output_types, int64_t keypool_size, const std::string& wallet_name = "");
 
 std::shared_ptr<CWallet> TestLoadWallet(WalletContext& context);
-std::shared_ptr<CWallet> TestLoadWallet(std::unique_ptr<WalletDatabase> database, WalletContext& context, uint64_t create_flags);
+std::shared_ptr<CWallet> TestLoadWallet(std::unique_ptr<WalletDatabase> database, WalletContext& context, uint64_t create_flags, std::vector<bilingual_str>* warnings = nullptr);
 void TestUnloadWallet(std::shared_ptr<CWallet>&& wallet);
 
 // Creates a copy of the provided database

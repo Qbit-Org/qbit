@@ -582,7 +582,7 @@ BOOST_FIXTURE_TEST_CASE(BackupAfterFailedRewriteDoesNotCopyPlaintextKeys, Regtes
     wallet->m_after_encrypt_wallet_commit = [&] { read.Start(wallet->GetDatabase()); };
     const std::string result{CallWalletRPC(context, encryptwallet(), "passphrase").get_str()};
     wallet->m_after_encrypt_wallet_commit = {};
-    BOOST_CHECK(result.find("Warning: the wallet file could not be rewritten") != std::string::npos);
+    BOOST_CHECK(result.find("Warning: " + PendingRewriteWarning().original) != std::string::npos);
     BOOST_CHECK(!HasPostEncryptionRewrite(*wallet));
     BOOST_REQUIRE(CountSecretsInFiles(wallet->GetDatabase().Files(), secrets) > 0);
 

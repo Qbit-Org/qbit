@@ -299,7 +299,7 @@ RPCHelpMan encryptwallet()
 
     std::string result{"wallet encrypted; The keypool has been flushed and a new HD seed was generated. You need to make a new backup with the backupwallet RPC."};
     if (pwallet->NeedsRewriteAfterEncryption()) {
-        result += " Warning: the wallet file could not be rewritten after encryption, so it may still contain deleted unencrypted keys. The rewrite is retried when the wallet is next loaded, and backupwallet rewrites the file first.";
+        result += " Warning: " + PendingRewriteWarning().original;
     }
     return result;
 },

@@ -79,11 +79,12 @@ std::unique_ptr<CWallet> CreateSyncedWallet(interfaces::Chain& chain, CChain& cc
     return wallet;
 }
 
-std::shared_ptr<CWallet> TestLoadWallet(std::unique_ptr<WalletDatabase> database, WalletContext& context, uint64_t create_flags)
+std::shared_ptr<CWallet> TestLoadWallet(std::unique_ptr<WalletDatabase> database, WalletContext& context, uint64_t create_flags, std::vector<bilingual_str>* warnings)
 {
     bilingual_str error;
-    std::vector<bilingual_str> warnings;
-    auto wallet = CWallet::Create(context, "", std::move(database), create_flags, error, warnings);
+    std::vector<bilingual_str> load_warnings;
+    auto wallet = CWallet::Create(context, "", std::move(database), create_flags, error, load_warnings);
+    if (warnings) *warnings = std::move(load_warnings);
     NotifyWalletLoaded(context, wallet);
     if (context.chain) {
         wallet->postInitProcess();

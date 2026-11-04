@@ -118,15 +118,14 @@ BOOST_FIXTURE_TEST_CASE(wallet_load_rewrites_encrypted_wallet_once, TestingSetup
         auto database{std::make_unique<MockableDatabase>(records)};
         MockableDatabase& mock{*database};
         mock.m_rewrite_pass = rewrite_pass;
-        bilingual_str error;
         std::vector<bilingual_str> warnings;
-        auto wallet{CWallet::Create(context, "", std::move(database), WALLET_FLAG_DESCRIPTORS, error, warnings)};
+        auto wallet{TestLoadWallet(std::move(database), context, WALLET_FLAG_DESCRIPTORS, &warnings)};
         BOOST_REQUIRE(wallet);
         BOOST_CHECK(wallet->IsCrypted());
         const int rewrites{mock.m_rewrite_count};
         // Only a failed rewrite is reported to the user.
         const bool warned{std::any_of(warnings.begin(), warnings.end(), [](const bilingual_str& warning) {
-            return warning.original.find("could not be rewritten after encryption") != std::string::npos;
+            return warning.original == PendingRewriteWarning().original;
         })};
         BOOST_CHECK_EQUAL(warned, rewrites > 0 && !rewrite_pass);
         records = mock.m_records;
