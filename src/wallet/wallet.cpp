@@ -4896,7 +4896,8 @@ util::Result<void> CWallet::BackupWallet(const std::string& strDest)
     // The copy includes free pages byte for byte, so deleted plaintext keys
     // must be gone from the file before it is made.
     if (NeedsRewriteAfterEncryption() && !RewriteAfterEncryption()) {
-        return util::Error{_("Backup refused: the wallet file may still contain deleted unencrypted keys, and rewriting it failed. Free space in the data and temporary directories, or reload the wallet, then try again.")};
+        return util::Error{strprintf(_("Backup refused: the wallet file may still contain deleted unencrypted keys, and rewriting it failed. Free space in the data and temporary directories, or reload the wallet, then try again. Meanwhile, to make a copy without those keys, unload the wallet and run %s with the -datadir and chain options that qbitd uses (an empty name for the default wallet); %s restores it."),
+                                     "\"qbit-wallet -wallet=<name> -dumpfile=<file> dump\"", "\"qbit-wallet -wallet=<new name> -dumpfile=<file> createfromdump\"")};
     }
     WriteBestBlock();
     if (!GetDatabase().Backup(strDest)) return util::Error{_("Wallet backup failed!")};

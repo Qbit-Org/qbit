@@ -1309,7 +1309,8 @@ RPCHelpMan backupwallet()
     return RPCHelpMan{
         "backupwallet",
         "Safely copies the current wallet file to the specified destination, which can either be a directory or a path with a filename.\n"
-        "If an encrypted wallet's file has not been rewritten since its encryption, it is rewritten first, and the backup fails if that rewrite fails.\n",
+        "If an encrypted wallet's file has not been rewritten since its encryption, it is rewritten first, and the backup fails if that rewrite fails.\n"
+        "A copy without the deleted keys can then still be made by unloading the wallet and running \"qbit-wallet dump\" on it.\n",
                 {
                     {"destination", RPCArg::Type::STR, RPCArg::Optional::NO, "The destination directory or file"},
                 },

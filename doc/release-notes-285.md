@@ -19,6 +19,15 @@ GUI's backup now run a pending rewrite first. If it fails, the backup is refused
 with an error. `encryptwallet` adds a warning to its result if its rewrite
 failed.
 
+While the rewrite keeps failing, a copy without the deleted keys can still be
+made with `qbit-wallet`, which copies records rather than the file. Unload the
+wallet, run `qbit-wallet -wallet=<name> -dumpfile=<file> dump`, and restore the
+dump with `qbit-wallet -wallet=<new name> -dumpfile=<file> createfromdump`. Add
+the same `-datadir` and chain options as for `qbitd`, and use an empty name for
+the default wallet. The dump file holds all of the wallet's records, including
+its encrypted keys, so keep it as safe as a backup. The refusal message now
+says this.
+
 Rewriting needs free disk space of up to twice the size of the wallet file. Part
 of that is a temporary copy in the temporary directory, which may be on another
 filesystem. The rewrite now also empties the wallet's `-journal` file, which

@@ -13,8 +13,10 @@
 #include <support/allocators/secure.h>
 #include <test/util/logging.h>
 #include <univalue.h>
+#include <util/strencodings.h>
 #include <util/translation.h>
 #include <wallet/context.h>
+#include <wallet/dump.h>
 #include <wallet/test/util.h>
 #include <wallet/test/wallet_p2mr_test_util.h>
 #include <wallet/sqlite.h>
@@ -849,6 +851,60 @@ BOOST_FIXTURE_TEST_CASE(EncryptWalletFinishesDeferredTopUpOfReplacedDescriptors,
     BOOST_REQUIRE(wallet);
     check_replaced(*wallet);
     TestUnloadWallet(std::move(wallet));
+}
+
+// While a pending rewrite fails, the backup refusal points to qbit-wallet's
+// dump, and a wallet created from that dump has none of the deleted keys.
+BOOST_FIXTURE_TEST_CASE(DumpOfWalletWithPendingRewriteHasNoDeletedKeys, RegtestP2MROnlyWalletTestingSetup)
+{
+    WalletContext context;
+    auto wallet{LoadWalletWithoutSecureDelete(context, m_args, *m_node.chain, "")};
+    BOOST_REQUIRE(wallet);
+    const auto secrets{GetPlaintextSecrets(*wallet)};
+    BOOST_REQUIRE(!secrets.empty());
+    const fs::path wallet_dir{fs::PathFromString(wallet->GetDatabase().Filename()).parent_path()};
+
+    UnfinishedRead read;
+    wallet->m_after_encrypt_wallet_commit = [&] { read.Start(wallet->GetDatabase()); };
+    BOOST_REQUIRE(wallet->EncryptWallet("passphrase"));
+    wallet->m_after_encrypt_wallet_commit = {};
+    const auto backup{wallet->BackupWallet(fs::PathToString(wallet_dir / "refused.bak"))};
+    BOOST_REQUIRE(!backup);
+    BOOST_CHECK(util::ErrorString(backup).original.find("unload the wallet and run \"qbit-wallet -wallet=<name> -dumpfile=<file> dump\"") != std::string::npos);
+    read.Finish();
+    TestUnloadWallet(std::move(wallet));
+    BOOST_REQUIRE(CountSecretsInFiles({wallet_dir / "wallet.dat"}, secrets) > 0);
+
+    const fs::path dump_file{wallet_dir / "wallet.dump"};
+    m_args.ForceSetArg("-dumpfile", fs::PathToString(dump_file));
+    {
+        DatabaseOptions options;
+        options.require_existing = true;
+        DatabaseStatus status;
+        bilingual_str error;
+        auto database{MakeWalletDatabase("", options, status, error)};
+        BOOST_REQUIRE(database);
+        BOOST_REQUIRE(DumpWallet(m_args, *database, error));
+    }
+    // The dump holds keys and values in hex.
+    std::vector<std::vector<unsigned char>> hex_secrets;
+    for (const auto& secret : secrets) {
+        const std::string hex{HexStr(secret)};
+        hex_secrets.emplace_back(hex.begin(), hex.end());
+    }
+    BOOST_CHECK_EQUAL(CountSecretsInFiles({dump_file}, hex_secrets), 0U);
+    {
+        bilingual_str error;
+        std::vector<bilingual_str> warnings;
+        BOOST_REQUIRE(CreateFromDump(m_args, "restored", wallet_dir / "restored", error, warnings));
+    }
+    BOOST_CHECK_EQUAL(CountSecretsInFiles({wallet_dir / "restored" / "wallet.dat"}, secrets), 0U);
+
+    auto restored{LoadWalletWithoutSecureDelete(context, m_args, *m_node.chain, "restored")};
+    BOOST_REQUIRE(restored);
+    BOOST_CHECK(restored->IsCrypted());
+    BOOST_CHECK(restored->Unlock("passphrase"));
+    TestUnloadWallet(std::move(restored));
 }
 
 BOOST_AUTO_TEST_SUITE_END()
