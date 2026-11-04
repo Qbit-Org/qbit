@@ -278,6 +278,11 @@ bool WalletBatch::WriteDescriptor(const uint256& desc_id, const WalletDescriptor
     return WriteIC(make_pair(DBKeys::WALLETDESCRIPTOR, desc_id), descriptor);
 }
 
+bool WalletBatch::HasDescriptor(const uint256& desc_id)
+{
+    return m_batch->Exists(std::make_pair(DBKeys::WALLETDESCRIPTOR, desc_id));
+}
+
 bool WalletBatch::WriteDescriptorDerivedCache(const CExtPubKey& xpub, const uint256& desc_id, uint32_t key_exp_index, uint32_t der_index)
 {
     std::vector<unsigned char> ser_xpub(BIP32_EXTKEY_SIZE);

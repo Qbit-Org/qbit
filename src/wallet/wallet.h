@@ -116,6 +116,8 @@ void TopUpKeyPoolAfterUnlock(WalletContext& context, const std::shared_ptr<CWall
 std::unique_ptr<WalletDatabase> MakeWalletDatabase(const std::string& name, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error);
 //! The warning for an encrypted wallet whose rewrite after encryption is still pending.
 bilingual_str PendingRewriteWarning();
+//! The result of an encryption that committed, but whose new HD seed could not be set up.
+bilingual_str NewSeedFailedWarning(const bilingual_str& reason);
 
 //! -paytxfee default
 constexpr CAmount DEFAULT_PAY_TX_FEE = 0;
@@ -504,6 +506,13 @@ private:
     // Same as 'AddActiveScriptPubKeyMan' but designed for use within a batch transaction context
     void AddActiveScriptPubKeyManWithDb(WalletBatch& batch, uint256 id, OutputType type, bool internal);
 
+    //! Finishes the deferred create-time keypool top-up of the active
+    //! descriptors that EncryptWallet's new HD seed replaces.
+    void TopUpDescriptorsBeforeReplacingThem() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    //! Replaces the active descriptors with ones from a new HD seed. If that
+    //! throws, removes the new descriptors from memory again before rethrowing.
+    void SetupNewSeedOrRollBack(bool use_create_keypool_warmup) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+
     /** Store wallet flags */
     void SetWalletFlagWithDB(WalletBatch& batch, uint64_t flags);
 
@@ -709,7 +718,15 @@ public:
 
     bool Unlock(const SecureString& strWalletPassphrase, bool run_pending_initial_keypool_top_up = true);
     bool ChangeWalletPassphrase(const SecureString& strOldWalletPassphrase, const SecureString& strNewWalletPassphrase);
-    bool EncryptWallet(const SecureString& strWalletPassphrase, bool use_create_keypool_warmup = false);
+    /**
+     * Encrypt the wallet, then replace its active descriptors with ones from a
+     * new HD seed. Returns false if the wallet was not encrypted. Once the
+     * encryption has committed, returns true and leaves the wallet locked even
+     * if a later step fails. If the new HD seed could not be set up, the wallet
+     * keeps its previous active descriptors, and new_seed_error, if given, is
+     * set to the reason.
+     */
+    bool EncryptWallet(const SecureString& strWalletPassphrase, bool use_create_keypool_warmup = false, bilingual_str* new_seed_error = nullptr);
     /**
      * Rewrite the database file so that deleted plaintext key records no
      * longer remain in its free space, then write the POST_ENCRYPTION_REWRITE

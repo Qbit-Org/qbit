@@ -44,3 +44,27 @@ process stops before the new seed is written, the wallet stays encrypted but
 keeps using its old seed for new addresses, and the old seed's keys were
 unencrypted on disk until the rewrite. Consider creating a new wallet with a
 passphrase and moving your funds if `encryptwallet` was interrupted.
+
+Failures after the encryption
+-----------------------------
+
+If anything failed after `encryptwallet` had committed the encryption, such as
+a write error while generating the new seed's keys, the RPC returned error `-1`
+although the wallet was encrypted. The wallet also stayed unlocked with no
+relock, and descriptors from the failed step stayed in memory without their
+records on disk, so new addresses could come from a descriptor that the next
+start would load inactive. The wallet is now locked whenever the call returns,
+those descriptors are removed again, and the RPC succeeds with a result that
+starts with `wallet encrypted; Warning:` and says that the new HD seed was not
+set up. New addresses then still come from the previous seed, as after an
+interrupted encryption, unless the new seed's descriptors were already written.
+In this case qbit-qt still reports a fatal error and quits, and `debug.log` has
+the reason; the wallet loads encrypted and locked at the next start.
+
+A new P2MR wallet fills most of its keypool in the background during its first
+minute or so. Only active descriptors were filled, so a wallet encrypted before
+that finished kept a 16-address lookahead for its previous seed, and later
+payments to that seed's addresses, for example from a backup taken before
+encryption, were not detected. `encryptwallet` now fills those descriptors
+first, which can make it take up to twice as long in that window. Wallets that
+were already encrypted in that window keep the short lookahead.

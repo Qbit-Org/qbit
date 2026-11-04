@@ -242,7 +242,7 @@ RPCHelpMan encryptwallet()
                 {
                     {"passphrase", RPCArg::Type::STR, RPCArg::Optional::NO, "The pass phrase to encrypt the wallet with. It must be at least 1 character, but should be long."},
                 },
-                RPCResult{RPCResult::Type::STR, "", "A string with further instructions"},
+                RPCResult{RPCResult::Type::STR, "", "A string with further instructions. It starts with \"wallet encrypted\" whenever the wallet was encrypted, and contains a warning if setting up the new HD seed, or rewriting the wallet file, did not finish."},
                 RPCExamples{
             "\nEncrypt your wallet\n"
             + HelpExampleCli("encryptwallet", "\"my pass phrase\"") +
@@ -293,11 +293,16 @@ RPCHelpMan encryptwallet()
         throw JSONRPCError(RPC_INVALID_PARAMETER, "passphrase cannot be empty");
     }
 
-    if (!pwallet->EncryptWallet(strWalletPass)) {
+    bilingual_str new_seed_error;
+    if (!pwallet->EncryptWallet(strWalletPass, /*use_create_keypool_warmup=*/false, &new_seed_error)) {
         throw JSONRPCError(RPC_WALLET_ENCRYPTION_FAILED, "Error: Failed to encrypt the wallet.");
     }
 
-    std::string result{"wallet encrypted; The keypool has been flushed and a new HD seed was generated. You need to make a new backup with the backupwallet RPC."};
+    // The wallet is encrypted either way, so a failure to set up the new seed
+    // is reported in the result rather than as an error.
+    std::string result{new_seed_error.empty() ?
+        "wallet encrypted; The keypool has been flushed and a new HD seed was generated. You need to make a new backup with the backupwallet RPC." :
+        "wallet encrypted; Warning: " + NewSeedFailedWarning(new_seed_error).original};
     if (pwallet->NeedsRewriteAfterEncryption()) {
         result += " Warning: " + PendingRewriteWarning().original;
     }

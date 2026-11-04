@@ -5,6 +5,7 @@
 #include <wallet/wallet.h>
 
 #include <interfaces/chain.h>
+#include <interfaces/wallet.h>
 #include <outputtype.h>
 #include <rpc/request.h>
 #include <rpc/util.h>
@@ -12,6 +13,8 @@
 #include <support/allocators/secure.h>
 #include <test/util/logging.h>
 #include <univalue.h>
+#include <util/translation.h>
+#include <wallet/context.h>
 #include <wallet/test/util.h>
 #include <wallet/test/wallet_p2mr_test_util.h>
 #include <wallet/sqlite.h>
@@ -33,6 +36,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -251,6 +255,35 @@ UniValue CallWalletRPC(WalletContext& context, const RPCHelpMan& rpc, const std:
     return rpc.HandleRequest(request);
 }
 
+//! The IDs of the wallet's active descriptors.
+std::set<uint256> GetActiveIDs(CWallet& wallet)
+{
+    LOCK(wallet.cs_wallet);
+    std::set<uint256> ids;
+    for (const ScriptPubKeyMan* spk_man : wallet.GetActiveScriptPubKeyMans()) ids.insert(spk_man->GetID());
+    return ids;
+}
+
+//! Makes the transaction that sets up EncryptWallet's new HD seed fail to
+//! commit, after it has added and activated the new descriptors in memory.
+//! The rewrite after the encryption fails as well.
+void FailNewSeedSetup(CWallet& wallet)
+{
+    MockableDatabase& database{GetMockableDatabase(wallet)};
+    wallet.m_after_encrypt_wallet_commit = [&database] {
+        database.m_txn_commit_pass = false;
+        database.m_rewrite_pass = false;
+    };
+}
+
+void RestoreNewSeedSetup(CWallet& wallet)
+{
+    wallet.m_after_encrypt_wallet_commit = {};
+    MockableDatabase& database{GetMockableDatabase(wallet)};
+    database.m_txn_commit_pass = true;
+    database.m_rewrite_pass = true;
+}
+
 //! The message of the RPC error that the call throws, or an empty string.
 std::string GetRPCError(const std::function<void()>& call)
 {
@@ -437,12 +470,16 @@ BOOST_FIXTURE_TEST_CASE(StaleTopUpSnapshotDoesNotWritePlaintextKeys, RegtestP2MR
     BOOST_CHECK(wallet->IsCrypted());
     BOOST_CHECK(wallet->IsLocked());
     BOOST_CHECK_EQUAL(CountDatabaseRecords(*wallet, DBKeys::WALLETDESCRIPTORPQCKEY), 0U);
+    // EncryptWallet finishes the deferred top-up of the descriptors that it
+    // replaces, with a snapshot of the encrypted wallet.
+    const unsigned int encrypted_keypool_size{change->GetKeyPoolSize()};
+    BOOST_CHECK(encrypted_keypool_size >= keypool_size);
 
     top_up_prepared.Release();
     WaitOrExit(top_up, "the top-up");
     change->m_after_prepare_top_up = {};
     BOOST_CHECK(!top_up.get());
-    BOOST_CHECK_EQUAL(change->GetKeyPoolSize(), keypool_size);
+    BOOST_CHECK_EQUAL(change->GetKeyPoolSize(), encrypted_keypool_size);
     BOOST_CHECK_EQUAL(CountDatabaseRecords(*wallet, DBKeys::WALLETDESCRIPTORPQCKEY), 0U);
 
     TestUnloadWallet(std::move(wallet));
@@ -458,7 +495,7 @@ BOOST_FIXTURE_TEST_CASE(StaleTopUpSnapshotDoesNotWritePlaintextKeys, RegtestP2MR
     auto* reloaded_change{dynamic_cast<DescriptorScriptPubKeyMan*>(WITH_LOCK(wallet->cs_wallet, return wallet->GetScriptPubKeyMan(change_id)))};
     BOOST_REQUIRE(reloaded_change);
     const size_t crypted_records{CountDatabaseRecords(*wallet, DBKeys::WALLETDESCRIPTORPQCCKEY)};
-    BOOST_CHECK(reloaded_change->TopUpWithInternalHintResult(/*internal_hint=*/true, target));
+    BOOST_CHECK(reloaded_change->TopUpWithInternalHintResult(/*internal_hint=*/true, encrypted_keypool_size + 4));
     BOOST_CHECK_EQUAL(CountDatabaseRecords(*wallet, DBKeys::WALLETDESCRIPTORPQCCKEY), crypted_records + 4);
     BOOST_CHECK_EQUAL(CountDatabaseRecords(*wallet, DBKeys::WALLETDESCRIPTORPQCKEY), 0U);
 
@@ -661,6 +698,156 @@ BOOST_FIXTURE_TEST_CASE(BackupWithoutPendingRewriteDoesNotRewrite, RegtestP2MROn
     BOOST_CHECK_EQUAL(CountSecretsInFiles({encrypted_backup}, secrets), 0U);
 
     RemoveWallet(context, wallet, /*load_on_start=*/std::nullopt);
+    TestUnloadWallet(std::move(wallet));
+}
+
+// Once the encryption has committed, a failure to set up the new HD seed must
+// not be reported as a failed encryption or leave the wallet unlocked. The new
+// descriptors that its aborted transaction added in memory must be gone too,
+// and the wallet must reload as it was left, with the rewrite still pending.
+BOOST_FIXTURE_TEST_CASE(EncryptWalletNewSeedFailureLeavesWalletEncryptedAndLocked, RegtestP2MROnlyWalletTestingSetup)
+{
+    std::shared_ptr<CWallet> wallet{CreateDescriptorWallet(*m_node.chain, P2MR_ONLY_OUTPUT_TYPES, /*keypool_size=*/2)};
+    const std::set<uint256> active_ids{GetActiveIDs(*wallet)};
+    BOOST_REQUIRE(!active_ids.empty());
+    const size_t spk_man_count{wallet->GetAllScriptPubKeyMans().size()};
+
+    FailNewSeedSetup(*wallet);
+    bilingual_str new_seed_error;
+    BOOST_CHECK(wallet->EncryptWallet("passphrase", /*use_create_keypool_warmup=*/false, &new_seed_error));
+    RestoreNewSeedSetup(*wallet);
+    BOOST_CHECK(new_seed_error.original.find("cannot process db transaction for descriptors setup") != std::string::npos);
+    BOOST_CHECK(wallet->IsCrypted());
+    BOOST_CHECK(wallet->IsLocked());
+    BOOST_CHECK(GetActiveIDs(*wallet) == active_ids);
+    BOOST_CHECK_EQUAL(wallet->GetAllScriptPubKeyMans().size(), spk_man_count);
+    BOOST_CHECK(WITH_LOCK(wallet->cs_wallet, return wallet->NeedsRewriteAfterEncryption()));
+
+    // New addresses still come from the previous seed's descriptors.
+    const auto dest{wallet->GetNewDestination(OutputType::P2MR, "")};
+    BOOST_REQUIRE(dest);
+    for (const ScriptPubKeyMan* spk_man : WITH_LOCK(wallet->cs_wallet, return wallet->GetScriptPubKeyMans(GetScriptForDestination(*dest)))) {
+        BOOST_CHECK(active_ids.contains(spk_man->GetID()));
+    }
+
+    // A restart loads the committed encryption with the previous descriptors,
+    // runs the pending rewrite, and unlocks with the new passphrase.
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+    auto reloaded{TestLoadWallet(DuplicateMockDatabase(wallet->GetDatabase()), context, WALLET_FLAG_DESCRIPTORS)};
+    BOOST_REQUIRE(reloaded);
+    BOOST_CHECK(reloaded->IsCrypted());
+    BOOST_CHECK(reloaded->IsLocked());
+    BOOST_CHECK(GetActiveIDs(*reloaded) == active_ids);
+    BOOST_CHECK_EQUAL(GetMockableDatabase(*reloaded).m_rewrite_count, 1);
+    BOOST_CHECK(!WITH_LOCK(reloaded->cs_wallet, return reloaded->NeedsRewriteAfterEncryption()));
+    BOOST_CHECK(reloaded->Unlock("passphrase"));
+    TestUnloadWallet(std::move(reloaded));
+}
+
+// If the new seed's transaction committed before the failure, its descriptors
+// are on disk and the next load makes them active, so they stay active.
+BOOST_FIXTURE_TEST_CASE(EncryptWalletNewSeedCommittedBeforeFailureStaysActive, RegtestP2MROnlyWalletTestingSetup)
+{
+    std::shared_ptr<CWallet> wallet{CreateDescriptorWallet(*m_node.chain, P2MR_ONLY_OUTPUT_TYPES, /*keypool_size=*/2)};
+    const std::set<uint256> old_ids{GetActiveIDs(*wallet)};
+    MockableDatabase& database{GetMockableDatabase(*wallet)};
+    // Throw once the first commit after the encryption's own is durable.
+    wallet->m_after_encrypt_wallet_commit = [&database] {
+        database.m_txn_commit_result_hook = [thrown = false](bool success) mutable {
+            if (!success || thrown) return;
+            thrown = true;
+            throw std::runtime_error("failure after the commit");
+        };
+    };
+    bilingual_str new_seed_error;
+    BOOST_CHECK(wallet->EncryptWallet("passphrase", /*use_create_keypool_warmup=*/false, &new_seed_error));
+    wallet->m_after_encrypt_wallet_commit = {};
+    database.m_txn_commit_result_hook = {};
+    BOOST_CHECK_EQUAL(new_seed_error.original, "the new HD seed was written and is active, but a step after writing it failed: failure after the commit. Reload the wallet before using it");
+    BOOST_CHECK(wallet->IsLocked());
+    const std::set<uint256> new_ids{GetActiveIDs(*wallet)};
+    BOOST_CHECK_EQUAL(new_ids.size(), old_ids.size());
+    for (const uint256& id : new_ids) BOOST_CHECK(!old_ids.contains(id));
+
+    CWallet reloaded{m_node.chain.get(), "", DuplicateMockDatabase(database)};
+    BOOST_REQUIRE(reloaded.LoadWallet() == DBErrors::LOAD_OK);
+    BOOST_CHECK(GetActiveIDs(reloaded) == new_ids);
+}
+
+// The encryptwallet RPC reports such an encryption as encrypted, with a
+// warning, and the GUI's interface throws with the same text.
+BOOST_FIXTURE_TEST_CASE(EncryptWalletNewSeedFailureIsReported, RegtestP2MROnlyWalletTestingSetup)
+{
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+
+    std::shared_ptr<CWallet> rpc_wallet{CreateDescriptorWallet(*m_node.chain, P2MR_ONLY_OUTPUT_TYPES, /*keypool_size=*/2)};
+    AddWallet(context, rpc_wallet);
+    FailNewSeedSetup(*rpc_wallet);
+    const std::string result{CallWalletRPC(context, encryptwallet(), "passphrase").get_str()};
+    RestoreNewSeedSetup(*rpc_wallet);
+    BOOST_CHECK(result.starts_with("wallet encrypted; Warning: The wallet is encrypted with the new passphrase and is now locked, but setting up its new HD seed did not finish (Error: cannot process db transaction for descriptors setup)."));
+    BOOST_CHECK(result.find("Warning: " + PendingRewriteWarning().original) != std::string::npos);
+    BOOST_CHECK(rpc_wallet->IsCrypted());
+    BOOST_CHECK(rpc_wallet->IsLocked());
+    BOOST_CHECK(RemoveWallet(context, rpc_wallet, /*load_on_start=*/std::nullopt));
+
+    std::shared_ptr<CWallet> gui_wallet{CreateDescriptorWallet(*m_node.chain, P2MR_ONLY_OUTPUT_TYPES, /*keypool_size=*/2)};
+    const auto gui_interface{interfaces::MakeWallet(context, gui_wallet)};
+    FailNewSeedSetup(*gui_wallet);
+    BOOST_CHECK_EXCEPTION(gui_interface->encryptWallet("passphrase"), std::runtime_error, [](const std::runtime_error& e) {
+        const std::string message{e.what()};
+        return message.starts_with("The wallet is encrypted with the new passphrase and is now locked, but setting up its new HD seed did not finish") &&
+               message.ends_with("Restart the application and unlock the wallet with the new passphrase.");
+    });
+    RestoreNewSeedSetup(*gui_wallet);
+    BOOST_CHECK(gui_wallet->IsCrypted());
+    BOOST_CHECK(gui_wallet->IsLocked());
+}
+
+// The deferred create-time top-up only extends active descriptors. Encrypting
+// while it is pending must finish it for the descriptors that the new seed
+// replaces, or they keep their short warm-up range for good.
+BOOST_FIXTURE_TEST_CASE(EncryptWalletFinishesDeferredTopUpOfReplacedDescriptors, RegtestP2MROnlyWalletTestingSetup)
+{
+    WalletContext context;
+    auto wallet{LoadP2MRWalletForKeyPoolTest(context, m_args, *m_node.chain)};
+    const unsigned int keypool_size{static_cast<unsigned int>(m_args.GetIntArg("-keypool", DEFAULT_KEYPOOL_SIZE))};
+    const std::set<uint256> replaced_ids{GetActiveIDs(*wallet)};
+    BOOST_REQUIRE(!replaced_ids.empty());
+    const auto get_spk_man{[](CWallet& w, const uint256& id) {
+        return dynamic_cast<DescriptorScriptPubKeyMan*>(WITH_LOCK(w.cs_wallet, return w.GetScriptPubKeyMan(id)));
+    }};
+    for (const uint256& id : replaced_ids) {
+        auto* spk_man{get_spk_man(*wallet, id)};
+        BOOST_REQUIRE(spk_man);
+        BOOST_REQUIRE(spk_man->HasDeferredCreateKeyPoolTopUp());
+        BOOST_REQUIRE(spk_man->GetKeyPoolSize() < keypool_size);
+    }
+
+    BOOST_REQUIRE(wallet->EncryptWallet("passphrase"));
+    BOOST_CHECK(wallet->IsLocked());
+    for (const uint256& id : GetActiveIDs(*wallet)) BOOST_CHECK(!replaced_ids.contains(id));
+    BOOST_CHECK(!wallet->HasPendingInitialKeyPoolTopUp());
+    const auto check_replaced{[&](CWallet& w) {
+        for (const uint256& id : replaced_ids) {
+            auto* spk_man{get_spk_man(w, id)};
+            BOOST_REQUIRE(spk_man);
+            BOOST_CHECK(!spk_man->HasDeferredCreateKeyPoolTopUp());
+            BOOST_CHECK_EQUAL(spk_man->GetKeyPoolSize(), keypool_size);
+        }
+        // The keys of the top-up were written encrypted.
+        BOOST_CHECK_EQUAL(CountDatabaseRecords(w, DBKeys::WALLETDESCRIPTORPQCKEY), 0U);
+    }};
+    check_replaced(*wallet);
+    TestUnloadWallet(std::move(wallet));
+
+    wallet = TestLoadWallet(context);
+    BOOST_REQUIRE(wallet);
+    check_replaced(*wallet);
     TestUnloadWallet(std::move(wallet));
 }
 
