@@ -279,11 +279,13 @@ public:
     //! Get required fee.
     virtual CAmount getRequiredFee(unsigned int tx_bytes) = 0;
 
-    //! Get minimum fee.
+    //! Get minimum fee. estimate_unavailable is set when fee estimation had no
+    //! estimate, even if a minimum fee rate then replaced the FALLBACK reason.
     virtual CAmount getMinimumFee(unsigned int tx_bytes,
         const wallet::CCoinControl& coin_control,
         int* returned_target,
-        FeeReason* reason) = 0;
+        FeeReason* reason,
+        bool* estimate_unavailable) = 0;
 
     //! Get tx confirm target.
     virtual unsigned int getConfirmTarget() = 0;

@@ -120,9 +120,11 @@ constexpr CAmount DEFAULT_PAY_TX_FEE = 0;
 //! -fallbackfee default. Unlike Bitcoin Core (which disables the fallback fee
 //! on mainnet), qbit defaults to the minimum relay fee rate so that wallets can
 //! create transactions while the chain is young and the fee estimator has no
-//! data (an empty mempool yields no estimates, see GetMinimumFeeRate()). The
-//! required-fee clamp in GetMinimumFeeRate() ensures this can never underpay
-//! relay policy, and organic fee estimates take precedence once available.
+//! data (an empty mempool yields no estimates, see GetMinimumFeeRate()).
+//! GetMinimumFeeRate() raises the fallback to this node's minimum relay fee,
+//! -mintxfee and mempool minimum fee, but peers with a stricter policy or a
+//! congested network may still not relay or mine the transaction until its fee
+//! is bumped. Organic fee estimates take precedence once available.
 //! Set -fallbackfee=0 to restore the upstream behavior of failing instead.
 static const CAmount DEFAULT_FALLBACK_FEE = DEFAULT_MIN_RELAY_TX_FEE;
 //! -discardfee default
@@ -837,6 +839,7 @@ public:
      /** If the cost to spend a change output at this feerate is greater than the value of the
       * output itself, just drop it to fees. */
     CFeeRate m_discard_rate{DEFAULT_DISCARD_FEE};
+    bool m_discard_rate_set{false}; //!< true if -discardfee was set; see GetDiscardRate()
 
     /** When the actual feerate is less than the consolidate feerate, we will tend to make transactions which
      * consolidate inputs. When the actual feerate is greater than the consolidate feerate, we will tend to make
