@@ -1038,10 +1038,10 @@ BOOST_FIXTURE_TEST_CASE(WalletLockWaitsForBackgroundKeyPoolTopUpStep, RegtestP2M
     WaitForDeleteWallet(std::move(wallet));
 }
 
-BOOST_FIXTURE_TEST_CASE(WalletPassphraseSchedulesP2MRLowWatermarkRefill, RegtestP2MROnlyWalletTestingSetup, * boost::unit_test::timeout(120))
+BOOST_FIXTURE_TEST_CASE(WalletPassphraseSchedulesP2MRKeypoolRefill, RegtestP2MROnlyWalletTestingSetup, * boost::unit_test::timeout(120))
 {
     constexpr int64_t keypool_size{64};
-    const std::string wallet_name{"walletpassphrase_low_watermark_test"};
+    const std::string wallet_name{"walletpassphrase_refill_test"};
     const std::string passphrase{"test-passphrase"};
     m_args.ForceSetArg("-keypool", util::ToString(keypool_size));
 
@@ -1067,30 +1067,33 @@ BOOST_FIXTURE_TEST_CASE(WalletPassphraseSchedulesP2MRLowWatermarkRefill, Regtest
     BOOST_REQUIRE(external_spk_man);
     BOOST_REQUIRE(internal_spk_man);
 
-    // Finish the create-time top-up, then drain both pools to the low
-    // watermark while the wallet is locked, where they cannot refill.
+    // Finish the create-time top-up, then, while the wallet is locked and the
+    // pools cannot refill, drain the receive pool to its low watermark and
+    // the change pool partway. A refill paused by a relock leaves a pool
+    // between the two.
     BOOST_REQUIRE(wallet->Unlock(SecureString{passphrase}));
     BOOST_REQUIRE(!wallet->HasPendingInitialKeyPoolTopUp());
     BOOST_REQUIRE(wallet->Lock());
     const unsigned int low_watermark{external_spk_man->GetP2MRReceiveKeyPoolLowWatermark()};
-    BOOST_REQUIRE_LT(int64_t{low_watermark}, keypool_size);
+    const unsigned int partial_size{keypool_size - 4};
+    BOOST_REQUIRE_LT(low_watermark, partial_size);
     while (external_spk_man->GetKeyPoolSize() > low_watermark) {
         BOOST_REQUIRE(wallet->GetNewDestination(OutputType::P2MR, ""));
     }
-    while (internal_spk_man->GetKeyPoolSize() > low_watermark) {
+    while (internal_spk_man->GetKeyPoolSize() > partial_size) {
         BOOST_REQUIRE(wallet->GetNewChangeDestination(OutputType::P2MR));
     }
     BOOST_REQUIRE(external_spk_man->NeedsP2MRReceiveKeyPoolRefill());
-    BOOST_REQUIRE(internal_spk_man->NeedsP2MRReceiveKeyPoolRefill());
+    BOOST_REQUIRE(!internal_spk_man->NeedsP2MRReceiveKeyPoolRefill());
 
     auto& scheduler{*Assert(m_node.scheduler)};
     SchedulerBlocker blocker{scheduler};
     CallWalletPassphrase(context, wallet_name, passphrase, /*timeout=*/1000);
 
-    // Both refills are queued rather than derived inline.
+    // Both refills to -keypool are queued rather than derived inline.
     BOOST_CHECK(!wallet->IsLocked());
     BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), low_watermark);
-    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), low_watermark);
+    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), partial_size);
     {
         LOCK(wallet->cs_wallet);
         BOOST_CHECK(wallet->m_p2mr_receive_keypool_refill_scheduled);

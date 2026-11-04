@@ -19,9 +19,8 @@ RPCHelpMan walletpassphrase()
             "\nNote:\n"
             "Issuing the walletpassphrase command while the wallet is already unlocked will set a new unlock\n"
             "time that overrides the old one.\n"
-            "A P2MR keypool that still needs its initial top-up, or that has dropped to its low watermark, is\n"
-            "refilled in the background after this call returns. The refill pauses while the wallet is locked\n"
-            "and resumes at the next unlock.\n",
+            "P2MR keypools are refilled to -keypool in the background after this call returns. The refill\n"
+            "pauses while the wallet is locked and resumes at the next walletpassphrase.\n",
                 {
                     {"passphrase", RPCArg::Type::STR, RPCArg::Optional::NO, "The wallet passphrase"},
                     {"timeout", RPCArg::Type::NUM, RPCArg::Optional::NO, "The time to keep the decryption key in seconds; capped at 100000000 (~3 years)."},
