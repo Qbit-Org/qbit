@@ -3454,6 +3454,11 @@ bool CWallet::SetAddressBook(const CTxDestination& address, const std::string& s
 
 bool CWallet::DelAddressBook(const CTxDestination& address)
 {
+    // DelAddressBookWithDB takes cs_wallet, so take it before the transaction
+    // takes the database writer, in the order cs_wallet -> cs_desc_man ->
+    // writer. Taking it inside could deadlock with a cs_wallet holder that
+    // waits for the writer, such as EncryptWallet or BackupWallet.
+    LOCK(cs_wallet);
     return RunWithinTxn(GetDatabase(), /*process_desc=*/"address book entry removal", [&](WalletBatch& batch){
         return DelAddressBookWithDB(batch, address);
     });
