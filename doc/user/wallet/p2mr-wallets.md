@@ -148,6 +148,48 @@ wallet at the same time, and do not restore an old backup and continue signing
 from it while a newer copy of the same wallet may also sign. That can make the
 two copies disagree about the current PQC signature counters.
 
+## Check an Encrypted Wallet for Unencrypted PQC Keys
+
+v1.0.0 could leave unencrypted PQC private keys in a wallet it encrypted while
+a background keypool refill was running. Anyone with such a wallet file, or a
+backup of it, can read those keys without the passphrase.
+
+To check a wallet:
+
+```bash
+qbit-cli -rpcwallet=main getwalletinfo
+```
+
+- On v1.0.0, an encrypted wallet is affected if
+  `pqc_key_validation.plaintext_records` is greater than 0.
+- On later releases, `pqc_key_validation.reencryption_required` is `true`
+  for an affected wallet, and the GUI shows a warning icon in the status bar.
+  For an unencrypted wallet it is always `false`.
+
+While the field is `true`, the wallet refuses to sign. Unlock the wallet once
+with `walletpassphrase` or in the GUI: the unlock re-encrypts the keys, keeps
+their signature counters and rewrites the wallet file. If the rewrite does not
+complete, the wallet is rewritten the next time it loads or is backed up. Then
+check that
+`reencryption_required` is `false`. If it is still `true`, `debug.log` says why;
+unlocking again retries. Keys whose records failed validation are not
+re-encrypted, and signing stays disabled until you restore or repair the
+wallet.
+
+Re-encryption does not change older copies. Wallet files and backups made
+before the unlock still contain the keys. The affected keys are those the
+refill added beyond the keypool at encryption time:
+
+- For a wallet that got a new seed at encryption, they belong to its old
+  descriptors and were never handed out by this wallet. Funds are at risk only
+  if those addresses were paid anyway.
+- For a blank wallet with imported descriptors, they are its next receive and
+  change addresses, and may already hold funds.
+
+If you are not sure that the wallet file and all of its backups stayed private,
+create a new wallet with a passphrase, move your funds to it, back it up, and
+delete the old backups.
+
 ## PQC Signature Counters
 
 P2MR v1 current-version leaves use version `0xc0` and bounded SLH-DSA keys.
@@ -322,6 +364,9 @@ been validated with qbit-aware tooling.
 - Do not use Bitcoin legacy, P2SH-SegWit, Bech32 v0, Bech32m/Taproot, or legacy
   multisig receive flows on launch chains.
 - Back up the wallet database with `backupwallet`.
+- If an encrypted wallet shows `pqc_key_validation.reencryption_required`,
+  unlock it to re-encrypt its keys, and see
+  [Check an Encrypted Wallet for Unencrypted PQC Keys](#check-an-encrypted-wallet-for-unencrypted-pqc-keys).
 - Keep only one live signer copy of a P2MR wallet.
 - Use `exportpubkeydb` and `importpubkeydb` for P2MR watch-only tracking.
 - Do not use external signer or hardware-wallet recipes unless qbit-specific
