@@ -282,6 +282,10 @@ mkdir -p "$DISTSRC"
             find build -name 'cmake_install.cmake' -exec sed -i 's| -u -r | |g' {} +
 
             cmake --install build --strip --prefix "${INSTALLPATH}" ${V:+--verbose}
+
+            # Install unstripped binaries outside of $INSTALLPATH, as input for
+            # the dSYM bundles of the debug tarball
+            cmake --install build --prefix "${PWD}/unstripped/${DISTNAME}" ${V:+--verbose}
             ;;
         *)
             cmake --install build --prefix "${INSTALLPATH}" ${V:+--verbose}
@@ -292,7 +296,18 @@ mkdir -p "$DISTSRC"
         cd installed
 
         case "$HOST" in
-            *darwin*) ;;
+            *darwin*)
+                # Link the DWARF of each unstripped binary into a dSYM bundle.
+                # Stripping keeps the LC_UUID, so the bundles also match the
+                # release, codesigned and app bundle binaries. Sorting lists
+                # every binary before the first bundle is created next to it.
+                (
+                    cd "${DISTSRC}/unstripped"
+                    find "${DISTNAME}/bin" "${DISTNAME}/libexec" -type f -executable -print0 \
+                        | sort --zero-terminated \
+                        | xargs -0 -P"$JOBS" -I{} dsymutil --num-threads 1 -o {}.dSYM {}
+                )
+                ;;
             *)
                 # Split binaries from their debug symbols
                 {
@@ -351,6 +366,14 @@ mkdir -p "$DISTSRC"
                     | tar --create --no-recursion --mode='u+rw,go+r-w,a+X' --null --files-from=- \
                     | gzip -9n > "${OUTDIR}/${DISTNAME}-${HOST}-unsigned.tar.gz" \
                     || ( rm -f "${OUTDIR}/${DISTNAME}-${HOST}-unsigned.tar.gz" && exit 1 )
+                (
+                    cd "${DISTSRC}/unstripped"
+                    find "${DISTNAME}" -path "*.dSYM*" -print0 \
+                        | sort --zero-terminated \
+                        | tar --create --no-recursion --mode='u+rw,go+r-w,a+X' --null --files-from=- \
+                        | gzip -9n > "${OUTDIR}/${DISTNAME}-${HOST}-debug.tar.gz" \
+                        || ( rm -f "${OUTDIR}/${DISTNAME}-${HOST}-debug.tar.gz" && exit 1 )
+                )
                 ;;
         esac
     )  # $DISTSRC/installed
