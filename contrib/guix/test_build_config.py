@@ -286,7 +286,11 @@ class GuixPackagingTest(unittest.TestCase):
                     self.assertIn(f"./{member}", codesigning)
 
                 debug = tar_contents(outdir / f"{DISTNAME}-{host}-debug.tar.gz")
-                expected_debug: dict[str, bytes | None] = {}
+                expected_debug: dict[str, bytes | None] = {
+                    DISTNAME: None,
+                    f"{DISTNAME}/bin": None,
+                    f"{DISTNAME}/libexec": None,
+                }
                 for executable in executables:
                     name = Path(executable).name
                     bundle = f"{DISTNAME}/{executable}.dSYM"

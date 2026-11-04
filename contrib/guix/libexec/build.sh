@@ -297,15 +297,15 @@ mkdir -p "$DISTSRC"
 
         case "$HOST" in
             *darwin*)
-                # Link the DWARF of each unstripped binary into a dSYM bundle.
-                # Stripping keeps the LC_UUID, so the bundles also match the
-                # release, codesigned and app bundle binaries. Sorting lists
-                # every binary before the first bundle is created next to it.
+                # Link the DWARF of each unstripped binary into a dSYM bundle
+                # in a separate debug tree. Run one binary at a time, as this
+                # needs far more memory than splitting with objcopy. Stripping
+                # keeps the LC_UUID, so the bundles also match the release,
+                # codesigned and app bundle binaries.
                 (
                     cd "${DISTSRC}/unstripped"
                     find "${DISTNAME}/bin" "${DISTNAME}/libexec" -type f -executable -print0 \
-                        | sort --zero-terminated \
-                        | xargs -0 -P"$JOBS" -I{} dsymutil --num-threads 1 -o {}.dSYM {}
+                        | xargs -0 -I{} dsymutil --num-threads 1 -o "${DISTSRC}/debug/{}.dSYM" {}
                 )
                 ;;
             *)
@@ -367,8 +367,8 @@ mkdir -p "$DISTSRC"
                     | gzip -9n > "${OUTDIR}/${DISTNAME}-${HOST}-unsigned.tar.gz" \
                     || ( rm -f "${OUTDIR}/${DISTNAME}-${HOST}-unsigned.tar.gz" && exit 1 )
                 (
-                    cd "${DISTSRC}/unstripped"
-                    find "${DISTNAME}" -path "*.dSYM*" -print0 \
+                    cd "${DISTSRC}/debug"
+                    find "${DISTNAME}" -print0 \
                         | sort --zero-terminated \
                         | tar --create --no-recursion --mode='u+rw,go+r-w,a+X' --null --files-from=- \
                         | gzip -9n > "${OUTDIR}/${DISTNAME}-${HOST}-debug.tar.gz" \
