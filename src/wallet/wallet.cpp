@@ -3454,49 +3454,48 @@ bool CWallet::SetAddressBook(const CTxDestination& address, const std::string& s
 
 bool CWallet::DelAddressBook(const CTxDestination& address)
 {
-    // DelAddressBookWithDB takes cs_wallet, so take it before the transaction
+    // DelAddressBookWithDB needs cs_wallet. Take it before the transaction
     // takes the database writer, in the order cs_wallet -> cs_desc_man ->
     // writer. Taking it inside could deadlock with a cs_wallet holder that
     // waits for the writer, such as EncryptWallet or BackupWallet.
     LOCK(cs_wallet);
-    return RunWithinTxn(GetDatabase(), /*process_desc=*/"address book entry removal", [&](WalletBatch& batch){
+    return RunWithinTxn(GetDatabase(), /*process_desc=*/"address book entry removal", [&](WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) {
         return DelAddressBookWithDB(batch, address);
     });
 }
 
 bool CWallet::DelAddressBookWithDB(WalletBatch& batch, const CTxDestination& address)
 {
+    // Callers take cs_wallet before their transaction takes the writer.
+    AssertLockHeld(cs_wallet);
     const std::string& dest = EncodeDestination(address);
-    {
-        LOCK(cs_wallet);
-        // If we want to delete receiving addresses, we should avoid calling EraseAddressData because it will delete the previously_spent value. Could instead just erase the label so it becomes a change address, and keep the data.
-        // NOTE: This isn't a problem for sending addresses because they don't have any data that needs to be kept.
-        // When adding new address data, it should be considered here whether to retain or delete it.
-        if (IsMine(address)) {
-            WalletLogPrintf("%s called with IsMine address, NOT SUPPORTED. Please report this bug! %s\n", __func__, CLIENT_BUGREPORT);
-            return false;
-        }
-        // Delete data rows associated with this address
-        if (!batch.EraseAddressData(address)) {
-            WalletLogPrintf("Error: cannot erase address book entry data\n");
-            return false;
-        }
-
-        // Delete purpose entry
-        if (!batch.ErasePurpose(dest)) {
-            WalletLogPrintf("Error: cannot erase address book entry purpose\n");
-            return false;
-        }
-
-        // Delete name entry
-        if (!batch.EraseName(dest)) {
-            WalletLogPrintf("Error: cannot erase address book entry name\n");
-            return false;
-        }
-
-        // finally, remove it from the map
-        m_address_book.erase(address);
+    // If we want to delete receiving addresses, we should avoid calling EraseAddressData because it will delete the previously_spent value. Could instead just erase the label so it becomes a change address, and keep the data.
+    // NOTE: This isn't a problem for sending addresses because they don't have any data that needs to be kept.
+    // When adding new address data, it should be considered here whether to retain or delete it.
+    if (IsMine(address)) {
+        WalletLogPrintf("%s called with IsMine address, NOT SUPPORTED. Please report this bug! %s\n", __func__, CLIENT_BUGREPORT);
+        return false;
     }
+    // Delete data rows associated with this address
+    if (!batch.EraseAddressData(address)) {
+        WalletLogPrintf("Error: cannot erase address book entry data\n");
+        return false;
+    }
+
+    // Delete purpose entry
+    if (!batch.ErasePurpose(dest)) {
+        WalletLogPrintf("Error: cannot erase address book entry purpose\n");
+        return false;
+    }
+
+    // Delete name entry
+    if (!batch.EraseName(dest)) {
+        WalletLogPrintf("Error: cannot erase address book entry name\n");
+        return false;
+    }
+
+    // finally, remove it from the map
+    m_address_book.erase(address);
 
     // All good, signal changes
     NotifyAddressBookChanged(address, "", /*is_mine=*/false, AddressPurpose::SEND, CT_DELETED);
