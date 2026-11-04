@@ -10,20 +10,27 @@
 #include <support/allocators/secure.h>
 #include <wallet/test/util.h>
 #include <wallet/test/wallet_p2mr_test_util.h>
+#include <wallet/sqlite.h>
 #include <wallet/test/wallet_test_fixture.h>
 #include <wallet/walletdb.h>
 
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
+#include <fstream>
 #include <future>
 #include <iostream>
+#include <iterator>
 #include <memory>
+#include <set>
 #include <string>
+#include <thread>
 #include <utility>
+#include <vector>
 
 namespace wallet {
 namespace {
@@ -128,6 +135,77 @@ size_t CountMasterKeyRecords(CWallet& wallet)
         if (record_type == DBKeys::MASTER_KEY) ++count;
     }
     return count;
+}
+
+//! Loads a P2MR wallet from a real database that does not overwrite deleted
+//! records. Release builds use SQLite without SQLITE_SECURE_DELETE, so this
+//! matches them whatever SQLite the test is linked with.
+std::shared_ptr<CWallet> LoadWalletWithoutSecureDelete(WalletContext& context, ArgsManager& args, interfaces::Chain& chain, const std::string& name)
+{
+    args.ForceSetArg("-keypool", "8");
+    context.args = &args;
+    context.chain = &chain;
+    DatabaseOptions options;
+    options.create_flags = WALLET_FLAG_DESCRIPTORS;
+    DatabaseStatus status;
+    bilingual_str error;
+    auto database{MakeWalletDatabase(name, options, status, error)};
+    BOOST_REQUIRE(database);
+    // SQLITE_OK is 0.
+    BOOST_REQUIRE_EQUAL(SQliteExecHandler{}.Exec(dynamic_cast<SQLiteDatabase&>(*database), "PRAGMA secure_delete = OFF"), 0);
+    return TestLoadWallet(std::move(database), context, options.create_flags);
+}
+
+//! The private keys of the wallet's plaintext key records.
+std::vector<std::vector<unsigned char>> GetPlaintextSecrets(CWallet& wallet)
+{
+    std::vector<std::vector<unsigned char>> secrets;
+    auto batch{wallet.GetDatabase().MakeBatch()};
+    for (const std::string& record_type : {DBKeys::WALLETDESCRIPTORKEY, DBKeys::WALLETDESCRIPTORPQCKEY}) {
+        DataStream prefix;
+        prefix << record_type;
+        auto cursor{batch->GetNewPrefixCursor(prefix)};
+        DataStream key, value;
+        while (cursor->Next(key, value) == DatabaseCursor::Status::MORE) {
+            std::string type;
+            uint256 desc_id;
+            key >> type >> desc_id;
+            if (type == DBKeys::WALLETDESCRIPTORKEY) {
+                CPubKey pubkey;
+                CPrivKey privkey;
+                key >> pubkey;
+                value >> privkey;
+                CKey secret;
+                BOOST_REQUIRE(secret.Load(privkey, pubkey, /*fSkipCheck=*/true));
+                secrets.emplace_back(UCharCast(secret.begin()), UCharCast(secret.end()));
+            } else {
+                std::vector<unsigned char> secret;
+                value >> secret;
+                BOOST_REQUIRE_EQUAL(secret.size(), CPQCKey::SIZE);
+                secrets.push_back(std::move(secret));
+            }
+        }
+    }
+    return secrets;
+}
+
+//! Counts the secrets that appear in any of the files, read as raw bytes.
+size_t CountSecretsInFiles(const std::vector<fs::path>& files, const std::vector<std::vector<unsigned char>>& secrets)
+{
+    std::set<size_t> found;
+    for (const fs::path& file : files) {
+        std::ifstream stream{file, std::ios::binary};
+        const std::vector<unsigned char> contents{std::istreambuf_iterator<char>{stream}, std::istreambuf_iterator<char>{}};
+        for (size_t i{0}; i < secrets.size(); ++i) {
+            if (std::search(contents.begin(), contents.end(), secrets[i].begin(), secrets[i].end()) != contents.end()) found.insert(i);
+        }
+    }
+    return found.size();
+}
+
+bool HasPostEncryptionRewrite(CWallet& wallet)
+{
+    return WalletBatch(wallet.GetDatabase()).HasPostEncryptionRewrite();
 }
 
 } // namespace
@@ -330,6 +408,114 @@ BOOST_FIXTURE_TEST_CASE(StaleTopUpSnapshotDoesNotWritePlaintextKeys, RegtestP2MR
     BOOST_CHECK_EQUAL(CountDatabaseRecords(*wallet, DBKeys::WALLETDESCRIPTORPQCCKEY), crypted_records + 4);
     BOOST_CHECK_EQUAL(CountDatabaseRecords(*wallet, DBKeys::WALLETDESCRIPTORPQCKEY), 0U);
 
+    TestUnloadWallet(std::move(wallet));
+}
+
+// A process that stops after the encryption commit and before the rewrite
+// leaves the deleted plaintext keys in the wallet's files. Copy the files at
+// that point, as a stop would leave them, and check that loading the copy
+// removes the keys.
+BOOST_FIXTURE_TEST_CASE(EncryptWalletStoppedBeforeRewriteIsRewrittenOnLoad, RegtestP2MROnlyWalletTestingSetup)
+{
+    WalletContext context;
+    auto wallet{LoadWalletWithoutSecureDelete(context, m_args, *m_node.chain, "")};
+    BOOST_REQUIRE(wallet);
+    const auto secrets{GetPlaintextSecrets(*wallet)};
+    BOOST_REQUIRE(!secrets.empty());
+
+    const fs::path stopped_dir{fs::PathFromString(wallet->GetDatabase().Filename()).parent_path() / "stopped"};
+    std::vector<fs::path> stopped_files;
+    wallet->m_after_encrypt_wallet_commit = [&] {
+        fs::create_directories(stopped_dir);
+        for (const fs::path& file : wallet->GetDatabase().Files()) {
+            if (!fs::exists(file)) continue;
+            stopped_files.push_back(stopped_dir / file.filename());
+            fs::copy_file(file, stopped_files.back(), fs::copy_options::none);
+        }
+    };
+    BOOST_REQUIRE(wallet->EncryptWallet("passphrase"));
+    wallet->m_after_encrypt_wallet_commit = {};
+    BOOST_CHECK(HasPostEncryptionRewrite(*wallet));
+    BOOST_CHECK_EQUAL(CountSecretsInFiles(wallet->GetDatabase().Files(), secrets), 0U);
+    TestUnloadWallet(std::move(wallet));
+
+    // Without a rewrite, the stopped wallet's files still hold the keys.
+    BOOST_REQUIRE(CountSecretsInFiles(stopped_files, secrets) > 0);
+    auto stopped{LoadWalletWithoutSecureDelete(context, m_args, *m_node.chain, "stopped")};
+    BOOST_REQUIRE(stopped);
+    BOOST_CHECK(stopped->IsCrypted());
+    BOOST_CHECK(HasPostEncryptionRewrite(*stopped));
+    BOOST_CHECK_EQUAL(CountSecretsInFiles(stopped->GetDatabase().Files(), secrets), 0U);
+    TestUnloadWallet(std::move(stopped));
+    BOOST_CHECK_EQUAL(CountSecretsInFiles(stopped_files, secrets), 0U);
+}
+
+// VACUUM fails while a transaction is open. The rewrite must wait for a
+// transaction that another batch has open rather than fail.
+BOOST_FIXTURE_TEST_CASE(EncryptWalletRewriteWaitsForOpenTransaction, RegtestP2MROnlyWalletTestingSetup)
+{
+    WalletContext context;
+    auto wallet{LoadWalletWithoutSecureDelete(context, m_args, *m_node.chain, "")};
+    BOOST_REQUIRE(wallet);
+    const auto secrets{GetPlaintextSecrets(*wallet)};
+    BOOST_REQUIRE(!secrets.empty());
+
+    std::promise<void> txn_begun;
+    std::future<bool> writer;
+    wallet->m_after_encrypt_wallet_commit = [&] {
+        writer = std::async(std::launch::async, [&] {
+            auto batch{wallet->GetDatabase().MakeBatch()};
+            const bool begun{batch->TxnBegin()};
+            txn_begun.set_value();
+            if (!begun) return false;
+            // Keep the transaction open while EncryptWallet starts its rewrite.
+            std::this_thread::sleep_for(std::chrono::milliseconds{300});
+            return batch->Write(std::string{"testrecord"}, uint8_t{1}) && batch->TxnCommit();
+        });
+        auto begun{txn_begun.get_future()};
+        WaitOrExit(begun, "the writer to begin its transaction");
+    };
+    BOOST_REQUIRE(wallet->EncryptWallet("passphrase"));
+    wallet->m_after_encrypt_wallet_commit = {};
+    WaitOrExit(writer, "the writer");
+    BOOST_CHECK(writer.get());
+
+    BOOST_CHECK(HasPostEncryptionRewrite(*wallet));
+    BOOST_CHECK_EQUAL(CountSecretsInFiles(wallet->GetDatabase().Files(), secrets), 0U);
+    TestUnloadWallet(std::move(wallet));
+}
+
+// A rewrite that fails, here because a statement still has a read transaction
+// open, must leave the record absent. The next load must rewrite the file.
+BOOST_FIXTURE_TEST_CASE(EncryptWalletFailedRewriteIsRetriedOnLoad, RegtestP2MROnlyWalletTestingSetup)
+{
+    WalletContext context;
+    auto wallet{LoadWalletWithoutSecureDelete(context, m_args, *m_node.chain, "")};
+    BOOST_REQUIRE(wallet);
+    const auto secrets{GetPlaintextSecrets(*wallet)};
+    BOOST_REQUIRE(!secrets.empty());
+
+    std::unique_ptr<DatabaseBatch> reader_batch;
+    std::unique_ptr<DatabaseCursor> reader;
+    wallet->m_after_encrypt_wallet_commit = [&] {
+        reader_batch = wallet->GetDatabase().MakeBatch();
+        reader = reader_batch->GetNewCursor();
+        DataStream key, value;
+        BOOST_REQUIRE(reader->Next(key, value) == DatabaseCursor::Status::MORE);
+    };
+    BOOST_REQUIRE(wallet->EncryptWallet("passphrase"));
+    wallet->m_after_encrypt_wallet_commit = {};
+    reader.reset();
+    reader_batch.reset();
+    BOOST_CHECK(wallet->IsCrypted());
+    BOOST_CHECK(!HasPostEncryptionRewrite(*wallet));
+    TestUnloadWallet(std::move(wallet));
+
+    wallet = LoadWalletWithoutSecureDelete(context, m_args, *m_node.chain, "");
+    BOOST_REQUIRE(wallet);
+    BOOST_CHECK(wallet->IsCrypted());
+    BOOST_CHECK(HasPostEncryptionRewrite(*wallet));
+    BOOST_CHECK_EQUAL(CountSecretsInFiles(wallet->GetDatabase().Files(), secrets), 0U);
     TestUnloadWallet(std::move(wallet));
 }
 

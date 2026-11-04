@@ -74,6 +74,7 @@ extern const std::string NAME;
 extern const std::string OLD_KEY;
 extern const std::string ORDERPOSNEXT;
 extern const std::string POOL;
+extern const std::string POST_ENCRYPTION_REWRITE;
 extern const std::string PURPOSE;
 extern const std::string PUBKEYDBCURSOR;
 extern const std::string PUBKEYDBENTRY;
@@ -266,6 +267,11 @@ public:
 
     bool WriteLockedUTXO(const COutPoint& output);
     bool EraseLockedUTXO(const COutPoint& output);
+
+    //! The POST_ENCRYPTION_REWRITE record, see CWallet::RewriteAfterEncryption
+    bool WritePostEncryptionRewrite();
+    bool ErasePostEncryptionRewrite();
+    bool HasPostEncryptionRewrite();
 
     bool WriteAddressPreviouslySpent(const CTxDestination& dest, bool previously_spent);
     bool WriteAddressReceiveRequest(const CTxDestination& dest, const std::string& id, const std::string& receive_request);

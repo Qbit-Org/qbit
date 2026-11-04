@@ -1284,6 +1284,14 @@ bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase, bool use_cr
             encrypted_batch = nullptr;
             return false;
         }
+        // This transaction deletes the plaintext key records, so the file
+        // needs a rewrite after it, even if it had one before.
+        if (!encrypted_batch->ErasePostEncryptionRewrite()) {
+            encrypted_batch->TxnAbort();
+            delete encrypted_batch;
+            encrypted_batch = nullptr;
+            return false;
+        }
         nMasterKeyMaxID = master_key_id;
         mapMasterKeys[master_key_id] = master_key;
 
@@ -1309,6 +1317,15 @@ bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase, bool use_cr
 
         delete encrypted_batch;
         encrypted_batch = nullptr;
+        if (m_after_encrypt_wallet_commit) m_after_encrypt_wallet_commit();
+
+        // The deleted plaintext keys stay in the file's free space until it
+        // is rewritten. Rewrite it now, before the new descriptors below spend
+        // tens of seconds deriving keys, and while the descriptor locks keep
+        // top-ups from writing. The new keys are written encrypted, so the
+        // file needs no rewrite after them. If the process stops first or the
+        // rewrite fails, the wallet is rewritten when it is next loaded.
+        RewriteAfterEncryption();
         // Release in the reverse order of acquisition.
         while (!desc_spk_man_locks.empty()) desc_spk_man_locks.pop_front();
 
@@ -1320,13 +1337,27 @@ bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase, bool use_cr
             SetupDescriptorScriptPubKeyMans(use_create_keypool_warmup);
         }
         ClearMasterKey();
-
-        // Need to completely rewrite the wallet file; if we don't, the database might keep
-        // bits of the unencrypted private key in slack space in the database file.
-        GetDatabase().Rewrite();
     }
     NotifyStatusChanged(this);
 
+    return true;
+}
+
+bool CWallet::RewriteAfterEncryption()
+{
+    AssertLockHeld(cs_wallet);
+    const auto start{SteadyClock::now()};
+    // The record is written only once the rewrite has succeeded, so a stop
+    // or failure at any point leaves it absent and the next load retries.
+    if (!GetDatabase().Rewrite()) {
+        WalletLogPrintf("Warning: Failed to rewrite the wallet file after encryption; deleted unencrypted keys may remain in it. The rewrite will be retried when the wallet is next loaded.\n");
+        return false;
+    }
+    if (!WalletBatch(GetDatabase()).WritePostEncryptionRewrite()) {
+        WalletLogPrintf("Warning: Failed to record the rewrite of the wallet file after encryption. The rewrite will be repeated when the wallet is next loaded.\n");
+        return false;
+    }
+    WalletLogPrintf("Rewrote the wallet file after encryption in %dms\n", Ticks<std::chrono::milliseconds>(SteadyClock::now() - start));
     return true;
 }
 
@@ -4360,6 +4391,17 @@ std::shared_ptr<CWallet> CWallet::Create(WalletContext& context, const std::stri
         } else {
             error = strprintf(_("Error loading %s"), walletFile);
             return nullptr;
+        }
+    }
+
+    // An encrypted wallet without the record stopped between its encryption
+    // and the rewrite after it, or was encrypted by a version that did not
+    // write the record. Rewrite it before any work on the wallet starts. A
+    // failure is logged and retried at the next load.
+    if (walletInstance->IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS)) {
+        LOCK(walletInstance->cs_wallet);
+        if (walletInstance->IsCrypted() && !WalletBatch(walletInstance->GetDatabase()).HasPostEncryptionRewrite()) {
+            walletInstance->RewriteAfterEncryption();
         }
     }
 

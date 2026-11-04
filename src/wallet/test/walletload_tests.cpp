@@ -2,8 +2,11 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or https://www.opensource.org/licenses/mit-license.php.
 
+#include <outputtype.h>
+#include <wallet/context.h>
 #include <wallet/test/util.h>
 #include <wallet/wallet.h>
+#include <wallet/walletdb.h>
 #include <test/util/logging.h>
 #include <test/util/setup_common.h>
 
@@ -81,6 +84,54 @@ BOOST_FIXTURE_TEST_CASE(wallet_load_descriptors, TestingSetup)
         BOOST_CHECK_EQUAL(wallet->LoadWallet(), DBErrors::CORRUPT);
         BOOST_CHECK(found); // The error must be logged
     }
+}
+
+// A wallet encrypted by v1.0.0 has no POST_ENCRYPTION_REWRITE record. Its
+// first load must rewrite the file and write the record, and later loads must
+// not rewrite it again. A failed rewrite must not fail the load, and the next
+// load must retry it.
+BOOST_FIXTURE_TEST_CASE(wallet_load_rewrites_encrypted_wallet_once, TestingSetup)
+{
+    m_args.ForceSetArg("-keypool", "1");
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+
+    DataStream record_key;
+    record_key << DBKeys::POST_ENCRYPTION_REWRITE;
+    const SerializeData record{record_key.begin(), record_key.end()};
+    MockableData records;
+    {
+        auto wallet{CreateDescriptorWallet(*m_node.chain, GetSupportedOutputTypes(), /*keypool_size=*/1)};
+        BOOST_REQUIRE(wallet->EncryptWallet("passphrase"));
+        records = GetMockableDatabase(*wallet).m_records;
+    }
+    BOOST_REQUIRE_EQUAL(records.erase(record), 1U);
+
+    // Loads the records, then keeps the records the load left behind.
+    const auto load{[&](bool rewrite_pass) {
+        auto database{std::make_unique<MockableDatabase>(records)};
+        MockableDatabase& mock{*database};
+        mock.m_rewrite_pass = rewrite_pass;
+        auto wallet{TestLoadWallet(std::move(database), context, WALLET_FLAG_DESCRIPTORS)};
+        BOOST_REQUIRE(wallet);
+        BOOST_CHECK(wallet->IsCrypted());
+        const int rewrites{mock.m_rewrite_count};
+        records = mock.m_records;
+        TestUnloadWallet(std::move(wallet));
+        return rewrites;
+    }};
+
+    BOOST_CHECK_EQUAL(load(/*rewrite_pass=*/true), 1);
+    BOOST_CHECK(records.contains(record));
+    BOOST_CHECK_EQUAL(load(/*rewrite_pass=*/true), 0);
+    BOOST_CHECK(records.contains(record));
+
+    records.erase(record);
+    BOOST_CHECK_EQUAL(load(/*rewrite_pass=*/false), 1);
+    BOOST_CHECK(!records.contains(record));
+    BOOST_CHECK_EQUAL(load(/*rewrite_pass=*/true), 1);
+    BOOST_CHECK(records.contains(record));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

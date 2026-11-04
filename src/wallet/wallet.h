@@ -708,6 +708,16 @@ public:
     bool Unlock(const SecureString& strWalletPassphrase, bool run_pending_initial_keypool_top_up = true);
     bool ChangeWalletPassphrase(const SecureString& strOldWalletPassphrase, const SecureString& strNewWalletPassphrase);
     bool EncryptWallet(const SecureString& strWalletPassphrase, bool use_create_keypool_warmup = false);
+    /**
+     * Rewrite the database file so that deleted plaintext key records no
+     * longer remain in its free space, then write the POST_ENCRYPTION_REWRITE
+     * record. A transaction that deletes plaintext key records from an
+     * encrypted wallet must erase that record and call this once it has
+     * committed; a wallet loaded without the record is rewritten again, so a
+     * stop before this completes is recovered at the next load. Returns false
+     * and leaves the record absent if the rewrite fails.
+     */
+    bool RewriteAfterEncryption() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     unsigned int ComputeTimeSmart(const CWalletTx& wtx, bool rescanning_old_block) const;
 
@@ -875,6 +885,10 @@ public:
     // database transaction has begun. Same configuration rules as
     // m_before_script_pub_key_cache_publish.
     std::function<void()> m_after_encrypt_wallet_txn_begin;
+    // Optional deterministic test hook invoked by EncryptWallet once its
+    // transaction has committed and before it rewrites the database. Same
+    // configuration rules as m_before_script_pub_key_cache_publish.
+    std::function<void()> m_after_encrypt_wallet_commit;
     // Optional deterministic test hook invoked by send and sendall after they
     // sign a transaction and before they commit it. send holds no wallet lock
     // there; sendall holds cs_wallet. Same configuration rules as

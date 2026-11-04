@@ -4,12 +4,20 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Test Wallet encryption"""
 
+try:
+    import sqlite3
+except ImportError:
+    pass
+
 import time
 import subprocess
 from threading import Thread
 
 from test_framework.authproxy import JSONRPCException
-from test_framework.messages import hash256
+from test_framework.messages import (
+    hash256,
+    ser_string,
+)
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_raises_rpc_error,
@@ -26,6 +34,58 @@ class WalletEncryptionTest(BitcoinTestFramework):
 
     def skip_test_if_missing_module(self):
         self.skip_if_no_wallet()
+        self.skip_if_no_py_sqlite3()
+
+    def test_rewrite_after_encryption(self):
+        self.log.info("Test that an encrypted wallet without the rewrite record is rewritten once when loaded")
+        node = self.nodes[0]
+        rewrite_log = "Rewrote the wallet file after encryption"
+        record_key = ser_string(b"postencryptionrewrite")
+        wallet_db = node.wallets_path / "rewrite" / self.wallet_data_filename
+
+        def count_records():
+            conn = sqlite3.connect(wallet_db)
+            with conn:
+                count = conn.execute("SELECT COUNT(*) FROM main WHERE key = ?", (record_key,)).fetchone()[0]
+            conn.close()
+            return count
+
+        node.createwallet(wallet_name="rewrite")
+        with node.assert_debug_log([rewrite_log]):
+            node.get_wallet_rpc("rewrite").encryptwallet("pass")
+        node.unloadwallet("rewrite")
+        assert_equal(count_records(), 1)
+
+        with node.assert_debug_log([], unexpected_msgs=[rewrite_log]):
+            node.loadwallet("rewrite")
+        node.unloadwallet("rewrite")
+
+        # A wallet encrypted by v1.0.0 has no record.
+        conn = sqlite3.connect(wallet_db)
+        with conn:
+            conn.execute("DELETE FROM main WHERE key = ?", (record_key,))
+        conn.close()
+
+        if self.is_wallet_tool_compiled():
+            # The wallet tool leaves the rewrite to the next load by the node.
+            subprocess.run(
+                self.get_binaries().wallet_argv() + [f"-datadir={node.datadir_path}", f"-chain={self.chain}", "-wallet=rewrite", "info"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
+            assert_equal(count_records(), 0)
+
+        with node.assert_debug_log([rewrite_log]):
+            node.loadwallet("rewrite")
+        node.unloadwallet("rewrite")
+        assert_equal(count_records(), 1)
+
+        with node.assert_debug_log([], unexpected_msgs=[rewrite_log]):
+            node.loadwallet("rewrite")
+        wallet = node.get_wallet_rpc("rewrite")
+        with WalletUnlock(wallet, "pass"):
+            wallet.getnewaddress()
+        wallet.unloadwallet()
 
     def run_test(self):
         passphrase = "WalletPassphrase"
@@ -200,6 +260,8 @@ class WalletEncryptionTest(BitcoinTestFramework):
             with open(dumpfile_path, "r", encoding="utf-8") as f:
                 # Check there's nothing with an 'mkey' prefix
                 assert_equal(all([not line.startswith("046d6b6579") for line in f]), True)
+
+        self.test_rewrite_after_encryption()
 
 
 if __name__ == '__main__':

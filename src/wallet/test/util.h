@@ -108,6 +108,7 @@ public:
     bool m_txn_commit_pass{true};
     bool m_txn_abort_pass{true};
     bool m_wallet_flags_write_pass{true};
+    bool m_rewrite_pass{true};
     //! Runs after a successful mock commit becomes durable, or immediately
     //! before a failed commit returns, while WalletBatch listeners are COMMITTING.
     std::function<void(bool)> m_txn_commit_result_hook;
@@ -116,13 +117,18 @@ public:
     int m_txn_begin_count{0};
     int m_txn_commit_count{0};
     int m_txn_abort_count{0};
+    int m_rewrite_count{0};
 
     MockableDatabase(MockableData records = {}) : WalletDatabase(), m_records(records) {}
     ~MockableDatabase() = default;
 
     void Open() override {}
 
-    bool Rewrite() override { return m_pass; }
+    bool Rewrite() override
+    {
+        ++m_rewrite_count;
+        return m_pass && m_rewrite_pass;
+    }
     bool Backup(const std::string& strDest) const override { return m_pass; }
     void Close() override {}
 
@@ -137,6 +143,7 @@ public:
         m_txn_begin_count = 0;
         m_txn_commit_count = 0;
         m_txn_abort_count = 0;
+        m_rewrite_count = 0;
     }
 };
 
