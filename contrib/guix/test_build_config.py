@@ -88,6 +88,9 @@ echo "STRIPPED $(basename "$1")" > "$2"
 
 FAKE_DSYMUTIL = r"""#!/usr/bin/env bash
 set -e
+mkdir "$FAKE_DSYMUTIL_LOG.lock" || { echo "fake dsymutil: concurrent run" >&2; exit 1; }
+trap 'rmdir "$FAKE_DSYMUTIL_LOG.lock"' EXIT
+sleep 0.1
 echo "$*" >> "$FAKE_DSYMUTIL_LOG"
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -254,7 +257,7 @@ class GuixPackagingTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         return run_packaging(BUILD_SH.read_text(encoding="utf8"), host, Path(tmp.name))
 
-    def test_darwin_ships_dsym_bundles_beside_stripped_release(self) -> None:
+    def test_darwin_debug_tarball_holds_dsym_bundles(self) -> None:
         executables = [f"bin/{name}" for name in BIN_NAMES] + [
             f"libexec/{name}" for name in LIBEXEC_NAMES
         ]
@@ -308,10 +311,17 @@ class GuixPackagingTest(unittest.TestCase):
                     )
                 self.assertEqual(debug, expected_debug)
 
+                # One dsymutil at a time (the fake fails on overlap), each
+                # writing its bundle to the debug tree, not next to its input.
                 invocations = (outdir.parent / "dsymutil.log").read_text(encoding="utf8").splitlines()
-                self.assertEqual(len(invocations), len(executables))
-                for invocation in invocations:
-                    self.assertTrue(invocation.startswith("--num-threads 1 -o "), invocation)
+                self.assertEqual(
+                    sorted(invocations),
+                    sorted(
+                        f"--num-threads 1 -o {outdir.parent}/distsrc/debug/{DISTNAME}/{executable}.dSYM "
+                        f"{DISTNAME}/{executable}"
+                        for executable in executables
+                    ),
+                )
 
     def test_linux_debug_tarball_keeps_split_debug_files(self) -> None:
         host = "x86_64-linux-gnu"

@@ -302,6 +302,7 @@ mkdir -p "$DISTSRC"
                 # needs far more memory than splitting with objcopy. Stripping
                 # keeps the LC_UUID, so the bundles also match the release,
                 # codesigned and app bundle binaries.
+                mkdir -p "${DISTSRC}/debug/${DISTNAME}/bin" "${DISTSRC}/debug/${DISTNAME}/libexec"
                 (
                     cd "${DISTSRC}/unstripped"
                     find "${DISTNAME}/bin" "${DISTNAME}/libexec" -type f -executable -print0 \
