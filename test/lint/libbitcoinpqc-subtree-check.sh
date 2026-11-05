@@ -116,12 +116,17 @@ fi
 
 upstream_commit="$(git rev-parse "${upstream_commit}^{commit}")"
 upstream_tree="$(git show -s --format=%T "${upstream_commit}")"
+# Search only non-merge commits that change the prefix, so neither a commit
+# that merely quotes the trailer nor a merge commit whose pull request title
+# quotes it can be picked.
 metadata_commit="$(
   git log \
+    --no-merges \
     --grep="^git-subtree-dir: ${PREFIX}/*$" \
     --format=%H \
     -n 1 \
-    HEAD
+    HEAD \
+    -- "${PREFIX}"
 )"
 metadata_split=""
 metadata_tree=""

@@ -173,3 +173,32 @@ Example usage:
 
     cd .../src
     ../contrib/devtools/circular-dependencies.py {*,*/*,*/*/*}.{h,cpp}
+
+update-libbitcoinpqc-subtree.sh
+===============================
+
+Imports a signed `qbit-libbitcoinpqc` release tag into `src/libbitcoinpqc` as
+one main-line commit with `git-subtree-dir` and `git-subtree-split` trailers.
+Before changing the tree it checks for a clean tree, Git 2.45 or later, the
+tag's signature and name, a downgrade, and any downstream delta the release
+would drop. It then runs `test/lint/libbitcoinpqc-subtree-check.sh` and undoes
+the import commit if the check fails.
+
+The default source is
+`https://github.com/Qbit-Org/qbit-libbitcoinpqc.git` tag `v0.3.0`. For the
+checks, the flags and the delta review, see
+[`doc/subtrees/libbitcoinpqc.md`](../../doc/subtrees/libbitcoinpqc.md).
+
+Run from the repository root:
+
+```bash
+contrib/devtools/update-libbitcoinpqc-subtree.sh <tag>
+```
+
+Optional flags and overrides:
+
+```bash
+LIBBITCOINPQC_REMOTE_URL=git@github.com:Qbit-Org/qbit-libbitcoinpqc.git \
+contrib/devtools/update-libbitcoinpqc-subtree.sh \
+  [--allow-downgrade] [--accept-upstream <path>]... <tag>
+```

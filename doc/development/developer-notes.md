@@ -1125,10 +1125,10 @@ The ultimate upstream of the few externally managed subtrees are:
   - Upstream at https://github.com/Qbit-Org/qbit-libbitcoinpqc ; imported
     directly from immutable release tags.
   - Follow [libbitcoinpqc subtree runbook](../subtrees/libbitcoinpqc.md).
-  - Update this subtree as one main-line import commit carrying
-    `git-subtree-dir` and `git-subtree-split` trailers, as described in the
-    runbook, so updates remain verifiable by
-    `test/lint/libbitcoinpqc-subtree-check.sh`.
+  - Use `contrib/devtools/update-libbitcoinpqc-subtree.sh` to update this
+    subtree. It imports a signed release tag as one main-line commit with
+    `git-subtree-dir` and `git-subtree-split` trailers, so updates remain
+    verifiable by `test/lint/libbitcoinpqc-subtree-check.sh`.
 
 - src/leveldb
   - Upstream at https://github.com/google/leveldb ; maintained by Google. Open
