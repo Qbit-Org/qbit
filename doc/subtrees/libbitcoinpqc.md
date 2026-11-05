@@ -37,9 +37,9 @@ continues to accept the full two-byte WOTS+C counter range. See the subtree's
 [`bounded30` signature-limit documentation](../../src/libbitcoinpqc/docs/bounded30-signature-limit.md)
 for the complete distinction.
 
-## Import Or Refresh The Subtree
+## Refresh The Subtree
 
-Import a release with the helper, from a clean `qbit` worktree:
+Refresh the subtree to a release with the helper, from a clean `qbit` worktree:
 
 ```bash
 git fetch origin
@@ -54,6 +54,10 @@ trailers, as Qbit-Org/qbit#268 did. Without `<tag>`, it imports
 `LIBBITCOINPQC_REMOTE_REF`, or else its pinned `DEFAULT_REMOTE_REF`. Do not
 import from `main`; create and review a release tag in `qbit-libbitcoinpqc`
 first.
+
+The helper only refreshes an existing import: it reads the current split from
+`HEAD`'s newest import commit and stops if there is none. A first import is a
+maintainer task outside the helper.
 
 Every check runs before the tree changes, and the helper stops at the first
 one that fails:
@@ -95,13 +99,15 @@ nothing.
 | `--accept-upstream <path>` | Take the release's version of a listed path, relative to `src/libbitcoinpqc`. Name each listed path once; a path that differs and is not named still stops the import. |
 | `LIBBITCOINPQC_REMOTE_URL` | Upstream repository. Default: `https://github.com/Qbit-Org/qbit-libbitcoinpqc.git`. |
 | `LIBBITCOINPQC_REMOTE_REF` | Tag to import when none is given. |
-| `LIBBITCOINPQC_TEST_SIGNER_CERT`, `LIBBITCOINPQC_TEST_SIGNER_FINGERPRINT` | Test-only signer overrides used by `ci/checks/test_update_libbitcoinpqc_subtree.py`. Never set them for a release import. |
+| `--test-signer-cert <path>`, `--test-signer-fingerprint <fpr>` | Test-only flags, used together by `ci/checks/test_update_libbitcoinpqc_subtree.py`, that replace the pinned signer and print `TEST SIGNER IN USE`. Never use them for a release import. No environment variable can change the signer. |
 
 ### Reviewing A Downstream Delta
 
 When the helper lists paths, the qbit subtree has a change that the release
 lacks, or that conflicts with how the release changed the same file. The error
-names the current split and the new split. For each listed path:
+names the current split and the new split, and lists conflicted paths apart from
+paths with qbit changes the release lacks. Each path is listed by its real name,
+including renamed and non-ASCII paths. For each listed path:
 
 1. Show qbit's change:
    `git diff <current-split>^{tree} HEAD:src/libbitcoinpqc -- <path>`.
@@ -162,7 +168,7 @@ When a PR touches `src/libbitcoinpqc`, confirm:
   `git-subtree-split` trailers.
 - [ ] `test/lint/libbitcoinpqc-subtree-check.sh` passes locally.
 - [ ] Any pin change updates every location listed in
-  [Import Or Refresh The Subtree](#import-or-refresh-the-subtree) and is
+  [Refresh The Subtree](#refresh-the-subtree) and is
   intentional.
 - [ ] Any use of `--allow-downgrade` or `--accept-upstream` is explained in the
   pull request.

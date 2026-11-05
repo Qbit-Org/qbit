@@ -1094,11 +1094,17 @@ def git_subtree_field(message: str, field: str) -> str:
 
 def latest_git_subtree_metadata(source: Path, relpath: str) -> dict[str, Any]:
     grep = f"^git-subtree-dir: {relpath}/*$"
+    # Like test/lint/libbitcoinpqc-subtree-check.sh, search only non-merge
+    # commits that change the subtree, so a commit or merge message that only
+    # quotes the trailer cannot be picked.
     git_args = [
         "log",
+        "--no-merges",
         f"--grep={grep}",
         "--pretty=format:%H%x1f%B%x1e",
         "HEAD",
+        "--",
+        relpath,
     ]
     exit_code, stdout, _stderr = git_command(source, *git_args)
     metadata: dict[str, Any] = {

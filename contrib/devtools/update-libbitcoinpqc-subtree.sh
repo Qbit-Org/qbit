@@ -15,17 +15,20 @@ readonly DEFAULT_SIGNER_FINGERPRINT="289EA3EC2F1939A24984840ED26CFC05586D371E"
 
 REMOTE_URL="${LIBBITCOINPQC_REMOTE_URL:-$DEFAULT_REMOTE_URL}"
 REMOTE_REF="${LIBBITCOINPQC_REMOTE_REF:-$DEFAULT_REMOTE_REF}"
-SIGNER_CERT="${LIBBITCOINPQC_TEST_SIGNER_CERT:-$DEFAULT_SIGNER_CERT}"
-SIGNER_FINGERPRINT="${LIBBITCOINPQC_TEST_SIGNER_FINGERPRINT:-$DEFAULT_SIGNER_FINGERPRINT}"
+# The signer is pinned. Only explicit test flags can replace it; no environment
+# variable can.
+SIGNER_CERT="${DEFAULT_SIGNER_CERT}"
+SIGNER_FINGERPRINT="${DEFAULT_SIGNER_FINGERPRINT}"
 
 usage() {
   cat <<EOF
 Usage: $(basename "$0") [--allow-downgrade] [--accept-upstream <path>]... [<tag>]
 
-Import a signed qbit-libbitcoinpqc release tag into $PREFIX as one main-line
-commit that carries git-subtree-dir and git-subtree-split trailers, then run
-test/lint/libbitcoinpqc-subtree-check.sh. Every check runs before the tree
-changes; a failed subtree check undoes the import commit.
+Refresh an existing $PREFIX import to a signed qbit-libbitcoinpqc release tag,
+as one main-line commit that carries git-subtree-dir and git-subtree-split
+trailers, then run test/lint/libbitcoinpqc-subtree-check.sh. Every check runs
+before the tree changes; a failed subtree check undoes the import commit.
+A first import is a maintainer task outside this helper.
 See doc/subtrees/libbitcoinpqc.md for the checks and the delta review.
 
 Options:
@@ -42,9 +45,12 @@ Environment overrides:
   LIBBITCOINPQC_REMOTE_URL   default: $DEFAULT_REMOTE_URL
   LIBBITCOINPQC_REMOTE_REF   default: $DEFAULT_REMOTE_REF
 
-Test-only environment overrides (for the helper's tests, not for releases):
-  LIBBITCOINPQC_TEST_SIGNER_CERT          default: $DEFAULT_SIGNER_CERT
-  LIBBITCOINPQC_TEST_SIGNER_FINGERPRINT   default: $DEFAULT_SIGNER_FINGERPRINT
+Test-only options (for the helper's tests, never for a real import):
+  --test-signer-cert <path>          Replace the pinned signer certificate,
+                                     $DEFAULT_SIGNER_CERT.
+  --test-signer-fingerprint <fpr>    Replace the pinned signing fingerprint,
+                                     $DEFAULT_SIGNER_FINGERPRINT.
+  Both must be given together, and the helper warns loudly when they are used.
 EOF
 }
 
@@ -63,9 +69,21 @@ contains() {
   return 1
 }
 
+# merge-tree names a conflicted entry it had to move aside path~<object id>.
+# Map such names back to the real path.
+real_path() {
+  local path="$1"
+  if [[ "${path}" == *~* && "${path##*~}" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]; then
+    path="${path%~*}"
+  fi
+  printf '%s' "${path}"
+}
+
 allow_downgrade=0
 accept_upstream=()
 tag=""
+test_signer_cert=""
+test_signer_fingerprint=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h | --help)
@@ -80,6 +98,16 @@ while [[ $# -gt 0 ]]; do
       accept_upstream+=("$2")
       shift
       ;;
+    --test-signer-cert)
+      [[ $# -ge 2 && -n "$2" ]] || die "--test-signer-cert requires a path"
+      test_signer_cert="$2"
+      shift
+      ;;
+    --test-signer-fingerprint)
+      [[ $# -ge 2 && -n "$2" ]] || die "--test-signer-fingerprint requires a fingerprint"
+      test_signer_fingerprint="$2"
+      shift
+      ;;
     -*)
       die "unknown option: $1 (see --help)"
       ;;
@@ -91,6 +119,14 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 tag="${tag:-$REMOTE_REF}"
+if [[ -n "${test_signer_cert}${test_signer_fingerprint}" ]]; then
+  [[ -n "${test_signer_cert}" && -n "${test_signer_fingerprint}" ]] \
+    || die "--test-signer-cert and --test-signer-fingerprint must be given together"
+  [[ "${test_signer_cert}" == /* ]] || test_signer_cert="${PWD}/${test_signer_cert}"
+  SIGNER_CERT="${test_signer_cert}"
+  SIGNER_FINGERPRINT="${test_signer_fingerprint}"
+  echo "warning: TEST SIGNER IN USE: not for real imports (${SIGNER_FINGERPRINT})" >&2
+fi
 
 git check-ref-format "refs/tags/${tag}" || die "not a valid tag name: ${tag}"
 [[ "${SIGNER_FINGERPRINT}" =~ ^[0-9A-F]{40}$ ]] \
@@ -172,55 +208,98 @@ if [[ "${allow_downgrade}" -ne 1 ]] \
   die "${tag} (${upstream_commit}) does not descend from the current split ${old_split}; pass --allow-downgrade to import it anyway"
 fi
 
-# Merge the qbit subtree into the release, with the old release as the base.
-# Where the result differs from the release, the import would drop a qbit
-# change or override a conflicting one.
 old_upstream_tree="$(git rev-parse --verify "${old_split}^{tree}")"
 qbit_tree="$(git rev-parse --verify "HEAD:${PREFIX}")"
 new_upstream_tree="$(git rev-parse --verify "${upstream_commit}^{tree}")"
-merge_status=0
-merge_output="$(
-  git merge-tree --write-tree --merge-base="${old_upstream_tree}" \
-    "${qbit_tree}" "${new_upstream_tree}"
-)" || merge_status=$?
-merged_tree="${merge_output%%[[:space:]]*}"
-if [[ "${merge_status}" -gt 1 || ! "${merged_tree}" =~ ^[0-9a-f]{40}$ ]]; then
-  die "git merge-tree failed (status ${merge_status})"
+if [[ "${new_upstream_tree}" == "${qbit_tree}" ]]; then
+  die "the release tree equals the vendored tree, so the pin cannot advance through an import commit; ask a maintainer"
 fi
-differing_paths="$(git diff --name-only "${new_upstream_tree}" "${merged_tree}")"
+
+# One EXIT trap removes the scratch files and, if the import started but did
+# not commit, restores the prefix, which was clean (including ignored files)
+# before the import started.
+work_dir=""
+import_started=0
+import_committed=0
+cleanup() {
+  if [[ "${import_started}" -eq 1 && "${import_committed}" -ne 1 ]]; then
+    git reset -q -- "${PREFIX}" || true
+    git checkout -q -- "${PREFIX}" || true
+    git clean -q -fdx -- "${PREFIX}" || true
+  fi
+  if [[ -n "${work_dir}" ]]; then
+    rm -rf "${work_dir}"
+  fi
+}
+trap cleanup EXIT
+work_dir="$(mktemp -d)"
+
+# Merge the qbit subtree into the release, with the old release as the base.
+# Where the result differs from the release, the import would drop a qbit
+# change or override a conflicting one. Paths are read with plumbing and NUL
+# separators, so quoting and rename detection cannot hide or mangle them.
+merge_status=0
+git merge-tree --write-tree -z --name-only --merge-base="${old_upstream_tree}" \
+  "${qbit_tree}" "${new_upstream_tree}" >"${work_dir}/merge" || merge_status=$?
+[[ "${merge_status}" -le 1 ]] || die "git merge-tree failed (status ${merge_status})"
+merged_tree=""
+conflicted_paths=()
+{
+  IFS= read -r -d '' merged_tree || true
+  if [[ "${merge_status}" -eq 1 ]]; then
+    # On a conflict, the merged tree is followed by the conflicted paths and an
+    # empty field.
+    while IFS= read -r -d '' path && [[ -n "${path}" ]]; do
+      path="$(real_path "${path}")"
+      contains "${path}" ${conflicted_paths[@]+"${conflicted_paths[@]}"} \
+        || conflicted_paths+=("${path}")
+    done
+  fi
+} <"${work_dir}/merge"
+[[ "${merged_tree}" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]] || die "git merge-tree returned no tree"
+git diff-tree -r -z --no-renames --name-only "${new_upstream_tree}" "${merged_tree}" \
+  >"${work_dir}/differing" || die "git diff-tree failed"
+differing_paths=()
+while IFS= read -r -d '' path; do
+  path="$(real_path "${path}")"
+  contains "${path}" ${conflicted_paths[@]+"${conflicted_paths[@]}"} && continue
+  contains "${path}" ${differing_paths[@]+"${differing_paths[@]}"} \
+    || differing_paths+=("${path}")
+done <"${work_dir}/differing"
+
 for path in ${accept_upstream[@]+"${accept_upstream[@]}"}; do
-  grep -qxF -- "${path}" <<<"${differing_paths}" \
+  contains "${path}" ${conflicted_paths[@]+"${conflicted_paths[@]}"} \
+    ${differing_paths[@]+"${differing_paths[@]}"} \
     || die "--accept-upstream ${path} does not name a path that differs from ${tag}"
 done
-unaccepted=""
-while IFS= read -r path; do
-  [[ -n "${path}" ]] || continue
-  contains "${path}" ${accept_upstream[@]+"${accept_upstream[@]}"} && continue
-  unaccepted+="  ${path}"$'\n'
-done <<<"${differing_paths}"
-if [[ -n "${unaccepted}" ]]; then
-  echo "error: importing ${tag} would drop or override qbit changes under ${PREFIX}." >&2
-  if [[ "${merge_status}" -eq 1 ]]; then
-    echo "The qbit subtree also conflicts with how ${tag} changed some of these paths." >&2
+unaccepted_conflicts=()
+for path in ${conflicted_paths[@]+"${conflicted_paths[@]}"}; do
+  contains "${path}" ${accept_upstream[@]+"${accept_upstream[@]}"} \
+    || unaccepted_conflicts+=("${path}")
+done
+unaccepted_paths=()
+for path in ${differing_paths[@]+"${differing_paths[@]}"}; do
+  contains "${path}" ${accept_upstream[@]+"${accept_upstream[@]}"} \
+    || unaccepted_paths+=("${path}")
+done
+if [[ -n "${unaccepted_conflicts[*]+x}${unaccepted_paths[*]+x}" ]]; then
+  echo "error: importing ${tag} would drop or override qbit changes under ${PREFIX}" >&2
+  echo "(new split ${upstream_commit}; current split ${old_split})." >&2
+  if [[ -n "${unaccepted_conflicts[*]+x}" ]]; then
+    echo "Paths where the qbit subtree conflicts with how ${tag} changed them:" >&2
+    printf '  %s\n' "${unaccepted_conflicts[@]}" >&2
   fi
-  echo "Paths that would differ from ${tag} (new split ${upstream_commit}; current split ${old_split}):" >&2
-  printf '%s' "${unaccepted}" >&2
+  if [[ -n "${unaccepted_paths[*]+x}" ]]; then
+    echo "Paths with qbit changes that ${tag} lacks:" >&2
+    printf '  %s\n' "${unaccepted_paths[@]}" >&2
+  fi
   echo "Review them, then rerun with --accept-upstream <path> for each path to take ${tag}'s version." >&2
   exit 1
 fi
 
 # Import with the caller's own GnuPG environment, so a maintainer whose commits
-# are signed gets a signed import commit. If the commit fails, restore the
-# prefix, which was clean before the import started.
-import_committed=0
-restore_prefix() {
-  if [[ "${import_committed}" -ne 1 ]]; then
-    git reset -q -- "${PREFIX}" || true
-    git checkout -q -- "${PREFIX}" || true
-    git clean -q -fd -- "${PREFIX}" || true
-  fi
-}
-trap restore_prefix EXIT
+# are signed gets a signed import commit.
+import_started=1
 git rm -r -q -- "${PREFIX}"
 git read-tree --prefix="${PREFIX}/" -u "${new_upstream_tree}"
 git commit -q \
@@ -228,7 +307,6 @@ git commit -q \
   -m "git-subtree-dir: ${PREFIX}
 git-subtree-split: ${upstream_commit}"
 import_committed=1
-trap - EXIT
 
 if ! LIBBITCOINPQC_REMOTE_URL="${REMOTE_URL}" LIBBITCOINPQC_REMOTE_REF="${tag}" \
   test/lint/libbitcoinpqc-subtree-check.sh; then

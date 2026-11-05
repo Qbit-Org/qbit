@@ -127,6 +127,20 @@ class UpdateLibbitcoinpqcSubtreeTest(unittest.TestCase):
             cls._git(work, "commit", "-q", "-m", f"release {tag}")
             cls._sign_tag(work, tag, cls.signer, cls.signer_home)
         cls._git(work, "tag", "-a", "-m", "unsigned", "v9.9.9-unsigned", "HEAD")
+        side_releases = [
+            ("v0.3.3", {"newdir/inner.c": "int inner;\n"}),
+            ("v0.3.4", {"fixture.gen": "generated\n"}),
+            ("v0.3.5", {}),
+        ]
+        for tag, files in side_releases:
+            cls._git(work, "checkout", "-q", "--detach", "v0.3.2")
+            for name, content in files.items():
+                (work / name).parent.mkdir(parents=True, exist_ok=True)
+                (work / name).write_text(content, encoding="utf8")
+            cls._git(work, "add", "-A")
+            cls._git(work, "commit", "-q", "--allow-empty", "-m", f"release {tag}")
+            cls._sign_tag(work, tag, cls.signer, cls.signer_home)
+        cls._git(work, "checkout", "-q", "v0.3.2")
         cls._sign_tag(work, "v9.9.9-wrong", cls.wrong, cls.wrong_home)
         # An older signed tag object published under a new name.
         cls._git(work, "update-ref", "refs/tags/v9.9.8", cls._git(work, "rev-parse", "v0.3.0"))
@@ -185,18 +199,24 @@ class UpdateLibbitcoinpqcSubtreeTest(unittest.TestCase):
         *args: str,
         gnupghome: Path | None = None,
         path_prefix: Path | None = None,
+        test_signer: bool = True,
+        extra_env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = self._env(
             gnupghome=gnupghome,
             LIBBITCOINPQC_REMOTE_URL=str(self.upstream),
-            LIBBITCOINPQC_TEST_SIGNER_CERT=str(self.signer_cert),
-            LIBBITCOINPQC_TEST_SIGNER_FINGERPRINT=self.signer,
             TMPDIR=str(self.tmp),
+            **(extra_env or {}),
         )
         if path_prefix is not None:
             env["PATH"] = f"{path_prefix}{os.pathsep}{env['PATH']}"
+        signer_args = (
+            ["--test-signer-cert", str(self.signer_cert), "--test-signer-fingerprint", self.signer]
+            if test_signer
+            else []
+        )
         result = subprocess.run(
-            [str(repo / HELPER), *args], cwd=repo, env=env, capture_output=True, text=True
+            [str(repo / HELPER), *signer_args, *args], cwd=repo, env=env, capture_output=True, text=True
         )
         self.assertEqual(list(self.tmp.iterdir()), [], "the throwaway keyring was left behind")
         return result
@@ -205,12 +225,13 @@ class UpdateLibbitcoinpqcSubtreeTest(unittest.TestCase):
         env = self._env(LIBBITCOINPQC_REMOTE_URL=str(self.upstream), LIBBITCOINPQC_REMOTE_REF=tag)
         return subprocess.run([str(repo / LINT)], cwd=repo, env=env, capture_output=True, text=True)
 
-    def assert_refused(self, repo: Path, message: str, *args: str, **kwargs: Path) -> None:
+    def assert_refused(self, repo: Path, message: str, *args: str, **kwargs: object) -> str:
         before = self.state(repo)
-        result = self.run_helper(repo, *args, **kwargs)
+        result = self.run_helper(repo, *args, **kwargs)  # type: ignore[arg-type]
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn(message, result.stderr)
         self.assertEqual(self.state(repo), before)
+        return result.stderr
 
     def assert_imported(self, repo: Path, tag: str, result: subprocess.CompletedProcess[str]) -> None:
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -329,7 +350,8 @@ class UpdateLibbitcoinpqcSubtreeTest(unittest.TestCase):
         (repo / PREFIX / "Cargo.lock").write_text("a = 3\nb = 1\n", encoding="utf8")
         self._git(repo, "add", "-A")
         self.commit(repo, "qbit lockfile change that conflicts with the release")
-        self.assert_refused(repo, "also conflicts", "v0.3.2")
+        stderr = self.assert_refused(repo, "conflicts with how v0.3.2 changed them:\n  Cargo.lock\n", "v0.3.2")
+        self.assertNotIn("~", stderr)
         self.assert_imported(repo, "v0.3.2", self.run_helper(repo, "--accept-upstream", "Cargo.lock", "v0.3.2"))
 
     @unittest.skipUnless(HAVE_GIT_2_45, "Git 2.45 or later is required")
@@ -355,6 +377,93 @@ class UpdateLibbitcoinpqcSubtreeTest(unittest.TestCase):
         self.commit(repo, "force a lint failure")
         self.assert_refused(repo, "the import commit was undone", "v0.3.2")
 
+    @unittest.skipUnless(HAVE_GIT_2_45, "Git 2.45 or later is required")
+    def test_file_directory_conflict_lists_the_real_path(self) -> None:
+        repo = self.make_downstream()
+        (repo / PREFIX / "newdir").write_text("qbit file\n", encoding="utf8")
+        self._git(repo, "add", "-A")
+        self.commit(repo, "qbit adds a file where the release adds a directory")
+        stderr = self.assert_refused(repo, "changed them:\n  newdir\n", "v0.3.3")
+        self.assertNotIn("newdir~", stderr)
+        self.assert_imported(repo, "v0.3.3", self.run_helper(repo, "--accept-upstream", "newdir", "v0.3.3"))
+
+    @unittest.skipUnless(HAVE_GIT_2_45, "Git 2.45 or later is required")
+    def test_renamed_path_lists_both_names(self) -> None:
+        repo = self.make_downstream()
+        self._git(repo, "mv", f"{PREFIX}/src.c", f"{PREFIX}/renamed.c")
+        self.commit(repo, "qbit renames a file")
+        stderr = self.assert_refused(repo, "  renamed.c\n", "v0.3.2")
+        self.assertIn("  src.c\n", stderr)
+        self.assert_refused(repo, "  src.c\n", "--accept-upstream", "renamed.c", "v0.3.2")
+        result = self.run_helper(repo, "--accept-upstream", "renamed.c", "--accept-upstream", "src.c", "v0.3.2")
+        self.assert_imported(repo, "v0.3.2", result)
+
+    @unittest.skipUnless(HAVE_GIT_2_45, "Git 2.45 or later is required")
+    def test_non_ascii_path_can_be_accepted(self) -> None:
+        repo = self.make_downstream()
+        name = "\u00fcn\u00efcode.c"
+        (repo / PREFIX / name).write_text("int u;\n", encoding="utf8")
+        self._git(repo, "add", "-A")
+        self.commit(repo, "qbit adds a non-ASCII path")
+        self.assert_refused(repo, f"  {name}\n", "v0.3.2")
+        self.assert_imported(repo, "v0.3.2", self.run_helper(repo, "--accept-upstream", name, "v0.3.2"))
+
+    @unittest.skipUnless(HAVE_GIT_2_45, "Git 2.45 or later is required")
+    def test_release_tree_equal_to_vendored_tree_is_refused_clearly(self) -> None:
+        repo = self.make_downstream()
+        self.assert_imported(repo, "v0.3.2", self.run_helper(repo, "v0.3.2"))
+        self.assert_refused(
+            repo,
+            "the release tree equals the vendored tree, so the pin cannot advance through an import commit; ask a maintainer",
+            "v0.3.5",
+        )
+
+    @unittest.skipUnless(HAVE_GIT_2_45, "Git 2.45 or later is required")
+    def test_failed_commit_restores_the_prefix_including_ignored_files(self) -> None:
+        repo = self.make_downstream()
+        (repo / ".gitignore").write_text("*.gen\n", encoding="utf8")
+        self._git(repo, "add", ".gitignore")
+        self.commit(repo, "qbit ignores generated files")
+        hook = repo / ".git" / "hooks" / "pre-commit"
+        hook.write_text("#!/bin/sh\nexit 1\n", encoding="utf8")
+        hook.chmod(0o755)
+        self.assert_refused(repo, "", "v0.3.4")
+        self.assertFalse((repo / PREFIX / "fixture.gen").exists())
+
+    @unittest.skipUnless(HAVE_GIT_2_45, "Git 2.45 or later is required")
+    def test_test_signer_flags_warn(self) -> None:
+        repo = self.make_downstream()
+        result = self.run_helper(repo, "v0.3.2")
+        self.assert_imported(repo, "v0.3.2", result)
+        self.assertIn("TEST SIGNER IN USE: not for real imports", result.stderr)
+
+    @unittest.skipUnless(HAVE_GIT_2_45, "Git 2.45 or later is required")
+    def test_signer_environment_variables_are_ignored(self) -> None:
+        repo = self.make_downstream()
+        cert = repo / "contrib/keys/operator-keys/public-keys/operator-01-release.asc"
+        cert.parent.mkdir(parents=True)
+        shutil.copy2(REPO_ROOT / "contrib/keys/operator-keys/public-keys/operator-01-release.asc", cert)
+        self._git(repo, "add", "-A")
+        self.commit(repo, "add the pinned signer certificate")
+        stderr = self.assert_refused(
+            repo,
+            "has no good signature from 289EA3EC2F1939A24984840ED26CFC05586D371E",
+            "v0.3.2",
+            test_signer=False,
+            extra_env={
+                "LIBBITCOINPQC_TEST_SIGNER_CERT": str(self.signer_cert),
+                "LIBBITCOINPQC_TEST_SIGNER_FINGERPRINT": self.signer,
+            },
+        )
+        self.assertNotIn("TEST SIGNER IN USE", stderr)
+
+    def test_test_signer_flags_must_be_given_together(self) -> None:
+        repo = self.make_downstream()
+        self.assert_refused(
+            repo, "must be given together", "--test-signer-cert", str(self.signer_cert), "v0.3.2",
+            test_signer=False,
+        )
+
     def test_usage_errors(self) -> None:
         repo = self.make_downstream()
         self.assert_refused(repo, "unknown option: --bogus", "--bogus")
@@ -364,6 +473,7 @@ class UpdateLibbitcoinpqcSubtreeTest(unittest.TestCase):
         result = self.run_helper(repo, "--help")
         self.assertEqual(result.returncode, 0)
         self.assertIn("--accept-upstream <path>", result.stdout)
+        self.assertIn("A first import is a maintainer task outside this helper.", result.stdout)
 
     @unittest.skipUnless(HAVE_GIT_2_45, "Git 2.45 or later is required")
     def test_lint_ignores_commits_that_only_quote_the_trailer(self) -> None:

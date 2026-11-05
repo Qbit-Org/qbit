@@ -177,8 +177,9 @@ Example usage:
 update-libbitcoinpqc-subtree.sh
 ===============================
 
-Imports a signed `qbit-libbitcoinpqc` release tag into `src/libbitcoinpqc` as
-one main-line commit with `git-subtree-dir` and `git-subtree-split` trailers.
+Refreshes `src/libbitcoinpqc` to a signed `qbit-libbitcoinpqc` release tag as
+one main-line commit with `git-subtree-dir` and `git-subtree-split` trailers. A
+first import is a maintainer task outside the helper.
 Before changing the tree it checks for a clean tree, Git 2.45 or later, the
 tag's signature and name, a downgrade, and any downstream delta the release
 would drop. It then runs `test/lint/libbitcoinpqc-subtree-check.sh` and undoes

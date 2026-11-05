@@ -295,5 +295,55 @@ class RunScannersTest(unittest.TestCase):
         )
 
 
+
+class LatestGitSubtreeMetadataTest(unittest.TestCase):
+    """The scanner reads the subtree split the way the subtree lint does."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.repo = Path(self.temp_dir.name)
+        self.git("init", "-q", "-b", "main")
+        (self.repo / "README").write_text("qbit\n", encoding="utf8")
+        (self.repo / "src" / "libbitcoinpqc").mkdir(parents=True)
+        (self.repo / "src" / "libbitcoinpqc" / "lib.c").write_text("int x;\n", encoding="utf8")
+        self.git("add", "-A")
+        self.split = "1" * 40
+        self.git(
+            "commit", "-q", "-m", "Squashed 'src/libbitcoinpqc/' content",
+            "-m", f"git-subtree-dir: src/libbitcoinpqc\ngit-subtree-split: {self.split}",
+        )
+        self.import_commit = self.git("rev-parse", "HEAD")
+        quoted = f"git-subtree-dir: src/libbitcoinpqc\ngit-subtree-split: {'0' * 40}"
+        # A later commit outside the subtree that quotes the trailer.
+        (self.repo / "README").write_text("docs\n", encoding="utf8")
+        self.git("add", "README")
+        self.git("commit", "-q", "-m", "doc: describe the import", "-m", quoted)
+        # A merge commit whose message quotes it, as a pull request title might.
+        self.git("checkout", "-q", "-b", "topic")
+        (self.repo / "notes.txt").write_text("notes\n", encoding="utf8")
+        self.git("add", "notes.txt")
+        self.git("commit", "-q", "-m", "notes")
+        self.git("checkout", "-q", "main")
+        self.git("merge", "-q", "--no-ff", "-m", "Merge pull request #1", "-m", quoted, "topic")
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def git(self, *args: str) -> str:
+        result = subprocess.run(
+            [
+                "git", "-c", "user.name=scanner test", "-c", "user.email=scanner@example.invalid",
+                "-c", "commit.gpgsign=false", "-C", str(self.repo), *args,
+            ],
+            check=True, capture_output=True, text=True,
+        )
+        return result.stdout.strip()
+
+    def test_ignores_commits_that_only_quote_the_trailer(self) -> None:
+        metadata = run_scanners.latest_git_subtree_metadata(self.repo, "src/libbitcoinpqc")
+        self.assertEqual(metadata["qbit_import_commit"], self.import_commit)
+        self.assertEqual(metadata["git_subtree_split"], self.split)
+
+
 if __name__ == "__main__":
     unittest.main()
