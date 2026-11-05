@@ -2596,6 +2596,17 @@ void VerifyNoSendConfirmation()
     }
 }
 
+std::vector<QMessageBox*> VisibleSendConfirmations()
+{
+    std::vector<QMessageBox*> dialogs;
+    for (QWidget* widget : QApplication::topLevelWidgets()) {
+        if (widget->inherits("SendConfirmationDialog") && widget->isVisible()) {
+            dialogs.push_back(qobject_cast<QMessageBox*>(widget));
+        }
+    }
+    return dialogs;
+}
+
 //! Press a button through its accessibility action, as VoiceOver or a UI
 //! automation client does. Unlike mouse and keyboard input, this reaches
 //! widgets in windows that a modal dialog blocks.
@@ -2628,18 +2639,10 @@ void TestSendPageActivationWhileConfirming(interfaces::Node& node, const QString
     SendCoinsDialog& send_dialog{mini_gui.sendCoinsDialog};
     QAbstractButton* const button{send_dialog.findChild<QAbstractButton*>(button_name)};
     QVERIFY(button);
+    QSignalSpy clicked{button, &QAbstractButton::clicked};
+    QVERIFY(clicked.isValid());
     QSignalSpy coins_sent{&send_dialog, &SendCoinsDialog::coinsSent};
     QVERIFY(coins_sent.isValid());
-
-    const auto confirmations{[] {
-        std::vector<QMessageBox*> dialogs;
-        for (QWidget* widget : QApplication::topLevelWidgets()) {
-            if (widget->inherits("SendConfirmationDialog") && widget->isVisible()) {
-                dialogs.push_back(qobject_cast<QMessageBox*>(widget));
-            }
-        }
-        return dialogs;
-    }};
     const auto confirm{[](QMessageBox* dialog) {
         QAbstractButton* const yes{dialog->button(QMessageBox::Yes)};
         if (!yes) return false;
@@ -2657,7 +2660,7 @@ void TestSendPageActivationWhileConfirming(interfaces::Node& node, const QString
     QTimer driver;
     driver.setInterval(20);
     QObject::connect(&driver, &QTimer::timeout, [&] {
-        const std::vector<QMessageBox*> dialogs{confirmations()};
+        const std::vector<QMessageBox*> dialogs{VisibleSendConfirmations()};
         if (!since_press.isValid()) {
             if (dialogs.empty()) return;
             first = dialogs.front();
@@ -2672,23 +2675,25 @@ void TestSendPageActivationWhileConfirming(interfaces::Node& node, const QString
                 return;
             }
         }
-        // Leave time for a second preparation, if one started, to show its
-        // confirmation before the first is confirmed.
-        if (first && since_press.elapsed() > 1000 && confirm(first)) {
+        // Wait until the press has clicked the button, then leave time for a
+        // second preparation, if one started, to show its confirmation before
+        // the first is confirmed.
+        if (first && !clicked.isEmpty() && since_press.elapsed() > 1000 && confirm(first)) {
             first_confirmed = true;
         }
     });
     driver.start();
 
     ClickSend(send_dialog);
-    QVERIFY(WaitUntil([&] { return first_confirmed && confirmations().empty(); }, 30000));
+    QVERIFY(WaitUntil([&] { return first_confirmed && VisibleSendConfirmations().empty(); }, 30000));
     QTest::qWait(200);
     driver.stop();
 
     QVERIFY(pressed);
+    QCOMPARE(clicked.count(), 1);
     QCOMPARE(later_confirmations, 0);
     QCOMPARE(coins_sent.count(), 1);
-    QVERIFY(confirmations().empty());
+    QVERIFY(VisibleSendConfirmations().empty());
 }
 
 //! An exception can escape the send request after it marked the send in
@@ -2784,13 +2789,9 @@ void TestSendDestructionDuringConfirmation(interfaces::Node& node, bool destroy_
     driver.setInterval(20);
     if (destroy_dialog) {
         QObject::connect(&driver, &QTimer::timeout, [&] {
-            for (QWidget* widget : QApplication::topLevelWidgets()) {
-                if (widget->inherits("SendConfirmationDialog") && widget->isVisible()) {
-                    driver.stop();
-                    owned_dialog.reset();
-                    return;
-                }
-            }
+            if (VisibleSendConfirmations().empty()) return;
+            driver.stop();
+            owned_dialog.reset();
         });
         driver.start();
     } else {
