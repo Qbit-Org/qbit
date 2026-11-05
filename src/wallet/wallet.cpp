@@ -1203,6 +1203,24 @@ void CWallet::AddToSpends(const CWalletTx& wtx)
         AddToSpends(txin.prevout, wtx.GetHash());
 }
 
+CWallet::EncryptionInProgressScope::EncryptionInProgressScope(CWallet& wallet)
+    : m_wallet{wallet}
+{
+    ++m_wallet.m_encryption_in_progress;
+    try {
+        m_wallet.NotifyEncryptionInProgressChanged();
+    } catch (...) {
+        --m_wallet.m_encryption_in_progress;
+        throw;
+    }
+}
+
+CWallet::EncryptionInProgressScope::~EncryptionInProgressScope()
+{
+    --m_wallet.m_encryption_in_progress;
+    m_wallet.NotifyEncryptionInProgressChanged();
+}
+
 //! EncryptWallet holds the descriptor locks in a list, which the thread-safety
 //! analysis cannot follow. Check that this one is held (with DEBUG_LOCKORDER)
 //! and tell the analysis, so that it still checks the calls that need it.
@@ -1220,17 +1238,7 @@ bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase, bool use_cr
     // whoever made it, so that listeners such as the GUI stop reading the
     // wallet before its locks are taken and read it again once the
     // encryption has finished.
-    struct EncryptionInProgressGuard {
-        CWallet& wallet;
-        ~EncryptionInProgressGuard()
-        {
-            --wallet.m_encryption_in_progress;
-            wallet.NotifyEncryptionInProgressChanged();
-        }
-    };
-    ++m_encryption_in_progress;
-    const EncryptionInProgressGuard encryption_in_progress_guard{*this};
-    NotifyEncryptionInProgressChanged();
+    const EncryptionInProgressScope encryption_in_progress{*this};
 
     // The key derivation below is tuned to take a noticeable amount of time,
     // so it runs before the wallet locks are taken. A caller that does not

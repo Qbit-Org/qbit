@@ -39,7 +39,10 @@
 #include <outputtype.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
+#include <rpc/protocol.h>
+#include <rpc/request.h>
 #include <rpc/server.h>
+#include <rpc/util.h>
 #include <script/interpreter.h>
 #include <script/p2mr.h>
 #include <script/p2mr_sizing.h>
@@ -114,6 +117,10 @@ using wallet::WALLET_FLAG_DISABLE_PRIVATE_KEYS;
 using wallet::WalletContext;
 using wallet::WalletDescriptor;
 using wallet::WalletRescanReserver;
+
+namespace wallet {
+RPCHelpMan encryptwallet();
+} // namespace wallet
 
 namespace
 {
@@ -5121,6 +5128,208 @@ void TestExternalEncryptionRealWallet(interfaces::Node& node)
     QVERIFY(addresses->purposeForAddress(coinbase_address) == wallet::AddressPurpose::RECEIVE);
 }
 
+//! The encryptwallet RPC takes the wallet locks before it checks whether the
+//! wallet can be encrypted, and that check waits for every descriptor
+//! manager's lock, which a background P2MR keypool refill or top-up step
+//! holds without the wallet locks while it derives and writes keys. The RPC
+//! announces the encryption before it takes the wallet locks, so the GUI
+//! stops reading the wallet while the RPC holds them and waits for the step.
+//! A call that returns an error ends its announcement with a refresh, and so
+//! does an encryption that throws before it takes the locks.
+void TestEncryptWalletRpcWaitingForKeypoolTopUp(interfaces::Node& node)
+{
+    TestChain100Setup test{ChainType::REGTEST, {.extra_args = {"-p2mronly=0", "-keypool=1"}}};
+    auto wallet_loader = interfaces::MakeWalletLoader(*test.m_node.chain, *Assert(test.m_node.args));
+    test.m_node.wallet_loader = wallet_loader.get();
+    node.setContext(&test.m_node);
+
+    const std::shared_ptr<CWallet> wallet{SetupDescriptorsWallet(node, test)};
+    std::unique_ptr<const PlatformStyle> platform_style{PlatformStyle::instantiate("other")};
+    MiniGUI mini_gui{node, platform_style.get()};
+    mini_gui.initModelForWallet(node, wallet, platform_style.get());
+    WalletModel& wallet_model{*mini_gui.walletModel};
+    wallet_model.startPollBalance();
+    AddressTableModel* const addresses{wallet_model.getAddressTableModel()};
+    const QString coinbase_address{QString::fromStdString(EncodeDestination(PKHash{test.coinbaseKey.GetPubKey()}))};
+    QVERIFY(addresses->purposeForAddress(coinbase_address) == wallet::AddressPurpose::RECEIVE);
+    QCOMPARE(wallet_model.getEncryptionStatus(), WalletModel::Unencrypted);
+    wallet_model.getPQCKeyValidationInfo();
+
+    QSignalSpy status_changed{&wallet_model, &WalletModel::encryptionStatusChanged};
+    QSignalSpy pqc_changed{&wallet_model, &WalletModel::pqcKeyValidationChanged};
+    QSignalSpy ended{&wallet_model, &WalletModel::walletEncryptionEnded};
+    QVERIFY(status_changed.isValid());
+    QVERIFY(pqc_changed.isValid());
+    QVERIFY(ended.isValid());
+
+    // An encryption that throws once it has derived its key, before it takes
+    // the wallet locks, ends its announcement, and the model reads the wallet
+    // again.
+    wallet->m_before_encrypt_wallet_locks = [] { throw std::runtime_error{"encryption failure before the wallet locks"}; };
+    std::string thrown;
+    std::thread thrower{[&wallet, &thrown] {
+        try {
+            wallet->EncryptWallet(SecureString{"test-passphrase"});
+        } catch (const std::runtime_error& e) {
+            thrown = e.what();
+        }
+    }};
+    thrower.join();
+    wallet->m_before_encrypt_wallet_locks = nullptr;
+    QCOMPARE(thrown, std::string{"encryption failure before the wallet locks"});
+    QVERIFY(!wallet->IsEncryptionInProgress());
+    QVERIFY(WaitUntil([&ended] { return ended.count() > 0; }, 5000));
+    QVERIFY(!wallet_model.isEncryptingWallet());
+    QVERIFY(pqc_changed.count() > 0);
+    QVERIFY(!wallet->IsCrypted());
+    QCOMPARE(wallet_model.getEncryptionStatus(), WalletModel::Unencrypted);
+    QCOMPARE(status_changed.count(), 0);
+
+    // Run the encryptwallet RPC against the wallet the model shows.
+    WalletContext& context{*node.walletLoader().context()};
+    QVERIFY(AddWallet(context, wallet));
+    struct RemoveWalletOnExit {
+        WalletContext& context;
+        std::shared_ptr<CWallet> wallet;
+        ~RemoveWalletOnExit() { RemoveWallet(context, wallet, /*load_on_start=*/std::nullopt); }
+    } const remove_on_exit{context, wallet};
+    const auto encrypt_rpc{[&context] {
+        JSONRPCRequest request;
+        request.context = &context;
+        request.strMethod = "encryptwallet";
+        request.params.setArray();
+        request.params.push_back("test-passphrase");
+        return wallet::encryptwallet().HandleRequest(request);
+    }};
+
+    // Hold one descriptor manager's lock the way a background keypool step
+    // does, without the wallet locks.
+    wallet::DescriptorScriptPubKeyMan* desc_spk_man{nullptr};
+    for (wallet::ScriptPubKeyMan* spk_man : wallet->GetAllScriptPubKeyMans()) {
+        desc_spk_man = dynamic_cast<wallet::DescriptorScriptPubKeyMan*>(spk_man);
+        if (desc_spk_man) break;
+    }
+    QVERIFY(desc_spk_man);
+    std::mutex hold_mutex;
+    std::condition_variable hold_cv;
+    bool held{false};
+    bool release{false};
+    bool gui_alive{false};
+    bool watchdog_released{false};
+    const auto release_hold{[&] {
+        {
+            std::lock_guard lock{hold_mutex};
+            release = true;
+        }
+        hold_cv.notify_all();
+    }};
+    std::thread top_up{[&] {
+        LOCK(desc_spk_man->cs_desc_man);
+        std::unique_lock lock{hold_mutex};
+        held = true;
+        hold_cv.notify_all();
+        hold_cv.wait(lock, [&release] { return release; });
+    }};
+    const JoinOnExit join_top_up{top_up};
+    QVERIFY(WaitUntil([&] {
+        std::lock_guard lock{hold_mutex};
+        return held;
+    }, 5000));
+
+    std::atomic<bool> rpc_returned{false};
+    std::string rpc_result;
+    std::string rpc_error;
+    std::thread rpc{[&] {
+        try {
+            rpc_result = encrypt_rpc().get_str();
+        } catch (const UniValue& e) {
+            rpc_error = e.write();
+        } catch (const std::exception& e) {
+            rpc_error = e.what();
+        }
+        rpc_returned = true;
+    }};
+    const JoinOnExit join_rpc{rpc};
+    struct ReleaseHoldOnExit {
+        std::function<void()> release;
+        ~ReleaseHoldOnExit() { release(); }
+    } const release_on_exit{release_hold};
+
+    // The RPC holds the wallet locks and waits for the descriptor lock.
+    QVERIFY(WaitUntil([&wallet] {
+        TRY_LOCK(wallet->cs_wallet, locked);
+        return !locked;
+    }, 5000));
+
+    int gui_ticks{0};
+    QTimer gui_latch;
+    QObject::connect(&gui_latch, &QTimer::timeout, [&gui_ticks] { ++gui_ticks; });
+    gui_latch.start(0);
+
+    // Release the keypool step if the GUI thread stops servicing events, so a
+    // read that waits for the wallet locks fails the assertions below instead
+    // of hanging the test.
+    std::thread watchdog{[&] {
+        std::unique_lock lock{hold_mutex};
+        if (!hold_cv.wait_for(lock, std::chrono::seconds{5}, [&gui_alive] { return gui_alive; })) {
+            watchdog_released = true;
+            release = true;
+            lock.unlock();
+            hold_cv.notify_all();
+        }
+    }};
+    const JoinOnExit join_watchdog{watchdog};
+
+    // Read what the main window, the overview page and the transaction list
+    // ask for, and raise a keypool notification as the wallet does.
+    const int ticks_at_hold{gui_ticks};
+    const WalletModel::EncryptionStatus status_during{wallet_model.getEncryptionStatus()};
+    wallet_model.getPQCKeyValidationInfo();
+    const std::optional<wallet::AddressPurpose> purpose_during{addresses->purposeForAddress(coinbase_address)};
+    wallet->NotifyCanGetAddressesChanged();
+    const bool responsive{WaitUntil([&gui_ticks, ticks_at_hold] { return gui_ticks > ticks_at_hold + 20; }, 5000)};
+    {
+        std::lock_guard lock{hold_mutex};
+        gui_alive = true;
+    }
+    hold_cv.notify_all();
+    watchdog.join();
+    QVERIFY2(!watchdog_released, "GUI thread blocked while the encryptwallet RPC waited for a keypool step with the wallet locks held");
+    QVERIFY(responsive);
+    QCOMPARE(status_during, WalletModel::Unencrypted);
+    QVERIFY(purpose_during == wallet::AddressPurpose::RECEIVE);
+    QVERIFY(!rpc_returned);
+    QVERIFY(wallet->IsEncryptionInProgress());
+    QVERIFY(wallet_model.isEncryptingWallet());
+
+    release_hold();
+    rpc.join();
+    top_up.join();
+    QVERIFY2(rpc_error.empty(), rpc_error.c_str());
+    QVERIFY2(rpc_result.starts_with("wallet encrypted"), rpc_result.c_str());
+    QVERIFY(WaitUntil([&] { return !wallet_model.isEncryptingWallet() && status_changed.count() == 1; }, 5000));
+    QVERIFY(!wallet->IsEncryptionInProgress());
+    QVERIFY(wallet->IsCrypted());
+    QVERIFY(wallet->IsLocked());
+    QCOMPARE(wallet_model.getEncryptionStatus(), WalletModel::Locked);
+
+    // A second call finds the wallet encrypted and returns -15. Its
+    // announcement still ends, and the model reads the wallet again.
+    const qsizetype ended_before_refusal{ended.count()};
+    int error_code{0};
+    try {
+        encrypt_rpc();
+    } catch (const UniValue& e) {
+        error_code = e.find_value("code").getInt<int>();
+    }
+    QCOMPARE(error_code, static_cast<int>(RPC_WALLET_WRONG_ENC_STATE));
+    QVERIFY(!wallet->IsEncryptionInProgress());
+    QVERIFY(WaitUntil([&ended, ended_before_refusal] { return ended.count() > ended_before_refusal; }, 5000));
+    QVERIFY(!wallet_model.isEncryptingWallet());
+    QCOMPARE(wallet_model.getEncryptionStatus(), WalletModel::Locked);
+    QCOMPARE(status_changed.count(), 1);
+}
+
 void TestGUI(interfaces::Node& node)
 {
     // Set up a small funded wallet history instead of importing the full mature chain.
@@ -5199,4 +5408,5 @@ void WalletTests::walletTests()
     TestExternalEncryptionOutlivesDialogRequest(m_node);
     TestExternalEncryptionModelDestroyed(m_node);
     TestExternalEncryptionRealWallet(m_node);
+    TestEncryptWalletRpcWaitingForKeypoolTopUp(m_node);
 }
