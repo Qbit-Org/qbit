@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -1563,6 +1564,105 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         self.assertNotIn("Found matching draft release", result.stdout)
         self.assertNotIn("gh release upload", result.stdout)
         self.assertNotIn("Validation-only mode", result.stdout)
+
+
+def extract_shell_function(source: str, name: str) -> str:
+    match = re.search(rf"^{name}\(\) \{{\n.*?^\}}\n", source, re.MULTILINE | re.DOTALL)
+    if match is None:
+        raise AssertionError(f"{name} is not defined in {PUBLISHER}")
+    return match.group(0)
+
+
+class TagTargetTrustedHistoryTest(unittest.TestCase):
+    """Run the publisher's tag-target history check on a merge-commit history."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.repo = Path(self.temp_dir.name) / "repo"
+        self.repo.mkdir()
+        git(self.repo, "init", "-q", "-b", "main")
+        self.commits: dict[str, str] = {}
+        self._commit("m1")
+        self._commit("m2")
+        # A multi-commit pull request merged with the merge button.
+        self._branch_and_merge("multi", ["multi-1", "multi-2"], "merge-multi")
+        # A squash-signed release pull request: one commit, then its merge.
+        self._branch_and_merge("release", ["release"], "merge-release")
+        # A side line with several commits merged in.
+        self._branch_and_merge("line", ["line-1", "line-2", "line-3"], "merge-line")
+        self._commit("m3")
+        self.trusted_ref = self.commits["m3"]
+        source = PUBLISHER.read_text(encoding="utf8")
+        self.script = "\n".join(
+            [
+                "set -euo pipefail",
+                extract_shell_function(source, "lowercase"),
+                extract_shell_function(source, "tag_target_on_trusted_history"),
+                'tag_target_on_trusted_history "$1" "$2" "$3"',
+            ]
+        )
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _commit(self, label: str) -> None:
+        (self.repo / "file").write_text(f"{label}\n", encoding="utf8")
+        git(self.repo, "add", "file")
+        git(self.repo, "commit", "-q", "-m", label)
+        self.commits[label] = git(self.repo, "rev-parse", "HEAD")
+
+    def _branch_and_merge(self, branch: str, labels: list[str], merge_label: str) -> None:
+        git(self.repo, "checkout", "-q", "-b", branch)
+        for label in labels:
+            self._commit(label)
+        git(self.repo, "checkout", "-q", "main")
+        git(self.repo, "merge", "-q", "--no-ff", "-m", merge_label, branch)
+        self.commits[merge_label] = git(self.repo, "rev-parse", "HEAD")
+
+    def check(self, target: str, trusted_ref: str | None = None) -> int:
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                self.script,
+                "tag-target-check",
+                str(self.repo),
+                trusted_ref or self.trusted_ref,
+                target,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode
+
+    def test_first_parent_commits_pass(self) -> None:
+        for label in ("m1", "m2", "m3"):
+            with self.subTest(label=label):
+                self.assertEqual(self.check(self.commits[label]), 0)
+
+    def test_merge_commits_pass(self) -> None:
+        for label in ("merge-multi", "merge-release", "merge-line"):
+            with self.subTest(label=label):
+                self.assertEqual(self.check(self.commits[label]), 0)
+
+    def test_merged_pull_request_heads_pass(self) -> None:
+        for label in ("release", "multi-2", "line-3"):
+            with self.subTest(label=label):
+                self.assertEqual(self.check(self.commits[label]), 0)
+
+    def test_uppercase_target_passes(self) -> None:
+        self.assertEqual(self.check(self.commits["release"].upper()), 0)
+
+    def test_intermediate_commit_of_merged_pull_request_fails(self) -> None:
+        self.assertNotEqual(self.check(self.commits["multi-1"]), 0)
+
+    def test_deeper_side_branch_commits_fail(self) -> None:
+        for label in ("line-1", "line-2"):
+            with self.subTest(label=label):
+                self.assertNotEqual(self.check(self.commits[label]), 0)
+
+    def test_unknown_trusted_ref_fails(self) -> None:
+        self.assertNotEqual(self.check(self.commits["m2"], trusted_ref="1" * 40), 0)
 
 
 if __name__ == "__main__":

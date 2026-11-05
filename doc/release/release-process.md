@@ -28,6 +28,13 @@ The tag target commit is the source commit used for release builds. Do not use a
 private source commit, a sanitizer mapping, a branch name, a short SHA, or a tag
 object SHA as the release source.
 
+With merge-commit merges, tag the squash-signed release commit (the head of the
+release pull request) or the merge commit that landed it; both pass the
+publisher's history check. That check accepts a commit on the first-parent
+history of `trusted_release_ref` or the head of a pull request merged into it,
+and refuses a commit from inside a multi-commit pull request or deeper on a
+merged side branch.
+
 The release validator recreates `qbit-<version>.tar.gz` directly from that tag
 target with the same `git archive --prefix="qbit-<version>/"` semantics used by
 the Guix build. Every counted core and PHOTON builder manifest must contain the
@@ -67,7 +74,8 @@ The publisher validates:
   signature verification as exactly `verified=true` and `reason=valid`
 - the tag signer is accepted by the qbit release key policy
 - `trusted_release_ref` is a full public commit SHA and is not the tag object or
-  tag target commit, and the tag target is on its first-parent history
+  tag target commit, and the tag target is on its first-parent history or is
+  the head of a pull request merged into it
 - the trusted qbit checkout and pinned `qbit-guix.sigs` checkout are clean, and
   the latter commit is public and reachable from its configured public branch
 - staged artifacts match `SHA256SUMS`

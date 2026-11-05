@@ -176,6 +176,21 @@ lowercase() {
     printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
 }
 
+tag_target_on_trusted_history() {
+    # Succeeds if the target is a first-parent commit of the trusted ref, or a
+    # direct parent of one, such as the head of a merged pull request. A deeper
+    # ancestor can be an intermediate pull request commit whose tree the
+    # trusted branch never had. awk reads the whole list, so pipefail cannot
+    # fail on an early exit, and an unknown ref fails rev-list.
+    local root="$1"
+    local trusted_ref="$2"
+    local target
+    target="$(lowercase "$3")"
+    git -C "$root" rev-list --first-parent --parents "$trusted_ref" \
+        | awk -v target="$target" \
+            '{ for (i = 1; i <= NF; i++) if ($i == target) found = 1 } END { exit !found }'
+}
+
 require_full_sha() {
     local name="$1"
     local value="$2"
@@ -1013,12 +1028,8 @@ TAG_TARGET="$(git -C "$TRUSTED_ROOT" rev-parse -q --verify "$TAG_OBJECT^{commit}
     || die "--trusted-release-ref must not equal the release tag object"
 [ "$(lowercase "$TRUSTED_RELEASE_REF")" != "$(lowercase "$TAG_TARGET")" ] \
     || die "--trusted-release-ref must not equal the release tag target"
-# Under merge commits, an ancestor may be a merged pull request's second-parent
-# head, whose tree the trusted branch never had; require a first-parent state.
-git -C "$TRUSTED_ROOT" rev-list --first-parent "$TRUSTED_RELEASE_REF" \
-    | awk -v target="$(lowercase "$TAG_TARGET")" \
-        '$0 == target { found = 1 } END { exit !found }' \
-    || die "Release tag target $TAG_TARGET must be on the first-parent history of trusted release ref $TRUSTED_RELEASE_REF"
+tag_target_on_trusted_history "$TRUSTED_ROOT" "$TRUSTED_RELEASE_REF" "$TAG_TARGET" \
+    || die "Release tag target $TAG_TARGET must be on the first-parent history of trusted release ref $TRUSTED_RELEASE_REF, or be the head of a pull request merged into it"
 
 GH_REPO_PATH="$(github_repo_path "$GH_REPO")"
 GUIX_SIGS_GH_REPO_PATH="$(github_repo_path "$GUIX_SIGS_GH_REPO")"
