@@ -507,6 +507,12 @@ bool WalletModel::isEncryptingWallet() const
 bool WalletModel::encryptWallet(const SecureString& passphrase)
 {
     if (m_encrypt_wallet_active) return false;
+    // Another caller, such as the encryptwallet RPC, is encrypting the
+    // wallet. This request could only wait for it and then be refused.
+    if (isEncryptingWallet()) {
+        Q_EMIT message(tr("Wallet encryption in progress"), tr("Wait for the wallet encryption to finish."), CClientUIInterface::MSG_WARNING);
+        return false;
+    }
 
     // The worker keeps its own reference to the wallet so the operation can
     // run to completion even if this model is deleted underneath it.
