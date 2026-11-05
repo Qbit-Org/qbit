@@ -210,6 +210,12 @@ void WalletView::showOutOfSyncWarning(bool fShow)
 
 void WalletView::encryptWallet()
 {
+    // Another caller, such as the encryptwallet RPC, is encrypting the
+    // wallet. Say so before the user chooses a passphrase.
+    if (walletModel->isEncryptingWallet()) {
+        Q_EMIT message(tr("Wallet encryption in progress"), tr("Wait for the wallet encryption to finish."), CClientUIInterface::MSG_WARNING);
+        return;
+    }
     const wallet::PQCKeyValidationInfo pqc_validation{walletModel->getPQCKeyValidationInfo()};
     if (pqc_validation.pending_records > 0) {
         Q_EMIT message(tr("Wallet encryption unavailable"),

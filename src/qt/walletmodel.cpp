@@ -86,6 +86,11 @@ WalletModel::WalletModel(std::unique_ptr<interfaces::Wallet> wallet, ClientModel
     recentRequestsTableModel = new RecentRequestsTableModel(this);
 
     subscribeToCoreSignals();
+    // Read the values reported while another caller encrypts the wallet, so
+    // they are the wallet's even if that starts before anything asks for
+    // them. Only once subscribed: the model must see that encryption end.
+    getEncryptionStatus();
+    getPQCKeyValidationInfo();
 }
 
 WalletModel::~WalletModel()
@@ -520,10 +525,11 @@ bool WalletModel::encryptWallet(const SecureString& passphrase)
     if (!wallet) return false;
 
     finishEncryptWalletThread();
-    // Take the values the GUI may ask for while the worker holds the wallet
-    // locks; endEncryptingWallet() refreshes them once it has returned.
-    cachedEncryptionStatus = getEncryptionStatus();
-    m_last_pqc_key_validation_info = getPQCKeyValidationInfo();
+    // Read the values the GUI may ask for while the worker holds the wallet
+    // locks, so they are reported as they were when it started;
+    // endEncryptingWallet() refreshes them once it has returned.
+    getEncryptionStatus();
+    getPQCKeyValidationInfo();
     m_encrypt_wallet_active = true;
     const uint64_t generation{++m_encrypt_wallet_generation};
     QPointer<WalletModel> model{this};
@@ -585,8 +591,15 @@ void WalletModel::updateEncryptionInProgress()
         return;
     }
     // An encryption this model never saw may still have changed the wallet,
-    // or thrown without announcing its status, so refresh in any case.
-    endEncryptingWallet();
+    // or thrown without announcing its status, so refresh in any case. Each
+    // encryption sends several notifications, which may all be waiting in
+    // the event queue, so refresh once after them.
+    if (m_encryption_end_queued) return;
+    m_encryption_end_queued = true;
+    QMetaObject::invokeMethod(this, [this] {
+        m_encryption_end_queued = false;
+        endEncryptingWallet();
+    }, Qt::QueuedConnection);
 }
 
 void WalletModel::endEncryptingWallet()
