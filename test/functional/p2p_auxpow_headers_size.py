@@ -169,7 +169,13 @@ class AuxpowHeadersSizeTest(BitcoinTestFramework):
         peer.send_and_ping(msg_sendheaders())
         node.invalidateblock(f"{large_hashes[0]:064x}")
         self.advance_mock_time()
-        fork_hash = int(self.generate(wallet, 1, sync_fun=self.no_op)[0], 16)
+        # reconsiderblock announces the new blocks once the tip has more work
+        # than the fork. A fork with the work of two large blocks makes that
+        # first announcement at least three large headers, too large for one
+        # message, and later ones do not connect to a header the peer was sent.
+        fork_hash = int(self.generate(wallet, 2, sync_fun=self.no_op)[-1], 16)
+        assert_greater_than_or_equal(int(node.getblockheader(f"{fork_hash:064x}")["chainwork"], 16),
+                                     int(node.getblockheader(f"{large_hashes[1]:064x}")["chainwork"], 16))
         peer.wait_until(lambda: any(fork_hash in message.hashes for message in peer.headers_messages))
         node.reconsiderblock(f"{large_hashes[0]:064x}")
         assert_equal(int(node.getbestblockhash(), 16), tip)
