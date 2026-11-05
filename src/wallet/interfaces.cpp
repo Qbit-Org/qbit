@@ -159,6 +159,7 @@ public:
         return m_wallet->EncryptWallet(wallet_passphrase);
     }
     bool isCrypted() override { return m_wallet->IsCrypted(); }
+    bool isEncryptionInProgress() override { return m_wallet->IsEncryptionInProgress(); }
     bool lock() override { return m_wallet->Lock(); }
     bool unlock(const SecureString& wallet_passphrase) override
     {
@@ -668,6 +669,10 @@ public:
     std::unique_ptr<Handler> handleCanGetAddressesChanged(CanGetAddressesChangedFn fn) override
     {
         return MakeSignalHandler(m_wallet->NotifyCanGetAddressesChanged.connect(fn));
+    }
+    std::unique_ptr<Handler> handleEncryptionInProgressChanged(EncryptionInProgressChangedFn fn) override
+    {
+        return MakeSignalHandler(m_wallet->NotifyEncryptionInProgressChanged.connect(fn));
     }
     CWallet* wallet() override { return m_wallet.get(); }
 

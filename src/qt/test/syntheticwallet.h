@@ -145,6 +145,9 @@ struct SyntheticWalletState {
     //! fee-bump path reports as "Can't draft transaction.".
     bool psbt_draft_complete{false};
     std::function<void()> can_get_addresses_changed;
+    //! Listener for the announcement CWallet::EncryptWallet makes when an
+    //! encryption starts and when it returns, whoever called it.
+    std::function<void()> encryption_in_progress_changed;
 };
 
 /**
