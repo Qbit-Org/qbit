@@ -907,20 +907,37 @@ void SendCoinsDialog::sendButtonClicked([[maybe_unused]] bool checked)
         return;
     }
 
-    if (m_prepare_thread) {
+    // fNewRecipientAllowed is false from the unlock request until the send
+    // finishes, including while the confirmation dialog runs its nested event
+    // loop. Modality blocks mouse and keyboard input to this page there, but
+    // accessibility clients can still press Send.
+    if (m_prepare_thread || !fNewRecipientAllowed) {
         log_send_button_timing("busy", false);
         return;
     }
 
     std::unique_ptr<WalletModelTransaction> transaction;
     CCoinControl coin_control;
-    if (!PrepareSendRequest(transaction, coin_control)) {
-        log_send_button_timing("prepare_request_failed", false);
-        return;
-    }
-    log_send_button_timing("queued", true);
+    try {
+        if (!PrepareSendRequest(transaction, coin_control)) {
+            log_send_button_timing("prepare_request_failed", false);
+            return;
+        }
+        log_send_button_timing("queued", true);
 
-    startPrepareTransaction(std::move(transaction), coin_control);
+        startPrepareTransaction(std::move(transaction), coin_control);
+    } catch (...) {
+        // ExceptionSafeConnect lets the application continue after a
+        // NonFatalCheckError. Unless the preparation thread already owns the
+        // attempt, release it here, or Send stays busy and the wallet stays
+        // unlocked until restart.
+        if (!m_prepare_thread) {
+            clearPrepareProgressDialog();
+            m_prepare_unlock_context.reset();
+            fNewRecipientAllowed = true;
+        }
+        throw;
+    }
 }
 
 void SendCoinsDialog::finishSendWithPreparedTransaction(QMessageBox::StandardButton retval)
@@ -1040,7 +1057,9 @@ void SendCoinsDialog::finishSendWithPreparedTransaction(QMessageBox::StandardBut
 
 void SendCoinsDialog::clear()
 {
-    m_current_transaction.reset();
+    // Leave m_current_transaction to the send flow, which resets it when it
+    // finishes. Clear All can still be pressed through accessibility while the
+    // confirmation dialog is open, and the confirmation needs the transaction.
 
     // Clear coin control settings
     m_coin_control->UnSelectAll();

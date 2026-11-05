@@ -47,6 +47,7 @@
 #include <streams.h>
 #include <consensus/consensus.h>
 #include <test/util/setup_common.h>
+#include <util/check.h>
 #include <util/translation.h>
 #include <validation.h>
 #include <wallet/pqc_usage.h>
@@ -68,6 +69,7 @@
 #include <vector>
 
 #include <QAbstractButton>
+#include <QAccessible>
 #include <QAction>
 #include <QApplication>
 #include <QCheckBox>
@@ -2570,7 +2572,7 @@ struct ReleaseSyntheticCreateOnExit {
 };
 
 //! Fill the first send entry and click Send without confirming anything.
-void ClickSend(SendCoinsDialog& send_dialog)
+void FillSendRequest(SendCoinsDialog& send_dialog)
 {
     QVBoxLayout* const entries{send_dialog.findChild<QVBoxLayout*>("entries")};
     QVERIFY(entries);
@@ -2579,6 +2581,11 @@ void ClickSend(SendCoinsDialog& send_dialog)
     entry->findChild<QValidatedLineEdit*>("payTo")->setText(QString::fromStdString(EncodeDestination(PKHash{})));
     entry->findChild<BitcoinAmountField*>("payAmount")->setValue(COIN);
     send_dialog.getCoinControl()->Select(COutPoint{Txid{}, 0});
+}
+
+void ClickSend(SendCoinsDialog& send_dialog)
+{
+    FillSendRequest(send_dialog);
     QVERIFY(QMetaObject::invokeMethod(&send_dialog, "sendButtonClicked", Q_ARG(bool, false)));
 }
 
@@ -2587,6 +2594,159 @@ void VerifyNoSendConfirmation()
     for (QWidget* widget : QApplication::topLevelWidgets()) {
         QVERIFY(!widget->inherits("SendConfirmationDialog"));
     }
+}
+
+//! Press a button through its accessibility action, as VoiceOver or a UI
+//! automation client does. Unlike mouse and keyboard input, this reaches
+//! widgets in windows that a modal dialog blocks.
+bool PressThroughAccessibility(QAbstractButton* button)
+{
+    QAccessibleInterface* const iface{QAccessible::queryAccessibleInterface(button)};
+    if (!iface || !iface->actionInterface()) return false;
+    iface->actionInterface()->doAction(QAccessibleActionInterface::pressAction());
+    return true;
+}
+
+//! While the first send confirmation is open, press a send-page button through
+//! accessibility. Confirm any later confirmation first and the first one last,
+//! as in the 2026-11-04 desktop run that aborted in
+//! finishSendWithPreparedTransaction. Exactly one transaction must be sent.
+void TestSendPageActivationWhileConfirming(interfaces::Node& node, const QString& button_name)
+{
+    TestChain100Setup test{ChainType::REGTEST, {.extra_args = {"-p2mronly=0"}}};
+    // The confirmation text asks the wallet loader whether several wallets are loaded.
+    auto wallet_loader = interfaces::MakeWalletLoader(*test.m_node.chain, *Assert(test.m_node.args));
+    test.m_node.wallet_loader = wallet_loader.get();
+    node.setContext(&test.m_node);
+
+    std::unique_ptr<const PlatformStyle> platform_style{PlatformStyle::instantiate("other")};
+    MiniGUI mini_gui{node, platform_style.get()};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    mini_gui.initModel(qt_test::MakeSyntheticWallet(wallet::PQCUsageReport{}, state), platform_style.get());
+    mini_gui.walletModel->pollBalanceChanged();
+
+    SendCoinsDialog& send_dialog{mini_gui.sendCoinsDialog};
+    QAbstractButton* const button{send_dialog.findChild<QAbstractButton*>(button_name)};
+    QVERIFY(button);
+    QSignalSpy coins_sent{&send_dialog, &SendCoinsDialog::coinsSent};
+    QVERIFY(coins_sent.isValid());
+
+    const auto confirmations{[] {
+        std::vector<QMessageBox*> dialogs;
+        for (QWidget* widget : QApplication::topLevelWidgets()) {
+            if (widget->inherits("SendConfirmationDialog") && widget->isVisible()) {
+                dialogs.push_back(qobject_cast<QMessageBox*>(widget));
+            }
+        }
+        return dialogs;
+    }};
+    const auto confirm{[](QMessageBox* dialog) {
+        QAbstractButton* const yes{dialog->button(QMessageBox::Yes)};
+        if (!yes) return false;
+        yes->setEnabled(true); // Skip the SEND_CONFIRM_DELAY countdown.
+        yes->click();
+        return true;
+    }};
+
+    // The timer keeps firing inside the confirmations' nested event loops.
+    QPointer<QMessageBox> first;
+    bool pressed{false};
+    bool first_confirmed{false};
+    int later_confirmations{0};
+    QElapsedTimer since_press;
+    QTimer driver;
+    driver.setInterval(20);
+    QObject::connect(&driver, &QTimer::timeout, [&] {
+        const std::vector<QMessageBox*> dialogs{confirmations()};
+        if (!since_press.isValid()) {
+            if (dialogs.empty()) return;
+            first = dialogs.front();
+            pressed = PressThroughAccessibility(button);
+            since_press.start();
+            return;
+        }
+        if (first_confirmed) return;
+        for (QMessageBox* dialog : dialogs) {
+            if (dialog != first && confirm(dialog)) {
+                ++later_confirmations;
+                return;
+            }
+        }
+        // Leave time for a second preparation, if one started, to show its
+        // confirmation before the first is confirmed.
+        if (first && since_press.elapsed() > 1000 && confirm(first)) {
+            first_confirmed = true;
+        }
+    });
+    driver.start();
+
+    ClickSend(send_dialog);
+    QVERIFY(WaitUntil([&] { return first_confirmed && confirmations().empty(); }, 30000));
+    QTest::qWait(200);
+    driver.stop();
+
+    QVERIFY(pressed);
+    QCOMPARE(later_confirmations, 0);
+    QCOMPARE(coins_sent.count(), 1);
+    QVERIFY(confirmations().empty());
+}
+
+//! An exception can escape the send request after it marked the send in
+//! flight, here from the unlock request. ExceptionSafeConnect reports a
+//! NonFatalCheckError and lets the application continue, so the request must
+//! release the send: the next Send has to reach the confirmation.
+void TestSendRequestExceptionReleasesSend(interfaces::Node& node)
+{
+    TestChain100Setup test{ChainType::REGTEST, {.extra_args = {"-p2mronly=0"}}};
+    // The confirmation text asks the wallet loader whether several wallets are loaded.
+    auto wallet_loader = interfaces::MakeWalletLoader(*test.m_node.chain, *Assert(test.m_node.args));
+    test.m_node.wallet_loader = wallet_loader.get();
+    node.setContext(&test.m_node);
+
+    std::unique_ptr<const PlatformStyle> platform_style{PlatformStyle::instantiate("other")};
+    MiniGUI mini_gui{node, platform_style.get()};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    state->encrypted = true;
+    state->locked = true;
+    mini_gui.initModel(qt_test::MakeSyntheticWallet(wallet::PQCUsageReport{}, state), platform_style.get());
+    mini_gui.walletModel->pollBalanceChanged();
+
+    // Stand in for the passphrase dialog: throw on the first request and
+    // unlock the wallet on the next.
+    bool throw_on_unlock{true};
+    QObject::connect(mini_gui.walletModel.get(), &WalletModel::requireUnlock, mini_gui.walletModel.get(), [&] {
+        if (throw_on_unlock) {
+            throw_on_unlock = false;
+            throw NonFatalCheckError{"synthetic unlock failure", __FILE__, __LINE__, __func__};
+        }
+        std::lock_guard lock{state->mutex};
+        state->locked = false;
+    });
+
+    SendCoinsDialog& send_dialog{mini_gui.sendCoinsDialog};
+    QAbstractButton* const send_button{send_dialog.findChild<QAbstractButton*>("sendButton")};
+    QVERIFY(send_button);
+    FillSendRequest(send_dialog);
+
+    // Click the button, so the exception goes through ExceptionSafeConnect and
+    // its "Internal error" message box.
+    QString warning;
+    new MessageBoxClicker({}, QMessageBox::Ok, &warning);
+    send_button->click();
+    QVERIFY(warning.contains("synthetic unlock failure"));
+    QVERIFY(!throw_on_unlock);
+
+    QString confirmation;
+    ConfirmSend(&confirmation, QMessageBox::Cancel);
+    send_button->click();
+    QVERIFY(WaitUntil([&] { return !confirmation.isEmpty(); }, 10000));
+    QCoreApplication::processEvents();
+
+    // The second request unlocked the wallet and relocked it after preparing.
+    QVERIFY(SyntheticStateMatches(state, [](const auto& value) {
+        return value.locked && value.lock_calls == 1;
+    }));
+    VerifyNoSendConfirmation();
 }
 
 void TestSendFailureShowsAllConsumedKeys(interfaces::Node& node)
@@ -4170,6 +4330,9 @@ void WalletTests::walletTests()
     TestSendPQCReportPropagation(m_node);
     TestAsyncFeeBumpLifecycle(m_node);
     TestSendCompletionAfterModelDestruction(m_node);
+    TestSendPageActivationWhileConfirming(m_node, QStringLiteral("sendButton"));
+    TestSendPageActivationWhileConfirming(m_node, QStringLiteral("clearButton"));
+    TestSendRequestExceptionReleasesSend(m_node);
     TestUnlockContextModelLifetime(m_node);
     TestCanGetAddressesNotificationIsQueued(m_node);
     TestSendPQCWarningFormatting();
