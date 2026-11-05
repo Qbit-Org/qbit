@@ -12,6 +12,7 @@
 #include <script/script.h>
 #include <util/check.h>
 #include <util/translation.h>
+#include <wallet/coincontrol.h>
 #include <wallet/wallet.h>
 
 #include <chrono>
@@ -199,7 +200,7 @@ public:
     bool isLockedCoin(const COutPoint&) override { return false; }
     void listLockedCoins(std::vector<COutPoint>&) override {}
     util::Result<CTransactionRef> createTransaction(const std::vector<wallet::CRecipient>& recipients,
-        const wallet::CCoinControl&,
+        const wallet::CCoinControl& coin_control,
         bool,
         int& change_pos,
         CAmount& fee,
@@ -210,6 +211,7 @@ public:
         {
             std::unique_lock lock{m_state->mutex};
             m_state->create_entered = true;
+            m_state->create_coins_selected = coin_control.HasSelected();
             wait_for_cancel = m_state->wait_for_cancel;
             m_state->condition.notify_all();
             if (!wait_for_cancel) {

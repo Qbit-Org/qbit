@@ -518,6 +518,15 @@ bool SendCoinsDialog::PrepareSendRequest(std::unique_ptr<WalletModelTransaction>
         return false;
     }
 
+    // Take the coin control with the recipients, before the unlock request:
+    // the passphrase dialog runs a nested event loop, and Clear All or a coin
+    // control change pressed through accessibility there must not alter
+    // this send.
+    updateCoinControlState();
+
+    coin_control = *m_coin_control;
+    coin_control.m_allow_other_inputs = !coin_control.HasSelected(); // future, could introduce a checkbox to customize this value.
+
     fNewRecipientAllowed = false;
     m_prepare_unlock_context = std::make_unique<WalletModel::UnlockContext>(model->requestUnlock());
     if(!m_prepare_unlock_context->isValid())
@@ -529,11 +538,6 @@ bool SendCoinsDialog::PrepareSendRequest(std::unique_ptr<WalletModelTransaction>
     }
 
     transaction = std::make_unique<WalletModelTransaction>(recipients);
-
-    updateCoinControlState();
-
-    coin_control = *m_coin_control;
-    coin_control.m_allow_other_inputs = !coin_control.HasSelected(); // future, could introduce a checkbox to customize this value.
     return true;
 }
 

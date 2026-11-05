@@ -2779,6 +2779,63 @@ void TestSendRequestExceptionReleasesSend(interfaces::Node& node, bool after_unl
     VerifyNoSendConfirmation();
 }
 
+//! The passphrase dialog behind the unlock request runs a nested event loop,
+//! and an accessibility client can press Clear All there. The send already
+//! in progress must keep the coin control it was requested with.
+void TestClearDuringUnlockKeepsSendRequest(interfaces::Node& node)
+{
+    TestChain100Setup test{ChainType::REGTEST, {.extra_args = {"-p2mronly=0"}}};
+    // The confirmation text asks the wallet loader whether several wallets are loaded.
+    auto wallet_loader = interfaces::MakeWalletLoader(*test.m_node.chain, *Assert(test.m_node.args));
+    test.m_node.wallet_loader = wallet_loader.get();
+    node.setContext(&test.m_node);
+
+    std::unique_ptr<const PlatformStyle> platform_style{PlatformStyle::instantiate("other")};
+    MiniGUI mini_gui{node, platform_style.get()};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    state->encrypted = true;
+    state->locked = true;
+    mini_gui.initModel(qt_test::MakeSyntheticWallet(wallet::PQCUsageReport{}, state), platform_style.get());
+    mini_gui.walletModel->pollBalanceChanged();
+
+    SendCoinsDialog& send_dialog{mini_gui.sendCoinsDialog};
+    QAbstractButton* const clear_button{send_dialog.findChild<QAbstractButton*>("clearButton")};
+    QVERIFY(clear_button);
+    QSignalSpy cleared{clear_button, &QAbstractButton::clicked};
+    QVERIFY(cleared.isValid());
+
+    // Stand in for the passphrase dialog: run events until the accessibility
+    // press has cleared the form, then unlock the wallet.
+    bool pressed{false};
+    QObject::connect(mini_gui.walletModel.get(), &WalletModel::requireUnlock, mini_gui.walletModel.get(), [&] {
+        pressed = PressThroughAccessibility(clear_button);
+        if (pressed) WaitUntil([&] { return !cleared.isEmpty(); }, 5000);
+        std::lock_guard lock{state->mutex};
+        state->locked = false;
+    });
+
+    // Without the selected input, preparing fails because the amount exceeds
+    // the cached balance, and the dialog reports it instead of confirming.
+    CancelSendConfirmations canceller;
+    QSignalSpy messages{&send_dialog, &SendCoinsDialog::message};
+    QVERIFY(messages.isValid());
+    ClickSend(send_dialog);
+    QVERIFY(WaitUntil([&] {
+        return (canceller.cancelled > 0 || !messages.isEmpty()) && VisibleSendConfirmations().empty();
+    }, 10000));
+    QCoreApplication::processEvents();
+
+    QVERIFY(pressed);
+    QCOMPARE(cleared.count(), 1);
+    QVERIFY(!send_dialog.getCoinControl()->HasSelected());
+    QCOMPARE(messages.count(), 0);
+    QCOMPARE(canceller.cancelled, 1);
+    QVERIFY(SyntheticStateMatches(state, [](const auto& value) {
+        return value.create_coins_selected;
+    }));
+    VerifyNoSendConfirmation();
+}
+
 //! BitcoinApplication::requestShutdown() deletes the wallet views, and the
 //! send dialogs they own, from whatever nested event loop is running. While a
 //! send confirmation is open, the stop RPC and SIGTERM wait for it to close,
@@ -4432,6 +4489,7 @@ void WalletTests::walletTests()
     TestSendPageActivationWhileConfirming(m_node, QStringLiteral("clearButton"));
     TestSendRequestExceptionReleasesSend(m_node, /*after_unlock=*/false);
     TestSendRequestExceptionReleasesSend(m_node, /*after_unlock=*/true);
+    TestClearDuringUnlockKeepsSendRequest(m_node);
     TestSendDestructionDuringConfirmation(m_node, /*destroy_dialog=*/true);
     TestSendDestructionDuringConfirmation(m_node, /*destroy_dialog=*/false);
     TestUnlockContextModelLifetime(m_node);

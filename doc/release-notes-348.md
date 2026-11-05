@@ -15,7 +15,9 @@ only a transaction confirmed in its own confirmation.
 Send now does nothing while a send is in progress, from the passphrase prompt
 until the confirmation closes, so one Send sends at most one transaction.
 Clear All still clears the form, and the confirmation still sends the
-transaction it shows.
+transaction it shows. The send also keeps the inputs selected with coin
+control when Send was pressed, even if the form is cleared or coin control
+is changed while the passphrase prompt is open.
 
 qbit-qt also no longer uses freed memory when it is asked to quit while a
 send confirmation is open, and Send no longer stays unavailable after an

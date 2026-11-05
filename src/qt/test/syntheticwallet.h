@@ -42,6 +42,9 @@ struct SyntheticWalletState {
     bool create_fail_before_reservation{false};
     bool create_counters_reserved{false};
     bool allow_create_completion{true};
+    //! Whether the coin control passed to the last createTransaction() had
+    //! inputs selected.
+    bool create_coins_selected{false};
     //! Throw a NonFatalCheckError from the next clone(), as an unexpected
     //! failure after the GUI has unlocked the wallet for a send.
     bool clone_throw{false};
