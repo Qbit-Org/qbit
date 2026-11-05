@@ -12,6 +12,7 @@ The public repository keeps a small branch surface:
 | `main` | Default public pull request target and active public integration branch. | Exists at public repository launch. |
 | `0.1.x` | Maintenance branch for v0.1.x testnet backports. | Create from the `v0.1.0-testnet4` tag target when the first v0.1.x patch, reset, or backport is needed. |
 | `1.x.x` | Maintenance branch for v1.x backports. | Create from the applicable v1 release tag when the first v1.x patch or backport is needed. |
+| `1.1.0` | Release line for v1.1.0. Signature rule only (full protection tracked separately). | Exists. |
 | `0.2.x` | Future maintenance/development line after v0.2.x opens. | Do not create during v0.1.x launch unless maintainers explicitly open that line. |
 | `upstream/bitcoin-v30.2` | Optional locked Bitcoin Core reference branch. | Create only if maintainers want a public upstream reference. |
 
@@ -239,13 +240,30 @@ branch rulesets and the repository allow, so merges never freeze:
    allowed merge methods to Squash and Rebase, and tick "Require linear
    history".
 4. Untick **Allow merge commits**.
-5. Confirm the earlier repository settings; a non-zero exit means a step did
-   not apply:
+5. Verify the rolled-back state with the assertions below. A non-zero exit
+   means stop: a step did not apply.
 
    ```sh
-   gh api repos/Qbit-Org/qbit | jq -e '
-     .allow_merge_commit == false and .allow_squash_merge == true
-     and .allow_rebase_merge == true'
+   (
+     set -euo pipefail
+     repo=Qbit-Org/qbit
+     gh api "repos/${repo}/rulesets" | jq -e '
+       all(.[] | select(.name == "signed-commits");
+           .enforcement == "disabled")'
+     gh api "repos/${repo}" | jq -e '
+       .allow_merge_commit == false and .allow_squash_merge == true
+       and .allow_rebase_merge == true'
+     for branch in main 0.1.x 1.0.0 1.x.x; do
+       gh api "repos/${repo}/rules/branches/${branch}" | jq -e '
+         all(.[]; .type != "required_signatures")
+         and any(.[]; .type == "required_linear_history")
+         and any(.[]; .type == "pull_request")
+         and all(.[] | select(.type == "pull_request");
+                 any(.parameters.allowed_merge_methods[]; . == "squash"))'
+     done
+     gh api "repos/${repo}/rules/branches/1.1.0" |
+       jq -e 'all(.[]; .type != "required_signatures")'
+   )
    ```
 
 Record the rollback in the release checklist: when it happened, the reason, the
@@ -263,10 +281,21 @@ that GitHub verifies. The rule lives in its own ruleset with no bypass actors,
 so the `OrganizationAdmin` bypass on the other branch rulesets does not exempt
 anyone from it.
 
+`squash-sign` is the maintainers' fleet tool; it is not vendored in this
+repository. It guarantees that each pull request it lands is one commit signed
+with an operator's OpenPGP key (or, for a standard two-commit subtree update,
+two commits that a person signed when they were created), that `verify` checked
+before merge that a person's key, not GitHub, signed them, and that the pull
+request lands with a merge commit. The maintainers track the results of the
+daily `squash-sign audit` privately.
+
 The `include` list names exact refs, not patterns. Creating a new long-lived
 branch therefore requires adding it to `signed-commits.json` and to the live
 ruleset; until then the branch accepts unsigned commits. The daily
-`squash-sign audit` reports protected branches that are missing from the list.
+`squash-sign audit` is the backstop: it reports protected branches that are
+missing from the list. `backport/*` and `release/v*` are short-lived pull
+request source branches, so they are deliberately not covered: drafts there may
+be unsigned, and their work lands through `squash-sign`.
 
 `1.1.0` has only the signature rule. No branch ruleset covers it, so it has no
 pull request, deletion, force-push, or status-check protection: anyone with
@@ -292,27 +321,49 @@ on a pull request branch:
   `dismiss_stale_reviews_on_push` and `require_last_push_approval` can require a
   fresh approval from someone other than the pusher.
 
-The only exception to one commit per pull request is a git-subtree update. It
-keeps its two commits, the "Squashed '<prefix>' changes" commit and the subtree
-merge, and both are signed when they are created with
-`git subtree pull --squash -S`, so the update needs two touches. `squash-sign`
-refuses to squash a subtree update, and lands it with its keep-commits path only
-when both commits are signed by a person's OpenPGP key. See the
-[libbitcoinpqc subtree runbook](../subtrees/libbitcoinpqc.md).
+A `src/libbitcoinpqc` import follows the same rule. The import is one
+main-line commit that carries the `git-subtree-dir` and `git-subtree-split`
+trailers, as in Qbit-Org/qbit#268. `squash-sign` squashes the import, pin, and
+release-notes commits into one operator-signed commit that keeps those
+trailers, so `test/lint/libbitcoinpqc-subtree-check.sh` still passes, with one
+touch. For a large vendored import, the signature attests the pin: the
+`git-subtree-split` upstream commit, the lint, and the upstream tree
+comparison. The operator does not attest a line-by-line reading of about 2,000
+vendored lines. The
+[libbitcoinpqc subtree runbook](../subtrees/libbitcoinpqc.md#signing-the-import)
+lists what the operator checks before touching.
 
-Pull requests from forks follow the same rule. Contributors sign their own
-commits, and a signature from any key registered on their GitHub account that
-GitHub verifies counts. If a fork pull request has an unsigned commit or more
-than one commit, a maintainer does not rewrite the contributor's branch, but
-recreates the pull request from a branch in this repository with `squash-sign`.
-The original author keeps credit through a `Co-authored-by` trailer and in the
-new pull request's body, and the maintainer closes the fork pull request with a
-link to the new one.
+Only a standard two-commit git-subtree update keeps its commits: the
+"Squashed '<prefix>/' changes" commit and the subtree merge. That shape is rare;
+it applies to the subtrees inherited from Bitcoin Core, which have not been
+updated since the fork. Both commits are signed when they are created, with
+`git subtree pull --squash -S`, so the update needs two touches, and it lands
+with `squash-sign merge --keep-commits`, which accepts it only when a person's
+OpenPGP key signed both commits.
+
+Contributors sign their own commits, and a signature from any key registered
+on their GitHub account that GitHub verifies counts. `squash-sign`'s own
+commits are always signed with an operator's OpenPGP key. `squash-sign` refuses
+fork pull requests by design:
+
+- A fork pull request that is a single commit Verified against the
+  contributor's own key, not a web-flow commit made in GitHub's web UI, lands
+  with the merge button as a merge commit.
+- If a fork pull request has an unsigned commit or more than one commit, a
+  maintainer does not rewrite the contributor's branch, but recreates the pull
+  request from a branch in this repository with `squash-sign`. The original
+  author keeps credit through a `Co-authored-by` trailer and in the new pull
+  request's body, and the maintainer closes the fork pull request with a link
+  to the new one.
+- A fork pull request that touches a subtree is not recreated from the fork: a
+  maintainer re-imports the subtree in a branch of this repository.
 
 In repositories that merge with merge commits,
-`squash-sign merge --admin-approvals` may merge with `--admin`, which bypasses
-the review requirement, so the pull request lands with zero approvals. It does
-so only when all of these checks pass:
+`squash-sign merge --admin-approvals` merges with `--admin` and zero approvals.
+On GitHub's server, `--admin` also bypasses the `Required Merge Gate` and every
+other rule in the branch rulesets that list `OrganizationAdmin` as a bypass
+actor, so `squash-sign` enforces the checks below on the client side only. Merging this way is an operator decision (G8). It merges only
+when all of these checks pass:
 
 - The repository allows merge commits only.
 - `squash-sign verify` passes.
@@ -325,9 +376,9 @@ so only when all of these checks pass:
   rule for required deployments, code scanning, or a merge queue applies.
 
 Agents never run plain `gh pr merge --admin`: it skips all of these checks,
-including the `Required Merge Gate`, because `OrganizationAdmin` bypasses the
-branch rulesets. The `signed-commits` ruleset has no bypass actors, so GitHub
-still refuses unsigned commits, even for admins.
+because `OrganizationAdmin` bypasses the branch rulesets. The `signed-commits`
+ruleset has no bypass actors, so GitHub still refuses unsigned commits, even for
+admins.
 
 The rule accepts any commit that GitHub marks Verified. GitHub signs only
 commits it creates itself through its API or web UI: GraphQL
