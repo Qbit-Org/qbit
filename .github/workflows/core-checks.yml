@@ -6,6 +6,15 @@ name: Core Checks
 
 on:
   pull_request:
+    # The same types as Required Merge Gate, which reads this workflow's run
+    # of its own event.
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+      - labeled
+      - unlabeled
     branches:
       - main
       - 1.0.0

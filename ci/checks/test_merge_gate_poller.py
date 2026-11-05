@@ -143,6 +143,7 @@ def workflow_run(
     *,
     created: datetime = SIBLINGS_CREATED,
     event: str = "pull_request",
+    head_sha: str = SHA,
     head_branch: str = "topic",
     repository_id: int = 1,
     pull_requests: tuple[int, ...] = (PR,),
@@ -152,7 +153,7 @@ def workflow_run(
         "id": run_id,
         "path": path,
         "event": event,
-        "head_sha": SHA,
+        "head_sha": head_sha,
         "head_branch": head_branch,
         "head_repository": {"id": repository_id},
         "pull_requests": [{"number": number} for number in pull_requests],
@@ -186,11 +187,13 @@ def ok(payload: str) -> tuple[int, str]:
 def github(runs: list[dict], suites: dict[int, list[dict]]) -> list[tuple]:
     """Routes answering the gate the way GitHub would for one head commit.
 
-    ``runs`` are every workflow run on the commit, of every event.  The
-    listing ignores its query's filters, so it is the gate's own selection that
-    keeps another event's runs out.  ``suites`` maps each check suite to its
-    check runs; the commit-wide listing serves all of them together.
+    ``runs`` are every workflow run on the commit, of every event, listed
+    newest first by ID as GitHub lists them.  The listing ignores its query's
+    filters, so it is the gate's own selection that keeps another event's runs
+    out.  ``suites`` maps each check suite to its check runs; the commit-wide
+    listing serves all of them together.
     """
+    runs = sorted(runs, key=lambda run: run["id"], reverse=True)
     routes = [(RUNS_ROUTE, [], ok(body(runs_page(*runs))))]
     for suite, check_runs in suites.items():
         routes.append((rf"/check-suites/{suite}/check-runs\?", [], ok(body(page(*check_runs)))))
@@ -350,7 +353,6 @@ class MergeGatePollerTest(unittest.TestCase):
             "REPOSITORY": "example/repo",
             "SHA": SHA,
             "EVENT_NAME": "pull_request",
-            "EVENT_ACTION": "synchronize",
             "PR_NUMBER": str(PR),
             "PR_DRAFT": "false",
             "RUN_ID": str(RUN_ID),
@@ -634,7 +636,6 @@ class MergeGatePollerTest(unittest.TestCase):
         cases = {
             "unsupported event": {"EVENT_NAME": "workflow_dispatch"},
             "no pull request number": {"PR_NUMBER": ""},
-            "no event action": {"EVENT_ACTION": ""},
             "no run ID": {"RUN_ID": ""},
             "malformed head SHA": {"SHA": "HEAD"},
         }
@@ -733,25 +734,24 @@ class MergeGatePollerTest(unittest.TestCase):
         # #268, replayed: marked ready for review 50 minutes after its last
         # push.  The draft-era Full Validation run skipped its gate job, and
         # the new run's gate job did not exist yet when the gate first polled.
-        # Core Checks does not run for ready_for_review, so its draft-era run
-        # is still the result for this head.
         # The draft-era runs were stamped a second apart, Full Validation's
-        # after its gate run's.
+        # after its gate run's.  The draft-era Core Checks run failed; this
+        # event's passed.
         draft_era = GATE_CREATED - timedelta(minutes=50)
         runs = [
             workflow_run(3000, GATE_WORKFLOW, 11, created=draft_era),
             workflow_run(3001, FULL_VALIDATION, 21, created=draft_era + timedelta(seconds=1)),
-            workflow_run(3002, CORE_CHECKS, CORE_CHECKS_SUITE, created=draft_era),
-            workflow_run(RUN_ID, GATE_WORKFLOW, GATE_SUITE, created=GATE_CREATED),
-            workflow_run(RUN_ID + 1, FULL_VALIDATION, FULL_VALIDATION_SUITE),
+            workflow_run(3002, CORE_CHECKS, 31, created=draft_era),
+            *this_events_runs(),
         ]
         suites = {
             21: [check_run("Full Validation Gate", "completed", "skipped", started_at="2026-11-04T14:43:00Z")],
-            CORE_CHECKS_SUITE: [check_run("Core Checks Gate", "completed", "success", started_at="2026-11-04T14:55:00Z")],
+            31: [check_run("Core Checks Gate", "completed", "failure", started_at="2026-11-04T14:55:00Z")],
+            CORE_CHECKS_SUITE: [check_run("Core Checks Gate", "completed", "success", started_at="2026-11-04T15:45:00Z")],
             FULL_VALIDATION_SUITE: [],
         }
         fake = FakeGh(self.tmp("ready-for-review"), routes=github(runs, suites))
-        completed = self.run_pending(fake, EVENT_ACTION="ready_for_review")
+        completed = self.run_pending(fake)
         self.assertNotIn("concluded skipped", completed.stdout)
         self.assertIn("Core Checks Gate: status=completed conclusion=success", completed.stdout)
         self.assertStillPending(completed, "Full Validation Gate")
@@ -762,7 +762,7 @@ class MergeGatePollerTest(unittest.TestCase):
             check_run("Full Validation Gate", "completed", "success", started_at="2026-11-04T21:00:00Z")
         ]
         fake = FakeGh(self.tmp("ready-for-review-green"), routes=github(runs, suites))
-        self.assertGatePassed(self.run_gate(fake, EVENT_ACTION="ready_for_review"))
+        self.assertGatePassed(self.run_gate(fake))
 
     def test_another_events_successes_do_not_pass_the_gate(self) -> None:
         # The 1.x.x -> main integration pattern: the pull request's head is a
@@ -786,7 +786,7 @@ class MergeGatePollerTest(unittest.TestCase):
             CORE_CHECKS_SUITE: [check_run("build smoke", "in_progress", None, started_at="2026-11-04T15:33:00Z")],
         }
         fake = FakeGh(self.tmp("push-context"), routes=github(runs, suites))
-        completed = self.run_pending(fake, EVENT_ACTION="opened")
+        completed = self.run_pending(fake)
         self.assertStillPending(completed, "Core Checks Gate", "Full Validation Gate")
         self.assertEqual(fake.calls_to(COMMIT_CHECK_RUNS_ROUTE), [])
 
@@ -821,7 +821,7 @@ class MergeGatePollerTest(unittest.TestCase):
             workflow_run(3002, CORE_CHECKS, 31, head_branch="1.x.x", **push),
         ]
         fake = FakeGh(self.tmp("other-push-branch"), routes=github(runs, green))
-        completed = self.run_pending(fake, EVENT_NAME="push", EVENT_ACTION="", PR_NUMBER="", PR_DRAFT="")
+        completed = self.run_pending(fake, EVENT_NAME="push", PR_NUMBER="", PR_DRAFT="")
         self.assertStillPending(completed, "Core Checks Gate", "Full Validation Gate")
 
     def test_a_fork_head_is_bound_by_its_branch_and_repository(self) -> None:
@@ -947,39 +947,35 @@ class MergeGatePollerTest(unittest.TestCase):
         self.assertEqual(len(fake.run_calls), 2, fake.calls)
         self.assertEqual(len(fake.check_run_calls), 2, fake.calls)
 
-    def test_a_workflow_this_event_did_not_start_is_read_from_its_newest_run(self) -> None:
-        # Which events start each workflow is read from the workflow files, so
-        # a trigger change that the gate does not know about fails here.  The
-        # only runs of either workflow are an earlier event's, an hour old: a
-        # workflow this event started has to be read from this event's run,
-        # and is pending until it exists.
+    def test_every_event_the_gate_runs_for_starts_the_workflows_it_reads(self) -> None:
+        # Each wait reads the run its own event started, so both workflows
+        # must run for every pull_request type, push and merge_group the gate
+        # runs for.  A workflow that did not would leave the gate waiting for
+        # a run that never comes; a fallback to an older run would read
+        # another event's result.  The triggers are read from the workflow
+        # files, so a change to them fails here.
         gate_triggers = self.workflow["on"]
-        workflows = {path: load_workflow_file(path)["on"] for path in (FULL_VALIDATION, CORE_CHECKS)}
-        check_of = {FULL_VALIDATION: "Full Validation Gate", CORE_CHECKS: "Core Checks Gate"}
-
-        def starts(triggers: dict, event: str, action: str) -> bool:
-            if event not in triggers:
-                return False
-            if event != "pull_request":
-                return True
-            types = (triggers[event] or {}).get("types", GITHUB_DEFAULT_PULL_REQUEST_TYPES)
-            return action in types
-
-        for path, triggers in workflows.items():
+        for path in (FULL_VALIDATION, CORE_CHECKS):
+            triggers = load_workflow_file(path)["on"]
+            with self.subTest(workflow=path, triggers="types"):
+                types = (triggers["pull_request"] or {}).get("types", GITHUB_DEFAULT_PULL_REQUEST_TYPES)
+                self.assertLessEqual(set(gate_triggers["pull_request"]["types"]), set(types))
             for event in ("pull_request", "push", "merge_group"):
-                with self.subTest(workflow=path, event=event, branches=True):
-                    # A branch the gate runs for but the workflow does not
-                    # would leave the gate waiting for a run that never comes.
+                with self.subTest(workflow=path, event=event, triggers="branches"):
                     self.assertLessEqual(
                         set(gate_triggers[event]["branches"]),
                         set(triggers[event]["branches"]),
                     )
+                    # A path or branch filter would skip the run for some
+                    # changes the gate still waits on.
+                    for key in ("paths", "paths-ignore", "branches-ignore"):
+                        self.assertNotIn(key, triggers[event] or {})
 
-        events = [("pull_request", action) for action in gate_triggers["pull_request"]["types"]]
-        events += [("push", ""), ("merge_group", "checks_requested")]
+        # The only runs of either workflow are an earlier event's, an hour
+        # old: whatever the event, both checks wait for this event's runs.
         stale = GATE_CREATED - timedelta(hours=1)
-        for event, action in events:
-            with self.subTest(event=event, action=action):
+        for event in ("pull_request", "push", "merge_group"):
+            with self.subTest(event=event):
                 fields = {"event": event} if event == "pull_request" else {"event": event, "pull_requests": ()}
                 runs = [
                     workflow_run(3000, GATE_WORKFLOW, 11, created=stale, **fields),
@@ -991,17 +987,87 @@ class MergeGatePollerTest(unittest.TestCase):
                     21: [check_run("Full Validation Gate", "completed", "success", started_at="2026-11-04T15:00:00Z")],
                     31: [check_run("Core Checks Gate", "completed", "success", started_at="2026-11-04T15:00:00Z")],
                 }
-                context = {"EVENT_NAME": event, "EVENT_ACTION": action}
+                context = {"EVENT_NAME": event}
                 if event != "pull_request":
                     context.update(PR_NUMBER="", PR_DRAFT="")
-                fake = FakeGh(self.tmp(f"started-{event}-{action}"), routes=github(runs, suites))
-                completed = self.run_pending(fake, **context)
-                pending = [check_of[path] for path in (CORE_CHECKS, FULL_VALIDATION) if starts(workflows[path], event, action)]
-                self.assertTrue(pending, "Full Validation runs for every event the gate runs for")
-                self.assertStillPending(completed, *pending)
-                for path in (CORE_CHECKS, FULL_VALIDATION):
-                    if check_of[path] not in pending:
-                        self.assertIn(f"{check_of[path]}: status=completed conclusion=success", completed.stdout)
+                fake = FakeGh(self.tmp(f"started-{event}"), routes=github(runs, suites))
+                self.assertStillPending(self.run_pending(fake, **context), "Core Checks Gate", "Full Validation Gate")
+
+    def test_the_newest_run_of_this_event_wins(self) -> None:
+        # A pull request opened with a label: GitHub sends opened and labeled
+        # seconds apart, too close to tell their runs apart by the window.
+        # The labeled runs cancelled the opened ones, and the gate must wait
+        # for them rather than fail on the cancelled runs.
+        opened = GATE_CREATED - timedelta(seconds=2)
+        suites = {
+            21: [check_run("Full Validation Gate", "completed", "cancelled", started_at="2026-11-04T15:32:40Z")],
+            31: [check_run("Core Checks Gate", "completed", "cancelled", started_at="2026-11-04T15:32:40Z")],
+            FULL_VALIDATION_SUITE: [check_run("lint", "in_progress", None, started_at="2026-11-04T15:33:00Z")],
+            CORE_CHECKS_SUITE: [check_run("build smoke", "in_progress", None, started_at="2026-11-04T15:33:00Z")],
+        }
+        cases = {
+            # (opened's run IDs, labeled's run IDs, labeled's runs' creation)
+            "labeled created later": ((3991, 3992), (RUN_ID + 1, RUN_ID + 2), SIBLINGS_CREATED),
+            # Creation time decides; run IDs are not assumed to follow it.
+            "labeled created later, with lower IDs": ((RUN_ID + 11, RUN_ID + 12), (3991, 3992), SIBLINGS_CREATED),
+            # In the same second, the higher run ID is the newer run.
+            "same second": ((3991, 3992), (RUN_ID + 1, RUN_ID + 2), opened),
+        }
+        for index, (label, ((old_fv, old_cc), (new_fv, new_cc), created)) in enumerate(cases.items()):
+            with self.subTest(case=label):
+                runs = [
+                    workflow_run(3990, GATE_WORKFLOW, 11, created=opened),
+                    workflow_run(old_fv, FULL_VALIDATION, 21, created=opened),
+                    workflow_run(old_cc, CORE_CHECKS, 31, created=opened),
+                    workflow_run(RUN_ID, GATE_WORKFLOW, GATE_SUITE, created=GATE_CREATED),
+                    workflow_run(new_fv, FULL_VALIDATION, FULL_VALIDATION_SUITE, created=created),
+                    workflow_run(new_cc, CORE_CHECKS, CORE_CHECKS_SUITE, created=created),
+                ]
+                fake = FakeGh(self.tmp(f"newest-{index}"), routes=github(runs, suites))
+                completed = self.run_pending(fake)
+                self.assertNotIn("concluded cancelled", completed.stdout)
+                self.assertStillPending(completed, "Core Checks Gate", "Full Validation Gate")
+
+    def test_another_events_run_inside_the_window_is_not_read(self) -> None:
+        # A push to a branch that has an open pull request starts the push
+        # runs and the pull request's synchronize runs in the same second, on
+        # the same commit and branch, and GitHub ties both to the pull request.
+        # The 1.x.x -> main integration does this on every push to 1.x.x.
+        # Only the event tells them apart.
+        push = {"event": "push", "head_branch": "1.x.x"}
+        runs = [
+            workflow_run(RUN_ID - 3, GATE_WORKFLOW, 12, created=GATE_CREATED, **push),
+            workflow_run(RUN_ID + 11, FULL_VALIDATION, 22, created=GATE_CREATED, **push),
+            workflow_run(RUN_ID + 12, CORE_CHECKS, 32, created=GATE_CREATED, **push),
+            *this_events_runs(head_branch="1.x.x"),
+        ]
+        suites = {
+            22: [check_run("Full Validation Gate", "completed", "success", started_at="2026-11-04T15:33:30Z")],
+            32: [check_run("Core Checks Gate", "completed", "success", started_at="2026-11-04T15:33:30Z")],
+            FULL_VALIDATION_SUITE: [check_run("lint", "in_progress", None, started_at="2026-11-04T15:33:00Z")],
+            CORE_CHECKS_SUITE: [check_run("build smoke", "in_progress", None, started_at="2026-11-04T15:33:00Z")],
+        }
+        fake = FakeGh(self.tmp("push-in-window"), routes=github(runs, suites))
+        self.assertStillPending(self.run_pending(fake), "Core Checks Gate", "Full Validation Gate")
+
+    def test_a_run_for_another_commit_is_not_read(self) -> None:
+        # The listing is asked for this head SHA, and the gate checks it too:
+        # a push moments later starts runs for the next commit.
+        later = {"head_sha": "1" * 40, "created": GATE_CREATED + timedelta(seconds=5)}
+        runs = [
+            *this_events_runs(),
+            workflow_run(RUN_ID + 10, GATE_WORKFLOW, 13, **later),
+            workflow_run(RUN_ID + 11, FULL_VALIDATION, 23, **later),
+            workflow_run(RUN_ID + 12, CORE_CHECKS, 33, **later),
+        ]
+        suites = {
+            23: [check_run("Full Validation Gate", "completed", "success", started_at="2026-11-04T15:40:00Z")],
+            33: [check_run("Core Checks Gate", "completed", "success", started_at="2026-11-04T15:40:00Z")],
+            FULL_VALIDATION_SUITE: [],
+            CORE_CHECKS_SUITE: [],
+        }
+        fake = FakeGh(self.tmp("other-commit"), routes=github(runs, suites))
+        self.assertStillPending(self.run_pending(fake), "Core Checks Gate", "Full Validation Gate")
 
     def test_each_check_is_read_from_the_workflow_that_reports_it(self) -> None:
         suite_workflow = {FULL_VALIDATION_SUITE: FULL_VALIDATION, CORE_CHECKS_SUITE: CORE_CHECKS}
@@ -1043,7 +1109,7 @@ class MergeGatePollerTest(unittest.TestCase):
         # Only a pull request can be a draft.
         fake = FakeGh(self.tmp("draft-push"), default=ok(body(page())))
         completed = self.run_gate(
-            fake, profile="github-metadata", EVENT_NAME="push", EVENT_ACTION="", PR_NUMBER="", PR_DRAFT=""
+            fake, profile="github-metadata", EVENT_NAME="push", PR_NUMBER="", PR_DRAFT=""
         )
         self.assertGatePassed(completed)
 
