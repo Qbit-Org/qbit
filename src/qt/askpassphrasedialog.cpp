@@ -158,6 +158,13 @@ void AskPassphraseDialog::accept()
                     // so the model outlives the confirmation above.
                     assert(model);
                     if (!model->encryptWallet(newpass1)) {
+                        // Another caller, such as the encryptwallet RPC, is
+                        // encrypting the wallet and the model has said so.
+                        // Nothing was attempted, so there is no result.
+                        if (model->isEncryptingWallet()) {
+                            QDialog::reject();
+                            return;
+                        }
                         showEncryptionResult(/*success=*/false);
                         return;
                     }

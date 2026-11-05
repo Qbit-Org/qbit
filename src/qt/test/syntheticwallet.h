@@ -150,6 +150,9 @@ struct SyntheticWalletState {
     //! Listener for the announcement CWallet::EncryptWallet makes when an
     //! encryption starts and when it returns, whoever called it.
     std::function<void()> encryption_in_progress_changed;
+    //! Encryptions announced without holding the latch, as the encryptwallet
+    //! RPC announces its own while it waits for the wallet locks.
+    int encryption_announcements{0};
 };
 
 /**

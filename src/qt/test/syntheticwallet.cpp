@@ -136,7 +136,7 @@ public:
     bool isEncryptionInProgress() override
     {
         std::lock_guard lock{m_state->mutex};
-        return m_state->encrypt_in_progress;
+        return m_state->encrypt_in_progress || m_state->encryption_announcements > 0;
     }
     bool lock() override
     {

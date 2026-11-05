@@ -19,8 +19,8 @@ handles encryption from the dialog:
   shown as they were before the encryption.
 - New transactions, keypool changes and status changes are applied once the
   encryption has finished.
-- Unlocking, sending, signing and fee bumping are refused with a "Wallet
-  encryption in progress" message.
+- Unlocking, sending, signing, fee bumping and encrypting from the Encrypt
+  Wallet dialog are refused with a "Wallet encryption in progress" message.
 
 When the encryption finishes, whether it succeeds or fails, the GUI reads the
 wallet again and shows it as encrypted and locked, or as it was before.
@@ -38,3 +38,5 @@ not respond until it does.
 - Loading a PSBT
 - Backing up the wallet
 - Closing the wallet
+- Opening a wallet in the GUI while it is being encrypted, for example right
+  after `loadwallet` or `createwallet`
