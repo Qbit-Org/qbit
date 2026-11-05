@@ -114,11 +114,10 @@ public:
 
     // Wallet encryption. Runs the wallet's encryption on a worker thread so
     // the GUI keeps processing events, and reports the outcome through
-    // encryptWalletFinished(). Returns false, and starts nothing, while an
-    // earlier encryption is still running, as refuseWhileEncrypting()
-    // reports. An exception from the wallet is
-    // rethrown on the GUI thread rather than reported as a failure: the
-    // encryption may already have committed.
+    // encryptWalletFinished(). While any encryption is running it starts
+    // nothing and returns false, after refuseWhileEncrypting() has told the
+    // user. An exception from the wallet is rethrown on the GUI thread rather
+    // than reported as a failure: the encryption may already have committed.
     bool encryptWallet(const SecureString& passphrase);
     // Whether the wallet is being encrypted, by encryptWallet() or by any
     // other caller such as the encryptwallet RPC. The encryption holds the
