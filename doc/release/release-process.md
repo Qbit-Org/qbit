@@ -14,8 +14,9 @@ exceptional flows. They are not the ordinary public release path.
 
 ## Release Source
 
-The release source is a reviewed public commit reachable from a protected public
-branch, usually `main` or a release branch such as `0.1.x`.
+The release source is a reviewed public commit on the first-parent history of a
+protected public branch (normally GitHub's merge commit, not the pull request
+head), usually `main` or a release branch such as `0.1.x`.
 
 Release candidates and final releases use signed annotated tags in the public
 qbit repository. Examples:
@@ -28,12 +29,15 @@ The tag target commit is the source commit used for release builds. Do not use a
 private source commit, a sanitizer mapping, a branch name, a short SHA, or a tag
 object SHA as the release source.
 
-With merge-commit merges, tag the squash-signed release commit (the head of the
-release pull request) or the merge commit that landed it; both pass the
-publisher's history check. That check accepts a commit on the first-parent
-history of `trusted_release_ref` or the head of a pull request merged into it,
-and refuses a commit from inside a multi-commit pull request or deeper on a
-merged side branch.
+With merge-commit merges, tag the merge commit that landed the release pull
+request, not the pull request's head. Branches are not required to be up to date
+before merging, so a pull request head's tree can lack changes the branch had
+when it merged; only the merge commit is a state the branch actually had. The
+publisher refuses a tag target that is not on the first-parent history of
+`trusted_release_ref`. The release attestation is the operator's signature on
+the annotated tag; the target commit's own signature plays no part here. For a
+release line such as `1.0.0` or `1.x.x`, take `trusted_release_ref` from that
+line's own branch and pass `--trusted-release-branch` with that branch.
 
 The release validator recreates `qbit-<version>.tar.gz` directly from that tag
 target with the same `git archive --prefix="qbit-<version>/"` semantics used by
@@ -50,6 +54,13 @@ It must be the full 40-character commit SHA of a public commit. It must not be a
 branch name, short SHA, tag ref, tag object SHA, or the release tag target
 commit. This preserves a separate public source anchor and public validation
 policy anchor for each release.
+
+It must be on the first-parent history of the protected branch that the
+publisher checks: `main` by default, or the branch passed with
+`--trusted-release-branch` for a release line. The publisher fetches that branch
+from GitHub, checks the fetched tip against the tip GitHub's API reports, and
+refuses a trusted ref off that line, such as a pull request head, which could
+carry validators and key policy from an older base.
 
 The release publisher must be run from a clean public checkout whose `HEAD`
 exactly equals `trusted_release_ref`. The publisher uses that checkout's
@@ -74,10 +85,12 @@ The publisher validates:
   signature verification as exactly `verified=true` and `reason=valid`
 - the tag signer is accepted by the qbit release key policy
 - `trusted_release_ref` is a full public commit SHA and is not the tag object or
-  tag target commit, and the tag target is on its first-parent history or is
-  the head of a pull request merged into it
+  tag target commit, and the tag target is on its first-parent history
+- `trusted_release_ref` is on the first-parent history of the trusted release
+  branch, whose fetched tip matches the tip GitHub reports
 - the trusted qbit checkout and pinned `qbit-guix.sigs` checkout are clean, and
-  the latter commit is public and reachable from its configured public branch
+  the latter commit is public and on the first-parent history of its
+  configured public branch, whose fetched tip matches the tip GitHub reports
 - staged artifacts match `SHA256SUMS`
 - `SHA256SUMS.asc` meets release-signature quorum
 - `qbit-guix.sigs` builder attestations meet builder quorum and every counted
@@ -253,6 +266,7 @@ contrib/release-process/publish-local-release.sh \
   --tag "${TAG}" \
   --artifacts-dir /path/to/staged-release \
   --trusted-release-ref "$(git rev-parse HEAD)" \
+  --trusted-release-branch main \
   --guix-sigs-repo /path/to/qbit-guix.sigs \
   --guix-sigs-ref "${GUIX_SIGS_REF}" \
   --release-line testnet \
@@ -384,6 +398,9 @@ Normal public release evidence should pin public data:
   digest, qbit conformance result, oracle report digest, finalized integration
   matrix digest, and exact-SHA consensus review evidence, or an explicit
   statement that completed qbit P2MR v1 conformance is not claimed
+
+Release-trust notes written from now on name GitHub's merge commit as the
+release source. Earlier notes stay as they were written.
 
 Normal public release evidence must not require private source commits,
 sanitizer manifests, sanitizer mapping files, private qbit-tools state, operator

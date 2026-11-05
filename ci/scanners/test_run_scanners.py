@@ -527,5 +527,76 @@ class LatestGitSubtreeMetadataTest(unittest.TestCase):
         self.assertEqual(self.metadata()["git_subtree_split"], "0" * 40)
 
 
+
+class HistoryLogOptsTest(unittest.TestCase):
+    """The history secret scan must see changes made only in a merge commit."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.repo = Path(self.temp_dir.name)
+        self.git("init", "-q", "-b", "main")
+        (self.repo / "a.txt").write_text("base\n", encoding="utf8")
+        self.git("add", "a.txt")
+        self.git("commit", "-q", "-m", "base")
+        self.base = self.git("rev-parse", "HEAD")
+        self.git("checkout", "-q", "-b", "topic")
+        (self.repo / "b.txt").write_text("topic\n", encoding="utf8")
+        self.git("add", "b.txt")
+        self.git("commit", "-q", "-m", "topic")
+        self.git("checkout", "-q", "main")
+        self.git("merge", "-q", "--no-ff", "--no-commit", "topic")
+        # A change that exists only in the merge commit.
+        (self.repo / "c.txt").write_text("ONLY_IN_MERGE_TOKEN\n", encoding="utf8")
+        self.git("add", "c.txt")
+        self.git("commit", "-q", "-m", "Merge pull request #1")
+        self.head = self.git("rev-parse", "HEAD")
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def git(self, *args: str) -> str:
+        result = subprocess.run(
+            [
+                "git", "-c", "user.name=scanner test", "-c", "user.email=scanner@example.invalid",
+                "-c", "commit.gpgsign=false", "-C", str(self.repo), *args,
+            ],
+            check=True, capture_output=True, text=True,
+        )
+        return result.stdout.strip()
+
+    def gitleaks_log(self, log_opts: str) -> str:
+        # gitleaks runs git log -p -U0 followed by the --log-opts words.
+        return self.git("log", "-p", "-U0", *log_opts.split())
+
+    def args(self, base_ref: str) -> object:
+        return type("Args", (), {"history_diff_base_ref": base_ref, "source_commit": self.head})()
+
+    def test_plain_git_log_misses_a_merge_only_change(self) -> None:
+        self.assertNotIn("ONLY_IN_MERGE_TOKEN", self.git("log", "-p", "-U0", "--full-history", "--all"))
+
+    def test_full_history_scan_sees_a_merge_only_change(self) -> None:
+        log_opts = run_scanners.history_log_opts(self.repo, self.args(""))
+        self.assertEqual(log_opts, "--full-history --all --diff-merges=first-parent")
+        log = self.gitleaks_log(log_opts)
+        self.assertIn("ONLY_IN_MERGE_TOKEN", log)
+        self.assertIn("topic", log)
+
+    def test_ranged_scan_sees_a_merge_only_change_and_every_parent(self) -> None:
+        log_opts = run_scanners.history_log_opts(self.repo, self.args(self.base))
+        self.assertEqual(log_opts, f"--diff-merges=first-parent {self.base}..{self.head}")
+        log = self.gitleaks_log(log_opts)
+        self.assertIn("ONLY_IN_MERGE_TOKEN", log)
+        self.assertIn("+topic", log)
+
+    def test_gitleaks_command_always_passes_log_opts(self) -> None:
+        raw_dir = self.repo / "raw"
+        commands, _report = run_scanners.external_commands("gitleaks", self.repo, raw_dir, self.args(""))
+        command = commands[0]
+        self.assertEqual(
+            command[command.index("--log-opts") + 1],
+            "--full-history --all --diff-merges=first-parent",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

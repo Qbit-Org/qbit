@@ -258,15 +258,22 @@ def git_merge_base(source: Path, left: str, right: str) -> str:
     return completed.stdout.strip()
 
 
+# git log -p prints no diff for a merge commit unless asked to, so a change made
+# only in a merge commit would go unscanned. Show each merge's diff against its
+# first parent, and keep walking every parent.
+HISTORY_DIFF_MERGES = "--diff-merges=first-parent"
+
+
 def history_log_opts(source: Path, args: argparse.Namespace) -> str:
     base_ref = str(getattr(args, "history_diff_base_ref", "") or "").strip()
     if not base_ref:
-        return ""
+        # gitleaks uses --full-history --all only when --log-opts is empty.
+        return f"--full-history --all {HISTORY_DIFF_MERGES}"
     source_commit = str(args.source_commit or git_commit(source)).strip()
     if not source_commit:
         raise SystemExit("History scanner diff scope requires a git source commit.")
     base_commit = git_merge_base(source, source_commit, base_ref)
-    return f"{base_commit}..{source_commit}"
+    return f"{HISTORY_DIFF_MERGES} {base_commit}..{source_commit}"
 
 
 def decode_command_output(output: bytes | str | None) -> str:
@@ -1033,8 +1040,7 @@ def external_commands(tool: str, source: Path, raw_dir: Path, args: argparse.Nam
             "--exit-code",
             "0",
         ]
-        if log_opts:
-            command.extend(["--log-opts", log_opts])
+        command.extend(["--log-opts", log_opts])
         allowlist = repo_root() / "ci" / "scanners" / "gitleaks-allowlist.toml"
         if allowlist.is_file():
             command.extend(["--config", str(allowlist)])

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -74,6 +75,17 @@ class PublishLocalReleaseTest(unittest.TestCase):
         self.tag_target = git(self.trusted, "rev-parse", f"refs/tags/{TAG}^{{commit}}")
         self.trusted_ref = git(self.trusted, "rev-parse", "HEAD")
         self.guix_sigs_ref = git(self.guix_sigs, "rev-parse", "HEAD")
+        # Local bare repositories stand in for GitHub; run_publisher redirects
+        # https://github.com/ to them with url.<base>.insteadOf.
+        self.github = self.root / "github"
+        for repository, checkout in (
+            ("Qbit-Org/qbit", self.trusted),
+            ("Qbit-Org/qbit-guix.sigs", self.guix_sigs),
+        ):
+            bare = self.github / f"{repository}.git"
+            bare.parent.mkdir(parents=True, exist_ok=True)
+            git(self.root, "init", "-q", "--bare", str(bare))
+            git(checkout, "push", "-q", str(bare), "HEAD:refs/heads/main")
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -162,8 +174,12 @@ if args and args[0] == "api":
                 ]
             )
         )
-    elif "/compare/" in endpoint:
-        print("behind")
+    elif "/branches/" in endpoint:
+        tips = json.loads(os.environ["FAKE_GH_BRANCH_TIPS"])
+        key = endpoint[len("repos/"):].replace("/branches/", "/", 1)
+        if key not in tips:
+            raise SystemExit(f"fake gh: no branch {key}")
+        print(tips[key])
     elif "/commits/" in endpoint:
         print(endpoint.rsplit("/", 1)[1])
     elif endpoint.count("/") == 2:
@@ -533,13 +549,23 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         tag_object_during_immutable_poll: str | None = None,
         mutate_notes_file: Path | None = None,
         asset_list_sequence: tuple[str, ...] = ("ok",),
+        branch_tips: dict[str, str] | None = None,
         cwd: Path | None = None,
         extra_env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = dict(os.environ)
         env["PATH"] = f"{self.bin_dir}{os.pathsep}{env['PATH']}"
+        tips = {
+            "Qbit-Org/qbit/main": self.trusted_ref,
+            "Qbit-Org/qbit-guix.sigs/main": self.guix_sigs_ref,
+        }
+        tips.update(branch_tips or {})
         env.update(
             {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": f"url.file://{self.github}/.insteadOf",
+                "GIT_CONFIG_VALUE_0": "https://github.com/",
+                "FAKE_GH_BRANCH_TIPS": json.dumps(tips),
                 "FAKE_GH_STATE": str(self.gh_state),
                 "FAKE_GH_LOG": str(self.gh_log),
                 "FAKE_GH_TAG": TAG,
@@ -1054,8 +1080,15 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
     def test_validation_only_rejects_matching_mutable_published_release(self) -> None:
         (self.gh_state / "release-state").write_text("published\n", encoding="utf8")
 
+        bare = self.github / "Example-Org" / "release-target.git"
+        bare.parent.mkdir(parents=True)
+        git(self.root, "init", "-q", "--bare", str(bare))
+        git(self.trusted, "push", "-q", str(bare), "HEAD:refs/heads/main")
         result = self.run_publisher(
-            "--repo", "Example-Org/release-target", immutable_sequence=("false",)
+            "--repo",
+            "Example-Org/release-target",
+            immutable_sequence=("false",),
+            branch_tips={"Example-Org/release-target/main": self.trusted_ref},
         )
 
         self.assertNotEqual(result.returncode, 0)
@@ -1566,6 +1599,80 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         self.assertNotIn("Validation-only mode", result.stdout)
 
 
+    def _set_github_branch(self, repository: str, checkout: Path, branch: str, commit: str) -> None:
+        bare = self.github / f"{repository}.git"
+        git(checkout, "push", "-q", "--force", str(bare), f"{commit}:refs/heads/{branch}")
+
+    def _merge_object(self, checkout: Path, first_parent: str | None, second_parent: str) -> str:
+        """Create, without moving HEAD, a branch state that merges second_parent.
+
+        The branch's own line starts from first_parent, or from a new root."""
+        tree = f"{first_parent or second_parent}^{{tree}}"
+        parents = ["-p", first_parent] if first_parent else []
+        side = git(checkout, "commit-tree", tree, *parents, "-m", "side")
+        return git(
+            checkout, "commit-tree", f"{second_parent}^{{tree}}",
+            "-p", side, "-p", second_parent, "-m", "Merge pull request #1",
+        )
+
+    def test_trusted_release_ref_on_branch_first_parent_history_passes(self) -> None:
+        later = git(
+            self.trusted, "commit-tree", f"{self.trusted_ref}^{{tree}}",
+            "-p", self.trusted_ref, "-m", "main moved on",
+        )
+        self._set_github_branch("Qbit-Org/qbit", self.trusted, "main", later)
+        result = self.run_publisher(branch_tips={"Qbit-Org/qbit/main": later})
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("repos/Qbit-Org/qbit/branches/main", self.gh_log.read_text(encoding="utf8"))
+
+    def test_trusted_release_ref_merged_as_pull_request_head_fails(self) -> None:
+        merge = self._merge_object(self.trusted, self.tag_target, self.trusted_ref)
+        self._set_github_branch("Qbit-Org/qbit", self.trusted, "main", merge)
+        result = self.run_publisher(branch_tips={"Qbit-Org/qbit/main": merge})
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            f"Trusted release ref {self.trusted_ref} must be on the first-parent history of "
+            "Qbit-Org/qbit:main",
+            result.stderr,
+        )
+
+    def test_trusted_branch_tip_must_match_github(self) -> None:
+        result = self.run_publisher(branch_tips={"Qbit-Org/qbit/main": self.tag_target})
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"but GitHub reports {self.tag_target}", result.stderr)
+
+    def test_release_line_uses_its_own_trusted_branch(self) -> None:
+        self._set_github_branch("Qbit-Org/qbit", self.trusted, "1.x.x", self.trusted_ref)
+        result = self.run_publisher(
+            "--trusted-release-branch", "1.x.x",
+            branch_tips={"Qbit-Org/qbit/1.x.x": self.trusted_ref},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("repos/Qbit-Org/qbit/branches/1.x.x", self.gh_log.read_text(encoding="utf8"))
+
+    def test_invalid_trusted_release_branch_fails(self) -> None:
+        result = self.run_publisher("--trusted-release-branch", "bad..branch")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--trusted-release-branch is not a valid branch name", result.stderr)
+
+    def test_guix_sigs_ref_merged_as_pull_request_head_fails(self) -> None:
+        merge = self._merge_object(self.guix_sigs, None, self.guix_sigs_ref)
+        self._set_github_branch("Qbit-Org/qbit-guix.sigs", self.guix_sigs, "main", merge)
+        result = self.run_publisher(branch_tips={"Qbit-Org/qbit-guix.sigs/main": merge})
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            f"qbit-guix.sigs commit {self.guix_sigs_ref} must be on the first-parent history of "
+            "Qbit-Org/qbit-guix.sigs:main",
+            result.stderr,
+        )
+
+
 def extract_shell_function(source: str, name: str) -> str:
     match = re.search(rf"^{name}\(\) \{{\n.*?^\}}\n", source, re.MULTILINE | re.DOTALL)
     if match is None:
@@ -1573,8 +1680,8 @@ def extract_shell_function(source: str, name: str) -> str:
     return match.group(0)
 
 
-class TagTargetTrustedHistoryTest(unittest.TestCase):
-    """Run the publisher's tag-target history check on a merge-commit history."""
+class FirstParentHistoryTest(unittest.TestCase):
+    """Run the publisher's first-parent history check on a merge-commit history."""
 
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -1582,53 +1689,61 @@ class TagTargetTrustedHistoryTest(unittest.TestCase):
         self.repo.mkdir()
         git(self.repo, "init", "-q", "-b", "main")
         self.commits: dict[str, str] = {}
-        self._commit("m1")
-        self._commit("m2")
+        self._commit("m1", "base.txt")
+        self._commit("m2", "base.txt")
         # A multi-commit pull request merged with the merge button.
         self._branch_and_merge("multi", ["multi-1", "multi-2"], "merge-multi")
-        # A squash-signed release pull request: one commit, then its merge.
-        self._branch_and_merge("release", ["release"], "merge-release")
-        # A side line with several commits merged in.
+        # A release pull request opened on a stale base: main gets S while it
+        # is open, so the merge has X+S+R but the pull request head has X+R.
+        git(self.repo, "checkout", "-q", "-b", "release")
+        self._commit("release", "release.txt")
+        git(self.repo, "checkout", "-q", "main")
+        self._commit("main-while-release-open", "base.txt")
+        self._merge("release", "merge-release")
+        # A long-lived side line merged in.
         self._branch_and_merge("line", ["line-1", "line-2", "line-3"], "merge-line")
-        self._commit("m3")
+        self._commit("m3", "base.txt")
         self.trusted_ref = self.commits["m3"]
         source = PUBLISHER.read_text(encoding="utf8")
         self.script = "\n".join(
             [
                 "set -euo pipefail",
                 extract_shell_function(source, "lowercase"),
-                extract_shell_function(source, "tag_target_on_trusted_history"),
-                'tag_target_on_trusted_history "$1" "$2" "$3"',
+                extract_shell_function(source, "on_first_parent_history"),
+                'on_first_parent_history "$1" "$2" "$3"',
             ]
         )
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
-    def _commit(self, label: str) -> None:
-        (self.repo / "file").write_text(f"{label}\n", encoding="utf8")
-        git(self.repo, "add", "file")
+    def _commit(self, label: str, path: str = "file") -> None:
+        (self.repo / path).write_text(f"{label}\n", encoding="utf8")
+        git(self.repo, "add", path)
         git(self.repo, "commit", "-q", "-m", label)
         self.commits[label] = git(self.repo, "rev-parse", "HEAD")
+
+    def _merge(self, branch: str, merge_label: str) -> None:
+        git(self.repo, "merge", "-q", "--no-ff", "-m", merge_label, branch)
+        self.commits[merge_label] = git(self.repo, "rev-parse", "HEAD")
 
     def _branch_and_merge(self, branch: str, labels: list[str], merge_label: str) -> None:
         git(self.repo, "checkout", "-q", "-b", branch)
         for label in labels:
-            self._commit(label)
+            self._commit(label, f"{branch}.txt")
         git(self.repo, "checkout", "-q", "main")
-        git(self.repo, "merge", "-q", "--no-ff", "-m", merge_label, branch)
-        self.commits[merge_label] = git(self.repo, "rev-parse", "HEAD")
+        self._merge(branch, merge_label)
 
-    def check(self, target: str, trusted_ref: str | None = None) -> int:
+    def check(self, commit: str, history_ref: str | None = None) -> int:
         result = subprocess.run(
             [
                 "bash",
                 "-c",
                 self.script,
-                "tag-target-check",
+                "first-parent-check",
                 str(self.repo),
-                trusted_ref or self.trusted_ref,
-                target,
+                history_ref or self.trusted_ref,
+                commit,
             ],
             capture_output=True,
             text=True,
@@ -1636,7 +1751,7 @@ class TagTargetTrustedHistoryTest(unittest.TestCase):
         return result.returncode
 
     def test_first_parent_commits_pass(self) -> None:
-        for label in ("m1", "m2", "m3"):
+        for label in ("m1", "m2", "main-while-release-open", "m3"):
             with self.subTest(label=label):
                 self.assertEqual(self.check(self.commits[label]), 0)
 
@@ -1645,24 +1760,31 @@ class TagTargetTrustedHistoryTest(unittest.TestCase):
             with self.subTest(label=label):
                 self.assertEqual(self.check(self.commits[label]), 0)
 
-    def test_merged_pull_request_heads_pass(self) -> None:
-        for label in ("release", "multi-2", "line-3"):
-            with self.subTest(label=label):
-                self.assertEqual(self.check(self.commits[label]), 0)
+    def test_uppercase_commit_passes(self) -> None:
+        self.assertEqual(self.check(self.commits["merge-release"].upper()), 0)
 
-    def test_uppercase_target_passes(self) -> None:
-        self.assertEqual(self.check(self.commits["release"].upper()), 0)
+    def test_merged_pull_request_heads_fail(self) -> None:
+        for label in ("release", "multi-2"):
+            with self.subTest(label=label):
+                self.assertNotEqual(self.check(self.commits[label]), 0)
+
+    def test_stale_base_pull_request_head_never_was_a_branch_state(self) -> None:
+        head_tree = git(self.repo, "rev-parse", f"{self.commits['release']}^{{tree}}")
+        merge_tree = git(self.repo, "rev-parse", f"{self.commits['merge-release']}^{{tree}}")
+        self.assertNotEqual(head_tree, merge_tree)
+        self.assertNotEqual(self.check(self.commits["release"]), 0)
+        self.assertEqual(self.check(self.commits["merge-release"]), 0)
 
     def test_intermediate_commit_of_merged_pull_request_fails(self) -> None:
         self.assertNotEqual(self.check(self.commits["multi-1"]), 0)
 
-    def test_deeper_side_branch_commits_fail(self) -> None:
-        for label in ("line-1", "line-2"):
+    def test_merged_long_lived_branch_commits_fail(self) -> None:
+        for label in ("line-3", "line-2", "line-1"):
             with self.subTest(label=label):
                 self.assertNotEqual(self.check(self.commits[label]), 0)
 
-    def test_unknown_trusted_ref_fails(self) -> None:
-        self.assertNotEqual(self.check(self.commits["m2"], trusted_ref="1" * 40), 0)
+    def test_unknown_history_ref_fails(self) -> None:
+        self.assertNotEqual(self.check(self.commits["m2"], history_ref="1" * 40), 0)
 
 
 if __name__ == "__main__":
