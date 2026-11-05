@@ -3,7 +3,8 @@
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Test that plaintext PQC key records in an encrypted wallet are reported,
-refused and re-encrypted on unlock (#283).
+refused and re-encrypted on unlock (#283), and that backupwallet refuses to
+copy them unless the caller overrides (#321).
 
 The wallet file is built the way v1.0.0 could leave it: a top-up that raced
 encryptwallet committed plaintext walletdescriptorpqckey rows, with their
@@ -46,6 +47,7 @@ TOP_UP_RECORD_TYPES = [ser_string(t) for t in (
     b"walletdescriptorpqckey",
 )]
 FIRST_COUNTER = 20
+BACKUP_REFUSED = "this encrypted wallet still stores PQC private keys unencrypted"
 
 
 def read_rows(path):
@@ -117,6 +119,25 @@ class WalletP2MRPlaintextReencryptionTest(BitcoinTestFramework):
             for secret in secrets:
                 assert secret not in data, f"{path.name} still holds a plaintext PQC key"
 
+    def load_affected_wallet(self, name, before_backup, stale_rows):
+        """Encrypt a copy of the wallet, then add a v1.0.0 top-up's rows."""
+        node = self.nodes[0]
+        node.restorewallet(name, before_backup)
+        wallet = node.get_wallet_rpc(name)
+        self.wait_pqc_key_validation_ready(wallet)
+        wallet.encryptwallet(PASSPHRASE)
+        node.unloadwallet(name)
+        conn = sqlite3.connect(self.wallet_file(name))
+        with conn:
+            conn.executemany("INSERT OR REPLACE INTO main VALUES(?, ?)", stale_rows.items())
+            # v1.0.0 does not record the rewrite after encryption.
+            conn.execute("DELETE FROM main WHERE key = ?", (REWRITE_RECORD,))
+        conn.close()
+        # Loading rewrites the file, but the plaintext records are still live.
+        with node.assert_debug_log([REWRITE_LOG]):
+            node.loadwallet(name)
+        return node.get_wallet_rpc(name)
+
     def run_test(self):
         node = self.nodes[0]
         funder = node.get_wallet_rpc(self.default_wallet_name)
@@ -162,21 +183,7 @@ class WalletP2MRPlaintextReencryptionTest(BitcoinTestFramework):
         affected_address = scratch.getnewaddress(address_type="p2mr")
         node.unloadwallet("scratch")
 
-        node.restorewallet("affected", before_backup)
-        affected = node.get_wallet_rpc("affected")
-        self.wait_pqc_key_validation_ready(affected)
-        affected.encryptwallet(PASSPHRASE)
-        node.unloadwallet("affected")
-        conn = sqlite3.connect(self.wallet_file("affected"))
-        with conn:
-            conn.executemany("INSERT OR REPLACE INTO main VALUES(?, ?)", stale_rows.items())
-            # v1.0.0 does not record the rewrite after encryption.
-            conn.execute("DELETE FROM main WHERE key = ?", (REWRITE_RECORD,))
-        conn.close()
-        # Loading rewrites the file, but the plaintext records are still live.
-        with node.assert_debug_log([REWRITE_LOG]):
-            node.loadwallet("affected")
-        affected = node.get_wallet_rpc("affected")
+        affected = self.load_affected_wallet("affected", before_backup, stale_rows)
 
         self.log.info("The wallet reports the plaintext records before it is unlocked")
         self.wait_until(lambda: affected.getwalletinfo()["pqc_key_validation"]["status"] == "complete")
@@ -199,9 +206,14 @@ class WalletP2MRPlaintextReencryptionTest(BitcoinTestFramework):
         assert_raises_rpc_error(-4, "this encrypted wallet still stores PQC private keys unencrypted", affected.send, {funder.getnewaddress(): 1})
         assert_raises_rpc_error(-13, "Please enter the wallet passphrase with walletpassphrase first", affected.sendtoaddress, funder.getnewaddress(), 1)
 
-        # A backup made now keeps the plaintext keys whatever happens later.
+        self.log.info("backupwallet refuses to copy the plaintext records unless the caller overrides")
         old_backup = backup_dir / "affected_before_unlock.dat"
-        affected.backupwallet(old_backup)
+        assert_raises_rpc_error(-13, BACKUP_REFUSED, affected.backupwallet, old_backup)
+        assert_raises_rpc_error(-13, "Unlock the wallet once with walletpassphrase", affected.backupwallet, old_backup, False)
+        assert_raises_rpc_error(-13, "To back up anyway, pass allow_unencrypted_pqc_keys=true.", affected.backupwallet, old_backup)
+        assert not old_backup.exists()
+        # A backup made now keeps the plaintext keys whatever happens later.
+        affected.backupwallet(destination=old_backup, allow_unencrypted_pqc_keys=True)
         assert all(secret in old_backup.read_bytes() for secret in secrets)
 
         self.log.info("Unlocking re-encrypts every plaintext record and rewrites the file")
@@ -215,6 +227,11 @@ class WalletP2MRPlaintextReencryptionTest(BitcoinTestFramework):
         assert_equal(affected.getaddressinfo(affected_address)["pqc_signature_count"], counter)
         self.assert_no_file_contains(self.wallet_file("affected").parent, secrets)
         affected.walletlock()
+
+        self.log.info("Once the keys are re-encrypted, a backup needs no override and holds none of them")
+        new_backup = backup_dir / "affected_after_unlock.dat"
+        affected.backupwallet(new_backup)
+        assert not any(secret in new_backup.read_bytes() for secret in secrets)
 
         node.unloadwallet("affected")
         rows = read_rows(self.wallet_file("affected"))
@@ -240,6 +257,37 @@ class WalletP2MRPlaintextReencryptionTest(BitcoinTestFramework):
 
         # The backup taken before the unlock still holds the plaintext keys.
         assert_equal(sum(record_type(k) == PQC_KEY for k in read_rows(old_backup)), len(counters))
+
+        self.log.info("A record that failed validation is never re-encrypted, so its wallet needs the override")
+        failed_key = min(counters)
+        failed_secret, failed_counter = parse_plaintext_value(stale_rows[failed_key])
+        failed_secret = bytes([failed_secret[0] ^ 1]) + failed_secret[1:]
+        failed_rows = dict(stale_rows)
+        failed_rows[failed_key] = plaintext_value(record_pubkey(failed_key), failed_secret, failed_counter)
+        failed = self.load_affected_wallet("failed", before_backup, failed_rows)
+        # Wait for every record, so that the unlock re-encrypts all the others.
+        def validation_done():
+            validation = failed.getwalletinfo()["pqc_key_validation"]
+            return validation["status"] == "failed" and validation["pending_records"] == 0
+        self.wait_until(validation_done)
+        failed.walletpassphrase(PASSPHRASE, 600)
+        validation = failed.getwalletinfo()["pqc_key_validation"]
+        assert_equal(validation["failed_records"], 1)
+        assert_equal(validation["plaintext_records"], 1)
+        assert_equal(validation["reencryption_required"], True)
+        failed_backup = backup_dir / "failed.dat"
+        assert_raises_rpc_error(-13, BACKUP_REFUSED, failed.backupwallet, failed_backup)
+        assert_raises_rpc_error(-13, "1 of the records failed validation, and no unlock re-encrypts those", failed.backupwallet, failed_backup)
+        assert_raises_rpc_error(-13, "then pass allow_unencrypted_pqc_keys=true to back up anyway", failed.backupwallet, failed_backup)
+        if self.is_cli_compiled():
+            # qbit-cli converts the argument to a bool.
+            node.cli("-rpcwallet=failed").backupwallet(str(failed_backup), True)
+        else:
+            failed.backupwallet(failed_backup, True)
+        backup_rows = read_rows(failed_backup)
+        assert_equal([k for k in backup_rows if record_type(k) == PQC_KEY], [failed_key])
+        assert failed_secret in failed_backup.read_bytes()
+        failed.walletlock()
 
 
 if __name__ == '__main__':

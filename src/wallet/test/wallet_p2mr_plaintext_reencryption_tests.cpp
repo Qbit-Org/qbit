@@ -724,6 +724,62 @@ BOOST_AUTO_TEST_CASE(BackupAfterFailedRewriteRewritesFirstOrIsRefused)
     BOOST_CHECK_EQUAL(db.m_rewrite_count, 3);
 }
 
+BOOST_AUTO_TEST_CASE(BackupIsRefusedUntilPlaintextPQCKeysAreReencrypted)
+{
+    const std::string destination{fs::PathToString(m_args.GetDataDirBase() / "affected.bak")};
+    auto wallet{Load(AffectedRecords())};
+    MockableDatabase& db{GetMockableDatabase(*wallet)};
+    BOOST_REQUIRE(HasRewriteRecord(db.m_records));
+    db.ResetCounts();
+
+    // Refused while the records are still being validated and once they
+    // are, without a copy or a rewrite. The message names a route for records
+    // that failed validation, because the GUI cannot pass the override.
+    for (const bool validated : {false, true}) {
+        if (validated) FinishValidation(*wallet);
+        CheckReported(*wallet, 3);
+        const auto backup{wallet->BackupWallet(destination)};
+        BOOST_REQUIRE(!backup);
+        BOOST_CHECK(util::ErrorString(backup).original.find("still stores PQC private keys unencrypted") != std::string::npos);
+        BOOST_CHECK(util::ErrorString(backup).original.find("qbit-wallet -wallet=<name> -dumpfile=<file> dump") != std::string::npos);
+        BOOST_CHECK_EQUAL(db.m_backup_count, 0);
+        BOOST_CHECK_EQUAL(db.m_rewrite_count, 0);
+    }
+
+    // The override copies the wallet as it is.
+    BOOST_CHECK(wallet->BackupWallet(destination, /*allow_unencrypted_pqc_keys=*/true));
+    BOOST_CHECK_EQUAL(db.m_backup_count, 1);
+    BOOST_CHECK_EQUAL(CountPlaintextPQCRecords(db.m_records), 3U);
+
+    // Once the unlock has re-encrypted them, a backup needs no override.
+    BOOST_REQUIRE(wallet->Unlock(PASSPHRASE, /*run_pending_initial_keypool_top_up=*/false));
+    BOOST_REQUIRE(wallet->ReencryptPlaintextPQCKeys());
+    CheckNotReported(*wallet);
+    BOOST_REQUIRE(wallet->Lock());
+    BOOST_CHECK(wallet->BackupWallet(destination));
+    BOOST_CHECK_EQUAL(db.m_backup_count, 2);
+}
+
+BOOST_AUTO_TEST_CASE(BackupWithAFailedRecordNeedsTheOverride)
+{
+    MockableData records{AffectedRecords()};
+    records.erase(PQCKeyRecordKey(DBKeys::WALLETDESCRIPTORPQCCKEY, desc_id, keys.at(2).pubkey));
+    PutPlaintextRecord(records, desc_id, keys.at(2), /*sig_counter=*/0, /*corrupt=*/true);
+    auto wallet{LoadValidatedAndUnlocked(records)};
+    BOOST_REQUIRE(wallet->ReencryptPlaintextPQCKeys());
+    BOOST_REQUIRE_EQUAL(wallet->GetPQCKeyValidationInfo().failed_records, 1U);
+    CheckReported(*wallet, 1);
+
+    // No unlock re-encrypts a failed record, so only the override backs it up.
+    MockableDatabase& db{GetMockableDatabase(*wallet)};
+    db.ResetCounts();
+    const std::string destination{fs::PathToString(m_args.GetDataDirBase() / "failed.bak")};
+    BOOST_CHECK(!wallet->BackupWallet(destination));
+    BOOST_CHECK_EQUAL(db.m_backup_count, 0);
+    BOOST_CHECK(wallet->BackupWallet(destination, /*allow_unencrypted_pqc_keys=*/true));
+    BOOST_CHECK_EQUAL(db.m_backup_count, 1);
+}
+
 BOOST_AUTO_TEST_CASE(RelockBeforeReencryptionLeavesWalletReported)
 {
     auto wallet{LoadValidatedAndUnlocked(AffectedRecords())};

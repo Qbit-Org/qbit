@@ -123,6 +123,7 @@ public:
     int m_txn_commit_count{0};
     int m_txn_abort_count{0};
     int m_rewrite_count{0};
+    mutable int m_backup_count{0};
 
     MockableDatabase(MockableData records = {}) : WalletDatabase(), m_records(records) {}
     ~MockableDatabase() = default;
@@ -134,7 +135,11 @@ public:
         ++m_rewrite_count;
         return m_pass && m_rewrite_pass;
     }
-    bool Backup(const std::string& strDest) const override { return m_pass; }
+    bool Backup(const std::string& strDest) const override
+    {
+        ++m_backup_count;
+        return m_pass;
+    }
     void Close() override {}
 
     std::string Filename() override { return "mockable"; }
@@ -149,6 +154,7 @@ public:
         m_txn_commit_count = 0;
         m_txn_abort_count = 0;
         m_rewrite_count = 0;
+        m_backup_count = 0;
     }
 };
 

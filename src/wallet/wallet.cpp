@@ -5031,12 +5031,19 @@ void CWallet::postInitProcess()
     WITH_LOCK(cs_wallet, chain().requestMempoolTransactions(*this));
 }
 
-util::Result<void> CWallet::BackupWallet(const std::string& strDest)
+util::Result<void> CWallet::BackupWallet(const std::string& strDest, bool allow_unencrypted_pqc_keys)
 {
     // Hold cs_wallet for the whole copy. EncryptWallet holds it from before
     // its commit through its rewrite, so an encryption cannot start between
     // this check and the copy.
     LOCK(cs_wallet);
+    // A copy keeps plaintext PQC key records after the next unlock has
+    // re-encrypted the wallet. Re-encryption needs cs_wallet, so the state
+    // checked here is the state copied.
+    if (!allow_unencrypted_pqc_keys && GetPQCKeyValidationInfo().reencryption_required) {
+        return util::Error{strprintf(_("Backup refused: this encrypted wallet still stores PQC private keys unencrypted, and the backup would contain them. Unlock the wallet once (enter its passphrase when you send, or run walletpassphrase in the console) so that they are re-encrypted, then try again. An unlock cannot re-encrypt some keys, such as those whose records failed validation, and the debug log then says why; to copy such a wallet anyway, unload it and run %s with the -datadir and chain options that qbitd uses (an empty name for the default wallet). The dump file contains those keys too, and %s restores it."),
+                                     "\"qbit-wallet -wallet=<name> -dumpfile=<file> dump\"", "\"qbit-wallet -wallet=<new name> -dumpfile=<file> createfromdump\"")};
+    }
     // The copy includes free pages byte for byte, so deleted plaintext keys
     // must be gone from the file before it is made.
     if (NeedsRewriteAfterEncryption() && !RewriteAfterEncryption()) {

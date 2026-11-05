@@ -1116,9 +1116,11 @@ public:
     /**
      * Copy the database to strDest. The copy includes the file's free space,
      * so a rewrite that is still pending after encryption runs first, and the
-     * backup is refused if it fails.
+     * backup is refused if it fails. Unless allow_unencrypted_pqc_keys is set,
+     * the backup is also refused while the wallet is encrypted but still
+     * stores plaintext PQC key records, because the copy would contain them.
      */
-    util::Result<void> BackupWallet(const std::string& strDest);
+    util::Result<void> BackupWallet(const std::string& strDest, bool allow_unencrypted_pqc_keys = false);
 
     /* Returns true if HD is enabled */
     bool IsHDEnabled() const;

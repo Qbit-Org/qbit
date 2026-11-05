@@ -176,6 +176,13 @@ unlocking again retries. Keys whose records failed validation are not
 re-encrypted, and signing stays disabled until you restore or repair the
 wallet.
 
+Make new backups only after the re-encryption. While the field is `true`,
+`backupwallet` and the GUI's backup refuse to copy the wallet, and
+`backupwallet` fails with error -13. `backupwallet <destination> true`
+(`allow_unencrypted_pqc_keys`) makes the backup anyway, for example for a
+wallet with records that failed validation; anyone with that backup can read
+those keys without the passphrase.
+
 Re-encryption does not change older copies. Wallet files and backups made
 before the unlock still contain the keys. The affected keys are those the
 refill added beyond the keypool at encryption time:
@@ -365,7 +372,7 @@ been validated with qbit-aware tooling.
   multisig receive flows on launch chains.
 - Back up the wallet database with `backupwallet`.
 - If an encrypted wallet shows `pqc_key_validation.reencryption_required`,
-  unlock it to re-encrypt its keys, and see
+  unlock it to re-encrypt its keys before you back it up, and see
   [Check an Encrypted Wallet for Unencrypted PQC Keys](#check-an-encrypted-wallet-for-unencrypted-pqc-keys).
 - Keep only one live signer copy of a P2MR wallet.
 - Use `exportpubkeydb` and `importpubkeydb` for P2MR watch-only tracking.

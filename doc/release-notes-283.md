@@ -8,6 +8,10 @@ itself as encrypted, used and rewrote those records whenever it signed with
 their keys, and copied them into every backup. Anyone with the wallet file or
 one of those backups can read these keys without the passphrase.
 
+The release note for #277 says that this release does not detect or
+re-encrypt unencrypted PQC keys that v1.0.0 already wrote. It now does both,
+as described below.
+
 How to check
 ------------
 
@@ -51,6 +55,31 @@ What this release does
   again. Records that failed validation are never re-encrypted, and signing
   stays disabled until the wallet is restored or repaired.
 
+Backups
+-------
+
+- `backupwallet` and the GUI's backup now refuse to copy a wallet while
+  `reencryption_required` is `true`, because the copy would contain the
+  unencrypted keys. `backupwallet` fails with error code -13
+  (`RPC_WALLET_UNLOCK_NEEDED`), and the error says what to do. Unlock the
+  wallet once so that it re-encrypts the keys, check that
+  `reencryption_required` is `false`, and then make the backup.
+- A scheduled `backupwallet` job for an affected wallet therefore starts
+  failing after the upgrade, and keeps failing until the wallet has been
+  unlocked once. Check such jobs for error -13.
+- `backupwallet` has a new optional second argument,
+  `allow_unencrypted_pqc_keys` (default `false`). Set it to `true` to make the
+  backup anyway, for example for a wallet with records that failed
+  validation, which are never re-encrypted. Anyone with such a backup can read
+  those keys without the passphrase.
+- The GUI has no such option. To copy a wallet whose records failed
+  validation, unload it and run
+  `qbit-wallet -wallet=<name> -dumpfile=<file> dump`, with the same
+  `-datadir` and chain options as for `qbitd` (an empty name for the default
+  wallet), and restore the dump with
+  `qbit-wallet -wallet=<new name> -dumpfile=<file> createfromdump`. The dump
+  file contains those keys too.
+
 Which funds are at risk
 -----------------------
 
@@ -68,8 +97,8 @@ the time of encryption.
   addresses, so funds the wallet received after encryption may sit on them.
 
 Re-encrypting the wallet cannot make these keys secret again. Older wallet
-files and every backup made from an affected wallet still contain them, and
-nothing in this release can change those copies. If you are not sure that the
+files and every backup made from an affected wallet before its re-encryption
+still contain them, and nothing in this release can change those copies. If you are not sure that the
 wallet file and all of its backups stayed private, create a new wallet with a
 passphrase using this release, move your funds to it, and then delete the old
 backups. For a blank wallet with imported descriptors, stop receiving to those
