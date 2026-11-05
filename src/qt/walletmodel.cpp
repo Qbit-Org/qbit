@@ -81,17 +81,19 @@ WalletModel::WalletModel(std::unique_ptr<interfaces::Wallet> wallet, ClientModel
     optionsModel(client_model.getOptionsModel()),
     timer(new QTimer(this))
 {
+    // Read the values reported while another caller encrypts the wallet, so
+    // they are the wallet's even if that starts before anything asks for
+    // them. Read the wallet directly, as the table models below do: if an
+    // encryption holds the wallet locks, creating the model waits for it
+    // either way.
+    m_last_encryption_status = readEncryptionStatus();
+    m_last_pqc_key_validation_info = m_wallet->getPQCKeyValidationInfo();
+
     addressTableModel = new AddressTableModel(this);
     transactionTableModel = new TransactionTableModel(platformStyle, this);
     recentRequestsTableModel = new RecentRequestsTableModel(this);
 
     subscribeToCoreSignals();
-    // Read the values reported while another caller encrypts the wallet, so
-    // they are the wallet's even if that starts before anything asks for
-    // them. Read the wallet directly, as the table models above do: an
-    // encryption announced already has not taken the wallet locks yet.
-    m_last_encryption_status = readEncryptionStatus();
-    m_last_pqc_key_validation_info = m_wallet->getPQCKeyValidationInfo();
 }
 
 WalletModel::~WalletModel()
