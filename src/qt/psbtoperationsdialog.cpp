@@ -50,6 +50,13 @@ using node::PSBTAnalysis;
 using node::TransactionError;
 
 namespace {
+std::string SerializePSBT(const PartiallySignedTransaction& psbt)
+{
+    DataStream stream{};
+    stream << psbt;
+    return stream.str();
+}
+
 QString AppendPQCUsageStatus(QString message, const wallet::PQCUsageReport& report, PQCSigningOutcome outcome)
 {
     const QString usage{FormatPQCSigningOutcomePlain(report, outcome)};
@@ -84,14 +91,13 @@ std::string SaveUnshownPSBT(const PartiallySignedTransaction& psbt) noexcept
 {
     // Runs from the destructor too, so no filesystem error may escape.
     try {
-        DataStream stream{};
-        stream << psbt;
+        const std::string serialized{SerializePSBT(psbt)};
         const std::string stem{strprintf("unshown-psbt-%s-%d", psbt.tx->GetHash().ToString(), TicksSinceEpoch<std::chrono::seconds>(SystemClock::now()))};
         for (int attempt{0}; attempt < 100; ++attempt) {
             const fs::path path{gArgs.GetDataDirNet() / fs::u8path(attempt == 0 ? stem + ".psbt" : strprintf("%s-%d.psbt", stem, attempt))};
             if (fs::exists(path)) continue;
             std::ofstream out{path, std::ofstream::out | std::ofstream::binary};
-            out << stream.str();
+            out << serialized;
             out.close();
             if (out) return strprintf("The signed PSBT was saved to %s.", fs::quoted(fs::PathToString(path)));
             std::error_code ec;
@@ -133,6 +139,9 @@ struct PSBTOperationsDialog::SignResult {
     bool complete{false};
     bool cancel_observed{false};
     wallet::PQCUsageReport pqc_usage;
+    //! Signing changed the PSBT. n_signed counts only finalized inputs, so it
+    //! misses a partial signature added to a multisig input.
+    bool changed{false};
     //! Set by the worker once the fields above hold its outcome.
     bool done{false};
 };
@@ -309,6 +318,7 @@ void PSBTOperationsDialog::signTransaction()
             return true;
         };
         try {
+            const std::string unsigned_psbt{SerializePSBT(result->psbt)};
             result->error = wallet->fillPSBT(std::nullopt,
                                              /*sign=*/true,
                                              /*bip32derivs=*/true,
@@ -317,6 +327,7 @@ void PSBTOperationsDialog::signTransaction()
                                              result->complete,
                                              &result->pqc_usage,
                                              progress_callback);
+            result->changed = SerializePSBT(result->psbt) != unsigned_psbt;
         } catch (const std::exception& e) {
             result->exception = e.what();
         }
@@ -434,7 +445,7 @@ void PSBTOperationsDialog::signTransactionFinished(uint64_t generation, std::sha
     // signing, keep them so the PSBT can still be copied, saved or broadcast.
     const bool wallet_unloaded{!m_wallet_model};
     m_transaction_data = std::move(result->psbt);
-    if (result->n_signed > 0) m_signatures_unexported = true;
+    if (result->changed) m_signatures_unexported = true;
     updateTransactionDisplay();
     setSigningControlsEnabled(true);
 
@@ -470,11 +481,11 @@ void PSBTOperationsDialog::logUnshownSignResult(const SignResult& result)
     } else if (result.error) {
         LogWarning("PSBT signing failed after its dialog was shut down or destroyed: %s.%s\n", PSBTErrorString(*result.error).original, usage);
     } else {
-        LogWarning("PSBT signing finished after its dialog was shut down or destroyed, so the result was not shown: %u input(s) signed, transaction %s.%s %s\n",
+        LogWarning("PSBT signing finished after its dialog was shut down or destroyed, so the result was not shown: %u input(s) fully signed, transaction %s.%s %s\n",
                    result.n_signed,
                    result.complete ? "complete" : "incomplete",
                    usage,
-                   result.n_signed > 0 ? SaveUnshownPSBT(result.psbt) : "Nothing was signed.");
+                   result.changed ? SaveUnshownPSBT(result.psbt) : "The PSBT was not changed.");
     }
 }
 

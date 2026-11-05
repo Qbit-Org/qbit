@@ -37,6 +37,7 @@ private Q_SLOTS:
     void canceledProgressStaysVisibleUntilWorkerReports();
     void shutdownCancelsSigningBeforeReservation();
     void shutdownLogsSigningFinishedAfterReservation();
+    void shutdownSavesPartialSignature();
     void destructionAfterReservationSavesSignedPSBT();
     void shutdownLogsUnexportedSignedPSBT();
     void walletUnloadDuringSigning();

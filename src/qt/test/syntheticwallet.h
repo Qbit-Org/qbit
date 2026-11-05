@@ -7,6 +7,7 @@
 
 #include <interfaces/wallet.h>
 #include <primitives/transaction.h>
+#include <psbt.h>
 #include <wallet/pqc_usage.h>
 
 #include <chrono>
@@ -96,6 +97,11 @@ struct SyntheticWalletState {
     bool psbt_sign_finished{false};
     bool psbt_fail{false};
     bool psbt_fail_before_reservation{false};
+    //! Add a partial signature, as one cosigner of a multisig input does,
+    //! instead of finalizing the input. FillPSBT then counts no signed input.
+    bool psbt_partial_signature{false};
+    //! The PSBT the last signing call produced.
+    PartiallySignedTransaction psbt_signed_result;
     int psbt_sign_calls{0};
     std::thread::id psbt_sign_thread;
     int lock_calls{0};

@@ -570,12 +570,42 @@ void PSBTOperationsDialogTests::shutdownLogsSigningFinishedAfterReservation()
     QVERIFY(WaitUntil([&] { return !log.find({finished}).empty(); }));
     VerifyUnshownPSBTSaved(log.find({finished}), files_before, SerializePSBT(SyntheticSignedPSBT(fixture.original_psbt)));
     const std::string line{log.find({finished})};
-    QVERIFY2(line.find("1 input(s) signed, transaction complete.") != std::string::npos, line.c_str());
+    QVERIFY2(line.find("1 input(s) fully signed, transaction complete.") != std::string::npos, line.c_str());
     QVERIFY2(line.find(strprintf("PQC key %s: 3 of %u signatures used, %u remaining, state normal.",
                                  PQCPubKeyHex(key.GetPubKey()).toStdString(), PQC_MAX_SIGNATURES, PQC_MAX_SIGNATURES - 3)) != std::string::npos,
              line.c_str());
     QVERIFY(!ReadState(state, [](const auto& value) { return value.psbt_cancel_observed; }));
     QCOMPARE(display_updates.count(), 0);
+}
+
+void PSBTOperationsDialogTests::shutdownSavesPartialSignature()
+{
+    // One cosigner's signature on a multisig input finalizes nothing, so the
+    // wallet counts no signed input, yet it consumed a counter.
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    state->psbt_simulate_pqc_reservation = true;
+    state->psbt_partial_signature = true;
+    state->allow_psbt_completion = false;
+    DialogFixture fixture{*m_context->client_model, m_context->platform_style.get(), state};
+    const auto files_before{UnshownPSBTFiles()};
+    const LogCapture log;
+
+    fixture.dialog->signTransaction();
+    QVERIFY(WaitUntil([&] { return ReadState(state, [](const auto& value) { return value.psbt_counters_reserved; }); }));
+    fixture.dialog->prepareForShutdown();
+    fixture.releaseWorker();
+
+    const std::string finished{"PSBT signing finished after its dialog was shut down or destroyed, so the result was not shown"};
+    QVERIFY(WaitUntil([&] { return !log.find({finished}).empty(); }));
+    const std::string line{log.find({finished})};
+    QVERIFY2(line.find("0 input(s) fully signed, transaction incomplete.") != std::string::npos, line.c_str());
+    PartiallySignedTransaction produced;
+    {
+        std::lock_guard lock{state->mutex};
+        produced = state->psbt_signed_result;
+    }
+    QVERIFY(!produced.inputs.front().partial_sigs.empty());
+    VerifyUnshownPSBTSaved(line, files_before, SerializePSBT(produced));
 }
 
 void PSBTOperationsDialogTests::destructionAfterReservationSavesSignedPSBT()
@@ -609,14 +639,17 @@ void PSBTOperationsDialogTests::destructionAfterReservationSavesSignedPSBT()
 void PSBTOperationsDialogTests::shutdownLogsUnexportedSignedPSBT()
 {
     const std::string closed{"PSBT dialog was shut down before its signed PSBT was copied, saved or broadcast."};
-    // Kept in the dialog, copied, or discarded by closing the dialog, which
-    // is deleted only later and so is still found at shutdown.
-    for (const std::string handling : {"kept", "copied", "closed"}) {
+    // Kept in the dialog (signed, or only partially signed as one cosigner of
+    // a multisig input), copied, or discarded by closing the dialog, which is
+    // deleted only later and so is still found at shutdown.
+    for (const std::string handling : {"kept", "partial", "copied", "closed"}) {
         auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+        state->psbt_partial_signature = handling == "partial";
         DialogFixture fixture{*m_context->client_model, m_context->platform_style.get(), state};
         fixture.dialog->show();
         fixture.dialog->signTransaction();
-        QVERIFY(WaitUntil([&] { return fixture.statusLabel()->text().contains(QStringLiteral("ready to broadcast")); }));
+        const QString done{handling == "partial" ? QStringLiteral("Could not sign any more inputs") : QStringLiteral("ready to broadcast")};
+        QVERIFY(WaitUntil([&] { return fixture.statusLabel()->text().contains(done); }));
         if (handling == "copied") fixture.dialog->copyToClipboard();
         if (handling == "closed") QVERIFY(WaitUntil([&] { return fixture.dialog->close(); }));
 
@@ -625,6 +658,16 @@ void PSBTOperationsDialogTests::shutdownLogsUnexportedSignedPSBT()
         fixture.dialog->prepareForShutdown();
         if (handling == "kept") {
             VerifyUnshownPSBTSaved(log.find({closed}), files_before, SerializePSBT(SyntheticSignedPSBT(fixture.original_psbt)));
+        } else if (handling == "partial") {
+            // The partial signature uses a fresh key, so compare against the
+            // PSBT the wallet produced.
+            PartiallySignedTransaction produced;
+            {
+                std::lock_guard lock{state->mutex};
+                produced = state->psbt_signed_result;
+            }
+            QVERIFY(!produced.inputs.front().partial_sigs.empty());
+            VerifyUnshownPSBTSaved(log.find({closed}), files_before, SerializePSBT(produced));
         } else {
             QVERIFY2(log.find({closed}).empty(), handling.c_str());
             QVERIFY2(NewUnshownPSBTFiles(files_before).empty(), handling.c_str());

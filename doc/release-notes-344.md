@@ -9,8 +9,10 @@ by then, so qbit-qt writes the outcome to `debug.log`, including the signature
 counts, limit states and warnings of each PQC key used, and saves a signed PSBT
 to the data directory as `unshown-psbt-<txid>-<time>.psbt`, where File > Load
 PSBT can open it. The log line names the file; the PSBT itself is not written
-to the log. A PSBT that the dialog signed but that was not copied, saved or
-broadcast before shutdown is saved the same way.
+to the log. This includes a partial signature added to a multisig input, which
+consumes a counter without completing the input. A PSBT that the dialog signed
+but that was not copied, saved or broadcast before shutdown is saved the same
+way.
 
 The PSBT dialog can no longer be closed while it is signing, which used to
 block the GUI until the signing finished and discard its result. After Cancel,
