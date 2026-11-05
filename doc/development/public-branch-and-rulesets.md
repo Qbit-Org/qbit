@@ -11,6 +11,7 @@ The public repository keeps a small branch surface:
 | --- | --- | --- |
 | `main` | Default public pull request target and active public integration branch. | Exists at public repository launch. |
 | `0.1.x` | Maintenance branch for v0.1.x testnet backports. | Create from the `v0.1.0-testnet4` tag target when the first v0.1.x patch, reset, or backport is needed. |
+| `1.0.0` | Release branch for the v1.0.0 mainnet line; changes targeting it run the mainnet publication posture checks. | Exists. |
 | `1.x.x` | Maintenance branch for v1.x backports. | Create from the applicable v1 release tag when the first v1.x patch or backport is needed. |
 | `1.1.0` | Release line for v1.1.0. Signature rule only (full protection tracked separately). | Exists. |
 | `0.2.x` | Future maintenance/development line after v0.2.x opens. | Do not create during v0.1.x launch unless maintainers explicitly open that line. |

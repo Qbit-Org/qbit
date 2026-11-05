@@ -67,7 +67,7 @@ The publisher validates:
   signature verification as exactly `verified=true` and `reason=valid`
 - the tag signer is accepted by the qbit release key policy
 - `trusted_release_ref` is a full public commit SHA and is not the tag object or
-  tag target commit, and the tag target is its ancestor
+  tag target commit, and the tag target is on its first-parent history
 - the trusted qbit checkout and pinned `qbit-guix.sigs` checkout are clean, and
   the latter commit is public and reachable from its configured public branch
 - staged artifacts match `SHA256SUMS`

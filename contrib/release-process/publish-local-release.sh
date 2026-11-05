@@ -1013,8 +1013,12 @@ TAG_TARGET="$(git -C "$TRUSTED_ROOT" rev-parse -q --verify "$TAG_OBJECT^{commit}
     || die "--trusted-release-ref must not equal the release tag object"
 [ "$(lowercase "$TRUSTED_RELEASE_REF")" != "$(lowercase "$TAG_TARGET")" ] \
     || die "--trusted-release-ref must not equal the release tag target"
-git -C "$TRUSTED_ROOT" merge-base --is-ancestor "$TAG_TARGET" "$TRUSTED_RELEASE_REF" \
-    || die "Release tag target $TAG_TARGET must be an ancestor of trusted release ref $TRUSTED_RELEASE_REF"
+# Under merge commits, an ancestor may be a merged pull request's second-parent
+# head, whose tree the trusted branch never had; require a first-parent state.
+git -C "$TRUSTED_ROOT" rev-list --first-parent "$TRUSTED_RELEASE_REF" \
+    | awk -v target="$(lowercase "$TAG_TARGET")" \
+        '$0 == target { found = 1 } END { exit !found }' \
+    || die "Release tag target $TAG_TARGET must be on the first-parent history of trusted release ref $TRUSTED_RELEASE_REF"
 
 GH_REPO_PATH="$(github_repo_path "$GH_REPO")"
 GUIX_SIGS_GH_REPO_PATH="$(github_repo_path "$GUIX_SIGS_GH_REPO")"
