@@ -181,10 +181,17 @@ gh api \
 Apply the merge-commit and signed-commit templates in the order below. GitHub
 blocks a merge when the methods a branch ruleset allows and the methods the
 repository enables do not overlap, so this order keeps pull requests mergeable
-at every step:
+at every step.
+
+Until step 4 disables squash merging, GitHub still accepts a squash merge of a
+pull request with unsigned commits, because it signs the squash commit itself.
+Run steps 1 to 4 back to back, with no merges in between: signature enforcement
+is real only after step 4.
 
 1. Import `.github/rulesets/signed-commits.json` as a new ruleset. Confirm that
-   it has no bypass actors and that its enforcement is `active`.
+   it has no bypass actors and that its enforcement is `active`, and record its
+   ID, the number at the end of the ruleset's settings URL. The checks in step 5
+   and in [Rolling Back](#rolling-back) use it.
 2. In Settings → General → Pull Requests, tick **Allow merge commits**. Leave
    squash merging enabled for now.
 3. Edit each existing branch ruleset (`main`, `0.1.x`, `1.0.0`, and `1.x.x`):
@@ -241,15 +248,22 @@ branch rulesets and the repository allow, so merges never freeze:
    history".
 4. Untick **Allow merge commits**.
 5. Verify the rolled-back state with the assertions below. A non-zero exit
-   means stop: a step did not apply.
+   means stop: a step did not apply. The per-branch assertions that no
+   `required_signatures` rule applies are the real check, whichever ruleset
+   carried the rule. The first assertion looks up the `signed-commits` ruleset
+   by the ID recorded at apply time, across every page of rulesets, and
+   requires that it still exists and is disabled, so it does not depend on the
+   ruleset's name: a renamed ruleset that is still active fails it, and so does
+   a deleted one.
 
    ```sh
    (
      set -euo pipefail
      repo=Qbit-Org/qbit
-     gh api "repos/${repo}/rulesets" | jq -e '
-       all(.[] | select(.name == "signed-commits");
-           .enforcement == "disabled")'
+     ruleset_id=<signed-commits-id>
+     gh api --paginate "repos/${repo}/rulesets" |
+       jq -e -s --argjson id "${ruleset_id}" '
+         add | any(.[]; .id == $id and .enforcement == "disabled")'
      gh api "repos/${repo}" | jq -e '
        .allow_merge_commit == false and .allow_squash_merge == true
        and .allow_rebase_merge == true'
@@ -359,19 +373,25 @@ fork pull requests by design:
   maintainer re-imports the subtree in a branch of this repository.
 
 In repositories that merge with merge commits,
-`squash-sign merge --admin-approvals` merges with `--admin` and zero approvals.
-On GitHub's server, `--admin` also bypasses the `Required Merge Gate` and every
-other rule in the branch rulesets that list `OrganizationAdmin` as a bypass
-actor, so `squash-sign` enforces the checks below on the client side only. Merging this way is an operator decision (G8). It merges only
-when all of these checks pass:
+`squash-sign merge --admin-approvals` acts on the pull request's review
+decision:
+
+- `CHANGES_REQUESTED`: it always refuses.
+- `APPROVED`, or no review required: it merges without `--admin`, so GitHub
+  enforces every rule on its server.
+- `REVIEW_REQUIRED`: it merges with `--admin` and zero approvals. On GitHub's
+  server, `--admin` also bypasses the `Required Merge Gate` and every other
+  rule in the branch rulesets that list `OrganizationAdmin` as a bypass actor,
+  so `squash-sign` enforces the checks below on the client side only. Merging
+  this way is an operator decision (G8).
+
+It passes `--admin` only when all of these checks pass:
 
 - The repository allows merge commits only.
 - `squash-sign verify` passes.
 - Every required status check is green, including checks bound to a GitHub App,
   where the check's `app.id` must match the required integration, and the
   branch is up to date with its base where the ruleset requires that.
-- The review decision is `REVIEW_REQUIRED`, and no review is
-  `CHANGES_REQUESTED`.
 - `--admin` would skip no other rule: no review thread is unresolved, and no
   rule for required deployments, code scanning, or a merge queue applies.
 

@@ -185,13 +185,6 @@ tag's signature and name, a downgrade, and any downstream delta the release
 would drop. It then runs `test/lint/libbitcoinpqc-subtree-check.sh` and undoes
 the import commit if the check fails or the helper is interrupted first.
 
-Limitation: the helper's `git subtree pull --squash` (or `add`) creates a
-squash commit that holds only the subtree, plus a merge, and the lint rejects
-that shape because the newest `git-subtree-dir` commit must contain
-`src/libbitcoinpqc`. Import a qbit release as one main-line commit with
-`git-subtree-dir` and `git-subtree-split` trailers instead, as described in the
-runbook below.
-
 The default source is
 `https://github.com/Qbit-Org/qbit-libbitcoinpqc.git` tag `v0.3.2`. For the
 checks, the flags and the delta review, see
