@@ -763,8 +763,12 @@ void SendCoinsDialog::prepareTransactionFinished(uint64_t generation, std::share
     const bool always_show_unsigned{model->getOptionsModel()->getEnablePSBTControls()};
     auto confirmationDialog = new SendConfirmationDialog(confirmation, question_string, informative_text, detailed_text, SEND_CONFIRM_DELAY, enable_send, always_show_unsigned, this);
     confirmationDialog->setAttribute(Qt::WA_DeleteOnClose);
+    QPointer<SendCoinsDialog> dialog{this};
     // TODO: Replace QDialog::exec() with safer QDialog::show().
     const auto retval = static_cast<QMessageBox::StandardButton>(confirmationDialog->exec());
+    // A shutdown that starts during the nested event loop deletes the wallet
+    // views, and this dialog with them, before exec() returns.
+    if (!dialog) return;
 
     finishSendWithPreparedTransaction(retval);
 }
@@ -971,7 +975,9 @@ void SendCoinsDialog::finishSendWithPreparedTransaction(QMessageBox::StandardBut
             status);
     };
 
-    if(retval != QMessageBox::Yes && retval != QMessageBox::Save)
+    // The model can go away while the confirmation runs its nested event
+    // loop, as it can during the preparation. Nothing can be sent without it.
+    if (!model || (retval != QMessageBox::Yes && retval != QMessageBox::Save))
     {
         fNewRecipientAllowed = true;
         m_current_transaction.reset();

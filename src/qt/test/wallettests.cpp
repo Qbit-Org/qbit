@@ -2749,6 +2749,76 @@ void TestSendRequestExceptionReleasesSend(interfaces::Node& node)
     VerifyNoSendConfirmation();
 }
 
+//! BitcoinApplication::requestShutdown() deletes the wallet views, and the
+//! send dialogs they own, from whatever nested event loop is running, for
+//! example when the stop RPC or SIGTERM arrives while a send confirmation is
+//! open. Destroy the dialog, or only its model, from the confirmation's nested
+//! event loop. Nothing may be sent, and nothing may use the destroyed object:
+//! without the fix, an ASan build reports a heap-use-after-free of the dialog,
+//! and confirming without a model dereferences a null pointer.
+void TestSendDestructionDuringConfirmation(interfaces::Node& node, bool destroy_dialog)
+{
+    TestChain100Setup test{ChainType::REGTEST, {.extra_args = {"-p2mronly=0"}}};
+    // The confirmation text asks the wallet loader whether several wallets are loaded.
+    auto wallet_loader = interfaces::MakeWalletLoader(*test.m_node.chain, *Assert(test.m_node.args));
+    test.m_node.wallet_loader = wallet_loader.get();
+    node.setContext(&test.m_node);
+
+    std::unique_ptr<const PlatformStyle> platform_style{PlatformStyle::instantiate("other")};
+    MiniGUI mini_gui{node, platform_style.get()};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    mini_gui.initModel(qt_test::MakeSyntheticWallet(wallet::PQCUsageReport{}, state), platform_style.get());
+    mini_gui.walletModel->pollBalanceChanged();
+
+    // Allocate the dialog separately, as a wallet view does, so it can be deleted.
+    auto owned_dialog{std::make_unique<SendCoinsDialog>(platform_style.get())};
+    QPointer<SendCoinsDialog> send_dialog{owned_dialog.get()};
+    send_dialog->setModel(mini_gui.walletModel.get());
+    QSignalSpy coins_sent{send_dialog.data(), &SendCoinsDialog::coinsSent};
+    QVERIFY(coins_sent.isValid());
+    QPointer<WalletModel> model_guard{mini_gui.walletModel.get()};
+
+    // Deleting the dialog deletes the confirmation, its child, so nothing is
+    // left to click. With only the model destroyed, confirm the send.
+    QTimer driver;
+    driver.setInterval(20);
+    if (destroy_dialog) {
+        QObject::connect(&driver, &QTimer::timeout, [&] {
+            for (QWidget* widget : QApplication::topLevelWidgets()) {
+                if (widget->inherits("SendConfirmationDialog") && widget->isVisible()) {
+                    driver.stop();
+                    owned_dialog.reset();
+                    return;
+                }
+            }
+        });
+        driver.start();
+    } else {
+        ConfirmSend(nullptr, QMessageBox::Yes, [&mini_gui] { mini_gui.walletModel.reset(); });
+    }
+
+    ClickSend(*send_dialog);
+    QVERIFY(WaitUntil([&] {
+        return (destroy_dialog ? send_dialog.isNull() : model_guard.isNull()) && !QApplication::activeModalWidget();
+    }, 30000));
+    driver.stop();
+    QCoreApplication::processEvents();
+
+    QCOMPARE(coins_sent.count(), 0);
+    VerifyNoSendConfirmation();
+    if (destroy_dialog) return;
+
+    // The send is no longer in flight: a pasted recipient is accepted again.
+    QVBoxLayout* const entries{send_dialog->findChild<QVBoxLayout*>("entries")};
+    QVERIFY(entries);
+    QCOMPARE(entries->count(), 1);
+    SendCoinsRecipient recipient;
+    recipient.address = QString::fromStdString(EncodeDestination(PKHash{}));
+    recipient.amount = COIN;
+    send_dialog->pasteEntry(recipient);
+    QCOMPARE(entries->count(), 2);
+}
+
 void TestSendFailureShowsAllConsumedKeys(interfaces::Node& node)
 {
     const CPQCPubKey normal_key{NewPQCPubKey()};
@@ -4333,6 +4403,8 @@ void WalletTests::walletTests()
     TestSendPageActivationWhileConfirming(m_node, QStringLiteral("sendButton"));
     TestSendPageActivationWhileConfirming(m_node, QStringLiteral("clearButton"));
     TestSendRequestExceptionReleasesSend(m_node);
+    TestSendDestructionDuringConfirmation(m_node, /*destroy_dialog=*/true);
+    TestSendDestructionDuringConfirmation(m_node, /*destroy_dialog=*/false);
     TestUnlockContextModelLifetime(m_node);
     TestCanGetAddressesNotificationIsQueued(m_node);
     TestSendPQCWarningFormatting();
