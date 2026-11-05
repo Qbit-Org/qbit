@@ -360,10 +360,10 @@ void PSBTOperationsDialogTests::canceledUnlockDoesNotStartSigning()
     QCOMPARE(SerializePSBT(clipboard_psbt), original);
 }
 
-//! Press Sign through accessibility, and call its slot, while the passphrase
-//! dialog of the first Sign is open on an encrypted, locked wallet. Exactly one
-//! signing attempt may run, the wallet may not be relocked under it, and its
-//! thread may not be left behind.
+//! Press Sign through accessibility just before the first Sign and while its
+//! passphrase dialog is open on an encrypted, locked wallet, and call its slot
+//! there. Exactly one signing attempt may run, the wallet may not be relocked
+//! under it, and its thread may not be left behind.
 void PSBTOperationsDialogTests::signDuringUnlockPromptIsIgnored()
 {
     auto state{std::make_shared<qt_test::SyntheticWalletState>()};
@@ -379,8 +379,13 @@ void PSBTOperationsDialogTests::signDuringUnlockPromptIsIgnored()
     // A modal dialog's nested event loop stands in for the passphrase dialog.
     // A nested prompt, which only a second attempt could open, unlocks at once.
     int prompts{0};
+    bool in_prompt{false};
+    int clicks_in_prompt{0};
     bool pressed{false};
     bool disabled_during_prompt{false};
+    QObject::connect(sign_button, &QAbstractButton::clicked, sign_button, [&] {
+        if (in_prompt) ++clicks_in_prompt;
+    });
     QObject::connect(fixture.wallet_model.get(), &WalletModel::requireUnlock, fixture.wallet_model.get(), [&] {
         if (++prompts == 1) {
             QDialog passphrase;
@@ -389,16 +394,24 @@ void PSBTOperationsDialogTests::signDuringUnlockPromptIsIgnored()
                 disabled_during_prompt = fixture.signingControlsDisabled();
                 pressed = PressThroughAccessibility(sign_button);
                 fixture.dialog->signTransaction();
-                // The accessible press clicks after a delay; leave time for it.
+                // Leave time for the click armed before the prompt opened.
                 QTimer::singleShot(500, &passphrase, &QDialog::accept);
             });
+            in_prompt = true;
             passphrase.exec();
+            in_prompt = false;
         }
         UnlockSyntheticWallet(state);
     });
 
+    // An accessible press clicks after a delay, so one made just before Sign
+    // is clicked clicks it again inside the prompt, after Sign was disabled.
+    // Only the in-flight guard stops that click. The press made inside the
+    // prompt finds Sign disabled and clicks nothing.
+    QVERIFY(PressThroughAccessibility(sign_button));
     sign_button->click();
     QVERIFY(pressed);
+    QCOMPARE(clicks_in_prompt, 1);
     QCOMPARE(prompts, 1);
     QVERIFY(disabled_during_prompt);
 
