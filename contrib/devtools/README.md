@@ -173,29 +173,3 @@ Example usage:
 
     cd .../src
     ../contrib/devtools/circular-dependencies.py {*,*/*,*/*/*}.{h,cpp}
-
-update-libbitcoinpqc-subtree.sh
-===============================
-
-Updates the `src/libbitcoinpqc` subtree from the pinned upstream release tag,
-then runs `test/lint/libbitcoinpqc-subtree-check.sh` to verify that the vendored
-tree and recorded `git-subtree-split` match the peeled tag commit.
-
-The default source is
-`https://github.com/Qbit-Org/qbit-libbitcoinpqc.git` tag `v0.3.0`. For the
-full release-tag import workflow, see
-[`doc/subtrees/libbitcoinpqc.md`](../../doc/subtrees/libbitcoinpqc.md).
-
-Run from the repository root:
-
-```bash
-contrib/devtools/update-libbitcoinpqc-subtree.sh
-```
-
-Optional overrides:
-
-```bash
-LIBBITCOINPQC_REMOTE_URL=git@github.com:Qbit-Org/qbit-libbitcoinpqc.git \
-LIBBITCOINPQC_REMOTE_REF=v0.3.0 \
-contrib/devtools/update-libbitcoinpqc-subtree.sh
-```

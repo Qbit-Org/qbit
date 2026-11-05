@@ -33,6 +33,6 @@ Choose exactly one:
 
 - [ ] Source commit is reachable from an immutable release tag in `Qbit-Org/qbit-libbitcoinpqc`.
 - [ ] qbit imports the tagged upstream tree directly without pruning or a curated subtree branch.
-- [ ] Subtree import/update was performed with `contrib/devtools/update-libbitcoinpqc-subtree.sh`.
+- [ ] Subtree import/update is one main-line import commit, made as described in "Import Or Refresh The Subtree" in `doc/subtrees/libbitcoinpqc.md`.
 - [ ] `test/lint/libbitcoinpqc-subtree-check.sh` passes locally.
-- [ ] Any default tag change in `contrib/devtools/update-libbitcoinpqc-subtree.sh` is intentional and matches `doc/subtrees/libbitcoinpqc.md`.
+- [ ] Any pin change updates every location listed in `doc/subtrees/libbitcoinpqc.md` and is intentional.
