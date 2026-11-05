@@ -94,6 +94,9 @@ private:
     //! Releases a held wallet worker if the scenario does not.
     std::thread m_latch_release;
     int m_shutdown_requests{0};
+    int m_windows_shown{0};
+    //! Set once the requests made during the node shutdown have been sent.
+    bool m_shutdown_probed{false};
     int m_coins_sent{0};
     bool m_flow_finished{false};
 };

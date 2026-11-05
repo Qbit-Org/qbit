@@ -338,8 +338,9 @@ void BitcoinApplication::requestShutdown()
     // Shutdown deletes the wallet views. The platform's Quit event, and
     // File > Exit pressed through accessibility, can arrive while the user is
     // still in a dialog whose nested event loop would return into them, so
-    // retry once every such dialog has closed.
-    if (GUIUtil::IsUserInteractionPending()) {
+    // retry once every such dialog has closed. A Quit event can also arrive
+    // before GuiMain has created the main window, during the Intro dialog.
+    if (!window || GUIUtil::IsUserInteractionPending()) {
         if (!m_deferred_shutdown_timer->isActive()) {
             qDebug() << __func__ << ": Deferring shutdown until no dialog is open";
             m_deferred_shutdown_timer->start(SHUTDOWN_POLLING_DELAY);
@@ -414,6 +415,10 @@ void BitcoinApplication::requestShutdown()
 void BitcoinApplication::initializeResult(bool success, interfaces::BlockAndHeaderTipInfo tip_info)
 {
     qDebug() << __func__ << ": Initialization result: " << success;
+
+    // A quit during initialization has already shut the GUI down, and the
+    // node shutdown it requested runs next, so do not set the GUI up again.
+    if (m_shutdown_started) return;
 
     if (success) {
         delete m_splash;

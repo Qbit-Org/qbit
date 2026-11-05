@@ -195,6 +195,9 @@ void QuitModalTests::quitDuringDialog_data()
     QTest::newRow("unload-under-progress") << QStringLiteral("unload-under-progress");
     // Popups that run no nested event loop do not hold a quit up.
     QTest::newRow("popups") << QStringLiteral("popups");
+    // A platform Quit before the main window exists, as during the Intro
+    // dialog, waits for the window and then shuts down during startup.
+    QTest::newRow("before-window") << QStringLiteral("before-window");
 }
 
 void QuitModalTests::quitDuringDialog()
@@ -236,15 +239,24 @@ void QuitModalScenario::quitDuringDialog()
     QVERIFY(m_app.createOptionsModel(/*resetSettings=*/true));
     QScopedPointer<const NetworkStyle> style(NetworkStyle::instantiate(Params().GetChainType()));
     m_app.setupPlatformStyle();
+    if (m_scenario == "before-window") {
+        sendQuitEvent();
+        m_flow_finished = true;
+    }
     m_app.createWindow(style.data());
+    connect(&m_app, &BitcoinApplication::windowShown, this, [this] { ++m_windows_shown; });
     connect(&m_app, &BitcoinApplication::windowShown, this, &QuitModalScenario::start);
     connect(&m_app, &BitcoinApplication::requestedShutdown, this, [this] {
         if (++m_shutdown_requests > 1) return;
-        // Another platform Quit, or File > Exit as the tray menu's Exit
-        // triggers it, while the node stops must not start a second shutdown.
         QTimer::singleShot(0, this, [this] {
+            // Another platform Quit, or File > Exit as the tray menu's Exit
+            // triggers it, while the node stops must not start a second
+            // shutdown. Nor may a successful result of an initialization that
+            // a quit during startup interrupted set the GUI up again.
             sendQuitEvent();
             triggerQuitAction();
+            m_app.initializeResult(/*success=*/true, interfaces::BlockAndHeaderTipInfo{});
+            m_shutdown_probed = true;
         });
     });
     QVERIFY(m_app.baseInitialize());
@@ -253,7 +265,10 @@ void QuitModalScenario::quitDuringDialog()
     if (m_latch_release.joinable()) m_latch_release.join();
 
     QVERIFY2(m_flow_finished, "The scenario did not reach its last step");
+    QVERIFY2(m_shutdown_probed, "The node shutdown ended before the second quit was sent");
     QCOMPARE(m_shutdown_requests, 1);
+    // A quit before the window exists usually ends startup before it shows.
+    if (m_scenario != "before-window") QCOMPARE(m_windows_shown, 1);
     QVERIFY(!m_view);
     QVERIFY(!m_model);
     // Only the PQC warning scenario confirms a send; the others cancel.
@@ -274,6 +289,8 @@ void QuitModalScenario::quitDuringDialog()
 void QuitModalScenario::start(BitcoinGUI* window)
 {
     m_window = window;
+    // The quit made before the window existed is still waiting to run.
+    if (m_scenario == "before-window") return;
     for (QAction* action : window->findChildren<QAction*>()) {
         if (action->parent() == window && action->menuRole() == QAction::QuitRole) m_quit_action = action;
     }
