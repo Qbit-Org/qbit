@@ -20,15 +20,18 @@
 #include <streams.h>
 #include <test/util/setup_common.h>
 #include <tinyformat.h>
+#include <util/check.h>
 #include <util/fs.h>
 #include <util/strencodings.h>
 #include <util/translation.h>
 #include <wallet/pqc_usage.h>
 
+#include <algorithm>
 #include <chrono>
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -36,10 +39,13 @@
 #include <utility>
 #include <vector>
 
+#include <QAbstractButton>
+#include <QAccessible>
 #include <QApplication>
 #include <QClipboard>
 #include <QCloseEvent>
 #include <QCoreApplication>
+#include <QDialog>
 #include <QElapsedTimer>
 #include <QEventLoop>
 #include <QLabel>
@@ -49,6 +55,7 @@
 #include <QPushButton>
 #include <QSignalSpy>
 #include <QTextEdit>
+#include <QThread>
 #include <QTimer>
 
 namespace {
@@ -216,6 +223,21 @@ public:
     }
 
     QLabel* statusLabel() const { return dialog->findChild<QLabel*>(QStringLiteral("statusBar")); }
+    QAbstractButton* button(const char* name) const { return dialog->findChild<QAbstractButton*>(QLatin1String(name)); }
+    //! Whether Sign, Copy and Save are enabled, for the dialog's unsigned PSBT.
+    bool signingControlsEnabled() const
+    {
+        return button("signTransactionButton")->isEnabled() &&
+               button("copyToClipboardButton")->isEnabled() &&
+               button("saveButton")->isEnabled();
+    }
+    bool signingControlsDisabled() const
+    {
+        return !button("signTransactionButton")->isEnabled() &&
+               !button("copyToClipboardButton")->isEnabled() &&
+               !button("saveButton")->isEnabled() &&
+               !button("broadcastTransactionButton")->isEnabled();
+    }
     QTextEdit* description() const { return dialog->findChild<QTextEdit*>(QStringLiteral("transactionDescription")); }
 
     std::shared_ptr<qt_test::SyntheticWalletState> state;
@@ -223,6 +245,56 @@ public:
     std::unique_ptr<WalletModel> wallet_model;
     std::unique_ptr<PSBTOperationsDialog> dialog;
 };
+
+//! Press a button through its accessibility action, as VoiceOver or a UI
+//! automation client does. Unlike mouse and keyboard input, this reaches
+//! widgets in windows that a modal dialog blocks.
+bool PressThroughAccessibility(QAbstractButton* button)
+{
+    QAccessibleInterface* const iface{QAccessible::queryAccessibleInterface(button)};
+    if (!iface || !iface->actionInterface()) return false;
+    iface->actionInterface()->doAction(QAccessibleActionInterface::pressAction());
+    return true;
+}
+
+//! Record every thread that signs, to check that the dialog deletes each one.
+//! Declare it before the fixture, so it outlives the signing threads.
+class SignThreadRecorder
+{
+public:
+    explicit SignThreadRecorder(std::shared_ptr<qt_test::SyntheticWalletState> state)
+        : m_state{std::move(state)}
+    {
+        std::lock_guard lock{m_state->mutex};
+        m_state->psbt_sign_started = [this] {
+            std::lock_guard threads_lock{m_mutex};
+            m_threads.emplace_back(QThread::currentThread());
+        };
+    }
+    ~SignThreadRecorder()
+    {
+        std::lock_guard lock{m_state->mutex};
+        m_state->psbt_sign_started = nullptr;
+    }
+
+    bool allDeleted() const
+    {
+        std::lock_guard lock{m_mutex};
+        return std::ranges::all_of(m_threads, [](const QPointer<QThread>& thread) { return thread.isNull(); });
+    }
+
+private:
+    const std::shared_ptr<qt_test::SyntheticWalletState> m_state;
+    mutable std::mutex m_mutex;
+    std::vector<QPointer<QThread>> m_threads;
+};
+
+//! Stand in for the passphrase dialog: unlock the wallet as it does.
+void UnlockSyntheticWallet(const std::shared_ptr<qt_test::SyntheticWalletState>& state)
+{
+    std::lock_guard lock{state->mutex};
+    state->locked = false;
+}
 } // namespace
 
 struct PSBTOperationsDialogTests::Context {
@@ -276,6 +348,8 @@ void PSBTOperationsDialogTests::canceledUnlockDoesNotStartSigning()
     QCOMPARE(ReadState(state, [](const auto& value) { return value.psbt_sign_calls; }), 0);
     QCOMPARE(display_updates.count(), 0);
     QVERIFY(!fixture.dialog->findChild<QProgressDialog*>(QStringLiteral("psbtSigningProgressDialog")));
+    // The canceled attempt is released, so Sign can be pressed again.
+    QVERIFY(fixture.signingControlsEnabled());
 
     fixture.dialog->copyToClipboard();
     const auto decoded{DecodeBase64(QApplication::clipboard()->text().toStdString())};
@@ -284,6 +358,120 @@ void PSBTOperationsDialogTests::canceledUnlockDoesNotStartSigning()
     std::string error;
     QVERIFY(DecodeRawPSBT(clipboard_psbt, MakeByteSpan(*decoded), error));
     QCOMPARE(SerializePSBT(clipboard_psbt), original);
+}
+
+//! Press Sign through accessibility, and call its slot, while the passphrase
+//! dialog of the first Sign is open on an encrypted, locked wallet. Exactly one
+//! signing attempt may run, the wallet may not be relocked under it, and its
+//! thread may not be left behind.
+void PSBTOperationsDialogTests::signDuringUnlockPromptIsIgnored()
+{
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    state->encrypted = true;
+    state->locked = true;
+    state->allow_psbt_reservation = false;
+    const SignThreadRecorder sign_threads{state};
+    DialogFixture fixture{*m_context->client_model, m_context->platform_style.get(), state};
+    QAbstractButton* const sign_button{fixture.button("signTransactionButton")};
+    QVERIFY(sign_button);
+    QVERIFY(fixture.signingControlsEnabled());
+
+    // A modal dialog's nested event loop stands in for the passphrase dialog.
+    // A nested prompt, which only a second attempt could open, unlocks at once.
+    int prompts{0};
+    bool pressed{false};
+    bool disabled_during_prompt{false};
+    QObject::connect(fixture.wallet_model.get(), &WalletModel::requireUnlock, fixture.wallet_model.get(), [&] {
+        if (++prompts == 1) {
+            QDialog passphrase;
+            passphrase.setWindowModality(Qt::ApplicationModal);
+            QTimer::singleShot(0, &passphrase, [&] {
+                disabled_during_prompt = fixture.signingControlsDisabled();
+                pressed = PressThroughAccessibility(sign_button);
+                fixture.dialog->signTransaction();
+                // The accessible press clicks after a delay; leave time for it.
+                QTimer::singleShot(500, &passphrase, &QDialog::accept);
+            });
+            passphrase.exec();
+        }
+        UnlockSyntheticWallet(state);
+    });
+
+    sign_button->click();
+    QVERIFY(pressed);
+    QCOMPARE(prompts, 1);
+    QVERIFY(disabled_during_prompt);
+
+    QVERIFY(WaitUntil([&] { return ReadState(state, [](const auto& value) { return value.psbt_sign_entered; }); }));
+    // Leave time for a second attempt, had one started, to reach the wallet.
+    QTest::qWait(200);
+    QCOMPARE(ReadState(state, [](const auto& value) { return value.psbt_sign_calls; }), 1);
+    QVERIFY(ReadState(state, [](const auto& value) { return !value.locked && value.lock_calls == 0; }));
+    QVERIFY(fixture.signingControlsDisabled());
+
+    fixture.releaseWorker();
+    QVERIFY(WaitUntil([&] { return fixture.statusLabel()->text().contains(QStringLiteral("ready to broadcast")); }));
+    QVERIFY(ReadState(state, [](const auto& value) {
+        return value.psbt_sign_calls == 1 && value.locked && value.lock_calls == 1;
+    }));
+
+    // Every signing thread is deleted once the dialog is: the dialog never
+    // lost track of one.
+    fixture.dialog.reset();
+    QVERIFY(WaitUntil([&] { return sign_threads.allDeleted(); }));
+}
+
+//! An exception that escapes the unlock request must not leave Sign busy.
+void PSBTOperationsDialogTests::unlockExceptionReleasesSigning()
+{
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    state->encrypted = true;
+    state->locked = true;
+    DialogFixture fixture{*m_context->client_model, m_context->platform_style.get(), state};
+
+    // Throw on the first request and unlock the wallet on the next.
+    bool throw_on_unlock{true};
+    QObject::connect(fixture.wallet_model.get(), &WalletModel::requireUnlock, fixture.wallet_model.get(), [&] {
+        if (throw_on_unlock) {
+            throw_on_unlock = false;
+            throw NonFatalCheckError{"synthetic unlock failure", __FILE__, __LINE__, __func__};
+        }
+        UnlockSyntheticWallet(state);
+    });
+
+    QVERIFY_THROWS_EXCEPTION(NonFatalCheckError, fixture.dialog->signTransaction());
+    QVERIFY(!throw_on_unlock);
+    QVERIFY(fixture.signingControlsEnabled());
+    QVERIFY(!fixture.dialog->findChild<QProgressDialog*>(QStringLiteral("psbtSigningProgressDialog")));
+
+    fixture.dialog->signTransaction();
+    QVERIFY(WaitUntil([&] { return fixture.statusLabel()->text().contains(QStringLiteral("ready to broadcast")); }));
+    QVERIFY(ReadState(state, [](const auto& value) {
+        return value.psbt_sign_calls == 1 && value.locked && value.lock_calls == 1;
+    }));
+}
+
+//! The passphrase dialog's nested event loop can close and delete the PSBT
+//! dialog. Signing must not start, and the wallet must be relocked.
+void PSBTOperationsDialogTests::dialogDeletedDuringUnlockPrompt()
+{
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    state->encrypted = true;
+    state->locked = true;
+    DialogFixture fixture{*m_context->client_model, m_context->platform_style.get(), state};
+    QPointer<PSBTOperationsDialog> dialog_guard{fixture.dialog.get()};
+
+    QObject::connect(fixture.wallet_model.get(), &WalletModel::requireUnlock, fixture.wallet_model.get(), [&] {
+        UnlockSyntheticWallet(state);
+        fixture.dialog.reset();
+    });
+
+    dialog_guard->signTransaction();
+    QVERIFY(dialog_guard.isNull());
+    QCoreApplication::processEvents();
+    QVERIFY(ReadState(state, [](const auto& value) {
+        return value.psbt_sign_calls == 0 && value.locked && value.lock_calls == 1;
+    }));
 }
 
 void PSBTOperationsDialogTests::eventLoopResponsiveWhileSigningPaused()
@@ -715,6 +903,7 @@ void PSBTOperationsDialogTests::signingFailurePreservesOriginalPSBT()
     auto state{std::make_shared<qt_test::SyntheticWalletState>()};
     state->psbt_simulate_pqc_reservation = true;
     state->psbt_fail = true;
+    const SignThreadRecorder sign_threads{state};
     CPQCKey key;
     key.MakeNewKey();
     const wallet::PQCUsageReport pqc_usage{MakePQCUsageReport(key.GetPubKey(), 2)};
@@ -738,6 +927,13 @@ void PSBTOperationsDialogTests::signingFailurePreservesOriginalPSBT()
     std::string error;
     QVERIFY(DecodeRawPSBT(clipboard_psbt, MakeByteSpan(*decoded), error));
     QCOMPARE(SerializePSBT(clipboard_psbt), original);
+
+    // The failed attempt is released, so Sign starts another once its thread
+    // is gone.
+    QVERIFY(fixture.signingControlsEnabled());
+    QVERIFY(WaitUntil([&] { return sign_threads.allDeleted(); }));
+    fixture.dialog->signTransaction();
+    QVERIFY(WaitUntil([&] { return ReadState(state, [](const auto& value) { return value.psbt_sign_calls == 2; }); }));
 }
 
 void PSBTOperationsDialogTests::usageStatesOnSuccessAndFailure()

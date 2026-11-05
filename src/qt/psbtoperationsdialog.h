@@ -76,6 +76,8 @@ private:
     //! Outcome of the running signing attempt, until signTransactionFinished()
     //! takes it. The worker writes it; read it only after the worker reports.
     std::shared_ptr<SignResult> m_pending_sign_result;
+    //! Set from before the unlock request until the signing attempt finishes.
+    bool m_sign_active{false};
     uint64_t m_sign_generation{0};
     std::atomic_bool m_sign_cancel_requested{false};
     std::atomic_bool m_sign_counters_reserved{false};
@@ -95,6 +97,7 @@ private:
     QString renderTransaction(const PartiallySignedTransaction &psbtx);
     void showStatus(const QString &msg, StatusLevel level);
     void showTransactionStatus(const PartiallySignedTransaction &psbtx);
+    void startSignTransaction();
     void signTransactionProgress(uint64_t generation, SigningProgress progress);
     void signTransactionFinished(uint64_t generation, std::shared_ptr<SignResult> result);
     //! Report the outcome of an attempt the dialog can no longer show.

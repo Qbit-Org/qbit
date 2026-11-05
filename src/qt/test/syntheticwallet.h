@@ -113,6 +113,8 @@ struct SyntheticWalletState {
     PartiallySignedTransaction psbt_signed_result;
     int psbt_sign_calls{0};
     std::thread::id psbt_sign_thread;
+    //! Called on the signing thread when a signing fillPSBT() call starts.
+    std::function<void()> psbt_sign_started;
     int lock_calls{0};
     int unlock_calls{0};
     bool bump_enabled{false};
