@@ -69,6 +69,7 @@ private:
     void startPSBTSigning();
     void startUnloadUnderProgress();
     void startPopups();
+    void startUnloadRescanStop();
 
     //! Fill in a payment and press Send.
     void pressSend();

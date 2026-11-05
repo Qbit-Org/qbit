@@ -344,6 +344,15 @@ void BitcoinApplication::requestShutdown()
         if (!m_deferred_shutdown_timer->isActive()) {
             qDebug() << __func__ << ": Deferring shutdown until no dialog is open";
             m_deferred_shutdown_timer->start(SHUTDOWN_POLLING_DELAY);
+            // Show the user what the quit waits for. A quit that seems to
+            // be ignored invites a force quit, which skips the node's flush.
+            // Raise the dialog directly: on Wayland, GUIUtil::bringToFront()
+            // re-creates the window, and hiding a dialog ends its exec().
+            if (window && (window->isHidden() || window->isMinimized())) window->showNormalIfMinimized();
+            if (QWidget* const dialog{QApplication::activeModalWidget()}) {
+                dialog->raise();
+                dialog->activateWindow();
+            }
         }
         return;
     }

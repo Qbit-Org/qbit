@@ -63,8 +63,8 @@ constexpr auto STEP_TIMEOUT{60s};
 //! Long enough for a deferred shutdown to be retried several times.
 constexpr auto RETRY_SPAN{3 * SHUTDOWN_POLLING_DELAY};
 //! A build without the fix joins a held worker during shutdown. Release it
-//! after this long so such a run fails instead of hanging.
-constexpr auto LATCH_RELEASE_DELAY{10s};
+//! this long after the quit so such a run fails instead of hanging.
+constexpr auto LATCH_RELEASE_DELAY{30s};
 constexpr int CHILD_TIMEOUT_MS{300'000};
 const QString RESCAN_TITLE{QStringLiteral("Rescanning…")};
 
@@ -124,6 +124,15 @@ void ClickButton(QMessageBox* box, QMessageBox::StandardButton which)
     // The send confirmation enables its buttons after a countdown.
     button->setEnabled(true);
     button->click();
+}
+
+QProgressDialog* FindRescanProgress()
+{
+    for (QWidget* widget : QApplication::topLevelWidgets()) {
+        auto* const dialog{qobject_cast<QProgressDialog*>(widget)};
+        if (dialog && dialog->labelText() == RESCAN_TITLE) return dialog;
+    }
+    return nullptr;
 }
 
 PartiallySignedTransaction MakeUnsignedPSBT()
@@ -195,6 +204,9 @@ void QuitModalTests::quitDuringDialog_data()
     QTest::newRow("unload-under-progress") << QStringLiteral("unload-under-progress");
     // Popups that run no nested event loop do not hold a quit up.
     QTest::newRow("popups") << QStringLiteral("popups");
+    // A wallet unloaded under its rescan progress dialog must not leave the
+    // dialog open, or the shutdown poll would wait for it after RPC stop.
+    QTest::newRow("unload-rescan-stop") << QStringLiteral("unload-rescan-stop");
     // A platform Quit before the main window exists, as during the Intro
     // dialog, waits for the window and then shuts down during startup.
     QTest::newRow("before-window") << QStringLiteral("before-window");
@@ -313,11 +325,9 @@ void QuitModalScenario::start(BitcoinGUI* window)
         m_state->locked = true;
     } else if (m_scenario == "encryption") {
         m_state->allow_encrypt = false;
-        m_latch_release = ReleaseLater(m_state, &qt_test::SyntheticWalletState::allow_encrypt);
     } else if (m_scenario == "psbt-signing") {
         m_state->psbt_simulate_pqc_reservation = true;
         m_state->allow_psbt_completion = false;
-        m_latch_release = ReleaseLater(m_state, &qt_test::SyntheticWalletState::allow_psbt_completion);
     }
 
     auto* const activity{new AdoptionActivity(controller, window)};
@@ -346,6 +356,7 @@ void QuitModalScenario::start(BitcoinGUI* window)
         if (m_scenario == "psbt-signing") return startPSBTSigning();
         if (m_scenario == "unload-under-progress") return startUnloadUnderProgress();
         if (m_scenario == "popups") return startPopups();
+        if (m_scenario == "unload-rescan-stop") return startUnloadRescanStop();
         QTest::qFail(qPrintable(QStringLiteral("Unknown scenario %1").arg(m_scenario)), __FILE__, __LINE__);
         sendQuitEvent();
     });
@@ -355,8 +366,13 @@ void QuitModalScenario::start(BitcoinGUI* window)
 void QuitModalScenario::startSendConfirmation()
 {
     when("the send confirmation", [] { return FindConfirmation(); }, [this] {
+        // The user has switched away. The deferred quit shows the window
+        // and the dialog it waits for again.
+        m_window->showMinimized();
+        QUIT_CHECK(m_window->isMinimized());
         sendQuitEvent();
         expectDeferred("The platform Quit event");
+        QUIT_CHECK(!m_window->isMinimized());
         triggerQuitAction();
         expectDeferred("File > Exit");
         after(RETRY_SPAN, [this] {
@@ -464,6 +480,7 @@ void QuitModalScenario::startEncryption()
         // Returns once the encryption has started.
         prompt->accept();
         when("the encryption to start", [this] { return ReadState(m_state, [](const auto& s) { return s.encrypt_entered; }); }, [this] {
+            m_latch_release = ReleaseLater(m_state, &qt_test::SyntheticWalletState::allow_encrypt);
             sendQuitEvent();
             expectDeferred("The platform Quit event");
             after(RETRY_SPAN, [this] {
@@ -500,6 +517,7 @@ void QuitModalScenario::startPSBTSigning()
     }, [this, find_button] {
         find_button("signTransactionButton")->click();
         when("the signing counters", [this] { return ReadState(m_state, [](const auto& s) { return s.psbt_counters_reserved; }); }, [this, find_button] {
+            m_latch_release = ReleaseLater(m_state, &qt_test::SyntheticWalletState::allow_psbt_completion);
             sendQuitEvent();
             expectDeferred("The platform Quit event");
             after(RETRY_SPAN, [this, find_button] {
@@ -525,11 +543,7 @@ void QuitModalScenario::startUnloadUnderProgress()
 {
     when("the send confirmation", [] { return FindConfirmation(); }, [this] {
         Q_EMIT m_model->showProgress(RESCAN_TITLE, 0);
-        QProgressDialog* progress{nullptr};
-        for (QWidget* widget : QApplication::topLevelWidgets()) {
-            auto* const dialog{qobject_cast<QProgressDialog*>(widget)};
-            if (dialog && dialog->labelText() == RESCAN_TITLE) progress = dialog;
-        }
+        QProgressDialog* const progress{FindRescanProgress()};
         QUIT_CHECK(progress);
         if (!progress) {
             sendQuitEvent();
@@ -582,6 +596,30 @@ void QuitModalScenario::startPopups()
 
         sendQuitEvent();
         QUIT_CHECK(m_shutdown_requests == 1);
+        expectShutdown();
+    });
+}
+
+//! Unload a wallet while its rescan progress dialog is open, for example
+//! with unloadwallet, then stop the node as RPC stop or SIGTERM does. The
+//! dialog must not outlive its view, or the shutdown poll would wait for it.
+void QuitModalScenario::startUnloadRescanStop()
+{
+    Q_EMIT m_model->showProgress(RESCAN_TITLE, 0);
+    const QPointer<QProgressDialog> progress{FindRescanProgress()};
+    QUIT_CHECK(progress);
+    if (!progress) {
+        sendQuitEvent();
+        return;
+    }
+    // The dialog shows itself once the rescan has run for a while.
+    progress->show();
+    // A progress dialog alone does not hold the unload up.
+    Q_EMIT m_model->unload();
+    when("the unload", [this] { return !m_view && !m_model; }, [this, progress] {
+        QUIT_CHECK(!progress || !progress->isVisible());
+        QUIT_CHECK(QApplication::activeModalWidget() == nullptr);
+        m_app.node().startShutdown();
         expectShutdown();
     });
 }
