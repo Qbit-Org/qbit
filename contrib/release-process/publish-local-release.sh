@@ -149,7 +149,8 @@ Repository overrides:
   --repo OWNER/REPO                 Default: Qbit-Org/qbit.
   --trusted-release-branch BRANCH   Protected branch that carries the trusted
                                      release ref. Default: main; a release line
-                                     passes its own branch, such as 1.x.x.
+                                     passes its own branch, such as 1.x.x. GitHub
+                                     must report it as protected.
   --guix-sigs-github-repo OWNER/REPO
                                      Default: Qbit-Org/qbit-guix.sigs.
   --guix-sigs-branch BRANCH         Default: main.
@@ -416,21 +417,30 @@ remote_commit() {
 }
 
 fetch_branch_tip() {
-    # Prints the tip of a GitHub branch after fetching it into a local checkout
-    # and checking that it is the tip GitHub's API reports, so its first-parent
-    # history can be read locally.
+    # Prints the tip of a protected GitHub branch after fetching exactly that
+    # commit into a local checkout, so its first-parent history can be read
+    # locally. Fetching the SHA the API reported, not the moving branch, keeps a
+    # merge that lands meanwhile from breaking the release partway. gh's
+    # credential helper lets the fetch reach a private repository.
     local root="$1"
     local repository="$2"
     local branch="$3"
     local label="$4"
+    local branch_info
     local api_tip
+    local protected
     local fetched_tip
-    api_tip="$(gh api "repos/$repository/branches/$branch" --jq '.commit.sha')" \
-        || die "Could not read $label branch $repository:$branch"
+    branch_info="$(
+        gh api "repos/$repository/branches/$branch" \
+            --jq '[.commit.sha, (.protected | tostring)] | @tsv'
+    )" || die "Could not read $label branch $repository:$branch"
+    IFS=$'\t' read -r api_tip protected <<<"$branch_info"
     require_full_sha "$label branch tip" "$api_tip"
-    git -C "$root" fetch --quiet --no-tags "https://github.com/$repository.git" \
-        "refs/heads/$branch" \
-        || die "Could not fetch $repository:$branch into $root"
+    [ "$protected" = true ] \
+        || die "$label branch $repository:$branch is not protected (protected=$protected)"
+    git -C "$root" -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
+        fetch --quiet --no-tags "https://github.com/$repository.git" "$api_tip" \
+        || die "Could not fetch $repository:$branch tip $api_tip into $root"
     fetched_tip="$(git -C "$root" rev-parse --verify FETCH_HEAD)"
     [ "$(lowercase "$fetched_tip")" = "$(lowercase "$api_tip")" ] \
         || die "$label branch $repository:$branch fetched $fetched_tip, but GitHub reports $api_tip"
@@ -793,6 +803,7 @@ MAKE_LATEST=preserve
 MODE=validate
 GH_REPO=Qbit-Org/qbit
 TRUSTED_RELEASE_BRANCH=main
+TRUSTED_RELEASE_BRANCH_EXPLICIT=0
 GUIX_SIGS_GH_REPO=Qbit-Org/qbit-guix.sigs
 GUIX_SIGS_BRANCH=main
 
@@ -913,6 +924,7 @@ while [ "$#" -gt 0 ]; do
         --trusted-release-branch)
             require_value "$1" "${2:-}"
             TRUSTED_RELEASE_BRANCH="$2"
+            TRUSTED_RELEASE_BRANCH_EXPLICIT=1
             shift 2
             ;;
         -h|--help)
@@ -970,6 +982,10 @@ git check-ref-format --branch "$TRUSTED_RELEASE_BRANCH" >/dev/null 2>&1 \
     || die "--trusted-release-branch is not a valid branch name: $TRUSTED_RELEASE_BRANCH"
 git check-ref-format --branch "$GUIX_SIGS_BRANCH" >/dev/null 2>&1 \
     || die "--guix-sigs-branch is not a valid branch name: $GUIX_SIGS_BRANCH"
+msg "Trusted release branch: $GH_REPO:$TRUSTED_RELEASE_BRANCH"
+if [ "$TRUSTED_RELEASE_BRANCH_EXPLICIT" -eq 0 ] && [[ "$TAG" == v1.* ]]; then
+    msg "Hint: pass --trusted-release-branch 1.x.x for a release-line tag"
+fi
 
 TRUSTED_ROOT="$(git -C "$SCRIPT_DIR/../.." rev-parse --show-toplevel 2>/dev/null)" \
     || die "Publisher is not running from a git checkout"

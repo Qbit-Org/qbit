@@ -179,7 +179,8 @@ if args and args[0] == "api":
         key = endpoint[len("repos/"):].replace("/branches/", "/", 1)
         if key not in tips:
             raise SystemExit(f"fake gh: no branch {key}")
-        print(tips[key])
+        unprotected = json.loads(os.environ.get("FAKE_GH_UNPROTECTED_BRANCHES", "[]"))
+        print(tips[key] + "\t" + ("false" if key in unprotected else "true"))
     elif "/commits/" in endpoint:
         print(endpoint.rsplit("/", 1)[1])
     elif endpoint.count("/") == 2:
@@ -550,6 +551,7 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         mutate_notes_file: Path | None = None,
         asset_list_sequence: tuple[str, ...] = ("ok",),
         branch_tips: dict[str, str] | None = None,
+        unprotected_branches: tuple[str, ...] = (),
         cwd: Path | None = None,
         extra_env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
@@ -566,6 +568,7 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
                 "GIT_CONFIG_KEY_0": f"url.file://{self.github}/.insteadOf",
                 "GIT_CONFIG_VALUE_0": "https://github.com/",
                 "FAKE_GH_BRANCH_TIPS": json.dumps(tips),
+                "FAKE_GH_UNPROTECTED_BRANCHES": json.dumps(list(unprotected_branches)),
                 "FAKE_GH_STATE": str(self.gh_state),
                 "FAKE_GH_LOG": str(self.gh_log),
                 "FAKE_GH_TAG": TAG,
@@ -1638,11 +1641,55 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
             result.stderr,
         )
 
-    def test_trusted_branch_tip_must_match_github(self) -> None:
-        result = self.run_publisher(branch_tips={"Qbit-Org/qbit/main": self.tag_target})
+    def test_trusted_branch_tip_missing_from_github_fails(self) -> None:
+        missing = "f" * 40
+        result = self.run_publisher(branch_tips={"Qbit-Org/qbit/main": missing})
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn(f"but GitHub reports {self.tag_target}", result.stderr)
+        self.assertIn(f"Could not fetch Qbit-Org/qbit:main tip {missing}", result.stderr)
+
+    def test_branch_tip_is_fetched_by_sha_when_the_branch_moves(self) -> None:
+        # A merge lands after the API read: GitHub's branch has moved on, but the
+        # publisher fetches the exact tip the API reported.
+        later = git(
+            self.trusted, "commit-tree", f"{self.trusted_ref}^{{tree}}",
+            "-p", self.trusted_ref, "-m", "merge that landed meanwhile",
+        )
+        self._set_github_branch("Qbit-Org/qbit", self.trusted, "main", later)
+        result = self.run_publisher(branch_tips={"Qbit-Org/qbit/main": self.trusted_ref})
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_unprotected_trusted_release_branch_fails(self) -> None:
+        self._set_github_branch("Qbit-Org/qbit", self.trusted, "topic", self.trusted_ref)
+        result = self.run_publisher(
+            "--trusted-release-branch", "topic",
+            branch_tips={"Qbit-Org/qbit/topic": self.trusted_ref},
+            unprotected_branches=("Qbit-Org/qbit/topic",),
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Trusted release branch Qbit-Org/qbit:topic is not protected", result.stderr)
+
+    def test_unprotected_guix_sigs_branch_fails(self) -> None:
+        result = self.run_publisher(unprotected_branches=("Qbit-Org/qbit-guix.sigs/main",))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("qbit-guix.sigs branch Qbit-Org/qbit-guix.sigs:main is not protected", result.stderr)
+
+    def test_trusted_release_branch_is_printed(self) -> None:
+        result = self.run_publisher()
+
+        self.assertIn("==> Trusted release branch: Qbit-Org/qbit:main", result.stdout)
+        self.assertNotIn("Hint: pass --trusted-release-branch", result.stdout)
+
+    def test_release_line_tag_on_default_branch_prints_hint(self) -> None:
+        hint = "Hint: pass --trusted-release-branch 1.x.x for a release-line tag"
+        default_branch = self.run_publisher("--tag", "v1.2.3")
+        explicit_branch = self.run_publisher("--tag", "v1.2.3", "--trusted-release-branch", "main")
+
+        self.assertIn(hint, default_branch.stdout)
+        self.assertNotIn(hint, explicit_branch.stdout)
 
     def test_release_line_uses_its_own_trusted_branch(self) -> None:
         self._set_github_branch("Qbit-Org/qbit", self.trusted, "1.x.x", self.trusted_ref)

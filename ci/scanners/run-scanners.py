@@ -259,9 +259,11 @@ def git_merge_base(source: Path, left: str, right: str) -> str:
 
 
 # git log -p prints no diff for a merge commit unless asked to, so a change made
-# only in a merge commit would go unscanned. Show each merge's diff against its
-# first parent, and keep walking every parent.
-HISTORY_DIFF_MERGES = "--diff-merges=first-parent"
+# only in a merge commit would go unscanned. --remerge-diff (Git 2.36 or later)
+# shows only what a merge changed relative to an automatic re-merge of its
+# parents, so a secret from a pull request commit is not reported again, under a
+# new fingerprint, on that pull request's merge. Every parent is still walked.
+HISTORY_DIFF_MERGES = "--remerge-diff"
 
 
 def history_log_opts(source: Path, args: argparse.Namespace) -> str:

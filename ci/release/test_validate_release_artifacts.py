@@ -745,6 +745,7 @@ class ReleasePublisherBoundaryTest(unittest.TestCase):
         self.assertIn("verify_remote_tag_pin post-publication", publisher)
         self.assertIn('on_first_parent_history "$TRUSTED_ROOT" "$TRUSTED_RELEASE_REF" "$TAG_TARGET"', publisher)
         self.assertIn("fetch_branch_tip", publisher)
+        self.assertIn("credential.helper=!gh auth git-credential", publisher)
         self.assertIn("ci/release/validate_release_artifacts.py", publisher)
         self.assertIn("ci/release/verify_mainnet_release_posture.py", publisher)
         self.assertIn("ci/release/verify_testnet_release_posture.py", publisher)

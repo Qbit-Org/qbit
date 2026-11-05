@@ -529,27 +529,40 @@ class LatestGitSubtreeMetadataTest(unittest.TestCase):
 
 
 class HistoryLogOptsTest(unittest.TestCase):
-    """The history secret scan must see changes made only in a merge commit."""
+    """The history secret scan sees merge-only changes once, without duplicates."""
+
+    PR_TOKEN = "PR_COMMIT_TOKEN"
+    EVIL_TOKEN = "ONLY_IN_MERGE_TOKEN"
 
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.repo = Path(self.temp_dir.name)
         self.git("init", "-q", "-b", "main")
-        (self.repo / "a.txt").write_text("base\n", encoding="utf8")
-        self.git("add", "a.txt")
-        self.git("commit", "-q", "-m", "base")
+        self.commit_file("a.txt", "base", "base")
         self.base = self.git("rev-parse", "HEAD")
+        # A pull request commit with a token, merged by a clean merge commit.
+        self.git("checkout", "-q", "-b", "pr")
+        self.commit_file("pr.txt", self.PR_TOKEN, "pull request commit")
+        self.pr_commit = self.git("rev-parse", "HEAD")
+        self.git("checkout", "-q", "main")
+        self.commit_file("m.txt", "main moves", "main moves")
+        self.git("merge", "-q", "--no-ff", "-m", "Merge pull request #1", "pr")
+        self.pr_merge = self.git("rev-parse", "HEAD")
+        # An evil merge: a token that exists only in the merge commit.
         self.git("checkout", "-q", "-b", "topic")
-        (self.repo / "b.txt").write_text("topic\n", encoding="utf8")
-        self.git("add", "b.txt")
-        self.git("commit", "-q", "-m", "topic")
+        self.commit_file("b.txt", "topic", "topic")
         self.git("checkout", "-q", "main")
         self.git("merge", "-q", "--no-ff", "--no-commit", "topic")
-        # A change that exists only in the merge commit.
-        (self.repo / "c.txt").write_text("ONLY_IN_MERGE_TOKEN\n", encoding="utf8")
+        (self.repo / "c.txt").write_text(f"{self.EVIL_TOKEN}\n", encoding="utf8")
         self.git("add", "c.txt")
-        self.git("commit", "-q", "-m", "Merge pull request #1")
-        self.head = self.git("rev-parse", "HEAD")
+        self.git("commit", "-q", "-m", "Merge pull request #2")
+        self.evil_merge = self.git("rev-parse", "HEAD")
+        # A clean upstream-style merge with no token.
+        self.git("checkout", "-q", "-b", "upstream")
+        self.commit_file("u.txt", "upstream", "upstream")
+        self.git("checkout", "-q", "main")
+        self.git("merge", "-q", "--no-ff", "-m", "Merge upstream", "upstream")
+        self.clean_merge = self.git("rev-parse", "HEAD")
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -564,38 +577,66 @@ class HistoryLogOptsTest(unittest.TestCase):
         )
         return result.stdout.strip()
 
-    def gitleaks_log(self, log_opts: str) -> str:
-        # gitleaks runs git log -p -U0 followed by the --log-opts words.
-        return self.git("log", "-p", "-U0", *log_opts.split())
+    def commit_file(self, path: str, content: str, message: str) -> None:
+        (self.repo / path).write_text(f"{content}\n", encoding="utf8")
+        self.git("add", path)
+        self.git("commit", "-q", "-m", message)
+
+    def added_lines_by_commit(self, log_opts: str) -> dict[str, str]:
+        """Run the git log that gitleaks runs and map each commit to its added lines."""
+        output = self.git("log", "-p", "-U0", "--format=@@COMMIT %H", *log_opts.split())
+        added: dict[str, str] = {}
+        commit = ""
+        for line in output.splitlines():
+            if line.startswith("@@COMMIT "):
+                commit = line.split()[1]
+                added[commit] = ""
+            elif line.startswith("+") and not line.startswith("+++"):
+                added[commit] += line[1:] + "\n"
+        return added
+
+    def commits_reporting(self, token: str, log_opts: str) -> list[str]:
+        return [c for c, lines in self.added_lines_by_commit(log_opts).items() if token in lines]
 
     def args(self, base_ref: str) -> object:
-        return type("Args", (), {"history_diff_base_ref": base_ref, "source_commit": self.head})()
+        return type("Args", (), {"history_diff_base_ref": base_ref, "source_commit": self.clean_merge})()
 
-    def test_plain_git_log_misses_a_merge_only_change(self) -> None:
-        self.assertNotIn("ONLY_IN_MERGE_TOKEN", self.git("log", "-p", "-U0", "--full-history", "--all"))
+    def full_history_opts(self) -> str:
+        return run_scanners.history_log_opts(self.repo, self.args(""))
 
-    def test_full_history_scan_sees_a_merge_only_change(self) -> None:
-        log_opts = run_scanners.history_log_opts(self.repo, self.args(""))
-        self.assertEqual(log_opts, "--full-history --all --diff-merges=first-parent")
-        log = self.gitleaks_log(log_opts)
-        self.assertIn("ONLY_IN_MERGE_TOKEN", log)
-        self.assertIn("topic", log)
+    def test_full_history_log_opts(self) -> None:
+        self.assertEqual(self.full_history_opts(), "--full-history --all --remerge-diff")
 
-    def test_ranged_scan_sees_a_merge_only_change_and_every_parent(self) -> None:
+    def test_ranged_log_opts(self) -> None:
+        self.assertEqual(
+            run_scanners.history_log_opts(self.repo, self.args(self.base)),
+            f"--remerge-diff {self.base}..{self.clean_merge}",
+        )
+
+    def test_pull_request_secret_is_reported_once_on_its_own_commit(self) -> None:
+        self.assertEqual(self.commits_reporting(self.PR_TOKEN, self.full_history_opts()), [self.pr_commit])
+
+    def test_evil_merge_secret_is_reported_on_the_merge(self) -> None:
+        self.assertEqual(self.commits_reporting(self.EVIL_TOKEN, self.full_history_opts()), [self.evil_merge])
+
+    def test_clean_merges_add_no_lines(self) -> None:
+        added = self.added_lines_by_commit(self.full_history_opts())
+        self.assertEqual(added[self.clean_merge], "")
+        self.assertEqual(added[self.pr_merge], "")
+
+    def test_ranged_scan_covers_every_parent(self) -> None:
         log_opts = run_scanners.history_log_opts(self.repo, self.args(self.base))
-        self.assertEqual(log_opts, f"--diff-merges=first-parent {self.base}..{self.head}")
-        log = self.gitleaks_log(log_opts)
-        self.assertIn("ONLY_IN_MERGE_TOKEN", log)
-        self.assertIn("+topic", log)
+        self.assertEqual(self.commits_reporting(self.PR_TOKEN, log_opts), [self.pr_commit])
+        self.assertEqual(self.commits_reporting(self.EVIL_TOKEN, log_opts), [self.evil_merge])
+
+    def test_plain_git_log_misses_the_evil_merge(self) -> None:
+        self.assertEqual(self.commits_reporting(self.EVIL_TOKEN, "--full-history --all"), [])
 
     def test_gitleaks_command_always_passes_log_opts(self) -> None:
         raw_dir = self.repo / "raw"
         commands, _report = run_scanners.external_commands("gitleaks", self.repo, raw_dir, self.args(""))
         command = commands[0]
-        self.assertEqual(
-            command[command.index("--log-opts") + 1],
-            "--full-history --all --diff-merges=first-parent",
-        )
+        self.assertEqual(command[command.index("--log-opts") + 1], "--full-history --all --remerge-diff")
 
 
 if __name__ == "__main__":
