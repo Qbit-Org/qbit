@@ -1660,5 +1660,31 @@ BOOST_FIXTURE_TEST_CASE(RemoveTxs, UnrestrictedRegtestChain100Setup)
     TestUnloadWallet(std::move(wallet));
 }
 
+BOOST_FIXTURE_TEST_CASE(GetSpendingTxsMatchesIsSpent, TestingSetup)
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    LOCK(wallet.cs_wallet);
+    const COutPoint coin{Txid::FromUint256(m_rng.rand256()), 0};
+    const auto add_spend = [&](uint32_t lock_time, const TxState& state) {
+        CMutableTransaction tx;
+        tx.vin.emplace_back(coin);
+        tx.vout.emplace_back(COIN, CScript{} << OP_TRUE);
+        tx.nLockTime = lock_time;
+        return wallet.AddToWallet(MakeTransactionRef(tx), state);
+    };
+
+    // Abandoned and conflicted transactions do not spend the coin.
+    add_spend(1, TxStateInactive{/*abandoned=*/true});
+    add_spend(2, TxStateBlockConflicted{uint256::ONE, /*height=*/1});
+    add_spend(3, TxStateInactive{})->mempool_conflicts.insert(Txid::FromUint256(m_rng.rand256()));
+    BOOST_CHECK(wallet.GetSpendingTxs(coin).empty());
+    BOOST_CHECK(!wallet.IsSpent(coin));
+
+    const Txid inactive{add_spend(4, TxStateInactive{})->GetHash()};
+    const Txid in_mempool{add_spend(5, TxStateInMempool{})->GetHash()};
+    BOOST_CHECK(wallet.GetSpendingTxs(coin) == (std::set<Txid>{inactive, in_mempool}));
+    BOOST_CHECK(wallet.IsSpent(coin));
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 } // namespace wallet

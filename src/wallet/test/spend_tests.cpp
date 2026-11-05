@@ -4,17 +4,34 @@
 
 #include <chainparams.h>
 #include <consensus/amount.h>
+#include <core_io.h>
+#include <key_io.h>
 #include <policy/fees.h>
+#include <rpc/protocol.h>
+#include <rpc/request.h>
+#include <rpc/util.h>
 #include <script/solver.h>
+#include <univalue.h>
 #include <validation.h>
 #include <wallet/coincontrol.h>
+#include <wallet/context.h>
 #include <wallet/spend.h>
 #include <wallet/test/util.h>
+#include <wallet/test/wallet_p2mr_test_util.h>
 #include <wallet/test/wallet_test_fixture.h>
 
 #include <boost/test/unit_test.hpp>
 
+#include <atomic>
+#include <future>
+#include <memory>
+#include <set>
+#include <utility>
+#include <vector>
+
 namespace wallet {
+RPCHelpMan send();
+
 BOOST_FIXTURE_TEST_SUITE(spend_tests, WalletTestingSetup)
 
 BOOST_FIXTURE_TEST_CASE(SubtractFee, UnrestrictedRegtestChain100Setup)
@@ -134,6 +151,161 @@ BOOST_FIXTURE_TEST_CASE(CreateTransactionReturnsChangeDestinationAfterSigningFai
     BOOST_REQUIRE(!res);
     BOOST_CHECK_EQUAL(util::ErrorString(res).original, "Signing transaction failed");
     BOOST_CHECK_EQUAL(get_internal_keypool_size(), keypool_size_before);
+}
+
+//! A wallet with five mature coins that the send RPC can reach, and a way to
+//! park one send call after it signs and before it commits.
+struct SendRPCSetup : public UnrestrictedRegtestChain100Setup {
+    WalletContext m_wallet_context;
+    std::shared_ptr<CWallet> m_wallet;
+    std::vector<COutPoint> m_coins;
+
+    std::promise<void> m_parked;
+    std::promise<void> m_release;
+    std::shared_future<void> m_release_future{m_release.get_future().share()};
+    std::atomic<bool> m_park_next{false};
+    std::atomic<bool> m_released{false};
+    std::future<std::pair<UniValue, UniValue>> m_parked_call;
+
+    SendRPCSetup()
+    {
+        for (int i = 0; i < 5; ++i) CreateAndProcessBlock({}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+        m_wallet_context.chain = m_node.chain.get();
+        m_wallet_context.args = &m_args;
+        m_wallet = CreateSyncedWallet(*m_node.chain, WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey, BECH32_ONLY_OUTPUT_TYPES, /*keypool_size=*/10);
+        AddWallet(m_wallet_context, m_wallet);
+        LOCK(m_wallet->cs_wallet);
+        for (const COutput& coin : AvailableCoins(*m_wallet).All()) m_coins.push_back(coin.outpoint);
+        BOOST_REQUIRE_EQUAL(m_coins.size(), 5U);
+        m_wallet->m_before_send_commit = [this] {
+            if (!m_park_next.exchange(false)) return;
+            m_parked.set_value();
+            m_release_future.wait();
+        };
+    }
+
+    ~SendRPCSetup()
+    {
+        // Let a parked call finish, even when a failed check ended the test early.
+        Release();
+        if (m_parked_call.valid()) m_parked_call.wait();
+        m_wallet->m_before_send_commit = {};
+        RemoveWallet(m_wallet_context, m_wallet, /*load_on_start=*/std::nullopt);
+    }
+
+    //! Call send with these inputs and options; return its result or the error it threw.
+    std::pair<UniValue, UniValue> Send(const std::vector<COutPoint>& inputs, UniValue options)
+    {
+        UniValue outputs{UniValue::VARR};
+        UniValue output{UniValue::VOBJ};
+        output.pushKV(EncodeDestination(*Assert(m_wallet->GetNewDestination(OutputType::BECH32, ""))), ValueFromAmount(COIN));
+        outputs.push_back(std::move(output));
+        UniValue input_array{UniValue::VARR};
+        for (const COutPoint& input : inputs) {
+            UniValue entry{UniValue::VOBJ};
+            entry.pushKV("txid", input.hash.GetHex());
+            entry.pushKV("vout", input.n);
+            input_array.push_back(std::move(entry));
+        }
+        options.pushKV("inputs", std::move(input_array));
+        JSONRPCRequest request;
+        request.context = &m_wallet_context;
+        request.params = UniValue{UniValue::VARR};
+        request.params.push_back(std::move(outputs));
+        for (int i = 0; i < 3; ++i) request.params.push_back(UniValue{});
+        request.params.push_back(std::move(options));
+        try {
+            return {send().HandleRequest(request), UniValue{}};
+        } catch (const UniValue& error) {
+            return {UniValue{}, error};
+        }
+    }
+
+    //! Start a send call that parks after it signs, and wait until it does.
+    void StartParkedSend(const std::vector<COutPoint>& inputs, const UniValue& options)
+    {
+        m_park_next = true;
+        m_parked_call = std::async(std::launch::async, [this, inputs, options] {
+            auto result{Send(inputs, options)};
+            // A call that failed before it signed must not leave the test waiting.
+            if (m_park_next.exchange(false)) m_parked.set_value();
+            return result;
+        });
+        m_parked.get_future().wait();
+    }
+
+    void Release()
+    {
+        if (!m_released.exchange(true)) m_release.set_value();
+    }
+
+    //! Let the parked call commit, and return its result or the error it threw.
+    std::pair<UniValue, UniValue> FinishParkedSend()
+    {
+        Release();
+        return m_parked_call.get();
+    }
+
+    static UniValue FeeRate(int sat_per_vb, bool lock_unspents = false)
+    {
+        UniValue options{UniValue::VOBJ};
+        options.pushKV("fee_rate", sat_per_vb);
+        if (lock_unspents) options.pushKV("lock_unspents", true);
+        return options;
+    }
+
+    std::set<COutPoint> LockedCoins()
+    {
+        LOCK(m_wallet->cs_wallet);
+        std::vector<COutPoint> locked;
+        m_wallet->ListLockedCoins(locked);
+        return {locked.begin(), locked.end()};
+    }
+};
+
+static void CheckConcurrentSpendError(const UniValue& error, const COutPoint& input, const UniValue& winner)
+{
+    BOOST_REQUIRE(error.isObject());
+    BOOST_CHECK_EQUAL(error["code"].getInt<int>(), RPC_WALLET_ERROR);
+    BOOST_CHECK_EQUAL(error["message"].get_str(), strprintf("Input %s:%u was spent by concurrent transaction %s. This transaction was not added to the wallet or broadcast; the call can be retried.", input.hash.GetHex(), input.n, winner["txid"].get_str()));
+}
+
+// Two send calls replace the same wallet transaction. The one that commits
+// second started while the original was the input's only spender, so it fails
+// and adds nothing to the wallet.
+BOOST_FIXTURE_TEST_CASE(ConcurrentSendReplacementsSucceedOnce, SendRPCSetup)
+{
+    const COutPoint& coin{m_coins.at(0)};
+    const auto [original, original_error]{Send({coin}, FeeRate(10))};
+    BOOST_REQUIRE(original_error.isNull());
+
+    StartParkedSend({coin}, FeeRate(20));
+    const auto [winner, winner_error]{Send({coin}, FeeRate(20))};
+    BOOST_REQUIRE(winner_error.isNull());
+    const auto [loser_result, loser_error]{FinishParkedSend()};
+
+    BOOST_CHECK(loser_result.isNull());
+    CheckConcurrentSpendError(loser_error, coin, winner);
+    LOCK(m_wallet->cs_wallet);
+    BOOST_CHECK(m_wallet->GetSpendingTxs(coin) == (std::set<Txid>{Txid::FromHex(original["txid"].get_str()).value(), Txid::FromHex(winner["txid"].get_str()).value()}));
+}
+
+// A send call with lock_unspents that loses the race unlocks the inputs it
+// locked, as committing them would have, except an input the user had locked.
+BOOST_FIXTURE_TEST_CASE(ConcurrentSendLoserReleasesItsCoinLocks, SendRPCSetup)
+{
+    const COutPoint& user_locked{m_coins.back()};
+    WITH_LOCK(m_wallet->cs_wallet, m_wallet->LockCoin(user_locked, /*persist=*/false));
+
+    StartParkedSend(m_coins, FeeRate(10, /*lock_unspents=*/true));
+    BOOST_CHECK(LockedCoins() == (std::set<COutPoint>{m_coins.begin(), m_coins.end()}));
+    const auto [winner, winner_error]{Send({m_coins.at(0)}, FeeRate(10))};
+    BOOST_REQUIRE(winner_error.isNull());
+    const auto [loser_result, loser_error]{FinishParkedSend()};
+
+    BOOST_CHECK(loser_result.isNull());
+    CheckConcurrentSpendError(loser_error, m_coins.at(0), winner);
+    BOOST_CHECK(LockedCoins() == std::set<COutPoint>{user_locked});
 }
 
 BOOST_AUTO_TEST_SUITE_END()
