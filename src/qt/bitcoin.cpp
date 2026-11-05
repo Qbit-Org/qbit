@@ -203,6 +203,9 @@ BitcoinApplication::BitcoinApplication()
     // Qt runs setlocale(LC_ALL, "") on initialization.
     RegisterMetaTypes();
     setQuitOnLastWindowClosed(false);
+
+    m_deferred_shutdown_timer = new QTimer(this);
+    connect(m_deferred_shutdown_timer, &QTimer::timeout, this, &BitcoinApplication::requestShutdown);
 }
 
 void BitcoinApplication::setupPlatformStyle()
@@ -328,6 +331,27 @@ void BitcoinApplication::requestInitialize()
 
 void BitcoinApplication::requestShutdown()
 {
+    // Requests that arrive once shutdown has started, such as a second
+    // platform Quit while the node stops, have nothing left to do.
+    if (m_shutdown_started) return;
+
+    // Shutdown deletes the wallet views. The platform's Quit event, and
+    // File > Exit pressed through accessibility, can arrive while the user is
+    // still in a dialog whose nested event loop would return into them, so
+    // retry once every such dialog has closed.
+    if (GUIUtil::IsUserInteractionPending()) {
+        if (!m_deferred_shutdown_timer->isActive()) {
+            qDebug() << __func__ << ": Deferring shutdown until no dialog is open";
+            m_deferred_shutdown_timer->start(SHUTDOWN_POLLING_DELAY);
+        }
+        return;
+    }
+    if (m_deferred_shutdown_timer->isActive()) {
+        qDebug() << __func__ << ": Running deferred shutdown";
+        m_deferred_shutdown_timer->stop();
+    }
+    m_shutdown_started = true;
+
     for (const auto w : QGuiApplication::topLevelWindows()) {
         w->hide();
     }

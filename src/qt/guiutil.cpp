@@ -1013,6 +1013,19 @@ void ShowModalDialogAsynchronously(QDialog* dialog)
     dialog->show();
 }
 
+bool IsUserInteractionPending()
+{
+    // The application's event loop is the outermost one, so a deeper level
+    // means a nested loop such as QDialog::exec() or QMenu::exec() still has
+    // its caller on the stack. This also holds after QDialog::done() has
+    // hidden the dialog but before exec() returns.
+    if (QThread::currentThread()->loopLevel() > 1) return true;
+    for (const QWidget* widget : QApplication::topLevelWidgets()) {
+        if (widget->isVisible() && widget->isModal() && !qobject_cast<const QProgressDialog*>(widget)) return true;
+    }
+    return false;
+}
+
 QString WalletDisplayName(const QString& name)
 {
     return name.isEmpty() ? "[" + QObject::tr("default wallet") + "]" : name;

@@ -30,6 +30,7 @@
 #include <QCloseEvent>
 #include <QMessageBox>
 #include <QMetaObject>
+#include <QPointer>
 #include <QThread>
 #include <QTimer>
 #include <QWindow>
@@ -200,18 +201,25 @@ WalletModel* WalletController::getOrCreateWalletOnGuiThread(std::unique_ptr<inte
     wallet_model->startPollBalance();
 
     connect(wallet_model, &WalletModel::unload, this, [this, wallet_model] {
-        // Defer removeAndDeleteWallet when no modal widget is actively waiting for an action.
+        // Defer removeAndDeleteWallet while the user is still in a dialog: a
+        // nested event loop could return into the deleted wallet view, even
+        // one underneath a progress dialog.
         // TODO: remove this workaround by removing usage of QDialog::exec.
-        QWidget* active_dialog = QApplication::activeModalWidget();
-        if (active_dialog && dynamic_cast<QProgressDialog*>(active_dialog) == nullptr) {
-            connect(qApp, &QApplication::focusWindowChanged, wallet_model, [this, wallet_model]() {
-                if (!QApplication::activeModalWidget()) {
-                    removeAndDeleteWallet(wallet_model);
-                }
-            }, Qt::QueuedConnection);
-        } else {
+        if (!GUIUtil::IsUserInteractionPending()) {
             removeAndDeleteWallet(wallet_model);
+            return;
         }
+        qDebug() << "Deferring wallet unload until no dialog is open";
+        auto* recheck{new QTimer(this)};
+        connect(recheck, &QTimer::timeout, this, [this, recheck, model = QPointer<WalletModel>{wallet_model}] {
+            if (model && GUIUtil::IsUserInteractionPending()) return;
+            recheck->stop();
+            recheck->deleteLater();
+            if (!model) return;
+            qDebug() << "Running deferred wallet unload";
+            removeAndDeleteWallet(model);
+        });
+        recheck->start(SHUTDOWN_POLLING_DELAY);
     }, Qt::QueuedConnection);
 
     // Re-emit coinsSent signal from wallet model.
