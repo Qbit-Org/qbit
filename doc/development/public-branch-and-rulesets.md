@@ -186,7 +186,8 @@ at every step.
 Until step 4 disables squash merging, GitHub still accepts a squash merge of a
 pull request with unsigned commits, because it signs the squash commit itself.
 Run steps 1 to 4 back to back, with no merges in between: signature enforcement
-is real only after step 4.
+is real only after step 4. A squash merge that slips into that gap is signed
+only by GitHub, and the daily `squash-sign audit` reports it.
 
 1. Import `.github/rulesets/signed-commits.json` as a new ruleset. Confirm that
    it has no bypass actors and that its enforcement is `active`, and record its
