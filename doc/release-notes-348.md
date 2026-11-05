@@ -9,7 +9,8 @@ transaction and opened a second confirmation. Confirming the second one
 broadcast its transaction, and confirming the first one then aborted
 qbit-qt. Pressing Clear All the same way and then confirming aborted it too.
 The transaction from the second confirmation could therefore already have
-been broadcast when qbit-qt aborted. No funds were at risk.
+been broadcast when qbit-qt aborted. No funds were at risk: qbit-qt broadcast
+only a transaction confirmed in its own confirmation.
 
 Send now does nothing while a send is in progress, from the passphrase prompt
 until the confirmation closes, so one Send sends at most one transaction.
