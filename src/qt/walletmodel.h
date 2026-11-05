@@ -115,8 +115,8 @@ public:
     // Wallet encryption. Runs the wallet's encryption on a worker thread so
     // the GUI keeps processing events, and reports the outcome through
     // encryptWalletFinished(). Returns false, and starts nothing, while an
-    // earlier encryption is still running; one started by another caller is
-    // also reported through message(). An exception from the wallet is
+    // earlier encryption is still running, as refuseWhileEncrypting()
+    // reports. An exception from the wallet is
     // rethrown on the GUI thread rather than reported as a failure: the
     // encryption may already have committed.
     bool encryptWallet(const SecureString& passphrase);
@@ -129,6 +129,9 @@ public:
     // delivered once the wallet reports that the encryption has finished,
     // followed by walletEncryptionEnded().
     bool isEncryptingWallet() const;
+    // While the wallet is being encrypted, tell the user to wait through
+    // message() and return true; otherwise return false.
+    bool refuseWhileEncrypting();
     // Passphrase only needed when unlocking
     bool setWalletLocked(bool locked, const SecureString &passPhrase=SecureString());
     bool changePassphrase(const SecureString &oldPass, const SecureString &newPass);
@@ -239,7 +242,8 @@ private:
     // progress until it handles the wallet's notification that it ended, so
     // updates held back meanwhile are delivered before newer ones.
     mutable bool m_wallet_encrypting{false};
-    // Set while updateEncryptionInProgress() has queued endEncryptingWallet().
+    // Set while updateEncryptionInProgress() has queued endEncryptingWallet()
+    // and no refresh has run since.
     bool m_encryption_end_queued{false};
     // Encryption and PQC validation status last read from the wallet,
     // reported while it is being encrypted.
@@ -253,6 +257,7 @@ private:
     void finishEncryptWallet(uint64_t generation, bool success, std::exception_ptr exception);
     void finishEncryptWalletThread();
     void endEncryptingWallet();
+    EncryptionStatus readEncryptionStatus() const;
 
     bool fForceCheckBalanceChanged{false};
 

@@ -3819,12 +3819,14 @@ void TestEncryptWalletKeepsGuiResponsive(interfaces::Node& node)
     QVERIFY(DialogShowsEncryptionInProgress(*dialog));
     QVERIFY(SyntheticStateMatches(state, [](const auto& value) { return value.encrypt_calls == 1 && value.encrypt_in_progress; }));
 
-    // Anything that would use the keys is refused rather than left to block
-    // on the wallet locks behind the modal dialog.
+    // Anything that would use the keys, or encrypt the wallet again, is
+    // refused rather than left to block on the wallet locks behind the modal
+    // dialog.
     QVERIFY(!model->requestUnlock().isValid());
     QVERIFY(!model->bumpFee(Txid{}));
-    QCOMPARE(messages.count(), 2);
-    QVERIFY(SyntheticStateMatches(state, [](const auto& value) { return value.unlock_calls == 0 && !value.bump_prepare_entered; }));
+    QVERIFY(!model->encryptWallet(SecureString{"other-passphrase"}));
+    QCOMPARE(messages.count(), 3);
+    QVERIFY(SyntheticStateMatches(state, [](const auto& value) { return value.unlock_calls == 0 && !value.bump_prepare_entered && value.encrypt_calls == 1; }));
 
     ReleaseSyntheticEncryption(state);
     QVERIFY(WaitUntil([&dialog_guard] { return dialog_guard.isNull(); }, 5000));
