@@ -26,6 +26,7 @@
 #include <node/types.h>
 #include <policy/fees.h>
 #include <txmempool.h>
+#include <util/rbf.h>
 #include <util/signing_timing.h>
 #include <util/time.h>
 #include <util/translation.h>
@@ -455,9 +456,10 @@ bool SendCoinsDialog::PrepareSendText(QString& question_string, QString& informa
         question_string.append(QbitUnits::formatHtmlWithUnit(model->getOptionsModel()->getDisplayUnit(), txFee));
         question_string.append("</span><br />");
 
-        // append RBF message according to transaction's signalling
+        // append RBF message according to transaction's signalling, not the
+        // checkbox, which can change while the transaction is prepared
         question_string.append("<span style='font-size:10pt; font-weight:normal;'>");
-        if (ui->optInRBF->isChecked()) {
+        if (SignalsOptInRBF(*m_current_transaction->getWtx())) {
             question_string.append(tr("You can increase the fee later (signals Replace-By-Fee, BIP-125)."));
         } else {
             question_string.append(tr("Not signalling Replace-By-Fee, BIP-125."));

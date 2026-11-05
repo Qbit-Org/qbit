@@ -2616,6 +2616,7 @@ struct CancelSendConfirmations {
         QObject::connect(&timer, &QTimer::timeout, [this] {
             for (QMessageBox* dialog : VisibleSendConfirmations()) {
                 ++cancelled;
+                text = dialog->text();
                 dialog->button(QMessageBox::Cancel)->click();
             }
         });
@@ -2624,6 +2625,7 @@ struct CancelSendConfirmations {
 
     QTimer timer;
     int cancelled{0};
+    QString text;
 };
 
 //! Press a button through its accessibility action, as VoiceOver or a UI
@@ -2780,8 +2782,9 @@ void TestSendRequestExceptionReleasesSend(interfaces::Node& node, bool after_unl
 }
 
 //! The passphrase dialog behind the unlock request runs a nested event loop,
-//! and an accessibility client can press Clear All there. The send already
-//! in progress must keep the coin control it was requested with.
+//! and an accessibility client can press Clear All or untick Replace-By-Fee
+//! there. The send already in progress must keep the coin control it was
+//! requested with, and its confirmation must describe that transaction.
 void TestClearDuringUnlockKeepsSendRequest(interfaces::Node& node)
 {
     TestChain100Setup test{ChainType::REGTEST, {.extra_args = {"-p2mronly=0"}}};
@@ -2795,6 +2798,7 @@ void TestClearDuringUnlockKeepsSendRequest(interfaces::Node& node)
     auto state{std::make_shared<qt_test::SyntheticWalletState>()};
     state->encrypted = true;
     state->locked = true;
+    state->create_rbf_input = true;
     mini_gui.initModel(qt_test::MakeSyntheticWallet(wallet::PQCUsageReport{}, state), platform_style.get());
     mini_gui.walletModel->pollBalanceChanged();
 
@@ -2803,13 +2807,17 @@ void TestClearDuringUnlockKeepsSendRequest(interfaces::Node& node)
     QVERIFY(clear_button);
     QSignalSpy cleared{clear_button, &QAbstractButton::clicked};
     QVERIFY(cleared.isValid());
+    QAbstractButton* const rbf_box{send_dialog.findChild<QAbstractButton*>("optInRBF")};
+    QVERIFY(rbf_box);
+    QVERIFY(rbf_box->isChecked());
 
     // Stand in for the passphrase dialog: run events until the accessibility
-    // press has cleared the form, then unlock the wallet.
+    // presses have cleared the form and unticked Replace-By-Fee, then unlock
+    // the wallet.
     bool pressed{false};
     QObject::connect(mini_gui.walletModel.get(), &WalletModel::requireUnlock, mini_gui.walletModel.get(), [&] {
-        pressed = PressThroughAccessibility(clear_button);
-        if (pressed) WaitUntil([&] { return !cleared.isEmpty(); }, 5000);
+        pressed = PressThroughAccessibility(clear_button) && PressThroughAccessibility(rbf_box);
+        if (pressed) WaitUntil([&] { return !cleared.isEmpty() && !rbf_box->isChecked(); }, 5000);
         std::lock_guard lock{state->mutex};
         state->locked = false;
     });
@@ -2827,12 +2835,15 @@ void TestClearDuringUnlockKeepsSendRequest(interfaces::Node& node)
 
     QVERIFY(pressed);
     QCOMPARE(cleared.count(), 1);
+    QVERIFY(!rbf_box->isChecked());
     QVERIFY(!send_dialog.getCoinControl()->HasSelected());
     QCOMPARE(messages.count(), 0);
     QCOMPARE(canceller.cancelled, 1);
     QVERIFY(SyntheticStateMatches(state, [](const auto& value) {
         return value.create_coins_selected;
     }));
+    // The transaction was requested with Replace-By-Fee ticked.
+    QVERIFY(canceller.text.contains("signals Replace-By-Fee"));
     VerifyNoSendConfirmation();
 }
 

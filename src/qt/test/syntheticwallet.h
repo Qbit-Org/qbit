@@ -45,6 +45,9 @@ struct SyntheticWalletState {
     //! Whether the coin control passed to the last createTransaction() had
     //! inputs selected.
     bool create_coins_selected{false};
+    //! Give the created transaction an input that signals Replace-By-Fee as
+    //! the coin control asks, as the wallet does.
+    bool create_rbf_input{false};
     //! Throw a NonFatalCheckError from the next clone(), as an unexpected
     //! failure after the GUI has unlocked the wallet for a send.
     bool clone_throw{false};
