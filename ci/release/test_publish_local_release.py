@@ -1669,27 +1669,34 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         )
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Trusted release branch Qbit-Org/qbit:topic is not protected", result.stderr)
+        self.assertIn(
+            "Qbit-Org/qbit:topic is not a protected branch; protect it with a ruleset before releasing from it",
+            result.stderr,
+        )
 
     def test_unprotected_guix_sigs_branch_fails(self) -> None:
         result = self.run_publisher(unprotected_branches=("Qbit-Org/qbit-guix.sigs/main",))
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("qbit-guix.sigs branch Qbit-Org/qbit-guix.sigs:main is not protected", result.stderr)
+        self.assertIn(
+            "Qbit-Org/qbit-guix.sigs:main is not a protected branch; protect it with a ruleset before releasing from it",
+            result.stderr,
+        )
 
-    def test_trusted_release_branch_is_printed(self) -> None:
-        result = self.run_publisher()
+    def test_default_trusted_release_branch_is_printed_with_hint(self) -> None:
+        hint = "==> Hint: a release-line release must pass --trusted-release-branch <line>"
+        for tag in (TAG, "v1.2.3"):
+            with self.subTest(tag=tag):
+                result = self.run_publisher("--tag", tag)
+                self.assertIn("==> Trusted release branch: Qbit-Org/qbit:main", result.stdout)
+                self.assertIn(hint, result.stdout)
 
+    def test_explicit_trusted_release_branch_prints_no_hint(self) -> None:
+        result = self.run_publisher("--trusted-release-branch", "main")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("==> Trusted release branch: Qbit-Org/qbit:main", result.stdout)
-        self.assertNotIn("Hint: pass --trusted-release-branch", result.stdout)
-
-    def test_release_line_tag_on_default_branch_prints_hint(self) -> None:
-        hint = "Hint: pass --trusted-release-branch 1.x.x for a release-line tag"
-        default_branch = self.run_publisher("--tag", "v1.2.3")
-        explicit_branch = self.run_publisher("--tag", "v1.2.3", "--trusted-release-branch", "main")
-
-        self.assertIn(hint, default_branch.stdout)
-        self.assertNotIn(hint, explicit_branch.stdout)
+        self.assertNotIn("Hint: a release-line release", result.stdout)
 
     def test_release_line_uses_its_own_trusted_branch(self) -> None:
         self._set_github_branch("Qbit-Org/qbit", self.trusted, "1.x.x", self.trusted_ref)

@@ -605,12 +605,14 @@ class HistoryLogOptsTest(unittest.TestCase):
         return run_scanners.history_log_opts(self.repo, self.args(""))
 
     def test_full_history_log_opts(self) -> None:
-        self.assertEqual(self.full_history_opts(), "--full-history --all --remerge-diff")
+        self.assertEqual(
+            self.full_history_opts(), "--full-history --all --diff-filter=tuxdb --remerge-diff"
+        )
 
     def test_ranged_log_opts(self) -> None:
         self.assertEqual(
             run_scanners.history_log_opts(self.repo, self.args(self.base)),
-            f"--remerge-diff {self.base}..{self.clean_merge}",
+            f"--diff-filter=tuxdb --remerge-diff {self.base}..{self.clean_merge}",
         )
 
     def test_pull_request_secret_is_reported_once_on_its_own_commit(self) -> None:
@@ -620,9 +622,11 @@ class HistoryLogOptsTest(unittest.TestCase):
         self.assertEqual(self.commits_reporting(self.EVIL_TOKEN, self.full_history_opts()), [self.evil_merge])
 
     def test_clean_merges_add_no_lines(self) -> None:
+        # A merge with an empty remerge diff adds no lines; with --diff-filter,
+        # git log does not list it at all.
         added = self.added_lines_by_commit(self.full_history_opts())
-        self.assertEqual(added[self.clean_merge], "")
-        self.assertEqual(added[self.pr_merge], "")
+        self.assertEqual(added.get(self.clean_merge, ""), "")
+        self.assertEqual(added.get(self.pr_merge, ""), "")
 
     def test_ranged_scan_covers_every_parent(self) -> None:
         log_opts = run_scanners.history_log_opts(self.repo, self.args(self.base))
@@ -636,7 +640,41 @@ class HistoryLogOptsTest(unittest.TestCase):
         raw_dir = self.repo / "raw"
         commands, _report = run_scanners.external_commands("gitleaks", self.repo, raw_dir, self.args(""))
         command = commands[0]
-        self.assertEqual(command[command.index("--log-opts") + 1], "--full-history --all --remerge-diff")
+        self.assertEqual(
+            command[command.index("--log-opts") + 1],
+            "--full-history --all --diff-filter=tuxdb --remerge-diff",
+        )
+
+    def with_git_version(self, output: str, exit_code: int = 0):
+        real = run_scanners.git_command
+
+        def fake(source, *args):
+            if args == ("version",):
+                return exit_code, output, ""
+            return real(source, *args)
+
+        return patch.object(run_scanners, "git_command", fake)
+
+    def test_old_git_stops_the_history_scan(self) -> None:
+        for output in ("git version 2.35.1\n", "git version 1.9.5\n"):
+            with self.subTest(output=output), self.with_git_version(output):
+                with self.assertRaises(SystemExit) as raised:
+                    run_scanners.history_log_opts(self.repo, self.args(""))
+                self.assertIn("needs Git 2.36 or later for --remerge-diff", str(raised.exception))
+
+    def test_unknown_git_version_stops_the_history_scan(self) -> None:
+        for output, code in (("not git\n", 0), ("", 127)):
+            with self.subTest(output=output, code=code), self.with_git_version(output, code):
+                with self.assertRaises(SystemExit):
+                    run_scanners.history_log_opts(self.repo, self.args(self.base))
+
+    def test_old_git_stops_the_gitleaks_command(self) -> None:
+        with self.with_git_version("git version 2.35.1\n"), self.assertRaises(SystemExit):
+            run_scanners.external_commands("gitleaks", self.repo, self.repo / "raw", self.args(""))
+
+    def test_git_2_36_is_enough(self) -> None:
+        with self.with_git_version("git version 2.36.0\n"):
+            self.assertIn("--remerge-diff", run_scanners.history_log_opts(self.repo, self.args("")))
 
 
 if __name__ == "__main__":

@@ -264,18 +264,39 @@ def git_merge_base(source: Path, left: str, right: str) -> str:
 # parents, so a secret from a pull request commit is not reported again, under a
 # new fingerprint, on that pull request's merge. Every parent is still walked.
 HISTORY_DIFF_MERGES = "--remerge-diff"
+HISTORY_DIFF_MERGES_MIN_GIT = (2, 36)
+
+# gitleaks v8.30.1 runs `git log -p -U0 --full-history --all --diff-filter=tuxdb`
+# when --log-opts is empty, but only `git log -p -U0 <log-opts>` when it is set
+# (sources/git.go:74-94), so the log options repeat the defaults that matter.
+GITLEAKS_DIFF_FILTER = "--diff-filter=tuxdb"
+GITLEAKS_FULL_HISTORY = "--full-history --all"
+
+
+def require_remerge_diff_git(source: Path) -> None:
+    """Stop rather than run a history scan that silently checks nothing."""
+    exit_code, stdout, _stderr = git_command(source, "version")
+    found = stdout.strip() or f"git version exited {exit_code}"
+    match = re.match(r"git version (\d+)\.(\d+)", found)
+    if exit_code != 0 or match is None or (
+        (int(match.group(1)), int(match.group(2))) < HISTORY_DIFF_MERGES_MIN_GIT
+    ):
+        raise SystemExit(
+            f"The history secret scan needs Git 2.36 or later for {HISTORY_DIFF_MERGES}; "
+            f"found: {found}"
+        )
 
 
 def history_log_opts(source: Path, args: argparse.Namespace) -> str:
+    require_remerge_diff_git(source)
     base_ref = str(getattr(args, "history_diff_base_ref", "") or "").strip()
     if not base_ref:
-        # gitleaks uses --full-history --all only when --log-opts is empty.
-        return f"--full-history --all {HISTORY_DIFF_MERGES}"
+        return f"{GITLEAKS_FULL_HISTORY} {GITLEAKS_DIFF_FILTER} {HISTORY_DIFF_MERGES}"
     source_commit = str(args.source_commit or git_commit(source)).strip()
     if not source_commit:
         raise SystemExit("History scanner diff scope requires a git source commit.")
     base_commit = git_merge_base(source, source_commit, base_ref)
-    return f"{HISTORY_DIFF_MERGES} {base_commit}..{source_commit}"
+    return f"{GITLEAKS_DIFF_FILTER} {HISTORY_DIFF_MERGES} {base_commit}..{source_commit}"
 
 
 def decode_command_output(output: bytes | str | None) -> str:

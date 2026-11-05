@@ -437,7 +437,7 @@ fetch_branch_tip() {
     IFS=$'\t' read -r api_tip protected <<<"$branch_info"
     require_full_sha "$label branch tip" "$api_tip"
     [ "$protected" = true ] \
-        || die "$label branch $repository:$branch is not protected (protected=$protected)"
+        || die "$repository:$branch is not a protected branch; protect it with a ruleset before releasing from it"
     git -C "$root" -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
         fetch --quiet --no-tags "https://github.com/$repository.git" "$api_tip" \
         || die "Could not fetch $repository:$branch tip $api_tip into $root"
@@ -983,8 +983,8 @@ git check-ref-format --branch "$TRUSTED_RELEASE_BRANCH" >/dev/null 2>&1 \
 git check-ref-format --branch "$GUIX_SIGS_BRANCH" >/dev/null 2>&1 \
     || die "--guix-sigs-branch is not a valid branch name: $GUIX_SIGS_BRANCH"
 msg "Trusted release branch: $GH_REPO:$TRUSTED_RELEASE_BRANCH"
-if [ "$TRUSTED_RELEASE_BRANCH_EXPLICIT" -eq 0 ] && [[ "$TAG" == v1.* ]]; then
-    msg "Hint: pass --trusted-release-branch 1.x.x for a release-line tag"
+if [ "$TRUSTED_RELEASE_BRANCH_EXPLICIT" -eq 0 ]; then
+    msg "Hint: a release-line release must pass --trusted-release-branch <line>"
 fi
 
 TRUSTED_ROOT="$(git -C "$SCRIPT_DIR/../.." rev-parse --show-toplevel 2>/dev/null)" \

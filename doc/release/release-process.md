@@ -61,8 +61,17 @@ publisher checks: `main` by default, or the branch passed with
 protected. The publisher fetches the exact tip commit GitHub's API reports for
 it, authenticating through `gh`, and refuses a trusted ref off that line, such
 as a pull request head, which could carry validators and key policy from an
-older base. The publisher prints the trusted release branch it uses, and hints
-at `--trusted-release-branch 1.x.x` for a `v1.*` tag on the default branch.
+older base. The publisher prints the trusted release branch it uses and, when
+`--trusted-release-branch` is not given, reminds that a release-line release
+must pass `--trusted-release-branch <line>`.
+
+Prerequisites for publishing with this publisher:
+
+- `Qbit-Org/qbit-guix.sigs` `main` must be protected, by its `signed-commits`
+  and merge-commit rulesets from the signed-commit rollout, before the next
+  release. Until then the publisher refuses every release.
+- Every release-line branch passed as `--trusted-release-branch` must be
+  protected, for example by a branch ruleset; an unprotected branch is refused.
 
 The release publisher must be run from a clean public checkout whose `HEAD`
 exactly equals `trusted_release_ref`. The publisher uses that checkout's
@@ -277,6 +286,11 @@ contrib/release-process/publish-local-release.sh \
   --notes-file "doc/release-notes-${TAG#v}.md" \
   --require-photon
 ```
+
+`--guix-sigs-ref` must be a state the `qbit-guix.sigs` branch actually had: the
+merge commit that landed the attestations, or the branch tip, on that branch's
+first-parent history. That is the same rule as for the release tag target; a
+pull request head in `qbit-guix.sigs` is refused.
 
 Add `--create-draft` to create or resume a draft without publishing it. Add
 `--publish` to create or resume a draft, verify its complete remote asset
