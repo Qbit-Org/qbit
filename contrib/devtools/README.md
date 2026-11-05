@@ -185,6 +185,10 @@ tag's signature and name, a downgrade, and any downstream delta the release
 would drop. It then runs `test/lint/libbitcoinpqc-subtree-check.sh` and undoes
 the import commit if the check fails or the helper is interrupted first.
 
+The update runs `git subtree pull --squash -S` (or `add` for a first import),
+which creates and signs two commits, so it needs two signing touches. Keep both
+commits in the pull request.
+
 The default source is
 `https://github.com/Qbit-Org/qbit-libbitcoinpqc.git` tag `v0.3.2`. For the
 checks, the flags and the delta review, see

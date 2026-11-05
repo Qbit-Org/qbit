@@ -41,6 +41,17 @@ Use qbit names and paths in public-facing changes:
 - qbit network flags and ports
 - qbit addresses and the `qbit:` payment URI scheme
 
+## Signed Commits
+
+Public branches accept only commits with a signature that GitHub verifies. Sign
+your commits with a key registered on your GitHub account; any key that GitHub
+verifies counts. Each pull request lands as one commit. If your pull request
+has an unsigned commit or more than one commit, a maintainer recreates it from
+a branch in this repository as one signed commit, credits you with a
+`Co-authored-by` trailer and in the new pull request's description, and closes
+yours with a link to it. See
+[Signed Commits](doc/development/public-branch-and-rulesets.md#signed-commits).
+
 ## Local Validation
 
 For non-trivial changes, build and run the smallest relevant checks before

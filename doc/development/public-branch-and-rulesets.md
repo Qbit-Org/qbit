@@ -191,19 +191,69 @@ at every step:
    only.
 4. Untick **Allow squash merging** and **Allow rebase merging**. The repository
    now matches `.github/repository-settings/merge-methods.json`.
-5. Verify the new ruleset and the rules GitHub enforces on each branch:
+5. Verify the result with the assertions below. Each `jq -e` exits non-zero
+   when an expectation fails, and the block stops at the first failure. A
+   non-zero exit means stop: fix the setting, or roll back (see
+   [Rolling Back](#rolling-back)).
 
    ```sh
-   gh api repos/Qbit-Org/qbit/rulesets/<signed-commits-id> \
-     --jq '{enforcement,bypass_actors,current_user_can_bypass}'
-   gh api repos/Qbit-Org/qbit/rules/branches/main --jq '.[].type'
+   (
+     set -euo pipefail
+     repo=Qbit-Org/qbit
+     ruleset_id=<signed-commits-id>
+     gh api "repos/${repo}/rulesets/${ruleset_id}" | jq -e '
+       .enforcement == "active" and .bypass_actors == []
+       and .current_user_can_bypass == "never"'
+     gh api "repos/${repo}" | jq -e '
+       .allow_merge_commit == true and .allow_squash_merge == false
+       and .allow_rebase_merge == false'
+     for branch in main 0.1.x 1.0.0 1.x.x; do
+       gh api "repos/${repo}/rules/branches/${branch}" |
+         jq -e --argjson id "${ruleset_id}" '
+           any(.[]; .type == "required_signatures" and .ruleset_id == $id)
+           and all(.[]; .type != "required_linear_history")
+           and any(.[]; .type == "pull_request")
+           and all(.[] | select(.type == "pull_request");
+                   .parameters.allowed_merge_methods == ["merge"])'
+     done
+     gh api "repos/${repo}/rules/branches/1.1.0" |
+       jq -e --argjson id "${ruleset_id}" '
+         any(.[]; .type == "required_signatures" and .ruleset_id == $id)'
+   )
    ```
 
-   The first command should print `active`, `[]`, and `never`. Run the second
-   for `main`, `0.1.x`, `1.0.0`, `1.1.0`, and `1.x.x`. Each output should
-   include `required_signatures` and should not include
-   `required_linear_history`; for every branch except `1.1.0` it should also
-   include `pull_request`.
+### Rolling Back
+
+The merge-commit path was proven on `qbit-white-paper` before the switch:
+spike pull request #6 merged a signed commit with a merge commit, and #7 ran the
+full `squash-sign` flow. If merges still stall after the switch, roll back in
+the order below. Each step leaves at least one merge method that both the
+branch rulesets and the repository allow, so merges never freeze:
+
+1. Set the `signed-commits` ruleset enforcement to `disabled` (Settings → Rules
+   → Rulesets → `signed-commits`). Keep the ruleset so that it can be
+   reactivated.
+2. In Settings → General → Pull Requests, tick **Allow squash merging** and
+   **Allow rebase merging**. Leave merge commits enabled for now.
+3. Edit each branch ruleset (`main`, `0.1.x`, `1.0.0`, and `1.x.x`): set the
+   allowed merge methods to Squash and Rebase, and tick "Require linear
+   history".
+4. Untick **Allow merge commits**.
+5. Confirm the earlier repository settings; a non-zero exit means a step did
+   not apply:
+
+   ```sh
+   gh api repos/Qbit-Org/qbit | jq -e '
+     .allow_merge_commit == false and .allow_squash_merge == true
+     and .allow_rebase_merge == true'
+   ```
+
+Record the rollback in the release checklist: when it happened, the reason, the
+pull requests that stalled, and, for each branch, the commit range that landed
+while `signed-commits` was disabled, so that `squash-sign audit` can review it.
+The templates in this repository still describe the merge-commit policy; reapply
+it with [Switching to Merge Commits](#switching-to-merge-commits) once the cause
+is fixed.
 
 ## Signed Commits
 
@@ -211,8 +261,17 @@ After the operator applies `.github/rulesets/signed-commits.json`, every commit
 pushed to `main`, `0.1.x`, `1.0.0`, `1.1.0`, or `1.x.x` must carry a signature
 that GitHub verifies. The rule lives in its own ruleset with no bypass actors,
 so the `OrganizationAdmin` bypass on the other branch rulesets does not exempt
-anyone from it. Add a new protected maintenance branch to its `include` list
-when that branch is created.
+anyone from it.
+
+The `include` list names exact refs, not patterns. Creating a new long-lived
+branch therefore requires adding it to `signed-commits.json` and to the live
+ruleset; until then the branch accepts unsigned commits. The daily
+`squash-sign audit` reports protected branches that are missing from the list.
+
+`1.1.0` has only the signature rule. No branch ruleset covers it, so it has no
+pull request, deletion, force-push, or status-check protection: anyone with
+write access can push a Verified commit to it directly, force-push it, or
+delete it. Adding its full protection is tracked separately.
 
 The rule checks commits when they reach a protected branch, not while they sit
 on a pull request branch:
@@ -222,21 +281,53 @@ on a pull request branch:
   reduces it to one commit, and the operator signs that commit with one
   hardware-key touch. The pull request then lands as that commit plus GitHub's
   merge commit, which GitHub signs.
-- Every pull request with more than one commit needs `squash-sign apply` before
-  merge, even when all of its commits are signed, and so does any pull request
-  with an unsigned commit. Pull requests opened under the earlier squash-only
-  policy stay mergeable after the switch once `squash-sign apply` has run;
-  GitHub refuses the merge commit while any of their commits is unsigned.
+- Every pull request squashes this way, including one with more than one commit
+  when all of its commits are signed, and any with an unsigned commit. Pull
+  requests opened under the earlier squash-only policy stay mergeable after the
+  switch once `squash-sign apply` has run; GitHub refuses the merge commit while
+  any of their commits is unsigned.
+- A backport also lands as one commit, and `squash-sign` keeps its original
+  authors as `Co-authored-by` trailers.
 - Run `squash-sign apply` before the final approval. The rewrite is a push, so
   `dismiss_stale_reviews_on_push` and `require_last_push_approval` can require a
   fresh approval from someone other than the pusher.
 
+The only exception to one commit per pull request is a git-subtree update. It
+keeps its two commits, the "Squashed '<prefix>' changes" commit and the subtree
+merge, and both are signed when they are created with
+`git subtree pull --squash -S`, so the update needs two touches. `squash-sign`
+refuses to squash a subtree update, and lands it with its keep-commits path only
+when both commits are signed by a person's OpenPGP key. See the
+[libbitcoinpqc subtree runbook](../subtrees/libbitcoinpqc.md).
+
+Pull requests from forks follow the same rule. Contributors sign their own
+commits, and a signature from any key registered on their GitHub account that
+GitHub verifies counts. If a fork pull request has an unsigned commit or more
+than one commit, a maintainer does not rewrite the contributor's branch, but
+recreates the pull request from a branch in this repository with `squash-sign`.
+The original author keeps credit through a `Co-authored-by` trailer and in the
+new pull request's body, and the maintainer closes the fork pull request with a
+link to the new one.
+
 In repositories that merge with merge commits,
-`squash-sign merge --admin-approvals` may merge with `--admin` and so bypass the
-review requirement, but only after `squash-sign verify` passes, the required
-checks are green, and no reviewer has requested changes. The `signed-commits`
-ruleset has no bypass actors, so GitHub still refuses unsigned commits, even for
-admins.
+`squash-sign merge --admin-approvals` may merge with `--admin`, which bypasses
+the review requirement, so the pull request lands with zero approvals. It does
+so only when all of these checks pass:
+
+- The repository allows merge commits only.
+- `squash-sign verify` passes.
+- Every required status check is green, including checks bound to a GitHub App,
+  where the check's `app.id` must match the required integration, and the
+  branch is up to date with its base where the ruleset requires that.
+- The review decision is `REVIEW_REQUIRED`, and no review is
+  `CHANGES_REQUESTED`.
+- `--admin` would skip no other rule: no review thread is unresolved, and no
+  rule for required deployments, code scanning, or a merge queue applies.
+
+Agents never run plain `gh pr merge --admin`: it skips all of these checks,
+including the `Required Merge Gate`, because `OrganizationAdmin` bypasses the
+branch rulesets. The `signed-commits` ruleset has no bypass actors, so GitHub
+still refuses unsigned commits, even for admins.
 
 The rule accepts any commit that GitHub marks Verified. GitHub signs only
 commits it creates itself through its API or web UI: GraphQL
@@ -245,20 +336,27 @@ and web UI edits. Those pass the rule without an operator signature. A bot that
 creates a commit locally and runs `git push` sends an unsigned commit, which
 GitHub refuses. `squash-sign verify` and a daily `squash-sign audit`, which run
 outside this repository, cover the GitHub-signed gap by process; the server
-does not.
+does not. `contrib/verify-commits` assumes merge commits that a developer signs
+with `github-merge.py`, while GitHub signs merge commits under this policy, so
+that tool needs a separate review before it is used on this history.
 
 No recurring upstream sync exists; upstream history arrived once, on
 2026-06-17. `refs/heads/upstream/**` is outside the signature rule, so an
 optional upstream reference branch can hold upstream history verbatim. A rare
 verbatim import of third-party history into a signed branch uses a recorded
-break-glass:
+break-glass that lifts the rule on that branch only:
 
-1. An organization admin sets the `signed-commits` ruleset enforcement to
-   `disabled`.
-2. The admin pushes the import.
-3. The admin sets the ruleset enforcement back to `active` immediately.
-4. The admin records the imported commit range and the reason in the release
-   checklist.
+1. An organization admin edits the `signed-commits` ruleset and removes only the
+   target branch's ref from its `include` list. Enforcement stays `active` on
+   every other branch.
+2. The admin pushes the import to that branch.
+3. The admin adds the ref back to the `include` list immediately.
+4. The admin runs the step 5 assertions in
+   [Switching to Merge Commits](#switching-to-merge-commits), which must pass
+   for every branch.
+5. The admin records the branch, the imported commit range, and the reason in
+   the release checklist, and confirms that only that range landed on the
+   branch while it was excluded.
 
 ## Operational Notes
 
