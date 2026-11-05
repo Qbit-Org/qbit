@@ -1310,7 +1310,10 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithInternalHintResultNoNotif
             if (!aborted) {
                 throw std::runtime_error(strprintf("Error during descriptors keypool top up. Cannot abort changes after commit failure for wallet [%s]", m_storage.LogName()));
             }
-            throw std::runtime_error(strprintf("Error during descriptors keypool top up. Cannot commit changes for wallet [%s]", m_storage.LogName()));
+            // The transaction, the staged publication and the in-memory state
+            // are all rolled back, so this is an ordinary top-up failure.
+            // Background refills report it instead of aborting the process.
+            return util::Error{Untranslated(strprintf("Error during descriptors keypool top up. Cannot commit changes for wallet [%s]", m_storage.LogName()))};
         }
         m_storage.FinishTopUpCommit(change->publication_id, /*committed=*/true);
     }
