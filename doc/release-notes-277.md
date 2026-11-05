@@ -17,6 +17,7 @@ read its keys before encryption stops without writing them, as a refill of a
 locked wallet does. Keys added after encryption, including by later refills,
 are stored encrypted. The wallet file format is unchanged.
 
-Unencrypted PQC keys that v1.0.0 already wrote are handled separately: see
-the release note for #283 (`release-notes-283.md`) for how to check a wallet,
-what unlocking it does, and what to do about funds and backups.
+This release does not detect or re-encrypt unencrypted PQC keys that v1.0.0
+already wrote. If you encrypted a wallet with v1.0.0, especially soon after
+creating it, consider creating a new wallet with a passphrase using this
+release and moving your funds to it.
