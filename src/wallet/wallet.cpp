@@ -1218,6 +1218,22 @@ bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase, bool use_cr
     // Only descriptor wallets can be encrypted
     Assert(IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS));
 
+    // Announce the encryption from here until this call returns or throws,
+    // whoever made it, so that listeners such as the GUI stop reading the
+    // wallet before its locks are taken and read it again once the
+    // encryption has finished.
+    struct EncryptionInProgressGuard {
+        CWallet& wallet;
+        ~EncryptionInProgressGuard()
+        {
+            --wallet.m_encryption_in_progress;
+            wallet.NotifyEncryptionInProgressChanged();
+        }
+    };
+    ++m_encryption_in_progress;
+    const EncryptionInProgressGuard encryption_in_progress_guard{*this};
+    NotifyEncryptionInProgressChanged();
+
     // The key derivation below is tuned to take a noticeable amount of time,
     // so it runs before the wallet locks are taken. A caller that does not
     // hold them, such as the GUI's encryption worker, does not stall other

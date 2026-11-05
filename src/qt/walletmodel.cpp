@@ -130,8 +130,9 @@ void WalletModel::updateStatus()
 {
     // The wallet notifies from inside the encryption while it still holds
     // its locks. Reading the status here would block the GUI thread on those
-    // locks, so finishEncryptWallet() refreshes once the worker has returned.
-    if (m_encrypt_wallet_active) return;
+    // locks, so endEncryptingWallet() refreshes once the encryption has
+    // finished.
+    if (isEncryptingWallet()) return;
 
     EncryptionStatus newEncryptionStatus = getEncryptionStatus();
 
@@ -198,9 +199,9 @@ void WalletModel::updateAddressBook(const QString &address, const QString &label
 
 void WalletModel::updateCanGetAddresses()
 {
-    // Listeners query the wallet, which blocks while the encryption worker
-    // holds its locks; finishEncryptWallet() re-emits once it has returned.
-    if (m_encrypt_wallet_active) {
+    // Listeners query the wallet, which blocks while the encryption holds its
+    // locks; endEncryptingWallet() re-emits once it has finished.
+    if (isEncryptingWallet()) {
         m_can_get_addresses_changed_deferred = true;
         return;
     }
@@ -463,34 +464,44 @@ RecentRequestsTableModel* WalletModel::getRecentRequestsTableModel() const
 
 WalletModel::EncryptionStatus WalletModel::getEncryptionStatus() const
 {
-    // The encryption worker holds the wallet locks until it returns, and
-    // finishEncryptWallet() delivers the status it changes. Answer from the
-    // status before it started rather than block the GUI thread on the wallet.
-    if (m_encrypt_wallet_active) return cachedEncryptionStatus;
+    // The encryption holds the wallet locks until it returns, and
+    // endEncryptingWallet() delivers the status it changes. Answer from the
+    // status last read rather than block the GUI thread on the wallet.
+    if (isEncryptingWallet()) return m_last_encryption_status;
 
     if(!m_wallet->isCrypted())
     {
         // A previous bug allowed for watchonly wallets to be encrypted (encryption keys set, but nothing is actually encrypted).
         // To avoid misrepresenting the encryption status of such wallets, we only return NoKeys for watchonly wallets that are unencrypted.
         if (m_wallet->privateKeysDisabled()) {
-            return NoKeys;
+            return m_last_encryption_status = NoKeys;
         }
-        return Unencrypted;
+        return m_last_encryption_status = Unencrypted;
     }
     else if(m_wallet->isLocked())
     {
-        return Locked;
+        return m_last_encryption_status = Locked;
     }
     else
     {
-        return Unlocked;
+        return m_last_encryption_status = Unlocked;
     }
 }
 
 wallet::PQCKeyValidationInfo WalletModel::getPQCKeyValidationInfo() const
 {
-    if (m_encrypt_wallet_active) return m_encrypt_wallet_pqc_info;
-    return m_wallet->getPQCKeyValidationInfo();
+    if (isEncryptingWallet()) return m_last_pqc_key_validation_info;
+    return m_last_pqc_key_validation_info = m_wallet->getPQCKeyValidationInfo();
+}
+
+bool WalletModel::isEncryptingWallet() const
+{
+    if (m_encrypt_wallet_active || m_wallet_encrypting) return true;
+    // Another caller, such as the encryptwallet RPC, may have started an
+    // encryption whose notification has not arrived yet. Remember it until
+    // updateEncryptionInProgress() handles the notification that it ended.
+    m_wallet_encrypting = m_wallet->isEncryptionInProgress();
+    return m_wallet_encrypting;
 }
 
 bool WalletModel::encryptWallet(const SecureString& passphrase)
@@ -504,9 +515,9 @@ bool WalletModel::encryptWallet(const SecureString& passphrase)
 
     finishEncryptWalletThread();
     // Take the values the GUI may ask for while the worker holds the wallet
-    // locks; finishEncryptWallet() refreshes them once it has returned.
+    // locks; endEncryptingWallet() refreshes them once it has returned.
     cachedEncryptionStatus = getEncryptionStatus();
-    m_encrypt_wallet_pqc_info = getPQCKeyValidationInfo();
+    m_last_pqc_key_validation_info = getPQCKeyValidationInfo();
     m_encrypt_wallet_active = true;
     const uint64_t generation{++m_encrypt_wallet_generation};
     QPointer<WalletModel> model{this};
@@ -554,10 +565,35 @@ void WalletModel::finishEncryptWallet(uint64_t generation, bool success, std::ex
         std::rethrow_exception(exception);
     }
     m_encrypt_wallet_active = false;
+    m_encrypt_wallet_result = success;
+    endEncryptingWallet();
+}
 
-    // Deliver what was held back while the worker owned the wallet locks.
-    // Listeners may run nested event loops that delete this model, so check
-    // it after each emission.
+void WalletModel::updateEncryptionInProgress()
+{
+    // Notifications from overlapping encryptions, or a start announced after
+    // the encryption has already finished, can arrive in any order, so act on
+    // what the wallet reports now rather than on the notification.
+    if (m_wallet->isEncryptionInProgress()) {
+        m_wallet_encrypting = true;
+        return;
+    }
+    // An encryption this model never saw may still have changed the wallet,
+    // or thrown without announcing its status, so refresh in any case.
+    endEncryptingWallet();
+}
+
+void WalletModel::endEncryptingWallet()
+{
+    // finishEncryptWallet() calls back once this model's worker has returned.
+    if (m_encrypt_wallet_active) return;
+    // The wallet's notification calls back once its encryption has finished.
+    m_wallet_encrypting = m_wallet->isEncryptionInProgress();
+    if (m_wallet_encrypting) return;
+
+    // Deliver what was held back while the encryption owned the wallet
+    // locks. Listeners may run nested event loops that delete this model, so
+    // check it after each emission.
     QPointer<WalletModel> model{this};
     updateStatus();
     if (!model) return;
@@ -570,7 +606,13 @@ void WalletModel::finishEncryptWallet(uint64_t generation, bool success, std::ex
         transactionTableModel->deliverDeferredUpdates();
         if (!model) return;
     }
-    Q_EMIT encryptWalletFinished(success);
+    if (m_encrypt_wallet_result) {
+        const bool success{*m_encrypt_wallet_result};
+        m_encrypt_wallet_result.reset();
+        Q_EMIT encryptWalletFinished(success);
+        if (!model) return;
+    }
+    Q_EMIT walletEncryptionEnded();
 }
 
 void WalletModel::finishEncryptWalletThread()
@@ -657,6 +699,14 @@ static void NotifyCanGetAddressesChanged(WalletModel* walletmodel)
     assert(invoked);
 }
 
+static void NotifyEncryptionInProgressChanged(WalletModel* walletmodel)
+{
+    // Raised on the encrypting thread, possibly with the wallet locks held,
+    // so never wait for the GUI thread here.
+    bool invoked = QMetaObject::invokeMethod(walletmodel, "updateEncryptionInProgress", Qt::QueuedConnection);
+    assert(invoked);
+}
+
 void WalletModel::subscribeToCoreSignals()
 {
     // Connect signals to wallet
@@ -666,6 +716,7 @@ void WalletModel::subscribeToCoreSignals()
     m_handler_transaction_changed = m_wallet->handleTransactionChanged(std::bind(NotifyTransactionChanged, this, std::placeholders::_1, std::placeholders::_2));
     m_handler_show_progress = m_wallet->handleShowProgress(std::bind(ShowProgress, this, std::placeholders::_1, std::placeholders::_2));
     m_handler_can_get_addrs_changed = m_wallet->handleCanGetAddressesChanged(std::bind(NotifyCanGetAddressesChanged, this));
+    m_handler_encryption_in_progress_changed = m_wallet->handleEncryptionInProgressChanged(std::bind(NotifyEncryptionInProgressChanged, this));
 }
 
 void WalletModel::unsubscribeFromCoreSignals()
@@ -677,6 +728,7 @@ void WalletModel::unsubscribeFromCoreSignals()
     m_handler_transaction_changed->disconnect();
     m_handler_show_progress->disconnect();
     m_handler_can_get_addrs_changed->disconnect();
+    m_handler_encryption_in_progress_changed->disconnect();
 }
 
 // WalletModel::UnlockContext implementation
@@ -691,7 +743,7 @@ WalletModel::UnlockContext WalletModel::requestUnlock()
     }
     // Nothing may use the keys while they are being encrypted: the wallet
     // would block until the encryption finishes and then be locked anyway.
-    if (m_encrypt_wallet_active) {
+    if (isEncryptingWallet()) {
         Q_EMIT message(tr("Wallet encryption in progress"), tr("Wait for the wallet encryption to finish."), CClientUIInterface::MSG_WARNING);
         return UnlockContext(this, /*valid=*/false, /*relock=*/false);
     }
@@ -742,7 +794,7 @@ bool WalletModel::bumpFee(Txid hash)
         Q_EMIT message(tr("Fee bump in progress"), tr("Wait for the current fee bump to finish."), CClientUIInterface::MSG_WARNING);
         return false;
     }
-    if (m_encrypt_wallet_active) {
+    if (isEncryptingWallet()) {
         Q_EMIT message(tr("Wallet encryption in progress"), tr("Wait for the wallet encryption to finish."), CClientUIInterface::MSG_WARNING);
         return false;
     }

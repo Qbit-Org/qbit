@@ -66,6 +66,7 @@ public:
     bool encryptWallet(const SecureString&) override
     {
         std::function<void()> status_changed;
+        std::function<void()> encryption_in_progress_changed;
         {
             std::lock_guard lock{m_state->mutex};
             // Like CWallet::EncryptWallet, which refuses a wallet that another
@@ -84,10 +85,13 @@ public:
             ++m_state->encrypt_calls;
             m_state->encrypt_thread = std::this_thread::get_id();
             status_changed = m_state->status_changed;
+            encryption_in_progress_changed = m_state->encryption_in_progress_changed;
         }
         m_state->condition.notify_all();
-        // Like CWallet::EncryptWallet, which unlocks the freshly encrypted keys
-        // and notifies while it still holds the wallet locks.
+        // Like CWallet::EncryptWallet, which announces the encryption whoever
+        // called it, then unlocks the freshly encrypted keys and notifies
+        // while it still holds the wallet locks.
+        if (encryption_in_progress_changed) encryption_in_progress_changed();
         if (status_changed) status_changed();
 
         bool success{false};
@@ -106,19 +110,33 @@ public:
             m_state->encrypt_in_progress = false;
             m_state->encrypt_finished = true;
             m_state->encrypt_finished_sequence = ++m_state->event_sequence;
+            // A listener may have unsubscribed while the latch was held, as
+            // a model destroyed during an encryption started elsewhere does.
+            status_changed = m_state->status_changed;
+            encryption_in_progress_changed = m_state->encryption_in_progress_changed;
         }
         m_state->condition.notify_all();
         // An exception after the database transaction committed leaves the
         // wallet encrypted, releases the locks by unwinding and skips the
-        // final status notification.
-        if (throw_after_commit) throw std::runtime_error{"synthetic encryption failure after commit"};
+        // final status notification. The end of the encryption is announced
+        // on every path.
+        if (throw_after_commit) {
+            if (encryption_in_progress_changed) encryption_in_progress_changed();
+            throw std::runtime_error{"synthetic encryption failure after commit"};
+        }
         if (status_changed) status_changed();
+        if (encryption_in_progress_changed) encryption_in_progress_changed();
         return success;
     }
     bool isCrypted() override
     {
         std::lock_guard lock{m_state->mutex};
         return m_state->encrypted;
+    }
+    bool isEncryptionInProgress() override
+    {
+        std::lock_guard lock{m_state->mutex};
+        return m_state->encrypt_in_progress;
     }
     bool lock() override
     {
@@ -796,6 +814,21 @@ public:
             if (auto state = weak_state.lock()) {
                 std::lock_guard lock{state->mutex};
                 state->can_get_addresses_changed = {};
+            }
+        });
+    }
+
+    std::unique_ptr<interfaces::Handler> handleEncryptionInProgressChanged(EncryptionInProgressChangedFn fn) override
+    {
+        {
+            std::lock_guard lock{m_state->mutex};
+            m_state->encryption_in_progress_changed = std::move(fn);
+        }
+        std::weak_ptr<SyntheticWalletState> weak_state{m_state};
+        return interfaces::MakeCleanupHandler([weak_state] {
+            if (auto state = weak_state.lock()) {
+                std::lock_guard lock{state->mutex};
+                state->encryption_in_progress_changed = {};
             }
         });
     }

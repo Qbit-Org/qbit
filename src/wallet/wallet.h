@@ -462,6 +462,9 @@ private:
     /** WalletFlags set on this wallet. */
     std::atomic<uint64_t> m_wallet_flags{0};
 
+    //! Number of EncryptWallet calls under way, see IsEncryptionInProgress().
+    std::atomic<int> m_encryption_in_progress{0};
+
     bool SetAddressBookWithDB(WalletBatch& batch, const CTxDestination& address, const std::string& strName, const std::optional<AddressPurpose>& strPurpose);
 
     //! Unsets a wallet flag and saves it to disk
@@ -744,6 +747,10 @@ public:
      * set to the reason.
      */
     bool EncryptWallet(const SecureString& strWalletPassphrase, bool use_create_keypool_warmup = false, bilingual_str* new_seed_error = nullptr);
+    //! Whether an EncryptWallet call is under way, whoever made it. It reads
+    //! no wallet state, so a caller that must not wait for the locks the
+    //! encryption holds can ask it at any time.
+    bool IsEncryptionInProgress() const { return m_encryption_in_progress.load() > 0; }
     /**
      * Rewrite the database file so that deleted plaintext key records no
      * longer remain in its free space, then write the POST_ENCRYPTION_REWRITE
@@ -1088,6 +1095,15 @@ public:
      * Note: Called without locks held.
      */
     boost::signals2::signal<void (CWallet* wallet)> NotifyStatusChanged;
+
+    /**
+     * An EncryptWallet call started or returned, see IsEncryptionInProgress().
+     * Notifications from overlapping calls can be seen in any order, so a
+     * listener reads IsEncryptionInProgress() rather than counting them.
+     * Note: Called with cs_wallet held when the caller holds it, as the
+     * encryptwallet RPC does, so a listener must not wait for wallet locks.
+     */
+    boost::signals2::signal<void ()> NotifyEncryptionInProgressChanged;
 
     /** Inquire whether this wallet broadcasts transactions. */
     bool GetBroadcastTransactions() const { return fBroadcastTransactions; }
