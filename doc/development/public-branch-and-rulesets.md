@@ -324,11 +324,12 @@ on a pull request branch:
   reduces it to one commit, and the operator signs that commit with one
   hardware-key touch. The pull request then lands as that commit plus GitHub's
   merge commit, which GitHub signs.
-- Every pull request squashes this way, including one with more than one commit
-  when all of its commits are signed, and any with an unsigned commit. Pull
-  requests opened under the earlier squash-only policy stay mergeable after the
-  switch once `squash-sign apply` has run; GitHub refuses the merge commit while
-  any of their commits is unsigned.
+- Every pull request from a branch in this repository squashes this way,
+  including one with more than one commit when all of its commits are signed,
+  and any with an unsigned commit. Pull requests from forks follow the fork
+  rules below. Pull requests opened under the earlier squash-only policy stay
+  mergeable after the switch once `squash-sign apply` has run; GitHub refuses
+  the merge commit while any of their commits is unsigned.
 - A backport also lands as one commit, and `squash-sign` keeps its original
   authors as `Co-authored-by` trailers.
 - Run `squash-sign apply` before the final approval. The rewrite is a push, so
