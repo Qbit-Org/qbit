@@ -239,54 +239,67 @@ full `squash-sign` flow. If merges still stall after the switch, roll back in
 the order below. Each step leaves at least one merge method that both the
 branch rulesets and the repository allow, so merges never freeze:
 
-1. Set the `signed-commits` ruleset enforcement to `disabled` (Settings → Rules
-   → Rulesets → `signed-commits`). Keep the ruleset so that it can be
-   reactivated.
+1. Optional: set the `signed-commits` ruleset enforcement to `disabled`
+   (Settings → Rules → Rulesets → `signed-commits`), keeping the ruleset so
+   that it can be reactivated. Do this only if the signature rule itself is the
+   problem. Restoring squash merges does not need it, because GitHub signs the
+   squash commit; while the rule stays active, rebase merges stay refused.
 2. In Settings → General → Pull Requests, tick **Allow squash merging** and
    **Allow rebase merging**. Leave merge commits enabled for now.
 3. Edit each branch ruleset (`main`, `0.1.x`, `1.0.0`, and `1.x.x`): set the
    allowed merge methods to Squash and Rebase, and tick "Require linear
    history".
 4. Untick **Allow merge commits**.
-5. Verify the rolled-back state with the assertions below. A non-zero exit
-   means stop: a step did not apply. The per-branch assertions that no
-   `required_signatures` rule applies are the real check, whichever ruleset
-   carried the rule. The first assertion looks up the `signed-commits` ruleset
-   by the ID recorded at apply time, across every page of rulesets, and
-   requires that it still exists and is disabled, so it does not depend on the
-   ruleset's name: a renamed ruleset that is still active fails it, and so does
-   a deleted one.
+5. Verify the rolled-back state with the assertions below. Set `signatures` to
+   `active` if you skipped step 1, or to `disabled` if you ran it. A non-zero
+   exit means stop: a step did not apply. The per-branch assertions on
+   `required_signatures` are the real check: with the rule kept, every branch
+   must still carry it from the recorded ruleset; with it disabled, no branch
+   may carry it, whichever ruleset carried it. The first assertion looks up the
+   `signed-commits` ruleset by the ID recorded at apply time, across every page
+   of rulesets, and requires that it still exists with the expected
+   enforcement, so it does not depend on the ruleset's name: a renamed ruleset
+   in the wrong state fails it, and so does a deleted one.
 
    ```sh
    (
      set -euo pipefail
      repo=Qbit-Org/qbit
      ruleset_id=<signed-commits-id>
+     signatures=<active-or-disabled>
+     case "${signatures}" in
+       active | disabled) ;;
+       *) echo "error: signatures must be active or disabled" >&2; exit 1 ;;
+     esac
      gh api --paginate "repos/${repo}/rulesets" |
-       jq -e -s --argjson id "${ruleset_id}" '
-         add | any(.[]; .id == $id and .enforcement == "disabled")'
+       jq -e -s --argjson id "${ruleset_id}" --arg want "${signatures}" '
+         add | any(.[]; .id == $id and .enforcement == $want)'
      gh api "repos/${repo}" | jq -e '
        .allow_merge_commit == false and .allow_squash_merge == true
        and .allow_rebase_merge == true'
-     for branch in main 0.1.x 1.0.0 1.x.x; do
-       gh api "repos/${repo}/rules/branches/${branch}" | jq -e '
-         all(.[]; .type != "required_signatures")
-         and any(.[]; .type == "required_linear_history")
-         and any(.[]; .type == "pull_request")
-         and all(.[] | select(.type == "pull_request");
-                 any(.parameters.allowed_merge_methods[]; . == "squash"))'
+     for branch in main 0.1.x 1.0.0 1.x.x 1.1.0; do
+       gh api "repos/${repo}/rules/branches/${branch}" |
+         jq -e --argjson id "${ruleset_id}" --arg want "${signatures}" \
+           --arg branch "${branch}" '
+           (if $want == "active"
+            then any(.[]; .type == "required_signatures" and .ruleset_id == $id)
+            else all(.[]; .type != "required_signatures") end)
+           and ($branch == "1.1.0" or (
+             any(.[]; .type == "required_linear_history")
+             and any(.[]; .type == "pull_request")
+             and all(.[] | select(.type == "pull_request");
+                     any(.parameters.allowed_merge_methods[]; . == "squash"))))'
      done
-     gh api "repos/${repo}/rules/branches/1.1.0" |
-       jq -e 'all(.[]; .type != "required_signatures")'
    )
    ```
 
 Record the rollback in the release checklist: when it happened, the reason, the
-pull requests that stalled, and, for each branch, the commit range that landed
-while `signed-commits` was disabled, so that `squash-sign audit` can review it.
-The templates in this repository still describe the merge-commit policy; reapply
-it with [Switching to Merge Commits](#switching-to-merge-commits) once the cause
-is fixed.
+pull requests that stalled, whether step 1 ran, and, if it did, for each branch
+the commit range that landed while `signed-commits` was disabled, so that
+`squash-sign audit` can review it. The templates in this repository still
+describe the merge-commit policy; reapply it with
+[Switching to Merge Commits](#switching-to-merge-commits) once the cause is
+fixed.
 
 ## Signed Commits
 
@@ -334,8 +347,9 @@ on a pull request branch:
 - A backport also lands as one commit, and `squash-sign` keeps its original
   authors as `Co-authored-by` trailers.
 - Run `squash-sign apply` before the final approval. The rewrite is a push, so
-  `dismiss_stale_reviews_on_push` and `require_last_push_approval` can require a
-  fresh approval from someone other than the pusher.
+  `dismiss_stale_reviews_on_push`, `require_last_push_approval` and
+  `require_extra_approval_for_unattributed_changes`, all `true` in the live
+  rulesets, can require a fresh approval from someone other than the pusher.
 
 A `src/libbitcoinpqc` import follows the same rule. The import is one
 main-line commit that carries the `git-subtree-dir` and `git-subtree-split`

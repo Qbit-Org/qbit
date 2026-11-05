@@ -46,8 +46,9 @@ Use qbit names and paths in public-facing changes:
 Public branches accept only commits with a signature that GitHub verifies. Sign
 your commits with a key registered on your GitHub account; any key that GitHub
 verifies counts, while maintainers sign their own landing commits with OpenPGP.
-Each pull request lands as one commit. A pull request from a branch in this
-repository lands through `squash-sign`, as described in
+Each pull request lands as one signed commit plus GitHub's merge commit; a
+standard two-commit subtree update keeps both of its commits. A pull request
+from a branch in this repository lands through `squash-sign`, as described in
 [Signed Commits](doc/development/public-branch-and-rulesets.md#signed-commits).
 A pull request from a fork lands as follows:
 
