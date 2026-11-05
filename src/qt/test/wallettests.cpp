@@ -4886,7 +4886,8 @@ void AnnounceSyntheticEncryption(const std::shared_ptr<qt_test::SyntheticWalletS
 //! encryptwallet RPC, is encrypting the wallet: the request could only wait
 //! for that encryption and then be refused, so the model refuses it at once
 //! with the message unlock requests and fee bumps get, and the dialog closes
-//! without claiming a result.
+//! without claiming a result. That holds even when the other encryption ends
+//! while the message is shown, whose event loop then sees it end.
 void TestEncryptWalletRefusedDuringOtherEncryption(interfaces::Node& node)
 {
     SyntheticModelEnvironment env{node};
@@ -4904,7 +4905,14 @@ void TestEncryptWalletRefusedDuringOtherEncryption(interfaces::Node& node)
     const JoinOnExit join_external{external.thread};
     const ReleaseSyntheticEncryptionOnExit release_on_exit{state};
     QVERIFY(WaitForSyntheticEncryption(state));
+    const bool refused{!model->encryptWallet(SecureString{"test-passphrase"})};
 
+    // The user dismisses the dialog's message only once the other encryption
+    // has finished.
+    QObject::connect(model.get(), &WalletModel::message, model.get(), [&state, &model] {
+        ReleaseSyntheticEncryption(state);
+        WaitUntil([&model] { return !model->isEncryptingWallet(); }, 5000);
+    }, Qt::SingleShotConnection);
     auto* dialog{new AskPassphraseDialog(AskPassphraseDialog::Encrypt, nullptr)};
     QPointer<AskPassphraseDialog> dialog_guard{dialog};
     dialog->setModel(model.get());
@@ -4914,24 +4922,73 @@ void TestEncryptWalletRefusedDuringOtherEncryption(interfaces::Node& node)
     SubmitEncryption(*dialog, QStringLiteral("test-passphrase"));
     const bool dialog_closed{WaitUntil([&dialog_guard] { return dialog_guard.isNull(); }, 2000)};
     QVERIFY2(watchdog.confirm(), "GUI thread blocked on a wallet being encrypted outside the GUI");
+    QVERIFY(refused);
     QVERIFY(dialog_closed);
-    QVERIFY(!result.clicked());
-    QCOMPARE(messages.count(), 1);
-    QCOMPARE(MessageAt(messages, 0).title, QStringLiteral("Wallet encryption in progress"));
-    QVERIFY(!model->encryptWallet(SecureString{"test-passphrase"}));
+    QVERIFY2(!result.clicked(), qPrintable(result_text));
     QCOMPARE(messages.count(), 2);
+    QCOMPARE(MessageAt(messages, 0).title, QStringLiteral("Wallet encryption in progress"));
+    QCOMPARE(MessageAt(messages, 1).title, QStringLiteral("Wallet encryption in progress"));
     QCOMPARE(finished.count(), 0);
-    QVERIFY(model->isEncryptingWallet());
-    QVERIFY(SyntheticStateMatches(state, [](const auto& value) {
-        return value.encrypt_calls == 1 && value.encrypt_in_progress && !value.background_clone_destroyed;
-    }));
 
-    ReleaseSyntheticEncryption(state);
     external.join();
     QVERIFY(external.result);
+    QVERIFY(!model->isEncryptingWallet());
+    QCOMPARE(model->getEncryptionStatus(), WalletModel::Locked);
+    QVERIFY(SyntheticStateMatches(state, [](const auto& value) { return value.encrypt_calls == 1 && !value.background_clone_destroyed; }));
+}
+
+//! A model reports the wallet's own status while another caller encrypts it,
+//! even if nothing has asked for the status since the model was created. An
+//! encryptwallet call on an encrypted wallet announces itself while it waits
+//! for the locks, before it is refused, and must not show the wallet as
+//! unencrypted meanwhile.
+void TestEncryptingModelReportsStatusFromCreation(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    state->encrypted = true;
+    state->locked = true;
+    auto model{env.makeModel(state)};
+    AnnounceSyntheticEncryption(state, +1);
+    QVERIFY(model->isEncryptingWallet());
+    QCOMPARE(model->getEncryptionStatus(), WalletModel::Locked);
+    AnnounceSyntheticEncryption(state, -1);
     QVERIFY(WaitUntil([&model] { return !model->isEncryptingWallet(); }, 5000));
     QCOMPARE(model->getEncryptionStatus(), WalletModel::Locked);
-    QCOMPARE(finished.count(), 0);
+}
+
+//! A listener that throws when an encryption is announced does not leave the
+//! wallet reporting an encryption in progress, and the other listeners hear
+//! that it ended. One that throws when it ends does not end the process.
+void TestEncryptionInProgressScopeListenerThrows()
+{
+    const auto wallet{std::make_shared<CWallet>(/*chain=*/nullptr, "", CreateMockableWalletDatabase())};
+    std::vector<bool> seen;
+    bool throw_while_in_progress{true};
+    boost::signals2::scoped_connection connection{wallet->NotifyEncryptionInProgressChanged.connect([&] {
+        const bool in_progress{wallet->IsEncryptionInProgress()};
+        seen.push_back(in_progress);
+        if (in_progress == throw_while_in_progress) throw std::runtime_error{"listener failure"};
+    })};
+
+    QString thrown;
+    try {
+        const CWallet::EncryptionInProgressScope scope{*wallet};
+    } catch (const std::runtime_error& e) {
+        thrown = QString::fromUtf8(e.what());
+    }
+    QCOMPARE(thrown, QStringLiteral("listener failure"));
+    QVERIFY(!wallet->IsEncryptionInProgress());
+    QVERIFY(seen == (std::vector<bool>{true, false}));
+
+    seen.clear();
+    throw_while_in_progress = false;
+    {
+        const CWallet::EncryptionInProgressScope scope{*wallet};
+        QVERIFY(wallet->IsEncryptionInProgress());
+    }
+    QVERIFY(!wallet->IsEncryptionInProgress());
+    QVERIFY(seen == (std::vector<bool>{true, false}));
 }
 
 //! The encryptwallet RPC announces its encryption before it waits for the
@@ -5478,6 +5535,8 @@ void WalletTests::walletTests()
     TestExternalEncryptionFailureEndsMode(m_node);
     TestEncryptWalletRefusedDuringOtherEncryption(m_node);
     TestEncryptWalletResultWaitsForOtherEncryption(m_node);
+    TestEncryptingModelReportsStatusFromCreation(m_node);
+    TestEncryptionInProgressScopeListenerThrows();
     TestExternalEncryptionModelDestroyed(m_node);
     TestExternalEncryptionRealWallet(m_node);
     TestEncryptWalletRpcWaitingForKeypoolTopUp(m_node);

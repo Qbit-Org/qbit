@@ -239,6 +239,8 @@ private:
     // progress until it handles the wallet's notification that it ended, so
     // updates held back meanwhile are delivered before newer ones.
     mutable bool m_wallet_encrypting{false};
+    // Set while updateEncryptionInProgress() has queued endEncryptingWallet().
+    bool m_encryption_end_queued{false};
     // Encryption and PQC validation status last read from the wallet,
     // reported while it is being encrypted.
     mutable EncryptionStatus m_last_encryption_status{Unencrypted};
