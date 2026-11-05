@@ -2746,7 +2746,7 @@ void TestSendRequestExceptionReleasesSend(interfaces::Node& node, bool after_unl
     QObject::connect(mini_gui.walletModel.get(), &WalletModel::requireUnlock, mini_gui.walletModel.get(), [&] {
         if (throw_on_unlock) {
             throw_on_unlock = false;
-            throw NonFatalCheckError{"synthetic unlock failure", __FILE__, __LINE__, __func__};
+            throw NonFatalCheckError{"synthetic unlock failure", __FILE__, __LINE__, "TestSendRequestExceptionReleasesSend"};
         }
         std::lock_guard lock{state->mutex};
         state->locked = false;
