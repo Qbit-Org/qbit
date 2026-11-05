@@ -9,6 +9,7 @@
         "refs/heads/main",
         "refs/heads/0.1.x",
         "refs/heads/1.0.0",
+        "refs/heads/1.1.0",
         "refs/heads/1.x.x"
       ],
       "exclude": []

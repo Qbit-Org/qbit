@@ -55,7 +55,7 @@ document describes the repository after the operator applies these templates.
 | `.github/rulesets/0.1.x.json` | `refs/heads/0.1.x` | Restrict branch creation to bypass actors, require pull requests, one approval, resolved conversations, the merge-commit merge method only, `Required Merge Gate`, block deletion, and block non-fast-forward updates. Do not require the branch to be up to date before merging. |
 | `.github/rulesets/1.0.0.json` | `refs/heads/1.0.0` | Restrict branch creation to bypass actors, require pull requests, one approval, resolved conversations, the merge-commit merge method only, `Required Merge Gate`, block deletion, and block non-fast-forward updates. Do not require the branch to be up to date before merging. |
 | `.github/rulesets/1.x.x.json` | `refs/heads/1.x.x` | Restrict branch creation to bypass actors, require pull requests, one approval, resolved conversations, the merge-commit merge method only, `Required Merge Gate` and `Key Policy Gate (1.x.x)` (GitHub Actions, integration 15368), code-owner review, block deletion, and block non-fast-forward updates. Require the branch to be up to date before merging. |
-| `.github/rulesets/signed-commits.json` | `refs/heads/main`, `refs/heads/0.1.x`, `refs/heads/1.0.0`, `refs/heads/1.x.x` | Require a verified signature on every commit pushed to these branches, with no bypass actors. See [Signed Commits](#signed-commits). |
+| `.github/rulesets/signed-commits.json` | `refs/heads/main`, `refs/heads/0.1.x`, `refs/heads/1.0.0`, `refs/heads/1.1.0`, `refs/heads/1.x.x` | Require a verified signature on every commit pushed to these branches, with no bypass actors. See [Signed Commits](#signed-commits). |
 | `.github/rulesets/release-tags-v-creation.json` | `refs/tags/v*` | Restrict tag creation to organization admins and the release-maintainers team. |
 | `.github/rulesets/release-tags-v-immutability.json` | `refs/tags/v*` | Restrict tag updates and deletion to organization admins only. |
 | `.github/rulesets/upstream-refs.json` | `refs/heads/upstream/**` | Lock optional upstream reference branches so only bypass actors can create, update, or delete them. |
@@ -73,9 +73,11 @@ merging with `--admin` ("Repository rule violations found. Commits must have
 verified signatures."). It also refuses rebase merges under that rule. It allows
 a squash merge of the same pull request through `--admin` or the REST API,
 because GitHub signs the squash commit itself, so a squash merge would land
-unsigned work under GitHub's signature. Each pull request therefore lands as its
-one operator-signed commit (see [Signed Commits](#signed-commits)) plus GitHub's
-merge commit.
+unsigned work under GitHub's signature. By process, each pull request lands as
+one operator-signed commit made with `squash-sign` (see
+[Signed Commits](#signed-commits)), plus GitHub's merge commit. GitHub itself
+enforces only that every commit in the pull request is Verified; it does not
+check whose key signed it.
 
 GitHub ruleset pull request merge-method restrictions apply to the target refs
 selected by each ruleset. Enforce the same merge-commit-only policy for every
@@ -117,7 +119,14 @@ their IDs with:
 gh api repos/Qbit-Org/qbit/rulesets --jq '.[] | [.id, .name] | @tsv'
 ```
 
-Update an existing ruleset with PUT to that ruleset's own ID:
+Prefer editing an existing ruleset in the browser (Settings → Rules → Rulesets)
+until it matches its template. A PUT replaces the whole ruleset, so it can reset
+a key that exists only in the live ruleset. The branch templates carry the
+live-only pull request keys seen on 2026-11-05 (`dismissal_restriction`,
+`require_extra_approval_for_unattributed_changes`, and `required_reviewers`),
+but compare the template with the live ruleset
+(`gh api repos/Qbit-Org/qbit/rulesets/<ruleset-id>`) before any PUT. A PUT must
+target that ruleset's own ID:
 
 ```sh
 gh api \
@@ -127,10 +136,8 @@ gh api \
   --input .github/rulesets/main.json
 ```
 
-A PUT replaces the ruleset with the template, so compare the template with the
-live ruleset (`gh api repos/Qbit-Org/qbit/rulesets/<ruleset-id>`) first. Use the
-same command with the other template paths after reviewing their target refs and
-ruleset IDs.
+Use the same command with the other template paths after reviewing their target
+refs and ruleset IDs.
 
 A template that has no live ruleset yet, such as
 `.github/rulesets/signed-commits.json`, must create a new ruleset. Import it in
@@ -156,7 +163,9 @@ When migrating the live `v*` tag policy, replace the former combined
 gh api orgs/Qbit-Org/teams/release-maintainers --jq .id
 ```
 
-Apply the repository-wide merge-method policy with the repository API:
+Apply the repository-wide merge-method policy with the repository API. During
+the switch to merge commits, run it only at step 4 of the order below, after the
+branch rulesets allow merge commits:
 
 ```sh
 gh api \
@@ -166,45 +175,77 @@ gh api \
   --input .github/repository-settings/merge-methods.json
 ```
 
-After applying, confirm the rules GitHub enforces on each public branch, here
-`main`, and the same for `0.1.x`, `1.0.0`, and `1.x.x`:
+### Switching to Merge Commits
 
-```sh
-gh api repos/Qbit-Org/qbit/rules/branches/main --jq '.[].type'
-```
+Apply the merge-commit and signed-commit templates in the order below. GitHub
+blocks a merge when the methods a branch ruleset allows and the methods the
+repository enables do not overlap, so this order keeps pull requests mergeable
+at every step:
 
-The output should include `required_signatures` and `pull_request`, and should
-not include `required_linear_history`.
+1. Import `.github/rulesets/signed-commits.json` as a new ruleset. Confirm that
+   it has no bypass actors and that its enforcement is `active`.
+2. In Settings → General → Pull Requests, tick **Allow merge commits**. Leave
+   squash merging enabled for now.
+3. Edit each existing branch ruleset (`main`, `0.1.x`, `1.0.0`, and `1.x.x`):
+   untick "Require linear history" and set the allowed merge methods to Merge
+   only.
+4. Untick **Allow squash merging** and **Allow rebase merging**. The repository
+   now matches `.github/repository-settings/merge-methods.json`.
+5. Verify the new ruleset and the rules GitHub enforces on each branch:
+
+   ```sh
+   gh api repos/Qbit-Org/qbit/rulesets/<signed-commits-id> \
+     --jq '{enforcement,bypass_actors,current_user_can_bypass}'
+   gh api repos/Qbit-Org/qbit/rules/branches/main --jq '.[].type'
+   ```
+
+   The first command should print `active`, `[]`, and `never`. Run the second
+   for `main`, `0.1.x`, `1.0.0`, `1.1.0`, and `1.x.x`. Each output should
+   include `required_signatures` and should not include
+   `required_linear_history`; for every branch except `1.1.0` it should also
+   include `pull_request`.
 
 ## Signed Commits
 
 After the operator applies `.github/rulesets/signed-commits.json`, every commit
-pushed to `main`, `0.1.x`, `1.0.0`, or `1.x.x` must carry a signature that
-GitHub verifies. The rule lives in its own ruleset with no bypass actors, so the
-`OrganizationAdmin` bypass on the other branch rulesets does not exempt anyone
-from it. Add a new protected maintenance branch to its `include` list when that
-branch is created.
+pushed to `main`, `0.1.x`, `1.0.0`, `1.1.0`, or `1.x.x` must carry a signature
+that GitHub verifies. The rule lives in its own ruleset with no bypass actors,
+so the `OrganizationAdmin` bypass on the other branch rulesets does not exempt
+anyone from it. Add a new protected maintenance branch to its `include` list
+when that branch is created.
 
 The rule checks commits when they reach a protected branch, not while they sit
 on a pull request branch:
 
 - Draft and review commits on a pull request branch may be unsigned.
-- Before merge, the operator runs `squash-sign apply` on the pull request, which
-  reduces it to one commit signed with the operator's key. The pull request then
-  lands as that commit plus GitHub's merge commit, which GitHub signs.
+- Before merge, an agent runs `squash-sign apply` on the pull request, which
+  reduces it to one commit, and the operator signs that commit with one
+  hardware-key touch. The pull request then lands as that commit plus GitHub's
+  merge commit, which GitHub signs.
+- Every pull request with more than one commit needs `squash-sign apply` before
+  merge, even when all of its commits are signed, and so does any pull request
+  with an unsigned commit. Pull requests opened under the earlier squash-only
+  policy stay mergeable after the switch once `squash-sign apply` has run;
+  GitHub refuses the merge commit while any of their commits is unsigned.
 - Run `squash-sign apply` before the final approval. The rewrite is a push, so
   `dismiss_stale_reviews_on_push` and `require_last_push_approval` can require a
-  fresh approval from someone other than the operator.
-- A pull request opened under the earlier squash-only policy stays mergeable
-  after the switch, but GitHub refuses its merge commit while any of its commits
-  is unsigned. Run `squash-sign apply` on such a pull request, including one with
-  several unsigned commits, before merging it.
+  fresh approval from someone other than the pusher.
 
-The rule accepts any commit that GitHub verifies, including commits GitHub signs
-itself: web UI edits, GraphQL `createCommitOnBranch`, and commits made with
-`GITHUB_TOKEN` or by a GitHub App or bot. It does not prove that the operator
-signed a commit. `squash-sign verify` and a daily `squash-sign audit`, which run
-outside this repository, cover that gap.
+In repositories that merge with merge commits,
+`squash-sign merge --admin-approvals` may merge with `--admin` and so bypass the
+review requirement, but only after `squash-sign verify` passes, the required
+checks are green, and no reviewer has requested changes. The `signed-commits`
+ruleset has no bypass actors, so GitHub still refuses unsigned commits, even for
+admins.
+
+The rule accepts any commit that GitHub marks Verified. GitHub signs only
+commits it creates itself through its API or web UI: GraphQL
+`createCommitOnBranch`, a commit created through the API with `GITHUB_TOKEN`,
+and web UI edits. Those pass the rule without an operator signature. A bot that
+creates a commit locally and runs `git push` sends an unsigned commit, which
+GitHub refuses. `squash-sign verify` and a daily `squash-sign audit`, which run
+outside this repository, cover the GitHub-signed gap by process; the server
+does not.
 
 No recurring upstream sync exists; upstream history arrived once, on
 2026-06-17. `refs/heads/upstream/**` is outside the signature rule, so an
