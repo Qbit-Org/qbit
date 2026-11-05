@@ -2607,6 +2607,25 @@ std::vector<QMessageBox*> VisibleSendConfirmations()
     return dialogs;
 }
 
+//! Cancel every send confirmation that opens while this exists. Unlike
+//! ConfirmSend, it leaves nothing behind if the test fails before one opens.
+struct CancelSendConfirmations {
+    CancelSendConfirmations()
+    {
+        timer.setInterval(20);
+        QObject::connect(&timer, &QTimer::timeout, [this] {
+            for (QMessageBox* dialog : VisibleSendConfirmations()) {
+                ++cancelled;
+                dialog->button(QMessageBox::Cancel)->click();
+            }
+        });
+        timer.start();
+    }
+
+    QTimer timer;
+    int cancelled{0};
+};
+
 //! Press a button through its accessibility action, as VoiceOver or a UI
 //! automation client does. Unlike mouse and keyboard input, this reaches
 //! widgets in windows that a modal dialog blocks.
@@ -2697,10 +2716,12 @@ void TestSendPageActivationWhileConfirming(interfaces::Node& node, const QString
 }
 
 //! An exception can escape the send request after it marked the send in
-//! flight, here from the unlock request. ExceptionSafeConnect reports a
+//! flight: from the unlock request, or after the unlock from the wallet
+//! clone that starts the preparation. ExceptionSafeConnect reports a
 //! NonFatalCheckError and lets the application continue, so the request must
-//! release the send: the next Send has to reach the confirmation.
-void TestSendRequestExceptionReleasesSend(interfaces::Node& node)
+//! release the send and any unlock: the wallet must be locked again, and the
+//! next Send has to reach the confirmation.
+void TestSendRequestExceptionReleasesSend(interfaces::Node& node, bool after_unlock)
 {
     TestChain100Setup test{ChainType::REGTEST, {.extra_args = {"-p2mronly=0"}}};
     // The confirmation text asks the wallet loader whether several wallets are loaded.
@@ -2716,9 +2737,10 @@ void TestSendRequestExceptionReleasesSend(interfaces::Node& node)
     mini_gui.initModel(qt_test::MakeSyntheticWallet(wallet::PQCUsageReport{}, state), platform_style.get());
     mini_gui.walletModel->pollBalanceChanged();
 
-    // Stand in for the passphrase dialog: throw on the first request and
-    // unlock the wallet on the next.
-    bool throw_on_unlock{true};
+    // Stand in for the passphrase dialog: unless the clone throws, throw on
+    // the first request, and unlock the wallet otherwise.
+    bool throw_on_unlock{!after_unlock};
+    state->clone_throw = after_unlock;
     QObject::connect(mini_gui.walletModel.get(), &WalletModel::requireUnlock, mini_gui.walletModel.get(), [&] {
         if (throw_on_unlock) {
             throw_on_unlock = false;
@@ -2738,29 +2760,34 @@ void TestSendRequestExceptionReleasesSend(interfaces::Node& node)
     QString warning;
     new MessageBoxClicker({}, QMessageBox::Ok, &warning);
     send_button->click();
-    QVERIFY(warning.contains("synthetic unlock failure"));
+    QVERIFY(warning.contains(after_unlock ? "synthetic clone failure" : "synthetic unlock failure"));
     QVERIFY(!throw_on_unlock);
+    // The failed request relocked the wallet if it had unlocked it.
+    QVERIFY(SyntheticStateMatches(state, [&](const auto& value) {
+        return !value.clone_throw && value.locked && value.lock_calls == (after_unlock ? 1 : 0);
+    }));
 
-    QString confirmation;
-    ConfirmSend(&confirmation, QMessageBox::Cancel);
+    CancelSendConfirmations canceller;
     send_button->click();
-    QVERIFY(WaitUntil([&] { return !confirmation.isEmpty(); }, 10000));
+    QVERIFY(WaitUntil([&] { return canceller.cancelled == 1 && VisibleSendConfirmations().empty(); }, 10000));
     QCoreApplication::processEvents();
 
     // The second request unlocked the wallet and relocked it after preparing.
-    QVERIFY(SyntheticStateMatches(state, [](const auto& value) {
-        return value.locked && value.lock_calls == 1;
+    QVERIFY(SyntheticStateMatches(state, [&](const auto& value) {
+        return value.locked && value.lock_calls == (after_unlock ? 2 : 1);
     }));
     VerifyNoSendConfirmation();
 }
 
 //! BitcoinApplication::requestShutdown() deletes the wallet views, and the
-//! send dialogs they own, from whatever nested event loop is running, for
-//! example when the stop RPC or SIGTERM arrives while a send confirmation is
-//! open. Destroy the dialog, or only its model, from the confirmation's nested
-//! event loop. Nothing may be sent, and nothing may use the destroyed object:
-//! without the fix, an ASan build reports a heap-use-after-free of the dialog,
-//! and confirming without a model dereferences a null pointer.
+//! send dialogs they own, from whatever nested event loop is running. While a
+//! send confirmation is open, the stop RPC and SIGTERM wait for it to close,
+//! but File > Quit pressed through accessibility and macOS application
+//! termination (QEvent::Quit) do not. Destroy the dialog, or only its model,
+//! from the confirmation's nested event loop. Nothing may be sent, and nothing
+//! may use the destroyed object: without the fix, an ASan build reports a
+//! heap-use-after-free of the dialog, and confirming without a model
+//! dereferences a null pointer.
 void TestSendDestructionDuringConfirmation(interfaces::Node& node, bool destroy_dialog)
 {
     TestChain100Setup test{ChainType::REGTEST, {.extra_args = {"-p2mronly=0"}}};
@@ -4403,7 +4430,8 @@ void WalletTests::walletTests()
     TestSendCompletionAfterModelDestruction(m_node);
     TestSendPageActivationWhileConfirming(m_node, QStringLiteral("sendButton"));
     TestSendPageActivationWhileConfirming(m_node, QStringLiteral("clearButton"));
-    TestSendRequestExceptionReleasesSend(m_node);
+    TestSendRequestExceptionReleasesSend(m_node, /*after_unlock=*/false);
+    TestSendRequestExceptionReleasesSend(m_node, /*after_unlock=*/true);
     TestSendDestructionDuringConfirmation(m_node, /*destroy_dialog=*/true);
     TestSendDestructionDuringConfirmation(m_node, /*destroy_dialog=*/false);
     TestUnlockContextModelLifetime(m_node);

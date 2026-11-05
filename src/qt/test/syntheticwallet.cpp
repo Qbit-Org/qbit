@@ -10,6 +10,7 @@
 #include <policy/fees.h>
 #include <primitives/transaction.h>
 #include <script/script.h>
+#include <util/check.h>
 #include <util/translation.h>
 #include <wallet/wallet.h>
 
@@ -144,6 +145,12 @@ public:
     std::string getWalletName() override { return "synthetic-pqc-report"; }
     std::unique_ptr<interfaces::Wallet> clone() override
     {
+        {
+            std::lock_guard lock{m_state->mutex};
+            if (std::exchange(m_state->clone_throw, false)) {
+                throw NonFatalCheckError{"synthetic clone failure", __FILE__, __LINE__, __func__};
+            }
+        }
         return std::make_unique<SyntheticWallet>(m_report, m_state, /*background_clone=*/true);
     }
     util::Result<CTxDestination> getNewDestination(const OutputType, const std::string&) override { return CTxDestination{PKHash{}}; }
