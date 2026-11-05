@@ -288,6 +288,16 @@ RPCHelpMan encryptwallet()
         throw JSONRPCError(RPC_WALLET_ERROR, "Error: the wallet is currently being used to rescan the blockchain for related transactions. Please call `abortrescan` before encrypting the wallet.");
     }
 
+    // Announce the encryption before taking the locks below, which this call
+    // holds until the encryption has finished: the checks under them can
+    // wait for a background keypool top-up, and listeners such as the GUI
+    // must stop reading the wallet before they could wait for the locks. The
+    // fail-fast checks above run before the announcement, so a call that
+    // fails them announces nothing. A call that fails under the locks, or
+    // finds the wallet encrypted there, ends the announcement once it has
+    // released them.
+    const CWallet::EncryptionInProgressScope encryption_in_progress{*pwallet};
+
     // Hold the locks from the encryption-state check through the encryption
     // itself, so a call that overlaps another encryption reports the wallet
     // as already encrypted once that encryption has finished.
