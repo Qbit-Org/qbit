@@ -137,6 +137,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
+      # Release fuzz evidence is counted at the coverage anchors in
+      # test_qbit_fuzz_coverage.py. A source change that alters, removes or
+      # duplicates an anchored line fails here instead of when the evidence
+      # is next regenerated. These checks need no build.
+      - name: Test qbit fuzz tooling
+        run: |
+          python3 test/fuzz/test_qbit_fuzz_coverage.py --anchors-only
+          python3 test/fuzz/test_qbit_fuzz_runner.py
+          python3 test/fuzz/qbit_corpora/generate_seeds.py --check
+
       - name: Install build dependencies
         run: |
           sudo apt-get update
