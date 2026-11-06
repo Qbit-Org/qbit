@@ -319,6 +319,7 @@ class UpdateLibbitcoinpqcSubtreeTest(unittest.TestCase):
         self.assertIn("GOOD", result.stdout)
         self.assertEqual(self.state(repo), before)
 
+    @unittest.skipUnless(HAVE_GIT_2_45, "Git 2.45 or later is required")
     def test_refuses_staged_only_change(self) -> None:
         repo = self.make_downstream()
         (repo / "README").write_text("staged\n", encoding="utf8")
@@ -326,16 +327,19 @@ class UpdateLibbitcoinpqcSubtreeTest(unittest.TestCase):
         (repo / "README").write_text("qbit\n", encoding="utf8")
         self.assert_refused(repo, "the index has staged changes", "v0.3.2")
 
+    @unittest.skipUnless(HAVE_GIT_2_45, "Git 2.45 or later is required")
     def test_refuses_unstaged_change(self) -> None:
         repo = self.make_downstream()
         (repo / "README").write_text("unstaged\n", encoding="utf8")
         self.assert_refused(repo, "the worktree has changes", "v0.3.2")
 
+    @unittest.skipUnless(HAVE_GIT_2_45, "Git 2.45 or later is required")
     def test_refuses_untracked_file_under_prefix(self) -> None:
         repo = self.make_downstream()
         (repo / PREFIX / "stray.c").write_text("stray\n", encoding="utf8")
         self.assert_refused(repo, f"untracked files under {PREFIX}", "v0.3.2")
 
+    @unittest.skipUnless(HAVE_GIT_2_45, "Git 2.45 or later is required")
     def test_refuses_ignored_file_under_prefix(self) -> None:
         repo = self.make_downstream()
         (repo / PREFIX / "build").mkdir()
@@ -674,6 +678,7 @@ class UpdateLibbitcoinpqcSubtreeTest(unittest.TestCase):
             f"FAIL: signer certificate not found: {repo}/contrib/keys/operator-keys/public-keys/", result.stderr
         )
 
+    @unittest.skipUnless(HAVE_GIT_2_45, "Git 2.45 or later is required")
     def test_test_signer_options_are_refused_for_the_real_upstream(self) -> None:
         repo = self.make_downstream()
         rewritten = str(self.case_dir / "looks-local")
