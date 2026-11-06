@@ -196,6 +196,15 @@ on_first_parent_history() {
         | awk -v commit="$commit" '$0 == commit { found = 1 } END { exit !found }'
 }
 
+valid_branch_name() {
+    # Checks the full ref name, which, unlike check-ref-format --branch, never
+    # expands @{-N} from the current repository, and refuses a leading dash and
+    # HEAD as --branch does.
+    local name="$1"
+    [[ "$name" != -* && "$name" != HEAD ]] \
+        && git check-ref-format "refs/heads/$name" >/dev/null 2>&1
+}
+
 require_full_sha() {
     local name="$1"
     local value="$2"
@@ -1011,9 +1020,9 @@ require_git
 gh auth status >/dev/null
 require_full_sha --trusted-release-ref "$TRUSTED_RELEASE_REF"
 require_full_sha --guix-sigs-ref "$GUIX_SIGS_REF"
-git check-ref-format --branch "$TRUSTED_RELEASE_BRANCH" >/dev/null 2>&1 \
+valid_branch_name "$TRUSTED_RELEASE_BRANCH" \
     || die "--trusted-release-branch is not a valid branch name: $TRUSTED_RELEASE_BRANCH"
-git check-ref-format --branch "$GUIX_SIGS_BRANCH" >/dev/null 2>&1 \
+valid_branch_name "$GUIX_SIGS_BRANCH" \
     || die "--guix-sigs-branch is not a valid branch name: $GUIX_SIGS_BRANCH"
 msg "Trusted release branch: $GH_REPO:$TRUSTED_RELEASE_BRANCH"
 if [ "$TRUSTED_RELEASE_BRANCH_EXPLICIT" -eq 0 ]; then

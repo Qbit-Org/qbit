@@ -39,26 +39,36 @@ run_scanners = load_run_scanners()
 
 
 class RunScannersTest(unittest.TestCase):
-    def test_infra_and_secrets_fails_when_the_secret_scan_did_not_complete(self) -> None:
-        def summary(tool: str, status: str) -> dict[str, object]:
-            return {"tool": tool, "status": status, "high_or_critical_untriaged_count": 0}
+    def test_infra_and_secrets_fails_only_on_an_incomplete_secret_history_scan(self) -> None:
+        def summary(tool: str, status: str, gaps: list[str] = [], **details: object) -> dict[str, object]:
+            return {
+                "tool": tool, "status": status, "high_or_critical_untriaged_count": 0,
+                "coverage_gaps": gaps, "details": details,
+            }
 
-        zizmor_skipped = summary("zizmor", "skipped")
-        for status in ("skipped", "failed", "missing_tool", ""):
-            with self.subTest(status=status):
-                self.assertTrue(
-                    run_scanners.should_fail(
-                        "infra-and-secrets", [summary("gitleaks", status), zizmor_skipped]
-                    )
-                )
+        complete = summary("gitleaks", "completed", history_scan_complete=True)
+        # Informational gaps from other scanners do not fail the policy.
+        informational = [
+            summary("zizmor", "skipped", ["zizmor is too old for qbit workflow syntax"]),
+            summary("clang_static_analyzer", "skipped", ["Build-backed scanner skipped by --skip-build-scanners."]),
+        ]
+        self.assertFalse(run_scanners.should_fail("infra-and-secrets", [complete, *informational]))
+        incomplete = {
+            "skipped": summary("gitleaks", "skipped", ["skipped"]),
+            "failed": summary("gitleaks", "failed", ["Scanner command exited non-zero"]),
+            "missing_tool": summary("gitleaks", "missing_tool", ["Required executable is not on PATH: gitleaks"]),
+            "no status": summary("gitleaks", ""),
+            "old-Git fallback": summary(
+                "gitleaks", "completed", ["merge-only content was not scanned"], history_scan_complete=False
+            ),
+            "completeness not recorded": summary("gitleaks", "completed"),
+        }
+        for name, gitleaks in incomplete.items():
+            with self.subTest(gitleaks=name):
+                self.assertTrue(run_scanners.should_fail("infra-and-secrets", [gitleaks, *informational]))
         self.assertFalse(
-            run_scanners.should_fail(
-                "infra-and-secrets", [summary("gitleaks", "completed"), zizmor_skipped]
-            )
+            run_scanners.should_fail("infra-only", [incomplete["skipped"], incomplete["old-Git fallback"]])
         )
-        partial = dict(summary("gitleaks", "completed"), coverage_gaps=["merge-only content was not scanned"])
-        self.assertTrue(run_scanners.should_fail("infra-and-secrets", [partial]))
-        self.assertFalse(run_scanners.should_fail("infra-only", [summary("gitleaks", "skipped"), partial]))
 
     def test_zizmor_version_gate_rejects_old_python38_compatible_release(self) -> None:
         self.assertFalse(run_scanners.zizmor_version_supported("zizmor 1.2.0"))
@@ -708,7 +718,7 @@ class HistoryLogOptsTest(unittest.TestCase):
         with self.with_git_version("git version 2.36.0\n"):
             self.assertEqual(run_scanners.remerge_diff_git_gap(self.repo), "")
 
-    def test_old_git_scans_without_remerge_diff_and_records_the_gap(self) -> None:
+    def run_fake_gitleaks(self, git_version: str) -> tuple[dict, list[str]]:
         bin_dir = self.repo / "fake-bin"
         bin_dir.mkdir()
         fake = bin_dir / "gitleaks"
@@ -728,11 +738,23 @@ class HistoryLogOptsTest(unittest.TestCase):
         output_root = self.repo / "evidence"
         output_root.mkdir()
         path = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
-        with self.with_git_version("git version 2.35.1\n"), patch.dict(os.environ, {"PATH": path}):
+        with self.with_git_version(git_version), patch.dict(os.environ, {"PATH": path}):
             summary = run_scanners.run_scanner("gitleaks", args, output_root)
-        argv = argv_log.read_text(encoding="utf8").splitlines()
+        return summary, argv_log.read_text(encoding="utf8").splitlines()
+
+    def test_current_git_scans_merges_and_passes_the_policy(self) -> None:
+        summary, argv = self.run_fake_gitleaks("git version 2.50.1\n")
+        self.assertEqual(argv[argv.index("--log-opts") + 1], "--full-history --all --diff-filter=tuxdb --remerge-diff")
+        self.assertEqual(summary["status"], "completed")
+        self.assertEqual(summary["coverage_gaps"], [])
+        self.assertIs(summary["details"]["history_scan_complete"], True)
+        self.assertFalse(run_scanners.should_fail("infra-and-secrets", [summary]))
+
+    def test_old_git_scans_without_remerge_diff_and_records_the_gap(self) -> None:
+        summary, argv = self.run_fake_gitleaks("git version 2.35.1\n")
         self.assertEqual(argv[argv.index("--log-opts") + 1], "--full-history --all --diff-filter=tuxdb")
         self.assertEqual(summary["status"], "completed")
+        self.assertIs(summary["details"]["history_scan_complete"], False)
         self.assertEqual(len(summary["coverage_gaps"]), 1)
         self.assertIn("merge commits was not scanned", summary["coverage_gaps"][0])
         self.assertIn("git version 2.35.1", summary["coverage_gaps"][0])

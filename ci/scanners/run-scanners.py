@@ -1729,10 +1729,12 @@ def run_scanner(tool: str, args: argparse.Namespace, output_root: Path) -> dict[
     if report is not None:
         raw_paths.append(report)
     accepted_finding_exit_codes = accepts_finding_exit_codes(tool, exit_codes, counts)
-    details = {
+    details: dict[str, Any] = {
         "command_exit_codes": exit_codes,
         "finding_exit_codes_accepted": accepted_finding_exit_codes,
     }
+    if tool == "gitleaks":
+        details["history_scan_complete"] = not git_gap
     coverage_gaps = []
     if any(code != 0 for code in exit_codes) and not accepted_finding_exit_codes:
         coverage_gaps.append("Scanner command exited non-zero; inspect private raw output before trusting coverage.")
@@ -1856,6 +1858,20 @@ def validate_source_state(args: argparse.Namespace, checked_out_commit: str) -> 
         )
 
 
+def secret_scan_incomplete(summary: dict[str, Any]) -> bool:
+    """Whether a gitleaks summary leaves part of the history unscanned.
+
+    That is a gitleaks run that did not complete (skipped, failed or missing),
+    or one that completed without --remerge-diff on a Git older than 2.36 and
+    so missed content changed only in merge commits. A completed summary must
+    say its history scan was complete. No other coverage gap counts here.
+    """
+    if str(summary.get("status", "")) != "completed":
+        return True
+    details = summary.get("details")
+    return not (isinstance(details, dict) and details.get("history_scan_complete") is True)
+
+
 def should_fail(fail_policy: str, summaries: list[dict[str, Any]]) -> bool:
     if fail_policy == "never":
         return False
@@ -1868,14 +1884,14 @@ def should_fail(fail_policy: str, summaries: list[dict[str, Any]]) -> bool:
         )
         return infra_failed or high_critical_failed
     if fail_policy == "infra-and-secrets":
-        # This policy requires the whole secret scan, so a gitleaks run that
-        # did not complete, or completed with a coverage gap such as the
-        # merge-only content an old Git cannot show, fails like a finding.
+        # This policy requires the whole secret history scan, so a gitleaks
+        # run that left part of the history unscanned fails like a finding.
+        # Informational coverage gaps, such as a skipped zizmor or a skipped
+        # build-backed scanner, do not fail it.
         secret_failed = any(
             summary.get("tool") == "gitleaks"
             and (
-                str(summary.get("status", "")) != "completed"
-                or bool(summary.get("coverage_gaps"))
+                secret_scan_incomplete(summary)
                 or safe_int(summary.get("high_or_critical_untriaged_count", 0)) > 0
             )
             for summary in summaries

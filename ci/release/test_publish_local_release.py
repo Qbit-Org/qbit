@@ -1756,6 +1756,18 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--trusted-release-branch is not a valid branch name", result.stderr)
 
+    def test_branch_names_are_checked_as_full_refs(self) -> None:
+        # Run where @{-1} names a real branch: check-ref-format --branch would
+        # expand it and accept it.
+        git(self.trusted, "checkout", "-q", "-b", "previous")
+        git(self.trusted, "checkout", "-q", "main")
+        for option in ("--trusted-release-branch", "--guix-sigs-branch"):
+            for name in ("@{-1}", "a..b", "-x", "HEAD"):
+                with self.subTest(option=option, name=name):
+                    result = self.run_publisher(option, name, cwd=self.trusted)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(f"{option} is not a valid branch name: {name}", result.stderr)
+
     def test_branch_name_is_percent_encoded_in_the_api_path(self) -> None:
         # A valid branch name can contain '#'. Unencoded, it would start a URL
         # fragment and the publisher would read main instead.
