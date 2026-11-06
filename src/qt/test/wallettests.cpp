@@ -76,6 +76,7 @@
 #include <QClipboard>
 #include <QColor>
 #include <QComboBox>
+#include <QDateTime>
 #include <QElapsedTimer>
 #include <QEvent>
 #include <QFrame>
@@ -3306,6 +3307,55 @@ void TestFeeBumpSuccessKeepsUsageVisible(interfaces::Node& node)
     QVERIFY(usage_widget->isHidden());
 }
 
+//! The usage panel is labelled with the time the bump was committed. A usage
+//! warning is shown modally before the panel updates, so the time it is
+//! displayed can be much later.
+void TestFeeBumpUsageShowsCommitTime(interfaces::Node& node)
+{
+    SyntheticModelEnvironment env{node};
+    const wallet::PQCUsageReport report{qt_test::MakeSyntheticPQCUsageReport({{NewPQCPubKey(), wallet::PQC_WARNING_SIGNATURE_THRESHOLD}})};
+    auto state{std::make_shared<qt_test::SyntheticWalletState>()};
+    state->bump_enabled = true;
+    auto model{env.makeModel(state, report)};
+    const ReleaseSyntheticBumpOnExit release_on_exit{state};
+    TransactionView view{env.platform_style.get()};
+    view.setModel(model.get());
+    QLabel* const usage_label{view.findChild<QLabel*>("feeBumpUsageLabel")};
+    QVERIFY(usage_label);
+
+    QDateTime warning_shown_at;
+    unsigned int warning_style{0};
+    QObject::connect(model.get(), &WalletModel::message, [&](const QString&, const QString&, unsigned int style) {
+        warning_style = style;
+        warning_shown_at = QDateTime::currentDateTime();
+        // Stand in for the time the user takes to dismiss the modal warning.
+        std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    });
+    Txid bumped_txid;
+    QString usage;
+    QDateTime committed_at;
+    QSignalSpy completed{model.get(), &WalletModel::feeBumped};
+    QObject::connect(model.get(), &WalletModel::feeBumped, [&](const Txid&, const Txid& bumped, const QString& pqc_usage, const QDateTime& time) {
+        bumped_txid = bumped;
+        usage = pqc_usage;
+        committed_at = time;
+    });
+    ConfirmSend(nullptr, QMessageBox::Yes);
+    QVERIFY(model->bumpFee(Txid{}));
+    QVERIFY(WaitUntil([&completed] { return completed.count() == 1; }, 5000));
+    QCOMPARE(warning_style, static_cast<unsigned int>(CClientUIInterface::MSG_WARNING));
+    QVERIFY(committed_at.isValid());
+    QVERIFY(committed_at <= warning_shown_at);
+    QVERIFY2(usage_label->text().contains("(" + GUIUtil::dateTimeStr(committed_at) + ")"), qPrintable(usage_label->text()));
+
+    // The panel shows the commit time it is given, however long ago that was.
+    const QDateTime earlier{QDate{2026, 1, 2}, QTime{3, 4}};
+    Q_EMIT model->feeBumped(Txid{}, bumped_txid, usage, earlier);
+    const QString text{usage_label->text()};
+    QVERIFY2(text.startsWith(QString{"Fee bump replacement %1 (%2)"}.arg(QString::fromStdString(bumped_txid.ToString()), GUIUtil::dateTimeStr(earlier))),
+             qPrintable(text));
+}
+
 void TestUsageIsAttemptLocal(interfaces::Node& node)
 {
     const wallet::PQCUsageReport report{qt_test::MakeSyntheticPQCUsageReport({{NewPQCPubKey(), 6}, {NewPQCPubKey(), PQC_MAX_SIGNATURES}})};
@@ -4544,6 +4594,7 @@ void WalletTests::walletTests()
     TestFeeBumpCommitFailureKeepsUsage(m_node);
     TestFeeBumpSuccessShowsUsage(m_node);
     TestFeeBumpSuccessKeepsUsageVisible(m_node);
+    TestFeeBumpUsageShowsCommitTime(m_node);
     TestUsageIsAttemptLocal(m_node);
     TestUsageStaysOutOfPortableArtifacts(m_node);
     TestFeeBumpModelDestroyedDuringPrepareFailure(m_node);

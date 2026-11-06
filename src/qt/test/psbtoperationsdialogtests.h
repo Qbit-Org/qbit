@@ -33,6 +33,13 @@ private Q_SLOTS:
     void lateCancellationDoesNotDropCompletedPSBT();
     void cancellationAfterCounterReservationIsIgnored();
     void dialogDestructionBeforeCompletion();
+    void closeIgnoredWhileSigning();
+    void canceledProgressStaysVisibleUntilWorkerReports();
+    void shutdownCancelsSigningBeforeReservation();
+    void shutdownLogsSigningFinishedAfterReservation();
+    void shutdownSavesPartialSignature();
+    void destructionAfterReservationSavesSignedPSBT();
+    void shutdownLogsUnexportedSignedPSBT();
     void walletUnloadDuringSigning();
     void signingFailurePreservesOriginalPSBT();
     void usageStatesOnSuccessAndFailure();

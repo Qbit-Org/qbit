@@ -17,6 +17,7 @@
 #include <qt/clientmodel.h>
 #include <qt/walletmodel.h>
 
+class QCloseEvent;
 class QProgressBar;
 class QProgressDialog;
 class QThread;
@@ -38,12 +39,28 @@ public:
     ~PSBTOperationsDialog();
 
     void openWithPSBT(PartiallySignedTransaction psbtx);
+    /**
+     * Cancel a signing attempt that has not reserved PQC counters yet and
+     * close its progress dialog. Every window is hidden during shutdown, so
+     * the outcome of an attempt that still finishes goes to the debug log,
+     * and a signed PSBT not yet copied, saved or broadcast is saved to the
+     * data directory.
+     */
+    void prepareForShutdown();
 
 public Q_SLOTS:
     void signTransaction();
     void broadcastTransaction();
     void copyToClipboard();
     void saveTransaction();
+    //! Ignored until the signing worker reports, see closeEvent().
+    void reject() override;
+
+protected:
+    //! Ignored until the signing worker reports: destroying the dialog would
+    //! block the GUI thread until the worker finishes and drop the result
+    //! from view.
+    void closeEvent(QCloseEvent* event) override;
 
 private:
     struct SignResult;
@@ -56,10 +73,16 @@ private:
     QPointer<QProgressDialog> m_sign_progress_dialog;
     QPointer<QProgressBar> m_sign_progress_bar;
     QThread* m_sign_thread{nullptr};
+    //! Outcome of the running signing attempt, until signTransactionFinished()
+    //! takes it. The worker writes it; read it only after the worker reports.
+    std::shared_ptr<SignResult> m_pending_sign_result;
     uint64_t m_sign_generation{0};
     std::atomic_bool m_sign_cancel_requested{false};
     std::atomic_bool m_sign_counters_reserved{false};
     std::shared_ptr<const wallet::PQCUsageReport> m_last_sign_pqc_usage;
+    bool m_shutdown_requested{false};
+    //! This dialog added signatures that were not copied, saved or broadcast yet.
+    bool m_signatures_unexported{false};
 
     enum class StatusLevel {
         INFO,
@@ -74,6 +97,8 @@ private:
     void showTransactionStatus(const PartiallySignedTransaction &psbtx);
     void signTransactionProgress(uint64_t generation, SigningProgress progress);
     void signTransactionFinished(uint64_t generation, std::shared_ptr<SignResult> result);
+    //! Report the outcome of an attempt the dialog can no longer show.
+    static void logUnshownSignResult(const SignResult& result);
 
 private Q_SLOTS:
     void cancelSignTransaction();

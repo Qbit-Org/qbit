@@ -7,6 +7,7 @@
 
 #include <interfaces/wallet.h>
 #include <primitives/transaction.h>
+#include <psbt.h>
 #include <wallet/pqc_usage.h>
 
 #include <chrono>
@@ -27,6 +28,10 @@ namespace qt_test {
 struct SyntheticWalletState {
     std::mutex mutex;
     std::condition_variable condition;
+    //! Wallet name, set before the wallet is created and not guarded by
+    //! mutex. WalletController keeps one model per name, so wallets adopted
+    //! side by side need different names.
+    std::string wallet_name{"synthetic-pqc-report"};
     bool create_entered{false};
     bool allow_create{true};
     bool wait_for_cancel{false};
@@ -91,12 +96,21 @@ struct SyntheticWalletState {
     bool allow_psbt_completion{true};
     bool allow_psbt_post_signing{true};
     bool psbt_simulate_pqc_reservation{false};
+    //! Pause between the last cancellable progress report and the simulated
+    //! reservation, where a cancellation request arrives too late to stop it.
+    bool psbt_counter_boundary_entered{false};
+    bool allow_psbt_counter_boundary{true};
     bool psbt_counters_reserved{false};
     bool psbt_input_signed{false};
     bool psbt_cancel_observed{false};
     bool psbt_sign_finished{false};
     bool psbt_fail{false};
     bool psbt_fail_before_reservation{false};
+    //! Add a partial signature, as one cosigner of a multisig input does,
+    //! instead of finalizing the input. FillPSBT then counts no signed input.
+    bool psbt_partial_signature{false};
+    //! The PSBT the last signing call produced.
+    PartiallySignedTransaction psbt_signed_result;
     int psbt_sign_calls{0};
     std::thread::id psbt_sign_thread;
     int lock_calls{0};

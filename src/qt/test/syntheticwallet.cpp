@@ -6,6 +6,7 @@
 
 #include <common/types.h>
 #include <interfaces/handler.h>
+#include <key.h>
 #include <outputtype.h>
 #include <policy/fees.h>
 #include <primitives/transaction.h>
@@ -144,7 +145,7 @@ public:
     bool changeWalletPassphrase(const SecureString&, const SecureString&) override { return false; }
     void abortRescan() override {}
     bool backupWallet(const std::string&) override { return false; }
-    std::string getWalletName() override { return "synthetic-pqc-report"; }
+    std::string getWalletName() override { return m_state->wallet_name; }
     std::unique_ptr<interfaces::Wallet> clone() override
     {
         {
@@ -566,6 +567,7 @@ public:
             m_state->psbt_sign_entered = true;
             m_state->psbt_sign_thread = std::this_thread::get_id();
             ++m_state->psbt_sign_calls;
+            m_state->psbt_signed_result = {};
         }
         m_state->condition.notify_all();
 
@@ -622,7 +624,10 @@ public:
                 return common::PSBTError::INCOMPLETE;
             }
             {
-                std::lock_guard lock{m_state->mutex};
+                std::unique_lock lock{m_state->mutex};
+                m_state->psbt_counter_boundary_entered = true;
+                m_state->condition.notify_all();
+                m_state->condition.wait(lock, [this] { return m_state->allow_psbt_counter_boundary; });
                 m_state->psbt_counters_reserved = true;
             }
             m_state->condition.notify_all();
@@ -646,10 +651,20 @@ public:
             return common::PSBTError::INCOMPLETE;
         }
 
-        if (!psbtx.inputs.empty()) {
-            psbtx.inputs.front().final_script_witness.stack = {{0x01}};
+        bool partial_signature{false};
+        {
+            std::lock_guard lock{m_state->mutex};
+            partial_signature = m_state->psbt_partial_signature;
         }
-        if (n_signed) *n_signed = psbtx.inputs.empty() ? 0 : 1;
+        if (!psbtx.inputs.empty()) {
+            if (partial_signature) {
+                const CPubKey pubkey{GenerateRandomKey().GetPubKey()};
+                psbtx.inputs.front().partial_sigs.emplace(pubkey.GetID(), SigPair{pubkey, {0x30, 0x01}});
+            } else {
+                psbtx.inputs.front().final_script_witness.stack = {{0x01}};
+            }
+        }
+        if (n_signed) *n_signed = psbtx.inputs.empty() || partial_signature ? 0 : 1;
         if (pqc_usage) *pqc_usage = m_report;
         {
             std::lock_guard lock{m_state->mutex};
@@ -672,7 +687,11 @@ public:
             std::lock_guard lock{m_state->mutex};
             fail = m_state->psbt_fail;
         }
-        complete = !fail;
+        complete = !fail && !partial_signature;
+        {
+            std::lock_guard lock{m_state->mutex};
+            m_state->psbt_signed_result = psbtx;
+        }
         finish(/*cancel_observed=*/false);
         return fail ? std::make_optional(common::PSBTError::SIGHASH_MISMATCH) : std::nullopt;
     }
