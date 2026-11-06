@@ -190,6 +190,7 @@ BASE_SCRIPTS = [
     'wallet_pubkeydb_pool.py',
     'wallet_pqc_usage.py',
     'wallet_p2mr_psbt.py',
+    'wallet_p2mr_plaintext_reencryption.py',
     'wallet_p2mr_multisig_restart.py',
     'interface_bitcoin_cli.py',
     'feature_bind_extra.py',
