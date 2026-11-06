@@ -208,6 +208,9 @@ void WalletView::showOutOfSyncWarning(bool fShow)
 
 void WalletView::encryptWallet()
 {
+    // The wallet is being encrypted, for example by the encryptwallet RPC.
+    // Say so before the user chooses a passphrase.
+    if (walletModel->refuseWhileEncrypting()) return;
     const wallet::PQCKeyValidationInfo pqc_validation{walletModel->getPQCKeyValidationInfo()};
     if (pqc_validation.pending_records > 0) {
         Q_EMIT message(tr("Wallet encryption unavailable"),

@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <exception>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include <QDateTime>
@@ -113,15 +114,23 @@ public:
 
     // Wallet encryption. Runs the wallet's encryption on a worker thread so
     // the GUI keeps processing events, and reports the outcome through
-    // encryptWalletFinished(). Returns false, and starts nothing, while an
-    // earlier encryption is still running. The worker holds the wallet locks
-    // until it returns, so getEncryptionStatus() and getPQCKeyValidationInfo()
-    // answer from the values taken before it started while it runs, and the
-    // transaction table holds back updates that would read the wallet. An
-    // exception from the wallet is rethrown on the GUI thread rather than
-    // reported as a failure: the encryption may already have committed.
+    // encryptWalletFinished(). While any encryption is running it starts
+    // nothing and returns false, after refuseWhileEncrypting() has told the
+    // user. An exception from the wallet is rethrown on the GUI thread rather
+    // than reported as a failure: the encryption may already have committed.
     bool encryptWallet(const SecureString& passphrase);
-    bool isEncryptingWallet() const { return m_encrypt_wallet_active; }
+    // Whether the wallet is being encrypted, by encryptWallet() or by any
+    // other caller such as the encryptwallet RPC. The encryption holds the
+    // wallet locks until it returns, so meanwhile getEncryptionStatus() and
+    // getPQCKeyValidationInfo() answer from the values last read, the address
+    // table answers labels from its rows, and status, keypool and transaction
+    // table updates that would read the wallet are held back. They are
+    // delivered once the wallet reports that the encryption has finished,
+    // followed by walletEncryptionEnded().
+    bool isEncryptingWallet() const;
+    // While the wallet is being encrypted, tell the user to wait through
+    // message() and return true; otherwise return false.
+    bool refuseWhileEncrypting();
     // Passphrase only needed when unlocking
     bool setWalletLocked(bool locked, const SecureString &passPhrase=SecureString());
     bool changePassphrase(const SecureString &oldPass, const SecureString &newPass);
@@ -186,6 +195,7 @@ private:
     std::unique_ptr<interfaces::Handler> m_handler_transaction_changed;
     std::unique_ptr<interfaces::Handler> m_handler_show_progress;
     std::unique_ptr<interfaces::Handler> m_handler_can_get_addrs_changed;
+    std::unique_ptr<interfaces::Handler> m_handler_encryption_in_progress_changed;
     ClientModel* m_client_model;
     interfaces::Node& m_node;
 
@@ -224,17 +234,29 @@ private:
     QThread* m_encrypt_wallet_thread{nullptr};
     uint64_t m_encrypt_wallet_generation{0};
     bool m_encrypt_wallet_active{false};
-    // PQC validation status from before the encryption started, reported
-    // while the worker holds the wallet locks. cachedEncryptionStatus serves
-    // the encryption status the same way.
-    wallet::PQCKeyValidationInfo m_encrypt_wallet_pqc_info;
+    // Outcome of this model's encryptWallet() worker, held until the wallet
+    // has also reported the end of every encryption in progress.
+    std::optional<bool> m_encrypt_wallet_result;
+    // Set from the moment the model sees the wallet report an encryption in
+    // progress until it handles the wallet's notification that it ended, so
+    // updates held back meanwhile are delivered before newer ones.
+    mutable bool m_wallet_encrypting{false};
+    // Set while updateEncryptionInProgress() has queued endEncryptingWallet()
+    // and no refresh has run since.
+    bool m_encryption_end_queued{false};
+    // Encryption and PQC validation status last read from the wallet,
+    // reported while it is being encrypted.
+    mutable EncryptionStatus m_last_encryption_status{Unencrypted};
+    mutable wallet::PQCKeyValidationInfo m_last_pqc_key_validation_info;
     // The wallet raises this notification while it still holds its locks
-    // during encryption. It is held back until the worker returns so no
-    // listener blocks the GUI thread on those locks.
+    // during encryption. It is held back until the encryption has finished so
+    // no listener blocks the GUI thread on those locks.
     bool m_can_get_addresses_changed_deferred{false};
 
     void finishEncryptWallet(uint64_t generation, bool success, std::exception_ptr exception);
     void finishEncryptWalletThread();
+    void endEncryptingWallet();
+    EncryptionStatus readEncryptionStatus() const;
 
     bool fForceCheckBalanceChanged{false};
 
@@ -292,6 +314,10 @@ Q_SIGNALS:
     // the worker has released the wallet.
     void encryptWalletFinished(bool success);
 
+    // The wallet is no longer being encrypted, whoever started the
+    // encryption, and the updates held back meanwhile have been delivered.
+    void walletEncryptionEnded();
+
     // A fee-bump replacement was committed by the background worker.
     // pqc_usage is the formatted PQC signing usage the bump consumed, or empty
     // when it consumed none. committed_at is the local time the commit
@@ -313,6 +339,8 @@ public Q_SLOTS:
     void updateAddressBook(const QString &address, const QString &label, bool isMine, wallet::AddressPurpose purpose, int status);
     /* Keypool availability might have changed */
     void updateCanGetAddresses();
+    /* The wallet started or finished an encryption */
+    void updateEncryptionInProgress();
     /* Current, immature or unconfirmed balance might have changed - emit 'balanceChanged' if so */
     void pollBalanceChanged();
 };

@@ -91,6 +91,11 @@ public:
     //! Return whether wallet is encrypted.
     virtual bool isCrypted() = 0;
 
+    //! Return whether the wallet is being encrypted, by this interface or any
+    //! other caller such as the encryptwallet RPC. Does not wait for the
+    //! wallet locks, which the encryption holds until it returns.
+    virtual bool isEncryptionInProgress() = 0;
+
     //! Lock wallet.
     virtual bool lock() = 0;
 
@@ -344,6 +349,12 @@ public:
     //! Register handler for keypool changed messages.
     using CanGetAddressesChangedFn = std::function<void()>;
     virtual std::unique_ptr<Handler> handleCanGetAddressesChanged(CanGetAddressesChangedFn fn) = 0;
+
+    //! Register handler for messages that an encryption started or finished,
+    //! see isEncryptionInProgress(). Called on the encrypting thread, possibly
+    //! with the wallet locks held, so the handler must not wait for them.
+    using EncryptionInProgressChangedFn = std::function<void()>;
+    virtual std::unique_ptr<Handler> handleEncryptionInProgressChanged(EncryptionInProgressChangedFn fn) = 0;
 
     //! Return pointer to internal wallet class, useful for testing.
     virtual wallet::CWallet* wallet() { return nullptr; }

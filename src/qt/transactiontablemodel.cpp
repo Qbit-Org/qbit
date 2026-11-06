@@ -276,9 +276,9 @@ void TransactionTableModel::updateAmountColumnTitle()
 
 void TransactionTableModel::updateTransaction(const QString &hash, int status, bool showTransaction)
 {
-    // A new transaction is read from the wallet, which blocks while the
-    // encryption worker holds the wallet locks. Hold the update back until
-    // the wallet model reports that the worker has returned.
+    // A new transaction is read from the wallet, which blocks while an
+    // encryption holds the wallet locks, whoever started it. Hold the update
+    // back until the wallet model reports that the encryption has finished.
     if (walletModel->isEncryptingWallet()) {
         m_deferred_updates.emplace_back([this, hash, status, showTransaction] { updateTransaction(hash, status, showTransaction); });
         return;
