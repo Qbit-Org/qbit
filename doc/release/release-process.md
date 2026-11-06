@@ -59,8 +59,11 @@ It must be on the first-parent history of the protected branch that the
 publisher checks: `main` by default, or the branch passed with
 `--trusted-release-branch` for a release line. GitHub must report that branch as
 protected, and its active rules must include `non_fast_forward` and `deletion`,
-so the history it anchors cannot be force-pushed away or deleted. The publisher
-fetches the exact tip commit GitHub's API reports for
+so someone without admin rights cannot force-push away the history it anchors
+or delete the branch. qbit's branch rulesets give organization admins an
+always-bypass, so an admin can still rewrite that history: the release's
+attestation is the operator-signed tag, and this check guards against rewrites
+by non-admins. The publisher fetches the exact tip commit GitHub's API reports for
 it, authenticating through `gh`, and refuses a trusted ref off that line, such
 as a pull request head, which could carry validators and key policy from an
 older base. The publisher prints the trusted release branch it uses and, when

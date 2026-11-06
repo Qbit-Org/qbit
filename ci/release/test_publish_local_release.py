@@ -1828,6 +1828,9 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
             "Qbit-Org/qbit-guix.sigs:main",
             result.stderr,
         )
+        self.assertIn(
+            "pin the merge commit that landed the attestations, not the pull request head", result.stderr
+        )
 
 
 def extract_shell_function(source: str, name: str) -> str:

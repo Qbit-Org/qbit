@@ -439,7 +439,10 @@ fetch_branch_tip() {
     # Prints the tip of a protected GitHub branch after fetching exactly that
     # commit into a local checkout, so its first-parent history can be read
     # locally. The branch's active rules must forbid force pushes and deletion,
-    # so the history it anchors cannot be rewritten. Fetching the SHA the API
+    # so someone without admin rights cannot rewrite the history it anchors.
+    # qbit's branch rulesets let organization admins bypass them, so an admin
+    # still can: the release's attestation is the operator-signed tag, and this
+    # check guards against rewrites by everyone else. Fetching the SHA the API
     # reported, not the moving branch, keeps a merge that lands meanwhile from
     # breaking the release partway. gh's credential helper lets the fetch reach
     # a private repository.
@@ -1120,7 +1123,7 @@ GUIX_SIGS_BRANCH_TIP="$(
     fetch_branch_tip "$GUIX_SIGS_REPO" "$GUIX_SIGS_GH_REPO_PATH" "$GUIX_SIGS_BRANCH" "qbit-guix.sigs"
 )"
 on_first_parent_history "$GUIX_SIGS_REPO" "$GUIX_SIGS_BRANCH_TIP" "$GUIX_SIGS_REF" \
-    || die "qbit-guix.sigs commit $GUIX_SIGS_REF must be on the first-parent history of $GUIX_SIGS_GH_REPO:$GUIX_SIGS_BRANCH ($GUIX_SIGS_BRANCH_TIP)"
+    || die "qbit-guix.sigs commit $GUIX_SIGS_REF must be on the first-parent history of $GUIX_SIGS_GH_REPO:$GUIX_SIGS_BRANCH ($GUIX_SIGS_BRANCH_TIP): pin the merge commit that landed the attestations, not the pull request head"
 
 verify_remote_tag_pin initial
 
