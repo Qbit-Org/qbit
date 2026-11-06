@@ -201,9 +201,10 @@ WalletModel* WalletController::getOrCreateWalletOnGuiThread(std::unique_ptr<inte
     wallet_model->startPollBalance();
 
     connect(wallet_model, &WalletModel::unload, this, [this, wallet_model] {
-        // Defer removeAndDeleteWallet while the user is still in a dialog: a
-        // nested event loop could return into the deleted wallet view, even
-        // one underneath a progress dialog.
+        // Defer removeAndDeleteWallet while a dialog's nested event loop, or
+        // a native dialog's modal loop, runs, even underneath a progress
+        // dialog: it could return into the deleted wallet view. Qt dialogs
+        // shown without a loop of their own do not hold the unload up.
         // TODO: remove this workaround by removing usage of QDialog::exec.
         if (!GUIUtil::IsUserInteractionPending()) {
             removeAndDeleteWallet(wallet_model);

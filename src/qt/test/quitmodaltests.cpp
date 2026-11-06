@@ -18,6 +18,7 @@
 #include <qt/bitcoinamountfield.h>
 #include <qt/bitcoingui.h>
 #include <qt/guiconstants.h>
+#include <qt/guiutil.h>
 #include <qt/networkstyle.h>
 #include <qt/qvalidatedlineedit.h>
 #include <qt/sendcoinsdialog.h>
@@ -43,6 +44,7 @@
 #include <QCompleter>
 #include <QDialog>
 #include <QEvent>
+#include <QEventLoop>
 #include <QLineEdit>
 #include <QMenu>
 #include <QMessageBox>
@@ -63,9 +65,9 @@ using namespace std::chrono_literals;
 constexpr auto STEP_TIMEOUT{60s};
 //! Long enough for a deferred shutdown to be retried several times.
 constexpr auto RETRY_SPAN{3 * SHUTDOWN_POLLING_DELAY};
-//! A build without the fix joins a held worker during shutdown. Release it
-//! this long after the quit so such a run fails instead of hanging.
-constexpr auto LATCH_RELEASE_DELAY{30s};
+//! The shutdown's teardown waits for a held wallet worker that cannot be
+//! cancelled. Release the worker this long after the quit.
+constexpr auto TEARDOWN_RELEASE_DELAY{100ms};
 #if QT_CONFIG(process)
 constexpr int CHILD_TIMEOUT_MS{300'000};
 #endif
@@ -157,22 +159,31 @@ bool ReadState(const std::shared_ptr<qt_test::SyntheticWalletState>& state, Pred
     return predicate(*state);
 }
 
-void Allow(const std::shared_ptr<qt_test::SyntheticWalletState>& state, bool qt_test::SyntheticWalletState::*flag)
+template <typename Predicate>
+bool WaitForState(const std::shared_ptr<qt_test::SyntheticWalletState>& state, Predicate&& predicate)
 {
-    {
-        std::lock_guard lock{state->mutex};
-        state.get()->*flag = true;
-    }
-    state->condition.notify_all();
+    std::unique_lock lock{state->mutex};
+    return state->condition.wait_for(lock, STEP_TIMEOUT, [&] { return predicate(*state); });
 }
 
-//! Release a held synthetic wallet worker from another thread if the
-//! scenario has not done so in time.
+//! Show dialog as Qt shows the widget standing in for a native message box or
+//! file dialog: QMessageBoxPrivate::setVisible() and
+//! QFileDialogPrivate::setVisible() set WA_DontShowOnScreen once the native
+//! dialog is shown, then show the widget, which stays off screen.
+void ShowAsNativeDialog(QDialog& dialog)
+{
+    dialog.setAttribute(Qt::WA_DontShowOnScreen);
+    dialog.setWindowModality(Qt::ApplicationModal);
+    dialog.show();
+}
+
+//! Release a held synthetic wallet worker from another thread, while the GUI
+//! thread may be waiting for it.
 std::thread ReleaseLater(std::shared_ptr<qt_test::SyntheticWalletState> state, bool qt_test::SyntheticWalletState::*flag)
 {
     return std::thread{[state = std::move(state), flag] {
         std::unique_lock lock{state->mutex};
-        if (!state->condition.wait_for(lock, LATCH_RELEASE_DELAY, [&] { return state.get()->*flag; })) {
+        if (!state->condition.wait_for(lock, TEARDOWN_RELEASE_DELAY, [&] { return state.get()->*flag; })) {
             state.get()->*flag = true;
             lock.unlock();
             state->condition.notify_all();
@@ -185,6 +196,49 @@ int QuitModalTests::RunScenario(BitcoinApplication& app, const QString& scenario
 {
     QuitModalScenario test{app, scenario};
     return QTest::qExec(&test);
+}
+
+//! Shutdown and wallet unload wait only for a dialog's nested event loop,
+//! which would return into the deleted wallet views. A modal dialog shown
+//! without a loop of its own, as the PSBT dialog is, does not hold them up.
+void QuitModalTests::pendingOnlyInNestedLoop()
+{
+    bool async_modal{false};
+    bool async_pending{true};
+    bool exec_pending{false};
+    bool native_pending{false};
+    bool native_closed_pending{true};
+    // QTest runs this outside any event loop, so this loop stands in for the
+    // application's, from which shutdown and wallet unload run.
+    QEventLoop loop;
+    QPointer<QDialog> async_dialog;
+    QTimer::singleShot(0, &loop, [&] {
+        async_dialog = new QDialog;
+        GUIUtil::ShowModalDialogAsynchronously(async_dialog);
+        async_modal = async_dialog->isVisible() && async_dialog->isModal();
+        async_pending = GUIUtil::IsUserInteractionPending();
+        // The send confirmation runs QDialog::exec().
+        QDialog exec_dialog;
+        QTimer::singleShot(0, &exec_dialog, [&] {
+            exec_pending = GUIUtil::IsUserInteractionPending();
+            exec_dialog.reject();
+        });
+        exec_dialog.exec();
+        // A native dialog runs the platform's modal loop, not a QEventLoop.
+        QDialog native_dialog;
+        ShowAsNativeDialog(native_dialog);
+        native_pending = GUIUtil::IsUserInteractionPending();
+        native_dialog.hide();
+        native_closed_pending = GUIUtil::IsUserInteractionPending();
+        loop.quit();
+    });
+    loop.exec();
+    delete async_dialog;
+    QVERIFY(async_modal);
+    QVERIFY(!async_pending);
+    QVERIFY(exec_pending);
+    QVERIFY(native_pending);
+    QVERIFY(!native_closed_pending);
 }
 
 void QuitModalTests::quitDuringDialog_data()
@@ -200,11 +254,21 @@ void QuitModalTests::quitDuringDialog_data()
     // A quit handled in the same event pass that closed the dialog, before
     // its exec() has returned.
     QTest::newRow("same-pass") << QStringLiteral("same-pass");
-    // Quit requests while busy work runs behind a dialog.
+    // Quit requests while work that cannot be cancelled runs behind a
+    // dialog shown without a nested event loop: the shutdown starts at once
+    // and its teardown waits for the work.
     QTest::newRow("encryption") << QStringLiteral("encryption");
     QTest::newRow("psbt-signing") << QStringLiteral("psbt-signing");
     // A wallet unload while a progress dialog covers the send confirmation.
     QTest::newRow("unload-under-progress") << QStringLiteral("unload-under-progress");
+    // A wallet unload while a dialog without a nested event loop is open.
+    QTest::newRow("unload-async-dialog") << QStringLiteral("unload-async-dialog");
+    // The Coin Control dialog refers to its send dialog's state, so it must
+    // not outlive the send dialog when such an unload deletes it.
+    QTest::newRow("unload-coin-control") << QStringLiteral("unload-coin-control");
+    // A native dialog runs the platform's modal loop instead of a
+    // QEventLoop, and defers quit and unload all the same.
+    QTest::newRow("native-dialog") << QStringLiteral("native-dialog");
     // Popups that run no nested event loop do not hold a quit up.
     QTest::newRow("popups") << QStringLiteral("popups");
     // A wallet unloaded under its rescan progress dialog must not leave the
@@ -300,8 +364,9 @@ void QuitModalScenario::quitDuringDialog()
     } else if (m_scenario == "encryption") {
         QVERIFY(ReadState(m_state, [](const auto& s) { return s.encrypt_calls == 1 && s.encrypt_finished && s.encrypted; }));
     } else if (m_scenario == "psbt-signing") {
-        QVERIFY(ReadState(m_state, [](const auto& s) {
-            return s.psbt_sign_calls == 1 && s.psbt_sign_finished && !s.psbt_cancel_observed;
+        // The signing finishes after the shutdown hid its dialog.
+        QVERIFY(WaitForState(m_state, [](const auto& s) {
+            return s.psbt_sign_finished && s.psbt_sign_calls == 1 && !s.psbt_cancel_observed;
         }));
     }
 }
@@ -363,6 +428,9 @@ void QuitModalScenario::start(BitcoinGUI* window)
         if (m_scenario == "encryption") return startEncryption();
         if (m_scenario == "psbt-signing") return startPSBTSigning();
         if (m_scenario == "unload-under-progress") return startUnloadUnderProgress();
+        if (m_scenario == "unload-async-dialog") return startUnloadAsyncDialog();
+        if (m_scenario == "unload-coin-control") return startUnloadCoinControl();
+        if (m_scenario == "native-dialog") return startNativeDialog();
         if (m_scenario == "popups") return startPopups();
         if (m_scenario == "unload-rescan-stop") return startUnloadRescanStop();
         QTest::qFail(qPrintable(QStringLiteral("Unknown scenario %1").arg(m_scenario)), __FILE__, __LINE__);
@@ -472,9 +540,10 @@ void QuitModalScenario::startSamePass()
     pressSend();
 }
 
-//! Quit while the wallet is being encrypted (#174 C4 a). Encryption cannot be
-//! cancelled, so the shutdown waits for it and for the user to read its
-//! result.
+//! Quit while the wallet is being encrypted (#174 C4 a). The passphrase
+//! prompt shows the encryption without a nested event loop, so the quit
+//! starts the shutdown at once. Encryption cannot be cancelled, so the
+//! teardown waits for it to commit.
 void QuitModalScenario::startEncryption()
 {
     m_view->encryptWallet();
@@ -488,33 +557,23 @@ void QuitModalScenario::startEncryption()
         // Returns once the encryption has started.
         prompt->accept();
         when("the encryption to start", [this] { return ReadState(m_state, [](const auto& s) { return s.encrypt_entered; }); }, [this] {
+            QUIT_CHECK(ReadState(m_state, [](const auto& s) { return s.encrypt_in_progress; }));
             m_latch_release = ReleaseLater(m_state, &qt_test::SyntheticWalletState::allow_encrypt);
             sendQuitEvent();
-            expectDeferred("The platform Quit event");
-            after(RETRY_SPAN, [this] {
-                expectDeferred("A retried quit");
-                QUIT_CHECK(ReadState(m_state, [](const auto& s) { return s.encrypt_in_progress; }));
-                when("the encryption result", [] { return FindMessageBox(QStringLiteral("Wallet encrypted")); }, [this] {
-                    expectDeferred("A retried quit");
-                    ClickButton(FindMessageBox(QStringLiteral("Wallet encrypted")), QMessageBox::Ok);
-                    expectShutdown();
-                });
-                Allow(m_state, &qt_test::SyntheticWalletState::allow_encrypt);
-            });
+            QUIT_CHECK(m_shutdown_requests == 1);
+            expectShutdown();
         });
     });
 }
 
 //! Quit while a PSBT is being signed after its signing counters were
-//! reserved (#174 C4 c). Signing cannot be cancelled then, so the shutdown
-//! waits for it and for the user to close the PSBT dialog.
+//! reserved (#174 C4 c). The PSBT dialog runs no nested event loop, so the
+//! quit starts the shutdown at once. The signing cannot be cancelled then;
+//! it finishes after the shutdown hid its dialog, which keeps its result
+//! (#344).
 void QuitModalScenario::startPSBTSigning()
 {
-    m_window->setCurrentWallet(m_model);
-    DataStream stream;
-    stream << MakeUnsignedPSBT();
-    QApplication::clipboard()->setText(QString::fromStdString(EncodeBase64(stream.str())));
-    QUIT_CHECK(QMetaObject::invokeMethod(m_window, "gotoLoadPSBT", Q_ARG(bool, true)));
+    openPSBTDialog();
     const auto find_button{[](const char* name) -> QPushButton* {
         QDialog* const dialog{FindDialog("PSBTOperationsDialog")};
         return dialog ? dialog->findChild<QPushButton*>(name) : nullptr;
@@ -524,24 +583,86 @@ void QuitModalScenario::startPSBTSigning()
         return sign && sign->isEnabled();
     }, [this, find_button] {
         find_button("signTransactionButton")->click();
-        when("the signing counters", [this] { return ReadState(m_state, [](const auto& s) { return s.psbt_counters_reserved; }); }, [this, find_button] {
+        when("the signing counters", [this] { return ReadState(m_state, [](const auto& s) { return s.psbt_counters_reserved; }); }, [this] {
             m_latch_release = ReleaseLater(m_state, &qt_test::SyntheticWalletState::allow_psbt_completion);
             sendQuitEvent();
-            expectDeferred("The platform Quit event");
-            after(RETRY_SPAN, [this, find_button] {
-                expectDeferred("A retried quit");
-                when("the signing result", [find_button] {
-                    QPushButton* const broadcast{find_button("broadcastTransactionButton")};
-                    return broadcast && broadcast->isEnabled();
-                }, [this, find_button] {
-                    expectDeferred("A retried quit");
-                    find_button("closeButton")->click();
-                    expectShutdown();
-                });
-                Allow(m_state, &qt_test::SyntheticWalletState::allow_psbt_completion);
-            });
+            QUIT_CHECK(m_shutdown_requests == 1);
+            expectShutdown();
         });
     });
+}
+
+//! Unload a wallet, for example with unloadwallet, while its PSBT dialog is
+//! open. The dialog is modal but runs no nested event loop, so the unload
+//! runs at once instead of waiting for the user to close it.
+void QuitModalScenario::startUnloadAsyncDialog()
+{
+    openPSBTDialog();
+    when("the PSBT dialog", [] { return FindDialog("PSBTOperationsDialog"); }, [this] {
+        QDialog* const dialog{FindDialog("PSBTOperationsDialog")};
+        QUIT_CHECK(dialog->isModal());
+        QUIT_CHECK(QApplication::activeModalWidget() == dialog);
+        const QPointer<QDialog> psbt_dialog{dialog};
+        Q_EMIT m_model->unload();
+        when("the unload", [this] { return !m_view && !m_model; }, [this, psbt_dialog] {
+            // The PSBT dialog belongs to the wallet frame and stays open
+            // without its wallet (#344).
+            QUIT_CHECK(psbt_dialog && psbt_dialog->isVisible());
+            QUIT_CHECK(m_shutdown_requests == 0);
+            sendQuitEvent();
+            QUIT_CHECK(m_shutdown_requests == 1);
+            expectShutdown();
+        });
+    });
+}
+
+//! Unload a wallet while the Coin Control dialog of its send dialog is open.
+//! The dialog refers to the send dialog's coin selection and to the wallet
+//! model, so the unload must delete it with the send dialog.
+void QuitModalScenario::startUnloadCoinControl()
+{
+    QUIT_CHECK(QMetaObject::invokeMethod(m_send_dialog, "coinControlButtonClicked"));
+    when("the Coin Control dialog", [] { return FindDialog("CoinControlDialog"); }, [this] {
+        const QPointer<QDialog> dialog{FindDialog("CoinControlDialog")};
+        QUIT_CHECK(dialog->isModal());
+        QUIT_CHECK(QApplication::activeModalWidget() == dialog);
+        Q_EMIT m_model->unload();
+        when("the unload", [this, dialog] { return !m_view && !m_model && !dialog; }, [this] {
+            sendQuitEvent();
+            QUIT_CHECK(m_shutdown_requests == 1);
+            expectShutdown();
+        });
+    });
+}
+
+//! Unload the wallet and quit while a native dialog, such as a macOS message
+//! box or file panel, is open. Linux CI has no native dialogs, so show a
+//! dialog marked the way Qt marks the widget that stands in for one.
+void QuitModalScenario::startNativeDialog()
+{
+    auto* const native_dialog{new QDialog};
+    ShowAsNativeDialog(*native_dialog);
+    Q_EMIT m_model->unload();
+    sendQuitEvent();
+    expectDeferred("The platform Quit event");
+    after(RETRY_SPAN, [this, native_dialog] {
+        // Close the dialog first, so a failed check cannot hold the shutdown
+        // up; neither the unload nor the quit runs before the next pass.
+        native_dialog->hide();
+        native_dialog->deleteLater();
+        expectDeferred("A retried quit");
+        QUIT_CHECK(m_view && m_model);
+        expectShutdown();
+    });
+}
+
+void QuitModalScenario::openPSBTDialog()
+{
+    m_window->setCurrentWallet(m_model);
+    DataStream stream;
+    stream << MakeUnsignedPSBT();
+    QApplication::clipboard()->setText(QString::fromStdString(EncodeBase64(stream.str())));
+    QUIT_CHECK(QMetaObject::invokeMethod(m_window, "gotoLoadPSBT", Q_ARG(bool, true)));
 }
 
 //! A wallet rescan, for example one started over RPC, shows its progress

@@ -42,6 +42,7 @@ public:
     static int RunScenario(BitcoinApplication& app, const QString& scenario);
 
 private Q_SLOTS:
+    void pendingOnlyInNestedLoop();
     void quitDuringDialog_data();
     void quitDuringDialog();
 };
@@ -68,9 +69,14 @@ private:
     void startEncryption();
     void startPSBTSigning();
     void startUnloadUnderProgress();
+    void startUnloadAsyncDialog();
+    void startUnloadCoinControl();
+    void startNativeDialog();
     void startPopups();
     void startUnloadRescanStop();
 
+    //! Open the PSBT dialog on an unsigned PSBT from the clipboard.
+    void openPSBTDialog();
     //! Fill in a payment and press Send.
     void pressSend();
     //! Run action once ready() holds, polling from whichever event loop runs.

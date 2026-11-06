@@ -413,9 +413,11 @@ namespace GUIUtil
     /**
      * Whether deleting wallet views now could pull GUI objects out from under
      * the user: a nested event loop such as QDialog::exec() or QMenu::exec()
-     * is still on the stack, or a modal dialog other than a progress dialog
-     * is visible. Progress dialogs only report background work, which
-     * shutdown and wallet unload cancel or wait for.
+     * is still on the stack and would return into them, or a native dialog,
+     * which runs the platform's modal loop instead, is open. Qt dialogs shown
+     * without a loop of their own, such as with
+     * ShowModalDialogAsynchronously(), do not count. Call from the GUI
+     * thread's event loop.
      */
     bool IsUserInteractionPending();
 

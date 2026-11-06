@@ -2848,15 +2848,16 @@ void TestClearDuringUnlockKeepsSendRequest(interfaces::Node& node)
     VerifyNoSendConfirmation();
 }
 
-//! BitcoinApplication::requestShutdown() deletes the wallet views, and the
-//! send dialogs they own, from whatever nested event loop is running. While a
-//! send confirmation is open, the stop RPC and SIGTERM wait for it to close,
-//! but File > Quit pressed through accessibility and macOS application
-//! termination (QEvent::Quit) do not. Destroy the dialog, or only its model,
-//! from the confirmation's nested event loop. Nothing may be sent, and nothing
-//! may use the destroyed object: without the fix, an ASan build reports a
-//! heap-use-after-free of the dialog, and confirming without a model
-//! dereferences a null pointer.
+//! BitcoinApplication::requestShutdown() deletes the wallet views and the
+//! send dialogs they own. The send confirmation runs a nested event loop, so
+//! the stop RPC, SIGTERM, File > Quit pressed through accessibility and macOS
+//! application termination (QEvent::Quit) all wait for it to close (#354).
+//! Should the dialog still be destroyed underneath it, for example by a path
+//! that does not wait, the send must fail safely. Destroy the dialog, or only
+//! its model, from the confirmation's nested event loop. Nothing may be sent,
+//! and nothing may use the destroyed object: without the fix, an ASan build
+//! reports a heap-use-after-free of the dialog, and confirming without a
+//! model dereferences a null pointer.
 void TestSendDestructionDuringConfirmation(interfaces::Node& node, bool destroy_dialog)
 {
     TestChain100Setup test{ChainType::REGTEST, {.extra_args = {"-p2mronly=0"}}};

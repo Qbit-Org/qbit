@@ -1020,8 +1020,17 @@ bool IsUserInteractionPending()
     // its caller on the stack. This also holds after QDialog::done() has
     // hidden the dialog but before exec() returns.
     if (QThread::currentThread()->loopLevel() > 1) return true;
+    // A native message box or file dialog, as on macOS, runs the platform's
+    // modal loop rather than a QEventLoop, but still has its caller on the
+    // stack. Qt stands a hidden widget in for it: in Qt 6.8,
+    // QMessageBoxPrivate::setVisible() and QFileDialogPrivate::setVisible()
+    // call setNativeDialogVisible(), set WA_DontShowOnScreen, and then call
+    // QDialogPrivate::setVisible(), so the widget is visible and modal.
+    // Re-check this when upgrading Qt. Qt dialogs shown without a loop of
+    // their own, as ShowModalDialogAsynchronously() shows them, are on screen
+    // and have no caller to return into; they handle their own teardown.
     for (const QWidget* widget : QApplication::topLevelWidgets()) {
-        if (widget->isVisible() && widget->isModal() && !qobject_cast<const QProgressDialog*>(widget)) return true;
+        if (widget->isVisible() && widget->isModal() && widget->testAttribute(Qt::WA_DontShowOnScreen)) return true;
     }
     return false;
 }

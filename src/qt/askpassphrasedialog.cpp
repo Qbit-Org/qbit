@@ -154,8 +154,9 @@ void AskPassphraseDialog::accept()
                         return;
                     }
                 } else {
-                    // Wallet unload is deferred while a modal dialog is open,
-                    // so the model outlives the confirmation above.
+                    // Wallet unload is deferred while the confirmation above
+                    // runs its nested event loop or, as a native message box,
+                    // the platform's modal loop, so the model outlives it.
                     assert(model);
                     if (!model->encryptWallet(newpass1)) {
                         showEncryptionResult(/*success=*/false);

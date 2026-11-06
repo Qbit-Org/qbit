@@ -1455,7 +1455,7 @@ void SendCoinsDialog::coinControlFeatureChanged(bool checked)
 // Coin Control: button inputs -> show actual coin control dialog
 void SendCoinsDialog::coinControlButtonClicked()
 {
-    auto dlg = new CoinControlDialog(*m_coin_control, model, platformStyle);
+    auto dlg = new CoinControlDialog(*m_coin_control, model, platformStyle, this);
     connect(dlg, &QDialog::finished, this, &SendCoinsDialog::coinControlUpdateLabels);
     GUIUtil::ShowModalDialogAsynchronously(dlg);
 }
