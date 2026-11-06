@@ -260,9 +260,11 @@ def git_merge_base(source: Path, left: str, right: str) -> str:
 
 # git log -p prints no diff for a merge commit unless asked to, so a change made
 # only in a merge commit would go unscanned. --remerge-diff (Git 2.36 or later)
-# shows only what a merge changed relative to an automatic re-merge of its
-# parents, so a secret from a pull request commit is not reported again, under a
-# new fingerprint, on that pull request's merge. Every parent is still walked.
+# shows what a merge changed relative to an automatic re-merge of its parents.
+# A clean merge shows only its merge-only changes, so a secret from a pull
+# request commit is not reported again, under a new fingerprint, on its merge.
+# A conflicted merge also shows, as added, the lines its resolution wrote in
+# place of the conflict markers. Every parent is still walked.
 HISTORY_DIFF_MERGES = "--remerge-diff"
 HISTORY_DIFF_MERGES_MIN_GIT = (2, 36)
 
@@ -273,22 +275,22 @@ GITLEAKS_DIFF_FILTER = "--diff-filter=tuxdb"
 GITLEAKS_FULL_HISTORY = "--full-history --all"
 
 
-def require_remerge_diff_git(source: Path) -> None:
-    """Stop rather than run a history scan that silently checks nothing."""
+def remerge_diff_git_gap(source: Path) -> str:
+    """Return a coverage gap when Git is too old for the history scan, else ""."""
     exit_code, stdout, _stderr = git_command(source, "version")
     found = stdout.strip() or f"git version exited {exit_code}"
     match = re.match(r"git version (\d+)\.(\d+)", found)
     if exit_code != 0 or match is None or (
         (int(match.group(1)), int(match.group(2))) < HISTORY_DIFF_MERGES_MIN_GIT
     ):
-        raise SystemExit(
-            f"The history secret scan needs Git 2.36 or later for {HISTORY_DIFF_MERGES}; "
-            f"found: {found}"
+        return (
+            f"gitleaks history scan skipped: it needs Git 2.36 or later for "
+            f"{HISTORY_DIFF_MERGES}; found: {found}"
         )
+    return ""
 
 
 def history_log_opts(source: Path, args: argparse.Namespace) -> str:
-    require_remerge_diff_git(source)
     base_ref = str(getattr(args, "history_diff_base_ref", "") or "").strip()
     if not base_ref:
         return f"{GITLEAKS_FULL_HISTORY} {GITLEAKS_DIFF_FILTER} {HISTORY_DIFF_MERGES}"
@@ -1675,6 +1677,23 @@ def run_scanner(tool: str, args: argparse.Namespace, output_root: Path) -> dict[
         write_json(summary_path, summary)
         return summary
 
+    if tool == "gitleaks":
+        git_gap = remerge_diff_git_gap(args.source)
+        if git_gap:
+            summary = create_summary(
+                args=args,
+                spec=spec,
+                status="skipped",
+                tool_version_value=external_tool_version,
+                commands=[],
+                raw_paths=[],
+                counts=empty_counts(),
+                triage_path=triage_path,
+                coverage_gaps=[git_gap],
+            )
+            write_json(summary_path, summary)
+            return summary
+
     commands, report = external_commands(tool, args.source, raw_dir, args)
     exit_codes = []
     cargo_audit_fetch_failed = False
@@ -1855,8 +1874,14 @@ def should_fail(fail_policy: str, summaries: list[dict[str, Any]]) -> bool:
         )
         return infra_failed or high_critical_failed
     if fail_policy == "infra-and-secrets":
+        # This policy requires the secret scan, so a gitleaks run that did not
+        # complete, such as one skipped for an old Git, fails like a finding.
         secret_failed = any(
-            summary.get("tool") == "gitleaks" and safe_int(summary.get("high_or_critical_untriaged_count", 0)) > 0
+            summary.get("tool") == "gitleaks"
+            and (
+                str(summary.get("status", "")) != "completed"
+                or safe_int(summary.get("high_or_critical_untriaged_count", 0)) > 0
+            )
             for summary in summaries
         )
         return infra_failed or secret_failed

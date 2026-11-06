@@ -104,6 +104,7 @@ import hashlib
 import json
 import os
 import sys
+import urllib.parse
 from pathlib import Path
 
 args = sys.argv[1:]
@@ -176,7 +177,9 @@ if args and args[0] == "api":
         )
     elif "/branches/" in endpoint:
         tips = json.loads(os.environ["FAKE_GH_BRANCH_TIPS"])
-        key = endpoint[len("repos/"):].replace("/branches/", "/", 1)
+        # Like gh, drop a URL fragment and decode the path.
+        path = urllib.parse.unquote(endpoint.split("#", 1)[0])
+        key = path[len("repos/"):].replace("/branches/", "/", 1)
         if key not in tips:
             raise SystemExit(f"fake gh: no branch {key}")
         unprotected = json.loads(os.environ.get("FAKE_GH_UNPROTECTED_BRANCHES", "[]"))
@@ -1713,6 +1716,62 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--trusted-release-branch is not a valid branch name", result.stderr)
+
+    def test_branch_name_is_percent_encoded_in_the_api_path(self) -> None:
+        # A valid branch name can contain '#'. Unencoded, it would start a URL
+        # fragment and the publisher would read main instead.
+        result = self.run_publisher("--trusted-release-branch", "main#x")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("repos/Qbit-Org/qbit/branches/main%23x", self.gh_log.read_text(encoding="utf8"))
+        self.assertIn("Could not read Trusted release branch Qbit-Org/qbit:main#x", result.stderr)
+
+    def test_shallow_trusted_checkout_fails(self) -> None:
+        # The publisher's own checkout, cloned shallow at the branch tip: the
+        # walk from the tip would miss the trusted release ref.
+        later = git(
+            self.trusted, "commit-tree", f"{self.trusted_ref}^{{tree}}",
+            "-p", self.trusted_ref, "-m", "main moved on",
+        )
+        self._set_github_branch("Qbit-Org/qbit", self.trusted, "main", later)
+        bare = self.github / "Qbit-Org/qbit.git"
+        git(self.trusted, "push", "-q", str(bare), f"refs/tags/{TAG}")
+        shallow = self.root / "qbit-shallow"
+        git(self.root, "clone", "-q", "--depth", "1", f"file://{bare}", str(shallow))
+        git(shallow, "fetch", "-q", "origin", self.trusted_ref, f"refs/tags/{TAG}:refs/tags/{TAG}")
+        git(shallow, "checkout", "-q", "--detach", self.trusted_ref)
+        self.trusted = shallow
+        result = self.run_publisher(branch_tips={"Qbit-Org/qbit/main": later})
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "The trusted release checkout is shallow; run git fetch --unshallow", result.stderr
+        )
+        self.assertNotIn("must be on the first-parent history", result.stderr)
+
+    def test_shallow_guix_sigs_checkout_fails(self) -> None:
+        # In a shallow clone of the branch tip, the walk from the tip stops at
+        # the shallow boundary and misses a merged commit fetched afterwards.
+        later = git(
+            self.guix_sigs, "commit-tree", f"{self.guix_sigs_ref}^{{tree}}",
+            "-p", self.guix_sigs_ref, "-m", "more attestations",
+        )
+        self._set_github_branch("Qbit-Org/qbit-guix.sigs", self.guix_sigs, "main", later)
+        shallow = self.root / "qbit-guix.sigs-shallow"
+        git(
+            self.root, "clone", "-q", "--depth", "1",
+            f"file://{self.github}/Qbit-Org/qbit-guix.sigs.git", str(shallow),
+        )
+        git(shallow, "fetch", "-q", "origin", self.guix_sigs_ref)
+        git(shallow, "checkout", "-q", "--detach", self.guix_sigs_ref)
+        self.guix_sigs = shallow
+        result = self.run_publisher(branch_tips={"Qbit-Org/qbit-guix.sigs/main": later})
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "The qbit-guix.sigs checkout is shallow; run git fetch --unshallow", result.stderr
+        )
+        self.assertNotIn("must be on the first-parent history", result.stderr)
 
     def test_guix_sigs_ref_merged_as_pull_request_head_fails(self) -> None:
         merge = self._merge_object(self.guix_sigs, None, self.guix_sigs_ref)

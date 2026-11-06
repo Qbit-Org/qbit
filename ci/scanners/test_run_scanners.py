@@ -6,8 +6,13 @@
 
 from __future__ import annotations
 
+import argparse
 import importlib.util
+import json
 import os
+import secrets
+import shutil
+import string
 import subprocess
 import sys
 import tempfile
@@ -34,6 +39,25 @@ run_scanners = load_run_scanners()
 
 
 class RunScannersTest(unittest.TestCase):
+    def test_infra_and_secrets_fails_when_the_secret_scan_did_not_complete(self) -> None:
+        def summary(tool: str, status: str) -> dict[str, object]:
+            return {"tool": tool, "status": status, "high_or_critical_untriaged_count": 0}
+
+        zizmor_skipped = summary("zizmor", "skipped")
+        for status in ("skipped", "failed", "missing_tool", ""):
+            with self.subTest(status=status):
+                self.assertTrue(
+                    run_scanners.should_fail(
+                        "infra-and-secrets", [summary("gitleaks", status), zizmor_skipped]
+                    )
+                )
+        self.assertFalse(
+            run_scanners.should_fail(
+                "infra-and-secrets", [summary("gitleaks", "completed"), zizmor_skipped]
+            )
+        )
+        self.assertFalse(run_scanners.should_fail("infra-only", [summary("gitleaks", "skipped")]))
+
     def test_zizmor_version_gate_rejects_old_python38_compatible_release(self) -> None:
         self.assertFalse(run_scanners.zizmor_version_supported("zizmor 1.2.0"))
 
@@ -655,26 +679,141 @@ class HistoryLogOptsTest(unittest.TestCase):
 
         return patch.object(run_scanners, "git_command", fake)
 
-    def test_old_git_stops_the_history_scan(self) -> None:
-        for output in ("git version 2.35.1\n", "git version 1.9.5\n"):
-            with self.subTest(output=output), self.with_git_version(output):
-                with self.assertRaises(SystemExit) as raised:
-                    run_scanners.history_log_opts(self.repo, self.args(""))
-                self.assertIn("needs Git 2.36 or later for --remerge-diff", str(raised.exception))
-
-    def test_unknown_git_version_stops_the_history_scan(self) -> None:
-        for output, code in (("not git\n", 0), ("", 127)):
+    def test_old_or_unknown_git_is_a_coverage_gap(self) -> None:
+        for output, code in (
+            ("git version 2.35.1\n", 0),
+            ("git version 1.9.5\n", 0),
+            ("not git\n", 0),
+            ("", 127),
+        ):
             with self.subTest(output=output, code=code), self.with_git_version(output, code):
-                with self.assertRaises(SystemExit):
-                    run_scanners.history_log_opts(self.repo, self.args(self.base))
-
-    def test_old_git_stops_the_gitleaks_command(self) -> None:
-        with self.with_git_version("git version 2.35.1\n"), self.assertRaises(SystemExit):
-            run_scanners.external_commands("gitleaks", self.repo, self.repo / "raw", self.args(""))
+                gap = run_scanners.remerge_diff_git_gap(self.repo)
+                self.assertIn("needs Git 2.36 or later for --remerge-diff", gap)
+                self.assertIn(output.strip() or "git version exited 127", gap)
 
     def test_git_2_36_is_enough(self) -> None:
         with self.with_git_version("git version 2.36.0\n"):
-            self.assertIn("--remerge-diff", run_scanners.history_log_opts(self.repo, self.args("")))
+            self.assertEqual(run_scanners.remerge_diff_git_gap(self.repo), "")
+
+    def test_old_git_skips_gitleaks_with_a_coverage_gap(self) -> None:
+        bin_dir = self.repo / "fake-bin"
+        bin_dir.mkdir()
+        fake = bin_dir / "gitleaks"
+        fake.write_text("#!/bin/sh\necho 8.30.1\n", encoding="utf8")
+        fake.chmod(0o755)
+        args = argparse.Namespace(
+            mode="nightly", source=self.repo, source_commit=self.clean_merge,
+            freeze_commit=self.clean_merge, history_diff_base_ref="", skip_build_scanners=False,
+        )
+        output_root = self.repo / "evidence"
+        output_root.mkdir()
+        path = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+        with self.with_git_version("git version 2.35.1\n"), patch.dict(os.environ, {"PATH": path}):
+            summary = run_scanners.run_scanner("gitleaks", args, output_root)
+        self.assertEqual(summary["status"], "skipped")
+        self.assertEqual(len(summary["coverage_gaps"]), 1)
+        self.assertIn("Git 2.36 or later", summary["coverage_gaps"][0])
+        self.assertIn("git version 2.35.1", summary["coverage_gaps"][0])
+        self.assertFalse((output_root / "gitleaks" / "raw").exists())
+        self.assertTrue(run_scanners.should_fail("infra-and-secrets", [summary]))
+
+
+
+@unittest.skipUnless(shutil.which("gitleaks"), "gitleaks is not on PATH")
+class GitleaksRemergeIntegrationTest(unittest.TestCase):
+    """Run the real gitleaks with the scanner's own command on conflicted merges."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.repo = Path(self.temp_dir.name) / "repo"
+        self.repo.mkdir()
+        self.git("init", "-q", "-b", "main")
+        self.write("a.txt", "base")
+        self.write("conf.txt", "shared = 1")
+        self.write("del.txt", "keep")
+        self.commit("base")
+        self.base = self.git("rev-parse", "HEAD")
+        # A pull request commit with a secret, merged cleanly.
+        self.git("checkout", "-q", "-b", "pr")
+        self.write("pr.txt", f'token = "{self.token()}"')
+        self.commit("pull request commit with a secret")
+        self.pr_commit = self.git("rev-parse", "HEAD")
+        self.git("checkout", "-q", "main")
+        self.git("merge", "-q", "--no-ff", "-m", "Merge pull request #1", "pr")
+        # A conflicted merge whose resolution adds a secret (remerge CONFLICT
+        # header plus a hunk).
+        self.git("checkout", "-q", "-b", "topic")
+        self.write("conf.txt", "shared = topic")
+        self.commit("topic edits conf")
+        self.git("checkout", "-q", "main")
+        self.write("conf.txt", "shared = main")
+        self.commit("main edits conf")
+        self.git("merge", "-q", "--no-ff", "topic", check=False)
+        self.write("conf.txt", f'shared = resolved\ntoken = "{self.token()}"')
+        self.commit("Merge pull request #2 (conflict resolved with a secret)")
+        self.evil_merge = self.git("rev-parse", "HEAD")
+        # A modify/delete conflict resolved by keeping the modified file: its
+        # remerge diff has a CONFLICT header and no hunks.
+        self.git("checkout", "-q", "-b", "remove")
+        self.git("rm", "-q", "del.txt")
+        self.commit("topic deletes del.txt")
+        self.git("checkout", "-q", "main")
+        self.write("del.txt", "keep, edited")
+        self.commit("main edits del.txt")
+        self.git("merge", "-q", "--no-ff", "remove", check=False)
+        self.git("add", "del.txt")
+        self.commit("Merge pull request #3 (modify/delete conflict)")
+        self.modify_delete_merge = self.git("rev-parse", "HEAD")
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def git(self, *args: str, check: bool = True) -> str:
+        result = subprocess.run(
+            [
+                "git", "-c", "user.name=scanner test", "-c", "user.email=scanner@example.invalid",
+                "-c", "commit.gpgsign=false", "-C", str(self.repo), *args,
+            ],
+            check=check, capture_output=True, text=True,
+        )
+        return result.stdout.strip()
+
+    def write(self, path: str, content: str) -> None:
+        (self.repo / path).write_text(f"{content}\n", encoding="utf8")
+
+    def commit(self, message: str) -> None:
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", message)
+
+    @staticmethod
+    def token() -> str:
+        alphabet = string.ascii_letters + string.digits
+        return "ghp_" + "".join(secrets.choice(alphabet) for _ in range(36))
+
+    def test_merge_only_secret_found_and_pull_request_secret_reported_once(self) -> None:
+        remerge = self.git("log", "-1", "-p", "--remerge-diff", self.evil_merge)
+        self.assertIn("remerge CONFLICT (content)", remerge)
+        no_hunks = self.git("log", "-1", "-p", "--remerge-diff", self.modify_delete_merge)
+        self.assertIn("remerge CONFLICT (modify/delete)", no_hunks)
+        self.assertNotIn("\n@@", no_hunks)
+
+        args = argparse.Namespace(history_diff_base_ref="", source_commit=self.modify_delete_merge)
+        raw_dir = Path(self.temp_dir.name) / "raw"
+        raw_dir.mkdir()
+        commands, report = run_scanners.external_commands("gitleaks", self.repo, raw_dir, args)
+        result = subprocess.run(commands[0], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        findings = json.loads(Path(report).read_text(encoding="utf8"))
+        by_commit = sorted((finding["Commit"], finding["File"]) for finding in findings)
+        self.assertEqual(
+            [commit for commit, _ in by_commit], sorted([self.pr_commit, self.evil_merge])
+        )
+        files = dict(by_commit)
+        self.assertEqual(files[self.pr_commit], "pr.txt")
+        # gitleaks 8.30.1 records a finding inside a conflicted file of a
+        # remerge diff as b/<path>: the "remerge CONFLICT" line between the
+        # diff and index headers changes how it parses the name.
+        self.assertIn(files[self.evil_merge], ("conf.txt", "b/conf.txt"))
 
 
 if __name__ == "__main__":

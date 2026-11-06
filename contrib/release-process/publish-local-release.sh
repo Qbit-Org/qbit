@@ -360,6 +360,18 @@ PY
     ) || die "Release tag $TAG failed the signature check"
 }
 
+require_full_history() {
+    # A shallow checkout cuts the first-parent walk short, so a merged commit
+    # would be reported as not on its branch.
+    local label="$1"
+    local root="$2"
+    case "$(git -C "$root" rev-parse --is-shallow-repository)" in
+        false) ;;
+        true) die "The $label is shallow; run git fetch --unshallow in $root" ;;
+        *) die "Could not tell whether the $label is shallow" ;;
+    esac
+}
+
 github_repo_path() {
     local repository="$1"
     local owner
@@ -416,6 +428,13 @@ remote_commit() {
         || die "$label resolved to $resolved, expected $commit_sha"
 }
 
+api_path_escape() {
+    # Percent-encodes a name for a GitHub API path. A valid branch name can
+    # contain # or %, which would otherwise end or change the path: main#x
+    # would query main.
+    python3 -I -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe="/"))' "$1"
+}
+
 fetch_branch_tip() {
     # Prints the tip of a protected GitHub branch after fetching exactly that
     # commit into a local checkout, so its first-parent history can be read
@@ -426,12 +445,15 @@ fetch_branch_tip() {
     local repository="$2"
     local branch="$3"
     local label="$4"
+    local branch_path
     local branch_info
     local api_tip
     local protected
     local fetched_tip
+    branch_path="$(api_path_escape "$branch")" \
+        || die "Could not encode $label branch name $branch"
     branch_info="$(
-        gh api "repos/$repository/branches/$branch" \
+        gh api "repos/$repository/branches/$branch_path" \
             --jq '[.commit.sha, (.protected | tostring)] | @tsv'
     )" || die "Could not read $label branch $repository:$branch"
     IFS=$'\t' read -r api_tip protected <<<"$branch_info"
@@ -1023,6 +1045,7 @@ GUIX_SIGS_SHA="$(git -C "$GUIX_SIGS_REPO" rev-parse HEAD)"
 [ "$(lowercase "$GUIX_SIGS_SHA")" = "$(lowercase "$GUIX_SIGS_REF")" ] \
     || die "qbit-guix.sigs checkout resolved $GUIX_SIGS_SHA, expected $GUIX_SIGS_REF"
 require_clean_checkout "qbit-guix.sigs checkout" "$GUIX_SIGS_REPO"
+require_full_history "qbit-guix.sigs checkout" "$GUIX_SIGS_REPO"
 # The validators read the qbit-guix.sigs files from an export of the pinned
 # commit (below), not from this working tree; index flags would only hide local
 # edits from the clean check above, so they are refused here, early.
