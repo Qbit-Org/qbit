@@ -748,15 +748,24 @@ class HistoryLogOptsTest(unittest.TestCase):
         with self.with_git_version("git version 2.36.0\n"):
             self.assertEqual(run_scanners.remerge_diff_git_gap(self.repo), "")
 
-    def run_fake_gitleaks(self, git_version: str, source: Path | None = None) -> tuple[dict, list[str]]:
+    # gitleaks 8.30.1's own log of a clean run: colored, on stderr.
+    CLEAN_LOG = "\x1b[90m11:01PM\x1b[0m \x1b[32mINF\x1b[0m 3 commits scanned.\n" \
+        "\x1b[90m11:01PM\x1b[0m \x1b[33mWRN\x1b[0m leaks found: 1\n"
+
+    def run_fake_gitleaks(
+        self, git_version: str, source: Path | None = None, log: str = CLEAN_LOG
+    ) -> tuple[dict, list[str]]:
         bin_dir = self.repo / "fake-bin"
         bin_dir.mkdir()
         fake = bin_dir / "gitleaks"
         argv_log = self.repo / "gitleaks-argv"
+        log_file = self.repo / "gitleaks-log"
+        log_file.write_text(log, encoding="utf8")
         fake.write_text(
             "#!/bin/sh\n"
             '[ "$1" = detect ] || { echo 8.30.1; exit 0; }\n'
             f'printf "%s\\n" "$@" > "{argv_log}"\n'
+            f'cat "{log_file}" >&2\n'
             'while [ $# -gt 0 ]; do [ "$1" = --report-path ] && echo "[]" > "$2"; shift; done\n',
             encoding="utf8",
         )
@@ -848,6 +857,24 @@ class HistoryLogOptsTest(unittest.TestCase):
         self.assertEqual(scopes, [["--all"]])
         self.assertEqual(gaps.call_args.args[1], scopes[0])
         self.assertTrue(argv[argv.index("--log-opts") + 1].startswith("--full-history --all "))
+
+    def test_an_error_in_gitleaks_log_is_an_incomplete_history_scan(self) -> None:
+        # gitleaks 8.30.1 exits 0 when git log fails and logs git's stderr.
+        failed_git = "\x1b[90m11:01PM\x1b[0m \x1b[31mERR\x1b[0m [git] fatal: bad revision\n" + self.CLEAN_LOG
+        logs = {
+            "git error": failed_git,
+            "fatal": "11:01PM FTL could not parse diff\n",
+            "partial scan": "11:01PM WRN no leaks found in partial scan\n",
+        }
+        for name, log in logs.items():
+            with self.subTest(log=name):
+                summary, _argv = self.run_fake_gitleaks("git version 2.50.1\n", log=log)
+                shutil.rmtree(self.repo / "fake-bin")
+                shutil.rmtree(self.repo / "evidence")
+                self.assertEqual(summary["status"], "completed")
+                self.assertIs(summary["details"]["history_scan_complete"], False)
+                self.assertTrue(any("gitleaks logged 1 error line(s)" in gap for gap in summary["coverage_gaps"]))
+                self.assertTrue(run_scanners.should_fail("infra-and-secrets", [summary]))
 
     def test_current_git_scans_merges_and_passes_the_policy(self) -> None:
         summary, argv = self.run_fake_gitleaks("git version 2.50.1\n")
@@ -954,6 +981,9 @@ class GitleaksRemergeIntegrationTest(unittest.TestCase):
         commands, report = run_scanners.external_commands("gitleaks", self.repo, raw_dir, args)
         result = subprocess.run(commands[0], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
+        stderr_log = raw_dir / "gitleaks.stderr"
+        stderr_log.write_text(result.stderr, encoding="utf8")
+        self.assertEqual(run_scanners.gitleaks_log_gap(stderr_log), "")
         findings = json.loads(Path(report).read_text(encoding="utf8"))
         by_commit = sorted((finding["Commit"], finding["File"]) for finding in findings)
         self.assertEqual(
@@ -965,6 +995,23 @@ class GitleaksRemergeIntegrationTest(unittest.TestCase):
         # remerge diff as b/<path>: the "remerge CONFLICT" line between the
         # diff and index headers changes how it parses the name.
         self.assertIn(files[self.evil_merge], ("conf.txt", "b/conf.txt"))
+
+
+    def test_a_failed_git_log_is_reported_as_an_incomplete_scan(self) -> None:
+        # gitleaks 8.30.1 exits 0 here: it logs git's error and finds nothing.
+        raw_dir = Path(self.temp_dir.name) / "raw-failed-git"
+        raw_dir.mkdir()
+        result = subprocess.run(
+            [
+                "gitleaks", "detect", "--source", str(self.repo), "--redact", "--report-format", "json",
+                "--report-path", str(raw_dir / "report.json"), "--exit-code", "0",
+                "--log-opts", "--all --no-such-git-option",
+            ],
+            capture_output=True, text=True,
+        )
+        stderr_log = raw_dir / "gitleaks.stderr"
+        stderr_log.write_text(result.stderr, encoding="utf8")
+        self.assertIn("error line(s)", run_scanners.gitleaks_log_gap(stderr_log))
 
 
 if __name__ == "__main__":

@@ -1674,6 +1674,38 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_a_stale_or_missing_fetch_head_is_not_read(self) -> None:
+        # A git that never writes FETCH_HEAD, as with --no-write-fetch-head,
+        # leaves the guix.sigs checkout without one and a stale one in the
+        # trusted checkout.
+        later = git(
+            self.trusted, "commit-tree", f"{self.trusted_ref}^{{tree}}",
+            "-p", self.trusted_ref, "-m", "main moved on",
+        )
+        self._set_github_branch("Qbit-Org/qbit", self.trusted, "main", later)
+        git(self.trusted, "fetch", "-q", str(self.github / "Qbit-Org/qbit.git"), self.trusted_ref)
+        real_git = shutil.which("git")
+        self._write_executable(
+            self.bin_dir / "git",
+            f"""#!/usr/bin/env bash
+            args=()
+            inserted=0
+            for arg in "$@"; do
+                args+=("$arg")
+                if [ "$arg" = fetch ] && [ "$inserted" -eq 0 ]; then
+                    args+=(--no-write-fetch-head)
+                    inserted=1
+                fi
+            done
+            exec {real_git} "${{args[@]}}"
+            """,
+        )
+        result = self.run_publisher(branch_tips={"Qbit-Org/qbit/main": later})
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(git(self.trusted, "rev-parse", "FETCH_HEAD^{commit}"), self.trusted_ref)
+        self.assertFalse((self.guix_sigs / ".git" / "FETCH_HEAD").exists())
+
     def test_unprotected_trusted_release_branch_fails(self) -> None:
         self._set_github_branch("Qbit-Org/qbit", self.trusted, "topic", self.trusted_ref)
         result = self.run_publisher(

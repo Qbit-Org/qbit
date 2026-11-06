@@ -464,7 +464,6 @@ fetch_branch_tip() {
     local api_tip
     local protected
     local rule_types
-    local fetched_tip
     branch_path="$(api_path_escape "$branch")" \
         || die "Could not encode $label branch name $branch"
     branch_info="$(
@@ -483,10 +482,11 @@ fetch_branch_tip() {
     git -C "$root" -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
         fetch --quiet --no-tags "https://github.com/$repository.git" "$api_tip" \
         || die "Could not fetch $repository:$branch tip $api_tip into $root"
-    fetched_tip="$(git -C "$root" rev-parse --verify FETCH_HEAD)"
-    [ "$(lowercase "$fetched_tip")" = "$(lowercase "$api_tip")" ] \
-        || die "$label branch $repository:$branch fetched $fetched_tip, but GitHub reports $api_tip"
-    printf '%s\n' "$fetched_tip"
+    # Check the fetched object itself, not FETCH_HEAD, which a fetch that does
+    # not write it leaves stale or missing.
+    git -C "$root" cat-file -e "$api_tip^{commit}" 2>/dev/null \
+        || die "$label branch $repository:$branch tip $api_tip is not a commit in $root after the fetch"
+    lowercase "$api_tip"
 }
 
 remote_tag_pin_failure() {

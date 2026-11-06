@@ -363,6 +363,35 @@ def octopus_merge_gap(source: Path, scope: list[str]) -> str:
     )
 
 
+# gitleaks 8.30.1 exits 0 even when git log fails: it logs git's stderr as
+# "ERR [git] ..." and reports "no leaks found" for what it read
+# (sources/git.go listenForStdErr). A scan it knows to be cut short logs
+# "partial scan" (cmd/root.go findingSummaryAndExit). Its diff parser,
+# go-gitdiff v0.9.1, logs nothing: it skips a file header it cannot parse and
+# stops at a fragment it cannot parse. An ERR or FTL line, or "partial scan",
+# therefore marks the history scan incomplete; warnings such as "leaks found"
+# do not.
+GITLEAKS_LOG_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+GITLEAKS_INCOMPLETE_LOG = re.compile(r"^\S+\s+(?:ERR|FTL)\s|partial scan")
+
+
+def gitleaks_log_gap(stderr_path: Path) -> str:
+    """Return a coverage gap when gitleaks' own log says the scan was incomplete, else ""."""
+    try:
+        log = stderr_path.read_text(encoding="utf8", errors="replace")
+    except OSError:
+        return "could not read gitleaks' log, so its history scan cannot be shown complete"
+    errors = [
+        line for line in GITLEAKS_LOG_ANSI.sub("", log).splitlines() if GITLEAKS_INCOMPLETE_LOG.search(line.strip())
+    ]
+    if not errors:
+        return ""
+    return (
+        f"gitleaks logged {len(errors)} error line(s), so its history scan may be incomplete; "
+        "inspect its private raw stderr"
+    )
+
+
 def gitleaks_history_gaps(source: Path, scope: list[str]) -> list[str]:
     return [gap for gap in (shallow_history_gap(source, scope), octopus_merge_gap(source, scope)) if gap]
 
@@ -1798,6 +1827,10 @@ def run_scanner(tool: str, args: argparse.Namespace, output_root: Path) -> dict[
                 shutil.rmtree(advisory_db, ignore_errors=True)
                 advisory_db.with_name(f"{advisory_db.name}.lock").unlink(missing_ok=True)
         exit_codes.append(exit_code)
+    if tool == "gitleaks":
+        log_gap = gitleaks_log_gap(raw_dir / "command-0.stderr.txt")
+        if log_gap:
+            history_gaps.append(log_gap)
     counts = parse_counts(tool, report, raw_dir, args.source)
     findings = parse_findings(tool, report, raw_dir, args.source)
     raw_paths = [raw_dir / f"command-{index}.stdout.txt" for index in range(len(commands))]
@@ -1942,8 +1975,9 @@ def secret_scan_incomplete(summary: dict[str, Any]) -> bool:
     That is a gitleaks run that did not complete (skipped, failed or missing),
     or one that completed but missed part of the history: it ran without
     --remerge-diff on a Git older than 2.36, a shallow boundary cut the walk,
-    or the history has octopus merges. A completed summary must say its history
-    scan was complete. No other coverage gap counts here.
+    the history has octopus merges, or gitleaks logged an error. A completed
+    summary must say its history scan was complete. No other coverage gap
+    counts here.
     """
     if str(summary.get("status", "")) != "completed":
         return True
