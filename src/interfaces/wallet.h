@@ -85,7 +85,8 @@ class Wallet
 public:
     virtual ~Wallet() = default;
 
-    //! Encrypt wallet.
+    //! Encrypt wallet. Returns false if the wallet was not encrypted. Throws
+    //! if it was encrypted, but its new HD seed could not be set up.
     virtual bool encryptWallet(const SecureString& wallet_passphrase) = 0;
 
     //! Return whether wallet is encrypted.
@@ -108,7 +109,7 @@ public:
     virtual void abortRescan() = 0;
 
     //! Back up wallet.
-    virtual bool backupWallet(const std::string& filename) = 0;
+    virtual util::Result<void> backupWallet(const std::string& filename) = 0;
 
     //! Get wallet name.
     virtual std::string getWalletName() = 0;

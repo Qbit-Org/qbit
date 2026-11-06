@@ -1308,7 +1308,9 @@ RPCHelpMan backupwallet()
 {
     return RPCHelpMan{
         "backupwallet",
-        "Safely copies the current wallet file to the specified destination, which can either be a directory or a path with a filename.\n",
+        "Safely copies the current wallet file to the specified destination, which can either be a directory or a path with a filename.\n"
+        "If an encrypted wallet's file has not been rewritten since its encryption, it is rewritten first, and the backup fails if that rewrite fails.\n"
+        "A copy without the deleted keys can then still be made by unloading the wallet and running \"qbit-wallet dump\" on it.\n",
                 {
                     {"destination", RPCArg::Type::STR, RPCArg::Optional::NO, "The destination directory or file"},
                 },
@@ -1319,7 +1321,7 @@ RPCHelpMan backupwallet()
                 },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
-    const std::shared_ptr<const CWallet> pwallet = GetWalletForJSONRPCRequest(request);
+    const std::shared_ptr<CWallet> pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return UniValue::VNULL;
 
     // Make sure the results are valid at least up to the most recent block
@@ -1329,8 +1331,9 @@ RPCHelpMan backupwallet()
     LOCK(pwallet->cs_wallet);
 
     std::string strDest = request.params[0].get_str();
-    if (!pwallet->BackupWallet(strDest)) {
-        throw JSONRPCError(RPC_WALLET_ERROR, "Error: Wallet backup failed!");
+    const auto backup{pwallet->BackupWallet(strDest)};
+    if (!backup) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Error: " + util::ErrorString(backup).original);
     }
 
     return UniValue::VNULL;

@@ -141,7 +141,8 @@ public:
     //! Counts the number of active database users to be sure that the database is not closed while someone is using it
     std::atomic<int> m_refcount{0};
 
-    /** Rewrite the entire database on disk
+    /** Rewrite the entire database on disk. Waits for any open transaction
+     *  to end, so the caller must not have one open.
      */
     virtual bool Rewrite() = 0;
 
