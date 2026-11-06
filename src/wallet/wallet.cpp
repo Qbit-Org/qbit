@@ -4488,6 +4488,7 @@ std::shared_ptr<CWallet> CWallet::Create(WalletContext& context, const std::stri
                                _("This is the transaction fee you may discard if change is smaller than dust at this level"));
         }
         walletInstance->m_discard_rate = CFeeRate{discard_fee.value()};
+        walletInstance->m_discard_rate_set = true;
     }
 
     if (const auto arg{args.GetArg("-paytxfee")}) {

@@ -615,13 +615,15 @@ public:
     CAmount getMinimumFee(unsigned int tx_bytes,
         const CCoinControl& coin_control,
         int* returned_target,
-        FeeReason* reason) override
+        FeeReason* reason,
+        bool* estimate_unavailable) override
     {
         FeeCalculation fee_calc;
         CAmount result;
         result = GetMinimumFee(*m_wallet, tx_bytes, coin_control, &fee_calc);
         if (returned_target) *returned_target = fee_calc.returnedTarget;
         if (reason) *reason = fee_calc.reason;
+        if (estimate_unavailable) *estimate_unavailable = fee_calc.estimate_unavailable;
         return result;
     }
     unsigned int getConfirmTarget() override { return m_wallet->m_confirm_target; }

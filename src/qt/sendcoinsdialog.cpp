@@ -1378,12 +1378,14 @@ void SendCoinsDialog::updateSmartFeeLabel()
     updateCoinControlState();
     m_coin_control->m_feerate.reset(); // Explicitly use only fee estimation rate for smart fee labels
     int returned_target;
-    FeeReason reason;
-    CFeeRate feeRate = CFeeRate(model->wallet().getMinimumFee(1000, *m_coin_control, &returned_target, &reason));
+    bool estimate_unavailable{false};
+    CFeeRate feeRate = CFeeRate(model->wallet().getMinimumFee(1000, *m_coin_control, &returned_target, /*reason=*/nullptr, &estimate_unavailable));
 
     ui->labelSmartFee->setText(tr("%1/kvB").arg(QbitUnits::formatWithUnit(model->getOptionsModel()->getDisplayUnit(), feeRate.GetFeePerK())));
 
-    if (reason == FeeReason::FALLBACK) {
+    // Check the estimate rather than the reason: -mintxfee or the mempool minimum
+    // can replace the FALLBACK reason without there being an estimate.
+    if (estimate_unavailable) {
         ui->labelSmartFee2->show(); // (Smart fee not initialized yet. This usually takes a few blocks...)
         ui->labelFeeEstimation->setText("");
         ui->fallbackFeeWarningLabel->setVisible(true);

@@ -4456,6 +4456,38 @@ void TestEncryptWalletRealWallet(interfaces::Node& node)
     TestUnloadWallet(std::move(reopened));
 }
 
+void TestFallbackFeeWarningWithMinimumFee(interfaces::Node& node)
+{
+    // Without a fee estimate, a -mintxfee above the fallback fee replaces the
+    // FALLBACK reason. The dialog must still show the fallback warning instead
+    // of a confirmation estimate it does not have.
+    TestChain100Setup test{ChainType::REGTEST, {.extra_args = {"-p2mronly=0"}}};
+    auto wallet_loader = interfaces::MakeWalletLoader(*test.m_node.chain, *Assert(test.m_node.args));
+    test.m_node.wallet_loader = wallet_loader.get();
+    node.setContext(&test.m_node);
+    QVERIFY(test.m_node.chain->estimateSmartFee(/*num_blocks=*/2, /*conservative=*/false) == CFeeRate{0});
+
+    std::unique_ptr<const PlatformStyle> platform_style{PlatformStyle::instantiate("other")};
+    for (const CAmount min_fee : {wallet::DEFAULT_TRANSACTION_MINFEE, wallet::DEFAULT_FALLBACK_FEE * 4}) {
+        const std::shared_ptr<CWallet> test_wallet{SetupDescriptorsWallet(node, test, /*watch_only=*/false, /*coinbase_offset=*/0, QT_WALLET_BECH32_DESCRIPTOR_OUTPUT_TYPES, /*fund_wallet=*/false)};
+        test_wallet->m_min_fee = CFeeRate{min_fee};
+        MiniGUI mini_gui{node, platform_style.get()};
+        mini_gui.initModelForWallet(node, test_wallet, platform_style.get());
+        SendCoinsDialog& send_dialog{mini_gui.sendCoinsDialog};
+
+        QLabel* const warning{send_dialog.findChild<QLabel*>("fallbackFeeWarningLabel")};
+        QLabel* const not_initialized{send_dialog.findChild<QLabel*>("labelSmartFee2")};
+        QLabel* const estimation{send_dialog.findChild<QLabel*>("labelFeeEstimation")};
+        QLabel* const smart_fee{send_dialog.findChild<QLabel*>("labelSmartFee")};
+        QVERIFY(warning && not_initialized && estimation && smart_fee);
+        QVERIFY2(!warning->isHidden(), qPrintable(QString::number(min_fee)));
+        QVERIFY(!not_initialized->isHidden());
+        QVERIFY2(estimation->text().isEmpty(), qPrintable(estimation->text()));
+        const CAmount expected_rate{std::max(wallet::DEFAULT_FALLBACK_FEE, min_fee)};
+        QCOMPARE(smart_fee->text(), QStringLiteral("%1/kvB").arg(QbitUnits::formatWithUnit(mini_gui.optionsModel.getDisplayUnit(), expected_rate)));
+    }
+}
+
 void TestGUI(interfaces::Node& node)
 {
     // Set up a small funded wallet history instead of importing the full mature chain.
@@ -4527,4 +4559,5 @@ void WalletTests::walletTests()
     TestEncryptWalletExceptionEscapes(m_node);
     TestEncryptWalletModelDestroyedWhileEncrypting(m_node);
     TestEncryptWalletRealWallet(m_node);
+    TestFallbackFeeWarningWithMinimumFee(m_node);
 }

@@ -95,6 +95,9 @@ struct FeeCalculation
     FeeReason reason = FeeReason::NONE;
     int desiredTarget = 0;
     int returnedTarget = 0;
+    /** Set by the wallet when fee estimation was used but had no estimate. Stays set
+     *  when a minimum fee rate then overrides the FALLBACK reason. */
+    bool estimate_unavailable = false;
 };
 
 /** \class CBlockPolicyEstimator

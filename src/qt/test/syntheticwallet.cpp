@@ -695,10 +695,11 @@ public:
     CoinsList listCoins() override { return {}; }
     std::vector<interfaces::WalletTxOut> getCoins(const std::vector<COutPoint>&) override { return {}; }
     CAmount getRequiredFee(unsigned int) override { return 0; }
-    CAmount getMinimumFee(unsigned int, const wallet::CCoinControl&, int* returned_target, FeeReason* reason) override
+    CAmount getMinimumFee(unsigned int, const wallet::CCoinControl&, int* returned_target, FeeReason* reason, bool* estimate_unavailable) override
     {
         if (returned_target) *returned_target = 6;
         if (reason) *reason = FeeReason::NONE;
+        if (estimate_unavailable) *estimate_unavailable = false;
         return 0;
     }
     unsigned int getConfirmTarget() override { return 6; }

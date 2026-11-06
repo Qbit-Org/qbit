@@ -15,6 +15,7 @@
 #include <validation.h>
 #include <wallet/coincontrol.h>
 #include <wallet/context.h>
+#include <wallet/fees.h>
 #include <wallet/spend.h>
 #include <wallet/test/util.h>
 #include <wallet/test/wallet_p2mr_test_util.h>
@@ -25,6 +26,7 @@
 #include <atomic>
 #include <future>
 #include <memory>
+#include <optional>
 #include <set>
 #include <utility>
 #include <vector>
@@ -38,6 +40,10 @@ BOOST_FIXTURE_TEST_CASE(SubtractFee, UnrestrictedRegtestChain100Setup)
 {
     CreateAndProcessBlock({}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
     auto wallet = CreateSyncedWallet(*m_node.chain, WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
+    // Set the discard rate explicitly, as -discardfee would. Without fee estimates
+    // it would otherwise fall to the fallback fee and keep the leftover as change.
+    wallet->m_discard_rate = CFeeRate{DEFAULT_DISCARD_FEE};
+    wallet->m_discard_rate_set = true;
 
     // Check that a subtract-from-recipient transaction slightly less than the
     // coinbase input amount does not create a change output (because it would
@@ -306,6 +312,74 @@ BOOST_FIXTURE_TEST_CASE(ConcurrentSendLoserReleasesItsCoinLocks, SendRPCSetup)
     BOOST_CHECK(loser_result.isNull());
     CheckConcurrentSpendError(loser_error, m_coins.at(0), winner);
     BOOST_CHECK(LockedCoins() == std::set<COutPoint>{user_locked});
+}
+
+BOOST_AUTO_TEST_CASE(discard_rate_without_fee_estimate)
+{
+    // With no estimate for the longest target, the fallback fee (raised to the
+    // required fee rate) stands in for it unless -discardfee was set, and the
+    // dust relay fee remains the floor.
+    CWallet& wallet{m_wallet};
+    BOOST_REQUIRE(wallet.chain().estimateSmartFee(wallet.chain().estimateMaxBlocks(), /*conservative=*/false) == CFeeRate{0});
+    const CAmount dust_relay_fee{wallet.chain().relayDustFee().GetFeePerK()};
+    BOOST_REQUIRE_GT(dust_relay_fee, DEFAULT_FALLBACK_FEE);
+    BOOST_REQUIRE_LT(dust_relay_fee, DEFAULT_DISCARD_FEE);
+
+    const auto discard_rate = [&wallet](CAmount fallback_fee, std::optional<CAmount> discard_fee) {
+        wallet.m_fallback_fee = CFeeRate{fallback_fee};
+        wallet.m_allow_fallback_fee = fallback_fee != 0;
+        wallet.m_discard_rate = CFeeRate{discard_fee.value_or(DEFAULT_DISCARD_FEE)};
+        wallet.m_discard_rate_set = discard_fee.has_value();
+        return GetDiscardRate(wallet).GetFeePerK();
+    };
+
+    // The default fallback is below the dust relay fee, so change is discarded
+    // only up to the dust relay floor, not at the 40x higher -discardfee default.
+    BOOST_CHECK_EQUAL(discard_rate(DEFAULT_FALLBACK_FEE, std::nullopt), dust_relay_fee);
+    BOOST_CHECK_EQUAL(discard_rate(dust_relay_fee, std::nullopt), dust_relay_fee);
+    BOOST_CHECK_EQUAL(discard_rate(dust_relay_fee + 1, std::nullopt), dust_relay_fee + 1);
+    BOOST_CHECK_EQUAL(discard_rate(DEFAULT_DISCARD_FEE - 1, std::nullopt), DEFAULT_DISCARD_FEE - 1);
+    // A fallback at or above the -discardfee default leaves the default in place,
+    // as before. The functional test framework's fallbackfee=0.0002 is such a case.
+    BOOST_CHECK_EQUAL(discard_rate(DEFAULT_DISCARD_FEE, std::nullopt), DEFAULT_DISCARD_FEE);
+    BOOST_CHECK_EQUAL(discard_rate(20000, std::nullopt), DEFAULT_DISCARD_FEE);
+    // -fallbackfee=0 has no rate to stand in.
+    BOOST_CHECK_EQUAL(discard_rate(0, std::nullopt), DEFAULT_DISCARD_FEE);
+    // An explicit -discardfee is used unchanged, even when it equals the default.
+    BOOST_CHECK_EQUAL(discard_rate(DEFAULT_FALLBACK_FEE, DEFAULT_DISCARD_FEE), DEFAULT_DISCARD_FEE);
+    BOOST_CHECK_EQUAL(discard_rate(DEFAULT_FALLBACK_FEE, 5000), 5000);
+    BOOST_CHECK_EQUAL(discard_rate(DEFAULT_FALLBACK_FEE, 0), dust_relay_fee);
+    // The stand-in is raised to the required fee rate, which spending the change will need too.
+    wallet.m_min_fee = CFeeRate{DEFAULT_FALLBACK_FEE * 4};
+    BOOST_CHECK_EQUAL(discard_rate(DEFAULT_FALLBACK_FEE, std::nullopt), DEFAULT_FALLBACK_FEE * 4);
+    BOOST_CHECK_EQUAL(discard_rate(DEFAULT_FALLBACK_FEE, 5000), 5000);
+}
+
+BOOST_AUTO_TEST_CASE(minimum_fee_rate_reports_unavailable_estimate)
+{
+    // A minimum fee rate can replace the FALLBACK reason, but the fee
+    // calculation must still say that there was no estimate.
+    CWallet& wallet{m_wallet};
+    CCoinControl coin_control;
+    const auto check = [&](CAmount expected_feerate, FeeReason expected_reason, bool expected_unavailable) {
+        FeeCalculation fee_calc;
+        BOOST_CHECK_EQUAL(GetMinimumFeeRate(wallet, coin_control, &fee_calc).GetFeePerK(), expected_feerate);
+        BOOST_CHECK(fee_calc.reason == expected_reason);
+        BOOST_CHECK_EQUAL(fee_calc.estimate_unavailable, expected_unavailable);
+    };
+
+    check(DEFAULT_FALLBACK_FEE, FeeReason::FALLBACK, true);
+    // -mintxfee above the fallback fee
+    wallet.m_min_fee = CFeeRate{DEFAULT_FALLBACK_FEE * 4};
+    check(DEFAULT_FALLBACK_FEE * 4, FeeReason::REQUIRED, true);
+    // An explicit fee rate does not use estimation
+    coin_control.m_feerate = CFeeRate{DEFAULT_FALLBACK_FEE * 8};
+    check(DEFAULT_FALLBACK_FEE * 8, FeeReason::PAYTXFEE, false);
+    // -fallbackfee=0 still returns a zero FALLBACK rate, which fails the send
+    coin_control.m_feerate.reset();
+    wallet.m_fallback_fee = CFeeRate{0};
+    wallet.m_allow_fallback_fee = false;
+    check(0, FeeReason::FALLBACK, true);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
