@@ -6,7 +6,10 @@
 #
 # The qbit-libbitcoinpqc release-tag check that
 # test/lint/libbitcoinpqc-subtree-check.sh and
-# contrib/devtools/update-libbitcoinpqc-subtree.sh both source.
+# contrib/devtools/update-libbitcoinpqc-subtree.sh both source. Both
+# already export LC_ALL=C; lint-shell-locale.py wants it here too.
+
+export LC_ALL=C
 
 # The scripts that source this file read these.
 # shellcheck disable=SC2034
