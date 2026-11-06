@@ -26,6 +26,7 @@
 #include <node/types.h>
 #include <policy/fees.h>
 #include <txmempool.h>
+#include <util/rbf.h>
 #include <util/signing_timing.h>
 #include <util/time.h>
 #include <util/translation.h>
@@ -455,9 +456,10 @@ bool SendCoinsDialog::PrepareSendText(QString& question_string, QString& informa
         question_string.append(QbitUnits::formatHtmlWithUnit(model->getOptionsModel()->getDisplayUnit(), txFee));
         question_string.append("</span><br />");
 
-        // append RBF message according to transaction's signalling
+        // append RBF message according to transaction's signalling, not the
+        // checkbox, which can change while the transaction is prepared
         question_string.append("<span style='font-size:10pt; font-weight:normal;'>");
-        if (ui->optInRBF->isChecked()) {
+        if (SignalsOptInRBF(*m_current_transaction->getWtx())) {
             question_string.append(tr("You can increase the fee later (signals Replace-By-Fee, BIP-125)."));
         } else {
             question_string.append(tr("Not signalling Replace-By-Fee, BIP-125."));
@@ -518,6 +520,15 @@ bool SendCoinsDialog::PrepareSendRequest(std::unique_ptr<WalletModelTransaction>
         return false;
     }
 
+    // Take the coin control with the recipients, before the unlock request:
+    // the passphrase dialog runs a nested event loop, and Clear All or a coin
+    // control change pressed through accessibility there must not alter
+    // this send.
+    updateCoinControlState();
+
+    coin_control = *m_coin_control;
+    coin_control.m_allow_other_inputs = !coin_control.HasSelected(); // future, could introduce a checkbox to customize this value.
+
     fNewRecipientAllowed = false;
     m_prepare_unlock_context = std::make_unique<WalletModel::UnlockContext>(model->requestUnlock());
     if(!m_prepare_unlock_context->isValid())
@@ -529,11 +540,6 @@ bool SendCoinsDialog::PrepareSendRequest(std::unique_ptr<WalletModelTransaction>
     }
 
     transaction = std::make_unique<WalletModelTransaction>(recipients);
-
-    updateCoinControlState();
-
-    coin_control = *m_coin_control;
-    coin_control.m_allow_other_inputs = !coin_control.HasSelected(); // future, could introduce a checkbox to customize this value.
     return true;
 }
 
@@ -763,8 +769,12 @@ void SendCoinsDialog::prepareTransactionFinished(uint64_t generation, std::share
     const bool always_show_unsigned{model->getOptionsModel()->getEnablePSBTControls()};
     auto confirmationDialog = new SendConfirmationDialog(confirmation, question_string, informative_text, detailed_text, SEND_CONFIRM_DELAY, enable_send, always_show_unsigned, this);
     confirmationDialog->setAttribute(Qt::WA_DeleteOnClose);
+    QPointer<SendCoinsDialog> dialog{this};
     // TODO: Replace QDialog::exec() with safer QDialog::show().
     const auto retval = static_cast<QMessageBox::StandardButton>(confirmationDialog->exec());
+    // A shutdown that starts during the nested event loop deletes the wallet
+    // views, and this dialog with them, before exec() returns.
+    if (!dialog) return;
 
     finishSendWithPreparedTransaction(retval);
 }
@@ -907,20 +917,37 @@ void SendCoinsDialog::sendButtonClicked([[maybe_unused]] bool checked)
         return;
     }
 
-    if (m_prepare_thread) {
+    // fNewRecipientAllowed is false from the unlock request until the send
+    // finishes, including while the confirmation dialog runs its nested event
+    // loop. Modality blocks mouse and keyboard input to this page there, but
+    // accessibility clients can still press Send.
+    if (m_prepare_thread || !fNewRecipientAllowed) {
         log_send_button_timing("busy", false);
         return;
     }
 
     std::unique_ptr<WalletModelTransaction> transaction;
     CCoinControl coin_control;
-    if (!PrepareSendRequest(transaction, coin_control)) {
-        log_send_button_timing("prepare_request_failed", false);
-        return;
-    }
-    log_send_button_timing("queued", true);
+    try {
+        if (!PrepareSendRequest(transaction, coin_control)) {
+            log_send_button_timing("prepare_request_failed", false);
+            return;
+        }
+        log_send_button_timing("queued", true);
 
-    startPrepareTransaction(std::move(transaction), coin_control);
+        startPrepareTransaction(std::move(transaction), coin_control);
+    } catch (...) {
+        // ExceptionSafeConnect lets the application continue after a
+        // NonFatalCheckError. Unless the preparation thread already owns the
+        // attempt, release it here, or Send stays busy and the wallet stays
+        // unlocked until restart.
+        if (!m_prepare_thread) {
+            clearPrepareProgressDialog();
+            m_prepare_unlock_context.reset();
+            fNewRecipientAllowed = true;
+        }
+        throw;
+    }
 }
 
 void SendCoinsDialog::finishSendWithPreparedTransaction(QMessageBox::StandardButton retval)
@@ -954,7 +981,9 @@ void SendCoinsDialog::finishSendWithPreparedTransaction(QMessageBox::StandardBut
             status);
     };
 
-    if(retval != QMessageBox::Yes && retval != QMessageBox::Save)
+    // The model can go away while the confirmation runs its nested event
+    // loop, as it can during the preparation. Nothing can be sent without it.
+    if (!model || (retval != QMessageBox::Yes && retval != QMessageBox::Save))
     {
         fNewRecipientAllowed = true;
         m_current_transaction.reset();
@@ -1040,7 +1069,9 @@ void SendCoinsDialog::finishSendWithPreparedTransaction(QMessageBox::StandardBut
 
 void SendCoinsDialog::clear()
 {
-    m_current_transaction.reset();
+    // Leave m_current_transaction to the send flow, which resets it when it
+    // finishes. Clear All can still be pressed through accessibility while the
+    // confirmation dialog is open, and the confirmation needs the transaction.
 
     // Clear coin control settings
     m_coin_control->UnSelectAll();

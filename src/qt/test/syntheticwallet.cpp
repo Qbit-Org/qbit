@@ -10,7 +10,10 @@
 #include <policy/fees.h>
 #include <primitives/transaction.h>
 #include <script/script.h>
+#include <util/check.h>
+#include <util/rbf.h>
 #include <util/translation.h>
+#include <wallet/coincontrol.h>
 #include <wallet/wallet.h>
 
 #include <chrono>
@@ -144,6 +147,12 @@ public:
     std::string getWalletName() override { return "synthetic-pqc-report"; }
     std::unique_ptr<interfaces::Wallet> clone() override
     {
+        {
+            std::lock_guard lock{m_state->mutex};
+            if (std::exchange(m_state->clone_throw, false)) {
+                throw NonFatalCheckError{"synthetic clone failure", __FILE__, __LINE__, __func__};
+            }
+        }
         return std::make_unique<SyntheticWallet>(m_report, m_state, /*background_clone=*/true);
     }
     util::Result<CTxDestination> getNewDestination(const OutputType, const std::string&) override { return CTxDestination{PKHash{}}; }
@@ -192,7 +201,7 @@ public:
     bool isLockedCoin(const COutPoint&) override { return false; }
     void listLockedCoins(std::vector<COutPoint>&) override {}
     util::Result<CTransactionRef> createTransaction(const std::vector<wallet::CRecipient>& recipients,
-        const wallet::CCoinControl&,
+        const wallet::CCoinControl& coin_control,
         bool,
         int& change_pos,
         CAmount& fee,
@@ -200,9 +209,12 @@ public:
         const SigningProgressCallback& progress_callback) override
     {
         bool wait_for_cancel{false};
+        bool rbf_input{false};
         {
             std::unique_lock lock{m_state->mutex};
             m_state->create_entered = true;
+            m_state->create_coins_selected = coin_control.HasSelected();
+            rbf_input = m_state->create_rbf_input;
             wait_for_cancel = m_state->wait_for_cancel;
             m_state->condition.notify_all();
             if (!wait_for_cancel) {
@@ -279,6 +291,10 @@ public:
         }
 
         CMutableTransaction tx;
+        if (rbf_input) {
+            const uint32_t sequence{coin_control.m_signal_bip125_rbf.value_or(true) ? MAX_BIP125_RBF_SEQUENCE : CTxIn::SEQUENCE_FINAL};
+            tx.vin.emplace_back(COutPoint{Txid::FromUint256(uint256::ONE), 0}, CScript{}, sequence);
+        }
         if (!recipients.empty()) {
             tx.vout.emplace_back(recipients.front().nAmount, CScript{} << OP_TRUE);
         }
