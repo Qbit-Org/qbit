@@ -718,7 +718,7 @@ class HistoryLogOptsTest(unittest.TestCase):
         with self.with_git_version("git version 2.36.0\n"):
             self.assertEqual(run_scanners.remerge_diff_git_gap(self.repo), "")
 
-    def run_fake_gitleaks(self, git_version: str) -> tuple[dict, list[str]]:
+    def run_fake_gitleaks(self, git_version: str, source: Path | None = None) -> tuple[dict, list[str]]:
         bin_dir = self.repo / "fake-bin"
         bin_dir.mkdir()
         fake = bin_dir / "gitleaks"
@@ -732,7 +732,7 @@ class HistoryLogOptsTest(unittest.TestCase):
         )
         fake.chmod(0o755)
         args = argparse.Namespace(
-            mode="nightly", source=self.repo, source_commit=self.clean_merge,
+            mode="nightly", source=source or self.repo, source_commit=self.clean_merge,
             freeze_commit=self.clean_merge, history_diff_base_ref="", skip_build_scanners=False,
         )
         output_root = self.repo / "evidence"
@@ -741,6 +741,68 @@ class HistoryLogOptsTest(unittest.TestCase):
         with self.with_git_version(git_version), patch.dict(os.environ, {"PATH": path}):
             summary = run_scanners.run_scanner("gitleaks", args, output_root)
         return summary, argv_log.read_text(encoding="utf8").splitlines()
+
+    def shallow_clone(self, depth: int) -> Path:
+        parent = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, parent, True)
+        clone = parent / "clone"
+        subprocess.run(
+            ["git", "clone", "-q", f"--depth={depth}", "--branch", "main", f"file://{self.repo}", str(clone)],
+            check=True, capture_output=True,
+        )
+        shallow = subprocess.run(
+            ["git", "-C", str(clone), "rev-parse", "--is-shallow-repository"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        self.assertEqual(shallow, "true")
+        return clone
+
+    def test_a_shallow_checkout_is_an_incomplete_history_scan(self) -> None:
+        clone = self.shallow_clone(depth=2)
+        summary, _argv = self.run_fake_gitleaks("git version 2.50.1\n", source=clone)
+        self.assertIs(summary["details"]["history_scan_complete"], False)
+        self.assertTrue(any("the source checkout is shallow at" in gap for gap in summary["coverage_gaps"]))
+        self.assertTrue(run_scanners.should_fail("infra-and-secrets", [summary]))
+        # A ranged scan whose range crosses the shallow boundary is cut too.
+        gap = run_scanners.shallow_history_gap(clone, [f"{self.evil_merge}..{self.clean_merge}"])
+        self.assertIn("could not walk all of it", gap)
+
+    def test_a_shallow_boundary_outside_the_scanned_history_does_not_count(self) -> None:
+        # As when the libbitcoinpqc subtree check fetches an upstream tag with
+        # --depth=1: the checkout is shallow, but no scanned ref reaches it.
+        other = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, other, True)
+        subprocess.run(["git", "init", "-q", "-b", "main", str(other)], check=True)
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false",
+             "-C", str(other), "commit", "-q", "--allow-empty", "-m", "upstream"],
+            check=True,
+        )
+        self.git("fetch", "-q", "--depth=1", f"file://{other}", "main")
+        self.assertEqual(self.git("rev-parse", "--is-shallow-repository"), "true")
+        summary, _argv = self.run_fake_gitleaks("git version 2.50.1\n")
+        self.assertEqual(summary["coverage_gaps"], [])
+        self.assertIs(summary["details"]["history_scan_complete"], True)
+        self.assertEqual(run_scanners.shallow_history_gap(self.repo, [f"{self.base}..{self.clean_merge}"]), "")
+
+    def test_an_octopus_merge_is_named_as_a_coverage_gap(self) -> None:
+        token = "ONLY_IN_OCTOPUS_TOKEN"
+        for branch in ("o1", "o2"):
+            self.git("checkout", "-q", "-b", branch, self.clean_merge)
+            self.commit_file(f"{branch}.txt", branch, branch)
+        self.git("checkout", "-q", "main")
+        self.git("merge", "-q", "--no-ff", "--no-commit", "o1", "o2")
+        (self.repo / "octopus.txt").write_text(f"{token}\n", encoding="utf8")
+        self.git("add", "octopus.txt")
+        self.git("commit", "-q", "-m", "Merge o1 and o2")
+        octopus = self.git("rev-parse", "HEAD")
+        self.assertEqual(len(self.git("log", "-1", "--format=%P", octopus).split()), 3)
+        # --remerge-diff shows nothing for it, so the secret is not scanned.
+        self.assertEqual(self.commits_reporting(token, self.full_history_opts()), [])
+        summary, _argv = self.run_fake_gitleaks("git version 2.50.1\n")
+        self.assertIs(summary["details"]["history_scan_complete"], False)
+        self.assertTrue(any(octopus[:12] in gap and "octopus merge" in gap for gap in summary["coverage_gaps"]))
+        self.assertTrue(run_scanners.should_fail("infra-and-secrets", [summary]))
 
     def test_current_git_scans_merges_and_passes_the_policy(self) -> None:
         summary, argv = self.run_fake_gitleaks("git version 2.50.1\n")

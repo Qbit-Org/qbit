@@ -264,7 +264,9 @@ def git_merge_base(source: Path, left: str, right: str) -> str:
 # A clean merge shows only its merge-only changes, so a secret from a pull
 # request commit is not reported again, under a new fingerprint, on its merge.
 # A conflicted merge also shows, as added, the lines its resolution wrote in
-# place of the conflict markers. Every parent is still walked.
+# place of the conflict markers. Every parent is still walked. It shows nothing
+# for an octopus merge, one with more than two parents, so the summary names
+# any in the scanned history as a coverage gap.
 HISTORY_DIFF_MERGES = "--remerge-diff"
 HISTORY_DIFF_MERGES_MIN_GIT = (2, 36)
 
@@ -293,16 +295,77 @@ def remerge_diff_git_gap(source: Path) -> str:
     return ""
 
 
-def history_log_opts(source: Path, args: argparse.Namespace, remerge_diff: bool = True) -> str:
-    diff_options = f"{GITLEAKS_DIFF_FILTER} {HISTORY_DIFF_MERGES}" if remerge_diff else GITLEAKS_DIFF_FILTER
+def history_scope(source: Path, args: argparse.Namespace) -> list[str]:
+    """Return the git rev-list arguments for the commits the history scan walks."""
     base_ref = str(getattr(args, "history_diff_base_ref", "") or "").strip()
     if not base_ref:
-        return f"{GITLEAKS_FULL_HISTORY} {diff_options}"
+        return ["--all"]
     source_commit = str(args.source_commit or git_commit(source)).strip()
     if not source_commit:
         raise SystemExit("History scanner diff scope requires a git source commit.")
     base_commit = git_merge_base(source, source_commit, base_ref)
-    return f"{diff_options} {base_commit}..{source_commit}"
+    return [f"{base_commit}..{source_commit}"]
+
+
+def history_log_opts(source: Path, args: argparse.Namespace, remerge_diff: bool = True) -> str:
+    diff_options = f"{GITLEAKS_DIFF_FILTER} {HISTORY_DIFF_MERGES}" if remerge_diff else GITLEAKS_DIFF_FILTER
+    scope = history_scope(source, args)
+    if scope == ["--all"]:
+        return f"{GITLEAKS_FULL_HISTORY} {diff_options}"
+    return f"{diff_options} {' '.join(scope)}"
+
+
+def shallow_history_gap(source: Path, scope: list[str]) -> str:
+    """Return a coverage gap when a shallow boundary cuts the scanned history, else "".
+
+    Only a boundary inside the scope cuts the walk. The libbitcoinpqc subtree
+    check can fetch an upstream tag with --depth=1, which marks the checkout
+    shallow at a commit no scanned ref reaches."""
+    exit_code, stdout, _stderr = git_command(source, "rev-parse", "--is-shallow-repository")
+    if exit_code == 0 and stdout.strip() == "false":
+        return ""
+    unknown = "could not tell whether a shallow checkout cuts the gitleaks history walk"
+    if exit_code != 0 or stdout.strip() != "true":
+        return unknown
+    exit_code, stdout, _stderr = git_command(source, "rev-parse", "--git-path", "shallow")
+    shallow_path = Path(stdout.strip())
+    if not shallow_path.is_absolute():
+        shallow_path = source / shallow_path
+    try:
+        boundaries = set(shallow_path.read_text(encoding="utf8").split())
+    except OSError:
+        return unknown
+    exit_code, stdout, _stderr = git_command(source, "rev-list", *scope)
+    if exit_code != 0:
+        return unknown
+    cut = boundaries.intersection(stdout.split())
+    if not cut:
+        return ""
+    return (
+        f"the source checkout is shallow at {len(cut)} commit(s) in the scanned history, so "
+        "gitleaks could not walk all of it; fetch the full history with git fetch --unshallow"
+    )
+
+
+def octopus_merge_gap(source: Path, scope: list[str]) -> str:
+    """Return a coverage gap naming octopus merges in the scanned history, else ""."""
+    exit_code, stdout, _stderr = git_command(source, "rev-list", "--min-parents=3", *scope)
+    if exit_code != 0:
+        return "could not list octopus merges in the scanned history"
+    commits = stdout.split()
+    if not commits:
+        return ""
+    named = ", ".join(commit[:12] for commit in commits[:10])
+    more = f" and {len(commits) - 10} more" if len(commits) > 10 else ""
+    return (
+        f"{HISTORY_DIFF_MERGES} shows no diff for an octopus merge, so content changed only in "
+        f"these merges was not scanned: {named}{more}"
+    )
+
+
+def gitleaks_history_gaps(source: Path, args: argparse.Namespace) -> list[str]:
+    scope = history_scope(source, args)
+    return [gap for gap in (shallow_history_gap(source, scope), octopus_merge_gap(source, scope)) if gap]
 
 
 def decode_command_output(output: bytes | str | None) -> str:
@@ -1686,6 +1749,7 @@ def run_scanner(tool: str, args: argparse.Namespace, output_root: Path) -> dict[
     # On Git older than 2.36, gitleaks still scans every commit's own changes,
     # without --remerge-diff, and the summary records the merge-only gap.
     git_gap = remerge_diff_git_gap(args.source) if tool == "gitleaks" else ""
+    history_gaps = gitleaks_history_gaps(args.source, args) if tool == "gitleaks" else []
     commands, report = external_commands(tool, args.source, raw_dir, args, remerge_diff=not git_gap)
     exit_codes = []
     cargo_audit_fetch_failed = False
@@ -1734,12 +1798,13 @@ def run_scanner(tool: str, args: argparse.Namespace, output_root: Path) -> dict[
         "finding_exit_codes_accepted": accepted_finding_exit_codes,
     }
     if tool == "gitleaks":
-        details["history_scan_complete"] = not git_gap
+        details["history_scan_complete"] = not git_gap and not history_gaps
     coverage_gaps = []
     if any(code != 0 for code in exit_codes) and not accepted_finding_exit_codes:
         coverage_gaps.append("Scanner command exited non-zero; inspect private raw output before trusting coverage.")
     if git_gap:
         coverage_gaps.append(git_gap)
+    coverage_gaps.extend(history_gaps)
     status = "completed" if all(code == 0 for code in exit_codes) or accepted_finding_exit_codes else "failed"
     if cargo_audit_fetch_failed:
         coverage_gaps.append(
@@ -1862,9 +1927,10 @@ def secret_scan_incomplete(summary: dict[str, Any]) -> bool:
     """Whether a gitleaks summary leaves part of the history unscanned.
 
     That is a gitleaks run that did not complete (skipped, failed or missing),
-    or one that completed without --remerge-diff on a Git older than 2.36 and
-    so missed content changed only in merge commits. A completed summary must
-    say its history scan was complete. No other coverage gap counts here.
+    or one that completed but missed part of the history: it ran without
+    --remerge-diff on a Git older than 2.36, a shallow boundary cut the walk,
+    or the history has octopus merges. A completed summary must say its history
+    scan was complete. No other coverage gap counts here.
     """
     if str(summary.get("status", "")) != "completed":
         return True
