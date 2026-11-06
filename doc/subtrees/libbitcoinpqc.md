@@ -67,9 +67,12 @@ one that fails:
 - The worktree and the index must both match `HEAD`, with no untracked or
   ignored files under `src/libbitcoinpqc`, so nothing else lands in the import
   commit. List ignored files with `git clean -ndX src/libbitcoinpqc`.
-- The current split is read from `HEAD`'s newest non-merge commit that changes
-  `src/libbitcoinpqc` and carries `git-subtree-dir: src/libbitcoinpqc`, the
-  same search the subtree check uses.
+- The current split is read from `HEAD`'s newest non-merge commit that carries
+  `git-subtree-dir: src/libbitcoinpqc`, the same search the subtree check uses.
+  It skips merge commits, whose pull request titles could quote the trailer,
+  and takes no pathspec, so an import commit that only moved the split is
+  found. A later non-merge commit that quotes the trailer can only make the
+  check fail.
 - The release tag must be an annotated tag with a good signature (`VALIDSIG`)
   from operator-01's signing key, `289EA3EC2F1939A24984840ED26CFC05586D371E`
   (listed in `contrib/keys/operator-keys/KEYS.md`), which signed `v0.3.0` and
@@ -87,11 +90,17 @@ one that fails:
   [Reviewing A Downstream Delta](#reviewing-a-downstream-delta).
 
 The import commit is made with the caller's own GnuPG environment, so a
-maintainer whose commits are signed gets a signed import commit. The helper
-then runs `test/lint/libbitcoinpqc-subtree-check.sh`; if the check fails, the
-helper undoes the import commit and exits non-zero, so no unverified import
-commit is left behind. Importing the tag that is already imported changes
-nothing.
+maintainer whose commits are signed gets a signed import commit. When the
+release's tree equals the vendored tree, as when a release upstreams qbit's
+approved downstream delta, the import commit only moves `git-subtree-split`
+and changes no file. The helper then runs
+`test/lint/libbitcoinpqc-subtree-check.sh`, which resolves the exact
+`refs/tags/<tag>`, and checks that the commit the lint verified is the tag's
+commit. If either check fails, the helper undoes the import commit and exits
+non-zero, so no unverified import commit is left behind; if the undo itself
+fails, it says to run `git reset --hard HEAD~1`. Importing the tag that is
+already imported changes nothing, but still runs the subtree check, so drift in
+the vendored tree is reported.
 
 | Flag or variable | Use |
 | --- | --- |

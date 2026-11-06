@@ -299,6 +299,8 @@ class RunScannersTest(unittest.TestCase):
 class LatestGitSubtreeMetadataTest(unittest.TestCase):
     """The scanner reads the subtree split the way the subtree lint does."""
 
+    QUOTED = f"git-subtree-dir: src/libbitcoinpqc\ngit-subtree-split: {'0' * 40}"
+
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.repo = Path(self.temp_dir.name)
@@ -313,18 +315,6 @@ class LatestGitSubtreeMetadataTest(unittest.TestCase):
             "-m", f"git-subtree-dir: src/libbitcoinpqc\ngit-subtree-split: {self.split}",
         )
         self.import_commit = self.git("rev-parse", "HEAD")
-        quoted = f"git-subtree-dir: src/libbitcoinpqc\ngit-subtree-split: {'0' * 40}"
-        # A later commit outside the subtree that quotes the trailer.
-        (self.repo / "README").write_text("docs\n", encoding="utf8")
-        self.git("add", "README")
-        self.git("commit", "-q", "-m", "doc: describe the import", "-m", quoted)
-        # A merge commit whose message quotes it, as a pull request title might.
-        self.git("checkout", "-q", "-b", "topic")
-        (self.repo / "notes.txt").write_text("notes\n", encoding="utf8")
-        self.git("add", "notes.txt")
-        self.git("commit", "-q", "-m", "notes")
-        self.git("checkout", "-q", "main")
-        self.git("merge", "-q", "--no-ff", "-m", "Merge pull request #1", "-m", quoted, "topic")
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -339,10 +329,33 @@ class LatestGitSubtreeMetadataTest(unittest.TestCase):
         )
         return result.stdout.strip()
 
-    def test_ignores_commits_that_only_quote_the_trailer(self) -> None:
-        metadata = run_scanners.latest_git_subtree_metadata(self.repo, "src/libbitcoinpqc")
-        self.assertEqual(metadata["qbit_import_commit"], self.import_commit)
-        self.assertEqual(metadata["git_subtree_split"], self.split)
+    def metadata(self) -> dict:
+        return run_scanners.latest_git_subtree_metadata(self.repo, "src/libbitcoinpqc")
+
+    def test_ignores_a_merge_commit_that_quotes_the_trailer(self) -> None:
+        self.git("checkout", "-q", "-b", "topic")
+        (self.repo / "notes.txt").write_text("notes\n", encoding="utf8")
+        self.git("add", "notes.txt")
+        self.git("commit", "-q", "-m", "notes")
+        self.git("checkout", "-q", "main")
+        self.git("merge", "-q", "--no-ff", "-m", "Merge pull request #1", "-m", self.QUOTED, "topic")
+        self.assertEqual(self.metadata()["qbit_import_commit"], self.import_commit)
+        self.assertEqual(self.metadata()["git_subtree_split"], self.split)
+
+    def test_finds_an_import_commit_that_only_moves_the_split(self) -> None:
+        moved = "2" * 40
+        self.git(
+            "commit", "-q", "--allow-empty", "-m", "Squashed 'src/libbitcoinpqc/' changes",
+            "-m", f"git-subtree-dir: src/libbitcoinpqc\ngit-subtree-split: {moved}",
+        )
+        self.assertEqual(self.metadata()["git_subtree_split"], moved)
+
+    def test_a_non_merge_commit_that_quotes_the_trailer_is_reported(self) -> None:
+        # Its split matches no release, so the subtree check fails closed.
+        (self.repo / "README").write_text("docs\n", encoding="utf8")
+        self.git("add", "README")
+        self.git("commit", "-q", "-m", "doc: describe the import", "-m", self.QUOTED)
+        self.assertEqual(self.metadata()["git_subtree_split"], "0" * 40)
 
 
 if __name__ == "__main__":

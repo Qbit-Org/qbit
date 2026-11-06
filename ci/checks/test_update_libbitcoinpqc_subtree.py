@@ -140,6 +140,13 @@ class UpdateLibbitcoinpqcSubtreeTest(unittest.TestCase):
             cls._git(work, "add", "-A")
             cls._git(work, "commit", "-q", "--allow-empty", "-m", f"release {tag}")
             cls._sign_tag(work, tag, cls.signer, cls.signer_home)
+        cls._git(work, "checkout", "-q", "--detach", "v0.3.0")
+        (work / "Cargo.lock").write_text("a = 1\nb = 2\n", encoding="utf8")
+        cls._git(work, "add", "-A")
+        cls._git(work, "commit", "-q", "-m", "release v0.3.6: upstream qbit's lockfile change")
+        cls._sign_tag(work, "v0.3.6", cls.signer, cls.signer_home)
+        # An annotated decoy whose ref name ends in v0.3.2 and sorts first.
+        cls._git(work, "tag", "-a", "-m", "decoy", "0/v0.3.2", "v0.3.0^{commit}")
         cls._git(work, "checkout", "-q", "v0.3.2")
         cls._sign_tag(work, "v9.9.9-wrong", cls.wrong, cls.wrong_home)
         # An older signed tag object published under a new name.
@@ -278,6 +285,7 @@ class UpdateLibbitcoinpqcSubtreeTest(unittest.TestCase):
         result = self.run_helper(repo, "v0.3.0")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("already imports v0.3.0", result.stdout)
+        self.assertIn("GOOD", result.stdout)
         self.assertEqual(self.state(repo), before)
 
     def test_refuses_staged_only_change(self) -> None:
@@ -409,14 +417,73 @@ class UpdateLibbitcoinpqcSubtreeTest(unittest.TestCase):
         self.assert_imported(repo, "v0.3.2", self.run_helper(repo, "--accept-upstream", name, "v0.3.2"))
 
     @unittest.skipUnless(HAVE_GIT_2_45, "Git 2.45 or later is required")
-    def test_release_tree_equal_to_vendored_tree_is_refused_clearly(self) -> None:
+    def test_release_with_the_vendored_tree_moves_only_the_split(self) -> None:
         repo = self.make_downstream()
         self.assert_imported(repo, "v0.3.2", self.run_helper(repo, "v0.3.2"))
-        self.assert_refused(
-            repo,
-            "the release tree equals the vendored tree, so the pin cannot advance through an import commit; ask a maintainer",
-            "v0.3.5",
+        result = self.run_helper(repo, "v0.3.5")
+        self.assert_imported(repo, "v0.3.5", result)
+        self.assertIn("the import commit only moves the split", result.stdout)
+        self.assertEqual(self._git(repo, "diff", "--name-only", "HEAD~1", "HEAD"), "")
+
+    @unittest.skipUnless(HAVE_GIT_2_45, "Git 2.45 or later is required")
+    def test_release_that_upstreams_the_downstream_delta_imports(self) -> None:
+        repo = self.make_downstream()
+        (repo / PREFIX / "Cargo.lock").write_text("a = 1\nb = 2\n", encoding="utf8")
+        self._git(repo, "add", "-A")
+        self.commit(repo, "qbit's approved lockfile delta")
+        self.assert_imported(repo, "v0.3.6", self.run_helper(repo, "v0.3.6"))
+        self.assertEqual(self._git(repo, "diff", "--name-only", "HEAD~1", "HEAD"), "")
+        lint = self.run_lint(repo, "v0.3.6")
+        self.assertEqual(lint.returncode, 0, lint.stderr)
+        self.assertIn("GOOD", lint.stdout)
+
+    @unittest.skipUnless(HAVE_GIT_2_45, "Git 2.45 or later is required")
+    def test_decoy_tag_ref_does_not_mislead_the_lint(self) -> None:
+        repo = self.make_downstream()
+        self.assert_imported(repo, "v0.3.2", self.run_helper(repo, "v0.3.2"))
+        lint = self.run_lint(repo, "v0.3.2")
+        self.assertEqual(lint.returncode, 0, lint.stderr)
+        self.assertIn(
+            f"resolves to commit {self._git(self.upstream, 'rev-parse', 'v0.3.2^{commit}')}", lint.stdout
         )
+
+    @unittest.skipUnless(HAVE_GIT_2_45, "Git 2.45 or later is required")
+    def test_helper_rejects_a_lint_that_verified_another_commit(self) -> None:
+        repo = self.make_downstream()
+        other = self._git(self.upstream, "rev-parse", "v0.3.0^{commit}")
+        (repo / LINT).write_text(
+            f"#!/usr/bin/env bash\necho 'x v0.3.2 resolves to commit {other} tree t'\necho GOOD\n",
+            encoding="utf8",
+        )
+        self._git(repo, "add", "-A")
+        self.commit(repo, "a lint that verifies another commit")
+        self.assert_refused(repo, f"the subtree check verified {other}, not v0.3.2", "v0.3.2")
+
+    @unittest.skipUnless(HAVE_GIT_2_45, "Git 2.45 or later is required")
+    def test_lint_failure_that_cannot_be_undone_says_how_to_recover(self) -> None:
+        repo = self.make_downstream()
+        (repo / LINT).write_text(
+            f"#!/usr/bin/env bash\necho dirty >> {PREFIX}/README.md\nexit 1\n", encoding="utf8"
+        )
+        self._git(repo, "add", "-A")
+        self.commit(repo, "a lint that dirties the subtree and fails")
+        result = self.run_helper(repo, "v0.3.2")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "the import commit failed the lint and could not be undone; run git reset --hard HEAD~1",
+            result.stderr,
+        )
+
+    @unittest.skipUnless(HAVE_GIT_2_45, "Git 2.45 or later is required")
+    def test_already_imported_tag_still_runs_the_subtree_check(self) -> None:
+        repo = self.make_downstream()
+        (repo / PREFIX / "src.c").write_text("int drift;\n", encoding="utf8")
+        self._git(repo, "add", "-A")
+        self.commit(repo, "vendored tree drifts")
+        result = self.run_helper(repo, "v0.3.0")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("already imports v0.3.0", result.stdout)
+        self.assertIn("already imports v0.3.0, but the subtree check failed", result.stderr)
 
     @unittest.skipUnless(HAVE_GIT_2_45, "Git 2.45 or later is required")
     def test_failed_commit_restores_the_prefix_including_ignored_files(self) -> None:
@@ -476,7 +543,7 @@ class UpdateLibbitcoinpqcSubtreeTest(unittest.TestCase):
         self.assertIn("A first import is a maintainer task outside this helper.", result.stdout)
 
     @unittest.skipUnless(HAVE_GIT_2_45, "Git 2.45 or later is required")
-    def test_lint_ignores_commits_that_only_quote_the_trailer(self) -> None:
+    def test_lint_fails_closed_on_a_commit_that_quotes_the_trailer(self) -> None:
         repo = self.make_downstream()
         self.assert_imported(repo, "v0.3.2", self.run_helper(repo, "v0.3.2"))
         quoted = f"git-subtree-dir: {PREFIX}\ngit-subtree-split: {'0' * 40}"
@@ -484,8 +551,8 @@ class UpdateLibbitcoinpqcSubtreeTest(unittest.TestCase):
         self._git(repo, "add", "README")
         self.commit(repo, "doc: describe the import", quoted)
         result = self.run_lint(repo, "v0.3.2")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("GOOD", result.stdout)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("FAIL", result.stderr)
 
     @unittest.skipUnless(HAVE_GIT_2_45, "Git 2.45 or later is required")
     def test_lint_finds_import_landed_by_a_merge_commit(self) -> None:

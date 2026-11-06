@@ -157,9 +157,10 @@ git diff --cached --quiet -- || die "the index has staged changes; commit or uns
   || die "ignored files under ${PREFIX}; list them with git clean -ndX ${PREFIX} and remove them first"
 
 # The current split is read the way test/lint/libbitcoinpqc-subtree-check.sh
-# finds it.
+# finds it: the newest non-merge commit with the trailer, with no pathspec, so
+# an import commit that only moved the split is found too.
 import_commit="$(
-  git log --no-merges --grep="^git-subtree-dir: ${PREFIX}/*$" --format=%H -n 1 HEAD -- "${PREFIX}"
+  git log --no-merges --grep="^git-subtree-dir: ${PREFIX}/*$" --format=%H -n 1 HEAD
 )"
 [[ -n "${import_commit}" ]] || die "no git-subtree-dir commit for ${PREFIX}; this helper refreshes an existing import"
 old_split="$(
@@ -174,7 +175,9 @@ git fetch --quiet --no-tags "${REMOTE_URL}" "refs/tags/${tag}"
 tag_object="$(git rev-parse --verify FETCH_HEAD)"
 
 # Check the tag against a throwaway keyring that holds only the signer's
-# certificate; the trap removes it on every exit and cannot fail itself.
+# certificate; the trap removes it on every exit and cannot fail itself. Like
+# status_fingerprints in ci/release/validate_release_artifacts.py, this pins
+# the first VALIDSIG field, the signing (sub)key's fingerprint.
 (
   GNUPGHOME="$(mktemp -d)"
   export GNUPGHOME
@@ -195,26 +198,6 @@ tag_object="$(git rev-parse --verify FETCH_HEAD)"
   fi
 )
 
-upstream_commit="$(git rev-parse --verify "${tag_object}^{commit}")"
-if [[ "${upstream_commit}" == "${old_split}" ]]; then
-  echo "${PREFIX} already imports ${tag} (${upstream_commit}); nothing to do."
-  exit 0
-fi
-if ! git cat-file -e "${old_split}^{commit}" 2>/dev/null; then
-  git fetch --quiet --no-tags "${REMOTE_URL}" "${old_split}"
-fi
-if [[ "${allow_downgrade}" -ne 1 ]] \
-  && ! git merge-base --is-ancestor "${old_split}" "${upstream_commit}"; then
-  die "${tag} (${upstream_commit}) does not descend from the current split ${old_split}; pass --allow-downgrade to import it anyway"
-fi
-
-old_upstream_tree="$(git rev-parse --verify "${old_split}^{tree}")"
-qbit_tree="$(git rev-parse --verify "HEAD:${PREFIX}")"
-new_upstream_tree="$(git rev-parse --verify "${upstream_commit}^{tree}")"
-if [[ "${new_upstream_tree}" == "${qbit_tree}" ]]; then
-  die "the release tree equals the vendored tree, so the pin cannot advance through an import commit; ask a maintainer"
-fi
-
 # One EXIT trap removes the scratch files and, if the import started but did
 # not commit, restores the prefix, which was clean (including ignored files)
 # before the import started.
@@ -233,6 +216,41 @@ cleanup() {
 }
 trap cleanup EXIT
 work_dir="$(mktemp -d)"
+
+# Run the subtree check for the tag, and set lint_commit to the commit the
+# check says the tag resolves to.
+lint_commit=""
+run_subtree_check() {
+  local status=0
+  LIBBITCOINPQC_REMOTE_URL="${REMOTE_URL}" LIBBITCOINPQC_REMOTE_REF="${tag}" \
+    test/lint/libbitcoinpqc-subtree-check.sh >"${work_dir}/lint" || status=$?
+  cat "${work_dir}/lint"
+  lint_commit="$(
+    awk '/ resolves to commit / { for (i = 1; i < NF; i++) if ($i == "commit") { print $(i + 1); exit } }' \
+      "${work_dir}/lint"
+  )"
+  return "${status}"
+}
+
+upstream_commit="$(git rev-parse --verify "${tag_object}^{commit}")"
+if [[ "${upstream_commit}" == "${old_split}" ]]; then
+  echo "${PREFIX} already imports ${tag} (${upstream_commit}); checking it."
+  run_subtree_check || die "${PREFIX} already imports ${tag}, but the subtree check failed"
+  [[ "${lint_commit}" == "${upstream_commit}" ]] \
+    || die "the subtree check verified ${lint_commit:-no commit}, not ${tag} (${upstream_commit})"
+  exit 0
+fi
+if ! git cat-file -e "${old_split}^{commit}" 2>/dev/null; then
+  git fetch --quiet --no-tags "${REMOTE_URL}" "${old_split}"
+fi
+if [[ "${allow_downgrade}" -ne 1 ]] \
+  && ! git merge-base --is-ancestor "${old_split}" "${upstream_commit}"; then
+  die "${tag} (${upstream_commit}) does not descend from the current split ${old_split}; pass --allow-downgrade to import it anyway"
+fi
+
+old_upstream_tree="$(git rev-parse --verify "${old_split}^{tree}")"
+qbit_tree="$(git rev-parse --verify "HEAD:${PREFIX}")"
+new_upstream_tree="$(git rev-parse --verify "${upstream_commit}^{tree}")"
 
 # Merge the qbit subtree into the release, with the old release as the base.
 # Where the result differs from the release, the import would drop a qbit
@@ -298,20 +316,35 @@ if [[ -n "${unaccepted_conflicts[*]+x}${unaccepted_paths[*]+x}" ]]; then
 fi
 
 # Import with the caller's own GnuPG environment, so a maintainer whose commits
-# are signed gets a signed import commit.
+# are signed gets a signed import commit. When the release tree equals the
+# vendored tree, as when a release upstreams qbit's downstream delta, the import
+# commit only moves git-subtree-split and changes no file.
 import_started=1
-git rm -r -q -- "${PREFIX}"
-git read-tree --prefix="${PREFIX}/" -u "${new_upstream_tree}"
-git commit -q \
+commit_args=()
+if [[ "${new_upstream_tree}" == "${qbit_tree}" ]]; then
+  echo "The release tree equals the vendored tree; the import commit only moves the split."
+  commit_args+=(--allow-empty)
+else
+  git rm -r -q -- "${PREFIX}"
+  git read-tree --prefix="${PREFIX}/" -u "${new_upstream_tree}"
+fi
+git commit -q ${commit_args[@]+"${commit_args[@]}"} \
   -m "Squashed '${PREFIX}/' changes from ${old_split:0:10}..${upstream_commit:0:10}" \
   -m "git-subtree-dir: ${PREFIX}
 git-subtree-split: ${upstream_commit}"
 import_committed=1
 
-if ! LIBBITCOINPQC_REMOTE_URL="${REMOTE_URL}" LIBBITCOINPQC_REMOTE_REF="${tag}" \
-  test/lint/libbitcoinpqc-subtree-check.sh; then
-  git reset -q --keep HEAD~1
-  die "the subtree check failed; the import commit was undone"
+lint_status=0
+run_subtree_check || lint_status=$?
+if [[ "${lint_status}" -ne 0 || "${lint_commit}" != "${upstream_commit}" ]]; then
+  if [[ "${lint_status}" -ne 0 ]]; then
+    reason="the subtree check failed"
+  else
+    reason="the subtree check verified ${lint_commit:-no commit}, not ${tag} (${upstream_commit})"
+  fi
+  git reset -q --keep HEAD~1 \
+    || die "${reason}; the import commit failed the lint and could not be undone; run git reset --hard HEAD~1"
+  die "${reason}; the import commit was undone"
 fi
 
 echo "Imported ${tag} (${upstream_commit}) into ${PREFIX}."

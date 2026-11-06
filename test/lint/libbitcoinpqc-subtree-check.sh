@@ -27,18 +27,17 @@ EOF
 }
 
 resolve_remote_commit() {
+  # Resolve the exact tag ref, never a suffix match such as refs/tags/x/<tag>:
+  # the peeled commit of an annotated tag, else a lightweight tag's commit.
   local remote_url="$1"
   local remote_ref="$2"
   local ls_remote_output
 
-  if ls_remote_output="$(git ls-remote --exit-code "${remote_url}" "${remote_ref}^{}" 2>/dev/null)"; then
-    printf '%s\n' "${ls_remote_output}" | awk 'NR==1 {print $1}'
-    return
-  fi
-
-  if ls_remote_output="$(git ls-remote --exit-code "${remote_url}" "${remote_ref}" 2>/dev/null)"; then
-    printf '%s\n' "${ls_remote_output}" | awk 'NR==1 {print $1}'
-  fi
+  ls_remote_output="$(git ls-remote "${remote_url}" "refs/tags/${remote_ref}" 2>/dev/null)" || return 0
+  printf '%s\n' "${ls_remote_output}" | awk -v ref="refs/tags/${remote_ref}" '
+    $2 == ref "^{}" { peeled = $1 }
+    $2 == ref { direct = $1 }
+    END { if (peeled != "") print peeled; else if (direct != "") print direct }'
 }
 
 approved_downstream_patch() {
@@ -106,7 +105,7 @@ if [[ -z "${upstream_commit}" ]]; then
 fi
 
 if ! git cat-file -e "${upstream_commit}^{commit}" 2>/dev/null; then
-  git fetch --depth=1 "${REMOTE_URL}" "${REMOTE_REF}" >/dev/null
+  git fetch --depth=1 "${REMOTE_URL}" "refs/tags/${REMOTE_REF}" >/dev/null
 fi
 
 if ! git cat-file -e "${upstream_commit}^{commit}" 2>/dev/null; then
@@ -116,17 +115,18 @@ fi
 
 upstream_commit="$(git rev-parse "${upstream_commit}^{commit}")"
 upstream_tree="$(git show -s --format=%T "${upstream_commit}")"
-# Search only non-merge commits that change the prefix, so neither a commit
-# that merely quotes the trailer nor a merge commit whose pull request title
-# quotes it can be picked.
+# Search only non-merge commits, so a merge commit whose pull request title
+# quotes the trailer cannot be picked. No pathspec: an import commit that only
+# moves git-subtree-split leaves the prefix unchanged and must still be found.
+# A later non-merge commit that quotes the trailer can only make this check
+# fail closed, never pass.
 metadata_commit="$(
   git log \
     --no-merges \
     --grep="^git-subtree-dir: ${PREFIX}/*$" \
     --format=%H \
     -n 1 \
-    HEAD \
-    -- "${PREFIX}"
+    HEAD
 )"
 metadata_split=""
 metadata_tree=""
