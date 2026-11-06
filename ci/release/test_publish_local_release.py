@@ -84,7 +84,7 @@ class PublishLocalReleaseTest(unittest.TestCase):
         ):
             bare = self.github / f"{repository}.git"
             bare.parent.mkdir(parents=True, exist_ok=True)
-            git(self.root, "init", "-q", "--bare", str(bare))
+            git(self.root, "init", "-q", "--bare", "--initial-branch=main", str(bare))
             git(checkout, "push", "-q", str(bare), "HEAD:refs/heads/main")
 
     def tearDown(self) -> None:
@@ -361,7 +361,7 @@ raise SystemExit(2)
     def _build_trusted_checkout(self) -> Path:
         root = self.root / "trusted"
         root.mkdir()
-        git(root, "init", "-q")
+        git(root, "init", "-q", "-b", "main")
         (root / "README.md").write_text("release source\n", encoding="utf8")
         git(root, "add", "README.md")
         git(root, "commit", "-q", "-m", "release source")
@@ -516,7 +516,7 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         keys_dir = root / "operator-keys"
         keys_dir.mkdir(parents=True)
         (keys_dir / "keys.json").write_text('{"schema_version": 2}\n', encoding="utf8")
-        git(root, "init", "-q")
+        git(root, "init", "-q", "-b", "main")
         git(root, "add", "-A")
         git(root, "commit", "-q", "-m", "builder attestations")
         return root
@@ -1088,7 +1088,7 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
 
         bare = self.github / "Example-Org" / "release-target.git"
         bare.parent.mkdir(parents=True)
-        git(self.root, "init", "-q", "--bare", str(bare))
+        git(self.root, "init", "-q", "--bare", "--initial-branch=main", str(bare))
         git(self.trusted, "push", "-q", str(bare), "HEAD:refs/heads/main")
         result = self.run_publisher(
             "--repo",
@@ -1737,9 +1737,13 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         bare = self.github / "Qbit-Org/qbit.git"
         git(self.trusted, "push", "-q", str(bare), f"refs/tags/{TAG}")
         shallow = self.root / "qbit-shallow"
-        git(self.root, "clone", "-q", "--depth", "1", f"file://{bare}", str(shallow))
+        git(
+            self.root, "clone", "-q", "--depth", "1", "--branch", "main",
+            f"file://{bare}", str(shallow),
+        )
         git(shallow, "fetch", "-q", "origin", self.trusted_ref, f"refs/tags/{TAG}:refs/tags/{TAG}")
         git(shallow, "checkout", "-q", "--detach", self.trusted_ref)
+        self.assertEqual(git(shallow, "rev-parse", "--is-shallow-repository"), "true")
         self.trusted = shallow
         result = self.run_publisher(branch_tips={"Qbit-Org/qbit/main": later})
 
@@ -1759,11 +1763,12 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         self._set_github_branch("Qbit-Org/qbit-guix.sigs", self.guix_sigs, "main", later)
         shallow = self.root / "qbit-guix.sigs-shallow"
         git(
-            self.root, "clone", "-q", "--depth", "1",
+            self.root, "clone", "-q", "--depth", "1", "--branch", "main",
             f"file://{self.github}/Qbit-Org/qbit-guix.sigs.git", str(shallow),
         )
         git(shallow, "fetch", "-q", "origin", self.guix_sigs_ref)
         git(shallow, "checkout", "-q", "--detach", self.guix_sigs_ref)
+        self.assertEqual(git(shallow, "rev-parse", "--is-shallow-repository"), "true")
         self.guix_sigs = shallow
         result = self.run_publisher(branch_tips={"Qbit-Org/qbit-guix.sigs/main": later})
 

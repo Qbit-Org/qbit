@@ -313,7 +313,7 @@ class ValidateReleaseArtifactsTest(unittest.TestCase):
         repo.mkdir()
         env = os.environ.copy()
         env["GNUPGHOME"] = str(self.secret_home)
-        subprocess.run([GIT, "init"], cwd=repo, check=True, capture_output=True, text=True)
+        subprocess.run([GIT, "init", "-b", "main"], cwd=repo, check=True, capture_output=True, text=True)
         subprocess.run(
             [GIT, "config", "user.name", "qbit test"],
             cwd=repo,

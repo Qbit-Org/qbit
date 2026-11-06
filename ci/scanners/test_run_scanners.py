@@ -91,7 +91,7 @@ class RunScannersTest(unittest.TestCase):
     def test_git_peel_commit_resolves_annotated_tag_object(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
-            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
             subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
             subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
             subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=repo, check=True)
