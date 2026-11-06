@@ -307,9 +307,9 @@ def history_scope(source: Path, args: argparse.Namespace) -> list[str]:
     return [f"{base_commit}..{source_commit}"]
 
 
-def history_log_opts(source: Path, args: argparse.Namespace, remerge_diff: bool = True) -> str:
+def history_log_opts(scope: list[str], remerge_diff: bool = True) -> str:
+    """Return gitleaks' --log-opts for the history_scope() result scope."""
     diff_options = f"{GITLEAKS_DIFF_FILTER} {HISTORY_DIFF_MERGES}" if remerge_diff else GITLEAKS_DIFF_FILTER
-    scope = history_scope(source, args)
     if scope == ["--all"]:
         return f"{GITLEAKS_FULL_HISTORY} {diff_options}"
     return f"{diff_options} {' '.join(scope)}"
@@ -363,8 +363,7 @@ def octopus_merge_gap(source: Path, scope: list[str]) -> str:
     )
 
 
-def gitleaks_history_gaps(source: Path, args: argparse.Namespace) -> list[str]:
-    scope = history_scope(source, args)
+def gitleaks_history_gaps(source: Path, scope: list[str]) -> list[str]:
     return [gap for gap in (shallow_history_gap(source, scope), octopus_merge_gap(source, scope)) if gap]
 
 
@@ -1083,7 +1082,12 @@ def can_reuse_syft_sbom(raw_dir: Path, args: argparse.Namespace, syft_sbom: Path
 
 
 def external_commands(
-    tool: str, source: Path, raw_dir: Path, args: argparse.Namespace, remerge_diff: bool = True
+    tool: str,
+    source: Path,
+    raw_dir: Path,
+    args: argparse.Namespace,
+    remerge_diff: bool = True,
+    scope: list[str] | None = None,
 ) -> tuple[list[list[str]], Path | None]:
     if tool == "codeql":
         db = raw_dir / "db-cpp"
@@ -1120,7 +1124,7 @@ def external_commands(
         )
     if tool == "gitleaks":
         report = raw_dir / "gitleaks.redacted.json"
-        log_opts = history_log_opts(source, args, remerge_diff)
+        log_opts = history_log_opts(scope if scope is not None else history_scope(source, args), remerge_diff)
         command = [
             "gitleaks",
             "detect",
@@ -1747,10 +1751,19 @@ def run_scanner(tool: str, args: argparse.Namespace, output_root: Path) -> dict[
         return summary
 
     # On Git older than 2.36, gitleaks still scans every commit's own changes,
-    # without --remerge-diff, and the summary records the merge-only gap.
-    git_gap = remerge_diff_git_gap(args.source) if tool == "gitleaks" else ""
-    history_gaps = gitleaks_history_gaps(args.source, args) if tool == "gitleaks" else []
-    commands, report = external_commands(tool, args.source, raw_dir, args, remerge_diff=not git_gap)
+    # without --remerge-diff, and the summary records the merge-only gap. The
+    # history scope is computed once, so the gap checks and gitleaks' --log-opts
+    # cover the same commits.
+    git_gap = ""
+    history_gaps: list[str] = []
+    scope = None
+    if tool == "gitleaks":
+        scope = history_scope(args.source, args)
+        git_gap = remerge_diff_git_gap(args.source)
+        history_gaps = gitleaks_history_gaps(args.source, scope)
+    commands, report = external_commands(
+        tool, args.source, raw_dir, args, remerge_diff=not git_gap, scope=scope
+    )
     exit_codes = []
     cargo_audit_fetch_failed = False
     for index, command in enumerate(commands):
@@ -1939,30 +1952,37 @@ def secret_scan_incomplete(summary: dict[str, Any]) -> bool:
 
 
 def should_fail(fail_policy: str, summaries: list[dict[str, Any]]) -> bool:
+    """Return whether the run fails under fail_policy.
+
+    never: never fails.
+    infra-only: a scanner failed or its tool is missing.
+    infra-and-secrets: infra-only, or gitleaks reports an untriaged finding.
+    high-critical: infra-only, or any scanner, gitleaks included, reports an
+        untriaged high or critical finding; every gitleaks finding counts as high.
+
+    The two policies that fail on secrets also fail when the gitleaks history
+    scan is incomplete (secret_scan_incomplete()), because a scan that missed
+    part of the history cannot show that it holds no secret. Informational
+    coverage gaps, such as a skipped zizmor or a skipped build-backed scanner,
+    fail no policy.
+    """
     if fail_policy == "never":
         return False
     infra_failed = any(str(summary.get("status", "")) in {"failed", "missing_tool"} for summary in summaries)
     if fail_policy == "infra-only":
         return infra_failed
+    gitleaks_summaries = [summary for summary in summaries if summary.get("tool") == "gitleaks"]
+    secret_scan_gap = any(secret_scan_incomplete(summary) for summary in gitleaks_summaries)
     if fail_policy == "high-critical":
         high_critical_failed = any(
             safe_int(summary.get("high_or_critical_untriaged_count", 0)) > 0 for summary in summaries
         )
-        return infra_failed or high_critical_failed
+        return infra_failed or high_critical_failed or secret_scan_gap
     if fail_policy == "infra-and-secrets":
-        # This policy requires the whole secret history scan, so a gitleaks
-        # run that left part of the history unscanned fails like a finding.
-        # Informational coverage gaps, such as a skipped zizmor or a skipped
-        # build-backed scanner, do not fail it.
-        secret_failed = any(
-            summary.get("tool") == "gitleaks"
-            and (
-                secret_scan_incomplete(summary)
-                or safe_int(summary.get("high_or_critical_untriaged_count", 0)) > 0
-            )
-            for summary in summaries
+        secret_found = any(
+            safe_int(summary.get("high_or_critical_untriaged_count", 0)) > 0 for summary in gitleaks_summaries
         )
-        return infra_failed or secret_failed
+        return infra_failed or secret_found or secret_scan_gap
     return False
 
 

@@ -70,6 +70,33 @@ class RunScannersTest(unittest.TestCase):
             run_scanners.should_fail("infra-only", [incomplete["skipped"], incomplete["old-Git fallback"]])
         )
 
+    def test_every_policy_that_fails_on_secrets_fails_on_an_incomplete_secret_scan(self) -> None:
+        def gitleaks(status: str, findings: int = 0, complete: bool = True) -> dict[str, object]:
+            return {
+                "tool": "gitleaks", "status": status, "high_or_critical_untriaged_count": findings,
+                "coverage_gaps": [] if complete else ["gap"], "details": {"history_scan_complete": complete},
+            }
+
+        zizmor_skipped = {"tool": "zizmor", "status": "skipped", "coverage_gaps": ["zizmor is too old"]}
+        cases = {
+            "complete, no findings": gitleaks("completed"),
+            "complete, a finding": gitleaks("completed", findings=1),
+            "old-Git, shallow or octopus gap": gitleaks("completed", complete=False),
+            "skipped": gitleaks("skipped", complete=False),
+            "failed": gitleaks("failed"),
+        }
+        # Only infra-and-secrets and high-critical fail on secrets.
+        expected = {
+            "never": (False, False, False, False, False),
+            "infra-only": (False, False, False, False, True),
+            "infra-and-secrets": (False, True, True, True, True),
+            "high-critical": (False, True, True, True, True),
+        }
+        for policy, outcomes in expected.items():
+            for (name, summary), fails in zip(cases.items(), outcomes):
+                with self.subTest(policy=policy, gitleaks=name):
+                    self.assertIs(run_scanners.should_fail(policy, [summary, zizmor_skipped]), fails)
+
     def test_zizmor_version_gate_rejects_old_python38_compatible_release(self) -> None:
         self.assertFalse(run_scanners.zizmor_version_supported("zizmor 1.2.0"))
 
@@ -637,8 +664,11 @@ class HistoryLogOptsTest(unittest.TestCase):
     def args(self, base_ref: str) -> object:
         return type("Args", (), {"history_diff_base_ref": base_ref, "source_commit": self.clean_merge})()
 
+    def scope(self, base_ref: str) -> list[str]:
+        return run_scanners.history_scope(self.repo, self.args(base_ref))
+
     def full_history_opts(self) -> str:
-        return run_scanners.history_log_opts(self.repo, self.args(""))
+        return run_scanners.history_log_opts(self.scope(""))
 
     def test_full_history_log_opts(self) -> None:
         self.assertEqual(
@@ -647,17 +677,17 @@ class HistoryLogOptsTest(unittest.TestCase):
 
     def test_ranged_log_opts(self) -> None:
         self.assertEqual(
-            run_scanners.history_log_opts(self.repo, self.args(self.base)),
+            run_scanners.history_log_opts(self.scope(self.base)),
             f"--diff-filter=tuxdb --remerge-diff {self.base}..{self.clean_merge}",
         )
 
     def test_log_opts_without_remerge_diff_keep_the_rest(self) -> None:
         self.assertEqual(
-            run_scanners.history_log_opts(self.repo, self.args(""), remerge_diff=False),
+            run_scanners.history_log_opts(self.scope(""), remerge_diff=False),
             "--full-history --all --diff-filter=tuxdb",
         )
         self.assertEqual(
-            run_scanners.history_log_opts(self.repo, self.args(self.base), remerge_diff=False),
+            run_scanners.history_log_opts(self.scope(self.base), remerge_diff=False),
             f"--diff-filter=tuxdb {self.base}..{self.clean_merge}",
         )
 
@@ -675,7 +705,7 @@ class HistoryLogOptsTest(unittest.TestCase):
         self.assertEqual(added.get(self.pr_merge, ""), "")
 
     def test_ranged_scan_covers_every_parent(self) -> None:
-        log_opts = run_scanners.history_log_opts(self.repo, self.args(self.base))
+        log_opts = run_scanners.history_log_opts(self.scope(self.base))
         self.assertEqual(self.commits_reporting(self.PR_TOKEN, log_opts), [self.pr_commit])
         self.assertEqual(self.commits_reporting(self.EVIL_TOKEN, log_opts), [self.evil_merge])
 
@@ -803,6 +833,21 @@ class HistoryLogOptsTest(unittest.TestCase):
         self.assertIs(summary["details"]["history_scan_complete"], False)
         self.assertTrue(any(octopus[:12] in gap and "octopus merge" in gap for gap in summary["coverage_gaps"]))
         self.assertTrue(run_scanners.should_fail("infra-and-secrets", [summary]))
+
+    def test_the_history_scope_is_computed_once_for_gaps_and_log_opts(self) -> None:
+        real = run_scanners.history_scope
+        scopes = []
+
+        def recording(source: Path, args: object) -> list[str]:
+            scopes.append(real(source, args))
+            return scopes[-1]
+
+        with patch.object(run_scanners, "history_scope", side_effect=recording), \
+                patch.object(run_scanners, "gitleaks_history_gaps", wraps=run_scanners.gitleaks_history_gaps) as gaps:
+            _summary, argv = self.run_fake_gitleaks("git version 2.50.1\n")
+        self.assertEqual(scopes, [["--all"]])
+        self.assertEqual(gaps.call_args.args[1], scopes[0])
+        self.assertTrue(argv[argv.index("--log-opts") + 1].startswith("--full-history --all "))
 
     def test_current_git_scans_merges_and_passes_the_policy(self) -> None:
         summary, argv = self.run_fake_gitleaks("git version 2.50.1\n")

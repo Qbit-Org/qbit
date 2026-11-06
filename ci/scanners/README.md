@@ -57,6 +57,26 @@ in `triage.jsonl` on that first full scan, or scan with a base ref. gitleaks
 that name. On this repository the full-history scan takes about 45 seconds,
 against about 28 without `--remerge-diff`.
 
+## Fail Policies
+
+`--fail-policy` decides when the run exits non-zero:
+
+- `never`: never.
+- `infra-only`: a scanner failed or its tool is missing.
+- `infra-and-secrets` (the nightly default): `infra-only`, or gitleaks reports
+  an untriaged finding.
+- `high-critical`: `infra-only`, or any scanner reports an untriaged high or
+  critical finding. Every gitleaks finding counts as high.
+
+The two policies that fail on secrets, `infra-and-secrets` and
+`high-critical`, also fail when the gitleaks history scan is incomplete:
+gitleaks was skipped, failed or missing, ran without `--remerge-diff` on a Git
+older than 2.36, met a shallow boundary inside the scanned history, or the
+history has octopus merges, which `--remerge-diff` cannot show. A scan that
+missed part of the history cannot show that it holds no secret. Informational
+coverage gaps, such as a skipped zizmor or a skipped build-backed scanner, fail
+no policy.
+
 ## Artifact Policy
 
 The runner captures command stdout/stderr and full scanner reports under each scanner's `raw/` directory. Treat `raw/` as private because scanner output can contain sensitive paths, redacted secret context, or unpublished vulnerability details.
