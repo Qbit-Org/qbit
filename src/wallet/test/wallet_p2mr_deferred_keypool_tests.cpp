@@ -10,12 +10,35 @@
 
 #include <thread>
 
+// These cases take a few seconds in a release build and, in the CI MSan job,
+// 10-45 times as long, up to about a minute, which is close to the release
+// time limits. Sanitizer builds get twice those limits.
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer) || __has_feature(address_sanitizer) || __has_feature(hwaddress_sanitizer) || \
+    __has_feature(thread_sanitizer)
+#define WALLET_P2MR_DEFERRED_KEYPOOL_TESTS_SANITIZER
+#endif
+#endif
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_HWADDRESS__) || defined(__SANITIZE_THREAD__)
+#define WALLET_P2MR_DEFERRED_KEYPOOL_TESTS_SANITIZER
+#endif
+
 namespace wallet {
 using namespace wallet_p2mr_test;
 
 RPCHelpMan walletpassphrase();
 
 namespace {
+//! Per-case time limit: `seconds` in a release build, twice that under a sanitizer.
+constexpr unsigned TimeLimit(unsigned seconds)
+{
+#ifdef WALLET_P2MR_DEFERRED_KEYPOOL_TESTS_SANITIZER
+    return 2 * seconds;
+#else
+    return seconds;
+#endif
+}
+
 void CallWalletPassphrase(WalletContext& context, const std::string& wallet_name, const std::string& passphrase, int64_t timeout)
 {
     JSONRPCRequest request;
@@ -113,7 +136,7 @@ BOOST_AUTO_TEST_CASE(DescriptorTopUpPublishesCacheOnlyAfterCallerTransactionComm
     TestUnloadWallet(std::move(wallet));
 }
 
-BOOST_FIXTURE_TEST_CASE(DeferredTopUpNotifiesAfterCommitWithoutWalletLockInversion, RegtestP2MROnlyWalletTestingSetup, * boost::unit_test::timeout(60))
+BOOST_FIXTURE_TEST_CASE(DeferredTopUpNotifiesAfterCommitWithoutWalletLockInversion, RegtestP2MROnlyWalletTestingSetup, * boost::unit_test::timeout(TimeLimit(60)))
 {
     constexpr int64_t keypool_size{DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL + 1};
     m_args.ForceSetArg("-keypool", util::ToString(keypool_size));
@@ -161,7 +184,7 @@ BOOST_FIXTURE_TEST_CASE(DeferredTopUpNotifiesAfterCommitWithoutWalletLockInversi
     TestUnloadWallet(std::move(wallet));
 }
 
-BOOST_FIXTURE_TEST_CASE(WalletInterfaceUnlockSerializesDeferredTopUpCachePublicationWithReaders, RegtestP2MROnlyWalletTestingSetup, * boost::unit_test::timeout(60))
+BOOST_FIXTURE_TEST_CASE(WalletInterfaceUnlockSerializesDeferredTopUpCachePublicationWithReaders, RegtestP2MROnlyWalletTestingSetup, * boost::unit_test::timeout(TimeLimit(60)))
 {
     constexpr int64_t keypool_size{DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL + 1};
     const SecureString passphrase{"test-passphrase"};
@@ -909,7 +932,7 @@ BOOST_FIXTURE_TEST_CASE(WalletInterfaceUnlockSchedulesDeferredP2MRKeypoolTopUp, 
     WaitForDeleteWallet(std::move(wallet));
 }
 
-BOOST_FIXTURE_TEST_CASE(WalletPassphraseSchedulesDeferredP2MRKeypoolTopUp, RegtestP2MROnlyWalletTestingSetup, * boost::unit_test::timeout(120))
+BOOST_FIXTURE_TEST_CASE(WalletPassphraseSchedulesDeferredP2MRKeypoolTopUp, RegtestP2MROnlyWalletTestingSetup, * boost::unit_test::timeout(TimeLimit(120)))
 {
     constexpr int64_t keypool_size{64};
     const std::string wallet_name{"walletpassphrase_deferred_test"};
@@ -970,7 +993,7 @@ BOOST_FIXTURE_TEST_CASE(WalletPassphraseSchedulesDeferredP2MRKeypoolTopUp, Regte
     WaitForDeleteWallet(std::move(wallet));
 }
 
-BOOST_FIXTURE_TEST_CASE(WalletLockWaitsForBackgroundKeyPoolTopUpStep, RegtestP2MROnlyWalletTestingSetup, * boost::unit_test::timeout(120))
+BOOST_FIXTURE_TEST_CASE(WalletLockWaitsForBackgroundKeyPoolTopUpStep, RegtestP2MROnlyWalletTestingSetup, * boost::unit_test::timeout(TimeLimit(120)))
 {
     constexpr int64_t keypool_size{64};
     const std::string wallet_name{"walletlock_background_step_test"};
@@ -1038,9 +1061,13 @@ BOOST_FIXTURE_TEST_CASE(WalletLockWaitsForBackgroundKeyPoolTopUpStep, RegtestP2M
     WaitForDeleteWallet(std::move(wallet));
 }
 
-BOOST_FIXTURE_TEST_CASE(WalletPassphraseSchedulesP2MRKeypoolRefill, RegtestP2MROnlyWalletTestingSetup, * boost::unit_test::timeout(120))
+BOOST_FIXTURE_TEST_CASE(WalletPassphraseSchedulesP2MRKeypoolRefill, RegtestP2MROnlyWalletTestingSetup, * boost::unit_test::timeout(TimeLimit(120)))
 {
-    constexpr int64_t keypool_size{64};
+    // Large enough that the receive refill takes two background steps, and no
+    // larger: under MSan each address drawn while locked takes about a second
+    // and each key derived about half that, and with -keypool=64 this case ran
+    // past its time limit.
+    constexpr int64_t keypool_size{2 * DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL + 4};
     const std::string wallet_name{"walletpassphrase_refill_test"};
     const std::string passphrase{"test-passphrase"};
     m_args.ForceSetArg("-keypool", util::ToString(keypool_size));
@@ -1085,6 +1112,8 @@ BOOST_FIXTURE_TEST_CASE(WalletPassphraseSchedulesP2MRKeypoolRefill, RegtestP2MRO
     }
     BOOST_REQUIRE(external_spk_man->NeedsP2MRReceiveKeyPoolRefill());
     BOOST_REQUIRE(!internal_spk_man->NeedsP2MRReceiveKeyPoolRefill());
+    // The first receive refill step stops short of -keypool.
+    BOOST_REQUIRE_LT(external_spk_man->GetP2MRReceiveKeyPoolRefillStepTarget(), keypool_size);
 
     auto& scheduler{*Assert(m_node.scheduler)};
     SchedulerBlocker blocker{scheduler};
@@ -1117,7 +1146,7 @@ BOOST_FIXTURE_TEST_CASE(WalletPassphraseSchedulesP2MRKeypoolRefill, RegtestP2MRO
     WaitForDeleteWallet(std::move(wallet));
 }
 
-BOOST_FIXTURE_TEST_CASE(WalletPassphraseTopsUpNonP2MRKeypoolInline, RegtestUnrestrictedWalletTestingSetup, * boost::unit_test::timeout(120))
+BOOST_FIXTURE_TEST_CASE(WalletPassphraseTopsUpNonP2MRKeypoolInline, RegtestUnrestrictedWalletTestingSetup, * boost::unit_test::timeout(TimeLimit(120)))
 {
     constexpr int64_t keypool_size{20};
     const std::string wallet_name{"walletpassphrase_non_p2mr_test"};
@@ -1196,7 +1225,7 @@ BOOST_FIXTURE_TEST_CASE(WalletPassphraseTopsUpNonP2MRKeypoolInline, RegtestUnres
     WaitForDeleteWallet(std::move(wallet));
 }
 
-BOOST_FIXTURE_TEST_CASE(BackgroundKeyPoolTopUpCommitFailurePausesWithoutAborting, RegtestP2MROnlyWalletTestingSetup, * boost::unit_test::timeout(120))
+BOOST_FIXTURE_TEST_CASE(BackgroundKeyPoolTopUpCommitFailurePausesWithoutAborting, RegtestP2MROnlyWalletTestingSetup, * boost::unit_test::timeout(TimeLimit(120)))
 {
     constexpr int64_t keypool_size{64};
     // Service the queue on this thread: an exception that escapes a step
