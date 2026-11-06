@@ -135,13 +135,9 @@ jobs:
     name: 'determine runners'
     needs: classify-changes
     if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted')))) }}
-    # Select the self-hosted runner pool by repository: the public Qbit-Org/qbit
-    # repo requires the dedicated trusted pool (qbit-trusted-ci), while every
-    # other context (the private bridge repo and forks) uses the standard
-    # self-hosted pool. The same workflow then runs full validation in both with
-    # no per-repo edits. Fork-PR safety is enforced separately by the trust-gate
-    # `if:` conditions, independent of the runner pool.
-    runs-on: &qbit_runs_on ${{ github.repository == 'Qbit-Org/qbit' && fromJSON('["self-hosted", "linux", "x64", "qbit-trusted-ci"]') || fromJSON('["self-hosted", "linux", "x64"]') }}
+    # This job only selects cache/profile outputs. Keep it off the compute pool
+    # so a saturated self-hosted queue cannot delay the validation fan-out.
+    runs-on: ubuntu-24.04
     outputs:
       provider: ${{ steps.runners.outputs.provider }}
       ci-profile: ${{ steps.runners.outputs.ci-profile }}
@@ -160,7 +156,13 @@ jobs:
 
   test-each-commit:
     name: 'test each commit'
-    runs-on: *qbit_runs_on
+    # Select the self-hosted runner pool by repository: the public Qbit-Org/qbit
+    # repo requires the dedicated trusted pool (qbit-trusted-ci), while every
+    # other context (the private bridge repo and forks) uses the standard
+    # self-hosted pool. The same workflow then runs full validation in both with
+    # no per-repo edits. Fork-PR safety is enforced separately by the trust-gate
+    # `if:` conditions, independent of the runner pool.
+    runs-on: &qbit_runs_on ${{ github.repository == 'Qbit-Org/qbit' && fromJSON('["self-hosted", "linux", "x64", "qbit-trusted-ci"]') || fromJSON('["self-hosted", "linux", "x64"]') }}
     if: ${{ github.event_name == 'pull_request' && vars.QBIT_ENABLE_TEST_EACH_COMMIT == 'true' && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted')) }} # Disabled by default: runner OS (Ubuntu 20.04) lacks required packages (mold, qt6)
     timeout-minutes: 360  # Use maximum time, see https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idtimeout-minutes. Assuming a worst case time of 1 hour per commit, this leads to a --max-count=6 below.
     env:
