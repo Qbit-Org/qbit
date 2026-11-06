@@ -35,6 +35,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -444,10 +445,11 @@ void PSBTOperationsDialogTests::unlockExceptionReleasesSigning()
 
     // Throw on the first request and unlock the wallet on the next.
     bool throw_on_unlock{true};
+    const std::string_view test_name{__func__}; // __func__ inside the lambda would name its operator().
     QObject::connect(fixture.wallet_model.get(), &WalletModel::requireUnlock, fixture.wallet_model.get(), [&] {
         if (throw_on_unlock) {
             throw_on_unlock = false;
-            throw NonFatalCheckError{"synthetic unlock failure", __FILE__, __LINE__, __func__};
+            throw NonFatalCheckError{"synthetic unlock failure", __FILE__, __LINE__, test_name};
         }
         UnlockSyntheticWallet(state);
     });
