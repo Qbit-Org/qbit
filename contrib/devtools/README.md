@@ -183,7 +183,7 @@ first import is a maintainer task outside the helper.
 Before changing the tree it checks for a clean tree, Git 2.45 or later, the
 tag's signature and name, a downgrade, and any downstream delta the release
 would drop. It then runs `test/lint/libbitcoinpqc-subtree-check.sh` and undoes
-the import commit if the check fails.
+the import commit if the check fails or the helper is interrupted first.
 
 The default source is
 `https://github.com/Qbit-Org/qbit-libbitcoinpqc.git` tag `v0.3.0`. For the

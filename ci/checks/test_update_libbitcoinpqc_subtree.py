@@ -9,8 +9,10 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -18,7 +20,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HELPER = Path("contrib/devtools/update-libbitcoinpqc-subtree.sh")
 LINT = Path("test/lint/libbitcoinpqc-subtree-check.sh")
+LIBRARY = Path("test/lint/libbitcoinpqc-release-tag.sh")
 PREFIX = "src/libbitcoinpqc"
+REAL_UPSTREAM = "https://github.com/Qbit-Org/qbit-libbitcoinpqc.git"
+PRIVATE_REFS = ("refs/libbitcoinpqc-import", "refs/libbitcoinpqc-subtree-check")
 
 
 def git_version() -> tuple[int, int]:
@@ -127,6 +132,7 @@ class UpdateLibbitcoinpqcSubtreeTest(unittest.TestCase):
             cls._git(work, "commit", "-q", "-m", f"release {tag}")
             cls._sign_tag(work, tag, cls.signer, cls.signer_home)
         cls._git(work, "tag", "-a", "-m", "unsigned", "v9.9.9-unsigned", "HEAD")
+        cls._git(work, "tag", "v9.9.7-lightweight", "HEAD")
         side_releases = [
             ("v0.3.3", {"newdir/inner.c": "int inner;\n"}),
             ("v0.3.4", {"fixture.gen": "generated\n"}),
@@ -174,7 +180,7 @@ class UpdateLibbitcoinpqcSubtreeTest(unittest.TestCase):
         self._git(repo, "config", "commit.gpgsign", "true" if sign else "false")
         if sign:
             self._git(repo, "config", "user.signingkey", self.maintainer)
-        for path in (HELPER, LINT):
+        for path in (HELPER, LINT, LIBRARY):
             (repo / path).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(REPO_ROOT / path, repo / path)
         (repo / "README").write_text("qbit\n", encoding="utf8")
@@ -200,6 +206,22 @@ class UpdateLibbitcoinpqcSubtreeTest(unittest.TestCase):
             self._git(repo, "status", "--porcelain", "--ignored"),
         )
 
+    def signer_args(self) -> list[str]:
+        return ["--test-signer-cert", str(self.signer_cert), "--test-signer-fingerprint", self.signer]
+
+    def helper_env(
+        self, gnupghome: Path | None = None, extra_env: dict[str, str] | None = None
+    ) -> dict[str, str]:
+        env = self._env(gnupghome=gnupghome, LIBBITCOINPQC_REMOTE_URL=str(self.upstream), TMPDIR=str(self.tmp))
+        env.update(extra_env or {})
+        return env
+
+    def assert_nothing_left_behind(self, repo: Path) -> None:
+        self.assertEqual(list(self.tmp.iterdir()), [], "the throwaway keyring was left behind")
+        self.assertEqual(self._git(repo, "for-each-ref", *PRIVATE_REFS), "", "a private tag ref was left behind")
+        # A --depth fetch would mark the repository shallow.
+        self.assertEqual(self._git(repo, "rev-parse", "--is-shallow-repository"), "false")
+
     def run_helper(
         self,
         repo: Path,
@@ -208,29 +230,38 @@ class UpdateLibbitcoinpqcSubtreeTest(unittest.TestCase):
         path_prefix: Path | None = None,
         test_signer: bool = True,
         extra_env: dict[str, str] | None = None,
+        cwd: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        env = self._env(
-            gnupghome=gnupghome,
-            LIBBITCOINPQC_REMOTE_URL=str(self.upstream),
-            TMPDIR=str(self.tmp),
-            **(extra_env or {}),
-        )
+        env = self.helper_env(gnupghome, extra_env)
         if path_prefix is not None:
             env["PATH"] = f"{path_prefix}{os.pathsep}{env['PATH']}"
-        signer_args = (
-            ["--test-signer-cert", str(self.signer_cert), "--test-signer-fingerprint", self.signer]
-            if test_signer
-            else []
-        )
+        signer_args = self.signer_args() if test_signer else []
         result = subprocess.run(
-            [str(repo / HELPER), *signer_args, *args], cwd=repo, env=env, capture_output=True, text=True
+            [str(repo / HELPER), *signer_args, *args], cwd=cwd or repo, env=env, capture_output=True, text=True
         )
-        self.assertEqual(list(self.tmp.iterdir()), [], "the throwaway keyring was left behind")
+        self.assert_nothing_left_behind(repo)
         return result
 
-    def run_lint(self, repo: Path, tag: str) -> subprocess.CompletedProcess[str]:
-        env = self._env(LIBBITCOINPQC_REMOTE_URL=str(self.upstream), LIBBITCOINPQC_REMOTE_REF=tag)
-        return subprocess.run([str(repo / LINT)], cwd=repo, env=env, capture_output=True, text=True)
+    def run_lint(
+        self,
+        repo: Path,
+        tag: str,
+        test_signer: bool = True,
+        url: str | None = None,
+        extra_env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        env = self._env(
+            LIBBITCOINPQC_REMOTE_URL=url or str(self.upstream),
+            LIBBITCOINPQC_REMOTE_REF=tag,
+            TMPDIR=str(self.tmp),
+        )
+        env.update(extra_env or {})
+        signer_args = self.signer_args() if test_signer else []
+        result = subprocess.run(
+            [str(repo / LINT), *signer_args], cwd=repo, env=env, capture_output=True, text=True
+        )
+        self.assert_nothing_left_behind(repo)
+        return result
 
     def assert_refused(self, repo: Path, message: str, *args: str, **kwargs: object) -> str:
         before = self.state(repo)
@@ -467,10 +498,11 @@ class UpdateLibbitcoinpqcSubtreeTest(unittest.TestCase):
         )
         self._git(repo, "add", "-A")
         self.commit(repo, "a lint that dirties the subtree and fails")
+        before = self._git(repo, "rev-parse", "HEAD")
         result = self.run_helper(repo, "v0.3.2")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(
-            "the import commit failed the lint and could not be undone; run git reset --hard HEAD~1",
+            f"the subtree check failed; the import commit could not be undone; run git reset --hard {before}",
             result.stderr,
         )
 
@@ -571,6 +603,164 @@ class UpdateLibbitcoinpqcSubtreeTest(unittest.TestCase):
         result = self.run_lint(repo, "v0.3.2")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("GOOD", result.stdout)
+
+    def assert_interrupt_undoes_the_import(self, signum: int) -> None:
+        repo = self.make_downstream()
+        started = self.case_dir / "lint-started"
+        (repo / LINT).write_text(
+            '#!/usr/bin/env bash\ntouch "${LINT_STARTED:?}"\nsleep 60\necho GOOD\n', encoding="utf8"
+        )
+        self._git(repo, "add", "-A")
+        self.commit(repo, "a slow subtree check")
+        before = self.state(repo)
+        process = subprocess.Popen(
+            [str(repo / HELPER), *self.signer_args(), "v0.3.2"],
+            cwd=repo, env=self.helper_env(extra_env={"LINT_STARTED": str(started)}),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
+        )
+        try:
+            deadline = time.monotonic() + 60
+            while not started.exists():
+                self.assertIsNone(process.poll(), "the helper exited before the subtree check started")
+                self.assertLess(time.monotonic(), deadline, "the subtree check never started")
+                time.sleep(0.05)
+            # The import commit exists now. Signal the whole job, as Ctrl-C does.
+            self.assertNotEqual(self._git(repo, "rev-parse", "HEAD"), before[0])
+            os.killpg(process.pid, signum)
+            _stdout, stderr = process.communicate(timeout=60)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate()
+        self.assertEqual(process.returncode, 128 + signum, stderr)
+        self.assertIn("the import stopped before the subtree check passed; the import commit was undone", stderr)
+        self.assertEqual(self.state(repo), before)
+        self.assert_nothing_left_behind(repo)
+
+    @unittest.skipUnless(HAVE_GIT_2_45, "Git 2.45 or later is required")
+    def test_sigterm_during_the_subtree_check_undoes_the_import(self) -> None:
+        self.assert_interrupt_undoes_the_import(signal.SIGTERM)
+
+    @unittest.skipUnless(HAVE_GIT_2_45, "Git 2.45 or later is required")
+    def test_sigint_during_the_subtree_check_undoes_the_import(self) -> None:
+        self.assert_interrupt_undoes_the_import(signal.SIGINT)
+
+    @unittest.skipUnless(HAVE_GIT_2_45, "Git 2.45 or later is required")
+    def test_lint_requires_a_release_tag_from_the_signer(self) -> None:
+        repo = self.make_downstream()
+        cases = [
+            ("v9.9.9-unsigned", "v9.9.9-unsigned has no good signature from"),
+            ("v9.9.7-lightweight", "v9.9.7-lightweight is not a signed annotated tag"),
+            ("v9.9.9-wrong", "v9.9.9-wrong has no good signature from"),
+            ("v9.9.8", "the fetched tag object is not v9.9.8 pointing at a commit"),
+        ]
+        for tag, message in cases:
+            with self.subTest(tag=tag):
+                result = self.run_lint(repo, tag)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(message, result.stderr)
+                self.assertIn(f"FAIL: {self.upstream} {tag} is not a release tag signed by", result.stderr)
+                self.assertNotIn("resolves to commit", result.stdout)
+        result = self.run_lint(repo, "v0.3.0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"has a good signature from {self.signer}", result.stdout)
+        self.assertIn("GOOD", result.stdout)
+
+    def test_lint_checks_the_pinned_signer_without_test_options(self) -> None:
+        repo = self.make_downstream()
+        result = self.run_lint(repo, "v0.3.0", test_signer=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            f"FAIL: signer certificate not found: {repo}/contrib/keys/operator-keys/public-keys/", result.stderr
+        )
+
+    def test_test_signer_options_are_refused_for_the_real_upstream(self) -> None:
+        repo = self.make_downstream()
+        rewritten = str(self.case_dir / "looks-local")
+        forms = {
+            "https": ({"LIBBITCOINPQC_REMOTE_URL": REAL_UPSTREAM}, REAL_UPSTREAM),
+            "scp": ({"LIBBITCOINPQC_REMOTE_URL": "git@github.com:Qbit-Org/qbit-libbitcoinpqc.git"}, None),
+            "insteadOf": (
+                {
+                    "LIBBITCOINPQC_REMOTE_URL": rewritten,
+                    "GIT_CONFIG_COUNT": "1",
+                    "GIT_CONFIG_KEY_0": f"url.{REAL_UPSTREAM}.insteadOf",
+                    "GIT_CONFIG_VALUE_0": rewritten,
+                },
+                rewritten,
+            ),
+        }
+        for form, (extra_env, url) in forms.items():
+            with self.subTest(form=form):
+                self.assert_refused(
+                    repo, "are accepted only for a local repository", "v0.3.2", extra_env=extra_env
+                )
+                lint = self.run_lint(
+                    repo, "v0.3.0", url=extra_env["LIBBITCOINPQC_REMOTE_URL"], extra_env=extra_env
+                )
+                self.assertEqual(lint.returncode, 1, lint.stdout)
+                self.assertIn("test signer options are accepted only for a local repository", lint.stderr)
+                if url is not None:
+                    self.assertIn(f"not {url}", lint.stderr)
+
+    @unittest.skipUnless(HAVE_GIT_2_45, "Git 2.45 or later is required")
+    def test_a_stale_fetch_head_is_not_read(self) -> None:
+        # The fixture's own fetch left FETCH_HEAD at the v0.3.0 tag object. A
+        # fetch that does not write it, as with --no-write-fetch-head, or one
+        # that another fetch overwrites, leaves it stale.
+        repo = self.make_downstream()
+        stale = (repo / ".git" / "FETCH_HEAD").read_text(encoding="utf8")
+        real_git = shutil.which("git")
+        shim_dir = self.write_shim(
+            "git",
+            f'[ "$1" = fetch ] && {{ shift; exec {real_git} fetch --no-write-fetch-head "$@"; }}\n'
+            f'exec {real_git} "$@"',
+        )
+        self.assert_imported(repo, "v0.3.2", self.run_helper(repo, "v0.3.2", path_prefix=shim_dir))
+        lint = self.run_lint(repo, "v0.3.2", extra_env={"PATH": f"{shim_dir}{os.pathsep}{os.environ['PATH']}"})
+        self.assertEqual(lint.returncode, 0, lint.stderr)
+        self.assertEqual((repo / ".git" / "FETCH_HEAD").read_text(encoding="utf8"), stale)
+
+    @unittest.skipUnless(HAVE_GIT_2_45, "Git 2.45 or later is required")
+    def test_a_skewed_committer_date_does_not_pick_an_older_import(self) -> None:
+        # The v0.3.2 import is dated in the future. Walked by date from the
+        # merge, it would come before the v0.3.5 import that descends from it.
+        repo = self.make_downstream()
+        future = {"GIT_COMMITTER_DATE": "2035-01-01T00:00:00Z"}
+        self.assert_imported(repo, "v0.3.2", self.run_helper(repo, "v0.3.2", extra_env=future))
+        self._git(repo, "checkout", "-q", "-b", "import")
+        self.assert_imported(repo, "v0.3.5", self.run_helper(repo, "v0.3.5"))
+        self._git(repo, "checkout", "-q", "main")
+        later = self._env(gnupghome=self.maintainer_home, GIT_COMMITTER_DATE="2030-01-01T00:00:00Z")
+        for args in (
+            ["commit", "-q", "--allow-empty", "-m", "main moved on"],
+            ["merge", "-q", "--no-ff", "-m", "Merge pull request #2", "import"],
+        ):
+            subprocess.run(["git", "-C", str(repo), *args], env=later, check=True, capture_output=True)
+        lint = self.run_lint(repo, "v0.3.5")
+        self.assertEqual(lint.returncode, 0, lint.stderr)
+        self.assertIn("GOOD", lint.stdout)
+        result = self.run_helper(repo, "v0.3.5")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("already imports v0.3.5", result.stdout)
+
+    @unittest.skipUnless(HAVE_GIT_2_45, "Git 2.45 or later is required")
+    def test_an_inherited_libbitcoinpqc_path_is_ignored(self) -> None:
+        repo = self.make_downstream()
+        elsewhere = {"LIBBITCOINPQC_PATH": "does/not/exist"}
+        lint = self.run_lint(repo, "v0.3.0", extra_env=elsewhere)
+        self.assertEqual(lint.returncode, 0, lint.stderr)
+        self.assertIn(f"{PREFIX} in HEAD currently refers to tree", lint.stdout)
+        self.assert_imported(repo, "v0.3.2", self.run_helper(repo, "v0.3.2", extra_env=elsewhere))
+
+    @unittest.skipUnless(HAVE_GIT_2_45, "Git 2.45 or later is required")
+    def test_relative_remote_is_resolved_from_the_starting_directory(self) -> None:
+        repo = self.make_downstream()
+        start = repo / PREFIX
+        relative = os.path.relpath(self.upstream, start)
+        result = self.run_helper(repo, "v0.3.2", cwd=start, extra_env={"LIBBITCOINPQC_REMOTE_URL": relative})
+        self.assert_imported(repo, "v0.3.2", result)
+        self.assertIn(f"Fetching v0.3.2 from {start}/{relative}", result.stdout)
 
 
 if __name__ == "__main__":

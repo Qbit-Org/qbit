@@ -72,16 +72,21 @@ one that fails:
   It skips merge commits, whose pull request titles could quote the trailer,
   and takes no pathspec, so an import commit that only moved the split is
   found. A later non-merge commit that quotes the trailer can only make the
-  check fail.
+  check fail. The search runs in topological order, so a skewed committer date
+  cannot make an older import win over one that descends from it.
 - The release tag must be an annotated tag with a good signature (`VALIDSIG`)
   from operator-01's signing key, `289EA3EC2F1939A24984840ED26CFC05586D371E`
   (listed in `contrib/keys/operator-keys/KEYS.md`), which signed `v0.3.0` and
   `v0.3.2`. The helper checks it against a throwaway keyring that holds only
   that certificate and is removed on every exit. A different signer needs a
-  maintainer decision before the import.
+  maintainer decision before the import. The subtree check runs the same
+  check, from `test/lint/libbitcoinpqc-release-tag.sh`, so CI verifies the
+  signer of the pinned tag too.
 - The signed tag object's own header must say `tag <tag>` and `type commit`, so
-  an older signed tag published under a new name is refused. The helper reads
-  the tag object ID once, right after the fetch, and uses it throughout.
+  an older signed tag published under a new name is refused. The helper fetches
+  the tag object into the private ref `refs/libbitcoinpqc-import/tag`, never
+  `FETCH_HEAD`, reads its ID once, uses it throughout, and deletes the ref on
+  exit.
 - The release must descend from the current split, unless `--allow-downgrade`
   is given, so a mistyped older tag is not imported.
 - No downstream delta may be dropped. The helper merges the qbit subtree into
@@ -94,11 +99,13 @@ maintainer whose commits are signed gets a signed import commit. When the
 release's tree equals the vendored tree, as when a release upstreams qbit's
 approved downstream delta, the import commit only moves `git-subtree-split`
 and changes no file. The helper then runs
-`test/lint/libbitcoinpqc-subtree-check.sh`, which resolves the exact
-`refs/tags/<tag>`, and checks that the commit the lint verified is the tag's
-commit. If either check fails, the helper undoes the import commit and exits
-non-zero, so no unverified import commit is left behind; if the undo itself
-fails, it says to run `git reset --hard HEAD~1`. Importing the tag that is
+`test/lint/libbitcoinpqc-subtree-check.sh`, which fetches the exact
+`refs/tags/<tag>` and checks its signer and header the same way, and checks
+that the commit the lint verified is the tag's commit. The import is done only
+when both checks pass. Until then any exit, including an interrupt (Ctrl-C,
+`SIGTERM` or `SIGHUP`), undoes the import commit, so no unverified import
+commit is left behind; if the undo itself fails, the helper says to run
+`git reset --hard <commit before the import>`. Importing the tag that is
 already imported changes nothing, but still runs the subtree check, so drift in
 the vendored tree is reported.
 
@@ -106,9 +113,12 @@ the vendored tree is reported.
 | --- | --- |
 | `--allow-downgrade` | Import a release that does not descend from the current split. |
 | `--accept-upstream <path>` | Take the release's version of a listed path, relative to `src/libbitcoinpqc`. Name each listed path once; a path that differs and is not named still stops the import. |
-| `LIBBITCOINPQC_REMOTE_URL` | Upstream repository. Default: `https://github.com/Qbit-Org/qbit-libbitcoinpqc.git`. |
+| `LIBBITCOINPQC_REMOTE_URL` | Upstream repository. Default: `https://github.com/Qbit-Org/qbit-libbitcoinpqc.git`. A relative path is read from the directory the helper starts in. |
 | `LIBBITCOINPQC_REMOTE_REF` | Tag to import when none is given. |
-| `--test-signer-cert <path>`, `--test-signer-fingerprint <fpr>` | Test-only flags, used together by `ci/checks/test_update_libbitcoinpqc_subtree.py`, that replace the pinned signer and print `TEST SIGNER IN USE`. Never use them for a release import. No environment variable can change the signer. |
+| `--test-signer-cert <path>`, `--test-signer-fingerprint <fpr>` | Test-only flags, used together by `ci/checks/test_update_libbitcoinpqc_subtree.py`, that replace the pinned signer and print `TEST SIGNER IN USE`. The helper and the subtree check accept them only when the remote is a local repository (a path or a `file://` URL, after any `url.<base>.insteadOf` rewriting), so the real upstream is always checked against the pinned signer. No environment variable can change the signer. |
+
+The prefix is fixed: neither the helper nor the subtree check reads
+`LIBBITCOINPQC_PATH`.
 
 ### Reviewing A Downstream Delta
 
@@ -155,9 +165,12 @@ commit referenced by the subtree metadata:
 test/lint/libbitcoinpqc-subtree-check.sh
 ```
 
-The check fetches the pinned tag if needed, should report `GOOD`, and should
-show the subtree split commit as `ac72d1ffa0ef486f08d37334a43f5db1adb731db`
-for the current pin.
+The check fetches the pinned tag object, requires a good signature from
+operator-01's pinned signing key and the tag's own header, should report
+`GOOD`, and should show the subtree split commit as
+`ac72d1ffa0ef486f08d37334a43f5db1adb731db` for the current pin. It fetches
+the whole upstream history, which is small, because a `--depth` fetch would
+mark the qbit checkout shallow.
 
 The current qbit tree carries one approved downstream security delta on top of
 the pinned upstream tag: `RUSTSEC-2026-0204-crossbeam-epoch-0.9.20`, which

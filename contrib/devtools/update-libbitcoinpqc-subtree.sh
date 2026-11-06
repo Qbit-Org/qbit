@@ -7,18 +7,21 @@
 export LC_ALL=C
 set -euo pipefail
 
-readonly PREFIX="src/libbitcoinpqc"
-readonly DEFAULT_REMOTE_URL="https://github.com/Qbit-Org/qbit-libbitcoinpqc.git"
-readonly DEFAULT_REMOTE_REF="v0.3.0"
-readonly DEFAULT_SIGNER_CERT="contrib/keys/operator-keys/public-keys/operator-01-release.asc"
-readonly DEFAULT_SIGNER_FINGERPRINT="289EA3EC2F1939A24984840ED26CFC05586D371E"
+# The release-tag check, shared with test/lint/libbitcoinpqc-subtree-check.sh.
+# shellcheck source=../../test/lint/libbitcoinpqc-release-tag.sh
+source "$(dirname "${BASH_SOURCE[0]}")/../../test/lint/libbitcoinpqc-release-tag.sh"
 
-REMOTE_URL="${LIBBITCOINPQC_REMOTE_URL:-$DEFAULT_REMOTE_URL}"
+readonly PREFIX="${LIBBITCOINPQC_PREFIX}"
+readonly DEFAULT_REMOTE_REF="v0.3.0"
+# The fetched tag object is held here while the helper runs.
+readonly TAG_REF="refs/libbitcoinpqc-import/tag"
+
+REMOTE_URL="${LIBBITCOINPQC_REMOTE_URL:-$LIBBITCOINPQC_UPSTREAM_URL}"
 REMOTE_REF="${LIBBITCOINPQC_REMOTE_REF:-$DEFAULT_REMOTE_REF}"
-# The signer is pinned. Only explicit test flags can replace it; no environment
-# variable can.
-SIGNER_CERT="${DEFAULT_SIGNER_CERT}"
-SIGNER_FINGERPRINT="${DEFAULT_SIGNER_FINGERPRINT}"
+# The signer is pinned. Only explicit test flags can replace it, and only for a
+# local repository; no environment variable can.
+SIGNER_CERT="${LIBBITCOINPQC_SIGNER_CERT}"
+SIGNER_FINGERPRINT="${LIBBITCOINPQC_SIGNER_FINGERPRINT}"
 
 usage() {
   cat <<EOF
@@ -42,15 +45,16 @@ Argument:
   <tag>  Release tag to import. Default: LIBBITCOINPQC_REMOTE_REF, else $DEFAULT_REMOTE_REF.
 
 Environment overrides:
-  LIBBITCOINPQC_REMOTE_URL   default: $DEFAULT_REMOTE_URL
+  LIBBITCOINPQC_REMOTE_URL   default: $LIBBITCOINPQC_UPSTREAM_URL
   LIBBITCOINPQC_REMOTE_REF   default: $DEFAULT_REMOTE_REF
 
 Test-only options (for the helper's tests, never for a real import):
   --test-signer-cert <path>          Replace the pinned signer certificate,
-                                     $DEFAULT_SIGNER_CERT.
+                                     $LIBBITCOINPQC_SIGNER_CERT.
   --test-signer-fingerprint <fpr>    Replace the pinned signing fingerprint,
-                                     $DEFAULT_SIGNER_FINGERPRINT.
-  Both must be given together, and the helper warns loudly when they are used.
+                                     $LIBBITCOINPQC_SIGNER_FINGERPRINT.
+  Both must be given together, they are refused unless the remote is a local
+  repository, and the helper warns loudly when they are used.
 EOF
 }
 
@@ -119,13 +123,14 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 tag="${tag:-$REMOTE_REF}"
+test_signer=0
 if [[ -n "${test_signer_cert}${test_signer_fingerprint}" ]]; then
   [[ -n "${test_signer_cert}" && -n "${test_signer_fingerprint}" ]] \
     || die "--test-signer-cert and --test-signer-fingerprint must be given together"
   [[ "${test_signer_cert}" == /* ]] || test_signer_cert="${PWD}/${test_signer_cert}"
   SIGNER_CERT="${test_signer_cert}"
   SIGNER_FINGERPRINT="${test_signer_fingerprint}"
-  echo "warning: TEST SIGNER IN USE: not for real imports (${SIGNER_FINGERPRINT})" >&2
+  test_signer=1
 fi
 
 git check-ref-format "refs/tags/${tag}" || die "not a valid tag name: ${tag}"
@@ -145,6 +150,19 @@ if (( git_major < 2 || (git_major == 2 && git_minor < 45) )); then
 fi
 
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "must run inside a git worktree"
+# A relative path names a repository relative to where the helper started, so
+# make it absolute before changing to the top-level directory. A URL, an
+# scp-like host:path or the name of a configured remote is left as it is.
+if [[ "${REMOTE_URL}" != /* && "${REMOTE_URL}" != *://* ]] \
+  && [[ "${REMOTE_URL}" != *:* || "${REMOTE_URL%%:*}" == */* ]] \
+  && ! git remote get-url "${REMOTE_URL}" >/dev/null 2>&1; then
+  REMOTE_URL="${PWD}/${REMOTE_URL}"
+fi
+if [[ "${test_signer}" -eq 1 ]]; then
+  libbitcoinpqc_is_local_remote "${REMOTE_URL}" \
+    || die "--test-signer-cert and --test-signer-fingerprint are accepted only for a local repository, not ${REMOTE_URL}"
+  echo "warning: TEST SIGNER IN USE: not for real imports (${SIGNER_FINGERPRINT})" >&2
+fi
 cd "$(git rev-parse --show-toplevel)"
 [[ -f "${SIGNER_CERT}" ]] || die "signer certificate not found: ${SIGNER_CERT}"
 
@@ -156,12 +174,46 @@ git diff --cached --quiet -- || die "the index has staged changes; commit or uns
 [[ -z "$(git ls-files --others -- "${PREFIX}")" ]] \
   || die "ignored files under ${PREFIX}; list them with git clean -ndX ${PREFIX} and remove them first"
 
+# One EXIT trap removes the private tag ref and the scratch files, and undoes
+# an import whose checks have not all passed: it resets an import commit away,
+# or restores a prefix changed before the commit; the prefix was clean,
+# including ignored files, before the import started. INT, TERM and HUP exit
+# through it too, so an interrupt still leaves a verified state.
+work_dir=""
+pre_import_head=""
+import_started=0
+import_verified=0
+undo_reason="the import stopped before the subtree check passed"
+cleanup() {
+  trap '' INT TERM HUP
+  if [[ "${import_started}" -eq 1 && "${import_verified}" -ne 1 ]]; then
+    if [[ "$(git rev-parse -q --verify HEAD)" == "${pre_import_head}" ]]; then
+      git reset -q -- "${PREFIX}" || true
+      git checkout -q -- "${PREFIX}" || true
+      git clean -q -fdx -- "${PREFIX}" || true
+    elif [[ "$(git rev-parse -q --verify HEAD~1)" == "${pre_import_head}" ]] \
+      && git reset -q --keep "${pre_import_head}"; then
+      echo "error: ${undo_reason}; the import commit was undone" >&2
+    else
+      echo "error: ${undo_reason}; the import commit could not be undone; run git reset --hard ${pre_import_head}" >&2
+    fi
+  fi
+  git update-ref -d "${TAG_REF}" >/dev/null 2>&1 || true
+  if [[ -n "${work_dir}" ]]; then
+    rm -rf "${work_dir}"
+  fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+work_dir="$(mktemp -d)"
+
 # The current split is read the way test/lint/libbitcoinpqc-subtree-check.sh
-# finds it: the newest non-merge commit with the trailer, with no pathspec, so
-# an import commit that only moved the split is found too.
-import_commit="$(
-  git log --no-merges --grep="^git-subtree-dir: ${PREFIX}/*$" --format=%H -n 1 HEAD
-)"
+# finds it: the newest non-merge commit with the trailer, in topological order
+# and with no pathspec, so an import commit that only moved the split is found
+# too.
+import_commit="$(libbitcoinpqc_latest_import)"
 [[ -n "${import_commit}" ]] || die "no git-subtree-dir commit for ${PREFIX}; this helper refreshes an existing import"
 old_split="$(
   git show -s --format=%B "${import_commit}" \
@@ -171,59 +223,23 @@ old_split="$(
   || die "import commit ${import_commit} has no valid git-subtree-split"
 
 echo "Fetching ${tag} from ${REMOTE_URL}"
-git fetch --quiet --no-tags "${REMOTE_URL}" "refs/tags/${tag}"
-tag_object="$(git rev-parse --verify FETCH_HEAD)"
+tag_object="$(libbitcoinpqc_fetch_tag "${REMOTE_URL}" "${tag}" "${TAG_REF}")" \
+  || die "could not fetch refs/tags/${tag} from ${REMOTE_URL}"
+libbitcoinpqc_verify_tag "${tag_object}" "${tag}" "${SIGNER_CERT}" "${SIGNER_FINGERPRINT}" \
+  || die "${tag} is not a release tag signed by ${SIGNER_FINGERPRINT}; not importing"
 
-# Check the tag against a throwaway keyring that holds only the signer's
-# certificate; the trap removes it on every exit and cannot fail itself. Like
-# status_fingerprints in ci/release/validate_release_artifacts.py, this pins
-# the first VALIDSIG field, the signing (sub)key's fingerprint.
-(
-  GNUPGHOME="$(mktemp -d)"
-  export GNUPGHOME
-  trap 'gpgconf --kill all >/dev/null 2>&1 || true; gpgconf --remove-socketdir >/dev/null 2>&1 || true; rm -rf "${GNUPGHOME:?}"' EXIT
-  gpg --batch --quiet --import "${SIGNER_CERT}"
-  if ! verify_status="$(git -c gpg.openpgp.program=gpg verify-tag --raw "${tag_object}" 2>&1)" \
-    || ! grep -q "^\[GNUPG:\] VALIDSIG ${SIGNER_FINGERPRINT} " <<<"${verify_status}"; then
-    printf '%s\n' "${verify_status}" >&2
-    die "${tag} has no good signature from ${SIGNER_FINGERPRINT}; not importing"
-  fi
-  # The signed tag object must name this tag and point at a commit, so an
-  # older signed tag published under a new name is refused.
-  tag_header="$(git cat-file tag "${tag_object}" | sed -n '1,/^$/p')"
-  if ! grep -qxF "tag ${tag}" <<<"${tag_header}" \
-    || ! grep -qxF "type commit" <<<"${tag_header}"; then
-    printf '%s\n' "${tag_header}" >&2
-    die "the fetched tag object is not ${tag} pointing at a commit"
-  fi
-)
-
-# One EXIT trap removes the scratch files and, if the import started but did
-# not commit, restores the prefix, which was clean (including ignored files)
-# before the import started.
-work_dir=""
-import_started=0
-import_committed=0
-cleanup() {
-  if [[ "${import_started}" -eq 1 && "${import_committed}" -ne 1 ]]; then
-    git reset -q -- "${PREFIX}" || true
-    git checkout -q -- "${PREFIX}" || true
-    git clean -q -fdx -- "${PREFIX}" || true
-  fi
-  if [[ -n "${work_dir}" ]]; then
-    rm -rf "${work_dir}"
-  fi
-}
-trap cleanup EXIT
-work_dir="$(mktemp -d)"
-
-# Run the subtree check for the tag, and set lint_commit to the commit the
-# check says the tag resolves to.
+# Run the subtree check for the tag, with the same signer, and set lint_commit
+# to the commit the check says the tag resolves to.
+lint_args=()
+if [[ "${test_signer}" -eq 1 ]]; then
+  lint_args+=(--test-signer-cert "${SIGNER_CERT}" --test-signer-fingerprint "${SIGNER_FINGERPRINT}")
+fi
 lint_commit=""
 run_subtree_check() {
   local status=0
   LIBBITCOINPQC_REMOTE_URL="${REMOTE_URL}" LIBBITCOINPQC_REMOTE_REF="${tag}" \
-    test/lint/libbitcoinpqc-subtree-check.sh >"${work_dir}/lint" || status=$?
+    test/lint/libbitcoinpqc-subtree-check.sh ${lint_args[@]+"${lint_args[@]}"} >"${work_dir}/lint" \
+    || status=$?
   cat "${work_dir}/lint"
   lint_commit="$(
     awk '/ resolves to commit / { for (i = 1; i < NF; i++) if ($i == "commit") { print $(i + 1); exit } }' \
@@ -319,6 +335,7 @@ fi
 # are signed gets a signed import commit. When the release tree equals the
 # vendored tree, as when a release upstreams qbit's downstream delta, the import
 # commit only moves git-subtree-split and changes no file.
+pre_import_head="$(git rev-parse --verify HEAD)"
 import_started=1
 commit_args=()
 if [[ "${new_upstream_tree}" == "${qbit_tree}" ]]; then
@@ -332,19 +349,19 @@ git commit -q ${commit_args[@]+"${commit_args[@]}"} \
   -m "Squashed '${PREFIX}/' changes from ${old_split:0:10}..${upstream_commit:0:10}" \
   -m "git-subtree-dir: ${PREFIX}
 git-subtree-split: ${upstream_commit}"
-import_committed=1
 
+# The import is done only when the subtree check passes and verified this tag's
+# commit; until then, any exit, an interrupt included, undoes the commit.
 lint_status=0
 run_subtree_check || lint_status=$?
-if [[ "${lint_status}" -ne 0 || "${lint_commit}" != "${upstream_commit}" ]]; then
-  if [[ "${lint_status}" -ne 0 ]]; then
-    reason="the subtree check failed"
-  else
-    reason="the subtree check verified ${lint_commit:-no commit}, not ${tag} (${upstream_commit})"
-  fi
-  git reset -q --keep HEAD~1 \
-    || die "${reason}; the import commit failed the lint and could not be undone; run git reset --hard HEAD~1"
-  die "${reason}; the import commit was undone"
+if [[ "${lint_status}" -ne 0 ]]; then
+  undo_reason="the subtree check failed"
+  exit 1
 fi
+if [[ "${lint_commit}" != "${upstream_commit}" ]]; then
+  undo_reason="the subtree check verified ${lint_commit:-no commit}, not ${tag} (${upstream_commit})"
+  exit 1
+fi
+import_verified=1
 
 echo "Imported ${tag} (${upstream_commit}) into ${PREFIX}."

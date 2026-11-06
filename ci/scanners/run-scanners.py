@@ -1097,9 +1097,12 @@ def latest_git_subtree_metadata(source: Path, relpath: str) -> dict[str, Any]:
     # Like test/lint/libbitcoinpqc-subtree-check.sh, search only non-merge
     # commits, so a merge commit whose pull request title quotes the trailer
     # cannot be picked. No pathspec: an import commit that only moves the split
-    # leaves the subtree unchanged and must still be found.
+    # leaves the subtree unchanged and must still be found. --topo-order lists a
+    # commit before its ancestors, so a skewed committer date cannot make an
+    # older import come first.
     git_args = [
         "log",
+        "--topo-order",
         "--no-merges",
         f"--grep={grep}",
         "--pretty=format:%H%x1f%B%x1e",
