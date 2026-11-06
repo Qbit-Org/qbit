@@ -276,7 +276,10 @@ GITLEAKS_FULL_HISTORY = "--full-history --all"
 
 
 def remerge_diff_git_gap(source: Path) -> str:
-    """Return a coverage gap when Git is too old for the history scan, else ""."""
+    """Return a coverage gap when Git is too old for --remerge-diff, else "".
+
+    The history scan then runs without it, so only merge-only content goes
+    unscanned."""
     exit_code, stdout, _stderr = git_command(source, "version")
     found = stdout.strip() or f"git version exited {exit_code}"
     match = re.match(r"git version (\d+)\.(\d+)", found)
@@ -284,21 +287,22 @@ def remerge_diff_git_gap(source: Path) -> str:
         (int(match.group(1)), int(match.group(2))) < HISTORY_DIFF_MERGES_MIN_GIT
     ):
         return (
-            f"gitleaks history scan skipped: it needs Git 2.36 or later for "
-            f"{HISTORY_DIFF_MERGES}; found: {found}"
+            f"gitleaks scanned history without {HISTORY_DIFF_MERGES}, which needs Git 2.36 "
+            f"or later, so content changed only in merge commits was not scanned; found: {found}"
         )
     return ""
 
 
-def history_log_opts(source: Path, args: argparse.Namespace) -> str:
+def history_log_opts(source: Path, args: argparse.Namespace, remerge_diff: bool = True) -> str:
+    diff_options = f"{GITLEAKS_DIFF_FILTER} {HISTORY_DIFF_MERGES}" if remerge_diff else GITLEAKS_DIFF_FILTER
     base_ref = str(getattr(args, "history_diff_base_ref", "") or "").strip()
     if not base_ref:
-        return f"{GITLEAKS_FULL_HISTORY} {GITLEAKS_DIFF_FILTER} {HISTORY_DIFF_MERGES}"
+        return f"{GITLEAKS_FULL_HISTORY} {diff_options}"
     source_commit = str(args.source_commit or git_commit(source)).strip()
     if not source_commit:
         raise SystemExit("History scanner diff scope requires a git source commit.")
     base_commit = git_merge_base(source, source_commit, base_ref)
-    return f"{GITLEAKS_DIFF_FILTER} {HISTORY_DIFF_MERGES} {base_commit}..{source_commit}"
+    return f"{diff_options} {base_commit}..{source_commit}"
 
 
 def decode_command_output(output: bytes | str | None) -> str:
@@ -1015,7 +1019,9 @@ def can_reuse_syft_sbom(raw_dir: Path, args: argparse.Namespace, syft_sbom: Path
     return str(syft_summary.get("source_scope", "")).strip() == source_scope(args.source)
 
 
-def external_commands(tool: str, source: Path, raw_dir: Path, args: argparse.Namespace) -> tuple[list[list[str]], Path | None]:
+def external_commands(
+    tool: str, source: Path, raw_dir: Path, args: argparse.Namespace, remerge_diff: bool = True
+) -> tuple[list[list[str]], Path | None]:
     if tool == "codeql":
         db = raw_dir / "db-cpp"
         sarif = raw_dir / "codeql-cpp.sarif"
@@ -1051,7 +1057,7 @@ def external_commands(tool: str, source: Path, raw_dir: Path, args: argparse.Nam
         )
     if tool == "gitleaks":
         report = raw_dir / "gitleaks.redacted.json"
-        log_opts = history_log_opts(source, args)
+        log_opts = history_log_opts(source, args, remerge_diff)
         command = [
             "gitleaks",
             "detect",
@@ -1677,24 +1683,10 @@ def run_scanner(tool: str, args: argparse.Namespace, output_root: Path) -> dict[
         write_json(summary_path, summary)
         return summary
 
-    if tool == "gitleaks":
-        git_gap = remerge_diff_git_gap(args.source)
-        if git_gap:
-            summary = create_summary(
-                args=args,
-                spec=spec,
-                status="skipped",
-                tool_version_value=external_tool_version,
-                commands=[],
-                raw_paths=[],
-                counts=empty_counts(),
-                triage_path=triage_path,
-                coverage_gaps=[git_gap],
-            )
-            write_json(summary_path, summary)
-            return summary
-
-    commands, report = external_commands(tool, args.source, raw_dir, args)
+    # On Git older than 2.36, gitleaks still scans every commit's own changes,
+    # without --remerge-diff, and the summary records the merge-only gap.
+    git_gap = remerge_diff_git_gap(args.source) if tool == "gitleaks" else ""
+    commands, report = external_commands(tool, args.source, raw_dir, args, remerge_diff=not git_gap)
     exit_codes = []
     cargo_audit_fetch_failed = False
     for index, command in enumerate(commands):
@@ -1744,6 +1736,8 @@ def run_scanner(tool: str, args: argparse.Namespace, output_root: Path) -> dict[
     coverage_gaps = []
     if any(code != 0 for code in exit_codes) and not accepted_finding_exit_codes:
         coverage_gaps.append("Scanner command exited non-zero; inspect private raw output before trusting coverage.")
+    if git_gap:
+        coverage_gaps.append(git_gap)
     status = "completed" if all(code == 0 for code in exit_codes) or accepted_finding_exit_codes else "failed"
     if cargo_audit_fetch_failed:
         coverage_gaps.append(
@@ -1874,12 +1868,14 @@ def should_fail(fail_policy: str, summaries: list[dict[str, Any]]) -> bool:
         )
         return infra_failed or high_critical_failed
     if fail_policy == "infra-and-secrets":
-        # This policy requires the secret scan, so a gitleaks run that did not
-        # complete, such as one skipped for an old Git, fails like a finding.
+        # This policy requires the whole secret scan, so a gitleaks run that
+        # did not complete, or completed with a coverage gap such as the
+        # merge-only content an old Git cannot show, fails like a finding.
         secret_failed = any(
             summary.get("tool") == "gitleaks"
             and (
                 str(summary.get("status", "")) != "completed"
+                or bool(summary.get("coverage_gaps"))
                 or safe_int(summary.get("high_or_critical_untriaged_count", 0)) > 0
             )
             for summary in summaries

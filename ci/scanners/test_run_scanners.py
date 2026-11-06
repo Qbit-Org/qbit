@@ -56,7 +56,9 @@ class RunScannersTest(unittest.TestCase):
                 "infra-and-secrets", [summary("gitleaks", "completed"), zizmor_skipped]
             )
         )
-        self.assertFalse(run_scanners.should_fail("infra-only", [summary("gitleaks", "skipped")]))
+        partial = dict(summary("gitleaks", "completed"), coverage_gaps=["merge-only content was not scanned"])
+        self.assertTrue(run_scanners.should_fail("infra-and-secrets", [partial]))
+        self.assertFalse(run_scanners.should_fail("infra-only", [summary("gitleaks", "skipped"), partial]))
 
     def test_zizmor_version_gate_rejects_old_python38_compatible_release(self) -> None:
         self.assertFalse(run_scanners.zizmor_version_supported("zizmor 1.2.0"))
@@ -639,6 +641,16 @@ class HistoryLogOptsTest(unittest.TestCase):
             f"--diff-filter=tuxdb --remerge-diff {self.base}..{self.clean_merge}",
         )
 
+    def test_log_opts_without_remerge_diff_keep_the_rest(self) -> None:
+        self.assertEqual(
+            run_scanners.history_log_opts(self.repo, self.args(""), remerge_diff=False),
+            "--full-history --all --diff-filter=tuxdb",
+        )
+        self.assertEqual(
+            run_scanners.history_log_opts(self.repo, self.args(self.base), remerge_diff=False),
+            f"--diff-filter=tuxdb {self.base}..{self.clean_merge}",
+        )
+
     def test_pull_request_secret_is_reported_once_on_its_own_commit(self) -> None:
         self.assertEqual(self.commits_reporting(self.PR_TOKEN, self.full_history_opts()), [self.pr_commit])
 
@@ -688,18 +700,26 @@ class HistoryLogOptsTest(unittest.TestCase):
         ):
             with self.subTest(output=output, code=code), self.with_git_version(output, code):
                 gap = run_scanners.remerge_diff_git_gap(self.repo)
-                self.assertIn("needs Git 2.36 or later for --remerge-diff", gap)
+                self.assertIn("without --remerge-diff, which needs Git 2.36 or later", gap)
+                self.assertIn("content changed only in merge commits was not scanned", gap)
                 self.assertIn(output.strip() or "git version exited 127", gap)
 
     def test_git_2_36_is_enough(self) -> None:
         with self.with_git_version("git version 2.36.0\n"):
             self.assertEqual(run_scanners.remerge_diff_git_gap(self.repo), "")
 
-    def test_old_git_skips_gitleaks_with_a_coverage_gap(self) -> None:
+    def test_old_git_scans_without_remerge_diff_and_records_the_gap(self) -> None:
         bin_dir = self.repo / "fake-bin"
         bin_dir.mkdir()
         fake = bin_dir / "gitleaks"
-        fake.write_text("#!/bin/sh\necho 8.30.1\n", encoding="utf8")
+        argv_log = self.repo / "gitleaks-argv"
+        fake.write_text(
+            "#!/bin/sh\n"
+            '[ "$1" = detect ] || { echo 8.30.1; exit 0; }\n'
+            f'printf "%s\\n" "$@" > "{argv_log}"\n'
+            'while [ $# -gt 0 ]; do [ "$1" = --report-path ] && echo "[]" > "$2"; shift; done\n',
+            encoding="utf8",
+        )
         fake.chmod(0o755)
         args = argparse.Namespace(
             mode="nightly", source=self.repo, source_commit=self.clean_merge,
@@ -710,12 +730,14 @@ class HistoryLogOptsTest(unittest.TestCase):
         path = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
         with self.with_git_version("git version 2.35.1\n"), patch.dict(os.environ, {"PATH": path}):
             summary = run_scanners.run_scanner("gitleaks", args, output_root)
-        self.assertEqual(summary["status"], "skipped")
+        argv = argv_log.read_text(encoding="utf8").splitlines()
+        self.assertEqual(argv[argv.index("--log-opts") + 1], "--full-history --all --diff-filter=tuxdb")
+        self.assertEqual(summary["status"], "completed")
         self.assertEqual(len(summary["coverage_gaps"]), 1)
-        self.assertIn("Git 2.36 or later", summary["coverage_gaps"][0])
+        self.assertIn("merge commits was not scanned", summary["coverage_gaps"][0])
         self.assertIn("git version 2.35.1", summary["coverage_gaps"][0])
-        self.assertFalse((output_root / "gitleaks" / "raw").exists())
         self.assertTrue(run_scanners.should_fail("infra-and-secrets", [summary]))
+        self.assertFalse(run_scanners.should_fail("infra-only", [summary]))
 
 
 

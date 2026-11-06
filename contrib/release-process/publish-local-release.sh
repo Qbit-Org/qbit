@@ -438,9 +438,11 @@ api_path_escape() {
 fetch_branch_tip() {
     # Prints the tip of a protected GitHub branch after fetching exactly that
     # commit into a local checkout, so its first-parent history can be read
-    # locally. Fetching the SHA the API reported, not the moving branch, keeps a
-    # merge that lands meanwhile from breaking the release partway. gh's
-    # credential helper lets the fetch reach a private repository.
+    # locally. The branch's active rules must forbid force pushes and deletion,
+    # so the history it anchors cannot be rewritten. Fetching the SHA the API
+    # reported, not the moving branch, keeps a merge that lands meanwhile from
+    # breaking the release partway. gh's credential helper lets the fetch reach
+    # a private repository.
     local root="$1"
     local repository="$2"
     local branch="$3"
@@ -449,6 +451,7 @@ fetch_branch_tip() {
     local branch_info
     local api_tip
     local protected
+    local rule_types
     local fetched_tip
     branch_path="$(api_path_escape "$branch")" \
         || die "Could not encode $label branch name $branch"
@@ -460,6 +463,11 @@ fetch_branch_tip() {
     require_full_sha "$label branch tip" "$api_tip"
     [ "$protected" = true ] \
         || die "$repository:$branch is not a protected branch; protect it with a ruleset before releasing from it"
+    rule_types="$(
+        gh api --paginate "repos/$repository/rules/branches/$branch_path" --jq '.[].type'
+    )" || die "Could not read the rules for $label branch $repository:$branch"
+    { grep -qx non_fast_forward <<<"$rule_types" && grep -qx deletion <<<"$rule_types"; } \
+        || die "$repository:$branch can be force-pushed or deleted; its ruleset needs non_fast_forward and deletion rules before releasing from it"
     git -C "$root" -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
         fetch --quiet --no-tags "https://github.com/$repository.git" "$api_tip" \
         || die "Could not fetch $repository:$branch tip $api_tip into $root"

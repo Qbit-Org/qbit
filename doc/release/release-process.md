@@ -58,7 +58,9 @@ policy anchor for each release.
 It must be on the first-parent history of the protected branch that the
 publisher checks: `main` by default, or the branch passed with
 `--trusted-release-branch` for a release line. GitHub must report that branch as
-protected. The publisher fetches the exact tip commit GitHub's API reports for
+protected, and its active rules must include `non_fast_forward` and `deletion`,
+so the history it anchors cannot be force-pushed away or deleted. The publisher
+fetches the exact tip commit GitHub's API reports for
 it, authenticating through `gh`, and refuses a trusted ref off that line, such
 as a pull request head, which could carry validators and key policy from an
 older base. The publisher prints the trusted release branch it uses and, when
@@ -69,9 +71,11 @@ Prerequisites for publishing with this publisher:
 
 - `Qbit-Org/qbit-guix.sigs` `main` must be protected, by its `signed-commits`
   and merge-commit rulesets from the signed-commit rollout, before the next
-  release. Until then the publisher refuses every release.
+  release, and its rollout ruleset must include the `deletion` and
+  `non_fast_forward` rules. Until then the publisher refuses every release.
 - Every release-line branch passed as `--trusted-release-branch` must be
-  protected, for example by a branch ruleset; an unprotected branch is refused.
+  protected by a branch ruleset with the `deletion` and `non_fast_forward`
+  rules; a branch without both is refused.
 
 The release publisher must be run from a clean public checkout whose `HEAD`
 exactly equals `trusted_release_ref`. The publisher uses that checkout's
@@ -98,11 +102,12 @@ The publisher validates:
 - `trusted_release_ref` is a full public commit SHA and is not the tag object or
   tag target commit, and the tag target is on its first-parent history
 - `trusted_release_ref` is on the first-parent history of the trusted release
-  branch, which GitHub reports as protected, at the exact tip GitHub reports
+  branch, which GitHub reports as protected with `non_fast_forward` and
+  `deletion` rules, at the exact tip GitHub reports
 - the trusted qbit checkout and pinned `qbit-guix.sigs` checkout are clean, and
   the latter commit is public and on the first-parent history of its
-  configured public branch, which GitHub reports as protected, at the exact tip
-  GitHub reports
+  configured public branch, which GitHub reports as protected with
+  `non_fast_forward` and `deletion` rules, at the exact tip GitHub reports
 - staged artifacts match `SHA256SUMS`
 - `SHA256SUMS.asc` meets release-signature quorum
 - `qbit-guix.sigs` builder attestations meet builder quorum and every counted

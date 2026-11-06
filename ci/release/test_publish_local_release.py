@@ -175,6 +175,15 @@ if args and args[0] == "api":
                 ]
             )
         )
+    elif "/rules/branches/" in endpoint:
+        tips = json.loads(os.environ["FAKE_GH_BRANCH_TIPS"])
+        path = urllib.parse.unquote(endpoint.split("#", 1)[0])
+        key = path[len("repos/"):].replace("/rules/branches/", "/", 1)
+        if key not in tips:
+            raise SystemExit(f"fake gh: no branch {key}")
+        rules = json.loads(os.environ.get("FAKE_GH_BRANCH_RULES", "{}"))
+        for rule_type in rules.get(key, ["deletion", "non_fast_forward", "required_signatures"]):
+            print(rule_type)
     elif "/branches/" in endpoint:
         tips = json.loads(os.environ["FAKE_GH_BRANCH_TIPS"])
         # Like gh, drop a URL fragment and decode the path.
@@ -555,6 +564,7 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         asset_list_sequence: tuple[str, ...] = ("ok",),
         branch_tips: dict[str, str] | None = None,
         unprotected_branches: tuple[str, ...] = (),
+        branch_rules: dict[str, list[str]] | None = None,
         cwd: Path | None = None,
         extra_env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
@@ -572,6 +582,7 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
                 "GIT_CONFIG_VALUE_0": "https://github.com/",
                 "FAKE_GH_BRANCH_TIPS": json.dumps(tips),
                 "FAKE_GH_UNPROTECTED_BRANCHES": json.dumps(list(unprotected_branches)),
+                "FAKE_GH_BRANCH_RULES": json.dumps(branch_rules or {}),
                 "FAKE_GH_STATE": str(self.gh_state),
                 "FAKE_GH_LOG": str(self.gh_log),
                 "FAKE_GH_TAG": TAG,
@@ -1685,6 +1696,34 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
             "Qbit-Org/qbit-guix.sigs:main is not a protected branch; protect it with a ruleset before releasing from it",
             result.stderr,
         )
+
+    def test_guix_sigs_branch_without_rules_fails(self) -> None:
+        # Live today: qbit-guix.sigs main is protected but has no rules.
+        result = self.run_publisher(branch_rules={"Qbit-Org/qbit-guix.sigs/main": []})
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "Qbit-Org/qbit-guix.sigs:main can be force-pushed or deleted; its ruleset needs "
+            "non_fast_forward and deletion rules before releasing from it",
+            result.stderr,
+        )
+
+    def test_trusted_branch_needs_both_history_rules(self) -> None:
+        for rules in (["deletion", "required_signatures"], ["non_fast_forward", "pull_request"]):
+            with self.subTest(rules=rules):
+                result = self.run_publisher(branch_rules={"Qbit-Org/qbit/main": rules})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Qbit-Org/qbit:main can be force-pushed or deleted", result.stderr)
+
+    def test_branch_rules_are_read_with_the_encoded_branch_name(self) -> None:
+        self._set_github_branch("Qbit-Org/qbit", self.trusted, "rel#1", self.trusted_ref)
+        result = self.run_publisher(
+            "--trusted-release-branch", "rel#1",
+            branch_tips={"Qbit-Org/qbit/rel#1": self.trusted_ref},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("repos/Qbit-Org/qbit/rules/branches/rel%231", self.gh_log.read_text(encoding="utf8"))
 
     def test_default_trusted_release_branch_is_printed_with_hint(self) -> None:
         hint = "==> Hint: a release-line release must pass --trusted-release-branch <line>"

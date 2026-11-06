@@ -46,8 +46,12 @@ Use qbit names and paths in public-facing changes:
 Public branches accept only commits with a signature that GitHub verifies. Sign
 your commits with a key registered on your GitHub account; any key that GitHub
 verifies counts, while maintainers sign their own landing commits with OpenPGP.
-Each pull request lands as one signed commit plus GitHub's merge commit; a
-standard two-commit subtree update keeps both of its commits. A pull request
+Each pull request lands as one signed commit plus GitHub's merge commit. A
+standard two-commit update of a subtree inherited from Bitcoin Core
+(`src/leveldb`, `src/secp256k1`, `src/crc32c`, `src/minisketch`,
+`src/crypto/ctaes` or `src/ipc/libmultiprocess`) keeps both of its commits; a
+`src/libbitcoinpqc` import is one commit, as
+[the libbitcoinpqc runbook](doc/subtrees/libbitcoinpqc.md) describes. A pull request
 from a branch in this repository lands through `squash-sign`, as described in
 [Signed Commits](doc/development/public-branch-and-rulesets.md#signed-commits).
 A pull request from a fork lands as follows:
