@@ -767,6 +767,23 @@ class ValidateBuilderAttestationsTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("quorum not met", result.stderr)
 
+    def test_staged_darwin_debug_archive_requires_builder_coverage(self) -> None:
+        darwin_debug = f"qbit-{self.version}-x86_64-apple-darwin-debug.tar.gz"
+        self.write_release_sha256sums([self.core_artifact, darwin_debug])
+
+        # Manifests from a build.sh without the macOS debug tarball do not count.
+        stale = self.run_builder_validator()
+
+        self.assertEqual(stale.returncode, 1)
+        self.assertIn(f"manifest does not cover staged artifact {darwin_debug}", stale.stderr)
+
+        self.write_attestations(self.builders[:2], "core", [self.core_artifact, darwin_debug])
+
+        result = self.run_builder_validator()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("core:2/2", result.stdout)
+
     def test_invalid_extra_builder_signature_does_not_block_met_quorum(self) -> None:
         self.write_attestations(self.builders[2:3], "core", [self.core_artifact])
         self.attestation_signature(self.builders[2], "core").unlink()
