@@ -40,10 +40,23 @@ GATE_JOB = "required-merge-gate"
 INJECTED_FAILURE = "injected classifier contract failure"
 SUBPROCESS_TIMEOUT_SECONDS = 120
 
-# Check names the gate's profiles poll for.  The simulated API answers for all
-# of them so the stub does not have to know which profile is under test;
+# Check names the gate's profiles poll for, and the workflows whose runs it
+# reads them from.  The simulated API answers for all of them so the stub does
+# not have to know which profile is under test;
 # ci/checks/test_merge_gate_poller.py owns the polling behaviour itself.
 POLLED_CHECK_NAMES = ("Core Checks Gate", "Full Validation Gate", "rpc-docs", "public-docs-lint")
+GATE_READS_WORKFLOWS = (
+    ".github/workflows/required-merge-gate.yml",
+    ".github/workflows/ci.yml",
+    ".github/workflows/core-checks.yml",
+)
+# The github context of a push the gate runs for.
+GATE_CONTEXT = {
+    "REPOSITORY": "example/repo",
+    "SHA": "0" * 40,
+    "EVENT_NAME": "push",
+    "RUN_ID": "1",
+}
 
 # ``unittest -v`` reports ``<method> (<class>[.<method>]) ... <result>``
 # depending on the Python version.  Stderr written while a test runs pushes
@@ -289,10 +302,13 @@ class ClassifierCiContractTest(unittest.TestCase):
 
     @staticmethod
     def write_fake_gh(directory: Path, *, conclusion: str | None) -> Path:
-        """Simulate only the check-run polling API used by the gate shell.
+        """Simulate only the run and check-run polling API used by the gate shell.
 
-        ``conclusion=None`` makes any call a hard error, proving the gate
-        failed before it polled anything.  Each call is appended to ``calls``.
+        The workflow-run listing holds the gate's own run (``GATE_CONTEXT``)
+        and one run of each workflow it reads; every check suite reports each
+        polled check with ``conclusion``.  ``conclusion=None`` makes any call a
+        hard error, proving the gate failed before it polled anything.  Each
+        call is appended to ``calls``.
         """
         calls = directory / "calls"
         gh = directory / "gh"
@@ -310,7 +326,26 @@ class ClassifierCiContractTest(unittest.TestCase):
                 for name in POLLED_CHECK_NAMES
             ]
             page.write_text(json.dumps({"total_count": len(runs), "check_runs": runs}), encoding="utf8")
-            body = f'cat "{page}"\n'
+            listing = directory / "workflow-runs.json"
+            workflow_runs = [
+                {
+                    "id": int(GATE_CONTEXT["RUN_ID"]) + offset,
+                    "path": path,
+                    "event": GATE_CONTEXT["EVENT_NAME"],
+                    "head_sha": GATE_CONTEXT["SHA"],
+                    "head_branch": "main",
+                    "head_repository": {"id": 1},
+                    "pull_requests": [],
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "check_suite_id": 100 + offset,
+                }
+                for offset, path in enumerate(GATE_READS_WORKFLOWS)
+            ]
+            listing.write_text(
+                json.dumps({"total_count": len(workflow_runs), "workflow_runs": workflow_runs}),
+                encoding="utf8",
+            )
+            body = f'if [[ "$*" == */actions/runs\\?* ]]; then cat "{listing}"; else cat "{page}"; fi\n'
         gh.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{calls}"\n{body}', encoding="utf8")
         gh.chmod(0o755)
         return calls
@@ -428,14 +463,14 @@ class ClassifierCiContractTest(unittest.TestCase):
             metadata = self.modeled_needs("success")
             metadata[CLASSIFY_JOB]["outputs"]["profile"] = "github-metadata"
             metadata["github-metadata-validation"]["result"] = "success"
-            completed = run_bash_step(gate["run"], cwd=sandbox, env=self.gate_env(fake, metadata))
+            completed = run_bash_step(gate["run"], cwd=sandbox, env=self.gate_env(fake, metadata, **GATE_CONTEXT))
             self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
             self.assertFalse(calls.exists(), "github-metadata profile must not poll checks")
 
             rpc_docs = self.modeled_needs("success")
             rpc_docs[CLASSIFY_JOB]["outputs"]["profile"] = "rpc-docs"
             rpc_docs["rpc-docs-validation"]["result"] = "success"
-            env = self.gate_env(fake, rpc_docs, REPOSITORY="example/repo", SHA="0" * 40)
+            env = self.gate_env(fake, rpc_docs, **GATE_CONTEXT)
             completed = run_bash_step(gate["run"], cwd=sandbox, env=env)
             self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
             self.assertTrue(calls.exists(), "rpc-docs profile must poll the simulated check API")
