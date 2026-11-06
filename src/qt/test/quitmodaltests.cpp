@@ -54,6 +54,7 @@
 #include <QTest>
 #include <QTimer>
 #include <QVBoxLayout>
+#include <QtGlobal>
 
 namespace {
 using namespace std::chrono_literals;
@@ -65,7 +66,9 @@ constexpr auto RETRY_SPAN{3 * SHUTDOWN_POLLING_DELAY};
 //! A build without the fix joins a held worker during shutdown. Release it
 //! this long after the quit so such a run fails instead of hanging.
 constexpr auto LATCH_RELEASE_DELAY{30s};
+#if QT_CONFIG(process)
 constexpr int CHILD_TIMEOUT_MS{300'000};
+#endif
 const QString RESCAN_TITLE{QStringLiteral("Rescanning…")};
 
 #define QUIT_CHECK(condition)                                                 \
@@ -220,6 +223,7 @@ void QuitModalTests::quitDuringDialog()
         QSKIP("BitcoinApplication tests need 'QT_QPA_PLATFORM=cocoa' on mac");
     }
 #endif
+#if QT_CONFIG(process)
     QFETCH(QString, scenario);
 
     QProcess child;
@@ -237,6 +241,10 @@ void QuitModalTests::quitDuringDialog()
     }
     QCOMPARE(child.exitStatus(), QProcess::NormalExit);
     QCOMPARE(child.exitCode(), 0);
+#else
+    // The depends Qt for Linux is built with -no-feature-process.
+    QSKIP("needs QProcess; this Qt was built without the process feature");
+#endif
 }
 
 QuitModalScenario::QuitModalScenario(BitcoinApplication& app, QString scenario)
