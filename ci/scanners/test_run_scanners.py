@@ -295,5 +295,96 @@ class RunScannersTest(unittest.TestCase):
         )
 
 
+
+class LatestGitSubtreeMetadataTest(unittest.TestCase):
+    """The scanner reads the subtree split the way the subtree lint does."""
+
+    QUOTED = f"git-subtree-dir: src/libbitcoinpqc\ngit-subtree-split: {'0' * 40}"
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.repo = Path(self.temp_dir.name)
+        self.git("init", "-q", "-b", "main")
+        (self.repo / "README").write_text("qbit\n", encoding="utf8")
+        (self.repo / "src" / "libbitcoinpqc").mkdir(parents=True)
+        (self.repo / "src" / "libbitcoinpqc" / "lib.c").write_text("int x;\n", encoding="utf8")
+        self.git("add", "-A")
+        self.split = "1" * 40
+        self.git(
+            "commit", "-q", "-m", "Squashed 'src/libbitcoinpqc/' content",
+            "-m", f"git-subtree-dir: src/libbitcoinpqc\ngit-subtree-split: {self.split}",
+        )
+        self.import_commit = self.git("rev-parse", "HEAD")
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def git(self, *args: str) -> str:
+        result = subprocess.run(
+            [
+                "git", "-c", "user.name=scanner test", "-c", "user.email=scanner@example.invalid",
+                "-c", "commit.gpgsign=false", "-C", str(self.repo), *args,
+            ],
+            check=True, capture_output=True, text=True,
+        )
+        return result.stdout.strip()
+
+    def metadata(self) -> dict:
+        return run_scanners.latest_git_subtree_metadata(self.repo, "src/libbitcoinpqc")
+
+    def commit_at(self, date: str, *args: str) -> None:
+        env = dict(os.environ, GIT_AUTHOR_DATE=date, GIT_COMMITTER_DATE=date)
+        subprocess.run(
+            [
+                "git", "-c", "user.name=scanner test", "-c", "user.email=scanner@example.invalid",
+                "-c", "commit.gpgsign=false", "-C", str(self.repo), *args,
+            ],
+            check=True, capture_output=True, text=True, env=env,
+        )
+
+    def test_a_skewed_committer_date_does_not_pick_an_older_import(self) -> None:
+        # The older import is dated in the future. Walked by date from the
+        # merge, it would come before its own descendant.
+        older, newer = "2" * 40, "3" * 40
+        self.commit_at(
+            "2035-01-01T00:00:00Z", "commit", "-q", "--allow-empty", "-m", "Squashed older",
+            "-m", f"git-subtree-dir: src/libbitcoinpqc\ngit-subtree-split: {older}",
+        )
+        self.git("checkout", "-q", "-b", "import")
+        self.commit_at(
+            "2026-01-01T00:00:00Z", "commit", "-q", "--allow-empty", "-m", "Squashed newer",
+            "-m", f"git-subtree-dir: src/libbitcoinpqc\ngit-subtree-split: {newer}",
+        )
+        self.git("checkout", "-q", "main")
+        self.commit_at("2026-01-02T00:00:00Z", "commit", "-q", "--allow-empty", "-m", "main moved on")
+        self.commit_at("2026-01-03T00:00:00Z", "merge", "-q", "--no-ff", "-m", "Merge pull request #2", "import")
+        self.assertEqual(self.metadata()["git_subtree_split"], newer)
+
+    def test_ignores_a_merge_commit_that_quotes_the_trailer(self) -> None:
+        self.git("checkout", "-q", "-b", "topic")
+        (self.repo / "notes.txt").write_text("notes\n", encoding="utf8")
+        self.git("add", "notes.txt")
+        self.git("commit", "-q", "-m", "notes")
+        self.git("checkout", "-q", "main")
+        self.git("merge", "-q", "--no-ff", "-m", "Merge pull request #1", "-m", self.QUOTED, "topic")
+        self.assertEqual(self.metadata()["qbit_import_commit"], self.import_commit)
+        self.assertEqual(self.metadata()["git_subtree_split"], self.split)
+
+    def test_finds_an_import_commit_that_only_moves_the_split(self) -> None:
+        moved = "2" * 40
+        self.git(
+            "commit", "-q", "--allow-empty", "-m", "Squashed 'src/libbitcoinpqc/' changes",
+            "-m", f"git-subtree-dir: src/libbitcoinpqc\ngit-subtree-split: {moved}",
+        )
+        self.assertEqual(self.metadata()["git_subtree_split"], moved)
+
+    def test_a_non_merge_commit_that_quotes_the_trailer_is_reported(self) -> None:
+        # Its split matches no release, so the subtree check fails closed.
+        (self.repo / "README").write_text("docs\n", encoding="utf8")
+        self.git("add", "README")
+        self.git("commit", "-q", "-m", "doc: describe the import", "-m", self.QUOTED)
+        self.assertEqual(self.metadata()["git_subtree_split"], "0" * 40)
+
+
 if __name__ == "__main__":
     unittest.main()
