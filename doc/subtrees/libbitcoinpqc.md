@@ -46,10 +46,15 @@ optimization and 288 KiB without it (208 KiB before `v0.3.2`). qbit compiles
 the subtree with its RelWithDebInfo C flags (`-O2`) in every build type.
 CMake places them after `CMAKE_C_FLAGS`, which is where `APPEND_CFLAGS` and
 `APPEND_CPPFLAGS` go, so an appended `-O0` does not take effect: the
-optimized size applies and each call needs about 17 KiB of free stack.
-Verification does not burn. qbit does not shrink
-the stacks of the threads that sign, so they keep the platform default, which
-is 512 KiB or more on qbit's release platforms.
+optimized size applies and each direct call into the library needs about
+17 KiB of free stack. qbit's own wrappers need more: after each
+`CPQCKey::MakeNewKey()`, `CPQCKey::Set()`, `CPQCKey::Sign()` and
+`DerivePQCKey()` call, qbit overwrites `PQC_STACK_BURN_BYTES` (32 KiB) of the
+stack the call released, so each of those calls needs at least 32 KiB of
+free stack plus its own frames. Verification does not burn. qbit does not
+shrink the stacks of the threads that sign, so they keep the platform
+default, which is 512 KiB or more on qbit's release platforms. musl gives
+threads only 128 KiB by default, which leaves less margin.
 
 `v0.3.2` adds `BITCOIN_PQC_ERROR_OUT_OF_MEMORY` (`-6`), which keygen and sign
 return when an allocation fails, and signing with a secret key that fails
