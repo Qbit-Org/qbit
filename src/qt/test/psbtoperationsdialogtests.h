@@ -26,6 +26,9 @@ private Q_SLOTS:
     void initTestCase();
     void cleanupTestCase();
     void canceledUnlockDoesNotStartSigning();
+    void signDuringUnlockPromptIsIgnored();
+    void unlockExceptionReleasesSigning();
+    void dialogDeletedDuringUnlockPrompt();
     void eventLoopResponsiveWhileSigningPaused();
     void successfulCompletionUpdatesDisplayOnce();
     void cancellationBeforeCounterReservation();

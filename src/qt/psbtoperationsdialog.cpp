@@ -242,16 +242,53 @@ void PSBTOperationsDialog::openWithPSBT(PartiallySignedTransaction psbtx)
 
 void PSBTOperationsDialog::signTransaction()
 {
-    if (m_sign_thread || !m_wallet_model || m_shutdown_requested) {
+    // Signing is in flight from before the unlock request until the attempt
+    // finishes or fails. The passphrase dialog runs a nested event loop, and
+    // its modality blocks mouse and keyboard input to this dialog there but
+    // not accessibility actions, which can still press Sign. A second attempt
+    // would replace the unlock context, which relocks the wallet under the
+    // running signing thread, and the thread itself, which then leaks.
+    if (m_sign_active || m_sign_thread || !m_wallet_model || m_shutdown_requested) {
         return;
     }
+    m_sign_active = true;
+    setSigningControlsEnabled(false);
 
-    m_sign_unlock_context = std::make_unique<WalletModel::UnlockContext>(m_wallet_model->requestUnlock());
-    if (!m_sign_unlock_context->isValid()) {
+    QPointer<PSBTOperationsDialog> dialog(this);
+    // Once the signing thread has started, signTransactionFinished() releases
+    // the attempt. Every other outcome is released here, an exception
+    // included, so a caller that continues after it does not find Sign busy
+    // and the wallet unlocked.
+    const auto release_unless_started = [this, &dialog] {
+        if (!dialog || m_sign_thread) return;
+        clearSignProgressDialog();
         m_sign_unlock_context.reset();
+        m_sign_active = false;
+        setSigningControlsEnabled(true);
+    };
+    try {
+        startSignTransaction();
+    } catch (...) {
+        release_unless_started();
+        throw;
+    }
+    release_unless_started();
+}
+
+void PSBTOperationsDialog::startSignTransaction()
+{
+    // The passphrase dialog behind requestUnlock() is a nested event loop,
+    // which can close and delete this dialog. Hold the context locally until
+    // the dialog is known to have survived it: dropping the context then
+    // relocks the wallet instead of writing to a deleted dialog.
+    QPointer<PSBTOperationsDialog> dialog(this);
+    auto unlock_context{std::make_unique<WalletModel::UnlockContext>(m_wallet_model->requestUnlock())};
+    if (!dialog) return;
+    if (!unlock_context->isValid()) {
         showStatus(tr("Cannot sign inputs while wallet is locked."), StatusLevel::WARN);
         return;
     }
+    m_sign_unlock_context = std::move(unlock_context);
 
     std::unique_ptr<interfaces::Wallet> wallet = m_wallet_model->wallet().clone();
     if (!wallet) {
@@ -259,7 +296,6 @@ void PSBTOperationsDialog::signTransaction()
     }
     if (!wallet) {
         showStatus(tr("Failed to sign transaction: Wallet is no longer loaded."), StatusLevel::ERR);
-        m_sign_unlock_context.reset();
         return;
     }
 
@@ -268,7 +304,6 @@ void PSBTOperationsDialog::signTransaction()
     m_sign_cancel_requested = false;
     m_sign_counters_reserved = false;
     m_last_sign_pqc_usage.reset();
-    setSigningControlsEnabled(false);
 
     m_sign_progress_dialog = new SigningProgressDialog(this);
     m_sign_progress_dialog->setObjectName(QStringLiteral("psbtSigningProgressDialog"));
@@ -290,7 +325,6 @@ void PSBTOperationsDialog::signTransaction()
         }
     });
 
-    QPointer<PSBTOperationsDialog> dialog(this);
     std::atomic_bool* cancel_flag = &m_sign_cancel_requested;
     std::atomic_bool* counters_reserved_flag = &m_sign_counters_reserved;
     auto result = std::make_shared<SignResult>();
@@ -400,6 +434,7 @@ void PSBTOperationsDialog::signTransactionFinished(uint64_t generation, std::sha
     if (generation != m_sign_generation) return;
     ++m_sign_generation;
     m_pending_sign_result.reset();
+    m_sign_active = false;
 
     const bool unlock_valid{m_sign_unlock_context && m_sign_unlock_context->isValid()};
     m_sign_cancel_requested = false;

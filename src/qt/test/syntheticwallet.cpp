@@ -562,14 +562,17 @@ public:
             return std::nullopt;
         }
 
+        std::function<void()> sign_started;
         {
             std::lock_guard lock{m_state->mutex};
             m_state->psbt_sign_entered = true;
             m_state->psbt_sign_thread = std::this_thread::get_id();
             ++m_state->psbt_sign_calls;
             m_state->psbt_signed_result = {};
+            sign_started = m_state->psbt_sign_started;
         }
         m_state->condition.notify_all();
+        if (sign_started) sign_started();
 
         const auto finish = [this](bool cancel_observed) {
             {
