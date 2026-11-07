@@ -9,6 +9,15 @@
 #include "sha256x8.h"
 #include "sha256avx.h"
 
+static void secure_zero_local(void *ptr, size_t len)
+{
+    volatile unsigned char *p = (volatile unsigned char *)ptr;
+    while (len > 0) {
+        *p++ = 0;
+        len--;
+    }
+}
+
 /*
  * 8-way parallel version of prf_addr; takes 8x as much input and output
  */
@@ -71,4 +80,9 @@ void prf_addrx8(unsigned char *out0,
     memcpy(out5, outbufx8 + 5*SPX_SHA256_OUTPUT_BYTES, SPX_N);
     memcpy(out6, outbufx8 + 6*SPX_SHA256_OUTPUT_BYTES, SPX_N);
     memcpy(out7, outbufx8 + 7*SPX_SHA256_OUTPUT_BYTES, SPX_N);
+
+    /* bufx8 holds eight exact SK_SEED copies and outbufx8 the secret PRF
+       outputs; neither may survive on the stack after the call. */
+    secure_zero_local(bufx8, sizeof(bufx8));
+    secure_zero_local(outbufx8, sizeof(outbufx8));
 }

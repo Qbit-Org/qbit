@@ -9,13 +9,13 @@ release tags from that repository, not the moving `main` branch.
 ## Current Pin
 
 - Source repository: `https://github.com/Qbit-Org/qbit-libbitcoinpqc.git`
-- Source tag: `v0.3.0`
-- Peeled tag commit: `ac72d1ffa0ef486f08d37334a43f5db1adb731db`
+- Source tag: `v0.3.2`
+- Peeled tag commit: `1965d0da1eb4d9e196613b8f3a5d0d866a221c53`
 - qbit subtree path: `src/libbitcoinpqc`
 
-`v0.3.0` is an annotated tag. Git subtree metadata records the peeled commit,
+`v0.3.2` is an annotated tag. Git subtree metadata records the peeled commit,
 so the expected `git-subtree-split` value is
-`ac72d1ffa0ef486f08d37334a43f5db1adb731db`.
+`1965d0da1eb4d9e196613b8f3a5d0d866a221c53`.
 
 ## Downstream Build Policy
 
@@ -36,6 +36,27 @@ signing statistics are active, not a verifier protocol limit. Verification
 continues to accept the full two-byte WOTS+C counter range. See the subtree's
 [`bounded30` signature-limit documentation](../../src/libbitcoinpqc/docs/bounded30-signature-limit.md)
 for the complete distinction.
+
+Since `v0.3.1`, `slh_dsa_keygen()`, `slh_dsa_sign()`,
+`slh_dsa_sign_with_stats()`, `slh_dsa_secret_key_validate()` and
+`slh_dsa_derandomize()` overwrite the stack they released before returning,
+so SK_SEED, SK_PRF and SHA-2 scratch do not outlive the call. The burn is
+`BITCOIN_PQC_BURN_STACK_BYTES`: 16 KiB when the library is compiled with
+optimization and 288 KiB without it (208 KiB before `v0.3.2`). qbit compiles
+the subtree with its RelWithDebInfo C flags (`-O2`) in every build type.
+CMake places them after `CMAKE_C_FLAGS`, which is where `APPEND_CFLAGS` and
+`APPEND_CPPFLAGS` go, so an appended `-O0` does not take effect: the
+optimized size applies and each call needs about 17 KiB of free stack.
+Verification does not burn. qbit does not shrink
+the stacks of the threads that sign, so they keep the platform default, which
+is 512 KiB or more on qbit's release platforms.
+
+`v0.3.2` adds `BITCOIN_PQC_ERROR_OUT_OF_MEMORY` (`-6`), which keygen and sign
+return when an allocation fails, and signing with a secret key that fails
+`bitcoin_pqc_secret_key_validate()` now returns `BITCOIN_PQC_ERROR_BAD_KEY`
+(`slh_dsa_sign()` returns `SLH_DSA_SIGN_ERROR_BAD_KEY`). qbit's callers treat
+any nonzero result as a failure, so neither change alters how qbit signs.
+Keys, signatures and verification results are unchanged from `v0.3.1`.
 
 ## Refresh The Subtree
 
@@ -76,11 +97,11 @@ one that fails:
   cannot make an older import win over one that descends from it.
 - The release tag must be an annotated tag with a good signature (`VALIDSIG`)
   from operator-01's signing key, `289EA3EC2F1939A24984840ED26CFC05586D371E`
-  (listed in `contrib/keys/operator-keys/KEYS.md`), which signed `v0.3.0` and
-  `v0.3.2`. The helper checks it against a throwaway keyring that holds only
-  that certificate and is removed on every exit. A different signer needs a
-  maintainer decision before the import. The subtree check runs the same
-  check, from `test/lint/libbitcoinpqc-release-tag.sh`, so CI verifies the
+  (listed in `contrib/keys/operator-keys/KEYS.md`), which signed `v0.3.0`,
+  `v0.3.1` and `v0.3.2`. The helper checks it against a throwaway keyring that
+  holds only that certificate and is removed on every exit. A different signer
+  needs a maintainer decision before the import. The subtree check runs the
+  same check, from `test/lint/libbitcoinpqc-release-tag.sh`, so CI verifies the
   signer of the pinned tag too.
 - The signed tag object's own header must say `tag <tag>` and `type commit`, so
   an older signed tag published under a new name is refused. The helper fetches
@@ -96,9 +117,8 @@ one that fails:
 
 The import commit is made with the caller's own GnuPG environment, so a
 maintainer whose commits are signed gets a signed import commit. When the
-release's tree equals the vendored tree, as when a release upstreams qbit's
-approved downstream delta, the import commit only moves `git-subtree-split`
-and changes no file. The helper then runs
+release's tree equals the vendored tree, the import commit only moves
+`git-subtree-split` and changes no file. The helper then runs
 `test/lint/libbitcoinpqc-subtree-check.sh`, which fetches the exact
 `refs/tags/<tag>` and checks its signer and header the same way, and checks
 that the commit the lint verified is the tag's commit. The import is done only
@@ -131,15 +151,14 @@ including renamed and non-ASCII paths. For each listed path:
 1. Show qbit's change:
    `git diff <current-split>^{tree} HEAD:src/libbitcoinpqc -- <path>`.
 2. Show the release's change: `git diff <current-split> <new-split> -- <path>`.
-3. Decide:
+3. Decide. A downstream delta cannot land: the subtree check accepts none, and
+   a committed edit under `src/libbitcoinpqc` fails it with
+   `tree differs from latest subtree import commit <hash>`.
    - If the release already fixes the same problem, possibly in a different
-     way, rerun the helper with `--accept-upstream <path>`, and remove the
-     delta from the approved list in
-     [Verify Subtree Integrity](#verify-subtree-integrity) and the subtree
-     check.
-   - If the release lacks the change, prefer a new upstream release that has
-     it. Otherwise rerun with `--accept-upstream <path>`, re-apply the change in
-     a separate commit, and record it as an approved delta in both places.
+     way, rerun the helper with `--accept-upstream <path>`. Use this flag only
+     to accept the release's version.
+   - If the release lacks the change, ship it through a new upstream release
+     tag and import that tag instead.
 
 Then update every pin location in a separate commit:
 
@@ -168,16 +187,15 @@ test/lint/libbitcoinpqc-subtree-check.sh
 The check fetches the pinned tag object, requires a good signature from
 operator-01's pinned signing key and the tag's own header, should report
 `GOOD`, and should show the subtree split commit as
-`ac72d1ffa0ef486f08d37334a43f5db1adb731db` for the current pin. It fetches
+`1965d0da1eb4d9e196613b8f3a5d0d866a221c53` for the current pin. It fetches
 the whole upstream history, which is small, because a `--depth` fetch would
 mark the qbit checkout shallow.
 
-The current qbit tree carries one approved downstream security delta on top of
-the pinned upstream tag: `RUSTSEC-2026-0204-crossbeam-epoch-0.9.20`, which
-updates only `src/libbitcoinpqc/Cargo.lock` from `crossbeam-epoch 0.9.18` to
-`0.9.20`. The subtree check accepts exactly that lockfile hunk and no other
-subtree drift. Drop the exception after `Qbit-Org/qbit-libbitcoinpqc` publishes
-an immutable tag containing the same advisory fix and qbit imports it.
+The current qbit tree carries no downstream delta: `HEAD:src/libbitcoinpqc`
+must equal the tagged upstream tree. Since `v0.3.1`, upstream contains the
+`RUSTSEC-2026-0204` `crossbeam-epoch 0.9.20` lockfile fix that qbit carried
+as a downstream patch on `v0.3.0`, so the subtree check no longer accepts any
+lockfile exception.
 
 ## PR Checklist For Subtree Updates
 
@@ -194,17 +212,29 @@ When a PR touches `src/libbitcoinpqc`, confirm:
   intentional.
 - [ ] Any use of `--allow-downgrade` or `--accept-upstream` is explained in the
   pull request.
-- [ ] Any downstream security delta is listed above, is limited to the exact
-  lint allowlist, and is removed once a fixed upstream release tag is imported.
+- [ ] `src/libbitcoinpqc` carries no downstream delta; any change it needs ships
+  through a new upstream release tag.
 
 ## Common Failures
 
 1. Signature:
-   `FAIL: src/libbitcoinpqc tree differs from upstream tag <tag>`
+   `FAIL: src/libbitcoinpqc tree differs from latest subtree import commit <hash>`
    Cause:
-   Files under `src/libbitcoinpqc` were edited manually after the subtree import.
+   A commit edited files under `src/libbitcoinpqc` after the subtree import.
    Fix:
-   Re-import via `contrib/devtools/update-libbitcoinpqc-subtree.sh`.
+   Rerunning the helper does not repair this. With the edit committed it stops
+   with `already imports <tag>, but the subtree check failed`, and with an
+   uncommitted edit it refuses the dirty worktree. Discard any uncommitted edit
+   with `git restore src/libbitcoinpqc`. Then restore the prefix from the tree
+   of the `git-subtree-split` commit the check printed, commit that, because the
+   check reads `HEAD`, and rerun the check:
+
+   ```bash
+   git rm -r -q -- src/libbitcoinpqc
+   git read-tree --prefix=src/libbitcoinpqc/ -u <git-subtree-split>^{tree}
+   git commit -m "Restore src/libbitcoinpqc to the imported release"
+   test/lint/libbitcoinpqc-subtree-check.sh
+   ```
 
 2. Signature:
    `FAIL: subtree split <hash> does not match upstream tag commit <hash>`
@@ -222,3 +252,44 @@ When a PR touches `src/libbitcoinpqc`, confirm:
    Fix:
    Use an authenticated remote URL override:
    `LIBBITCOINPQC_REMOTE_URL=git@github.com:Qbit-Org/qbit-libbitcoinpqc.git`.
+
+4. Signature:
+   `<tag> is not a signed annotated tag` or
+   `<tag> has no good signature from <fingerprint>`, then
+   `error: <tag> is not a release tag signed by <fingerprint>; not importing`
+   from the helper or
+   `FAIL: <url> <tag> is not a release tag signed by <fingerprint>` from the
+   subtree check
+   Cause:
+   The tag is lightweight, unsigned, or signed by a key other than operator-01's
+   pinned signing key.
+   Fix:
+   Do not import it. Import a signed annotated tag from operator-01. A different
+   signer needs a maintainer decision before the import.
+
+5. Signature:
+   `the fetched tag object is not <tag> pointing at a commit`, then the
+   `is not a release tag signed by <fingerprint>` error above
+   Cause:
+   The signed tag object's own header does not say `tag <tag>` and `type commit`,
+   as when an older signed tag is published under a new name.
+   Fix:
+   Do not import it. Publish a new signed tag whose header names it, and import
+   that tag.
+
+6. Signature:
+   `error: importing <tag> would drop or override qbit changes under src/libbitcoinpqc`
+   Cause:
+   The qbit subtree has a change that the release lacks, or that conflicts with
+   how the release changed the same file.
+   Fix:
+   Follow [Reviewing A Downstream Delta](#reviewing-a-downstream-delta).
+
+7. Signature:
+   `error: <tag> (<commit>) does not descend from the current split <hash>; pass --allow-downgrade to import it anyway`
+   Cause:
+   The tag is not a descendant of the current import, usually because the tag
+   name was mistyped.
+   Fix:
+   Check the tag name. Pass `--allow-downgrade` only for an intended downgrade,
+   and explain it in the pull request.

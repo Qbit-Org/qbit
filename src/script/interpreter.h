@@ -151,6 +151,10 @@ enum : uint32_t {
     // removed at the height-activated validation-weight-v2 consensus change.
     SCRIPT_VERIFY_P2MR_LEGACY_VALIDATION_WEIGHT = (1U << 22),
 
+    // Bound the total bytes held on the stack and altstack while a P2MR v1
+    // script executes to MAX_STANDARD_P2MR_V1_STACK_BYTES (policy only).
+    SCRIPT_VERIFY_P2MR_STACK_BYTES = (1U << 23),
+
     // Constants to point to the highest flag in use. Add new flags above this line.
     //
     SCRIPT_VERIFY_END_MARKER
@@ -307,6 +311,12 @@ public:
         return false;
     }
 
+    /** Verify an OP_CHECKDATASIGPQC/OP_CHECKDATASIGADDPQC signature over its
+     *  QbitDataSigPQC digest. The interpreter performs every weight, size and
+     *  digest step first; this only decides whether the signature is valid.
+     *  The default runs the primitive verification. */
+    virtual bool VerifyPQCDataSignature(std::span<const unsigned char> sig, const CPQCPubKey& pubkey, const uint256& datasig_hash) const;
+
     virtual bool CheckTemplateVerifyHash(std::span<const unsigned char> expected, ScriptError* serror = nullptr) const
     {
         return false;
@@ -390,6 +400,11 @@ public:
     bool CheckPQCSignature(std::span<const unsigned char> sig, std::span<const unsigned char> pubkey, SigVersion sigversion, ScriptExecutionData& execdata, ScriptError* serror = nullptr) const override
     {
         return m_checker.CheckPQCSignature(sig, pubkey, sigversion, execdata, serror);
+    }
+
+    bool VerifyPQCDataSignature(std::span<const unsigned char> sig, const CPQCPubKey& pubkey, const uint256& datasig_hash) const override
+    {
+        return m_checker.VerifyPQCDataSignature(sig, pubkey, datasig_hash);
     }
 
     bool CheckTemplateVerifyHash(std::span<const unsigned char> expected, ScriptError* serror = nullptr) const override

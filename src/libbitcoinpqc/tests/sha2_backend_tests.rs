@@ -7,6 +7,10 @@ unsafe extern "C" {
     fn sha256_inc_init(state: *mut u8);
     fn sha256_inc_blocks(state: *mut u8, input: *const u8, inblocks: usize);
     fn sha256_inc_finalize(out: *mut u8, state: *mut u8, input: *const u8, inlen: usize);
+    fn sha512(out: *mut u8, input: *const u8, inlen: usize);
+    fn sha512_inc_init(state: *mut u8);
+    fn sha512_inc_blocks(state: *mut u8, input: *const u8, inblocks: usize);
+    fn sha512_inc_finalize(out: *mut u8, state: *mut u8, input: *const u8, inlen: usize);
     #[link_name = "SPX_ull_to_bytes"]
     fn spx_ull_to_bytes(out: *mut u8, outlen: c_uint, input: c_ulonglong);
 }
@@ -50,6 +54,37 @@ fn sha256_incremental(input: &[u8]) -> [u8; 32] {
     out
 }
 
+fn sha512_oneshot(input: &[u8]) -> [u8; 64] {
+    let mut out = [0u8; 64];
+    unsafe {
+        sha512(out.as_mut_ptr(), input.as_ptr(), input.len());
+    }
+    out
+}
+
+fn sha512_incremental(input: &[u8]) -> [u8; 64] {
+    let mut state = [0u8; 72];
+    let mut out = [0u8; 64];
+    let blocks = input.len() / 128;
+    let rem = input.len() % 128;
+
+    unsafe {
+        sha512_inc_init(state.as_mut_ptr());
+        if blocks > 0 {
+            sha512_inc_blocks(state.as_mut_ptr(), input.as_ptr(), blocks);
+        }
+        let tail = &input[(blocks * 128)..(blocks * 128 + rem)];
+        sha512_inc_finalize(
+            out.as_mut_ptr(),
+            state.as_mut_ptr(),
+            tail.as_ptr(),
+            tail.len(),
+        );
+    }
+
+    out
+}
+
 #[test]
 fn sha256_known_answer_vectors() {
     let vectors = [
@@ -82,6 +117,57 @@ fn sha256_incremental_matches_oneshot() {
 
     let one_shot = sha256_oneshot(&msg);
     let incremental = sha256_incremental(&msg);
+    assert_eq!(one_shot, incremental);
+}
+
+#[test]
+fn sha512_known_answer_vectors() {
+    let vectors = [
+        (
+            "",
+            concat!(
+                "cf83e1357eefb8bdf1542850d66d8007",
+                "d620e4050b5715dc83f4a921d36ce9ce",
+                "47d0d13c5d85f2b0ff8318d2877eec2f",
+                "63b931bd47417a81a538327af927da3e"
+            ),
+        ),
+        (
+            "abc",
+            concat!(
+                "ddaf35a193617abacc417349ae204131",
+                "12e6fa4e89a97ea20a9eeee64b55d39a",
+                "2192992a274fc1a836ba3c23a3feebbd",
+                "454d4423643ce80e2a9ac94fa54ca49f"
+            ),
+        ),
+        (
+            "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmn\
+             hijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu",
+            concat!(
+                "8e959b75dae313da8cf4f72814fc143f",
+                "8f7779c6eb9f7fa17299aeadb6889018",
+                "501d289e4900f7e4331b99dec4b5433a",
+                "c7d329eeb6dd26545e96e55b874be909"
+            ),
+        ),
+    ];
+
+    for (input, expected_hex) in vectors {
+        let digest = sha512_oneshot(input.as_bytes());
+        assert_eq!(digest.as_slice(), hex_to_bytes(expected_hex));
+    }
+}
+
+#[test]
+fn sha512_incremental_matches_oneshot() {
+    let mut msg = vec![0u8; 8192 + 73];
+    for (i, byte) in msg.iter_mut().enumerate() {
+        *byte = (i as u8).wrapping_mul(43).wrapping_add(11);
+    }
+
+    let one_shot = sha512_oneshot(&msg);
+    let incremental = sha512_incremental(&msg);
     assert_eq!(one_shot, incremental);
 }
 

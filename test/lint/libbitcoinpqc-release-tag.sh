@@ -1,4 +1,6 @@
 # shellcheck shell=bash
+# The scripts that source this file read its readonly variables.
+# shellcheck disable=SC2034
 #
 # Copyright (c) 2026-present The qbit core developers
 # Distributed under the MIT software license, see the accompanying
@@ -11,8 +13,6 @@
 
 export LC_ALL=C
 
-# The scripts that source this file read these.
-# shellcheck disable=SC2034
 readonly LIBBITCOINPQC_PREFIX="src/libbitcoinpqc"
 readonly LIBBITCOINPQC_UPSTREAM_URL="https://github.com/Qbit-Org/qbit-libbitcoinpqc.git"
 readonly LIBBITCOINPQC_SIGNER_CERT="contrib/keys/operator-keys/public-keys/operator-01-release.asc"

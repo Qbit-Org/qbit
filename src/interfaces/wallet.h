@@ -198,10 +198,13 @@ public:
         std::vector<bilingual_str>& errors,
         CAmount& old_fee,
         CAmount& new_fee,
-        CMutableTransaction& mtx) = 0;
+        CMutableTransaction& mtx,
+        const SigningProgressCallback& progress_callback = {}) = 0;
 
     //! Sign bump transaction.
-    virtual bool signBumpTransaction(CMutableTransaction& mtx) = 0;
+    virtual bool signBumpTransaction(CMutableTransaction& mtx,
+        wallet::PQCUsageReport* pqc_usage = nullptr,
+        const SigningProgressCallback& progress_callback = {}) = 0;
 
     //! Commit bump transaction.
     virtual bool commitBumpTransaction(const Txid& txid,
@@ -238,7 +241,8 @@ public:
         size_t* n_signed,
         PartiallySignedTransaction& psbtx,
         bool& complete,
-        wallet::PQCUsageReport* pqc_usage = nullptr) = 0;
+        wallet::PQCUsageReport* pqc_usage = nullptr,
+        const SigningProgressCallback& progress_callback = {}) = 0;
 
     //! Get balances.
     virtual WalletBalances getBalances() = 0;
@@ -275,11 +279,13 @@ public:
     //! Get required fee.
     virtual CAmount getRequiredFee(unsigned int tx_bytes) = 0;
 
-    //! Get minimum fee.
+    //! Get minimum fee. estimate_unavailable is set when fee estimation had no
+    //! estimate, even if a minimum fee rate then replaced the FALLBACK reason.
     virtual CAmount getMinimumFee(unsigned int tx_bytes,
         const wallet::CCoinControl& coin_control,
         int* returned_target,
-        FeeReason* reason) = 0;
+        FeeReason* reason,
+        bool* estimate_unavailable) = 0;
 
     //! Get tx confirm target.
     virtual unsigned int getConfirmTarget() = 0;

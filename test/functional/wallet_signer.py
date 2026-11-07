@@ -201,20 +201,50 @@ class WalletSignerTest(BitcoinTestFramework):
 
         self.log.info('Prepare fee bumped mock PSBT')
 
-        # Now that the transaction is broadcast, bump fee in mock wallet:
         orig_tx_id = res["txid"]
-        mock_psbt_bumped = mock_wallet.psbtbumpfee(orig_tx_id)["psbt"]
-        mock_psbt_bumped_signed = mock_wallet.walletprocesspsbt(psbt=mock_psbt_bumped, sign=True, sighashtype="ALL", bip32derivs=True)
+        mock_sign_taproot = os.path.join(self.nodes[1].cwd, "mock_sign_taproot")
+        baseline_mempool = set(self.nodes[1].getrawmempool())
+        baseline_tx_count = hww.getwalletinfo()["txcount"]
+        baseline_orig_tx = hww.gettransaction(orig_tx_id)
+        assert orig_tx_id in baseline_mempool
+        assert "replaced_by_txid" not in baseline_orig_tx
 
-        with open(os.path.join(self.nodes[1].cwd, "mock_psbt"), "w", encoding="utf8") as f:
-            f.write(mock_psbt_bumped_signed["psbt"])
+        with open(mock_sign_taproot, "w", encoding="utf8"):
+            pass
+        try:
+            for signer_mode in ["output", "sequence"]:
+                self.log.info(f'Test bumpfee rejects external signer {signer_mode} mutation')
+                with open(mock_sign_taproot, "w", encoding="utf8") as f:
+                    f.write(signer_mode)
 
-        self.log.info('Test bumpfee using hww1')
+                assert_raises_rpc_error(
+                    -4,
+                    "Transaction incomplete. Try psbtbumpfee instead.",
+                    hww.bumpfee,
+                    orig_tx_id,
+                )
 
-        # Bump fee
-        res = hww.bumpfee(orig_tx_id)
+                assert_equal(set(self.nodes[1].getrawmempool()), baseline_mempool)
+                assert orig_tx_id in self.nodes[1].getrawmempool()
+                assert_equal(hww.getwalletinfo()["txcount"], baseline_tx_count)
+                orig_tx = hww.gettransaction(orig_tx_id)
+                assert "replaced_by_txid" not in orig_tx
+                assert_equal(orig_tx["walletconflicts"], baseline_orig_tx["walletconflicts"])
+                assert_equal(orig_tx["mempoolconflicts"], baseline_orig_tx["mempoolconflicts"])
+
+            self.log.info('Test bumpfee using hww1')
+
+            # Sign the exact PSBT passed to the mock after proving that signed
+            # transaction substitutions are rejected.
+            with open(mock_sign_taproot, "w", encoding="utf8"):
+                pass
+            res = hww.bumpfee(orig_tx_id)
+        finally:
+            os.remove(mock_sign_taproot)
         assert_greater_than(res["fee"], res["origfee"])
         assert_equal(res["errors"], [])
+        assert res["txid"] in self.nodes[1].getrawmempool()
+        assert orig_tx_id not in self.nodes[1].getrawmempool()
 
 
     def test_disconnected_signer(self):

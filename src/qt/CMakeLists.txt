@@ -171,6 +171,8 @@ if(ENABLE_WALLET)
       overviewpage.h
       paymentserver.cpp
       paymentserver.h
+      pqcusageformat.cpp
+      pqcusageformat.h
       psbtoperationsdialog.cpp
       psbtoperationsdialog.h
       qrimagewidget.cpp

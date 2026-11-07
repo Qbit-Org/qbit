@@ -12,9 +12,11 @@
 #include <util/fs.h>
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 
 class ArgsManager;
 struct bilingual_str;
@@ -208,6 +210,38 @@ fs::path BDBDataFile(const fs::path& path);
 fs::path SQLiteDataFile(const fs::path& path);
 bool IsBDBFile(const fs::path& path);
 bool IsSQLiteFile(const fs::path& path);
+
+/**
+ * Registers a SQLite database file as open in this process for the lifetime of
+ * this object.
+ *
+ * On POSIX systems, closing any file descriptor for a file releases every
+ * fcntl() lock the process holds on that file, including the exclusive lock of
+ * an open SQLite wallet. IsBDBFile() and IsSQLiteFile() therefore do not open a
+ * registered file, and keep the registry locked until they close any file they
+ * open. SQLiteDatabase registers its file before taking the exclusive lock.
+ * Files are identified by device and inode, so a registered file is recognized
+ * through any path, including symlinks and hard links.
+ *
+ * Windows file locks are not released by closing another handle, and stat()
+ * there reports no inode number, so registration does nothing on Windows.
+ */
+class SQLiteFileRegistration
+{
+public:
+    //! Throws std::runtime_error if the file cannot be identified.
+    explicit SQLiteFileRegistration(const fs::path& path);
+    ~SQLiteFileRegistration();
+
+    SQLiteFileRegistration(const SQLiteFileRegistration&) = delete;
+    SQLiteFileRegistration& operator=(const SQLiteFileRegistration&) = delete;
+
+private:
+    std::optional<std::pair<uint64_t, uint64_t>> m_id;
+};
+
+//! Return whether path refers to a registered SQLite file. Does not open the file.
+bool IsRegisteredSQLiteFile(const fs::path& path);
 } // namespace wallet
 
 #endif // QBIT_WALLET_DB_H

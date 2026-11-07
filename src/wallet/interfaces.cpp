@@ -160,7 +160,14 @@ public:
     }
     bool isCrypted() override { return m_wallet->IsCrypted(); }
     bool lock() override { return m_wallet->Lock(); }
-    bool unlock(const SecureString& wallet_passphrase) override { return m_wallet->Unlock(wallet_passphrase); }
+    bool unlock(const SecureString& wallet_passphrase) override
+    {
+        if (!m_wallet->Unlock(wallet_passphrase, /*run_pending_initial_keypool_top_up=*/false)) {
+            return false;
+        }
+        MaybeSchedulePendingInitialKeyPoolTopUp(m_context, m_wallet);
+        return true;
+    }
     bool isLocked() override { return m_wallet->IsLocked(); }
     bool changeWalletPassphrase(const SecureString& old_wallet_passphrase,
         const SecureString& new_wallet_passphrase) override
@@ -360,13 +367,13 @@ public:
                                      sign,
                                      sign ? pqc_usage_recorder.GetObserver() : PQCSignatureCounterObserver{},
                                      progress_callback);
+        if (pqc_usage) {
+            *pqc_usage = sign ? BuildSigningPQCUsageReport(pqc_usage_recorder) : PQCUsageReport{};
+        }
         if (!res) return util::Error{util::ErrorString(res)};
         const auto& txr = *res;
         fee = txr.fee;
         change_pos = txr.change_pos ? int(*txr.change_pos) : -1;
-        if (pqc_usage) {
-            *pqc_usage = sign ? BuildSigningPQCUsageReport(pqc_usage_recorder) : PQCUsageReport{};
-        }
 
         return txr.tx;
     }
@@ -392,15 +399,23 @@ public:
         std::vector<bilingual_str>& errors,
         CAmount& old_fee,
         CAmount& new_fee,
-        CMutableTransaction& mtx) override
+        CMutableTransaction& mtx,
+        const SigningProgressCallback& progress_callback) override
     {
         std::vector<CTxOut> outputs; // just an empty list of new recipients for now
-        return feebumper::CreateRateBumpTransaction(*m_wallet.get(), txid, coin_control, errors, old_fee, new_fee, mtx, /* require_mine= */ true, outputs) == feebumper::Result::OK;
+        return feebumper::CreateRateBumpTransaction(*m_wallet.get(), txid, coin_control, errors, old_fee, new_fee, mtx, /* require_mine= */ true, outputs, /*original_change_index=*/std::nullopt, progress_callback) == feebumper::Result::OK;
     }
-    bool signBumpTransaction(CMutableTransaction& mtx) override
+    bool signBumpTransaction(CMutableTransaction& mtx,
+        wallet::PQCUsageReport* pqc_usage,
+        const SigningProgressCallback& progress_callback) override
     {
         if (GetPQCKeyValidationSigningError(*m_wallet)) return false;
-        return feebumper::SignTransaction(*m_wallet.get(), mtx);
+        PQCUsageRecorder pqc_usage_recorder;
+        const bool success{feebumper::SignTransaction(*m_wallet.get(), mtx, pqc_usage_recorder.GetObserver(), progress_callback)};
+        if (pqc_usage) {
+            *pqc_usage = BuildSigningPQCUsageReport(pqc_usage_recorder);
+        }
+        return success;
     }
     bool commitBumpTransaction(const Txid& txid,
         CMutableTransaction&& mtx,
@@ -479,7 +494,8 @@ public:
         size_t* n_signed,
         PartiallySignedTransaction& psbtx,
         bool& complete,
-        wallet::PQCUsageReport* pqc_usage) override
+        wallet::PQCUsageReport* pqc_usage,
+        const SigningProgressCallback& progress_callback) override
     {
         if (sign) {
             if (GetPQCKeyValidationSigningError(*m_wallet)) {
@@ -497,7 +513,8 @@ public:
                                             bip32derivs,
                                             n_signed,
                                             /*finalize=*/true,
-                                            sign ? pqc_usage_recorder.GetObserver() : PQCSignatureCounterObserver{});
+                                            sign ? pqc_usage_recorder.GetObserver() : PQCSignatureCounterObserver{},
+                                            progress_callback);
         if (pqc_usage) {
             *pqc_usage = sign ? BuildSigningPQCUsageReport(pqc_usage_recorder) : PQCUsageReport{};
         }
@@ -598,13 +615,15 @@ public:
     CAmount getMinimumFee(unsigned int tx_bytes,
         const CCoinControl& coin_control,
         int* returned_target,
-        FeeReason* reason) override
+        FeeReason* reason,
+        bool* estimate_unavailable) override
     {
         FeeCalculation fee_calc;
         CAmount result;
         result = GetMinimumFee(*m_wallet, tx_bytes, coin_control, &fee_calc);
         if (returned_target) *returned_target = fee_calc.returnedTarget;
         if (reason) *reason = fee_calc.reason;
+        if (estimate_unavailable) *estimate_unavailable = fee_calc.estimate_unavailable;
         return result;
     }
     unsigned int getConfirmTarget() override { return m_wallet->m_confirm_target; }

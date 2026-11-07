@@ -159,6 +159,11 @@ chain rescan, by descriptors, by xpubs, or by pubkey database exports. Old
 backups, descriptor recovery, and separate live signer copies can produce stale
 or divergent local counts.
 
+The security margin falls as a key signs more. A key keeps the full 128-bit
+classical security level up to about `2^26` (67,108,864) signatures, and about
+118 bits at the hard limit. Rotate high-volume keys well before the limit. See
+[P2MR Signature Security Margin](../../reference/p2mr-signature-security.md).
+
 Use `getaddressinfo` on a wallet-owned P2MR address to inspect local state:
 
 ```bash
@@ -213,7 +218,10 @@ Signing RPCs can include PQC usage state when local P2MR signing happened:
 
 `send` and `sendall` are experimental RPCs. `signrawtransactionwithkey` can use
 explicit `pqc(KEY)` material but does not expose or persist wallet counter
-state.
+state. Neither it nor `descriptorprocesspsbt` tracks PQC signature counts
+across calls for the keys passed to them. Signatures made through those RPCs
+are not counted by any wallet, so the caller must keep each key within the
+`1,073,741,824` signature limit.
 
 Signing RPCs may also return a `warnings` array. Display or log warning text,
 but do not parse it as a stable programmatic interface.

@@ -6,8 +6,10 @@
 #define QBIT_WALLET_FEEBUMPER_H
 
 #include <consensus/consensus.h>
-#include <script/interpreter.h>
 #include <primitives/transaction.h>
+#include <script/interpreter.h>
+#include <script/signingprogress.h>
+#include <script/signingprovider.h>
 
 class uint256;
 enum class FeeEstimateMode;
@@ -45,6 +47,7 @@ bool TransactionCanBeBumped(const CWallet& wallet, const Txid& txid);
  * @param[in] require_mine Whether the original transaction must consist of inputs that can be spent by the wallet
  * @param[in] outputs Vector of new outputs to replace the bumped transaction's outputs
  * @param[in] original_change_index The position of the change output to deduct the fee from in the transaction being bumped
+ * @param[in] progress_callback Reports preparation progress and permits cooperative cancellation
  */
 Result CreateRateBumpTransaction(CWallet& wallet,
     const Txid& txid,
@@ -55,12 +58,16 @@ Result CreateRateBumpTransaction(CWallet& wallet,
     CMutableTransaction& mtx,
     bool require_mine,
     const std::vector<CTxOut>& outputs,
-    std::optional<uint32_t> original_change_index = std::nullopt);
+    std::optional<uint32_t> original_change_index = std::nullopt,
+    const SigningProgressCallback& progress_callback = {});
 
 //! Sign the new transaction,
 //! @return false if the tx couldn't be found or if it was
 //! impossible to create the signature(s)
-bool SignTransaction(CWallet& wallet, CMutableTransaction& mtx);
+bool SignTransaction(CWallet& wallet,
+    CMutableTransaction& mtx,
+    const PQCSignatureCounterObserver& pqc_counter_observer = {},
+    const SigningProgressCallback& progress_callback = {});
 
 //! Commit the bumpfee transaction.
 //! @return success in case of CWallet::CommitTransaction was successful,

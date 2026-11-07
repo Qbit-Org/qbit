@@ -46,6 +46,14 @@ bool CheckP2MRV1InitialStackResourceLimits(const std::span<const valtype>& stack
     return true;
 }
 
+//! Total size of the elements of `stack` from position `begin` to the top.
+size_t StackBytesFrom(const std::vector<valtype>& stack, size_t begin)
+{
+    size_t bytes{0};
+    for (size_t i{begin}; i < stack.size(); ++i) bytes += stack[i].size();
+    return bytes;
+}
+
 } // namespace
 
 bool CastToBool(const valtype& vch)
@@ -434,7 +442,7 @@ static bool EvalChecksigP2MR(const valtype& sig, const valtype& pubkey, ScriptEx
     return true;
 }
 
-static bool EvalCheckDataSigPQC(const valtype& sig, const valtype& msg_hash, const valtype& pubkey, ScriptExecutionData& execdata, unsigned int flags, ScriptError* serror, bool& success)
+static bool EvalCheckDataSigPQC(const valtype& sig, const valtype& msg_hash, const valtype& pubkey, ScriptExecutionData& execdata, unsigned int flags, const BaseSignatureChecker& checker, ScriptError* serror, bool& success)
 {
     success = !sig.empty();
     if (success) {
@@ -464,7 +472,7 @@ static bool EvalCheckDataSigPQC(const valtype& sig, const valtype& msg_hash, con
 
     const CPQCPubKey pqc_pubkey{pubkey};
     const uint256 datasig_hash = ComputeQbitDataSigPQCHash(msg_hash);
-    if (!pqc_pubkey.Verify(datasig_hash, sig)) {
+    if (!checker.VerifyPQCDataSignature(sig, pqc_pubkey, datasig_hash)) {
         return set_error(serror, SCRIPT_ERR_P2MR_SIG);
     }
     return true;
@@ -521,6 +529,8 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
     uint32_t opcode_pos = 0;
     execdata.m_codeseparator_pos = 0xFFFFFFFFUL;
     execdata.m_codeseparator_pos_init = true;
+    const bool check_p2mr_stack_bytes{sigversion == SigVersion::P2MR && (flags & SCRIPT_VERIFY_P2MR_STACK_BYTES)};
+    size_t p2mr_stack_bytes{check_p2mr_stack_bytes ? StackBytesFrom(stack, 0) : 0};
 
     try
     {
@@ -562,6 +572,19 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
             // With SCRIPT_VERIFY_CONST_SCRIPTCODE, OP_CODESEPARATOR in non-segwit script is rejected even in an unexecuted branch
             if (opcode == OP_CODESEPARATOR && sigversion == SigVersion::BASE && (flags & SCRIPT_VERIFY_CONST_SCRIPTCODE))
                 return set_error(serror, SCRIPT_ERR_OP_CODESEPARATOR);
+
+            // Opcodes change at most the top six stack elements and the top
+            // altstack element. OP_ROLL also reorders the elements below its
+            // operand, which leaves their total size unchanged. Track the stack
+            // byte total by re-measuring only those windows around each opcode.
+            size_t stack_window_begin{0};
+            size_t altstack_window_begin{0};
+            size_t window_bytes{0};
+            if (check_p2mr_stack_bytes) {
+                stack_window_begin = stack.size() - std::min<size_t>(stack.size(), opcode == OP_ROLL ? 1 : 6);
+                altstack_window_begin = altstack.size() - std::min<size_t>(altstack.size(), 1);
+                window_bytes = StackBytesFrom(stack, stack_window_begin) + StackBytesFrom(altstack, altstack_window_begin);
+            }
 
             if (fExec && 0 <= opcode && opcode <= OP_PUSHDATA4) {
                 if (fRequireMinimal && !CheckMinimalPush(vchPushValue, opcode)) {
@@ -1238,7 +1261,7 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                     const valtype& pubkey = stacktop(-1);
 
                     bool success{false};
-                    if (!EvalCheckDataSigPQC(sig, msg_hash, pubkey, execdata, flags, serror, success)) return false;
+                    if (!EvalCheckDataSigPQC(sig, msg_hash, pubkey, execdata, flags, checker, serror, success)) return false;
                     popstack(stack);
                     popstack(stack);
                     popstack(stack);
@@ -1259,7 +1282,7 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                     const valtype& pubkey = stacktop(-1);
 
                     bool success{false};
-                    if (!EvalCheckDataSigPQC(sig, msg_hash, pubkey, execdata, flags, serror, success)) return false;
+                    if (!EvalCheckDataSigPQC(sig, msg_hash, pubkey, execdata, flags, checker, serror, success)) return false;
                     popstack(stack);
                     popstack(stack);
                     popstack(stack);
@@ -1387,6 +1410,10 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
             // Size limits
             if (stack.size() + altstack.size() > MAX_STACK_SIZE)
                 return set_error(serror, SCRIPT_ERR_STACK_SIZE);
+            if (check_p2mr_stack_bytes) {
+                p2mr_stack_bytes = p2mr_stack_bytes - window_bytes + StackBytesFrom(stack, stack_window_begin) + StackBytesFrom(altstack, altstack_window_begin);
+                if (p2mr_stack_bytes > MAX_STANDARD_P2MR_V1_STACK_BYTES) return set_error(serror, SCRIPT_ERR_P2MR_STACK_BYTES);
+            }
         }
     }
     catch (...)
@@ -1995,6 +2022,11 @@ bool GenericTransactionSignatureChecker<T>::CheckSchnorrSignature(std::span<cons
     }
     if (!VerifySchnorrSignature(sig, pubkey, sighash)) return set_error(serror, SCRIPT_ERR_SCHNORR_SIG);
     return true;
+}
+
+bool BaseSignatureChecker::VerifyPQCDataSignature(std::span<const unsigned char> sig, const CPQCPubKey& pubkey, const uint256& datasig_hash) const
+{
+    return pubkey.Verify(datasig_hash, sig);
 }
 
 template <class T>

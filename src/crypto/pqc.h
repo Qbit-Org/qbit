@@ -12,9 +12,11 @@
 #include <uint256.h>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 // Bounded SLH-DSA-SHA2-128s (h=30) constants from libbitcoinpqc.
@@ -29,6 +31,35 @@ static_assert(PQC_KEYGEN_RANDOM_DATA_SIZE >= 128);
 
 // SLH-DSA-SHA2-128s-bounded30 usage bound.
 constexpr uint32_t PQC_MAX_SIGNATURES = 1U << 30;
+
+//! Bytes of released stack that CPQCKey and DerivePQCKey overwrite after each
+//! secret-key operation (see BurnReleasedStack() in pqc.cpp).
+constexpr size_t PQC_STACK_BURN_BYTES = 32 * 1024;
+
+/** Counts backend calls from CPQCPubKey::Verify for tests; production never
+ * installs one. Invalid keys and signature lengths do not reach the backend.
+ * Installation must not overlap another counter or any Verify call. Join all
+ * verification threads before destruction. Concurrent calls are counted safely.
+ */
+class ScopedPQCVerificationCounter
+{
+    friend class CPQCPubKey;
+    static inline std::atomic<ScopedPQCVerificationCounter*> g_counter{nullptr};
+    std::atomic<uint64_t> m_calls{0};
+
+public:
+    ScopedPQCVerificationCounter()
+    {
+        ScopedPQCVerificationCounter* expected{nullptr};
+        if (!g_counter.compare_exchange_strong(expected, this)) {
+            throw std::logic_error("A PQC verification counter is already installed");
+        }
+    }
+    ~ScopedPQCVerificationCounter() { g_counter.store(nullptr); }
+    ScopedPQCVerificationCounter(const ScopedPQCVerificationCounter&) = delete;
+    ScopedPQCVerificationCounter& operator=(const ScopedPQCVerificationCounter&) = delete;
+    uint64_t GetCount() const { return m_calls.load(std::memory_order_relaxed); }
+};
 
 class CPQCPubKey
 {
@@ -52,6 +83,9 @@ public:
     bool Verify(const uint256& hash, std::span<const unsigned char> sig) const
     {
         if (!m_valid || sig.size() != PQC_SIG_SIZE) return false;
+        if (auto* counter = ScopedPQCVerificationCounter::g_counter.load()) {
+            counter->m_calls.fetch_add(1, std::memory_order_relaxed);
+        }
         return slh_dsa_verify(sig.data(), sig.size(), hash.begin(), hash.size(), m_data.data()) == 0;
     }
     CKeyID GetID() const
@@ -107,6 +141,30 @@ public:
             m_valid = false;
         }
     }
+};
+
+/** Test-only observation of actual signer calls, never private key material.
+ * Callbacks may run concurrently on signing threads and must not throw.
+ */
+class PQCSigningObserver
+{
+public:
+    virtual ~PQCSigningObserver() = default;
+    virtual uint64_t BeforeSign(const CPQCPubKey& pubkey, uint32_t counter) = 0;
+    virtual void AfterSign(uint64_t call, bool success) = 0;
+};
+
+/** Installs the process-wide test observer; production never installs one.
+ * Installation must not overlap another observer or any Sign call. The caller
+ * must join all signing threads before destruction and keep the observer alive.
+ */
+class ScopedPQCSigningObserver
+{
+public:
+    explicit ScopedPQCSigningObserver(PQCSigningObserver& observer);
+    ~ScopedPQCSigningObserver();
+    ScopedPQCSigningObserver(const ScopedPQCSigningObserver&) = delete;
+    ScopedPQCSigningObserver& operator=(const ScopedPQCSigningObserver&) = delete;
 };
 
 class CPQCKey

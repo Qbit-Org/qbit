@@ -135,7 +135,56 @@ std::set<int> InterpretSubtractFeeFromOutputInstructions(const UniValue& sffo_in
     return sffo_set;
 }
 
-static UniValue FinishTransaction(const std::shared_ptr<CWallet> pwallet, const UniValue& options, CMutableTransaction& rawTx)
+//! Wallet state of a call's preset inputs before it funds the transaction.
+struct PresetInputState {
+    //! Wallet transactions that already spend them, such as one the call replaces
+    std::set<Txid> spenders;
+    //! Those the user had locked, which a failed call leaves locked
+    std::set<COutPoint> locked;
+};
+
+static PresetInputState GetPresetInputState(const CWallet& wallet, const std::vector<CTxIn>& inputs) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    PresetInputState state;
+    for (const CTxIn& txin : inputs) {
+        state.spenders.merge(wallet.GetSpendingTxs(txin.prevout));
+        if (wallet.IsLockedCoin(txin.prevout)) state.locked.insert(txin.prevout);
+    }
+    return state;
+}
+
+/**
+ * Throw if a wallet transaction other than tx and the preset inputs' prior
+ * spenders spends one of tx's inputs. FinishTransaction signs without holding
+ * cs_wallet, so a concurrent call can commit a spend of the same coin after tx
+ * was funded.
+ */
+static void EnsureInputsNotSpentConcurrently(CWallet& wallet, const CTransaction& tx, const PresetInputState& preset, bool lock_unspents) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    for (const CTxIn& txin : tx.vin) {
+        for (const Txid& spender : wallet.GetSpendingTxs(txin.prevout)) {
+            // A spender with tx's txid is tx itself, perhaps with another
+            // witness. Committing tx again leaves that transaction in the
+            // wallet and rebroadcasts it, so the txid we return can confirm.
+            if (spender == tx.GetHash() || preset.spenders.contains(spender)) continue;
+            // Committing tx would have unlocked the inputs lock_unspents
+            // locked. Unlock them, except those the user had locked.
+            if (lock_unspents) {
+                for (const CTxIn& input : tx.vin) {
+                    if (!preset.locked.contains(input.prevout)) wallet.UnlockCoin(input.prevout);
+                }
+            }
+            throw JSONRPCError(RPC_WALLET_ERROR, strprintf("Input %s:%u was spent by concurrent transaction %s. This transaction was not added to the wallet or broadcast; the call can be retried.", txin.prevout.hash.GetHex(), txin.prevout.n, spender.GetHex()));
+        }
+    }
+}
+
+/**
+ * @param[in] preset  The preset inputs' prior spenders, such as a transaction
+ *                    the call replaces, and locks. Any other spender found at
+ *                    commit makes the call fail.
+ */
+static UniValue FinishTransaction(const std::shared_ptr<CWallet> pwallet, const UniValue& options, CMutableTransaction& rawTx, const PresetInputState& preset)
 {
     EnsurePQCKeyValidationReadyForSigning(*pwallet);
     bool can_anti_fee_snipe = !options.exists("locktime");
@@ -185,6 +234,10 @@ static UniValue FinishTransaction(const std::shared_ptr<CWallet> pwallet, const 
         CTransactionRef tx(MakeTransactionRef(std::move(mtx)));
         result.pushKV("txid", tx->GetHash().GetHex());
         if (add_to_wallet && !psbt_opt_in) {
+            if (pwallet->m_before_send_commit) pwallet->m_before_send_commit();
+            const bool lock_unspents{options.exists("lock_unspents") && options["lock_unspents"].get_bool()};
+            LOCK(pwallet->cs_wallet);
+            EnsureInputsNotSpentConcurrently(*pwallet, *tx, preset, lock_unspents);
             pwallet->CommitTransaction(tx, {}, /*orderForm=*/{});
         } else {
             result.pushKV("hex", hex);
@@ -1408,10 +1461,13 @@ RPCHelpMan send()
             // Clear tx.vout since it is not meant to be used now that we are passing outputs directly.
             // This sets us up for a future PR to completely remove tx from the function signature in favor of passing inputs directly
             rawTx.vout.clear();
+            // Preset inputs may already be spent, by a transaction this one
+            // replaces, or locked. Automatically selected coins are neither.
+            const PresetInputState preset{WITH_LOCK(pwallet->cs_wallet, return GetPresetInputState(*pwallet, rawTx.vin))};
             auto txr = FundTransaction(*pwallet, rawTx, recipients, options, coin_control, /*override_min_fee=*/false);
 
             CMutableTransaction tx = CMutableTransaction(*txr.tx);
-            return FinishTransaction(pwallet, options, tx);
+            return FinishTransaction(pwallet, options, tx, preset);
         }
     };
 }
@@ -1693,7 +1749,9 @@ RPCHelpMan sendall()
                 }
             }
 
-            return FinishTransaction(pwallet, options, rawTx);
+            // sendall holds cs_wallet from coin selection through commit and
+            // never selects a spent coin, so the commit check cannot fail.
+            return FinishTransaction(pwallet, options, rawTx, /*preset=*/{});
         }
     };
 }
@@ -1835,7 +1893,7 @@ RPCHelpMan walletcreatefundedpsbt()
                             {"changePosition", RPCArg::Type::NUM, RPCArg::DefaultHint{"random"}, "The index of the change output"},
                             {"change_type", RPCArg::Type::STR, RPCArg::DefaultHint{"set by -changetype"}, "The output type to use. Only valid if changeAddress is not specified. Options are " + FormatWalletOutputTypes() + "."},
                             {"includeWatching", RPCArg::Type::BOOL, RPCArg::Default{false}, "(DEPRECATED) No longer used"},
-                            {"lockUnspents", RPCArg::Type::BOOL, RPCArg::Default{false}, "Lock selected unspent outputs"},
+                            {"lockUnspents", RPCArg::Type::BOOL, RPCArg::Default{false}, "Lock selected unspent outputs. Set it when funding PSBTs concurrently, so other wallet calls do not select the same coins until they are spent, unlocked with lockunspent, or the wallet is unloaded."},
                             {"fee_rate", RPCArg::Type::AMOUNT, RPCArg::DefaultHint{"not set, fall back to wallet fee estimation"}, "Specify a fee rate in " + CURRENCY_ATOM + "/vB."},
                             {"feeRate", RPCArg::Type::AMOUNT, RPCArg::DefaultHint{"not set, fall back to wallet fee estimation"}, "Specify a fee rate in " + CURRENCY_UNIT + "/kvB."},
                             {"subtractFeeFromOutputs", RPCArg::Type::ARR, RPCArg::Default{UniValue::VARR}, "The outputs to subtract the fee from.\n"

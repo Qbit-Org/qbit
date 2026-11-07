@@ -348,6 +348,11 @@ void BitcoinApplication::requestShutdown()
     // Request node shutdown, which can interrupt long operations, like
     // rescanning a wallet.
     node().startShutdown();
+#ifdef ENABLE_WALLET
+    // Request cancellation for every wallet send worker before teardown can
+    // block on a worker owned by a later wallet view.
+    window->prepareWalletsForShutdown();
+#endif // ENABLE_WALLET
     // Prior to unsetting the client model, stop listening backend signals
     if (clientModel) {
         clientModel->stop();
@@ -361,7 +366,8 @@ void BitcoinApplication::requestShutdown()
 #ifdef ENABLE_WALLET
     // Wallet views own background send workers and temporary unlock contexts
     // which reference WalletModel objects parented to the wallet controller.
-    // Destroy the views and join their workers before deleting those models.
+    // Destroy the views and join the already-cancelled workers before deleting
+    // those models.
     window->removeAllWallets();
 
     // Delete wallet controller here manually, instead of relying on Qt object

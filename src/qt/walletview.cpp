@@ -113,6 +113,12 @@ WalletView::WalletView(WalletModel* wallet_model, const PlatformStyle* _platform
 
 WalletView::~WalletView() = default;
 
+void WalletView::prepareForShutdown()
+{
+    walletModel->prepareForShutdown();
+    sendCoinsPage->prepareForShutdown();
+}
+
 void WalletView::setClientModel(ClientModel *_clientModel)
 {
     this->clientModel = _clientModel;

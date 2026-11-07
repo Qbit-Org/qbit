@@ -18,7 +18,9 @@ RPCHelpMan walletpassphrase()
                 "This is needed prior to performing transactions related to private keys such as sending QBT\n"
             "\nNote:\n"
             "Issuing the walletpassphrase command while the wallet is already unlocked will set a new unlock\n"
-            "time that overrides the old one.\n",
+            "time that overrides the old one.\n"
+            "P2MR keypools are refilled to -keypool in the background after this call returns. The refill\n"
+            "pauses while the wallet is locked and resumes at the next walletpassphrase.\n",
                 {
                     {"passphrase", RPCArg::Type::STR, RPCArg::Optional::NO, "The wallet passphrase"},
                     {"timeout", RPCArg::Type::NUM, RPCArg::Optional::NO, "The time to keep the decryption key in seconds; capped at 100000000 (~3 years)."},
@@ -71,7 +73,9 @@ RPCHelpMan walletpassphrase()
             throw JSONRPCError(RPC_INVALID_PARAMETER, "passphrase cannot be empty");
         }
 
-        if (!pwallet->Unlock(strWalletPass)) {
+        // Deriving P2MR keys here would hold cs_wallet for seconds per hundred
+        // keys; TopUpKeyPoolAfterUnlock() below schedules them instead.
+        if (!pwallet->Unlock(strWalletPass, /*run_pending_initial_keypool_top_up=*/false)) {
             // Check if the passphrase has a null character (see #27067 for details)
             if (strWalletPass.find('\0') == std::string::npos) {
                 throw JSONRPCError(RPC_WALLET_PASSPHRASE_INCORRECT, "Error: The wallet passphrase entered was incorrect.");
@@ -85,17 +89,20 @@ RPCHelpMan walletpassphrase()
             }
         }
 
-        pwallet->TopUpKeyPool();
-
         pwallet->nRelockTime = GetTime() + nSleepTime;
         relock_time = pwallet->nRelockTime;
     }
+
+    WalletContext& context = EnsureWalletContext(request.context);
+    // m_relock_mutex is still held, so the wallet cannot be relocked before
+    // the non-P2MR top-up finishes. A background P2MR step that starts after
+    // the relock stops without deriving.
+    TopUpKeyPoolAfterUnlock(context, wallet);
 
     // Get wallet scheduler to queue up the relock callback in the future.
     // Scheduled events don't get destructed until they are executed,
     // and they are executed in series in a single scheduler thread so
     // no cs_wallet lock is needed.
-    WalletContext& context = EnsureWalletContext(request.context);
     // Keep a weak pointer to the wallet so that it is possible to unload the
     // wallet before the following callback is called. If a valid shared pointer
     // is acquired in the callback then the wallet is still loaded.
@@ -257,6 +264,11 @@ RPCHelpMan encryptwallet()
         throw JSONRPCError(RPC_WALLET_ENCRYPTION_FAILED, "Error: wallet does not contain private keys, nothing to encrypt.");
     }
 
+    // Hold the locks from the encryption-state check through the encryption
+    // itself, so a call that overlaps another encryption reports the wallet
+    // as already encrypted once that encryption has finished.
+    LOCK2(pwallet->m_relock_mutex, pwallet->cs_wallet);
+
     if (pwallet->IsCrypted()) {
         throw JSONRPCError(RPC_WALLET_WRONG_ENC_STATE, "Error: running with an encrypted wallet, but encryptwallet was called.");
     }
@@ -272,8 +284,6 @@ RPCHelpMan encryptwallet()
     if (pqc_validation.failed_records > 0) {
         throw JSONRPCError(RPC_WALLET_ERROR, "Error: plaintext PQC wallet key validation failed. Wallet encryption is disabled until the wallet is restored or repaired.");
     }
-
-    LOCK2(pwallet->m_relock_mutex, pwallet->cs_wallet);
 
     SecureString strWalletPass;
     strWalletPass.reserve(100);

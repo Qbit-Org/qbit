@@ -7,6 +7,7 @@
 
 #include <QObject>
 #include <QPointer>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <set>
@@ -32,6 +33,7 @@ public:
 
 private Q_SLOTS:
     void appTests();
+    void cleanup();
     void guiTests(BitcoinGUI* window);
     void consoleTests(RPCConsole* console);
 
@@ -60,9 +62,19 @@ private:
     QPointer<WalletView> m_shutdown_wallet_view;
     QPointer<SendCoinsDialog> m_shutdown_send_dialog;
     std::shared_ptr<qt_test::SyntheticWalletState> m_shutdown_wallet_state;
-    int64_t m_shutdown_elapsed_ms{-1};
+    //! Recorded under the synthetic wallet state mutex when the shutdown send
+    //! dialog is destroyed, after its destructor joined the prepare worker.
+    uint64_t m_shutdown_dialog_destroyed_sequence{0};
+    std::chrono::steady_clock::time_point m_shutdown_dialog_destroyed_time;
     int m_shutdown_coins_sent{0};
+    //! Wallets whose PSBT dialog is signing when shutdown starts: one worker
+    //! is paused before PQC counter reservation, the other after it.
+    std::shared_ptr<qt_test::SyntheticWalletState> m_psbt_unreserved_state;
+    std::shared_ptr<qt_test::SyntheticWalletState> m_psbt_reserved_state;
+    //! The serialized signed PSBT the reserved worker produces.
+    std::string m_psbt_reserved_signed;
     bool m_wallet_dependents_destroyed_before_model{false};
+    bool m_remove_test_wallet_settings{false};
 };
 
 #endif // QBIT_QT_TEST_APPTESTS_H

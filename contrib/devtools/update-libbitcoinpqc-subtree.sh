@@ -12,7 +12,7 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/../../test/lint/libbitcoinpqc-release-tag.sh"
 
 readonly PREFIX="${LIBBITCOINPQC_PREFIX}"
-readonly DEFAULT_REMOTE_REF="v0.3.0"
+readonly DEFAULT_REMOTE_REF="v0.3.2"
 # The fetched tag object is held here while the helper runs.
 readonly TAG_REF="refs/libbitcoinpqc-import/tag"
 

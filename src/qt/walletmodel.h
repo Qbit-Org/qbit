@@ -13,8 +13,13 @@
 #include <primitives/transaction_identifier.h>
 #include <support/allocators/secure.h>
 
+#include <atomic>
+#include <cstdint>
+#include <exception>
+#include <memory>
 #include <vector>
 
+#include <QDateTime>
 #include <QObject>
 #include <QPointer>
 
@@ -43,6 +48,9 @@ class CCoinControl;
 
 QT_BEGIN_NAMESPACE
 class QTimer;
+class QProgressBar;
+class QProgressDialog;
+class QThread;
 QT_END_NAMESPACE
 
 /** Interface to Bitcoin wallet from Qt view code. */
@@ -103,8 +111,17 @@ public:
     // Send coins to a list of recipients
     void sendCoins(WalletModelTransaction& transaction);
 
-    // Wallet encryption
-    bool setWalletEncrypted(const SecureString& passphrase);
+    // Wallet encryption. Runs the wallet's encryption on a worker thread so
+    // the GUI keeps processing events, and reports the outcome through
+    // encryptWalletFinished(). Returns false, and starts nothing, while an
+    // earlier encryption is still running. The worker holds the wallet locks
+    // until it returns, so getEncryptionStatus() and getPQCKeyValidationInfo()
+    // answer from the values taken before it started while it runs, and the
+    // transaction table holds back updates that would read the wallet. An
+    // exception from the wallet is rethrown on the GUI thread rather than
+    // reported as a failure: the encryption may already have committed.
+    bool encryptWallet(const SecureString& passphrase);
+    bool isEncryptingWallet() const { return m_encrypt_wallet_active; }
     // Passphrase only needed when unlocking
     bool setWalletLocked(bool locked, const SecureString &passPhrase=SecureString());
     bool changePassphrase(const SecureString &oldPass, const SecureString &newPass);
@@ -132,7 +149,7 @@ public:
 
     UnlockContext requestUnlock();
 
-    bool bumpFee(Txid hash, Txid& new_hash);
+    bool bumpFee(Txid hash);
     void displayAddress(std::string sAddress) const;
 
     static bool isWalletEnabled();
@@ -141,6 +158,7 @@ public:
     interfaces::Wallet& wallet() const { return *m_wallet; }
     ClientModel& clientModel() const { return *m_client_model; }
     void setClientModel(ClientModel* client_model);
+    void prepareForShutdown();
 
     QString getWalletName() const;
     QString getDisplayName() const;
@@ -170,6 +188,53 @@ private:
     std::unique_ptr<interfaces::Handler> m_handler_can_get_addrs_changed;
     ClientModel* m_client_model;
     interfaces::Node& m_node;
+
+    struct BumpFeeResult;
+    enum class BumpFeeProgressPhase {
+        Preparing,
+        Reserving,
+        Signing,
+        Finalizing,
+        Committing,
+    };
+    enum class BumpFeeCancellationState : uint8_t {
+        Cancellable,
+        Canceled,
+        Irreversible,
+    };
+    struct BumpFeeProgress;
+    QThread* m_bump_fee_thread{nullptr};
+    QPointer<QProgressDialog> m_bump_fee_progress_dialog;
+    QPointer<QProgressBar> m_bump_fee_progress_bar;
+    std::unique_ptr<UnlockContext> m_bump_fee_unlock_context;
+    uint64_t m_bump_fee_generation{0};
+    bool m_bump_fee_active{false};
+    std::atomic<BumpFeeCancellationState> m_bump_fee_cancellation_state{BumpFeeCancellationState::Cancellable};
+
+    void startBumpFeePreparation(Txid txid, std::unique_ptr<interfaces::Wallet> wallet);
+    void bumpFeePrepared(uint64_t generation, std::shared_ptr<BumpFeeResult> result);
+    void startBumpFeeSigning(uint64_t generation, std::shared_ptr<BumpFeeResult> result);
+    void bumpFeeProgress(uint64_t generation, BumpFeeProgress progress);
+    void bumpFeeFinished(uint64_t generation, std::shared_ptr<BumpFeeResult> result);
+    void cancelBumpFee();
+    void clearBumpFeeProgressDialog();
+    void finishBumpFeeThread();
+    void resetBumpFeeState();
+
+    QThread* m_encrypt_wallet_thread{nullptr};
+    uint64_t m_encrypt_wallet_generation{0};
+    bool m_encrypt_wallet_active{false};
+    // PQC validation status from before the encryption started, reported
+    // while the worker holds the wallet locks. cachedEncryptionStatus serves
+    // the encryption status the same way.
+    wallet::PQCKeyValidationInfo m_encrypt_wallet_pqc_info;
+    // The wallet raises this notification while it still holds its locks
+    // during encryption. It is held back until the worker returns so no
+    // listener blocks the GUI thread on those locks.
+    bool m_can_get_addresses_changed_deferred{false};
+
+    void finishEncryptWallet(uint64_t generation, bool success, std::exception_ptr exception);
+    void finishEncryptWalletThread();
 
     bool fForceCheckBalanceChanged{false};
 
@@ -223,6 +288,17 @@ Q_SIGNALS:
     // Notify that there are now keys in the keypool
     void canGetAddressesChanged();
 
+    // Outcome of an encryptWallet() request, emitted on the GUI thread after
+    // the worker has released the wallet.
+    void encryptWalletFinished(bool success);
+
+    // A fee-bump replacement was committed by the background worker.
+    // pqc_usage is the formatted PQC signing usage the bump consumed, or empty
+    // when it consumed none. committed_at is the local time the commit
+    // returned, which can be well before this signal when a usage warning
+    // is shown modally first.
+    void feeBumped(const Txid& original_txid, const Txid& bumped_txid, const QString& pqc_usage, const QDateTime& committed_at);
+
     void timerTimeout();
 
 public Q_SLOTS:
@@ -235,6 +311,8 @@ public Q_SLOTS:
     void updateTransaction();
     /* New, updated or removed address book entry */
     void updateAddressBook(const QString &address, const QString &label, bool isMine, wallet::AddressPurpose purpose, int status);
+    /* Keypool availability might have changed */
+    void updateCanGetAddresses();
     /* Current, immature or unconfirmed balance might have changed - emit 'balanceChanged' if so */
     void pollBalanceChanged();
 };

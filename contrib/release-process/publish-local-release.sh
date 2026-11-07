@@ -411,11 +411,32 @@ if actual != expected:
 PY
 }
 
+# Replace the manifest only after the whole paginated listing succeeds. A failed
+# or partial listing leaves no manifest and returns nonzero: an unreadable asset
+# list is unknown, never an empty release.
 write_remote_asset_manifest() {
     local destination="$1"
+    local listing="$destination.listing"
     [ -n "$RELEASE_ID" ] || die "Cannot list assets without a release ID"
-    gh api "repos/$GH_REPO_PATH/releases/$RELEASE_ID/assets?per_page=100" \
-        --paginate --jq '.[] | [.name, (.digest // "")] | @tsv' > "$destination"
+    rm -f "$destination" "$listing" \
+        || die "Could not discard the previous remote asset manifest"
+    if ! gh api "repos/$GH_REPO_PATH/releases/$RELEASE_ID/assets?per_page=100" \
+            --paginate --jq '.[] | [.name, (.digest // "")] | @tsv' \
+            > "$listing" 2> "$ASSET_LIST_ERRORS"; then
+        rm -f "$listing"
+        return 1
+    fi
+    mv "$listing" "$destination" \
+        || die "Could not store the remote asset manifest"
+}
+
+asset_list_failure() {
+    local phase="$1"
+    shift
+    cat "$ASSET_LIST_ERRORS" >&2
+    die "The asset-list request for release $TAG (ID $RELEASE_ID) in $GH_REPO" \
+        "failed during $phase; the remote asset inventory is unknown and was not" \
+        "compared." "$@"
 }
 
 compare_asset_manifests() {
@@ -478,27 +499,41 @@ remote_has_asset() {
     return 1
 }
 
+# Returns 0 on a match, 1 when the last successful listing did not match, and 2
+# when the last asset-list request failed.
 wait_for_asset_manifest_match() {
     local mode="$1"
     local attempt
+    local listed
     local errors="$WORK_DIR/asset-verification-errors"
     for attempt in 1 2 3 4 5; do
-        write_remote_asset_manifest "$REMOTE_ASSET_MANIFEST"
-        if compare_asset_manifests "$mode" "$REMOTE_ASSET_MANIFEST" 2> "$errors"; then
-            return 0
+        if write_remote_asset_manifest "$REMOTE_ASSET_MANIFEST"; then
+            listed=1
+            if compare_asset_manifests "$mode" "$REMOTE_ASSET_MANIFEST" 2> "$errors"; then
+                return 0
+            fi
+        else
+            listed=0
         fi
         [ "$attempt" -eq 5 ] || sleep 2
     done
+    [ "$listed" -eq 1 ] || return 2
     cat "$errors" >&2
     return 1
 }
 
-wait_for_subset_assets() {
-    wait_for_asset_manifest_match subset
-}
-
-wait_for_exact_assets() {
-    wait_for_asset_manifest_match exact
+require_asset_manifest_match() {
+    local mode="$1"
+    local phase="$2"
+    local mismatch_error="$3"
+    shift 3
+    local status=0
+    wait_for_asset_manifest_match "$mode" || status=$?
+    case "$status" in
+        0) ;;
+        2) asset_list_failure "$phase" "$@" ;;
+        *) die "$mismatch_error" ;;
+    esac
 }
 
 TAG=""
@@ -766,6 +801,7 @@ trap 'rm -rf "$WORK_DIR"' EXIT
 VALIDATION_OUTPUT="$WORK_DIR/validation-output.env"
 LOCAL_ASSET_MANIFEST="$WORK_DIR/local-assets.tsv"
 REMOTE_ASSET_MANIFEST="$WORK_DIR/remote-assets.tsv"
+ASSET_LIST_ERRORS="$WORK_DIR/asset-list-errors"
 : > "$VALIDATION_OUTPUT"
 [ -z "$NOTES_FILE" ] || prepare_release_notes
 
@@ -960,15 +996,17 @@ if RELEASE_VIEW_OUTPUT="$(release_view)"; then
         [ "$MODE" = validate ] \
             || die "Release $TAG already exists and is published; refusing to modify it"
         require_immutable_release
-        write_remote_asset_manifest "$REMOTE_ASSET_MANIFEST"
-        compare_asset_manifests exact "$REMOTE_ASSET_MANIFEST"
+        write_remote_asset_manifest "$REMOTE_ASSET_MANIFEST" \
+            || asset_list_failure "published release validation"
+        compare_asset_manifests exact "$REMOTE_ASSET_MANIFEST" \
+            || die "Published release assets do not exactly match the validated upload set"
         verify_remote_tag_pin post-publication
         msg "Published release assets exactly match local names and SHA256 digests"
         msg "Validation-only mode complete: $RELEASE_URL (immutable=true)"
         exit 0
     fi
-    wait_for_subset_assets \
-        || die "Draft release assets are not a digest-matching subset of the validated upload set"
+    require_asset_manifest_match subset "draft resume verification" \
+        "Draft release assets are not a digest-matching subset of the validated upload set"
     msg "Found matching draft release; missing assets will be resumed"
 else
     view_status=$?
@@ -1025,8 +1063,8 @@ if [ -z "$RELEASE_ID" ]; then
     [ "$RELEASE_IS_DRAFT" = true ] || die "New release $TAG is not a draft"
 fi
 
-wait_for_subset_assets \
-    || die "Draft release assets are not a digest-matching subset of the validated upload set"
+require_asset_manifest_match subset "pre-upload verification" \
+    "Draft release assets are not a digest-matching subset of the validated upload set"
 for upload_file in "${upload_files[@]}"; do
     asset_name="$(basename "$upload_file")"
     if remote_has_asset "$asset_name"; then
@@ -1037,8 +1075,8 @@ for upload_file in "${upload_files[@]}"; do
     fi
 done
 
-wait_for_exact_assets \
-    || die "Draft release assets do not exactly match the validated upload set"
+require_asset_manifest_match exact "draft verification" \
+    "Draft release assets do not exactly match the validated upload set"
 msg "Draft release assets exactly match local names and SHA256 digests"
 
 edit_args=(
@@ -1089,8 +1127,11 @@ if [ "$MODE" = publish ]; then
     "${publish_args[@]}" >/dev/null \
         || die "Could not publish release $TAG"
     wait_for_published_immutable_release
-    wait_for_exact_assets \
-        || die "Published immutable release assets do not exactly match the validated upload set"
+    require_asset_manifest_match exact "post-publication verification" \
+        "Published immutable release assets do not exactly match the validated upload set" \
+        "Release $TAG is already published. Preserve the publisher transcript and" \
+        "rerun this publisher without --create-draft or --publish to verify the" \
+        "published assets once the asset list is readable."
     verify_remote_tag_pin post-publication
     msg "Published immutable release assets exactly match local names and SHA256 digests"
     msg "Published immutable release: $RELEASE_URL"

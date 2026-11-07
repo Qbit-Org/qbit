@@ -14,6 +14,7 @@
 #include <logging.h>
 #include <outputtype.h>
 #include <policy/feerate.h>
+#include <policy/policy.h>
 #include <primitives/transaction.h>
 #include <primitives/transaction_identifier.h>
 #include <script/interpreter.h>
@@ -106,13 +107,26 @@ std::shared_ptr<CWallet> RestoreWallet(WalletContext& context, const fs::path& b
 std::unique_ptr<interfaces::Handler> HandleLoadWallet(WalletContext& context, LoadWalletFn load_wallet);
 void NotifyWalletLoaded(WalletContext& context, const std::shared_ptr<CWallet>& wallet);
 void SchedulePlaintextPQCKeyValidation(CScheduler& scheduler, const std::shared_ptr<CWallet>& wallet);
+void MaybeSchedulePendingInitialKeyPoolTopUp(WalletContext& context, const std::shared_ptr<CWallet>& wallet);
+void MaybeSchedulePendingInitialKeyPoolTopUpAfterLoad(WalletContext& context, const std::shared_ptr<CWallet>& wallet);
 void MaybeScheduleP2MRKeyPoolRefill(WalletContext& context, const std::shared_ptr<CWallet>& wallet, OutputType type, bool internal);
+//! Top up the active keypools after an unlock: non-P2MR ones inline, P2MR ones
+//! (the pending create-time top-up, or a refill to -keypool) in the background.
+void TopUpKeyPoolAfterUnlock(WalletContext& context, const std::shared_ptr<CWallet>& wallet);
 std::unique_ptr<WalletDatabase> MakeWalletDatabase(const std::string& name, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error);
 
 //! -paytxfee default
 constexpr CAmount DEFAULT_PAY_TX_FEE = 0;
-//! -fallbackfee default
-static const CAmount DEFAULT_FALLBACK_FEE = 0;
+//! -fallbackfee default. Unlike Bitcoin Core (which disables the fallback fee
+//! on mainnet), qbit defaults to the minimum relay fee rate so that wallets can
+//! create transactions while the chain is young and the fee estimator has no
+//! data (an empty mempool yields no estimates, see GetMinimumFeeRate()).
+//! GetMinimumFeeRate() raises the fallback to this node's minimum relay fee,
+//! -mintxfee and mempool minimum fee, but peers with a stricter policy or a
+//! congested network may still not relay or mine the transaction until its fee
+//! is bumped. Organic fee estimates take precedence once available.
+//! Set -fallbackfee=0 to restore the upstream behavior of failing instead.
+static const CAmount DEFAULT_FALLBACK_FEE = DEFAULT_MIN_RELAY_TX_FEE;
 //! -discardfee default
 static const CAmount DEFAULT_DISCARD_FEE = 10000;
 //! -mintxfee default
@@ -492,7 +506,30 @@ private:
     void SetWalletFlagWithDB(WalletBatch& batch, uint64_t flags);
 
     //! Cache of descriptor ScriptPubKeys used for IsMine. Maps ScriptPubKey to set of spkms
-    std::unordered_map<CScript, std::vector<ScriptPubKeyMan*>, SaltedSipHasher> m_cached_spks;
+    std::unordered_map<CScript, std::vector<ScriptPubKeyMan*>, SaltedSipHasher> m_cached_spks GUARDED_BY(cs_wallet);
+
+    enum class TopUpPublicationState {
+        STAGED,
+        COMMITTING,
+        COMMITTED_PENDING_CACHE,
+    };
+    struct TopUpPublicationRecord {
+        ScriptPubKeyMan* spkm;
+        std::weak_ptr<void> lifetime;
+        std::set<CScript> scripts;
+        TopUpPublicationState state{TopUpPublicationState::STAGED};
+    };
+
+    // Exact scripts crossing the database-commit-to-wallet-cache handoff. This
+    // mutex is never held while acquiring cs_wallet or a descriptor lock.
+    mutable Mutex m_topup_pub_mutex;
+    mutable std::condition_variable_any m_topup_pub_cv;
+    TopUpPublicationId m_next_topup_pub_id GUARDED_BY(m_topup_pub_mutex){1};
+    std::unordered_map<TopUpPublicationId, TopUpPublicationRecord> m_topup_publications GUARDED_BY(m_topup_pub_mutex);
+    std::unordered_map<CScript, std::vector<TopUpPublicationId>, SaltedSipHasher> m_topup_publications_by_script GUARDED_BY(m_topup_pub_mutex);
+
+    void EraseTopUpPublication(TopUpPublicationId id) EXCLUSIVE_LOCKS_REQUIRED(m_topup_pub_mutex);
+    std::vector<ScriptPubKeyMan*> GetCommittedTopUpScriptPubKeyMans(const CScript& script) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     //! Set of both spent and unspent transaction outputs owned by this wallet
     std::unordered_map<COutPoint, WalletTXO, SaltedOutpointHasher> m_txos GUARDED_BY(cs_wallet);
@@ -620,6 +657,8 @@ public:
     bool IsTxImmatureCoinBase(const CWalletTx& wtx) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     bool IsSpent(const COutPoint& outpoint) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    //! Wallet transactions that spend outpoint, by the definition IsSpent() uses
+    std::set<Txid> GetSpendingTxs(const COutPoint& outpoint) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     // Whether this or any known scriptPubKey with the same single key has been spent.
     bool IsSpentKey(const CScript& scriptPubKey) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
@@ -761,7 +800,8 @@ public:
                   bool bip32derivs = true,
                   size_t* n_signed = nullptr,
                   bool finalize = true,
-                  const PQCSignatureCounterObserver& pqc_counter_observer = {}) const;
+                  const PQCSignatureCounterObserver& pqc_counter_observer = {},
+                  const SigningProgressCallback& progress_callback = {}) const;
 
     /**
      * Submit the transaction to the node's mempool and then relay to peers.
@@ -799,6 +839,7 @@ public:
      /** If the cost to spend a change output at this feerate is greater than the value of the
       * output itself, just drop it to fees. */
     CFeeRate m_discard_rate{DEFAULT_DISCARD_FEE};
+    bool m_discard_rate_set{false}; //!< true if -discardfee was set; see GetDiscardRate()
 
     /** When the actual feerate is less than the consolidate feerate, we will tend to make transactions which
      * consolidate inputs. When the actual feerate is greater than the consolidate feerate, we will tend to make
@@ -821,6 +862,26 @@ public:
 
     /** Number of pre-generated keys/scripts by each spkm (part of the look-ahead process, used to detect payments) */
     int64_t m_keypool_size{DEFAULT_KEYPOOL_SIZE};
+    // Optional deterministic test hook invoked after descriptor persistence
+    // and before script cache publication takes cs_wallet. Configure it before
+    // starting concurrent wallet work and leave it unchanged until that work
+    // completes.
+    std::function<void(const std::set<CScript>&, ScriptPubKeyMan*)> m_before_script_pub_key_cache_publish;
+    // Optional deterministic test hook invoked by EncryptWallet after it has
+    // derived the encryption key and before it takes the wallet locks. Same
+    // configuration rules as m_before_script_pub_key_cache_publish.
+    std::function<void()> m_before_encrypt_wallet_locks;
+    // Optional deterministic test hook invoked by EncryptWallet once its
+    // database transaction has begun. Same configuration rules as
+    // m_before_script_pub_key_cache_publish.
+    std::function<void()> m_after_encrypt_wallet_txn_begin;
+    // Optional deterministic test hook invoked by send and sendall after they
+    // sign a transaction and before they commit it. send holds no wallet lock
+    // there; sendall holds cs_wallet. Same configuration rules as
+    // m_before_script_pub_key_cache_publish.
+    std::function<void()> m_before_send_commit;
+    bool m_deferred_create_keypool_top_up_scheduled GUARDED_BY(cs_wallet){false};
+    bool m_deferred_create_keypool_top_up_reschedule_requested GUARDED_BY(cs_wallet){false};
     bool m_p2mr_receive_keypool_refill_scheduled GUARDED_BY(cs_wallet){false};
     bool m_p2mr_change_keypool_refill_scheduled GUARDED_BY(cs_wallet){false};
 
@@ -930,6 +991,9 @@ public:
 
     //! Get wallet transactions that conflict with given transaction (spend same outputs)
     std::set<Txid> GetConflicts(const Txid& txid) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+
+    //! Get wallet transactions that spend the given output
+    std::set<Txid> GetWalletSpenders(const COutPoint& outpoint) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     //! Check if a given transaction has any of its outputs spent by another transaction in the wallet
     bool HasWalletSpend(const CTransactionRef& tx) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
@@ -1050,8 +1114,8 @@ public:
     };
 
     //! Returns all unique ScriptPubKeyMans in m_internal_spk_managers and m_external_spk_managers
-    std::set<ScriptPubKeyMan*> GetActiveScriptPubKeyMans() const;
-    bool IsActiveScriptPubKeyMan(const ScriptPubKeyMan& spkm) const;
+    std::set<ScriptPubKeyMan*> GetActiveScriptPubKeyMans() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool IsActiveScriptPubKeyMan(const ScriptPubKeyMan& spkm) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     //! Returns all unique ScriptPubKeyMans
     std::set<ScriptPubKeyMan*> GetAllScriptPubKeyMans() const;
@@ -1060,7 +1124,7 @@ public:
     ScriptPubKeyMan* GetScriptPubKeyMan(const OutputType& type, bool internal) const;
 
     //! Get all the ScriptPubKeyMans for a script
-    std::set<ScriptPubKeyMan*> GetScriptPubKeyMans(const CScript& script) const;
+    std::set<ScriptPubKeyMan*> GetScriptPubKeyMans(const CScript& script) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     //! Get the ScriptPubKeyMan by id
     ScriptPubKeyMan* GetScriptPubKeyMan(const uint256& id) const;
 
@@ -1102,7 +1166,7 @@ public:
     void WriteBestBlock() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     //! Connect the signals from ScriptPubKeyMans to the signals in CWallet
-    void ConnectScriptPubKeyManNotifiers();
+    void ConnectScriptPubKeyManNotifiers() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     //! Instantiate a descriptor ScriptPubKeyMan from the WalletDescriptor and load it
     DescriptorScriptPubKeyMan& LoadDescriptorScriptPubKeyMan(uint256 id, WalletDescriptor& desc);
@@ -1166,9 +1230,13 @@ public:
     bool CanGrindR() const;
 
     //! Add scriptPubKeys for this ScriptPubKeyMan into the scriptPubKey cache
-    void CacheNewScriptPubKeys(const std::set<CScript>& spks, ScriptPubKeyMan* spkm);
+    void CacheNewScriptPubKeys(const std::set<CScript>& spks, ScriptPubKeyMan* spkm) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
-    void TopUpCallback(const std::set<CScript>& spks, ScriptPubKeyMan* spkm) override;
+    TopUpPublicationId StageTopUpPublication(const std::set<CScript>& spks, ScriptPubKeyMan* spkm, std::weak_ptr<void> lifetime) override;
+    void BeginTopUpCommit(TopUpPublicationId id) override;
+    void FinishTopUpCommit(TopUpPublicationId id, bool committed) override;
+    void CancelTopUpPublication(TopUpPublicationId id) override;
+    bool TopUpCallback(const std::set<CScript>& spks, ScriptPubKeyMan* spkm, TopUpPublicationId id = INVALID_TOPUP_PUBLICATION_ID) override;
 
     //! Retrieve the xpubs in use by the active descriptors
     std::set<CExtPubKey> GetActiveHDPubKeys() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);

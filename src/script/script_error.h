@@ -86,6 +86,7 @@ typedef enum ScriptError_t
     SCRIPT_ERR_P2MR_SIG,
     SCRIPT_ERR_P2MR_SIG_HASHTYPE,
     SCRIPT_ERR_P2MR_CHECKSIG,
+    SCRIPT_ERR_P2MR_STACK_BYTES,
     SCRIPT_ERR_TEMPLATE_MISMATCH,
 
     /* Constant scriptCode */

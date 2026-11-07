@@ -42,6 +42,8 @@ pub enum PqcError {
     BadSignature,
     NotImplemented,
     SigningLimitExceeded,
+    /// A C error code without a dedicated variant, such as
+    /// `BITCOIN_PQC_ERROR_OUT_OF_MEMORY` (-6).
     Other(i32),
 }
 
@@ -744,5 +746,21 @@ pub fn test_seed_keypair_with_prefilled_root_tail(
         ))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn out_of_memory_code_maps_to_other() {
+        let code = bitcoin_pqc_error_t_BITCOIN_PQC_ERROR_OUT_OF_MEMORY;
+
+        assert_eq!(map_error(code), Err(PqcError::Other(code)));
+        assert_eq!(
+            PqcError::Other(code).to_string(),
+            format!("Unexpected error code: {code}")
+        );
     }
 }
