@@ -1051,6 +1051,77 @@ def validate_against_base_policy(
     return f"follows {base_projection['policy_id']}"
 
 
+KEYS_MD_BEGIN = "<!-- BEGIN generated from keys.json by ci/release/validate_key_metadata.py --write-keys-md -->"
+KEYS_MD_END = "<!-- END generated from keys.json -->"
+
+
+def render_keys_md_tables(data: dict[str, Any]) -> str:
+    """KEYS.md's release-line and signer tables, as keys.json sets them."""
+
+    def cell(value: object) -> str:
+        return ", ".join(str(item) for item in value) if isinstance(value, list) else str(value)
+
+    lines = [
+        KEYS_MD_BEGIN,
+        "",
+        "Current release-line policy",
+        "---------------------------",
+        "",
+        "| Release Line | Active Signers | Release Signatures | Builder Attestations | Later Policy Changes |",
+        "|--------------|----------------|--------------------|----------------------|----------------------|",
+    ]
+    for line, settings in data["release_lines"].items():
+        lines.append(
+            f"| {line} | {settings['active_signer_set_size']} | {settings['release_signature_quorum']} | "
+            f"{settings['builder_attestation_quorum']} | {settings['policy_change_quorum']} |"
+        )
+    lines += [
+        "",
+        "Current signers",
+        "---------------",
+        "",
+        "| Signer Alias | Status | Signing Fingerprint | Public Certificate | Release Line | Capabilities | Artifact Sets | Created | First Release |",
+        "|--------------|--------|---------------------|--------------------|--------------|--------------|---------------|---------|---------------|",
+    ]
+    for signer in data["signers"]:
+        fields = ("alias", "status", "signing_fingerprint", "public_key_file", "release_lines", "capabilities", "artifact_sets", "created", "first_release")
+        lines.append("| " + " | ".join(cell(signer.get(field, "")) for field in fields) + " |")
+    lines += ["", KEYS_MD_END]
+    return "\n".join(lines) + "\n"
+
+
+def keys_md_section(text: str, path: Path) -> tuple[int, int]:
+    if text.count(KEYS_MD_BEGIN) != 1 or text.count(KEYS_MD_END) != 1:
+        raise MetadataError(f"{path}: expected one generated section from keys.json")
+    start = text.index(KEYS_MD_BEGIN)
+    end = text.index(KEYS_MD_END) + len(KEYS_MD_END) + 1
+    if end <= start:
+        raise MetadataError(f"{path}: malformed generated section")
+    return start, end
+
+
+def check_keys_md(keys_dir: Path, data: dict[str, Any]) -> None:
+    """KEYS.md, if present, shows exactly keys.json's tables."""
+
+    path = keys_dir / "KEYS.md"
+    if not path.exists():
+        return
+    text = path.read_text(encoding="utf8")
+    start, end = keys_md_section(text, path)
+    if text[start:end] != render_keys_md_tables(data):
+        raise MetadataError(
+            f"{path}: its tables do not match keys.json; regenerate them with "
+            "ci/release/validate_key_metadata.py --write-keys-md"
+        )
+
+
+def write_keys_md(keys_dir: Path, data: dict[str, Any]) -> None:
+    path = keys_dir / "KEYS.md"
+    text = path.read_text(encoding="utf8")
+    start, end = keys_md_section(text, path)
+    path.write_text(text[:start] + render_keys_md_tables(data) + text[end:], encoding="utf8")
+
+
 def compare_operator_mirror(canonical: dict[str, Any], mirror: dict[str, Any]) -> None:
     if canonical != mirror:
         raise MetadataError(
@@ -1071,6 +1142,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--approval-dir-mirror", type=Path)
     parser.add_argument("--gpg", default=shutil.which("gpg") or "gpg")
     parser.add_argument("--require-public-key-files", action="store_true")
+    parser.add_argument(
+        "--check-keys-md",
+        action="store_true",
+        help="Require KEYS.md, when present, to show exactly keys.json's generated tables.",
+    )
+    parser.add_argument(
+        "--write-keys-md",
+        action="store_true",
+        help="Regenerate the tables in the policy directory's KEYS.md from keys.json, then exit.",
+    )
     parser.add_argument(
         "--verify-public-key-certificates",
         action="store_true",
@@ -1114,6 +1195,10 @@ def main() -> int:
         reject_symlinked_input(args.operator_keys_dir, label="--operator-keys-dir")
         canonical_policy = args.operator_policy.resolve()
         canonical_keys_dir = args.operator_keys_dir.resolve()
+        if args.write_keys_md:
+            write_keys_md(canonical_keys_dir, load_json(canonical_policy))
+            print(f"Regenerated {canonical_keys_dir / 'KEYS.md'} from keys.json")
+            return 0
         require_files = args.require_public_key_files or args.verify_public_key_certificates
         base_keys_dir = None
         if args.base_operator_keys_dir is not None:
@@ -1135,6 +1220,8 @@ def main() -> int:
             gpg=args.gpg,
             validate_transition=base_keys_dir is None and not args.skip_policy_transition_validation,
         )
+        if args.check_keys_md:
+            check_keys_md(canonical_keys_dir, load_json(canonical_policy))
         if args.verify_public_key_certificates:
             validate_policy_file_set(canonical_projection, canonical_keys_dir)
             verify_public_key_certificates(canonical_projection, canonical_keys_dir, args.gpg)

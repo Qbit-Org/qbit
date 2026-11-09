@@ -35,6 +35,9 @@ from test_classifier_ci_contract import REPO_ROOT, WorkflowLoader, run_bash_step
 
 import classify_merge_profile  # noqa: E402
 
+sys.path.insert(0, str(REPO_ROOT / "ci" / "release"))
+import validate_key_metadata  # noqa: E402
+
 WORKFLOW = REPO_ROOT / ".github/workflows/required-merge-gate.yml"
 JOB = "operator-key-policy-validation"
 STEP = "Validate current policy and transition approvals"
@@ -332,8 +335,14 @@ class KeyPolicyGateContractTest(unittest.TestCase):
 
     # Policy changes ------------------------------------------------------
 
+    def write_keys_md(self, data: bytes | None = None) -> Path:
+        path = self.repo / KEYS / "KEYS.md"
+        policy = json.loads(data or (self.repo / KEYS / "keys.json").read_bytes())
+        path.write_text("Signer index.\n\n" + validate_key_metadata.render_keys_md_tables(policy), encoding="utf8")
+        return path
+
     def test_unchanged_policy_passes(self) -> None:
-        (self.repo / KEYS / "KEYS.md").write_text("Signer index.\n", encoding="utf8")
+        self.write_keys_md()
         self.commit("document the signers")
         self.assert_accepted("Base policy: unchanged")
 
@@ -696,6 +705,99 @@ class KeyPolicyGateContractTest(unittest.TestCase):
         self.land()
         self.replace_certificate("operator-02", second_only)
         self.assert_refused("certificate change removes signature records of operator-02")
+
+    # Tree shape and case-insensitive readers ----------------------------
+
+    def splice_tree(self, tree: str, name: str, oid: str, *, duplicate: str | None = None) -> str:
+        """A copy of `tree` with entry `name` pointing at `oid`; with `duplicate`, a second entry of that name."""
+
+        raw = b""
+        for line in self.git("ls-tree", tree).splitlines():
+            meta, entry = line.split("\t", 1)
+            mode, _type, entry_oid = meta.split()
+            target = oid if entry == name else entry_oid
+            for blob in ([duplicate, target] if duplicate and entry == name else [target]):
+                raw += f"{mode.lstrip('0')} {entry}".encode() + b"\0" + bytes.fromhex(blob)
+        result = subprocess.run(
+            ["git", "hash-object", "-t", "tree", "-w", "--literally", "--stdin"],
+            cwd=self.repo, input=raw, capture_output=True, check=True,
+        )
+        return result.stdout.decode().strip()
+
+    def test_duplicate_tree_entries_are_refused(self) -> None:
+        other = self.policy_data(1, ["operator-04", "operator-05", "operator-06"], None, policy_id="qbit-release-keys-testnet-900001")
+        other_blob = subprocess.run(
+            ["git", "hash-object", "-w", "--stdin"], cwd=self.repo,
+            input=(json.dumps(other, indent=2) + "\n").encode(), capture_output=True, check=True,
+        ).stdout.decode().strip()
+        good_blob = self.git("rev-parse", f"HEAD:{KEYS}/keys.json")
+        keys_tree = self.splice_tree(self.git("rev-parse", f"HEAD:{KEYS}"), "keys.json", good_blob, duplicate=other_blob)
+        contrib_keys = self.splice_tree(self.git("rev-parse", "HEAD:contrib/keys"), "operator-keys", keys_tree)
+        contrib = self.splice_tree(self.git("rev-parse", "HEAD:contrib"), "keys", contrib_keys)
+        root = self.splice_tree(self.git("rev-parse", "HEAD^{tree}"), "contrib", contrib)
+        self.git("update-ref", "HEAD", self.git("commit-tree", root, "-p", self.base, "-m", "two keys.json entries"))
+        self.assert_refused(f"HEAD:{KEYS}/keys.json has more than one tree entry")
+
+        contrib = self.splice_tree(self.git("rev-parse", f"{self.base}:contrib"), "keys", self.git("rev-parse", f"{self.base}:contrib/keys"), duplicate=self.git("rev-parse", f"{self.base}:contrib/keys"))
+        root = self.splice_tree(self.git("rev-parse", f"{self.base}^{{tree}}"), "contrib", contrib)
+        self.git("update-ref", "HEAD", self.git("commit-tree", root, "-p", self.base, "-m", "two contrib/keys entries"))
+        self.assert_refused("HEAD:contrib/keys has more than one tree entry")
+
+    def test_case_variants_of_the_policy_path_are_refused(self) -> None:
+        for variant, expected in (
+            ("contrib/Keys/operator-keys/keys.json", "names contrib/keys with other letters"),
+            ("contrib/keys/Operator-Keys/keys.json", "names contrib/keys/operator-keys with other letters"),
+            ("contrib/key\u017f/notes.md", "names contrib/keys with other letters"),
+            (f"{KEYS}/Keys.json", "are the same file on case-insensitive checkouts"),
+            (".GitAttributes", "names .gitattributes with other letters"),
+        ):
+            with self.subTest(variant=variant):
+                self.git("checkout", "--quiet", "-B", f"variant-{len(variant)}-{variant[-6:].encode().hex()}", self.base)
+                path = self.repo / variant
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}\n", encoding="utf8")
+                self.commit(f"add {variant}")
+                self.assertEqual(self.changed_paths()["touched_operator_keys"], "true")
+                self.assert_refused(expected)
+
+    def test_attributes_are_checked_as_case_insensitive_checkouts_read_them(self) -> None:
+        (self.repo / ".gitattributes").write_text("CONTRIB/KEYS/OPERATOR-KEYS/public-keys/** export-ignore\n", encoding="utf8")
+        self.commit("attributes in other letters")
+        self.assert_refused("has the export-ignore attribute (set) with core.ignorecase=true")
+
+    def test_an_attribute_for_a_future_approvals_directory_says_how_to_fix_it(self) -> None:
+        (self.repo / ".gitattributes").write_text(
+            f"{KEYS}/approvals/qbit-release-keys-testnet-000003/** text eol=crlf\n", encoding="utf8"
+        )
+        self.commit("attributes")
+        self.land()
+        self.write_policy(
+            3,
+            ["operator-01", "operator-04", "operator-05"],
+            previous=self.policies[2],
+            approvers=["operator-01", "operator-04"],
+        )
+        self.commit("sequence 3 policy")
+        self.assert_refused("No .gitattributes rule may match files under contrib/keys/operator-keys: remove or narrow the rule")
+
+    def test_keys_md_must_match_keys_json(self) -> None:
+        self.write_keys_md()
+        self.commit("KEYS.md")
+        self.land()
+        path = self.repo / KEYS / "KEYS.md"
+        path.write_text(path.read_text(encoding="utf8").replace("| testnet | 3 | 2 |", "| testnet | 3 | 1 |"), encoding="utf8")
+        self.commit("KEYS.md shows another quorum")
+        self.assert_refused("its tables do not match keys.json")
+
+    def test_a_policy_change_without_signatures_is_refused(self) -> None:
+        self.write_policy(3, ["operator-01", "operator-04", "operator-05"], previous=self.policies[2], approvers=[])
+        approval_dir = self.repo / KEYS / "approvals" / "qbit-release-keys-testnet-000003"
+        approval_dir.mkdir(parents=True)
+        (approval_dir / "approval-note.md").write_text("Policy change approval.\n", encoding="utf8")
+        policy = (self.repo / KEYS / "keys.json").read_bytes()
+        (approval_dir / "policy.SHA256").write_text(f"{hashlib.sha256(policy).hexdigest()}  keys.json\n", encoding="utf8")
+        self.commit("sequence 3 policy without approval signatures")
+        self.assert_refused("need 2 approval(s) from the previous active signer set")
 
     def write_raw_policy(self, data: dict, approvers: list[str]) -> None:
         keys_dir = self.repo / KEYS

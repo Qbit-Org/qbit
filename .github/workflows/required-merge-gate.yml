@@ -211,15 +211,25 @@ jobs:
               prefix="${prefix:+${prefix}/}${part}"
               entry="$(git ls-tree "${rev}" -- "${prefix}")"
               [[ -n "${entry}" ]] || return 0
+              if [[ "${entry}" == *$'\n'* ]]; then
+                echo "::error::${rev}:${prefix} has more than one tree entry"
+                return 1
+              fi
               if [[ "${entry}" != "040000 tree "* ]]; then
                 echo "::error::${rev}:${prefix} is not a directory: ${entry%%$'\t'*}"
                 return 1
               fi
             done
             git ls-tree -r -z "${rev}" -- "${canonical_dir}" > "${dest}.list"
+            local -A seen=()
             while IFS= read -r -d '' entry; do
               meta="${entry%%$'\t'*}"
               path="${entry#*$'\t'}"
+              if [[ -n "${seen["${path}"]+set}" ]]; then
+                echo "::error::${rev}:${path} has more than one tree entry"
+                return 1
+              fi
+              seen["${path}"]=1
               read -r mode type oid <<< "${meta}"
               if [[ "${mode}" != "100644" || "${type}" != "blob" ]]; then
                 echo "::error::${rev}:${path} is not a regular file (mode ${mode})"
@@ -232,26 +242,69 @@ jobs:
             # Checkout and archive attributes would make other readers of the
             # head see other bytes than these objects: none may apply to the
             # policy. The base's own attributes do not matter here.
+            # Checked as case-sensitive and case-insensitive (macOS, Windows) clones read them.
             [[ "${check_attributes}" == "check-attributes" ]] || return 0
-            git ls-tree -r -z --name-only "${rev}" -- "${canonical_dir}" \
-              | git check-attr --source "${rev}" -z --stdin \
-                  text eol crlf filter ident working-tree-encoding export-ignore export-subst \
-              > "${dest}.attributes"
-            while IFS= read -r -d '' path && IFS= read -r -d '' attribute && IFS= read -r -d '' value; do
-              if [[ "${value}" != "unspecified" ]]; then
-                echo "::error::${rev}:${path} has the ${attribute} attribute (${value})"
-                return 1
-              fi
-            done < "${dest}.attributes"
+            local ignorecase
+            for ignorecase in false true; do
+              git ls-tree -r -z --name-only "${rev}" -- "${canonical_dir}" \
+                | git -c core.ignorecase="${ignorecase}" check-attr --source "${rev}" -z --stdin \
+                    text eol crlf filter ident working-tree-encoding export-ignore export-subst \
+                > "${dest}.attributes"
+              while IFS= read -r -d '' path && IFS= read -r -d '' attribute && IFS= read -r -d '' value; do
+                if [[ "${value}" != "unspecified" ]]; then
+                  echo "::error::${rev}:${path} has the ${attribute} attribute (${value}) with core.ignorecase=${ignorecase}. No .gitattributes rule may match files under ${canonical_dir}: remove or narrow the rule that does (git check-attr -a -- '${path}' names it)."
+                  return 1
+                fi
+              done < "${dest}.attributes"
+            done
           }
           extract_policy HEAD "${work}/head" check-attributes
           extract_policy "${base}" "${work}/base" no-attributes
+
+          # A path that equals the policy path, or .gitattributes, only after
+          # Unicode compatibility normalisation and case folding is the same
+          # file on case-insensitive checkouts: the head may not have one.
+          git ls-tree -r -z --name-only --full-tree HEAD > "${work}/head-paths"
+          python3 - "${work}/head-paths" "${canonical_dir}" <<'PY'
+          import sys
+          import unicodedata
+
+          def fold(text: str) -> str:
+              return unicodedata.normalize("NFKC", text).casefold()
+
+          listing, canonical = sys.argv[1], sys.argv[2]
+          names = open(listing, "rb").read().split(b"\0")
+          paths = [name.decode("utf8", errors="surrogateescape") for name in names if name]
+          parts = canonical.split("/")
+          guarded = {fold("/".join(parts[:depth])): "/".join(parts[:depth]) for depth in range(1, len(parts) + 1)}
+          problems = []
+          seen = {}
+          for path in paths:
+              components = path.split("/")
+              for depth in range(1, len(components) + 1):
+                  prefix = "/".join(components[:depth])
+                  expected = guarded.get(fold(prefix))
+                  if expected is not None and prefix != expected:
+                      problems.append(f"{path} names {expected} with other letters")
+                      break
+              if any(fold(part) == ".gitattributes" and part != ".gitattributes" for part in components):
+                  problems.append(f"{path} names .gitattributes with other letters")
+              if path.startswith(canonical + "/"):
+                  key = fold(path)
+                  if key in seen and seen[key] != path:
+                      problems.append(f"{path} and {seen[key]} are the same file on case-insensitive checkouts")
+                  seen.setdefault(key, path)
+          for problem in problems:
+              print(f"::error::{problem}")
+          sys.exit(1 if problems else 0)
+          PY
 
           head_args=(
             --operator-policy "${work}/head/keys.json"
             --operator-keys-dir "${work}/head"
             --require-public-key-files
             --verify-public-key-certificates
+            --check-keys-md
             --base-operator-keys-dir "${work}/base"
           )
           # Once any first-parent ancestor of the base had a policy, the base must have one.

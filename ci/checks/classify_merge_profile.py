@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import unicodedata
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
@@ -58,11 +59,25 @@ OPERATOR_KEYS_PREFIXES = ("contrib/keys/operator-keys/",)
 OPERATOR_KEYS_PATH_ENTRIES = frozenset({"contrib", "contrib/keys", "contrib/keys/operator-keys"})
 
 
+def fold_path(path: str) -> str:
+    """A path as case-insensitive checkouts compare it: NFKC-normalised and case-folded."""
+
+    return unicodedata.normalize("NFKC", path).casefold()
+
+
 def touches_operator_keys(path: str) -> bool:
+    # Folded, so that case and Unicode-compatibility variants of the policy
+    # path or of .gitattributes, which case-insensitive checkouts treat as
+    # the same file, are routed too.
+    folded = fold_path(path)
+    entries = {fold_path(entry): entry for entry in OPERATOR_KEYS_PATH_ENTRIES}
+    components = path.split("/")
+    prefixes = ["/".join(components[:depth]) for depth in range(1, len(components) + 1)]
     return (
-        any(path.startswith(prefix) for prefix in OPERATOR_KEYS_PREFIXES)
-        or path in OPERATOR_KEYS_PATH_ENTRIES
-        or PurePosixPath(path).name == ".gitattributes"
+        any(folded.startswith(fold_path(prefix)) for prefix in OPERATOR_KEYS_PREFIXES)
+        or folded in entries
+        or any(fold_path(prefix) in entries and prefix != entries[fold_path(prefix)] for prefix in prefixes)
+        or fold_path(PurePosixPath(path).name) == ".gitattributes"
     )
 
 

@@ -98,6 +98,7 @@ class GoodSignaturesTest(unittest.TestCase):
             ("no GOODSIG", validsig()),
             ("no VALIDSIG", goodsig()),
             ("VALIDSIG without its primary key", goodsig() + validsig(primary=None)),
+            ("two GOODSIG lines for one signature", goodsig() + goodsig() + validsig()),
         ):
             with self.subTest(name=name):
                 self.assertEqual(validate_key_metadata.good_signatures("[GNUPG:] NEWSIG\n" + status), [])

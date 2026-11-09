@@ -96,6 +96,20 @@ class ClassifyMergeProfileTest(unittest.TestCase):
         outputs = classify_merge_profile.github_outputs(self.classify(["contrib/keysmith/README.md"]))
         self.assertEqual(outputs["touched_operator_keys"], "false")
 
+    def test_case_and_compatibility_variants_touch_operator_keys(self) -> None:
+        for path in (
+            "contrib/Keys/operator-keys/keys.json",
+            "contrib/keys/Operator-Keys/keys.json",
+            "contrib/key\u017f/operator-key\u017f/keys.json",
+            "contrib/key\u017f/notes.md",
+            "CONTRIB/KEYS",
+            ".GitAttributes",
+            "doc/.GITATTRIBUTES",
+        ):
+            with self.subTest(path=path):
+                outputs = classify_merge_profile.github_outputs(self.classify([path]))
+                self.assertEqual(outputs["touched_operator_keys"], "true")
+
     def test_quoted_and_nul_separated_paths_are_read_as_paths(self) -> None:
         name = "contrib/keys/operator-keys/approvals/qbit-release-keys-testnet-00000\u00e9/x.asc"
         quoted = '"contrib/keys/operator-keys/approvals/qbit-release-keys-testnet-00000\\303\\251/x.asc"'

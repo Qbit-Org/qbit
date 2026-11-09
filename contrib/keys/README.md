@@ -94,11 +94,17 @@ pull request's `contrib/keys/operator-keys` against the base branch's
 
 - Both policies are read from git objects, not from a checkout or an archive:
   every directory on the path must be a directory, and every file under it a
-  regular file (mode 100644), so symlinks are refused. No checkout or archive
-  attribute (`text`, `eol`, `filter`, `ident`, `export-ignore`, ...) may apply
-  to the policy's files at the head. The directory must hold exactly the
-  policy's files: `keys.json`, `KEYS.md`, the certificates `keys.json`
-  references, and `approvals/<policy-id>/` material.
+  regular file (mode 100644), so symlinks are refused, and no path may have
+  more than one tree entry. No checkout or archive attribute (`text`, `eol`,
+  `filter`, `ident`, `export-ignore`, ...) may apply to the policy's files at
+  the head, read with `core.ignorecase` both off and on. The head may not hold
+  a path that equals the policy path, or `.gitattributes`, only after Unicode
+  compatibility normalisation and case folding, since case-insensitive
+  checkouts would treat it as the same file. The directory must hold exactly
+  the policy's files: `keys.json`, `KEYS.md`, the certificates `keys.json`
+  references, and `approvals/<policy-id>/` material. `KEYS.md`'s tables are
+  generated from `keys.json` (`validate_key_metadata.py --write-keys-md`) and
+  must match it (`--check-keys-md`).
 - A `keys.json` that differs from the base's must follow the base policy
   directly: `policy_sequence` one more and `previous_policy_sha256` the base
   `keys.json` digest. Its approvals are verified against the base policy's
@@ -135,10 +141,24 @@ so signers whose signing keys share a primary key count once. Once a signing
 key expires its signatures stop counting, so refresh certificates before
 expiry (operator-01's primary key expires on 2028-06-07).
 
-Two further options for certificate-only changes are pending operator
-decisions: approvals by `policy_change_quorum` signers over a manifest of
-certificate digests, or schema v3 with a per-signer `public_key_sha256` in
-`keys.json`, which would make any certificate change a policy change.
+Known limits:
+
+- Approvals do not expire. They sign the new `keys.json` digest, which names
+  its predecessor, so a successor that the previous signers approved can land
+  for as long as the base still holds that predecessor. To withdraw consent,
+  land a different successor.
+- A `.gitattributes` rule written for files that do not exist yet, such as a
+  future `approvals/<policy-id>/`, lands without effect, and later blocks the
+  change that adds those files. The gate's error names the file and the
+  attribute; remove or narrow the rule (`git check-attr -a -- <path>` shows
+  it), since no attribute may apply under `contrib/keys/operator-keys`.
+
+Certificate-only changes, a changed certificate under an unchanged
+`keys.json`, need no separate approval: they are covered by the continuity
+checks above (same primary key, same subkey set, no removed signature
+records, approvals and verification with the base's certificates). Binding
+certificate digests into `keys.json` could be considered at a future policy
+rotation.
 
 **Old releases.** v1.0.0 was signed under `qbit-release-keys-mainnet-000002`,
 `keys.json` SHA-256
