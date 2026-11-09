@@ -22,6 +22,16 @@ from __future__ import annotations
 import os
 import sys
 
+# Run isolated (python3 -I -S -B): no PYTHONPATH, user or site packages, startup
+# hooks or bytecode. The tools need only the standard library. Started any
+# other way, the tool runs itself again isolated before importing anything
+# else; hooks the first interpreter already ran cannot be undone, which is why
+# the documented invocation passes the flags itself.
+if __name__ == "__main__" and not (sys.flags.isolated and sys.flags.no_site and sys.flags.dont_write_bytecode):
+    if not sys.executable:
+        sys.exit("ERR: cannot find the Python interpreter; run python3 -I -S -B " + __file__)
+    os.execv(sys.executable, [sys.executable, "-I", "-S", "-B", os.path.realpath(__file__), *sys.argv[1:]])
+
 # Never look modules up by name in this directory, so a stray sourceless .pyc
 # beside the tools cannot shadow a module, and never read or write __pycache__
 # in the trusted checkout.
@@ -264,7 +274,10 @@ def select_artifact_set(
         common.note(f"{artifact} attestation not counted: {item}")
     not_counted = sorted(set(verified) - set(counted))
     for alias in not_counted:
-        common.note(f"{artifact} attestation from {alias} verifies but does not cover the staged set")
+        common.note(
+            f"{artifact} attestation from {alias} verifies but validate_artifact_attestations did not count it "
+            "(it does not cover the staged set, or its primary key is already counted)"
+        )
     return SelectedArtifactSet(artifact=artifact, entries=entries, counted=counted, not_counted=not_counted)
 
 
@@ -308,24 +321,90 @@ def locate_builder_outputs(
     return found
 
 
+@dataclass(frozen=True)
+class PublisherChecks:
+    """Runs the publisher's validator commands exactly as publish-local-release.sh does."""
+
+    trusted: Any
+    tag: str
+    tag_target: str
+    release_line: str
+    guix_sigs_dir: Path
+    gpg: str
+
+    def run(self, script: str, args: list[str]) -> None:
+        # -E -s -S -B: no PYTHON* environment, user site, site hooks or bytecode.
+        # Not -I, which would also drop the script's own directory from
+        # sys.path: the validators import their siblings from the exported
+        # trusted ref.
+        command = [sys.executable, "-E", "-s", "-S", "-B", str(self.trusted.validators_dir / script), *args]
+        result = common.run_command(command)
+        if result.returncode != 0:
+            detail = " ".join((result.stderr or result.stdout).split())
+            raise common.ReleaseToolError(f"The publisher's {script} rejects this release: {detail}")
+
+    def key_policy_mirror(self) -> None:
+        self.run(
+            "validate_key_metadata.py",
+            [
+                "--operator-policy", str(self.trusted.policy_path),
+                "--operator-keys-dir", str(self.trusted.keys_dir),
+                "--operator-policy-mirror", str(self.guix_sigs_dir / "operator-keys" / "keys.json"),
+                "--operator-keys-dir-mirror", str(self.guix_sigs_dir / "operator-keys"),
+                "--skip-policy-transition-validation",
+                "--require-public-key-files",
+                "--gpg", self.gpg,
+            ],
+        )
+
+    def builder_attestations(self, artifacts_dir: Path, artifacts: list[str]) -> None:
+        args = [
+            "--artifacts-dir", str(artifacts_dir),
+            "--tag", self.tag,
+            "--source-root", str(self.trusted.root),
+            "--expected-tag-target", self.tag_target,
+            "--release-line", self.release_line,
+            "--guix-sigs-repo", str(self.guix_sigs_dir),
+            "--operator-key-policy", str(self.trusted.policy_path),
+            "--operator-keys-dir", str(self.trusted.keys_dir),
+            "--guix-operator-key-policy", str(self.guix_sigs_dir / "operator-keys" / "keys.json"),
+            "--guix-operator-keys-dir", str(self.guix_sigs_dir / "operator-keys"),
+            "--gpg", self.gpg,
+        ]
+        for artifact in artifacts:
+            args += ["--artifact", artifact]
+        self.run("validate_builder_attestations.py", args)
+
+
+def verify_tag_signature(validators: common.Validators, checks: PublisherChecks, release_policy: Any) -> None:
+    """The publisher's tag check: the annotated tag is signed by an active release key."""
+
+    vra = validators.release_artifacts
+    with common.temporary_gnupg_home("qbit-stage-tag-gnupg-") as home:
+        previous = os.getcwd()
+        try:
+            vra.import_release_keys(checks.gpg, home, checks.trusted.keys_dir, release_policy)
+            # verify_tag_signature runs git verify-tag in the current directory.
+            os.chdir(checks.trusted.root)
+            vra.verify_tag_signature(checks.gpg, home, checks.tag, release_policy)
+        except validators.errors as exc:
+            raise common.ReleaseToolError(str(exc)) from exc
+        finally:
+            os.chdir(previous)
+
+
 def verify_new_stage(
     validators: common.Validators,
     stage_dir: Path,
     entries: dict[str, str],
     *,
-    gpg: str,
-    gnupg_home: Path,
-    guix_sigs_dir: Path,
-    version: str,
+    checks: PublisherChecks,
     selections: list[SelectedArtifactSet],
-    policy: Any,
-    source_archive: Any,
     rules: NamingRules,
 ) -> None:
     """Re-check an assembled stage directory the way the publisher will."""
 
     vra = validators.release_artifacts
-    vba = validators.builder_attestations
     try:
         staged = vra.staged_file_names(stage_dir)
         parsed = vra.parse_sha256sums(stage_dir / common.CHECKSUMS_FILE)
@@ -342,20 +421,9 @@ def verify_new_stage(
             rules.allow_unsigned_platform_artifacts,
             rules.allow_codesigning_artifacts,
         )
-        for selection in selections:
-            vba.validate_artifact_attestations(
-                gpg=gpg,
-                gnupg_home=gnupg_home,
-                guix_sigs_repo=guix_sigs_dir,
-                version=version,
-                artifact=selection.artifact,
-                release_entries=vba.expected_release_entries(stage_dir, rules.tag, selection.artifact),
-                source_archive=source_archive,
-                builders=policy.active_builders,
-                quorum=policy.builder_attestation_quorum,
-            )
     except validators.errors as exc:
         raise common.ReleaseToolError(f"Assembled stage directory failed validation: {exc}") from exc
+    checks.builder_attestations(stage_dir, [selection.artifact for selection in selections])
 
 
 def check_existing_stage(
@@ -379,16 +447,21 @@ def check_existing_stage(
         ) from exc
 
 
-def write_sha256sums_only(destination: Path, sha256sums: bytes) -> str:
+def write_sha256sums_only(
+    destination: Path, sha256sums: bytes, checks: PublisherChecks, artifacts: list[str]
+) -> str:
     if destination.is_symlink() or (destination.exists() and not destination.is_file()):
         raise common.ReleaseToolError(f"--sha256sums-output must be a regular file path: {destination}")
-    if destination.exists():
-        if destination.read_bytes() != sha256sums:
-            raise common.ReleaseToolError(f"{destination} already exists with different content; refusing to overwrite it")
-        return "unchanged"
     with common.scratch_dir_beside(destination) as scratch:
         candidate = scratch / common.CHECKSUMS_FILE
         candidate.write_bytes(sha256sums)
+        checks.builder_attestations(scratch, artifacts)
+        if destination.exists():
+            if destination.read_bytes() != sha256sums:
+                raise common.ReleaseToolError(
+                    f"{destination} already exists with different content; refusing to overwrite it"
+                )
+            return "unchanged"
         common.publish_file_no_clobber(candidate, destination)
     return "created"
 
@@ -422,6 +495,7 @@ def assemble_stage(
             os.rename(scratch, stage_dir)
         except OSError as exc:
             raise common.ReleaseToolError(f"Cannot move the verified stage into {stage_dir}: {exc}") from exc
+        common.record_written(stage_dir)
 
 
 def reject_overlap(stage_dir: Path, protected: list[tuple[str, Path]]) -> None:
@@ -472,7 +546,8 @@ def main(argv: list[str] | None = None) -> int:
 def stage(args: argparse.Namespace) -> int:
     if not TAG_RE.fullmatch(args.tag):
         raise common.ReleaseToolError(f"--tag must be a safe v-prefixed release tag: {args.tag!r}")
-    with common.open_trusted_release(Path(__file__), args.trusted_release_ref, git=args.git) as checkout:
+    common.note_non_default_gpg(args.gpg)
+    with common.open_trusted_release(Path(__file__), args.trusted_release_ref, git=common.GIT) as checkout:
         validators = checkout.validators
         vra = validators.release_artifacts
         vba = validators.builder_attestations
@@ -496,13 +571,13 @@ def stage(args: argparse.Namespace) -> int:
             raise common.ReleaseToolError(str(exc)) from exc
 
         tag_target = common.git_output(
-            args.git,
+            common.GIT,
             checkout.root,
             ["rev-parse", "--verify", f"refs/tags/{args.tag}^{{commit}}"],
             action=f"resolve release tag {args.tag} in the trusted qbit checkout",
         ).strip()
         ancestor = common.run_command(
-            [args.git, "-C", str(checkout.root), "merge-base", "--is-ancestor", tag_target, checkout.ref]
+            [common.GIT, "-C", str(checkout.root), "merge-base", "--is-ancestor", tag_target, checkout.ref]
         )
         if ancestor.returncode != 0:
             raise common.ReleaseToolError(
@@ -510,13 +585,28 @@ def stage(args: argparse.Namespace) -> int:
             )
         try:
             source_archive = vba.reconstruct_canonical_source_archive(
-                git=args.git,
+                git=common.GIT,
                 source_root=checkout.root,
                 tag=args.tag,
                 expected_tag_target=tag_target,
             )
         except vba.BuilderValidationError as exc:
             raise common.ReleaseToolError(str(exc)) from exc
+
+        # The checks the publisher makes at publication that need nothing
+        # staged: the qbit-guix.sigs key-policy mirror and the tag signature.
+        # They run first, so a release that cannot publish fails before
+        # anyone signs.
+        checks = PublisherChecks(
+            trusted=checkout,
+            tag=args.tag,
+            tag_target=tag_target,
+            release_line=args.release_line,
+            guix_sigs_dir=guix_sigs_dir,
+            gpg=args.gpg,
+        )
+        checks.key_policy_mirror()
+        verify_tag_signature(validators, checks, release_policy)
 
         stage_dir = None
         output_dirs: list[Path] = []
@@ -567,7 +657,7 @@ def stage(args: argparse.Namespace) -> int:
             sha256sums = render_sha256sums(entries)
 
             if stage_dir is None:
-                status = write_sha256sums_only(args.sha256sums_output, sha256sums)
+                status = write_sha256sums_only(args.sha256sums_output, sha256sums, checks, artifacts)
                 sha256sums_path = Path(os.path.abspath(args.sha256sums_output))
             else:
                 sha256sums_path = stage_dir / common.CHECKSUMS_FILE
@@ -583,13 +673,8 @@ def stage(args: argparse.Namespace) -> int:
                         entries,
                         sources,
                         sha256sums,
-                        gpg=args.gpg,
-                        gnupg_home=gnupg_home,
-                        guix_sigs_dir=guix_sigs_dir,
-                        version=version,
+                        checks=checks,
                         selections=selections,
-                        policy=builder_policy,
-                        source_archive=source_archive,
                         rules=rules,
                     )
                     status = "created"

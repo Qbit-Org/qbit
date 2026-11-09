@@ -14,10 +14,21 @@ Builder-host orchestration (driving `contrib/guix` on a builder, Apple SDK
 handling, pushing attestations to `qbit-guix.sigs`) is not part of these tools.
 
 The staging, signing and combining tools reuse the publisher's validators in
-`ci/release/`, so their outputs are exactly what `publish-local-release.sh`
-accepts: `validate_builder_attestations.py` decides which builder attestations
-count, and `validate_release_artifacts.py` decides which attested files are
-public release assets and parses every `SHA256SUMS`.
+`ci/release/`: `validate_builder_attestations.py` decides which builder
+attestations count, and `validate_release_artifacts.py` decides which attested
+files are public release assets, parses every `SHA256SUMS` and decides which
+signatures count. Staging also runs the publisher's checks that need nothing
+staged, so a release that cannot be published fails before anyone signs: the
+qbit-guix.sigs key-policy mirror (`validate_key_metadata.py` and
+`validate_builder_attestations.py`, with the publisher's arguments) and the
+release tag's signature by an active release key. The publisher's GitHub checks
+(public refs, the GitHub-verified tag, release immutability) and the mainnet,
+testnet and P2MR posture checks still run only at publication.
+
+Run the tools as `python3 -I -S -B <tool>`: no `PYTHONPATH`, user or site
+packages, `sitecustomize`/`usercustomize` hooks or bytecode. They need only the
+standard library. Started any other way, a tool runs itself again with those
+flags, but startup hooks the first interpreter ran cannot be undone.
 
 ## Trust anchor
 
@@ -30,7 +41,16 @@ more than an empty `git status`:
 - `contrib/release-process` holds no untracked or ignored files, such as a
   stray `.pyc`;
 - the running tool and `release_staging_common.py` are byte-identical to their
-  blobs at the ref.
+  blobs at the ref (a checkout that converts line endings, for example with
+  `core.autocrlf=true`, is refused with a message saying so: use a checkout
+  made with `core.autocrlf=false`);
+- the checkout is not shallow.
+
+Every git command, the tools' and the validators', runs without the caller's
+`GIT_*` variables (`GIT_DIR`, `GIT_INDEX_FILE`, object and config overrides),
+with replace refs ignored (`GIT_NO_REPLACE_OBJECTS=1`) and without the graft
+file, so a local `git replace` or graft cannot make the tools read anything but
+the commit's own objects. `publish-local-release.sh` does the same.
 
 The validators (`ci/release/`) and the release key policy
 (`contrib/keys/operator-keys/`: `keys.json` and the public certificates) are not
@@ -38,9 +58,13 @@ read from the working tree at all. The tools export their blobs at the ref into
 a private scratch directory and load them from there, so index flags, ignored
 files or stale bytecode in the checkout cannot change them. The tools never
 import modules by name from their own directory and neither read nor write
-`__pycache__`. There is no option or environment variable that points them at
-another `keys.json`. `--release-line` (`testnet` or `mainnet`) is always
-required and selects the quorums and the eligible signers from that policy.
+`__pycache__`. No option or environment variable chooses which `keys.json`,
+certificates or validators are read. `--gpg` (default: `gpg` on `PATH`) chooses
+the gpg executable that makes every signature check and signature, so it
+decides whether signatures verify; it exists for tests, the qbit-tools wrappers
+never pass it, and the tools print a `note:` when it is not the default.
+`--release-line` (`testnet` or `mainnet`) is always required and selects the
+quorums and the eligible signers from that policy.
 
 ### One ref and one policy for a release
 
@@ -75,7 +99,7 @@ staging steps use their own pinned ref:
 ## Stage: `stage-release-artifacts.py`
 
 ```sh
-contrib/release-process/stage-release-artifacts.py \
+python3 -I -S -B contrib/release-process/stage-release-artifacts.py \
   --trusted-release-ref "$STAGING_REF" \
   --release-line mainnet \
   --tag v1.0.1 \
@@ -133,7 +157,7 @@ one `artifact` line per file, `counted_core`/`counted_photon`,
 ## Sign: `sign-sha256sums.py`
 
 ```sh
-contrib/release-process/sign-sha256sums.py \
+python3 -I -S -B contrib/release-process/sign-sha256sums.py \
   --trusted-release-ref "$STAGING_REF" \
   --release-line mainnet \
   --stage-dir ../staged-release \
@@ -150,14 +174,21 @@ active signers and `SHA256SUMS.asc`), and, when given, that `SHA256SUMS` has
 the expected digest. Pass the `sha256sums_sha256` from your own staging run so
 that you only sign the manifest you derived yourself.
 
-It reads `SHA256SUMS` once and checks the staged files, the expected digest and
-the signature against those same bytes, which it passes to the operator's
-existing GnuPG setup (`GNUPGHOME`, smartcard or keyring) on stdin:
+It reads `SHA256SUMS` once into a private copy (mode 0600, in a 0700 scratch
+directory) and checks the staged files, the expected digest and the signature
+against those same bytes. The copy's digest is checked again immediately before
+and after signing. It signs with the operator's existing GnuPG setup
+(`GNUPGHOME`, smartcard or keyring), leaving gpg's stdin on the terminal:
 
 ```sh
 gpg --batch --armor --detach-sign --digest-algo SHA256 \
-  --local-user '<signing_fingerprint>!' --output <scratch>/SHA256SUMS.<alias>.asc < <verified bytes>
+  --local-user '<signing_fingerprint>!' --output <scratch>/SHA256SUMS.<alias>.asc <scratch>/SHA256SUMS
 ```
+
+A curses or tty pinentry asks for the smartcard PIN on the terminal named by
+`GPG_TTY`. The tool passes `GPG_TTY` through and sets it from its own terminal
+when it is unset; set it yourself (`export GPG_TTY=$(tty)`) when stdin is not
+the terminal. GUI pinentries such as pinentry-mac do not need it.
 
 The `!` makes GnuPG use exactly the policy's signing subkey even if the
 certificate has a newer one. The tool never exports, imports or reads private
@@ -175,16 +206,17 @@ file that does not verify is never replaced.
 ## Combine: `combine-sha256sums-signatures.py`
 
 ```sh
-contrib/release-process/combine-sha256sums-signatures.py \
+python3 -I -S -B contrib/release-process/combine-sha256sums-signatures.py \
   --trusted-release-ref "$STAGING_REF" \
   --release-line mainnet \
   --stage-dir ../staged-release
 ```
 
 The directory must hold `SHA256SUMS` and the collected
-`SHA256SUMS.<alias>.asc` files, each a single ASCII-armored signature; any other
-`SHA256SUMS*` file stops the tool. `SHA256SUMS.asc` is the byte concatenation of
-the per-operator files in alias order, which is how v1.0.0's was made.
+`SHA256SUMS.<alias>.asc` files. Besides the artifacts `SHA256SUMS` lists (which
+need not be present), anything else stops the tool, including a temporary file
+left by a killed run. `SHA256SUMS.asc` is the byte concatenation of the
+per-operator files in sorted alias order, which is how v1.0.0's was made.
 
 The tool does not count signers itself. It accepts the set exactly when the
 publisher's release-signature check accepts it: each file is checked with
@@ -192,9 +224,11 @@ publisher's release-signature check accepts it: each file is checked with
 files and `SHA256SUMS.asc` with `verify_manifest_signatures`, both from
 `ci/release/validate_release_artifacts.py` at the trusted ref. Which signers
 count, and the line's `release_signature_quorum`, are therefore whatever that
-validator enforces. A test asserts that the tool and that check agree on the
-same inputs. The combined file is moved into place only after it passes. It
-does not hash the artifacts; the signing tool and the publisher do.
+validator enforces, and so is the signature format: armor the publisher
+accepts, CRLF line endings for example, combine and sign accept too. A test
+asserts that the tool and that check agree on the same inputs. The combined
+file is moved into place only after it passes. It does not hash the
+artifacts; the signing tool and the publisher do.
 
 An existing `SHA256SUMS.asc` is kept only if it is byte-identical
 (`status=unchanged`); otherwise the tool refuses to overwrite it.
@@ -203,18 +237,23 @@ The stage directory is then ready for `publish-local-release.sh`.
 
 ## Failure behaviour
 
-All outputs are assembled in a scratch directory next to their destination
-(`.<name>.tmp-*`) and moved into place only after they verify, never replacing
-an existing file. Where hard links are not available (exFAT media, some network
-filesystems, or a stage directory that is a mount point), the verified file is
-written to a temporary file in the destination directory, flushed to disk and
-renamed into place.
+All outputs are assembled in a private scratch directory next to their
+destination (`.<name>.tmp-*`) and moved into place only after they verify.
+Where hard links are not available (exFAT media, some network filesystems, or
+a stage directory that is a mount point), the verified file is written to a
+temporary file in the destination directory, flushed to disk and renamed into
+place. The destination is never partially written, but on that path refusing
+to overwrite is best effort: a file that appears between the check and the
+rename is replaced.
 
 SIGINT, SIGTERM, SIGHUP and I/O errors such as a full disk end a tool with a
-single `ERR:` line after its scratch copies are removed, so the destination
-never holds a partial `SHA256SUMS`, `SHA256SUMS.<alias>.asc` or `SHA256SUMS.asc`.
-Only SIGKILL or a power loss can leave a scratch directory behind; the next run
-lists it in a `note:` and leaves deleting it to you.
+single `ERR:` line. A signal that arrives while scratch is being removed waits
+until it is gone. The message says what is actually on disk: whether scratch
+was removed or which directory is left, and whether any output had already been
+written. SIGKILL or a power loss can leave a scratch directory next to the stage
+(the next run lists it in a `note:`) or a temporary file inside it; stage, sign
+and combine refuse a stage directory holding such a file, or any file it should
+not hold, and say which to delete.
 
 The stage directory gets the mode a plain `mkdir` would give it (0755 under the
 usual umask 022) and the files 0644, so a separate account can publish from
@@ -250,7 +289,7 @@ gh release download v1.0.0 --repo Qbit-Org/qbit --pattern 'SHA256SUMS*' --dir "$
 git clone --quiet https://github.com/Qbit-Org/qbit-guix.sigs "$work/qbit-guix.sigs"
 git -C "$work/qbit-guix.sigs" checkout --quiet --detach c18adfe292cf54cbee73ff86d0f1d3619a8ffea3
 
-"$QBIT"/contrib/release-process/stage-release-artifacts.py \
+python3 -I -S -B "$QBIT"/contrib/release-process/stage-release-artifacts.py \
   --trusted-release-ref "$REF" --release-line mainnet --tag v1.0.0 \
   --guix-sigs-dir "$work/qbit-guix.sigs" --allow-unsigned-platform-artifacts \
   --sha256sums-output "$work/derived/SHA256SUMS" > "$work/stage.out"
@@ -259,7 +298,7 @@ cmp "$work/derived/SHA256SUMS" "$work/published/SHA256SUMS"
 
 mkdir "$work/combined"
 cp "$work/published/SHA256SUMS" "$work"/published/SHA256SUMS.operator-0?.asc "$work/combined/"
-"$QBIT"/contrib/release-process/combine-sha256sums-signatures.py \
+python3 -I -S -B "$QBIT"/contrib/release-process/combine-sha256sums-signatures.py \
   --trusted-release-ref "$REF" --release-line mainnet --stage-dir "$work/combined" > "$work/combine.out"
 grep -Fx policy_sha256=f04ae262bd40cdda5c481fc18cef29b405878e66d06c33b49865ea42b38eaf9f "$work/combine.out"
 cmp "$work/combined/SHA256SUMS.asc" "$work/published/SHA256SUMS.asc"

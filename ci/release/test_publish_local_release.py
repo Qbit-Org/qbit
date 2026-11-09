@@ -387,6 +387,11 @@ with output_path.open("a", encoding="utf8") as output:
     output.write("__FILES__\n")
 with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
     log.write("release " + " ".join(args) + "\n")
+    log.write(
+        f"release-python ignore_environment={sys.flags.ignore_environment} "
+        f"no_user_site={sys.flags.no_user_site} no_site={sys.flags.no_site} "
+        f"dont_write_bytecode={sys.flags.dont_write_bytecode} script={__file__}\n"
+    )
 """,
         )
         self._write_executable(
@@ -671,6 +676,65 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Publisher checkout resolved", result.stderr)
+        self.assertFalse(self.validator_log.exists())
+
+    def test_validators_and_policy_come_from_the_trusted_commit(self) -> None:
+        result = self.run_publisher()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        validator_log = self.validator_log.read_text(encoding="utf8")
+        self.assertIn(
+            "release-python ignore_environment=1 no_user_site=1 no_site=1 dont_write_bytecode=1", validator_log
+        )
+        self.assertIn("/trusted-ref/ci/release/validate_release_artifacts.py", validator_log)
+        self.assertIn("/trusted-ref/contrib/keys/operator-keys/keys.json", validator_log)
+        self.assertNotIn(f"{self.trusted.resolve()}/contrib/keys", validator_log)
+
+    def test_replace_ref_does_not_change_what_is_read(self) -> None:
+        trusted_head = self.trusted_ref
+        validator = "ci/release/validate_release_artifacts.py"
+        git(self.trusted, "checkout", "-q", "-b", "replacement")
+        with (self.trusted / validator).open("a", encoding="utf8") as source:
+            source.write('open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8").write("REPLACED\\n")\n')
+        git(self.trusted, "commit", "-q", "-am", "replacement")
+        replacement = git(self.trusted, "rev-parse", "HEAD")
+        git(self.trusted, "checkout", "-q", "-")
+        git(self.trusted, "replace", trusted_head, replacement)
+        # With replace refs honoured, the checkout now holds the replacement
+        # while HEAD still names the trusted commit.
+        git(self.trusted, "reset", "-q", "--hard", trusted_head)
+        self.assertEqual(git(self.trusted, "rev-parse", "HEAD"), trusted_head)
+
+        result = self.run_publisher()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Trusted release checkout must be clean", result.stderr)
+        self.assertFalse(self.validator_log.exists())
+
+        # The replace ref stays, but the checkout holds the real commit again:
+        # the publisher reads the trusted commit, not the replacement.
+        git(self.trusted, "--no-replace-objects", "reset", "-q", "--hard", trusted_head)
+        result = self.run_publisher()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("REPLACED", self.validator_log.read_text(encoding="utf8"))
+
+    def test_shallow_trusted_checkout_fails_closed(self) -> None:
+        first = git(self.trusted, "rev-list", "--max-parents=0", "HEAD")
+        (self.trusted / ".git" / "shallow").write_text(first + "\n", encoding="utf8")
+
+        result = self.run_publisher()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Trusted release checkout must not be shallow", result.stderr)
+        self.assertFalse(self.validator_log.exists())
+
+    def test_index_flags_on_trusted_paths_fail_closed(self) -> None:
+        keys_json = "contrib/keys/operator-keys/keys.json"
+        git(self.trusted, "update-index", "--skip-worktree", keys_json)
+        (self.trusted / keys_json).write_text('{"schema_version": 3}\n', encoding="utf8")
+        self.assertEqual(git(self.trusted, "status", "--porcelain"), "")
+
+        result = self.run_publisher()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("index flags (assume-unchanged or skip-worktree) on: " + keys_json, result.stderr)
         self.assertFalse(self.validator_log.exists())
 
     def test_published_release_is_never_modified(self) -> None:

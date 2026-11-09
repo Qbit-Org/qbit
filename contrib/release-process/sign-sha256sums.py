@@ -18,6 +18,16 @@ from __future__ import annotations
 import os
 import sys
 
+# Run isolated (python3 -I -S -B): no PYTHONPATH, user or site packages, startup
+# hooks or bytecode. The tools need only the standard library. Started any
+# other way, the tool runs itself again isolated before importing anything
+# else; hooks the first interpreter already ran cannot be undone, which is why
+# the documented invocation passes the flags itself.
+if __name__ == "__main__" and not (sys.flags.isolated and sys.flags.no_site and sys.flags.dont_write_bytecode):
+    if not sys.executable:
+        sys.exit("ERR: cannot find the Python interpreter; run python3 -I -S -B " + __file__)
+    os.execv(sys.executable, [sys.executable, "-I", "-S", "-B", os.path.realpath(__file__), *sys.argv[1:]])
+
 # Never look modules up by name in this directory, so a stray sourceless .pyc
 # beside the tools cannot shadow a module, and never read or write __pycache__
 # in the trusted checkout.
@@ -73,10 +83,23 @@ def require_secret_key(gpg: str, fingerprint: str) -> None:
         )
 
 
-def detach_sign(gpg: str, fingerprint: str, manifest: bytes, signature: Path) -> None:
+def gpg_environment() -> dict[str, str]:
+    """The operator's environment, with GPG_TTY set if a terminal is at hand.
+
+    Curses and tty pinentries ask for the smartcard PIN on the terminal that
+    GPG_TTY names; GUI pinentries such as pinentry-mac do not need it.
+    """
+
+    env = dict(os.environ)
+    if not env.get("GPG_TTY") and sys.stdin.isatty():
+        env["GPG_TTY"] = os.ttyname(sys.stdin.fileno())
+    return env
+
+
+def detach_sign(gpg: str, fingerprint: str, manifest: Path, signature: Path) -> None:
     # The trailing "!" makes GnuPG use exactly this (sub)key rather than the
-    # newest signing subkey of the same certificate. The manifest goes in on
-    # stdin, so GnuPG signs exactly the bytes that were verified.
+    # newest signing subkey of the same certificate. The manifest is a private
+    # copy of the verified bytes; stdin stays the operator's terminal.
     result = common.run_command(
         [
             gpg,
@@ -89,11 +112,17 @@ def detach_sign(gpg: str, fingerprint: str, manifest: bytes, signature: Path) ->
             f"{fingerprint}!",
             "--output",
             str(signature),
+            str(manifest),
         ],
-        input_bytes=manifest,
+        env=gpg_environment(),
     )
     if result.returncode != 0:
         raise common.ReleaseToolError(f"gpg failed to sign SHA256SUMS:\n{result.stderr.strip()}")
+
+
+def require_digest(path: Path, expected: str, moment: str) -> None:
+    if common.sha256_bytes(path.read_bytes()) != expected:
+        raise common.ReleaseToolError(f"The private copy of SHA256SUMS changed {moment}; nothing was written")
 
 
 def verify_signature(
@@ -104,8 +133,7 @@ def verify_signature(
     manifest: Path,
     signer: Any,
 ) -> None:
-    data = common.read_regular_file(signature, label="Release signature")
-    common.require_single_armored_signature(signature, data)
+    common.read_regular_file(signature, label="Release signature")
     try:
         validators.release_artifacts.verify_manifest_signature_file(gpg, gnupg_home, signature, manifest, signer)
     except validators.errors as exc:
@@ -135,7 +163,8 @@ def main(argv: list[str] | None = None) -> int:
 
 def sign(args: argparse.Namespace) -> int:
     expected_digest = common.normalize_expected_sha256(args.expected_sha256sums_sha256)
-    with common.open_trusted_release(Path(__file__), args.trusted_release_ref, git=args.git) as trusted:
+    common.note_non_default_gpg(args.gpg)
+    with common.open_trusted_release(Path(__file__), args.trusted_release_ref, git=common.GIT) as trusted:
         validators = trusted.validators
         vra = validators.release_artifacts
         try:
@@ -163,7 +192,6 @@ def sign(args: argparse.Namespace) -> int:
         manifest = stage_dir / common.CHECKSUMS_FILE
         signature_path = stage_dir / f"{common.CHECKSUMS_FILE}.{signer.alias}.asc"
         common.note_stale_scratch(stage_dir)
-        common.note_stale_scratch(signature_path)
         # Read SHA256SUMS once: these bytes are checked against the staged
         # files, compared with the expected digest, signed and verified.
         sha256sums = common.read_regular_file(manifest, label="SHA256SUMS")
@@ -176,8 +204,12 @@ def sign(args: argparse.Namespace) -> int:
         with common.temporary_gnupg_home("qbit-sign-verify-gnupg-") as verify_home, common.scratch_dir_beside(
             stage_dir
         ) as scratch:
+            # The scratch directory is a private 0700 directory and the copy is
+            # 0600, so only this user can change the bytes that get signed.
             verified_manifest = scratch / common.CHECKSUMS_FILE
-            verified_manifest.write_bytes(sha256sums)
+            fd = os.open(verified_manifest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as output:
+                output.write(sha256sums)
             common.verify_staged_files(validators, stage_dir, policy, manifest=verified_manifest)
             try:
                 vra.import_release_keys(args.gpg, verify_home, trusted.keys_dir, policy)
@@ -189,7 +221,8 @@ def sign(args: argparse.Namespace) -> int:
                     verify_signature(validators, args.gpg, verify_home, signature_path, verified_manifest, signer)
                 except common.ReleaseToolError as exc:
                     raise common.ReleaseToolError(
-                        f"{signature_path} already exists and does not verify ({exc}); refusing to overwrite it"
+                        f"{signature_path} already exists and the publisher's check rejects it ({exc}); "
+                        "refusing to overwrite it"
                     ) from exc
                 status = "unchanged"
             else:
@@ -206,7 +239,9 @@ def sign(args: argparse.Namespace) -> int:
                         ]
                     )
                 candidate = scratch / signature_path.name
-                detach_sign(args.gpg, signer.fingerprint, sha256sums, candidate)
+                require_digest(verified_manifest, sha256sums_sha256, "before signing")
+                detach_sign(args.gpg, signer.fingerprint, verified_manifest, candidate)
+                require_digest(verified_manifest, sha256sums_sha256, "while it was being signed")
                 verify_signature(validators, args.gpg, verify_home, candidate, verified_manifest, signer)
                 if common.read_regular_file(manifest, label="SHA256SUMS") != sha256sums:
                     raise common.ReleaseToolError("SHA256SUMS changed while it was being signed")

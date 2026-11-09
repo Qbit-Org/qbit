@@ -14,8 +14,10 @@ public certificates.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib
+import io
 import importlib.util
 import json
 import os
@@ -30,6 +32,7 @@ import textwrap
 import unittest
 from pathlib import Path
 from types import ModuleType
+from typing import Callable
 from unittest import mock
 
 try:
@@ -340,12 +343,32 @@ def make_policy(
     }
 
 
+def sign_tag(repo: Path, tag: str, gnupg_home: Path, fingerprint: str, target: str | None = None) -> None:
+    """Create (or replace) an annotated tag signed with ``fingerprint``."""
+
+    subprocess.run(
+        [
+            GIT,
+            "-c", "user.name=qbit release test",
+            "-c", "user.email=release-test@example.invalid",
+            "-c", f"user.signingkey={fingerprint}!",
+            "-c", f"gpg.program={GPG}",
+            "-C", str(repo),
+            "tag", "-f", "-s", "-m", tag, tag, *([target] if target else []),
+        ],
+        check=True,
+        capture_output=True,
+        env={**os.environ, "GNUPGHOME": str(gnupg_home)},
+    )
+
+
 def build_trusted_checkout(
     root: Path,
     *,
     policy: dict[str, object],
     certificates: dict[str, str],
     tag: str | None = TAG,
+    tag_signer: tuple[Path, str] | None = None,
 ) -> tuple[Path, str]:
     """Create a clean qbit checkout holding the tools, validators and key policy."""
 
@@ -357,7 +380,9 @@ def build_trusted_checkout(
     (repo / ".gitignore").write_text("*.pyc\n__pycache__/\n", encoding="utf8")
     git(repo, "add", "README.md", ".gitignore")
     git(repo, "commit", "-q", "-m", "release source")
-    if tag is not None:
+    if tag is not None and tag_signer is not None:
+        sign_tag(repo, tag, *tag_signer)
+    elif tag is not None:
         git(repo, "tag", "-a", tag, "-m", tag)
     tools_dir = repo / "contrib" / "release-process"
     tools_dir.mkdir(parents=True)
@@ -509,7 +534,12 @@ class ReleaseFixture:
             revoked={"revoked-01": keyring.fingerprints["revoked-01"]},
         )
         certificates = {alias: keyring.certificate(alias) for alias in (*OPERATORS, "revoked-01")}
-        self.trusted, self.ref = build_trusted_checkout(root, policy=self.policy, certificates=certificates)
+        self.trusted, self.ref = build_trusted_checkout(
+            root,
+            policy=self.policy,
+            certificates=certificates,
+            tag_signer=(keyring.home, keyring.fingerprints["operator-01"]),
+        )
         self.keys_dir = self.trusted / "contrib" / "keys" / "operator-keys"
         self.tag_target = git(self.trusted, "rev-parse", f"refs/tags/{TAG}^{{commit}}")
         validators = repo_validators()
@@ -535,6 +565,8 @@ class ReleaseFixture:
         (self.core_output / "src" / f"qbit-{VERSION}.tar.gz").write_bytes(b"guix source tarball\n")
         (self.core_output / "x86_64-linux-gnu" / "SHA256SUMS.part").write_text("fragment\n", encoding="utf8")
         self.guix_sigs = root / "guix-sigs"
+        # qbit-guix.sigs mirrors the key policy; the publisher checks the copy.
+        shutil.copytree(self.keys_dir, self.guix_sigs / "operator-keys")
         for alias in OPERATORS:
             self.attest(alias, "core")
             self.attest(alias, "photon")
@@ -584,8 +616,13 @@ class ReleaseFixture:
         gpg: Path | None = None,
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        # The documented invocation, in its own process group so a test can
+        # signal the tool and its children the way a terminal would.
         command = [
             sys.executable,
+            "-I",
+            "-S",
+            "-B",
             str(self.trusted / "contrib" / "release-process" / tool),
             "--trusted-release-ref",
             self.ref,
@@ -605,6 +642,7 @@ class ReleaseFixture:
             text=True,
             encoding="utf8",
             env=process_env,
+            start_new_session=True,
         )
 
     def stage(self, *extra: str, stage_dir: Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -814,7 +852,9 @@ class StageReleaseArtifactsTest(ReleaseToolTestCase):
         outputs = self.assert_ok(result)
         self.assertEqual(outputs["counted_core"], ["operator-01,operator-02"])
         self.assertIn(f"qbit-{VERSION}-x86_64-linux-gnu-debug.tar.gz", outputs["artifact"])
-        self.assertIn("operator-03 verifies but does not cover the staged set", result.stderr)
+        self.assertIn(
+            "attestation from operator-03 verifies but validate_artifact_attestations did not count it", result.stderr
+        )
 
     def test_conflicting_attested_sets_are_refused(self) -> None:
         fixture = self.fixture(builder_quorum=1)
@@ -839,6 +879,25 @@ class StageReleaseArtifactsTest(ReleaseToolTestCase):
         missing.symlink_to(fixture.root / "README")
         self.assert_fails(fixture.stage(), "must be a regular file")
         self.assertFalse(fixture.stage_dir.exists())
+
+    def test_publisher_checks_run_before_anything_is_staged(self) -> None:
+        fixture = self.fixture()
+        mirror = fixture.guix_sigs / "operator-keys" / "keys.json"
+        original = mirror.read_bytes()
+        drifted = json.loads(original)
+        drifted["release_lines"]["testnet"]["builder_attestation_quorum"] = 1
+        mirror.write_text(json.dumps(drifted, indent=2, sort_keys=True) + "\n", encoding="utf8")
+        self.assert_fails(fixture.stage(), "The publisher's validate_key_metadata.py rejects this release")
+        self.assertFalse(fixture.stage_dir.exists())
+        mirror.write_bytes(original)
+
+        # A tag over the same commit, signed by a key outside the policy.
+        sign_tag(fixture.trusted, TAG, self.keyring.home, self.keyring.fingerprints["outsider-01"], fixture.tag_target)
+        self.assert_fails(fixture.stage(), f"Release tag {TAG} was not signed by an active qbit release key")
+        self.assertFalse(fixture.stage_dir.exists())
+
+        sign_tag(fixture.trusted, TAG, self.keyring.home, self.keyring.fingerprints["operator-02"], fixture.tag_target)
+        self.assertEqual(self.assert_ok(fixture.stage())["status"], ["created"])
 
     def test_inputs_are_validated_at_the_boundary(self) -> None:
         fixture = self.fixture()
@@ -954,11 +1013,19 @@ class SignSha256sumsTest(ReleaseToolTestCase):
         )
         self.assertIn(f"VALIDSIG {self.keyring.fingerprints[alias]}", verify.stdout)
 
+    def test_existing_signature_with_crlf_armor_is_kept(self) -> None:
+        signature = self.release.stage_dir / "SHA256SUMS.operator-01.asc"
+        self.keyring.sign("operator-01", self.release.stage_dir / "SHA256SUMS", signature)
+        signature.write_bytes(signature.read_bytes().replace(b"\n", b"\r\n"))
+        before = signature.read_bytes()
+        self.assertEqual(self.assert_ok(self.release.sign("operator-01"))["status"], ["unchanged"])
+        self.assertEqual(signature.read_bytes(), before)
+
     def test_existing_signature_that_does_not_verify_is_never_replaced(self) -> None:
         signature = self.release.stage_dir / "SHA256SUMS.operator-01.asc"
         self.keyring.sign("outsider-01", self.release.stage_dir / "SHA256SUMS", signature)
         before = signature.read_bytes()
-        self.assert_fails(self.release.sign("operator-01"), "already exists and does not verify")
+        self.assert_fails(self.release.sign("operator-01"), "already exists and the publisher's check rejects it")
         self.assertEqual(signature.read_bytes(), before)
 
     def test_refuses_to_sign_a_stage_that_does_not_match_sha256sums(self) -> None:
@@ -1088,14 +1155,15 @@ class CombineSha256sumsSignaturesTest(ReleaseToolTestCase):
         (self.stage_dir / "SHA256SUMS.revoked-01.asc").unlink()
 
         (self.stage_dir / "SHA256SUMS.operator-01.asc.bak").write_bytes(b"backup\n")
-        self.assert_fails(self.release.combine(), "Unexpected SHA256SUMS files")
+        self.assert_fails(self.release.combine(), "not covered by SHA256SUMS: SHA256SUMS.operator-01.asc.bak")
         (self.stage_dir / "SHA256SUMS.operator-01.asc.bak").unlink()
 
-        doubled = self.stage_dir / "SHA256SUMS.operator-02.asc"
-        original = doubled.read_bytes()
-        doubled.write_bytes(original + original)
-        self.assert_fails(self.release.combine(), "exactly one ASCII-armored PGP signature block")
-        doubled.write_bytes(original)
+        leftover = self.stage_dir / ".SHA256SUMS.asc.tmp-killed"
+        leftover.write_bytes(b"partial")
+        self.assert_fails(self.release.combine(), "left by an interrupted run; delete them and run again")
+        self.assert_fails(self.release.sign("operator-03"), "left by an interrupted run; delete them and run again")
+        self.assert_fails(self.release.stage(), "left by an interrupted run; delete them and run again")
+        leftover.unlink()
         self.assertFalse((self.stage_dir / "SHA256SUMS.asc").exists())
 
         self.assertEqual(self.assert_ok(self.release.combine())["release_signature_count"], ["2"])
@@ -1161,6 +1229,108 @@ class TrustedCheckoutHardeningTest(ReleaseToolTestCase):
         self.assertNotIn("PLANTED-CODE-RAN", result.stdout + result.stderr)
         self.assert_fails(result, "must not contain untracked or ignored files: contrib/release-process/argparse.pyc")
 
+    def test_replace_refs_and_grafts_do_not_change_what_is_read(self) -> None:
+        trusted = self.release.trusted
+        keys_json = "contrib/keys/operator-keys/keys.json"
+        self.assert_ok(self.release.sign("operator-01"))
+        # A replacement for the trusted commit whose policy needs one signature.
+        policy = json.loads((trusted / keys_json).read_text(encoding="utf8"))
+        policy["release_lines"]["testnet"]["release_signature_quorum"] = 1
+        git(trusted, "checkout", "-q", "-b", "replacement")
+        (trusted / keys_json).write_text(json.dumps(policy, indent=2, sort_keys=True) + "\n", encoding="utf8")
+        git(trusted, "commit", "-q", "-am", "replacement")
+        replacement = git(trusted, "rev-parse", "HEAD")
+        git(trusted, "checkout", "-q", "-")
+        git(trusted, "replace", self.release.ref, replacement)
+        git(trusted, "reset", "-q", "--hard", self.release.ref)
+        self.assertEqual(git(trusted, "rev-parse", "HEAD"), self.release.ref)
+        self.assertEqual(git(trusted, "status", "--porcelain"), "")
+        # git, honouring the replace ref, sees a clean checkout; the tools do not.
+        self.assert_fails(self.release.combine(), "Trusted qbit checkout must be clean")
+
+        # The replace ref stays, the checkout holds the real commit again: the
+        # tools read the real policy, so one signature is still below quorum.
+        git(trusted, "--no-replace-objects", "reset", "-q", "--hard", self.release.ref)
+        self.assert_fails(self.release.combine(), "Release signature quorum not met for testnet")
+
+        git(trusted, "replace", "-d", self.release.ref)
+        (trusted / ".git" / "shallow").write_text(git(trusted, "rev-list", "--max-parents=0", "HEAD") + "\n", encoding="utf8")
+        self.assert_fails(self.release.combine(), "Trusted qbit checkout must not be shallow")
+        (trusted / ".git" / "shallow").unlink()
+
+    def test_grafts_cannot_make_a_tag_an_ancestor_of_the_trusted_ref(self) -> None:
+        trusted = self.release.trusted
+        branch = git(trusted, "rev-parse", "--abbrev-ref", "HEAD")
+        git(trusted, "checkout", "-q", "--orphan", "unrelated")
+        git(trusted, "rm", "-q", "-r", "-f", ".")
+        (trusted / "unrelated.txt").write_text("unrelated history\n", encoding="utf8")
+        git(trusted, "add", "unrelated.txt")
+        git(trusted, "commit", "-q", "-m", "unrelated")
+        unrelated = git(trusted, "rev-parse", "HEAD")
+        git(trusted, "tag", "-a", "v2.0.0-testnet1", "-m", "v2.0.0-testnet1")
+        git(trusted, "checkout", "-q", "-f", branch)
+        parents = git(trusted, "rev-list", "--parents", "-n", "1", self.release.ref).split()
+        (trusted / ".git" / "info").mkdir(exist_ok=True)
+        (trusted / ".git" / "info" / "grafts").write_text(" ".join([*parents, unrelated]) + "\n", encoding="utf8")
+        (self.release.guix_sigs / "2.0.0-testnet1").mkdir()
+        result = self.release.run(
+            STAGE_TOOL, "--tag", "v2.0.0-testnet1", "--guix-sigs-dir", str(self.release.guix_sigs),
+            "--sha256sums-output", str(self.root / "derived" / "SHA256SUMS"),
+        )
+        self.assert_fails(result, f"target {unrelated} is not an ancestor of the trusted release ref")
+
+    def test_line_ending_conversion_is_reported_clearly(self) -> None:
+        trusted = self.release.trusted
+        git(trusted, "config", "core.autocrlf", "true")
+        for name in TOOL_FILES:
+            (trusted / "contrib" / "release-process" / name).unlink()
+        git(trusted, "checkout", "--", "contrib/release-process")
+        self.assertEqual(git(trusted, "status", "--porcelain"), "")
+        self.assertIn(b"\r\n", (trusted / "contrib" / "release-process" / COMBINE_TOOL).read_bytes())
+        self.assert_fails(self.release.combine(), "differs from its blob at the trusted ref only in line endings")
+
+    def test_python_startup_hooks_never_run(self) -> None:
+        markers = self.root / "markers.log"
+        python_path = self.root / "pythonpath"
+        python_path.mkdir()
+        for module in ("sitecustomize", "argparse"):
+            (python_path / f"{module}.py").write_text(
+                f"open({str(markers)!r}, 'a', encoding='utf8').write('{module}\\n')\n", encoding="utf8"
+            )
+        user_base = self.root / "userbase"
+        user_site = subprocess.run(
+            [sys.executable, "-c", "import site; print(site.getusersitepackages())"],
+            check=True, capture_output=True, text=True, encoding="utf8",
+            env={**os.environ, "PYTHONUSERBASE": str(user_base)},
+        ).stdout.strip()
+        Path(user_site).mkdir(parents=True)
+        (Path(user_site) / "usercustomize.py").write_text(
+            f"open({str(markers)!r}, 'a', encoding='utf8').write('usercustomize\\n')\n", encoding="utf8"
+        )
+        hooks = {"PYTHONPATH": str(python_path), "PYTHONUSERBASE": str(user_base)}
+        tool = str(self.release.trusted / "contrib" / "release-process" / COMBINE_TOOL)
+        args = ["--trusted-release-ref", self.release.ref, "--release-line", "testnet",
+                "--stage-dir", str(self.release.stage_dir)]
+        self.sign_all()
+
+        # The documented invocation runs none of them.
+        documented = subprocess.run(
+            [sys.executable, "-I", "-S", "-B", tool, *args], check=False, capture_output=True, text=True,
+            encoding="utf8", env={**os.environ, **hooks},
+        )
+        self.assertEqual(documented.returncode, 0, msg=documented.stderr)
+        self.assertFalse(markers.exists(), msg=markers.read_text(encoding="utf8") if markers.exists() else "")
+
+        # Started plainly, the interpreter has already run its startup hooks,
+        # but the tool runs itself again isolated before importing anything a
+        # PYTHONPATH module could shadow.
+        plain = subprocess.run(
+            [sys.executable, tool, *args], check=False, capture_output=True, text=True,
+            encoding="utf8", env={**os.environ, **hooks},
+        )
+        self.assertEqual(plain.returncode, 0, msg=plain.stderr)
+        self.assertNotIn("argparse", markers.read_text(encoding="utf8").split())
+
     def test_bytecode_left_by_the_publisher_does_not_block_the_tools(self) -> None:
         # Running the publisher's validators from the checkout writes ignored
         # bytecode under ci/release; the tools read the validators from the
@@ -1174,6 +1344,8 @@ class TrustedCheckoutHardeningTest(ReleaseToolTestCase):
 
 class InterruptedRunTest(ReleaseToolTestCase):
     def signalling_gpg(self, name: str, condition: str, signum: int) -> Path:
+        # Signal the tool's whole process group, as a terminal does for Ctrl-C:
+        # the tool and any validator it is running receive it.
         return self.gpg_wrapper(
             name,
             f"""\
@@ -1181,7 +1353,7 @@ class InterruptedRunTest(ReleaseToolTestCase):
             import time
             from pathlib import Path
             if {condition}:
-                os.kill(os.getppid(), {signum})
+                os.killpg(os.getpgrp(), {signum})
                 time.sleep(30)
             """,
         )
@@ -1256,6 +1428,54 @@ class InterruptedRunTest(ReleaseToolTestCase):
         self.assertTrue(leftover.is_dir())
 
 
+class SignalSafeCleanupTest(unittest.TestCase):
+    """run_main in-process, with the environment and handlers restored afterwards."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory(prefix="qbit-release-cleanup-")
+        self.root = Path(self.tmp.name)
+        self.common = tools_common()
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def run_body(self, body: Callable[[], int]) -> tuple[int, str]:
+        stderr = io.StringIO()
+        with mock.patch.dict(os.environ), contextlib.redirect_stderr(stderr):
+            code = self.common.run_main(body)
+        return code, stderr.getvalue()
+
+    def failing_body(self, error: BaseException) -> Callable[[], int]:
+        def body() -> int:
+            with self.common.scratch_dir_beside(self.root / "staged-release") as scratch:
+                for index in range(200):
+                    (scratch / f"artifact-{index}").write_bytes(b"copy")
+                raise error
+        return body
+
+    def test_a_signal_during_cleanup_waits_until_the_scratch_is_gone(self) -> None:
+        real_rmtree = shutil.rmtree
+
+        def interrupted_rmtree(path: object, ignore_errors: bool = False) -> None:
+            os.kill(os.getpid(), signal.SIGTERM)
+            real_rmtree(path, ignore_errors=ignore_errors)
+
+        with mock.patch.object(self.common.shutil, "rmtree", interrupted_rmtree):
+            code, stderr = self.run_body(self.failing_body(self.common.ReleaseToolError("staging failed")))
+        self.assertEqual(code, 128 + signal.SIGTERM)
+        self.assertIn("ERR: interrupted by SIGTERM; scratch copies were removed; no output was written", stderr)
+        self.assertEqual(sorted(self.root.iterdir()), [])
+
+    def test_the_message_reports_scratch_that_could_not_be_removed(self) -> None:
+        with mock.patch.object(self.common.shutil, "rmtree", lambda path, ignore_errors=False: None):
+            code, stderr = self.run_body(self.failing_body(OSError(28, "No space left on device")))
+        self.assertEqual(code, 1)
+        leftovers = sorted(self.root.glob(".staged-release.tmp-*"))
+        self.assertEqual(len(leftovers), 1)
+        self.assertIn(f"scratch left behind, safe to delete: {leftovers[0]}; no output was written", stderr)
+        shutil.rmtree(leftovers[0])
+
+
 class OutputPublishingTest(ReleaseToolTestCase):
     def test_stage_directory_gets_the_mode_of_a_plain_mkdir(self) -> None:
         fixture = self.fixture()
@@ -1289,19 +1509,51 @@ class OutputPublishingTest(ReleaseToolTestCase):
             common.publish_file_no_clobber(source, destination)
         self.assertEqual(sorted(path.name for path in destination.parent.iterdir()), ["SHA256SUMS.asc"])
 
-    def test_sign_passes_the_verified_bytes_to_gpg_on_stdin(self) -> None:
+    def test_sign_signs_a_private_copy_of_the_verified_bytes(self) -> None:
         fixture = self.fixture()
         self.assert_ok(fixture.stage())
         manifest = fixture.stage_dir / "SHA256SUMS"
-        # A file argument would let gpg read SHA256SUMS a second time.
-        stdin_only = self.gpg_wrapper(
-            "gpg-stdin-only",
-            """\
-            if "--detach-sign" in args and args[-2] != "--output":
-                sys.exit(5)
+        log = self.root / "gpg-sign.log"
+        # gpg gets a file argument (its stdin stays the operator's terminal, which
+        # tty and curses pinentries need), and that file is a private copy.
+        checking = self.gpg_wrapper(
+            "gpg-private-copy",
+            f"""\
+            import stat
+            if "--detach-sign" in args:
+                copy = args[-1]
+                with open({str(log)!r}, "w", encoding="utf8") as out:
+                    out.write(f"copy={{copy}}\\n")
+                    out.write(f"mode={{oct(stat.S_IMODE(os.stat(copy).st_mode))}}\\n")
+                    out.write(f"dir_mode={{oct(stat.S_IMODE(os.stat(os.path.dirname(copy)).st_mode))}}\\n")
+                    out.write(f"same_bytes={{open(copy, 'rb').read() == open({str(manifest)!r}, 'rb').read()}}\\n")
+                    out.write(f"gpg_tty={{os.environ.get('GPG_TTY', '')}}\\n")
             """,
         )
-        self.assertEqual(self.assert_ok(fixture.sign("operator-01", gpg=stdin_only))["status"], ["created"])
+        result = fixture.run(
+            SIGN_TOOL, "--stage-dir", str(fixture.stage_dir), "--alias", "operator-01", "--yes",
+            gpg=checking, env={"GNUPGHOME": str(self.keyring.home), "GPG_TTY": "/dev/pts/test"},
+        )
+        self.assertEqual(self.assert_ok(result)["status"], ["created"])
+        recorded = dict(line.split("=", 1) for line in log.read_text(encoding="utf8").splitlines())
+        self.assertNotEqual(Path(recorded["copy"]), manifest)
+        self.assertEqual(recorded["mode"], "0o600")
+        self.assertEqual(recorded["dir_mode"], "0o700")
+        self.assertEqual(recorded["same_bytes"], "True")
+        self.assertEqual(recorded["gpg_tty"], "/dev/pts/test")
+
+        tampering = self.gpg_wrapper(
+            "gpg-tamper-copy",
+            """\
+            if "--detach-sign" in args:
+                with open(args[-1], "a", encoding="utf8") as copy:
+                    copy.write("tampered\\n")
+            """,
+        )
+        self.assert_fails(
+            fixture.sign("operator-02", gpg=tampering), "private copy of SHA256SUMS changed while it was being signed"
+        )
+        self.assertFalse((fixture.stage_dir / "SHA256SUMS.operator-02.asc").exists())
 
         swapping = self.gpg_wrapper(
             "gpg-swap-manifest",
@@ -1312,8 +1564,8 @@ class OutputPublishingTest(ReleaseToolTestCase):
                     output.write("swapped\\n")
             """,
         )
-        self.assert_fails(fixture.sign("operator-02", gpg=swapping), "SHA256SUMS changed while it was being signed")
-        self.assertFalse((fixture.stage_dir / "SHA256SUMS.operator-02.asc").exists())
+        self.assert_fails(fixture.sign("operator-03", gpg=swapping), "SHA256SUMS changed while it was being signed")
+        self.assertFalse((fixture.stage_dir / "SHA256SUMS.operator-03.asc").exists())
         os.replace(f"{manifest}.orig", manifest)
 
 
@@ -1334,7 +1586,7 @@ class CombinePublisherParityTest(ReleaseToolTestCase):
         return True
 
     def run_scenario(self, name: str, signers: dict[str, str], certificates: dict[str, str],
-                     signatures: dict[str, str]) -> tuple[bool, bool]:
+                     signatures: dict[str, str], transform: Callable[[bytes], bytes] | None = None) -> tuple[bool, bool]:
         root = self.root / name
         root.mkdir()
         policy = make_policy(signers, revoked={"revoked-01": self.keyring.fingerprints["revoked-01"]})
@@ -1344,7 +1596,10 @@ class CombinePublisherParityTest(ReleaseToolTestCase):
         stage_dir.mkdir()
         (stage_dir / "SHA256SUMS").write_text(f"{'ab' * 32}  qbit-{VERSION}-x86_64-linux-gnu.tar.gz\n", encoding="utf8")
         for alias, fingerprint in signatures.items():
-            self.keyring.sign_with(fingerprint, stage_dir / "SHA256SUMS", stage_dir / f"SHA256SUMS.{alias}.asc")
+            signature = stage_dir / f"SHA256SUMS.{alias}.asc"
+            self.keyring.sign_with(fingerprint, stage_dir / "SHA256SUMS", signature)
+            if transform is not None:
+                signature.write_bytes(transform(signature.read_bytes()))
         publisher_dir = root / "publisher"
         shutil.copytree(stage_dir, publisher_dir)
         (publisher_dir / "SHA256SUMS.asc").write_bytes(
@@ -1384,6 +1639,19 @@ class CombinePublisherParityTest(ReleaseToolTestCase):
                 combine_accepts, publisher_accepts = self.run_scenario(name, signers, certs, signatures)
                 self.assertEqual(combine_accepts, publisher_accepts)
                 self.assertEqual(combine_accepts, expected)
+
+        # Armor the publisher accepts is armor combine accepts.
+        for name, transform in (
+            ("crlf-armor", lambda data: data.replace(b"\n", b"\r\n")),
+            ("doubled-block", lambda data: data + data),
+            ("garbage", lambda data: b"not a signature\n"),
+        ):
+            with self.subTest(scenario=name):
+                combine_accepts, publisher_accepts = self.run_scenario(
+                    name, operators, certificates, operators, transform
+                )
+                self.assertEqual(combine_accepts, publisher_accepts)
+                self.assertEqual(combine_accepts, name != "garbage")
 
         # Two aliases on signing subkeys of one certificate: whatever the
         # publisher's check decides (counting by primary key rejects it), combine

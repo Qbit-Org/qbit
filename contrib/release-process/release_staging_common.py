@@ -7,7 +7,8 @@ The tools run from a clean qbit checkout whose HEAD is the trusted release ref.
 The validators and the release key policy are read from the blobs at that ref,
 exported into a private scratch directory, never from the working tree, and
 there is deliberately no option or environment variable that points the tools
-at a different keys.json.
+at a different keys.json. Every git command, including the validators' own,
+runs without the caller's GIT_* settings, replace refs or grafts.
 """
 
 from __future__ import annotations
@@ -42,11 +43,19 @@ VALIDATOR_MODULES = (
     "validate_release_artifacts",
     "validate_builder_attestations",
 )
-ARMORED_SIGNATURE_BEGIN = b"-----BEGIN PGP SIGNATURE-----\n"
-ARMORED_SIGNATURE_END = b"-----END PGP SIGNATURE-----\n"
 INTERRUPT_SIGNALS = tuple(
     getattr(signal, name) for name in ("SIGINT", "SIGTERM", "SIGHUP") if hasattr(signal, name)
 )
+GIT = shutil.which("git") or "git"
+DEFAULT_GPG = shutil.which("gpg") or "gpg"
+# Hidden files the tools create next to an output while writing it; one found
+# inside a stage directory was left by a run that was killed outright.
+INTERRUPTED_LEFTOVER_RE = re.compile(r"^\..+\.tmp-")
+
+# Scratch directories this run created and has not removed yet, and outputs it
+# has moved into place, so that an error reports what is actually on disk.
+_SCRATCH: set[Path] = set()
+_WRITTEN: list[Path] = []
 
 
 class ReleaseToolError(Exception):
@@ -84,6 +93,7 @@ class TrustedRelease:
     ref: str
     policy_path: Path
     keys_dir: Path
+    validators_dir: Path
     validators: Validators
 
 
@@ -152,12 +162,73 @@ def git_bytes(git: str, cwd: Path, args: list[str], *, action: str, stdin: bytes
     return result.stdout
 
 
+def harden_git_environment() -> None:
+    """Make every git command, the tools' and the validators', read real objects.
+
+    The caller's GIT_* variables (GIT_DIR, GIT_INDEX_FILE, object directories,
+    config overrides, replace-ref bases, ...) are dropped, replace refs are
+    ignored and the graft file is replaced by an empty one.
+    """
+
+    for name in [name for name in os.environ if name.startswith("GIT_")]:
+        del os.environ[name]
+    os.environ["GIT_NO_REPLACE_OBJECTS"] = "1"
+    os.environ["GIT_GRAFT_FILE"] = os.devnull
+
+
+@contextlib.contextmanager
+def interrupts_blocked() -> Iterator[None]:
+    """Hold SIGINT, SIGTERM and SIGHUP until the block ends, so cleanup finishes."""
+
+    if not hasattr(signal, "pthread_sigmask"):
+        yield
+        return
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, INTERRUPT_SIGNALS)
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+def remove_tree(path: Path) -> None:
+    with interrupts_blocked():
+        shutil.rmtree(path, ignore_errors=True)
+        if not path.exists():
+            _SCRATCH.discard(path)
+
+
+@contextlib.contextmanager
+def private_directory(prefix: str, parent: Path | None = None) -> Iterator[Path]:
+    """Yield a new 0700 directory and remove it, uninterrupted, when done."""
+
+    with interrupts_blocked():
+        path = Path(tempfile.mkdtemp(prefix=prefix, dir=parent))
+        _SCRATCH.add(path)
+    try:
+        yield path
+    finally:
+        remove_tree(path)
+
+
+def record_written(path: Path) -> None:
+    _WRITTEN.append(path)
+
+
+def disk_state() -> str:
+    left = sorted(str(path) for path in _SCRATCH if path.exists())
+    scratch = "scratch left behind, safe to delete: " + ", ".join(left) if left else "scratch copies were removed"
+    written = "already written: " + ", ".join(map(str, _WRITTEN)) if _WRITTEN else "no output was written"
+    return f"{scratch}; {written}"
+
+
 def run_main(body: Callable[[], int]) -> int:
     """Run a tool body, turning failures and interruptions into one ERR: line.
 
     SIGINT, SIGTERM and SIGHUP raise Interrupted, so every scratch directory is
-    removed by its context manager before the tool exits; signals that were
-    ignored when the tool started (for example under nohup) stay ignored.
+    removed by its context manager before the tool exits; signals arriving
+    while a directory is being removed wait until it is gone. Signals that were
+    ignored when the tool started (for example under nohup) stay ignored. The
+    message reports what is actually left on disk.
     """
 
     def interrupted(signum: int, _frame: object) -> None:
@@ -165,8 +236,12 @@ def run_main(body: Callable[[], int]) -> int:
             signal.signal(handled, signal.SIG_IGN)
         raise Interrupted(signum)
 
-    for handled in INTERRUPT_SIGNALS:
-        if signal.getsignal(handled) is not signal.SIG_IGN:
+    harden_git_environment()
+    _SCRATCH.clear()
+    _WRITTEN.clear()
+    previous = {handled: signal.getsignal(handled) for handled in INTERRUPT_SIGNALS}
+    for handled, disposition in previous.items():
+        if disposition is not signal.SIG_IGN:
             signal.signal(handled, interrupted)
     try:
         return body()
@@ -174,15 +249,15 @@ def run_main(body: Callable[[], int]) -> int:
         print(f"ERR: {exc}", file=sys.stderr)
         return 1
     except Interrupted as exc:
-        print(
-            f"ERR: interrupted by {signal.Signals(exc.signum).name}; scratch copies were removed "
-            "and no output was written",
-            file=sys.stderr,
-        )
+        print(f"ERR: interrupted by {signal.Signals(exc.signum).name}; {disk_state()}", file=sys.stderr)
         return 128 + exc.signum
     except OSError as exc:
-        print(f"ERR: {exc}; scratch copies were removed and no output was written", file=sys.stderr)
+        print(f"ERR: {exc}; {disk_state()}", file=sys.stderr)
         return 1
+    finally:
+        for handled, disposition in previous.items():
+            if disposition is not None:
+                signal.signal(handled, disposition)
 
 
 def path_traverses_symlink(root: Path, relative: str) -> bool:
@@ -286,6 +361,11 @@ def check_trusted_checkout(tool_path: Path, trusted_ref: str, *, git: str) -> tu
             f"Trusted qbit checkout {root} is at {head}, not --trusted-release-ref "
             f"{trusted_ref.lower()}"
         )
+    shallow = git_output(
+        git, root, ["rev-parse", "--is-shallow-repository"], action="check whether the checkout is shallow"
+    ).strip()
+    if shallow != "false":
+        raise ReleaseToolError(f"Trusted qbit checkout must not be shallow: {root}")
     status = git_output(
         git,
         root,
@@ -326,7 +406,14 @@ def check_trusted_checkout(tool_path: Path, trusted_ref: str, *, git: str) -> tu
         committed = git_bytes(
             git, root, ["cat-file", "blob", f"{head}:{relative}"], action=f"read {relative} at the trusted ref"
         )
-        if running.read_bytes() != committed:
+        working = running.read_bytes()
+        if working != committed:
+            if working.replace(b"\r\n", b"\n") == committed.replace(b"\r\n", b"\n"):
+                raise ReleaseToolError(
+                    f"{relative} differs from its blob at the trusted ref only in line endings: the checkout "
+                    "converts them (core.autocrlf or an eol attribute). Use a checkout made with "
+                    "core.autocrlf=false; the policy and validators are read from git objects either way"
+                )
             raise ReleaseToolError(f"{relative} differs from its blob at the trusted ref")
     return root, head
 
@@ -356,23 +443,28 @@ def open_trusted_release(tool_path: Path, trusted_ref: str, *, git: str) -> Iter
     """Check the trusted checkout and export its validators and policy into scratch."""
 
     root, head = check_trusted_checkout(tool_path, trusted_ref, git=git)
-    with tempfile.TemporaryDirectory(prefix="qbit-trusted-ref-") as scratch:
-        export_root = Path(scratch)
+    with private_directory("qbit-trusted-ref-") as export_root:
         export_trusted_tree(git, root, head, export_root)
         keys_dir = export_root / OPERATOR_KEYS_RELATIVE_DIR
         policy_path = keys_dir / "keys.json"
         if not policy_path.is_file():
             raise ReleaseToolError(f"Trusted ref {head} has no {OPERATOR_KEYS_RELATIVE_DIR}/keys.json")
-        validators = load_validators(export_root / VALIDATORS_RELATIVE_DIR)
-        yield TrustedRelease(root=root, ref=head, policy_path=policy_path, keys_dir=keys_dir, validators=validators)
+        validators_dir = export_root / VALIDATORS_RELATIVE_DIR
+        validators = load_validators(validators_dir)
+        yield TrustedRelease(
+            root=root,
+            ref=head,
+            policy_path=policy_path,
+            keys_dir=keys_dir,
+            validators_dir=validators_dir,
+            validators=validators,
+        )
 
 
 @contextlib.contextmanager
 def temporary_gnupg_home(prefix: str) -> Iterator[Path]:
-    with tempfile.TemporaryDirectory(prefix=prefix) as home:
-        path = Path(home)
-        path.chmod(0o700)
-        yield path
+    with private_directory(prefix) as home:
+        yield home
 
 
 def note_stale_scratch(destination: Path) -> None:
@@ -393,13 +485,14 @@ def scratch_dir_beside(destination: Path) -> Iterator[Path]:
     parent = destination.parent
     try:
         parent.mkdir(parents=True, exist_ok=True)
-        path = Path(tempfile.mkdtemp(prefix=f".{destination.name}.tmp-", dir=parent))
+        scratch = private_directory(f".{destination.name}.tmp-", parent)
+        path = scratch.__enter__()
     except OSError as exc:
         raise ReleaseToolError(f"Cannot create a scratch directory in {parent}: {exc}") from exc
     try:
         yield path
     finally:
-        shutil.rmtree(path, ignore_errors=True)
+        scratch.__exit__(None, None, None)
 
 
 def current_umask() -> int:
@@ -422,6 +515,7 @@ def publish_file_no_clobber(source: Path, destination: Path) -> None:
 
     try:
         os.link(source, destination)
+        record_written(destination)
         fsync_directory(destination.parent)
         return
     except FileExistsError as exc:
@@ -432,6 +526,9 @@ def publish_file_no_clobber(source: Path, destination: Path) -> None:
     # Filesystems without hard links, or a destination on another filesystem:
     # write a complete temporary file next to the destination, flush it, and
     # rename it into place, so the destination is never partially written.
+    # Refusing to overwrite is best effort here: a file that appears between
+    # the check and the rename is replaced. A run killed outright can leave the
+    # temporary file, which the next run refuses with instructions.
     data = source.read_bytes()
     fd, temp_name = tempfile.mkstemp(prefix=f".{destination.name}.tmp-", dir=destination.parent)
     temp = Path(temp_name)
@@ -444,6 +541,7 @@ def publish_file_no_clobber(source: Path, destination: Path) -> None:
         if destination.exists() or destination.is_symlink():
             raise ReleaseToolError(f"Refusing to overwrite {destination}; it appeared while this tool ran")
         os.replace(temp, destination)
+        record_written(destination)
         fsync_directory(destination.parent)
     finally:
         with contextlib.suppress(FileNotFoundError):
@@ -476,40 +574,22 @@ def require_directory(path: Path, *, label: str) -> Path:
     return path.resolve()
 
 
-def require_single_armored_signature(path: Path, data: bytes) -> None:
-    """Require one ASCII-armored detached signature, so concatenation stays well formed."""
-
-    try:
-        data.decode("ascii")
-    except UnicodeDecodeError as exc:
-        raise ReleaseToolError(f"{path.name} is not an ASCII-armored signature") from exc
-    if (
-        not data.startswith(ARMORED_SIGNATURE_BEGIN)
-        or not data.endswith(ARMORED_SIGNATURE_END)
-        or data.count(b"-----BEGIN PGP") != 1
-        or data.count(b"-----END PGP") != 1
-        or b"\r" in data
-    ):
-        raise ReleaseToolError(
-            f"{path.name} must contain exactly one ASCII-armored PGP signature block with LF line endings"
-        )
-
-
-def verify_staged_files(
+def check_stage_names(
     validators: Validators,
     stage_dir: Path,
     policy: Any,
     *,
     manifest: Path | None = None,
+    require_artifacts: bool = True,
 ) -> dict[str, Any]:
-    """Check a stage directory against SHA256SUMS with the publisher's rules.
+    """Check which files a stage directory holds, with the publisher's rules.
 
     ``manifest`` is the SHA256SUMS to check against; it defaults to the stage's
     own file and is a scratch copy when the caller must act on exactly the bytes
-    it verified. The directory may hold, besides the listed artifacts and
-    SHA256SUMS, only per-signer SHA256SUMS.<alias>.asc files of active release
-    signers and SHA256SUMS.asc. Every listed artifact must be a regular file
-    with the listed digest.
+    it verified. Besides the listed artifacts and SHA256SUMS the directory may
+    hold only per-signer SHA256SUMS.<alias>.asc files of active release signers
+    and SHA256SUMS.asc; anything else, in particular a temporary file left by a
+    killed run, is refused before it can reach the publisher.
     """
 
     vra = validators.release_artifacts
@@ -524,12 +604,33 @@ def verify_staged_files(
         raise ReleaseToolError(f"{CHECKSUMS_FILE} must not be a symlink: {stage_dir / CHECKSUMS_FILE}")
     allowed = set(entries) | {CHECKSUMS_FILE, COMBINED_SIGNATURE_FILE}
     allowed |= {path.name for path in signatures.values()}
-    missing = sorted((set(entries) | {CHECKSUMS_FILE}) - staged)
+    required = (set(entries) if require_artifacts else set()) | {CHECKSUMS_FILE}
+    missing = sorted(required - staged)
     extra = sorted(staged - allowed)
+    leftovers = [name for name in extra if INTERRUPTED_LEFTOVER_RE.match(name)]
+    if leftovers:
+        raise ReleaseToolError(
+            f"Stage directory {stage_dir} holds files left by an interrupted run; delete them and run again: "
+            + ", ".join(leftovers)
+        )
     if missing:
         raise ReleaseToolError("Stage directory is missing files listed in SHA256SUMS: " + ", ".join(missing))
     if extra:
         raise ReleaseToolError("Stage directory contains files not covered by SHA256SUMS: " + ", ".join(extra))
+    return entries
+
+
+def verify_staged_files(
+    validators: Validators,
+    stage_dir: Path,
+    policy: Any,
+    *,
+    manifest: Path | None = None,
+) -> dict[str, Any]:
+    """check_stage_names, then every listed artifact must have its listed digest."""
+
+    vra = validators.release_artifacts
+    entries = check_stage_names(validators, stage_dir, policy, manifest=manifest)
     for name, entry in sorted(entries.items()):
         artifact = stage_dir / name
         if artifact.is_symlink():
@@ -547,5 +648,17 @@ def add_common_arguments(parser: Any) -> None:
         help="Full commit SHA of the clean qbit checkout this tool runs from.",
     )
     parser.add_argument("--release-line", required=True, choices=("testnet", "mainnet"))
-    parser.add_argument("--gpg", default=shutil.which("gpg") or "gpg")
-    parser.add_argument("--git", default=shutil.which("git") or "git")
+    parser.add_argument(
+        "--gpg",
+        default=DEFAULT_GPG,
+        help=(
+            "gpg executable that makes every signature check and signature (default: gpg on PATH). "
+            "It cannot change which keys.json or certificates are read, but it decides whether "
+            "signatures verify; it exists for tests."
+        ),
+    )
+
+
+def note_non_default_gpg(gpg: str) -> None:
+    if gpg != DEFAULT_GPG:
+        note(f"--gpg {gpg} makes every signature check; it is not the default {DEFAULT_GPG}")
