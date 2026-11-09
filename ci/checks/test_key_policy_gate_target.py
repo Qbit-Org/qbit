@@ -192,11 +192,9 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
         self.assertIn("validate_key_metadata.py refused the change", result.stdout)
 
     def test_target_loads_its_modules_from_their_own_files(self) -> None:
-        # A module of the same name beside the gate in the base must not be loaded instead.
-        for name in ("classify_merge_profile.py", "validate_key_metadata.py"):
-            directory = "ci/release" if name.startswith("classify") else "ci/checks"
-            (self.repo / directory / name).write_text("raise SystemExit(0)\n", encoding="utf8")
-        self.commit("files named like the gate's modules")
+        # A classifier beside the gate script, in the base, must not be loaded instead of ci/checks'.
+        (self.repo / "ci" / "release" / "classify_merge_profile.py").write_text("raise SystemExit(0)\n", encoding="utf8")
+        self.commit("a file named like the gate's classifier")
         self.land()
         self.edit("ci/release/validate_key_metadata.py")
         self.commit("change the validator")

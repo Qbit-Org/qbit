@@ -40,12 +40,19 @@ def load_module(name: str, path: Path):
     file added beside it can stand in for a module it loads.
     """
 
+    existing = sys.modules.get(name)
+    if existing is not None and Path(getattr(existing, "__file__", "") or "").resolve() == path.resolve():
+        return existing
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot load {path}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
-    spec.loader.exec_module(module)
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        del sys.modules[name]
+        raise
     return module
 
 
@@ -422,6 +429,9 @@ def check_target(base: str, head: str, work: Path) -> None:
 
 
 def main() -> int:
+    if not sys.flags.isolated:
+        print("::error::run the key-policy gate isolated: python3 -I ci/release/key_policy_gate.py ...")
+        return 1
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("mode", choices=("policy", "target"))
     parser.add_argument("--base", required=True)
