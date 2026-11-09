@@ -1085,9 +1085,6 @@ Known limitations
   sanitizer builds, and CI runs no unit tests on macOS or on ARM, riscv64, or
   ppc64, so the depth is unverified on macOS, Windows, and Linux on ARM,
   riscv64, and ppc64, and in sanitizer builds (#268, #270, refs #260).
-- The v1.0.1 release readiness inspection (#174) exercised a testnet4 wallet on
-  macOS. Linux and Windows desktop notification behavior and a packaged-binary
-  smoke check on each supported platform are separate release evidence.
 
 Credits and acknowledgements
 ============================
