@@ -30,6 +30,7 @@ target_sources(test_bitcoin
     wallet_p2mr_encryption_tests.cpp
     wallet_p2mr_markunused_tests.cpp
     wallet_p2mr_parallel_signing_tests.cpp
+    wallet_p2mr_plaintext_reencryption_tests.cpp
     wallet_p2mr_plaintext_validation_completion_tests.cpp
     wallet_p2mr_plaintext_validation_failure_tests.cpp
     wallet_p2mr_plaintext_validation_ready_tests.cpp
