@@ -19,19 +19,43 @@ attestations, which reproduces a release manifest without its artifacts.
 
 from __future__ import annotations
 
-import argparse
 import os
-import re
-import shutil
 import sys
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
 
-# Keep the trusted checkout byte-for-byte clean between tool runs.
+# Never look modules up by name in this directory, so a stray sourceless .pyc
+# beside the tools cannot shadow a module, and never read or write __pycache__
+# in the trusted checkout.
+_TOOL_DIR = os.path.dirname(os.path.realpath(__file__))
+if sys.path and os.path.realpath(sys.path[0] or os.curdir) == _TOOL_DIR:
+    del sys.path[0]
 sys.dont_write_bytecode = True
 
-import release_staging_common as common  # noqa: E402
+import atexit  # noqa: E402
+import importlib.util  # noqa: E402
+import shutil  # noqa: E402
+import tempfile  # noqa: E402
+
+sys.pycache_prefix = tempfile.mkdtemp(prefix="qbit-release-tools-pycache-")
+atexit.register(shutil.rmtree, sys.pycache_prefix, True)
+
+
+def _load_common():  # type: ignore[no-untyped-def]
+    path = os.path.join(_TOOL_DIR, "release_staging_common.py")
+    spec = importlib.util.spec_from_file_location("release_staging_common", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+common = _load_common()
+
+import argparse  # noqa: E402
+import re  # noqa: E402
+from dataclasses import dataclass  # noqa: E402
+from pathlib import Path  # noqa: E402
+from typing import Any  # noqa: E402
 
 
 TAG_RE = re.compile(r"^v[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -391,6 +415,9 @@ def assemble_stage(
         with (scratch / common.CHECKSUMS_FILE).open("xb") as output:
             output.write(sha256sums)
         verify_new_stage(validators, scratch, entries, **verify_args)
+        # mkdtemp creates the scratch 0700; the stage gets the mode a plain
+        # mkdir would give it, so a separate publishing account can read it.
+        os.chmod(scratch, 0o777 & ~common.current_umask())
         try:
             os.rename(scratch, stage_dir)
         except OSError as exc:
@@ -439,12 +466,14 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
-    try:
-        args = parse_args(argv)
-        if not TAG_RE.fullmatch(args.tag):
-            raise common.ReleaseToolError(f"--tag must be a safe v-prefixed release tag: {args.tag!r}")
-        checkout = common.resolve_trusted_checkout(Path(__file__), args.trusted_release_ref, git=args.git)
-        validators = common.load_validators(checkout.root)
+    return common.run_main(lambda: stage(parse_args(argv)))
+
+
+def stage(args: argparse.Namespace) -> int:
+    if not TAG_RE.fullmatch(args.tag):
+        raise common.ReleaseToolError(f"--tag must be a safe v-prefixed release tag: {args.tag!r}")
+    with common.open_trusted_release(Path(__file__), args.trusted_release_ref, git=args.git) as checkout:
+        validators = checkout.validators
         vra = validators.release_artifacts
         vba = validators.builder_attestations
         rules = NamingRules(
@@ -505,6 +534,7 @@ def main(argv: list[str] | None = None) -> int:
                 + [("qbit-guix.sigs checkout", guix_sigs_dir), ("trusted qbit checkout", checkout.root)],
             )
 
+        common.note_stale_scratch(stage_dir if stage_dir is not None else Path(os.path.abspath(args.sha256sums_output)))
         exclusions: dict[str, str] = {}
         with common.temporary_gnupg_home("qbit-stage-gnupg-") as gnupg_home:
             try:
@@ -581,10 +611,7 @@ def main(argv: list[str] | None = None) -> int:
             common.emit("artifact", name)
         common.emit("sha256sums_path", sha256sums_path)
         common.emit("sha256sums_sha256", common.sha256_bytes(sha256sums))
-        return 0
-    except common.ReleaseToolError as exc:
-        print(f"ERR: {exc}", file=sys.stderr)
-        return 1
+    return 0
 
 
 if __name__ == "__main__":

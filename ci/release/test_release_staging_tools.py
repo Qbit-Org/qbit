@@ -19,7 +19,10 @@ import importlib
 import importlib.util
 import json
 import os
+import py_compile
 import shutil
+import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -27,7 +30,17 @@ import textwrap
 import unittest
 from pathlib import Path
 from types import ModuleType
+from unittest import mock
 
+try:
+    import resource
+except ImportError:  # pragma: no cover - not available on Windows
+    resource = None  # type: ignore[assignment]
+
+
+# Importing the tools in-process must not leave bytecode beside them: the tools
+# refuse to run from a checkout with ignored files in contrib/release-process.
+sys.dont_write_bytecode = True
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TOOLS_DIR = REPO_ROOT / "contrib" / "release-process"
@@ -245,8 +258,13 @@ def load_tool_module(file_name: str) -> ModuleType:
 def repo_validators() -> object:
     if str(TOOLS_DIR) not in sys.path:
         sys.path.insert(0, str(TOOLS_DIR))
-    common = importlib.import_module("release_staging_common")
-    return common.load_validators(REPO_ROOT)
+    return tools_common().load_validators(VALIDATORS_DIR)
+
+
+def tools_common() -> ModuleType:
+    if str(TOOLS_DIR) not in sys.path:
+        sys.path.insert(0, str(TOOLS_DIR))
+    return importlib.import_module("release_staging_common")
 
 
 def parse_outputs(stdout: str) -> dict[str, list[str]]:
@@ -335,7 +353,9 @@ def build_trusted_checkout(
     repo.mkdir()
     git(repo, "init", "-q")
     (repo / "README.md").write_text("release source\n", encoding="utf8")
-    git(repo, "add", "README.md")
+    # Like qbit's .gitignore, so bytecode is an ignored file, not an untracked one.
+    (repo / ".gitignore").write_text("*.pyc\n__pycache__/\n", encoding="utf8")
+    git(repo, "add", "README.md", ".gitignore")
     git(repo, "commit", "-q", "-m", "release source")
     if tag is not None:
         git(repo, "tag", "-a", tag, "-m", tag)
@@ -454,12 +474,15 @@ class Keyring:
         return self.gpg("--armor", "--export", self.fingerprints[alias]).stdout
 
     def sign(self, alias: str, path: Path, output: Path) -> None:
+        self.sign_with(self.fingerprints[alias], path, output)
+
+    def sign_with(self, fingerprint: str, path: Path, output: Path) -> None:
         self.gpg(
             "--yes",
             "--armor",
             "--detach-sign",
             "--local-user",
-            self.fingerprints[alias] + "!",
+            fingerprint + "!",
             "--output",
             str(output),
             str(path),
@@ -516,6 +539,15 @@ class ReleaseFixture:
             self.attest(alias, "core")
             self.attest(alias, "photon")
         self.stage_dir = root / "staged-release"
+
+    def replace_output(self, path: Path, content: bytes) -> None:
+        """Change a builder output and re-attest it for every operator."""
+
+        self.outputs[path] = content
+        path.write_bytes(content)
+        for alias in OPERATORS:
+            self.attest(alias, "core")
+            self.attest(alias, "photon")
 
     def manifest_entries(self, artifact: str) -> dict[str, str]:
         output_dir = self.core_output if artifact == "core" else self.photon_output
@@ -1088,6 +1120,285 @@ class CombineSha256sumsSignaturesTest(ReleaseToolTestCase):
         self.assertFalse((self.stage_dir / "SHA256SUMS.asc").exists())
         self.assertEqual(self.release.scratch_leftovers(), [])
         self.assertEqual(self.assert_ok(self.release.combine())["status"], ["created"])
+
+
+class TrustedCheckoutHardeningTest(ReleaseToolTestCase):
+    """What git status does not show must not change what the tools trust."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.release = self.fixture()
+        self.assert_ok(self.release.stage())
+
+    def sign_all(self) -> None:
+        for alias in OPERATORS:
+            self.assert_ok(self.release.sign(alias))
+
+    def test_index_flags_on_release_paths_are_refused(self) -> None:
+        keys_json = "contrib/keys/operator-keys/keys.json"
+        policy = json.loads((self.release.trusted / keys_json).read_text(encoding="utf8"))
+        policy["release_lines"]["testnet"]["release_signature_quorum"] = 1
+        git(self.release.trusted, "update-index", "--skip-worktree", keys_json)
+        (self.release.trusted / keys_json).write_text(json.dumps(policy), encoding="utf8")
+        self.assertEqual(git(self.release.trusted, "status", "--porcelain"), "")
+        self.assert_fails(self.release.combine(), "index flags (assume-unchanged or skip-worktree) on: " + keys_json)
+        git(self.release.trusted, "update-index", "--no-skip-worktree", keys_json)
+        git(self.release.trusted, "checkout", "--", keys_json)
+
+        validator = "ci/release/validate_release_artifacts.py"
+        git(self.release.trusted, "update-index", "--assume-unchanged", validator)
+        self.assert_fails(self.release.sign("operator-01"), "index flags (assume-unchanged or skip-worktree) on: " + validator)
+        git(self.release.trusted, "update-index", "--no-assume-unchanged", validator)
+        self.assert_ok(self.release.sign("operator-01"))
+
+    def test_planted_bytecode_beside_the_tools_never_runs(self) -> None:
+        source = self.root / "planted.py"
+        source.write_text('import sys\nsys.stderr.write("PLANTED-CODE-RAN\\n")\n', encoding="utf8")
+        planted = self.release.trusted / "contrib" / "release-process" / "argparse.pyc"
+        py_compile.compile(str(source), cfile=str(planted), doraise=True)
+        self.assertEqual(git(self.release.trusted, "status", "--porcelain"), "")
+        result = self.release.combine()
+        self.assertNotIn("PLANTED-CODE-RAN", result.stdout + result.stderr)
+        self.assert_fails(result, "must not contain untracked or ignored files: contrib/release-process/argparse.pyc")
+
+    def test_bytecode_left_by_the_publisher_does_not_block_the_tools(self) -> None:
+        # Running the publisher's validators from the checkout writes ignored
+        # bytecode under ci/release; the tools read the validators from the
+        # trusted ref instead, so that bytecode is never loaded or in the way.
+        pycache = self.release.trusted / "ci" / "release" / "__pycache__"
+        pycache.mkdir()
+        (pycache / "validate_release_artifacts.cpython-399.pyc").write_bytes(b"not bytecode")
+        self.sign_all()
+        self.assert_ok(self.release.combine())
+
+
+class InterruptedRunTest(ReleaseToolTestCase):
+    def signalling_gpg(self, name: str, condition: str, signum: int) -> Path:
+        return self.gpg_wrapper(
+            name,
+            f"""\
+            import signal
+            import time
+            from pathlib import Path
+            if {condition}:
+                os.kill(os.getppid(), {signum})
+                time.sleep(30)
+            """,
+        )
+
+    def test_sigterm_during_stage_verification_removes_the_scratch_copies(self) -> None:
+        fixture = self.fixture()
+        wrapper = self.signalling_gpg(
+            "gpg-sigterm",
+            f'"--verify" in args and any(Path({str(self.root)!r}).glob(".staged-release.tmp-*/SHA256SUMS"))',
+            signal.SIGTERM,
+        )
+        result = fixture.run(
+            STAGE_TOOL,
+            "--tag", TAG, "--guix-sigs-dir", str(fixture.guix_sigs), "--allow-unsigned-platform-artifacts",
+            "--builder-output-dir", str(fixture.core_output), "--builder-output-dir", str(fixture.photon_output),
+            "--stage-dir", str(fixture.stage_dir),
+            gpg=wrapper,
+        )
+        self.assertEqual(result.returncode, 128 + signal.SIGTERM, msg=result.stderr)
+        self.assertIn("ERR: interrupted by SIGTERM; scratch copies were removed", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse(fixture.stage_dir.exists())
+        self.assertEqual(fixture.scratch_leftovers(), [])
+        self.assertEqual(self.assert_ok(fixture.stage())["status"], ["created"])
+
+    def test_sigint_during_signing_writes_no_signature(self) -> None:
+        fixture = self.fixture()
+        self.assert_ok(fixture.stage())
+        wrapper = self.signalling_gpg("gpg-sigint", '"--detach-sign" in args', signal.SIGINT)
+        result = fixture.sign("operator-01", gpg=wrapper)
+        self.assertEqual(result.returncode, 128 + signal.SIGINT, msg=result.stderr)
+        self.assertIn("ERR: interrupted by SIGINT", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse((fixture.stage_dir / "SHA256SUMS.operator-01.asc").exists())
+        self.assertEqual(fixture.scratch_leftovers(), [])
+
+    @unittest.skipUnless(resource is not None, "needs RLIMIT_FSIZE")
+    def test_os_error_while_copying_is_reported_without_a_traceback(self) -> None:
+        fixture = self.fixture()
+        large = fixture.core_output / "x86_64-linux-gnu" / f"qbit-{VERSION}-x86_64-linux-gnu.tar.gz"
+        fixture.replace_output(large, b"\0" * (1 << 20))
+        limit = 256 * 1024
+
+        def limit_file_size() -> None:
+            resource.setrlimit(resource.RLIMIT_FSIZE, (limit, limit))
+
+        command = [
+            sys.executable, str(fixture.trusted / "contrib" / "release-process" / STAGE_TOOL),
+            "--trusted-release-ref", fixture.ref, "--release-line", "testnet",
+            "--tag", TAG, "--guix-sigs-dir", str(fixture.guix_sigs), "--allow-unsigned-platform-artifacts",
+            "--builder-output-dir", str(fixture.core_output), "--builder-output-dir", str(fixture.photon_output),
+            "--stage-dir", str(fixture.stage_dir),
+        ]
+        result = subprocess.run(
+            command, check=False, capture_output=True, text=True, encoding="utf8",
+            stdin=subprocess.DEVNULL, preexec_fn=limit_file_size,
+        )
+        self.assertEqual(result.returncode, 1, msg=result.stderr)
+        self.assertIn("File too large", result.stderr)
+        self.assertTrue(result.stderr.splitlines()[-1].startswith("ERR: [Errno 27] File too large"), msg=result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse(fixture.stage_dir.exists())
+        self.assertEqual(fixture.scratch_leftovers(), [])
+
+    def test_scratch_left_by_a_killed_run_is_reported_not_deleted(self) -> None:
+        fixture = self.fixture()
+        leftover = self.root / ".staged-release.tmp-killed"
+        leftover.mkdir()
+        result = fixture.stage()
+        self.assert_ok(result)
+        self.assertIn(f"scratch left by an interrupted run, safe to delete: {leftover}", result.stderr)
+        self.assertTrue(leftover.is_dir())
+
+
+class OutputPublishingTest(ReleaseToolTestCase):
+    def test_stage_directory_gets_the_mode_of_a_plain_mkdir(self) -> None:
+        fixture = self.fixture()
+        self.assert_ok(fixture.stage())
+        umask = os.umask(0o022)
+        os.umask(umask)
+        self.assertEqual(stat.S_IMODE(fixture.stage_dir.stat().st_mode), 0o777 & ~umask)
+
+    def test_fallback_without_hard_links_never_writes_the_destination_in_place(self) -> None:
+        common = tools_common()
+        source = self.root / "candidate"
+        source.write_bytes(b"verified bytes\n")
+        destination = self.root / "out" / "SHA256SUMS.asc"
+        destination.parent.mkdir()
+        no_links = mock.patch.object(common.os, "link", side_effect=PermissionError("no hard links"))
+
+        with no_links, mock.patch.object(common.os, "fsync", side_effect=OSError("disk gone")):
+            with self.assertRaises(OSError):
+                common.publish_file_no_clobber(source, destination)
+        self.assertEqual(sorted(destination.parent.iterdir()), [])
+
+        with no_links:
+            common.publish_file_no_clobber(source, destination)
+        self.assertEqual(destination.read_bytes(), b"verified bytes\n")
+        umask = os.umask(0o022)
+        os.umask(umask)
+        self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o666 & ~umask)
+        self.assertEqual(sorted(path.name for path in destination.parent.iterdir()), ["SHA256SUMS.asc"])
+
+        with no_links, self.assertRaises(common.ReleaseToolError):
+            common.publish_file_no_clobber(source, destination)
+        self.assertEqual(sorted(path.name for path in destination.parent.iterdir()), ["SHA256SUMS.asc"])
+
+    def test_sign_passes_the_verified_bytes_to_gpg_on_stdin(self) -> None:
+        fixture = self.fixture()
+        self.assert_ok(fixture.stage())
+        manifest = fixture.stage_dir / "SHA256SUMS"
+        # A file argument would let gpg read SHA256SUMS a second time.
+        stdin_only = self.gpg_wrapper(
+            "gpg-stdin-only",
+            """\
+            if "--detach-sign" in args and args[-2] != "--output":
+                sys.exit(5)
+            """,
+        )
+        self.assertEqual(self.assert_ok(fixture.sign("operator-01", gpg=stdin_only))["status"], ["created"])
+
+        swapping = self.gpg_wrapper(
+            "gpg-swap-manifest",
+            f"""\
+            if "--detach-sign" in args:
+                os.replace({str(manifest)!r}, {str(manifest)!r} + ".orig")
+                with open({str(manifest)!r}, "w", encoding="utf8") as output:
+                    output.write("swapped\\n")
+            """,
+        )
+        self.assert_fails(fixture.sign("operator-02", gpg=swapping), "SHA256SUMS changed while it was being signed")
+        self.assertFalse((fixture.stage_dir / "SHA256SUMS.operator-02.asc").exists())
+        os.replace(f"{manifest}.orig", manifest)
+
+
+class CombinePublisherParityTest(ReleaseToolTestCase):
+    """combine accepts exactly the signature sets that the publisher's check accepts."""
+
+    def publisher_accepts(self, trusted: Path, stage_dir: Path) -> bool:
+        vra = repo_validators().release_artifacts
+        keys_dir = trusted / "contrib" / "keys" / "operator-keys"
+        try:
+            policy = vra.load_release_policy(keys_dir / "keys.json", keys_dir, "testnet")
+            with tempfile.TemporaryDirectory(prefix="qbit-parity-gnupg-") as home:
+                Path(home).chmod(0o700)
+                vra.import_release_keys(GPG, Path(home), keys_dir, policy)
+                vra.verify_manifest_signatures(GPG, Path(home), stage_dir, policy)
+        except vra.ReleaseValidationError:
+            return False
+        return True
+
+    def run_scenario(self, name: str, signers: dict[str, str], certificates: dict[str, str],
+                     signatures: dict[str, str]) -> tuple[bool, bool]:
+        root = self.root / name
+        root.mkdir()
+        policy = make_policy(signers, revoked={"revoked-01": self.keyring.fingerprints["revoked-01"]})
+        certificates = {**certificates, "revoked-01": self.keyring.certificate("revoked-01")}
+        trusted, ref = build_trusted_checkout(root, policy=policy, certificates=certificates, tag=None)
+        stage_dir = root / "stage"
+        stage_dir.mkdir()
+        (stage_dir / "SHA256SUMS").write_text(f"{'ab' * 32}  qbit-{VERSION}-x86_64-linux-gnu.tar.gz\n", encoding="utf8")
+        for alias, fingerprint in signatures.items():
+            self.keyring.sign_with(fingerprint, stage_dir / "SHA256SUMS", stage_dir / f"SHA256SUMS.{alias}.asc")
+        publisher_dir = root / "publisher"
+        shutil.copytree(stage_dir, publisher_dir)
+        (publisher_dir / "SHA256SUMS.asc").write_bytes(
+            b"".join((stage_dir / f"SHA256SUMS.{alias}.asc").read_bytes() for alias in sorted(signatures))
+        )
+        combine = subprocess.run(
+            [sys.executable, str(trusted / "contrib" / "release-process" / COMBINE_TOOL),
+             "--trusted-release-ref", ref, "--release-line", "testnet", "--stage-dir", str(stage_dir)],
+            check=False, capture_output=True, text=True, encoding="utf8",
+        )
+        return combine.returncode == 0, self.publisher_accepts(trusted, publisher_dir)
+
+    def test_combine_and_publisher_agree(self) -> None:
+        fingerprints = self.keyring.fingerprints
+        operators = {alias: fingerprints[alias] for alias in OPERATORS}
+        certificates = {alias: self.keyring.certificate(alias) for alias in OPERATORS}
+        scenarios = {
+            "all-three": (operators, certificates, operators, True),
+            "below-quorum": (operators, certificates, {"operator-01": fingerprints["operator-01"]}, False),
+            "another-operators-key": (
+                operators, certificates,
+                {"operator-01": fingerprints["operator-01"], "operator-03": fingerprints["operator-01"]}, False,
+            ),
+            "outsider-key": (
+                operators, certificates,
+                {"operator-01": fingerprints["operator-01"], "operator-03": fingerprints["outsider-01"]}, False,
+            ),
+            "revoked-signer": (
+                operators, certificates,
+                {**{alias: operators[alias] for alias in ("operator-01", "operator-02")},
+                 "revoked-01": fingerprints["revoked-01"]},
+                False,
+            ),
+        }
+        for name, (signers, certs, signatures, expected) in scenarios.items():
+            with self.subTest(scenario=name):
+                combine_accepts, publisher_accepts = self.run_scenario(name, signers, certs, signatures)
+                self.assertEqual(combine_accepts, publisher_accepts)
+                self.assertEqual(combine_accepts, expected)
+
+        # Two aliases on signing subkeys of one certificate: whatever the
+        # publisher's check decides (counting by primary key rejects it), combine
+        # must decide the same, because it runs that same check.
+        shared = Keyring.SUBKEY_SIGNER
+        signers = {**operators, "operator-02": self.keyring.newer_subkeys[shared]}
+        certs = {**certificates, "operator-02": self.keyring.certificate(shared)}
+        for name, aliases in (
+            ("shared-primary-only", ("operator-02", "operator-03")),
+            ("shared-primary-plus-one", ("operator-01", "operator-02", "operator-03")),
+        ):
+            with self.subTest(scenario=name):
+                signatures = {alias: signers[alias] for alias in aliases}
+                combine_accepts, publisher_accepts = self.run_scenario(name, signers, certs, signatures)
+                self.assertEqual(combine_accepts, publisher_accepts)
 
 
 @unittest.skipUnless(GPG and GIT, "gpg and git are required for release tool tests")

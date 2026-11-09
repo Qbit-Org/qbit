@@ -15,15 +15,41 @@ signature by the same signer is kept, so re-running is safe.
 
 from __future__ import annotations
 
-import argparse
+import os
 import sys
-from pathlib import Path
-from typing import Any
 
-# Keep the trusted checkout byte-for-byte clean between tool runs.
+# Never look modules up by name in this directory, so a stray sourceless .pyc
+# beside the tools cannot shadow a module, and never read or write __pycache__
+# in the trusted checkout.
+_TOOL_DIR = os.path.dirname(os.path.realpath(__file__))
+if sys.path and os.path.realpath(sys.path[0] or os.curdir) == _TOOL_DIR:
+    del sys.path[0]
 sys.dont_write_bytecode = True
 
-import release_staging_common as common  # noqa: E402
+import atexit  # noqa: E402
+import importlib.util  # noqa: E402
+import shutil  # noqa: E402
+import tempfile  # noqa: E402
+
+sys.pycache_prefix = tempfile.mkdtemp(prefix="qbit-release-tools-pycache-")
+atexit.register(shutil.rmtree, sys.pycache_prefix, True)
+
+
+def _load_common():  # type: ignore[no-untyped-def]
+    path = os.path.join(_TOOL_DIR, "release_staging_common.py")
+    spec = importlib.util.spec_from_file_location("release_staging_common", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+common = _load_common()
+
+import argparse  # noqa: E402
+from pathlib import Path  # noqa: E402
+from typing import Any  # noqa: E402
 
 
 def confirm(summary: list[tuple[str, object]]) -> None:
@@ -47,9 +73,10 @@ def require_secret_key(gpg: str, fingerprint: str) -> None:
         )
 
 
-def detach_sign(gpg: str, fingerprint: str, manifest: Path, signature: Path) -> None:
+def detach_sign(gpg: str, fingerprint: str, manifest: bytes, signature: Path) -> None:
     # The trailing "!" makes GnuPG use exactly this (sub)key rather than the
-    # newest signing subkey of the same certificate.
+    # newest signing subkey of the same certificate. The manifest goes in on
+    # stdin, so GnuPG signs exactly the bytes that were verified.
     result = common.run_command(
         [
             gpg,
@@ -62,8 +89,8 @@ def detach_sign(gpg: str, fingerprint: str, manifest: Path, signature: Path) -> 
             f"{fingerprint}!",
             "--output",
             str(signature),
-            str(manifest),
-        ]
+        ],
+        input_bytes=manifest,
     )
     if result.returncode != 0:
         raise common.ReleaseToolError(f"gpg failed to sign SHA256SUMS:\n{result.stderr.strip()}")
@@ -103,21 +130,23 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
-    try:
-        args = parse_args(argv)
-        expected_digest = common.normalize_expected_sha256(args.expected_sha256sums_sha256)
-        checkout = common.resolve_trusted_checkout(Path(__file__), args.trusted_release_ref, git=args.git)
-        validators = common.load_validators(checkout.root)
+    return common.run_main(lambda: sign(parse_args(argv)))
+
+
+def sign(args: argparse.Namespace) -> int:
+    expected_digest = common.normalize_expected_sha256(args.expected_sha256sums_sha256)
+    with common.open_trusted_release(Path(__file__), args.trusted_release_ref, git=args.git) as trusted:
+        validators = trusted.validators
         vra = validators.release_artifacts
         try:
-            policy = vra.load_release_policy(checkout.policy_path, checkout.keys_dir, args.release_line)
+            policy = vra.load_release_policy(trusted.policy_path, trusted.keys_dir, args.release_line)
         except validators.errors as exc:
             raise common.ReleaseToolError(str(exc)) from exc
         signer = policy.signers_by_alias.get(args.alias)
         if signer is None:
             raise common.ReleaseToolError(
                 f"{args.alias!r} is not an active release-signing signer for {args.release_line} in "
-                f"{checkout.policy_path}; active: {', '.join(sorted(policy.active_aliases))}"
+                f"keys.json at {trusted.ref}; active: {', '.join(sorted(policy.active_aliases))}"
             )
         if args.expected_fingerprint is not None:
             try:
@@ -132,24 +161,32 @@ def main(argv: list[str] | None = None) -> int:
 
         stage_dir = common.require_directory(args.stage_dir, label="--stage-dir")
         manifest = stage_dir / common.CHECKSUMS_FILE
-        common.verify_staged_files(validators, stage_dir, policy)
+        signature_path = stage_dir / f"{common.CHECKSUMS_FILE}.{signer.alias}.asc"
+        common.note_stale_scratch(stage_dir)
+        common.note_stale_scratch(signature_path)
+        # Read SHA256SUMS once: these bytes are checked against the staged
+        # files, compared with the expected digest, signed and verified.
         sha256sums = common.read_regular_file(manifest, label="SHA256SUMS")
         sha256sums_sha256 = common.sha256_bytes(sha256sums)
         if expected_digest is not None and sha256sums_sha256 != expected_digest:
             raise common.ReleaseToolError(
                 f"SHA256SUMS SHA-256 mismatch: expected {expected_digest}, got {sha256sums_sha256}"
             )
-        signature_path = stage_dir / f"{common.CHECKSUMS_FILE}.{signer.alias}.asc"
 
-        with common.temporary_gnupg_home("qbit-sign-verify-gnupg-") as verify_home:
+        with common.temporary_gnupg_home("qbit-sign-verify-gnupg-") as verify_home, common.scratch_dir_beside(
+            stage_dir
+        ) as scratch:
+            verified_manifest = scratch / common.CHECKSUMS_FILE
+            verified_manifest.write_bytes(sha256sums)
+            common.verify_staged_files(validators, stage_dir, policy, manifest=verified_manifest)
             try:
-                vra.import_release_keys(args.gpg, verify_home, checkout.keys_dir, policy)
+                vra.import_release_keys(args.gpg, verify_home, trusted.keys_dir, policy)
             except validators.errors as exc:
                 raise common.ReleaseToolError(str(exc)) from exc
 
             if signature_path.exists() or signature_path.is_symlink():
                 try:
-                    verify_signature(validators, args.gpg, verify_home, signature_path, manifest, signer)
+                    verify_signature(validators, args.gpg, verify_home, signature_path, verified_manifest, signer)
                 except common.ReleaseToolError as exc:
                     raise common.ReleaseToolError(
                         f"{signature_path} already exists and does not verify ({exc}); refusing to overwrite it"
@@ -168,30 +205,24 @@ def main(argv: list[str] | None = None) -> int:
                             ("Signature path", signature_path),
                         ]
                     )
-                with common.scratch_dir_beside(stage_dir) as scratch:
-                    signed_manifest = scratch / common.CHECKSUMS_FILE
-                    signed_manifest.write_bytes(sha256sums)
-                    candidate = scratch / signature_path.name
-                    detach_sign(args.gpg, signer.fingerprint, signed_manifest, candidate)
-                    verify_signature(validators, args.gpg, verify_home, candidate, signed_manifest, signer)
-                    if common.read_regular_file(manifest, label="SHA256SUMS") != sha256sums:
-                        raise common.ReleaseToolError("SHA256SUMS changed while it was being signed")
-                    common.publish_file_no_clobber(candidate, signature_path)
+                candidate = scratch / signature_path.name
+                detach_sign(args.gpg, signer.fingerprint, sha256sums, candidate)
+                verify_signature(validators, args.gpg, verify_home, candidate, verified_manifest, signer)
+                if common.read_regular_file(manifest, label="SHA256SUMS") != sha256sums:
+                    raise common.ReleaseToolError("SHA256SUMS changed while it was being signed")
+                common.publish_file_no_clobber(candidate, signature_path)
                 status = "created"
 
         common.emit("status", status)
         common.emit("signer_alias", signer.alias)
         common.emit("signer_fpr", signer.fingerprint)
         common.emit("release_line", args.release_line)
-        common.emit("trusted_release_ref", checkout.ref)
+        common.emit("trusted_release_ref", trusted.ref)
         common.emit("policy_sha256", policy.policy_sha256)
         common.emit("sha256sums_sha256", sha256sums_sha256)
         common.emit("signature_path", signature_path)
         common.emit("signature_sha256", common.sha256_bytes(signature_path.read_bytes()))
-        return 0
-    except common.ReleaseToolError as exc:
-        print(f"ERR: {exc}", file=sys.stderr)
-        return 1
+    return 0
 
 
 if __name__ == "__main__":

@@ -20,6 +20,19 @@ GITHUB_METADATA_PROFILE = "github-metadata"
 SOURCE_PROFILE = "source"
 
 RELEASE_TRUST_DOC_RE = re.compile(r"^doc/release-trust-[^/]+[.]md$")
+# The public release tools. Listed file by file: other files under
+# contrib/release-process (tests stripped from public snapshots) keep the full
+# source profile.
+RELEASE_TOOL_PATHS = frozenset(
+    {
+        "contrib/release-process/README.md",
+        "contrib/release-process/combine-sha256sums-signatures.py",
+        "contrib/release-process/publish-local-release.sh",
+        "contrib/release-process/release_staging_common.py",
+        "contrib/release-process/sign-sha256sums.py",
+        "contrib/release-process/stage-release-artifacts.py",
+    }
+)
 PUBLIC_RELEASE_NOTES_RE = re.compile(r"^doc/release-notes-[^/]+[.]md$")
 
 PUBLIC_DOCS_ROOT_FILES = frozenset(
@@ -120,7 +133,7 @@ def normalize_path(path: str) -> str | None:
 
 def is_release_policy_path(path: str) -> bool:
     return (
-        path == "contrib/release-process/publish-local-release.sh"
+        path in RELEASE_TOOL_PATHS
         or path.startswith("ci/release/")
         or any(path.startswith(prefix) for prefix in OPERATOR_KEYS_PREFIXES)
         or RELEASE_TRUST_DOC_RE.fullmatch(path) is not None
@@ -212,7 +225,7 @@ def github_outputs(classification: Classification) -> dict[str, str]:
             )
         ),
         "touched_release_publish": bool_output(
-            "contrib/release-process/publish-local-release.sh" in paths
+            any(path in RELEASE_TOOL_PATHS for path in paths)
         ),
         "touched_release_validators": bool_output(
             any(path.startswith("ci/release/") for path in paths)

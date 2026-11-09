@@ -216,6 +216,24 @@ class ClassifyMergeProfileTest(unittest.TestCase):
         self.assertEqual(outputs["touched_release_validators"], "true")
         self.assertEqual(outputs["touched_release_trust_docs"], "true")
 
+    def test_release_tools_alone_use_release_policy_profile(self) -> None:
+        for path in sorted(classify_merge_profile.RELEASE_TOOL_PATHS):
+            with self.subTest(path=path):
+                classification = self.classify([path])
+                outputs = classify_merge_profile.github_outputs(classification)
+
+                self.assertEqual(classification.profile, classify_merge_profile.RELEASE_POLICY_PROFILE)
+                self.assertEqual(outputs["touched_release_publish"], "true")
+                self.assertEqual(outputs["source_validation_required"], "false")
+
+    def test_other_release_process_files_keep_source_profile(self) -> None:
+        path = "contrib/release-process/test_release_signing_helpers.py"
+        classification = self.classify([path])
+        outputs = classify_merge_profile.github_outputs(classification)
+
+        self.assertEqual(classification.profile, classify_merge_profile.SOURCE_PROFILE)
+        self.assertEqual(outputs["touched_release_publish"], "false")
+
     def test_github_outputs_report_rpc_docs_profile(self) -> None:
         outputs = classify_merge_profile.github_outputs(self.classify(RPC_DOCS_PATHS))
 
