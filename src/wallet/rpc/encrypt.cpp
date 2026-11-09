@@ -242,7 +242,7 @@ RPCHelpMan encryptwallet()
                 {
                     {"passphrase", RPCArg::Type::STR, RPCArg::Optional::NO, "The pass phrase to encrypt the wallet with. It must be at least 1 character, but should be long."},
                 },
-                RPCResult{RPCResult::Type::STR, "", "A string with further instructions"},
+                RPCResult{RPCResult::Type::STR, "", "A string with further instructions. It starts with \"wallet encrypted\" whenever the wallet was encrypted, and contains a warning if setting up the new HD seed, or rewriting the wallet file, did not finish."},
                 RPCExamples{
             "\nEncrypt your wallet\n"
             + HelpExampleCli("encryptwallet", "\"my pass phrase\"") +
@@ -262,6 +262,18 @@ RPCHelpMan encryptwallet()
 
     if (pwallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
         throw JSONRPCError(RPC_WALLET_ENCRYPTION_FAILED, "Error: wallet does not contain private keys, nothing to encrypt.");
+    }
+
+    // A rescan or descriptor import holds m_relock_mutex for its whole run,
+    // and an import also holds cs_wallet while it derives keys. Fail at once,
+    // with the errors and in the order that encryptwallet used before it took
+    // the locks first, and like it read the encryption state without them.
+    // The checks are repeated under the locks.
+    if (pwallet->IsScanningWithPassphrase()) {
+        if (pwallet->IsCrypted()) {
+            throw JSONRPCError(RPC_WALLET_WRONG_ENC_STATE, "Error: running with an encrypted wallet, but encryptwallet was called.");
+        }
+        throw JSONRPCError(RPC_WALLET_ERROR, "Error: the wallet is currently being used to rescan the blockchain for related transactions. Please call `abortrescan` before encrypting the wallet.");
     }
 
     // Hold the locks from the encryption-state check through the encryption
@@ -293,11 +305,20 @@ RPCHelpMan encryptwallet()
         throw JSONRPCError(RPC_INVALID_PARAMETER, "passphrase cannot be empty");
     }
 
-    if (!pwallet->EncryptWallet(strWalletPass)) {
+    bilingual_str new_seed_error;
+    if (!pwallet->EncryptWallet(strWalletPass, /*use_create_keypool_warmup=*/false, &new_seed_error)) {
         throw JSONRPCError(RPC_WALLET_ENCRYPTION_FAILED, "Error: Failed to encrypt the wallet.");
     }
 
-    return "wallet encrypted; The keypool has been flushed and a new HD seed was generated. You need to make a new backup with the backupwallet RPC.";
+    // The wallet is encrypted either way, so a failure to set up the new seed
+    // is reported in the result rather than as an error.
+    std::string result{new_seed_error.empty() ?
+        "wallet encrypted; The keypool has been flushed and a new HD seed was generated. You need to make a new backup with the backupwallet RPC." :
+        "wallet encrypted; Warning: " + NewSeedFailedWarning(new_seed_error).original};
+    if (pwallet->NeedsRewriteAfterEncryption()) {
+        result += " Warning: " + PendingRewriteWarning().original;
+    }
+    return result;
 },
     };
 }

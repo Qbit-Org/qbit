@@ -54,6 +54,7 @@ const std::string NAME{"name"};
 const std::string OLD_KEY{"wkey"};
 const std::string ORDERPOSNEXT{"orderposnext"};
 const std::string POOL{"pool"};
+const std::string POST_ENCRYPTION_REWRITE{"postencryptionrewrite"};
 const std::string PURPOSE{"purpose"};
 const std::string PUBKEYDBCURSOR{"pubkeydbcursor"};
 const std::string PUBKEYDBENTRY{"pubkeydbentry"};
@@ -277,6 +278,11 @@ bool WalletBatch::WriteDescriptor(const uint256& desc_id, const WalletDescriptor
     return WriteIC(make_pair(DBKeys::WALLETDESCRIPTOR, desc_id), descriptor);
 }
 
+bool WalletBatch::HasDescriptor(const uint256& desc_id)
+{
+    return m_batch->Exists(std::make_pair(DBKeys::WALLETDESCRIPTOR, desc_id));
+}
+
 bool WalletBatch::WriteDescriptorDerivedCache(const CExtPubKey& xpub, const uint256& desc_id, uint32_t key_exp_index, uint32_t der_index)
 {
     std::vector<unsigned char> ser_xpub(BIP32_EXTKEY_SIZE);
@@ -341,6 +347,21 @@ bool WalletBatch::WriteLockedUTXO(const COutPoint& output)
 bool WalletBatch::EraseLockedUTXO(const COutPoint& output)
 {
     return EraseIC(std::make_pair(DBKeys::LOCKED_UTXO, std::make_pair(output.hash, output.n)));
+}
+
+bool WalletBatch::WritePostEncryptionRewrite()
+{
+    return WriteIC(DBKeys::POST_ENCRYPTION_REWRITE, uint8_t{'1'});
+}
+
+bool WalletBatch::ErasePostEncryptionRewrite()
+{
+    return EraseIC(DBKeys::POST_ENCRYPTION_REWRITE);
+}
+
+bool WalletBatch::HasPostEncryptionRewrite()
+{
+    return m_batch->Exists(DBKeys::POST_ENCRYPTION_REWRITE);
 }
 
 bool LoadKey(CWallet* pwallet, DataStream& ssKey, DataStream& ssValue, std::string& strErr)

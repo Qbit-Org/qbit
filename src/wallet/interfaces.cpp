@@ -34,6 +34,7 @@
 
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -156,7 +157,14 @@ public:
 
     bool encryptWallet(const SecureString& wallet_passphrase) override
     {
-        return m_wallet->EncryptWallet(wallet_passphrase);
+        bilingual_str new_seed_error;
+        if (!m_wallet->EncryptWallet(wallet_passphrase, /*use_create_keypool_warmup=*/false, &new_seed_error)) return false;
+        if (!new_seed_error.empty()) {
+            // Neither true nor false describes this outcome, so report it as
+            // an exception, as an exception from the encryption itself is.
+            throw std::runtime_error(NewSeedFailedWarning(new_seed_error).original + " Restart the application and unlock the wallet with the new passphrase.");
+        }
+        return true;
     }
     bool isCrypted() override { return m_wallet->IsCrypted(); }
     bool lock() override { return m_wallet->Lock(); }
@@ -175,7 +183,7 @@ public:
         return m_wallet->ChangeWalletPassphrase(old_wallet_passphrase, new_wallet_passphrase);
     }
     void abortRescan() override { m_wallet->AbortRescan(); }
-    bool backupWallet(const std::string& filename) override { return m_wallet->BackupWallet(filename); }
+    util::Result<void> backupWallet(const std::string& filename) override { return m_wallet->BackupWallet(filename); }
     std::string getWalletName() override { return m_wallet->GetName(); }
     std::unique_ptr<Wallet> clone() override { return std::make_unique<WalletImpl>(m_context, m_wallet); }
     util::Result<CTxDestination> getNewDestination(const OutputType type, const std::string& label) override
