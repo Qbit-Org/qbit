@@ -192,13 +192,30 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
         self.assertIn("validate_key_metadata.py refused the change", result.stdout)
 
     def test_target_loads_its_modules_from_their_own_files(self) -> None:
-        # A classifier beside the gate script, in the base, must not be loaded instead of ci/checks'.
-        (self.repo / "ci" / "release" / "classify_merge_profile.py").write_text("raise SystemExit(0)\n", encoding="utf8")
-        self.commit("a file named like the gate's classifier")
+        # A file named like one of the gate's modules, in the other module's
+        # directory in the base, must not be loaded instead.
+        for directory, name in (("ci/release", "classify_merge_profile.py"), ("ci/checks", "validate_key_metadata.py")):
+            (self.repo / directory / name).write_text("raise SystemExit(0)\n", encoding="utf8")
+        self.commit("files named like the gate's modules")
         self.land()
         self.edit("ci/release/validate_key_metadata.py")
         self.commit("change the validator")
         self.assert_target_refused("this change to the gate's code needs contrib/keys/gate-approvals/")
+
+    def test_gate_refuses_to_run_without_isolation(self) -> None:
+        # Without -I, a module beside the gate would be imported before the
+        # standard library's; the gate must refuse before importing one, whether
+        # the import sits above the check (__future__) or below it (re).
+        for name in ("__future__.py", "re.py"):
+            (self.repo / "ci" / "release" / name).write_text("raise SystemExit(0)\n", encoding="utf8")
+        result = subprocess.run(
+            [sys.executable, str(self.repo / contract.GATE_SCRIPT), "policy", "--base", self.base, "--head", self.base,
+             "--work", str(self.root / "unisolated")],
+            cwd=self.repo, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("run the key-policy gate isolated: python3 -I", result.stdout)
+        self.assertFalse((self.root / "unisolated").exists())
 
     def test_target_needs_each_release_lines_quorum_for_a_gate_change(self) -> None:
         data = self.policy_data(3, ["operator-01", "operator-02", "operator-04"], self.policies[2])

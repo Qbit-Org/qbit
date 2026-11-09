@@ -179,9 +179,10 @@ gate state: a different base state needs new signatures. Like policy
 approvals, it does not expire: it holds again if the base returns to that
 state. No other gate-approval directory may change in the same pull request.
 
-The job runs the gate isolated (`python3 -I`, with the gate's directories
-looked up after the standard library), so a file added beside it cannot stand
-in for a module it imports. It runs again when a pull request's base branch
+The job runs the gate isolated (`python3 -I`), and the gate refuses to start
+otherwise. It adds no directory to the module search path and loads its two
+modules from their own files, so a file added beside it cannot stand in for a
+module it imports. It runs again when a pull request's base branch
 changes. It fetches the pull request without credentials, which works for this
 public repository. The workflow reaches a pull request only once its base
 branch holds it, so it does not check the pull request that adds it.

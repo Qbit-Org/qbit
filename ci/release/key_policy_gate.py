@@ -17,18 +17,24 @@ Nothing from --head is executed or imported: its files are written out as data
 for the validators and gpg to read.
 """
 
-from __future__ import annotations
-
-import argparse
-import functools
-import hashlib
-import importlib.util
-import re
-import shutil
-import subprocess
 import sys
-import tempfile
-from pathlib import Path
+
+# Refuse before importing anything else (sys is built in): run as a script
+# without -I, Python looks up modules in the script's directory before the
+# standard library.
+if __name__ == "__main__" and not sys.flags.isolated:
+    print("::error::run the key-policy gate isolated: python3 -I ci/release/key_policy_gate.py ...")
+    raise SystemExit(1)
+
+import argparse  # noqa: E402
+import functools  # noqa: E402
+import hashlib  # noqa: E402
+import importlib.util  # noqa: E402
+import re  # noqa: E402
+import shutil  # noqa: E402
+import subprocess  # noqa: E402
+import tempfile  # noqa: E402
+from pathlib import Path  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 
@@ -51,7 +57,10 @@ def load_module(name: str, path: Path):
     try:
         spec.loader.exec_module(module)
     except BaseException:
-        del sys.modules[name]
+        if existing is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = existing
         raise
     return module
 
@@ -429,9 +438,6 @@ def check_target(base: str, head: str, work: Path) -> None:
 
 
 def main() -> int:
-    if not sys.flags.isolated:
-        print("::error::run the key-policy gate isolated: python3 -I ci/release/key_policy_gate.py ...")
-        return 1
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("mode", choices=("policy", "target"))
     parser.add_argument("--base", required=True)
