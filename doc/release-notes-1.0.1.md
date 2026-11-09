@@ -403,6 +403,11 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   not detected. `encryptwallet` now fills those descriptors first, which can
   make it take up to twice as long in that window. Wallets already encrypted
   in that window keep the short lookahead (#300).
+- Removing an address book entry in qbit-qt took the wallet database's
+  writer before the wallet lock, the reverse of the order other wallet
+  writes use, so a removal that coincided with another wallet write, such as
+  wallet encryption or an incoming transaction, could deadlock the wallet.
+  It now takes the wallet lock first (#300, fixes #293).
 - v1.0.0 could write unencrypted PQC private keys into a wallet that was
   being encrypted while a background keypool refill ran (#277). This release
   now detects and re-encrypts them. `getwalletinfo` reports
@@ -642,10 +647,11 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   full-script cache are unchanged, data signatures were left uncached, and a
   benchmark for the two-pass admission pattern was added (#162). #265 below
   caches data signatures in a separate domain.
-- No throughput or initial block download measurement accompanies this
-  release. The signature caches and descriptor batching are described by their
+- The signature caches and descriptor batching are described by their
   behavior only; this release does not claim a speedup. The #268 entry below
-  gives the measured signing and verification cost of the PQC library update.
+  gives the measured signing and verification cost of the PQC library update:
+  because of its verification cost, a mainnet `-reindex-chainstate` on one
+  x86-64 machine took about 5 to 8% longer than with v1.0.0.
 - Header synchronization clamps a negative commitment window, which can occur
   when a chain start is ahead of the local clock, instead of converting it to
   an oversized unsigned bound (#137).
@@ -737,9 +743,13 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   AVX2, key generation and signing also use the library's eight-way AVX2
   SHA-256 code; verification does not. In measurements of production-mode
   builds on x86-64 Linux with AVX2, made for the v1.0.1 release review, key
-  generation takes about 11 to 15% longer and signing about 11 to 18% longer,
-  and verification shows no change beyond measurement noise. Other CPUs and
-  platforms were not measured, including aarch64 and other non-x86 Linux
+  generation takes about 11 to 15% longer and signing about 11 to 18% longer.
+  Verification takes about 7 to 8% longer in a micro-benchmark of
+  production-mode builds on x86-64, because v0.3.2 also wipes the buffers of
+  each SHA-256 and SHA-512 hash it finalizes. On the same x86-64 machine, a
+  `-reindex-chainstate` of mainnet, which includes block validation, took
+  about 5 to 8% longer than with v1.0.0. Other CPUs and platforms were not
+  measured, including aarch64 and other non-x86 Linux
   builds, Macs, and x86 CPUs without AVX2. Secret-key validation was not
   measured either; #268's earlier measurement of v0.3.1 put it about 12%
   slower, like key generation. A key generation, validation, or signing call
@@ -840,8 +850,8 @@ Known limitations
 
 - The PSBT operations dialog and the Sign/Verify dialog write a key's PQC
   limit state differently: the PSBT dialog uses a translatable label such as
-  "Normal", while the Sign/Verify dialog shows the raw state name such as
-  "NORMAL". The meaning is identical; only the wording differs (#166).
+  "Normal", while the Sign/Verify dialog shows the untranslated state name
+  such as "normal". The meaning is identical; only the wording differs (#166).
 - Unsigned-platform waiver: the macOS and Windows artifacts for this release
   are not code-signed or notarized. They are published with `-unsigned` in
   their names, and codesigning payloads are not published. macOS Gatekeeper
@@ -909,8 +919,12 @@ Known limitations
     v1.0.1 peers stopped at a `headers` reply cut short for size and did not
     continue its low-work headers presync. On testnet4, a new v1.0.0 node
     synced to the tip from only a v1.0.1 node, and a new v1.0.1 node from
-    only a v1.0.0 node. A network with such ranges converges once its nodes
-    upgrade to v1.0.1, apart from the cases in the next two items.
+    only a v1.0.0 node. On mainnet, mixed v1.0.0 and v1.0.1 nodes synced in
+    both directions, and no headers reply was cut short; the largest
+    2,000-header window is about 0.72 MB. A network with such ranges
+    converges once its nodes upgrade to v1.0.1, apart from the cases in the
+    next two items. Upgrade nodes that accept inbound connections first; no
+    configuration change is needed.
   - Low-work headers sync holds at most 36 MB of AuxPoW payload while
     redownloading, so it cannot complete, from any peer, through a range where
     roughly 15,000 to 17,000 consecutive headers carry more than that. It
@@ -1003,6 +1017,17 @@ Known limitations
   after a PSBT is copied. Review found code paths where such a quit makes
   qbit-qt use freed memory and crash. The send confirmation case is fixed
   (#348); the others are tracked in #349.
+- While the file dialog of the PSBT dialog's Save is open, an accessibility
+  client, such as VoiceOver, or a UI automation tool can still press Sign or
+  Close in the PSBT dialog behind it; mouse and keyboard input cannot. Sign
+  then makes a signing attempt, which consumes PQC signing capacity, but Save
+  writes the PSBT without the new signatures, and Close can make qbit-qt use
+  the freed dialog. Do not press PSBT dialog buttons through such tools while
+  saving (#364).
+- With coin control enabled and no fee estimate, the coin-control panel on
+  the Send page can show a small change amount, such as about 0.00001 QBT,
+  that the wallet then adds to the fee. The fee and total in the send
+  confirmation are correct (#365).
 - Wallet files can keep key material that encryption should have removed.
   `walletpassphrasechange` leaves the master key wrapped with the old
   passphrase in the file's free space (#294). A failed write or erase while
@@ -1046,8 +1071,6 @@ Known limitations
   loader still accepts encrypted key records without a counter tag or with an
   older one, so anyone who can write to the wallet file can roll a counter
   back (#288). Keep only one copy of a wallet that signs.
-- A qbit-qt address-book deletion that coincides with another wallet write
-  can deadlock the wallet (#293).
 - A local client of the IPC mining interface (`qbit-node -ipcbind`) can stop
   `qbit-node`. When `submitSolution` rejects a block version that has the
   AuxPoW bit set, the template keeps that version, and the next `getBlock` or
