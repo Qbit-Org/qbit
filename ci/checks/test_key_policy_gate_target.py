@@ -92,12 +92,12 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
         """Sign the gate manifest of HEAD and commit the approvals; return the approvals directory."""
 
         if manifest is None:
-            lines = []
-            for path in sorted(key_policy_gate.GATE_CODE_PATHS):
-                if subprocess.run(["git", "cat-file", "-e", f"HEAD:{path}"], cwd=self.repo).returncode == 0:
-                    blob = subprocess.run(["git", "cat-file", "blob", f"HEAD:{path}"], cwd=self.repo, capture_output=True, check=True).stdout
-                    lines.append(f"{hashlib.sha256(blob).hexdigest()}  {path}\n")
-            manifest = "".join(lines).encode()
+            previous = os.getcwd()
+            os.chdir(self.repo)
+            try:
+                manifest = key_policy_gate.gate_manifest(self.base, "HEAD")
+            finally:
+                os.chdir(previous)
         directory = self.repo / key_policy_gate.GATE_APPROVALS_DIR / hashlib.sha256(manifest).hexdigest()
         directory.mkdir(parents=True)
         (directory / "gate.SHA256").write_bytes(manifest)
@@ -178,6 +178,55 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
         )
         self.commit("approval by another subkey")
         self.assert_target_refused("operator-01.asc: not a good signature by operator-01 over gate.SHA256")
+
+    def test_target_runs_isolated_from_files_beside_the_gate(self) -> None:
+        # A module beside the gate in the base must not stand in for one it imports.
+        (self.repo / "ci" / "release" / "json.py").write_text("raise SystemExit('json.py was imported')\n", encoding="utf8")
+        self.commit("a file beside the gate")
+        self.land()
+        (self.repo / KEYS / "keys.json").write_bytes(self.policies[1])
+        self.commit("sequence 1 policy")
+        result = self.run_target()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("json.py was imported", result.stdout + result.stderr)
+        self.assertIn("validate_key_metadata.py refused the change", result.stdout)
+
+    def test_target_needs_each_release_lines_quorum_for_a_gate_change(self) -> None:
+        data = self.policy_data(3, ["operator-01", "operator-02", "operator-04"], self.policies[2])
+        data["release_lines"]["mainnet"] = dict(data["release_lines"]["testnet"], active_signer_set_size=1, release_signature_quorum=1, builder_attestation_quorum=1, policy_change_quorum=1)
+        data["signers"].append(dict(data["signers"][0], alias="operator-05", signing_fingerprint=self.signers["operator-05"]["signing"],
+                                    public_key_file="public-keys/operator-05-release.asc", release_lines=["mainnet"]))
+        self.write_raw_policy(data, ["operator-01", "operator-02"])
+        self.commit("a base with a mainnet line")
+        self.land()
+        self.edit("ci/release/validate_key_metadata.py")
+        self.commit("change the validator")
+        self.approve_gate_change(["operator-01", "operator-02"])
+        self.assert_target_refused("needs 1 approval(s) over")
+        self.assertIn("active mainnet signers, got 0", self.run_target().stdout)
+
+    def test_target_approvals_hold_only_for_the_base_they_name(self) -> None:
+        self.edit("ci/release/validate_key_metadata.py", "# first\n")
+        self.commit("first gate change")
+        first = (self.repo / contract.VALIDATOR).read_bytes()
+        self.approve_gate_change(["operator-01", "operator-02"])
+        self.land()
+        self.edit("ci/release/validate_key_metadata.py", "# second\n")
+        self.commit("second gate change")
+        self.approve_gate_change(["operator-01", "operator-02"])
+        self.land()
+        # Restoring the first version needs approvals for this change, not the old ones.
+        (self.repo / contract.VALIDATOR).write_bytes(first)
+        self.commit("restore the first version")
+        self.assert_target_refused("this change to the gate's code needs contrib/keys/gate-approvals/")
+
+    def test_target_refuses_another_check_under_the_gates_name(self) -> None:
+        workflow = self.repo / ".github" / "workflows" / "other.yml"
+        workflow.parent.mkdir(parents=True, exist_ok=True)
+        workflow.write_text("jobs:\n  other:\n    name: Key Policy Gate\n    runs-on: ubuntu-24.04\n", encoding="utf8")
+        self.commit("another workflow")
+        self.approve_gate_change(["operator-01", "operator-02"])
+        self.assert_target_refused("names something 'Key Policy Gate'")
 
     def test_target_refuses_approvals_of_another_manifest(self) -> None:
         self.edit("ci/release/validate_key_metadata.py")

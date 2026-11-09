@@ -1094,7 +1094,7 @@ def keys_md_section(text: str, path: Path) -> tuple[int, int]:
     if text.count(KEYS_MD_BEGIN) != 1 or text.count(KEYS_MD_END) != 1:
         raise MetadataError(f"{path}: expected one generated section from keys.json")
     start = text.index(KEYS_MD_BEGIN)
-    end = text.index(KEYS_MD_END) + len(KEYS_MD_END) + 1
+    end = text.index(KEYS_MD_END) + len(KEYS_MD_END)
     if end <= start:
         raise MetadataError(f"{path}: malformed generated section")
     return start, end
@@ -1108,7 +1108,7 @@ def check_keys_md(keys_dir: Path, data: dict[str, Any]) -> None:
         return
     text = path.read_text(encoding="utf8")
     start, end = keys_md_section(text, path)
-    if text[start:end] != render_keys_md_tables(data):
+    if text[start:end] != render_keys_md_tables(data).rstrip("\n"):
         raise MetadataError(
             f"{path}: its tables do not match keys.json; regenerate them with "
             "ci/release/validate_key_metadata.py --write-keys-md"
@@ -1119,7 +1119,7 @@ def write_keys_md(keys_dir: Path, data: dict[str, Any]) -> None:
     path = keys_dir / "KEYS.md"
     text = path.read_text(encoding="utf8")
     start, end = keys_md_section(text, path)
-    path.write_text(text[:start] + render_keys_md_tables(data) + text[end:], encoding="utf8")
+    path.write_text(text[:start] + render_keys_md_tables(data).rstrip("\n") + text[end:], encoding="utf8")
 
 
 def compare_operator_mirror(canonical: dict[str, Any], mirror: dict[str, Any]) -> None:

@@ -145,30 +145,42 @@ against its merge base with the base branch:
 
 - A change to the key policy (any path the classifier routes to the key job)
   gets the checks above, run by the base's validator.
-- A change to the gate's own code (`GATE_CODE_PATHS` in the base's
-  `key_policy_gate.py`: this workflow, `required-merge-gate.yml`,
-  `.github/CODEOWNERS`, the classifier, the release validators, the gate
-  script and its tests, and this README) needs approvals by the base policy's
-  signers, as below.
+- A change to the gate's own code (`GATE_CODE_PATHS` and
+  `GATE_CODE_PREFIXES` in the base's `key_policy_gate.py`: every workflow under
+  `.github/workflows/`, since any workflow could post a check under the gate's
+  name, `.github/CODEOWNERS`, the classifier, the release validators, the
+  gate script and its tests, and this README) needs approvals by the base
+  policy's signers, as below. Only `key-policy-gate.yml` may name anything
+  `Key Policy Gate`.
 - Any other file under `contrib/keys/` is refused.
 
 A gate change is approved in `contrib/keys/gate-approvals/<id>/`:
 
 ```text
-gate.SHA256       one line "<sha256>  <path>\n" for every GATE_CODE_PATHS file
-                  present in the pull request's head, sorted by path; the
-                  sha256 is that of the file's bytes
+gate.SHA256       "base  <sha256>\n", the SHA-256 of the base's own file lines
+                  below, then one line "<sha256>  <path>\n" for every gate code
+                  file in the pull request's head, sorted by path; each sha256
+                  is that of the file's bytes
 approval-note.md  what the change is and why
 <alias>.asc       detached signatures over gate.SHA256
 ```
 
 `<id>` is the SHA-256 of `gate.SHA256`. The base's code computes the manifest
-from the head's git objects and requires that directory, with that exact
-`gate.SHA256`, and good signatures (as release validators count them) by at
-least the base policy's highest `policy_change_quorum` of its active signers,
-with distinct primary keys, verified with the base's certificates. No other
-gate-approval directory may change in the same pull request. The workflow
-reaches a pull request only once its base branch holds it.
+from the base's and the head's git objects and requires that directory, with
+that exact `gate.SHA256`, and good signatures (as release validators count
+them) with distinct primary keys, verified with the base's certificates, that
+meet every release line's `policy_change_quorum` from that line's active
+signers. Because the manifest names the base, an approval covers one change
+from one base: a later base, or restoring an earlier gate version, needs new
+signatures. No other gate-approval directory may change in the same pull
+request.
+
+The job runs the gate isolated (`python3 -I`, with the gate's directories
+looked up after the standard library), so a file added beside it cannot stand
+in for a module it imports. It runs again when a pull request's base branch
+changes. It fetches the pull request without credentials, which works for this
+public repository. The workflow reaches a pull request only once its base
+branch holds it, so it does not check the pull request that adds it.
 
 Release validators count a signature only when gpg's GOODSIG and VALIDSIG
 agree and gpg reports no revoked or expired key or other error for it

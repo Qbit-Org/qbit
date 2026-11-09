@@ -7,7 +7,8 @@ name: Key Policy Gate
 # from the pull request runs here. See contrib/keys/README.md.
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened, ready_for_review]
+    # edited: a new base branch means the gate runs again against it.
+    types: [opened, synchronize, reopened, edited, ready_for_review]
 
 permissions:
   contents: read
@@ -54,5 +55,5 @@ jobs:
           BASE_SHA: ${{ github.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          python3 ci/release/key_policy_gate.py target \
+          python3 -I ci/release/key_policy_gate.py target \
             --base "${BASE_SHA}" --head "${HEAD_SHA}" --work "${RUNNER_TEMP}/key-policy-gate"

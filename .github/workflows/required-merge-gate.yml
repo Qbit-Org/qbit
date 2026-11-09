@@ -183,7 +183,6 @@ jobs:
           # contrib/keys/operator-keys is the only copy of the release key
           # policy in this repository. Mirrors and downstream pins are checked
           # against it by their own consumers (see contrib/keys/README.md).
-          canonical_dir="contrib/keys/operator-keys"
 
           # The policy is checked against the base's: a changed keys.json must
           # follow the base policy directly, with approvals verified against the
@@ -207,7 +206,7 @@ jobs:
           # archive, and checked by ci/release/key_policy_gate.py: the trees,
           # attributes and case-insensitive paths, then this checkout's
           # validator and the base's own (see contrib/keys/README.md).
-          python3 ci/release/key_policy_gate.py policy \
+          python3 -I ci/release/key_policy_gate.py policy \
             --base "${base}" --head HEAD --work "${RUNNER_TEMP}/key-policy"
 
   release-policy-validation:

@@ -26,24 +26,28 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import unicodedata
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(HERE.parent / "checks"))
+# Run with `python3 -I`, and look in these directories after the standard
+# library, so no file added beside the gate can stand in for a module it
+# imports.
+sys.path.append(str(HERE))
+sys.path.append(str(HERE.parent / "checks"))
 
 import classify_merge_profile  # noqa: E402
 import validate_key_metadata as key_metadata  # noqa: E402
 
 POLICY_DIR = "contrib/keys/operator-keys"
 GATE_APPROVALS_DIR = "contrib/keys/gate-approvals"
-# The gate's own code and its description: a change to any of these needs
-# approvals by the base policy's signers over a manifest of their contents.
+GATE_CHECK_NAME = "Key Policy Gate"
+GATE_WORKFLOW = ".github/workflows/key-policy-gate.yml"
+# The gate's own code and its description: a change to any of these, or to any
+# workflow (a workflow can post a check under the gate's name), needs approvals
+# by the base policy's signers over a manifest of their contents.
+GATE_CODE_PREFIXES = (".github/workflows/",)
 GATE_CODE_PATHS = (
     ".github/CODEOWNERS",
-    ".github/workflows/key-policy-gate.yml",
-    ".github/workflows/required-merge-gate.yml",
     "ci/checks/classify_merge_profile.py",
     "ci/checks/test_key_policy_gate_contract.py",
     "ci/checks/test_key_policy_gate_target.py",
@@ -70,8 +74,11 @@ def git(*args: str, data: bytes | None = None) -> bytes:
     return result.stdout
 
 
-def fold(text: str) -> str:
-    return unicodedata.normalize("NFKC", text).casefold()
+fold = classify_merge_profile.fold_path
+
+
+def is_gate_code(path: str) -> bool:
+    return path in GATE_CODE_PATHS or path.startswith(GATE_CODE_PREFIXES)
 
 
 def split_nul(data: bytes) -> list[bytes]:
@@ -189,10 +196,16 @@ def file_map(directory: Path) -> dict[str, bytes]:
     }
 
 
+def python(script: Path) -> list[str]:
+    """Run `script` isolated (-I): no script directory or user site on its path."""
+
+    return [sys.executable, "-I", str(script)]
+
+
 def run(command: list[str]) -> None:
     sys.stdout.flush()
     if subprocess.run(command, check=False).returncode != 0:
-        raise GateError(f"{Path(command[1]).name} refused the change")
+        raise GateError(f"{Path(command[2]).name} refused the change")
 
 
 def check_policy(base: str, head: str, work: Path) -> None:
@@ -202,9 +215,10 @@ def check_policy(base: str, head: str, work: Path) -> None:
     extract_policy(head, head_dir, check_attributes=True)
     extract_policy(base, base_dir, check_attributes=False)
     check_folded_paths(head)
+    if (base_dir / "KEYS.md").is_file() and not (head_dir / "KEYS.md").is_file():
+        raise GateError(f"{POLICY_DIR}/KEYS.md is at the base and must stay")
     head_args = [
-        sys.executable,
-        str(HERE / "validate_key_metadata.py"),
+        *python(HERE / "validate_key_metadata.py"),
         "--operator-policy", str(head_dir / "keys.json"),
         "--operator-keys-dir", str(head_dir),
         "--require-public-key-files",
@@ -227,7 +241,7 @@ def check_policy(base: str, head: str, work: Path) -> None:
     base_validator = work / "base-validator.py"
     base_validator.write_bytes(git("cat-file", "blob", entry[2]))
     base_args = [
-        sys.executable, str(base_validator),
+        *python(base_validator),
         "--operator-policy", str(head_dir / "keys.json"),
         "--operator-keys-dir", str(head_dir),
         "--require-public-key-files",
@@ -241,24 +255,52 @@ def check_policy(base: str, head: str, work: Path) -> None:
     run(base_args)
 
 
-def gate_manifest(head: str) -> bytes:
-    """`<sha256>  <path>` for every gate code path present at `head`, sorted by path."""
+def gate_files(rev: str) -> dict[str, bytes]:
+    """The gate code files at `rev`: GATE_CODE_PATHS and every file under GATE_CODE_PREFIXES."""
 
-    lines = []
-    for path in sorted(GATE_CODE_PATHS):
-        entry = tree_entry(head, path)
+    files: dict[str, bytes] = {}
+    candidates = [(path, tree_entry(rev, path)) for path in GATE_CODE_PATHS]
+    for prefix in GATE_CODE_PREFIXES:
+        for mode, kind, oid, name in blob_entries(rev, prefix):
+            candidates.append((name, (mode, kind, oid)))
+    for path, entry in candidates:
         if entry is None:
             continue
         if entry[:2] not in {("100644", "blob"), ("100755", "blob")}:
-            raise GateError(f"{head}:{path} is not a regular file (mode {entry[0]})")
-        lines.append(f"{hashlib.sha256(git('cat-file', 'blob', entry[2])).hexdigest()}  {path}\n")
-    return "".join(lines).encode()
+            raise GateError(f"{rev}:{path} is not a regular file (mode {entry[0]})")
+        files[path] = git("cat-file", "blob", entry[2])
+    return files
+
+
+def gate_manifest(base: str, head: str) -> bytes:
+    """The manifest a gate change is approved over.
+
+    Its first line names the base's gate code (`base  <sha256 of the base's
+    file lines>`), so approvals hold only for the change from that base; then
+    `<sha256>  <path>` for every gate code file at `head`, sorted by path.
+    """
+
+    def file_lines(rev: str) -> str:
+        return "".join(f"{hashlib.sha256(data).hexdigest()}  {path}\n" for path, data in sorted(gate_files(rev).items()))
+
+    base_lines = file_lines(base)
+    return (f"base  {hashlib.sha256(base_lines.encode()).hexdigest()}\n" + file_lines(head)).encode()
+
+
+def check_gate_check_name(head: str) -> None:
+    """Only key-policy-gate.yml may define a job named like the required check."""
+
+    pattern = re.compile(rf"^\s*name:\s*[\"']?{re.escape(GATE_CHECK_NAME)}[\"']?\s*$", re.MULTILINE | re.IGNORECASE)
+    for path, data in sorted(gate_files(head).items()):
+        if path.startswith(".github/workflows/") and path != GATE_WORKFLOW and pattern.search(data.decode("utf8", errors="replace")):
+            raise GateError(f"{path} names something '{GATE_CHECK_NAME}'; only {GATE_WORKFLOW} may")
 
 
 def check_gate_approvals(base: str, head: str, changed: list[str], work: Path) -> str:
     """A change to the gate's code needs its manifest signed by the base policy's quorum."""
 
-    manifest = gate_manifest(head)
+    check_gate_check_name(head)
+    manifest = gate_manifest(base, head)
     approval_dir = f"{GATE_APPROVALS_DIR}/{hashlib.sha256(manifest).hexdigest()}"
     stray = [path for path in changed if path.startswith(GATE_APPROVALS_DIR + "/") and not path.startswith(approval_dir + "/")]
     if stray:
@@ -284,7 +326,6 @@ def check_gate_approvals(base: str, head: str, changed: list[str], work: Path) -
     projection = key_metadata.validate_operator_policy(
         base_dir / "keys.json", base_dir, require_files=False, validate_transition=False
     )
-    required = key_metadata.required_policy_change_quorum(projection)
     active = {signer["alias"]: signer for signer in projection["signers"] if signer["status"] == "active"}
     manifest_path = work / "gate.SHA256"
     manifest_path.write_bytes(manifest)
@@ -315,11 +356,16 @@ def check_gate_approvals(base: str, head: str, changed: list[str], work: Path) -
             if primary in counted:
                 raise GateError(f"{approval_dir}/{relative}: {alias} shares a primary key with {counted[primary]}")
             counted[primary] = alias
-    if len(counted) < required:
-        raise GateError(
-            f"this change to the gate's code needs {required} approval(s) over {approval_dir}/gate.SHA256 "
-            f"from the base policy's active signers, got {len(counted)}"
-        )
+    # As for a policy change: each release line's own signers must meet that line's quorum.
+    approvers = set(counted.values())
+    for line, settings in sorted(projection["release_lines"].items()):
+        required = settings["policy_change_quorum"]
+        line_approvers = approvers & key_metadata.active_aliases_for_line(projection, line)
+        if len(line_approvers) < required:
+            raise GateError(
+                f"this change to the gate's code needs {required} approval(s) over {approval_dir}/gate.SHA256 "
+                f"from the base policy's active {line} signers, got {len(line_approvers)}"
+            )
     return f"gate change approved by {', '.join(sorted(counted.values()))}"
 
 
@@ -330,13 +376,13 @@ def check_target(base: str, head: str, work: Path) -> None:
         for name in split_nul(git("diff", "--no-renames", "--name-only", "-z", merge_base, head))
     ]
     policy = [path for path in changed if classify_merge_profile.touches_operator_keys(path)]
-    gate = [path for path in changed if path in GATE_CODE_PATHS]
+    gate = [path for path in changed if is_gate_code(path)]
     approvals = [path for path in changed if path.startswith(GATE_APPROVALS_DIR + "/")]
     other = [
         path
         for path in changed
         if path.startswith("contrib/keys/")
-        and path not in GATE_CODE_PATHS
+        and not is_gate_code(path)
         and not path.startswith(POLICY_DIR + "/")
         and not path.startswith(GATE_APPROVALS_DIR + "/")
     ]

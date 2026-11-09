@@ -792,6 +792,14 @@ class KeyPolicyGateContractTest(unittest.TestCase):
         self.commit("KEYS.md shows another quorum")
         self.assert_refused("its tables do not match keys.json")
 
+    def test_keys_md_cannot_be_dropped(self) -> None:
+        self.write_keys_md()
+        self.commit("KEYS.md")
+        self.land()
+        (self.repo / KEYS / "KEYS.md").unlink()
+        self.commit("drop KEYS.md")
+        self.assert_refused("KEYS.md is at the base and must stay")
+
     def test_a_policy_change_without_signatures_is_refused(self) -> None:
         self.write_policy(3, ["operator-01", "operator-04", "operator-05"], previous=self.policies[2], approvers=[])
         approval_dir = self.repo / KEYS / "approvals" / "qbit-release-keys-testnet-000003"

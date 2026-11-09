@@ -65,12 +65,15 @@ def fold_path(path: str) -> str:
     return unicodedata.normalize("NFKC", path).casefold()
 
 
+FOLDED_OPERATOR_KEYS_PATH_ENTRIES = {fold_path(entry): entry for entry in OPERATOR_KEYS_PATH_ENTRIES}
+
+
 def touches_operator_keys(path: str) -> bool:
     # Folded, so that case and Unicode-compatibility variants of the policy
     # path or of .gitattributes, which case-insensitive checkouts treat as
     # the same file, are routed too.
     folded = fold_path(path)
-    entries = {fold_path(entry): entry for entry in OPERATOR_KEYS_PATH_ENTRIES}
+    entries = FOLDED_OPERATOR_KEYS_PATH_ENTRIES
     components = path.split("/")
     prefixes = ["/".join(components[:depth]) for depth in range(1, len(components) + 1)]
     return (
