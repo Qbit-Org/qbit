@@ -9,6 +9,7 @@ add_executable(test_bitcoin-qt
   clientmodeltests.cpp
   modaloverlaytests.cpp
   optiontests.cpp
+  pokertests.cpp
   rpcnestedtests.cpp
   test_main.cpp
   uritests.cpp

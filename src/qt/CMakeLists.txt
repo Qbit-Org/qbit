@@ -105,6 +105,20 @@ add_library(bitcoinqt STATIC EXCLUDE_FROM_ALL
   peertablesortproxy.h
   platformstyle.cpp
   platformstyle.h
+  poker/bot.cpp
+  poker/bot.h
+  poker/cards.cpp
+  poker/cards.h
+  poker/game.cpp
+  poker/game.h
+  poker/handeval.cpp
+  poker/handeval.h
+  pokerlobby.cpp
+  pokerlobby.h
+  pokertable.cpp
+  pokertable.h
+  pokertableview.cpp
+  pokertableview.h
   qvalidatedlineedit.cpp
   qvalidatedlineedit.h
   qvaluecombobox.cpp
