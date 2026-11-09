@@ -315,12 +315,17 @@ def export_trusted_tree(git: str, root: Path, ref: str, destination: Path) -> No
     )
     offset = 0
     for path, oid in files:
-        header_end = batch.index(b"\n", offset)
-        header = batch[offset:header_end].decode("ascii").split()
-        if len(header) != 3 or header[0] != oid or header[1] != "blob":
-            raise ReleaseToolError(f"Unexpected git cat-file output for {path}")
-        size = int(header[2])
+        try:
+            header_end = batch.index(b"\n", offset)
+            header = batch[offset:header_end].decode("ascii").split()
+            if len(header) != 3 or header[0] != oid or header[1] != "blob":
+                raise ValueError(header)
+            size = int(header[2])
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise ReleaseToolError(f"Unexpected git cat-file output for {path}") from exc
         content = batch[header_end + 1 : header_end + 1 + size]
+        if len(content) != size or batch[header_end + 1 + size : header_end + 2 + size] != b"\n":
+            raise ReleaseToolError(f"Truncated git cat-file output for {path}")
         offset = header_end + 1 + size + 1
         target = destination.joinpath(*PurePosixPath(path).parts)
         target.parent.mkdir(parents=True, exist_ok=True)

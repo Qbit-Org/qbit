@@ -240,9 +240,12 @@ The stage directory is then ready for `publish-local-release.sh`.
 All outputs are assembled in a private scratch directory next to their
 destination (`.<name>.tmp-*`) and moved into place only after they verify.
 Where hard links are not available (exFAT media, some network filesystems, or
-a stage directory that is a mount point), the verified file is written to a
-temporary file in the destination directory, flushed to disk and renamed into
-place. The destination is never partially written, but on that path refusing
+a stage directory that is a mount point when the signing and combining tools
+write into it), the verified file is written to a temporary file in the
+destination directory, flushed to disk and renamed into place.
+`stage-release-artifacts.py` builds the stage next to `--stage-dir` and renames
+it into place, so it refuses a `--stage-dir` that is a mount point: give a new
+directory inside the mount instead. The destination is never partially written, but on that path refusing
 to overwrite is best effort: a file that appears between the check and the
 rename is replaced.
 

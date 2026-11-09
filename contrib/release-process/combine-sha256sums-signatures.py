@@ -40,22 +40,19 @@ if sys.path and os.path.realpath(sys.path[0] or os.curdir) == _TOOL_DIR:
     del sys.path[0]
 sys.dont_write_bytecode = True
 
-import atexit  # noqa: E402
-import importlib.util  # noqa: E402
-import shutil  # noqa: E402
-import tempfile  # noqa: E402
-
-sys.pycache_prefix = tempfile.mkdtemp(prefix="qbit-release-tools-pycache-")
-atexit.register(shutil.rmtree, sys.pycache_prefix, True)
+import types  # noqa: E402
 
 
 def _load_common():  # type: ignore[no-untyped-def]
+    # Compile the shared module from its source, so no bytecode beside it is
+    # ever read; the validators are imported from a fresh export of the ref.
     path = os.path.join(_TOOL_DIR, "release_staging_common.py")
-    spec = importlib.util.spec_from_file_location("release_staging_common", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
+    with open(path, "rb") as source:
+        code = compile(source.read(), path, "exec", dont_inherit=True)
+    module = types.ModuleType("release_staging_common")
+    module.__file__ = path
+    sys.modules[module.__name__] = module
+    exec(code, module.__dict__)
     return module
 
 

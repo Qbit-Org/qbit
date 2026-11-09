@@ -40,35 +40,38 @@ if sys.path and os.path.realpath(sys.path[0] or os.curdir) == _TOOL_DIR:
     del sys.path[0]
 sys.dont_write_bytecode = True
 
-import atexit  # noqa: E402
-import importlib.util  # noqa: E402
-import shutil  # noqa: E402
-import tempfile  # noqa: E402
-
-sys.pycache_prefix = tempfile.mkdtemp(prefix="qbit-release-tools-pycache-")
-atexit.register(shutil.rmtree, sys.pycache_prefix, True)
+import types  # noqa: E402
 
 
 def _load_common():  # type: ignore[no-untyped-def]
+    # Compile the shared module from its source, so no bytecode beside it is
+    # ever read; the validators are imported from a fresh export of the ref.
     path = os.path.join(_TOOL_DIR, "release_staging_common.py")
-    spec = importlib.util.spec_from_file_location("release_staging_common", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
+    with open(path, "rb") as source:
+        code = compile(source.read(), path, "exec", dont_inherit=True)
+    module = types.ModuleType("release_staging_common")
+    module.__file__ = path
+    sys.modules[module.__name__] = module
+    exec(code, module.__dict__)
     return module
 
 
 common = _load_common()
 
 import argparse  # noqa: E402
+import errno  # noqa: E402
 import re  # noqa: E402
+import shutil  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
 from pathlib import Path  # noqa: E402
 from typing import Any  # noqa: E402
 
 
 TAG_RE = re.compile(r"^v[A-Za-z0-9][A-Za-z0-9._-]*$")
+MOUNT_POINT_ADVICE = (
+    "the stage is built next to --stage-dir and renamed into place, so give a new directory on the same "
+    "filesystem as its parent, for example inside the mount"
+)
 ARTIFACT_SETS = ("core", "photon")
 
 
@@ -494,7 +497,8 @@ def assemble_stage(
         try:
             os.rename(scratch, stage_dir)
         except OSError as exc:
-            raise common.ReleaseToolError(f"Cannot move the verified stage into {stage_dir}: {exc}") from exc
+            hint = f"; {MOUNT_POINT_ADVICE}" if exc.errno in (errno.EBUSY, errno.EXDEV) else ""
+            raise common.ReleaseToolError(f"Cannot move the verified stage into {stage_dir}: {exc}{hint}") from exc
         common.record_written(stage_dir)
 
 
@@ -546,6 +550,8 @@ def main(argv: list[str] | None = None) -> int:
 def stage(args: argparse.Namespace) -> int:
     if not TAG_RE.fullmatch(args.tag):
         raise common.ReleaseToolError(f"--tag must be a safe v-prefixed release tag: {args.tag!r}")
+    if args.stage_dir is not None and os.path.ismount(args.stage_dir):
+        raise common.ReleaseToolError(f"--stage-dir {args.stage_dir} is a mount point; {MOUNT_POINT_ADVICE}")
     common.note_non_default_gpg(args.gpg)
     with common.open_trusted_release(Path(__file__), args.trusted_release_ref, git=common.GIT) as checkout:
         validators = checkout.validators

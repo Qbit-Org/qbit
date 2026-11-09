@@ -488,6 +488,7 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         tag_object_during_immutable_poll: str | None = None,
         mutate_notes_file: Path | None = None,
         asset_list_sequence: tuple[str, ...] = ("ok",),
+        cwd: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = dict(os.environ)
         env["PATH"] = f"{self.bin_dir}{os.pathsep}{env['PATH']}"
@@ -546,7 +547,7 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         if release_line == "testnet":
             args.extend(["--testnet-posture-evidence", str(self.posture)])
         args.extend(extra_args)
-        return subprocess.run(args, check=False, capture_output=True, text=True, env=env)
+        return subprocess.run(args, check=False, capture_output=True, text=True, env=env, cwd=cwd)
 
     def assert_no_write_after_failed_asset_list(self) -> None:
         """Fail if gh changed the release before a failed listing was superseded."""
@@ -689,6 +690,19 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         self.assertIn("/trusted-ref/ci/release/validate_release_artifacts.py", validator_log)
         self.assertIn("/trusted-ref/contrib/keys/operator-keys/keys.json", validator_log)
         self.assertNotIn(f"{self.trusted.resolve()}/contrib/keys", validator_log)
+
+    def test_modules_in_the_callers_directory_never_load(self) -> None:
+        marker = self.root / "shadowed.log"
+        caller = self.root / "caller"
+        caller.mkdir()
+        for module in ("hashlib", "json"):
+            (caller / f"{module}.py").write_text(
+                f"open({str(marker)!r}, 'a', encoding='utf8').write('{module}\\n')\n", encoding="utf8"
+            )
+
+        result = self.run_publisher(cwd=caller)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(marker.exists(), marker.read_text(encoding="utf8") if marker.exists() else "")
 
     def test_replace_ref_does_not_change_what_is_read(self) -> None:
         trusted_head = self.trusted_ref

@@ -16,8 +16,10 @@ export GIT_NO_REPLACE_OBJECTS=1
 export GIT_GRAFT_FILE=/dev/null
 # Python runs without PYTHON* environment variables, user or site packages,
 # startup hooks or bytecode; everything it runs needs only the standard
-# library. (Not -I: the validators import their siblings from their own
-# directory, the exported trusted ref.)
+# library. Inline snippets are fully isolated (-I keeps the current directory
+# off sys.path). The validators run with -E -s instead of -I, because they
+# import their siblings from their own directory, the exported trusted ref.
+PYTHON_SNIPPET=(python3 -I -S -B)
 PYTHON=(python3 -E -s -S -B)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -172,6 +174,10 @@ export_trusted_paths() {
     local mode
     local type
     local object
+    local listing="$destination/.ls-tree"
+    mkdir -p "$destination"
+    git -C "$root" ls-tree -r -z --full-tree "$ref" -- "$@" > "$listing" \
+        || die "Could not list $* at trusted release ref $ref"
     while IFS= read -r -d '' entry; do
         meta="${entry%%$'\t'*}"
         path="${entry#*$'\t'}"
@@ -184,8 +190,9 @@ export_trusted_paths() {
             */../*|*/./*|*//*) die "Trusted release ref has an unsafe path: $path" ;;
         esac
         mkdir -p "$destination/$(dirname "$path")"
-        git -C "$root" cat-file blob "$object" > "$destination/$path"
-    done < <(git -C "$root" ls-tree -r -z --full-tree "$ref" -- "$@")
+        git -C "$root" cat-file blob "$object" > "$destination/$path" \
+            || die "Could not read $path at trusted release ref $ref"
+    done < "$listing"
 }
 
 github_repo_path() {
@@ -406,7 +413,7 @@ wait_for_published_immutable_release() {
 prepare_release_notes() {
     if [ -n "$NOTES_FILE" ]; then
         EFFECTIVE_NOTES_FILE="$WORK_DIR/explicit-release-notes.md"
-        "${PYTHON[@]}" - "$NOTES_FILE" "$EFFECTIVE_NOTES_FILE" <<'PY'
+        "${PYTHON_SNIPPET[@]}" - "$NOTES_FILE" "$EFFECTIVE_NOTES_FILE" <<'PY'
 import sys
 from pathlib import Path
 
@@ -430,7 +437,7 @@ PY
         --method POST \
         -f "tag_name=$TAG" > "$response" \
         || die "Could not generate release notes for $TAG"
-    "${PYTHON[@]}" - "$response" "$EFFECTIVE_NOTES_FILE" <<'PY'
+    "${PYTHON_SNIPPET[@]}" - "$response" "$EFFECTIVE_NOTES_FILE" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -448,7 +455,7 @@ verify_release_notes() {
     [ -n "$RELEASE_ID" ] || die "Cannot verify release notes without a release ID"
     gh api "repos/$GH_REPO_PATH/releases/$RELEASE_ID" > "$response" \
         || die "Could not inspect release $RELEASE_ID"
-    "${PYTHON[@]}" - "$EFFECTIVE_NOTES_FILE" "$response" <<'PY'
+    "${PYTHON_SNIPPET[@]}" - "$EFFECTIVE_NOTES_FILE" "$response" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -498,7 +505,7 @@ asset_list_failure() {
 compare_asset_manifests() {
     local mode="$1"
     local remote_manifest="$2"
-    "${PYTHON[@]}" - "$LOCAL_ASSET_MANIFEST" "$remote_manifest" "$mode" <<'PY'
+    "${PYTHON_SNIPPET[@]}" - "$LOCAL_ASSET_MANIFEST" "$remote_manifest" "$mode" <<'PY'
 import sys
 from pathlib import Path
 
@@ -793,6 +800,8 @@ require_clean_checkout "Trusted release checkout" "$TRUSTED_ROOT"
 require_plain_index "Trusted release checkout" "$TRUSTED_ROOT" \
     contrib/release-process ci/release contrib/keys
 
+# Checked here to fail before any network call; the files that actually run are
+# checked again after they are exported from the trusted ref below.
 required_trusted_paths=(
     ci/release/validate_release_artifacts.py
     ci/release/validate_builder_attestations.py
@@ -872,6 +881,10 @@ export_trusted_paths "$TRUSTED_ROOT" "$TRUSTED_RELEASE_REF" "$TRUSTED_EXPORT" \
     ci/release contrib/keys/operator-keys
 VALIDATORS="$TRUSTED_EXPORT/ci/release"
 TRUSTED_KEYS_DIR="$TRUSTED_EXPORT/contrib/keys/operator-keys"
+for required_path in "${required_trusted_paths[@]}"; do
+    [ -f "$TRUSTED_EXPORT/$required_path" ] \
+        || die "Trusted release ref $TRUSTED_RELEASE_REF does not contain $required_path"
+done
 [ -z "$NOTES_FILE" ] || prepare_release_notes
 
 if [ "$RELEASE_LINE" = mainnet ]; then
@@ -977,7 +990,7 @@ for upload_file in "${upload_files[@]}"; do
         || die "Validated upload filename must not contain #: $asset_name"
 done
 
-"${PYTHON[@]}" - "$LOCAL_ASSET_MANIFEST" "${upload_files[@]}" <<'PY'
+"${PYTHON_SNIPPET[@]}" - "$LOCAL_ASSET_MANIFEST" "${upload_files[@]}" <<'PY'
 import hashlib
 import sys
 from pathlib import Path
