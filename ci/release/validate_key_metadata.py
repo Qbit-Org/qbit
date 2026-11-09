@@ -736,6 +736,216 @@ def validate_operator_policy(
     return projection
 
 
+def read_certificate(gpg: str, path: Path) -> dict[str, Any]:
+    """The primary keys, keys and signature records of one armored certificate.
+
+    gpg reads it in a throwaway home, so nothing else is in the keyring. A
+    signature record drops its validity field, which depends on the keyring.
+    """
+
+    if not path.is_file():
+        raise MetadataError(f"missing signer public certificate {path}")
+    with tempfile.TemporaryDirectory(prefix="qkm-cert-") as home:
+        Path(home).chmod(0o700)
+        result = run_command(
+            [
+                gpg,
+                "--batch",
+                "--no-tty",
+                "--no-autostart",
+                "--homedir",
+                home,
+                "--with-colons",
+                "--fingerprint",
+                "--with-sig-list",
+                "--show-keys",
+                str(path),
+            ]
+        )
+    if result.returncode != 0:
+        raise MetadataError(f"{path}: gpg cannot read the certificate:\n{result.stderr}")
+    primaries: list[str] = []
+    keys: dict[str, dict[str, str]] = {}
+    signatures: set[str] = set()
+    record: list[str] | None = None
+    for line in result.stdout.splitlines():
+        fields = line.split(":")
+        if fields[0] in {"pub", "sub"}:
+            record = fields
+        elif fields[0] == "fpr" and record is not None and len(fields) > 9:
+            fingerprint = normalize_fingerprint(fields[9], path=f"{path} fingerprint")
+            if record[0] == "pub":
+                primaries.append(fingerprint)
+            keys[fingerprint] = {
+                "primary": primaries[-1] if primaries else "",
+                "validity": record[1],
+                "capabilities": record[11] if len(record) > 11 else "",
+            }
+            record = None
+        elif fields[0] in {"sig", "rev"}:
+            signatures.add(":".join(field for index, field in enumerate(fields) if index != 1))
+    return {"primaries": primaries, "keys": keys, "signatures": signatures}
+
+
+def verify_public_key_certificates(projection: dict[str, Any], keys_dir: Path, gpg: str) -> None:
+    """Each signer's certificate holds one primary key with its signing key, and no two signers share one."""
+
+    gpg_path = shutil.which(gpg) if Path(gpg).name == gpg else gpg
+    if not gpg_path:
+        raise MetadataError(f"gpg executable not found: {gpg}")
+    owners: dict[str, str] = {}
+    for signer in projection["signers"]:
+        path = keys_dir / signer["public_key_file"]
+        certificate = read_certificate(gpg_path, path)
+        if len(certificate["primaries"]) != 1:
+            raise MetadataError(
+                f"{path}: certificate must hold exactly one primary key, got {len(certificate['primaries'])}"
+            )
+        primary = certificate["primaries"][0]
+        key = certificate["keys"].get(signer["signing_fingerprint"])
+        if key is None:
+            raise MetadataError(f"{path}: certificate has no key {signer['signing_fingerprint']} for {signer['alias']}")
+        if "s" not in key["capabilities"] or key["validity"] == "r":
+            raise MetadataError(
+                f"{path}: key {signer['signing_fingerprint']} of {signer['alias']} is not a valid signing key"
+            )
+        if primary in owners:
+            raise MetadataError(
+                f"{path}: primary key {primary} of {signer['alias']} is also {owners[primary]}'s primary key"
+            )
+        owners[primary] = signer["alias"]
+
+
+def validate_certificate_continuity(
+    projection: dict[str, Any],
+    keys_dir: Path,
+    base_keys_dir: Path,
+    gpg: str,
+) -> list[str]:
+    """Check signer certificates that changed against BASE under an unchanged keys.json.
+
+    A changed certificate must keep its primary key and its exact set of
+    subkeys, and keep every signature record BASE has, revocations and expiry
+    self-signatures included. It may only add records, such as a refreshed
+    self-signature. Returns the aliases whose certificates changed.
+    """
+
+    gpg_path = shutil.which(gpg) if Path(gpg).name == gpg else gpg
+    if not gpg_path:
+        raise MetadataError(f"gpg executable not found: {gpg}")
+    changed: list[str] = []
+    for signer in projection["signers"]:
+        relative = signer["public_key_file"]
+        head_path = keys_dir / relative
+        base_path = base_keys_dir / relative
+        if not base_path.is_file():
+            raise MetadataError(f"{relative}: certificate is new, but keys.json is unchanged from the base policy")
+        if head_path.read_bytes() == base_path.read_bytes():
+            continue
+        changed.append(signer["alias"])
+        head = read_certificate(gpg_path, head_path)
+        base = read_certificate(gpg_path, base_path)
+        if head["primaries"] != base["primaries"]:
+            raise MetadataError(f"{relative}: certificate change replaces the primary key of {signer['alias']}")
+        if set(head["keys"]) != set(base["keys"]):
+            raise MetadataError(f"{relative}: certificate change adds or removes keys of {signer['alias']}")
+        if not base["signatures"] <= head["signatures"]:
+            raise MetadataError(
+                f"{relative}: certificate change removes signature records of {signer['alias']}"
+            )
+    return changed
+
+
+def approval_files(keys_dir: Path) -> dict[str, bytes]:
+    root = keys_dir / "approvals"
+    if not root.is_dir():
+        return {}
+    return {
+        str(path.relative_to(keys_dir)): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def validate_approval_history(keys_dir: Path, base_keys_dir: Path, new_policy_id: str | None) -> None:
+    """Approval material already at the base stays as it is.
+
+    Every approvals/<policy-id>/ directory the base has must be unchanged, and
+    the only new one allowed is the new policy's, alongside its keys.json.
+    """
+
+    head = approval_files(keys_dir)
+    base = approval_files(base_keys_dir)
+    base_dirs = {Path(name).parts[1] for name in base}
+    for name, data in base.items():
+        if head.get(name) != data:
+            raise MetadataError(f"{name}: approval material already at the base cannot change or be removed")
+    for name in sorted(set(head) - set(base)):
+        policy_dir = Path(name).parts[1]
+        if policy_dir in base_dirs:
+            raise MetadataError(f"{name}: approval material cannot be added to approvals/{policy_dir} after it landed")
+        if policy_dir != new_policy_id:
+            raise MetadataError(f"{name}: approvals/{policy_dir} can only be added with that policy's keys.json")
+
+
+def validate_against_base_policy(
+    projection: dict[str, Any],
+    policy_path: Path,
+    keys_dir: Path,
+    base_keys_dir: Path,
+    approval_dir: Path | None,
+    gpg: str,
+    verify_certificates: bool,
+) -> str:
+    """Tie the checked-in policy to the base branch's: return how it relates.
+
+    Without a base policy only a sequence 1 bootstrap policy may be added. A
+    keys.json that differs from the base's must follow it directly
+    (previous_policy_sha256 is the base digest, policy_sequence one more), with
+    approvals verified against the base policy and the base certificates. An
+    unchanged keys.json with changed certificates gets the continuity checks.
+    """
+
+    base_policy_path = base_keys_dir / "keys.json"
+    if not base_policy_path.is_file():
+        if projection["policy_sequence"] != 1:
+            raise MetadataError(
+                "the base has no operator policy: only a sequence 1 bootstrap policy can be added, "
+                f"not sequence {projection['policy_sequence']}"
+            )
+        return "bootstrap"
+    base_projection = validate_operator_policy(
+        base_policy_path,
+        base_keys_dir,
+        require_files=False,
+        validate_transition=False,
+    )
+    if policy_path.read_bytes() == base_policy_path.read_bytes():
+        validate_approval_history(keys_dir, base_keys_dir, None)
+        if verify_certificates:
+            changed = validate_certificate_continuity(projection, keys_dir, base_keys_dir, gpg)
+            return "unchanged" if not changed else "certificates updated: " + ", ".join(changed)
+        return "unchanged"
+    if projection["policy_sequence"] != base_projection["policy_sequence"] + 1:
+        raise MetadataError(
+            f"policy_sequence {projection['policy_sequence']} must follow the base policy "
+            f"{base_projection['policy_id']} (sequence {base_projection['policy_sequence']}) as "
+            f"{base_projection['policy_sequence'] + 1}"
+        )
+    if projection["previous_policy_sha256"] != base_projection["policy_sha256"]:
+        raise MetadataError(
+            f"previous_policy_sha256 must be the base policy's digest {base_projection['policy_sha256']}"
+        )
+    validate_approval_history(keys_dir, base_keys_dir, projection["policy_id"])
+    validate_policy_transition(
+        projection,
+        base_policy_path,
+        approval_dir or approval_dir_for(keys_dir, projection["policy_id"]),
+        gpg,
+    )
+    return f"follows {base_projection['policy_id']}"
+
+
 def compare_operator_mirror(canonical: dict[str, Any], mirror: dict[str, Any]) -> None:
     if canonical != mirror:
         raise MetadataError(
@@ -757,6 +967,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpg", default=shutil.which("gpg") or "gpg")
     parser.add_argument("--require-public-key-files", action="store_true")
     parser.add_argument(
+        "--verify-public-key-certificates",
+        action="store_true",
+        help=(
+            "Also read each signer certificate with gpg: exactly one primary key, the signer's "
+            "signing key present and signing-capable, no primary key shared by two signers. "
+            "Implies --require-public-key-files."
+        ),
+    )
+    parser.add_argument(
+        "--base-operator-keys-dir",
+        type=Path,
+        help=(
+            "The base branch's operator-keys directory (empty when the base has no policy). "
+            "A changed keys.json must then follow the base policy directly, with approvals "
+            "verified against it and its certificates; certificates changed under an unchanged "
+            "keys.json get continuity checks. Replaces --previous-operator-policy."
+        ),
+    )
+    parser.add_argument(
         "--skip-policy-transition-validation",
         action="store_true",
         help=(
@@ -775,15 +1004,40 @@ def main() -> int:
         reject_symlinked_input(args.operator_keys_dir, label="--operator-keys-dir")
         canonical_policy = args.operator_policy.resolve()
         canonical_keys_dir = args.operator_keys_dir.resolve()
+        require_files = args.require_public_key_files or args.verify_public_key_certificates
+        base_keys_dir = None
+        if args.base_operator_keys_dir is not None:
+            if args.previous_operator_policy or args.skip_policy_transition_validation or args.operator_policy_mirror:
+                raise MetadataError(
+                    "--base-operator-keys-dir replaces --previous-operator-policy and "
+                    "--skip-policy-transition-validation, and takes no mirror"
+                )
+            reject_symlinked_input(args.base_operator_keys_dir, label="--base-operator-keys-dir")
+            base_keys_dir = args.base_operator_keys_dir.resolve()
+            if not base_keys_dir.is_dir():
+                raise MetadataError(f"--base-operator-keys-dir is not a directory: {base_keys_dir}")
         canonical_projection = validate_operator_policy(
             canonical_policy,
             canonical_keys_dir,
-            args.require_public_key_files,
+            require_files,
             previous_policy_path=args.previous_operator_policy.resolve() if args.previous_operator_policy else None,
             approval_dir=args.approval_dir.resolve() if args.approval_dir else None,
             gpg=args.gpg,
-            validate_transition=not args.skip_policy_transition_validation,
+            validate_transition=base_keys_dir is None and not args.skip_policy_transition_validation,
         )
+        if args.verify_public_key_certificates:
+            verify_public_key_certificates(canonical_projection, canonical_keys_dir, args.gpg)
+        if base_keys_dir is not None:
+            relation = validate_against_base_policy(
+                canonical_projection,
+                canonical_policy,
+                canonical_keys_dir,
+                base_keys_dir,
+                args.approval_dir.resolve() if args.approval_dir else None,
+                args.gpg,
+                args.verify_public_key_certificates,
+            )
+            print(f"Base policy: {relation}")
         if args.operator_policy_mirror:
             mirror_keys_dir_arg = args.operator_keys_dir_mirror or args.operator_policy_mirror.parent
             reject_symlinked_input(args.operator_policy_mirror, label="--operator-policy-mirror")

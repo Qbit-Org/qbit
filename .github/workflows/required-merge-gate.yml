@@ -139,6 +139,11 @@ jobs:
       - name: Test merge gate polling contract
         run: /usr/bin/python3 ci/checks/test_merge_gate_poller.py -v
 
+      # The operator-key step must tie a changed policy to the base's: lift it
+      # out of this workflow and run it against scratch key-policy histories.
+      - name: Test operator key policy gate contract
+        run: /usr/bin/python3 ci/checks/test_key_policy_gate_contract.py -v
+
       - name: Classify validation profile
         id: classify
         run: |
@@ -175,64 +180,38 @@ jobs:
           # policy in this repository. Mirrors and downstream pins are checked
           # against it by their own consumers (see contrib/keys/README.md).
           canonical_dir="contrib/keys/operator-keys"
-          validator_args=(
-            --operator-policy "${canonical_dir}/keys.json"
-            --operator-keys-dir "${canonical_dir}"
-            --require-public-key-files
-          )
 
-          policy_sequence="$(
-            jq -er '.policy_sequence | select(type == "number")' "${canonical_dir}/keys.json"
-          )"
-          if (( policy_sequence > 1 )); then
-            previous_policy_sha256="$(
-              jq -er '.previous_policy_sha256 | select(type == "string")' \
-                "${canonical_dir}/keys.json"
-            )"
-            history_root=""
-            if [[ "${EVENT_NAME}" == "pull_request" || "${EVENT_NAME}" == "merge_group" ]]; then
-              history_root="${BASE_SHA}"
-            elif [[ "${EVENT_NAME}" == "push" && -n "${BEFORE_SHA}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
-              history_root="${BEFORE_SHA}"
-            elif git rev-parse --verify HEAD^ >/dev/null 2>&1; then
-              history_root="$(git rev-parse HEAD^)"
-            fi
-
-            if [[ -z "${history_root}" ]]; then
-              echo "::error::Unable to identify trusted history for previous operator policy discovery."
-              exit 1
-            fi
-
-            previous_commit=""
-            while IFS= read -r candidate_commit; do
-              if ! git cat-file -e "${candidate_commit}:${canonical_dir}/keys.json" 2>/dev/null; then
-                continue
-              fi
-              candidate_sha256="$(
-                git show "${candidate_commit}:${canonical_dir}/keys.json" \
-                  | sha256sum \
-                  | cut -d ' ' -f 1
-              )"
-              if [[ "${candidate_sha256}" == "${previous_policy_sha256}" ]]; then
-                previous_commit="${candidate_commit}"
-                break
-              fi
-            done < <(git rev-list "${history_root}" -- "${canonical_dir}/keys.json")
-
-            if [[ -z "${previous_commit}" ]]; then
-              echo "::error::Previous operator policy ${previous_policy_sha256} is not present in trusted base history."
-              exit 1
-            fi
-
-            previous_root="${RUNNER_TEMP}/previous-operator-policy"
-            mkdir -p "${previous_root}"
-            git archive "${previous_commit}" "${canonical_dir}" | tar -x -C "${previous_root}"
-            validator_args+=(
-              --previous-operator-policy "${previous_root}/${canonical_dir}/keys.json"
-            )
+          # The policy is checked against the base's: a changed keys.json must
+          # follow the base policy directly, with approvals verified against the
+          # base policy and certificates; certificates changed under an
+          # unchanged keys.json get continuity checks. An empty base directory
+          # means the base has no policy.
+          base=""
+          if [[ "${EVENT_NAME}" == "pull_request" || "${EVENT_NAME}" == "merge_group" ]]; then
+            base="${BASE_SHA}"
+          elif [[ "${EVENT_NAME}" == "push" && -n "${BEFORE_SHA}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
+            base="${BEFORE_SHA}"
+          elif git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+            base="$(git rev-parse HEAD^)"
+          fi
+          if [[ -z "${base}" ]] || ! git rev-parse --verify --quiet "${base}^{commit}" >/dev/null; then
+            echo "::error::Unable to identify the base commit for operator policy validation."
+            exit 1
           fi
 
-          python3 ci/release/validate_key_metadata.py "${validator_args[@]}"
+          base_root="${RUNNER_TEMP}/base-operator-policy"
+          rm -rf "${base_root}"
+          mkdir -p "${base_root}/${canonical_dir}"
+          if git cat-file -e "${base}:${canonical_dir}" 2>/dev/null; then
+            git archive "${base}" "${canonical_dir}" | tar -x -C "${base_root}"
+          fi
+
+          python3 ci/release/validate_key_metadata.py \
+            --operator-policy "${canonical_dir}/keys.json" \
+            --operator-keys-dir "${canonical_dir}" \
+            --require-public-key-files \
+            --verify-public-key-certificates \
+            --base-operator-keys-dir "${base_root}/${canonical_dir}"
 
   release-policy-validation:
     name: release-policy validation

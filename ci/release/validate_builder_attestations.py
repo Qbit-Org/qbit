@@ -543,6 +543,19 @@ def reconstruct_canonical_source_archive(
     )
 
 
+def status_primary_fingerprints(status_output: str) -> list[str]:
+    """The primary-key fingerprint of each VALIDSIG, its tenth argument."""
+
+    fingerprints: list[str] = []
+    for line in status_output.splitlines():
+        if not line.startswith("[GNUPG:] VALIDSIG "):
+            continue
+        fields = line.split()
+        if len(fields) >= 12:
+            fingerprints.append(normalize_fingerprint(fields[11]))
+    return fingerprints
+
+
 def status_fingerprints(status_output: str) -> list[str]:
     fingerprints: list[str] = []
     for line in status_output.splitlines():
@@ -559,7 +572,9 @@ def verify_manifest_signature(
     gnupg_home: Path,
     manifest: Path,
     expected_fingerprint: str,
-) -> None:
+) -> str:
+    """Verify a builder attestation and return its primary-key fingerprint."""
+
     signature = Path(f"{manifest}.asc")
     if not signature.is_file():
         raise BuilderValidationError(f"Missing builder attestation signature: {signature}")
@@ -592,6 +607,10 @@ def verify_manifest_signature(
         raise BuilderValidationError(
             f"Builder attestation {signature} was not signed by expected fingerprint {expected_fingerprint}"
         )
+    primaries = set(status_primary_fingerprints(result.stdout))
+    if len(primaries) != 1:
+        raise BuilderValidationError(f"Builder attestation {signature} did not name exactly one primary key")
+    return primaries.pop()
 
 
 def find_builder_manifest(builder_dir: Path, artifact: str) -> Path | None:
@@ -643,7 +662,10 @@ def validate_artifact_attestations(
     builders: dict[str, BuilderOperator],
     quorum: int,
 ) -> list[str]:
+    # Quorum counts distinct primary keys: builders whose signing keys share
+    # one primary key count once.
     counted: list[str] = []
+    counted_primaries: dict[str, str] = {}
     rejected: list[str] = []
     version_dir = guix_sigs_repo / version
     if not version_dir.is_dir():
@@ -659,8 +681,12 @@ def validate_artifact_attestations(
         if manifest is None:
             continue
         try:
-            verify_manifest_signature(gpg, gnupg_home, manifest, builder.fingerprint)
+            primary = verify_manifest_signature(gpg, gnupg_home, manifest, builder.fingerprint)
             require_manifest_coverage(manifest, release_entries, source_archive)
+            if primary in counted_primaries:
+                rejected.append(f"{alias}: primary key {primary} already counted for {counted_primaries[primary]}")
+                continue
+            counted_primaries[primary] = alias
             counted.append(alias)
         except BuilderValidationError as exc:
             rejected.append(f"{alias}: {one_line_error(exc)}")

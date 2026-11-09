@@ -78,6 +78,24 @@ class ValidateBuilderAttestationsTest(unittest.TestCase):
         }
 
     @classmethod
+    def generate_shared_primary_signers(cls, name: str, aliases: list[str]) -> list[dict[str, str]]:
+        """Signers whose signing subkeys all hang off one certify-only primary key."""
+
+        loopback = ["--batch", "--pinentry-mode", "loopback", "--passphrase", ""]
+        uid = f"{name} <{name}@example.invalid>"
+        cls.gpg([*loopback, "--quick-gen-key", uid, "ed25519", "cert", "never"], home=cls.secret_home)
+        listing = cls.gpg(["--batch", "--with-colons", "--fingerprint", "--list-keys", uid], home=cls.secret_home)
+        primary = next(line.split(":")[9] for line in listing.stdout.splitlines() if line.startswith("fpr:"))
+        for _alias in aliases:
+            cls.gpg([*loopback, "--quick-add-key", primary, "ed25519", "sign", "never"], home=cls.secret_home)
+        listing = cls.gpg(["--batch", "--with-colons", "--fingerprint", "--list-keys", primary], home=cls.secret_home)
+        subkeys = [line.split(":")[9] for line in listing.stdout.splitlines() if line.startswith("fpr:")][1:]
+        return [
+            {"alias": alias, "fingerprint": subkey, "local_user": f"{subkey}!", "primary": primary}
+            for alias, subkey in zip(aliases, subkeys)
+        ]
+
+    @classmethod
     def gpg(cls, args: list[str], *, home: Path) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
             [GPG, "--homedir", str(home), *args],
@@ -327,7 +345,7 @@ class ValidateBuilderAttestationsTest(unittest.TestCase):
                     "--armor",
                     "--detach-sign",
                     "--local-user",
-                    builder["fingerprint"],
+                    builder.get("local_user", builder["fingerprint"]),
                     "--output",
                     str(manifest) + ".asc",
                     str(manifest),
@@ -554,6 +572,23 @@ class ValidateBuilderAttestationsTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1)
         self.assertIn("Source root is not a directory", result.stderr)
+
+    def test_builders_sharing_a_primary_key_count_once(self) -> None:
+        shared = self.generate_shared_primary_signers("builder-shared", ["operator-05", "operator-06"])
+        builders = [*shared, self.builders[0]]
+        self.write_operator_policy(builders, testnet_builder_quorum=3)
+        self.write_attestations(builders, "core", [self.core_artifact])
+
+        result = self.run_builder_validator()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("core builder attestation quorum not met: got 2, need 3", result.stderr)
+        self.assertIn("already counted for operator-05", result.stderr)
+
+        self.write_operator_policy(builders, testnet_builder_quorum=2)
+        result = self.run_builder_validator()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("core:2/2", result.stdout)
 
     def test_under_quorum_fails(self) -> None:
         shutil.rmtree(self.guix_sigs_repo / self.version / "operator-02")

@@ -28,9 +28,9 @@ One source of truth
 source of truth for the release key policy: `keys.json`, the certificates it
 references, and `approvals/<policy-id>/`. It is always read at a trusted ref:
 the publisher's `trusted_release_ref` checkout for a publication, the signed
-tag's tree for the policy in effect at a release, and the base history for a
-policy change. Nothing else is a trust source, and this repository keeps no
-second copy: the merge gate validates this directory alone.
+tag's tree for the policy in effect at a release, and the base branch's
+policy for a change to it. Nothing else is a trust source, and this repository
+keeps no second copy: the merge gate validates this directory alone.
 
 **Access.** Each consumer verifies against this directory, never against a copy
 of its own:
@@ -38,7 +38,7 @@ of its own:
 | Consumer | Reads the policy from | Check |
 |---|---|---|
 | `ci/release/` validators, `publish-local-release.sh` | the `trusted_release_ref` checkout (their default paths) | full schema, quorum, signatures |
-| `required-merge-gate.yml` | the pull request, with the previous policy found in base history by `previous_policy_sha256` | `validate_key_metadata.py` with transition approvals |
+| `required-merge-gate.yml` | the pull request, and the base branch's `contrib/keys/operator-keys` | key-policy continuity checks (below) |
 | qbit-tools wizard and offline signer tooling | `QBIT_OPERATOR_KEYS_JSON`: this `keys.json` in the trusted-ref checkout | quorum and signer set read from it, never repeated; v1.0.0 also pins its SHA-256 |
 | `qbit-guix.sigs` `operator-keys/` | a derived, non-authoritative mirror, seeded by `contrib/guix/init-supporting-repos.sh` | release-time tamper check: the publisher requires it byte-identical (below) |
 | downstream repositories (qbit-rpc) | a pin: a qbit commit, `keys.json`'s SHA-256, each certificate's SHA-256 | every downloaded file must match its pinned digest |
@@ -75,16 +75,49 @@ the trusted-ref keys only.
    `keys.json` SHA-256.
 2. Land it here with `approvals/<policy-id>/policy.SHA256`, `approval-note.md`
    and detached approvals from the previous policy's signers, meeting each
-   changed release line's previous `policy_change_quorum`. The merge gate
-   finds the previous policy in base history by digest and checks them.
-3. Re-sync `qbit-guix.sigs/operator-keys/` from here: `keys.json`, the
-   referenced certificates, and the current `approvals/<policy-id>/` only.
-   The publisher refuses a stale copy.
+   changed release line's previous `policy_change_quorum`.
+3. Rebuild `qbit-guix.sigs/operator-keys/` from the trusted ref:
+   `contrib/guix/init-supporting-repos.sh --resync-operator-keys <trusted-ref>
+   <qbit-guix.sigs>` writes exactly `keys.json`, the referenced certificates
+   and the current `approvals/<policy-id>/`, removes anything else, and runs
+   the publisher's checks. The publisher refuses a stale copy.
 4. Downstream pins move only when a downstream needs a release signed under
    the new policy. qbit-rpc's `node scripts/qbit-release.mjs pin <commit>`
    refuses a policy that is not the pinned one or its direct successor; the
    reviewer repeats the approval check with `validate_key_metadata.py
    --previous-operator-policy`.
+
+**Key-policy continuity checks.** The merge gate checks a pull request's
+`contrib/keys/operator-keys` against the base branch's
+(`validate_key_metadata.py --base-operator-keys-dir`):
+
+- A `keys.json` that differs from the base's must follow the base policy
+  directly: `policy_sequence` one more and `previous_policy_sha256` the base
+  `keys.json` digest, so it cannot return to an earlier policy or start a new
+  sequence 1 over an existing one. Its approvals are verified against the base
+  policy's signers and the base's certificates, so a refreshed certificate at
+  the base is the one used.
+- Without a base policy, only a sequence 1 bootstrap policy can be added.
+- Approval material already at the base stays unchanged; a new
+  `approvals/<policy-id>/` arrives only with that policy's `keys.json`.
+- Each signer certificate holds exactly one primary key with the signer's
+  signing key, and no two signers share a primary key
+  (`--verify-public-key-certificates`).
+- A certificate changed under an unchanged `keys.json` must keep its primary
+  key and its exact set of subkeys, and keep every signature record the base
+  certificate has, revocations and expiry self-signatures included; it may only
+  add records. To refresh an expiry, import the base certificate and the
+  refreshed one into an empty keyring and export the result, which keeps both
+  self-signatures; a plain re-export of the refreshed key drops the older one
+  and is refused.
+
+Release validators count a quorum by distinct primary keys, so signers whose
+signing keys share a primary key count once.
+
+Two further options for certificate-only changes are pending operator
+decisions: approvals by `policy_change_quorum` signers over a manifest of
+certificate digests, or schema v3 with a per-signer `public_key_sha256` in
+`keys.json`, which would make any certificate change a policy change.
 
 **Old releases.** v1.0.0 was signed under `qbit-release-keys-mainnet-000002`,
 `keys.json` SHA-256
@@ -123,11 +156,12 @@ Publication rules
 
 - Keep `operator-keys/KEYS.md`, `operator-keys/keys.json`, and every referenced
   signer certificate in sync.
-- Re-sync the derived `qbit-guix.sigs/operator-keys/` copy from this directory:
-  `keys.json`, every referenced certificate, and the current policy's
-  `approvals/<policy-id>/`. Keep it strict: no README files, notes, hidden
-  files, stale certificates, older approval directories, or unreferenced
-  documents.
+- Rebuild the derived `qbit-guix.sigs/operator-keys/` copy from this directory
+  at the trusted ref with `contrib/guix/init-supporting-repos.sh
+  --resync-operator-keys <trusted-ref> <qbit-guix.sigs>`: `keys.json`, every
+  referenced certificate, and the current policy's `approvals/<policy-id>/`.
+  Keep it strict: no README files, notes, hidden files, stale certificates,
+  older approval directories, or unreferenced documents.
 - Validate key metadata and the `qbit-guix.sigs` copy before relying on a
   policy. For the bootstrap policy, or release-time shape/copy checks where
   transition approval material is not available, use the explicit shape-only

@@ -92,9 +92,10 @@ Before relying on a signer policy:
 - publish each signer certificate referenced by `keys.json`
 - update `operator-keys/KEYS.md`
 - update `operator-keys/keys.json`
-- re-sync the derived `qbit-guix.sigs/operator-keys/` copy from this
-  directory; it is not a trust source, and the release publisher refuses a
-  copy that differs
+- rebuild the derived `qbit-guix.sigs/operator-keys/` copy from this
+  directory at the trusted ref (`contrib/guix/init-supporting-repos.sh
+  --resync-operator-keys`); it is not a trust source, and the release
+  publisher refuses a copy that differs
 - keep the `qbit-guix.sigs/operator-keys/` copy strict and data-only: no
   README files, notes, hidden files, unreferenced certificates, or stale
   approval material

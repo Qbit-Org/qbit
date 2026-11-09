@@ -86,6 +86,24 @@ class ValidateReleaseArtifactsTest(unittest.TestCase):
         }
 
     @classmethod
+    def generate_shared_primary_signers(cls, name: str, aliases: list[str]) -> list[dict[str, str]]:
+        """Signers whose signing subkeys all hang off one certify-only primary key."""
+
+        loopback = ["--batch", "--pinentry-mode", "loopback", "--passphrase", ""]
+        uid = f"{name} <{name}@example.invalid>"
+        cls.gpg([*loopback, "--quick-gen-key", uid, "ed25519", "cert", "never"], home=cls.secret_home)
+        listing = cls.gpg(["--batch", "--with-colons", "--fingerprint", "--list-keys", uid], home=cls.secret_home)
+        primary = next(line.split(":")[9] for line in listing.stdout.splitlines() if line.startswith("fpr:"))
+        for _alias in aliases:
+            cls.gpg([*loopback, "--quick-add-key", primary, "ed25519", "sign", "never"], home=cls.secret_home)
+        listing = cls.gpg(["--batch", "--with-colons", "--fingerprint", "--list-keys", primary], home=cls.secret_home)
+        subkeys = [line.split(":")[9] for line in listing.stdout.splitlines() if line.startswith("fpr:")][1:]
+        return [
+            {"alias": alias, "fingerprint": subkey, "local_user": f"{subkey}!", "primary": primary}
+            for alias, subkey in zip(aliases, subkeys)
+        ]
+
+    @classmethod
     def gpg(
         cls, args: list[str], *, home: Path
     ) -> subprocess.CompletedProcess[str]:
@@ -225,7 +243,7 @@ class ValidateReleaseArtifactsTest(unittest.TestCase):
                     "--armor",
                     "--detach-sign",
                     "--local-user",
-                    signer["fingerprint"],
+                    signer.get("local_user", signer["fingerprint"]),
                     "--output",
                     str(output),
                     str(self.artifacts_dir / "SHA256SUMS"),
@@ -459,6 +477,26 @@ class ValidateReleaseArtifactsTest(unittest.TestCase):
             result.stderr,
         )
         self.assertIn("extra operator-03", result.stderr)
+
+    def test_signers_sharing_a_primary_key_count_once(self) -> None:
+        shared = self.generate_shared_primary_signers("release-shared", ["shared-01", "shared-02"])
+        for signer in shared:
+            signer["public_key_file"] = f"public-keys/{signer['alias']}-release.asc"
+        signers = [*shared, self.signers[2]]
+        self.export_public_keys(shared)
+        self.write_policy(signers, quorum=3, set_size=3)
+        self.prepare_valid_staging(signers=signers)
+
+        result = self.run_validator()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Release signature quorum not met", result.stderr)
+        self.assertIn("by distinct primary keys", result.stderr)
+
+        # Two distinct primary keys still meet a quorum of two.
+        self.write_policy(signers, quorum=2, set_size=3)
+        result = self.run_validator()
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_release_signature_under_quorum_fails(self) -> None:
         self.prepare_valid_staging(signers=self.signers[:1])
