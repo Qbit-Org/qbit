@@ -63,6 +63,54 @@ def valid_policy(
     }
 
 
+sys.path.insert(0, str(REPO_ROOT / "ci" / "release"))
+import validate_key_metadata  # noqa: E402
+
+SIGNING = "A" * 24 + "0123456789ABCDEF"
+PRIMARY = "C" * 40
+
+
+def validsig(signing: str = SIGNING, primary: str | None = PRIMARY) -> str:
+    fields = [signing, "2026-07-15", "1784156878", "0", "4", "0", "22", "10", "00"] + ([primary] if primary else [])
+    return "[GNUPG:] VALIDSIG " + " ".join(fields) + "\n"
+
+
+def goodsig(signing: str = SIGNING) -> str:
+    return f"[GNUPG:] GOODSIG {signing[-16:]} signer <signer@example.invalid>\n"
+
+
+class GoodSignaturesTest(unittest.TestCase):
+    """A signature counts only when GOODSIG and VALIDSIG agree and nothing refuses it."""
+
+    def test_counts_an_agreeing_goodsig_and_validsig(self) -> None:
+        status = "[GNUPG:] NEWSIG\n" + goodsig() + validsig()
+        self.assertEqual(validate_key_metadata.good_signatures(status), [(SIGNING, PRIMARY)])
+
+    def test_refuses_revoked_expired_and_unverifiable_keys(self) -> None:
+        for keyword in ("REVKEYSIG", "EXPKEYSIG", "ERRSIG", "BADSIG", "EXPSIG", "NO_PUBKEY"):
+            with self.subTest(keyword=keyword):
+                status = f"[GNUPG:] NEWSIG\n[GNUPG:] {keyword} {SIGNING[-16:]} x\n" + goodsig() + validsig()
+                self.assertEqual(validate_key_metadata.good_signatures(status), [])
+
+    def test_refuses_disagreeing_or_incomplete_records(self) -> None:
+        for name, status in (
+            ("other key in GOODSIG", goodsig("B" * 40) + validsig()),
+            ("no GOODSIG", validsig()),
+            ("no VALIDSIG", goodsig()),
+            ("VALIDSIG without its primary key", goodsig() + validsig(primary=None)),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(validate_key_metadata.good_signatures("[GNUPG:] NEWSIG\n" + status), [])
+
+    def test_judges_each_signature_on_its_own(self) -> None:
+        other = "D" * 24 + "FEDCBA9876543210"
+        status = (
+            "[GNUPG:] NEWSIG\n" + goodsig() + validsig()
+            + "[GNUPG:] NEWSIG\n" + f"[GNUPG:] REVKEYSIG {other[-16:]} x\n" + goodsig(other) + validsig(other)
+        )
+        self.assertEqual(validate_key_metadata.good_signatures(status), [(SIGNING, PRIMARY)])
+
+
 class ValidateKeyMetadataTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:

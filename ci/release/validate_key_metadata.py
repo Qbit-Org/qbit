@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import hashlib
 import json
 import re
@@ -495,15 +496,46 @@ def run_command(command: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, check=False, capture_output=True, text=True)
 
 
-def status_fingerprints(status_output: str) -> list[str]:
-    fingerprints: list[str] = []
+def good_signatures(status_output: str) -> list[tuple[str, str]]:
+    """The signatures gpg's --status-fd output shows as good, as (signing, primary) fingerprints.
+
+    A signature counts only when its GOODSIG and VALIDSIG agree on the key and
+    VALIDSIG names the primary key (its tenth argument), and nothing else gpg
+    reported for it (REVKEYSIG, EXPKEYSIG, ERRSIG, BADSIG, EXPSIG, NO_PUBKEY)
+    says otherwise. Status lines are grouped per signature by NEWSIG.
+    """
+
+    refused = {"REVKEYSIG", "EXPKEYSIG", "ERRSIG", "BADSIG", "EXPSIG", "NO_PUBKEY"}
+    groups: list[list[list[str]]] = [[]]
     for line in status_output.splitlines():
-        if not line.startswith("[GNUPG:] VALIDSIG "):
+        if not line.startswith("[GNUPG:] "):
             continue
-        fields = line.split()
-        if len(fields) >= 3:
-            fingerprints.append(normalize_fingerprint(fields[2], path="gpg status"))
-    return fingerprints
+        fields = line.split()[1:]
+        if not fields:
+            continue
+        if fields[0] == "NEWSIG":
+            groups.append([])
+            continue
+        groups[-1].append(fields)
+    good: list[tuple[str, str]] = []
+    for group in groups:
+        keywords = [fields[0] for fields in group]
+        if not group or refused & set(keywords):
+            continue
+        goodsig = [fields for fields in group if fields[0] == "GOODSIG"]
+        validsig = [fields for fields in group if fields[0] == "VALIDSIG"]
+        if len(goodsig) != 1 or len(validsig) != 1 or len(goodsig[0]) < 2 or len(validsig[0]) < 11:
+            continue
+        signing = normalize_fingerprint(validsig[0][1], path="gpg VALIDSIG")
+        primary = normalize_fingerprint(validsig[0][10], path="gpg VALIDSIG primary key")
+        if not signing.endswith(goodsig[0][1].upper()):
+            continue
+        good.append((signing, primary))
+    return good
+
+
+def status_fingerprints(status_output: str) -> list[str]:
+    return [signing for signing, _primary in good_signatures(status_output)]
 
 
 def import_previous_signer_key(
@@ -552,7 +584,9 @@ def verify_approval_signature(
         )
     valid_fingerprints = set(status_fingerprints(result.stdout))
     if not valid_fingerprints:
-        raise MetadataError(f"{approval_file}: approval signature produced no valid signer fingerprint")
+        raise MetadataError(
+            f"{approval_file}: approval signature produced no good signature by a valid key:\n{result.stdout}"
+        )
     unexpected = sorted(valid_fingerprints - {expected_fingerprint})
     if unexpected:
         raise MetadataError(
@@ -739,11 +773,13 @@ def validate_operator_policy(
 def read_certificate(gpg: str, path: Path) -> dict[str, Any]:
     """The primary keys, keys and signature records of one armored certificate.
 
-    gpg reads it in a throwaway home, so nothing else is in the keyring. A
-    signature record drops its validity field, which depends on the keyring.
+    gpg reads it in a throwaway home, so nothing else is in the keyring. Each
+    signature record keeps its context: the key or user ID it belongs to, and
+    every field but the keyring-dependent validity, so records that look alike
+    on different keys stay distinct. They are counted as a multiset.
     """
 
-    if not path.is_file():
+    if not path.is_file() or path.is_symlink():
         raise MetadataError(f"missing signer public certificate {path}")
     with tempfile.TemporaryDirectory(prefix="qkm-cert-") as home:
         Path(home).chmod(0o700)
@@ -766,8 +802,9 @@ def read_certificate(gpg: str, path: Path) -> dict[str, Any]:
         raise MetadataError(f"{path}: gpg cannot read the certificate:\n{result.stderr}")
     primaries: list[str] = []
     keys: dict[str, dict[str, str]] = {}
-    signatures: set[str] = set()
+    signatures: collections.Counter[tuple[str, str]] = collections.Counter()
     record: list[str] | None = None
+    context = ""
     for line in result.stdout.splitlines():
         fields = line.split(":")
         if fields[0] in {"pub", "sub"}:
@@ -778,17 +815,28 @@ def read_certificate(gpg: str, path: Path) -> dict[str, Any]:
                 primaries.append(fingerprint)
             keys[fingerprint] = {
                 "primary": primaries[-1] if primaries else "",
+                "is_primary": "yes" if record[0] == "pub" else "",
                 "validity": record[1],
                 "capabilities": record[11] if len(record) > 11 else "",
             }
+            context = f"key {fingerprint}"
             record = None
+        elif fields[0] in {"uid", "uat"}:
+            context = f"{fields[0]} {fields[7] if len(fields) > 7 else ''} {fields[9] if len(fields) > 9 else ''}"
         elif fields[0] in {"sig", "rev"}:
-            signatures.add(":".join(field for index, field in enumerate(fields) if index != 1))
+            signatures[(context, ":".join(field for index, field in enumerate(fields) if index != 1))] += 1
     return {"primaries": primaries, "keys": keys, "signatures": signatures}
 
 
 def verify_public_key_certificates(projection: dict[str, Any], keys_dir: Path, gpg: str) -> None:
-    """Each signer's certificate holds one primary key with its signing key, and no two signers share one."""
+    """Check every signer certificate with gpg.
+
+    Each holds exactly one primary key and the signer's signing key. For an
+    active signer that key must be signing-capable and not revoked, and no two
+    active signers may share a primary key. A rotated, revoked or lost signer's
+    certificate may carry its key's revocation, and a rotated signer may share
+    its primary key with the active entry that replaced its signing subkey.
+    """
 
     gpg_path = shutil.which(gpg) if Path(gpg).name == gpg else gpg
     if not gpg_path:
@@ -805,10 +853,14 @@ def verify_public_key_certificates(projection: dict[str, Any], keys_dir: Path, g
         key = certificate["keys"].get(signer["signing_fingerprint"])
         if key is None:
             raise MetadataError(f"{path}: certificate has no key {signer['signing_fingerprint']} for {signer['alias']}")
-        if "s" not in key["capabilities"] or key["validity"] == "r":
+        if signer["status"] != "active":
+            continue
+        if "s" not in key["capabilities"]:
             raise MetadataError(
-                f"{path}: key {signer['signing_fingerprint']} of {signer['alias']} is not a valid signing key"
+                f"{path}: key {signer['signing_fingerprint']} of {signer['alias']} is not signing-capable"
             )
+        if key["validity"] == "r":
+            raise MetadataError(f"{path}: key {signer['signing_fingerprint']} of {signer['alias']} is revoked")
         if primary in owners:
             raise MetadataError(
                 f"{path}: primary key {primary} of {signer['alias']} is also {owners[primary]}'s primary key"
@@ -819,40 +871,57 @@ def verify_public_key_certificates(projection: dict[str, Any], keys_dir: Path, g
 def validate_certificate_continuity(
     projection: dict[str, Any],
     keys_dir: Path,
+    base_projection: dict[str, Any],
     base_keys_dir: Path,
     gpg: str,
+    *,
+    policy_changed: bool,
 ) -> list[str]:
-    """Check signer certificates that changed against BASE under an unchanged keys.json.
+    """Check signer certificates against BASE; return the aliases whose certificates changed.
 
-    A changed certificate must keep its primary key and its exact set of
-    subkeys, and keep every signature record BASE has, revocations and expiry
-    self-signatures included. It may only add records, such as a refreshed
-    self-signature. Returns the aliases whose certificates changed.
+    Under an unchanged keys.json every certificate must already be at BASE,
+    and a changed one must keep its primary key and exact subkey set. With a
+    new keys.json, a certificate of a continuing signer (same alias and signing
+    key at BASE) is checked the same way, except that it may gain a subkey the
+    new policy names as a signing key; other certificates are new and get only
+    the per-certificate checks. Either way a checked certificate must keep
+    every signature record BASE has, with its key or user ID, as a multiset:
+    it may only add records, such as a refreshed self-signature.
     """
 
     gpg_path = shutil.which(gpg) if Path(gpg).name == gpg else gpg
     if not gpg_path:
         raise MetadataError(f"gpg executable not found: {gpg}")
-    changed: list[str] = []
+    base_keys = {(signer["alias"], signer["signing_fingerprint"]) for signer in base_projection["signers"]}
+    by_file: dict[str, list[dict[str, Any]]] = {}
     for signer in projection["signers"]:
-        relative = signer["public_key_file"]
+        by_file.setdefault(signer["public_key_file"], []).append(signer)
+    changed: list[str] = []
+    for relative, signers in sorted(by_file.items()):
         head_path = keys_dir / relative
         base_path = base_keys_dir / relative
+        aliases = ", ".join(signer["alias"] for signer in signers)
         if not base_path.is_file():
-            raise MetadataError(f"{relative}: certificate is new, but keys.json is unchanged from the base policy")
+            if not policy_changed:
+                raise MetadataError(f"{relative}: certificate is new, but keys.json is unchanged from the base policy")
+            continue
+        if policy_changed and not any((signer["alias"], signer["signing_fingerprint"]) in base_keys for signer in signers):
+            continue
         if head_path.read_bytes() == base_path.read_bytes():
             continue
-        changed.append(signer["alias"])
+        changed.append(aliases)
         head = read_certificate(gpg_path, head_path)
         base = read_certificate(gpg_path, base_path)
         if head["primaries"] != base["primaries"]:
-            raise MetadataError(f"{relative}: certificate change replaces the primary key of {signer['alias']}")
-        if set(head["keys"]) != set(base["keys"]):
-            raise MetadataError(f"{relative}: certificate change adds or removes keys of {signer['alias']}")
-        if not base["signatures"] <= head["signatures"]:
-            raise MetadataError(
-                f"{relative}: certificate change removes signature records of {signer['alias']}"
-            )
+            raise MetadataError(f"{relative}: certificate change replaces the primary key of {aliases}")
+        head_subkeys = set(head["keys"]) - set(head["primaries"])
+        base_subkeys = set(base["keys"]) - set(base["primaries"])
+        allowed_new = {signer["signing_fingerprint"] for signer in signers} if policy_changed else set()
+        if not base_subkeys <= head_subkeys or not head_subkeys - base_subkeys <= allowed_new:
+            raise MetadataError(f"{relative}: certificate change adds or removes keys of {aliases}")
+        missing = base["signatures"] - head["signatures"]
+        if missing:
+            raise MetadataError(f"{relative}: certificate change removes signature records of {aliases}")
     return changed
 
 
@@ -888,6 +957,33 @@ def validate_approval_history(keys_dir: Path, base_keys_dir: Path, new_policy_id
             raise MetadataError(f"{name}: approvals/{policy_dir} can only be added with that policy's keys.json")
 
 
+APPROVAL_FILE_RE = re.compile(r"^approvals/([a-z0-9][a-z0-9-]{2,127})/(policy\.SHA256|approval-note\.md|([a-z0-9][a-z0-9-]{2,31})\.asc)$")
+
+
+def validate_policy_file_set(projection: dict[str, Any], keys_dir: Path) -> None:
+    """The directory holds exactly the policy's files, each a regular file.
+
+    That is keys.json, KEYS.md, the certificates keys.json references, and
+    approvals/<policy-id>/ material (policy.SHA256, approval-note.md and
+    <alias>.asc), the same shape the qbit-guix.sigs mirror check expects.
+    """
+
+    referenced = {signer["public_key_file"] for signer in projection["signers"]}
+    unexpected: list[str] = []
+    for path in sorted(keys_dir.rglob("*")):
+        relative = path.relative_to(keys_dir).as_posix()
+        if path.is_symlink() or (not path.is_dir() and not path.is_file()):
+            unexpected.append(relative)
+            continue
+        if path.is_dir():
+            continue
+        if relative in {"keys.json", "KEYS.md"} or relative in referenced or APPROVAL_FILE_RE.fullmatch(relative):
+            continue
+        unexpected.append(relative)
+    if unexpected:
+        raise MetadataError(f"{keys_dir}: unexpected file(s) in the operator key directory: {', '.join(unexpected)}")
+
+
 def validate_against_base_policy(
     projection: dict[str, Any],
     policy_path: Path,
@@ -896,6 +992,7 @@ def validate_against_base_policy(
     approval_dir: Path | None,
     gpg: str,
     verify_certificates: bool,
+    base_history_had_policy: bool = False,
 ) -> str:
     """Tie the checked-in policy to the base branch's: return how it relates.
 
@@ -908,6 +1005,10 @@ def validate_against_base_policy(
 
     base_policy_path = base_keys_dir / "keys.json"
     if not base_policy_path.is_file():
+        if base_history_had_policy:
+            raise MetadataError(
+                "the base has no operator policy, but its history had one: a policy cannot start over"
+            )
         if projection["policy_sequence"] != 1:
             raise MetadataError(
                 "the base has no operator policy: only a sequence 1 bootstrap policy can be added, "
@@ -923,7 +1024,9 @@ def validate_against_base_policy(
     if policy_path.read_bytes() == base_policy_path.read_bytes():
         validate_approval_history(keys_dir, base_keys_dir, None)
         if verify_certificates:
-            changed = validate_certificate_continuity(projection, keys_dir, base_keys_dir, gpg)
+            changed = validate_certificate_continuity(
+                projection, keys_dir, base_projection, base_keys_dir, gpg, policy_changed=False
+            )
             return "unchanged" if not changed else "certificates updated: " + ", ".join(changed)
         return "unchanged"
     if projection["policy_sequence"] != base_projection["policy_sequence"] + 1:
@@ -943,6 +1046,8 @@ def validate_against_base_policy(
         approval_dir or approval_dir_for(keys_dir, projection["policy_id"]),
         gpg,
     )
+    if verify_certificates:
+        validate_certificate_continuity(projection, keys_dir, base_projection, base_keys_dir, gpg, policy_changed=True)
     return f"follows {base_projection['policy_id']}"
 
 
@@ -974,6 +1079,11 @@ def parse_args() -> argparse.Namespace:
             "signing key present and signing-capable, no primary key shared by two signers. "
             "Implies --require-public-key-files."
         ),
+    )
+    parser.add_argument(
+        "--base-history-had-policy",
+        action="store_true",
+        help="The base's history had a policy: refuse a base without one.",
     )
     parser.add_argument(
         "--base-operator-keys-dir",
@@ -1026,6 +1136,7 @@ def main() -> int:
             validate_transition=base_keys_dir is None and not args.skip_policy_transition_validation,
         )
         if args.verify_public_key_certificates:
+            validate_policy_file_set(canonical_projection, canonical_keys_dir)
             verify_public_key_certificates(canonical_projection, canonical_keys_dir, args.gpg)
         if base_keys_dir is not None:
             relation = validate_against_base_policy(
@@ -1036,6 +1147,7 @@ def main() -> int:
                 args.approval_dir.resolve() if args.approval_dir else None,
                 args.gpg,
                 args.verify_public_key_certificates,
+                args.base_history_had_policy,
             )
             print(f"Base policy: {relation}")
         if args.operator_policy_mirror:

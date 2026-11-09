@@ -199,19 +199,91 @@ jobs:
             exit 1
           fi
 
-          base_root="${RUNNER_TEMP}/base-operator-policy"
-          rm -rf "${base_root}"
-          mkdir -p "${base_root}/${canonical_dir}"
-          if git cat-file -e "${base}:${canonical_dir}" 2>/dev/null; then
-            git archive "${base}" "${canonical_dir}" | tar -x -C "${base_root}"
-          fi
+          # Both policies are read from git objects: no checkout, no
+          # attributes. Every directory on the policy path must be a tree and
+          # every file under it a regular 100644 blob.
+          work="${RUNNER_TEMP}/key-policy"
+          rm -rf "${work}"
+          mkdir -p "${work}/head" "${work}/base"
+          extract_policy() {
+            local rev="$1" dest="$2" check_attributes="$3" prefix="" part entry meta path relative mode type oid
+            for part in contrib keys operator-keys; do
+              prefix="${prefix:+${prefix}/}${part}"
+              entry="$(git ls-tree "${rev}" -- "${prefix}")"
+              [[ -n "${entry}" ]] || return 0
+              if [[ "${entry}" != "040000 tree "* ]]; then
+                echo "::error::${rev}:${prefix} is not a directory: ${entry%%$'\t'*}"
+                return 1
+              fi
+            done
+            git ls-tree -r -z "${rev}" -- "${canonical_dir}" > "${dest}.list"
+            while IFS= read -r -d '' entry; do
+              meta="${entry%%$'\t'*}"
+              path="${entry#*$'\t'}"
+              read -r mode type oid <<< "${meta}"
+              if [[ "${mode}" != "100644" || "${type}" != "blob" ]]; then
+                echo "::error::${rev}:${path} is not a regular file (mode ${mode})"
+                return 1
+              fi
+              relative="${path#"${canonical_dir}/"}"
+              mkdir -p "$(dirname "${dest}/${relative}")"
+              git cat-file blob "${oid}" > "${dest}/${relative}"
+            done < "${dest}.list"
+            # Checkout and archive attributes would make other readers of the
+            # head see other bytes than these objects: none may apply to the
+            # policy. The base's own attributes do not matter here.
+            [[ "${check_attributes}" == "check-attributes" ]] || return 0
+            git ls-tree -r -z --name-only "${rev}" -- "${canonical_dir}" \
+              | git check-attr --source "${rev}" -z --stdin \
+                  text eol crlf filter ident working-tree-encoding export-ignore export-subst \
+              > "${dest}.attributes"
+            while IFS= read -r -d '' path && IFS= read -r -d '' attribute && IFS= read -r -d '' value; do
+              if [[ "${value}" != "unspecified" ]]; then
+                echo "::error::${rev}:${path} has the ${attribute} attribute (${value})"
+                return 1
+              fi
+            done < "${dest}.attributes"
+          }
+          extract_policy HEAD "${work}/head" check-attributes
+          extract_policy "${base}" "${work}/base" no-attributes
 
-          python3 ci/release/validate_key_metadata.py \
-            --operator-policy "${canonical_dir}/keys.json" \
-            --operator-keys-dir "${canonical_dir}" \
-            --require-public-key-files \
-            --verify-public-key-certificates \
-            --base-operator-keys-dir "${base_root}/${canonical_dir}"
+          head_args=(
+            --operator-policy "${work}/head/keys.json"
+            --operator-keys-dir "${work}/head"
+            --require-public-key-files
+            --verify-public-key-certificates
+            --base-operator-keys-dir "${work}/base"
+          )
+          # Once any first-parent ancestor of the base had a policy, the base must have one.
+          if [[ -n "$(git rev-list --first-parent -n 1 "${base}" -- "${canonical_dir}/keys.json")" ]]; then
+            head_args+=(--base-history-had-policy)
+          fi
+          python3 ci/release/validate_key_metadata.py "${head_args[@]}"
+
+          # A change must also pass the base's own validator, read from git
+          # objects, with the arguments every version of it accepts.
+          if ! diff -r -q "${work}/head" "${work}/base" > /dev/null; then
+            validator="ci/release/validate_key_metadata.py"
+            if ! [[ "$(git ls-tree "${base}" -- "${validator}")" =~ ^100(644|755)\ blob\  ]]; then
+              echo "::error::The base has no ${validator} to check this change with."
+              exit 1
+            fi
+            git cat-file blob "${base}:${validator}" > "${work}/base-validator.py"
+            base_args=(
+              --operator-policy "${work}/head/keys.json"
+              --operator-keys-dir "${work}/head"
+              --require-public-key-files
+            )
+            if [[ -f "${work}/base/keys.json" ]]; then
+              if cmp -s "${work}/head/keys.json" "${work}/base/keys.json"; then
+                base_args+=(--skip-policy-transition-validation)
+              else
+                base_args+=(--previous-operator-policy "${work}/base/keys.json")
+              fi
+            fi
+            echo "Checking the change with the base's validator"
+            python3 "${work}/base-validator.py" "${base_args[@]}"
+          fi
 
   release-policy-validation:
     name: release-policy validation

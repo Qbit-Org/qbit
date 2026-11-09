@@ -88,6 +88,26 @@ class ClassifyMergeProfileTest(unittest.TestCase):
         self.assertTrue(classification.release_policy_only)
         self.assertEqual(outputs["touched_operator_keys"], "true")
 
+    def test_policy_path_entries_and_attribute_files_touch_operator_keys(self) -> None:
+        for path in ("contrib/keys", "contrib", "contrib/keys/operator-keys", ".gitattributes", "doc/.gitattributes"):
+            with self.subTest(path=path):
+                outputs = classify_merge_profile.github_outputs(self.classify([path]))
+                self.assertEqual(outputs["touched_operator_keys"], "true")
+        outputs = classify_merge_profile.github_outputs(self.classify(["contrib/keysmith/README.md"]))
+        self.assertEqual(outputs["touched_operator_keys"], "false")
+
+    def test_quoted_and_nul_separated_paths_are_read_as_paths(self) -> None:
+        name = "contrib/keys/operator-keys/approvals/qbit-release-keys-testnet-00000\u00e9/x.asc"
+        quoted = '"contrib/keys/operator-keys/approvals/qbit-release-keys-testnet-00000\\303\\251/x.asc"'
+        with tempfile.TemporaryDirectory() as tmp:
+            for content in (quoted + "\n", name + "\0" + "README.md" + "\0"):
+                listing = Path(tmp) / "changed-files.txt"
+                listing.write_bytes(content.encode("utf8"))
+                paths = classify_merge_profile.load_changed_files(str(listing))
+                self.assertEqual(paths[0], name)
+                outputs = classify_merge_profile.github_outputs(self.classify(paths))
+                self.assertEqual(outputs["touched_operator_keys"], "true")
+
     def test_removed_guix_sigs_template_mirror_is_not_operator_key_policy(self) -> None:
         # contrib/keys/operator-keys is the only in-repo copy of the policy; a
         # file re-added under the old template mirror path gets the full

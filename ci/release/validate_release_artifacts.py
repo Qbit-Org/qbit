@@ -347,27 +347,15 @@ def import_release_keys(
 
 
 def status_fingerprints(status_output: str) -> list[str]:
-    fingerprints: list[str] = []
-    for line in status_output.splitlines():
-        if not line.startswith("[GNUPG:] VALIDSIG "):
-            continue
-        fields = line.split()
-        if len(fields) >= 3:
-            fingerprints.append(normalize_fingerprint(fields[2]))
-    return fingerprints
+    """Signing-key fingerprints of the good signatures (validate_key_metadata.good_signatures)."""
+
+    return [signing for signing, _primary in key_metadata.good_signatures(status_output)]
 
 
 def status_primary_fingerprints(status_output: str) -> list[str]:
-    """The primary-key fingerprint of each VALIDSIG, its tenth argument."""
+    """Primary-key fingerprints of the good signatures (validate_key_metadata.good_signatures)."""
 
-    fingerprints: list[str] = []
-    for line in status_output.splitlines():
-        if not line.startswith("[GNUPG:] VALIDSIG "):
-            continue
-        fields = line.split()
-        if len(fields) >= 12:
-            fingerprints.append(normalize_fingerprint(fields[11]))
-    return fingerprints
+    return [primary for _signing, primary in key_metadata.good_signatures(status_output)]
 
 
 def verify_detached_signature_file(

@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from validate_key_metadata import MetadataError, validate_operator_policy
+from validate_key_metadata import MetadataError, good_signatures, validate_operator_policy
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -544,27 +544,15 @@ def reconstruct_canonical_source_archive(
 
 
 def status_primary_fingerprints(status_output: str) -> list[str]:
-    """The primary-key fingerprint of each VALIDSIG, its tenth argument."""
+    """Primary-key fingerprints of the good signatures (validate_key_metadata.good_signatures)."""
 
-    fingerprints: list[str] = []
-    for line in status_output.splitlines():
-        if not line.startswith("[GNUPG:] VALIDSIG "):
-            continue
-        fields = line.split()
-        if len(fields) >= 12:
-            fingerprints.append(normalize_fingerprint(fields[11]))
-    return fingerprints
+    return [primary for _signing, primary in good_signatures(status_output)]
 
 
 def status_fingerprints(status_output: str) -> list[str]:
-    fingerprints: list[str] = []
-    for line in status_output.splitlines():
-        if not line.startswith("[GNUPG:] VALIDSIG "):
-            continue
-        fields = line.split()
-        if len(fields) >= 3:
-            fingerprints.append(normalize_fingerprint(fields[2]))
-    return fingerprints
+    """Signing-key fingerprints of the good signatures (validate_key_metadata.good_signatures)."""
+
+    return [signing for signing, _primary in good_signatures(status_output)]
 
 
 def verify_manifest_signature(

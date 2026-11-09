@@ -45,7 +45,9 @@ class ValidateReleaseArtifactsTest(unittest.TestCase):
         cls.class_tmp.cleanup()
 
     @classmethod
-    def generate_signer(cls, index: int, alias: str) -> dict[str, str]:
+    def generate_signer(
+        cls, index: int, alias: str, *, faked_time: str | None = None, expire: str = "0"
+    ) -> dict[str, str]:
         batch = cls.tmp_path / f"signer-{index}.batch"
         batch.write_text(
             "\n".join(
@@ -55,7 +57,7 @@ class ValidateReleaseArtifactsTest(unittest.TestCase):
                     "Key-Usage: sign",
                     f"Name-Real: qbit release signer {index}",
                     f"Name-Email: release-signer-{index}@example.invalid",
-                    "Expire-Date: 0",
+                    f"Expire-Date: {expire}",
                     "%no-protection",
                     "%commit",
                     "",
@@ -63,9 +65,11 @@ class ValidateReleaseArtifactsTest(unittest.TestCase):
             ),
             encoding="utf8",
         )
-        cls.gpg(["--batch", "--generate-key", str(batch)], home=cls.secret_home)
+        faked = ["--faked-system-time", f"{faked_time}!"] if faked_time else []
+        cls.gpg([*faked, "--batch", "--generate-key", str(batch)], home=cls.secret_home)
         list_result = cls.gpg(
             [
+                *faked,
                 "--batch",
                 "--with-colons",
                 "--fingerprint",
@@ -79,11 +83,14 @@ class ValidateReleaseArtifactsTest(unittest.TestCase):
             for line in list_result.stdout.splitlines()
             if line.startswith("fpr:")
         )
-        return {
+        signer = {
             "alias": alias,
             "fingerprint": fingerprint,
             "public_key_file": f"public-keys/{alias}-release.asc",
         }
+        if faked_time:
+            signer["faked_time"] = faked_time
+        return signer
 
     @classmethod
     def generate_shared_primary_signers(cls, name: str, aliases: list[str]) -> list[dict[str, str]]:
@@ -236,8 +243,10 @@ class ValidateReleaseArtifactsTest(unittest.TestCase):
         for index, signer in enumerate(signers):
             alias = output_aliases[index] if output_aliases else signer["alias"]
             output = self.artifacts_dir / f"SHA256SUMS.{alias}.asc"
+            faked = ["--faked-system-time", f"{signer['faked_time']}!"] if signer.get("faked_time") else []
             self.gpg(
                 [
+                    *faked,
                     "--batch",
                     "--yes",
                     "--armor",
@@ -497,6 +506,28 @@ class ValidateReleaseArtifactsTest(unittest.TestCase):
         self.write_policy(signers, quorum=2, set_size=3)
         result = self.run_validator()
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_signatures_by_revoked_or_expired_keys_do_not_count(self) -> None:
+        revoked = self.generate_signer(20, "operator-20")
+        expired = self.generate_signer(21, "operator-21", faked_time="20200101T000000", expire="1d")
+        for signer in (revoked, expired):
+            with self.subTest(alias=signer["alias"]):
+                for name in list(self.artifacts_dir.iterdir()):
+                    name.unlink()
+                signers = [self.signers[0], signer]
+                self.write_policy(signers, quorum=2, set_size=2)
+                self.prepare_valid_staging(signers=signers)
+                if signer is revoked:
+                    revocation = self.secret_home / "openpgp-revocs.d" / f"{signer['fingerprint']}.rev"
+                    certificate = self.root / "revocation.asc"
+                    certificate.write_text(revocation.read_text(encoding="utf8").replace(":-----BEGIN", "-----BEGIN"), encoding="utf8")
+                    self.gpg(["--batch", "--import", str(certificate)], home=self.secret_home)
+                self.export_public_keys([signer])
+
+                result = self.run_validator()
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("GPG verification produced no valid signature", result.stderr)
 
     def test_release_signature_under_quorum_fails(self) -> None:
         self.prepare_valid_staging(signers=self.signers[:1])

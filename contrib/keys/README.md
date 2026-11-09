@@ -87,32 +87,53 @@ the trusted-ref keys only.
    reviewer repeats the approval check with `validate_key_metadata.py
    --previous-operator-policy`.
 
-**Key-policy continuity checks.** The merge gate checks a pull request's
-`contrib/keys/operator-keys` against the base branch's
+**Key-policy continuity checks.** When a pull request touches the policy
+path, a directory on it, or any `.gitattributes`, the merge gate checks the
+pull request's `contrib/keys/operator-keys` against the base branch's
 (`validate_key_metadata.py --base-operator-keys-dir`):
 
+- Both policies are read from git objects, not from a checkout or an archive:
+  every directory on the path must be a directory, and every file under it a
+  regular file (mode 100644), so symlinks are refused. No checkout or archive
+  attribute (`text`, `eol`, `filter`, `ident`, `export-ignore`, ...) may apply
+  to the policy's files at the head. The directory must hold exactly the
+  policy's files: `keys.json`, `KEYS.md`, the certificates `keys.json`
+  references, and `approvals/<policy-id>/` material.
 - A `keys.json` that differs from the base's must follow the base policy
   directly: `policy_sequence` one more and `previous_policy_sha256` the base
-  `keys.json` digest, so it cannot return to an earlier policy or start a new
-  sequence 1 over an existing one. Its approvals are verified against the base
-  policy's signers and the base's certificates, so a refreshed certificate at
-  the base is the one used.
-- Without a base policy, only a sequence 1 bootstrap policy can be added.
+  `keys.json` digest. Its approvals are verified against the base policy's
+  signers and the base's certificates. Without a base policy, only a sequence
+  1 bootstrap policy can be added, and only if no first-parent ancestor of the
+  base ever had one.
 - Approval material already at the base stays unchanged; a new
-  `approvals/<policy-id>/` arrives only with that policy's `keys.json`.
+  `approvals/<policy-id>/` arrives only with that policy's `keys.json`. A
+  policy that landed is replaced by a newer one, not reverted.
+- The base's own `validate_key_metadata.py`, read from git objects, must also
+  accept a change.
 - Each signer certificate holds exactly one primary key with the signer's
-  signing key, and no two signers share a primary key
-  (`--verify-public-key-certificates`).
-- A certificate changed under an unchanged `keys.json` must keep its primary
-  key and its exact set of subkeys, and keep every signature record the base
-  certificate has, revocations and expiry self-signatures included; it may only
-  add records. To refresh an expiry, import the base certificate and the
-  refreshed one into an empty keyring and export the result, which keeps both
-  self-signatures; a plain re-export of the refreshed key drops the older one
-  and is refused.
+  signing key (`--verify-public-key-certificates`). An active signer's
+  signing key must be signing-capable and not revoked, and no two active
+  signers may share a primary key. A rotated, revoked or lost signer's
+  certificate may carry its key's revocation. A signer moves to another subkey
+  of the same primary key with a new policy: its entry becomes `rotated`, with
+  `replacement_signing_fingerprint`, beside a new active entry for the new
+  subkey that uses the same certificate.
+- A certificate of a continuing signer (same alias and signing key at the
+  base) must keep its primary key and subkeys, and every signature record the
+  base certificate has, each with the key or user ID it belongs to and counted
+  as a multiset; it may only add records. Under an unchanged `keys.json` no
+  certificate may be new, and none may gain a subkey; with a new `keys.json` a
+  certificate may gain only a subkey the new policy names as a signing key. To
+  refresh an expiry, import the base certificate and the refreshed one into an
+  empty keyring and export the result, which keeps both self-signatures; a
+  plain re-export of the refreshed key drops the older one and is refused.
 
-Release validators count a quorum by distinct primary keys, so signers whose
-signing keys share a primary key count once.
+Release validators count a signature only when gpg's GOODSIG and VALIDSIG
+agree and gpg reports no revoked or expired key or other error for it
+(REVKEYSIG, EXPKEYSIG, ERRSIG), and count a quorum by distinct primary keys,
+so signers whose signing keys share a primary key count once. Once a signing
+key expires its signatures stop counting, so refresh certificates before
+expiry (operator-01's primary key expires on 2028-06-07).
 
 Two further options for certificate-only changes are pending operator
 decisions: approvals by `policy_change_quorum` signers over a manifest of
