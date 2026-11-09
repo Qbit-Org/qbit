@@ -20,6 +20,7 @@ for the validators and gpg to read.
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import re
 import shutil
@@ -45,7 +46,7 @@ GATE_WORKFLOW = ".github/workflows/key-policy-gate.yml"
 # The gate's own code and its description: a change to any of these, or to any
 # workflow (a workflow can post a check under the gate's name), needs approvals
 # by the base policy's signers over a manifest of their contents.
-GATE_CODE_PREFIXES = (".github/workflows/",)
+GATE_CODE_PREFIXES = (".github/workflows/", ".github/actions/")
 GATE_CODE_PATHS = (
     ".github/CODEOWNERS",
     "ci/checks/classify_merge_profile.py",
@@ -202,10 +203,10 @@ def python(script: Path) -> list[str]:
     return [sys.executable, "-I", str(script)]
 
 
-def run(command: list[str]) -> None:
+def run(command: list[str], name: str) -> None:
     sys.stdout.flush()
     if subprocess.run(command, check=False).returncode != 0:
-        raise GateError(f"{Path(command[2]).name} refused the change")
+        raise GateError(f"{name} refused the change")
 
 
 def check_policy(base: str, head: str, work: Path) -> None:
@@ -229,7 +230,7 @@ def check_policy(base: str, head: str, work: Path) -> None:
     # Once any first-parent ancestor of the base had a policy, the base must have one.
     if git("rev-list", "--first-parent", "-n", "1", base, "--", f"{POLICY_DIR}/keys.json").strip():
         head_args.append("--base-history-had-policy")
-    run(head_args)
+    run(head_args, "validate_key_metadata.py")
 
     if file_map(head_dir) == file_map(base_dir):
         return
@@ -252,9 +253,10 @@ def check_policy(base: str, head: str, work: Path) -> None:
         else:
             base_args += ["--previous-operator-policy", str(base_dir / "keys.json")]
     print("Checking the change with the base's validator")
-    run(base_args)
+    run(base_args, "the base's validate_key_metadata.py")
 
 
+@functools.lru_cache(maxsize=None)
 def gate_files(rev: str) -> dict[str, bytes]:
     """The gate code files at `rev`: GATE_CODE_PATHS and every file under GATE_CODE_PREFIXES."""
 
@@ -290,15 +292,19 @@ def gate_manifest(base: str, head: str) -> bytes:
 def check_gate_check_name(head: str) -> None:
     """Only key-policy-gate.yml may define a job named like the required check."""
 
-    pattern = re.compile(rf"^\s*name:\s*[\"']?{re.escape(GATE_CHECK_NAME)}[\"']?\s*$", re.MULTILINE | re.IGNORECASE)
+    pattern = re.compile(
+        rf"^\s*-?\s*name:\s*[\"']?{re.escape(GATE_CHECK_NAME)}[\"']?\s*(#.*)?$", re.MULTILINE | re.IGNORECASE
+    )
     for path, data in sorted(gate_files(head).items()):
-        if path.startswith(".github/workflows/") and path != GATE_WORKFLOW and pattern.search(data.decode("utf8", errors="replace")):
+        if path.startswith(GATE_CODE_PREFIXES) and path != GATE_WORKFLOW and pattern.search(data.decode("utf8", errors="replace")):
             raise GateError(f"{path} names something '{GATE_CHECK_NAME}'; only {GATE_WORKFLOW} may")
 
 
 def check_gate_approvals(base: str, head: str, changed: list[str], work: Path) -> str:
     """A change to the gate's code needs its manifest signed by the base policy's quorum."""
 
+    if subprocess.run(["git", "merge-base", "--is-ancestor", base, head], check=False).returncode != 0:
+        raise GateError("bring the pull request up to date with its base branch before a gate change is approved")
     check_gate_check_name(head)
     manifest = gate_manifest(base, head)
     approval_dir = f"{GATE_APPROVALS_DIR}/{hashlib.sha256(manifest).hexdigest()}"
@@ -358,6 +364,8 @@ def check_gate_approvals(base: str, head: str, changed: list[str], work: Path) -
             counted[primary] = alias
     # As for a policy change: each release line's own signers must meet that line's quorum.
     approvers = set(counted.values())
+    if not approvers or not projection["release_lines"]:
+        raise GateError(f"this change to the gate's code has no approvals in {approval_dir}")
     for line, settings in sorted(projection["release_lines"].items()):
         required = settings["policy_change_quorum"]
         line_approvers = approvers & key_metadata.active_aliases_for_line(projection, line)

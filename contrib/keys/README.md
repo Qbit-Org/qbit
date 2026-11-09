@@ -150,8 +150,11 @@ against its merge base with the base branch:
   `.github/workflows/`, since any workflow could post a check under the gate's
   name, `.github/CODEOWNERS`, the classifier, the release validators, the
   gate script and its tests, and this README) needs approvals by the base
-  policy's signers, as below. Only `key-policy-gate.yml` may name anything
-  `Key Policy Gate`.
+  policy's signers, as below. Composite actions under `.github/actions/`
+  count too. Only `key-policy-gate.yml` may name a job `Key Policy Gate`; this
+  is a line check, and code a pull request runs in its own workflows could
+  still post a status under that name, so the repository settings that limit
+  what workflow tokens may post matter as well.
 - Any other file under `contrib/keys/` is refused.
 
 A gate change is approved in `contrib/keys/gate-approvals/<id>/`:
@@ -170,10 +173,11 @@ from the base's and the head's git objects and requires that directory, with
 that exact `gate.SHA256`, and good signatures (as release validators count
 them) with distinct primary keys, verified with the base's certificates, that
 meet every release line's `policy_change_quorum` from that line's active
-signers. Because the manifest names the base, an approval covers one change
-from one base: a later base, or restoring an earlier gate version, needs new
-signatures. No other gate-approval directory may change in the same pull
-request.
+signers. The pull request must contain its base branch's tip. Because the
+manifest names the base's gate files, an approval covers one change from one
+gate state: a different base state needs new signatures. Like policy
+approvals, it does not expire: it holds again if the base returns to that
+state. No other gate-approval directory may change in the same pull request.
 
 The job runs the gate isolated (`python3 -I`, with the gate's directories
 looked up after the standard library), so a file added beside it cannot stand

@@ -228,6 +228,28 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
         self.approve_gate_change(["operator-01", "operator-02"])
         self.assert_target_refused("names something 'Key Policy Gate'")
 
+    def test_target_treats_composite_actions_as_gate_code(self) -> None:
+        self.edit(".github/actions/setup/action.yml", "runs:\n  using: composite\n  steps: []\n")
+        self.commit("add a composite action")
+        self.assert_target_refused("Gate code changed: .github/actions/setup/action.yml")
+
+    def test_target_refuses_the_gates_name_with_a_trailing_comment(self) -> None:
+        self.edit(".github/workflows/other.yml", "jobs:\n  other:\n    name: Key Policy Gate  # required\n")
+        self.commit("another workflow")
+        self.approve_gate_change(["operator-01", "operator-02"])
+        self.assert_target_refused("names something 'Key Policy Gate'")
+
+    def test_target_needs_an_up_to_date_branch_for_a_gate_change(self) -> None:
+        self.edit("ci/release/validate_key_metadata.py")
+        self.commit("change the validator")
+        self.approve_gate_change(["operator-01", "operator-02"])
+        head = self.git("rev-parse", "HEAD")
+        self.git("checkout", "--quiet", self.base)
+        self.edit("doc/notes.md", "Notes.\n")
+        self.base = self.commit("the base moves on")
+        self.git("checkout", "--quiet", head)
+        self.assert_target_refused("bring the pull request up to date with its base branch")
+
     def test_target_refuses_approvals_of_another_manifest(self) -> None:
         self.edit("ci/release/validate_key_metadata.py")
         self.commit("change the validator")
