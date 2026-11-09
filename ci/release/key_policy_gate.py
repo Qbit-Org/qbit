@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import functools
 import hashlib
+import importlib.util
 import re
 import shutil
 import subprocess
@@ -30,14 +31,26 @@ import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-# Run with `python3 -I`, and look in these directories after the standard
-# library, so no file added beside the gate can stand in for a module it
-# imports.
-sys.path.append(str(HERE))
-sys.path.append(str(HERE.parent / "checks"))
 
-import classify_merge_profile  # noqa: E402
-import validate_key_metadata as key_metadata  # noqa: E402
+
+def load_module(name: str, path: Path):
+    """Load `name` from exactly `path`, a gate code file, not from a search path.
+
+    The gate runs with `python3 -I` and adds no directory to sys.path, so no
+    file added beside it can stand in for a module it loads.
+    """
+
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+classify_merge_profile = load_module("classify_merge_profile", HERE.parent / "checks" / "classify_merge_profile.py")
+key_metadata = load_module("validate_key_metadata", HERE / "validate_key_metadata.py")
 
 POLICY_DIR = "contrib/keys/operator-keys"
 GATE_APPROVALS_DIR = "contrib/keys/gate-approvals"

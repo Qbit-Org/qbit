@@ -191,6 +191,17 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
         self.assertNotIn("json.py was imported", result.stdout + result.stderr)
         self.assertIn("validate_key_metadata.py refused the change", result.stdout)
 
+    def test_target_loads_its_modules_from_their_own_files(self) -> None:
+        # A module of the same name beside the gate in the base must not be loaded instead.
+        for name in ("classify_merge_profile.py", "validate_key_metadata.py"):
+            directory = "ci/release" if name.startswith("classify") else "ci/checks"
+            (self.repo / directory / name).write_text("raise SystemExit(0)\n", encoding="utf8")
+        self.commit("files named like the gate's modules")
+        self.land()
+        self.edit("ci/release/validate_key_metadata.py")
+        self.commit("change the validator")
+        self.assert_target_refused("this change to the gate's code needs contrib/keys/gate-approvals/")
+
     def test_target_needs_each_release_lines_quorum_for_a_gate_change(self) -> None:
         data = self.policy_data(3, ["operator-01", "operator-02", "operator-04"], self.policies[2])
         data["release_lines"]["mainnet"] = dict(data["release_lines"]["testnet"], active_signer_set_size=1, release_signature_quorum=1, builder_attestation_quorum=1, policy_change_quorum=1)
