@@ -15,13 +15,25 @@ messages that stay within the message size limit, a vendored PQC library
 update and a qbit-side stack wipe that together clear copies of secret-key
 material from the stack they release, wallet encryption that a background
 keypool refill can no longer deadlock or follow with unencrypted key writes
-(wallet files can still keep some unencrypted keys; see Known limitations),
-and witness checks for blocks submitted over the IPC mining interface. The
+(older wallet files and backups can still hold unencrypted keys; see Known
+limitations), and witness checks for blocks submitted over the IPC mining interface. The
 updated library also performs consensus signature verification; keys,
 signatures, and verification results are unchanged.
+Fixes merged during release testing keep loaded wallet files locked, make a
+`send` whose coins a concurrent call spent fail instead of reporting success,
+resume pending P2MR keypool refills at startup and run them in the background
+after `walletpassphrase`, remove deleted unencrypted keys from the wallet
+file right after encryption, re-encrypt the PQC keys that v1.0.0 left
+unencrypted in encrypted wallets, keep more small change when no fee estimate
+is available, keep PSBT signing results across shutdown, stop qbit-qt from
+aborting when accessibility tools press Send again during a send
+confirmation, make it ignore Sign pressed the same way while a PSBT is being
+signed, update the GUI release builds to Qt 6.8.4, and add debug symbol
+archives for macOS.
 It adds one standardness rule for P2MR spends, but contains no consensus rule
-change, no scheduled network activation, no change to the mainnet or testnet4
-network identity, and no wallet database format change.
+change, no scheduled network activation, and no change to the mainnet or
+testnet4 network identity. The wallet database format is unchanged apart from
+one new record, which v1.0.0 ignores.
 
 Please report bugs using the Qbit issue tracker.
 
@@ -37,18 +49,30 @@ backups continue to work without a reindex, chain reset, or wallet migration.
 If you encrypted a wallet with v1.0.0, especially soon after creating it, its
 file may still hold unencrypted PQC private keys, which anyone with the file
 or a backup made from it can read without the passphrase (#277, #283). This
-release stops new ones from being written, but it does not detect or
-re-encrypt the ones v1.0.0 wrote, signing with such a key rewrites its
-unencrypted record, and backups copy it. On an encrypted wallet, a non-zero
-`pqc_key_validation.plaintext_records` in `getwalletinfo` shows that the
-wallet holds such keys; a zero count does not prove that the file holds
-none. Consider creating a new wallet with a passphrase using this release,
-moving your funds to it, and no longer using the old wallet or its backups.
+release stops new ones from being written, and re-encrypts the ones v1.0.0
+wrote the next time the wallet is unlocked (#301). After upgrading, check
+`pqc_key_validation.reencryption_required` in `getwalletinfo`. While it is
+`true`, the wallet refuses to sign and to be backed up (see Behavior
+changes). Unlock the wallet once: with `walletpassphrase`, or in qbit-qt,
+which has no separate unlock action, by entering the passphrase when it asks
+for it, for example for a send, or by running `walletpassphrase` in its
+console. Then check that `reencryption_required` is `false` before you make a
+new backup. Re-encryption cannot change older copies: wallet files and
+backups made before it still contain those keys. If you are not sure that
+the wallet file and all of its backups stayed private, create a new wallet
+with a passphrase using this release, move your funds to it, and delete the
+old backups (see Known limitations).
 
-Downgrading to v1.0.0 remains possible. This release adds no wallet record
-types, so v1.0.0 can still open wallets and data directories that v1.0.1 has
-used, but a downgraded node loses the fixes in this release, including the
-wallet encryption fixes (#277).
+The first time this release loads a wallet that v1.0.0 encrypted, it rewrites
+the wallet file once (see Wallet fixes). This needs free disk space of up to
+twice the size of the wallet file: about the file's size again beside the
+wallet, for its `-journal` file, and about the same in the temporary
+directory, which may be on another filesystem (#300).
+
+Downgrading to v1.0.0 remains possible. This release adds one wallet record,
+which v1.0.0 ignores, so v1.0.0 can still open wallets and data directories
+that v1.0.1 has used, but a downgraded node loses the fixes in this release,
+including the wallet encryption fixes (#277, #300, #301).
 
 On Linux, replace the installed `qbit`, `qbitd`, `qbit-qt`, `qbit-cli`,
 `qbit-tx`, `qbit-util`, and `qbit-wallet` binaries from the archive's `bin`
@@ -102,6 +126,44 @@ Behavior changes to review before upgrading
   Mining interface). IPC clients must submit the complete coinbase,
   including its witness; unlike the `submitblock` RPC, `submitSolution` does
   not add the witness reserved value (#289, fixes #278).
+- On Linux, macOS, and other non-Windows systems, `restorewallet` and qbit-qt's
+  Restore Wallet action now refuse a backup file that is the database of a
+  wallet loaded by the same node, with "Run backupwallet first and restore
+  from that backup." Run `backupwallet` first and restore from that copy
+  (#297, fixes #280).
+- `send` now fails with error code `-4` (`RPC_WALLET_ERROR`), returns no txid,
+  and adds nothing to the wallet when another call spent one of its inputs
+  while it was signing. Callers that run `send` concurrently on one wallet
+  should expect this error; the call can be retried (see Wallet fixes) (#298,
+  fixes #281).
+- `walletpassphrase` now returns before P2MR keypools are refilled, and the
+  refill continues in the background while the wallet stays unlocked. Scripts
+  that read `keypoolsize` or `keypoolsize_hd_internal` from `getwalletinfo`
+  right after `walletpassphrase` may see a value below `-keypool` until the
+  refill finishes (#299, fixes #304).
+- `keypoolrefill` now reports a failed database commit with error code `-4`
+  (`RPC_WALLET_ERROR`) instead of `-1` (#299, fixes #319).
+- When no fee estimate is available and `-discardfee` is not set, the wallet
+  now keeps small change that it used to add to the fee (see Fallback fee)
+  (#346, fixes #306).
+- Every wallet encrypted by v1.0.0 is rewritten once, the first time this
+  release loads it. This adds to that load's duration in proportion to the
+  file's size, and needs free disk space (see How to Upgrade). In release
+  testing, the first load of a 29 MB wallet with 5,250 transactions took
+  about 0.12 seconds longer (0.43 against 0.30 seconds); later loads do not
+  rewrite (#300, fixes #285).
+- `backupwallet` and qbit-qt's backup now rewrite a wallet file whose
+  post-encryption rewrite is still pending before they copy it, and refuse
+  the backup with an error if that rewrite fails (#300, fixes #285).
+- An encrypted wallet that still holds unencrypted PQC key records refuses to
+  sign with any key until it has been unlocked once. Signing RPCs and qbit-qt
+  return an error that says so, and `getwalletinfo` reports
+  `pqc_key_validation.reencryption_required: true` and
+  `pqc_key_validation.signing_blocked: true` (#301, fixes #283).
+- `backupwallet` and qbit-qt's backup refuse to copy such a wallet.
+  `backupwallet` fails with error code `-13` (`RPC_WALLET_UNLOCK_NEEDED`), so
+  a scheduled backup job for an affected wallet fails after the upgrade until
+  the wallet has been unlocked once. Check such jobs for error `-13` (#301).
 
 Compatibility
 =============
@@ -150,10 +212,9 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   published only after descriptor locks and database transactions are
   released. Unlocking in qbit-qt returns promptly. `createwallet`,
   `loadwallet`, and unlocking in qbit-qt complete a pending initial P2MR
-  keypool refill through deduplicated scheduler steps. The `walletpassphrase`
-  RPC still completes the refill before it returns, and an unencrypted
-  wallet loaded at startup does not resume it (see Known limitations) (#143,
-  fixes #138).
+  keypool refill through deduplicated scheduler steps. #299 later moved the
+  `walletpassphrase` refill to the background and made wallets loaded at
+  startup resume a pending refill (see below) (#143, fixes #138).
 - Descriptor top-ups now stage newly derived scripts and publish wallet
   ownership and cache updates only after the backing database transaction
   commits. A top-up inside a caller-owned transaction publishes once on
@@ -206,9 +267,164 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   refill that read its keys before encryption stops without writing them, as
   a refill of a locked wallet does. Keys added after encryption, including by
   later refills, are stored encrypted. Both bugs date from v1.0.0. The wallet
-  file format is unchanged. This release does not detect or re-encrypt
-  unencrypted PQC keys that v1.0.0 already wrote (see How to Upgrade)
-  (#277).
+  file format is unchanged. Unencrypted PQC keys that v1.0.0 already wrote
+  are detected and re-encrypted at the next unlock (see the #301 entry below
+  and How to Upgrade) (#277).
+- On Linux, macOS, and other non-Windows systems, `listwalletdir`, qbit-qt's
+  Open Wallet menu, and loading a loaded wallet's file again through a
+  symbolic or hard link released the exclusive lock the node holds on each
+  loaded wallet. A second `qbitd`, `qbit-qt`, or `qbit-wallet` process could
+  then open a wallet that was still in use, and with two processes writing to
+  one wallet, PQC signature counter updates could be lost and the wallet file
+  corrupted. The node now keeps track of the wallet files it has open and
+  recognizes them without opening them, so their locks stay held;
+  `listwalletdir` output is unchanged. `restorewallet` and qbit-qt's Restore
+  Wallet action now refuse a backup file that is a loaded wallet's database,
+  because copying it also released the lock and the restored copy would sign
+  alongside the original (see Behavior changes). Windows behavior is
+  unchanged: closing a file there does not release the lock (#297, fixes
+  #280).
+- Concurrent `send` calls on one wallet could select the same coin, because
+  `send` signs without holding the wallet lock, which takes about 200 ms per
+  P2MR input. Every call returned `complete: true` and a txid, but only one
+  of the transactions entered the mempool; the others stayed in the wallet
+  and could never confirm. `send` now checks, under the wallet lock it holds
+  to commit, that no other wallet transaction started spending one of its
+  inputs while the call was running. Abandoned and conflicted transactions do
+  not count. A call that loses this race fails with error code `-4`, names
+  the transaction that won, returns no txid, and adds nothing to the wallet
+  or the mempool. If it was called with `lock_unspents=true`, it unlocks the
+  coins it locked, except those locked before the call. The call can be
+  retried. It has already signed, so it has still used a signature counter
+  value for each P2MR input: counters may over-count this way, but never
+  under-count. Replacing a wallet transaction by passing its inputs to `send`
+  in `inputs` still works.
+  Two calls that make identical requests, with the same destination and
+  amount, can build the same transaction. Both calls can then return success
+  with the same txid, and only one payment is made; the losing call does not
+  always fail with error `-4`. In release testing this happened in most
+  rounds of two identical concurrent calls, as it did with v1.0.0. To make two
+  equal payments, make the calls one after the other.
+  `sendall`, `sendtoaddress`, and `sendmany`, which hold the wallet lock from
+  coin selection through commit, are unchanged, and so is the qbit-qt Send
+  flow (see Known limitations) (#298, fixes #281).
+- A new P2MR wallet derives 16 receive and 16 change keys when it is created,
+  and fills the rest of its keypool (`-keypool`, 1000 by default) in a top-up
+  that starts 30 seconds later or, for an encrypted wallet, at its first
+  unlock. If the node stopped before that top-up finished, an unencrypted
+  wallet loaded at startup through `-wallet` or `load_on_startup` never
+  resumed it, and watched as few as its first 16 receive and 16 change
+  addresses, so payments to later addresses of the same seed, for example
+  from a restored backup or another copy of the wallet, were not seen.
+  Wallets loaded at startup now resume the pending top-up 30 seconds after
+  the wallets start, as `loadwallet` already did. This includes wallets left
+  in this state by v1.0.0. The resumed top-up watches the new addresses from
+  then on, but does not find payments already made to them: if another copy
+  of the wallet may have used later addresses, run `rescanblockchain` once
+  `keypoolsize` in `getwalletinfo` has reached `-keypool`. Block processing
+  slows while such top-ups run (see Known limitations) (#299, fixes #284).
+- The first `walletpassphrase` of a wallet created with a passphrase derived
+  the rest of its P2MR keypool, about 2,000 keys at the default `-keypool`,
+  before it returned, and an unlock after a P2MR keypool had run down
+  refilled it to `-keypool` first. The call held the wallet lock meanwhile,
+  so other calls on that wallet waited, and so did the block-processing
+  callbacks of all wallets, which on a busy node could delay block
+  connection. `walletpassphrase` now returns as soon as the wallet is
+  unlocked, and P2MR keypools, including a pending initial top-up, are
+  refilled to `-keypool` in short background steps that do not hold the
+  wallet lock. In release testing on regtest, the first `walletpassphrase` of
+  such a wallet returned in about 0.1 seconds, against about 25 seconds with
+  v1.0.0, and blocks kept connecting while the refill ran. The steps pause
+  while the wallet is locked and resume at the next `walletpassphrase`, so
+  with a short timeout the refill can take several unlocks. When a lock
+  pauses a refill, `debug.log` says that the refill "paused after a failed
+  background step"; this is expected and not an error. Other keypools are
+  still topped up before the call returns. The unlock timeout now starts when
+  the wallet is unlocked rather than after the refill. `getnewaddress` and
+  transaction creation keep working during the refill, deriving one key at a
+  time past the last derived address (#299, fixes #304).
+- Locking an encrypted wallet, through `walletlock`, qbit-qt, or the
+  `walletpassphrase` timeout, now waits until transaction signing has freed
+  its temporary copies of decrypted ECDSA and PQC keys, and until a running
+  background keypool step has freed its copies, usually within a second.
+  Transaction signing, as used by `sendtoaddress`, `sendmany`, `bumpfee`,
+  and `signrawtransactionwithwallet`, could let the lock return while those
+  copies were still in memory; PSBT signing already freed them first. The
+  copies were, and still are, wiped when freed (#299, fixes #287 and #304).
+- If the wallet database could not commit a keypool top-up, for example
+  because the disk was full, the top-up threw an exception after it had
+  rolled its changes back. In a background P2MR refill, which can run for a
+  minute or more after a wallet is created, loaded, or unlocked, this stopped
+  `qbitd` or `qbit-qt`. Such a failure is now reported as an ordinary top-up
+  error. A background refill logs the reason and that it "paused after a
+  failed background step", and starts again at the next unlock,
+  `loadwallet`, or restart, or, for a low-watermark refill, at the next new
+  address. `keypoolrefill` reports the failure with error code `-4` instead
+  of `-1`. `getnewaddress`, block processing, and wallet loading carry on
+  with the keys already derived; once those are used up, `getnewaddress`
+  fails with "Keypool ran out". The node still stops if the rollback itself
+  fails (#299, fixes #319).
+- `encryptwallet` deleted a wallet's unencrypted private keys, then spent
+  about 30 seconds generating a new keypool, and only then rewrote the wallet
+  file. The deleted keys stayed readable in the file until that rewrite, and
+  if the process stopped during those 30 seconds, or the rewrite failed,
+  nothing removed them later. For a wallet encrypted in place, these are the
+  keys that control its existing funds. The file is now rewritten right
+  after the keys are deleted, and the wallet records that this succeeded. An
+  encrypted wallet without that record is rewritten when it is next loaded,
+  before any other work on it starts; if that rewrite fails, the wallet still
+  loads with a warning, and the rewrite is tried again at the next load.
+  `encryptwallet` adds a warning to its result if its rewrite failed. The
+  rewrite also empties the wallet's `-journal` file, which otherwise kept
+  copies of the deleted keys for as long as the wallet stayed loaded.
+  `qbit-wallet` does not rewrite wallets; while the rewrite keeps failing, a
+  copy without the deleted keys can be made by unloading the wallet and
+  running `qbit-wallet -wallet=<name> -dumpfile=<file> dump` and
+  `qbit-wallet -wallet=<new name> -dumpfile=<file> createfromdump`, with the
+  same `-datadir` and chain options as for `qbitd` (an empty name for the
+  default wallet). The dump file holds all of the wallet's records,
+  including its encrypted keys, so keep it as safe as a backup. The rewrite
+  cannot reach copies made earlier: a backup taken before encryption, or by
+  v1.0.0 during or after an interrupted encryption or after a failed
+  rewrite, can still contain unencrypted keys (#300, fixes #285).
+- If anything failed after `encryptwallet` had committed the encryption, such
+  as a write error while generating the new seed's keys, the RPC returned
+  error `-1` although the wallet was encrypted, the wallet stayed unlocked
+  with no relock, and descriptors from the failed step stayed in memory
+  without their records on disk. The wallet is now locked whenever the call
+  returns, those descriptors are removed again, and the RPC succeeds with a
+  result that starts with `wallet encrypted; Warning:` and says that the new
+  HD seed was not set up. New addresses then still come from the previous
+  seed. qbit-qt still reports a fatal error and quits in this case, and the
+  wallet loads encrypted and locked at the next start (#300).
+- A wallet encrypted before its first background keypool fill finished kept a
+  16-address lookahead for its previous seed, so later payments to that
+  seed's addresses, for example from a backup taken before encryption, were
+  not detected. `encryptwallet` now fills those descriptors first, which can
+  make it take up to twice as long in that window. Wallets already encrypted
+  in that window keep the short lookahead (#300).
+- v1.0.0 could write unencrypted PQC private keys into a wallet that was
+  being encrypted while a background keypool refill ran (#277). This release
+  now detects and re-encrypts them. `getwalletinfo` reports
+  `pqc_key_validation.reencryption_required`, which is `true` while an
+  encrypted wallet still holds unencrypted PQC key records, including records
+  still being validated after the wallet loaded, and qbit-qt shows a warning
+  icon in the status bar. The next unlock, with `walletpassphrase` or in
+  qbit-qt (see How to Upgrade), replaces every validated unencrypted record
+  with an encrypted one in one database transaction, keeping each key's
+  signature counter (the higher one if the key also had an encrypted record),
+  and then rewrites the wallet file as `encryptwallet` does. An affected
+  wallet therefore logs "Rewrote the wallet file after encryption" twice:
+  once when this release first loads it, and again at its first unlock. In
+  qbit-qt, that second rewrite briefly blocks the window, in release testing
+  for about 0.08 seconds on a 2 MB wallet, longer for larger files. Records
+  still being validated at the unlock are re-encrypted as soon as validation
+  finishes if the wallet is still unlocked, and otherwise at the next unlock.
+  Nothing happens until you unlock. If re-encryption fails, no record
+  changes, the wallet keeps refusing to sign, and `debug.log` records the
+  reason; the next unlock tries again. Records that failed validation are
+  never re-encrypted. Unencrypted wallets are not affected (#301, fixes
+  #283).
 
 ### Fallback fee
 
@@ -232,6 +448,31 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   capacity. Services that prefer transaction creation to fail when no estimate
   is available should set `-fallbackfee=0`, which restores the previous
   behavior (#151).
+- When no fee estimate is available and `-discardfee` is not set, the wallet
+  now decides whether change is worth keeping at the rate it pays without
+  estimates: `-fallbackfee`, raised to `-mintxfee` and the minimum relay fee,
+  with the dust relay fee as the floor. It used the `-discardfee` default of
+  0.0001 QBT/kvB before, 40 times the default fallback rate, so P2MR change
+  below about 0.00038 QBT was added to the fee, which could make the fee up
+  to about 40 times the fee of the transaction itself. With the default
+  settings, at the 250 sat/kvB fallback rate, P2MR change is now added to the
+  fee only below about 0.000025 to 0.00003 QBT. In release testing on
+  regtest, change of 0.00003 QBT and above was kept and change of 0.000025
+  QBT and below went to the fee; a send that left 0.0002 QBT of change kept
+  it and paid a 966 sat fee, where it used to pay 20,966 sat, and
+  `fee_reason` was "Fallback fee". Nothing changes if `-discardfee` is set,
+  even to its default value, if `-fallbackfee=0`, or while a fee estimate is
+  available. The `-discardfee` help describes the new limit (#346, fixes
+  #306).
+- qbit-qt's Send page now shows its "Warning: Fee estimation is currently not
+  possible." label whenever there is no fee estimate, including when
+  `-mintxfee` or the mempool minimum fee raises the fee rate above the
+  fallback fee. It used to hide the warning in that case and show a
+  confirmation estimate ("within N blocks") that did not exist. The RPC
+  `fee_reason` field is unchanged: it names the rule that set the final fee
+  rate, so it reads "Fallback fee" only when the fallback rate itself applies,
+  and otherwise, for example, "Minimum Required Fee" or "Mempool Min Fee"
+  (#346, fixes #322).
 
 ### Updated RPCs
 
@@ -254,6 +495,36 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
 - `gettransaction`, `listtransactions`, and default `listsinceblock` can
   return a `send` entry without `vout`, `address`, or `label` (see Behavior
   changes) (#150).
+- `send` fails with error code `-4` when a concurrent call spent one of its
+  inputs while it was signing (see Wallet fixes) (#298). The
+  `walletcreatefundedpsbt` help now says to set `lockUnspents` when funding
+  PSBTs concurrently (#298).
+- `restorewallet` refuses a backup file that is the database of a loaded
+  wallet, except on Windows (see Behavior changes) (#297).
+- `walletpassphrase` returns before P2MR keypools are refilled; its help says
+  that the refill continues in the background, pauses while the wallet is
+  locked, and resumes at the next `walletpassphrase` (#299).
+- `keypoolrefill` reports a failed database commit with error code `-4`
+  instead of `-1` (#299).
+- The `importdescriptors` help now says that PQC signature counters are kept
+  per descriptor, and do not include signatures the same key made in other
+  descriptors of this wallet, in other wallets, or outside this wallet (#346,
+  fixes #323).
+- `encryptwallet` succeeds with a result that starts with
+  `wallet encrypted; Warning:` when the encryption was committed but a later
+  step failed, and adds a warning to its result when the wallet file could
+  not be rewritten (see Wallet fixes) (#300).
+- `backupwallet` rewrites a wallet whose post-encryption rewrite is pending
+  before it copies it, and refuses the backup if that fails (#300).
+- `getwalletinfo` adds `pqc_key_validation.reencryption_required` (#301).
+- `backupwallet` refuses to copy a wallet while
+  `pqc_key_validation.reencryption_required` is `true`, with error code
+  `-13`. It has a new optional second argument, `allow_unencrypted_pqc_keys`
+  (default `false`), to make the backup anyway, for example for a wallet with
+  records that failed validation, which are never re-encrypted. Anyone with
+  such a backup can read those keys without the passphrase. qbit-qt has no
+  such option; `qbit-wallet` `dump` can copy such a wallet, and its dump file
+  contains those keys too (#301).
 
 ### Signing-usage visibility and qbit-qt responsiveness
 
@@ -289,7 +560,9 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   replacement txid and the local commit time, so the report remains visible
   on desktops without a notification backend (no D-Bus, no tray). The
   existing non-modal information message and modal warning are unchanged
-  (#177, fixes #168).
+  (#177, fixes #168). The panel's time is the time the replacement was
+  committed, not the later time the panel was shown after a usage warning
+  (#344).
 - Encrypting an existing wallet from qbit-qt runs on a worker
   thread. The passphrase dialog stays open as a busy indicator and ignores a
   second submit, GUI reads that would block on the wallet lock are served
@@ -303,6 +576,61 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   or overview page resolves address labels from the address book rows qbit-qt
   already holds, instead of waiting for the wallet lock until encryption
   finishes (#182, fixes #180).
+- Quitting qbit-qt while the Load PSBT dialog is signing now cancels the
+  signing if it has not reserved PQC signature counters yet, so shutdown no
+  longer waits for the whole signing and no counters are consumed. Signing
+  that has already reserved counters cannot be stopped and still finishes.
+  Every window is hidden by then, so qbit-qt writes the outcome to
+  `debug.log`, including the signature counts, limit states, and warnings of
+  each PQC key used, and saves a signed PSBT to the data directory as
+  `unshown-psbt-<txid>-<time>.psbt`, which File > Load PSBT can open. The log
+  line names the file; the PSBT itself is not written to the log. This
+  includes a partial signature added to a multisig input, which consumes a
+  counter without completing the input. A PSBT that the dialog signed but
+  that was not copied, saved, or broadcast before shutdown is saved the same
+  way. The PSBT dialog can no longer be closed while it is signing, which
+  used to block the GUI until the signing finished and discard its result.
+  After Cancel, the progress dialog stays on screen until signing has
+  actually stopped, or until it finishes if the cancellation came too late to
+  prevent the counter reservation. Saving a PSBT to a file that cannot be
+  written now reports a failure instead of "PSBT saved to disk." When the
+  wallet is unloaded while the PSBT dialog is signing, a successful signature
+  is now kept and reported as signed, with a note that the wallet was
+  unloaded, and the PSBT can still be copied, saved, or broadcast; it used to
+  be discarded and reported as a failure (#344).
+- In the PSBT operations dialog, Sign now does nothing while a signing
+  attempt is in progress, from the passphrase prompt until signing finishes,
+  so one Sign makes at most one signing attempt. Mouse and keyboard input
+  cannot reach the dialog behind the passphrase prompt, but an accessibility
+  client, such as VoiceOver, or a UI automation tool still can; pressing Sign
+  through one started a second signing attempt with a second passphrase
+  prompt, a bug present since v1.0.0. Copy and Save are unavailable for the
+  whole attempt. qbit-qt also no longer uses freed memory when the dialog is
+  closed this way while its passphrase prompt is open; the signing attempt
+  then ends before it signs and the wallet stays locked (#353, fixes #350).
+- qbit-qt could abort while a send confirmation was open, a bug present since
+  v1.0.0. Mouse and keyboard input cannot reach the Send page behind the
+  confirmation, but an accessibility client, such as VoiceOver, or a UI
+  automation tool still can. Pressing Send through one prepared a second
+  transaction and opened a second confirmation; confirming the second one
+  broadcast its transaction, and confirming the first one then aborted
+  qbit-qt. Pressing Clear All the same way and then confirming aborted it
+  too. No funds were at risk: qbit-qt broadcast only a transaction confirmed
+  in its own confirmation. Send now does nothing while a send is in progress,
+  from the passphrase prompt until the confirmation closes, so one Send sends
+  at most one transaction. The send also keeps the inputs selected with coin
+  control when Send was pressed, even if the form is cleared or coin control
+  is changed while the passphrase prompt is open. qbit-qt also no longer uses
+  freed memory when it is asked to quit while a send confirmation is open,
+  and Send no longer stays unavailable after an internal error is reported
+  while a send is being started (#348).
+- Release builds of qbit-qt now use Qt 6.8.4 instead of Qt 6.7.3. This fixes
+  a crash on macOS when quitting qbit-qt after an accessibility client, such
+  as VoiceOver or a UI automation tool, had inspected its windows. The crash
+  was a use-after-free in Qt's macOS accessibility cache (QTBUG-134784),
+  which Qt 6.8.4 fixes; the build also applies a later Qt fix for a related
+  use-after-free (QTBUG-149612). Saved GUI settings and window layouts are
+  read and written as before (#347).
 
 ### Validation and performance work
 
@@ -470,12 +798,26 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   signature counts for keys passed to these RPCs are not tracked across calls.
   Each call treats every key as unused, so the caller must keep each key
   within its limit of 1,073,741,824 signatures. The `importdescriptors` help
-  now states that an imported key's counter does not include signatures made
-  outside this wallet. Signing behavior is unchanged (#264, refs #261).
+  now states that PQC signature counters are kept per descriptor, so an
+  imported key's counter does not include signatures made in other
+  descriptors, in other wallets, or outside this wallet (#346). Signing
+  behavior is unchanged (#264, refs #261).
 - The vendored libbitcoinpqc tree now equals its upstream release tag. The
   `RUSTSEC-2026-0204` `crossbeam-epoch` lockfile update that qbit carried on
   top of v0.3.0 is upstream since v0.3.1, so the subtree check no longer
   accepts any downstream change (#268).
+- Each macOS release now has a debug symbol archive,
+  `qbit-<version>-x86_64-apple-darwin-debug.tar.gz` and
+  `qbit-<version>-arm64-apple-darwin-debug.tar.gz`, alongside the Linux and
+  Windows debug archives. It holds a `.dSYM` bundle for every binary in
+  `bin/` and `libexec/`, which `atos`, `lldb`, and other macOS tools use to
+  turn the addresses in a crash report into function names, source files,
+  and line numbers. A bundle matches a binary when `dwarfdump --uuid` prints
+  the same UUID for both; each bundle matches its binary in the release
+  tarball, in the signed tarball and zip when those are published, and the
+  `qbit-qt` binary inside `qbit-qt.app`. The release binaries and the other
+  macOS archives are unchanged. Releases up to v1.0.0 have no macOS debug
+  archive (#343).
 - Stabilized the REST chain-info comparison and Qt shutdown tests (#137,
   #149, #164).
 
@@ -525,9 +867,13 @@ Known limitations
     evidence. No fuzz target reaches the PQC domains of the signature cache
     that #162 and #265 use.
   - The other changes merged after the #176 source (#177, #178, #182, #183,
-    #252, #264, #277, #289, and #342) touch only wallet, qbit-qt,
-    mining-interface, RPC help, test, CI, and documentation code, which none
-    of the six qbit-specific targets reaches.
+    #252, #264, #277, #289, #297, #298, #299, #300, #301, #342, #343, #344,
+    #345, #346, #347, #348, #353, #358, #360, #361, #362, #367, and #368)
+    touch only wallet, qbit-qt, Qt build, release build, mining-interface,
+    RPC help and argument conversion, test, CI, developer tooling, and
+    documentation code, which none of the six qbit-specific targets reaches.
+    #346 also adds a field to the fee calculation result declared in
+    `src/policy/fees.h`, which none of those targets includes.
 
   The earlier evidence was produced with LLVM 20.1.8 on the #176 source. The
   llvm-cov coverage checker met every expectation, including the
@@ -558,7 +904,13 @@ Known limitations
   - Nodes running v1.0.0 still stall or abort headers sync through ranges with
     large AuxPoW headers. They take a message cut short for size as the end of
     the peer's headers, and when they serve headers they still send the
-    oversized message, which upgraded nodes also reject.
+    oversized message, which upgraded nodes also reject. In release testing
+    on regtest with large AuxPoW blocks, a v1.0.0 node that synced only from
+    v1.0.1 peers stopped at a `headers` reply cut short for size and did not
+    continue its low-work headers presync. On testnet4, a new v1.0.0 node
+    synced to the tip from only a v1.0.1 node, and a new v1.0.1 node from
+    only a v1.0.0 node. A network with such ranges converges once its nodes
+    upgrade to v1.0.1, apart from the cases in the next two items.
   - Low-work headers sync holds at most 36 MB of AuxPoW payload while
     redownloading, so it cannot complete, from any peer, through a range where
     roughly 15,000 to 17,000 consecutive headers carry more than that. It
@@ -601,55 +953,92 @@ Known limitations
   consumed stays consumed and is not shown unless a usage warning applies. A
   PSBT made with Create Unsigned consumes capacity again when it is signed.
   This predates v1.0.1.
-- Concurrent `send` or `sendall` calls, or concurrent
-  `walletcreatefundedpsbt` and `walletprocesspsbt` flows, on one wallet can
-  select the same coin, because coins are not held locked while PQC signing
-  runs. Every call reports success (`complete: true`, with a txid for `send`
-  and `sendall`), but only one of the transactions can confirm, and each
-  signature still consumes counter capacity. Serialize sending calls per
-  wallet, or set `lockUnspents` when funding PSBTs concurrently (#281). The
-  qbit-qt Send flow likewise does not check, before committing, whether an
-  RPC call spent its inputs while the confirmation dialog was open (#290).
-- A new P2MR wallet fills most of its keypool in a refill that runs in the
-  background 30 seconds after the wallet is created or loaded, or, for an
-  encrypted wallet, at its first unlock (inline when it is unlocked with
-  `walletpassphrase`; see the next item). If the node stops before the refill
-  finishes, an unencrypted wallet loaded at the next startup through
-  `-wallet` or `load_on_startup` does not resume it and watches only its
-  first 16 receive and 16 change addresses, so payments to later addresses
-  of the same seed, for example from a restored copy, are not seen. An
-  encrypted wallet resumes it at its first unlock. If the node may have
-  stopped during an unencrypted wallet's first refill, for example within a
-  few minutes of creating or loading it, run `keypoolrefill` once the wallet
-  is loaded again, and if another copy of the wallet may have used later
-  addresses, run `rescanblockchain` afterwards (#284).
-- The `walletpassphrase` RPC completes a pending initial refill and tops the
-  keypool up to its `-keypool` size before it returns, and `encryptwallet` and
-  encryption from qbit-qt derive the new keypool before they finish. Each
-  holds the wallet lock meanwhile, which at the default `-keypool` can take
-  tens of seconds. Other wallet calls wait, and the wallet's handling of new
-  blocks is delayed, which can slow block processing. Unlocking in qbit-qt
-  runs a pending initial refill in the background, and does not refill a
-  run-down pool at unlock (#304).
-- Wallet files can keep key material that encryption should have removed. A
-  wallet encrypted by v1.0.0 can hold unencrypted PQC private keys (#283; see
-  How to Upgrade). After `encryptwallet`, the deleted unencrypted keys stay
-  readable in the file's free space until the file is rewritten, which never
-  happens if the process stops while the new keypool is derived (#285).
+- If an RPC call spends the same coins while qbit-qt's send confirmation is
+  open, confirming the GUI send reports no error: qbit-qt clears its form and
+  lists its own transaction, although only the RPC call's transaction is
+  broadcast. Only one payment is made, and the GUI's transaction cannot
+  confirm. The qbit-qt Send flow does not check, before committing, whether
+  its inputs were spent while the confirmation was open. Do not spend from
+  one wallet through RPC and qbit-qt at the same time (#290).
+- Concurrent `walletcreatefundedpsbt` and `walletprocesspsbt` flows on one
+  wallet can select the same coin, because coins are not held locked while
+  PQC signing runs. Only one of the transactions can confirm, and each
+  signature still consumes counter capacity. Set `lockUnspents` when funding
+  PSBTs concurrently (#281, #298).
+- While P2MR keypool top-ups run, block processing during initial block
+  download slows sharply. Wallets loaded at startup whose initial top-up is
+  still pending now resume it 30 seconds after the wallets start (see Wallet
+  fixes), so a node that is still syncing can spend that time processing
+  blocks much more slowly. In release testing on regtest, a syncing node
+  processed about 6 blocks per second while three wallets' pending top-ups
+  ran, which took about 79 seconds together, against 270 to 290 blocks per
+  second once their keypools were full and about 2,200 with no wallets
+  loaded. Block processing returned to its normal rate when the top-ups
+  finished. These regtest figures show the relative effect; they are not
+  mainnet sync rates (#299).
+- `encryptwallet` and encryption from qbit-qt derive the new keypool before
+  they finish, and hold the wallet lock meanwhile; encrypting a populated
+  wallet at the default `-keypool` took about 70 seconds in release testing.
+  Other calls on that wallet wait, and the wallet's handling of new blocks is
+  delayed, which can slow block processing. While an `encryptwallet` RPC
+  runs on a wallet that qbit-qt has open, parts of qbit-qt can stop
+  responding until it finishes (#174).
+- A wallet created with a passphrase, by `createwallet` or by qbit-qt's
+  Create Wallet, keeps `bech32` as its default address type until it is
+  loaded again, for example after `unloadwallet` and `loadwallet` or a
+  restart. Until then, `getnewaddress` without an address type fails with
+  "Output type 'bech32' is not available on this chain";
+  `getnewaddress "" p2mr` works, and qbit-qt's Receive tab is not affected.
+  This predates v1.0.1 (#363).
+- qbit-qt does not shut down while a dialog is open. `qbit-cli stop` and
+  SIGTERM wait until a running PSBT signing or send preparation has finished
+  and the PSBT dialog or send confirmation it opens has been closed, and
+  then shut down. On macOS, Dock > Quit does nothing while a progress dialog
+  is open, such as the one shown while a PSBT is signed or a send is
+  prepared; choose Quit again once it has closed. This is the existing
+  design, and Bitcoin Core does the same. Close open dialogs before stopping
+  the node. Quit requests from the platform (on macOS: Dock > Quit, logout,
+  or a Quit Apple event) are not held back in the same way for every dialog
+  that waits for an answer, such as a passphrase prompt or the message shown
+  after a PSBT is copied. Review found code paths where such a quit makes
+  qbit-qt use freed memory and crash. The send confirmation case is fixed
+  (#348); the others are tracked in #349.
+- Wallet files can keep key material that encryption should have removed.
   `walletpassphrasechange` leaves the master key wrapped with the old
   passphrase in the file's free space (#294). A failed write or erase while
-  descriptor ECDSA keys are encrypted is ignored (#296). Treat wallet files
-  and backups from before or around an encryption or passphrase change as
-  unencrypted; to be safe, create a new wallet with a passphrase using this
-  release and move your funds to it.
-- `listwalletdir`, qbit-qt's Open Wallet menu, and opening a loaded wallet's
-  file through a symbolic or hard link release the exclusive lock on loaded
-  SQLite wallets, so a second `qbitd`, `qbit-qt`, or `qbit-wallet` can open a
-  live wallet. Two writers lose PQC counter updates and corrupt the wallet
-  (#280). `importmempool`, `loadtxoutset`, and qbit-qt's PSBT dialogs can do
-  the same when given a loaded wallet's file, and the PSBT save dialog can
-  overwrite it (#295). Never let two processes share a wallet directory, and
-  never pass a loaded wallet's file to these commands or dialogs.
+  descriptor ECDSA keys are encrypted is ignored (#296). Copies of a wallet
+  made before this release rewrote or re-encrypted it can still hold
+  unencrypted keys (#300, #301). Treat wallet files and backups from before
+  or around an encryption or passphrase change as unencrypted; to be safe,
+  create a new wallet with a passphrase using this release and move your
+  funds to it.
+- Encryption still generates the replacement seed only after the
+  post-encryption rewrite. If the process stops before the new seed is
+  written, the wallet stays encrypted but keeps using its old seed for new
+  addresses, whose keys were unencrypted on disk until the rewrite. If
+  `encryptwallet` was interrupted, consider creating a new wallet with a
+  passphrase and moving your funds (#300).
+- Re-encryption cannot make the PQC keys that v1.0.0 left unencrypted secret
+  again. Older wallet files and every backup made before re-encryption still
+  contain them. The affected keys are those a background refill added beyond
+  the wallet's keypool at encryption. For a wallet that got a new seed at
+  encryption, they belong to its old descriptors and were never handed out
+  as addresses, so funds are exposed only if those addresses are paid
+  anyway, for example by a copy restored from a backup made before
+  encryption. A blank wallet with imported descriptors keeps them active
+  through encryption, so the affected keys are its next receive and change
+  addresses and may already hold funds. If you are not sure that the wallet
+  file and all of its backups stayed private, create a new wallet with a
+  passphrase using this release, move your funds to it, and delete the old
+  backups. For a blank wallet with imported descriptors, stop receiving to
+  those descriptors as well (#301).
+- `importmempool`, `loadtxoutset`, and qbit-qt's PSBT dialogs release the
+  exclusive lock on a loaded SQLite wallet when given that wallet's file, so
+  a second `qbitd`, `qbit-qt`, or `qbit-wallet` can then open the live
+  wallet, and the PSBT save dialog can overwrite it (#295). Two writers lose
+  PQC counter updates and corrupt the wallet. Never let two processes share a
+  wallet directory, and never pass a loaded wallet's file to these commands
+  or dialogs.
 - PQC signature counters can roll back. Restoring an older backup, or loading
   an older copy of a wallet file, does so with no warning, and the restored
   copy can sign alongside the live wallet (#282). Re-importing a descriptor
@@ -657,12 +1046,8 @@ Known limitations
   loader still accepts encrypted key records without a counter tag or with an
   older one, so anyone who can write to the wallet file can roll a counter
   back (#288). Keep only one copy of a wallet that signs.
-- Locking does not wait for all background work. `walletlock` does not stop a
-  background P2MR keypool refill that is already running, which keeps its
-  copy of the master key until it finishes (#286), and it can return while
-  copies of decrypted signing keys are still being freed (#287). A qbit-qt
-  address-book deletion that coincides with another wallet write can
-  deadlock the wallet (#293).
+- A qbit-qt address-book deletion that coincides with another wallet write
+  can deadlock the wallet (#293).
 - A local client of the IPC mining interface (`qbit-node -ipcbind`) can stop
   `qbit-node`. When `submitSolution` rejects a block version that has the
   AuxPoW bit set, the template keeps that version, and the next `getBlock` or
