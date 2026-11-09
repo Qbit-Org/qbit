@@ -363,6 +363,7 @@ jobs:
 
           tests=(
             ci.release.test_publish_local_release
+            ci.release.test_release_staging_tools
             ci.release.test_validate_builder_attestations
             ci.release.test_validate_key_metadata
             ci.release.test_validate_release_artifacts
