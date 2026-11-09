@@ -40,10 +40,10 @@ run_scanners = load_run_scanners()
 
 class RunScannersTest(unittest.TestCase):
     def test_infra_and_secrets_fails_only_on_an_incomplete_secret_history_scan(self) -> None:
-        def summary(tool: str, status: str, gaps: list[str] = [], **details: object) -> dict[str, object]:
+        def summary(tool: str, status: str, gaps: tuple[str, ...] = (), **details: object) -> dict[str, object]:
             return {
                 "tool": tool, "status": status, "high_or_critical_untriaged_count": 0,
-                "coverage_gaps": gaps, "details": details,
+                "coverage_gaps": list(gaps), "details": details,
             }
 
         complete = summary("gitleaks", "completed", history_scan_complete=True)
