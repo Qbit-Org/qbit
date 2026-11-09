@@ -9,7 +9,9 @@ Key model
 
 `operator-keys/keys.json` is the public trust anchor. It records the active
 release signer set, release-line quorum settings, signer capabilities, artifact
-sets, and policy transition requirements.
+sets, and policy transition requirements. This directory, read at the
+release's trusted ref, is the one source of truth for the policy; copies and
+pins elsewhere are checked against it (`contrib/keys/README.md`).
 
 Each active signer has an independent public certificate listed in `keys.json`.
 Release signing and builder attestation remain separate workflow checks. A
@@ -90,11 +92,15 @@ Before relying on a signer policy:
 - publish each signer certificate referenced by `keys.json`
 - update `operator-keys/KEYS.md`
 - update `operator-keys/keys.json`
-- mirror the same machine-verifiable policy data into
-  `qbit-guix.sigs/operator-keys/`
-- keep the `qbit-guix.sigs/operator-keys/` mirror strict and data-only: no
+- re-sync the derived `qbit-guix.sigs/operator-keys/` copy from this
+  directory; it is not a trust source, and the release publisher refuses a
+  copy that differs
+- keep the `qbit-guix.sigs/operator-keys/` copy strict and data-only: no
   README files, notes, hidden files, unreferenced certificates, or stale
   approval material
+- move downstream pins (qbit-rpc's `scripts/qbit-release-keys/pin.json`) only
+  when they need a release signed under the new policy; see
+  `contrib/keys/README.md`
 - verify release signatures such as `SHA256SUMS.operator-01.asc` from a clean
   keyring
 - verify Guix attestations under `<version>/operator-01/` from a clean keyring

@@ -17,7 +17,7 @@ TRUSTED_RELEASE_REF_PATHS = [
     "contrib/release-process/publish-local-release.sh",
     "ci/release/test_validate_release_artifacts.py",
     "contrib/keys/operator-keys/KEYS.md",
-    "contrib/guix/repo-templates/qbit-guix.sigs/operator-keys/keys.json",
+    "contrib/keys/operator-keys/keys.json",
     "doc/release-trust-0.1.1-testnet4.md",
 ]
 
@@ -76,9 +76,9 @@ class ClassifyMergeProfileTest(unittest.TestCase):
 
         self.assertEqual(classification.profile, classify_merge_profile.RELEASE_POLICY_PROFILE)
 
-    def test_guix_operator_key_mirror_is_release_policy(self) -> None:
+    def test_operator_key_approvals_are_release_policy(self) -> None:
         path = (
-            "contrib/guix/repo-templates/qbit-guix.sigs/operator-keys/"
+            "contrib/keys/operator-keys/"
             "approvals/qbit-release-keys-mainnet-000002/operator-02.asc"
         )
         classification = self.classify([path])
@@ -87,6 +87,17 @@ class ClassifyMergeProfileTest(unittest.TestCase):
         self.assertEqual(classification.profile, classify_merge_profile.RELEASE_POLICY_PROFILE)
         self.assertTrue(classification.release_policy_only)
         self.assertEqual(outputs["touched_operator_keys"], "true")
+
+    def test_removed_guix_sigs_template_mirror_is_not_operator_key_policy(self) -> None:
+        # contrib/keys/operator-keys is the only in-repo copy of the policy; a
+        # file re-added under the old template mirror path gets the full
+        # source profile instead of the lightweight operator-key route.
+        path = "contrib/guix/repo-templates/qbit-guix.sigs/operator-keys/keys.json"
+        classification = self.classify([path])
+        outputs = classify_merge_profile.github_outputs(classification)
+
+        self.assertEqual(classification.profile, classify_merge_profile.SOURCE_PROFILE)
+        self.assertEqual(outputs["touched_operator_keys"], "false")
 
     def test_p2mr_release_validator_paths_use_release_policy_profile(self) -> None:
         for path in (

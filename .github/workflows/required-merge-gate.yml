@@ -171,13 +171,13 @@ jobs:
         run: |
           set -euo pipefail
 
+          # contrib/keys/operator-keys is the only copy of the release key
+          # policy in this repository. Mirrors and downstream pins are checked
+          # against it by their own consumers (see contrib/keys/README.md).
           canonical_dir="contrib/keys/operator-keys"
-          mirror_dir="contrib/guix/repo-templates/qbit-guix.sigs/operator-keys"
           validator_args=(
             --operator-policy "${canonical_dir}/keys.json"
             --operator-keys-dir "${canonical_dir}"
-            --operator-policy-mirror "${mirror_dir}/keys.json"
-            --operator-keys-dir-mirror "${mirror_dir}"
             --require-public-key-files
           )
 
@@ -233,37 +233,6 @@ jobs:
           fi
 
           python3 ci/release/validate_key_metadata.py "${validator_args[@]}"
-
-      - name: Validate exact operator-key mirror
-        run: |
-          set -euo pipefail
-          PYTHONPATH=ci/release python3 - <<'PY'
-          import json
-          from pathlib import Path
-
-          from validate_builder_attestations import load_builder_policy, validate_builder_mirror
-
-          canonical_dir = Path("contrib/keys/operator-keys")
-          mirror_dir = Path("contrib/guix/repo-templates/qbit-guix.sigs/operator-keys")
-          release_lines = json.loads(
-              (canonical_dir / "keys.json").read_text(encoding="utf8")
-          )["release_lines"]
-
-          for release_line in sorted(release_lines):
-              policy = load_builder_policy(
-                  canonical_dir / "keys.json",
-                  canonical_dir,
-                  release_line,
-              )
-              validate_builder_mirror(
-                  policy,
-                  canonical_dir,
-                  mirror_dir / "keys.json",
-                  mirror_dir,
-                  release_line,
-              )
-              print(f"Exact operator-key mirror validated for {release_line}")
-          PY
 
   release-policy-validation:
     name: release-policy validation

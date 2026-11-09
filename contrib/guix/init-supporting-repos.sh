@@ -16,6 +16,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 TEMPLATE_DIR="${SCRIPT_DIR}/repo-templates"
 readonly TEMPLATE_DIR
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+readonly REPO_ROOT
+# The release key policy has one source of truth: contrib/keys/operator-keys
+# in this repository, read at the release's trusted ref. qbit-guix.sigs only
+# carries a derived copy, seeded from it here.
+CANONICAL_KEYS_DIR="${REPO_ROOT}/contrib/keys/operator-keys"
+readonly CANONICAL_KEYS_DIR
 
 usage() {
     cat <<'EOF'
@@ -66,20 +73,48 @@ EOF
     fi
 }
 
+# Print the operator-keys files the release publisher requires in the
+# qbit-guix.sigs mirror for the canonical policy: keys.json, every referenced
+# signer certificate, and the current policy's approval material. This is the
+# file set ci/release/validate_builder_attestations.py checks byte for byte.
+operator_keys_mirror_files() {
+    PYTHONPATH="${REPO_ROOT}/ci/release" python3 - "${CANONICAL_KEYS_DIR}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from validate_builder_attestations import (
+    BuilderValidationError,
+    expected_operator_key_files,
+    load_builder_policy,
+)
+
+keys_dir = Path(sys.argv[1])
+policy_path = keys_dir / "keys.json"
+try:
+    release_lines = json.loads(policy_path.read_text(encoding="utf8"))["release_lines"]
+    files = set()
+    for release_line in sorted(release_lines):
+        policy = load_builder_policy(policy_path, keys_dir, release_line)
+        files |= expected_operator_key_files(keys_dir, policy)
+except (BuilderValidationError, OSError, KeyError, TypeError, ValueError) as exc:
+    sys.exit(f"ERR: canonical operator key policy is not mirrorable: {exc}")
+for relative in sorted(files):
+    print(relative)
+PY
+}
+
 init_guix_sigs_repo() {
     local repo_dir="$1"
-    local public_key
+    local mirror_files
+    local relative
     init_git_repo "${repo_dir}"
     copy_if_missing "${TEMPLATE_DIR}/qbit-guix.sigs/README.md" "${repo_dir}/README.md"
-    copy_if_missing "${TEMPLATE_DIR}/qbit-guix.sigs/operator-keys/keys.json" "${repo_dir}/operator-keys/keys.json"
-    mkdir -p "${repo_dir}/operator-keys/public-keys"
-    if [[ -d "${TEMPLATE_DIR}/qbit-guix.sigs/operator-keys/public-keys" ]]; then
-        for public_key in "${TEMPLATE_DIR}/qbit-guix.sigs/operator-keys/public-keys"/*.asc; do
-            [[ -e "${public_key}" ]] || continue
-            copy_if_missing "${public_key}" "${repo_dir}/operator-keys/public-keys/$(basename "${public_key}")"
-        done
-    fi
-    mkdir -p "${repo_dir}/operator-keys/approvals"
+    mirror_files="$(operator_keys_mirror_files)"
+    while IFS= read -r relative; do
+        [[ -n "${relative}" ]] || continue
+        copy_if_missing "${CANONICAL_KEYS_DIR}/${relative}" "${repo_dir}/operator-keys/${relative}"
+    done <<< "${mirror_files}"
 }
 
 init_detached_sigs_repo() {
@@ -116,11 +151,11 @@ cat <<'EOF'
 
 Next steps:
 1. Review and customize the generated repository README.
-2. Replace operator-keys/keys.json with the canonical release signer policy.
-3. Mirror the referenced signer public certificates under
-   operator-keys/public-keys/ and policy approval material under
-   operator-keys/approvals/.
-4. Add the GitHub remotes and push the initialized repositories.
-5. For detached signatures, create per-release orphan branches when the first
+2. operator-keys/ was seeded from this checkout's contrib/keys/operator-keys.
+   It is a derived copy, never a trust source: before each release, re-sync it
+   from contrib/keys/operator-keys at the release's trusted ref. The release
+   publisher refuses a qbit-guix.sigs commit whose copy differs.
+3. Add the GitHub remotes and push the initialized repositories.
+4. For detached signatures, create per-release orphan branches when the first
    codesigned release is produced.
 EOF

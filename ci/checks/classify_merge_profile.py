@@ -51,10 +51,7 @@ GITHUB_METADATA_PREFIXES = (
     ".github/repository-settings/",
     ".github/rulesets/",
 )
-OPERATOR_KEYS_PREFIXES = (
-    "contrib/keys/operator-keys/",
-    "contrib/guix/repo-templates/qbit-guix.sigs/operator-keys/",
-)
+OPERATOR_KEYS_PREFIXES = ("contrib/keys/operator-keys/",)
 
 
 @dataclass(frozen=True)

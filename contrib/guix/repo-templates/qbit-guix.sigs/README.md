@@ -7,9 +7,9 @@ operator build checks.
 
 - Publish `noncodesigned.SHA256SUMS{,.asc}` and `all.SHA256SUMS{,.asc}` files
   for each release version and operator.
-- Provide a public, data-only mirror of qbit release signer policy,
-  signer public certificates, and policy approval material under
-  `operator-keys/`.
+- Carry a derived, data-only copy of the qbit release signer policy, signer
+  public certificates, and current policy approval material under
+  `operator-keys/`, next to the attestations they verify.
 - Support `./contrib/guix/guix-attest` and `./contrib/guix/guix-verify` via the
   `GUIX_SIGS_REPO` environment variable.
 
@@ -58,6 +58,15 @@ signer has `builder-attestation` capability in `operator-keys/keys.json`.
 Release-signature quorum and builder-attestation quorum remain separate checks
 over the active signer policy.
 
-`operator-keys/` is machine-verified release key mirror data. Do not place
-README files, notes, hidden files, stale certificates, unreferenced approval
-files, or other human-only documents under that directory.
+`operator-keys/` is not a trust source. The release key policy has one source
+of truth: `contrib/keys/operator-keys/` in `Qbit-Org/qbit`, read at the
+release's trusted ref (see `contrib/keys/README.md` there). Release validators
+read the policy from that checkout; the release publisher also refuses a
+`qbit-guix.sigs` commit whose `operator-keys/` differs from it, byte for byte.
+Verifiers should take keys from qbit, not from this directory.
+
+Keep `operator-keys/` strict machine data: exactly `keys.json`, the signer
+certificates it references, and the current policy's
+`approvals/<policy-id>/` material. Do not place README files, notes, hidden
+files, stale certificates, older approval directories, or other human-only
+documents under it.
