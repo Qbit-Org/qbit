@@ -417,7 +417,8 @@ namespace GUIUtil
      * which runs the platform's modal loop instead, is open. Qt dialogs shown
      * without a loop of their own, such as with
      * ShowModalDialogAsynchronously(), do not count. Call from the GUI
-     * thread's event loop.
+     * thread's event loop. RPC stop and SIGTERM also wait for any modal
+     * widget; see the shutdown poll in BitcoinApplication::createWindow().
      */
     bool IsUserInteractionPending();
 

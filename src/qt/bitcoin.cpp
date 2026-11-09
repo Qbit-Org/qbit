@@ -267,6 +267,10 @@ void BitcoinApplication::createWindow(const NetworkStyle *networkStyle)
 
     pollShutdownTimer = new QTimer(window);
     connect(pollShutdownTimer, &QTimer::timeout, [this]{
+        // RPC stop and SIGTERM keep upstream's gate on purpose: an
+        // unattended stop waits for any modal dialog, including progress and
+        // asynchronous dialogs. User quits instead defer only while
+        // GUIUtil::IsUserInteractionPending() holds; see requestShutdown().
         if (!QApplication::activeModalWidget()) {
             window->detectShutdown();
         }
