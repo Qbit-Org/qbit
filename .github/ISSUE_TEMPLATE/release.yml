@@ -1,0 +1,100 @@
+name: Release
+description: Track one qbit release from freeze to downstream pins (maintainers).
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This issue tracks one release. Follow `doc/release/release-process.md` at the head of the release branch; the checklist below mirrors it.
+
+        Record evidence (run URLs, commit SHAs, digests) next to each item as it completes. Do not include security-sensitive details; email contact@qbit.org for security reports.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The release version, without the leading v.
+      placeholder: e.g. 1.0.1
+    validations:
+      required: true
+  - type: dropdown
+    id: release-line
+    attributes:
+      label: Release line
+      description: The value passed to the publisher's --release-line option.
+      multiple: false
+      options:
+        - mainnet
+        - testnet
+    validations:
+      required: true
+  - type: input
+    id: release-branch
+    attributes:
+      label: Release branch
+      description: The branch the release is cut from.
+      placeholder: e.g. 1.x.x
+    validations:
+      required: true
+  - type: input
+    id: tag-target
+    attributes:
+      label: Tag target
+      description: The full 40-character SHA of the commit to tag. Fill it in once the candidate is final.
+      placeholder: 40-character commit SHA
+    validations:
+      required: false
+  - type: input
+    id: coordinator
+    attributes:
+      label: Release coordinator
+      description: The GitHub username of the release coordinator.
+    validations:
+      required: true
+  - type: checkboxes
+    id: before
+    attributes:
+      label: Before the tag
+      options:
+        - label: Freeze announced on the release branch; each accepted exception recorded in this issue.
+        - label: Review status of every merge since the previous release recorded for the trust record.
+        - label: Prep PR merged (version bump, regenerated man pages and qbit.conf, consolidated release notes, fragments deleted).
+        - label: Release notes cover behavior changes, upgrade and downgrade, known limitations and every waiver.
+        - label: Chainparams maintenance reviewed and recorded (minor releases only).
+        - label: Core Checks, Full Validation and the Required Merge Gate green on the exact tag-target commit, or each waived failure recorded for the trust record.
+        - label: Nightly CI dispatched on the release branch at the candidate, and the run recorded.
+        - label: Mainnet posture validator passes on the candidate commit.
+        - label: Fuzz evidence and the full qbit P2MR v1 unit suite run on the candidate source.
+        - label: Packaged candidate built with Guix and FORCE_VERSION, and smoke-tested on each platform (install or upgrade, sync, encrypted send and relock, PSBT, clean shutdown).
+        - label: Platform-signing disposition recorded (signed artifacts, or an explicit unsigned-platform waiver for this release).
+  - type: checkboxes
+    id: during
+    attributes:
+      label: During the release
+      options:
+        - label: Signed annotated tag pushed on the exact commit; GitHub reports verified=true and reason=valid; tag object, tag target and signer recorded.
+        - label: Builder quorum met in qbit-guix.sigs for core and PHOTON; the counted qbit-guix.sigs commit recorded.
+        - label: The packaged candidate's tested artifacts match the tagged build's SHA256SUMS.
+        - label: Debug symbol archives staged and listed in SHA256SUMS (Linux and Windows, and macOS from v1.0.1).
+        - label: SHA256SUMS signed to the signing quorum and SHA256SUMS.asc combined.
+        - label: P2MR v1 evidence produced on the tag target, and the verifier passes locally.
+        - label: Publish-time notes written outside the checkout, with the P2MR v1 sentence naming the tag target.
+        - label: Trust-record PR merged; its merge commit recorded as trusted_release_ref.
+        - label: Publisher validation-only run passes from a clean checkout at trusted_release_ref.
+        - label: Draft created with --create-draft, and the draft body checked.
+        - label: Published with --publish; the release is immutable and the publisher's Evidence line is saved.
+  - type: checkboxes
+    id: after
+    attributes:
+      label: After the release
+      options:
+        - label: Follow-up trust-record PR merged (trusted_release_ref SHA, ref the publisher ran from, release URL).
+        - label: Release branch integrated into the default branch, following the recorded branch-model decision.
+        - label: RPC docs on docs.qbit.org list the release.
+        - label: Downstream pins bumped in qbit-rpc, qbit-js, qbit-mining-bootstrap and qbit-electrs.
+        - label: This issue closed with links to the release, the trust record and the downstream PRs.
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Decisions, freeze exceptions, waivers and links to evidence.
+    validations:
+      required: false

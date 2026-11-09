@@ -56,6 +56,7 @@ Source Contributor References
 
 - [Build docs](build/)
 - [Developer notes](development/developer-notes.md)
+- [Release process](release/README.md)
 - [Developer productivity](development/productivity.md)
 - [Performance benchmarking](performance/benchmarking.md)
 - [RPC benchmarking](performance/rpc-benchmarking.md)

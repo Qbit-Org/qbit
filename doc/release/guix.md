@@ -1,10 +1,30 @@
 # Bootstrappable qbit Builds
 
-qbit release binaries are built by release operators with reproducible Guix
-builds and checked against builder attestations before publication.
+qbit release binaries are built by release builders with reproducible Guix
+builds, and checked against builder attestations before publication. The
+[release runbook](release-process.md) says when this happens in a release.
 
-Public release evidence pins the exact `qbit-guix.sigs` commit used for
-attestation validation.
+## Builders and attestations
+
+Builders are the active `builder-attestation` signers for the release line in
+[`contrib/keys/operator-keys/keys.json`](../../contrib/keys/operator-keys/keys.json).
+Each builder builds the signed tag with the builders' Guix tooling, which
+drives the public scripts in [contrib/guix](../../contrib/guix/):
+`guix-build` for core, `guix-build-photon` for PHOTON, and `guix-attest` to
+write signed manifests.
+
+Each builder then adds its manifests to `Qbit-Org/qbit-guix.sigs` under
+`<version>/<alias>/`: `noncodesigned.SHA256SUMS`, plus `all.SHA256SUMS` when
+codesigned outputs exist, each with a detached `.asc` signature. PHOTON
+manifests use the same names with a `photon-` prefix. The validator reads
+`all.SHA256SUMS` when it exists and `noncodesigned.SHA256SUMS` otherwise. An
+artifact set passes once the number of builders with matching manifests
+reaches that release line's `builder_attestation_quorum` in `keys.json`.
+Public release evidence pins the exact `qbit-guix.sigs` commit used for that
+count.
+
+Before tagging, a candidate can be built with `FORCE_VERSION=<version>`, so
+its artifacts have the names a tagged build will produce.
 
 ## Build outputs
 
@@ -62,4 +82,5 @@ python3 ci/release/validate_builder_attestations.py \
 The validator requires an annotated local tag, confirms that it resolves to
 the supplied commit, reconstructs the archive from that commit rather than the
 worktree or `trusted_release_ref`, and reports the canonical source digest for
-release evidence.
+release evidence. The publisher runs the same validator; see
+[the publisher reference](publisher-reference.md#builder-attestations).
