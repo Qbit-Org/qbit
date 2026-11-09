@@ -32,9 +32,9 @@ The publisher's `--release-line` must be `mainnet` or `testnet`. The artifact
 validator also requires a testnet tag to contain `testnet` and a mainnet tag
 not to. `--tag` must match `^v[A-Za-z0-9][A-Za-z0-9._-]*$`. The tags pushed so
 far are `v0.1.0-testnet4`, `v0.1.1-testnet4`, `v0.1.2-testnet4` and `v1.0.0`.
-Names such as `v1.0.1-rc1` or `v0.1.0-testnet4-rc1` are format examples; no
-rc tag has ever been pushed, and whether a release has release candidates is
-decided per release.
+Names such as `v1.0.1-rc1` or `v0.1.0-testnet4-rc1` are format examples. As
+of 2026-11-09, the repository has no rc tags. Whether a release has release
+candidates is decided per release.
 
 **Testnet releases** require `--testnet-posture-evidence FILE`; the
 publisher exits before validation without it. It passes the file to
@@ -197,7 +197,7 @@ fails unless:
 **CI coverage.** Core Checks runs the same validator in its `mainnet
 publication posture` job, gated by `mainnet_publish_gate_required` in
 `.github/workflows/core-checks.yml`. Each branch carries its own copy of that
-workflow. In `1.x.x`'s copy (as of `9574775b1f`), the job runs only when the
+workflow. In `1.x.x`'s copy (as of `b10c761916`), the job runs only when the
 target branch is `1.0.0` (a pull request into it, or a push to it) and the
 change profile is `source` or `release-policy`, so runs for `1.x.x` and
 `main` skip it. `1.1.0`'s copy also covers `1.1.0`
@@ -388,16 +388,20 @@ Public release evidence pins public data only:
 - `trusted_release_ref`, how it was chosen, and its review evidence;
 - the exact-byte `keys.json` sha256, `policy_id` and `policy_sequence`;
 - the exact `qbit-guix.sigs` commit used for validation;
-- the counted builder aliases for each artifact set;
+- the counted builder aliases and fingerprints for each artifact set;
 - the canonical source archive name and sha256, and the tag target it came
   from;
-- the counted release-signer aliases;
+- the counted release-signer aliases and fingerprints. The publisher prints
+  builder and signer aliases only; each fingerprint is that alias's
+  `signing_fingerprint` in the `keys.json` at `trusted_release_ref`;
 - the sha256 of `SHA256SUMS`, of `SHA256SUMS.asc` and of each individual
   signature, and the artifact count;
 - whether PHOTON was included, and its validation result;
 - the publisher's printed `Pinned refs`, `Key policy`, `Artifacts`,
   `Release signatures`, `Builder attestations`, `Builder source` and
-  `Evidence` lines, and the ref it ran from;
+  `Evidence` lines, and its `Published immutable release assets exactly match
+  local names and SHA256 digests` line, taken from the saved output of each
+  run, and the ref it ran from;
 - the release URL and its final immutable state;
 - the P2MR v1 profile version, the tag target, the corpus manifest digest,
   the qbit result, the oracle report digest, the finalized matrix digest and

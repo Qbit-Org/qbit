@@ -77,10 +77,14 @@ signers. If the policy changes, the file is authoritative, not this sentence.
   `CLIENT_VERSION_RC 0`, `CLIENT_VERSION_PHASE ""` (a non-empty phase adds
   `-<phase>` to every version string) and `CLIENT_VERSION_IS_RELEASE "true"`;
   a release candidate sets `CLIENT_VERSION_RC`. Check `COPYRIGHT_YEAR`.
-- [ ] Build the bumped, committed tree with the GUI, the wallet and every
-  tool, because `gen-manpages.py` needs every binary including `bin/qbit-qt`,
-  and `BUILD_GUI` is `OFF` by default. Use a non-Debug build, so that no
-  binary reports `-dirty` and no Debug-only option appears:
+- [ ] Commit the version bump, then build that commit with the GUI, the
+  wallet and every tool, because `gen-manpages.py` needs every binary
+  including `bin/qbit-qt`, and `BUILD_GUI` is `OFF` by default. Build with no
+  local changes: `git status --porcelain --untracked-files=no` must print
+  nothing. With `CLIENT_VERSION_IS_RELEASE "true"` the binaries never report
+  `-dirty`, so `gen-manpages.py` cannot detect a dirty build. Use a non-Debug
+  build, because a Debug build adds Debug-only options, such as the `lock`
+  debug category, to the help text the pages are generated from:
 
   ```sh
   cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_GUI=ON -DENABLE_WALLET=ON -DBUILD_CLI=ON -DBUILD_TX=ON -DBUILD_UTIL=ON -DBUILD_WALLET_TOOL=ON
@@ -102,12 +106,18 @@ signers. If the policy changes, the file is authoritative, not this sentence.
   merged since `PREVIOUS_TAG` into `doc/release-notes-<VERSION>.md`, then
   delete them. A fragment that already existed at `PREVIOUS_TAG` belongs to an
   earlier release: check it against that release's notes and delete it
-  without folding it in. This command sorts them:
+  without folding it in. This command sorts them. It fails, and sorts
+  nothing, unless `PREVIOUS_TAG` is set and that tag exists locally:
 
   ```sh
-  for f in $(git ls-files doc | grep -E '^doc/release-notes-[0-9]+\.md$'); do
-    if git cat-file -e "${PREVIOUS_TAG}:${f}" 2>/dev/null; then echo "older: ${f}"; else echo "new: ${f}"; fi
-  done
+  (
+    set -eu
+    git rev-parse --verify --quiet "refs/tags/${PREVIOUS_TAG}^{commit}" >/dev/null ||
+      { echo "tag ${PREVIOUS_TAG} not found; run: git fetch origin tag ${PREVIOUS_TAG}" >&2; exit 1; }
+    for f in $(git ls-files doc | grep -E '^doc/release-notes-[0-9]+\.md$'); do
+      if git cat-file -e "refs/tags/${PREVIOUS_TAG}:${f}" 2>/dev/null; then echo "older: ${f}"; else echo "new: ${f}"; fi
+    done
+  )
   ```
 
 - [ ] The notes cover behavior changes, upgrade and downgrade, known
@@ -151,16 +161,28 @@ Run these on the exact commit you will tag. Any later merge restarts the list.
   ```
 
 - [ ] **Mainnet posture.** In `1.x.x`'s `core-checks.yml` (as of
-  `9574775b1f`), the `mainnet publication posture` job runs only for changes
+  `b10c761916`), the `mainnet publication posture` job runs only for changes
   to `1.0.0`; `1.1.0`'s copy also covers `1.1.0`
   ([#256](https://github.com/Qbit-Org/qbit/pull/256)). Where the job does
-  not run, run the validator yourself. It needs an annotated tag, so work in
-  a throwaway clone and never push that tag:
+  not run, run both of its checks yourself in a fresh worktree of
+  `TAG_TARGET`. Without `--release-tag` the posture validator checks the
+  working tree, so no tag is needed. The last command applies
+  `mainnet_ci_posture.json` to the result, as the CI job does:
 
   ```sh
-  git -c tag.gpgSign=false tag --annotate --message "posture check" v0.0.0-posture-check "${TAG_TARGET}"
-  python3 ci/release/verify_mainnet_release_posture.py --source-root "$PWD" --release-tag v0.0.0-posture-check
+  (
+    set -eu
+    repo="$PWD"; dir="$(mktemp -d)"
+    trap 'cd "$repo"; git worktree remove --force "$dir" 2>/dev/null || rmdir "$dir" 2>/dev/null || true' EXIT
+    git worktree add --detach "$dir" "${TAG_TARGET}"
+    cd "$dir"; rc=0
+    python3 ci/release/verify_mainnet_release_posture.py --source-root "$dir" --result-json "$dir/posture-result.json" || rc=$?
+    python3 ci/release/verify_mainnet_ci_posture.py --policy ci/release/mainnet_ci_posture.json --result-json "$dir/posture-result.json" --validator-exit-code "$rc"
+  )
   ```
+
+  The check passes only if the block exits 0 and its last line is
+  `Validated publication-ready mainnet CI posture`.
 
 - [ ] **Fuzz evidence** on the candidate source, following
   [fuzzing.md](../development/fuzzing.md#qbit-seed-corpora). Record, for the
@@ -211,7 +233,7 @@ The `public-release-tags-v-immutability` ruleset blocks updating or deleting
 a `v*` tag for everyone except organization admins, who can bypass it. The
 publisher's tag pin still detects a moved tag. The publisher accepts tags
 that match `^v[A-Za-z0-9][A-Za-z0-9._-]*$`, and a mainnet tag must not
-contain `testnet`. No rc tag has been pushed so far.
+contain `testnet`. As of 2026-11-09, the repository has no rc tags.
 
 ### 2. Guix builds and attestations
 
@@ -275,29 +297,43 @@ contain `testnet`. No rc tag has been pushed so far.
   authoritative list of fields; in summary, the record contains:
   - [ ] the tag, tag object and tag target; the signer's alias and
     fingerprint; the tagger, tag date and GitHub verification result;
-  - [ ] `trusted_release_ref`, how it was chosen (the commit that lands this
-    record on `RELEASE_BRANCH`), and its review evidence;
+  - [ ] how `trusted_release_ref` is chosen (the commit that lands this
+    record on `RELEASE_BRANCH`), and the review evidence;
   - [ ] the `keys.json` sha256, `policy_id` and `policy_sequence`;
-  - [ ] the exact `qbit-guix.sigs` commit, the counted builders for each
-    artifact set, and the source archive's name, sha256 and tag target;
-  - [ ] the counted signers; the sha256 of `SHA256SUMS`, of `SHA256SUMS.asc`
-    and of each individual signature; the artifact count; and whether PHOTON
-    is included;
+  - [ ] the exact `qbit-guix.sigs` commit, the counted builders' aliases and
+    fingerprints for each artifact set, and the source archive's name, sha256
+    and tag target;
+  - [ ] the counted signers' aliases and fingerprints; the sha256 of
+    `SHA256SUMS`, of `SHA256SUMS.asc` and of each individual signature; the
+    artifact count; and whether PHOTON is included. The publisher cannot run
+    before this PR lands, so take the counted aliases from the two validators
+    it runs, run directly on the staged set:
+    `ci/release/validate_release_artifacts.py` prints the counted signer
+    aliases, and `ci/release/validate_builder_attestations.py --github-output
+    <file>` (see [guix.md](guix.md#source-archive-binding)) writes the counted
+    builder aliases for each artifact set. Take each fingerprint from that
+    alias's `signing_fingerprint` in the `keys.json` this PR lands with, which
+    is the copy the publisher trusts at `TRUSTED_RELEASE_REF`;
   - [ ] the P2MR v1 profile version, digests, results and consensus review;
-  - [ ] the publisher's printed evidence lines, the ref it ran from, and the
-    release URL and immutable state;
   - [ ] the CI runs at the tag target, any unsigned-platform or codesigning
     waiver, and the review status recorded at the freeze.
-- [ ] Values that exist only after the PR lands or after publication (the
-  `trusted_release_ref` SHA, the publisher's output, the ref it ran from, and
-  the release URL) go in a follow-up PR. A follow-up never moves
+- [ ] Values that exist only after the PR lands or after publication go in a
+  follow-up PR after step 6: the `trusted_release_ref` SHA; the publisher's
+  printed evidence lines, from the saved output of each run; the ref it ran
+  from; and the release URL and its immutable state. A follow-up never moves
   `trusted_release_ref`.
 
 ### 6. Publish
 
 Run the publisher three times with the same arguments: with no mode flag
 (validation only), then with `--create-draft`, then with `--publish`. Each run
-repeats the full validation.
+repeats the full validation. Save the complete output of every run, including
+repeated ones, outside the checkout; a log file inside the checkout would make
+it dirty. For example, wrap each run as
+`( set -o pipefail; contrib/release-process/publish-local-release.sh ... 2>&1 | tee -a /srv/release/v1.0.1/publisher.log )`,
+with a log for this release only; `pipefail` keeps a failed run's nonzero
+exit status. The output can contain local paths; only its evidence lines go
+in the trust record.
 
 - [ ] Prepare a clean clone of `Qbit-Org/qbit` with `TRUSTED_RELEASE_REF`
   checked out and the tag fetched, and a clean `qbit-guix.sigs` clone at
@@ -343,8 +379,13 @@ repeats the full validation.
     [#256](https://github.com/Qbit-Org/qbit/pull/256) plans for v1.1.0-rc1.
 - [ ] Add `--create-draft`, then check that the draft body carries the P2MR v1
   sentence. The publisher does not check it.
-- [ ] Replace `--create-draft` with `--publish`. Keep the final `Evidence:`
-  line and the release URL for the trust record.
+- [ ] Replace `--create-draft` with `--publish`, and record the release URL
+  for the trust record. The upload set is exactly the staged directory: the
+  artifacts listed in `SHA256SUMS`, `SHA256SUMS` itself and its signatures.
+  The publisher's `Published immutable release assets exactly match local
+  names and SHA256 digests` line and the `Evidence` line's `file_count`,
+  together with the recorded digests of `SHA256SUMS` and its signatures, pin
+  every published asset.
 
 ### Immutable-publication recovery
 

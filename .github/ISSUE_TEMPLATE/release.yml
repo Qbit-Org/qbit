@@ -60,7 +60,7 @@ body:
         - label: Chainparams maintenance reviewed and recorded (x.y.0 releases only).
         - label: Full Validation and the Required Merge Gate green on the final commit.
         - label: Nightly CI dispatched on the release branch at the candidate, and the run recorded.
-        - label: Mainnet posture validator passes on the candidate commit.
+        - label: Mainnet posture check passes on the candidate commit (the posture validator exits 0 and the CI-posture check prints Validated publication-ready mainnet CI posture).
         - label: Fuzz evidence on the candidate source (coverage checker, seed replay, mutation phase with execution counts) for the qbit targets plus process_message and p2p_headers_presync.
         - label: Full qbit P2MR v1 unit suite run on the candidate source.
         - label: Pre-tag smoke evidence from a Guix build with FORCE_VERSION on each platform (install or upgrade, sync, encrypted send and relock, PSBT, clean shutdown).
@@ -81,13 +81,13 @@ body:
         - label: Trust-record PR landed; the commit that landed it recorded as trusted_release_ref.
         - label: Publisher validation-only run passes from a clean checkout at trusted_release_ref.
         - label: Draft created with --create-draft, and the draft body checked.
-        - label: Published with --publish; the release is immutable and the publisher's Evidence line is saved.
+        - label: Published with --publish; the release is immutable, and the output of every publisher run is saved outside the checkout.
   - type: checkboxes
     id: after
     attributes:
       label: After the release
       options:
-        - label: Follow-up trust-record PR merged (trusted_release_ref SHA, publisher output, ref the publisher ran from, release URL).
+        - label: Follow-up trust-record PR merged (trusted_release_ref SHA, the publisher's evidence lines, the ref it ran from, release URL and immutable state).
         - label: Release branch integrated into the default branch, following the operator's recorded branch-model decision and main's ruleset.
         - label: RPC docs on docs.qbit.org list the release.
         - label: Downstream pins bumped in qbit-rpc, qbit-js, qbit-wallet, qbit-mining-bootstrap and qbit-electrs.
