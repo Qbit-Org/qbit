@@ -22,17 +22,26 @@ has no workflow inputs and no workflow run.
 ## Release source and tags
 
 The release source is the commit that the signed annotated tag points to (the
-tag target). Mainnet releases are cut from a release branch; `1.x.x` is the
-active 1.x maintenance branch, `1.1.0` was forked from it to prepare 1.1.0,
-and `main` has been unchanged since the v1.0.0 trust record. The runbook
-lists the [branches and release lines](release-process.md#branches-and-release-lines).
+tag target). v1.0.1 is being cut from `1.x.x`, the active 1.x maintenance
+branch; v1.0.0 was cut from `main`, which has been unchanged since the
+v1.0.0 trust record. `1.1.0` was forked from `1.x.x` to prepare 1.1.0. The
+branch model is pending an operator decision. The runbook lists the
+[branches and release lines](release-process.md#branches-and-release-lines).
 
 The publisher's `--release-line` must be `mainnet` or `testnet`. The artifact
 validator also requires a testnet tag to contain `testnet` and a mainnet tag
 not to. `--tag` must match `^v[A-Za-z0-9][A-Za-z0-9._-]*$`. The tags pushed so
 far are `v0.1.0-testnet4`, `v0.1.1-testnet4`, `v0.1.2-testnet4` and `v1.0.0`.
 Names such as `v1.0.1-rc1` or `v0.1.0-testnet4-rc1` are format examples; no
-rc tag has ever been pushed.
+rc tag has ever been pushed, and whether a release has release candidates is
+decided per release.
+
+**Testnet releases** require `--testnet-posture-evidence FILE`; the
+publisher exits before validation without it. It passes the file to
+`ci/release/verify_testnet_release_posture.py` together with the tag and the
+staged artifacts, and forwards `--allow-unsigned-platform-artifacts` and
+`--allow-codesigning-artifacts` to that validator. Whether testnet-only
+releases continue is pending an operator decision.
 
 Never use a branch name, a short SHA, a tag object SHA or an unpublished
 commit as the release source.
@@ -53,7 +62,12 @@ It runs this check before validation, again immediately before `--publish`
 makes the release public, and once more after publication. The artifact
 validator separately runs `git verify-tag` against the policy's keys and
 requires a signature from an active `release-signing` key for the release
-line.
+line. GitHub reports `verified=true` only when the signing key is on a GitHub
+account whose verified email matches the tagger.
+
+The `public-release-tags-v-immutability` ruleset blocks updating or deleting
+`v*` tags, but organization admins can bypass it. The tag pin is what
+detects a tag that was moved after it was pinned.
 
 ## Trusted release ref
 
@@ -76,7 +90,7 @@ tag target, not from this checkout.
 
 **Process, not enforced:** the publisher does not check branch protection,
 reviews, or which branch contains the commit. By process,
-`trusted_release_ref` is the commit that merges the trust-record PR into the
+`trusted_release_ref` is the commit that lands the trust-record PR on the
 release branch, and the trust record states how it was chosen. A later
 revision of the trust record never moves it.
 
@@ -102,15 +116,18 @@ exactly:
 - `SHA256SUMS` itself, which must not list itself or any signature file;
 - one `SHA256SUMS.<alias>.asc` per counted signer, where each alias is an
   active `release-signing` signer for the release line;
-- `SHA256SUMS.asc`, which combines the individual signatures. Its valid
-  signer set must equal the set of valid individual signatures.
+- `SHA256SUMS.asc`, the concatenation of the individual `.asc` files in the
+  policy's alias order. The validator checks that its valid signer set equals
+  the set of valid individual signatures; it does not check the order.
 
 Artifact names must start with `qbit-<version>-` or `qbit-photon-<version>-`
 and end in `.tar.gz`, `.tar.xz`, `.zip`, `.dmg` or `.exe`. A name with an
 `-unsigned` component needs `--allow-unsigned-platform-artifacts`, and a name
 with a `-codesigning` component needs `--allow-codesigning-artifacts`.
 At least one core artifact is required, and `--require-photon` also requires
-a PHOTON artifact. The release-signature quorum is
+a PHOTON artifact. The source archive `qbit-<version>.tar.gz` does not match
+these name rules, so the staged `SHA256SUMS` must leave it out; it is builder
+evidence only (see [guix.md](guix.md)). The release-signature quorum is
 `release_signature_quorum` for the release line in `keys.json`. Every file in
 the directory is uploaded.
 
@@ -178,16 +195,19 @@ fails unless:
   assert that default and explicit mainnet selection.
 
 **CI coverage.** Core Checks runs the same validator in its `mainnet
-publication posture` job only when the target branch is `1.0.0` (a pull
-request into it, or a push to it) and the change profile is `source` or
-`release-policy` (`mainnet_publish_gate_required` in
-`.github/workflows/core-checks.yml`). Runs for any other branch, including
-`1.x.x` and `main`, skip the job. It was skipped at the
-v1.0.0 tag target, and at the `1.x.x` commit that
+publication posture` job, gated by `mainnet_publish_gate_required` in
+`.github/workflows/core-checks.yml`. Each branch carries its own copy of that
+workflow. In `1.x.x`'s copy (as of `9574775b1f`), the job runs only when the
+target branch is `1.0.0` (a pull request into it, or a push to it) and the
+change profile is `source` or `release-policy`, so runs for `1.x.x` and
+`main` skip it. `1.1.0`'s copy also covers `1.1.0`
+([#256](https://github.com/Qbit-Org/qbit/pull/256)). The job was skipped at
+the v1.0.0 tag target, and at the `1.x.x` commit that
 [#174](https://github.com/Qbit-Org/qbit/issues/174) tested.
 `ci/release/mainnet_ci_posture.json` is in its `final` phase with no expected
 failures, so where the job does run, it requires the validator to pass. The
-publisher does not read that file; it is the authority for publication.
+publisher does not read that file; the publisher, not that file, is the
+authority for publication.
 
 ## P2MR v1 conformance inputs
 
@@ -221,6 +241,7 @@ To prepare the inputs:
 5. Complete a finalized copy of the integration matrix whose
    `release_source_commit` is the tag target. Every required in-tree surface
    must be `supported` and `pass`, with `version` equal to the tag target,
+   an `owner` and its `limitations`,
    plus an environment, a review date and stable public evidence. Leave
    unsupported external categories as explicit `not-claimed` rows.
 6. Run the consensus review on the tag target and keep a stable public
@@ -301,9 +322,12 @@ that is not yet in the draft.
 
 Asset inventories are compared only after a complete, paginated listing
 succeeds. The publisher compares names and the SHA256 digests GitHub
-computed, retrying up to five times, two seconds apart, to allow for API
-propagation. If the listing still fails, the publisher stops with an error
-that names the asset-list request, before any upload, edit or publication.
+computed. While it resumes, uploads to or publishes a draft, it retries the
+listing and comparison up to five times, two seconds apart, to allow for API
+propagation. Validation-only mode against an already published release lists
+its assets once, without retries. If the listing fails, the publisher stops
+with an error that names the asset-list request, before any upload, edit or
+publication.
 If that happens after publication, rerun the publisher in validation-only
 mode once the listing is readable.
 
@@ -342,11 +366,15 @@ observed tag values; it cannot roll the publication back.
 | --- | --- | --- |
 | Unsigned platform artifacts | `--allow-unsigned-platform-artifacts` | Release notes and trust record |
 | Public codesigning payloads | `--allow-codesigning-artifacts` | Release notes and trust record |
-| A CI failure at the tag target | None: the publisher does not read CI results | Trust record |
 
-v1.0.0 shipped `-unsigned` macOS and Windows artifacts without a recorded
-platform-signing waiver, and was tagged while a Full Validation run that later
-failed was still in progress. Both are recorded in
+There is no CI waiver: Full Validation and the Required Merge Gate must be
+green on the final commit before tagging
+([#181](https://github.com/Qbit-Org/qbit/pull/181)). The publisher does not
+read CI results. Whether to have a CI waiver policy is left to the operator.
+
+For history: v1.0.0 shipped `-unsigned` macOS and Windows artifacts without a
+recorded platform-signing waiver, and was tagged while a Full Validation run
+that later failed was still in progress. Both are recorded in
 [its trust record](../release-trust-1.0.0.md). An earlier release's waiver
 does not carry over to a new release.
 
@@ -375,11 +403,12 @@ Public release evidence pins public data only:
   the qbit result, the oracle report digest, the finalized matrix digest and
   the consensus review reference, or a statement that conformance is not
   claimed;
-- CI runs at the tag target, and every waiver.
+- the CI runs at the tag target, and any unsigned-platform or codesigning
+  waiver.
 
 Public evidence must not depend on private source commits, private operator
-tooling state, custody or operator card-binding records, or filled internal
-evidence templates.
+tooling state, operator key-custody records, or filled internal evidence
+templates.
 
 ## Private operational material
 

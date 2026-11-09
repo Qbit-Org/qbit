@@ -8,10 +8,15 @@ builds, and checked against builder attestations before publication. The
 
 Builders are the active `builder-attestation` signers for the release line in
 [`contrib/keys/operator-keys/keys.json`](../../contrib/keys/operator-keys/keys.json).
-Each builder builds the signed tag with the builders' Guix tooling, which
-drives the public scripts in [contrib/guix](../../contrib/guix/):
-`guix-build` for core, `guix-build-photon` for PHOTON, and `guix-attest` to
-write signed manifests.
+Each builder builds the signed tag with the public scripts in
+[contrib/guix](../../contrib/guix/), and then writes signed manifests:
+
+1. `contrib/guix/guix-build` builds core.
+2. `contrib/guix/guix-build-photon` builds PHOTON.
+3. `contrib/guix/guix-attest` attests core, and again with `ARTIFACT=photon`
+   for PHOTON. Set `GUIX_SIGS_REPO` to a `qbit-guix.sigs` clone and
+   `SIGNER=<signing fingerprint>=<keys.json alias>`: the part after `=` names
+   the output directory, and the validator reads `<version>/<alias>/`.
 
 Each builder then adds its manifests to `Qbit-Org/qbit-guix.sigs` under
 `<version>/<alias>/`: `noncodesigned.SHA256SUMS`, plus `all.SHA256SUMS` when
@@ -23,8 +28,9 @@ reaches that release line's `builder_attestation_quorum` in `keys.json`.
 Public release evidence pins the exact `qbit-guix.sigs` commit used for that
 count.
 
-Before tagging, a candidate can be built with `FORCE_VERSION=<version>`, so
-its artifacts have the names a tagged build will produce.
+For pre-tag smoke evidence, a candidate can be built with
+`FORCE_VERSION=<version>`, so its artifacts have the names a tagged build
+will produce.
 
 ## Build outputs
 
