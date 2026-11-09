@@ -837,6 +837,18 @@ class ValidateKeyMetadataTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("primary/root/certification", result.stderr)
 
+    def test_rejects_a_public_key_file_not_written_in_normal_form(self) -> None:
+        for spelling in ("public-keys/./operator-01-release.asc", "public-keys//operator-01-release.asc"):
+            with self.subTest(spelling=spelling):
+                policy = valid_policy()
+                policy["signers"][0]["public_key_file"] = spelling  # type: ignore[index]
+                self.write_policy(policy)
+
+                result = self.run_validator()
+
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("expected the path written as public-keys/operator-01-release.asc", result.stderr)
+
     def test_rejects_primary_public_key_filename(self) -> None:
         policy = valid_policy()
         policy["signers"][0]["public_key_file"] = "public-keys/qbit-operator-primary-AAAAAAAA.asc"  # type: ignore[index]

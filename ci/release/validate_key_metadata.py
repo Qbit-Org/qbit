@@ -270,6 +270,8 @@ def validate_public_key_file(entry: dict[str, Any], *, path: str) -> str:
     public_key_path = Path(public_key_file)
     if public_key_path.is_absolute() or ".." in public_key_path.parts:
         raise MetadataError(f"{path}.public_key_file: expected a relative file under public-keys/")
+    if public_key_path.as_posix() != public_key_file:
+        raise MetadataError(f"{path}.public_key_file: expected the path written as {public_key_path.as_posix()}")
     if len(public_key_path.parts) != 2 or public_key_path.parts[0] != "public-keys":
         raise MetadataError(f"{path}.public_key_file: expected a file under public-keys/")
     if public_key_path.suffix != ".asc":
@@ -836,15 +838,20 @@ def verify_public_key_certificates(projection: dict[str, Any], keys_dir: Path, g
     active signers may share a primary key. A rotated, revoked or lost signer's
     certificate may carry its key's revocation, and a rotated signer may share
     its primary key with the active entry that replaced its signing subkey.
+    A key is in one certificate file only: signers sharing a primary key share
+    its file.
     """
 
     gpg_path = shutil.which(gpg) if Path(gpg).name == gpg else gpg
     if not gpg_path:
         raise MetadataError(f"gpg executable not found: {gpg}")
     owners: dict[str, str] = {}
+    certificates: dict[str, dict[str, Any]] = {}
     for signer in projection["signers"]:
         path = keys_dir / signer["public_key_file"]
-        certificate = read_certificate(gpg_path, path)
+        if signer["public_key_file"] not in certificates:
+            certificates[signer["public_key_file"]] = read_certificate(gpg_path, path)
+        certificate = certificates[signer["public_key_file"]]
         if len(certificate["primaries"]) != 1:
             raise MetadataError(
                 f"{path}: certificate must hold exactly one primary key, got {len(certificate['primaries'])}"
@@ -866,6 +873,14 @@ def verify_public_key_certificates(projection: dict[str, Any], keys_dir: Path, g
                 f"{path}: primary key {primary} of {signer['alias']} is also {owners[primary]}'s primary key"
             )
         owners[primary] = signer["alias"]
+    holders: dict[str, str] = {}
+    for relative, certificate in sorted(certificates.items()):
+        for fingerprint in sorted(certificate["keys"]):
+            if holders.setdefault(fingerprint, relative) != relative:
+                raise MetadataError(
+                    f"{relative}: key {fingerprint} is also in {holders[fingerprint]}: "
+                    "a key's certificate must be one file"
+                )
 
 
 def validate_certificate_continuity(
@@ -877,51 +892,78 @@ def validate_certificate_continuity(
     *,
     policy_changed: bool,
 ) -> list[str]:
-    """Check signer certificates against BASE; return the aliases whose certificates changed.
+    """Check signer certificates against BASE; return the aliases whose certificate files changed.
 
-    Under an unchanged keys.json every certificate must already be at BASE,
-    and a changed one must keep its primary key and exact subkey set. With a
-    new keys.json, a certificate of a continuing signer (same alias and signing
-    key at BASE) is checked the same way, except that it may gain a subkey the
-    new policy names as a signing key; other certificates are new and get only
-    the per-certificate checks. Either way a checked certificate must keep
-    every signature record BASE has, with its key or user ID, as a multiset:
-    it may only add records, such as a refreshed self-signature.
+    Under an unchanged keys.json every certificate must already be at BASE
+    under the same file name, and the aliases returned are those whose file
+    differs from it. When every BASE certificate file is still there with the
+    same bytes, only certificates under new file names are checked; otherwise
+    every certificate is. A checked certificate is compared with every BASE
+    certificate holding any of its keys, primary or subkey, whatever its file
+    name or its signers' aliases, and under an unchanged keys.json with BASE's
+    file of the same name too. Each must have the same primary key; the
+    certificate must keep all their keys, gaining only a subkey a new keys.json
+    names as one of its signers' signing keys, and every signature record each
+    of them has, with its key or user ID, as a multiset: it may only add
+    records, such as a refreshed self-signature. A certificate sharing no key
+    with BASE is a new signer's and gets only the per-certificate checks.
     """
 
     gpg_path = shutil.which(gpg) if Path(gpg).name == gpg else gpg
     if not gpg_path:
         raise MetadataError(f"gpg executable not found: {gpg}")
-    base_keys = {(signer["alias"], signer["signing_fingerprint"]) for signer in base_projection["signers"]}
     by_file: dict[str, list[dict[str, Any]]] = {}
     for signer in projection["signers"]:
         by_file.setdefault(signer["public_key_file"], []).append(signer)
+    base_files = sorted(
+        relative
+        for relative in {signer["public_key_file"] for signer in base_projection["signers"]}
+        if (base_keys_dir / relative).is_file()
+    )
+
+    same_as_base = {
+        relative: (base_keys_dir / relative).is_file()
+        and (keys_dir / relative).is_file()
+        and (keys_dir / relative).read_bytes() == (base_keys_dir / relative).read_bytes()
+        for relative in sorted(set(by_file) | set(base_files))
+    }
+
     changed: list[str] = []
     for relative, signers in sorted(by_file.items()):
-        head_path = keys_dir / relative
-        base_path = base_keys_dir / relative
-        aliases = ", ".join(signer["alias"] for signer in signers)
-        if not base_path.is_file():
+        if not (base_keys_dir / relative).is_file():
             if not policy_changed:
                 raise MetadataError(f"{relative}: certificate is new, but keys.json is unchanged from the base policy")
+        elif not same_as_base[relative]:
+            changed.append(", ".join(signer["alias"] for signer in signers))
+    base_kept = all(same_as_base[relative] for relative in base_files)
+    checked = [relative for relative in sorted(by_file) if not (base_kept and same_as_base[relative])]
+    if not checked:
+        return changed
+    base_certificates = {relative: read_certificate(gpg_path, base_keys_dir / relative) for relative in base_files}
+    for relative in checked:
+        signers = by_file[relative]
+        aliases = ", ".join(signer["alias"] for signer in signers)
+        head = read_certificate(gpg_path, keys_dir / relative)
+        head_keys = set(head["keys"])
+        continued = {
+            base_relative: base
+            for base_relative, base in base_certificates.items()
+            if head_keys & set(base["keys"])
+        }
+        if not policy_changed:
+            continued[relative] = base_certificates[relative]
+        if not continued:
             continue
-        if policy_changed and not any((signer["alias"], signer["signing_fingerprint"]) in base_keys for signer in signers):
-            continue
-        if head_path.read_bytes() == base_path.read_bytes():
-            continue
-        changed.append(aliases)
-        head = read_certificate(gpg_path, head_path)
-        base = read_certificate(gpg_path, base_path)
-        if head["primaries"] != base["primaries"]:
+        if any(set(base["primaries"]) != set(head["primaries"]) for base in continued.values()):
             raise MetadataError(f"{relative}: certificate change replaces the primary key of {aliases}")
-        head_subkeys = set(head["keys"]) - set(head["primaries"])
-        base_subkeys = set(base["keys"]) - set(base["primaries"])
+        head_subkeys = head_keys - set(head["primaries"])
+        base_subkeys = {key for base in continued.values() for key in set(base["keys"]) - set(base["primaries"])}
         allowed_new = {signer["signing_fingerprint"] for signer in signers} if policy_changed else set()
         if not base_subkeys <= head_subkeys or not head_subkeys - base_subkeys <= allowed_new:
             raise MetadataError(f"{relative}: certificate change adds or removes keys of {aliases}")
-        missing = base["signatures"] - head["signatures"]
-        if missing:
-            raise MetadataError(f"{relative}: certificate change removes signature records of {aliases}")
+        for base in continued.values():
+            if base["signatures"] - head["signatures"]:
+                raise MetadataError(f"{relative}: certificate change removes signature records of {aliases}")
     return changed
 
 

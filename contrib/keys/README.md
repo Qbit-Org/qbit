@@ -123,16 +123,23 @@ pull request's `contrib/keys/operator-keys` against the base branch's
   certificate may carry its key's revocation. A signer moves to another subkey
   of the same primary key with a new policy: its entry becomes `rotated`, with
   `replacement_signing_fingerprint`, beside a new active entry for the new
-  subkey that uses the same certificate.
-- A certificate of a continuing signer (same alias and signing key at the
-  base) must keep its primary key and subkeys, and every signature record the
-  base certificate has, each with the key or user ID it belongs to and counted
-  as a multiset; it may only add records. Under an unchanged `keys.json` no
-  certificate may be new, and none may gain a subkey; with a new `keys.json` a
-  certificate may gain only a subkey the new policy names as a signing key. To
-  refresh an expiry, import the base certificate and the refreshed one into an
-  empty keyring and export the result, which keeps both self-signatures; a
-  plain re-export of the refreshed key drops the older one and is refused.
+  subkey that uses the same certificate. A key may be in one certificate file
+  only.
+- When any base certificate file changes or goes, every certificate is
+  checked; otherwise only certificates under new file names are. A checked
+  certificate is compared with every base certificate holding any of its keys,
+  primary or subkey, whatever its file name or its signers' aliases, and under
+  an unchanged `keys.json` with the base's file of the same name too. Each must
+  have the same primary key, and the certificate must keep all their keys and
+  every signature record each of them has, each with the key or user ID it
+  belongs to and counted as a multiset; it may only add records. A certificate
+  sharing no key with the base is a new signer's and gets only the checks
+  above. Under an unchanged `keys.json` no certificate may be new, and none
+  may gain a subkey; with a new `keys.json` a certificate may gain only a
+  subkey the new policy names as a signing key. To refresh an expiry, import
+  the base certificate and the refreshed one into an empty keyring and export
+  the result, which keeps both self-signatures; a plain re-export of the
+  refreshed key drops the older one and is refused.
 
 **Base-only gate.** The checks above live in code a pull request can change,
 so the `Key Policy Gate` check (`.github/workflows/key-policy-gate.yml`) runs

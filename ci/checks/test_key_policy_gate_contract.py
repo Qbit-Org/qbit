@@ -155,16 +155,45 @@ class KeyPolicyGateContractTest(unittest.TestCase):
         cls.edit_key(primary2, "key 2\nkey 3\nrevkey\ny\n0\n\ny\nsave\n")
         cls.op2_extra_subkeys_revoked = cls.export(primary2)
 
+        # operator-04's signing subkey bound under another primary key: the same
+        # key material and creation time give the same subkey fingerprint.
+        rehome = cls.class_root / "rehome"
+        shutil.copytree(cls.home, rehome, ignore=shutil.ignore_patterns("S.*"))
+        signing4 = cls.signers["operator-04"]["signing"]
+        listing = cls.gpg("--with-colons", "--with-keygrip", "--fingerprint", "--list-keys", signing4, home=rehome)
+        record: list[str] = []
+        created = keygrip = None
+        for fields in (line.split(":") for line in listing.splitlines()):
+            if fields[0] in {"pub", "sub"}:
+                record, fingerprint = fields, None
+            elif fields[0] == "fpr" and record:
+                fingerprint = fields[9]
+            elif fields[0] == "grp" and record and fingerprint == signing4:
+                created, keygrip = int(record[5]), fields[9]
+        if keygrip is None:
+            raise AssertionError("operator-04's signing subkey was not listed")
+        cls.gpg("--faked-system-time", f"{created - 10}!", "--quick-gen-key", "rehomed <rehomed@example.invalid>",
+                "ed25519", "cert", "1y", home=rehome)
+        listing = cls.gpg("--with-colons", "--fingerprint", "--list-keys", "rehomed", home=rehome)
+        rehomed = next(line.split(":")[9] for line in listing.splitlines() if line.startswith("fpr:"))
+        cls.edit_key(rehomed, f"addkey\n13\n{keygrip}\nQ\n0\nsave\n", home=rehome,
+                     extra=("--expert", "--faked-system-time", f"{created}!"))
+        listing = cls.gpg("--with-colons", "--fingerprint", "--list-keys", rehomed, home=rehome).splitlines()
+        moved = [listing[index - 1].split(":") for index, line in enumerate(listing) if line.split(":")[9:10] == [signing4]]
+        if not moved or moved[0][0] != "sub" or "s" not in moved[0][11]:
+            raise AssertionError("the re-homed subkey is missing or cannot sign")
+        cls.op4_rehomed = cls.export(rehomed, home=rehome)
+
     @classmethod
     def key_fingerprints(cls, primary: str, home: Path | None = None) -> list[str]:
         listing = cls.gpg("--with-colons", "--fingerprint", "--list-keys", primary, home=home)
         return [line.split(":")[9] for line in listing.splitlines() if line.startswith("fpr:")]
 
     @classmethod
-    def edit_key(cls, primary: str, script: str, home: Path | None = None) -> None:
+    def edit_key(cls, primary: str, script: str, home: Path | None = None, extra: tuple[str, ...] = ()) -> None:
         result = subprocess.run(
             [GPG, "--homedir", str(home or cls.home), "--batch", "--pinentry-mode", "loopback", "--passphrase", "",
-             "--command-fd", "0", "--status-fd", "2", "--edit-key", primary],
+             *extra, "--command-fd", "0", "--status-fd", "2", "--edit-key", primary],
             input=script, text=True, capture_output=True, check=False,
         )
         if result.returncode != 0:
@@ -172,7 +201,7 @@ class KeyPolicyGateContractTest(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls) -> None:
-        for home in (cls.home, cls.class_root / "merge", cls.class_root / "revoked"):
+        for home in (cls.home, cls.class_root / "merge", cls.class_root / "revoked", cls.class_root / "rehome"):
             subprocess.run(["gpgconf", "--homedir", str(home), "--kill", "all"], check=False, capture_output=True)
         cls.class_tmp.cleanup()
 
@@ -452,6 +481,17 @@ class KeyPolicyGateContractTest(unittest.TestCase):
         self.replace_certificate("operator-01", self.extra_subkey)
         self.assert_refused("certificate change adds or removes keys of operator-01")
 
+    def test_certificate_change_that_moves_the_signing_key_to_another_primary_key_is_refused(self) -> None:
+        self.replace_certificate("operator-04", self.op4_rehomed)
+        self.assert_refused("certificate change replaces the primary key of operator-04")
+
+    def test_an_unchanged_policy_keeps_each_files_primary_key(self) -> None:
+        # Even when the base file shares no key with the signer's certificate.
+        self.replace_certificate("operator-04", self.certificates["operator-05"])
+        self.land()
+        self.replace_certificate("operator-04", self.certificates["operator-04"])
+        self.assert_refused("certificate change replaces the primary key of operator-04")
+
     def test_certificates_swapped_between_signers_are_refused(self) -> None:
         public_keys = self.repo / KEYS / "public-keys"
         first, second = (public_keys / f"{alias}-release.asc" for alias in ("operator-01", "operator-02"))
@@ -660,6 +700,37 @@ class KeyPolicyGateContractTest(unittest.TestCase):
         self.commit("sequence 3 policy rotates operator-01's signing subkey")
         self.assert_accepted("Base policy: follows qbit-release-keys-testnet-000002")
 
+    def test_a_key_is_in_one_certificate_file(self) -> None:
+        data = self.policy_data(3, ["operator-01", "operator-02", "operator-04"], self.policies[2])
+        self.rotate_operator_01_into(data, "public-keys/operator-01-r2-release.asc")
+        self.write_raw_policy(
+            data, ["operator-01", "operator-02"],
+            files={"public-keys/operator-01-r2-release.asc": self.extra_subkey_merged},
+        )
+        self.commit("sequence 3 policy puts operator-01's key in two files")
+        self.assert_refused("is also in public-keys/operator-01-r2-release.asc: a key's certificate must be one file")
+
+    def test_a_dropped_certificate_keeps_its_records_in_another_file(self) -> None:
+        # A base from before the one-file rule: a rotated signer and its replacement in two files.
+        data = self.policy_data(3, ["operator-01", "operator-02", "operator-04"], self.policies[2])
+        self.rotate_operator_01_into(data, "public-keys/operator-01-r2-release.asc")
+        self.write_raw_policy(
+            data, ["operator-01", "operator-02"],
+            files={"public-keys/operator-01-release.asc": self.merged_refresh,
+                   "public-keys/operator-01-r2-release.asc": self.extra_subkey},
+        )
+        self.commit("sequence 3 policy with two files for one key")
+        self.land()
+        previous = (self.repo / KEYS / "keys.json").read_bytes()
+        data = dict(data, policy_id="qbit-release-keys-testnet-000004", policy_sequence=4,
+                    previous_policy_sha256=hashlib.sha256(previous).hexdigest(), signers=data["signers"][1:])
+        self.write_raw_policy(
+            data, ["operator-02", "operator-04"],
+            files={"public-keys/operator-01-r2-release.asc": self.extra_subkey},
+        )
+        self.commit("sequence 4 policy drops the rotated signer's file")
+        self.assert_refused("certificate change removes signature records of operator-01-r2")
+
     def test_a_policy_change_keeps_continuing_signers_certificate_records(self) -> None:
         self.replace_certificate("operator-01", self.merged_refresh)
         self.land()
@@ -685,6 +756,46 @@ class KeyPolicyGateContractTest(unittest.TestCase):
         (self.repo / KEYS / "public-keys" / "operator-02-release.asc").write_bytes(self.op2_extra_subkeys)
         self.commit("sequence 3 policy")
         self.assert_refused("certificate change removes signature records of operator-02")
+
+    def test_a_renamed_certificate_keeps_its_records(self) -> None:
+        self.replace_certificate("operator-02", self.op2_extra_subkeys_revoked)
+        self.land()
+        data = self.policy_data(3, ["operator-01", "operator-02", "operator-04"], self.policies[2])
+        data["signers"][1]["public_key_file"] = "public-keys/operator-02-renamed.asc"
+        self.write_raw_policy(
+            data, ["operator-01", "operator-04"], files={"public-keys/operator-02-renamed.asc": self.op2_extra_subkeys}
+        )
+        self.commit("sequence 3 policy renames a certificate")
+        self.assert_refused("certificate change removes signature records of operator-02")
+
+    def test_a_certificate_under_another_alias_keeps_its_records(self) -> None:
+        self.replace_certificate("operator-02", self.op2_extra_subkeys_revoked)
+        self.land()
+        data = self.policy_data(3, ["operator-01", "operator-02", "operator-04"], self.policies[2])
+        data["signers"][1]["alias"] = "operator-02-r2"
+        self.write_raw_policy(
+            data, ["operator-01", "operator-04"], files={"public-keys/operator-02-release.asc": self.op2_extra_subkeys}
+        )
+        self.commit("sequence 3 policy renames a signer")
+        self.assert_refused("certificate change removes signature records of operator-02-r2")
+
+    def test_a_signing_key_moved_to_another_primary_key_under_another_alias_is_refused(self) -> None:
+        data = self.policy_data(3, ["operator-01", "operator-02", "operator-04"], self.policies[2])
+        data["signers"][2].update(alias="operator-04-r2", public_key_file="public-keys/operator-04-r2-release.asc")
+        self.write_raw_policy(
+            data, ["operator-01", "operator-02"], files={"public-keys/operator-04-r2-release.asc": self.op4_rehomed}
+        )
+        self.commit("sequence 3 policy renames a signer")
+        self.assert_refused("certificate change replaces the primary key of operator-04-r2")
+
+    def test_a_renamed_certificate_that_keeps_its_records_passes(self) -> None:
+        data = self.policy_data(3, ["operator-01", "operator-02", "operator-04"], self.policies[2])
+        data["signers"][1]["public_key_file"] = "public-keys/operator-02-renamed.asc"
+        self.write_raw_policy(
+            data, ["operator-01", "operator-04"], files={"public-keys/operator-02-renamed.asc": self.certificates["operator-02"]}
+        )
+        self.commit("sequence 3 policy renames a certificate")
+        self.assert_accepted("Base policy: follows qbit-release-keys-testnet-000002")
 
     def test_revocations_made_together_are_counted_one_by_one(self) -> None:
         self.replace_certificate("operator-02", self.op2_extra_subkeys_revoked)
@@ -810,13 +921,26 @@ class KeyPolicyGateContractTest(unittest.TestCase):
         self.commit("sequence 3 policy without approval signatures")
         self.assert_refused("need 2 approval(s) from the previous active signer set")
 
-    def write_raw_policy(self, data: dict, approvers: list[str]) -> None:
+    def rotate_operator_01_into(self, data: dict, public_key_file: str) -> None:
+        """operator-01 rotated to its extra subkey, held by operator-01-r2 in `public_key_file`."""
+
+        replacement = dict(data["signers"][0], alias="operator-01-r2", signing_fingerprint=self.extra_subkey_fingerprint,
+                           public_key_file=public_key_file)
+        data["signers"][0].update(
+            status="rotated", release_lines=[], capabilities=[], artifact_sets=[],
+            replacement_signing_fingerprint=self.extra_subkey_fingerprint,
+        )
+        data["signers"].append(replacement)
+
+    def write_raw_policy(self, data: dict, approvers: list[str], files: dict[str, bytes] | None = None) -> None:
         keys_dir = self.repo / KEYS
         policy = (json.dumps(data, indent=2) + "\n").encode("utf8")
         (keys_dir / "keys.json").write_bytes(policy)
         if (keys_dir / "public-keys").exists():
             shutil.rmtree(keys_dir / "public-keys")
         (keys_dir / "public-keys").mkdir()
+        for relative, certificate in (files or {}).items():
+            (keys_dir / relative).write_bytes(certificate)
         for signer in data["signers"]:
             path = keys_dir / signer["public_key_file"]
             if not path.exists():
