@@ -6,6 +6,31 @@ builds and checked against builder attestations before publication.
 Public release evidence pins the exact `qbit-guix.sigs` commit used for
 attestation validation.
 
+## Build outputs
+
+Each Linux host produces `qbit-<version>-<host>.tar.gz` and
+`qbit-<version>-<host>-debug.tar.gz`. Windows produces
+`qbit-<version>-win64-setup-unsigned.exe`, `qbit-<version>-win64-unsigned.zip`,
+`qbit-<version>-win64-debug.zip` and `qbit-<version>-win64-codesigning.tar.gz`.
+
+Each macOS host (`x86_64-apple-darwin`, `arm64-apple-darwin`) produces:
+
+- `qbit-<version>-<host>-unsigned.tar.gz` with the stripped binaries
+- `qbit-<version>-<host>-unsigned.zip` with `qbit-qt.app`
+- `qbit-<version>-<host>-codesigning.tar.gz`, the input to `guix-codesign`
+- `qbit-<version>-<host>-debug.tar.gz` with a `.dSYM` bundle per binary in
+  `bin/` and `libexec/`
+
+`contrib/guix/libexec/build.sh` installs the macOS binaries twice: stripped
+for the release archives, and unstripped into a separate tree. It then runs
+`dsymutil` on the unstripped copies. `dsymutil` comes from the same LLVM
+package as the `llvm-strip` and `llvm-ar` used by depends: the pinned Guix
+`clang-toolchain-18` includes LLVM 18. `guix-codesign` signs the stripped
+binaries from the codesigning tarball. The debug archive stays in the
+non-codesigned output, and its bundles match the signed binaries by UUID.
+`contrib/guix/test_build_config.py` runs the packaging part of `build.sh`
+with stand-in tools to check this layout.
+
 ## Source archive binding
 
 Core and PHOTON Guix builds both create `qbit-<version>.tar.gz` from the build

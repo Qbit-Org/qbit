@@ -328,6 +328,31 @@ Unsigned platform or public codesigning payload waivers require the explicit
 `--allow-unsigned-platform-artifacts` or `--allow-codesigning-artifacts` flags.
 Use them only when the corresponding public release waiver has been recorded.
 
+## Debug Symbol Archives
+
+Each platform's stripped release binaries have a debug symbol archive from the
+same Guix build:
+
+| Platform | Archive | Contents |
+| --- | --- | --- |
+| Linux | `qbit-<version>-<host>-debug.tar.gz` | a `.dbg` file per binary in `bin/` and `libexec/` |
+| Windows | `qbit-<version>-win64-debug.zip` | a `.dbg` file per binary in `bin/` and `libexec/` |
+| macOS | `qbit-<version>-<host>-debug.tar.gz` | a `.dSYM` bundle per binary in `bin/` and `libexec/` |
+
+The macOS archive starts with v1.0.1; v1.0.0 and earlier releases have none.
+Its bundles are linked with `dsymutil` from unstripped copies of the binaries,
+so the stripped binaries and the other macOS archives are unchanged. Stripping
+and codesigning keep each binary's `LC_UUID`, so a bundle also matches the
+codesigned binaries and the binary inside `qbit-qt.app`.
+
+The debug archives are release artifacts. They are part of every builder's
+`noncodesigned.SHA256SUMS` and `all.SHA256SUMS`, so builders reproduce and
+attest them like the binaries. Stage them, list them in `SHA256SUMS` and upload
+them with the rest of the release. They contain no executables and need no
+unsigned-platform waiver. The validators require nothing per platform, so a
+staged release without a macOS debug archive also validates. If one is staged,
+every counted builder manifest must cover it.
+
 ## Public Evidence
 
 Normal public release evidence should pin public data:
