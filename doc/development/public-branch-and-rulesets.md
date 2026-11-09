@@ -48,10 +48,10 @@ Ruleset JSON templates are the public-safe files below:
 
 | Template | Target | Baseline behavior |
 | --- | --- | --- |
-| `.github/rulesets/main.json` | `refs/heads/main` | Require pull requests, one approval, resolved conversations, squash/rebase merge methods only, linear history, `Required Merge Gate`, block deletion, and block non-fast-forward updates. Do not require the branch to be up to date before merging. |
+| `.github/rulesets/main.json` | `refs/heads/main` | Require pull requests, one approval, resolved conversations, squash/rebase merge methods only, linear history, `Required Merge Gate` and `Key Policy Gate` (GitHub Actions, integration 15368), code-owner review, block deletion, and block non-fast-forward updates. Require the branch to be up to date before merging. |
 | `.github/rulesets/0.1.x.json` | `refs/heads/0.1.x` | Restrict branch creation to bypass actors, require pull requests, one approval, resolved conversations, squash/rebase merge methods only, linear history, `Required Merge Gate`, block deletion, and block non-fast-forward updates. Do not require the branch to be up to date before merging. |
 | `.github/rulesets/1.0.0.json` | `refs/heads/1.0.0` | Restrict branch creation to bypass actors, require pull requests, one approval, resolved conversations, squash/rebase merge methods only, linear history, `Required Merge Gate`, block deletion, and block non-fast-forward updates. Do not require the branch to be up to date before merging. |
-| `.github/rulesets/1.x.x.json` | `refs/heads/1.x.x` | Restrict branch creation to bypass actors, require pull requests, one approval, resolved conversations, squash/rebase merge methods only, linear history, `Required Merge Gate`, block deletion, and block non-fast-forward updates. Do not require the branch to be up to date before merging. |
+| `.github/rulesets/1.x.x.json` | `refs/heads/1.x.x` | Restrict branch creation to bypass actors, require pull requests, one approval, resolved conversations, squash/rebase merge methods only, linear history, `Required Merge Gate` and `Key Policy Gate` (GitHub Actions, integration 15368), code-owner review, block deletion, and block non-fast-forward updates. Require the branch to be up to date before merging. |
 | `.github/rulesets/release-tags-v-creation.json` | `refs/tags/v*` | Restrict tag creation to organization admins and the release-maintainers team. |
 | `.github/rulesets/release-tags-v-immutability.json` | `refs/tags/v*` | Restrict tag updates and deletion to organization admins only. |
 | `.github/rulesets/upstream-refs.json` | `refs/heads/upstream/**` | Lock optional upstream reference branches so only bypass actors can create, update, or delete them. |
@@ -127,7 +127,9 @@ gh api \
 
 ## Operational Notes
 
-Required status checks are encoded only as the aggregate `Required Merge Gate`.
+Required status checks are encoded as the aggregate `Required Merge Gate`; on
+`main` and `1.x.x` also as `Key Policy Gate`, the base-only key-policy check
+(`.github/workflows/key-policy-gate.yml`, see `contrib/keys/README.md`).
 Do not protect public branches with the raw `Core Checks Gate` or
 `Full Validation Gate` checks. Those checks are inputs to the required gate, and
 the required gate chooses the correct validation profile after classifying the
@@ -143,7 +145,7 @@ The required merge gate has five validation profiles:
 | Release-policy validation | Pull requests whose changed paths are only release policy or trusted release reference files. | Run `git diff --check`, release publisher and validator tests for touched publication or validator files, `bash -n` for publisher changes, and operator key metadata validation when operator keys are touched. |
 | RPC docs validation | Pull requests whose changed paths are only RPC documentation pipeline files. | Run `git diff --check`, RPC docs unit tests, and require the existing `rpc-docs` build check. |
 | Public docs validation | Pull requests whose changed paths are only public-facing documentation and release notes. | Run `git diff --check` and require the existing `public-docs-lint` check. |
-| GitHub metadata validation | Pull requests whose changed paths are only public ruleset templates, repository settings, issue/PR templates, and the docs that explain those settings. | Run `git diff --check`, parse ruleset and repository-settings JSON, assert that public branch rulesets require only `Required Merge Gate`, and best-effort parse issue template YAML when PyYAML is available. |
+| GitHub metadata validation | Pull requests whose changed paths are only public ruleset templates, repository settings, issue/PR templates, and the docs that explain those settings. | Run `git diff --check`, parse ruleset and repository-settings JSON, assert the public branch rulesets' required checks (`Required Merge Gate`, and `Key Policy Gate` with code-owner review on `main` and `1.x.x`), and best-effort parse issue template YAML when PyYAML is available. |
 
 The lightweight profiles are intentionally narrow. The release-policy allowlist
 is:
@@ -199,10 +201,10 @@ span more than one lightweight profile, also use full source validation.
 Merge queue is not enabled in these templates. Enable it only after public CI
 supports `merge_group` events.
 
-Code-owner review is disabled in these templates because public owner and team
-IDs are not frozen here. Enable `require_code_owner_review` only after a public
-`CODEOWNERS` file exists and the referenced owners are valid in the public
-repository.
+Code-owner review is required on `main` and `1.x.x`: `.github/CODEOWNERS` gives
+`contrib/keys/`, `ci/release/`, `ci/checks/` and `.github/workflows/` to
+`@Qbit-Org/release-maintainers`. The other maintenance branches do not require
+it yet.
 
 ## Backport Metadata
 

@@ -144,6 +144,10 @@ jobs:
       - name: Test operator key policy gate contract
         run: /usr/bin/python3 ci/checks/test_key_policy_gate_contract.py -v
 
+      # The base-only Key Policy Gate job (key-policy-gate.yml), run the same way.
+      - name: Test base-only key policy gate contract
+        run: /usr/bin/python3 ci/checks/test_key_policy_gate_target.py -v
+
       - name: Classify validation profile
         id: classify
         run: |
@@ -199,144 +203,12 @@ jobs:
             exit 1
           fi
 
-          # Both policies are read from git objects: no checkout, no
-          # attributes. Every directory on the policy path must be a tree and
-          # every file under it a regular 100644 blob.
-          work="${RUNNER_TEMP}/key-policy"
-          rm -rf "${work}"
-          mkdir -p "${work}/head" "${work}/base"
-          extract_policy() {
-            local rev="$1" dest="$2" check_attributes="$3" prefix="" part entry meta path relative mode type oid
-            for part in contrib keys operator-keys; do
-              prefix="${prefix:+${prefix}/}${part}"
-              entry="$(git ls-tree "${rev}" -- "${prefix}")"
-              [[ -n "${entry}" ]] || return 0
-              if [[ "${entry}" == *$'\n'* ]]; then
-                echo "::error::${rev}:${prefix} has more than one tree entry"
-                return 1
-              fi
-              if [[ "${entry}" != "040000 tree "* ]]; then
-                echo "::error::${rev}:${prefix} is not a directory: ${entry%%$'\t'*}"
-                return 1
-              fi
-            done
-            git ls-tree -r -z "${rev}" -- "${canonical_dir}" > "${dest}.list"
-            local -A seen=()
-            while IFS= read -r -d '' entry; do
-              meta="${entry%%$'\t'*}"
-              path="${entry#*$'\t'}"
-              if [[ -n "${seen["${path}"]+set}" ]]; then
-                echo "::error::${rev}:${path} has more than one tree entry"
-                return 1
-              fi
-              seen["${path}"]=1
-              read -r mode type oid <<< "${meta}"
-              if [[ "${mode}" != "100644" || "${type}" != "blob" ]]; then
-                echo "::error::${rev}:${path} is not a regular file (mode ${mode})"
-                return 1
-              fi
-              relative="${path#"${canonical_dir}/"}"
-              mkdir -p "$(dirname "${dest}/${relative}")"
-              git cat-file blob "${oid}" > "${dest}/${relative}"
-            done < "${dest}.list"
-            # Checkout and archive attributes would make other readers of the
-            # head see other bytes than these objects: none may apply to the
-            # policy. The base's own attributes do not matter here.
-            # Checked as case-sensitive and case-insensitive (macOS, Windows) clones read them.
-            [[ "${check_attributes}" == "check-attributes" ]] || return 0
-            local ignorecase
-            for ignorecase in false true; do
-              git ls-tree -r -z --name-only "${rev}" -- "${canonical_dir}" \
-                | git -c core.ignorecase="${ignorecase}" check-attr --source "${rev}" -z --stdin \
-                    text eol crlf filter ident working-tree-encoding export-ignore export-subst \
-                > "${dest}.attributes"
-              while IFS= read -r -d '' path && IFS= read -r -d '' attribute && IFS= read -r -d '' value; do
-                if [[ "${value}" != "unspecified" ]]; then
-                  echo "::error::${rev}:${path} has the ${attribute} attribute (${value}) with core.ignorecase=${ignorecase}. No .gitattributes rule may match files under ${canonical_dir}: remove or narrow the rule that does (git check-attr -a -- '${path}' names it)."
-                  return 1
-                fi
-              done < "${dest}.attributes"
-            done
-          }
-          extract_policy HEAD "${work}/head" check-attributes
-          extract_policy "${base}" "${work}/base" no-attributes
-
-          # A path that equals the policy path, or .gitattributes, only after
-          # Unicode compatibility normalisation and case folding is the same
-          # file on case-insensitive checkouts: the head may not have one.
-          git ls-tree -r -z --name-only --full-tree HEAD > "${work}/head-paths"
-          python3 - "${work}/head-paths" "${canonical_dir}" <<'PY'
-          import sys
-          import unicodedata
-
-          def fold(text: str) -> str:
-              return unicodedata.normalize("NFKC", text).casefold()
-
-          listing, canonical = sys.argv[1], sys.argv[2]
-          names = open(listing, "rb").read().split(b"\0")
-          paths = [name.decode("utf8", errors="surrogateescape") for name in names if name]
-          parts = canonical.split("/")
-          guarded = {fold("/".join(parts[:depth])): "/".join(parts[:depth]) for depth in range(1, len(parts) + 1)}
-          problems = []
-          seen = {}
-          for path in paths:
-              components = path.split("/")
-              for depth in range(1, len(components) + 1):
-                  prefix = "/".join(components[:depth])
-                  expected = guarded.get(fold(prefix))
-                  if expected is not None and prefix != expected:
-                      problems.append(f"{path} names {expected} with other letters")
-                      break
-              if any(fold(part) == ".gitattributes" and part != ".gitattributes" for part in components):
-                  problems.append(f"{path} names .gitattributes with other letters")
-              if path.startswith(canonical + "/"):
-                  key = fold(path)
-                  if key in seen and seen[key] != path:
-                      problems.append(f"{path} and {seen[key]} are the same file on case-insensitive checkouts")
-                  seen.setdefault(key, path)
-          for problem in problems:
-              print(f"::error::{problem}")
-          sys.exit(1 if problems else 0)
-          PY
-
-          head_args=(
-            --operator-policy "${work}/head/keys.json"
-            --operator-keys-dir "${work}/head"
-            --require-public-key-files
-            --verify-public-key-certificates
-            --check-keys-md
-            --base-operator-keys-dir "${work}/base"
-          )
-          # Once any first-parent ancestor of the base had a policy, the base must have one.
-          if [[ -n "$(git rev-list --first-parent -n 1 "${base}" -- "${canonical_dir}/keys.json")" ]]; then
-            head_args+=(--base-history-had-policy)
-          fi
-          python3 ci/release/validate_key_metadata.py "${head_args[@]}"
-
-          # A change must also pass the base's own validator, read from git
-          # objects, with the arguments every version of it accepts.
-          if ! diff -r -q "${work}/head" "${work}/base" > /dev/null; then
-            validator="ci/release/validate_key_metadata.py"
-            if ! [[ "$(git ls-tree "${base}" -- "${validator}")" =~ ^100(644|755)\ blob\  ]]; then
-              echo "::error::The base has no ${validator} to check this change with."
-              exit 1
-            fi
-            git cat-file blob "${base}:${validator}" > "${work}/base-validator.py"
-            base_args=(
-              --operator-policy "${work}/head/keys.json"
-              --operator-keys-dir "${work}/head"
-              --require-public-key-files
-            )
-            if [[ -f "${work}/base/keys.json" ]]; then
-              if cmp -s "${work}/head/keys.json" "${work}/base/keys.json"; then
-                base_args+=(--skip-policy-transition-validation)
-              else
-                base_args+=(--previous-operator-policy "${work}/base/keys.json")
-              fi
-            fi
-            echo "Checking the change with the base's validator"
-            python3 "${work}/base-validator.py" "${base_args[@]}"
-          fi
+          # Both policies are read from git objects, never from a checkout or an
+          # archive, and checked by ci/release/key_policy_gate.py: the trees,
+          # attributes and case-insensitive paths, then this checkout's
+          # validator and the base's own (see contrib/keys/README.md).
+          python3 ci/release/key_policy_gate.py policy \
+            --base "${base}" --head HEAD --work "${RUNNER_TEMP}/key-policy"
 
   release-policy-validation:
     name: release-policy validation
@@ -718,6 +590,9 @@ jobs:
           import json
           from pathlib import Path
 
+          # main and 1.x.x also require the base-only Key Policy Gate, from the
+          # GitHub Actions app, an up-to-date branch, and code-owner review.
+          key_policy_branches = {"main.json", "1.x.x.json"}
           for path in (
               Path(".github/rulesets/main.json"),
               Path(".github/rulesets/1.0.0.json"),
@@ -725,15 +600,29 @@ jobs:
               Path(".github/rulesets/0.1.x.json"),
           ):
               data = json.loads(path.read_text(encoding="utf8"))
-              contexts = []
+              checks = []
               strict = None
+              code_owner_review = None
               for rule in data.get("rules", []):
+                  parameters = rule.get("parameters", {})
                   if rule.get("type") == "required_status_checks":
-                      parameters = rule.get("parameters", {})
                       checks = parameters.get("required_status_checks", [])
-                      contexts = [check.get("context") for check in checks]
                       strict = parameters.get("strict_required_status_checks_policy")
-                      break
+                  if rule.get("type") == "pull_request":
+                      code_owner_review = parameters.get("require_code_owner_review")
+              contexts = [check.get("context") for check in checks]
+              if path.name in key_policy_branches:
+                  expected = ["Required Merge Gate", "Key Policy Gate"]
+                  key_check = next((check for check in checks if check.get("context") == "Key Policy Gate"), {})
+                  if contexts != expected or key_check.get("integration_id") != 15368:
+                      raise SystemExit(
+                          f"{path}: required status checks must be {expected!r}, with Key Policy Gate "
+                          f"from integration 15368, got {checks!r}"
+                      )
+                  if strict is not True or code_owner_review is not True:
+                      raise SystemExit(f"{path}: strict status checks and code-owner review must be required")
+                  print(f"{path}: Required Merge Gate and Key Policy Gate (strict, code-owner review)")
+                  continue
               if contexts != ["Required Merge Gate"]:
                   raise SystemExit(
                       f"{path}: required status checks must be exactly ['Required Merge Gate'], got {contexts!r}"

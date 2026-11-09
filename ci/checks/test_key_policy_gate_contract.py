@@ -42,6 +42,8 @@ WORKFLOW = REPO_ROOT / ".github/workflows/required-merge-gate.yml"
 JOB = "operator-key-policy-validation"
 STEP = "Validate current policy and transition approvals"
 VALIDATOR = Path("ci/release/validate_key_metadata.py")
+GATE_SCRIPT = Path("ci/release/key_policy_gate.py")
+CLASSIFIER = Path("ci/checks/classify_merge_profile.py")
 KEYS = Path("contrib/keys/operator-keys")
 GPG = shutil.which("gpg")
 ALIASES = [f"operator-{index:02d}" for index in range(1, 7)]
@@ -212,8 +214,9 @@ class KeyPolicyGateContractTest(unittest.TestCase):
         self.git("config", "user.name", "Key policy fixture")
         self.git("config", "user.email", "key-policy-fixture@example.invalid")
         self.git("config", "commit.gpgsign", "false")
-        (self.repo / VALIDATOR).parent.mkdir(parents=True)
-        shutil.copy2(REPO_ROOT / VALIDATOR, self.repo / VALIDATOR)
+        for script in (VALIDATOR, GATE_SCRIPT, CLASSIFIER):
+            (self.repo / script).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(REPO_ROOT / script, self.repo / script)
         self.policies: dict[int, bytes] = {}
         self.write_policy(1, ["operator-01", "operator-02", "operator-03"])
         self.commit("sequence 1 policy")

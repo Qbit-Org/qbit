@@ -134,6 +134,42 @@ pull request's `contrib/keys/operator-keys` against the base branch's
   empty keyring and export the result, which keeps both self-signatures; a
   plain re-export of the refreshed key drops the older one and is refused.
 
+**Base-only gate.** The checks above live in code a pull request can change,
+so the `Key Policy Gate` check (`.github/workflows/key-policy-gate.yml`) runs
+them with the base branch's code only. It is triggered by
+`pull_request_target`, so GitHub runs the base branch's definition of the
+workflow; it checks out only the base commit, without credentials, fetches the
+pull request's head as git objects, and executes nothing from it. Its script,
+`ci/release/key_policy_gate.py`, finds the paths the pull request changes
+against its merge base with the base branch:
+
+- A change to the key policy (any path the classifier routes to the key job)
+  gets the checks above, run by the base's validator.
+- A change to the gate's own code (`GATE_CODE_PATHS` in the base's
+  `key_policy_gate.py`: this workflow, `required-merge-gate.yml`,
+  `.github/CODEOWNERS`, the classifier, the release validators, the gate
+  script and its tests, and this README) needs approvals by the base policy's
+  signers, as below.
+- Any other file under `contrib/keys/` is refused.
+
+A gate change is approved in `contrib/keys/gate-approvals/<id>/`:
+
+```text
+gate.SHA256       one line "<sha256>  <path>\n" for every GATE_CODE_PATHS file
+                  present in the pull request's head, sorted by path; the
+                  sha256 is that of the file's bytes
+approval-note.md  what the change is and why
+<alias>.asc       detached signatures over gate.SHA256
+```
+
+`<id>` is the SHA-256 of `gate.SHA256`. The base's code computes the manifest
+from the head's git objects and requires that directory, with that exact
+`gate.SHA256`, and good signatures (as release validators count them) by at
+least the base policy's highest `policy_change_quorum` of its active signers,
+with distinct primary keys, verified with the base's certificates. No other
+gate-approval directory may change in the same pull request. The workflow
+reaches a pull request only once its base branch holds it.
+
 Release validators count a signature only when gpg's GOODSIG and VALIDSIG
 agree and gpg reports no revoked or expired key or other error for it
 (REVKEYSIG, EXPKEYSIG, ERRSIG), and count a quorum by distinct primary keys,

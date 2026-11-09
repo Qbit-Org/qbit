@@ -1,0 +1,8 @@
+# Changes to the release key policy, the release validators, the CI checks and
+# the workflows need a review by the release maintainers (the rulesets require
+# code-owner review on the protected branches).
+/contrib/keys/ @Qbit-Org/release-maintainers
+/ci/release/ @Qbit-Org/release-maintainers
+/ci/checks/ @Qbit-Org/release-maintainers
+/.github/workflows/ @Qbit-Org/release-maintainers
+/.github/CODEOWNERS @Qbit-Org/release-maintainers
