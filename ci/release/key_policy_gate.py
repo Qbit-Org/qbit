@@ -133,7 +133,7 @@ GATE_WORKFLOW_KEYS = {"name", "on", "permissions", "concurrency", "jobs"}
 GATE_JOB_KEYS = {"name", "runs-on", "timeout-minutes", "permissions", "steps"}
 GATE_STEP_KEYS = {"name", "env", "run", "uses", "with"}
 GATE_CHECKOUT_KEYS = {"ref", "fetch-depth", "persist-credentials"}
-# The gate reads history (merge bases, a policy's past): the checkout is full.
+# The gate reads history (whether the head contains the base, a policy's past): the checkout is full.
 GATE_FETCH_DEPTH = 0
 GATE_TRIGGER = {"pull_request_target": {"types": ["opened", "synchronize", "reopened", "edited", "ready_for_review"]}}
 GATE_CONCURRENCY = {"group": "key-policy-gate-${{ github.event.pull_request.number }}", "cancel-in-progress": "true"}
@@ -577,6 +577,8 @@ def refuse_repeated_keys(path: str, root) -> None:
                     continue
                 if not isinstance(key_node, yaml.ScalarNode):
                     raise GateError(f"{path}: a mapping key that is not a scalar")
+                if key_node.tag == "tag:yaml.org,2002:null":
+                    raise GateError(f"{path}: a mapping key that is null ({key_node.value!r})")
                 if (key_node.tag, key_node.value) in keys:
                     raise GateError(f"{path}: the key {key_node.value!r} appears twice in one mapping")
                 keys.add((key_node.tag, key_node.value))
@@ -833,6 +835,9 @@ def check_gate_workflow(path: str, data: bytes) -> None:
         raise GateError(f"{path} may not ask to post checks or statuses: the job's own result is the check")
     if not declares(workflow.get("permissions")) and not declares(job.get("permissions")):
         raise GateError(f"{path} must declare its token permissions")
+    for mapping in (workflow, job):
+        if "permissions" in mapping and mapping["permissions"] is None:
+            raise GateError(f"{path}: its permissions may not be null; GitHub does not read null there")
     for permissions in (workflow.get("permissions"), job.get("permissions")):
         if declares(permissions) and permissions != GATE_PERMISSIONS:
             raise GateError(f"{path}: its token may only read contents ({GATE_PERMISSIONS!r})")
@@ -852,12 +857,12 @@ def check_gate_workflow(path: str, data: bytes) -> None:
             raise GateError(f"{path}: a step's run must be a command")
         if "name" in step and not isinstance(step["name"], str):
             raise GateError(f"{path}: a step's name must be text")
-        env = step.get("env")
-        if env is not None:
+        if "env" in step:
+            env = step["env"]
             if not isinstance(env, dict):
                 raise GateError(f"{path}: a step's env must be a mapping")
             for name, value in env.items():
-                if GATE_STEP_ENV.get(name) != value:
+                if not isinstance(name, str) or GATE_STEP_ENV.get(name) != value:
                     raise GateError(
                         f"{path}: a step's env may set only the gate's inputs, each to its value from the "
                         f"pull request event, not {name!r}: {value!r}"
@@ -925,10 +930,19 @@ def check_gate_check_name(head: str, changed: list[str]) -> None:
             raise GateError(f"{path} must declare its token permissions, for the workflow or for every job")
 
 
+def contains(head: str, base: str) -> bool:
+    """Whether `head` contains `base`; any error of git's is a refusal of its own."""
+
+    result = subprocess.run(["git", "merge-base", "--is-ancestor", base, head], capture_output=True, check=False)
+    if result.returncode not in (0, 1):
+        raise GateError(f"git merge-base --is-ancestor failed: {result.stderr.decode(errors='replace').strip()}")
+    return result.returncode == 0
+
+
 def check_gate_approvals(base: str, head: str, changed: list[str], work: Path) -> str:
     """A change to the gate's code needs its manifest signed by the base policy's quorum."""
 
-    if subprocess.run(["git", "merge-base", "--is-ancestor", base, head], check=False).returncode != 0:
+    if not contains(head, base):
         raise GateError("bring the pull request up to date with its base branch before a gate change is approved")
     check_gate_check_name(head, changed)
     manifest = gate_manifest(base, head)
@@ -1010,7 +1024,7 @@ def check_target(base: str, head: str, work: Path) -> None:
     # is exactly what merging the pull request brings: no older merge base,
     # criss-cross history or rename on the base side can make GitHub's merge
     # differ from what the gate checked.
-    if subprocess.run(["git", "merge-base", "--is-ancestor", base, head], check=False).returncode != 0:
+    if not contains(head, base):
         raise GateError("bring the pull request up to date with its base branch: the gate checks a head that contains it")
     changed = [
         name.decode("utf8", errors="surrogateescape")

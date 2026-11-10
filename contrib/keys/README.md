@@ -165,7 +165,9 @@ script must therefore keep the command line the workflow uses (`target --base
 version of its workflow that holds anything but the keys it needs (so no
 condition, ignored failure, matrix, container, services, other shell or
 defaults), uses YAML anchors, aliases or merge keys, has a step that does not
-either run a command or use an action (settings only for an action), runs
+either run a command or use an action (settings only for an action), has a
+name that is not text or a `run:` that is not a command, sets null
+permissions or a null step `env:`, runs
 anywhere but `ubuntu-24.04`, triggers on anything but `pull_request_target`
 with the expected event types, sets a concurrency other than the expected one
 or a timeout outside 1 to 360 minutes, leaves its token
@@ -186,8 +188,9 @@ neither can satisfy a pull request into `main` or `1.x.x`.
 
 The script requires the pull request to contain its base branch's tip (bring
 it up to date otherwise), so that what it checks is exactly what merging the
-pull request brings, and finds the paths the pull request changes against that
-tip:
+pull request brings, as long as the branch's ruleset requires pull requests to
+be up to date before merging (the gate does not run again when only the base
+moves). It finds the paths the pull request changes against that tip:
 
 - A change to the key policy (any path the classifier routes to the key job)
   gets the checks above, run by the base's validator.
