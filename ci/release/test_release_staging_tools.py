@@ -23,6 +23,7 @@ import json
 import os
 import py_compile
 import shutil
+import shlex
 import signal
 import stat
 import subprocess
@@ -220,7 +221,7 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def git(repo: Path, *args: str) -> str:
+def git(repo: Path, *args: str, input: str | None = None) -> str:
     result = subprocess.run(
         [
             GIT,
@@ -240,6 +241,7 @@ def git(repo: Path, *args: str) -> str:
         capture_output=True,
         text=True,
         encoding="utf8",
+        input=input,
     )
     return result.stdout.strip()
 
@@ -662,7 +664,15 @@ class ReleaseFixture:
             *extra,
         )
 
+    def staged_digest(self) -> str:
+        """The digest an operator passes: their own derivation, here the stage's SHA256SUMS."""
+
+        manifest = self.stage_dir / "SHA256SUMS"
+        return sha256_hex(manifest.read_bytes()) if manifest.is_file() else "0" * 64
+
     def sign(self, alias: str, *extra: str, gpg: Path | None = None) -> subprocess.CompletedProcess[str]:
+        if "--expected-sha256sums-sha256" not in extra:
+            extra = ("--expected-sha256sums-sha256", self.staged_digest(), *extra)
         return self.run(
             SIGN_TOOL,
             "--stage-dir",
@@ -811,6 +821,22 @@ class StageReleaseArtifactsTest(ReleaseToolTestCase):
         (fixture.stage_dir / "SHA256SUMS").write_bytes(before["SHA256SUMS"] + b"\n")
         self.assert_fails(fixture.stage(), "already exists with a different SHA256SUMS")
 
+    def test_rerun_runs_the_publisher_checks_again(self) -> None:
+        fixture = self.fixture()
+        self.assert_ok(fixture.stage())
+        # The qbit-guix.sigs key mirror gains a file the trusted policy does
+        # not have; the publisher's builder check refuses that mirror.
+        stray = fixture.guix_sigs / "operator-keys" / "public-keys" / "stray-release.asc"
+        stray.write_text(fixture.keyring.certificate("outsider-01"), encoding="utf8")
+        self.assert_fails(fixture.stage(), "The publisher's validate_builder_attestations.py rejects this release")
+        stray.unlink()
+        self.assertEqual(self.assert_ok(fixture.stage())["status"], ["unchanged"])
+        # Signatures in the stage are what the publisher sees too.
+        for alias in OPERATORS:
+            self.assert_ok(fixture.sign(alias))
+        self.assert_ok(fixture.combine())
+        self.assertEqual(self.assert_ok(fixture.stage())["status"], ["unchanged"])
+
     def test_failure_after_partial_copy_leaves_no_stage_behind(self) -> None:
         fixture = self.fixture()
         # The PHOTON artifact sorts last, so every other artifact is already
@@ -893,7 +919,10 @@ class StageReleaseArtifactsTest(ReleaseToolTestCase):
 
         # A tag over the same commit, signed by a key outside the policy.
         sign_tag(fixture.trusted, TAG, self.keyring.home, self.keyring.fingerprints["outsider-01"], fixture.tag_target)
-        self.assert_fails(fixture.stage(), f"Release tag {TAG} was not signed by an active qbit release key")
+        tag_object = git(fixture.trusted, "rev-parse", f"refs/tags/{TAG}")
+        self.assert_fails(
+            fixture.stage(), f"Release tag {TAG} ({tag_object}) was not signed by an active qbit release key"
+        )
         self.assertFalse(fixture.stage_dir.exists())
 
         sign_tag(fixture.trusted, TAG, self.keyring.home, self.keyring.fingerprints["operator-02"], fixture.tag_target)
@@ -926,7 +955,8 @@ class TrustedCheckoutTest(ReleaseToolTestCase):
         self.assert_ok(fixture.stage())
         for tool, args in (
             (STAGE_TOOL, ("--tag", TAG, "--guix-sigs-dir", str(fixture.guix_sigs), "--sha256sums-output", "x")),
-            (SIGN_TOOL, ("--stage-dir", str(fixture.stage_dir), "--alias", "operator-01", "--yes")),
+            (SIGN_TOOL, ("--stage-dir", str(fixture.stage_dir), "--alias", "operator-01", "--yes",
+                         "--expected-sha256sums-sha256", fixture.staged_digest())),
             (COMBINE_TOOL, ("--stage-dir", str(fixture.stage_dir))),
         ):
             with self.subTest(tool=tool):
@@ -1053,8 +1083,13 @@ class SignSha256sumsTest(ReleaseToolTestCase):
         self.assert_fails(self.release.sign("outsider-01"), "is not an active release-signing signer")
         self.assert_fails(
             self.release.run(SIGN_TOOL, "--stage-dir", str(self.release.stage_dir), "--alias", "operator-01",
-                             env={"GNUPGHOME": str(self.keyring.home)}),
+                             "--expected-sha256sums-sha256", self.digest, env={"GNUPGHOME": str(self.keyring.home)}),
             "Signing requires --yes when stdin is not interactive",
+        )
+        self.assert_fails(
+            self.release.run(SIGN_TOOL, "--stage-dir", str(self.release.stage_dir), "--alias", "operator-01", "--yes",
+                             env={"GNUPGHOME": str(self.keyring.home)}),
+            "the following arguments are required: --expected-sha256sums-sha256",
         )
         self.assertEqual(sorted(self.release.stage_dir.glob("SHA256SUMS.*.asc")), [])
 
@@ -1279,6 +1314,210 @@ class TrustedCheckoutHardeningTest(ReleaseToolTestCase):
         )
         self.assert_fails(result, f"target {unrelated} is not an ancestor of the trusted release ref")
 
+    def derive_sha256sums(self) -> subprocess.CompletedProcess[str]:
+        derived = self.root / "derived" / "SHA256SUMS"
+        derived.unlink(missing_ok=True)
+        return self.release.run(
+            STAGE_TOOL, "--tag", TAG, "--guix-sigs-dir", str(self.release.guix_sigs),
+            "--allow-unsigned-platform-artifacts", "--sha256sums-output", str(derived),
+        )
+
+    def test_an_ambiguous_ref_cannot_stand_in_for_the_release_tag(self) -> None:
+        trusted = self.release.trusted
+        signed = git(trusted, "rev-parse", f"refs/tags/{TAG}")
+        # The release tag becomes an unsigned annotated tag of the same commit,
+        # while the signed tag object stays reachable under the bare tag name
+        # through a ref that git resolves before refs/tags/ and git status
+        # does not show.
+        git(trusted, "tag", "-f", "-a", TAG, "-m", TAG, self.release.tag_target)
+        self.assertNotEqual(git(trusted, "rev-parse", f"refs/tags/{TAG}"), signed)
+        strays = {
+            f"refs/{TAG}": lambda: git(trusted, "update-ref", f"refs/{TAG}", signed),
+            f".git/{TAG}": lambda: (trusted / ".git" / TAG).write_text(signed + "\n", encoding="utf8"),
+        }
+        for stray, plant in strays.items():
+            with self.subTest(stray=stray):
+                plant()
+                try:
+                    self.assertEqual(git(trusted, "rev-parse", "--verify", "-q", f"{TAG}^{{tag}}"), signed)
+                    self.assertEqual(git(trusted, "status", "--porcelain"), "")
+                    self.assert_fails(self.derive_sha256sums(), "was not signed by an active qbit release key")
+                finally:
+                    if stray.startswith("refs/"):
+                        git(trusted, "update-ref", "-d", stray)
+                    else:
+                        (trusted / stray).unlink()
+        self.assert_fails(self.derive_sha256sums(), "was not signed by an active qbit release key")
+        git(trusted, "update-ref", f"refs/tags/{TAG}", signed)
+        self.assert_ok(self.derive_sha256sums())
+
+    def test_a_signed_tag_of_another_name_cannot_stand_in_for_the_release_tag(self) -> None:
+        trusted = self.release.trusted
+        signed = git(trusted, "rev-parse", f"refs/tags/{TAG}")
+        other = "v0.9.0-testnet1"
+        sign_tag(trusted, other, self.keyring.home, self.keyring.fingerprints["operator-01"], self.release.tag_target)
+        git(trusted, "update-ref", f"refs/tags/{TAG}", git(trusted, "rev-parse", f"refs/tags/{other}"))
+        self.assert_fails(self.derive_sha256sums(), f"Release tag {TAG} is a tag object named {other!r}")
+
+        # Only line feeds end a tag header line.
+        odd_name = git(trusted, "mktag", input=(
+            f"object {self.release.tag_target}\ntype commit\ntag {TAG}\u0085x\n"
+            f"tagger qbit release test <release-test@example.invalid> 1700000000 +0000\n\n{TAG}\n"
+        ))
+        git(trusted, "update-ref", f"refs/tags/{TAG}", odd_name)
+        self.assert_fails(self.derive_sha256sums(), f"Release tag {TAG} is a tag object named {TAG + chr(0x85) + 'x'!r}")
+        cr_name = git(trusted, "hash-object", "-t", "tag", "--literally", "-w", "--stdin", input=(
+            f"object {self.release.tag_target}\ntype commit\ntag {TAG}\rx\n"
+            f"tagger qbit release test <release-test@example.invalid> 1700000000 +0000\n\n{TAG}\n"
+        ))
+        git(trusted, "update-ref", f"refs/tags/{TAG}", cr_name)
+        self.assert_fails(self.derive_sha256sums(), f"Release tag {TAG} is a tag object named {TAG + chr(13) + 'x'!r}")
+
+        # With refs/tags/<tag> gone, git would resolve refs/tags/<tag> as
+        # refs/refs/tags/<tag>; the tools read only the exact ref.
+        git(trusted, "update-ref", "-d", f"refs/tags/{TAG}")
+        git(trusted, "update-ref", f"refs/refs/tags/{TAG}", signed)
+        self.assertEqual(git(trusted, "rev-parse", "--verify", "-q", f"refs/tags/{TAG}^{{tag}}"), signed)
+        self.assert_fails(self.derive_sha256sums(), f"Failed to resolve release tag {TAG} as an annotated tag")
+
+    def test_repository_config_and_hooks_never_run_programs(self) -> None:
+        trusted = self.release.trusted
+        markers = self.root / "programs-run.log"
+        fingerprint = self.keyring.fingerprints["operator-01"]
+
+        def program(name: str, body: str) -> str:
+            path = write_executable(self.root / "bin" / name, f"#!/bin/sh\necho {name} >> '{markers}'\n{body}\n")
+            return str(path)
+
+        git(trusted, "config", "core.fsmonitor", program("fsmonitor", "exit 1"))
+        git(trusted, "config", "filter.planted.clean", program("clean-filter", "exec cat"))
+        git(trusted, "config", "filter.planted.smudge", program("smudge-filter", "exec cat"))
+        git(trusted, "config", "filter.planted.required", "true")
+        (trusted / ".git" / "info").mkdir(exist_ok=True)
+        (trusted / ".git" / "info" / "attributes").write_text("* filter=planted\n", encoding="utf8")
+        (trusted / ".git" / "hooks").mkdir(exist_ok=True)
+        Path(program("post-index-change", "exit 0")).rename(trusted / ".git" / "hooks" / "post-index-change")
+        git(trusted, "config", "tar.tar.gz.command", program("tar-gz", "exec gzip -cn"))
+        # A filter driver and an unrelated key that are not UTF-8.
+        latin = program("latin-clean-filter", "exec cat").encode("utf8")
+        with (trusted / ".git" / "config").open("ab") as config:
+            config.write(b'[filter "pl\xe4nted"]\n\tclean = ' + latin + b'\n[url "https://jos\xe9.invalid/"]\n\tinsteadOf = none\n')
+        # A driver with an empty name, which "filter=" selects.
+        empty = program("empty-name-clean-filter", "exec cat").encode("utf8")
+        with (trusted / ".git" / "config").open("ab") as config:
+            config.write(b'[filter ""]\n\tclean = ' + empty + b'\n')
+        with (trusted / ".git" / "info" / "attributes").open("ab") as attributes:
+            attributes.write(b"README.md filter=pl\xe4nted\ncontrib/keys/operator-keys/keys.json filter=\n")
+        # An SSH-format signature program that reports a good signature by an
+        # active release key, as a planted program could.
+        allowed = self.root / "allowed-signers"
+        allowed.write_text("operator-01 ssh-ed25519 AAAA\n", encoding="utf8")
+        git(trusted, "config", "gpg.ssh.allowedSignersFile", str(allowed))
+        git(trusted, "config", "gpg.ssh.program", program("ssh-keygen", textwrap.dedent(f"""\
+            case "$*" in *find-principals*) echo operator-01; exit 0;; esac
+            cat > /dev/null
+            echo 'Good "git" signature for operator-01 with ED25519 key SHA256:planted'
+            echo '[GNUPG:] VALIDSIG {fingerprint} 2026-01-01 0 4 0 22 10 00 {fingerprint}'
+            exit 0""")))
+        self.assertEqual(git(trusted, "-c", "core.fsmonitor=false", "status", "--porcelain"), "")
+        # After that status refreshed the index: stat-dirty files make git
+        # status run the clean filters and want to write the index (the hook).
+        for path in (trusted / "README.md", trusted / "contrib" / "keys" / "operator-keys" / "keys.json"):
+            os.utime(path, (1, 1))
+        markers.unlink(missing_ok=True)
+
+        self.assert_ok(self.derive_sha256sums())
+        self.sign_all()
+        self.assert_ok(self.release.combine())
+        self.assertFalse(markers.exists(), markers.read_text(encoding="utf8") if markers.exists() else "")
+
+        # The release tag, re-made with an SSH-format signature block.
+        ssh_tag = git(trusted, "mktag", input=(
+            f"object {self.release.tag_target}\ntype commit\ntag {TAG}\n"
+            "tagger qbit release test <release-test@example.invalid> 1700000000 +0000\n\n"
+            f"{TAG}\n-----BEGIN SSH SIGNATURE-----\nU1NIU0lH\n-----END SSH SIGNATURE-----\n"
+        ))
+        git(trusted, "update-ref", f"refs/tags/{TAG}", ssh_tag)
+        self.assert_fails(self.derive_sha256sums(), "was not signed by an active qbit release key")
+        self.assertFalse(markers.exists(), markers.read_text(encoding="utf8") if markers.exists() else "")
+
+    def test_a_partial_clone_remote_is_never_fetched_from(self) -> None:
+        trusted = self.release.trusted
+        markers = self.root / "programs-run.log"
+        ssh = write_executable(self.root / "bin" / "planted-ssh", f"#!/bin/sh\necho ssh >> '{markers}'\nexit 1\n")
+        git(trusted, "config", "core.repositoryformatversion", "1")
+        git(trusted, "config", "extensions.partialClone", "planted")
+        git(trusted, "config", "remote.planted.url", "ssh://example.invalid/qbit")
+        git(trusted, "config", "remote.planted.promisor", "true")
+        git(trusted, "config", "protocol.ssh.allow", "always")
+        git(trusted, "config", "core.sshCommand", str(ssh))
+        # A validator blob the tools export goes missing; git would fetch it.
+        blob = git(trusted, "rev-parse", "HEAD:ci/release/validate_key_metadata.py")
+        (trusted / ".git" / "objects" / blob[:2] / blob[2:]).unlink()
+        result = self.release.combine()
+        self.assertFalse(markers.exists(), "a fetch ran the configured ssh command")
+        self.assert_fails(
+            result, "Trusted qbit checkout must not be a partial clone (extensions.partialclone, remote.planted.promisor)"
+        )
+        # extensions.partialClone names a remote, so even "false" counts.
+        git(trusted, "config", "extensions.partialClone", "false")
+        self.assert_fails(self.release.combine(), "must not be a partial clone (extensions.partialclone, remote.")
+        # A promisor remote is enough for git to fetch.
+        git(trusted, "config", "--unset", "extensions.partialClone")
+        self.assert_fails(self.release.combine(), "must not be a partial clone (remote.planted.promisor)")
+        self.assertFalse(markers.exists(), "a fetch ran the configured ssh command")
+
+        # Past that check, the environment alone stops the fetch, even on a git
+        # without GIT_NO_LAZY_FETCH (before 2.45): GIT_ALLOW_PROTOCOL outranks
+        # the checkout's protocol.ssh.allow=always.
+        common = tools_common()
+        with mock.patch.dict(os.environ):
+            common.harden_git_environment()
+            del os.environ["GIT_NO_LAZY_FETCH"]
+            fetched = subprocess.run(
+                [GIT, "-C", str(trusted), "cat-file", "-p", blob], check=False, capture_output=True, text=True
+            )
+        self.assertNotEqual(fetched.returncode, 0)
+        self.assertFalse(markers.exists(), "a fetch ran the configured ssh command")
+
+        # Without a promisor remote, a missing object is reported as such.
+        git(trusted, "config", "--unset", "remote.planted.promisor")
+        self.assert_fails(
+            self.release.combine(),
+            f"The trusted checkout does not have the object of ci/release/validate_key_metadata.py ({blob})",
+        )
+
+    def test_a_submodule_checkout_is_never_entered(self) -> None:
+        trusted = self.release.trusted
+        markers = self.root / "programs-run.log"
+        clean = write_executable(self.root / "bin" / "sub-clean", f"#!/bin/sh\necho sub-clean >> '{markers}'\nexec cat\n")
+        sub = trusted / "sub"
+        sub.mkdir()
+        git(sub, "init", "-q")
+        (sub / "file.txt").write_text("submodule\n", encoding="utf8")
+        git(sub, "add", "file.txt")
+        git(sub, "commit", "-q", "-m", "submodule")
+        git(sub, "config", "filter.planted.clean", str(clean))
+        (sub / ".git" / "info").mkdir(exist_ok=True)
+        (sub / ".git" / "info" / "attributes").write_text("* filter=planted\n", encoding="utf8")
+        os.utime(sub / "file.txt", (1, 1))
+        git(trusted, "update-index", "--add", "--cacheinfo", f"160000,{git(sub, 'rev-parse', 'HEAD')},sub")
+        markers.unlink(missing_ok=True)
+        self.assert_fails(self.release.combine(), "Trusted qbit checkout must be clean")
+        self.assertFalse(markers.exists(), "git status ran inside the submodule checkout")
+
+    def test_git_under_the_tools_environment_prints_no_graft_hint(self) -> None:
+        common = tools_common()
+        with mock.patch.dict(os.environ):
+            common.harden_git_environment()
+            self.assertEqual(os.environ["GIT_GRAFT_FILE"], os.devnull)
+            result = subprocess.run(
+                [GIT, "-C", str(self.release.trusted), "status", "--porcelain"],
+                check=False, capture_output=True, text=True, encoding="utf8",
+            )
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+        self.assertNotIn("grafts", result.stderr)
+
     def test_line_ending_conversion_is_reported_clearly(self) -> None:
         trusted = self.release.trusted
         git(trusted, "config", "core.autocrlf", "true")
@@ -1477,6 +1716,26 @@ class SignalSafeCleanupTest(unittest.TestCase):
 
 
 class OutputPublishingTest(ReleaseToolTestCase):
+    def test_a_mount_point_stage_dir_is_refused_up_front(self) -> None:
+        fixture = self.fixture()
+        mount = Path(os.path.abspath(os.sep))
+        self.assertTrue(os.path.ismount(mount))
+        resolved_only = Path(os.sep, "qbit-release-tools-missing", os.pardir)
+        self.assertFalse(os.path.ismount(resolved_only))
+        results = {
+            STAGE_TOOL: fixture.stage(stage_dir=mount),
+            f"{STAGE_TOOL} {resolved_only}": fixture.stage(stage_dir=resolved_only),
+            SIGN_TOOL: fixture.run(
+                SIGN_TOOL, "--stage-dir", str(mount), "--alias", "operator-01", "--yes",
+                "--expected-sha256sums-sha256", "0" * 64, env={"GNUPGHOME": str(self.keyring.home)},
+            ),
+            COMBINE_TOOL: fixture.run(COMBINE_TOOL, "--stage-dir", str(mount)),
+        }
+        for tool, result in results.items():
+            with self.subTest(tool=tool):
+                self.assert_fails(result, f"--stage-dir {mount} is a mount point")
+                self.assertIn("inside the mount", result.stderr)
+
     def test_stage_directory_gets_the_mode_of_a_plain_mkdir(self) -> None:
         fixture = self.fixture()
         self.assert_ok(fixture.stage())
@@ -1532,6 +1791,7 @@ class OutputPublishingTest(ReleaseToolTestCase):
         )
         result = fixture.run(
             SIGN_TOOL, "--stage-dir", str(fixture.stage_dir), "--alias", "operator-01", "--yes",
+            "--expected-sha256sums-sha256", fixture.staged_digest(),
             gpg=checking, env={"GNUPGHOME": str(self.keyring.home), "GPG_TTY": "/dev/pts/test"},
         )
         self.assertEqual(self.assert_ok(result)["status"], ["created"])
@@ -1667,6 +1927,115 @@ class CombinePublisherParityTest(ReleaseToolTestCase):
                 signatures = {alias: signers[alias] for alias in aliases}
                 combine_accepts, publisher_accepts = self.run_scenario(name, signers, certs, signatures)
                 self.assertEqual(combine_accepts, publisher_accepts)
+
+
+class GitHardeningTest(unittest.TestCase):
+    """The tools and the publisher give git the same hardened environment."""
+
+    def test_old_git_is_refused_and_archive_compression_is_pinned(self) -> None:
+        common = tools_common()
+        cases = {
+            "git version 2.30.2\n": None,
+            "git version 2.34.1\n": "gzip -cn",
+            "git version 2.39.5 (Apple Git-154)\n": "git archive gzip",
+            "git version 2.53.0\n": "git archive gzip",
+        }
+        for output, gzip in cases.items():
+            with self.subTest(output=output), mock.patch.dict(os.environ):
+                common.harden_git_environment()
+                version = subprocess.CompletedProcess(["git", "version"], 0, output, "")
+                with mock.patch.object(common, "run_command", return_value=version):
+                    if gzip is None:
+                        with self.assertRaisesRegex(common.ReleaseToolError, "need git 2.31 or newer"):
+                            common.require_git("git")
+                        continue
+                    common.require_git("git")
+                config = {
+                    os.environ[f"GIT_CONFIG_KEY_{index}"]: os.environ[f"GIT_CONFIG_VALUE_{index}"]
+                    for index in range(int(os.environ["GIT_CONFIG_COUNT"]))
+                }
+                self.assertEqual(config["tar.tar.gz.command"], gzip)
+                self.assertEqual(config["tar.tgz.command"], gzip)
+
+    def test_publisher_uses_the_tools_git_environment_and_config(self) -> None:
+        common = tools_common()
+        text = (TOOLS_DIR / "publish-local-release.sh").read_text(encoding="utf8")
+
+        def array(name: str) -> list[str]:
+            body = text.split(f"\n{name}=(\n", 1)[1].split("\n)\n", 1)[0]
+            return shlex.split(body)
+
+        self.assertEqual(
+            list(zip(array("GIT_SAFE_CONFIG_KEYS"), array("GIT_SAFE_CONFIG_VALUES"))),
+            [(key, value.replace(common.NO_PROGRAM, "/dev/null/disabled")) for key, value in common.SAFE_GIT_CONFIG],
+        )
+        exported = dict(
+            line.removeprefix("export ").split("=", 1)
+            for line in text.splitlines()
+            if line.startswith("export GIT_") and not line.startswith("export GIT_CONFIG_")
+        )
+        self.assertEqual(exported, dict(common.SAFE_GIT_ENVIRONMENT))
+
+
+class StagePathTest(unittest.TestCase):
+    def test_an_unresolvable_stage_dir_is_an_error_line_not_a_traceback(self) -> None:
+        stage = load_tool_module(STAGE_TOOL)
+        for error in (RuntimeError("Symlink loop from '/x'"), PermissionError(13, "Permission denied")):
+            with self.subTest(error=type(error).__name__), mock.patch.object(Path, "resolve", side_effect=error):
+                with self.assertRaisesRegex(stage.common.ReleaseToolError, "Cannot resolve --stage-dir /x/stage"):
+                    stage.stage_path(Path("/x/stage"))
+
+
+class PublisherCommandParityTest(unittest.TestCase):
+    """Stage runs the publisher's validator commands with the publisher's flags."""
+
+    @staticmethod
+    def publisher_flags(start: str, end: str | None = None) -> set[str]:
+        """Flags of the publisher command that starts at the line holding ``start``."""
+
+        text = (TOOLS_DIR / "publish-local-release.sh").read_text(encoding="utf8")
+        lines = text.splitlines()
+        first = next(index for index, line in enumerate(lines) if start in line)
+        block: list[str] = []
+        for line in lines[first:]:
+            block.append(line)
+            if (end is None and not line.rstrip().endswith("\\")) or (end is not None and line.strip() == end):
+                break
+        if start.startswith("builder_args=("):
+            block += [line for line in lines if line.strip().startswith("builder_args+=(")]
+        return {token for line in block for token in line.split() if token.startswith("--")}
+
+    def stage_commands(self) -> dict[str, set[str]]:
+        stage = load_tool_module(STAGE_TOOL)
+        trusted = mock.Mock(
+            root=Path("/trusted"), policy_path=Path("/keys/keys.json"), keys_dir=Path("/keys"),
+            validators_dir=Path("/validators"),
+        )
+        checks = stage.PublisherChecks(
+            trusted=trusted, tag=TAG, tag_object="1" * 40, tag_target="2" * 40, release_line="testnet",
+            guix_sigs_dir=Path("/guix-sigs"), gpg="gpg",
+        )
+        commands: dict[str, set[str]] = {}
+        with mock.patch.object(
+            stage.PublisherChecks, "run",
+            lambda _self, script, args: commands.__setitem__(script, {a for a in args if a.startswith("--")}),
+        ):
+            checks.key_policy_mirror()
+            checks.builder_attestations(Path("/stage"), ["core", "photon"])
+        return commands
+
+    def test_stage_passes_the_publishers_validator_flags(self) -> None:
+        commands = self.stage_commands()
+        # Stage adds --gpg (it exists for tests and is passed through) and has
+        # no GitHub output file; everything else must match the publisher.
+        self.assertEqual(
+            commands["validate_key_metadata.py"] - {"--gpg"},
+            self.publisher_flags('"$VALIDATORS/validate_key_metadata.py" \\'),
+        )
+        self.assertEqual(
+            commands["validate_builder_attestations.py"] - {"--gpg"},
+            self.publisher_flags("builder_args=(", ")") - {"--github-output"},
+        )
 
 
 @unittest.skipUnless(GPG and GIT, "gpg and git are required for release tool tests")

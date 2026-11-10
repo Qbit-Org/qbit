@@ -8,12 +8,76 @@ set -euo pipefail
 
 # Every git command, including the validators', reads real objects only: none
 # of the caller's GIT_* settings (repository, index, object or config
-# overrides), no replace refs and no grafts.
+# overrides), no replace refs and no grafts. git status never writes the
+# index, nothing pages, and nothing is fetched, so a partial-clone remote in a
+# checkout's config cannot make a missing object run ssh or a helper
+# (GIT_ALLOW_PROTOCOL allows only "none", which does not exist).
 while IFS= read -r git_variable; do
     unset "$git_variable"
 done < <(compgen -e | grep '^GIT_' || true)
 export GIT_NO_REPLACE_OBJECTS=1
 export GIT_GRAFT_FILE=/dev/null
+export GIT_OPTIONAL_LOCKS=0
+export GIT_PAGER=cat
+export GIT_NO_LAZY_FETCH=1
+export GIT_ALLOW_PROTOCOL=none
+# Config every git command runs with, whatever the system, user or repository
+# config says, as in contrib/release-process/release_staging_common.py: nothing
+# may run a program or change which history is read. GIT_CONFIG_COUNT/KEY/VALUE
+# outrank config files; only an explicit git -c (the validators' gpg.program)
+# outranks them. /dev/null/disabled cannot exist, so no program or hook runs.
+# advice.graftFileDeprecated only silences the hint the empty graft file causes.
+# core.fsmonitor is empty, not false: git before 2.36 reads it as a hook
+# command and would run "false". gpg.ssh.program and gpg.x509.program: git
+# verify-tag runs the program of the signature's format, and only OpenPGP may
+# verify, with the gpg.program the validators pass by git -c; gpg.program is
+# off for anything else (a %G? export-subst placeholder in git archive).
+# tar.umask keeps git archive's default file modes.
+GIT_SAFE_CONFIG_KEYS=(
+    advice.graftFileDeprecated core.fsmonitor core.hooksPath core.commitGraph
+    gpg.ssh.program gpg.x509.program gpg.program tar.umask
+)
+GIT_SAFE_CONFIG_VALUES=(
+    false "" /dev/null/disabled false
+    /dev/null/disabled /dev/null/disabled /dev/null/disabled 0002
+)
+export_git_safe_config() {
+    local index
+    export GIT_CONFIG_COUNT="${#GIT_SAFE_CONFIG_KEYS[@]}"
+    for index in "${!GIT_SAFE_CONFIG_KEYS[@]}"; do
+        export "GIT_CONFIG_KEY_$index=${GIT_SAFE_CONFIG_KEYS[$index]}"
+        export "GIT_CONFIG_VALUE_$index=${GIT_SAFE_CONFIG_VALUES[$index]}"
+    done
+}
+export_git_safe_config
+
+# GIT_CONFIG_COUNT arrived in git 2.31; older git would ignore the overrides.
+# git archive pipes a .tar.gz through tar.tar.gz.command (tar.tgz.command),
+# which config could set to any program: pin git's own default for this
+# version (its built-in gzip from 2.38, gzip -cn before).
+require_git() {
+    local version
+    local major
+    local minor
+    local gzip
+    version="$(git version)" || die "Could not run git version"
+    [[ "$version" =~ ^git\ version\ ([0-9]+)\.([0-9]+) ]] \
+        || die "Cannot tell the git version from: $version"
+    major="${BASH_REMATCH[1]}"
+    minor="${BASH_REMATCH[2]}"
+    if [ "$major" -lt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -lt 31 ]; }; then
+        die "$version is too old: the publisher needs git 2.31 or newer, whose GIT_CONFIG_COUNT keeps checkout config from running programs"
+    fi
+    if [ "$major" -gt 2 ] || [ "$minor" -ge 38 ]; then
+        gzip="git archive gzip"
+    else
+        gzip="gzip -cn"
+    fi
+    GIT_SAFE_CONFIG_KEYS+=(tar.tar.gz.command tar.tgz.command)
+    GIT_SAFE_CONFIG_VALUES+=("$gzip" "$gzip")
+    export_git_safe_config
+}
+
 # Python runs without PYTHON* environment variables, user or site packages,
 # startup hooks or bytecode; everything it runs needs only the standard
 # library. Inline snippets are fully isolated (-I keeps the current directory
@@ -141,11 +205,56 @@ resolve_file() {
     printf '%s/%s\n' "$(resolve_dir "$parent")" "$name"
 }
 
+# Attributes can route any path through a filter driver, and git status and
+# git archive run them; a driver git has no command for is a no-op. Drivers are
+# named in config, so every one the checkout's config defines gets empty
+# commands and required=false.
+disable_git_filters() {
+    local label="$1"
+    local root="$2"
+    local keys
+    local key
+    local driver
+    local known
+    keys="$(git -C "$root" config --list --name-only)" \
+        || die "Could not read the git config of the $label: $root"
+    while IFS= read -r key; do
+        # The driver name may be empty: [filter ""] serves "filter=".
+        [[ "$key" =~ ^filter\.(.*)\.(clean|smudge|process|required)$ ]] || continue
+        driver="${BASH_REMATCH[1]}"
+        for known in "${GIT_SAFE_CONFIG_KEYS[@]}"; do
+            [ "$known" != "filter.$driver.clean" ] || continue 2
+        done
+        GIT_SAFE_CONFIG_KEYS+=(
+            "filter.$driver.clean" "filter.$driver.smudge" "filter.$driver.process" "filter.$driver.required"
+        )
+        GIT_SAFE_CONFIG_VALUES+=("" "" "" false)
+    done <<< "$keys"
+    export_git_safe_config
+}
+
 require_clean_checkout() {
     local label="$1"
     local root="$2"
-    [ -z "$(git -C "$root" status --porcelain --untracked-files=normal)" ] \
-        || die "$label must be clean: $root"
+    local status
+    local promisors
+    # Like release_staging_common.refuse_partial_clone: the environment forbids
+    # every fetch anyway; this says why up front.
+    # extensions.partialClone names a remote, so any value counts.
+    promisors="$(
+        { git -C "$root" config --get-regexp '^extensions\.partialclone$' | awk '{ print $1 }' || true
+          git -C "$root" config --type=bool --get-regexp '^remote\..*\.promisor$' \
+              | awk '$NF != "false" { print $1 }' || true
+        } | paste -sd, -
+    )"
+    [ -z "$promisors" ] \
+        || die "$label must not be a partial clone ($promisors): $root; the publisher never fetches missing objects"
+    disable_git_filters "$label" "$root"
+    # --ignore-submodules=dirty: a gitlink still shows, but git status does not
+    # run inside a submodule checkout, whose own config could name filters.
+    status="$(git -C "$root" status --porcelain --untracked-files=normal --ignore-submodules=dirty)" \
+        || die "Could not run git status in the $label: $root"
+    [ -z "$status" ] || die "$label must be clean: $root"
 }
 
 # git status does not show files marked assume-unchanged (lowercase tag) or
@@ -164,34 +273,37 @@ require_plain_index() {
 # what is read is exactly what the commit holds, whatever the working tree,
 # its line-ending conversion or the index say.
 export_trusted_paths() {
-    local root="$1"
-    local ref="$2"
-    local destination="$3"
-    shift 3
+    local label="$1"
+    local root="$2"
+    local ref="$3"
+    local destination="$4"
+    shift 4
     local entry
     local meta
     local path
     local mode
     local type
     local object
-    local listing="$destination/.ls-tree"
+    local listing="$destination.ls-tree"
     mkdir -p "$destination"
     git -C "$root" ls-tree -r -z --full-tree "$ref" -- "$@" > "$listing" \
-        || die "Could not list $* at trusted release ref $ref"
+        || die "Could not list ${*:-the tree} at $label $ref"
     while IFS= read -r -d '' entry; do
         meta="${entry%%$'\t'*}"
         path="${entry#*$'\t'}"
         read -r mode type object <<< "$meta"
         case "$mode:$type" in
             100644:blob|100755:blob) ;;
-            *) die "Trusted release ref has a non-regular file at $path" ;;
+            *) die "$label $ref has a non-regular file at $path" ;;
         esac
         case "/$path/" in
-            */../*|*/./*|*//*) die "Trusted release ref has an unsafe path: $path" ;;
+            */../*|*/./*|*//*) die "$label $ref has an unsafe path: $path" ;;
         esac
-        mkdir -p "$destination/$(dirname "$path")"
+        case "$path" in
+            */*) mkdir -p "$destination/${path%/*}" ;;
+        esac
         git -C "$root" cat-file blob "$object" > "$destination/$path" \
-            || die "Could not read $path at trusted release ref $ref"
+            || die "Could not read $path at $label $ref"
     done < "$listing"
 }
 
@@ -783,7 +895,8 @@ if [ "$RELEASE_LINE" = mainnet ] \
     done
 fi
 
-need_cmd awk gh git gpg grep python3 tr
+need_cmd awk gh git gpg grep paste python3 tr
+require_git
 gh auth status >/dev/null
 require_full_sha --trusted-release-ref "$TRUSTED_RELEASE_REF"
 require_full_sha --guix-sigs-ref "$GUIX_SIGS_REF"
@@ -824,6 +937,10 @@ GUIX_SIGS_SHA="$(git -C "$GUIX_SIGS_REPO" rev-parse HEAD)"
 [ "$(lowercase "$GUIX_SIGS_SHA")" = "$(lowercase "$GUIX_SIGS_REF")" ] \
     || die "qbit-guix.sigs checkout resolved $GUIX_SIGS_SHA, expected $GUIX_SIGS_REF"
 require_clean_checkout "qbit-guix.sigs checkout" "$GUIX_SIGS_REPO"
+# The validators read the qbit-guix.sigs files from an export of the pinned
+# commit (below), not from this working tree; index flags would only hide local
+# edits from the clean check above, so they are refused here, early.
+require_plain_index "qbit-guix.sigs checkout" "$GUIX_SIGS_REPO" .
 
 if [ -n "$NOTES_FILE" ]; then
     NOTES_FILE="$(resolve_file "$NOTES_FILE")"
@@ -877,7 +994,7 @@ ASSET_LIST_ERRORS="$WORK_DIR/asset-list-errors"
 # objects, not the working tree, and run isolated from Python startup hooks
 # and bytecode, so nothing in the checkout outside its commit can change them.
 TRUSTED_EXPORT="$WORK_DIR/trusted-ref"
-export_trusted_paths "$TRUSTED_ROOT" "$TRUSTED_RELEASE_REF" "$TRUSTED_EXPORT" \
+export_trusted_paths "Trusted release ref" "$TRUSTED_ROOT" "$TRUSTED_RELEASE_REF" "$TRUSTED_EXPORT" \
     ci/release contrib/keys/operator-keys
 VALIDATORS="$TRUSTED_EXPORT/ci/release"
 TRUSTED_KEYS_DIR="$TRUSTED_EXPORT/contrib/keys/operator-keys"
@@ -885,6 +1002,13 @@ for required_path in "${required_trusted_paths[@]}"; do
     [ -f "$TRUSTED_EXPORT/$required_path" ] \
         || die "Trusted release ref $TRUSTED_RELEASE_REF does not contain $required_path"
 done
+# The key mirror and this version's attestations, the only qbit-guix.sigs
+# files the validators read, come from the pinned commit's objects too: index
+# stat data, core.checkStat or core.ignoreCase can hide working-tree changes
+# from git status, so the checkout checks above only give early, clear errors.
+GUIX_SIGS_EXPORT="$WORK_DIR/qbit-guix.sigs-ref"
+export_trusted_paths "qbit-guix.sigs ref" "$GUIX_SIGS_REPO" "$GUIX_SIGS_REF" "$GUIX_SIGS_EXPORT" \
+    operator-keys "${TAG#v}"
 [ -z "$NOTES_FILE" ] || prepare_release_notes
 
 if [ "$RELEASE_LINE" = mainnet ]; then
@@ -942,8 +1066,8 @@ msg "Validating qbit-guix.sigs key-policy mirror"
 "${PYTHON[@]}" "$VALIDATORS/validate_key_metadata.py" \
     --operator-policy "$TRUSTED_KEYS_DIR/keys.json" \
     --operator-keys-dir "$TRUSTED_KEYS_DIR" \
-    --operator-policy-mirror "$GUIX_SIGS_REPO/operator-keys/keys.json" \
-    --operator-keys-dir-mirror "$GUIX_SIGS_REPO/operator-keys" \
+    --operator-policy-mirror "$GUIX_SIGS_EXPORT/operator-keys/keys.json" \
+    --operator-keys-dir-mirror "$GUIX_SIGS_EXPORT/operator-keys" \
     --skip-policy-transition-validation \
     --require-public-key-files
 
@@ -956,11 +1080,11 @@ builder_args=(
     --source-root "$TRUSTED_ROOT"
     --expected-tag-target "$TAG_TARGET"
     --release-line "$RELEASE_LINE"
-    --guix-sigs-repo "$GUIX_SIGS_REPO"
+    --guix-sigs-repo "$GUIX_SIGS_EXPORT"
     --operator-key-policy "$TRUSTED_KEYS_DIR/keys.json"
     --operator-keys-dir "$TRUSTED_KEYS_DIR"
-    --guix-operator-key-policy "$GUIX_SIGS_REPO/operator-keys/keys.json"
-    --guix-operator-keys-dir "$GUIX_SIGS_REPO/operator-keys"
+    --guix-operator-key-policy "$GUIX_SIGS_EXPORT/operator-keys/keys.json"
+    --guix-operator-keys-dir "$GUIX_SIGS_EXPORT/operator-keys"
     --github-output "$VALIDATION_OUTPUT"
 )
 if [ "$REQUIRE_PHOTON" -eq 1 ] || [ "$PHOTON_ARTIFACT_COUNT" != 0 ]; then

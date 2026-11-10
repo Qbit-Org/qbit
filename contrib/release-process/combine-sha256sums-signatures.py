@@ -94,6 +94,7 @@ def combine(args: argparse.Namespace) -> int:
             raise common.ReleaseToolError(str(exc)) from exc
 
         stage_dir = common.require_directory(args.stage_dir, label="--stage-dir")
+        common.refuse_mount_point(stage_dir, common.SIGN_MOUNT_POINT_ADVICE)
         manifest = stage_dir / common.CHECKSUMS_FILE
         combined_path = stage_dir / common.COMBINED_SIGNATURE_FILE
         common.note_stale_scratch(stage_dir)

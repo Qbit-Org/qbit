@@ -11,6 +11,11 @@ operator's existing GnuPG setup (smartcard or keyring; it never exports or
 reads private key material), verifies the signature against the trusted public
 certificate, and only then writes SHA256SUMS.<alias>.asc. An existing valid
 signature by the same signer is kept, so re-running is safe.
+
+--expected-sha256sums-sha256 is required: the operator passes the digest of
+the SHA256SUMS they derived themselves from the counted attestations, so a
+manifest someone else put in the stage directory is never signed, with --yes
+or without.
 """
 
 from __future__ import annotations
@@ -144,7 +149,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--alias", required=True, help="Release signer alias from keys.json, for example operator-02.")
     parser.add_argument(
         "--expected-sha256sums-sha256",
-        help="Refuse to sign unless SHA256SUMS has this SHA-256 digest.",
+        required=True,
+        help=(
+            "SHA-256 of the SHA256SUMS you derived yourself (sha256sums_sha256 from your own "
+            "stage-release-artifacts.py run); the tool refuses to sign any other SHA256SUMS."
+        ),
     )
     parser.add_argument(
         "--expected-fingerprint",
@@ -186,6 +195,7 @@ def sign(args: argparse.Namespace) -> int:
                 )
 
         stage_dir = common.require_directory(args.stage_dir, label="--stage-dir")
+        common.refuse_mount_point(stage_dir, common.SIGN_MOUNT_POINT_ADVICE)
         manifest = stage_dir / common.CHECKSUMS_FILE
         signature_path = stage_dir / f"{common.CHECKSUMS_FILE}.{signer.alias}.asc"
         common.note_stale_scratch(stage_dir)
@@ -193,7 +203,7 @@ def sign(args: argparse.Namespace) -> int:
         # files, compared with the expected digest, signed and verified.
         sha256sums = common.read_regular_file(manifest, label="SHA256SUMS")
         sha256sums_sha256 = common.sha256_bytes(sha256sums)
-        if expected_digest is not None and sha256sums_sha256 != expected_digest:
+        if sha256sums_sha256 != expected_digest:
             raise common.ReleaseToolError(
                 f"SHA256SUMS SHA-256 mismatch: expected {expected_digest}, got {sha256sums_sha256}"
             )

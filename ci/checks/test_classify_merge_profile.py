@@ -217,7 +217,18 @@ class ClassifyMergeProfileTest(unittest.TestCase):
         self.assertEqual(outputs["touched_release_trust_docs"], "true")
 
     def test_release_tools_alone_use_release_policy_profile(self) -> None:
-        for path in sorted(classify_merge_profile.RELEASE_TOOL_PATHS):
+        # Listed here rather than read from RELEASE_TOOL_PATHS, so a tool left
+        # out of that set fails this test instead of passing it.
+        release_tools = (
+            "contrib/release-process/README.md",
+            "contrib/release-process/combine-sha256sums-signatures.py",
+            "contrib/release-process/publish-local-release.sh",
+            "contrib/release-process/release_staging_common.py",
+            "contrib/release-process/sign-sha256sums.py",
+            "contrib/release-process/stage-release-artifacts.py",
+        )
+        self.assertEqual(set(release_tools), classify_merge_profile.RELEASE_TOOL_PATHS)
+        for path in release_tools:
             with self.subTest(path=path):
                 classification = self.classify([path])
                 outputs = classify_merge_profile.github_outputs(classification)

@@ -326,10 +326,15 @@ def locate_builder_outputs(
 
 @dataclass(frozen=True)
 class PublisherChecks:
-    """Runs the publisher's validator commands exactly as publish-local-release.sh does."""
+    """Runs the publisher's validator commands with publish-local-release.sh's arguments.
+
+    The publisher passes an export of the --guix-sigs-ref commit as the
+    qbit-guix.sigs directory; stage passes --guix-sigs-dir as given.
+    """
 
     trusted: Any
     tag: str
+    tag_object: str
     tag_target: str
     release_line: str
     guix_sigs_dir: Path
@@ -379,8 +384,50 @@ class PublisherChecks:
         self.run("validate_builder_attestations.py", args)
 
 
+def resolve_release_tag(root: Path, tag: str) -> tuple[str, str]:
+    """Return the annotated tag object at refs/tags/<tag> and the commit it targets.
+
+    Only the exact ref refs/tags/<tag> is read (git show-ref --verify): git
+    looks a name up as $GIT_DIR/<name>, refs/<name>, refs/tags/<name>, ...,
+    even refs/refs/tags/<tag> for refs/tags/<tag>, so a stray ref that git
+    status does not show could otherwise stand in for the tag. The tag object
+    must also name this tag; its signature covers that name, so a signed tag
+    of another release cannot be put at this ref.
+    """
+
+    ref = f"refs/tags/{tag}"
+    action = f"resolve release tag {tag} as an annotated tag at {ref} in the trusted qbit checkout"
+    tag_object = common.git_output(common.GIT, root, ["show-ref", "--verify", "--hash", ref], action=action)
+    tag_object = tag_object.strip().lower()
+    kind = common.git_output(common.GIT, root, ["cat-file", "-t", tag_object], action=action).strip()
+    if kind != "tag":
+        raise common.ReleaseToolError(f"Failed to {action}: {ref} is a {kind}, not an annotated tag")
+    # Bytes, so that only a line feed ends a header line.
+    payload = common.git_bytes(
+        common.GIT, root, ["cat-file", "tag", tag_object], action=f"read release tag object {tag_object}"
+    )
+    headers = payload.split(b"\n\n", 1)[0].split(b"\n")
+    names = [line.removeprefix(b"tag ") for line in headers if line.startswith(b"tag ")]
+    if names != [tag.encode("ascii")]:
+        named = repr(names[0].decode("utf8", errors="backslashreplace")) if names else "nothing"
+        raise common.ReleaseToolError(
+            f"Release tag {tag} is a tag object named {named} ({tag_object} at refs/tags/{tag})"
+        )
+    tag_target = common.git_output(
+        common.GIT,
+        root,
+        ["rev-parse", "--verify", f"{tag_object}^{{commit}}"],
+        action=f"resolve the commit of release tag {tag}",
+    ).strip().lower()
+    return tag_object, tag_target
+
+
 def verify_tag_signature(validators: common.Validators, checks: PublisherChecks, release_policy: Any) -> None:
-    """The publisher's tag check: the annotated tag is signed by an active release key."""
+    """The publisher's tag check: the annotated tag is signed by an active release key.
+
+    git verify-tag gets the tag object resolved from refs/tags/<tag>, so the
+    signature checked is the one of the tag that is staged.
+    """
 
     vra = validators.release_artifacts
     with common.temporary_gnupg_home("qbit-stage-tag-gnupg-") as home:
@@ -389,34 +436,32 @@ def verify_tag_signature(validators: common.Validators, checks: PublisherChecks,
             vra.import_release_keys(checks.gpg, home, checks.trusted.keys_dir, release_policy)
             # verify_tag_signature runs git verify-tag in the current directory.
             os.chdir(checks.trusted.root)
-            vra.verify_tag_signature(checks.gpg, home, checks.tag, release_policy)
+            vra.verify_tag_signature(checks.gpg, home, checks.tag_object, release_policy)
         except validators.errors as exc:
-            raise common.ReleaseToolError(str(exc)) from exc
+            # The validator names the object it was given; name the tag too.
+            message = str(exc).replace(
+                f"Release tag {checks.tag_object}", f"Release tag {checks.tag} ({checks.tag_object})", 1
+            )
+            raise common.ReleaseToolError(message) from exc
         finally:
             os.chdir(previous)
 
 
-def verify_new_stage(
+def check_with_publisher(
     validators: common.Validators,
     stage_dir: Path,
-    entries: dict[str, str],
     *,
     checks: PublisherChecks,
     selections: list[SelectedArtifactSet],
     rules: NamingRules,
+    label: str,
 ) -> None:
-    """Re-check an assembled stage directory the way the publisher will."""
+    """The publisher's artifact-name and builder-attestation checks on a stage directory."""
 
     vra = validators.release_artifacts
     try:
-        staged = vra.staged_file_names(stage_dir)
-        parsed = vra.parse_sha256sums(stage_dir / common.CHECKSUMS_FILE)
-        if staged != set(entries) | {common.CHECKSUMS_FILE}:
-            raise common.ReleaseToolError("Assembled stage directory does not match the derived upload set")
-        if {name: entry.digest for name, entry in parsed.items()} != entries:
-            raise common.ReleaseToolError("Written SHA256SUMS does not match the derived upload set")
         vra.validate_artifact_names(
-            parsed,
+            vra.parse_sha256sums(stage_dir / common.CHECKSUMS_FILE),
             rules.tag,
             rules.release_line,
             True,
@@ -425,8 +470,29 @@ def verify_new_stage(
             rules.allow_codesigning_artifacts,
         )
     except validators.errors as exc:
-        raise common.ReleaseToolError(f"Assembled stage directory failed validation: {exc}") from exc
+        raise common.ReleaseToolError(f"{label} failed validation: {exc}") from exc
     checks.builder_attestations(stage_dir, [selection.artifact for selection in selections])
+
+
+def verify_new_stage(
+    validators: common.Validators,
+    stage_dir: Path,
+    entries: dict[str, str],
+    **publisher_args: Any,
+) -> None:
+    """Re-check an assembled stage directory the way the publisher will."""
+
+    vra = validators.release_artifacts
+    try:
+        staged = vra.staged_file_names(stage_dir)
+        parsed = vra.parse_sha256sums(stage_dir / common.CHECKSUMS_FILE)
+    except validators.errors as exc:
+        raise common.ReleaseToolError(f"Assembled stage directory failed validation: {exc}") from exc
+    if staged != set(entries) | {common.CHECKSUMS_FILE}:
+        raise common.ReleaseToolError("Assembled stage directory does not match the derived upload set")
+    if {name: entry.digest for name, entry in parsed.items()} != entries:
+        raise common.ReleaseToolError("Written SHA256SUMS does not match the derived upload set")
+    check_with_publisher(validators, stage_dir, label="Assembled stage directory", **publisher_args)
 
 
 def check_existing_stage(
@@ -434,7 +500,14 @@ def check_existing_stage(
     stage_dir: Path,
     sha256sums: bytes,
     release_policy: Any,
+    **publisher_args: Any,
 ) -> None:
+    """Accept an existing stage only if it is this stage and still passes the publisher's checks.
+
+    The attestations, the qbit-guix.sigs key mirror or the policy may have
+    changed since it was staged, so the checks a new stage gets run again.
+    """
+
     existing = common.read_regular_file(stage_dir / common.CHECKSUMS_FILE, label="Existing SHA256SUMS")
     if existing != sha256sums:
         raise common.ReleaseToolError(
@@ -448,6 +521,7 @@ def check_existing_stage(
             f"Stage directory {stage_dir} already exists and differs from the derived stage: {exc}; "
             "refusing to overwrite it"
         ) from exc
+    check_with_publisher(validators, stage_dir, label=f"Existing stage directory {stage_dir}", **publisher_args)
 
 
 def write_sha256sums_only(
@@ -502,6 +576,16 @@ def assemble_stage(
         common.record_written(stage_dir)
 
 
+def stage_path(raw: Path) -> Path:
+    """The path stage uses for --stage-dir: absolute, with its parent's symlinks and ".." resolved."""
+
+    absolute = Path(os.path.abspath(raw))
+    try:
+        return absolute.parent.resolve() / absolute.name
+    except (OSError, RuntimeError) as exc:
+        raise common.ReleaseToolError(f"Cannot resolve --stage-dir {raw}: {exc}") from exc
+
+
 def reject_overlap(stage_dir: Path, protected: list[tuple[str, Path]]) -> None:
     for label, path in protected:
         if stage_dir == path or stage_dir.is_relative_to(path) or path.is_relative_to(stage_dir):
@@ -550,8 +634,8 @@ def main(argv: list[str] | None = None) -> int:
 def stage(args: argparse.Namespace) -> int:
     if not TAG_RE.fullmatch(args.tag):
         raise common.ReleaseToolError(f"--tag must be a safe v-prefixed release tag: {args.tag!r}")
-    if args.stage_dir is not None and os.path.ismount(args.stage_dir):
-        raise common.ReleaseToolError(f"--stage-dir {args.stage_dir} is a mount point; {MOUNT_POINT_ADVICE}")
+    if args.stage_dir is not None:
+        common.refuse_mount_point(stage_path(args.stage_dir), MOUNT_POINT_ADVICE)
     common.note_non_default_gpg(args.gpg)
     with common.open_trusted_release(Path(__file__), args.trusted_release_ref, git=common.GIT) as checkout:
         validators = checkout.validators
@@ -576,12 +660,7 @@ def stage(args: argparse.Namespace) -> int:
         except validators.errors as exc:
             raise common.ReleaseToolError(str(exc)) from exc
 
-        tag_target = common.git_output(
-            common.GIT,
-            checkout.root,
-            ["rev-parse", "--verify", f"refs/tags/{args.tag}^{{commit}}"],
-            action=f"resolve release tag {args.tag} in the trusted qbit checkout",
-        ).strip()
+        tag_object, tag_target = resolve_release_tag(checkout.root, args.tag)
         ancestor = common.run_command(
             [common.GIT, "-C", str(checkout.root), "merge-base", "--is-ancestor", tag_target, checkout.ref]
         )
@@ -606,6 +685,7 @@ def stage(args: argparse.Namespace) -> int:
         checks = PublisherChecks(
             trusted=checkout,
             tag=args.tag,
+            tag_object=tag_object,
             tag_target=tag_target,
             release_line=args.release_line,
             guix_sigs_dir=guix_sigs_dir,
@@ -620,10 +700,11 @@ def stage(args: argparse.Namespace) -> int:
             output_dirs = [
                 common.require_directory(path, label="--builder-output-dir") for path in args.builder_output_dir
             ]
-            stage_dir = Path(os.path.abspath(args.stage_dir))
-            if stage_dir.is_symlink() or (stage_dir.exists() and not stage_dir.is_dir()):
+            if Path(os.path.abspath(args.stage_dir)).is_symlink():
+                raise common.ReleaseToolError(f"--stage-dir must be a directory path: {args.stage_dir}")
+            stage_dir = stage_path(args.stage_dir)
+            if stage_dir.exists() and not stage_dir.is_dir():
                 raise common.ReleaseToolError(f"--stage-dir must be a directory path: {stage_dir}")
-            stage_dir = stage_dir.parent.resolve() / stage_dir.name
             reject_overlap(
                 stage_dir,
                 [("builder output directory", path) for path in output_dirs]
@@ -668,7 +749,15 @@ def stage(args: argparse.Namespace) -> int:
             else:
                 sha256sums_path = stage_dir / common.CHECKSUMS_FILE
                 if stage_dir.is_dir() and any(stage_dir.iterdir()):
-                    check_existing_stage(validators, stage_dir, sha256sums, release_policy)
+                    check_existing_stage(
+                        validators,
+                        stage_dir,
+                        sha256sums,
+                        release_policy,
+                        checks=checks,
+                        selections=selections,
+                        rules=rules,
+                    )
                     status = "unchanged"
                 else:
                     prefixes = tuple(artifact_prefix(version, artifact) for artifact in artifacts)

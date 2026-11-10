@@ -21,7 +21,12 @@ signatures count. Staging also runs the publisher's checks that need nothing
 staged, so a release that cannot be published fails before anyone signs: the
 qbit-guix.sigs key-policy mirror (`validate_key_metadata.py` and
 `validate_builder_attestations.py`, with the publisher's arguments) and the
-release tag's signature by an active release key. The publisher's GitHub checks
+release tag's signature by an active release key. The tag checked is the tag
+object at `refs/tags/<tag>`, passed to `git verify-tag` by object id, and it
+must name `<tag>`: a bare tag name would let a stray `refs/<tag>` or
+`.git/<tag>`, which git resolves first and `git status` does not show, stand in
+for it, and a signed tag of another release cannot be moved to this name. The
+publisher's GitHub checks
 (public refs, the GitHub-verified tag, release immutability) and the mainnet,
 testnet and P2MR posture checks still run only at publication.
 
@@ -44,13 +49,32 @@ more than an empty `git status`:
   blobs at the ref (a checkout that converts line endings, for example with
   `core.autocrlf=true`, is refused with a message saying so: use a checkout
   made with `core.autocrlf=false`);
-- the checkout is not shallow.
+- the checkout is not shallow and not a partial clone (the tools never fetch).
 
 Every git command, the tools' and the validators', runs without the caller's
 `GIT_*` variables (`GIT_DIR`, `GIT_INDEX_FILE`, object and config overrides),
-with replace refs ignored (`GIT_NO_REPLACE_OBJECTS=1`) and without the graft
-file, so a local `git replace` or graft cannot make the tools read anything but
-the commit's own objects. `publish-local-release.sh` does the same.
+with replace refs ignored (`GIT_NO_REPLACE_OBJECTS=1`) and an empty graft file,
+so a local `git replace` or graft cannot make the tools read anything but the
+commit's own objects. `git status` does not write the index
+(`GIT_OPTIONAL_LOCKS=0`) or enter submodule checkouts
+(`--ignore-submodules=dirty`), nothing pages (`GIT_PAGER=cat`), and nothing is
+fetched (`GIT_NO_LAZY_FETCH=1`, and `GIT_ALLOW_PROTOCOL=none`, which outranks
+any `protocol.*` config), so a partial-clone remote cannot turn a missing
+object into an ssh or helper run; partial clones are refused up front.
+`GIT_CONFIG_COUNT` overrides, which outrank the system, user and repository
+config, keep that config from running programs or changing history: fsmonitor
+off (`core.fsmonitor` empty), hooks off, `core.commitGraph=false` (a
+commit-graph file can claim other parents, as a graft could), no signature
+program except the validators' own for `git verify-tag` (only OpenPGP tags
+verify), `git archive`'s gzip and file modes pinned to git's defaults
+(`tar.tar.gz.command`, `tar.umask`), and every filter driver the checkout's
+config defines gets empty `clean`, `smudge` and `process` commands, since `git
+status` and `git archive` would run them. `advice.graftFileDeprecated=false`
+only silences git's hint about the empty graft file. `GIT_CONFIG_COUNT` needs
+git 2.31 or newer, and the tools refuse an older git.
+`publish-local-release.sh` does the same for the trusted and qbit-guix.sigs
+checkouts, and reads the qbit-guix.sigs files from the `--guix-sigs-ref`
+commit's objects.
 
 The validators (`ci/release/`) and the release key policy
 (`contrib/keys/operator-keys/`: `keys.json` and the public certificates) are not
@@ -109,6 +133,12 @@ python3 -I -S -B contrib/release-process/stage-release-artifacts.py \
   --stage-dir ../staged-release
 ```
 
+`--guix-sigs-dir` is read as a directory, not pinned to a commit. Stage from
+a clean qbit-guix.sigs checkout at the merged commit that will be the
+publisher's `--guix-sigs-ref`: the publisher validates the files of that
+commit, read from its git objects (and requires a clean checkout at it), so
+signatures over a manifest staged from anything else are refused there.
+
 For each artifact set (`core`, and `photon` when any active builder attested
 PHOTON; select explicitly with repeated `--artifact`), the tool:
 
@@ -141,7 +171,10 @@ stage directory is left behind.
 `SHA256SUMS` has one `<sha256>  <file name>` line per artifact (two spaces, LF
 line endings), sorted by file name. That is the format of the v1.0.0 release.
 
-Re-running with the same inputs is a no-op (`status=unchanged`). An existing
+Re-running with the same inputs is a no-op (`status=unchanged`), after the
+existing stage passes the same publisher checks a new one gets (artifact names
+and the builder attestations over its `SHA256SUMS`), since the attestations,
+the key mirror or the policy may have changed since it was staged. An existing
 stage directory whose `SHA256SUMS` or artifacts differ, or that holds other
 files, is never modified; move it aside to stage again. Per-operator signatures
 and `SHA256SUMS.asc` in an existing stage directory are kept.
@@ -167,12 +200,14 @@ python3 -I -S -B contrib/release-process/sign-sha256sums.py \
 
 The tool resolves `--alias` to its `signing_fingerprint` in the trusted policy;
 the alias must be an active `release-signing` signer of the release line.
-`--expected-fingerprint` is an optional cross-check. Before signing it checks
-that `SHA256SUMS` parses, that every listed artifact is present with its digest,
-that the directory holds nothing else (apart from per-operator signatures of
-active signers and `SHA256SUMS.asc`), and, when given, that `SHA256SUMS` has
-the expected digest. Pass the `sha256sums_sha256` from your own staging run so
-that you only sign the manifest you derived yourself.
+`--expected-fingerprint` is an optional cross-check.
+`--expected-sha256sums-sha256` is required: the `sha256sums_sha256` from your
+own staging run (`--sha256sums-output` is enough), so that you only sign the
+manifest you derived yourself, never one someone else put in the stage
+directory, with `--yes` or without. Before signing the tool checks that
+`SHA256SUMS` has that digest, that it parses, that every listed artifact is
+present with its digest, and that the directory holds nothing else (apart from
+per-operator signatures of active signers and `SHA256SUMS.asc`).
 
 It reads `SHA256SUMS` once into a private copy (mode 0600, in a 0700 scratch
 directory) and checks the staged files, the expected digest and the signature
@@ -239,15 +274,15 @@ The stage directory is then ready for `publish-local-release.sh`.
 
 All outputs are assembled in a private scratch directory next to their
 destination (`.<name>.tmp-*`) and moved into place only after they verify.
-Where hard links are not available (exFAT media, some network filesystems, or
-a stage directory that is a mount point when the signing and combining tools
-write into it), the verified file is written to a temporary file in the
-destination directory, flushed to disk and renamed into place.
-`stage-release-artifacts.py` builds the stage next to `--stage-dir` and renames
-it into place, so it refuses a `--stage-dir` that is a mount point: give a new
-directory inside the mount instead. The destination is never partially written, but on that path refusing
-to overwrite is best effort: a file that appears between the check and the
-rename is replaced.
+That directory is next to `--stage-dir`, so all three tools refuse a
+`--stage-dir` that is a mount point (for example `/media/$USER/RELEASE` or
+`/Volumes/RELEASE`), where it would be outside the mount and usually not
+writable: keep the stage in a directory inside the mount. Where hard links are
+not available (exFAT media, some network filesystems), the verified file is
+written to a temporary file in the destination directory, flushed to disk and
+renamed into place. The destination is never partially written, but on that
+path refusing to overwrite is best effort: a file that appears between the
+check and the rename is replaced.
 
 SIGINT, SIGTERM, SIGHUP and I/O errors such as a full disk end a tool with a
 single `ERR:` line. A signal that arrives while scratch is being removed waits

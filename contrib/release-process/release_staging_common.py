@@ -8,7 +8,9 @@ The validators and the release key policy are read from the blobs at that ref,
 exported into a private scratch directory, never from the working tree, and
 there is deliberately no option or environment variable that points the tools
 at a different keys.json. Every git command, including the validators' own,
-runs without the caller's GIT_* settings, replace refs or grafts.
+runs without the caller's GIT_* settings, replace refs or grafts, and with
+config overrides that stop the system, user or repository config from running
+programs (hooks, fsmonitor, filters, non-OpenPGP signature programs).
 """
 
 from __future__ import annotations
@@ -51,11 +53,65 @@ DEFAULT_GPG = shutil.which("gpg") or "gpg"
 # Hidden files the tools create next to an output while writing it; one found
 # inside a stage directory was left by a run that was killed outright.
 INTERRUPTED_LEFTOVER_RE = re.compile(r"^\..+\.tmp-")
+SIGN_MOUNT_POINT_ADVICE = (
+    "the signature is assembled in a private directory next to --stage-dir, outside the mount, where "
+    "it usually cannot be written; keep the stage in a directory inside the mount"
+)
+
+# A path no program or directory can exist at: /dev/null is not a directory.
+NO_PROGRAM = os.path.join(os.devnull, "disabled")
+# Config every git command runs with, whatever the system, user or repository
+# config says: nothing may run a program or change which history is read.
+SAFE_GIT_CONFIG = (
+    # The graft file is the empty /dev/null; this only silences git's hint
+    # that graft files are deprecated.
+    ("advice.graftFileDeprecated", "false"),
+    # Empty, not "false": git before 2.36 reads core.fsmonitor as a hook
+    # command and would run "false"; every version reads empty as off.
+    ("core.fsmonitor", ""),
+    ("core.hooksPath", NO_PROGRAM),
+    # A commit-graph file can claim other parents, as a graft could.
+    ("core.commitGraph", "false"),
+    # git verify-tag runs the program of the signature's format. The
+    # validators pass gpg.program with git -c, which outranks these, for
+    # OpenPGP; SSH and X.509 never verify.
+    ("gpg.ssh.program", NO_PROGRAM),
+    ("gpg.x509.program", NO_PROGRAM),
+    # Any other OpenPGP check, such as a %G? export-subst placeholder in
+    # git archive, runs nothing.
+    ("gpg.program", NO_PROGRAM),
+    # git archive's default file modes, so the source archive has the bytes
+    # builders made (require_git pins its compression).
+    ("tar.umask", "0002"),
+)
+# Environment every git command runs with, besides the config above: no pager,
+# and no fetch of any kind, so a partial-clone remote in the checkout's config
+# cannot make a missing object run ssh, a remote helper or a credential helper.
+SAFE_GIT_ENVIRONMENT = (
+    ("GIT_NO_REPLACE_OBJECTS", "1"),
+    ("GIT_GRAFT_FILE", os.devnull),
+    ("GIT_OPTIONAL_LOCKS", "0"),
+    ("GIT_PAGER", "cat"),
+    ("GIT_NO_LAZY_FETCH", "1"),
+    # Only the protocol "none", which does not exist; this outranks any
+    # protocol.allow or protocol.<name>.allow config.
+    ("GIT_ALLOW_PROTOCOL", "none"),
+)
+# GIT_CONFIG_COUNT arrived in git 2.31; older git would ignore the overrides.
+MIN_GIT_VERSION = (2, 31)
+# From git 2.38 git archive compresses .tar.gz itself unless
+# tar.<format>.command says otherwise; before, its default was gzip -cn.
+INTERNAL_GZIP_GIT_VERSION = (2, 38)
+GIT_VERSION_RE = re.compile(r"git version (\d+)\.(\d+)")
+# The driver name may be empty: [filter ""] is a valid driver for "filter=".
+FILTER_KEY_RE = re.compile(rb"filter\.(.*)\.(?:clean|smudge|process|required)")
 
 # Scratch directories this run created and has not removed yet, and outputs it
 # has moved into place, so that an error reports what is actually on disk.
 _SCRATCH: set[Path] = set()
 _WRITTEN: list[Path] = []
+# The config overrides set_git_config last passed to git.
+_GIT_CONFIG: list[tuple[str, str]] = []
 
 
 class ReleaseToolError(Exception):
@@ -162,18 +218,96 @@ def git_bytes(git: str, cwd: Path, args: list[str], *, action: str, stdin: bytes
     return result.stdout
 
 
+def set_git_config(overrides: list[tuple[str, str]]) -> None:
+    """Pass ``overrides`` to every git command this process starts.
+
+    GIT_CONFIG_COUNT/KEY/VALUE outrank the system, user and repository config;
+    only an explicit ``git -c`` outranks them, which is how the validators
+    pass gpg.program.
+    """
+
+    for name in [name for name in os.environ if name.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))]:
+        del os.environ[name]
+    os.environ["GIT_CONFIG_COUNT"] = str(len(overrides))
+    for index, (key, value) in enumerate(overrides):
+        os.environ[f"GIT_CONFIG_KEY_{index}"] = key
+        os.environ[f"GIT_CONFIG_VALUE_{index}"] = value
+
+
 def harden_git_environment() -> None:
     """Make every git command, the tools' and the validators', read real objects.
 
     The caller's GIT_* variables (GIT_DIR, GIT_INDEX_FILE, object directories,
     config overrides, replace-ref bases, ...) are dropped, replace refs are
-    ignored and the graft file is replaced by an empty one.
+    ignored, the graft file is replaced by an empty one, git status never
+    writes the index, nothing pages and nothing is fetched
+    (SAFE_GIT_ENVIRONMENT). SAFE_GIT_CONFIG then overrides whatever the system,
+    user or repository config says about programs git may run and history it
+    reads; require_git pins git archive's compression and
+    disable_filter_drivers adds the filter drivers a checkout defines.
     """
 
     for name in [name for name in os.environ if name.startswith("GIT_")]:
         del os.environ[name]
-    os.environ["GIT_NO_REPLACE_OBJECTS"] = "1"
-    os.environ["GIT_GRAFT_FILE"] = os.devnull
+    os.environ.update(SAFE_GIT_ENVIRONMENT)
+    _GIT_CONFIG[:] = list(SAFE_GIT_CONFIG)
+    set_git_config(_GIT_CONFIG)
+
+
+def add_git_config(overrides: list[tuple[str, str]]) -> None:
+    known = {key for key, _value in _GIT_CONFIG}
+    _GIT_CONFIG.extend(item for item in overrides if item[0] not in known)
+    set_git_config(_GIT_CONFIG)
+
+
+def require_git(git: str) -> None:
+    """Refuse a git too old for the overrides, and pin git archive's compression.
+
+    git archive pipes a .tar.gz through tar.tar.gz.command (tar.tgz.command),
+    which config could set to any program; it is pinned to git's own default
+    for this version. Config that only changes the archive's bytes (for example
+    core.autocrlf or attributes in .git/info) cannot run anything; the archive
+    then does not match the attested one and staging stops.
+    """
+
+    result = run_command([git, "version"])
+    match = GIT_VERSION_RE.match(result.stdout) if result.returncode == 0 else None
+    if match is None:
+        raise ReleaseToolError(f"Cannot tell which git {git} is: {one_line(result.stderr or result.stdout)}")
+    version = (int(match.group(1)), int(match.group(2)))
+    if version < MIN_GIT_VERSION:
+        raise ReleaseToolError(
+            f"{git} is git {version[0]}.{version[1]}; the release tools need git "
+            f"{MIN_GIT_VERSION[0]}.{MIN_GIT_VERSION[1]} or newer, whose GIT_CONFIG_COUNT keeps the "
+            "checkout's config from running programs"
+        )
+    gzip = "git archive gzip" if version >= INTERNAL_GZIP_GIT_VERSION else "gzip -cn"
+    add_git_config([("tar.tar.gz.command", gzip), ("tar.tgz.command", gzip)])
+
+
+def disable_filter_drivers(git: str, root: Path) -> None:
+    """Turn off every clean, smudge and process filter git config defines for ``root``.
+
+    Attributes can route any path through a filter driver, and git status and
+    git archive run them; a driver git has no command for is a no-op. Drivers
+    are named in config, so they are read from it and each one gets empty
+    commands and required=false.
+    """
+
+    listing = git_bytes(git, root, ["config", "--list", "--name-only", "-z"], action="read the git config")
+    # Keys are bytes: a driver name, like any subsection, need not be UTF-8.
+    # os.fsdecode is the inverse of how os.environ encodes, so git gets back
+    # exactly those bytes whatever the locale.
+    drivers = sorted(
+        {os.fsdecode(match.group(1)) for raw in listing.split(b"\0") if (match := FILTER_KEY_RE.fullmatch(raw))}
+    )
+    add_git_config(
+        [
+            (f"filter.{driver}.{setting}", value)
+            for driver in drivers
+            for setting, value in (("clean", ""), ("smudge", ""), ("process", ""), ("required", "false"))
+        ]
+    )
 
 
 @contextlib.contextmanager
@@ -260,15 +394,6 @@ def run_main(body: Callable[[], int]) -> int:
                 signal.signal(handled, disposition)
 
 
-def path_traverses_symlink(root: Path, relative: str) -> bool:
-    current = root
-    for part in PurePosixPath(relative).parts:
-        current = current / part
-        if current.is_symlink():
-            return True
-    return False
-
-
 def export_trusted_tree(git: str, root: Path, ref: str, destination: Path) -> None:
     """Write the blobs of EXPORTED_PATHS at ``ref`` into ``destination``.
 
@@ -318,6 +443,8 @@ def export_trusted_tree(git: str, root: Path, ref: str, destination: Path) -> No
         try:
             header_end = batch.index(b"\n", offset)
             header = batch[offset:header_end].decode("ascii").split()
+            if header == [oid, "missing"]:
+                raise ReleaseToolError(f"The trusted checkout does not have the object of {path} ({oid})")
             if len(header) != 3 or header[0] != oid or header[1] != "blob":
                 raise ValueError(header)
             size = int(header[2])
@@ -332,6 +459,27 @@ def export_trusted_tree(git: str, root: Path, ref: str, destination: Path) -> No
         target.write_bytes(content)
 
 
+def refuse_partial_clone(git: str, root: Path, *, label: str) -> None:
+    """Refuse a partial clone: git would fetch a missing object from its promisor remote.
+
+    The environment forbids every fetch anyway; this says why up front.
+    """
+
+    def keys(config: list[str], *, unless: str | None = None) -> list[str]:
+        lines = run_command([git, "-C", str(root), "config", *config]).stdout.splitlines()
+        return [line.split()[0] for line in lines if line.strip() and (unless is None or not line.endswith(unless))]
+
+    # extensions.partialClone names a remote, so any value counts.
+    promisors = keys(["--get-regexp", r"^extensions\.partialclone$"]) + keys(
+        ["--type=bool", "--get-regexp", r"^remote\..*\.promisor$"], unless=" false"
+    )
+    if promisors:
+        raise ReleaseToolError(
+            f"{label} must not be a partial clone ({', '.join(promisors)}): {root}; "
+            "the release tools never fetch missing objects"
+        )
+
+
 def check_trusted_checkout(tool_path: Path, trusted_ref: str, *, git: str) -> tuple[Path, str]:
     """Return the root and HEAD of the checkout that holds ``tool_path``.
 
@@ -342,6 +490,7 @@ def check_trusted_checkout(tool_path: Path, trusted_ref: str, *, git: str) -> tu
 
     if not COMMIT_SHA_RE.fullmatch(trusted_ref or ""):
         raise ReleaseToolError("--trusted-release-ref must be a full 40-character commit SHA")
+    require_git(git)
     tool_path = tool_path.resolve()
     toplevel = git_output(
         git,
@@ -371,10 +520,14 @@ def check_trusted_checkout(tool_path: Path, trusted_ref: str, *, git: str) -> tu
     ).strip()
     if shallow != "false":
         raise ReleaseToolError(f"Trusted qbit checkout must not be shallow: {root}")
+    refuse_partial_clone(git, root, label="Trusted qbit checkout")
+    disable_filter_drivers(git, root)
+    # --ignore-submodules=dirty: a gitlink still shows, but git status does not
+    # run inside a submodule checkout, whose own config could name filters.
     status = git_output(
         git,
         root,
-        ["status", "--porcelain", "--untracked-files=normal"],
+        ["status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=dirty"],
         action="check that the trusted qbit checkout is clean",
     )
     if status.strip():
@@ -397,7 +550,10 @@ def check_trusted_checkout(tool_path: Path, trusted_ref: str, *, git: str) -> tu
     stray = git_output(
         git,
         root,
-        ["status", "--porcelain", "--ignored", "--untracked-files=all", "--", TOOLS_RELATIVE_DIR],
+        [
+            "status", "--porcelain", "--ignored", "--untracked-files=all", "--ignore-submodules=dirty",
+            "--", TOOLS_RELATIVE_DIR,
+        ],
         action="check the release tools directory",
     ).strip()
     if stray:
@@ -479,6 +635,13 @@ def note_stale_scratch(destination: Path) -> None:
         note(f"scratch left by an interrupted run, safe to delete: {leftover}")
 
 
+def refuse_mount_point(stage_dir: Path, advice: str) -> None:
+    """Refuse a --stage-dir that is a mount point: its scratch would be outside the mount."""
+
+    if os.path.ismount(stage_dir):
+        raise ReleaseToolError(f"--stage-dir {stage_dir} is a mount point; {advice}")
+
+
 @contextlib.contextmanager
 def scratch_dir_beside(destination: Path) -> Iterator[Path]:
     """Yield a private directory next to ``destination`` and always remove it.
@@ -488,16 +651,13 @@ def scratch_dir_beside(destination: Path) -> Iterator[Path]:
     """
 
     parent = destination.parent
-    try:
-        parent.mkdir(parents=True, exist_ok=True)
-        scratch = private_directory(f".{destination.name}.tmp-", parent)
-        path = scratch.__enter__()
-    except OSError as exc:
-        raise ReleaseToolError(f"Cannot create a scratch directory in {parent}: {exc}") from exc
-    try:
+    with contextlib.ExitStack() as stack:
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+            path = stack.enter_context(private_directory(f".{destination.name}.tmp-", parent))
+        except OSError as exc:
+            raise ReleaseToolError(f"Cannot create a scratch directory in {parent}: {exc}") from exc
         yield path
-    finally:
-        scratch.__exit__(None, None, None)
 
 
 def current_umask() -> int:

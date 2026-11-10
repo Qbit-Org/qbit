@@ -397,6 +397,7 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         self._write_executable(
             validator_dir / "validate_builder_attestations.py",
             r"""#!/usr/bin/env python3
+import hashlib
 import os
 import sys
 from pathlib import Path
@@ -414,6 +415,11 @@ with Path(option("--github-output")).open("a", encoding="utf8") as output:
     output.write("builder_attestation_tag_target=" + option("--expected-tag-target") + "\n")
 with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
     log.write("builder " + " ".join(args) + "\n")
+    guix_keys = Path(option("--guix-operator-key-policy")).read_bytes()
+    log.write("builder-guix-keys " + hashlib.sha256(guix_keys).hexdigest() + "\n")
+    guix_sigs = Path(option("--guix-sigs-repo"))
+    files = sorted(str(path.relative_to(guix_sigs)) for path in guix_sigs.rglob("*") if path.is_file())
+    log.write("builder-guix-files " + " ".join(files) + "\n")
 """,
         )
         self._write_executable(
@@ -730,6 +736,146 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         result = self.run_publisher()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertNotIn("REPLACED", self.validator_log.read_text(encoding="utf8"))
+
+    def test_repository_config_and_hooks_never_run_programs(self) -> None:
+        markers = self.root / "programs-run.log"
+
+        def program(name: str, body: str) -> Path:
+            path = self.root / "planted" / name
+            path.parent.mkdir(exist_ok=True)
+            self._write_executable(path, f"#!/bin/sh\necho {name} >> '{markers}'\n{body}\n")
+            return path
+
+        for label, checkout in (("trusted", self.trusted), ("guix-sigs", self.guix_sigs)):
+            git(checkout, "config", "core.fsmonitor", str(program(f"{label}-fsmonitor", "exit 1")))
+            git(checkout, "config", "filter.planted.clean", str(program(f"{label}-clean-filter", "exec cat")))
+            git(checkout, "config", "filter.planted.smudge", str(program(f"{label}-smudge-filter", "exec cat")))
+            git(checkout, "config", "filter.planted.required", "true")
+            (checkout / ".git" / "info").mkdir(exist_ok=True)
+            # A driver with an empty name, which "filter=" selects, and one
+            # whose name is not UTF-8.
+            with (checkout / ".git" / "config").open("ab") as config:
+                config.write(b'[filter ""]\n\tclean = ' + str(program(f"{label}-empty-name-filter", "exec cat")).encode())
+                config.write(b'\n[filter "pl\xe4nted"]\n\tclean = ' + str(program(f"{label}-latin-filter", "exec cat")).encode())
+                config.write(b"\n")
+            (checkout / ".git" / "info" / "attributes").write_bytes(
+                b"* filter=planted\nREADME.md filter=\noperator-keys/keys.json filter=pl\xe4nted\n"
+            )
+            (checkout / ".git" / "hooks").mkdir(exist_ok=True)
+            program(f"{label}-post-index-change", "exit 0").rename(checkout / ".git" / "hooks" / "post-index-change")
+            self.assertEqual(git(checkout, "-c", "core.fsmonitor=false", "status", "--porcelain"), "")
+            # After that status refreshed the index: stat-dirty files make git
+            # status run the clean filter and want to write the index (the hook).
+            for path in checkout.rglob("*"):
+                if ".git" not in path.relative_to(checkout).parts and path.is_file():
+                    os.utime(path, (1, 1))
+        markers.unlink(missing_ok=True)
+
+        result = self.run_publisher()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(markers.exists(), markers.read_text(encoding="utf8") if markers.exists() else "")
+        # The empty graft file disables grafts without git's deprecation hint.
+        self.assertNotIn("grafts", result.stderr)
+
+    def test_partial_clones_fail_closed(self) -> None:
+        for label, checkout in (("Trusted release checkout", self.trusted), ("qbit-guix.sigs checkout", self.guix_sigs)):
+            with self.subTest(checkout=label):
+                git(checkout, "config", "core.repositoryformatversion", "1")
+                git(checkout, "config", "extensions.partialClone", "origin")
+                result = self.run_publisher()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"{label} must not be a partial clone (extensions.partialclone)", result.stderr)
+                self.assertFalse(self.validator_log.exists())
+                # The value is a remote name, so even "false" counts.
+                git(checkout, "config", "extensions.partialClone", "false")
+                result = self.run_publisher()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"{label} must not be a partial clone (extensions.partialclone)", result.stderr)
+                git(checkout, "config", "--unset", "extensions.partialClone")
+                # A promisor remote alone is enough for git to fetch.
+                git(checkout, "config", "remote.origin.promisor", "true")
+                result = self.run_publisher()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"{label} must not be a partial clone (remote.origin.promisor)", result.stderr)
+                self.assertFalse(self.validator_log.exists())
+                git(checkout, "config", "--unset", "remote.origin.promisor")
+
+    def test_guix_sigs_files_come_from_the_pinned_commit(self) -> None:
+        keys = self.guix_sigs / "operator-keys" / "keys.json"
+        committed = keys.read_bytes()
+        # Same size and mtime, other bytes: with core.checkStat=minimal git
+        # status trusts the index's stat data and reports a clean checkout.
+        # (An old mtime keeps the entry from being racily clean.)
+        os.utime(keys, (1, 1))
+        git(self.guix_sigs, "update-index", "--refresh")
+        git(self.guix_sigs, "config", "core.checkStat", "minimal")
+        keys.write_bytes(committed.replace(b"2", b"3"))
+        os.utime(keys, (1, 1))
+        self.assertNotEqual(keys.read_bytes(), committed)
+        self.assertEqual(git(self.guix_sigs, "status", "--porcelain"), "")
+
+        result = self.run_publisher()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        log = self.validator_log.read_text(encoding="utf8")
+        self.assertIn("builder-guix-keys " + hashlib.sha256(committed).hexdigest(), log)
+        self.assertNotIn(f"--guix-sigs-repo {self.guix_sigs.resolve()} ", log)
+
+    def test_guix_sigs_checkout_hides_nothing_that_is_validated(self) -> None:
+        manifest = self.guix_sigs / "operator-keys" / "keys.json"
+        git(self.guix_sigs, "update-index", "--skip-worktree", "operator-keys/keys.json")
+        manifest.write_text('{"schema_version": 3}\n', encoding="utf8")
+        self.assertEqual(git(self.guix_sigs, "status", "--porcelain"), "")
+        result = self.run_publisher()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("qbit-guix.sigs checkout has index flags (assume-unchanged or skip-worktree) on: "
+                      "operator-keys/keys.json", result.stderr)
+        git(self.guix_sigs, "update-index", "--no-skip-worktree", "operator-keys/keys.json")
+        git(self.guix_sigs, "checkout", "--", "operator-keys/keys.json")
+
+        # An ignored file next to the attestations is not validated: the
+        # validators get the pinned commit's files only.
+        planted = self.guix_sigs / TAG.removeprefix("v") / "operator-01" / "all.SHA256SUMS"
+        planted.parent.mkdir(parents=True)
+        planted.write_text("planted\n", encoding="utf8")
+        (self.guix_sigs / ".git" / "info").mkdir(exist_ok=True)
+        (self.guix_sigs / ".git" / "info" / "exclude").write_text("all.SHA256SUMS\n", encoding="utf8")
+        self.assertEqual(git(self.guix_sigs, "status", "--porcelain"), "")
+        result = self.run_publisher()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("builder-guix-files operator-keys/keys.json\n", self.validator_log.read_text(encoding="utf8"))
+
+    def test_submodule_checkouts_are_never_entered(self) -> None:
+        markers = self.root / "programs-run.log"
+        clean = self.root / "planted" / "sub-clean"
+        clean.parent.mkdir()
+        self._write_executable(clean, f"#!/bin/sh\necho sub-clean >> '{markers}'\nexec cat\n")
+        sub = self.trusted / "sub"
+        sub.mkdir()
+        git(sub, "init", "-q")
+        (sub / "file.txt").write_text("submodule\n", encoding="utf8")
+        git(sub, "add", "file.txt")
+        git(sub, "commit", "-q", "-m", "submodule")
+        git(sub, "config", "filter.planted.clean", str(clean))
+        (sub / ".git" / "info").mkdir(exist_ok=True)
+        (sub / ".git" / "info" / "attributes").write_text("* filter=planted\n", encoding="utf8")
+        os.utime(sub / "file.txt", (1, 1))
+        git(self.trusted, "update-index", "--add", "--cacheinfo", f"160000,{git(sub, 'rev-parse', 'HEAD')},sub")
+        markers.unlink(missing_ok=True)
+        result = self.run_publisher()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Trusted release checkout must be clean", result.stderr)
+        self.assertFalse(markers.exists(), "git status ran inside the submodule checkout")
+
+    def test_git_older_than_2_31_is_refused(self) -> None:
+        real_git = shutil.which("git")
+        self._write_executable(
+            self.bin_dir / "git",
+            f'#!/usr/bin/env bash\n[ "$1" != version ] || {{ echo "git version 2.30.2"; exit 0; }}\nexec {real_git} "$@"\n',
+        )
+        result = self.run_publisher()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("git version 2.30.2 is too old: the publisher needs git 2.31 or newer", result.stderr)
+        self.assertFalse(self.validator_log.exists())
 
     def test_shallow_trusted_checkout_fails_closed(self) -> None:
         first = git(self.trusted, "rev-list", "--max-parents=0", "HEAD")
