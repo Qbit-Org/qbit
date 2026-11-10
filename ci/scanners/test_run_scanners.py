@@ -590,7 +590,6 @@ class LatestGitSubtreeMetadataTest(unittest.TestCase):
         self.assertEqual(self.metadata()["git_subtree_split"], "0" * 40)
 
 
-
 class HistoryLogOptsTest(unittest.TestCase):
     """The history secret scan sees merge-only changes once, without duplicates."""
 

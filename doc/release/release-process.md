@@ -72,10 +72,13 @@ must pass `--trusted-release-branch <line>`.
 
 Prerequisites for publishing with this publisher:
 
-- `Qbit-Org/qbit-guix.sigs` `main` must be protected, by its `signed-commits`
-  and merge-commit rulesets from the signed-commit rollout, before the next
-  release, and its rollout ruleset must include the `deletion` and
-  `non_fast_forward` rules. Until then the publisher refuses every release.
+- `Qbit-Org/qbit-guix.sigs` `main` must be protected by a ruleset with the
+  `deletion` and `non_fast_forward` rules; the publisher refuses every release
+  while it is not. Its `public-main` ruleset carries both rules, and its
+  `signed-commits` ruleset requires signed commits; both were applied on
+  2026-11-09, and their templates are in
+  `contrib/guix/repo-templates/qbit-guix.sigs/rulesets/`. A change to
+  `public-main` must keep both rules.
 - Every release-line branch passed as `--trusted-release-branch` must be
   protected by a branch ruleset with the `deletion` and `non_fast_forward`
   rules; a branch without both is refused.

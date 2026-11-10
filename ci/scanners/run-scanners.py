@@ -318,8 +318,8 @@ def history_log_opts(scope: list[str], remerge_diff: bool = True) -> str:
 def shallow_history_gap(source: Path, scope: list[str]) -> str:
     """Return a coverage gap when a shallow boundary cuts the scanned history, else "".
 
-    Only a boundary inside the scope cuts the walk. The libbitcoinpqc subtree
-    check can fetch an upstream tag with --depth=1, which marks the checkout
+    Only a boundary inside the scope cuts the walk. A --depth fetch of another
+    repository's ref, such as an upstream release tag, marks the checkout
     shallow at a commit no scanned ref reaches."""
     exit_code, stdout, _stderr = git_command(source, "rev-parse", "--is-shallow-repository")
     if exit_code == 0 and stdout.strip() == "false":

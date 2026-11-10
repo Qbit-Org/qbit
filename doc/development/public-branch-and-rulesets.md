@@ -367,10 +367,19 @@ lists what the operator checks before touching.
 Only a standard two-commit git-subtree update keeps its commits: the
 "Squashed '<prefix>/' changes" commit and the subtree merge. That shape is rare;
 it applies to the subtrees inherited from Bitcoin Core, which have not been
-updated since the fork. Both commits are signed when they are created, with
-`git subtree pull --squash -S`, so the update needs two touches, and it lands
-with `squash-sign merge --keep-commits`, which accepts it only when a person's
-OpenPGP key signed both commits.
+updated since the fork. Both commits must be signed when they are created, so
+the update needs two touches:
+
+1. Check that `git subtree -h` lists `-S, --[no-]gpg-sign`. Older Git, such as
+   2.43, lacks it and fails with `unknown switch S`; upgrade Git if it is
+   missing.
+2. Run `git subtree pull --squash -S --prefix=<prefix> <repository> <ref>`.
+3. Confirm that both new commits are signed with `git log --show-signature -2`.
+
+`git subtree` makes the squash commit with `git commit-tree`, which ignores
+`commit.gpgsign`, so without `-S` that commit is created unsigned and no error
+is shown. The update lands with `squash-sign merge --keep-commits`, which
+accepts it only when a person's OpenPGP key signed both commits.
 
 Contributors sign their own commits, and a signature from any key registered
 on their GitHub account that GitHub verifies counts. `squash-sign`'s own
