@@ -164,12 +164,14 @@ script must therefore keep the command line the workflow uses (`target --base
 --head --work`, run with `-I -B -X pycache_prefix`). The gate refuses a
 version of its workflow that holds anything but the keys it needs (so no
 condition, ignored failure, matrix, container, services, other shell or
-defaults), sets environment variables other than the pull request's values,
-takes the repository's default token permissions, uses any action but
+defaults), runs anywhere but `ubuntu-24.04`, triggers on anything but
+`pull_request_target` with the expected event types, asks for any token
+permission but `contents: read`, sets a step's `env:` to anything but the
+gate's inputs from the pull request event, uses any action but
 `actions/checkout` pinned to a commit, or checks out anything but the base
-commit without persisted credentials; what its `run:` steps do is for the
-signers who approve the change to read, as is that the pinned commit is
-`actions/checkout`'s own.
+commit without persisted credentials. What its `run:` steps do, including
+anything they write to `$GITHUB_ENV`, is for the signers who approve the
+change to read, as is that the pinned commit is `actions/checkout`'s own.
 
 The check is named for its base, `Key Policy Gate (main)` or
 `Key Policy Gate (1.x.x)`, and each branch's ruleset requires its own name.

@@ -690,9 +690,13 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
                 self.commit("a gate directory as a symlink")
                 self.assert_target_refused(f"{path} is not a regular file (mode 120000)")
 
+    def test_the_gates_own_workflow_passes_its_own_check(self) -> None:
+        key_policy_gate.check_gate_workflow(key_policy_gate.GATE_WORKFLOW, TARGET_WORKFLOW.read_bytes())
+
     def test_target_checks_the_gates_own_workflow(self) -> None:
         good = (
-            "on:\n  pull_request_target:\n    types: [opened]\npermissions:\n  contents: read\n"
+            "on:\n  pull_request_target:\n    types: [opened, synchronize, reopened, edited, ready_for_review]\n"
+            "permissions:\n  contents: read\n"
             "jobs:\n  key-policy-gate:\n    name: Key Policy Gate (${{ github.event.pull_request.base.ref }})\n    runs-on: ubuntu-24.04\n"
             "    steps:\n      - uses: actions/checkout@0000000000000000000000000000000000000000\n"
             "        with:\n          ref: ${{ github.event.pull_request.base.sha }}\n          persist-credentials: false\n"
@@ -715,13 +719,28 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
             "no checkout": (good.replace("      - uses: actions/checkout@0000000000000000000000000000000000000000\n        with:\n          ref: ${{ github.event.pull_request.base.sha }}\n          persist-credentials: false\n", ""), "must check out exactly the pull request's base commit"),
             "two checkouts": (good.replace("      - name: Gate\n", "      - uses: actions/checkout@0000000000000000000000000000000000000000\n        with:\n          ref: ${{ github.event.pull_request.base.sha }}\n          persist-credentials: false\n      - name: Gate\n"), "must check out exactly the pull request's base commit"),
             "a moving checkout ref": (good.replace("actions/checkout@0000000000000000000000000000000000000000", "actions/checkout@main"), "pinned to a commit"),
-            "persisted credentials": (good.replace("          persist-credentials: false\n", ""), "without persisting credentials"),
-            "a checkout of another repository": (good.replace("          persist-credentials: false\n", "          persist-credentials: false\n          repository: someone/else\n"), "without persisting credentials"),
+            "persisted credentials": (good.replace("          persist-credentials: false\n", ""), "must not persist credentials"),
+            "a checkout of another repository": (good.replace("          persist-credentials: false\n", "          persist-credentials: false\n          repository: someone/else\n"), "its checkout may set only"),
             "checkout settings as text": (good.replace("        with:\n          ref: ${{ github.event.pull_request.base.sha }}\n          persist-credentials: false\n", "        with: x\n"), "must check out exactly the pull request's base commit"),
             "another shell by default": (good.replace("jobs:\n", "defaults:\n  run:\n    shell: 'true {0}'\njobs:\n"), "its workflow may not use defaults"),
             "a job in a container": (good.replace("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-24.04\n    container: someone/image\n"), "its job may not use container"),
             "a step with another shell": (good.replace("      - name: Gate\n", "      - name: Gate\n        shell: 'true {0}'\n"), "a step may not use shell"),
-            "a step that sets BASH_ENV": (good.replace("          BASE_SHA: ${{ github.event.pull_request.base.sha }}\n", "          BASE_SHA: ${{ github.event.pull_request.base.sha }}\n          BASH_ENV: /tmp/x\n"), "a step's env may set only the pull request's values"),
+            "a step that sets BASH_ENV": (good.replace("          BASE_SHA: ${{ github.event.pull_request.base.sha }}\n", "          BASE_SHA: ${{ github.event.pull_request.base.sha }}\n          BASH_ENV: /tmp/x\n"), "a step's env may set only the gate's inputs"),
+            "the base taken from the head": (good.replace("          BASE_SHA: ${{ github.event.pull_request.base.sha }}\n", "          BASE_SHA: ${{ github.event.pull_request.head.sha }}\n"), "a step's env may set only the gate's inputs"),
+            "a token in a step's env": (good.replace("          BASE_SHA: ${{ github.event.pull_request.base.sha }}\n", "          BASE_SHA: ${{ github.event.pull_request.base.sha }}\n          PR_TOKEN: ${{ github.token }}\n"), "a step's env may set only the gate's inputs"),
+            "env as a list": (good.replace("        env:\n          BASE_SHA: ${{ github.event.pull_request.base.sha }}\n", "        env: []\n"), "a step's env must be a mapping"),
+            "another runner": (good.replace("    runs-on: ubuntu-24.04\n", "    runs-on: self-hosted\n"), "must run on ubuntu-24.04"),
+            "a runner the pull request picks": (good.replace("    runs-on: ubuntu-24.04\n", "    runs-on: ${{ github.event.pull_request.head.ref }}\n"), "must run on ubuntu-24.04"),
+            "write permissions": (good.replace("  contents: read\n", "  contents: write\n", 1), "may only read contents"),
+            "only some event types": (good.replace("[opened, synchronize, reopened, edited, ready_for_review]", "[opened]"), "may run only on pull_request_target"),
+            "a shared concurrency group": (good.replace("jobs:\n", "concurrency:\n  group: shared\njobs:\n"), "its concurrency must be"),
+            "the expected concurrency": (good.replace("jobs:\n", "concurrency:\n  group: key-policy-gate-${{ github.event.pull_request.number }}\n  cancel-in-progress: true\njobs:\n"), None),
+            "no time to run": (good.replace("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-24.04\n    timeout-minutes: 0\n"), "timeout-minutes must be"),
+            "a pin in capitals": (good.replace("actions/checkout@0000000000000000000000000000000000000000", "actions/checkout@" + "A" * 40), "pinned to a commit"),
+            "a pinned checkout spelled otherwise": (good.replace("actions/checkout@0000000000000000000000000000000000000000", "Actions/Checkout@0000000000000000000000000000000000000000"), None),
+            "a fullwidth action": (good.replace("actions/checkout@0000000000000000000000000000000000000000", "\uff41ctions/checkout@0000000000000000000000000000000000000000"), "pinned to a commit"),
+            "services": (good.replace("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-24.04\n    services: {db: {image: x}}\n"), "its job may not use services"),
+            "a step id": (good.replace("      - name: Gate\n", "      - name: Gate\n        id: gate\n"), "a step may not use id"),
             "permissions on the job": (good.replace("permissions:\n  contents: read\n", "").replace("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-24.04\n    permissions:\n      contents: read\n", 1), None),
             "a checkout spelled otherwise": (good.replace("      - name: Gate\n", "      - uses: Actions/Checkout@v5\n        with:\n          ref: ${{ github.event.pull_request.head.sha }}\n      - name: Gate\n"), "pinned to a commit"),
             "another action": (good.replace("      - name: Gate\n", "      - uses: ./.github/actions/setup\n      - name: Gate\n"), "may use no action but actions/checkout"),

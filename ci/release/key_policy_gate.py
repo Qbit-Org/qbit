@@ -126,9 +126,25 @@ GATE_CHECK_NAME = "Key Policy Gate"
 GATE_BASES = ("main", "1.x.x")
 GATE_CHECK_NAMES = (GATE_CHECK_NAME, *(f"{GATE_CHECK_NAME} ({base})" for base in GATE_BASES))
 GATE_JOB_NAME = f"{GATE_CHECK_NAME} (${{{{ github.event.pull_request.base.ref }}}})"
-# The environment the gate's workflow steps may set: values from the pull
-# request event, never variables that change how a shell or program runs.
-GATE_STEP_ENV_RE = re.compile(r"(?:BASE|HEAD|PR|REPOSITORY)_[A-Z_]+")
+# What the gate's own workflow may hold (see check_gate_workflow): the keys
+# at each level, and the one value each checked key may have.
+GATE_WORKFLOW_KEYS = {"name", "on", "permissions", "concurrency", "jobs"}
+GATE_JOB_KEYS = {"name", "runs-on", "timeout-minutes", "permissions", "steps"}
+GATE_STEP_KEYS = {"name", "env", "run", "uses", "with"}
+GATE_CHECKOUT_KEYS = {"ref", "fetch-depth", "persist-credentials"}
+GATE_TRIGGER = {"pull_request_target": {"types": ["opened", "synchronize", "reopened", "edited", "ready_for_review"]}}
+GATE_CONCURRENCY = {"group": "key-policy-gate-${{ github.event.pull_request.number }}", "cancel-in-progress": "true"}
+GATE_PERMISSIONS = {"contents": "read"}
+GATE_RUNNER = "ubuntu-24.04"
+GATE_BASE_COMMIT = "${{ github.event.pull_request.base.sha }}"
+# A step's env may set only these names, each to exactly this value.
+GATE_STEP_ENV = {
+    "BASE_REF": "${{ github.event.pull_request.base.ref }}",
+    "BASE_SHA": GATE_BASE_COMMIT,
+    "HEAD_SHA": "${{ github.event.pull_request.head.sha }}",
+    "PR_NUMBER": "${{ github.event.pull_request.number }}",
+    "REPOSITORY_URL": "${{ github.server_url }}/${{ github.repository }}",
+}
 GATE_WORKFLOW = ".github/workflows/key-policy-gate.yml"
 WORKFLOW_DIR = ".github/workflows/"
 # The gate's own code and its description: a change to any file under these
@@ -657,8 +673,8 @@ def can_post_checks(permissions) -> bool:
     return True
 
 
-# Text YAML 1.2 (or 1.1) reads as a number: GitHub renders such a matrix
-# value as it prints the number, not as written.
+# Text a YAML reader may take as a number: GitHub renders such a matrix value
+# as it prints the number, not as written.
 NUMBER_RE = re.compile(
     r"[-+]?(?:0[xob][0-9a-f_]+|(?:[0-9][0-9_]*\.?[0-9_]*|\.[0-9][0-9_]*)(?:e[-+]?[0-9]+)?|\.(?:inf|nan))",
     re.IGNORECASE,
@@ -666,9 +682,11 @@ NUMBER_RE = re.compile(
 
 
 def is_number(text: str) -> bool:
-    """Whether YAML 1.2 could read `text` as a number (decimal, 0x/0o/0b, exponent, .inf, .nan).
+    """Whether a YAML reader may take `text` as a number.
 
-    PyYAML already builds YAML 1.1's other forms, such as 1:30, as numbers.
+    This covers YAML 1.2's core forms (decimal, exponent, 0x, 0o, .inf, .nan)
+    and, to be safe, signed hex and 0b; PyYAML already builds YAML 1.1's
+    other forms, such as 1:30, as numbers.
     """
 
     return bool(NUMBER_RE.fullmatch(text.strip()))
@@ -761,33 +779,47 @@ def pieces_reach(pieces: list[list[str] | None], target: str) -> bool:
 
 
 def check_gate_workflow(path: str, data: bytes) -> None:
-    """key-policy-gate.yml runs only on pull_request_target, as one job named like the check, posting no checks itself."""
+    """The gate's own workflow may hold only what it needs to run the gate, and nothing that could skip it.
+
+    It runs on pull_request_target with the expected event types, as one job
+    named GATE_JOB_NAME on GATE_RUNNER with only contents: read. Each level
+    holds only the keys in GATE_WORKFLOW_KEYS, GATE_JOB_KEYS and
+    GATE_STEP_KEYS, so no condition, ignored failure, matrix, container,
+    services, defaults or other shell. A step's env sets only GATE_STEP_ENV's
+    names to their exact values, and the one action is actions/checkout
+    pinned to a commit, checking out the base commit without persisting
+    credentials. What its run: steps do is for the signers to review.
+    """
 
     workflow = read_workflow(path, data)
     if not isinstance(workflow, dict):
         raise GateError(f"{path} is not a workflow mapping")
-    triggers = workflow.get("on")
-    names = list(triggers) if isinstance(triggers, dict) else triggers if isinstance(triggers, list) else [triggers]
-    if names != ["pull_request_target"]:
-        raise GateError(f"{path} may run only on pull_request_target, not {names!r}")
+    if workflow.get("on") != GATE_TRIGGER:
+        raise GateError(f"{path} may run only on pull_request_target, for exactly {GATE_TRIGGER!r}")
     jobs = workflow.get("jobs")
     if not isinstance(jobs, dict) or len(jobs) != 1:
         raise GateError(f"{path} must hold exactly one job")
     job = next(iter(jobs.values()))
     if not isinstance(job, dict) or job.get("name") != GATE_JOB_NAME:
         raise GateError(f"{path}: its job must be named exactly '{GATE_JOB_NAME}'")
-    # Only these keys: anything else (if, continue-on-error, strategy, defaults
-    # with another shell, a container or services, ...) could skip the gate,
-    # ignore its failure or run it somewhere else.
-    allowed = {
-        "workflow": {"name", "on", "permissions", "concurrency", "jobs"},
-        "job": {"name", "runs-on", "timeout-minutes", "permissions", "steps"},
-        "step": {"name", "env", "run", "uses", "with"},
-    }
-    for kind, mapping in (("workflow", workflow), ("job", job)):
-        extra = sorted(str(key) for key in mapping if key not in allowed[kind])
+    for kind, mapping, allowed in (("workflow", workflow, GATE_WORKFLOW_KEYS), ("job", job, GATE_JOB_KEYS)):
+        extra = sorted(str(key) for key in mapping if key not in allowed)
         if extra:
             raise GateError(f"{path}: its {kind} may not use {', '.join(extra)}")
+    if job.get("runs-on") != GATE_RUNNER:
+        raise GateError(f"{path}: its job must run on {GATE_RUNNER}")
+    if "concurrency" in workflow and workflow["concurrency"] != GATE_CONCURRENCY:
+        raise GateError(f"{path}: its concurrency must be {GATE_CONCURRENCY!r}")
+    timeout = job.get("timeout-minutes", 20)
+    if not isinstance(timeout, int) or isinstance(timeout, bool) or not 1 <= timeout <= 360:
+        raise GateError(f"{path}: its job's timeout-minutes must be a whole number from 1 to 360")
+    if can_post_checks(workflow.get("permissions")) or can_post_checks(job.get("permissions")):
+        raise GateError(f"{path} may not ask to post checks or statuses: the job's own result is the check")
+    if not declares(workflow.get("permissions")) and not declares(job.get("permissions")):
+        raise GateError(f"{path} must declare its token permissions")
+    for permissions in (workflow.get("permissions"), job.get("permissions")):
+        if declares(permissions) and permissions != GATE_PERMISSIONS:
+            raise GateError(f"{path}: its token may only read contents ({GATE_PERMISSIONS!r})")
     steps = job.get("steps")
     if not isinstance(steps, list) or not steps:
         raise GateError(f"{path}: its job must run steps")
@@ -795,36 +827,35 @@ def check_gate_workflow(path: str, data: bytes) -> None:
     for step in steps:
         if not isinstance(step, dict):
             raise GateError(f"{path}: a step is not a mapping")
-        extra = sorted(str(key) for key in step if key not in allowed["step"])
+        extra = sorted(str(key) for key in step if key not in GATE_STEP_KEYS)
         if extra:
             raise GateError(f"{path}: a step may not use {', '.join(extra)}")
-        env = step.get("env") or {}
-        if not isinstance(env, dict) or any(not GATE_STEP_ENV_RE.fullmatch(str(name)) for name in env):
-            raise GateError(f"{path}: a step's env may set only the pull request's values ({GATE_STEP_ENV_RE.pattern})")
+        env = step.get("env")
+        if env is not None and not (isinstance(env, str) and squeezed(env) in {"", "~", "null"}):
+            if not isinstance(env, dict):
+                raise GateError(f"{path}: a step's env must be a mapping")
+            for name, value in env.items():
+                if GATE_STEP_ENV.get(name) != value:
+                    raise GateError(
+                        f"{path}: a step's env may set only the gate's inputs, each to its value from the "
+                        f"pull request event, not {name!r}: {value!r}"
+                    )
         if "uses" in step:
             # GitHub reads owner and repository names case-insensitively; a
             # moving ref could change what runs without a signer seeing it.
-            if not re.fullmatch(r"actions/checkout@[0-9a-f]{40}", fold(str(step["uses"]))):
+            action, _at, ref = str(step["uses"]).partition("@")
+            if not (action.isascii() and action.lower() == "actions/checkout" and re.fullmatch(r"[0-9a-f]{40}", ref)):
                 raise GateError(
                     f"{path}: its steps may use no action but actions/checkout pinned to a commit, not {step['uses']!r}"
                 )
             checkouts.append(step)
-    base_commit = "${{ github.event.pull_request.base.sha }}"
     settings = checkouts[0].get("with") if len(checkouts) == 1 else None
-    if (
-        not isinstance(settings, dict)
-        or settings.get("ref") != base_commit
-        or str(settings.get("persist-credentials")).lower() != "false"
-        or not set(settings) <= {"ref", "fetch-depth", "persist-credentials"}
-    ):
-        raise GateError(
-            f"{path}: its job must check out exactly the pull request's base commit ({base_commit}), "
-            "without persisting credentials"
-        )
-    if can_post_checks(workflow.get("permissions")) or can_post_checks(job.get("permissions")):
-        raise GateError(f"{path} may not ask to post checks or statuses: the job's own result is the check")
-    if not declares(workflow.get("permissions")) and not declares(job.get("permissions")):
-        raise GateError(f"{path} must declare its token permissions")
+    if not isinstance(settings, dict) or settings.get("ref") != GATE_BASE_COMMIT:
+        raise GateError(f"{path}: its job must check out exactly the pull request's base commit ({GATE_BASE_COMMIT})")
+    if not set(settings) <= GATE_CHECKOUT_KEYS:
+        raise GateError(f"{path}: its checkout may set only {', '.join(sorted(GATE_CHECKOUT_KEYS))}")
+    if str(settings.get("persist-credentials")).lower() != "false":
+        raise GateError(f"{path}: its checkout must not persist credentials (persist-credentials: false)")
 
 
 def check_gate_check_name(head: str, changed: list[str]) -> None:
