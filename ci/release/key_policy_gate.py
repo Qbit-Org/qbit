@@ -126,6 +126,9 @@ GATE_CHECK_NAME = "Key Policy Gate"
 GATE_BASES = ("main", "1.x.x")
 GATE_CHECK_NAMES = (GATE_CHECK_NAME, *(f"{GATE_CHECK_NAME} ({base})" for base in GATE_BASES))
 GATE_JOB_NAME = f"{GATE_CHECK_NAME} (${{{{ github.event.pull_request.base.ref }}}})"
+# The environment the gate's workflow steps may set: values from the pull
+# request event, never variables that change how a shell or program runs.
+GATE_STEP_ENV_RE = re.compile(r"(?:BASE|HEAD|PR|REPOSITORY)_[A-Z_]+")
 GATE_WORKFLOW = ".github/workflows/key-policy-gate.yml"
 WORKFLOW_DIR = ".github/workflows/"
 # The gate's own code and its description: a change to any file under these
@@ -562,7 +565,7 @@ def refuse_repeated_keys(path: str, root) -> None:
 
 
 def read_workflow(path: str, data: bytes):
-    """A workflow parsed with workflow_loader, refusing repeated keys and tagged sets or pairs."""
+    """A workflow parsed with workflow_loader, refusing explicit tags, repeated keys and odd characters."""
 
     yaml, loader_class = workflow_loader()
     try:
@@ -595,10 +598,10 @@ def read_workflow(path: str, data: bytes):
             loader.dispose()
     except GateError:
         raise
-    except Exception as exc:  # PyYAML raises more than YAMLError for tagged scalars it cannot build
+    except Exception as exc:  # PyYAML raises more than YAMLError for input it cannot build
         raise GateError(f"{path} cannot be read as YAML: {type(exc).__name__}: {exc}") from exc
-    # Tags such as !!set, !!omap, !!pairs, !!binary and !!timestamp build values
-    # GitHub reads otherwise: only text, numbers, mappings and sequences pass.
+    # A backstop to the tag refusal above: only text, numbers, mappings and
+    # sequences pass (!!set, !!omap, !!pairs, !!binary, !!timestamp build others).
     seen: set[int] = set()
     pending = [document]
     while pending:
@@ -663,7 +666,10 @@ NUMBER_RE = re.compile(
 
 
 def is_number(text: str) -> bool:
-    """Whether YAML 1.2 (or 1.1) could read `text` as a number."""
+    """Whether YAML 1.2 could read `text` as a number (decimal, 0x/0o/0b, exponent, .inf, .nan).
+
+    PyYAML already builds YAML 1.1's other forms, such as 1:30, as numbers.
+    """
 
     return bool(NUMBER_RE.fullmatch(text.strip()))
 
@@ -770,10 +776,18 @@ def check_gate_workflow(path: str, data: bytes) -> None:
     job = next(iter(jobs.values()))
     if not isinstance(job, dict) or job.get("name") != GATE_JOB_NAME:
         raise GateError(f"{path}: its job must be named exactly '{GATE_JOB_NAME}'")
-    # A skipped job or step, or one whose failure is ignored, would pass.
-    for key in ("if", "continue-on-error", "strategy", "uses", "needs"):
-        if key in job:
-            raise GateError(f"{path}: its job may not use {key}")
+    # Only these keys: anything else (if, continue-on-error, strategy, defaults
+    # with another shell, a container or services, ...) could skip the gate,
+    # ignore its failure or run it somewhere else.
+    allowed = {
+        "workflow": {"name", "on", "permissions", "concurrency", "jobs"},
+        "job": {"name", "runs-on", "timeout-minutes", "permissions", "steps"},
+        "step": {"name", "env", "run", "uses", "with"},
+    }
+    for kind, mapping in (("workflow", workflow), ("job", job)):
+        extra = sorted(str(key) for key in mapping if key not in allowed[kind])
+        if extra:
+            raise GateError(f"{path}: its {kind} may not use {', '.join(extra)}")
     steps = job.get("steps")
     if not isinstance(steps, list) or not steps:
         raise GateError(f"{path}: its job must run steps")
@@ -781,17 +795,32 @@ def check_gate_workflow(path: str, data: bytes) -> None:
     for step in steps:
         if not isinstance(step, dict):
             raise GateError(f"{path}: a step is not a mapping")
-        for key in ("if", "continue-on-error"):
-            if key in step:
-                raise GateError(f"{path}: a step may not use {key}")
+        extra = sorted(str(key) for key in step if key not in allowed["step"])
+        if extra:
+            raise GateError(f"{path}: a step may not use {', '.join(extra)}")
+        env = step.get("env") or {}
+        if not isinstance(env, dict) or any(not GATE_STEP_ENV_RE.fullmatch(str(name)) for name in env):
+            raise GateError(f"{path}: a step's env may set only the pull request's values ({GATE_STEP_ENV_RE.pattern})")
         if "uses" in step:
-            # GitHub reads owner and repository names case-insensitively.
-            if not fold(str(step["uses"])).startswith("actions/checkout@"):
-                raise GateError(f"{path}: its steps may use no action but actions/checkout, not {step['uses']!r}")
+            # GitHub reads owner and repository names case-insensitively; a
+            # moving ref could change what runs without a signer seeing it.
+            if not re.fullmatch(r"actions/checkout@[0-9a-f]{40}", fold(str(step["uses"]))):
+                raise GateError(
+                    f"{path}: its steps may use no action but actions/checkout pinned to a commit, not {step['uses']!r}"
+                )
             checkouts.append(step)
     base_commit = "${{ github.event.pull_request.base.sha }}"
-    if len(checkouts) != 1 or (checkouts[0].get("with") or {}).get("ref") != base_commit:
-        raise GateError(f"{path}: its job must check out exactly the pull request's base commit ({base_commit})")
+    settings = checkouts[0].get("with") if len(checkouts) == 1 else None
+    if (
+        not isinstance(settings, dict)
+        or settings.get("ref") != base_commit
+        or str(settings.get("persist-credentials")).lower() != "false"
+        or not set(settings) <= {"ref", "fetch-depth", "persist-credentials"}
+    ):
+        raise GateError(
+            f"{path}: its job must check out exactly the pull request's base commit ({base_commit}), "
+            "without persisting credentials"
+        )
     if can_post_checks(workflow.get("permissions")) or can_post_checks(job.get("permissions")):
         raise GateError(f"{path} may not ask to post checks or statuses: the job's own result is the check")
     if not declares(workflow.get("permissions")) and not declares(job.get("permissions")):

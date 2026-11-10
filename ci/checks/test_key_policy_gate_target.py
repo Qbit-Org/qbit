@@ -460,7 +460,8 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
             "binary matrix value": ("permissions: {}\njobs:\n  other:\n    name: ${{ matrix.a }}\n    strategy:\n      matrix:\n        a: [!!binary S2V5IFBvbGljeSBHYXRl]\n", "uses an explicit YAML tag"),
             "binary permission": ("jobs:\n  other:\n    permissions:\n      checks: !!binary d3JpdGU=\n", "uses an explicit YAML tag"),
             "null tag": ("permissions: {}\njobs:\n  other:\n    name: !!null Key Policy Gate (main)\n", "uses an explicit YAML tag"),
-            "str tag on a permission": ("jobs:\n  other:\n    permissions: {checks: !!null write}\n", "uses an explicit YAML tag"),
+            "null tag on a permission": ("jobs:\n  other:\n    permissions: {checks: !!null write}\n", "uses an explicit YAML tag"),
+            "str tag": ("permissions: {}\njobs:\n  other:\n    name: !!str Other\n", "uses an explicit YAML tag"),
             "tagged scalar": ("permissions: {}\njobs:\n  other:\n    name: !!bool Key Policy Gate\n", "uses an explicit YAML tag"),
             "tagged timestamp": ("permissions: {}\njobs:\n  other:\n    name: !!timestamp foo\n", "uses an explicit YAML tag"),
             "line separator": ("permissions: {}\njobs:\n  other:\n    runs-on: x #\u2028    name: Key Policy Gate\n", "holds a control or separator character"),
@@ -489,8 +490,9 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
             "env:\n  CUTOFF: 2026-01-01\n  ODD: 2001-13-45\n  EQUALS: =\n"
             "jobs:\n  build:\n    name: Build ${{ matrix.name }} (${{ matrix.os }})\n"
             "    strategy:\n      matrix:\n        name: [Gate keeper, Lint]\n        os: [linux]\n"
-            "  plain:\n    name: Key Policy ${{ matrix.s }}\n    strategy:\n      matrix:\n        s: ['', '-', '_', e1, lint]\n"
             "    steps:\n      - run: echo 'the Key Policy Gate check is required'\n      - uses: ./.github/actions/setup\n"
+            "  plain:\n    name: Key Policy ${{ matrix.s }}\n    strategy:\n      matrix:\n        s: ['', '-', '_', e1, lint]\n"
+            "    steps:\n      - run: echo plain\n"
             "  docs:\n    needs: build\n    name: docs (${{ matrix.id }})\n"
             "    strategy:\n      matrix: ${{ fromJSON(needs.build.outputs.matrix) }}\n",
             encoding="utf8",
@@ -693,8 +695,8 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
             "on:\n  pull_request_target:\n    types: [opened]\npermissions:\n  contents: read\n"
             "jobs:\n  key-policy-gate:\n    name: Key Policy Gate (${{ github.event.pull_request.base.ref }})\n    runs-on: ubuntu-24.04\n"
             "    steps:\n      - uses: actions/checkout@0000000000000000000000000000000000000000\n"
-            "        with:\n          ref: ${{ github.event.pull_request.base.sha }}\n"
-            "      - name: Gate\n        run: echo gate\n"
+            "        with:\n          ref: ${{ github.event.pull_request.base.sha }}\n          persist-credentials: false\n"
+            "      - name: Gate\n        env:\n          BASE_SHA: ${{ github.event.pull_request.base.sha }}\n        run: echo gate\n"
         )
         cases = {
             "pull request trigger": (good.replace("pull_request_target:", "pull_request:"), "may run only on pull_request_target"),
@@ -710,9 +712,18 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
             "a job strategy": (good.replace("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-24.04\n    strategy: {matrix: {a: [1]}}\n"), "its job may not use strategy"),
             "a job that needs another": (good.replace("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-24.04\n    needs: [other]\n"), "its job may not use needs"),
             "a reusable workflow job": (good.replace("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-24.04\n    uses: ./.github/workflows/other.yml\n"), "its job may not use uses"),
-            "no checkout": (good.replace("      - uses: actions/checkout@0000000000000000000000000000000000000000\n        with:\n          ref: ${{ github.event.pull_request.base.sha }}\n", ""), "must check out exactly the pull request's base commit"),
-            "two checkouts": (good.replace("      - name: Gate\n", "      - uses: actions/checkout@0000000000000000000000000000000000000000\n        with:\n          ref: ${{ github.event.pull_request.base.sha }}\n      - name: Gate\n"), "must check out exactly the pull request's base commit"),
-            "a checkout spelled otherwise": (good.replace("      - name: Gate\n", "      - uses: Actions/Checkout@v5\n        with:\n          ref: ${{ github.event.pull_request.head.sha }}\n      - name: Gate\n"), "must check out exactly the pull request's base commit"),
+            "no checkout": (good.replace("      - uses: actions/checkout@0000000000000000000000000000000000000000\n        with:\n          ref: ${{ github.event.pull_request.base.sha }}\n          persist-credentials: false\n", ""), "must check out exactly the pull request's base commit"),
+            "two checkouts": (good.replace("      - name: Gate\n", "      - uses: actions/checkout@0000000000000000000000000000000000000000\n        with:\n          ref: ${{ github.event.pull_request.base.sha }}\n          persist-credentials: false\n      - name: Gate\n"), "must check out exactly the pull request's base commit"),
+            "a moving checkout ref": (good.replace("actions/checkout@0000000000000000000000000000000000000000", "actions/checkout@main"), "pinned to a commit"),
+            "persisted credentials": (good.replace("          persist-credentials: false\n", ""), "without persisting credentials"),
+            "a checkout of another repository": (good.replace("          persist-credentials: false\n", "          persist-credentials: false\n          repository: someone/else\n"), "without persisting credentials"),
+            "checkout settings as text": (good.replace("        with:\n          ref: ${{ github.event.pull_request.base.sha }}\n          persist-credentials: false\n", "        with: x\n"), "must check out exactly the pull request's base commit"),
+            "another shell by default": (good.replace("jobs:\n", "defaults:\n  run:\n    shell: 'true {0}'\njobs:\n"), "its workflow may not use defaults"),
+            "a job in a container": (good.replace("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-24.04\n    container: someone/image\n"), "its job may not use container"),
+            "a step with another shell": (good.replace("      - name: Gate\n", "      - name: Gate\n        shell: 'true {0}'\n"), "a step may not use shell"),
+            "a step that sets BASH_ENV": (good.replace("          BASE_SHA: ${{ github.event.pull_request.base.sha }}\n", "          BASE_SHA: ${{ github.event.pull_request.base.sha }}\n          BASH_ENV: /tmp/x\n"), "a step's env may set only the pull request's values"),
+            "permissions on the job": (good.replace("permissions:\n  contents: read\n", "").replace("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-24.04\n    permissions:\n      contents: read\n", 1), None),
+            "a checkout spelled otherwise": (good.replace("      - name: Gate\n", "      - uses: Actions/Checkout@v5\n        with:\n          ref: ${{ github.event.pull_request.head.sha }}\n      - name: Gate\n"), "pinned to a commit"),
             "another action": (good.replace("      - name: Gate\n", "      - uses: ./.github/actions/setup\n      - name: Gate\n"), "may use no action but actions/checkout"),
             "default permissions": (good.replace("permissions:\n  contents: read\n", ""), "must declare its token permissions"),
             "the gate's workflow": (good, None),

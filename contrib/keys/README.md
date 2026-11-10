@@ -162,10 +162,14 @@ The workflow itself runs as the default branch holds it: an approved change to
 it on `1.x.x` takes effect only when `main` has it. Every release line's gate
 script must therefore keep the command line the workflow uses (`target --base
 --head --work`, run with `-I -B -X pycache_prefix`). The gate refuses a
-version of its workflow that could skip its job or a step, ignore a failure,
-take the repository's default token permissions, use any action but
-`actions/checkout`, or check out anything with it but the base commit; what
-its `run:` steps do is for the signers who approve the change to read.
+version of its workflow that holds anything but the keys it needs (so no
+condition, ignored failure, matrix, container, services, other shell or
+defaults), sets environment variables other than the pull request's values,
+takes the repository's default token permissions, uses any action but
+`actions/checkout` pinned to a commit, or checks out anything but the base
+commit without persisted credentials; what its `run:` steps do is for the
+signers who approve the change to read, as is that the pinned commit is
+`actions/checkout`'s own.
 
 The check is named for its base, `Key Policy Gate (main)` or
 `Key Policy Gate (1.x.x)`, and each branch's ruleset requires its own name.
@@ -201,8 +205,10 @@ with the base branch:
   `test/lint/lint-files.py` checks the same for tracked files.
 
 Only `key-policy-gate.yml` may name a job `Key Policy Gate`. On a gate change
-the gate parses every workflow with the distribution's PyYAML (refusing
-repeated keys) and refuses a workflow or job name that can evaluate to the
+the gate parses every workflow with the distribution's PyYAML, refusing
+repeated keys, explicit YAML tags (`!!str` and the like) and control or
+separator characters in any of them, and refuses a workflow or job name that
+can evaluate to the
 check's name, compared case-insensitively and ignoring whitespace. An
 expression in a name may only read a matrix value, such as
 `${{ matrix.name }}`: a value the job's strategy gives as text is put in
@@ -284,8 +290,10 @@ The gate does not check the pull request that adds it.
 Once armed, each protected branch keeps its own gate approvals, and a pull
 request may add only its own approvals directory. A pull request that carries
 one branch's approvals into the other, such as a merge of `1.x.x` into `main`,
-cannot pass the gate; such a sync is an administrator's fast-forward, as in
-step 3.
+cannot pass the gate. Step 3's fast-forward works only while `main` has no
+commit of its own; after that, a gate change reaches the other branch as a
+pull request that carries the change without the first branch's approvals
+directory, approved again for that branch.
 
 Release validators count a signature only when gpg's GOODSIG and VALIDSIG
 agree and gpg reports no revoked or expired key or other error for it
