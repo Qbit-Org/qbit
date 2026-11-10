@@ -9,10 +9,11 @@ policy  checks contrib/keys/operator-keys at --head against --base: both trees
         are read from git objects, then this directory's
         validate_key_metadata.py and the base's own copy must accept the change.
 target  is the base-only job (pull_request_target): run from a checkout of the
-        base, it finds the paths --head changes against its merge base with
-        --base, runs `policy` for a policy change, and requires approvals for a
-        change to the gate's own code (see is_gate_code: every file under
-        GATE_CODE_PREFIXES, GATE_CODE_PATHS, and every .gitattributes).
+        base, it requires --head to contain --base, finds the paths --head
+        changes against --base, runs `policy` for a policy change, and
+        requires approvals for a change to the gate's own code (see
+        is_gate_code: every file under GATE_CODE_PREFIXES, GATE_CODE_PATHS,
+        and every .gitattributes).
 
 Nothing from --head is executed or imported: its files are written out as data
 for the validators and gpg to read.
@@ -547,8 +548,9 @@ def workflow_loader():
         pass
 
     # GitHub reads YAML 1.2, where on, yes, off, dates and = are text: of
-    # PyYAML's YAML 1.1 rules only numbers and merge keys (<<) apply here.
-    kept = ("tag:yaml.org,2002:int", "tag:yaml.org,2002:float", "tag:yaml.org,2002:merge")
+    # PyYAML's YAML 1.1 rules only numbers, merge keys (<<) and null (plain
+    # ~, null, Null, NULL or nothing, as YAML 1.2 spells it) apply here.
+    kept = ("tag:yaml.org,2002:int", "tag:yaml.org,2002:float", "tag:yaml.org,2002:merge", "tag:yaml.org,2002:null")
     WorkflowLoader.yaml_implicit_resolvers = {
         first: [(tag, regexp) for tag, regexp in resolvers if tag in kept]
         for first, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
@@ -652,15 +654,10 @@ def strings(node) -> list[str]:
     return found
 
 
-YAML_NULLS = {"", "~", "null", "Null", "NULL"}
-
-
 def declares(permissions) -> bool:
-    """Whether a `permissions` value sets the token's permissions; empty or null (as YAML spells it) leaves the default."""
+    """Whether a `permissions` value sets the token's permissions; null (or none) leaves the default."""
 
-    if permissions is None:
-        return False
-    return not (isinstance(permissions, str) and permissions.strip() in YAML_NULLS)
+    return permissions is not None
 
 
 def can_post_checks(permissions) -> bool:
@@ -790,15 +787,29 @@ def check_gate_workflow(path: str, data: bytes) -> None:
     named GATE_JOB_NAME on GATE_RUNNER with only contents: read. Each level
     holds only the keys in GATE_WORKFLOW_KEYS, GATE_JOB_KEYS and
     GATE_STEP_KEYS, so no condition, ignored failure, matrix, container,
-    services, defaults or other shell. A step's env sets only GATE_STEP_ENV's
-    names to their exact values, and the one action is actions/checkout
-    pinned to a commit, checking out the base commit without persisting
+    services, defaults or other shell, and no anchors, aliases or merge keys.
+    Each step runs a command or uses an action (settings only for an action),
+    a step's env sets only GATE_STEP_ENV's names to their exact values, and
+    the one action is actions/checkout pinned to a commit, checking out the
+    base commit with its full history (fetch-depth: 0) and without persisting
     credentials. What its run: steps do is for the signers to review.
     """
 
+    # No anchors, aliases or merge keys: what the gate reads is what GitHub reads.
+    yaml, loader_class = workflow_loader()
+    try:
+        for token in yaml.scan(data.decode("utf8"), Loader=loader_class):
+            if isinstance(token, (yaml.AnchorToken, yaml.AliasToken)) or (
+                isinstance(token, yaml.ScalarToken) and token.plain and token.value == "<<"
+            ):
+                raise GateError(f"{path} may not use YAML anchors, aliases or merge keys")
+    except (UnicodeDecodeError, yaml.YAMLError) as exc:
+        raise GateError(f"{path} cannot be read as YAML: {exc}") from exc
     workflow = read_workflow(path, data)
     if not isinstance(workflow, dict):
         raise GateError(f"{path} is not a workflow mapping")
+    if "name" in workflow and not isinstance(workflow["name"], str):
+        raise GateError(f"{path}: its name must be text")
     if workflow.get("on") != GATE_TRIGGER:
         raise GateError(f"{path} may run only on pull_request_target, for exactly {GATE_TRIGGER!r}")
     jobs = workflow.get("jobs")
@@ -837,8 +848,12 @@ def check_gate_workflow(path: str, data: bytes) -> None:
             raise GateError(f"{path}: a step may not use {', '.join(extra)}")
         if ("run" in step) == ("uses" in step) or ("with" in step and "uses" not in step):
             raise GateError(f"{path}: a step must either run a command or use an action, with settings only for an action")
+        if "run" in step and (not isinstance(step["run"], str) or not step["run"].strip()):
+            raise GateError(f"{path}: a step's run must be a command")
+        if "name" in step and not isinstance(step["name"], str):
+            raise GateError(f"{path}: a step's name must be text")
         env = step.get("env")
-        if env is not None and not (isinstance(env, str) and env.strip() in YAML_NULLS):
+        if env is not None:
             if not isinstance(env, dict):
                 raise GateError(f"{path}: a step's env must be a mapping")
             for name, value in env.items():
@@ -991,17 +1006,15 @@ def check_target(base: str, head: str, work: Path) -> None:
     bytecode = [path for _mode, _kind, _oid, path in tree(head) if is_bytecode(path)]
     if bytecode:
         raise GateError(f"Python bytecode caches may not be committed: {', '.join(map(shown, bytecode))}")
-    # With more than one merge base, git's diff and GitHub's merge could start
-    # from different commits: the pull request first takes in its base.
-    merge_bases = git("merge-base", "--all", base, head).decode().split()
-    if len(merge_bases) != 1:
-        raise GateError(
-            f"{len(merge_bases)} merge bases with the base branch: merge the base branch into the pull request first"
-        )
-    merge_base = merge_bases[0]
+    # The head must contain the base branch's tip. Then the diff from the base
+    # is exactly what merging the pull request brings: no older merge base,
+    # criss-cross history or rename on the base side can make GitHub's merge
+    # differ from what the gate checked.
+    if subprocess.run(["git", "merge-base", "--is-ancestor", base, head], check=False).returncode != 0:
+        raise GateError("bring the pull request up to date with its base branch: the gate checks a head that contains it")
     changed = [
         name.decode("utf8", errors="surrogateescape")
-        for name in split_nul(git("diff", "--no-renames", "--name-only", "-z", merge_base, head))
+        for name in split_nul(git("diff", "--no-renames", "--name-only", "-z", base, head))
     ]
     policy = [path for path in changed if classify_merge_profile.touches_operator_keys(path)]
     gate = [path for path in changed if is_gate_code(path)]

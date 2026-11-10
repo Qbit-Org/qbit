@@ -752,6 +752,16 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
             "a step that runs and uses": (good.replace("        run: echo gate\n", "        run: echo gate\n        uses: actions/checkout@0000000000000000000000000000000000000000\n"), "either run a command or use an action"),
             "a step with only a name": (good.replace("      - name: Gate\n", "      - name: Nothing\n      - name: Gate\n"), "either run a command or use an action"),
             "settings on a run step": (good.replace("        run: echo gate\n", "        run: echo gate\n        with: {a: b}\n"), "settings only for an action"),
+            "null written as text": (good.replace("permissions:\n  contents: read\n", "permissions: 'null'\n"), "may only read contents"),
+            "null on the workflow, permissions on the job": (good.replace("permissions:\n  contents: read\n", "permissions: Null\n").replace("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-24.04\n    permissions:\n      contents: read\n", 1), None),
+            "a null step env": (good.replace("        env:\n          BASE_SHA: ${{ github.event.pull_request.base.sha }}\n", "        env: NULL\n"), None),
+            "a step env written as text": (good.replace("        env:\n          BASE_SHA: ${{ github.event.pull_request.base.sha }}\n", "        env: 'null'\n"), "a step's env must be a mapping"),
+            "an anchor": (good.replace("    runs-on: ubuntu-24.04\n", "    runs-on: &runner ubuntu-24.04\n"), "may not use YAML anchors, aliases or merge keys"),
+            "a merge key": (good.replace("      - name: Gate\n", "      - <<: {name: Gate}\n        name: Gate\n"), "may not use YAML anchors, aliases or merge keys"),
+            "a run that is not a command": (good.replace("        run: echo gate\n", "        run: {a: b}\n"), "a step's run must be a command"),
+            "an empty run": (good.replace("        run: echo gate\n", "        run: ''\n"), "a step's run must be a command"),
+            "a step name that is a list": (good.replace("      - name: Gate\n", "      - name: [Gate]\n"), "a step's name must be text"),
+            "a workflow name that is a mapping": ("name: {a: b}\n" + good, "its name must be text"),
             "permissions on the job": (good.replace("permissions:\n  contents: read\n", "").replace("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-24.04\n    permissions:\n      contents: read\n", 1), None),
             "a checkout spelled otherwise": (good.replace("      - name: Gate\n", "      - uses: Actions/Checkout@v5\n        with:\n          ref: ${{ github.event.pull_request.head.sha }}\n      - name: Gate\n"), "pinned to a commit"),
             "another action": (good.replace("      - name: Gate\n", "      - uses: ./.github/actions/setup\n      - name: Gate\n"), "may use no action but actions/checkout"),
@@ -847,6 +857,28 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
             {base: [f"{key_policy_gate.GATE_CHECK_NAME} ({base})"] for base in key_policy_gate.GATE_BASES},
         )
 
+    def test_target_accepts_a_head_that_merged_its_base(self) -> None:
+        self.edit("doc/notes.md", "Notes.\n")
+        self.commit("notes")
+        head = self.git("rev-parse", "HEAD")
+        self.git("checkout", "--quiet", "--detach", self.base)
+        self.edit("doc/other.md", "Other.\n")
+        self.base = self.commit("the base moves on")
+        self.git("checkout", "--quiet", "--detach", head)
+        self.git("merge", "--quiet", "--no-edit", self.base)
+        self.assert_target_accepted("No key policy or gate code path changed")
+
+    def test_target_refuses_a_head_behind_its_base(self) -> None:
+        # Even without a gate path in its own diff: the merge could bring one (a rename on the base, say).
+        self.edit("doc/notes.md", "Notes.\n")
+        self.commit("notes")
+        head = self.git("rev-parse", "HEAD")
+        self.git("checkout", "--quiet", "--detach", self.base)
+        self.edit("doc/other.md", "Other.\n")
+        self.base = self.commit("the base moves on")
+        self.git("checkout", "--quiet", "--detach", head)
+        self.assert_target_refused("bring the pull request up to date with its base branch")
+
     def test_target_refuses_a_head_with_two_merge_bases(self) -> None:
         # Criss-cross history: git's diff and GitHub's merge could start from different commits.
         tree = self.git("rev-parse", f"{self.base}^{{tree}}")
@@ -858,7 +890,7 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
         head_tree = self.git("write-tree")
         self.git("update-ref", "HEAD", self.git("commit-tree", head_tree, "-p", second, "-p", first, "-m", "head merges both"))
         self.git("reset", "--quiet", "--hard", "HEAD")
-        self.assert_target_refused("2 merge bases with the base branch")
+        self.assert_target_refused("bring the pull request up to date with its base branch")
 
     def test_target_refuses_control_characters_in_gate_paths(self) -> None:
         # A line break in a path could make two different file sets share a manifest.

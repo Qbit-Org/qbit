@@ -164,9 +164,11 @@ script must therefore keep the command line the workflow uses (`target --base
 --head --work`, run with `-I -B -X pycache_prefix`). The gate refuses a
 version of its workflow that holds anything but the keys it needs (so no
 condition, ignored failure, matrix, container, services, other shell or
-defaults), runs anywhere but `ubuntu-24.04`, triggers on anything but
-`pull_request_target` with the expected event types, sets another
-concurrency group or a timeout outside 1 to 360 minutes, leaves its token
+defaults), uses YAML anchors, aliases or merge keys, has a step that does not
+either run a command or use an action (settings only for an action), runs
+anywhere but `ubuntu-24.04`, triggers on anything but `pull_request_target`
+with the expected event types, sets a concurrency other than the expected one
+or a timeout outside 1 to 360 minutes, leaves its token
 permissions undeclared or asks for any but `contents: read`, sets a step's
 `env:` to anything but the gate's inputs (the pull request event's values and
 the repository's URL), uses any action but `actions/checkout` pinned to a
@@ -182,9 +184,10 @@ with the same head share them: a run for a branch that is not allowed fails,
 and a run for the other protected branch posts only that branch's name, so
 neither can satisfy a pull request into `main` or `1.x.x`.
 
-The script finds the paths the pull request changes against its merge base
-with the base branch; a pull request with more than one merge base, which
-GitHub's merge would combine, first takes in its base branch:
+The script requires the pull request to contain its base branch's tip (bring
+it up to date otherwise), so that what it checks is exactly what merging the
+pull request brings, and finds the paths the pull request changes against that
+tip:
 
 - A change to the key policy (any path the classifier routes to the key job)
   gets the checks above, run by the base's validator.
