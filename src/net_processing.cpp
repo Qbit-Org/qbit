@@ -58,6 +58,7 @@
 #include <txmempool.h>
 #include <uint256.h>
 #include <util/check.h>
+#include <util/overflow.h>
 #include <util/strencodings.h>
 #include <util/time.h>
 #include <util/trace.h>
@@ -213,6 +214,113 @@ static constexpr double MAX_ADDR_RATE_PER_SECOND{0.1};
 static constexpr size_t MAX_ADDR_PROCESSING_TOKEN_BUCKET{MAX_ADDR_TO_SEND};
 /** The compactblocks version we support. See BIP 152. */
 static constexpr uint64_t CMPCTBLOCKS_VERSION{2};
+
+std::optional<bool> IsTxValidationTimeCharged(TxValidationResult result)
+{
+    switch (result) {
+    // Rejected for a reason in the transaction itself under our consensus and standardness
+    // rules, not because of the state of our chain or mempool.
+    case TxValidationResult::TX_CONSENSUS:
+    case TxValidationResult::TX_INPUTS_NOT_STANDARD:
+    case TxValidationResult::TX_NOT_STANDARD:
+    case TxValidationResult::TX_WITNESS_MUTATED:
+    case TxValidationResult::TX_WITNESS_STRIPPED:
+        return true;
+    // Not validated, or rejected because of our chain or mempool state (missing or spent
+    // inputs, locks, conflicts, fees and mempool limits, package reconsideration). An honest
+    // peer can send these, for example after a reorg or when our mempool is full.
+    case TxValidationResult::TX_RESULT_UNSET:
+    case TxValidationResult::TX_MISSING_INPUTS:
+    case TxValidationResult::TX_PREMATURE_SPEND:
+    case TxValidationResult::TX_CONFLICT:
+    case TxValidationResult::TX_MEMPOOL_POLICY:
+    case TxValidationResult::TX_NO_MEMPOOL:
+    case TxValidationResult::TX_RECONSIDERABLE:
+    case TxValidationResult::TX_UNKNOWN:
+        return false;
+    } // no default case, so the compiler can warn about missing cases
+    return std::nullopt;
+}
+
+namespace {
+using TxValidationCredit = TxValidationBudget::Credit;
+
+/** Clamp a budget duration to the range accepted for the settings. */
+std::chrono::microseconds ClampTxValidationSetting(std::chrono::microseconds value)
+{
+    return std::clamp(value, std::chrono::microseconds{0}, MAX_TX_VALIDATION_BUDGET_SETTING);
+}
+
+TxValidationBudgetOptions ClampTxValidationBudgetOptions(TxValidationBudgetOptions options)
+{
+    options.peer_rate = ClampTxValidationSetting(options.peer_rate);
+    options.peer_cap = ClampTxValidationSetting(options.peer_cap);
+    options.pool_rate = ClampTxValidationSetting(options.pool_rate);
+    options.pool_cap = ClampTxValidationSetting(options.pool_cap);
+    return options;
+}
+
+/**
+ * Add rate (credit per second) over elapsed to credit, up to cap. The settings are clamped, so
+ * every balance stays within [TX_VALIDATION_CREDIT_FLOOR, MAX_TX_VALIDATION_BUDGET_SETTING] and
+ * nothing here overflows, however much time has elapsed.
+ */
+TxValidationCredit RefillTxValidationCredit(TxValidationCredit credit, std::chrono::microseconds elapsed,
+                                            std::chrono::microseconds rate, std::chrono::microseconds cap)
+{
+    const TxValidationCredit cap_credit{cap};
+    if (credit >= cap_credit || elapsed <= std::chrono::microseconds{0} || rate <= std::chrono::microseconds{0}) return credit;
+    // Each microsecond of elapsed time adds rate.count() picoseconds of credit.
+    const int64_t missing{(cap_credit - credit).count()};
+    if (elapsed.count() >= (missing + rate.count() - 1) / rate.count()) return cap_credit;
+    return credit + TxValidationCredit{elapsed.count() * rate.count()};
+}
+} // namespace
+
+TxValidationBudget::TxValidationBudget(const TxValidationBudgetOptions& options, std::chrono::microseconds now)
+    : m_options{ClampTxValidationBudgetOptions(options)},
+      m_pool_credit{m_options.pool_cap},
+      m_pool_last_refill{now}
+{
+}
+
+void TxValidationBudget::RefillAccount(Account& account, std::chrono::microseconds now) const
+{
+    account.m_credit = RefillTxValidationCredit(account.m_credit, now - account.m_last_refill, m_options.peer_rate, m_options.peer_cap);
+    account.m_last_refill = now;
+    if (account.m_credit >= Credit{m_options.peer_cap}) account.m_established = true;
+}
+
+void TxValidationBudget::RefillPool(std::chrono::microseconds now)
+{
+    m_pool_credit = RefillTxValidationCredit(m_pool_credit, now - m_pool_last_refill, m_options.pool_rate, m_options.pool_cap);
+    m_pool_last_refill = now;
+}
+
+bool TxValidationBudget::MayValidate(Account& account, bool exempt, std::chrono::microseconds now)
+{
+    if (exempt || !m_options.enabled) return true;
+    RefillAccount(account, now);
+    if (CanUseOwnCredit(account)) return true;
+    RefillPool(now);
+    return m_pool_credit > Credit::zero();
+}
+
+void TxValidationBudget::Charge(Account& account, bool exempt, std::chrono::microseconds cost, std::chrono::microseconds now)
+{
+    cost = std::max(cost, std::chrono::microseconds{0});
+    account.m_total_charged = std::chrono::microseconds{SaturatingAdd(account.m_total_charged.count(), cost.count())};
+    if (exempt || !m_options.enabled) return;
+    RefillAccount(account, now);
+    RefillPool(now);
+    // Charge the balance that allowed the validation. If neither allows it (the transaction was
+    // validated without asking, for example as part of a package that another peer started),
+    // the peer's own credit pays.
+    Credit& balance{CanUseOwnCredit(account) || m_pool_credit <= Credit::zero() ? account.m_credit : m_pool_credit};
+    // No single charge needs to exceed the distance from the largest balance to the floor.
+    const Credit deduction{std::min(cost, MAX_TX_VALIDATION_BUDGET_SETTING - TX_VALIDATION_CREDIT_FLOOR)};
+    balance = std::max(balance - deduction, Credit{TX_VALIDATION_CREDIT_FLOOR});
+}
 
 // Internal stuff
 namespace {
@@ -447,10 +555,30 @@ struct Peer {
      * timestamp the peer sent in the version message. */
     std::atomic<std::chrono::seconds> m_time_offset{0s};
 
-    explicit Peer(NodeId id, ServiceFlags our_services, bool is_inbound)
+    /** Whether the version handshake with this peer has completed. */
+    std::atomic_bool m_successfully_connected{false};
+
+    /** Whether this peer is exempt from the transaction validation budget (NoBan permission or a
+     *  manual connection, as for MaybeDiscourageAndDisconnect). */
+    const bool m_tx_validation_exempt;
+    /** This peer's account in the transaction validation budget. */
+    TxValidationBudget::Account m_tx_validation_account GUARDED_BY(NetEventsInterface::g_msgproc_mutex){GetTime<std::chrono::microseconds>()};
+    /** Value of m_tx_dropped_while_throttled when this peer was last throttled, for logging. */
+    uint64_t m_tx_dropped_at_throttle_start GUARDED_BY(NetEventsInterface::g_msgproc_mutex){0};
+    /** Total time spent validating this peer's transactions that were rejected for a reason in the
+     *  transaction itself. Also counted for exempt peers. */
+    std::atomic<std::chrono::microseconds> m_failed_tx_validation_time{0us};
+    /** Whether this peer's transactions are not validated because it is over its budget, as of the
+     *  last check. */
+    std::atomic_bool m_tx_validation_throttled{false};
+    /** Number of transactions from this peer dropped without validation while it was over its budget. */
+    std::atomic<uint64_t> m_tx_dropped_while_throttled{0};
+
+    explicit Peer(NodeId id, ServiceFlags our_services, bool is_inbound, bool tx_validation_exempt)
         : m_id{id}
         , m_our_services{our_services}
         , m_is_inbound{is_inbound}
+        , m_tx_validation_exempt{tx_validation_exempt}
     {}
 
 private:
@@ -669,7 +797,8 @@ private:
      *                     reconsidered, creating more work, possibly for other peers.
      * @return             True if meaningful work was done (an orphan was accepted/rejected).
      *                     If no meaningful work was done, then the work set for this peer
-     *                     will be empty.
+     *                     will be empty, unless the peer is over its transaction validation
+     *                     budget, in which case its work set waits until the budget refills.
      */
     bool ProcessOrphanTx(Peer& peer)
         EXCLUSIVE_LOCKS_REQUIRED(!m_peer_mutex, g_msgproc_mutex, !m_tx_download_mutex);
@@ -829,6 +958,34 @@ private:
     TimeOffsets m_outbound_time_offsets{m_warnings};
 
     const Options m_opts;
+
+    /** Budget for the time spent validating peers' transactions that are then rejected. Holds
+     *  the node-wide pool; each Peer holds its own account. */
+    TxValidationBudget m_tx_validation_budget GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
+
+    /** Whether peer is over its transaction validation budget, so that its transactions are not
+     *  validated now. Updates the reported state, and logs when the peer starts or stops being
+     *  throttled. */
+    bool IsTxValidationThrottled(Peer& peer) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
+
+    /** Charge cost, the time spent validating a transaction from peer that was rejected for a
+     *  reason in the transaction itself (see IsTxValidationTimeCharged). */
+    void ChargeTxValidation(Peer& peer, std::chrono::microseconds cost) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
+
+    /** Run the periodic flush of the coins cache, which mempool acceptance otherwise runs at its
+     *  end, so that it is not part of the validation time charged to a peer. */
+    void FlushStateBeforeTxValidation() EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+
+    /** Validate tx, received from peer, for the mempool. Charge the time spent to the peer if tx
+     *  is rejected for a reason in the transaction itself. */
+    MempoolAcceptResult ProcessPeerTransaction(Peer& peer, const CTransactionRef& tx)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_main, g_msgproc_mutex);
+
+    /** Evaluate a package of transactions received from peers. Charge the time spent to the senders
+     *  of the package members that are rejected for a reason in the transaction itself, split
+     *  equally between them. */
+    PackageMempoolAcceptResult ProcessPeerPackage(const node::PackageToValidate& package_to_validate)
+        EXCLUSIVE_LOCKS_REQUIRED(cs_main, !m_peer_mutex, g_msgproc_mutex);
 
     bool RejectIncomingTxs(const CNode& peer) const;
 
@@ -1669,7 +1826,8 @@ void PeerManagerImpl::InitializeNode(const CNode& node, ServiceFlags our_service
         our_services = static_cast<ServiceFlags>(our_services | NODE_BLOOM);
     }
 
-    PeerRef peer = std::make_shared<Peer>(nodeid, our_services, node.IsInboundConn());
+    const bool tx_validation_exempt{node.HasPermission(NetPermissionFlags::NoBan) || node.IsManualConn()};
+    PeerRef peer = std::make_shared<Peer>(nodeid, our_services, node.IsInboundConn(), tx_validation_exempt);
     {
         LOCK(m_peer_mutex);
         m_peer_map.emplace_hint(m_peer_map.end(), nodeid, peer);
@@ -1846,6 +2004,13 @@ bool PeerManagerImpl::GetNodeStateStats(NodeId nodeid, CNodeStateStats& stats) c
     }
 
     stats.m_ping_wait = ping_wait;
+    if (peer->m_successfully_connected) {
+        stats.m_tx_validation = TxValidationStats{
+            .failed_time = peer->m_failed_tx_validation_time.load(),
+            .throttled = peer->m_tx_validation_throttled.load(),
+            .dropped = peer->m_tx_dropped_while_throttled.load(),
+        };
+    }
     stats.m_addr_processed = peer->m_addr_processed.load();
     stats.m_addr_rate_limited = peer->m_addr_rate_limited.load();
     stats.m_addr_relay_enabled = peer->m_addr_relay_enabled.load();
@@ -2076,7 +2241,8 @@ PeerManagerImpl::PeerManagerImpl(CConnman& connman, AddrMan& addrman,
       m_mempool(pool),
       m_txdownloadman(node::TxDownloadOptions{pool, m_rng, opts.deterministic_rng}),
       m_warnings{warnings},
-      m_opts{opts}
+      m_opts{opts},
+      m_tx_validation_budget{opts.tx_validation_budget, GetTime<std::chrono::microseconds>()}
 {
     // While Erlay support is incomplete, it must be enabled explicitly via -txreconciliation.
     // This argument can go away after Erlay support is complete.
@@ -3190,6 +3356,92 @@ void PeerManagerImpl::ProcessHeadersMessage(CNode& pfrom, Peer& peer,
     return;
 }
 
+namespace {
+/** Time elapsed since start, rounded up so that no validation is charged as zero. */
+std::chrono::microseconds ValidationTimeSince(SteadyClock::time_point start)
+{
+    return std::chrono::ceil<std::chrono::microseconds>(SteadyClock::now() - start);
+}
+
+/** Whether the time spent validating a transaction with this result is charged to its sender. */
+bool IsChargedTxValidationResult(const MempoolAcceptResult& result)
+{
+    return result.m_result_type == MempoolAcceptResult::ResultType::INVALID &&
+           Assume(IsTxValidationTimeCharged(result.m_state.GetResult())).value_or(false);
+}
+} // namespace
+
+bool PeerManagerImpl::IsTxValidationThrottled(Peer& peer)
+{
+    const bool throttled{!m_tx_validation_budget.MayValidate(peer.m_tx_validation_account, peer.m_tx_validation_exempt,
+                                                             GetTime<std::chrono::microseconds>())};
+    if (throttled != peer.m_tx_validation_throttled.load()) {
+        const uint64_t dropped{peer.m_tx_dropped_while_throttled.load()};
+        if (throttled) {
+            peer.m_tx_dropped_at_throttle_start = dropped;
+            LogDebug(BCLog::NET, "peer=%d is over its transaction validation budget, not validating its transactions until the budget refills\n",
+                     peer.m_id);
+        } else {
+            LogDebug(BCLog::NET, "peer=%d is within its transaction validation budget again; transactions dropped while over it: %u\n",
+                     peer.m_id, dropped - peer.m_tx_dropped_at_throttle_start);
+        }
+        peer.m_tx_validation_throttled = throttled;
+    }
+    return throttled;
+}
+
+void PeerManagerImpl::ChargeTxValidation(Peer& peer, std::chrono::microseconds cost)
+{
+    auto& account{peer.m_tx_validation_account};
+    m_tx_validation_budget.Charge(account, peer.m_tx_validation_exempt, cost, GetTime<std::chrono::microseconds>());
+    peer.m_failed_tx_validation_time = account.GetTotalCharged();
+    // Report, and log, a peer that this charge puts over its budget at once.
+    IsTxValidationThrottled(peer);
+}
+
+void PeerManagerImpl::FlushStateBeforeTxValidation()
+{
+    BlockValidationState state;
+    m_chainman.ActiveChainstate().FlushStateToDisk(state, FlushStateMode::PERIODIC);
+}
+
+MempoolAcceptResult PeerManagerImpl::ProcessPeerTransaction(Peer& peer, const CTransactionRef& tx)
+{
+    FlushStateBeforeTxValidation();
+    const auto validation_start{SteadyClock::now()};
+    MempoolAcceptResult result{m_chainman.ProcessTransaction(tx)};
+    if (IsChargedTxValidationResult(result)) ChargeTxValidation(peer, ValidationTimeSince(validation_start));
+    return result;
+}
+
+PackageMempoolAcceptResult PeerManagerImpl::ProcessPeerPackage(const node::PackageToValidate& package_to_validate)
+{
+    FlushStateBeforeTxValidation();
+    const auto validation_start{SteadyClock::now()};
+    PackageMempoolAcceptResult package_result{ProcessNewPackage(m_chainman.ActiveChainstate(), m_mempool, package_to_validate.m_txns,
+                                                                /*test_accept=*/false, /*client_maxfeerate=*/std::nullopt)};
+    const std::chrono::microseconds cost{ValidationTimeSince(validation_start)};
+
+    const auto& package{package_to_validate.m_txns};
+    const auto& senders{package_to_validate.m_senders};
+    if (!Assume(package.size() == senders.size())) return package_result;
+
+    std::vector<NodeId> charged_senders;
+    for (size_t i{0}; i < package.size(); ++i) {
+        const auto it_result{package_result.m_tx_results.find(package[i]->GetWitnessHash())};
+        if (it_result == package_result.m_tx_results.end() || !IsChargedTxValidationResult(it_result->second)) continue;
+        if (std::ranges::find(charged_senders, senders[i]) == charged_senders.end()) charged_senders.push_back(senders[i]);
+    }
+    if (charged_senders.empty()) return package_result;
+
+    const int64_t count{static_cast<int64_t>(charged_senders.size())};
+    const std::chrono::microseconds share{(cost.count() + count - 1) / count};
+    for (const NodeId sender : charged_senders) {
+        if (const PeerRef peer{GetPeerRef(sender)}) ChargeTxValidation(*peer, share);
+    }
+    return package_result;
+}
+
 std::optional<node::PackageToValidate> PeerManagerImpl::ProcessInvalidTx(NodeId nodeid, const CTransactionRef& ptx, const TxValidationState& state,
                                        bool first_time_failure)
 {
@@ -3301,10 +3553,14 @@ bool PeerManagerImpl::ProcessOrphanTx(Peer& peer)
     AssertLockHeld(g_msgproc_mutex);
     LOCK2(::cs_main, m_tx_download_mutex);
 
+    // The orphans of a peer that is over its transaction validation budget wait in its work
+    // set until the budget has refilled.
+    if (m_txdownloadman.HaveMoreWork(peer.m_id) && IsTxValidationThrottled(peer)) return false;
+
     CTransactionRef porphanTx = nullptr;
 
     while (CTransactionRef porphanTx = m_txdownloadman.GetTxToReconsider(peer.m_id)) {
-        const MempoolAcceptResult result = m_chainman.ProcessTransaction(porphanTx);
+        const MempoolAcceptResult result{ProcessPeerTransaction(peer, porphanTx)};
         const TxValidationState& state = result.m_state;
         const Txid& orphanHash = porphanTx->GetHash();
         const Wtxid& orphan_wtxid = porphanTx->GetWitnessHash();
@@ -3951,6 +4207,7 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
         }
 
         pfrom.fSuccessfullyConnected = true;
+        peer->m_successfully_connected = true;
         return;
     }
 
@@ -4180,6 +4437,9 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
         }
 
         const bool reject_tx_invs{RejectIncomingTxs(pfrom)};
+        // Whether the peer is over its transaction validation budget, evaluated at its first
+        // transaction announcement in this message.
+        std::optional<bool> tx_validation_throttled;
 
         LOCK2(cs_main, m_tx_download_mutex);
 
@@ -4222,6 +4482,10 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
                 AddKnownTx(*peer, inv.hash);
 
                 if (!m_chainman.IsInitialBlockDownload()) {
+                    // Transactions are not requested from a peer that is over its transaction
+                    // validation budget; they are requested from other peers that announce them.
+                    if (!tx_validation_throttled.has_value()) tx_validation_throttled = IsTxValidationThrottled(*peer);
+                    if (*tx_validation_throttled) continue;
                     const bool fAlreadyHave{m_txdownloadman.AddTxAnnouncement(pfrom.GetId(), gtxid, current_time)};
                     LogDebug(BCLog::NET, "got inv: %s  %s peer=%d\n", inv.ToString(), fAlreadyHave ? "have" : "new", pfrom.GetId());
                 }
@@ -4531,6 +4795,14 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
         LOCK2(cs_main, m_tx_download_mutex);
 
         const auto& [should_validate, package_to_validate] = m_txdownloadman.ReceivedTx(pfrom.GetId(), ptx);
+        if ((should_validate || package_to_validate) && IsTxValidationThrottled(*peer)) {
+            // The peer is over its transaction validation budget: drop the transaction without
+            // validating it, alone or in a package. It is not treated as rejected (no reject filter,
+            // orphanage or extra transactions for compact blocks). ReceivedTx() has released the
+            // request for it, so it is requested from other peers that announce it.
+            ++peer->m_tx_dropped_while_throttled;
+            return;
+        }
         if (!should_validate) {
             if (pfrom.HasPermission(NetPermissionFlags::ForceRelay)) {
                 // Always relay transactions received from peers with forcerelay
@@ -4547,7 +4819,7 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
             }
 
             if (package_to_validate) {
-                const auto package_result{ProcessNewPackage(m_chainman.ActiveChainstate(), m_mempool, package_to_validate->m_txns, /*test_accept=*/false, /*client_maxfeerate=*/std::nullopt)};
+                const auto package_result{ProcessPeerPackage(*package_to_validate)};
                 LogDebug(BCLog::TXPACKAGES, "package evaluation for %s: %s\n", package_to_validate->ToString(),
                          package_result.m_state.IsValid() ? "package accepted" : "package rejected");
                 ProcessPackageResult(package_to_validate.value(), package_result);
@@ -4558,7 +4830,7 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
         // ReceivedTx should not be telling us to validate the tx and a package.
         Assume(!package_to_validate.has_value());
 
-        const MempoolAcceptResult result = m_chainman.ProcessTransaction(ptx);
+        const MempoolAcceptResult result{ProcessPeerTransaction(*peer, ptx)};
         const TxValidationState& state = result.m_state;
 
         if (result.m_result_type == MempoolAcceptResult::ResultType::VALID) {
@@ -4567,7 +4839,7 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
         }
         if (state.IsInvalid()) {
             if (auto package_to_validate{ProcessInvalidTx(pfrom.GetId(), ptx, state, /*first_time_failure=*/true)}) {
-                const auto package_result{ProcessNewPackage(m_chainman.ActiveChainstate(), m_mempool, package_to_validate->m_txns, /*test_accept=*/false, /*client_maxfeerate=*/std::nullopt)};
+                const auto package_result{ProcessPeerPackage(*package_to_validate)};
                 LogDebug(BCLog::TXPACKAGES, "package evaluation for %s: %s\n", package_to_validate->ToString(),
                          package_result.m_state.IsValid() ? "package accepted" : "package rejected");
                 ProcessPackageResult(package_to_validate.value(), package_result);
@@ -5320,6 +5592,10 @@ bool PeerManagerImpl::ProcessMessages(CNode* pfrom, std::atomic<bool>& interrupt
         }
     }
 
+    // Update the reported state of a peer that was over its transaction validation budget, which
+    // is otherwise evaluated only when the peer has transactions to validate or request.
+    if (peer->m_tx_validation_throttled) IsTxValidationThrottled(*peer);
+
     const bool processed_orphan = ProcessOrphanTx(*peer);
 
     if (pfrom->fDisconnect)
@@ -5371,8 +5647,9 @@ bool PeerManagerImpl::ProcessMessages(CNode* pfrom, std::atomic<bool>& interrupt
         //  by another peer that was already processed; in that case,
         //  the extra work may not be noticed, possibly resulting in an
         //  unnecessary 100ms delay)
+        // The orphans of a peer that is over its budget wait, so they are not more work now.
         LOCK(m_tx_download_mutex);
-        if (m_txdownloadman.HaveMoreWork(peer->m_id)) fMoreWork = true;
+        if (m_txdownloadman.HaveMoreWork(peer->m_id) && !IsTxValidationThrottled(*peer)) fMoreWork = true;
     } catch (const std::exception& e) {
         LogDebug(BCLog::NET, "%s(%s, %u bytes): Exception '%s' (%s) caught\n", __func__, SanitizeString(msg.m_type), msg.m_message_size, e.what(), typeid(e).name());
     } catch (...) {
@@ -6290,7 +6567,18 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
         //
         {
             LOCK(m_tx_download_mutex);
-            for (const GenTxid& gtxid : m_txdownloadman.GetRequestsToSend(pto->GetId(), current_time)) {
+            std::vector<GenTxid> tx_requests{m_txdownloadman.GetRequestsToSend(pto->GetId(), current_time)};
+            if (!tx_requests.empty() && IsTxValidationThrottled(*peer)) {
+                // Transactions are not requested from a peer that is over its transaction validation
+                // budget, including those it announced before. Release the requests at once, as if the
+                // peer had replied that it does not have the transactions, so that they are requested
+                // from other peers that announced them.
+                LogDebug(BCLog::NET, "not requesting %u transactions from peer=%d, which is over its transaction validation budget\n",
+                         tx_requests.size(), pto->GetId());
+                m_txdownloadman.ReceivedNotFound(pto->GetId(), tx_requests);
+                tx_requests.clear();
+            }
+            for (const GenTxid& gtxid : tx_requests) {
                 vGetData.emplace_back(gtxid.IsWtxid() ? MSG_WTX : (MSG_TX | GetFetchFlags(*peer)), gtxid.ToUint256());
                 if (vGetData.size() >= MAX_GETDATA_SZ) {
                     MakeAndPushMessage(*pto, NetMsgType::GETDATA, vGetData);
