@@ -449,8 +449,10 @@ public:
 
         const std::size_t data_chunks = params.data_chunks;
         const std::size_t group_payload_bytes = data_chunks * FEC_CHUNK_SIZE;
-        const std::size_t group_count =
-            original_size / group_payload_bytes + (original_size % group_payload_bytes != 0 ? 1 : 0);
+        if (original_size > std::numeric_limits<std::size_t>::max() - group_payload_bytes) {
+            return std::numeric_limits<std::size_t>::max();
+        }
+        const std::size_t group_count = DivCeil(original_size, group_payload_bytes);
         if (group_count > std::numeric_limits<std::uint16_t>::max()) {
             return std::numeric_limits<std::size_t>::max();
         }

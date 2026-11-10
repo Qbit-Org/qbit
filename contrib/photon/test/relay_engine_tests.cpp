@@ -123,6 +123,9 @@ class CapturingSubmitter final : public photon::BlockSubmitter {
 public:
     ParentCheck CheckParent(const std::string& block_hash_hex, const std::string& prev_hash_hex, std::uint32_t max_depth) override
     {
+        if (check_hook) {
+            check_hook();
+        }
         ++check_calls;
         last_block_hash = block_hash_hex;
         last_prev_hash = prev_hash_hex;
@@ -134,11 +137,13 @@ public:
     {
         ++submit_calls;
         last_block.assign(block_data.begin(), block_data.end());
-        return submit_result;
+        return submit_hook ? submit_hook(block_data) : submit_result;
     }
 
     ParentCheck parent_result{ParentCheck::kNearTip};
     SubmitOutcome submit_result{SubmitOutcome::kAccepted};
+    std::function<void()> check_hook{};
+    std::function<SubmitOutcome(std::span<const std::uint8_t>)> submit_hook{};
     std::size_t check_calls{0};
     std::size_t submit_calls{0};
     std::string last_block_hash{};
@@ -873,7 +878,7 @@ void TestMismatchedIdentifierNotSubmitted()
     Require(engine.stats().submit_failures == 0, "a dropped block is not a submission");
     Require(engine.stats().inbound_entries == 0, "dropped block state should be released");
     const auto peer = PeerStats(engine, 0);
-    Require(peer.has_value() && peer->blocks_dropped == 1 && peer->fault_score == 1, "mismatch should count against the peer");
+    Require(peer.has_value() && peer->faults == 1 && peer->fault_score == 1, "mismatch should count against the peer");
 }
 
 void TestTooShortBlockNotSubmitted()
@@ -934,7 +939,7 @@ void TestBlockWithParentAwayFromTipNotSubmitted()
         Require(submitter.submit_calls == 0, "block whose parent is not near the tip must not be submitted");
         Require(engine.stats().blocks_parent_rejected == 1, "parent rejection should be counted");
         const auto peer = PeerStats(engine, 0);
-        Require(peer.has_value() && peer->blocks_dropped == 1 && peer->fault_score == 1,
+        Require(peer.has_value() && peer->faults == 1 && peer->fault_score == 1,
                 "parent rejection should count against the peer");
     }
 }
@@ -990,7 +995,7 @@ void TestSubmitOutcomesCountedSeparately()
     Require(stats.submit_errors == 1, "error count");
     Require(stats.submit_failures == 8, "submit_failures should keep counting every non-accepted submission");
     const auto peer = PeerStats(engine, 0);
-    Require(peer.has_value() && peer->blocks_received_in == 1 && peer->submit_failures == 8, "per-peer submit counts");
+    Require(peer.has_value() && peer->blocks_received_in == 1 && peer->faults == 2, "per-peer counts");
     Require(peer->fault_score == 2, "only inconclusive and rejected blocks count against the peer");
 }
 
@@ -1559,6 +1564,133 @@ void TestFailedReservationEvictsNothing()
     Require(PeerStats(engine, 0)->inbound_decoder_bytes == small, "peer 0 should keep its small block");
 }
 
+void TestRejectedCopyDoesNotBlockOtherPeersCopy()
+{
+    MockClock clock{};
+    RelayEngine engine(clock);
+    CapturingSubmitter submitter;
+
+    const TestBlock honest = EncodeTestBlock(2000, 0xF800);
+    // Another peer's copy carries the same header (so the same identifier) with a different body.
+    TestBlock bad;
+    bad.bytes.assign(honest.bytes.begin(), honest.bytes.begin() + 80);
+    const std::vector<std::uint8_t> junk = RandomBytes(120, 0xF801);
+    bad.bytes.insert(bad.bytes.end(), junk.begin(), junk.end());
+    bad.prefix = PrefixOf(bad.bytes);
+    Require(bad.prefix == honest.prefix, "both copies share the header");
+    photon::fec::Encoder encoder(photon::fec::Parameters::FromDataChunkCount(2));
+    bad.encoded = encoder.Encode(bad.bytes);
+
+    submitter.submit_hook = [&](std::span<const std::uint8_t> data) {
+        return std::equal(data.begin(), data.end(), honest.bytes.begin(), honest.bytes.end()) ? SubmitOutcome::kAccepted
+                                                                                             : SubmitOutcome::kRejected;
+    };
+
+    DeliverBlock(engine, kPeer1, bad, submitter);
+    Require(engine.stats().submit_rejected == 1, "the bad copy should be rejected by the node");
+    DeliverBlock(engine, kPeer0, honest, submitter);
+    Require(submitter.submit_calls == 2 && engine.stats().submit_successes == 1, "the honest copy must still be submitted");
+    Require(PeerStats(engine, 1)->fault_score == 1 && PeerStats(engine, 0)->fault_score == 0, "only the bad copy's sender is counted");
+}
+
+void TestSettleUsesTimeAfterNodeCalls()
+{
+    MockClock clock{};
+    RelayEngine engine(clock);
+    CapturingSubmitter submitter;
+    submitter.parent_result = ParentCheck::kUnavailable;
+    // The node takes longer to (not) answer than the settle lifetime.
+    submitter.check_hook = [&clock] { clock.Advance(std::chrono::seconds{11}); };
+
+    const TestBlock block = EncodeTestBlock(300, 0xF810);
+    DeliverBlock(engine, kPeer0, block, submitter);
+    submitter.check_hook = {};
+    clock.Advance(std::chrono::seconds{1});
+    DeliverBlock(engine, kPeer1, block, submitter);
+    Require(submitter.check_calls == 1, "a copy right after a slow failed check should not be checked again");
+}
+
+void TestUnknownParentEndsOnlyThatCopy()
+{
+    MockClock clock{};
+    RelayEngine engine(clock);
+    CapturingSubmitter submitter;
+    submitter.parent_result = ParentCheck::kUnknown;
+
+    const TestBlock block = EncodeTestBlock(300, 0xF820);
+    DeliverBlock(engine, kPeer0, block, submitter);
+    // The node may learn the parent a moment later; another peer's copy is checked again.
+    submitter.parent_result = ParentCheck::kNearTip;
+    DeliverBlock(engine, kPeer1, block, submitter);
+    Require(submitter.check_calls == 2 && submitter.submit_calls == 1, "another peer's copy should be checked and submitted");
+}
+
+void TestRepeatedPreHeaderChunksNotBuffered()
+{
+    MockClock clock{};
+    RelayEngineConfig config{};
+    config.max_inbound_buffered_bytes = 2 * photon::fec::FEC_CHUNK_SIZE;
+    RelayEngine engine(clock, config);
+    CapturingSubmitter submitter;
+
+    const TestBlock block = EncodeTestBlock(300, 0xF830);
+    for (int i = 0; i < 5; ++i) {
+        engine.OnBlockChunk(kPeer0, BuildChunkPayload(block.encoded.chunks[0], block.prefix), submitter);
+    }
+    engine.OnBlockChunk(kPeer0, BuildChunkPayload(block.encoded.chunks[1], block.prefix), submitter);
+    Require(engine.stats().inbound_rejected == 0, "repeats should not take buffer space");
+    engine.OnBlockHeader(kPeer0, BuildHeaderPayload(block.encoded, block.prefix, block.bytes.size()), submitter);
+    Require(submitter.submit_calls == 1 && submitter.last_block == block.bytes, "the buffered chunks should complete the block");
+}
+
+void TestMalformedHeadersCountAgainstPeer()
+{
+    MockClock clock{};
+    RelayEngine engine(clock);
+    CapturingSubmitter submitter;
+    const RelayEngineConfig defaults{};
+
+    for (std::uint64_t i = 0; i < defaults.peer_fault_threshold; ++i) {
+        BlockHeaderPayload header{};
+        header.block_hash_prefix = 0xC000 + i;
+        header.original_size = 1000;
+        header.data_chunks = 1; // no sender produces this
+        header.coding_group_count = 1;
+        engine.OnBlockHeader(kPeer1, header, submitter);
+    }
+    Require(engine.stats().peer_suspensions == 1, "malformed headers should pause the peer");
+
+    // Headers refused during the pause are not remembered as handled.
+    const TestBlock block = EncodeTestBlock(300, 0xF840);
+    DeliverBlock(engine, kPeer1, block, submitter);
+    Require(submitter.submit_calls == 0, "a paused peer's block is refused");
+    clock.Advance(defaults.peer_suspend_initial + std::chrono::milliseconds{1});
+    DeliverBlock(engine, kPeer1, block, submitter);
+    Require(submitter.submit_calls == 1, "the same block is accepted after the pause");
+}
+
+void TestBufferedChunksCheckedBeforeEviction()
+{
+    const auto params = photon::fec::Parameters::FromDataChunkCount(2);
+    MockClock clock{};
+    RelayEngineConfig config{};
+    const TestBlock kept = EncodeTestBlock(300, 0xF850);
+    const TestBlock bad = EncodeTestBlock(300, 0xF851);
+    config.max_inbound_decoder_bytes_per_peer = photon::fec::Decoder::MemoryBytes(params, kept.bytes.size());
+    RelayEngine engine(clock, config);
+    CapturingSubmitter submitter;
+
+    engine.OnBlockHeader(kPeer0, BuildHeaderPayload(kept.encoded, kept.prefix, kept.bytes.size()), submitter);
+    BlockChunkPayload stray = BuildChunkPayload(bad.encoded.chunks[0], bad.prefix);
+    stray.coding_group_id = 7; // the announced block has one group
+    engine.OnBlockChunk(kPeer0, stray, submitter);
+    engine.OnBlockHeader(kPeer0, BuildHeaderPayload(bad.encoded, bad.prefix, bad.bytes.size()), submitter);
+
+    Require(engine.stats().inbound_evictions == 0, "nothing should be evicted for a block that cannot be decoded");
+    Require(PeerStats(engine, 0)->inbound_decoder_bytes == config.max_inbound_decoder_bytes_per_peer, "the other block should be kept");
+    Require(PeerStats(engine, 0)->faults == 1, "the bad block should count against the peer");
+}
+
 #if defined(PHOTON_TEST_HAVE_MALLINFO2)
 std::size_t HeapInUse()
 {
@@ -1756,6 +1888,12 @@ int RunAllTests()
         {"refused_header_remaining_chunks_ignored", TestRefusedHeaderRemainingChunksIgnored},
         {"node_answered_block_still_relayed_out", TestNodeAnsweredBlockStillRelayedOut},
         {"unavailable_check_not_repeated_for_copies", TestUnavailableCheckNotRepeatedForCopies},
+        {"rejected_copy_does_not_block_other_peers_copy", TestRejectedCopyDoesNotBlockOtherPeersCopy},
+        {"settle_uses_time_after_node_calls", TestSettleUsesTimeAfterNodeCalls},
+        {"unknown_parent_ends_only_that_copy", TestUnknownParentEndsOnlyThatCopy},
+        {"repeated_preheader_chunks_not_buffered", TestRepeatedPreHeaderChunksNotBuffered},
+        {"malformed_headers_count_against_peer", TestMalformedHeadersCountAgainstPeer},
+        {"buffered_chunks_checked_before_eviction", TestBufferedChunksCheckedBeforeEviction},
     };
 
     int failures = 0;

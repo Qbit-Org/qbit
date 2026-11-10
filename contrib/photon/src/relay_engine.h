@@ -87,8 +87,8 @@ struct RelayStats {
 struct PeerRelayStats {
     std::size_t slot_index{0};
     std::uint64_t blocks_received_in{0};
-    std::uint64_t submit_failures{0};
-    std::uint64_t blocks_dropped{0};
+    // Events that added to the fault score (unusable blocks, headers and chunks).
+    std::uint64_t faults{0};
     std::uint64_t inbound_rejected{0};
     std::uint64_t inbound_evictions{0};
     std::uint64_t suspensions{0};
@@ -117,6 +117,52 @@ struct BlockHeaderSummary {
 [[nodiscard]] std::optional<BlockHeaderSummary> ReadBlockHeaderSummary(std::span<const std::uint8_t> block_data);
 
 [[nodiscard]] std::uint64_t HashPrefixFromHex(const std::string& hash_hex);
+
+namespace detail {
+
+/// Keys remembered for a limited time, oldest dropped first beyond a capacity.
+template <typename Key, typename Hash = std::hash<Key>>
+class RecentSet {
+public:
+    RecentSet(std::chrono::milliseconds lifetime, std::size_t capacity)
+        : m_lifetime(lifetime)
+        , m_capacity(capacity)
+    {
+    }
+
+    void Insert(const Key& key, Clock::TimePoint now)
+    {
+        if (!m_keys.insert(key).second) {
+            return;
+        }
+        m_order.emplace_back(key, now);
+        while (m_order.size() > m_capacity) {
+            m_keys.erase(m_order.front().first);
+            m_order.pop_front();
+        }
+    }
+
+    [[nodiscard]] bool Contains(const Key& key) const
+    {
+        return m_keys.count(key) != 0;
+    }
+
+    void Prune(Clock::TimePoint now)
+    {
+        while (!m_order.empty() && now - m_order.front().second > m_lifetime) {
+            m_keys.erase(m_order.front().first);
+            m_order.pop_front();
+        }
+    }
+
+private:
+    std::chrono::milliseconds m_lifetime;
+    std::size_t m_capacity;
+    std::deque<std::pair<Key, Clock::TimePoint>> m_order{};
+    std::unordered_set<Key, Hash> m_keys{};
+};
+
+} // namespace detail
 
 class RelayEngine {
 public:
@@ -215,9 +261,8 @@ private:
     InboundRelay& CreateInbound(const InboundRelayKey& key, Clock::TimePoint now);
     void ChargeDecoder(const InboundRelayKey& key, InboundRelay& relay, std::size_t bytes);
     void MarkFinished(const InboundRelayKey& key, Clock::TimePoint now);
-    [[nodiscard]] bool IsFinished(const InboundRelayKey& key, Clock::TimePoint now);
     void SettleInbound(std::uint64_t hash_prefix, Clock::TimePoint now);
-    [[nodiscard]] bool IsSettled(std::uint64_t hash_prefix, Clock::TimePoint now);
+    [[nodiscard]] bool IsHandled(const InboundRelayKey& key) const;
     void LogUnusedBlock(Clock::TimePoint now, std::size_t slot_index, const std::string& block, const char* reason);
     void UpdateUsageStats();
     void EvictExpiredInbound(Clock::TimePoint now);
@@ -238,16 +283,20 @@ private:
     std::size_t m_inbound_buffered_bytes{0};
     std::size_t m_inbound_decoder_bytes{0};
     std::map<std::size_t, PeerInbound> m_peers{};
+    // How long a handled block's remaining chunks, and other peers' copies of a block the node has
+    // already answered for, are ignored; and how many such entries are kept.
+    static constexpr std::chrono::milliseconds kHandledInboundLifetime{std::chrono::seconds{10}};
+    static constexpr std::size_t kMaxHandledInbound = 256;
+
     // One peer's blocks already handled or refused, so that the sender's remaining chunks do not
     // start a new incomplete block.
-    std::deque<std::pair<InboundRelayKey, Clock::TimePoint>> m_finished_order{};
-    std::unordered_set<InboundRelayKey, InboundRelayKeyHash> m_finished{};
-    // Blocks the node has already answered for (other than accepting them), so that other peers'
-    // copies are not decoded and sent to the node again. Unlike the seen set, this does not stop
-    // the relay from sending the block on when its own node announces it.
-    std::deque<std::pair<std::uint64_t, Clock::TimePoint>> m_settled_order{};
-    std::unordered_set<std::uint64_t> m_settled{};
-    LogRateLimiter m_unused_block_logs{std::chrono::seconds{60}};
+    detail::RecentSet<InboundRelayKey, InboundRelayKeyHash> m_finished{kHandledInboundLifetime, kMaxHandledInbound};
+    // Blocks about which the node gave an answer that holds for any copy (it has the block, the
+    // parent is too far, or the node is not answering), so other peers' copies are not decoded and
+    // sent to the node again. Unlike the seen set, this does not stop the relay from sending the
+    // block on when its own node announces it.
+    detail::RecentSet<std::uint64_t> m_settled{kHandledInboundLifetime, kMaxHandledInbound};
+    std::map<std::string, LogRateLimiter> m_unused_block_logs{};
 
     std::deque<std::uint64_t> m_seen_order{};
     std::unordered_set<std::uint64_t> m_seen_set{};

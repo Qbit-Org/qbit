@@ -16,11 +16,6 @@ namespace photon {
 namespace {
 
 constexpr std::size_t kHeaderRedundancy = 3;
-// How long a handled or refused block's remaining chunks, and other peers' copies of a block the
-// node has already answered for, are ignored.
-constexpr std::chrono::seconds kHandledInboundLifetime{10};
-constexpr std::size_t kMaxHandledInbound = 256;
-
 // Serialized block header: version (4), previous block hash (32), merkle root (32), time, bits, nonce.
 constexpr std::size_t kBlockHeaderSize = 80;
 constexpr std::size_t kPrevBlockHashOffset = 4;
@@ -241,7 +236,7 @@ void RelayEngine::OnBlockHeader(const InboundPeerInfo& inbound_peer,
     const std::size_t slot = inbound_peer.slot_index;
     const InboundRelayKey key = MakeInboundRelayKey(inbound_peer, payload.block_hash_prefix);
 
-    if (IsKnown(payload.block_hash_prefix) || IsSettled(payload.block_hash_prefix, now) || IsFinished(key, now)) {
+    if (IsKnown(payload.block_hash_prefix) || IsHandled(key)) {
         ++m_stats.blocks_already_known;
         return;
     }
@@ -253,22 +248,27 @@ void RelayEngine::OnBlockHeader(const InboundPeerInfo& inbound_peer,
         return;
     }
 
+    if (IsSuspended(slot, now)) {
+        RejectInbound(slot);
+        EraseInbound(key);
+        return;
+    }
+
     // A refused header also ends this block for this peer: its remaining chunks are ignored
-    // rather than buffered for a decoder that will not come.
-    const auto refuse = [&] {
+    // rather than buffered for a decoder that will not come. A header that no honest sender
+    // produces also counts against the peer.
+    const auto refuse = [&](bool fault) {
         RejectInbound(slot);
         EraseInbound(key);
         MarkFinished(key, now);
+        if (fault) {
+            RecordFault(slot, now);
+        }
     };
 
-    if (payload.data_chunks < 2 || payload.data_chunks >= fec::FEC_TOTAL_CHUNKS ||
-        payload.original_size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
-        EraseInbound(key);
-        MarkFinished(key, now);
-        return;
-    }
-    if (payload.original_size == 0 || payload.original_size > static_cast<std::uint64_t>(m_config.max_inbound_original_size)) {
-        refuse();
+    if (payload.data_chunks < 2 || payload.data_chunks >= fec::FEC_TOTAL_CHUNKS || payload.original_size == 0 ||
+        payload.original_size > static_cast<std::uint64_t>(m_config.max_inbound_original_size)) {
+        refuse(/*fault=*/true);
         return;
     }
 
@@ -276,8 +276,7 @@ void RelayEngine::OnBlockHeader(const InboundPeerInfo& inbound_peer,
     try {
         params = fec::Parameters::FromDataChunkCount(payload.data_chunks);
     } catch (const std::exception&) {
-        EraseInbound(key);
-        MarkFinished(key, now);
+        refuse(/*fault=*/true);
         return;
     }
 
@@ -286,23 +285,28 @@ void RelayEngine::OnBlockHeader(const InboundPeerInfo& inbound_peer,
     const std::size_t expected_group_count = DivCeil(original_size, group_payload_bytes);
     if (expected_group_count > std::numeric_limits<std::uint16_t>::max() ||
         payload.coding_group_count != static_cast<std::uint16_t>(expected_group_count)) {
-        refuse();
+        refuse(/*fault=*/true);
         return;
     }
 
     const std::size_t decoder_bytes = fec::Decoder::MemoryBytes(params, original_size);
     if (decoder_bytes > m_config.max_inbound_decoder_bytes_per_entry) {
-        refuse();
-        return;
-    }
-    if (IsSuspended(slot, now)) {
-        RejectInbound(slot);
-        EraseInbound(key);
+        refuse(/*fault=*/true);
         return;
     }
 
+    // Chunks that arrived before the header must fit it, checked before anything is evicted.
+    if (existing != m_inbound.end()) {
+        for (const fec::Chunk& chunk : existing->second.buffered_chunks) {
+            if (chunk.coding_group_id >= expected_group_count || chunk.chunk_id >= fec::FEC_TOTAL_CHUNKS) {
+                refuse(/*fault=*/true);
+                return;
+            }
+        }
+    }
+
     if (!MakeRoom(key, /*new_entry=*/existing == m_inbound.end(), decoder_bytes, now)) {
-        refuse();
+        refuse(/*fault=*/false);
         return;
     }
     existing = m_inbound.find(key);
@@ -312,7 +316,7 @@ void RelayEngine::OnBlockHeader(const InboundPeerInfo& inbound_peer,
         relay.decoder.emplace(params, original_size);
     } catch (const std::exception&) {
         relay.decoder.reset();
-        refuse();
+        refuse(/*fault=*/false);
         return;
     }
     relay.params = params;
@@ -321,8 +325,7 @@ void RelayEngine::OnBlockHeader(const InboundPeerInfo& inbound_peer,
 
     for (const fec::Chunk& chunk : relay.buffered_chunks) {
         if (!relay.decoder->AddChunk(chunk)) {
-            refuse();
-            RecordFault(slot, now);
+            refuse(/*fault=*/true);
             return;
         }
     }
@@ -344,7 +347,7 @@ void RelayEngine::OnBlockChunk(const InboundPeerInfo& inbound_peer,
     EvictExpiredInbound(now);
 
     const InboundRelayKey key = MakeInboundRelayKey(inbound_peer, payload.block_hash_prefix);
-    if (IsKnown(payload.block_hash_prefix) || IsSettled(payload.block_hash_prefix, now) || IsFinished(key, now)) {
+    if (IsKnown(payload.block_hash_prefix) || IsHandled(key)) {
         ++m_stats.blocks_already_known;
         return;
     }
@@ -545,6 +548,7 @@ void RelayEngine::RecordFault(std::size_t slot_index, Clock::TimePoint now)
     PeerInbound& peer = Peer(slot_index);
     DecayFaults(peer, now);
     ++peer.fault_score;
+    ++peer.stats.faults;
     if (peer.fault_score >= m_config.peer_fault_threshold) {
         SuspendPeer(slot_index, now);
     }
@@ -694,50 +698,25 @@ void RelayEngine::ChargeDecoder(const InboundRelayKey& key, InboundRelay& relay,
 
 void RelayEngine::MarkFinished(const InboundRelayKey& key, Clock::TimePoint now)
 {
-    if (!m_finished.insert(key).second) {
-        return;
-    }
-    m_finished_order.emplace_back(key, now);
-    while (m_finished_order.size() > kMaxHandledInbound) {
-        m_finished.erase(m_finished_order.front().first);
-        m_finished_order.pop_front();
-    }
-}
-
-bool RelayEngine::IsFinished(const InboundRelayKey& key, Clock::TimePoint now)
-{
-    while (!m_finished_order.empty() && now - m_finished_order.front().second > kHandledInboundLifetime) {
-        m_finished.erase(m_finished_order.front().first);
-        m_finished_order.pop_front();
-    }
-    return m_finished.count(key) != 0;
+    m_finished.Insert(key, now);
 }
 
 void RelayEngine::SettleInbound(std::uint64_t hash_prefix, Clock::TimePoint now)
 {
     EraseInboundForPrefix(hash_prefix);
-    if (!m_settled.insert(hash_prefix).second) {
-        return;
-    }
-    m_settled_order.emplace_back(hash_prefix, now);
-    while (m_settled_order.size() > kMaxHandledInbound) {
-        m_settled.erase(m_settled_order.front().first);
-        m_settled_order.pop_front();
-    }
+    m_settled.Insert(hash_prefix, now);
 }
 
-bool RelayEngine::IsSettled(std::uint64_t hash_prefix, Clock::TimePoint now)
+bool RelayEngine::IsHandled(const InboundRelayKey& key) const
 {
-    while (!m_settled_order.empty() && now - m_settled_order.front().second > kHandledInboundLifetime) {
-        m_settled.erase(m_settled_order.front().first);
-        m_settled_order.pop_front();
-    }
-    return m_settled.count(hash_prefix) != 0;
+    return m_settled.Contains(key.hash_prefix) || m_finished.Contains(key);
 }
 
 void RelayEngine::LogUnusedBlock(Clock::TimePoint now, std::size_t slot_index, const std::string& block, const char* reason)
 {
-    if (const auto message = m_unused_block_logs.Record(
+    // One limit per reason, so a frequent reason does not hide a rarer one.
+    auto& limiter = m_unused_block_logs.try_emplace(reason, std::chrono::seconds{60}).first->second;
+    if (const auto message = limiter.Record(
             now, "relay inbound block " + block + " from peer slot " + std::to_string(slot_index) + " not used: " + reason)) {
         LOG_WARN(*message);
     }
@@ -751,6 +730,9 @@ void RelayEngine::UpdateUsageStats()
 
 void RelayEngine::EvictExpiredInbound(Clock::TimePoint now)
 {
+    m_finished.Prune(now);
+    m_settled.Prune(now);
+
     for (auto it = m_inbound.begin(); it != m_inbound.end();) {
         if (now - it->second.last_updated <= m_config.max_inbound_age) {
             ++it;
@@ -835,100 +817,108 @@ void RelayEngine::TryFinalizeInbound(const InboundRelayKey& key, InboundRelay& r
         return;
     }
 
-    const auto now = m_clock.Now();
     const std::size_t slot = key.slot_index;
     const auto reconstructed = relay.decoder->Reconstruct();
 
     // The decoder is no longer needed whatever happens next; release it before calling the node,
     // and ignore the rest of this block's chunks from this peer.
+    const auto finished_at = m_clock.Now();
     EraseInbound(key);
-    MarkFinished(key, now);
+    MarkFinished(key, finished_at);
 
     if (!reconstructed.has_value()) {
         ++m_stats.submit_failures;
-        ++Peer(slot).stats.submit_failures;
-        LogUnusedBlock(now, slot, "(undecodable)", "decode failed");
-        RecordFault(slot, now);
+        LogUnusedBlock(finished_at, slot, "(undecodable)", "decode failed");
+        RecordFault(slot, finished_at);
         return;
     }
 
-    // The reconstructed block must be the block that was announced.
+    // The reconstructed block must be the block that was announced. Only its 80-byte header is
+    // bound to the identifier; the rest is judged by the node.
     const auto summary = ReadBlockHeaderSummary(*reconstructed);
     if (!summary.has_value() || HashPrefixFromHex(summary->hash_hex) != key.hash_prefix) {
         ++m_stats.blocks_mismatched;
-        ++Peer(slot).stats.blocks_dropped;
-        LogUnusedBlock(now, slot, summary.has_value() ? summary->hash_hex : "(no header)", "does not match its announced identifier");
-        RecordFault(slot, now);
+        LogUnusedBlock(finished_at, slot, summary.has_value() ? summary->hash_hex : "(no header)", "does not match its announced identifier");
+        RecordFault(slot, finished_at);
         return;
     }
-
-    // From here on the outcome is a property of this block, not of the copy: other peers' copies
-    // of it are not decoded and sent to the node again.
     const auto& block = summary->hash_hex;
 
-    // It must also build on the node's best chain, at or close to its tip.
+    // It must also build on the node's best chain, at or close to its tip. Answers that depend
+    // only on the header, or on the node not answering, hold for every copy of the block and
+    // settle it; answers that may depend on this copy's body, or that the node may outgrow
+    // within seconds, end only this peer's copy.
     const ParentCheck parent = submitter.CheckParent(block, summary->prev_hash_hex, m_config.max_parent_depth);
+    const auto checked_at = m_clock.Now();
     switch (parent) {
     case ParentCheck::kNearTip:
         break;
     case ParentCheck::kAlreadyKnown:
         ++m_stats.blocks_already_known;
-        SettleInbound(key.hash_prefix, now);
+        SettleInbound(key.hash_prefix, checked_at);
         return;
     case ParentCheck::kUnavailable:
         // Nothing is known about the block, and the peer is not at fault.
         ++m_stats.block_checks_unavailable;
-        LogUnusedBlock(now, slot, block, "qbitd did not answer the parent check");
-        SettleInbound(key.hash_prefix, now);
+        LogUnusedBlock(checked_at, slot, block, "qbitd did not answer the parent check");
+        SettleInbound(key.hash_prefix, checked_at);
         return;
     case ParentCheck::kNodeBehind:
         // The local node has not caught up with this block's chain; not the peer's fault.
         ++m_stats.blocks_node_behind;
-        SettleInbound(key.hash_prefix, now);
         return;
     case ParentCheck::kTooFar:
+        ++m_stats.blocks_parent_rejected;
+        LogUnusedBlock(checked_at, slot, block, "too far from the best block");
+        SettleInbound(key.hash_prefix, checked_at);
+        RecordFault(slot, checked_at);
+        return;
     case ParentCheck::kUnknown:
         ++m_stats.blocks_parent_rejected;
-        ++Peer(slot).stats.blocks_dropped;
-        LogUnusedBlock(now, slot, block, parent == ParentCheck::kUnknown ? "parent unknown to qbitd" : "parent too far from the best block");
-        SettleInbound(key.hash_prefix, now);
-        RecordFault(slot, now);
+        LogUnusedBlock(checked_at, slot, block, "parent unknown to qbitd");
+        RecordFault(slot, checked_at);
         return;
     }
 
     const SubmitOutcome outcome = submitter.SubmitBlock(*reconstructed);
+    const auto submitted_at = m_clock.Now();
     if (outcome == SubmitOutcome::kAccepted) {
         ++m_stats.submit_successes;
         ++m_stats.blocks_received_in;
-        RecordAccepted(slot, now);
+        RecordAccepted(slot, submitted_at);
         RememberSeen(key.hash_prefix);
         EraseInboundForPrefix(key.hash_prefix);
         return;
     }
 
     ++m_stats.submit_failures;
-    ++Peer(slot).stats.submit_failures;
-    SettleInbound(key.hash_prefix, now);
     switch (outcome) {
     case SubmitOutcome::kDuplicate:
+        // The node already holds this block, so other copies add nothing.
         ++m_stats.submit_duplicates;
+        SettleInbound(key.hash_prefix, submitted_at);
         break;
     case SubmitOutcome::kInconclusive:
+        // Stored by the node (so this copy's body was sound): other copies add nothing.
         ++m_stats.submit_inconclusive;
-        RecordFault(slot, now);
+        SettleInbound(key.hash_prefix, submitted_at);
+        RecordFault(slot, submitted_at);
         break;
     case SubmitOutcome::kRejected:
+        // May be this copy's body only: another peer's copy is still tried.
         ++m_stats.submit_rejected;
-        LogUnusedBlock(now, slot, block, "rejected by qbitd");
-        RecordFault(slot, now);
+        LogUnusedBlock(submitted_at, slot, block, "rejected by qbitd");
+        RecordFault(slot, submitted_at);
         break;
     case SubmitOutcome::kTimeout:
         ++m_stats.submit_timeouts;
-        LogUnusedBlock(now, slot, block, "no answer from qbitd to submitblock");
+        LogUnusedBlock(submitted_at, slot, block, "no answer from qbitd to submitblock");
+        SettleInbound(key.hash_prefix, submitted_at);
         break;
     case SubmitOutcome::kError:
         ++m_stats.submit_errors;
-        LogUnusedBlock(now, slot, block, "qbitd returned an error for submitblock");
+        LogUnusedBlock(submitted_at, slot, block, "qbitd returned an error for submitblock");
+        SettleInbound(key.hash_prefix, submitted_at);
         break;
     case SubmitOutcome::kAccepted:
         break;
@@ -946,6 +936,13 @@ bool RelayEngine::FeedChunk(const InboundRelayKey& key, InboundRelay& relay, con
     if (!relay.decoder.has_value()) {
         if (relay.buffered_chunks.size() >= m_config.max_inbound_buffered_chunks_per_entry) {
             RejectInbound(key.slot_index);
+            return true;
+        }
+        const bool repeated = std::any_of(relay.buffered_chunks.begin(), relay.buffered_chunks.end(), [&chunk](const fec::Chunk& held) {
+            return held.coding_group_id == chunk.coding_group_id && held.chunk_id == chunk.chunk_id;
+        });
+        if (repeated) {
+            // Not progress, and nothing new to keep.
             return true;
         }
         if (!HasGlobalInboundBufferCapacity()) {

@@ -570,7 +570,9 @@ ParentCheck RpcClient::CheckParent(const std::string& block_hash_hex,
             return ParentCheck::kUnavailable;
         }
         if (block->confirmations >= 1) {
-            return ParentCheck::kAlreadyKnown;
+            // Known near the tip (a race with the node's own peers) is harmless; a block far down
+            // the best chain is as far from the tip as a block whose parent is.
+            return block->confirmations - 1 <= depth ? ParentCheck::kAlreadyKnown : ParentCheck::kTooFar;
         }
     }
 
@@ -592,9 +594,9 @@ ParentCheck RpcClient::CheckParent(const std::string& block_hash_hex,
     if (!best.has_value()) {
         return ParentCheck::kUnavailable;
     }
-    if (parent->height > best->height && parent->chainwork > best->chainwork) {
-        // The node knows the parent only as a header on a branch with more work than its best
-        // block: it is still catching up with that branch.
+    if (parent->chainwork > best->chainwork) {
+        // The parent is on a branch with more work than the node's best block that the node has
+        // not made its best chain yet: it is still catching up with that branch.
         return ParentCheck::kNodeBehind;
     }
     if (parent->height + depth < best->height) {

@@ -77,8 +77,7 @@ void LogPeerRelayStats(const RelayEngine& relay_engine, const std::vector<PeerCo
         LOG_INFO("peer relay stats peer=" + name
                  + " slot=" + std::to_string(stats.slot_index)
                  + " blocks_in=" + std::to_string(stats.blocks_received_in)
-                 + " submit_fail=" + std::to_string(stats.submit_failures)
-                 + " blocks_dropped=" + std::to_string(stats.blocks_dropped)
+                 + " faults=" + std::to_string(stats.faults)
                  + " inbound_rejected=" + std::to_string(stats.inbound_rejected)
                  + " inbound_evicted=" + std::to_string(stats.inbound_evictions)
                  + " fault_score=" + std::to_string(stats.fault_score)

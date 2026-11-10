@@ -236,6 +236,8 @@ struct ServerStep {
     std::string response{};
     int delay_ms{0};
     std::function<void(const std::string&)> on_request{};
+    // When set, the response is written in eight slices with this pause before each.
+    int slice_delay_ms{0};
 };
 
 class MockHttpServer {
@@ -345,7 +347,15 @@ private:
                 std::this_thread::sleep_for(std::chrono::milliseconds(step.delay_ms));
             }
 
-            SendAll(client_fd, step.response);
+            if (step.slice_delay_ms > 0) {
+                const std::size_t slice = (step.response.size() + 7) / 8;
+                for (std::size_t offset = 0; offset < step.response.size(); offset += slice) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(step.slice_delay_ms));
+                    SendAll(client_fd, step.response.substr(offset, slice));
+                }
+            } else {
+                SendAll(client_fd, step.response);
+            }
             shutdown(client_fd, SHUT_RDWR);
             close(client_fd);
         }
@@ -689,10 +699,16 @@ void TestCheckParentBlockAlreadyKnown()
     RunParentCase("block is the best block",
                   {{ServerStep{JsonResult("\"" + kBlockHash + "\"")}}, photon::ParentCheck::kAlreadyKnown, {"getbestblockhash"}},
                   prev);
-    // A block the node already has deep in its best chain is recognised before its parent is judged.
+    // A block the node already has near the tip is recognised before its parent is judged...
     RunParentCase("block on the best chain",
-                  {{ServerStep{JsonResult("\"" + HashHex('b') + "\"")}, ServerStep{HeaderReply(kBlockHash, 20, 80, ChainWork("100"))}},
+                  {{ServerStep{JsonResult("\"" + HashHex('b') + "\"")}, ServerStep{HeaderReply(kBlockHash, 3, 98, ChainWork("100"))}},
                    photon::ParentCheck::kAlreadyKnown,
+                   {"getbestblockhash", "getblockheader"}},
+                  prev);
+    // ...but one deep in the best chain is as far from the tip as a block whose parent is.
+    RunParentCase("block deep in the best chain",
+                  {{ServerStep{JsonResult("\"" + HashHex('b') + "\"")}, ServerStep{HeaderReply(kBlockHash, 20, 80, ChainWork("100"))}},
+                   photon::ParentCheck::kTooFar,
                    {"getbestblockhash", "getblockheader"}},
                   prev);
 }
@@ -788,7 +804,7 @@ void TestCheckParentCompetingBranchNearTip()
     RunParentCase("branch far below the tip",
                   {{ServerStep{JsonResult("\"" + best + "\"")},
                     BlockNotFound(),
-                    ServerStep{HeaderReply(prev, -1, 93, ChainWork("1f6"))},
+                    ServerStep{HeaderReply(prev, -1, 93, ChainWork("1e0"))},
                     ServerStep{HeaderReply(best, 1, 100, ChainWork("1f5"))}},
                    photon::ParentCheck::kTooFar,
                    {"getbestblockhash", "getblockheader", "getblockheader", "getblockheader"}},
@@ -804,6 +820,15 @@ void TestCheckParentNodeBehind()
                   {{ServerStep{JsonResult("\"" + best + "\"")},
                     BlockNotFound(),
                     ServerStep{HeaderReply(prev, -1, 105, ChainWork("2f4"))},
+                    ServerStep{HeaderReply(best, 1, 100, ChainWork("1f5"))}},
+                   photon::ParentCheck::kNodeBehind,
+                   {"getbestblockhash", "getblockheader", "getblockheader", "getblockheader"}},
+                  prev);
+    // A branch with more work than the best block, even below it in height.
+    RunParentCase("lower branch with more work",
+                  {{ServerStep{JsonResult("\"" + best + "\"")},
+                    BlockNotFound(),
+                    ServerStep{HeaderReply(prev, -1, 98, ChainWork("2f4"))},
                     ServerStep{HeaderReply(best, 1, 100, ChainWork("1f5"))}},
                    photon::ParentCheck::kNodeBehind,
                    {"getbestblockhash", "getblockheader", "getblockheader", "getblockheader"}},
@@ -870,8 +895,9 @@ void TestCheckParentSharesOneDeadline()
 void TestRpcDeadlineBoundsWholeCall()
 {
     const auto cookie_path = WriteTempFile("rpc_cookie_trickle", "__cookie__:trickletoken\n");
-    // A reply that arrives after the call's deadline fails even though the connection stays open.
-    MockHttpServer server({ServerStep{JsonResult(R"("ok")"), 700, {}}});
+    // Each slice of the reply arrives well within the socket timeout, but the whole reply does not
+    // arrive within the call's deadline.
+    MockHttpServer server({ServerStep{JsonResult(R"("ok")"), 0, {}, 100}});
     photon::RpcClient client = MakeClient(server.port(), cookie_path, std::chrono::milliseconds{300});
 
     const auto start = std::chrono::steady_clock::now();
