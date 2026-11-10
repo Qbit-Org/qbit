@@ -63,6 +63,12 @@ public:
     [[nodiscard]] bool IsComplete() const;
     std::optional<std::vector<std::uint8_t>> Reconstruct() const;
 
+    /// Upper bound, in bytes, of the heap memory a decoder constructed with these arguments holds
+    /// between construction and destruction, including the per-group codec state that the vendored
+    /// CM256 and Wirehair codecs allocate. It does not include the buffer that Reconstruct() returns.
+    /// Returns SIZE_MAX for arguments the constructor would reject.
+    [[nodiscard]] static std::size_t MemoryBytes(Parameters params, std::size_t original_size);
+
 private:
     class Impl;
     std::unique_ptr<Impl> m_impl;
