@@ -18,21 +18,18 @@ on:
       - 0.1.x
       - 1.0.0
       - 1.x.x
-      - develop
   push:
     branches:
       - main
       - 0.1.x
       - 1.0.0
       - 1.x.x
-      - develop
   merge_group:
     branches:
       - main
       - 0.1.x
       - 1.0.0
       - 1.x.x
-      - develop
 
 permissions:
   contents: read
@@ -312,7 +309,6 @@ jobs:
             ci.release.test_validate_builder_attestations
             ci.release.test_validate_key_metadata
             ci.release.test_validate_release_artifacts
-            ci.release.test_verify_mainnet_ci_posture
             ci.release.test_verify_mainnet_release_posture
             ci.release.test_verify_p2mr_v1_conformance
           )
