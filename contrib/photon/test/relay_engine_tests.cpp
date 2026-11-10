@@ -5,17 +5,23 @@
 #include <relay_engine.h>
 #include <udp_transport.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdint>
 #include <exception>
 #include <functional>
 #include <iostream>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
+
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 namespace {
 
@@ -25,11 +31,14 @@ using photon::InboundPeerInfo;
 using photon::MessageType;
 using photon::MockClock;
 using photon::Packet;
+using photon::ParentCheck;
 using photon::PeerConfig;
 using photon::PeerManager;
+using photon::PeerRelayStats;
 using photon::RelayEngine;
 using photon::RelayEngineConfig;
 using photon::RelayStats;
+using photon::SubmitOutcome;
 
 constexpr std::uint64_t kRemoteSessionId = 7001;
 
@@ -59,6 +68,21 @@ std::vector<std::uint8_t> RandomBytes(std::size_t size, std::uint64_t seed)
         byte = static_cast<std::uint8_t>(dist(rng));
     }
     return out;
+}
+
+// A serialized block: an 80-byte header followed by transaction bytes. The relay reads only the
+// header, so random bytes serve as both.
+std::vector<std::uint8_t> MakeBlock(std::size_t size, std::uint64_t seed)
+{
+    Require(size > 80, "test block must hold a header and a transaction count");
+    return RandomBytes(size, seed);
+}
+
+std::uint64_t PrefixOf(const std::vector<std::uint8_t>& block)
+{
+    const auto summary = photon::ReadBlockHeaderSummary(block);
+    Require(summary.has_value(), "test block header should be readable");
+    return photon::HashPrefixFromHex(summary->hash_hex);
 }
 
 PeerConfig MakePeer(std::uint16_t port, const std::array<std::uint8_t, 32>& key)
@@ -93,17 +117,45 @@ public:
 
 class CapturingSubmitter final : public photon::BlockSubmitter {
 public:
-    bool SubmitBlock(std::span<const std::uint8_t> block_data) override
+    ParentCheck CheckParent(const std::string& prev_hash_hex, std::uint32_t max_depth) override
+    {
+        ++check_calls;
+        last_prev_hash = prev_hash_hex;
+        last_max_depth = max_depth;
+        return parent_result;
+    }
+
+    SubmitOutcome SubmitBlock(std::span<const std::uint8_t> block_data) override
     {
         ++submit_calls;
         last_block.assign(block_data.begin(), block_data.end());
         return submit_result;
     }
 
-    bool submit_result{true};
+    ParentCheck parent_result{ParentCheck::kNearTip};
+    SubmitOutcome submit_result{SubmitOutcome::kAccepted};
+    std::size_t check_calls{0};
     std::size_t submit_calls{0};
+    std::string last_prev_hash{};
+    std::uint32_t last_max_depth{0};
     std::vector<std::uint8_t> last_block{};
 };
+
+struct TestBlock {
+    std::vector<std::uint8_t> bytes{};
+    std::uint64_t prefix{0};
+    photon::fec::EncodedBlock encoded{};
+};
+
+TestBlock EncodeTestBlock(std::size_t size, std::uint64_t seed, std::uint16_t data_chunks = 2)
+{
+    TestBlock block;
+    block.bytes = MakeBlock(size, seed);
+    block.prefix = PrefixOf(block.bytes);
+    photon::fec::Encoder encoder(photon::fec::Parameters::FromDataChunkCount(data_chunks));
+    block.encoded = encoder.Encode(block.bytes);
+    return block;
+}
 
 bool ResolveLoopback(const std::string& host,
                      std::uint16_t port,
@@ -251,11 +303,11 @@ void TestInboundReconstructionAllChunks()
     CapturingSubmitter submitter;
 
     const auto params = photon::fec::Parameters::FromDataChunkCount(20);
-    const std::vector<std::uint8_t> block = RandomBytes(5000, 0x3333);
+    const std::vector<std::uint8_t> block = MakeBlock(5000, 0x3333);
     photon::fec::Encoder encoder(params);
     const photon::fec::EncodedBlock encoded = encoder.Encode(block);
 
-    constexpr std::uint64_t kPrefix = 0x1234567890ABCDEFULL;
+    const std::uint64_t kPrefix = PrefixOf(block);
     BlockHeaderPayload header{};
     header.block_hash_prefix = kPrefix;
     header.original_size = static_cast<std::uint64_t>(block.size());
@@ -270,6 +322,7 @@ void TestInboundReconstructionAllChunks()
 
     Require(submitter.submit_calls == 1, "expected one successful submit");
     Require(submitter.last_block == block, "reconstructed block mismatch");
+    Require(submitter.check_calls == 1, "expected one parent check before the submit");
 }
 
 void TestInboundDedupKnownPrefix()
@@ -306,11 +359,11 @@ void TestInboundWithLossStillRecovers()
     CapturingSubmitter submitter;
 
     const auto params = photon::fec::Parameters::FromDataChunkCount(20);
-    const std::vector<std::uint8_t> block = RandomBytes(5000, 0x5555);
+    const std::vector<std::uint8_t> block = MakeBlock(5000, 0x5555);
     photon::fec::Encoder encoder(params);
     const photon::fec::EncodedBlock encoded = encoder.Encode(block);
 
-    constexpr std::uint64_t kPrefix = 0x9988776655443322ULL;
+    const std::uint64_t kPrefix = PrefixOf(block);
     BlockHeaderPayload header{};
     header.block_hash_prefix = kPrefix;
     header.original_size = static_cast<std::uint64_t>(block.size());
@@ -334,11 +387,11 @@ void TestBlockHeaderFlowCreatesDecoder()
     CapturingSubmitter submitter;
 
     const auto params = photon::fec::Parameters::FromDataChunkCount(2);
-    const std::vector<std::uint8_t> block = {'a', 'b', 'c', 'd', 'e'};
+    const std::vector<std::uint8_t> block = MakeBlock(100, 0xABCDE);
     photon::fec::Encoder encoder(params);
     const photon::fec::EncodedBlock encoded = encoder.Encode(block);
 
-    constexpr std::uint64_t kPrefix = 0x0F0E0D0C0B0A0908ULL;
+    const std::uint64_t kPrefix = PrefixOf(block);
 
     engine.OnBlockChunk(BuildChunkPayload(encoded.chunks[0], kPrefix), submitter);
     Require(submitter.submit_calls == 0, "chunk before header should not submit");
@@ -363,11 +416,11 @@ void TestDuplicateHeaderDoesNotResetProgress()
     CapturingSubmitter submitter;
 
     const auto params = photon::fec::Parameters::FromDataChunkCount(2);
-    const std::vector<std::uint8_t> block = {'r', 'e', 'l', 'a', 'y'};
+    const std::vector<std::uint8_t> block = MakeBlock(100, 0x7E1A7);
     photon::fec::Encoder encoder(params);
     const photon::fec::EncodedBlock encoded = encoder.Encode(block);
 
-    constexpr std::uint64_t kPrefix = 0x0A0B0C0D0E0F0102ULL;
+    const std::uint64_t kPrefix = PrefixOf(block);
 
     BlockHeaderPayload header{};
     header.block_hash_prefix = kPrefix;
@@ -393,11 +446,11 @@ void TestSamePrefixConflictingPeerDoesNotPoisonHonestRelay()
     CapturingSubmitter submitter;
 
     const auto params = photon::fec::Parameters::FromDataChunkCount(2);
-    const std::vector<std::uint8_t> block = {'h', 'o', 'n', 'e', 's', 't'};
+    const std::vector<std::uint8_t> block = MakeBlock(100, 0x40E57);
     photon::fec::Encoder encoder(params);
     const photon::fec::EncodedBlock encoded = encoder.Encode(block);
 
-    constexpr std::uint64_t kPrefix = 0x0BADC0FFEE123456ULL;
+    const std::uint64_t kPrefix = PrefixOf(block);
     const InboundPeerInfo honest_peer{
         .slot_index = 0,
         .remote_session_id = 7001,
@@ -489,11 +542,11 @@ void TestPostHeaderChunkFailureErasesDecoder()
     CapturingSubmitter submitter;
 
     const auto params = photon::fec::Parameters::FromDataChunkCount(2);
-    const std::vector<std::uint8_t> block = {'b', 'a', 'd'};
+    const std::vector<std::uint8_t> block = MakeBlock(100, 0xBAD);
     photon::fec::Encoder encoder(params);
     const photon::fec::EncodedBlock encoded = encoder.Encode(block);
 
-    constexpr std::uint64_t kPrefix = 0x2525252525252525ULL;
+    const std::uint64_t kPrefix = PrefixOf(block);
     engine.OnBlockHeader(BuildHeaderPayload(encoded, kPrefix, block.size()), submitter);
 
     BlockChunkPayload invalid = BuildChunkPayload(encoded.chunks[0], kPrefix);
@@ -556,31 +609,26 @@ void TestInboundEntryLimitEvictsOldestPrefix()
     RelayEngine engine(clock, config);
     CapturingSubmitter submitter;
 
-    const auto params = photon::fec::Parameters::FromDataChunkCount(2);
-    const std::vector<std::uint8_t> block = {'l', 'i', 'm', 'i', 't'};
-    photon::fec::Encoder encoder(params);
-    const photon::fec::EncodedBlock encoded = encoder.Encode(block);
+    const TestBlock evicted = EncodeTestBlock(100, 0x11);
+    const TestBlock second = EncodeTestBlock(100, 0x12);
+    const TestBlock kept = EncodeTestBlock(100, 0x13);
 
-    constexpr std::uint64_t kEvictedPrefix = 0x0000000000000001ULL;
-    constexpr std::uint64_t kSecondPrefix = 0x0000000000000002ULL;
-    constexpr std::uint64_t kKeptPrefix = 0x0000000000000003ULL;
-
-    engine.OnBlockChunk(BuildChunkPayload(encoded.chunks[0], kEvictedPrefix), submitter);
+    engine.OnBlockChunk(BuildChunkPayload(evicted.encoded.chunks[0], evicted.prefix), submitter);
     clock.Advance(std::chrono::milliseconds{1});
-    engine.OnBlockChunk(BuildChunkPayload(encoded.chunks[0], kSecondPrefix), submitter);
+    engine.OnBlockChunk(BuildChunkPayload(second.encoded.chunks[0], second.prefix), submitter);
     clock.Advance(std::chrono::milliseconds{1});
-    engine.OnBlockChunk(BuildChunkPayload(encoded.chunks[0], kKeptPrefix), submitter);
+    engine.OnBlockChunk(BuildChunkPayload(kept.encoded.chunks[0], kept.prefix), submitter);
 
     Require(engine.stats().inbound_evictions == 1, "entry cap should evict one incomplete relay");
 
-    engine.OnBlockHeader(BuildHeaderPayload(encoded, kEvictedPrefix, block.size()), submitter);
-    engine.OnBlockChunk(BuildChunkPayload(encoded.chunks[1], kEvictedPrefix), submitter);
+    engine.OnBlockHeader(BuildHeaderPayload(evicted.encoded, evicted.prefix, evicted.bytes.size()), submitter);
+    engine.OnBlockChunk(BuildChunkPayload(evicted.encoded.chunks[1], evicted.prefix), submitter);
     Require(submitter.submit_calls == 0, "oldest evicted prefix should have lost its buffered chunk");
 
-    engine.OnBlockHeader(BuildHeaderPayload(encoded, kKeptPrefix, block.size()), submitter);
-    engine.OnBlockChunk(BuildChunkPayload(encoded.chunks[1], kKeptPrefix), submitter);
+    engine.OnBlockHeader(BuildHeaderPayload(kept.encoded, kept.prefix, kept.bytes.size()), submitter);
+    engine.OnBlockChunk(BuildChunkPayload(kept.encoded.chunks[1], kept.prefix), submitter);
     Require(submitter.submit_calls == 1, "newer prefix should still reconstruct inside entry cap");
-    Require(submitter.last_block == block, "entry-cap reconstruction mismatch");
+    Require(submitter.last_block == kept.bytes, "entry-cap reconstruction mismatch");
 }
 
 void TestInboundAgeLimitEvictsIncompleteRelay()
@@ -594,11 +642,11 @@ void TestInboundAgeLimitEvictsIncompleteRelay()
     PeerManager manager(std::vector<PeerConfig>{}, clock, ResolveLoopback);
 
     const auto params = photon::fec::Parameters::FromDataChunkCount(2);
-    const std::vector<std::uint8_t> block = {'a', 'g', 'e'};
+    const std::vector<std::uint8_t> block = MakeBlock(100, 0xA6E);
     photon::fec::Encoder encoder(params);
     const photon::fec::EncodedBlock encoded = encoder.Encode(block);
 
-    constexpr std::uint64_t kPrefix = 0x0BADF00D0BADF00DULL;
+    const std::uint64_t kPrefix = PrefixOf(block);
 
     engine.OnBlockChunk(BuildChunkPayload(encoded.chunks[0], kPrefix), submitter);
     clock.Advance(std::chrono::milliseconds{11});
@@ -622,11 +670,11 @@ void TestInboundAgeLimitUsesLastActivity()
     PeerManager manager(std::vector<PeerConfig>{}, clock, ResolveLoopback);
 
     const auto params = photon::fec::Parameters::FromDataChunkCount(2);
-    const std::vector<std::uint8_t> block = {'s', 'l', 'o', 'w'};
+    const std::vector<std::uint8_t> block = MakeBlock(100, 0x510);
     photon::fec::Encoder encoder(params);
     const photon::fec::EncodedBlock encoded = encoder.Encode(block);
 
-    constexpr std::uint64_t kPrefix = 0x5151515151515151ULL;
+    const std::uint64_t kPrefix = PrefixOf(block);
 
     engine.OnBlockChunk(BuildChunkPayload(encoded.chunks[0], kPrefix), submitter);
     clock.Advance(std::chrono::milliseconds{8});
@@ -651,11 +699,11 @@ void TestInboundPreHeaderBufferedByteLimit()
     CapturingSubmitter submitter;
 
     const auto params = photon::fec::Parameters::FromDataChunkCount(2);
-    const std::vector<std::uint8_t> block = {'b', 'y', 't', 'e'};
+    const std::vector<std::uint8_t> block = MakeBlock(100, 0xB17E);
     photon::fec::Encoder encoder(params);
     const photon::fec::EncodedBlock encoded = encoder.Encode(block);
 
-    constexpr std::uint64_t kPrefix = 0x1234000012340000ULL;
+    const std::uint64_t kPrefix = PrefixOf(block);
 
     engine.OnBlockChunk(BuildChunkPayload(encoded.chunks[0], kPrefix), submitter);
     engine.OnBlockChunk(BuildChunkPayload(encoded.chunks[1], kPrefix), submitter);
@@ -681,11 +729,11 @@ void TestRejectedNewPrefixChunkDoesNotEvictExistingRelay()
     CapturingSubmitter submitter;
 
     const auto params = photon::fec::Parameters::FromDataChunkCount(2);
-    const std::vector<std::uint8_t> block = {'k', 'e', 'e', 'p'};
+    const std::vector<std::uint8_t> block = MakeBlock(100, 0x4EE9);
     photon::fec::Encoder encoder(params);
     const photon::fec::EncodedBlock encoded = encoder.Encode(block);
 
-    constexpr std::uint64_t kDecoderPrefix = 0xAAAA000000000001ULL;
+    const std::uint64_t kDecoderPrefix = PrefixOf(block);
     constexpr std::uint64_t kBufferedPrefix = 0xBBBB000000000002ULL;
     constexpr std::uint64_t kRejectedPrefix = 0xCCCC000000000003ULL;
 
@@ -717,11 +765,11 @@ void TestInboundLimitsAllowValidReconstruction()
     CapturingSubmitter submitter;
 
     const auto params = photon::fec::Parameters::FromDataChunkCount(2);
-    const std::vector<std::uint8_t> block = {'o', 'k'};
+    const std::vector<std::uint8_t> block = MakeBlock(100, 0x0C);
     photon::fec::Encoder encoder(params);
     const photon::fec::EncodedBlock encoded = encoder.Encode(block);
 
-    constexpr std::uint64_t kPrefix = 0xABCD0000ABCD0000ULL;
+    const std::uint64_t kPrefix = PrefixOf(block);
 
     engine.OnBlockChunk(BuildChunkPayload(encoded.chunks[0], kPrefix), submitter);
     engine.OnBlockHeader(BuildHeaderPayload(encoded, kPrefix, block.size()), submitter);
@@ -753,11 +801,11 @@ void TestStatsAccumulation()
     engine.PumpOutbound(sink, manager);
 
     const auto params = photon::fec::Parameters::FromDataChunkCount(2);
-    const std::vector<std::uint8_t> inbound_block = {'h', 'i'};
+    const std::vector<std::uint8_t> inbound_block = MakeBlock(100, 0x41);
     photon::fec::Encoder encoder(params);
     const photon::fec::EncodedBlock encoded = encoder.Encode(inbound_block);
 
-    constexpr std::uint64_t kInboundPrefix = 0xABCDEF1234567890ULL;
+    const std::uint64_t kInboundPrefix = PrefixOf(inbound_block);
     BlockHeaderPayload header{};
     header.block_hash_prefix = kInboundPrefix;
     header.original_size = static_cast<std::uint64_t>(inbound_block.size());
@@ -772,6 +820,600 @@ void TestStatsAccumulation()
     Require(stats.chunks_sent > 0, "chunks_sent should increment");
     Require(stats.blocks_received_in == 1, "blocks_received_in should increment");
     Require(stats.submit_successes == 1, "submit_successes should increment");
+}
+
+// Sends the header and then the data chunks of every coding group, which completes the decode.
+void DeliverBlock(RelayEngine& engine,
+                  const InboundPeerInfo& peer,
+                  const TestBlock& block,
+                  CapturingSubmitter& submitter,
+                  std::optional<std::uint64_t> announced_prefix = std::nullopt)
+{
+    const std::uint64_t prefix = announced_prefix.value_or(block.prefix);
+    engine.OnBlockHeader(peer, BuildHeaderPayload(block.encoded, prefix, block.bytes.size()), submitter);
+    for (const auto& chunk : block.encoded.chunks) {
+        if (chunk.chunk_id < block.encoded.params.data_chunks) {
+            engine.OnBlockChunk(peer, BuildChunkPayload(chunk, prefix), submitter);
+        }
+    }
+}
+
+std::optional<PeerRelayStats> PeerStats(const RelayEngine& engine, std::size_t slot_index)
+{
+    for (const PeerRelayStats& stats : engine.PeerStatsSnapshot()) {
+        if (stats.slot_index == slot_index) {
+            return stats;
+        }
+    }
+    return std::nullopt;
+}
+
+const InboundPeerInfo kPeer0{.slot_index = 0, .remote_session_id = 7001, .remote_peer_id = 8001};
+const InboundPeerInfo kPeer1{.slot_index = 1, .remote_session_id = 7002, .remote_peer_id = 8002};
+const InboundPeerInfo kPeer2{.slot_index = 2, .remote_session_id = 7003, .remote_peer_id = 8003};
+
+void TestMismatchedIdentifierNotSubmitted()
+{
+    MockClock clock{};
+    RelayEngine engine(clock);
+    CapturingSubmitter submitter;
+
+    const TestBlock block = EncodeTestBlock(500, 0xD1);
+    DeliverBlock(engine, kPeer0, block, submitter, block.prefix ^ 0x1ULL);
+
+    Require(submitter.check_calls == 0, "a block that is not the announced one must not reach the node");
+    Require(submitter.submit_calls == 0, "a block that is not the announced one must not be submitted");
+    Require(engine.stats().blocks_mismatched == 1, "identifier mismatch should be counted");
+    Require(engine.stats().submit_failures == 0, "a dropped block is not a submission");
+    Require(engine.stats().inbound_entries == 0, "dropped block state should be released");
+    const auto peer = PeerStats(engine, 0);
+    Require(peer.has_value() && peer->blocks_dropped == 1 && peer->fault_score == 1, "mismatch should count against the peer");
+}
+
+void TestTooShortBlockNotSubmitted()
+{
+    MockClock clock{};
+    RelayEngine engine(clock);
+    CapturingSubmitter submitter;
+
+    // 80 bytes cannot hold a header and a transaction count.
+    const std::vector<std::uint8_t> payload = RandomBytes(80, 0xD2);
+    photon::fec::Encoder encoder(photon::fec::Parameters::FromDataChunkCount(2));
+    TestBlock block;
+    block.bytes = payload;
+    block.prefix = 0x1122334455667788ULL;
+    block.encoded = encoder.Encode(payload);
+    DeliverBlock(engine, kPeer0, block, submitter);
+
+    Require(submitter.submit_calls == 0, "a payload without a block header must not be submitted");
+    Require(engine.stats().blocks_mismatched == 1, "unreadable header should be counted");
+}
+
+void TestParentCheckReceivesBlockParent()
+{
+    MockClock clock{};
+    RelayEngine engine(clock);
+    CapturingSubmitter submitter;
+
+    TestBlock block = EncodeTestBlock(300, 0xD3);
+    // hashPrevBlock (bytes 4..36, little-endian) = 0x01..0x20, printed in display order.
+    for (std::size_t i = 0; i < 32; ++i) {
+        block.bytes[4 + i] = static_cast<std::uint8_t>(i + 1);
+    }
+    block.prefix = PrefixOf(block.bytes);
+    photon::fec::Encoder encoder(photon::fec::Parameters::FromDataChunkCount(2));
+    block.encoded = encoder.Encode(block.bytes);
+
+    DeliverBlock(engine, kPeer0, block, submitter);
+
+    Require(submitter.check_calls == 1, "parent should be checked once per finished block");
+    Require(submitter.last_prev_hash == "201f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090807060504030201",
+            "parent hash should be passed in display order");
+    Require(submitter.last_max_depth == RelayEngineConfig{}.max_parent_depth, "configured depth should be passed");
+    Require(submitter.submit_calls == 1, "block near the tip should be submitted");
+}
+
+void TestBlockWithParentAwayFromTipNotSubmitted()
+{
+    for (const ParentCheck result : {ParentCheck::kTooFar, ParentCheck::kUnknown}) {
+        MockClock clock{};
+        RelayEngine engine(clock);
+        CapturingSubmitter submitter;
+        submitter.parent_result = result;
+
+        DeliverBlock(engine, kPeer0, EncodeTestBlock(500, 0xD4), submitter);
+
+        Require(submitter.check_calls == 1, "parent should be checked");
+        Require(submitter.submit_calls == 0, "block whose parent is not near the tip must not be submitted");
+        Require(engine.stats().blocks_parent_rejected == 1, "parent rejection should be counted");
+        const auto peer = PeerStats(engine, 0);
+        Require(peer.has_value() && peer->blocks_dropped == 1 && peer->fault_score == 1,
+                "parent rejection should count against the peer");
+    }
+}
+
+void TestUnavailableParentCheckDropsWithoutPenalty()
+{
+    MockClock clock{};
+    RelayEngine engine(clock);
+    CapturingSubmitter submitter;
+    submitter.parent_result = ParentCheck::kUnavailable;
+
+    for (std::uint64_t i = 0; i < 20; ++i) {
+        DeliverBlock(engine, kPeer0, EncodeTestBlock(200, 0xE000 + i), submitter);
+    }
+
+    Require(submitter.submit_calls == 0, "blocks must not be submitted when the parent check fails");
+    Require(engine.stats().block_checks_unavailable == 20, "failed checks should be counted");
+    Require(engine.stats().blocks_parent_rejected == 0, "failed checks are not parent rejections");
+    Require(engine.stats().peer_suspensions == 0, "failed checks must not suspend the peer");
+    const auto peer = PeerStats(engine, 0);
+    Require(peer.has_value() && peer->fault_score == 0 && !peer->suspended, "failed checks must not count against the peer");
+}
+
+void TestSubmitOutcomesCountedSeparately()
+{
+    MockClock clock{};
+    RelayEngine engine(clock);
+    CapturingSubmitter submitter;
+
+    const std::vector<SubmitOutcome> outcomes{
+        SubmitOutcome::kAccepted,
+        SubmitOutcome::kDuplicate,
+        SubmitOutcome::kDuplicate,
+        SubmitOutcome::kInconclusive,
+        SubmitOutcome::kRejected,
+        SubmitOutcome::kTimeout,
+        SubmitOutcome::kTimeout,
+        SubmitOutcome::kTimeout,
+        SubmitOutcome::kError,
+    };
+    std::uint64_t seed = 0xF000;
+    for (const SubmitOutcome outcome : outcomes) {
+        submitter.submit_result = outcome;
+        DeliverBlock(engine, kPeer0, EncodeTestBlock(200, ++seed), submitter);
+    }
+
+    const RelayStats stats = engine.stats();
+    Require(stats.submit_successes == 1 && stats.blocks_received_in == 1, "accepted count");
+    Require(stats.submit_duplicates == 2, "duplicate count");
+    Require(stats.submit_inconclusive == 1, "inconclusive count");
+    Require(stats.submit_rejected == 1, "rejected count");
+    Require(stats.submit_timeouts == 3, "timeout count");
+    Require(stats.submit_errors == 1, "error count");
+    Require(stats.submit_failures == 8, "submit_failures should keep counting every non-accepted submission");
+    const auto peer = PeerStats(engine, 0);
+    Require(peer.has_value() && peer->blocks_received_in == 1 && peer->submit_failures == 8, "per-peer submit counts");
+    Require(peer->fault_score == 2, "only inconclusive and rejected blocks count against the peer");
+}
+
+void TestNeutralOutcomesNeverSuspendPeer()
+{
+    MockClock clock{};
+    RelayEngine engine(clock);
+    CapturingSubmitter submitter;
+
+    std::uint64_t seed = 0xF100;
+    for (const SubmitOutcome outcome : {SubmitOutcome::kDuplicate, SubmitOutcome::kTimeout, SubmitOutcome::kError}) {
+        submitter.submit_result = outcome;
+        for (int i = 0; i < 12; ++i) {
+            DeliverBlock(engine, kPeer0, EncodeTestBlock(200, ++seed), submitter);
+        }
+    }
+
+    Require(submitter.submit_calls == 36, "every block should have been submitted");
+    Require(engine.stats().peer_suspensions == 0, "duplicates, timeouts and errors must not suspend a peer");
+    const auto peer = PeerStats(engine, 0);
+    Require(peer.has_value() && peer->fault_score == 0, "neutral outcomes must not add to the fault score");
+}
+
+void TestRepeatedRejectedBlocksSuspendPeer()
+{
+    MockClock clock{};
+    RelayEngine engine(clock);
+    CapturingSubmitter submitter;
+    submitter.submit_result = SubmitOutcome::kRejected;
+    const std::uint32_t threshold = RelayEngineConfig{}.peer_fault_threshold;
+
+    std::uint64_t seed = 0xF200;
+    for (std::uint32_t i = 0; i + 1 < threshold; ++i) {
+        DeliverBlock(engine, kPeer1, EncodeTestBlock(200, ++seed), submitter);
+    }
+    Require(engine.stats().peer_suspensions == 0, "peer must not be suspended below the threshold");
+    DeliverBlock(engine, kPeer1, EncodeTestBlock(200, ++seed), submitter);
+    Require(engine.stats().peer_suspensions == 1, "peer should be suspended at the threshold");
+    Require(submitter.submit_calls == threshold, "every block up to the threshold was submitted");
+
+    // While suspended, the peer's blocks are refused before any decoding.
+    const RelayStats before = engine.stats();
+    DeliverBlock(engine, kPeer1, EncodeTestBlock(200, ++seed), submitter);
+    Require(submitter.submit_calls == threshold, "suspended peer's block must not be submitted");
+    Require(engine.stats().inbound_rejected > before.inbound_rejected, "suspended peer's packets should be refused");
+    Require(engine.stats().inbound_entries == 0, "suspended peer must not hold inbound state");
+    auto peer = PeerStats(engine, 1);
+    Require(peer.has_value() && peer->suspended && peer->suspensions == 1, "per-peer suspension state");
+
+    // Another peer is unaffected.
+    submitter.submit_result = SubmitOutcome::kAccepted;
+    DeliverBlock(engine, kPeer0, EncodeTestBlock(200, ++seed), submitter);
+    Require(submitter.submit_calls == threshold + 1, "other peer's block should still be submitted");
+
+    // After the initial pause the peer is heard again; a second suspension lasts twice as long.
+    clock.Advance(RelayEngineConfig{}.peer_suspend_initial + std::chrono::milliseconds{1});
+    submitter.submit_result = SubmitOutcome::kRejected;
+    for (std::uint32_t i = 0; i < threshold; ++i) {
+        DeliverBlock(engine, kPeer1, EncodeTestBlock(200, ++seed), submitter);
+    }
+    Require(engine.stats().peer_suspensions == 2, "peer should be suspended again");
+    clock.Advance(RelayEngineConfig{}.peer_suspend_initial + std::chrono::milliseconds{1});
+    peer = PeerStats(engine, 1);
+    Require(peer.has_value() && peer->suspended, "second suspension should outlast the initial pause");
+    clock.Advance(RelayEngineConfig{}.peer_suspend_initial);
+    peer = PeerStats(engine, 1);
+    Require(peer.has_value() && !peer->suspended, "second suspension should end after twice the initial pause");
+}
+
+void TestAcceptedBlockLowersFaultScoreWithoutResetting()
+{
+    MockClock clock{};
+    RelayEngine engine(clock);
+    CapturingSubmitter submitter;
+    const RelayEngineConfig defaults{};
+
+    std::uint64_t seed = 0xF300;
+    submitter.submit_result = SubmitOutcome::kRejected;
+    for (std::uint32_t i = 0; i + 1 < defaults.peer_fault_threshold; ++i) {
+        DeliverBlock(engine, kPeer1, EncodeTestBlock(200, ++seed), submitter);
+    }
+    submitter.submit_result = SubmitOutcome::kAccepted;
+    DeliverBlock(engine, kPeer1, EncodeTestBlock(200, ++seed), submitter);
+
+    auto peer = PeerStats(engine, 1);
+    Require(peer.has_value() && peer->fault_score == defaults.peer_fault_threshold - 1 - defaults.peer_fault_success_credit,
+            "an accepted block should lower the score by the fixed credit");
+
+    // Interleaving accepted blocks cannot keep a peer below the threshold indefinitely.
+    submitter.submit_result = SubmitOutcome::kRejected;
+    for (std::uint32_t i = 0; i < defaults.peer_fault_success_credit + 1; ++i) {
+        DeliverBlock(engine, kPeer1, EncodeTestBlock(200, ++seed), submitter);
+    }
+    Require(engine.stats().peer_suspensions == 1, "peer should reach the threshold despite the accepted block");
+}
+
+void TestFaultScoreDecaysOverTime()
+{
+    MockClock clock{};
+    RelayEngine engine(clock);
+    CapturingSubmitter submitter;
+    submitter.submit_result = SubmitOutcome::kInconclusive;
+    const RelayEngineConfig defaults{};
+
+    std::uint64_t seed = 0xF400;
+    for (int i = 0; i < 6; ++i) {
+        DeliverBlock(engine, kPeer0, EncodeTestBlock(200, ++seed), submitter);
+    }
+    clock.Advance(defaults.peer_fault_decay_interval * 4);
+    auto peer = PeerStats(engine, 0);
+    Require(peer.has_value() && peer->fault_score == 2, "score should decay by one per interval");
+
+    // An occasional failed block, as in honest stale races, never accumulates to a suspension.
+    for (int i = 0; i < 100; ++i) {
+        DeliverBlock(engine, kPeer0, EncodeTestBlock(200, ++seed), submitter);
+        clock.Advance(defaults.peer_fault_decay_interval);
+    }
+    Require(engine.stats().peer_suspensions == 0, "one failed block per decay interval must not suspend a peer");
+}
+
+void TestPeerFloodDoesNotEvictOtherPeersBlock()
+{
+    MockClock clock{};
+    RelayEngine engine(clock);
+    CapturingSubmitter submitter;
+
+    // Peer 0 relays a block with the default parameters: three headers, then the first half of
+    // the chunks.
+    const auto params = photon::fec::Parameters::FromOverheadRatio(1.2);
+    const TestBlock honest = EncodeTestBlock(600'000, 0xF500, params.data_chunks);
+    const BlockHeaderPayload honest_header = BuildHeaderPayload(honest.encoded, honest.prefix, honest.bytes.size());
+    for (int i = 0; i < 3; ++i) {
+        engine.OnBlockHeader(kPeer0, honest_header, submitter);
+    }
+    const std::size_t half = honest.encoded.chunks.size() / 2;
+    for (std::size_t i = 0; i < half; ++i) {
+        engine.OnBlockChunk(kPeer0, BuildChunkPayload(honest.encoded.chunks[i], honest.prefix), submitter);
+    }
+
+    // Peer 1 announces 128 maximum-size blocks with fresh identifiers.
+    clock.Advance(std::chrono::milliseconds{5});
+    for (std::uint64_t k = 0; k < 128; ++k) {
+        BlockHeaderPayload flood{};
+        flood.block_hash_prefix = 0x1000 + k;
+        flood.original_size = 2'000'000;
+        flood.data_chunks = params.data_chunks;
+        flood.coding_group_count = static_cast<std::uint16_t>(
+            (2'000'000 + params.data_chunks * photon::fec::FEC_CHUNK_SIZE - 1) / (params.data_chunks * photon::fec::FEC_CHUNK_SIZE));
+        engine.OnBlockHeader(kPeer1, flood, submitter);
+    }
+
+    for (std::size_t i = half; i < honest.encoded.chunks.size(); ++i) {
+        engine.OnBlockChunk(kPeer0, BuildChunkPayload(honest.encoded.chunks[i], honest.prefix), submitter);
+    }
+
+    Require(submitter.submit_calls == 1, "peer 0's block should be submitted despite peer 1's headers");
+    Require(submitter.last_block == honest.bytes, "peer 0's block should be reconstructed intact");
+
+    const auto peer0 = PeerStats(engine, 0);
+    const auto peer1 = PeerStats(engine, 1);
+    Require(peer0.has_value() && peer0->inbound_evictions == 0, "peer 0 must lose nothing to peer 1");
+    Require(peer1.has_value() && peer1->inbound_evictions > 0, "peer 1's own blocks should be displaced");
+    const RelayEngineConfig defaults{};
+    Require(peer1->inbound_entries <= defaults.max_inbound_entries_per_peer, "peer 1 should stay within its entry quota");
+    Require(peer1->inbound_decoder_bytes <= defaults.max_inbound_decoder_bytes_per_peer,
+            "peer 1 should stay within its decoder quota");
+}
+
+void TestPerPeerEntryQuotaBoundary()
+{
+    MockClock clock{};
+    RelayEngineConfig config{};
+    config.max_inbound_entries_per_peer = 2;
+    RelayEngine engine(clock, config);
+    CapturingSubmitter submitter;
+
+    const TestBlock other = EncodeTestBlock(100, 0xF601);
+    const TestBlock first = EncodeTestBlock(100, 0xF602);
+    const TestBlock second = EncodeTestBlock(100, 0xF603);
+    const TestBlock third = EncodeTestBlock(100, 0xF604);
+
+    engine.OnBlockChunk(kPeer1, BuildChunkPayload(other.encoded.chunks[0], other.prefix), submitter);
+    clock.Advance(std::chrono::milliseconds{1});
+    engine.OnBlockChunk(kPeer0, BuildChunkPayload(first.encoded.chunks[0], first.prefix), submitter);
+    clock.Advance(std::chrono::milliseconds{1});
+    engine.OnBlockChunk(kPeer0, BuildChunkPayload(second.encoded.chunks[0], second.prefix), submitter);
+    Require(engine.stats().inbound_evictions == 0, "two entries fit the per-peer quota");
+
+    clock.Advance(std::chrono::milliseconds{1});
+    engine.OnBlockChunk(kPeer0, BuildChunkPayload(third.encoded.chunks[0], third.prefix), submitter);
+    Require(engine.stats().inbound_evictions == 1, "third entry should displace one of the peer's own");
+    Require(PeerStats(engine, 0)->inbound_evictions == 1, "the eviction belongs to peer 0");
+    Require(PeerStats(engine, 1)->inbound_evictions == 0, "peer 1's older entry must be kept");
+
+    // Peer 1's entry is intact; peer 0's oldest one was the one dropped.
+    engine.OnBlockHeader(kPeer1, BuildHeaderPayload(other.encoded, other.prefix, other.bytes.size()), submitter);
+    engine.OnBlockChunk(kPeer1, BuildChunkPayload(other.encoded.chunks[1], other.prefix), submitter);
+    Require(submitter.submit_calls == 1 && submitter.last_block == other.bytes, "peer 1's block should complete");
+    engine.OnBlockHeader(kPeer0, BuildHeaderPayload(first.encoded, first.prefix, first.bytes.size()), submitter);
+    engine.OnBlockChunk(kPeer0, BuildChunkPayload(first.encoded.chunks[1], first.prefix), submitter);
+    Require(submitter.submit_calls == 1, "peer 0's oldest entry should have been evicted");
+    engine.OnBlockHeader(kPeer0, BuildHeaderPayload(third.encoded, third.prefix, third.bytes.size()), submitter);
+    engine.OnBlockChunk(kPeer0, BuildChunkPayload(third.encoded.chunks[1], third.prefix), submitter);
+    Require(submitter.submit_calls == 2 && submitter.last_block == third.bytes, "peer 0's newest entry should complete");
+}
+
+void TestPerPeerDecoderQuotaBoundary()
+{
+    const auto params = photon::fec::Parameters::FromOverheadRatio(1.2);
+    const std::size_t size = 600'000;
+    const std::size_t charge = photon::fec::Decoder::MemoryBytes(params, size);
+    const auto group_count = static_cast<std::uint16_t>(
+        (size + params.data_chunks * photon::fec::FEC_CHUNK_SIZE - 1) / (params.data_chunks * photon::fec::FEC_CHUNK_SIZE));
+    auto header = [&](std::uint64_t prefix) {
+        BlockHeaderPayload h{};
+        h.block_hash_prefix = prefix;
+        h.original_size = size;
+        h.data_chunks = params.data_chunks;
+        h.coding_group_count = group_count;
+        return h;
+    };
+
+    MockClock clock{};
+    RelayEngineConfig config{};
+    config.max_inbound_decoder_bytes_per_peer = 2 * charge;
+    RelayEngine engine(clock, config);
+    CapturingSubmitter submitter;
+
+    engine.OnBlockHeader(kPeer0, header(1), submitter);
+    engine.OnBlockHeader(kPeer0, header(2), submitter);
+    Require(engine.stats().inbound_evictions == 0 && engine.stats().inbound_rejected == 0, "two decoders fit exactly");
+    Require(PeerStats(engine, 0)->inbound_decoder_bytes == 2 * charge, "decoder bytes should be charged per entry");
+
+    engine.OnBlockHeader(kPeer1, header(3), submitter);
+    Require(engine.stats().inbound_evictions == 0, "another peer has its own quota");
+
+    engine.OnBlockHeader(kPeer0, header(4), submitter);
+    Require(engine.stats().inbound_evictions == 1, "third decoder should displace the peer's own oldest");
+    Require(PeerStats(engine, 0)->inbound_decoder_bytes == 2 * charge, "peer 0 should stay at its quota");
+    Require(PeerStats(engine, 1)->inbound_decoder_bytes == charge, "peer 1's decoder must be kept");
+
+    // A single block larger than the peer quota is refused outright.
+    RelayEngineConfig small{};
+    small.max_inbound_decoder_bytes_per_peer = charge - 1;
+    RelayEngine small_engine(clock, small);
+    small_engine.OnBlockHeader(kPeer0, header(5), submitter);
+    Require(small_engine.stats().inbound_rejected == 1 && small_engine.stats().inbound_entries == 0,
+            "a decoder above the peer quota should be refused and leave no state");
+}
+
+void TestGlobalLimitSparesOtherPeersRecentProgress()
+{
+    MockClock clock{};
+    RelayEngineConfig config{};
+    config.max_inbound_entries = 2;
+    RelayEngine engine(clock, config);
+    CapturingSubmitter submitter;
+
+    const TestBlock block0 = EncodeTestBlock(100, 0xF701);
+    const TestBlock block1 = EncodeTestBlock(100, 0xF702);
+    const TestBlock block2 = EncodeTestBlock(100, 0xF703);
+
+    engine.OnBlockHeader(kPeer0, BuildHeaderPayload(block0.encoded, block0.prefix, block0.bytes.size()), submitter);
+    engine.OnBlockChunk(kPeer0, BuildChunkPayload(block0.encoded.chunks[0], block0.prefix), submitter);
+    engine.OnBlockHeader(kPeer1, BuildHeaderPayload(block1.encoded, block1.prefix, block1.bytes.size()), submitter);
+
+    // Both entries are fresh: peer 2 cannot displace either of them.
+    engine.OnBlockHeader(kPeer2, BuildHeaderPayload(block2.encoded, block2.prefix, block2.bytes.size()), submitter);
+    Require(engine.stats().inbound_evictions == 0, "entries with recent progress must not be displaced");
+    Require(PeerStats(engine, 2)->inbound_rejected == 1, "the new entry should be refused instead");
+
+    // Peer 0 keeps making progress; peer 1 goes quiet past the grace period.
+    clock.Advance(config.inbound_progress_grace);
+    engine.OnBlockHeader(kPeer0, BuildHeaderPayload(block0.encoded, block0.prefix, block0.bytes.size()), submitter);
+    clock.Advance(std::chrono::milliseconds{1});
+    engine.OnBlockHeader(kPeer2, BuildHeaderPayload(block2.encoded, block2.prefix, block2.bytes.size()), submitter);
+    Require(PeerStats(engine, 1)->inbound_evictions == 1, "the idle entry should be displaced");
+    Require(PeerStats(engine, 0)->inbound_evictions == 0, "the active entry must be kept");
+
+    engine.OnBlockChunk(kPeer0, BuildChunkPayload(block0.encoded.chunks[1], block0.prefix), submitter);
+    engine.OnBlockChunk(kPeer2, BuildChunkPayload(block2.encoded.chunks[0], block2.prefix), submitter);
+    engine.OnBlockChunk(kPeer2, BuildChunkPayload(block2.encoded.chunks[1], block2.prefix), submitter);
+    Require(submitter.submit_calls == 2, "both remaining blocks should complete");
+}
+
+void TestOversizedDecoderChargeRejected()
+{
+    MockClock clock{};
+    RelayEngine engine(clock);
+    CapturingSubmitter submitter;
+
+    // A maximum-size block split into many small Wirehair groups costs far more decoder memory
+    // than its payload; it is refused before any decoder is built.
+    BlockHeaderPayload header{};
+    header.block_hash_prefix = 0x7777;
+    header.original_size = 2'000'000;
+    header.data_chunks = 28;
+    header.coding_group_count = static_cast<std::uint16_t>((2'000'000 + 28 * photon::fec::FEC_CHUNK_SIZE - 1) / (28 * photon::fec::FEC_CHUNK_SIZE));
+    Require(photon::fec::Decoder::MemoryBytes(photon::fec::Parameters::FromDataChunkCount(28), 2'000'000) >
+                RelayEngineConfig{}.max_inbound_decoder_bytes_per_entry,
+            "test parameters should exceed the per-block charge limit");
+
+    engine.OnBlockHeader(kPeer0, header, submitter);
+    Require(engine.stats().inbound_rejected == 1, "over-limit decoder should be refused");
+    Require(engine.stats().inbound_entries == 0 && engine.stats().inbound_decoder_bytes == 0, "no state should remain");
+}
+
+#if defined(__GLIBC__)
+std::size_t HeapInUse()
+{
+    const struct mallinfo2 info = mallinfo2();
+    return info.uordblks + info.hblkhd;
+}
+
+std::size_t HeapGrowthSince(std::size_t base)
+{
+    const std::size_t now = HeapInUse();
+    return now > base ? now - base : 0;
+}
+
+// Largest block size for which a decoder with `data_chunks` fits within `charge_limit`.
+std::size_t LargestChargeableSize(std::uint16_t data_chunks, std::size_t charge_limit, std::size_t size_limit)
+{
+    const auto params = photon::fec::Parameters::FromDataChunkCount(data_chunks);
+    const std::size_t group_bytes = static_cast<std::size_t>(data_chunks) * photon::fec::FEC_CHUNK_SIZE;
+    std::size_t best = 0;
+    for (std::size_t groups = 1; groups * group_bytes - group_bytes < size_limit; ++groups) {
+        const std::size_t size = std::min(groups * group_bytes, size_limit);
+        if (photon::fec::Decoder::MemoryBytes(params, size) > charge_limit) {
+            break;
+        }
+        best = size;
+    }
+    return best;
+}
+#endif
+
+void TestDefaultBlockDecoderFitsEntryLimit()
+{
+#if defined(__GLIBC__)
+    const RelayEngineConfig defaults{};
+    const auto params = photon::fec::Parameters::FromOverheadRatio(1.2);
+    const std::vector<std::uint8_t> block = MakeBlock(defaults.max_inbound_original_size, 0xF800);
+    photon::fec::Encoder encoder(params);
+    const photon::fec::EncodedBlock encoded = encoder.Encode(block);
+    const std::size_t charge = photon::fec::Decoder::MemoryBytes(params, block.size());
+
+    // Measure the real decoder: parity chunks first (the most state held), then data chunks.
+    const std::size_t base = HeapInUse();
+    std::size_t peak = 0;
+    {
+        photon::fec::Decoder decoder(params, block.size());
+        peak = HeapGrowthSince(base);
+        for (int pass = 0; pass < 2 && !decoder.IsComplete(); ++pass) {
+            for (const auto& chunk : encoded.chunks) {
+                if ((pass == 0) != (chunk.chunk_id >= params.data_chunks)) {
+                    continue;
+                }
+                (void)decoder.AddChunk(chunk);
+                peak = std::max(peak, HeapGrowthSince(base));
+                if (decoder.IsComplete()) {
+                    break;
+                }
+            }
+        }
+        Require(decoder.IsComplete(), "default-parameter block should decode");
+    }
+
+    std::cout << "  default 2,000,000-byte block: decoder peak " << peak << " B, charged " << charge
+              << " B, per-block limit " << defaults.max_inbound_decoder_bytes_per_entry << " B, margin over charge "
+              << (defaults.max_inbound_decoder_bytes_per_entry - std::min(charge, defaults.max_inbound_decoder_bytes_per_entry))
+              << " B\n";
+    Require(peak <= charge, "measured decoder memory must not exceed the charge");
+    Require(charge <= defaults.max_inbound_decoder_bytes_per_entry, "default block must fit the per-block limit");
+    Require(defaults.max_inbound_decoder_bytes_per_entry - charge >= 128 * 1024, "per-block limit should leave a margin");
+#else
+    std::cout << "  (heap measurement needs glibc; skipped)\n";
+#endif
+}
+
+void TestWorstCaseInboundDecodersStayWithinBound()
+{
+#if defined(__GLIBC__)
+    MockClock clock{};
+    const RelayEngineConfig defaults{};
+    CapturingSubmitter submitter;
+
+    // Parameter mix that costs the most decoder memory per block, each at the largest size the
+    // per-block limit admits.
+    const std::vector<std::uint16_t> worst_data_chunks{2, 27, 28, 40, 64, 128, 212, 254};
+
+    const std::size_t base = HeapInUse();
+    std::size_t peak = 0;
+    std::size_t charged_peak = 0;
+    {
+        RelayEngine engine(clock, defaults);
+        std::uint64_t prefix = 0x9000;
+        for (std::size_t slot = 0; slot < 24; ++slot) {
+            const InboundPeerInfo peer{.slot_index = slot, .remote_session_id = 100 + slot, .remote_peer_id = 200 + slot};
+            for (const std::uint16_t data_chunks : worst_data_chunks) {
+                const std::size_t size = LargestChargeableSize(
+                    data_chunks, defaults.max_inbound_decoder_bytes_per_entry, defaults.max_inbound_original_size);
+                Require(size > 0, "every parameter set should admit some block");
+                const std::size_t group_bytes = static_cast<std::size_t>(data_chunks) * photon::fec::FEC_CHUNK_SIZE;
+                BlockHeaderPayload header{};
+                header.block_hash_prefix = ++prefix;
+                header.original_size = size;
+                header.data_chunks = data_chunks;
+                header.coding_group_count = static_cast<std::uint16_t>((size + group_bytes - 1) / group_bytes);
+                engine.OnBlockHeader(peer, header, submitter);
+                peak = std::max(peak, HeapGrowthSince(base));
+                charged_peak = std::max<std::size_t>(charged_peak, engine.stats().inbound_decoder_bytes);
+                const auto peer_stats = PeerStats(engine, slot);
+                Require(peer_stats.has_value() && peer_stats->inbound_decoder_bytes <= defaults.max_inbound_decoder_bytes_per_peer,
+                        "per-peer decoder charge must stay within its limit");
+            }
+        }
+        Require(engine.stats().inbound_entries <= defaults.max_inbound_entries, "entry limit must hold");
+    }
+
+    // Engine bookkeeping (map nodes, per-peer state) is small next to the decoders.
+    constexpr std::size_t kBookkeepingAllowance = 1024 * 1024;
+    std::cout << "  worst-case inbound decoders: heap peak " << peak << " B, charged peak " << charged_peak
+              << " B, documented bound " << defaults.max_inbound_decoder_bytes << " B\n";
+    Require(charged_peak <= defaults.max_inbound_decoder_bytes, "charged decoder memory must stay within the total limit");
+    Require(peak <= charged_peak + kBookkeepingAllowance, "measured memory must stay within the charge");
+    Require(peak <= defaults.max_inbound_decoder_bytes + kBookkeepingAllowance, "measured memory must stay within the documented bound");
+#else
+    std::cout << "  (heap measurement needs glibc; skipped)\n";
+#endif
 }
 
 int RunAllTests()
@@ -798,6 +1440,23 @@ int RunAllTests()
         {"rejected_new_prefix_chunk_does_not_evict_existing_relay", TestRejectedNewPrefixChunkDoesNotEvictExistingRelay},
         {"inbound_limits_allow_valid_reconstruction", TestInboundLimitsAllowValidReconstruction},
         {"stats_accumulation", TestStatsAccumulation},
+        {"mismatched_identifier_not_submitted", TestMismatchedIdentifierNotSubmitted},
+        {"too_short_block_not_submitted", TestTooShortBlockNotSubmitted},
+        {"parent_check_receives_block_parent", TestParentCheckReceivesBlockParent},
+        {"block_with_parent_away_from_tip_not_submitted", TestBlockWithParentAwayFromTipNotSubmitted},
+        {"unavailable_parent_check_drops_without_penalty", TestUnavailableParentCheckDropsWithoutPenalty},
+        {"submit_outcomes_counted_separately", TestSubmitOutcomesCountedSeparately},
+        {"neutral_outcomes_never_suspend_peer", TestNeutralOutcomesNeverSuspendPeer},
+        {"repeated_rejected_blocks_suspend_peer", TestRepeatedRejectedBlocksSuspendPeer},
+        {"accepted_block_lowers_fault_score_without_resetting", TestAcceptedBlockLowersFaultScoreWithoutResetting},
+        {"fault_score_decays_over_time", TestFaultScoreDecaysOverTime},
+        {"peer_flood_does_not_evict_other_peers_block", TestPeerFloodDoesNotEvictOtherPeersBlock},
+        {"per_peer_entry_quota_boundary", TestPerPeerEntryQuotaBoundary},
+        {"per_peer_decoder_quota_boundary", TestPerPeerDecoderQuotaBoundary},
+        {"global_limit_spares_other_peers_recent_progress", TestGlobalLimitSparesOtherPeersRecentProgress},
+        {"oversized_decoder_charge_rejected", TestOversizedDecoderChargeRejected},
+        {"default_block_decoder_fits_entry_limit", TestDefaultBlockDecoderFitsEntryLimit},
+        {"worst_case_inbound_decoders_stay_within_bound", TestWorstCaseInboundDecodersStayWithinBound},
     };
 
     int failures = 0;

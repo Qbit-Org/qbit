@@ -10,6 +10,27 @@
 
 namespace photon {
 
+/// Result of handing a block to the node with submitblock.
+enum class SubmitOutcome : std::uint8_t {
+    kAccepted,     ///< The node accepted the block (null result).
+    kDuplicate,    ///< The node already had the block.
+    kInconclusive, ///< The node stored the block but did not (yet) make it part of its best chain.
+    kRejected,     ///< The node rejected the block (BIP22 reason or block decode error).
+    kTimeout,      ///< No usable response: timeout, connection failure or a malformed HTTP reply.
+    kError,        ///< The node answered with an error that is not a verdict on the block.
+};
+
+/// Where a block's parent sits relative to the node's best chain.
+enum class ParentCheck : std::uint8_t {
+    kNearTip,     ///< The parent is the best block, or close enough to it by depth and chain work.
+    kTooFar,      ///< The parent is known but too far below the best block.
+    kUnknown,     ///< The node does not know the parent.
+    kUnavailable, ///< The node could not be queried; nothing is known about the parent.
+};
+
+[[nodiscard]] const char* SubmitOutcomeName(SubmitOutcome outcome);
+[[nodiscard]] const char* ParentCheckName(ParentCheck check);
+
 struct RpcClientOptions {
     std::string host{"127.0.0.1"};
     std::uint16_t port{8352};
@@ -23,13 +44,42 @@ public:
 
     bool Probe();
     std::optional<std::vector<std::uint8_t>> GetBlock(const std::string& hash_hex);
-    bool SubmitBlock(std::span<const std::uint8_t> block_data);
+    SubmitOutcome SubmitBlock(std::span<const std::uint8_t> block_data);
+
+    /// Locates the block `prev_hash_hex` (64 hex digits, display order) relative to the node's best
+    /// chain. kNearTip means it is the best block, an ancestor of it at most `max_depth` blocks
+    /// deep, or a block on another branch with at least as much chain work as the best chain's
+    /// block `max_depth` below the best block. All queries together stop after the RPC timeout.
+    ParentCheck CheckParent(const std::string& prev_hash_hex, std::uint32_t max_depth);
 
 private:
     struct HttpResponse {
         int status_code{0};
         std::string body{};
     };
+
+    struct RpcReply {
+        enum class Status {
+            kResult,      ///< HTTP 200 with a null error; body holds the reply.
+            kRpcError,    ///< The node returned a JSON-RPC error object.
+            kNoResponse,  ///< Connection, send or receive failure, or timeout.
+            kBadResponse, ///< A reply that is neither a result nor a JSON-RPC error.
+        };
+
+        Status status{Status::kNoResponse};
+        std::string body{};
+        std::optional<std::int64_t> error_code{};
+    };
+
+    struct HeaderInfo {
+        std::int64_t confirmations{0};
+        std::int64_t height{0};
+        std::string chainwork{};
+    };
+
+    RpcReply Call(const std::string& method, const std::string& params_json);
+    std::optional<std::string> CallForHash(const std::string& method, const std::string& params_json);
+    std::optional<HeaderInfo> ParseHeaderInfo(const RpcReply& reply) const;
 
     std::optional<HttpResponse> SendJsonRpc(const std::string& method, const std::string& params_json);
     std::optional<HttpResponse> SendHttpRequest(const std::string& request_body);

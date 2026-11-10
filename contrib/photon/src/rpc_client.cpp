@@ -25,10 +25,15 @@
 namespace photon {
 namespace {
 
+// JSON-RPC error codes returned by the node (src/rpc/protocol.h).
+constexpr std::int64_t kRpcInvalidAddressOrKey = -5;
+constexpr std::int64_t kRpcDeserializationError = -22;
+
 enum class JsonFieldKind {
     kMissing,
     kNull,
     kString,
+    kNumber,
     kOther,
 };
 
@@ -276,7 +281,46 @@ JsonField ExtractJsonField(const std::string& json, const std::string& field_nam
         return JsonField{JsonFieldKind::kString, *parsed};
     }
 
+    if (json[colon_pos] == '-' || std::isdigit(static_cast<unsigned char>(json[colon_pos]))) {
+        std::size_t end = colon_pos + 1;
+        while (end < json.size()) {
+            const char ch = json[end];
+            if (!std::isdigit(static_cast<unsigned char>(ch)) && ch != '.' && ch != 'e' && ch != 'E' && ch != '+' && ch != '-') {
+                break;
+            }
+            ++end;
+        }
+        return JsonField{JsonFieldKind::kNumber, json.substr(colon_pos, end - colon_pos)};
+    }
+
     return JsonField{JsonFieldKind::kOther, {}};
+}
+
+std::optional<std::int64_t> ParseInteger(const JsonField& field)
+{
+    if (field.kind != JsonFieldKind::kNumber) {
+        return std::nullopt;
+    }
+
+    std::int64_t value = 0;
+    const char* begin = field.string_value.data();
+    const char* end = begin + field.string_value.size();
+    const auto [ptr, ec] = std::from_chars(begin, end, value);
+    if (ec != std::errc{} || ptr != end) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+// A 256-bit value as the node prints it: 64 lowercase hex digits.
+bool IsUint256Hex(const std::string& value)
+{
+    if (value.size() != 64) {
+        return false;
+    }
+    return std::all_of(value.begin(), value.end(), [](char ch) {
+        return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+    });
 }
 
 bool SendAll(int fd, const std::string& payload)
@@ -334,6 +378,40 @@ std::optional<std::string> ReadResponse(int fd)
 
 } // namespace
 
+const char* SubmitOutcomeName(SubmitOutcome outcome)
+{
+    switch (outcome) {
+    case SubmitOutcome::kAccepted:
+        return "accepted";
+    case SubmitOutcome::kDuplicate:
+        return "duplicate";
+    case SubmitOutcome::kInconclusive:
+        return "inconclusive";
+    case SubmitOutcome::kRejected:
+        return "rejected";
+    case SubmitOutcome::kTimeout:
+        return "timeout";
+    case SubmitOutcome::kError:
+        return "error";
+    }
+    return "unknown";
+}
+
+const char* ParentCheckName(ParentCheck check)
+{
+    switch (check) {
+    case ParentCheck::kNearTip:
+        return "near_tip";
+    case ParentCheck::kTooFar:
+        return "too_far";
+    case ParentCheck::kUnknown:
+        return "unknown";
+    case ParentCheck::kUnavailable:
+        return "unavailable";
+    }
+    return "unknown";
+}
+
 RpcClient::RpcClient(RpcClientOptions options)
     : m_options(std::move(options))
 {
@@ -389,28 +467,166 @@ std::optional<std::vector<std::uint8_t>> RpcClient::GetBlock(const std::string& 
     return HexDecode(result_field.string_value);
 }
 
-bool RpcClient::SubmitBlock(std::span<const std::uint8_t> block_data)
+SubmitOutcome RpcClient::SubmitBlock(std::span<const std::uint8_t> block_data)
 {
     const std::string block_hex = HexEncode(block_data);
     const std::string params = "[\"" + block_hex + "\"]";
 
-    const auto response = SendJsonRpc("submitblock", params);
-    if (!response.has_value()) {
-        return false;
+    const RpcReply reply = Call("submitblock", params);
+    switch (reply.status) {
+    case RpcReply::Status::kNoResponse:
+        return SubmitOutcome::kTimeout;
+    case RpcReply::Status::kBadResponse:
+        return SubmitOutcome::kError;
+    case RpcReply::Status::kRpcError:
+        // A block that does not decode is a verdict on the block; other errors are about the node.
+        return reply.error_code == kRpcDeserializationError ? SubmitOutcome::kRejected : SubmitOutcome::kError;
+    case RpcReply::Status::kResult:
+        break;
     }
 
-    if (response->status_code != 200) {
-        LOG_WARN("submitblock HTTP status " + std::to_string(response->status_code));
-        return false;
+    const JsonField result_field = ExtractJsonField(reply.body, "result");
+    if (result_field.kind == JsonFieldKind::kNull) {
+        return SubmitOutcome::kAccepted;
+    }
+    if (result_field.kind != JsonFieldKind::kString) {
+        return SubmitOutcome::kError;
+    }
+    if (result_field.string_value == "duplicate") {
+        return SubmitOutcome::kDuplicate;
+    }
+    if (result_field.string_value == "inconclusive") {
+        return SubmitOutcome::kInconclusive;
+    }
+    return SubmitOutcome::kRejected;
+}
+
+ParentCheck RpcClient::CheckParent(const std::string& prev_hash_hex, std::uint32_t max_depth)
+{
+    if (!IsUint256Hex(prev_hash_hex)) {
+        return ParentCheck::kUnavailable;
+    }
+
+    // One budget for the whole check, so a slow node cannot stretch it across several calls.
+    const auto deadline = std::chrono::steady_clock::now() + m_options.timeout;
+    const auto expired = [&deadline] { return std::chrono::steady_clock::now() >= deadline; };
+    const std::int64_t depth = static_cast<std::int64_t>(max_depth);
+
+    const auto best_hash = CallForHash("getbestblockhash", "[]");
+    if (!best_hash.has_value()) {
+        return ParentCheck::kUnavailable;
+    }
+    if (*best_hash == prev_hash_hex) {
+        return ParentCheck::kNearTip;
+    }
+
+    if (expired()) {
+        return ParentCheck::kUnavailable;
+    }
+    const RpcReply parent_reply = Call("getblockheader", "[\"" + prev_hash_hex + "\",true]");
+    if (parent_reply.status == RpcReply::Status::kRpcError && parent_reply.error_code == kRpcInvalidAddressOrKey) {
+        return ParentCheck::kUnknown;
+    }
+    const auto parent = ParseHeaderInfo(parent_reply);
+    if (!parent.has_value()) {
+        return ParentCheck::kUnavailable;
+    }
+    if (parent->confirmations >= 1) {
+        // On the best chain: confirmations counts the best block itself.
+        return parent->confirmations - 1 <= depth ? ParentCheck::kNearTip : ParentCheck::kTooFar;
+    }
+
+    // On another branch: compare its chain work with the best chain's block `max_depth` below the
+    // best block, so a competing branch near the tip qualifies and a low-work one does not.
+    if (expired()) {
+        return ParentCheck::kUnavailable;
+    }
+    const auto best = ParseHeaderInfo(Call("getblockheader", "[\"" + *best_hash + "\",true]"));
+    if (!best.has_value()) {
+        return ParentCheck::kUnavailable;
+    }
+    if (parent->height + depth < best->height) {
+        return ParentCheck::kTooFar;
+    }
+
+    if (expired()) {
+        return ParentCheck::kUnavailable;
+    }
+    const std::int64_t anchor_height = std::max<std::int64_t>(0, best->height - depth);
+    const auto anchor_hash = CallForHash("getblockhash", "[" + std::to_string(anchor_height) + "]");
+    if (!anchor_hash.has_value() || expired()) {
+        return ParentCheck::kUnavailable;
+    }
+    const auto anchor = ParseHeaderInfo(Call("getblockheader", "[\"" + *anchor_hash + "\",true]"));
+    if (!anchor.has_value()) {
+        return ParentCheck::kUnavailable;
+    }
+
+    // Both are 64-digit lowercase hex, so string order is numeric order.
+    return parent->chainwork >= anchor->chainwork ? ParentCheck::kNearTip : ParentCheck::kTooFar;
+}
+
+RpcClient::RpcReply RpcClient::Call(const std::string& method, const std::string& params_json)
+{
+    const auto response = SendJsonRpc(method, params_json);
+    if (!response.has_value()) {
+        return RpcReply{.status = RpcReply::Status::kNoResponse};
     }
 
     const JsonField error_field = ExtractJsonField(response->body, "error");
-    if (error_field.kind != JsonFieldKind::kNull) {
-        return false;
+    if (error_field.kind == JsonFieldKind::kNull) {
+        if (response->status_code != 200) {
+            LOG_WARN(method + " HTTP status " + std::to_string(response->status_code));
+            return RpcReply{.status = RpcReply::Status::kBadResponse};
+        }
+        return RpcReply{.status = RpcReply::Status::kResult, .body = response->body};
     }
 
-    const JsonField result_field = ExtractJsonField(response->body, "result");
-    return result_field.kind == JsonFieldKind::kNull;
+    if (error_field.kind == JsonFieldKind::kOther) {
+        return RpcReply{
+            .status = RpcReply::Status::kRpcError,
+            .body = response->body,
+            .error_code = ParseInteger(ExtractJsonField(response->body, "code")),
+        };
+    }
+
+    LOG_WARN(method + " returned an unexpected reply (HTTP status " + std::to_string(response->status_code) + ")");
+    return RpcReply{.status = RpcReply::Status::kBadResponse};
+}
+
+std::optional<std::string> RpcClient::CallForHash(const std::string& method, const std::string& params_json)
+{
+    const RpcReply reply = Call(method, params_json);
+    if (reply.status != RpcReply::Status::kResult) {
+        return std::nullopt;
+    }
+
+    const JsonField result_field = ExtractJsonField(reply.body, "result");
+    if (result_field.kind != JsonFieldKind::kString || !IsUint256Hex(result_field.string_value)) {
+        return std::nullopt;
+    }
+    return result_field.string_value;
+}
+
+std::optional<RpcClient::HeaderInfo> RpcClient::ParseHeaderInfo(const RpcReply& reply) const
+{
+    if (reply.status != RpcReply::Status::kResult) {
+        return std::nullopt;
+    }
+
+    const auto confirmations = ParseInteger(ExtractJsonField(reply.body, "confirmations"));
+    const auto height = ParseInteger(ExtractJsonField(reply.body, "height"));
+    const JsonField chainwork = ExtractJsonField(reply.body, "chainwork");
+    if (!confirmations.has_value() || !height.has_value() || *height < 0 ||
+        chainwork.kind != JsonFieldKind::kString || !IsUint256Hex(chainwork.string_value)) {
+        return std::nullopt;
+    }
+
+    return HeaderInfo{
+        .confirmations = *confirmations,
+        .height = *height,
+        .chainwork = chainwork.string_value,
+    };
 }
 
 std::optional<RpcClient::HttpResponse> RpcClient::SendJsonRpc(const std::string& method, const std::string& params_json)

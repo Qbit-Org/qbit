@@ -5,6 +5,7 @@
 #include <fec.h>
 #include <peer_manager.h>
 #include <protocol.h>
+#include <rpc_client.h>
 #include <scheduler.h>
 
 #include <chrono>
@@ -12,6 +13,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <map>
 #include <optional>
 #include <span>
 #include <string>
@@ -26,11 +28,31 @@ struct RelayEngineConfig {
     std::size_t max_outbound_chunks_per_tick{64};
     std::size_t seen_blocks_capacity{16};
     std::size_t max_inbound_original_size{2'000'000};
+    // Incomplete inbound blocks, in total and per peer slot.
     std::size_t max_inbound_entries{128};
+    std::size_t max_inbound_entries_per_peer{4};
     std::size_t max_inbound_buffered_chunks_per_entry{64};
     std::size_t max_inbound_buffered_bytes{1024 * fec::FEC_CHUNK_SIZE};
-    std::size_t max_inbound_decoder_bytes_per_entry{3 * 1024 * 1024};
+    // Decoder memory as charged by fec::Decoder::MemoryBytes(): per block, per peer slot, in total.
+    std::size_t max_inbound_decoder_bytes_per_entry{5 * 1024 * 1024};
+    std::size_t max_inbound_decoder_bytes_per_peer{10 * 1024 * 1024};
+    std::size_t max_inbound_decoder_bytes{64 * 1024 * 1024};
     std::chrono::milliseconds max_inbound_age{std::chrono::minutes{2}};
+    // An incomplete block that received a packet within this window is never displaced by
+    // another peer's block.
+    std::chrono::milliseconds inbound_progress_grace{std::chrono::seconds{10}};
+    // A reconstructed block is submitted only if its parent is within this many blocks of the
+    // node's best block (see RpcClient::CheckParent).
+    std::uint32_t max_parent_depth{6};
+    // Per peer slot: each failed block adds one point, each accepted block removes
+    // peer_fault_success_credit points, and one point decays every peer_fault_decay_interval.
+    // Reaching peer_fault_threshold refuses the slot's inbound blocks for peer_suspend_initial,
+    // doubling on each repeat up to peer_suspend_max.
+    std::uint32_t peer_fault_threshold{8};
+    std::uint32_t peer_fault_success_credit{2};
+    std::chrono::milliseconds peer_fault_decay_interval{std::chrono::seconds{60}};
+    std::chrono::milliseconds peer_suspend_initial{std::chrono::seconds{60}};
+    std::chrono::milliseconds peer_suspend_max{std::chrono::minutes{30}};
 };
 
 struct RelayStats {
@@ -40,16 +62,54 @@ struct RelayStats {
     std::uint64_t chunks_sent{0};
     std::uint64_t chunks_received{0};
     std::uint64_t submit_successes{0};
+    // Every reconstructed block that was not accepted: the outcomes below plus decode failures.
     std::uint64_t submit_failures{0};
+    std::uint64_t submit_duplicates{0};
+    std::uint64_t submit_inconclusive{0};
+    std::uint64_t submit_rejected{0};
+    std::uint64_t submit_timeouts{0};
+    std::uint64_t submit_errors{0};
+    // Reconstructed blocks dropped before submission.
+    std::uint64_t blocks_mismatched{0};
+    std::uint64_t blocks_parent_rejected{0};
+    std::uint64_t block_checks_unavailable{0};
     std::uint64_t inbound_rejected{0};
     std::uint64_t inbound_evictions{0};
+    std::uint64_t peer_suspensions{0};
+    // Current usage.
+    std::uint64_t inbound_entries{0};
+    std::uint64_t inbound_decoder_bytes{0};
+};
+
+struct PeerRelayStats {
+    std::size_t slot_index{0};
+    std::uint64_t blocks_received_in{0};
+    std::uint64_t submit_failures{0};
+    std::uint64_t blocks_dropped{0};
+    std::uint64_t inbound_rejected{0};
+    std::uint64_t inbound_evictions{0};
+    std::uint64_t suspensions{0};
+    std::uint32_t fault_score{0};
+    bool suspended{false};
+    std::uint64_t inbound_entries{0};
+    std::uint64_t inbound_decoder_bytes{0};
 };
 
 class BlockSubmitter {
 public:
     virtual ~BlockSubmitter() = default;
-    virtual bool SubmitBlock(std::span<const std::uint8_t> block_data) = 0;
+    virtual ParentCheck CheckParent(const std::string& prev_hash_hex, std::uint32_t max_depth) = 0;
+    virtual SubmitOutcome SubmitBlock(std::span<const std::uint8_t> block_data) = 0;
 };
+
+/// Identity of a serialized block, read from its 80-byte header.
+struct BlockHeaderSummary {
+    std::string hash_hex{};      ///< Display order, as the node prints it.
+    std::string prev_hash_hex{}; ///< Display order.
+};
+
+/// Reads the header of a serialized block. Returns nullopt when the data is too short to be a block.
+[[nodiscard]] std::optional<BlockHeaderSummary> ReadBlockHeaderSummary(std::span<const std::uint8_t> block_data);
 
 [[nodiscard]] std::uint64_t HashPrefixFromHex(const std::string& hash_hex);
 
@@ -72,6 +132,9 @@ public:
     {
         return m_stats;
     }
+
+    /// Per-slot counters for every slot that has sent inbound block traffic, ordered by slot.
+    [[nodiscard]] std::vector<PeerRelayStats> PeerStatsSnapshot() const;
 
     [[nodiscard]] bool HasOutbound() const
     {
@@ -101,6 +164,7 @@ private:
         Clock::TimePoint first_seen{};
         Clock::TimePoint last_updated{};
         std::size_t buffered_bytes{0};
+        std::size_t decoder_bytes{0};
     };
 
     struct InboundRelayKey {
@@ -112,6 +176,17 @@ private:
         [[nodiscard]] bool operator==(const InboundRelayKey&) const = default;
     };
 
+    struct PeerInbound {
+        std::size_t entries{0};
+        std::size_t decoder_bytes{0};
+        std::uint32_t fault_score{0};
+        Clock::TimePoint fault_decay_from{};
+        Clock::TimePoint suspended_until{};
+        std::uint32_t suspension_level{0};
+        bool ever_suspended{false};
+        PeerRelayStats stats{};
+    };
+
     struct InboundRelayKeyHash {
         [[nodiscard]] std::size_t operator()(const InboundRelayKey& key) const;
     };
@@ -120,14 +195,27 @@ private:
                                                              std::uint64_t hash_prefix);
     [[nodiscard]] static bool InboundRelayKeyLess(const InboundRelayKey& left, const InboundRelayKey& right);
 
+    using InboundMap = std::unordered_map<InboundRelayKey, InboundRelay, InboundRelayKeyHash>;
+
     void RememberSeen(std::uint64_t hash_prefix);
     [[nodiscard]] bool IsKnown(std::uint64_t hash_prefix) const;
     [[nodiscard]] bool HasGlobalInboundBufferCapacity() const;
+    [[nodiscard]] PeerInbound& Peer(std::size_t slot_index);
+    void RejectInbound(std::size_t slot_index);
+    [[nodiscard]] bool IsSuspended(std::size_t slot_index, Clock::TimePoint now);
+    void DecayFaults(PeerInbound& peer, Clock::TimePoint now) const;
+    void RecordFault(std::size_t slot_index, Clock::TimePoint now);
+    void RecordAccepted(std::size_t slot_index, Clock::TimePoint now);
+    void SuspendPeer(std::size_t slot_index, Clock::TimePoint now);
     [[nodiscard]] InboundRelay* GetOrCreateInbound(const InboundRelayKey& key, Clock::TimePoint now);
+    [[nodiscard]] bool ReserveDecoderBytes(const InboundRelayKey& key, InboundRelay& relay, std::size_t bytes, Clock::TimePoint now);
+    [[nodiscard]] bool EvictOwnOldest(std::size_t slot_index, const InboundRelayKey* keep, bool decoder_only);
+    [[nodiscard]] bool EvictForGlobalLimit(std::size_t slot_index, const InboundRelayKey* keep, bool decoder_only, Clock::TimePoint now);
     void EvictExpiredInbound(Clock::TimePoint now);
-    [[nodiscard]] bool EvictOldestInbound();
+    InboundMap::iterator EraseInboundAt(InboundMap::iterator it, bool evicted);
     void EraseInbound(const InboundRelayKey& key);
     void EraseInboundForPrefix(std::uint64_t hash_prefix);
+    void EraseInboundForSlot(std::size_t slot_index);
     void ClearBufferedChunks(InboundRelay& relay);
     void TryFinalizeInbound(const InboundRelayKey& key, InboundRelay& relay, BlockSubmitter& submitter);
     [[nodiscard]] bool FeedChunk(const InboundRelayKey& key, InboundRelay& relay, const BlockChunkPayload& payload);
@@ -137,8 +225,10 @@ private:
     RelayStats m_stats{};
 
     std::optional<OutboundRelay> m_outbound{};
-    std::unordered_map<InboundRelayKey, InboundRelay, InboundRelayKeyHash> m_inbound{};
+    InboundMap m_inbound{};
     std::size_t m_inbound_buffered_bytes{0};
+    std::size_t m_inbound_decoder_bytes{0};
+    std::map<std::size_t, PeerInbound> m_peers{};
 
     std::deque<std::uint64_t> m_seen_order{};
     std::unordered_set<std::uint64_t> m_seen_set{};
