@@ -62,6 +62,7 @@ std::string RelayStatsLogFields(const RelayStats& stats)
         + " block_mismatch=" + std::to_string(stats.blocks_mismatched)
         + " block_parent_rejected=" + std::to_string(stats.blocks_parent_rejected)
         + " block_check_unavailable=" + std::to_string(stats.block_checks_unavailable)
+        + " block_node_behind=" + std::to_string(stats.blocks_node_behind)
         + " inbound_rejected=" + std::to_string(stats.inbound_rejected)
         + " inbound_evicted=" + std::to_string(stats.inbound_evictions)
         + " inbound_entries=" + std::to_string(stats.inbound_entries)
@@ -136,9 +137,11 @@ public:
         return m_rpc.SubmitBlock(block_data);
     }
 
-    ParentCheck CheckParent(const std::string& prev_hash_hex, std::uint32_t max_depth) override
+    ParentCheck CheckParent(const std::string& block_hash_hex,
+                            const std::string& prev_hash_hex,
+                            std::uint32_t max_depth) override
     {
-        return m_rpc.CheckParent(prev_hash_hex, max_depth);
+        return m_rpc.CheckParent(block_hash_hex, prev_hash_hex, max_depth);
     }
 
 private:
@@ -195,9 +198,11 @@ public:
     {
     }
 
-    ParentCheck CheckParent(const std::string& prev_hash_hex, std::uint32_t max_depth) override
+    ParentCheck CheckParent(const std::string& block_hash_hex,
+                            const std::string& prev_hash_hex,
+                            std::uint32_t max_depth) override
     {
-        return m_rpc.CheckParent(prev_hash_hex, max_depth);
+        return m_rpc.CheckParent(block_hash_hex, prev_hash_hex, max_depth);
     }
 
     SubmitOutcome SubmitBlock(std::span<const std::uint8_t> block_data) override

@@ -30,6 +30,10 @@ constexpr std::chrono::milliseconds kDefaultPeerFaultDecayInterval{std::chrono::
 constexpr std::chrono::milliseconds kDefaultPeerSuspendInitial{std::chrono::seconds{60}};
 constexpr std::chrono::milliseconds kDefaultPeerSuspendMax{std::chrono::minutes{30}};
 
+// How long the remaining chunks of a block that was already handled are ignored.
+constexpr std::chrono::seconds kFinishedInboundLifetime{10};
+constexpr std::size_t kMaxFinishedInbound = 256;
+
 // Serialized block header: version (4), previous block hash (32), merkle root (32), time, bits, nonce.
 constexpr std::size_t kBlockHeaderSize = 80;
 constexpr std::size_t kPrevBlockHashOffset = 4;
@@ -269,8 +273,9 @@ void RelayEngine::OnBlockHeader(const InboundPeerInfo& inbound_peer,
     const auto now = m_clock.Now();
     EvictExpiredInbound(now);
     const std::size_t slot = inbound_peer.slot_index;
+    const InboundRelayKey key = MakeInboundRelayKey(inbound_peer, payload.block_hash_prefix);
 
-    if (IsKnown(payload.block_hash_prefix)) {
+    if (IsKnown(payload.block_hash_prefix) || IsFinished(key, now)) {
         ++m_stats.blocks_already_known;
         return;
     }
@@ -315,7 +320,6 @@ void RelayEngine::OnBlockHeader(const InboundPeerInfo& inbound_peer,
         return;
     }
 
-    const InboundRelayKey key = MakeInboundRelayKey(inbound_peer, payload.block_hash_prefix);
     InboundRelay* relay = GetOrCreateInbound(key, now);
     if (relay == nullptr) {
         RejectInbound(slot);
@@ -348,6 +352,8 @@ void RelayEngine::OnBlockHeader(const InboundPeerInfo& inbound_peer,
         if (!relay->decoder->AddChunk(chunk)) {
             RejectInbound(slot);
             EraseInbound(key);
+            MarkFinished(key, now);
+            RecordFault(slot, now);
             return;
         }
     }
@@ -368,12 +374,12 @@ void RelayEngine::OnBlockChunk(const InboundPeerInfo& inbound_peer,
     const auto now = m_clock.Now();
     EvictExpiredInbound(now);
 
-    if (IsKnown(payload.block_hash_prefix)) {
+    const InboundRelayKey key = MakeInboundRelayKey(inbound_peer, payload.block_hash_prefix);
+    if (IsKnown(payload.block_hash_prefix) || IsFinished(key, now)) {
         ++m_stats.blocks_already_known;
         return;
     }
 
-    const InboundRelayKey key = MakeInboundRelayKey(inbound_peer, payload.block_hash_prefix);
     if (m_inbound.find(key) == m_inbound.end() &&
         (IsSuspended(key.slot_index, now) || !HasGlobalInboundBufferCapacity())) {
         RejectInbound(key.slot_index);
@@ -622,14 +628,17 @@ RelayEngine::InboundRelay* RelayEngine::GetOrCreateInbound(const InboundRelayKey
     }
 
     PeerInbound& peer = Peer(key.slot_index);
-    while (peer.entries >= m_config.max_inbound_entries_per_peer) {
-        if (!EvictOwnOldest(key.slot_index, nullptr, /*decoder_only=*/false)) {
+    const std::size_t own_excess =
+        peer.entries + 1 > m_config.max_inbound_entries_per_peer ? peer.entries + 1 - m_config.max_inbound_entries_per_peer : 0;
+    const std::size_t total_excess =
+        m_inbound.size() + 1 > m_config.max_inbound_entries ? m_inbound.size() + 1 - m_config.max_inbound_entries : 0;
+    if (own_excess > 0 || total_excess > 0) {
+        const auto victims = PlanEvictions(key.slot_index, nullptr, /*by_decoder_bytes=*/false, own_excess, total_excess, now);
+        if (!victims.has_value()) {
             return nullptr;
         }
-    }
-    while (m_inbound.size() >= m_config.max_inbound_entries) {
-        if (!EvictForGlobalLimit(key.slot_index, nullptr, /*decoder_only=*/false, now)) {
-            return nullptr;
+        for (const auto victim : *victims) {
+            EraseInboundAt(victim, /*evicted=*/true);
         }
     }
 
@@ -638,7 +647,7 @@ RelayEngine::InboundRelay* RelayEngine::GetOrCreateInbound(const InboundRelayKey
     inserted_it->second.first_seen = now;
     inserted_it->second.last_updated = now;
     ++peer.entries;
-    m_stats.inbound_entries = m_inbound.size();
+    UpdateUsageStats();
     return &inserted_it->second;
 }
 
@@ -648,73 +657,117 @@ bool RelayEngine::ReserveDecoderBytes(const InboundRelayKey& key,
                                       Clock::TimePoint now)
 {
     PeerInbound& peer = Peer(key.slot_index);
-    while (peer.decoder_bytes + bytes > m_config.max_inbound_decoder_bytes_per_peer) {
-        if (!EvictOwnOldest(key.slot_index, &key, /*decoder_only=*/true)) {
+    const std::size_t own_excess = peer.decoder_bytes + bytes > m_config.max_inbound_decoder_bytes_per_peer
+                                       ? peer.decoder_bytes + bytes - m_config.max_inbound_decoder_bytes_per_peer
+                                       : 0;
+    const std::size_t total_excess = m_inbound_decoder_bytes + bytes > m_config.max_inbound_decoder_bytes
+                                         ? m_inbound_decoder_bytes + bytes - m_config.max_inbound_decoder_bytes
+                                         : 0;
+    if (own_excess > 0 || total_excess > 0) {
+        const auto victims = PlanEvictions(key.slot_index, &key, /*by_decoder_bytes=*/true, own_excess, total_excess, now);
+        if (!victims.has_value()) {
             return false;
         }
-    }
-    while (m_inbound_decoder_bytes + bytes > m_config.max_inbound_decoder_bytes) {
-        if (!EvictForGlobalLimit(key.slot_index, &key, /*decoder_only=*/true, now)) {
-            return false;
+        for (const auto victim : *victims) {
+            EraseInboundAt(victim, /*evicted=*/true);
         }
     }
 
     relay.decoder_bytes = bytes;
     peer.decoder_bytes += bytes;
     m_inbound_decoder_bytes += bytes;
+    UpdateUsageStats();
+    return true;
+}
+
+std::optional<std::vector<RelayEngine::InboundMap::iterator>> RelayEngine::PlanEvictions(std::size_t slot_index,
+                                                                                        const InboundRelayKey* keep,
+                                                                                        bool by_decoder_bytes,
+                                                                                        std::size_t own_excess,
+                                                                                        std::size_t total_excess,
+                                                                                        Clock::TimePoint now)
+{
+    // The requesting peer gives up its own oldest blocks first, to fit its own limit and then the
+    // total one. Beyond that, only another peer's block that has stopped making progress may be
+    // displaced. Nothing is freed unless the new block will fit.
+    std::vector<InboundMap::iterator> own;
+    std::vector<InboundMap::iterator> idle_others;
+    for (auto it = m_inbound.begin(); it != m_inbound.end(); ++it) {
+        if ((keep != nullptr && it->first == *keep) || (by_decoder_bytes && it->second.decoder_bytes == 0)) {
+            continue;
+        }
+        if (it->first.slot_index == slot_index) {
+            own.push_back(it);
+        } else if (now - it->second.last_updated > m_config.inbound_progress_grace) {
+            idle_others.push_back(it);
+        }
+    }
+    std::sort(own.begin(), own.end(), [](const auto& left, const auto& right) {
+        if (left->second.first_seen != right->second.first_seen) {
+            return left->second.first_seen < right->second.first_seen;
+        }
+        return InboundRelayKeyLess(left->first, right->first);
+    });
+    std::sort(idle_others.begin(), idle_others.end(), [](const auto& left, const auto& right) {
+        if (left->second.last_updated != right->second.last_updated) {
+            return left->second.last_updated < right->second.last_updated;
+        }
+        return InboundRelayKeyLess(left->first, right->first);
+    });
+
+    const auto weight = [by_decoder_bytes](const InboundMap::iterator& it) {
+        return by_decoder_bytes ? it->second.decoder_bytes : std::size_t{1};
+    };
+
+    std::vector<InboundMap::iterator> victims;
+    std::size_t freed = 0;
+    std::size_t next_own = 0;
+    while (freed < own_excess) {
+        if (next_own == own.size()) {
+            return std::nullopt;
+        }
+        freed += weight(own[next_own]);
+        victims.push_back(own[next_own++]);
+    }
+    while (freed < total_excess && next_own < own.size()) {
+        freed += weight(own[next_own]);
+        victims.push_back(own[next_own++]);
+    }
+    for (std::size_t next_other = 0; freed < total_excess; ++next_other) {
+        if (next_other == idle_others.size()) {
+            return std::nullopt;
+        }
+        freed += weight(idle_others[next_other]);
+        victims.push_back(idle_others[next_other]);
+    }
+    return victims;
+}
+
+void RelayEngine::MarkFinished(const InboundRelayKey& key, Clock::TimePoint now)
+{
+    if (!m_finished.insert(key).second) {
+        return;
+    }
+    m_finished_order.emplace_back(key, now);
+    while (m_finished_order.size() > kMaxFinishedInbound) {
+        m_finished.erase(m_finished_order.front().first);
+        m_finished_order.pop_front();
+    }
+}
+
+bool RelayEngine::IsFinished(const InboundRelayKey& key, Clock::TimePoint now)
+{
+    while (!m_finished_order.empty() && now - m_finished_order.front().second > kFinishedInboundLifetime) {
+        m_finished.erase(m_finished_order.front().first);
+        m_finished_order.pop_front();
+    }
+    return m_finished.count(key) != 0;
+}
+
+void RelayEngine::UpdateUsageStats()
+{
+    m_stats.inbound_entries = m_inbound.size();
     m_stats.inbound_decoder_bytes = m_inbound_decoder_bytes;
-    return true;
-}
-
-bool RelayEngine::EvictOwnOldest(std::size_t slot_index, const InboundRelayKey* keep, bool decoder_only)
-{
-    auto victim = m_inbound.end();
-    for (auto it = m_inbound.begin(); it != m_inbound.end(); ++it) {
-        if (it->first.slot_index != slot_index || (keep != nullptr && it->first == *keep) ||
-            (decoder_only && it->second.decoder_bytes == 0)) {
-            continue;
-        }
-        if (victim == m_inbound.end() || it->second.first_seen < victim->second.first_seen ||
-            (it->second.first_seen == victim->second.first_seen && InboundRelayKeyLess(it->first, victim->first))) {
-            victim = it;
-        }
-    }
-
-    if (victim == m_inbound.end()) {
-        return false;
-    }
-    EraseInboundAt(victim, /*evicted=*/true);
-    return true;
-}
-
-bool RelayEngine::EvictForGlobalLimit(std::size_t slot_index,
-                                      const InboundRelayKey* keep,
-                                      bool decoder_only,
-                                      Clock::TimePoint now)
-{
-    // The requesting peer gives up its own oldest block first.
-    if (EvictOwnOldest(slot_index, keep, decoder_only)) {
-        return true;
-    }
-
-    // Otherwise only another peer's block that has stopped making progress may be displaced.
-    auto victim = m_inbound.end();
-    for (auto it = m_inbound.begin(); it != m_inbound.end(); ++it) {
-        if (it->first.slot_index == slot_index || now - it->second.last_updated <= m_config.inbound_progress_grace ||
-            (decoder_only && it->second.decoder_bytes == 0)) {
-            continue;
-        }
-        if (victim == m_inbound.end() || it->second.last_updated < victim->second.last_updated ||
-            (it->second.last_updated == victim->second.last_updated && InboundRelayKeyLess(it->first, victim->first))) {
-            victim = it;
-        }
-    }
-
-    if (victim == m_inbound.end()) {
-        return false;
-    }
-    EraseInboundAt(victim, /*evicted=*/true);
-    return true;
 }
 
 void RelayEngine::EvictExpiredInbound(Clock::TimePoint now)
@@ -747,8 +800,7 @@ RelayEngine::InboundMap::iterator RelayEngine::EraseInboundAt(InboundMap::iterat
     }
 
     auto next = m_inbound.erase(it);
-    m_stats.inbound_entries = m_inbound.size();
-    m_stats.inbound_decoder_bytes = m_inbound_decoder_bytes;
+    UpdateUsageStats();
     return next;
 }
 
@@ -808,8 +860,10 @@ void RelayEngine::TryFinalizeInbound(const InboundRelayKey& key, InboundRelay& r
     const std::size_t slot = key.slot_index;
     const auto reconstructed = relay.decoder->Reconstruct();
 
-    // The decoder is no longer needed whatever happens next; release it before calling the node.
+    // The decoder is no longer needed whatever happens next; release it before calling the node,
+    // and ignore the rest of this block's chunks from this peer.
     EraseInbound(key);
+    MarkFinished(key, now);
 
     if (!reconstructed.has_value()) {
         ++m_stats.submit_failures;
@@ -827,14 +881,32 @@ void RelayEngine::TryFinalizeInbound(const InboundRelayKey& key, InboundRelay& r
         return;
     }
 
+    // Once the node has the block, other peers' copies of it need not be decoded or submitted.
+    const auto settle = [this, &key] {
+        RememberSeen(key.hash_prefix);
+        EraseInboundForPrefix(key.hash_prefix);
+    };
+
     // It must also build on the node's best chain, at or close to its tip.
-    const ParentCheck parent = submitter.CheckParent(summary->prev_hash_hex, m_config.max_parent_depth);
-    if (parent == ParentCheck::kUnavailable) {
+    const ParentCheck parent =
+        submitter.CheckParent(summary->hash_hex, summary->prev_hash_hex, m_config.max_parent_depth);
+    switch (parent) {
+    case ParentCheck::kNearTip:
+        break;
+    case ParentCheck::kAlreadyKnown:
+        ++m_stats.blocks_already_known;
+        settle();
+        return;
+    case ParentCheck::kUnavailable:
         // Nothing is known about the block, and the peer is not at fault.
         ++m_stats.block_checks_unavailable;
         return;
-    }
-    if (parent != ParentCheck::kNearTip) {
+    case ParentCheck::kNodeBehind:
+        // The local node has not caught up with this block's chain; not the peer's fault.
+        ++m_stats.blocks_node_behind;
+        return;
+    case ParentCheck::kTooFar:
+    case ParentCheck::kUnknown:
         ++m_stats.blocks_parent_rejected;
         ++Peer(slot).stats.blocks_dropped;
         RecordFault(slot, now);
@@ -846,8 +918,7 @@ void RelayEngine::TryFinalizeInbound(const InboundRelayKey& key, InboundRelay& r
         ++m_stats.submit_successes;
         ++m_stats.blocks_received_in;
         RecordAccepted(slot, now);
-        RememberSeen(key.hash_prefix);
-        EraseInboundForPrefix(key.hash_prefix);
+        settle();
         return;
     }
 
@@ -856,9 +927,12 @@ void RelayEngine::TryFinalizeInbound(const InboundRelayKey& key, InboundRelay& r
     switch (outcome) {
     case SubmitOutcome::kDuplicate:
         ++m_stats.submit_duplicates;
+        settle();
         break;
     case SubmitOutcome::kInconclusive:
+        // Stored by the node: count it against this peer once, not once per peer relaying it.
         ++m_stats.submit_inconclusive;
+        settle();
         RecordFault(slot, now);
         break;
     case SubmitOutcome::kRejected:
@@ -900,8 +974,12 @@ bool RelayEngine::FeedChunk(const InboundRelayKey& key, InboundRelay& relay, con
     }
 
     if (!relay.decoder->AddChunk(chunk)) {
+        // A chunk that does not fit the announced block: drop the block and count it against the peer.
+        const auto now = m_clock.Now();
         RejectInbound(key.slot_index);
         EraseInbound(key);
+        MarkFinished(key, now);
+        RecordFault(key.slot_index, now);
         return false;
     }
     return true;

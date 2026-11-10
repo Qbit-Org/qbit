@@ -130,7 +130,7 @@ public:
         return m_state->submit_result;
     }
 
-    photon::ParentCheck CheckParent(const std::string& prev_hash_hex, std::uint32_t) override
+    photon::ParentCheck CheckParent(const std::string&, const std::string& prev_hash_hex, std::uint32_t) override
     {
         ++m_state->parent_check_calls;
         m_state->last_parent_hash = prev_hash_hex;

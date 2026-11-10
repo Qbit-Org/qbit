@@ -350,12 +350,36 @@ bool SendAll(int fd, const std::string& payload)
     return true;
 }
 
-std::optional<std::string> ReadResponse(int fd)
+using Deadline = std::chrono::steady_clock::time_point;
+
+// Time left until `deadline` as a socket timeout; nullopt once it has passed.
+std::optional<timeval> RemainingTimeout(Deadline deadline)
+{
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+        return std::nullopt;
+    }
+    const auto left = std::chrono::duration_cast<std::chrono::microseconds>(deadline - now);
+    const auto micros = std::max<std::chrono::microseconds::rep>(left.count(), 1000);
+    timeval timeout{};
+    timeout.tv_sec = static_cast<decltype(timeout.tv_sec)>(micros / 1'000'000);
+    timeout.tv_usec = static_cast<suseconds_t>(micros % 1'000'000);
+    return timeout;
+}
+
+std::optional<std::string> ReadResponse(int fd, Deadline deadline)
 {
     std::string out;
     std::array<char, 4096> buffer{};
 
     while (true) {
+        // Re-arm the receive timeout with what is left, so a slow reply cannot outlast the deadline.
+        const auto timeout = RemainingTimeout(deadline);
+        if (!timeout.has_value()) {
+            return std::nullopt;
+        }
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &*timeout, sizeof(*timeout));
+
         const ssize_t bytes = recv(fd, buffer.data(), buffer.size(), 0);
         if (bytes == 0) {
             break;
@@ -408,6 +432,10 @@ const char* ParentCheckName(ParentCheck check)
         return "unknown";
     case ParentCheck::kUnavailable:
         return "unavailable";
+    case ParentCheck::kAlreadyKnown:
+        return "already_known";
+    case ParentCheck::kNodeBehind:
+        return "node_behind";
     }
     return "unknown";
 }
@@ -501,30 +529,46 @@ SubmitOutcome RpcClient::SubmitBlock(std::span<const std::uint8_t> block_data)
     return SubmitOutcome::kRejected;
 }
 
-ParentCheck RpcClient::CheckParent(const std::string& prev_hash_hex, std::uint32_t max_depth)
+ParentCheck RpcClient::CheckParent(const std::string& block_hash_hex,
+                                   const std::string& prev_hash_hex,
+                                   std::uint32_t max_depth)
 {
-    if (!IsUint256Hex(prev_hash_hex)) {
+    if (!IsUint256Hex(block_hash_hex) || !IsUint256Hex(prev_hash_hex)) {
         return ParentCheck::kUnavailable;
     }
 
-    // One budget for the whole check, so a slow node cannot stretch it across several calls.
-    const auto deadline = std::chrono::steady_clock::now() + m_options.timeout;
-    const auto expired = [&deadline] { return std::chrono::steady_clock::now() >= deadline; };
+    // One deadline for every call of the check, so a slow node cannot stretch it.
+    const Deadline deadline = std::chrono::steady_clock::now() + m_options.timeout;
     const std::int64_t depth = static_cast<std::int64_t>(max_depth);
+    const auto is_not_found = [](const RpcReply& reply) {
+        return reply.status == RpcReply::Status::kRpcError && reply.error_code == kRpcInvalidAddressOrKey;
+    };
 
-    const auto best_hash = CallForHash("getbestblockhash", "[]");
+    const auto best_hash = CallForHash("getbestblockhash", "[]", deadline);
     if (!best_hash.has_value()) {
         return ParentCheck::kUnavailable;
     }
     if (*best_hash == prev_hash_hex) {
         return ParentCheck::kNearTip;
     }
-
-    if (expired()) {
-        return ParentCheck::kUnavailable;
+    if (*best_hash == block_hash_hex) {
+        return ParentCheck::kAlreadyKnown;
     }
-    const RpcReply parent_reply = Call("getblockheader", "[\"" + prev_hash_hex + "\",true]");
-    if (parent_reply.status == RpcReply::Status::kRpcError && parent_reply.error_code == kRpcInvalidAddressOrKey) {
+
+    // Off the common path, first ask whether the node already has the block on its best chain.
+    const RpcReply block_reply = Call("getblockheader", "[\"" + block_hash_hex + "\",true]", deadline);
+    if (!is_not_found(block_reply)) {
+        const auto block = ParseHeaderInfo(block_reply);
+        if (!block.has_value()) {
+            return ParentCheck::kUnavailable;
+        }
+        if (block->confirmations >= 1) {
+            return ParentCheck::kAlreadyKnown;
+        }
+    }
+
+    const RpcReply parent_reply = Call("getblockheader", "[\"" + prev_hash_hex + "\",true]", deadline);
+    if (is_not_found(parent_reply)) {
         return ParentCheck::kUnknown;
     }
     const auto parent = ParseHeaderInfo(parent_reply);
@@ -536,28 +580,27 @@ ParentCheck RpcClient::CheckParent(const std::string& prev_hash_hex, std::uint32
         return parent->confirmations - 1 <= depth ? ParentCheck::kNearTip : ParentCheck::kTooFar;
     }
 
-    // On another branch: compare its chain work with the best chain's block `max_depth` below the
-    // best block, so a competing branch near the tip qualifies and a low-work one does not.
-    if (expired()) {
-        return ParentCheck::kUnavailable;
-    }
-    const auto best = ParseHeaderInfo(Call("getblockheader", "[\"" + *best_hash + "\",true]"));
+    // On another branch.
+    const auto best = ParseHeaderInfo(Call("getblockheader", "[\"" + *best_hash + "\",true]", deadline));
     if (!best.has_value()) {
         return ParentCheck::kUnavailable;
+    }
+    if (parent->height > best->height) {
+        // The node knows the parent only as a header above its best block: it is still catching up.
+        return ParentCheck::kNodeBehind;
     }
     if (parent->height + depth < best->height) {
         return ParentCheck::kTooFar;
     }
 
-    if (expired()) {
-        return ParentCheck::kUnavailable;
-    }
+    // Compare chain work with the best chain's block `max_depth` below the best block, so a
+    // competing branch near the tip qualifies and a low-work one does not.
     const std::int64_t anchor_height = std::max<std::int64_t>(0, best->height - depth);
-    const auto anchor_hash = CallForHash("getblockhash", "[" + std::to_string(anchor_height) + "]");
-    if (!anchor_hash.has_value() || expired()) {
+    const auto anchor_hash = CallForHash("getblockhash", "[" + std::to_string(anchor_height) + "]", deadline);
+    if (!anchor_hash.has_value()) {
         return ParentCheck::kUnavailable;
     }
-    const auto anchor = ParseHeaderInfo(Call("getblockheader", "[\"" + *anchor_hash + "\",true]"));
+    const auto anchor = ParseHeaderInfo(Call("getblockheader", "[\"" + *anchor_hash + "\",true]", deadline));
     if (!anchor.has_value()) {
         return ParentCheck::kUnavailable;
     }
@@ -568,7 +611,12 @@ ParentCheck RpcClient::CheckParent(const std::string& prev_hash_hex, std::uint32
 
 RpcClient::RpcReply RpcClient::Call(const std::string& method, const std::string& params_json)
 {
-    const auto response = SendJsonRpc(method, params_json);
+    return Call(method, params_json, std::chrono::steady_clock::now() + m_options.timeout);
+}
+
+RpcClient::RpcReply RpcClient::Call(const std::string& method, const std::string& params_json, Deadline deadline)
+{
+    const auto response = SendJsonRpc(method, params_json, deadline);
     if (!response.has_value()) {
         return RpcReply{.status = RpcReply::Status::kNoResponse};
     }
@@ -594,9 +642,11 @@ RpcClient::RpcReply RpcClient::Call(const std::string& method, const std::string
     return RpcReply{.status = RpcReply::Status::kBadResponse};
 }
 
-std::optional<std::string> RpcClient::CallForHash(const std::string& method, const std::string& params_json)
+std::optional<std::string> RpcClient::CallForHash(const std::string& method,
+                                                  const std::string& params_json,
+                                                  Deadline deadline)
 {
-    const RpcReply reply = Call(method, params_json);
+    const RpcReply reply = Call(method, params_json, deadline);
     if (reply.status != RpcReply::Status::kResult) {
         return std::nullopt;
     }
@@ -631,6 +681,13 @@ std::optional<RpcClient::HeaderInfo> RpcClient::ParseHeaderInfo(const RpcReply& 
 
 std::optional<RpcClient::HttpResponse> RpcClient::SendJsonRpc(const std::string& method, const std::string& params_json)
 {
+    return SendJsonRpc(method, params_json, std::chrono::steady_clock::now() + m_options.timeout);
+}
+
+std::optional<RpcClient::HttpResponse> RpcClient::SendJsonRpc(const std::string& method,
+                                                              const std::string& params_json,
+                                                              Deadline deadline)
+{
     if (!m_cookie_loaded && !LoadCookie()) {
         return std::nullopt;
     }
@@ -640,7 +697,7 @@ std::optional<RpcClient::HttpResponse> RpcClient::SendJsonRpc(const std::string&
         "{\"jsonrpc\":\"1.0\",\"id\":\"qbit-photon-" + std::to_string(request_id)
         + "\",\"method\":\"" + method + "\",\"params\":" + params_json + "}";
 
-    auto response = SendHttpRequest(request_body);
+    auto response = SendHttpRequest(request_body, deadline);
     if (!response.has_value()) {
         return std::nullopt;
     }
@@ -652,15 +709,19 @@ std::optional<RpcClient::HttpResponse> RpcClient::SendJsonRpc(const std::string&
             return response;
         }
 
-        response = SendHttpRequest(request_body);
+        response = SendHttpRequest(request_body, deadline);
     }
 
     return response;
 }
 
-std::optional<RpcClient::HttpResponse> RpcClient::SendHttpRequest(const std::string& request_body)
+std::optional<RpcClient::HttpResponse> RpcClient::SendHttpRequest(const std::string& request_body, Deadline deadline)
 {
     if (!m_cookie_loaded) {
+        return std::nullopt;
+    }
+    if (!RemainingTimeout(deadline).has_value()) {
+        LOG_WARN("RPC deadline passed before the request could be sent");
         return std::nullopt;
     }
 
@@ -704,11 +765,13 @@ std::optional<RpcClient::HttpResponse> RpcClient::SendHttpRequest(const std::str
         }
 #endif
 
-        timeval timeout{};
-        timeout.tv_sec = static_cast<long>(m_options.timeout.count() / 1000);
-        timeout.tv_usec = static_cast<suseconds_t>((m_options.timeout.count() % 1000) * 1000);
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+        const auto timeout = RemainingTimeout(deadline);
+        if (!timeout.has_value()) {
+            close(fd);
+            break;
+        }
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &*timeout, sizeof(*timeout));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &*timeout, sizeof(*timeout));
 
         int connect_rc = -1;
         do {
@@ -736,7 +799,7 @@ std::optional<RpcClient::HttpResponse> RpcClient::SendHttpRequest(const std::str
         return std::nullopt;
     }
 
-    const auto raw_response = ReadResponse(connected_fd);
+    const auto raw_response = ReadResponse(connected_fd, deadline);
     close(connected_fd);
 
     if (!raw_response.has_value()) {

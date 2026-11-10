@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <functional>
 #include <iostream>
@@ -368,6 +369,18 @@ std::size_t HeapInUse()
     return info.uordblks + info.hblkhd;
 }
 
+// mallinfo2 sees only glibc's allocator; under a sanitizer or a preloaded allocator it reports
+// nothing useful, so measurements are skipped there.
+bool HeapMeasurable()
+{
+    constexpr std::size_t kProbeBytes = 1024 * 1024;
+    const std::size_t base = HeapInUse();
+    void* volatile probe = std::malloc(kProbeBytes);
+    const bool visible = probe != nullptr && HeapInUse() >= base + kProbeBytes;
+    std::free(probe);
+    return visible;
+}
+
 // Peak heap held by a decoder for `block`, from construction until it completes. Parity chunks
 // are fed first so the decoder holds the most state before it can finish.
 std::size_t MeasureDecoderPeak(const Parameters& params, const std::vector<std::uint8_t>& block)
@@ -401,6 +414,10 @@ std::size_t MeasureDecoderPeak(const Parameters& params, const std::vector<std::
 void TestDecoderMemoryChargeCoversHeap()
 {
 #if defined(__GLIBC__)
+    if (!HeapMeasurable()) {
+        std::cout << "  (allocator not visible to mallinfo2; skipped)\n";
+        return;
+    }
     // One coding group for every data chunk count: the charge must cover what the codec allocates,
     // without being so loose that the relay limits stop meaning anything.
     for (std::uint16_t data_chunks = 2; data_chunks < FEC_TOTAL_CHUNKS; ++data_chunks) {

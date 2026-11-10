@@ -62,7 +62,8 @@ struct RelayStats {
     std::uint64_t chunks_sent{0};
     std::uint64_t chunks_received{0};
     std::uint64_t submit_successes{0};
-    // Every reconstructed block that was not accepted: the outcomes below plus decode failures.
+    // Blocks handed to qbitd that it did not accept (the outcomes below), plus reconstructed
+    // blocks that failed to decode.
     std::uint64_t submit_failures{0};
     std::uint64_t submit_duplicates{0};
     std::uint64_t submit_inconclusive{0};
@@ -73,6 +74,7 @@ struct RelayStats {
     std::uint64_t blocks_mismatched{0};
     std::uint64_t blocks_parent_rejected{0};
     std::uint64_t block_checks_unavailable{0};
+    std::uint64_t blocks_node_behind{0};
     std::uint64_t inbound_rejected{0};
     std::uint64_t inbound_evictions{0};
     std::uint64_t peer_suspensions{0};
@@ -98,7 +100,9 @@ struct PeerRelayStats {
 class BlockSubmitter {
 public:
     virtual ~BlockSubmitter() = default;
-    virtual ParentCheck CheckParent(const std::string& prev_hash_hex, std::uint32_t max_depth) = 0;
+    virtual ParentCheck CheckParent(const std::string& block_hash_hex,
+                                    const std::string& prev_hash_hex,
+                                    std::uint32_t max_depth) = 0;
     virtual SubmitOutcome SubmitBlock(std::span<const std::uint8_t> block_data) = 0;
 };
 
@@ -209,8 +213,15 @@ private:
     void SuspendPeer(std::size_t slot_index, Clock::TimePoint now);
     [[nodiscard]] InboundRelay* GetOrCreateInbound(const InboundRelayKey& key, Clock::TimePoint now);
     [[nodiscard]] bool ReserveDecoderBytes(const InboundRelayKey& key, InboundRelay& relay, std::size_t bytes, Clock::TimePoint now);
-    [[nodiscard]] bool EvictOwnOldest(std::size_t slot_index, const InboundRelayKey* keep, bool decoder_only);
-    [[nodiscard]] bool EvictForGlobalLimit(std::size_t slot_index, const InboundRelayKey* keep, bool decoder_only, Clock::TimePoint now);
+    [[nodiscard]] std::optional<std::vector<InboundMap::iterator>> PlanEvictions(std::size_t slot_index,
+                                                                                const InboundRelayKey* keep,
+                                                                                bool by_decoder_bytes,
+                                                                                std::size_t own_excess,
+                                                                                std::size_t total_excess,
+                                                                                Clock::TimePoint now);
+    void MarkFinished(const InboundRelayKey& key, Clock::TimePoint now);
+    [[nodiscard]] bool IsFinished(const InboundRelayKey& key, Clock::TimePoint now);
+    void UpdateUsageStats();
     void EvictExpiredInbound(Clock::TimePoint now);
     InboundMap::iterator EraseInboundAt(InboundMap::iterator it, bool evicted);
     void EraseInbound(const InboundRelayKey& key);
@@ -229,6 +240,10 @@ private:
     std::size_t m_inbound_buffered_bytes{0};
     std::size_t m_inbound_decoder_bytes{0};
     std::map<std::size_t, PeerInbound> m_peers{};
+    // Inbound blocks already handled (submitted or dropped), so that the sender's remaining chunks
+    // do not start a new incomplete block.
+    std::deque<std::pair<InboundRelayKey, Clock::TimePoint>> m_finished_order{};
+    std::unordered_set<InboundRelayKey, InboundRelayKeyHash> m_finished{};
 
     std::deque<std::uint64_t> m_seen_order{};
     std::unordered_set<std::uint64_t> m_seen_set{};
