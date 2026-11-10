@@ -161,9 +161,11 @@ whatever branch a pull request targets. The job:
 The workflow itself runs as the default branch holds it: an approved change to
 it on `1.x.x` takes effect only when `main` has it. Every release line's gate
 script must therefore keep the command line the workflow uses (`target --base
---head --work`, run with `-I -B -X pycache_prefix`), and the gate refuses a
-workflow that could skip its job or a step, ignore a failure, or check out
-anything but the base commit.
+--head --work`, run with `-I -B -X pycache_prefix`). The gate refuses a
+version of its workflow that could skip its job or a step, ignore a failure,
+take the repository's default token permissions, use any action but
+`actions/checkout`, or check out anything with it but the base commit; what
+its `run:` steps do is for the signers who approve the change to read.
 
 The check is named for its base, `Key Policy Gate (main)` or
 `Key Policy Gate (1.x.x)`, and each branch's ruleset requires its own name.
@@ -278,6 +280,12 @@ this order:
 No ruleset may require the gate before step 3: until `main` holds the
 workflow, no run posts the check, and pull requests would wait for it forever.
 The gate does not check the pull request that adds it.
+
+Once armed, each protected branch keeps its own gate approvals, and a pull
+request may add only its own approvals directory. A pull request that carries
+one branch's approvals into the other, such as a merge of `1.x.x` into `main`,
+cannot pass the gate; such a sync is an administrator's fast-forward, as in
+step 3.
 
 Release validators count a signature only when gpg's GOODSIG and VALIDSIG
 agree and gpg reports no revoked or expired key or other error for it

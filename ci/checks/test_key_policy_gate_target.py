@@ -453,14 +453,16 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
             "recursive alias": ("x: &a [*a]\njobs:\n  other:\n    name: *a\n", "must declare its token permissions"),
             "matrix key YAML 1.1 reads as a boolean": ("permissions: {}\njobs:\n  other:\n    name: ${{ matrix.on }}\n    strategy:\n      matrix:\n        on: [Key Policy Gate]\n", "names something 'Key Policy Gate'"),
             "matrix key in another case": ("permissions: {}\njobs:\n  other:\n    name: ${{ matrix.CHECK }}\n    strategy:\n      matrix:\n        include:\n          - {check: Key Policy Gate}\n", "names something 'Key Policy Gate'"),
-            "job as a tagged set": ("permissions: {}\njobs: {other: !!set {name: Key Policy Gate, runs-on: x}}\n", "YAML tags that build set values are not allowed"),
-            "permissions as a tagged set": ("jobs:\n  other:\n    permissions: !!set {checks: write}\n", "YAML tags that build set values are not allowed"),
+            "job as a tagged set": ("permissions: {}\njobs: {other: !!set {name: Key Policy Gate, runs-on: x}}\n", "uses an explicit YAML tag"),
+            "permissions as a tagged set": ("jobs:\n  other:\n    permissions: !!set {checks: write}\n", "uses an explicit YAML tag"),
             "empty permissions": ("permissions:\njobs:\n  other:\n    name: Other\n", "must declare its token permissions"),
             "null permissions": ("permissions: ~\njobs:\n  other:\n    name: Other\n", "must declare its token permissions"),
-            "binary matrix value": ("permissions: {}\njobs:\n  other:\n    name: ${{ matrix.a }}\n    strategy:\n      matrix:\n        a: [!!binary S2V5IFBvbGljeSBHYXRl]\n", "YAML tags that build bytes values are not allowed"),
-            "binary permission": ("jobs:\n  other:\n    permissions:\n      checks: !!binary d3JpdGU=\n", "YAML tags that build bytes values are not allowed"),
-            "tagged scalar": ("permissions: {}\njobs:\n  other:\n    name: !!bool Key Policy Gate\n", "cannot be read as YAML"),
-            "tagged timestamp": ("permissions: {}\njobs:\n  other:\n    name: !!timestamp foo\n", "cannot be read as YAML"),
+            "binary matrix value": ("permissions: {}\njobs:\n  other:\n    name: ${{ matrix.a }}\n    strategy:\n      matrix:\n        a: [!!binary S2V5IFBvbGljeSBHYXRl]\n", "uses an explicit YAML tag"),
+            "binary permission": ("jobs:\n  other:\n    permissions:\n      checks: !!binary d3JpdGU=\n", "uses an explicit YAML tag"),
+            "null tag": ("permissions: {}\njobs:\n  other:\n    name: !!null Key Policy Gate (main)\n", "uses an explicit YAML tag"),
+            "str tag on a permission": ("jobs:\n  other:\n    permissions: {checks: !!null write}\n", "uses an explicit YAML tag"),
+            "tagged scalar": ("permissions: {}\njobs:\n  other:\n    name: !!bool Key Policy Gate\n", "uses an explicit YAML tag"),
+            "tagged timestamp": ("permissions: {}\njobs:\n  other:\n    name: !!timestamp foo\n", "uses an explicit YAML tag"),
             "line separator": ("permissions: {}\njobs:\n  other:\n    runs-on: x #\u2028    name: Key Policy Gate\n", "holds a control or separator character"),
             "byte-order mark in a key": ("permissions: {}\njobs: {other: {runs-on: x,\n\ufeffname: Key Policy Gate}}\n", "holds a control or separator character: \\ufeff"),
             "many aliased matrix entries": ("permissions: {}\nl: &l [" + ", ".join(["x"] * 300) + "]\ne: &e {a: *l}\njobs:\n  other:\n    name: Key Policy Gate${{ matrix.a }}\n    strategy:\n      matrix:\n        include: [" + ", ".join(["*e"] * 300) + "]\n", "names something 'Key Policy Gate'"),
@@ -487,6 +489,7 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
             "env:\n  CUTOFF: 2026-01-01\n  ODD: 2001-13-45\n  EQUALS: =\n"
             "jobs:\n  build:\n    name: Build ${{ matrix.name }} (${{ matrix.os }})\n"
             "    strategy:\n      matrix:\n        name: [Gate keeper, Lint]\n        os: [linux]\n"
+            "  plain:\n    name: Key Policy ${{ matrix.s }}\n    strategy:\n      matrix:\n        s: ['', '-', '_', e1, lint]\n"
             "    steps:\n      - run: echo 'the Key Policy Gate check is required'\n      - uses: ./.github/actions/setup\n"
             "  docs:\n    needs: build\n    name: docs (${{ matrix.id }})\n"
             "    strategy:\n      matrix: ${{ fromJSON(needs.build.outputs.matrix) }}\n",
@@ -703,6 +706,15 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
             "a step condition": (good.replace("      - name: Gate\n", "      - name: Gate\n        if: false\n"), "a step may not use if"),
             "an ignored failure": (good.replace("      - name: Gate\n", "      - name: Gate\n        continue-on-error: true\n"), "a step may not use continue-on-error"),
             "another checkout": (good.replace("ref: ${{ github.event.pull_request.base.sha }}", "ref: ${{ github.sha }}"), "must check out exactly the pull request's base commit"),
+            "a job that ignores failure": (good.replace("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-24.04\n    continue-on-error: true\n"), "its job may not use continue-on-error"),
+            "a job strategy": (good.replace("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-24.04\n    strategy: {matrix: {a: [1]}}\n"), "its job may not use strategy"),
+            "a job that needs another": (good.replace("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-24.04\n    needs: [other]\n"), "its job may not use needs"),
+            "a reusable workflow job": (good.replace("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-24.04\n    uses: ./.github/workflows/other.yml\n"), "its job may not use uses"),
+            "no checkout": (good.replace("      - uses: actions/checkout@0000000000000000000000000000000000000000\n        with:\n          ref: ${{ github.event.pull_request.base.sha }}\n", ""), "must check out exactly the pull request's base commit"),
+            "two checkouts": (good.replace("      - name: Gate\n", "      - uses: actions/checkout@0000000000000000000000000000000000000000\n        with:\n          ref: ${{ github.event.pull_request.base.sha }}\n      - name: Gate\n"), "must check out exactly the pull request's base commit"),
+            "a checkout spelled otherwise": (good.replace("      - name: Gate\n", "      - uses: Actions/Checkout@v5\n        with:\n          ref: ${{ github.event.pull_request.head.sha }}\n      - name: Gate\n"), "must check out exactly the pull request's base commit"),
+            "another action": (good.replace("      - name: Gate\n", "      - uses: ./.github/actions/setup\n      - name: Gate\n"), "may use no action but actions/checkout"),
+            "default permissions": (good.replace("permissions:\n  contents: read\n", ""), "must declare its token permissions"),
             "the gate's workflow": (good, None),
         }
         for index, (name, (text, expected)) in enumerate(sorted(cases.items())):

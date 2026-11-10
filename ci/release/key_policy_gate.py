@@ -582,6 +582,10 @@ def read_workflow(path: str, data: bytes):
     if odd:
         raise GateError(f"{path} holds a control or separator character: {shown(odd[0])}")
     try:
+        # An explicit tag (!!null, !!str, !!set, ...) changes what a key or value
+        # reads as, and readers differ on them: none may appear.
+        if any(isinstance(token, yaml.TagToken) for token in yaml.scan(text, Loader=loader_class)):
+            raise GateError(f"{path} uses an explicit YAML tag")
         loader = loader_class(text)
         try:
             root = loader.get_single_node()
@@ -650,12 +654,23 @@ def can_post_checks(permissions) -> bool:
     return True
 
 
+# Text YAML 1.2 (or 1.1) reads as a number: GitHub renders such a matrix
+# value as it prints the number, not as written.
+NUMBER_RE = re.compile(
+    r"[-+]?(?:0[xob][0-9a-f_]+|(?:[0-9][0-9_]*\.?[0-9_]*|\.[0-9][0-9_]*)(?:e[-+]?[0-9]+)?|\.(?:inf|nan))",
+    re.IGNORECASE,
+)
+
+
+def is_number(text: str) -> bool:
+    """Whether YAML 1.2 (or 1.1) could read `text` as a number."""
+
+    return bool(NUMBER_RE.fullmatch(text.strip()))
+
+
 # An expression in a name may only read a matrix value, such as ${{ matrix.name }}:
 # no literals, functions or operators, and no context a pull request, a
 # dispatcher or a setting supplies (github.event, inputs, vars, needs).
-NUMBER_RE = re.compile(
-    r"[-+]?(?:0[xob][0-9a-f_]+|(?:[0-9][0-9_]*)?\.?[0-9_]*(?:e[-+]?[0-9]+)?|\.(?:inf|nan))", re.IGNORECASE
-)
 MATRIX_EXPRESSION_RE = re.compile(r"\$\{\{\s*matrix\.([A-Za-z0-9_-]+)\s*\}\}")
 
 
@@ -696,7 +711,7 @@ def matrix_values(strategy, key: str) -> list[str] | None:
                 continue
             # A number (or text YAML 1.2 reads as one, such as 0o1 or 1e0)
             # renders as GitHub prints it, not as written: it stands for any text.
-            if not isinstance(value, str) or "${{" in value or NUMBER_RE.fullmatch(value.strip()):
+            if not isinstance(value, str) or "${{" in value or is_number(value):
                 return None
             found.add(value)
     return sorted(found)
@@ -769,13 +784,18 @@ def check_gate_workflow(path: str, data: bytes) -> None:
         for key in ("if", "continue-on-error"):
             if key in step:
                 raise GateError(f"{path}: a step may not use {key}")
-        if str(step.get("uses", "")).startswith("actions/checkout@"):
+        if "uses" in step:
+            # GitHub reads owner and repository names case-insensitively.
+            if not fold(str(step["uses"])).startswith("actions/checkout@"):
+                raise GateError(f"{path}: its steps may use no action but actions/checkout, not {step['uses']!r}")
             checkouts.append(step)
     base_commit = "${{ github.event.pull_request.base.sha }}"
     if len(checkouts) != 1 or (checkouts[0].get("with") or {}).get("ref") != base_commit:
         raise GateError(f"{path}: its job must check out exactly the pull request's base commit ({base_commit})")
     if can_post_checks(workflow.get("permissions")) or can_post_checks(job.get("permissions")):
         raise GateError(f"{path} may not ask to post checks or statuses: the job's own result is the check")
+    if not declares(workflow.get("permissions")) and not declares(job.get("permissions")):
+        raise GateError(f"{path} must declare its token permissions")
 
 
 def check_gate_check_name(head: str, changed: list[str]) -> None:
