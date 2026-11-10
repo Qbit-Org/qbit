@@ -444,17 +444,17 @@ api_path_escape() {
     python3 -I -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe="/"))' "$1"
 }
 
-fetch_branch_tip() {
-    # Prints the tip of a protected GitHub branch after fetching exactly that
-    # commit into a local checkout, so its first-parent history can be read
+protected_branch_tip() {
+    # Prints the tip of a protected GitHub branch after checking that the local
+    # checkout already has that commit, so its first-parent history can be read
     # locally. The branch's active rules must forbid force pushes and deletion,
     # so someone without admin rights cannot rewrite the history it anchors.
     # qbit's branch rulesets let organization admins bypass them, so an admin
     # still can: the release's attestation is the operator-signed tag, and this
-    # check guards against rewrites by everyone else. Fetching the SHA the API
-    # reported, not the moving branch, keeps a merge that lands meanwhile from
-    # breaking the release partway. gh's credential helper lets the fetch reach
-    # a private repository.
+    # check guards against rewrites by everyone else. The publisher never
+    # fetches (see the top of this file), so the operator fetches the branch
+    # before running it. A merge that lands after that fetch stops the publisher
+    # here, before anything is published.
     local root="$1"
     local repository="$2"
     local branch="$3"
@@ -479,13 +479,8 @@ fetch_branch_tip() {
     )" || die "Could not read the rules for $label branch $repository:$branch"
     { grep -qx non_fast_forward <<<"$rule_types" && grep -qx deletion <<<"$rule_types"; } \
         || die "$repository:$branch can be force-pushed or deleted; its ruleset needs non_fast_forward and deletion rules before releasing from it"
-    git -C "$root" -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
-        fetch --quiet --no-tags "https://github.com/$repository.git" "$api_tip" \
-        || die "Could not fetch $repository:$branch tip $api_tip into $root"
-    # Check the fetched object itself, not FETCH_HEAD, which a fetch that does
-    # not write it leaves stale or missing.
     git -C "$root" cat-file -e "$api_tip^{commit}" 2>/dev/null \
-        || die "$label branch $repository:$branch tip $api_tip is not a commit in $root after the fetch"
+        || die "$label branch $repository:$branch is at $api_tip, which $root does not have; the publisher never fetches, so fetch $branch there and run it again"
     lowercase "$api_tip"
 }
 
@@ -1122,14 +1117,14 @@ REPO_CAN_PUSH="$(
 msg "Verifying trusted release ref is public and on $GH_REPO:$TRUSTED_RELEASE_BRANCH"
 remote_commit "$GH_REPO_PATH" "$TRUSTED_RELEASE_REF" "Trusted release ref"
 TRUSTED_BRANCH_TIP="$(
-    fetch_branch_tip "$TRUSTED_ROOT" "$GH_REPO_PATH" "$TRUSTED_RELEASE_BRANCH" "Trusted release"
+    protected_branch_tip "$TRUSTED_ROOT" "$GH_REPO_PATH" "$TRUSTED_RELEASE_BRANCH" "Trusted release"
 )"
 on_first_parent_history "$TRUSTED_ROOT" "$TRUSTED_BRANCH_TIP" "$TRUSTED_RELEASE_REF" \
     || die "Trusted release ref $TRUSTED_RELEASE_REF must be on the first-parent history of $GH_REPO:$TRUSTED_RELEASE_BRANCH ($TRUSTED_BRANCH_TIP)"
 msg "Verifying qbit-guix.sigs commit is public and merged"
 remote_commit "$GUIX_SIGS_GH_REPO_PATH" "$GUIX_SIGS_REF" "qbit-guix.sigs commit"
 GUIX_SIGS_BRANCH_TIP="$(
-    fetch_branch_tip "$GUIX_SIGS_REPO" "$GUIX_SIGS_GH_REPO_PATH" "$GUIX_SIGS_BRANCH" "qbit-guix.sigs"
+    protected_branch_tip "$GUIX_SIGS_REPO" "$GUIX_SIGS_GH_REPO_PATH" "$GUIX_SIGS_BRANCH" "qbit-guix.sigs"
 )"
 on_first_parent_history "$GUIX_SIGS_REPO" "$GUIX_SIGS_BRANCH_TIP" "$GUIX_SIGS_REF" \
     || die "qbit-guix.sigs commit $GUIX_SIGS_REF must be on the first-parent history of $GUIX_SIGS_GH_REPO:$GUIX_SIGS_BRANCH ($GUIX_SIGS_BRANCH_TIP): pin the merge commit that landed the attestations, not the pull request head"

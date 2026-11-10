@@ -63,12 +63,16 @@ so someone without admin rights cannot force-push away the history it anchors
 or delete the branch. qbit's branch rulesets give organization admins an
 always-bypass, so an admin can still rewrite that history: the release's
 attestation is the operator-signed tag, and this check guards against rewrites
-by non-admins. The publisher fetches the exact tip commit GitHub's API reports for
-it, authenticating through `gh`, and refuses a trusted ref off that line, such
-as a pull request head, which could carry validators and key policy from an
-older base. The publisher prints the trusted release branch it uses and, when
-`--trusted-release-branch` is not given, reminds that a release-line release
-must pass `--trusted-release-branch <line>`.
+by non-admins. The publisher reads the tip commit GitHub's API reports for it
+and refuses a trusted ref off that line, such as a pull request head, which
+could carry validators and key policy from an older base. The publisher never
+fetches, so the trusted checkout must already have that tip, and the
+qbit-guix.sigs checkout the tip of its branch: fetch both branches before
+running it. If a merge lands after that fetch, the publisher stops before it
+publishes anything; fetch again and rerun it. The publisher prints the trusted
+release branch it uses and, when `--trusted-release-branch` is not given,
+reminds that a release-line release must pass
+`--trusted-release-branch <line>`.
 
 Prerequisites for publishing with this publisher:
 

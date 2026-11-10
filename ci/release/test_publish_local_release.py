@@ -75,8 +75,9 @@ class PublishLocalReleaseTest(unittest.TestCase):
         self.tag_target = git(self.trusted, "rev-parse", f"refs/tags/{TAG}^{{commit}}")
         self.trusted_ref = git(self.trusted, "rev-parse", "HEAD")
         self.guix_sigs_ref = git(self.guix_sigs, "rev-parse", "HEAD")
-        # Local bare repositories stand in for GitHub; run_publisher redirects
-        # https://github.com/ to them with url.<base>.insteadOf.
+        # Local bare repositories stand in for GitHub's copies. The publisher
+        # never fetches, so it reads only the checkouts; tests clone or commit
+        # in the bare repositories to make history a checkout lacks.
         self.github = self.root / "github"
         for repository, checkout in (
             ("Qbit-Org/qbit", self.trusted),
@@ -577,9 +578,6 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         tips.update(branch_tips or {})
         env.update(
             {
-                "GIT_CONFIG_COUNT": "1",
-                "GIT_CONFIG_KEY_0": f"url.file://{self.github}/.insteadOf",
-                "GIT_CONFIG_VALUE_0": "https://github.com/",
                 "FAKE_GH_BRANCH_TIPS": json.dumps(tips),
                 "FAKE_GH_UNPROTECTED_BRANCHES": json.dumps(list(unprotected_branches)),
                 "FAKE_GH_BRANCH_RULES": json.dumps(branch_rules or {}),
@@ -1655,56 +1653,34 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
             result.stderr,
         )
 
-    def test_trusted_branch_tip_missing_from_github_fails(self) -> None:
-        missing = "f" * 40
-        result = self.run_publisher(branch_tips={"Qbit-Org/qbit/main": missing})
+    def test_branch_tip_missing_from_the_checkout_fails_without_a_fetch(self) -> None:
+        # A merge landed on GitHub after the operator's last fetch: the API
+        # reports a tip that only GitHub has. The publisher stops and fetches
+        # nothing.
+        for repository, checkout, label in (
+            ("Qbit-Org/qbit", self.trusted, "Trusted release"),
+            ("Qbit-Org/qbit-guix.sigs", self.guix_sigs, "qbit-guix.sigs"),
+        ):
+            with self.subTest(repository=repository):
+                bare = self.github / f"{repository}.git"
+                later = git(
+                    bare, "commit-tree", "refs/heads/main^{tree}",
+                    "-p", "refs/heads/main", "-m", "merge that landed meanwhile",
+                )
+                git(bare, "update-ref", "refs/heads/main", later)
+                result = self.run_publisher(branch_tips={f"{repository}/main": later})
 
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn(f"Could not fetch Qbit-Org/qbit:main tip {missing}", result.stderr)
-
-    def test_branch_tip_is_fetched_by_sha_when_the_branch_moves(self) -> None:
-        # A merge lands after the API read: GitHub's branch has moved on, but the
-        # publisher fetches the exact tip the API reported.
-        later = git(
-            self.trusted, "commit-tree", f"{self.trusted_ref}^{{tree}}",
-            "-p", self.trusted_ref, "-m", "merge that landed meanwhile",
-        )
-        self._set_github_branch("Qbit-Org/qbit", self.trusted, "main", later)
-        result = self.run_publisher(branch_tips={"Qbit-Org/qbit/main": self.trusted_ref})
-
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-
-    def test_a_stale_or_missing_fetch_head_is_not_read(self) -> None:
-        # A git that never writes FETCH_HEAD, as with --no-write-fetch-head,
-        # leaves the guix.sigs checkout without one and a stale one in the
-        # trusted checkout.
-        later = git(
-            self.trusted, "commit-tree", f"{self.trusted_ref}^{{tree}}",
-            "-p", self.trusted_ref, "-m", "main moved on",
-        )
-        self._set_github_branch("Qbit-Org/qbit", self.trusted, "main", later)
-        git(self.trusted, "fetch", "-q", str(self.github / "Qbit-Org/qbit.git"), self.trusted_ref)
-        real_git = shutil.which("git")
-        self._write_executable(
-            self.bin_dir / "git",
-            f"""#!/usr/bin/env bash
-            args=()
-            inserted=0
-            for arg in "$@"; do
-                args+=("$arg")
-                if [ "$arg" = fetch ] && [ "$inserted" -eq 0 ]; then
-                    args+=(--no-write-fetch-head)
-                    inserted=1
-                fi
-            done
-            exec {real_git} "${{args[@]}}"
-            """,
-        )
-        result = self.run_publisher(branch_tips={"Qbit-Org/qbit/main": later})
-
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(git(self.trusted, "rev-parse", "FETCH_HEAD^{commit}"), self.trusted_ref)
-        self.assertFalse((self.guix_sigs / ".git" / "FETCH_HEAD").exists())
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    f"{label} branch {repository}:main is at {later}, which {checkout} does not have",
+                    result.stderr,
+                )
+                self.assertNotIn("first-parent history", result.stderr)
+                missing = subprocess.run(
+                    ["git", "-C", str(checkout), "cat-file", "-e", f"{later}^{{commit}}"],
+                    check=False, capture_output=True,
+                )
+                self.assertNotEqual(missing.returncode, 0)
 
     def test_unprotected_trusted_release_branch_fails(self) -> None:
         self._set_github_branch("Qbit-Org/qbit", self.trusted, "topic", self.trusted_ref)
@@ -1831,9 +1807,7 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         result = self.run_publisher(branch_tips={"Qbit-Org/qbit/main": later})
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn(
-            "The trusted release checkout is shallow; run git fetch --unshallow", result.stderr
-        )
+        self.assertIn("Trusted release checkout must not be shallow", result.stderr)
         self.assertNotIn("must be on the first-parent history", result.stderr)
 
     def test_shallow_guix_sigs_checkout_fails(self) -> None:
