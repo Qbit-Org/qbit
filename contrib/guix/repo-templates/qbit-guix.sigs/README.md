@@ -7,9 +7,9 @@ operator build checks.
 
 - Publish `noncodesigned.SHA256SUMS{,.asc}` and `all.SHA256SUMS{,.asc}` files
   for each release version and operator.
-- Provide a public, data-only mirror of qbit release signer policy,
-  signer public certificates, and policy approval material under
-  `operator-keys/`.
+- Carry a derived, data-only copy of the qbit release signer policy, signer
+  public certificates, and current policy approval material under
+  `operator-keys/`, next to the attestations they verify.
 - Support `./contrib/guix/guix-attest` and `./contrib/guix/guix-verify` via the
   `GUIX_SIGS_REPO` environment variable.
 
@@ -58,6 +58,71 @@ signer has `builder-attestation` capability in `operator-keys/keys.json`.
 Release-signature quorum and builder-attestation quorum remain separate checks
 over the active signer policy.
 
-`operator-keys/` is machine-verified release key mirror data. Do not place
-README files, notes, hidden files, stale certificates, unreferenced approval
-files, or other human-only documents under that directory.
+`operator-keys/` is not a trust source. The release key policy has one source
+of truth: `contrib/keys/operator-keys/` in `Qbit-Org/qbit`, read at the
+release's trusted ref (see `contrib/keys/README.md` there). Release validators
+read the policy from that checkout; the release publisher also refuses a
+`qbit-guix.sigs` commit whose `operator-keys/` differs from it, byte for byte.
+Verifiers should take keys from qbit, not from this directory.
+
+Keep `operator-keys/` strict machine data: exactly `keys.json`, the signer
+certificates it references, and the current policy's
+`approvals/<policy-id>/` material. Do not place README files, notes, hidden
+files, stale certificates, older approval directories, or other human-only
+documents under it.
+
+## Repository Rulesets
+
+The qbit source repository keeps the templates for this repository's `main`
+rulesets in `contrib/guix/repo-templates/qbit-guix.sigs/rulesets/`:
+
+| Template | Enforces on `main` |
+| --- | --- |
+| `signed-commits.json` | A verified signature on every commit, with no bypass actors. |
+| `public-main.json` | No deletion and no non-fast-forward updates. Pull requests are required, merged with the merge-commit method only. |
+
+Releases read this repository at a trusted ref, so `main` must be protected
+with both the `deletion` and `non_fast_forward` rules. The signed-commit
+rollout's release publisher checks this and refuses to publish otherwise.
+
+Because `main` needs a verified signature on every commit, an attestation pull
+request merges only when each of its commits is signed. Squash and rebase
+merges are off, so a pull request with an unsigned commit is first squashed
+into one commit that a maintainer signs, then merged with a merge commit, as
+the signed-commit rollout's `squash-sign` does.
+
+GitHub does not apply ruleset files from a repository. From the root of a qbit
+checkout, an organization admin sets the repository's merge methods, then
+applies each template:
+
+```bash
+gh api -X PATCH repos/Qbit-Org/qbit-guix.sigs \
+  -F allow_merge_commit=true -F allow_squash_merge=false -F allow_rebase_merge=false
+gh api -X POST repos/Qbit-Org/qbit-guix.sigs/rulesets \
+  --input contrib/guix/repo-templates/qbit-guix.sigs/rulesets/signed-commits.json
+gh api -X POST repos/Qbit-Org/qbit-guix.sigs/rulesets \
+  --input contrib/guix/repo-templates/qbit-guix.sigs/rulesets/public-main.json
+```
+
+To change a ruleset that already exists, find its ID, read it back, and PUT
+the template to that ID instead of creating a second ruleset:
+
+```bash
+gh api repos/Qbit-Org/qbit-guix.sigs/rulesets --jq '.[] | [.id, .name] | @tsv'
+gh api -X PUT repos/Qbit-Org/qbit-guix.sigs/rulesets/<ruleset-id> \
+  --input contrib/guix/repo-templates/qbit-guix.sigs/rulesets/<template>.json
+```
+
+Then confirm that the branch rules and protection are live:
+
+```bash
+gh api repos/Qbit-Org/qbit-guix.sigs/rules/branches/main --jq '[.[].type]'
+gh api repos/Qbit-Org/qbit-guix.sigs/branches/main --jq .protected
+```
+
+The first command's list, in any order, includes `required_signatures`,
+`deletion`, `non_fast_forward` and `pull_request`; organization rulesets can add
+more. The second prints `true`.
+
+`contrib/guix/init-supporting-repos.sh` copies this README only into a new
+checkout, so update an existing qbit-guix.sigs README by hand.

@@ -12,10 +12,12 @@ import hashlib
 import json
 import math
 import os
+import plistlib
 import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,6 +41,7 @@ SCANNER_TRIAGED_DISPOSITIONS = {
     "routed_to_track",
 }
 MIN_ZIZMOR_VERSION = (1, 24, 0)
+CARGO_AUDIT_FETCH_ATTEMPTS = 3
 README_PREAMBLE = (
     f"{OUTPUT_ROOT_README_TITLE}\n\n"
     "Raw scanner output may contain sensitive paths or secret-adjacent context and is private by default.\n"
@@ -760,17 +763,85 @@ def findings_from_cargo_audit(path: Path) -> list[dict[str, str]]:
     return findings
 
 
+def cargo_audit_report_parsed(path: Path) -> bool:
+    data = load_json(path)
+    return isinstance(data, dict) and "database" in data
+
+
+def cargo_audit_advisory_db(raw_dir: Path) -> Path:
+    return raw_dir / "advisory-db"
+
+
+def cargo_audit_reports(raw_dir: Path) -> list[Path]:
+    # A run that failed before auditing (for example while fetching the
+    # advisory database) leaves no report, or output without the database
+    # metadata that every cargo-audit JSON report carries.
+    return [path for path in sorted(raw_dir.glob("command-*.stdout.txt")) if cargo_audit_report_parsed(path)]
+
+
 def summarize_cargo_audit_outputs(raw_dir: Path) -> dict[str, int]:
     counts = empty_counts()
-    for path in sorted(raw_dir.glob("command-*.stdout.txt")):
+    for path in cargo_audit_reports(raw_dir):
         counts = merge_counts(counts, summarize_cargo_audit(path))
     return counts
 
 
 def findings_from_cargo_audit_outputs(raw_dir: Path) -> list[dict[str, str]]:
     findings = []
-    for path in sorted(raw_dir.glob("command-*.stdout.txt")):
+    for path in cargo_audit_reports(raw_dir):
         findings.extend(findings_from_cargo_audit(path))
+    return findings
+
+
+def clang_static_analyzer_findings(raw_dir: Path, source: Path | None = None) -> list[dict[str, str]]:
+    findings = []
+    seen = set()
+    roots = [source.resolve()] if source is not None else []
+    # Generated headers live in the out-of-tree build directory under raw_dir.
+    roots.append((raw_dir / "build").resolve())
+    for path in sorted(raw_dir.glob("scan-build/**/*.plist")):
+        try:
+            data = plistlib.loads(path.read_bytes())
+        except Exception:
+            # A report cut short (for example when the analyzer is killed) can
+            # fail in the XML parser itself; skip it rather than abort the run.
+            continue
+        diagnostics = data.get("diagnostics") if isinstance(data, dict) else None
+        if not isinstance(diagnostics, list):
+            continue
+        files = data.get("files")
+        files = files if isinstance(files, list) else []
+        for diagnostic in diagnostics:
+            if not isinstance(diagnostic, dict):
+                continue
+            location = diagnostic.get("location")
+            location = location if isinstance(location, dict) else {}
+            file_index = location.get("file")
+            file_name = ""
+            if isinstance(file_index, int) and 0 <= file_index < len(files):
+                file_name = str(files[file_index])
+                for root in roots:
+                    try:
+                        file_name = Path(file_name).resolve().relative_to(root).as_posix()
+                        break
+                    except ValueError:
+                        continue
+            # One issue in a header shows up in the plist of every translation
+            # unit that includes it, so count each issue once. The issue hash
+            # does not cover the file, so the file is part of the identity.
+            identity = {
+                "check": str(diagnostic.get("check_name", "")),
+                "file": file_name,
+                "hash": str(diagnostic.get("issue_hash_content_of_line_in_context", "")),
+            }
+            if not identity["hash"]:
+                # Without a hash, keep different issues of one check apart by line.
+                identity["line"] = str(location.get("line", ""))
+            key = tuple(sorted(identity.items()))
+            if key in seen:
+                continue
+            seen.add(key)
+            findings.append(normalized_finding("clang_static_analyzer", "unknown", identity))
     return findings
 
 
@@ -986,10 +1057,26 @@ def external_commands(tool: str, source: Path, raw_dir: Path, args: argparse.Nam
     if tool == "clang_static_analyzer":
         build_dir = raw_dir / "build"
         report = raw_dir / "scan-build"
+        # Configure under scan-build so CMake records the analyzer wrappers as
+        # its compilers, with clang behind them so flag probes keep only flags
+        # the analyzer accepts. ccache would skip analysis on cache hits.
+        # Reports from configure-time try_compile checks are not counted.
+        scan_build = ["scan-build", "--use-cc=clang", "--use-c++=clang++"]
         return (
             [
-                ["cmake", "-S", str(source), "-B", str(build_dir), "-DCMAKE_BUILD_TYPE=Debug"],
-                ["scan-build", "-o", str(report), "cmake", "--build", str(build_dir), "-j2"],
+                [
+                    *scan_build,
+                    "-o",
+                    str(raw_dir / "scan-build-configure"),
+                    "cmake",
+                    "-S",
+                    str(source),
+                    "-B",
+                    str(build_dir),
+                    "-DCMAKE_BUILD_TYPE=Debug",
+                    "-DWITH_CCACHE=OFF",
+                ],
+                [*scan_build, "-plist-html", "-o", str(report), "cmake", "--build", str(build_dir), "-j2"],
             ],
             report,
         )
@@ -1010,24 +1097,23 @@ def external_commands(tool: str, source: Path, raw_dir: Path, args: argparse.Nam
         return (commands, report)
     if tool == "cargo_audit":
         manifests = sorted(source.glob("**/Cargo.lock"))
+        # Use a fresh advisory database for this run: the first command fetches
+        # it and the others reuse it, so one fetch failure or a stale lock in a
+        # persistent runner checkout cannot fail every lockfile.
+        advisory_db = cargo_audit_advisory_db(raw_dir)
         commands = []
         for lockfile in manifests:
-            commands.append(
-                [
-                    "cargo",
-                    "audit",
-                    "--json",
-                    "--file",
-                    str(lockfile),
-                ]
-            )
+            command = ["cargo", "audit", "--db", str(advisory_db), "--json", "--file", str(lockfile)]
+            if commands:
+                command.insert(2, "--no-fetch")
+            commands.append(command)
         if not commands:
-            commands = [["cargo", "audit", "--json"]]
+            commands = [["cargo", "audit", "--db", str(advisory_db), "--json"]]
         return (commands, None)
     raise ValueError(f"Unsupported external scanner: {tool}")
 
 
-def parse_counts(tool: str, report: Path | None, raw_dir: Path) -> dict[str, int]:
+def parse_counts(tool: str, report: Path | None, raw_dir: Path, source: Path | None = None) -> dict[str, int]:
     if tool == "codeql":
         return summarize_sarif(report) if report else empty_counts()
     if tool == "osv":
@@ -1045,14 +1131,13 @@ def parse_counts(tool: str, report: Path | None, raw_dir: Path) -> dict[str, int
     if tool == "actionlint":
         return summarize_text_lines(report, "medium") if report else empty_counts()
     if tool == "clang_static_analyzer":
-        plist_count = len(list(raw_dir.glob("scan-build/**/*.plist")))
         counts = empty_counts()
-        counts["unknown"] = plist_count
+        counts["unknown"] = len(clang_static_analyzer_findings(raw_dir, source))
         return counts
     return empty_counts()
 
 
-def parse_findings(tool: str, report: Path | None, raw_dir: Path) -> list[dict[str, str]]:
+def parse_findings(tool: str, report: Path | None, raw_dir: Path, source: Path | None = None) -> list[dict[str, str]]:
     if tool == "codeql":
         return findings_from_sarif(tool, report) if report else []
     if tool == "osv":
@@ -1070,10 +1155,7 @@ def parse_findings(tool: str, report: Path | None, raw_dir: Path) -> list[dict[s
     if tool == "actionlint":
         return findings_from_text_lines(tool, report, "medium") if report else []
     if tool == "clang_static_analyzer":
-        return [
-            normalized_finding(tool, "unknown", {"plist": path.name})
-            for path in sorted(raw_dir.glob("scan-build/**/*.plist"))
-        ]
+        return clang_static_analyzer_findings(raw_dir, source)
     return []
 
 
@@ -1566,12 +1648,44 @@ def run_scanner(tool: str, args: argparse.Namespace, output_root: Path) -> dict[
 
     commands, report = external_commands(tool, args.source, raw_dir, args)
     exit_codes = []
+    cargo_audit_fetch_failed = False
     for index, command in enumerate(commands):
-        exit_codes.append(run_command(command, raw_dir, index, args.source))
-    counts = parse_counts(tool, report, raw_dir)
-    findings = parse_findings(tool, report, raw_dir)
+        if cargo_audit_fetch_failed and "--no-fetch" in command:
+            # The shared fetch failed on every attempt, so let each remaining
+            # lockfile fetch the database for itself.
+            command = [part for part in command if part != "--no-fetch"]
+            commands[index] = command
+        exit_code = run_command(command, raw_dir, index, args.source)
+        if tool == "cargo_audit" and index == 0:
+            # The first command fetches the advisory database; retry transient
+            # fetch failures, which leave no JSON report on stdout. A failed
+            # fetch can leave a partial clone or a lock behind, so start each
+            # retry from an empty database directory.
+            stdout_path = raw_dir / f"command-{index}.stdout.txt"
+            advisory_db = cargo_audit_advisory_db(raw_dir)
+            for attempt in range(1, CARGO_AUDIT_FETCH_ATTEMPTS):
+                if cargo_audit_report_parsed(stdout_path):
+                    break
+                # Keep each failed attempt's output, under names that the
+                # command-*.stdout.txt report parsers do not read.
+                for stream in ("stdout", "stderr"):
+                    previous = raw_dir / f"command-{index}.{stream}.txt"
+                    if previous.exists():
+                        previous.replace(raw_dir / f"attempt-{attempt}.command-{index}.{stream}.txt")
+                shutil.rmtree(advisory_db, ignore_errors=True)
+                advisory_db.with_name(f"{advisory_db.name}.lock").unlink(missing_ok=True)
+                time.sleep(10 * attempt)
+                exit_code = run_command(command, raw_dir, index, args.source)
+            cargo_audit_fetch_failed = not cargo_audit_report_parsed(stdout_path)
+            if cargo_audit_fetch_failed:
+                shutil.rmtree(advisory_db, ignore_errors=True)
+                advisory_db.with_name(f"{advisory_db.name}.lock").unlink(missing_ok=True)
+        exit_codes.append(exit_code)
+    counts = parse_counts(tool, report, raw_dir, args.source)
+    findings = parse_findings(tool, report, raw_dir, args.source)
     raw_paths = [raw_dir / f"command-{index}.stdout.txt" for index in range(len(commands))]
     raw_paths.extend(raw_dir / f"command-{index}.stderr.txt" for index in range(len(commands)))
+    raw_paths.extend(sorted(raw_dir.glob("attempt-*.command-*.txt")))
     if report is not None:
         raw_paths.append(report)
     accepted_finding_exit_codes = accepts_finding_exit_codes(tool, exit_codes, counts)
@@ -1583,6 +1697,11 @@ def run_scanner(tool: str, args: argparse.Namespace, output_root: Path) -> dict[
     if any(code != 0 for code in exit_codes) and not accepted_finding_exit_codes:
         coverage_gaps.append("Scanner command exited non-zero; inspect private raw output before trusting coverage.")
     status = "completed" if all(code == 0 for code in exit_codes) or accepted_finding_exit_codes else "failed"
+    if cargo_audit_fetch_failed:
+        coverage_gaps.append(
+            "cargo-audit could not fetch the advisory database after retries, so the first lockfile was not audited."
+        )
+        status = "failed"
     summary = create_summary(
         args=args,
         spec=spec,

@@ -487,6 +487,7 @@ jobs:
           # validators, so a missing file is a regression and must fail.
           required_tests=(
             ci/release/test_publish_local_release.py
+            ci/release/test_release_staging_tools.py
             ci/release/test_validate_builder_attestations.py
             ci/release/test_validate_key_metadata.py
             ci/release/test_validate_release_artifacts.py
