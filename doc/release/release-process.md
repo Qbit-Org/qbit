@@ -16,12 +16,17 @@ The examples use these placeholders:
 | `RELEASE_BRANCH` | Branch the release is cut from | `1.x.x` |
 | `TAG_TARGET` | Full SHA of the commit the tag points to | |
 | `SIGNING_FPR` | The tag signer's `signing_fingerprint` in `keys.json` | |
+| `STAGING_REF` | Full SHA of the `RELEASE_BRANCH` commit the staging tools run from (step 3) | |
+| `SHA256SUMS_SHA256` | The `sha256sums_sha256` the coordinator's staging run prints (step 3) | |
+| `MY_SHA256SUMS_SHA256` | The `sha256sums_sha256` a signer's own derivation prints (step 3) | |
 | `TRUSTED_RELEASE_REF` | Full SHA of the commit that lands the trust-record PR | |
 | `GUIX_SIGS_REF` | Full SHA of the counted `qbit-guix.sigs` commit | |
+| `FOLLOW_UP_REF` | Full SHA of the commit that lands the follow-up trust-record PR | |
+| `MAIN_TARGET` | Full SHA of the `RELEASE_BRANCH` commit `main` is fast-forwarded to after the release | |
 
 ## Branches and release lines
 
-As of 2026-11-09:
+As of 2026-11-10:
 
 | Branch | State |
 | --- | --- |
@@ -32,17 +37,18 @@ As of 2026-11-09:
 
 The publisher accepts `--release-line mainnet` or `--release-line testnet`.
 The published tags are `v0.1.0-testnet4`, `v0.1.1-testnet4` and
-`v0.1.2-testnet4` (testnet), and `v1.0.0` (mainnet). The branch model, and
-whether testnet-only releases continue, are pending operator decisions; this
-runbook does not set either. Whether a release has release candidates is
-decided per release.
+`v0.1.2-testnet4` (testnet), and `v1.0.0` (mainnet). v1.0.1 reaches `main`
+by an admin fast-forward ([after the release](#after-the-release)). The
+longer-term branch model, and whether testnet-only releases continue, are
+pending operator decisions; this runbook does not set either. Whether a
+release has release candidates is decided per release.
 
 ## Roles
 
 | Role | Who | Responsible for |
 | --- | --- | --- |
-| Release coordinator | Named in the tracking issue | Freeze, prep PR, go/no-go, trust record, closing the issue |
-| Builders | Active signers in `keys.json` with the `builder-attestation` capability, `mainnet` in `release_lines`, and the artifact set (`core`, `photon`) in `artifact_sets` | Guix builds and attestation PRs into `Qbit-Org/qbit-guix.sigs` |
+| Release coordinator | Named in the tracking issue | Freeze, prep PR, go/no-go, `STAGING_REF`, staging and combining `SHA256SUMS`, trust record, closing the issue |
+| Builders | Active signers in `keys.json` with the `builder-attestation` capability, `mainnet` in `release_lines`, and the artifact set (`core`, `photon`) in `artifact_sets` | Guix builds, attestation PRs into `Qbit-Org/qbit-guix.sigs`, and keeping their build roots until the release is published |
 | Signers | Active signers in `keys.json` with the `release-signing` capability and `mainnet` in `release_lines` | Signing the tag (one signer) and `SHA256SUMS` (quorum) |
 | Tag pusher | An organization admin, or a member of the team that the `public-release-tags-v-creation` ruleset allows | Pushing the signed tag; this need not be the signer |
 | Publisher operator | A GitHub account with push access to `Qbit-Org/qbit` | Running `contrib/release-process/publish-local-release.sh` |
@@ -112,6 +118,7 @@ signers. If the policy changes, the file is authoritative, not this sentence.
   ```sh
   (
     set -eu
+    cd "$(git rev-parse --show-toplevel)"
     git rev-parse --verify --quiet "refs/tags/${PREVIOUS_TAG}^{commit}" >/dev/null ||
       { echo "tag ${PREVIOUS_TAG} not found; run: git fetch origin tag ${PREVIOUS_TAG}" >&2; exit 1; }
     for f in $(git ls-files doc | grep -E '^doc/release-notes-[0-9]+\.md$'); do
@@ -160,14 +167,17 @@ Run these on the exact commit you will tag. Any later merge restarts the list.
   gh workflow run ci-nightly-heavy.yml --repo Qbit-Org/qbit --ref "${RELEASE_BRANCH}" -f run_scanners=true
   ```
 
-- [ ] **Mainnet posture.** In `1.x.x`'s `core-checks.yml` (as of
-  `b10c761916`), the `mainnet publication posture` job runs only for changes
-  to `1.0.0`; `1.1.0`'s copy also covers `1.1.0`
-  ([#256](https://github.com/Qbit-Org/qbit/pull/256)). Where the job does
-  not run, run both of its checks yourself in a fresh worktree of
-  `TAG_TARGET`. Without `--release-tag` the posture validator checks the
-  working tree, so no tag is needed. The last command applies
-  `mainnet_ci_posture.json` to the result, as the CI job does:
+- [ ] **Mainnet posture.** Core Checks runs the posture validator in its
+  `mainnet publication posture` job for `source` and `release-policy`
+  changes to a mainnet line
+  ([CI coverage](publisher-reference.md#mainnet-launch-posture)), so the job
+  is skipped on a commit whose own change was, for example, docs only. If
+  the job ran and passed in a Core Checks push run on `RELEASE_BRANCH` whose
+  head is `TAG_TARGET`, record the run; a pull-request run tests a merge
+  preview, not `TAG_TARGET` itself. In every other case (skipped, failed,
+  cancelled, or no push run at `TAG_TARGET`), run the validator yourself in a fresh worktree of
+  `TAG_TARGET`; a failure blocks the tag. Without `--release-tag` it checks
+  the working tree, so no tag is needed:
 
   ```sh
   (
@@ -175,14 +185,13 @@ Run these on the exact commit you will tag. Any later merge restarts the list.
     repo="$PWD"; dir="$(mktemp -d)"
     trap 'cd "$repo"; git worktree remove --force "$dir" 2>/dev/null || rmdir "$dir" 2>/dev/null || true' EXIT
     git worktree add --detach "$dir" "${TAG_TARGET}"
-    cd "$dir"; rc=0
-    python3 ci/release/verify_mainnet_release_posture.py --source-root "$dir" --result-json "$dir/posture-result.json" || rc=$?
-    python3 ci/release/verify_mainnet_ci_posture.py --policy ci/release/mainnet_ci_posture.json --result-json "$dir/posture-result.json" --validator-exit-code "$rc"
+    cd "$dir"
+    python3 ci/release/verify_mainnet_release_posture.py --source-root "$dir"
   )
   ```
 
-  The check passes only if the block exits 0 and its last line is
-  `Validated publication-ready mainnet CI posture`.
+  The manual check passes only if the block exits 0, after printing
+  `Validated fail-closed mainnet release posture for working tree`.
 
 - [ ] **Fuzz evidence** on the candidate source, following
   [fuzzing.md](../development/fuzzing.md#qbit-seed-corpora). Record, for the
@@ -233,7 +242,7 @@ The `public-release-tags-v-immutability` ruleset blocks updating or deleting
 a `v*` tag for everyone except organization admins, who can bypass it. The
 publisher's tag pin still detects a moved tag. The publisher accepts tags
 that match `^v[A-Za-z0-9][A-Za-z0-9._-]*$`, and a mainnet tag must not
-contain `testnet`. As of 2026-11-09, the repository has no rc tags.
+contain `testnet`. As of 2026-11-10, the repository has no rc tags.
 
 ### 2. Guix builds and attestations
 
@@ -257,25 +266,134 @@ contain `testnet`. As of 2026-11-09, the repository has no rc tags.
   becomes `GUIX_SIGS_REF`.
 - [ ] The packaged candidate's smoke-tested artifacts match the tagged
   build's `SHA256SUMS`.
+- [ ] Builders keep their build roots: step 3 copies the artifacts from their
+  Guix output directories, and the roots are removed only
+  [after the release](#after-the-release).
 
-### 3. Stage and sign `SHA256SUMS`
+### 3. Stage, sign and combine `SHA256SUMS`
 
-- [ ] Signers stage the release artifacts, and each signer signs
-  `SHA256SUMS`, until the signing quorum is met. The staged directory must
-  have the [layout the validator requires](publisher-reference.md#staged-artifact-directory).
-  In particular:
-  - the staged set includes the
-    [debug symbol archives](publisher-reference.md#debug-symbol-archives)
-    from the same builds, listed in `SHA256SUMS` and uploaded with the rest
-    of the release: `qbit-<VERSION>-<host>-debug.tar.gz` for each Linux and
-    macOS host, and `qbit-<VERSION>-win64-debug.zip` for Windows. The macOS
-    archives start with v1.0.1, and none of them needs an unsigned-platform
-    waiver;
-  - the staged `SHA256SUMS` leaves out the source archive
-    `qbit-<VERSION>.tar.gz`, and leaves out `-codesigning` payloads unless
-    they are waived;
-  - `SHA256SUMS.asc` is the concatenation of the individual
-    `SHA256SUMS.<alias>.asc` files, in the policy's alias order.
+Use the public tools in `contrib/release-process`, run as
+[its README](../../contrib/release-process/README.md) shows: as
+`python3 -I -S -B <tool>`, from a clean checkout of `STAGING_REF` that has
+the release tag and is neither shallow nor a partial clone. They build the
+[staged directory](publisher-reference.md#staged-artifact-directory) the
+publisher validates, with the publisher's own validators. The paths are
+examples.
+
+- [ ] The coordinator pins `STAGING_REF`: the full SHA of a public commit on
+  `RELEASE_BRANCH` that contains the tools and descends from `TAG_TARGET`.
+  Record it in the tracking issue. Staging, every signature and the
+  combination run with `--trusted-release-ref "${STAGING_REF}"`.
+- [ ] Record the waivers this release uses in the tracking issue. Staging
+  takes exactly the same subset of `--allow-unsigned-platform-artifacts` and
+  `--allow-codesigning-artifacts` that step 6 passes to the publisher, and
+  no other. While the #70 unsigned-platform waiver is recorded, that is
+  `--allow-unsigned-platform-artifacts` alone.
+- [ ] Stage from a clean `qbit-guix.sigs` checkout at `GUIX_SIGS_REF`, the
+  commit the publisher will count. The tool reads `--guix-sigs-dir` as a
+  plain directory, so check the checkout first, and so does every signer
+  who derives the manifest. The first command must print `GUIX_SIGS_REF`,
+  and the other two nothing:
+
+  ```sh
+  git -C /srv/release/qbit-guix.sigs rev-parse HEAD
+  GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null git -C /srv/release/qbit-guix.sigs status --porcelain --untracked-files=all --ignored
+  git -C /srv/release/qbit-guix.sigs ls-files -v | grep -v '^H '
+  ```
+
+  The second command reads real objects, as the publisher does, so a
+  replace ref or graft cannot hide a different tree.
+
+  The artifacts come from one builder's Guix output directories, core and
+  PHOTON; pass one builder's, not several, because the tool refuses
+  duplicate file names. Name both artifact sets, so that staging fails, as
+  the publisher's `--require-photon` would, when PHOTON is missing:
+
+  ```sh
+  # --allow-unsigned-platform-artifacts applies only while the #70
+  # unsigned-platform waiver is recorded for this release; drop it otherwise.
+  python3 -I -S -B contrib/release-process/stage-release-artifacts.py \
+    --trusted-release-ref "${STAGING_REF}" \
+    --release-line mainnet \
+    --tag v1.0.1 \
+    --guix-sigs-dir /srv/release/qbit-guix.sigs \
+    --artifact core \
+    --artifact photon \
+    --builder-output-dir /srv/release/v1.0.1/guix-build/output \
+    --builder-output-dir /srv/release/v1.0.1/guix-build/output-photon \
+    --allow-unsigned-platform-artifacts \
+    --stage-dir /srv/release/v1.0.1/staged
+  ```
+
+  The tool stages exactly the attested files the publisher accepts with the
+  same waivers, and writes `SHA256SUMS` from the counted builder
+  attestations. It never stages the source archive `qbit-<VERSION>.tar.gz`,
+  and it refuses a `--stage-dir` that is a mount point. The staged set
+  includes the
+  [debug symbol archives](publisher-reference.md#debug-symbol-archives):
+  `qbit-<VERSION>-<host>-debug.tar.gz` for each Linux and macOS host, and
+  `qbit-<VERSION>-win64-debug.zip` for Windows. The macOS archives start with
+  v1.0.1. Record the printed `policy_sha256`, `sha256sums_sha256`,
+  `artifact_count`, `counted_core`, `counted_photon`, `source_archive` and
+  `source_sha256` in the tracking issue.
+- [ ] Before signing, each signer checks that `STAGING_REF` is on
+  `RELEASE_BRANCH` and that its release key policy (`keys.json` and the
+  certificates in `public-keys/`) is the branch's. Being on the branch does
+  not mean every change was reviewed: check the freeze's list of merges
+  without an approving review too. The block must print `ok`:
+
+  ```sh
+  (
+    set -eu
+    git fetch origin
+    branch="refs/remotes/origin/${RELEASE_BRANCH}"
+    git merge-base --is-ancestor "${STAGING_REF}" "$branch" || { echo "STAGING_REF is not on ${RELEASE_BRANCH}" >&2; exit 1; }
+    for p in keys.json public-keys; do
+      test "$(git rev-parse "${STAGING_REF}:contrib/keys/operator-keys/$p")" = "$(git rev-parse "$branch:contrib/keys/operator-keys/$p")" || { echo "$p differs from ${RELEASE_BRANCH}" >&2; exit 1; }
+    done
+    echo ok
+  )
+  ```
+
+- [ ] Each signer derives the manifest from the same inputs, replacing
+  `--stage-dir` and `--builder-output-dir` with `--sha256sums-output FILE`,
+  and checks that the printed `policy_sha256` and `sha256sums_sha256` equal
+  the recorded values. Their own `sha256sums_sha256` is
+  `MY_SHA256SUMS_SHA256`.
+- [ ] Each signer signs a copy of the stage directory, passing
+  `MY_SHA256SUMS_SHA256` from their own run, never the recorded value. The
+  tool takes the fingerprint from the alias's `signing_fingerprint` in the
+  policy at `STAGING_REF`:
+
+  ```sh
+  python3 -I -S -B contrib/release-process/sign-sha256sums.py \
+    --trusted-release-ref "${STAGING_REF}" \
+    --release-line mainnet \
+    --stage-dir /srv/release/v1.0.1/staged \
+    --alias <alias> \
+    --expected-sha256sums-sha256 "${MY_SHA256SUMS_SHA256}"
+  ```
+
+  Record each run's `signer_fpr` and `signature_sha256`.
+- [ ] Once signatures reach the signing quorum, the coordinator collects the
+  `SHA256SUMS.<alias>.asc` files into the stage directory, checks that
+  `sha256sum` of each equals its signer's recorded `signature_sha256` (a file
+  re-encoded in transit still verifies, but no longer matches the record),
+  and combines them. `SHA256SUMS.asc` is their concatenation in sorted alias
+  order:
+
+  ```sh
+  python3 -I -S -B contrib/release-process/combine-sha256sums-signatures.py \
+    --trusted-release-ref "${STAGING_REF}" \
+    --release-line mainnet \
+    --stage-dir /srv/release/v1.0.1/staged \
+    --expected-sha256sums-sha256 "${SHA256SUMS_SHA256}"
+  ```
+
+  Record the printed `release_signature_aliases` and `combined_sha256`.
+- [ ] Re-run the stage command unchanged. On the existing stage directory it
+  checks every artifact against its digest and the builder attestations
+  again, keeps the signatures, and must print `status=unchanged`.
 
 ### 4. P2MR v1 evidence
 
@@ -299,24 +417,43 @@ contain `testnet`. As of 2026-11-09, the repository has no rc tags.
     fingerprint; the tagger, tag date and GitHub verification result;
   - [ ] how `trusted_release_ref` is chosen (the commit that lands this
     record on `RELEASE_BRANCH`), and the review evidence;
-  - [ ] the `keys.json` sha256, `policy_id` and `policy_sequence`;
+  - [ ] the `keys.json` sha256, `policy_id` and `policy_sequence`, and
+    `STAGING_REF` with the staging tools' `policy_sha256`;
   - [ ] the exact `qbit-guix.sigs` commit, the counted builders' aliases and
     fingerprints for each artifact set, and the source archive's name, sha256
     and tag target;
   - [ ] the counted signers' aliases and fingerprints; the sha256 of
     `SHA256SUMS`, of `SHA256SUMS.asc` and of each individual signature; the
-    artifact count; and whether PHOTON is included. The publisher cannot run
-    before this PR lands, so take the counted aliases from the two validators
-    it runs, run directly on the staged set:
-    `ci/release/validate_release_artifacts.py` prints the counted signer
-    aliases, and `ci/release/validate_builder_attestations.py --github-output
-    <file>` (see [guix.md](guix.md#source-archive-binding)) writes the counted
-    builder aliases for each artifact set. Take each fingerprint from that
-    alias's `signing_fingerprint` in the `keys.json` this PR lands with, which
-    is the copy the publisher trusts at `TRUSTED_RELEASE_REF`;
+    artifact count; and whether PHOTON is included. The publisher runs at
+    `TRUSTED_RELEASE_REF` only after this PR lands, so take these from the
+    step 3 records: the counted builders from `counted_core` and
+    `counted_photon`, the counted signers from `release_signature_aliases`,
+    the digests from `sha256sums_sha256`, `signature_sha256` and
+    `combined_sha256`, and the count from `artifact_count`. Take each
+    fingerprint from that alias's `signing_fingerprint` in the `keys.json`
+    this PR lands with, which is the copy the publisher trusts at
+    `TRUSTED_RELEASE_REF`;
   - [ ] the P2MR v1 profile version, digests, results and consensus review;
   - [ ] the CI runs at the tag target, any unsigned-platform or codesigning
     waiver, and the review status recorded at the freeze.
+- [ ] Right before the PR merges, check that the release key policy on
+  `RELEASE_BRANCH`, `keys.json` and the certificates in `public-keys/`, is
+  still the one at `STAGING_REF`; a certificate can change under an
+  unchanged `keys.json`. If it is not, the signatures were checked under
+  another policy: do not merge; stage and sign again at a ref with the
+  current policy, and update the record first. This must print `ok`:
+
+  ```sh
+  (
+    set -eu
+    git fetch origin
+    for p in keys.json public-keys; do
+      test "$(git rev-parse "${STAGING_REF}:contrib/keys/operator-keys/$p")" = "$(git rev-parse "refs/remotes/origin/${RELEASE_BRANCH}:contrib/keys/operator-keys/$p")" || { echo "$p differs from ${RELEASE_BRANCH}" >&2; exit 1; }
+    done
+    echo ok
+  )
+  ```
+
 - [ ] Values that exist only after the PR lands or after publication go in a
   follow-up PR after step 6: the `trusted_release_ref` SHA; the publisher's
   printed evidence lines, from the saved output of each run; the ref it ran
@@ -335,9 +472,11 @@ with a log for this release only; `pipefail` keeps a failed run's nonzero
 exit status. The output can contain local paths; only its evidence lines go
 in the trust record.
 
-- [ ] Prepare a clean clone of `Qbit-Org/qbit` with `TRUSTED_RELEASE_REF`
-  checked out and the tag fetched, and a clean `qbit-guix.sigs` clone at
-  `GUIX_SIGS_REF`. Untracked files count as dirty.
+- [ ] Prepare a clean, complete clone of `Qbit-Org/qbit` with
+  `TRUSTED_RELEASE_REF` checked out and the tag fetched, and a clean
+  `qbit-guix.sigs` clone at `GUIX_SIGS_REF`. Untracked files count as dirty,
+  and the publisher refuses a shallow or partial clone
+  ([checks](publisher-reference.md#trusted-release-ref)).
 - [ ] From the root of the publisher clone, run validation only. The paths
   are examples:
 
@@ -377,6 +516,20 @@ in the trust record.
     and `--make-latest false` instead, and give each rc its own trust record
     (`doc/release-trust-<VERSION>-rcN.md`), as
     [#256](https://github.com/Qbit-Org/qbit/pull/256) plans for v1.1.0-rc1.
+- [ ] Check the validation-only output against step 3 and the trust record.
+  Its `Key policy: sha256=` must equal the recorded `policy_sha256`, and the
+  certificates in `public-keys/` at `TRUSTED_RELEASE_REF` must be the ones at
+  `STAGING_REF` (the same `git rev-parse` comparison as in step 5). Its
+  `Release signatures` and `Builder attestations` aliases, its `Artifacts`
+  total, the `tag_object`, `tag_target` and `guix_sigs_ref` on its `Pinned
+  refs` line and the digest on its `Builder source` line must equal the ones
+  the trust record states; and the waiver flags must be exactly the ones
+  staging used. The staged files must
+  still have the recorded digests, so `sha256sum` of the staged
+  `SHA256SUMS`, `SHA256SUMS.asc` and each `SHA256SUMS.<alias>.asc` must
+  match the record. If any differ, stop before `--create-draft` and raise it
+  with the operator: the trust record does not describe what the publisher
+  counts.
 - [ ] Add `--create-draft`, then check that the draft body carries the P2MR v1
   sentence. The publisher does not check it.
 - [ ] Replace `--create-draft` with `--publish`, and record the release URL
@@ -401,21 +554,65 @@ immutable, the publisher cannot roll the release back.
 ## After the release
 
 - [ ] Merge the follow-up trust-record PR.
-- [ ] Integrate the release branch into the default branch, following the
-  operator's recorded branch-model decision and `main`'s ruleset. As of
-  2026-11-09, that ruleset requires a pull request merged by squash or
-  rebase, linear history, and no non-fast-forward pushes, and the repository
-  disables merge commits. So a plain fast-forward needs an admin bypass, and
-  a rebase merge rewrites the commits, which would leave the tag target off
-  `main`.
-- [ ] Check the RPC docs. They deploy after integration: on a push to
-  `main`, or when RPC Docs Pages is dispatched on `main` with
-  `publish=true`. The `github-pages` environment allows only `main`, and
-  `main` currently lacks `doc/rpc/versioned_site.py`, so the run that
-  publishing triggers does not deploy. Confirm that docs.qbit.org lists the
-  release.
+- [ ] Builders remove their build roots only after the release is published
+  and its `SHA256SUMS` matches their attestation: for each artifact set the
+  builder attested, every published line of that set appears, with the same
+  digest, in the builder's manifest for it (`all.SHA256SUMS` or
+  `noncodesigned.SHA256SUMS`, and the `photon-` manifest for PHOTON). A
+  builder whose manifest does not match raises it in the tracking issue.
+- [ ] Integrate the release into `main` as the operator decides for that
+  release. For v1.0.1 the decision is an admin fast-forward: an organization
+  admin moves `main` to `MAIN_TARGET`, the release commit on `RELEASE_BRANCH`
+  that the operator names in the tracking issue, bypassing `main`'s ruleset.
+  A fast-forward keeps the tag target and the trust records on `main` with
+  their SHAs. The block pushes only if `main` is an ancestor of
+  `MAIN_TARGET`, `MAIN_TARGET` is on `RELEASE_BRANCH`, and it contains
+  `TAG_TARGET`, `TRUSTED_RELEASE_REF` and the merged follow-up trust record
+  (`FOLLOW_UP_REF`, the commit that landed it):
+
+  ```sh
+  (
+    set -eu
+    git fetch origin
+    git merge-base --is-ancestor refs/remotes/origin/main "${MAIN_TARGET}" || { echo "main has commits that MAIN_TARGET lacks" >&2; exit 1; }
+    git merge-base --is-ancestor "${MAIN_TARGET}" "refs/remotes/origin/${RELEASE_BRANCH}" || { echo "MAIN_TARGET is not on ${RELEASE_BRANCH}" >&2; exit 1; }
+    for c in "${TAG_TARGET}" "${TRUSTED_RELEASE_REF}" "${FOLLOW_UP_REF}"; do
+      git merge-base --is-ancestor "$c" "${MAIN_TARGET}" || { echo "MAIN_TARGET does not contain $c" >&2; exit 1; }
+    done
+    git push origin "${MAIN_TARGET}:refs/heads/main"
+  )
+  ```
+
+- [ ] One time, after v1.0.1's fast-forward has brought
+  `.github/workflows/key-policy-gate.yml` to `main`: arm the Key Policy
+  Gate. Follow "Arming the gate" in
+  [contrib/keys/README.md](../../contrib/keys/README.md) and the ruleset
+  notes in
+  [public-branch-and-rulesets.md](../development/public-branch-and-rulesets.md),
+  in this order:
+  1. an Actions event policy allows `pull_request_target` for the workflow,
+     before 2026-12-02;
+  2. the `main` and `1.x.x` rulesets require their per-base checks,
+     `Key Policy Gate (main)` and `Key Policy Gate (1.x.x)`, from GitHub
+     Actions (integration 15368), with code-owner review and up-to-date
+     branches, as `.github/rulesets/` describes;
+  3. `@Qbit-Org/release-maintainers` gets write access, so `CODEOWNERS`
+     applies.
+
+  No ruleset may require the gate before `main` has the workflow: until then
+  no run posts the check, and pull requests would wait for it forever. Pull
+  requests already open into `main` or `1.x.x` get a gate run only on their
+  next event, so after step 2 push to, edit or reopen each one that shows
+  the check as expected but missing. If
+  v1.0.1 has not reached `main` well before 2026-12-02, raise the deadline
+  with the operator.
+- [ ] Check the RPC docs. The `github-pages` environment deploys only from
+  `main`, so they deploy after the fast-forward: on its push to `main`, or
+  when RPC Docs Pages is dispatched on `main` with `publish=true`. Until then
+  `main` lacks `doc/rpc/versioned_site.py`, so the run that publishing
+  triggers does not deploy. Confirm that docs.qbit.org lists the release.
 - [ ] Bump the downstream pins. Each path below exists on that repository's
-  `main` as of 2026-11-09:
+  `main` as of 2026-11-10:
   - [ ] `Qbit-Org/qbit-rpc`: `QBIT_CORE_VERSION` in
     `scripts/qbit-core-release.mjs`; the supported range in
     `packages/rpc/src/version.ts`, for a new minor version; and

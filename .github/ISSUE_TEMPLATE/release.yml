@@ -60,7 +60,7 @@ body:
         - label: Chainparams maintenance reviewed and recorded (x.y.0 releases only).
         - label: Full Validation and the Required Merge Gate green on the final commit.
         - label: Nightly CI dispatched on the release branch at the candidate, and the run recorded.
-        - label: Mainnet posture check passes on the candidate commit (the posture validator exits 0 and the CI-posture check prints Validated publication-ready mainnet CI posture).
+        - label: Mainnet posture passes on the candidate commit (the Core Checks mainnet publication posture job passed in a run at that commit; otherwise the manual posture validator run exits 0).
         - label: Fuzz evidence on the candidate source (coverage checker, seed replay, mutation phase with execution counts) for the qbit targets plus process_message and p2p_headers_presync.
         - label: Full qbit P2MR v1 unit suite run on the candidate source.
         - label: Pre-tag smoke evidence from a Guix build with FORCE_VERSION on each platform (install or upgrade, sync, encrypted send and relock, PSBT, clean shutdown).
@@ -74,12 +74,16 @@ body:
         - label: Tag pushed by an account the v* tag-creation ruleset allows; GitHub reports verified=true and reason=valid; tag object, tag target and signer recorded.
         - label: Builder quorum met in qbit-guix.sigs for core and PHOTON; the counted qbit-guix.sigs commit recorded.
         - label: The packaged candidate's tested artifacts match the tagged build's SHA256SUMS.
-        - label: Debug symbol archives staged and listed in SHA256SUMS (Linux and Windows, and macOS from v1.0.1).
-        - label: SHA256SUMS signed to the signing quorum and SHA256SUMS.asc combined in alias order.
+        - label: Builders keep their build roots and Guix output directories until after publication.
+        - label: STAGING_REF pinned on the release branch and recorded here, with the waivers this release uses (the same subset of flags as the publisher's).
+        - label: Staged with stage-release-artifacts.py --artifact core --artifact photon from a clean qbit-guix.sigs checkout at the counted commit; policy_sha256, sha256sums_sha256, artifact_count, counted_core, counted_photon, source_archive and source_sha256 recorded here; debug symbol archives included.
+        - label: Each signer checked that STAGING_REF is on the release branch with the branch's key policy, derived the manifest with --sha256sums-output, matched policy_sha256 and sha256sums_sha256, and signed with sign-sha256sums.py --expected-sha256sums-sha256 set to their own digest; each signer_fpr and signature_sha256 recorded here.
+        - label: SHA256SUMS.asc combined with combine-sha256sums-signatures.py --expected-sha256sums-sha256 at the signing quorum; release_signature_aliases and combined_sha256 recorded here; a rerun of the stage command prints status=unchanged.
         - label: P2MR v1 evidence produced on the tag target, and the verifier passes locally.
         - label: Publish-time notes written outside the checkout, with the P2MR v1 sentence naming the tag target.
+        - label: The release branch's key policy (keys.json and certificates) is still the one at STAGING_REF right before the trust-record PR merges.
         - label: Trust-record PR landed; the commit that landed it recorded as trusted_release_ref.
-        - label: Publisher validation-only run passes from a clean checkout at trusted_release_ref.
+        - label: Publisher validation-only run passes from a clean checkout at trusted_release_ref; its key policy digest, signer and builder aliases, artifact total, guix_sigs_ref and source digest, and the staged SHA256SUMS and signature digests, equal the trust record's.
         - label: Draft created with --create-draft, and the draft body checked.
         - label: Published with --publish; the release is immutable, and the output of every publisher run is saved outside the checkout.
   - type: checkboxes
@@ -88,7 +92,9 @@ body:
       label: After the release
       options:
         - label: Follow-up trust-record PR merged (trusted_release_ref SHA, the publisher's evidence lines, the ref it ran from, release URL and immutable state).
-        - label: Release branch integrated into the default branch, following the operator's recorded branch-model decision and main's ruleset.
+        - label: Builders removed their build roots only after publication, once each attested artifact set's published lines matched their manifest for that set.
+        - label: Release integrated into main as the operator decided for this release (v1.0.1 - admin fast-forward to the named release commit, which contains the tag target and both trust records), and the new main commit recorded here.
+        - label: "Only for v1.0.1: Key Policy Gate armed after the fast-forward, in order: Actions event policy before 2026-12-02; the per-base checks in the main and 1.x.x rulesets, from GitHub Actions, with code-owner review and up-to-date branches; write access for release-maintainers (contrib/keys/README.md)."
         - label: RPC docs on docs.qbit.org list the release.
         - label: Downstream pins bumped in qbit-rpc, qbit-js, qbit-wallet, qbit-mining-bootstrap and qbit-electrs.
         - label: This issue closed with links to the release, the trust record and the downstream PRs.

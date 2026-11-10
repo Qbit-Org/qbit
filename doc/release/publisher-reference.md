@@ -24,8 +24,9 @@ has no workflow inputs and no workflow run.
 The release source is the commit that the signed annotated tag points to (the
 tag target). v1.0.1 is being cut from `1.x.x`, the active 1.x maintenance
 branch; v1.0.0 was cut from `main`, which has been unchanged since the
-v1.0.0 trust record. `1.1.0` was forked from `1.x.x` to prepare 1.1.0. The
-branch model is pending an operator decision. The runbook lists the
+v1.0.0 trust record. `1.1.0` was forked from `1.x.x` to prepare 1.1.0.
+v1.0.1 reaches `main` by an admin fast-forward; the longer-term branch model
+is pending an operator decision. The runbook lists the
 [branches and release lines](release-process.md#branches-and-release-lines).
 
 The publisher's `--release-line` must be `mainnet` or `testnet`. The artifact
@@ -33,7 +34,7 @@ validator also requires a testnet tag to contain `testnet` and a mainnet tag
 not to. `--tag` must match `^v[A-Za-z0-9][A-Za-z0-9._-]*$`. The tags pushed so
 far are `v0.1.0-testnet4`, `v0.1.1-testnet4`, `v0.1.2-testnet4` and `v1.0.0`.
 Names such as `v1.0.1-rc1` or `v0.1.0-testnet4-rc1` are format examples. As
-of 2026-11-09, the repository has no rc tags. Whether a release has release
+of 2026-11-10, the repository has no rc tags. Whether a release has release
 candidates is decided per release.
 
 **Testnet releases** require `--testnet-posture-evidence FILE`; the
@@ -48,9 +49,17 @@ commit as the release source.
 
 ## Tag pinning
 
-At startup the publisher reads the tag from the trusted checkout. It must be
-an annotated tag (`refs/tags/<TAG>^{tag}`), and the publisher pins both the
-tag object and its target commit. It then checks GitHub (`verify_remote_tag_pin`):
+At startup the publisher reads exactly `refs/tags/<TAG>` from the trusted
+checkout (`git show-ref --verify`), and pins that tag object and its target
+commit. It refuses the tag unless:
+
+- the ref holds an annotated tag object, and that object's own `tag` header
+  names `<TAG>`, so a signed tag of another release cannot stand in for it;
+- the bare name `<TAG>` resolves to the same object. Git looks a bare name up
+  as `.git/<TAG>` and `refs/<TAG>` before `refs/tags/<TAG>`, and `git status`
+  shows neither.
+
+It then checks GitHub (`verify_remote_tag_pin`):
 
 - the remote ref `tags/<TAG>` is of type `tag`, and its object equals the
   pinned tag object;
@@ -59,11 +68,12 @@ tag object and its target commit. It then checks GitHub (`verify_remote_tag_pin`
   `reason=valid`.
 
 It runs this check before validation, again immediately before `--publish`
-makes the release public, and once more after publication. The artifact
-validator separately runs `git verify-tag` against the policy's keys and
-requires a signature from an active `release-signing` key for the release
-line. GitHub reports `verified=true` only when the signing key is on a GitHub
-account whose verified email matches the tagger.
+makes the release public, and once more after publication. Separately, the
+publisher passes the pinned tag object, not the tag name, to the artifact
+validator's `verify_tag_signature`, which runs `git verify-tag` against the
+policy's keys and requires a signature from an active `release-signing` key
+for the release line. GitHub reports `verified=true` only when the signing key
+is on a GitHub account whose verified email matches the tagger.
 
 The `public-release-tags-v-immutability` ruleset blocks updating or deleting
 `v*` tags, but organization admins can bypass it. The tag pin is what
@@ -80,13 +90,29 @@ tag target, not from this checkout.
 - the value is a full 40-character SHA;
 - the publisher script runs from a git checkout whose `HEAD` equals that SHA;
 - the checkout is clean, with untracked files counted (`git status
-  --porcelain --untracked-files=normal`);
-- the checkout contains every validator the publisher calls and
-  `contrib/keys/operator-keys/keys.json`;
+  --porcelain --untracked-files=normal --ignore-submodules=dirty`), and it is
+  neither shallow nor a partial clone;
+- no file under `contrib/release-process`, `ci/release` or `contrib/keys` is
+  marked assume-unchanged or skip-worktree;
+- the SHA holds every validator the publisher calls and
+  `contrib/keys/operator-keys/keys.json`. The publisher exports `ci/release`
+  and `contrib/keys/operator-keys` from the SHA's git objects and runs the
+  validators from that export (`python3 -E -s -S -B`), so the working tree,
+  the index and stale bytecode cannot change them;
 - the SHA is neither the tag object nor the tag target;
 - the tag target is an ancestor of the SHA;
 - GitHub serves the commit from the target repository (`remote_commit`,
   through the commits API).
+
+Every git command the publisher and the validators run reads only real
+objects. The caller's `GIT_*` variables are cleared, replace refs are ignored
+(`GIT_NO_REPLACE_OBJECTS=1`), the graft file is empty, and nothing is fetched
+(`GIT_NO_LAZY_FETCH=1`, `GIT_ALLOW_PROTOCOL=none`). `GIT_CONFIG_COUNT`
+overrides keep the checkouts' config from running hooks, fsmonitor, filter
+drivers or a signature program other than OpenPGP, and from using a
+commit-graph. The publisher therefore requires git 2.31 or newer.
+[contrib/release-process/README.md](../../contrib/release-process/README.md)
+describes the same isolation for the staging tools.
 
 **Process, not enforced:** the publisher does not check branch protection,
 reviews, or which branch contains the commit. By process,
@@ -99,26 +125,35 @@ revision of the trust record never moves it.
 `--guix-sigs-repo` and `--guix-sigs-ref` name a local clone of
 `Qbit-Org/qbit-guix.sigs` and the commit to count. The publisher requires:
 
-- a full 40-character SHA, and a clean clone whose `HEAD` equals it;
+- a full 40-character SHA, and a clean clone whose `HEAD` equals it, which
+  is not a partial clone and has no assume-unchanged or skip-worktree flags;
 - the commit exists on GitHub (`--guix-sigs-github-repo`, default
   `Qbit-Org/qbit-guix.sigs`);
 - the commit is reachable from `--guix-sigs-branch`, default `main`: GitHub's
   compare status from that branch to the commit is `behind` or `identical`;
 - the clone's `operator-keys/` mirror matches the trusted key policy
-  (`validate_key_metadata.py` with `--operator-policy-mirror`).
+  ([key policy](#key-policy)).
+
+The validators read `operator-keys/` and the release's `<version>/`
+attestations from that commit's git objects, exported to a work directory,
+not from the clone's working tree.
 
 ## Staged artifact directory
 
-`--artifacts-dir` must be a flat directory of regular files, containing
-exactly:
+`--artifacts-dir` must be a flat directory of regular files. The staging,
+signing and combining tools in `contrib/release-process` build it with the
+publisher's own validators (runbook
+[step 3](release-process.md#3-stage-sign-and-combine-sha256sums)). It must
+contain exactly:
 
 - every artifact listed in `SHA256SUMS`, each with a matching digest;
 - `SHA256SUMS` itself, which must not list itself or any signature file;
 - one `SHA256SUMS.<alias>.asc` per counted signer, where each alias is an
   active `release-signing` signer for the release line;
-- `SHA256SUMS.asc`, the concatenation of the individual `.asc` files in the
-  policy's alias order. The validator checks that its valid signer set equals
-  the set of valid individual signatures; it does not check the order.
+- `SHA256SUMS.asc`, the concatenation of the individual `.asc` files in
+  sorted alias order, as `combine-sha256sums-signatures.py` writes it. The
+  validator checks that its valid signer set equals the set of valid
+  individual signatures; it does not check the order.
 
 Artifact names must start with `qbit-<version>-` or `qbit-photon-<version>-`
 and end in `.tar.gz`, `.tar.xz`, `.zip`, `.dmg` or `.exe`. A name with an
@@ -128,8 +163,9 @@ At least one core artifact is required, and `--require-photon` also requires
 a PHOTON artifact. The source archive `qbit-<version>.tar.gz` does not match
 these name rules, so the staged `SHA256SUMS` must leave it out; it is builder
 evidence only (see [guix.md](guix.md)). The release-signature quorum is
-`release_signature_quorum` for the release line in `keys.json`. Every file in
-the directory is uploaded.
+`release_signature_quorum` for the release line in `keys.json`, counted by
+distinct primary keys ([key policy](#key-policy)). Every file in the
+directory is uploaded.
 
 ## Builder attestations
 
@@ -140,16 +176,54 @@ manifest under `<version>/<alias>/` in the `qbit-guix.sigs` clone. It reads
 
 - the alias is an active `builder-attestation` signer for the release line,
   and lists that artifact set in `artifact_sets`;
-- the manifest's detached signature (`<manifest>.asc`) verifies against that
-  builder's key;
+- the manifest's detached signature (`<manifest>.asc`) is a good signature
+  by that builder's key ([key policy](#key-policy));
 - the manifest covers every release artifact of that set, with matching
   digests;
 - the manifest contains the canonical source archive, reconstructed from the
   tag target (see [guix.md](guix.md)).
 
-Each artifact set needs `builder_attestation_quorum` builders. PHOTON is
-checked when `--require-photon` is given or the staged set contains PHOTON
-artifacts.
+Each artifact set needs `builder_attestation_quorum` builders with distinct
+primary keys: builders whose signing keys share a primary key count once.
+PHOTON is checked when `--require-photon` is given or the staged set contains
+PHOTON artifacts.
+
+## Key policy
+
+The canonical release key policy is `contrib/keys/operator-keys/` at
+`trusted_release_ref`: `keys.json` and the signers' public certificates.
+[contrib/keys/README.md](../../contrib/keys/README.md) describes it, its
+rotation chain, and every consumer. `qbit-guix.sigs` keeps `operator-keys/`
+as a derived, non-authoritative mirror. The publisher requires the mirror at
+the pinned commit to match the canonical policy, twice:
+`validate_key_metadata.py --operator-policy-mirror` compares the validated
+projections, policy SHA-256 included, and `validate_builder_attestations.py
+--guix-operator-key-policy` requires exactly the canonical file set, byte for
+byte. A mirror that differs stops the release. The mirror never grants trust:
+attestations and release signatures are verified only with the
+trusted-ref keys.
+
+The validators count a signature only when gpg's `GOODSIG` and `VALIDSIG`
+agree on the key, `VALIDSIG` names the primary key, and gpg reports nothing
+against it (`REVKEYSIG`, `EXPKEYSIG`, `ERRSIG`, `BADSIG`, `EXPSIG`,
+`NO_PUBKEY`). A signature by a revoked or expired key therefore never counts.
+Release-signature and builder quorums count distinct primary keys. Validating
+the policy itself requires each certificate to hold exactly one primary key
+and the signer's signing key; an active signer's key must be
+signing-capable and not revoked, and no two active signers may share a
+primary key.
+
+A pull request that changes `contrib/keys/` runs the key-policy checks in
+the Required Merge Gate against the base branch's policy: the policy chain
+(the next `policy_sequence`, and `previous_policy_sha256` equal to the base
+`keys.json` digest) and certificate continuity. A changed certificate must
+keep its primary key, its keys and its signature records, and may only add
+to them, such as a refreshed self-signature or a subkey that the new
+`keys.json` names. Because those checks live in code a pull request can
+change, the Key Policy Gate (`.github/workflows/key-policy-gate.yml`) also
+runs them with the base branch's own code, for pull requests into `main` and
+`1.x.x`. It is armed after v1.0.1 reaches `main`
+([runbook](release-process.md#after-the-release)).
 
 ## Debug symbol archives
 
@@ -196,18 +270,21 @@ fails unless:
 
 **CI coverage.** Core Checks runs the same validator in its `mainnet
 publication posture` job, gated by `mainnet_publish_gate_required` in
-`.github/workflows/core-checks.yml`. Each branch carries its own copy of that
-workflow. In `1.x.x`'s copy (as of `b10c761916`), the job runs only when the
-target branch is `1.0.0` (a pull request into it, or a push to it) and the
-change profile is `source` or `release-policy`, so runs for `1.x.x` and
-`main` skip it. `1.1.0`'s copy also covers `1.1.0`
-([#256](https://github.com/Qbit-Org/qbit/pull/256)). The job was skipped at
-the v1.0.0 tag target, and at the `1.x.x` commit that
-[#174](https://github.com/Qbit-Org/qbit/issues/174) tested.
-`ci/release/mainnet_ci_posture.json` is in its `final` phase with no expected
-failures, so where the job does run, it requires the validator to pass. The
-publisher does not read that file; the publisher, not that file, is the
-authority for publication.
+`.github/workflows/core-checks.yml`, and the validator's exit status decides
+the job. Each branch runs its own copy of that workflow. Since
+[#385](https://github.com/Qbit-Org/qbit/pull/385), `1.x.x`'s copy runs the
+job when the target branch is a mainnet line (`main`, or a release branch of
+major version 1 or later, such as `1.x.x`, `1.1.0` or `1.0.0`; the `0.x`
+lines are testnet) and the change profile is `source` or `release-policy`.
+`1.1.0` and `1.0.0` gate themselves in their own copies, and `main` keeps
+its older rule, which covers only `1.0.0`, until it is fast-forwarded after
+v1.0.1. A commit whose change has another profile, such as docs only, skips
+the job. It was skipped at the v1.0.0 tag target, and at the `1.x.x` commit
+that [#174](https://github.com/Qbit-Org/qbit/issues/174) tested. Where it is
+skipped, the runbook's
+[manual posture check](release-process.md#candidate-checks) stands in for
+it. CI results do not decide publication: the publisher runs the validator
+itself, with no waiver.
 
 ## P2MR v1 conformance inputs
 
@@ -386,7 +463,9 @@ Public release evidence pins public data only:
 - the tag object, tag target, signer fingerprint, tagger, tag date and
   GitHub verification result;
 - `trusted_release_ref`, how it was chosen, and its review evidence;
-- the exact-byte `keys.json` sha256, `policy_id` and `policy_sequence`;
+- the exact-byte `keys.json` sha256, `policy_id` and `policy_sequence`, and
+  the `STAGING_REF` the staging tools ran at, with their `policy_sha256`,
+  which must equal it;
 - the exact `qbit-guix.sigs` commit used for validation;
 - the counted builder aliases and fingerprints for each artifact set;
 - the canonical source archive name and sha256, and the tag target it came

@@ -28,6 +28,14 @@ reaches that release line's `builder_attestation_quorum` in `keys.json`.
 Public release evidence pins the exact `qbit-guix.sigs` commit used for that
 count.
 
+Keep the build root, with its Guix output directories, until the release is
+published and its `SHA256SUMS` matches your attestation: every published line
+of each artifact set you attested appears, with the same digest, in your
+manifest for that set. The coordinator stages the release artifacts from one
+builder's output directories with
+`contrib/release-process/stage-release-artifacts.py`
+([runbook step 3](release-process.md#3-stage-sign-and-combine-sha256sums)).
+
 For pre-tag smoke evidence, a candidate can be built with
 `FORCE_VERSION=<version>`, so its artifacts have the names a tagged build
 will produce.
