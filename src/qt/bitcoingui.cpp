@@ -1584,6 +1584,14 @@ void BitcoinGUI::updateWalletPQCValidationStatus()
         } else {
             labelWalletEncryptionIcon->setToolTip(tr("Wallet is unencrypted. qbit validates PQC keys every time this wallet loads. Encrypt wallet to enable authenticated fast loads."));
         }
+    } else if (walletModel->getEncryptionStatus() != WalletModel::Unencrypted && info.reencryption_required) {
+        labelWalletEncryptionIcon->show();
+        labelWalletEncryptionIcon->setThemedPixmap(QStringLiteral(":/icons/warning"), STATUSBAR_ICONSIZE, STATUSBAR_ICONSIZE);
+        if (info.failed_records > 0) {
+            labelWalletEncryptionIcon->setToolTip(tr("Wallet is encrypted, but it still stores %n PQC private key(s) unencrypted, and some of them failed validation. Signing is disabled until the wallet is restored or repaired, and backups are refused.", "", static_cast<int>(info.plaintext_records)));
+        } else {
+            labelWalletEncryptionIcon->setToolTip(tr("Wallet is encrypted, but it still stores %n PQC private key(s) unencrypted. Unlock the wallet to re-encrypt them: enter its passphrase when you send, or run walletpassphrase in the console. Signing and backups are refused until then. Older backups of this wallet still contain these keys.", "", static_cast<int>(info.plaintext_records)));
+        }
     }
 
     if (m_chain_sync_progress_visible) {
@@ -1599,7 +1607,9 @@ void BitcoinGUI::updateWalletPQCValidationStatus()
         progressBar->setValue(std::min(progress_value, PROGRESS_BAR_MAX - 1));
         progressBar->setFormat(tr("%1%").arg(progress_value));
         progressBar->setVisible(true);
-        const QString tooltip{tr("This wallet is unencrypted. qbit is validating plaintext PQC keys before spending is enabled. Encrypt this wallet to enable authenticated fast loads in the future.")};
+        const QString tooltip{walletModel->getEncryptionStatus() == WalletModel::Unencrypted ?
+            tr("This wallet is unencrypted. qbit is validating plaintext PQC keys before spending is enabled. Encrypt this wallet to enable authenticated fast loads in the future.") :
+            tr("This wallet is encrypted, but it still stores PQC private keys unencrypted. qbit is validating them; unlock the wallet afterwards to re-encrypt them. Signing and backups are refused until then.")};
         progressBarLabel->setToolTip(tooltip);
         progressBar->setToolTip(tooltip);
         m_wallet_pqc_validation_progress_visible = true;

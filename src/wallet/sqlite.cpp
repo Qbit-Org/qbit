@@ -341,8 +341,28 @@ void SQLiteDatabase::Open()
 
 bool SQLiteDatabase::Rewrite()
 {
-    // Rewrite the database using the VACUUM command: https://sqlite.org/lang_vacuum.html
-    int ret = sqlite3_exec(m_db, "VACUUM", nullptr, nullptr, nullptr);
+    // VACUUM fails while a transaction is open on the connection. A batch
+    // keeps the writer semaphore for as long as its transaction is open, so
+    // wait for the current writer to finish.
+    m_write_semaphore.acquire();
+    // In exclusive locking mode the rollback journal is kept between
+    // transactions. After a VACUUM it holds every page the VACUUM replaced,
+    // free space included, so have the VACUUM truncate it when it commits.
+    bilingual_str error;
+    const std::optional<int> journal_size_limit{ReadPragmaInteger(m_db, "journal_size_limit", "the journal size limit", error)};
+    int ret{journal_size_limit ? sqlite3_exec(m_db, "PRAGMA journal_size_limit = 0", nullptr, nullptr, nullptr) : SQLITE_ERROR};
+    if (ret == SQLITE_OK) {
+        // Rewrite the database using the VACUUM command: https://sqlite.org/lang_vacuum.html
+        ret = sqlite3_exec(m_db, "VACUUM", nullptr, nullptr, nullptr);
+        const std::string restore_limit{strprintf("PRAGMA journal_size_limit = %d", *journal_size_limit)};
+        if (sqlite3_exec(m_db, restore_limit.c_str(), nullptr, nullptr, nullptr) != SQLITE_OK) {
+            LogWarning("SQLiteDatabase: Failed to restore the journal size limit of %s", Filename());
+        }
+    }
+    m_write_semaphore.release();
+    if (ret != SQLITE_OK) {
+        LogWarning("SQLiteDatabase: Failed to rewrite %s: %s", Filename(), journal_size_limit ? sqlite3_errstr(ret) : error.original);
+    }
     return ret == SQLITE_OK;
 }
 

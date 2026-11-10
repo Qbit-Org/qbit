@@ -80,7 +80,9 @@
 #include <condition_variable>
 #include <exception>
 #include <forward_list>
+#include <iterator>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <thread>
 #include <tuple>
@@ -1211,7 +1213,7 @@ static void AssertDescriptorLockHeld(const DescriptorScriptPubKeyMan* desc_spk_m
     AssertLockHeld(desc_spk_man->cs_desc_man);
 }
 
-bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase, bool use_create_keypool_warmup)
+bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase, bool use_create_keypool_warmup, bilingual_str* new_seed_error)
 {
     // Only descriptor wallets can be encrypted
     Assert(IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS));
@@ -1284,6 +1286,14 @@ bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase, bool use_cr
             encrypted_batch = nullptr;
             return false;
         }
+        // This transaction deletes the plaintext key records, so the file
+        // needs a rewrite after it, even if it had one before.
+        if (!encrypted_batch->ErasePostEncryptionRewrite()) {
+            encrypted_batch->TxnAbort();
+            delete encrypted_batch;
+            encrypted_batch = nullptr;
+            return false;
+        }
         nMasterKeyMaxID = master_key_id;
         mapMasterKeys[master_key_id] = master_key;
 
@@ -1309,25 +1319,154 @@ bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase, bool use_cr
 
         delete encrypted_batch;
         encrypted_batch = nullptr;
+
+        // The wallet is encrypted on disk from here on, so this returns true
+        // whatever happens below, and must not leave the wallet unlocked. A
+        // failure below only means that the wallet keeps its previous seed, or
+        // that the rewrite is retried later.
+        try {
+            if (m_after_encrypt_wallet_commit) m_after_encrypt_wallet_commit();
+
+            // The deleted plaintext keys stay in the file's free space until it
+            // is rewritten. Rewrite it now, before the new descriptors below spend
+            // tens of seconds deriving keys, and while the descriptor locks keep
+            // top-ups from writing. The new keys are written encrypted, so the
+            // file needs no rewrite after them. If the process stops first or the
+            // rewrite fails, the wallet is rewritten when it is next loaded, or
+            // before its next backup.
+            RewriteAfterEncryption();
+        } catch (const std::exception& e) {
+            WalletLogPrintf("Warning: Failed to rewrite the wallet file after encryption (%s). The rewrite will be retried when the wallet is next loaded.\n", e.what());
+        } catch (...) {
+            WalletLogPrintf("Warning: Failed to rewrite the wallet file after encryption. The rewrite will be retried when the wallet is next loaded.\n");
+        }
         // Release in the reverse order of acquisition.
         while (!desc_spk_man_locks.empty()) desc_spk_man_locks.pop_front();
 
-        ClearMasterKey();
-        Unlock(strWalletPassphrase, /*run_pending_initial_keypool_top_up=*/false);
+        bilingual_str setup_error;
+        try {
+            ClearMasterKey();
+            if (!Unlock(strWalletPassphrase, /*run_pending_initial_keypool_top_up=*/false)) {
+                throw std::runtime_error("the wallet could not be unlocked with the new passphrase");
+            }
 
-        // Make new descriptors with a new seed
-        if (!IsWalletFlagSet(WALLET_FLAG_BLANK_WALLET)) {
-            SetupDescriptorScriptPubKeyMans(use_create_keypool_warmup);
+            // Make new descriptors with a new seed
+            if (!IsWalletFlagSet(WALLET_FLAG_BLANK_WALLET)) {
+                TopUpDescriptorsBeforeReplacingThem();
+                SetupNewSeedOrRollBack(use_create_keypool_warmup);
+            }
+        } catch (const std::exception& e) {
+            setup_error = Untranslated(e.what());
+        } catch (...) {
+            setup_error = Untranslated("unknown error");
+        }
+        if (!setup_error.empty()) {
+            WalletLogPrintf("Error: The wallet is encrypted, but setting up its new HD seed failed: %s\n", setup_error.original);
         }
         ClearMasterKey();
-
-        // Need to completely rewrite the wallet file; if we don't, the database might keep
-        // bits of the unencrypted private key in slack space in the database file.
-        GetDatabase().Rewrite();
+        if (new_seed_error) *new_seed_error = std::move(setup_error);
     }
     NotifyStatusChanged(this);
 
     return true;
+}
+
+void CWallet::TopUpDescriptorsBeforeReplacingThem()
+{
+    AssertLockHeld(cs_wallet);
+    // The deferred create-time top-up only extends active descriptors, so one
+    // that the new seed replaces would keep its short warm-up range for good,
+    // and payments to its addresses past that range would never be found. The
+    // wallet is unlocked here, so finish the top-up while the descriptors are
+    // still active; its keys are written encrypted. A failure only leaves the
+    // short range, so it must not keep the new seed from being set up.
+    if (!HasPendingInitialKeyPoolTopUp()) return;
+    try {
+        if (RunPendingInitialKeyPoolTopUp()) return;
+    } catch (const std::exception& e) {
+        WalletLogPrintf("Deferred create-time keypool top up failed: %s\n", e.what());
+    } catch (...) {
+        WalletLogPrintf("Deferred create-time keypool top up failed with an unknown error\n");
+    }
+    WalletLogPrintf("Warning: The deferred keypool top-up did not finish before the new seed replaced the active descriptors. Payments to their addresses beyond their current keypool will not be detected.\n");
+}
+
+void CWallet::SetupNewSeedOrRollBack(bool use_create_keypool_warmup)
+{
+    AssertLockHeld(cs_wallet);
+    const auto external_spk_managers{m_external_spk_managers};
+    const auto internal_spk_managers{m_internal_spk_managers};
+    std::set<uint256> existing_ids;
+    for (const auto& [id, _] : m_spk_managers) existing_ids.insert(id);
+    try {
+        SetupDescriptorScriptPubKeyMans(use_create_keypool_warmup);
+    } catch (...) {
+        // The setup throws when its transaction is aborted, and then none of
+        // the new descriptors, their keys or their active records are on
+        // disk. Remove them from memory too, so that the wallet does not give
+        // out addresses from descriptors that the next load would not have.
+        // Only a callback that fails after the commit throws with the new
+        // descriptors on disk; keep them active then, as the next load will.
+        // If the database cannot tell, roll back: the previous seed's
+        // descriptors stay on disk, so their addresses stay watched.
+        bool committed{false};
+        try {
+            WalletBatch batch{GetDatabase()};
+            for (const auto& [id, _] : m_spk_managers) {
+                if (!existing_ids.contains(id) && batch.HasDescriptor(id)) committed = true;
+            }
+        } catch (...) {
+        }
+        if (committed) {
+            std::string reason{"unknown error"};
+            try {
+                throw;
+            } catch (const std::exception& e) {
+                reason = e.what();
+            } catch (...) {
+            }
+            throw std::runtime_error(strprintf("the new HD seed was written and is active, but a step after writing it failed: %s. Reload the wallet before using it", reason));
+        }
+        m_external_spk_managers = external_spk_managers;
+        m_internal_spk_managers = internal_spk_managers;
+        std::set<const ScriptPubKeyMan*> removed;
+        for (const auto& [id, spk_man] : m_spk_managers) {
+            if (!existing_ids.contains(id)) removed.insert(spk_man.get());
+        }
+        if (!removed.empty()) {
+            for (auto it{m_cached_spks.begin()}; it != m_cached_spks.end();) {
+                std::erase_if(it->second, [&](const ScriptPubKeyMan* spk_man) { return removed.contains(spk_man); });
+                it = it->second.empty() ? m_cached_spks.erase(it) : std::next(it);
+            }
+            std::erase_if(m_spk_managers, [&](const auto& entry) { return !existing_ids.contains(entry.first); });
+        }
+        NotifyCanGetAddressesChanged();
+        throw;
+    }
+}
+
+bool CWallet::RewriteAfterEncryption()
+{
+    AssertLockHeld(cs_wallet);
+    const auto start{SteadyClock::now()};
+    // The record is written only once the rewrite has succeeded, so a stop
+    // or failure at any point leaves it absent and the next load retries.
+    if (!GetDatabase().Rewrite()) {
+        WalletLogPrintf("Warning: Failed to rewrite the wallet file after encryption; deleted unencrypted keys may remain in it. The rewrite will be retried when the wallet is next loaded.\n");
+        return false;
+    }
+    if (!WalletBatch(GetDatabase()).WritePostEncryptionRewrite()) {
+        WalletLogPrintf("Warning: Failed to record the rewrite of the wallet file after encryption. The rewrite will be repeated when the wallet is next loaded.\n");
+        return false;
+    }
+    WalletLogPrintf("Rewrote the wallet file after encryption in %dms\n", Ticks<std::chrono::milliseconds>(SteadyClock::now() - start));
+    return true;
+}
+
+bool CWallet::NeedsRewriteAfterEncryption()
+{
+    AssertLockHeld(cs_wallet);
+    return IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS) && IsCrypted() && !WalletBatch(GetDatabase()).HasPostEncryptionRewrite();
 }
 
 DBErrors CWallet::ReorderTransactions()
@@ -3416,44 +3555,48 @@ bool CWallet::SetAddressBook(const CTxDestination& address, const std::string& s
 
 bool CWallet::DelAddressBook(const CTxDestination& address)
 {
-    return RunWithinTxn(GetDatabase(), /*process_desc=*/"address book entry removal", [&](WalletBatch& batch){
+    // DelAddressBookWithDB needs cs_wallet. Take it before the transaction
+    // takes the database writer, in the order cs_wallet -> cs_desc_man ->
+    // writer. Taking it inside could deadlock with a cs_wallet holder that
+    // waits for the writer, such as EncryptWallet or BackupWallet.
+    LOCK(cs_wallet);
+    return RunWithinTxn(GetDatabase(), /*process_desc=*/"address book entry removal", [&](WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) {
         return DelAddressBookWithDB(batch, address);
     });
 }
 
 bool CWallet::DelAddressBookWithDB(WalletBatch& batch, const CTxDestination& address)
 {
+    // Callers take cs_wallet before their transaction takes the writer.
+    AssertLockHeld(cs_wallet);
     const std::string& dest = EncodeDestination(address);
-    {
-        LOCK(cs_wallet);
-        // If we want to delete receiving addresses, we should avoid calling EraseAddressData because it will delete the previously_spent value. Could instead just erase the label so it becomes a change address, and keep the data.
-        // NOTE: This isn't a problem for sending addresses because they don't have any data that needs to be kept.
-        // When adding new address data, it should be considered here whether to retain or delete it.
-        if (IsMine(address)) {
-            WalletLogPrintf("%s called with IsMine address, NOT SUPPORTED. Please report this bug! %s\n", __func__, CLIENT_BUGREPORT);
-            return false;
-        }
-        // Delete data rows associated with this address
-        if (!batch.EraseAddressData(address)) {
-            WalletLogPrintf("Error: cannot erase address book entry data\n");
-            return false;
-        }
-
-        // Delete purpose entry
-        if (!batch.ErasePurpose(dest)) {
-            WalletLogPrintf("Error: cannot erase address book entry purpose\n");
-            return false;
-        }
-
-        // Delete name entry
-        if (!batch.EraseName(dest)) {
-            WalletLogPrintf("Error: cannot erase address book entry name\n");
-            return false;
-        }
-
-        // finally, remove it from the map
-        m_address_book.erase(address);
+    // If we want to delete receiving addresses, we should avoid calling EraseAddressData because it will delete the previously_spent value. Could instead just erase the label so it becomes a change address, and keep the data.
+    // NOTE: This isn't a problem for sending addresses because they don't have any data that needs to be kept.
+    // When adding new address data, it should be considered here whether to retain or delete it.
+    if (IsMine(address)) {
+        WalletLogPrintf("%s called with IsMine address, NOT SUPPORTED. Please report this bug! %s\n", __func__, CLIENT_BUGREPORT);
+        return false;
     }
+    // Delete data rows associated with this address
+    if (!batch.EraseAddressData(address)) {
+        WalletLogPrintf("Error: cannot erase address book entry data\n");
+        return false;
+    }
+
+    // Delete purpose entry
+    if (!batch.ErasePurpose(dest)) {
+        WalletLogPrintf("Error: cannot erase address book entry purpose\n");
+        return false;
+    }
+
+    // Delete name entry
+    if (!batch.EraseName(dest)) {
+        WalletLogPrintf("Error: cannot erase address book entry name\n");
+        return false;
+    }
+
+    // finally, remove it from the map
+    m_address_book.erase(address);
 
     // All good, signal changes
     NotifyAddressBookChanged(address, "", /*is_mine=*/false, AddressPurpose::SEND, CT_DELETED);
@@ -3701,7 +3844,9 @@ PQCKeyValidationInfo CWallet::GetPQCKeyValidationInfo() const
         }
     }
 
-    info.signing_blocked = info.pending_records > 0 || info.failed_records > 0;
+    // Pending and failed records count too: they are plaintext on disk.
+    info.reencryption_required = encrypted && info.plaintext_records > 0;
+    info.signing_blocked = info.pending_records > 0 || info.failed_records > 0 || info.reencryption_required;
     info.encryption_recommended = !encrypted && info.plaintext_records > 0 && info.failed_records == 0;
     if (info.failed_records > 0) {
         info.status = PQCKeyValidationStatus::FAILED;
@@ -3762,8 +3907,150 @@ CWallet::PlaintextPQCKeyValidationStepResult CWallet::RunPlaintextPQCKeyValidati
     NotifyStatusChanged(this);
 
     if (info.pending_records > 0) return PlaintextPQCKeyValidationStepResult::IN_PROGRESS;
+    // Keys validated after the last unlock are re-encrypted now if the wallet
+    // is still unlocked, and otherwise at the next unlock.
+    ReencryptPlaintextPQCKeys();
     return info.failed_records > 0 ? PlaintextPQCKeyValidationStepResult::FAILED
                                    : PlaintextPQCKeyValidationStepResult::COMPLETE;
+}
+
+bool CWallet::HasPQCKeyReencryptionWork() const
+{
+    AssertLockHeld(cs_wallet);
+    for (const auto& [_, spk_man] : m_spk_managers) {
+        const auto* desc_spk_man{dynamic_cast<const DescriptorScriptPubKeyMan*>(spk_man.get())};
+        if (desc_spk_man && WITH_LOCK(desc_spk_man->cs_desc_man, return desc_spk_man->HasPQCKeysToReencrypt())) return true;
+    }
+    return false;
+}
+
+bool CWallet::ReencryptPlaintextPQCKeys()
+{
+    // Callers run on the GUI thread, the scheduler thread or an RPC that must
+    // still schedule its relock, so a failure is logged, not thrown.
+    try {
+        return ReencryptPlaintextPQCKeysOrThrow();
+    } catch (const std::exception& e) {
+        WalletLogPrintf("Warning: re-encrypting plaintext PQC key records failed: %s\n", e.what());
+        return false;
+    }
+}
+
+bool CWallet::ReencryptPlaintextPQCKeysOrThrow()
+{
+    AssertLockNotHeld(cs_wallet);
+    if (!IsCrypted()) return true;
+    // Only a crypted key that decrypted at unlock shows that the master key
+    // is the wallet's. Without one, a wrong passphrase can unlock the wallet,
+    // and re-encrypting under it would lose the keys for good.
+    const auto master_key_unverified{[&]() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) {
+        if (HaveCryptedKeys()) return false;
+        WalletLogPrintf("Warning: not re-encrypting plaintext PQC key records, because no encrypted key in this wallet confirms its passphrase. "
+                        "They stay unencrypted and signing with PQC keys stays disabled.\n");
+        return true;
+    }};
+    {
+        LOCK(cs_wallet);
+        if (!HasPQCKeyReencryptionWork()) return true;
+        if (vMasterKey.empty() || master_key_unverified()) return false;
+    }
+    if (m_before_reencrypt_pqc_keys_locks) m_before_reencrypt_pqc_keys_locks();
+
+    bool success{false};
+    {
+        // Same protocol as Lock(). A signer may hold a descriptor lock while it
+        // waits for cs_wallet, so wait for active signers before taking
+        // cs_wallet and then every descriptor lock. Holding m_relock_mutex
+        // keeps walletlock and timed relocks out until the work is done.
+        LOCK(m_relock_mutex);
+        BlockAndWaitForActiveSigningProviderSnapshots();
+        const struct SigningUnblocker {
+            const CWallet& wallet;
+            ~SigningUnblocker() { wallet.UnblockActiveSigningProviderSnapshots(); }
+        } signing_unblocker{*this};
+
+        LOCK(cs_wallet);
+        if (vMasterKey.empty()) {
+            // Relocked since the check above. Re-encryption needs the master key.
+            WalletLogPrintf("Wallet was locked before its plaintext PQC keys could be re-encrypted; the next unlock retries\n");
+            return false;
+        }
+
+        // Background top-ups hold their manager's lock while they wait for the
+        // database writer, so take every descriptor lock before the
+        // transaction begins. UniqueLock cannot be moved, so the locks are
+        // constructed in place in a list.
+        std::vector<DescriptorScriptPubKeyMan*> desc_spk_mans;
+        std::forward_list<UniqueLock<RecursiveMutex>> desc_spk_man_locks;
+        for (const auto& [_, spk_man] : m_spk_managers) {
+            auto* desc_spk_man{dynamic_cast<DescriptorScriptPubKeyMan*>(spk_man.get())};
+            if (!desc_spk_man) continue;
+            desc_spk_mans.push_back(desc_spk_man);
+            desc_spk_man_locks.emplace_front(desc_spk_man->cs_desc_man, "desc_spk_man->cs_desc_man", __FILE__, __LINE__);
+        }
+
+        bool reencrypt{false};
+        for (DescriptorScriptPubKeyMan* desc_spk_man : desc_spk_mans) {
+            AssertDescriptorLockHeld(desc_spk_man);
+            reencrypt |= desc_spk_man->HasPQCKeysToReencrypt();
+        }
+        if (reencrypt && master_key_unverified()) return false;
+
+        bool reencrypted{!reencrypt};
+        if (reencrypt) {
+            WalletBatch batch(GetDatabase());
+            std::string error;
+            std::vector<std::pair<DescriptorScriptPubKeyMan*, std::vector<ReencryptedPQCKey>>> updates;
+            size_t num_records{0};
+            if (!batch.TxnBegin()) {
+                error = "cannot begin a database transaction";
+            } else {
+                if (m_after_reencrypt_pqc_keys_txn_begin) m_after_reencrypt_pqc_keys_txn_begin();
+                // This transaction deletes plaintext key records, so the file
+                // needs a rewrite after it. See RewriteAfterEncryption.
+                if (!batch.ErasePostEncryptionRewrite()) {
+                    error = "cannot erase the post-encryption rewrite record";
+                }
+                for (DescriptorScriptPubKeyMan* desc_spk_man : desc_spk_mans) {
+                    if (!error.empty()) break;
+                    AssertDescriptorLockHeld(desc_spk_man);
+                    auto res{desc_spk_man->WriteReencryptedPQCKeys(batch, vMasterKey)};
+                    if (!res) {
+                        error = strprintf("descriptor %s: %s", desc_spk_man->GetID().ToString(), util::ErrorString(res).original);
+                        break;
+                    }
+                    num_records += res->size();
+                    if (!res->empty()) updates.emplace_back(desc_spk_man, std::move(*res));
+                }
+                if (error.empty() && !batch.TxnCommit()) {
+                    error = "cannot commit the database transaction";
+                }
+                if (!error.empty()) batch.TxnAbort();
+            }
+
+            if (error.empty()) {
+                // The records are crypted on disk; only now change the maps.
+                for (auto& [desc_spk_man, keys] : updates) {
+                    AssertDescriptorLockHeld(desc_spk_man);
+                    desc_spk_man->ApplyReencryptedPQCKeys(keys);
+                }
+                reencrypted = true;
+                WalletLogPrintf("Re-encrypted %u plaintext PQC key records\n", num_records);
+            } else {
+                WalletLogPrintf("Warning: re-encrypting plaintext PQC key records failed (%s). "
+                                "No record was changed; signing with PQC keys stays disabled and the next unlock retries.\n", error);
+            }
+        }
+
+        // The old records stay in the file's free space until it is
+        // rewritten. Keep the descriptor locks so that no top-up holds a
+        // transaction open meanwhile. If the process stops first or the
+        // rewrite fails, the wallet is rewritten at its next load or backup.
+        const bool rewritten{!reencrypt || !reencrypted || RewriteAfterEncryption()};
+        success = reencrypted && rewritten;
+    }
+    NotifyStatusChanged(this);
+    return success;
 }
 
 bool CWallet::IsPQCKeyValidationReadyForPrivateKeyUse() const
@@ -4291,6 +4578,18 @@ static util::Result<fs::path> GetWalletPath(const std::string& name)
     return wallet_path;
 }
 
+bilingual_str NewSeedFailedWarning(const bilingual_str& reason)
+{
+    return strprintf(_("The wallet is encrypted with the new passphrase and is now locked, but setting up its new HD seed did not finish (%s). New addresses may still come from the previous HD seed, whose keys were stored unencrypted before. Make a new backup of the wallet. To stop using the previous seed, create a new wallet with a passphrase and move your funds to it."), reason);
+}
+
+bilingual_str PendingRewriteWarning()
+{
+    // The rewrite may also have succeeded with only its record failing to be
+    // written, so this says the file may, not does, hold the keys.
+    return _("The rewrite of the wallet file after encryption did not complete, so the file may still contain deleted unencrypted keys. The rewrite is retried when the wallet is next loaded, and before a backup.");
+}
+
 std::unique_ptr<WalletDatabase> MakeWalletDatabase(const std::string& name, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error_string)
 {
     const auto& wallet_path = GetWalletPath(name);
@@ -4360,6 +4659,18 @@ std::shared_ptr<CWallet> CWallet::Create(WalletContext& context, const std::stri
         } else {
             error = strprintf(_("Error loading %s"), walletFile);
             return nullptr;
+        }
+    }
+
+    // An encrypted wallet without the record stopped between its encryption
+    // and the rewrite after it, or was encrypted by a version that did not
+    // write the record. Rewrite it before any work on the wallet starts. A
+    // failure does not fail the load; it is reported and retried at the next
+    // load.
+    {
+        LOCK(walletInstance->cs_wallet);
+        if (walletInstance->NeedsRewriteAfterEncryption() && !walletInstance->RewriteAfterEncryption()) {
+            warnings.push_back(PendingRewriteWarning());
         }
     }
 
@@ -4720,10 +5031,28 @@ void CWallet::postInitProcess()
     WITH_LOCK(cs_wallet, chain().requestMempoolTransactions(*this));
 }
 
-bool CWallet::BackupWallet(const std::string& strDest) const
+util::Result<void> CWallet::BackupWallet(const std::string& strDest, bool allow_unencrypted_pqc_keys)
 {
-    WITH_LOCK(cs_wallet, WriteBestBlock());
-    return GetDatabase().Backup(strDest);
+    // Hold cs_wallet for the whole copy. EncryptWallet holds it from before
+    // its commit through its rewrite, so an encryption cannot start between
+    // this check and the copy.
+    LOCK(cs_wallet);
+    // A copy keeps plaintext PQC key records after the next unlock has
+    // re-encrypted the wallet. Re-encryption needs cs_wallet, so the state
+    // checked here is the state copied.
+    if (!allow_unencrypted_pqc_keys && GetPQCKeyValidationInfo().reencryption_required) {
+        return util::Error{strprintf(_("Backup refused: this encrypted wallet still stores PQC private keys unencrypted, and the backup would contain them. Unlock the wallet once (enter its passphrase when you send, or run walletpassphrase in the console) so that they are re-encrypted, then try again. An unlock cannot re-encrypt some keys, such as those whose records failed validation, and the debug log then says why; to copy such a wallet anyway, unload it and run %s with the -datadir and chain options that qbitd uses (an empty name for the default wallet). The dump file contains those keys too, and %s restores it."),
+                                     "\"qbit-wallet -wallet=<name> -dumpfile=<file> dump\"", "\"qbit-wallet -wallet=<new name> -dumpfile=<file> createfromdump\"")};
+    }
+    // The copy includes free pages byte for byte, so deleted plaintext keys
+    // must be gone from the file before it is made.
+    if (NeedsRewriteAfterEncryption() && !RewriteAfterEncryption()) {
+        return util::Error{strprintf(_("Backup refused: the wallet file may still contain deleted unencrypted keys, and rewriting it failed. Free space in the data and temporary directories, or reload the wallet, then try again. Meanwhile, to make a copy without those keys, unload the wallet and run %s with the -datadir and chain options that qbitd uses (an empty name for the default wallet); %s restores it."),
+                                     "\"qbit-wallet -wallet=<name> -dumpfile=<file> dump\"", "\"qbit-wallet -wallet=<new name> -dumpfile=<file> createfromdump\"")};
+    }
+    WriteBestBlock();
+    if (!GetDatabase().Backup(strDest)) return util::Error{_("Wallet backup failed!")};
+    return {};
 }
 
 int CWallet::GetTxDepthInMainChain(const CWalletTx& wtx) const

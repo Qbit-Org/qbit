@@ -681,6 +681,30 @@ class ValidateReleaseArtifactsTest(unittest.TestCase):
         waived = self.run_validator("--allow-unsigned-platform-artifacts")
         self.assertEqual(waived.returncode, 0, waived.stderr)
 
+    def test_darwin_debug_archives_need_no_waiver(self) -> None:
+        # v1.0.1 adds macOS debug tarballs; staging without them, as for
+        # v1.0.0, is covered by the other tests.
+        names = [
+            f"qbit-{self.version}-x86_64-linux-gnu.tar.gz",
+            f"qbit-{self.version}-x86_64-linux-gnu-debug.tar.gz",
+            f"qbit-{self.version}-x86_64-apple-darwin-debug.tar.gz",
+            f"qbit-{self.version}-arm64-apple-darwin-debug.tar.gz",
+        ]
+        for name in names:
+            self.write_artifact(name)
+        self.write_sha256sums(names)
+        self.sign_manifest(self.signers[:2])
+        self.write_combined_signature(["operator-01", "operator-02"])
+        github_output = self.root / "github-output.txt"
+
+        result = self.run_validator("--github-output", str(github_output))
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = github_output.read_text(encoding="utf8")
+        self.assertIn("core_artifact_count=4", output)
+        for name in names:
+            self.assertIn(str(self.artifacts_dir / name), output)
+
     def test_codesigning_payload_fails(self) -> None:
         self.prepare_valid_staging(
             name=f"qbit-{self.version}-x86_64-apple-darwin-codesigning.tar.gz"

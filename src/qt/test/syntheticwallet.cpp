@@ -144,7 +144,7 @@ public:
     }
     bool changeWalletPassphrase(const SecureString&, const SecureString&) override { return false; }
     void abortRescan() override {}
-    bool backupWallet(const std::string&) override { return false; }
+    util::Result<void> backupWallet(const std::string&) override { return util::Error{Untranslated("Unsupported")}; }
     std::string getWalletName() override { return m_state->wallet_name; }
     std::unique_ptr<interfaces::Wallet> clone() override
     {

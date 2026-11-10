@@ -114,6 +114,10 @@ void MaybeScheduleP2MRKeyPoolRefill(WalletContext& context, const std::shared_pt
 //! (the pending create-time top-up, or a refill to -keypool) in the background.
 void TopUpKeyPoolAfterUnlock(WalletContext& context, const std::shared_ptr<CWallet>& wallet);
 std::unique_ptr<WalletDatabase> MakeWalletDatabase(const std::string& name, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error);
+//! The warning for an encrypted wallet whose rewrite after encryption is still pending.
+bilingual_str PendingRewriteWarning();
+//! The result of an encryption that committed, but whose new HD seed could not be set up.
+bilingual_str NewSeedFailedWarning(const bilingual_str& reason);
 
 //! -paytxfee default
 constexpr CAmount DEFAULT_PAY_TX_FEE = 0;
@@ -387,6 +391,9 @@ private:
     bool Unlock(const CKeyingMaterial& vMasterKeyIn);
     void ClearMasterKey() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
+    bool HasPQCKeyReencryptionWork() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool ReencryptPlaintextPQCKeysOrThrow() LOCKS_EXCLUDED(cs_wallet);
+
     std::atomic<bool> fAbortRescan{false};
     std::atomic<bool> fScanningWallet{false}; // controlled by WalletRescanReserver
     std::atomic<bool> m_scanning_with_passphrase{false};
@@ -501,6 +508,13 @@ private:
 
     // Same as 'AddActiveScriptPubKeyMan' but designed for use within a batch transaction context
     void AddActiveScriptPubKeyManWithDb(WalletBatch& batch, uint256 id, OutputType type, bool internal);
+
+    //! Finishes the deferred create-time keypool top-up of the active
+    //! descriptors that EncryptWallet's new HD seed replaces.
+    void TopUpDescriptorsBeforeReplacingThem() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    //! Replaces the active descriptors with ones from a new HD seed. If that
+    //! throws, removes the new descriptors from memory again before rethrowing.
+    void SetupNewSeedOrRollBack(bool use_create_keypool_warmup) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     /** Store wallet flags */
     void SetWalletFlagWithDB(WalletBatch& batch, uint64_t flags);
@@ -706,8 +720,42 @@ public:
     bool m_plaintext_pqc_key_validation_running GUARDED_BY(cs_wallet){false};
 
     bool Unlock(const SecureString& strWalletPassphrase, bool run_pending_initial_keypool_top_up = true);
+    /**
+     * Replace the plaintext PQC key records of an encrypted, unlocked wallet
+     * with crypted ones in one transaction, then rewrite the database file
+     * with RewriteAfterEncryption.
+     * User-initiated unlocks call this once the unlock has returned, and so
+     * does plaintext key validation when it finishes. It does nothing, and
+     * takes no lock beyond a brief state read, when there is nothing to do.
+     * Like Lock(), it waits for active signers before it takes cs_wallet.
+     * Returns false if the wallet was locked or a step failed. If the
+     * re-encryption failed, the records stay reported and refused and the
+     * next call retries; if only the rewrite failed, the next load or backup
+     * retries it. It logs an exception instead of throwing it.
+     */
+    bool ReencryptPlaintextPQCKeys() LOCKS_EXCLUDED(cs_wallet);
     bool ChangeWalletPassphrase(const SecureString& strOldWalletPassphrase, const SecureString& strNewWalletPassphrase);
-    bool EncryptWallet(const SecureString& strWalletPassphrase, bool use_create_keypool_warmup = false);
+    /**
+     * Encrypt the wallet, then replace its active descriptors with ones from a
+     * new HD seed. Returns false if the wallet was not encrypted. Once the
+     * encryption has committed, returns true and leaves the wallet locked even
+     * if a later step fails. If the new HD seed could not be set up, the wallet
+     * keeps its previous active descriptors, and new_seed_error, if given, is
+     * set to the reason.
+     */
+    bool EncryptWallet(const SecureString& strWalletPassphrase, bool use_create_keypool_warmup = false, bilingual_str* new_seed_error = nullptr);
+    /**
+     * Rewrite the database file so that deleted plaintext key records no
+     * longer remain in its free space, then write the POST_ENCRYPTION_REWRITE
+     * record. A transaction that deletes plaintext key records from an
+     * encrypted wallet must erase that record and call this once it has
+     * committed; a wallet loaded without the record is rewritten again, so a
+     * stop before this completes is recovered at the next load. Returns false
+     * and leaves the record absent if the rewrite fails.
+     */
+    bool RewriteAfterEncryption() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    //! Whether this is an encrypted wallet without the POST_ENCRYPTION_REWRITE record.
+    bool NeedsRewriteAfterEncryption() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     unsigned int ComputeTimeSmart(const CWalletTx& wtx, bool rescanning_old_block) const;
 
@@ -875,6 +923,16 @@ public:
     // database transaction has begun. Same configuration rules as
     // m_before_script_pub_key_cache_publish.
     std::function<void()> m_after_encrypt_wallet_txn_begin;
+    // Optional deterministic test hook invoked by EncryptWallet once its
+    // transaction has committed and before it rewrites the database. Same
+    // configuration rules as m_before_script_pub_key_cache_publish.
+    std::function<void()> m_after_encrypt_wallet_commit;
+    // Optional deterministic test hooks invoked by ReencryptPlaintextPQCKeys
+    // once it has found work and before it waits for signers, and once its
+    // database transaction has begun.
+    // Same configuration rules as m_before_script_pub_key_cache_publish.
+    std::function<void()> m_before_reencrypt_pqc_keys_locks;
+    std::function<void()> m_after_reencrypt_pqc_keys_txn_begin;
     // Optional deterministic test hook invoked by send and sendall after they
     // sign a transaction and before they commit it. send holds no wallet lock
     // there; sendall holds cs_wallet. Same configuration rules as
@@ -969,7 +1027,7 @@ public:
     bool SetAddressBook(const CTxDestination& address, const std::string& strName, const std::optional<AddressPurpose>& purpose);
 
     bool DelAddressBook(const CTxDestination& address);
-    bool DelAddressBookWithDB(WalletBatch& batch, const CTxDestination& address);
+    bool DelAddressBookWithDB(WalletBatch& batch, const CTxDestination& address) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     bool IsAddressPreviouslySpent(const CTxDestination& dest) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool SetAddressPreviouslySpent(WalletBatch& batch, const CTxDestination& dest, bool used) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
@@ -1055,7 +1113,14 @@ public:
      */
     void postInitProcess();
 
-    bool BackupWallet(const std::string& strDest) const;
+    /**
+     * Copy the database to strDest. The copy includes the file's free space,
+     * so a rewrite that is still pending after encryption runs first, and the
+     * backup is refused if it fails. Unless allow_unencrypted_pqc_keys is set,
+     * the backup is also refused while the wallet is encrypted but still
+     * stores plaintext PQC key records, because the copy would contain them.
+     */
+    util::Result<void> BackupWallet(const std::string& strDest, bool allow_unencrypted_pqc_keys = false);
 
     /* Returns true if HD is enabled */
     bool IsHDEnabled() const;
