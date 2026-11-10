@@ -5,6 +5,7 @@
 #include <qt/poker/cards.h>
 
 #include <random.h>
+#include <util/strencodings.h>
 
 #include <algorithm>
 #include <array>
@@ -14,9 +15,6 @@ namespace poker {
 namespace {
 constexpr std::string_view RANK_CHARS{"23456789TJQKA"};
 constexpr std::string_view SUIT_CHARS{"cdhs"};
-
-char ToLowerAscii(char c) { return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c; }
-char ToUpperAscii(char c) { return (c >= 'a' && c <= 'z') ? static_cast<char>(c - 'a' + 'A') : c; }
 } // namespace
 
 char RankChar(int rank) { return RANK_CHARS.at(rank); }
@@ -31,8 +29,8 @@ std::string CardToString(Card card)
 std::optional<Card> ParseCard(std::string_view text)
 {
     if (text.size() != 2) return std::nullopt;
-    const auto rank{RANK_CHARS.find(ToUpperAscii(text[0]))};
-    const auto suit{SUIT_CHARS.find(ToLowerAscii(text[1]))};
+    const auto rank{RANK_CHARS.find(ToUpper(text[0]))};
+    const auto suit{SUIT_CHARS.find(ToLower(text[1]))};
     if (rank == std::string_view::npos || suit == std::string_view::npos) return std::nullopt;
     return MakeCard(static_cast<int>(rank), static_cast<int>(suit));
 }

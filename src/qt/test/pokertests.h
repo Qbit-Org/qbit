@@ -30,6 +30,9 @@ private Q_SLOTS:
     void preActions();
     void randomTables();
     void tableWindow();
+    void headsUpSitOut();
+    void bigStacks();
+    void raiseSlider();
 };
 
 #endif // QBIT_QT_TEST_POKERTESTS_H

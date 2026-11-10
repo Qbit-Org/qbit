@@ -6,6 +6,7 @@
 
 #include <qt/pokertableview.h>
 
+#include <algorithm>
 #include <utility>
 
 #include <QHBoxLayout>
@@ -21,6 +22,9 @@
 namespace {
 constexpr int SEATS_ROLE{Qt::UserRole};
 constexpr int SPEC_ROLE{Qt::UserRole + 1};
+//! Pixels between cascaded table windows, and how many fit down a diagonal before the next one starts.
+constexpr int CASCADE_STEP{30};
+constexpr int CASCADE_LENGTH{8};
 } // namespace
 
 PokerLobby::PokerLobby(QWidget* parent)
@@ -50,7 +54,6 @@ PokerLobby::PokerLobby(QWidget* parent)
 
     auto* join{new QPushButton(tr("&Join Table"), this)};
     auto* open_new{new QPushButton(tr("&Open New Table"), this)};
-    join->setDefault(true);
     auto* buttons{new QHBoxLayout};
     buttons->addWidget(open_new);
     buttons->addStretch();
@@ -137,20 +140,25 @@ void PokerLobby::openNewTable()
 
 PokerTableWindow* PokerLobby::openTable(const PokerTableSpec& spec)
 {
+    // Cascade into the first position no open table holds, so a new window never covers an open one.
+    std::erase_if(m_open_tables, [](const OpenTable& open) { return open.window.isNull(); });
+    int slot{0};
+    while (std::ranges::any_of(m_open_tables, [slot](const OpenTable& open) { return open.slot == slot; })) ++slot;
     auto* window{new PokerTableWindow(spec, this)};
-    // Cascade new windows so several tables can be played at once.
-    const int offset{30 * static_cast<int>(m_open_tables.size() % 8)};
-    window->move(pos() + QPoint{60 + offset, 40 + offset});
+    // Each diagonal of windows starts a little to the right of the last, so windows stay on screen without
+    // landing exactly on each other.
+    const int along{slot % CASCADE_LENGTH};
+    const int diagonal{slot / CASCADE_LENGTH};
+    window->move(pos() + QPoint{60 + CASCADE_STEP * along + (CASCADE_STEP / 2) * diagonal, 40 + CASCADE_STEP * along});
     window->show();
-    m_open_tables.removeIf([](const QPointer<PokerTableWindow>& open) { return open.isNull(); });
-    m_open_tables.append(window);
+    m_open_tables.push_back({window, slot});
     return window;
 }
 
 void PokerLobby::closeTables()
 {
-    for (const QPointer<PokerTableWindow>& window : m_open_tables) {
-        if (window) window->close();
+    for (const OpenTable& open : m_open_tables) {
+        if (open.window) open.window->close();
     }
     m_open_tables.clear();
 }

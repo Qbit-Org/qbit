@@ -5,17 +5,19 @@
 #include <qt/pokertable.h>
 
 #include <qt/pokertableview.h>
+#include <util/check.h>
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <initializer_list>
-#include <limits>
 #include <utility>
 #include <vector>
 
 #include <QApplication>
 #include <QCheckBox>
 #include <QCloseEvent>
+#include <QDoubleSpinBox>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLatin1Char>
@@ -23,7 +25,6 @@
 #include <QPushButton>
 #include <QSignalBlocker>
 #include <QSlider>
-#include <QSpinBox>
 #include <QStatusBar>
 #include <QStringList>
 #include <QTimer>
@@ -51,13 +52,17 @@ constexpr std::array<BotProfile, 12> BOT_PROFILES{{
     {"Wendy", {.looseness = 0.35, .aggression = 0.45, .bluffing = 0.05}},
 }};
 
-//! QSpinBox and QSlider hold ints. Bigger stacks can still move all-in: the maximum means all-in.
-constexpr poker::Chips MAX_WIDGET_CHIPS{std::numeric_limits<int>::max()};
+//! Most steps the raise slider takes from the minimum raise to all-in. The amount box is a QDoubleSpinBox
+//! because it holds every chip count up to poker::MAX_STACK exactly, unlike an int.
+constexpr int MAX_SLIDER_STEPS{1000};
 
-int ToWidget(poker::Chips chips)
-{
-    return static_cast<int>(std::clamp<poker::Chips>(chips, 0, MAX_WIDGET_CHIPS));
-}
+//! m_pre_actions holds the boxes in PreAction order, FOLD first.
+constexpr size_t PreActionIndex(PreAction action) { return static_cast<size_t>(action) - 1; }
+constexpr PreAction PreActionAt(size_t index) { return static_cast<PreAction>(index + 1); }
+static_assert(PreActionAt(0) == PreAction::FOLD && PreActionAt(NUM_PRE_ACTIONS - 1) == PreAction::RAISE_ANY);
+
+// A free name for every computer seat, even while another seat is being refilled, so seatBot() always succeeds.
+static_assert(BOT_PROFILES.size() >= poker::Table::MAX_SEATS);
 
 QString ChipText(poker::Chips chips) { return PokerTableView::chipsText(chips); }
 } // namespace
@@ -96,6 +101,7 @@ PokerTableWindow::PokerTableWindow(const PokerTableSpec& spec, QWidget* parent)
     setWindowTitle(tr("Poker - %1").arg(m_spec.name));
 
     m_timer = new QTimer(this);
+    m_timer->setObjectName(QStringLiteral("pokerTimer"));
     m_timer->setSingleShot(true);
     connect(m_timer, &QTimer::timeout, this, &PokerTableWindow::runTask);
 
@@ -108,6 +114,14 @@ PokerTableWindow::PokerTableWindow(const PokerTableSpec& spec, QWidget* parent)
     }
     m_table.SetButton(static_cast<int>(m_rng.randrange(m_table.NumSeats())));
     refresh();
+}
+
+PokerTableWindow::~PokerTableWindow()
+{
+    m_timer->stop();
+    // Child widgets are normally deleted after this class's members. Everything in the central widget (the view
+    // and the controls, whose handlers use this object) depends on those members, so delete it while they exist.
+    delete takeCentralWidget();
 }
 
 void PokerTableWindow::buildUi()
@@ -144,8 +158,9 @@ void PokerTableWindow::buildUi()
 
     auto* sizing{new QHBoxLayout};
     m_raise_slider = new QSlider(Qt::Horizontal, central);
-    m_raise_amount = new QSpinBox(central);
+    m_raise_amount = new QDoubleSpinBox(central);
     m_raise_amount->setObjectName(QStringLiteral("pokerRaiseAmount"));
+    m_raise_amount->setDecimals(0);
     m_raise_amount->setGroupSeparatorShown(true);
     m_raise_amount->setMinimumWidth(110);
     m_half_pot_button = new QPushButton(tr("Half pot"), central);
@@ -160,21 +175,23 @@ void PokerTableWindow::buildUi()
 
     // Actions chosen ahead of your turn, as in the original FOLD / CALL / CALL ANY / RAISE / RAISE ANY boxes.
     auto* ahead{new QHBoxLayout};
-    m_pre_fold = new QCheckBox(tr("Fold"), central);
-    m_pre_call = new QCheckBox(tr("Call"), central);
-    m_pre_call_any = new QCheckBox(tr("Call any"), central);
-    m_pre_raise = new QCheckBox(tr("Raise"), central);
-    m_pre_raise_any = new QCheckBox(tr("Raise any"), central);
-    m_pre_fold->setObjectName(QStringLiteral("pokerPreFold"));
-    m_pre_call_any->setObjectName(QStringLiteral("pokerPreCallAny"));
-    m_pre_fold->setToolTip(tr("When your turn comes: check if nobody has bet, otherwise fold."));
-    m_pre_call->setToolTip(tr("When your turn comes: call this amount. Cleared if someone raises first."));
-    m_pre_call_any->setToolTip(tr("When your turn comes: check or call whatever the bet is."));
-    m_pre_raise->setToolTip(tr("When your turn comes: make this minimum raise. Cleared if someone raises first."));
-    m_pre_raise_any->setToolTip(tr("When your turn comes: make the minimum raise, whatever the bet is."));
-    for (QCheckBox* box : {m_pre_fold, m_pre_call, m_pre_call_any, m_pre_raise, m_pre_raise_any}) {
+    const std::array<QString, NUM_PRE_ACTIONS> labels{tr("Fold"), tr("Call"), tr("Call any"), tr("Raise"), tr("Raise any")};
+    const std::array<QString, NUM_PRE_ACTIONS> tips{
+        tr("When your turn comes: check if nobody has bet, otherwise fold."),
+        tr("When your turn comes: call this amount. Cleared if someone raises first."),
+        tr("When your turn comes: check or call whatever the bet is."),
+        tr("When your turn comes: make this minimum raise. Cleared if someone raises first."),
+        tr("When your turn comes: make the minimum raise, whatever the bet is."),
+    };
+    static constexpr std::array<const char*, NUM_PRE_ACTIONS> OBJECT_NAMES{"pokerPreFold", "pokerPreCall", "pokerPreCallAny", "pokerPreRaise", "pokerPreRaiseAny"};
+    for (size_t i{0}; i < m_pre_actions.size(); ++i) {
+        QCheckBox* box{new QCheckBox(labels[i], central)};
+        box->setObjectName(QString::fromLatin1(OBJECT_NAMES[i]));
+        box->setToolTip(tips[i]);
         ahead->addWidget(box);
-        connect(box, &QCheckBox::toggled, this, [this, box](bool checked) { preActionToggled(box, checked); });
+        const PreAction action{PreActionAt(i)};
+        connect(box, &QCheckBox::toggled, this, [this, action](bool checked) { preActionToggled(action, checked); });
+        m_pre_actions[i] = box;
     }
     ahead->addStretch();
     controls->addLayout(ahead);
@@ -207,16 +224,18 @@ void PokerTableWindow::buildUi()
     });
     connect(m_raise_button, &QPushButton::clicked, this, [this] {
         const poker::LegalActions legal{m_table.Legal()};
-        // The widgets cannot hold every stack size; their maximum always means all-in.
-        const poker::Chips amount{m_raise_amount->value() >= m_raise_amount->maximum() ? legal.max_raise_to : m_raise_amount->value()};
-        heroAct(poker::Action::RaiseTo(std::clamp(amount, legal.min_raise_to, legal.max_raise_to)));
+        heroAct(poker::Action::RaiseTo(std::clamp(raiseAmount(), legal.min_raise_to, legal.max_raise_to)));
     });
-    connect(m_raise_amount, &QSpinBox::valueChanged, this, [this](int value) {
-        if (m_raise_slider->value() != value) m_raise_slider->setValue(value);
+    connect(m_raise_amount, &QDoubleSpinBox::valueChanged, this, [this] {
+        if (!m_slider_driving) syncRaiseSlider();
         updateRaiseButton();
     });
-    connect(m_raise_slider, &QSlider::valueChanged, this, [this](int value) {
-        if (m_raise_amount->value() != value) m_raise_amount->setValue(value);
+    connect(m_raise_slider, &QSlider::valueChanged, this, [this](int position) {
+        const poker::LegalActions legal{m_table.Legal()};
+        if (!legal.can_raise) return;
+        m_slider_driving = true;
+        setRaiseAmount(sliderToChips(position, legal));
+        m_slider_driving = false;
     });
     connect(m_half_pot_button, &QPushButton::clicked, this, [this] { setRaiseAmount(potSizedRaise(0.5)); });
     connect(m_pot_button, &QPushButton::clicked, this, [this] { setRaiseAmount(potSizedRaise(1.0)); });
@@ -334,9 +353,22 @@ void PokerTableWindow::runTask()
 
 bool PokerTableWindow::autoDeal() const
 {
-    // Keep dealing while the hero plays or watches; pause when the hero has run out of chips.
+    // Keep dealing while the hero plays or watches. Stop when the hero has run out of chips, when no hand can
+    // start (sitting out of a heads-up table), or after a failed deal until something at the table changes.
     const poker::Seat& hero{m_table.GetSeat(m_hero)};
-    return hero.sitting_out || hero.stack > 0;
+    if (m_deal_failed_at == m_table.Version()) return false;
+    return (hero.sitting_out || hero.stack > 0) && playersNextHand() >= 2;
+}
+
+int PokerTableWindow::playersNextHand() const
+{
+    // The seats the table would deal in now, plus the computer seats that startHand() refills first.
+    int refills{0};
+    for (int seat{0}; seat < m_table.NumSeats(); ++seat) {
+        const poker::Seat& s{m_table.GetSeat(seat)};
+        if (seat != m_hero && (!s.occupied || s.stack == 0)) ++refills;
+    }
+    return m_table.EligibleCount() + refills;
 }
 
 int PokerTableWindow::jitter(int delay_ms)
@@ -347,9 +379,15 @@ int PokerTableWindow::jitter(int delay_ms)
 
 void PokerTableWindow::startHand()
 {
-    if (m_table.GetPhase() != poker::Phase::IDLE) return;
+    // Replace busted computer players only when a hand follows at once, so the last hand's results are never
+    // shown under a newcomer's name.
+    if (m_table.GetPhase() != poker::Phase::IDLE || playersNextHand() < 2) return;
     replaceBustedBots();
-    if (m_table.CanStartHand()) m_table.StartHand(m_rng);
+    if (!m_table.CanStartHand() || !m_table.StartHand(m_rng)) {
+        // Not expected. Stop dealing on our own until something at the table changes; Deal Hand retries.
+        m_deal_failed_at = m_table.Version();
+        log(tr("The next hand could not be dealt."));
+    }
 }
 
 void PokerTableWindow::seatBot(int seat)
@@ -401,22 +439,29 @@ bool PokerTableWindow::runPreAction()
     return action && m_table.Act(m_hero, *action);
 }
 
-void PokerTableWindow::preActionToggled(QCheckBox* box, bool checked)
+void PokerTableWindow::preActionToggled(PreAction action, bool checked)
 {
     if (!checked) return;
     // Like radio buttons that can also be cleared.
-    for (QCheckBox* other : {m_pre_fold, m_pre_call, m_pre_call_any, m_pre_raise, m_pre_raise_any}) {
-        if (other != box && other->isChecked()) {
-            const QSignalBlocker blocker{other};
-            other->setChecked(false);
+    QCheckBox* const chosen{preActionBox(action)};
+    for (QCheckBox* box : m_pre_actions) {
+        if (box != chosen && box->isChecked()) {
+            const QSignalBlocker blocker{box};
+            box->setChecked(false);
         }
     }
     m_pre_context = {m_table.HandNumber(), m_table.GetStreet(), m_table.CurrentBet()};
 }
 
+QCheckBox* PokerTableWindow::preActionBox(PreAction action) const
+{
+    Assume(action != PreAction::NONE);
+    return m_pre_actions.at(PreActionIndex(action));
+}
+
 void PokerTableWindow::clearPreActions()
 {
-    for (QCheckBox* box : {m_pre_fold, m_pre_call, m_pre_call_any, m_pre_raise, m_pre_raise_any}) {
+    for (QCheckBox* box : m_pre_actions) {
         const QSignalBlocker blocker{box};
         box->setChecked(false);
     }
@@ -424,11 +469,9 @@ void PokerTableWindow::clearPreActions()
 
 PreAction PokerTableWindow::chosenPreAction() const
 {
-    if (m_pre_fold->isChecked()) return PreAction::FOLD;
-    if (m_pre_call->isChecked()) return PreAction::CALL;
-    if (m_pre_call_any->isChecked()) return PreAction::CALL_ANY;
-    if (m_pre_raise->isChecked()) return PreAction::RAISE;
-    if (m_pre_raise_any->isChecked()) return PreAction::RAISE_ANY;
+    for (size_t i{0}; i < m_pre_actions.size(); ++i) {
+        if (m_pre_actions[i]->isChecked()) return PreActionAt(i);
+    }
     return PreAction::NONE;
 }
 
@@ -454,17 +497,18 @@ void PokerTableWindow::updateControls()
         widget->setEnabled(can_raise);
     }
     if (can_raise) {
-        const int low{ToWidget(legal.min_raise_to)};
-        const int high{ToWidget(legal.max_raise_to)};
         const QSignalBlocker block_amount{m_raise_amount};
         const QSignalBlocker block_slider{m_raise_slider};
-        m_raise_amount->setRange(low, high);
-        m_raise_slider->setRange(low, high);
-        m_raise_amount->setSingleStep(ToWidget(m_table.Config().small_blind));
-        m_raise_slider->setSingleStep(ToWidget(m_table.Config().small_blind));
-        m_raise_slider->setPageStep(ToWidget(m_table.Config().big_blind));
-        if (!m_hero_turn_shown) m_raise_amount->setValue(low);
-        m_raise_slider->setValue(m_raise_amount->value());
+        m_raise_amount->setRange(static_cast<double>(legal.min_raise_to), static_cast<double>(legal.max_raise_to));
+        m_raise_amount->setSingleStep(static_cast<double>(m_table.Config().small_blind));
+        if (!m_hero_turn_shown) m_raise_amount->setValue(static_cast<double>(legal.min_raise_to));
+        // One slider step is at least one small blind, so arrow keys and the wheel always change the amount.
+        const poker::Chips span{legal.max_raise_to - legal.min_raise_to};
+        m_slider_steps = static_cast<int>(std::clamp<poker::Chips>(span / m_table.Config().small_blind, 1, MAX_SLIDER_STEPS));
+        m_raise_slider->setRange(0, m_slider_steps);
+        m_raise_slider->setSingleStep(1);
+        m_raise_slider->setPageStep(std::max(1, m_slider_steps / 10));
+        syncRaiseSlider();
     }
     m_hero_turn_shown = my_turn;
     updateRaiseButton();
@@ -472,24 +516,23 @@ void PokerTableWindow::updateControls()
     // Actions picked ahead of your turn belong to one street, and CALL / RAISE to one bet size.
     const bool same_street{m_pre_context.hand == m_table.HandNumber() && m_pre_context.street == m_table.GetStreet()};
     if (anyPreAction() && (!same_street || phase != poker::Phase::BETTING || !hero.CanAct())) clearPreActions();
-    if ((m_pre_call->isChecked() || m_pre_raise->isChecked()) && m_pre_context.current_bet != m_table.CurrentBet()) {
+    const PreAction chosen{chosenPreAction()};
+    if ((chosen == PreAction::CALL || chosen == PreAction::RAISE) && m_pre_context.current_bet != m_table.CurrentBet()) {
         clearPreActions();
         statusBar()->showMessage(tr("The bet changed, so the action you picked in advance was cleared."), 4000);
     }
     const bool can_choose_ahead{phase == poker::Phase::BETTING && !my_turn && hero.CanAct()};
-    m_pre_fold->setText(legal.can_check ? tr("Check/Fold") : tr("Fold"));
-    m_pre_call->setText(legal.can_call ? tr("Call %1").arg(ChipText(legal.call_amount)) : tr("Check"));
+    preActionBox(PreAction::FOLD)->setText(legal.can_check ? tr("Check/Fold") : tr("Fold"));
+    preActionBox(PreAction::CALL)->setText(legal.can_call ? tr("Call %1").arg(ChipText(legal.call_amount)) : tr("Check"));
     if (legal.can_raise) {
-        m_pre_raise->setText(m_table.CurrentBet() == 0 ? tr("Bet %1").arg(ChipText(legal.min_raise_to))
-                                                       : tr("Raise to %1").arg(ChipText(legal.min_raise_to)));
+        preActionBox(PreAction::RAISE)->setText(m_table.CurrentBet() == 0 ? tr("Bet %1").arg(ChipText(legal.min_raise_to))
+                                                                          : tr("Raise to %1").arg(ChipText(legal.min_raise_to)));
     } else {
-        m_pre_raise->setText(tr("Raise"));
+        preActionBox(PreAction::RAISE)->setText(tr("Raise"));
     }
-    m_pre_fold->setEnabled(can_choose_ahead);
-    m_pre_call->setEnabled(can_choose_ahead);
-    m_pre_call_any->setEnabled(can_choose_ahead);
-    m_pre_raise->setEnabled(can_choose_ahead && legal.can_raise);
-    m_pre_raise_any->setEnabled(can_choose_ahead);
+    for (QCheckBox* box : m_pre_actions) {
+        box->setEnabled(can_choose_ahead && (box != preActionBox(PreAction::RAISE) || legal.can_raise));
+    }
 
     // The table.
     const bool idle{phase == poker::Phase::IDLE};
@@ -497,16 +540,16 @@ void PokerTableWindow::updateControls()
         const QSignalBlocker blocker{m_sit_out};
         m_sit_out->setChecked(hero.sitting_out);
     }
-    // Computer players who run out of chips are replaced before the next deal.
-    const int players_next_hand{m_table.NumSeats() - 1 + (hero.stack > 0 && !hero.sitting_out ? 1 : 0)};
-    m_deal_button->setEnabled(idle && players_next_hand >= 2);
+    m_deal_button->setEnabled(idle && playersNextHand() >= 2);
     m_rebuy_button->setEnabled(idle && hero.stack < m_spec.buy_in);
     m_rebuy_button->setText(hero.stack == 0 ? tr("Re&buy %1").arg(ChipText(m_spec.buy_in)) : tr("Top &up to %1").arg(ChipText(m_spec.buy_in)));
 
     QString status;
     switch (phase) {
     case poker::Phase::IDLE:
-        if (hero.stack == 0 && !hero.sitting_out) {
+        if (m_deal_failed_at == m_table.Version()) {
+            status = tr("The next hand could not be dealt. Click Deal Hand to try again.");
+        } else if (hero.stack == 0 && !hero.sitting_out) {
             status = tr("You are out of chips. Rebuy to keep playing, or pick Deal Me Out to watch.");
         } else if (hero.sitting_out) {
             status = tr("You are sitting out.");
@@ -538,9 +581,9 @@ void PokerTableWindow::updateRaiseButton()
         m_raise_button->setText(tr("&Raise"));
         return;
     }
-    const bool all_in{m_raise_amount->value() >= m_raise_amount->maximum()};
-    const QString amount{ChipText(all_in ? legal.max_raise_to : m_raise_amount->value())};
-    if (all_in) {
+    const poker::Chips raise_to{std::clamp(raiseAmount(), legal.min_raise_to, legal.max_raise_to)};
+    const QString amount{ChipText(raise_to)};
+    if (raise_to == legal.max_raise_to) {
         m_raise_button->setText(tr("All-&in %1").arg(amount));
     } else if (m_table.CurrentBet() == 0) {
         m_raise_button->setText(tr("&Bet %1").arg(amount));
@@ -549,9 +592,43 @@ void PokerTableWindow::updateRaiseButton()
     }
 }
 
+poker::Chips PokerTableWindow::raiseAmount() const
+{
+    return static_cast<poker::Chips>(std::llround(m_raise_amount->value()));
+}
+
 void PokerTableWindow::setRaiseAmount(poker::Chips amount)
 {
-    m_raise_amount->setValue(std::clamp(ToWidget(amount), m_raise_amount->minimum(), m_raise_amount->maximum()));
+    m_raise_amount->setValue(std::clamp(static_cast<double>(amount), m_raise_amount->minimum(), m_raise_amount->maximum()));
+}
+
+poker::Chips PokerTableWindow::sliderToChips(int position, const poker::LegalActions& legal) const
+{
+    // The far end is all-in; every other position is a whole number of small blinds above the minimum raise.
+    if (position >= m_slider_steps) return legal.max_raise_to;
+    const poker::Chips span{legal.max_raise_to - legal.min_raise_to};
+    poker::Chips amount{legal.min_raise_to + static_cast<poker::Chips>(std::llround(static_cast<double>(span) * position / m_slider_steps))};
+    amount -= (amount - legal.min_raise_to) % m_table.Config().small_blind;
+    return std::clamp(amount, legal.min_raise_to, legal.max_raise_to);
+}
+
+int PokerTableWindow::chipsToSlider(poker::Chips amount, const poker::LegalActions& legal) const
+{
+    // Only the minimum raise sits at the start and only all-in at the end, so moving to either end always
+    // changes the amount.
+    const poker::Chips span{legal.max_raise_to - legal.min_raise_to};
+    if (amount >= legal.max_raise_to || span <= 0) return m_slider_steps;
+    if (amount <= legal.min_raise_to) return 0;
+    const double share{static_cast<double>(amount - legal.min_raise_to) / static_cast<double>(span)};
+    return std::clamp(static_cast<int>(std::lround(share * m_slider_steps)), 1, std::max(1, m_slider_steps - 1));
+}
+
+void PokerTableWindow::syncRaiseSlider()
+{
+    const poker::LegalActions legal{m_table.Legal()};
+    if (!legal.can_raise) return;
+    const QSignalBlocker blocker{m_raise_slider};
+    m_raise_slider->setValue(chipsToSlider(raiseAmount(), legal));
 }
 
 poker::Chips PokerTableWindow::potSizedRaise(double fraction) const

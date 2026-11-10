@@ -399,7 +399,8 @@ void BitcoinGUI::createActions()
     m_migrate_wallet_action->setStatusTip(tr("Migrate a wallet"));
     m_migrate_wallet_menu = new QMenu(this);
 
-    m_poker_lobby_action = new QAction(tr("&Poker Lobby"), this);
+    // Alt+L: the Window menu already uses P for Peers.
+    m_poker_lobby_action = new QAction(tr("Poker &Lobby"), this);
     m_poker_lobby_action->setMenuRole(QAction::NoRole);
     m_poker_lobby_action->setStatusTip(tr("Play Satoshi's poker game with play money against computer players"));
 

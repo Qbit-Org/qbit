@@ -9,7 +9,6 @@
 
 #include <vector>
 
-#include <QList>
 #include <QPointer>
 #include <QWidget>
 
@@ -39,10 +38,16 @@ private:
     void openNewTable();
     int selectedSeats() const;
 
+    //! An open table window and the cascade position it was placed at.
+    struct OpenTable {
+        QPointer<PokerTableWindow> window;
+        int slot{0};
+    };
+
     QTreeWidget* m_games{nullptr};
     QTreeWidget* m_tables{nullptr};
     std::vector<PokerTableSpec> m_specs;
-    QList<QPointer<PokerTableWindow>> m_open_tables;
+    std::vector<OpenTable> m_open_tables;
     int m_new_table_count{0};
 };
 

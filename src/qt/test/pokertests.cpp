@@ -17,16 +17,22 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 #include <QCheckBox>
+#include <QDoubleSpinBox>
 #include <QPlainTextEdit>
+#include <QPoint>
 #include <QPointer>
 #include <QPushButton>
+#include <QSlider>
+#include <QTimer>
 #include <QTreeWidget>
 
 using poker::Action;
@@ -734,11 +740,141 @@ void PokerTests::tableWindow()
     window->close();
     QTRY_VERIFY(window.isNull());
 
-    // The lobby lists the default tables, opens a table and closes it again.
+    // The lobby lists the default tables, cascades new windows from the ones still open, and closes them.
     PokerLobby lobby;
     QCOMPARE(lobby.findChild<QTreeWidget*>(QStringLiteral("pokerTables"))->topLevelItemCount(), 8);
-    QPointer<PokerTableWindow> opened{lobby.openTable(PokerLobby::DefaultTables().front())};
-    QVERIFY(opened);
+    QPointer<PokerTableWindow> first{lobby.openTable(PokerLobby::DefaultTables().front())};
+    QPointer<PokerTableWindow> second{lobby.openTable(PokerLobby::DefaultTables().front())};
+    const QPoint first_pos{first->pos()};
+    QVERIFY(second->pos().x() > first_pos.x() + 15 && second->pos().y() > first_pos.y() + 15);
+    first->close();
+    second->close();
+    QTRY_VERIFY(first.isNull() && second.isNull());
+    // With nothing open any more, the next window goes back to the first position. Some platforms shift
+    // windows by a few pixels for their frame; a stale cascade would be 60 pixels off.
+    QPointer<PokerTableWindow> third{lobby.openTable(PokerLobby::DefaultTables().front())};
+    QVERIFY((third->pos() - first_pos).manhattanLength() < 15);
+    // With the first position taken again, the next window takes the second, and after closing the first
+    // window the one after that goes back to the first position instead of covering an open table.
+    QPointer<PokerTableWindow> fourth{lobby.openTable(PokerLobby::DefaultTables().front())};
+    QVERIFY((fourth->pos() - third->pos()).manhattanLength() > 15);
+    third->close();
+    QTRY_VERIFY(third.isNull());
+    QPointer<PokerTableWindow> fifth{lobby.openTable(PokerLobby::DefaultTables().front())};
+    QVERIFY((fifth->pos() - first_pos).manhattanLength() < 15);
+    QVERIFY((fifth->pos() - fourth->pos()).manhattanLength() > 15);
     lobby.closeTables();
-    QTRY_VERIFY(opened.isNull());
+    QTRY_VERIFY(fourth.isNull() && fifth.isNull());
+}
+
+void PokerTests::headsUpSitOut()
+{
+    // Sitting out of a heads-up table leaves nobody to play: dealing stops and no timer keeps retrying.
+    QPointer<PokerTableWindow> window{new PokerTableWindow({.name = QStringLiteral("Heads up"), .seats = 2, .small_blind = 1, .big_blind = 2, .buy_in = 100000})};
+    window->setPace(0, 0, 0);
+    window->show();
+    auto* fold{window->findChild<QPushButton*>(QStringLiteral("pokerFoldButton"))};
+    auto* deal{window->findChild<QPushButton*>(QStringLiteral("pokerDealButton"))};
+    auto* sit_out{window->findChild<QCheckBox*>(QStringLiteral("pokerSitOut"))};
+    auto* timer{window->findChild<QTimer*>(QStringLiteral("pokerTimer"))};
+    QVERIFY(fold && deal && sit_out && timer);
+    const Table& table{window->table()};
+    const int hero{window->heroSeat()};
+    QTRY_VERIFY_WITH_TIMEOUT(table.HandNumber() > 0, 20000);
+    sit_out->click();
+    while (table.GetPhase() != Phase::IDLE) {
+        QTRY_VERIFY_WITH_TIMEOUT(table.ToAct() == hero || table.GetPhase() == Phase::IDLE, 20000);
+        if (table.ToAct() == hero) fold->click();
+    }
+    const uint64_t hands{table.HandNumber()};
+    QVERIFY(!timer->isActive());
+    QTest::qWait(200);
+    QCOMPARE(table.HandNumber(), hands);
+    QVERIFY(!timer->isActive());
+    QVERIFY(!deal->isEnabled());
+    window->close();
+    QTRY_VERIFY(window.isNull());
+}
+
+void PokerTests::bigStacks()
+{
+    // Bets above what an int holds: the raise button still raises exactly the amount shown.
+    QPointer<PokerTableWindow> window{new PokerTableWindow(
+        {.name = QStringLiteral("Whales"), .seats = 2, .small_blind = 1'500'000'000, .big_blind = 3'000'000'000, .buy_in = 300'000'000'000})};
+    window->setPace(0, 0, 0);
+    window->show();
+    auto* fold{window->findChild<QPushButton*>(QStringLiteral("pokerFoldButton"))};
+    auto* raise{window->findChild<QPushButton*>(QStringLiteral("pokerRaiseButton"))};
+    QVERIFY(fold && raise);
+    const Table& table{window->table()};
+    const int hero{window->heroSeat()};
+    bool raised{false};
+    for (int attempt{0}; attempt < 50 && !raised; ++attempt) {
+        QTRY_VERIFY_WITH_TIMEOUT(table.ToAct() == hero, 20000);
+        // Wait for a turn with room for a raise that is not all-in.
+        if (!table.Legal().can_raise || table.Legal().min_raise_to >= table.Legal().max_raise_to) {
+            fold->click();
+            continue;
+        }
+        const Chips min_raise{table.Legal().min_raise_to};
+        QVERIFY(min_raise > std::numeric_limits<int>::max());
+        const size_t before{table.Events().size()};
+        raise->click();
+        QVERIFY(table.Events().size() > before);
+        QCOMPARE(table.Events()[before].seat, hero);
+        QCOMPARE(table.Events()[before].total, min_raise);
+        QVERIFY(!table.Events()[before].all_in);
+        raised = true;
+    }
+    QVERIFY(raised);
+    window->close();
+    QTRY_VERIFY(window.isNull());
+}
+
+void PokerTests::raiseSlider()
+{
+    // Every slider step moves the raise by at least a small blind, and the amount never pulls the slider back.
+    for (const auto& [small_blind, big_blind, buy_in] : {std::tuple<Chips, Chips, Chips>{1, 2, 200}, {25, 50, 5000}}) {
+        QPointer<PokerTableWindow> window{new PokerTableWindow({.name = QStringLiteral("Slider"), .seats = 2, .small_blind = small_blind, .big_blind = big_blind, .buy_in = buy_in})};
+        window->setPace(0, 0, 0);
+        window->show();
+        auto* slider{window->findChild<QSlider*>()};
+        auto* amount{window->findChild<QDoubleSpinBox*>(QStringLiteral("pokerRaiseAmount"))};
+        auto* fold{window->findChild<QPushButton*>(QStringLiteral("pokerFoldButton"))};
+        auto* rebuy{window->findChild<QPushButton*>(QStringLiteral("pokerRebuyButton"))};
+        QVERIFY(slider && amount && fold && rebuy);
+        const Table& table{window->table()};
+        const int hero{window->heroSeat()};
+        bool checked{false};
+        for (int attempt{0}; attempt < 50 && !checked; ++attempt) {
+            QTRY_VERIFY_WITH_TIMEOUT(table.ToAct() == hero || (table.GetPhase() == Phase::IDLE && table.GetSeat(hero).stack == 0), 20000);
+            if (table.ToAct() != hero) {
+                rebuy->click();
+                continue;
+            }
+            // Wait for a turn with room for a raise that is not all-in.
+            const poker::LegalActions legal{table.Legal()};
+            if (!legal.can_raise || legal.max_raise_to - legal.min_raise_to < 2 * small_blind) {
+                fold->click();
+                continue;
+            }
+            QVERIFY(slider->isEnabled());
+            QCOMPARE(slider->value(), 0);
+            const double minimum{amount->value()};
+            QTest::keyClick(slider, Qt::Key_Right);
+            QCOMPARE(slider->value(), 1);
+            QVERIFY(amount->value() >= minimum + static_cast<double>(small_blind));
+            QTest::keyClick(slider, Qt::Key_End);
+            QCOMPARE(amount->value(), amount->maximum());
+            // Typing an amount just below all-in keeps the slider off the end, so End still moves it to all-in.
+            amount->setValue(amount->maximum() - static_cast<double>(small_blind));
+            QVERIFY(slider->value() < slider->maximum());
+            QTest::keyClick(slider, Qt::Key_End);
+            QCOMPARE(amount->value(), amount->maximum());
+            checked = true;
+        }
+        QVERIFY(checked);
+        window->close();
+        QTRY_VERIFY(window.isNull());
+    }
 }

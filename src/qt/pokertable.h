@@ -10,6 +10,7 @@
 #include <random.h>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 
@@ -22,12 +23,13 @@ class QCloseEvent;
 class QLabel;
 class QPlainTextEdit;
 class QPushButton;
+class QDoubleSpinBox;
 class QSlider;
-class QSpinBox;
 class QTimer;
 
 /** An action picked before the hero's turn, as in the original FOLD / CALL / CALL ANY / RAISE / RAISE ANY boxes. */
 enum class PreAction { NONE, FOLD, CALL, CALL_ANY, RAISE, RAISE_ANY };
+inline constexpr size_t NUM_PRE_ACTIONS{static_cast<size_t>(PreAction::RAISE_ANY)};
 
 /** The table state an advance action was picked in. */
 struct PreActionContext {
@@ -67,6 +69,7 @@ class PokerTableWindow : public QMainWindow
 
 public:
     explicit PokerTableWindow(const PokerTableSpec& spec, QWidget* parent = nullptr);
+    ~PokerTableWindow() override;
 
     /** Delays in milliseconds for a computer player's turn, dealing a street, and the pause between hands. */
     void setPace(int bot_ms, int street_ms, int hand_ms);
@@ -89,18 +92,24 @@ private:
     void replaceBustedBots();
     void heroAct(const poker::Action& action);
     bool runPreAction();
-    void preActionToggled(QCheckBox* box, bool checked);
+    void preActionToggled(PreAction action, bool checked);
+    QCheckBox* preActionBox(PreAction action) const;
     void clearPreActions();
     PreAction chosenPreAction() const;
     bool anyPreAction() const { return chosenPreAction() != PreAction::NONE; }
     void updateControls();
     void updateRaiseButton();
+    poker::Chips raiseAmount() const;
     void setRaiseAmount(poker::Chips amount);
+    poker::Chips sliderToChips(int position, const poker::LegalActions& legal) const;
+    int chipsToSlider(poker::Chips amount, const poker::LegalActions& legal) const;
+    void syncRaiseSlider();
     poker::Chips potSizedRaise(double fraction) const;
     void appendNewEvents();
     void log(const QString& line);
     QString seatName(int seat) const;
     bool autoDeal() const;
+    int playersNextHand() const;
     int jitter(int delay_ms);
 
     const PokerTableSpec m_spec;
@@ -121,6 +130,12 @@ private:
     //! Table version the action controls were last drawn for; clicks for any other state are ignored.
     uint64_t m_controls_version{0};
     bool m_hero_turn_shown{false};
+    //! Raise slider steps for the current turn: at most one per small blind, so every step changes the amount.
+    int m_slider_steps{1};
+    //! Set while the slider sets the amount, so the amount does not move the slider back.
+    bool m_slider_driving{false};
+    //! Table version at which dealing a hand failed; no automatic deal until the table changes.
+    std::optional<uint64_t> m_deal_failed_at;
     //! The state the advance action was picked in.
     PreActionContext m_pre_context;
 
@@ -130,16 +145,13 @@ private:
     QPushButton* m_fold_button{nullptr};
     QPushButton* m_call_button{nullptr};
     QPushButton* m_raise_button{nullptr};
-    QSpinBox* m_raise_amount{nullptr};
+    QDoubleSpinBox* m_raise_amount{nullptr};
     QSlider* m_raise_slider{nullptr};
     QPushButton* m_half_pot_button{nullptr};
     QPushButton* m_pot_button{nullptr};
     QPushButton* m_all_in_button{nullptr};
-    QCheckBox* m_pre_fold{nullptr};
-    QCheckBox* m_pre_call{nullptr};
-    QCheckBox* m_pre_call_any{nullptr};
-    QCheckBox* m_pre_raise{nullptr};
-    QCheckBox* m_pre_raise_any{nullptr};
+    //! FOLD, CALL, CALL ANY, RAISE and RAISE ANY, in PreAction order.
+    std::array<QCheckBox*, NUM_PRE_ACTIONS> m_pre_actions{};
     QCheckBox* m_sit_out{nullptr};
     QPushButton* m_deal_button{nullptr};
     QPushButton* m_rebuy_button{nullptr};
