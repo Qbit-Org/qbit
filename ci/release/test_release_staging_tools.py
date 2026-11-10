@@ -1351,6 +1351,36 @@ class TrustedCheckoutHardeningTest(ReleaseToolTestCase):
         git(trusted, "update-ref", f"refs/tags/{TAG}", signed)
         self.assert_ok(self.derive_sha256sums())
 
+    def publisher_tag_check(self, tag_object: str) -> subprocess.CompletedProcess[str]:
+        """Run publish-local-release.sh's verify_release_tag_signature snippet as the publisher does."""
+
+        text = (TOOLS_DIR / "publish-local-release.sh").read_text(encoding="utf8")
+        function = text.split("\nverify_release_tag_signature() {\n", 1)[1]
+        snippet = function.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0] + "\n"
+        keys = self.release.trusted / "contrib" / "keys" / "operator-keys"
+        return subprocess.run(
+            [sys.executable, "-I", "-S", "-B", "-", str(self.release.trusted / "ci" / "release"), str(keys),
+             "testnet", TAG, tag_object],
+            input=snippet, cwd=self.release.trusted, check=False, capture_output=True, text=True, encoding="utf8",
+        )
+
+    def test_the_publishers_tag_check_verifies_the_refs_tags_object(self) -> None:
+        trusted = self.release.trusted
+        self.sign_all()
+        self.assert_ok(self.release.combine())
+        signed = git(trusted, "rev-parse", f"refs/tags/{TAG}")
+        self.assertEqual(self.publisher_tag_check(signed).returncode, 0)
+        # The repro: refs/tags/<tag> unsigned, the signed tag kept at refs/<tag>.
+        git(trusted, "tag", "-f", "-a", TAG, "-m", TAG, self.release.tag_target)
+        unsigned = git(trusted, "rev-parse", f"refs/tags/{TAG}")
+        git(trusted, "update-ref", f"refs/{TAG}", signed)
+        self.assertEqual(git(trusted, "status", "--porcelain"), "")
+        # The bare name now names the signed tag; the check is on the refs/tags object.
+        self.assertEqual(git(trusted, "rev-parse", "--verify", "-q", f"{TAG}^{{tag}}"), signed)
+        result = self.publisher_tag_check(unsigned)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"Release tag {TAG} ({unsigned}) was not signed by an active qbit release key", result.stderr)
+
     def test_a_signed_tag_of_another_name_cannot_stand_in_for_the_release_tag(self) -> None:
         trusted = self.release.trusted
         signed = git(trusted, "rev-parse", f"refs/tags/{TAG}")

@@ -307,6 +307,39 @@ export_trusted_paths() {
     done < "$listing"
 }
 
+# The release tag is signed by an active release key: the validator's own
+# verify_tag_signature, given the pinned tag object (TAG_OBJECT) rather than
+# the bare tag name that validate_release_artifacts.py --verify-tag-signature
+# would pass to git verify-tag.
+verify_release_tag_signature() {
+    (cd "$TRUSTED_ROOT" && "${PYTHON_SNIPPET[@]}" - "$VALIDATORS" "$TRUSTED_KEYS_DIR" "$RELEASE_LINE" "$TAG" "$TAG_OBJECT" <<'PY'
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
+validators, keys_dir, release_line, tag, tag_object = sys.argv[1:6]
+# The validators import their siblings from the exported trusted ref.
+sys.path.insert(0, validators)
+import validate_release_artifacts as vra  # noqa: E402
+
+gpg = shutil.which("gpg") or "gpg"
+keys = Path(keys_dir)
+try:
+    policy = vra.load_release_policy(keys / "keys.json", keys, release_line)
+    with tempfile.TemporaryDirectory(prefix="qbit-release-tag-gnupg-") as home:
+        gnupg_home = Path(home)
+        gnupg_home.chmod(0o700)
+        vra.import_release_keys(gpg, gnupg_home, keys, policy)
+        # git verify-tag runs in the current directory, the trusted checkout.
+        vra.verify_tag_signature(gpg, gnupg_home, tag_object, policy)
+except vra.ReleaseValidationError as exc:
+    message = str(exc).replace(f"Release tag {tag_object}", f"Release tag {tag} ({tag_object})", 1)
+    raise SystemExit(f"ERR: {message}")
+PY
+    ) || die "Release tag $TAG failed the signature check"
+}
+
 github_repo_path() {
     local repository="$1"
     local owner
@@ -955,9 +988,26 @@ if [ "$P2MR_CONFORMANCE_REQUESTED" -eq 1 ]; then
 fi
 RELEASE_NAME="${RELEASE_NAME:-qbit $TAG}"
 
-TAG_OBJECT="$(git -C "$TRUSTED_ROOT" rev-parse -q --verify "refs/tags/$TAG^{tag}" 2>/dev/null || true)"
-TAG_TARGET="$(git -C "$TRUSTED_ROOT" rev-parse -q --verify "refs/tags/$TAG^{commit}" 2>/dev/null || true)"
-[ -n "$TAG_OBJECT" ] || die "Trusted release checkout is missing annotated tag $TAG"
+# Only the exact ref refs/tags/$TAG is read (show-ref --verify): git looks a
+# name up as $GIT_DIR/<name>, refs/<name>, refs/tags/<name>, ..., even
+# refs/refs/tags/$TAG for refs/tags/$TAG, so a ref git status does not show
+# could otherwise stand in for the tag. The signature check uses this object.
+TAG_OBJECT="$(git -C "$TRUSTED_ROOT" show-ref --verify --hash "refs/tags/$TAG" 2>/dev/null || true)"
+[ -n "$TAG_OBJECT" ] && [ "$(git -C "$TRUSTED_ROOT" cat-file -t "$TAG_OBJECT" 2>/dev/null)" = tag ] \
+    || die "Trusted release checkout is missing annotated tag $TAG"
+# Validators that take the tag name (verify_testnet_release_posture.py resolves
+# $TAG^{commit}) must see the same object, so the bare name must resolve to it.
+BARE_TAG_OBJECT="$(git -C "$TRUSTED_ROOT" rev-parse -q --verify "$TAG^{tag}" 2>/dev/null || true)"
+[ "$BARE_TAG_OBJECT" = "$TAG_OBJECT" ] \
+    || die "The name $TAG resolves to ${BARE_TAG_OBJECT:-no tag}, not to refs/tags/$TAG ($TAG_OBJECT): remove the ref git finds first (.git/$TAG or refs/$TAG)"
+# The tag object must name $TAG: its signature covers that name, so a signed
+# tag of another release cannot be put at refs/tags/$TAG. awk reads the whole
+# object, so git cat-file never meets a closed pipe.
+TAG_OBJECT_NAME="$(git -C "$TRUSTED_ROOT" cat-file tag "$TAG_OBJECT" \
+    | awk 'BEGIN { header = 1 } $0 == "" { header = 0 } header && /^tag / { print substr($0, 5) }')"
+[ "$TAG_OBJECT_NAME" = "$TAG" ] \
+    || die "Release tag $TAG is a tag object named $(printf '%q' "${TAG_OBJECT_NAME:-nothing}") ($TAG_OBJECT at refs/tags/$TAG)"
+TAG_TARGET="$(git -C "$TRUSTED_ROOT" rev-parse -q --verify "$TAG_OBJECT^{commit}" 2>/dev/null || true)"
 [ -n "$TAG_TARGET" ] || die "Trusted release checkout is missing commit target for $TAG"
 [ "$(lowercase "$TRUSTED_RELEASE_REF")" != "$(lowercase "$TAG_OBJECT")" ] \
     || die "--trusted-release-ref must not equal the release tag object"
@@ -1052,7 +1102,6 @@ release_args=(
     --release-line "$RELEASE_LINE"
     --operator-key-policy "$TRUSTED_KEYS_DIR/keys.json"
     --operator-keys-dir "$TRUSTED_KEYS_DIR"
-    --verify-tag-signature
     --github-output "$VALIDATION_OUTPUT"
 )
 [ "$REQUIRE_PHOTON" -eq 0 ] || release_args+=(--require-photon-artifact)
@@ -1061,6 +1110,8 @@ release_args=(
 [ "$ALLOW_CODESIGNING_ARTIFACTS" -eq 0 ] \
     || release_args+=(--allow-codesigning-artifacts)
 (cd "$TRUSTED_ROOT" && "${PYTHON[@]}" "$VALIDATORS/validate_release_artifacts.py" "${release_args[@]}")
+msg "Validating the release tag signature"
+verify_release_tag_signature
 
 msg "Validating qbit-guix.sigs key-policy mirror"
 "${PYTHON[@]}" "$VALIDATORS/validate_key_metadata.py" \

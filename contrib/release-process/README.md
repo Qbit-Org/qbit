@@ -25,8 +25,13 @@ release tag's signature by an active release key. The tag checked is the tag
 object at `refs/tags/<tag>`, passed to `git verify-tag` by object id, and it
 must name `<tag>`: a bare tag name would let a stray `refs/<tag>` or
 `.git/<tag>`, which git resolves first and `git status` does not show, stand in
-for it, and a signed tag of another release cannot be moved to this name. The
-publisher's GitHub checks
+for it, and a signed tag of another release cannot be moved to this name.
+`publish-local-release.sh` checks the tag the same way: it reads exactly
+`refs/tags/<tag>` and calls the validator's `verify_tag_signature` on that
+object instead of passing the bare name to `validate_release_artifacts.py
+--verify-tag-signature`, and it refuses a checkout where the bare name
+resolves to anything else, since the testnet posture check still takes it.
+The publisher's GitHub checks
 (public refs, the GitHub-verified tag, release immutability) and the mainnet,
 testnet and P2MR posture checks still run only at publication.
 

@@ -22,7 +22,7 @@ TAG = "v0.0.0-testnet1"
 GENERATED_NOTES = "Generated release notes\n\n* Deterministic change list\n"
 
 
-def git(repo: Path, *args: str) -> str:
+def git(repo: Path, *args: str, input: str | None = None) -> str:
     result = subprocess.run(
         [
             "git",
@@ -41,6 +41,7 @@ def git(repo: Path, *args: str) -> str:
         check=True,
         capture_output=True,
         text=True,
+        input=input,
     )
     return result.stdout.strip()
 
@@ -358,40 +359,77 @@ raise SystemExit(2)
             validator_dir / "validate_release_artifacts.py",
             r"""#!/usr/bin/env python3
 import os
+import subprocess
 import sys
 from pathlib import Path
 
-args = sys.argv[1:]
-def option(name):
-    return args[args.index(name) + 1]
 
-artifacts = Path(option("--artifacts-dir"))
-output_path = Path(option("--github-output"))
-notes_to_mutate = os.environ.get("FAKE_MUTATE_NOTES_FILE")
-if notes_to_mutate:
-    Path(notes_to_mutate).write_text("mutated after snapshot\n", encoding="utf8")
-files = sorted(path.resolve() for path in artifacts.iterdir() if path.is_file())
-with output_path.open("a", encoding="utf8") as output:
-    output.write(f"file_count={len(files)}\n")
-    output.write("artifact_count=1\n")
-    output.write("core_artifact_count=1\n")
-    output.write("photon_artifact_count=0\n")
-    output.write("release_signer_count=3\n")
-    output.write("release_signature_count=2\n")
-    output.write("release_signature_quorum=2\n")
-    output.write("release_signature_aliases=operator-01,operator-02\n")
-    output.write("keys_json_sha256=" + "a" * 64 + "\n")
-    output.write("files<<__FILES__\n")
-    for path in files:
-        output.write(str(path) + "\n")
-    output.write("__FILES__\n")
-with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
-    log.write("release " + " ".join(args) + "\n")
-    log.write(
-        f"release-python ignore_environment={sys.flags.ignore_environment} "
-        f"no_user_site={sys.flags.no_user_site} no_site={sys.flags.no_site} "
-        f"dont_write_bytecode={sys.flags.dont_write_bytecode} script={__file__}\n"
-    )
+class ReleaseValidationError(Exception):
+    pass
+
+
+def load_release_policy(policy_path, keys_dir, release_line):
+    return {"release_line": release_line}
+
+
+def import_release_keys(gpg, gnupg_home, keys_dir, policy):
+    pass
+
+
+def verify_tag_signature(gpg, gnupg_home, tag, policy):
+    # Like the real one: git verify-tag <tag> in the current directory. A tag
+    # object listed in FAKE_UNSIGNED_TAG_OBJECTS counts as unsigned.
+    resolved = subprocess.run(
+        ["git", "rev-parse", "--verify", "-q", tag + "^{tag}"], capture_output=True, text=True
+    ).stdout.strip()
+    with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
+        log.write(f"verify-tag {tag} object={resolved}\n")
+    if not resolved or resolved in os.environ.get("FAKE_UNSIGNED_TAG_OBJECTS", "").split(","):
+        raise ReleaseValidationError(f"Release tag {tag} was not signed by an active qbit release key")
+
+
+def main():
+    args = sys.argv[1:]
+
+    def option(name):
+        return args[args.index(name) + 1]
+
+    artifacts = Path(option("--artifacts-dir"))
+    output_path = Path(option("--github-output"))
+    notes_to_mutate = os.environ.get("FAKE_MUTATE_NOTES_FILE")
+    if notes_to_mutate:
+        Path(notes_to_mutate).write_text("mutated after snapshot\n", encoding="utf8")
+    if "--verify-tag-signature" in args:
+        try:
+            verify_tag_signature(None, None, option("--tag"), None)
+        except ReleaseValidationError as exc:
+            raise SystemExit(f"ERR: {exc}")
+    files = sorted(path.resolve() for path in artifacts.iterdir() if path.is_file())
+    with output_path.open("a", encoding="utf8") as output:
+        output.write(f"file_count={len(files)}\n")
+        output.write("artifact_count=1\n")
+        output.write("core_artifact_count=1\n")
+        output.write("photon_artifact_count=0\n")
+        output.write("release_signer_count=3\n")
+        output.write("release_signature_count=2\n")
+        output.write("release_signature_quorum=2\n")
+        output.write("release_signature_aliases=operator-01,operator-02\n")
+        output.write("keys_json_sha256=" + "a" * 64 + "\n")
+        output.write("files<<__FILES__\n")
+        for path in files:
+            output.write(str(path) + "\n")
+        output.write("__FILES__\n")
+    with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
+        log.write("release " + " ".join(args) + "\n")
+        log.write(
+            f"release-python ignore_environment={sys.flags.ignore_environment} "
+            f"no_user_site={sys.flags.no_user_site} no_site={sys.flags.no_site} "
+            f"dont_write_bytecode={sys.flags.dont_write_bytecode} script={__file__}\n"
+        )
+
+
+if __name__ == "__main__":
+    main()
 """,
         )
         self._write_executable(
@@ -495,6 +533,7 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         mutate_notes_file: Path | None = None,
         asset_list_sequence: tuple[str, ...] = ("ok",),
         cwd: Path | None = None,
+        extra_env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = dict(os.environ)
         env["PATH"] = f"{self.bin_dir}{os.pathsep}{env['PATH']}"
@@ -553,6 +592,7 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         if release_line == "testnet":
             args.extend(["--testnet-posture-evidence", str(self.posture)])
         args.extend(extra_args)
+        env.update(extra_env or {})
         return subprocess.run(args, check=False, capture_output=True, text=True, env=env, cwd=cwd)
 
     def assert_no_write_after_failed_asset_list(self) -> None:
@@ -776,6 +816,87 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         self.assertFalse(markers.exists(), markers.read_text(encoding="utf8") if markers.exists() else "")
         # The empty graft file disables grafts without git's deprecation hint.
         self.assertNotIn("grafts", result.stderr)
+
+    def test_tag_signature_is_checked_on_the_refs_tags_object(self) -> None:
+        # The repro: refs/tags/<tag> holds an unsigned tag, while the signed tag
+        # object stays reachable under the bare name through refs/<tag> or
+        # .git/<tag>, which git resolves first and git status does not show.
+        # The publisher refuses the ambiguous name, and checks the signature of
+        # the refs/tags object only.
+        unsigned = self.tag_object
+        git(self.trusted, "tag", "-f", "-a", "v0.0.0-signed", "-m", "signed", self.tag_target)
+        signed = git(self.trusted, "rev-parse", "refs/tags/v0.0.0-signed")
+        git(self.trusted, "update-ref", "-d", "refs/tags/v0.0.0-signed")
+        strays = {
+            f"refs/{TAG}": lambda: git(self.trusted, "update-ref", f"refs/{TAG}", signed),
+            f".git/{TAG}": lambda: (self.trusted / ".git" / TAG).write_text(signed + "\n", encoding="utf8"),
+        }
+        for stray, plant in strays.items():
+            with self.subTest(stray=stray):
+                plant()
+                try:
+                    self.assertEqual(git(self.trusted, "rev-parse", "--verify", "-q", f"{TAG}^{{tag}}"), signed)
+                    self.assertEqual(git(self.trusted, "status", "--porcelain"), "")
+                    self.validator_log.unlink(missing_ok=True)
+                    result = self.run_publisher(extra_env={"FAKE_UNSIGNED_TAG_OBJECTS": unsigned})
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn(f"The name {TAG} resolves to {signed}, not to refs/tags/{TAG} ({unsigned})",
+                                  result.stderr)
+                    self.assertFalse(self.validator_log.exists())
+                finally:
+                    if stray.startswith("refs/"):
+                        git(self.trusted, "update-ref", "-d", stray)
+                    else:
+                        (self.trusted / stray).unlink()
+
+        # The signature check gets the refs/tags object by id.
+        result = self.run_publisher(extra_env={"FAKE_UNSIGNED_TAG_OBJECTS": unsigned})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"Release tag {TAG} ({unsigned}) was not signed by an active qbit release key", result.stderr)
+        self.assertIn(f"verify-tag {unsigned} object={unsigned}\n", self.validator_log.read_text(encoding="utf8"))
+        self.validator_log.unlink()
+        result = self.run_publisher()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"verify-tag {unsigned} object={unsigned}\n", self.validator_log.read_text(encoding="utf8"))
+
+    def test_release_tag_is_read_from_refs_tags_only(self) -> None:
+        # A signed tag object of another release moved to refs/tags/<tag>.
+        git(self.trusted, "tag", "-a", "v0.0.0-other", "-m", "other", self.tag_target)
+        other = git(self.trusted, "rev-parse", "refs/tags/v0.0.0-other")
+        git(self.trusted, "update-ref", f"refs/tags/{TAG}", other)
+        result = self.run_publisher(tag_object_sequence=(other,))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"Release tag {TAG} is a tag object named v0.0.0-other ({other} at refs/tags/{TAG})",
+                      result.stderr)
+        self.assertFalse(self.validator_log.exists())
+
+        # Control characters in the tag object's name are shown escaped.
+        odd = git(self.trusted, "hash-object", "-t", "tag", "--literally", "-w", "--stdin", input=(
+            f"object {self.tag_target}\ntype commit\ntag {TAG}\x1b[2K\n"
+            "tagger qbit release test <release-test@example.invalid> 1700000000 +0000\n\nodd\n"
+        ))
+        git(self.trusted, "update-ref", f"refs/tags/{TAG}", odd)
+        result = self.run_publisher(tag_object_sequence=(odd,))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"Release tag {TAG} is a tag object named $'{TAG}\\E[2K' ({odd}", result.stderr)
+        self.assertNotIn("\x1b", result.stderr)
+
+        # A lightweight tag is not an annotated release tag.
+        git(self.trusted, "update-ref", f"refs/tags/{TAG}", self.tag_target)
+        result = self.run_publisher()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"Trusted release checkout is missing annotated tag {TAG}", result.stderr)
+        self.assertFalse(self.validator_log.exists())
+
+        # With refs/tags/<tag> gone, git would resolve refs/tags/<tag> as
+        # refs/refs/tags/<tag>; the publisher reads only the exact ref.
+        git(self.trusted, "update-ref", "-d", f"refs/tags/{TAG}")
+        git(self.trusted, "update-ref", f"refs/refs/tags/{TAG}", self.tag_object)
+        self.assertEqual(git(self.trusted, "rev-parse", "--verify", "-q", f"refs/tags/{TAG}^{{tag}}"), self.tag_object)
+        result = self.run_publisher()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"Trusted release checkout is missing annotated tag {TAG}", result.stderr)
+        self.assertFalse(self.validator_log.exists())
 
     def test_partial_clones_fail_closed(self) -> None:
         for label, checkout in (("Trusted release checkout", self.trusted), ("qbit-guix.sigs checkout", self.guix_sigs)):
