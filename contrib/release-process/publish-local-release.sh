@@ -105,6 +105,10 @@ The script must come from a clean checkout whose HEAD is the trusted release
 ref. Validation is always performed before any release is created or changed.
 With neither --create-draft nor --publish, the script is validation-only.
 
+The script never fetches. Fetch the trusted release branch into this checkout
+and the qbit-guix.sigs branch into --guix-sigs-repo first: each checkout must
+have the tip GitHub reports for its branch.
+
 Required:
   --tag TAG                         Signed annotated release tag.
   --artifacts-dir DIR               Flat validator-approved staging directory.
@@ -441,7 +445,7 @@ api_path_escape() {
     # Percent-encodes a name for a GitHub API path. A valid branch name can
     # contain # or %, which would otherwise end or change the path: main#x
     # would query main.
-    python3 -I -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe="/"))' "$1"
+    "${PYTHON_SNIPPET[@]}" -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe="/"))' "$1"
 }
 
 protected_branch_tip() {

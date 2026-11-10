@@ -1810,6 +1810,19 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         self.assertIn("Trusted release checkout must not be shallow", result.stderr)
         self.assertNotIn("must be on the first-parent history", result.stderr)
 
+    def test_guix_sigs_ref_on_branch_first_parent_history_passes(self) -> None:
+        later = git(
+            self.guix_sigs, "commit-tree", f"{self.guix_sigs_ref}^{{tree}}",
+            "-p", self.guix_sigs_ref, "-m", "more attestations",
+        )
+        self._set_github_branch("Qbit-Org/qbit-guix.sigs", self.guix_sigs, "main", later)
+        result = self.run_publisher(branch_tips={"Qbit-Org/qbit-guix.sigs/main": later})
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            "repos/Qbit-Org/qbit-guix.sigs/branches/main", self.gh_log.read_text(encoding="utf8")
+        )
+
     def test_shallow_guix_sigs_checkout_fails(self) -> None:
         # In a shallow clone of the branch tip, the walk from the tip stops at
         # the shallow boundary and misses a merged commit fetched afterwards.

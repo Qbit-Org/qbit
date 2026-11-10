@@ -30,14 +30,16 @@ private source commit, a sanitizer mapping, a branch name, a short SHA, or a tag
 object SHA as the release source.
 
 With merge-commit merges, tag the merge commit that landed the release pull
-request, not the pull request's head. Branches are not required to be up to date
-before merging, so a pull request head's tree can lack changes the branch had
-when it merged; only the merge commit is a state the branch actually had. The
-publisher refuses a tag target that is not on the first-parent history of
-`trusted_release_ref`. The release attestation is the operator's signature on
-the annotated tag; the target commit's own signature plays no part here. For a
-release line such as `1.0.0` or `1.x.x`, take `trusted_release_ref` from that
-line's own branch and pass `--trusted-release-branch` with that branch.
+request, not the pull request's head. Only the merge commit is a state the
+branch actually had: `0.1.x` and `1.0.0` do not require a pull request to be up
+to date before merging, and an admin can bypass that rule on `main` and
+`1.x.x`, so a pull request head's tree can lack changes the branch had when it
+merged. The publisher refuses a tag target that is not on the first-parent
+history of `trusted_release_ref`. The release attestation is the operator's
+signature on the annotated tag; the target commit's own signature plays no part
+here. For a release line such as `1.0.0` or `1.x.x`, take `trusted_release_ref`
+from that line's own branch and pass `--trusted-release-branch` with that
+branch.
 
 The release validator recreates `qbit-<version>.tar.gz` directly from that tag
 target with the same `git archive --prefix="qbit-<version>/"` semantics used by
@@ -284,11 +286,15 @@ Public validators live under `ci/release/`. Release key metadata lives under
 The publisher requires `gh`, `git`, `gpg`, `python3`, and an authenticated GitHub
 account with push access to the target repository. Push access is required even
 in validation-only mode so the release listing includes drafts. Run it from the
-repository root at the selected trusted release ref. A command with no
-publication mode performs all local and remote validation without changing a
+repository root at the selected trusted release ref. Fetch the trusted release
+branch and the `qbit-guix.sigs` branch first: the publisher never fetches, and
+stops if a checkout lacks the tip GitHub reports for its branch. A command with
+no publication mode performs all local and remote validation without changing a
 GitHub Release:
 
 ```sh
+git fetch origin main
+git -C /path/to/qbit-guix.sigs fetch origin main
 contrib/release-process/publish-local-release.sh \
   --tag "${TAG}" \
   --artifacts-dir /path/to/staged-release \
