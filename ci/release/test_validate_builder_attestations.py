@@ -914,7 +914,7 @@ class ValidateBuilderAttestationsTest(unittest.TestCase):
 
         with self.assertRaisesRegex(
             validate_builder_attestations.BuilderValidationError,
-            "gpg status output line 4 holds a line separator other than a line feed",
+            r"gpg status output line \d+ holds a line separator other than a line feed \(U\+2028\)",
         ):
             validate_builder_attestations.verify_manifest_signature(
                 GPG, home, signature.with_suffix(""), victim["fingerprint"]

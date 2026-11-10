@@ -29,6 +29,7 @@ ALLOWED_ARTIFACT_SUFFIXES = (".tar.gz", ".tar.xz", ".zip", ".dmg", ".exe")
 SHA256SUMS_LINE_RE = re.compile(r"^([0-9A-Fa-f]{64}) ([ *])(.+)$")
 FINGERPRINT_RE = re.compile(r"^[0-9A-F]{40}$")
 RELEASE_SIGNATURE_RE = re.compile(r"^SHA256SUMS\.([a-z0-9][a-z0-9-]{2,31})\.asc$")
+OBJECT_ID_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
 class ReleaseValidationError(Exception):
@@ -355,19 +356,19 @@ def import_release_keys(
         )
 
 
-def good_signatures(status_output: bytes, what: str) -> list[tuple[str, str]]:
+def good_signatures(status_output: bytes, what: str, source: str = "gpg status output") -> list[tuple[str, str]]:
     """validate_key_metadata.good_signatures, refusing what it cannot read as a release validation error."""
 
     try:
-        return key_metadata.good_signatures(status_output)
+        return key_metadata.good_signatures(status_output, source)
     except key_metadata.MetadataError as exc:
         raise ReleaseValidationError(f"{what}: {exc}") from exc
 
 
-def status_fingerprints(status_output: bytes, what: str = "gpg") -> list[str]:
+def status_fingerprints(status_output: bytes, what: str = "gpg", source: str = "gpg status output") -> list[str]:
     """Signing-key fingerprints of the good signatures (validate_key_metadata.good_signatures)."""
 
-    return [signing for signing, _primary in good_signatures(status_output, what)]
+    return [signing for signing, _primary in good_signatures(status_output, what, source)]
 
 
 def verify_detached_signature_file(
@@ -522,8 +523,12 @@ def verify_tag_signature(
 ) -> None:
     env = os.environ.copy()
     env["GNUPGHOME"] = str(gnupg_home)
+    # A tag object ID, or the tag's full ref name, which git finds before any
+    # other ref; core.warnAmbiguousRefs=false keeps git from warning about such
+    # refs on standard error, which must hold gpg's status lines only.
+    name = tag if OBJECT_ID_RE.fullmatch(tag) else f"refs/tags/{tag}"
     result = run_command(
-        ["git", "-c", f"gpg.program={gpg}", "verify-tag", "--raw", tag],
+        ["git", "-c", f"gpg.program={gpg}", "-c", "core.warnAmbiguousRefs=false", "verify-tag", "--raw", name],
         env=env,
         text=False,
     )
@@ -533,7 +538,7 @@ def verify_tag_signature(
             f"{key_metadata.shown(result.stdout)}{key_metadata.shown(result.stderr)}"
         )
     # --raw: gpg's status lines, and only those, on standard error.
-    valid_fingerprints = status_fingerprints(result.stderr, f"Release tag {tag}")
+    valid_fingerprints = status_fingerprints(result.stderr, f"Release tag {tag}", "git verify-tag --raw output")
     counted = sorted(set(valid_fingerprints) & policy.active_fingerprints)
     if not counted:
         raise ReleaseValidationError(

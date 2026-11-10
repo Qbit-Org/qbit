@@ -108,6 +108,10 @@ class GoodSignaturesTest(unittest.TestCase):
             ("EXPSIG", f"EXPSIG {key_id} x"),
             ("ERRSIG", f"ERRSIG {key_id} 22 10 00 1784156878 9 {SIGNING}"),
             ("NO_PUBKEY", f"NO_PUBKEY {key_id}"),
+            ("REVKEYSIG of a key with an empty user ID", f"REVKEYSIG {key_id} "),
+            ("EXPKEYSIG of a key with an empty user ID", f"EXPKEYSIG {key_id} "),
+            ("BADSIG of a key with an empty user ID", f"BADSIG {key_id} "),
+            ("EXPSIG of a key with an empty user ID", f"EXPSIG {key_id} "),
         ):
             with self.subTest(keyword=keyword):
                 status = NEWSIG + f"[GNUPG:] {line}\n".encode() + goodsig() + validsig()
@@ -157,7 +161,7 @@ class GoodSignaturesTest(unittest.TestCase):
             ("a line that is not a status line", ONE_GOOD_SIGNATURE + b"gpg: Good signature\n"),
             ("a status line without its keyword", ONE_GOOD_SIGNATURE + b"[GNUPG:] \n"),
             ("a lowercase keyword", ONE_GOOD_SIGNATURE + b"[GNUPG:] goodsig x\n"),
-            ("GOODSIG without a user ID", NEWSIG + f"[GNUPG:] GOODSIG {SIGNING[-16:]}\n".encode() + validsig()),
+            ("GOODSIG without the space before its user ID", NEWSIG + f"[GNUPG:] GOODSIG {SIGNING[-16:]}\n".encode() + validsig()),
             ("GOODSIG with a short key ID", NEWSIG + f"[GNUPG:] GOODSIG {SIGNING[-8:]} x\n".encode() + validsig()),
             ("GOODSIG with a lowercase key ID", NEWSIG + goodsig(SIGNING.lower()) + validsig()),
             ("VALIDSIG with too few fields", NEWSIG + goodsig() + b" ".join(validsig().split(b" ")[:-2]) + b"\n"),
@@ -172,6 +176,14 @@ class GoodSignaturesTest(unittest.TestCase):
                 with self.assertRaises(validate_key_metadata.GpgOutputError):
                     validate_key_metadata.good_signatures(status)
 
+    def test_names_the_line_it_cannot_read(self) -> None:
+        # git prints its own warnings on standard error too.
+        status = b"warning: refname 'v1.0.0' is ambiguous.\n" + ONE_GOOD_SIGNATURE
+        with self.assertRaisesRegex(
+            validate_key_metadata.GpgOutputError, "line 1 is not a gpg status line: \"warning: refname 'v1.0.0'"
+        ):
+            validate_key_metadata.good_signatures(status)
+
     def test_accepts_status_lines_it_does_not_read(self) -> None:
         status = (
             b"[GNUPG:] KEY_CONSIDERED " + PRIMARY.encode() + b" 0\n" + ONE_GOOD_SIGNATURE
@@ -179,6 +191,8 @@ class GoodSignaturesTest(unittest.TestCase):
         )
         self.assertEqual(validate_key_metadata.good_signatures(status), [(SIGNING, PRIMARY)])
         self.assertEqual(validate_key_metadata.good_signatures(b""), [])
+        # An empty user ID packet.
+        self.assertEqual(validate_key_metadata.good_signatures(NEWSIG + goodsig(user_id="") + validsig()), [(SIGNING, PRIMARY)])
 
     def test_takes_only_bytes(self) -> None:
         # Text mode would have turned a carriage return into a line feed already.

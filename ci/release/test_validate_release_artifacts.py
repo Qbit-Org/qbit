@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -759,6 +760,19 @@ class ValidateReleaseArtifactsTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_release_tag_signature_is_read_from_the_tag_ref(self) -> None:
+        # Branches named like the tag or like its ref make those names ambiguous
+        # to git, and git looks a bare name up as refs/<name> before refs/tags/<name>.
+        self.prepare_valid_staging()
+        repo = self.create_signed_tag_repo(self.signers[0])
+        for branch in (self.tag, f"refs/tags/{self.tag}"):
+            subprocess.run([GIT, "branch", branch], cwd=repo, check=True, capture_output=True)
+        subprocess.run([GIT, "update-ref", f"refs/{self.tag}", "HEAD"], cwd=repo, check=True, capture_output=True)
+
+        result = self.run_validator("--verify-tag-signature", cwd=repo)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_release_tag_signature_from_non_policy_key_fails(self) -> None:
         self.prepare_valid_staging()
         repo = self.create_signed_tag_repo(self.signers[3])
@@ -806,7 +820,7 @@ class ValidateReleaseArtifactsTest(unittest.TestCase):
         policy = validate_release_artifacts.load_release_policy(self.policy, self.keys_dir, "testnet")
         error = validate_release_artifacts.ReleaseValidationError
 
-        with self.assertRaisesRegex(error, "SHA256SUMS.operator-02.asc: gpg status output line 4 holds a line separator"):
+        with self.assertRaisesRegex(error, re.escape("SHA256SUMS.operator-02.asc: gpg status output line ") + r"\d+ holds a line separator other than a line feed \(U\+2028\)"):
             validate_release_artifacts.verify_manifest_signature_file(
                 GPG,
                 home,
@@ -818,7 +832,8 @@ class ValidateReleaseArtifactsTest(unittest.TestCase):
         previous = os.getcwd()
         os.chdir(repo)
         try:
-            with self.assertRaisesRegex(error, f"Release tag {self.tag}: gpg status output line 4 holds a line separator"):
+            pattern = re.escape(f"Release tag {self.tag}: git verify-tag --raw output line ") + r"\d+ holds a line separator other than a line feed \(U\+2028\)"
+            with self.assertRaisesRegex(error, pattern):
                 validate_release_artifacts.verify_tag_signature(GPG, home, self.tag, policy)
         finally:
             os.chdir(previous)

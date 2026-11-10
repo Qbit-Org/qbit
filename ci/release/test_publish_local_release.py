@@ -359,6 +359,7 @@ raise SystemExit(2)
             validator_dir / "validate_release_artifacts.py",
             r"""#!/usr/bin/env python3
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -377,10 +378,12 @@ def import_release_keys(gpg, gnupg_home, keys_dir, policy):
 
 
 def verify_tag_signature(gpg, gnupg_home, tag, policy):
-    # Like the real one: git verify-tag <tag> in the current directory. A tag
-    # object listed in FAKE_UNSIGNED_TAG_OBJECTS counts as unsigned.
+    # Like the real one: git verify-tag <tag object ID or refs/tags/<tag>> in
+    # the current directory. A tag object listed in FAKE_UNSIGNED_TAG_OBJECTS
+    # counts as unsigned.
+    name = tag if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", tag) else "refs/tags/" + tag
     resolved = subprocess.run(
-        ["git", "rev-parse", "--verify", "-q", tag + "^{tag}"], capture_output=True, text=True
+        ["git", "rev-parse", "--verify", "-q", name + "^{tag}"], capture_output=True, text=True
     ).stdout.strip()
     with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         log.write(f"verify-tag {tag} object={resolved}\n")

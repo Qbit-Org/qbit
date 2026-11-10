@@ -216,7 +216,12 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
             "--output", str(self.repo / directory / "operator-02.asc"), str(self.repo / directory / "gate.SHA256"),
         )
         self.commit("operator-02's approval, signed by operator-01")
-        self.assert_target_refused("operator-02.asc: gpg status output line 4 holds a line separator other than a line feed")
+        result = self.run_target()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertRegex(
+            result.stdout + result.stderr,
+            r"operator-02\.asc: gpg status output line \d+ holds a line separator other than a line feed \(U\+2028\)",
+        )
 
     def test_target_runs_isolated_from_files_beside_the_gate(self) -> None:
         # A module beside the gate in the base must not stand in for one it imports.

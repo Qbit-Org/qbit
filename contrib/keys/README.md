@@ -317,9 +317,12 @@ The validators and the gate read gpg's status output and key listings, and
 `git verify-tag --raw`, as bytes split at line feeds only. They refuse the
 whole output if it is not UTF-8, is not made of complete well-formed lines,
 or holds any other character that ends a line in Python (CR, VT, FF, U+001C
-to U+001E, U+0085, U+2028, U+2029): gpg prints some of these as they are in
-user IDs and notations. A certificate whose user ID holds one of them cannot
-be used.
+to U+001E, U+0085, U+2028, U+2029). gpg escapes the control characters among
+these but prints U+0085, U+2028 and U+2029 as they are, so a certificate whose
+user ID holds one of those cannot be used. A signature's notations and policy
+or keyserver URLs, if any, should be ASCII: gpg splits long notation data
+across lines without regard to UTF-8, and output that is not UTF-8 fails the
+whole check.
 
 Known limits:
 

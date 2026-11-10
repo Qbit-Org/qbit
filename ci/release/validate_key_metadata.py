@@ -511,11 +511,10 @@ class GpgOutputError(MetadataError):
     """Raised when gpg or git printed output that cannot be read unambiguously."""
 
 
-# gpg and git end each line of their output with a line feed. str.splitlines()
-# and str.split() also break lines or fields at these characters, and gpg
-# prints some of them as they are in user IDs and notation data, which the
-# owner of a key chooses: a reader that split there could be shown status lines
-# or records gpg never wrote. Output that holds any of them is refused.
+# gpg and git end each line of their output with a line feed; str.splitlines()
+# also ends a line at each of these, and gpg prints some of them as they are in
+# user IDs and notation data. Output that holds any of them is refused, so that
+# no reader can take it for more lines than gpg wrote.
 OTHER_LINE_SEPARATORS = frozenset("\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029")
 STATUS_PREFIX = "[GNUPG:] "
 STATUS_KEYWORD_RE = re.compile(r"[A-Z][A-Z0-9_]*")
@@ -564,13 +563,15 @@ def status_records(output: bytes, what: str = "gpg status output") -> list[tuple
     records: list[tuple[str, tuple[str, ...]]] = []
     for number, line in enumerate(output_lines(output, what), start=1):
         if not line.startswith(STATUS_PREFIX):
-            raise GpgOutputError(f"{what} line {number} is not a gpg status line")
+            shown_line = repr(line[:100]) + ("..." if len(line) > 100 else "")
+            raise GpgOutputError(f"{what} line {number} is not a gpg status line: {shown_line}")
         keyword, space, rest = line[len(STATUS_PREFIX):].partition(" ")
         if not STATUS_KEYWORD_RE.fullmatch(keyword):
             raise GpgOutputError(f"{what} line {number} has no status keyword")
         if keyword in KEY_AND_USER_ID_STATUS:
             key_id, space, user_id = rest.partition(" ")
-            if not STATUS_KEY_ID_RE.fullmatch(key_id) or not space or not user_id:
+            # An empty user ID packet gives an empty user ID.
+            if not STATUS_KEY_ID_RE.fullmatch(key_id) or not space:
                 raise GpgOutputError(f"{what} line {number}: malformed {keyword}")
             arguments: tuple[str, ...] = (key_id, user_id)
         elif keyword in STATUS_ARGUMENT_COUNTS:
@@ -591,7 +592,7 @@ def colon_records(output: bytes, what: str) -> list[list[str]]:
     return [line.split(":") for line in output_lines(output, what)]
 
 
-def good_signatures(status_output: bytes) -> list[tuple[str, str]]:
+def good_signatures(status_output: bytes, source: str = "gpg status output") -> list[tuple[str, str]]:
     """The signatures gpg's --status-fd output shows as good, as (signing, primary) fingerprints.
 
     A signature counts only when its GOODSIG and VALIDSIG agree on the key and
@@ -603,13 +604,13 @@ def good_signatures(status_output: bytes) -> list[tuple[str, str]]:
     """
 
     groups: list[list[tuple[str, tuple[str, ...]]]] = []
-    for keyword, arguments in status_records(status_output):
+    for keyword, arguments in status_records(status_output, source):
         if keyword == "NEWSIG":
             groups.append([])
         elif groups:
             groups[-1].append((keyword, arguments))
         elif keyword in SIGNATURE_RESULT_STATUS:
-            raise GpgOutputError(f"gpg status output reports {keyword} before any NEWSIG")
+            raise GpgOutputError(f"{source} reports {keyword} before any NEWSIG")
     good: list[tuple[str, str]] = []
     for group in groups:
         if REFUSED_SIGNATURE_STATUS & {keyword for keyword, _arguments in group}:
