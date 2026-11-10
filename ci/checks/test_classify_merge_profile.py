@@ -122,6 +122,17 @@ class ClassifyMergeProfileTest(unittest.TestCase):
                 outputs = classify_merge_profile.github_outputs(self.classify(paths))
                 self.assertEqual(outputs["touched_operator_keys"], "true")
 
+    def test_unquoted_paths_end_at_line_feeds_only(self) -> None:
+        # With core.quotePath=false git prints names as they are: only a line
+        # feed ends one, even where str.splitlines() would also split.
+        with tempfile.TemporaryDirectory() as tmp:
+            for separator in ("\x85", "\u2028", "\u2029"):
+                with self.subTest(separator=f"U+{ord(separator):04X}"):
+                    name = f"doc/a{separator}b.md"
+                    listing = Path(tmp) / "changed-files.txt"
+                    listing.write_bytes(f"{name}\nREADME.md\n".encode("utf8"))
+                    self.assertEqual(classify_merge_profile.load_changed_files(str(listing)), [name, "README.md"])
+
     def test_removed_guix_sigs_template_mirror_is_not_operator_key_policy(self) -> None:
         # contrib/keys/operator-keys is the only in-repo copy of the policy; a
         # file re-added under the old template mirror path gets the full

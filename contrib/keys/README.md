@@ -313,6 +313,14 @@ so signers whose signing keys share a primary key count once. Once a signing
 key expires its signatures stop counting, so refresh certificates before
 expiry (operator-01's primary key expires on 2028-06-07).
 
+The validators and the gate read gpg's status output and key listings, and
+`git verify-tag --raw`, as bytes split at line feeds only. They refuse the
+whole output if it is not UTF-8, is not made of complete well-formed lines,
+or holds any other character that ends a line in Python (CR, VT, FF, U+001C
+to U+001E, U+0085, U+2028, U+2029): gpg prints some of these as they are in
+user IDs and notations. A certificate whose user ID holds one of them cannot
+be used.
+
 Known limits:
 
 - Approvals do not expire. They sign the new `keys.json` digest, which names

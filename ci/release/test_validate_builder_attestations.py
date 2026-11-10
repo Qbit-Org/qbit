@@ -21,6 +21,24 @@ BUILDER_VALIDATOR = REPO_ROOT / "ci" / "release" / "validate_builder_attestation
 GPG = shutil.which("gpg")
 GIT = shutil.which("git")
 
+sys.path.insert(0, str(REPO_ROOT / "ci" / "release"))
+import validate_builder_attestations  # noqa: E402
+
+
+def forged_user_id(victim: str) -> str:
+    """A user ID that, split at U+2028, reads as gpg status lines of a good signature by `victim`."""
+
+    return "\u2028".join(
+        [
+            "forger",
+            "[GNUPG:] NEWSIG",
+            f"[GNUPG:] GOODSIG {victim[-16:]} victim",
+            f"[GNUPG:] VALIDSIG {victim} 2026-11-10 1794344931 0 4 0 22 10 00 {victim}",
+            "[GNUPG:] NEWSIG",
+            "forger <forger@example.invalid>",
+        ]
+    )
+
 
 @unittest.skipUnless(GPG and GIT, "gpg and git are required for builder attestation tests")
 class ValidateBuilderAttestationsTest(unittest.TestCase):
@@ -31,6 +49,7 @@ class ValidateBuilderAttestationsTest(unittest.TestCase):
         cls.secret_home = cls.tmp_path / "secret-gnupg"
         cls.secret_home.mkdir(mode=0o700)
         cls.builders = [cls.generate_builder(index) for index in range(1, 5)]
+        cls.forger = cls.generate_forger(cls.builders[1]["fingerprint"], "operator-05")
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -76,6 +95,23 @@ class ValidateBuilderAttestationsTest(unittest.TestCase):
             "alias": alias,
             "fingerprint": fingerprint,
         }
+
+    @classmethod
+    def generate_forger(cls, victim: str, alias: str) -> dict[str, str]:
+        """A builder whose user ID poses as gpg status lines of a good signature by `victim`."""
+
+        def fingerprints() -> set[str]:
+            listing = cls.gpg(["--batch", "--with-colons", "--fingerprint", "--list-keys"], home=cls.secret_home)
+            return {line.split(":")[9] for line in listing.stdout.split("\n") if line.startswith("fpr:")}
+
+        before = fingerprints()
+        cls.gpg(
+            ["--batch", "--pinentry-mode", "loopback", "--passphrase", "", "--quick-gen-key",
+             forged_user_id(victim), "ed25519", "sign", "never"],
+            home=cls.secret_home,
+        )
+        (fingerprint,) = fingerprints() - before
+        return {"alias": alias, "fingerprint": fingerprint}
 
     @classmethod
     def generate_shared_primary_signers(cls, name: str, aliases: list[str]) -> list[dict[str, str]]:
@@ -838,6 +874,51 @@ class ValidateBuilderAttestationsTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("core builder attestation quorum not met: got 1, need 2", result.stderr)
         self.assertIn("rejected=operator-03", result.stderr)
+
+    def stage_forged_attestations(self) -> dict[str, str]:
+        """operator-05 attests as itself and as operator-02, whose good signature its user ID poses as."""
+
+        victim = self.builders[1]
+        self.write_operator_policy([self.builders[0], victim, self.forger])
+        shutil.rmtree(self.guix_sigs_repo / self.version)
+        self.write_attestations(
+            [{"alias": victim["alias"], "fingerprint": self.forger["fingerprint"]}, self.forger],
+            "core",
+            [self.core_artifact],
+        )
+        signature = self.attestation_signature(victim, "core")
+        status = subprocess.run(
+            [GPG, "--homedir", str(self.secret_home), "--batch", "--trust-model", "always", "--status-fd", "1",
+             "--verify", str(signature), str(signature.with_suffix(""))],
+            check=True, capture_output=True,
+        ).stdout
+        # A reader splitting at U+2028 would see operator-02's good signature.
+        self.assertIn(f"[GNUPG:] GOODSIG {victim['fingerprint'][-16:]} victim", status.decode().splitlines())
+        return victim
+
+    def test_a_builder_whose_user_id_poses_as_another_builder_is_refused(self) -> None:
+        self.stage_forged_attestations()
+
+        result = self.run_builder_validator()
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("line separator other than a line feed (U+2028)", result.stderr)
+
+    def test_attestation_check_refuses_status_lines_a_user_id_adds(self) -> None:
+        victim = self.stage_forged_attestations()
+        home = self.root / "gnupg"
+        home.mkdir(mode=0o700)
+        for builder in (victim, self.forger):
+            self.gpg(["--batch", "--import", str(self.keys_dir / self.public_key_file(builder["alias"]))], home=home)
+        signature = self.attestation_signature(victim, "core")
+
+        with self.assertRaisesRegex(
+            validate_builder_attestations.BuilderValidationError,
+            "gpg status output line 4 holds a line separator other than a line feed",
+        ):
+            validate_builder_attestations.verify_manifest_signature(
+                GPG, home, signature.with_suffix(""), victim["fingerprint"]
+            )
 
     def test_core_and_photon_quorum_succeeds(self) -> None:
         self.write_release_sha256sums([self.core_artifact, self.photon_artifact])

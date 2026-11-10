@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -150,15 +151,20 @@ def active_release_signers(release_line: str) -> dict[str, str]:
     return active
 
 
-def status_fingerprints(status_output: str) -> list[str]:
-    fingerprints: list[str] = []
-    for line in status_output.splitlines():
-        if not line.startswith("[GNUPG:] VALIDSIG "):
-            continue
-        fields = line.split()
-        if len(fields) >= 3:
-            fingerprints.append(normalize_fingerprint(fields[2]))
-    return fingerprints
+def status_fingerprints(status_output: bytes) -> list[str]:
+    """The fingerprints gpg's VALIDSIG status lines name, read with the release validators' parser."""
+
+    path = REPO_ROOT / "ci" / "release" / "validate_key_metadata.py"
+    spec = importlib.util.spec_from_file_location("validate_key_metadata", path)
+    if spec is None or spec.loader is None:
+        raise VersionedSiteError(f"cannot load {path}")
+    key_metadata = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(key_metadata)
+    try:
+        records = key_metadata.status_records(status_output, "git verify-tag --raw output")
+    except key_metadata.GpgOutputError as exc:
+        raise VersionedSiteError(str(exc)) from exc
+    return [normalize_fingerprint(arguments[0]) for keyword, arguments in records if keyword == "VALIDSIG"]
 
 
 def verify_tag_signed_by_active_release_key(tag: str) -> None:
@@ -181,18 +187,19 @@ def verify_tag_signed_by_active_release_key(tag: str) -> None:
             *[str(keys_dir / path) for path in active_signers.values()],
         ]
         subprocess.run(import_command, check=True, capture_output=True, text=True)
+        # Bytes: text mode would also turn a carriage return into a line feed.
         result = subprocess.run(
             ["git", "-c", f"gpg.program={gpg}", "verify-tag", "--raw", tag],
             check=False,
             capture_output=True,
-            text=True,
             env={**os.environ, "GNUPGHOME": str(gnupg_home)},
         )
     if result.returncode != 0:
         raise VersionedSiteError(
             f"release tag was not signed by an active qbit release key: {tag}"
         )
-    counted = sorted(set(status_fingerprints(result.stdout + result.stderr)) & set(active_signers))
+    # --raw: gpg's status lines, and only those, on standard error.
+    counted = sorted(set(status_fingerprints(result.stderr)) & set(active_signers))
     if not counted:
         raise VersionedSiteError(
             f"release tag signature did not come from an active qbit release key: {tag}"

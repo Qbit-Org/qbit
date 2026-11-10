@@ -23,6 +23,24 @@ PUBLISH_LOCAL = REPO_ROOT / "contrib" / "release-process" / "publish-local-relea
 GPG = shutil.which("gpg")
 GIT = shutil.which("git")
 
+sys.path.insert(0, str(REPO_ROOT / "ci" / "release"))
+import validate_release_artifacts  # noqa: E402
+
+
+def forged_user_id(victim: str) -> str:
+    """A user ID that, split at U+2028, reads as gpg status lines of a good signature by `victim`."""
+
+    return "\u2028".join(
+        [
+            "forger",
+            "[GNUPG:] NEWSIG",
+            f"[GNUPG:] GOODSIG {victim[-16:]} victim",
+            f"[GNUPG:] VALIDSIG {victim} 2026-11-10 1794344931 0 4 0 22 10 00 {victim}",
+            "[GNUPG:] NEWSIG",
+            "forger <forger@example.invalid>",
+        ]
+    )
+
 
 @unittest.skipUnless(GPG and GIT, "gpg and git are required for release validation tests")
 class ValidateReleaseArtifactsTest(unittest.TestCase):
@@ -39,6 +57,7 @@ class ValidateReleaseArtifactsTest(unittest.TestCase):
             cls.generate_signer(4, "external-01"),
             cls.generate_signer(5, "revoked-01"),
         ]
+        cls.forger = cls.generate_forger(cls.signers[1]["fingerprint"], "operator-04")
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -91,6 +110,23 @@ class ValidateReleaseArtifactsTest(unittest.TestCase):
         if faked_time:
             signer["faked_time"] = faked_time
         return signer
+
+    @classmethod
+    def generate_forger(cls, victim: str, alias: str) -> dict[str, str]:
+        """A signer whose user ID poses as gpg status lines of a good signature by `victim`."""
+
+        def fingerprints() -> set[str]:
+            listing = cls.gpg(["--batch", "--with-colons", "--fingerprint", "--list-keys"], home=cls.secret_home)
+            return {line.split(":")[9] for line in listing.stdout.split("\n") if line.startswith("fpr:")}
+
+        before = fingerprints()
+        cls.gpg(
+            ["--batch", "--pinentry-mode", "loopback", "--passphrase", "", "--quick-gen-key",
+             forged_user_id(victim), "ed25519", "sign", "never"],
+            home=cls.secret_home,
+        )
+        (fingerprint,) = fingerprints() - before
+        return {"alias": alias, "fingerprint": fingerprint, "public_key_file": f"public-keys/{alias}-release.asc"}
 
     @classmethod
     def generate_shared_primary_signers(cls, name: str, aliases: list[str]) -> list[dict[str, str]]:
@@ -731,6 +767,61 @@ class ValidateReleaseArtifactsTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1)
         self.assertIn("not signed by an active qbit release key", result.stderr)
+
+
+    def stage_forged_signatures(self) -> dict[str, str]:
+        """operator-04 signs SHA256SUMS as itself and as operator-02, whose good signature its user ID poses as."""
+
+        victim = self.signers[1]
+        self.export_public_keys([self.forger])
+        self.write_policy([self.signers[0], victim, self.forger], quorum=2, set_size=3)
+        name = f"qbit-{self.version}-x86_64-linux-gnu.tar.gz"
+        self.write_artifact(name)
+        self.write_sha256sums([name])
+        self.sign_manifest([self.forger, self.forger], output_aliases=["operator-02", "operator-04"])
+        self.write_combined_signature(["operator-02", "operator-04"])
+        status = subprocess.run(
+            [GPG, "--homedir", str(self.secret_home), "--batch", "--trust-model", "always", "--status-fd", "1",
+             "--verify", str(self.artifacts_dir / "SHA256SUMS.operator-02.asc"), str(self.artifacts_dir / "SHA256SUMS")],
+            check=True, capture_output=True,
+        ).stdout
+        # A reader splitting at U+2028 would see operator-02's good signature.
+        self.assertIn(f"[GNUPG:] GOODSIG {victim['fingerprint'][-16:]} victim", status.decode().splitlines())
+        return victim
+
+    def test_a_signer_whose_user_id_poses_as_another_signer_is_refused(self) -> None:
+        self.stage_forged_signatures()
+
+        result = self.run_validator()
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("line separator other than a line feed (U+2028)", result.stderr)
+
+    def test_signature_checks_refuse_status_lines_a_user_id_adds(self) -> None:
+        victim = self.stage_forged_signatures()
+        home = self.root / "gnupg"
+        home.mkdir(mode=0o700)
+        for signer in (victim, self.forger):
+            self.gpg(["--batch", "--import", str(self.keys_dir / signer["public_key_file"])], home=home)
+        policy = validate_release_artifacts.load_release_policy(self.policy, self.keys_dir, "testnet")
+        error = validate_release_artifacts.ReleaseValidationError
+
+        with self.assertRaisesRegex(error, "SHA256SUMS.operator-02.asc: gpg status output line 4 holds a line separator"):
+            validate_release_artifacts.verify_manifest_signature_file(
+                GPG,
+                home,
+                self.artifacts_dir / "SHA256SUMS.operator-02.asc",
+                self.artifacts_dir / "SHA256SUMS",
+                next(signer for signer in policy.release_signers if signer.alias == "operator-02"),
+            )
+        repo = self.create_signed_tag_repo(self.forger)
+        previous = os.getcwd()
+        os.chdir(repo)
+        try:
+            with self.assertRaisesRegex(error, f"Release tag {self.tag}: gpg status output line 4 holds a line separator"):
+                validate_release_artifacts.verify_tag_signature(GPG, home, self.tag, policy)
+        finally:
+            os.chdir(previous)
 
 
 class ReleasePublisherBoundaryTest(unittest.TestCase):

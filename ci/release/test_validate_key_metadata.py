@@ -68,28 +68,49 @@ import validate_key_metadata  # noqa: E402
 
 SIGNING = "A" * 24 + "0123456789ABCDEF"
 PRIMARY = "C" * 40
+VICTIM = "E" * 24 + "FEDCBA9876543210"
+# Every character str.splitlines() ends a line at, besides the line feed.
+OTHER_LINE_SEPARATORS = ["\r", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"]
 
 
-def validsig(signing: str = SIGNING, primary: str | None = PRIMARY) -> str:
+def validsig(signing: str = SIGNING, primary: str | None = PRIMARY) -> bytes:
     fields = [signing, "2026-07-15", "1784156878", "0", "4", "0", "22", "10", "00"] + ([primary] if primary else [])
-    return "[GNUPG:] VALIDSIG " + " ".join(fields) + "\n"
+    return ("[GNUPG:] VALIDSIG " + " ".join(fields) + "\n").encode()
 
 
-def goodsig(signing: str = SIGNING) -> str:
-    return f"[GNUPG:] GOODSIG {signing[-16:]} signer <signer@example.invalid>\n"
+def goodsig(signing: str = SIGNING, user_id: str = "signer <signer@example.invalid>") -> bytes:
+    return f"[GNUPG:] GOODSIG {signing[-16:]} {user_id}\n".encode()
+
+
+NEWSIG = b"[GNUPG:] NEWSIG\n"
+ONE_GOOD_SIGNATURE = NEWSIG + b"[GNUPG:] KEY_CONSIDERED " + PRIMARY.encode() + b" 0\n" + goodsig() + validsig()
+
+
+def forged_user_id(separator: str, victim: str = VICTIM) -> str:
+    """A user ID that, split at `separator`, adds a good signature by `victim` to the status output."""
+
+    fake = ["[GNUPG:] NEWSIG", goodsig(victim, "victim").decode()[:-1], validsig(victim, victim).decode()[:-1], "[GNUPG:] NEWSIG"]
+    return separator.join(["signer", *fake, "signer <signer@example.invalid>"])
 
 
 class GoodSignaturesTest(unittest.TestCase):
     """A signature counts only when GOODSIG and VALIDSIG agree and nothing refuses it."""
 
     def test_counts_an_agreeing_goodsig_and_validsig(self) -> None:
-        status = "[GNUPG:] NEWSIG\n" + goodsig() + validsig()
-        self.assertEqual(validate_key_metadata.good_signatures(status), [(SIGNING, PRIMARY)])
+        self.assertEqual(validate_key_metadata.good_signatures(ONE_GOOD_SIGNATURE), [(SIGNING, PRIMARY)])
 
     def test_refuses_revoked_expired_and_unverifiable_keys(self) -> None:
-        for keyword in ("REVKEYSIG", "EXPKEYSIG", "ERRSIG", "BADSIG", "EXPSIG", "NO_PUBKEY"):
+        key_id = SIGNING[-16:]
+        for keyword, line in (
+            ("REVKEYSIG", f"REVKEYSIG {key_id} x"),
+            ("EXPKEYSIG", f"EXPKEYSIG {key_id} x"),
+            ("BADSIG", f"BADSIG {key_id} x"),
+            ("EXPSIG", f"EXPSIG {key_id} x"),
+            ("ERRSIG", f"ERRSIG {key_id} 22 10 00 1784156878 9 {SIGNING}"),
+            ("NO_PUBKEY", f"NO_PUBKEY {key_id}"),
+        ):
             with self.subTest(keyword=keyword):
-                status = f"[GNUPG:] NEWSIG\n[GNUPG:] {keyword} {SIGNING[-16:]} x\n" + goodsig() + validsig()
+                status = NEWSIG + f"[GNUPG:] {line}\n".encode() + goodsig() + validsig()
                 self.assertEqual(validate_key_metadata.good_signatures(status), [])
 
     def test_refuses_disagreeing_or_incomplete_records(self) -> None:
@@ -101,15 +122,96 @@ class GoodSignaturesTest(unittest.TestCase):
             ("two GOODSIG lines for one signature", goodsig() + goodsig() + validsig()),
         ):
             with self.subTest(name=name):
-                self.assertEqual(validate_key_metadata.good_signatures("[GNUPG:] NEWSIG\n" + status), [])
+                self.assertEqual(validate_key_metadata.good_signatures(NEWSIG + status), [])
 
     def test_judges_each_signature_on_its_own(self) -> None:
         other = "D" * 24 + "FEDCBA9876543210"
         status = (
-            "[GNUPG:] NEWSIG\n" + goodsig() + validsig()
-            + "[GNUPG:] NEWSIG\n" + f"[GNUPG:] REVKEYSIG {other[-16:]} x\n" + goodsig(other) + validsig(other)
+            NEWSIG + goodsig() + validsig()
+            + NEWSIG + f"[GNUPG:] REVKEYSIG {other[-16:]} x\n".encode() + goodsig(other) + validsig(other)
         )
         self.assertEqual(validate_key_metadata.good_signatures(status), [(SIGNING, PRIMARY)])
+
+    def test_a_user_id_cannot_add_status_lines(self) -> None:
+        # gpg escapes the C0 controls among these in status lines, but prints
+        # U+0085, U+2028 and U+2029 as they are in the user ID.
+        for separator in OTHER_LINE_SEPARATORS:
+            with self.subTest(separator=f"U+{ord(separator):04X}"):
+                status = NEWSIG + goodsig(user_id=forged_user_id(separator)) + validsig()
+                # What a reader that splits at this character would see.
+                self.assertIn(validsig(VICTIM, VICTIM).decode()[:-1], status.decode().splitlines())
+                with self.assertRaisesRegex(validate_key_metadata.GpgOutputError, "line separator other than a line feed"):
+                    validate_key_metadata.good_signatures(status)
+
+    def test_other_status_lines_cannot_hold_line_separators_either(self) -> None:
+        for separator in OTHER_LINE_SEPARATORS:
+            with self.subTest(separator=f"U+{ord(separator):04X}"):
+                notation = f"[GNUPG:] NOTATION_DATA a{separator}[GNUPG:]%20NEWSIG\n".encode()
+                with self.assertRaises(validate_key_metadata.GpgOutputError):
+                    validate_key_metadata.good_signatures(ONE_GOOD_SIGNATURE + notation)
+
+    def test_refuses_output_it_cannot_read_exactly(self) -> None:
+        for name, status in (
+            ("not UTF-8", NEWSIG + goodsig()[:-1] + b"\xff\n" + validsig()),
+            ("no line feed at the end", ONE_GOOD_SIGNATURE[:-1]),
+            ("a line that is not a status line", ONE_GOOD_SIGNATURE + b"gpg: Good signature\n"),
+            ("a status line without its keyword", ONE_GOOD_SIGNATURE + b"[GNUPG:] \n"),
+            ("a lowercase keyword", ONE_GOOD_SIGNATURE + b"[GNUPG:] goodsig x\n"),
+            ("GOODSIG without a user ID", NEWSIG + f"[GNUPG:] GOODSIG {SIGNING[-16:]}\n".encode() + validsig()),
+            ("GOODSIG with a short key ID", NEWSIG + f"[GNUPG:] GOODSIG {SIGNING[-8:]} x\n".encode() + validsig()),
+            ("GOODSIG with a lowercase key ID", NEWSIG + goodsig(SIGNING.lower()) + validsig()),
+            ("VALIDSIG with too few fields", NEWSIG + goodsig() + b" ".join(validsig().split(b" ")[:-2]) + b"\n"),
+            ("VALIDSIG with too many fields", NEWSIG + goodsig() + validsig()[:-1] + b" extra\n"),
+            ("VALIDSIG with an empty field", NEWSIG + goodsig() + validsig().replace(b" 0 ", b"  ", 1)),
+            ("ERRSIG with too few fields", NEWSIG + f"[GNUPG:] ERRSIG {SIGNING[-16:]} x\n".encode()),
+            ("NO_PUBKEY with two fields", NEWSIG + f"[GNUPG:] NO_PUBKEY {SIGNING[-16:]} x\n".encode()),
+            ("NEWSIG with two fields", b"[GNUPG:] NEWSIG a b\n" + goodsig() + validsig()),
+            ("a signature before any NEWSIG", goodsig() + validsig()),
+        ):
+            with self.subTest(name=name):
+                with self.assertRaises(validate_key_metadata.GpgOutputError):
+                    validate_key_metadata.good_signatures(status)
+
+    def test_accepts_status_lines_it_does_not_read(self) -> None:
+        status = (
+            b"[GNUPG:] KEY_CONSIDERED " + PRIMARY.encode() + b" 0\n" + ONE_GOOD_SIGNATURE
+            + b"[GNUPG:] TRUST_UNDEFINED 0 pgp\n" + b"[GNUPG:] VERIFICATION_COMPLIANCE_MODE 23\n"
+        )
+        self.assertEqual(validate_key_metadata.good_signatures(status), [(SIGNING, PRIMARY)])
+        self.assertEqual(validate_key_metadata.good_signatures(b""), [])
+
+    def test_takes_only_bytes(self) -> None:
+        # Text mode would have turned a carriage return into a line feed already.
+        with self.assertRaises(TypeError):
+            validate_key_metadata.good_signatures(ONE_GOOD_SIGNATURE.decode())
+
+
+class ColonRecordsTest(unittest.TestCase):
+    """--with-colons listings split into records at line feeds only.
+
+    gpg escapes colons in a listed user ID, so a user ID cannot spell out a
+    whole record there; a listing that holds another line separator is still
+    refused, as anything ambiguous is.
+    """
+
+    LISTING = (
+        b"pub:-:255:22:" + PRIMARY[-16:].encode() + b":1784156878:::-:::cSC:::::ed25519:::0:\n"
+        b"fpr:::::::::" + PRIMARY.encode() + b":\n"
+    )
+
+    def test_reads_records(self) -> None:
+        records = validate_key_metadata.colon_records(self.LISTING, "listing")
+        self.assertEqual([record[0] for record in records], ["pub", "fpr"])
+        self.assertEqual(records[1][9], PRIMARY)
+
+    def test_a_user_id_cannot_add_records(self) -> None:
+        for separator in OTHER_LINE_SEPARATORS:
+            with self.subTest(separator=f"U+{ord(separator):04X}"):
+                uid = f"uid:-::::1784156878::{'1' * 40}::signer{separator}fpr:::::::::{VICTIM}::::::::::0:\n"
+                listing = self.LISTING + uid.encode()
+                self.assertIn(VICTIM, [line.split(":")[9] for line in listing.decode().splitlines() if line.startswith("fpr:")])
+                with self.assertRaisesRegex(validate_key_metadata.GpgOutputError, "line separator other than a line feed"):
+                    validate_key_metadata.colon_records(listing, "listing")
 
 
 class ValidateKeyMetadataTest(unittest.TestCase):
@@ -122,6 +224,7 @@ class ValidateKeyMetadataTest(unittest.TestCase):
         if GPG:
             cls.secret_home.mkdir(mode=0o700)
             cls.gpg_signers = [cls.generate_signer(index) for index in range(1, 5)]
+            cls.forger = cls.generate_forger(cls.gpg_signers[1]["fingerprint"])
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -177,6 +280,36 @@ class ValidateKeyMetadataTest(unittest.TestCase):
             if line.startswith("fpr:")
         )
         return {"alias": f"operator-{index:02d}", "fingerprint": fingerprint}
+
+    @classmethod
+    def generate_forger(cls, victim: str) -> dict[str, str]:
+        """A signer whose user ID, split at U+2028, reads as gpg status lines of a good signature by `victim`."""
+
+        def fingerprints() -> set[str]:
+            listing = cls.gpg(["--batch", "--with-colons", "--fingerprint", "--list-keys"], home=cls.secret_home)
+            return {line.split(":")[9] for line in listing.stdout.split("\n") if line.startswith("fpr:")}
+
+        before = fingerprints()
+        cls.gpg(
+            ["--batch", "--pinentry-mode", "loopback", "--passphrase", "", "--quick-gen-key",
+             forged_user_id("\u2028", victim), "ed25519", "sign", "never"],
+            home=cls.secret_home,
+        )
+        (fingerprint,) = fingerprints() - before
+        return {"fingerprint": fingerprint}
+
+    def assert_status_poses_as(self, signature: Path, data: Path, victim: str) -> None:
+        """gpg's status output for `signature` shows `victim`'s good signature to a reader that splits at U+2028."""
+
+        result = subprocess.run(
+            [GPG, "--homedir", str(self.secret_home), "--batch", "--trust-model", "always", "--status-fd", "1",
+             "--verify", str(signature), str(data)],
+            check=False, capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(validsig(victim, victim).decode()[:-1], result.stdout.decode().splitlines())
+        with self.assertRaises(validate_key_metadata.GpgOutputError):
+            validate_key_metadata.good_signatures(result.stdout)
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -598,6 +731,58 @@ class ValidateKeyMetadataTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1)
         self.assertIn("was signed by unexpected fingerprint", result.stderr)
+
+    @unittest.skipUnless(GPG, "gpg is required for policy approval signature tests")
+    def test_rejects_an_approval_by_a_signer_whose_user_id_poses_as_another(self) -> None:
+        # operator-03 signs its own approval and operator-02's.
+        victim = self.gpg_signers[1]["fingerprint"]
+        fingerprints = [self.gpg_signers[0]["fingerprint"], victim, self.forger["fingerprint"]]
+        self.write_previous_policy(valid_policy(fingerprints=fingerprints), export_public_files=True)
+        policy = valid_policy(
+            sequence=2, previous_policy_sha256=self.policy_sha256(self.previous_policy), fingerprints=fingerprints
+        )
+        self.write_policy(policy, write_public_files=True, export_public_files=True)
+        forger = self.forger["fingerprint"]
+        approval_dir = self.write_approval_dir(
+            policy, ["operator-02", "operator-03"], signer_fingerprints={"operator-02": forger, "operator-03": forger}
+        )
+        self.assert_status_poses_as(approval_dir / "operator-02.asc", approval_dir / "policy.SHA256", victim)
+
+        result = self.run_validator(
+            "--previous-operator-policy",
+            str(self.previous_policy),
+            "--approval-dir",
+            str(approval_dir),
+            mirror=False,
+        )
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("line separator other than a line feed (U+2028)", result.stderr)
+
+    @unittest.skipUnless(GPG, "gpg is required for policy approval signature tests")
+    def test_counts_approvals_by_their_true_signers(self) -> None:
+        victim = self.gpg_signers[1]["fingerprint"]
+        fingerprints = [self.gpg_signers[0]["fingerprint"], victim, self.forger["fingerprint"]]
+        self.write_previous_policy(valid_policy(fingerprints=fingerprints), export_public_files=True)
+        policy = valid_policy(
+            sequence=2, previous_policy_sha256=self.policy_sha256(self.previous_policy), fingerprints=fingerprints
+        )
+        self.write_policy(policy, write_public_files=True, export_public_files=True)
+        approval_dir = self.write_approval_dir(
+            policy,
+            ["operator-01", "operator-02"],
+            signer_fingerprints={"operator-01": fingerprints[0], "operator-02": victim},
+        )
+
+        result = self.run_validator(
+            "--previous-operator-policy",
+            str(self.previous_policy),
+            "--approval-dir",
+            str(approval_dir),
+            mirror=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_rejects_stale_previous_policy_hash(self) -> None:
         self.write_previous_policy()
