@@ -1003,12 +1003,10 @@ bool CWallet::Unlock(const SecureString& strWalletPassphrase, bool run_pending_i
 
 bool CWallet::ChangeWalletPassphrase(const SecureString& strOldWalletPassphrase, const SecureString& strNewWalletPassphrase)
 {
-    bool fWasLocked = IsLocked();
     bool changed{false};
 
     {
         LOCK(m_relock_mutex);
-        Lock();
 
         CKeyingMaterial plain_master_key;
         {
@@ -1018,7 +1016,13 @@ bool CWallet::ChangeWalletPassphrase(const SecureString& strOldWalletPassphrase,
                 if (!DecryptMasterKey(strOldWalletPassphrase, master_key, plain_master_key)) {
                     return false;
                 }
-                if (Unlock(plain_master_key))
+                // Check the decrypted master key against the wallet's keys
+                // instead of unlocking the wallet with it. The master key
+                // itself does not change, so the wallet keeps its lock state.
+                const bool key_matches{std::all_of(m_spk_managers.begin(), m_spk_managers.end(), [&](const auto& spk_man_pair) {
+                    return spk_man_pair.second->CheckDecryptionKey(plain_master_key);
+                })};
+                if (key_matches)
                 {
                     if (!EncryptMasterKey(strNewWalletPassphrase, plain_master_key, master_key)) {
                         return false;
@@ -1030,10 +1034,6 @@ bool CWallet::ChangeWalletPassphrase(const SecureString& strOldWalletPassphrase,
                     break;
                 }
             }
-        }
-
-        if (fWasLocked) {
-            Lock();
         }
     }
 
