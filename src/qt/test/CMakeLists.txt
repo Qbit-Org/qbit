@@ -33,6 +33,7 @@ if(ENABLE_WALLET)
     PRIVATE
       addressbooktests.cpp
       psbtoperationsdialogtests.cpp
+      quitmodaltests.cpp
       syntheticwallet.cpp
       transactionrecordtests.cpp
       walletcontrollertests.cpp
