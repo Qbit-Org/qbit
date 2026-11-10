@@ -62,6 +62,12 @@ MANIFEST_PATH = Path("test/functional/data/rpc_perf_manifest.json")
 HELPER_PATH = Path("ci/ibd-perf-lanes.sh")
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 
+# Upper bound on the minutes a nightly 32 bit ARM shard spends before its first
+# test: image, depends, configure and compile in an emulated arm64 container
+# without a restored ccache or depends cache. Measured at 147-166 minutes across
+# five shard jobs in November 2026; lower it once the build is cached or shared.
+ARM_BUILD_MINUTES_MAX = 170
+
 
 # ---------------------------------------------------------------------------
 # YAML loading
@@ -969,6 +975,65 @@ class ScheduledValidationContractTest(unittest.TestCase):
                 self.assertNotIn("QBIT_FUZZ_MUTATE_MIN_TIME", other.get("env") or {}, job_id)
         for key in ("ibd", "rpc"):
             self.assertNotIn("QBIT_FUZZ_MUTATE_MIN_TIME", self.workflow_text[key])
+
+    def test_nightly_arm_shards_fit_their_job_deadline(self) -> None:
+        """The emulated ARM shards get a deadline that covers build plus tests.
+
+        Each shard spends up to ARM_BUILD_MINUTES_MAX building before ctest
+        starts, and ctest may then run one test for up to the per-test timeout
+        (TEST_RUNNER_TIMEOUT_FACTOR minutes, see ci/test/03_test_script.sh).
+        Both must fit inside the job's effective timeout-minutes. The shards'
+        include ranges must together cover every registered test.
+        """
+        workflow = self.workflows["nightly"]
+        context, _outputs = self.resolve_schedule("nightly")
+        job = workflow["jobs"]["nightly-matrix"]
+        include = job["strategy"]["matrix"]["include"]
+        arm = [entry for entry in include if entry["file-env"].endswith("/00_setup_env_arm.sh")]
+        self.assertEqual(
+            sorted(entry["name"] for entry in arm),
+            [f"32 bit ARM, unit tests shard {n}/2, no functional tests" for n in (1, 2)],
+        )
+
+        # The factor's only source is the 00_setup_env.sh default: neither the
+        # ARM env file nor the workflow may override it.
+        setup_env = (REPO_ROOT / "ci" / "test" / "00_setup_env.sh").read_text(encoding="utf8")
+        default_factor = re.search(
+            r"^\s*export\s+TEST_RUNNER_TIMEOUT_FACTOR=[\"']?\$\{TEST_RUNNER_TIMEOUT_FACTOR:-[\"']?(\d+)[\"']?\}[\"']?\s*(?:#.*)?$",
+            setup_env,
+            re.M,
+        )
+        self.assertIsNotNone(default_factor, "TEST_RUNNER_TIMEOUT_FACTOR default not found in ci/test/00_setup_env.sh")
+        factor_minutes = int(default_factor.group(1))
+        arm_env = (REPO_ROOT / "ci" / "test" / "00_setup_env_arm.sh").read_text(encoding="utf8")
+        self.assertNotIn("TEST_RUNNER_TIMEOUT_FACTOR", arm_env)
+
+        # ctest's per-test timeout is the factor in minutes, and the shard
+        # range reaches ctest as its include filter.
+        test_script = (REPO_ROOT / "ci" / "test" / "03_test_script.sh").read_text(encoding="utf8")
+        self.assertRegex(
+            test_script,
+            r"--timeout\s+[\"']?\$\(\(\s*[\"']?\$?\{?TEST_RUNNER_TIMEOUT_FACTOR\}?[\"']?\s*\*\s*60\s*\)\)[\"']?",
+        )
+        self.assertRegex(test_script, r"-I\s+[\"']?\$\{?CTEST_INCLUDE_RANGE\}?[\"']?")
+
+        ranges = []
+        for entry in arm:
+            entry_context = dict(context, matrix=entry)
+            env = job_env(workflow, job, entry_context)
+            start, end = (int(part) for part in env["CTEST_INCLUDE_RANGE"].split(","))
+            ranges.append((start, end))
+            with self.subTest(matrix=entry["name"]):
+                self.assertNotIn("TEST_RUNNER_TIMEOUT_FACTOR", env)
+                minutes = render(job["timeout-minutes"], entry_context)
+                self.assertIsInstance(minutes, int)
+                self.assertLess(ARM_BUILD_MINUTES_MAX + factor_minutes, minutes)
+
+        ranges.sort()
+        self.assertEqual(ranges[0][0], 1)
+        for (_, previous_end), (next_start, _) in zip(ranges, ranges[1:]):
+            self.assertEqual(next_start, previous_end + 1)
+        self.assertGreaterEqual(ranges[-1][1], 99999)
 
     def test_expression_evaluator_matches_actions_semantics(self) -> None:
         context = {"github": {"event_name": "schedule", "ref": "refs/heads/main"}, "inputs": {}}

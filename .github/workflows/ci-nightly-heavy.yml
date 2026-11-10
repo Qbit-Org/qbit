@@ -167,14 +167,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The 32 bit ARM shards run in an emulated arm64 container on x64
+          # runners and nightly runs restore no ccache or depends cache, so
+          # each shard spends 147-166 minutes building (image, depends,
+          # configure, compile) before its first test. Shard 1 tests take
+          # ~14 minutes and shard 2 ~30 (bounded by the slowest wallet P2MR
+          # suite, ~24 minutes, behind the 40 minute per-test ctest timeout).
+          # 300 minutes keeps the slowest observed shard near 70% of its limit.
           - name: '32 bit ARM, unit tests shard 1/2, no functional tests'
-            timeout-minutes: 180
+            timeout-minutes: 300
             file-env: './ci/test/00_setup_env_arm.sh'
             ctest_include_range: '1,139'
             container-cpus: '8'
             container-memory: '48g'
           - name: '32 bit ARM, unit tests shard 2/2, no functional tests'
-            timeout-minutes: 180
+            timeout-minutes: 300
             file-env: './ci/test/00_setup_env_arm.sh'
             ctest_include_range: '140,99999'
             container-cpus: '8'
