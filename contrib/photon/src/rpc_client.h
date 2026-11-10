@@ -16,6 +16,7 @@ enum class SubmitOutcome : std::uint8_t {
     kDuplicate,    ///< The node already had the block.
     kInconclusive, ///< The node stored the block but did not (yet) make it part of its best chain.
     kRejected,     ///< The node rejected the block (BIP22 reason or block decode error).
+    kKnownInvalid, ///< The node had already marked a block with this hash invalid.
     kTimeout,      ///< No usable response: timeout, connection failure or a malformed HTTP reply.
     kError,        ///< The node answered with an error that is not a verdict on the block.
 };

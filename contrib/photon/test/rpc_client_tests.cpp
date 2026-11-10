@@ -630,6 +630,7 @@ void TestSubmitBlockOutcomes()
     const std::vector<Case> cases{
         {JsonResult("null"), 0, photon::SubmitOutcome::kAccepted},
         {JsonResult(R"("duplicate")"), 0, photon::SubmitOutcome::kDuplicate},
+        {JsonResult(R"("duplicate-invalid")"), 0, photon::SubmitOutcome::kKnownInvalid},
         {JsonResult(R"("inconclusive")"), 0, photon::SubmitOutcome::kInconclusive},
         {JsonResult(R"("high-hash")"), 0, photon::SubmitOutcome::kRejected},
         {JsonError(-22, "Block decode failed"), 0, photon::SubmitOutcome::kRejected},

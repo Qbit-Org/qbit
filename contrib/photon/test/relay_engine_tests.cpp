@@ -1691,6 +1691,44 @@ void TestBufferedChunksCheckedBeforeEviction()
     Require(PeerStats(engine, 0)->faults == 1, "the bad block should count against the peer");
 }
 
+void TestKnownInvalidBlockSettledForAllCopies()
+{
+    MockClock clock{};
+    RelayEngine engine(clock);
+    CapturingSubmitter submitter;
+    submitter.submit_result = SubmitOutcome::kKnownInvalid;
+
+    const TestBlock block = EncodeTestBlock(300, 0xF860);
+    DeliverBlock(engine, kPeer0, block, submitter);
+    DeliverBlock(engine, kPeer1, block, submitter);
+    Require(submitter.submit_calls == 1, "a block the node holds as invalid should be submitted once");
+    Require(engine.stats().submit_rejected == 1, "it counts as rejected");
+    Require(PeerStats(engine, 0)->faults == 1, "and against the first sender");
+}
+
+void TestHandledBlockTimedAfterNodeCalls()
+{
+    MockClock clock{};
+    RelayEngine engine(clock);
+    CapturingSubmitter submitter;
+    submitter.submit_result = SubmitOutcome::kRejected;
+    // The node takes longer to answer than the time remaining chunks are ignored for.
+    submitter.check_hook = [&clock] { clock.Advance(std::chrono::seconds{6}); };
+    submitter.submit_hook = [&clock](std::span<const std::uint8_t>) {
+        clock.Advance(std::chrono::seconds{6});
+        return SubmitOutcome::kRejected;
+    };
+
+    const TestBlock block = EncodeTestBlock(300, 0xF870);
+    DeliverBlock(engine, kPeer0, block, submitter);
+    submitter.check_hook = {};
+    // The sender's remaining chunks, read after the node calls return, are still ignored.
+    for (std::size_t i = block.encoded.params.data_chunks; i < 20; ++i) {
+        engine.OnBlockChunk(kPeer0, BuildChunkPayload(block.encoded.chunks[i], block.prefix), submitter);
+    }
+    Require(engine.stats().inbound_entries == 0, "remaining chunks must not start a new incomplete block");
+}
+
 #if defined(PHOTON_TEST_HAVE_MALLINFO2)
 std::size_t HeapInUse()
 {
@@ -1894,6 +1932,8 @@ int RunAllTests()
         {"repeated_preheader_chunks_not_buffered", TestRepeatedPreHeaderChunksNotBuffered},
         {"malformed_headers_count_against_peer", TestMalformedHeadersCountAgainstPeer},
         {"buffered_chunks_checked_before_eviction", TestBufferedChunksCheckedBeforeEviction},
+        {"known_invalid_block_settled_for_all_copies", TestKnownInvalidBlockSettledForAllCopies},
+        {"handled_block_timed_after_node_calls", TestHandledBlockTimedAfterNodeCalls},
     };
 
     int failures = 0;

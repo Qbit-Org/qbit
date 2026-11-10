@@ -381,13 +381,16 @@ std::optional<std::string> ReadResponse(int fd, Deadline deadline)
 
     while (true) {
         // Re-arm the receive timeout with what is left, so a slow reply cannot outlast the deadline.
+        // Past the deadline, only a reply that has already arrived in full is still taken.
         const auto timeout = RemainingTimeout(deadline);
-        if (!timeout.has_value()) {
-            return std::nullopt;
+        int flags = 0;
+        if (timeout.has_value()) {
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &*timeout, sizeof(*timeout));
+        } else {
+            flags = MSG_DONTWAIT;
         }
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &*timeout, sizeof(*timeout));
 
-        const ssize_t bytes = recv(fd, buffer.data(), buffer.size(), 0);
+        const ssize_t bytes = recv(fd, buffer.data(), buffer.size(), flags);
         if (bytes == 0) {
             break;
         }
@@ -420,6 +423,8 @@ const char* SubmitOutcomeName(SubmitOutcome outcome)
         return "inconclusive";
     case SubmitOutcome::kRejected:
         return "rejected";
+    case SubmitOutcome::kKnownInvalid:
+        return "known_invalid";
     case SubmitOutcome::kTimeout:
         return "timeout";
     case SubmitOutcome::kError:
@@ -526,6 +531,9 @@ SubmitOutcome RpcClient::SubmitBlock(std::span<const std::uint8_t> block_data)
     }
     if (result_field.kind != JsonFieldKind::kString) {
         return SubmitOutcome::kError;
+    }
+    if (result_field.string_value == "duplicate-invalid") {
+        return SubmitOutcome::kKnownInvalid;
     }
     if (result_field.string_value == "duplicate") {
         return SubmitOutcome::kDuplicate;

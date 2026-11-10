@@ -458,7 +458,7 @@ public:
         }
 
         // m_groups is sized once, at construction.
-        total = SaturatingAdd(total, SaturatingMultiply(group_count, sizeof(GroupState)) + kAllocationOverheadBytes);
+        total = SaturatingAdd(total, SaturatingAdd(SaturatingMultiply(group_count, sizeof(GroupState)), kAllocationOverheadBytes));
 
         std::size_t per_group_bytes = 0;
         if (data_chunks <= CM256_MAX_DATA_CHUNKS) {

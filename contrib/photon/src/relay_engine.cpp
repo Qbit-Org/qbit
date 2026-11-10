@@ -820,11 +820,16 @@ void RelayEngine::TryFinalizeInbound(const InboundRelayKey& key, InboundRelay& r
     const std::size_t slot = key.slot_index;
     const auto reconstructed = relay.decoder->Reconstruct();
 
-    // The decoder is no longer needed whatever happens next; release it before calling the node,
-    // and ignore the rest of this block's chunks from this peer.
+    // The decoder is no longer needed whatever happens next; release it before calling the node.
+    // Whatever the outcome, the rest of this block's chunks from this peer are then ignored, timed
+    // from when the node calls return (no packets are handled while they run).
     const auto finished_at = m_clock.Now();
     EraseInbound(key);
-    MarkFinished(key, finished_at);
+    struct FinishOnReturn {
+        RelayEngine& engine;
+        const InboundRelayKey& key;
+        ~FinishOnReturn() { engine.MarkFinished(key, engine.m_clock.Now()); }
+    } finish_on_return{*this, key};
 
     if (!reconstructed.has_value()) {
         ++m_stats.submit_failures;
@@ -908,6 +913,13 @@ void RelayEngine::TryFinalizeInbound(const InboundRelayKey& key, InboundRelay& r
         // May be this copy's body only: another peer's copy is still tried.
         ++m_stats.submit_rejected;
         LogUnusedBlock(submitted_at, slot, block, "rejected by qbitd");
+        RecordFault(slot, submitted_at);
+        break;
+    case SubmitOutcome::kKnownInvalid:
+        // Decided by the block hash alone: no copy of it will do.
+        ++m_stats.submit_rejected;
+        LogUnusedBlock(submitted_at, slot, block, "already marked invalid by qbitd");
+        SettleInbound(key.hash_prefix, submitted_at);
         RecordFault(slot, submitted_at);
         break;
     case SubmitOutcome::kTimeout:
