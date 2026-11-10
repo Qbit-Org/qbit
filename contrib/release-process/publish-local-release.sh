@@ -6,6 +6,86 @@
 export LC_ALL=C
 set -euo pipefail
 
+# Every git command, including the validators', reads real objects only: none
+# of the caller's GIT_* settings (repository, index, object or config
+# overrides), no replace refs and no grafts. git status never writes the
+# index, nothing pages, and nothing is fetched, so a partial-clone remote in a
+# checkout's config cannot make a missing object run ssh or a helper
+# (GIT_ALLOW_PROTOCOL allows only "none", which does not exist).
+while IFS= read -r git_variable; do
+    unset "$git_variable"
+done < <(compgen -e | grep '^GIT_' || true)
+export GIT_NO_REPLACE_OBJECTS=1
+export GIT_GRAFT_FILE=/dev/null
+export GIT_OPTIONAL_LOCKS=0
+export GIT_PAGER=cat
+export GIT_NO_LAZY_FETCH=1
+export GIT_ALLOW_PROTOCOL=none
+# Config every git command runs with, whatever the system, user or repository
+# config says, as in contrib/release-process/release_staging_common.py: nothing
+# may run a program or change which history is read. GIT_CONFIG_COUNT/KEY/VALUE
+# outrank config files; only an explicit git -c (the validators' gpg.program)
+# outranks them. /dev/null/disabled cannot exist, so no program or hook runs.
+# advice.graftFileDeprecated only silences the hint the empty graft file causes.
+# core.fsmonitor is empty, not false: git before 2.36 reads it as a hook
+# command and would run "false". gpg.ssh.program and gpg.x509.program: git
+# verify-tag runs the program of the signature's format, and only OpenPGP may
+# verify, with the gpg.program the validators pass by git -c; gpg.program is
+# off for anything else (a %G? export-subst placeholder in git archive).
+# tar.umask keeps git archive's default file modes.
+GIT_SAFE_CONFIG_KEYS=(
+    advice.graftFileDeprecated core.fsmonitor core.hooksPath core.commitGraph
+    gpg.ssh.program gpg.x509.program gpg.program tar.umask
+)
+GIT_SAFE_CONFIG_VALUES=(
+    false "" /dev/null/disabled false
+    /dev/null/disabled /dev/null/disabled /dev/null/disabled 0002
+)
+export_git_safe_config() {
+    local index
+    export GIT_CONFIG_COUNT="${#GIT_SAFE_CONFIG_KEYS[@]}"
+    for index in "${!GIT_SAFE_CONFIG_KEYS[@]}"; do
+        export "GIT_CONFIG_KEY_$index=${GIT_SAFE_CONFIG_KEYS[$index]}"
+        export "GIT_CONFIG_VALUE_$index=${GIT_SAFE_CONFIG_VALUES[$index]}"
+    done
+}
+export_git_safe_config
+
+# GIT_CONFIG_COUNT arrived in git 2.31; older git would ignore the overrides.
+# git archive pipes a .tar.gz through tar.tar.gz.command (tar.tgz.command),
+# which config could set to any program: pin git's own default for this
+# version (its built-in gzip from 2.38, gzip -cn before).
+require_git() {
+    local version
+    local major
+    local minor
+    local gzip
+    version="$(git version)" || die "Could not run git version"
+    [[ "$version" =~ ^git\ version\ ([0-9]+)\.([0-9]+) ]] \
+        || die "Cannot tell the git version from: $version"
+    major="${BASH_REMATCH[1]}"
+    minor="${BASH_REMATCH[2]}"
+    if [ "$major" -lt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -lt 31 ]; }; then
+        die "$version is too old: the publisher needs git 2.31 or newer, whose GIT_CONFIG_COUNT keeps checkout config from running programs"
+    fi
+    if [ "$major" -gt 2 ] || [ "$minor" -ge 38 ]; then
+        gzip="git archive gzip"
+    else
+        gzip="gzip -cn"
+    fi
+    GIT_SAFE_CONFIG_KEYS+=(tar.tar.gz.command tar.tgz.command)
+    GIT_SAFE_CONFIG_VALUES+=("$gzip" "$gzip")
+    export_git_safe_config
+}
+
+# Python runs without PYTHON* environment variables, user or site packages,
+# startup hooks or bytecode; everything it runs needs only the standard
+# library. Inline snippets are fully isolated (-I keeps the current directory
+# off sys.path). The validators run with -E -s instead of -I, because they
+# import their siblings from their own directory, the exported trusted ref.
+PYTHON_SNIPPET=(python3 -I -S -B)
+PYTHON=(python3 -E -s -S -B)
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
 die() {
@@ -125,11 +205,139 @@ resolve_file() {
     printf '%s/%s\n' "$(resolve_dir "$parent")" "$name"
 }
 
+# Attributes can route any path through a filter driver, and git status and
+# git archive run them; a driver git has no command for is a no-op. Drivers are
+# named in config, so every one the checkout's config defines gets empty
+# commands and required=false.
+disable_git_filters() {
+    local label="$1"
+    local root="$2"
+    local keys
+    local key
+    local driver
+    local known
+    keys="$(git -C "$root" config --list --name-only)" \
+        || die "Could not read the git config of the $label: $root"
+    while IFS= read -r key; do
+        # The driver name may be empty: [filter ""] serves "filter=".
+        [[ "$key" =~ ^filter\.(.*)\.(clean|smudge|process|required)$ ]] || continue
+        driver="${BASH_REMATCH[1]}"
+        for known in "${GIT_SAFE_CONFIG_KEYS[@]}"; do
+            [ "$known" != "filter.$driver.clean" ] || continue 2
+        done
+        GIT_SAFE_CONFIG_KEYS+=(
+            "filter.$driver.clean" "filter.$driver.smudge" "filter.$driver.process" "filter.$driver.required"
+        )
+        GIT_SAFE_CONFIG_VALUES+=("" "" "" false)
+    done <<< "$keys"
+    export_git_safe_config
+}
+
 require_clean_checkout() {
     local label="$1"
     local root="$2"
-    [ -z "$(git -C "$root" status --porcelain --untracked-files=normal)" ] \
-        || die "$label must be clean: $root"
+    local status
+    local promisors
+    # Like release_staging_common.refuse_partial_clone: the environment forbids
+    # every fetch anyway; this says why up front.
+    # extensions.partialClone names a remote, so any value counts.
+    promisors="$(
+        { git -C "$root" config --get-regexp '^extensions\.partialclone$' | awk '{ print $1 }' || true
+          git -C "$root" config --type=bool --get-regexp '^remote\..*\.promisor$' \
+              | awk '$NF != "false" { print $1 }' || true
+        } | paste -sd, -
+    )"
+    [ -z "$promisors" ] \
+        || die "$label must not be a partial clone ($promisors): $root; the publisher never fetches missing objects"
+    disable_git_filters "$label" "$root"
+    # --ignore-submodules=dirty: a gitlink still shows, but git status does not
+    # run inside a submodule checkout, whose own config could name filters.
+    status="$(git -C "$root" status --porcelain --untracked-files=normal --ignore-submodules=dirty)" \
+        || die "Could not run git status in the $label: $root"
+    [ -z "$status" ] || die "$label must be clean: $root"
+}
+
+# git status does not show files marked assume-unchanged (lowercase tag) or
+# skip-worktree (S); only plain tracked entries (H) are acceptable.
+require_plain_index() {
+    local label="$1"
+    local root="$2"
+    shift 2
+    local flagged
+    flagged="$(git -C "$root" ls-files -v -- "$@" | awk '$1 != "H" { print substr($0, 3) }')"
+    [ -z "$flagged" ] \
+        || die "$label has index flags (assume-unchanged or skip-worktree) on: ${flagged//$'\n'/, }"
+}
+
+# Write the blobs under the given paths at a commit into a directory, so that
+# what is read is exactly what the commit holds, whatever the working tree,
+# its line-ending conversion or the index say.
+export_trusted_paths() {
+    local label="$1"
+    local root="$2"
+    local ref="$3"
+    local destination="$4"
+    shift 4
+    local entry
+    local meta
+    local path
+    local mode
+    local type
+    local object
+    local listing="$destination.ls-tree"
+    mkdir -p "$destination"
+    git -C "$root" ls-tree -r -z --full-tree "$ref" -- "$@" > "$listing" \
+        || die "Could not list ${*:-the tree} at $label $ref"
+    while IFS= read -r -d '' entry; do
+        meta="${entry%%$'\t'*}"
+        path="${entry#*$'\t'}"
+        read -r mode type object <<< "$meta"
+        case "$mode:$type" in
+            100644:blob|100755:blob) ;;
+            *) die "$label $ref has a non-regular file at $path" ;;
+        esac
+        case "/$path/" in
+            */../*|*/./*|*//*) die "$label $ref has an unsafe path: $path" ;;
+        esac
+        case "$path" in
+            */*) mkdir -p "$destination/${path%/*}" ;;
+        esac
+        git -C "$root" cat-file blob "$object" > "$destination/$path" \
+            || die "Could not read $path at $label $ref"
+    done < "$listing"
+}
+
+# The release tag is signed by an active release key: the validator's own
+# verify_tag_signature, given the pinned tag object (TAG_OBJECT) rather than
+# the bare tag name that validate_release_artifacts.py --verify-tag-signature
+# would pass to git verify-tag.
+verify_release_tag_signature() {
+    (cd "$TRUSTED_ROOT" && "${PYTHON_SNIPPET[@]}" - "$VALIDATORS" "$TRUSTED_KEYS_DIR" "$RELEASE_LINE" "$TAG" "$TAG_OBJECT" <<'PY'
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+
+validators, keys_dir, release_line, tag, tag_object = sys.argv[1:6]
+# The validators import their siblings from the exported trusted ref.
+sys.path.insert(0, validators)
+import validate_release_artifacts as vra  # noqa: E402
+
+gpg = shutil.which("gpg") or "gpg"
+keys = Path(keys_dir)
+try:
+    policy = vra.load_release_policy(keys / "keys.json", keys, release_line)
+    with tempfile.TemporaryDirectory(prefix="qbit-release-tag-gnupg-") as home:
+        gnupg_home = Path(home)
+        gnupg_home.chmod(0o700)
+        vra.import_release_keys(gpg, gnupg_home, keys, policy)
+        # git verify-tag runs in the current directory, the trusted checkout.
+        vra.verify_tag_signature(gpg, gnupg_home, tag_object, policy)
+except vra.ReleaseValidationError as exc:
+    message = str(exc).replace(f"Release tag {tag_object}", f"Release tag {tag} ({tag_object})", 1)
+    raise SystemExit(f"ERR: {message}")
+PY
+    ) || die "Release tag $TAG failed the signature check"
 }
 
 github_repo_path() {
@@ -350,7 +558,7 @@ wait_for_published_immutable_release() {
 prepare_release_notes() {
     if [ -n "$NOTES_FILE" ]; then
         EFFECTIVE_NOTES_FILE="$WORK_DIR/explicit-release-notes.md"
-        python3 - "$NOTES_FILE" "$EFFECTIVE_NOTES_FILE" <<'PY'
+        "${PYTHON_SNIPPET[@]}" - "$NOTES_FILE" "$EFFECTIVE_NOTES_FILE" <<'PY'
 import sys
 from pathlib import Path
 
@@ -374,7 +582,7 @@ PY
         --method POST \
         -f "tag_name=$TAG" > "$response" \
         || die "Could not generate release notes for $TAG"
-    python3 - "$response" "$EFFECTIVE_NOTES_FILE" <<'PY'
+    "${PYTHON_SNIPPET[@]}" - "$response" "$EFFECTIVE_NOTES_FILE" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -392,7 +600,7 @@ verify_release_notes() {
     [ -n "$RELEASE_ID" ] || die "Cannot verify release notes without a release ID"
     gh api "repos/$GH_REPO_PATH/releases/$RELEASE_ID" > "$response" \
         || die "Could not inspect release $RELEASE_ID"
-    python3 - "$EFFECTIVE_NOTES_FILE" "$response" <<'PY'
+    "${PYTHON_SNIPPET[@]}" - "$EFFECTIVE_NOTES_FILE" "$response" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -442,7 +650,7 @@ asset_list_failure() {
 compare_asset_manifests() {
     local mode="$1"
     local remote_manifest="$2"
-    python3 - "$LOCAL_ASSET_MANIFEST" "$remote_manifest" "$mode" <<'PY'
+    "${PYTHON_SNIPPET[@]}" - "$LOCAL_ASSET_MANIFEST" "$remote_manifest" "$mode" <<'PY'
 import sys
 from pathlib import Path
 
@@ -720,7 +928,8 @@ if [ "$RELEASE_LINE" = mainnet ] \
     done
 fi
 
-need_cmd awk gh git gpg grep python3 tr
+need_cmd awk gh git gpg grep paste python3 tr
+require_git
 gh auth status >/dev/null
 require_full_sha --trusted-release-ref "$TRUSTED_RELEASE_REF"
 require_full_sha --guix-sigs-ref "$GUIX_SIGS_REF"
@@ -732,7 +941,13 @@ TRUSTED_SHA="$(git -C "$TRUSTED_ROOT" rev-parse HEAD)"
 [ "$(lowercase "$TRUSTED_SHA")" = "$(lowercase "$TRUSTED_RELEASE_REF")" ] \
     || die "Publisher checkout resolved $TRUSTED_SHA, expected $TRUSTED_RELEASE_REF"
 require_clean_checkout "Trusted release checkout" "$TRUSTED_ROOT"
+[ "$(git -C "$TRUSTED_ROOT" rev-parse --is-shallow-repository)" = false ] \
+    || die "Trusted release checkout must not be shallow: $TRUSTED_ROOT"
+require_plain_index "Trusted release checkout" "$TRUSTED_ROOT" \
+    contrib/release-process ci/release contrib/keys
 
+# Checked here to fail before any network call; the files that actually run are
+# checked again after they are exported from the trusted ref below.
 required_trusted_paths=(
     ci/release/validate_release_artifacts.py
     ci/release/validate_builder_attestations.py
@@ -755,6 +970,10 @@ GUIX_SIGS_SHA="$(git -C "$GUIX_SIGS_REPO" rev-parse HEAD)"
 [ "$(lowercase "$GUIX_SIGS_SHA")" = "$(lowercase "$GUIX_SIGS_REF")" ] \
     || die "qbit-guix.sigs checkout resolved $GUIX_SIGS_SHA, expected $GUIX_SIGS_REF"
 require_clean_checkout "qbit-guix.sigs checkout" "$GUIX_SIGS_REPO"
+# The validators read the qbit-guix.sigs files from an export of the pinned
+# commit (below), not from this working tree; index flags would only hide local
+# edits from the clean check above, so they are refused here, early.
+require_plain_index "qbit-guix.sigs checkout" "$GUIX_SIGS_REPO" .
 
 if [ -n "$NOTES_FILE" ]; then
     NOTES_FILE="$(resolve_file "$NOTES_FILE")"
@@ -769,9 +988,26 @@ if [ "$P2MR_CONFORMANCE_REQUESTED" -eq 1 ]; then
 fi
 RELEASE_NAME="${RELEASE_NAME:-qbit $TAG}"
 
-TAG_OBJECT="$(git -C "$TRUSTED_ROOT" rev-parse -q --verify "refs/tags/$TAG^{tag}" 2>/dev/null || true)"
-TAG_TARGET="$(git -C "$TRUSTED_ROOT" rev-parse -q --verify "refs/tags/$TAG^{commit}" 2>/dev/null || true)"
-[ -n "$TAG_OBJECT" ] || die "Trusted release checkout is missing annotated tag $TAG"
+# Only the exact ref refs/tags/$TAG is read (show-ref --verify): git looks a
+# name up as $GIT_DIR/<name>, refs/<name>, refs/tags/<name>, ..., even
+# refs/refs/tags/$TAG for refs/tags/$TAG, so a ref git status does not show
+# could otherwise stand in for the tag. The signature check uses this object.
+TAG_OBJECT="$(git -C "$TRUSTED_ROOT" show-ref --verify --hash "refs/tags/$TAG" 2>/dev/null || true)"
+[ -n "$TAG_OBJECT" ] && [ "$(git -C "$TRUSTED_ROOT" cat-file -t "$TAG_OBJECT" 2>/dev/null)" = tag ] \
+    || die "Trusted release checkout is missing annotated tag $TAG"
+# Validators that take the tag name (verify_testnet_release_posture.py resolves
+# $TAG^{commit}) must see the same object, so the bare name must resolve to it.
+BARE_TAG_OBJECT="$(git -C "$TRUSTED_ROOT" rev-parse -q --verify "$TAG^{tag}" 2>/dev/null || true)"
+[ "$BARE_TAG_OBJECT" = "$TAG_OBJECT" ] \
+    || die "The name $TAG resolves to ${BARE_TAG_OBJECT:-no tag}, not to refs/tags/$TAG ($TAG_OBJECT): remove the ref git finds first (.git/$TAG or refs/$TAG)"
+# The tag object must name $TAG: its signature covers that name, so a signed
+# tag of another release cannot be put at refs/tags/$TAG. awk reads the whole
+# object, so git cat-file never meets a closed pipe.
+TAG_OBJECT_NAME="$(git -C "$TRUSTED_ROOT" cat-file tag "$TAG_OBJECT" \
+    | awk 'BEGIN { header = 1 } $0 == "" { header = 0 } header && /^tag / { print substr($0, 5) }')"
+[ "$TAG_OBJECT_NAME" = "$TAG" ] \
+    || die "Release tag $TAG is a tag object named $(printf '%q' "${TAG_OBJECT_NAME:-nothing}") ($TAG_OBJECT at refs/tags/$TAG)"
+TAG_TARGET="$(git -C "$TRUSTED_ROOT" rev-parse -q --verify "$TAG_OBJECT^{commit}" 2>/dev/null || true)"
 [ -n "$TAG_TARGET" ] || die "Trusted release checkout is missing commit target for $TAG"
 [ "$(lowercase "$TRUSTED_RELEASE_REF")" != "$(lowercase "$TAG_OBJECT")" ] \
     || die "--trusted-release-ref must not equal the release tag object"
@@ -803,18 +1039,38 @@ LOCAL_ASSET_MANIFEST="$WORK_DIR/local-assets.tsv"
 REMOTE_ASSET_MANIFEST="$WORK_DIR/remote-assets.tsv"
 ASSET_LIST_ERRORS="$WORK_DIR/asset-list-errors"
 : > "$VALIDATION_OUTPUT"
+
+# The validators and the release key policy come from the trusted ref's git
+# objects, not the working tree, and run isolated from Python startup hooks
+# and bytecode, so nothing in the checkout outside its commit can change them.
+TRUSTED_EXPORT="$WORK_DIR/trusted-ref"
+export_trusted_paths "Trusted release ref" "$TRUSTED_ROOT" "$TRUSTED_RELEASE_REF" "$TRUSTED_EXPORT" \
+    ci/release contrib/keys/operator-keys
+VALIDATORS="$TRUSTED_EXPORT/ci/release"
+TRUSTED_KEYS_DIR="$TRUSTED_EXPORT/contrib/keys/operator-keys"
+for required_path in "${required_trusted_paths[@]}"; do
+    [ -f "$TRUSTED_EXPORT/$required_path" ] \
+        || die "Trusted release ref $TRUSTED_RELEASE_REF does not contain $required_path"
+done
+# The key mirror and this version's attestations, the only qbit-guix.sigs
+# files the validators read, come from the pinned commit's objects too: index
+# stat data, core.checkStat or core.ignoreCase can hide working-tree changes
+# from git status, so the checkout checks above only give early, clear errors.
+GUIX_SIGS_EXPORT="$WORK_DIR/qbit-guix.sigs-ref"
+export_trusted_paths "qbit-guix.sigs ref" "$GUIX_SIGS_REPO" "$GUIX_SIGS_REF" "$GUIX_SIGS_EXPORT" \
+    operator-keys "${TAG#v}"
 [ -z "$NOTES_FILE" ] || prepare_release_notes
 
 if [ "$RELEASE_LINE" = mainnet ]; then
     msg "Validating fail-closed mainnet launch posture"
-    python3 "$TRUSTED_ROOT/ci/release/verify_mainnet_release_posture.py" \
+    "${PYTHON[@]}" "$VALIDATORS/verify_mainnet_release_posture.py" \
         --source-root "$TRUSTED_ROOT" \
         --release-tag "$TAG"
 fi
 
 if [ "$P2MR_CONFORMANCE_REQUESTED" -eq 1 ]; then
     msg "Validating qbit P2MR v1 release conformance"
-    python3 "$TRUSTED_ROOT/ci/release/verify_p2mr_v1_conformance.py" \
+    "${PYTHON[@]}" "$VALIDATORS/verify_p2mr_v1_conformance.py" \
         --evidence "$P2MR_V1_CONFORMANCE_EVIDENCE" \
         --source-root "$TRUSTED_ROOT" \
         --release-tag "$TAG" \
@@ -835,7 +1091,7 @@ if [ "$RELEASE_LINE" = testnet ]; then
         || posture_args+=(--allow-unsigned-platform-artifacts)
     [ "$ALLOW_CODESIGNING_ARTIFACTS" -eq 0 ] \
         || posture_args+=(--allow-codesigning-artifacts)
-    python3 "$TRUSTED_ROOT/ci/release/verify_testnet_release_posture.py" \
+    "${PYTHON[@]}" "$VALIDATORS/verify_testnet_release_posture.py" \
         "${posture_args[@]}"
 fi
 
@@ -844,9 +1100,8 @@ release_args=(
     --artifacts-dir "$ARTIFACTS_DIR"
     --tag "$TAG"
     --release-line "$RELEASE_LINE"
-    --operator-key-policy "$TRUSTED_ROOT/contrib/keys/operator-keys/keys.json"
-    --operator-keys-dir "$TRUSTED_ROOT/contrib/keys/operator-keys"
-    --verify-tag-signature
+    --operator-key-policy "$TRUSTED_KEYS_DIR/keys.json"
+    --operator-keys-dir "$TRUSTED_KEYS_DIR"
     --github-output "$VALIDATION_OUTPUT"
 )
 [ "$REQUIRE_PHOTON" -eq 0 ] || release_args+=(--require-photon-artifact)
@@ -854,14 +1109,16 @@ release_args=(
     || release_args+=(--allow-unsigned-platform-artifacts)
 [ "$ALLOW_CODESIGNING_ARTIFACTS" -eq 0 ] \
     || release_args+=(--allow-codesigning-artifacts)
-(cd "$TRUSTED_ROOT" && python3 ci/release/validate_release_artifacts.py "${release_args[@]}")
+(cd "$TRUSTED_ROOT" && "${PYTHON[@]}" "$VALIDATORS/validate_release_artifacts.py" "${release_args[@]}")
+msg "Validating the release tag signature"
+verify_release_tag_signature
 
 msg "Validating qbit-guix.sigs key-policy mirror"
-python3 "$TRUSTED_ROOT/ci/release/validate_key_metadata.py" \
-    --operator-policy "$TRUSTED_ROOT/contrib/keys/operator-keys/keys.json" \
-    --operator-keys-dir "$TRUSTED_ROOT/contrib/keys/operator-keys" \
-    --operator-policy-mirror "$GUIX_SIGS_REPO/operator-keys/keys.json" \
-    --operator-keys-dir-mirror "$GUIX_SIGS_REPO/operator-keys" \
+"${PYTHON[@]}" "$VALIDATORS/validate_key_metadata.py" \
+    --operator-policy "$TRUSTED_KEYS_DIR/keys.json" \
+    --operator-keys-dir "$TRUSTED_KEYS_DIR" \
+    --operator-policy-mirror "$GUIX_SIGS_EXPORT/operator-keys/keys.json" \
+    --operator-keys-dir-mirror "$GUIX_SIGS_EXPORT/operator-keys" \
     --skip-policy-transition-validation \
     --require-public-key-files
 
@@ -874,17 +1131,17 @@ builder_args=(
     --source-root "$TRUSTED_ROOT"
     --expected-tag-target "$TAG_TARGET"
     --release-line "$RELEASE_LINE"
-    --guix-sigs-repo "$GUIX_SIGS_REPO"
-    --operator-key-policy "$TRUSTED_ROOT/contrib/keys/operator-keys/keys.json"
-    --operator-keys-dir "$TRUSTED_ROOT/contrib/keys/operator-keys"
-    --guix-operator-key-policy "$GUIX_SIGS_REPO/operator-keys/keys.json"
-    --guix-operator-keys-dir "$GUIX_SIGS_REPO/operator-keys"
+    --guix-sigs-repo "$GUIX_SIGS_EXPORT"
+    --operator-key-policy "$TRUSTED_KEYS_DIR/keys.json"
+    --operator-keys-dir "$TRUSTED_KEYS_DIR"
+    --guix-operator-key-policy "$GUIX_SIGS_EXPORT/operator-keys/keys.json"
+    --guix-operator-keys-dir "$GUIX_SIGS_EXPORT/operator-keys"
     --github-output "$VALIDATION_OUTPUT"
 )
 if [ "$REQUIRE_PHOTON" -eq 1 ] || [ "$PHOTON_ARTIFACT_COUNT" != 0 ]; then
     builder_args+=(--artifact core --artifact photon)
 fi
-python3 "$TRUSTED_ROOT/ci/release/validate_builder_attestations.py" "${builder_args[@]}"
+"${PYTHON[@]}" "$VALIDATORS/validate_builder_attestations.py" "${builder_args[@]}"
 
 upload_files=()
 while IFS= read -r upload_file; do
@@ -908,7 +1165,7 @@ for upload_file in "${upload_files[@]}"; do
         || die "Validated upload filename must not contain #: $asset_name"
 done
 
-python3 - "$LOCAL_ASSET_MANIFEST" "${upload_files[@]}" <<'PY'
+"${PYTHON_SNIPPET[@]}" - "$LOCAL_ASSET_MANIFEST" "${upload_files[@]}" <<'PY'
 import hashlib
 import sys
 from pathlib import Path
