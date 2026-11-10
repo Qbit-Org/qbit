@@ -381,7 +381,7 @@ std::optional<std::string> ReadResponse(int fd, Deadline deadline)
 
     while (true) {
         // Re-arm the receive timeout with what is left, so a slow reply cannot outlast the deadline.
-        // Past the deadline, only a reply that has already arrived in full is still taken.
+        // Past the deadline, the reply is still taken if the rest of it is already waiting.
         const auto timeout = RemainingTimeout(deadline);
         int flags = 0;
         if (timeout.has_value()) {

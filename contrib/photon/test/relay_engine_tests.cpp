@@ -849,7 +849,7 @@ void DeliverBlock(RelayEngine& engine,
     }
 }
 
-std::optional<PeerRelayStats> PeerStats(const RelayEngine& engine, std::size_t slot_index)
+std::optional<PeerRelayStats> FindPeerStats(const RelayEngine& engine, std::size_t slot_index)
 {
     for (const PeerRelayStats& stats : engine.PeerStatsSnapshot()) {
         if (stats.slot_index == slot_index) {
@@ -857,6 +857,12 @@ std::optional<PeerRelayStats> PeerStats(const RelayEngine& engine, std::size_t s
         }
     }
     return std::nullopt;
+}
+
+// Counters for a slot; all zero for a slot that has no inbound state.
+PeerRelayStats PeerStats(const RelayEngine& engine, std::size_t slot_index)
+{
+    return FindPeerStats(engine, slot_index).value_or(PeerRelayStats{.slot_index = slot_index});
 }
 
 const InboundPeerInfo kPeer0{.slot_index = 0, .remote_session_id = 7001, .remote_peer_id = 8001};
@@ -878,7 +884,7 @@ void TestMismatchedIdentifierNotSubmitted()
     Require(engine.stats().submit_failures == 0, "a dropped block is not a submission");
     Require(engine.stats().inbound_entries == 0, "dropped block state should be released");
     const auto peer = PeerStats(engine, 0);
-    Require(peer.has_value() && peer->faults == 1 && peer->fault_score == 1, "mismatch should count against the peer");
+    Require(peer.faults == 1 && peer.fault_score == 1, "mismatch should count against the peer");
 }
 
 void TestTooShortBlockNotSubmitted()
@@ -939,7 +945,7 @@ void TestBlockWithParentAwayFromTipNotSubmitted()
         Require(submitter.submit_calls == 0, "block whose parent is not near the tip must not be submitted");
         Require(engine.stats().blocks_parent_rejected == 1, "parent rejection should be counted");
         const auto peer = PeerStats(engine, 0);
-        Require(peer.has_value() && peer->faults == 1 && peer->fault_score == 1,
+        Require(peer.faults == 1 && peer.fault_score == 1,
                 "parent rejection should count against the peer");
     }
 }
@@ -960,7 +966,7 @@ void TestUnavailableParentCheckDropsWithoutPenalty()
     Require(engine.stats().blocks_parent_rejected == 0, "failed checks are not parent rejections");
     Require(engine.stats().peer_suspensions == 0, "failed checks must not suspend the peer");
     const auto peer = PeerStats(engine, 0);
-    Require(peer.has_value() && peer->fault_score == 0 && !peer->suspended, "failed checks must not count against the peer");
+    Require(peer.fault_score == 0 && !peer.suspended, "failed checks must not count against the peer");
 }
 
 void TestSubmitOutcomesCountedSeparately()
@@ -975,6 +981,7 @@ void TestSubmitOutcomesCountedSeparately()
         SubmitOutcome::kDuplicate,
         SubmitOutcome::kInconclusive,
         SubmitOutcome::kRejected,
+        SubmitOutcome::kKnownInvalid,
         SubmitOutcome::kTimeout,
         SubmitOutcome::kTimeout,
         SubmitOutcome::kTimeout,
@@ -990,13 +997,13 @@ void TestSubmitOutcomesCountedSeparately()
     Require(stats.submit_successes == 1 && stats.blocks_received_in == 1, "accepted count");
     Require(stats.submit_duplicates == 2, "duplicate count");
     Require(stats.submit_inconclusive == 1, "inconclusive count");
-    Require(stats.submit_rejected == 1, "rejected count");
+    Require(stats.submit_rejected == 2, "rejected count, including blocks already marked invalid");
     Require(stats.submit_timeouts == 3, "timeout count");
     Require(stats.submit_errors == 1, "error count");
-    Require(stats.submit_failures == 8, "submit_failures should keep counting every non-accepted submission");
+    Require(stats.submit_failures == 9, "submit_failures should keep counting every non-accepted submission");
     const auto peer = PeerStats(engine, 0);
-    Require(peer.has_value() && peer->blocks_received_in == 1 && peer->faults == 2, "per-peer counts");
-    Require(peer->fault_score == 2, "only inconclusive and rejected blocks count against the peer");
+    Require(peer.blocks_received_in == 1 && peer.faults == 3, "per-peer counts");
+    Require(peer.fault_score == 3, "only inconclusive and rejected blocks count against the peer");
 }
 
 void TestNeutralOutcomesNeverSuspendPeer()
@@ -1016,7 +1023,7 @@ void TestNeutralOutcomesNeverSuspendPeer()
     Require(submitter.submit_calls == 36, "every block should have been submitted");
     Require(engine.stats().peer_suspensions == 0, "duplicates, timeouts and errors must not suspend a peer");
     const auto peer = PeerStats(engine, 0);
-    Require(peer.has_value() && peer->fault_score == 0, "neutral outcomes must not add to the fault score");
+    Require(peer.fault_score == 0, "neutral outcomes must not add to the fault score");
 }
 
 void TestRepeatedRejectedBlocksSuspendPeer()
@@ -1043,7 +1050,7 @@ void TestRepeatedRejectedBlocksSuspendPeer()
     Require(engine.stats().inbound_rejected > before.inbound_rejected, "suspended peer's packets should be refused");
     Require(engine.stats().inbound_entries == 0, "suspended peer must not hold inbound state");
     auto peer = PeerStats(engine, 1);
-    Require(peer.has_value() && peer->suspended && peer->suspensions == 1, "per-peer suspension state");
+    Require(peer.suspended && peer.suspensions == 1, "per-peer suspension state");
 
     // Another peer is unaffected.
     submitter.submit_result = SubmitOutcome::kAccepted;
@@ -1059,10 +1066,10 @@ void TestRepeatedRejectedBlocksSuspendPeer()
     Require(engine.stats().peer_suspensions == 2, "peer should be suspended again");
     clock.Advance(RelayEngineConfig{}.peer_suspend_initial + std::chrono::milliseconds{1});
     peer = PeerStats(engine, 1);
-    Require(peer.has_value() && peer->suspended, "second suspension should outlast the initial pause");
+    Require(peer.suspended, "second suspension should outlast the initial pause");
     clock.Advance(RelayEngineConfig{}.peer_suspend_initial);
     peer = PeerStats(engine, 1);
-    Require(peer.has_value() && !peer->suspended, "second suspension should end after twice the initial pause");
+    Require(!peer.suspended, "second suspension should end after twice the initial pause");
 }
 
 void TestAcceptedBlockLowersFaultScoreWithoutResetting()
@@ -1081,7 +1088,7 @@ void TestAcceptedBlockLowersFaultScoreWithoutResetting()
     DeliverBlock(engine, kPeer1, EncodeTestBlock(200, ++seed), submitter);
 
     auto peer = PeerStats(engine, 1);
-    Require(peer.has_value() && peer->fault_score == defaults.peer_fault_threshold - 1 - defaults.peer_fault_success_credit,
+    Require(peer.fault_score == defaults.peer_fault_threshold - 1 - defaults.peer_fault_success_credit,
             "an accepted block should lower the score by the fixed credit");
 
     // Interleaving accepted blocks cannot keep a peer below the threshold indefinitely.
@@ -1106,7 +1113,7 @@ void TestFaultScoreDecaysOverTime()
     }
     clock.Advance(defaults.peer_fault_decay_interval * 4);
     auto peer = PeerStats(engine, 0);
-    Require(peer.has_value() && peer->fault_score == 2, "score should decay by one per interval");
+    Require(peer.fault_score == 2, "score should decay by one per interval");
 
     // An occasional failed block, as in honest stale races, never accumulates to a suspension.
     for (int i = 0; i < 100; ++i) {
@@ -1156,11 +1163,11 @@ void TestPeerFloodDoesNotEvictOtherPeersBlock()
 
     const auto peer0 = PeerStats(engine, 0);
     const auto peer1 = PeerStats(engine, 1);
-    Require(peer0.has_value() && peer0->inbound_evictions == 0, "peer 0 must lose nothing to peer 1");
-    Require(peer1.has_value() && peer1->inbound_evictions > 0, "peer 1's own blocks should be displaced");
+    Require(peer0.inbound_evictions == 0, "peer 0 must lose nothing to peer 1");
+    Require(peer1.inbound_evictions > 0, "peer 1's own blocks should be displaced");
     const RelayEngineConfig defaults{};
-    Require(peer1->inbound_entries <= defaults.max_inbound_entries_per_peer, "peer 1 should stay within its entry quota");
-    Require(peer1->inbound_decoder_bytes <= defaults.max_inbound_decoder_bytes_per_peer,
+    Require(peer1.inbound_entries <= defaults.max_inbound_entries_per_peer, "peer 1 should stay within its entry quota");
+    Require(peer1.inbound_decoder_bytes <= defaults.max_inbound_decoder_bytes_per_peer,
             "peer 1 should stay within its decoder quota");
 }
 
@@ -1187,8 +1194,8 @@ void TestPerPeerEntryQuotaBoundary()
     clock.Advance(std::chrono::milliseconds{1});
     engine.OnBlockChunk(kPeer0, BuildChunkPayload(third.encoded.chunks[0], third.prefix), submitter);
     Require(engine.stats().inbound_evictions == 1, "third entry should displace one of the peer's own");
-    Require(PeerStats(engine, 0)->inbound_evictions == 1, "the eviction belongs to peer 0");
-    Require(PeerStats(engine, 1)->inbound_evictions == 0, "peer 1's older entry must be kept");
+    Require(PeerStats(engine, 0).inbound_evictions == 1, "the eviction belongs to peer 0");
+    Require(PeerStats(engine, 1).inbound_evictions == 0, "peer 1's older entry must be kept");
 
     // Peer 1's entry is intact; peer 0's oldest one was the one dropped.
     engine.OnBlockHeader(kPeer1, BuildHeaderPayload(other.encoded, other.prefix, other.bytes.size()), submitter);
@@ -1227,15 +1234,15 @@ void TestPerPeerDecoderQuotaBoundary()
     engine.OnBlockHeader(kPeer0, header(1), submitter);
     engine.OnBlockHeader(kPeer0, header(2), submitter);
     Require(engine.stats().inbound_evictions == 0 && engine.stats().inbound_rejected == 0, "two decoders fit exactly");
-    Require(PeerStats(engine, 0)->inbound_decoder_bytes == 2 * charge, "decoder bytes should be charged per entry");
+    Require(PeerStats(engine, 0).inbound_decoder_bytes == 2 * charge, "decoder bytes should be charged per entry");
 
     engine.OnBlockHeader(kPeer1, header(3), submitter);
     Require(engine.stats().inbound_evictions == 0, "another peer has its own quota");
 
     engine.OnBlockHeader(kPeer0, header(4), submitter);
     Require(engine.stats().inbound_evictions == 1, "third decoder should displace the peer's own oldest");
-    Require(PeerStats(engine, 0)->inbound_decoder_bytes == 2 * charge, "peer 0 should stay at its quota");
-    Require(PeerStats(engine, 1)->inbound_decoder_bytes == charge, "peer 1's decoder must be kept");
+    Require(PeerStats(engine, 0).inbound_decoder_bytes == 2 * charge, "peer 0 should stay at its quota");
+    Require(PeerStats(engine, 1).inbound_decoder_bytes == charge, "peer 1's decoder must be kept");
 
     // A single block larger than the peer quota is refused outright.
     RelayEngineConfig small{};
@@ -1266,7 +1273,7 @@ void TestGlobalLimitSparesOtherPeersRecentProgress()
     // Both entries are fresh: peer 2 cannot displace either of them.
     engine.OnBlockHeader(kPeer2, BuildHeaderPayload(block2.encoded, block2.prefix, block2.bytes.size()), submitter);
     Require(engine.stats().inbound_evictions == 0, "entries with recent progress must not be displaced");
-    Require(PeerStats(engine, 2)->inbound_rejected == 1, "the new entry should be refused instead");
+    Require(PeerStats(engine, 2).inbound_rejected == 1, "the new entry should be refused instead");
 
     // Peer 0 keeps making progress with new chunks; peer 1 only repeats itself, which is not progress.
     clock.Advance(config.inbound_progress_grace);
@@ -1275,8 +1282,8 @@ void TestGlobalLimitSparesOtherPeersRecentProgress()
     clock.Advance(std::chrono::milliseconds{1});
     const TestBlock block3 = EncodeTestBlock(100, 0xF704);
     engine.OnBlockHeader(kPeer2, BuildHeaderPayload(block3.encoded, block3.prefix, block3.bytes.size()), submitter);
-    Require(PeerStats(engine, 1)->inbound_evictions == 1, "the idle entry should be displaced");
-    Require(PeerStats(engine, 0)->inbound_evictions == 0, "the active entry must be kept");
+    Require(PeerStats(engine, 1).inbound_evictions == 1, "the idle entry should be displaced");
+    Require(PeerStats(engine, 0).inbound_evictions == 0, "the active entry must be kept");
 
     for (std::size_t i = 2; i < block0.encoded.params.data_chunks; ++i) {
         engine.OnBlockChunk(kPeer0, chunk0(i), submitter);
@@ -1307,8 +1314,8 @@ void TestRepeatedChunksDoNotKeepBlockAlive()
     clock.Advance(std::chrono::seconds{4});
     const TestBlock other = EncodeTestBlock(100, 0xF711);
     engine.OnBlockChunk(kPeer0, BuildChunkPayload(other.encoded.chunks[0], other.prefix), submitter);
-    Require(PeerStats(engine, 1)->inbound_evictions == 1, "a block that only repeats itself should age out");
-    Require(PeerStats(engine, 1)->inbound_entries == 0, "its state should be released");
+    Require(PeerStats(engine, 1).inbound_evictions == 1, "a block that only repeats itself should age out");
+    Require(PeerStats(engine, 1).inbound_entries == 0, "its state should be released");
 }
 
 void TestCombinedLimitsEvictNothingWhenRefused()
@@ -1344,7 +1351,7 @@ void TestCombinedLimitsEvictNothingWhenRefused()
     wanted.block_hash_prefix = 0xB1;
     engine.OnBlockHeader(kPeer0, wanted, submitter);
     Require(engine.stats().inbound_evictions == 0, "nothing should be evicted for a refused block");
-    Require(PeerStats(engine, 0)->inbound_entries == 2, "peer 0 should keep its entries");
+    Require(PeerStats(engine, 0).inbound_entries == 2, "peer 0 should keep its entries");
 }
 
 void TestRefusedHeaderRemainingChunksIgnored()
@@ -1431,7 +1438,7 @@ void TestBlockAlreadyKnownNotSubmittedOrPenalized()
     DeliverBlock(engine, kPeer0, block, submitter);
     Require(submitter.check_calls == 1 && submitter.submit_calls == 0, "a block the node has must not be submitted");
     Require(engine.stats().blocks_already_known >= 1, "it should count as known");
-    Require(PeerStats(engine, 0)->fault_score == 0, "it must not count against the peer");
+    Require(PeerStats(engine, 0).fault_score == 0, "it must not count against the peer");
 
     // Another peer's copy is recognised without asking the node again.
     DeliverBlock(engine, kPeer1, block, submitter);
@@ -1451,7 +1458,7 @@ void TestNodeBehindDropsWithoutPenalty()
     Require(submitter.submit_calls == 0, "blocks the node cannot connect yet are not submitted");
     Require(engine.stats().blocks_node_behind == 20, "they should be counted separately");
     Require(engine.stats().blocks_parent_rejected == 0, "they are not parent rejections");
-    Require(engine.stats().peer_suspensions == 0 && PeerStats(engine, 0)->fault_score == 0,
+    Require(engine.stats().peer_suspensions == 0 && PeerStats(engine, 0).fault_score == 0,
             "a lagging local node must not count against the peer");
 }
 
@@ -1474,8 +1481,8 @@ void TestInconclusiveBlockCountedOnceAcrossPeers()
     }
 
     Require(submitter.submit_calls == 1, "the node should receive the block once");
-    Require(PeerStats(engine, 0)->fault_score == 1, "the first peer's copy counts once");
-    Require(PeerStats(engine, 1)->fault_score == 0 && PeerStats(engine, 2)->fault_score == 0,
+    Require(PeerStats(engine, 0).fault_score == 1, "the first peer's copy counts once");
+    Require(PeerStats(engine, 1).fault_score == 0 && PeerStats(engine, 2).fault_score == 0,
             "other peers relaying the same block are not counted");
     Require(engine.stats().inbound_entries == 0, "other copies should be released");
 }
@@ -1522,7 +1529,7 @@ void TestRemainingChunksOfHandledBlockIgnored()
     submitter.parent_result = ParentCheck::kNearTip;
     DeliverBlock(engine, kPeer1, block, submitter);
     Require(submitter.check_calls == 1 && submitter.submit_calls == 0, "another peer's copy should not be re-checked at once");
-    Require(PeerStats(engine, 1)->fault_score == 0, "and does not count against that peer");
+    Require(PeerStats(engine, 1).fault_score == 0, "and does not count against that peer");
 
     // ...but is processed again once that has expired.
     clock.Advance(std::chrono::seconds{11});
@@ -1561,7 +1568,7 @@ void TestFailedReservationEvictsNothing()
     engine.OnBlockHeader(kPeer0, header(3, 600'000), submitter);
     Require(engine.stats().inbound_rejected == 1, "the large block should be refused");
     Require(engine.stats().inbound_evictions == 0, "nothing should be evicted for a block that is refused anyway");
-    Require(PeerStats(engine, 0)->inbound_decoder_bytes == small, "peer 0 should keep its small block");
+    Require(PeerStats(engine, 0).inbound_decoder_bytes == small, "peer 0 should keep its small block");
 }
 
 void TestRejectedCopyDoesNotBlockOtherPeersCopy()
@@ -1590,7 +1597,7 @@ void TestRejectedCopyDoesNotBlockOtherPeersCopy()
     Require(engine.stats().submit_rejected == 1, "the bad copy should be rejected by the node");
     DeliverBlock(engine, kPeer0, honest, submitter);
     Require(submitter.submit_calls == 2 && engine.stats().submit_successes == 1, "the honest copy must still be submitted");
-    Require(PeerStats(engine, 1)->fault_score == 1 && PeerStats(engine, 0)->fault_score == 0, "only the bad copy's sender is counted");
+    Require(PeerStats(engine, 1).fault_score == 1 && PeerStats(engine, 0).fault_score == 0, "only the bad copy's sender is counted");
 }
 
 void TestSettleUsesTimeAfterNodeCalls()
@@ -1687,8 +1694,8 @@ void TestBufferedChunksCheckedBeforeEviction()
     engine.OnBlockHeader(kPeer0, BuildHeaderPayload(bad.encoded, bad.prefix, bad.bytes.size()), submitter);
 
     Require(engine.stats().inbound_evictions == 0, "nothing should be evicted for a block that cannot be decoded");
-    Require(PeerStats(engine, 0)->inbound_decoder_bytes == config.max_inbound_decoder_bytes_per_peer, "the other block should be kept");
-    Require(PeerStats(engine, 0)->faults == 1, "the bad block should count against the peer");
+    Require(PeerStats(engine, 0).inbound_decoder_bytes == config.max_inbound_decoder_bytes_per_peer, "the other block should be kept");
+    Require(PeerStats(engine, 0).faults == 1, "the bad block should count against the peer");
 }
 
 void TestKnownInvalidBlockSettledForAllCopies()
@@ -1702,8 +1709,9 @@ void TestKnownInvalidBlockSettledForAllCopies()
     DeliverBlock(engine, kPeer0, block, submitter);
     DeliverBlock(engine, kPeer1, block, submitter);
     Require(submitter.submit_calls == 1, "a block the node holds as invalid should be submitted once");
-    Require(engine.stats().submit_rejected == 1, "it counts as rejected");
-    Require(PeerStats(engine, 0)->faults == 1, "and against the first sender");
+    Require(engine.stats().submit_rejected == 1 && engine.stats().submit_failures == 1, "it counts as rejected once");
+    Require(PeerStats(engine, 0).faults == 1, "and against the first sender");
+    Require(PeerStats(engine, 1).faults == 0, "but not against later senders");
 }
 
 void TestHandledBlockTimedAfterNodeCalls()
@@ -1713,15 +1721,13 @@ void TestHandledBlockTimedAfterNodeCalls()
     CapturingSubmitter submitter;
     submitter.submit_result = SubmitOutcome::kRejected;
     // The node takes longer to answer than the time remaining chunks are ignored for.
-    submitter.check_hook = [&clock] { clock.Advance(std::chrono::seconds{6}); };
     submitter.submit_hook = [&clock](std::span<const std::uint8_t>) {
-        clock.Advance(std::chrono::seconds{6});
+        clock.Advance(std::chrono::seconds{11});
         return SubmitOutcome::kRejected;
     };
 
     const TestBlock block = EncodeTestBlock(300, 0xF870);
     DeliverBlock(engine, kPeer0, block, submitter);
-    submitter.check_hook = {};
     // The sender's remaining chunks, read after the node calls return, are still ignored.
     for (std::size_t i = block.encoded.params.data_chunks; i < 20; ++i) {
         engine.OnBlockChunk(kPeer0, BuildChunkPayload(block.encoded.chunks[i], block.prefix), submitter);
@@ -1854,8 +1860,8 @@ void TestWorstCaseInboundDecodersStayWithinBound()
                 engine.OnBlockHeader(peer, header, submitter);
                 peak = std::max(peak, HeapGrowthSince(base));
                 charged_peak = std::max<std::size_t>(charged_peak, engine.stats().inbound_decoder_bytes);
-                const auto peer_stats = PeerStats(engine, slot);
-                Require(peer_stats.has_value() && peer_stats->inbound_decoder_bytes <= defaults.max_inbound_decoder_bytes_per_peer,
+                const PeerRelayStats peer_stats = PeerStats(engine, slot);
+                Require(peer_stats.inbound_decoder_bytes <= defaults.max_inbound_decoder_bytes_per_peer,
                         "per-peer decoder charge must stay within its limit");
             }
         }
