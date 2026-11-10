@@ -64,10 +64,28 @@ def dearmor(data: bytes) -> bytes:
     return base64.b64decode("".join(body))
 
 
+def crc24(raw: bytes) -> int:
+    """The OpenPGP armor checksum (RFC 4880, section 6.1)."""
+
+    crc = 0xB704CE
+    for byte in raw:
+        crc ^= byte << 16
+        for _ in range(8):
+            crc <<= 1
+            if crc & 0x1000000:
+                crc ^= 0x1864CFB
+    return crc & 0xFFFFFF
+
+
 def armor(raw: bytes) -> bytes:
+    # With its checksum line, as gpg writes it: without one, gpg misreads the
+    # END line of any armor whose data is a multiple of three bytes long.
     encoded = base64.b64encode(raw).decode("ascii")
     lines = [encoded[index : index + 64] for index in range(0, len(encoded), 64)]
-    return ("-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n" + "\n".join(lines) + "\n-----END PGP PUBLIC KEY BLOCK-----\n").encode("ascii")
+    checksum = base64.b64encode(crc24(raw).to_bytes(3, "big")).decode("ascii")
+    return (
+        "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n" + "\n".join(lines) + f"\n={checksum}\n-----END PGP PUBLIC KEY BLOCK-----\n"
+    ).encode("ascii")
 
 
 def packets(raw: bytes) -> list[tuple[int, int, bytes]]:
@@ -101,6 +119,29 @@ def packets(raw: bytes) -> list[tuple[int, int, bytes]]:
         signature_type = body[1] if tag == 2 and body and body[0] in (4, 5, 6) else -1
         out.append((tag, signature_type, raw[start:index]))
     return out
+
+
+# CI must run these tests: without gpg they fail there, and only skip locally.
+@unittest.skipUnless(GPG or os.environ.get("CI"), "gpg is required (in CI these tests fail instead)")
+class ArmorTest(unittest.TestCase):
+    def test_gpg_reads_the_armor_back_at_every_length(self) -> None:
+        # A certificate's length changes from run to run, since a signature's
+        # integers drop leading zero bytes; gpg must read back each length.
+        if not GPG:
+            raise AssertionError("gpg is required for the key policy gate contract tests")
+        data = bytes(range(256)) * 2
+        with tempfile.TemporaryDirectory() as home:
+            os.chmod(home, 0o700)
+            for length in (300, 301, 302):
+                with self.subTest(length=length):
+                    raw = data[:length]
+                    result = subprocess.run(
+                        [GPG, "--homedir", home, "--batch", "--dearmor"], input=armor(raw), capture_output=True, check=False
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+                    self.assertEqual(result.stdout, raw)
+                    self.assertEqual(dearmor(armor(raw)), raw)
+            subprocess.run(["gpgconf", "--homedir", home, "--kill", "all"], check=False, capture_output=True)
 
 
 # CI must run these tests: without gpg they fail there, and only skip locally.
