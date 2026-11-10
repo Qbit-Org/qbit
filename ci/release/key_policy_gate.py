@@ -132,6 +132,8 @@ GATE_WORKFLOW_KEYS = {"name", "on", "permissions", "concurrency", "jobs"}
 GATE_JOB_KEYS = {"name", "runs-on", "timeout-minutes", "permissions", "steps"}
 GATE_STEP_KEYS = {"name", "env", "run", "uses", "with"}
 GATE_CHECKOUT_KEYS = {"ref", "fetch-depth", "persist-credentials"}
+# The gate reads history (merge bases, a policy's past): the checkout is full.
+GATE_FETCH_DEPTH = 0
 GATE_TRIGGER = {"pull_request_target": {"types": ["opened", "synchronize", "reopened", "edited", "ready_for_review"]}}
 GATE_CONCURRENCY = {"group": "key-policy-gate-${{ github.event.pull_request.number }}", "cancel-in-progress": "true"}
 GATE_PERMISSIONS = {"contents": "read"}
@@ -650,12 +652,15 @@ def strings(node) -> list[str]:
     return found
 
 
+YAML_NULLS = {"", "~", "null", "Null", "NULL"}
+
+
 def declares(permissions) -> bool:
-    """Whether a `permissions` value sets the token's permissions; empty or null leaves the default."""
+    """Whether a `permissions` value sets the token's permissions; empty or null (as YAML spells it) leaves the default."""
 
     if permissions is None:
         return False
-    return not (isinstance(permissions, str) and squeezed(permissions) in {"", "~", "null"})
+    return not (isinstance(permissions, str) and permissions.strip() in YAML_NULLS)
 
 
 def can_post_checks(permissions) -> bool:
@@ -830,8 +835,10 @@ def check_gate_workflow(path: str, data: bytes) -> None:
         extra = sorted(str(key) for key in step if key not in GATE_STEP_KEYS)
         if extra:
             raise GateError(f"{path}: a step may not use {', '.join(extra)}")
+        if ("run" in step) == ("uses" in step) or ("with" in step and "uses" not in step):
+            raise GateError(f"{path}: a step must either run a command or use an action, with settings only for an action")
         env = step.get("env")
-        if env is not None and not (isinstance(env, str) and squeezed(env) in {"", "~", "null"}):
+        if env is not None and not (isinstance(env, str) and env.strip() in YAML_NULLS):
             if not isinstance(env, dict):
                 raise GateError(f"{path}: a step's env must be a mapping")
             for name, value in env.items():
@@ -856,6 +863,9 @@ def check_gate_workflow(path: str, data: bytes) -> None:
         raise GateError(f"{path}: its checkout may set only {', '.join(sorted(GATE_CHECKOUT_KEYS))}")
     if str(settings.get("persist-credentials")).lower() != "false":
         raise GateError(f"{path}: its checkout must not persist credentials (persist-credentials: false)")
+    depth = settings.get("fetch-depth")
+    if not isinstance(depth, int) or isinstance(depth, bool) or depth != GATE_FETCH_DEPTH:
+        raise GateError(f"{path}: its checkout must fetch the full history (fetch-depth: {GATE_FETCH_DEPTH})")
 
 
 def check_gate_check_name(head: str, changed: list[str]) -> None:
@@ -981,7 +991,14 @@ def check_target(base: str, head: str, work: Path) -> None:
     bytecode = [path for _mode, _kind, _oid, path in tree(head) if is_bytecode(path)]
     if bytecode:
         raise GateError(f"Python bytecode caches may not be committed: {', '.join(map(shown, bytecode))}")
-    merge_base = git("merge-base", base, head).decode().strip()
+    # With more than one merge base, git's diff and GitHub's merge could start
+    # from different commits: the pull request first takes in its base.
+    merge_bases = git("merge-base", "--all", base, head).decode().split()
+    if len(merge_bases) != 1:
+        raise GateError(
+            f"{len(merge_bases)} merge bases with the base branch: merge the base branch into the pull request first"
+        )
+    merge_base = merge_bases[0]
     changed = [
         name.decode("utf8", errors="surrogateescape")
         for name in split_nul(git("diff", "--no-renames", "--name-only", "-z", merge_base, head))

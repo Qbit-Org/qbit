@@ -699,7 +699,7 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
             "permissions:\n  contents: read\n"
             "jobs:\n  key-policy-gate:\n    name: Key Policy Gate (${{ github.event.pull_request.base.ref }})\n    runs-on: ubuntu-24.04\n"
             "    steps:\n      - uses: actions/checkout@0000000000000000000000000000000000000000\n"
-            "        with:\n          ref: ${{ github.event.pull_request.base.sha }}\n          persist-credentials: false\n"
+            "        with:\n          ref: ${{ github.event.pull_request.base.sha }}\n          fetch-depth: 0\n          persist-credentials: false\n"
             "      - name: Gate\n        env:\n          BASE_SHA: ${{ github.event.pull_request.base.sha }}\n        run: echo gate\n"
         )
         cases = {
@@ -716,12 +716,12 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
             "a job strategy": (good.replace("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-24.04\n    strategy: {matrix: {a: [1]}}\n"), "its job may not use strategy"),
             "a job that needs another": (good.replace("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-24.04\n    needs: [other]\n"), "its job may not use needs"),
             "a reusable workflow job": (good.replace("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-24.04\n    uses: ./.github/workflows/other.yml\n"), "its job may not use uses"),
-            "no checkout": (good.replace("      - uses: actions/checkout@0000000000000000000000000000000000000000\n        with:\n          ref: ${{ github.event.pull_request.base.sha }}\n          persist-credentials: false\n", ""), "must check out exactly the pull request's base commit"),
-            "two checkouts": (good.replace("      - name: Gate\n", "      - uses: actions/checkout@0000000000000000000000000000000000000000\n        with:\n          ref: ${{ github.event.pull_request.base.sha }}\n          persist-credentials: false\n      - name: Gate\n"), "must check out exactly the pull request's base commit"),
+            "no checkout": (good.replace("      - uses: actions/checkout@0000000000000000000000000000000000000000\n        with:\n          ref: ${{ github.event.pull_request.base.sha }}\n          fetch-depth: 0\n          persist-credentials: false\n", ""), "must check out exactly the pull request's base commit"),
+            "two checkouts": (good.replace("      - name: Gate\n", "      - uses: actions/checkout@0000000000000000000000000000000000000000\n        with:\n          ref: ${{ github.event.pull_request.base.sha }}\n          fetch-depth: 0\n          persist-credentials: false\n      - name: Gate\n"), "must check out exactly the pull request's base commit"),
             "a moving checkout ref": (good.replace("actions/checkout@0000000000000000000000000000000000000000", "actions/checkout@main"), "pinned to a commit"),
             "persisted credentials": (good.replace("          persist-credentials: false\n", ""), "must not persist credentials"),
             "a checkout of another repository": (good.replace("          persist-credentials: false\n", "          persist-credentials: false\n          repository: someone/else\n"), "its checkout may set only"),
-            "checkout settings as text": (good.replace("        with:\n          ref: ${{ github.event.pull_request.base.sha }}\n          persist-credentials: false\n", "        with: x\n"), "must check out exactly the pull request's base commit"),
+            "checkout settings as text": (good.replace("        with:\n          ref: ${{ github.event.pull_request.base.sha }}\n          fetch-depth: 0\n          persist-credentials: false\n", "        with: x\n"), "must check out exactly the pull request's base commit"),
             "another shell by default": (good.replace("jobs:\n", "defaults:\n  run:\n    shell: 'true {0}'\njobs:\n"), "its workflow may not use defaults"),
             "a job in a container": (good.replace("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-24.04\n    container: someone/image\n"), "its job may not use container"),
             "a step with another shell": (good.replace("      - name: Gate\n", "      - name: Gate\n        shell: 'true {0}'\n"), "a step may not use shell"),
@@ -741,6 +741,17 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
             "a fullwidth action": (good.replace("actions/checkout@0000000000000000000000000000000000000000", "\uff41ctions/checkout@0000000000000000000000000000000000000000"), "pinned to a commit"),
             "services": (good.replace("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-24.04\n    services: {db: {image: x}}\n"), "its job may not use services"),
             "a step id": (good.replace("      - name: Gate\n", "      - name: Gate\n        id: gate\n"), "a step may not use id"),
+            "a shallow checkout": (good.replace("          fetch-depth: 0\n", ""), "must fetch the full history"),
+            "a checkout depth of one": (good.replace("          fetch-depth: 0\n", "          fetch-depth: 1\n"), "must fetch the full history"),
+            "a checkout depth the pull request picks": (good.replace("          fetch-depth: 0\n", "          fetch-depth: ${{ github.event.pull_request.commits }}\n"), "must fetch the full history"),
+            "a long timeout": (good.replace("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-24.04\n    timeout-minutes: 361\n"), "timeout-minutes must be"),
+            "a timeout in words": (good.replace("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-24.04\n    timeout-minutes: twenty\n"), "timeout-minutes must be"),
+            "job permissions beyond the workflow's": (good.replace("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-24.04\n    permissions:\n      contents: write\n"), "may only read contents"),
+            "a branch filter": (good.replace("    types: [opened, synchronize, reopened, edited, ready_for_review]\n", "    types: [opened, synchronize, reopened, edited, ready_for_review]\n    branches: [main]\n"), "may run only on pull_request_target"),
+            "null spelled otherwise": (good.replace("permissions:\n  contents: read\n", "permissions: NuLl\n"), "may only read contents"),
+            "a step that runs and uses": (good.replace("        run: echo gate\n", "        run: echo gate\n        uses: actions/checkout@0000000000000000000000000000000000000000\n"), "either run a command or use an action"),
+            "a step with only a name": (good.replace("      - name: Gate\n", "      - name: Nothing\n      - name: Gate\n"), "either run a command or use an action"),
+            "settings on a run step": (good.replace("        run: echo gate\n", "        run: echo gate\n        with: {a: b}\n"), "settings only for an action"),
             "permissions on the job": (good.replace("permissions:\n  contents: read\n", "").replace("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-24.04\n    permissions:\n      contents: read\n", 1), None),
             "a checkout spelled otherwise": (good.replace("      - name: Gate\n", "      - uses: Actions/Checkout@v5\n        with:\n          ref: ${{ github.event.pull_request.head.sha }}\n      - name: Gate\n"), "pinned to a commit"),
             "another action": (good.replace("      - name: Gate\n", "      - uses: ./.github/actions/setup\n      - name: Gate\n"), "may use no action but actions/checkout"),
@@ -835,6 +846,19 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
             required,
             {base: [f"{key_policy_gate.GATE_CHECK_NAME} ({base})"] for base in key_policy_gate.GATE_BASES},
         )
+
+    def test_target_refuses_a_head_with_two_merge_bases(self) -> None:
+        # Criss-cross history: git's diff and GitHub's merge could start from different commits.
+        tree = self.git("rev-parse", f"{self.base}^{{tree}}")
+        first = self.git("commit-tree", tree, "-p", self.base, "-m", "first")
+        second = self.git("commit-tree", tree, "-p", self.base, "-m", "second")
+        self.base = self.git("commit-tree", tree, "-p", first, "-p", second, "-m", "base merges both")
+        self.edit("doc/notes.md", "Notes.\n")
+        self.git("add", "-A")
+        head_tree = self.git("write-tree")
+        self.git("update-ref", "HEAD", self.git("commit-tree", head_tree, "-p", second, "-p", first, "-m", "head merges both"))
+        self.git("reset", "--quiet", "--hard", "HEAD")
+        self.assert_target_refused("2 merge bases with the base branch")
 
     def test_target_refuses_control_characters_in_gate_paths(self) -> None:
         # A line break in a path could make two different file sets share a manifest.
