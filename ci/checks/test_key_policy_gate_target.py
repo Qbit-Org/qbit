@@ -545,7 +545,8 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
 
     def test_target_handles_gate_paths_that_are_not_utf8(self) -> None:
         (self.repo / "ci" / "checks").mkdir(parents=True, exist_ok=True)
-        with open(os.path.join(os.fsencode(self.repo), b"ci", b"checks", b"data-\xff.txt"), "wb") as handle:
+        path = os.path.join(os.fsencode(self.repo), b"ci", b"checks", b"data-\xff.txt")
+        with open(path, "wb") as handle:
             handle.write(b"data\n")
         self.commit("a file with a name that is not UTF-8")
         # Refused, not crashed: a signer could not read such a path in the manifest.
