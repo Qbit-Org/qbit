@@ -1205,6 +1205,41 @@ void CWallet::AddToSpends(const CWalletTx& wtx)
         AddToSpends(txin.prevout, wtx.GetHash());
 }
 
+//! Tell listeners that an encryption has ended. This runs in a destructor and
+//! in an exception handler, which cannot pass a listener's exception on, so
+//! the exception is logged instead.
+static void NotifyEncryptionEnded(const CWallet& wallet, boost::signals2::signal<void()>& notify) noexcept
+{
+    try {
+        notify();
+    } catch (const std::exception& e) {
+        wallet.WalletLogPrintf("Encryption-in-progress listener failed: %s\n", e.what());
+    } catch (...) {
+        wallet.WalletLogPrintf("Encryption-in-progress listener failed\n");
+    }
+}
+
+CWallet::EncryptionInProgressScope::EncryptionInProgressScope(CWallet& wallet)
+    : m_wallet{wallet}
+{
+    ++m_wallet.m_encryption_in_progress;
+    try {
+        m_wallet.NotifyEncryptionInProgressChanged();
+    } catch (...) {
+        // The scope is not created, so end the announcement here: a listener
+        // may already have seen it.
+        --m_wallet.m_encryption_in_progress;
+        NotifyEncryptionEnded(m_wallet, m_wallet.NotifyEncryptionInProgressChanged);
+        throw;
+    }
+}
+
+CWallet::EncryptionInProgressScope::~EncryptionInProgressScope()
+{
+    --m_wallet.m_encryption_in_progress;
+    NotifyEncryptionEnded(m_wallet, m_wallet.NotifyEncryptionInProgressChanged);
+}
+
 //! EncryptWallet holds the descriptor locks in a list, which the thread-safety
 //! analysis cannot follow. Check that this one is held (with DEBUG_LOCKORDER)
 //! and tell the analysis, so that it still checks the calls that need it.
@@ -1217,6 +1252,12 @@ bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase, bool use_cr
 {
     // Only descriptor wallets can be encrypted
     Assert(IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS));
+
+    // Announce the encryption from here until this call returns or throws,
+    // whoever made it, so that listeners such as the GUI stop reading the
+    // wallet before its locks are taken and read it again once the
+    // encryption has finished.
+    const EncryptionInProgressScope encryption_in_progress{*this};
 
     // The key derivation below is tuned to take a noticeable amount of time,
     // so it runs before the wallet locks are taken. A caller that does not

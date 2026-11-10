@@ -462,6 +462,10 @@ private:
     /** WalletFlags set on this wallet. */
     std::atomic<uint64_t> m_wallet_flags{0};
 
+    //! Number of EncryptionInProgressScope objects alive, see
+    //! IsEncryptionInProgress().
+    std::atomic<int> m_encryption_in_progress{0};
+
     bool SetAddressBookWithDB(WalletBatch& batch, const CTxDestination& address, const std::string& strName, const std::optional<AddressPurpose>& strPurpose);
 
     //! Unsets a wallet flag and saves it to disk
@@ -744,6 +748,32 @@ public:
      * set to the reason.
      */
     bool EncryptWallet(const SecureString& strWalletPassphrase, bool use_create_keypool_warmup = false, bilingual_str* new_seed_error = nullptr);
+    //! Whether an encryption is under way, whoever started it. It reads no
+    //! wallet state, so a caller that must not wait for the locks the
+    //! encryption holds can ask it at any time.
+    bool IsEncryptionInProgress() const { return m_encryption_in_progress.load() > 0; }
+
+    /**
+     * Announces an encryption for as long as it lives: IsEncryptionInProgress()
+     * reports it, and NotifyEncryptionInProgressChanged is raised when it is
+     * created and when it is destroyed. EncryptWallet holds one. A caller that
+     * takes the wallet locks before calling EncryptWallet, as the
+     * encryptwallet RPC does, holds another from before it takes them, so
+     * listeners stop reading the wallet before they could wait for those
+     * locks. Scopes nest.
+     */
+    class EncryptionInProgressScope
+    {
+    public:
+        explicit EncryptionInProgressScope(CWallet& wallet);
+        ~EncryptionInProgressScope();
+        EncryptionInProgressScope(const EncryptionInProgressScope&) = delete;
+        EncryptionInProgressScope& operator=(const EncryptionInProgressScope&) = delete;
+
+    private:
+        CWallet& m_wallet;
+    };
+
     /**
      * Rewrite the database file so that deleted plaintext key records no
      * longer remain in its free space, then write the POST_ENCRYPTION_REWRITE
@@ -1088,6 +1118,15 @@ public:
      * Note: Called without locks held.
      */
     boost::signals2::signal<void (CWallet* wallet)> NotifyStatusChanged;
+
+    /**
+     * An encryption started or ended, see EncryptionInProgressScope.
+     * Notifications from overlapping encryptions can be seen in any order, so
+     * a listener reads IsEncryptionInProgress() rather than counting them.
+     * Note: Can be called with cs_wallet held, as EncryptWallet does when its
+     * caller holds it, so a listener must not wait for wallet locks.
+     */
+    boost::signals2::signal<void ()> NotifyEncryptionInProgressChanged;
 
     /** Inquire whether this wallet broadcasts transactions. */
     bool GetBroadcastTransactions() const { return fBroadcastTransactions; }
