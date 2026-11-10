@@ -112,6 +112,33 @@ class KeyPolicyGateContractTest(unittest.TestCase):
             raise AssertionError("gpg is required for the key policy gate contract tests")
         cls.class_tmp = tempfile.TemporaryDirectory()
         cls.class_root = Path(cls.class_tmp.name)
+        # Every git command these tests run reads this configuration, not the
+        # caller's: nothing they commit is signed, whoever runs them.
+        passed = [name for name in os.environ if name.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))]
+        # Run from a git hook, the caller's repository would be ours too.
+        passed += [
+            name for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR",
+                              "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX", "GIT_TEMPLATE_DIR",
+                              "GIT_ATTR_SOURCE")
+            if name in os.environ
+        ]
+        cls.saved_environ = {
+            name: os.environ.get(name)
+            for name in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_ATTR_NOSYSTEM", "GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", *passed)
+        }
+        git_config = cls.class_root / "gitconfig"
+        git_config.write_text(
+            "[commit]\n\tgpgsign = false\n[tag]\n\tgpgsign = false\n"
+            "[core]\n\texcludesFile = /dev/null\n\tattributesFile = /dev/null\n"
+            "[user]\n\tname = Key policy fixture\n\temail = key-policy-fixture@example.invalid\n",
+            encoding="utf8",
+        )
+        for name in ("GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", *passed):
+            os.environ.pop(name, None)
+        os.environ["GIT_CONFIG_GLOBAL"] = str(git_config)
+        os.environ["GIT_CONFIG_NOSYSTEM"] = "1"
+        os.environ["GIT_ATTR_NOSYSTEM"] = "1"
+        cls.addClassCleanup(cls.restore_environ)
         cls.home = cls.class_root / "gnupg"
         cls.home.mkdir(mode=0o700)
         cls.script, cls.step_env = gate_step()
@@ -198,6 +225,14 @@ class KeyPolicyGateContractTest(unittest.TestCase):
         )
         if result.returncode != 0:
             raise AssertionError(f"gpg --edit-key {primary} failed:\n{result.stderr}")
+
+    @classmethod
+    def restore_environ(cls) -> None:
+        for name, value in cls.saved_environ.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -345,6 +380,9 @@ class KeyPolicyGateContractTest(unittest.TestCase):
         env = {
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "HOME": str(self.root),
+            "GIT_CONFIG_GLOBAL": os.environ["GIT_CONFIG_GLOBAL"],
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_ATTR_NOSYSTEM": "1",
             "GNUPGHOME": str(self.root / "unused-gnupg"),
             "RUNNER_TEMP": str(runner_temp),
             "EVENT_NAME": "pull_request",
@@ -508,6 +546,24 @@ class KeyPolicyGateContractTest(unittest.TestCase):
         self.assert_refused("certificate must hold exactly one primary key, got 2")
 
 
+    def test_git_reads_the_fixture_configuration(self) -> None:
+        # Whoever runs these tests, nothing they commit asks for a signature.
+        self.assertEqual(os.environ.get("GIT_CONFIG_NOSYSTEM"), "1")
+        self.assertEqual(os.environ.get("GIT_CONFIG_GLOBAL"), str(self.class_root / "gitconfig"))
+        self.assertEqual(self.git("config", "--global", "--get", "commit.gpgsign"), "false")
+        self.assertEqual(self.git("config", "--global", "--get", "tag.gpgsign"), "false")
+        self.assertEqual(self.git("config", "--global", "--get", "core.excludesFile"), "/dev/null")
+        self.assertEqual(self.git("config", "--global", "--get", "core.attributesFile"), "/dev/null")
+        self.assertEqual(os.environ.get("GIT_ATTR_NOSYSTEM"), "1")
+        self.assertNotIn("GIT_CONFIG_COUNT", os.environ)
+        self.assertNotIn("GIT_CONFIG_PARAMETERS", os.environ)
+
+    def test_unset_attributes_on_the_policy_are_allowed(self) -> None:
+        # -text and -export-ignore change no bytes of the policy's files.
+        (self.repo / ".gitattributes").write_text("contrib/keys/operator-keys/** -text -export-ignore\n", encoding="utf8")
+        self.commit("unset attributes on the policy")
+        self.assert_accepted("Base policy: unchanged")
+
     # Reading the policy --------------------------------------------------
 
     def changed_paths(self) -> dict[str, str]:
@@ -596,7 +652,10 @@ class KeyPolicyGateContractTest(unittest.TestCase):
         result = self.run_gate()
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertIn("Checking the change with the base's validator", result.stdout)
-        self.assertIn("previous_policy_sha256 does not match", result.stderr)
+        # The validators' errors reach the log through the gate's own output,
+        # and the gate ends on its summary, whatever the head's validator lacks.
+        self.assertIn("previous_policy_sha256 does not match", result.stdout)
+        self.assertTrue(result.stdout.splitlines()[-1].startswith("::error::"), result.stdout + result.stderr)
 
     # Approval material ------------------------------------------------
 
@@ -892,7 +951,7 @@ class KeyPolicyGateContractTest(unittest.TestCase):
             approvers=["operator-01", "operator-04"],
         )
         self.commit("sequence 3 policy")
-        self.assert_refused("No .gitattributes rule may match files under contrib/keys/operator-keys: remove or narrow the rule")
+        self.assert_refused("No .gitattributes rule may set this attribute for files under contrib/keys/operator-keys")
 
     def test_keys_md_must_match_keys_json(self) -> None:
         self.write_keys_md()

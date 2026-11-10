@@ -39,7 +39,7 @@
             "context": "Required Merge Gate"
           },
           {
-            "context": "Key Policy Gate",
+            "context": "Key Policy Gate (1.x.x)",
             "integration_id": 15368
           }
         ],
@@ -54,10 +54,16 @@
           "rebase"
         ],
         "dismiss_stale_reviews_on_push": true,
+        "dismissal_restriction": {
+          "allowed_actors": [],
+          "enabled": false
+        },
         "require_code_owner_review": true,
+        "require_extra_approval_for_unattributed_changes": true,
         "require_last_push_approval": true,
         "required_approving_review_count": 1,
-        "required_review_thread_resolution": true
+        "required_review_thread_resolution": true,
+        "required_reviewers": []
       }
     }
   ]

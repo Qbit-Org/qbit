@@ -96,8 +96,10 @@ pull request's `contrib/keys/operator-keys` against the base branch's
   every directory on the path must be a directory, and every file under it a
   regular file (mode 100644), so symlinks are refused, and no path may have
   more than one tree entry. No checkout or archive attribute (`text`, `eol`,
-  `filter`, `ident`, `export-ignore`, ...) may apply to the policy's files at
-  the head, read with `core.ignorecase` both off and on. The head may not hold
+  `filter`, `ident`, `export-ignore`, ...) may be set or given a value for
+  the policy's files at the head, read with `core.ignorecase` both off and on;
+  an attribute may only be left unspecified or unset (`-text`), which changes
+  no bytes. The head may not hold
   a path that equals the policy path, or `.gitattributes`, only after Unicode
   compatibility normalisation and case folding, since case-insensitive
   checkouts would treat it as the same file. The directory must hold exactly
@@ -142,35 +144,90 @@ pull request's `contrib/keys/operator-keys` against the base branch's
   refreshed key drops the older one and is refused.
 
 **Base-only gate.** The checks above live in code a pull request can change,
-so the `Key Policy Gate` check (`.github/workflows/key-policy-gate.yml`) runs
-them with the base branch's code only. It is triggered by
-`pull_request_target`, so GitHub runs the base branch's definition of the
-workflow; it checks out only the base commit, without credentials, fetches the
-pull request's head as git objects, and executes nothing from it. Its script,
-`ci/release/key_policy_gate.py`, finds the paths the pull request changes
-against its merge base with the base branch:
+so the Key Policy Gate (`.github/workflows/key-policy-gate.yml`) runs them with
+the base branch's own code only. It is triggered by `pull_request_target`, for
+which GitHub runs the workflow as the default branch (`main`) defines it,
+whatever branch a pull request targets. The job:
+
+1. refuses, as a failure and never a skip, a pull request whose base branch is
+   not `main` or `1.x.x`, the branches whose rulesets require the gate;
+2. refuses a base commit that is not that branch's current tip (update the
+   pull request with its base branch: a re-run reuses the old event);
+3. checks out only that base commit, without credentials, fetches the pull
+   request's head as git objects, and executes nothing from it;
+4. runs the base commit's own `ci/release/key_policy_gate.py`, so each release
+   line is checked by its own gate code.
+
+The workflow itself runs as the default branch holds it: an approved change to
+it on `1.x.x` takes effect only when `main` has it. Every release line's gate
+script must therefore keep the command line the workflow uses (`target --base
+--head --work`, run with `-I -B -X pycache_prefix`), and the gate refuses a
+workflow that could skip its job or a step, ignore a failure, or check out
+anything but the base commit.
+
+The check is named for its base, `Key Policy Gate (main)` or
+`Key Policy Gate (1.x.x)`, and each branch's ruleset requires its own name.
+Check results belong to a commit, not to a pull request, so two pull requests
+with the same head share them: a run for a branch that is not allowed fails,
+and a run for the other protected branch posts only that branch's name, so
+neither can satisfy a pull request into `main` or `1.x.x`.
+
+The script finds the paths the pull request changes against its merge base
+with the base branch:
 
 - A change to the key policy (any path the classifier routes to the key job)
   gets the checks above, run by the base's validator.
-- A change to the gate's own code (`GATE_CODE_PATHS` and
-  `GATE_CODE_PREFIXES` in the base's `key_policy_gate.py`: every workflow under
-  `.github/workflows/`, since any workflow could post a check under the gate's
-  name, `.github/CODEOWNERS`, the classifier, the release validators, the
-  gate script and its tests, and this README) needs approvals by the base
-  policy's signers, as below. Composite actions under `.github/actions/`
-  count too. Only `key-policy-gate.yml` may name a job `Key Policy Gate`; this
-  is a line check, and code a pull request runs in its own workflows could
-  still post a status under that name, so the repository settings that limit
-  what workflow tokens may post matter as well.
+- A change to the gate's own code (`GATE_CODE_PREFIXES` and
+  `GATE_CODE_PATHS` in the base's `key_policy_gate.py`) needs approvals by the
+  base policy's signers, as below. Gate code is every file under `ci/release/`,
+  `ci/checks/`, `.github/workflows/` and `.github/actions/`, whatever its type
+  (every workflow counts, since any workflow could post a check under the
+  gate's name), every `CODEOWNERS` file GitHub reads (`.github/`, the root,
+  `docs/`), this README, and every `.gitattributes` at any depth, since
+  attributes change how the gate's code is checked out. The directories
+  themselves and their parents (`ci`, `.github`, `docs`, `contrib`, ...) are
+  gate code too: a symlink in place of one is refused, and a file in place of
+  one needs approvals. Paths are compared
+  case-insensitively (NFKC, then case-folded), as a case-insensitive checkout
+  would compare them. No attribute that changes a checkout's bytes (`text`,
+  `eol`, `crlf`, `filter`, `ident`, `working-tree-encoding`) may be set or
+  given a value for files under those four directories, even with approvals;
+  unset (`-text`, `binary`) is allowed.
 - Any other file under `contrib/keys/` is refused.
+- The pull request's head may not hold a Python bytecode cache (a
+  `__pycache__` directory or a `.pyc`/`.pyo` file) anywhere in its tree;
+  `test/lint/lint-files.py` checks the same for tracked files.
+
+Only `key-policy-gate.yml` may name a job `Key Policy Gate`. On a gate change
+the gate parses every workflow with the distribution's PyYAML (refusing
+repeated keys) and refuses a workflow or job name that can evaluate to the
+check's name, compared case-insensitively and ignoring whitespace. An
+expression in a name may only read a matrix value, such as
+`${{ matrix.name }}`: a value the job's strategy gives as text is put in
+exactly, a combination may also leave it empty, and a computed value or
+matrix stands for any text. It also refuses `checks: write`,
+`statuses: write` and `write-all`, and a workflow the pull request adds or
+changes must declare its token permissions, for itself or for every job.
+`ci-nightly-heavy.yml` and `lint-image-prewarm.yml` declare none yet, so the
+pull request that next changes either must add them. This is a defence in
+depth, not a guarantee: a required check is matched by name and app, so any
+workflow run that may post checks or statuses on the pull request's head (its
+own `pull_request` workflows, or a workflow on another branch) could post one
+under the gate's name, and code can build a name at run time. Keep the
+default workflow token read-only, and consider a ruleset that requires
+`key-policy-gate.yml` by path rather than a check by name.
 
 A gate change is approved in `contrib/keys/gate-approvals/<id>/`:
 
 ```text
-gate.SHA256       "base  <sha256>\n", the SHA-256 of the base's own file lines
-                  below, then one line "<sha256>  <path>\n" for every gate code
-                  file in the pull request's head, sorted by path; each sha256
-                  is that of the file's bytes
+gate.SHA256       "base  <sha256>\n", the SHA-256 of the base's gate code and
+                  gate approval entries ("<mode> <type> <sha256 of the
+                  entry's bytes, or a submodule's object id>\t<path>",
+                  NUL-separated, in tree order); then
+                  one line "<sha256>  <path>\n" for every gate code file in
+                  the pull request's head, sorted by path; each sha256 is that
+                  of the file's bytes, and no gate path may hold a character
+                  that is not printable, such as a line break
 approval-note.md  what the change is and why
 <alias>.asc       detached signatures over gate.SHA256
 ```
@@ -180,19 +237,47 @@ from the base's and the head's git objects and requires that directory, with
 that exact `gate.SHA256`, and good signatures (as release validators count
 them) with distinct primary keys, verified with the base's certificates, that
 meet every release line's `policy_change_quorum` from that line's active
-signers. The pull request must contain its base branch's tip. Because the
-manifest names the base's gate files, an approval covers one change from one
-gate state: a different base state needs new signatures. Like policy
-approvals, it does not expire: it holds again if the base returns to that
-state. No other gate-approval directory may change in the same pull request.
+signers. The pull request must contain its base branch's tip. No other
+gate-approval directory may change in the same pull request, so approvals only
+accumulate, and every approved gate change adds one. The manifest's first line
+covers them, so the base never returns to an earlier gate state, and an
+approval covers exactly one change from one state: reverting a gate change and
+making it again needs new signatures, and a later base state needs new
+signatures too. Like policy approvals, gate approvals carry no expiry date.
 
-The job runs the gate isolated (`python3 -I`), and the gate refuses to start
-otherwise. It adds no directory to the module search path and loads its two
-modules from their own files, so a file added beside it cannot stand in for a
-module it imports. It runs again when a pull request's base branch
+The job runs the gate as `python3 -I -B -X pycache_prefix=<new empty
+directory>`, and the gate refuses to start otherwise, before importing
+anything but built-in modules; its own child processes run the same way.
+`-I` keeps the script's directory off the module search path, and the gate
+loads its two modules from their own files, so a file added beside it cannot
+stand in for a module it imports. `-B` and a pycache prefix outside the
+checkout keep Python from reading a bytecode cache from the checkout, which
+`-I` alone does not. It runs again when a pull request's base branch
 changes. It fetches the pull request without credentials, which works for this
-public repository. The workflow reaches a pull request only once its base
-branch holds it, so it does not check the pull request that adds it.
+public repository.
+
+**Arming the gate.** GitHub runs only the default branch's copy of the
+workflow, and from 2026-12-02 blocks `pull_request_target` in public
+repositories unless an Actions event policy allows it (brownouts on 2026-11-09
+and 2026-11-16, 16:00 to 18:00 UTC, show the block early). The gate is armed in
+this order:
+
+1. this change merges into `1.x.x`;
+2. v1.0.1 is published;
+3. an administrator fast-forwards `main` to the release, which brings the
+   workflow to the default branch;
+4. an Actions event policy allows `pull_request_target` for
+   `.github/workflows/key-policy-gate.yml` (workflow file targeting), before
+   2026-12-02;
+5. the `main` and `1.x.x` rulesets require `Key Policy Gate (main)` and
+   `Key Policy Gate (1.x.x)` respectively (GitHub Actions, integration 15368),
+   with code-owner review and up-to-date branches, as `.github/rulesets/`
+   describes;
+6. `@Qbit-Org/release-maintainers` gets write access, so CODEOWNERS applies.
+
+No ruleset may require the gate before step 3: until `main` holds the
+workflow, no run posts the check, and pull requests would wait for it forever.
+The gate does not check the pull request that adds it.
 
 Release validators count a signature only when gpg's GOODSIG and VALIDSIG
 agree and gpg reports no revoked or expired key or other error for it
@@ -211,7 +296,7 @@ Known limits:
   future `approvals/<policy-id>/`, lands without effect, and later blocks the
   change that adds those files. The gate's error names the file and the
   attribute; remove or narrow the rule (`git check-attr -a -- <path>` shows
-  it), since no attribute may apply under `contrib/keys/operator-keys`.
+  it), since no attribute may be set under `contrib/keys/operator-keys`.
 
 Certificate-only changes, a changed certificate under an unchanged
 `keys.json`, need no separate approval: they are covered by the continuity

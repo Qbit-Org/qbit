@@ -206,7 +206,8 @@ jobs:
           # archive, and checked by ci/release/key_policy_gate.py: the trees,
           # attributes and case-insensitive paths, then this checkout's
           # validator and the base's own (see contrib/keys/README.md).
-          python3 -I ci/release/key_policy_gate.py policy \
+          pycache="$(mktemp -d "${RUNNER_TEMP}/key-policy-pycache.XXXXXX")"
+          /usr/bin/python3 -I -B -X "pycache_prefix=${pycache}" ci/release/key_policy_gate.py policy \
             --base "${base}" --head HEAD --work "${RUNNER_TEMP}/key-policy"
 
   release-policy-validation:
@@ -589,9 +590,10 @@ jobs:
           import json
           from pathlib import Path
 
-          # main and 1.x.x also require the base-only Key Policy Gate, from the
-          # GitHub Actions app, an up-to-date branch, and code-owner review.
-          key_policy_branches = {"main.json", "1.x.x.json"}
+          # main and 1.x.x also require the base-only Key Policy Gate under
+          # their own check name, from the GitHub Actions app, an up-to-date
+          # branch, and code-owner review.
+          key_policy_branches = {"main.json": "Key Policy Gate (main)", "1.x.x.json": "Key Policy Gate (1.x.x)"}
           for path in (
               Path(".github/rulesets/main.json"),
               Path(".github/rulesets/1.0.0.json"),
@@ -602,6 +604,7 @@ jobs:
               checks = []
               strict = None
               code_owner_review = None
+              unattributed = None
               for rule in data.get("rules", []):
                   parameters = rule.get("parameters", {})
                   if rule.get("type") == "required_status_checks":
@@ -609,18 +612,23 @@ jobs:
                       strict = parameters.get("strict_required_status_checks_policy")
                   if rule.get("type") == "pull_request":
                       code_owner_review = parameters.get("require_code_owner_review")
+                      unattributed = parameters.get("require_extra_approval_for_unattributed_changes")
+              # The live rulesets require it; a template without it would drop it.
+              if unattributed is not True:
+                  raise SystemExit(f"{path}: require_extra_approval_for_unattributed_changes must be true")
               contexts = [check.get("context") for check in checks]
               if path.name in key_policy_branches:
-                  expected = ["Required Merge Gate", "Key Policy Gate"]
-                  key_check = next((check for check in checks if check.get("context") == "Key Policy Gate"), {})
+                  gate_check = key_policy_branches[path.name]
+                  expected = ["Required Merge Gate", gate_check]
+                  key_check = next((check for check in checks if check.get("context") == gate_check), {})
                   if contexts != expected or key_check.get("integration_id") != 15368:
                       raise SystemExit(
-                          f"{path}: required status checks must be {expected!r}, with Key Policy Gate "
+                          f"{path}: required status checks must be {expected!r}, with {gate_check} "
                           f"from integration 15368, got {checks!r}"
                       )
                   if strict is not True or code_owner_review is not True:
                       raise SystemExit(f"{path}: strict status checks and code-owner review must be required")
-                  print(f"{path}: Required Merge Gate and Key Policy Gate (strict, code-owner review)")
+                  print(f"{path}: Required Merge Gate and {gate_check} (strict, code-owner review)")
                   continue
               if contexts != ["Required Merge Gate"]:
                   raise SystemExit(
