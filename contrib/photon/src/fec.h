@@ -61,6 +61,8 @@ public:
     bool AddChunk(const Chunk& chunk);
     bool AddChunk(std::uint16_t coding_group_id, std::uint8_t chunk_id, std::span<const std::uint8_t> bytes);
     [[nodiscard]] bool IsComplete() const;
+    /// Distinct chunks accepted so far; repeated chunks and chunks for completed groups do not count.
+    [[nodiscard]] std::size_t ReceivedChunkCount() const;
     std::optional<std::vector<std::uint8_t>> Reconstruct() const;
 
     /// Upper bound, in bytes, of the heap memory a decoder constructed with these arguments holds

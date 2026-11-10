@@ -27,7 +27,7 @@ enum class ParentCheck : std::uint8_t {
     kUnknown,      ///< The node does not know the parent.
     kUnavailable,  ///< The node could not be queried; nothing is known about the parent.
     kAlreadyKnown, ///< The node already has the block itself on its best chain.
-    kNodeBehind,   ///< The node knows the parent only above its best block: it has not caught up.
+    kNodeBehind,   ///< The parent is above the node's best block on a branch with more work: the node is catching up.
 };
 
 [[nodiscard]] const char* SubmitOutcomeName(SubmitOutcome outcome);

@@ -22,6 +22,9 @@
 
 #if defined(__GLIBC__)
 #include <malloc.h>
+#if __GLIBC_PREREQ(2, 33)
+#define PHOTON_TEST_HAVE_MALLINFO2 1
+#endif
 #endif
 
 namespace {
@@ -1246,12 +1249,13 @@ void TestGlobalLimitSparesOtherPeersRecentProgress()
     RelayEngine engine(clock, config);
     CapturingSubmitter submitter;
 
-    const TestBlock block0 = EncodeTestBlock(100, 0xF701);
+    const TestBlock block0 = EncodeTestBlock(5000, 0xF701, 20); // needs 20 chunks
     const TestBlock block1 = EncodeTestBlock(100, 0xF702);
     const TestBlock block2 = EncodeTestBlock(100, 0xF703);
+    auto chunk0 = [&](std::size_t i) { return BuildChunkPayload(block0.encoded.chunks[i], block0.prefix); };
 
     engine.OnBlockHeader(kPeer0, BuildHeaderPayload(block0.encoded, block0.prefix, block0.bytes.size()), submitter);
-    engine.OnBlockChunk(kPeer0, BuildChunkPayload(block0.encoded.chunks[0], block0.prefix), submitter);
+    engine.OnBlockChunk(kPeer0, chunk0(0), submitter);
     engine.OnBlockHeader(kPeer1, BuildHeaderPayload(block1.encoded, block1.prefix, block1.bytes.size()), submitter);
 
     // Both entries are fresh: peer 2 cannot displace either of them.
@@ -1259,18 +1263,134 @@ void TestGlobalLimitSparesOtherPeersRecentProgress()
     Require(engine.stats().inbound_evictions == 0, "entries with recent progress must not be displaced");
     Require(PeerStats(engine, 2)->inbound_rejected == 1, "the new entry should be refused instead");
 
-    // Peer 0 keeps making progress; peer 1 goes quiet past the grace period.
+    // Peer 0 keeps making progress with new chunks; peer 1 only repeats itself, which is not progress.
     clock.Advance(config.inbound_progress_grace);
-    engine.OnBlockHeader(kPeer0, BuildHeaderPayload(block0.encoded, block0.prefix, block0.bytes.size()), submitter);
+    engine.OnBlockChunk(kPeer0, chunk0(1), submitter);
+    engine.OnBlockHeader(kPeer1, BuildHeaderPayload(block1.encoded, block1.prefix, block1.bytes.size()), submitter);
     clock.Advance(std::chrono::milliseconds{1});
-    engine.OnBlockHeader(kPeer2, BuildHeaderPayload(block2.encoded, block2.prefix, block2.bytes.size()), submitter);
+    const TestBlock block3 = EncodeTestBlock(100, 0xF704);
+    engine.OnBlockHeader(kPeer2, BuildHeaderPayload(block3.encoded, block3.prefix, block3.bytes.size()), submitter);
     Require(PeerStats(engine, 1)->inbound_evictions == 1, "the idle entry should be displaced");
     Require(PeerStats(engine, 0)->inbound_evictions == 0, "the active entry must be kept");
 
-    engine.OnBlockChunk(kPeer0, BuildChunkPayload(block0.encoded.chunks[1], block0.prefix), submitter);
-    engine.OnBlockChunk(kPeer2, BuildChunkPayload(block2.encoded.chunks[0], block2.prefix), submitter);
-    engine.OnBlockChunk(kPeer2, BuildChunkPayload(block2.encoded.chunks[1], block2.prefix), submitter);
+    for (std::size_t i = 2; i < block0.encoded.params.data_chunks; ++i) {
+        engine.OnBlockChunk(kPeer0, chunk0(i), submitter);
+    }
+    engine.OnBlockChunk(kPeer2, BuildChunkPayload(block3.encoded.chunks[0], block3.prefix), submitter);
+    engine.OnBlockChunk(kPeer2, BuildChunkPayload(block3.encoded.chunks[1], block3.prefix), submitter);
     Require(submitter.submit_calls == 2, "both remaining blocks should complete");
+}
+
+void TestRepeatedChunksDoNotKeepBlockAlive()
+{
+    MockClock clock{};
+    RelayEngineConfig config{};
+    config.max_inbound_age = std::chrono::seconds{30};
+    RelayEngine engine(clock, config);
+    CapturingSubmitter submitter;
+
+    const TestBlock block = EncodeTestBlock(5000, 0xF710, 20);
+    engine.OnBlockHeader(kPeer1, BuildHeaderPayload(block.encoded, block.prefix, block.bytes.size()), submitter);
+    engine.OnBlockChunk(kPeer1, BuildChunkPayload(block.encoded.chunks[0], block.prefix), submitter);
+    for (int i = 0; i < 3; ++i) {
+        clock.Advance(std::chrono::seconds{9});
+        engine.OnBlockChunk(kPeer1, BuildChunkPayload(block.encoded.chunks[0], block.prefix), submitter);
+        engine.OnBlockHeader(kPeer1, BuildHeaderPayload(block.encoded, block.prefix, block.bytes.size()), submitter);
+    }
+
+    // 31 s after its last new chunk (but 4 s after the last repeat), any inbound activity ages it out.
+    clock.Advance(std::chrono::seconds{4});
+    const TestBlock other = EncodeTestBlock(100, 0xF711);
+    engine.OnBlockChunk(kPeer0, BuildChunkPayload(other.encoded.chunks[0], other.prefix), submitter);
+    Require(PeerStats(engine, 1)->inbound_evictions == 1, "a block that only repeats itself should age out");
+    Require(PeerStats(engine, 1)->inbound_entries == 0, "its state should be released");
+}
+
+void TestCombinedLimitsEvictNothingWhenRefused()
+{
+    const auto params = photon::fec::Parameters::FromOverheadRatio(1.2);
+    const std::size_t charge = photon::fec::Decoder::MemoryBytes(params, 600'000);
+    const auto group_count = static_cast<std::uint16_t>(
+        (600'000 + params.data_chunks * photon::fec::FEC_CHUNK_SIZE - 1) / (params.data_chunks * photon::fec::FEC_CHUNK_SIZE));
+
+    MockClock clock{};
+    RelayEngineConfig config{};
+    config.max_inbound_entries_per_peer = 2;
+    config.max_inbound_decoder_bytes = charge;
+    RelayEngine engine(clock, config);
+    CapturingSubmitter submitter;
+
+    // Peer 1's active block fills the decoder total; peer 0 holds its full entry quota without decoders.
+    BlockHeaderPayload busy{};
+    busy.block_hash_prefix = 0xB0;
+    busy.original_size = 600'000;
+    busy.data_chunks = params.data_chunks;
+    busy.coding_group_count = group_count;
+    engine.OnBlockHeader(kPeer1, busy, submitter);
+    const TestBlock pending1 = EncodeTestBlock(100, 0xF720);
+    const TestBlock pending2 = EncodeTestBlock(100, 0xF721);
+    engine.OnBlockChunk(kPeer0, BuildChunkPayload(pending1.encoded.chunks[0], pending1.prefix), submitter);
+    engine.OnBlockChunk(kPeer0, BuildChunkPayload(pending2.encoded.chunks[0], pending2.prefix), submitter);
+    Require(engine.stats().inbound_entries == 3, "setup should fit");
+
+    // Peer 0's new header would need an entry and decoder memory; the memory cannot be found, so
+    // none of its own entries is given up for it.
+    BlockHeaderPayload wanted = busy;
+    wanted.block_hash_prefix = 0xB1;
+    engine.OnBlockHeader(kPeer0, wanted, submitter);
+    Require(engine.stats().inbound_evictions == 0, "nothing should be evicted for a refused block");
+    Require(PeerStats(engine, 0)->inbound_entries == 2, "peer 0 should keep its entries");
+}
+
+void TestRefusedHeaderRemainingChunksIgnored()
+{
+    MockClock clock{};
+    RelayEngine engine(clock);
+    CapturingSubmitter submitter;
+
+    const auto params = photon::fec::Parameters::FromDataChunkCount(28);
+    const std::vector<std::uint8_t> big = MakeBlock(2'000'000, 0xF730);
+    photon::fec::Encoder encoder(params);
+    const photon::fec::EncodedBlock encoded = encoder.Encode(big);
+    const std::uint64_t prefix = PrefixOf(big);
+
+    engine.OnBlockHeader(kPeer0, BuildHeaderPayload(encoded, prefix, big.size()), submitter);
+    Require(engine.stats().inbound_rejected == 1, "the header should be refused");
+    for (std::size_t i = 0; i < 200; ++i) {
+        engine.OnBlockChunk(kPeer0, BuildChunkPayload(encoded.chunks[i], prefix), submitter);
+    }
+    Require(engine.stats().inbound_rejected == 1, "its chunks should not be counted as further refusals");
+    Require(engine.stats().inbound_entries == 0, "its chunks should not be buffered");
+}
+
+void TestNodeAnsweredBlockStillRelayedOut()
+{
+    MockClock clock{};
+    RelayEngine engine(clock);
+    CapturingSubmitter submitter;
+    submitter.submit_result = SubmitOutcome::kDuplicate;
+
+    const TestBlock block = EncodeTestBlock(300, 0xF740);
+    DeliverBlock(engine, kPeer0, block, submitter);
+    Require(engine.stats().submit_duplicates == 1, "the node already had the block");
+
+    // The local node announcing the block afterwards still sends it on to the other relays.
+    engine.OnNewBlock(photon::ReadBlockHeaderSummary(block.bytes)->hash_hex, block.bytes);
+    Require(engine.stats().blocks_relayed_out == 1, "a block the node already had should still be relayed out");
+}
+
+void TestUnavailableCheckNotRepeatedForCopies()
+{
+    MockClock clock{};
+    RelayEngine engine(clock);
+    CapturingSubmitter submitter;
+    submitter.parent_result = ParentCheck::kUnavailable;
+
+    const TestBlock block = EncodeTestBlock(300, 0xF750);
+    for (const InboundPeerInfo& peer : {kPeer0, kPeer1, kPeer2}) {
+        DeliverBlock(engine, peer, block, submitter);
+    }
+    Require(submitter.check_calls == 1, "the node should be asked once per block, not once per copy");
 }
 
 void TestOversizedDecoderChargeRejected()
@@ -1393,10 +1513,16 @@ void TestRemainingChunksOfHandledBlockIgnored()
     Require(engine.stats().inbound_rejected == before.inbound_rejected, "remaining chunks are not refusals");
     Require(submitter.check_calls == 1, "the block should be handled once");
 
-    // Another peer's copy under the same identifier is still processed.
+    // The verdict is about the block, so another peer's copy is not checked again for a while...
     submitter.parent_result = ParentCheck::kNearTip;
     DeliverBlock(engine, kPeer1, block, submitter);
-    Require(submitter.submit_calls == 1, "another peer's copy should be submitted");
+    Require(submitter.check_calls == 1 && submitter.submit_calls == 0, "another peer's copy should not be re-checked at once");
+    Require(PeerStats(engine, 1)->fault_score == 0, "and does not count against that peer");
+
+    // ...but is processed again once that has expired.
+    clock.Advance(std::chrono::seconds{11});
+    DeliverBlock(engine, kPeer2, block, submitter);
+    Require(submitter.submit_calls == 1, "a later copy should be processed");
 }
 
 void TestFailedReservationEvictsNothing()
@@ -1433,7 +1559,7 @@ void TestFailedReservationEvictsNothing()
     Require(PeerStats(engine, 0)->inbound_decoder_bytes == small, "peer 0 should keep its small block");
 }
 
-#if defined(__GLIBC__)
+#if defined(PHOTON_TEST_HAVE_MALLINFO2)
 std::size_t HeapInUse()
 {
     const struct mallinfo2 info = mallinfo2();
@@ -1477,7 +1603,7 @@ std::size_t LargestChargeableSize(std::uint16_t data_chunks, std::size_t charge_
 
 void TestDefaultBlockDecoderFitsEntryLimit()
 {
-#if defined(__GLIBC__)
+#if defined(PHOTON_TEST_HAVE_MALLINFO2)
     if (!HeapMeasurable()) {
         std::cout << "  (allocator not visible to mallinfo2; skipped)\n";
         return;
@@ -1518,13 +1644,13 @@ void TestDefaultBlockDecoderFitsEntryLimit()
     Require(charge <= defaults.max_inbound_decoder_bytes_per_entry, "default block must fit the per-block limit");
     Require(defaults.max_inbound_decoder_bytes_per_entry - charge >= 128 * 1024, "per-block limit should leave a margin");
 #else
-    std::cout << "  (heap measurement needs glibc; skipped)\n";
+    std::cout << "  (heap measurement needs glibc 2.33 or later; skipped)\n";
 #endif
 }
 
 void TestWorstCaseInboundDecodersStayWithinBound()
 {
-#if defined(__GLIBC__)
+#if defined(PHOTON_TEST_HAVE_MALLINFO2)
     if (!HeapMeasurable()) {
         std::cout << "  (allocator not visible to mallinfo2; skipped)\n";
         return;
@@ -1574,7 +1700,7 @@ void TestWorstCaseInboundDecodersStayWithinBound()
     Require(peak <= charged_peak + kBookkeepingAllowance, "measured memory must stay within the charge");
     Require(peak <= defaults.max_inbound_decoder_bytes + kBookkeepingAllowance, "measured memory must stay within the documented bound");
 #else
-    std::cout << "  (heap measurement needs glibc; skipped)\n";
+    std::cout << "  (heap measurement needs glibc 2.33 or later; skipped)\n";
 #endif
 }
 
@@ -1625,6 +1751,11 @@ int RunAllTests()
         {"invalid_chunk_after_header_counts_against_peer", TestInvalidChunkAfterHeaderCountsAgainstPeer},
         {"remaining_chunks_of_handled_block_ignored", TestRemainingChunksOfHandledBlockIgnored},
         {"failed_reservation_evicts_nothing", TestFailedReservationEvictsNothing},
+        {"repeated_chunks_do_not_keep_block_alive", TestRepeatedChunksDoNotKeepBlockAlive},
+        {"combined_limits_evict_nothing_when_refused", TestCombinedLimitsEvictNothingWhenRefused},
+        {"refused_header_remaining_chunks_ignored", TestRefusedHeaderRemainingChunksIgnored},
+        {"node_answered_block_still_relayed_out", TestNodeAnsweredBlockStillRelayedOut},
+        {"unavailable_check_not_repeated_for_copies", TestUnavailableCheckNotRepeatedForCopies},
     };
 
     int failures = 0;

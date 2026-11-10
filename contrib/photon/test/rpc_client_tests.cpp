@@ -808,6 +808,17 @@ void TestCheckParentNodeBehind()
                    photon::ParentCheck::kNodeBehind,
                    {"getbestblockhash", "getblockheader", "getblockheader", "getblockheader"}},
                   prev);
+    // A longer branch with less work than the best chain is judged by its chain work instead.
+    RunParentCase("longer low-work branch",
+                  {{ServerStep{JsonResult("\"" + best + "\"")},
+                    BlockNotFound(),
+                    ServerStep{HeaderReply(prev, -1, 105, ChainWork("040"))},
+                    ServerStep{HeaderReply(best, 1, 100, ChainWork("1f5"))},
+                    ServerStep{JsonResult("\"" + HashHex('c') + "\"")},
+                    ServerStep{HeaderReply(HashHex('c'), 7, 94, ChainWork("1ef"))}},
+                   photon::ParentCheck::kTooFar,
+                   {"getbestblockhash", "getblockheader", "getblockheader", "getblockheader", "getblockhash", "getblockheader"}},
+                  prev);
 }
 
 void TestCheckParentUnavailable()

@@ -18,6 +18,9 @@
 
 #if defined(__GLIBC__)
 #include <malloc.h>
+#if __GLIBC_PREREQ(2, 33)
+#define PHOTON_TEST_HAVE_MALLINFO2 1
+#endif
 #endif
 
 namespace {
@@ -355,7 +358,7 @@ void TestDuplicateAndValidation()
     Require(!decoder.AddChunk(99, 1, by_id[1]->bytes), "invalid group id should be rejected");
 }
 
-#if defined(__GLIBC__)
+#if defined(PHOTON_TEST_HAVE_MALLINFO2)
 std::size_t HeapGrowthSince(std::size_t base)
 {
     const struct mallinfo2 info = mallinfo2();
@@ -413,7 +416,7 @@ std::size_t MeasureDecoderPeak(const Parameters& params, const std::vector<std::
 
 void TestDecoderMemoryChargeCoversHeap()
 {
-#if defined(__GLIBC__)
+#if defined(PHOTON_TEST_HAVE_MALLINFO2)
     if (!HeapMeasurable()) {
         std::cout << "  (allocator not visible to mallinfo2; skipped)\n";
         return;
@@ -444,7 +447,7 @@ void TestDecoderMemoryChargeCoversHeap()
         Require(peak <= charge, "charge below measured heap for multi-group data_chunks=" + std::to_string(data_chunks));
     }
 #else
-    std::cout << "  (heap measurement needs glibc; skipped)\n";
+    std::cout << "  (heap measurement needs glibc 2.33 or later; skipped)\n";
 #endif
 }
 

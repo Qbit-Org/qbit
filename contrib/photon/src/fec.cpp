@@ -354,6 +354,7 @@ public:
         }
 
         group.seen[chunk_id] = true;
+        ++m_received_chunks;
 
         if (group.use_cm256) {
             group.chunk_data.emplace_back();
@@ -387,6 +388,11 @@ public:
     [[nodiscard]] bool IsComplete() const
     {
         return AllGroupsComplete();
+    }
+
+    [[nodiscard]] std::size_t ReceivedChunkCount() const
+    {
+        return m_received_chunks;
     }
 
     std::optional<std::vector<std::uint8_t>> Reconstruct() const
@@ -557,6 +563,7 @@ private:
     std::size_t m_group_payload_bytes{0};
     std::uint16_t m_group_count{0};
     std::vector<GroupState> m_groups{};
+    std::size_t m_received_chunks{0};
 };
 
 Decoder::Decoder(Parameters params, std::size_t original_size)
@@ -589,6 +596,11 @@ bool Decoder::AddChunk(
 bool Decoder::IsComplete() const
 {
     return m_impl->IsComplete();
+}
+
+std::size_t Decoder::ReceivedChunkCount() const
+{
+    return m_impl->ReceivedChunkCount();
 }
 
 std::optional<std::vector<std::uint8_t>> Decoder::Reconstruct() const

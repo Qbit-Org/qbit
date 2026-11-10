@@ -3,6 +3,7 @@
 
 #include <clock.h>
 #include <fec.h>
+#include <log_rate_limiter.h>
 #include <peer_manager.h>
 #include <protocol.h>
 #include <rpc_client.h>
@@ -187,7 +188,6 @@ private:
         Clock::TimePoint fault_decay_from{};
         Clock::TimePoint suspended_until{};
         std::uint32_t suspension_level{0};
-        bool ever_suspended{false};
         PeerRelayStats stats{};
     };
 
@@ -211,16 +211,14 @@ private:
     void RecordFault(std::size_t slot_index, Clock::TimePoint now);
     void RecordAccepted(std::size_t slot_index, Clock::TimePoint now);
     void SuspendPeer(std::size_t slot_index, Clock::TimePoint now);
-    [[nodiscard]] InboundRelay* GetOrCreateInbound(const InboundRelayKey& key, Clock::TimePoint now);
-    [[nodiscard]] bool ReserveDecoderBytes(const InboundRelayKey& key, InboundRelay& relay, std::size_t bytes, Clock::TimePoint now);
-    [[nodiscard]] std::optional<std::vector<InboundMap::iterator>> PlanEvictions(std::size_t slot_index,
-                                                                                const InboundRelayKey* keep,
-                                                                                bool by_decoder_bytes,
-                                                                                std::size_t own_excess,
-                                                                                std::size_t total_excess,
-                                                                                Clock::TimePoint now);
+    [[nodiscard]] bool MakeRoom(const InboundRelayKey& key, bool new_entry, std::size_t decoder_bytes, Clock::TimePoint now);
+    InboundRelay& CreateInbound(const InboundRelayKey& key, Clock::TimePoint now);
+    void ChargeDecoder(const InboundRelayKey& key, InboundRelay& relay, std::size_t bytes);
     void MarkFinished(const InboundRelayKey& key, Clock::TimePoint now);
     [[nodiscard]] bool IsFinished(const InboundRelayKey& key, Clock::TimePoint now);
+    void SettleInbound(std::uint64_t hash_prefix, Clock::TimePoint now);
+    [[nodiscard]] bool IsSettled(std::uint64_t hash_prefix, Clock::TimePoint now);
+    void LogUnusedBlock(Clock::TimePoint now, std::size_t slot_index, const std::string& block, const char* reason);
     void UpdateUsageStats();
     void EvictExpiredInbound(Clock::TimePoint now);
     InboundMap::iterator EraseInboundAt(InboundMap::iterator it, bool evicted);
@@ -240,10 +238,16 @@ private:
     std::size_t m_inbound_buffered_bytes{0};
     std::size_t m_inbound_decoder_bytes{0};
     std::map<std::size_t, PeerInbound> m_peers{};
-    // Inbound blocks already handled (submitted or dropped), so that the sender's remaining chunks
-    // do not start a new incomplete block.
+    // One peer's blocks already handled or refused, so that the sender's remaining chunks do not
+    // start a new incomplete block.
     std::deque<std::pair<InboundRelayKey, Clock::TimePoint>> m_finished_order{};
     std::unordered_set<InboundRelayKey, InboundRelayKeyHash> m_finished{};
+    // Blocks the node has already answered for (other than accepting them), so that other peers'
+    // copies are not decoded and sent to the node again. Unlike the seen set, this does not stop
+    // the relay from sending the block on when its own node announces it.
+    std::deque<std::pair<std::uint64_t, Clock::TimePoint>> m_settled_order{};
+    std::unordered_set<std::uint64_t> m_settled{};
+    LogRateLimiter m_unused_block_logs{std::chrono::seconds{60}};
 
     std::deque<std::uint64_t> m_seen_order{};
     std::unordered_set<std::uint64_t> m_seen_set{};

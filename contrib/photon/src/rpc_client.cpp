@@ -323,33 +323,6 @@ bool IsUint256Hex(const std::string& value)
     });
 }
 
-bool SendAll(int fd, const std::string& payload)
-{
-    std::size_t sent = 0;
-
-#if defined(MSG_NOSIGNAL)
-    constexpr int kSendFlags = MSG_NOSIGNAL;
-#else
-    constexpr int kSendFlags = 0;
-#endif
-
-    while (sent < payload.size()) {
-        const ssize_t bytes = send(fd, payload.data() + sent, payload.size() - sent, kSendFlags);
-        if (bytes < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return false;
-        }
-        if (bytes == 0) {
-            return false;
-        }
-        sent += static_cast<std::size_t>(bytes);
-    }
-
-    return true;
-}
-
 using Deadline = std::chrono::steady_clock::time_point;
 
 // Time left until `deadline` as a socket timeout; nullopt once it has passed.
@@ -365,6 +338,40 @@ std::optional<timeval> RemainingTimeout(Deadline deadline)
     timeout.tv_sec = static_cast<decltype(timeout.tv_sec)>(micros / 1'000'000);
     timeout.tv_usec = static_cast<suseconds_t>(micros % 1'000'000);
     return timeout;
+}
+
+bool SendAll(int fd, const std::string& payload, Deadline deadline)
+{
+    std::size_t sent = 0;
+
+#if defined(MSG_NOSIGNAL)
+    constexpr int kSendFlags = MSG_NOSIGNAL;
+#else
+    constexpr int kSendFlags = 0;
+#endif
+
+    while (sent < payload.size()) {
+        // Re-arm the send timeout with what is left, so a slow reader cannot outlast the deadline.
+        const auto timeout = RemainingTimeout(deadline);
+        if (!timeout.has_value()) {
+            return false;
+        }
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &*timeout, sizeof(*timeout));
+
+        const ssize_t bytes = send(fd, payload.data() + sent, payload.size() - sent, kSendFlags);
+        if (bytes < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false;
+        }
+        if (bytes == 0) {
+            return false;
+        }
+        sent += static_cast<std::size_t>(bytes);
+    }
+
+    return true;
 }
 
 std::optional<std::string> ReadResponse(int fd, Deadline deadline)
@@ -585,8 +592,9 @@ ParentCheck RpcClient::CheckParent(const std::string& block_hash_hex,
     if (!best.has_value()) {
         return ParentCheck::kUnavailable;
     }
-    if (parent->height > best->height) {
-        // The node knows the parent only as a header above its best block: it is still catching up.
+    if (parent->height > best->height && parent->chainwork > best->chainwork) {
+        // The node knows the parent only as a header on a branch with more work than its best
+        // block: it is still catching up with that branch.
         return ParentCheck::kNodeBehind;
     }
     if (parent->height + depth < best->height) {
@@ -793,7 +801,7 @@ std::optional<RpcClient::HttpResponse> RpcClient::SendHttpRequest(const std::str
         return std::nullopt;
     }
 
-    if (!SendAll(connected_fd, request)) {
+    if (!SendAll(connected_fd, request, deadline)) {
         LOG_WARN("failed to send RPC request");
         close(connected_fd);
         return std::nullopt;
