@@ -9,7 +9,9 @@ This checks that all files in the repository have correct filenames and permissi
 
 import os
 import re
+import shlex
 import sys
+import unicodedata
 from subprocess import check_output
 from typing import Optional, NoReturn
 
@@ -129,6 +131,22 @@ def check_source_filenames(files) -> int:
     return failed_tests
 
 
+def check_no_bytecode() -> int:
+    """
+    Checks that no Python bytecode cache is committed anywhere, including the excluded subtrees:
+    Python can run a committed __pycache__/*.pyc in place of its source.
+    """
+    raw = check_output(["git", "ls-files", "-z", "--full-name"]).decode("utf8", errors="surrogateescape")
+    failed_tests = 0
+    for path in raw.rstrip("\0").split("\0"):
+        # Folded as ci/release/key_policy_gate.py folds paths (NFKC, then casefold).
+        parts = [unicodedata.normalize("NFKC", part).casefold() for part in path.split("/")]
+        if "__pycache__" in parts or parts[-1].endswith((".pyc", ".pyo")):
+            print(f"""File {repr(path)} is a Python bytecode cache, which must not be committed. Do "git rm --cached -- {shlex.quote(path)}".""")
+            failed_tests += 1
+    return failed_tests
+
+
 def check_all_file_permissions(files) -> int:
     """
     Checks all files in the repository match an allowed executable or non-executable file permission octal.
@@ -219,6 +237,7 @@ def main() -> NoReturn:
     failed_tests += check_source_filenames(files)
     failed_tests += check_all_file_permissions(files)
     failed_tests += check_shebang_file_permissions(files)
+    failed_tests += check_no_bytecode()
 
     if failed_tests:
         print(

@@ -347,14 +347,15 @@ def import_release_keys(
 
 
 def status_fingerprints(status_output: str) -> list[str]:
-    fingerprints: list[str] = []
-    for line in status_output.splitlines():
-        if not line.startswith("[GNUPG:] VALIDSIG "):
-            continue
-        fields = line.split()
-        if len(fields) >= 3:
-            fingerprints.append(normalize_fingerprint(fields[2]))
-    return fingerprints
+    """Signing-key fingerprints of the good signatures (validate_key_metadata.good_signatures)."""
+
+    return [signing for signing, _primary in key_metadata.good_signatures(status_output)]
+
+
+def status_primary_fingerprints(status_output: str) -> list[str]:
+    """Primary-key fingerprints of the good signatures (validate_key_metadata.good_signatures)."""
+
+    return [primary for _signing, primary in key_metadata.good_signatures(status_output)]
 
 
 def verify_detached_signature_file(
@@ -362,6 +363,8 @@ def verify_detached_signature_file(
     gnupg_home: Path,
     signature: Path,
     checksums: Path,
+    *,
+    primary_fingerprints: set[str] | None = None,
 ) -> set[str]:
     if not signature.is_file():
         raise ReleaseValidationError(f"Missing required release file: {signature}")
@@ -389,6 +392,8 @@ def verify_detached_signature_file(
     valid_fingerprints = set(status_fingerprints(result.stdout))
     if not valid_fingerprints:
         raise ReleaseValidationError(f"GPG verification produced no valid signature for {signature.name}")
+    if primary_fingerprints is not None:
+        primary_fingerprints.update(status_primary_fingerprints(result.stdout))
     return valid_fingerprints
 
 
@@ -398,8 +403,13 @@ def verify_manifest_signature_file(
     signature: Path,
     checksums: Path,
     signer: ReleaseSigner,
-) -> None:
-    valid_fingerprints = verify_detached_signature_file(gpg, gnupg_home, signature, checksums)
+) -> str:
+    """Verify one operator's signature and return its primary-key fingerprint."""
+
+    primaries: set[str] = set()
+    valid_fingerprints = verify_detached_signature_file(
+        gpg, gnupg_home, signature, checksums, primary_fingerprints=primaries
+    )
 
     expected = {signer.fingerprint}
     unexpected = sorted(valid_fingerprints - expected)
@@ -412,6 +422,9 @@ def verify_manifest_signature_file(
         raise ReleaseValidationError(
             f"{signature.name} was not signed by expected fingerprint {signer.fingerprint}"
         )
+    if len(primaries) != 1:
+        raise ReleaseValidationError(f"{signature.name} did not name exactly one primary key")
+    return primaries.pop()
 
 
 def verify_combined_manifest_signature_file(
@@ -458,16 +471,24 @@ def verify_manifest_signatures(
     checksums = artifacts_dir / CHECKSUMS_FILE
     staged = staged_file_names(artifacts_dir)
     signatures = release_signature_paths(artifacts_dir, staged, policy)
+    # Quorum counts distinct primary keys: signers whose signing keys share one
+    # primary key count once.
     counted: list[str] = []
+    verified: set[str] = set()
+    primaries: dict[str, str] = {}
     for alias, signature in sorted(signatures.items()):
         signer = policy.signers_by_alias[alias]
-        verify_manifest_signature_file(gpg, gnupg_home, signature, checksums, signer)
+        primary = verify_manifest_signature_file(gpg, gnupg_home, signature, checksums, signer)
+        verified.add(alias)
+        if primary in primaries:
+            continue
+        primaries[primary] = alias
         counted.append(alias)
 
     if len(counted) < policy.signature_quorum:
         raise ReleaseValidationError(
             f"Release signature quorum not met for {policy.release_line}: "
-            f"got {len(counted)} valid active release signer signature(s), "
+            f"got {len(counted)} valid active release signer signature(s) by distinct primary keys, "
             f"need {policy.signature_quorum}; counted={', '.join(counted) or 'none'}"
         )
 
@@ -477,7 +498,7 @@ def verify_manifest_signatures(
         artifacts_dir / "SHA256SUMS.asc",
         checksums,
         policy,
-        set(counted),
+        verified,
     )
     return tuple(counted)
 

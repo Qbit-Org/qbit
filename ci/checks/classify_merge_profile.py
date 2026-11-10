@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import unicodedata
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
@@ -64,10 +65,36 @@ GITHUB_METADATA_PREFIXES = (
     ".github/repository-settings/",
     ".github/rulesets/",
 )
-OPERATOR_KEYS_PREFIXES = (
-    "contrib/keys/operator-keys/",
-    "contrib/guix/repo-templates/qbit-guix.sigs/operator-keys/",
-)
+OPERATOR_KEYS_PREFIXES = ("contrib/keys/operator-keys/",)
+# Changes that can change what the policy path holds without a file under it:
+# the directories on the path themselves (a symlink or file in their place)
+# and attribute files, which change how its files are checked out or archived.
+OPERATOR_KEYS_PATH_ENTRIES = frozenset({"contrib", "contrib/keys", "contrib/keys/operator-keys"})
+
+
+def fold_path(path: str) -> str:
+    """A path as case-insensitive checkouts compare it: NFKC-normalised and case-folded."""
+
+    return unicodedata.normalize("NFKC", path).casefold()
+
+
+FOLDED_OPERATOR_KEYS_PATH_ENTRIES = {fold_path(entry): entry for entry in OPERATOR_KEYS_PATH_ENTRIES}
+
+
+def touches_operator_keys(path: str) -> bool:
+    # Folded, so that case and Unicode-compatibility variants of the policy
+    # path or of .gitattributes, which case-insensitive checkouts treat as
+    # the same file, are routed too.
+    folded = fold_path(path)
+    entries = FOLDED_OPERATOR_KEYS_PATH_ENTRIES
+    components = path.split("/")
+    prefixes = ["/".join(components[:depth]) for depth in range(1, len(components) + 1)]
+    return (
+        any(folded.startswith(fold_path(prefix)) for prefix in OPERATOR_KEYS_PREFIXES)
+        or folded in entries
+        or any(fold_path(prefix) in entries and prefix != entries[fold_path(prefix)] for prefix in prefixes)
+        or fold_path(PurePosixPath(path).name) == ".gitattributes"
+    )
 
 
 @dataclass(frozen=True)
@@ -198,9 +225,43 @@ def classify_paths(paths: list[str] | tuple[str, ...]) -> Classification:
     )
 
 
+GIT_QUOTE_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
+
+
+def unquote_git_path(name: str) -> str:
+    """Undo git's C-style quoting of a path (core.quotePath), as `git diff --name-only` prints it."""
+
+    if len(name) < 2 or not (name.startswith('"') and name.endswith('"')):
+        return name
+    body = name[1:-1]
+    raw = bytearray()
+    index = 0
+    while index < len(body):
+        char = body[index]
+        if char != "\\":
+            raw.extend(char.encode("utf8"))
+            index += 1
+            continue
+        escape = body[index + 1 : index + 2]
+        if escape in GIT_QUOTE_ESCAPES:
+            raw.append(GIT_QUOTE_ESCAPES[escape])
+            index += 2
+        elif len(body) >= index + 4 and all(digit in "01234567" for digit in body[index + 1 : index + 4]):
+            raw.append(int(body[index + 1 : index + 4], 8))
+            index += 4
+        else:
+            raise ValueError(f"malformed quoted path: {name}")
+    return raw.decode("utf8", errors="surrogateescape")
+
+
 def load_changed_files(path: str) -> list[str]:
-    with open(path, encoding="utf8") as file:
-        return file.read().splitlines()
+    """Paths from a NUL-separated list (`-z`), or a line-separated one with git's quoting undone."""
+
+    with open(path, "rb") as file:
+        data = file.read()
+    if b"\0" in data:
+        return [name.decode("utf8", errors="surrogateescape") for name in data.split(b"\0") if name]
+    return [unquote_git_path(line) for line in data.decode("utf8", errors="surrogateescape").splitlines()]
 
 
 def bool_output(value: bool) -> str:
@@ -217,13 +278,7 @@ def github_outputs(classification: Classification) -> dict[str, str]:
         "github_metadata_only": bool_output(classification.github_metadata_only),
         "source_validation_required": bool_output(classification.profile == SOURCE_PROFILE),
         "changed_count": str(len(paths)),
-        "touched_operator_keys": bool_output(
-            any(
-                path.startswith(prefix)
-                for path in paths
-                for prefix in OPERATOR_KEYS_PREFIXES
-            )
-        ),
+        "touched_operator_keys": bool_output(any(touches_operator_keys(path) for path in paths)),
         "touched_release_publish": bool_output(
             any(path in RELEASE_TOOL_PATHS for path in paths)
         ),

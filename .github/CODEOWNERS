@@ -1,0 +1,11 @@
+# Changes to the release key policy, the release validators, the CI checks,
+# the workflows and actions, and attributes need a review by the release
+# maintainers (the rulesets require code-owner review on the protected
+# branches). GitHub applies an owner only once the team has write access.
+/contrib/keys/ @Qbit-Org/release-maintainers
+/ci/release/ @Qbit-Org/release-maintainers
+/ci/checks/ @Qbit-Org/release-maintainers
+/.github/workflows/ @Qbit-Org/release-maintainers
+/.github/actions/ @Qbit-Org/release-maintainers
+.gitattributes @Qbit-Org/release-maintainers
+/.github/CODEOWNERS @Qbit-Org/release-maintainers
