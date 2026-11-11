@@ -652,7 +652,8 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-txvalidationbudget=<peer_rate>,<peer_cap>,<pool_rate>,<pool_cap>",
                    strprintf("Budget for the time spent validating transactions from peers that are then rejected, in microseconds: "
                              "credit a peer earns per second, the most credit a peer can hold, credit added to the shared pool per second "
-                             "and the size of the pool. <peer_rate> and <peer_cap> must be at least 1. Set to 0 to disable the budget. "
+                             "and the size of the pool (a connection can draw a tenth of the pool at once, refilled at a tenth of its rate). "
+                             "<peer_rate> and <peer_cap> must be at least 1. Set to 0 to disable the budget. "
                              "(default: %d,%d,%d,%d)",
                              DEFAULT_TX_VALIDATION_PEER_RATE.count(), DEFAULT_TX_VALIDATION_PEER_CAP.count(),
                              DEFAULT_TX_VALIDATION_POOL_RATE.count(), DEFAULT_TX_VALIDATION_POOL_CAP.count()),

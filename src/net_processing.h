@@ -58,8 +58,12 @@ static constexpr std::chrono::microseconds DEFAULT_TX_VALIDATION_PEER_CAP{100'00
 static constexpr std::chrono::microseconds DEFAULT_TX_VALIDATION_POOL_RATE{50'000};
 /** Default size of the node-wide pool. */
 static constexpr std::chrono::microseconds DEFAULT_TX_VALIDATION_POOL_CAP{500'000};
-/** Lowest balance that a peer's credit or the pool can reach. */
+/** Lowest balance that a peer's credit, its share of the pool or the pool can reach. */
 static constexpr std::chrono::microseconds TX_VALIDATION_CREDIT_FLOOR{-1'000'000};
+/** A connection that draws on the node-wide pool can take at most 1/TX_VALIDATION_POOL_SHARES of
+ *  the pool's size at once and of its refill rate over time, so that one connection cannot keep
+ *  the pool empty for the others. */
+static constexpr int64_t TX_VALIDATION_POOL_SHARES{10};
 /** Largest value accepted for any of the four TxValidationBudgetOptions durations. */
 static constexpr std::chrono::microseconds MAX_TX_VALIDATION_BUDGET_SETTING{std::chrono::hours{1}};
 
@@ -94,17 +98,27 @@ std::optional<bool> IsTxValidationTimeCharged(TxValidationResult result);
  * peer_cap. A peer can use its own credit once the credit has reached peer_cap for the first
  * time; until then, and whenever it has no positive credit, it draws on a node-wide pool that
  * starts full and grows by pool_rate per second up to pool_cap. A new connection therefore
- * draws on the pool only, and reconnecting does not give a peer more credit.
+ * draws on the pool only, and reconnecting does not give a peer more own credit.
+ *
+ * Each connection draws on the pool only within its own share of it, which starts full at
+ * pool_cap / TX_VALIDATION_POOL_SHARES and grows by pool_rate / TX_VALIDATION_POOL_SHARES per
+ * second; whatever the pool pays for a peer also comes out of that peer's share. Over time, one
+ * connection therefore draws at most a TX_VALIDATION_POOL_SHARES-th of the pool's rate, and
+ * keeping the pool empty takes at least TX_VALIDATION_POOL_SHARES connections drawing at that
+ * rate. A new connection starts with a full share, so what connection churn draws is bounded by
+ * the pool rather than by the share.
  *
  * Validation time is charged after the transaction has been validated, so a balance can go
  * negative, down to TX_VALIDATION_CREDIT_FLOOR. A peer that can neither use its own credit nor
- * draw on the pool is throttled: its transactions are not validated until its credit or the
- * pool is positive again. Exempt peers are never throttled and are never charged.
+ * draw on the pool is throttled: its transactions are not validated until its credit, or both
+ * the pool and its share of it, are positive again. Exempt peers are never throttled and are
+ * never charged.
  *
  * Over time, the time charged is therefore bounded by peer_rate for each connected peer plus
- * pool_rate, apart from the transaction that takes a balance below zero, which is charged in
- * full down to the floor. A peer's debt ends with its connection, but a new connection can use
- * its own credit only after peer_cap / peer_rate seconds.
+ * pool_rate, and what one connection draws on the pool by pool_rate / TX_VALIDATION_POOL_SHARES,
+ * apart from the transaction that takes a balance below zero, which is charged in full down to
+ * the floor. A peer's debt ends with its connection, but a new connection can use its own
+ * credit only after peer_cap / peer_rate seconds.
  *
  * Credit grows with the (mockable) node clock passed in as now. If the clock moves backwards,
  * nothing is added and growth restarts from the new time. Not thread-safe.
@@ -127,6 +141,9 @@ public:
         bool IsEstablished() const { return m_established; }
         /** Total validation time charged, including time not deducted because the peer is exempt. */
         std::chrono::microseconds GetTotalCharged() const { return m_total_charged; }
+        /** How much of its share of the pool the peer has used and not yet earned back, as of the
+         *  last refill, rounded down. Its share is pool_cap / TX_VALIDATION_POOL_SHARES minus this. */
+        Credit GetPoolShareUsed() const { return m_pool_share_used / TX_VALIDATION_POOL_SHARES; }
 
     private:
         friend class TxValidationBudget;
@@ -134,6 +151,9 @@ public:
         std::chrono::microseconds m_last_refill;
         bool m_established{false};
         std::chrono::microseconds m_total_charged{0};
+        /** TX_VALIDATION_POOL_SHARES times the part of its share of the pool that the peer has used,
+         *  so that it is earned back at pool_rate up to pool_cap without rounding. */
+        Credit m_pool_share_used{0};
     };
 
     TxValidationBudget(const TxValidationBudgetOptions& options, std::chrono::microseconds now);
@@ -158,6 +178,11 @@ private:
     void RefillPool(std::chrono::microseconds now);
     /** Whether the peer can use its own credit (otherwise it draws on the pool). */
     static bool CanUseOwnCredit(const Account& account) { return account.m_established && account.m_credit > Credit::zero(); }
+    /** Whether the peer can draw on the pool: both the pool and the peer's share of it are positive. */
+    bool CanDrawOnPool(const Account& account) const
+    {
+        return m_pool_credit > Credit::zero() && account.m_pool_share_used < Credit{m_options.pool_cap};
+    }
 };
 
 /** Transaction validation budget figures for one peer. */

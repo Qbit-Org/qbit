@@ -214,6 +214,11 @@ static constexpr double MAX_ADDR_RATE_PER_SECOND{0.1};
 static constexpr size_t MAX_ADDR_PROCESSING_TOKEN_BUCKET{MAX_ADDR_TO_SEND};
 /** The compactblocks version we support. See BIP 152. */
 static constexpr uint64_t CMPCTBLOCKS_VERSION{2};
+/** How often a peer's deferred transaction announcements that the download manager has not taken
+ *  yet are announced to it again (see Peer::m_tx_reannounced): longer than one request to another
+ *  peer that announced them can be outstanding, with its announcement delays. */
+static constexpr auto DEFERRED_TX_ANNOUNCEMENT_RETRY_DELAY{node::NONPREF_PEER_TX_DELAY + node::TXID_RELAY_DELAY +
+                                                          node::OVERLOADED_PEER_TX_DELAY + node::GETDATA_TX_INTERVAL + 1s};
 
 std::optional<bool> IsTxValidationTimeCharged(TxValidationResult result)
 {
@@ -262,18 +267,23 @@ TxValidationBudgetOptions ClampTxValidationBudgetOptions(TxValidationBudgetOptio
 
 /**
  * Add rate (credit per second) over elapsed to credit, up to cap. The settings are clamped, so
- * every balance stays within [TX_VALIDATION_CREDIT_FLOOR, MAX_TX_VALIDATION_BUDGET_SETTING] and
- * nothing here overflows, however much time has elapsed.
+ * every balance stays within [TX_VALIDATION_POOL_SHARES * TX_VALIDATION_CREDIT_FLOOR,
+ * MAX_TX_VALIDATION_BUDGET_SETTING] and nothing here overflows, however much time has elapsed.
  */
 TxValidationCredit RefillTxValidationCredit(TxValidationCredit credit, std::chrono::microseconds elapsed,
-                                            std::chrono::microseconds rate, std::chrono::microseconds cap)
+                                            std::chrono::microseconds rate, TxValidationCredit cap)
 {
-    const TxValidationCredit cap_credit{cap};
-    if (credit >= cap_credit || elapsed <= std::chrono::microseconds{0} || rate <= std::chrono::microseconds{0}) return credit;
+    if (credit >= cap || elapsed <= std::chrono::microseconds{0} || rate <= std::chrono::microseconds{0}) return credit;
     // Each microsecond of elapsed time adds rate.count() picoseconds of credit.
-    const int64_t missing{(cap_credit - credit).count()};
-    if (elapsed.count() >= (missing + rate.count() - 1) / rate.count()) return cap_credit;
+    const int64_t missing{(cap - credit).count()};
+    if (elapsed.count() >= (missing + rate.count() - 1) / rate.count()) return cap;
     return credit + TxValidationCredit{elapsed.count() * rate.count()};
+}
+
+/** Deduct deduction from balance, down to TX_VALIDATION_CREDIT_FLOOR. */
+TxValidationCredit DeductTxValidationCredit(TxValidationCredit balance, TxValidationCredit deduction)
+{
+    return std::max(balance - deduction, TxValidationCredit{TX_VALIDATION_CREDIT_FLOOR});
 }
 } // namespace
 
@@ -286,14 +296,20 @@ TxValidationBudget::TxValidationBudget(const TxValidationBudgetOptions& options,
 
 void TxValidationBudget::RefillAccount(Account& account, std::chrono::microseconds now) const
 {
-    account.m_credit = RefillTxValidationCredit(account.m_credit, now - account.m_last_refill, m_options.peer_rate, m_options.peer_cap);
+    const std::chrono::microseconds elapsed{now - account.m_last_refill};
+    account.m_credit = RefillTxValidationCredit(account.m_credit, elapsed, m_options.peer_rate, Credit{m_options.peer_cap});
+    // The peer's share of the pool, kept scaled by TX_VALIDATION_POOL_SHARES, grows at pool_rate up
+    // to pool_cap.
+    const Credit scaled_share_cap{m_options.pool_cap};
+    account.m_pool_share_used = scaled_share_cap - RefillTxValidationCredit(scaled_share_cap - account.m_pool_share_used, elapsed,
+                                                                            m_options.pool_rate, scaled_share_cap);
     account.m_last_refill = now;
     if (account.m_credit >= Credit{m_options.peer_cap}) account.m_established = true;
 }
 
 void TxValidationBudget::RefillPool(std::chrono::microseconds now)
 {
-    m_pool_credit = RefillTxValidationCredit(m_pool_credit, now - m_pool_last_refill, m_options.pool_rate, m_options.pool_cap);
+    m_pool_credit = RefillTxValidationCredit(m_pool_credit, now - m_pool_last_refill, m_options.pool_rate, Credit{m_options.pool_cap});
     m_pool_last_refill = now;
 }
 
@@ -303,7 +319,7 @@ bool TxValidationBudget::MayValidate(Account& account, bool exempt, std::chrono:
     RefillAccount(account, now);
     if (CanUseOwnCredit(account)) return true;
     RefillPool(now);
-    return m_pool_credit > Credit::zero();
+    return CanDrawOnPool(account);
 }
 
 void TxValidationBudget::Charge(Account& account, bool exempt, std::chrono::microseconds cost, std::chrono::microseconds now)
@@ -313,13 +329,20 @@ void TxValidationBudget::Charge(Account& account, bool exempt, std::chrono::micr
     if (exempt || !m_options.enabled) return;
     RefillAccount(account, now);
     RefillPool(now);
-    // Charge the balance that allowed the validation. If neither allows it (the transaction was
-    // validated without asking, for example as part of a package that another peer started),
-    // the peer's own credit pays.
-    Credit& balance{CanUseOwnCredit(account) || m_pool_credit <= Credit::zero() ? account.m_credit : m_pool_credit};
     // No single charge needs to exceed the distance from the largest balance to the floor.
     const Credit deduction{std::min(cost, MAX_TX_VALIDATION_BUDGET_SETTING - TX_VALIDATION_CREDIT_FLOOR)};
-    balance = std::max(balance - deduction, Credit{TX_VALIDATION_CREDIT_FLOOR});
+    // Charge the balance that allowed the validation: the peer's own credit, or the pool and the
+    // peer's share of it. If neither allows it (the transaction was validated without asking, for
+    // example as part of a package that another peer started), the pool and the peer's share pay
+    // while the pool is positive, and the peer's own credit otherwise.
+    if (CanUseOwnCredit(account) || m_pool_credit <= Credit::zero()) {
+        account.m_credit = DeductTxValidationCredit(account.m_credit, deduction);
+    } else {
+        m_pool_credit = DeductTxValidationCredit(m_pool_credit, deduction);
+        const Credit scaled_share_cap{m_options.pool_cap};
+        const Credit scaled_share{scaled_share_cap - account.m_pool_share_used - deduction * TX_VALIDATION_POOL_SHARES};
+        account.m_pool_share_used = scaled_share_cap - std::max(scaled_share, Credit{TX_VALIDATION_CREDIT_FLOOR} * TX_VALIDATION_POOL_SHARES);
+    }
 }
 
 // Internal stuff
@@ -573,6 +596,20 @@ struct Peer {
     std::atomic_bool m_tx_validation_throttled{false};
     /** Number of transactions from this peer dropped without validation while it was over its budget. */
     std::atomic<uint64_t> m_tx_dropped_while_throttled{0};
+    /** Transactions that this peer announced or sent while it was over its budget, and that were
+     *  therefore not requested from it or not validated. They are announced to the download
+     *  manager again once the peer is within its budget, so that they are requested from it then
+     *  unless the node already has them. At most node::MAX_PEER_TX_ANNOUNCEMENTS. */
+    std::vector<GenTxid> m_tx_deferred_announcements GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
+    /** Deferred announcements that have been announced to the download manager again, for
+     *  transactions the node does not have and has not requested from this peer since. The download
+     *  manager ignores an announcement while it still tracks an earlier one of the same transaction
+     *  from this peer, which it does while requests for it to other peers are outstanding; so these
+     *  are announced again every DEFERRED_TX_ANNOUNCEMENT_RETRY_DELAY until the transaction is
+     *  requested from this peer or the node has it. At most node::MAX_PEER_TX_ANNOUNCEMENTS. */
+    std::set<GenTxid> m_tx_reannounced GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
+    /** When m_tx_reannounced is next announced to the download manager again. */
+    std::chrono::microseconds m_tx_reannounce_time GUARDED_BY(NetEventsInterface::g_msgproc_mutex){0};
 
     explicit Peer(NodeId id, ServiceFlags our_services, bool is_inbound, bool tx_validation_exempt)
         : m_id{id}
@@ -971,6 +1008,10 @@ private:
     /** Charge cost, the time spent validating a transaction from peer that was rejected for a
      *  reason in the transaction itself (see IsTxValidationTimeCharged). */
     void ChargeTxValidation(Peer& peer, std::chrono::microseconds cost) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
+
+    /** Remember that gtxid, announced or sent by peer, was not requested from it or not validated
+     *  because peer is over its transaction validation budget. */
+    void DeferTxAnnouncement(Peer& peer, const GenTxid& gtxid) EXCLUSIVE_LOCKS_REQUIRED(g_msgproc_mutex);
 
     /** Run the periodic flush of the coins cache, which mempool acceptance otherwise runs at its
      *  end, so that it is not part of the validation time charged to a peer. */
@@ -3400,6 +3441,17 @@ void PeerManagerImpl::ChargeTxValidation(Peer& peer, std::chrono::microseconds c
     IsTxValidationThrottled(peer);
 }
 
+void PeerManagerImpl::DeferTxAnnouncement(Peer& peer, const GenTxid& gtxid)
+{
+    auto& deferred{peer.m_tx_deferred_announcements};
+    if (deferred.size() >= static_cast<size_t>(node::MAX_PEER_TX_ANNOUNCEMENTS)) return;
+    deferred.push_back(gtxid);
+    if (deferred.size() == static_cast<size_t>(node::MAX_PEER_TX_ANNOUNCEMENTS)) {
+        LogDebug(BCLog::NET, "peer=%d is over its transaction validation budget and has announced %u transactions meanwhile; not keeping more\n",
+                 peer.m_id, deferred.size());
+    }
+}
+
 void PeerManagerImpl::FlushStateBeforeTxValidation()
 {
     BlockValidationState state;
@@ -4489,9 +4541,13 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
 
                 if (!m_chainman.IsInitialBlockDownload()) {
                     // Transactions are not requested from a peer that is over its transaction
-                    // validation budget; they are requested from other peers that announce them.
+                    // validation budget; they are requested from other peers that announce them,
+                    // and from this peer once it is within its budget again.
                     if (!tx_validation_throttled.has_value()) tx_validation_throttled = IsTxValidationThrottled(*peer);
-                    if (*tx_validation_throttled) continue;
+                    if (*tx_validation_throttled) {
+                        DeferTxAnnouncement(*peer, gtxid);
+                        continue;
+                    }
                     const bool fAlreadyHave{m_txdownloadman.AddTxAnnouncement(pfrom.GetId(), gtxid, current_time)};
                     LogDebug(BCLog::NET, "got inv: %s  %s peer=%d\n", inv.ToString(), fAlreadyHave ? "have" : "new", pfrom.GetId());
                 }
@@ -4805,8 +4861,12 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
             // The peer is over its transaction validation budget: drop the transaction without
             // validating it, alone or in a package. It is not treated as rejected (no reject filter,
             // orphanage or extra transactions for compact blocks). ReceivedTx() has released the
-            // request for it, so it is requested from other peers that announce it.
+            // request for it, so it is requested from other peers that announce it, and from this
+            // peer once it is within its budget again. A transaction that would have started a
+            // package is in the reconsiderable reject filter by wtxid, so it is requested by txid,
+            // as missing parents are.
             ++peer->m_tx_dropped_while_throttled;
+            DeferTxAnnouncement(*peer, (package_to_validate || !peer->m_wtxid_relay) ? GenTxid{txid} : GenTxid{wtxid});
             return;
         }
         if (!should_validate) {
@@ -6573,15 +6633,52 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
         //
         {
             LOCK(m_tx_download_mutex);
+            if (!peer->m_tx_reannounced.empty() && current_time >= peer->m_tx_reannounce_time &&
+                !IsTxValidationThrottled(*peer)) {
+                // Announce again what was announced again below and has not been requested from
+                // this peer since, in case the requests to other peers that kept the download
+                // manager from taking it have failed meanwhile.
+                auto& reannounced{peer->m_tx_reannounced};
+                for (auto it{reannounced.begin()}; it != reannounced.end();) {
+                    const bool already_have{m_txdownloadman.AddTxAnnouncement(pto->GetId(), *it, current_time)};
+                    it = already_have ? reannounced.erase(it) : std::next(it);
+                }
+                peer->m_tx_reannounce_time = current_time + DEFERRED_TX_ANNOUNCEMENT_RETRY_DELAY;
+            }
+            if (!peer->m_tx_deferred_announcements.empty() && !IsTxValidationThrottled(*peer)) {
+                // The peer is within its transaction validation budget again: announce what it
+                // announced or sent while it was over it, so that those transactions are requested
+                // from it unless we already have them.
+                LogDebug(BCLog::NET, "considering %u transactions again that peer=%d announced while over its transaction validation budget\n",
+                         peer->m_tx_deferred_announcements.size(), pto->GetId());
+                auto& reannounced{peer->m_tx_reannounced};
+                if (reannounced.empty()) peer->m_tx_reannounce_time = current_time + DEFERRED_TX_ANNOUNCEMENT_RETRY_DELAY;
+                for (const GenTxid& gtxid : std::exchange(peer->m_tx_deferred_announcements, {})) {
+                    const bool already_have{m_txdownloadman.AddTxAnnouncement(pto->GetId(), gtxid, current_time)};
+                    if (!already_have && reannounced.size() < static_cast<size_t>(node::MAX_PEER_TX_ANNOUNCEMENTS)) {
+                        reannounced.insert(gtxid);
+                    }
+                }
+            }
             std::vector<GenTxid> tx_requests{m_txdownloadman.GetRequestsToSend(pto->GetId(), current_time)};
+            // A transaction requested from this peer now (or released below and deferred again), by
+            // txid or wtxid, needs no announcing again.
+            if (!peer->m_tx_reannounced.empty()) {
+                for (const GenTxid& gtxid : tx_requests) {
+                    peer->m_tx_reannounced.erase(GenTxid{Txid::FromUint256(gtxid.ToUint256())});
+                    peer->m_tx_reannounced.erase(GenTxid{Wtxid::FromUint256(gtxid.ToUint256())});
+                }
+            }
             if (!tx_requests.empty() && IsTxValidationThrottled(*peer)) {
                 // Transactions are not requested from a peer that is over its transaction validation
                 // budget, including those it announced before. Release the requests at once, as if the
                 // peer had replied that it does not have the transactions, so that they are requested
-                // from other peers that announced them.
+                // from other peers that announced them, and from this peer once it is within its
+                // budget again.
                 LogDebug(BCLog::NET, "not requesting %u transactions from peer=%d, which is over its transaction validation budget\n",
                          tx_requests.size(), pto->GetId());
                 m_txdownloadman.ReceivedNotFound(pto->GetId(), tx_requests);
+                for (const GenTxid& gtxid : tx_requests) DeferTxAnnouncement(*peer, gtxid);
                 tx_requests.clear();
             }
             for (const GenTxid& gtxid : tx_requests) {
