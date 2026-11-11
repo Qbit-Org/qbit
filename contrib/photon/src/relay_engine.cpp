@@ -914,25 +914,36 @@ void RelayEngine::CheckAndSubmit(const InboundRelayKey& key,
     // only on the header, or on the node not answering, hold for every copy of the block and
     // settle it; answers that may depend on this copy's body, or that the node may outgrow
     // within seconds, end only this peer's copy.
-    ParentCheck parent = submitter.CheckParent(block, summary.prev_hash_hex, m_config.max_parent_depth);
+    const auto check_parent = [&] {
+        const ParentCheck result = submitter.CheckParent(block, summary.prev_hash_hex, m_config.max_parent_depth);
+        m_last_node_call_answered = result != ParentCheck::kUnavailable;
+        if (m_last_node_call_answered) {
+            ++m_node_answers;
+        }
+        return result;
+    };
+    ParentCheck parent = check_parent();
     auto checked_at = m_clock.Now();
-    if (parent != ParentCheck::kUnavailable) {
-        ++m_node_answers;
-    }
     // The node is answering again and does not know this block's parent because the parent is the
     // held block: try the held block first, then check this block again.
     bool parent_retried = false;
     if (!retry && parent == ParentCheck::kUnknown && m_held.has_value() && m_held->summary.hash_hex == summary.prev_hash_hex) {
         RetryHeld(submitter);
         parent_retried = true;
-        if (IsSuspended(slot, m_clock.Now())) {
-            return; // the held block's retry paused this block's sender
+        const auto now = m_clock.Now();
+        if (IsSuspended(slot, now)) {
+            LogUnusedBlock(now, slot, block, "its sender was paused while its parent was tried again");
+            return;
         }
-        parent = submitter.CheckParent(block, summary.prev_hash_hex, m_config.max_parent_depth);
+        if (!m_last_node_call_answered) {
+            // The node stopped answering while the parent was tried: keep this block for one more
+            // try rather than calling the node again now.
+            LogUnusedBlock(now, slot, block, "qbitd did not answer for its parent (will try once more)");
+            HoldBlock(key, block_id, summary, std::move(block_data), now);
+            return;
+        }
+        parent = check_parent();
         checked_at = m_clock.Now();
-        if (parent != ParentCheck::kUnavailable) {
-            ++m_node_answers;
-        }
     }
     bool parent_pending = false;
     switch (parent) {
@@ -994,7 +1005,8 @@ void RelayEngine::CheckAndSubmit(const InboundRelayKey& key,
 
     const SubmitOutcome outcome = submitter.SubmitBlock(block_data);
     const auto submitted_at = m_clock.Now();
-    if (outcome != SubmitOutcome::kTimeout) {
+    m_last_node_call_answered = outcome != SubmitOutcome::kTimeout;
+    if (m_last_node_call_answered) {
         ++m_node_answers;
     }
     if (outcome == SubmitOutcome::kAccepted) {
@@ -1064,7 +1076,15 @@ void RelayEngine::HoldBlock(const InboundRelayKey& key,
                             Clock::TimePoint now)
 {
     // One block at a time, at most max_inbound_original_size bytes. A newer block replaces an
-    // older one, which is the likelier of the two to have reached the node another way.
+    // older one, which is the likelier of the two to have reached the node another way, except
+    // that the held block is kept when the newer one builds on it: the node cannot connect the
+    // newer one without it. The newer one is then settled like any block the node did not answer for.
+    if (m_held.has_value() && m_held->summary.hash_hex == summary.prev_hash_hex) {
+        LogUnusedBlock(now, key.slot_index, summary.hash_hex, "qbitd did not answer; its parent is already kept for one more try");
+        EraseInboundForPrefix(block_id, now);
+        m_settled.Insert(block_id, now);
+        return;
+    }
     if (m_held.has_value()) {
         DropHeldBlock(now, "dropped while waiting for qbitd: replaced by a newer block", /*settle=*/true);
     }

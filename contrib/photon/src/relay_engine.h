@@ -358,6 +358,8 @@ private:
     // Counts qbitd's answers and block announcements, so a held block is tried again only once qbitd
     // is answering.
     std::uint64_t m_node_answers{0};
+    // Whether the last parent check or submitblock got an answer from qbitd.
+    bool m_last_node_call_answered{true};
     std::map<std::string, LogRateLimiter> m_unused_block_logs{};
 
     // Blocks relayed out or accepted, keyed by BlockIdFromHex of the block hash.

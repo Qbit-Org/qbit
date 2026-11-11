@@ -2423,8 +2423,8 @@ void TestUnansweredBlockTriedOnceMore()
             engine.RetryHeldBlock(submitter);
             Require(submitter.check_calls == 4, "the parent should not be tried again");
         }
-        // qbitd still does not answer: the held block is not tried again at that point; the new
-        // block replaces it and is tried once qbitd answers.
+        // qbitd still does not answer: the held block is not tried again at that point, and it is
+        // kept rather than replaced by its child.
         {
             MockClock clock{};
             RelayEngine engine(clock);
@@ -2435,14 +2435,75 @@ void TestUnansweredBlockTriedOnceMore()
             const TestBlock child = child_of(held, 0xB584);
             DeliverBlock(engine, kPeer1, child, submitter);
             Require(submitter.check_calls == 2 && engine.stats().node_retries == 0, "a node that does not answer should not be called again");
-            Require(engine.stats().held_blocks_dropped == 1, "the parent should be replaced");
+            Require(engine.stats().held_blocks_dropped == 0, "the parent should stay held");
+            DeliverBlock(engine, kPeer2, child, submitter, BlockIdOf(child.bytes));
+            Require(submitter.check_calls == 2, "the dropped child's copies should not be checked at once");
             submitter.parent_result = ParentCheck::kNearTip;
             node_announces_block(engine, 0xB585);
             engine.RetryHeldBlock(submitter);
-            Require(submitter.submit_calls == 1 && submitter.last_block == child.bytes, "the child should be held and retried");
+            Require(submitter.submit_calls == 1 && submitter.last_block == held.bytes, "the parent should be retried");
+            Require(PeerStats(engine, 0).faults == 0 && PeerStats(engine, 1).faults == 0, "neither counts against its sender");
         }
-        // The held parent's retry gets no answer: the child's unknown parent does not count against
-        // its sender, even after the sender's allowance is used.
+        // The held parent's retry is answered, but qbitd still cannot use it (its own parent is
+        // unknown): the child's unknown parent does not count against its sender either.
+        {
+            MockClock clock{};
+            RelayEngine engine(clock);
+            CapturingSubmitter submitter;
+            submitter.parent_result = ParentCheck::kUnavailable;
+            const TestBlock held = EncodeTestBlock(500, 0xB5E0);
+            DeliverBlock(engine, kPeer0, held, submitter);
+            submitter.parent_result = ParentCheck::kUnknown;
+            DeliverBlock(engine, kPeer1, EncodeTestBlock(300, 0xB5E1), submitter); // uses the allowance
+            const TestBlock child = child_of(held, 0xB5E2);
+            DeliverBlock(engine, kPeer1, child, submitter);
+            Require(submitter.check_calls == 5 && engine.stats().node_retries == 1, "parent retried, child checked twice");
+            Require(PeerStats(engine, 0).faults == 0 && PeerStats(engine, 1).faults == 0, "neither counts against its sender");
+        }
+        // The held parent's retry is answered but the child's second check is not: the child is held.
+        {
+            MockClock clock{};
+            RelayEngine engine(clock);
+            CapturingSubmitter submitter;
+            submitter.parent_result = ParentCheck::kUnavailable;
+            const TestBlock held = EncodeTestBlock(500, 0xB5B0);
+            DeliverBlock(engine, kPeer0, held, submitter);
+            const TestBlock child = child_of(held, 0xB5B1);
+            submitter.parent_results = {ParentCheck::kUnknown, ParentCheck::kNearTip, ParentCheck::kUnavailable};
+            DeliverBlock(engine, kPeer1, child, submitter);
+            Require(submitter.check_calls == 4 && submitter.submit_calls == 1 && submitter.last_block == held.bytes,
+                    "the parent should be submitted");
+            Require(engine.stats().held_blocks_dropped == 0, "nothing should be dropped");
+            submitter.parent_result = ParentCheck::kNearTip;
+            node_announces_block(engine, 0xB5B2);
+            engine.RetryHeldBlock(submitter);
+            Require(submitter.submit_calls == 2 && submitter.last_block == child.bytes, "the child should be held and retried");
+        }
+        // The held parent's retry pauses the parent's sender, a different peer: the child is still used.
+        {
+            MockClock clock{};
+            RelayEngine engine(clock);
+            CapturingSubmitter submitter;
+            submitter.parent_result = ParentCheck::kTooFar;
+            for (std::uint32_t i = 0; i + 1 < RelayEngineConfig{}.peer_fault_threshold; ++i) {
+                DeliverBlock(engine, kPeer0, EncodeTestBlock(200, 0xB5C0 + i), submitter);
+            }
+            submitter.parent_result = ParentCheck::kUnavailable;
+            const TestBlock held = EncodeTestBlock(500, 0xB5D0);
+            DeliverBlock(engine, kPeer0, held, submitter);
+            const TestBlock child = child_of(held, 0xB5D1);
+            submitter.parent_results = {ParentCheck::kUnknown, ParentCheck::kNearTip, ParentCheck::kParentNotConnected};
+            submitter.submit_hook = [&held](std::span<const std::uint8_t> data) {
+                return std::equal(data.begin(), data.end(), held.bytes.begin(), held.bytes.end()) ? SubmitOutcome::kRejected
+                                                                                                 : SubmitOutcome::kInconclusive;
+            };
+            DeliverBlock(engine, kPeer1, child, submitter);
+            Require(PeerStats(engine, 0).suspended && !PeerStats(engine, 1).suspended, "only the parent's sender should be paused");
+            Require(submitter.submit_calls == 2 && submitter.last_block == child.bytes, "the child should still be submitted");
+            Require(PeerStats(engine, 1).faults == 0, "the child should not count against its sender");
+        }
+        // The held parent's retry gets no answer: the child is not checked again but held, and its
+        // unknown parent does not count against its sender, even after the sender's allowance is used.
         {
             MockClock clock{};
             RelayEngine engine(clock);
@@ -2453,9 +2514,15 @@ void TestUnansweredBlockTriedOnceMore()
             submitter.parent_result = ParentCheck::kUnknown;
             DeliverBlock(engine, kPeer1, EncodeTestBlock(300, 0xB587), submitter); // uses the allowance
             const TestBlock child = child_of(held, 0xB588);
-            submitter.parent_results = {ParentCheck::kUnknown, ParentCheck::kUnavailable, ParentCheck::kUnknown};
+            submitter.parent_results = {ParentCheck::kUnknown, ParentCheck::kUnavailable};
             DeliverBlock(engine, kPeer1, child, submitter);
             Require(engine.stats().node_retries == 1 && submitter.submit_calls == 0, "the parent should be tried once");
+            Require(submitter.check_calls == 4, "the child should not be checked again while qbitd does not answer");
+            // The child is held instead, and its retry finding its parent unknown is not counted.
+            submitter.parent_result = ParentCheck::kUnknown;
+            node_announces_block(engine, 0xB589);
+            engine.RetryHeldBlock(submitter);
+            Require(submitter.check_calls == 5 && engine.stats().node_retries == 2, "the child should be retried");
             Require(PeerStats(engine, 1).faults == 0, "the child should not count against its sender");
         }
         // The held parent is rejected and that pauses the sender of both: the child is dropped.
