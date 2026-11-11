@@ -268,11 +268,7 @@ void RelayEngine::OnBlockHeader(const InboundPeerInfo& inbound_peer,
     const InboundRelayKey key = MakeInboundRelayKey(inbound_peer, payload.block_hash_prefix);
 
     if (IsKnown(payload.block_hash_prefix) || IsHandled(key)) {
-        if (IsHeld(key.hash_prefix)) {
-            // The rest of this copy stays ignored if the hold ends without settling the block.
-            MarkFinished(key, now);
-        }
-        ++m_stats.blocks_already_known;
+        NoteIgnoredCopy(key, now);
         return;
     }
 
@@ -383,10 +379,7 @@ void RelayEngine::OnBlockChunk(const InboundPeerInfo& inbound_peer,
 
     const InboundRelayKey key = MakeInboundRelayKey(inbound_peer, payload.block_hash_prefix);
     if (IsKnown(payload.block_hash_prefix) || IsHandled(key)) {
-        if (IsHeld(key.hash_prefix)) {
-            MarkFinished(key, now);
-        }
-        ++m_stats.blocks_already_known;
+        NoteIgnoredCopy(key, now);
         return;
     }
 
@@ -915,24 +908,31 @@ void RelayEngine::CheckAndSubmit(const InboundRelayKey& key,
     }
     if (retry) {
         ++m_stats.node_retries;
-    } else if (m_held.has_value() && m_held->summary.hash_hex == summary.prev_hash_hex) {
-        // This block builds on the held block: try that once more first, so the node can connect
-        // both, rather than finding this block's parent unknown.
-        RetryHeld(submitter);
-        if (IsKnown(block_id)) {
-            ++m_stats.blocks_already_known;
-            return;
-        }
     }
 
     // It must also build on the node's best chain, at or close to its tip. Answers that depend
     // only on the header, or on the node not answering, hold for every copy of the block and
     // settle it; answers that may depend on this copy's body, or that the node may outgrow
     // within seconds, end only this peer's copy.
-    const ParentCheck parent = submitter.CheckParent(block, summary.prev_hash_hex, m_config.max_parent_depth);
-    const auto checked_at = m_clock.Now();
+    ParentCheck parent = submitter.CheckParent(block, summary.prev_hash_hex, m_config.max_parent_depth);
+    auto checked_at = m_clock.Now();
     if (parent != ParentCheck::kUnavailable) {
         ++m_node_answers;
+    }
+    // The node is answering again and does not know this block's parent because the parent is the
+    // held block: try the held block first, then check this block again.
+    bool parent_retried = false;
+    if (!retry && parent == ParentCheck::kUnknown && m_held.has_value() && m_held->summary.hash_hex == summary.prev_hash_hex) {
+        RetryHeld(submitter);
+        parent_retried = true;
+        if (IsSuspended(slot, m_clock.Now())) {
+            return; // the held block's retry paused this block's sender
+        }
+        parent = submitter.CheckParent(block, summary.prev_hash_hex, m_config.max_parent_depth);
+        checked_at = m_clock.Now();
+        if (parent != ParentCheck::kUnavailable) {
+            ++m_node_answers;
+        }
     }
     bool parent_pending = false;
     switch (parent) {
@@ -974,12 +974,13 @@ void RelayEngine::CheckAndSubmit(const InboundRelayKey& key,
         return;
     case ParentCheck::kUnknown: {
         // The node may not have the parent yet (it may still be on its way over P2P), so one such
-        // block per peer per decay interval is not the peer's fault; more than that is. A held
-        // block's retry, which may come late, is not counted.
+        // block per peer per decay interval is not the peer's fault; more than that is. Neither a
+        // held block's retry, which may come late, nor a block whose held parent was just tried
+        // again is counted.
         ++m_stats.blocks_parent_unknown;
         LogUnusedBlock(checked_at, slot, block, "parent unknown to qbitd");
         PeerInbound& peer = Peer(slot);
-        if (!retry) {
+        if (!retry && !parent_retried) {
             if (peer.unknown_parent_allowed_at.has_value() &&
                 checked_at - *peer.unknown_parent_allowed_at < m_config.peer_fault_decay_interval) {
                 RecordFault(slot, checked_at);
@@ -1098,6 +1099,16 @@ void RelayEngine::ExpireHeldBlock(Clock::TimePoint now)
     }
 }
 
+void RelayEngine::NoteIgnoredCopy(const InboundRelayKey& key, Clock::TimePoint now)
+{
+    ++m_stats.blocks_already_known;
+    if (IsHeld(key.hash_prefix)) {
+        // A copy of the held block: the rest of its chunks are ignored for kHandledInboundLifetime
+        // even if the hold ends without settling the block.
+        MarkFinished(key, now);
+    }
+}
+
 bool RelayEngine::IsHeld(std::uint64_t block_id) const
 {
     return m_held.has_value() && m_held->block_id == block_id;
@@ -1115,6 +1126,9 @@ void RelayEngine::RetryHeldBlock(BlockSubmitter& submitter)
 
 void RelayEngine::RetryHeld(BlockSubmitter& submitter)
 {
+    if (!m_held.has_value()) {
+        return;
+    }
     HeldBlock held = std::move(*m_held);
     m_held.reset();
     CheckAndSubmit(held.key, std::move(held.block), held.summary, submitter, /*retry=*/true);

@@ -325,6 +325,7 @@ private:
     void RetryHeld(BlockSubmitter& submitter);
     void ExpireHeldBlock(Clock::TimePoint now);
     [[nodiscard]] bool IsHeld(std::uint64_t block_id) const;
+    void NoteIgnoredCopy(const InboundRelayKey& key, Clock::TimePoint now);
     [[nodiscard]] bool FeedChunk(const InboundRelayKey& key, InboundRelay& relay, const BlockChunkPayload& payload);
 
     const Clock& m_clock;

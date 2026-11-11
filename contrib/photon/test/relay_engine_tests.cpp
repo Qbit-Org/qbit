@@ -151,6 +151,11 @@ public:
         last_block_hash = block_hash_hex;
         last_prev_hash = prev_hash_hex;
         last_max_depth = max_depth;
+        if (!parent_results.empty()) {
+            const ParentCheck result = parent_results.front();
+            parent_results.pop_front();
+            return result;
+        }
         return parent_result;
     }
 
@@ -162,6 +167,8 @@ public:
     }
 
     ParentCheck parent_result{ParentCheck::kNearTip};
+    // Answers for the next parent checks, before parent_result applies.
+    std::deque<ParentCheck> parent_results{};
     SubmitOutcome submit_result{SubmitOutcome::kAccepted};
     std::function<void()> check_hook{};
     std::function<SubmitOutcome(std::span<const std::uint8_t>)> submit_hook{};
@@ -2378,7 +2385,7 @@ void TestUnansweredBlockTriedOnceMore()
         Require(submitter.check_calls == checks + 1 && submitter.last_block == paused.bytes,
                 "another peer's copy of a paused peer's held block should be used");
     }
-    // A block that builds on the held block has the held block tried first.
+    // A block whose parent is the held block: the held block is tried first once qbitd answers.
     {
         const auto child_of = [](const TestBlock& parent, std::uint64_t seed) {
             TestBlock child = EncodeTestBlock(300, seed);
@@ -2392,7 +2399,8 @@ void TestUnansweredBlockTriedOnceMore()
             return child;
         };
 
-        // The node answers again: both blocks are submitted, parent first.
+        // The node answers again, but does not know the new block's parent, the held block: the
+        // held block is tried first, then the new block is checked again, and both are submitted.
         {
             MockClock clock{};
             RelayEngine engine(clock);
@@ -2406,15 +2414,17 @@ void TestUnansweredBlockTriedOnceMore()
                 submitted.emplace_back(data.begin(), data.end());
                 return SubmitOutcome::kAccepted;
             };
-            submitter.parent_result = ParentCheck::kNearTip;
+            submitter.parent_results = {ParentCheck::kUnknown, ParentCheck::kNearTip, ParentCheck::kNearTip};
             DeliverBlock(engine, kPeer1, child, submitter);
-            Require(submitted.size() == 2 && submitted[0] == held.bytes && submitted[1] == child.bytes,
+            Require(submitter.check_calls == 4 && submitted.size() == 2 && submitted[0] == held.bytes && submitted[1] == child.bytes,
                     "the held parent should be submitted before its child");
             Require(engine.stats().node_retries == 1 && engine.stats().submit_successes == 2, "both should be accepted");
+            Require(engine.stats().blocks_parent_unknown == 0, "the child's parent is found on the second check");
             engine.RetryHeldBlock(submitter);
-            Require(submitter.check_calls == 3, "the parent should not be tried again");
+            Require(submitter.check_calls == 4, "the parent should not be tried again");
         }
-        // The node still does not answer: the parent is given up and the child is held instead.
+        // qbitd still does not answer: the held block is not tried again at that point; the new
+        // block replaces it and is tried once qbitd answers.
         {
             MockClock clock{};
             RelayEngine engine(clock);
@@ -2424,13 +2434,52 @@ void TestUnansweredBlockTriedOnceMore()
             DeliverBlock(engine, kPeer0, held, submitter);
             const TestBlock child = child_of(held, 0xB584);
             DeliverBlock(engine, kPeer1, child, submitter);
-            Require(submitter.check_calls == 3 && engine.stats().node_retries == 1, "the parent should be tried once more first");
-            Require(engine.stats().held_blocks_dropped == 0, "the parent was retried, not dropped");
+            Require(submitter.check_calls == 2 && engine.stats().node_retries == 0, "a node that does not answer should not be called again");
+            Require(engine.stats().held_blocks_dropped == 1, "the parent should be replaced");
             submitter.parent_result = ParentCheck::kNearTip;
             node_announces_block(engine, 0xB585);
             engine.RetryHeldBlock(submitter);
             Require(submitter.submit_calls == 1 && submitter.last_block == child.bytes, "the child should be held and retried");
-            Require(PeerStats(engine, 0).faults == 0 && PeerStats(engine, 1).faults == 0, "neither counts against its sender");
+        }
+        // The held parent's retry gets no answer: the child's unknown parent does not count against
+        // its sender, even after the sender's allowance is used.
+        {
+            MockClock clock{};
+            RelayEngine engine(clock);
+            CapturingSubmitter submitter;
+            submitter.parent_result = ParentCheck::kUnavailable;
+            const TestBlock held = EncodeTestBlock(500, 0xB586);
+            DeliverBlock(engine, kPeer0, held, submitter);
+            submitter.parent_result = ParentCheck::kUnknown;
+            DeliverBlock(engine, kPeer1, EncodeTestBlock(300, 0xB587), submitter); // uses the allowance
+            const TestBlock child = child_of(held, 0xB588);
+            submitter.parent_results = {ParentCheck::kUnknown, ParentCheck::kUnavailable, ParentCheck::kUnknown};
+            DeliverBlock(engine, kPeer1, child, submitter);
+            Require(engine.stats().node_retries == 1 && submitter.submit_calls == 0, "the parent should be tried once");
+            Require(PeerStats(engine, 1).faults == 0, "the child should not count against its sender");
+        }
+        // The held parent is rejected and that pauses the sender of both: the child is dropped.
+        {
+            MockClock clock{};
+            RelayEngine engine(clock);
+            CapturingSubmitter submitter;
+            submitter.parent_result = ParentCheck::kTooFar;
+            for (std::uint32_t i = 0; i + 1 < RelayEngineConfig{}.peer_fault_threshold; ++i) {
+                DeliverBlock(engine, kPeer1, EncodeTestBlock(200, 0xB590 + i), submitter);
+            }
+            submitter.parent_result = ParentCheck::kUnavailable;
+            const TestBlock held = EncodeTestBlock(500, 0xB5A0);
+            DeliverBlock(engine, kPeer1, held, submitter);
+            const TestBlock child = child_of(held, 0xB5A1);
+            submitter.parent_results = {ParentCheck::kUnknown, ParentCheck::kNearTip};
+            submitter.submit_result = SubmitOutcome::kRejected;
+            DeliverBlock(engine, kPeer1, child, submitter);
+            Require(PeerStats(engine, 1).suspended, "the rejected parent should pause its sender");
+            Require(submitter.submit_calls == 1 && submitter.last_block == held.bytes, "the paused sender's child should not be submitted");
+            submitter.parent_result = ParentCheck::kNearTip;
+            node_announces_block(engine, 0xB5A2);
+            engine.RetryHeldBlock(submitter);
+            Require(submitter.submit_calls == 1, "nor held for later");
         }
     }
     // A copy in progress when the block is held: the rest of its chunks are ignored, even after a
