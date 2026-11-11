@@ -4931,13 +4931,10 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
             // mapBlockSource is only used for punishing peers and setting
             // which peers send us compact blocks, so the race between here and
             // cs_main in ProcessNewBlock is fine.
-            if (requested_recovery) {
-                // Retryable recovery failures can leave the previous source entry behind
-                // because the block never reaches ProcessBlock()/BlockChecked().
-                mapBlockSource.insert_or_assign(hash, std::make_pair(pfrom.GetId(), true));
-            } else {
-                mapBlockSource.emplace(hash, std::make_pair(pfrom.GetId(), true));
-            }
+            // Record this peer as the source of the block being processed,
+            // replacing any earlier entry, so that the result of processing
+            // it is attributed to this peer.
+            mapBlockSource.insert_or_assign(hash, std::make_pair(pfrom.GetId(), true));
 
             // Check claimed work on this block against our anti-dos thresholds.
             if (prev_block && prev_block->nChainWork + CalculateClaimedHeadersWork({{pblock->GetBlockHeader()}}) >= GetAntiDoSWorkThreshold()) {
