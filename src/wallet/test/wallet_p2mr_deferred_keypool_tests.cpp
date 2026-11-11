@@ -1330,8 +1330,8 @@ BOOST_FIXTURE_TEST_CASE(WalletPassphraseRefillHoldsOffLocksButNotStaleRelocks, R
     auto& scheduler{*Assert(m_node.scheduler)};
 
     // An earlier unlock, ended by walletlock, leaves its relock callback
-    // queued. Then one address is handed out while locked, so that the next
-    // unlock has a key to derive.
+    // queued. Then more addresses are handed out while locked than one
+    // refill step derives, so that the next unlock refills in several steps.
     constexpr int64_t first_timeout{100};
     CallWalletPassphrase(context, wallet_name, passphrase, first_timeout);
     BOOST_REQUIRE_EQUAL(external_spk_man->GetKeyPoolSize(), keypool_size);
@@ -1340,19 +1340,23 @@ BOOST_FIXTURE_TEST_CASE(WalletPassphraseRefillHoldsOffLocksButNotStaleRelocks, R
         BOOST_REQUIRE(wallet->Lock());
         WITH_LOCK(wallet->cs_wallet, wallet->nRelockTime = 0);
     }
-    BOOST_REQUIRE(wallet->GetNewDestination(OutputType::P2MR, ""));
+    constexpr int64_t addresses_used{DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL + 4};
+    for (int64_t i = 0; i < addresses_used; ++i) {
+        BOOST_REQUIRE(wallet->GetNewDestination(OutputType::P2MR, ""));
+    }
+    BOOST_REQUIRE_EQUAL(external_spk_man->GetKeyPoolSize(), keypool_size - addresses_used);
 
-    // While the next unlock refills, make the stale callback due and see
-    // whether the scheduler thread runs past it, and start a lock that must
-    // wait for the refill.
+    // While the first step of the next unlock's refill runs, make the stale
+    // callback due and see whether the scheduler thread runs past it, and
+    // start a lock that must wait for the whole refill, not only that step.
     std::atomic_bool scheduler_ran{false};
     std::atomic_bool lock_returned_during_refill{false};
     std::promise<void> lock_returned;
     std::shared_future<void> lock_returned_future{lock_returned.get_future().share()};
     std::thread lock_thread;
-    bool first_notification{true};
+    int refill_steps{0};
     boost::signals2::scoped_connection connection{external_spk_man->NotifyCanGetAddressesChanged.connect([&] {
-        if (!std::exchange(first_notification, false)) return;
+        if (++refill_steps > 1) return;
         scheduler.MockForward(std::chrono::seconds{first_timeout});
         // Shared, so that a marker that runs only after the wait times out
         // still has its promise.
@@ -1366,11 +1370,14 @@ BOOST_FIXTURE_TEST_CASE(WalletPassphraseRefillHoldsOffLocksButNotStaleRelocks, R
         }};
         lock_returned_during_refill = lock_returned_future.wait_for(std::chrono::milliseconds{500}) == std::future_status::ready;
     })};
-    CallWalletPassphrase(context, wallet_name, passphrase, /*timeout=*/1000);
+    // A lock that got in between the steps would make a later step fail,
+    // and the call with it.
+    BOOST_CHECK_NO_THROW(CallWalletPassphrase(context, wallet_name, passphrase, /*timeout=*/1000));
     connection.disconnect();
     BOOST_REQUIRE(lock_thread.joinable());
     lock_thread.join();
 
+    BOOST_CHECK_GE(refill_steps, 2);
     BOOST_CHECK(scheduler_ran);
     BOOST_CHECK(!lock_returned_during_refill);
     // The lock came after the refill had finished.
