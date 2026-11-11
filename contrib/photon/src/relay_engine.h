@@ -50,6 +50,8 @@ struct RelayEngineConfig {
     std::chrono::milliseconds held_block_lifetime{std::chrono::minutes{2}};
     // Per peer slot: each failed block adds one point, each accepted block removes
     // peer_fault_success_credit points, and one point decays every peer_fault_decay_interval.
+    // A block whose parent qbitd does not know adds a point only if the peer already had one let
+    // off within the last peer_fault_decay_interval.
     // Reaching peer_fault_threshold refuses the slot's inbound blocks for peer_suspend_initial,
     // doubling on each repeat up to peer_suspend_max.
     std::uint32_t peer_fault_threshold{8};
@@ -76,13 +78,17 @@ struct RelayStats {
     std::uint64_t submit_errors{0};
     // Reconstructed blocks dropped before submission.
     std::uint64_t blocks_mismatched{0};
+    // Parent too far from the best block (counts against the peer) or unknown to qbitd (does not).
     std::uint64_t blocks_parent_rejected{0};
+    std::uint64_t blocks_parent_unknown{0};
     std::uint64_t block_checks_unavailable{0};
     std::uint64_t blocks_node_behind{0};
     // Reconstructed blocks submitted while qbitd had their parent's header but had not connected it.
     std::uint64_t blocks_parent_pending{0};
-    // Blocks tried once more after qbitd did not answer for them.
+    // Blocks sent to qbitd once more after it did not answer for them, and held blocks dropped
+    // without that (replaced by a newer one, expired, or their peer paused).
     std::uint64_t node_retries{0};
+    std::uint64_t held_blocks_dropped{0};
     std::uint64_t inbound_rejected{0};
     std::uint64_t inbound_evictions{0};
     std::uint64_t peer_suspensions{0};
@@ -253,6 +259,8 @@ private:
         Clock::TimePoint fault_decay_from{};
         Clock::TimePoint suspended_until{};
         std::uint32_t suspension_level{0};
+        // When the peer last had a block with an unknown parent let off (see CheckAndSubmit).
+        std::optional<Clock::TimePoint> unknown_parent_allowed_at{};
         PeerRelayStats stats{};
     };
 
@@ -269,6 +277,8 @@ private:
     // A reconstructed block that qbitd did not answer for, kept for one more try.
     struct HeldBlock {
         InboundRelayKey key{};
+        std::uint64_t block_id{0};
+        BlockHeaderSummary summary{};
         std::vector<std::uint8_t> block{};
         Clock::TimePoint held_at{};
         std::uint64_t node_answers{0};
@@ -304,7 +314,14 @@ private:
                         const BlockHeaderSummary& summary,
                         BlockSubmitter& submitter,
                         bool retry);
-    void HoldBlock(const InboundRelayKey& key, std::vector<std::uint8_t> block_data, Clock::TimePoint now);
+    void HoldBlock(const InboundRelayKey& key,
+                   std::uint64_t block_id,
+                   const BlockHeaderSummary& summary,
+                   std::vector<std::uint8_t> block_data,
+                   Clock::TimePoint now);
+    void DropHeldBlock(Clock::TimePoint now, const char* reason);
+    void ExpireHeldBlock(Clock::TimePoint now);
+    [[nodiscard]] bool IsHeld(std::uint64_t block_id) const;
     [[nodiscard]] bool FeedChunk(const InboundRelayKey& key, InboundRelay& relay, const BlockChunkPayload& payload);
 
     const Clock& m_clock;
@@ -330,6 +347,7 @@ private:
     // block on when its own node announces it.
     // Keyed by BlockIdFromHex of the block hash, whichever form a copy was announced under.
     detail::RecentSet<std::uint64_t> m_settled{kHandledInboundLifetime, kMaxHandledInbound};
+    // While a block is held, other copies of it are ignored as if settled.
     std::optional<HeldBlock> m_held{};
     // Counts qbitd's answers and block announcements, so a held block is tried again only once qbitd
     // is answering.

@@ -964,13 +964,16 @@ void TestBlockWithParentAwayFromTipNotSubmitted()
 
         Require(submitter.check_calls == 1, "parent should be checked");
         Require(submitter.submit_calls == 0, "block whose parent is not near the tip must not be submitted");
-        Require(engine.stats().blocks_parent_rejected == 1, "parent rejection should be counted");
+        const bool too_far = result == ParentCheck::kTooFar;
+        Require(engine.stats().blocks_parent_rejected == (too_far ? 1U : 0U) &&
+                    engine.stats().blocks_parent_unknown == (too_far ? 0U : 1U),
+                "too-far and unknown parents should be counted separately");
         const auto peer = PeerStats(engine, 0);
-        // A parent the node does not know yet may still be on its way to it, so only a parent too
-        // far from the tip counts against the peer.
-        const std::uint32_t expected = result == ParentCheck::kTooFar ? 1 : 0;
+        // A parent the node does not know yet may still be on its way to it, so a first such block
+        // does not count against the peer.
+        const std::uint32_t expected = too_far ? 1 : 0;
         Require(peer.faults == expected && peer.fault_score == expected,
-                "only a parent too far from the tip should count against the peer");
+                "only a parent too far from the tip should count against the peer here");
     }
 }
 
@@ -1976,6 +1979,10 @@ void TestBlockAnnouncedUnderBothFormsUsedOnce()
         DeliverBlock(engine, kPeer0, block, submitter, BlockIdOf(block.bytes));
         DeliverBlock(engine, kPeer1, block, submitter, block.prefix);
         Require(submitter.submit_calls == 1 && submitter.check_calls == 1, "a settled block should not reach the node again");
+        // Under this version's form, a copy of a settled block is not even decoded.
+        const RelayStats before = engine.stats();
+        DeliverBlock(engine, kPeer2, block, submitter, BlockIdOf(block.bytes));
+        Require(engine.stats().chunks_received == before.chunks_received, "a settled block's copy should not be decoded");
     }
 }
 
@@ -2175,21 +2182,66 @@ void TestParentKnownOnlyAsHeaderSubmitted()
     Require(PeerStats(engine, 2).faults == 0, "a node far behind is not the peer's fault");
 }
 
-void TestUnknownParentNotCountedAgainstPeer()
+void TestUnknownParentAllowedOncePerInterval()
 {
     MockClock clock{};
     RelayEngine engine(clock);
     CapturingSubmitter submitter;
     submitter.parent_result = ParentCheck::kUnknown;
+    const RelayEngineConfig defaults{};
 
-    for (std::uint64_t i = 0; i < 20; ++i) {
-        DeliverBlock(engine, kPeer0, EncodeTestBlock(200, 0xB400 + i), submitter);
+    DeliverBlock(engine, kPeer0, EncodeTestBlock(200, 0xB400), submitter);
+    Require(PeerStats(engine, 0).faults == 0, "a peer's first unknown-parent block should be let off");
+    DeliverBlock(engine, kPeer0, EncodeTestBlock(200, 0xB401), submitter);
+    Require(PeerStats(engine, 0).faults == 1, "a second one within the interval should count");
+    DeliverBlock(engine, kPeer1, EncodeTestBlock(200, 0xB402), submitter);
+    Require(PeerStats(engine, 1).faults == 0, "each peer has its own allowance");
+
+    // A full interval after the last one let off, one is let off again.
+    clock.Advance(defaults.peer_fault_decay_interval);
+    DeliverBlock(engine, kPeer0, EncodeTestBlock(200, 0xB403), submitter);
+    Require(PeerStats(engine, 0).faults == 1, "the allowance should renew after the interval");
+
+    // A stream of them pauses the peer, like other unusable blocks.
+    for (std::uint32_t i = 0; i < defaults.peer_fault_threshold; ++i) {
+        DeliverBlock(engine, kPeer0, EncodeTestBlock(200, 0xB410 + i), submitter);
     }
+    Require(PeerStats(engine, 0).suspended && engine.stats().peer_suspensions == 1, "the peer should be paused");
     Require(submitter.submit_calls == 0, "blocks with an unknown parent must not be submitted");
-    Require(engine.stats().blocks_parent_rejected == 20, "they should be counted");
-    Require(engine.stats().peer_suspensions == 0, "they must not suspend the peer");
+    Require(engine.stats().blocks_parent_unknown == 4 + defaults.peer_fault_threshold, "they should be counted");
+    Require(engine.stats().blocks_parent_rejected == 0, "they are not parent rejections");
+}
+
+void TestUnknownParentRaceStaysNeutral()
+{
+    MockClock clock{};
+    RelayEngine engine(clock);
+    CapturingSubmitter submitter;
+
+    // A peer relays a block before qbitd has its parent.
+    const TestBlock child = EncodeTestBlock(300, 0xB420);
+    submitter.parent_result = ParentCheck::kUnknown;
+    DeliverBlock(engine, kPeer0, child, submitter, BlockIdOf(child.bytes));
+    Require(submitter.submit_calls == 0 && engine.stats().blocks_parent_unknown == 1, "the block should be dropped");
+
+    // The parent, then the block, reach qbitd over P2P, and qbitd announces them.
+    const std::vector<std::uint8_t> parent = MakeBlock(300, 0xB421);
+    engine.OnNewBlock(HashOf(parent), parent);
+    engine.OnNewBlock(HashOf(child.bytes), child.bytes);
+
+    // The peer's next block is used.
+    clock.Advance(std::chrono::seconds{20});
+    submitter.parent_result = ParentCheck::kNearTip;
+    const TestBlock next = EncodeTestBlock(300, 0xB422);
+    DeliverBlock(engine, kPeer0, next, submitter, BlockIdOf(next.bytes));
+    Require(submitter.submit_calls == 1 && engine.stats().submit_successes == 1, "the next block should be accepted");
+
+    // The same race a few minutes later is let off again.
+    clock.Advance(std::chrono::minutes{5});
+    submitter.parent_result = ParentCheck::kUnknown;
+    DeliverBlock(engine, kPeer0, EncodeTestBlock(300, 0xB423), submitter);
     const auto peer = PeerStats(engine, 0);
-    Require(peer.faults == 0 && peer.fault_score == 0 && !peer.suspended, "they must not count against the peer");
+    Require(peer.faults == 0 && peer.fault_score == 0, "occasional races must not count against the peer");
 }
 
 void TestUnansweredBlockTriedOnceMore()
@@ -2209,8 +2261,11 @@ void TestUnansweredBlockTriedOnceMore()
         DeliverBlock(engine, kPeer0, block, submitter, BlockIdOf(block.bytes));
         Require(submitter.check_calls == 1 && submitter.submit_calls == 0, "block should not be submitted yet");
 
-        // Other copies are not checked again meanwhile.
+        // Other copies are not checked again meanwhile; under this version's form they are not
+        // even decoded.
+        const RelayStats before = engine.stats();
         DeliverBlock(engine, kPeer1, block, submitter, BlockIdOf(block.bytes));
+        Require(engine.stats().chunks_received == before.chunks_received, "a held block's copy should not be decoded");
         DeliverBlock(engine, kPeer2, block, submitter, block.prefix);
         Require(submitter.check_calls == 1, "copies should not be checked while the block is held");
 
@@ -2244,6 +2299,7 @@ void TestUnansweredBlockTriedOnceMore()
         engine.RetryHeldBlock(submitter);
         Require(submitter.check_calls == 2 && submitter.submit_calls == 0, "a block should be retried once only");
         Require(engine.stats().block_checks_unavailable == 2 && PeerStats(engine, 0).faults == 0, "neither attempt counts against the peer");
+        Require(engine.stats().node_retries == 1 && engine.stats().held_blocks_dropped == 0, "one retry, nothing dropped unretried");
     }
     // submitblock gets no answer; the retry finds the node has the block and does not send it again.
     {
@@ -2283,6 +2339,7 @@ void TestUnansweredBlockTriedOnceMore()
         engine.OnNewBlock(HashOf(block.bytes), block.bytes);
         engine.RetryHeldBlock(submitter);
         Require(submitter.check_calls == 1 && submitter.submit_calls == 0, "a block the node announced needs no retry");
+        Require(engine.stats().node_retries == 0, "no retry is counted without a call to the node");
     }
     // A held block is dropped after its lifetime, and when its sender is paused.
     {
@@ -2295,6 +2352,7 @@ void TestUnansweredBlockTriedOnceMore()
         node_announces_block(engine, 0xB552);
         engine.RetryHeldBlock(submitter);
         Require(submitter.check_calls == 1, "an expired held block should not be retried");
+        Require(engine.stats().held_blocks_dropped == 1, "the expired block should be counted");
 
         DeliverBlock(engine, kPeer1, EncodeTestBlock(500, 0xB553), submitter);
         submitter.parent_result = ParentCheck::kTooFar;
@@ -2306,6 +2364,66 @@ void TestUnansweredBlockTriedOnceMore()
         node_announces_block(engine, 0xB554);
         engine.RetryHeldBlock(submitter);
         Require(submitter.check_calls == checks, "a paused peer's held block should not be retried");
+        Require(engine.stats().held_blocks_dropped == 2, "the paused peer's block should be counted");
+    }
+    // A newer block replaces the held one.
+    {
+        MockClock clock{};
+        RelayEngine engine(clock);
+        CapturingSubmitter submitter;
+        submitter.parent_result = ParentCheck::kUnavailable;
+        DeliverBlock(engine, kPeer0, EncodeTestBlock(500, 0xB571), submitter);
+        const TestBlock newer = EncodeTestBlock(500, 0xB572);
+        DeliverBlock(engine, kPeer1, newer, submitter);
+        Require(engine.stats().held_blocks_dropped == 1, "the replaced block should be counted");
+        submitter.parent_result = ParentCheck::kNearTip;
+        node_announces_block(engine, 0xB573);
+        engine.RetryHeldBlock(submitter);
+        Require(submitter.submit_calls == 1 && submitter.last_block == newer.bytes, "the newer block should be retried");
+    }
+}
+
+// What a retry finds may reflect how long the node took to answer: those outcomes do not count
+// against the sender, while verdicts on the block itself still do.
+void TestHeldBlockRetryOutcomes()
+{
+    struct Case {
+        ParentCheck parent;
+        SubmitOutcome submit;
+        std::uint64_t faults;
+    };
+    const std::vector<Case> cases{
+        {ParentCheck::kTooFar, SubmitOutcome::kAccepted, 0},
+        {ParentCheck::kUnknown, SubmitOutcome::kAccepted, 0},
+        {ParentCheck::kNearTip, SubmitOutcome::kInconclusive, 0},
+        {ParentCheck::kNearTip, SubmitOutcome::kRejected, 1},
+        {ParentCheck::kNearTip, SubmitOutcome::kKnownInvalid, 1},
+    };
+    std::uint64_t seed = 0xB600;
+    for (const Case& test_case : cases) {
+        MockClock clock{};
+        RelayEngine engine(clock);
+        CapturingSubmitter submitter;
+        submitter.parent_result = ParentCheck::kUnavailable;
+        const TestBlock block = EncodeTestBlock(500, ++seed);
+        DeliverBlock(engine, kPeer0, block, submitter);
+
+        submitter.parent_result = test_case.parent;
+        submitter.submit_result = test_case.submit;
+        const std::vector<std::uint8_t> other = MakeBlock(300, ++seed);
+        engine.OnNewBlock(HashOf(other), other);
+        engine.RetryHeldBlock(submitter);
+        Require(submitter.check_calls == 2 && engine.stats().node_retries == 1, "the held block should be retried");
+        Require(PeerStats(engine, 0).faults == test_case.faults,
+                std::string("retry outcome ") + photon::ParentCheckName(test_case.parent) + "/" +
+                    photon::SubmitOutcomeName(test_case.submit) + " charged wrongly");
+
+        // An outcome that concerns only this copy leaves other peers' copies to be tried.
+        if (test_case.submit == SubmitOutcome::kRejected) {
+            submitter.submit_result = SubmitOutcome::kAccepted;
+            DeliverBlock(engine, kPeer1, block, submitter, BlockIdOf(block.bytes));
+            Require(submitter.submit_calls == 2 && engine.stats().submit_successes == 1, "another peer's copy should be used");
+        }
     }
 }
 
@@ -2522,7 +2640,9 @@ int RunAllTests()
         {"mainnet_hash_sequence_relayed_without_suppression", TestMainnetHashSequenceRelayedWithoutSuppression},
         {"identifier_keyed_receiver_gets_every_block", TestIdentifierKeyedReceiverGetsEveryBlock},
         {"parent_known_only_as_header_submitted", TestParentKnownOnlyAsHeaderSubmitted},
-        {"unknown_parent_not_counted_against_peer", TestUnknownParentNotCountedAgainstPeer},
+        {"unknown_parent_allowed_once_per_interval", TestUnknownParentAllowedOncePerInterval},
+        {"unknown_parent_race_stays_neutral", TestUnknownParentRaceStaysNeutral},
+        {"held_block_retry_outcomes", TestHeldBlockRetryOutcomes},
         {"unanswered_block_tried_once_more", TestUnansweredBlockTriedOnceMore},
     };
 
