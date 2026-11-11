@@ -726,15 +726,16 @@ P2MRKeyPoolRefillResult RefillP2MRKeyPoolsAfterUnlock(CWallet& wallet)
         return result;
     }};
 
-    const auto stop{[&](int64_t steps) {
-        return steps == max_steps || (wallet.HaveChain() && wallet.chain().shutdownRequested());
+    const auto shutdown_requested{[&] {
+        return wallet.HaveChain() && wallet.chain().shutdownRequested();
     }};
 
+    bool incomplete{false};
     try {
         // The refill step does not run while a create-time top-up is pending,
         // so finish that first.
         for (int64_t steps{0}; wallet.HasPendingInitialKeyPoolTopUp(); ++steps) {
-            if (stop(steps)) return finish(P2MRKeyPoolRefillResult::INCOMPLETE);
+            if (steps == max_steps || shutdown_requested()) return finish(P2MRKeyPoolRefillResult::INCOMPLETE);
             ++steps_run;
             if (wallet.RunPendingInitialKeyPoolTopUpStep() == CWallet::PendingInitialKeyPoolTopUpStepResult::FAILED) {
                 return finish(P2MRKeyPoolRefillResult::FAILED);
@@ -748,7 +749,13 @@ P2MRKeyPoolRefillResult RefillP2MRKeyPoolsAfterUnlock(CWallet& wallet)
                 if (!spk_man || spk_man->P2MRReceiveKeyPoolFull()) continue;
             }
             for (int64_t steps{0};; ++steps) {
-                if (stop(steps)) return finish(P2MRKeyPoolRefillResult::INCOMPLETE);
+                if (shutdown_requested()) return finish(P2MRKeyPoolRefillResult::INCOMPLETE);
+                // Each pool has its own step limit, so a receive pool that
+                // addresses keep draining still leaves the change pool its steps.
+                if (steps == max_steps) {
+                    incomplete = true;
+                    break;
+                }
                 ++steps_run;
                 const auto step_result{wallet.RunP2MRKeyPoolRefillStep(internal)};
                 if (step_result == CWallet::P2MRKeyPoolRefillStepResult::COMPLETE) break;
@@ -763,7 +770,7 @@ P2MRKeyPoolRefillResult RefillP2MRKeyPoolsAfterUnlock(CWallet& wallet)
         wallet.WalletLogPrintf("P2MR keypool refill after unlock step threw: %s\n", e.what());
         return finish(P2MRKeyPoolRefillResult::FAILED);
     }
-    return finish(P2MRKeyPoolRefillResult::COMPLETE);
+    return finish(incomplete ? P2MRKeyPoolRefillResult::INCOMPLETE : P2MRKeyPoolRefillResult::COMPLETE);
 }
 
 std::shared_ptr<CWallet> LoadWallet(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings)

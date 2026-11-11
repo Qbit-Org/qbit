@@ -1509,9 +1509,19 @@ BOOST_FIXTURE_TEST_CASE(RefillP2MRKeyPoolsAfterUnlockReportsFailuresAndStopsAtSt
     BOOST_CHECK(!WITH_LOCK(wallet->cs_wallet, return wallet->m_p2mr_receive_keypool_refill_scheduled));
     database.m_txn_commit_pass = true;
 
+    // Some change used meanwhile, staying above the low watermark so that
+    // drawing it does not refill the change pool inline.
+    constexpr int change_used{4};
+    for (int i = 0; i < change_used; ++i) {
+        BOOST_REQUIRE(wallet->GetNewChangeDestination(OutputType::P2MR));
+    }
+    BOOST_REQUIRE_EQUAL(internal_spk_man->GetKeyPoolSize(), keypool_size - change_used);
+    BOOST_REQUIRE_GT(internal_spk_man->GetKeyPoolSize(), internal_spk_man->GetP2MRReceiveKeyPoolLowWatermark());
+
     // Addresses handed out as fast as the steps derive them stop the refill
     // at its step limit instead of holding the caller indefinitely. Two
-    // addresses after each step keep the pool just short of full.
+    // addresses after each step keep the pool just short of full. The change
+    // pool still gets its own steps and is filled.
     int steps{0};
     bool drawing{false};
     boost::signals2::scoped_connection connection{external_spk_man->NotifyCanGetAddressesChanged.connect([&] {
@@ -1527,6 +1537,7 @@ BOOST_FIXTURE_TEST_CASE(RefillP2MRKeyPoolsAfterUnlockReportsFailuresAndStopsAtSt
     connection.disconnect();
     BOOST_CHECK_EQUAL(steps, 2 * (keypool_size / DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL + 1));
     BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), keypool_size - 2);
+    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), keypool_size);
 
     BOOST_CHECK(RefillP2MRKeyPoolsAfterUnlock(*wallet) == P2MRKeyPoolRefillResult::COMPLETE);
     BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), keypool_size);

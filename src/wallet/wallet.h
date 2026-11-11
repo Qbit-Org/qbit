@@ -116,8 +116,9 @@ void TopUpKeyPoolAfterUnlock(WalletContext& context, const std::shared_ptr<CWall
 enum class P2MRKeyPoolRefillResult {
     //! The pending create-time top-up, if any, and both P2MR keypools reached -keypool.
     COMPLETE,
-    //! The step limit was reached first, for example because addresses were
-    //! handed out as fast as the steps derived them, or shutdown was requested.
+    //! A pool reached its step limit first, for example because addresses
+    //! were handed out as fast as the steps derived them, or shutdown was
+    //! requested.
     INCOMPLETE,
     //! A step failed; it logged why.
     FAILED,
