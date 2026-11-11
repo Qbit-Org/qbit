@@ -305,7 +305,9 @@ private:
     void EvictExpiredInbound(Clock::TimePoint now);
     InboundMap::iterator EraseInboundAt(InboundMap::iterator it, bool evicted);
     void EraseInbound(const InboundRelayKey& key);
-    void EraseInboundForPrefix(std::uint64_t hash_prefix);
+    // Erases incomplete blocks announced under `hash_prefix`; with `finished_at`, the rest of their
+    // chunks are ignored as well.
+    void EraseInboundForPrefix(std::uint64_t hash_prefix, std::optional<Clock::TimePoint> finished_at = std::nullopt);
     void EraseInboundForSlot(std::size_t slot_index);
     void ClearBufferedChunks(InboundRelay& relay);
     void TryFinalizeInbound(const InboundRelayKey& key, InboundRelay& relay, BlockSubmitter& submitter);
@@ -319,7 +321,8 @@ private:
                    const BlockHeaderSummary& summary,
                    std::vector<std::uint8_t> block_data,
                    Clock::TimePoint now);
-    void DropHeldBlock(Clock::TimePoint now, const char* reason);
+    void DropHeldBlock(Clock::TimePoint now, const char* reason, bool settle);
+    void RetryHeld(BlockSubmitter& submitter);
     void ExpireHeldBlock(Clock::TimePoint now);
     [[nodiscard]] bool IsHeld(std::uint64_t block_id) const;
     [[nodiscard]] bool FeedChunk(const InboundRelayKey& key, InboundRelay& relay, const BlockChunkPayload& payload);
@@ -345,9 +348,11 @@ private:
     // parent is too far, or the node is not answering), so other peers' copies are not decoded and
     // sent to the node again. Unlike the seen set, this does not stop the relay from sending the
     // block on when its own node announces it.
-    // Keyed by BlockIdFromHex of the block hash, whichever form a copy was announced under.
+    // Keyed by BlockIdFromHex of the block hash, whichever form a copy was announced under. A held
+    // block dropped without a retry (replaced or expired) is settled too.
     detail::RecentSet<std::uint64_t> m_settled{kHandledInboundLifetime, kMaxHandledInbound};
-    // While a block is held, other copies of it are ignored as if settled.
+    // While a block is held, other copies of it under the identifier this version announces are
+    // ignored as if settled; copies under the earlier form are recognised once decoded.
     std::optional<HeldBlock> m_held{};
     // Counts qbitd's answers and block announcements, so a held block is tried again only once qbitd
     // is answering.
