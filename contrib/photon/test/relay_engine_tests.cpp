@@ -1,5 +1,6 @@
 #include <clock.h>
 #include <fec.h>
+#include <mainnet_block_headers.h>
 #include <peer_manager.h>
 #include <protocol.h>
 #include <relay_engine.h>
@@ -7,16 +8,23 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <exception>
 #include <functional>
+#include <iomanip>
 #include <iostream>
+#include <map>
 #include <optional>
 #include <random>
+#include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -82,11 +90,24 @@ std::vector<std::uint8_t> MakeBlock(std::size_t size, std::uint64_t seed)
     return RandomBytes(size, seed);
 }
 
-std::uint64_t PrefixOf(const std::vector<std::uint8_t>& block)
+std::string HashOf(const std::vector<std::uint8_t>& block)
 {
     const auto summary = photon::ReadBlockHeaderSummary(block);
     Require(summary.has_value(), "test block header should be readable");
-    return photon::HashPrefixFromHex(summary->hash_hex);
+    return summary->hash_hex;
+}
+
+// The identifier earlier versions announce a block under (its hash's leading 64 bits). Receivers
+// still accept it, so most tests below use it.
+std::uint64_t PrefixOf(const std::vector<std::uint8_t>& block)
+{
+    return photon::HashPrefixFromHex(HashOf(block));
+}
+
+// The identifier this version announces a block under (its hash's low-order 64 bits).
+std::uint64_t BlockIdOf(const std::vector<std::uint8_t>& block)
+{
+    return photon::BlockIdFromHex(HashOf(block));
 }
 
 PeerConfig MakePeer(std::uint16_t port, const std::array<std::uint8_t, 32>& key)
@@ -299,7 +320,7 @@ void TestOutboundPreemption()
         if (item.packet.msg_type == MessageType::kBlockHeader) {
             BlockHeaderPayload header{};
             Require(photon::DecodeBlockHeaderPayload(item.packet.payload, header), "header decode failed");
-            saw_new_prefix = header.block_hash_prefix == photon::HashPrefixFromHex(new_hash);
+            saw_new_prefix = header.block_hash_prefix == photon::BlockIdFromHex(new_hash);
             break;
         }
     }
@@ -343,7 +364,7 @@ void TestInboundDedupKnownPrefix()
     CapturingSubmitter submitter;
 
     const std::string hash_hex = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-    const std::uint64_t prefix = photon::HashPrefixFromHex(hash_hex);
+    const std::uint64_t prefix = photon::BlockIdFromHex(hash_hex);
 
     const std::vector<std::uint8_t> block = RandomBytes(4000, 0x4444);
     engine.OnNewBlock(hash_hex, block);
@@ -945,8 +966,11 @@ void TestBlockWithParentAwayFromTipNotSubmitted()
         Require(submitter.submit_calls == 0, "block whose parent is not near the tip must not be submitted");
         Require(engine.stats().blocks_parent_rejected == 1, "parent rejection should be counted");
         const auto peer = PeerStats(engine, 0);
-        Require(peer.faults == 1 && peer.fault_score == 1,
-                "parent rejection should count against the peer");
+        // A parent the node does not know yet may still be on its way to it, so only a parent too
+        // far from the tip counts against the peer.
+        const std::uint32_t expected = result == ParentCheck::kTooFar ? 1 : 0;
+        Require(peer.faults == expected && peer.fault_score == expected,
+                "only a parent too far from the tip should count against the peer");
     }
 }
 
@@ -1735,6 +1759,556 @@ void TestHandledBlockTimedAfterNodeCalls()
     Require(engine.stats().inbound_entries == 0, "remaining chunks must not start a new incomplete block");
 }
 
+std::string Hex64(std::uint64_t value)
+{
+    std::ostringstream out;
+    out << std::hex << std::setw(16) << std::setfill('0') << value;
+    return out.str();
+}
+
+// A block built from a real mainnet header and a made-up body; the relay reads only the header.
+std::vector<std::uint8_t> MainnetBlock(std::size_t index)
+{
+    const std::string_view hex = photon::test::kMainnetHeaders.at(index).hex;
+    Require(hex.size() == 160, "fixture header should be 80 bytes");
+    std::vector<std::uint8_t> block;
+    for (std::size_t i = 0; i < hex.size(); i += 2) {
+        block.push_back(static_cast<std::uint8_t>(std::stoul(std::string(hex.substr(i, 2)), nullptr, 16)));
+    }
+    const std::vector<std::uint8_t> body = RandomBytes(300, 0x5EED0000 + index);
+    block.insert(block.end(), body.begin(), body.end());
+    return block;
+}
+
+// Pumps the engine's current outbound block until all of its packets are sent.
+void PumpAll(RelayEngine& engine, RecordingSink& sink, PeerManager& manager)
+{
+    for (int i = 0; i < 1000 && engine.HasOutbound(); ++i) {
+        engine.PumpOutbound(sink, manager);
+    }
+    Require(!engine.HasOutbound(), "outbound block should be fully sent");
+}
+
+// Feeds every block packet in `sent` to `receiver` as if received from `from`.
+void DeliverPackets(const std::vector<RecordingSink::Sent>& sent,
+                    RelayEngine& receiver,
+                    const InboundPeerInfo& from,
+                    CapturingSubmitter& submitter)
+{
+    for (const auto& item : sent) {
+        if (item.packet.msg_type == MessageType::kBlockHeader) {
+            BlockHeaderPayload header{};
+            Require(photon::DecodeBlockHeaderPayload(item.packet.payload, header), "header decode failed");
+            receiver.OnBlockHeader(from, header, submitter);
+        } else if (item.packet.msg_type == MessageType::kBlockChunk) {
+            BlockChunkPayload chunk{};
+            Require(photon::DecodeBlockChunkPayload(item.packet.payload, chunk), "chunk decode failed");
+            receiver.OnBlockChunk(from, chunk, submitter);
+        }
+    }
+}
+
+std::optional<std::uint64_t> AnnouncedIdentifier(const std::vector<RecordingSink::Sent>& sent)
+{
+    for (const auto& item : sent) {
+        if (item.packet.msg_type == MessageType::kBlockHeader) {
+            BlockHeaderPayload header{};
+            Require(photon::DecodeBlockHeaderPayload(item.packet.payload, header), "header decode failed");
+            return header.block_hash_prefix;
+        }
+    }
+    return std::nullopt;
+}
+
+void TestBlocksSharingLeadingHashBitsAllRelayed()
+{
+    MockClock clock{};
+    RecordingSink sink;
+    const auto key = Key(61);
+    constexpr std::uint16_t kPort = 42021;
+    PeerManager manager({MakePeer(kPort, key)}, clock, ResolveLoopback);
+    ActivatePeer(manager, sink, key, kPort);
+
+    RelayEngine engine(clock);
+    std::mt19937_64 rng(0x1EAD);
+    for (std::uint64_t i = 0; i < 20; ++i) {
+        // Like native-lane block hashes: the same leading 64 bits, different low-order bits.
+        const std::string hash = Hex64(1) + Hex64(rng()) + Hex64(rng()) + Hex64(rng());
+        sink.sent.clear();
+        engine.OnNewBlock(hash, RandomBytes(3000, 0xC100 + i));
+        PumpAll(engine, sink, manager);
+
+        const auto announced = AnnouncedIdentifier(sink.sent);
+        Require(announced.has_value(), "block " + std::to_string(i) + " should be announced");
+        Require(*announced == photon::BlockIdFromHex(hash), "block should be announced under its hash's low-order bits");
+        for (const auto& item : sink.sent) {
+            if (item.packet.msg_type == MessageType::kBlockChunk) {
+                BlockChunkPayload chunk{};
+                Require(photon::DecodeBlockChunkPayload(item.packet.payload, chunk), "chunk decode failed");
+                Require(chunk.block_hash_prefix == *announced, "chunks should carry the announced identifier");
+            }
+        }
+    }
+    Require(engine.stats().blocks_relayed_out == 20, "every block should be relayed out");
+    Require(engine.stats().blocks_already_known == 0, "no block should be taken for an earlier one");
+}
+
+void TestBlockIdentifierForms()
+{
+    const std::string hash = "00000000000000010123456789abcdef0011223344556677fedcba9876543210";
+    Require(photon::BlockIdFromHex(hash) == 0xfedcba9876543210ULL, "identifier is the last 16 hex digits");
+    Require(photon::HashPrefixFromHex(hash) == 0x1ULL, "earlier form is the first 16 hex digits");
+    std::string upper = hash;
+    std::transform(upper.begin(), upper.end(), upper.begin(), [](char ch) { return static_cast<char>(std::toupper(ch)); });
+    Require(photon::BlockIdFromHex(upper) == 0xfedcba9876543210ULL, "upper-case hex is accepted");
+    Require(photon::BlockIdFromHex(hash.substr(0, 63)) == 0, "a short hash has no identifier");
+    Require(photon::BlockIdFromHex(hash + "0") == 0, "a long hash has no identifier");
+    Require(photon::BlockIdFromHex("x" + hash.substr(1)) == 0, "a hash with a non-hex digit has no identifier");
+    Require(photon::BlockIdFromHex("") == 0, "an empty hash has no identifier");
+
+    // The identifier is the low 64 bits of the hash as a number: the first 8 bytes of the header's
+    // double SHA-256, read little-endian.
+    const std::vector<std::uint8_t> block = MakeBlock(200, 0xB000);
+    const std::string block_hash = HashOf(block);
+    std::uint64_t low = 0;
+    for (std::size_t i = 0; i < 8; ++i) {
+        const std::size_t pos = 62 - 2 * i; // byte i of the hash, in display-order hex
+        low |= static_cast<std::uint64_t>(std::stoul(block_hash.substr(pos, 2), nullptr, 16)) << (8 * i);
+    }
+    Require(BlockIdOf(block) == low, "identifier should be the hash's low-order 64 bits");
+}
+
+void TestEarlierFormIdentifierAcceptedWithoutFault()
+{
+    MockClock clock{};
+    RelayEngine engine(clock);
+    CapturingSubmitter submitter;
+
+    // Header first.
+    const TestBlock block = EncodeTestBlock(500, 0xB101);
+    Require(block.prefix != BlockIdOf(block.bytes), "the two forms should differ for this block");
+    DeliverBlock(engine, kPeer0, block, submitter, block.prefix);
+    Require(submitter.submit_calls == 1 && submitter.last_block == block.bytes, "earlier-form block should be submitted");
+
+    // Chunks before the header.
+    const TestBlock other = EncodeTestBlock(500, 0xB102);
+    engine.OnBlockChunk(kPeer1, BuildChunkPayload(other.encoded.chunks[0], other.prefix), submitter);
+    engine.OnBlockHeader(kPeer1, BuildHeaderPayload(other.encoded, other.prefix, other.bytes.size()), submitter);
+    engine.OnBlockChunk(kPeer1, BuildChunkPayload(other.encoded.chunks[1], other.prefix), submitter);
+    Require(submitter.submit_calls == 2 && submitter.last_block == other.bytes, "earlier-form chunks should be used");
+
+    Require(engine.stats().submit_successes == 2 && engine.stats().blocks_mismatched == 0, "both blocks should be accepted");
+    Require(PeerStats(engine, 0).faults == 0 && PeerStats(engine, 1).faults == 0, "earlier-form blocks must not count against peers");
+}
+
+void TestBlockIdentifierAccepted()
+{
+    MockClock clock{};
+    RelayEngine engine(clock);
+    CapturingSubmitter submitter;
+
+    const TestBlock block = EncodeTestBlock(500, 0xB111);
+    DeliverBlock(engine, kPeer0, block, submitter, BlockIdOf(block.bytes));
+    Require(submitter.submit_calls == 1 && submitter.last_block == block.bytes, "block should be submitted");
+    Require(engine.stats().submit_successes == 1 && engine.stats().blocks_mismatched == 0, "block should be accepted");
+    Require(PeerStats(engine, 0).faults == 0, "block must not count against the peer");
+
+    // A mismatch is still caught in this form.
+    const TestBlock other = EncodeTestBlock(500, 0xB112);
+    DeliverBlock(engine, kPeer1, other, submitter, BlockIdOf(other.bytes) ^ 0x1ULL);
+    Require(submitter.submit_calls == 1 && engine.stats().blocks_mismatched == 1, "mismatched identifier should be dropped");
+    Require(PeerStats(engine, 1).faults == 1, "mismatch should count against the peer");
+
+    // The local node announcing the accepted block does not send it back out.
+    engine.OnNewBlock(HashOf(block.bytes), block.bytes);
+    Require(engine.stats().blocks_relayed_out == 0, "an accepted block should not be relayed out again");
+}
+
+void TestBlockAnnouncedUnderBothFormsUsedOnce()
+{
+    // Earlier form first: a copy under this version's form is recognised before it is decoded.
+    {
+        MockClock clock{};
+        RelayEngine engine(clock);
+        CapturingSubmitter submitter;
+        const TestBlock block = EncodeTestBlock(500, 0xB121);
+        DeliverBlock(engine, kPeer0, block, submitter, block.prefix);
+        const RelayStats before = engine.stats();
+        DeliverBlock(engine, kPeer1, block, submitter, BlockIdOf(block.bytes));
+        Require(submitter.submit_calls == 1 && submitter.check_calls == 1, "the block should reach the node once");
+        Require(engine.stats().chunks_received == before.chunks_received, "the second copy should not be decoded");
+        engine.OnNewBlock(HashOf(block.bytes), block.bytes);
+        Require(engine.stats().blocks_relayed_out == 0, "the block should not be relayed out again");
+    }
+    // This version's form first: a copy under the earlier form is recognised once reconstructed.
+    {
+        MockClock clock{};
+        RelayEngine engine(clock);
+        CapturingSubmitter submitter;
+        const TestBlock block = EncodeTestBlock(500, 0xB122);
+        DeliverBlock(engine, kPeer0, block, submitter, BlockIdOf(block.bytes));
+        DeliverBlock(engine, kPeer1, block, submitter, block.prefix);
+        Require(submitter.submit_calls == 1 && submitter.check_calls == 1, "the block should reach the node once");
+        Require(PeerStats(engine, 1).faults == 0, "the later copy must not count against its sender");
+        Require(engine.stats().inbound_entries == 0, "no state should remain");
+    }
+    // Both in flight at once.
+    {
+        MockClock clock{};
+        RelayEngine engine(clock);
+        CapturingSubmitter submitter;
+        const TestBlock block = EncodeTestBlock(500, 0xB123);
+        engine.OnBlockHeader(kPeer1, BuildHeaderPayload(block.encoded, block.prefix, block.bytes.size()), submitter);
+        engine.OnBlockChunk(kPeer1, BuildChunkPayload(block.encoded.chunks[0], block.prefix), submitter);
+        DeliverBlock(engine, kPeer0, block, submitter, BlockIdOf(block.bytes));
+        engine.OnBlockChunk(kPeer1, BuildChunkPayload(block.encoded.chunks[1], block.prefix), submitter);
+        Require(submitter.submit_calls == 1 && submitter.check_calls == 1, "the block should reach the node once");
+        Require(PeerStats(engine, 1).faults == 0, "the other copy must not count against its sender");
+        Require(engine.stats().inbound_entries == 0, "no state should remain");
+    }
+    // An answer that settles the block (here: the node already had it) covers the other form too.
+    {
+        MockClock clock{};
+        RelayEngine engine(clock);
+        CapturingSubmitter submitter;
+        submitter.submit_result = SubmitOutcome::kDuplicate;
+        const TestBlock block = EncodeTestBlock(500, 0xB124);
+        DeliverBlock(engine, kPeer0, block, submitter, BlockIdOf(block.bytes));
+        DeliverBlock(engine, kPeer1, block, submitter, block.prefix);
+        Require(submitter.submit_calls == 1 && submitter.check_calls == 1, "a settled block should not reach the node again");
+    }
+}
+
+void TestMainnetHashSequenceRelayedWithoutSuppression()
+{
+    const auto& headers = photon::test::kMainnetHeaders;
+    std::set<std::uint64_t> native_prefixes;
+    std::size_t native_blocks = 0;
+    for (std::size_t i = 0; i < headers.size(); ++i) {
+        if (!headers[i].auxpow) {
+            ++native_blocks;
+            native_prefixes.insert(PrefixOf(MainnetBlock(i)));
+        }
+    }
+    Require(native_blocks >= 40 && native_prefixes.size() <= 3, "the fixture's native-lane hashes should share their leading bits");
+
+    MockClock clock{};
+    RecordingSink sink;
+    const auto key = Key(71);
+    constexpr std::uint16_t kPort = 42031;
+    PeerManager manager({MakePeer(kPort, key)}, clock, ResolveLoopback);
+    ActivatePeer(manager, sink, key, kPort);
+
+    RelayEngine sender(clock);
+    RelayEngine receiver(clock);
+    CapturingSubmitter submitter;
+    for (std::size_t i = 0; i < headers.size(); ++i) {
+        const std::vector<std::uint8_t> block = MainnetBlock(i);
+        const std::string hash = HashOf(block);
+        sink.sent.clear();
+        sender.OnNewBlock(hash, block);
+        PumpAll(sender, sink, manager);
+        DeliverPackets(sink.sent, receiver, kPeer0, submitter);
+        Require(submitter.submit_calls == i + 1 && submitter.last_block == block,
+                "mainnet block " + std::to_string(i) + " should reach the receiving node");
+        // The receiving node then announces the block; the receiver does not send it back out.
+        receiver.OnNewBlock(hash, block);
+        clock.Advance(std::chrono::seconds{1});
+    }
+
+    Require(sender.stats().blocks_relayed_out == headers.size(), "every block should be relayed out");
+    Require(sender.stats().blocks_already_known == 0, "no block should be taken for an earlier one");
+    Require(receiver.stats().submit_successes == headers.size(), "every block should be accepted");
+    Require(receiver.stats().blocks_relayed_out == 0, "relayed blocks should not be sent back out");
+    Require(PeerStats(receiver, 0).faults == 0, "no block should count against the sender");
+}
+
+// A receiver that, like earlier versions, uses the announced identifier only as a key: no check
+// against the block, a seen set of announced identifiers, and the earlier form for blocks its own
+// node announces.
+class IdentifierKeyedReceiver {
+public:
+    void OnHeader(const BlockHeaderPayload& header)
+    {
+        if (Seen(header.block_hash_prefix) || m_decoders.count(header.block_hash_prefix) != 0) {
+            return;
+        }
+        m_decoders.emplace(header.block_hash_prefix,
+                           photon::fec::Decoder(photon::fec::Parameters::FromDataChunkCount(header.data_chunks),
+                                                static_cast<std::size_t>(header.original_size)));
+    }
+
+    void OnChunk(const BlockChunkPayload& chunk)
+    {
+        const auto it = m_decoders.find(chunk.block_hash_prefix);
+        if (Seen(chunk.block_hash_prefix) || it == m_decoders.end()) {
+            return;
+        }
+        Require(it->second.AddChunk(chunk.coding_group_id, chunk.chunk_id, chunk.chunk_data), "chunk should fit its block");
+        if (!it->second.IsComplete()) {
+            return;
+        }
+        const auto block = it->second.Reconstruct();
+        Require(block.has_value(), "block should reconstruct");
+        delivered.push_back(*block);
+        Remember(chunk.block_hash_prefix);
+        m_decoders.erase(it);
+    }
+
+    // The local node announces a block; returns the identifier it is relayed out under, if any.
+    std::optional<std::uint64_t> OnNodeBlock(const std::string& hash_hex)
+    {
+        const std::uint64_t id = photon::HashPrefixFromHex(hash_hex);
+        if (Seen(id)) {
+            return std::nullopt;
+        }
+        Remember(id);
+        return id;
+    }
+
+    std::vector<std::vector<std::uint8_t>> delivered{};
+
+private:
+    bool Seen(std::uint64_t id) const { return m_seen.count(id) != 0; }
+
+    void Remember(std::uint64_t id)
+    {
+        if (!m_seen.insert(id).second) {
+            return;
+        }
+        m_order.push_back(id);
+        if (m_order.size() > 16) {
+            m_seen.erase(m_order.front());
+            m_order.pop_front();
+        }
+    }
+
+    std::map<std::uint64_t, photon::fec::Decoder> m_decoders{};
+    std::deque<std::uint64_t> m_order{};
+    std::unordered_set<std::uint64_t> m_seen{};
+};
+
+void TestIdentifierKeyedReceiverGetsEveryBlock()
+{
+    MockClock clock{};
+    RecordingSink sink;
+    const auto key = Key(81);
+    constexpr std::uint16_t kPort = 42041;
+    PeerManager manager({MakePeer(kPort, key)}, clock, ResolveLoopback);
+    ActivatePeer(manager, sink, key, kPort);
+
+    RelayEngine sender(clock);
+    CapturingSubmitter submitter;
+    IdentifierKeyedReceiver earlier;
+    const auto& headers = photon::test::kMainnetHeaders;
+    std::size_t sent_back = 0;
+    for (std::size_t i = 0; i < headers.size(); ++i) {
+        const std::vector<std::uint8_t> block = MainnetBlock(i);
+        const std::string hash = HashOf(block);
+        sink.sent.clear();
+        sender.OnNewBlock(hash, block);
+        PumpAll(sender, sink, manager);
+        for (const auto& item : sink.sent) {
+            if (item.packet.msg_type == MessageType::kBlockHeader) {
+                BlockHeaderPayload header{};
+                Require(photon::DecodeBlockHeaderPayload(item.packet.payload, header), "header decode failed");
+                earlier.OnHeader(header);
+            } else if (item.packet.msg_type == MessageType::kBlockChunk) {
+                BlockChunkPayload chunk{};
+                Require(photon::DecodeBlockChunkPayload(item.packet.payload, chunk), "chunk decode failed");
+                earlier.OnChunk(chunk);
+            }
+        }
+        Require(earlier.delivered.size() == i + 1 && earlier.delivered.back() == block,
+                "mainnet block " + std::to_string(i) + " should reach the identifier-keyed receiver intact");
+
+        // Its node announces the block, and it may send it on under the earlier form; this
+        // relay recognises that copy as a block it already sent, without asking its node.
+        if (const auto id = earlier.OnNodeBlock(hash)) {
+            ++sent_back;
+            TestBlock copy;
+            copy.bytes = block;
+            copy.prefix = *id;
+            copy.encoded = photon::fec::Encoder(photon::fec::Parameters::FromDataChunkCount(2)).Encode(block);
+            DeliverBlock(sender, kPeer0, copy, submitter);
+        }
+        clock.Advance(std::chrono::seconds{1});
+    }
+
+    Require(sent_back > 0, "the receiver should send some blocks back under the earlier form");
+    Require(submitter.check_calls == 0 && submitter.submit_calls == 0, "copies of the relay's own blocks must not reach its node");
+    Require(PeerStats(sender, 0).faults == 0, "copies sent back must not count against the receiver");
+    Require(sender.stats().blocks_relayed_out == headers.size(), "each block should be relayed out once");
+}
+
+void TestParentKnownOnlyAsHeaderSubmitted()
+{
+    MockClock clock{};
+    RelayEngine engine(clock);
+    CapturingSubmitter submitter;
+    submitter.parent_result = ParentCheck::kParentNotConnected;
+
+    // The node stores the block without connecting it yet: not the peer's fault, however often.
+    submitter.submit_result = SubmitOutcome::kInconclusive;
+    for (std::uint64_t i = 0; i < 20; ++i) {
+        DeliverBlock(engine, kPeer0, EncodeTestBlock(200, 0xB300 + i), submitter);
+    }
+    Require(submitter.submit_calls == 20, "blocks whose parent the node knows as a header should be submitted");
+    Require(engine.stats().blocks_parent_pending == 20 && engine.stats().submit_inconclusive == 20, "they should be counted");
+    Require(engine.stats().blocks_node_behind == 0 && engine.stats().blocks_parent_rejected == 0, "they are not dropped");
+    Require(PeerStats(engine, 0).faults == 0 && engine.stats().peer_suspensions == 0, "they must not count against the peer");
+
+    // The node may connect it at once, after the parent.
+    submitter.submit_result = SubmitOutcome::kAccepted;
+    DeliverBlock(engine, kPeer0, EncodeTestBlock(200, 0xB320), submitter);
+    Require(engine.stats().submit_successes == 1, "block should be accepted");
+
+    // A rejection still counts.
+    submitter.submit_result = SubmitOutcome::kRejected;
+    DeliverBlock(engine, kPeer1, EncodeTestBlock(200, 0xB321), submitter);
+    Require(PeerStats(engine, 1).faults == 1, "a rejected block should count against its sender");
+
+    // A node far behind still drops the block, without counting it against the peer.
+    submitter.parent_result = ParentCheck::kNodeBehind;
+    DeliverBlock(engine, kPeer2, EncodeTestBlock(200, 0xB322), submitter);
+    Require(submitter.submit_calls == 22 && engine.stats().blocks_node_behind == 1, "a node far behind should not be sent the block");
+    Require(PeerStats(engine, 2).faults == 0, "a node far behind is not the peer's fault");
+}
+
+void TestUnknownParentNotCountedAgainstPeer()
+{
+    MockClock clock{};
+    RelayEngine engine(clock);
+    CapturingSubmitter submitter;
+    submitter.parent_result = ParentCheck::kUnknown;
+
+    for (std::uint64_t i = 0; i < 20; ++i) {
+        DeliverBlock(engine, kPeer0, EncodeTestBlock(200, 0xB400 + i), submitter);
+    }
+    Require(submitter.submit_calls == 0, "blocks with an unknown parent must not be submitted");
+    Require(engine.stats().blocks_parent_rejected == 20, "they should be counted");
+    Require(engine.stats().peer_suspensions == 0, "they must not suspend the peer");
+    const auto peer = PeerStats(engine, 0);
+    Require(peer.faults == 0 && peer.fault_score == 0 && !peer.suspended, "they must not count against the peer");
+}
+
+void TestUnansweredBlockTriedOnceMore()
+{
+    const auto node_announces_block = [](RelayEngine& engine, std::uint64_t seed) {
+        const std::vector<std::uint8_t> other = MakeBlock(300, seed);
+        engine.OnNewBlock(HashOf(other), other);
+    };
+
+    // The parent check gets no answer; the block is tried again once the node announces a block.
+    {
+        MockClock clock{};
+        RelayEngine engine(clock);
+        CapturingSubmitter submitter;
+        submitter.parent_result = ParentCheck::kUnavailable;
+        const TestBlock block = EncodeTestBlock(500, 0xB501);
+        DeliverBlock(engine, kPeer0, block, submitter, BlockIdOf(block.bytes));
+        Require(submitter.check_calls == 1 && submitter.submit_calls == 0, "block should not be submitted yet");
+
+        // Other copies are not checked again meanwhile.
+        DeliverBlock(engine, kPeer1, block, submitter, BlockIdOf(block.bytes));
+        DeliverBlock(engine, kPeer2, block, submitter, block.prefix);
+        Require(submitter.check_calls == 1, "copies should not be checked while the block is held");
+
+        // No retry while the node has given no answer since.
+        clock.Advance(std::chrono::seconds{30});
+        engine.RetryHeldBlock(submitter);
+        Require(submitter.check_calls == 1, "a node that has not answered should not be called again");
+
+        submitter.parent_result = ParentCheck::kNearTip;
+        node_announces_block(engine, 0xB502);
+        engine.RetryHeldBlock(submitter);
+        Require(submitter.check_calls == 2 && submitter.submit_calls == 1 && submitter.last_block == block.bytes,
+                "held block should be checked and submitted again");
+        Require(engine.stats().node_retries == 1 && engine.stats().submit_successes == 1, "retry should be counted");
+        Require(PeerStats(engine, 0).blocks_received_in == 1, "the accepted block should be credited to its sender");
+
+        node_announces_block(engine, 0xB503);
+        engine.RetryHeldBlock(submitter);
+        Require(submitter.check_calls == 2 && engine.stats().node_retries == 1, "a block should be retried once");
+    }
+    // The retry gets no answer either: the block is dropped.
+    {
+        MockClock clock{};
+        RelayEngine engine(clock);
+        CapturingSubmitter submitter;
+        submitter.parent_result = ParentCheck::kUnavailable;
+        DeliverBlock(engine, kPeer0, EncodeTestBlock(500, 0xB511), submitter);
+        node_announces_block(engine, 0xB512);
+        engine.RetryHeldBlock(submitter);
+        node_announces_block(engine, 0xB513);
+        engine.RetryHeldBlock(submitter);
+        Require(submitter.check_calls == 2 && submitter.submit_calls == 0, "a block should be retried once only");
+        Require(engine.stats().block_checks_unavailable == 2 && PeerStats(engine, 0).faults == 0, "neither attempt counts against the peer");
+    }
+    // submitblock gets no answer; the retry finds the node has the block and does not send it again.
+    {
+        MockClock clock{};
+        RelayEngine engine(clock);
+        CapturingSubmitter submitter;
+        submitter.submit_result = SubmitOutcome::kTimeout;
+        DeliverBlock(engine, kPeer0, EncodeTestBlock(500, 0xB521), submitter);
+        Require(submitter.submit_calls == 1 && engine.stats().submit_timeouts == 1, "submission should time out");
+        submitter.parent_result = ParentCheck::kAlreadyKnown;
+        node_announces_block(engine, 0xB522);
+        engine.RetryHeldBlock(submitter);
+        Require(submitter.check_calls == 2 && submitter.submit_calls == 1, "the node's copy should be found before resubmitting");
+        Require(engine.stats().node_retries == 1, "retry should be counted");
+    }
+    // Another block's answered check also shows the node answers again.
+    {
+        MockClock clock{};
+        RelayEngine engine(clock);
+        CapturingSubmitter submitter;
+        submitter.parent_result = ParentCheck::kUnavailable;
+        const TestBlock held = EncodeTestBlock(500, 0xB531);
+        DeliverBlock(engine, kPeer0, held, submitter);
+        submitter.parent_result = ParentCheck::kNearTip;
+        DeliverBlock(engine, kPeer1, EncodeTestBlock(500, 0xB532), submitter);
+        engine.RetryHeldBlock(submitter);
+        Require(submitter.submit_calls == 2 && submitter.last_block == held.bytes, "held block should follow the answered one");
+    }
+    // The node announcing the held block itself: no further node calls.
+    {
+        MockClock clock{};
+        RelayEngine engine(clock);
+        CapturingSubmitter submitter;
+        submitter.parent_result = ParentCheck::kUnavailable;
+        const TestBlock block = EncodeTestBlock(500, 0xB541);
+        DeliverBlock(engine, kPeer0, block, submitter);
+        engine.OnNewBlock(HashOf(block.bytes), block.bytes);
+        engine.RetryHeldBlock(submitter);
+        Require(submitter.check_calls == 1 && submitter.submit_calls == 0, "a block the node announced needs no retry");
+    }
+    // A held block is dropped after its lifetime, and when its sender is paused.
+    {
+        MockClock clock{};
+        RelayEngine engine(clock);
+        CapturingSubmitter submitter;
+        submitter.parent_result = ParentCheck::kUnavailable;
+        DeliverBlock(engine, kPeer0, EncodeTestBlock(500, 0xB551), submitter);
+        clock.Advance(RelayEngineConfig{}.held_block_lifetime + std::chrono::milliseconds{1});
+        node_announces_block(engine, 0xB552);
+        engine.RetryHeldBlock(submitter);
+        Require(submitter.check_calls == 1, "an expired held block should not be retried");
+
+        DeliverBlock(engine, kPeer1, EncodeTestBlock(500, 0xB553), submitter);
+        submitter.parent_result = ParentCheck::kTooFar;
+        for (std::uint32_t i = 0; i < RelayEngineConfig{}.peer_fault_threshold; ++i) {
+            DeliverBlock(engine, kPeer1, EncodeTestBlock(200, 0xB560 + i), submitter);
+        }
+        Require(PeerStats(engine, 1).suspended, "peer should be paused");
+        const std::size_t checks = submitter.check_calls;
+        node_announces_block(engine, 0xB554);
+        engine.RetryHeldBlock(submitter);
+        Require(submitter.check_calls == checks, "a paused peer's held block should not be retried");
+    }
+}
+
 #if defined(PHOTON_TEST_HAVE_MALLINFO2)
 std::size_t HeapInUse()
 {
@@ -1940,6 +2514,16 @@ int RunAllTests()
         {"buffered_chunks_checked_before_eviction", TestBufferedChunksCheckedBeforeEviction},
         {"known_invalid_block_settled_for_all_copies", TestKnownInvalidBlockSettledForAllCopies},
         {"handled_block_timed_after_node_calls", TestHandledBlockTimedAfterNodeCalls},
+        {"block_identifier_forms", TestBlockIdentifierForms},
+        {"blocks_sharing_leading_hash_bits_all_relayed", TestBlocksSharingLeadingHashBitsAllRelayed},
+        {"earlier_form_identifier_accepted_without_fault", TestEarlierFormIdentifierAcceptedWithoutFault},
+        {"block_identifier_accepted", TestBlockIdentifierAccepted},
+        {"block_announced_under_both_forms_used_once", TestBlockAnnouncedUnderBothFormsUsedOnce},
+        {"mainnet_hash_sequence_relayed_without_suppression", TestMainnetHashSequenceRelayedWithoutSuppression},
+        {"identifier_keyed_receiver_gets_every_block", TestIdentifierKeyedReceiverGetsEveryBlock},
+        {"parent_known_only_as_header_submitted", TestParentKnownOnlyAsHeaderSubmitted},
+        {"unknown_parent_not_counted_against_peer", TestUnknownParentNotCountedAgainstPeer},
+        {"unanswered_block_tried_once_more", TestUnansweredBlockTriedOnceMore},
     };
 
     int failures = 0;

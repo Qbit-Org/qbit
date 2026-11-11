@@ -448,6 +448,8 @@ const char* ParentCheckName(ParentCheck check)
         return "already_known";
     case ParentCheck::kNodeBehind:
         return "node_behind";
+    case ParentCheck::kParentNotConnected:
+        return "parent_not_connected";
     }
     return "unknown";
 }
@@ -604,8 +606,10 @@ ParentCheck RpcClient::CheckParent(const std::string& block_hash_hex,
     }
     if (parent->chainwork > best->chainwork) {
         // The parent is on a branch with more work than the node's best block that the node has
-        // not made its best chain yet: it is still catching up with that branch.
-        return ParentCheck::kNodeBehind;
+        // not made its best chain yet: it has the parent's header but has not connected it (it may
+        // still be downloading or connecting it). Close to the best block, the node can store this
+        // block and connect it right after its parent; further ahead it is catching up.
+        return parent->height <= best->height + depth ? ParentCheck::kParentNotConnected : ParentCheck::kNodeBehind;
     }
     if (parent->height + depth < best->height) {
         return ParentCheck::kTooFar;

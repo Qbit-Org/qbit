@@ -63,6 +63,8 @@ std::string RelayStatsLogFields(const RelayStats& stats)
         + " block_parent_rejected=" + std::to_string(stats.blocks_parent_rejected)
         + " block_check_unavailable=" + std::to_string(stats.block_checks_unavailable)
         + " block_node_behind=" + std::to_string(stats.blocks_node_behind)
+        + " block_parent_pending=" + std::to_string(stats.blocks_parent_pending)
+        + " node_retries=" + std::to_string(stats.node_retries)
         + " inbound_rejected=" + std::to_string(stats.inbound_rejected)
         + " inbound_evicted=" + std::to_string(stats.inbound_evictions)
         + " inbound_entries=" + std::to_string(stats.inbound_entries)
@@ -439,6 +441,7 @@ int Run(int argc, char** argv, std::ostream& out, std::ostream& err, Deps deps)
                 relay_engine.OnNewBlock(hash_hex, *block);
             }
         }
+        relay_engine.RetryHeldBlock(submitter);
 
         const auto now = clock.Now();
         if (now >= next_stats_log) {

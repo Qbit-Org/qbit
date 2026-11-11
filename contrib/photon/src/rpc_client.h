@@ -28,7 +28,11 @@ enum class ParentCheck : std::uint8_t {
     kUnknown,      ///< The node does not know the parent.
     kUnavailable,  ///< The node could not be queried; nothing is known about the parent.
     kAlreadyKnown, ///< The node already has the block itself on its best chain, near the tip.
-    kNodeBehind,   ///< The parent is on a branch with more work than the node's best chain: the node is catching up.
+    kNodeBehind,   ///< The parent is on a branch with more work than the node's best chain, more than
+                   ///< max_depth blocks above the best block: the node is catching up.
+    kParentNotConnected, ///< The parent is on a branch with more work than the node's best chain, at most
+                         ///< max_depth blocks above the best block: the node has its header but has not
+                         ///< connected it yet, and can connect the block after it.
 };
 
 [[nodiscard]] const char* SubmitOutcomeName(SubmitOutcome outcome);
@@ -53,8 +57,10 @@ public:
     /// relative to the node's best chain. kNearTip means the parent is the best block, an ancestor
     /// of it at most `max_depth` blocks deep, or a block on another branch with no more chain work
     /// than the best block, at most `max_depth` blocks below it in height and with at least as much
-    /// chain work as the best chain's block `max_depth` below the best block. Takes one call when
-    /// the parent is the best block and at most six otherwise, all within one RPC timeout.
+    /// chain work as the best chain's block `max_depth` below the best block. A parent on a branch
+    /// with more chain work than the best block is kParentNotConnected up to `max_depth` blocks above
+    /// the best block, and kNodeBehind beyond that. Takes one call when the parent is the best block
+    /// and at most six otherwise, all within one RPC timeout.
     ParentCheck CheckParent(const std::string& block_hash_hex, const std::string& prev_hash_hex, std::uint32_t max_depth);
 
 private:
