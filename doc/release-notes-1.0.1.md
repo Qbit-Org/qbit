@@ -25,11 +25,16 @@ resume pending P2MR keypool refills at startup and run them in the background
 after `walletpassphrase`, remove deleted unencrypted keys from the wallet
 file right after encryption, re-encrypt the PQC keys that v1.0.0 left
 unencrypted in encrypted wallets, keep more small change when no fee estimate
-is available, keep PSBT signing results across shutdown, stop qbit-qt from
-aborting when accessibility tools press Send again during a send
+is available, keep PSBT signing results across shutdown, keep a wallet locked
+or unlocked when `walletpassphrasechange` changes its passphrase, stop
+qbit-qt from aborting when accessibility tools press Send again during a send
 confirmation, make it ignore Sign pressed the same way while a PSBT is being
-signed, update the GUI release builds to Qt 6.8.4, and add debug symbol
-archives for macOS.
+signed, keep it responding while an `encryptwallet` call runs, make it wait
+for open dialogs before it quits or unloads a wallet, update the GUI release
+builds to Qt 6.8.4, and add debug symbol archives for macOS. Nodes now take
+the `NODE_WITNESS_PRUNED` service flag only from a peer's own `version`
+message, and the qbit-photon block relay bounds the inbound state each peer
+can hold and checks blocks before it submits them.
 It adds one standardness rule for P2MR spends, but contains no consensus rule
 change, no scheduled network activation, and no change to the mainnet or
 testnet4 network identity. The wallet database format is unchanged apart from
@@ -430,6 +435,13 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   reason; the next unlock tries again. Records that failed validation are
   never re-encrypted. Unencrypted wallets are not affected (#301, fixes
   #283).
+- `walletpassphrasechange` no longer locks or unlocks the wallet. It locked
+  the wallet before it checked the old passphrase, so a change that failed,
+  for example because the old passphrase was wrong, locked a wallet that had
+  been unlocked. The wallet now keeps its lock state: an unlocked
+  wallet stays unlocked until its `walletpassphrase` timeout, and a locked
+  wallet stays locked. qbit-qt's Change Passphrase still locks the wallet
+  before it changes the passphrase, as before (#379).
 
 ### Fallback fee
 
@@ -530,6 +542,8 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   such a backup can read those keys without the passphrase. qbit-qt has no
   such option; `qbit-wallet` `dump` can copy such a wallet, and its dump file
   contains those keys too (#301).
+- `walletpassphrasechange` keeps the wallet's lock state, also when it fails
+  (see Wallet fixes) (#379).
 
 ### Signing-usage visibility and qbit-qt responsiveness
 
@@ -581,6 +595,24 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   or overview page resolves address labels from the address book rows qbit-qt
   already holds, instead of waiting for the wallet lock until encryption
   finishes (#182, fixes #180).
+- Encrypting a wallet with the `encryptwallet` RPC, for example from
+  `qbit-cli` or qbit-qt's console, while qbit-qt had the wallet open stalled
+  qbit-qt until the encryption finished. Encryption generates new keys while
+  it holds the wallet locks, which can take minutes with a large `-keypool`,
+  and the status bar, the overview page, the transaction list, and the
+  Receive page waited for those locks, so the window stopped repainting and
+  responding. The wallet now announces when an encryption starts and
+  finishes, whoever started it, and qbit-qt handles an encryption started
+  outside it the way it handles one started from its Encrypt Wallet dialog:
+  the window keeps repainting and responding; the encryption status, the PQC
+  key validation status, and address labels are shown as they were before
+  the encryption; new transactions, keypool changes, and status changes are
+  applied once the encryption has finished; and unlocking, sending, signing,
+  fee bumping, and encrypting from the Encrypt Wallet dialog are refused
+  with a "Wallet encryption in progress" message. When the encryption
+  finishes, whether it succeeds or fails, qbit-qt reads the wallet again and
+  shows it as encrypted and locked, or as it was before. Some actions still
+  wait for the encryption (see Known limitations) (#352).
 - Quitting qbit-qt while the Load PSBT dialog is signing now cancels the
   signing if it has not reserved PQC signature counters yet, so shutdown no
   longer waits for the whole signing and no counters are consumed. Signing
@@ -629,6 +661,42 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   freed memory when it is asked to quit while a send confirmation is open,
   and Send no longer stays unavailable after an internal error is reported
   while a send is being started (#348).
+- qbit-qt could crash, or use freed memory, when it was asked to quit while a
+  dialog was waiting for an answer, such as the send confirmation, the "PSBT
+  copied" box, the warning shown after a send, or the passphrase prompt. The
+  quit could come from the platform (on macOS: Dock > Quit, logout, or a
+  Quit Apple event), or from File > Exit pressed through an accessibility
+  client behind the dialog; shutdown then deleted the wallet views while the
+  dialog's code was still running. A quit from the platform or from
+  File > Exit now waits until every message box or dialog whose code is
+  waiting for an answer has been answered, and qbit-qt shuts down right
+  after that. While it waits, qbit-qt shows its main window and brings that
+  dialog to the front. Unloading a wallet, for example with `unloadwallet`,
+  waits for such dialogs the same way, even when a progress dialog covers
+  one. Nothing is sent or signed because of the quit: cancelling the dialog
+  cancels the operation, as before. Dialogs that stay open without holding
+  up the code that opened them, such as the PSBT dialog, Coin Control, the
+  options dialog, and progress dialogs, do not delay a quit from the
+  platform or from File > Exit; shutdown still cancels transaction
+  preparation and fee bumps that can be cancelled, and waits for those that
+  cannot. Wallet encryption and PSBT signing cannot be cancelled once they
+  have started: such a quit during either starts the shutdown at once, the
+  shutdown waits for the work to finish, and the "Wallet encrypted" box is
+  not shown; a PSBT signed this way is saved to the data directory, as
+  described for #344 above. A second quit request while one is waiting, or
+  while the node is shutting down, is ignored; a second Quit from the
+  platform used to request the node shutdown again. A platform quit made
+  while the first-run data directory dialog is open is carried out once that
+  dialog has closed and startup has created the main window; it used to
+  crash qbit-qt. On macOS, a logout started while such a dialog is open is
+  cancelled, as before, and qbit-qt now quits once the dialog is closed. On
+  Windows, logging off already waited for open dialogs. RPC `stop` and
+  SIGTERM keep their rule (see Known limitations). Most context menus, such
+  as those of the address book and the peers table, hold a quit until they
+  close, and RPC `stop` and SIGTERM now also wait for them. A wallet's rescan
+  progress dialog no longer stays open after the wallet is unloaded, where it
+  kept RPC `stop` and SIGTERM from shutting qbit-qt down until it was
+  cancelled (#354, fixes #349).
 - Release builds of qbit-qt now use Qt 6.8.4 instead of Qt 6.7.3. This fixes
   a crash on macOS when quitting qbit-qt after an accessibility client, such
   as VoiceOver or a UI automation tool, had inspected its windows. The crash
@@ -762,6 +830,56 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   library's wipe does not reach, and adds margin to the library's own wipe.
   Each of these calls therefore needs at least 32 KiB of free stack, plus its
   own frames (#270, refs #260).
+- A node now keeps the `NODE_WITNESS_PRUNED` service flag for an address
+  only when the peer itself advertised it in its `version` message on a
+  connection the node made. The flag is removed from the addresses in `addr`
+  and `addrv2` messages before they are stored or relayed, so a flag that
+  arrives in a relayed address is neither stored nor used when the node
+  decides which addresses to avoid. The node also does not restore the flag
+  when it loads `peers.dat`, because the file does not record how the flag
+  was learned; it is learned again the next time the node connects to the
+  peer. With `-debug=addrman`, the log says for how many addresses it was
+  not restored. A peer's own `version` message is handled as before, and so
+  are other service flags. The `peers.dat` format is unchanged, so v1.0.0
+  can still read the file (#380).
+
+### PHOTON
+
+- The qbit-photon block relay now bounds the inbound block state each relay
+  peer can hold. Decoder memory is charged at what the FEC codecs allocate
+  for a block's announced parameters, rather than at the block's size, and
+  is capped at 5 MiB per block, 10 MiB per peer, and 64 MiB in total; a
+  2,000,000-byte block with the default parameters is charged about 4.8 MiB.
+  Incomplete blocks are capped at 4 per peer and 128 in total. At a limit, a
+  peer first gives up its own oldest incomplete blocks; another peer's block
+  is displaced only if it has received no new chunk for 10 seconds, and
+  otherwise the new block is refused. `contrib/photon/relay-node.service`
+  now sets `MemoryMax=256M` (#381).
+- Before it submits a reconstructed block to qbitd, qbit-photon checks that
+  the block's header hash matches the identifier the block was announced
+  under, and asks qbitd where the block's parent is, with
+  `getbestblockhash`, and `getblockheader` and `getblockhash` when the parent
+  is not the best block. The parent must be the best block, one of its
+  ancestors at most 6 blocks deep, or a block on a competing branch with at
+  least the chain work of the best chain's block 6 below the tip, so
+  children of competing tips are still relayed. A block that fails these
+  checks is dropped without calling `submitblock`. The `[qbitd]`
+  `rpc_timeout_ms` setting (default 5000) now bounds each RPC call to qbitd
+  in total, and the whole parent check, instead of each receive (#381).
+- Each relay peer has a fault score. A malformed header or a block that
+  cannot be used adds a point, a block that qbitd accepts removes two, and
+  one point decays every minute. At 8 points, qbit-photon refuses that
+  peer's inbound blocks for 60 seconds, doubling on each repeat up to 30
+  minutes; other peers are not affected. A local qbitd that does not answer,
+  or that is still catching up, never counts against a peer. The stats line
+  now reports each `submitblock` outcome separately (`submit_duplicate`,
+  `submit_inconclusive`, `submit_rejected`, `submit_timeout`, and
+  `submit_error`), with new `block_*`, `inbound_entries`,
+  `inbound_decoder_bytes`, and `peer_suspensions` fields, and is followed by
+  a `peer relay stats` line for each peer that has sent block traffic.
+  `contrib/photon/RUNBOOK.md` describes the limits, the checks, and the log
+  fields. The relay wire format is unchanged, so relays running v1.0.0 and
+  v1.0.1 interoperate (#381).
 
 ### Release engineering, CI, and documentation
 
@@ -828,6 +946,84 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   `qbit-qt` binary inside `qbit-qt.app`. The release binaries and the other
   macOS archives are unchanged. Releases up to v1.0.0 have no macOS debug
   archive (#343).
+- Added templates of the two rulesets that protect `main` of
+  `Qbit-Org/qbit-guix.sigs`, the attestation repository that releases read
+  at a pinned commit, in
+  `contrib/guix/repo-templates/qbit-guix.sigs/rulesets/`.
+  `signed-commits.json` requires a verified signature on every commit, with
+  no bypass actors, and `public-main.json` blocks deletion and
+  non-fast-forward updates and requires pull requests merged with merge
+  commits only. The templates equal the rulesets applied on 2026-11-09, and
+  the template README says how to apply and check them. GitHub does not
+  apply ruleset files from a repository, so the templates change nothing by
+  themselves (#371).
+- Added public tools in `contrib/release-process/` to stage the release
+  artifacts and derive `SHA256SUMS` from the counted builder attestations
+  (`stage-release-artifacts.py`), to sign `SHA256SUMS` once per operator
+  (`sign-sha256sums.py`), and to combine the signatures into
+  `SHA256SUMS.asc` (`combine-sha256sums-signatures.py`), replacing private
+  tooling and a manual concatenation. They use the publisher's validators
+  in `ci/release/`, read the key policy and those validators from git
+  objects at the trusted ref, and run the publisher's checks that need
+  nothing staged before anyone signs. Run on the public v1.0.0 attestations
+  and signatures, they reproduce v1.0.0's `SHA256SUMS` and `SHA256SUMS.asc`
+  byte for byte. `contrib/release-process/README.md` documents them. The
+  local publisher, `publish-local-release.sh`, now also reads its key policy
+  and validators from git objects, ignores replace refs and grafts, refuses
+  a shallow or partial checkout, and requires git 2.31 or newer; its flags
+  are unchanged (#374).
+- The release key policy now lives only in `contrib/keys/operator-keys/`,
+  read at the release's trusted ref. The copy in the qbit-guix.sigs
+  repository template is removed, and `contrib/guix/init-supporting-repos.sh`
+  seeds the qbit-guix.sigs `operator-keys/` mirror from the canonical
+  directory, or rebuilds it with `--resync-operator-keys`.
+  `contrib/keys/README.md` describes the policy, the mirror, and how
+  downstream projects should pin and verify it. A pull request that changes
+  the policy must continue the base branch's policy: the next
+  `policy_sequence`, `previous_policy_sha256` equal to the base `keys.json`
+  digest, and approvals verified against the base certificates. A changed
+  certificate must keep its primary key, its subkeys, and its signature
+  records. The release-signature and builder quorums count distinct primary
+  keys, and a signature counts only when gpg's `GOODSIG` and `VALIDSIG`
+  agree and gpg reports no revoked or expired key or other error for it. The
+  Required Merge Gate runs these checks. Because they live in code a pull
+  request can change, a new Key Policy Gate workflow
+  (`.github/workflows/key-policy-gate.yml`) also runs them with the base
+  branch's own code, a new `.github/CODEOWNERS` assigns the key policy, the
+  release validators, the CI checks, and the workflows to the release
+  maintainers, and the `main` and `1.x.x` ruleset templates now require the
+  gate and code-owner review. GitHub runs that workflow only from `main`, so
+  the gate runs, and the rulesets can require it, only after this release
+  has reached `main` (see "Arming the gate" in `contrib/keys/README.md`).
+  The policy itself, `qbit-release-keys-mainnet-000002`, is unchanged, and
+  the v1.0.0 release signatures and builder attestations still verify
+  (#375).
+- Replaced the release documentation. `doc/release/release-process.md` is now
+  a checklist runbook for a mainnet release from a release branch,
+  `doc/release/publisher-reference.md` describes what the publisher and its
+  validators check and what is left to process, and a Release issue form
+  (`.github/ISSUE_TEMPLATE/release.yml`) mirrors the runbook. Several
+  statements in the earlier documentation no longer matched the code,
+  including the branch a release is cut from and the claim that the
+  publisher enforces the P2MR v1 release-note sentence: the publisher only
+  checks that the notes file is valid UTF-8. The issue form appears on
+  GitHub once it reaches the default branch (#376).
+- The 32-bit ARM unit-test shards of Nightly CI now have 300 minutes instead
+  of 180. Their emulated build, which restores no cache, used most of the
+  old limit, and shard 2/2 hit it. A contract test,
+  `ci/checks/test_scheduled_validation_contract.py`, checks that each ARM
+  shard's build budget plus its per-test timeout fits its job's limit, and
+  that the shards' test ranges are contiguous and start at 1 (#377).
+- Core Checks now runs the mainnet publication posture check
+  (`ci/release/verify_mainnet_release_posture.py`) for the `source` and
+  `release-policy` profiles on `main` and on every release branch of major
+  version 1 or later, such as `1.x.x`, `1.1.0`, and `1.0.0`, instead of only
+  on `1.0.0`; `0.x` branches are testnet lines. Each branch runs its own copy
+  of the workflow, so `main` gets the rule only when this change reaches it.
+  The job calls the validator directly: `verify_mainnet_ci_posture.py` and
+  `mainnet_ci_posture.json`, which only passed its result through, are
+  removed. Core Checks no longer lists the nonexistent `develop` branch and
+  now also runs for `1.1.0` (#385).
 - Stabilized the REST chain-info comparison and Qt shutdown tests (#137,
   #149, #164).
 
@@ -863,7 +1059,7 @@ Known limitations
 - Fresh fuzz evidence on the release source is required before the release
   is tagged. It is tracked in #173 and #174 and is not recorded in this file.
   The earlier evidence summarized below was produced before #263, #265, #266,
-  #268, and #270 merged, and does not cover their changes:
+  #268, #270, and #380 merged, and does not cover their changes:
   - #263 and #265 change the script interpreter that the `p2mr_script` target
     runs, and #263 adds its new flag to that target's fuzzed flag sets.
   - #268 replaces the vendored library whose key generation, secret-key
@@ -876,14 +1072,20 @@ Known limitations
     `p2p_headers_presync` targets reach it but were not part of that
     evidence. No fuzz target reaches the PQC domains of the signature cache
     that #162 and #265 use.
+  - #380 changes address handling in `net_processing` and `addrman`, which
+    none of the six qbit-specific targets reaches. The inherited `addrman`,
+    `addrman_serdeser`, `data_stream_addr_man`, `process_message`, and
+    `process_messages` targets reach it but were not part of that evidence.
   - The other changes merged after the #176 source (#177, #178, #182, #183,
     #252, #264, #277, #289, #297, #298, #299, #300, #301, #342, #343, #344,
-    #345, #346, #347, #348, #353, #358, #360, #361, #362, #367, and #368)
-    touch only wallet, qbit-qt, Qt build, release build, mining-interface,
-    RPC help and argument conversion, test, CI, developer tooling, and
-    documentation code, which none of the six qbit-specific targets reaches.
-    #346 also adds a field to the fee calculation result declared in
-    `src/policy/fees.h`, which none of those targets includes.
+    #345, #346, #347, #348, #352, #353, #354, #358, #360, #361, #362, #367,
+    #368, #371, #374, #375, #376, #377, #379, #381, and #385) touch only
+    wallet, qbit-qt, Qt build, release build, mining-interface, RPC help and
+    argument conversion, test, CI, release tooling, developer tooling,
+    qbit-photon, and documentation code, which none of the six
+    qbit-specific targets reaches. #346 also adds a field to the fee
+    calculation result declared in `src/policy/fees.h`, which none of those
+    targets includes.
 
   The earlier evidence was produced with LLVM 20.1.8 on the #176 source. The
   llvm-cov coverage checker met every expectation, including the
@@ -995,8 +1197,17 @@ Known limitations
   wallet at the default `-keypool` took about 70 seconds in release testing.
   Other calls on that wallet wait, and the wallet's handling of new blocks is
   delayed, which can slow block processing. While an `encryptwallet` RPC
-  runs on a wallet that qbit-qt has open, parts of qbit-qt can stop
-  responding until it finishes (#174).
+  runs on a wallet that qbit-qt has open, qbit-qt keeps responding (see
+  #352 above), but these actions still need the wallet and wait for the
+  encryption to finish, as in v1.0.0, and the window does not respond until
+  it has: creating a new receiving address or removing a payment request;
+  adding, editing, or deleting an address book entry; opening the coin
+  control dialog, changing the amounts on the Send page while coins are
+  selected in coin control, or entering a custom change address; opening the
+  details of a transaction, or its context menu in the transaction list;
+  loading a PSBT; backing up or closing the wallet; and opening the wallet in
+  qbit-qt while it is being encrypted, for example right after `loadwallet`
+  or `createwallet` (#174, #352).
 - A wallet created with a passphrase, by `createwallet` or by qbit-qt's
   Create Wallet, keeps `bech32` as its default address type until it is
   loaded again, for example after `unloadwallet` and `loadwallet` or a
@@ -1005,18 +1216,16 @@ Known limitations
   `getnewaddress "" p2mr` works, and qbit-qt's Receive tab is not affected.
   This predates v1.0.1 (#363).
 - qbit-qt does not shut down while a dialog is open. `qbit-cli stop` and
-  SIGTERM wait until a running PSBT signing or send preparation has finished
-  and the PSBT dialog or send confirmation it opens has been closed, and
-  then shut down. On macOS, Dock > Quit does nothing while a progress dialog
-  is open, such as the one shown while a PSBT is signed or a send is
-  prepared; choose Quit again once it has closed. This is the existing
+  SIGTERM shut qbit-qt down only while no modal dialog is open, including
+  progress dialogs and dialogs such as the PSBT dialog, so they wait until a
+  running PSBT signing or send preparation has finished and the PSBT dialog
+  or send confirmation it opens has been closed. This is the existing
   design, and Bitcoin Core does the same. Close open dialogs before stopping
-  the node. Quit requests from the platform (on macOS: Dock > Quit, logout,
-  or a Quit Apple event) are not held back in the same way for every dialog
-  that waits for an answer, such as a passphrase prompt or the message shown
-  after a PSBT is copied. Review found code paths where such a quit makes
-  qbit-qt use freed memory and crash. The send confirmation case is fixed
-  (#348); the others are tracked in #349.
+  an unattended qbit-qt node. A quit from the platform or from File > Exit
+  waits only for dialogs that need an answer (see #354 above); no dialog is
+  answered or closed automatically. On macOS, Dock > Quit does nothing while
+  a progress dialog is open, such as the one shown while a PSBT is signed or
+  a send is prepared; choose Quit again once it has closed.
 - While the file dialog of the PSBT dialog's Save is open, an accessibility
   client, such as VoiceOver, or a UI automation tool can still press Sign or
   Close in the PSBT dialog behind it; mouse and keyboard input cannot. Sign
