@@ -490,6 +490,8 @@ struct CNodeState {
     bool m_requested_hb_cmpctblocks{false};
     /** Whether this peer will send us cmpctblocks if we request them. */
     bool m_provides_cmpctblocks{false};
+    //! Whether this peer sent an invalid block in reply to a witness recovery request.
+    bool m_failed_witness_recovery{false};
 
     /** State used to enforce CHAIN_SYNC_TIMEOUT and EXTRA_PEER_CHECK_INTERVAL logic.
       *
@@ -1205,6 +1207,7 @@ static bool CanServeWitnessRecovery(const Peer& peer, const CNodeState& state, c
     return CanServeBlocks(peer) &&
            CanServeWitnesses(peer) &&
            !IsWitnessPrunedPeer(peer) &&
+           !state.m_failed_witness_recovery &&
            state.pindexBestKnownBlock != nullptr &&
            state.pindexBestKnownBlock->nHeight >= block_index.nHeight + COINBASE_MATURITY &&
            state.pindexBestKnownBlock->GetAncestor(block_index.nHeight) == &block_index;
@@ -4910,6 +4913,23 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
             requested_stripped = WasBlockRequestedStripped(hash, pfrom.GetId());
             requested_recovery = WasBlockRequestedForRecovery(hash, pfrom.GetId());
             check_witness_root = prev_block && DeploymentActiveAfter(prev_block, m_chainman, Consensus::DEPLOYMENT_SEGWIT);
+        }
+
+        if (requested_recovery) {
+            // A block requested for witness recovery is stored and connected
+            // without AcceptBlock(), so check it here. A peer whose copy fails
+            // is not asked for witness recovery again.
+            LOCK(cs_main);
+            BlockValidationState recovery_state;
+            const CBlockIndex* recovery_index{m_chainman.m_blockman.LookupBlockIndex(hash)};
+            if (!Assume(recovery_index) || !m_chainman.CheckRecoveredBlock(*pblock, *recovery_index, recovery_state)) {
+                LogDebug(BCLog::NET, "Received invalid witness recovery block %s from peer=%d: %s\n",
+                         hash.ToString(), peer->m_id, recovery_state.ToString());
+                Misbehaving(*peer, "invalid witness recovery block");
+                Assert(State(pfrom.GetId()))->m_failed_witness_recovery = true;
+                RemoveBlockRequest(hash, peer->m_id);
+                return;
+            }
         }
 
         // Check for possible mutation if it connects to something we know so we can check for DEPLOYMENT_SEGWIT being active

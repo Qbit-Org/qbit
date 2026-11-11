@@ -3482,7 +3482,11 @@ bool Chainstate::ConnectTip(
             if (used_recovered) {
                 m_chainman.ClearWitnessRecovery(pindexNew->GetBlockHash());
                 (void)m_blockman.RemoveRecoveredBlock(pindexNew->GetBlockHash());
-                if (state.IsInvalid()) {
+                // Retry recovery only if the copy itself is bad. A copy that
+                // passes CheckRecoveredBlock() has the data the block hash
+                // commits to, so its failure is the block's own.
+                BlockValidationState copy_state;
+                if (state.IsInvalid() && !m_chainman.CheckRecoveredBlock(*block_to_connect, *pindexNew, copy_state)) {
                     LogWarning("Recovered witness block %s failed validation (%s); discarding recovered payload and retrying recovery\n",
                                pindexNew->GetBlockHash().ToString(), state.ToString());
                     BlockValidationState retry_state;
@@ -5114,6 +5118,19 @@ void ChainstateManager::ClearWitnessRecovery(const uint256& block_hash)
     if (m_pending_witness_recovery == block_hash) {
         m_pending_witness_recovery.reset();
     }
+}
+
+bool ChainstateManager::CheckRecoveredBlock(const CBlock& block, const CBlockIndex& block_index, BlockValidationState& state) const
+{
+    AssertLockHeld(::cs_main);
+
+    // As in AcceptBlockHeader() for a known header, check the payload against
+    // the commitment rules for the block's height.
+    if (const auto error = auxpow::Validate(block, GetConsensus(), /*check_pow=*/true, auxpow::CommitmentValidationForHeight(GetConsensus(), block_index.nHeight))) {
+        return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, error->reject_reason, error->debug_message);
+    }
+    return CheckBlock(block, state, GetConsensus()) &&
+           ContextualCheckBlock(block, state, *this, block_index.pprev);
 }
 
 MempoolAcceptResult ChainstateManager::ProcessTransaction(const CTransactionRef& tx, bool test_accept)
