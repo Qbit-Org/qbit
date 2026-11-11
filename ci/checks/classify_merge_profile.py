@@ -261,7 +261,10 @@ def load_changed_files(path: str) -> list[str]:
         data = file.read()
     if b"\0" in data:
         return [name.decode("utf8", errors="surrogateescape") for name in data.split(b"\0") if name]
-    return [unquote_git_path(line) for line in data.decode("utf8", errors="surrogateescape").splitlines()]
+    # git ends each name with a line feed only; a name printed unquoted
+    # (core.quotePath=false) may hold U+2028 and the like, which splitlines()
+    # would also split at.
+    return [unquote_git_path(line) for line in data.decode("utf8", errors="surrogateescape").split("\n") if line]
 
 
 def bool_output(value: bool) -> str:

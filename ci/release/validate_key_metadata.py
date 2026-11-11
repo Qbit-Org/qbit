@@ -494,49 +494,140 @@ def validate_policy_sha256_file(path: Path, expected_policy_sha256: str) -> None
         raise MetadataError(f"{path}: policy hash does not match checked-in keys.json")
 
 
-def run_command(command: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, check=False, capture_output=True, text=True)
+def run_command(command: list[str], *, text: bool = True) -> subprocess.CompletedProcess[Any]:
+    """Run `command`. Output that gets parsed is read as bytes (text=False): text
+    mode would also turn a carriage return into a line feed."""
+
+    return subprocess.run(command, check=False, capture_output=True, text=text)
 
 
-def good_signatures(status_output: str) -> list[tuple[str, str]]:
+def shown(output: bytes | str) -> str:
+    """Program output for an error message."""
+
+    return output.decode("utf8", errors="backslashreplace") if isinstance(output, bytes) else output
+
+
+class GpgOutputError(MetadataError):
+    """Raised when gpg or git printed output that cannot be read unambiguously."""
+
+
+# gpg and git end each line of their output with a line feed; str.splitlines()
+# also ends a line at each of these, and gpg prints some of them as they are in
+# user IDs and notation data. Output that holds any of them is refused, so that
+# no reader can take it for more lines than gpg wrote.
+OTHER_LINE_SEPARATORS = frozenset("\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029")
+STATUS_PREFIX = "[GNUPG:] "
+STATUS_KEYWORD_RE = re.compile(r"[A-Z][A-Z0-9_]*")
+# A long key ID or a v4 or v5 fingerprint, as gpg prints them.
+STATUS_KEY_ID_RE = re.compile(r"[0-9A-F]{16}|[0-9A-F]{40}|[0-9A-F]{64}")
+# Status lines that report a signature's result as "<key ID> <user ID>"; the
+# user ID may hold spaces, so it is the rest of the line (gpg's doc/DETAILS).
+KEY_AND_USER_ID_STATUS = frozenset({"GOODSIG", "EXPSIG", "EXPKEYSIG", "REVKEYSIG", "BADSIG"})
+# The other status lines the signature checks read, with the numbers of
+# space-separated arguments gpg's doc/DETAILS gives them.
+STATUS_ARGUMENT_COUNTS = {
+    "NEWSIG": (0, 1),
+    "VALIDSIG": (9, 10),
+    "ERRSIG": (6, 7),
+    "NO_PUBKEY": (1, 1),
+}
+SIGNATURE_RESULT_STATUS = KEY_AND_USER_ID_STATUS | {"VALIDSIG", "ERRSIG", "NO_PUBKEY"}
+REFUSED_SIGNATURE_STATUS = frozenset({"REVKEYSIG", "EXPKEYSIG", "ERRSIG", "BADSIG", "EXPSIG", "NO_PUBKEY"})
+
+
+def output_lines(output: bytes, what: str) -> list[str]:
+    """The lines of a program's output: UTF-8, each ended by a line feed, and no other line separator."""
+
+    if not isinstance(output, bytes):
+        raise TypeError(f"{what} must be read as bytes")
+    try:
+        text = output.decode("utf8")
+    except UnicodeDecodeError as exc:
+        raise GpgOutputError(f"{what} is not UTF-8") from exc
+    if not text:
+        return []
+    if not text.endswith("\n"):
+        raise GpgOutputError(f"{what} does not end with a line feed")
+    lines = text[:-1].split("\n")
+    for number, line in enumerate(lines, start=1):
+        found = OTHER_LINE_SEPARATORS.intersection(line)
+        if found:
+            names = ", ".join(f"U+{ord(char):04X}" for char in sorted(found))
+            raise GpgOutputError(f"{what} line {number} holds a line separator other than a line feed ({names})")
+    return lines
+
+
+def status_records(output: bytes, what: str = "gpg status output") -> list[tuple[str, tuple[str, ...]]]:
+    """gpg's --status-fd output as (keyword, arguments), refusing anything but well-formed status lines."""
+
+    records: list[tuple[str, tuple[str, ...]]] = []
+    for number, line in enumerate(output_lines(output, what), start=1):
+        if not line.startswith(STATUS_PREFIX):
+            shown_line = repr(line[:100]) + ("..." if len(line) > 100 else "")
+            raise GpgOutputError(f"{what} line {number} is not a gpg status line: {shown_line}")
+        keyword, space, rest = line[len(STATUS_PREFIX):].partition(" ")
+        if not STATUS_KEYWORD_RE.fullmatch(keyword):
+            raise GpgOutputError(f"{what} line {number} has no status keyword")
+        if keyword in KEY_AND_USER_ID_STATUS:
+            key_id, space, user_id = rest.partition(" ")
+            # An empty user ID packet gives an empty user ID.
+            if not STATUS_KEY_ID_RE.fullmatch(key_id) or not space:
+                raise GpgOutputError(f"{what} line {number}: malformed {keyword}")
+            arguments: tuple[str, ...] = (key_id, user_id)
+        elif keyword in STATUS_ARGUMENT_COUNTS:
+            arguments = tuple(rest.split(" ")) if space else ()
+            least, most = STATUS_ARGUMENT_COUNTS[keyword]
+            if not least <= len(arguments) <= most or "" in arguments:
+                raise GpgOutputError(f"{what} line {number}: malformed {keyword}")
+        else:
+            # Not read by any check; only its shape matters.
+            arguments = (rest,) if space else ()
+        records.append((keyword, arguments))
+    return records
+
+
+def colon_records(output: bytes, what: str) -> list[list[str]]:
+    """gpg's --with-colons output, one list of fields per record."""
+
+    return [line.split(":") for line in output_lines(output, what)]
+
+
+def good_signatures(status_output: bytes, source: str = "gpg status output") -> list[tuple[str, str]]:
     """The signatures gpg's --status-fd output shows as good, as (signing, primary) fingerprints.
 
     A signature counts only when its GOODSIG and VALIDSIG agree on the key and
     VALIDSIG names the primary key (its tenth argument), and nothing else gpg
     reported for it (REVKEYSIG, EXPKEYSIG, ERRSIG, BADSIG, EXPSIG, NO_PUBKEY)
-    says otherwise. Status lines are grouped per signature by NEWSIG.
+    says otherwise. Status lines are grouped per signature by NEWSIG, and a
+    signature's result before any NEWSIG refuses the whole output, as does
+    anything status_records refuses.
     """
 
-    refused = {"REVKEYSIG", "EXPKEYSIG", "ERRSIG", "BADSIG", "EXPSIG", "NO_PUBKEY"}
-    groups: list[list[list[str]]] = [[]]
-    for line in status_output.splitlines():
-        if not line.startswith("[GNUPG:] "):
-            continue
-        fields = line.split()[1:]
-        if not fields:
-            continue
-        if fields[0] == "NEWSIG":
+    groups: list[list[tuple[str, tuple[str, ...]]]] = []
+    for keyword, arguments in status_records(status_output, source):
+        if keyword == "NEWSIG":
             groups.append([])
-            continue
-        groups[-1].append(fields)
+        elif groups:
+            groups[-1].append((keyword, arguments))
+        elif keyword in SIGNATURE_RESULT_STATUS:
+            raise GpgOutputError(f"{source} reports {keyword} before any NEWSIG")
     good: list[tuple[str, str]] = []
     for group in groups:
-        keywords = [fields[0] for fields in group]
-        if not group or refused & set(keywords):
+        if REFUSED_SIGNATURE_STATUS & {keyword for keyword, _arguments in group}:
             continue
-        goodsig = [fields for fields in group if fields[0] == "GOODSIG"]
-        validsig = [fields for fields in group if fields[0] == "VALIDSIG"]
-        if len(goodsig) != 1 or len(validsig) != 1 or len(goodsig[0]) < 2 or len(validsig[0]) < 11:
+        goodsig = [arguments for keyword, arguments in group if keyword == "GOODSIG"]
+        validsig = [arguments for keyword, arguments in group if keyword == "VALIDSIG"]
+        if len(goodsig) != 1 or len(validsig) != 1 or len(validsig[0]) != 10:
             continue
-        signing = normalize_fingerprint(validsig[0][1], path="gpg VALIDSIG")
-        primary = normalize_fingerprint(validsig[0][10], path="gpg VALIDSIG primary key")
-        if not signing.endswith(goodsig[0][1].upper()):
+        signing = normalize_fingerprint(validsig[0][0], path="gpg VALIDSIG")
+        primary = normalize_fingerprint(validsig[0][9], path="gpg VALIDSIG primary key")
+        if not signing.endswith(goodsig[0][0]):
             continue
         good.append((signing, primary))
     return good
 
 
-def status_fingerprints(status_output: str) -> list[str]:
+def status_fingerprints(status_output: bytes) -> list[str]:
     return [signing for signing, _primary in good_signatures(status_output)]
 
 
@@ -577,17 +668,21 @@ def verify_approval_signature(
             "--verify",
             str(approval_file),
             str(signed_policy_sha256),
-        ]
+        ],
+        text=False,
     )
     if result.returncode != 0:
         raise MetadataError(
             f"{approval_file}: approval signature does not verify against policy.SHA256:\n"
-            f"{result.stdout}{result.stderr}"
+            f"{shown(result.stdout)}{shown(result.stderr)}"
         )
-    valid_fingerprints = set(status_fingerprints(result.stdout))
+    try:
+        valid_fingerprints = set(status_fingerprints(result.stdout))
+    except GpgOutputError as exc:
+        raise GpgOutputError(f"{approval_file}: {exc}") from exc
     if not valid_fingerprints:
         raise MetadataError(
-            f"{approval_file}: approval signature produced no good signature by a valid key:\n{result.stdout}"
+            f"{approval_file}: approval signature produced no good signature by a valid key:\n{shown(result.stdout)}"
         )
     unexpected = sorted(valid_fingerprints - {expected_fingerprint})
     if unexpected:
@@ -798,17 +893,17 @@ def read_certificate(gpg: str, path: Path) -> dict[str, Any]:
                 "--with-sig-list",
                 "--show-keys",
                 str(path),
-            ]
+            ],
+            text=False,
         )
     if result.returncode != 0:
-        raise MetadataError(f"{path}: gpg cannot read the certificate:\n{result.stderr}")
+        raise MetadataError(f"{path}: gpg cannot read the certificate:\n{shown(result.stderr)}")
     primaries: list[str] = []
     keys: dict[str, dict[str, str]] = {}
     signatures: collections.Counter[tuple[str, str]] = collections.Counter()
     record: list[str] | None = None
     context = ""
-    for line in result.stdout.splitlines():
-        fields = line.split(":")
+    for fields in colon_records(result.stdout, f"{path}: gpg's listing of the certificate"):
         if fields[0] in {"pub", "sub"}:
             record = fields
         elif fields[0] == "fpr" and record is not None and len(fields) > 9:

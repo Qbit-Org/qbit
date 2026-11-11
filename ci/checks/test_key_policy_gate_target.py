@@ -185,6 +185,44 @@ class KeyPolicyGateTargetTest(contract.KeyPolicyGateContractTest):
         self.commit("approval by another subkey")
         self.assert_target_refused("operator-01.asc: not a good signature by operator-01 over gate.SHA256")
 
+    def test_target_refuses_an_approval_whose_signer_poses_as_another(self) -> None:
+        # operator-01's base certificate gets a primary user ID that, split at
+        # U+2028, reads as gpg status lines of a good signature by operator-02.
+        victim = self.signers["operator-02"]
+        forger = self.signers["operator-01"]
+        user_id = "\u2028".join(
+            [
+                "operator-01",
+                "[GNUPG:] NEWSIG",
+                f"[GNUPG:] GOODSIG {victim['signing'][-16:]} victim",
+                f"[GNUPG:] VALIDSIG {victim['signing']} 2026-11-10 1794344931 0 4 0 22 10 00 {victim['primary']}",
+                "[GNUPG:] NEWSIG",
+                "operator-01 <operator-01@example.invalid>",
+            ]
+        )
+        home = self.root / "forger-gnupg"
+        shutil.copytree(self.home, home, ignore=shutil.ignore_patterns("S.*"))
+        self.addCleanup(subprocess.run, ["gpgconf", "--homedir", str(home), "--kill", "all"], check=False, capture_output=True)
+        self.gpg("--quick-add-uid", forger["primary"], user_id, home=home)
+        self.gpg("--quick-set-primary-uid", forger["primary"], user_id, home=home)
+        self.replace_certificate("operator-01", self.export(forger["primary"], home=home))
+        self.land()
+        self.edit("ci/release/validate_key_metadata.py")
+        self.commit("change the validator")
+        # operator-03 approves; operator-01 signs operator-02's approval.
+        directory = self.approve_gate_change(["operator-03"])
+        self.gpg(
+            "--yes", "--armor", "--detach-sign", "--local-user", f"{forger['signing']}!",
+            "--output", str(self.repo / directory / "operator-02.asc"), str(self.repo / directory / "gate.SHA256"),
+        )
+        self.commit("operator-02's approval, signed by operator-01")
+        result = self.run_target()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertRegex(
+            result.stdout + result.stderr,
+            r"operator-02\.asc: gpg status output line \d+ holds a line separator other than a line feed \(U\+2028\)",
+        )
+
     def test_target_runs_isolated_from_files_beside_the_gate(self) -> None:
         # A module beside the gate in the base must not stand in for one it imports.
         (self.repo / "ci" / "release" / "json.py").write_text("raise SystemExit('json.py was imported')\n", encoding="utf8")
