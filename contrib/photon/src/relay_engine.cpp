@@ -285,14 +285,16 @@ void RelayEngine::OnBlockHeader(const InboundPeerInfo& inbound_peer,
         return;
     }
 
-    // A refused header also ends this block for this peer: its remaining chunks are ignored
-    // rather than buffered for a decoder that will not come. A header that no honest sender
-    // produces also counts against the peer.
+    // A header that no honest sender produces ends this block for this peer, and counts against
+    // it: the block's remaining chunks are ignored rather than buffered for a decoder that will
+    // not come. A header refused only for lack of room ends nothing, so that a later copy of it
+    // can still start the block once room is free; until then, the chunks that follow it are
+    // treated like those of any block whose header has not arrived, within the same limits.
     const auto refuse = [&](bool fault) {
         RejectInbound(slot);
         EraseInbound(key);
-        MarkFinished(key, now);
         if (fault) {
+            MarkFinished(key, now);
             RecordFault(slot, now);
         }
     };

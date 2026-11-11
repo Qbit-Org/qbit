@@ -1409,6 +1409,92 @@ void TestRefusedHeaderRemainingChunksIgnored()
     Require(engine.stats().inbound_entries == 0, "its chunks should not be buffered");
 }
 
+void TestCapacityRefusedHeaderCanBeRetried()
+{
+    const auto params = photon::fec::Parameters::FromOverheadRatio(1.2);
+    const TestBlock busy = EncodeTestBlock(600'000, 0xF780, params.data_chunks);
+    const TestBlock wanted = EncodeTestBlock(600'000, 0xF781, params.data_chunks);
+    const std::size_t charge = photon::fec::Decoder::MemoryBytes(params, wanted.bytes.size());
+    const auto send_data_chunks = [](RelayEngine& engine, const InboundPeerInfo& peer, const TestBlock& block,
+                                     std::size_t from, CapturingSubmitter& submitter) {
+        for (std::size_t i = from; i < block.encoded.chunks.size(); ++i) {
+            if (block.encoded.chunks[i].chunk_id < block.encoded.params.data_chunks) {
+                engine.OnBlockChunk(peer, BuildChunkPayload(block.encoded.chunks[i], block.prefix), submitter);
+            }
+        }
+    };
+
+    MockClock clock{};
+    RelayEngineConfig config{};
+    config.max_inbound_decoder_bytes = charge; // one such decoder in total
+    RelayEngine engine(clock, config);
+    CapturingSubmitter submitter;
+
+    // Peer 1's block, still receiving chunks, holds all the decoder memory.
+    engine.OnBlockHeader(kPeer1, BuildHeaderPayload(busy.encoded, busy.prefix, busy.bytes.size()), submitter);
+    engine.OnBlockChunk(kPeer1, BuildChunkPayload(busy.encoded.chunks[0], busy.prefix), submitter);
+
+    // Peer 0's header copies are refused for lack of room, which is not the peer's fault, and
+    // nothing is given up for them.
+    const BlockHeaderPayload wanted_header = BuildHeaderPayload(wanted.encoded, wanted.prefix, wanted.bytes.size());
+    for (int i = 0; i < 3; ++i) {
+        engine.OnBlockHeader(kPeer0, wanted_header, submitter);
+    }
+    Require(PeerStats(engine, 0).inbound_rejected == 3, "every header copy should be refused while there is no room");
+    Require(PeerStats(engine, 0).faults == 0, "a header refused for lack of room should not count against the peer");
+    Require(engine.stats().inbound_evictions == 0, "nothing should be evicted for a refused header");
+    Require(PeerStats(engine, 0).inbound_decoder_bytes == 0, "a refused header should hold no decoder memory");
+
+    // The chunks that follow are buffered as for a block whose header has not arrived, within the
+    // same per-block limit.
+    const std::size_t early = config.max_inbound_buffered_chunks_per_entry + 4;
+    for (std::size_t i = 0; i < early; ++i) {
+        engine.OnBlockChunk(kPeer0, BuildChunkPayload(wanted.encoded.chunks[i], wanted.prefix), submitter);
+    }
+    Require(PeerStats(engine, 0).inbound_entries == 1, "the following chunks should be kept in one entry");
+    Require(PeerStats(engine, 0).inbound_rejected == 3 + 4, "chunks beyond the pre-header limit should be refused");
+
+    // Peer 1's block completes and frees the decoder memory.
+    send_data_chunks(engine, kPeer1, busy, 1, submitter);
+    Require(submitter.submit_calls == 1 && submitter.last_block == busy.bytes, "peer 1's block should complete");
+    Require(engine.stats().inbound_decoder_bytes == 0, "the completed block's decoder memory should be released");
+
+    // A later copy of peer 0's header now starts the block from the chunks kept so far, and the
+    // rest of its chunks complete it.
+    engine.OnBlockHeader(kPeer0, wanted_header, submitter);
+    Require(PeerStats(engine, 0).inbound_decoder_bytes == charge, "the later header copy should start the block");
+    send_data_chunks(engine, kPeer0, wanted, 0, submitter);
+    Require(submitter.submit_calls == 2 && submitter.last_block == wanted.bytes,
+            "peer 0's block should complete once room is free");
+    Require(PeerStats(engine, 0).faults == 0 && PeerStats(engine, 0).inbound_evictions == 0,
+            "peer 0 should not be penalized for the earlier refusal");
+}
+
+void TestFaultRefusedHeaderStaysHandled()
+{
+    MockClock clock{};
+    RelayEngine engine(clock);
+    CapturingSubmitter submitter;
+
+    const TestBlock block = EncodeTestBlock(5000, 0xF790, 20);
+    BlockHeaderPayload malformed = BuildHeaderPayload(block.encoded, block.prefix, block.bytes.size());
+    ++malformed.coding_group_count;
+    engine.OnBlockHeader(kPeer0, malformed, submitter);
+    Require(PeerStats(engine, 0).inbound_rejected == 1 && PeerStats(engine, 0).faults == 1,
+            "the malformed header should be refused and count against the peer");
+
+    // The rest of that block from the same peer is ignored, a well-formed header copy included.
+    DeliverBlock(engine, kPeer0, block, submitter);
+    Require(submitter.submit_calls == 0, "the block should not be started from the same peer");
+    Require(engine.stats().inbound_entries == 0, "its chunks should not be buffered");
+    Require(PeerStats(engine, 0).inbound_rejected == 1 && PeerStats(engine, 0).faults == 1,
+            "its later packets should be ignored, not refused or counted again");
+
+    // Another peer's copy is still used.
+    DeliverBlock(engine, kPeer1, block, submitter);
+    Require(submitter.submit_calls == 1 && submitter.last_block == block.bytes, "another peer's copy should be used");
+}
+
 void TestNodeAnsweredBlockStillRelayedOut()
 {
     MockClock clock{};
@@ -2847,6 +2933,8 @@ int RunAllTests()
         {"repeated_chunks_do_not_keep_block_alive", TestRepeatedChunksDoNotKeepBlockAlive},
         {"combined_limits_evict_nothing_when_refused", TestCombinedLimitsEvictNothingWhenRefused},
         {"refused_header_remaining_chunks_ignored", TestRefusedHeaderRemainingChunksIgnored},
+        {"capacity_refused_header_can_be_retried", TestCapacityRefusedHeaderCanBeRetried},
+        {"fault_refused_header_stays_handled", TestFaultRefusedHeaderStaysHandled},
         {"node_answered_block_still_relayed_out", TestNodeAnsweredBlockStillRelayedOut},
         {"unavailable_check_not_repeated_for_copies", TestUnavailableCheckNotRepeatedForCopies},
         {"rejected_copy_does_not_block_other_peers_copy", TestRejectedCopyDoesNotBlockOtherPeersCopy},

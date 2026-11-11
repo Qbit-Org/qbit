@@ -342,8 +342,8 @@ private:
     static constexpr std::chrono::milliseconds kHandledInboundLifetime{std::chrono::seconds{10}};
     static constexpr std::size_t kMaxHandledInbound = 256;
 
-    // One peer's blocks already handled or refused, so that the sender's remaining chunks do not
-    // start a new incomplete block.
+    // One peer's blocks already handled, or refused for a header no honest sender produces, so
+    // that the sender's remaining chunks do not start a new incomplete block.
     detail::RecentSet<InboundRelayKey, InboundRelayKeyHash> m_finished{kHandledInboundLifetime, kMaxHandledInbound};
     // Blocks about which the node gave an answer that holds for any copy (it has the block, the
     // parent is too far, or the node is not answering), so other peers' copies are not decoded and
