@@ -64,10 +64,22 @@ jobs:
   classify-changes:
     name: classify validation profile
     runs-on: ubuntu-24.04
+    # The pass marker decision reads the run a marker names, its jobs and
+    # artifacts and the cache listing (actions: read), and this pull request's
+    # listing and timeline (pull-requests: read). Job permissions replace the
+    # workflow's, so contents: read is repeated.
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
     outputs:
       profile: ${{ steps.classify.outputs.profile }}
       release_policy_only: ${{ steps.classify.outputs.release_policy_only }}
       source_validation_required: ${{ steps.classify.outputs.source_validation_required }}
+      # 'true' only when the decision step ran, succeeded and said so; any
+      # other outcome runs everything.
+      tree_pass_skip: ${{ steps.marker-decision.outcome == 'success' && steps.marker-decision.outputs.skip == 'true' && 'true' || 'false' }}
+      tree_pass_key_prefix: ${{ steps.marker-key.outputs.key_prefix }}
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -131,10 +143,89 @@ jobs:
             --changed-files "${{ steps.changed-files.outputs.changed_files }}" \
             --github-output "$GITHUB_OUTPUT"
 
+      # Same-tree skip (doc/development/ci-same-tree-skip.md): a pull request
+      # whose commit under test has a tree that already passed this workflow,
+      # routed the same way, skips the expensive jobs below. Pull requests only;
+      # every failure in these steps runs everything.
+      - name: Compute pass marker key
+        id: marker-key
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        env:
+          # Bump to invalidate every pass marker of this workflow.
+          TREE_PASS_MARKER_SALT: '1'
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CHANGED_FILES: ${{ steps.changed-files.outputs.changed_files }}
+        run: |
+          python3 ci/checks/tree_pass_marker.py key \
+            --workflow-ref "${GITHUB_WORKFLOW_REF}" \
+            --repository "${GITHUB_REPOSITORY}" \
+            --salt "${TREE_PASS_MARKER_SALT}" \
+            --event "${EVENT_NAME}" \
+            --sha "${GITHUB_SHA}" \
+            --head-sha "${HEAD_SHA}" \
+            --base-ref "${BASE_REF}" \
+            --changed-files "${CHANGED_FILES}" \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Look up pass marker
+        id: marker-lookup
+        if: github.event_name == 'pull_request' && steps.marker-key.outputs.key_prefix != ''
+        continue-on-error: true
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .tree-pass-marker
+          key: ${{ steps.marker-key.outputs.key_prefix }}
+          restore-keys: ${{ steps.marker-key.outputs.key_prefix }}
+          lookup-only: true
+
+      - name: Decide whether this tree already passed
+        id: marker-decision
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          VALIDATION_PROFILE: ${{ steps.classify.outputs.profile }}
+          KEY_OUTCOME: ${{ steps.marker-key.outcome }}
+          KEY_PREFIX: ${{ steps.marker-key.outputs.key_prefix }}
+          HEAD_TREE: ${{ steps.marker-key.outputs.head_tree }}
+          WORKFLOW_PATH: ${{ steps.marker-key.outputs.workflow_path }}
+          LOOKUP_OUTCOME: ${{ steps.marker-lookup.outcome }}
+          MATCHED_KEY: ${{ steps.marker-lookup.outputs.cache-matched-key }}
+          HEAD_REPOSITORY_ID: ${{ github.event.pull_request.head.repo.id }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_OWNER: ${{ github.event.pull_request.head.repo.owner.login }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 ci/checks/tree_pass_marker.py decide \
+            --event "${EVENT_NAME}" \
+            --labels-json "${PR_LABELS}" \
+            --profile "${VALIDATION_PROFILE}" \
+            --key-outcome "${KEY_OUTCOME}" \
+            --key-prefix "${KEY_PREFIX}" \
+            --head-tree "${HEAD_TREE}" \
+            --workflow-path "${WORKFLOW_PATH}" \
+            --lookup-outcome "${LOOKUP_OUTCOME}" \
+            --matched-key "${MATCHED_KEY}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --repository "${GITHUB_REPOSITORY}" \
+            --head-repository-id "${HEAD_REPOSITORY_ID}" \
+            --head-ref "${HEAD_REF}" \
+            --head-owner "${HEAD_OWNER}" \
+            --pr-number "${PR_NUMBER}" \
+            --gate-job 'Full Validation Gate' \
+            --save-job 'save pass marker' \
+            --github-output "${GITHUB_OUTPUT}"
+
   runners:
     name: 'determine runners'
     needs: classify-changes
-    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted')))) }}
+    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted')))) && needs.classify-changes.outputs.tree_pass_skip != 'true' }}
     # This job only selects cache/profile outputs. Keep it off the compute pool
     # so a saturated self-hosted queue cannot delay the validation fan-out.
     runs-on: ubuntu-24.04
@@ -297,7 +388,7 @@ jobs:
     name: ${{ matrix.job-name }}
     runs-on: ${{ github.repository == 'Qbit-Org/qbit' && 'blacksmith-8vcpu-windows-2025' || 'windows-2022' }}
     needs: classify-changes
-    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted')))) }}
+    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted')))) && needs.classify-changes.outputs.tree_pass_skip != 'true' }}
     timeout-minutes: 240
 
     env:
@@ -603,7 +694,7 @@ jobs:
       - classify-changes
       - runners
     runs-on: *qbit_runs_on
-    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted')))) }}
+    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted')))) && needs.classify-changes.outputs.tree_pass_skip != 'true' }}
     timeout-minutes: 240
 
     env:
@@ -651,7 +742,7 @@ jobs:
     # third-party Windows runner for untrusted fork PRs. success() preserves the
     # existing requirement that windows-cross completed; windows-cross shares
     # this trust gate, so untrusted forks skip it and this job in turn.
-    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' && success() && (github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted')))) }}
+    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' && success() && (github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted')))) && needs.classify-changes.outputs.tree_pass_skip != 'true' }}
     timeout-minutes: 240
 
     env:
@@ -740,7 +831,7 @@ jobs:
       - classify-changes
       - runners
     runs-on: *qbit_runs_on
-    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted')))) }}
+    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted')))) && needs.classify-changes.outputs.tree_pass_skip != 'true' }}
     timeout-minutes: ${{ matrix.timeout-minutes }}
 
     env:
@@ -922,7 +1013,7 @@ jobs:
       - classify-changes
       - runners
     runs-on: *qbit_runs_on
-    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted')))) }}
+    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted')))) && needs.classify-changes.outputs.tree_pass_skip != 'true' }}
     timeout-minutes: 40
     env:
       CONTAINER_NAME: "bitcoin-linter"
@@ -959,11 +1050,52 @@ jobs:
           docker rm "$LINT_CID" || true
           exit "$rc"
 
+  # The lints that read history rather than the tree: the commit-message and
+  # scripted-diff lints read the pull request's commits, and the subtree lint
+  # finds each subtree's last import with git log. A rewrite with the same
+  # tree, such as the signed commit that lands, must still pass them, so the
+  # pass marker never skips this job (doc/development/ci-same-tree-skip.md).
+  # The subtree lint fetches the libbitcoinpqc release tag from GitHub and
+  # checks its signature with gpg, which the hosted ubuntu-24.04 image
+  # carries (gnupg2) and the lint job's container installs. The lint job runs
+  # all three too, with every other lint.
+  lint-commit-range:
+    name: 'lint commit range'
+    needs: classify-changes
+    runs-on: ubuntu-24.04
+    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' && (github.event_name != 'pull_request' || github.event.pull_request.draft != true) }}
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: *CHECKOUT_REF_TMPL
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Lint commit messages, scripted diffs and subtrees
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          # The range ci/lint/06_script.sh lints: on a pull request, the
+          # commits its merge commit brings in; otherwise the test runner's
+          # default, from the last merge commit.
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            if [[ "$(git rev-list -1 HEAD)" != "$(git rev-list -1 --merges HEAD)" ]]; then
+              echo "::error::The top commit must be the pull request's merge commit."
+              exit 1
+            fi
+            export COMMIT_RANGE="HEAD~..HEAD"
+          fi
+          cargo run --quiet --manifest-path ./test/lint/test_runner/Cargo.toml -- \
+            --lint=commit_msg --lint=scripted_diff --lint=subtree
+
   public-docs-lint:
     name: 'public-docs-lint'
     needs: classify-changes
     runs-on: ubuntu-24.04
-    if: ${{ (needs.classify-changes.outputs.source_validation_required == 'true' || needs.classify-changes.outputs.profile == 'public-docs') && (github.event_name != 'pull_request' || github.event.pull_request.draft != true) }}
+    if: ${{ (needs.classify-changes.outputs.source_validation_required == 'true' || needs.classify-changes.outputs.profile == 'public-docs') && (github.event_name != 'pull_request' || github.event.pull_request.draft != true) && needs.classify-changes.outputs.tree_pass_skip != 'true' }}
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -982,7 +1114,7 @@ jobs:
     name: 'rpc-docs'
     needs: classify-changes
     runs-on: ubuntu-24.04
-    if: ${{ (needs.classify-changes.outputs.source_validation_required == 'true' || needs.classify-changes.outputs.profile == 'rpc-docs') && (github.event_name != 'pull_request' || github.event.pull_request.draft != true) }}
+    if: ${{ (needs.classify-changes.outputs.source_validation_required == 'true' || needs.classify-changes.outputs.profile == 'rpc-docs') && (github.event_name != 'pull_request' || github.event.pull_request.draft != true) && needs.classify-changes.outputs.tree_pass_skip != 'true' }}
     timeout-minutes: 45
 
     steps:
@@ -1081,6 +1213,7 @@ jobs:
       - windows-native-test
       - ci-matrix
       - lint
+      - lint-commit-range
       - public-docs-lint
       - rpc-docs
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.draft != true) }}
@@ -1103,10 +1236,25 @@ jobs:
           WINDOWS_NATIVE_TEST_RESULT: ${{ needs.windows-native-test.result }}
           CI_MATRIX_RESULT: ${{ needs.ci-matrix.result }}
           LINT_RESULT: ${{ needs.lint.result }}
+          LINT_COMMIT_RANGE_RESULT: ${{ needs.lint-commit-range.result }}
           PUBLIC_DOCS_LINT_RESULT: ${{ needs.public-docs-lint.result }}
           RPC_DOCS_RESULT: ${{ needs.rpc-docs.result }}
+          EVENT_NAME: ${{ github.event_name }}
+          TREE_PASS_SKIP: ${{ needs.classify-changes.outputs.tree_pass_skip }}
         run: |
           set -euo pipefail
+
+          # A pull request whose tree already passed this workflow skips the
+          # jobs above (doc/development/ci-same-tree-skip.md). Only then is a
+          # skipped job accepted; a failed or cancelled job never is.
+          marker_skip=false
+          if [[ "${TREE_PASS_SKIP}" == "true" ]]; then
+            if [[ "${EVENT_NAME}" != "pull_request" ]]; then
+              echo "::error title=Full Validation failed::A ${EVENT_NAME} run reported a pass marker skip; only pull requests skip."
+              exit 1
+            fi
+            marker_skip=true
+          fi
 
           failed=0
           check_result() {
@@ -1120,6 +1268,15 @@ jobs:
             fi
           }
 
+          # A job the pass marker may skip.
+          check_job() {
+            if [[ "${marker_skip}" == "true" && "$2" == "skipped" ]]; then
+              echo "$1: skipped, this tree already passed Full Validation"
+              return 0
+            fi
+            check_result "$1" "$2"
+          }
+
           check_result "classify validation profile" "${CLASSIFY_CHANGES_RESULT}"
           echo "CI profile: ${CI_PROFILE:-unavailable}"
 
@@ -1128,13 +1285,90 @@ jobs:
             exit "${failed}"
           fi
 
-          check_result "determine runners" "${RUNNERS_RESULT}"
-          check_result "Windows native DLL" "${WINDOWS_NATIVE_DLL_RESULT}"
-          check_result "Linux->Windows cross" "${WINDOWS_CROSS_RESULT}"
-          check_result "Windows cross-built tests" "${WINDOWS_NATIVE_TEST_RESULT}"
-          check_result "CI matrix" "${CI_MATRIX_RESULT}"
-          check_result "lint" "${LINT_RESULT}"
-          check_result "public docs lint" "${PUBLIC_DOCS_LINT_RESULT}"
-          check_result "rpc docs" "${RPC_DOCS_RESULT}"
+          check_job "determine runners" "${RUNNERS_RESULT}"
+          check_job "Windows native DLL" "${WINDOWS_NATIVE_DLL_RESULT}"
+          check_job "Linux->Windows cross" "${WINDOWS_CROSS_RESULT}"
+          check_job "Windows cross-built tests" "${WINDOWS_NATIVE_TEST_RESULT}"
+          check_job "CI matrix" "${CI_MATRIX_RESULT}"
+          check_job "lint" "${LINT_RESULT}"
+          # Never skipped by the marker: always required.
+          check_result "lint commit range" "${LINT_COMMIT_RANGE_RESULT}"
+          check_job "public docs lint" "${PUBLIC_DOCS_LINT_RESULT}"
+          check_job "rpc docs" "${RPC_DOCS_RESULT}"
 
+          if [[ "${marker_skip}" == "true" && "${failed}" == "0" ]]; then
+            echo "::notice title=Full Validation::This tree already passed Full Validation in an earlier run of this pull request."
+          fi
           exit "${failed}"
+
+  # Saves this run's pass marker, only after a pull request run that did all
+  # of the work above and passed (doc/development/ci-same-tree-skip.md).
+  # test-each-commit and macos-native-arm64 are not part of the gate, so the
+  # marker neither stands for nor skips them.
+  save-pass-marker:
+    name: save pass marker
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs:
+      - classify-changes
+      - runners
+      - windows-native-dll
+      - windows-cross
+      - windows-native-test
+      - ci-matrix
+      - lint
+      - lint-commit-range
+      - public-docs-lint
+      - rpc-docs
+      - full-validation-gate
+    if: ${{ always() && github.event_name == 'pull_request' && needs.classify-changes.outputs.profile == 'source' && needs.classify-changes.outputs.tree_pass_skip == 'false' && needs.full-validation-gate.result == 'success' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          sparse-checkout: ci/checks
+          # The merge ref check fetches anonymously; this repository is public.
+          persist-credentials: false
+
+      - name: Check every job passed
+        id: plan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 ci/checks/tree_pass_marker.py save-plan \
+            --event "${EVENT_NAME}" \
+            --needs-json "${NEEDS_JSON}" \
+            --classify-job classify-changes \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --sha "${GITHUB_SHA}" \
+            --pr-number "${PR_NUMBER}" \
+            --check-merge-ref \
+            --marker-dir .tree-pass-marker \
+            --github-output "${GITHUB_OUTPUT}"
+
+      # The proof that this run's own checks approved the marker. Only a job
+      # of this run can upload an artifact to it, and a run that vouches for a
+      # tree ran that very tree's code. Uploaded before the marker, so a
+      # marker never exists without it.
+      - name: Upload pass marker proof
+        id: proof
+        if: steps.plan.outputs.save == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.plan.outputs.artifact }}
+          path: .tree-pass-marker/marker.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Save pass marker
+        if: steps.plan.outputs.save == 'true' && steps.proof.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .tree-pass-marker
+          key: ${{ steps.plan.outputs.key }}
