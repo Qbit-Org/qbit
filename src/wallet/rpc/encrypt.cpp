@@ -23,13 +23,16 @@ RPCHelpMan walletpassphrase()
             "time that overrides the old one.\n"
             "Before it returns, the call refills the wallet's keypools to -keypool, so that a full keypool\n"
             "of addresses can be handed out after the wallet is locked again. A P2MR key takes roughly\n"
-            "15 ms to derive, so the first unlock of a new wallet at the default -keypool takes about\n"
-            "30 seconds. The refill holds the wallet lock only briefly at a time, so most other calls on\n"
-            "the wallet keep working, but walletlock, walletpassphrasechange, rescans and imports wait for\n"
-            "it. The timeout counts from the end of the refill. If addresses are drawn from the wallet\n"
-            "about as fast as the refill derives them, it stops after a bounded number of steps and\n"
-            "continues in the background while the wallet is unlocked. If the refill fails, the call\n"
-            "returns an error and the wallet stays unlocked until the timeout.\n",
+            "15 ms to derive, and the first unlock of a new wallet derives about twice -keypool keys, so\n"
+            "it takes about 30 seconds at the default -keypool and grows with -keypool, to about 5 minutes\n"
+            "at -keypool=10000. The refill holds the wallet lock only briefly at a time, so most other\n"
+            "calls on the wallet keep working, but walletlock, walletpassphrasechange, another\n"
+            "walletpassphrase, unloadwallet, rescans and imports wait for it, as do locking the wallet and\n"
+            "changing its passphrase in qbit-qt. The timeout counts from the end of the refill. If\n"
+            "addresses are drawn from the wallet about as fast as the refill derives them, it stops after\n"
+            "a bounded number of steps per keypool and continues in the background while the wallet is\n"
+            "unlocked. If the refill fails, the call returns an error and the wallet stays unlocked until\n"
+            "the timeout.\n",
                 {
                     {"passphrase", RPCArg::Type::STR, RPCArg::Optional::NO, "The wallet passphrase"},
                     {"timeout", RPCArg::Type::NUM, RPCArg::Optional::NO, "The time to keep the decryption key in seconds; capped at 100000000 (~3 years)."},

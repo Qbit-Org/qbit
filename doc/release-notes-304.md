@@ -18,5 +18,12 @@ Locking the wallet, through `walletlock`, qbit-qt or the `walletpassphrase`
 timeout, now waits for a background keypool step that is running, usually
 under a second, so that the step's copies of the decrypted keys are freed
 before the lock completes. Background steps include those started at wallet
-load, by unlocking in qbit-qt and by `getnewaddress`. A `walletlock` sent while
-`walletpassphrase` is still refilling waits until the refill has finished.
+load, by unlocking in qbit-qt and by `getnewaddress`.
+
+While `walletpassphrase` is still refilling, `walletlock`,
+`walletpassphrasechange`, another `walletpassphrase`, `unloadwallet`, rescans
+and descriptor imports on that wallet wait until the refill has finished, as
+do locking the wallet and changing its passphrase in qbit-qt. The refill of a
+new wallet's first unlock derives about twice `-keypool` keys, so this wait
+grows with `-keypool`: about 30 seconds at the default, and about 5 minutes at
+`-keypool=10000`.
