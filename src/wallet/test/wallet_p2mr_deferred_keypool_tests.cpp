@@ -1354,9 +1354,12 @@ BOOST_FIXTURE_TEST_CASE(WalletPassphraseRefillHoldsOffLocksButNotStaleRelocks, R
     boost::signals2::scoped_connection connection{external_spk_man->NotifyCanGetAddressesChanged.connect([&] {
         if (!std::exchange(first_notification, false)) return;
         scheduler.MockForward(std::chrono::seconds{first_timeout});
-        std::promise<void> marker;
-        scheduler.scheduleFromNow([&marker] { marker.set_value(); }, std::chrono::milliseconds{0});
-        scheduler_ran = marker.get_future().wait_for(std::chrono::seconds{10}) == std::future_status::ready;
+        // Shared, so that a marker that runs only after the wait times out
+        // still has its promise.
+        auto marker{std::make_shared<std::promise<void>>()};
+        auto marker_ran{marker->get_future()};
+        scheduler.scheduleFromNow([marker] { marker->set_value(); }, std::chrono::milliseconds{0});
+        scheduler_ran = marker_ran.wait_for(std::chrono::seconds{10}) == std::future_status::ready;
         lock_thread = std::thread{[&] {
             wallet->Lock();
             lock_returned.set_value();
