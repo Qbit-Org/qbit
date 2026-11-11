@@ -1774,7 +1774,8 @@ bool PeerManagerImpl::HasAllDesirableServiceFlags(ServiceFlags services) const
 
 bool PeerManagerImpl::HasUndesirableServiceFlags(ServiceFlags services) const
 {
-    return WITH_LOCK(::cs_main, return m_chainman.RequiresArchivePeersForValidation() && (services & NODE_WITNESS_PRUNED));
+    // Only flags in DirectOnlyServiceFlags() may count against an address.
+    return WITH_LOCK(::cs_main, return m_chainman.RequiresArchivePeersForValidation() && (services & DirectOnlyServiceFlags()));
 }
 
 ServiceFlags PeerManagerImpl::GetDesirableServiceFlags(ServiceFlags services) const
@@ -3662,6 +3663,7 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
             // Overwrites potentially existing services. In contrast to this,
             // unvalidated services received via gossip relay in ADDR/ADDRV2
             // messages are only ever added but cannot replace existing ones.
+            // The flags in DirectOnlyServiceFlags() are only stored here.
             m_addrman.SetServices(pfrom.addr, nServices);
         }
         if (pfrom.ExpectServicesFromConn() && !HasAllDesirableServiceFlags(nServices))
@@ -4138,6 +4140,10 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
             if (addr.nTime <= NodeSeconds{100000000s} || addr.nTime > current_a_time + 10min) {
                 addr.nTime = current_a_time - 5 * 24h;
             }
+            // Relayed service flags are unverified. Do not store or relay the
+            // ones that count against an address: those are only taken from
+            // a peer's own version message on a connection we made to it.
+            addr.nServices = ServiceFlags(addr.nServices & ~DirectOnlyServiceFlags());
             AddAddressKnown(*peer, addr);
             if (m_banman && (m_banman->IsDiscouraged(addr) || m_banman->IsBanned(addr))) {
                 // Do not process banned/discouraged addresses beyond remembering we received them
