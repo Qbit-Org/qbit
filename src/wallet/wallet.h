@@ -113,6 +113,21 @@ void MaybeScheduleP2MRKeyPoolRefill(WalletContext& context, const std::shared_pt
 //! Top up the active keypools after an unlock: non-P2MR ones inline, P2MR ones
 //! (the pending create-time top-up, or a refill to -keypool) in the background.
 void TopUpKeyPoolAfterUnlock(WalletContext& context, const std::shared_ptr<CWallet>& wallet);
+enum class P2MRKeyPoolRefillResult {
+    //! The pending create-time top-up, if any, and both P2MR keypools reached -keypool.
+    COMPLETE,
+    //! The step limit was reached first, for example because addresses were
+    //! handed out as fast as the steps derived them.
+    INCOMPLETE,
+    //! A step failed; it logged why.
+    FAILED,
+};
+//! Refill the P2MR keypools of an unlocked wallet to -keypool on the calling
+//! thread, so that the keys exist before the wallet is locked again: a locked
+//! wallet cannot derive P2MR keys. This runs the background refill steps one
+//! after another, each holding cs_wallet only briefly. It runs at most a fixed
+//! number of steps per pool, about twice what an empty pool needs.
+P2MRKeyPoolRefillResult RefillP2MRKeyPoolsAfterUnlock(CWallet& wallet);
 std::unique_ptr<WalletDatabase> MakeWalletDatabase(const std::string& name, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error);
 //! The warning for an encrypted wallet whose rewrite after encryption is still pending.
 bilingual_str PendingRewriteWarning();

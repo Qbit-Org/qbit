@@ -212,8 +212,20 @@ For wallet-managed withdrawals:
 ```sh
 qbit-cli <chain option> -rpcwallet=exchange-hot walletpassphrase "<strong-passphrase>" 120
 qbit-cli <chain option> -rpcwallet=exchange-hot sendtoaddress "$destination" 1.25
+qbit-cli <chain option> -rpcwallet=exchange-hot keypoolrefill
 qbit-cli <chain option> -rpcwallet=exchange-hot walletlock
 ```
+
+A locked wallet cannot derive new P2MR keys. While it is locked, it can hand
+out only the deposit addresses already in its keypool, `-keypool` of them
+(1000 by default), and `getnewaddress` then fails with error `-12`,
+`Keypool ran out`, until the wallet is unlocked again. `walletpassphrase`
+refills the keypool before it returns. Call `keypoolrefill` before
+`walletlock` as well, so that addresses and change used while the wallet was
+unlocked are replaced before it locks. Deriving P2MR keys takes roughly 15 ms
+each, and `keypoolrefill` makes other calls on the wallet wait until it
+finishes, so allow for it in the unlock timeout. If you hand out more deposit
+addresses between unlocks than the keypool holds, raise `-keypool`.
 
 P2MR signatures are large, and qbit does not apply a Bitcoin-style witness
 discount. Withdrawal batching, consolidation, and fee policies must be tested

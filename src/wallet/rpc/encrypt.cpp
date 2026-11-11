@@ -19,8 +19,12 @@ RPCHelpMan walletpassphrase()
             "\nNote:\n"
             "Issuing the walletpassphrase command while the wallet is already unlocked will set a new unlock\n"
             "time that overrides the old one.\n"
-            "P2MR keypools are refilled to -keypool in the background after this call returns. The refill\n"
-            "pauses while the wallet is locked and resumes at the next walletpassphrase.\n",
+            "Before it returns, the call refills the wallet's keypools to -keypool, so that a full keypool\n"
+            "of addresses can be handed out after the wallet is locked again. Deriving P2MR keys can take\n"
+            "tens of seconds for a large -keypool. The refill holds the wallet lock only briefly at a time,\n"
+            "so other wallet calls keep working, but walletlock waits for it to finish. The timeout counts\n"
+            "from the end of the refill. If the refill fails, the call returns an error, and the wallet\n"
+            "stays unlocked until the timeout.\n",
                 {
                     {"passphrase", RPCArg::Type::STR, RPCArg::Optional::NO, "The wallet passphrase"},
                     {"timeout", RPCArg::Type::NUM, RPCArg::Optional::NO, "The time to keep the decryption key in seconds; capped at 100000000 (~3 years)."},
@@ -96,20 +100,27 @@ RPCHelpMan walletpassphrase()
     // Replace plaintext PQC key records left by older versions. This needs
     // cs_wallet released, and runs before the relock below is scheduled.
     pwallet->ReencryptPlaintextPQCKeys();
+
+    // A locked wallet cannot derive P2MR keys, so refill those keypools to
+    // -keypool now: callers commonly lock the wallet again right away and then
+    // hand out addresses. The steps hold cs_wallet only briefly. Holding
+    // m_relock_mutex keeps walletlock and earlier relock callbacks from
+    // locking the wallet before the refill and the top-up below finish.
+    const P2MRKeyPoolRefillResult refill_result{RefillP2MRKeyPoolsAfterUnlock(*pwallet)};
+    WalletContext& context = EnsureWalletContext(request.context);
+    // Top up the non-P2MR keypools, and let a P2MR refill that stopped short
+    // continue in the background. A background P2MR step that starts after
+    // the relock stops without deriving.
+    TopUpKeyPoolAfterUnlock(context, wallet);
+
     // Move the deadline set above to after that work, which can include a
-    // long database rewrite, so the wallet relocks when unlocked_until says.
-    // Holding m_relock_mutex keeps an earlier relock callback out meanwhile.
+    // long database rewrite and the keypool refill, so the timeout counts from
+    // here and the wallet relocks when unlocked_until says.
     {
         LOCK(pwallet->cs_wallet);
         pwallet->nRelockTime = GetTime() + nSleepTime;
         relock_time = pwallet->nRelockTime;
     }
-
-    WalletContext& context = EnsureWalletContext(request.context);
-    // m_relock_mutex is still held, so the wallet cannot be relocked before
-    // the non-P2MR top-up finishes. A background P2MR step that starts after
-    // the relock stops without deriving.
-    TopUpKeyPoolAfterUnlock(context, wallet);
 
     // Get wallet scheduler to queue up the relock callback in the future.
     // Scheduled events don't get destructed until they are executed,
@@ -132,6 +143,10 @@ RPCHelpMan walletpassphrase()
         }
     }, std::chrono::seconds(nSleepTime));
 
+    if (refill_result == P2MRKeyPoolRefillResult::FAILED) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Error: the wallet is unlocked, but its keypool could not be refilled; see the debug log. "
+                                             "The wallet still locks again after the timeout.");
+    }
     return UniValue::VNULL;
 },
     };

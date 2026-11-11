@@ -1,5 +1,5 @@
-`walletpassphrase` refills P2MR keypools in the background
-==========================================================
+`walletpassphrase` no longer holds the wallet lock while it refills P2MR keypools
+================================================================================
 
 The first `walletpassphrase` of a wallet created with a passphrase derived
 the rest of its P2MR keypool before it returned: about 2,000 keys, or roughly
@@ -7,23 +7,18 @@ the rest of its P2MR keypool before it returned: about 2,000 keys, or roughly
 had drained also refilled it to `-keypool` before returning. All that time
 the RPC held the wallet lock, so every other RPC on that wallet waited, and so
 did the validation callbacks of all wallets, which on a busy node could also
-delay block connection. The unlock timeout started only after the refill.
+delay block connection.
 
-`walletpassphrase` now returns as soon as the wallet is unlocked. P2MR
-keypools, including a pending initial top-up, are refilled to `-keypool` in
-short background steps that do not hold the wallet lock. The steps pause
-while the wallet is locked and resume at the next `walletpassphrase`, so with
-a short timeout the refill can take several unlocks. Other keypools are still topped
+`walletpassphrase` still refills the P2MR keypools, including a pending
+initial top-up, to `-keypool` before it returns, and the unlock timeout still
+starts when the refill ends. It now derives the keys in short steps that each
+hold the wallet lock only briefly, so other RPCs on the wallet and the
+validation callbacks keep running meanwhile. Other keypools are still topped
 up before the call returns.
 
 Locking the wallet, through `walletlock`, qbit-qt or the `walletpassphrase`
-timeout, now waits for a background step that is running, usually under a
-second, so that the step's copies of the decrypted keys are freed before the
-lock completes. This also applies to the background steps started by
-unlocking in qbit-qt or by `getnewaddress`.
-
-Scripts that read `keypoolsize` or `keypoolsize_hd_internal` from
-`getwalletinfo` right after `walletpassphrase` may now see a value below
-`-keypool` until the refill finishes. `getnewaddress` and transaction
-creation keep working meanwhile: past the last derived address they derive
-one key at a time.
+timeout, now waits for a background keypool step that is running, usually
+under a second, so that the step's copies of the decrypted keys are freed
+before the lock completes. Background steps include those started at wallet
+load, by unlocking in qbit-qt and by `getnewaddress`. A `walletlock` sent while
+`walletpassphrase` is still refilling waits until the refill has finished.
