@@ -7,6 +7,7 @@
 #include <interfaces/chain.h>
 #include <interfaces/wallet.h>
 #include <outputtype.h>
+#include <random.h>
 #include <rpc/request.h>
 #include <rpc/util.h>
 #include <streams.h>
@@ -16,6 +17,7 @@
 #include <util/strencodings.h>
 #include <util/translation.h>
 #include <wallet/context.h>
+#include <wallet/crypter.h>
 #include <wallet/dump.h>
 #include <wallet/test/util.h>
 #include <wallet/test/wallet_p2mr_test_util.h>
@@ -35,6 +37,7 @@
 #include <future>
 #include <iostream>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -297,6 +300,40 @@ std::string GetRPCError(const std::function<void()>& call)
     return "";
 }
 
+//! The descriptors that have a plaintext ECDSA key record in the database.
+std::set<uint256> GetDescriptorsWithPlaintextKeys(const MockableData& records)
+{
+    std::set<uint256> desc_ids;
+    for (const auto& [serialized_key, _] : records) {
+        DataStream key{serialized_key};
+        std::string record_type;
+        key >> record_type;
+        if (record_type != DBKeys::WALLETDESCRIPTORKEY) continue;
+        uint256 desc_id;
+        key >> desc_id;
+        desc_ids.insert(desc_id);
+    }
+    return desc_ids;
+}
+
+//! The descriptor's string with its private keys.
+std::string GetPrivateDescriptor(const DescriptorScriptPubKeyMan& spk_man)
+{
+    std::string desc;
+    BOOST_CHECK(spk_man.GetDescriptorString(desc, /*priv=*/true));
+    return desc;
+}
+
+//! Each descriptor's string with its private keys, by descriptor ID.
+std::map<uint256, std::string> GetPrivateDescriptors(CWallet& wallet)
+{
+    std::map<uint256, std::string> descs;
+    for (const ScriptPubKeyMan* spk_man : wallet.GetAllScriptPubKeyMans()) {
+        descs.emplace(spk_man->GetID(), GetPrivateDescriptor(dynamic_cast<const DescriptorScriptPubKeyMan&>(*spk_man)));
+    }
+    return descs;
+}
+
 } // namespace
 
 BOOST_FIXTURE_TEST_SUITE(wallet_encryption_tests, WalletTestingSetup)
@@ -396,6 +433,79 @@ BOOST_AUTO_TEST_CASE(EncryptWalletFailedMasterKeyWriteLeavesWalletUnencrypted)
     BOOST_CHECK(wallet->IsCrypted());
     BOOST_CHECK_EQUAL(CountMasterKeyRecords(*wallet), 1U);
     BOOST_CHECK(wallet->Unlock(passphrase));
+}
+
+// EncryptWallet writes each descriptor key's crypted record and erases its
+// plaintext record in one transaction. If an erase fails, the descriptor's
+// encryption must fail and keep its keys, so that EncryptWallet aborts the
+// transaction instead of committing it with the plaintext record still in the
+// file. EncryptWallet then stops the process, so this runs the encryption
+// steps of its transaction directly, then reloads the wallet as a restart
+// would and encrypts it again.
+BOOST_AUTO_TEST_CASE(FailedPlaintextKeyEraseFailsEncryption)
+{
+    m_args.ForceSetArg("-keypool", "1");
+    auto wallet{CreateUnencryptedWallet(*m_node.chain)};
+    MockableDatabase& database{GetMockableDatabase(*wallet)};
+    const MockableData records_before{database.m_records};
+    const std::set<uint256> with_plaintext_keys{GetDescriptorsWithPlaintextKeys(records_before)};
+    BOOST_REQUIRE(!with_plaintext_keys.empty());
+    const std::map<uint256, std::string> descs_before{GetPrivateDescriptors(*wallet)};
+
+    // Erasing a plaintext key record fails, without aborting the transaction.
+    DataStream prefix;
+    prefix << DBKeys::WALLETDESCRIPTORKEY;
+    database.m_erase_fail_prefix = SerializeData{prefix.begin(), prefix.end()};
+    CKeyingMaterial master_key(WALLET_CRYPTO_KEY_SIZE);
+    GetStrongRandBytes(master_key);
+    {
+        LOCK(wallet->cs_wallet);
+        WalletBatch batch{wallet->GetDatabase()};
+        BOOST_REQUIRE(batch.TxnBegin());
+        for (ScriptPubKeyMan* spk_man : wallet->GetAllScriptPubKeyMans()) {
+            auto& desc_spk_man{dynamic_cast<DescriptorScriptPubKeyMan&>(*spk_man)};
+            LOCK(desc_spk_man.cs_desc_man);
+            const bool has_plaintext_keys{with_plaintext_keys.contains(desc_spk_man.GetID())};
+            BOOST_CHECK_EQUAL(desc_spk_man.Encrypt(master_key, &batch), !has_plaintext_keys);
+            if (has_plaintext_keys) {
+                BOOST_CHECK_EQUAL(GetPrivateDescriptor(desc_spk_man), descs_before.at(desc_spk_man.GetID()));
+            }
+        }
+        BOOST_REQUIRE(batch.TxnAbort());
+    }
+    database.m_erase_fail_prefix.reset();
+    BOOST_CHECK(database.m_records == records_before);
+
+    // The wallet reloads unencrypted, with its keys, and can then be encrypted.
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+    auto reloaded{TestLoadWallet(DuplicateMockDatabase(database), context, WALLET_FLAG_DESCRIPTORS)};
+    BOOST_REQUIRE(reloaded);
+    BOOST_CHECK(!reloaded->IsCrypted());
+    BOOST_CHECK(GetPrivateDescriptors(*reloaded) == descs_before);
+
+    // The loaded plaintext PQC keys must be validated before encryption.
+    CWallet::PlaintextPQCKeyValidationStepResult step_result;
+    do {
+        step_result = reloaded->RunPlaintextPQCKeyValidationStep();
+    } while (step_result == CWallet::PlaintextPQCKeyValidationStepResult::IN_PROGRESS);
+    BOOST_REQUIRE(step_result == CWallet::PlaintextPQCKeyValidationStepResult::COMPLETE);
+    const SecureString passphrase{"passphrase"};
+    BOOST_REQUIRE(reloaded->EncryptWallet(passphrase));
+    BOOST_CHECK(GetDescriptorsWithPlaintextKeys(GetMockableDatabase(*reloaded).m_records).empty());
+    auto encrypted{TestLoadWallet(DuplicateMockDatabase(reloaded->GetDatabase()), context, WALLET_FLAG_DESCRIPTORS)};
+    TestUnloadWallet(std::move(reloaded));
+    BOOST_REQUIRE(encrypted);
+    BOOST_CHECK(encrypted->IsCrypted());
+    BOOST_CHECK(encrypted->IsLocked());
+    BOOST_REQUIRE(encrypted->Unlock(passphrase));
+    for (const auto& [desc_id, desc] : descs_before) {
+        const auto* spk_man{dynamic_cast<DescriptorScriptPubKeyMan*>(encrypted->GetScriptPubKeyMan(desc_id))};
+        BOOST_REQUIRE(spk_man);
+        BOOST_CHECK_EQUAL(GetPrivateDescriptor(*spk_man), desc);
+    }
+    TestUnloadWallet(std::move(encrypted));
 }
 
 // A background top-up runs without cs_wallet, as RunP2MRKeyPoolRefillStep and
