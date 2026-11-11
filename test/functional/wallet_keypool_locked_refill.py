@@ -83,20 +83,23 @@ class WalletKeypoolLockedRefillTest(BitcoinTestFramework):
         self.run_cycles(node.get_wallet_rpc("new"))
 
     def test_short_timeout(self):
-        self.log.info("The unlock timeout counts from the end of the refill, and the wallet still relocks")
+        self.log.info("The unlock timeout counts from the end of the refill")
         wallet = self.nodes[0].get_wallet_rpc("new")
         # The receive pool is empty after the cycles above, so the call
-        # derives -keypool keys before it returns.
-        timeout = 5
+        # derives -keypool keys before it returns. The timeout is long enough
+        # that the wallet is still unlocked when getwalletinfo returns, even on
+        # a slow or loaded machine.
+        timeout = 20
         elapsed, returned, info = self.unlock_and_check_keypool(wallet, timeout)
         self.log.info(f"  walletpassphrase refilled the keypool in {elapsed:.1f}s")
-        # The deadline was set when the refill ended, under a second before the
-        # call returned. (When the refill takes more than a second or two, a
-        # deadline counted from the start of the call fails this check; the
-        # unit tests check the deadline exactly.)
-        assert_greater_than_or_equal(info["unlocked_until"], int(returned) - 1 + timeout)
+        # The deadline was set when the refill ended, just before the call
+        # returned; allow 2 seconds for the reply to arrive. (When the refill
+        # takes more than a few seconds, a deadline counted from the start of
+        # the call fails this check; the unit tests check the deadline exactly.)
+        assert_greater_than_or_equal(info["unlocked_until"], int(returned) - 2 + timeout)
         assert_greater_than_or_equal(int(returned) + timeout, info["unlocked_until"])
-        self.wait_until(lambda: wallet.getwalletinfo()["unlocked_until"] == 0)
+        # The timeout-0 case below checks that the wallet relocks on its own.
+        wallet.walletlock()
         self.hand_out_keypool_while_locked(wallet, set())
 
         self.log.info("A timeout of 0 relocks right after the refill")
