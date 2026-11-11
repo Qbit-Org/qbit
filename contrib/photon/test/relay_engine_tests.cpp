@@ -1530,8 +1530,9 @@ void TestCapacityRefusedHeaderCanBeRetried()
     SendDataChunks(engine, kPeer0, wanted, 0, submitter);
     Require(submitter.submit_calls == 0 && PeerStats(engine, 0).inbound_decoder_bytes == 0, "the block should wait");
 
-    // Once peer 1's block has completed, a header copy that arrives late (delayed on the way)
-    // starts the block from the kept chunks.
+    // Once peer 1's block has completed, a further header copy starts the block from the kept
+    // chunks. A sender sends its header copies before its chunks, and older packets are dropped
+    // before they reach the relay engine, so this order checks the engine on its own.
     SendDataChunks(engine, kPeer1, busy, 1, submitter);
     Require(submitter.submit_calls == 1, "peer 1's block should complete");
     engine.OnBlockHeader(kPeer0, HeaderOf(wanted), submitter);
@@ -1606,8 +1607,9 @@ void TestHeaderAfterChunksWaitsWithThem()
     engine.OnBlockHeader(kPeer1, HeaderOf(busy), submitter);
     SendChunks(engine, kPeer1, busy, 0, 1, submitter);
 
-    // Peer 0's first chunks overtake its headers; the block then waits in the entry they made,
-    // although peer 0 has no other entry free.
+    // Chunks that reach the engine before their header (not from a sender that follows the
+    // protocol, whose header copies come first) make an entry; when the header is then refused
+    // for lack of room, the block waits in that entry, although peer 0 has no other entry free.
     SendInOrder(engine, kPeer0, wanted, order, 0, 10, submitter);
     for (int i = 0; i < 3; ++i) {
         engine.OnBlockHeader(kPeer0, HeaderOf(wanted), submitter);
@@ -1644,7 +1646,8 @@ void TestStartingWaitingBlockIsNotProgress()
     engine.OnBlockHeader(kPeer0, HeaderOf(wanted), submitter);
     SendChunks(engine, kPeer0, wanted, 0, 10, submitter);
 
-    // Long after peer 0's last new chunk, room frees and a repeated header copy starts its block.
+    // Long after peer 0's last new chunk, room frees and a further header copy starts its block
+    // (an order that checks the engine on its own: a sender's header copies come first).
     clock.Advance(config.inbound_progress_grace + std::chrono::milliseconds{1});
     SendDataChunks(engine, kPeer1, busy, 1, submitter);
     Require(submitter.submit_calls == 1, "peer 1's block should complete");
