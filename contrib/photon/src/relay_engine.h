@@ -232,9 +232,20 @@ private:
         bool header_sent{false};
     };
 
+    // A block's validated header, kept while there is no room for its decoder.
+    struct WaitingHeader {
+        fec::Parameters params{};
+        std::size_t original_size{0};
+        std::size_t coding_group_count{0};
+        std::size_t decoder_bytes{0};
+        // m_inbound_releases when room was last looked for.
+        std::uint64_t releases{0};
+    };
+
     struct InboundRelay {
         std::optional<fec::Parameters> params{};
         std::optional<fec::Decoder> decoder{};
+        std::optional<WaitingHeader> waiting{};
         std::vector<fec::Chunk> buffered_chunks{};
         Clock::TimePoint first_seen{};
         Clock::TimePoint last_updated{};
@@ -297,6 +308,18 @@ private:
     [[nodiscard]] bool MakeRoom(const InboundRelayKey& key, bool new_entry, std::size_t decoder_bytes, Clock::TimePoint now);
     InboundRelay& CreateInbound(const InboundRelayKey& key, Clock::TimePoint now);
     void ChargeDecoder(const InboundRelayKey& key, InboundRelay& relay, std::size_t bytes);
+    // Builds the decoder of a block that has room for it and gives it the chunks buffered so far.
+    // Returns false if the block was dropped instead.
+    [[nodiscard]] bool StartDecoder(const InboundRelayKey& key,
+                                    InboundRelay& relay,
+                                    fec::Parameters params,
+                                    std::size_t original_size,
+                                    std::size_t decoder_bytes,
+                                    Clock::TimePoint now);
+    // For a block whose header waits for room: starts it if an incomplete block has been released
+    // since room was last looked for and its decoder now fits without displacing anything. Returns
+    // false if the block was dropped.
+    [[nodiscard]] bool StartIfRoom(const InboundRelayKey& key, InboundRelay& relay, Clock::TimePoint now);
     void MarkFinished(const InboundRelayKey& key, Clock::TimePoint now);
     void SettleInbound(std::uint64_t block_id, Clock::TimePoint now);
     [[nodiscard]] bool IsHandled(const InboundRelayKey& key) const;
@@ -336,14 +359,17 @@ private:
     InboundMap m_inbound{};
     std::size_t m_inbound_buffered_bytes{0};
     std::size_t m_inbound_decoder_bytes{0};
+    // Incomplete blocks released so far, so that a block waiting for room looks for it again only
+    // after one has been.
+    std::uint64_t m_inbound_releases{0};
     std::map<std::size_t, PeerInbound> m_peers{};
     // How long a handled block's remaining chunks, and other peers' copies of a block the node has
     // already answered for, are ignored; and how many such entries are kept.
     static constexpr std::chrono::milliseconds kHandledInboundLifetime{std::chrono::seconds{10}};
     static constexpr std::size_t kMaxHandledInbound = 256;
 
-    // One peer's blocks already handled, or refused for a header no honest sender produces, so
-    // that the sender's remaining chunks do not start a new incomplete block.
+    // One peer's blocks already handled or refused, so that the sender's remaining chunks do not
+    // start a new incomplete block.
     detail::RecentSet<InboundRelayKey, InboundRelayKeyHash> m_finished{kHandledInboundLifetime, kMaxHandledInbound};
     // Blocks about which the node gave an answer that holds for any copy (it has the block, the
     // parent is too far, or the node is not answering), so other peers' copies are not decoded and
