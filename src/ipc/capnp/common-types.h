@@ -7,12 +7,15 @@
 
 #include <clientversion.h>
 #include <interfaces/types.h>
+#include <logging.h>
 #include <primitives/transaction.h>
 #include <serialize.h>
 #include <streams.h>
 #include <univalue.h>
 
 #include <cstddef>
+#include <ios>
+#include <memory>
 #include <mp/proxy-types.h>
 #include <mp/type-chrono.h>
 #include <mp/type-context.h>
@@ -105,6 +108,32 @@ requires ipc::capnp::Deserializable<LocalType>
     SpanReader stream({data.begin(), data.end()});
     auto wrapper{ipc::capnp::Wrap(stream)};
     return read_dest.construct(::deserialize, wrapper);
+}
+
+//! Overload multiprocess library's CustomReadField hook to read missing, empty,
+//! or undecodable Data as a null CTransactionRef instead of throwing. Server
+//! methods taking an mp.Context argument run on an IPC worker thread, and the
+//! bundled libmultiprocess does not catch exceptions there, so a decoding error
+//! must not escape. Server methods with CTransactionRef arguments must reject
+//! null values. Use Priority<2> so this hook takes precedence over the generic
+//! std::shared_ptr hook.
+template <typename Input, typename ReadDest>
+decltype(auto) CustomReadField(TypeList<CTransactionRef>, Priority<2>, InvokeContext& invoke_context, Input&& input, ReadDest&& read_dest)
+{
+    return read_dest.update([&](CTransactionRef& value) {
+        value.reset();
+        if (!input.has() || input.get().size() == 0) return;
+        try {
+            ReadField(TypeList<CTransaction>(), invoke_context, input,
+                ReadDestEmplace(TypeList<CTransaction>(), [&](auto&&... args) -> auto& {
+                    value = std::make_shared<const CTransaction>(std::forward<decltype(args)>(args)...);
+                    return *value;
+                }));
+        } catch (const std::ios_base::failure& e) {
+            LogDebug(BCLog::IPC, "Could not deserialize transaction received over IPC: %s", e.what());
+            value.reset();
+        }
+    });
 }
 
 //! Overload CustomBuildField and CustomReadField to serialize UniValue

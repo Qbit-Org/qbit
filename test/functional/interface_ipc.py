@@ -236,6 +236,22 @@ class IPCInterfaceTest(BitcoinTestFramework):
             assert_equal(res.reason, "bad-version(0x00000000)")
             res = await template.result.submitSolution(ctx, block.nVersion, block.nTime, block.nNonce, coinbase.serialize())
             assert_equal(res.result, False)
+
+            self.log.debug("Submit a missing coinbase")
+            res = await template.result.submitSolution(context=ctx, version=block.nVersion, timestamp=block.nTime, nonce=block.nNonce)
+            assert_equal(res.result, False)
+            self.log.debug("Submit an empty coinbase")
+            res = await template.result.submitSolution(ctx, block.nVersion, block.nTime, block.nNonce, b"")
+            assert_equal(res.result, False)
+            for desc, coinbase_data in [("one byte", b"\x01"), ("a truncated", coinbase.serialize()[:-1])]:
+                self.log.debug(f"Submit {desc} coinbase that cannot be deserialized")
+                with self.nodes[0].assert_debug_log(["Could not deserialize transaction received over IPC"]):
+                    res = await template.result.submitSolution(ctx, block.nVersion, block.nTime, block.nNonce, coinbase_data)
+                assert_equal(res.result, False)
+            self.log.debug("The node keeps running and the template can still be used")
+            assert_equal(self.nodes[0].getblockcount(), current_block_height)
+            assert_equal(len((await template.result.getBlockHeader(ctx)).result), block_header_size)
+
             self.log.debug("Submit a valid block")
             block.nVersion = original_version
             block.solve()
