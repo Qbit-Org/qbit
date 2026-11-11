@@ -117,7 +117,7 @@ enum class P2MRKeyPoolRefillResult {
     //! The pending create-time top-up, if any, and both P2MR keypools reached -keypool.
     COMPLETE,
     //! The step limit was reached first, for example because addresses were
-    //! handed out as fast as the steps derived them.
+    //! handed out as fast as the steps derived them, or shutdown was requested.
     INCOMPLETE,
     //! A step failed; it logged why.
     FAILED,
@@ -126,7 +126,8 @@ enum class P2MRKeyPoolRefillResult {
 //! thread, so that the keys exist before the wallet is locked again: a locked
 //! wallet cannot derive P2MR keys. This runs the background refill steps one
 //! after another, each holding cs_wallet only briefly. It runs at most a fixed
-//! number of steps per pool, about twice what an empty pool needs.
+//! number of steps per pool, about twice what an empty pool needs, and stops
+//! early when shutdown is requested.
 P2MRKeyPoolRefillResult RefillP2MRKeyPoolsAfterUnlock(CWallet& wallet);
 std::unique_ptr<WalletDatabase> MakeWalletDatabase(const std::string& name, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error);
 //! The warning for an encrypted wallet whose rewrite after encryption is still pending.

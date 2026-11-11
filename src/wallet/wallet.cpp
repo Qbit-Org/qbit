@@ -719,33 +719,36 @@ P2MRKeyPoolRefillResult RefillP2MRKeyPoolsAfterUnlock(CWallet& wallet)
     const auto finish{[&](P2MRKeyPoolRefillResult result) {
         if (result == P2MRKeyPoolRefillResult::COMPLETE && steps_run == 0) return result;
         const char* outcome{result == P2MRKeyPoolRefillResult::COMPLETE   ? "completed" :
-                            result == P2MRKeyPoolRefillResult::INCOMPLETE ? "stopped at its step limit" :
+                            result == P2MRKeyPoolRefillResult::INCOMPLETE ? "stopped before the keypools were full" :
                                                                             "failed"};
         wallet.WalletLogPrintf("P2MR keypool refill after unlock %s after %d steps in %dms\n",
             outcome, steps_run, Ticks<std::chrono::milliseconds>(SteadyClock::now() - start));
         return result;
     }};
 
+    const auto stop{[&](int64_t steps) {
+        return steps == max_steps || (wallet.HaveChain() && wallet.chain().shutdownRequested());
+    }};
+
     try {
         // The refill step does not run while a create-time top-up is pending,
         // so finish that first.
         for (int64_t steps{0}; wallet.HasPendingInitialKeyPoolTopUp(); ++steps) {
-            if (steps == max_steps) return finish(P2MRKeyPoolRefillResult::INCOMPLETE);
+            if (stop(steps)) return finish(P2MRKeyPoolRefillResult::INCOMPLETE);
             ++steps_run;
             if (wallet.RunPendingInitialKeyPoolTopUpStep() == CWallet::PendingInitialKeyPoolTopUpStepResult::FAILED) {
                 return finish(P2MRKeyPoolRefillResult::FAILED);
             }
         }
         for (const bool internal : {false, true}) {
-            // A step on a full pool would only clear the flag of a background
-            // refill that may still be running, so skip it.
+            // Nothing to do for a full pool.
             {
                 LOCK(wallet.cs_wallet);
                 auto* spk_man{dynamic_cast<DescriptorScriptPubKeyMan*>(wallet.GetScriptPubKeyMan(OutputType::P2MR, internal))};
                 if (!spk_man || spk_man->P2MRReceiveKeyPoolFull()) continue;
             }
             for (int64_t steps{0};; ++steps) {
-                if (steps == max_steps) return finish(P2MRKeyPoolRefillResult::INCOMPLETE);
+                if (stop(steps)) return finish(P2MRKeyPoolRefillResult::INCOMPLETE);
                 ++steps_run;
                 const auto step_result{wallet.RunP2MRKeyPoolRefillStep(internal)};
                 if (step_result == CWallet::P2MRKeyPoolRefillStepResult::COMPLETE) break;

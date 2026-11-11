@@ -10,11 +10,9 @@ did the validation callbacks of all wallets, which on a busy node could also
 delay block connection.
 
 `walletpassphrase` still refills the P2MR keypools, including a pending
-initial top-up, to `-keypool` before it returns, and the unlock timeout still
-starts when the refill ends. It now derives the keys in short steps that each
-hold the wallet lock only briefly, so other RPCs on the wallet and the
-validation callbacks keep running meanwhile. Other keypools are still topped
-up before the call returns.
+initial top-up, before it returns (see the notes for #411). It now derives the
+keys in short steps that each hold the wallet lock only briefly, so most other
+RPCs on the wallet and the validation callbacks keep running meanwhile.
 
 Locking the wallet, through `walletlock`, qbit-qt or the `walletpassphrase`
 timeout, now waits for a background keypool step that is running, usually

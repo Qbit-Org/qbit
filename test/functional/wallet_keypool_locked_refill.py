@@ -13,6 +13,7 @@ With --previous-qbitd=<path to a v1.0.0 qbitd>, the test also creates a wallet
 with that binary on the same datadir and runs the cycles on it.
 """
 
+import os
 import time
 
 from test_framework.test_framework import BitcoinTestFramework
@@ -90,8 +91,11 @@ class WalletKeypoolLockedRefillTest(BitcoinTestFramework):
         elapsed, returned, info = self.unlock_and_check_keypool(wallet, timeout)
         self.log.info(f"  walletpassphrase refilled the keypool in {elapsed:.1f}s")
         # The deadline was set when the refill ended, under a second before the
-        # call returned, rather than when the call started.
+        # call returned. (When the refill takes more than a second or two, a
+        # deadline counted from the start of the call fails this check; the
+        # unit tests check the deadline exactly.)
         assert_greater_than_or_equal(info["unlocked_until"], int(returned) - 1 + timeout)
+        assert_greater_than_or_equal(int(returned) + timeout, info["unlocked_until"])
         self.wait_until(lambda: wallet.getwalletinfo()["unlocked_until"] == 0)
         self.hand_out_keypool_while_locked(wallet, set())
 
@@ -107,9 +111,15 @@ class WalletKeypoolLockedRefillTest(BitcoinTestFramework):
             return
         self.log.info("A wallet created by the previous release hands out -keypool addresses while locked, every cycle")
         node = self.nodes[0]
-        current_qbitd = node.args[0]
+        # Swap the qbitd binary in the node's command line, which can start
+        # with a wrapper such as valgrind.
+        qbitd_index = next((i for i, arg in enumerate(node.args) if os.path.basename(arg) in ("qbitd", "qbitd.exe")), None)
+        if qbitd_index is None:
+            self.log.info("Skipping the previous-release wallet check; the node is not started as qbitd")
+            return
+        current_qbitd = node.args[qbitd_index]
         self.stop_node(0)
-        node.args[0] = previous_qbitd
+        node.args[qbitd_index] = previous_qbitd
         self.start_node(0)
         node.createwallet(wallet_name="previous", passphrase=PASSPHRASE)
         wallet = node.get_wallet_rpc("previous")
@@ -120,7 +130,7 @@ class WalletKeypoolLockedRefillTest(BitcoinTestFramework):
         for _ in range(KEYPOOL_SIZE // 4):
             wallet.getnewaddress(address_type="p2mr")
         self.stop_node(0)
-        node.args[0] = current_qbitd
+        node.args[qbitd_index] = current_qbitd
         self.start_node(0)
         node.loadwallet("previous")
         self.run_cycles(node.get_wallet_rpc("previous"))

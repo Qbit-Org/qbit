@@ -1228,6 +1228,156 @@ BOOST_FIXTURE_TEST_CASE(WalletPassphraseTopsUpNonP2MRKeypoolInline, RegtestUnres
     WaitForDeleteWallet(std::move(wallet));
 }
 
+BOOST_FIXTURE_TEST_CASE(WalletPassphraseSchedulesRelockWhenRefillFails, RegtestP2MROnlyWalletTestingSetup, * boost::unit_test::timeout(TimeLimit(120)))
+{
+    constexpr int64_t keypool_size{2 * DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL + 4};
+    const std::string wallet_name{"walletpassphrase_failed_refill_test"};
+    const std::string passphrase{"test-passphrase"};
+    m_args.ForceSetArg("-keypool", util::ToString(keypool_size));
+
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+    context.scheduler = Assert(m_node.scheduler).get();
+
+    DatabaseOptions options;
+    options.require_create = true;
+    options.create_flags = WALLET_FLAG_DESCRIPTORS;
+    options.create_passphrase = SecureString{passphrase};
+
+    DatabaseStatus status;
+    bilingual_str error;
+    std::vector<bilingual_str> warnings;
+    auto wallet = CreateWallet(context, wallet_name, std::nullopt, options, status, error, warnings);
+    BOOST_REQUIRE(wallet);
+    BOOST_REQUIRE(wallet->IsLocked());
+    BOOST_REQUIRE(wallet->HasPendingInitialKeyPoolTopUp());
+    auto* external_spk_man = WITH_LOCK(wallet->cs_wallet, return dynamic_cast<DescriptorScriptPubKeyMan*>(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false)));
+    auto* internal_spk_man = WITH_LOCK(wallet->cs_wallet, return dynamic_cast<DescriptorScriptPubKeyMan*>(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/true)));
+    BOOST_REQUIRE(external_spk_man);
+    BOOST_REQUIRE(internal_spk_man);
+
+    constexpr int64_t now{1'800'000'000};
+    SetMockTime(now);
+    auto& scheduler{*Assert(m_node.scheduler)};
+    // Unlock with every top-up failing, then check that the relock is
+    // scheduled: lock the wallet by hand, release the scheduler and see the
+    // relock callback reset the deadline.
+    const auto check_relock_scheduled{[&] {
+        BOOST_CHECK(!wallet->IsLocked());
+        BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet, return wallet->nRelockTime), now);
+        BOOST_CHECK(wallet->HasPendingInitialKeyPoolTopUp());
+        BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+        BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+        external_spk_man->m_after_prepare_top_up = {};
+        internal_spk_man->m_after_prepare_top_up = {};
+        BOOST_REQUIRE(wallet->Lock());
+    }};
+
+    {
+        // A failed step: the RPC reports it, and the wallet relocks.
+        SchedulerBlocker blocker{scheduler};
+        external_spk_man->m_after_prepare_top_up = [] { throw std::runtime_error("injected top-up failure"); };
+        internal_spk_man->m_after_prepare_top_up = external_spk_man->m_after_prepare_top_up;
+        BOOST_CHECK_EXCEPTION(CallWalletPassphrase(context, wallet_name, passphrase, /*timeout=*/0), UniValue, [](const UniValue& e) {
+            return e.find_value("code").getInt<int>() == RPC_WALLET_ERROR;
+        });
+        check_relock_scheduled();
+    }
+    WaitForScheduler(scheduler);
+    BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet, return wallet->nRelockTime), 0);
+
+    {
+        // Any other exception still schedules the relock before it propagates.
+        SchedulerBlocker blocker{scheduler};
+        external_spk_man->m_after_prepare_top_up = [] { throw 42; };
+        internal_spk_man->m_after_prepare_top_up = external_spk_man->m_after_prepare_top_up;
+        BOOST_CHECK_THROW(CallWalletPassphrase(context, wallet_name, passphrase, /*timeout=*/0), int);
+        check_relock_scheduled();
+    }
+    WaitForScheduler(scheduler);
+    BOOST_CHECK_EQUAL(WITH_LOCK(wallet->cs_wallet, return wallet->nRelockTime), 0);
+
+    SetMockTime(0);
+    BOOST_CHECK(RemoveWallet(context, wallet, std::nullopt));
+    WaitForDeleteWallet(std::move(wallet));
+}
+
+BOOST_FIXTURE_TEST_CASE(WalletPassphraseRefillHoldsOffLocksButNotStaleRelocks, RegtestP2MROnlyWalletTestingSetup, * boost::unit_test::timeout(TimeLimit(120)))
+{
+    constexpr int64_t keypool_size{2 * DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL + 4};
+    const std::string wallet_name{"walletpassphrase_stale_relock_test"};
+    const std::string passphrase{"test-passphrase"};
+    m_args.ForceSetArg("-keypool", util::ToString(keypool_size));
+
+    WalletContext context;
+    context.args = &m_args;
+    context.chain = m_node.chain.get();
+    context.scheduler = Assert(m_node.scheduler).get();
+
+    DatabaseOptions options;
+    options.require_create = true;
+    options.create_flags = WALLET_FLAG_DESCRIPTORS;
+    options.create_passphrase = SecureString{passphrase};
+
+    DatabaseStatus status;
+    bilingual_str error;
+    std::vector<bilingual_str> warnings;
+    auto wallet = CreateWallet(context, wallet_name, std::nullopt, options, status, error, warnings);
+    BOOST_REQUIRE(wallet);
+    auto* external_spk_man = WITH_LOCK(wallet->cs_wallet, return dynamic_cast<DescriptorScriptPubKeyMan*>(wallet->GetScriptPubKeyMan(OutputType::P2MR, /*internal=*/false)));
+    BOOST_REQUIRE(external_spk_man);
+    auto& scheduler{*Assert(m_node.scheduler)};
+
+    // An earlier unlock, ended by walletlock, leaves its relock callback
+    // queued. Then one address is handed out while locked, so that the next
+    // unlock has a key to derive.
+    constexpr int64_t first_timeout{100};
+    CallWalletPassphrase(context, wallet_name, passphrase, first_timeout);
+    BOOST_REQUIRE_EQUAL(external_spk_man->GetKeyPoolSize(), keypool_size);
+    {
+        LOCK(wallet->m_relock_mutex);
+        BOOST_REQUIRE(wallet->Lock());
+        WITH_LOCK(wallet->cs_wallet, wallet->nRelockTime = 0);
+    }
+    BOOST_REQUIRE(wallet->GetNewDestination(OutputType::P2MR, ""));
+
+    // While the next unlock refills, make the stale callback due and see
+    // whether the scheduler thread runs past it, and start a lock that must
+    // wait for the refill.
+    std::atomic_bool scheduler_ran{false};
+    std::atomic_bool lock_returned_during_refill{false};
+    std::promise<void> lock_returned;
+    std::shared_future<void> lock_returned_future{lock_returned.get_future().share()};
+    std::thread lock_thread;
+    bool first_notification{true};
+    boost::signals2::scoped_connection connection{external_spk_man->NotifyCanGetAddressesChanged.connect([&] {
+        if (!std::exchange(first_notification, false)) return;
+        scheduler.MockForward(std::chrono::seconds{first_timeout});
+        std::promise<void> marker;
+        scheduler.scheduleFromNow([&marker] { marker.set_value(); }, std::chrono::milliseconds{0});
+        scheduler_ran = marker.get_future().wait_for(std::chrono::seconds{10}) == std::future_status::ready;
+        lock_thread = std::thread{[&] {
+            wallet->Lock();
+            lock_returned.set_value();
+        }};
+        lock_returned_during_refill = lock_returned_future.wait_for(std::chrono::milliseconds{500}) == std::future_status::ready;
+    })};
+    CallWalletPassphrase(context, wallet_name, passphrase, /*timeout=*/1000);
+    connection.disconnect();
+    BOOST_REQUIRE(lock_thread.joinable());
+    lock_thread.join();
+
+    BOOST_CHECK(scheduler_ran);
+    BOOST_CHECK(!lock_returned_during_refill);
+    // The lock came after the refill had finished.
+    BOOST_CHECK(wallet->IsLocked());
+    BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), keypool_size);
+
+    BOOST_CHECK(RemoveWallet(context, wallet, std::nullopt));
+    WaitForDeleteWallet(std::move(wallet));
+}
+
 BOOST_FIXTURE_TEST_CASE(BackgroundKeyPoolTopUpCommitFailurePausesWithoutAborting, RegtestP2MROnlyWalletTestingSetup, * boost::unit_test::timeout(TimeLimit(120)))
 {
     constexpr int64_t keypool_size{64};
@@ -1348,6 +1498,8 @@ BOOST_FIXTURE_TEST_CASE(RefillP2MRKeyPoolsAfterUnlockReportsFailuresAndStopsAtSt
         BOOST_REQUIRE(wallet->GetNewDestination(OutputType::P2MR, ""));
     }
     const unsigned int low_watermark{external_spk_man->GetKeyPoolSize()};
+    // As if a background refill had been queued meanwhile.
+    WITH_LOCK(wallet->cs_wallet, wallet->m_p2mr_receive_keypool_refill_scheduled = true);
     database.m_txn_commit_pass = false;
     BOOST_CHECK(RefillP2MRKeyPoolsAfterUnlock(*wallet) == P2MRKeyPoolRefillResult::FAILED);
     BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), low_watermark);

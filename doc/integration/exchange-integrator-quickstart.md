@@ -222,10 +222,13 @@ out only the deposit addresses already in its keypool, `-keypool` of them
 `Keypool ran out`, until the wallet is unlocked again. `walletpassphrase`
 refills the keypool before it returns. Call `keypoolrefill` before
 `walletlock` as well, so that addresses and change used while the wallet was
-unlocked are replaced before it locks. Deriving P2MR keys takes roughly 15 ms
-each, and `keypoolrefill` makes other calls on the wallet wait until it
-finishes, so allow for it in the unlock timeout. If you hand out more deposit
-addresses between unlocks than the keypool holds, raise `-keypool`.
+unlocked are replaced before it locks. Deriving a P2MR key takes roughly
+15 ms, and `keypoolrefill` holds the wallet lock until it has derived every
+missing key: other calls on the wallet wait, and on a busy node the processing
+of new blocks and transactions can wait too. Call it as part of each unlock,
+so that only the keys used since the last refill are missing, and allow for it
+in the unlock timeout. If you hand out more deposit addresses between unlocks
+than the keypool holds, raise `-keypool`.
 
 P2MR signatures are large, and qbit does not apply a Bitcoin-style witness
 discount. Withdrawal batching, consolidation, and fee policies must be tested
