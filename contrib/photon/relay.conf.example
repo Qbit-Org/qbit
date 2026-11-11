@@ -30,7 +30,9 @@ rpc_port = 8352
 # your qbitd instance uses another chain, datadir, or compatibility path.
 rpc_cookiefile = /var/lib/qbit/.cookie
 
-# RPC timeout in milliseconds.
+# RPC deadline in milliseconds: the total time allowed for each call to qbitd
+# (sending and receiving), and for the whole check made before a relayed block
+# is submitted.
 rpc_timeout_ms = 5000
 
 [peer.primary]
