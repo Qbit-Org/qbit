@@ -371,6 +371,7 @@ void RelayEngine::OnBlockHeader(const InboundPeerInfo& inbound_peer,
     }
     existing = m_inbound.find(key);
     InboundRelay& relay = existing != m_inbound.end() ? existing->second : CreateInbound(key, now);
+    relay.last_updated = now;
     if (StartDecoder(key, relay, params, original_size, decoder_bytes, now)) {
         TryFinalizeInbound(key, relay, submitter);
     }
@@ -770,7 +771,6 @@ bool RelayEngine::StartDecoder(const InboundRelayKey& key,
     }
     relay.waiting.reset();
     relay.params = params;
-    relay.last_updated = now;
     ChargeDecoder(key, relay, decoder_bytes);
 
     for (const fec::Chunk& chunk : relay.buffered_chunks) {
@@ -1241,16 +1241,14 @@ bool RelayEngine::FeedChunk(const InboundRelayKey& key, InboundRelay& relay, con
     };
 
     if (!relay.decoder.has_value()) {
-        // A block whose header waits for room was counted as refused once, for its header. Its
-        // chunks must fit that header; those that cannot be kept are not counted again.
+        // The chunks of a block whose header waits for room must fit that header.
         const bool waiting = relay.waiting.has_value();
         if (waiting && (chunk.coding_group_id >= relay.waiting->coding_group_count || chunk.chunk_id >= fec::FEC_TOTAL_CHUNKS)) {
             return drop_block();
         }
-        if (relay.buffered_chunks.size() >= m_config.max_inbound_buffered_chunks_per_entry) {
-            if (!waiting) {
-                RejectInbound(key.slot_index);
-            }
+        const bool full = relay.buffered_chunks.size() >= m_config.max_inbound_buffered_chunks_per_entry;
+        if (full && !waiting) {
+            RejectInbound(key.slot_index);
             return true;
         }
         const bool repeated = std::any_of(relay.buffered_chunks.begin(), relay.buffered_chunks.end(), [&chunk](const fec::Chunk& held) {
@@ -1260,9 +1258,22 @@ bool RelayEngine::FeedChunk(const InboundRelayKey& key, InboundRelay& relay, con
             // Not progress, and nothing new to keep.
             return true;
         }
-        if (!HasGlobalInboundBufferCapacity()) {
+        if (full || !HasGlobalInboundBufferCapacity()) {
             if (!waiting) {
                 RejectInbound(key.slot_index);
+                return true;
+            }
+            // A waiting block was counted as refused once, for its header; the chunks it cannot
+            // keep are not counted again. A sender sends each chunk once, so once more of them
+            // are lost here than all its coding groups have parity chunks, some group can no
+            // longer be completed: the block then ends as if its header had been refused.
+            WaitingHeader& header = *relay.waiting;
+            ++header.dropped;
+            const std::size_t parity_per_group = static_cast<std::size_t>(header.params.total_chunks - header.params.data_chunks);
+            if (header.dropped > header.coding_group_count * parity_per_group) {
+                EraseInbound(key);
+                MarkFinished(key, now);
+                return false;
             }
             return true;
         }

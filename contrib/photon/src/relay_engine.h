@@ -240,6 +240,8 @@ private:
         std::size_t decoder_bytes{0};
         // m_inbound_releases when room was last looked for.
         std::uint64_t releases{0};
+        // Chunks that could not be kept meanwhile.
+        std::size_t dropped{0};
     };
 
     struct InboundRelay {
@@ -309,7 +311,7 @@ private:
     InboundRelay& CreateInbound(const InboundRelayKey& key, Clock::TimePoint now);
     void ChargeDecoder(const InboundRelayKey& key, InboundRelay& relay, std::size_t bytes);
     // Builds the decoder of a block that has room for it and gives it the chunks buffered so far.
-    // Returns false if the block was dropped instead.
+    // Returns false if the block was dropped instead. Does not count as progress.
     [[nodiscard]] bool StartDecoder(const InboundRelayKey& key,
                                     InboundRelay& relay,
                                     fec::Parameters params,
