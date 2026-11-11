@@ -1632,8 +1632,8 @@ void TestSettleUsesTimeAfterNodeCalls()
     MockClock clock{};
     RelayEngine engine(clock);
     CapturingSubmitter submitter;
-    submitter.parent_result = ParentCheck::kUnavailable;
-    // The node takes longer to (not) answer than the settle lifetime.
+    submitter.parent_result = ParentCheck::kAlreadyKnown;
+    // The node takes longer to answer than the settle lifetime.
     submitter.check_hook = [&clock] { clock.Advance(std::chrono::seconds{11}); };
 
     const TestBlock block = EncodeTestBlock(300, 0xF810);
@@ -1641,7 +1641,7 @@ void TestSettleUsesTimeAfterNodeCalls()
     submitter.check_hook = {};
     clock.Advance(std::chrono::seconds{1});
     DeliverBlock(engine, kPeer1, block, submitter);
-    Require(submitter.check_calls == 1, "a copy right after a slow failed check should not be checked again");
+    Require(submitter.check_calls == 1, "a copy right after a slow check should not be checked again");
 }
 
 void TestUnknownParentEndsOnlyThatCopy()
@@ -2224,10 +2224,12 @@ void TestUnknownParentRaceStaysNeutral()
     DeliverBlock(engine, kPeer0, child, submitter, BlockIdOf(child.bytes));
     Require(submitter.submit_calls == 0 && engine.stats().blocks_parent_unknown == 1, "the block should be dropped");
 
-    // The parent, then the block, reach qbitd over P2P, and qbitd announces them.
+    // The parent, then the block, reach qbitd over P2P, and qbitd announces them; the relay sends
+    // both on.
     const std::vector<std::uint8_t> parent = MakeBlock(300, 0xB421);
     engine.OnNewBlock(HashOf(parent), parent);
     engine.OnNewBlock(HashOf(child.bytes), child.bytes);
+    Require(engine.stats().blocks_relayed_out == 2, "both blocks should be relayed out");
 
     // The peer's next block is used.
     clock.Advance(std::chrono::seconds{20});
@@ -2366,16 +2368,65 @@ void TestUnansweredBlockTriedOnceMore()
         Require(submitter.check_calls == checks, "a paused peer's held block should not be retried");
         Require(engine.stats().held_blocks_dropped == 2, "the paused peer's block should be counted");
     }
+    // A child of the held block, checked while the block is held, does not count against its sender.
+    {
+        MockClock clock{};
+        RelayEngine engine(clock);
+        CapturingSubmitter submitter;
+        submitter.parent_result = ParentCheck::kUnavailable;
+        const TestBlock held = EncodeTestBlock(500, 0xB581);
+        DeliverBlock(engine, kPeer0, held, submitter);
+
+        TestBlock child = EncodeTestBlock(300, 0xB582);
+        const std::string held_hash = HashOf(held.bytes);
+        for (std::size_t i = 0; i < 32; ++i) {
+            child.bytes[4 + i] = static_cast<std::uint8_t>(std::stoul(held_hash.substr((31 - i) * 2, 2), nullptr, 16));
+        }
+        child.prefix = PrefixOf(child.bytes);
+        child.encoded = photon::fec::Encoder(photon::fec::Parameters::FromDataChunkCount(2)).Encode(child.bytes);
+        Require(photon::ReadBlockHeaderSummary(child.bytes)->prev_hash_hex == held_hash, "child should build on the held block");
+
+        submitter.parent_result = ParentCheck::kUnknown;
+        DeliverBlock(engine, kPeer1, EncodeTestBlock(300, 0xB583), submitter); // uses the peer's allowance
+        DeliverBlock(engine, kPeer1, child, submitter);
+        Require(PeerStats(engine, 1).faults == 0, "a child of the held block should not count against its sender");
+    }
+    // A copy in progress when the block is held: the rest of its chunks are ignored, even after a
+    // retry that leaves other copies free to be tried.
+    {
+        MockClock clock{};
+        RelayEngine engine(clock);
+        CapturingSubmitter submitter;
+        const TestBlock block = EncodeTestBlock(500, 0xB591);
+        const std::uint64_t id = BlockIdOf(block.bytes);
+        engine.OnBlockHeader(kPeer1, BuildHeaderPayload(block.encoded, id, block.bytes.size()), submitter);
+        engine.OnBlockChunk(kPeer1, BuildChunkPayload(block.encoded.chunks[0], id), submitter);
+        submitter.parent_result = ParentCheck::kUnavailable;
+        DeliverBlock(engine, kPeer0, block, submitter, id);
+        Require(engine.stats().inbound_entries == 0, "the copy in progress should be dropped when the block is held");
+
+        submitter.parent_result = ParentCheck::kNearTip;
+        submitter.submit_result = SubmitOutcome::kRejected;
+        node_announces_block(engine, 0xB592);
+        engine.RetryHeldBlock(submitter);
+        Require(engine.stats().submit_rejected == 1, "the retried copy should be rejected");
+        engine.OnBlockChunk(kPeer1, BuildChunkPayload(block.encoded.chunks[1], id), submitter);
+        Require(engine.stats().inbound_entries == 0, "the dropped copy's remaining chunks must not start a new block");
+    }
     // A newer block replaces the held one.
     {
         MockClock clock{};
         RelayEngine engine(clock);
         CapturingSubmitter submitter;
         submitter.parent_result = ParentCheck::kUnavailable;
-        DeliverBlock(engine, kPeer0, EncodeTestBlock(500, 0xB571), submitter);
+        const TestBlock replaced = EncodeTestBlock(500, 0xB571);
+        DeliverBlock(engine, kPeer0, replaced, submitter);
         const TestBlock newer = EncodeTestBlock(500, 0xB572);
         DeliverBlock(engine, kPeer1, newer, submitter);
         Require(engine.stats().held_blocks_dropped == 1, "the replaced block should be counted");
+        // A late copy of the replaced block is not sent to the node again right away.
+        DeliverBlock(engine, kPeer2, replaced, submitter);
+        Require(submitter.check_calls == 2, "a replaced block's copy should not be checked again at once");
         submitter.parent_result = ParentCheck::kNearTip;
         node_announces_block(engine, 0xB573);
         engine.RetryHeldBlock(submitter);
@@ -2417,6 +2468,12 @@ void TestHeldBlockRetryOutcomes()
         Require(PeerStats(engine, 0).faults == test_case.faults,
                 std::string("retry outcome ") + photon::ParentCheckName(test_case.parent) + "/" +
                     photon::SubmitOutcomeName(test_case.submit) + " charged wrongly");
+
+        // A retry with an unknown parent does not use up the peer's allowance.
+        if (test_case.parent == ParentCheck::kUnknown) {
+            DeliverBlock(engine, kPeer0, EncodeTestBlock(500, ++seed), submitter);
+            Require(PeerStats(engine, 0).faults == 0, "the peer's allowance should be left for its next block");
+        }
 
         // An outcome that concerns only this copy leaves other peers' copies to be tried.
         if (test_case.submit == SubmitOutcome::kRejected) {

@@ -955,12 +955,13 @@ void RelayEngine::CheckAndSubmit(const InboundRelayKey& key,
         return;
     case ParentCheck::kUnknown: {
         // The node may not have the parent yet (it may still be on its way over P2P), so one such
-        // block per peer per decay interval is not the peer's fault; more than that is. A held
-        // block is not counted, as its retry may come late.
+        // block per peer per decay interval is not the peer's fault; more than that is. Neither a
+        // held block's retry, which may come late, nor a child of the held block is counted.
         ++m_stats.blocks_parent_unknown;
         LogUnusedBlock(checked_at, slot, block, "parent unknown to qbitd");
         PeerInbound& peer = Peer(slot);
-        if (!retry) {
+        const bool parent_held = m_held.has_value() && m_held->summary.hash_hex == summary.prev_hash_hex;
+        if (!retry && !parent_held) {
             if (peer.unknown_parent_allowed_at.has_value() &&
                 checked_at - *peer.unknown_parent_allowed_at < m_config.peer_fault_decay_interval) {
                 RecordFault(slot, checked_at);
@@ -1048,8 +1049,16 @@ void RelayEngine::HoldBlock(const InboundRelayKey& key,
     if (m_held.has_value()) {
         DropHeldBlock(now, "dropped while waiting for qbitd: replaced by a newer block");
     }
-    // Other copies in progress are dropped now; later ones are ignored while this one is held.
-    EraseInboundForPrefix(block_id);
+    // Other copies in progress are dropped now, and the rest of their chunks ignored; later copies
+    // are ignored while this one is held.
+    for (auto it = m_inbound.begin(); it != m_inbound.end();) {
+        if (it->first.hash_prefix != block_id) {
+            ++it;
+            continue;
+        }
+        MarkFinished(it->first, now);
+        it = EraseInboundAt(it, /*evicted=*/false);
+    }
     m_held = HeldBlock{
         .key = key,
         .block_id = block_id,
@@ -1064,6 +1073,8 @@ void RelayEngine::DropHeldBlock(Clock::TimePoint now, const char* reason)
 {
     ++m_stats.held_blocks_dropped;
     LogUnusedBlock(now, m_held->key.slot_index, m_held->summary.hash_hex, reason);
+    // As for any block the node did not answer for, other copies are not sent to it for a while.
+    m_settled.Insert(m_held->block_id, now);
     m_held.reset();
 }
 

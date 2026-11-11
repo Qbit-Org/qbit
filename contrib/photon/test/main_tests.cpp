@@ -487,9 +487,10 @@ void TestHashNotificationSendsChunksToPeer()
     CHECK(SentMessage(transport_state->sent_packets, photon::MessageType::kBlockChunk));
 }
 
-// Feeds a peer's block into the main loop. With `first_check_unanswered`, qbitd does not answer the
-// first parent check and announces a block some loop iterations later.
-void RunInboundBlockThroughApp(bool first_check_unanswered)
+// Feeds a peer's block into the main loop, announced under this version's identifier or, with
+// `earlier_form`, under the form earlier versions use. With `first_check_unanswered`, qbitd does not
+// answer the first parent check and announces a block some loop iterations later.
+void RunInboundBlockThroughApp(bool first_check_unanswered, bool earlier_form)
 {
     ArgvBuilder args({"qbit-photon"});
     std::ostringstream out;
@@ -511,7 +512,8 @@ void RunInboundBlockThroughApp(bool first_check_unanswered)
     }
     const auto summary = photon::ReadBlockHeaderSummary(block);
     CHECK(summary.has_value());
-    const std::uint64_t kHashPrefix = photon::BlockIdFromHex(summary.has_value() ? summary->hash_hex : std::string{});
+    const std::string block_hash = summary.has_value() ? summary->hash_hex : std::string{};
+    const std::uint64_t kHashPrefix = earlier_form ? photon::HashPrefixFromHex(block_hash) : photon::BlockIdFromHex(block_hash);
 
     const auto listener_state = std::make_shared<ListenerState>();
     const auto rpc_state = std::make_shared<RpcState>();
@@ -602,12 +604,13 @@ void RunInboundBlockThroughApp(bool first_check_unanswered)
 
 void TestInboundChunksTriggerSubmitBlock()
 {
-    RunInboundBlockThroughApp(/*first_check_unanswered=*/false);
+    RunInboundBlockThroughApp(/*first_check_unanswered=*/false, /*earlier_form=*/false);
+    RunInboundBlockThroughApp(/*first_check_unanswered=*/false, /*earlier_form=*/true);
 }
 
 void TestUnansweredBlockRetriedByMainLoop()
 {
-    RunInboundBlockThroughApp(/*first_check_unanswered=*/true);
+    RunInboundBlockThroughApp(/*first_check_unanswered=*/true, /*earlier_form=*/false);
 }
 
 void TestMalformedUdpParseErrorsAreRateLimited()

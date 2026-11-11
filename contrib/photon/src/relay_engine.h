@@ -78,7 +78,7 @@ struct RelayStats {
     std::uint64_t submit_errors{0};
     // Reconstructed blocks dropped before submission.
     std::uint64_t blocks_mismatched{0};
-    // Parent too far from the best block (counts against the peer) or unknown to qbitd (does not).
+    // Parent too far from the best block, and parent unknown to qbitd.
     std::uint64_t blocks_parent_rejected{0};
     std::uint64_t blocks_parent_unknown{0};
     std::uint64_t block_checks_unavailable{0};
