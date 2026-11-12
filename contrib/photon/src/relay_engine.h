@@ -45,8 +45,13 @@ struct RelayEngineConfig {
     // A reconstructed block is submitted only if its parent is within this many blocks of the
     // node's best block (see RpcClient::CheckParent).
     std::uint32_t max_parent_depth{6};
+    // One reconstructed block that qbitd did not answer for (parent check or submitblock) is kept
+    // and tried once more after qbitd next answers or announces a block, for at most this long.
+    std::chrono::milliseconds held_block_lifetime{std::chrono::minutes{2}};
     // Per peer slot: each failed block adds one point, each accepted block removes
     // peer_fault_success_credit points, and one point decays every peer_fault_decay_interval.
+    // A block whose parent qbitd does not know adds a point only if the peer already had one let
+    // off within the last peer_fault_decay_interval.
     // Reaching peer_fault_threshold refuses the slot's inbound blocks for peer_suspend_initial,
     // doubling on each repeat up to peer_suspend_max.
     std::uint32_t peer_fault_threshold{8};
@@ -73,9 +78,17 @@ struct RelayStats {
     std::uint64_t submit_errors{0};
     // Reconstructed blocks dropped before submission.
     std::uint64_t blocks_mismatched{0};
+    // Parent too far from the best block, and parent unknown to qbitd.
     std::uint64_t blocks_parent_rejected{0};
+    std::uint64_t blocks_parent_unknown{0};
     std::uint64_t block_checks_unavailable{0};
     std::uint64_t blocks_node_behind{0};
+    // Reconstructed blocks submitted while qbitd had their parent's header but had not connected it.
+    std::uint64_t blocks_parent_pending{0};
+    // Blocks sent to qbitd once more after it did not answer for them, and held blocks dropped
+    // without that (replaced by a newer one, expired, or their peer paused).
+    std::uint64_t node_retries{0};
+    std::uint64_t held_blocks_dropped{0};
     std::uint64_t inbound_rejected{0};
     std::uint64_t inbound_evictions{0};
     std::uint64_t peer_suspensions{0};
@@ -116,6 +129,14 @@ struct BlockHeaderSummary {
 /// Reads the header of a serialized block. Returns nullopt when the data is too short to be a block.
 [[nodiscard]] std::optional<BlockHeaderSummary> ReadBlockHeaderSummary(std::span<const std::uint8_t> block_data);
 
+/// The identifier a block is announced under: the low-order 64 bits of its hash, which are the last
+/// 16 digits of its display-order hex. Proof of work constrains the leading bits of a block hash,
+/// not these. Returns 0 unless `hash_hex` is 64 hex digits.
+[[nodiscard]] std::uint64_t BlockIdFromHex(const std::string& hash_hex);
+
+/// The leading 64 bits of a block hash (the first 16 digits of its display-order hex). Earlier
+/// versions announced blocks under this value; it is still accepted from peers. Returns 0 when
+/// `hash_hex` does not start with 16 hex digits.
 [[nodiscard]] std::uint64_t HashPrefixFromHex(const std::string& hash_hex);
 
 namespace detail {
@@ -178,6 +199,9 @@ public:
                       const BlockChunkPayload& payload,
                       BlockSubmitter& submitter);
     void PumpOutbound(PacketSink& sink, PeerManager& peer_manager);
+    /// Tries the held block (see RelayEngineConfig::held_block_lifetime) once more if qbitd has
+    /// answered or announced a block since it was held. Call regularly.
+    void RetryHeldBlock(BlockSubmitter& submitter);
 
     [[nodiscard]] const RelayStats& stats() const
     {
@@ -219,6 +243,7 @@ private:
     };
 
     struct InboundRelayKey {
+        // The identifier the block was announced under, in either form (see BlockIdFromHex).
         std::uint64_t hash_prefix{0};
         std::size_t slot_index{0};
         std::uint64_t remote_session_id{0};
@@ -234,6 +259,8 @@ private:
         Clock::TimePoint fault_decay_from{};
         Clock::TimePoint suspended_until{};
         std::uint32_t suspension_level{0};
+        // When the peer last had a block with an unknown parent let off (see CheckAndSubmit).
+        std::optional<Clock::TimePoint> unknown_parent_allowed_at{};
         PeerRelayStats stats{};
     };
 
@@ -247,8 +274,18 @@ private:
 
     using InboundMap = std::unordered_map<InboundRelayKey, InboundRelay, InboundRelayKeyHash>;
 
-    void RememberSeen(std::uint64_t hash_prefix);
-    [[nodiscard]] bool IsKnown(std::uint64_t hash_prefix) const;
+    // A reconstructed block that qbitd did not answer for, kept for one more try.
+    struct HeldBlock {
+        InboundRelayKey key{};
+        std::uint64_t block_id{0};
+        BlockHeaderSummary summary{};
+        std::vector<std::uint8_t> block{};
+        Clock::TimePoint held_at{};
+        std::uint64_t node_answers{0};
+    };
+
+    void RememberSeen(std::uint64_t block_id);
+    [[nodiscard]] bool IsKnown(std::uint64_t block_id) const;
     [[nodiscard]] bool HasGlobalInboundBufferCapacity() const;
     [[nodiscard]] PeerInbound& Peer(std::size_t slot_index);
     void RejectInbound(std::size_t slot_index);
@@ -261,17 +298,34 @@ private:
     InboundRelay& CreateInbound(const InboundRelayKey& key, Clock::TimePoint now);
     void ChargeDecoder(const InboundRelayKey& key, InboundRelay& relay, std::size_t bytes);
     void MarkFinished(const InboundRelayKey& key, Clock::TimePoint now);
-    void SettleInbound(std::uint64_t hash_prefix, Clock::TimePoint now);
+    void SettleInbound(std::uint64_t block_id, Clock::TimePoint now);
     [[nodiscard]] bool IsHandled(const InboundRelayKey& key) const;
     void LogUnusedBlock(Clock::TimePoint now, std::size_t slot_index, const std::string& block, const char* reason);
     void UpdateUsageStats();
     void EvictExpiredInbound(Clock::TimePoint now);
     InboundMap::iterator EraseInboundAt(InboundMap::iterator it, bool evicted);
     void EraseInbound(const InboundRelayKey& key);
-    void EraseInboundForPrefix(std::uint64_t hash_prefix);
+    // Erases incomplete blocks announced under `hash_prefix`; with `finished_at`, the rest of their
+    // chunks are ignored as well.
+    void EraseInboundForPrefix(std::uint64_t hash_prefix, std::optional<Clock::TimePoint> finished_at = std::nullopt);
     void EraseInboundForSlot(std::size_t slot_index);
     void ClearBufferedChunks(InboundRelay& relay);
     void TryFinalizeInbound(const InboundRelayKey& key, InboundRelay& relay, BlockSubmitter& submitter);
+    void CheckAndSubmit(const InboundRelayKey& key,
+                        std::vector<std::uint8_t> block_data,
+                        const BlockHeaderSummary& summary,
+                        BlockSubmitter& submitter,
+                        bool retry);
+    void HoldBlock(const InboundRelayKey& key,
+                   std::uint64_t block_id,
+                   const BlockHeaderSummary& summary,
+                   std::vector<std::uint8_t> block_data,
+                   Clock::TimePoint now);
+    void DropHeldBlock(Clock::TimePoint now, const char* reason, bool settle);
+    void RetryHeld(BlockSubmitter& submitter);
+    void ExpireHeldBlock(Clock::TimePoint now);
+    [[nodiscard]] bool IsHeld(std::uint64_t block_id) const;
+    void NoteIgnoredCopy(const InboundRelayKey& key, Clock::TimePoint now);
     [[nodiscard]] bool FeedChunk(const InboundRelayKey& key, InboundRelay& relay, const BlockChunkPayload& payload);
 
     const Clock& m_clock;
@@ -295,9 +349,20 @@ private:
     // parent is too far, or the node is not answering), so other peers' copies are not decoded and
     // sent to the node again. Unlike the seen set, this does not stop the relay from sending the
     // block on when its own node announces it.
+    // Keyed by BlockIdFromHex of the block hash, whichever form a copy was announced under. A held
+    // block dropped without a retry (replaced or expired) is settled too.
     detail::RecentSet<std::uint64_t> m_settled{kHandledInboundLifetime, kMaxHandledInbound};
+    // While a block is held, other copies of it under the identifier this version announces are
+    // ignored as if settled; copies under the earlier form are recognised once decoded.
+    std::optional<HeldBlock> m_held{};
+    // Counts qbitd's answers and block announcements, so a held block is tried again only once qbitd
+    // is answering.
+    std::uint64_t m_node_answers{0};
+    // Whether the last parent check or submitblock got an answer from qbitd.
+    bool m_last_node_call_answered{true};
     std::map<std::string, LogRateLimiter> m_unused_block_logs{};
 
+    // Blocks relayed out or accepted, keyed by BlockIdFromHex of the block hash.
     std::deque<std::uint64_t> m_seen_order{};
     std::unordered_set<std::uint64_t> m_seen_set{};
 };
