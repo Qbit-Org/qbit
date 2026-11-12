@@ -21,21 +21,28 @@ updated library also performs consensus signature verification; keys,
 signatures, and verification results are unchanged.
 Fixes merged during release testing keep loaded wallet files locked, make a
 `send` whose coins a concurrent call spent fail instead of reporting success,
-resume pending P2MR keypool refills at startup and run them in the background
-after `walletpassphrase`, remove deleted unencrypted keys from the wallet
-file right after encryption, re-encrypt the PQC keys that v1.0.0 left
-unencrypted in encrypted wallets, keep more small change when no fee estimate
-is available, keep PSBT signing results across shutdown, keep a wallet locked
-or unlocked when `walletpassphrasechange` changes its passphrase, stop
-qbit-qt from aborting when accessibility tools press Send again during a send
-confirmation, make it ignore Sign pressed the same way while a PSBT is being
-signed, keep it responding while an `encryptwallet` call runs, make it wait
-for open dialogs before it quits or unloads a wallet, update the GUI release
-builds to Qt 6.8.4, and add debug symbol archives for macOS. Nodes now take
-the `NODE_WITNESS_PRUNED` service flag only from a peer's own `version`
-message, and the qbit-photon block relay bounds the inbound state each peer
-can hold and checks blocks before it submits them.
-It adds one standardness rule for P2MR spends, but contains no consensus rule
+resume pending P2MR keypool refills at startup, let `walletpassphrase` refill
+P2MR keypools without holding the wallet lock, remove deleted unencrypted keys
+from the wallet file right after encryption, make wallet encryption fail when
+an unencrypted descriptor key record cannot be removed, re-encrypt the PQC keys
+that v1.0.0 left unencrypted in encrypted wallets, keep more small change when
+no fee estimate is available, keep PSBT signing results across shutdown, keep a
+wallet locked or unlocked when `walletpassphrasechange` changes its passphrase,
+stop qbit-qt from aborting when accessibility tools press Send again during a
+send confirmation, make it ignore Sign pressed the same way while a PSBT is
+being signed, keep it responding while an `encryptwallet` call runs, make it
+wait for open dialogs before it quits or unloads a wallet, update the GUI
+release builds to Qt 6.8.4, and add debug symbol archives for macOS. Nodes now
+take the `NODE_WITNESS_PRUNED` service flag only from a peer's own `version`
+message, budget the time they spend validating each peer's transactions that
+are then rejected, attribute each received block to the peer that sent it, and
+check blocks fetched to restore pruned witness data before they store them. The
+qbit-photon block relay bounds the inbound state each peer can hold, checks
+blocks before it submits them, and announces blocks under the low-order bits of
+their hash, so that it no longer skips most native-lane blocks.
+`submitSolution` on the IPC mining interface returns false for a missing or
+unreadable coinbase, and qbit-qt adds a play-money poker game.
+It adds two standardness rules for P2MR spends, but contains no consensus rule
 change, no scheduled network activation, and no change to the mainnet or
 testnet4 network identity. The wallet database format is unchanged apart from
 one new record, which v1.0.0 ignores.
@@ -50,6 +57,8 @@ installing v1.0.1. Then install the new binaries from the GitHub Release page.
 
 Existing v1.0.0 mainnet and testnet4 data directories, wallets, and wallet
 backups continue to work without a reindex, chain reset, or wallet migration.
+
+If a node reports a block as invalid that its peers accept, run `reconsiderblock <hash>` after upgrading.
 
 If you encrypted a wallet with v1.0.0, especially soon after creating it, its
 file may still hold unencrypted PQC private keys, which anyone with the file
@@ -77,7 +86,7 @@ directory, which may be on another filesystem (#300).
 Downgrading to v1.0.0 remains possible. This release adds one wallet record,
 which v1.0.0 ignores, so v1.0.0 can still open wallets and data directories
 that v1.0.1 has used, but a downgraded node loses the fixes in this release,
-including the wallet encryption fixes (#277, #300, #301).
+including the wallet encryption fixes (#277, #300, #301, #418).
 
 On Linux, replace the installed `qbit`, `qbitd`, `qbit-qt`, `qbit-cli`,
 `qbit-tx`, `qbit-util`, and `qbit-wallet` binaries from the archive's `bin`
@@ -126,6 +135,33 @@ Behavior changes to review before upgrading
   contains it is still accepted, and nodes running v1.0.0 still relay it.
   Wallet signing and PSBT finalization check the same standard rules and
   report such a spend as incomplete (#263, refs #257).
+- Standard policy now also limits hashing of large P2MR v1 stack elements.
+  Each `OP_RIPEMD160`, `OP_SHA1`, `OP_SHA256`, `OP_HASH160`, or `OP_HASH256`
+  that a P2MR v1 script applies to a stack element longer than 520 bytes
+  costs one unit per started 64-byte block of the element, from a per-input
+  budget equal to the input's initial validation weight, separate from the
+  signature charges. A spend that exceeds the budget is rejected with the
+  reject reason `mempool-script-verify-flag-failed (Standard P2MR hashing
+  limit exceeded)`. Elements that fit in a pushed literal cost nothing, so
+  only scripts that hash initial witness items longer than 520 bytes are
+  affected. Such a spend is still consensus-valid, so a block that contains
+  it is still accepted, and nodes running v1.0.0 still relay it. Wallet
+  signing and PSBT finalization check the same standard rules and report
+  such a spend as incomplete (#415).
+- Nodes now budget the time they spend validating a peer's transactions that
+  are then rejected for a reason in the transaction itself, including the
+  two P2MR standardness rules above. A peer over its budget is not
+  disconnected or discouraged, but until the budget refills its
+  transactions are dropped without validation and requested from other
+  peers, and no transactions are requested from it; afterwards, those it
+  announced or sent meanwhile are requested from it unless the node already
+  has them. Peers with the `noban` permission and manual connections are
+  exempt. The budget can be changed only with the debug option
+  `-txvalidationbudget=<peer_rate>,<peer_cap>,<pool_rate>,<pool_cap>`
+  (in microseconds; default `500,100000,50000,500000`; `0` disables it),
+  which is meant for tests and is listed only by `-help-debug`; a malformed
+  value stops the node at startup (see "Mempool, P2P, and PQC library
+  hardening") (#386, #422, fixes #275).
 - `submitSolution` on the IPC mining interface (`qbit-node -ipcbind`) now
   rejects blocks that fail the coinbase witness checks it used to skip (see
   Mining interface). IPC clients must submit the complete coinbase,
@@ -141,11 +177,16 @@ Behavior changes to review before upgrading
   while it was signing. Callers that run `send` concurrently on one wallet
   should expect this error; the call can be retried (see Wallet fixes) (#298,
   fixes #281).
-- `walletpassphrase` now returns before P2MR keypools are refilled, and the
-  refill continues in the background while the wallet stays unlocked. Scripts
-  that read `keypoolsize` or `keypoolsize_hd_internal` from `getwalletinfo`
-  right after `walletpassphrase` may see a value below `-keypool` until the
-  refill finishes (#299, fixes #304).
+- `walletpassphrase` refills the P2MR keypools to `-keypool` before it
+  returns, as v1.0.0 did, and the unlock timeout counts from the end of the
+  refill, so even a short timeout leaves the keypools full. The refill no
+  longer holds the wallet lock, so most other calls on the wallet keep
+  working, but `walletlock`, `walletpassphrasechange`, another
+  `walletpassphrase`, `unloadwallet`, rescans, and descriptor imports on that
+  wallet wait until it has finished. If the refill fails, `walletpassphrase`
+  now returns error code `-4` (`RPC_WALLET_ERROR`), and the wallet stays
+  unlocked until the timeout or `walletlock` (see Wallet fixes) (#299, #411,
+  fixes #304).
 - `keypoolrefill` now reports a failed database commit with error code `-4`
   (`RPC_WALLET_ERROR`) instead of `-1` (#299, fixes #319).
 - When no fee estimate is available and `-discardfee` is not set, the wallet
@@ -217,9 +258,10 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   published only after descriptor locks and database transactions are
   released. Unlocking in qbit-qt returns promptly. `createwallet`,
   `loadwallet`, and unlocking in qbit-qt complete a pending initial P2MR
-  keypool refill through deduplicated scheduler steps. #299 later moved the
-  `walletpassphrase` refill to the background and made wallets loaded at
-  startup resume a pending refill (see below) (#143, fixes #138).
+  keypool refill through deduplicated scheduler steps. #299 and #411 later
+  made the `walletpassphrase` refill hold the wallet lock only briefly at a
+  time, and #299 made wallets loaded at startup resume a pending refill (see
+  below) (#143, fixes #138).
 - Descriptor top-ups now stage newly derived scripts and publish wallet
   ownership and cache updates only after the backing database transaction
   commits. A top-up inside a caller-owned transaction publishes once on
@@ -330,24 +372,47 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   slows while such top-ups run (see Known limitations) (#299, fixes #284).
 - The first `walletpassphrase` of a wallet created with a passphrase derived
   the rest of its P2MR keypool, about 2,000 keys at the default `-keypool`,
-  before it returned, and an unlock after a P2MR keypool had run down
-  refilled it to `-keypool` first. The call held the wallet lock meanwhile,
-  so other calls on that wallet waited, and so did the block-processing
-  callbacks of all wallets, which on a busy node could delay block
-  connection. `walletpassphrase` now returns as soon as the wallet is
-  unlocked, and P2MR keypools, including a pending initial top-up, are
-  refilled to `-keypool` in short background steps that do not hold the
-  wallet lock. In release testing on regtest, the first `walletpassphrase` of
-  such a wallet returned in about 0.1 seconds, against about 25 seconds with
-  v1.0.0, and blocks kept connecting while the refill ran. The steps pause
-  while the wallet is locked and resume at the next `walletpassphrase`, so
-  with a short timeout the refill can take several unlocks. When a lock
-  pauses a refill, `debug.log` says that the refill "paused after a failed
-  background step"; this is expected and not an error. Other keypools are
-  still topped up before the call returns. The unlock timeout now starts when
-  the wallet is unlocked rather than after the refill. `getnewaddress` and
-  transaction creation keep working during the refill, deriving one key at a
-  time past the last derived address (#299, fixes #304).
+  before it returned, and an unlock after a P2MR keypool had run down refilled
+  it to `-keypool` first. The call held the wallet lock meanwhile, so other
+  calls on that wallet waited, and so did the block-processing callbacks of
+  all wallets, which on a busy node could delay block connection.
+  `walletpassphrase` still refills the P2MR receive and change keypools,
+  including a pending initial top-up, to `-keypool` before it returns, because
+  a locked wallet cannot derive P2MR keys: until it is unlocked again, it can
+  hand out only the P2MR addresses already in its keypool, and `getnewaddress`
+  then fails with error `-12`, "Keypool ran out". The call now derives the
+  keys in short steps that each hold the wallet lock only briefly, so most
+  other calls on the wallet and the block-processing callbacks keep running
+  meanwhile. The unlock timeout counts from the end of the refill, so even a
+  short timeout leaves the keypools full, unless addresses or change are used
+  while the wallet is unlocked. The refill takes roughly 15 ms per missing key
+  on a typical machine: about 3 seconds for 200 addresses handed out since the
+  last unlock. The first unlock of a wallet created with a passphrase derives
+  about twice `-keypool` keys, so its duration grows with `-keypool`: about 30
+  seconds at the default `-keypool=1000`, and about 5 minutes at
+  `-keypool=10000`. Meanwhile, `walletlock`, `walletpassphrasechange`, another
+  `walletpassphrase`, `unloadwallet`, rescans, and descriptor imports on that
+  wallet wait for the refill, as do locking the wallet and changing its
+  passphrase in qbit-qt, and unlocking it in qbit-qt while unencrypted PQC
+  keys that v1.0.0 wrote still need re-encrypting (see the #301 entry below).
+  If a refill step fails, for example on a database write error,
+  `walletpassphrase` now returns error `-4`; the wallet is still unlocked in
+  that case, and locks again when the timeout expires or on `walletlock`. If
+  addresses are handed out from the same wallet during the refill about as
+  fast as it derives keys, the refill stops after about twice the steps an
+  empty keypool needs, counted for each keypool, and the rest continues in the
+  background while the wallet stays unlocked. Other keypools are still topped
+  up before the call returns. Unlocking a wallet in qbit-qt does not refill a
+  partly used P2MR keypool; it only resumes a pending initial top-up in the
+  background (#355). Background refills, such as those started at wallet load
+  or by `getnewaddress`, pause while the wallet is locked and are completed by
+  the next `walletpassphrase`; when a lock pauses one, `debug.log` says that
+  the refill "paused after a failed background step", which is expected and
+  not an error. `getnewaddress` and transaction creation keep working during a
+  refill, deriving one key at a time past the last derived address. The
+  exchange integration guide now recommends calling `keypoolrefill` before
+  `walletlock`, so that addresses and change used while the wallet was
+  unlocked are replaced before it locks (#299, #411, fixes #304).
 - Locking an encrypted wallet, through `walletlock`, qbit-qt, or the
   `walletpassphrase` timeout, now waits until transaction signing has freed
   its temporary copies of decrypted ECDSA and PQC keys, and until a running
@@ -402,6 +467,18 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   HD seed was not set up. New addresses then still come from the previous
   seed. qbit-qt still reports a fatal error and quits in this case, and the
   wallet loads encrypted and locked at the next start (#300).
+- When `encryptwallet`, or encrypting a wallet in qbit-qt, replaced a
+  descriptor's unencrypted private key record with its encrypted record, it
+  ignored whether writing the encrypted record or erasing the unencrypted one
+  had succeeded. If either failed, the wallet still reported itself as
+  encrypted while the unencrypted private key record stayed in the wallet
+  file. Such a failure now fails the encryption. As with any other failure
+  while the wallet's keys are being encrypted, `qbitd` or `qbit-qt` then
+  stops with an assertion failure, without saving any part of the
+  encryption. After a restart the wallet loads unencrypted, with all of its
+  keys, and it can be encrypted again once the cause of the database error
+  has been fixed. PQC keys are handled the same way. The wallet file format
+  is unchanged (#418, fixes #296).
 - A wallet encrypted before its first background keypool fill finished kept a
   16-address lookahead for its previous seed, so later payments to that
   seed's addresses, for example from a backup taken before encryption, were
@@ -518,9 +595,12 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   PSBTs concurrently (#298).
 - `restorewallet` refuses a backup file that is the database of a loaded
   wallet, except on Windows (see Behavior changes) (#297).
-- `walletpassphrase` returns before P2MR keypools are refilled; its help says
-  that the refill continues in the background, pauses while the wallet is
-  locked, and resumes at the next `walletpassphrase` (#299).
+- `walletpassphrase` refills the P2MR keypools before it returns without
+  holding the wallet lock, and returns error code `-4` if the refill fails,
+  leaving the wallet unlocked until the timeout. Its help says roughly how
+  long the refill takes, which calls wait for it, that the timeout counts
+  from its end, and what an early stop or a failure means (see Wallet fixes)
+  (#299, #411).
 - `keypoolrefill` reports a failed database commit with error code `-4`
   instead of `-1` (#299).
 - The `importdescriptors` help now says that PQC signature counters are kept
@@ -544,6 +624,15 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   contains those keys too (#301).
 - `walletpassphrasechange` keeps the wallet's lock state, also when it fails
   (see Wallet fixes) (#379).
+- `getpeerinfo` reports three new fields once the version handshake with a
+  peer has completed: `failed_tx_validation_time` (the total time in
+  microseconds spent validating the peer's transactions that were rejected
+  for a reason in the transaction itself, also for exempt peers),
+  `tx_validation_throttled` (whether the peer's transactions are currently
+  not validated), and `tx_dropped_while_throttled` (the number of
+  transactions received from the peer that were dropped without validation
+  because the peer was over its budget) (see "Mempool, P2P, and PQC library
+  hardening") (#386, #422).
 
 ### Signing-usage visibility and qbit-qt responsiveness
 
@@ -704,6 +793,13 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   which Qt 6.8.4 fixes; the build also applies a later Qt fix for a related
   use-after-free (QTBUG-149612). Saved GUI settings and window layouts are
   read and written as before (#347).
+- qbit-qt has a new Window > Poker Lobby entry: no-limit Texas Hold'em
+  against computer players at heads-up, 6-max, and full-ring tables. Chips
+  are play money with no value. The game never touches the wallet, sends
+  nothing over the network, and does nothing until the lobby is opened. The
+  lobby and table follow the two poker windows Satoshi Nakamoto designed for
+  the first Bitcoin client, which were never connected to a game and were
+  removed in 2009. See `doc/user/poker.md` (#378).
 
 ### Validation and performance work
 
@@ -752,6 +848,10 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   `submitSolution` returns false. The `submitblock` RPC and consensus rules
   are unchanged. This is a backport of bitcoin/bitcoin#33745 (#289, fixes
   #278).
+- `submitSolution` now returns false when its coinbase argument is missing,
+  empty, or cannot be read as a transaction. The template is left unchanged
+  and can still be used. With `-debug=ipc`, a coinbase that cannot be read is
+  logged. Valid submissions behave as before (#419).
 
 ### Mempool, P2P, and PQC library hardening
 
@@ -765,6 +865,17 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   scripts that copy stack elements reach it. The P2MR v1 profile, the
   conformance corpus, and the independent oracle cover the new limit. Block
   validity is unchanged (#263, refs #257).
+- Standard policy also limits hashing of P2MR v1 stack elements longer than
+  520 bytes, through the new `SCRIPT_VERIFY_P2MR_HASH_WEIGHT` flag and its
+  own script error. Each `OP_RIPEMD160`, `OP_SHA1`, `OP_SHA256`,
+  `OP_HASH160`, or `OP_HASH256` applied to such an element costs one unit
+  per started 64-byte block of the element. The units come from a per-input
+  budget equal to the input's initial validation weight, separate from the
+  signature charges, and elements that fit in a pushed literal cost nothing
+  (see Behavior changes). The flag applies to mempool admission and the
+  other users of the standard script verification flags. Consensus rules
+  are unchanged. `CastToBool`, which every script evaluation uses, now scans
+  64 bytes at a time; its results are unchanged (#415).
 - `OP_CHECKDATASIGPQC` and `OP_CHECKDATASIGADDPQC` checks now use the
   signature cache, like P2MR transaction signatures since #162. A data
   signature does not commit to the spending transaction, so a peer could
@@ -842,6 +953,64 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   not restored. A peer's own `version` message is handled as before, and so
   are other service flags. The `peers.dat` format is unchanged, so v1.0.0
   can still read the file (#380).
+- The time the node spends validating a transaction received from a peer is
+  now measured, and charged to that peer when the transaction is rejected
+  for a reason in the transaction itself (invalid by consensus,
+  non-standard, or with a mutated or missing witness). This includes
+  transactions from `tx` messages, orphan reconsideration, and package
+  evaluation. Rejections that depend on the node's chain or mempool state,
+  such as missing inputs, conflicts, fee and mempool limits, are not
+  charged. Transactions submitted over RPC are never charged (#386, #422,
+  fixes #275).
+  - Each peer earns 500 µs of credit per second of connection, up to 100 ms,
+    and can use it once it has reached 100 ms. Until then, and while its
+    credit is used up, the peer draws on a node-wide pool of 500 ms that
+    refills at 50 ms per second. Each connection can draw at most a tenth of
+    the pool: 50 ms at once, refilled at 5 ms per second, so it takes at
+    least ten connections drawing at that rate to keep the pool empty. A new
+    connection starts with a full share, so what new connections draw is
+    bounded by the pool. With the default 125 connections this bounds the
+    charged time to about 11% of the message-handling thread over time,
+    apart from the one transaction that takes a peer's credit, its share of
+    the pool, or the pool below zero, which is charged in full down to a
+    floor of -1 s. Raising `-maxconnections` raises the bound by 0.5 ms per
+    second for each extra connection. The node's periodic coins cache flush,
+    which mempool acceptance also runs at its end, is run just before the
+    measured time starts, so it is not charged unless it falls due during
+    the validation itself.
+  - While a peer has no credit it can use and cannot draw on the pool, the
+    node stops validating that peer's transactions until the budget refills:
+    transactions it sends are dropped without validation and requested from
+    other peers that announce them, transactions are not requested from it
+    (including those it announced earlier), and its orphan transactions
+    wait. Once the peer is within its budget again, the transactions it
+    announced or sent meanwhile are requested from it, unless the node
+    already has them, for example from another peer. A dropped transaction
+    is not added to the reject filters, so the same transaction from another
+    peer is validated as usual. The peer is not disconnected or discouraged.
+    Peers with the `noban` permission and manual connections are exempt.
+  - A debug log line (`-debug=net`) marks when a peer goes over its budget
+    and when it is within it again, with the number of transactions dropped
+    meanwhile. `getpeerinfo` reports the charged time and the throttle state
+    of each peer (see Updated RPCs).
+- Block data received from peers is now attributed to the peer that sent it.
+  Each `block` message's sender is recorded as the block's source, replacing
+  any earlier one, so the result of processing a block is attributed to the
+  peer whose block was processed. The compact block paths are unchanged. A
+  block's size and weight failures that depend on its AuxPoW payload, which
+  counts toward block size and weight but is not covered by the block hash,
+  are now classified using the size of the committed portion; failures of the
+  committed portion keep their existing classification. The node connects the
+  copy of a block that it validated and stored. A block fetched to restore
+  pruned witness data is now checked before it is stored, with the checks
+  applied to any other received block whose header is already known: its
+  AuxPoW payload against the commitment rules for its height, then the usual
+  block checks. A peer whose copy fails is treated as misbehaving and is not
+  asked for witness recovery again on that connection. A recovered copy that
+  passes these checks but still fails to connect marks the block invalid, as
+  it would on a node that kept its witness data. Only nodes that have pruned
+  witness data request witness recovery. Consensus rules, the wire format, and
+  the file formats are unchanged (#414).
 
 ### PHOTON
 
@@ -878,8 +1047,38 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   `inbound_decoder_bytes`, and `peer_suspensions` fields, and is followed by
   a `peer relay stats` line for each peer that has sent block traffic.
   `contrib/photon/RUNBOOK.md` describes the limits, the checks, and the log
-  fields. The relay wire format is unchanged, so relays running v1.0.0 and
-  v1.0.1 interoperate (#381).
+  fields. The relay wire format is unchanged. Relays running v1.0.0 and
+  v1.0.1 interoperate in both directions; during a rollout, a v1.0.0
+  receiver may send a block back once under the earlier identifier (see the
+  next entry) (#381, #410).
+- qbit-photon now announces a block under the low-order 64 bits of its hash,
+  the last 16 hex digits of the hash as qbitd prints it, instead of the
+  leading 64 bits. A native-lane block's proof of work is on its own hash,
+  so its leading bits take only a few values, and most native-lane blocks
+  were taken for a block already relayed and not relayed on. A relay accepts
+  a block announced under either form, and a block that arrives under both
+  forms reaches qbitd once and is not relayed back out. Relays running
+  v1.0.0 use the identifier only as a key and receive every block announced
+  under the new form; after their qbitd accepts such a block, they may send
+  it on once more under the earlier form, and relays running v1.0.1
+  recognize that copy, once they have decoded it, as a block they already
+  have, without counting it against the sender. The packet format and
+  protocol version are unchanged (#410, fixes #388).
+- The parent check before a block is submitted to qbitd also changed. If
+  qbitd knows the parent only as a header on a branch with more chain work
+  than its best block, at most 6 blocks above it, the block is submitted and
+  qbitd connects it after the parent; if qbitd stores it without connecting
+  it yet, that does not count against the sender. A parent further ahead
+  still means qbitd is catching up, and the block is dropped. A block whose
+  parent qbitd does not know is dropped, but a peer's first such block
+  within 60 seconds does not count against it, since the parent may still be
+  on its way to qbitd. If qbitd does not answer the parent check or
+  `submitblock`, qbit-photon keeps the block and tries it once more after
+  qbitd next answers a call or announces a block, for up to 2 minutes; it
+  keeps one block at a time, and a newer block replaces it unless it builds
+  on it. The stats line adds `block_parent_pending`, `block_parent_unknown`
+  (previously counted in `block_parent_rejected`), `node_retries`, and
+  `held_dropped` (#410).
 
 ### Release engineering, CI, and documentation
 
@@ -1024,6 +1223,18 @@ tag. Pull request numbers refer to the Qbit-Org/qbit repository.
   `mainnet_ci_posture.json`, which only passed its result through, are
   removed. Core Checks no longer lists the nonexistent `develop` branch and
   now also runs for `1.1.0` (#385).
+- The release validators in `ci/release/`, the Key Policy Gate, and the RPC
+  documentation's tag check now read gpg's status output and key listings,
+  and `git verify-tag --raw`, as bytes split at line feeds only, with one
+  parser. They refuse the whole output if it is not UTF-8, does not end in
+  a line feed, or holds any other line separator, such as CR, U+0085,
+  U+2028, or U+2029, and they accept only status lines of the shape gpg
+  documents. Which signatures count is unchanged. A certificate whose user
+  ID holds U+0085, U+2028, or U+2029 cannot be used in the key policy; none
+  of the current certificates has one. `git verify-tag --raw` is now given
+  the tag's full ref name or object ID, and its status lines are read from
+  standard error only. `contrib/keys/README.md` describes the rules, and
+  recommends ASCII for signature notations (#387).
 - Stabilized the REST chain-info comparison and Qt shutdown tests (#137,
   #149, #164).
 
@@ -1059,9 +1270,16 @@ Known limitations
 - Fresh fuzz evidence on the release source is required before the release
   is tagged. It is tracked in #173 and #174 and is not recorded in this file.
   The earlier evidence summarized below was produced before #263, #265, #266,
-  #268, #270, and #380 merged, and does not cover their changes:
+  #268, #270, #380, #386, #414, #415, and #422 merged, and does not cover
+  their changes:
   - #263 and #265 change the script interpreter that the `p2mr_script` target
     runs, and #263 adds its new flag to that target's fuzzed flag sets.
+  - #415 changes the same interpreter, including `CastToBool`, which every
+    script evaluation calls, but its new flag is not in the `p2mr_script`
+    target's fuzzed flag sets. The inherited `script_interpreter` target
+    calls `CastToBool` directly, and the inherited `eval_script`,
+    `script_flags`, and `miniscript` targets reach it through the
+    interpreter, but they were not part of that evidence.
   - #268 replaces the vendored library whose key generation, secret-key
     validation, signing, and verification the `pqc` and `p2mr_script` targets
     call.
@@ -1076,10 +1294,21 @@ Known limitations
     none of the six qbit-specific targets reaches. The inherited `addrman`,
     `addrman_serdeser`, `data_stream_addr_man`, `process_message`, and
     `process_messages` targets reach it but were not part of that evidence.
+  - #386 and #422 change transaction handling in `net_processing`, which
+    none of the six qbit-specific targets reaches. The inherited
+    `process_message` and `process_messages` targets reach it but were not
+    part of that evidence.
+  - #414 changes block checks in `validation.cpp` and block handling in
+    `net_processing`. Of the six qbit-specific targets, only `auxpow`
+    reaches part of it, the size checks in `CheckBlock`. The inherited
+    `block` target also reaches those checks, and the inherited
+    `process_message` and `process_messages` targets reach the block
+    handling, but they were not part of that evidence.
   - The other changes merged after the #176 source (#177, #178, #182, #183,
     #252, #264, #277, #289, #297, #298, #299, #300, #301, #342, #343, #344,
     #345, #346, #347, #348, #352, #353, #354, #358, #360, #361, #362, #367,
-    #368, #371, #374, #375, #376, #377, #379, #381, and #385) touch only
+    #368, #371, #374, #375, #376, #377, #378, #379, #381, #385, #387, #410,
+    #411, #418, and #419) touch only
     wallet, qbit-qt, Qt build, release build, mining-interface, RPC help and
     argument conversion, test, CI, release tooling, developer tooling,
     qbit-photon, and documentation code, which none of the six
@@ -1103,11 +1332,13 @@ Known limitations
 - Failed PQC signature checks are not cached. Anyone holding one valid
   signature can derive unlimited distinct invalid PQC signatures that each
   still cost a full verification, on both the data-signature and
-  transaction-signature paths. Because this release does not penalize peers
-  that relay consensus-invalid transactions, a peer can cost a node about
-  0.5 µs of message-handling and `cs_main` time per witness byte. Discouraging
-  peers whose P2MR PQC signatures fail, or budgeting script-validation cost
-  per peer, are possible follow-ups (#265, refs #259).
+  transaction-signature paths. This release does not disconnect or
+  discourage peers that relay consensus-invalid transactions, and such a
+  transaction costs a node about 0.5 µs of message-handling and `cs_main`
+  time per witness byte. The per-peer budget for validating rejected
+  transactions bounds the total time charged this way to about 11% of the
+  message-handling thread with the default 125 connections (see "Mempool,
+  P2P, and PQC library hardening") (#265, #386, refs #259).
 - Large AuxPoW payloads still have these limits, deferred to later releases
   (#266, refs #258):
   - No consensus rule limits the size of an AuxPoW payload yet. Adding one
@@ -1239,13 +1470,11 @@ Known limitations
   confirmation are correct (#365).
 - Wallet files can keep key material that encryption should have removed.
   `walletpassphrasechange` leaves the master key wrapped with the old
-  passphrase in the file's free space (#294). A failed write or erase while
-  descriptor ECDSA keys are encrypted is ignored (#296). Copies of a wallet
-  made before this release rewrote or re-encrypted it can still hold
-  unencrypted keys (#300, #301). Treat wallet files and backups from before
-  or around an encryption or passphrase change as unencrypted; to be safe,
-  create a new wallet with a passphrase using this release and move your
-  funds to it.
+  passphrase in the file's free space (#294). Copies of a wallet made before
+  this release rewrote or re-encrypted it can still hold unencrypted keys
+  (#300, #301). Treat wallet files and backups from before or around an
+  encryption or passphrase change as unencrypted; to be safe, create a new
+  wallet with a passphrase using this release and move your funds to it.
 - Encryption still generates the replacement seed only after the
   post-encryption rewrite. If the process stops before the new seed is
   written, the wallet stays encrypted but keeps using its old seed for new
