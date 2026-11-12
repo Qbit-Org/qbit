@@ -345,8 +345,8 @@ BOOST_AUTO_TEST_CASE(balances_floor_and_clock_changes)
 
     // The pool's debt, and a peer's share of the pool, stop at the floor too: the pool is
     // positive again after 1 s / 50 ms per second = 20 s, the peer's share after
-    // 1 s / 5 ms per second = 200 s. Both refill to their caps. (The peers' own credit is not
-    // usable before an hour has passed.)
+    // 1 s / 5 ms per second = 200 s. Both refill to their caps. (With a cap of an hour, the peers'
+    // own credit does not become usable in this test.)
     TxValidationBudget pooled{TxValidationBudgetOptions{.peer_cap = 1h}, T0};
     Account young{T0};
     pooled.Charge(young, /*exempt=*/false, 1h, T0);
