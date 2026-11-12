@@ -10,11 +10,15 @@ its budget, its transactions are dropped without validation and its
 announcements are not requested, until the budget has refilled. The peer is
 not disconnected or discouraged, and noban peers are exempt.
 
+Once a peer is within its budget again, the transactions it announced or sent
+meanwhile are requested from it. A peer can draw on the shared pool only within
+its share of it, so that other peers can still draw on the pool.
+
 The test uses -txvalidationbudget=<peer_rate>,<peer_cap>,<pool_rate>,<pool_cap>
 (microseconds) to set a budget small enough to reach with a few transactions:
 each peer can use 1 us of own credit, earned at 1 us per second once connected,
-and the shared pool holds 2 ms and does not refill. Sections that need the pool
-full again restart the node.
+and the shared pool holds 2 ms and does not refill (each peer can draw 200 us of
+it). Sections that need the pool full again restart the node.
 """
 
 import json
@@ -28,6 +32,7 @@ from test_framework.messages import (
     CTxIn,
     CTxInWitness,
     CTxOut,
+    MSG_BLOCK,
     MSG_WTX,
     msg_inv,
     msg_tx,
@@ -75,10 +80,18 @@ class GetdataRecorder(P2PInterface):
     def __init__(self):
         super().__init__()
         self.requested = set()
+        self.txs = {}
+
+    def provide(self, tx):
+        """Reply with tx when it is requested."""
+        self.txs[tx.wtxid_int] = tx
+        self.txs[tx.txid_int] = tx
 
     def on_getdata(self, message):
         for inv in message.inv:
             self.requested.add(inv.hash)
+            if inv.hash in self.txs:
+                self.send_without_ping(msg_tx(self.txs[inv.hash]))
 
 
 class TxValidationBudgetTest(BitcoinTestFramework):
@@ -153,6 +166,7 @@ class TxValidationBudgetTest(BitcoinTestFramework):
         self.generate(self.wallet, 1)
 
         self.test_peer_over_budget()
+        self.test_requested_again_after_throttling()
         self.test_orphans_wait()
         self.test_noban_peer_is_exempt()
         self.test_disabled_budget()
@@ -248,6 +262,109 @@ class TxValidationBudgetTest(BitcoinTestFramework):
         assert_equal(info["tx_validation_throttled"], False)
         assert_equal(info["tx_dropped_while_throttled"], 1)
         assert_equal(len(node.getpeerinfo()), 2)
+
+        self.log.info("What it announced while over its budget is requested from it now, apart from what the node has")
+        mocktime += INBOUND_REQUEST_DELAY
+        node.setmocktime(mocktime)
+        peer_a.wait_until(lambda: txid_a in peer_a.requested and txid_early in peer_a.requested)
+        peer_a.sync_with_ping()
+        with p2p_lock:
+            assert dropped_tx["tx"].wtxid_int not in peer_a.requested
+
+        node.setmocktime(0)
+        node.disconnect_p2ps()
+        self.generate(self.wallet, 1)
+
+    def advance_time(self, mocktime, seconds, peers):
+        """Advance the mock time by seconds, in steps of at most 10 minutes, and sync with peers."""
+        node = self.nodes[0]
+        while seconds > 0:
+            step = min(seconds, 600)
+            mocktime += step
+            seconds -= step
+            node.setmocktime(mocktime)
+            for peer in peers:
+                peer.sync_with_ping()
+        return mocktime
+
+    def test_requested_again_after_throttling(self):
+        node = self.nodes[0]
+        self.log.info("New peers whose transactions are dropped while one peer keeps the pool low have them requested later")
+        # Peers never earn own credit they can use, so every peer draws on the pool. The pool holds
+        # 1 us and refills at 10 us per second; a peer can draw 0.1 us of it at once, refilled at
+        # 1 us per second. Any rejected transaction therefore empties the pool, and the peer that
+        # sent it can draw on the pool again only about ten times later than the pool is refilled.
+        self.restart_node(0, extra_args=["-txvalidationbudget=1,3600000000,10,1", "-peertimeout=999999999"])
+        mocktime = int(time.time())
+        node.setmocktime(mocktime)
+        sender = self.connect_peer()
+        inbound = self.connect_peer()
+        outbound = node.add_outbound_p2p_connection(GetdataRecorder(), p2p_idx=0)
+        outbound.peer_id = next(p["id"] for p in node.getpeerinfo() if not p["inbound"])
+        # The outbound peer has our chain, so it is not disconnected for lagging behind when the
+        # mock time moves on.
+        outbound.send_and_ping(msg_inv([CInv(t=MSG_BLOCK, h=int(node.getbestblockhash(), 16))]))
+        peers = [sender, inbound, outbound]
+        inbound_txs = [self.wallet.create_self_transfer(confirmed_only=True)["tx"] for _ in range(3)]
+        outbound_txs = [self.wallet.create_self_transfer(confirmed_only=True)["tx"] for _ in range(2)]
+        for tx in inbound_txs:
+            inbound.provide(tx)
+        for tx in outbound_txs:
+            outbound.provide(tx)
+
+        with node.assert_debug_log(expected_msgs=[], unexpected_msgs=["Misbehaving", "discouraging"]):
+            # One rejected transaction from the sender empties the pool.
+            sender.send_and_ping(msg_tx(self.signature_failure()))
+            charged = self.peer_info(sender)["failed_tx_validation_time"]
+            assert_greater_than(charged, 1)
+            assert_equal(self.peer_info(sender)["tx_validation_throttled"], True)
+
+            # The new inbound and outbound peers are over the budget too, as long as the pool is
+            # empty: an announced transaction is not requested, and a sent one is dropped.
+            inbound.send_and_ping(msg_inv([CInv(t=MSG_WTX, h=inbound_txs[0].wtxid_int)]))
+            inbound.send_and_ping(msg_tx(inbound_txs[1]))
+            outbound.send_and_ping(msg_inv([CInv(t=MSG_WTX, h=outbound_txs[0].wtxid_int)]))
+            for peer in (inbound, outbound):
+                assert_equal(self.peer_info(peer)["tx_validation_throttled"], True)
+            assert_equal(self.peer_info(inbound)["tx_dropped_while_throttled"], 1)
+            outbound.sync_with_ping()
+            mempool = node.getrawmempool()
+            with p2p_lock:
+                assert outbound_txs[0].wtxid_int not in outbound.requested
+            for tx in [inbound_txs[0], inbound_txs[1], outbound_txs[0]]:
+                assert tx.txid_hex not in mempool
+
+            self.log.info("Once the pool has refilled, the sender is still over its share of it")
+            # The pool is positive again (charged - 1) / 10 seconds after the rejection, and the
+            # sender's share (charged - 0.1) seconds after it.
+            mocktime = self.advance_time(mocktime, (charged - 1) // 10 + 1, peers)
+            sender.send_and_ping(msg_tx(self.signature_failure()))
+            info = self.peer_info(sender)
+            assert_equal(info["failed_tx_validation_time"], charged)
+            assert_equal(info["tx_dropped_while_throttled"], 1)
+            assert_equal(info["tx_validation_throttled"], True)
+
+            self.log.info("The other peers are within their budget again, and their transactions are requested from them")
+            inbound.send_and_ping(msg_inv([CInv(t=MSG_WTX, h=inbound_txs[2].wtxid_int)]))
+            outbound.send_and_ping(msg_inv([CInv(t=MSG_WTX, h=outbound_txs[1].wtxid_int)]))
+            # The sender keeps sending a rejected transaction per second. They are dropped while it is
+            # over its share of the pool, so the other peers' transactions get through.
+            expected = [tx.txid_hex for tx in inbound_txs + outbound_txs]
+            for _ in range(60):
+                if all(txid in node.getrawmempool() for txid in expected):
+                    break
+                sender.send_and_ping(msg_tx(self.signature_failure()))
+                mocktime = self.advance_time(mocktime, 1, peers)
+            mempool = node.getrawmempool()
+            for txid in expected:
+                assert txid in mempool
+            for peer in (inbound, outbound):
+                assert_equal(self.peer_info(peer)["tx_validation_throttled"], False)
+            assert_equal(self.peer_info(inbound)["tx_dropped_while_throttled"], 1)
+            assert_equal(self.peer_info(outbound)["tx_dropped_while_throttled"], 0)
+            assert_equal(len(node.getpeerinfo()), 3)
+            assert all(peer.is_connected for peer in peers)
+            assert_equal(node.listbanned(), [])
 
         node.setmocktime(0)
         node.disconnect_p2ps()

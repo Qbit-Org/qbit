@@ -16,23 +16,30 @@ P2P and network changes
 - Each peer earns 500 µs of credit per second of connection, up to 100 ms, and
   can use it once it has reached 100 ms. Until then, and while its credit is
   used up, the peer draws on a node-wide pool of 500 ms that refills at 50 ms
-  per second. With the default 125 connections this bounds the charged time to
-  about 11 % of the message-handling thread over time, apart from the one
-  transaction that takes a peer's credit or the pool below zero, which is
-  charged in full down to a floor of -1 s. Raising `-maxconnections` raises
-  the bound by 0.5 ms per second for each extra connection. The node's
-  periodic coins cache flush, which mempool acceptance also runs at its end,
-  is run just before the measured time starts, so it is not charged unless it
-  falls due during the validation itself.
+  per second. Each connection can draw at most a tenth of the pool: 50 ms at
+  once, refilled at 5 ms per second, so it takes at least ten connections
+  drawing at that rate to keep the pool empty. A new connection starts with a
+  full share, so what new connections draw is bounded by the pool. With the default 125 connections this bounds
+  the charged time to about 11 % of the message-handling thread over time,
+  apart from the one transaction that takes a peer's credit, its share of the
+  pool or the pool below zero, which is charged in full down to a floor of
+  -1 s. Raising `-maxconnections` raises the bound by 0.5 ms per second for
+  each extra connection. The node's periodic coins cache flush, which mempool
+  acceptance also runs at its end, is run just before the measured time
+  starts, so it is not charged unless it falls due during the validation
+  itself.
 
-- While a peer has no credit it can use and the pool is empty, the node stops
-  validating that peer's transactions until the budget refills: transactions
-  it sends are dropped without validation and requested from other peers that
-  announce them, transactions are not requested from it (including those it
-  announced earlier), and its orphan transactions wait. A dropped transaction
-  is not added to the reject filters, so the same transaction from another
-  peer is validated as usual. The peer is not disconnected or discouraged.
-  Peers with the `noban` permission and manual connections are exempt.
+- While a peer has no credit it can use and cannot draw on the pool, the node
+  stops validating that peer's transactions until the budget refills:
+  transactions it sends are dropped without validation and requested from
+  other peers that announce them, transactions are not requested from it
+  (including those it announced earlier), and its orphan transactions wait.
+  Once the peer is within its budget again, the transactions it announced or
+  sent meanwhile are requested from it, unless the node already has them, for
+  example from another peer. A dropped transaction is not added to the reject
+  filters, so the same transaction from another peer is validated as usual.
+  The peer is not disconnected or discouraged. Peers with the `noban`
+  permission and manual connections are exempt.
 
 - A debug log line (`-debug=net`) marks when a peer goes over its budget and
   when it is within it again, with the number of transactions dropped

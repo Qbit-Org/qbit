@@ -8,8 +8,10 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -61,17 +63,25 @@ BOOST_AUTO_TEST_CASE(credit_accrues_and_caps)
     BOOST_CHECK(budget.MayValidate(account, /*exempt=*/false, T0 + 10'000s));
     BOOST_CHECK(account.GetCredit() == Credit{100ms});
 
-    // The pool is charged for a peer that cannot use its own credit, then grows at the pool
-    // rate (50 ms per second) up to its cap (500 ms).
+    // The pool, and the peer's share of it, are charged for a peer that cannot use its own
+    // credit. The pool then grows at the pool rate (50 ms per second) up to its cap (500 ms).
     Account young{T0 + 10'000s};
     budget.Charge(young, /*exempt=*/false, 300ms, T0 + 10'000s);
     BOOST_CHECK(budget.GetPoolCredit() == Credit{200ms});
     BOOST_CHECK(young.GetCredit() == Credit::zero());
+    BOOST_CHECK(young.GetPoolShareUsed() == Credit{300ms});
     BOOST_CHECK(young.GetTotalCharged() == 300ms);
-    BOOST_CHECK(budget.MayValidate(young, /*exempt=*/false, T0 + 10'001s));
+    Account other{T0 + 10'000s};
+    BOOST_CHECK(budget.MayValidate(other, /*exempt=*/false, T0 + 10'001s));
     BOOST_CHECK(budget.GetPoolCredit() == Credit{250ms});
-    BOOST_CHECK(budget.MayValidate(young, /*exempt=*/false, T0 + 10'100s));
+    BOOST_CHECK(budget.MayValidate(other, /*exempt=*/false, T0 + 10'100s));
     BOOST_CHECK(budget.GetPoolCredit() == Credit{500ms});
+
+    // A peer's share of the pool grows back at a tenth of the pool rate (5 ms per second).
+    BOOST_CHECK(!budget.MayValidate(young, /*exempt=*/false, T0 + 10'010s));
+    BOOST_CHECK(young.GetPoolShareUsed() == Credit{250ms});
+    BOOST_CHECK(budget.MayValidate(young, /*exempt=*/false, T0 + 10'100s));
+    BOOST_CHECK(young.GetPoolShareUsed() == Credit::zero());
 
     // Many small refills add exactly as much as one large one.
     Account small_steps{T0};
@@ -137,12 +147,111 @@ BOOST_AUTO_TEST_CASE(pool_is_shared_by_peers_without_credit)
     BOOST_CHECK(established.GetCredit() == Credit{99ms});
     BOOST_CHECK(budget.GetPoolCredit() == Credit{-100ms});
 
-    // The pool is positive again 2 s plus one microsecond later.
+    // The pool is positive again 2 s plus one microsecond later, for the peers that have not used
+    // up their share of it.
     BOOST_CHECK(!budget.MayValidate(young, /*exempt=*/false, now + 2s));
     BOOST_CHECK(budget.GetPoolCredit() == Credit::zero());
     BOOST_CHECK(young.GetCredit() == Credit{1ms});
-    BOOST_CHECK(budget.MayValidate(young, /*exempt=*/false, now + 2s + 1us));
     BOOST_CHECK(budget.MayValidate(other_young, /*exempt=*/false, now + 2s + 1us));
+
+    // The peer that took the pool below zero has used more than its share (50 ms), and draws on
+    // the pool again once it has earned back all but its share, at 5 ms per second: (600 ms -
+    // 50 ms) / 5 ms per second = 110 s later.
+    BOOST_CHECK(!budget.MayValidate(young, /*exempt=*/false, now + 2s + 1us));
+    BOOST_CHECK(!budget.MayValidate(young, /*exempt=*/false, now + 110s));
+    BOOST_CHECK(young.GetPoolShareUsed() == Credit{50ms});
+    BOOST_CHECK(budget.MayValidate(young, /*exempt=*/false, now + 110s + 1us));
+}
+
+BOOST_AUTO_TEST_CASE(pool_share_limits_each_peer)
+{
+    const Credit share{Credit{DEFAULT_TX_VALIDATION_POOL_CAP} / TX_VALIDATION_POOL_SHARES};
+    BOOST_REQUIRE(share == Credit{50ms});
+    TxValidationBudget budget{DEFAULT_BUDGET, T0};
+    std::chrono::microseconds now{T0};
+
+    // A peer without usable own credit draws on the pool while it has used less than its share
+    // (50 ms). The validation that takes it past its share is charged in full.
+    Account greedy{now};
+    int validations{0};
+    while (budget.MayValidate(greedy, /*exempt=*/false, now)) {
+        budget.Charge(greedy, /*exempt=*/false, 7ms, now);
+        ++validations;
+    }
+    BOOST_CHECK_EQUAL(validations, 8);
+    BOOST_CHECK(greedy.GetPoolShareUsed() == Credit{56ms});
+    BOOST_CHECK(budget.GetPoolCredit() == Credit{444ms});
+    BOOST_CHECK(greedy.GetCredit() == Credit::zero());
+
+    // The rest of the pool stays available to the other peers, each within its own share.
+    Account other{now};
+    BOOST_CHECK(budget.MayValidate(other, /*exempt=*/false, now));
+    budget.Charge(other, /*exempt=*/false, 49ms, now);
+    BOOST_CHECK(budget.MayValidate(other, /*exempt=*/false, now));
+    budget.Charge(other, /*exempt=*/false, 1ms, now);
+    BOOST_CHECK(!budget.MayValidate(other, /*exempt=*/false, now));
+    BOOST_CHECK(budget.GetPoolCredit() == Credit{394ms});
+    Account newcomer{now};
+    BOOST_CHECK(budget.MayValidate(newcomer, /*exempt=*/false, now));
+
+    // A share grows back at a tenth of the pool rate, 5 ms per second: the greedy peer, 6 ms over
+    // its share, may draw again 1.2 s later.
+    BOOST_CHECK(!budget.MayValidate(greedy, /*exempt=*/false, now + 1200ms));
+    BOOST_CHECK(greedy.GetPoolShareUsed() == share);
+    BOOST_CHECK(budget.MayValidate(greedy, /*exempt=*/false, now + 1200ms + 1us));
+    BOOST_CHECK(budget.MayValidate(greedy, /*exempt=*/false, now + 1h));
+    BOOST_CHECK(greedy.GetPoolShareUsed() == Credit::zero());
+
+    // A peer with usable own credit does not touch its share of the pool.
+    Account established{now};
+    Establish(budget, established, now);
+    budget.Charge(established, /*exempt=*/false, 10ms, now);
+    BOOST_CHECK(established.GetCredit() == Credit{90ms});
+    BOOST_CHECK(established.GetPoolShareUsed() == Credit::zero());
+    // Once its own credit is used up, it draws on the pool within its share like any other peer.
+    budget.Charge(established, /*exempt=*/false, 90ms, now);
+    BOOST_CHECK(established.GetCredit() == Credit::zero());
+    BOOST_CHECK(budget.MayValidate(established, /*exempt=*/false, now));
+    budget.Charge(established, /*exempt=*/false, 60ms, now);
+    BOOST_CHECK(established.GetCredit() == Credit::zero());
+    BOOST_CHECK(established.GetPoolShareUsed() == Credit{60ms});
+    BOOST_CHECK(!budget.MayValidate(established, /*exempt=*/false, now));
+}
+
+BOOST_AUTO_TEST_CASE(one_peer_cannot_keep_the_pool_empty)
+{
+    // A peer that sends a rejected transaction costing 1 ms every 10 ms for 100 s draws at most
+    // its share at once plus a tenth of the pool rate over time; the pool stays positive.
+    TxValidationBudget budget{DEFAULT_BUDGET, T0};
+    Account heavy{T0};
+    std::chrono::microseconds charged{0};
+    Credit lowest_pool{budget.GetPoolCredit()};
+    for (std::chrono::microseconds now{T0}; now < T0 + 100s; now += 10ms) {
+        if (budget.MayValidate(heavy, /*exempt=*/false, now)) {
+            budget.Charge(heavy, /*exempt=*/false, 1ms, now);
+            charged += 1ms;
+        }
+        lowest_pool = std::min(lowest_pool, budget.GetPoolCredit());
+    }
+    BOOST_CHECK(lowest_pool > Credit::zero());
+    BOOST_CHECK(!heavy.IsEstablished());
+    BOOST_CHECK(charged <= 50ms + 100 * 5ms + 1ms);
+    BOOST_CHECK(charged >= 50ms + 99 * 5ms);
+
+    // It takes TX_VALIDATION_POOL_SHARES peers drawing at their limit to empty the pool: with
+    // one fewer, the pool stays positive.
+    for (const int64_t count : {TX_VALIDATION_POOL_SHARES - 1, TX_VALIDATION_POOL_SHARES}) {
+        TxValidationBudget shared{DEFAULT_BUDGET, T0};
+        std::vector<Account> peers(count, Account{T0});
+        bool emptied{false};
+        for (std::chrono::microseconds now{T0}; now < T0 + 100s; now += 10ms) {
+            for (Account& peer : peers) {
+                if (shared.MayValidate(peer, /*exempt=*/false, now)) shared.Charge(peer, /*exempt=*/false, 1ms, now);
+            }
+            if (shared.GetPoolCredit() <= Credit::zero()) emptied = true;
+        }
+        BOOST_CHECK_EQUAL(emptied, count == TX_VALIDATION_POOL_SHARES);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(new_connections_draw_on_the_pool_only)
@@ -190,6 +299,7 @@ BOOST_AUTO_TEST_CASE(exempt_peers_and_disabled_budget)
     Account exempt_pooled{T0};
     pooled.Charge(exempt_pooled, /*exempt=*/true, 1s, T0);
     BOOST_CHECK(pooled.GetPoolCredit() == Credit{DEFAULT_TX_VALIDATION_POOL_CAP});
+    BOOST_CHECK(exempt_pooled.GetPoolShareUsed() == Credit::zero());
     BOOST_CHECK(exempt_pooled.GetTotalCharged() == 1s);
 
     // A disabled budget throttles nobody and charges nothing, but still counts the time.
@@ -233,16 +343,27 @@ BOOST_AUTO_TEST_CASE(balances_floor_and_clock_changes)
     BOOST_CHECK(budget.MayValidate(established, /*exempt=*/false, far_future));
     BOOST_CHECK(established.GetCredit() == Credit{DEFAULT_TX_VALIDATION_PEER_CAP});
 
-    // The pool's debt stops at the floor too, and the pool refills to its cap.
-    TxValidationBudget pooled{DEFAULT_BUDGET, T0};
+    // The pool's debt, and a peer's share of the pool, stop at the floor too: the pool is
+    // positive again after 1 s / 50 ms per second = 20 s, the peer's share after
+    // 1 s / 5 ms per second = 200 s. Both refill to their caps. (With a cap of an hour, the peers'
+    // own credit does not become usable in this test.)
+    TxValidationBudget pooled{TxValidationBudgetOptions{.peer_cap = 1h}, T0};
     Account young{T0};
     pooled.Charge(young, /*exempt=*/false, 1h, T0);
     BOOST_CHECK(pooled.GetPoolCredit() == Credit{TX_VALIDATION_CREDIT_FLOOR});
+    BOOST_CHECK(young.GetPoolShareUsed() == Credit{DEFAULT_TX_VALIDATION_POOL_CAP} / TX_VALIDATION_POOL_SHARES - Credit{TX_VALIDATION_CREDIT_FLOOR});
     BOOST_CHECK(young.GetCredit() == Credit::zero());
     BOOST_CHECK(!pooled.MayValidate(young, /*exempt=*/false, T0));
+    Account other_young{T0};
+    BOOST_CHECK(!pooled.MayValidate(other_young, /*exempt=*/false, T0 + 20s));
+    BOOST_CHECK(pooled.MayValidate(other_young, /*exempt=*/false, T0 + 20s + 1us));
+    BOOST_CHECK(!pooled.MayValidate(young, /*exempt=*/false, T0 + 200s));
+    BOOST_CHECK(pooled.MayValidate(young, /*exempt=*/false, T0 + 200s + 1us));
     Account late{far_future};
     BOOST_CHECK(pooled.MayValidate(late, /*exempt=*/false, far_future));
     BOOST_CHECK(pooled.GetPoolCredit() == Credit{DEFAULT_TX_VALIDATION_POOL_CAP});
+    BOOST_CHECK(pooled.MayValidate(young, /*exempt=*/false, far_future));
+    BOOST_CHECK(young.GetPoolShareUsed() == Credit::zero());
 
     // Settings beyond the accepted range are clamped.
     TxValidationBudget clamped{TxValidationBudgetOptions{.peer_rate = std::chrono::microseconds::max(), .peer_cap = -1s,
