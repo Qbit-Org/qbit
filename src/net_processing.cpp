@@ -214,9 +214,10 @@ static constexpr double MAX_ADDR_RATE_PER_SECOND{0.1};
 static constexpr size_t MAX_ADDR_PROCESSING_TOKEN_BUCKET{MAX_ADDR_TO_SEND};
 /** The compactblocks version we support. See BIP 152. */
 static constexpr uint64_t CMPCTBLOCKS_VERSION{2};
-/** How often a peer's deferred transaction announcements that the download manager has not taken
- *  yet are announced to it again (see Peer::m_tx_reannounced): longer than one request to another
- *  peer that announced them can be outstanding, with its announcement delays. */
+/** How often a peer's deferred transaction announcements are announced to the download manager:
+ *  those deferred since the last time (see Peer::m_tx_deferred_announce_time), and those the
+ *  download manager has not taken yet (see Peer::m_tx_reannounced). Longer than one request to
+ *  another peer that announced them can be outstanding, with its announcement delays. */
 static constexpr auto DEFERRED_TX_ANNOUNCEMENT_RETRY_DELAY{node::NONPREF_PEER_TX_DELAY + node::TXID_RELAY_DELAY +
                                                           node::OVERLOADED_PEER_TX_DELAY + node::GETDATA_TX_INTERVAL + 1s};
 
@@ -610,6 +611,11 @@ struct Peer {
     std::set<GenTxid> m_tx_reannounced GUARDED_BY(NetEventsInterface::g_msgproc_mutex);
     /** When m_tx_reannounced is next announced to the download manager again. */
     std::chrono::microseconds m_tx_reannounce_time GUARDED_BY(NetEventsInterface::g_msgproc_mutex){0};
+    /** The earliest time at which m_tx_deferred_announcements is next announced to the download
+     *  manager: DEFERRED_TX_ANNOUNCEMENT_RETRY_DELAY after the last time. A request that falls due
+     *  while the peer is over its budget again is released and deferred again, so the same
+     *  announcements can come back here; they are not announced more often than that. */
+    std::chrono::microseconds m_tx_deferred_announce_time GUARDED_BY(NetEventsInterface::g_msgproc_mutex){0};
 
     explicit Peer(NodeId id, ServiceFlags our_services, bool is_inbound, bool tx_validation_exempt)
         : m_id{id}
@@ -6662,10 +6668,16 @@ bool PeerManagerImpl::SendMessages(CNode* pto)
                 }
                 peer->m_tx_reannounce_time = current_time + DEFERRED_TX_ANNOUNCEMENT_RETRY_DELAY;
             }
-            if (!peer->m_tx_deferred_announcements.empty() && !IsTxValidationThrottled(*peer)) {
+            // The budget is checked first, so that a change of the peer's state is noticed (and
+            // reported) here as before, whether or not the announcements are due.
+            if (!peer->m_tx_deferred_announcements.empty() && !IsTxValidationThrottled(*peer) &&
+                current_time >= peer->m_tx_deferred_announce_time) {
                 // The peer is within its transaction validation budget again: announce what it
                 // announced or sent while it was over it, so that those transactions are requested
-                // from it unless we already have them.
+                // from it unless we already have them. This happens at most once per
+                // DEFERRED_TX_ANNOUNCEMENT_RETRY_DELAY: what is deferred meanwhile, including
+                // requests released below, waits until then.
+                peer->m_tx_deferred_announce_time = current_time + DEFERRED_TX_ANNOUNCEMENT_RETRY_DELAY;
                 LogDebug(BCLog::NET, "considering %u transactions again that peer=%d announced while over its transaction validation budget\n",
                          peer->m_tx_deferred_announcements.size(), pto->GetId());
                 auto& reannounced{peer->m_tx_reannounced};
