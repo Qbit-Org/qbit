@@ -1260,6 +1260,99 @@ BOOST_FIXTURE_TEST_CASE(tx_validation_budget_requests_again_after_throttling, Tx
     connman->ClearTestNodes();
 }
 
+BOOST_FIXTURE_TEST_CASE(tx_validation_budget_deferred_announcements_wait_for_retry_delay, TxValidationBudgetSetup)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    auto& chainman{*Assert(m_node.chainman)};
+    BOOST_REQUIRE(!chainman.IsInitialBlockDownload());
+    const auto start{GetTime<std::chrono::seconds>()};
+    SetMockTime(start);
+
+    // No peer's own credit reaches its cap here, so every peer draws on the pool. One rejected
+    // transaction empties the pool, and the pool and the sender's share of it are full again one
+    // second later, whatever the validation cost (a balance does not go below the floor of -1 s).
+    PeerManager::Options opts;
+    opts.tx_validation_budget = TxValidationBudgetOptions{
+        .peer_rate = 1us,
+        .peer_cap = 1h,
+        .pool_rate = 10s,
+        .pool_cap = 1us,
+    };
+    auto connman = std::make_unique<ConnmanTestMsg>(0x7279, 0x7279, *m_node.addrman, *m_node.netgroupman, Params());
+    auto peerman = PeerManager::make(*connman, *m_node.addrman, m_node.banman.get(), chainman, *m_node.mempool, *m_node.warnings, opts);
+    connman->SetMsgProc(peerman.get());
+    // An inbound peer, whose announcements are requested only after a delay.
+    CNode& quiet{AddTxTestPeer(*connman, /*id=*/0, ConnectionType::INBOUND, NetPermissionFlags::None)};
+    CNode& sender{AddTxTestPeer(*connman, /*id=*/1, ConnectionType::INBOUND, NetPermissionFlags::None)};
+    SentMessages sent{*m_node.args};
+    // As DEFERRED_TX_ANNOUNCEMENT_RETRY_DELAY in net_processing.cpp.
+    constexpr auto RETRY_DELAY{67s};
+
+    const auto empty_pool{[&]() EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex) {
+        const auto charged{GetTxValidationStats(*peerman, sender).failed_time};
+        SendTx(*connman, sender, InvalidSpend());
+        BOOST_REQUIRE(GetTxValidationStats(*peerman, sender).failed_time > charged);
+    }};
+    // Move to time, optionally empty the pool, then let peerman send its messages to the quiet peer.
+    const auto requested_at{[&](std::chrono::seconds time, bool pool_empty) EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex) {
+        SetMockTime(time);
+        if (pool_empty) empty_pool();
+        return RequestedTxs(*peerman, *connman, quiet, sent);
+    }};
+
+    // The quiet peer announces a transaction while the pool is empty. It is over the budget, so
+    // the announcement is deferred. The peer sends nothing else in this test.
+    const uint256 txid{0xd1};
+    BOOST_CHECK(requested_at(start + 1s, /*pool_empty=*/true).empty());
+    AnnounceTx(*connman, quiet, txid);
+    BOOST_CHECK(GetTxValidationStats(*peerman, quiet).throttled);
+    BOOST_CHECK(RequestedTxs(*peerman, *connman, quiet, sent).empty());
+
+    // A second later the pool is full again: the peer is within the budget and the announcement
+    // is passed on. The request is not due yet.
+    const auto passed_on{start + 2s};
+    BOOST_CHECK(requested_at(passed_on, /*pool_empty=*/false).empty());
+    BOOST_CHECK(!GetTxValidationStats(*peerman, quiet).throttled);
+
+    // The pool is empty whenever the peer's messages are sent during the next seconds, so the
+    // request that falls due is released, not sent, and the announcement is deferred again.
+    for (auto time{passed_on + 1s}; time <= passed_on + 6s; time += 1s) {
+        BOOST_CHECK(requested_at(time, /*pool_empty=*/true).empty());
+    }
+    BOOST_CHECK(GetTxValidationStats(*peerman, quiet).throttled);
+
+    // From now on the pool stays full. The peer is within the budget again, which is still
+    // noticed at once, but the announcement is not passed on again before the retry delay has
+    // passed since the last time: nothing is requested meanwhile.
+    for (auto time{passed_on + 7s}; time < passed_on + RETRY_DELAY; time += 1s) {
+        BOOST_CHECK(requested_at(time, /*pool_empty=*/false).empty());
+        BOOST_CHECK(!GetTxValidationStats(*peerman, quiet).throttled);
+    }
+
+    // Then it is passed on, and the transaction is requested from the peer exactly once.
+    std::set<uint256> requested;
+    size_t requests{0};
+    for (auto time{passed_on + RETRY_DELAY}; time <= passed_on + RETRY_DELAY + 6s; time += 1s) {
+        std::set<uint256> now_requested{requested_at(time, /*pool_empty=*/false)};
+        requests += now_requested.size();
+        requested.merge(now_requested);
+    }
+    BOOST_CHECK(requested == std::set<uint256>{txid});
+    BOOST_CHECK_EQUAL(requests, 1U);
+
+    // It is not requested again, also after the request the peer did not answer has timed out
+    // and another retry delay has passed.
+    for (const auto later : {RETRY_DELAY + 70s, 2 * RETRY_DELAY + 10s, 3 * RETRY_DELAY + 10s}) {
+        BOOST_CHECK(requested_at(passed_on + later, /*pool_empty=*/false).empty());
+    }
+    BOOST_CHECK(!quiet.fDisconnect);
+    BOOST_CHECK(!sender.fDisconnect);
+
+    peerman->FinalizeNode(quiet);
+    peerman->FinalizeNode(sender);
+    connman->ClearTestNodes();
+}
+
 BOOST_FIXTURE_TEST_CASE(tx_validation_budget_requests_again_after_other_announcers_fail, TxValidationBudgetSetup)
 {
     LOCK(NetEventsInterface::g_msgproc_mutex);
