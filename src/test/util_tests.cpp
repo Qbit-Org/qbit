@@ -875,7 +875,7 @@ BOOST_AUTO_TEST_CASE(test_FormatSubVersion)
     BOOST_CHECK_EQUAL(FormatSubVersion("Test", 99900, std::vector<std::string>()),std::string("/Test:9.99.0/"));
     BOOST_CHECK_EQUAL(FormatSubVersion("Test", 99900, comments),std::string("/Test:9.99.0(comment1)/"));
     BOOST_CHECK_EQUAL(FormatSubVersion("Test", 99900, comments2),std::string("/Test:9.99.0(comment1; Comment2; .,_?@-; )/"));
-    BOOST_CHECK_EQUAL(FormatSubVersion("Test", CLIENT_VERSION, std::vector<std::string>()), std::string("/Test:") + CLIENT_VERSION_STRING + "/");
+    BOOST_CHECK_EQUAL(FormatSubVersion("Test", CLIENT_VERSION, std::vector<std::string>()), strprintf("/Test:%d.%d.%d/", CLIENT_VERSION_MAJOR, CLIENT_VERSION_MINOR, CLIENT_VERSION_BUILD));
     BOOST_CHECK_EQUAL(FormatSubVersion(UA_NAME, CLIENT_VERSION, std::vector<std::string>()), std::string("/") + UA_NAME + ":" + CLIENT_VERSION_STRING + "/");
     BOOST_CHECK_EQUAL(FormatSubVersion(UA_NAME, CLIENT_VERSION, comments), std::string("/") + UA_NAME + ":" + CLIENT_VERSION_STRING + "(comment1)/");
 }
