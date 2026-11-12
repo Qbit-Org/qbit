@@ -27,6 +27,7 @@
 #include <atomic>
 #include <algorithm>
 #include <array>
+#include <exception>
 #include <optional>
 #include <span>
 #include <string>
@@ -53,6 +54,7 @@ const std::string NAME{"name"};
 const std::string OLD_KEY{"wkey"};
 const std::string ORDERPOSNEXT{"orderposnext"};
 const std::string POOL{"pool"};
+const std::string POST_ENCRYPTION_REWRITE{"postencryptionrewrite"};
 const std::string PURPOSE{"purpose"};
 const std::string PUBKEYDBCURSOR{"pubkeydbcursor"};
 const std::string PUBKEYDBENTRY{"pubkeydbentry"};
@@ -236,8 +238,9 @@ bool WalletBatch::WriteCryptedDescriptorKey(const uint256& desc_id, const CPubKe
     if (!WriteIC(std::make_pair(DBKeys::WALLETDESCRIPTORCKEY, std::make_pair(desc_id, pubkey)), secret, false)) {
         return false;
     }
-    EraseIC(std::make_pair(DBKeys::WALLETDESCRIPTORKEY, std::make_pair(desc_id, pubkey)));
-    return true;
+    // Callers rely on the plaintext record being gone. Erasing a missing
+    // record succeeds.
+    return EraseIC(std::make_pair(DBKeys::WALLETDESCRIPTORKEY, std::make_pair(desc_id, pubkey)));
 }
 
 bool WalletBatch::WriteDescriptorPQCKey(const uint256& desc_id, const CPQCPubKey& pubkey, const CPQCKey& privkey, uint32_t sig_counter)
@@ -267,13 +270,19 @@ bool WalletBatch::WriteCryptedDescriptorPQCKey(const uint256& desc_id, const CPQ
     if (!wrote) {
         return false;
     }
-    EraseIC(std::make_pair(DBKeys::WALLETDESCRIPTORPQCKEY, std::make_pair(desc_id, pubkey)));
-    return true;
+    // Callers rely on the plaintext record being gone. Erasing a missing
+    // record succeeds.
+    return EraseIC(std::make_pair(DBKeys::WALLETDESCRIPTORPQCKEY, std::make_pair(desc_id, pubkey)));
 }
 
 bool WalletBatch::WriteDescriptor(const uint256& desc_id, const WalletDescriptor& descriptor)
 {
     return WriteIC(make_pair(DBKeys::WALLETDESCRIPTOR, desc_id), descriptor);
+}
+
+bool WalletBatch::HasDescriptor(const uint256& desc_id)
+{
+    return m_batch->Exists(std::make_pair(DBKeys::WALLETDESCRIPTOR, desc_id));
 }
 
 bool WalletBatch::WriteDescriptorDerivedCache(const CExtPubKey& xpub, const uint256& desc_id, uint32_t key_exp_index, uint32_t der_index)
@@ -340,6 +349,21 @@ bool WalletBatch::WriteLockedUTXO(const COutPoint& output)
 bool WalletBatch::EraseLockedUTXO(const COutPoint& output)
 {
     return EraseIC(std::make_pair(DBKeys::LOCKED_UTXO, std::make_pair(output.hash, output.n)));
+}
+
+bool WalletBatch::WritePostEncryptionRewrite()
+{
+    return WriteIC(DBKeys::POST_ENCRYPTION_REWRITE, uint8_t{'1'});
+}
+
+bool WalletBatch::ErasePostEncryptionRewrite()
+{
+    return EraseIC(DBKeys::POST_ENCRYPTION_REWRITE);
+}
+
+bool WalletBatch::HasPostEncryptionRewrite()
+{
+    return m_batch->Exists(DBKeys::POST_ENCRYPTION_REWRITE);
 }
 
 bool LoadKey(CWallet* pwallet, DataStream& ssKey, DataStream& ssValue, std::string& strErr)
@@ -1478,6 +1502,9 @@ static bool RunWithinTxn(WalletBatch& batch, std::string_view process_desc, cons
 
     if (!batch.TxnCommit()) {
         LogDebug(BCLog::WALLETDB, "Error: cannot commit db txn for %s\n", process_desc);
+        if (batch.HasActiveTxn() && !batch.TxnAbort()) {
+            LogDebug(BCLog::WALLETDB, "Error: cannot abort db txn after commit failure for %s\n", process_desc);
+        }
         return false;
     }
 
@@ -1541,25 +1568,97 @@ bool WalletBatch::TxnBegin()
     return m_batch->TxnBegin();
 }
 
+WalletBatch::~WalletBatch()
+{
+    if (!HasActiveTxn()) return;
+    try {
+        if (!TxnAbort()) {
+            LogDebug(BCLog::WALLETDB, "Error: cannot abort active db txn while destroying wallet batch\n");
+        }
+    } catch (const std::exception& e) {
+        LogDebug(BCLog::WALLETDB, "Error aborting active db txn while destroying wallet batch: %s\n", e.what());
+    }
+}
+
 bool WalletBatch::TxnCommit()
 {
-    bool res = m_batch->TxnCommit();
-    if (res) {
+    size_t prepared{0};
+    try {
         for (const auto& listener : m_txn_listeners) {
-            listener.on_commit();
+            ++prepared;
+            if (listener.on_commit_prepare) listener.on_commit_prepare();
         }
-        // txn finished, clear listeners
-        m_txn_listeners.clear();
+    } catch (...) {
+        const std::exception_ptr prepare_error{std::current_exception()};
+        for (size_t i{0}; i < prepared; ++i) {
+            try {
+                if (m_txn_listeners[i].on_commit_failure) m_txn_listeners[i].on_commit_failure();
+            } catch (...) {
+            }
+        }
+        std::rethrow_exception(prepare_error);
     }
-    return res;
+
+    bool res{false};
+    try {
+        res = m_batch->TxnCommit();
+    } catch (...) {
+        const std::exception_ptr commit_error{std::current_exception()};
+        for (const auto& listener : m_txn_listeners) {
+            try {
+                if (listener.on_commit_failure) listener.on_commit_failure();
+            } catch (...) {
+            }
+        }
+        std::rethrow_exception(commit_error);
+    }
+
+    if (!res) {
+        std::exception_ptr callback_error;
+        for (const auto& listener : m_txn_listeners) {
+            try {
+                if (listener.on_commit_failure) listener.on_commit_failure();
+            } catch (...) {
+                if (!callback_error) callback_error = std::current_exception();
+            }
+        }
+        if (callback_error) std::rethrow_exception(callback_error);
+        return false;
+    }
+
+    // The database is durable. Move listeners out so callbacks are never run
+    // again even if an outcome or publication callback throws.
+    std::vector<DbTxnListener> listeners{std::move(m_txn_listeners)};
+    m_txn_listeners.clear();
+    std::exception_ptr callback_error;
+    for (const auto& listener : listeners) {
+        try {
+            if (listener.on_commit_success) listener.on_commit_success();
+        } catch (...) {
+            if (!callback_error) callback_error = std::current_exception();
+        }
+    }
+    // Resolve every transaction outcome before a publication callback can
+    // acquire cs_wallet. This lets readers wait on COMMITTING safely.
+    if (!callback_error) {
+        for (const auto& listener : listeners) {
+            try {
+                if (listener.on_commit) listener.on_commit();
+            } catch (...) {
+                if (!callback_error) callback_error = std::current_exception();
+            }
+        }
+    }
+    if (callback_error) std::rethrow_exception(callback_error);
+    return true;
 }
 
 bool WalletBatch::TxnAbort()
 {
     bool res = m_batch->TxnAbort();
     if (res) {
-        for (const auto& listener : m_txn_listeners) {
-            listener.on_abort();
+        for (auto it = m_txn_listeners.rbegin(); it != m_txn_listeners.rend(); ++it) {
+            if (it->on_abort) it->on_abort();
         }
         // txn finished, clear listeners
         m_txn_listeners.clear();

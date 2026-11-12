@@ -120,15 +120,15 @@ The defaults match `doc/subtrees/libbitcoinpqc.md`; `LIBBITCOINPQC_REMOTE_URL`
 and `LIBBITCOINPQC_REMOTE_REF` can be overridden when testing a future tagged
 release before changing the defaults.
 
-This check fetches the pinned `Qbit-Org/qbit-libbitcoinpqc` release tag and
-verifies that both `HEAD:src/libbitcoinpqc` and the recorded
-`git-subtree-split` match the peeled tag commit. For the full libbitcoinpqc
+This check fetches the pinned `Qbit-Org/qbit-libbitcoinpqc` release tag,
+requires a good signature from operator-01's pinned signing key, and verifies
+that both `HEAD:src/libbitcoinpqc` and the recorded `git-subtree-split` match
+the peeled tag commit. The tag check is in `libbitcoinpqc-release-tag.sh`,
+which `contrib/devtools/update-libbitcoinpqc-subtree.sh` also uses. For the full libbitcoinpqc
 subtree workflow, see
 [`doc/subtrees/libbitcoinpqc.md`](../../doc/subtrees/libbitcoinpqc.md).
 
-The check accepts the exact documented downstream lockfile patch for
-`RUSTSEC-2026-0204-crossbeam-epoch-0.9.20`. Any other subtree drift remains a
-failure.
+Any subtree drift from the tagged upstream tree is a failure.
 
 lint-libbitcoinpqc-vectors.py
 =============================

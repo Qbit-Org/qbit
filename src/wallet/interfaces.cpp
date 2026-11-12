@@ -34,6 +34,7 @@
 
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -146,6 +147,9 @@ std::optional<bilingual_str> GetPQCKeyValidationSigningError(const CWallet& wall
     if (pqc_validation.failed_records > 0) {
         return Untranslated("Plaintext PQC wallet key validation failed. Wallet signing is disabled until the wallet is restored or repaired.");
     }
+    if (pqc_validation.reencryption_required) {
+        return Untranslated("This encrypted wallet still stores PQC private keys unencrypted, so signing is disabled. Unlocking the wallet re-encrypts them: unlock it again, and if this persists check the debug log and getwalletinfo.pqc_key_validation.");
+    }
     return std::nullopt;
 }
 
@@ -156,11 +160,27 @@ public:
 
     bool encryptWallet(const SecureString& wallet_passphrase) override
     {
-        return m_wallet->EncryptWallet(wallet_passphrase);
+        bilingual_str new_seed_error;
+        if (!m_wallet->EncryptWallet(wallet_passphrase, /*use_create_keypool_warmup=*/false, &new_seed_error)) return false;
+        if (!new_seed_error.empty()) {
+            // Neither true nor false describes this outcome, so report it as
+            // an exception, as an exception from the encryption itself is.
+            throw std::runtime_error(NewSeedFailedWarning(new_seed_error).original + " Restart the application and unlock the wallet with the new passphrase.");
+        }
+        return true;
     }
     bool isCrypted() override { return m_wallet->IsCrypted(); }
+    bool isEncryptionInProgress() override { return m_wallet->IsEncryptionInProgress(); }
     bool lock() override { return m_wallet->Lock(); }
-    bool unlock(const SecureString& wallet_passphrase) override { return m_wallet->Unlock(wallet_passphrase); }
+    bool unlock(const SecureString& wallet_passphrase) override
+    {
+        if (!m_wallet->Unlock(wallet_passphrase, /*run_pending_initial_keypool_top_up=*/false)) {
+            return false;
+        }
+        m_wallet->ReencryptPlaintextPQCKeys();
+        MaybeSchedulePendingInitialKeyPoolTopUp(m_context, m_wallet);
+        return true;
+    }
     bool isLocked() override { return m_wallet->IsLocked(); }
     bool changeWalletPassphrase(const SecureString& old_wallet_passphrase,
         const SecureString& new_wallet_passphrase) override
@@ -168,7 +188,7 @@ public:
         return m_wallet->ChangeWalletPassphrase(old_wallet_passphrase, new_wallet_passphrase);
     }
     void abortRescan() override { m_wallet->AbortRescan(); }
-    bool backupWallet(const std::string& filename) override { return m_wallet->BackupWallet(filename); }
+    util::Result<void> backupWallet(const std::string& filename) override { return m_wallet->BackupWallet(filename); }
     std::string getWalletName() override { return m_wallet->GetName(); }
     std::unique_ptr<Wallet> clone() override { return std::make_unique<WalletImpl>(m_context, m_wallet); }
     util::Result<CTxDestination> getNewDestination(const OutputType type, const std::string& label) override
@@ -360,13 +380,13 @@ public:
                                      sign,
                                      sign ? pqc_usage_recorder.GetObserver() : PQCSignatureCounterObserver{},
                                      progress_callback);
+        if (pqc_usage) {
+            *pqc_usage = sign ? BuildSigningPQCUsageReport(pqc_usage_recorder) : PQCUsageReport{};
+        }
         if (!res) return util::Error{util::ErrorString(res)};
         const auto& txr = *res;
         fee = txr.fee;
         change_pos = txr.change_pos ? int(*txr.change_pos) : -1;
-        if (pqc_usage) {
-            *pqc_usage = sign ? BuildSigningPQCUsageReport(pqc_usage_recorder) : PQCUsageReport{};
-        }
 
         return txr.tx;
     }
@@ -392,15 +412,23 @@ public:
         std::vector<bilingual_str>& errors,
         CAmount& old_fee,
         CAmount& new_fee,
-        CMutableTransaction& mtx) override
+        CMutableTransaction& mtx,
+        const SigningProgressCallback& progress_callback) override
     {
         std::vector<CTxOut> outputs; // just an empty list of new recipients for now
-        return feebumper::CreateRateBumpTransaction(*m_wallet.get(), txid, coin_control, errors, old_fee, new_fee, mtx, /* require_mine= */ true, outputs) == feebumper::Result::OK;
+        return feebumper::CreateRateBumpTransaction(*m_wallet.get(), txid, coin_control, errors, old_fee, new_fee, mtx, /* require_mine= */ true, outputs, /*original_change_index=*/std::nullopt, progress_callback) == feebumper::Result::OK;
     }
-    bool signBumpTransaction(CMutableTransaction& mtx) override
+    bool signBumpTransaction(CMutableTransaction& mtx,
+        wallet::PQCUsageReport* pqc_usage,
+        const SigningProgressCallback& progress_callback) override
     {
         if (GetPQCKeyValidationSigningError(*m_wallet)) return false;
-        return feebumper::SignTransaction(*m_wallet.get(), mtx);
+        PQCUsageRecorder pqc_usage_recorder;
+        const bool success{feebumper::SignTransaction(*m_wallet.get(), mtx, pqc_usage_recorder.GetObserver(), progress_callback)};
+        if (pqc_usage) {
+            *pqc_usage = BuildSigningPQCUsageReport(pqc_usage_recorder);
+        }
+        return success;
     }
     bool commitBumpTransaction(const Txid& txid,
         CMutableTransaction&& mtx,
@@ -479,7 +507,8 @@ public:
         size_t* n_signed,
         PartiallySignedTransaction& psbtx,
         bool& complete,
-        wallet::PQCUsageReport* pqc_usage) override
+        wallet::PQCUsageReport* pqc_usage,
+        const SigningProgressCallback& progress_callback) override
     {
         if (sign) {
             if (GetPQCKeyValidationSigningError(*m_wallet)) {
@@ -497,7 +526,8 @@ public:
                                             bip32derivs,
                                             n_signed,
                                             /*finalize=*/true,
-                                            sign ? pqc_usage_recorder.GetObserver() : PQCSignatureCounterObserver{});
+                                            sign ? pqc_usage_recorder.GetObserver() : PQCSignatureCounterObserver{},
+                                            progress_callback);
         if (pqc_usage) {
             *pqc_usage = sign ? BuildSigningPQCUsageReport(pqc_usage_recorder) : PQCUsageReport{};
         }
@@ -598,13 +628,15 @@ public:
     CAmount getMinimumFee(unsigned int tx_bytes,
         const CCoinControl& coin_control,
         int* returned_target,
-        FeeReason* reason) override
+        FeeReason* reason,
+        bool* estimate_unavailable) override
     {
         FeeCalculation fee_calc;
         CAmount result;
         result = GetMinimumFee(*m_wallet, tx_bytes, coin_control, &fee_calc);
         if (returned_target) *returned_target = fee_calc.returnedTarget;
         if (reason) *reason = fee_calc.reason;
+        if (estimate_unavailable) *estimate_unavailable = fee_calc.estimate_unavailable;
         return result;
     }
     unsigned int getConfirmTarget() override { return m_wallet->m_confirm_target; }
@@ -649,6 +681,10 @@ public:
     std::unique_ptr<Handler> handleCanGetAddressesChanged(CanGetAddressesChangedFn fn) override
     {
         return MakeSignalHandler(m_wallet->NotifyCanGetAddressesChanged.connect(fn));
+    }
+    std::unique_ptr<Handler> handleEncryptionInProgressChanged(EncryptionInProgressChangedFn fn) override
+    {
+        return MakeSignalHandler(m_wallet->NotifyEncryptionInProgressChanged.connect(fn));
     }
     CWallet* wallet() override { return m_wallet.get(); }
 

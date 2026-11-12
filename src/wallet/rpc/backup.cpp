@@ -5,6 +5,7 @@
 #include <chain.h>
 #include <clientversion.h>
 #include <core_io.h>
+#include <crypto/pqc.h>
 #include <hash.h>
 #include <interfaces/chain.h>
 #include <key_io.h>
@@ -1022,6 +1023,7 @@ RPCHelpMan importdescriptors()
         "Import descriptors. This will trigger a rescan of the blockchain based on the earliest timestamp of all descriptors being imported. Requires a new wallet backup.\n"
         "When importing descriptors with multipath key expressions, if the multipath specifier contains exactly two elements, the descriptor produced from the second element will be imported as an internal descriptor.\n"
         "P2MR descriptors that depend only on BIP32 extended public keys are not accepted; use importpubkeydb for watch-only P2MR tracking.\n"
+        + strprintf("PQC signature counters are kept per descriptor. They do not include signatures the same key made in other descriptors of this wallet, in other wallets, or outside this wallet, so the caller is responsible for keeping each PQC key within its limit of %u signatures.\n", PQC_MAX_SIGNATURES) +
             "\nNote: This call can take over an hour to complete if using an early timestamp; during that time, other rpc calls\n"
             "may report that the imported keys, addresses or scripts exist but related transactions are still missing.\n"
             "The rescan is significantly faster if block filters are available (using startup option \"-blockfilterindex=1\").\n",
@@ -1306,9 +1308,13 @@ RPCHelpMan backupwallet()
 {
     return RPCHelpMan{
         "backupwallet",
-        "Safely copies the current wallet file to the specified destination, which can either be a directory or a path with a filename.\n",
+        "Safely copies the current wallet file to the specified destination, which can either be a directory or a path with a filename.\n"
+        "If an encrypted wallet's file has not been rewritten since its encryption, it is rewritten first, and the backup fails if that rewrite fails.\n"
+        "A copy without the deleted keys can then still be made by unloading the wallet and running \"qbit-wallet dump\" on it.\n"
+        "While an encrypted wallet still stores PQC private keys unencrypted (pqc_key_validation.reencryption_required in getwalletinfo), the backup is refused with error -13, because it would contain them. Unlocking the wallet once re-encrypts them.\n",
                 {
                     {"destination", RPCArg::Type::STR, RPCArg::Optional::NO, "The destination directory or file"},
+                    {"allow_unencrypted_pqc_keys", RPCArg::Type::BOOL, RPCArg::Default{false}, "Make the backup even while reencryption_required is true, for example for a wallet with records that failed validation, which are never re-encrypted. Anyone with such a backup can read those keys without the passphrase."},
                 },
                 RPCResult{RPCResult::Type::NONE, "", ""},
                 RPCExamples{
@@ -1317,7 +1323,7 @@ RPCHelpMan backupwallet()
                 },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
-    const std::shared_ptr<const CWallet> pwallet = GetWalletForJSONRPCRequest(request);
+    const std::shared_ptr<CWallet> pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return UniValue::VNULL;
 
     // Make sure the results are valid at least up to the most recent block
@@ -1327,8 +1333,23 @@ RPCHelpMan backupwallet()
     LOCK(pwallet->cs_wallet);
 
     std::string strDest = request.params[0].get_str();
-    if (!pwallet->BackupWallet(strDest)) {
-        throw JSONRPCError(RPC_WALLET_ERROR, "Error: Wallet backup failed!");
+    const bool allow_unencrypted_pqc_keys{self.Arg<bool>("allow_unencrypted_pqc_keys")};
+    // BackupWallet refuses this too; checking here, under the cs_wallet held
+    // through the copy, gives scripts a distinct error code and the RPC remedy.
+    if (!allow_unencrypted_pqc_keys) {
+        const PQCKeyValidationInfo pqc_validation{pwallet->GetPQCKeyValidationInfo()};
+        if (pqc_validation.reencryption_required) {
+            const std::string override_hint{pqc_validation.failed_records > 0 ?
+                strprintf("%u of the records failed validation, and no unlock re-encrypts those: unlock first so that the others are, then pass allow_unencrypted_pqc_keys=true to back up anyway.", pqc_validation.failed_records) :
+                "To back up anyway, pass allow_unencrypted_pqc_keys=true."};
+            throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Error: this encrypted wallet still stores PQC private keys unencrypted (getwalletinfo.pqc_key_validation.reencryption_required), and the backup would contain them. "
+                                                         "Unlock the wallet once with walletpassphrase so that they are re-encrypted, then back up again; if it is still refused, debug.log and getwalletinfo.pqc_key_validation say why. " +
+                                                         override_hint);
+        }
+    }
+    const auto backup{pwallet->BackupWallet(strDest, allow_unencrypted_pqc_keys)};
+    if (!backup) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Error: " + util::ErrorString(backup).original);
     }
 
     return UniValue::VNULL;

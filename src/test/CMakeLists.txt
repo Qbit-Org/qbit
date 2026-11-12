@@ -81,6 +81,7 @@ add_executable(test_bitcoin
   p2mr_datapqchash_tests.cpp
   pcp_tests.cpp
   pqc_tests.cpp
+  pqc_sigcache_tests.cpp
   peerman_tests.cpp
   pmt_tests.cpp
   policy_fee_tests.cpp
@@ -124,6 +125,7 @@ add_executable(test_bitcoin
   torcontrol_tests.cpp
   transaction_tests.cpp
   translation_tests.cpp
+  tx_validation_budget_tests.cpp
   txdownload_tests.cpp
   txgraph_tests.cpp
   txindex_tests.cpp

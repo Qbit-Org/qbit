@@ -203,6 +203,9 @@ BitcoinApplication::BitcoinApplication()
     // Qt runs setlocale(LC_ALL, "") on initialization.
     RegisterMetaTypes();
     setQuitOnLastWindowClosed(false);
+
+    m_deferred_shutdown_timer = new QTimer(this);
+    connect(m_deferred_shutdown_timer, &QTimer::timeout, this, &BitcoinApplication::requestShutdown);
 }
 
 void BitcoinApplication::setupPlatformStyle()
@@ -264,6 +267,10 @@ void BitcoinApplication::createWindow(const NetworkStyle *networkStyle)
 
     pollShutdownTimer = new QTimer(window);
     connect(pollShutdownTimer, &QTimer::timeout, [this]{
+        // RPC stop and SIGTERM keep upstream's gate on purpose: an
+        // unattended stop waits for any modal dialog, including progress and
+        // asynchronous dialogs. User quits instead defer only while
+        // GUIUtil::IsUserInteractionPending() holds; see requestShutdown().
         if (!QApplication::activeModalWidget()) {
             window->detectShutdown();
         }
@@ -328,6 +335,37 @@ void BitcoinApplication::requestInitialize()
 
 void BitcoinApplication::requestShutdown()
 {
+    // Requests that arrive once shutdown has started, such as a second
+    // platform Quit while the node stops, have nothing left to do.
+    if (m_shutdown_started) return;
+
+    // Shutdown deletes the wallet views. The platform's Quit event, and
+    // File > Exit pressed through accessibility, can arrive while the user is
+    // still in a dialog whose nested event loop would return into them, so
+    // retry once every such dialog has closed. A Quit event can also arrive
+    // before GuiMain has created the main window, during the Intro dialog.
+    if (!window || GUIUtil::IsUserInteractionPending()) {
+        if (!m_deferred_shutdown_timer->isActive()) {
+            qDebug() << __func__ << ": Deferring shutdown until no dialog is open";
+            m_deferred_shutdown_timer->start(SHUTDOWN_POLLING_DELAY);
+            // Show the user what the quit waits for. A quit that seems to
+            // be ignored invites a force quit, which skips the node's flush.
+            // Raise the dialog directly: on Wayland, GUIUtil::bringToFront()
+            // re-creates the window, and hiding a dialog ends its exec().
+            if (window && (window->isHidden() || window->isMinimized())) window->showNormalIfMinimized();
+            if (QWidget* const dialog{QApplication::activeModalWidget()}) {
+                dialog->raise();
+                dialog->activateWindow();
+            }
+        }
+        return;
+    }
+    if (m_deferred_shutdown_timer->isActive()) {
+        qDebug() << __func__ << ": Running deferred shutdown";
+        m_deferred_shutdown_timer->stop();
+    }
+    m_shutdown_started = true;
+
     for (const auto w : QGuiApplication::topLevelWindows()) {
         w->hide();
     }
@@ -348,6 +386,11 @@ void BitcoinApplication::requestShutdown()
     // Request node shutdown, which can interrupt long operations, like
     // rescanning a wallet.
     node().startShutdown();
+#ifdef ENABLE_WALLET
+    // Request cancellation for every wallet send worker before teardown can
+    // block on a worker owned by a later wallet view.
+    window->prepareWalletsForShutdown();
+#endif // ENABLE_WALLET
     // Prior to unsetting the client model, stop listening backend signals
     if (clientModel) {
         clientModel->stop();
@@ -361,7 +404,8 @@ void BitcoinApplication::requestShutdown()
 #ifdef ENABLE_WALLET
     // Wallet views own background send workers and temporary unlock contexts
     // which reference WalletModel objects parented to the wallet controller.
-    // Destroy the views and join their workers before deleting those models.
+    // Destroy the views and join the already-cancelled workers before deleting
+    // those models.
     window->removeAllWallets();
 
     // Delete wallet controller here manually, instead of relying on Qt object
@@ -384,6 +428,10 @@ void BitcoinApplication::requestShutdown()
 void BitcoinApplication::initializeResult(bool success, interfaces::BlockAndHeaderTipInfo tip_info)
 {
     qDebug() << __func__ << ": Initialization result: " << success;
+
+    // A quit during initialization has already shut the GUI down, and the
+    // node shutdown it requested runs next, so do not set the GUI up again.
+    if (m_shutdown_started) return;
 
     if (success) {
         delete m_splash;

@@ -23,6 +23,10 @@ Common descriptor-aware RPCs include:
 - `descriptorprocesspsbt`
 - `generatetodescriptor` on regtest
 
+Private descriptors passed to `descriptorprocesspsbt` sign without PQC
+signature counting across calls; see
+[P2MR Signature Security Margin](../../reference/p2mr-signature-security.md).
+
 ## P2MR Descriptors
 
 qbit P2MR descriptors use `mr(...)` at the top level.

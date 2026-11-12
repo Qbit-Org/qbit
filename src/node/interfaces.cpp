@@ -619,7 +619,20 @@ public:
                int{FillBlock(block1, block1_out, lock, active, chainman().m_blockman)} &
                int{FillBlock(block2, block2_out, lock, active, chainman().m_blockman)};
     }
-    void findCoins(std::map<COutPoint, Coin>& coins) override { return FindCoins(m_node, coins); }
+    void findCoins(std::map<COutPoint, Coin>& coins, std::map<COutPoint, Txid>* mempool_spenders) override
+    {
+        assert(m_node.mempool);
+        LOCK2(cs_main, m_node.mempool->cs);
+        FindCoins(m_node, coins);
+        if (mempool_spenders) {
+            mempool_spenders->clear();
+            for (const auto& [outpoint, _] : coins) {
+                if (const auto* spender = m_node.mempool->GetConflictTx(outpoint)) {
+                    mempool_spenders->emplace(outpoint, spender->GetHash());
+                }
+            }
+        }
+    }
     double guessVerificationProgress(const uint256& block_hash) override
     {
         LOCK(chainman().GetMutex());
@@ -723,6 +736,11 @@ public:
         }
         LOCK(m_node.mempool->cs);
         return m_node.mempool->CheckPackageLimits({tx}, package_vsize);
+    }
+    bool isFinalAtTip(const CTransactionRef& tx) override
+    {
+        LOCK(::cs_main);
+        return CheckFinalTxAtTip(*Assert(chainman().ActiveChain().Tip()), *tx);
     }
     CFeeRate estimateSmartFee(int num_blocks, bool conservative, FeeCalculation* calc) override
     {
@@ -912,6 +930,7 @@ public:
 
     bool submitSolution(uint32_t version, uint32_t timestamp, uint32_t nonce, CTransactionRef coinbase) override
     {
+        if (!coinbase) return false;
         AddMerkleRootAndCoinbase(m_block_template->block, std::move(coinbase), version, timestamp, nonce);
         return chainman().ProcessNewBlock(std::make_shared<const CBlock>(m_block_template->block), /*force_processing=*/true, /*min_pow_checked=*/true, /*new_block=*/nullptr);
     }

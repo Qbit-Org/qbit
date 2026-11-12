@@ -12,6 +12,7 @@
 #include <qt/test/clientmodeltests.h>
 #include <qt/test/modaloverlaytests.h>
 #include <qt/test/optiontests.h>
+#include <qt/test/pokertests.h>
 #include <qt/test/rpcnestedtests.h>
 #include <qt/test/uritests.h>
 #include <test/util/setup_common.h>
@@ -19,6 +20,9 @@
 
 #ifdef ENABLE_WALLET
 #include <qt/test/addressbooktests.h>
+#include <qt/test/psbtoperationsdialogtests.h>
+#include <qt/test/quitmodaltests.h>
+#include <qt/test/transactionrecordtests.h>
 #include <qt/test/walletcontrollertests.h>
 #include <qt/test/walletactivitytests.h>
 #include <qt/test/wallettests.h>
@@ -30,6 +34,7 @@
 #include <QSettings>
 #include <QTest>
 
+#include <cstdlib>
 #include <functional>
 
 const std::function<void(const std::string&)> G_TEST_LOG_FUN{};
@@ -76,6 +81,22 @@ int main(int argc, char* argv[])
     QCoreApplication::setOrganizationName(QAPP_ORG_NAME);
     QCoreApplication::setApplicationName(QAPP_APP_NAME_DEFAULT "-test");
 
+#ifdef ENABLE_WALLET
+    if (const char* scenario{std::getenv(QuitModalTests::SCENARIO_ENV)}) {
+        // A child process of QuitModalTests runs one application lifecycle,
+        // with settings of its own.
+        QCoreApplication::setApplicationName(QAPP_APP_NAME_DEFAULT "-test-quit-modal");
+        int failures{0};
+        {
+            BitcoinApplication app;
+            app.createNode(*init);
+            failures = QuitModalTests::RunScenario(app, QString::fromLocal8Bit(scenario));
+        }
+        QSettings{}.clear();
+        return failures;
+    }
+#endif // ENABLE_WALLET
+
     int num_test_failures{0};
 
     {
@@ -97,12 +118,24 @@ int main(int argc, char* argv[])
         URITests test1;
         num_test_failures += QTest::qExec(&test1);
 
+        PokerTests poker_tests;
+        num_test_failures += QTest::qExec(&poker_tests);
+
         RPCNestedTests test3(app.node());
         num_test_failures += QTest::qExec(&test3);
 
 #ifdef ENABLE_WALLET
+        TransactionRecordTests transaction_record_tests;
+        num_test_failures += QTest::qExec(&transaction_record_tests);
+
         WalletTests test5(app.node());
         num_test_failures += QTest::qExec(&test5);
+
+        PSBTOperationsDialogTests psbt_operations_dialog_tests(app.node());
+        num_test_failures += QTest::qExec(&psbt_operations_dialog_tests);
+
+        QuitModalTests quit_modal_tests;
+        num_test_failures += QTest::qExec(&quit_modal_tests);
 
         WalletControllerTests wallet_controller_tests(app.node());
         num_test_failures += QTest::qExec(&wallet_controller_tests);

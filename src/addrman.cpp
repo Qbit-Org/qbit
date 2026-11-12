@@ -390,6 +390,20 @@ void AddrManImpl::Unserialize(Stream& s_)
         LogDebug(BCLog::ADDRMAN, "addrman lost %i new and %i tried addresses due to collisions or invalid addresses\n", nLostUnk, nLost);
     }
 
+    // The file does not record how a service flag was learned, so the flags
+    // that are only accepted from the peer itself are not restored. They are
+    // stored again by SetServices() when we next connect to the peer.
+    int direct_only_dropped{0};
+    for (auto& [id, info] : mapInfo) {
+        if (info.nServices & DirectOnlyServiceFlags()) {
+            info.nServices = ServiceFlags(info.nServices & ~DirectOnlyServiceFlags());
+            ++direct_only_dropped;
+        }
+    }
+    if (direct_only_dropped > 0) {
+        LogDebug(BCLog::ADDRMAN, "Did not restore service flags that are only learned from the peer itself for %i addresses\n", direct_only_dropped);
+    }
+
     const int check_code{CheckAddrman()};
     if (check_code != 0) {
         throw std::ios_base::failure(strprintf(
@@ -562,6 +576,9 @@ bool AddrManImpl::AddSingle(const CAddress& addr, const CNetAddr& source, std::c
         time_penalty = 0s;
     }
 
+    // Flags that count against an address are only stored by SetServices().
+    const ServiceFlags services{addr.nServices & ~DirectOnlyServiceFlags()};
+
     if (pinfo) {
         // periodically update nTime
         const bool currently_online{NodeClock::now() - addr.nTime < 24h};
@@ -571,7 +588,7 @@ bool AddrManImpl::AddSingle(const CAddress& addr, const CNetAddr& source, std::c
         }
 
         // add services
-        pinfo->nServices = ServiceFlags(pinfo->nServices | addr.nServices);
+        pinfo->nServices = ServiceFlags(pinfo->nServices | services);
 
         // do not update if no new information is present
         if (addr.nTime <= pinfo->nTime) {
@@ -593,6 +610,7 @@ bool AddrManImpl::AddSingle(const CAddress& addr, const CNetAddr& source, std::c
         }
     } else {
         pinfo = Create(addr, source, &nId);
+        pinfo->nServices = services;
         pinfo->nTime = std::max(NodeSeconds{0s}, pinfo->nTime - time_penalty);
     }
 

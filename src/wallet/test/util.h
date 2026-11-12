@@ -9,12 +9,16 @@
 #include <wallet/db.h>
 #include <wallet/scriptpubkeyman.h>
 
+#include <functional>
 #include <memory>
+#include <optional>
 #include <span>
+#include <vector>
 
 class ArgsManager;
 class CChain;
 class CKey;
+struct bilingual_str;
 enum class OutputType;
 namespace interfaces {
 class Chain;
@@ -36,7 +40,7 @@ std::unique_ptr<CWallet> CreateSyncedWallet(interfaces::Chain& chain, CChain& cc
 std::unique_ptr<CWallet> CreateDescriptorWallet(interfaces::Chain& chain, std::span<const OutputType> output_types, int64_t keypool_size, const std::string& wallet_name = "");
 
 std::shared_ptr<CWallet> TestLoadWallet(WalletContext& context);
-std::shared_ptr<CWallet> TestLoadWallet(std::unique_ptr<WalletDatabase> database, WalletContext& context, uint64_t create_flags);
+std::shared_ptr<CWallet> TestLoadWallet(std::unique_ptr<WalletDatabase> database, WalletContext& context, uint64_t create_flags, std::vector<bilingual_str>* warnings = nullptr);
 void TestUnloadWallet(std::shared_ptr<CWallet>&& wallet);
 
 // Creates a copy of the provided database
@@ -69,6 +73,8 @@ class MockableBatch : public DatabaseBatch
 {
 private:
     MockableDatabase& m_database;
+    bool m_txn_active{false};
+    std::optional<MockableData> m_txn_snapshot;
 
     bool ReadKey(DataStream&& key, DataStream& value) override;
     bool WriteKey(DataStream&& key, DataStream&& value, bool overwrite=true) override;
@@ -78,16 +84,16 @@ private:
 
 public:
     explicit MockableBatch(MockableDatabase& database) : m_database(database) {}
-    ~MockableBatch() = default;
+    ~MockableBatch() override;
 
-    void Close() override {}
+    void Close() override;
 
     std::unique_ptr<DatabaseCursor> GetNewCursor() override;
     std::unique_ptr<DatabaseCursor> GetNewPrefixCursor(std::span<const std::byte> prefix) override;
     bool TxnBegin() override;
     bool TxnCommit() override;
     bool TxnAbort() override;
-    bool HasActiveTxn() override { return false; }
+    bool HasActiveTxn() override { return m_txn_active; }
 };
 
 /** A WalletDatabase whose contents and return values can be modified as needed for testing
@@ -103,19 +109,37 @@ public:
     bool m_txn_begin_pass{true};
     bool m_txn_commit_pass{true};
     bool m_txn_abort_pass{true};
+    bool m_wallet_flags_write_pass{true};
+    bool m_rewrite_pass{true};
+    //! Erasing a key that starts with this prefix fails, without aborting an
+    //! open transaction.
+    std::optional<SerializeData> m_erase_fail_prefix;
+    //! Runs after a successful mock commit becomes durable, or immediately
+    //! before a failed commit returns, while WalletBatch listeners are COMMITTING.
+    std::function<void(bool)> m_txn_commit_result_hook;
     int m_write_fail_after{-1};
     int m_write_count{0};
     int m_txn_begin_count{0};
     int m_txn_commit_count{0};
     int m_txn_abort_count{0};
+    int m_rewrite_count{0};
+    mutable int m_backup_count{0};
 
     MockableDatabase(MockableData records = {}) : WalletDatabase(), m_records(records) {}
     ~MockableDatabase() = default;
 
     void Open() override {}
 
-    bool Rewrite() override { return m_pass; }
-    bool Backup(const std::string& strDest) const override { return m_pass; }
+    bool Rewrite() override
+    {
+        ++m_rewrite_count;
+        return m_pass && m_rewrite_pass;
+    }
+    bool Backup(const std::string& strDest) const override
+    {
+        ++m_backup_count;
+        return m_pass;
+    }
     void Close() override {}
 
     std::string Filename() override { return "mockable"; }
@@ -129,6 +153,8 @@ public:
         m_txn_begin_count = 0;
         m_txn_commit_count = 0;
         m_txn_abort_count = 0;
+        m_rewrite_count = 0;
+        m_backup_count = 0;
     }
 };
 

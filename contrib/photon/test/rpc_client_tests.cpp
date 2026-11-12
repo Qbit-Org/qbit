@@ -1,3 +1,7 @@
+#include <clock.h>
+#include <fec.h>
+#include <protocol.h>
+#include <relay_engine.h>
 #include <rpc_client.h>
 
 #include <arpa/inet.h>
@@ -232,6 +236,8 @@ struct ServerStep {
     std::string response{};
     int delay_ms{0};
     std::function<void(const std::string&)> on_request{};
+    // When set, the response is written in eight slices with this pause before each.
+    int slice_delay_ms{0};
 };
 
 class MockHttpServer {
@@ -341,7 +347,15 @@ private:
                 std::this_thread::sleep_for(std::chrono::milliseconds(step.delay_ms));
             }
 
-            SendAll(client_fd, step.response);
+            if (step.slice_delay_ms > 0) {
+                const std::size_t slice = (step.response.size() + 7) / 8;
+                for (std::size_t offset = 0; offset < step.response.size(); offset += slice) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(step.slice_delay_ms));
+                    SendAll(client_fd, step.response.substr(offset, slice));
+                }
+            } else {
+                SendAll(client_fd, step.response);
+            }
             shutdown(client_fd, SHUT_RDWR);
             close(client_fd);
         }
@@ -513,7 +527,8 @@ void TestSubmitBlockSuccess()
     });
 
     const std::vector<std::uint8_t> block_data{0xAA, 0xBB, 0xCC, 0xDD};
-    Require(client.SubmitBlock(block_data), "SubmitBlock should succeed on null result + null error");
+    Require(client.SubmitBlock(block_data) == photon::SubmitOutcome::kAccepted,
+            "SubmitBlock should succeed on null result + null error");
     Require(captured_request.find("\"method\":\"submitblock\"") != std::string::npos, "submitblock RPC method not present in request");
     Require(captured_request.find("aabbccdd") != std::string::npos, "submitblock payload hex not present in request");
 
@@ -546,6 +561,539 @@ void TestConnectionClosedDuringRequestHandling()
     server.Stop();
 }
 
+photon::RpcClient MakeClient(std::uint16_t port, const std::filesystem::path& cookie_path, std::chrono::milliseconds timeout)
+{
+    return photon::RpcClient(photon::RpcClientOptions{
+        .host = "127.0.0.1",
+        .port = port,
+        .cookie_file = cookie_path.string(),
+        .timeout = timeout,
+    });
+}
+
+std::string JsonResult(const std::string& result_json)
+{
+    return HttpResponse(200, R"({"result":)" + result_json + R"(,"error":null,"id":"x"})");
+}
+
+std::string JsonError(int code, const std::string& message)
+{
+    return HttpResponse(500, R"({"result":null,"error":{"code":)" + std::to_string(code) + R"(,"message":")" + message + R"("},"id":"x"})");
+}
+
+std::string HashHex(char digit)
+{
+    return std::string(64, digit);
+}
+
+// 64-digit chain work with `tail` as its low digits.
+std::string ChainWork(const std::string& tail)
+{
+    return std::string(64 - tail.size(), '0') + tail;
+}
+
+std::string HeaderReply(const std::string& hash, int confirmations, int height, const std::string& chainwork)
+{
+    return JsonResult(R"({"hash":")" + hash + R"(","confirmations":)" + std::to_string(confirmations)
+                      + R"(,"height":)" + std::to_string(height) + R"(,"version":536870912,"bits":"1d00ffff","chainwork":")"
+                      + chainwork + R"(","nTx":1})");
+}
+
+std::string RequestMethod(const std::string& request)
+{
+    const std::string key = "\"method\":\"";
+    const auto start = request.find(key);
+    if (start == std::string::npos) {
+        return {};
+    }
+    const auto end = request.find('"', start + key.size());
+    return request.substr(start + key.size(), end - start - key.size());
+}
+
+void RequireMethods(const MockHttpServer& server, const std::vector<std::string>& expected)
+{
+    const auto requests = server.requests();
+    Require(requests.size() == expected.size(),
+            "expected " + std::to_string(expected.size()) + " RPC calls, saw " + std::to_string(requests.size()));
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        Require(RequestMethod(requests[i]) == expected[i], "unexpected RPC call " + RequestMethod(requests[i]));
+    }
+}
+
+void TestSubmitBlockOutcomes()
+{
+    struct Case {
+        std::string response;
+        int delay_ms;
+        photon::SubmitOutcome expected;
+    };
+    const std::vector<Case> cases{
+        {JsonResult("null"), 0, photon::SubmitOutcome::kAccepted},
+        {JsonResult(R"("duplicate")"), 0, photon::SubmitOutcome::kDuplicate},
+        {JsonResult(R"("duplicate-invalid")"), 0, photon::SubmitOutcome::kKnownInvalid},
+        {JsonResult(R"("inconclusive")"), 0, photon::SubmitOutcome::kInconclusive},
+        {JsonResult(R"("high-hash")"), 0, photon::SubmitOutcome::kRejected},
+        {JsonError(-22, "Block decode failed"), 0, photon::SubmitOutcome::kRejected},
+        {JsonError(-28, "Loading block index..."), 0, photon::SubmitOutcome::kError},
+        {JsonError(-25, "system error"), 0, photon::SubmitOutcome::kError},
+        {HttpResponse(200, "not json"), 0, photon::SubmitOutcome::kError},
+        {JsonResult("null"), 250, photon::SubmitOutcome::kTimeout},
+    };
+
+    for (const Case& test_case : cases) {
+        const auto cookie_path = WriteTempFile("rpc_cookie_outcome", "__cookie__:outcometoken\n");
+        MockHttpServer server({ServerStep{test_case.response, test_case.delay_ms, {}}});
+        photon::RpcClient client = MakeClient(server.port(), cookie_path, std::chrono::milliseconds{100});
+
+        const std::vector<std::uint8_t> block_data{0x01, 0x02};
+        const photon::SubmitOutcome outcome = client.SubmitBlock(block_data);
+        Require(outcome == test_case.expected,
+                std::string("submitblock outcome ") + photon::SubmitOutcomeName(outcome) + ", expected "
+                    + photon::SubmitOutcomeName(test_case.expected));
+
+        RemoveFile(cookie_path);
+        server.Stop();
+    }
+}
+
+struct ParentCase {
+    std::vector<ServerStep> steps;
+    photon::ParentCheck expected;
+    std::vector<std::string> methods;
+};
+
+const std::string kBlockHash = std::string(64, 'd');
+
+void RunParentCase(const std::string& name, const ParentCase& test_case, const std::string& prev, std::uint32_t depth = 6,
+                   std::chrono::milliseconds timeout = std::chrono::milliseconds{2000},
+                   const std::string& block = kBlockHash)
+{
+    const auto cookie_path = WriteTempFile("rpc_cookie_parent", "__cookie__:parenttoken\n");
+    MockHttpServer server(test_case.steps);
+    photon::RpcClient client = MakeClient(server.port(), cookie_path, timeout);
+
+    const photon::ParentCheck result = client.CheckParent(block, prev, depth);
+    server.Stop();
+    RemoveFile(cookie_path);
+
+    Require(result == test_case.expected, name + ": parent check returned " + photon::ParentCheckName(result)
+                                              + ", expected " + photon::ParentCheckName(test_case.expected));
+    RequireMethods(server, test_case.methods);
+}
+
+ServerStep BlockNotFound()
+{
+    return ServerStep{JsonError(-5, "Block not found")};
+}
+
+void TestCheckParentBestBlock()
+{
+    const std::string prev = HashHex('a');
+    RunParentCase("best block",
+                  {{ServerStep{JsonResult("\"" + prev + "\"")}}, photon::ParentCheck::kNearTip, {"getbestblockhash"}},
+                  prev);
+}
+
+void TestCheckParentBlockAlreadyKnown()
+{
+    const std::string prev = HashHex('a');
+    RunParentCase("block is the best block",
+                  {{ServerStep{JsonResult("\"" + kBlockHash + "\"")}}, photon::ParentCheck::kAlreadyKnown, {"getbestblockhash"}},
+                  prev);
+    // A block the node already has near the tip is recognised before its parent is judged...
+    RunParentCase("block on the best chain",
+                  {{ServerStep{JsonResult("\"" + HashHex('b') + "\"")}, ServerStep{HeaderReply(kBlockHash, 3, 98, ChainWork("100"))}},
+                   photon::ParentCheck::kAlreadyKnown,
+                   {"getbestblockhash", "getblockheader"}},
+                  prev);
+    // ...but one deep in the best chain is as far from the tip as a block whose parent is.
+    RunParentCase("block deep in the best chain",
+                  {{ServerStep{JsonResult("\"" + HashHex('b') + "\"")}, ServerStep{HeaderReply(kBlockHash, 20, 80, ChainWork("100"))}},
+                   photon::ParentCheck::kTooFar,
+                   {"getbestblockhash", "getblockheader"}},
+                  prev);
+}
+
+void TestCheckParentActiveChainDepth()
+{
+    const std::string prev = HashHex('a');
+    const std::string best = HashHex('b');
+    const std::vector<std::string> calls{"getbestblockhash", "getblockheader", "getblockheader"};
+    // confirmations counts the best block itself: 7 confirmations is 6 blocks below it.
+    RunParentCase("depth 6",
+                  {{ServerStep{JsonResult("\"" + best + "\"")}, BlockNotFound(), ServerStep{HeaderReply(prev, 7, 94, ChainWork("100"))}},
+                   photon::ParentCheck::kNearTip,
+                   calls},
+                  prev);
+    RunParentCase("depth 7",
+                  {{ServerStep{JsonResult("\"" + best + "\"")}, BlockNotFound(), ServerStep{HeaderReply(prev, 8, 93, ChainWork("100"))}},
+                   photon::ParentCheck::kTooFar,
+                   calls},
+                  prev);
+    RunParentCase("depth 0 limit",
+                  {{ServerStep{JsonResult("\"" + best + "\"")}, BlockNotFound(), ServerStep{HeaderReply(prev, 2, 99, ChainWork("100"))}},
+                   photon::ParentCheck::kTooFar,
+                   calls},
+                  prev, 0);
+    // A block the node holds only off its best chain is still judged by its parent.
+    RunParentCase("block known on another branch",
+                  {{ServerStep{JsonResult("\"" + best + "\"")},
+                    ServerStep{HeaderReply(kBlockHash, -1, 95, ChainWork("100"))},
+                    ServerStep{HeaderReply(prev, 7, 94, ChainWork("100"))}},
+                   photon::ParentCheck::kNearTip,
+                   calls},
+                  prev);
+}
+
+void TestCheckParentUnknown()
+{
+    const std::string prev = HashHex('a');
+    RunParentCase("unknown parent",
+                  {{ServerStep{JsonResult("\"" + HashHex('b') + "\"")}, BlockNotFound(), BlockNotFound()},
+                   photon::ParentCheck::kUnknown,
+                   {"getbestblockhash", "getblockheader", "getblockheader"}},
+                  prev);
+}
+
+void TestCheckParentCompetingBranchNearTip()
+{
+    const std::string prev = HashHex('a');
+    const std::string best = HashHex('b');
+    const std::string anchor = HashHex('c');
+    const std::vector<std::string> all_calls{
+        "getbestblockhash", "getblockheader", "getblockheader", "getblockheader", "getblockhash", "getblockheader"};
+
+    // The best block's sibling: same height, side branch, chain work above the block six below the tip.
+    std::string getblockhash_request;
+    RunParentCase("sibling of the best block",
+                  {{ServerStep{JsonResult("\"" + best + "\"")},
+                    BlockNotFound(),
+                    ServerStep{HeaderReply(prev, -1, 100, ChainWork("1f4"))},
+                    ServerStep{HeaderReply(best, 1, 100, ChainWork("1f5"))},
+                    ServerStep{JsonResult("\"" + anchor + "\""), 0, [&getblockhash_request](const std::string& r) { getblockhash_request = r; }},
+                    ServerStep{HeaderReply(anchor, 7, 94, ChainWork("1ef"))}},
+                   photon::ParentCheck::kNearTip,
+                   all_calls},
+                  prev);
+    Require(getblockhash_request.find("\"params\":[94]") != std::string::npos, "anchor should be six blocks below the best block");
+
+    // A competing branch tip six blocks down with exactly the anchor's chain work still qualifies.
+    RunParentCase("competing branch at the depth limit",
+                  {{ServerStep{JsonResult("\"" + best + "\"")},
+                    BlockNotFound(),
+                    ServerStep{HeaderReply(prev, -1, 94, ChainWork("1ef"))},
+                    ServerStep{HeaderReply(best, 1, 100, ChainWork("1f5"))},
+                    ServerStep{JsonResult("\"" + anchor + "\"")},
+                    ServerStep{HeaderReply(anchor, 7, 94, ChainWork("1ef"))}},
+                   photon::ParentCheck::kNearTip,
+                   all_calls},
+                  prev);
+
+    // Same heights, but the branch carries less work than the best chain six blocks down.
+    RunParentCase("low-work branch",
+                  {{ServerStep{JsonResult("\"" + best + "\"")},
+                    BlockNotFound(),
+                    ServerStep{HeaderReply(prev, -1, 99, ChainWork("1ee"))},
+                    ServerStep{HeaderReply(best, 1, 100, ChainWork("1f5"))},
+                    ServerStep{JsonResult("\"" + anchor + "\"")},
+                    ServerStep{HeaderReply(anchor, 7, 94, ChainWork("1ef"))}},
+                   photon::ParentCheck::kTooFar,
+                   all_calls},
+                  prev);
+
+    // A branch block far below the best block is refused before the chain-work lookup.
+    RunParentCase("branch far below the tip",
+                  {{ServerStep{JsonResult("\"" + best + "\"")},
+                    BlockNotFound(),
+                    ServerStep{HeaderReply(prev, -1, 93, ChainWork("1e0"))},
+                    ServerStep{HeaderReply(best, 1, 100, ChainWork("1f5"))}},
+                   photon::ParentCheck::kTooFar,
+                   {"getbestblockhash", "getblockheader", "getblockheader", "getblockheader"}},
+                  prev);
+}
+
+void TestCheckParentNodeBehind()
+{
+    const std::string prev = HashHex('a');
+    const std::string best = HashHex('b');
+    // The node knows the parent only as a header more than six blocks above its best block (it is
+    // still syncing).
+    RunParentCase("parent far above the best block",
+                  {{ServerStep{JsonResult("\"" + best + "\"")},
+                    BlockNotFound(),
+                    ServerStep{HeaderReply(prev, -1, 107, ChainWork("2f4"))},
+                    ServerStep{HeaderReply(best, 1, 100, ChainWork("1f5"))}},
+                   photon::ParentCheck::kNodeBehind,
+                   {"getbestblockhash", "getblockheader", "getblockheader", "getblockheader"}},
+                  prev);
+    // A longer branch with less work than the best chain is judged by its chain work instead.
+    RunParentCase("longer low-work branch",
+                  {{ServerStep{JsonResult("\"" + best + "\"")},
+                    BlockNotFound(),
+                    ServerStep{HeaderReply(prev, -1, 105, ChainWork("040"))},
+                    ServerStep{HeaderReply(best, 1, 100, ChainWork("1f5"))},
+                    ServerStep{JsonResult("\"" + HashHex('c') + "\"")},
+                    ServerStep{HeaderReply(HashHex('c'), 7, 94, ChainWork("1ef"))}},
+                   photon::ParentCheck::kTooFar,
+                   {"getbestblockhash", "getblockheader", "getblockheader", "getblockheader", "getblockhash", "getblockheader"}},
+                  prev);
+}
+
+void TestCheckParentNotConnected()
+{
+    const std::string prev = HashHex('a');
+    const std::string best = HashHex('b');
+    const std::vector<std::string> calls{"getbestblockhash", "getblockheader", "getblockheader", "getblockheader"};
+    // The node has the parent's header just above its best block but has not connected it yet.
+    RunParentCase("parent header next to the best block",
+                  {{ServerStep{JsonResult("\"" + best + "\"")},
+                    BlockNotFound(),
+                    ServerStep{HeaderReply(prev, -1, 101, ChainWork("1f6"))},
+                    ServerStep{HeaderReply(best, 1, 100, ChainWork("1f5"))}},
+                   photon::ParentCheck::kParentNotConnected,
+                   calls},
+                  prev);
+    RunParentCase("parent header at the depth limit above the best block",
+                  {{ServerStep{JsonResult("\"" + best + "\"")},
+                    BlockNotFound(),
+                    ServerStep{HeaderReply(prev, -1, 106, ChainWork("2f4"))},
+                    ServerStep{HeaderReply(best, 1, 100, ChainWork("1f5"))}},
+                   photon::ParentCheck::kParentNotConnected,
+                   calls},
+                  prev);
+    // A branch with more work than the best block, even below it in height.
+    RunParentCase("lower branch with more work",
+                  {{ServerStep{JsonResult("\"" + best + "\"")},
+                    BlockNotFound(),
+                    ServerStep{HeaderReply(prev, -1, 98, ChainWork("2f4"))},
+                    ServerStep{HeaderReply(best, 1, 100, ChainWork("1f5"))}},
+                   photon::ParentCheck::kParentNotConnected,
+                   calls},
+                  prev);
+    RunParentCase("depth 0 limit",
+                  {{ServerStep{JsonResult("\"" + best + "\"")},
+                    BlockNotFound(),
+                    ServerStep{HeaderReply(prev, -1, 101, ChainWork("1f6"))},
+                    ServerStep{HeaderReply(best, 1, 100, ChainWork("1f5"))}},
+                   photon::ParentCheck::kNodeBehind,
+                   calls},
+                  prev, 0);
+}
+
+void TestCheckParentUnavailable()
+{
+    const std::string prev = HashHex('a');
+    const std::string best = HashHex('b');
+
+    RunParentCase("no answer",
+                  {{ServerStep{JsonResult("\"" + best + "\""), 300, {}}}, photon::ParentCheck::kUnavailable, {"getbestblockhash"}},
+                  prev, 6, std::chrono::milliseconds{100});
+    RunParentCase("node warming up",
+                  {{ServerStep{JsonResult("\"" + best + "\"")}, ServerStep{JsonError(-28, "Loading block index...")}},
+                   photon::ParentCheck::kUnavailable,
+                   {"getbestblockhash", "getblockheader"}},
+                  prev);
+    RunParentCase("malformed header reply",
+                  {{ServerStep{JsonResult("\"" + best + "\"")}, BlockNotFound(), ServerStep{HeaderReply(prev, 3, 98, "zz")}},
+                   photon::ParentCheck::kUnavailable,
+                   {"getbestblockhash", "getblockheader", "getblockheader"}},
+                  prev);
+    RunParentCase("malformed best block hash",
+                  {{ServerStep{JsonResult("\"1234\"")}}, photon::ParentCheck::kUnavailable, {"getbestblockhash"}},
+                  prev);
+    RunParentCase("malformed input", {{}, photon::ParentCheck::kUnavailable, {}}, "not-a-hash");
+    RunParentCase("malformed block hash", {{}, photon::ParentCheck::kUnavailable, {}}, prev, 6, std::chrono::milliseconds{2000}, "xyz");
+}
+
+void TestCheckParentSharesOneDeadline()
+{
+    const std::string prev = HashHex('a');
+    const std::string best = HashHex('b');
+    const auto cookie_path = WriteTempFile("rpc_cookie_deadline", "__cookie__:deadlinetoken\n");
+    // The first reply arrives in time; the second would arrive after the check's single deadline,
+    // so the check gives up at the deadline instead of waiting another full timeout.
+    MockHttpServer server({ServerStep{JsonResult("\"" + best + "\""), 500, {}}, ServerStep{JsonError(-5, "Block not found"), 1500, {}}});
+    photon::RpcClient client = MakeClient(server.port(), cookie_path, std::chrono::milliseconds{1000});
+
+    const auto start = std::chrono::steady_clock::now();
+    const photon::ParentCheck result = client.CheckParent(kBlockHash, prev, 6);
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    server.Stop();
+    RemoveFile(cookie_path);
+
+    Require(result == photon::ParentCheck::kUnavailable, "check past its deadline should be unavailable");
+    Require(elapsed < std::chrono::milliseconds{1400}, "check should end at its single deadline");
+    RequireMethods(server, {"getbestblockhash", "getblockheader"});
+}
+
+void TestRpcDeadlineBoundsWholeCall()
+{
+    const auto cookie_path = WriteTempFile("rpc_cookie_trickle", "__cookie__:trickletoken\n");
+    // Each slice of the reply arrives well within the socket timeout, but the whole reply does not
+    // arrive within the call's deadline.
+    MockHttpServer server({ServerStep{JsonResult(R"("ok")"), 0, {}, 100}});
+    photon::RpcClient client = MakeClient(server.port(), cookie_path, std::chrono::milliseconds{300});
+
+    const auto start = std::chrono::steady_clock::now();
+    const photon::SubmitOutcome outcome = client.SubmitBlock(std::vector<std::uint8_t>{0x01});
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    server.Stop();
+    RemoveFile(cookie_path);
+
+    Require(outcome == photon::SubmitOutcome::kTimeout, "late reply should count as a timeout");
+    Require(elapsed < std::chrono::milliseconds{650}, "call should end at its deadline");
+}
+
+class RpcBlockSubmitter final : public photon::BlockSubmitter {
+public:
+    explicit RpcBlockSubmitter(photon::RpcClient& client)
+        : m_client(client)
+    {
+    }
+
+    photon::ParentCheck CheckParent(const std::string& block_hash_hex,
+                                    const std::string& prev_hash_hex,
+                                    std::uint32_t max_depth) override
+    {
+        return m_client.CheckParent(block_hash_hex, prev_hash_hex, max_depth);
+    }
+
+    photon::SubmitOutcome SubmitBlock(std::span<const std::uint8_t> block_data) override
+    {
+        return m_client.SubmitBlock(block_data);
+    }
+
+private:
+    photon::RpcClient& m_client;
+};
+
+// Relays one block whose parent is `prev_display_hex` through a RelayEngine backed by a real
+// RpcClient talking to the scripted node.
+photon::RelayStats RelayBlockThroughNode(const std::string& prev_display_hex,
+                                         std::vector<ServerStep> steps,
+                                         std::vector<std::uint8_t>& block,
+                                         std::vector<std::string>& requests)
+{
+    block.assign(300, 0);
+    for (std::size_t i = 0; i < block.size(); ++i) {
+        block[i] = static_cast<std::uint8_t>(i * 7 + 3);
+    }
+    for (std::size_t i = 0; i < 32; ++i) {
+        const std::string byte_hex = prev_display_hex.substr((31 - i) * 2, 2);
+        block[4 + i] = static_cast<std::uint8_t>(std::stoul(byte_hex, nullptr, 16));
+    }
+    const auto summary = photon::ReadBlockHeaderSummary(block);
+    Require(summary.has_value() && summary->prev_hash_hex == prev_display_hex, "test block parent mismatch");
+    const std::uint64_t prefix = photon::BlockIdFromHex(summary->hash_hex);
+
+    const auto cookie_path = WriteTempFile("rpc_cookie_relay", "__cookie__:relaytoken\n");
+    MockHttpServer server(std::move(steps));
+    photon::RpcClient client = MakeClient(server.port(), cookie_path, std::chrono::milliseconds{2000});
+    RpcBlockSubmitter submitter(client);
+
+    photon::MockClock clock{};
+    photon::RelayEngine engine(clock);
+    photon::fec::Encoder encoder(photon::fec::Parameters::FromDataChunkCount(2));
+    const photon::fec::EncodedBlock encoded = encoder.Encode(block);
+
+    photon::BlockHeaderPayload header{};
+    header.block_hash_prefix = prefix;
+    header.original_size = block.size();
+    header.data_chunks = encoded.params.data_chunks;
+    header.coding_group_count = encoded.coding_group_count;
+    engine.OnBlockHeader(header, submitter);
+    for (std::size_t i = 0; i < 2; ++i) {
+        photon::BlockChunkPayload chunk{};
+        chunk.block_hash_prefix = prefix;
+        chunk.coding_group_id = encoded.chunks[i].coding_group_id;
+        chunk.chunk_id = encoded.chunks[i].chunk_id;
+        chunk.data_len = static_cast<std::uint16_t>(photon::fec::FEC_CHUNK_SIZE);
+        chunk.chunk_data = encoded.chunks[i].bytes;
+        engine.OnBlockChunk(chunk, submitter);
+    }
+
+    server.Stop();
+    RemoveFile(cookie_path);
+    requests = server.requests();
+    return engine.stats();
+}
+
+void TestRelaySubmitsChildOfCompetingTip()
+{
+    const std::string sibling = HashHex('5');
+    const std::string best = HashHex('6');
+    const std::string anchor = HashHex('7');
+    std::vector<std::uint8_t> block;
+    std::vector<std::string> requests;
+    const photon::RelayStats stats = RelayBlockThroughNode(
+        sibling,
+        {ServerStep{JsonResult("\"" + best + "\"")},
+         ServerStep{JsonError(-5, "Block not found")},
+         ServerStep{HeaderReply(sibling, -1, 100, ChainWork("1f4"))},
+         ServerStep{HeaderReply(best, 1, 100, ChainWork("1f4"))},
+         ServerStep{JsonResult("\"" + anchor + "\"")},
+         ServerStep{HeaderReply(anchor, 7, 94, ChainWork("1ee"))},
+         ServerStep{JsonResult("null")}},
+        block,
+        requests);
+
+    Require(requests.size() == 7 && RequestMethod(requests.back()) == "submitblock", "block should reach submitblock");
+    std::string block_hex;
+    for (const std::uint8_t byte : block) {
+        static constexpr char kHex[] = "0123456789abcdef";
+        block_hex.push_back(kHex[byte >> 4]);
+        block_hex.push_back(kHex[byte & 0x0F]);
+    }
+    Require(requests.back().find(block_hex) != std::string::npos, "submitted bytes should be the relayed block");
+    Require(stats.submit_successes == 1, "block should be counted as accepted");
+}
+
+void TestRelaySubmitsChildOfUnconnectedParent()
+{
+    const std::string parent = HashHex('5');
+    const std::string best = HashHex('6');
+    std::vector<std::uint8_t> block;
+    std::vector<std::string> requests;
+    // qbitd has the parent's header one block above its best block, and stores the block without
+    // connecting it yet.
+    const photon::RelayStats stats = RelayBlockThroughNode(
+        parent,
+        {ServerStep{JsonResult("\"" + best + "\"")},
+         ServerStep{JsonError(-5, "Block not found")},
+         ServerStep{HeaderReply(parent, -1, 101, ChainWork("1f5"))},
+         ServerStep{HeaderReply(best, 1, 100, ChainWork("1f4"))},
+         ServerStep{JsonResult(R"("inconclusive")")}},
+        block,
+        requests);
+
+    Require(requests.size() == 5 && RequestMethod(requests.back()) == "submitblock", "block should reach submitblock");
+    Require(stats.blocks_parent_pending == 1 && stats.submit_inconclusive == 1, "block should be counted as submitted early");
+    Require(stats.blocks_node_behind == 0 && stats.blocks_parent_rejected == 0, "block should not be dropped");
+}
+
+void TestRelayDropsBlockOnLowWorkBranch()
+{
+    const std::string branch = HashHex('5');
+    const std::string best = HashHex('6');
+    const std::string anchor = HashHex('7');
+    std::vector<std::uint8_t> block;
+    std::vector<std::string> requests;
+    const photon::RelayStats stats = RelayBlockThroughNode(
+        branch,
+        {ServerStep{JsonResult("\"" + best + "\"")},
+         ServerStep{JsonError(-5, "Block not found")},
+         ServerStep{HeaderReply(branch, -1, 99, ChainWork("040"))},
+         ServerStep{HeaderReply(best, 1, 100, ChainWork("1f4"))},
+         ServerStep{JsonResult("\"" + anchor + "\"")},
+         ServerStep{HeaderReply(anchor, 7, 94, ChainWork("1ee"))},
+         ServerStep{JsonResult("null")}},
+        block,
+        requests);
+
+    Require(requests.size() == 6, "block on a low-work branch must not reach submitblock");
+    Require(stats.blocks_parent_rejected == 1 && stats.submit_successes == 0, "block should be counted as dropped");
+}
+
 int RunAllTests()
 {
     const std::vector<std::pair<std::string, std::function<void()>>> tests = {
@@ -555,6 +1103,20 @@ int RunAllTests()
         {"timeout_handling", TestTimeoutHandling},
         {"submitblock_success", TestSubmitBlockSuccess},
         {"connection_closed_during_request", TestConnectionClosedDuringRequestHandling},
+        {"submitblock_outcomes", TestSubmitBlockOutcomes},
+        {"check_parent_best_block", TestCheckParentBestBlock},
+        {"check_parent_block_already_known", TestCheckParentBlockAlreadyKnown},
+        {"check_parent_node_behind", TestCheckParentNodeBehind},
+        {"check_parent_not_connected", TestCheckParentNotConnected},
+        {"rpc_deadline_bounds_whole_call", TestRpcDeadlineBoundsWholeCall},
+        {"check_parent_active_chain_depth", TestCheckParentActiveChainDepth},
+        {"check_parent_unknown", TestCheckParentUnknown},
+        {"check_parent_competing_branch_near_tip", TestCheckParentCompetingBranchNearTip},
+        {"check_parent_unavailable", TestCheckParentUnavailable},
+        {"check_parent_shares_one_deadline", TestCheckParentSharesOneDeadline},
+        {"relay_submits_child_of_competing_tip", TestRelaySubmitsChildOfCompetingTip},
+        {"relay_drops_block_on_low_work_branch", TestRelayDropsBlockOnLowWorkBranch},
+        {"relay_submits_child_of_unconnected_parent", TestRelaySubmitsChildOfUnconnectedParent},
     };
 
     int failures = 0;

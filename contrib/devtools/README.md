@@ -177,25 +177,29 @@ Example usage:
 update-libbitcoinpqc-subtree.sh
 ===============================
 
-Updates the `src/libbitcoinpqc` subtree from the pinned upstream release tag,
-then runs `test/lint/libbitcoinpqc-subtree-check.sh` to verify that the vendored
-tree and recorded `git-subtree-split` match the peeled tag commit.
+Refreshes `src/libbitcoinpqc` to a signed `qbit-libbitcoinpqc` release tag as
+one main-line commit with `git-subtree-dir` and `git-subtree-split` trailers. A
+first import is a maintainer task outside the helper.
+Before changing the tree it checks for a clean tree, Git 2.45 or later, the
+tag's signature and name, a downgrade, and any downstream delta the release
+would drop. It then runs `test/lint/libbitcoinpqc-subtree-check.sh` and undoes
+the import commit if the check fails or the helper is interrupted first.
 
 The default source is
-`https://github.com/Qbit-Org/qbit-libbitcoinpqc.git` tag `v0.3.0`. For the
-full release-tag import workflow, see
+`https://github.com/Qbit-Org/qbit-libbitcoinpqc.git` tag `v0.3.2`. For the
+checks, the flags and the delta review, see
 [`doc/subtrees/libbitcoinpqc.md`](../../doc/subtrees/libbitcoinpqc.md).
 
-Run from the repository root:
+Run from the repository root. `<tag>` is optional and defaults to `v0.3.2`:
 
 ```bash
-contrib/devtools/update-libbitcoinpqc-subtree.sh
+contrib/devtools/update-libbitcoinpqc-subtree.sh [<tag>]
 ```
 
-Optional overrides:
+Optional flags and overrides:
 
 ```bash
 LIBBITCOINPQC_REMOTE_URL=git@github.com:Qbit-Org/qbit-libbitcoinpqc.git \
-LIBBITCOINPQC_REMOTE_REF=v0.3.0 \
-contrib/devtools/update-libbitcoinpqc-subtree.sh
+contrib/devtools/update-libbitcoinpqc-subtree.sh \
+  [--allow-downgrade] [--accept-upstream <path>]... [<tag>]
 ```

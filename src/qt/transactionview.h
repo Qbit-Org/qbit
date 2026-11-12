@@ -12,6 +12,7 @@
 
 #include <QWidget>
 #include <QKeyEvent>
+#include <QMetaObject>
 
 class PlatformStyle;
 class TransactionDescDialog;
@@ -20,8 +21,10 @@ class WalletModel;
 
 QT_BEGIN_NAMESPACE
 class QComboBox;
+class QDateTime;
 class QDateTimeEdit;
 class QFrame;
+class QLabel;
 class QLineEdit;
 class QMenu;
 class QModelIndex;
@@ -68,6 +71,7 @@ private:
     WalletModel *model{nullptr};
     TransactionFilterProxy *transactionProxyModel{nullptr};
     QTableView *transactionView{nullptr};
+    QMetaObject::Connection m_fee_bumped_connection;
 
     QComboBox *dateWidget;
     QComboBox *typeWidget;
@@ -79,12 +83,16 @@ private:
     QFrame *dateRangeWidget;
     QDateTimeEdit *dateFrom;
     QDateTimeEdit *dateTo;
+    QFrame* m_fee_bump_usage_widget{nullptr};
+    QLabel* m_fee_bump_usage_label{nullptr};
     QAction *abandonAction{nullptr};
     QAction *bumpFeeAction{nullptr};
     QAction *copyAddressAction{nullptr};
     QAction *copyLabelAction{nullptr};
 
     QWidget *createDateRangeWidget();
+    QWidget* createFeeBumpUsageWidget();
+    void showFeeBumpUsage(const Txid& bumped_txid, const QString& pqc_usage, const QDateTime& committed_at);
 
     bool eventFilter(QObject *obj, QEvent *event) override;
 

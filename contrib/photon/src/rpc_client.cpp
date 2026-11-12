@@ -25,10 +25,15 @@
 namespace photon {
 namespace {
 
+// JSON-RPC error codes returned by the node (src/rpc/protocol.h).
+constexpr std::int64_t kRpcInvalidAddressOrKey = -5;
+constexpr std::int64_t kRpcDeserializationError = -22;
+
 enum class JsonFieldKind {
     kMissing,
     kNull,
     kString,
+    kNumber,
     kOther,
 };
 
@@ -276,10 +281,66 @@ JsonField ExtractJsonField(const std::string& json, const std::string& field_nam
         return JsonField{JsonFieldKind::kString, *parsed};
     }
 
+    if (json[colon_pos] == '-' || std::isdigit(static_cast<unsigned char>(json[colon_pos]))) {
+        std::size_t end = colon_pos + 1;
+        while (end < json.size()) {
+            const char ch = json[end];
+            if (!std::isdigit(static_cast<unsigned char>(ch)) && ch != '.' && ch != 'e' && ch != 'E' && ch != '+' && ch != '-') {
+                break;
+            }
+            ++end;
+        }
+        return JsonField{JsonFieldKind::kNumber, json.substr(colon_pos, end - colon_pos)};
+    }
+
     return JsonField{JsonFieldKind::kOther, {}};
 }
 
-bool SendAll(int fd, const std::string& payload)
+std::optional<std::int64_t> ParseInteger(const JsonField& field)
+{
+    if (field.kind != JsonFieldKind::kNumber) {
+        return std::nullopt;
+    }
+
+    std::int64_t value = 0;
+    const char* begin = field.string_value.data();
+    const char* end = begin + field.string_value.size();
+    const auto [ptr, ec] = std::from_chars(begin, end, value);
+    if (ec != std::errc{} || ptr != end) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+// A 256-bit value as the node prints it: 64 lowercase hex digits.
+bool IsUint256Hex(const std::string& value)
+{
+    if (value.size() != 64) {
+        return false;
+    }
+    return std::all_of(value.begin(), value.end(), [](char ch) {
+        return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+    });
+}
+
+using Deadline = std::chrono::steady_clock::time_point;
+
+// Time left until `deadline` as a socket timeout; nullopt once it has passed.
+std::optional<timeval> RemainingTimeout(Deadline deadline)
+{
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+        return std::nullopt;
+    }
+    const auto left = std::chrono::duration_cast<std::chrono::microseconds>(deadline - now);
+    const auto micros = std::max<std::chrono::microseconds::rep>(left.count(), 1000);
+    timeval timeout{};
+    timeout.tv_sec = static_cast<decltype(timeout.tv_sec)>(micros / 1'000'000);
+    timeout.tv_usec = static_cast<suseconds_t>(micros % 1'000'000);
+    return timeout;
+}
+
+bool SendAll(int fd, const std::string& payload, Deadline deadline)
 {
     std::size_t sent = 0;
 
@@ -290,6 +351,13 @@ bool SendAll(int fd, const std::string& payload)
 #endif
 
     while (sent < payload.size()) {
+        // Re-arm the send timeout with what is left, so a slow reader cannot outlast the deadline.
+        const auto timeout = RemainingTimeout(deadline);
+        if (!timeout.has_value()) {
+            return false;
+        }
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &*timeout, sizeof(*timeout));
+
         const ssize_t bytes = send(fd, payload.data() + sent, payload.size() - sent, kSendFlags);
         if (bytes < 0) {
             if (errno == EINTR) {
@@ -306,13 +374,23 @@ bool SendAll(int fd, const std::string& payload)
     return true;
 }
 
-std::optional<std::string> ReadResponse(int fd)
+std::optional<std::string> ReadResponse(int fd, Deadline deadline)
 {
     std::string out;
     std::array<char, 4096> buffer{};
 
     while (true) {
-        const ssize_t bytes = recv(fd, buffer.data(), buffer.size(), 0);
+        // Re-arm the receive timeout with what is left, so a slow reply cannot outlast the deadline.
+        // Past the deadline, the reply is still taken if the rest of it is already waiting.
+        const auto timeout = RemainingTimeout(deadline);
+        int flags = 0;
+        if (timeout.has_value()) {
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &*timeout, sizeof(*timeout));
+        } else {
+            flags = MSG_DONTWAIT;
+        }
+
+        const ssize_t bytes = recv(fd, buffer.data(), buffer.size(), flags);
         if (bytes == 0) {
             break;
         }
@@ -333,6 +411,48 @@ std::optional<std::string> ReadResponse(int fd)
 }
 
 } // namespace
+
+const char* SubmitOutcomeName(SubmitOutcome outcome)
+{
+    switch (outcome) {
+    case SubmitOutcome::kAccepted:
+        return "accepted";
+    case SubmitOutcome::kDuplicate:
+        return "duplicate";
+    case SubmitOutcome::kInconclusive:
+        return "inconclusive";
+    case SubmitOutcome::kRejected:
+        return "rejected";
+    case SubmitOutcome::kKnownInvalid:
+        return "known_invalid";
+    case SubmitOutcome::kTimeout:
+        return "timeout";
+    case SubmitOutcome::kError:
+        return "error";
+    }
+    return "unknown";
+}
+
+const char* ParentCheckName(ParentCheck check)
+{
+    switch (check) {
+    case ParentCheck::kNearTip:
+        return "near_tip";
+    case ParentCheck::kTooFar:
+        return "too_far";
+    case ParentCheck::kUnknown:
+        return "unknown";
+    case ParentCheck::kUnavailable:
+        return "unavailable";
+    case ParentCheck::kAlreadyKnown:
+        return "already_known";
+    case ParentCheck::kNodeBehind:
+        return "node_behind";
+    case ParentCheck::kParentNotConnected:
+        return "parent_not_connected";
+    }
+    return "unknown";
+}
 
 RpcClient::RpcClient(RpcClientOptions options)
     : m_options(std::move(options))
@@ -389,31 +509,206 @@ std::optional<std::vector<std::uint8_t>> RpcClient::GetBlock(const std::string& 
     return HexDecode(result_field.string_value);
 }
 
-bool RpcClient::SubmitBlock(std::span<const std::uint8_t> block_data)
+SubmitOutcome RpcClient::SubmitBlock(std::span<const std::uint8_t> block_data)
 {
     const std::string block_hex = HexEncode(block_data);
     const std::string params = "[\"" + block_hex + "\"]";
 
-    const auto response = SendJsonRpc("submitblock", params);
-    if (!response.has_value()) {
-        return false;
+    const RpcReply reply = Call("submitblock", params);
+    switch (reply.status) {
+    case RpcReply::Status::kNoResponse:
+        return SubmitOutcome::kTimeout;
+    case RpcReply::Status::kBadResponse:
+        return SubmitOutcome::kError;
+    case RpcReply::Status::kRpcError:
+        // A block that does not decode is a verdict on the block; other errors are about the node.
+        return reply.error_code == kRpcDeserializationError ? SubmitOutcome::kRejected : SubmitOutcome::kError;
+    case RpcReply::Status::kResult:
+        break;
     }
 
-    if (response->status_code != 200) {
-        LOG_WARN("submitblock HTTP status " + std::to_string(response->status_code));
-        return false;
+    const JsonField result_field = ExtractJsonField(reply.body, "result");
+    if (result_field.kind == JsonFieldKind::kNull) {
+        return SubmitOutcome::kAccepted;
+    }
+    if (result_field.kind != JsonFieldKind::kString) {
+        return SubmitOutcome::kError;
+    }
+    if (result_field.string_value == "duplicate-invalid") {
+        return SubmitOutcome::kKnownInvalid;
+    }
+    if (result_field.string_value == "duplicate") {
+        return SubmitOutcome::kDuplicate;
+    }
+    if (result_field.string_value == "inconclusive") {
+        return SubmitOutcome::kInconclusive;
+    }
+    return SubmitOutcome::kRejected;
+}
+
+ParentCheck RpcClient::CheckParent(const std::string& block_hash_hex,
+                                   const std::string& prev_hash_hex,
+                                   std::uint32_t max_depth)
+{
+    if (!IsUint256Hex(block_hash_hex) || !IsUint256Hex(prev_hash_hex)) {
+        return ParentCheck::kUnavailable;
+    }
+
+    // One deadline for every call of the check, so a slow node cannot stretch it.
+    const Deadline deadline = std::chrono::steady_clock::now() + m_options.timeout;
+    const std::int64_t depth = static_cast<std::int64_t>(max_depth);
+    const auto is_not_found = [](const RpcReply& reply) {
+        return reply.status == RpcReply::Status::kRpcError && reply.error_code == kRpcInvalidAddressOrKey;
+    };
+
+    const auto best_hash = CallForHash("getbestblockhash", "[]", deadline);
+    if (!best_hash.has_value()) {
+        return ParentCheck::kUnavailable;
+    }
+    if (*best_hash == prev_hash_hex) {
+        return ParentCheck::kNearTip;
+    }
+    if (*best_hash == block_hash_hex) {
+        return ParentCheck::kAlreadyKnown;
+    }
+
+    // Off the common path, first ask whether the node already has the block on its best chain.
+    const RpcReply block_reply = Call("getblockheader", "[\"" + block_hash_hex + "\",true]", deadline);
+    if (!is_not_found(block_reply)) {
+        const auto block = ParseHeaderInfo(block_reply);
+        if (!block.has_value()) {
+            return ParentCheck::kUnavailable;
+        }
+        if (block->confirmations >= 1) {
+            // Known near the tip (a race with the node's own peers) is harmless; a block far down
+            // the best chain is as far from the tip as a block whose parent is.
+            return block->confirmations - 1 <= depth ? ParentCheck::kAlreadyKnown : ParentCheck::kTooFar;
+        }
+    }
+
+    const RpcReply parent_reply = Call("getblockheader", "[\"" + prev_hash_hex + "\",true]", deadline);
+    if (is_not_found(parent_reply)) {
+        return ParentCheck::kUnknown;
+    }
+    const auto parent = ParseHeaderInfo(parent_reply);
+    if (!parent.has_value()) {
+        return ParentCheck::kUnavailable;
+    }
+    if (parent->confirmations >= 1) {
+        // On the best chain: confirmations counts the best block itself.
+        return parent->confirmations - 1 <= depth ? ParentCheck::kNearTip : ParentCheck::kTooFar;
+    }
+
+    // On another branch.
+    const auto best = ParseHeaderInfo(Call("getblockheader", "[\"" + *best_hash + "\",true]", deadline));
+    if (!best.has_value()) {
+        return ParentCheck::kUnavailable;
+    }
+    if (parent->chainwork > best->chainwork) {
+        // The parent is on a branch with more work than the node's best block that the node has
+        // not made its best chain yet: it has the parent's header but has not connected it (it may
+        // still be downloading or connecting it). Close to the best block, the node can store this
+        // block and connect it right after its parent; further ahead it is catching up.
+        return parent->height <= best->height + depth ? ParentCheck::kParentNotConnected : ParentCheck::kNodeBehind;
+    }
+    if (parent->height + depth < best->height) {
+        return ParentCheck::kTooFar;
+    }
+
+    // Compare chain work with the best chain's block `max_depth` below the best block, so a
+    // competing branch near the tip qualifies and a low-work one does not.
+    const std::int64_t anchor_height = std::max<std::int64_t>(0, best->height - depth);
+    const auto anchor_hash = CallForHash("getblockhash", "[" + std::to_string(anchor_height) + "]", deadline);
+    if (!anchor_hash.has_value()) {
+        return ParentCheck::kUnavailable;
+    }
+    const auto anchor = ParseHeaderInfo(Call("getblockheader", "[\"" + *anchor_hash + "\",true]", deadline));
+    if (!anchor.has_value()) {
+        return ParentCheck::kUnavailable;
+    }
+
+    // Both are 64-digit lowercase hex, so string order is numeric order.
+    return parent->chainwork >= anchor->chainwork ? ParentCheck::kNearTip : ParentCheck::kTooFar;
+}
+
+RpcClient::RpcReply RpcClient::Call(const std::string& method, const std::string& params_json)
+{
+    return Call(method, params_json, std::chrono::steady_clock::now() + m_options.timeout);
+}
+
+RpcClient::RpcReply RpcClient::Call(const std::string& method, const std::string& params_json, Deadline deadline)
+{
+    const auto response = SendJsonRpc(method, params_json, deadline);
+    if (!response.has_value()) {
+        return RpcReply{.status = RpcReply::Status::kNoResponse};
     }
 
     const JsonField error_field = ExtractJsonField(response->body, "error");
-    if (error_field.kind != JsonFieldKind::kNull) {
-        return false;
+    if (error_field.kind == JsonFieldKind::kNull) {
+        if (response->status_code != 200) {
+            LOG_WARN(method + " HTTP status " + std::to_string(response->status_code));
+            return RpcReply{.status = RpcReply::Status::kBadResponse};
+        }
+        return RpcReply{.status = RpcReply::Status::kResult, .body = response->body};
     }
 
-    const JsonField result_field = ExtractJsonField(response->body, "result");
-    return result_field.kind == JsonFieldKind::kNull;
+    if (error_field.kind == JsonFieldKind::kOther) {
+        return RpcReply{
+            .status = RpcReply::Status::kRpcError,
+            .body = response->body,
+            .error_code = ParseInteger(ExtractJsonField(response->body, "code")),
+        };
+    }
+
+    LOG_WARN(method + " returned an unexpected reply (HTTP status " + std::to_string(response->status_code) + ")");
+    return RpcReply{.status = RpcReply::Status::kBadResponse};
+}
+
+std::optional<std::string> RpcClient::CallForHash(const std::string& method,
+                                                  const std::string& params_json,
+                                                  Deadline deadline)
+{
+    const RpcReply reply = Call(method, params_json, deadline);
+    if (reply.status != RpcReply::Status::kResult) {
+        return std::nullopt;
+    }
+
+    const JsonField result_field = ExtractJsonField(reply.body, "result");
+    if (result_field.kind != JsonFieldKind::kString || !IsUint256Hex(result_field.string_value)) {
+        return std::nullopt;
+    }
+    return result_field.string_value;
+}
+
+std::optional<RpcClient::HeaderInfo> RpcClient::ParseHeaderInfo(const RpcReply& reply) const
+{
+    if (reply.status != RpcReply::Status::kResult) {
+        return std::nullopt;
+    }
+
+    const auto confirmations = ParseInteger(ExtractJsonField(reply.body, "confirmations"));
+    const auto height = ParseInteger(ExtractJsonField(reply.body, "height"));
+    const JsonField chainwork = ExtractJsonField(reply.body, "chainwork");
+    if (!confirmations.has_value() || !height.has_value() || *height < 0 ||
+        chainwork.kind != JsonFieldKind::kString || !IsUint256Hex(chainwork.string_value)) {
+        return std::nullopt;
+    }
+
+    return HeaderInfo{
+        .confirmations = *confirmations,
+        .height = *height,
+        .chainwork = chainwork.string_value,
+    };
 }
 
 std::optional<RpcClient::HttpResponse> RpcClient::SendJsonRpc(const std::string& method, const std::string& params_json)
+{
+    return SendJsonRpc(method, params_json, std::chrono::steady_clock::now() + m_options.timeout);
+}
+
+std::optional<RpcClient::HttpResponse> RpcClient::SendJsonRpc(const std::string& method,
+                                                              const std::string& params_json,
+                                                              Deadline deadline)
 {
     if (!m_cookie_loaded && !LoadCookie()) {
         return std::nullopt;
@@ -424,7 +719,7 @@ std::optional<RpcClient::HttpResponse> RpcClient::SendJsonRpc(const std::string&
         "{\"jsonrpc\":\"1.0\",\"id\":\"qbit-photon-" + std::to_string(request_id)
         + "\",\"method\":\"" + method + "\",\"params\":" + params_json + "}";
 
-    auto response = SendHttpRequest(request_body);
+    auto response = SendHttpRequest(request_body, deadline);
     if (!response.has_value()) {
         return std::nullopt;
     }
@@ -436,15 +731,19 @@ std::optional<RpcClient::HttpResponse> RpcClient::SendJsonRpc(const std::string&
             return response;
         }
 
-        response = SendHttpRequest(request_body);
+        response = SendHttpRequest(request_body, deadline);
     }
 
     return response;
 }
 
-std::optional<RpcClient::HttpResponse> RpcClient::SendHttpRequest(const std::string& request_body)
+std::optional<RpcClient::HttpResponse> RpcClient::SendHttpRequest(const std::string& request_body, Deadline deadline)
 {
     if (!m_cookie_loaded) {
+        return std::nullopt;
+    }
+    if (!RemainingTimeout(deadline).has_value()) {
+        LOG_WARN("RPC deadline passed before the request could be sent");
         return std::nullopt;
     }
 
@@ -488,11 +787,13 @@ std::optional<RpcClient::HttpResponse> RpcClient::SendHttpRequest(const std::str
         }
 #endif
 
-        timeval timeout{};
-        timeout.tv_sec = static_cast<long>(m_options.timeout.count() / 1000);
-        timeout.tv_usec = static_cast<suseconds_t>((m_options.timeout.count() % 1000) * 1000);
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+        const auto timeout = RemainingTimeout(deadline);
+        if (!timeout.has_value()) {
+            close(fd);
+            break;
+        }
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &*timeout, sizeof(*timeout));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &*timeout, sizeof(*timeout));
 
         int connect_rc = -1;
         do {
@@ -514,13 +815,13 @@ std::optional<RpcClient::HttpResponse> RpcClient::SendHttpRequest(const std::str
         return std::nullopt;
     }
 
-    if (!SendAll(connected_fd, request)) {
+    if (!SendAll(connected_fd, request, deadline)) {
         LOG_WARN("failed to send RPC request");
         close(connected_fd);
         return std::nullopt;
     }
 
-    const auto raw_response = ReadResponse(connected_fd);
+    const auto raw_response = ReadResponse(connected_fd, deadline);
     close(connected_fd);
 
     if (!raw_response.has_value()) {

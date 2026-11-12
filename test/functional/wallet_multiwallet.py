@@ -408,6 +408,65 @@ class MultiWalletTest(BitcoinTestFramework):
         self.nodes[0].unloadwallet(wallet)
         self.nodes[1].loadwallet(wallet)
 
+        self.test_wallet_probes_keep_lock()
+
+    def test_wallet_probes_keep_lock(self):
+        self.log.info("Test that probing a loaded wallet's file does not release its exclusive lock")
+        node0, node1 = self.nodes
+        wallets_dir = node0.wallets_path
+        self.restart_node(0, ['-nowallet'])
+        self.restart_node(1, ['-nowallet', f'-walletdir={wallets_dir}'])
+        lock_error = "Unable to obtain an exclusive lock"
+        # The fix is POSIX-only: Windows does not release file locks when
+        # another handle is closed, so the checks that depend on it are skipped.
+        is_windows = platform.system() == 'Windows'
+
+        self.log.info("Check listwalletdir")
+        node0.createwallet("locked")
+        assert {'name': 'locked', 'warnings': []} in node0.listwalletdir()['wallets']
+        assert_raises_rpc_error(-4, lock_error, node1.loadwallet, "locked")
+
+        if is_windows:
+            self.log.warning("Skipping symlink, hard link and restorewallet checks on Windows")
+        else:
+            self.log.info("Check an in-process load of the same file through a symlink and a hard link")
+            node0.createwallet("locked_target")
+            os.symlink("locked_target", wallets_dir / "locked_symlink")
+            os.mkdir(wallets_dir / "locked_hardlink")
+            os.link(wallets_dir / "locked_target" / "wallet.dat", wallets_dir / "locked_hardlink" / "wallet.dat")
+            for alias in ["locked_symlink", "locked_hardlink"]:
+                assert_raises_rpc_error(-4, lock_error, node0.loadwallet, alias)
+                assert_raises_rpc_error(-4, lock_error, node1.loadwallet, "locked_target")
+                assert_raises_rpc_error(-4, "This wallet is already a descriptor wallet", node0.migratewallet, alias)
+                assert_raises_rpc_error(-4, lock_error, node1.loadwallet, "locked_target")
+            # The failed loads must not unregister the file while the wallet is still loaded
+            node0.listwalletdir()
+            assert_raises_rpc_error(-4, lock_error, node1.loadwallet, "locked_target")
+
+            self.log.info("Check restorewallet from a loaded wallet's file")
+            assert_raises_rpc_error(-8, "is the database of a loaded wallet", node0.restorewallet, "restored", str(wallets_dir / "locked" / "wallet.dat"))
+            assert not (wallets_dir / "restored").exists()
+            assert_raises_rpc_error(-4, lock_error, node1.loadwallet, "locked")
+
+        self.log.info("Check that listwalletdir output does not depend on which wallets are loaded")
+        by_name = lambda listing: sorted(listing['wallets'], key=lambda w: w['name'])
+        loaded_listing = by_name(node0.listwalletdir())
+        for wallet_name in node0.listwallets():
+            node0.unloadwallet(wallet_name)
+        assert_equal(by_name(node0.listwalletdir()), loaded_listing)
+
+        if not is_windows:
+            self.log.info("Check that unloading a wallet unregisters its file")
+            node0.restorewallet("restored", str(wallets_dir / "locked" / "wallet.dat"))
+            node0.unloadwallet("restored")
+
+        self.log.info("Check that another process can load a wallet once it is unloaded, and not after it is reloaded")
+        node1.loadwallet("locked")
+        node1.unloadwallet("locked")
+        node0.loadwallet("locked")
+        node0.listwalletdir()
+        assert_raises_rpc_error(-4, lock_error, node1.loadwallet, "locked")
+
 
 if __name__ == '__main__':
     MultiWalletTest(__file__).main()

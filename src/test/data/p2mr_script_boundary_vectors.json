@@ -879,6 +879,44 @@
       }
     },
     {
+      "id": "resource-runtime-stack-bytes-1048576",
+      "category": "resource",
+      "scenario": "resource",
+      "parameters": {
+        "kind": "runtime-stack-bytes",
+        "value": 1048576
+      },
+      "consensus": {
+        "accepted": true,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_OK"
+      },
+      "policy": {
+        "accepted": true,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_OK"
+      }
+    },
+    {
+      "id": "resource-runtime-stack-bytes-1048577",
+      "category": "resource",
+      "scenario": "resource",
+      "parameters": {
+        "kind": "runtime-stack-bytes",
+        "value": 1048577
+      },
+      "consensus": {
+        "accepted": true,
+        "stage": "script-complete",
+        "error": "SCRIPT_ERR_OK"
+      },
+      "policy": {
+        "accepted": false,
+        "stage": "policy",
+        "error": "SCRIPT_ERR_P2MR_STACK_BYTES"
+      }
+    },
+    {
       "id": "resource-validation-weight-one",
       "category": "resource",
       "scenario": "resource",

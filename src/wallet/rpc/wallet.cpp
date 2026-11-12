@@ -77,12 +77,13 @@ static RPCHelpMan getwalletinfo()
                         {
                             {RPCResult::Type::STR, "status", "one of not_required, pending, running, complete, failed"},
                             {RPCResult::Type::NUM, "progress", "validation progress percentage [0.0, 1.0]"},
-                            {RPCResult::Type::NUM, "plaintext_records", "number of plaintext PQC records in this wallet"},
+                            {RPCResult::Type::NUM, "plaintext_records", "number of plaintext PQC records in this wallet. In an encrypted wallet this includes a record whose key also has a crypted record"},
                             {RPCResult::Type::NUM, "pending_records", "number of plaintext PQC records awaiting validation"},
                             {RPCResult::Type::NUM, "validated_records", "number of validated plaintext PQC records"},
                             {RPCResult::Type::NUM, "failed_records", "number of plaintext PQC records that failed validation"},
-                            {RPCResult::Type::BOOL, "signing_blocked", "whether PQC signing is blocked by validation state"},
+                            {RPCResult::Type::BOOL, "signing_blocked", "whether PQC signing is blocked by validation state, or because reencryption_required is true"},
                             {RPCResult::Type::BOOL, "encryption_recommended", "whether wallet encryption would enable authenticated fast loads"},
+                            {RPCResult::Type::BOOL, "reencryption_required", "whether this wallet is encrypted but still holds plaintext_records, whose keys anyone with the wallet file or a backup of it can read without the passphrase. Unlocking the wallet re-encrypts every validated record; signing stays blocked while any remain. Records that failed validation are never re-encrypted"},
                         }},
                         {RPCResult::Type::BOOL, "external_signer", "whether this wallet is configured to use an external signer such as a hardware wallet"},
                         {RPCResult::Type::BOOL, "blank", "Whether this wallet intentionally does not contain any keys, scripts, or descriptors"},
@@ -146,6 +147,7 @@ static RPCHelpMan getwalletinfo()
     pqc_validation_obj.pushKV("failed_records", static_cast<uint64_t>(pqc_validation.failed_records));
     pqc_validation_obj.pushKV("signing_blocked", pqc_validation.signing_blocked);
     pqc_validation_obj.pushKV("encryption_recommended", pqc_validation.encryption_recommended);
+    pqc_validation_obj.pushKV("reencryption_required", pqc_validation.reencryption_required);
     obj.pushKV("pqc_key_validation", std::move(pqc_validation_obj));
     obj.pushKV("external_signer", pwallet->IsWalletFlagSet(WALLET_FLAG_EXTERNAL_SIGNER));
     obj.pushKV("blank", pwallet->IsWalletFlagSet(WALLET_FLAG_BLANK_WALLET));

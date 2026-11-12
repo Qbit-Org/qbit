@@ -17,7 +17,7 @@ TRUSTED_RELEASE_REF_PATHS = [
     "contrib/release-process/publish-local-release.sh",
     "ci/release/test_validate_release_artifacts.py",
     "contrib/keys/operator-keys/KEYS.md",
-    "contrib/guix/repo-templates/qbit-guix.sigs/operator-keys/keys.json",
+    "contrib/keys/operator-keys/keys.json",
     "doc/release-trust-0.1.1-testnet4.md",
 ]
 
@@ -76,9 +76,9 @@ class ClassifyMergeProfileTest(unittest.TestCase):
 
         self.assertEqual(classification.profile, classify_merge_profile.RELEASE_POLICY_PROFILE)
 
-    def test_guix_operator_key_mirror_is_release_policy(self) -> None:
+    def test_operator_key_approvals_are_release_policy(self) -> None:
         path = (
-            "contrib/guix/repo-templates/qbit-guix.sigs/operator-keys/"
+            "contrib/keys/operator-keys/"
             "approvals/qbit-release-keys-mainnet-000002/operator-02.asc"
         )
         classification = self.classify([path])
@@ -87,6 +87,62 @@ class ClassifyMergeProfileTest(unittest.TestCase):
         self.assertEqual(classification.profile, classify_merge_profile.RELEASE_POLICY_PROFILE)
         self.assertTrue(classification.release_policy_only)
         self.assertEqual(outputs["touched_operator_keys"], "true")
+
+    def test_policy_path_entries_and_attribute_files_touch_operator_keys(self) -> None:
+        for path in ("contrib/keys", "contrib", "contrib/keys/operator-keys", ".gitattributes", "doc/.gitattributes"):
+            with self.subTest(path=path):
+                outputs = classify_merge_profile.github_outputs(self.classify([path]))
+                self.assertEqual(outputs["touched_operator_keys"], "true")
+        outputs = classify_merge_profile.github_outputs(self.classify(["contrib/keysmith/README.md"]))
+        self.assertEqual(outputs["touched_operator_keys"], "false")
+
+    def test_case_and_compatibility_variants_touch_operator_keys(self) -> None:
+        for path in (
+            "contrib/Keys/operator-keys/keys.json",
+            "contrib/keys/Operator-Keys/keys.json",
+            "contrib/key\u017f/operator-key\u017f/keys.json",
+            "contrib/key\u017f/notes.md",
+            "CONTRIB/KEYS",
+            ".GitAttributes",
+            "doc/.GITATTRIBUTES",
+        ):
+            with self.subTest(path=path):
+                outputs = classify_merge_profile.github_outputs(self.classify([path]))
+                self.assertEqual(outputs["touched_operator_keys"], "true")
+
+    def test_quoted_and_nul_separated_paths_are_read_as_paths(self) -> None:
+        name = "contrib/keys/operator-keys/approvals/qbit-release-keys-testnet-00000\u00e9/x.asc"
+        quoted = '"contrib/keys/operator-keys/approvals/qbit-release-keys-testnet-00000\\303\\251/x.asc"'
+        with tempfile.TemporaryDirectory() as tmp:
+            for content in (quoted + "\n", name + "\0" + "README.md" + "\0"):
+                listing = Path(tmp) / "changed-files.txt"
+                listing.write_bytes(content.encode("utf8"))
+                paths = classify_merge_profile.load_changed_files(str(listing))
+                self.assertEqual(paths[0], name)
+                outputs = classify_merge_profile.github_outputs(self.classify(paths))
+                self.assertEqual(outputs["touched_operator_keys"], "true")
+
+    def test_unquoted_paths_end_at_line_feeds_only(self) -> None:
+        # With core.quotePath=false git prints names as they are: only a line
+        # feed ends one, even where str.splitlines() would also split.
+        with tempfile.TemporaryDirectory() as tmp:
+            for separator in ("\x85", "\u2028", "\u2029"):
+                with self.subTest(separator=f"U+{ord(separator):04X}"):
+                    name = f"doc/a{separator}b.md"
+                    listing = Path(tmp) / "changed-files.txt"
+                    listing.write_bytes(f"{name}\nREADME.md\n".encode("utf8"))
+                    self.assertEqual(classify_merge_profile.load_changed_files(str(listing)), [name, "README.md"])
+
+    def test_removed_guix_sigs_template_mirror_is_not_operator_key_policy(self) -> None:
+        # contrib/keys/operator-keys is the only in-repo copy of the policy; a
+        # file re-added under the old template mirror path gets the full
+        # source profile instead of the lightweight operator-key route.
+        path = "contrib/guix/repo-templates/qbit-guix.sigs/operator-keys/keys.json"
+        classification = self.classify([path])
+        outputs = classify_merge_profile.github_outputs(classification)
+
+        self.assertEqual(classification.profile, classify_merge_profile.SOURCE_PROFILE)
+        self.assertEqual(outputs["touched_operator_keys"], "false")
 
     def test_p2mr_release_validator_paths_use_release_policy_profile(self) -> None:
         for path in (
@@ -215,6 +271,35 @@ class ClassifyMergeProfileTest(unittest.TestCase):
         self.assertEqual(outputs["touched_release_publish"], "true")
         self.assertEqual(outputs["touched_release_validators"], "true")
         self.assertEqual(outputs["touched_release_trust_docs"], "true")
+
+    def test_release_tools_alone_use_release_policy_profile(self) -> None:
+        # Listed here rather than read from RELEASE_TOOL_PATHS, so a tool left
+        # out of that set fails this test instead of passing it.
+        release_tools = (
+            "contrib/release-process/README.md",
+            "contrib/release-process/combine-sha256sums-signatures.py",
+            "contrib/release-process/publish-local-release.sh",
+            "contrib/release-process/release_staging_common.py",
+            "contrib/release-process/sign-sha256sums.py",
+            "contrib/release-process/stage-release-artifacts.py",
+        )
+        self.assertEqual(set(release_tools), classify_merge_profile.RELEASE_TOOL_PATHS)
+        for path in release_tools:
+            with self.subTest(path=path):
+                classification = self.classify([path])
+                outputs = classify_merge_profile.github_outputs(classification)
+
+                self.assertEqual(classification.profile, classify_merge_profile.RELEASE_POLICY_PROFILE)
+                self.assertEqual(outputs["touched_release_publish"], "true")
+                self.assertEqual(outputs["source_validation_required"], "false")
+
+    def test_other_release_process_files_keep_source_profile(self) -> None:
+        path = "contrib/release-process/test_release_signing_helpers.py"
+        classification = self.classify([path])
+        outputs = classify_merge_profile.github_outputs(classification)
+
+        self.assertEqual(classification.profile, classify_merge_profile.SOURCE_PROFILE)
+        self.assertEqual(outputs["touched_release_publish"], "false")
 
     def test_github_outputs_report_rpc_docs_profile(self) -> None:
         outputs = classify_merge_profile.github_outputs(self.classify(RPC_DOCS_PATHS))

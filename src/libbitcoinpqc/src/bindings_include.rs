@@ -14,6 +14,7 @@ pub mod doc_bindings {
     pub const bitcoin_pqc_error_t_BITCOIN_PQC_ERROR_BAD_SIGNATURE: bitcoin_pqc_error_t = -3;
     pub const bitcoin_pqc_error_t_BITCOIN_PQC_ERROR_NOT_IMPLEMENTED: bitcoin_pqc_error_t = -4;
     pub const bitcoin_pqc_error_t_BITCOIN_PQC_ERROR_SIGNING_LIMIT: bitcoin_pqc_error_t = -5;
+    pub const bitcoin_pqc_error_t_BITCOIN_PQC_ERROR_OUT_OF_MEMORY: bitcoin_pqc_error_t = -6;
     pub const BITCOIN_PQC_SIGN_WOTSC_LAYERS: u32 = 5;
 
     #[repr(C)]
@@ -128,6 +129,7 @@ pub mod ide_bindings {
     pub const bitcoin_pqc_error_t_BITCOIN_PQC_ERROR_BAD_SIGNATURE: bitcoin_pqc_error_t = -3;
     pub const bitcoin_pqc_error_t_BITCOIN_PQC_ERROR_NOT_IMPLEMENTED: bitcoin_pqc_error_t = -4;
     pub const bitcoin_pqc_error_t_BITCOIN_PQC_ERROR_SIGNING_LIMIT: bitcoin_pqc_error_t = -5;
+    pub const bitcoin_pqc_error_t_BITCOIN_PQC_ERROR_OUT_OF_MEMORY: bitcoin_pqc_error_t = -6;
     pub const BITCOIN_PQC_SIGN_WOTSC_LAYERS: u32 = 5;
 
     #[repr(C)]

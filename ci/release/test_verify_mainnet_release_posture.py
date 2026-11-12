@@ -18,6 +18,11 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = Path(__file__).with_name("verify_mainnet_release_posture.py")
 CORE_CHECKS = REPO_ROOT / ".github" / "workflows" / "core-checks.yml"
+REQUIRED_MERGE_GATE = REPO_ROOT / ".github" / "workflows" / "required-merge-gate.yml"
+# The release lines Core Checks runs for: every mainnet line runs the mainnet
+# publication gate.
+MAINNET_RELEASE_LINES = ("main", "1.x.x", "1.1.0", "1.0.0")
+TESTNET_RELEASE_LINES = ("0.1.x",)
 
 VALID_CHAINPARAMS = """\
 static constexpr int QBIT_PUBLIC_TESTNET_AUXPOW_CHAIN_ID{31430};
@@ -515,12 +520,108 @@ def test_release_builds_default_mainnet_guard_off():
 
     def test_core_checks_runs_real_gate_on_release_candidate_tag(self) -> None:
         workflow = CORE_CHECKS.read_text(encoding="utf8")
+        required_gate = REQUIRED_MERGE_GATE.read_text(encoding="utf8")
 
-        self.assertIn("mainnet-publish-gate:", workflow)
-        self.assertIn("mainnet_publish_gate_required", workflow)
-        self.assertIn("ci/release/verify_mainnet_release_posture.py", workflow)
-        self.assertIn('--release-tag "${RELEASE_CANDIDATE_TAG}"', workflow)
+        job_start = workflow.index("  mainnet-publish-gate:")
+        job = workflow[job_start : workflow.index("  core-checks-gate:", job_start)]
+        self.assertIn(
+            "if: ${{ needs.classify-changes.outputs.mainnet_publish_gate_required == 'true' }}",
+            job,
+        )
+        self.assertNotIn("source_validation_required", job)
+        # The validator's own exit status decides: nothing reinterprets or
+        # ignores it.
+        self.assertEqual(
+            self.step_script(job, "Run fail-closed mainnet publication gate"),
+            "set -euo pipefail\n"
+            "python3 ci/release/verify_mainnet_release_posture.py \\\n"
+            '  --source-root "$GITHUB_WORKSPACE" \\\n'
+            '  --release-tag "${RELEASE_CANDIDATE_TAG}"\n',
+        )
+        self.assertNotIn("continue-on-error", job)
+        self.assertNotIn("mainnet_ci_posture", workflow + required_gate)
         self.assertIn("- mainnet-publish-gate", workflow)
+
+        # The values the release-target rule gets, and where its answer goes.
+        for line in (
+            "      mainnet_publish_gate_required: ${{ steps.release-target.outputs.mainnet_publish_gate_required }}\n",
+            "          TARGET_REF: ${{ github.base_ref || github.event.merge_group.base_ref || github.ref }}\n",
+            "          VALIDATION_PROFILE: ${{ steps.classify.outputs.profile }}\n",
+            "          MAINNET_PUBLISH_GATE_REQUIRED: ${{ needs.classify-changes.outputs.mainnet_publish_gate_required }}\n",
+            "          MAINNET_PUBLISH_GATE_RESULT: ${{ needs.mainnet-publish-gate.result }}\n",
+        ):
+            with self.subTest(line=line.strip()):
+                self.assertEqual(workflow.count(line), 1)
+
+        # The gate checks the posture result before it may stop early for a
+        # profile without source checks.
+        self.assertLess(
+            workflow.index('check_result "mainnet publication posture"'),
+            workflow.index('if [[ "${SOURCE_VALIDATION_REQUIRED}" != "true" ]]'),
+        )
+        release_policy_case = required_gate.split("release-policy)", 1)[1].split(";;", 1)[0]
+        self.assertIn('wait_for_checks "Core Checks Gate"', release_policy_case)
+
+    @staticmethod
+    def step_script(workflow: str, step_name: str) -> str:
+        """The run block of the named step, unindented."""
+
+        step = workflow[workflow.index(f"      - name: {step_name}\n") :]
+        lines = step.split("        run: |\n", 1)[1].splitlines()
+        body: list[str] = []
+        for line in lines:
+            if line.strip() and not line.startswith("          "):
+                break
+            body.append(line[10:])
+        return "\n".join(body).rstrip("\n") + "\n"
+
+    def release_target(self, target_ref: str, profile: str) -> str:
+        script = self.step_script(CORE_CHECKS.read_text(encoding="utf8"), "Classify release target")
+        output = self.root / "github-output"
+        output.write_text("", encoding="utf8")
+        subprocess.run(
+            ["bash", "-c", script],
+            check=True,
+            env={"PATH": "/usr/bin:/bin", "TARGET_REF": target_ref, "VALIDATION_PROFILE": profile,
+                 "GITHUB_OUTPUT": str(output)},
+        )
+        return output.read_text(encoding="utf8").strip()
+
+    def test_every_mainnet_release_line_runs_the_publication_gate(self) -> None:
+        required = "mainnet_publish_gate_required=true"
+        not_required = "mainnet_publish_gate_required=false"
+        for branch in MAINNET_RELEASE_LINES:
+            # A pull request names its base branch; push and merge_group refs.
+            for target_ref in (branch, f"refs/heads/{branch}"):
+                for profile in ("source", "release-policy"):
+                    with self.subTest(target=target_ref, profile=profile):
+                        self.assertEqual(self.release_target(target_ref, profile), required)
+                for profile in ("rpc-docs", "public-docs", "github-metadata"):
+                    with self.subTest(target=target_ref, profile=profile):
+                        self.assertEqual(self.release_target(target_ref, profile), not_required)
+        for target_ref in ("0.1.x", "refs/heads/0.1.x", "0.2.0", "develop", "feature/main", "main-old",
+                           "1.0.0-rc1", "x.1.0", "1x1x0", "refs/tags/v1.0.0", "refs/pull/1/merge"):
+            with self.subTest(target=target_ref):
+                self.assertEqual(self.release_target(target_ref, "source"), not_required)
+
+    def test_core_checks_triggers_cover_every_mainnet_release_line(self) -> None:
+        workflow = CORE_CHECKS.read_text(encoding="utf8")
+        triggers = "\n" + workflow.split("\non:\n", 1)[1].split("\npermissions:", 1)[0]
+        for event in ("pull_request", "push", "merge_group"):
+            block = triggers.split(f"\n  {event}:\n", 1)[1].split("    branches:\n", 1)[1]
+            branches: list[str] = []
+            for line in block.splitlines():
+                if not line.startswith("      - "):
+                    break
+                branches.append(line.removeprefix("      - ").strip())
+            with self.subTest(event=event):
+                self.assertEqual(len(branches), len(set(branches)), branches)
+                self.assertEqual(set(branches), {*MAINNET_RELEASE_LINES, *TESTNET_RELEASE_LINES})
+                for branch in branches:
+                    expected = "true" if branch in MAINNET_RELEASE_LINES else "false"
+                    self.assertEqual(
+                        self.release_target(branch, "source"), f"mainnet_publish_gate_required={expected}"
+                    )
 
 
 if __name__ == "__main__":

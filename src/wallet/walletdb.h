@@ -74,6 +74,7 @@ extern const std::string NAME;
 extern const std::string OLD_KEY;
 extern const std::string ORDERPOSNEXT;
 extern const std::string POOL;
+extern const std::string POST_ENCRYPTION_REWRITE;
 extern const std::string PURPOSE;
 extern const std::string PUBKEYDBCURSOR;
 extern const std::string PUBKEYDBENTRY;
@@ -182,6 +183,11 @@ public:
 
 struct DbTxnListener
 {
+    // Commit outcome callbacks must not acquire wallet or descriptor locks.
+    // All success outcomes are resolved before any on_commit publication runs.
+    std::function<void()> on_commit_prepare;
+    std::function<void()> on_commit_success;
+    std::function<void()> on_commit_failure;
     std::function<void()> on_commit, on_abort;
 };
 
@@ -220,6 +226,7 @@ public:
     }
     WalletBatch(const WalletBatch&) = delete;
     WalletBatch& operator=(const WalletBatch&) = delete;
+    ~WalletBatch();
 
     bool WriteName(const std::string& strAddress, const std::string& strName);
     bool EraseName(const std::string& strAddress);
@@ -250,8 +257,10 @@ public:
     bool WriteDescriptorKey(const uint256& desc_id, const CPubKey& pubkey, const CPrivKey& privkey);
     bool WriteCryptedDescriptorKey(const uint256& desc_id, const CPubKey& pubkey, const std::vector<unsigned char>& secret);
     bool WriteDescriptorPQCKey(const uint256& desc_id, const CPQCPubKey& pubkey, const CPQCKey& privkey, uint32_t sig_counter = 0);
+    //! Also erases the plaintext record of the key, and fails if that fails.
     bool WriteCryptedDescriptorPQCKey(const uint256& desc_id, const CPQCPubKey& pubkey, const std::vector<unsigned char>& secret, uint32_t sig_counter = 0, const uint256* auth_tag = nullptr);
     bool WriteDescriptor(const uint256& desc_id, const WalletDescriptor& descriptor);
+    bool HasDescriptor(const uint256& desc_id);
     bool WriteDescriptorDerivedCache(const CExtPubKey& xpub, const uint256& desc_id, uint32_t key_exp_index, uint32_t der_index);
     bool WriteDescriptorDerivedP2MRCache(const CPQCPubKey& pubkey, const uint256& desc_id, uint32_t key_exp_index, uint32_t der_index);
     bool WriteDescriptorParentCache(const CExtPubKey& xpub, const uint256& desc_id, uint32_t key_exp_index);
@@ -260,6 +269,11 @@ public:
 
     bool WriteLockedUTXO(const COutPoint& output);
     bool EraseLockedUTXO(const COutPoint& output);
+
+    //! The POST_ENCRYPTION_REWRITE record, see CWallet::RewriteAfterEncryption
+    bool WritePostEncryptionRewrite();
+    bool ErasePostEncryptionRewrite();
+    bool HasPostEncryptionRewrite();
 
     bool WriteAddressPreviouslySpent(const CTxDestination& dest, bool previously_spent);
     bool WriteAddressReceiveRequest(const CTxDestination& dest, const std::string& id, const std::string& receive_request);

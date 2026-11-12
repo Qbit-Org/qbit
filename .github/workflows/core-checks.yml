@@ -6,29 +6,35 @@ name: Core Checks
 
 on:
   pull_request:
+    # The same types as Required Merge Gate, which reads this workflow's run
+    # of its own event.
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+      - labeled
+      - unlabeled
     branches:
       - main
+      - 1.x.x
+      - 1.1.0
       - 1.0.0
       - 0.1.x
-      - 1.0.0
-      - 1.x.x
-      - develop
   push:
     branches:
       - main
+      - 1.x.x
+      - 1.1.0
       - 1.0.0
       - 0.1.x
-      - 1.0.0
-      - 1.x.x
-      - develop
   merge_group:
     branches:
       - main
+      - 1.x.x
+      - 1.1.0
       - 1.0.0
       - 0.1.x
-      - 1.0.0
-      - 1.x.x
-      - develop
 
 permissions:
   contents: read
@@ -75,7 +81,7 @@ jobs:
               echo "::error::Pull request base SHA is unavailable."
               exit 1
             fi
-            git diff --name-only "${BASE_SHA}...HEAD" > "${changed_files}"
+            git diff --no-renames --name-only "${BASE_SHA}...HEAD" > "${changed_files}"
           elif [[ "${EVENT_NAME}" == "merge_group" ]]; then
             base_branch="${BASE_REF#refs/heads/}"
             if [[ -z "${base_branch}" ]]; then
@@ -83,15 +89,15 @@ jobs:
               exit 1
             fi
             git fetch --no-tags --prune origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"
-            git diff --name-only "origin/${base_branch}...HEAD" > "${changed_files}"
+            git diff --no-renames --name-only "origin/${base_branch}...HEAD" > "${changed_files}"
           elif [[ "${EVENT_NAME}" == "push" ]]; then
             if [[ -n "${BEFORE_SHA}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
-              git diff --name-only "${BEFORE_SHA}..HEAD" > "${changed_files}"
+              git diff --no-renames --name-only "${BEFORE_SHA}..HEAD" > "${changed_files}"
             else
               git fetch --no-tags --prune origin "${DEFAULT_BRANCH}"
               merge_base="$(git merge-base "origin/${DEFAULT_BRANCH}" HEAD 2>/dev/null || true)"
               if [[ -n "${merge_base}" ]]; then
-                git diff --name-only "${merge_base}...HEAD" > "${changed_files}"
+                git diff --no-renames --name-only "${merge_base}...HEAD" > "${changed_files}"
               else
                 git diff-tree --no-commit-id --name-only -r HEAD > "${changed_files}"
               fi
@@ -118,8 +124,12 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Every mainnet release line runs the mainnet publication posture
+          # check: main and every release branch of major version 1 or later
+          # (1.x.x, 1.1.0, 1.0.0, ...). The 0.x lines are testnet.
+          mainnet_line_re='^(main|[1-9][0-9]*\.(x|[0-9]+)\.(x|[0-9]+))$'
           target_branch="${TARGET_REF#refs/heads/}"
-          if [[ "${target_branch}" == "1.0.0" ]] && \
+          if [[ "${target_branch}" =~ ${mainnet_line_re} ]] && \
              [[ "${VALIDATION_PROFILE}" == "source" || "${VALIDATION_PROFILE}" == "release-policy" ]]; then
             echo "mainnet_publish_gate_required=true" >> "$GITHUB_OUTPUT"
           else
@@ -137,6 +147,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
+      # Release fuzz evidence is counted at the coverage anchors in
+      # test_qbit_fuzz_coverage.py. A source change that alters, removes or
+      # duplicates an anchored line fails here instead of when the evidence
+      # is next regenerated. These checks need no build.
+      - name: Test qbit fuzz tooling
+        run: |
+          python3 test/fuzz/test_qbit_fuzz_coverage.py --anchors-only
+          python3 test/fuzz/test_qbit_fuzz_runner.py
+          python3 test/fuzz/qbit_corpora/generate_seeds.py --check
+
       - name: Install build dependencies
         run: |
           sudo apt-get update
@@ -152,6 +172,9 @@ jobs:
 
       - name: Test integrated libbitcoinpqc build policy
         run: python3 ci/checks/test_libbitcoinpqc_build_policy.py
+
+      - name: Test IBD timeout wiring
+        run: python3 ci/checks/test_ibd_timeout_wiring.py
 
       - name: Configure build
         run: |
@@ -231,6 +254,7 @@ jobs:
           suites=(
             pqc_tests
             asert_tests
+            auxpow_tests
             pow_tests
             subsidy_tests
             script_p2mr_tests
@@ -413,11 +437,11 @@ jobs:
               git fetch --no-tags --prune origin main
               merge_base="$(git merge-base origin/main HEAD 2>/dev/null || true)"
               if [[ -n "${merge_base}" ]]; then
-                git diff --name-only "${merge_base}" HEAD > "${changed_files}"
+                git diff --no-renames --name-only "${merge_base}" HEAD > "${changed_files}"
               else
                 git diff-tree --no-commit-id --name-only -r HEAD > "${changed_files}"
               fi
-            elif ! git diff --name-only "${before}" HEAD > "${changed_files}"; then
+            elif ! git diff --no-renames --name-only "${before}" HEAD > "${changed_files}"; then
               echo "Could not diff push range; running release validator tests."
               echo "changed=true" >> "$GITHUB_OUTPUT"
               exit 0
@@ -432,7 +456,7 @@ jobs:
             fi
 
             git fetch --no-tags --prune origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"
-            if ! git diff --name-only "origin/${base_branch}...HEAD" > "${changed_files}"; then
+            if ! git diff --no-renames --name-only "origin/${base_branch}...HEAD" > "${changed_files}"; then
               echo "Could not diff against origin/${base_branch}; running release validator tests."
               echo "changed=true" >> "$GITHUB_OUTPUT"
               exit 0
@@ -464,10 +488,10 @@ jobs:
           # validators, so a missing file is a regression and must fail.
           required_tests=(
             ci/release/test_publish_local_release.py
+            ci/release/test_release_staging_tools.py
             ci/release/test_validate_builder_attestations.py
             ci/release/test_validate_key_metadata.py
             ci/release/test_validate_release_artifacts.py
-            ci/release/test_verify_mainnet_ci_posture.py
             ci/release/test_verify_mainnet_release_posture.py
             ci/release/test_verify_p2mr_v1_conformance.py
             ci/release/test_verify_testnet_release_posture.py
@@ -528,20 +552,9 @@ jobs:
           RELEASE_CANDIDATE_TAG: ${{ steps.release-candidate.outputs.tag }}
         run: |
           set -euo pipefail
-          posture_result="${RUNNER_TEMP}/mainnet-posture-result.json"
-
-          set +e
           python3 ci/release/verify_mainnet_release_posture.py \
             --source-root "$GITHUB_WORKSPACE" \
-            --release-tag "${RELEASE_CANDIDATE_TAG}" \
-            --result-json "${posture_result}"
-          validator_exit_code=$?
-          set -e
-
-          python3 ci/release/verify_mainnet_ci_posture.py \
-            --policy ci/release/mainnet_ci_posture.json \
-            --result-json "${posture_result}" \
-            --validator-exit-code "${validator_exit_code}"
+            --release-tag "${RELEASE_CANDIDATE_TAG}"
 
   core-checks-gate:
     name: 'Core Checks Gate'
@@ -554,9 +567,10 @@ jobs:
       - functional-smoke
       - release-validator-tests
       - mainnet-publish-gate
-    # Aggregate core check input for Required Merge Gate. The phase-aware
-    # mainnet posture runs for source and release-policy changes targeting
-    # 1.0.0; source build/test jobs remain conditional on source validation.
+    # Aggregate core check input for Required Merge Gate. The mainnet
+    # posture runs for source and release-policy changes targeting a mainnet
+    # release line; source build/test jobs remain conditional on source
+    # validation.
     if: ${{ always() }}
     steps:
       - name: Check core check results

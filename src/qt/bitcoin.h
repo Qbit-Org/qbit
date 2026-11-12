@@ -95,6 +95,10 @@ private:
     ClientModel* clientModel{nullptr};
     BitcoinGUI* window{nullptr};
     QTimer* pollShutdownTimer{nullptr};
+    //! Retries a shutdown request made while the user was still in a dialog.
+    QTimer* m_deferred_shutdown_timer{nullptr};
+    //! Set once requestShutdown() starts the shutdown, which happens only once.
+    bool m_shutdown_started{false};
 #ifdef ENABLE_WALLET
     PaymentServer* paymentServer{nullptr};
     WalletController* m_wallet_controller{nullptr};

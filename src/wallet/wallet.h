@@ -14,6 +14,7 @@
 #include <logging.h>
 #include <outputtype.h>
 #include <policy/feerate.h>
+#include <policy/policy.h>
 #include <primitives/transaction.h>
 #include <primitives/transaction_identifier.h>
 #include <script/interpreter.h>
@@ -106,13 +107,47 @@ std::shared_ptr<CWallet> RestoreWallet(WalletContext& context, const fs::path& b
 std::unique_ptr<interfaces::Handler> HandleLoadWallet(WalletContext& context, LoadWalletFn load_wallet);
 void NotifyWalletLoaded(WalletContext& context, const std::shared_ptr<CWallet>& wallet);
 void SchedulePlaintextPQCKeyValidation(CScheduler& scheduler, const std::shared_ptr<CWallet>& wallet);
+void MaybeSchedulePendingInitialKeyPoolTopUp(WalletContext& context, const std::shared_ptr<CWallet>& wallet);
+void MaybeSchedulePendingInitialKeyPoolTopUpAfterLoad(WalletContext& context, const std::shared_ptr<CWallet>& wallet);
 void MaybeScheduleP2MRKeyPoolRefill(WalletContext& context, const std::shared_ptr<CWallet>& wallet, OutputType type, bool internal);
+//! Top up the active keypools after an unlock: non-P2MR ones inline, P2MR ones
+//! (the pending create-time top-up, or a refill to -keypool) in the background.
+void TopUpKeyPoolAfterUnlock(WalletContext& context, const std::shared_ptr<CWallet>& wallet);
+enum class P2MRKeyPoolRefillResult {
+    //! The pending create-time top-up, if any, and both P2MR keypools reached -keypool.
+    COMPLETE,
+    //! A pool reached its step limit first, for example because addresses
+    //! were handed out as fast as the steps derived them, or shutdown was
+    //! requested.
+    INCOMPLETE,
+    //! A step failed; it logged why.
+    FAILED,
+};
+//! Refill the P2MR keypools of an unlocked wallet to -keypool on the calling
+//! thread, so that the keys exist before the wallet is locked again: a locked
+//! wallet cannot derive P2MR keys. This runs the background refill steps one
+//! after another, each holding cs_wallet only briefly. It runs at most a fixed
+//! number of steps per pool, about twice what an empty pool needs, and stops
+//! early when shutdown is requested.
+P2MRKeyPoolRefillResult RefillP2MRKeyPoolsAfterUnlock(CWallet& wallet);
 std::unique_ptr<WalletDatabase> MakeWalletDatabase(const std::string& name, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error);
+//! The warning for an encrypted wallet whose rewrite after encryption is still pending.
+bilingual_str PendingRewriteWarning();
+//! The result of an encryption that committed, but whose new HD seed could not be set up.
+bilingual_str NewSeedFailedWarning(const bilingual_str& reason);
 
 //! -paytxfee default
 constexpr CAmount DEFAULT_PAY_TX_FEE = 0;
-//! -fallbackfee default
-static const CAmount DEFAULT_FALLBACK_FEE = 0;
+//! -fallbackfee default. Unlike Bitcoin Core (which disables the fallback fee
+//! on mainnet), qbit defaults to the minimum relay fee rate so that wallets can
+//! create transactions while the chain is young and the fee estimator has no
+//! data (an empty mempool yields no estimates, see GetMinimumFeeRate()).
+//! GetMinimumFeeRate() raises the fallback to this node's minimum relay fee,
+//! -mintxfee and mempool minimum fee, but peers with a stricter policy or a
+//! congested network may still not relay or mine the transaction until its fee
+//! is bumped. Organic fee estimates take precedence once available.
+//! Set -fallbackfee=0 to restore the upstream behavior of failing instead.
+static const CAmount DEFAULT_FALLBACK_FEE = DEFAULT_MIN_RELAY_TX_FEE;
 //! -discardfee default
 static const CAmount DEFAULT_DISCARD_FEE = 10000;
 //! -mintxfee default
@@ -373,6 +408,9 @@ private:
     bool Unlock(const CKeyingMaterial& vMasterKeyIn);
     void ClearMasterKey() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
+    bool HasPQCKeyReencryptionWork() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool ReencryptPlaintextPQCKeysOrThrow() LOCKS_EXCLUDED(cs_wallet);
+
     std::atomic<bool> fAbortRescan{false};
     std::atomic<bool> fScanningWallet{false}; // controlled by WalletRescanReserver
     std::atomic<bool> m_scanning_with_passphrase{false};
@@ -441,6 +479,10 @@ private:
     /** WalletFlags set on this wallet. */
     std::atomic<uint64_t> m_wallet_flags{0};
 
+    //! Number of EncryptionInProgressScope objects alive, see
+    //! IsEncryptionInProgress().
+    std::atomic<int> m_encryption_in_progress{0};
+
     bool SetAddressBookWithDB(WalletBatch& batch, const CTxDestination& address, const std::string& strName, const std::optional<AddressPurpose>& strPurpose);
 
     //! Unsets a wallet flag and saves it to disk
@@ -488,11 +530,41 @@ private:
     // Same as 'AddActiveScriptPubKeyMan' but designed for use within a batch transaction context
     void AddActiveScriptPubKeyManWithDb(WalletBatch& batch, uint256 id, OutputType type, bool internal);
 
+    //! Finishes the deferred create-time keypool top-up of the active
+    //! descriptors that EncryptWallet's new HD seed replaces.
+    void TopUpDescriptorsBeforeReplacingThem() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    //! Replaces the active descriptors with ones from a new HD seed. If that
+    //! throws, removes the new descriptors from memory again before rethrowing.
+    void SetupNewSeedOrRollBack(bool use_create_keypool_warmup) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+
     /** Store wallet flags */
     void SetWalletFlagWithDB(WalletBatch& batch, uint64_t flags);
 
     //! Cache of descriptor ScriptPubKeys used for IsMine. Maps ScriptPubKey to set of spkms
-    std::unordered_map<CScript, std::vector<ScriptPubKeyMan*>, SaltedSipHasher> m_cached_spks;
+    std::unordered_map<CScript, std::vector<ScriptPubKeyMan*>, SaltedSipHasher> m_cached_spks GUARDED_BY(cs_wallet);
+
+    enum class TopUpPublicationState {
+        STAGED,
+        COMMITTING,
+        COMMITTED_PENDING_CACHE,
+    };
+    struct TopUpPublicationRecord {
+        ScriptPubKeyMan* spkm;
+        std::weak_ptr<void> lifetime;
+        std::set<CScript> scripts;
+        TopUpPublicationState state{TopUpPublicationState::STAGED};
+    };
+
+    // Exact scripts crossing the database-commit-to-wallet-cache handoff. This
+    // mutex is never held while acquiring cs_wallet or a descriptor lock.
+    mutable Mutex m_topup_pub_mutex;
+    mutable std::condition_variable_any m_topup_pub_cv;
+    TopUpPublicationId m_next_topup_pub_id GUARDED_BY(m_topup_pub_mutex){1};
+    std::unordered_map<TopUpPublicationId, TopUpPublicationRecord> m_topup_publications GUARDED_BY(m_topup_pub_mutex);
+    std::unordered_map<CScript, std::vector<TopUpPublicationId>, SaltedSipHasher> m_topup_publications_by_script GUARDED_BY(m_topup_pub_mutex);
+
+    void EraseTopUpPublication(TopUpPublicationId id) EXCLUSIVE_LOCKS_REQUIRED(m_topup_pub_mutex);
+    std::vector<ScriptPubKeyMan*> GetCommittedTopUpScriptPubKeyMans(const CScript& script) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     //! Set of both spent and unspent transaction outputs owned by this wallet
     std::unordered_map<COutPoint, WalletTXO, SaltedOutpointHasher> m_txos GUARDED_BY(cs_wallet);
@@ -620,6 +692,8 @@ public:
     bool IsTxImmatureCoinBase(const CWalletTx& wtx) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     bool IsSpent(const COutPoint& outpoint) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    //! Wallet transactions that spend outpoint, by the definition IsSpent() uses
+    std::set<Txid> GetSpendingTxs(const COutPoint& outpoint) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     // Whether this or any known scriptPubKey with the same single key has been spent.
     bool IsSpentKey(const CScript& scriptPubKey) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
@@ -667,8 +741,68 @@ public:
     bool m_plaintext_pqc_key_validation_running GUARDED_BY(cs_wallet){false};
 
     bool Unlock(const SecureString& strWalletPassphrase, bool run_pending_initial_keypool_top_up = true);
+    /**
+     * Replace the plaintext PQC key records of an encrypted, unlocked wallet
+     * with crypted ones in one transaction, then rewrite the database file
+     * with RewriteAfterEncryption.
+     * User-initiated unlocks call this once the unlock has returned, and so
+     * does plaintext key validation when it finishes. It does nothing, and
+     * takes no lock beyond a brief state read, when there is nothing to do.
+     * Like Lock(), it waits for active signers before it takes cs_wallet.
+     * Returns false if the wallet was locked or a step failed. If the
+     * re-encryption failed, the records stay reported and refused and the
+     * next call retries; if only the rewrite failed, the next load or backup
+     * retries it. It logs an exception instead of throwing it.
+     */
+    bool ReencryptPlaintextPQCKeys() LOCKS_EXCLUDED(cs_wallet);
     bool ChangeWalletPassphrase(const SecureString& strOldWalletPassphrase, const SecureString& strNewWalletPassphrase);
-    bool EncryptWallet(const SecureString& strWalletPassphrase, bool use_create_keypool_warmup = false);
+    /**
+     * Encrypt the wallet, then replace its active descriptors with ones from a
+     * new HD seed. Returns false if the wallet was not encrypted. Once the
+     * encryption has committed, returns true and leaves the wallet locked even
+     * if a later step fails. If the new HD seed could not be set up, the wallet
+     * keeps its previous active descriptors, and new_seed_error, if given, is
+     * set to the reason.
+     */
+    bool EncryptWallet(const SecureString& strWalletPassphrase, bool use_create_keypool_warmup = false, bilingual_str* new_seed_error = nullptr);
+    //! Whether an encryption is under way, whoever started it. It reads no
+    //! wallet state, so a caller that must not wait for the locks the
+    //! encryption holds can ask it at any time.
+    bool IsEncryptionInProgress() const { return m_encryption_in_progress.load() > 0; }
+
+    /**
+     * Announces an encryption for as long as it lives: IsEncryptionInProgress()
+     * reports it, and NotifyEncryptionInProgressChanged is raised when it is
+     * created and when it is destroyed. EncryptWallet holds one. A caller that
+     * takes the wallet locks before calling EncryptWallet, as the
+     * encryptwallet RPC does, holds another from before it takes them, so
+     * listeners stop reading the wallet before they could wait for those
+     * locks. Scopes nest.
+     */
+    class EncryptionInProgressScope
+    {
+    public:
+        explicit EncryptionInProgressScope(CWallet& wallet);
+        ~EncryptionInProgressScope();
+        EncryptionInProgressScope(const EncryptionInProgressScope&) = delete;
+        EncryptionInProgressScope& operator=(const EncryptionInProgressScope&) = delete;
+
+    private:
+        CWallet& m_wallet;
+    };
+
+    /**
+     * Rewrite the database file so that deleted plaintext key records no
+     * longer remain in its free space, then write the POST_ENCRYPTION_REWRITE
+     * record. A transaction that deletes plaintext key records from an
+     * encrypted wallet must erase that record and call this once it has
+     * committed; a wallet loaded without the record is rewritten again, so a
+     * stop before this completes is recovered at the next load. Returns false
+     * and leaves the record absent if the rewrite fails.
+     */
+    bool RewriteAfterEncryption() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    //! Whether this is an encrypted wallet without the POST_ENCRYPTION_REWRITE record.
+    bool NeedsRewriteAfterEncryption() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     unsigned int ComputeTimeSmart(const CWalletTx& wtx, bool rescanning_old_block) const;
 
@@ -761,7 +895,8 @@ public:
                   bool bip32derivs = true,
                   size_t* n_signed = nullptr,
                   bool finalize = true,
-                  const PQCSignatureCounterObserver& pqc_counter_observer = {}) const;
+                  const PQCSignatureCounterObserver& pqc_counter_observer = {},
+                  const SigningProgressCallback& progress_callback = {}) const;
 
     /**
      * Submit the transaction to the node's mempool and then relay to peers.
@@ -799,6 +934,7 @@ public:
      /** If the cost to spend a change output at this feerate is greater than the value of the
       * output itself, just drop it to fees. */
     CFeeRate m_discard_rate{DEFAULT_DISCARD_FEE};
+    bool m_discard_rate_set{false}; //!< true if -discardfee was set; see GetDiscardRate()
 
     /** When the actual feerate is less than the consolidate feerate, we will tend to make transactions which
      * consolidate inputs. When the actual feerate is greater than the consolidate feerate, we will tend to make
@@ -821,6 +957,36 @@ public:
 
     /** Number of pre-generated keys/scripts by each spkm (part of the look-ahead process, used to detect payments) */
     int64_t m_keypool_size{DEFAULT_KEYPOOL_SIZE};
+    // Optional deterministic test hook invoked after descriptor persistence
+    // and before script cache publication takes cs_wallet. Configure it before
+    // starting concurrent wallet work and leave it unchanged until that work
+    // completes.
+    std::function<void(const std::set<CScript>&, ScriptPubKeyMan*)> m_before_script_pub_key_cache_publish;
+    // Optional deterministic test hook invoked by EncryptWallet after it has
+    // derived the encryption key and before it takes the wallet locks. Same
+    // configuration rules as m_before_script_pub_key_cache_publish.
+    std::function<void()> m_before_encrypt_wallet_locks;
+    // Optional deterministic test hook invoked by EncryptWallet once its
+    // database transaction has begun. Same configuration rules as
+    // m_before_script_pub_key_cache_publish.
+    std::function<void()> m_after_encrypt_wallet_txn_begin;
+    // Optional deterministic test hook invoked by EncryptWallet once its
+    // transaction has committed and before it rewrites the database. Same
+    // configuration rules as m_before_script_pub_key_cache_publish.
+    std::function<void()> m_after_encrypt_wallet_commit;
+    // Optional deterministic test hooks invoked by ReencryptPlaintextPQCKeys
+    // once it has found work and before it waits for signers, and once its
+    // database transaction has begun.
+    // Same configuration rules as m_before_script_pub_key_cache_publish.
+    std::function<void()> m_before_reencrypt_pqc_keys_locks;
+    std::function<void()> m_after_reencrypt_pqc_keys_txn_begin;
+    // Optional deterministic test hook invoked by send and sendall after they
+    // sign a transaction and before they commit it. send holds no wallet lock
+    // there; sendall holds cs_wallet. Same configuration rules as
+    // m_before_script_pub_key_cache_publish.
+    std::function<void()> m_before_send_commit;
+    bool m_deferred_create_keypool_top_up_scheduled GUARDED_BY(cs_wallet){false};
+    bool m_deferred_create_keypool_top_up_reschedule_requested GUARDED_BY(cs_wallet){false};
     bool m_p2mr_receive_keypool_refill_scheduled GUARDED_BY(cs_wallet){false};
     bool m_p2mr_change_keypool_refill_scheduled GUARDED_BY(cs_wallet){false};
 
@@ -908,7 +1074,7 @@ public:
     bool SetAddressBook(const CTxDestination& address, const std::string& strName, const std::optional<AddressPurpose>& purpose);
 
     bool DelAddressBook(const CTxDestination& address);
-    bool DelAddressBookWithDB(WalletBatch& batch, const CTxDestination& address);
+    bool DelAddressBookWithDB(WalletBatch& batch, const CTxDestination& address) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     bool IsAddressPreviouslySpent(const CTxDestination& dest) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool SetAddressPreviouslySpent(WalletBatch& batch, const CTxDestination& dest, bool used) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
@@ -930,6 +1096,9 @@ public:
 
     //! Get wallet transactions that conflict with given transaction (spend same outputs)
     std::set<Txid> GetConflicts(const Txid& txid) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+
+    //! Get wallet transactions that spend the given output
+    std::set<Txid> GetWalletSpenders(const COutPoint& outpoint) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     //! Check if a given transaction has any of its outputs spent by another transaction in the wallet
     bool HasWalletSpend(const CTransactionRef& tx) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
@@ -967,6 +1136,15 @@ public:
      */
     boost::signals2::signal<void (CWallet* wallet)> NotifyStatusChanged;
 
+    /**
+     * An encryption started or ended, see EncryptionInProgressScope.
+     * Notifications from overlapping encryptions can be seen in any order, so
+     * a listener reads IsEncryptionInProgress() rather than counting them.
+     * Note: Can be called with cs_wallet held, as EncryptWallet does when its
+     * caller holds it, so a listener must not wait for wallet locks.
+     */
+    boost::signals2::signal<void ()> NotifyEncryptionInProgressChanged;
+
     /** Inquire whether this wallet broadcasts transactions. */
     bool GetBroadcastTransactions() const { return fBroadcastTransactions; }
     /** Set whether this wallet broadcasts transactions. */
@@ -991,7 +1169,14 @@ public:
      */
     void postInitProcess();
 
-    bool BackupWallet(const std::string& strDest) const;
+    /**
+     * Copy the database to strDest. The copy includes the file's free space,
+     * so a rewrite that is still pending after encryption runs first, and the
+     * backup is refused if it fails. Unless allow_unencrypted_pqc_keys is set,
+     * the backup is also refused while the wallet is encrypted but still
+     * stores plaintext PQC key records, because the copy would contain them.
+     */
+    util::Result<void> BackupWallet(const std::string& strDest, bool allow_unencrypted_pqc_keys = false);
 
     /* Returns true if HD is enabled */
     bool IsHDEnabled() const;
@@ -1050,8 +1235,8 @@ public:
     };
 
     //! Returns all unique ScriptPubKeyMans in m_internal_spk_managers and m_external_spk_managers
-    std::set<ScriptPubKeyMan*> GetActiveScriptPubKeyMans() const;
-    bool IsActiveScriptPubKeyMan(const ScriptPubKeyMan& spkm) const;
+    std::set<ScriptPubKeyMan*> GetActiveScriptPubKeyMans() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool IsActiveScriptPubKeyMan(const ScriptPubKeyMan& spkm) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     //! Returns all unique ScriptPubKeyMans
     std::set<ScriptPubKeyMan*> GetAllScriptPubKeyMans() const;
@@ -1060,7 +1245,7 @@ public:
     ScriptPubKeyMan* GetScriptPubKeyMan(const OutputType& type, bool internal) const;
 
     //! Get all the ScriptPubKeyMans for a script
-    std::set<ScriptPubKeyMan*> GetScriptPubKeyMans(const CScript& script) const;
+    std::set<ScriptPubKeyMan*> GetScriptPubKeyMans(const CScript& script) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     //! Get the ScriptPubKeyMan by id
     ScriptPubKeyMan* GetScriptPubKeyMan(const uint256& id) const;
 
@@ -1102,7 +1287,7 @@ public:
     void WriteBestBlock() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     //! Connect the signals from ScriptPubKeyMans to the signals in CWallet
-    void ConnectScriptPubKeyManNotifiers();
+    void ConnectScriptPubKeyManNotifiers() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     //! Instantiate a descriptor ScriptPubKeyMan from the WalletDescriptor and load it
     DescriptorScriptPubKeyMan& LoadDescriptorScriptPubKeyMan(uint256 id, WalletDescriptor& desc);
@@ -1166,9 +1351,13 @@ public:
     bool CanGrindR() const;
 
     //! Add scriptPubKeys for this ScriptPubKeyMan into the scriptPubKey cache
-    void CacheNewScriptPubKeys(const std::set<CScript>& spks, ScriptPubKeyMan* spkm);
+    void CacheNewScriptPubKeys(const std::set<CScript>& spks, ScriptPubKeyMan* spkm) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
-    void TopUpCallback(const std::set<CScript>& spks, ScriptPubKeyMan* spkm) override;
+    TopUpPublicationId StageTopUpPublication(const std::set<CScript>& spks, ScriptPubKeyMan* spkm, std::weak_ptr<void> lifetime) override;
+    void BeginTopUpCommit(TopUpPublicationId id) override;
+    void FinishTopUpCommit(TopUpPublicationId id, bool committed) override;
+    void CancelTopUpPublication(TopUpPublicationId id) override;
+    bool TopUpCallback(const std::set<CScript>& spks, ScriptPubKeyMan* spkm, TopUpPublicationId id = INVALID_TOPUP_PUBLICATION_ID) override;
 
     //! Retrieve the xpubs in use by the active descriptors
     std::set<CExtPubKey> GetActiveHDPubKeys() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);

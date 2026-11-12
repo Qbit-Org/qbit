@@ -18,6 +18,7 @@
 #include <qt/optionsdialog.h>
 #include <qt/optionsmodel.h>
 #include <qt/platformstyle.h>
+#include <qt/pokerlobby.h>
 #include <qt/rpcconsole.h>
 #include <qt/utilitydialog.h>
 
@@ -398,6 +399,11 @@ void BitcoinGUI::createActions()
     m_migrate_wallet_action->setStatusTip(tr("Migrate a wallet"));
     m_migrate_wallet_menu = new QMenu(this);
 
+    // Alt+L: the Window menu already uses P for Peers.
+    m_poker_lobby_action = new QAction(tr("Poker &Lobby"), this);
+    m_poker_lobby_action->setMenuRole(QAction::NoRole);
+    m_poker_lobby_action->setStatusTip(tr("Play Satoshi's poker game with play money against computer players"));
+
     showHelpMessageAction = new QAction(tr("&Command-line options"), this);
     showHelpMessageAction->setMenuRole(QAction::NoRole);
     showHelpMessageAction->setStatusTip(tr("Show the %1 help message to get a list with possible qbit command-line options").arg(CLIENT_NAME));
@@ -412,6 +418,7 @@ void BitcoinGUI::createActions()
     connect(aboutQtAction, &QAction::triggered, qApp, QApplication::aboutQt);
     connect(optionsAction, &QAction::triggered, this, &BitcoinGUI::optionsClicked);
     connect(showHelpMessageAction, &QAction::triggered, this, &BitcoinGUI::showHelpMessageClicked);
+    connect(m_poker_lobby_action, &QAction::triggered, this, &BitcoinGUI::showPokerLobby);
     connect(openRPCConsoleAction, &QAction::triggered, this, &BitcoinGUI::showDebugWindow);
     // prevents an open debug window from becoming stuck/unusable on client shutdown
     connect(quitAction, &QAction::triggered, rpcConsole, &QWidget::hide);
@@ -609,6 +616,9 @@ void BitcoinGUI::createMenuBar()
     }
 
     window_menu->addSeparator();
+    window_menu->addAction(m_poker_lobby_action);
+
+    window_menu->addSeparator();
     for (RPCConsole::TabTypes tab_type : rpcConsole->tabs()) {
         QAction* tab_action = window_menu->addAction(rpcConsole->tabTitle(tab_type));
         tab_action->setShortcut(rpcConsole->tabShortcut(tab_type));
@@ -728,6 +738,10 @@ void BitcoinGUI::setClientModel(ClientModel *_clientModel, interfaces::BlockAndH
         }
 #endif // ENABLE_WALLET
         unitDisplayControl->setOptionsModel(nullptr);
+        if (m_poker_lobby) {
+            m_poker_lobby->closeTables();
+            m_poker_lobby->close();
+        }
         // Disable top bar menu actions
         appMenuBar->clear();
     }
@@ -842,6 +856,11 @@ void BitcoinGUI::setCurrentWalletBySelectorIndex(int index)
 {
     WalletModel* wallet_model = m_wallet_selector->itemData(index).value<WalletModel*>();
     if (wallet_model) setCurrentWallet(wallet_model);
+}
+
+void BitcoinGUI::prepareWalletsForShutdown()
+{
+    if (walletFrame) walletFrame->prepareForShutdown();
 }
 
 void BitcoinGUI::removeAllWallets()
@@ -993,6 +1012,12 @@ void BitcoinGUI::showDebugWindowActivateConsole()
 {
     rpcConsole->setTabFocus(RPCConsole::TabTypes::CONSOLE);
     showDebugWindow();
+}
+
+void BitcoinGUI::showPokerLobby()
+{
+    if (!m_poker_lobby) m_poker_lobby = new PokerLobby(this);
+    GUIUtil::bringToFront(m_poker_lobby);
 }
 
 void BitcoinGUI::showHelpMessageClicked()
@@ -1495,8 +1520,17 @@ bool BitcoinGUI::eventFilter(QObject *object, QEvent *event)
 #ifdef ENABLE_WALLET
 bool BitcoinGUI::handlePaymentRequest(const SendCoinsRecipient& recipient)
 {
+    if (!walletFrame) return false;
+    // Filling in the Send page reads the address book, which the encryption
+    // keeps locked. Deliver the request once the wallet has finished
+    // encrypting; a dropped model drops the request with it.
+    WalletModel* const wallet_model{walletFrame->currentWalletModel()};
+    if (wallet_model && wallet_model->isEncryptingWallet()) {
+        connect(wallet_model, &WalletModel::walletEncryptionEnded, this, [this, recipient] { handlePaymentRequest(recipient); }, Qt::SingleShotConnection);
+        return true;
+    }
     // URI has to be valid
-    if (walletFrame && walletFrame->handlePaymentRequest(recipient))
+    if (walletFrame->handlePaymentRequest(recipient))
     {
         showNormalIfMinimized();
         gotoSendCoinsPage();
@@ -1570,6 +1604,14 @@ void BitcoinGUI::updateWalletPQCValidationStatus()
         } else {
             labelWalletEncryptionIcon->setToolTip(tr("Wallet is unencrypted. qbit validates PQC keys every time this wallet loads. Encrypt wallet to enable authenticated fast loads."));
         }
+    } else if (walletModel->getEncryptionStatus() != WalletModel::Unencrypted && info.reencryption_required) {
+        labelWalletEncryptionIcon->show();
+        labelWalletEncryptionIcon->setThemedPixmap(QStringLiteral(":/icons/warning"), STATUSBAR_ICONSIZE, STATUSBAR_ICONSIZE);
+        if (info.failed_records > 0) {
+            labelWalletEncryptionIcon->setToolTip(tr("Wallet is encrypted, but it still stores %n PQC private key(s) unencrypted, and some of them failed validation. Signing is disabled until the wallet is restored or repaired, and backups are refused.", "", static_cast<int>(info.plaintext_records)));
+        } else {
+            labelWalletEncryptionIcon->setToolTip(tr("Wallet is encrypted, but it still stores %n PQC private key(s) unencrypted. Unlock the wallet to re-encrypt them: enter its passphrase when you send, or run walletpassphrase in the console. Signing and backups are refused until then. Older backups of this wallet still contain these keys.", "", static_cast<int>(info.plaintext_records)));
+        }
     }
 
     if (m_chain_sync_progress_visible) {
@@ -1585,7 +1627,9 @@ void BitcoinGUI::updateWalletPQCValidationStatus()
         progressBar->setValue(std::min(progress_value, PROGRESS_BAR_MAX - 1));
         progressBar->setFormat(tr("%1%").arg(progress_value));
         progressBar->setVisible(true);
-        const QString tooltip{tr("This wallet is unencrypted. qbit is validating plaintext PQC keys before spending is enabled. Encrypt this wallet to enable authenticated fast loads in the future.")};
+        const QString tooltip{walletModel->getEncryptionStatus() == WalletModel::Unencrypted ?
+            tr("This wallet is unencrypted. qbit is validating plaintext PQC keys before spending is enabled. Encrypt this wallet to enable authenticated fast loads in the future.") :
+            tr("This wallet is encrypted, but it still stores PQC private keys unencrypted. qbit is validating them; unlock the wallet afterwards to re-encrypt them. Signing and backups are refused until then.")};
         progressBarLabel->setToolTip(tooltip);
         progressBar->setToolTip(tooltip);
         m_wallet_pqc_validation_progress_visible = true;
@@ -1608,7 +1652,14 @@ void BitcoinGUI::updateWalletStatus()
     }
     WalletModel * const walletModel = walletView->getWalletModel();
     setEncryptionStatus(walletModel->getEncryptionStatus());
-    setHDStatus(walletModel->wallet().privateKeysDisabled(), walletModel->wallet().hdEnabled());
+    // Any wallet's status change lands here while another one may be
+    // encrypting. The model answers the queries above from cached values
+    // meanwhile, but the HD status query reads the descriptor managers the
+    // encryption is replacing; it cannot change during the encryption and
+    // the model refreshes the status once the encryption has finished.
+    if (!walletModel->isEncryptingWallet()) {
+        setHDStatus(walletModel->wallet().privateKeysDisabled(), walletModel->wallet().hdEnabled());
+    }
     updateWalletPQCValidationStatus();
 }
 #endif // ENABLE_WALLET

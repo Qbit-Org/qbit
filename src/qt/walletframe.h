@@ -38,6 +38,7 @@ public:
 
     bool addView(WalletView* walletView);
     void setCurrentWallet(WalletModel* wallet_model);
+    void prepareForShutdown();
     void removeWallet(WalletModel* wallet_model);
     QList<WalletModel*> getWalletModels() const;
 

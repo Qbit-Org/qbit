@@ -264,35 +264,267 @@ class RunScannersTest(unittest.TestCase):
             gaps,
         )
 
-    def test_libbitcoinpqc_approves_crossbeam_rustsec_lockfile_patch(self) -> None:
-        self.assertEqual(
-            [run_scanners.LIBBITCOINPQC_RUSTSEC_CROSSBEAM_PATCH_ID],
-            run_scanners.libbitcoinpqc_approved_downstream_patch_ids(
-                ["Cargo.lock"],
-                run_scanners.LIBBITCOINPQC_RUSTSEC_CROSSBEAM_PATCH_LINES,
-            ),
+    def test_cargo_audit_fetches_one_advisory_database(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source"
+            raw_dir = Path(tmp) / "raw"
+            for relpath in ("a/Cargo.lock", "b/Cargo.lock"):
+                (source / relpath).parent.mkdir(parents=True)
+                (source / relpath).write_text("", encoding="utf-8")
+            commands, _ = run_scanners.external_commands("cargo_audit", source, raw_dir, object())
+        db_args = ["--db", str(raw_dir / "advisory-db")]
+        self.assertEqual(len(commands), 2)
+        self.assertNotIn("--no-fetch", commands[0])
+        self.assertIn("--no-fetch", commands[1])
+        for command in commands:
+            self.assertEqual(command[command.index("--db"):command.index("--db") + 2], db_args)
+
+    def test_cargo_audit_retries_failed_advisory_fetch(self) -> None:
+        attempts = []
+
+        partial_db_seen_on_retry = []
+
+        def fake_run_command(command, raw_dir, index, cwd):
+            attempts.append(index)
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            advisory_db = run_scanners.cargo_audit_advisory_db(raw_dir)
+            if attempts.count(0) == 2:
+                partial_db_seen_on_retry.append(advisory_db.exists())
+            report = {"database": {}, "vulnerabilities": {"list": []}}
+            failed_fetch = index == 0 and attempts.count(0) == 1
+            if failed_fetch:
+                # A failed fetch can leave a partial clone behind.
+                advisory_db.mkdir(parents=True, exist_ok=True)
+                (advisory_db / "partial").write_text("", encoding="utf-8")
+            (raw_dir / f"command-{index}.stdout.txt").write_text(
+                "" if failed_fetch else run_scanners.json.dumps(report), encoding="utf-8"
+            )
+            (raw_dir / f"command-{index}.stderr.txt").write_text(
+                "fetch failed\n" if failed_fetch else "", encoding="utf-8"
+            )
+            return 1 if failed_fetch else 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source"
+            (source / "a").mkdir(parents=True)
+            (source / "a" / "Cargo.lock").write_text("", encoding="utf-8")
+            args = run_scanners.argparse.Namespace(
+                source=source, skip_build_scanners=False, mode="manual_dry_run",
+                source_commit="", freeze_commit="", scanner=["cargo_audit"],
+            )
+            with patch.object(run_scanners, "run_command", side_effect=fake_run_command), \
+                    patch.object(run_scanners.shutil, "which", return_value="/usr/bin/cargo"), \
+                    patch.object(run_scanners, "tool_version", return_value="cargo 1.0.0"), \
+                    patch.object(run_scanners.time, "sleep"):
+                summary = run_scanners.run_scanner("cargo_audit", args, Path(tmp) / "out")
+            first_attempt_stderr = next(Path(tmp, "out").rglob("attempt-1.command-0.stderr.txt"))
+            self.assertEqual(first_attempt_stderr.read_text(encoding="utf-8"), "fetch failed\n")
+        self.assertEqual(attempts, [0, 0])
+        self.assertEqual(partial_db_seen_on_retry, [False])
+        self.assertEqual(summary["status"], "completed")
+
+    def test_cargo_audit_falls_back_to_own_fetch_after_failed_retries(self) -> None:
+        commands_run = []
+        # A failed attempt that still printed vulnerabilities must not be counted.
+        stray = {"vulnerabilities": {"list": [{"advisory": {"id": "RUSTSEC-0000-0000"}, "package": {}}]}}
+
+        def fake_run_command(command, raw_dir, index, cwd):
+            commands_run.append((index, list(command)))
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            report = {"database": {}, "vulnerabilities": {"list": stray["vulnerabilities"]["list"]}}
+            output = stray if index == 0 else report
+            (raw_dir / f"command-{index}.stdout.txt").write_text(run_scanners.json.dumps(output), encoding="utf-8")
+            (raw_dir / f"command-{index}.stderr.txt").write_text("", encoding="utf-8")
+            return 1 if index == 0 else 0
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source"
+            for relpath in ("a/Cargo.lock", "b/Cargo.lock"):
+                (source / relpath).parent.mkdir(parents=True)
+                (source / relpath).write_text("", encoding="utf-8")
+            args = run_scanners.argparse.Namespace(
+                source=source, skip_build_scanners=False, mode="manual_dry_run",
+                source_commit="", freeze_commit="", scanner=["cargo_audit"],
+            )
+            with patch.object(run_scanners, "run_command", side_effect=fake_run_command), \
+                    patch.object(run_scanners.shutil, "which", return_value="/usr/bin/cargo"), \
+                    patch.object(run_scanners, "tool_version", return_value="cargo 1.0.0"), \
+                    patch.object(run_scanners.time, "sleep"):
+                summary = run_scanners.run_scanner("cargo_audit", args, Path(tmp) / "out")
+            raw_dir = next(Path(tmp, "out").rglob("attempt-1.command-0.stdout.txt")).parent
+            counts = run_scanners.summarize_cargo_audit_outputs(raw_dir)
+        indexes = [index for index, _ in commands_run]
+        self.assertEqual(indexes, [0] * run_scanners.CARGO_AUDIT_FETCH_ATTEMPTS + [1])
+        self.assertNotIn("--no-fetch", commands_run[-1][1])
+        # Only the second lockfile's real report counts; output without a
+        # report, from the kept attempts or the last one, does not.
+        self.assertEqual(sum(counts.values()), 1)
+        self.assertEqual(summary["details"]["command_exit_codes"], [1, 0])
+        # The first lockfile was never audited: a failure with a gap, not a masked success.
+        self.assertEqual(summary["status"], "failed")
+        self.assertTrue(any("advisory database" in gap for gap in summary["coverage_gaps"]))
+        # The summary records the command that actually ran for the second lockfile.
+        self.assertNotIn("--no-fetch", summary["command"].split(" && ")[1])
+
+    def test_clang_static_analyzer_keeps_issues_in_different_files_apart(self) -> None:
+        def findings_for(root: Path) -> list[str]:
+            source = root / "checkout"
+            raw_dir = root / "out" / "raw"
+            run_dir = raw_dir / "scan-build" / "run"
+            run_dir.mkdir(parents=True)
+            for name in ("a.cpp", "b.cpp"):
+                diagnostic = {
+                    "check_name": "core.NullDereference",
+                    "issue_hash_content_of_line_in_context": "same",
+                    "location": {"file": 0, "line": 7},
+                }
+                plist = {"files": [str(source / "src" / name)], "diagnostics": [diagnostic]}
+                (run_dir / f"report-{name}.plist").write_bytes(run_scanners.plistlib.dumps(plist))
+            for line in (3, 9):
+                diagnostic = {"check_name": "core.CallAndMessage", "location": {"file": 0, "line": line}}
+                plist = {"files": [str(source / "src" / "c.cpp")], "diagnostics": [diagnostic]}
+                (run_dir / f"report-c-{line}.plist").write_bytes(run_scanners.plistlib.dumps(plist))
+            # A generated header in the out-of-tree build directory.
+            diagnostic = {"check_name": "core.uninitialized.Assign", "location": {"file": 0, "line": 1}}
+            plist = {"files": [str(raw_dir / "build" / "gen.h")], "diagnostics": [diagnostic]}
+            (run_dir / "report-gen.plist").write_bytes(run_scanners.plistlib.dumps(plist))
+            findings = run_scanners.parse_findings("clang_static_analyzer", run_dir, raw_dir, source)
+            return sorted(finding["finding_id"] for finding in findings)
+
+        with tempfile.TemporaryDirectory() as tmp_a, tempfile.TemporaryDirectory() as tmp_b:
+            first = findings_for(Path(tmp_a))
+            second = findings_for(Path(tmp_b))
+        self.assertEqual(len(first), 5)
+        self.assertEqual(len(set(first)), 5)
+        # Identities use paths relative to the source, so they match across checkouts.
+        self.assertEqual(first, second)
+
+    def test_clang_static_analyzer_configures_under_scan_build(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            raw_dir = Path(tmp) / "raw"
+            commands, report = run_scanners.external_commands("clang_static_analyzer", Path(tmp), raw_dir, object())
+        configure, build = commands
+        for command in commands:
+            self.assertEqual(command[:3], ["scan-build", "--use-cc=clang", "--use-c++=clang++"])
+        self.assertIn("-DWITH_CCACHE=OFF", configure)
+        self.assertNotEqual(configure[configure.index("-o") + 1], str(report))
+        self.assertEqual(build[build.index("-o") + 1], str(report))
+        self.assertIn("-plist-html", build)
+
+    def test_clang_static_analyzer_counts_diagnostics_not_plists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            raw_dir = Path(tmp) / "raw"
+            run_dir = raw_dir / "scan-build" / "run"
+            run_dir.mkdir(parents=True)
+            diagnostic = {"check_name": "core.NullDereference", "issue_hash_content_of_line_in_context": "abc"}
+            (run_dir / "report-empty.plist").write_bytes(run_scanners.plistlib.dumps({"diagnostics": []}))
+            (run_dir / "report-bug.plist").write_bytes(run_scanners.plistlib.dumps({"diagnostics": [diagnostic]}))
+            (run_dir / "report-bad.plist").write_text("not a plist", encoding="utf-8")
+            # Cut short mid-write: plistlib raises the XML parser's own error.
+            (run_dir / "report-truncated.plist").write_bytes(
+                b'<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>diagnostics</key>'
+            )
+            # The same header issue reported again from another translation unit.
+            (run_dir / "report-bug-again.plist").write_bytes(
+                run_scanners.plistlib.dumps({"diagnostics": [diagnostic]})
+            )
+            other = dict(diagnostic, check_name="core.DivideZero")
+            (run_dir / "report-other.plist").write_bytes(run_scanners.plistlib.dumps({"diagnostics": [other]}))
+            counts = run_scanners.parse_counts("clang_static_analyzer", run_dir, raw_dir)
+            findings = run_scanners.parse_findings("clang_static_analyzer", run_dir, raw_dir)
+        self.assertEqual(counts["unknown"], 2)
+        self.assertEqual(len(findings), 2)
+
+
+
+class LatestGitSubtreeMetadataTest(unittest.TestCase):
+    """The scanner reads the subtree split the way the subtree lint does."""
+
+    QUOTED = f"git-subtree-dir: src/libbitcoinpqc\ngit-subtree-split: {'0' * 40}"
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.repo = Path(self.temp_dir.name)
+        self.git("init", "-q", "-b", "main")
+        (self.repo / "README").write_text("qbit\n", encoding="utf8")
+        (self.repo / "src" / "libbitcoinpqc").mkdir(parents=True)
+        (self.repo / "src" / "libbitcoinpqc" / "lib.c").write_text("int x;\n", encoding="utf8")
+        self.git("add", "-A")
+        self.split = "1" * 40
+        self.git(
+            "commit", "-q", "-m", "Squashed 'src/libbitcoinpqc/' content",
+            "-m", f"git-subtree-dir: src/libbitcoinpqc\ngit-subtree-split: {self.split}",
+        )
+        self.import_commit = self.git("rev-parse", "HEAD")
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def git(self, *args: str) -> str:
+        result = subprocess.run(
+            [
+                "git", "-c", "user.name=scanner test", "-c", "user.email=scanner@example.invalid",
+                "-c", "commit.gpgsign=false", "-C", str(self.repo), *args,
+            ],
+            check=True, capture_output=True, text=True,
+        )
+        return result.stdout.strip()
+
+    def metadata(self) -> dict:
+        return run_scanners.latest_git_subtree_metadata(self.repo, "src/libbitcoinpqc")
+
+    def commit_at(self, date: str, *args: str) -> None:
+        env = dict(os.environ, GIT_AUTHOR_DATE=date, GIT_COMMITTER_DATE=date)
+        subprocess.run(
+            [
+                "git", "-c", "user.name=scanner test", "-c", "user.email=scanner@example.invalid",
+                "-c", "commit.gpgsign=false", "-C", str(self.repo), *args,
+            ],
+            check=True, capture_output=True, text=True, env=env,
         )
 
-    def test_libbitcoinpqc_rejects_other_lockfile_patch(self) -> None:
-        changed_lines = list(run_scanners.LIBBITCOINPQC_RUSTSEC_CROSSBEAM_PATCH_LINES)
-        changed_lines[-1] = '+checksum = "unexpected"'
-
-        self.assertEqual(
-            [],
-            run_scanners.libbitcoinpqc_approved_downstream_patch_ids(
-                ["Cargo.lock"],
-                changed_lines,
-            ),
+    def test_a_skewed_committer_date_does_not_pick_an_older_import(self) -> None:
+        # The older import is dated in the future. Walked by date from the
+        # merge, it would come before its own descendant.
+        older, newer = "2" * 40, "3" * 40
+        self.commit_at(
+            "2035-01-01T00:00:00Z", "commit", "-q", "--allow-empty", "-m", "Squashed older",
+            "-m", f"git-subtree-dir: src/libbitcoinpqc\ngit-subtree-split: {older}",
         )
-
-    def test_libbitcoinpqc_rejects_extra_downstream_path(self) -> None:
-        self.assertEqual(
-            [],
-            run_scanners.libbitcoinpqc_approved_downstream_patch_ids(
-                ["Cargo.lock", "README.md"],
-                run_scanners.LIBBITCOINPQC_RUSTSEC_CROSSBEAM_PATCH_LINES,
-            ),
+        self.git("checkout", "-q", "-b", "import")
+        self.commit_at(
+            "2026-01-01T00:00:00Z", "commit", "-q", "--allow-empty", "-m", "Squashed newer",
+            "-m", f"git-subtree-dir: src/libbitcoinpqc\ngit-subtree-split: {newer}",
         )
+        self.git("checkout", "-q", "main")
+        self.commit_at("2026-01-02T00:00:00Z", "commit", "-q", "--allow-empty", "-m", "main moved on")
+        self.commit_at("2026-01-03T00:00:00Z", "merge", "-q", "--no-ff", "-m", "Merge pull request #2", "import")
+        self.assertEqual(self.metadata()["git_subtree_split"], newer)
+
+    def test_ignores_a_merge_commit_that_quotes_the_trailer(self) -> None:
+        self.git("checkout", "-q", "-b", "topic")
+        (self.repo / "notes.txt").write_text("notes\n", encoding="utf8")
+        self.git("add", "notes.txt")
+        self.git("commit", "-q", "-m", "notes")
+        self.git("checkout", "-q", "main")
+        self.git("merge", "-q", "--no-ff", "-m", "Merge pull request #1", "-m", self.QUOTED, "topic")
+        self.assertEqual(self.metadata()["qbit_import_commit"], self.import_commit)
+        self.assertEqual(self.metadata()["git_subtree_split"], self.split)
+
+    def test_finds_an_import_commit_that_only_moves_the_split(self) -> None:
+        moved = "2" * 40
+        self.git(
+            "commit", "-q", "--allow-empty", "-m", "Squashed 'src/libbitcoinpqc/' changes",
+            "-m", f"git-subtree-dir: src/libbitcoinpqc\ngit-subtree-split: {moved}",
+        )
+        self.assertEqual(self.metadata()["git_subtree_split"], moved)
+
+    def test_a_non_merge_commit_that_quotes_the_trailer_is_reported(self) -> None:
+        # Its split matches no release, so the subtree check fails closed.
+        (self.repo / "README").write_text("docs\n", encoding="utf8")
+        self.git("add", "README")
+        self.git("commit", "-q", "-m", "doc: describe the import", "-m", self.QUOTED)
+        self.assertEqual(self.metadata()["git_subtree_split"], "0" * 40)
 
 
 if __name__ == "__main__":

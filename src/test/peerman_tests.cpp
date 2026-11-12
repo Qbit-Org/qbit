@@ -3,20 +3,34 @@
 // file COPYING or https://www.opensource.org/licenses/mit-license.php.
 
 #include <net.h>
+#include <auxpow.h>
+#include <banman.h>
 #include <chainparams.h>
+#include <consensus/merkle.h>
+#include <crypto/pqc.h>
+#include <net_permissions.h>
+#include <netbase.h>
 #include <node/miner.h>
 #include <net_processing.h>
 #include <pow.h>
 #include <protocol.h>
+#include <script/interpreter.h>
+#include <script/script.h>
+#include <streams.h>
+#include <txmempool.h>
 #include <test/util/net.h>
 #include <test/util/script.h>
 #include <test/util/setup_common.h>
+#include <test/util/validation.h>
 #include <validation.h>
+#include <validationinterface.h>
 
 #include <boost/test/unit_test.hpp>
 
 #include <algorithm>
 #include <deque>
+#include <set>
+#include <utility>
 
 BOOST_FIXTURE_TEST_SUITE(peerman_tests, RegTestingSetup)
 
@@ -102,6 +116,173 @@ static CBlockIndex& InsertTestBlockIndex(ChainstateManager& chainman, const uint
     index.BuildCadenceLaneLinks();
     return index;
 }
+
+/** Parent coinbase padding that makes an AuxPoW header about 1.9 MB, so two fit in one headers message. */
+static constexpr size_t LARGE_AUXPOW_PADDING{1'900'000};
+
+/** A valid AuxPoW payload for header whose parent coinbase carries an extra output of padding bytes. */
+static std::shared_ptr<const CAuxPow> MakePaddedAuxpow(const CBlockHeader& header, const Consensus::Params& consensus, size_t padding)
+{
+    // Merged mining header, the aux block hash in display order, merkle size 1 and nonce 0.
+    std::vector<unsigned char> commitment{0xfa, 0xbe, 0x6d, 0x6d};
+    const uint256 hash{header.GetHash()};
+    commitment.insert(commitment.end(), hash.begin(), hash.end());
+    std::reverse(commitment.end() - uint256::size(), commitment.end());
+    commitment.insert(commitment.end(), {1, 0, 0, 0, 0, 0, 0, 0});
+
+    CMutableTransaction coinbase;
+    coinbase.version = 1;
+    coinbase.vin.resize(1);
+    coinbase.vin[0].prevout.SetNull();
+    coinbase.vin[0].scriptSig = CScript{} << commitment;
+    coinbase.vout.resize(2);
+    coinbase.vout[0].scriptPubKey = CScript{} << OP_TRUE;
+    coinbase.vout[1].scriptPubKey.resize(padding);
+
+    auto auxpow{std::make_shared<CAuxPow>()};
+    auxpow->coinbase_tx = MakeTransactionRef(std::move(coinbase));
+    auxpow->parent_block.nVersion = 1;
+    auxpow->parent_block.hashMerkleRoot = auxpow->coinbase_tx->GetHash().ToUint256();
+    auxpow->parent_block.nTime = header.nTime;
+    auxpow->parent_block.nBits = header.nBits;
+    while (!CheckProofOfWork(auxpow->parent_block.GetHash(), header.nBits, consensus)) ++auxpow->parent_block.nNonce;
+    return auxpow;
+}
+
+/** Give an AuxPoW header a payload that makes its headers message entry entry_size bytes. */
+static void SetHeadersEntrySize(CBlockHeader& header, const Consensus::Params& consensus, size_t entry_size)
+{
+    header.auxpow = MakePaddedAuxpow(header, consensus, entry_size);
+    header.auxpow = MakePaddedAuxpow(header, consensus, 2 * entry_size - HeadersMessageEntrySize(header));
+    BOOST_REQUIRE_EQUAL(HeadersMessageEntrySize(header), entry_size);
+}
+
+/** Mine a block onto the active tip whose AuxPoW header is padded by padding bytes. */
+static void MineAuxpowBlock(const node::NodeContext& node, size_t padding)
+{
+    auto& chainman{*Assert(node.chainman)};
+    const auto& consensus{chainman.GetConsensus()};
+    CBlock block{node::BlockAssembler{chainman.ActiveChainstate(), nullptr, {}}.CreateNewBlock()->block};
+    block.nVersion = MakeVersion(static_cast<uint16_t>(consensus.nAuxpowChainId), /*auxpow=*/true, block.GetVersionBits());
+    chainman.GenerateCoinbaseCommitment(block, WITH_LOCK(::cs_main, return chainman.ActiveTip()));
+    block.hashMerkleRoot = BlockMerkleRoot(block);
+    block.auxpow = MakePaddedAuxpow(block, consensus, padding);
+    BOOST_REQUIRE(chainman.ProcessNewBlock(std::make_shared<const CBlock>(block), /*force_processing=*/true, /*min_pow_checked=*/true, nullptr));
+    node.validation_signals->SyncWithValidationInterfaceQueue();
+    BOOST_REQUIRE_EQUAL(WITH_LOCK(::cs_main, return chainman.ActiveTip()->GetBlockHash()), block.GetHash());
+}
+
+/** Headers building on base that are not in the block index: num_large AuxPoW headers padded by
+ *  LARGE_AUXPOW_PADDING bytes, then num_small ordinary headers. */
+static std::vector<CBlockHeader> BuildAuxpowHeaders(const CBlockIndex& base, const Consensus::Params& consensus, size_t num_large, size_t num_small)
+{
+    std::vector<CBlockHeader> headers;
+    CBlockHeader prev{base.GetBlockHeader()};
+    for (size_t i{0}; i < num_large + num_small; ++i) {
+        const bool large{i < num_large};
+        CBlockHeader header;
+        header.nVersion = MakeVersion(large ? static_cast<uint16_t>(consensus.nAuxpowChainId) : 0, /*auxpow=*/large, /*version_bits=*/0);
+        header.hashPrevBlock = prev.GetHash();
+        header.hashMerkleRoot = uint256::ONE;
+        header.nTime = prev.nTime + consensus.nPowTargetSpacing;
+        header.nBits = base.nBits; // regtest does not retarget
+        if (large) {
+            header.auxpow = MakePaddedAuxpow(header, consensus, LARGE_AUXPOW_PADDING);
+        } else {
+            while (!CheckProofOfWork(header.GetHash(), header.nBits, consensus)) ++header.nNonce;
+        }
+        headers.push_back(header);
+        prev = header;
+    }
+    return headers;
+}
+
+static CNode& AddHeadersTestPeer(ConnmanTestMsg& connman, NodeId id) EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex)
+{
+    auto* peer = new CNode{id,
+                           /*sock=*/nullptr,
+                           CAddress{},
+                           /*nKeyedNetGroupIn=*/static_cast<uint64_t>(id),
+                           /*nLocalHostNonceIn=*/static_cast<uint64_t>(id),
+                           CAddress{},
+                           /*addrNameIn=*/"",
+                           ConnectionType::INBOUND,
+                           /*inbound_onion=*/false};
+    connman.Handshake(*peer, /*successfully_connected=*/true,
+                      /*remote_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                      /*local_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                      /*version=*/PROTOCOL_VERSION,
+                      /*relay_txs=*/true);
+    connman.AddTestNode(*peer);
+    connman.FlushSendBuffer(*peer);
+    return *peer;
+}
+
+/** Process a message from peer, as if it had arrived over the network. */
+template <typename... Args>
+static void ReceiveFromPeer(PeerManager& peerman, CNode& peer, const std::string& msg_type, Args&&... args) EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex)
+{
+    const CSerializedNetMsg msg{NetMsg::Make(msg_type, std::forward<Args>(args)...)};
+    DataStream stream{msg.data};
+    const std::atomic<bool> interrupt{false};
+    peerman.ProcessMessage(peer, msg_type, stream, /*time_received=*/std::chrono::microseconds{0}, interrupt);
+}
+
+static void ReceiveHeadersFromPeer(PeerManager& peerman, CNode& peer, const std::vector<CBlockHeader>& headers) EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex)
+{
+    // Like a sender, use CBlocks for the 0x00 transaction count after each header.
+    const std::vector<CBlock> blocks(headers.begin(), headers.end());
+    ReceiveFromPeer(peerman, peer, NetMsgType::HEADERS, TX_WITH_WITNESS(blocks));
+}
+
+/** Parse a headers message payload the way PeerManager does. */
+static std::vector<CBlockHeader> ParseHeadersMessage(std::span<const unsigned char> payload)
+{
+    DataStream stream{payload};
+    std::vector<CBlockHeader> headers(ReadCompactSize(stream));
+    for (CBlockHeader& header : headers) {
+        stream >> header;
+        BOOST_CHECK_EQUAL(ReadCompactSize(stream), 0U);
+    }
+    BOOST_CHECK(stream.empty());
+    return headers;
+}
+
+/** Records the messages sent to peers while in scope. */
+class SentMessages
+{
+public:
+    explicit SentMessages(ArgsManager& args) : m_args{args}, m_capture_orig{CaptureMessage}
+    {
+        m_args.ForceSetArg("-capturemessages", "1");
+        CaptureMessage = [this](const CAddress&, const std::string& msg_type, std::span<const unsigned char> data, bool is_incoming) {
+            if (!is_incoming) m_messages.emplace_back(msg_type, std::vector<unsigned char>(data.begin(), data.end()));
+        };
+    }
+
+    ~SentMessages()
+    {
+        CaptureMessage = m_capture_orig;
+        m_args.ForceSetArg("-capturemessages", "0");
+    }
+
+    /** Remove and return the payloads of the msg_type messages sent so far. */
+    std::vector<std::vector<unsigned char>> Take(const std::string& msg_type)
+    {
+        std::vector<std::vector<unsigned char>> payloads;
+        std::erase_if(m_messages, [&](auto& message) {
+            if (message.first != msg_type) return false;
+            payloads.push_back(std::move(message.second));
+            return true;
+        });
+        return payloads;
+    }
+
+private:
+    ArgsManager& m_args;
+    const decltype(CaptureMessage) m_capture_orig;
+    std::vector<std::pair<std::string, std::vector<unsigned char>>> m_messages;
+};
 
 // Verifying when network-limited peer connections are desirable based on the node's proximity to the tip
 BOOST_AUTO_TEST_CASE(connections_desirable_service_flags)
@@ -387,6 +568,858 @@ BOOST_FIXTURE_TEST_CASE(recovery_block_source_updates_to_latest_peer_after_retry
 
     peerman->FinalizeNode(*peer1);
     peerman->FinalizeNode(*peer2);
+    connman->ClearTestNodes();
+}
+
+BOOST_AUTO_TEST_CASE(headers_message_count_or_size_decides_whether_to_ask_for_more)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    auto connman = std::make_unique<ConnmanTestMsg>(0x2586, 0x2586, *m_node.addrman, *m_node.netgroupman, Params());
+    auto peerman = PeerManager::make(*connman, *m_node.addrman, nullptr, *m_node.chainman, *m_node.mempool, *m_node.warnings, {});
+    connman->SetMsgProc(peerman.get());
+    CNode& peer{AddHeadersTestPeer(*connman, /*id=*/0)};
+
+    const auto& consensus{m_node.chainman->GetConsensus()};
+    SentMessages sent{*m_node.args};
+    const auto asks_for_more{[&](const std::vector<CBlockHeader>& headers) EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex) {
+        ReceiveHeadersFromPeer(*peerman, peer, headers);
+        connman->FlushSendBuffer(peer);
+        BOOST_CHECK(!peer.fDisconnect);
+        return !sent.Take(NetMsgType::GETHEADERS).empty();
+    }};
+
+    // A message of MAX_HEADERS_RESULTS headers may not hold all of them, as
+    // before; one header fewer does. Ordinary headers stay far below the size
+    // threshold, so for them the count alone decides.
+    const CBlockIndex* genesis{WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain().Genesis())};
+    const auto headers{BuildAuxpowHeaders(*genesis, consensus, /*num_large=*/0, /*num_small=*/MAX_HEADERS_RESULTS)};
+    BOOST_CHECK_LT(HeadersMessageSize(headers), THRESHOLD_HEADERS_MESSAGE_SIZE);
+    BOOST_CHECK(!asks_for_more({headers.begin(), headers.end() - 1}));
+    BOOST_CHECK(asks_for_more(headers));
+
+    // With fewer headers, a message of THRESHOLD_HEADERS_MESSAGE_SIZE bytes
+    // may have been cut short by size; one byte less may not.
+    const CBlockIndex* tip{WITH_LOCK(::cs_main, return m_node.chainman->m_best_header)};
+    BOOST_REQUIRE_EQUAL(tip->GetBlockHash(), headers.back().GetHash());
+    auto large{BuildAuxpowHeaders(*tip, consensus, /*num_large=*/2, /*num_small=*/0)};
+    const size_t first_entry{1'000'000};
+    SetHeadersEntrySize(large[0], consensus, first_entry);
+    SetHeadersEntrySize(large[1], consensus, THRESHOLD_HEADERS_MESSAGE_SIZE - 1 - GetSizeOfCompactSize(2) - first_entry);
+    BOOST_REQUIRE_EQUAL(HeadersMessageSize(large), THRESHOLD_HEADERS_MESSAGE_SIZE - 1);
+    BOOST_CHECK(!asks_for_more(large));
+    SetHeadersEntrySize(large[1], consensus, THRESHOLD_HEADERS_MESSAGE_SIZE - GetSizeOfCompactSize(2) - first_entry);
+    BOOST_REQUIRE_EQUAL(HeadersMessageSize(large), THRESHOLD_HEADERS_MESSAGE_SIZE);
+    BOOST_CHECK(asks_for_more(large));
+
+    peerman->FinalizeNode(peer);
+    connman->ClearTestNodes();
+}
+
+BOOST_AUTO_TEST_CASE(getheaders_reply_with_small_headers_is_unchanged)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    auto connman = std::make_unique<ConnmanTestMsg>(0x2580, 0x2580, *m_node.addrman, *m_node.netgroupman, Params());
+    auto peerman = PeerManager::make(*connman, *m_node.addrman, nullptr, *m_node.chainman, *m_node.mempool, *m_node.warnings, {});
+    connman->SetMsgProc(peerman.get());
+    CNode& peer{AddHeadersTestPeer(*connman, /*id=*/0)};
+
+    MineToHeight(m_node, MAX_HEADERS_RESULTS + 1);
+    std::vector<CBlock> expected;
+    uint256 genesis_hash, last_expected_hash;
+    {
+        LOCK(::cs_main);
+        const CChain& chain{m_node.chainman->ActiveChain()};
+        for (int height{1}; height <= static_cast<int>(MAX_HEADERS_RESULTS); ++height) expected.emplace_back(chain[height]->GetBlockHeader());
+        genesis_hash = chain.Genesis()->GetBlockHash();
+        last_expected_hash = chain[MAX_HEADERS_RESULTS]->GetBlockHash();
+    }
+
+    SentMessages sent{*m_node.args};
+    ReceiveFromPeer(*peerman, peer, NetMsgType::GETHEADERS, CBlockLocator{{genesis_hash}}, uint256{});
+    auto replies{sent.Take(NetMsgType::HEADERS)};
+    BOOST_REQUIRE_EQUAL(replies.size(), 1U);
+    // One message of MAX_HEADERS_RESULTS headers, byte for byte what the
+    // count-only sender produced.
+    BOOST_CHECK(replies[0] == NetMsg::Make(NetMsgType::HEADERS, TX_WITH_WITNESS(expected)).data);
+    BOOST_CHECK(MayHaveMoreHeaders(ParseHeadersMessage(replies[0])));
+
+    ReceiveFromPeer(*peerman, peer, NetMsgType::GETHEADERS, CBlockLocator{{last_expected_hash}}, uint256{});
+    replies = sent.Take(NetMsgType::HEADERS);
+    BOOST_REQUIRE_EQUAL(replies.size(), 1U);
+    const auto last{ParseHeadersMessage(replies[0])};
+    BOOST_REQUIRE_EQUAL(last.size(), 1U);
+    BOOST_CHECK(!MayHaveMoreHeaders(last));
+
+    peerman->FinalizeNode(peer);
+    connman->ClearTestNodes();
+}
+
+BOOST_AUTO_TEST_CASE(getheaders_replies_with_large_auxpow_headers_stay_within_receive_limit)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    auto connman = std::make_unique<ConnmanTestMsg>(0x2581, 0x2581, *m_node.addrman, *m_node.netgroupman, Params());
+    auto peerman = PeerManager::make(*connman, *m_node.addrman, nullptr, *m_node.chainman, *m_node.mempool, *m_node.warnings, {});
+    connman->SetMsgProc(peerman.get());
+    CNode& peer{AddHeadersTestPeer(*connman, /*id=*/0)};
+
+    MineToHeight(m_node, 3);
+    for (int i{0}; i < 5; ++i) MineAuxpowBlock(m_node, LARGE_AUXPOW_PADDING);
+    for (int i{0}; i < 3; ++i) MineAuxpowBlock(m_node, /*padding=*/0);
+    std::vector<CBlockHeader> chain_headers;
+    {
+        LOCK(::cs_main);
+        const CChain& chain{m_node.chainman->ActiveChain()};
+        for (const CBlockIndex* pindex{chain[1]}; pindex; pindex = chain.Next(pindex)) chain_headers.push_back(pindex->GetBlockHeader());
+    }
+    // The whole range would not fit in one message.
+    size_t chain_bytes{0};
+    for (const CBlockHeader& header : chain_headers) chain_bytes += HeadersMessageEntrySize(header);
+    BOOST_REQUIRE_GT(chain_bytes, MAX_PROTOCOL_MESSAGE_LENGTH);
+
+    // Request headers like a syncing peer until a reply looks final.
+    SentMessages sent{*m_node.args};
+    std::vector<CBlockHeader> received;
+    std::vector<size_t> reply_sizes;
+    uint256 last_hash{Params().GenesisBlock().GetHash()};
+    while (true) {
+        BOOST_REQUIRE_LT(reply_sizes.size(), chain_headers.size());
+        ReceiveFromPeer(*peerman, peer, NetMsgType::GETHEADERS, CBlockLocator{{last_hash}}, uint256{});
+        connman->FlushSendBuffer(peer);
+        const auto replies{sent.Take(NetMsgType::HEADERS)};
+        BOOST_REQUIRE_EQUAL(replies.size(), 1U);
+        BOOST_CHECK_LE(replies[0].size(), MAX_PROTOCOL_MESSAGE_LENGTH);
+        const auto headers{ParseHeadersMessage(replies[0])};
+        BOOST_REQUIRE(!headers.empty());
+        BOOST_CHECK_EQUAL(headers.front().hashPrevBlock, last_hash);
+        received.insert(received.end(), headers.begin(), headers.end());
+        reply_sizes.push_back(headers.size());
+        last_hash = headers.back().GetHash();
+        if (!MayHaveMoreHeaders(headers)) break;
+        // A reply cut short by size still reaches the size threshold.
+        BOOST_CHECK_GE(replies[0].size(), THRESHOLD_HEADERS_MESSAGE_SIZE);
+    }
+
+    // [3 small, 2 large], [2 large], [1 large, 3 small], each ending at the
+    // receive limit until the last, which reaches the tip.
+    BOOST_CHECK(reply_sizes == (std::vector<size_t>{5, 2, 4}));
+    BOOST_REQUIRE_EQUAL(received.size(), chain_headers.size());
+    for (size_t i{0}; i < received.size(); ++i) {
+        BOOST_CHECK_EQUAL(received[i].GetHash(), chain_headers[i].GetHash());
+        BOOST_CHECK_EQUAL(GetSerializeSize(received[i]), GetSerializeSize(chain_headers[i]));
+    }
+
+    peerman->FinalizeNode(peer);
+    connman->ClearTestNodes();
+}
+
+BOOST_AUTO_TEST_CASE(getheaders_reply_with_oversized_index_auxpow_stays_within_receive_limit)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    auto connman = std::make_unique<ConnmanTestMsg>(0x2585, 0x2585, *m_node.addrman, *m_node.netgroupman, Params());
+    auto peerman = PeerManager::make(*connman, *m_node.addrman, nullptr, *m_node.chainman, *m_node.mempool, *m_node.warnings, {});
+    connman->SetMsgProc(peerman.get());
+    CNode& peer{AddHeadersTestPeer(*connman, /*id=*/0)};
+
+    auto& chainman{*m_node.chainman};
+    const auto& consensus{chainman.GetConsensus()};
+    MineToHeight(m_node, 2);
+    CBlock block{node::BlockAssembler{chainman.ActiveChainstate(), nullptr, {}}.CreateNewBlock()->block};
+    block.nVersion = MakeVersion(static_cast<uint16_t>(consensus.nAuxpowChainId), /*auxpow=*/true, block.GetVersionBits());
+    chainman.GenerateCoinbaseCommitment(block, WITH_LOCK(::cs_main, return chainman.ActiveTip()));
+    block.hashMerkleRoot = BlockMerkleRoot(block);
+
+    // AuxPoW is not part of the block hash, so the header can first arrive
+    // alone in a headers message with a payload no block could carry, and the
+    // block index keeps that payload when the block arrives with its own.
+    const size_t oversized_entry{MAX_PROTOCOL_MESSAGE_LENGTH - GetSizeOfCompactSize(1) - 4};
+    CBlockHeader header{block.GetBlockHeader()};
+    SetHeadersEntrySize(header, consensus, oversized_entry);
+    BlockValidationState state;
+    BOOST_REQUIRE_MESSAGE(chainman.ProcessNewBlockHeaders({{header}}, /*min_pow_checked=*/true, state), state.ToString());
+    block.auxpow = MakePaddedAuxpow(block, consensus, /*padding=*/0);
+    BOOST_REQUIRE(chainman.ProcessNewBlock(std::make_shared<const CBlock>(block), /*force_processing=*/true, /*min_pow_checked=*/true, nullptr));
+    m_node.validation_signals->SyncWithValidationInterfaceQueue();
+    BOOST_REQUIRE_EQUAL(HeadersMessageEntrySize(WITH_LOCK(::cs_main, return chainman.ActiveTip()->GetBlockHeader())), oversized_entry);
+    for (int i{0}; i < 2; ++i) MineAuxpowBlock(m_node, /*padding=*/0);
+
+    // That header goes alone, with nothing after it pushing the message past
+    // the receive limit, and the rest follows on request.
+    SentMessages sent{*m_node.args};
+    ReceiveFromPeer(*peerman, peer, NetMsgType::GETHEADERS, CBlockLocator{{block.hashPrevBlock}}, uint256{});
+    connman->FlushSendBuffer(peer);
+    auto replies{sent.Take(NetMsgType::HEADERS)};
+    BOOST_REQUIRE_EQUAL(replies.size(), 1U);
+    BOOST_CHECK_LE(replies[0].size(), MAX_PROTOCOL_MESSAGE_LENGTH);
+    const auto first{ParseHeadersMessage(replies[0])};
+    BOOST_REQUIRE_EQUAL(first.size(), 1U);
+    BOOST_CHECK_EQUAL(first[0].GetHash(), block.GetHash());
+    BOOST_CHECK(MayHaveMoreHeaders(first));
+
+    ReceiveFromPeer(*peerman, peer, NetMsgType::GETHEADERS, CBlockLocator{{block.GetHash()}}, uint256{});
+    replies = sent.Take(NetMsgType::HEADERS);
+    BOOST_REQUIRE_EQUAL(replies.size(), 1U);
+    const auto rest{ParseHeadersMessage(replies[0])};
+    BOOST_CHECK_EQUAL(rest.size(), 2U);
+    BOOST_CHECK(!MayHaveMoreHeaders(rest));
+
+    peerman->FinalizeNode(peer);
+    connman->ClearTestNodes();
+}
+
+BOOST_AUTO_TEST_CASE(headers_sync_requests_more_after_byte_limited_message)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    auto connman = std::make_unique<ConnmanTestMsg>(0x2582, 0x2582, *m_node.addrman, *m_node.netgroupman, Params());
+    auto peerman = PeerManager::make(*connman, *m_node.addrman, nullptr, *m_node.chainman, *m_node.mempool, *m_node.warnings, {});
+    connman->SetMsgProc(peerman.get());
+    CNode& peer{AddHeadersTestPeer(*connman, /*id=*/0)};
+
+    const CBlockIndex* genesis{WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain().Genesis())};
+    const auto headers{BuildAuxpowHeaders(*genesis, m_node.chainman->GetConsensus(), /*num_large=*/5, /*num_small=*/3)};
+    const auto messages{SplitIntoHeadersMessages(headers)};
+    BOOST_REQUIRE_EQUAL(messages.size(), 3U);
+
+    SentMessages sent{*m_node.args};
+    for (size_t i{0}; i < messages.size(); ++i) {
+        ReceiveHeadersFromPeer(*peerman, peer, messages[i]);
+        connman->FlushSendBuffer(peer);
+        BOOST_CHECK(!peer.fDisconnect);
+        BOOST_CHECK_EQUAL(WITH_LOCK(::cs_main, return m_node.chainman->m_best_header->GetBlockHash()), messages[i].back().GetHash());
+        const auto requests{sent.Take(NetMsgType::GETHEADERS)};
+        if (i + 1 < messages.size()) {
+            // A byte-limited message far short of MAX_HEADERS_RESULTS headers
+            // is not the peer's tip: ask for the headers after it.
+            BOOST_CHECK_LT(messages[i].size(), MAX_HEADERS_RESULTS);
+            BOOST_REQUIRE_EQUAL(requests.size(), 1U);
+            DataStream request{requests[0]};
+            CBlockLocator locator;
+            request >> locator;
+            BOOST_CHECK_EQUAL(locator.vHave.front(), messages[i].back().GetHash());
+        } else {
+            BOOST_CHECK(requests.empty());
+        }
+    }
+
+    // A v1.0.0 sender fills a message up to MAX_HEADERS_RESULTS headers
+    // regardless of size. If its last message happens to exceed the size
+    // threshold, we ask once more and accept the empty reply as final.
+    const CBlockIndex* tip{WITH_LOCK(::cs_main, return m_node.chainman->m_best_header)};
+    const auto more_headers{BuildAuxpowHeaders(*tip, m_node.chainman->GetConsensus(), /*num_large=*/2, /*num_small=*/0)};
+    BOOST_REQUIRE(MayHaveMoreHeaders(more_headers));
+    ReceiveHeadersFromPeer(*peerman, peer, more_headers);
+    connman->FlushSendBuffer(peer);
+    BOOST_CHECK_EQUAL(sent.Take(NetMsgType::GETHEADERS).size(), 1U);
+    ReceiveHeadersFromPeer(*peerman, peer, {});
+    BOOST_CHECK(sent.Take(NetMsgType::GETHEADERS).empty());
+    BOOST_CHECK(!peer.fDisconnect);
+    BOOST_CHECK_EQUAL(WITH_LOCK(::cs_main, return m_node.chainman->m_best_header->GetBlockHash()), more_headers.back().GetHash());
+
+    peerman->FinalizeNode(peer);
+    connman->ClearTestNodes();
+}
+
+BOOST_AUTO_TEST_CASE(low_work_headers_sync_continues_through_byte_limited_messages)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    auto connman = std::make_unique<ConnmanTestMsg>(0x2583, 0x2583, *m_node.addrman, *m_node.netgroupman, Params());
+    auto peerman = PeerManager::make(*connman, *m_node.addrman, nullptr, *m_node.chainman, *m_node.mempool, *m_node.warnings, {});
+    connman->SetMsgProc(peerman.get());
+    CNode& peer{AddHeadersTestPeer(*connman, /*id=*/0)};
+
+    const CBlockIndex* genesis{WITH_LOCK(::cs_main, return m_node.chainman->ActiveChain().Genesis())};
+    const auto headers{BuildAuxpowHeaders(*genesis, m_node.chainman->GetConsensus(), /*num_large=*/5, /*num_small=*/3)};
+    const auto messages{SplitIntoHeadersMessages(headers)};
+    BOOST_REQUIRE_EQUAL(messages.size(), 3U);
+
+    // Require exactly the work of the whole chain, so that only its last
+    // header completes each phase of the low-work headers sync.
+    arith_uint256 chain_work{genesis->nChainWork};
+    for (const CBlockHeader& header : headers) chain_work += GetBlockProof(CBlockIndex{header});
+    const_cast<ChainstateManager::Options&>(m_node.chainman->m_options).minimum_chain_work = chain_work;
+
+    SentMessages sent{*m_node.args};
+    const auto next_request_start{[&]() {
+        connman->FlushSendBuffer(peer);
+        const auto requests{sent.Take(NetMsgType::GETHEADERS)};
+        BOOST_REQUIRE_EQUAL(requests.size(), 1U);
+        DataStream request{requests[0]};
+        CBlockLocator locator;
+        request >> locator;
+        return locator.vHave.front();
+    }};
+
+    // PRESYNC follows the byte-limited messages, then restarts from the
+    // chain start once the chain has enough work.
+    for (size_t i{0}; i < messages.size(); ++i) {
+        ReceiveHeadersFromPeer(*peerman, peer, messages[i]);
+        BOOST_CHECK_EQUAL(next_request_start(), i + 1 < messages.size() ? messages[i].back().GetHash() : genesis->GetBlockHash());
+        BOOST_CHECK_EQUAL(WITH_LOCK(::cs_main, return m_node.chainman->m_best_header), genesis);
+    }
+
+    // REDOWNLOAD follows them again and then accepts every header.
+    for (size_t i{0}; i + 1 < messages.size(); ++i) {
+        ReceiveHeadersFromPeer(*peerman, peer, messages[i]);
+        BOOST_CHECK_EQUAL(next_request_start(), messages[i].back().GetHash());
+        BOOST_CHECK_EQUAL(WITH_LOCK(::cs_main, return m_node.chainman->m_best_header), genesis);
+    }
+    ReceiveHeadersFromPeer(*peerman, peer, messages.back());
+    connman->FlushSendBuffer(peer);
+    BOOST_CHECK(sent.Take(NetMsgType::GETHEADERS).empty());
+    BOOST_CHECK(!peer.fDisconnect);
+    BOOST_CHECK_EQUAL(WITH_LOCK(::cs_main, return m_node.chainman->m_best_header->GetBlockHash()), headers.back().GetHash());
+
+    peerman->FinalizeNode(peer);
+    connman->ClearTestNodes();
+}
+
+BOOST_AUTO_TEST_CASE(headers_announcement_too_large_for_one_message_reverts_to_inv)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    auto& chainman{static_cast<TestChainstateManager&>(*m_node.chainman)};
+    chainman.JumpOutOfIbd();
+    auto connman = std::make_unique<ConnmanTestMsg>(0x2584, 0x2584, *m_node.addrman, *m_node.netgroupman, Params());
+    auto peerman = PeerManager::make(*connman, *m_node.addrman, nullptr, chainman, *m_node.mempool, *m_node.warnings, {});
+    connman->SetMsgProc(peerman.get());
+    m_node.validation_signals->RegisterValidationInterface(peerman.get());
+    CNode& peer{AddHeadersTestPeer(*connman, /*id=*/0)};
+
+    // The peer wants headers announcements and has our tip.
+    ReceiveFromPeer(*peerman, peer, NetMsgType::SENDHEADERS);
+    ReceiveFromPeer(*peerman, peer, NetMsgType::GETHEADERS, CBlockLocator{{WITH_LOCK(::cs_main, return chainman.ActiveTip()->GetBlockHash())}}, uint256{});
+    connman->FlushSendBuffer(peer);
+
+    SentMessages sent{*m_node.args};
+    // Small headers are announced in a headers message, as before.
+    for (int i{0}; i < 2; ++i) MineAuxpowBlock(m_node, /*padding=*/0);
+    peerman->SendMessages(&peer);
+    connman->FlushSendBuffer(peer);
+    const auto announcements{sent.Take(NetMsgType::HEADERS)};
+    BOOST_REQUIRE_EQUAL(announcements.size(), 1U);
+    BOOST_CHECK_EQUAL(ParseHeadersMessage(announcements[0]).size(), 2U);
+
+    // Three large AuxPoW headers do not fit in one message: announce the tip
+    // with an inv instead, so the peer fetches the headers with getheaders.
+    for (int i{0}; i < 3; ++i) MineAuxpowBlock(m_node, LARGE_AUXPOW_PADDING);
+    peerman->SendMessages(&peer);
+    connman->FlushSendBuffer(peer);
+    const uint256 tip_hash{WITH_LOCK(::cs_main, return chainman.ActiveTip()->GetBlockHash())};
+    std::vector<CInv> invs;
+    for (const auto& payload : sent.Take(NetMsgType::INV)) {
+        DataStream stream{payload};
+        std::vector<CInv> payload_invs;
+        stream >> payload_invs;
+        invs.insert(invs.end(), payload_invs.begin(), payload_invs.end());
+    }
+    BOOST_CHECK(std::ranges::any_of(invs, [&](const CInv& inv) { return inv.IsMsgBlk() && inv.hash == tip_hash; }));
+    BOOST_CHECK(sent.Take(NetMsgType::HEADERS).empty());
+
+    m_node.validation_signals->SyncWithValidationInterfaceQueue();
+    m_node.validation_signals->UnregisterValidationInterface(peerman.get());
+    peerman->FinalizeNode(peer);
+    connman->ClearTestNodes();
+}
+
+namespace {
+/** A chain with confirmed P2MR coins: one whose leaf takes a PQC signature, and several that
+ *  are spent with OP_TRUE. */
+struct TxValidationBudgetSetup : public TestChain100Setup {
+    using valtype = std::vector<unsigned char>;
+    static constexpr uint32_t VALID_COINS{8};
+
+    valtype m_leaf_bytes;
+    valtype m_control_block{static_cast<unsigned char>(P2MR_LEAF_VERSION_V1 | 1)};
+    CMutableTransaction m_funding;
+    //! A signature for the first spend of the PQC coin, corrupted, so every spend fails verification.
+    valtype m_corrupted_sig;
+    uint32_t m_next_invalid{0};
+    uint32_t m_next_valid{1};
+
+    TxValidationBudgetSetup() : TestChain100Setup{ChainType::REGTEST, {.extra_args = {"-p2mronly=1"}}}
+    {
+        CPQCKey key;
+        key.MakeNewKey();
+        const CPQCPubKey pubkey{key.GetPubKey()};
+        const CScript leaf_script{CScript{} << valtype(pubkey.begin(), pubkey.end()) << OP_CHECKSIGPQC};
+        m_leaf_bytes.assign(leaf_script.begin(), leaf_script.end());
+        const uint256 leaf_hash{ComputeP2MRLeafHash(P2MR_LEAF_VERSION_V1, m_leaf_bytes)};
+        const uint256 merkle_root{ComputeP2MRMerkleRoot(m_control_block, leaf_hash)};
+        const CScript pqc_script_pubkey{CScript{} << OP_2 << valtype(merkle_root.begin(), merkle_root.end())};
+
+        const CAmount coin_value{m_coinbase_txns[0]->vout[0].nValue / (VALID_COINS + 2)};
+        std::vector<CTxOut> outputs(1 + VALID_COINS, CTxOut{coin_value, P2MROpTrueScript()});
+        outputs[0].scriptPubKey = pqc_script_pubkey;
+        m_funding = CreateValidMempoolTransaction(
+            /*input_transactions=*/{m_coinbase_txns[0]},
+            /*inputs=*/{COutPoint{m_coinbase_txns[0]->GetHash(), 0}},
+            /*input_height=*/COINBASE_MATURITY,
+            /*input_signing_keys=*/{coinbaseKey},
+            /*outputs=*/outputs,
+            /*submit=*/false);
+        CreateAndProcessBlock({m_funding}, P2MROpTrueScript());
+
+        CMutableTransaction first{InvalidSpend()};
+        m_next_invalid = 0;
+        PrecomputedTransactionData txdata;
+        txdata.Init(first, {m_funding.vout[0]});
+        ScriptExecutionData execdata;
+        execdata.m_annex_init = true;
+        execdata.m_annex_present = false;
+        execdata.m_tapleaf_hash = leaf_hash;
+        execdata.m_tapleaf_hash_init = true;
+        execdata.m_codeseparator_pos = 0xFFFFFFFFUL;
+        execdata.m_codeseparator_pos_init = true;
+        uint256 sighash;
+        Assert(SignatureHashP2MR(sighash, execdata, first, 0, SIGHASH_DEFAULT, txdata, MissingDataBehavior::ASSERT_FAIL));
+        uint32_t signatures_made{0};
+        Assert(key.Sign(sighash, m_corrupted_sig, signatures_made));
+        m_corrupted_sig[0] ^= 1;
+    }
+
+    /** A new transaction (with a new txid) that spends the PQC coin and fails signature verification. */
+    CMutableTransaction InvalidSpend()
+    {
+        CMutableTransaction tx;
+        tx.version = 2;
+        tx.vin.emplace_back(COutPoint{m_funding.GetHash(), 0});
+        tx.vin.back().scriptWitness.stack = {m_corrupted_sig, m_leaf_bytes, m_control_block};
+        tx.vout.emplace_back(m_funding.vout[0].nValue - 100'000 - m_next_invalid++, P2MROpTrueScript());
+        return tx;
+    }
+
+    /** A valid transaction that spends the next unspent OP_TRUE coin. */
+    CMutableTransaction ValidSpend()
+    {
+        BOOST_REQUIRE(m_next_valid <= VALID_COINS);
+        CMutableTransaction tx;
+        tx.version = 2;
+        tx.vin.emplace_back(COutPoint{m_funding.GetHash(), m_next_valid});
+        tx.vin.back().scriptWitness.stack = P2MROpTrueStack();
+        tx.vout.emplace_back(m_funding.vout[m_next_valid].nValue - 100'000, P2MROpTrueScript());
+        ++m_next_valid;
+        return tx;
+    }
+
+    bool InMempool(const CMutableTransaction& tx) const
+    {
+        return WITH_LOCK(m_node.mempool->cs, return m_node.mempool->exists(tx.GetHash()));
+    }
+};
+
+/** A budget small enough that one rejected transaction puts a peer over it: a peer's credit is
+ *  usable after one millisecond and allows a single validation, and there is no pool. */
+constexpr TxValidationBudgetOptions TINY_TX_VALIDATION_BUDGET{
+    .peer_rate = std::chrono::microseconds{1'000},
+    .peer_cap = std::chrono::microseconds{1},
+    .pool_rate = std::chrono::microseconds{0},
+    .pool_cap = std::chrono::microseconds{0},
+};
+
+CNode& AddTxTestPeer(ConnmanTestMsg& connman, NodeId id, ConnectionType conn_type, NetPermissionFlags permissions)
+    EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex)
+{
+    auto* peer = new CNode{id,
+                           /*sock=*/nullptr,
+                           CAddress{LookupNumeric(strprintf("10.0.0.%d", id + 1), 8333), NODE_NONE},
+                           /*nKeyedNetGroupIn=*/static_cast<uint64_t>(id),
+                           /*nLocalHostNonceIn=*/static_cast<uint64_t>(id),
+                           CAddress{},
+                           /*addrNameIn=*/"",
+                           conn_type,
+                           /*inbound_onion=*/false,
+                           CNodeOptions{.permission_flags = permissions}};
+    connman.Handshake(*peer, /*successfully_connected=*/true,
+                      /*remote_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                      /*local_services=*/ServiceFlags(NODE_NETWORK | NODE_WITNESS),
+                      /*version=*/PROTOCOL_VERSION,
+                      /*relay_txs=*/true);
+    connman.AddTestNode(*peer);
+    connman.FlushSendBuffer(*peer);
+    return *peer;
+}
+
+void SendTx(ConnmanTestMsg& connman, CNode& peer, const CMutableTransaction& tx) EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex)
+{
+    (void)connman.ReceiveMsgFrom(peer, NetMsg::Make(NetMsgType::TX, TX_WITH_WITNESS(tx)));
+    peer.fPauseSend = false;
+    connman.ProcessMessagesOnce(peer);
+}
+
+TxValidationStats GetTxValidationStats(const PeerManager& peerman, const CNode& peer)
+{
+    CNodeStateStats stats;
+    BOOST_REQUIRE(peerman.GetNodeStateStats(peer.GetId(), stats));
+    BOOST_REQUIRE(stats.m_tx_validation.has_value());
+    return *stats.m_tx_validation;
+}
+
+void AnnounceTx(ConnmanTestMsg& connman, CNode& peer, const uint256& txid) EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex)
+{
+    (void)connman.ReceiveMsgFrom(peer, NetMsg::Make(NetMsgType::INV, std::vector<CInv>{CInv{MSG_TX, txid}}));
+    peer.fPauseSend = false;
+    connman.ProcessMessagesOnce(peer);
+}
+
+/** Let peerman send its messages to peer, and return the transactions it requested. */
+std::set<uint256> RequestedTxs(PeerManager& peerman, ConnmanTestMsg& connman, CNode& peer, SentMessages& sent)
+    EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex)
+{
+    peerman.SendMessages(&peer);
+    connman.FlushSendBuffer(peer);
+    std::set<uint256> requested;
+    for (const auto& payload : sent.Take(NetMsgType::GETDATA)) {
+        DataStream stream{payload};
+        std::vector<CInv> invs;
+        stream >> invs;
+        for (const CInv& inv : invs) {
+            if (inv.IsGenTxMsg()) requested.insert(inv.hash);
+        }
+    }
+    return requested;
+}
+} // namespace
+
+BOOST_FIXTURE_TEST_CASE(tx_validation_budget_throttles_peer, TxValidationBudgetSetup)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    auto& chainman{*Assert(m_node.chainman)};
+    BOOST_REQUIRE(!chainman.IsInitialBlockDownload());
+    const auto start{GetTime<std::chrono::seconds>()};
+    SetMockTime(start);
+
+    PeerManager::Options opts;
+    opts.tx_validation_budget = TINY_TX_VALIDATION_BUDGET;
+    auto connman = std::make_unique<ConnmanTestMsg>(0x7275, 0x7275, *m_node.addrman, *m_node.netgroupman, Params());
+    auto peerman = PeerManager::make(*connman, *m_node.addrman, m_node.banman.get(), chainman, *m_node.mempool, *m_node.warnings, opts);
+    connman->SetMsgProc(peerman.get());
+    CNode& peer_a{AddTxTestPeer(*connman, /*id=*/0, ConnectionType::INBOUND, NetPermissionFlags::None)};
+    CNode& peer_b{AddTxTestPeer(*connman, /*id=*/1, ConnectionType::INBOUND, NetPermissionFlags::None)};
+    // Let both peers earn the credit they can use.
+    SetMockTime(start + 1s);
+
+    // Peer A sends transactions with a corrupted signature. The first is validated and puts A
+    // over its budget; the others are dropped without verifying their signatures.
+    {
+        ScopedPQCVerificationCounter verifications;
+        for (int i{0}; i < 5; ++i) SendTx(*connman, peer_a, InvalidSpend());
+        BOOST_CHECK_EQUAL(verifications.GetCount(), 1U);
+    }
+    TxValidationStats stats_a{GetTxValidationStats(*peerman, peer_a)};
+    BOOST_CHECK(stats_a.throttled);
+    BOOST_CHECK(stats_a.failed_time > 0us);
+    BOOST_CHECK_EQUAL(stats_a.dropped, 4U);
+    // A is neither disconnected nor discouraged.
+    peerman->SendMessages(&peer_a);
+    BOOST_CHECK(!peer_a.fDisconnect);
+    BOOST_CHECK(!m_node.banman->IsDiscouraged(peer_a.addr));
+
+    // Peer B's valid transaction is accepted while A is over its budget.
+    const CMutableTransaction valid_b{ValidSpend()};
+    SendTx(*connman, peer_b, valid_b);
+    BOOST_CHECK(InMempool(valid_b));
+
+    // A valid transaction from A is dropped, not rejected: the same transaction from B is accepted.
+    const CMutableTransaction valid_a{ValidSpend()};
+    SendTx(*connman, peer_a, valid_a);
+    BOOST_CHECK(!InMempool(valid_a));
+    BOOST_CHECK_EQUAL(GetTxValidationStats(*peerman, peer_a).dropped, 5U);
+    SendTx(*connman, peer_b, valid_a);
+    BOOST_CHECK(InMempool(valid_a));
+
+    const TxValidationStats stats_b{GetTxValidationStats(*peerman, peer_b)};
+    BOOST_CHECK(!stats_b.throttled);
+    BOOST_CHECK(stats_b.failed_time == 0us);
+    BOOST_CHECK_EQUAL(stats_b.dropped, 0U);
+
+    // Once A's credit has refilled, its next transaction is validated again.
+    SetMockTime(start + 1h);
+    const CMutableTransaction later_a{ValidSpend()};
+    SendTx(*connman, peer_a, later_a);
+    BOOST_CHECK(InMempool(later_a));
+    stats_a = GetTxValidationStats(*peerman, peer_a);
+    BOOST_CHECK(!stats_a.throttled);
+    BOOST_CHECK_EQUAL(stats_a.dropped, 5U);
+    BOOST_CHECK(!peer_a.fDisconnect);
+
+    peerman->FinalizeNode(peer_a);
+    peerman->FinalizeNode(peer_b);
+    connman->ClearTestNodes();
+}
+
+BOOST_FIXTURE_TEST_CASE(tx_validation_budget_exempts_noban_and_manual_peers, TxValidationBudgetSetup)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    auto& chainman{*Assert(m_node.chainman)};
+    BOOST_REQUIRE(!chainman.IsInitialBlockDownload());
+    const auto start{GetTime<std::chrono::seconds>()};
+    SetMockTime(start);
+
+    PeerManager::Options opts;
+    opts.tx_validation_budget = TINY_TX_VALIDATION_BUDGET;
+    auto connman = std::make_unique<ConnmanTestMsg>(0x7276, 0x7276, *m_node.addrman, *m_node.netgroupman, Params());
+    auto peerman = PeerManager::make(*connman, *m_node.addrman, m_node.banman.get(), chainman, *m_node.mempool, *m_node.warnings, opts);
+    connman->SetMsgProc(peerman.get());
+    CNode& noban{AddTxTestPeer(*connman, /*id=*/0, ConnectionType::INBOUND, NetPermissionFlags::NoBan)};
+    CNode& manual{AddTxTestPeer(*connman, /*id=*/1, ConnectionType::MANUAL, NetPermissionFlags::None)};
+    SetMockTime(start + 1s);
+
+    // The same stream as in tx_validation_budget_throttles_peer: every transaction is validated.
+    for (CNode* peer : {&noban, &manual}) {
+        ScopedPQCVerificationCounter verifications;
+        for (int i{0}; i < 5; ++i) SendTx(*connman, *peer, InvalidSpend());
+        BOOST_CHECK_EQUAL(verifications.GetCount(), 5U);
+        const TxValidationStats stats{GetTxValidationStats(*peerman, *peer)};
+        BOOST_CHECK(!stats.throttled);
+        BOOST_CHECK(stats.failed_time > 0us);
+        BOOST_CHECK_EQUAL(stats.dropped, 0U);
+    }
+
+    // They still have their valid transactions accepted.
+    const CMutableTransaction valid{ValidSpend()};
+    SendTx(*connman, noban, valid);
+    BOOST_CHECK(InMempool(valid));
+
+    peerman->FinalizeNode(noban);
+    peerman->FinalizeNode(manual);
+    connman->ClearTestNodes();
+}
+
+BOOST_FIXTURE_TEST_CASE(tx_validation_budget_requests_again_after_throttling, TxValidationBudgetSetup)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    auto& chainman{*Assert(m_node.chainman)};
+    BOOST_REQUIRE(!chainman.IsInitialBlockDownload());
+    const auto start{GetTime<std::chrono::seconds>()};
+    SetMockTime(start);
+
+    PeerManager::Options opts;
+    opts.tx_validation_budget = TINY_TX_VALIDATION_BUDGET;
+    auto connman = std::make_unique<ConnmanTestMsg>(0x7277, 0x7277, *m_node.addrman, *m_node.netgroupman, Params());
+    auto peerman = PeerManager::make(*connman, *m_node.addrman, m_node.banman.get(), chainman, *m_node.mempool, *m_node.warnings, opts);
+    connman->SetMsgProc(peerman.get());
+    // An outbound peer, so that the transactions it announces can be requested from it at once.
+    CNode& peer_a{AddTxTestPeer(*connman, /*id=*/0, ConnectionType::OUTBOUND_FULL_RELAY, NetPermissionFlags::None)};
+    CNode& peer_b{AddTxTestPeer(*connman, /*id=*/1, ConnectionType::INBOUND, NetPermissionFlags::None)};
+    SentMessages sent{*m_node.args};
+    SetMockTime(start + 1s);
+
+    // While within its budget, a transaction that only peer A announces is due to be requested
+    // from it.
+    const uint256 announced_before{0xb1};
+    AnnounceTx(*connman, peer_a, announced_before);
+
+    // A rejected transaction puts A over its budget before the request is sent.
+    SendTx(*connman, peer_a, InvalidSpend());
+    BOOST_REQUIRE(GetTxValidationStats(*peerman, peer_a).throttled);
+
+    // The request that has fallen due is released instead of being sent.
+    BOOST_CHECK(RequestedTxs(*peerman, *connman, peer_a, sent).empty());
+
+    // A transaction A announces now is not requested from it.
+    const uint256 announced_while_throttled{0xb2};
+    AnnounceTx(*connman, peer_a, announced_while_throttled);
+    BOOST_CHECK(RequestedTxs(*peerman, *connman, peer_a, sent).empty());
+
+    // Valid transactions A sends now are dropped without validation. One of them arrives from
+    // peer B as well, and is accepted from it.
+    const CMutableTransaction sent_while_throttled{ValidSpend()};
+    const CMutableTransaction also_from_b{ValidSpend()};
+    SendTx(*connman, peer_a, sent_while_throttled);
+    SendTx(*connman, peer_a, also_from_b);
+    BOOST_CHECK(!InMempool(sent_while_throttled));
+    BOOST_CHECK_EQUAL(GetTxValidationStats(*peerman, peer_a).dropped, 2U);
+    SendTx(*connman, peer_b, also_from_b);
+    BOOST_CHECK(InMempool(also_from_b));
+    BOOST_CHECK(RequestedTxs(*peerman, *connman, peer_a, sent).empty());
+
+    // Once A is within its budget again (its debt is at most 1 s, repaid at 1 ms per second),
+    // everything it announced or sent meanwhile is requested from it, apart from the transaction
+    // that has arrived from B.
+    SetMockTime(start + 1002s);
+    const std::set<uint256> requested{RequestedTxs(*peerman, *connman, peer_a, sent)};
+    BOOST_CHECK(!GetTxValidationStats(*peerman, peer_a).throttled);
+    const std::set<uint256> expected{announced_before, announced_while_throttled, sent_while_throttled.GetHash().ToUint256()};
+    BOOST_CHECK(requested == expected);
+
+    // The transaction A sends in reply is validated and accepted.
+    SendTx(*connman, peer_a, sent_while_throttled);
+    BOOST_CHECK(InMempool(sent_while_throttled));
+    BOOST_CHECK_EQUAL(GetTxValidationStats(*peerman, peer_a).dropped, 2U);
+    BOOST_CHECK(!peer_a.fDisconnect);
+    BOOST_CHECK(!m_node.banman->IsDiscouraged(peer_a.addr));
+
+    // Nothing is requested again, also after the requests A did not answer have timed out (after
+    // 60 s) and the deferred announcements could have been announced again (every 67 s).
+    BOOST_CHECK(RequestedTxs(*peerman, *connman, peer_a, sent).empty());
+    SetMockTime(start + 1100s);
+    BOOST_CHECK(RequestedTxs(*peerman, *connman, peer_a, sent).empty());
+    SetMockTime(start + 1170s);
+    BOOST_CHECK(RequestedTxs(*peerman, *connman, peer_a, sent).empty());
+
+    peerman->FinalizeNode(peer_a);
+    peerman->FinalizeNode(peer_b);
+    connman->ClearTestNodes();
+}
+
+BOOST_FIXTURE_TEST_CASE(tx_validation_budget_deferred_announcements_wait_for_retry_delay, TxValidationBudgetSetup)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    auto& chainman{*Assert(m_node.chainman)};
+    BOOST_REQUIRE(!chainman.IsInitialBlockDownload());
+    const auto start{GetTime<std::chrono::seconds>()};
+    SetMockTime(start);
+
+    // No peer's own credit reaches its cap here, so every peer draws on the pool. One rejected
+    // transaction empties the pool, and the pool and the sender's share of it are full again one
+    // second later, whatever the validation cost (a balance does not go below the floor of -1 s).
+    PeerManager::Options opts;
+    opts.tx_validation_budget = TxValidationBudgetOptions{
+        .peer_rate = 1us,
+        .peer_cap = 1h,
+        .pool_rate = 10s,
+        .pool_cap = 1us,
+    };
+    auto connman = std::make_unique<ConnmanTestMsg>(0x7279, 0x7279, *m_node.addrman, *m_node.netgroupman, Params());
+    auto peerman = PeerManager::make(*connman, *m_node.addrman, m_node.banman.get(), chainman, *m_node.mempool, *m_node.warnings, opts);
+    connman->SetMsgProc(peerman.get());
+    // An inbound peer, whose announcements are requested only after a delay.
+    CNode& quiet{AddTxTestPeer(*connman, /*id=*/0, ConnectionType::INBOUND, NetPermissionFlags::None)};
+    CNode& sender{AddTxTestPeer(*connman, /*id=*/1, ConnectionType::INBOUND, NetPermissionFlags::None)};
+    SentMessages sent{*m_node.args};
+    // As DEFERRED_TX_ANNOUNCEMENT_RETRY_DELAY in net_processing.cpp.
+    constexpr auto RETRY_DELAY{67s};
+
+    const auto empty_pool{[&]() EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex) {
+        const auto charged{GetTxValidationStats(*peerman, sender).failed_time};
+        SendTx(*connman, sender, InvalidSpend());
+        BOOST_REQUIRE(GetTxValidationStats(*peerman, sender).failed_time > charged);
+    }};
+    // Move to time, optionally empty the pool, then let peerman send its messages to the quiet peer.
+    const auto requested_at{[&](std::chrono::seconds time, bool pool_empty) EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex) {
+        SetMockTime(time);
+        if (pool_empty) empty_pool();
+        return RequestedTxs(*peerman, *connman, quiet, sent);
+    }};
+
+    // The quiet peer announces a transaction while the pool is empty. It is over the budget, so
+    // the announcement is deferred. The peer sends nothing else in this test.
+    const uint256 txid{0xd1};
+    BOOST_CHECK(requested_at(start + 1s, /*pool_empty=*/true).empty());
+    AnnounceTx(*connman, quiet, txid);
+    BOOST_CHECK(GetTxValidationStats(*peerman, quiet).throttled);
+    BOOST_CHECK(RequestedTxs(*peerman, *connman, quiet, sent).empty());
+
+    // A second later the pool is full again: the peer is within the budget and the announcement
+    // is passed on. The request is not due yet.
+    const auto passed_on{start + 2s};
+    BOOST_CHECK(requested_at(passed_on, /*pool_empty=*/false).empty());
+    BOOST_CHECK(!GetTxValidationStats(*peerman, quiet).throttled);
+
+    // The pool is empty whenever the peer's messages are sent during the next seconds, so the
+    // request that falls due is released, not sent, and the announcement is deferred again.
+    for (auto time{passed_on + 1s}; time <= passed_on + 6s; time += 1s) {
+        BOOST_CHECK(requested_at(time, /*pool_empty=*/true).empty());
+    }
+    BOOST_CHECK(GetTxValidationStats(*peerman, quiet).throttled);
+
+    // From now on the pool stays full. The peer is within the budget again, which is still
+    // noticed at once, but the announcement is not passed on again before the retry delay has
+    // passed since the last time: nothing is requested meanwhile.
+    for (auto time{passed_on + 7s}; time < passed_on + RETRY_DELAY; time += 1s) {
+        BOOST_CHECK(requested_at(time, /*pool_empty=*/false).empty());
+        BOOST_CHECK(!GetTxValidationStats(*peerman, quiet).throttled);
+    }
+
+    // Then it is passed on, and the transaction is requested from the peer exactly once.
+    std::set<uint256> requested;
+    size_t requests{0};
+    for (auto time{passed_on + RETRY_DELAY}; time <= passed_on + RETRY_DELAY + 6s; time += 1s) {
+        std::set<uint256> now_requested{requested_at(time, /*pool_empty=*/false)};
+        requests += now_requested.size();
+        requested.merge(now_requested);
+    }
+    BOOST_CHECK(requested == std::set<uint256>{txid});
+    BOOST_CHECK_EQUAL(requests, 1U);
+
+    // It is not requested again, also after the request the peer did not answer has timed out
+    // and another retry delay has passed.
+    for (const auto later : {RETRY_DELAY + 70s, 2 * RETRY_DELAY + 10s, 3 * RETRY_DELAY + 10s}) {
+        BOOST_CHECK(requested_at(passed_on + later, /*pool_empty=*/false).empty());
+    }
+    BOOST_CHECK(!quiet.fDisconnect);
+    BOOST_CHECK(!sender.fDisconnect);
+
+    peerman->FinalizeNode(quiet);
+    peerman->FinalizeNode(sender);
+    connman->ClearTestNodes();
+}
+
+BOOST_FIXTURE_TEST_CASE(tx_validation_budget_requests_again_after_other_announcers_fail, TxValidationBudgetSetup)
+{
+    LOCK(NetEventsInterface::g_msgproc_mutex);
+    auto& chainman{*Assert(m_node.chainman)};
+    BOOST_REQUIRE(!chainman.IsInitialBlockDownload());
+    const auto start{GetTime<std::chrono::seconds>()};
+    SetMockTime(start);
+
+    // As TINY_TX_VALIDATION_BUDGET, but a peer's credit grows by one second per second, so that a
+    // peer over its budget is within it again one second later, whatever its debt.
+    PeerManager::Options opts;
+    opts.tx_validation_budget = TINY_TX_VALIDATION_BUDGET;
+    opts.tx_validation_budget.peer_rate = 1s;
+    auto connman = std::make_unique<ConnmanTestMsg>(0x7278, 0x7278, *m_node.addrman, *m_node.netgroupman, Params());
+    auto peerman = PeerManager::make(*connman, *m_node.addrman, m_node.banman.get(), chainman, *m_node.mempool, *m_node.warnings, opts);
+    connman->SetMsgProc(peerman.get());
+    CNode& peer_a{AddTxTestPeer(*connman, /*id=*/0, ConnectionType::OUTBOUND_FULL_RELAY, NetPermissionFlags::None)};
+    CNode& peer_b{AddTxTestPeer(*connman, /*id=*/1, ConnectionType::INBOUND, NetPermissionFlags::None)};
+    CNode& peer_c{AddTxTestPeer(*connman, /*id=*/2, ConnectionType::INBOUND, NetPermissionFlags::None)};
+    SentMessages sent{*m_node.args};
+    const auto requested_from_b_or_c{[&]() EXCLUSIVE_LOCKS_REQUIRED(NetEventsInterface::g_msgproc_mutex) {
+        std::set<uint256> requested{RequestedTxs(*peerman, *connman, peer_b, sent)};
+        requested.merge(RequestedTxs(*peerman, *connman, peer_c, sent));
+        return requested;
+    }};
+    SetMockTime(start + 1s);
+
+    // Three peers announce a transaction; it is due to be requested from A, the outbound peer, first.
+    const uint256 txid{0xc1};
+    AnnounceTx(*connman, peer_a, txid);
+    AnnounceTx(*connman, peer_b, txid);
+    AnnounceTx(*connman, peer_c, txid);
+
+    // A goes over its budget, so the request is released and B or C is asked instead.
+    SendTx(*connman, peer_a, InvalidSpend());
+    BOOST_REQUIRE(GetTxValidationStats(*peerman, peer_a).throttled);
+    BOOST_CHECK(RequestedTxs(*peerman, *connman, peer_a, sent).empty());
+    SetMockTime(start + 4s);
+    BOOST_CHECK(requested_from_b_or_c() == std::set<uint256>{txid});
+
+    // A is within its budget again while the request to another peer is outstanding, so it is not
+    // asked yet.
+    BOOST_CHECK(RequestedTxs(*peerman, *connman, peer_a, sent).empty());
+    BOOST_CHECK(!GetTxValidationStats(*peerman, peer_a).throttled);
+
+    // Neither B nor C replies. Each request times out after 60 s, and then the other is asked.
+    SetMockTime(start + 65s);
+    BOOST_CHECK(requested_from_b_or_c() == std::set<uint256>{txid});
+    SetMockTime(start + 4s + 67s);
+    BOOST_CHECK(RequestedTxs(*peerman, *connman, peer_a, sent).empty());
+    SetMockTime(start + 126s);
+    BOOST_CHECK(requested_from_b_or_c().empty());
+
+    // Once both have timed out, A is asked.
+    SetMockTime(start + 4s + 2 * 67s);
+    BOOST_CHECK(RequestedTxs(*peerman, *connman, peer_a, sent) == std::set<uint256>{txid});
+
+    // Only once, also after A has not replied.
+    SetMockTime(start + 1000s);
+    BOOST_CHECK(RequestedTxs(*peerman, *connman, peer_a, sent).empty());
+    SetMockTime(start + 1070s);
+    BOOST_CHECK(RequestedTxs(*peerman, *connman, peer_a, sent).empty());
+    BOOST_CHECK(!peer_a.fDisconnect);
+
+    peerman->FinalizeNode(peer_a);
+    peerman->FinalizeNode(peer_b);
+    peerman->FinalizeNode(peer_c);
     connman->ClearTestNodes();
 }
 

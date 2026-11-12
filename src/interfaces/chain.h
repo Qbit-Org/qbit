@@ -185,8 +185,10 @@ public:
 
     //! Look up unspent output information. Returns coins in the mempool and in
     //! the current chain UTXO set. Iterates through all the keys in the map and
-    //! populates the values.
-    virtual void findCoins(std::map<COutPoint, Coin>& coins) = 0;
+    //! populates the values. Coins spent by mempool transactions are included.
+    //! If requested, also replace mempool_spenders with each input's current
+    //! spender, from the same locked chain/mempool snapshot.
+    virtual void findCoins(std::map<COutPoint, Coin>& coins, std::map<COutPoint, Txid>* mempool_spenders = nullptr) = 0;
 
     //! Estimate fraction of total transactions verified if blocks up to
     //! the specified block hash are verified.
@@ -261,6 +263,10 @@ public:
 
     //! Check if transaction will pass the mempool's chain limits.
     virtual util::Result<void> checkChainLimits(const CTransactionRef& tx, std::optional<int64_t> tx_vsize = std::nullopt) = 0;
+
+    //! Check if transaction is final at the current chain tip, applying the
+    //! same rule the mempool uses when it accepts a transaction.
+    virtual bool isFinalAtTip(const CTransactionRef& tx) = 0;
 
     //! Estimate smart fee.
     virtual CFeeRate estimateSmartFee(int num_blocks, bool conservative, FeeCalculation* calc = nullptr) = 0;

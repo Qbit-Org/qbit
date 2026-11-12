@@ -85,11 +85,17 @@ class Wallet
 public:
     virtual ~Wallet() = default;
 
-    //! Encrypt wallet.
+    //! Encrypt wallet. Returns false if the wallet was not encrypted. Throws
+    //! if it was encrypted, but its new HD seed could not be set up.
     virtual bool encryptWallet(const SecureString& wallet_passphrase) = 0;
 
     //! Return whether wallet is encrypted.
     virtual bool isCrypted() = 0;
+
+    //! Return whether the wallet is being encrypted, by this interface or any
+    //! other caller such as the encryptwallet RPC. Does not wait for the
+    //! wallet locks, which the encryption holds until it returns.
+    virtual bool isEncryptionInProgress() = 0;
 
     //! Lock wallet.
     virtual bool lock() = 0;
@@ -108,7 +114,7 @@ public:
     virtual void abortRescan() = 0;
 
     //! Back up wallet.
-    virtual bool backupWallet(const std::string& filename) = 0;
+    virtual util::Result<void> backupWallet(const std::string& filename) = 0;
 
     //! Get wallet name.
     virtual std::string getWalletName() = 0;
@@ -198,10 +204,13 @@ public:
         std::vector<bilingual_str>& errors,
         CAmount& old_fee,
         CAmount& new_fee,
-        CMutableTransaction& mtx) = 0;
+        CMutableTransaction& mtx,
+        const SigningProgressCallback& progress_callback = {}) = 0;
 
     //! Sign bump transaction.
-    virtual bool signBumpTransaction(CMutableTransaction& mtx) = 0;
+    virtual bool signBumpTransaction(CMutableTransaction& mtx,
+        wallet::PQCUsageReport* pqc_usage = nullptr,
+        const SigningProgressCallback& progress_callback = {}) = 0;
 
     //! Commit bump transaction.
     virtual bool commitBumpTransaction(const Txid& txid,
@@ -238,7 +247,8 @@ public:
         size_t* n_signed,
         PartiallySignedTransaction& psbtx,
         bool& complete,
-        wallet::PQCUsageReport* pqc_usage = nullptr) = 0;
+        wallet::PQCUsageReport* pqc_usage = nullptr,
+        const SigningProgressCallback& progress_callback = {}) = 0;
 
     //! Get balances.
     virtual WalletBalances getBalances() = 0;
@@ -275,11 +285,13 @@ public:
     //! Get required fee.
     virtual CAmount getRequiredFee(unsigned int tx_bytes) = 0;
 
-    //! Get minimum fee.
+    //! Get minimum fee. estimate_unavailable is set when fee estimation had no
+    //! estimate, even if a minimum fee rate then replaced the FALLBACK reason.
     virtual CAmount getMinimumFee(unsigned int tx_bytes,
         const wallet::CCoinControl& coin_control,
         int* returned_target,
-        FeeReason* reason) = 0;
+        FeeReason* reason,
+        bool* estimate_unavailable) = 0;
 
     //! Get tx confirm target.
     virtual unsigned int getConfirmTarget() = 0;
@@ -338,6 +350,12 @@ public:
     //! Register handler for keypool changed messages.
     using CanGetAddressesChangedFn = std::function<void()>;
     virtual std::unique_ptr<Handler> handleCanGetAddressesChanged(CanGetAddressesChangedFn fn) = 0;
+
+    //! Register handler for messages that an encryption started or finished,
+    //! see isEncryptionInProgress(). Called on the encrypting thread, possibly
+    //! with the wallet locks held, so the handler must not wait for them.
+    using EncryptionInProgressChangedFn = std::function<void()>;
+    virtual std::unique_ptr<Handler> handleEncryptionInProgressChanged(EncryptionInProgressChangedFn fn) = 0;
 
     //! Return pointer to internal wallet class, useful for testing.
     virtual wallet::CWallet* wallet() { return nullptr; }

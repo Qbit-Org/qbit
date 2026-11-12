@@ -123,6 +123,15 @@ QList<TransactionRecord> TransactionRecord::decomposeTransaction(const interface
                 parts.append(sub);
             }
         }
+
+        // If every output was classified as change, no per-output record was
+        // created above. Preserve a fee-bearing payment to self as a
+        // transaction-level record so the history reconciles with the balance.
+        if (all_from_me && parts.empty() && nTxFee > 0) {
+            TransactionRecord sub(hash, nTime, TransactionRecord::PaymentToSelf, "", -nTxFee, 0);
+            sub.idx = -1;
+            parts.append(sub);
+        }
     } else {
         //
         // Mixed debit transaction, can't break down payees
@@ -144,6 +153,8 @@ void TransactionRecord::updateStatus(const interfaces::WalletTxStatus& wtx, cons
         typesort = 2; break;
     case RecvWithAddress: case RecvFromOther:
         typesort = 3; break;
+    case PaymentToSelf:
+        typesort = 4; break;
     default:
         typesort = 9;
     }

@@ -69,6 +69,9 @@ void EnsurePQCKeyValidationReadyForSigning(const CWallet& wallet)
     if (info.failed_records > 0) {
         throw JSONRPCError(RPC_WALLET_ERROR, "Error: plaintext PQC wallet key validation failed. Wallet signing is disabled until the wallet is restored or repaired.");
     }
+    if (info.reencryption_required) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Error: this encrypted wallet still stores PQC private keys unencrypted, so signing is disabled. Unlocking the wallet re-encrypts them: run walletpassphrase again, and if this persists check debug.log and getwalletinfo.pqc_key_validation.");
+    }
 }
 
 } // namespace

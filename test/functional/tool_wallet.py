@@ -156,6 +156,15 @@ class ToolWalletTest(BitcoinTestFramework):
         path = self.nodes[0].wallets_path / "nonexistent.dat"
         self.assert_raises_tool_error("Failed to load database path '{}'. Path does not exist.".format(path), '-wallet=nonexistent.dat', 'info')
 
+    def test_tool_wallet_after_listwalletdir(self):
+        self.log.info("Test that qbit-wallet cannot open a loaded wallet after listwalletdir")
+        assert {'name': self.default_wallet_name, 'warnings': []} in self.nodes[0].listwalletdir()['wallets']
+        error = f"SQLiteDatabase: Unable to obtain an exclusive lock on the database, is it being used by another instance of {self.config['environment']['CLIENT_NAME']}?"
+        self.assert_raises_tool_error(error, '-wallet=' + self.default_wallet_name, 'info')
+        dump_path = self.nodes[0].datadir_path / "locked.dump"
+        self.assert_raises_tool_error(error, '-wallet=' + self.default_wallet_name, f'-dumpfile={dump_path}', 'dump')
+        assert not dump_path.exists()
+
     def test_tool_wallet_info(self):
         wallet_info = self.nodes[0].getwalletinfo()
         address_book = self.get_address_book_size(self.nodes[0].get_wallet_rpc(self.default_wallet_name))
@@ -467,6 +476,7 @@ class ToolWalletTest(BitcoinTestFramework):
     def run_test(self):
         self.wallet_path = self.nodes[0].wallets_path / self.default_wallet_name / self.wallet_data_filename
         self.test_invalid_tool_commands_and_args()
+        self.test_tool_wallet_after_listwalletdir()
         # Warning: The following tests are order-dependent.
         self.test_tool_wallet_info()
         self.test_tool_wallet_info_after_transaction()

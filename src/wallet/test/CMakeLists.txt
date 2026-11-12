@@ -19,6 +19,7 @@ target_sources(test_bitcoin
     scriptpubkeyman_tests.cpp
     spend_tests.cpp
     wallet_crypto_tests.cpp
+    wallet_encryption_tests.cpp
     wallet_p2mr_basic_tests.cpp
     wallet_p2mr_batch_reservation_tests.cpp
     wallet_p2mr_change_keypool_tests.cpp
@@ -29,6 +30,7 @@ target_sources(test_bitcoin
     wallet_p2mr_encryption_tests.cpp
     wallet_p2mr_markunused_tests.cpp
     wallet_p2mr_parallel_signing_tests.cpp
+    wallet_p2mr_plaintext_reencryption_tests.cpp
     wallet_p2mr_plaintext_validation_completion_tests.cpp
     wallet_p2mr_plaintext_validation_failure_tests.cpp
     wallet_p2mr_plaintext_validation_ready_tests.cpp

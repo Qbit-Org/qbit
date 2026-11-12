@@ -1043,6 +1043,12 @@ public:
     const CBlockIndex* PendingWitnessRecovery() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     bool ScheduleWitnessRecovery(const CBlockIndex& block_index) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     void ClearWitnessRecovery(const uint256& block_hash) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    /**
+     * Check a copy of block_index, which must not be the genesis block,
+     * received for witness recovery. The copy is connected without passing
+     * through AcceptBlock(), so apply the checks AcceptBlock() would.
+     */
+    bool CheckRecoveredBlock(const CBlock& block, const CBlockIndex& block_index, BlockValidationState& state) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     kernel::Notifications& GetNotifications() const { return m_options.notifications; };
 
     /**
@@ -1309,7 +1315,11 @@ public:
     //! ResizeCoinsCaches() as needed.
     void MaybeRebalanceCaches() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
-    /** Update uncommitted block structures (currently: only the witness reserved value). This is safe for submitted blocks. */
+    /**
+     * Update uncommitted block structures (currently: only the witness reserved
+     * value). This is safe for submitted blocks as long as they honor
+     * default_witness_commitment from the template.
+     */
     void UpdateUncommittedBlockStructures(CBlock& block, const CBlockIndex* pindexPrev) const;
 
     /** Produce the necessary coinbase commitment for a block (modifies the hash, don't call for mined blocks). */

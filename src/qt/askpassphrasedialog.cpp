@@ -11,9 +11,20 @@
 
 #include <support/allocators/secure.h>
 
+#include <cassert>
+
 #include <QKeyEvent>
 #include <QMessageBox>
+#include <QProgressBar>
 #include <QPushButton>
+
+namespace {
+QString EncryptionReminder()
+{
+    return AskPassphraseDialog::tr("Remember that encrypting your wallet cannot fully protect "
+                                   "your QBT from being stolen by malware infecting your computer.");
+}
+} // namespace
 
 AskPassphraseDialog::AskPassphraseDialog(Mode _mode, QWidget *parent, SecureString* passphrase_out) :
     QDialog(parent, GUIUtil::dialog_flags),
@@ -30,6 +41,8 @@ AskPassphraseDialog::AskPassphraseDialog(Mode _mode, QWidget *parent, SecureStri
     ui->passEdit1->setMaxLength(MAX_PASSPHRASE_SIZE);
     ui->passEdit2->setMaxLength(MAX_PASSPHRASE_SIZE);
     ui->passEdit3->setMaxLength(MAX_PASSPHRASE_SIZE);
+
+    ui->progressBar->hide();
 
     // Setup Caps Lock detection.
     ui->passEdit1->installEventFilter(this);
@@ -76,11 +89,23 @@ AskPassphraseDialog::~AskPassphraseDialog()
 void AskPassphraseDialog::setModel(WalletModel *_model)
 {
     this->model = _model;
+    if (!_model) return;
+    connect(_model, &WalletModel::encryptWalletFinished, this, &AskPassphraseDialog::encryptWalletFinished);
+    // A model deleted mid-encryption can no longer report a result, so stop
+    // waiting for one. Close without done(): its finished() listeners refresh
+    // the wallet status from the model that is being destroyed.
+    connect(_model, &QObject::destroyed, this, [this] {
+        if (!m_encryption_in_progress) return;
+        m_encryption_in_progress = false;
+        hide();
+        if (testAttribute(Qt::WA_DeleteOnClose)) deleteLater();
+    });
 }
 
 void AskPassphraseDialog::accept()
 {
     SecureString oldpass, newpass1, newpass2;
+    if (m_encryption_in_progress) return;
     if (!model && mode != Encrypt && mode != UnlockMigration)
         return;
     oldpass.reserve(MAX_PASSPHRASE_SIZE);
@@ -113,14 +138,12 @@ void AskPassphraseDialog::accept()
         {
             if(newpass1 == newpass2)
             {
-                QString encryption_reminder = tr("Remember that encrypting your wallet cannot fully protect "
-                "your QBT from being stolen by malware infecting your computer.");
                 if (m_passphrase_out) {
                     m_passphrase_out->assign(newpass1);
                     QMessageBox msgBoxWarning(QMessageBox::Warning,
                                               tr("Wallet to be encrypted"),
                                               "<qt>" +
-                                                  tr("Your wallet is about to be encrypted. ") + encryption_reminder + " " +
+                                                  tr("Your wallet is about to be encrypted. ") + EncryptionReminder() + " " +
                                                   tr("Are you sure you wish to encrypt your wallet?") +
                                                   "</b></qt>",
                                               QMessageBox::Cancel | QMessageBox::Yes, this);
@@ -131,21 +154,32 @@ void AskPassphraseDialog::accept()
                         return;
                     }
                 } else {
-                    assert(model != nullptr);
-                    if (model->setWalletEncrypted(newpass1)) {
-                        QMessageBox::warning(this, tr("Wallet encrypted"),
-                                             "<qt>" +
-                                             tr("Your wallet is now encrypted. ") + encryption_reminder +
-                                             "<br><br><b>" +
-                                             tr("IMPORTANT: Any previous backups you have made of your wallet file "
-                                             "should be replaced with the newly generated, encrypted wallet file. "
-                                             "For security reasons, previous backups of the unencrypted wallet file "
-                                             "will become useless as soon as you start using the new, encrypted wallet.") +
-                                             "</b></qt>");
-                    } else {
-                        QMessageBox::critical(this, tr("Wallet encryption failed"),
-                                             tr("Wallet encryption failed due to an internal error. Your wallet was not encrypted."));
+                    // Wallet unload is deferred while the confirmation above
+                    // runs its nested event loop or, as a native message box,
+                    // the platform's modal loop, so the model outlives it.
+                    assert(model);
+                    // Another caller, such as the encryptwallet RPC, may be
+                    // encrypting the wallet. The model then refuses and says
+                    // so in a message box, whose event loop can see that
+                    // encryption end, so decide before asking.
+                    const bool other_encryption{model->isEncryptingWallet()};
+                    QPointer<AskPassphraseDialog> dialog{this};
+                    if (!model->encryptWallet(newpass1)) {
+                        if (!dialog) return;
+                        // Nothing was attempted, so there is no result.
+                        if (other_encryption || model->isEncryptingWallet()) {
+                            QDialog::reject();
+                            return;
+                        }
+                        showEncryptionResult(/*success=*/false);
+                        return;
                     }
+                    // Encryption runs on a worker thread; this dialog stays
+                    // open as the progress indicator until the model reports
+                    // the outcome through encryptWalletFinished().
+                    m_encryption_in_progress = true;
+                    showEncryptionInProgress();
+                    return;
                 }
                 QDialog::accept(); // Success
             }
@@ -218,6 +252,67 @@ void AskPassphraseDialog::accept()
         }
         break;
     }
+}
+
+void AskPassphraseDialog::reject()
+{
+    if (m_encryption_in_progress) return;
+    QDialog::reject();
+}
+
+void AskPassphraseDialog::showEncryptionInProgress()
+{
+    ui->warningLabel->setText(tr("Encrypting the wallet. This can take a while for a wallet with many keys. "
+                                 "The wallet will be locked when encryption finishes."));
+    ui->passLabel2->hide();
+    ui->passEdit2->hide();
+    ui->passLabel3->hide();
+    ui->passEdit3->hide();
+    ui->toggleShowPasswordButton->hide();
+    ui->capsLabel->hide();
+    ui->progressBar->setRange(0, 0);
+    ui->progressBar->show();
+    ui->buttonBox->setEnabled(false);
+}
+
+void AskPassphraseDialog::encryptWalletFinished(bool success)
+{
+    if (mode != Encrypt || !m_encryption_in_progress) return;
+    m_encryption_in_progress = false;
+    showEncryptionResult(success);
+}
+
+void AskPassphraseDialog::showEncryptionResult(bool success)
+{
+    // The message box runs a nested event loop; the dialog can be deleted
+    // with its wallet view before it returns.
+    QPointer<AskPassphraseDialog> dialog{this};
+    if (success) {
+        QMessageBox::warning(this, tr("Wallet encrypted"),
+                             "<qt>" +
+                             tr("Your wallet is now encrypted. ") + EncryptionReminder() +
+                             "<br><br><b>" +
+                             tr("IMPORTANT: Any previous backups you have made of your wallet file "
+                             "should be replaced with the newly generated, encrypted wallet file. "
+                             "For security reasons, previous backups of the unencrypted wallet file "
+                             "will become useless as soon as you start using the new, encrypted wallet.") +
+                             "</b></qt>");
+    } else {
+        // Another request, such as the encryptwallet RPC, can encrypt the
+        // wallet while this one derives its key; the wallet then needs that
+        // request's passphrase. The model reads the wallet again once the
+        // worker has returned.
+        const WalletModel::EncryptionStatus status{model ? model->getEncryptionStatus() : WalletModel::Unencrypted};
+        if (status == WalletModel::Locked || status == WalletModel::Unlocked) {
+            QMessageBox::critical(this, tr("Wallet encryption failed"),
+                                 tr("The wallet was already encrypted by another request. Your passphrase was not used."));
+        } else {
+            QMessageBox::critical(this, tr("Wallet encryption failed"),
+                                 tr("Wallet encryption failed due to an internal error. Your wallet was not encrypted."));
+        }
+    }
+    if (!dialog) return;
+    QDialog::accept();
 }
 
 void AskPassphraseDialog::textChanged()

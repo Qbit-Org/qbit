@@ -4,14 +4,26 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Test Wallet encryption"""
 
+try:
+    import sqlite3
+    HAVE_SQLITE3 = True
+except ImportError:
+    HAVE_SQLITE3 = False
+
 import time
 import subprocess
+from threading import Thread
 
-from test_framework.messages import hash256
+from test_framework.authproxy import JSONRPCException
+from test_framework.messages import (
+    hash256,
+    ser_string,
+)
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_raises_rpc_error,
     assert_equal,
+    get_rpc_proxy,
 )
 from test_framework.wallet_util import WalletUnlock
 
@@ -23,6 +35,95 @@ class WalletEncryptionTest(BitcoinTestFramework):
 
     def skip_test_if_missing_module(self):
         self.skip_if_no_wallet()
+
+    def test_rewrite_after_encryption(self):
+        if not HAVE_SQLITE3:
+            self.log.info("Skipping the rewrite checks: the Python sqlite3 module is not available")
+            return
+        self.log.info("Test that an encrypted wallet without the rewrite record is rewritten once when loaded")
+        node = self.nodes[0]
+        rewrite_log = "Rewrote the wallet file after encryption"
+        record_key = ser_string(b"postencryptionrewrite")
+        wallet_db = node.wallets_path / "rewrite" / self.wallet_data_filename
+
+        def count_records():
+            conn = sqlite3.connect(wallet_db)
+            with conn:
+                count = conn.execute("SELECT COUNT(*) FROM main WHERE key = ?", (record_key,)).fetchone()[0]
+            conn.close()
+            return count
+
+        node.createwallet(wallet_name="rewrite")
+        with node.assert_debug_log([rewrite_log]):
+            result = node.get_wallet_rpc("rewrite").encryptwallet("pass")
+        assert "Warning" not in result
+        node.unloadwallet("rewrite")
+        assert_equal(count_records(), 1)
+
+        with node.assert_debug_log([], unexpected_msgs=[rewrite_log]):
+            node.loadwallet("rewrite")
+        node.unloadwallet("rewrite")
+
+        # A wallet encrypted by v1.0.0 has no record.
+        conn = sqlite3.connect(wallet_db)
+        with conn:
+            conn.execute("DELETE FROM main WHERE key = ?", (record_key,))
+        conn.close()
+
+        if self.is_wallet_tool_compiled():
+            # The wallet tool leaves the rewrite to the next load by the node.
+            subprocess.run(
+                self.get_binaries().wallet_argv() + [f"-datadir={node.datadir_path}", f"-chain={self.chain}", "-wallet=rewrite", "info"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
+            assert_equal(count_records(), 0)
+
+        with node.assert_debug_log([rewrite_log]):
+            node.loadwallet("rewrite")
+        node.unloadwallet("rewrite")
+        assert_equal(count_records(), 1)
+
+        with node.assert_debug_log([], unexpected_msgs=[rewrite_log]):
+            node.loadwallet("rewrite")
+        wallet = node.get_wallet_rpc("rewrite")
+        with WalletUnlock(wallet, "pass"):
+            wallet.getnewaddress()
+        wallet.unloadwallet()
+
+    def test_encrypt_during_rescan(self):
+        self.log.info("Test that encryptwallet fails at once while the wallet is rescanning")
+        node = self.nodes[0]
+        node.createwallet(wallet_name="rescan_source")
+        source = node.get_wallet_rpc("rescan_source")
+        desc = next(d["desc"] for d in source.listdescriptors(True)["descriptors"] if d["desc"].startswith("mr(") and not d["internal"])
+        source.unloadwallet()
+        node.createwallet(wallet_name="rescanning", blank=True)
+        wallet = node.get_wallet_rpc("rescanning")
+        assert_equal(wallet.importdescriptors([{"desc": desc, "timestamp": "now", "range": [0, 1]}]), [{"success": True}])
+        results = []
+
+        def import_descriptor():
+            if self.options.usecli:
+                rpc = node.cli("-rpcwallet=rescanning")
+            else:
+                rpc = get_rpc_proxy(node.url, 0, timeout=600, coveragedir=node.coverage_dir) / "wallet/rescanning"
+            results.append(rpc.importdescriptors([{"desc": desc, "timestamp": 0, "range": [0, 299]}]))
+
+        # Widening the range of the imported descriptor logs the update after
+        # the import has reserved the rescan, then derives the new P2MR keys,
+        # which is slow enough to keep the reservation for seconds.
+        importing = Thread(target=import_descriptor)
+        with node.busy_wait_for_debug_log([b"Update existing descriptor"]):
+            importing.start()
+        assert_raises_rpc_error(-4, "Error: the wallet is currently being used to rescan the blockchain for related transactions. Please call `abortrescan` before encrypting the wallet.", wallet.encryptwallet, "pass")
+        # It failed while the import was still running, rather than after it.
+        assert importing.is_alive()
+        importing.join()
+        assert_equal(results, [[{"success": True}]])
+        # The wallet was not encrypted after the import finished either.
+        assert_raises_rpc_error(-15, "Error: running with an unencrypted wallet, but walletlock was called.", wallet.walletlock)
+        wallet.unloadwallet()
 
     def run_test(self):
         passphrase = "WalletPassphrase"
@@ -103,6 +204,42 @@ class WalletEncryptionTest(BitcoinTestFramework):
                 sig = self.nodes[0].signmessage(address, msg)
                 assert self.nodes[0].verifymessage(address, sig, msg)
 
+        self.log.info("Test that overlapping encryptwallet calls encrypt the wallet once")
+        self.nodes[0].createwallet(wallet_name="overlap")
+        passphrases = ["first passphrase", "second passphrase"]
+        results = [None] * len(passphrases)
+
+        def encrypt(index):
+            # Each thread needs its own RPC connection.
+            if self.options.usecli:
+                rpc = self.nodes[0].cli("-rpcwallet=overlap")
+            else:
+                rpc = get_rpc_proxy(self.nodes[0].url, 0, timeout=600, coveragedir=self.nodes[0].coverage_dir) / "wallet/overlap"
+            try:
+                results[index] = rpc.encryptwallet(passphrases[index])
+            except JSONRPCException as e:
+                results[index] = e
+
+        threads = [Thread(target=encrypt, args=(index,)) for index in range(len(passphrases))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        winners = [index for index, result in enumerate(results) if isinstance(result, str)]
+        losers = [index for index, result in enumerate(results) if isinstance(result, JSONRPCException)]
+        assert_equal(len(winners), 1)
+        assert_equal(len(losers), 1)
+        # The call that did not encrypt the wallet reports the wallet as
+        # already encrypted, the same error as any later encryptwallet call.
+        assert_equal(results[losers[0]].error["code"], -15)
+        assert_equal(results[losers[0]].error["message"], "Error: running with an encrypted wallet, but encryptwallet was called.")
+        overlap_wallet = self.nodes[0].get_wallet_rpc("overlap")
+        assert_equal(overlap_wallet.getwalletinfo()["unlocked_until"], 0)
+        assert_raises_rpc_error(-14, "wallet passphrase entered was incorrect", overlap_wallet.walletpassphrase, passphrases[losers[0]], 10)
+        with WalletUnlock(overlap_wallet, passphrases[winners[0]]):
+            assert overlap_wallet.getwalletinfo()["unlocked_until"] > 0
+        overlap_wallet.unloadwallet()
+
         self.log.info("Test that wallets without private keys cannot be encrypted")
         self.nodes[0].createwallet(wallet_name="noprivs", disable_private_keys=True)
         noprivs_wallet = self.nodes[0].get_wallet_rpc("noprivs")
@@ -161,6 +298,9 @@ class WalletEncryptionTest(BitcoinTestFramework):
             with open(dumpfile_path, "r", encoding="utf-8") as f:
                 # Check there's nothing with an 'mkey' prefix
                 assert_equal(all([not line.startswith("046d6b6579") for line in f]), True)
+
+        self.test_rewrite_after_encryption()
+        self.test_encrypt_during_rescan()
 
 
 if __name__ == '__main__':
