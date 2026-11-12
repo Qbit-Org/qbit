@@ -180,6 +180,7 @@ BASE_SCRIPTS = [
     'wallet_hd.py',
     'wallet_blank.py',
     'wallet_keypool_topup.py',
+    'wallet_keypool_locked_refill.py',
     'wallet_fast_rescan.py',
     'wallet_gethdkeys.py',
     'wallet_createwalletdescriptor.py',
