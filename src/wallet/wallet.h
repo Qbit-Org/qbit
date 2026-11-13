@@ -113,6 +113,23 @@ void MaybeScheduleP2MRKeyPoolRefill(WalletContext& context, const std::shared_pt
 //! Top up the active keypools after an unlock: non-P2MR ones inline, P2MR ones
 //! (the pending create-time top-up, or a refill to -keypool) in the background.
 void TopUpKeyPoolAfterUnlock(WalletContext& context, const std::shared_ptr<CWallet>& wallet);
+enum class P2MRKeyPoolRefillResult {
+    //! The pending create-time top-up, if any, and both P2MR keypools reached -keypool.
+    COMPLETE,
+    //! A pool reached its step limit first, for example because addresses
+    //! were handed out as fast as the steps derived them, or shutdown was
+    //! requested.
+    INCOMPLETE,
+    //! A step failed; it logged why.
+    FAILED,
+};
+//! Refill the P2MR keypools of an unlocked wallet to -keypool on the calling
+//! thread, so that the keys exist before the wallet is locked again: a locked
+//! wallet cannot derive P2MR keys. This runs the background refill steps one
+//! after another, each holding cs_wallet only briefly. It runs at most a fixed
+//! number of steps per pool, about twice what an empty pool needs, and stops
+//! early when shutdown is requested.
+P2MRKeyPoolRefillResult RefillP2MRKeyPoolsAfterUnlock(CWallet& wallet);
 std::unique_ptr<WalletDatabase> MakeWalletDatabase(const std::string& name, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error);
 //! The warning for an encrypted wallet whose rewrite after encryption is still pending.
 bilingual_str PendingRewriteWarning();
@@ -462,6 +479,10 @@ private:
     /** WalletFlags set on this wallet. */
     std::atomic<uint64_t> m_wallet_flags{0};
 
+    //! Number of EncryptionInProgressScope objects alive, see
+    //! IsEncryptionInProgress().
+    std::atomic<int> m_encryption_in_progress{0};
+
     bool SetAddressBookWithDB(WalletBatch& batch, const CTxDestination& address, const std::string& strName, const std::optional<AddressPurpose>& strPurpose);
 
     //! Unsets a wallet flag and saves it to disk
@@ -744,6 +765,32 @@ public:
      * set to the reason.
      */
     bool EncryptWallet(const SecureString& strWalletPassphrase, bool use_create_keypool_warmup = false, bilingual_str* new_seed_error = nullptr);
+    //! Whether an encryption is under way, whoever started it. It reads no
+    //! wallet state, so a caller that must not wait for the locks the
+    //! encryption holds can ask it at any time.
+    bool IsEncryptionInProgress() const { return m_encryption_in_progress.load() > 0; }
+
+    /**
+     * Announces an encryption for as long as it lives: IsEncryptionInProgress()
+     * reports it, and NotifyEncryptionInProgressChanged is raised when it is
+     * created and when it is destroyed. EncryptWallet holds one. A caller that
+     * takes the wallet locks before calling EncryptWallet, as the
+     * encryptwallet RPC does, holds another from before it takes them, so
+     * listeners stop reading the wallet before they could wait for those
+     * locks. Scopes nest.
+     */
+    class EncryptionInProgressScope
+    {
+    public:
+        explicit EncryptionInProgressScope(CWallet& wallet);
+        ~EncryptionInProgressScope();
+        EncryptionInProgressScope(const EncryptionInProgressScope&) = delete;
+        EncryptionInProgressScope& operator=(const EncryptionInProgressScope&) = delete;
+
+    private:
+        CWallet& m_wallet;
+    };
+
     /**
      * Rewrite the database file so that deleted plaintext key records no
      * longer remain in its free space, then write the POST_ENCRYPTION_REWRITE
@@ -1088,6 +1135,15 @@ public:
      * Note: Called without locks held.
      */
     boost::signals2::signal<void (CWallet* wallet)> NotifyStatusChanged;
+
+    /**
+     * An encryption started or ended, see EncryptionInProgressScope.
+     * Notifications from overlapping encryptions can be seen in any order, so
+     * a listener reads IsEncryptionInProgress() rather than counting them.
+     * Note: Can be called with cs_wallet held, as EncryptWallet does when its
+     * caller holds it, so a listener must not wait for wallet locks.
+     */
+    boost::signals2::signal<void ()> NotifyEncryptionInProgressChanged;
 
     /** Inquire whether this wallet broadcasts transactions. */
     bool GetBroadcastTransactions() const { return fBroadcastTransactions; }

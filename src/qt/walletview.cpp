@@ -113,7 +113,17 @@ WalletView::WalletView(WalletModel* wallet_model, const PlatformStyle* _platform
     connect(walletModel, &WalletModel::showProgress, this, &WalletView::showProgress);
 }
 
-WalletView::~WalletView() = default;
+WalletView::~WalletView()
+{
+    // The rescan progress dialog has no parent, so it would stay open and
+    // application-modal after this view, and the shutdown poll would wait
+    // for it. This can run inside the dialog's own setValue(), which
+    // processes events, so delete it later.
+    if (progressDialog) {
+        progressDialog->hide();
+        progressDialog->deleteLater();
+    }
+}
 
 void WalletView::prepareForShutdown()
 {
@@ -210,6 +220,9 @@ void WalletView::showOutOfSyncWarning(bool fShow)
 
 void WalletView::encryptWallet()
 {
+    // The wallet is being encrypted, for example by the encryptwallet RPC.
+    // Say so before the user chooses a passphrase.
+    if (walletModel->refuseWhileEncrypting()) return;
     const wallet::PQCKeyValidationInfo pqc_validation{walletModel->getPQCKeyValidationInfo()};
     if (pqc_validation.pending_records > 0) {
         Q_EMIT message(tr("Wallet encryption unavailable"),

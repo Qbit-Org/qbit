@@ -451,10 +451,10 @@ bool AddressTableModel::getAddressData(const QString &address,
         std::string* name,
         wallet::AddressPurpose* purpose) const {
     CTxDestination destination = DecodeDestination(address.toStdString());
-    // The wallet blocks while the encryption worker holds its locks, and the
-    // address book cannot change until it returns, so answer from the rows
-    // this model already holds. A repaint of the transaction list looks up
-    // its labels here without any user input.
+    // The wallet blocks while an encryption holds its locks, whoever started
+    // it, and the address book cannot change until it returns, so answer from
+    // the rows this model already holds. A repaint of the transaction list
+    // looks up its labels here without any user input.
     if (walletModel->isEncryptingWallet()) {
         const AddressTableEntry* entry = priv->find(QString::fromStdString(EncodeDestination(destination)));
         if (!entry) return false;

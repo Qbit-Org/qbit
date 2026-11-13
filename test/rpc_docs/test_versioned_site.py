@@ -176,11 +176,18 @@ class VersionDiscoveryTest(unittest.TestCase):
             ):
                 versioned_site.resolve_trusted_release_tag("Qbit-Org/qbit", "v1.0.0")
 
+    @staticmethod
+    def verify_tag_status(fingerprint: str, user_id: str = "signer <signer@example.invalid>") -> bytes:
+        return (
+            "[GNUPG:] NEWSIG\n"
+            f"[GNUPG:] GOODSIG {fingerprint[-16:]} {user_id}\n"
+            f"[GNUPG:] VALIDSIG {fingerprint} 2026-01-01 1767225600 0 4 0 22 10 00 {fingerprint}\n"
+        ).encode("utf8")
+
     def test_verify_tag_signature_requires_active_policy_fingerprint(self) -> None:
-        valid_signature = f"[GNUPG:] VALIDSIG {'A' * 40} 2026-01-01 0 4 0 1 10 00"
         run_results = [
             subprocess.CompletedProcess(["gpg"], 0, "", ""),
-            subprocess.CompletedProcess(["git"], 0, valid_signature, ""),
+            subprocess.CompletedProcess(["git"], 0, b"", self.verify_tag_status("A" * 40)),
         ]
 
         with (
@@ -190,15 +197,18 @@ class VersionDiscoveryTest(unittest.TestCase):
                 "active_release_signers",
                 return_value={"A" * 40: "public-keys/operator-01-release.asc"},
             ),
-            mock.patch.object(versioned_site.subprocess, "run", side_effect=run_results),
+            mock.patch.object(versioned_site.subprocess, "run", side_effect=run_results) as run,
         ):
             versioned_site.verify_tag_signed_by_active_release_key("v1.0.0")
+        # Read as bytes: text mode would also turn a carriage return into a line feed.
+        verify_tag = run.call_args_list[1]
+        self.assertEqual(verify_tag.args[0][-5:], ["-c", "core.warnAmbiguousRefs=false", "verify-tag", "--raw", "refs/tags/v1.0.0"])
+        self.assertFalse(verify_tag.kwargs.get("text") or verify_tag.kwargs.get("universal_newlines"))
 
     def test_verify_tag_signature_rejects_inactive_policy_fingerprint(self) -> None:
-        inactive_signature = f"[GNUPG:] VALIDSIG {'B' * 40} 2026-01-01 0 4 0 1 10 00"
         run_results = [
             subprocess.CompletedProcess(["gpg"], 0, "", ""),
-            subprocess.CompletedProcess(["git"], 0, inactive_signature, ""),
+            subprocess.CompletedProcess(["git"], 0, b"", self.verify_tag_status("B" * 40)),
         ]
 
         with (
@@ -212,6 +222,37 @@ class VersionDiscoveryTest(unittest.TestCase):
         ):
             with self.assertRaisesRegex(
                 versioned_site.VersionedSiteError, "active qbit release key"
+            ):
+                versioned_site.verify_tag_signed_by_active_release_key("v1.0.0")
+
+    def test_a_missing_parser_is_reported(self) -> None:
+        versioned_site.release_key_metadata.cache_clear()
+        self.addCleanup(versioned_site.release_key_metadata.cache_clear)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(versioned_site, "REPO_ROOT", Path(tmp)):
+            with self.assertRaisesRegex(
+                versioned_site.VersionedSiteError, "cannot load the release validators' gpg output parser"
+            ):
+                versioned_site.release_key_metadata()
+
+    def test_verify_tag_signature_refuses_status_lines_a_user_id_adds(self) -> None:
+        # B signs; its user ID, split at U+2028, reads as A's VALIDSIG.
+        forged = f"x\u2028[GNUPG:] VALIDSIG {'A' * 40} 2026-01-01 1767225600 0 4 0 22 10 00 {'A' * 40}\u2028x"
+        run_results = [
+            subprocess.CompletedProcess(["gpg"], 0, "", ""),
+            subprocess.CompletedProcess(["git"], 0, b"", self.verify_tag_status("B" * 40, forged)),
+        ]
+
+        with (
+            mock.patch.object(versioned_site.shutil, "which", return_value="/usr/bin/gpg"),
+            mock.patch.object(
+                versioned_site,
+                "active_release_signers",
+                return_value={"A" * 40: "public-keys/operator-01-release.asc"},
+            ),
+            mock.patch.object(versioned_site.subprocess, "run", side_effect=run_results),
+        ):
+            with self.assertRaisesRegex(
+                versioned_site.VersionedSiteError, r"release tag v1\.0\.0: .*line separator other than a line feed \(U\+2028\)"
             ):
                 versioned_site.verify_tag_signed_by_active_release_key("v1.0.0")
 

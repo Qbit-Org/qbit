@@ -707,6 +707,72 @@ void TopUpKeyPoolAfterUnlock(WalletContext& context, const std::shared_ptr<CWall
     MaybeScheduleP2MRKeyPoolRefillInternal(context, wallet, OutputType::P2MR, /*internal=*/true, /*fill_partial_pool=*/true);
 }
 
+P2MRKeyPoolRefillResult RefillP2MRKeyPoolsAfterUnlock(CWallet& wallet)
+{
+    AssertLockNotHeld(wallet.cs_wallet);
+    // Each step adds up to DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL keys to a
+    // pool. Twice the steps an empty pool needs leaves room for addresses
+    // handed out meanwhile, and still bounds how long the caller waits.
+    const int64_t max_steps{2 * (std::max<int64_t>(wallet.m_keypool_size, 0) / DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL + 1)};
+    const auto start{SteadyClock::now()};
+    int64_t steps_run{0};
+    const auto finish{[&](P2MRKeyPoolRefillResult result) {
+        if (result == P2MRKeyPoolRefillResult::COMPLETE && steps_run == 0) return result;
+        const char* outcome{result == P2MRKeyPoolRefillResult::COMPLETE   ? "completed" :
+                            result == P2MRKeyPoolRefillResult::INCOMPLETE ? "stopped before the keypools were full" :
+                                                                            "failed"};
+        wallet.WalletLogPrintf("P2MR keypool refill after unlock %s after %d steps in %dms\n",
+            outcome, steps_run, Ticks<std::chrono::milliseconds>(SteadyClock::now() - start));
+        return result;
+    }};
+
+    const auto shutdown_requested{[&] {
+        return wallet.HaveChain() && wallet.chain().shutdownRequested();
+    }};
+
+    bool incomplete{false};
+    try {
+        // The refill step does not run while a create-time top-up is pending,
+        // so finish that first.
+        for (int64_t steps{0}; wallet.HasPendingInitialKeyPoolTopUp(); ++steps) {
+            if (steps == max_steps || shutdown_requested()) return finish(P2MRKeyPoolRefillResult::INCOMPLETE);
+            ++steps_run;
+            if (wallet.RunPendingInitialKeyPoolTopUpStep() == CWallet::PendingInitialKeyPoolTopUpStepResult::FAILED) {
+                return finish(P2MRKeyPoolRefillResult::FAILED);
+            }
+        }
+        for (const bool internal : {false, true}) {
+            // Nothing to do for a full pool.
+            {
+                LOCK(wallet.cs_wallet);
+                auto* spk_man{dynamic_cast<DescriptorScriptPubKeyMan*>(wallet.GetScriptPubKeyMan(OutputType::P2MR, internal))};
+                if (!spk_man || spk_man->P2MRReceiveKeyPoolFull()) continue;
+            }
+            for (int64_t steps{0};; ++steps) {
+                if (shutdown_requested()) return finish(P2MRKeyPoolRefillResult::INCOMPLETE);
+                // Each pool has its own step limit, so a receive pool that
+                // addresses keep draining still leaves the change pool its steps.
+                if (steps == max_steps) {
+                    incomplete = true;
+                    break;
+                }
+                ++steps_run;
+                const auto step_result{wallet.RunP2MRKeyPoolRefillStep(internal)};
+                if (step_result == CWallet::P2MRKeyPoolRefillStepResult::COMPLETE) break;
+                if (step_result == CWallet::P2MRKeyPoolRefillStepResult::FAILED) {
+                    return finish(P2MRKeyPoolRefillResult::FAILED);
+                }
+            }
+        }
+    } catch (const std::exception& e) {
+        // The caller still has to arrange the relock, so report the error
+        // rather than let it escape.
+        wallet.WalletLogPrintf("P2MR keypool refill after unlock step threw: %s\n", e.what());
+        return finish(P2MRKeyPoolRefillResult::FAILED);
+    }
+    return finish(incomplete ? P2MRKeyPoolRefillResult::INCOMPLETE : P2MRKeyPoolRefillResult::COMPLETE);
+}
+
 std::shared_ptr<CWallet> LoadWallet(WalletContext& context, const std::string& name, std::optional<bool> load_on_start, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings)
 {
     auto result = WITH_LOCK(g_loading_wallet_mutex, return g_loading_wallet_set.insert(name));
@@ -1205,6 +1271,41 @@ void CWallet::AddToSpends(const CWalletTx& wtx)
         AddToSpends(txin.prevout, wtx.GetHash());
 }
 
+//! Tell listeners that an encryption has ended. This runs in a destructor and
+//! in an exception handler, which cannot pass a listener's exception on, so
+//! the exception is logged instead.
+static void NotifyEncryptionEnded(const CWallet& wallet, boost::signals2::signal<void()>& notify) noexcept
+{
+    try {
+        notify();
+    } catch (const std::exception& e) {
+        wallet.WalletLogPrintf("Encryption-in-progress listener failed: %s\n", e.what());
+    } catch (...) {
+        wallet.WalletLogPrintf("Encryption-in-progress listener failed\n");
+    }
+}
+
+CWallet::EncryptionInProgressScope::EncryptionInProgressScope(CWallet& wallet)
+    : m_wallet{wallet}
+{
+    ++m_wallet.m_encryption_in_progress;
+    try {
+        m_wallet.NotifyEncryptionInProgressChanged();
+    } catch (...) {
+        // The scope is not created, so end the announcement here: a listener
+        // may already have seen it.
+        --m_wallet.m_encryption_in_progress;
+        NotifyEncryptionEnded(m_wallet, m_wallet.NotifyEncryptionInProgressChanged);
+        throw;
+    }
+}
+
+CWallet::EncryptionInProgressScope::~EncryptionInProgressScope()
+{
+    --m_wallet.m_encryption_in_progress;
+    NotifyEncryptionEnded(m_wallet, m_wallet.NotifyEncryptionInProgressChanged);
+}
+
 //! EncryptWallet holds the descriptor locks in a list, which the thread-safety
 //! analysis cannot follow. Check that this one is held (with DEBUG_LOCKORDER)
 //! and tell the analysis, so that it still checks the calls that need it.
@@ -1217,6 +1318,12 @@ bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase, bool use_cr
 {
     // Only descriptor wallets can be encrypted
     Assert(IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS));
+
+    // Announce the encryption from here until this call returns or throws,
+    // whoever made it, so that listeners such as the GUI stop reading the
+    // wallet before its locks are taken and read it again once the
+    // encryption has finished.
+    const EncryptionInProgressScope encryption_in_progress{*this};
 
     // The key derivation below is tuned to take a noticeable amount of time,
     // so it runs before the wallet locks are taken. A caller that does not

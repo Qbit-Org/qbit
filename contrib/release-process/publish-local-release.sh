@@ -342,8 +342,8 @@ export_trusted_paths() {
 
 # The release tag is signed by an active release key: the validator's own
 # verify_tag_signature, given the pinned tag object (TAG_OBJECT) rather than
-# the bare tag name that validate_release_artifacts.py --verify-tag-signature
-# would pass to git verify-tag.
+# the tag name (refs/tags/<tag>) that validate_release_artifacts.py
+# --verify-tag-signature would pass to git verify-tag.
 verify_release_tag_signature() {
     (cd "$TRUSTED_ROOT" && "${PYTHON_SNIPPET[@]}" - "$VALIDATORS" "$TRUSTED_KEYS_DIR" "$RELEASE_LINE" "$TAG" "$TAG_OBJECT" <<'PY'
 import shutil

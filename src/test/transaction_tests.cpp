@@ -74,6 +74,7 @@ static std::map<std::string, unsigned int> mapFlagNames = {
     {std::string("DISCOURAGE_UPGRADABLE_TAPROOT_VERSION"), (unsigned int)SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION},
     {std::string("P2MR_RULES"), (unsigned int)SCRIPT_VERIFY_P2MR_RULES},
     {std::string("P2MR_STACK_BYTES"), (unsigned int)SCRIPT_VERIFY_P2MR_STACK_BYTES},
+    {std::string("P2MR_HASH_WEIGHT"), (unsigned int)SCRIPT_VERIFY_P2MR_HASH_WEIGHT},
 };
 
 unsigned int ParseScriptFlags(std::string strFlags)

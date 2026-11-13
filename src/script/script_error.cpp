@@ -127,6 +127,8 @@ std::string ScriptErrorString(const ScriptError serror)
             return "OP_CHECKSIG(VERIFY) is not available in P2MR";
         case SCRIPT_ERR_P2MR_STACK_BYTES:
             return "Standard P2MR stack byte limit exceeded";
+        case SCRIPT_ERR_P2MR_HASH_WEIGHT:
+            return "Standard P2MR hashing limit exceeded";
         case SCRIPT_ERR_TEMPLATE_MISMATCH:
             return "Transaction template hash does not match";
         case SCRIPT_ERR_OP_CODESEPARATOR:

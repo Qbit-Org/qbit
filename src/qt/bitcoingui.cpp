@@ -18,6 +18,7 @@
 #include <qt/optionsdialog.h>
 #include <qt/optionsmodel.h>
 #include <qt/platformstyle.h>
+#include <qt/pokerlobby.h>
 #include <qt/rpcconsole.h>
 #include <qt/utilitydialog.h>
 
@@ -398,6 +399,11 @@ void BitcoinGUI::createActions()
     m_migrate_wallet_action->setStatusTip(tr("Migrate a wallet"));
     m_migrate_wallet_menu = new QMenu(this);
 
+    // Alt+L: the Window menu already uses P for Peers.
+    m_poker_lobby_action = new QAction(tr("Poker &Lobby"), this);
+    m_poker_lobby_action->setMenuRole(QAction::NoRole);
+    m_poker_lobby_action->setStatusTip(tr("Play Satoshi's poker game with play money against computer players"));
+
     showHelpMessageAction = new QAction(tr("&Command-line options"), this);
     showHelpMessageAction->setMenuRole(QAction::NoRole);
     showHelpMessageAction->setStatusTip(tr("Show the %1 help message to get a list with possible qbit command-line options").arg(CLIENT_NAME));
@@ -412,6 +418,7 @@ void BitcoinGUI::createActions()
     connect(aboutQtAction, &QAction::triggered, qApp, QApplication::aboutQt);
     connect(optionsAction, &QAction::triggered, this, &BitcoinGUI::optionsClicked);
     connect(showHelpMessageAction, &QAction::triggered, this, &BitcoinGUI::showHelpMessageClicked);
+    connect(m_poker_lobby_action, &QAction::triggered, this, &BitcoinGUI::showPokerLobby);
     connect(openRPCConsoleAction, &QAction::triggered, this, &BitcoinGUI::showDebugWindow);
     // prevents an open debug window from becoming stuck/unusable on client shutdown
     connect(quitAction, &QAction::triggered, rpcConsole, &QWidget::hide);
@@ -609,6 +616,9 @@ void BitcoinGUI::createMenuBar()
     }
 
     window_menu->addSeparator();
+    window_menu->addAction(m_poker_lobby_action);
+
+    window_menu->addSeparator();
     for (RPCConsole::TabTypes tab_type : rpcConsole->tabs()) {
         QAction* tab_action = window_menu->addAction(rpcConsole->tabTitle(tab_type));
         tab_action->setShortcut(rpcConsole->tabShortcut(tab_type));
@@ -728,6 +738,10 @@ void BitcoinGUI::setClientModel(ClientModel *_clientModel, interfaces::BlockAndH
         }
 #endif // ENABLE_WALLET
         unitDisplayControl->setOptionsModel(nullptr);
+        if (m_poker_lobby) {
+            m_poker_lobby->closeTables();
+            m_poker_lobby->close();
+        }
         // Disable top bar menu actions
         appMenuBar->clear();
     }
@@ -998,6 +1012,12 @@ void BitcoinGUI::showDebugWindowActivateConsole()
 {
     rpcConsole->setTabFocus(RPCConsole::TabTypes::CONSOLE);
     showDebugWindow();
+}
+
+void BitcoinGUI::showPokerLobby()
+{
+    if (!m_poker_lobby) m_poker_lobby = new PokerLobby(this);
+    GUIUtil::bringToFront(m_poker_lobby);
 }
 
 void BitcoinGUI::showHelpMessageClicked()
@@ -1502,11 +1522,11 @@ bool BitcoinGUI::handlePaymentRequest(const SendCoinsRecipient& recipient)
 {
     if (!walletFrame) return false;
     // Filling in the Send page reads the address book, which the encryption
-    // worker keeps locked. Deliver the request once the wallet has finished
+    // keeps locked. Deliver the request once the wallet has finished
     // encrypting; a dropped model drops the request with it.
     WalletModel* const wallet_model{walletFrame->currentWalletModel()};
     if (wallet_model && wallet_model->isEncryptingWallet()) {
-        connect(wallet_model, &WalletModel::encryptWalletFinished, this, [this, recipient] { handlePaymentRequest(recipient); }, Qt::SingleShotConnection);
+        connect(wallet_model, &WalletModel::walletEncryptionEnded, this, [this, recipient] { handlePaymentRequest(recipient); }, Qt::SingleShotConnection);
         return true;
     }
     // URI has to be valid
@@ -1635,8 +1655,8 @@ void BitcoinGUI::updateWalletStatus()
     // Any wallet's status change lands here while another one may be
     // encrypting. The model answers the queries above from cached values
     // meanwhile, but the HD status query reads the descriptor managers the
-    // encryption worker is replacing; it cannot change during the encryption
-    // and the model refreshes the status once the worker has returned.
+    // encryption is replacing; it cannot change during the encryption and
+    // the model refreshes the status once the encryption has finished.
     if (!walletModel->isEncryptingWallet()) {
         setHDStatus(walletModel->wallet().privateKeysDisabled(), walletModel->wallet().hdEnabled());
     }

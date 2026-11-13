@@ -154,10 +154,23 @@ void AskPassphraseDialog::accept()
                         return;
                     }
                 } else {
-                    // Wallet unload is deferred while a modal dialog is open,
-                    // so the model outlives the confirmation above.
+                    // Wallet unload is deferred while the confirmation above
+                    // runs its nested event loop or, as a native message box,
+                    // the platform's modal loop, so the model outlives it.
                     assert(model);
+                    // Another caller, such as the encryptwallet RPC, may be
+                    // encrypting the wallet. The model then refuses and says
+                    // so in a message box, whose event loop can see that
+                    // encryption end, so decide before asking.
+                    const bool other_encryption{model->isEncryptingWallet()};
+                    QPointer<AskPassphraseDialog> dialog{this};
                     if (!model->encryptWallet(newpass1)) {
+                        if (!dialog) return;
+                        // Nothing was attempted, so there is no result.
+                        if (other_encryption || model->isEncryptingWallet()) {
+                            QDialog::reject();
+                            return;
+                        }
                         showEncryptionResult(/*success=*/false);
                         return;
                     }

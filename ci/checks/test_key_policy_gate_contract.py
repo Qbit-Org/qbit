@@ -550,6 +550,16 @@ class KeyPolicyGateContractTest(unittest.TestCase):
         self.replace_certificate("operator-01", self.merged_refresh)
         self.assert_accepted("Base policy: certificates updated: operator-01")
 
+    def test_a_certificate_whose_user_id_holds_a_line_separator_is_refused(self) -> None:
+        # gpg lists the user ID as it is, so a reader splitting there would read records gpg never wrote.
+        primary = self.signers["operator-01"]["primary"]
+        home = self.root / "separator-gnupg"
+        shutil.copytree(self.home, home, ignore=shutil.ignore_patterns("S.*"))
+        self.addCleanup(subprocess.run, ["gpgconf", "--homedir", str(home), "--kill", "all"], check=False, capture_output=True)
+        self.gpg("--quick-add-uid", primary, "operator-01\u2028rev <operator-01@example.invalid>", home=home)
+        self.replace_certificate("operator-01", self.export(primary, home=home))
+        self.assert_refused("line separator other than a line feed (U+2028)")
+
     def test_certificate_change_that_drops_a_signature_record_is_refused(self) -> None:
         self.replace_certificate("operator-01", self.merged_refresh)
         self.base = self.git("rev-parse", "HEAD")
