@@ -51,11 +51,23 @@ jobs:
   classify-changes:
     name: classify validation profile
     runs-on: ubuntu-24.04
+    # The pass marker decision reads the run a marker names, its jobs and
+    # artifacts and the cache listing (actions: read), and this pull request's
+    # listing and timeline (pull-requests: read). Job permissions replace the
+    # workflow's, so contents: read is repeated.
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: read
     outputs:
       profile: ${{ steps.classify.outputs.profile }}
       release_policy_only: ${{ steps.classify.outputs.release_policy_only }}
       source_validation_required: ${{ steps.classify.outputs.source_validation_required }}
       mainnet_publish_gate_required: ${{ steps.release-target.outputs.mainnet_publish_gate_required }}
+      # 'true' only when the decision step ran, succeeded and said so; any
+      # other outcome runs everything.
+      tree_pass_skip: ${{ steps.marker-decision.outcome == 'success' && steps.marker-decision.outputs.skip == 'true' && 'true' || 'false' }}
+      tree_pass_key_prefix: ${{ steps.marker-key.outputs.key_prefix }}
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -136,10 +148,89 @@ jobs:
             echo "mainnet_publish_gate_required=false" >> "$GITHUB_OUTPUT"
           fi
 
+      # Same-tree skip (doc/development/ci-same-tree-skip.md): a pull request
+      # whose commit under test has a tree that already passed this workflow,
+      # routed the same way, skips the jobs below. Pull requests only; every
+      # failure in these steps runs everything.
+      - name: Compute pass marker key
+        id: marker-key
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        env:
+          # Bump to invalidate every pass marker of this workflow.
+          TREE_PASS_MARKER_SALT: '1'
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CHANGED_FILES: ${{ steps.changed-files.outputs.changed_files }}
+        run: |
+          python3 ci/checks/tree_pass_marker.py key \
+            --workflow-ref "${GITHUB_WORKFLOW_REF}" \
+            --repository "${GITHUB_REPOSITORY}" \
+            --salt "${TREE_PASS_MARKER_SALT}" \
+            --event "${EVENT_NAME}" \
+            --sha "${GITHUB_SHA}" \
+            --head-sha "${HEAD_SHA}" \
+            --base-ref "${BASE_REF}" \
+            --changed-files "${CHANGED_FILES}" \
+            --github-output "${GITHUB_OUTPUT}"
+
+      - name: Look up pass marker
+        id: marker-lookup
+        if: github.event_name == 'pull_request' && steps.marker-key.outputs.key_prefix != ''
+        continue-on-error: true
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .tree-pass-marker
+          key: ${{ steps.marker-key.outputs.key_prefix }}
+          restore-keys: ${{ steps.marker-key.outputs.key_prefix }}
+          lookup-only: true
+
+      - name: Decide whether this tree already passed
+        id: marker-decision
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          VALIDATION_PROFILE: ${{ steps.classify.outputs.profile }}
+          KEY_OUTCOME: ${{ steps.marker-key.outcome }}
+          KEY_PREFIX: ${{ steps.marker-key.outputs.key_prefix }}
+          HEAD_TREE: ${{ steps.marker-key.outputs.head_tree }}
+          WORKFLOW_PATH: ${{ steps.marker-key.outputs.workflow_path }}
+          LOOKUP_OUTCOME: ${{ steps.marker-lookup.outcome }}
+          MATCHED_KEY: ${{ steps.marker-lookup.outputs.cache-matched-key }}
+          HEAD_REPOSITORY_ID: ${{ github.event.pull_request.head.repo.id }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_OWNER: ${{ github.event.pull_request.head.repo.owner.login }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 ci/checks/tree_pass_marker.py decide \
+            --event "${EVENT_NAME}" \
+            --labels-json "${PR_LABELS}" \
+            --profile "${VALIDATION_PROFILE}" \
+            --key-outcome "${KEY_OUTCOME}" \
+            --key-prefix "${KEY_PREFIX}" \
+            --head-tree "${HEAD_TREE}" \
+            --workflow-path "${WORKFLOW_PATH}" \
+            --lookup-outcome "${LOOKUP_OUTCOME}" \
+            --matched-key "${MATCHED_KEY}" \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --repository "${GITHUB_REPOSITORY}" \
+            --head-repository-id "${HEAD_REPOSITORY_ID}" \
+            --head-ref "${HEAD_REF}" \
+            --head-owner "${HEAD_OWNER}" \
+            --pr-number "${PR_NUMBER}" \
+            --gate-job 'Core Checks Gate' \
+            --save-job 'save pass marker' \
+            --github-output "${GITHUB_OUTPUT}"
+
   build-smoke:
     name: build smoke
     needs: classify-changes
-    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' }}
+    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' && needs.classify-changes.outputs.tree_pass_skip != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
 
@@ -212,7 +303,7 @@ jobs:
   focused-unit-suites:
     name: focused unit suites
     needs: classify-changes
-    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' }}
+    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' && needs.classify-changes.outputs.tree_pass_skip != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 75
 
@@ -271,7 +362,7 @@ jobs:
   p2mr-v1-conformance:
     name: P2MR v1 conformance
     needs: classify-changes
-    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' }}
+    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' && needs.classify-changes.outputs.tree_pass_skip != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
 
@@ -353,7 +444,7 @@ jobs:
   functional-smoke:
     name: functional smoke
     needs: classify-changes
-    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' }}
+    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' && needs.classify-changes.outputs.tree_pass_skip != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
 
@@ -409,10 +500,46 @@ jobs:
             rpc_whitelist.py \
             feature_orphan_metrics.py
 
+  # The same-tree skip's own contract: the decision rules of
+  # ci/checks/tree_pass_marker.py and the wiring of this workflow and Full
+  # Validation (doc/development/ci-same-tree-skip.md). The pass marker never
+  # skips it, so a regression that skips without a valid marker cannot also
+  # skip the job that would catch it, and Core Checks Gate requires it to
+  # succeed in every run. It runs here, for changes routed to source, rather
+  # than in Required Merge Gate's classification, which every pull request
+  # waits for.
+  same-tree-skip-contract:
+    name: same-tree skip contract
+    needs: classify-changes
+    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      # Use the system Python that owns the distribution's PyYAML package.
+      # This job runs in every skip run too, so a package mirror hiccup must
+      # not turn a skip red: nothing is installed when the module is already
+      # there, and the install is retried.
+      - name: Install workflow contract dependencies
+        run: |
+          if /usr/bin/python3 -c 'import yaml' 2>/dev/null; then
+            echo "PyYAML is already installed."
+            exit 0
+          fi
+          ci/retry/retry --tries=3 --min=5 --max=30 -- sudo apt-get update
+          ci/retry/retry --tries=3 --min=5 --max=30 -- sudo apt-get install -y --no-install-recommends python3-yaml
+
+      - name: Test same-tree skip contract
+        run: /usr/bin/python3 ci/checks/test_tree_pass_marker.py -v
+
   release-validator-tests:
     name: release validator tests
     needs: classify-changes
-    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' }}
+    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' && needs.classify-changes.outputs.tree_pass_skip != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
 
@@ -522,7 +649,7 @@ jobs:
   mainnet-publish-gate:
     name: mainnet publication posture
     needs: classify-changes
-    if: ${{ needs.classify-changes.outputs.mainnet_publish_gate_required == 'true' }}
+    if: ${{ needs.classify-changes.outputs.mainnet_publish_gate_required == 'true' && needs.classify-changes.outputs.tree_pass_skip != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
 
@@ -565,6 +692,7 @@ jobs:
       - focused-unit-suites
       - p2mr-v1-conformance
       - functional-smoke
+      - same-tree-skip-contract
       - release-validator-tests
       - mainnet-publish-gate
     # Aggregate core check input for Required Merge Gate. The mainnet
@@ -582,11 +710,26 @@ jobs:
           FOCUSED_UNIT_SUITES_RESULT: ${{ needs.focused-unit-suites.result }}
           P2MR_V1_CONFORMANCE_RESULT: ${{ needs.p2mr-v1-conformance.result }}
           FUNCTIONAL_SMOKE_RESULT: ${{ needs.functional-smoke.result }}
+          SAME_TREE_SKIP_CONTRACT_RESULT: ${{ needs.same-tree-skip-contract.result }}
           RELEASE_VALIDATOR_TESTS_RESULT: ${{ needs.release-validator-tests.result }}
           MAINNET_PUBLISH_GATE_REQUIRED: ${{ needs.classify-changes.outputs.mainnet_publish_gate_required }}
           MAINNET_PUBLISH_GATE_RESULT: ${{ needs.mainnet-publish-gate.result }}
+          EVENT_NAME: ${{ github.event_name }}
+          TREE_PASS_SKIP: ${{ needs.classify-changes.outputs.tree_pass_skip }}
         run: |
           set -euo pipefail
+
+          # A pull request whose tree already passed this workflow skips the
+          # jobs above (doc/development/ci-same-tree-skip.md). Only then is a
+          # skipped job accepted; a failed or cancelled job never is.
+          marker_skip=false
+          if [[ "${TREE_PASS_SKIP}" == "true" ]]; then
+            if [[ "${EVENT_NAME}" != "pull_request" ]]; then
+              echo "::error title=Core Checks failed::A ${EVENT_NAME} run reported a pass marker skip; only pull requests skip."
+              exit 1
+            fi
+            marker_skip=true
+          fi
 
           failed=0
           check_result() {
@@ -600,10 +743,19 @@ jobs:
             fi
           }
 
+          # A job the pass marker may skip.
+          check_job() {
+            if [[ "${marker_skip}" == "true" && "$2" == "skipped" ]]; then
+              echo "$1: skipped, this tree already passed Core Checks"
+              return 0
+            fi
+            check_result "$1" "$2"
+          }
+
           check_result "classify validation profile" "${CLASSIFY_CHANGES_RESULT}"
 
           if [[ "${MAINNET_PUBLISH_GATE_REQUIRED}" == "true" ]]; then
-            check_result "mainnet publication posture" "${MAINNET_PUBLISH_GATE_RESULT}"
+            check_job "mainnet publication posture" "${MAINNET_PUBLISH_GATE_RESULT}"
           else
             echo "Mainnet publication posture is not required for this target/profile."
           fi
@@ -613,10 +765,81 @@ jobs:
             exit "${failed}"
           fi
 
-          check_result "build smoke" "${BUILD_SMOKE_RESULT}"
-          check_result "focused unit suites" "${FOCUSED_UNIT_SUITES_RESULT}"
-          check_result "P2MR v1 conformance" "${P2MR_V1_CONFORMANCE_RESULT}"
-          check_result "functional smoke" "${FUNCTIONAL_SMOKE_RESULT}"
-          check_result "release validator tests" "${RELEASE_VALIDATOR_TESTS_RESULT}"
+          check_job "build smoke" "${BUILD_SMOKE_RESULT}"
+          check_job "focused unit suites" "${FOCUSED_UNIT_SUITES_RESULT}"
+          check_job "P2MR v1 conformance" "${P2MR_V1_CONFORMANCE_RESULT}"
+          check_job "functional smoke" "${FUNCTIONAL_SMOKE_RESULT}"
+          check_result "same-tree skip contract" "${SAME_TREE_SKIP_CONTRACT_RESULT}"
+          check_job "release validator tests" "${RELEASE_VALIDATOR_TESTS_RESULT}"
 
+          if [[ "${marker_skip}" == "true" && "${failed}" == "0" ]]; then
+            echo "::notice title=Core Checks::This tree already passed Core Checks in an earlier run of this pull request."
+          fi
           exit "${failed}"
+
+  # Saves this run's pass marker, only after a pull request run that did all
+  # of the work above and passed (doc/development/ci-same-tree-skip.md).
+  save-pass-marker:
+    name: save pass marker
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    needs:
+      - classify-changes
+      - build-smoke
+      - focused-unit-suites
+      - p2mr-v1-conformance
+      - functional-smoke
+      - same-tree-skip-contract
+      - release-validator-tests
+      - mainnet-publish-gate
+      - core-checks-gate
+    if: ${{ always() && github.event_name == 'pull_request' && needs.classify-changes.outputs.profile == 'source' && needs.classify-changes.outputs.tree_pass_skip == 'false' && needs.core-checks-gate.result == 'success' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          sparse-checkout: ci/checks
+          persist-credentials: false
+
+      - name: Check every job passed
+        id: plan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 ci/checks/tree_pass_marker.py save-plan \
+            --event "${EVENT_NAME}" \
+            --needs-json "${NEEDS_JSON}" \
+            --classify-job classify-changes \
+            --run-id "${GITHUB_RUN_ID}" \
+            --run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --sha "${GITHUB_SHA}" \
+            --pr-number "${PR_NUMBER}" \
+            --optional-job mainnet-publish-gate=mainnet_publish_gate_required \
+            --marker-dir .tree-pass-marker \
+            --github-output "${GITHUB_OUTPUT}"
+
+      # The proof that this run's own checks approved the marker. Only a job
+      # of this run can upload an artifact to it, and a run that vouches for a
+      # tree ran that very tree's code. Uploaded before the marker, so a
+      # marker never exists without it.
+      - name: Upload pass marker proof
+        id: proof
+        if: steps.plan.outputs.save == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.plan.outputs.artifact }}
+          path: .tree-pass-marker/marker.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Save pass marker
+        if: steps.plan.outputs.save == 'true' && steps.proof.outcome == 'success'
+        continue-on-error: true
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .tree-pass-marker
+          key: ${{ steps.plan.outputs.key }}
