@@ -386,10 +386,17 @@ jobs:
         env:
           JOBS_INPUT: ${{ inputs.jobs }}
           # The nightly-matrix entries; "job" is the name the jobs input uses.
+          # The 32 bit ARM shards run in an emulated arm64 container on x64
+          # runners and nightly runs restore no ccache or depends cache, so
+          # each shard spends 147-166 minutes building (image, depends,
+          # configure, compile) before its first test. Shard 1 tests take
+          # ~14 minutes and shard 2 ~30 (bounded by the slowest wallet P2MR
+          # suite, ~24 minutes, behind the 40 minute per-test ctest timeout).
+          # 300 minutes keeps the slowest observed shard near 70% of its limit.
           JOB_CATALOG: |
             [
-              {"job": "arm32-unit-1", "name": "32 bit ARM, unit tests shard 1/2, no functional tests", "timeout-minutes": 180, "file-env": "./ci/test/00_setup_env_arm.sh", "ctest_include_range": "1,139", "container-cpus": "8", "container-memory": "48g"},
-              {"job": "arm32-unit-2", "name": "32 bit ARM, unit tests shard 2/2, no functional tests", "timeout-minutes": 180, "file-env": "./ci/test/00_setup_env_arm.sh", "ctest_include_range": "140,99999", "container-cpus": "8", "container-memory": "48g"},
+              {"job": "arm32-unit-1", "name": "32 bit ARM, unit tests shard 1/2, no functional tests", "timeout-minutes": 300, "file-env": "./ci/test/00_setup_env_arm.sh", "ctest_include_range": "1,139", "container-cpus": "8", "container-memory": "48g"},
+              {"job": "arm32-unit-2", "name": "32 bit ARM, unit tests shard 2/2, no functional tests", "timeout-minutes": 300, "file-env": "./ci/test/00_setup_env_arm.sh", "ctest_include_range": "140,99999", "container-cpus": "8", "container-memory": "48g"},
               {"job": "previous-releases", "name": "previous releases, depends DEBUG", "timeout-minutes": 180, "file-env": "./ci/test/00_setup_env_native_previous_releases.sh", "container-cpus": "8", "container-memory": "48g"},
               {"job": "fuzz", "name": "fuzzer,address,undefined,integer, no depends", "timeout-minutes": 240, "file-env": "./ci/test/00_setup_env_native_fuzz.sh", "makejobs": "-j12", "container-cpus": "12", "container-memory": "64g", "fuzz-mutate-min-time": "120"}
             ]

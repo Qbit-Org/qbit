@@ -49,6 +49,8 @@ struct PQCKeyValidationInfo {
     double progress{1.0};
     bool signing_blocked{false};
     bool encryption_recommended{false};
+    //! The wallet is encrypted but still stores plaintext PQC key records.
+    bool reencryption_required{false};
 };
 } // namespace wallet
 

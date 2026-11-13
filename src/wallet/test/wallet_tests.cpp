@@ -670,9 +670,10 @@ BOOST_AUTO_TEST_CASE(DescriptorTopUpResultRestoresMemoryAfterCommitFailure)
     database.ResetCounts();
     database.m_txn_commit_pass = false;
 
-    BOOST_CHECK_THROW(
-        spk_man->TopUpWithInternalHintResult(/*internal_hint=*/false, target_size),
-        std::runtime_error);
+    // Everything is rolled back, so the failure is reported as a result.
+    auto failed_res{spk_man->TopUpWithInternalHintResult(/*internal_hint=*/false, target_size)};
+    BOOST_CHECK(!failed_res);
+    BOOST_CHECK(util::ErrorString(failed_res).original.find("Cannot commit changes") != std::string::npos);
     BOOST_CHECK_EQUAL(database.m_txn_begin_count, 1);
     BOOST_CHECK_EQUAL(database.m_txn_commit_count, 1);
     BOOST_CHECK_EQUAL(database.m_txn_abort_count, 1);
@@ -685,6 +686,38 @@ BOOST_AUTO_TEST_CASE(DescriptorTopUpResultRestoresMemoryAfterCommitFailure)
     BOOST_REQUIRE_MESSAGE(retry_res.has_value(), util::ErrorString(retry_res).original);
     BOOST_CHECK_EQUAL(spk_man->GetKeyPoolSize(), target_size);
     BOOST_CHECK_EQUAL(notifications, 1);
+}
+
+BOOST_AUTO_TEST_CASE(DescriptorTopUpResultThrowsWhenCommitAndAbortFail)
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    LOCK(wallet.cs_wallet);
+    wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+    wallet.SetupDescriptorScriptPubKeyMans(BECH32_ONLY_OUTPUT_TYPES);
+
+    auto* spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(wallet.GetScriptPubKeyMan(OutputType::BECH32, /*internal=*/false));
+    BOOST_REQUIRE(spk_man);
+
+    auto& database = GetMockableDatabase(wallet);
+    const unsigned int previous_size{spk_man->GetKeyPoolSize()};
+    int notifications{0};
+    boost::signals2::scoped_connection connection{spk_man->NotifyCanGetAddressesChanged.connect([&] { ++notifications; })};
+    database.ResetCounts();
+    database.m_txn_commit_pass = false;
+    database.m_txn_abort_pass = false;
+
+    // The database transaction may still be open, so this stays fatal.
+    BOOST_CHECK_EXCEPTION(
+        spk_man->TopUpWithInternalHintResult(/*internal_hint=*/false, previous_size + 1),
+        std::runtime_error,
+        HasReason{"Cannot abort changes after commit failure"});
+    BOOST_CHECK_EQUAL(database.m_txn_commit_count, 1);
+    // ~WalletBatch() retries the abort.
+    BOOST_CHECK_GE(database.m_txn_abort_count, 1);
+    BOOST_CHECK_EQUAL(spk_man->GetKeyPoolSize(), previous_size);
+    BOOST_CHECK_EQUAL(notifications, 0);
+    database.m_txn_commit_pass = true;
+    database.m_txn_abort_pass = true;
 }
 
 BOOST_AUTO_TEST_CASE(DescriptorTopUpWithDBPublishesOnExternalTransactionCommit)
@@ -1658,6 +1691,32 @@ BOOST_FIXTURE_TEST_CASE(RemoveTxs, UnrestrictedRegtestChain100Setup)
     }
 
     TestUnloadWallet(std::move(wallet));
+}
+
+BOOST_FIXTURE_TEST_CASE(GetSpendingTxsMatchesIsSpent, TestingSetup)
+{
+    CWallet wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
+    LOCK(wallet.cs_wallet);
+    const COutPoint coin{Txid::FromUint256(m_rng.rand256()), 0};
+    const auto add_spend = [&](uint32_t lock_time, const TxState& state) {
+        CMutableTransaction tx;
+        tx.vin.emplace_back(coin);
+        tx.vout.emplace_back(COIN, CScript{} << OP_TRUE);
+        tx.nLockTime = lock_time;
+        return wallet.AddToWallet(MakeTransactionRef(tx), state);
+    };
+
+    // Abandoned and conflicted transactions do not spend the coin.
+    add_spend(1, TxStateInactive{/*abandoned=*/true});
+    add_spend(2, TxStateBlockConflicted{uint256::ONE, /*height=*/1});
+    add_spend(3, TxStateInactive{})->mempool_conflicts.insert(Txid::FromUint256(m_rng.rand256()));
+    BOOST_CHECK(wallet.GetSpendingTxs(coin).empty());
+    BOOST_CHECK(!wallet.IsSpent(coin));
+
+    const Txid inactive{add_spend(4, TxStateInactive{})->GetHash()};
+    const Txid in_mempool{add_spend(5, TxStateInMempool{})->GetHash()};
+    BOOST_CHECK(wallet.GetSpendingTxs(coin) == (std::set<Txid>{inactive, in_mempool}));
+    BOOST_CHECK(wallet.IsSpent(coin));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

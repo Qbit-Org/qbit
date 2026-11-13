@@ -151,6 +151,14 @@ enum : uint32_t {
     // removed at the height-activated validation-weight-v2 consensus change.
     SCRIPT_VERIFY_P2MR_LEGACY_VALIDATION_WEIGHT = (1U << 22),
 
+    // Bound the total bytes held on the stack and altstack while a P2MR v1
+    // script executes to MAX_STANDARD_P2MR_V1_STACK_BYTES (policy only).
+    SCRIPT_VERIFY_P2MR_STACK_BYTES = (1U << 23),
+
+    // Charge hashing of P2MR v1 stack elements larger than
+    // MAX_SCRIPT_ELEMENT_SIZE against a per-input budget (policy only).
+    SCRIPT_VERIFY_P2MR_HASH_WEIGHT = (1U << 24),
+
     // Constants to point to the highest flag in use. Add new flags above this line.
     //
     SCRIPT_VERIFY_END_MARKER
@@ -232,6 +240,12 @@ struct ScriptExecutionData
     bool m_validation_weight_left_init = false;
     //! How much validation weight is left (decremented for every successful non-empty signature check).
     int64_t m_validation_weight_left;
+    //! Whether m_p2mr_hash_weight_left is initialized.
+    bool m_p2mr_hash_weight_left_init = false;
+    //! How much of the separate P2MR budget for hashing large stack elements is
+    //! left (decremented under SCRIPT_VERIFY_P2MR_HASH_WEIGHT). It starts at
+    //! the input's initial validation weight.
+    int64_t m_p2mr_hash_weight_left;
 
     //! The hash of the corresponding output
     std::optional<uint256> m_output_hash;
@@ -306,6 +320,12 @@ public:
     {
         return false;
     }
+
+    /** Verify an OP_CHECKDATASIGPQC/OP_CHECKDATASIGADDPQC signature over its
+     *  QbitDataSigPQC digest. The interpreter performs every weight, size and
+     *  digest step first; this only decides whether the signature is valid.
+     *  The default runs the primitive verification. */
+    virtual bool VerifyPQCDataSignature(std::span<const unsigned char> sig, const CPQCPubKey& pubkey, const uint256& datasig_hash) const;
 
     virtual bool CheckTemplateVerifyHash(std::span<const unsigned char> expected, ScriptError* serror = nullptr) const
     {
@@ -390,6 +410,11 @@ public:
     bool CheckPQCSignature(std::span<const unsigned char> sig, std::span<const unsigned char> pubkey, SigVersion sigversion, ScriptExecutionData& execdata, ScriptError* serror = nullptr) const override
     {
         return m_checker.CheckPQCSignature(sig, pubkey, sigversion, execdata, serror);
+    }
+
+    bool VerifyPQCDataSignature(std::span<const unsigned char> sig, const CPQCPubKey& pubkey, const uint256& datasig_hash) const override
+    {
+        return m_checker.VerifyPQCDataSignature(sig, pubkey, datasig_hash);
     }
 
     bool CheckTemplateVerifyHash(std::span<const unsigned char> expected, ScriptError* serror = nullptr) const override

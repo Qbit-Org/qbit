@@ -36,6 +36,7 @@ CFeeRate GetMinimumFeeRate(const CWallet& wallet, const CCoinControl& coin_contr
        The first parameter that is set is used.
     */
     CFeeRate feerate_needed;
+    if (feeCalc) feeCalc->estimate_unavailable = false;
     if (coin_control.m_feerate) { // 1.
         feerate_needed = *(coin_control.m_feerate);
         if (feeCalc) feeCalc->reason = FeeReason::PAYTXFEE;
@@ -59,7 +60,11 @@ CFeeRate GetMinimumFeeRate(const CWallet& wallet, const CCoinControl& coin_contr
         if (feerate_needed == CFeeRate(0)) {
             // if we don't have enough data for estimateSmartFee, then use fallback fee
             feerate_needed = wallet.m_fallback_fee;
-            if (feeCalc) feeCalc->reason = FeeReason::FALLBACK;
+            if (feeCalc) {
+                feeCalc->reason = FeeReason::FALLBACK;
+                // The minimums below may replace the reason, but not the fact that there was no estimate
+                feeCalc->estimate_unavailable = true;
+            }
 
             // directly return if fallback fee is disabled (feerate 0 == disabled)
             if (wallet.m_fallback_fee == CFeeRate(0)) return feerate_needed;
@@ -85,6 +90,13 @@ CFeeRate GetDiscardRate(const CWallet& wallet)
 {
     unsigned int highest_target = wallet.chain().estimateMaxBlocks();
     CFeeRate discard_rate = wallet.chain().estimateSmartFee(highest_target, /*conservative=*/false);
+    // Without an estimate for the longest target, and unless -discardfee was set, let the fallback
+    // fee, raised to the required fee rate that spending the change must pay too, stand in for it.
+    // Otherwise change worth up to the cost of spending it at the -discardfee default, many times
+    // the default fallback fee, would be added to the fee.
+    if (discard_rate == CFeeRate(0) && wallet.m_allow_fallback_fee && !wallet.m_discard_rate_set) {
+        discard_rate = std::max(wallet.m_fallback_fee, GetRequiredFeeRate(wallet));
+    }
     // Don't let discard_rate be greater than longest possible fee estimate if we get a valid fee estimate
     discard_rate = (discard_rate == CFeeRate(0)) ? wallet.m_discard_rate : std::min(discard_rate, wallet.m_discard_rate);
     // Discard rate must be at least dust relay feerate

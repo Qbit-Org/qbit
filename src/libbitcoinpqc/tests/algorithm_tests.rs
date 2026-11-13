@@ -1,6 +1,6 @@
 use bitcoinpqc::{
-    generate_keypair, public_key_size, secret_key_size, sign, signature_size, verify, PqcError,
-    PublicKey, SecretKey, Signature,
+    generate_keypair, public_key_size, secret_key_size, sign, sign_with_stats, signature_size,
+    verify, PqcError, PublicKey, SecretKey, Signature,
 };
 
 fn fixed_random_data() -> Vec<u8> {
@@ -57,6 +57,39 @@ fn test_secret_debug_output_is_redacted() {
 }
 
 #[test]
+fn test_sign_rejects_inconsistent_secret_key_as_bad_key() {
+    let keypair = generate_keypair(&fixed_random_data()).expect("keygen should succeed");
+    let message = b"inconsistent-secret-key";
+    let secret_bytes = keypair.secret_key.as_secret_bytes().to_vec();
+    let n = secret_key_size() / 4;
+
+    // Layout: [SK_SEED || SK_PRF || PUB_SEED || root]. SK_SEED, PUB_SEED and
+    // root all feed the stored-root check, so each mutation is a rejected key.
+    for offset in [0, 2 * n, 3 * n] {
+        let mut corrupted = secret_bytes.clone();
+        corrupted[offset] ^= 0x80;
+        let corrupted = SecretKey::try_from_slice(&corrupted).expect("exact-size key");
+
+        assert!(
+            matches!(sign(&corrupted, message), Err(PqcError::BadKey)),
+            "mutation at byte {offset} should be BadKey"
+        );
+        let error = sign_with_stats(&corrupted, message)
+            .expect_err("sign_with_stats should reject an inconsistent key");
+        assert_eq!(error.error, PqcError::BadKey);
+    }
+
+    // Control: SK_PRF does not feed the stored root, so signing still
+    // succeeds and verifies under the unchanged public key.
+    let mut prf_only = secret_bytes.clone();
+    prf_only[n] ^= 0x80;
+    let prf_only = SecretKey::try_from_slice(&prf_only).expect("exact-size key");
+    let signature = sign(&prf_only, message).expect("SK_PRF-only mutation should still sign");
+    verify(&keypair.public_key, message, &signature)
+        .expect("signature should verify under the original public key");
+}
+
+#[test]
 fn test_bad_input_validation() {
     let short_random = vec![7u8; 127];
     assert_eq!(
@@ -76,4 +109,23 @@ fn test_bad_input_validation() {
         Signature::try_from_slice(&vec![0u8; signature_size() - 1]),
         Err(PqcError::BadSignature)
     );
+}
+
+// PqcError is not #[non_exhaustive], so a new variant breaks every downstream
+// exhaustive match. This match names exactly the 0.3.0 variant set with no
+// wildcard arm: adding a variant fails to compile here and needs a minor
+// release. C codes without a variant, such as BITCOIN_PQC_ERROR_OUT_OF_MEMORY
+// (-6), reach Rust as Other(code).
+#[test]
+fn test_pqc_error_variants_match_0_3_0() {
+    let variant = match PqcError::Other(-6) {
+        PqcError::BadArgument => "BadArgument",
+        PqcError::InsufficientData => "InsufficientData",
+        PqcError::BadKey => "BadKey",
+        PqcError::BadSignature => "BadSignature",
+        PqcError::NotImplemented => "NotImplemented",
+        PqcError::SigningLimitExceeded => "SigningLimitExceeded",
+        PqcError::Other(_) => "Other",
+    };
+    assert_eq!(variant, "Other");
 }

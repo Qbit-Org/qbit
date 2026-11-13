@@ -28,6 +28,21 @@ void sha512_inc_blocks(uint8_t *state, const uint8_t *in, size_t inblocks);
 void sha512_inc_finalize(uint8_t *out, uint8_t *state, const uint8_t *in, size_t inlen);
 void sha512(uint8_t *out, const uint8_t *in, size_t inlen);
 
+#if defined(BITCOINPQC_ENABLE_TEST_HELPERS)
+enum spx_sha2_impl_id {
+    SPX_SHA2_IMPL_UNINITIALIZED = 0,
+    SPX_SHA2_IMPL_SCALAR = 1,
+    SPX_SHA2_IMPL_X86_SHA_NI = 2,
+    SPX_SHA2_IMPL_ARM_SHA = 3,
+    SPX_SHA2_IMPL_COMMONCRYPTO = 4,
+    SPX_SHA2_IMPL_UNKNOWN = 5
+};
+
+/* Passively observe the cached implementation without initializing it. */
+int spx_sha2_test_sha256_impl(void);
+int spx_sha2_test_sha512_impl(void);
+#endif
+
 #define mgf1_256 SPX_NAMESPACE(mgf1_256)
 void mgf1_256(unsigned char *out, unsigned long outlen,
           const unsigned char *in, unsigned long inlen);

@@ -20,7 +20,9 @@
 
 #include <interfaces/node.h>
 #include <node/interface_ui.h>
+#include <util/result.h>
 #include <util/strencodings.h>
+#include <util/translation.h>
 
 #include <QAction>
 #include <QFileDialog>
@@ -111,7 +113,17 @@ WalletView::WalletView(WalletModel* wallet_model, const PlatformStyle* _platform
     connect(walletModel, &WalletModel::showProgress, this, &WalletView::showProgress);
 }
 
-WalletView::~WalletView() = default;
+WalletView::~WalletView()
+{
+    // The rescan progress dialog has no parent, so it would stay open and
+    // application-modal after this view, and the shutdown poll would wait
+    // for it. This can run inside the dialog's own setValue(), which
+    // processes events, so delete it later.
+    if (progressDialog) {
+        progressDialog->hide();
+        progressDialog->deleteLater();
+    }
+}
 
 void WalletView::prepareForShutdown()
 {
@@ -208,6 +220,9 @@ void WalletView::showOutOfSyncWarning(bool fShow)
 
 void WalletView::encryptWallet()
 {
+    // The wallet is being encrypted, for example by the encryptwallet RPC.
+    // Say so before the user chooses a passphrase.
+    if (walletModel->refuseWhileEncrypting()) return;
     const wallet::PQCKeyValidationInfo pqc_validation{walletModel->getPQCKeyValidationInfo()};
     if (pqc_validation.pending_records > 0) {
         Q_EMIT message(tr("Wallet encryption unavailable"),
@@ -237,8 +252,9 @@ void WalletView::backupWallet()
     if (filename.isEmpty())
         return;
 
-    if (!walletModel->wallet().backupWallet(filename.toLocal8Bit().data())) {
-        Q_EMIT message(tr("Backup Failed"), tr("There was an error trying to save the wallet data to %1.").arg(filename),
+    const auto backup{walletModel->wallet().backupWallet(filename.toLocal8Bit().data())};
+    if (!backup) {
+        Q_EMIT message(tr("Backup Failed"), tr("There was an error trying to save the wallet data to %1.").arg(filename) + QLatin1Char(' ') + QString::fromStdString(util::ErrorString(backup).translated),
             CClientUIInterface::MSG_ERROR);
         }
     else {

@@ -1,0 +1,107 @@
+name: Key Policy Gate
+
+# Checks a pull request's changes to the release key policy, and to the code
+# that checks it, with its base branch's own code only. GitHub runs
+# pull_request_target workflows as the default branch defines them, for pull
+# requests into any branch: this job refuses every base branch but main and
+# 1.x.x, checks out only the pull request's base commit, and reads the pull
+# request's commits as git objects, so nothing from the pull request runs here.
+# See contrib/keys/README.md.
+on:
+  pull_request_target:
+    # edited: a new base branch means the gate runs again against it.
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: key-policy-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  key-policy-gate:
+    # A required status check, one name per base branch: each protected
+    # branch's ruleset requires its own ("Key Policy Gate (main)",
+    # "Key Policy Gate (1.x.x)"), so a run for one base cannot stand in for
+    # another. Keep these names stable.
+    name: Key Policy Gate (${{ github.event.pull_request.base.ref }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check the base branch
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Only branches whose rulesets require this gate; any other base
+          # fails here, and never skips, since a skipped run would pass.
+          case "${BASE_REF}" in
+            main | 1.x.x) ;;
+            *)
+              echo "::error::This gate checks pull requests into main and 1.x.x only."
+              exit 1
+              ;;
+          esac
+          # The base commit must be the branch's tip, not one named in a stale
+          # event. ls-remote also lists refs that only end in refs/heads/<base>,
+          # so exactly one line must name the branch itself.
+          tips="$(git ls-remote "${REPOSITORY_URL}" "refs/heads/${BASE_REF}")"
+          tip=""
+          count=0
+          while IFS=$'\t' read -r sha ref; do
+            if [[ "${ref}" == "refs/heads/${BASE_REF}" ]]; then
+              tip="${sha}"
+              count=$((count + 1))
+            fi
+          done <<< "${tips}"
+          if [[ "${count}" -ne 1 ]]; then
+            echo "::error::The base branch was not found."
+            exit 1
+          fi
+          if [[ "${tip}" != "${BASE_SHA}" ]]; then
+            echo "::error::The base branch is at ${tip}, not ${BASE_SHA}: update the pull request with its base branch."
+            exit 1
+          fi
+
+      - name: Check out the base commit
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install gpg and PyYAML
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gpg python3-yaml
+
+      - name: Fetch the pull request's commits as data
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --no-recurse-submodules origin \
+            "+refs/pull/${PR_NUMBER}/head:refs/key-policy-gate/head"
+          fetched="$(git rev-parse refs/key-policy-gate/head)"
+          if [[ "${fetched}" != "${HEAD_SHA}" ]]; then
+            echo "::error::Fetched ${fetched} for pull request ${PR_NUMBER}, expected ${HEAD_SHA}."
+            exit 1
+          fi
+
+      - name: Check gated changes with the base's code
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # The system Python, which the python3-yaml package serves. -I:
+          # nothing beside the script on the module path. -B and a new, empty
+          # pycache prefix outside the checkout: no bytecode cache is read
+          # from the checkout.
+          pycache="$(mktemp -d "${RUNNER_TEMP}/key-policy-gate-pycache.XXXXXX")"
+          /usr/bin/python3 -I -B -X "pycache_prefix=${pycache}" ci/release/key_policy_gate.py target \
+            --base "${BASE_SHA}" --head "${HEAD_SHA}" --work "${RUNNER_TEMP}/key-policy-gate"

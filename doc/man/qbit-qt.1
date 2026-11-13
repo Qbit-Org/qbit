@@ -492,7 +492,10 @@ The fee rate (in QBT/kvB) that indicates your tolerance for discarding
 change by adding it to the fee (default: 0.0001). Note: An output
 is discarded if it is dust at this rate, but we will always
 discard up to the dust relay fee and a discard fee above that is
-limited by the fee estimate for the longest target
+limited by the fee estimate for the longest target. If there is
+no estimate and this option is not set, the limit is \fB\-fallbackfee\fR
+raised to \fB\-mintxfee\fR and the minimum relay fee, unless
+\fB\-fallbackfee\fR is 0
 .HP
 \fB\-fallbackfee=\fR<amt>
 .IP

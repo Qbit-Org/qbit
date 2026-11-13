@@ -11,6 +11,7 @@
 #include <pow.h>
 #include <primitives/pureheader.h>
 #include <serialize.h>
+#include <test/util/net.h>
 #include <test/util/setup_common.h>
 #include <util/chaintype.h>
 #include <util/time.h>
@@ -309,6 +310,78 @@ BOOST_AUTO_TEST_CASE(headers_sync_state)
     // Nevertheless, no validation errors should have been detected with the
     // chain:
     BOOST_CHECK(result.success);
+}
+
+// A peer serving large AuxPoW headers ends a headers message early to keep it
+// under the receive limit, so a message far short of MAX_HEADERS_RESULTS
+// headers may not reach the peer's tip. Both sync phases must keep requesting
+// headers after such a message.
+BOOST_AUTO_TEST_CASE(headers_sync_continues_through_byte_limited_messages)
+{
+    const auto& consensus{Params().GetConsensus()};
+    const CBlockIndex* chain_start = WITH_LOCK(::cs_main, return m_node.chainman->m_blockman.LookupBlockIndex(Params().GenesisBlock().GetHash()));
+    BOOST_REQUIRE(chain_start);
+
+    // Five large AuxPoW headers followed by three ordinary ones. The header
+    // hash does not commit to the payload, so the large headers can share one.
+    std::vector<CBlockHeader> headers;
+    GenerateHeaders(headers, 5, chain_start->GetBlockHash(),
+                    MakeVersion(static_cast<uint16_t>(consensus.nAuxpowChainId), /*auxpow=*/true, /*version_bits=*/0),
+                    chain_start->GetBlockTime(), ArithToUint256(0), chain_start->nBits);
+    const auto large_auxpow{MakeAuxpowPayloadWithScriptSigSize(1'900'000)};
+    for (CBlockHeader& header : headers) header.auxpow = large_auxpow;
+    GenerateHeaders(headers, 8, headers.back().GetHash(), chain_start->nVersion,
+                    headers.back().nTime, ArithToUint256(0), chain_start->nBits);
+
+    const auto messages{SplitIntoHeadersMessages(headers)};
+    BOOST_REQUIRE_EQUAL(messages.size(), 3U);
+    BOOST_CHECK_EQUAL(messages[0].size(), 2U);
+    BOOST_CHECK_EQUAL(messages[1].size(), 2U);
+    BOOST_CHECK_EQUAL(messages[2].size(), 4U);
+    BOOST_CHECK(MayHaveMoreHeaders(messages[0]));
+    BOOST_CHECK(MayHaveMoreHeaders(messages[1]));
+    BOOST_CHECK(!MayHaveMoreHeaders(messages[2]));
+
+    // Judged by header count alone, the first message looks final and
+    // PRESYNC gives up on the peer.
+    {
+        HeadersSyncState hss{/*id=*/0, consensus, chain_start, ClaimedWork(*chain_start, headers)};
+        const auto result{hss.ProcessNextHeaders(messages[0], /*full_headers_message=*/messages[0].size() == MAX_HEADERS_RESULTS)};
+        BOOST_CHECK(result.success);
+        BOOST_CHECK(!result.request_more);
+        BOOST_CHECK(hss.GetState() == HeadersSyncState::State::FINAL);
+    }
+
+    HeadersSyncState hss{/*id=*/0, consensus, chain_start, ClaimedWork(*chain_start, headers)};
+    // PRESYNC reaches the required work with the last message, then restarts
+    // from the chain start for REDOWNLOAD.
+    for (size_t i{0}; i < messages.size(); ++i) {
+        const auto result{hss.ProcessNextHeaders(messages[i], MayHaveMoreHeaders(messages[i]))};
+        BOOST_REQUIRE(result.success);
+        BOOST_REQUIRE(result.request_more);
+        BOOST_CHECK(result.pow_validated_headers.empty());
+        BOOST_CHECK(hss.GetState() == (i + 1 < messages.size() ? HeadersSyncState::State::PRESYNC : HeadersSyncState::State::REDOWNLOAD));
+    }
+    BOOST_CHECK_EQUAL(hss.NextHeadersRequestLocator().vHave.front(), chain_start->GetBlockHash());
+
+    // REDOWNLOAD asks for more after each byte-limited message and releases
+    // every header once it reaches the required work.
+    std::vector<CBlockHeader> released;
+    for (size_t i{0}; i < messages.size(); ++i) {
+        const auto result{hss.ProcessNextHeaders(messages[i], MayHaveMoreHeaders(messages[i]))};
+        BOOST_REQUIRE(result.success);
+        BOOST_CHECK_EQUAL(result.request_more, i + 1 < messages.size());
+        if (result.request_more) {
+            BOOST_CHECK_EQUAL(hss.NextHeadersRequestLocator().vHave.front(), messages[i].back().GetHash());
+        }
+        released.insert(released.end(), result.pow_validated_headers.begin(), result.pow_validated_headers.end());
+    }
+    BOOST_CHECK(hss.GetState() == HeadersSyncState::State::FINAL);
+    BOOST_REQUIRE_EQUAL(released.size(), headers.size());
+    for (size_t i{0}; i < headers.size(); ++i) {
+        BOOST_CHECK_EQUAL(released[i].GetHash(), headers[i].GetHash());
+        BOOST_CHECK(released[i].auxpow == headers[i].auxpow);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(headers_sync_future_chain_start_does_not_wrap_commitment_limit)

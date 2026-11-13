@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <functional>
 #include <iostream>
@@ -11,8 +12,16 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <limits>
 #include <unordered_set>
 #include <vector>
+
+#if defined(__GLIBC__)
+#include <malloc.h>
+#if __GLIBC_PREREQ(2, 33)
+#define PHOTON_TEST_HAVE_MALLINFO2 1
+#endif
+#endif
 
 namespace {
 
@@ -349,6 +358,111 @@ void TestDuplicateAndValidation()
     Require(!decoder.AddChunk(99, 1, by_id[1]->bytes), "invalid group id should be rejected");
 }
 
+#if defined(PHOTON_TEST_HAVE_MALLINFO2)
+std::size_t HeapGrowthSince(std::size_t base)
+{
+    const struct mallinfo2 info = mallinfo2();
+    const std::size_t now = info.uordblks + info.hblkhd;
+    return now > base ? now - base : 0;
+}
+
+std::size_t HeapInUse()
+{
+    const struct mallinfo2 info = mallinfo2();
+    return info.uordblks + info.hblkhd;
+}
+
+// mallinfo2 sees only glibc's allocator; under a sanitizer or a preloaded allocator it reports
+// nothing useful, so measurements are skipped there.
+bool HeapMeasurable()
+{
+    constexpr std::size_t kProbeBytes = 1024 * 1024;
+    const std::size_t base = HeapInUse();
+    void* volatile probe = std::malloc(kProbeBytes);
+    const bool visible = probe != nullptr && HeapInUse() >= base + kProbeBytes;
+    std::free(probe);
+    return visible;
+}
+
+// Peak heap held by a decoder for `block`, from construction until it completes. Parity chunks
+// are fed first so the decoder holds the most state before it can finish.
+std::size_t MeasureDecoderPeak(const Parameters& params, const std::vector<std::uint8_t>& block)
+{
+    Encoder encoder(params);
+    const EncodedBlock encoded = encoder.Encode(block);
+
+    const std::size_t base = HeapInUse();
+    std::size_t peak = 0;
+    {
+        Decoder decoder(params, block.size());
+        peak = HeapGrowthSince(base);
+        for (int pass = 0; pass < 2 && !decoder.IsComplete(); ++pass) {
+            for (const Chunk& chunk : encoded.chunks) {
+                if ((pass == 0) != (chunk.chunk_id >= params.data_chunks)) {
+                    continue;
+                }
+                (void)decoder.AddChunk(chunk);
+                peak = std::max(peak, HeapGrowthSince(base));
+                if (decoder.IsComplete()) {
+                    break;
+                }
+            }
+        }
+        Require(decoder.IsComplete(), "decoder should complete with every chunk");
+    }
+    return peak;
+}
+#endif
+
+void TestDecoderMemoryChargeCoversHeap()
+{
+#if defined(PHOTON_TEST_HAVE_MALLINFO2)
+    if (!HeapMeasurable()) {
+        std::cout << "  (allocator not visible to mallinfo2; skipped)\n";
+        return;
+    }
+    // One coding group for every data chunk count: the charge must cover what the codec allocates,
+    // without being so loose that the relay limits stop meaning anything.
+    for (std::uint16_t data_chunks = 2; data_chunks < FEC_TOTAL_CHUNKS; ++data_chunks) {
+        const Parameters params = Parameters::FromDataChunkCount(data_chunks);
+        const std::vector<std::uint8_t> block = RandomBytes(static_cast<std::size_t>(data_chunks) * FEC_CHUNK_SIZE, 0xC0DE + data_chunks);
+        const std::size_t peak = MeasureDecoderPeak(params, block);
+        const std::size_t charge = Decoder::MemoryBytes(params, block.size());
+        Require(peak <= charge, "charge below measured heap for data_chunks=" + std::to_string(data_chunks)
+                                    + " (" + std::to_string(charge) + " < " + std::to_string(peak) + ")");
+        // CM256 completes a group inside one AddChunk call, briefly holding the received and the
+        // decoded payload together; sampling between calls cannot see that, so allow for it.
+        const std::size_t slack = data_chunks <= photon::fec::CM256_MAX_DATA_CHUNKS ? peak : peak / 4;
+        Require(charge <= peak + slack + 4096, "charge far above measured heap for data_chunks=" + std::to_string(data_chunks));
+    }
+
+    // Multi-group blocks up to the relay's 2,000,000-byte limit.
+    for (const std::uint16_t data_chunks : {2, 27, 28, 64, 212, 254}) {
+        const Parameters params = Parameters::FromDataChunkCount(data_chunks);
+        const std::size_t size = data_chunks <= photon::fec::CM256_MAX_DATA_CHUNKS ? 200'000 : 2'000'000;
+        const std::vector<std::uint8_t> block = RandomBytes(size, 0xBEEF + data_chunks);
+        const std::size_t peak = MeasureDecoderPeak(params, block);
+        const std::size_t charge = Decoder::MemoryBytes(params, block.size());
+        std::cout << "  data_chunks=" << data_chunks << " size=" << size << " heap_peak=" << peak << " charge=" << charge << '\n';
+        Require(peak <= charge, "charge below measured heap for multi-group data_chunks=" + std::to_string(data_chunks));
+    }
+#else
+    std::cout << "  (heap measurement needs glibc 2.33 or later; skipped)\n";
+#endif
+}
+
+void TestDecoderMemoryChargeRejectsInvalidArguments()
+{
+    Parameters invalid{};
+    invalid.data_chunks = 1;
+    invalid.parity_chunks = 254;
+    Require(Decoder::MemoryBytes(invalid, 1000) == std::numeric_limits<std::size_t>::max(), "invalid parameters should not be chargeable");
+    Require(Decoder::MemoryBytes(Parameters::FromDataChunkCount(2), std::numeric_limits<std::size_t>::max()) ==
+                std::numeric_limits<std::size_t>::max(),
+            "too many coding groups should not be chargeable");
+    Require(Decoder::MemoryBytes(Parameters::FromDataChunkCount(212), 0) < 1024, "an empty decoder holds almost nothing");
+}
+
 int RunAllTests()
 {
     const std::vector<std::pair<std::string, std::function<void()>>> tests = {
@@ -361,6 +475,8 @@ int RunAllTests()
         {"corrupted_packet_handling", TestCorruptedPacketHandling},
         {"out_of_order_delivery", TestOutOfOrderDelivery},
         {"duplicate_and_validation", TestDuplicateAndValidation},
+        {"decoder_memory_charge_covers_heap", TestDecoderMemoryChargeCoversHeap},
+        {"decoder_memory_charge_rejects_invalid_arguments", TestDecoderMemoryChargeRejectsInvalidArguments},
     };
 
     int failures = 0;

@@ -1045,7 +1045,10 @@ bool DescriptorScriptPubKeyMan::CheckDecryptionKey(const CKeyingMaterial& master
                 keyFail = true;
                 break;
             }
-            if (legacy_auth_tag &&
+            // Writing the crypted record erases a plaintext record for the
+            // same key, so leave a key that still has one to re-encryption,
+            // which keeps the higher of the two counters.
+            if (legacy_auth_tag && !HavePlaintextPQCKeyRecord(pubkey) &&
                 batch.WriteCryptedDescriptorPQCKey(m_wallet_descriptor.id, pubkey, crypted_key.crypted_secret, sig_counter, &*legacy_auth_tag)) {
                 crypted_key.auth_tag = *legacy_auth_tag;
             }
@@ -1068,7 +1071,7 @@ bool DescriptorScriptPubKeyMan::CheckDecryptionKey(const CKeyingMaterial& master
 
 bool DescriptorScriptPubKeyMan::Encrypt(const CKeyingMaterial& master_key, WalletBatch* batch)
 {
-    LOCK(cs_desc_man);
+    AssertLockHeld(cs_desc_man);
     if (HasBlockedPlaintextPQCKeys()) {
         return false;
     }
@@ -1086,7 +1089,9 @@ bool DescriptorScriptPubKeyMan::Encrypt(const CKeyingMaterial& master_key, Walle
             return false;
         }
         m_map_crypted_keys[pubkey.GetID()] = make_pair(pubkey, crypted_secret);
-        batch->WriteCryptedDescriptorKey(GetID(), pubkey, crypted_secret);
+        if (!batch->WriteCryptedDescriptorKey(GetID(), pubkey, crypted_secret)) {
+            return false;
+        }
     }
     for (const auto& [pubkey, key] : m_map_pqc_keys) {
         std::vector<unsigned char> crypted_secret;
@@ -1098,7 +1103,9 @@ bool DescriptorScriptPubKeyMan::Encrypt(const CKeyingMaterial& master_key, Walle
         const uint32_t sig_counter = counter_it != m_map_pqc_sig_counters.end() ? counter_it->second : 0;
         const uint256 auth_tag{GetCryptedPQCKeyAuthTag(master_key, GetID(), pubkey, std::span<const unsigned char>{secret.data(), secret.size()}, sig_counter)};
         m_map_crypted_pqc_keys[pubkey] = CryptedPQCKeyRecord{crypted_secret, auth_tag};
-        batch->WriteCryptedDescriptorPQCKey(GetID(), pubkey, crypted_secret, sig_counter, &auth_tag);
+        if (!batch->WriteCryptedDescriptorPQCKey(GetID(), pubkey, crypted_secret, sig_counter, &auth_tag)) {
+            return false;
+        }
     }
     m_map_keys.clear();
     m_map_pqc_keys.clear();
@@ -1131,10 +1138,26 @@ void DescriptorScriptPubKeyMan::ReturnDestination(int64_t index, bool internal, 
 
 std::map<CKeyID, CKey> DescriptorScriptPubKeyMan::GetKeys() const
 {
+    bool has_encryption_keys{false};
+    std::optional<CKeyingMaterial> encryption_key;
+    return GetKeys(has_encryption_keys, encryption_key);
+}
+
+std::map<CKeyID, CKey> DescriptorScriptPubKeyMan::GetKeys(bool& has_encryption_keys, std::optional<CKeyingMaterial>& encryption_key) const
+{
     KeyMap keys;
     CryptedKeyMap crypted_keys;
-    const bool has_encryption_keys = m_storage.HasEncryptionKeys();
-    std::optional<CKeyingMaterial> encryption_key;
+    {
+        // EncryptWallet holds cs_desc_man while it adds the first master key
+        // and encrypts the keys, so the state and the copy agree.
+        LOCK(cs_desc_man);
+        has_encryption_keys = m_storage.HasEncryptionKeys();
+        keys = m_map_keys;
+        if (has_encryption_keys) {
+            crypted_keys = m_map_crypted_keys;
+        }
+    }
+    encryption_key.reset();
     if (has_encryption_keys) {
         m_storage.WithEncryptionKey([&](const CKeyingMaterial& key) {
             if (!key.empty()) {
@@ -1142,13 +1165,6 @@ std::map<CKeyID, CKey> DescriptorScriptPubKeyMan::GetKeys() const
             }
             return true;
         });
-    }
-    {
-        LOCK(cs_desc_man);
-        keys = m_map_keys;
-        if (has_encryption_keys) {
-            crypted_keys = m_map_crypted_keys;
-        }
     }
 
     if (has_encryption_keys && !crypted_keys.empty()) {
@@ -1215,19 +1231,27 @@ bool DescriptorScriptPubKeyMan::TopUpWithInternalHint(std::optional<bool> intern
 
 DescriptorScriptPubKeyMan::TopUpPreparation DescriptorScriptPubKeyMan::PrepareTopUp(std::optional<bool> internal_hint) const
 {
+    AssertLockNotHeld(cs_desc_man);
     TopUpPreparation prepared;
     prepared.spkman_is_internal = internal_hint.has_value() ? internal_hint : m_storage.IsInternalScriptPubKeyMan(this);
-    prepared.provider.keys = GetKeys();
-    prepared.has_encryption_keys = m_storage.HasEncryptionKeys();
-    if (prepared.has_encryption_keys) {
-        m_storage.WithEncryptionKey([&](const CKeyingMaterial& key) {
-            if (!key.empty()) {
-                prepared.encryption_key = key;
-            }
-            return true;
-        });
-    }
+    // Take the keys, the encryption state and the encryption key together, so
+    // that CheckTopUpPreparation's check of the state also covers the keys.
+    prepared.provider.keys = GetKeys(prepared.has_encryption_keys, prepared.encryption_key);
     return prepared;
+}
+
+util::Result<void> DescriptorScriptPubKeyMan::CheckTopUpPreparation(const TopUpPreparation& prepared) const
+{
+    AssertLockHeld(cs_desc_man);
+    // Encryption cannot be undone, and EncryptWallet adds the first master
+    // key while it holds the cs_desc_man of every manager in the wallet, so
+    // the answer stays valid until cs_desc_man is released. A plaintext
+    // snapshot taken before that would write plaintext keys into the
+    // encrypted wallet.
+    if (!prepared.has_encryption_keys && m_storage.HasEncryptionKeys()) {
+        return util::Error{Untranslated("wallet was encrypted after this keypool top-up took its key snapshot")};
+    }
+    return {};
 }
 
 util::Result<void> DescriptorScriptPubKeyMan::TopUpWithInternalHintResult(std::optional<bool> internal_hint, unsigned int size)
@@ -1242,9 +1266,15 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithInternalHintResultNoNotif
 {
     AssertLockNotHeld(cs_desc_man);
     const TopUpPreparation prepared{PrepareTopUp(internal_hint)};
+    if (m_after_prepare_top_up) m_after_prepare_top_up();
     std::shared_ptr<TopUpChange> change;
     {
         LOCK(cs_desc_man);
+        // Fail a stale attempt as a locked wallet would; a later attempt takes
+        // a new snapshot. Checking before the transaction begins keeps a stale
+        // top-up from waiting for the writer or holding a transaction open
+        // during EncryptWallet's database rewrite.
+        if (auto res{CheckTopUpPreparation(prepared)}; !res) return res;
         // Keep descriptor and database lock ordering aligned with address reservation.
         WalletBatch batch(m_storage.GetDatabase());
         if (!batch.TxnBegin()) {
@@ -1287,7 +1317,10 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithInternalHintResultNoNotif
             if (!aborted) {
                 throw std::runtime_error(strprintf("Error during descriptors keypool top up. Cannot abort changes after commit failure for wallet [%s]", m_storage.LogName()));
             }
-            throw std::runtime_error(strprintf("Error during descriptors keypool top up. Cannot commit changes for wallet [%s]", m_storage.LogName()));
+            // The transaction, the staged publication and the in-memory state
+            // are all rolled back, so this is an ordinary top-up failure.
+            // Background refills report it instead of aborting the process.
+            return util::Error{Untranslated(strprintf("Error during descriptors keypool top up. Cannot commit changes for wallet [%s]", m_storage.LogName()))};
         }
         m_storage.FinishTopUpCommit(change->publication_id, /*committed=*/true);
     }
@@ -1338,6 +1371,7 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBResult(WalletBatch& bat
 util::Result<std::shared_ptr<DescriptorScriptPubKeyMan::TopUpChange>> DescriptorScriptPubKeyMan::TopUpWithDBPreparedResult(WalletBatch& batch, unsigned int size, const TopUpPreparation& prepared, bool throw_on_persistence_error, bool rollback_state_on_error)
 {
     AssertLockHeld(cs_desc_man);
+    if (auto res{CheckTopUpPreparation(prepared)}; !res) return util::Error{util::ErrorString(res)};
     auto rollback_state{std::make_shared<TopUpRollbackState>(
         m_wallet_descriptor.range_start,
         m_wallet_descriptor.range_end,
@@ -1444,7 +1478,7 @@ util::Result<std::shared_ptr<DescriptorScriptPubKeyMan::TopUpChange>> Descriptor
                     return top_up_error(Untranslated(strprintf("failed to derive P2MR private key at descriptor index %d", i)));
                 }
                 const CPQCPubKey pqc_pub = pqc_key.GetPubKey();
-                const bool had_pqc_key = m_map_pqc_keys.contains(pqc_pub) || m_map_crypted_pqc_keys.contains(pqc_pub) || m_pending_plaintext_pqc_keys.contains(pqc_pub);
+                const bool had_pqc_key = HavePQCKeyRecord(pqc_pub);
                 remember_pqc_key(pqc_pub);
                 if (!AddDescriptorPQCKeyWithDB(batch, pqc_pub, pqc_key, prepared.has_encryption_keys, prepared.encryption_key ? &*prepared.encryption_key : nullptr)) {
                     if (prepared.has_encryption_keys && !prepared.encryption_key) {
@@ -1461,7 +1495,7 @@ util::Result<std::shared_ptr<DescriptorScriptPubKeyMan::TopUpChange>> Descriptor
                         return top_up_error(Untranslated(strprintf("failed to derive P2MR private key at descriptor index %d", i)));
                     }
                     const CPQCPubKey pqc_pub = pqc_key.GetPubKey();
-                    const bool had_pqc_key = m_map_pqc_keys.contains(pqc_pub) || m_map_crypted_pqc_keys.contains(pqc_pub) || m_pending_plaintext_pqc_keys.contains(pqc_pub);
+                    const bool had_pqc_key = HavePQCKeyRecord(pqc_pub);
                     remember_pqc_key(pqc_pub);
                     if (!AddDescriptorPQCKeyWithDB(batch, pqc_pub, pqc_key, prepared.has_encryption_keys, prepared.encryption_key ? &*prepared.encryption_key : nullptr)) {
                         if (prepared.has_encryption_keys && !prepared.encryption_key) {
@@ -1497,14 +1531,14 @@ util::Result<std::shared_ptr<DescriptorScriptPubKeyMan::TopUpChange>> Descriptor
             if (prepared.has_encryption_keys && !prepared.encryption_key && has_private_p2mr_source) {
                 for (const auto& p2mr_pair : out_keys.p2mr_pubkeys) {
                     const CPQCPubKey& pqc_pub = p2mr_pair.second;
-                    const bool has_pqc_key = m_map_pqc_keys.contains(pqc_pub) || m_map_crypted_pqc_keys.contains(pqc_pub) || m_pending_plaintext_pqc_keys.contains(pqc_pub);
+                    const bool has_pqc_key = HavePQCKeyRecord(pqc_pub);
                     if (!has_pqc_key && !out_keys.pqc_keys.contains(pqc_pub)) {
                         return persistence_error(_("wallet encryption key is unavailable for P2MR private-key persistence"), /*persistence_write_may_have_started=*/false);
                     }
                 }
             }
             for (const auto& [pqc_pub, pqc_key] : out_keys.pqc_keys) {
-                const bool had_pqc_key = m_map_pqc_keys.contains(pqc_pub) || m_map_crypted_pqc_keys.contains(pqc_pub) || m_pending_plaintext_pqc_keys.contains(pqc_pub);
+                const bool had_pqc_key = HavePQCKeyRecord(pqc_pub);
                 remember_pqc_key(pqc_pub);
                 if (!AddDescriptorPQCKeyWithDB(batch, pqc_pub, pqc_key, prepared.has_encryption_keys, prepared.encryption_key ? &*prepared.encryption_key : nullptr)) {
                     if (prepared.has_encryption_keys && !prepared.encryption_key) {
@@ -1785,7 +1819,7 @@ bool DescriptorScriptPubKeyMan::AddDescriptorPQCKeyWithDB(WalletBatch& batch, co
     AssertLockHeld(cs_desc_man);
     assert(!m_storage.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS));
 
-    if (m_map_pqc_keys.contains(pubkey) || m_map_crypted_pqc_keys.contains(pubkey) || m_pending_plaintext_pqc_keys.contains(pubkey)) {
+    if (HavePQCKeyRecord(pubkey)) {
         return true;
     }
 
@@ -1995,7 +2029,7 @@ bool DescriptorScriptPubKeyMan::CanGetAddresses(bool internal) const
 bool DescriptorScriptPubKeyMan::HavePrivateKeys() const
 {
     LOCK(cs_desc_man);
-    return !m_map_keys.empty() || !m_map_crypted_keys.empty() || !m_map_pqc_keys.empty() || !m_map_crypted_pqc_keys.empty() || !m_pending_plaintext_pqc_keys.empty();
+    return !m_map_keys.empty() || !m_map_crypted_keys.empty() || !m_map_pqc_keys.empty() || !m_map_crypted_pqc_keys.empty() || !m_pending_plaintext_pqc_keys.empty() || !m_unencrypted_pqc_keys.empty();
 }
 
 bool DescriptorScriptPubKeyMan::HaveCryptedKeys() const
@@ -2004,28 +2038,59 @@ bool DescriptorScriptPubKeyMan::HaveCryptedKeys() const
     return !m_map_crypted_keys.empty() || !m_map_crypted_pqc_keys.empty();
 }
 
+bool DescriptorScriptPubKeyMan::HavePlaintextPQCKeyRecord(const CPQCPubKey& pubkey) const
+{
+    AssertLockHeld(cs_desc_man);
+    // m_map_pqc_keys holds the expected plaintext keys of an unencrypted
+    // wallet, so it only counts in an encrypted one.
+    return m_pending_plaintext_pqc_keys.contains(pubkey) || m_unencrypted_pqc_keys.contains(pubkey) ||
+           m_failed_plaintext_pqc_keys.contains(pubkey) ||
+           (m_storage.HasEncryptionKeys() && m_map_pqc_keys.contains(pubkey));
+}
+
+bool DescriptorScriptPubKeyMan::HavePQCKeyRecord(const CPQCPubKey& pubkey) const
+{
+    AssertLockHeld(cs_desc_man);
+    // A record that failed validation counts too, so that a top-up never
+    // replaces it with a fresh record at counter 0.
+    return m_map_pqc_keys.contains(pubkey) || m_map_crypted_pqc_keys.contains(pubkey) || HavePlaintextPQCKeyRecord(pubkey);
+}
+
 bool DescriptorScriptPubKeyMan::HasBlockedPlaintextPQCKeys() const
 {
     AssertLockHeld(cs_desc_man);
-    return !m_pending_plaintext_pqc_keys.empty() || !m_failed_plaintext_pqc_keys.empty();
+    return !m_pending_plaintext_pqc_keys.empty() || !m_failed_plaintext_pqc_keys.empty() || !m_unencrypted_pqc_keys.empty();
 }
 
 bool DescriptorScriptPubKeyMan::IsPlaintextPQCKeyBlocked(const CPQCPubKey& pubkey) const
 {
     AssertLockHeld(cs_desc_man);
-    if (m_pending_plaintext_pqc_keys.contains(pubkey)) return true;
-    return m_failed_plaintext_pqc_keys.contains(pubkey) && !m_map_crypted_pqc_keys.contains(pubkey);
+    if (m_pending_plaintext_pqc_keys.contains(pubkey) || m_unencrypted_pqc_keys.contains(pubkey)) return true;
+    // An encrypted wallet must not sign with, or rewrite, a key while a
+    // plaintext record for it remains, even if a crypted record exists too.
+    const bool encrypted{m_storage.HasEncryptionKeys()};
+    if (encrypted && m_map_pqc_keys.contains(pubkey)) return true;
+    return m_failed_plaintext_pqc_keys.contains(pubkey) && (encrypted || !m_map_crypted_pqc_keys.contains(pubkey));
 }
 
 std::set<CPQCPubKey> DescriptorScriptPubKeyMan::GetBlockedPlaintextPQCKeys() const
 {
     AssertLockHeld(cs_desc_man);
+    const bool encrypted{m_storage.HasEncryptionKeys()};
     std::set<CPQCPubKey> blocked_pubkeys;
     for (const auto& [pubkey, _] : m_pending_plaintext_pqc_keys) {
         blocked_pubkeys.insert(pubkey);
     }
+    for (const auto& [pubkey, _] : m_unencrypted_pqc_keys) {
+        blocked_pubkeys.insert(pubkey);
+    }
+    if (encrypted) {
+        for (const auto& [pubkey, _] : m_map_pqc_keys) {
+            blocked_pubkeys.insert(pubkey);
+        }
+    }
     for (const CPQCPubKey& pubkey : m_failed_plaintext_pqc_keys) {
-        if (!m_map_crypted_pqc_keys.contains(pubkey)) {
+        if (encrypted || !m_map_crypted_pqc_keys.contains(pubkey)) {
             blocked_pubkeys.insert(pubkey);
         }
     }
@@ -2037,10 +2102,11 @@ PQCKeyValidationInfo DescriptorScriptPubKeyMan::GetPQCKeyValidationInfo() const
     LOCK(cs_desc_man);
     PQCKeyValidationInfo info;
     info.pending_records = m_pending_plaintext_pqc_keys.size();
-    info.validated_records = m_map_pqc_keys.size();
+    info.validated_records = m_map_pqc_keys.size() + m_unencrypted_pqc_keys.size();
     info.failed_records = m_failed_plaintext_pqc_keys.size();
     info.plaintext_records = info.pending_records + info.validated_records + info.failed_records;
-    info.signing_blocked = info.pending_records > 0 || info.failed_records > 0;
+    info.reencryption_required = m_storage.HasEncryptionKeys() && info.plaintext_records > 0;
+    info.signing_blocked = info.pending_records > 0 || info.failed_records > 0 || info.reencryption_required;
     info.encryption_recommended = info.plaintext_records > 0 && info.failed_records == 0;
 
     if (info.failed_records > 0) {
@@ -2306,6 +2372,8 @@ bool DescriptorScriptPubKeyMan::ReservePQCSignatureCountersBatch(const std::map<
     LOCK(cs_desc_man);
 
     for (const auto& [pubkey, count] : counts) {
+        // This also refuses any plaintext key in an encrypted wallet, so the
+        // write below never rewrites a plaintext record there.
         if (IsPlaintextPQCKeyBlocked(pubkey)) return false;
 
         const auto key_it = m_map_pqc_keys.find(pubkey);
@@ -2909,15 +2977,22 @@ std::unique_ptr<CKeyMetadata> DescriptorScriptPubKeyMan::GetMetadata(const CTxDe
 std::optional<uint32_t> DescriptorScriptPubKeyMan::GetPQCSignatureCounter(const CPQCPubKey& pubkey) const
 {
     LOCK(cs_desc_man);
-    const bool have_local_key = m_map_pqc_keys.contains(pubkey) || m_map_crypted_pqc_keys.contains(pubkey) ||
-                                m_pending_plaintext_pqc_keys.contains(pubkey) || m_failed_plaintext_pqc_keys.contains(pubkey);
+    const bool have_local_key = HavePQCKeyRecord(pubkey);
     if (!have_local_key) {
         return std::nullopt;
     }
+    uint32_t sig_counter{0};
     if (const auto counter_it = m_map_pqc_sig_counters.find(pubkey); counter_it != m_map_pqc_sig_counters.end()) {
-        return counter_it->second;
+        sig_counter = counter_it->second;
     }
-    return 0;
+    // Re-encryption keeps the higher counter of a key's plaintext and crypted
+    // records, so report that one, also while the plaintext one is pending.
+    for (const auto* plaintext_keys : {&m_pending_plaintext_pqc_keys, &m_unencrypted_pqc_keys}) {
+        if (const auto it = plaintext_keys->find(pubkey); it != plaintext_keys->end()) {
+            sig_counter = std::max(sig_counter, it->second.sig_counter);
+        }
+    }
+    return sig_counter;
 }
 
 uint256 DescriptorScriptPubKeyMan::GetID() const
@@ -2994,12 +3069,15 @@ bool DescriptorScriptPubKeyMan::AddPQCKey(const CPQCPubKey& pubkey, const CPQCKe
 bool DescriptorScriptPubKeyMan::AddPendingPlaintextPQCKey(const CPQCPubKey& pubkey, CKeyingMaterial secret, uint32_t sig_counter)
 {
     LOCK(cs_desc_man);
-    if (m_map_pqc_keys.contains(pubkey) || m_pending_plaintext_pqc_keys.contains(pubkey)) {
+    if (m_map_pqc_keys.contains(pubkey) || m_pending_plaintext_pqc_keys.contains(pubkey) || m_unencrypted_pqc_keys.contains(pubkey)) {
         return false;
     }
     m_failed_plaintext_pqc_keys.erase(pubkey);
     m_pending_plaintext_pqc_keys.emplace(pubkey, PendingPlaintextPQCKey{std::move(secret), sig_counter});
-    m_map_pqc_sig_counters[pubkey] = sig_counter;
+    // A crypted record's auth tag covers its own counter; keep that one.
+    if (!m_map_crypted_pqc_keys.contains(pubkey)) {
+        m_map_pqc_sig_counters[pubkey] = sig_counter;
+    }
     return true;
 }
 
@@ -3018,7 +3096,11 @@ bool DescriptorScriptPubKeyMan::CompletePendingPlaintextPQCKeyValidation(const C
     if (pending_it == m_pending_plaintext_pqc_keys.end()) {
         return false;
     }
-    if (!m_map_crypted_pqc_keys.contains(pubkey)) {
+    if (m_storage.HasEncryptionKeys()) {
+        // A plaintext record in an encrypted wallet is never adopted for
+        // signing. Keep it, with its counter, for re-encryption.
+        m_unencrypted_pqc_keys.insert_or_assign(pubkey, PendingPlaintextPQCKey{CKeyingMaterial{key.data(), key.data() + key.size()}, sig_counter});
+    } else if (!m_map_crypted_pqc_keys.contains(pubkey)) {
         m_map_pqc_keys[pubkey] = key;
         m_map_pqc_sig_counters[pubkey] = sig_counter;
     }
@@ -3062,11 +3144,80 @@ std::vector<CPQCPubKey> DescriptorScriptPubKeyMan::GetPQCKeys() const
     for (const auto& [pubkey, _] : m_map_crypted_pqc_keys) {
         keys.push_back(pubkey);
     }
-    for (const auto& [pubkey, _] : m_pending_plaintext_pqc_keys) {
-        if (m_map_pqc_keys.contains(pubkey) || m_map_crypted_pqc_keys.contains(pubkey)) continue;
-        keys.push_back(pubkey);
+    for (const auto* plaintext_keys : {&m_pending_plaintext_pqc_keys, &m_unencrypted_pqc_keys}) {
+        for (const auto& [pubkey, _] : *plaintext_keys) {
+            if (m_map_pqc_keys.contains(pubkey) || m_map_crypted_pqc_keys.contains(pubkey)) continue;
+            keys.push_back(pubkey);
+        }
     }
     return keys;
+}
+
+bool DescriptorScriptPubKeyMan::HasPQCKeysToReencrypt() const
+{
+    AssertLockHeld(cs_desc_man);
+    return m_storage.HasEncryptionKeys() && (!m_unencrypted_pqc_keys.empty() || !m_map_pqc_keys.empty());
+}
+
+util::Result<std::vector<ReencryptedPQCKey>> DescriptorScriptPubKeyMan::WriteReencryptedPQCKeys(WalletBatch& batch, const CKeyingMaterial& master_key) const
+{
+    AssertLockHeld(cs_desc_man);
+    std::vector<ReencryptedPQCKey> reencrypted;
+    if (!HasPQCKeysToReencrypt()) return reencrypted;
+
+    const uint256 desc_id{m_wallet_descriptor.id};
+    const auto reencrypt = [&](const CPQCPubKey& pubkey, const CKeyingMaterial& plaintext_secret, uint32_t plaintext_counter) EXCLUSIVE_LOCKS_REQUIRED(cs_desc_man) -> util::Result<void> {
+        const auto counter_it{m_map_pqc_sig_counters.find(pubkey)};
+        const uint32_t current_counter{counter_it != m_map_pqc_sig_counters.end() ? counter_it->second : 0};
+        ReencryptedPQCKey update{.pubkey = pubkey, .record = {}, .sig_counter = std::max(current_counter, plaintext_counter)};
+        CKeyingMaterial secret;
+        if (const auto crypted_it{m_map_crypted_pqc_keys.find(pubkey)}; crypted_it != m_map_crypted_pqc_keys.end()) {
+            // Keep the crypted key. Its auth tag covers the counter it was
+            // written with, which m_map_pqc_sig_counters holds.
+            CPQCKey key;
+            std::optional<uint256> legacy_auth_tag;
+            if (!DecryptPQCKey(master_key, desc_id, crypted_it->second, pubkey, current_counter, key, &legacy_auth_tag)) {
+                return util::Error{Untranslated("cannot decrypt the existing crypted record of a PQC key")};
+            }
+            update.record.crypted_secret = crypted_it->second.crypted_secret;
+            secret.assign(key.data(), key.data() + key.size());
+        } else {
+            secret = plaintext_secret;
+            if (!EncryptSecret(master_key, secret, GetPQCKeyIV(pubkey), update.record.crypted_secret)) {
+                return util::Error{Untranslated("cannot encrypt a plaintext PQC key")};
+            }
+        }
+        update.record.auth_tag = GetCryptedPQCKeyAuthTag(master_key, desc_id, pubkey, std::span<const unsigned char>{secret.data(), secret.size()}, update.sig_counter);
+        // Writing the crypted record erases the plaintext one in the same transaction.
+        if (!batch.WriteCryptedDescriptorPQCKey(desc_id, pubkey, update.record.crypted_secret, update.sig_counter, &*update.record.auth_tag)) {
+            return util::Error{Untranslated("cannot write a crypted PQC key record")};
+        }
+        reencrypted.push_back(std::move(update));
+        return {};
+    };
+
+    for (const auto& [pubkey, plaintext] : m_unencrypted_pqc_keys) {
+        if (auto res{reencrypt(pubkey, plaintext.secret, plaintext.sig_counter)}; !res) return util::Error{util::ErrorString(res)};
+    }
+    for (const auto& [pubkey, key] : m_map_pqc_keys) {
+        // Written above, with the higher of the counters.
+        if (m_unencrypted_pqc_keys.contains(pubkey)) continue;
+        const auto counter_it{m_map_pqc_sig_counters.find(pubkey)};
+        const uint32_t sig_counter{counter_it != m_map_pqc_sig_counters.end() ? counter_it->second : 0};
+        if (auto res{reencrypt(pubkey, CKeyingMaterial{key.data(), key.data() + key.size()}, sig_counter)}; !res) return util::Error{util::ErrorString(res)};
+    }
+    return reencrypted;
+}
+
+void DescriptorScriptPubKeyMan::ApplyReencryptedPQCKeys(const std::vector<ReencryptedPQCKey>& keys)
+{
+    AssertLockHeld(cs_desc_man);
+    for (const ReencryptedPQCKey& key : keys) {
+        m_map_crypted_pqc_keys[key.pubkey] = key.record;
+        m_map_pqc_sig_counters[key.pubkey] = key.sig_counter;
+        m_unencrypted_pqc_keys.erase(key.pubkey);
+        m_map_pqc_keys.erase(key.pubkey);
+    }
 }
 
 bool DescriptorScriptPubKeyMan::HasWalletDescriptor(const WalletDescriptor& desc) const

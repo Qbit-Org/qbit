@@ -20,14 +20,20 @@
 #include <common/args.h>
 #include <interfaces/wallet.h>
 #include <key_io.h>
+#include <psbt.h>
 #include <qt/bitcoinamountfield.h>
+#include <qt/psbtoperationsdialog.h>
 #include <qt/qvalidatedlineedit.h>
 #include <qt/sendcoinsdialog.h>
 #include <qt/sendcoinsentry.h>
 #include <qt/test/syntheticwallet.h>
+#include <qt/test/util.h>
 #include <qt/walletcontroller.h>
+#include <qt/walletframe.h>
 #include <qt/walletview.h>
+#include <streams.h>
 #include <univalue.h>
+#include <util/strencodings.h>
 #include <wallet/coincontrol.h>
 #include <wallet/wallet.h>
 #endif // ENABLE_WALLET
@@ -36,6 +42,7 @@
 #include <thread>
 
 #include <QAction>
+#include <QClipboard>
 #include <QDialogButtonBox>
 #include <QElapsedTimer>
 #include <QEvent>
@@ -106,6 +113,65 @@ void AcceptFeeBumpConfirmation()
     timer->start();
 }
 
+template <typename Predicate>
+bool WaitUntil(Predicate predicate, int timeout_ms)
+{
+    QElapsedTimer timer;
+    timer.start();
+    while (timer.elapsed() < timeout_ms) {
+        if (predicate()) return true;
+        QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+        QTest::qWait(10);
+    }
+    return predicate();
+}
+
+template <typename Predicate>
+bool SyntheticStateMatches(const std::shared_ptr<qt_test::SyntheticWalletState>& state, Predicate predicate)
+{
+    std::lock_guard lock{state->mutex};
+    return predicate(*state);
+}
+
+//! One input the synthetic wallet signs.
+PartiallySignedTransaction MakeShutdownPSBT()
+{
+    CMutableTransaction tx;
+    tx.vin.emplace_back(COutPoint{Txid{}, 0});
+    tx.vout.emplace_back(COIN - 1'000, CScript{} << OP_TRUE);
+    PartiallySignedTransaction psbt{tx};
+    psbt.inputs.front().witness_utxo = CTxOut{COIN, GetScriptForDestination(WitnessV0KeyHash{GenerateRandomKey().GetPubKey()})};
+    return psbt;
+}
+
+std::string SerializePSBT(const PartiallySignedTransaction& psbt)
+{
+    DataStream stream;
+    stream << psbt;
+    return stream.str();
+}
+
+// The PSBT dialogs are destroyed with the window after the test returns, and
+// their destructors join the workers, so never leave a worker latched.
+struct ReleasePSBTWorkersOnExit {
+    std::vector<std::shared_ptr<qt_test::SyntheticWalletState>> states;
+
+    ~ReleasePSBTWorkersOnExit()
+    {
+        for (const auto& state : states) {
+            if (!state) continue;
+            {
+                std::lock_guard lock{state->mutex};
+                state->allow_psbt_reservation = true;
+                state->allow_psbt_counter_boundary = true;
+                state->allow_psbt_completion = true;
+                state->allow_psbt_post_signing = true;
+            }
+            state->condition.notify_all();
+        }
+    }
+};
+
 bool WaitForIrreversibleFeeBumpSigning(const std::shared_ptr<qt_test::SyntheticWalletState>& state, int timeout_ms)
 {
     QElapsedTimer timer;
@@ -175,10 +241,13 @@ void AppTests::appTests()
     m_app.exec();
 
 #ifdef ENABLE_WALLET
+    const ReleasePSBTWorkersOnExit release_psbt_workers{{m_psbt_unreserved_state, m_psbt_reserved_state}};
     QVERIFY(m_shutdown_wallet_model);
     QVERIFY(m_shutdown_wallet_view);
     QVERIFY(m_shutdown_send_dialog);
     QVERIFY(m_shutdown_wallet_state);
+    QVERIFY(m_psbt_unreserved_state);
+    QVERIFY(m_psbt_reserved_state);
 
     const auto state{m_shutdown_wallet_state};
     const auto shutdown_start{std::chrono::steady_clock::now()};
@@ -204,6 +273,18 @@ void AppTests::appTests()
         }
         state->condition.notify_all();
     }};
+    // The PSBT worker past counter reservation cannot be cancelled and
+    // finishes after teardown hid its dialog and deleted the models.
+    std::thread psbt_signer_release{[psbt_state = m_psbt_reserved_state] {
+        std::this_thread::sleep_for(100ms);
+        {
+            std::lock_guard lock{psbt_state->mutex};
+            psbt_state->allow_psbt_completion = true;
+        }
+        psbt_state->condition.notify_all();
+    }};
+    const LogCapture log;
+    const auto psbt_files_before{UnshownPSBTFiles()};
 
     QEvent quit_event{QEvent::Quit};
     const bool quit_delivered{QCoreApplication::sendEvent(&m_app, &quit_event)};
@@ -222,6 +303,17 @@ void AppTests::appTests()
     state->condition.notify_all();
     watchdog.join();
     bump_signer_release.join();
+    psbt_signer_release.join();
+
+    // Nothing joins the PSBT worker paused before reservation during
+    // teardown, so it must observe the shutdown request on its own.
+    bool psbt_cancel_finished{false};
+    {
+        std::unique_lock lock{m_psbt_unreserved_state->mutex};
+        psbt_cancel_finished = m_psbt_unreserved_state->condition.wait_until(lock, shutdown_start + 5s, [this] {
+            return m_psbt_unreserved_state->psbt_sign_finished;
+        });
+    }
 
     bool worker_destroyed{false};
     uint64_t create_finished_sequence{0};
@@ -253,6 +345,16 @@ void AppTests::appTests()
     m_app.exec();
 
 #ifdef ENABLE_WALLET
+    // Both PSBT results arrive on the GUI thread after the dialogs were hidden
+    // and the wallet and client models deleted. The signed PSBT must be saved
+    // and logged instead of vanishing with the hidden dialog.
+    const bool psbt_signed_logged{WaitUntil([&] {
+        return !log.find({"PSBT signing finished after its dialog was shut down or destroyed", "The signed PSBT was saved to "}).empty();
+    }, 5000)};
+    const auto psbt_files_saved{NewUnshownPSBTFiles(psbt_files_before)};
+    const bool psbt_cancel_logged{WaitUntil([&] {
+        return !log.find({"PSBT signing was canceled because its dialog was shut down or destroyed."}).empty();
+    }, 5000)};
     bool cancel_observed{false};
     bool watchdog_released{false};
     bool locked{false};
@@ -273,6 +375,20 @@ void AppTests::appTests()
     QVERIFY(quit_delivered);
     QVERIFY2(!watchdog_released, "Qt wallet shutdown did not cancel the send worker within five seconds");
     QVERIFY(cancel_observed);
+    // The watchdog bounds only cancellation. This looser bound catches GUI
+    // teardown that turns slow after the workers are cancelled or joined.
+    QVERIFY2(teardown_returned_time - shutdown_start < 30s, "Qt wallet shutdown teardown exceeded thirty seconds");
+    QVERIFY2(psbt_cancel_finished, "Qt wallet shutdown did not cancel the PSBT signing worker within five seconds");
+    QVERIFY(SyntheticStateMatches(m_psbt_unreserved_state, [](const auto& value) {
+        return value.psbt_cancel_observed && !value.psbt_counters_reserved;
+    }));
+    QVERIFY(psbt_cancel_logged);
+    QVERIFY(SyntheticStateMatches(m_psbt_reserved_state, [](const auto& value) {
+        return value.psbt_sign_finished && value.psbt_counters_reserved && !value.psbt_cancel_observed;
+    }));
+    QVERIFY2(psbt_signed_logged, "Qt wallet shutdown dropped a PSBT signed after counter reservation without logging it");
+    QCOMPARE(psbt_files_saved.size(), size_t{1});
+    QVERIFY(psbt_files_saved.begin()->second == m_psbt_reserved_signed);
     // The dialog destroyed marker is recorded directly on this thread inside
     // teardown, after ~SendCoinsDialog joined its worker. Requiring worker
     // completion before it does not depend on scheduling after sendEvent
@@ -426,7 +542,53 @@ void AppTests::guiTests(BitcoinGUI* window)
     QVERIFY(m_shutdown_wallet_model->bumpFee(Txid{}));
     QVERIFY(WaitForIrreversibleFeeBumpSigning(m_shutdown_wallet_state, 5000));
 
-    QCOMPARE(window->findChildren<WalletView*>().size(), 3);
+    // PSBT dialogs are children of the wallet frame, not of a wallet view.
+    // Load one through File > Load PSBT from clipboard for each of two more
+    // wallets and leave its worker paused before or after counter reservation.
+    WalletFrame* const wallet_frame{window->findChild<WalletFrame*>()};
+    QVERIFY(wallet_frame);
+    m_psbt_unreserved_state = std::make_shared<qt_test::SyntheticWalletState>();
+    m_psbt_unreserved_state->wallet_name = "qt-shutdown-psbt-unreserved";
+    m_psbt_unreserved_state->psbt_simulate_pqc_reservation = true;
+    m_psbt_unreserved_state->allow_psbt_reservation = false;
+    m_psbt_reserved_state = std::make_shared<qt_test::SyntheticWalletState>();
+    m_psbt_reserved_state->wallet_name = "qt-shutdown-psbt-reserved";
+    m_psbt_reserved_state->psbt_simulate_pqc_reservation = true;
+    m_psbt_reserved_state->allow_psbt_completion = false;
+    const PartiallySignedTransaction psbt{MakeShutdownPSBT()};
+    PartiallySignedTransaction signed_psbt{psbt};
+    signed_psbt.inputs.front().final_script_witness.stack = {{0x01}};
+    m_psbt_reserved_signed = SerializePSBT(signed_psbt);
+    for (const auto& psbt_state : {m_psbt_unreserved_state, m_psbt_reserved_state}) {
+        QSignalSpy psbt_wallet_added_spy(controller, &WalletController::walletAdded);
+        QVERIFY(psbt_wallet_added_spy.isValid());
+        const auto adopted{std::make_shared<QPointer<WalletModel>>()};
+        auto* activity{new TestWalletAdoptionActivity(controller, window)};
+        activity->adopt(
+            qt_test::MakeSyntheticWallet(wallet::PQCUsageReport{}, psbt_state),
+            [adopted, activity](WalletModel* model) {
+                *adopted = model;
+                activity->deleteLater();
+            });
+        if (!*adopted) QVERIFY(psbt_wallet_added_spy.wait(5000));
+        QVERIFY(*adopted);
+        window->setCurrentWallet(*adopted);
+        QCOMPARE(wallet_frame->currentWalletModel(), adopted->data());
+
+        const QList<PSBTOperationsDialog*> existing{wallet_frame->findChildren<PSBTOperationsDialog*>()};
+        QApplication::clipboard()->setText(QString::fromStdString(EncodeBase64(SerializePSBT(psbt))));
+        wallet_frame->gotoLoadPSBT(/*from_clipboard=*/true);
+        PSBTOperationsDialog* dialog{nullptr};
+        for (PSBTOperationsDialog* candidate : wallet_frame->findChildren<PSBTOperationsDialog*>()) {
+            if (!existing.contains(candidate)) dialog = candidate;
+        }
+        QVERIFY(dialog);
+        dialog->signTransaction();
+    }
+    QVERIFY(WaitUntil([this] { return SyntheticStateMatches(m_psbt_unreserved_state, [](const auto& value) { return value.psbt_sign_entered; }); }, 5000));
+    QVERIFY(WaitUntil([this] { return SyntheticStateMatches(m_psbt_reserved_state, [](const auto& value) { return value.psbt_counters_reserved; }); }, 5000));
+
+    QCOMPARE(window->findChildren<WalletView*>().size(), 5);
 #endif // ENABLE_WALLET
 
     connect(window, &BitcoinGUI::consoleShown, this, &AppTests::consoleTests);

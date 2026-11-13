@@ -19,7 +19,6 @@ on:
       - 1.0.0
       - 1.x.x
       - 1.1.0
-      - develop
   push:
     branches:
       - main
@@ -27,7 +26,6 @@ on:
       - 1.0.0
       - 1.x.x
       - 1.1.0
-      - develop
   merge_group:
     branches:
       - main
@@ -35,14 +33,9 @@ on:
       - 1.0.0
       - 1.x.x
       - 1.1.0
-      - develop
 
 permissions:
   contents: read
-  checks: read
-  # The gate reads workflow runs, its own and those behind the checks it
-  # waits for, to tell which event produced a failed check.
-  actions: read
 
 concurrency:
   group: required-merge-gate-${{ github.event_name != 'pull_request' && github.run_id || github.ref }}
@@ -89,7 +82,7 @@ jobs:
               echo "::error::Pull request base SHA is unavailable."
               exit 1
             fi
-            git diff --name-only --no-renames "${BASE_SHA}...HEAD" > "${changed_files}"
+            git diff --no-renames --name-only "${BASE_SHA}...HEAD" > "${changed_files}"
           elif [[ "${EVENT_NAME}" == "merge_group" ]]; then
             base_branch="${BASE_REF#refs/heads/}"
             if [[ -z "${base_branch}" ]]; then
@@ -97,15 +90,15 @@ jobs:
               exit 1
             fi
             git fetch --no-tags --prune origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"
-            git diff --name-only --no-renames "origin/${base_branch}...HEAD" > "${changed_files}"
+            git diff --no-renames --name-only "origin/${base_branch}...HEAD" > "${changed_files}"
           elif [[ "${EVENT_NAME}" == "push" ]]; then
             if [[ -n "${BEFORE_SHA}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
-              git diff --name-only --no-renames "${BEFORE_SHA}..HEAD" > "${changed_files}"
+              git diff --no-renames --name-only "${BEFORE_SHA}..HEAD" > "${changed_files}"
             else
               git fetch --no-tags --prune origin "${DEFAULT_BRANCH}"
               merge_base="$(git merge-base "origin/${DEFAULT_BRANCH}" HEAD 2>/dev/null || true)"
               if [[ -n "${merge_base}" ]]; then
-                git diff --name-only --no-renames "${merge_base}...HEAD" > "${changed_files}"
+                git diff --no-renames --name-only "${merge_base}...HEAD" > "${changed_files}"
               else
                 git diff-tree --no-commit-id --name-only -r HEAD > "${changed_files}"
               fi
@@ -134,12 +127,26 @@ jobs:
       - name: Test classifier workflow contract
         run: /usr/bin/python3 ci/checks/test_classifier_ci_contract.py -v
 
+      # A changed-file list that hides the source side of a rename routes a
+      # source change to a lightweight profile.
+      - name: Test changed-file listing contract
+        run: /usr/bin/python3 ci/checks/test_changed_files_contract.py -v
+
       # The gate's waiting loop is what turns other checks into this required
       # check. Run its contract here, in a job the gate depends on, so a
       # regression that would let the gate pass on an unread or failed check
       # fails classification instead.
       - name: Test merge gate polling contract
         run: /usr/bin/python3 ci/checks/test_merge_gate_poller.py -v
+
+      # The operator-key step must tie a changed policy to the base's: lift it
+      # out of this workflow and run it against scratch key-policy histories.
+      - name: Test operator key policy gate contract
+        run: /usr/bin/python3 ci/checks/test_key_policy_gate_contract.py -v
+
+      # The base-only Key Policy Gate job (key-policy-gate.yml), run the same way.
+      - name: Test base-only key policy gate contract
+        run: /usr/bin/python3 ci/checks/test_key_policy_gate_target.py -v
 
       # Job selection, source resolution and unit-test evidence of the PQ and
       # nightly workflows, which run outside pull requests, the nightly
@@ -184,99 +191,35 @@ jobs:
         run: |
           set -euo pipefail
 
-          canonical_dir="contrib/keys/operator-keys"
-          mirror_dir="contrib/guix/repo-templates/qbit-guix.sigs/operator-keys"
-          validator_args=(
-            --operator-policy "${canonical_dir}/keys.json"
-            --operator-keys-dir "${canonical_dir}"
-            --operator-policy-mirror "${mirror_dir}/keys.json"
-            --operator-keys-dir-mirror "${mirror_dir}"
-            --require-public-key-files
-          )
+          # contrib/keys/operator-keys is the only copy of the release key
+          # policy in this repository. Mirrors and downstream pins are checked
+          # against it by their own consumers (see contrib/keys/README.md).
 
-          policy_sequence="$(
-            jq -er '.policy_sequence | select(type == "number")' "${canonical_dir}/keys.json"
-          )"
-          if (( policy_sequence > 1 )); then
-            previous_policy_sha256="$(
-              jq -er '.previous_policy_sha256 | select(type == "string")' \
-                "${canonical_dir}/keys.json"
-            )"
-            history_root=""
-            if [[ "${EVENT_NAME}" == "pull_request" || "${EVENT_NAME}" == "merge_group" ]]; then
-              history_root="${BASE_SHA}"
-            elif [[ "${EVENT_NAME}" == "push" && -n "${BEFORE_SHA}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
-              history_root="${BEFORE_SHA}"
-            elif git rev-parse --verify HEAD^ >/dev/null 2>&1; then
-              history_root="$(git rev-parse HEAD^)"
-            fi
-
-            if [[ -z "${history_root}" ]]; then
-              echo "::error::Unable to identify trusted history for previous operator policy discovery."
-              exit 1
-            fi
-
-            previous_commit=""
-            while IFS= read -r candidate_commit; do
-              if ! git cat-file -e "${candidate_commit}:${canonical_dir}/keys.json" 2>/dev/null; then
-                continue
-              fi
-              candidate_sha256="$(
-                git show "${candidate_commit}:${canonical_dir}/keys.json" \
-                  | sha256sum \
-                  | cut -d ' ' -f 1
-              )"
-              if [[ "${candidate_sha256}" == "${previous_policy_sha256}" ]]; then
-                previous_commit="${candidate_commit}"
-                break
-              fi
-            done < <(git rev-list "${history_root}" -- "${canonical_dir}/keys.json")
-
-            if [[ -z "${previous_commit}" ]]; then
-              echo "::error::Previous operator policy ${previous_policy_sha256} is not present in trusted base history."
-              exit 1
-            fi
-
-            previous_root="${RUNNER_TEMP}/previous-operator-policy"
-            mkdir -p "${previous_root}"
-            git archive "${previous_commit}" "${canonical_dir}" | tar -x -C "${previous_root}"
-            validator_args+=(
-              --previous-operator-policy "${previous_root}/${canonical_dir}/keys.json"
-            )
+          # The policy is checked against the base's: a changed keys.json must
+          # follow the base policy directly, with approvals verified against the
+          # base policy and certificates; certificates changed under an
+          # unchanged keys.json get continuity checks. An empty base directory
+          # means the base has no policy.
+          base=""
+          if [[ "${EVENT_NAME}" == "pull_request" || "${EVENT_NAME}" == "merge_group" ]]; then
+            base="${BASE_SHA}"
+          elif [[ "${EVENT_NAME}" == "push" && -n "${BEFORE_SHA}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
+            base="${BEFORE_SHA}"
+          elif git rev-parse --verify HEAD^ >/dev/null 2>&1; then
+            base="$(git rev-parse HEAD^)"
+          fi
+          if [[ -z "${base}" ]] || ! git rev-parse --verify --quiet "${base}^{commit}" >/dev/null; then
+            echo "::error::Unable to identify the base commit for operator policy validation."
+            exit 1
           fi
 
-          python3 ci/release/validate_key_metadata.py "${validator_args[@]}"
-
-      - name: Validate exact operator-key mirror
-        run: |
-          set -euo pipefail
-          PYTHONPATH=ci/release python3 - <<'PY'
-          import json
-          from pathlib import Path
-
-          from validate_builder_attestations import load_builder_policy, validate_builder_mirror
-
-          canonical_dir = Path("contrib/keys/operator-keys")
-          mirror_dir = Path("contrib/guix/repo-templates/qbit-guix.sigs/operator-keys")
-          release_lines = json.loads(
-              (canonical_dir / "keys.json").read_text(encoding="utf8")
-          )["release_lines"]
-
-          for release_line in sorted(release_lines):
-              policy = load_builder_policy(
-                  canonical_dir / "keys.json",
-                  canonical_dir,
-                  release_line,
-              )
-              validate_builder_mirror(
-                  policy,
-                  canonical_dir,
-                  mirror_dir / "keys.json",
-                  mirror_dir,
-                  release_line,
-              )
-              print(f"Exact operator-key mirror validated for {release_line}")
-          PY
+          # Both policies are read from git objects, never from a checkout or an
+          # archive, and checked by ci/release/key_policy_gate.py: the trees,
+          # attributes and case-insensitive paths, then this checkout's
+          # validator and the base's own (see contrib/keys/README.md).
+          pycache="$(mktemp -d "${RUNNER_TEMP}/key-policy-pycache.XXXXXX")"
+          /usr/bin/python3 -I -B -X "pycache_prefix=${pycache}" ci/release/key_policy_gate.py policy \
+            --base "${base}" --head HEAD --work "${RUNNER_TEMP}/key-policy"
 
   release-policy-validation:
     name: release-policy validation
@@ -311,7 +254,7 @@ jobs:
               exit 1
             fi
             diff_range="${BASE_SHA}...HEAD"
-            git diff --name-only --no-renames "${diff_range}" > "${changed_files}"
+            git diff --no-renames --name-only "${diff_range}" > "${changed_files}"
           elif [[ "${EVENT_NAME}" == "merge_group" ]]; then
             base_branch="${BASE_REF#refs/heads/}"
             if [[ -z "${base_branch}" ]]; then
@@ -320,17 +263,17 @@ jobs:
             fi
             git fetch --no-tags --prune origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"
             diff_range="origin/${base_branch}...HEAD"
-            git diff --name-only --no-renames "${diff_range}" > "${changed_files}"
+            git diff --no-renames --name-only "${diff_range}" > "${changed_files}"
           elif [[ "${EVENT_NAME}" == "push" ]]; then
             if [[ -n "${BEFORE_SHA}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
               diff_range="${BEFORE_SHA}..HEAD"
-              git diff --name-only --no-renames "${diff_range}" > "${changed_files}"
+              git diff --no-renames --name-only "${diff_range}" > "${changed_files}"
             else
               git fetch --no-tags --prune origin "${DEFAULT_BRANCH}"
               merge_base="$(git merge-base "origin/${DEFAULT_BRANCH}" HEAD 2>/dev/null || true)"
               if [[ -n "${merge_base}" ]]; then
                 diff_range="${merge_base}...HEAD"
-                git diff --name-only --no-renames "${diff_range}" > "${changed_files}"
+                git diff --no-renames --name-only "${diff_range}" > "${changed_files}"
               else
                 git diff-tree --no-commit-id --name-only -r HEAD > "${changed_files}"
               fi
@@ -376,10 +319,10 @@ jobs:
 
           tests=(
             ci.release.test_publish_local_release
+            ci.release.test_release_staging_tools
             ci.release.test_validate_builder_attestations
             ci.release.test_validate_key_metadata
             ci.release.test_validate_release_artifacts
-            ci.release.test_verify_mainnet_ci_posture
             ci.release.test_verify_mainnet_release_posture
             ci.release.test_verify_p2mr_v1_conformance
           )
@@ -430,7 +373,7 @@ jobs:
               exit 1
             fi
             diff_range="${BASE_SHA}...HEAD"
-            git diff --name-only --no-renames "${diff_range}" > "${changed_files}"
+            git diff --no-renames --name-only "${diff_range}" > "${changed_files}"
           elif [[ "${EVENT_NAME}" == "merge_group" ]]; then
             base_branch="${BASE_REF#refs/heads/}"
             if [[ -z "${base_branch}" ]]; then
@@ -439,17 +382,17 @@ jobs:
             fi
             git fetch --no-tags --prune origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"
             diff_range="origin/${base_branch}...HEAD"
-            git diff --name-only --no-renames "${diff_range}" > "${changed_files}"
+            git diff --no-renames --name-only "${diff_range}" > "${changed_files}"
           elif [[ "${EVENT_NAME}" == "push" ]]; then
             if [[ -n "${BEFORE_SHA}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
               diff_range="${BEFORE_SHA}..HEAD"
-              git diff --name-only --no-renames "${diff_range}" > "${changed_files}"
+              git diff --no-renames --name-only "${diff_range}" > "${changed_files}"
             else
               git fetch --no-tags --prune origin "${DEFAULT_BRANCH}"
               merge_base="$(git merge-base "origin/${DEFAULT_BRANCH}" HEAD 2>/dev/null || true)"
               if [[ -n "${merge_base}" ]]; then
                 diff_range="${merge_base}...HEAD"
-                git diff --name-only --no-renames "${diff_range}" > "${changed_files}"
+                git diff --no-renames --name-only "${diff_range}" > "${changed_files}"
               else
                 git diff-tree --no-commit-id --name-only -r HEAD > "${changed_files}"
               fi
@@ -516,7 +459,7 @@ jobs:
               exit 1
             fi
             diff_range="${BASE_SHA}...HEAD"
-            git diff --name-only --no-renames "${diff_range}" > "${changed_files}"
+            git diff --no-renames --name-only "${diff_range}" > "${changed_files}"
           elif [[ "${EVENT_NAME}" == "merge_group" ]]; then
             base_branch="${BASE_REF#refs/heads/}"
             if [[ -z "${base_branch}" ]]; then
@@ -525,17 +468,17 @@ jobs:
             fi
             git fetch --no-tags --prune origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"
             diff_range="origin/${base_branch}...HEAD"
-            git diff --name-only --no-renames "${diff_range}" > "${changed_files}"
+            git diff --no-renames --name-only "${diff_range}" > "${changed_files}"
           elif [[ "${EVENT_NAME}" == "push" ]]; then
             if [[ -n "${BEFORE_SHA}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
               diff_range="${BEFORE_SHA}..HEAD"
-              git diff --name-only --no-renames "${diff_range}" > "${changed_files}"
+              git diff --no-renames --name-only "${diff_range}" > "${changed_files}"
             else
               git fetch --no-tags --prune origin "${DEFAULT_BRANCH}"
               merge_base="$(git merge-base "origin/${DEFAULT_BRANCH}" HEAD 2>/dev/null || true)"
               if [[ -n "${merge_base}" ]]; then
                 diff_range="${merge_base}...HEAD"
-                git diff --name-only --no-renames "${diff_range}" > "${changed_files}"
+                git diff --no-renames --name-only "${diff_range}" > "${changed_files}"
               else
                 git diff-tree --no-commit-id --name-only -r HEAD > "${changed_files}"
               fi
@@ -599,7 +542,7 @@ jobs:
               exit 1
             fi
             diff_range="${BASE_SHA}...HEAD"
-            git diff --name-only --no-renames "${diff_range}" > "${changed_files}"
+            git diff --no-renames --name-only "${diff_range}" > "${changed_files}"
           elif [[ "${EVENT_NAME}" == "merge_group" ]]; then
             base_branch="${BASE_REF#refs/heads/}"
             if [[ -z "${base_branch}" ]]; then
@@ -608,17 +551,17 @@ jobs:
             fi
             git fetch --no-tags --prune origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"
             diff_range="origin/${base_branch}...HEAD"
-            git diff --name-only --no-renames "${diff_range}" > "${changed_files}"
+            git diff --no-renames --name-only "${diff_range}" > "${changed_files}"
           elif [[ "${EVENT_NAME}" == "push" ]]; then
             if [[ -n "${BEFORE_SHA}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
               diff_range="${BEFORE_SHA}..HEAD"
-              git diff --name-only --no-renames "${diff_range}" > "${changed_files}"
+              git diff --no-renames --name-only "${diff_range}" > "${changed_files}"
             else
               git fetch --no-tags --prune origin "${DEFAULT_BRANCH}"
               merge_base="$(git merge-base "origin/${DEFAULT_BRANCH}" HEAD 2>/dev/null || true)"
               if [[ -n "${merge_base}" ]]; then
                 diff_range="${merge_base}...HEAD"
-                git diff --name-only --no-renames "${diff_range}" > "${changed_files}"
+                git diff --no-renames --name-only "${diff_range}" > "${changed_files}"
               else
                 git diff-tree --no-commit-id --name-only -r HEAD > "${changed_files}"
               fi
@@ -658,6 +601,10 @@ jobs:
           import json
           from pathlib import Path
 
+          # main and 1.x.x also require the base-only Key Policy Gate under
+          # their own check name, from the GitHub Actions app, an up-to-date
+          # branch, and code-owner review.
+          key_policy_branches = {"main.json": "Key Policy Gate (main)", "1.x.x.json": "Key Policy Gate (1.x.x)"}
           for path in (
               Path(".github/rulesets/main.json"),
               Path(".github/rulesets/1.0.0.json"),
@@ -666,15 +613,35 @@ jobs:
               Path(".github/rulesets/0.1.x.json"),
           ):
               data = json.loads(path.read_text(encoding="utf8"))
-              contexts = []
+              checks = []
               strict = None
+              code_owner_review = None
+              unattributed = None
               for rule in data.get("rules", []):
+                  parameters = rule.get("parameters", {})
                   if rule.get("type") == "required_status_checks":
-                      parameters = rule.get("parameters", {})
                       checks = parameters.get("required_status_checks", [])
-                      contexts = [check.get("context") for check in checks]
                       strict = parameters.get("strict_required_status_checks_policy")
-                      break
+                  if rule.get("type") == "pull_request":
+                      code_owner_review = parameters.get("require_code_owner_review")
+                      unattributed = parameters.get("require_extra_approval_for_unattributed_changes")
+              # The live rulesets require it; a template without it would drop it.
+              if unattributed is not True:
+                  raise SystemExit(f"{path}: require_extra_approval_for_unattributed_changes must be true")
+              contexts = [check.get("context") for check in checks]
+              if path.name in key_policy_branches:
+                  gate_check = key_policy_branches[path.name]
+                  expected = ["Required Merge Gate", gate_check]
+                  key_check = next((check for check in checks if check.get("context") == gate_check), {})
+                  if contexts != expected or key_check.get("integration_id") != 15368:
+                      raise SystemExit(
+                          f"{path}: required status checks must be {expected!r}, with {gate_check} "
+                          f"from integration 15368, got {checks!r}"
+                      )
+                  if strict is not True or code_owner_review is not True:
+                      raise SystemExit(f"{path}: strict status checks and code-owner review must be required")
+                  print(f"{path}: Required Merge Gate and {gate_check} (strict, code-owner review)")
+                  continue
               if contexts != ["Required Merge Gate"]:
                   raise SystemExit(
                       f"{path}: required status checks must be exactly ['Required Merge Gate'], got {contexts!r}"
@@ -711,9 +678,15 @@ jobs:
       - rpc-docs-validation
       - public-docs-validation
       - github-metadata-validation
-    if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.draft != true) }}
+    # Drafts run the gate too, and fail it. A job its condition skips leaves
+    # a skipped check, which branch protection accepts as passing.
+    if: ${{ always() }}
     runs-on: ubuntu-24.04
     timeout-minutes: 360
+    # Only this job reads other workflows' runs and check runs.
+    permissions:
+      actions: read
+      checks: read
     steps:
       - name: Check required validation profile
         env:
@@ -729,9 +702,21 @@ jobs:
           TOUCHED_OPERATOR_KEYS: ${{ needs.classify-changes.outputs.touched_operator_keys }}
           REPOSITORY: ${{ github.repository }}
           SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
           RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
+
+          if [[ "${EVENT_NAME}" == "pull_request" && "${PR_DRAFT}" != "false" ]]; then
+            if [[ "${PR_DRAFT}" == "true" ]]; then
+              echo "::error title=Required Merge Gate failed::Pull request #${PR_NUMBER} is a draft: draft pull requests are not mergeable. Mark it ready for review to run the gate."
+            else
+              echo "::error title=Required Merge Gate failed::Pull request draft state '${PR_DRAFT}' could not be read."
+            fi
+            exit 1
+          fi
 
           if [[ "${CLASSIFY_CHANGES_RESULT}" != "success" ]]; then
             echo "::error title=Required Merge Gate failed::Change classification result was ${CLASSIFY_CHANGES_RESULT}."
@@ -774,22 +759,110 @@ jobs:
             fi
           done
 
+          # The waits below read only the workflow runs this event started,
+          # so they need the event and this gate's own run.
+          case "${EVENT_NAME}" in
+            pull_request)
+              if [[ ! "${PR_NUMBER}" =~ ^[1-9][0-9]*$ ]]; then
+                echo "::error title=Required Merge Gate failed::Pull request number '${PR_NUMBER}' could not be read."
+                exit 1
+              fi
+              pr_json="${PR_NUMBER}"
+              ;;
+            push | merge_group)
+              pr_json=null
+              ;;
+            *)
+              echo "::error title=Required Merge Gate failed::Unsupported event ${EVENT_NAME}."
+              exit 1
+              ;;
+          esac
+          if [[ ! "${RUN_ID}" =~ ^[1-9][0-9]*$ || ! "${SHA}" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]; then
+            echo "::error title=Required Merge Gate failed::Run ID '${RUN_ID}' or head SHA '${SHA}' could not be read."
+            exit 1
+          fi
+
+          # The workflows that report the checks the profiles wait for. Both
+          # run for every event this gate runs for, so each wait reads the run
+          # its own event started.
+          WORKFLOW_PATHS=(.github/workflows/ci.yml .github/workflows/core-checks.yml)
+          workflow_of() {
+            case "$1" in
+              "Full Validation Gate" | rpc-docs | public-docs-lint)
+                echo ".github/workflows/ci.yml"
+                ;;
+              "Core Checks Gate")
+                echo ".github/workflows/core-checks.yml"
+                ;;
+              *)
+                return 1
+                ;;
+            esac
+          }
+
+          # The runs one event starts are created up to a second or two
+          # apart, in either order: Full Validation and Core Checks have been
+          # stamped a second before the gate run of the same event. Events
+          # closer together than this cannot be told apart by creation time,
+          # so for them the newest run wins.
+          SIBLING_RUN_SKEW_SECONDS=60
+
+          # Selection contract, applied to the slurped pages of /actions/runs
+          # for ${SHA} and this event:
+          #
+          # * a page without a workflow_runs array is malformed, and this
+          #   gate's own run must be listed. It fixes the head branch and
+          #   repository, and whether GitHub ties these runs to pull request
+          #   $pr; GitHub ties none to a fork's head branch;
+          # * a run of a workflow counts only if it matches all of that and
+          #   was created at most $skew seconds before this gate run. A run
+          #   created at least $skew seconds after the previous gate run for
+          #   the same head counts too: that is too late to be the previous
+          #   event's;
+          # * the newest run that counts wins. A re-run keeps its run and its
+          #   check suite, so its check runs are read from that suite;
+          # * the output is one line per workflow, in $workflows order: the
+          #   path, then "absent" or the run's check suite, ID and creation
+          #   time.
+          # The $ names are jq variables bound by --arg and --argjson below.
+          # shellcheck disable=SC2016
+          workflow_run_filter='
+            def created: .created_at | fromdateiso8601;
+            def for_pr: $pr != null and any(.pull_requests[]?; .number == $pr);
+            if type != "array" or length == 0 then error("empty workflow-runs response") else . end
+            | map(if (.workflow_runs | type) == "array" then .workflow_runs else error("malformed workflow-runs page") end)
+            | add
+            | map(select(.event == $event and .head_sha == $sha))
+            | (map(select(.id == $run_id)) | if length == 1 then .[0] else error("run \($run_id) is not listed") end) as $self
+            | ($self | created) as $self_created
+            | map(select(
+                .head_branch == $self.head_branch
+                and .head_repository.id == $self.head_repository.id
+                and for_pr == ($self | for_pr)
+              ))
+            | . as $runs
+            | ([$runs[] | select(.path == $self.path and ([created, .id] < [$self_created, $self.id])) | created] | max) as $previous
+            | ([$self_created - $skew, ($previous // empty) + $skew] | min) as $floor
+            | $workflows
+            | split(" ")
+            | .[]
+            | . as $path
+            | [$runs[] | select(.path == $path and created >= $floor)]
+            | max_by([created, .id])
+            | if . == null then [$path, "absent"] else [$path, .check_suite_id, .id, .created_at] end
+            | @tsv
+          '
+
           # Selection contract, applied to the slurped pages of
-          # /commits/{sha}/check-runs:
+          # /check-suites/{id}/check-runs:
           #
           # * a page without a check_runs array is malformed and must never be
-          #   mistaken for "this commit has no check runs";
-          # * every check run with the name is reported, one per line, oldest
-          #   first by started_at (created_at while a run has not started): a
-          #   re-run check appears more than once, and so does a check that
-          #   more than one event ran (judge_check below picks the one that
-          #   decides);
+          #   mistaken for "this suite has no check runs";
+          # * a re-run check appears more than once, so the newest run by
+          #   started_at (created_at while a run has not started) wins;
           # * "absent" means the query succeeded and reported no run with that
           #   name, which is a different fact from a query that could not be
-          #   read at all;
-          # * each check run's check suite travels with it: it names the
-          #   workflow run, and so the event, that produced the check (see
-          #   date_check_suite below).
+          #   read at all.
           # $name is a jq variable bound by --arg below, not a shell expansion.
           # shellcheck disable=SC2016
           check_run_filter='
@@ -798,44 +871,82 @@ jobs:
             | add
             | map(select(.name == $name))
             | sort_by(.started_at // .created_at // "")
-            | if length == 0 then "absent"
-              else .[] | ["found", (.status // ""), (.conclusion // ""), (((.check_suite // {}).id // "") | tostring), (.started_at // .created_at // "")] | @tsv
-              end
+            | last
+            | if . == null then "absent" else ["found", (.status // ""), (.conclusion // "")] | @tsv end
           '
-          # "found<TAB>status<TAB>conclusion<TAB>check suite id<TAB>started_at"
-          check_run_line=$'found\t[a-z_]+\t[^\t\n]*\t[^\t\n]*\t[^\t\n]*'
-          check_run_pattern="^(absent|${check_run_line}("$'\n'"${check_run_line})*)\$"
 
           summarize_stderr() {
             tr '\n' ' ' < "$1" | cut -c1-300
           }
 
-          # GET the API path $4 with `gh api --paginate`, pass the slurped
-          # pages through the jq program $6 (arguments from $7 on go to jq),
-          # and trust the result only if it matches the bash regex $5. $1
-          # names the check for the log and $2 what is read.
+          # Whether $1 is a check-run observation: "absent", or
+          # "found<TAB>status<TAB>conclusion" with a status GitHub could send.
+          is_check_run_observation() {
+            local fields
+
+            case "$1" in
+              absent)
+                return 0
+                ;;
+              found$'\t'*)
+                fields="${1#found$'\t'}"
+                if [[ "${fields%%$'\t'*}" =~ ^[a-z_]+$ ]]; then
+                  return 0
+                fi
+                ;;
+            esac
+            return 1
+          }
+
+          # Whether $1 is a workflow-runs observation: exactly one line for
+          # each workflow, in WORKFLOW_PATHS order.
+          is_workflow_runs_observation() {
+            local line
+            local index=0
+            local pattern=$'^([^\t]+)\t(absent|[1-9][0-9]*\t[1-9][0-9]*\t[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z)$'
+
+            while IFS= read -r line; do
+              if (( index >= ${#WORKFLOW_PATHS[@]} )) \
+                || [[ ! "${line}" =~ ${pattern} ]] \
+                || [[ "${BASH_REMATCH[1]}" != "${WORKFLOW_PATHS[index]}" ]]; then
+                return 1
+              fi
+              index=$((index + 1))
+            done <<< "$1"
+
+            if (( index == ${#WORKFLOW_PATHS[@]} )); then
+              return 0
+            fi
+            return 1
+          }
+
+          # Read the paginated listing at $4 and reduce it with the jq program
+          # $6; any further arguments go to jq ahead of the program. $1 names
+          # the listing and $2 what it is read for, in the log.
           #
-          # On success sets API_RESULT and returns 0. Returns 1 when the path
-          # could not be read within GATE_QUERY_MAX_ATTEMPTS attempts or
-          # before $3, the wall-clock deadline shared with the caller: an
-          # unreadable response is never success and never "not found yet".
+          # On success sets QUERY_OBSERVATION to the program's output, once
+          # the function named $5 has accepted it, and returns 0. Returns 1
+          # when the listing could not be read within GATE_QUERY_MAX_ATTEMPTS
+          # attempts or before $3, the wall-clock deadline shared with the
+          # caller: an unreadable query is never success and never "not found
+          # yet".
           #
           # The result travels in a variable rather than on stdout because this
           # function also logs there, and errexit is not in force for a function
           # called from a condition, so every failure is handled explicitly.
-          read_api() {
-            local check_name="$1"
-            local what="$2"
+          query_api() {
+            local kind="$1"
+            local label="$2"
             local deadline="$3"
-            local path="$4"
-            local pattern="$5"
+            local endpoint="$4"
+            local accept="$5"
             local filter="$6"
             shift 6
             local attempt=1
             local backoff="${GATE_QUERY_BACKOFF_SECONDS}"
-            local body reason result stderr_path now rc
+            local body observation reason stderr_path now rc
 
-            API_RESULT=""
+            QUERY_OBSERVATION=""
 
             while (( attempt <= GATE_QUERY_MAX_ATTEMPTS )); do
               stderr_path="$(mktemp)"
@@ -844,32 +955,32 @@ jobs:
                 timeout "${GATE_QUERY_TIMEOUT_SECONDS}" gh api \
                   -H "Accept: application/vnd.github+json" \
                   --paginate \
-                  "${path}" \
+                  "${endpoint}" \
                   2>"${stderr_path}"
               )" || rc=$?
 
               if (( rc != 0 )); then
-                reason="${what} query failed (exit ${rc}): $(summarize_stderr "${stderr_path}")"
+                reason="${kind} query failed (exit ${rc}): $(summarize_stderr "${stderr_path}")"
               else
                 rc=0
-                result="$(
+                observation="$(
                   printf '%s' "${body}" \
                     | jq -e -r -s "$@" "${filter}" 2>"${stderr_path}"
                 )" || rc=$?
 
                 if (( rc != 0 )); then
-                  reason="${what} response could not be read (jq exit ${rc}): $(summarize_stderr "${stderr_path}")"
-                elif [[ "${result}" =~ ${pattern} ]]; then
+                  reason="${kind} response could not be read (jq exit ${rc}): $(summarize_stderr "${stderr_path}")"
+                elif "${accept}" "${observation}"; then
                   rm -f "${stderr_path}"
-                  API_RESULT="${result}"
+                  QUERY_OBSERVATION="${observation}"
                   return 0
                 else
-                  reason="${what} response was malformed: ${result}"
+                  reason="${kind} response was malformed: $(printf '%s' "${observation}" | tr '\n' ' ' | cut -c1-300)"
                 fi
               fi
 
               rm -f "${stderr_path}"
-              echo "::warning title=Required Merge Gate retrying::${check_name}: ${reason} (attempt ${attempt}/${GATE_QUERY_MAX_ATTEMPTS})"
+              echo "::warning title=Required Merge Gate retrying::${label}: ${reason} (attempt ${attempt}/${GATE_QUERY_MAX_ATTEMPTS})"
 
               attempt=$((attempt + 1))
               if (( attempt > GATE_QUERY_MAX_ATTEMPTS )); then
@@ -878,7 +989,7 @@ jobs:
 
               now="$(date +%s)"
               if (( now + backoff > deadline )); then
-                echo "${check_name}: wait deadline reached while the ${what} query was unreadable"
+                echo "${label}: wait deadline reached while the ${kind} query was unreadable"
                 break
               fi
 
@@ -892,391 +1003,66 @@ jobs:
             return 1
           }
 
-          # Read every check run named $1 on ${SHA}.
-          #
-          # On success sets QUERY_OBSERVATION to "absent" or to one line per
-          # check run (see check_run_pattern) and returns 0. Returns 1 when the
-          # query could not be read (see read_api; $2 is the deadline).
+          # Read the newest check run named $1 in check suite $2, before the
+          # deadline $3. QUERY_OBSERVATION becomes "absent" or
+          # "found<TAB>status<TAB>conclusion".
           query_check_run() {
-            QUERY_OBSERVATION=""
-            read_api "$1" "check-runs" "$2" \
-              "/repos/${REPOSITORY}/commits/${SHA}/check-runs?per_page=100" \
-              "${check_run_pattern}" "${check_run_filter}" --arg name "$1" || return 1
-            QUERY_OBSERVATION="${API_RESULT}"
+            query_api check-runs "$1" "$3" \
+              "/repos/${REPOSITORY}/check-suites/$2/check-runs?per_page=100" \
+              is_check_run_observation "${check_run_filter}" \
+              --arg name "$1"
           }
 
-          # Which event a check belongs to.
-          #
-          # When CI runs again on a commit (a reopen, a label, a re-run), this
-          # gate starts within seconds, but Core Checks and Full Validation
-          # create their gate checks only at their last job, minutes later.
-          # Until then the newest check of that name is an earlier event's,
-          # and its failure says nothing about the run under way. A cutoff
-          # in time cannot tell that apart from a failure of this event:
-          # Core Checks, Full Validation and this gate are separate workflows,
-          # scheduled independently, so a check this event started can fail
-          # before this gate's run even starts; an earlier event's check can be
-          # cancelled, or fail, after it started; and re-running this gate
-          # alone starts it again but starts nothing else.
-          #
-          # What the checks of one event share is the event, but GitHub's REST
-          # API names it nowhere: a workflow run, check suite or check run
-          # carries no delivery id or activity type. What it does give:
-          #
-          # * every workflow run a push, pull request event or merge group
-          #   starts is created at that event, within seconds of the others
-          #   (see EVENT_SKEW_SECONDS for how close), and a re-run keeps the
-          #   workflow run: its id, run_number, check suite and created_at
-          #   stay, and only run_attempt and run_started_at move (checked on
-          #   this repository's PR #229);
-          # * a workflow's run_number grows with each new run and is kept by a
-          #   re-run (GitHub's contexts reference), so of two runs of one
-          #   workflow on this commit the higher run_number is the later
-          #   event's, even when both were created in the same second.
-          #
-          # So:
-          #
-          # * a check run's check suite names the workflow run that produced
-          #   it (GET /actions/runs?check_suite_id=), whose created_at dates
-          #   the event that started it; once read, a check suite's workflow
-          #   run is cached, as it cannot change;
-          # * this gate's own workflow run's created_at (GET
-          #   /actions/runs/{run_id}, never the attempt's) dates the event it
-          #   judges, so a gate-only re-run still judges its original event;
-          # * a check whose workflow run was created more than
-          #   EVENT_SKEW_SECONDS before this gate's belongs to an earlier event;
-          # * any other belongs to this event or a later one, unless a newer
-          #   run of its workflow is on this commit (GET
-          #   /actions/workflows/{id}/runs?head_sha=): then an event since,
-          #   however soon after, has started the run that replaces it.
-          #
-          # That newer run is the usual case, not an edge one. A newer event
-          # cancels an earlier event's Core Checks and Full Validation runs
-          # (their concurrency groups cancel in progress), whose gate jobs
-          # still run (if: always()) and conclude failure: of 8 such cancelled
-          # Core Checks runs sampled here, 7 did. So the earlier event's
-          # failure lands after the newer event, and the newer run already
-          # exists, having caused the cancellation.
-          #
-          # What is left: two events whose runs are created within
-          # EVENT_SKEW_SECONDS of each other, the earlier one's check failing,
-          # and the later one's run of that workflow not yet listed when this
-          # gate judges it. That failure is taken as current and fails at once.
-          # And a current failure whose workflow has a newer run, from an event
-          # after this gate's, is waited on: that run's result decides.
-          #
-          # Only a check that concluded neither success nor cancelled is
-          # dated against this gate: a success on this commit passes whichever
-          # event produced it, and a cancellation is never a verdict. Which of
-          # a check's runs is judged at all is judge_check's to say, below.
-          #
-          # Workflow runs started by one event are created this close together.
-          # Across 325 pull request events on this repository (June to October
-          # 2026), one event's runs were created within 4 s of each other, and
-          # this gate's run up to 3 s after another's; the closest two events
-          # on one commit were 28 s apart. A documented allowance, not a
-          # tunable: a smaller value risks taking a current failure as earlier
-          # (it is waited on until the deadline), a larger one widens the
-          # window left above, where only the newer run tells events apart.
-          EVENT_SKEW_SECONDS=10
+          # Find, before the deadline $1, the run of each workflow that
+          # belongs to this event, and record its check suite in
+          # WORKFLOW_SUITE: "absent" while GitHub lists none.
+          declare -A WORKFLOW_SUITE=()
+          declare -A WORKFLOW_RUN=()
+          resolve_workflow_runs() {
+            local deadline="$1"
+            local path suite run created
 
-          # GET /actions/runs/{run_id}: this gate's own workflow run.
-          # $run_id is bound by --argjson below.
-          # shellcheck disable=SC2016
-          gate_run_filter='
-            if type != "array" or length != 1 then error("expected one workflow run") else .[0] end
-            | if .id != $run_id then error("not workflow run \($run_id)") else . end
-            | .created_at
-            | [(fromdateiso8601 | tostring), .]
-            | @tsv
-          '
-          # "<epoch seconds><TAB><created_at as the API wrote it>"
-          created_at_pattern=$'^[0-9]+\t[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
-          # GET /actions/runs?check_suite_id={id}: the one workflow run that
-          # owns a check suite. A run of another suite is never taken for it,
-          # even if the filter were ignored. $suite is bound by --argjson.
-          # shellcheck disable=SC2016
-          suite_run_filter='
-            if type != "array" or length == 0 then error("empty workflow-runs response") else . end
-            | map(if (.workflow_runs | type) == "array" then .workflow_runs[] else error("malformed workflow-runs page") end)
-            | map(select(.check_suite_id == $suite))
-            | if length != 1 then error("\(length) workflow runs own check suite \($suite)") else .[0] end
-            | [(.created_at | fromdateiso8601 | tostring), (.run_number | tostring), (.workflow_id | tostring), .created_at]
-            | @tsv
-          '
-          # "<epoch seconds><TAB><run_number><TAB><workflow id><TAB><created_at as the API wrote it>"
-          suite_run_pattern=$'^[0-9]+\t[1-9][0-9]*\t[1-9][0-9]*\t[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
-          # GET /actions/workflows/{id}/runs?head_sha=: a workflow's runs on
-          # this commit, and of them the one with the highest run_number. Runs
-          # of another workflow or commit are never counted, even if the
-          # filters were ignored, and a listing that lacks the failed check's
-          # own run is not trusted. $workflow and $suite are bound by
-          # --argjson, $sha by --arg.
-          # shellcheck disable=SC2016
-          newest_run_filter='
-            if type != "array" or length == 0 then error("empty workflow-runs response") else . end
-            | map(if (.workflow_runs | type) == "array" then .workflow_runs[] else error("malformed workflow-runs page") end)
-            | map(select(.workflow_id == $workflow and .head_sha == $sha))
-            | if any(.[]; .check_suite_id == $suite) then . else error("check suite \($suite) is not among the runs of workflow \($workflow) on \($sha)") end
-            | if all(.[]; (.run_number | type) == "number") then . else error("a run of workflow \($workflow) has no run_number") end
-            | max_by(.run_number)
-            | [(.run_number | tostring), .created_at]
-            | @tsv
-          '
-          # "<run_number><TAB><created_at as the API wrote it>"
-          newest_run_pattern=$'^[1-9][0-9]*\t[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
-
-          GATE_RUN_CREATED=""
-          declare -A SUITE_RUN=()
-          declare -A SUITE_NEWER_RUN=()
-
-          # Read this gate's own workflow run once, into GATE_RUN_CREATED
-          # ("<epoch><TAB><created_at>"). Returns 1 if it could not be read by
-          # $2, the shared deadline ($1 names the check for the log).
-          date_gate_run() {
-            if [[ -n "${GATE_RUN_CREATED}" ]]; then
-              return 0
-            fi
-            if [[ ! "${RUN_ID}" =~ ^[1-9][0-9]*$ ]]; then
-              echo "$1: this gate's workflow run id is not a number: '${RUN_ID}'"
+            if ! query_api workflow-runs "workflow runs" "${deadline}" \
+              "/repos/${REPOSITORY}/actions/runs?head_sha=${SHA}&event=${EVENT_NAME}&per_page=100" \
+              is_workflow_runs_observation "${workflow_run_filter}" \
+              --arg event "${EVENT_NAME}" \
+              --arg sha "${SHA}" \
+              --argjson run_id "${RUN_ID}" \
+              --argjson pr "${pr_json}" \
+              --argjson skew "${SIBLING_RUN_SKEW_SECONDS}" \
+              --arg workflows "${WORKFLOW_PATHS[*]}"
+            then
               return 1
             fi
-            read_api "$1" "workflow-run" "$2" \
-              "/repos/${REPOSITORY}/actions/runs/${RUN_ID}" \
-              "${created_at_pattern}" "${gate_run_filter}" --argjson run_id "${RUN_ID}" || return 1
-            GATE_RUN_CREATED="${API_RESULT}"
-            echo "This gate's workflow run was created at ${GATE_RUN_CREATED#*$'\t'}, by the event it judges"
-          }
 
-          # Read the workflow run that owns check suite $2 once, into
-          # SUITE_RUN[$2] (see suite_run_pattern). Returns 1 if $2 is not a
-          # check suite id, or its workflow run could not be read by $3, the
-          # shared deadline ($1 names the check for the log).
-          date_check_suite() {
-            if [[ ! "$2" =~ ^[1-9][0-9]*$ ]]; then
-              echo "$1: the check run names no check suite: '$2'"
-              return 1
-            fi
-            if [[ -n "${SUITE_RUN[$2]:-}" ]]; then
-              return 0
-            fi
-            read_api "$1" "workflow-run" "$3" \
-              "/repos/${REPOSITORY}/actions/runs?check_suite_id=$2&exclude_pull_requests=true&per_page=100" \
-              "${suite_run_pattern}" "${suite_run_filter}" --argjson suite "$2" || return 1
-            SUITE_RUN[$2]="${API_RESULT}"
-          }
-
-          # Date the event of check $1, from check suite $2 (see above).
-          #
-          # Sets CHECK_EVENT to "earlier", "superseded" (a newer run of its
-          # workflow is on this commit, named in CHECK_NEWER_RUN as
-          # "<run_number><TAB><created_at>") or "current", and CHECK_RUN_NUMBER
-          # and CHECK_RUN_CREATED_AT to its own workflow run's, and returns 0.
-          # Returns 1 when the check run names no check suite, or a workflow
-          # run or listing it needs could not be read by $3, the shared
-          # deadline: an event that cannot be dated is never success, never
-          # earlier and never current.
-          date_check_event() {
-            local check_name="$1"
-            local check_suite_id="$2"
-            local deadline="$3"
-            local check_created gate_created workflow_id newest_number
-
-            CHECK_EVENT=""
-            CHECK_RUN_NUMBER=""
-            CHECK_RUN_CREATED_AT=""
-            CHECK_NEWER_RUN=""
-
-            date_gate_run "${check_name}" "${deadline}" || return 1
-            date_check_suite "${check_name}" "${check_suite_id}" "${deadline}" || return 1
-
-            check_created="${SUITE_RUN[${check_suite_id}]}"
-            CHECK_RUN_CREATED_AT="${check_created##*$'\t'}"
-            CHECK_RUN_NUMBER="${check_created#*$'\t'}"
-            workflow_id="${CHECK_RUN_NUMBER#*$'\t'}"
-            CHECK_RUN_NUMBER="${CHECK_RUN_NUMBER%%$'\t'*}"
-            workflow_id="${workflow_id%%$'\t'*}"
-            check_created="${check_created%%$'\t'*}"
-            gate_created="${GATE_RUN_CREATED%%$'\t'*}"
-            if (( check_created < gate_created - EVENT_SKEW_SECONDS )); then
-              CHECK_EVENT="earlier"
-              return 0
-            fi
-
-            # A newer run, once listed, stays on the commit, so it is cached;
-            # its absence is read when the verdict hangs on it, and a failure
-            # with no newer run is a verdict that ends the wait.
-            if [[ -z "${SUITE_NEWER_RUN[${check_suite_id}]:-}" ]]; then
-              read_api "${check_name}" "workflow-runs" "${deadline}" \
-                "/repos/${REPOSITORY}/actions/workflows/${workflow_id}/runs?head_sha=${SHA}&exclude_pull_requests=true&per_page=100" \
-                "${newest_run_pattern}" "${newest_run_filter}" \
-                --argjson workflow "${workflow_id}" --argjson suite "${check_suite_id}" --arg sha "${SHA}" || return 1
-              newest_number="${API_RESULT%%$'\t'*}"
-              if (( newest_number > CHECK_RUN_NUMBER )); then
-                SUITE_NEWER_RUN[${check_suite_id}]="${API_RESULT}"
+            while IFS=$'\t' read -r path suite run created; do
+              if [[ "${suite}" != "absent" && "${run}" != "${WORKFLOW_RUN[${path}]:-}" ]]; then
+                echo "${path}: reading run ${run} (check suite ${suite}, created ${created}) for this ${EVENT_NAME} event"
               fi
-            fi
-            if [[ -n "${SUITE_NEWER_RUN[${check_suite_id}]:-}" ]]; then
-              CHECK_NEWER_RUN="${SUITE_NEWER_RUN[${check_suite_id}]}"
-              CHECK_EVENT="superseded"
-            else
-              CHECK_EVENT="current"
-            fi
+              WORKFLOW_SUITE["${path}"]="${suite}"
+              WORKFLOW_RUN["${path}"]="${run}"
+            done <<< "${QUERY_OBSERVATION}"
           }
 
-          # Judge check $1 from its check runs in QUERY_OBSERVATION, by $2, the
-          # shared deadline.
+          # Wait until every named check in this event's workflow runs has
+          # concluded successfully.
           #
-          # A check has a run per event that ran CI on this commit, each in
-          # that event's workflow run, and a re-run adds another to the same
-          # workflow run. The check run of the newest workflow run decides: by
-          # its created_at, which dates its event, then its run_number, which
-          # orders one workflow's runs created in the same second; and within
-          # that workflow run the newest attempt, by started_at. So a manual
-          # re-run of an earlier event's workflow, however recent, never
-          # outranks this event's (or a later event's) result, and an earlier
-          # event's result is judged only while no later one has reported.
-          # Workflow runs are read only to rank check runs from more than one
-          # of them, and only when not all of those succeeded: a check whose
-          # runs all succeeded passes whichever decides.
-          #
-          # Sets CHECK_VERDICT to "success", "failed" or "pending" and returns 0;
-          # a failed check's conclusion is in CHECK_CONCLUSION, and a pending
-          # one is named in CHECK_PENDING the way the timeout reports it.
-          # Returns 1, with the reason in CHECK_UNCORRELATED, when the workflow
-          # runs the verdict depends on could not be read.
-          judge_check() {
-            local check_name="$1"
-            local deadline="$2"
-            local lines=() statuses=() conclusions=() suites=() stamps=()
-            local line fields index decide ranked run run_number
-            local status conclusion all_success=1
-            local -A distinct=()
-
-            CHECK_VERDICT=""
-            CHECK_CONCLUSION=""
-            CHECK_PENDING="${check_name}"
-            CHECK_UNCORRELATED=""
-
-            if [[ "${QUERY_OBSERVATION}" == "absent" ]]; then
-              echo "${check_name}: query succeeded, no such check run on ${SHA} yet"
-              CHECK_VERDICT="pending"
-              return 0
-            fi
-
-            mapfile -t lines <<< "${QUERY_OBSERVATION}"
-            for line in "${lines[@]}"; do
-              fields="${line#found$'\t'}"
-              statuses+=("${fields%%$'\t'*}")
-              fields="${fields#*$'\t'}"
-              conclusions+=("${fields%%$'\t'*}")
-              fields="${fields#*$'\t'}"
-              suites+=("${fields%%$'\t'*}")
-              stamps+=("${fields#*$'\t'}")
-              if [[ "${statuses[-1]}" != "completed" || "${conclusions[-1]}" != "success" ]]; then
-                all_success=0
-              fi
-            done
-
-            # The newest by started_at, which is right within one workflow run.
-            decide=$(( ${#lines[@]} - 1 ))
-            if (( ${#lines[@]} > 1 && ! all_success )); then
-              for index in "${!lines[@]}"; do
-                if [[ ! "${suites[index]}" =~ ^[1-9][0-9]*$ ]]; then
-                  echo "${check_name}: a check run names no check suite: '${suites[index]}'"
-                  CHECK_UNCORRELATED="${check_name} on ${SHA} has ${#lines[@]} check runs, but not every one names the workflow run that tells which event is newest"
-                  return 1
-                fi
-                distinct[${suites[index]}]=1
-              done
-              if (( ${#distinct[@]} > 1 )); then
-                ranked=""
-                for index in "${!lines[@]}"; do
-                  if ! date_check_suite "${check_name}" "${suites[index]}" "${deadline}"; then
-                    CHECK_UNCORRELATED="${check_name} on ${SHA} has check runs from ${#distinct[@]} workflow runs, but the workflow runs that tell which event is newest could not be read"
-                    return 1
-                  fi
-                  run="${SUITE_RUN[${suites[index]}]}"
-                  run_number="${run#*$'\t'}"
-                  run_number="${run_number%%$'\t'*}"
-                  ranked+="${run%%$'\t'*}"$'\t'"${run_number}"$'\t'"${stamps[index]}"$'\t'"${index}"$'\n'
-                done
-                decide="$(printf '%s' "${ranked}" | LC_ALL=C sort -t $'\t' -k1,1n -k2,2n -k3,3 -k4,4n | tail -n 1)"
-                decide="${decide##*$'\t'}"
-                if [[ ! "${decide}" =~ ^[0-9]+$ ]] || (( decide >= ${#lines[@]} )); then
-                  CHECK_UNCORRELATED="${check_name} on ${SHA} has check runs from ${#distinct[@]} workflow runs, which could not be ranked"
-                  return 1
-                fi
-                run="${SUITE_RUN[${suites[decide]}]}"
-                echo "${check_name}: ${#lines[@]} check runs from ${#distinct[@]} workflow runs; the newest workflow run's, created at ${run##*$'\t'}, decides"
-              fi
-            fi
-
-            status="${statuses[decide]}"
-            conclusion="${conclusions[decide]}"
-            echo "${check_name}: status=${status} conclusion=${conclusion:-pending}"
-
-            if [[ "${status}" != "completed" ]]; then
-              CHECK_VERDICT="pending"
-              return 0
-            fi
-            if [[ "${conclusion}" == "success" ]]; then
-              CHECK_VERDICT="success"
-              return 0
-            fi
-            if [[ "${conclusion}" == "cancelled" ]]; then
-              # A cancelled check is never a verdict: it was superseded (a
-              # newer push, reopen or label cancels the running workflow,
-              # possibly after this gate started) or it never ran. Wait for
-              # the run that replaces it; the deadline still fails the gate.
-              echo "${check_name}: cancelled; waiting for the run that replaces it"
-              CHECK_PENDING="${check_name} (cancelled)"
-              CHECK_VERDICT="pending"
-              return 0
-            fi
-
-            if ! date_check_event "${check_name}" "${suites[decide]}" "${deadline}"; then
-              CHECK_UNCORRELATED="${check_name} on ${SHA} concluded ${conclusion:-unknown}, but the workflow runs that tell whether it belongs to this event could not be read"
-              return 1
-            fi
-            case "${CHECK_EVENT}" in
-              earlier)
-                echo "${check_name}: concluded ${conclusion:-unknown} in a workflow run created at ${CHECK_RUN_CREATED_AT}, by an earlier event than this gate's (${GATE_RUN_CREATED#*$'\t'}); waiting for a newer run"
-                CHECK_PENDING="${check_name} (last ${conclusion:-unknown} from an earlier event)"
-                CHECK_VERDICT="pending"
-                ;;
-              superseded)
-                echo "${check_name}: concluded ${conclusion:-unknown} in run #${CHECK_RUN_NUMBER} of its workflow, created at ${CHECK_RUN_CREATED_AT}, but run #${CHECK_NEWER_RUN%%$'\t'*}, created at ${CHECK_NEWER_RUN#*$'\t'}, has since started on ${SHA}; waiting for its result"
-                CHECK_PENDING="${check_name} (last ${conclusion:-unknown} superseded by a newer run)"
-                CHECK_VERDICT="pending"
-                ;;
-              current)
-                CHECK_CONCLUSION="${conclusion}"
-                CHECK_VERDICT="failed"
-                ;;
-              *)
-                CHECK_UNCORRELATED="${check_name} on ${SHA} concluded ${conclusion:-unknown} in an event that could not be told ('${CHECK_EVENT}')"
-                return 1
-                ;;
-            esac
-          }
-
-          # Wait until every named check on ${SHA} has concluded successfully.
-          #
-          # Returns 1 under four distinct error titles: a check concluded
-          # something other than success, the check runs could not be read, a
-          # check's runs could not be traced to their events, or the shared
-          # deadline passed with checks still pending. Only a completed check
-          # with a success conclusion is success. A check that concluded
-          # otherwise is a verdict only if it belongs to the event this gate
-          # judges, or a later one, and no newer run of its workflow is on this
-          # commit; an earlier event's, or a superseded one, is waited on, as
-          # its newer run may not have reported yet, and a cancelled one is
-          # always waited on.
+          # Returns 1 under three distinct error titles: a check concluded
+          # something other than success, the workflow or check runs could
+          # not be read, or the shared deadline passed with checks still
+          # pending. Only a completed check with a success conclusion is
+          # success, and a check from another event's runs is never read.
           wait_for_checks() {
             local check_names=("$@")
             local pending=()
-            local check_name now deadline
+            local check_name conclusion fields now observation status deadline suite workflow
+
+            for check_name in "${check_names[@]}"; do
+              if ! workflow_of "${check_name}" > /dev/null; then
+                echo "::error title=Required Merge Gate failed::No workflow is known to report ${check_name}."
+                return 1
+              fi
+            done
 
             now="$(date +%s)"
             deadline=$(( now + GATE_WAIT_TIMEOUT_SECONDS ))
@@ -1284,31 +1070,45 @@ jobs:
             while :; do
               pending=()
 
+              if ! resolve_workflow_runs "${deadline}"; then
+                echo "::error title=Required Merge Gate could not read check runs::Workflow runs for this ${EVENT_NAME} event on ${SHA} could not be read after ${GATE_QUERY_MAX_ATTEMPTS} attempts; failing closed with no verdict for: ${check_names[*]}"
+                return 1
+              fi
               for check_name in "${check_names[@]}"; do
-                if ! query_check_run "${check_name}" "${deadline}"; then
+                workflow="$(workflow_of "${check_name}")"
+                suite="${WORKFLOW_SUITE[${workflow}]}"
+                if [[ "${suite}" == "absent" ]]; then
+                  echo "${check_name}: query succeeded, no ${workflow} run for this ${EVENT_NAME} event on ${SHA} yet"
+                  pending+=("${check_name}")
+                  continue
+                fi
+
+                if ! query_check_run "${check_name}" "${suite}" "${deadline}"; then
                   echo "::error title=Required Merge Gate could not read check runs::Check runs for ${check_name} on ${SHA} could not be read after ${GATE_QUERY_MAX_ATTEMPTS} attempts; failing closed with no verdict for: ${check_names[*]}"
                   return 1
                 fi
-                if ! judge_check "${check_name}" "${deadline}"; then
-                  echo "::error title=Required Merge Gate could not correlate check runs::${CHECK_UNCORRELATED}; failing closed with no verdict for: ${check_names[*]}"
-                  return 1
+                observation="${QUERY_OBSERVATION}"
+
+                if [[ "${observation}" == "absent" ]]; then
+                  echo "${check_name}: query succeeded, no such check run in check suite ${suite} on ${SHA} yet"
+                  pending+=("${check_name}")
+                  continue
                 fi
 
-                case "${CHECK_VERDICT}" in
-                  success)
-                    ;;
-                  pending)
-                    pending+=("${CHECK_PENDING}")
-                    ;;
-                  failed)
-                    echo "::error title=Required Merge Gate failed::${check_name} concluded ${CHECK_CONCLUSION:-unknown}."
+                fields="${observation#found$'\t'}"
+                status="${fields%%$'\t'*}"
+                conclusion="${fields#*$'\t'}"
+                echo "${check_name}: status=${status} conclusion=${conclusion:-pending}"
+
+                if [[ "${status}" == "completed" ]]; then
+                  if [[ "${conclusion}" != "success" ]]; then
+                    echo "::error title=Required Merge Gate failed::${check_name} concluded ${conclusion:-unknown}."
                     return 1
-                    ;;
-                  *)
-                    echo "::error title=Required Merge Gate failed::${check_name} has no verdict ('${CHECK_VERDICT}')."
-                    return 1
-                    ;;
-                esac
+                  fi
+                  continue
+                fi
+
+                pending+=("${check_name}")
               done
 
               if (( ${#pending[@]} == 0 )); then

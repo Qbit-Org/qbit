@@ -8,6 +8,7 @@
 #include <sync.h>
 #include <wallet/db.h>
 
+#include <optional>
 #include <semaphore>
 
 struct bilingual_str;
@@ -107,6 +108,9 @@ private:
     const fs::path m_dir_path;
 
     const std::string m_file_path;
+
+    //! Set while m_db is open on a database file. Taken before the exclusive lock.
+    std::optional<SQLiteFileRegistration> m_file_registration;
 
     /**
      * This mutex protects SQLite initialization and shutdown.

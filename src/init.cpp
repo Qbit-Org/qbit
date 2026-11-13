@@ -652,6 +652,15 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-test=<option>", "Pass a test-only option. Options include : " + Join(TEST_OPTIONS_DOC, ", ") + ".", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-capturemessages", "Capture all P2P messages to disk", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-mlkemportable", "Use the portable ML-KEM-1024 code instead of native code, in case native code misbehaves on this CPU. A non-numeric value, or a double negative such as -nomlkemportable=0, warns at startup and states how it was read (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-txvalidationbudget=<peer_rate>,<peer_cap>,<pool_rate>,<pool_cap>",
+                   strprintf("Budget for the time spent validating transactions from peers that are then rejected, in microseconds: "
+                             "credit a peer earns per second, the most credit a peer can hold, credit added to the shared pool per second "
+                             "and the size of the pool (a connection can draw a tenth of the pool at once, refilled at a tenth of its rate). "
+                             "<peer_rate> and <peer_cap> must be at least 1. Set to 0 to disable the budget. "
+                             "(default: %d,%d,%d,%d)",
+                             DEFAULT_TX_VALIDATION_PEER_RATE.count(), DEFAULT_TX_VALIDATION_PEER_CAP.count(),
+                             DEFAULT_TX_VALIDATION_POOL_RATE.count(), DEFAULT_TX_VALIDATION_POOL_CAP.count()),
+                   ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-mocktime=<n>", "Replace actual time with " + UNIX_EPOCH_TIME + " (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-maxsigcachesize=<n>", strprintf("Limit sum of signature cache and script execution cache sizes to <n> MiB (default: %u)", DEFAULT_VALIDATION_CACHE_BYTES >> 20), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-maxtipage=<n>",
@@ -1240,6 +1249,11 @@ bool AppInitParameterInteraction(const ArgsManager& args)
         if (!mempool_result) {
             return InitError(util::ErrorString(mempool_result));
         }
+        PeerManager::Options peerman_opts_dummy{};
+        auto peerman_result{ApplyArgsManOptions(args, peerman_opts_dummy)};
+        if (!peerman_result) {
+            return InitError(util::ErrorString(peerman_result));
+        }
     }
 
     return true;
@@ -1683,7 +1697,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     fDiscover = args.GetBoolArg("-discover", true);
 
     PeerManager::Options peerman_opts{};
-    ApplyArgsManOptions(args, peerman_opts);
+    Assert(ApplyArgsManOptions(args, peerman_opts)); // no error can happen, already checked in AppInitParameterInteraction
 
     {
 

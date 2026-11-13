@@ -33,6 +33,11 @@ fn main() {
     println!("cargo:rerun-if-env-changed=BITCOINPQC_FORSC_MAX_GRIND_ATTEMPTS");
     println!("cargo:rerun-if-env-changed=BITCOINPQC_WOTSC_MAX_COUNTER");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_TEST_BENCH_ENV_KNOBS");
+    // The cmake crate reads these but does not declare them, so without this a
+    // sanitizer run reuses a C library built without the sanitizer flags.
+    println!("cargo:rerun-if-env-changed=CC");
+    println!("cargo:rerun-if-env-changed=CFLAGS");
+    println!("cargo:rerun-if-env-changed=LDFLAGS");
 
     let bindings = bindgen::Builder::default()
         .header("include/libbitcoinpqc/bitcoinpqc.h")

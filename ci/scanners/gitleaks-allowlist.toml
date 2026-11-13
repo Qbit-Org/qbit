@@ -13,3 +13,14 @@ paths = [
 regexes = [
   '''"(keygen_entropy|secret_key)": "[0-9a-f]+"''',
 ]
+
+[[allowlists]]
+description = "Fuzz seed format tags (qbfx-v1-fixture, qbfx-v1-generation) that generic-api-key reads as values"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = [
+  '''test/fuzz/qbit_corpora/generate_seeds\.py''',
+]
+regexes = [
+  '''^qbfx-v1-(fixture|generation)$''',
+]

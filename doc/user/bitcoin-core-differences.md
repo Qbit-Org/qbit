@@ -118,6 +118,13 @@ The active signature profile is bounded `SLH-DSA-SHA2-128s`:
 | Optional transaction-signature suffix | A nonzero sighash byte; `0x01` means `SIGHASH_ALL` |
 | P2MR leaf version | `0xc0` |
 
+Signers must keep each PQC key to at most `2^30` signatures. This is a
+signer-side usage contract: consensus does not count signatures, and a
+signature made past the limit still verifies. The security margin depends on
+how many signatures a key produces: the full 128-bit classical level up to
+about `2^26` signatures, and about 118 bits at the `2^30` limit. See
+[P2MR Signature Security Margin](../reference/p2mr-signature-security.md).
+
 ### P2MR Data-Signature Opcodes
 
 `OP_CHECKDATASIGPQC` and `OP_CHECKDATASIGADDPQC` verify PQC attestations over caller-supplied 32-byte message hashes, rather than over the qbit transaction sighash. They are intended for protocols where offchain attestors sign a structured message, such as a bridge message that also commits to a transaction template. qbit verifies the signature threshold and any separate script covenant/template checks; it does not independently prove external-chain finality, burn validity, or nullifier uniqueness.
@@ -139,7 +146,7 @@ The data-signature checks use these consensus rules:
 - Empty signatures do not verify; `OP_CHECKDATASIGPQC` pushes false and `OP_CHECKDATASIGADDPQC` contributes 0.
 - Non-empty malformed or invalid signatures fail script execution.
 - Verification uses `TaggedHash("QbitDataSigPQC", msg_hash)` and `CPQCPubKey::Verify(...)`.
-- Each non-empty data-signature attempt consumes the same P2MR validation-weight charge as `OP_CHECKSIGPQC`: 3,730 units.
+- Each non-empty data-signature attempt consumes the same P2MR validation-weight charge as `OP_CHECKSIGPQC`: 3,683 units. On testnet4, blocks below height 60,000 charge the original 3,730 units, and so do regtest blocks below a height set with `-testactivationheight=p2mrweightv2@<height>`.
 
 Standard relay/mining policy does not add a separate data-signature opcode policy layer. These opcodes inherit P2MR v1 witness and transaction policy:
 
@@ -148,7 +155,10 @@ Standard relay/mining policy does not add a separate data-signature opcode polic
 | Maximum P2MR v1 initial witness stack item | 16 KiB |
 | Maximum aggregate P2MR v1 initial witness stack bytes | 128 KiB |
 | Maximum interpreter stack items | 1,000 |
+| Maximum P2MR v1 main stack plus alt-stack bytes after each opcode | 1 MiB |
 | Maximum standard transaction weight | 400,000 |
+
+A P2MR v1 spend that exceeds the 1 MiB stack-byte limit is rejected from the mempool with `mempool-script-verify-flag-failed (Standard P2MR stack byte limit exceeded)`. The limit is policy only: such a spend is still consensus-valid.
 
 The wallet tracks PQC signature usage. Bitcoin Core users should not treat qbit keys as ordinary secp256k1 keys with unlimited operational reuse. The active bounded profile has a finite signature budget per key, and wallet/RPC output can report `pqc_signature_count`, `pqc_signature_limit`, `pqc_signatures_remaining`, and `pqc_limit_state`.
 

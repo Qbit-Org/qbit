@@ -1,5 +1,6 @@
 #include <fec.h>
 
+#include <vendor/WirehairCodec.h>
 #include <vendor/cm256.h>
 #include <vendor/wirehair/wirehair.h>
 
@@ -16,6 +17,58 @@ template <typename T>
 constexpr T DivCeil(T numerator, T denominator)
 {
     return (numerator + denominator - 1) / denominator;
+}
+
+// Allocator bookkeeping charged per heap allocation (chunk header and size rounding), generously.
+constexpr std::size_t kAllocationOverheadBytes = 64;
+
+// The Wirehair codec over-allocates each buffer by its SIMD alignment; use the widest it supports.
+constexpr std::size_t kWirehairAlignmentSlackBytes = 32;
+
+std::size_t SaturatingAdd(std::size_t left, std::size_t right)
+{
+    if (right > std::numeric_limits<std::size_t>::max() - left) {
+        return std::numeric_limits<std::size_t>::max();
+    }
+    return left + right;
+}
+
+std::size_t SaturatingMultiply(std::size_t left, std::size_t right)
+{
+    if (left != 0 && right > std::numeric_limits<std::size_t>::max() / left) {
+        return std::numeric_limits<std::size_t>::max();
+    }
+    return left * right;
+}
+
+// Heap held by one Wirehair decoder group for `data_chunks` blocks of FEC_CHUNK_SIZE bytes. This
+// follows wirehair::Codec::InitializeDecoder (AllocateInput and AllocateWorkspace), plus the
+// AllocateMatrix call made once enough chunks have arrived, sized as if every column were deferred.
+std::size_t WirehairDecoderGroupBytes(std::size_t data_chunks)
+{
+    const std::size_t block_bytes = FEC_CHUNK_SIZE;
+    const std::size_t extra_rows = CAT_MAX_EXTRA_ROWS;
+    const std::size_t dense_rows = wirehair::GetDenseCount(static_cast<unsigned>(data_chunks));
+    const std::size_t mix_columns = dense_rows + wirehair::kHeavyRows;
+
+    const std::size_t input_bytes = (data_chunks + extra_rows) * block_bytes;
+    const std::size_t workspace_bytes = (data_chunks + mix_columns + 1) * block_bytes
+        + sizeof(wirehair::PeelRow) * (data_chunks + extra_rows)
+        + sizeof(wirehair::PeelColumn) * data_chunks
+        + sizeof(wirehair::PeelRefs) * data_chunks
+        + (data_chunks + extra_rows);
+
+    const std::size_t ge_columns = data_chunks + mix_columns;
+    const std::size_t ge_pitch = DivCeil<std::size_t>(ge_columns, 64);
+    const std::size_t ge_rows = data_chunks + dense_rows + extra_rows + 1;
+    const std::size_t heavy_columns = std::min<std::size_t>(mix_columns, wirehair::kHeavyCols);
+    const std::size_t heavy_pitch = (heavy_columns + 3 + 3) & ~std::size_t{3};
+    const std::size_t matrix_bytes = (data_chunks + ge_rows) * ge_pitch * sizeof(std::uint64_t)
+        + heavy_pitch * (wirehair::kHeavyRows + extra_rows)
+        + ((ge_columns + extra_rows) * 2 + ge_columns) * sizeof(std::uint16_t);
+
+    return sizeof(wirehair::Codec) + input_bytes + workspace_bytes + matrix_bytes
+        + 3 * kWirehairAlignmentSlackBytes + 4 * kAllocationOverheadBytes;
 }
 
 void ValidateParameters(const Parameters& params)
@@ -301,6 +354,7 @@ public:
         }
 
         group.seen[chunk_id] = true;
+        ++m_received_chunks;
 
         if (group.use_cm256) {
             group.chunk_data.emplace_back();
@@ -334,6 +388,11 @@ public:
     [[nodiscard]] bool IsComplete() const
     {
         return AllGroupsComplete();
+    }
+
+    [[nodiscard]] std::size_t ReceivedChunkCount() const
+    {
+        return m_received_chunks;
     }
 
     std::optional<std::vector<std::uint8_t>> Reconstruct() const
@@ -379,6 +438,40 @@ public:
         }
 
         return output;
+    }
+
+    static std::size_t MemoryBytes(const Parameters& params, std::size_t original_size)
+    {
+        std::size_t total = sizeof(Impl) + kAllocationOverheadBytes;
+        if (original_size == 0) {
+            return total;
+        }
+
+        const std::size_t data_chunks = params.data_chunks;
+        const std::size_t group_payload_bytes = data_chunks * FEC_CHUNK_SIZE;
+        if (original_size > std::numeric_limits<std::size_t>::max() - group_payload_bytes) {
+            return std::numeric_limits<std::size_t>::max();
+        }
+        const std::size_t group_count = DivCeil(original_size, group_payload_bytes);
+        if (group_count > std::numeric_limits<std::uint16_t>::max()) {
+            return std::numeric_limits<std::size_t>::max();
+        }
+
+        // m_groups is sized once, at construction.
+        total = SaturatingAdd(total, SaturatingAdd(SaturatingMultiply(group_count, sizeof(GroupState)), kAllocationOverheadBytes));
+
+        std::size_t per_group_bytes = 0;
+        if (data_chunks <= CM256_MAX_DATA_CHUNKS) {
+            // Received chunks (reserved at construction) and their ids. A completed group swaps
+            // these for decoded_bytes of the same payload size; while one group completes, both
+            // are held, so one extra group payload is charged once.
+            per_group_bytes = group_payload_bytes + data_chunks + 2 * kAllocationOverheadBytes;
+            total = SaturatingAdd(total, group_payload_bytes + kAllocationOverheadBytes);
+        } else {
+            per_group_bytes = WirehairDecoderGroupBytes(data_chunks);
+        }
+
+        return SaturatingAdd(total, SaturatingMultiply(group_count, per_group_bytes));
     }
 
 private:
@@ -472,6 +565,7 @@ private:
     std::size_t m_group_payload_bytes{0};
     std::uint16_t m_group_count{0};
     std::vector<GroupState> m_groups{};
+    std::size_t m_received_chunks{0};
 };
 
 Decoder::Decoder(Parameters params, std::size_t original_size)
@@ -506,9 +600,24 @@ bool Decoder::IsComplete() const
     return m_impl->IsComplete();
 }
 
+std::size_t Decoder::ReceivedChunkCount() const
+{
+    return m_impl->ReceivedChunkCount();
+}
+
 std::optional<std::vector<std::uint8_t>> Decoder::Reconstruct() const
 {
     return m_impl->Reconstruct();
+}
+
+std::size_t Decoder::MemoryBytes(Parameters params, std::size_t original_size)
+{
+    try {
+        ValidateParameters(params);
+    } catch (const std::invalid_argument&) {
+        return std::numeric_limits<std::size_t>::max();
+    }
+    return Impl::MemoryBytes(params, original_size);
 }
 
 } // namespace photon::fec

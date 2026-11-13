@@ -6,11 +6,15 @@
 
 #include <common/types.h>
 #include <interfaces/handler.h>
+#include <key.h>
 #include <outputtype.h>
 #include <policy/fees.h>
 #include <primitives/transaction.h>
 #include <script/script.h>
+#include <util/check.h>
+#include <util/rbf.h>
 #include <util/translation.h>
+#include <wallet/coincontrol.h>
 #include <wallet/wallet.h>
 
 #include <chrono>
@@ -62,6 +66,7 @@ public:
     bool encryptWallet(const SecureString&) override
     {
         std::function<void()> status_changed;
+        std::function<void()> encryption_in_progress_changed;
         {
             std::lock_guard lock{m_state->mutex};
             // Like CWallet::EncryptWallet, which refuses a wallet that another
@@ -80,10 +85,13 @@ public:
             ++m_state->encrypt_calls;
             m_state->encrypt_thread = std::this_thread::get_id();
             status_changed = m_state->status_changed;
+            encryption_in_progress_changed = m_state->encryption_in_progress_changed;
         }
         m_state->condition.notify_all();
-        // Like CWallet::EncryptWallet, which unlocks the freshly encrypted keys
-        // and notifies while it still holds the wallet locks.
+        // Like CWallet::EncryptWallet, which announces the encryption whoever
+        // called it, then unlocks the freshly encrypted keys and notifies
+        // while it still holds the wallet locks.
+        if (encryption_in_progress_changed) encryption_in_progress_changed();
         if (status_changed) status_changed();
 
         bool success{false};
@@ -102,19 +110,33 @@ public:
             m_state->encrypt_in_progress = false;
             m_state->encrypt_finished = true;
             m_state->encrypt_finished_sequence = ++m_state->event_sequence;
+            // A listener may have unsubscribed while the latch was held, as
+            // a model destroyed during an encryption started elsewhere does.
+            status_changed = m_state->status_changed;
+            encryption_in_progress_changed = m_state->encryption_in_progress_changed;
         }
         m_state->condition.notify_all();
         // An exception after the database transaction committed leaves the
         // wallet encrypted, releases the locks by unwinding and skips the
-        // final status notification.
-        if (throw_after_commit) throw std::runtime_error{"synthetic encryption failure after commit"};
+        // final status notification. The end of the encryption is announced
+        // on every path.
+        if (throw_after_commit) {
+            if (encryption_in_progress_changed) encryption_in_progress_changed();
+            throw std::runtime_error{"synthetic encryption failure after commit"};
+        }
         if (status_changed) status_changed();
+        if (encryption_in_progress_changed) encryption_in_progress_changed();
         return success;
     }
     bool isCrypted() override
     {
         std::lock_guard lock{m_state->mutex};
         return m_state->encrypted;
+    }
+    bool isEncryptionInProgress() override
+    {
+        std::lock_guard lock{m_state->mutex};
+        return m_state->encrypt_in_progress || m_state->encryption_announcements > 0;
     }
     bool lock() override
     {
@@ -140,10 +162,16 @@ public:
     }
     bool changeWalletPassphrase(const SecureString&, const SecureString&) override { return false; }
     void abortRescan() override {}
-    bool backupWallet(const std::string&) override { return false; }
-    std::string getWalletName() override { return "synthetic-pqc-report"; }
+    util::Result<void> backupWallet(const std::string&) override { return util::Error{Untranslated("Unsupported")}; }
+    std::string getWalletName() override { return m_state->wallet_name; }
     std::unique_ptr<interfaces::Wallet> clone() override
     {
+        {
+            std::lock_guard lock{m_state->mutex};
+            if (std::exchange(m_state->clone_throw, false)) {
+                throw NonFatalCheckError{"synthetic clone failure", __FILE__, __LINE__, __func__};
+            }
+        }
         return std::make_unique<SyntheticWallet>(m_report, m_state, /*background_clone=*/true);
     }
     util::Result<CTxDestination> getNewDestination(const OutputType, const std::string&) override { return CTxDestination{PKHash{}}; }
@@ -192,7 +220,7 @@ public:
     bool isLockedCoin(const COutPoint&) override { return false; }
     void listLockedCoins(std::vector<COutPoint>&) override {}
     util::Result<CTransactionRef> createTransaction(const std::vector<wallet::CRecipient>& recipients,
-        const wallet::CCoinControl&,
+        const wallet::CCoinControl& coin_control,
         bool,
         int& change_pos,
         CAmount& fee,
@@ -200,9 +228,12 @@ public:
         const SigningProgressCallback& progress_callback) override
     {
         bool wait_for_cancel{false};
+        bool rbf_input{false};
         {
             std::unique_lock lock{m_state->mutex};
             m_state->create_entered = true;
+            m_state->create_coins_selected = coin_control.HasSelected();
+            rbf_input = m_state->create_rbf_input;
             wait_for_cancel = m_state->wait_for_cancel;
             m_state->condition.notify_all();
             if (!wait_for_cancel) {
@@ -279,6 +310,10 @@ public:
         }
 
         CMutableTransaction tx;
+        if (rbf_input) {
+            const uint32_t sequence{coin_control.m_signal_bip125_rbf.value_or(true) ? MAX_BIP125_RBF_SEQUENCE : CTxIn::SEQUENCE_FINAL};
+            tx.vin.emplace_back(COutPoint{Txid::FromUint256(uint256::ONE), 0}, CScript{}, sequence);
+        }
         if (!recipients.empty()) {
             tx.vout.emplace_back(recipients.front().nAmount, CScript{} << OP_TRUE);
         }
@@ -545,13 +580,17 @@ public:
             return std::nullopt;
         }
 
+        std::function<void()> sign_started;
         {
             std::lock_guard lock{m_state->mutex};
             m_state->psbt_sign_entered = true;
             m_state->psbt_sign_thread = std::this_thread::get_id();
             ++m_state->psbt_sign_calls;
+            m_state->psbt_signed_result = {};
+            sign_started = m_state->psbt_sign_started;
         }
         m_state->condition.notify_all();
+        if (sign_started) sign_started();
 
         const auto finish = [this](bool cancel_observed) {
             {
@@ -606,7 +645,10 @@ public:
                 return common::PSBTError::INCOMPLETE;
             }
             {
-                std::lock_guard lock{m_state->mutex};
+                std::unique_lock lock{m_state->mutex};
+                m_state->psbt_counter_boundary_entered = true;
+                m_state->condition.notify_all();
+                m_state->condition.wait(lock, [this] { return m_state->allow_psbt_counter_boundary; });
                 m_state->psbt_counters_reserved = true;
             }
             m_state->condition.notify_all();
@@ -630,10 +672,20 @@ public:
             return common::PSBTError::INCOMPLETE;
         }
 
-        if (!psbtx.inputs.empty()) {
-            psbtx.inputs.front().final_script_witness.stack = {{0x01}};
+        bool partial_signature{false};
+        {
+            std::lock_guard lock{m_state->mutex};
+            partial_signature = m_state->psbt_partial_signature;
         }
-        if (n_signed) *n_signed = psbtx.inputs.empty() ? 0 : 1;
+        if (!psbtx.inputs.empty()) {
+            if (partial_signature) {
+                const CPubKey pubkey{GenerateRandomKey().GetPubKey()};
+                psbtx.inputs.front().partial_sigs.emplace(pubkey.GetID(), SigPair{pubkey, {0x30, 0x01}});
+            } else {
+                psbtx.inputs.front().final_script_witness.stack = {{0x01}};
+            }
+        }
+        if (n_signed) *n_signed = psbtx.inputs.empty() || partial_signature ? 0 : 1;
         if (pqc_usage) *pqc_usage = m_report;
         {
             std::lock_guard lock{m_state->mutex};
@@ -656,7 +708,11 @@ public:
             std::lock_guard lock{m_state->mutex};
             fail = m_state->psbt_fail;
         }
-        complete = !fail;
+        complete = !fail && !partial_signature;
+        {
+            std::lock_guard lock{m_state->mutex};
+            m_state->psbt_signed_result = psbtx;
+        }
         finish(/*cancel_observed=*/false);
         return fail ? std::make_optional(common::PSBTError::SIGHASH_MISMATCH) : std::nullopt;
     }
@@ -679,10 +735,11 @@ public:
     CoinsList listCoins() override { return {}; }
     std::vector<interfaces::WalletTxOut> getCoins(const std::vector<COutPoint>&) override { return {}; }
     CAmount getRequiredFee(unsigned int) override { return 0; }
-    CAmount getMinimumFee(unsigned int, const wallet::CCoinControl&, int* returned_target, FeeReason* reason) override
+    CAmount getMinimumFee(unsigned int, const wallet::CCoinControl&, int* returned_target, FeeReason* reason, bool* estimate_unavailable) override
     {
         if (returned_target) *returned_target = 6;
         if (reason) *reason = FeeReason::NONE;
+        if (estimate_unavailable) *estimate_unavailable = false;
         return 0;
     }
     unsigned int getConfirmTarget() override { return 6; }
@@ -757,6 +814,21 @@ public:
             if (auto state = weak_state.lock()) {
                 std::lock_guard lock{state->mutex};
                 state->can_get_addresses_changed = {};
+            }
+        });
+    }
+
+    std::unique_ptr<interfaces::Handler> handleEncryptionInProgressChanged(EncryptionInProgressChangedFn fn) override
+    {
+        {
+            std::lock_guard lock{m_state->mutex};
+            m_state->encryption_in_progress_changed = std::move(fn);
+        }
+        std::weak_ptr<SyntheticWalletState> weak_state{m_state};
+        return interfaces::MakeCleanupHandler([weak_state] {
+            if (auto state = weak_state.lock()) {
+                std::lock_guard lock{state->mutex};
+                state->encryption_in_progress_changed = {};
             }
         });
     }

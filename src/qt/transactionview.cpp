@@ -217,8 +217,8 @@ void TransactionView::setModel(WalletModel *_model)
         transactionProxyModel->setSortRole(Qt::EditRole);
         transactionView->setModel(transactionProxyModel);
         transactionView->sortByColumn(TransactionTableModel::Date, Qt::DescendingOrder);
-        m_fee_bumped_connection = connect(_model, &WalletModel::feeBumped, this, [this, _model](const Txid& original_txid, const Txid& bumped_txid, const QString& pqc_usage) {
-            showFeeBumpUsage(bumped_txid, pqc_usage);
+        m_fee_bumped_connection = connect(_model, &WalletModel::feeBumped, this, [this, _model](const Txid& original_txid, const Txid& bumped_txid, const QString& pqc_usage, const QDateTime& committed_at) {
+            showFeeBumpUsage(bumped_txid, pqc_usage, committed_at);
             transactionView->selectionModel()->clearSelection();
             _model->getTransactionTableModel()->updateTransaction(
                 QString::fromStdString(original_txid.ToString()), CT_UPDATED, true);
@@ -593,7 +593,7 @@ QWidget* TransactionView::createFeeBumpUsageWidget()
     return m_fee_bump_usage_widget;
 }
 
-void TransactionView::showFeeBumpUsage(const Txid& bumped_txid, const QString& pqc_usage)
+void TransactionView::showFeeBumpUsage(const Txid& bumped_txid, const QString& pqc_usage, const QDateTime& committed_at)
 {
     // A bump that consumed nothing must not leave an earlier report looking
     // like its own.
@@ -603,7 +603,7 @@ void TransactionView::showFeeBumpUsage(const Txid& bumped_txid, const QString& p
     }
     //: Header of the panel showing the PQC signing usage a fee bump consumed.
     //: %1 is the replacement transaction ID, %2 the local time it was committed.
-    const QString header{tr("Fee bump replacement %1 (%2)").arg(QString::fromStdString(bumped_txid.ToString()), GUIUtil::dateTimeStr(QDateTime::currentDateTime()))};
+    const QString header{tr("Fee bump replacement %1 (%2)").arg(QString::fromStdString(bumped_txid.ToString()), GUIUtil::dateTimeStr(committed_at))};
     m_fee_bump_usage_label->setText(header + "\n\n" + pqc_usage);
     m_fee_bump_usage_widget->setVisible(true);
 }

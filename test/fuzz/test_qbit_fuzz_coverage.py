@@ -68,10 +68,10 @@ ANCHORS = {
     # Signing: transaction signature creation and the PQC key wrapper.
     "sign_pqc_provider": Anchor("src/script/sign.cpp", ("if (!provider.SignPQC(pubkey, hash, raw_sig)) return false;",), "provider.SignPQC"),
     "sign_pqc_append_hashtype": Anchor("src/script/sign.cpp", ("sig = std::move(raw_sig);", "if (nHashType) sig.push_back(nHashType);"), "sig.push_back"),
-    "pqc_set_reject": Anchor("src/crypto/pqc.cpp", ("slh_dsa_secret_key_validate(begin, SIZE) != 0) {", "ClearKeyData();"), "ClearKeyData"),
+    "pqc_set_reject": Anchor("src/crypto/pqc.cpp", ("if (validate_ret != 0) {", "ClearKeyData();"), "ClearKeyData"),
     "pqc_set_accept": Anchor("src/crypto/pqc.cpp", ("MakeKeyData();", "std::memcpy(m_keydata->data(), begin, SIZE);"), "std::memcpy"),
     "pqc_sign_refused": Anchor("src/crypto/pqc.cpp", ("if (!IsValid() || counter_inout >= PQC_MAX_SIGNATURES) return finish(false);",), "return"),
-    "pqc_sign_call": Anchor("src/crypto/pqc.cpp", ("if (slh_dsa_sign(candidate_sig.data(), &siglen, hash.begin(), hash.size(), m_keydata->data()) != 0 ||",), "slh_dsa_sign"),
+    "pqc_sign_call": Anchor("src/crypto/pqc.cpp", ("const int sign_ret = SignImpl(candidate_sig.data(), siglen, hash, m_keydata->data());",), "SignImpl"),
     "pqc_sign_accept": Anchor("src/crypto/pqc.cpp", ("sig = std::move(candidate_sig);",), "sig"),
     "pqc_verify_call": Anchor("src/crypto/pqc.h", ("return slh_dsa_verify(sig.data(), sig.size(), hash.begin(), hash.size(), m_data.data()) == 0;",), "slh_dsa_verify"),
     # Harness generation, signing and verification call sites.
@@ -193,7 +193,7 @@ class AnchorResolutionTest(unittest.TestCase):
         return resolve_anchor(anchor, source_dir)
 
     def test_refusal_branch_resolves_to_its_return(self):
-        # Sign() also has `return finish(false);` for a failed slh_dsa_sign, which must not be chosen.
+        # Sign() also has `return finish(false);` for a failed SignImpl call, which must not be chosen.
         anchor = ANCHORS["pqc_sign_refused"]
         source = f"{{\n    {anchor.lines[0]}\n    if (failed) {{\n        return finish(false);\n    }}\n}}\n"
         self.assertEqual(self.resolve(anchor, source), (2, 4 + anchor.lines[0].index("return finish(false);") + 1))

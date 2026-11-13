@@ -69,7 +69,8 @@ void WalletInit::AddWalletOptions(ArgsManager& argsman) const
     argsman.AddArg("-consolidatefeerate=<amt>", strprintf("The maximum feerate (in %s/kvB) at which transaction building may use more inputs than strictly necessary so that the wallet's UTXO pool can be reduced (default: %s).", CURRENCY_UNIT, FormatMoney(DEFAULT_CONSOLIDATE_FEERATE)), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-disablewallet", "Do not load the wallet and disable wallet RPC calls", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-discardfee=<amt>", strprintf("The fee rate (in %s/kvB) that indicates your tolerance for discarding change by adding it to the fee (default: %s). "
-                                                                "Note: An output is discarded if it is dust at this rate, but we will always discard up to the dust relay fee and a discard fee above that is limited by the fee estimate for the longest target",
+                                                                "Note: An output is discarded if it is dust at this rate, but we will always discard up to the dust relay fee and a discard fee above that is limited by the fee estimate for the longest target. "
+                                                                "If there is no estimate and this option is not set, the limit is -fallbackfee raised to -mintxfee and the minimum relay fee, unless -fallbackfee is 0",
                                                               CURRENCY_UNIT, FormatMoney(DEFAULT_DISCARD_FEE)), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
 
     argsman.AddArg("-fallbackfee=<amt>", strprintf("A fee rate (in %s/kvB) that will be used when fee estimation has insufficient data. 0 to entirely disable the fallbackfee feature. (default: %s)",

@@ -4,6 +4,7 @@
 
 #include <bitcoin-build-config.h> // IWYU pragma: keep
 #include <crypto/hex_base.h>
+#include <crypto/hmac_sha256.h>
 #include <crypto/pqc.h>
 #include <crypto/sha256.h>
 #include <hash.h>
@@ -21,14 +22,41 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdint>
+#include <cstring>
 #include <numeric>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
 #include <boost/test/unit_test.hpp>
+
+#ifndef WIN32
+#include <pthread.h>
+#endif
+
+// The stack-residue test inspects a thread stack the test allocates itself.
+// ASan, HWASan and SafeStack move locals off that stack, MSan tracks the
+// initialization of every byte, and TSan calls its runtime below every
+// instrumented frame, the burn's included, so the inspection only runs
+// without them.
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(hwaddress_sanitizer) || __has_feature(memory_sanitizer) || \
+    __has_feature(safe_stack) || __has_feature(thread_sanitizer)
+#define PQC_STACK_RESIDUE_SANITIZED
+#endif
+#endif
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_HWADDRESS__) || defined(__SANITIZE_THREAD__)
+#define PQC_STACK_RESIDUE_SANITIZED
+#endif
+#if !defined(WIN32) && !defined(PQC_STACK_RESIDUE_SANITIZED)
+#define PQC_STACK_RESIDUE_TEST
+#include <sys/mman.h>
+#endif
 
 BOOST_FIXTURE_TEST_SUITE(pqc_tests, BasicTestingSetup)
 
@@ -93,6 +121,139 @@ void CheckInvalidPQCKey(const CPQCKey& key, const char* tag)
     BOOST_REQUIRE_EQUAL(sig.size(), 1U);
     BOOST_CHECK_EQUAL(sig.front(), 0x42);
 }
+
+#ifdef PQC_STACK_RESIDUE_TEST
+constexpr size_t PAINTED_STACK_SIZE{1U << 20};
+constexpr unsigned char STACK_PAINT{0xa5};
+
+struct PaintedStack {
+    //! Every byte of the thread's stack mapping after the thread exited.
+    std::vector<unsigned char> bytes;
+    //! Offset of a local in the thread's outermost test frame. Frames the
+    //! calls under test used lie below it; TLS and thread bookkeeping above.
+    size_t frame_offset{0};
+};
+
+/**
+ * Run fn on a thread whose stack is a painted mapping owned by the test and
+ * return that stack once the thread has exited, so the stack a call released
+ * can be inspected without reading outside a live object. fn must not throw.
+ */
+template <typename Fn>
+[[nodiscard]] PaintedStack RunOnPaintedStack(Fn fn)
+{
+    int flags{MAP_PRIVATE | MAP_ANONYMOUS};
+#ifdef MAP_STACK
+    flags |= MAP_STACK;
+#endif
+    void* const stack{mmap(nullptr, PAINTED_STACK_SIZE, PROT_READ | PROT_WRITE, flags, -1, 0)};
+    BOOST_REQUIRE(stack != MAP_FAILED);
+    std::memset(stack, STACK_PAINT, PAINTED_STACK_SIZE);
+
+    struct Context {
+        Fn* fn;
+        uintptr_t frame;
+    } context{&fn, 0};
+    const auto trampoline{[](void* arg) -> void* {
+        auto& ctx{*static_cast<Context*>(arg)};
+        volatile unsigned char frame_marker{0};
+        ctx.frame = reinterpret_cast<uintptr_t>(&frame_marker);
+        (*ctx.fn)();
+        return nullptr;
+    }};
+
+    pthread_attr_t attr;
+    BOOST_REQUIRE_EQUAL(pthread_attr_init(&attr), 0);
+    BOOST_REQUIRE_EQUAL(pthread_attr_setstack(&attr, stack, PAINTED_STACK_SIZE), 0);
+    pthread_t thread;
+    BOOST_REQUIRE_EQUAL(pthread_create(&thread, &attr, trampoline, &context), 0);
+    BOOST_REQUIRE_EQUAL(pthread_join(thread, nullptr), 0);
+    BOOST_REQUIRE_EQUAL(pthread_attr_destroy(&attr), 0);
+
+    const auto* const begin{static_cast<const unsigned char*>(stack)};
+    PaintedStack out{{begin, begin + PAINTED_STACK_SIZE}, 0};
+    BOOST_REQUIRE_EQUAL(munmap(stack, PAINTED_STACK_SIZE), 0);
+    const uintptr_t base{reinterpret_cast<uintptr_t>(begin)};
+    BOOST_REQUIRE(context.frame > base && context.frame < base + PAINTED_STACK_SIZE);
+    out.frame_offset = context.frame - base;
+    return out;
+}
+
+[[nodiscard]] bool ContainsBytes(std::span<const unsigned char> haystack, std::span<const unsigned char> needle)
+{
+    return std::search(haystack.begin(), haystack.end(), needle.begin(), needle.end()) != haystack.end();
+}
+
+struct ZeroRun {
+    size_t length{0};
+    //! Bytes between the deepest write below the frame and the run. The stack
+    //! grows down, so the deepest write is the lowest byte no longer painted.
+    size_t written_below{0};
+};
+
+//! Find the longest run of zero bytes written below a frame.
+[[nodiscard]] ZeroRun LongestZeroRun(std::span<const unsigned char> below_frame)
+{
+    const auto deepest{std::find_if(below_frame.begin(), below_frame.end(), [](unsigned char byte) { return byte != STACK_PAINT; })};
+    ZeroRun longest;
+    for (auto run{std::find(deepest, below_frame.end(), 0)}; run != below_frame.end(); run = std::find(run, below_frame.end(), 0)) {
+        const auto run_end{std::find_if(run, below_frame.end(), [](unsigned char byte) { return byte != 0; })};
+        if (static_cast<size_t>(run_end - run) > longest.length) {
+            longest = {static_cast<size_t>(run_end - run), static_cast<size_t>(run - deepest)};
+        }
+        run = run_end;
+    }
+    return longest;
+}
+
+/**
+ * Check the stack a secret-key call released: no exact SK_SEED or SK_PRF copy
+ * may remain anywhere on it, and the deepest stack written below the caller
+ * must be a zeroed burn window, so no frame of the call ran below the burn.
+ * Only the burn's own frames may write below the window, at most
+ * max_written_below_burn bytes. The burn also covers SHA-2 message-schedule
+ * spills, which hold the secret only in transformed form.
+ */
+void CheckReleasedStack(const PaintedStack& stack, std::span<const unsigned char> secret, size_t max_written_below_burn)
+{
+    // Secret key layout: [SK_SEED || SK_PRF || PUB_SEED || root], n bytes each.
+    constexpr size_t n{PQC_SECKEY_SIZE / 4};
+    // slh_dsa.h documents a 16 KiB burn in optimized builds (more unoptimized).
+    // Requiring 12 KiB leaves room for the frames that ran after the burn.
+    constexpr size_t MIN_BURNED_BYTES{12 * 1024};
+
+    BOOST_REQUIRE_EQUAL(secret.size(), PQC_SECKEY_SIZE);
+    BOOST_CHECK_MESSAGE(!ContainsBytes(stack.bytes, secret.first(n)), "SK_SEED copy left on the released stack");
+    BOOST_CHECK_MESSAGE(!ContainsBytes(stack.bytes, secret.subspan(n, n)), "SK_PRF copy left on the released stack");
+    const ZeroRun burned{LongestZeroRun(std::span<const unsigned char>{stack.bytes}.first(stack.frame_offset))};
+    BOOST_CHECK_MESSAGE(burned.length >= MIN_BURNED_BYTES, "longest zeroed run below the caller is " << burned.length << " bytes");
+    BOOST_CHECK_MESSAGE(burned.written_below <= max_written_below_burn,
+                        burned.written_below << " bytes were written below the longest zeroed run");
+}
+
+//! Check the stack released by a direct libbitcoinpqc keygen, secret-key
+//! validation or signing call, whose deepest burn is the library's own.
+void CheckLibraryScrubbedStack(const PaintedStack& stack, std::span<const unsigned char> secret)
+{
+    // The library's burn may write a few bytes below the array it zeroes: on
+    // i686, its position-independent prologue pushes a return address there
+    // to load the GOT pointer.
+    constexpr size_t MAX_WRITTEN_BELOW_BURN{64};
+    CheckReleasedStack(stack, secret, MAX_WRITTEN_BELOW_BURN);
+}
+
+//! Check the stack released by a CPQCKey or DerivePQCKey call. Its deepest
+//! burn is qbit's BurnReleasedStack(), which reaches below the library's.
+void CheckScrubbedStack(const PaintedStack& stack, const CPQCKey& key)
+{
+    // BurnReleasedStack()'s memory_cleanse() and memset() frames write below
+    // the array it zeroes: 38 bytes measured at -O2 on x86-64, 64 on i686, and
+    // at most 78 at Clang -O0 (76 on i686).
+    constexpr size_t MAX_WRITTEN_BELOW_BURN{128};
+    BOOST_REQUIRE(key.IsValid());
+    CheckReleasedStack(stack, std::span<const unsigned char>{key.data(), key.size()}, MAX_WRITTEN_BELOW_BURN);
+}
+#endif
 
 #ifdef ENABLE_WALLET
 [[nodiscard]] bool ContainsWarningSubstring(const std::vector<bilingual_str>& warnings, const std::string& needle)
@@ -462,6 +623,72 @@ BOOST_AUTO_TEST_CASE(pqc_low_wots_cap_sign_failure_cleans_output)
     BOOST_CHECK(std::all_of(sig.begin(), sig.end(), [](unsigned char byte) { return byte == 0; }));
 }
 
+BOOST_AUTO_TEST_CASE(pqc_secret_key_calls_scrub_released_stack)
+{
+#ifndef PQC_STACK_RESIDUE_TEST
+    BOOST_TEST_MESSAGE("skipping: needs POSIX threads and a build without ASan, HWASan, MSan, SafeStack or TSan");
+#else
+    CPQCKey generated;
+    const PaintedStack keygen_stack{RunOnPaintedStack([&] { generated.MakeNewKey(); })};
+    BOOST_TEST_CONTEXT("CPQCKey::MakeNewKey") CheckScrubbedStack(keygen_stack, generated);
+
+    const std::vector<unsigned char> secret{generated.data(), generated.data() + generated.size()};
+    CPQCKey imported;
+    const PaintedStack validate_stack{RunOnPaintedStack([&] { imported.Set(secret.data(), secret.data() + secret.size()); })};
+    BOOST_REQUIRE(imported == generated);
+    BOOST_TEST_CONTEXT("CPQCKey::Set") CheckScrubbedStack(validate_stack, imported);
+
+    const uint256 hash{TestHash("pqc_secret_key_calls_scrub_released_stack")};
+    std::vector<unsigned char> sig;
+    uint32_t counter{0};
+    bool signed_ok{false};
+    const PaintedStack sign_stack{RunOnPaintedStack([&] { signed_ok = generated.Sign(hash, sig, counter); })};
+    BOOST_REQUIRE(signed_ok);
+    BOOST_CHECK(generated.GetPubKey().Verify(hash, sig));
+    BOOST_TEST_CONTEXT("CPQCKey::Sign") CheckScrubbedStack(sign_stack, generated);
+
+    std::array<unsigned char, 64> master_seed{};
+    std::iota(master_seed.begin(), master_seed.end(), 0x42);
+    CPQCKey derived;
+    bool derived_ok{false};
+    const PaintedStack derive_stack{RunOnPaintedStack([&] {
+        derived_ok = DerivePQCKey(std::span<const unsigned char>{master_seed.data(), master_seed.size()},
+                                  /*account=*/0, /*change=*/0, /*index=*/0, derived);
+    })};
+    BOOST_REQUIRE(derived_ok);
+    BOOST_TEST_CONTEXT("DerivePQCKey") CheckScrubbedStack(derive_stack, derived);
+
+    // In the runs above, qbit's burn reaches below the library's and hides it,
+    // so also check the library's own burn on direct calls.
+    std::array<unsigned char, PQC_KEYGEN_RANDOM_DATA_SIZE> random_data;
+    std::iota(random_data.begin(), random_data.end(), 0x17);
+    std::array<unsigned char, PQC_PUBKEY_SIZE> library_pubkey{};
+    std::array<unsigned char, PQC_SECKEY_SIZE> library_seckey{};
+    int keygen_ret{-1};
+    const PaintedStack library_keygen_stack{RunOnPaintedStack([&] {
+        keygen_ret = slh_dsa_keygen(library_pubkey.data(), library_seckey.data(), random_data.data(), random_data.size());
+    })};
+    BOOST_REQUIRE_EQUAL(keygen_ret, 0);
+    BOOST_TEST_CONTEXT("slh_dsa_keygen") CheckLibraryScrubbedStack(library_keygen_stack, library_seckey);
+
+    int validate_ret{-1};
+    const PaintedStack library_validate_stack{RunOnPaintedStack([&] { validate_ret = slh_dsa_secret_key_validate(secret.data(), secret.size()); })};
+    BOOST_REQUIRE_EQUAL(validate_ret, 0);
+    BOOST_TEST_CONTEXT("slh_dsa_secret_key_validate") CheckLibraryScrubbedStack(library_validate_stack, secret);
+
+    std::vector<unsigned char> library_sig(PQC_SIG_SIZE);
+    size_t library_siglen{library_sig.size()};
+    int sign_ret{-1};
+    const PaintedStack library_sign_stack{RunOnPaintedStack([&] {
+        sign_ret = slh_dsa_sign(library_sig.data(), &library_siglen, hash.begin(), hash.size(), secret.data());
+    })};
+    BOOST_REQUIRE_EQUAL(sign_ret, 0);
+    BOOST_REQUIRE_EQUAL(library_siglen, PQC_SIG_SIZE);
+    BOOST_CHECK(generated.GetPubKey().Verify(hash, library_sig));
+    BOOST_TEST_CONTEXT("slh_dsa_sign") CheckLibraryScrubbedStack(library_sign_stack, secret);
+#endif
+}
+
 BOOST_AUTO_TEST_CASE(pqc_wrong_message_rejected)
 {
     CPQCKey key;
@@ -511,6 +738,237 @@ BOOST_AUTO_TEST_CASE(pqc_deterministic_signing)
     BOOST_CHECK_EQUAL(counter1, 1);
     BOOST_CHECK_EQUAL(counter2, 1);
 }
+
+// The released-stack probes read stack memory that the test did not
+// initialize, which MemorySanitizer reports, and AddressSanitizer can move
+// frames to a heap-allocated fake stack, where the probes cannot see them.
+// Sanitizers also enlarge frames, so the small-thread test assumes a plain build.
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer) || __has_feature(address_sanitizer)
+#define PQC_TESTS_NO_STACK_PROBES
+#endif
+#if __has_feature(memory_sanitizer) || __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#define PQC_TESTS_SANITIZER
+#endif
+#endif
+#if defined(__SANITIZE_ADDRESS__)
+#define PQC_TESTS_NO_STACK_PROBES
+#endif
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define PQC_TESTS_SANITIZER
+#endif
+#if !defined(WIN32) && !defined(PQC_TESTS_SANITIZER)
+#define PQC_TESTS_SMALL_THREAD_STACK
+#endif
+// Valgrind's Memcheck treats the released stack as unaddressable and the
+// copying function's own frame as undefined. When its client requests are
+// available, the probes exempt the copied range from address errors and mark
+// the copy defined, so they also run cleanly under Valgrind.
+#if !defined(PQC_TESTS_NO_STACK_PROBES) && defined(__has_include)
+#if __has_include(<valgrind/memcheck.h>)
+#include <valgrind/memcheck.h>
+#define PQC_TESTS_MEMCHECK
+#endif
+#endif
+
+#if !defined(PQC_TESTS_NO_STACK_PROBES) || defined(PQC_TESTS_SMALL_THREAD_STACK)
+namespace {
+//! Static, so no copy of it reaches the stack except through DerivePQCKey().
+constexpr std::array<unsigned char, 32> DERIVATION_TEST_SEED{
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f};
+} // namespace
+#endif
+
+#ifndef PQC_TESTS_NO_STACK_PROBES
+namespace {
+//! SLH-DSA secret keys start with the 16-byte SK_SEED.
+std::array<unsigned char, 16> SecretKeySeed(const CPQCKey& key)
+{
+    std::array<unsigned char, 16> sk_seed;
+    std::copy_n(key.data(), sk_seed.size(), sk_seed.begin());
+    return sk_seed;
+}
+
+//! Bytes of released stack painted and copied by the probes: a wide margin
+//! over PQC_STACK_BURN_BYTES, so stack used below the burn is visible.
+constexpr size_t RELEASED_STACK_PROBE_BYTES{192 * 1024};
+constexpr unsigned char RELEASED_STACK_PAINT{0xa5};
+
+#if defined(__GNUC__)
+#define PQC_TESTS_NOINLINE __attribute__((noinline))
+#elif defined(_MSC_VER)
+#define PQC_TESTS_NOINLINE __declspec(noinline)
+#endif
+
+//! Fill the stack region below the caller's frame with RELEASED_STACK_PAINT.
+//! It paints more than SnapshotReleasedStack() copies, so a slightly different
+//! frame layout there still copies only painted bytes. Must not be inlined, so
+//! the buffer occupies that region.
+PQC_TESTS_NOINLINE void PaintReleasedStack()
+{
+    volatile unsigned char paint[RELEASED_STACK_PROBE_BYTES + 4096];
+    for (size_t i{0}; i < sizeof(paint); ++i) paint[i] = RELEASED_STACK_PAINT;
+}
+
+//! Copy the stack region a call made from the caller's frame has just
+//! released into `snapshot`, deepest byte first. The copy reads below this
+//! function's own small frame and calls nothing. A frame large enough to hold
+//! the region would be probed by -fstack-clash-protection when allocated, and
+//! on most targets the probes store to it (Clang on x86 and GCC on AArch64
+//! store zeros), which the checks would read as stack the operation wrote.
+//! Must not be inlined.
+PQC_TESTS_NOINLINE void SnapshotReleasedStack(unsigned char* snapshot, size_t size)
+{
+    volatile unsigned char top{0};
+    const auto* released{reinterpret_cast<const volatile unsigned char*>(reinterpret_cast<uintptr_t>(&top) - size)};
+#ifdef PQC_TESTS_MEMCHECK
+    (void)VALGRIND_DISABLE_ADDR_ERROR_REPORTING_IN_RANGE(released, size);
+#endif
+    for (size_t i{0}; i < size; ++i) snapshot[i] = released[i];
+#ifdef PQC_TESTS_MEMCHECK
+    (void)VALGRIND_ENABLE_ADDR_ERROR_REPORTING_IN_RANGE(released, size);
+    (void)VALGRIND_MAKE_MEM_DEFINED(snapshot, size);
+#endif
+}
+
+//! Paint the stack, run `op`, and copy the stack region it released. The
+//! snapshot is allocated first, so no allocation runs between `op` and the copy.
+template <typename Op>
+std::vector<unsigned char> ProbeReleasedStack(Op op)
+{
+    std::vector<unsigned char> snapshot(RELEASED_STACK_PROBE_BYTES);
+    PaintReleasedStack();
+    op();
+    SnapshotReleasedStack(snapshot.data(), snapshot.size());
+    return snapshot;
+}
+
+//! Check that the stack burn covered every byte the operation wrote: below
+//! the zeroed burn buffer, only the frames of memory_cleanse() itself may
+//! differ from the paint. Code that runs after the burn, such as the secure
+//! allocator in CPQCKey::Set(), may reuse the top of the burned region.
+void CheckBurnCoversReleasedStack(const std::vector<unsigned char>& snapshot)
+{
+    constexpr size_t MIN_BURN_RUN{PQC_STACK_BURN_BYTES - 4096};
+    size_t burn_begin{0};
+    size_t zero_run{0};
+    for (size_t i{0}; i < snapshot.size() && zero_run < MIN_BURN_RUN; ++i) {
+        zero_run = snapshot[i] == 0 ? zero_run + 1 : 0;
+        if (zero_run == 1) burn_begin = i;
+    }
+    BOOST_REQUIRE_MESSAGE(zero_run >= MIN_BURN_RUN, "no burned region in the released stack");
+    BOOST_REQUIRE_GE(burn_begin, PQC_STACK_BURN_BYTES);
+
+    constexpr size_t CLEANSE_FRAMES_BYTES{1024};
+    const auto untouched_end{snapshot.begin() + (burn_begin - CLEANSE_FRAMES_BYTES)};
+    const auto deepest_write{std::find_if(snapshot.begin(), untouched_end, [](unsigned char b) { return b != RELEASED_STACK_PAINT; })};
+    BOOST_CHECK_MESSAGE(deepest_write == untouched_end,
+                        "stack written " << (snapshot.begin() + burn_begin - deepest_write) << " bytes below the burned region");
+}
+
+[[nodiscard]] size_t CountOccurrences(std::span<const unsigned char> haystack, std::span<const unsigned char> needle)
+{
+    size_t count{0};
+    for (auto it{haystack.begin()}; (it = std::search(it, haystack.end(), needle.begin(), needle.end())) != haystack.end(); ++it) ++count;
+    return count;
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(pqc_secret_key_operations_clear_released_stack)
+{
+    CPQCKey key;
+    const std::vector<unsigned char> after_keygen{ProbeReleasedStack([&] { key.MakeNewKey(); })};
+    BOOST_REQUIRE(key.IsValid());
+    CheckBurnCoversReleasedStack(after_keygen);
+    BOOST_CHECK_EQUAL(CountOccurrences(after_keygen, SecretKeySeed(key)), 0U);
+
+    CPQCKey imported;
+    const std::vector<unsigned char> after_validate{ProbeReleasedStack([&] { imported.Set(key.data(), key.data() + key.size()); })};
+    BOOST_REQUIRE(imported.IsValid());
+    CheckBurnCoversReleasedStack(after_validate);
+    BOOST_CHECK_EQUAL(CountOccurrences(after_validate, SecretKeySeed(key)), 0U);
+
+    const uint256 hash{TestHash("pqc_secret_key_operations_clear_released_stack")};
+    std::vector<unsigned char> sig;
+    uint32_t counter{0};
+    bool signed_ok{false};
+    const std::vector<unsigned char> after_sign{ProbeReleasedStack([&] { signed_ok = key.Sign(hash, sig, counter); })};
+    BOOST_REQUIRE(signed_ok);
+    CheckBurnCoversReleasedStack(after_sign);
+    BOOST_CHECK_EQUAL(CountOccurrences(after_sign, SecretKeySeed(key)), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(pqc_key_derivation_clears_released_stack)
+{
+    CPQCKey key;
+    bool derived{false};
+    const std::vector<unsigned char> after_derive{ProbeReleasedStack([&] { derived = DerivePQCKey(DERIVATION_TEST_SEED, 0, 0, 0, key); })};
+    BOOST_REQUIRE(derived);
+    CheckBurnCoversReleasedStack(after_derive);
+
+    // HKDF-extract computes prk = HMAC-SHA256(salt, seed). The salt is public,
+    // so the inner hash of that HMAC is as secret as prk.
+    constexpr std::string_view hkdf_salt{"qbit-sphincs-v1"};
+    std::array<unsigned char, 64> inner_key;
+    inner_key.fill(0x36);
+    for (size_t i{0}; i < hkdf_salt.size(); ++i) inner_key[i] ^= static_cast<unsigned char>(hkdf_salt[i]);
+    std::array<unsigned char, CSHA256::OUTPUT_SIZE> inner_hash;
+    CSHA256().Write(inner_key.data(), inner_key.size()).Write(DERIVATION_TEST_SEED.data(), DERIVATION_TEST_SEED.size()).Finalize(inner_hash.data());
+    std::array<unsigned char, CHMAC_SHA256::OUTPUT_SIZE> prk;
+    CHMAC_SHA256(reinterpret_cast<const unsigned char*>(hkdf_salt.data()), hkdf_salt.size())
+        .Write(DERIVATION_TEST_SEED.data(), DERIVATION_TEST_SEED.size())
+        .Finalize(prk.data());
+
+    BOOST_CHECK_EQUAL(CountOccurrences(after_derive, std::span{DERIVATION_TEST_SEED}.first(16)), 0U);
+    BOOST_CHECK_EQUAL(CountOccurrences(after_derive, std::span{DERIVATION_TEST_SEED}.last(16)), 0U);
+    BOOST_CHECK_EQUAL(CountOccurrences(after_derive, inner_hash), 0U);
+    BOOST_CHECK_EQUAL(CountOccurrences(after_derive, prk), 0U);
+    BOOST_CHECK_EQUAL(CountOccurrences(after_derive, SecretKeySeed(key)), 0U);
+}
+#endif // PQC_TESTS_NO_STACK_PROBES
+
+#ifdef PQC_TESTS_SMALL_THREAD_STACK
+BOOST_AUTO_TEST_CASE(pqc_secret_key_operations_fit_small_thread_stack)
+{
+    // musl starts threads with 128 KiB of stack by default. Every secret-key
+    // operation, including its stack burn, must fit in such a thread.
+    struct Results {
+        bool keygen{false};
+        bool validate{false};
+        bool sign{false};
+        bool derive{false};
+    } results;
+    const auto run{[](void* arg) -> void* {
+        auto& r{*static_cast<Results*>(arg)};
+        CPQCKey key;
+        key.MakeNewKey();
+        r.keygen = key.IsValid();
+        CPQCKey imported;
+        imported.Set(key.data(), key.data() + key.size());
+        r.validate = imported.IsValid();
+        std::vector<unsigned char> sig;
+        uint32_t counter{0};
+        r.sign = key.Sign(TestHash("pqc_secret_key_operations_fit_small_thread_stack"), sig, counter);
+        CPQCKey derived;
+        r.derive = DerivePQCKey(DERIVATION_TEST_SEED, 0, 0, 0, derived);
+        return nullptr;
+    }};
+
+    pthread_attr_t attr;
+    BOOST_REQUIRE_EQUAL(pthread_attr_init(&attr), 0);
+    BOOST_REQUIRE_EQUAL(pthread_attr_setstacksize(&attr, 128 * 1024), 0);
+    pthread_t thread;
+    BOOST_REQUIRE_EQUAL(pthread_create(&thread, &attr, run, &results), 0);
+    BOOST_REQUIRE_EQUAL(pthread_join(thread, nullptr), 0);
+    BOOST_REQUIRE_EQUAL(pthread_attr_destroy(&attr), 0);
+    BOOST_CHECK(results.keygen);
+    BOOST_CHECK(results.validate);
+    BOOST_CHECK(results.sign);
+    BOOST_CHECK(results.derive);
+}
+#endif // PQC_TESTS_SMALL_THREAD_STACK
 
 BOOST_AUTO_TEST_CASE(pqc_signing_provider_counter_updates)
 {

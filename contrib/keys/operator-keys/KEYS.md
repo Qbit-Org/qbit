@@ -9,7 +9,9 @@ Key model
 
 `operator-keys/keys.json` is the public trust anchor. It records the active
 release signer set, release-line quorum settings, signer capabilities, artifact
-sets, and policy transition requirements.
+sets, and policy transition requirements. This directory, read at the
+release's trusted ref, is the one source of truth for the policy; copies and
+pins elsewhere are checked against it (`contrib/keys/README.md`).
 
 Each active signer has an independent public certificate listed in `keys.json`.
 Release signing and builder attestation remain separate workflow checks. A
@@ -63,6 +65,8 @@ approvals/<policy_id>/
 The hash is computed over the checked-in `keys.json` bytes. Detached approval
 signatures are counted against active signers from the previous policy.
 
+<!-- BEGIN generated from keys.json by ci/release/validate_key_metadata.py --write-keys-md -->
+
 Current release-line policy
 ---------------------------
 
@@ -74,13 +78,15 @@ Current release-line policy
 Current signers
 ---------------
 
-| Signer Alias | Signing Fingerprint | Public Certificate | Release Line | Capabilities | Artifact Sets | Created | First Release |
-|--------------|---------------------|--------------------|--------------|--------------|---------------|---------|---------------|
-| operator-01 | 289EA3EC2F1939A24984840ED26CFC05586D371E | public-keys/operator-01-release.asc | mainnet, testnet | release-signing, builder-attestation | core, photon | 2026-06-08 | v0.1.0-testnet4-rc3 |
-| operator-02 | 1B95A7AA02F5530BDB1CD92387012E62F6CC1393 | public-keys/operator-02-release.asc | mainnet, testnet | release-signing, builder-attestation | core, photon | 2026-06-08 | v0.1.0-testnet4-rc3 |
-| operator-03 | 05A14A415C26F4216DC254FE52D5CC557D764586 | public-keys/operator-03-release.asc | mainnet, testnet | release-signing, builder-attestation | core, photon | 2026-06-08 | v0.1.0-testnet4-rc3 |
-| operator-04 | 71E5D38304B66183448285AB81859E1B1DEA4ED5 | public-keys/operator-04-release.asc | mainnet | release-signing, builder-attestation | core, photon | 2026-07-07 | v1.0.0 |
-| operator-05 | D57AB80A8580EC27CDB45455E9FC0931AE6CA9BD | public-keys/operator-05-release.asc | mainnet | release-signing, builder-attestation | core, photon | 2026-07-14 | v1.0.0 |
+| Signer Alias | Status | Signing Fingerprint | Public Certificate | Release Line | Capabilities | Artifact Sets | Created | First Release |
+|--------------|--------|---------------------|--------------------|--------------|--------------|---------------|---------|---------------|
+| operator-01 | active | 289EA3EC2F1939A24984840ED26CFC05586D371E | public-keys/operator-01-release.asc | mainnet, testnet | release-signing, builder-attestation | core, photon | 2026-06-08 | v0.1.0-testnet4-rc3 |
+| operator-02 | active | 1B95A7AA02F5530BDB1CD92387012E62F6CC1393 | public-keys/operator-02-release.asc | mainnet, testnet | release-signing, builder-attestation | core, photon | 2026-06-08 | v0.1.0-testnet4-rc3 |
+| operator-03 | active | 05A14A415C26F4216DC254FE52D5CC557D764586 | public-keys/operator-03-release.asc | mainnet, testnet | release-signing, builder-attestation | core, photon | 2026-06-08 | v0.1.0-testnet4-rc3 |
+| operator-04 | active | 71E5D38304B66183448285AB81859E1B1DEA4ED5 | public-keys/operator-04-release.asc | mainnet | release-signing, builder-attestation | core, photon | 2026-07-07 | v1.0.0 |
+| operator-05 | active | D57AB80A8580EC27CDB45455E9FC0931AE6CA9BD | public-keys/operator-05-release.asc | mainnet | release-signing, builder-attestation | core, photon | 2026-07-14 | v1.0.0 |
+
+<!-- END generated from keys.json -->
 
 Publication checklist
 ---------------------
@@ -90,11 +96,16 @@ Before relying on a signer policy:
 - publish each signer certificate referenced by `keys.json`
 - update `operator-keys/KEYS.md`
 - update `operator-keys/keys.json`
-- mirror the same machine-verifiable policy data into
-  `qbit-guix.sigs/operator-keys/`
-- keep the `qbit-guix.sigs/operator-keys/` mirror strict and data-only: no
+- rebuild the derived `qbit-guix.sigs/operator-keys/` copy from this
+  directory at the trusted ref (`contrib/guix/init-supporting-repos.sh
+  --resync-operator-keys`); it is not a trust source, and the release
+  publisher refuses a copy that differs
+- keep the `qbit-guix.sigs/operator-keys/` copy strict and data-only: no
   README files, notes, hidden files, unreferenced certificates, or stale
   approval material
+- move downstream pins (qbit-rpc's `scripts/qbit-release-keys/pin.json`) only
+  when they need a release signed under the new policy; see
+  `contrib/keys/README.md`
 - verify release signatures such as `SHA256SUMS.operator-01.asc` from a clean
   keyring
 - verify Guix attestations under `<version>/operator-01/` from a clean keyring

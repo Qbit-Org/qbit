@@ -1126,7 +1126,8 @@ The ultimate upstream of the few externally managed subtrees are:
     directly from immutable release tags.
   - Follow [libbitcoinpqc subtree runbook](../subtrees/libbitcoinpqc.md).
   - Use `contrib/devtools/update-libbitcoinpqc-subtree.sh` to update this
-    subtree, so updates come through `git subtree add/pull --squash` and remain
+    subtree. It imports a signed release tag as one main-line commit with
+    `git-subtree-dir` and `git-subtree-split` trailers, so updates remain
     verifiable by `test/lint/libbitcoinpqc-subtree-check.sh`.
 
 - src/leveldb

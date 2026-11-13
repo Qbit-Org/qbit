@@ -7,59 +7,36 @@
 export LC_ALL=C
 set -euo pipefail
 
-PREFIX="${LIBBITCOINPQC_PATH:-src/libbitcoinpqc}"
-REMOTE_URL="${LIBBITCOINPQC_REMOTE_URL:-https://github.com/Qbit-Org/qbit-libbitcoinpqc.git}"
-REMOTE_REF="${LIBBITCOINPQC_REMOTE_REF:-v0.3.0}"
-APPROVED_RUSTSEC_CROSSBEAM_PATCH="RUSTSEC-2026-0204-crossbeam-epoch-0.9.20"
-APPROVED_RUSTSEC_CROSSBEAM_DIFF_LINES=$'-version = "0.9.18"\n+version = "0.9.20"\n-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"\n+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"'
+# shellcheck source=libbitcoinpqc-release-tag.sh
+source "$(dirname "${BASH_SOURCE[0]}")/libbitcoinpqc-release-tag.sh"
+
+# The prefix is fixed, so no inherited variable can point the check elsewhere.
+readonly PREFIX="${LIBBITCOINPQC_PREFIX}"
+REMOTE_URL="${LIBBITCOINPQC_REMOTE_URL:-${LIBBITCOINPQC_UPSTREAM_URL}}"
+REMOTE_REF="${LIBBITCOINPQC_REMOTE_REF:-v0.3.2}"
+# The fetched tag object is held here while the check runs.
+readonly TAG_REF="refs/libbitcoinpqc-subtree-check/tag"
 
 usage() {
   cat <<EOF
-Usage: $(basename "$0")
+Usage: $(basename "$0") [--test-signer-cert <path> --test-signer-fingerprint <fpr>]
 
-Verify that $PREFIX matches the tagged upstream libbitcoinpqc tree.
+Verify that the upstream libbitcoinpqc release tag has a good signature from
+the pinned signer, and that $PREFIX matches its tree.
 
 Environment overrides:
-  LIBBITCOINPQC_PATH        default: src/libbitcoinpqc
-  LIBBITCOINPQC_REMOTE_URL  default: https://github.com/Qbit-Org/qbit-libbitcoinpqc.git
-  LIBBITCOINPQC_REMOTE_REF  default: v0.3.0
+  LIBBITCOINPQC_REMOTE_URL  default: ${LIBBITCOINPQC_UPSTREAM_URL}
+  LIBBITCOINPQC_REMOTE_REF  default: v0.3.2
+
+Test-only options, accepted only when the remote is a local repository:
+  --test-signer-cert <path>          Replace the pinned signer certificate,
+                                     ${LIBBITCOINPQC_SIGNER_CERT}.
+  --test-signer-fingerprint <fpr>    Replace the pinned signing fingerprint,
+                                     ${LIBBITCOINPQC_SIGNER_FINGERPRINT}.
 EOF
 }
 
-resolve_remote_commit() {
-  local remote_url="$1"
-  local remote_ref="$2"
-  local ls_remote_output
-
-  if ls_remote_output="$(git ls-remote --exit-code "${remote_url}" "${remote_ref}^{}" 2>/dev/null)"; then
-    printf '%s\n' "${ls_remote_output}" | awk 'NR==1 {print $1}'
-    return
-  fi
-
-  if ls_remote_output="$(git ls-remote --exit-code "${remote_url}" "${remote_ref}" 2>/dev/null)"; then
-    printf '%s\n' "${ls_remote_output}" | awk 'NR==1 {print $1}'
-  fi
-}
-
-approved_downstream_patch() {
-  local base_tree="$1"
-  local current_tree="$2"
-  local changed_paths
-  local changed_lines
-
-  changed_paths="$(git diff --name-only "${base_tree}" "${current_tree}")"
-  if [[ "${changed_paths}" != "Cargo.lock" ]]; then
-    return 1
-  fi
-
-  changed_lines="$(
-    git diff --unified=0 --no-ext-diff "${base_tree}" "${current_tree}" -- Cargo.lock |
-    awk '/^[-+]/ && $0 !~ /^(---|\+\+\+)/ {print}'
-  )"
-  [[ "${changed_lines}" == "${APPROVED_RUSTSEC_CROSSBEAM_DIFF_LINES}" ]]
-}
-
-verify_tree_match_or_approved_patch() {
+verify_tree_match() {
   local base_tree="$1"
   local current_tree="$2"
   local failure_message="$3"
@@ -68,30 +45,85 @@ verify_tree_match_or_approved_patch() {
     return 0
   fi
 
-  if approved_downstream_patch "${base_tree}" "${current_tree}"; then
-    echo "GOOD: approved downstream libbitcoinpqc patch ${APPROVED_RUSTSEC_CROSSBEAM_PATCH}"
-    return 0
-  fi
-
   git diff --stat "${base_tree}" "${current_tree}" >&2 || true
   echo "FAIL: ${failure_message}" >&2
   exit 1
 }
 
-if [[ "${1-}" == "--help" || "${1-}" == "-h" ]]; then
-  usage
-  exit 0
-fi
-
-if [[ $# -ne 0 ]]; then
-  usage >&2
-  exit 2
-fi
+signer_cert="${LIBBITCOINPQC_SIGNER_CERT}"
+signer_fingerprint="${LIBBITCOINPQC_SIGNER_FINGERPRINT}"
+test_signer_cert=""
+test_signer_fingerprint=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    --test-signer-cert | --test-signer-fingerprint)
+      if [[ $# -lt 2 || -z "$2" ]]; then
+        echo "FAIL: $1 requires a value" >&2
+        exit 2
+      fi
+      if [[ "$1" == --test-signer-cert ]]; then
+        test_signer_cert="$2"
+      else
+        test_signer_fingerprint="$2"
+      fi
+      shift
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
 
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "FAIL: must run inside a git worktree" >&2
   exit 1
 fi
+
+if [[ -n "${test_signer_cert}${test_signer_fingerprint}" ]]; then
+  if [[ -z "${test_signer_cert}" || -z "${test_signer_fingerprint}" ]]; then
+    echo "FAIL: --test-signer-cert and --test-signer-fingerprint must be given together" >&2
+    exit 2
+  fi
+  if ! libbitcoinpqc_is_local_remote "${REMOTE_URL}"; then
+    echo "FAIL: test signer options are accepted only for a local repository, not ${REMOTE_URL}" >&2
+    exit 1
+  fi
+  [[ "${test_signer_cert}" == /* ]] || test_signer_cert="${PWD}/${test_signer_cert}"
+  signer_cert="${test_signer_cert}"
+  signer_fingerprint="${test_signer_fingerprint}"
+  echo "warning: TEST SIGNER IN USE (${signer_fingerprint})" >&2
+else
+  signer_cert="$(git rev-parse --show-toplevel)/${signer_cert}"
+fi
+if [[ ! -f "${signer_cert}" ]]; then
+  echo "FAIL: signer certificate not found: ${signer_cert}" >&2
+  exit 1
+fi
+
+# Verify the release tag before any split or tree check: fetch the tag object
+# itself into a private ref, removed on every exit, and require the pinned
+# signer. The whole upstream history is small; a --depth fetch would mark this
+# repository shallow.
+trap 'git update-ref -d "${TAG_REF}" >/dev/null 2>&1 || true' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+if ! tag_object="$(libbitcoinpqc_fetch_tag "${REMOTE_URL}" "${REMOTE_REF}" "${TAG_REF}")"; then
+  echo "FAIL: unable to fetch refs/tags/${REMOTE_REF} from ${REMOTE_URL}" >&2
+  exit 1
+fi
+if ! libbitcoinpqc_verify_tag "${tag_object}" "${REMOTE_REF}" "${signer_cert}" "${signer_fingerprint}"; then
+  echo "FAIL: ${REMOTE_URL} ${REMOTE_REF} is not a release tag signed by ${signer_fingerprint}" >&2
+  exit 1
+fi
+upstream_commit="$(git rev-parse --verify "${tag_object}^{commit}")"
+upstream_tree="$(git rev-parse --verify "${upstream_commit}^{tree}")"
+echo "${REMOTE_REF} tag object ${tag_object} has a good signature from ${signer_fingerprint}"
 
 current_tree="$(git rev-parse "HEAD:${PREFIX}" 2>/dev/null || true)"
 if [[ -z "${current_tree}" ]]; then
@@ -99,30 +131,12 @@ if [[ -z "${current_tree}" ]]; then
   exit 1
 fi
 
-upstream_commit="$(resolve_remote_commit "${REMOTE_URL}" "${REMOTE_REF}")"
-if [[ -z "${upstream_commit}" ]]; then
-  echo "FAIL: unable to resolve ${REMOTE_URL} ${REMOTE_REF}" >&2
-  exit 1
-fi
-
-if ! git cat-file -e "${upstream_commit}^{commit}" 2>/dev/null; then
-  git fetch --depth=1 "${REMOTE_URL}" "${REMOTE_REF}" >/dev/null
-fi
-
-if ! git cat-file -e "${upstream_commit}^{commit}" 2>/dev/null; then
-  echo "FAIL: upstream commit ${upstream_commit} unavailable after fetch" >&2
-  exit 1
-fi
-
-upstream_commit="$(git rev-parse "${upstream_commit}^{commit}")"
-upstream_tree="$(git show -s --format=%T "${upstream_commit}")"
-metadata_commit="$(
-  git log \
-    --grep="^git-subtree-dir: ${PREFIX}/*$" \
-    --format=%H \
-    -n 1 \
-    HEAD
-)"
+# Search only non-merge commits, so a merge commit whose pull request title
+# quotes the trailer cannot be picked. No pathspec: an import commit that only
+# moves git-subtree-split leaves the prefix unchanged and must still be found.
+# A later non-merge commit that quotes the trailer can only make this check
+# fail closed, never pass.
+metadata_commit="$(libbitcoinpqc_latest_import)"
 metadata_split=""
 metadata_tree=""
 if [[ -n "${metadata_commit}" ]]; then
@@ -158,12 +172,12 @@ if [[ "${metadata_split}" != "${upstream_commit}" ]]; then
   exit 1
 fi
 
-verify_tree_match_or_approved_patch \
+verify_tree_match \
   "${metadata_tree}" \
   "${current_tree}" \
   "${PREFIX} tree differs from latest subtree import commit ${metadata_commit}"
 
-verify_tree_match_or_approved_patch \
+verify_tree_match \
   "${upstream_tree}" \
   "${current_tree}" \
   "${PREFIX} tree differs from upstream tag ${REMOTE_REF}"

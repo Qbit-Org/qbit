@@ -9,6 +9,7 @@ add_executable(test_bitcoin-qt
   clientmodeltests.cpp
   modaloverlaytests.cpp
   optiontests.cpp
+  pokertests.cpp
   rpcnestedtests.cpp
   test_main.cpp
   uritests.cpp
@@ -33,6 +34,7 @@ if(ENABLE_WALLET)
     PRIVATE
       addressbooktests.cpp
       psbtoperationsdialogtests.cpp
+      quitmodaltests.cpp
       syntheticwallet.cpp
       transactionrecordtests.cpp
       walletcontrollertests.cpp

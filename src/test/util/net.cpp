@@ -125,6 +125,40 @@ CNode* ConnmanTestMsg::ConnectNodePublic(PeerManager& peerman, const char* pszDe
     return node;
 }
 
+size_t HeadersMessageEntrySize(const CBlockHeader& header)
+{
+    return GetSerializeSize(header) + GetSizeOfCompactSize(0);
+}
+
+size_t HeadersMessageSize(const std::vector<CBlockHeader>& headers)
+{
+    size_t size{GetSizeOfCompactSize(headers.size())};
+    for (const CBlockHeader& header : headers) size += HeadersMessageEntrySize(header);
+    return size;
+}
+
+std::vector<std::vector<CBlockHeader>> SplitIntoHeadersMessages(const std::vector<CBlockHeader>& headers)
+{
+    std::vector<std::vector<CBlockHeader>> messages;
+    size_t entries_size{0};
+    for (const CBlockHeader& header : headers) {
+        const size_t entry_size{HeadersMessageEntrySize(header)};
+        if (messages.empty() || messages.back().size() == MAX_HEADERS_RESULTS ||
+            GetSizeOfCompactSize(messages.back().size() + 1) + entries_size + entry_size > MAX_PROTOCOL_MESSAGE_LENGTH) {
+            messages.emplace_back();
+            entries_size = 0;
+        }
+        entries_size += entry_size;
+        messages.back().push_back(header);
+    }
+    return messages;
+}
+
+bool MayHaveMoreHeaders(const std::vector<CBlockHeader>& headers)
+{
+    return headers.size() == MAX_HEADERS_RESULTS || HeadersMessageSize(headers) >= THRESHOLD_HEADERS_MESSAGE_SIZE;
+}
+
 std::vector<NodeEvictionCandidate> GetRandomNodeEvictionCandidates(int n_candidates, FastRandomContext& random_context)
 {
     std::vector<NodeEvictionCandidate> candidates;

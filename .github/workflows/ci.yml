@@ -98,7 +98,7 @@ jobs:
               echo "::error::Pull request base SHA is unavailable."
               exit 1
             fi
-            git diff --name-only --no-renames "${BASE_SHA}...HEAD" > "${changed_files}"
+            git diff --no-renames --name-only "${BASE_SHA}...HEAD" > "${changed_files}"
           elif [[ "${EVENT_NAME}" == "merge_group" ]]; then
             base_branch="${BASE_REF#refs/heads/}"
             if [[ -z "${base_branch}" ]]; then
@@ -106,15 +106,15 @@ jobs:
               exit 1
             fi
             git fetch --no-tags --prune origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"
-            git diff --name-only --no-renames "origin/${base_branch}...HEAD" > "${changed_files}"
+            git diff --no-renames --name-only "origin/${base_branch}...HEAD" > "${changed_files}"
           elif [[ "${EVENT_NAME}" == "push" ]]; then
             if [[ -n "${BEFORE_SHA}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
-              git diff --name-only --no-renames "${BEFORE_SHA}..HEAD" > "${changed_files}"
+              git diff --no-renames --name-only "${BEFORE_SHA}..HEAD" > "${changed_files}"
             else
               git fetch --no-tags --prune origin "${DEFAULT_BRANCH}"
               merge_base="$(git merge-base "origin/${DEFAULT_BRANCH}" HEAD 2>/dev/null || true)"
               if [[ -n "${merge_base}" ]]; then
-                git diff --name-only --no-renames "${merge_base}...HEAD" > "${changed_files}"
+                git diff --no-renames --name-only "${merge_base}...HEAD" > "${changed_files}"
               else
                 git diff-tree --no-commit-id --name-only -r HEAD > "${changed_files}"
               fi
@@ -140,13 +140,9 @@ jobs:
     name: 'determine runners'
     needs: classify-changes
     if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted')))) }}
-    # Select the self-hosted runner pool by repository: the public Qbit-Org/qbit
-    # repo requires the dedicated trusted pool (qbit-trusted-ci), while every
-    # other context (the private bridge repo and forks) uses the standard
-    # self-hosted pool. The same workflow then runs full validation in both with
-    # no per-repo edits. Fork-PR safety is enforced separately by the trust-gate
-    # `if:` conditions, independent of the runner pool.
-    runs-on: &qbit_runs_on ${{ github.repository == 'Qbit-Org/qbit' && fromJSON('["self-hosted", "linux", "x64", "qbit-trusted-ci"]') || fromJSON('["self-hosted", "linux", "x64"]') }}
+    # This job only selects cache/profile outputs. Keep it off the compute pool
+    # so a saturated self-hosted queue cannot delay the validation fan-out.
+    runs-on: ubuntu-24.04
     outputs:
       provider: ${{ steps.runners.outputs.provider }}
       ci-profile: ${{ steps.runners.outputs.ci-profile }}
@@ -165,7 +161,13 @@ jobs:
 
   test-each-commit:
     name: 'test each commit'
-    runs-on: *qbit_runs_on
+    # Select the self-hosted runner pool by repository: the public Qbit-Org/qbit
+    # repo requires the dedicated trusted pool (qbit-trusted-ci), while every
+    # other context (the private bridge repo and forks) uses the standard
+    # self-hosted pool. The same workflow then runs full validation in both with
+    # no per-repo edits. Fork-PR safety is enforced separately by the trust-gate
+    # `if:` conditions, independent of the runner pool.
+    runs-on: &qbit_runs_on ${{ github.repository == 'Qbit-Org/qbit' && fromJSON('["self-hosted", "linux", "x64", "qbit-trusted-ci"]') || fromJSON('["self-hosted", "linux", "x64"]') }}
     if: ${{ github.event_name == 'pull_request' && vars.QBIT_ENABLE_TEST_EACH_COMMIT == 'true' && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted')) }} # Disabled by default: runner OS (Ubuntu 20.04) lacks required packages (mold, qt6)
     timeout-minutes: 360  # Use maximum time, see https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idtimeout-minutes. Assuming a worst case time of 1 hour per commit, this leads to a --max-count=6 below.
     env:
