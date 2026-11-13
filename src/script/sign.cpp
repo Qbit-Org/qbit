@@ -1128,8 +1128,11 @@ static std::optional<bool> TrySignTransactionPQCParallel(
 
     std::mutex progress_mutex;
     const auto notify_completed_input = [&](unsigned int input_index) {
-        const unsigned int completed{++completed_inputs};
+        // Count and report under one lock. Otherwise a worker that counted
+        // earlier could report after one that counted later, and the
+        // reported progress would go backwards.
         std::lock_guard<std::mutex> lock{progress_mutex};
+        const unsigned int completed{++completed_inputs};
         NotifySigningProgressPhase(progress_callback, SigningProgressPhase::SIGNING_INPUTS, completed, static_cast<unsigned int>(mtx.vin.size()), input_index, /*cancellable=*/false);
     };
 

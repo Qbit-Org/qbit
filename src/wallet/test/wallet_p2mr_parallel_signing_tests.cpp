@@ -10,8 +10,11 @@
 #include <wallet/pqc_usage.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <optional>
+#include <thread>
 
 #ifndef WIN32
 #include <sys/resource.h>
@@ -243,17 +246,118 @@ BOOST_AUTO_TEST_CASE(P2MRWalletParallelDefaultArgsUseAutoWorkers)
 
     bool saw_reservation_complete{false};
     bool saw_signing_complete{false};
+    unsigned int previous_signing_completed{0};
     for (const SigningProgress& progress : progress_events) {
         if (progress.phase == SigningProgressPhase::RESERVING_PQC_COUNTERS) {
             BOOST_CHECK_EQUAL(progress.total, INPUT_COUNT);
             saw_reservation_complete |= progress.completed == INPUT_COUNT;
         } else if (progress.phase == SigningProgressPhase::SIGNING_INPUTS) {
             BOOST_CHECK_EQUAL(progress.total, INPUT_COUNT);
+            BOOST_CHECK_GE(progress.completed, previous_signing_completed);
+            previous_signing_completed = progress.completed;
             saw_signing_complete |= progress.completed == INPUT_COUNT;
         }
     }
     BOOST_CHECK(saw_reservation_complete);
     BOOST_CHECK(saw_signing_complete);
+}
+
+/** Holds the worker that signs with one key after it signs, before it counts
+ * its input, until Release(), and counts finished signatures. Waits give up
+ * after WAIT_LIMIT so a test using it cannot hang.
+ */
+class HeldSignerObserver : public PQCSigningObserver
+{
+public:
+    explicit HeldSignerObserver(const CPQCPubKey& held_pubkey) : m_held_pubkey{held_pubkey} {}
+
+    uint64_t BeforeSign(const CPQCPubKey& pubkey, uint32_t) override
+    {
+        return pubkey == m_held_pubkey ? HELD_CALL : OTHER_CALL;
+    }
+
+    void AfterSign(uint64_t call, bool) override
+    {
+        ++m_signed;
+        if (call != HELD_CALL) return;
+        // Spin rather than sleep, so the worker moves on as soon as it is released.
+        const auto deadline{std::chrono::steady_clock::now() + WAIT_LIMIT};
+        while (!m_released.load() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+    }
+
+    void WaitForSignatures(unsigned int count) const
+    {
+        const auto deadline{std::chrono::steady_clock::now() + WAIT_LIMIT};
+        while (m_signed.load() < count && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        }
+    }
+
+    void Release() { m_released.store(true); }
+
+private:
+    static constexpr uint64_t HELD_CALL{1};
+    static constexpr uint64_t OTHER_CALL{2};
+    static constexpr std::chrono::seconds WAIT_LIMIT{10};
+    const CPQCPubKey m_held_pubkey;
+    std::atomic<unsigned int> m_signed{0};
+    std::atomic_bool m_released{false};
+};
+
+// Regression test for #394: SIGNING_INPUTS progress from the parallel signer
+// never decreases. The signer used to take a worker's count before taking the
+// progress lock, so a worker could take a higher count but report first. To
+// make that likely, the worker that signs input 0 is held after signing; the
+// first report keeps the progress lock until another worker has signed and is
+// waiting for it, then releases the held worker as the lock is freed, so that
+// worker can take the lock before the waiting one wakes. Counting under the
+// lock keeps the order correct whatever the timing, so this case cannot fail
+// on correct code; the waits only make the old race likely.
+BOOST_AUTO_TEST_CASE(P2MRWalletParallelProgressNeverDecreases)
+{
+    static constexpr size_t INPUT_COUNT{4};
+    static constexpr int REPETITIONS{3};
+    m_node.args->ForceSetArg("-walletpqcparallel", "1");
+    m_node.args->ForceSetArg("-walletpqcsignthreads", "3");
+
+    for (int repetition{0}; repetition < REPETITIONS; ++repetition) {
+        auto workload{MakeDistinctKeyP2MRSigningWorkload(*m_node.chain, INPUT_COUNT)};
+        HeldSignerObserver observer{workload.pubkeys.at(0).pqc_pubkey};
+        std::vector<SigningProgress> signing_events;
+        bool held_lock{false};
+        std::map<int, bilingual_str> input_errors;
+        bool signed_ok{false};
+        {
+            ScopedPQCSigningObserver scoped_observer{observer};
+            signed_ok = workload.wallet->SignTransaction(workload.spend_tx, workload.coins, SIGHASH_DEFAULT, input_errors,
+                /*pqc_counter_observer=*/{},
+                [&](const SigningProgress& progress) {
+                    if (progress.phase != SigningProgressPhase::SIGNING_INPUTS) return true;
+                    signing_events.push_back(progress);
+                    if (progress.input_index && !held_lock) {
+                        held_lock = true;
+                        // This worker, the held one and a third one have signed.
+                        observer.WaitForSignatures(3);
+                        // Give the third worker time to reach the progress lock.
+                        std::this_thread::sleep_for(std::chrono::milliseconds{20});
+                        observer.Release();
+                    }
+                    return true;
+                });
+        }
+
+        BOOST_REQUIRE_MESSAGE(signed_ok, FormatInputErrors(input_errors));
+        unsigned int previous_completed{0};
+        for (const SigningProgress& progress : signing_events) {
+            BOOST_CHECK_EQUAL(progress.total, INPUT_COUNT);
+            BOOST_CHECK_GE(progress.completed, previous_completed);
+            BOOST_CHECK_LE(progress.completed, progress.total);
+            previous_completed = progress.completed;
+        }
+        BOOST_CHECK_EQUAL(previous_completed, INPUT_COUNT);
+    }
 }
 
 BOOST_AUTO_TEST_CASE(P2MRWalletParallelIgnoresCancelAfterCounterReservation)
