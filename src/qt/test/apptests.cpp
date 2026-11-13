@@ -251,9 +251,9 @@ void AppTests::appTests()
 
     const auto state{m_shutdown_wallet_state};
     const auto shutdown_start{std::chrono::steady_clock::now()};
-    // Bound only the cancellation contract: the pending send worker must
-    // observe the shutdown request within five seconds. Unrelated teardown
-    // after the worker is joined is timed below for diagnostics only.
+    // Bound the cancellation contract: the pending send worker must observe
+    // the shutdown request within five seconds. Teardown after the worker is
+    // joined is timed below and checked only against a much looser bound.
     std::thread watchdog{[state, shutdown_start] {
         std::unique_lock lock{state->mutex};
         if (!state->condition.wait_until(lock, shutdown_start + 5s, [state] {
@@ -375,9 +375,18 @@ void AppTests::appTests()
     QVERIFY(quit_delivered);
     QVERIFY2(!watchdog_released, "Qt wallet shutdown did not cancel the send worker within five seconds");
     QVERIFY(cancel_observed);
-    // The watchdog bounds only cancellation. This looser bound catches GUI
-    // teardown that turns slow after the workers are cancelled or joined.
-    QVERIFY2(teardown_returned_time - shutdown_start < 30s, "Qt wallet shutdown teardown exceeded thirty seconds");
+    // The watchdog bounds only cancellation. This check catches a GUI
+    // teardown that does return, but takes longer than the bound after the
+    // workers are cancelled or joined. A teardown that never returns does not
+    // reach it; the QtTest function watchdog and the ctest timeout catch that.
+    // The bound is deliberately loose: the teardown makes about 30
+    // synchronous disk syncs for settings writes on the GUI thread, and
+    // loaded CI runners take 1 to 2.3 s per sync (up to 69 s seen), so a
+    // tighter wall-clock bound fails on disk latency alone (#404). Three
+    // minutes still lets it fire before either watchdog.
+    constexpr auto SLOW_TEARDOWN_BOUND{3min};
+    QVERIFY2(teardown_returned_time - shutdown_start < SLOW_TEARDOWN_BOUND,
+             "Qt wallet shutdown teardown took longer than three minutes");
     QVERIFY2(psbt_cancel_finished, "Qt wallet shutdown did not cancel the PSBT signing worker within five seconds");
     QVERIFY(SyntheticStateMatches(m_psbt_unreserved_state, [](const auto& value) {
         return value.psbt_cancel_observed && !value.psbt_counters_reserved;

@@ -38,7 +38,11 @@
 #include <QWidget>
 
 namespace {
-constexpr int WAIT_TIMEOUT_MS{30'000};
+// Every WaitUntil below expects its condition to become true and returns as
+// soon as it does, so this is only a hang bound. Wallet creation and loading
+// sync the disk many times, and loaded CI runners take 1 to 2.3 s per sync, so
+// a 30 s bound failed on disk latency alone (#428).
+constexpr int WAIT_TIMEOUT_MS{5 * 60'000};
 constexpr auto EXISTING_WALLET_NAME{"existing"};
 constexpr auto CREATED_WALLET_NAME{"created"};
 
@@ -395,7 +399,7 @@ void WalletActivityTests::ordinaryLoadAndShutdown()
     QPointer<QProgressDialog> progress_dialog{
         parent.findChild<QProgressDialog*>(QStringLiteral("walletControllerProgressDialog"))};
     QVERIFY(progress_dialog);
-    QVERIFY(WaitUntil([&] { return progress_dialog->isVisible(); }));
+    QVERIFY(WaitUntil([&] { return progress_dialog && progress_dialog->isVisible(); }));
     teardown_models.reset();
     QVERIFY(activity.isNull());
     QVERIFY(progress_dialog.isNull());
