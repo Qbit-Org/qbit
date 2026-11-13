@@ -6,8 +6,12 @@
 #include <rpc/request.h>
 #include <rpc/util.h>
 #include <script/descriptor.h>
+#include <util/time.h>
 #include <wallet/sqlite.h>
 
+#include <array>
+#include <optional>
+#include <string_view>
 #include <thread>
 
 // These cases take a few seconds in a release build and, in the CI MSan job,
@@ -76,6 +80,72 @@ private:
     std::promise<void> m_release;
     bool m_released{false};
 };
+
+//! The delay before the deferred create-time top-up that CreateWallet(),
+//! LoadWallet() and StartWallets() queue. wallet.cpp does not expose it.
+constexpr std::chrono::seconds DEFERRED_TOP_UP_DELAY{30};
+
+//! The earliest time at which a task queued with
+//! CScheduler::scheduleFromNow() can run. CScheduler compares due times with
+//! std::chrono::steady_clock, which SteadyClock is, so a reading taken before
+//! the call that queues the task is a lower bound on when it was queued.
+//!
+//! A check that the task has not run yet holds only for state read before
+//! that time, which real time can pass on a slow machine. Read the state
+//! first, then check it only if ObservedBeforeDue() returns true.
+class TaskDueBound
+{
+public:
+    //! Construct right before the call that queues the task `delay` out.
+    explicit TaskDueBound(std::chrono::milliseconds delay) : m_earliest_run{SteadyClock::now() + delay} {}
+
+    //! Bring the scheduler's tasks, this one included, `delta` closer.
+    void MockForward(CScheduler& scheduler, std::chrono::seconds delta)
+    {
+        m_earliest_run -= delta;
+        scheduler.MockForward(delta);
+    }
+
+    //! Whether state read before this call was read before the task could
+    //! start. If not, says that the checks that `what` are skipped.
+    bool ObservedBeforeDue(std::string_view what) const
+    {
+        const auto now{SteadyClock::now()};
+        if (now < m_earliest_run) return true;
+        BOOST_TEST_MESSAGE("Skipped the checks that " << what << ": real time overran the margin by "
+                           << Ticks<std::chrono::milliseconds>(now - m_earliest_run) << " ms");
+        return false;
+    }
+
+private:
+    SteadyClock::time_point m_earliest_run;
+};
+
+//! Check that the deferred top-up has not run on `wallet`: it is pending, and
+//! both P2MR pools hold only the warm-up keys. `top_up` bounds when the
+//! top-up can start.
+void CheckDeferredTopUpNotRun(CWallet& wallet, const TaskDueBound& top_up, std::string_view what)
+{
+    bool pending{false};
+    std::array<unsigned int, 2> keypool_sizes{};
+    {
+        LOCK(wallet.cs_wallet);
+        pending = wallet.HasPendingInitialKeyPoolTopUp();
+        for (const bool internal : {false, true}) {
+            auto* spk_man{dynamic_cast<DescriptorScriptPubKeyMan*>(wallet.GetScriptPubKeyMan(OutputType::P2MR, internal))};
+            BOOST_REQUIRE(spk_man);
+            keypool_sizes[internal] = spk_man->GetKeyPoolSize();
+        }
+    }
+    if (!top_up.ObservedBeforeDue(what)) return;
+    BOOST_TEST_CONTEXT(what)
+    {
+        BOOST_CHECK(pending);
+        for (const unsigned int size : keypool_sizes) {
+            BOOST_CHECK_EQUAL(size, DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+        }
+    }
+}
 } // namespace
 
 BOOST_FIXTURE_TEST_SUITE(wallet_p2mr_deferred_keypool_tests, WalletTestingSetup)
@@ -358,9 +428,23 @@ BOOST_FIXTURE_TEST_CASE(CreateWalletSchedulerRefillsDeferredP2MRKeypoolAcrossBat
     DatabaseStatus status;
     bilingual_str error;
     std::vector<bilingual_str> warnings;
+    // Start the bound once the warm-up keys exist, so that deriving them does
+    // not use up the margin. CreateWallet() calls this hook and only then
+    // queues the top-up: on this path, without a passphrase, it calls the
+    // hook at BEFORE_LOAD_NOTIFICATION and then NotifyWalletLoaded(),
+    // AddWallet(), postInitProcess() and SchedulePendingInitialKeyPoolTopUp().
+    // A reading taken after the top-up was queued would not be a lower bound.
+    std::optional<TaskDueBound> top_up;
+    context.create_wallet_stage_fn = [&top_up](CreateWalletStage stage) {
+        if (stage == CreateWalletStage::BEFORE_LOAD_NOTIFICATION) top_up.emplace(DEFERRED_TOP_UP_DELAY);
+    };
     auto wallet = CreateWallet(context, "scheduled_refill_test", std::nullopt, options, status, error, warnings);
+    // The context is local to this case, so an exception cannot leave the
+    // hook set for another one.
+    context.create_wallet_stage_fn = {};
     BOOST_REQUIRE(wallet);
     BOOST_REQUIRE_EQUAL(status, DatabaseStatus::SUCCESS);
+    BOOST_REQUIRE(top_up);
 
     DescriptorScriptPubKeyMan* external_spk_man{nullptr};
     DescriptorScriptPubKeyMan* internal_spk_man{nullptr};
@@ -372,22 +456,17 @@ BOOST_FIXTURE_TEST_CASE(CreateWalletSchedulerRefillsDeferredP2MRKeypoolAcrossBat
     BOOST_REQUIRE(external_spk_man);
     BOOST_REQUIRE(internal_spk_man);
 
-    BOOST_CHECK(wallet->HasPendingInitialKeyPoolTopUp());
-    BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
-    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+    CheckDeferredTopUpNotRun(*wallet, *top_up, "the top-up has not run when CreateWallet() returns");
 
     auto& scheduler = *Assert(m_node.scheduler);
-    scheduler.MockForward(std::chrono::seconds{29});
+    top_up->MockForward(scheduler, std::chrono::seconds{20});
     WaitForScheduler(scheduler);
-    BOOST_CHECK(wallet->HasPendingInitialKeyPoolTopUp());
-    {
-        LOCK(wallet->cs_wallet);
-        BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
-        BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
-    }
+    CheckDeferredTopUpNotRun(*wallet, *top_up, "the top-up has not run 10 s before it is due");
 
+    top_up->MockForward(scheduler, std::chrono::seconds{9});
+    WaitForScheduler(scheduler);
     for (int i = 0; i < 10 && wallet->HasPendingInitialKeyPoolTopUp(); ++i) {
-        scheduler.MockForward(std::chrono::seconds{1});
+        top_up->MockForward(scheduler, std::chrono::seconds{1});
         WaitForScheduler(scheduler);
     }
 
@@ -428,6 +507,7 @@ BOOST_FIXTURE_TEST_CASE(LoadWalletSchedulerRefillsDeferredP2MRKeypoolAcrossBatch
 
     DatabaseOptions load_options;
     load_options.require_existing = true;
+    TaskDueBound top_up{DEFERRED_TOP_UP_DELAY};
     auto loaded_wallet = LoadWallet(context, "scheduled_reload_test", std::nullopt, load_options, status, error, warnings);
     BOOST_REQUIRE(loaded_wallet);
     BOOST_REQUIRE_EQUAL(status, DatabaseStatus::SUCCESS);
@@ -442,25 +522,17 @@ BOOST_FIXTURE_TEST_CASE(LoadWalletSchedulerRefillsDeferredP2MRKeypoolAcrossBatch
     BOOST_REQUIRE(external_spk_man);
     BOOST_REQUIRE(internal_spk_man);
 
-    BOOST_CHECK(loaded_wallet->HasPendingInitialKeyPoolTopUp());
-    {
-        LOCK(loaded_wallet->cs_wallet);
-        BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
-        BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
-    }
+    CheckDeferredTopUpNotRun(*loaded_wallet, top_up, "the top-up has not run when LoadWallet() returns");
 
     auto& scheduler = *Assert(m_node.scheduler);
-    scheduler.MockForward(std::chrono::seconds{29});
+    top_up.MockForward(scheduler, std::chrono::seconds{20});
     WaitForScheduler(scheduler);
-    BOOST_CHECK(loaded_wallet->HasPendingInitialKeyPoolTopUp());
-    {
-        LOCK(loaded_wallet->cs_wallet);
-        BOOST_CHECK_EQUAL(external_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
-        BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
-    }
+    CheckDeferredTopUpNotRun(*loaded_wallet, top_up, "the top-up has not run 10 s before it is due");
 
+    top_up.MockForward(scheduler, std::chrono::seconds{9});
+    WaitForScheduler(scheduler);
     for (int i = 0; i < 10 && loaded_wallet->HasPendingInitialKeyPoolTopUp(); ++i) {
-        scheduler.MockForward(std::chrono::seconds{1});
+        top_up.MockForward(scheduler, std::chrono::seconds{1});
         WaitForScheduler(scheduler);
     }
 
@@ -539,8 +611,13 @@ BOOST_FIXTURE_TEST_CASE(StartWalletsSchedulesDeferredP2MRKeypoolTopUpForStartupW
     }
 
     auto& scheduler = *Assert(m_node.scheduler);
+    TaskDueBound top_up{DEFERRED_TOP_UP_DELAY};
     m_wallet_loader->start(scheduler);
-    BOOST_CHECK(WITH_LOCK(plain_wallet->cs_wallet, return plain_wallet->m_deferred_create_keypool_top_up_scheduled));
+    // The flag stays set until the top-up has run.
+    const bool plain_top_up_scheduled{WITH_LOCK(plain_wallet->cs_wallet, return plain_wallet->m_deferred_create_keypool_top_up_scheduled)};
+    if (top_up.ObservedBeforeDue("StartWallets() queued a top-up for the plain wallet")) {
+        BOOST_CHECK(plain_top_up_scheduled);
+    }
     // A locked wallet queues nothing and still finishes at its first unlock.
     BOOST_CHECK(!WITH_LOCK(encrypted_wallet->cs_wallet, return encrypted_wallet->m_deferred_create_keypool_top_up_scheduled));
 
@@ -548,16 +625,16 @@ BOOST_FIXTURE_TEST_CASE(StartWalletsSchedulesDeferredP2MRKeypoolTopUpForStartupW
     BOOST_CHECK(RemoveWallet(context, unloaded_wallet, std::nullopt));
     WaitForDeleteWallet(std::move(unloaded_wallet));
 
-    // Stay well inside the 30 second delay that loadwallet also uses.
-    scheduler.MockForward(std::chrono::seconds{25});
+    // Halfway through the delay, which loadwallet also uses, the top-up has
+    // not run.
+    top_up.MockForward(scheduler, std::chrono::seconds{15});
     WaitForScheduler(scheduler);
-    BOOST_CHECK(plain_wallet->HasPendingInitialKeyPoolTopUp());
-    check_keypool_size(*plain_wallet, DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+    CheckDeferredTopUpNotRun(*plain_wallet, top_up, "the startup top-up has not run 15 s before it is due");
 
-    scheduler.MockForward(std::chrono::seconds{5});
+    top_up.MockForward(scheduler, std::chrono::seconds{15});
     WaitForScheduler(scheduler);
     for (int i = 0; i < 10 && plain_wallet->HasPendingInitialKeyPoolTopUp(); ++i) {
-        scheduler.MockForward(std::chrono::seconds{1});
+        top_up.MockForward(scheduler, std::chrono::seconds{1});
         WaitForScheduler(scheduler);
     }
     BOOST_CHECK(!plain_wallet->HasPendingInitialKeyPoolTopUp());
@@ -570,16 +647,21 @@ BOOST_FIXTURE_TEST_CASE(StartWalletsSchedulesDeferredP2MRKeypoolTopUpForStartupW
     BOOST_CHECK(!encrypted_wallet->HasPendingInitialKeyPoolTopUp());
     check_keypool_size(*encrypted_wallet, keypool_size);
 
+    // Reload without a scheduler, so that the reload queues no top-up of its
+    // own and the checks see only what the one queued at startup did.
+    WalletContext reload_context;
+    reload_context.args = context.args;
+    reload_context.chain = context.chain;
     DatabaseOptions load_options;
     load_options.require_existing = true;
     DatabaseStatus status;
     bilingual_str error;
     std::vector<bilingual_str> warnings;
-    auto reloaded_wallet = LoadWallet(context, "startup_unloaded", std::nullopt, load_options, status, error, warnings);
+    auto reloaded_wallet = LoadWallet(reload_context, "startup_unloaded", std::nullopt, load_options, status, error, warnings);
     BOOST_REQUIRE(reloaded_wallet);
     BOOST_CHECK(reloaded_wallet->HasPendingInitialKeyPoolTopUp());
     check_keypool_size(*reloaded_wallet, DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
-    BOOST_CHECK(RemoveWallet(context, reloaded_wallet, std::nullopt));
+    BOOST_CHECK(RemoveWallet(reload_context, reloaded_wallet, std::nullopt));
     WaitForDeleteWallet(std::move(reloaded_wallet));
 
     plain_wallet.reset();
