@@ -34,6 +34,10 @@
         "required_status_checks": [
           {
             "context": "Required Merge Gate"
+          },
+          {
+            "context": "signed-landing",
+            "integration_id": 15368
           }
         ],
         "strict_required_status_checks_policy": false

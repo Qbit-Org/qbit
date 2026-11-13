@@ -591,6 +591,9 @@ jobs:
           # their own check name, from the GitHub Actions app, an up-to-date
           # branch, and code-owner review.
           key_policy_branches = {"main.json": "Key Policy Gate (main)", "1.x.x.json": "Key Policy Gate (1.x.x)"}
+          # 1.x.x, 1.0.0 and 0.1.x also require signed-landing (one commit a
+          # person signed) from the GitHub Actions app; main does not.
+          signed_landing_branches = {"1.x.x.json", "1.0.0.json", "0.1.x.json"}
           for path in (
               Path(".github/rulesets/main.json"),
               Path(".github/rulesets/1.0.0.json"),
@@ -614,9 +617,13 @@ jobs:
               if unattributed is not True:
                   raise SystemExit(f"{path}: require_extra_approval_for_unattributed_changes must be true")
               contexts = [check.get("context") for check in checks]
+              landing = ["signed-landing"] if path.name in signed_landing_branches else []
+              landing_check = next((check for check in checks if check.get("context") == "signed-landing"), {})
+              if landing and landing_check.get("integration_id") != 15368:
+                  raise SystemExit(f"{path}: signed-landing must be required from integration 15368, got {checks!r}")
               if path.name in key_policy_branches:
                   gate_check = key_policy_branches[path.name]
-                  expected = ["Required Merge Gate", gate_check]
+                  expected = ["Required Merge Gate", gate_check, *landing]
                   key_check = next((check for check in checks if check.get("context") == gate_check), {})
                   if contexts != expected or key_check.get("integration_id") != 15368:
                       raise SystemExit(
@@ -625,17 +632,18 @@ jobs:
                       )
                   if strict is not True or code_owner_review is not True:
                       raise SystemExit(f"{path}: strict status checks and code-owner review must be required")
-                  print(f"{path}: Required Merge Gate and {gate_check} (strict, code-owner review)")
+                  print(f"{path}: {', '.join(expected)} (strict, code-owner review)")
                   continue
-              if contexts != ["Required Merge Gate"]:
+              expected = ["Required Merge Gate", *landing]
+              if contexts != expected:
                   raise SystemExit(
-                      f"{path}: required status checks must be exactly ['Required Merge Gate'], got {contexts!r}"
+                      f"{path}: required status checks must be exactly {expected!r}, got {contexts!r}"
                   )
               if strict is not False:
                   raise SystemExit(
                       f"{path}: strict required status checks policy must be false, got {strict!r}"
                   )
-              print(f"{path}: Required Merge Gate (branch update not required)")
+              print(f"{path}: {', '.join(expected)} (branch update not required)")
           PY
 
       - name: Check issue template YAML syntax

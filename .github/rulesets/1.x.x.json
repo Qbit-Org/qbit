@@ -38,6 +38,10 @@
           {
             "context": "Key Policy Gate (1.x.x)",
             "integration_id": 15368
+          },
+          {
+            "context": "signed-landing",
+            "integration_id": 15368
           }
         ],
         "strict_required_status_checks_policy": true

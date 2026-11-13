@@ -1202,8 +1202,9 @@ To create a scripted-diff:
     - `-END VERIFY SCRIPT-`
 - open the scripted-diff commit as its own single-commit pull request. Its message survives the
   merge, so the script can still be verified: a pull request lands as one commit squashed by
-  `squash-sign`, which keeps a lone commit's message, or, from a fork, as its one commit verified
-  against its author's own key, merged as it is. Only a standard two-commit update of a subtree
+  `squash-sign`, which keeps a lone commit's message, or, from a fork, as its one commit signed
+  with an OpenPGP key on its author's own GitHub account, merged as it is (the `signed-landing`
+  check does not read SSH or S/MIME signatures). Only a standard two-commit update of a subtree
   inherited from Bitcoin Core keeps both of its commits; see
   [Signed Commits](../../CONTRIBUTING.md#signed-commits).
 
