@@ -1,0 +1,590 @@
+# Required check: a pull request is ready to land only as one commit that a
+# person signed with an OpenPGP key of their own. GitHub's signature rule also
+# accepts commits GitHub signs itself (web edits, "Update branch" merges,
+# bots), so this check tells them apart. A branch listed in AS_IS_HEADS merges
+# as it is instead, and is not judged.
+#
+# It always runs from the default branch's copy of this file
+# (pull_request_target), whatever branch the pull request targets, so a pull
+# request can't change the rule it is judged by. It reads the pull request
+# through the API and never checks out or runs its code. GitHub blocks this
+# event in public repositories unless an Actions policy allows it for this
+# file.
+#
+# .github/rulesets/README.md says how a pull request lands.
+name: signed-landing
+
+# Each run's title records its event: the pull request's number, when it was last
+# updated, its state, whether it is a draft, its base branch and its head commit.
+# The check reads its own runs to learn what happened to the pull requests on a
+# commit, and to tell when one of GitHub's answers about them is from before an
+# event.
+run-name: >-
+  signed-landing #${{ github.event.pull_request.number }}
+  ${{ github.event.pull_request.updated_at }}
+  ${{ github.event.pull_request.state }}
+  ${{ github.event.pull_request.draft }}
+  ${{ github.event.pull_request.base.ref }}
+  ${{ github.event.pull_request.head.sha }}
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited, ready_for_review, converted_to_draft, closed]
+
+permissions:
+  actions: read            # this workflow's own runs
+  contents: read           # git's comparison of a base branch with the head commit
+  pull-requests: read
+
+concurrency:
+  # Per head commit, whichever pull request the event is for: the newest run for a
+  # commit cancels the older ones, so its result comes from the run that read
+  # GitHub last, and a run for an older head never cancels the current one's.
+  group: signed-landing-${{ github.event.pull_request.head.sha }}
+  cancel-in-progress: true
+
+jobs:
+  signed-landing:
+    name: signed-landing
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: One commit, signed by a person
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          AS_IS_HEADS: "sync-* subtree-*"
+        run: |
+          python3 - <<'PY'
+          import base64
+          import binascii
+          import datetime
+          import fnmatch
+          import http.client
+          import json
+          import os
+          import re
+          import sys
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          # GitHub's own signing keys (https://github.com/web-flow.gpg). A commit they
+          # sign is verified, but no person signed it. The list only makes the message
+          # clearer: what decides is that the signing key is one of the committer's own.
+          GITHUB_KEY_IDS = {"B5690EEEBB952194", "4AEE18F83AFDEB23"}
+          LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?")
+          ARMOR = re.compile(r"^-----BEGIN PGP SIGNATURE-----\n(?:[^\n:]+:[^\n]*\n)*\n"
+                             r"([A-Za-z0-9+/=\n]+?)\n(?:=[A-Za-z0-9+/]{4}\n)?-----END PGP SIGNATURE-----$")
+          LISTED = 100      # GitHub's largest page: a shorter answer is the whole list
+          PAGES = 10        # pages read of the open pull requests, and of the check's runs
+          WORKFLOW = "signed-landing.yml"      # this workflow's file: its runs are the check's record of events
+          EVENT = "pull_request_target"        # the event of the runs that count: only the default branch's copy of the file runs for it
+          LAG = 600         # seconds of the check's runs read before this run: far longer than GitHub's lists lag an event
+          STAMP = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
+          # The workflow's run-name: the pull request's number, updated_at, state, draft, base branch and head commit, as its
+          # event had them.
+          RUN_TITLE = re.compile(r"signed-landing #([1-9]\d{0,9}) (\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ) (open|closed) (true|false) ([^ ]+) "
+                                 r"([0-9a-f]{40})")
+          HOW = "A maintainer squashes the pull request into one commit, signs it and pushes it before merging."
+
+
+          class NotReady(Exception):
+              """The pull request can't land as it is."""
+
+
+          class Unknown(Exception):
+              """GitHub's answer could not be read, so nothing was decided."""
+
+
+          class Behind(Unknown):
+              """One of GitHub's answers hasn't caught up with an event, or two of them
+              disagree. Right after a push, a close or a new pull request that is usually
+              a read that lags, so it is worth asking again."""
+
+
+          def subpacket_issuers(body, pos):
+              """The issuer key IDs a v4 signature names, as (hashed, unhashed). The
+              hashed area is covered by the signature. The unhashed area is not: anyone
+              can add an issuer there without breaking the signature."""
+              areas = []
+              for _area in ("hashed", "unhashed"):
+                  ids = []
+                  end = pos + 2 + int.from_bytes(body[pos:pos + 2], "big")
+                  pos += 2
+                  if end > len(body):
+                      raise ValueError("subpacket area overruns the packet")
+                  while pos < end:
+                      octet = body[pos]
+                      if octet < 192:
+                          length, pos = octet, pos + 1
+                      elif octet < 255:
+                          length, pos = ((octet - 192) << 8) + body[pos + 1] + 192, pos + 2
+                      else:
+                          length, pos = int.from_bytes(body[pos + 1:pos + 5], "big"), pos + 5
+                      if length < 1 or pos + length > end:
+                          raise ValueError("bad subpacket length")
+                      kind, value = body[pos] & 0x7F, body[pos + 1:pos + length]
+                      pos += length
+                      if kind == 16 and len(value) == 8:                        # issuer key ID
+                          ids.append(value.hex().upper())
+                      elif kind == 33 and len(value) == 21 and value[0] == 4:   # issuer fingerprint
+                          ids.append(value[-8:].hex().upper())
+                  areas.append(ids)
+              return areas[0], areas[1]
+
+
+          def openpgp_issuers(armored):
+              """(hashed, unhashed) issuer key IDs of the one v4 signature packet in an
+              armored OpenPGP signature, or None if it is anything else."""
+              match = ARMOR.match(armored.replace("\r\n", "\n").strip())
+              if not match:
+                  return None
+              try:
+                  data = base64.b64decode(match.group(1), validate=False)
+                  first = data[0]
+                  if not first & 0x80:
+                      return None
+                  if first & 0x40:                      # new-format packet header
+                      tag, octet = first & 0x3F, data[1]
+                      if octet < 192:
+                          start, length = 2, octet
+                      elif octet < 224:
+                          start, length = 3, ((octet - 192) << 8) + data[2] + 192
+                      elif octet == 255:
+                          start, length = 6, int.from_bytes(data[2:6], "big")
+                      else:
+                          return None
+                  else:                                 # old-format packet header
+                      tag, kind = (first >> 2) & 0x0F, first & 3
+                      if kind == 3:
+                          return None
+                      size = 1 << kind
+                      start, length = 1 + size, int.from_bytes(data[1:1 + size], "big")
+                  body = data[start:start + length]
+                  if tag != 2 or len(body) != length or start + length != len(data) or not body or body[0] != 4:
+                      return None
+                  return subpacket_issuers(body, 4)
+              except (IndexError, ValueError, binascii.Error):
+                  return None
+
+
+          def signer_problem(commit, keys_of):
+              """Why this commit is not signed by a person, or None if it is: verified by
+              GitHub, with one OpenPGP signature from a key its committer registered."""
+              inner = commit.get("commit")
+              verification = inner.get("verification") if isinstance(inner, dict) else None
+              if not isinstance(verification, dict) or not isinstance(verification.get("verified"), bool):
+                  raise Unknown("GitHub's answer has no signature verification for the commit")
+              if not verification["verified"] or verification.get("reason") != "valid":
+                  return f"it has no verified signature (GitHub says: {verification.get('reason') or 'not verified'})"
+              committer = commit.get("committer") if isinstance(commit.get("committer"), dict) else {}
+              git_committer = inner.get("committer") if isinstance(inner.get("committer"), dict) else {}
+              login, email = committer.get("login"), git_committer.get("email")
+              signature = verification.get("signature")
+              signature = signature.strip() if isinstance(signature, str) else ""
+              by_github = "GitHub signed it, not a person (a web edit, an \"Update branch\" merge, or a bot)"
+              if login == "web-flow" or email == "noreply@github.com":
+                  return by_github
+              if signature.startswith("-----BEGIN SSH SIGNATURE-----"):
+                  return "it is signed with an SSH key, and commits here are signed with an OpenPGP key"
+              if signature.startswith("-----BEGIN SIGNED MESSAGE-----"):
+                  return "it is signed with an S/MIME certificate, and commits here are signed with an OpenPGP key"
+              issuers = openpgp_issuers(signature)
+              if issuers is None:
+                  return "its signature could not be read as one OpenPGP signature"
+              signed_over, loose = issuers
+              if GITHUB_KEY_IDS.intersection(signed_over + loose):
+                  return by_github
+              if not signed_over or set(loose) - set(signed_over):
+                  # Only an issuer the signature covers says who signed. One named beside it,
+                  # or instead of it, could have been added by anyone.
+                  return "its signature doesn't name its key in the part it signs, or names another key outside it"
+              if committer.get("type") != "User" or not isinstance(login, str) or not LOGIN.fullmatch(login):
+                  return "GitHub names no user account as its committer, so the signing key is nobody's"
+              if not set(signed_over) <= keys_of(login):     # every issuer it names, not just one of them
+                  return f"its signature is not from an OpenPGP key that {login} has on GitHub"
+              return None
+
+
+          def merges_as_is(head_ref, patterns):
+              """Whether a branch name matches one of the patterns, one path segment at a
+              time: a `*` never crosses a `/`, and `**` means nothing more than `*`."""
+              parts = head_ref.split("/")
+              for pattern in patterns:
+                  wanted = pattern.split("/")
+                  if len(wanted) == len(parts) and all(fnmatch.fnmatchcase(part, want) for part, want in zip(parts, wanted)):
+                      return True
+              return False
+
+
+          def judge(pr, commits, as_is_heads, event_head, keys_of):
+              """A sentence saying why the pull request may land. Raises NotReady or Unknown."""
+              try:
+                  head, base = pr["head"], pr["base"]
+                  head_ref, head_sha, count = head["ref"], head["sha"], pr["commits"]
+                  same_repo = (head.get("repo") or {}).get("full_name") == base["repo"]["full_name"]
+              except (KeyError, TypeError) as exc:
+                  raise Unknown(f"GitHub's answer for the pull request is missing {exc}") from exc
+              if not isinstance(head_ref, str) or not isinstance(head_sha, str) or type(count) is not int:
+                  raise Unknown("GitHub's answer for the pull request has an unexpected shape")
+              if head_sha != event_head:
+                  # This run reports on the commit that started it. Judging a newer head here
+                  # would put that head's verdict on the older commit.
+                  raise Behind(f"GitHub reports {head_sha[:12]} as the pull request's head, and this run is for "
+                               f"{event_head[:12]}. If the pull request has moved on, the run for its new head decides. "
+                               "If not, re-run this check")
+              if same_repo and merges_as_is(head_ref, as_is_heads):
+                  return (f"`{head_ref}` is a branch that merges as it is, so this check doesn't judge its {count} "
+                          "commit(s). GitHub's signature rule still requires each of them to be verified.")
+              if count != 1:
+                  listed = ([commit.get("sha") for commit in commits]
+                            if isinstance(commits, list) and all(isinstance(commit, dict) for commit in commits) else None)
+                  if listed is not None and len(listed) < LISTED and head_sha not in listed:
+                      # The whole list, without this head: it is from before the push, and the count may be too.
+                      raise Behind("GitHub's list of the pull request's commits doesn't show its head yet. Re-run this check")
+                  if listed == [head_sha]:
+                      # The list says one commit and the count doesn't: one of them hasn't caught up with the push.
+                      raise Behind("GitHub's count of the pull request's commits doesn't match its list yet. Re-run this check")
+                  raise NotReady(f"It has {count} commits, and it lands as one. {HOW}")
+              if not isinstance(commits, list) or not all(isinstance(commit, dict) for commit in commits):
+                  raise Unknown("GitHub's list of the pull request's commits has an unexpected shape")
+              if len(commits) != 1:
+                  # The pull request says one commit. Right after a squash is pushed, the list can
+                  # still hold the commits from before it.
+                  raise Behind("GitHub's list of the pull request's commits doesn't match its count of one yet. "
+                               "Re-run this check")
+              commit = commits[0]
+              if commit.get("sha") != head_sha:
+                  raise Behind("GitHub's list of the pull request's commits doesn't show its head yet. Re-run this check")
+              parents = commit.get("parents")
+              if not isinstance(parents, list):
+                  raise Unknown("GitHub's answer has no parents for the commit")
+              if len(parents) != 1:
+                  raise NotReady(f"Its commit {head_sha[:12]} is a merge commit. {HOW}")
+              problem = signer_problem(commit, keys_of)
+              if problem:
+                  raise NotReady(f"Its commit {head_sha[:12]} can't land: {problem}. {HOW}")
+              return f"One commit, {head_sha[:12]}, signed by a person."
+
+
+          def judge_all(pr, commits, others, as_is_heads, event_head, keys_of):
+              """judge() for this pull request, then for every other pull request that could merge
+              the same head commit (`others`: their (pull request, commits) answers). The result is a
+              check on the commit, and a ruleset matches it by name alone: a pass earned against
+              one base must not let the same commit land on another, where it could be several
+              commits. So the commit passes only if every pull request that could merge it may land.
+
+              A pull request that can't merge the commit as it is (closed, a draft, or on another
+              commit by now) reports for the others instead of failing them. Alone, it is judged as
+              ever, so a commit never turns green because the pull request that could not land it
+              was closed."""
+              if others and standing(pr, event_head) == "gone":
+                  verdict = ("This pull request can't merge this commit as it is (it is closed, a draft, or on another commit), "
+                             "and every other open pull request with this head commit may land.")
+              else:
+                  verdict = judge(pr, commits, as_is_heads, event_head, keys_of)
+              for other, other_commits in others:
+                  try:
+                      judge(other, other_commits, as_is_heads, event_head, keys_of)
+                  except NotReady as exc:
+                      number = other.get("number") if isinstance(other, dict) else None
+                      raise NotReady(f"Pull request #{number} has the same head commit and can't land. {exc} This check "
+                                     "belongs to the commit, so it fails for every pull request the commit heads: close "
+                                     "that pull request or turn it into a draft (either runs this check again), or make "
+                                     "it ready and then re-run this check") from exc
+              return verdict
+
+
+          def fetch(path, token, deadline):
+              """A GitHub API answer as JSON. Raises Unknown when none arrives in time."""
+              api = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+              last, attempts = "no attempt was made", 4
+              for attempt in range(attempts):
+                  left = deadline - time.monotonic()
+                  if left <= 1:
+                      break
+                  wait = 2 * (attempt + 1)
+                  request = urllib.request.Request(api + path, headers={
+                      "Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+                      "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "signed-landing"})
+                  try:
+                      with urllib.request.urlopen(request, timeout=min(30, left)) as response:
+                          return json.load(response)
+                  except urllib.error.HTTPError as exc:
+                      last = f"HTTP {exc.code}"
+                      retry_after = (exc.headers.get("Retry-After") or "") if exc.headers else ""
+                      if exc.code in (403, 429) and retry_after.isdigit():      # a rate limit says how long to wait
+                          wait = int(retry_after) + 1
+                      elif exc.code not in (429, 500, 502, 503, 504):
+                          break
+                  except (OSError, http.client.HTTPException, ValueError) as exc:
+                      last = str(exc) or type(exc).__name__
+                  if attempt + 1 < attempts:
+                      time.sleep(max(0, min(wait, deadline - time.monotonic() - 1)))
+              raise Unknown(f"GitHub did not answer for {path} ({last}). Re-run this check")
+
+
+          def committer_keys(login, token, deadline):
+              """The IDs of the OpenPGP keys and subkeys a user has on GitHub."""
+              keys = fetch(f"/users/{login}/gpg_keys?per_page=100", token, deadline)
+              if not isinstance(keys, list):
+                  raise Unknown(f"GitHub's list of {login}'s OpenPGP keys has an unexpected shape")
+              ids = set()
+              for key in keys:
+                  if not isinstance(key, dict) or key.get("revoked") is True:      # a revoked key takes its subkeys with it
+                      continue
+                  entries = [key] + list(key.get("subkeys") or [])
+                  ids.update(e["key_id"].upper() for e in entries
+                             if isinstance(e, dict) and isinstance(e.get("key_id"), str)
+                             and e.get("revoked") is not True and e.get("can_sign") is not False)
+              return ids
+
+
+          def open_heads(repo, sha, token, deadline):
+              """The numbers of the open pull requests whose head is this commit, whatever
+              branch or repository they come from, with the pages read. Drafts are left out: a
+              draft can't merge, and it is judged by its own run when it is marked ready."""
+              numbers = []
+              for page in range(1, PAGES + 1):
+                  found = fetch(f"/repos/{repo}/pulls?state=open&per_page={LISTED}&page={page}", token, deadline)
+                  if not isinstance(found, list) or not all(isinstance(other, dict) for other in found):
+                      raise Unknown("GitHub's list of the open pull requests has an unexpected shape")
+                  for other in found:
+                      other_head = other.get("head")
+                      if not isinstance(other_head, dict) or type(other.get("number")) is not int:
+                          raise Unknown("GitHub's list of the open pull requests has an unexpected shape")
+                      if other_head.get("sha") == sha and other.get("draft") is not True:
+                          numbers.append(other["number"])
+                  if len(found) < LISTED:
+                      return numbers, page
+              raise Unknown("this repository has too many open pull requests to check them all")
+
+
+          def siblings(repo, number, sha, token, deadline):
+              """The other open pull requests that head the commit this run reports on."""
+              numbers, pages = open_heads(repo, sha, token, deadline)
+              if pages > 1 and open_heads(repo, sha, token, deadline)[0] != numbers:
+                  # Pages are read by position: one that closed between two reads can hide another.
+                  raise Behind("GitHub's list of the open pull requests changed while it was read. Re-run this check")
+              return [other for other in numbers if other != number]
+
+
+          def events_seen(repo, number, run_id, attempt, token, deadline):
+              """What this check's recent runs record about pull requests: {number: [(stamp, head
+              commit, landable, base branch)]}. The workflow's run-name writes each run's title
+              from its event: the pull request's number, its `updated_at`, its state, whether it
+              is a draft, its base branch and its head commit. GitHub keeps the run from when it
+              starts it a few seconds after the event, also when a newer run cancelled it. So the
+              runs say what happened to a pull request without reading the pull request back,
+              which is the read that can lag.
+
+              Only `pull_request_target` runs count. For that event GitHub runs the default
+              branch's copy of this file, so those titles are the workflow's own. A pull request
+              that changes the file to run on another event, with titles of its choosing, records
+              nothing. Nor does a title stamped long after its run was created.
+
+              The list has to show this run itself, running this attempt. An answer that does is
+              taken to show every run created before this one started, and until it does it is
+              asked for again. A run for this commit that is created later replaces this one's
+              result once it runs. From its own entry down, the runs of the ten minutes before
+              this one are read, or a thousand older runs if those reach less far back: either is
+              far longer than GitHub's lists lag an event. A run from before the run-name is
+              titled after its pull request and named after the workflow, and records nothing
+              here.
+
+              A burst of runs, which anyone can cause by editing a pull request over and over,
+              pushes this run down the list. A first attempt is looked for on the later pages
+              too: what it needs is the runs before it, and they are further down with it. A
+              re-run is different. The runs created between its first attempt and now are above
+              it, on pages whose answers its own entry says nothing about, so a re-run has to be
+              on the first page, and otherwise decides nothing and says how to start a new run."""
+              seen, running, since, older = {}, False, None, set()
+              for page in range(1, 3 * PAGES + 1):        # up to PAGES to find this run, PAGES below it, and some read twice
+                  found = fetch(f"/repos/{repo}/actions/workflows/{WORKFLOW}/runs?per_page={LISTED}&page={page}", token, deadline)
+                  runs = found.get("workflow_runs") if isinstance(found, dict) else None
+                  if not isinstance(runs, list) or not all(isinstance(run, dict) for run in runs):
+                      raise Unknown("GitHub's list of this check's runs has an unexpected shape")
+                  for run in runs:
+                      title, created = run.get("name"), run.get("created_at")
+                      named = (RUN_TITLE.fullmatch(title) if isinstance(title, str) and title == run.get("display_title")
+                               and run.get("event") == EVENT else None)
+                      if not isinstance(created, str) or not STAMP.fullmatch(created):
+                          named = None
+                      else:
+                          made = datetime.datetime.strptime(created, "%Y-%m-%dT%H:%M:%SZ")
+                          if named and named.group(2) > (made + datetime.timedelta(seconds=LAG)).strftime("%Y-%m-%dT%H:%M:%SZ"):
+                              named = None                  # an event can't be much newer than the run it started
+                      if type(run.get("id")) is int and run["id"] == run_id:
+                          if not named or int(named.group(1)) != number:
+                              raise Unknown("this run's title doesn't name its pull request as the check reads it")
+                          running = (run.get("status") == "in_progress" and type(run.get("run_attempt")) is int
+                                     and run["run_attempt"] >= attempt)
+                          since = (made - datetime.timedelta(seconds=LAG)).strftime("%Y-%m-%dT%H:%M:%SZ")
+                      if running and type(run.get("id")) is int and run["id"] < run_id:
+                          older.add(run["id"])
+                      if named:
+                          seen.setdefault(int(named.group(1)), []).append(
+                              (named.group(2), named.group(6), named.group(3) == "open" and named.group(4) == "false", named.group(5)))
+                  if not running:
+                      ids = [run["id"] for run in runs if type(run.get("id")) is int]
+                      if len(runs) == LISTED and ids and run_id < min(ids):      # the list goes on, and this run is further down it
+                          if attempt == 1 and page < PAGES:
+                              continue
+                          if attempt == 1:
+                              raise Unknown("a thousand runs of this check or more were created after this one. Edit the "
+                                            f"description of pull request #{number} to start a new run")
+                          raise Unknown("this run is re-run with a hundred newer runs above it, so it can't tell how current "
+                                        f"GitHub's list of them is. Edit the description of pull request #{number} to start "
+                                        "a new run")
+                      raise Behind("GitHub's list of this check's runs doesn't show this run running yet. Re-run this check, "
+                                   f"or edit the description of pull request #{number} to start a new run")
+                  last = runs[-1].get("created_at") if runs else None        # the list is by id, newest first
+                  if (len(runs) < LISTED or (isinstance(last, str) and STAMP.fullmatch(last) and last < since)
+                          or len(older) >= PAGES * LISTED):
+                      return seen
+              raise Unknown("GitHub's list of this check's runs moved too fast to be read. Edit the description of pull "
+                            f"request #{number} to start a new run")
+
+
+          def standing(pr, sha):
+              """How a pull request's own answer stands to this commit: "here" when it could merge
+              it (open, not a draft, and its head is the commit), "gone" when it is closed, a draft
+              or on another commit, and None when the answer doesn't say."""
+              head, base = (pr.get("head"), pr.get("base")) if isinstance(pr, dict) else (None, None)
+              if (not isinstance(head, dict) or not isinstance(head.get("sha"), str)
+                      or not isinstance(base, dict) or not isinstance(base.get("ref"), str)
+                      or pr.get("state") not in ("open", "closed") or not isinstance(pr.get("draft"), bool)):
+                  return None
+              return "here" if head["sha"] == sha and pr["state"] == "open" and not pr["draft"] else "gone"
+
+
+          def outrun(pr, records, sha):
+              """Why a pull request's own answer can't be relied on against what the check's runs
+              recorded of it (events_seen), or None. `updated_at` only moves forward. So an answer
+              stamped earlier than an event is from before that event, and one stamped later than
+              every event on record has them all.
+
+              An answer stamped in the very second of the last event may be from just before it.
+              It is relied on only if it says what that event says: whether the pull request could
+              merge this commit, and into which base branch. If it says otherwise, or two events
+              of that second disagree, it is asked for again."""
+              updated = pr.get("updated_at") if isinstance(pr, dict) else None
+              if not isinstance(updated, str) or not STAMP.fullmatch(updated):
+                  raise Unknown("GitHub's answer for a pull request has no readable updated_at")
+              newest = max(stamp for stamp, _, _, _ in records)
+              if updated < newest:
+                  return "from before its last event"
+              if updated == newest:
+                  recorded = {base if head == sha and landable else None
+                              for stamp, head, landable, base in records if stamp == newest}
+                  said = pr["base"]["ref"] if standing(pr, sha) == "here" else None
+                  if recorded != {said}:
+                      return (f"stamped in the second of its last event, which doesn't say the same (any update to "
+                              f"#{pr.get('number')}, such as a comment, moves its stamp)")
+              return None
+
+
+          def count_settled(repo, pr, sha, token, deadline):
+              """Raises Behind unless the pull request's own count of its commits is what git says:
+              the commits on its head that its base branch lacks. GitHub works the comparison out
+              from the repository when asked. The pull request's `commits` is worked out after an
+              event, and right after its base is changed it can still count against the old one."""
+              # per_page=1: only the count is wanted, not the list of commits.
+              compared = fetch(f"/repos/{repo}/compare/{urllib.parse.quote(pr['base']['ref'], safe='')}...{sha}?per_page=1",
+                               token, deadline)
+              ahead = compared.get("ahead_by") if isinstance(compared, dict) else None
+              if type(ahead) is not int:
+                  raise Unknown("GitHub's comparison of the base branch with the head commit has an unexpected shape")
+              if pr.get("commits") != ahead:
+                  raise Behind(f"GitHub counts {pr.get('commits')} commits for pull request #{pr.get('number')}, and git has "
+                               f"{ahead} on its head that its base branch lacks. Re-run this check")
+
+
+          def sharing(repo, number, sha, seen, token, deadline):
+              """The (pull request, commits) answers of the other pull requests that could merge the
+              commit this run reports on. They are found in two records: GitHub's list of open pull
+              requests, which can lag an event by some seconds, and the check's recent runs
+              (`seen`, for every pull request and commit), those of them that are on this commit.
+
+              Each one is then asked itself. For one the runs know, on whatever commit, outrun()
+              says whether the answer has caught up with its events: if not, it is asked again,
+              and if so, the answer decides whether it still could merge the commit. One only the
+              list shows has no event on record, so an answer that disagrees with the list is
+              asked again instead of judging a pull request that may be closed or leaving out one
+              that may still land."""
+              listed = siblings(repo, number, sha, token, deadline)
+              ran = sorted(other for other, records in seen.items()
+                           if other != number and other not in listed and any(head == sha for _, head, _, _ in records))
+              found = []
+              for other in listed + ran:
+                  answer = fetch(f"/repos/{repo}/pulls/{other}", token, deadline)
+                  where = standing(answer, sha)
+                  if where is None:
+                      raise Unknown(f"GitHub's answer for pull request #{other} has an unexpected shape")
+                  why = outrun(answer, seen[other], sha) if other in seen else None
+                  if why:
+                      raise Behind(f"GitHub's answer for #{other} is {why}. Re-run this check")
+                  if where == "gone":
+                      if other not in seen:
+                          raise Behind(f"GitHub's list of the open pull requests shows #{other} on this commit, open and "
+                                       "ready, and its own answer doesn't. Re-run this check")
+                      continue
+                  count_settled(repo, answer, sha, token, deadline)
+                  found.append((answer, fetch(f"/repos/{repo}/pulls/{other}/commits?per_page={LISTED}", token, deadline)))
+              return found
+
+
+          def main():
+              repo, number, token, event_head, run_id, attempt = (os.environ.get(name, "") for name in (
+                  "REPO", "PR", "GH_TOKEN", "HEAD_SHA", "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT"))
+              if (not re.fullmatch(r"[\w.-]+/[\w.-]+", repo) or not re.fullmatch(r"[1-9]\d*", number) or not token
+                      or not re.fullmatch(r"[0-9a-f]{40}", event_head)
+                      or not re.fullmatch(r"[1-9]\d*", run_id) or not re.fullmatch(r"[1-9]\d*", attempt)):
+                  print("::error title=signed-landing::REPO, PR, HEAD_SHA and GH_TOKEN must be set by the workflow, "
+                        "and GITHUB_RUN_ID and GITHUB_RUN_ATTEMPT by the runner")
+                  return 1
+              as_is_heads = os.environ.get("AS_IS_HEADS", "").split()
+              deadline = time.monotonic() + 120
+              known = {}
+
+              def keys_of(login):                       # one read for each committer, however many pull requests are judged
+                  if login not in known:
+                      known[login] = committer_keys(login, token, deadline)
+                  return known[login]
+
+              try:
+                  while True:
+                      try:
+                          seen = events_seen(repo, int(number), int(run_id), int(attempt), token, deadline)
+                          pr = fetch(f"/repos/{repo}/pulls/{number}", token, deadline)
+                          why = outrun(pr, seen[int(number)], event_head)
+                          if why:
+                              raise Behind(f"GitHub's answer for #{number} is {why}. Re-run this check")
+                          if standing(pr, event_head) == "here":
+                              count_settled(repo, pr, event_head, token, deadline)
+                          commits = fetch(f"/repos/{repo}/pulls/{number}/commits?per_page={LISTED}", token, deadline)
+                          others = sharing(repo, int(number), event_head, seen, token, deadline)
+                          print(judge_all(pr, commits, others, as_is_heads, event_head, keys_of))
+                          return 0
+                      except Behind:
+                          # This is the only run for this commit, so give GitHub's reads time to catch up
+                          # with the event before reporting: half the deadline, asking every five seconds.
+                          if deadline - time.monotonic() < 65:
+                              raise
+                          time.sleep(5)
+              except NotReady as exc:
+                  print(f"::error title=Not ready to land::{exc}")
+              except Unknown as exc:
+                  print(f"::error title=Could not check this pull request::{exc}.")
+              except Exception as exc:                  # never pass, and never fail without saying why
+                  print(f"::error title=Could not check this pull request::{type(exc).__name__}: {exc}. Re-run this check.")
+              return 1
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          PY

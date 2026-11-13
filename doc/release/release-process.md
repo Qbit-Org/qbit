@@ -43,6 +43,24 @@ longer-term branch model, and whether testnet-only releases continue, are
 pending operator decisions; this runbook does not set either. Whether a
 release has release candidates is decided per release.
 
+The release source, `TAG_TARGET`, is a reviewed public commit on the
+first-parent history of a protected public branch, usually `RELEASE_BRANCH`:
+normally GitHub's merge commit, not the pull request head
+([1. Tag](#1-tag)).
+
+Prerequisites for publishing with the publisher:
+
+- `Qbit-Org/qbit-guix.sigs` `main` must be protected by a ruleset with the
+  `deletion` and `non_fast_forward` rules; the publisher refuses every release
+  while it is not. Its `public-main` ruleset carries both rules, and its
+  `signed-commits` ruleset requires signed commits; both were applied on
+  2026-11-09, and their templates are in
+  `contrib/guix/repo-templates/qbit-guix.sigs/rulesets/`. A change to
+  `public-main` must keep both rules.
+- Every release-line branch passed as `--trusted-release-branch` must be
+  protected by a branch ruleset with the `deletion` and `non_fast_forward`
+  rules; a branch without both is refused.
+
 ## Roles
 
 | Role | Who | Responsible for |
@@ -213,6 +231,17 @@ Run these on the exact commit you will tag. Any later merge restarts the list.
 
 ### 1. Tag
 
+With merge-commit merges, tag the merge commit that landed the release pull
+request, not the pull request's head. Only the merge commit is a state the
+branch actually had: `0.1.x` and `1.0.0` do not require a pull request to be up
+to date before merging, `main` and `1.x.x` require it only once the Key Policy
+Gate is armed ([after the release](#after-the-release)), and an admin can
+bypass that rule, so a pull request head's tree can lack changes the branch had
+when it merged. The publisher refuses a tag target that is not on the
+first-parent history of `trusted_release_ref`. The release attestation is the
+operator's signature on the annotated tag; the target commit's own signature
+plays no part here.
+
 - [ ] A signer with an active mainnet `release-signing` key signs an
   annotated tag on the exact commit with that key, and checks that the
   signature's fingerprint is the one in `keys.json`:
@@ -263,7 +292,11 @@ contain `testnet`. As of 2026-11-10, the repository has no rc tags.
   signed manifests under `<VERSION>/<alias>/`.
 - [ ] Attestation PRs merge until each artifact set meets the builder quorum.
   Record the `qbit-guix.sigs` commit on `main` that you will count; it
-  becomes `GUIX_SIGS_REF`.
+  becomes `GUIX_SIGS_REF`. `GUIX_SIGS_REF`, the publisher's
+  `--guix-sigs-ref`, must be a state the `qbit-guix.sigs` branch actually
+  had: the merge commit that landed the attestations, or the branch tip, on
+  that branch's first-parent history. That is the same rule as for the release
+  tag target; a pull request head in `qbit-guix.sigs` is refused.
 - [ ] The packaged candidate's smoke-tested artifacts match the tagged
   build's `SHA256SUMS`.
 - [ ] Builders keep their build roots: step 3 copies the artifacts from their
@@ -281,8 +314,9 @@ publisher validates, with the publisher's own validators. The paths are
 examples.
 
 - [ ] The coordinator pins `STAGING_REF`: the full SHA of a public commit on
-  `RELEASE_BRANCH` that contains the tools and descends from `TAG_TARGET`.
-  Record it in the tracking issue. Staging, every signature and the
+  the first-parent history of `RELEASE_BRANCH` that contains the tools and
+  has `TAG_TARGET` on its own first-parent history. Record it in the
+  tracking issue. Staging, every signature and the
   combination run with `--trusted-release-ref "${STAGING_REF}"`.
 - [ ] Record the waivers this release uses in the tracking issue. Staging
   takes exactly the same subset of `--allow-unsigned-platform-artifacts` and
@@ -336,18 +370,18 @@ examples.
   v1.0.1. Record the printed `policy_sha256`, `sha256sums_sha256`,
   `artifact_count`, `counted_core`, `counted_photon`, `source_archive` and
   `source_sha256` in the tracking issue.
-- [ ] Before signing, each signer checks that `STAGING_REF` is on
-  `RELEASE_BRANCH` and that its release key policy (`keys.json` and the
-  certificates in `public-keys/`) is the branch's. Being on the branch does
-  not mean every change was reviewed: check the freeze's list of merges
-  without an approving review too. The block must print `ok`:
+- [ ] Before signing, each signer checks that `STAGING_REF` is on the
+  first-parent history of `RELEASE_BRANCH` and that its release key policy
+  (`keys.json` and the certificates in `public-keys/`) is the branch's. Being
+  on the branch does not mean every change was reviewed: check the freeze's
+  list of merges without an approving review too. The block must print `ok`:
 
   ```sh
   (
     set -eu
     git fetch origin
     branch="refs/remotes/origin/${RELEASE_BRANCH}"
-    git merge-base --is-ancestor "${STAGING_REF}" "$branch" || { echo "STAGING_REF is not on ${RELEASE_BRANCH}" >&2; exit 1; }
+    git rev-list --first-parent "$branch" | grep -Fx "${STAGING_REF}" >/dev/null || { echo "STAGING_REF is not on the first-parent history of ${RELEASE_BRANCH}" >&2; exit 1; }
     for p in keys.json public-keys; do
       test "$(git rev-parse "${STAGING_REF}:contrib/keys/operator-keys/$p")" = "$(git rev-parse "$branch:contrib/keys/operator-keys/$p")" || { echo "$p differs from ${RELEASE_BRANCH}" >&2; exit 1; }
     done
@@ -436,6 +470,9 @@ examples.
   - [ ] the P2MR v1 profile version, digests, results and consensus review;
   - [ ] the CI runs at the tag target, any unsigned-platform or codesigning
     waiver, and the review status recorded at the freeze.
+
+  Release-trust records written from now on name GitHub's merge commit as the
+  release source. Earlier records stay as they were written.
 - [ ] Right before the PR merges, check that the release key policy on
   `RELEASE_BRANCH`, `keys.json` and the certificates in `public-keys/`, is
   still the one at `STAGING_REF`; a certificate can change under an
@@ -477,6 +514,36 @@ in the trust record.
   `qbit-guix.sigs` clone at `GUIX_SIGS_REF`. Untracked files count as dirty,
   and the publisher refuses a shallow or partial clone
   ([checks](publisher-reference.md#trusted-release-ref)).
+- [ ] Fetch `RELEASE_BRANCH` into the publisher clone and the `qbit-guix.sigs`
+  branch into its clone. The publisher never fetches, and stops if a checkout
+  lacks the tip GitHub reports for its branch. If a merge lands after that
+  fetch, the publisher stops before it publishes anything; fetch again and
+  rerun it:
+
+  ```sh
+  git fetch origin "${RELEASE_BRANCH}"
+  git -C /srv/release/qbit-guix.sigs fetch origin main
+  ```
+
+  `TRUSTED_RELEASE_REF` must be on the first-parent history of the protected
+  branch that the publisher checks: `main` by default, or the branch passed
+  with `--trusted-release-branch`. For a release line such as `1.0.0` or
+  `1.x.x`, take `TRUSTED_RELEASE_REF` from that line's own branch and pass
+  `--trusted-release-branch` with that branch. GitHub must report that branch
+  as protected, and its active rules must include `non_fast_forward` and
+  `deletion`, so someone without admin rights cannot force-push away the
+  history it anchors or delete the branch. qbit's branch rulesets give
+  organization admins an always-bypass, so an admin can still rewrite that
+  history: the release's attestation is the operator-signed tag, and this
+  check guards against rewrites by non-admins. The publisher reads the tip
+  commit GitHub's API reports for the branch and refuses a trusted ref off
+  that line, such as a pull request head, which could carry validators and key
+  policy from an older base. It checks `GUIX_SIGS_REF` the same way: it must
+  be on the first-parent history of the `qbit-guix.sigs` branch, which GitHub
+  reports as protected with `non_fast_forward` and `deletion` rules, at the
+  exact tip GitHub reports. The publisher prints the trusted release branch it
+  uses and, when `--trusted-release-branch` is not given, reminds that a
+  release-line release must pass `--trusted-release-branch <line>`.
 - [ ] From the root of the publisher clone, run validation only. The paths
   are examples:
 
@@ -488,6 +555,7 @@ in the trust record.
     --release-line mainnet \
     --artifacts-dir /srv/release/v1.0.1/staged \
     --trusted-release-ref "${TRUSTED_RELEASE_REF}" \
+    --trusted-release-branch "${RELEASE_BRANCH}" \
     --guix-sigs-repo /srv/release/qbit-guix.sigs \
     --guix-sigs-ref "${GUIX_SIGS_REF}" \
     --p2mr-v1-conformance-evidence /srv/release/v1.0.1/p2mr/conformance-evidence.json \
@@ -500,6 +568,11 @@ in the trust record.
     --make-latest true
   ```
 
+  - `--trusted-release-branch` names the protected branch that carries
+    `TRUSTED_RELEASE_REF`, here `RELEASE_BRANCH`. Without it the publisher
+    checks `main`. A publisher from before this check, whose `--help` lists
+    no `--trusted-release-branch`, refuses the option as an unknown argument:
+    leave it out when `TRUSTED_RELEASE_REF` predates it.
   - The three `--p2mr-v1-*` files must be given as absolute paths. Mainnet
     requires all three.
   - `--require-photon` requires PHOTON artifacts and a PHOTON builder quorum.
@@ -562,11 +635,12 @@ immutable, the publisher cannot roll the release back.
   builder whose manifest does not match raises it in the tracking issue.
 - [ ] Integrate the release into `main` as the operator decides for that
   release. For v1.0.1 the decision is an admin fast-forward: an organization
-  admin moves `main` to `MAIN_TARGET`, the release commit on `RELEASE_BRANCH`
-  that the operator names in the tracking issue, bypassing `main`'s ruleset.
-  A fast-forward keeps the tag target and the trust records on `main` with
-  their SHAs. The block pushes only if `main` is an ancestor of
-  `MAIN_TARGET`, `MAIN_TARGET` is on `RELEASE_BRANCH`, and it contains
+  admin moves `main` to `MAIN_TARGET`, the release commit on the first-parent
+  history of `RELEASE_BRANCH` that the operator names in the tracking issue,
+  bypassing `main`'s ruleset. A fast-forward keeps the tag target and the
+  trust records on `main` with their SHAs. The block pushes only if `main` is
+  an ancestor of `MAIN_TARGET`, `MAIN_TARGET` is on the first-parent history
+  of `RELEASE_BRANCH`, and it contains
   `TAG_TARGET`, `TRUSTED_RELEASE_REF` and the merged follow-up trust record
   (`FOLLOW_UP_REF`, the commit that landed it):
 
@@ -575,7 +649,7 @@ immutable, the publisher cannot roll the release back.
     set -eu
     git fetch origin
     git merge-base --is-ancestor refs/remotes/origin/main "${MAIN_TARGET}" || { echo "main has commits that MAIN_TARGET lacks" >&2; exit 1; }
-    git merge-base --is-ancestor "${MAIN_TARGET}" "refs/remotes/origin/${RELEASE_BRANCH}" || { echo "MAIN_TARGET is not on ${RELEASE_BRANCH}" >&2; exit 1; }
+    git rev-list --first-parent "refs/remotes/origin/${RELEASE_BRANCH}" | grep -Fx "${MAIN_TARGET}" >/dev/null || { echo "MAIN_TARGET is not on the first-parent history of ${RELEASE_BRANCH}" >&2; exit 1; }
     for c in "${TAG_TARGET}" "${TRUSTED_RELEASE_REF}" "${FOLLOW_UP_REF}"; do
       git merge-base --is-ancestor "$c" "${MAIN_TARGET}" || { echo "MAIN_TARGET does not contain $c" >&2; exit 1; }
     done

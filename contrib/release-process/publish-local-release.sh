@@ -105,10 +105,16 @@ The script must come from a clean checkout whose HEAD is the trusted release
 ref. Validation is always performed before any release is created or changed.
 With neither --create-draft nor --publish, the script is validation-only.
 
+The script never fetches. Fetch the trusted release branch into this checkout
+and the qbit-guix.sigs branch into --guix-sigs-repo first: each checkout must
+have the tip GitHub reports for its branch.
+
 Required:
   --tag TAG                         Signed annotated release tag.
   --artifacts-dir DIR               Flat validator-approved staging directory.
-  --trusted-release-ref SHA         Full commit SHA of this trusted checkout.
+  --trusted-release-ref SHA         Full commit SHA of this trusted checkout. It
+                                     must be on the first-parent history of the
+                                     trusted release branch.
   --guix-sigs-repo DIR              Clean qbit-guix.sigs checkout.
   --guix-sigs-ref SHA               Full commit SHA of that checkout.
   --release-line LINE               testnet or mainnet.
@@ -145,6 +151,10 @@ Publication mode (mutually exclusive):
 
 Repository overrides:
   --repo OWNER/REPO                 Default: Qbit-Org/qbit.
+  --trusted-release-branch BRANCH   Protected branch that carries the trusted
+                                     release ref. Default: main; a release line
+                                     passes its own branch, such as 1.x.x. GitHub
+                                     must report it as protected.
   --guix-sigs-github-repo OWNER/REPO
                                      Default: Qbit-Org/qbit-guix.sigs.
   --guix-sigs-branch BRANCH         Default: main.
@@ -174,6 +184,29 @@ require_value() {
 
 lowercase() {
     printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+on_first_parent_history() {
+    # Succeeds if commit is on the first-parent history of history_ref, the
+    # sequence of states that branch actually had. Under merge commits, any
+    # other ancestor, including a merged pull request's head, can have a tree
+    # the branch never had. awk reads the whole list, so pipefail cannot fail
+    # on an early exit, and an unknown ref fails rev-list.
+    local root="$1"
+    local history_ref="$2"
+    local commit
+    commit="$(lowercase "$3")"
+    git -C "$root" rev-list --first-parent "$history_ref" \
+        | awk -v commit="$commit" '$0 == commit { found = 1 } END { exit !found }'
+}
+
+valid_branch_name() {
+    # Checks the full ref name, which, unlike check-ref-format --branch, never
+    # expands @{-N} from the current repository, and refuses a leading dash and
+    # HEAD as --branch does.
+    local name="$1"
+    [[ "$name" != -* && "$name" != HEAD ]] \
+        && git check-ref-format "refs/heads/$name" >/dev/null 2>&1
 }
 
 require_full_sha() {
@@ -340,6 +373,18 @@ PY
     ) || die "Release tag $TAG failed the signature check"
 }
 
+require_full_history() {
+    # A shallow checkout cuts the first-parent walk short, so a merged commit
+    # would be reported as not on its branch.
+    local label="$1"
+    local root="$2"
+    case "$(git -C "$root" rev-parse --is-shallow-repository)" in
+        false) ;;
+        true) die "The $label is shallow; run git fetch --unshallow in $root" ;;
+        *) die "Could not tell whether the $label is shallow" ;;
+    esac
+}
+
 github_repo_path() {
     local repository="$1"
     local owner
@@ -396,18 +441,51 @@ remote_commit() {
         || die "$label resolved to $resolved, expected $commit_sha"
 }
 
-remote_commit_on_branch() {
-    local repository="$1"
-    local commit_sha="$2"
+api_path_escape() {
+    # Percent-encodes a name for a GitHub API path. A valid branch name can
+    # contain # or %, which would otherwise end or change the path: main#x
+    # would query main.
+    "${PYTHON_SNIPPET[@]}" -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe="/"))' "$1"
+}
+
+protected_branch_tip() {
+    # Prints the tip of a protected GitHub branch after checking that the local
+    # checkout already has that commit, so its first-parent history can be read
+    # locally. The branch's active rules must forbid force pushes and deletion,
+    # so someone without admin rights cannot rewrite the history it anchors.
+    # qbit's branch rulesets let organization admins bypass them, so an admin
+    # still can: the release's attestation is the operator-signed tag, and this
+    # check guards against rewrites by everyone else. The publisher never
+    # fetches (see the top of this file), so the operator fetches the branch
+    # before running it. A merge that lands after that fetch stops the publisher
+    # here, before anything is published.
+    local root="$1"
+    local repository="$2"
     local branch="$3"
     local label="$4"
-    local status
-    status="$(gh api "repos/$repository/compare/$branch...$commit_sha" --jq '.status')" \
-        || die "$label $commit_sha is not comparable with $repository:$branch"
-    case "$status" in
-        behind|identical) ;;
-        *) die "$label $commit_sha is not reachable from $repository:$branch (status: $status)" ;;
-    esac
+    local branch_path
+    local branch_info
+    local api_tip
+    local protected
+    local rule_types
+    branch_path="$(api_path_escape "$branch")" \
+        || die "Could not encode $label branch name $branch"
+    branch_info="$(
+        gh api "repos/$repository/branches/$branch_path" \
+            --jq '[.commit.sha, (.protected | tostring)] | @tsv'
+    )" || die "Could not read $label branch $repository:$branch"
+    IFS=$'\t' read -r api_tip protected <<<"$branch_info"
+    require_full_sha "$label branch tip" "$api_tip"
+    [ "$protected" = true ] \
+        || die "$repository:$branch is not a protected branch; protect it with a ruleset before releasing from it"
+    rule_types="$(
+        gh api --paginate "repos/$repository/rules/branches/$branch_path" --jq '.[].type'
+    )" || die "Could not read the rules for $label branch $repository:$branch"
+    { grep -qx non_fast_forward <<<"$rule_types" && grep -qx deletion <<<"$rule_types"; } \
+        || die "$repository:$branch can be force-pushed or deleted; its ruleset needs non_fast_forward and deletion rules before releasing from it"
+    git -C "$root" cat-file -e "$api_tip^{commit}" 2>/dev/null \
+        || die "$label branch $repository:$branch is at $api_tip, which $root does not have; the publisher never fetches, so fetch $branch there and run it again"
+    lowercase "$api_tip"
 }
 
 remote_tag_pin_failure() {
@@ -765,6 +843,8 @@ PRERELEASE=preserve
 MAKE_LATEST=preserve
 MODE=validate
 GH_REPO=Qbit-Org/qbit
+TRUSTED_RELEASE_BRANCH=main
+TRUSTED_RELEASE_BRANCH_EXPLICIT=0
 GUIX_SIGS_GH_REPO=Qbit-Org/qbit-guix.sigs
 GUIX_SIGS_BRANCH=main
 
@@ -882,6 +962,12 @@ while [ "$#" -gt 0 ]; do
             GUIX_SIGS_BRANCH="$2"
             shift 2
             ;;
+        --trusted-release-branch)
+            require_value "$1" "${2:-}"
+            TRUSTED_RELEASE_BRANCH="$2"
+            TRUSTED_RELEASE_BRANCH_EXPLICIT=1
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -933,6 +1019,14 @@ require_git
 gh auth status >/dev/null
 require_full_sha --trusted-release-ref "$TRUSTED_RELEASE_REF"
 require_full_sha --guix-sigs-ref "$GUIX_SIGS_REF"
+valid_branch_name "$TRUSTED_RELEASE_BRANCH" \
+    || die "--trusted-release-branch is not a valid branch name: $TRUSTED_RELEASE_BRANCH"
+valid_branch_name "$GUIX_SIGS_BRANCH" \
+    || die "--guix-sigs-branch is not a valid branch name: $GUIX_SIGS_BRANCH"
+msg "Trusted release branch: $GH_REPO:$TRUSTED_RELEASE_BRANCH"
+if [ "$TRUSTED_RELEASE_BRANCH_EXPLICIT" -eq 0 ]; then
+    msg "Hint: a release-line release must pass --trusted-release-branch <line>"
+fi
 
 TRUSTED_ROOT="$(git -C "$SCRIPT_DIR/../.." rev-parse --show-toplevel 2>/dev/null)" \
     || die "Publisher is not running from a git checkout"
@@ -970,6 +1064,7 @@ GUIX_SIGS_SHA="$(git -C "$GUIX_SIGS_REPO" rev-parse HEAD)"
 [ "$(lowercase "$GUIX_SIGS_SHA")" = "$(lowercase "$GUIX_SIGS_REF")" ] \
     || die "qbit-guix.sigs checkout resolved $GUIX_SIGS_SHA, expected $GUIX_SIGS_REF"
 require_clean_checkout "qbit-guix.sigs checkout" "$GUIX_SIGS_REPO"
+require_full_history "qbit-guix.sigs checkout" "$GUIX_SIGS_REPO"
 # The validators read the qbit-guix.sigs files from an export of the pinned
 # commit (below), not from this working tree; index flags would only hide local
 # edits from the clean check above, so they are refused here, early.
@@ -1013,8 +1108,8 @@ TAG_TARGET="$(git -C "$TRUSTED_ROOT" rev-parse -q --verify "$TAG_OBJECT^{commit}
     || die "--trusted-release-ref must not equal the release tag object"
 [ "$(lowercase "$TRUSTED_RELEASE_REF")" != "$(lowercase "$TAG_TARGET")" ] \
     || die "--trusted-release-ref must not equal the release tag target"
-git -C "$TRUSTED_ROOT" merge-base --is-ancestor "$TAG_TARGET" "$TRUSTED_RELEASE_REF" \
-    || die "Release tag target $TAG_TARGET must be an ancestor of trusted release ref $TRUSTED_RELEASE_REF"
+on_first_parent_history "$TRUSTED_ROOT" "$TRUSTED_RELEASE_REF" "$TAG_TARGET" \
+    || die "Release tag target $TAG_TARGET must be on the first-parent history of trusted release ref $TRUSTED_RELEASE_REF: tag the merge commit that landed the release, not the pull request's head"
 
 GH_REPO_PATH="$(github_repo_path "$GH_REPO")"
 GUIX_SIGS_GH_REPO_PATH="$(github_repo_path "$GUIX_SIGS_GH_REPO")"
@@ -1023,12 +1118,20 @@ REPO_CAN_PUSH="$(
 )" || die "Could not verify authenticated access to $GH_REPO"
 [ "$REPO_CAN_PUSH" = true ] \
     || die "Authenticated GitHub account requires push access to $GH_REPO to discover draft releases"
-msg "Verifying trusted release ref is public"
+msg "Verifying trusted release ref is public and on $GH_REPO:$TRUSTED_RELEASE_BRANCH"
 remote_commit "$GH_REPO_PATH" "$TRUSTED_RELEASE_REF" "Trusted release ref"
+TRUSTED_BRANCH_TIP="$(
+    protected_branch_tip "$TRUSTED_ROOT" "$GH_REPO_PATH" "$TRUSTED_RELEASE_BRANCH" "Trusted release"
+)"
+on_first_parent_history "$TRUSTED_ROOT" "$TRUSTED_BRANCH_TIP" "$TRUSTED_RELEASE_REF" \
+    || die "Trusted release ref $TRUSTED_RELEASE_REF must be on the first-parent history of $GH_REPO:$TRUSTED_RELEASE_BRANCH ($TRUSTED_BRANCH_TIP)"
 msg "Verifying qbit-guix.sigs commit is public and merged"
 remote_commit "$GUIX_SIGS_GH_REPO_PATH" "$GUIX_SIGS_REF" "qbit-guix.sigs commit"
-remote_commit_on_branch "$GUIX_SIGS_GH_REPO_PATH" "$GUIX_SIGS_REF" \
-    "$GUIX_SIGS_BRANCH" "qbit-guix.sigs commit"
+GUIX_SIGS_BRANCH_TIP="$(
+    protected_branch_tip "$GUIX_SIGS_REPO" "$GUIX_SIGS_GH_REPO_PATH" "$GUIX_SIGS_BRANCH" "qbit-guix.sigs"
+)"
+on_first_parent_history "$GUIX_SIGS_REPO" "$GUIX_SIGS_BRANCH_TIP" "$GUIX_SIGS_REF" \
+    || die "qbit-guix.sigs commit $GUIX_SIGS_REF must be on the first-parent history of $GUIX_SIGS_GH_REPO:$GUIX_SIGS_BRANCH ($GUIX_SIGS_BRANCH_TIP): pin the merge commit that landed the attestations, not the pull request head"
 
 verify_remote_tag_pin initial
 

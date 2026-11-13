@@ -180,6 +180,31 @@ Then update every pin location in a separate commit:
 lists the remaining mentions to review; release notes and the fixed fixtures in
 `ci/scanners/test_run_scanners.py` keep theirs.
 
+### Signing The Import
+
+Under the signed-commit policy, `squash-sign` squashes the pull request's
+commits (the import, the pin and test changes, and the release notes) into one
+operator-signed commit. The helper's import is one main-line commit that
+carries the `git-subtree-dir` and `git-subtree-split` trailers, and
+`squash-sign` keeps those trailers, so the lint still passes; that needs one
+touch. See
+[Signed Commits](../development/public-branch-and-rulesets.md#signed-commits).
+
+For a large vendored import, the signature attests the pin, not a line-by-line
+reading of the vendored code: the operator does not review an import of about
+2,000 lines line by line. Before touching, the operator checks:
+
+- the upstream commit: `git-subtree-split` is the peeled commit of the signed
+  upstream release tag;
+- the lint result: `test/lint/libbitcoinpqc-subtree-check.sh` reports `GOOD`,
+  which compares the vendored tree with the upstream tree;
+- the pin test: every pin location names the new tag, and the tests that read
+  those pins pass.
+
+A fork pull request that touches `src/libbitcoinpqc` is not merged or
+recreated from the fork: a maintainer re-imports the release in a branch of
+this repository.
+
 ## Verify Subtree Integrity
 
 After importing, verify that the qbit subtree exactly matches the upstream
@@ -195,6 +220,11 @@ operator-01's pinned signing key and the tag's own header, should report
 `1965d0da1eb4d9e196613b8f3a5d0d866a221c53` for the current pin. It fetches
 the whole upstream history, which is small, because a `--depth` fetch would
 mark the qbit checkout shallow.
+
+The check's search for the newest import commit, described in
+[Refresh The Subtree](#refresh-the-subtree), walks every parent, not only the
+first: with merge-commit merges, the import commit is the merge's second
+parent, so a `--first-parent` search would skip it.
 
 The current qbit tree carries no downstream delta: `HEAD:src/libbitcoinpqc`
 must equal the tagged upstream tree. Since `v0.3.1`, upstream contains the

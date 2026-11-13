@@ -28,15 +28,16 @@
       "type": "non_fast_forward"
     },
     {
-      "type": "required_linear_history"
-    },
-    {
       "type": "required_status_checks",
       "parameters": {
         "do_not_enforce_on_create": true,
         "required_status_checks": [
           {
             "context": "Required Merge Gate"
+          },
+          {
+            "context": "signed-landing",
+            "integration_id": 15368
           }
         ],
         "strict_required_status_checks_policy": false
@@ -46,8 +47,7 @@
       "type": "pull_request",
       "parameters": {
         "allowed_merge_methods": [
-          "squash",
-          "rebase"
+          "merge"
         ],
         "dismiss_stale_reviews_on_push": true,
         "dismissal_restriction": {

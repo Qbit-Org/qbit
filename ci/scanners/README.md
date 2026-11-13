@@ -47,6 +47,36 @@ Git-history scanners are intentionally bounded. The runner resolves
 the default `origin/main` base, scheduled `0.1.x` runs scan the qbit
 `main...0.1.x` history window instead of inherited upstream `main` history.
 
+Without `--history-diff-base-ref`, gitleaks scans the whole history with
+`--remerge-diff`, which shows, as added lines, how each conflicted merge
+resolved its conflicts. qbit's history carries about 15.6k merge commits
+inherited from upstream, so the first full-history scan can report
+conflict-resolution lines from those merges as new findings. Triage them once
+in `triage.jsonl` on that first full scan, or scan with a base ref. gitleaks
+8.30.1 reports a finding in a conflicted file as `b/<path>`, so triage it under
+that name. On this repository the full-history scan takes about 45 seconds,
+against about 28 without `--remerge-diff`.
+
+## Fail Policies
+
+`--fail-policy` decides when the run exits non-zero:
+
+- `never`: never.
+- `infra-only`: a scanner failed or its tool is missing.
+- `infra-and-secrets` (the nightly default): `infra-only`, or gitleaks reports
+  an untriaged finding.
+- `high-critical`: `infra-only`, or any scanner reports an untriaged high or
+  critical finding. Every gitleaks finding counts as high.
+
+The two policies that fail on secrets, `infra-and-secrets` and
+`high-critical`, also fail when the gitleaks history scan is incomplete:
+gitleaks was skipped, failed or missing, ran without `--remerge-diff` on a Git
+older than 2.36, met a shallow boundary inside the scanned history, or the
+history has octopus merges, which `--remerge-diff` cannot show. A scan that
+missed part of the history cannot show that it holds no secret. Informational
+coverage gaps, such as a skipped zizmor or a skipped build-backed scanner, fail
+no policy.
+
 ## Artifact Policy
 
 The runner captures command stdout/stderr and full scanner reports under each scanner's `raw/` directory. Treat `raw/` as private because scanner output can contain sensitive paths, redacted secret context, or unpublished vulnerability details.

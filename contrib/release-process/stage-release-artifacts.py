@@ -661,12 +661,25 @@ def stage(args: argparse.Namespace) -> int:
             raise common.ReleaseToolError(str(exc)) from exc
 
         tag_object, tag_target = resolve_release_tag(checkout.root, args.tag)
-        ancestor = common.run_command(
-            [common.GIT, "-C", str(checkout.root), "merge-base", "--is-ancestor", tag_target, checkout.ref]
+        # The publisher's rule: only the first-parent line is a state the
+        # branch had, so the head of a merged pull request is refused.
+        first_parents = common.git_output(
+            common.GIT, checkout.root, ["rev-list", "--first-parent", checkout.ref],
+            action="read the first-parent history of the trusted release ref",
         )
-        if ancestor.returncode != 0:
+        if tag_target not in first_parents.split():
+            ancestor = common.run_command(
+                [common.GIT, "-C", str(checkout.root), "merge-base", "--is-ancestor", tag_target, checkout.ref]
+            )
+            if ancestor.returncode != 0:
+                raise common.ReleaseToolError(
+                    f"Release tag {args.tag} target {tag_target} is not an ancestor of the trusted release ref"
+                    f" {checkout.ref}"
+                )
             raise common.ReleaseToolError(
-                f"Release tag {args.tag} target {tag_target} is not an ancestor of the trusted release ref {checkout.ref}"
+                f"Release tag {args.tag} target {tag_target} is an ancestor of the trusted release ref"
+                f" {checkout.ref} but not on its first-parent history: tag the merge commit that landed the"
+                " release, not the pull request's head"
             )
         try:
             source_archive = vba.reconstruct_canonical_source_archive(

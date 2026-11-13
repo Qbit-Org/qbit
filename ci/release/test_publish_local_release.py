@@ -7,7 +7,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -73,6 +75,18 @@ class PublishLocalReleaseTest(unittest.TestCase):
         self.tag_target = git(self.trusted, "rev-parse", f"refs/tags/{TAG}^{{commit}}")
         self.trusted_ref = git(self.trusted, "rev-parse", "HEAD")
         self.guix_sigs_ref = git(self.guix_sigs, "rev-parse", "HEAD")
+        # Local bare repositories stand in for GitHub's copies. The publisher
+        # never fetches, so it reads only the checkouts; tests clone or commit
+        # in the bare repositories to make history a checkout lacks.
+        self.github = self.root / "github"
+        for repository, checkout in (
+            ("Qbit-Org/qbit", self.trusted),
+            ("Qbit-Org/qbit-guix.sigs", self.guix_sigs),
+        ):
+            bare = self.github / f"{repository}.git"
+            bare.parent.mkdir(parents=True, exist_ok=True)
+            git(self.root, "init", "-q", "--bare", "--initial-branch=main", str(bare))
+            git(checkout, "push", "-q", str(bare), "HEAD:refs/heads/main")
 
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
@@ -91,6 +105,7 @@ import hashlib
 import json
 import os
 import sys
+import urllib.parse
 from pathlib import Path
 
 args = sys.argv[1:]
@@ -161,8 +176,24 @@ if args and args[0] == "api":
                 ]
             )
         )
-    elif "/compare/" in endpoint:
-        print("behind")
+    elif "/rules/branches/" in endpoint:
+        tips = json.loads(os.environ["FAKE_GH_BRANCH_TIPS"])
+        path = urllib.parse.unquote(endpoint.split("#", 1)[0])
+        key = path[len("repos/"):].replace("/rules/branches/", "/", 1)
+        if key not in tips:
+            raise SystemExit(f"fake gh: no branch {key}")
+        rules = json.loads(os.environ.get("FAKE_GH_BRANCH_RULES", "{}"))
+        for rule_type in rules.get(key, ["deletion", "non_fast_forward", "required_signatures"]):
+            print(rule_type)
+    elif "/branches/" in endpoint:
+        tips = json.loads(os.environ["FAKE_GH_BRANCH_TIPS"])
+        # Like gh, drop a URL fragment and decode the path.
+        path = urllib.parse.unquote(endpoint.split("#", 1)[0])
+        key = path[len("repos/"):].replace("/branches/", "/", 1)
+        if key not in tips:
+            raise SystemExit(f"fake gh: no branch {key}")
+        unprotected = json.loads(os.environ.get("FAKE_GH_UNPROTECTED_BRANCHES", "[]"))
+        print(tips[key] + "\t" + ("false" if key in unprotected else "true"))
     elif "/commits/" in endpoint:
         print(endpoint.rsplit("/", 1)[1])
     elif endpoint.count("/") == 2:
@@ -340,7 +371,7 @@ raise SystemExit(2)
     def _build_trusted_checkout(self) -> Path:
         root = self.root / "trusted"
         root.mkdir()
-        git(root, "init", "-q")
+        git(root, "init", "-q", "-b", "main")
         (root / "README.md").write_text("release source\n", encoding="utf8")
         git(root, "add", "README.md")
         git(root, "commit", "-q", "-m", "release source")
@@ -498,7 +529,7 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         keys_dir = root / "operator-keys"
         keys_dir.mkdir(parents=True)
         (keys_dir / "keys.json").write_text('{"schema_version": 2}\n', encoding="utf8")
-        git(root, "init", "-q")
+        git(root, "init", "-q", "-b", "main")
         git(root, "add", "-A")
         git(root, "commit", "-q", "-m", "builder attestations")
         return root
@@ -535,13 +566,24 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         tag_object_during_immutable_poll: str | None = None,
         mutate_notes_file: Path | None = None,
         asset_list_sequence: tuple[str, ...] = ("ok",),
+        branch_tips: dict[str, str] | None = None,
+        unprotected_branches: tuple[str, ...] = (),
+        branch_rules: dict[str, list[str]] | None = None,
         cwd: Path | None = None,
         extra_env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = dict(os.environ)
         env["PATH"] = f"{self.bin_dir}{os.pathsep}{env['PATH']}"
+        tips = {
+            "Qbit-Org/qbit/main": self.trusted_ref,
+            "Qbit-Org/qbit-guix.sigs/main": self.guix_sigs_ref,
+        }
+        tips.update(branch_tips or {})
         env.update(
             {
+                "FAKE_GH_BRANCH_TIPS": json.dumps(tips),
+                "FAKE_GH_UNPROTECTED_BRANCHES": json.dumps(list(unprotected_branches)),
+                "FAKE_GH_BRANCH_RULES": json.dumps(branch_rules or {}),
                 "FAKE_GH_STATE": str(self.gh_state),
                 "FAKE_GH_LOG": str(self.gh_log),
                 "FAKE_GH_TAG": TAG,
@@ -1056,8 +1098,15 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
     def test_validation_only_rejects_matching_mutable_published_release(self) -> None:
         (self.gh_state / "release-state").write_text("published\n", encoding="utf8")
 
+        bare = self.github / "Example-Org" / "release-target.git"
+        bare.parent.mkdir(parents=True)
+        git(self.root, "init", "-q", "--bare", "--initial-branch=main", str(bare))
+        git(self.trusted, "push", "-q", str(bare), "HEAD:refs/heads/main")
         result = self.run_publisher(
-            "--repo", "Example-Org/release-target", immutable_sequence=("false",)
+            "--repo",
+            "Example-Org/release-target",
+            immutable_sequence=("false",),
+            branch_tips={"Example-Org/release-target/main": self.trusted_ref},
         )
 
         self.assertNotEqual(result.returncode, 0)
@@ -1566,6 +1615,370 @@ with open(os.environ["FAKE_VALIDATOR_LOG"], "a", encoding="utf8") as log:
         self.assertNotIn("Found matching draft release", result.stdout)
         self.assertNotIn("gh release upload", result.stdout)
         self.assertNotIn("Validation-only mode", result.stdout)
+
+
+    def _set_github_branch(self, repository: str, checkout: Path, branch: str, commit: str) -> None:
+        bare = self.github / f"{repository}.git"
+        git(checkout, "push", "-q", "--force", str(bare), f"{commit}:refs/heads/{branch}")
+
+    def _merge_object(self, checkout: Path, first_parent: str | None, second_parent: str) -> str:
+        """Create, without moving HEAD, a branch state that merges second_parent.
+
+        The branch's own line starts from first_parent, or from a new root."""
+        tree = f"{first_parent or second_parent}^{{tree}}"
+        parents = ["-p", first_parent] if first_parent else []
+        side = git(checkout, "commit-tree", tree, *parents, "-m", "side")
+        return git(
+            checkout, "commit-tree", f"{second_parent}^{{tree}}",
+            "-p", side, "-p", second_parent, "-m", "Merge pull request #1",
+        )
+
+    def test_trusted_release_ref_on_branch_first_parent_history_passes(self) -> None:
+        later = git(
+            self.trusted, "commit-tree", f"{self.trusted_ref}^{{tree}}",
+            "-p", self.trusted_ref, "-m", "main moved on",
+        )
+        self._set_github_branch("Qbit-Org/qbit", self.trusted, "main", later)
+        result = self.run_publisher(branch_tips={"Qbit-Org/qbit/main": later})
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("repos/Qbit-Org/qbit/branches/main", self.gh_log.read_text(encoding="utf8"))
+
+    def test_trusted_release_ref_merged_as_pull_request_head_fails(self) -> None:
+        merge = self._merge_object(self.trusted, self.tag_target, self.trusted_ref)
+        self._set_github_branch("Qbit-Org/qbit", self.trusted, "main", merge)
+        result = self.run_publisher(branch_tips={"Qbit-Org/qbit/main": merge})
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            f"Trusted release ref {self.trusted_ref} must be on the first-parent history of "
+            "Qbit-Org/qbit:main",
+            result.stderr,
+        )
+
+    def test_branch_tip_missing_from_the_checkout_fails_without_a_fetch(self) -> None:
+        # A merge landed on GitHub after the operator's last fetch: the API
+        # reports a tip that only GitHub has. The publisher stops and fetches
+        # nothing.
+        for repository, checkout, label in (
+            ("Qbit-Org/qbit", self.trusted, "Trusted release"),
+            ("Qbit-Org/qbit-guix.sigs", self.guix_sigs, "qbit-guix.sigs"),
+        ):
+            with self.subTest(repository=repository):
+                bare = self.github / f"{repository}.git"
+                later = git(
+                    bare, "commit-tree", "refs/heads/main^{tree}",
+                    "-p", "refs/heads/main", "-m", "merge that landed meanwhile",
+                )
+                git(bare, "update-ref", "refs/heads/main", later)
+                result = self.run_publisher(branch_tips={f"{repository}/main": later})
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    f"{label} branch {repository}:main is at {later}, which {checkout} does not have",
+                    result.stderr,
+                )
+                self.assertNotIn("first-parent history", result.stderr)
+                missing = subprocess.run(
+                    ["git", "-C", str(checkout), "cat-file", "-e", f"{later}^{{commit}}"],
+                    check=False, capture_output=True,
+                )
+                self.assertNotEqual(missing.returncode, 0)
+
+    def test_unprotected_trusted_release_branch_fails(self) -> None:
+        self._set_github_branch("Qbit-Org/qbit", self.trusted, "topic", self.trusted_ref)
+        result = self.run_publisher(
+            "--trusted-release-branch", "topic",
+            branch_tips={"Qbit-Org/qbit/topic": self.trusted_ref},
+            unprotected_branches=("Qbit-Org/qbit/topic",),
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "Qbit-Org/qbit:topic is not a protected branch; protect it with a ruleset before releasing from it",
+            result.stderr,
+        )
+
+    def test_unprotected_guix_sigs_branch_fails(self) -> None:
+        result = self.run_publisher(unprotected_branches=("Qbit-Org/qbit-guix.sigs/main",))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "Qbit-Org/qbit-guix.sigs:main is not a protected branch; protect it with a ruleset before releasing from it",
+            result.stderr,
+        )
+
+    def test_guix_sigs_branch_without_rules_fails(self) -> None:
+        # Live today: qbit-guix.sigs main is protected but has no rules.
+        result = self.run_publisher(branch_rules={"Qbit-Org/qbit-guix.sigs/main": []})
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "Qbit-Org/qbit-guix.sigs:main can be force-pushed or deleted; its ruleset needs "
+            "non_fast_forward and deletion rules before releasing from it",
+            result.stderr,
+        )
+
+    def test_trusted_branch_needs_both_history_rules(self) -> None:
+        for rules in (["deletion", "required_signatures"], ["non_fast_forward", "pull_request"]):
+            with self.subTest(rules=rules):
+                result = self.run_publisher(branch_rules={"Qbit-Org/qbit/main": rules})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Qbit-Org/qbit:main can be force-pushed or deleted", result.stderr)
+
+    def test_branch_rules_are_read_with_the_encoded_branch_name(self) -> None:
+        self._set_github_branch("Qbit-Org/qbit", self.trusted, "rel#1", self.trusted_ref)
+        result = self.run_publisher(
+            "--trusted-release-branch", "rel#1",
+            branch_tips={"Qbit-Org/qbit/rel#1": self.trusted_ref},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("repos/Qbit-Org/qbit/rules/branches/rel%231", self.gh_log.read_text(encoding="utf8"))
+
+    def test_default_trusted_release_branch_is_printed_with_hint(self) -> None:
+        hint = "==> Hint: a release-line release must pass --trusted-release-branch <line>"
+        for tag in (TAG, "v1.2.3"):
+            with self.subTest(tag=tag):
+                result = self.run_publisher("--tag", tag)
+                self.assertIn("==> Trusted release branch: Qbit-Org/qbit:main", result.stdout)
+                self.assertIn(hint, result.stdout)
+
+    def test_explicit_trusted_release_branch_prints_no_hint(self) -> None:
+        result = self.run_publisher("--trusted-release-branch", "main")
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("==> Trusted release branch: Qbit-Org/qbit:main", result.stdout)
+        self.assertNotIn("Hint: a release-line release", result.stdout)
+
+    def test_release_line_uses_its_own_trusted_branch(self) -> None:
+        self._set_github_branch("Qbit-Org/qbit", self.trusted, "1.x.x", self.trusted_ref)
+        result = self.run_publisher(
+            "--trusted-release-branch", "1.x.x",
+            branch_tips={"Qbit-Org/qbit/1.x.x": self.trusted_ref},
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("repos/Qbit-Org/qbit/branches/1.x.x", self.gh_log.read_text(encoding="utf8"))
+
+    def test_invalid_trusted_release_branch_fails(self) -> None:
+        result = self.run_publisher("--trusted-release-branch", "bad..branch")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--trusted-release-branch is not a valid branch name", result.stderr)
+
+    def test_branch_names_are_checked_as_full_refs(self) -> None:
+        # Run where @{-1} names a real branch: check-ref-format --branch would
+        # expand it and accept it.
+        git(self.trusted, "checkout", "-q", "-b", "previous")
+        git(self.trusted, "checkout", "-q", "main")
+        for option in ("--trusted-release-branch", "--guix-sigs-branch"):
+            for name in ("@{-1}", "a..b", "-x", "HEAD"):
+                with self.subTest(option=option, name=name):
+                    result = self.run_publisher(option, name, cwd=self.trusted)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(f"{option} is not a valid branch name: {name}", result.stderr)
+
+    def test_branch_name_is_percent_encoded_in_the_api_path(self) -> None:
+        # A valid branch name can contain '#'. Unencoded, it would start a URL
+        # fragment and the publisher would read main instead.
+        result = self.run_publisher("--trusted-release-branch", "main#x")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("repos/Qbit-Org/qbit/branches/main%23x", self.gh_log.read_text(encoding="utf8"))
+        self.assertIn("Could not read Trusted release branch Qbit-Org/qbit:main#x", result.stderr)
+
+    def test_shallow_trusted_checkout_fails(self) -> None:
+        # The publisher's own checkout, cloned shallow at the branch tip: the
+        # walk from the tip would miss the trusted release ref.
+        later = git(
+            self.trusted, "commit-tree", f"{self.trusted_ref}^{{tree}}",
+            "-p", self.trusted_ref, "-m", "main moved on",
+        )
+        self._set_github_branch("Qbit-Org/qbit", self.trusted, "main", later)
+        bare = self.github / "Qbit-Org/qbit.git"
+        git(self.trusted, "push", "-q", str(bare), f"refs/tags/{TAG}")
+        shallow = self.root / "qbit-shallow"
+        git(
+            self.root, "clone", "-q", "--depth", "1", "--branch", "main",
+            f"file://{bare}", str(shallow),
+        )
+        git(shallow, "fetch", "-q", "origin", self.trusted_ref, f"refs/tags/{TAG}:refs/tags/{TAG}")
+        git(shallow, "checkout", "-q", "--detach", self.trusted_ref)
+        self.assertEqual(git(shallow, "rev-parse", "--is-shallow-repository"), "true")
+        self.trusted = shallow
+        result = self.run_publisher(branch_tips={"Qbit-Org/qbit/main": later})
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Trusted release checkout must not be shallow", result.stderr)
+        self.assertNotIn("must be on the first-parent history", result.stderr)
+
+    def test_guix_sigs_ref_on_branch_first_parent_history_passes(self) -> None:
+        later = git(
+            self.guix_sigs, "commit-tree", f"{self.guix_sigs_ref}^{{tree}}",
+            "-p", self.guix_sigs_ref, "-m", "more attestations",
+        )
+        self._set_github_branch("Qbit-Org/qbit-guix.sigs", self.guix_sigs, "main", later)
+        result = self.run_publisher(branch_tips={"Qbit-Org/qbit-guix.sigs/main": later})
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            "repos/Qbit-Org/qbit-guix.sigs/branches/main", self.gh_log.read_text(encoding="utf8")
+        )
+
+    def test_shallow_guix_sigs_checkout_fails(self) -> None:
+        # In a shallow clone of the branch tip, the walk from the tip stops at
+        # the shallow boundary and misses a merged commit fetched afterwards.
+        later = git(
+            self.guix_sigs, "commit-tree", f"{self.guix_sigs_ref}^{{tree}}",
+            "-p", self.guix_sigs_ref, "-m", "more attestations",
+        )
+        self._set_github_branch("Qbit-Org/qbit-guix.sigs", self.guix_sigs, "main", later)
+        shallow = self.root / "qbit-guix.sigs-shallow"
+        git(
+            self.root, "clone", "-q", "--depth", "1", "--branch", "main",
+            f"file://{self.github}/Qbit-Org/qbit-guix.sigs.git", str(shallow),
+        )
+        git(shallow, "fetch", "-q", "origin", self.guix_sigs_ref)
+        git(shallow, "checkout", "-q", "--detach", self.guix_sigs_ref)
+        self.assertEqual(git(shallow, "rev-parse", "--is-shallow-repository"), "true")
+        self.guix_sigs = shallow
+        result = self.run_publisher(branch_tips={"Qbit-Org/qbit-guix.sigs/main": later})
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "The qbit-guix.sigs checkout is shallow; run git fetch --unshallow", result.stderr
+        )
+        self.assertNotIn("must be on the first-parent history", result.stderr)
+
+    def test_guix_sigs_ref_merged_as_pull_request_head_fails(self) -> None:
+        merge = self._merge_object(self.guix_sigs, None, self.guix_sigs_ref)
+        self._set_github_branch("Qbit-Org/qbit-guix.sigs", self.guix_sigs, "main", merge)
+        result = self.run_publisher(branch_tips={"Qbit-Org/qbit-guix.sigs/main": merge})
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            f"qbit-guix.sigs commit {self.guix_sigs_ref} must be on the first-parent history of "
+            "Qbit-Org/qbit-guix.sigs:main",
+            result.stderr,
+        )
+        self.assertIn(
+            "pin the merge commit that landed the attestations, not the pull request head", result.stderr
+        )
+
+
+def extract_shell_function(source: str, name: str) -> str:
+    match = re.search(rf"^{name}\(\) \{{\n.*?^\}}\n", source, re.MULTILINE | re.DOTALL)
+    if match is None:
+        raise AssertionError(f"{name} is not defined in {PUBLISHER}")
+    return match.group(0)
+
+
+class FirstParentHistoryTest(unittest.TestCase):
+    """Run the publisher's first-parent history check on a merge-commit history."""
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.repo = Path(self.temp_dir.name) / "repo"
+        self.repo.mkdir()
+        git(self.repo, "init", "-q", "-b", "main")
+        self.commits: dict[str, str] = {}
+        self._commit("m1", "base.txt")
+        self._commit("m2", "base.txt")
+        # A multi-commit pull request merged with the merge button.
+        self._branch_and_merge("multi", ["multi-1", "multi-2"], "merge-multi")
+        # A release pull request opened on a stale base: main gets S while it
+        # is open, so the merge has X+S+R but the pull request head has X+R.
+        git(self.repo, "checkout", "-q", "-b", "release")
+        self._commit("release", "release.txt")
+        git(self.repo, "checkout", "-q", "main")
+        self._commit("main-while-release-open", "base.txt")
+        self._merge("release", "merge-release")
+        # A long-lived side line merged in.
+        self._branch_and_merge("line", ["line-1", "line-2", "line-3"], "merge-line")
+        self._commit("m3", "base.txt")
+        self.trusted_ref = self.commits["m3"]
+        source = PUBLISHER.read_text(encoding="utf8")
+        self.script = "\n".join(
+            [
+                "set -euo pipefail",
+                extract_shell_function(source, "lowercase"),
+                extract_shell_function(source, "on_first_parent_history"),
+                'on_first_parent_history "$1" "$2" "$3"',
+            ]
+        )
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def _commit(self, label: str, path: str = "file") -> None:
+        (self.repo / path).write_text(f"{label}\n", encoding="utf8")
+        git(self.repo, "add", path)
+        git(self.repo, "commit", "-q", "-m", label)
+        self.commits[label] = git(self.repo, "rev-parse", "HEAD")
+
+    def _merge(self, branch: str, merge_label: str) -> None:
+        git(self.repo, "merge", "-q", "--no-ff", "-m", merge_label, branch)
+        self.commits[merge_label] = git(self.repo, "rev-parse", "HEAD")
+
+    def _branch_and_merge(self, branch: str, labels: list[str], merge_label: str) -> None:
+        git(self.repo, "checkout", "-q", "-b", branch)
+        for label in labels:
+            self._commit(label, f"{branch}.txt")
+        git(self.repo, "checkout", "-q", "main")
+        self._merge(branch, merge_label)
+
+    def check(self, commit: str, history_ref: str | None = None) -> int:
+        result = subprocess.run(
+            [
+                "bash",
+                "-c",
+                self.script,
+                "first-parent-check",
+                str(self.repo),
+                history_ref or self.trusted_ref,
+                commit,
+            ],
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode
+
+    def test_first_parent_commits_pass(self) -> None:
+        for label in ("m1", "m2", "main-while-release-open", "m3"):
+            with self.subTest(label=label):
+                self.assertEqual(self.check(self.commits[label]), 0)
+
+    def test_merge_commits_pass(self) -> None:
+        for label in ("merge-multi", "merge-release", "merge-line"):
+            with self.subTest(label=label):
+                self.assertEqual(self.check(self.commits[label]), 0)
+
+    def test_uppercase_commit_passes(self) -> None:
+        self.assertEqual(self.check(self.commits["merge-release"].upper()), 0)
+
+    def test_merged_pull_request_heads_fail(self) -> None:
+        for label in ("release", "multi-2"):
+            with self.subTest(label=label):
+                self.assertNotEqual(self.check(self.commits[label]), 0)
+
+    def test_stale_base_pull_request_head_never_was_a_branch_state(self) -> None:
+        head_tree = git(self.repo, "rev-parse", f"{self.commits['release']}^{{tree}}")
+        merge_tree = git(self.repo, "rev-parse", f"{self.commits['merge-release']}^{{tree}}")
+        self.assertNotEqual(head_tree, merge_tree)
+        self.assertNotEqual(self.check(self.commits["release"]), 0)
+        self.assertEqual(self.check(self.commits["merge-release"]), 0)
+
+    def test_intermediate_commit_of_merged_pull_request_fails(self) -> None:
+        self.assertNotEqual(self.check(self.commits["multi-1"]), 0)
+
+    def test_merged_long_lived_branch_commits_fail(self) -> None:
+        for label in ("line-3", "line-2", "line-1"):
+            with self.subTest(label=label):
+                self.assertNotEqual(self.check(self.commits[label]), 0)
+
+    def test_unknown_history_ref_fails(self) -> None:
+        self.assertNotEqual(self.check(self.commits["m2"], history_ref="1" * 40), 0)
 
 
 if __name__ == "__main__":

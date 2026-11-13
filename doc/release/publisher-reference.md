@@ -100,7 +100,7 @@ tag target, not from this checkout.
   validators from that export (`python3 -E -s -S -B`), so the working tree,
   the index and stale bytecode cannot change them;
 - the SHA is neither the tag object nor the tag target;
-- the tag target is an ancestor of the SHA;
+- the tag target is on the SHA's first-parent history;
 - GitHub serves the commit from the target repository (`remote_commit`,
   through the commits API).
 
@@ -114,8 +114,14 @@ commit-graph. The publisher therefore requires git 2.31 or newer.
 [contrib/release-process/README.md](../../contrib/release-process/README.md)
 describes the same isolation for the staging tools.
 
-**Process, not enforced:** the publisher does not check branch protection,
-reviews, or which branch contains the commit. By process,
+The publisher also requires the SHA to be on the first-parent history of the
+trusted release branch, `--trusted-release-branch` (default `main`; a release
+line passes its own branch, such as `1.x.x`). GitHub must report that branch
+as protected, with `non_fast_forward` and `deletion` among its active rules.
+The publisher reads the branch's tip from GitHub, and the checkout must
+already have that tip, because the publisher never fetches.
+
+**Process, not enforced:** the publisher does not check reviews. By process,
 `trusted_release_ref` is the commit that lands the trust-record PR on the
 release branch, and the trust record states how it was chosen. A later
 revision of the trust record never moves it.
@@ -129,8 +135,10 @@ revision of the trust record never moves it.
   is not a partial clone and has no assume-unchanged or skip-worktree flags;
 - the commit exists on GitHub (`--guix-sigs-github-repo`, default
   `Qbit-Org/qbit-guix.sigs`);
-- the commit is reachable from `--guix-sigs-branch`, default `main`: GitHub's
-  compare status from that branch to the commit is `behind` or `identical`;
+- the commit is on the first-parent history of `--guix-sigs-branch`, default
+  `main`, which GitHub reports as protected with `non_fast_forward` and
+  `deletion` rules, at the tip GitHub reports, which the clone must already
+  have; a pull request head is refused;
 - the clone's `operator-keys/` mirror matches the trusted key policy
   ([key policy](#key-policy)).
 
