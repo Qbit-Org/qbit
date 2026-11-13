@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "profile": "qbit-p2mr-v1",
+  "profile_version": 1,
+  "specification_commit": "0439a7e5b37fb3f7e4ddfb735b68961445a882c8",
+  "corpus_manifest_sha256": "00cd4e1cc25a0540e3a0d372737b490a66eeff2bea9b09f4cccccc5fa97cd7ab",
+  "release_tag": "v1.0.1",
+  "release_source_commit": "0439a7e5b37fb3f7e4ddfb735b68961445a882c8",
+  "consensus_review": {
+    "source_commit": "0439a7e5b37fb3f7e4ddfb735b68961445a882c8",
+    "evidence": "https://github.com/Qbit-Org/qbit/blob/3989ffd0a126d0d447734acd0e93b21263d70185/doc/release-trust-1.0.1.md#consensus-review"
+  },
+  "oracle": {
+    "name": "p2mr-v1-oracle",
+    "version": "1",
+    "source_commit": "0439a7e5b37fb3f7e4ddfb735b68961445a882c8",
+    "report_sha256": "8728d4a2b385d22175221b313077752a4c8768d518430d40630f7b9ed7c57c08",
+    "result": "pass",
+    "case_count": 80
+  },
+  "qbit": {
+    "test_binary_commit": "0439a7e5b37fb3f7e4ddfb735b68961445a882c8",
+    "result": "pass",
+    "case_count": 80,
+    "evidence": "https://github.com/Qbit-Org/qbit/actions/runs/43449959636"
+  },
+  "integration_matrix": {
+    "release_source_commit": "0439a7e5b37fb3f7e4ddfb735b68961445a882c8",
+    "sha256": "19f2760eb5152740870ae8131df65613c9f18fbaa292c41738c97b5aff99268d",
+    "blocking_failures": 0,
+    "unresolved_claimed_support": 0
+  }
+}
