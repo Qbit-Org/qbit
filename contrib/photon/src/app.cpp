@@ -14,6 +14,7 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace photon::app {
 namespace {
@@ -42,6 +43,53 @@ std::string PeerStatsLogFields(const PeerManagerStats& stats)
         + " peer_session_replacements=" + std::to_string(stats.totals.session_replacements)
         + " peer_session_replacement_rejects=" + std::to_string(stats.totals.session_replacement_rejects)
         + " peer_resolve_failures=" + std::to_string(stats.totals.resolve_failures);
+}
+
+std::string RelayStatsLogFields(const RelayStats& stats)
+{
+    return " blocks_out=" + std::to_string(stats.blocks_relayed_out)
+        + " blocks_in=" + std::to_string(stats.blocks_received_in)
+        + " known=" + std::to_string(stats.blocks_already_known)
+        + " chunks_sent=" + std::to_string(stats.chunks_sent)
+        + " chunks_recv=" + std::to_string(stats.chunks_received)
+        + " submit_ok=" + std::to_string(stats.submit_successes)
+        + " submit_fail=" + std::to_string(stats.submit_failures)
+        + " submit_duplicate=" + std::to_string(stats.submit_duplicates)
+        + " submit_inconclusive=" + std::to_string(stats.submit_inconclusive)
+        + " submit_rejected=" + std::to_string(stats.submit_rejected)
+        + " submit_timeout=" + std::to_string(stats.submit_timeouts)
+        + " submit_error=" + std::to_string(stats.submit_errors)
+        + " block_mismatch=" + std::to_string(stats.blocks_mismatched)
+        + " block_parent_rejected=" + std::to_string(stats.blocks_parent_rejected)
+        + " block_parent_unknown=" + std::to_string(stats.blocks_parent_unknown)
+        + " block_check_unavailable=" + std::to_string(stats.block_checks_unavailable)
+        + " block_node_behind=" + std::to_string(stats.blocks_node_behind)
+        + " block_parent_pending=" + std::to_string(stats.blocks_parent_pending)
+        + " node_retries=" + std::to_string(stats.node_retries)
+        + " held_dropped=" + std::to_string(stats.held_blocks_dropped)
+        + " inbound_rejected=" + std::to_string(stats.inbound_rejected)
+        + " inbound_evicted=" + std::to_string(stats.inbound_evictions)
+        + " inbound_entries=" + std::to_string(stats.inbound_entries)
+        + " inbound_decoder_bytes=" + std::to_string(stats.inbound_decoder_bytes)
+        + " peer_suspensions=" + std::to_string(stats.peer_suspensions);
+}
+
+void LogPeerRelayStats(const RelayEngine& relay_engine, const std::vector<PeerConfig>& peers)
+{
+    for (const PeerRelayStats& stats : relay_engine.PeerStatsSnapshot()) {
+        const std::string name = stats.slot_index < peers.size() ? peers[stats.slot_index].name : std::string{};
+        LOG_INFO("peer relay stats peer=" + name
+                 + " slot=" + std::to_string(stats.slot_index)
+                 + " blocks_in=" + std::to_string(stats.blocks_received_in)
+                 + " faults=" + std::to_string(stats.faults)
+                 + " inbound_rejected=" + std::to_string(stats.inbound_rejected)
+                 + " inbound_evicted=" + std::to_string(stats.inbound_evictions)
+                 + " fault_score=" + std::to_string(stats.fault_score)
+                 + " suspensions=" + std::to_string(stats.suspensions)
+                 + " suspended=" + std::string(stats.suspended ? "1" : "0")
+                 + " inbound_entries=" + std::to_string(stats.inbound_entries)
+                 + " inbound_decoder_bytes=" + std::to_string(stats.inbound_decoder_bytes));
+    }
 }
 
 void PrintUsage(std::ostream& out, const char* program)
@@ -87,9 +135,16 @@ public:
         return m_rpc.GetBlock(hash_hex);
     }
 
-    bool SubmitBlock(std::span<const std::uint8_t> block_data) override
+    SubmitOutcome SubmitBlock(std::span<const std::uint8_t> block_data) override
     {
         return m_rpc.SubmitBlock(block_data);
+    }
+
+    ParentCheck CheckParent(const std::string& block_hash_hex,
+                            const std::string& prev_hash_hex,
+                            std::uint32_t max_depth) override
+    {
+        return m_rpc.CheckParent(block_hash_hex, prev_hash_hex, max_depth);
     }
 
 private:
@@ -146,7 +201,14 @@ public:
     {
     }
 
-    bool SubmitBlock(std::span<const std::uint8_t> block_data) override
+    ParentCheck CheckParent(const std::string& block_hash_hex,
+                            const std::string& prev_hash_hex,
+                            std::uint32_t max_depth) override
+    {
+        return m_rpc.CheckParent(block_hash_hex, prev_hash_hex, max_depth);
+    }
+
+    SubmitOutcome SubmitBlock(std::span<const std::uint8_t> block_data) override
     {
         return m_rpc.SubmitBlock(block_data);
     }
@@ -381,6 +443,7 @@ int Run(int argc, char** argv, std::ostream& out, std::ostream& err, Deps deps)
                 relay_engine.OnNewBlock(hash_hex, *block);
             }
         }
+        relay_engine.RetryHeldBlock(submitter);
 
         const auto now = clock.Now();
         if (now >= next_stats_log) {
@@ -388,17 +451,10 @@ int Run(int argc, char** argv, std::ostream& out, std::ostream& err, Deps deps)
             const PeerManagerStats peer_stats = peer_manager.StatsSnapshot();
             LOG_INFO("stats"
                      + PeerStatsLogFields(peer_stats)
-                     + " blocks_out=" + std::to_string(stats.blocks_relayed_out)
-                     + " blocks_in=" + std::to_string(stats.blocks_received_in)
-                     + " known=" + std::to_string(stats.blocks_already_known)
-                     + " chunks_sent=" + std::to_string(stats.chunks_sent)
-                     + " chunks_recv=" + std::to_string(stats.chunks_received)
-                     + " submit_ok=" + std::to_string(stats.submit_successes)
-                     + " submit_fail=" + std::to_string(stats.submit_failures)
-                     + " inbound_rejected=" + std::to_string(stats.inbound_rejected)
-                     + " inbound_evicted=" + std::to_string(stats.inbound_evictions)
+                     + RelayStatsLogFields(stats)
                      + " udp_parse_errors=" + std::to_string(udp_parse_error_logs.total())
                      + " udp_parse_error_logs_suppressed=" + std::to_string(udp_parse_error_logs.suppressed()));
+            LogPeerRelayStats(relay_engine, loaded.config.peers);
             next_stats_log = now + std::chrono::seconds(60);
         }
     }
@@ -409,17 +465,10 @@ int Run(int argc, char** argv, std::ostream& out, std::ostream& err, Deps deps)
     const PeerManagerStats peer_stats = peer_manager.StatsSnapshot();
     LOG_INFO("shutdown stats"
              + PeerStatsLogFields(peer_stats)
-             + " blocks_out=" + std::to_string(stats.blocks_relayed_out)
-             + " blocks_in=" + std::to_string(stats.blocks_received_in)
-             + " known=" + std::to_string(stats.blocks_already_known)
-             + " chunks_sent=" + std::to_string(stats.chunks_sent)
-             + " chunks_recv=" + std::to_string(stats.chunks_received)
-             + " submit_ok=" + std::to_string(stats.submit_successes)
-             + " submit_fail=" + std::to_string(stats.submit_failures)
-             + " inbound_rejected=" + std::to_string(stats.inbound_rejected)
-             + " inbound_evicted=" + std::to_string(stats.inbound_evictions)
+             + RelayStatsLogFields(stats)
              + " udp_parse_errors=" + std::to_string(udp_parse_error_logs.total())
              + " udp_parse_error_logs_suppressed=" + std::to_string(udp_parse_error_logs.suppressed()));
+    LogPeerRelayStats(relay_engine, loaded.config.peers);
 
     LOG_INFO("received shutdown signal, exiting");
     return 0;

@@ -155,6 +155,10 @@ enum : uint32_t {
     // script executes to MAX_STANDARD_P2MR_V1_STACK_BYTES (policy only).
     SCRIPT_VERIFY_P2MR_STACK_BYTES = (1U << 23),
 
+    // Charge hashing of P2MR v1 stack elements larger than
+    // MAX_SCRIPT_ELEMENT_SIZE against a per-input budget (policy only).
+    SCRIPT_VERIFY_P2MR_HASH_WEIGHT = (1U << 24),
+
     // Constants to point to the highest flag in use. Add new flags above this line.
     //
     SCRIPT_VERIFY_END_MARKER
@@ -236,6 +240,12 @@ struct ScriptExecutionData
     bool m_validation_weight_left_init = false;
     //! How much validation weight is left (decremented for every successful non-empty signature check).
     int64_t m_validation_weight_left;
+    //! Whether m_p2mr_hash_weight_left is initialized.
+    bool m_p2mr_hash_weight_left_init = false;
+    //! How much of the separate P2MR budget for hashing large stack elements is
+    //! left (decremented under SCRIPT_VERIFY_P2MR_HASH_WEIGHT). It starts at
+    //! the input's initial validation weight.
+    int64_t m_p2mr_hash_weight_left;
 
     //! The hash of the corresponding output
     std::optional<uint256> m_output_hash;

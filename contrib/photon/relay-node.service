@@ -33,5 +33,9 @@ PrivateDevices=true
 MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
 
+# Inbound block decoding is capped at 64 MiB and the relay stays well under 128 MiB in total
+# (see RUNBOOK.md, "Freshness And Inbound Bounds"); this limit keeps headroom above that.
+MemoryMax=256M
+
 [Install]
 WantedBy=multi-user.target

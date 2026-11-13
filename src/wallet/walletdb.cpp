@@ -238,8 +238,9 @@ bool WalletBatch::WriteCryptedDescriptorKey(const uint256& desc_id, const CPubKe
     if (!WriteIC(std::make_pair(DBKeys::WALLETDESCRIPTORCKEY, std::make_pair(desc_id, pubkey)), secret, false)) {
         return false;
     }
-    EraseIC(std::make_pair(DBKeys::WALLETDESCRIPTORKEY, std::make_pair(desc_id, pubkey)));
-    return true;
+    // Callers rely on the plaintext record being gone. Erasing a missing
+    // record succeeds.
+    return EraseIC(std::make_pair(DBKeys::WALLETDESCRIPTORKEY, std::make_pair(desc_id, pubkey)));
 }
 
 bool WalletBatch::WriteDescriptorPQCKey(const uint256& desc_id, const CPQCPubKey& pubkey, const CPQCKey& privkey, uint32_t sig_counter)

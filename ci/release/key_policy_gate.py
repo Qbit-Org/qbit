@@ -992,9 +992,13 @@ def check_gate_approvals(base: str, head: str, changed: list[str], work: Path) -
             signature.write_bytes(data)
             result = key_metadata.run_command(
                 ["gpg", "--batch", "--no-tty", "--homedir", home, "--trust-model", "always", "--status-fd", "1",
-                 "--verify", str(signature), str(manifest_path)]
+                 "--verify", str(signature), str(manifest_path)],
+                text=False,
             )
-            good = key_metadata.good_signatures(result.stdout)
+            try:
+                good = key_metadata.good_signatures(result.stdout)
+            except key_metadata.GpgOutputError as exc:
+                raise GateError(f"{approval_dir}/{relative}: {exc}") from exc
             if result.returncode != 0 or [signing for signing, _primary in good] != [signer["signing_fingerprint"]]:
                 raise GateError(f"{approval_dir}/{relative}: not a good signature by {alias} over gate.SHA256")
             primary = good[0][1]
