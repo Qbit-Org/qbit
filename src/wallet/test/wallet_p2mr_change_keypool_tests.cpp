@@ -192,9 +192,13 @@ BOOST_FIXTURE_TEST_CASE(P2MRGetRawChangeAddressSchedulesLowWatermarkRefill, Regt
         BOOST_CHECK_EQUAL(internal_spk_man->GetWalletDescriptor().range_end, range_end_at_watermark);
     }
 
-    MaybeScheduleP2MRKeyPoolRefill(context, wallet, OutputType::P2MR, /*internal=*/true);
-    BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), low_watermark - 1);
     {
+        // The refill is queued 1 ms out, and its steps take cs_wallet before
+        // they change the pool. Holding cs_wallet across the call and the
+        // checks keeps a slow test thread from seeing a refill that has run.
+        LOCK(wallet->cs_wallet);
+        MaybeScheduleP2MRKeyPoolRefill(context, wallet, OutputType::P2MR, /*internal=*/true);
+        BOOST_CHECK_EQUAL(internal_spk_man->GetKeyPoolSize(), low_watermark - 1);
         LOCK(internal_spk_man->cs_desc_man);
         BOOST_CHECK_EQUAL(internal_spk_man->GetWalletDescriptor().range_end, range_end_at_watermark);
     }
