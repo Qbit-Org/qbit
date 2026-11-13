@@ -196,16 +196,20 @@ from the tag target, so the publisher would refuse it. The publisher also
 requires `trusted_release_ref` to differ from both the annotated tag object
 and the peeled tag target.
 
-Its SHA exists only once this record has landed and is recorded in the
-follow-up, which does not move it. Later revisions of this record do not
-move it either. This record was prepared as one commit whose parent is the
-tag target and which adds only this file. Whether the landed commit keeps
-that shape, so that its tree differs from the tag target's only by this file:
-`PENDING`, checked when it lands and recorded in the follow-up.
+The fixed `trusted_release_ref` is
+`3989ffd0a126d0d447734acd0e93b21263d70185`, which landed
+[#424](https://github.com/Qbit-Org/qbit/pull/424). Its only parent is the tag
+target, and its tree differs from that target's only by the addition of
+`doc/release-trust-1.0.1.md`. Its `keys.json` and `public-keys/` objects equal
+those at `STAGING_REF`. Later revisions of this record do not move this ref.
 
-Review evidence for `trusted_release_ref`, the review of the pull request
-that lands this record (#424) and who approved it: `PENDING`, recorded in the
-follow-up.
+[`djh58` approved #424](https://github.com/Qbit-Org/qbit/pull/424#pullrequestreview-5896798968)
+at `2026-11-13T19:25:50Z`, on head
+`944d96eb295a638b6ce85c5cdc22b288e173eba2`. The required checks passed before
+landing. The signed head was checked by `squash-sign`; landing used its
+squash-merge fallback because the repository disabled merge commits. No
+approval or required-check bypass was used for #424. The landed record's
+bytes match those of the approved signed head.
 
 Every path below exists at the tag target:
 
@@ -271,9 +275,9 @@ The three builders' manifests in `1.0.1/<alias>/` are byte-identical:
 - Artifact count: 21, of which 19 core and 2 PHOTON. The source archive and
   the three `-codesigning` payloads that the builders attested are not
   release artifacts and are not listed.
-- PHOTON: included. Staging counted three PHOTON builders. The publisher's
-  PHOTON validation, under `--require-photon`, runs after this record lands;
-  its result goes in the follow-up.
+- PHOTON: included. Staging and the publisher counted three PHOTON builders.
+  Publisher validation passed with `--require-photon`, including both
+  PHOTON artifacts and the `photon=3/3` builder quorum.
 
 The 21 artifacts are:
 
@@ -328,9 +332,14 @@ The fingerprint recorded is the alias's `signing_fingerprint` in the
 | qbit result | `pass`, 80 cases: the full qbit P2MR v1 unit suite on the tag target. Public reference: Full Validation run [43449959636](https://github.com/Qbit-Org/qbit/actions/runs/43449959636) |
 | Independent oracle report | SHA256 `8728d4a2b385d22175221b313077752a4c8768d518430d40630f7b9ed7c57c08`; `pass`, 80 cases; the standalone oracle run in release mode on the tag target |
 | Finalized integration matrix | SHA256 `19f2760eb5152740870ae8131df65613c9f18fbaa292c41738c97b5aff99268d`; its `release_source_commit` is the tag target; 0 blocking failures and 0 unresolved claims of support |
-| Evidence envelope | `PENDING`: SHA256 of the envelope; it changes when the consensus review reference is filled in, so it goes in the follow-up |
-| Validator run against the signed tag | `PENDING`: the result of `verify_p2mr_v1_conformance.py --release-tag v1.0.1` with the three files, once the consensus review reference is filled in. With that reference still open, it was the validator's only error |
-| Where the three files are published | The follow-up record PR will add `conformance-evidence.json`, `oracle-report.json` and `integration-matrix.json` under `doc/release/evidence/1.0.1/` in `Qbit-Org/qbit`, so that the digests can be recomputed. |
+| Evidence envelope | SHA256 `3a50cc2907c3d52317cb728f0c6ec75bd3c2eeec1db10eb98df1a561f0b6dcf0`; the consensus review reference is the permanent link below |
+| Validator run against the signed tag | PASS: `verify_p2mr_v1_conformance.py --release-tag v1.0.1` at `trusted_release_ref` validated all three finalized files against the tag target, with `cases=80` and the matrix SHA256 above |
+| Where the three files are published | [Evidence envelope](release/evidence/1.0.1/conformance-evidence.json), [oracle report](release/evidence/1.0.1/oracle-report.json) and [integration matrix](release/evidence/1.0.1/integration-matrix.json), committed byte-for-byte from the publisher inputs |
+
+The final envelope points to the
+[permanent consensus review](https://github.com/Qbit-Org/qbit/blob/3989ffd0a126d0d447734acd0e93b21263d70185/doc/release-trust-1.0.1.md#consensus-review).
+Only that reference changed when the envelope was finalized; the oracle
+report and integration matrix retained their recorded digests.
 
 The specification and corpus manifest digests are computed from the git
 blobs at the tag target; the verifier reads the same blobs. Both files are
@@ -411,8 +420,9 @@ codesigning payloads are not published. Staging and publication pass
 [1.0.1 release notes](release-notes-1.0.1.md) carry the same waiver under
 "Known limitations", and [#181](https://github.com/Qbit-Org/qbit/pull/181)
 records it. It remains until macOS and Windows signing accounts are available
-([#70](https://github.com/Qbit-Org/qbit/issues/70)). Confirmation against the
-published asset set goes in the follow-up.
+([#70](https://github.com/Qbit-Org/qbit/issues/70)). The published asset set
+was verified to contain the six unsigned platform artifacts and no
+codesigning payloads.
 
 ### 2. Tag on a squash commit, before that commit's own CI finished
 
@@ -563,21 +573,60 @@ pristine and ad-hoc digests are recorded in the packaged smoke report.
 | macOS x86_64 / qbitd | `6576f8b5298d659a334afba79755e6168af3fb628fd6ec24de2c0cfabac2c90b` | unchanged |
 | macOS x86_64 / qbit-qt | `a0627a43cbb214e49fa2778c45acb48129ac6ac1ff88896513ebedefece69098` | unchanged |
 
-## Recorded after this record lands
+## Publication record
 
-These values exist only after this record lands or after publication. A
-follow-up records them and does not move `trusted_release_ref`:
+The publisher ran from a clean checkout of
+`3989ffd0a126d0d447734acd0e93b21263d70185`, the fixed `trusted_release_ref`,
+with `GUIX_SIGS_REF` pinned as above. It used `--release-line mainnet`,
+`--require-photon`, `--allow-unsigned-platform-artifacts`,
+`--no-prerelease` and `--make-latest true`. No other waiver flag was used.
 
-- the `trusted_release_ref` SHA; that its parent is the tag target and its
-  tree differs from the tag target's only by this file; that the key policy
-  at it (`keys.json` and the certificates in `public-keys/`) is the one at
-  `STAGING_REF`; and the review of the pull request that landed it;
-- the permanent link to the [consensus review](#consensus-review) above,
-  and the evidence envelope's SHA256;
-- the publisher's printed `Pinned refs`, `Key policy`, `Artifacts`,
-  `Release signatures`, `Builder attestations`, `Builder source` and
-  `Evidence` lines, its `Published immutable release assets exactly match
-  local names and SHA256 digests` line, and the ref it ran from;
-- the publisher's PHOTON validation result;
-- the release URL and its final immutable state, and confirmation that the
-  published asset set carries the unsigned-platform waiver of item 1.
+The staging ancestry gate was checked against `main`, under the recorded
+[item 3 deviation](#3-main-was-fast-forwarded-before-publication).
+The key-policy comparison still covered both `main` and `1.x.x`; both
+matched `STAGING_REF`. The tag target's tree equalled
+`35a01d570ceef5984ae84e15d4dc74adecb587be`, the tree of the recorded `1.x.x`
+head. The runbook's `1.x.x` ancestry requirement was not used as a release
+gate.
+
+Validation passed before draft creation. The first draft attempt created
+an empty draft, then stopped because it could not inspect the release.
+After the coordinator approved a retry, the publisher uploaded and verified
+all 26 files. The coordinator subsequently published the release manually.
+A post-publication validation-only run then passed against the exact
+published notes and the original staged files; it made no release changes.
+
+The post-publication run printed:
+
+```text
+Pinned refs: tag_object=a5dc57ae00eefcff453db0a335497b9a83be4ba0 tag_target=0439a7e5b37fb3f7e4ddfb735b68961445a882c8 trusted_release_ref=3989ffd0a126d0d447734acd0e93b21263d70185 guix_sigs_ref=503230a08b17bba130a7ca33f5c263e6c073e2ac
+Key policy: sha256=f04ae262bd40cdda5c481fc18cef29b405878e66d06c33b49865ea42b38eaf9f active_release_signers=5
+Artifacts: total=21 core=19 photon=2
+Release signatures: 3/3 aliases=operator-01,operator-02,operator-03
+Builder attestations: core=3/3 aliases=operator-01,operator-02,operator-03 photon=3/3 aliases=operator-01,operator-02,operator-03
+Builder source: qbit-1.0.1.tar.gz 9b794c652bd8d94f861dcf6e0cf221230a5fa9f3d8b86658daee86bbbf0db89d from 0439a7e5b37fb3f7e4ddfb735b68961445a882c8
+Published release assets exactly match local names and SHA256 digests
+Validation-only mode complete: https://github.com/Qbit-Org/qbit/releases/tag/v1.0.1 (immutable=true)
+```
+
+The successful draft upload printed this `Evidence` line:
+
+```text
+Evidence: tag_object=a5dc57ae00eefcff453db0a335497b9a83be4ba0 tag_target=0439a7e5b37fb3f7e4ddfb735b68961445a882c8 trusted_release_ref=3989ffd0a126d0d447734acd0e93b21263d70185 guix_sigs_ref=503230a08b17bba130a7ca33f5c263e6c073e2ac artifact_count=21 file_count=26 source_sha256=9b794c652bd8d94f861dcf6e0cf221230a5fa9f3d8b86658daee86bbbf0db89d
+```
+
+The validation-only path prints the asset-match and immutable-state lines
+separately, as quoted above. There was no publisher `--publish` invocation.
+
+- Release: [v1.0.1](https://github.com/Qbit-Org/qbit/releases/tag/v1.0.1),
+  GitHub release ID `444652290`.
+- Published at `2026-11-13T19:48:49Z`.
+- GitHub state: `draft=false`, `prerelease=false`, `immutable=true`.
+- Uploaded set: 21 artifacts, `SHA256SUMS`, the combined signature and three
+  individual signatures, for 26 files. GitHub-generated source downloads
+  and release attestations are separate from this uploaded set.
+- The published notes retain exactly one recorded conformance sentence.
+  Relative to the approved draft notes, the title heading was removed and
+  line endings changed from LF to CRLF; the remaining text is unchanged.
+  The exact published body used for post-publication validation has SHA256
+  `b4b2fe4f53788ec43271a82d4a8d658ce2eb3e0385ad4dedc13a790181df9322`.
